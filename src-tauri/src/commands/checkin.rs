@@ -1,5 +1,4 @@
 use std::io::{BufRead, BufReader, Write};
-use std::process::Stdio;
 use tauri::{AppHandle, Emitter, State};
 
 use serde::Deserialize;

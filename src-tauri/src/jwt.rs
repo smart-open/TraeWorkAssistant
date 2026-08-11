@@ -1,6 +1,8 @@
 //! JWT 解析（不校验签名，仅本地展示用途）。
 //! 支持 `Cloud-IDE-JWT <token>` 前缀；payload 取 data.id 与 exp。
 
+use base64::Engine;
+
 pub struct JwtInfo {
     pub user_id: Option<String>,
     pub exp_hours: Option<f64>,

@@ -12,20 +12,6 @@ pub struct EnvStatus {
     pub path: Option<String>,
 }
 
-fn capture(cmd: &mut Command) -> Option<String> {
-    match cmd.output() {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout).to_string();
-            if s.trim().is_empty() {
-                Some(String::from_utf8_lossy(&o.stderr).to_string())
-            } else {
-                Some(s)
-            }
-        }
-        Err(_) => None,
-    }
-}
-
 #[tauri::command]
 pub fn env_check(_app: AppHandle, _state: State<AppState>) -> EnvStatus {
     let (installed, path, version) = detect_trae();

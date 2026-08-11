@@ -24,7 +24,7 @@ pub struct RawAccount {
     pub updated_at: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct AccountsFile {
     pub accounts: Vec<RawAccount>,
 }

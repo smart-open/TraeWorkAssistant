@@ -1,5 +1,5 @@
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::State;
 
 use crate::fs_utils;
 use crate::jwt;
