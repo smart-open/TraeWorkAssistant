@@ -51,9 +51,9 @@ export default function Sidebar({
               key={item.key}
               onClick={() => onNav(item.key)}
               className={cn(
-                'flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition',
+                'flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition active:scale-[0.98]',
                 active
-                  ? 'bg-brand-600 text-white'
+                  ? 'bg-gradient-to-r from-brand-600 to-brand-500 text-white shadow-[0_8px_20px_-8px_rgba(79,70,229,0.6)]'
                   : 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800',
               )}
             >
@@ -66,7 +66,7 @@ export default function Sidebar({
       <div className="border-t border-slate-200 p-3 dark:border-slate-800">
         <button
           onClick={copyInvite}
-          className="flex w-full items-center justify-center gap-2 rounded-lg bg-amber-500 px-3 py-2 text-sm font-medium text-white transition hover:bg-amber-400"
+          className="flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-amber-500 to-amber-400 px-3 py-2 text-sm font-semibold text-white shadow-[0_8px_20px_-8px_rgba(245,158,11,0.5)] transition hover:from-amber-400 hover:to-amber-300 active:scale-[0.98]"
         >
           <Gift size={16} />
           邀请得 5000 积分

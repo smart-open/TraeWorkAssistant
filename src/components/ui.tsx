@@ -21,6 +21,26 @@ const toneMap: Record<Tone, string> = {
   violet: 'bg-violet-100 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300',
 };
 
+const accentMap: Record<Tone, string> = {
+  slate: 'bg-slate-400',
+  brand: 'bg-brand-500',
+  green: 'bg-emerald-500',
+  amber: 'bg-amber-500',
+  red: 'bg-rose-500',
+  blue: 'bg-sky-500',
+  violet: 'bg-violet-500',
+};
+
+const valueToneMap: Record<Tone, string> = {
+  slate: 'text-slate-800 dark:text-slate-100',
+  brand: 'text-brand-600 dark:text-brand-400',
+  green: 'text-emerald-600 dark:text-emerald-400',
+  amber: 'text-amber-600 dark:text-amber-400',
+  red: 'text-rose-600 dark:text-rose-400',
+  blue: 'text-sky-600 dark:text-sky-400',
+  violet: 'text-violet-600 dark:text-violet-400',
+};
+
 export function Badge({
   children,
   tone = 'slate',
@@ -108,7 +128,11 @@ export function EmptyState({
 }) {
   return (
     <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 py-12 text-center dark:border-slate-700">
-      {icon && <div className="mb-3 text-slate-400">{icon}</div>}
+      {icon && (
+        <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-100 text-slate-400 dark:bg-slate-800">
+          {icon}
+        </div>
+      )}
       <p className="text-sm font-medium text-slate-600 dark:text-slate-300">{title}</p>
       {hint && <p className="mt-1 max-w-sm text-xs text-slate-400">{hint}</p>}
     </div>
@@ -127,20 +151,10 @@ export function StatCard({
   tone?: Tone;
 }) {
   return (
-    <div className="card p-4">
+    <div className="card relative overflow-hidden p-4">
+      <div className={cn('absolute inset-x-0 top-0 h-0.5', accentMap[tone])} />
       <div className="text-xs font-medium text-slate-500 dark:text-slate-400">{label}</div>
-      <div
-        className={cn(
-          'mt-1 text-2xl font-semibold',
-          tone === 'brand' && 'text-brand-600 dark:text-brand-400',
-          tone === 'green' && 'text-emerald-600 dark:text-emerald-400',
-          tone === 'amber' && 'text-amber-600 dark:text-amber-400',
-          tone === 'red' && 'text-rose-600 dark:text-rose-400',
-          tone === 'blue' && 'text-sky-600 dark:text-sky-400',
-          tone === 'violet' && 'text-violet-600 dark:text-violet-400',
-          tone === 'slate' && 'text-slate-800 dark:text-slate-100',
-        )}
-      >
+      <div className={cn('mt-1 text-2xl font-semibold tracking-tight tabular-nums', valueToneMap[tone])}>
         {value}
       </div>
       {hint && <div className="mt-1 text-xs text-slate-400">{hint}</div>}

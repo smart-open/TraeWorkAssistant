@@ -1,4 +1,4 @@
-import { useMemo, useEffect, useState } from 'react';
+import { useMemo } from 'react';
 import {
   BarChart,
   Bar,
@@ -9,18 +9,16 @@ import {
   CartesianGrid,
   Cell,
 } from 'recharts';
-import { Gift, Copy, Coins } from 'lucide-react';
+import { Coins } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { StatCard, Badge, EmptyState } from '../components/ui';
 import { useAppStore } from '../store';
-import { api } from '../lib/tauri';
 
 const COLORS = ['#6366f1', '#818cf8', '#22c55e', '#f59e0b', '#ef4444', '#0ea5e9', '#a855f7', '#14b8a6', '#f43f5e', '#10b981'];
 
 export default function Credits() {
   const accounts = useAppStore((s) => s.accounts);
   const groups = useAppStore((s) => s.groups);
-  const toast = useAppStore((s) => s.pushToast);
 
   const rows = useMemo(
     () => [...accounts].sort((a, b) => (b.credits ?? -1) - (a.credits ?? -1)),
@@ -28,24 +26,6 @@ export default function Credits() {
   );
   const total = rows.reduce((s, a) => s + (a.credits ?? 0), 0);
   const avg = rows.length === 0 ? 0 : Math.round(total / rows.length);
-
-  const [inviteUrl, setInviteUrl] = useState('');
-  useEffect(() => {
-    api.misc
-      .inviteLink()
-      .then((r) => setInviteUrl(r.url))
-      .catch(() => setInviteUrl(''));
-  }, []);
-
-  const invite = async () => {
-    try {
-      const r = await api.misc.inviteLink();
-      await navigator.clipboard.writeText(r.url);
-      toast('success', '邀请链接已复制到剪贴板');
-    } catch (e) {
-      toast('error', `复制失败：${String(e)}`);
-    }
-  };
 
   return (
     <div className="animate-fade-in">
@@ -60,8 +40,8 @@ export default function Credits() {
         <StatCard label="账号平均积分" value={avg.toLocaleString()} tone="blue" />
       </div>
 
-      <div className="grid gap-3 md:grid-cols-3">
-        <div className="card p-4 md:col-span-2">
+      <div className="grid gap-3 md:grid-cols-1">
+        <div className="card p-4">
           <h3 className="mb-3 font-medium">账号积分排行</h3>
           {rows.length === 0 ? (
             <EmptyState icon={<Coins size={28} />} title="尚无积分数据" hint="添加账号或运行一次签到即可看到。" />
@@ -85,18 +65,6 @@ export default function Credits() {
               </ResponsiveContainer>
             </div>
           )}
-        </div>
-        <div className="card p-4">
-          <h3 className="mb-3 font-medium">邀请得 5000 积分</h3>
-          <p className="text-sm text-slate-500">
-            每邀请一位新用户注册，双方均可获得 5000 积分。
-          </p>
-          <button onClick={invite} className="mt-4 w-full bg-amber-500 btn text-white hover:bg-amber-400">
-            <Copy size={15} /> 复制邀请链接
-          </button>
-          <div className="mt-3 break-all rounded-lg bg-slate-100 p-2 text-xs text-slate-500 dark:bg-slate-800">
-            {inviteUrl || '加载邀请链接中…'}
-          </div>
         </div>
       </div>
 

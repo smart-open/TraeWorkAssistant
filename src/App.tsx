@@ -55,9 +55,10 @@ export default function App() {
       <TitleBar />
       <div className="flex min-h-0 flex-1">
         <Sidebar view={view} onNav={setView} />
-        <main className="flex min-w-0 flex-1 flex-col">
+        <main className="relative flex min-w-0 flex-1 flex-col">
+          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(60%_50%_at_0%_0%,rgba(99,102,241,0.07),transparent)]" />
           <TopBar />
-          <div className="min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
+          <div className="relative min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
         </main>
       </div>
       <Toaster />
