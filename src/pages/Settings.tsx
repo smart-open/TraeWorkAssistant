@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Copy, Calendar, Power, Trash2, Gift, Save } from 'lucide-react';
+import { Copy, Calendar, Power, Trash2, Save } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge } from '../components/ui';
 import { useAppStore } from '../store';
@@ -14,7 +14,6 @@ export default function Settings() {
   const [time, setTime] = useState('09:00');
   const [taskInfo, setTaskInfo] = useState<string>('');
   const [busyTask, setBusyTask] = useState(false);
-  const [inviteUrl, setInviteUrl] = useState('');
 
   useEffect(() => {
     void refreshSettings();
@@ -26,24 +25,6 @@ export default function Settings() {
   ) => {
     void saveSettings({ [key]: val } as Partial<NonNullable<typeof settings>>);
   };
-
-  const copyInvite = async () => {
-    try {
-      const r = await api.misc.inviteLink();
-      await navigator.clipboard.writeText(r.url);
-      setInviteUrl(r.url);
-      toast('success', '邀请链接已复制');
-    } catch (e) {
-      toast('error', `复制失败：${String(e)}`);
-    }
-  };
-
-  useEffect(() => {
-    api.misc
-      .inviteLink()
-      .then((r) => setInviteUrl(r.url))
-      .catch(() => setInviteUrl(''));
-  }, []);
 
   const register = async () => {
     setBusyTask(true);
@@ -255,17 +236,6 @@ export default function Settings() {
               {taskInfo}
             </pre>
           )}
-        </section>
-
-        <section className="card p-4">
-          <h3 className="mb-2 font-medium">邀请得积分</h3>
-          <p className="text-sm text-slate-500">分享链接，双方均可获 5000 积分。</p>
-          <button onClick={copyInvite} className="mt-3 w-full bg-amber-500 btn text-white hover:bg-amber-400">
-            <Gift size={15} /> 复制邀请链接
-          </button>
-          <div className="mt-2 break-all rounded bg-slate-100 p-2 text-xs text-slate-500 dark:bg-slate-800">
-            {inviteUrl || '加载邀请链接中…'}
-          </div>
         </section>
 
         <section className="card p-4">

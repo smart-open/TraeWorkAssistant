@@ -51,16 +51,6 @@ export default function Dashboard() {
     [accounts],
   );
 
-  const invite = async () => {
-    try {
-      const r = await api.misc.inviteLink();
-      await navigator.clipboard.writeText(r.url);
-      toast('success', '邀请链接已复制到剪贴板');
-    } catch (e) {
-      toast('error', `获取邀请链接失败：${String(e)}`);
-    }
-  };
-
   const refresh = async () => {
     toast('info', '刷新中…');
     // 简单做法：依次触发 store 刷新动作
@@ -175,15 +165,6 @@ export default function Dashboard() {
               </ResponsiveContainer>
             </div>
           )}
-        </div>
-        <div className="card p-4">
-          <h3 className="mb-3 font-medium">邀请得积分</h3>
-          <p className="text-sm text-slate-500">
-            每邀请一位新用户注册 Trae，双方均可获得 5000 积分。
-          </p>
-          <button onClick={invite} className="mt-4 w-full bg-amber-500 px-3 py-2 btn text-white hover:bg-amber-400">
-            <Gift size={16} /> 复制邀请链接
-          </button>
         </div>
       </div>
     </div>
