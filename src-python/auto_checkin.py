@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+r"""
+Trae Work 多账号自动签到脚本 — Trae Work 助手 内置版
+=====================================================
+读取 checkin_accounts.json 中保存的各账号 JWT，按账号分配稳定伪设备 ID
+（与 device_proxy.py 共用 device_map.json），批量调用签到接口领取积分。
+
+JWT 获取方式：
+1. 启动 device_proxy.py 并启动 TRAE 走代理；
+2. 在 TRAE 里切换每个账号并点击签到；
+3. 代理日志 (proxy.log) 会打印出 [JWT 自动更新] user=... 及对应的 Authorization 头。
+
+环境变量 TRAEDATA_DIR 可重定向数据文件位置（桌面端用它指向 %APPDATA%\TraeWorkAssistant）。
+
+命令行参数：
+    --json-stream   以单行 JSON（NDJSON）输出每账号结果，供桌面端逐条渲染
+    --accounts U1,U2   仅签指定 UserID（逗号分隔）
+    --scope all|group:<id>   兼容参数（实际过滤由桌面端通过 --accounts 下发）
+
+把 JWT 按如下格式填入 checkin_accounts.json：
+{
+  "accounts": [
+    {"name": "me_1676", "UserID": "1234567890123456", "jwt": "Cloud-IDE-JWT eyJ..."}
+  ]
+}
+"""
+import os
+import sys
+import json
+import base64
+import random
+import hashlib
+import uuid
+import datetime
+import urllib.request
+import urllib.error
+import socket
+import gzip
+import zlib
+import argparse
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+# 数据目录：优先 TRAEDATA_DIR（由桌面端注入），否则回退到脚本目录（保持独立可用性）
+DATA_DIR = os.environ.get("TRAEDATA_DIR", BASE)
+ACCOUNTS_FILE = os.path.join(DATA_DIR, "checkin_accounts.json")
+MAP_FILE = os.path.join(DATA_DIR, "device_map.json")
+SIGNIN_URL = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim"
+STATUS_URL = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status"
+EXPIRY_WARN_HOURS = 24  # JWT 剩余有效期低于该值时发出告警
+LOG_FILE = os.path.join(DATA_DIR, "checkin_log.txt")
+
+# 伪随机但稳定的生成器，保证同一 user_id 在 device_map.json 缺失时也能复现相同 ID
+# 注意：random.Random 是有状态的，必须「每次调用新建」才能保证同 seed 恒等输出，
+# 不能缓存对象（缓存会因状态前进导致同 seed 二次调用产出不同序列）。
+
+
+def _normalize_seed(seed):
+    """将任意 seed 归一为稳定 int（字符串走 sha256，跨进程一致；纯数字串按数值）。"""
+    if isinstance(seed, int):
+        return seed & 0x7FFFFFFFFFFFFFFF
+    if isinstance(seed, str):
+        if seed.isdigit():
+            return int(seed) & 0x7FFFFFFFFFFFFFFF
+        return int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16) & 0x7FFFFFFFFFFFFFFF
+    return seed
+
+
+def _stable_rng(seed):
+    """基于 seed 的稳定随机数生成器（与 device_proxy.py 保持一致）。"""
+    return random.Random(_normalize_seed(seed))
+
+
+def rand_digits(n, seed=None):
+    if seed is None:
+        return "".join(random.choice("0123456789") for _ in range(n))
+    return "".join(_stable_rng(seed).choice("0123456789") for _ in range(n))
+
+
+def rand_hex(n, seed=None):
+    if seed is None:
+        return "".join(random.choice("0123456789abcdef") for _ in range(n))
+    return "".join(_stable_rng(seed).choice("0123456789abcdef") for _ in range(n))
+
+
+def load_json(path, default=None):
+    if default is None:
+        default = {}
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[警告] 读取 {path} 失败: {e}")
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[警告] 写入 {path} 失败: {e}")
+
+
+def extract_user_id(jwt):
+    """从 JWT payload 里取 data.id，不校验签名。"""
+    token = jwt
+    if token.startswith("Cloud-IDE-JWT "):
+        token = token.split(None, 1)[1]
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        pad = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(pad))
+        data = payload.get("data", {})
+        if isinstance(data, dict) and data.get("id"):
+            return data.get("id")
+        if payload.get("auth_id"):
+            return payload.get("auth_id")
+        if payload.get("sub"):
+            return payload.get("sub")
+        return None
+    except Exception:
+        return None
+
+
+def get_jwt_exp(jwt):
+    """从 JWT payload 取 exp 字段，返回 (exp_datetime, remaining_hours) 或 (None, None)。"""
+    token = jwt
+    if token.startswith("Cloud-IDE-JWT "):
+        token = token.split(None, 1)[1]
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None, None
+    try:
+        pad = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(pad))
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            return None, None
+        exp_dt = datetime.datetime.fromtimestamp(exp)
+        remaining = (exp_dt - datetime.datetime.now()).total_seconds() / 3600.0
+        return exp_dt, remaining
+    except Exception:
+        return None, None
+
+
+def _decode_body(raw, ce):
+    """按 Content-Encoding 解压响应体（标准库覆盖 gzip/deflate）。"""
+    ce = (ce or "").lower().strip()
+    try:
+        if ce == "gzip":
+            return gzip.decompress(raw).decode("utf-8", "replace")
+        if ce == "deflate":
+            return zlib.decompress(raw, -zlib.MAX_WBITS).decode("utf-8", "replace")
+    except Exception:
+        pass
+    return raw.decode("utf-8", "replace")
+
+
+def get_device_for(user_id, device_map):
+    """
+    复用/生成 device_map.json 中该 user_id 的设备标识。
+    结构与 device_proxy.py 完全一致，确保代理和脚本看到的映射相同。
+    """
+    if user_id not in device_map:
+        device_map[user_id] = {
+            "device_id": rand_digits(15, seed=user_id),
+            "market_user_id": str(uuid.UUID(int=_stable_rng(user_id).getrandbits(128))),
+            "session_id": rand_hex(64, seed=user_id),
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        save_json(MAP_FILE, device_map)
+    return device_map[user_id]
+
+
+def _build_headers(jwt, dev):
+    """签到/状态接口共用的请求头（按账号独立设备 id 与 session）。"""
+    return {
+        "accept": "*/*",
+        "accept-encoding": "gzip, deflate",
+        "accept-language": "zh-CN",
+        "authorization": jwt if jwt.startswith("Cloud-IDE-JWT ") else f"Cloud-IDE-JWT {jwt}",
+        "content-type": "application/json",
+        "user-agent": "VSCode 1.107.1 (TRAE SOLO CN)",
+        "x-market-client-id": "VSCode 1.107.1",
+        "x-market-user-id": dev["market_user_id"],
+        "x-user-region": "CN",
+        "x-device-id": dev["device_id"],
+        "x-lgw-req-sdk-type": "3",
+        "package-type": "stable_cn",
+        "x-request-id": str(uuid.uuid4()),
+        "x-lscbd-aid": "787976",
+        "x-lscbd-platform": "windows",
+        "app-version": "0.1.45",
+        "x-tt-trace-id": f"00-{uuid.uuid4().hex[:16]}-01",
+        "vscode-sessionid": dev["session_id"],
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "no-cors",
+        "sec-fetch-site": "none",
+    }
+
+
+def _http_post(url, jwt, dev, body=b"{}", timeout=30):
+    """统一 POST 入口，返回 (status_code:int, body_text:str)。"""
+    headers = _build_headers(jwt, dev)
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, _decode_body(resp.read(), resp.headers.get("Content-Encoding", ""))
+    except urllib.error.HTTPError as e:
+        return e.code, _decode_body(e.read(), e.headers.get("Content-Encoding", ""))
+    except socket.timeout:
+        return 0, ""
+    except Exception as e:
+        return -1, f"{type(e).__name__}: {e}"
+
+
+def status_check(name, jwt, device_map, timeout=30):
+    """预检：返回 (ok: bool, checked_in: bool|None, credits: int|None, code: int|None, message: str)。"""
+    user_id = extract_user_id(jwt)
+    if not user_id:
+        return False, None, None, None, "无法从 JWT 解析 user id"
+    dev = get_device_for(user_id, device_map)
+    status, body = _http_post(STATUS_URL, jwt, dev, body=b"{}", timeout=timeout)
+    if status < 0:
+        return False, None, None, None, body or "网络异常"
+    try:
+        data = json.loads(body)
+    except Exception:
+        return False, None, None, status, f"非 JSON 响应: {body[:200]}"
+    code = data.get("code")
+    checked_in = data.get("checked_in")
+    credits = data.get("credits")
+    msg = data.get("message", "")
+    if code != 0:
+        return False, checked_in, credits, code, msg or f"HTTP {status}"
+    return True, bool(checked_in), credits, code, msg
+
+
+def signin(name, jwt, device_map, timeout=30):
+    """对单个账号执行签到，返回 (success: bool, message: str, code: int|None)。"""
+    user_id = extract_user_id(jwt)
+    if not user_id:
+        return False, "无法从 JWT 解析 user id", None
+
+    dev = get_device_for(user_id, device_map)
+    status, body = _http_post(SIGNIN_URL, jwt, dev, body=b"{}", timeout=timeout)
+
+    if status < 0:
+        return False, body or "网络异常", None
+    try:
+        data = json.loads(body)
+        return data.get("code") == 0, data.get("message", f"HTTP {status}"), data.get("code")
+    except Exception:
+        return False, f"HTTP {status}: 非 JSON 响应: {body[:200]}", status if status else None
+
+
+# ----------------- NDJSON 输出（--json-stream） -----------------
+_JSON_STREAM = False
+
+
+def emit(obj):
+    if _JSON_STREAM:
+        print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def main():
+    global _JSON_STREAM
+    parser = argparse.ArgumentParser(description="Trae Work 多账号自动签到")
+    parser.add_argument("--json-stream", action="store_true", help="以 NDJSON 输出每账号结果")
+    parser.add_argument("--accounts", default="", help="仅签指定 UserID（逗号分隔）")
+    parser.add_argument("--scope", default="all", help="兼容参数（all|group:<id>）")
+    args = parser.parse_args()
+    _JSON_STREAM = args.json_stream
+    target_uids = (
+        {u.strip() for u in args.accounts.split(",") if u.strip()}
+        if args.accounts
+        else None
+    )
+
+    print("=" * 60)
+    print("Trae Work 多账号自动签到")
+    print("=" * 60)
+
+    accounts_cfg = load_json(ACCOUNTS_FILE, default={"accounts": []})
+    accounts = accounts_cfg.get("accounts", [])
+
+    if not accounts:
+        print()
+        print("ℹ️  checkin_accounts.json 中暂无账号，无需签到。")
+        emit({"type": "start", "total": 0})
+        emit({"type": "done", "ok": 0, "already": 0, "failed": 0})
+        summary = {
+            "time": datetime.datetime.now().isoformat(timespec="seconds"),
+            "results": [],
+            "total_ok": 0,
+            "already": 0,
+            "failed": 0,
+            "warnings": [],
+            "note": "no_accounts_yet",
+        }
+        save_json(os.path.join(DATA_DIR, "checkin_summary.json"), summary)
+        return 0
+
+    # 计算本次要处理的账号（受 --accounts 过滤）
+    pending = []
+    for acc in accounts:
+        jwt = acc.get("jwt", "")
+        uid = extract_user_id(jwt) if jwt else acc.get("UserID")
+        if target_uids and uid not in target_uids:
+            continue
+        pending.append(acc)
+
+    emit({"type": "start", "total": len(pending)})
+
+    device_map = load_json(MAP_FILE, default={})
+    results = []
+    warnings = []
+    total_ok = 0
+    already = 0
+    failed = 0
+
+    for idx, acc in enumerate(pending, 1):
+        name = acc.get("name", f"账号{idx}")
+        jwt = acc.get("jwt", "")
+        print(f"\n[{idx}/{len(pending)}] 账号: {name}")
+        if not jwt:
+            print(f"  结果: 跳过（未配置 jwt）")
+            results.append({"name": name, "ok": False, "message": "未配置 jwt"})
+            failed += 1
+            emit({"type": "account", "index": idx, "user_id": acc.get("UserID", ""), "name": name, "status": "fail", "message": "未配置 jwt"})
+            continue
+
+        user_id = extract_user_id(jwt)
+        print(f"  user_id: {user_id}")
+
+        exp_dt, remaining = get_jwt_exp(jwt)
+        if remaining is not None:
+            if remaining < 0:
+                print(f"  [WARN] JWT 已过期（{exp_dt:%Y-%m-%d %H:%M}），需重新抓取！")
+                warnings.append(f"{name}: JWT 已过期({exp_dt:%Y-%m-%d %H:%M})，请重新抓取")
+            elif remaining < EXPIRY_WARN_HOURS:
+                print(f"  [WARN] JWT 将于 {remaining:.1f} 小时后过期（{exp_dt:%Y-%m-%d %H:%M}），请尽快重新抓取")
+                warnings.append(f"{name}: JWT 将于 {remaining:.1f}h 后过期({exp_dt:%Y-%m-%d %H:%M})，请重新抓取")
+
+        dev = get_device_for(user_id, device_map)
+        print(f"  x-device-id: {dev['device_id']} (from device_map.json)")
+
+        ok_s, checked_in, credits_before, code_s, msg_s = status_check(name, jwt, device_map)
+        if ok_s and checked_in:
+            print(f"  [OK] 已签到（credits={credits_before}），跳过 claim")
+            results.append({
+                "name": name, "ok": True, "code": 0,
+                "action": "skip_already", "credits": credits_before,
+                "message": msg_s or "已签到",
+            })
+            already += 1
+            emit({"type": "account", "index": idx, "user_id": user_id, "name": name, "status": "already", "credits": credits_before})
+            continue
+        if not ok_s:
+            print(f"  [WARN] status 预检失败 (code={code_s}) {msg_s} —— 仍尝试 claim")
+
+        ok, msg, code = signin(name, jwt, device_map)
+        result = {"name": name, "ok": ok, "code": code, "message": msg, "action": "claim"}
+
+        if ok:
+            ok2, _checked, credits_after, code2, msg2 = status_check(name, jwt, device_map)
+            if ok2 and isinstance(credits_after, int) and isinstance(credits_before, int):
+                delta = credits_after - credits_before
+                result["credits_before"] = credits_before
+                result["credits_after"] = credits_after
+                result["credits_delta"] = delta
+                print(f"  积分核对: {credits_before} -> {credits_after} (delta={delta:+d})")
+                if delta > 0:
+                    print(f"  [OK] 签到成功，积分 +{delta}")
+                    result["action"] = "claim_ok"
+                else:
+                    print(f"  [OK] 签到成功（积分未变化，可能为幂等返回/今日已发）")
+                    result["action"] = "claim_idempotent"
+            else:
+                print(f"  [OK] 签到成功（积分复核失败 code={code2}，已忽略：{msg2}）")
+                result["action"] = "claim_ok"
+
+        results.append(result)
+        print(f"  结果: {'成功' if ok else '失败'} (code={code}) {msg}")
+        emit({
+            "type": "account",
+            "index": idx,
+            "user_id": user_id,
+            "name": name,
+            "status": "success" if ok else "fail",
+            "code": code,
+            "message": msg,
+            "delta": result.get("credits_delta"),
+        })
+        if ok:
+            total_ok += 1
+        else:
+            failed += 1
+
+    print("\n" + "=" * 60)
+    print(f"签到完成: 成功 {total_ok} / 已签到 {already} / 失败 {failed} / 总计 {len(pending)}")
+    print("=" * 60)
+
+    if warnings:
+        print("\n[WARN]  JWT 过期告警：")
+        for w in warnings:
+            print(f"   - {w}")
+
+    summary = {
+        "time": datetime.datetime.now().isoformat(timespec="seconds"),
+        "results": [{k: v for k, v in r.items() if k != "jwt"} for r in results],
+        "total_ok": total_ok,
+        "already": already,
+        "failed": failed,
+        "warnings": warnings,
+    }
+    save_json(os.path.join(DATA_DIR, "checkin_summary.json"), summary)
+    print(f"结果摘要已保存: {os.path.join(DATA_DIR, 'checkin_summary.json')}")
+
+    log_line = (
+        f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
+        f"成功{total_ok}/已签到{already}/失败{failed}/总计{len(pending)}"
+        + (f" | 告警: {'; '.join(warnings)}" if warnings else "")
+        + "\n"
+    )
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_line)
+    except Exception as e:
+        print(f"[警告] 写入 {LOG_FILE} 失败: {e}")
+
+    emit({"type": "done", "ok": total_ok, "already": already, "failed": failed})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

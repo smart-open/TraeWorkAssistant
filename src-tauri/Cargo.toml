@@ -1,0 +1,25 @@
+[package]
+name = "trae-work-helper"
+version = "1.0.0"
+description = "Trae Work 助手 - 多账号签到与管理桌面端"
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+
+[features]
+# 仅桌面端
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

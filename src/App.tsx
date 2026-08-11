@@ -1,0 +1,62 @@
+import { useEffect, useState } from 'react';
+import TitleBar from './components/TitleBar';
+import Sidebar, { type ViewKey } from './components/Sidebar';
+import TopBar from './components/TopBar';
+import Toaster from './components/Toaster';
+import { useAppStore } from './store';
+import Dashboard from './pages/Dashboard';
+import Accounts from './pages/Accounts';
+import Checkin from './pages/Checkin';
+import Credits from './pages/Credits';
+import Logs from './pages/Logs';
+import Settings from './pages/Settings';
+
+function renderView(view: ViewKey) {
+  switch (view) {
+    case 'dashboard':
+      return <Dashboard />;
+    case 'accounts':
+      return <Accounts />;
+    case 'checkin':
+      return <Checkin />;
+    case 'credits':
+      return <Credits />;
+    case 'logs':
+      return <Logs />;
+    case 'settings':
+      return <Settings />;
+  }
+}
+
+export default function App() {
+  const [view, setView] = useState<ViewKey>('dashboard');
+  const init = useAppStore((s) => s.init);
+  const settings = useAppStore((s) => s.settings);
+
+  useEffect(() => {
+    void init();
+  }, [init]);
+
+  useEffect(() => {
+    const theme = settings?.theme ?? 'system';
+    const dark =
+      theme === 'dark' ||
+      (theme === 'system' &&
+        window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.classList.toggle('dark', dark);
+  }, [settings?.theme]);
+
+  return (
+    <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-slate-950 dark:text-slate-100">
+      <TitleBar />
+      <div className="flex min-h-0 flex-1">
+        <Sidebar view={view} onNav={setView} />
+        <main className="flex min-w-0 flex-1 flex-col">
+          <TopBar />
+          <div className="min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
+        </main>
+      </div>
+      <Toaster />
+    </div>
+  );
+}

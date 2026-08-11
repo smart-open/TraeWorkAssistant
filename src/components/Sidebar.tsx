@@ -1,0 +1,82 @@
+import {
+  LayoutDashboard,
+  Users,
+  PlayCircle,
+  Coins,
+  ScrollText,
+  Settings,
+  Gift,
+} from 'lucide-react';
+import { useAppStore } from '../store';
+import { cn } from '../lib/cn';
+
+export type ViewKey =
+  | 'dashboard'
+  | 'accounts'
+  | 'checkin'
+  | 'credits'
+  | 'logs'
+  | 'settings';
+
+const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
+  { key: 'dashboard', label: '概览', icon: LayoutDashboard },
+  { key: 'accounts', label: '账号管理', icon: Users },
+  { key: 'checkin', label: '一键签到', icon: PlayCircle },
+  { key: 'credits', label: '积分看板', icon: Coins },
+  { key: 'logs', label: '运行日志', icon: ScrollText },
+  { key: 'settings', label: '设置', icon: Settings },
+];
+
+export default function Sidebar({
+  view,
+  onNav,
+}: {
+  view: ViewKey;
+  onNav: (v: ViewKey) => void;
+}) {
+  const invite = useAppStore((s) => s.pushToast);
+  const copyInvite = async () => {
+    try {
+      const r = await (await import('../lib/tauri')).api.misc.inviteLink();
+      await navigator.clipboard.writeText(r.url);
+      invite('success', '邀请链接已复制到剪贴板');
+    } catch (e) {
+      invite('error', `获取邀请链接失败：${String(e)}`);
+    }
+  };
+
+  return (
+    <aside className="flex w-52 shrink-0 flex-col border-r border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+      <nav className="flex-1 space-y-1 p-3">
+        {NAV.map((item) => {
+          const Icon = item.icon;
+          const active = view === item.key;
+          return (
+            <button
+              key={item.key}
+              onClick={() => onNav(item.key)}
+              className={cn(
+                'flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition',
+                active
+                  ? 'bg-brand-600 text-white'
+                  : 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800',
+              )}
+            >
+              <Icon size={17} />
+              {item.label}
+            </button>
+          );
+        })}
+      </nav>
+      <div className="border-t border-slate-200 p-3 dark:border-slate-800">
+        <button
+          onClick={copyInvite}
+          className="flex w-full items-center justify-center gap-2 rounded-lg bg-amber-500 px-3 py-2 text-sm font-medium text-white transition hover:bg-amber-400"
+        >
+          <Gift size={16} />
+          邀请得 5000 积分
+        </button>
+      </div>
+    </aside>
+  );
+}

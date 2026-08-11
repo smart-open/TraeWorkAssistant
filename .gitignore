@@ -1,0 +1,21 @@
+# Build
+dist/
+node_modules/
+src-tauri/target/
+
+# Logs
+*.log
+logs/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# WorkBuddy 自动产物（严禁提交）
+.workbuddy/
+
+# Python
+__pycache__/
+*.pyc
