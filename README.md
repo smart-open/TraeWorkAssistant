@@ -18,7 +18,7 @@ Trae Work 助手是面向 Windows 的桌面端应用，把「多账号签到 + �
 | 账号 | 列表 + 分组筛选 + 粘贴 JWT 手动添加 + 删除（含 TRAE Profile 清理） + 重置设备 ID + 切换账号登录态 + 实时刷新 |
 | 分组 | 新建/重命名/调色/删除，账号可自由分组或回落到未分组 |
 | 签到 | 全部 / 指定分组 / 手动勾选 + 跳过今日已签 + 跳过 JWT 过期 + 实时进度条（success/already/fail）|
-| 积分 | Top 8/Top 12 排行柱状图 + 列表 + 邀请得 5000 积分 |
+| 积分 | 今日新增 / 近 7 日趋势折线图 / 账号排行柱状图 + 明细列表（邀请入口移至侧栏底部「邀请得 5000 积分」） |
 | 日志 | 代理/签到/切换日志查询（关键字、类型） + 实时代理流 |
 | 设置 | 主题 / 端口 / 自动启代理 / 跳过策略 / 通知 / 语言 / Windows 计划任务 / 邀请链接 |
 | 切换 | 非交互 PowerShell 桥（关闭 TRAE → 备份 last → 恢复目标快照 → 重置 MachineGuid → 带代理启动 TRAE）|
@@ -61,7 +61,7 @@ trae-work-helper/
 │   │   ├── PageHeader.tsx
 │   │   └── ui.tsx                 # Card/Badge/Progress/Modal/EmptyState/StatCard/Spinner
 │   └── pages/
-│       ├── Dashboard.tsx          # 概览（统计 + 积分榜 + 邀请）
+│       ├── Dashboard.tsx          # 概览（统计 + 积分榜）
 │       ├── Accounts.tsx           # 账号 + 分组 + 添加（JWT 自动解析）
 │       ├── Checkin.tsx            # 一键签到（实时进度）
 │       ├── Credits.tsx            # 积分看板
@@ -165,7 +165,7 @@ npm run tauri build
 4. 在 Trae Work 中**切换不同账号**，每次都会触发代理捕获 JWT，写回 `checkin_accounts.json`。
 5. **账号管理**页确认账号列表、调整分组；过期 JWT 用 `jwt_parse` 自动判别（红/黄/绿）。
 6. **一键签到**页选择范围与跳过规则 -> 实时进度（success/already/fail）-> 完成 toast。
-7. **积分看板**查看排行 -> 一键复制邀请链接 -> 邀请新用户注册得 5000 积分。
+7. **积分看板**查看今日新增积分、近 7 日趋势与账号排行明细；需要邀请时，点左侧底部「邀请得 5000 积分」一键复制链接。
 8. **切换账号**：在「账号管理」行点击登录图标 -> PowerShell 桥执行「关闭 TRAE -> 备份 last -> 恢复快照 -> 重置 MachineGuid -> 带代理启动 TRAE」。
 9. **设置**页可注册 Windows 计划任务，在每天固定时间后台跑 Python 签到（无需打开应用）。
 
@@ -196,7 +196,7 @@ python src-python/tests/test_auto_checkin.py
 - 不支持 macOS / Linux（Tauri 2 可编译但本项目仅在 Windows 上验证代理证书与 MachineGuid 流程）。
 - 切换登录态依赖 PowerShell 5.1+（Win10/11 自带）。
 - 邀请链接固化在 Rust `INVITE_LINK` 常量：`https://www.trae.cn/work-fission/4CP3KDBT5W9A?utm_source=copy_link&utm_medium=friends_invite`（前端展示与复制均取自该常量，保证一致）。
-- 积分看板当前展示「积分总额 / 账号数 / 平均积分 / 账号排行」，需求中的「今日新增 / 近 7 日趋势」尚未实现（规划中）。
+- 积分看板已完整实现「积分总额 / 账号数 / 平均积分 / 今日新增积分」统计卡，并提供「近 7 日积分趋势」折线图与「账号积分排行」柱状图 + 明细列表；数据来自 `credits_history.json`（由签到脚本实时落盘，自动裁剪 90 天）。
 
 ---
 

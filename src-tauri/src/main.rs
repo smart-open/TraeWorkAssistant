@@ -53,6 +53,7 @@ fn main() {
             commands::misc::settings_get,
             commands::misc::settings_set,
             commands::misc::invite_link,
+            commands::misc::credits_history,
             commands::misc::task_register,
             commands::misc::task_status,
             commands::misc::task_unregister,

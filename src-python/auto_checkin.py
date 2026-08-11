@@ -106,6 +106,20 @@ def save_json(path, data):
         print(f"[警告] 写入 {path} 失败: {e}")
 
 
+def save_credits_history(user_id, credits, delta):
+    """把账号最新积分与本次新增写入 credits_history.json（按日期追加，自动裁剪到 90 天内）。
+    前端积分看板/趋势图消费此文件；此前该文件只被读取而从未写入，导致积分展示恒为 0。"""
+    path = os.path.join(DATA_DIR, "credits_history.json")
+    data = load_json(path, default={"records": []})
+    recs = data.get("records", [])
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    recs.append({"date": today, "user_id": user_id, "credits": credits, "delta": delta})
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
+    recs = [r for r in recs if r.get("date", "") >= cutoff]
+    data["records"] = recs
+    save_json(path, data)
+
+
 def extract_user_id(jwt):
     """从 JWT payload 里取 data.id，不校验签名。"""
     token = jwt
@@ -377,17 +391,22 @@ def main():
             })
             already += 1
             emit({"type": "account", "index": idx, "user_id": user_id, "name": name, "status": "already", "credits": credits_before})
+            save_credits_history(user_id, credits_before, 0)
             continue
         if not ok_s:
             print(f"  [WARN] status 预检失败 (code={code_s}) {msg_s} —— 仍尝试 claim")
 
         ok, msg, code = signin_with_retry(name, jwt, device_map, retry=args.retry)
         result = {"name": name, "ok": ok, "code": code, "message": msg, "action": "claim"}
+        final_credits: int | None = None
+        final_delta = 0
 
         if ok:
             ok2, _checked, credits_after, code2, msg2 = status_check(name, jwt, device_map)
             if ok2 and isinstance(credits_after, int) and isinstance(credits_before, int):
                 delta = credits_after - credits_before
+                final_credits = credits_after
+                final_delta = delta
                 result["credits_before"] = credits_before
                 result["credits_after"] = credits_after
                 result["credits_delta"] = delta
@@ -401,9 +420,13 @@ def main():
             else:
                 print(f"  [OK] 签到成功（积分复核失败 code={code2}，已忽略：{msg2}）")
                 result["action"] = "claim_ok"
+                final_credits = credits_after if isinstance(credits_after, int) else None
 
         results.append(result)
         print(f"  结果: {'成功' if ok else '失败'} (code={code}) {msg}")
+        # 落盘积分历史（供前端看板/趋势），并回传余额让实时进度不再显示「余额 ?」
+        if final_credits is not None:
+            save_credits_history(user_id, final_credits, final_delta)
         emit({
             "type": "account",
             "index": idx,
@@ -412,7 +435,8 @@ def main():
             "status": "success" if ok else "fail",
             "code": code,
             "message": msg,
-            "delta": result.get("credits_delta"),
+            "credits": final_credits,
+            "delta": final_delta if final_delta else None,
         })
         if ok:
             total_ok += 1

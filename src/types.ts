@@ -99,3 +99,10 @@ export interface CheckinDone {
   failed: number;
   total?: number;
 }
+
+export interface CreditRecord {
+  date: string;
+  user_id: string;
+  credits: number;
+  delta: number;
+}

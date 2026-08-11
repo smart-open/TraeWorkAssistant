@@ -7,6 +7,8 @@ use crate::models::{
     AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, Group, RawAccount,
     CreditsFile, CheckinSummary,
 };
+use std::collections::HashMap;
+
 use crate::state::AppState;
 
 #[tauri::command]
@@ -212,12 +214,25 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
             .unwrap_or_default();
         let info = jwt::parse(&a.jwt);
         let group_id = groups.membership.get(&uid).cloned();
-        let credits_val = credits
-            .records
-            .iter()
-            .filter(|r| r.user_id == uid)
-            .map(|r| r.credits)
-            .max();
+        // 取该账号最近日期的积分记录（credits_history.json 按日期追加，可能多条）；
+        // 同日期取较大值，跨日期取较新日期，避免展示历史峰值而非当前余额。
+        let credits_val = {
+            let mut best: Option<(String, i64)> = None;
+            for r in &credits.records {
+                if r.user_id != uid {
+                    continue;
+                }
+                match &best {
+                    None => best = Some((r.date.clone(), r.credits)),
+                    Some((d, c)) => {
+                        if r.date > *d || (r.date == *d && r.credits > *c) {
+                            best = Some((r.date.clone(), r.credits));
+                        }
+                    }
+                }
+            }
+            best.map(|(_, c)| c)
+        };
         let device_mask = device_map
             .get(&uid)
             .map(|d: &DeviceEntry| fs_utils::mask(&d.device_id));

@@ -5,7 +5,7 @@ use tauri::{AppHandle, State};
 
 use crate::fs_utils;
 use crate::jwt;
-use crate::models::{DeviceMap, Settings};
+use crate::models::{CreditRecord, CreditsFile, DeviceMap, Settings};
 use crate::state::AppState;
 
 pub const INVITE_LINK: &str =
@@ -133,6 +133,13 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
         }
     }
     fs_utils::write_json(&path, &current)
+}
+
+// ---------------- 积分历史（供看板/趋势图） ----------------
+
+#[tauri::command]
+pub fn credits_history(state: State<AppState>) -> Vec<CreditRecord> {
+    fs_utils::read_json::<CreditsFile>(&state.path("credits_history.json")).records
 }
 
 // ---------------- 邀请 ----------------

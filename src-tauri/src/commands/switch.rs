@@ -49,6 +49,7 @@ pub fn switch_account(
     // stdout 线程：NDJSON -> switch-progress 事件
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
+        let mut done_emitted = false;
         for line in reader.lines() {
             if let Ok(l) = line {
                 let l = l.trim().to_string();
@@ -59,14 +60,17 @@ pub fn switch_account(
                 // 检测 done / fatal 行，emit switch-done 事件
                 if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
                     let success = l.contains("\"stage\":\"done\"");
+                    done_emitted = true;
                     let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": l }));
                 }
             }
         }
         let exit_status = child.wait();
-        // 子进程结束后也 emit switch-done（防止 PS 脚本未输出 done/fatal 的边界情况）
-        let success = matches!(&exit_status, Ok(s) if s.success());
-        let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status) }));
+        // 仅当脚本未输出 done/fatal 时才在结束时兜底 emit，避免对同一次切换重复发两次 switch-done
+        if !done_emitted {
+            let success = matches!(&exit_status, Ok(s) if s.success());
+            let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status) }));
+        }
     });
 
     // stderr 线程：防止管道缓冲区写满导致子进程死锁

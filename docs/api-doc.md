@@ -32,6 +32,12 @@
 
 ### `accounts_list()` → `Account[]`
 - `Account`: `{ userId, name, groupId|null, jwtExpHours: number|null, checkedToday: boolean|null, credits: number|null, deviceIdMasked: string|null }`
+- `credits` 取 `credits_history.json` 中该账号**最新日期**的余额（非历史峰值），无记录时为 `null`。
+
+### `credits_history()` → `CreditRecord[]`
+- 返回积分历史明细（按日期聚合给看板绘图）。
+- `CreditRecord`: `{ date: string, user_id: string, credits: number, delta: number }`（`date` 为本地 `YYYY-MM-DD`；`credits`=当日余额，`delta`=当日新增）。
+- 数据源 `credits_history.json` 由 `auto_checkin.py` 在签到时按日期**追加落盘**（自动裁剪到 90 天）。
 
 ### `account_add_manual(name, jwt, groupId?)` → `{ ok, error? }`
 ### `account_delete(userId, deleteProfile)` → `{ ok, error? }`
@@ -81,6 +87,9 @@
 ```
 
 `status` 取值：`already`(已签) / `success` / `fail`。前端据此渲染进度与颜色。
+
+- 账号行附带 `credits`（签到后最新余额）与 `delta`（本次新增积分，仅 `success` 有值）。前端积分看板据此**实时刷新**余额与「今日新增」，无需等待 `done`。
+- 每次签到，`auto_checkin.py` 会把 `{date, user_id, credits, delta}` 追加写入 `credits_history.json`（已签/失败也写一行，delta 为 0），供 `credits_history()` 命令与看板趋势图读取。
 
 ## 9. 数据 DTO 关系
 

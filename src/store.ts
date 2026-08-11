@@ -5,6 +5,7 @@ import type {
   AccountView,
   CheckinAccountResult,
   CheckinDone,
+  CreditRecord,
   EnvStatus,
   GroupView,
   LogLine,
@@ -45,6 +46,7 @@ interface AppState {
   groups: GroupView[];
   settings: Settings | null;
   logs: LogLine[];
+  creditsHistory: CreditRecord[];
   proxyLog: string[];
   switchProgress: string[];
   checkin: CheckinState;
@@ -61,6 +63,7 @@ interface AppState {
   refreshGroups: () => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshLogs: (q?: LogQuery) => Promise<void>;
+  refreshCreditsHistory: () => Promise<void>;
 
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
@@ -89,6 +92,8 @@ interface AppState {
 }
 
 let toastSeq = 0;
+// 已注册的事件监听取消函数；StrictMode 下 init 会执行两次，靠它先注销旧监听避免重复注册
+let unsubs: Array<() => void> = [];
 
 function defaultSettings(): Settings {
   return {
@@ -118,13 +123,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   groups: [],
   settings: null,
   logs: [],
+  creditsHistory: [],
   proxyLog: [],
   switchProgress: [],
   checkin: { active: false, total: 0, index: 0, results: [], done: null },
   toasts: [],
 
   init: async () => {
-    await setupListeners({
+    // StrictMode 下 effect 会执行两次：先注销旧监听，避免重复注册导致事件触发两次（如 captured 重复 +1、toast 双发）
+    unsubs.forEach((u) => u());
+    unsubs = [];
+    unsubs = await setupListeners({
       onProxyLog: (line) =>
         set((s) => ({ proxyLog: [...s.proxyLog.slice(-199), line] })),
       onAccountCaptured: (uid) => {
@@ -159,6 +168,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().refreshAccounts(),
       get().refreshGroups(),
       get().refreshSettings(),
+      get().refreshCreditsHistory(),
     ]);
     set({ ready: true });
 
@@ -270,6 +280,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ logs });
     } catch (err) {
       get().pushToast('error', `读取日志失败：${String(err)}`);
+    }
+  },
+  refreshCreditsHistory: async () => {
+    try {
+      const creditsHistory = await api.misc.creditsHistory();
+      set({ creditsHistory });
+    } catch (err) {
+      get().pushToast('error', `读取积分历史失败：${String(err)}`);
     }
   },
 
