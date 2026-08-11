@@ -119,6 +119,42 @@ export default function Settings() {
         </section>
 
         <section className="card p-4">
+          <h3 className="mb-3 font-medium">通用与通知</h3>
+          <div className="space-y-3 text-sm">
+            <div>
+              <label className="label">通知方式</label>
+              <select
+                value={settings.notify}
+                onChange={(e) => update('notify', e.target.value)}
+                className="input"
+              >
+                <option value="toast">应用内 Toast</option>
+                <option value="system">系统通知</option>
+                <option value="both">Toast + 系统通知</option>
+                <option value="none">不通知</option>
+              </select>
+            </div>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={settings.launch_minimized}
+                onChange={(e) => update('launch_minimized', e.target.checked)}
+              />
+              启动时最小化到托盘
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={settings.tray}
+                onChange={(e) => update('tray', e.target.checked)}
+              />
+              启用系统托盘图标
+            </label>
+            <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
+          </div>
+        </section>
+
+        <section className="card p-4">
           <h3 className="mb-3 font-medium">代理与签到</h3>
           <div className="space-y-3 text-sm">
             <div>
@@ -163,6 +199,17 @@ export default function Settings() {
                 className="input w-24"
                 min={0}
                 max={5}
+              />
+            </div>
+            <div>
+              <label className="label">日志保留天数</label>
+              <input
+                type="number"
+                value={settings.log_retention_days}
+                onChange={(e) => update('log_retention_days', Number(e.target.value) || 30)}
+                className="input w-24"
+                min={1}
+                max={365}
               />
             </div>
           </div>

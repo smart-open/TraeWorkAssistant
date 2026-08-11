@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "主窗口默认权限：核心 API + 通知 + 对话框 + Shell",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "shell:default",
+    "dialog:default"
+  ]
+}

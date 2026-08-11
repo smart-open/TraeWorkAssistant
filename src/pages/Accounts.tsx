@@ -9,6 +9,7 @@ import {
   XCircle,
   AlertTriangle,
   HelpCircle,
+  KeyRound,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
@@ -40,6 +41,7 @@ export default function Accounts() {
   const moveAccount = useAppStore((s) => s.moveAccount);
   const resetDevice = useAppStore((s) => s.resetDevice);
   const switchTo = useAppStore((s) => s.switchTo);
+  const renewJwt = useAppStore((s) => s.renewJwt);
   const toast = useAppStore((s) => s.pushToast);
 
   const [filter, setFilter] = useState<string>('all');
@@ -162,6 +164,15 @@ export default function Accounts() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1">
+                        {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24) && (
+                          <button
+                            title="续期 JWT（启动代理并切换账号）"
+                            onClick={() => void renewJwt(a.user_id)}
+                            className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10"
+                          >
+                            <KeyRound size={14} />
+                          </button>
+                        )}
                         <button title="切换到此账号" onClick={() => void switchTo(a.user_id)} className="btn-ghost !p-2">
                           <LogIn size={14} />
                         </button>

@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Trae Work 助手",
         "width": 1180,
         "height": 760,

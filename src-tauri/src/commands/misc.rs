@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 
@@ -82,6 +81,11 @@ pub fn logs_query(state: State<AppState>, opts: LogsOpts) -> Vec<LogLine> {
         if let Ok(content) = std::fs::read_to_string(&p) {
             for raw in content.lines() {
                 let (time, msg) = split_time(raw);
+                if let Some(ref date) = opts.date {
+                    if !time.starts_with(date) {
+                        continue;
+                    }
+                }
                 if let Some(kw) = &opts.keyword {
                     if !msg.contains(kw) && !time.contains(kw) {
                         continue;
@@ -118,8 +122,18 @@ pub fn settings_get(state: State<AppState>) -> Settings {
 }
 
 #[tauri::command]
-pub fn settings_set(state: State<AppState>, patch: Settings) -> Result<(), String> {
-    fs_utils::write_json(&state.path("app_settings.json"), &patch)
+pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<(), String> {
+    let path = state.path("app_settings.json");
+    // 读取现有设置，合并 patch 中出现的字段（真正的 patch 语义）
+    let mut current: serde_json::Value = fs_utils::read_json(&path);
+    if let (Some(current_obj), Some(patch_obj)) =
+        (current.as_object_mut(), patch.as_object())
+    {
+        for (k, v) in patch_obj {
+            current_obj.insert(k.clone(), v.clone());
+        }
+    }
+    fs_utils::write_json(&path, &current)
 }
 
 // ---------------- 邀请 ----------------
@@ -144,8 +158,10 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
     let py = state.python_exe.clone();
     let script = state.python_dir.join("auto_checkin.py");
     let data_dir = state.data_dir.to_string_lossy().to_string();
+    // schtasks /TR 不会继承当前进程环境变量，需在命令行中显式设置 TRAEDATA_DIR
     let tr = format!(
-        "\"{}\" \"{}\"",
+        "cmd /c set TRAEDATA_DIR={}&\"{}\" \"{}\"",
+        data_dir,
         py.replace('\\', "/"),
         script.to_string_lossy().replace('\\', "/")
     );
@@ -165,7 +181,6 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
             "HIGHEST",
             "/F",
         ])
-        .env("TRAEDATA_DIR", &data_dir)
         .status()
         .map_err(|e| format!("注册计划任务失败: {e}"))?;
     if !status.success() {
@@ -190,7 +205,3 @@ pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), S
         .status();
     Ok(())
 }
-
-// 避免未使用的导入告警
-#[allow(dead_code)]
-fn _keep(_: HashMap<String, String>) {}

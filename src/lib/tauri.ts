@@ -101,11 +101,17 @@ export type CheckinProgressEvent =
   | CheckinAccountEvent
   | CheckinDoneEvent;
 
+export interface SwitchDoneEvent {
+  success: boolean;
+  raw: string;
+}
+
 export interface ListenerHandlers {
   onProxyLog?: (line: string) => void;
   onAccountCaptured?: (uid: string) => void;
   onCheckinProgress?: (e: CheckinProgressEvent) => void;
   onSwitchProgress?: (line: string) => void;
+  onSwitchDone?: (e: SwitchDoneEvent) => void;
 }
 
 export async function setupListeners(
@@ -135,6 +141,13 @@ export async function setupListeners(
     unsubs.push(
       await listen<string>('switch-progress', (e) =>
         handlers.onSwitchProgress!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onSwitchDone) {
+    unsubs.push(
+      await listen<SwitchDoneEvent>('switch-done', (e) =>
+        handlers.onSwitchDone!(e.payload),
       ),
     );
   }

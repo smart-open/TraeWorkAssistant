@@ -9,14 +9,9 @@ import {
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
+import type { ViewKey } from '../types';
 
-export type ViewKey =
-  | 'dashboard'
-  | 'accounts'
-  | 'checkin'
-  | 'credits'
-  | 'logs'
-  | 'settings';
+export type { ViewKey };
 
 const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'dashboard', label: '概览', icon: LayoutDashboard },

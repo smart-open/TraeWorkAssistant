@@ -52,9 +52,13 @@ pub fn checkin_start(
 
     let mut child = spawn_script(&state, "auto_checkin.py", &args, true)?;
     let stdout = child.stdout.take().ok_or("无法获取子进程输出")?;
+    let stderr = child.stderr.take();
     let data_dir = state.data_dir.clone();
     let app2 = app.clone();
 
+    crate::fs_utils::app_log(&state.data_dir, &format!("签到已启动: {} 个账号", uids.len()));
+
+    // stdout 线程：NDJSON 解析 -> 事件 emit + 日志追加
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         let log_path = data_dir.join("logs").join("checkin.log");
@@ -84,5 +88,27 @@ pub fn checkin_start(
         }
         let _ = child.wait();
     });
+
+    // stderr 线程：防止管道缓冲区写满导致子进程死锁
+    if let Some(stderr) = stderr {
+        let data_dir2 = state.data_dir.clone();
+        std::thread::spawn(move || {
+            let log_path = data_dir2.join("logs").join("checkin.log");
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(l) = line {
+                    let l = format!("[stderr] {}", l.trim());
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path)
+                    {
+                        let _ = writeln!(f, "[{}] {}", crate::fs_utils::now_ts(), l);
+                    }
+                }
+            }
+        });
+    }
+
     Ok(())
 }

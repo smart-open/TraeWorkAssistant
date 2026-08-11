@@ -29,6 +29,7 @@ import threading
 import base64
 import random
 import uuid
+import hashlib
 import datetime
 import http.client
 
@@ -49,6 +50,7 @@ AUTO_CAPTURE_JWT = os.environ.get("AUTO_CAPTURE_JWT", "1") not in ("0", "false",
 
 # ---------------- 日志 ----------------
 _log_lock = threading.Lock()
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 _logf = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
 
 def log(*a):
@@ -84,19 +86,41 @@ def save_map():
     except Exception as e:
         log("保存映射失败:", e)
 
-def rand_digits(n):
-    return "".join(random.choice("0123456789") for _ in range(n))
+def _normalize_seed(seed):
+    """将任意 seed 归一为稳定 int（与 auto_checkin.py 完全一致）。"""
+    if isinstance(seed, int):
+        return seed & 0x7FFFFFFFFFFFFFFF
+    if isinstance(seed, str):
+        if seed.isdigit():
+            return int(seed) & 0x7FFFFFFFFFFFFFFF
+        return int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16) & 0x7FFFFFFFFFFFFFFF
+    return seed
 
-def rand_hex(n):
-    return "".join(random.choice("0123456789abcdef") for _ in range(n))
+
+def _stable_rng(seed):
+    """基于 seed 的稳定随机数生成器（与 auto_checkin.py 保持一致）。"""
+    return random.Random(_normalize_seed(seed))
+
+
+def rand_digits(n, seed=None):
+    if seed is None:
+        return "".join(random.choice("0123456789") for _ in range(n))
+    return "".join(_stable_rng(seed).choice("0123456789") for _ in range(n))
+
+
+def rand_hex(n, seed=None):
+    if seed is None:
+        return "".join(random.choice("0123456789abcdef") for _ in range(n))
+    return "".join(_stable_rng(seed).choice("0123456789abcdef") for _ in range(n))
+
 
 def get_device_for(user_id):
     with _map_lock:
         if user_id not in _device_map:
             _device_map[user_id] = {
-                "device_id": rand_digits(15),
-                "market_user_id": str(uuid.uuid4()),
-                "session_id": rand_hex(64),
+                "device_id": rand_digits(15, seed=user_id),
+                "market_user_id": str(uuid.UUID(int=_stable_rng(user_id).getrandbits(128))),
+                "session_id": rand_hex(64, seed=user_id),
                 "created": datetime.datetime.now().isoformat(timespec="seconds"),
             }
             save_map()

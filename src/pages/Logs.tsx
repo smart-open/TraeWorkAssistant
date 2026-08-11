@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { RefreshCw, Search, Trash2 } from 'lucide-react';
+import { RefreshCw, Search, Trash2, Download } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState } from '../components/ui';
 import { useAppStore } from '../store';
@@ -27,14 +27,39 @@ export default function Logs() {
 
   const [type, setType] = useState('all');
   const [kw, setKw] = useState('');
+  const [date, setDate] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(true);
 
   useEffect(() => {
-    void refreshLogs({ logType: type, keyword: kw || undefined });
-  }, [type, refreshLogs]);
+    void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined });
+  }, [type, date, refreshLogs]);
+
+  // D5：autoRefresh 勾选时按当前过滤条件定时刷新日志；取消或卸载时清理
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const id = setInterval(() => {
+      void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined });
+    }, 2000);
+    return () => clearInterval(id);
+  }, [autoRefresh, type, date, kw, refreshLogs]);
 
   const onSearch = () => {
-    void refreshLogs({ logType: type, keyword: kw || undefined });
+    void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined });
+  };
+
+  const exportLogs = () => {
+    if (logs.length === 0) return;
+    const header = '时间\t类型\t内容\n';
+    const body = logs
+      .map((l) => `${l.time}\t${l.log_type}\t${l.message}`)
+      .join('\n');
+    const blob = new Blob(['\ufeff' + header + body], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `trae-logs-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -53,12 +78,15 @@ export default function Logs() {
             </button>
             <button
               onClick={() => {
-                void refreshLogs({ logType: type, keyword: kw || undefined });
+                void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined });
                 void refreshAccounts();
               }}
               className="btn-outline"
             >
               <RefreshCw size={15} /> 刷新
+            </button>
+            <button onClick={exportLogs} disabled={logs.length === 0} className="btn-outline">
+              <Download size={15} /> 导出
             </button>
           </>
         }
@@ -82,6 +110,12 @@ export default function Logs() {
                 <option key={t.v} value={t.v}>{t.label}</option>
               ))}
             </select>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="input !py-1.5 !text-xs w-36"
+            />
             <input
               value={kw}
               onChange={(e) => setKw(e.target.value)}

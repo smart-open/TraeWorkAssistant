@@ -48,7 +48,7 @@ MAP_FILE = os.path.join(DATA_DIR, "device_map.json")
 SIGNIN_URL = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim"
 STATUS_URL = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status"
 EXPIRY_WARN_HOURS = 24  # JWT 剩余有效期低于该值时发出告警
-LOG_FILE = os.path.join(DATA_DIR, "checkin_log.txt")
+LOG_FILE = os.path.join(DATA_DIR, "logs", "checkin.log")
 
 # 伪随机但稳定的生成器，保证同一 user_id 在 device_map.json 缺失时也能复现相同 ID
 # 注意：random.Random 是有状态的，必须「每次调用新建」才能保证同 seed 恒等输出，

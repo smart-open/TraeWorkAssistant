@@ -96,6 +96,7 @@ trae-work-helper/
 | `account-captured` | `string`（新捕获的 userId） |
 | `checkin-progress` | `{type:'start',total}` / `{type:'account',index,user_id,name,status:'already'\|'success'\|'fail',credits?,delta?,elapsed?,code?,message?}` / `{type:'done',ok,already,failed,total?}` |
 | `switch-progress` | `string`（PowerShell NDJSON 单行） |
+| `switch-done` | `{ success: boolean, raw: string }`（切换完成/失败终止信号，供前端给出完成提示） |
 
 ## 7. 数据文件
 

@@ -17,8 +17,9 @@ pub fn parse(jwt_full: &str) -> JwtInfo {
             exp_hours: None,
         };
     }
-    let pad = format!("{}{}", parts[1], "=".repeat(parts[1].len() % 4));
-    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(pad) else {
+    // padding 与 Python 一致：(4 - len % 4) % 4
+    let pad = format!("{}{}", parts[1], "=".repeat((4 - parts[1].len() % 4) % 4));
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&pad) else {
         return JwtInfo {
             user_id: None,
             exp_hours: None,

@@ -28,6 +28,7 @@ export default function Dashboard() {
   const proxy = useAppStore((s) => s.proxy);
   const certInstalled = useAppStore((s) => s.certInstalled);
   const startProxy = useAppStore((s) => s.startProxy);
+  const setView = useAppStore((s) => s.setView);
   const toast = useAppStore((s) => s.pushToast);
 
   const total = accounts.length;
@@ -89,9 +90,9 @@ export default function Dashboard() {
                 <Power size={15} /> 启动代理
               </button>
             ) : (
-              <a className="btn-primary" href="#/checkin">
+              <button onClick={() => setView('checkin')} className="btn-primary">
                 <PlayCircle size={15} /> 立即签到
-              </a>
+              </button>
             )}
           </>
         }
@@ -103,7 +104,7 @@ export default function Dashboard() {
         <StatCard
           label="代理状态"
           value={proxy.running ? `运行 :${proxy.port}` : '未启动'}
-          hint={proxy.started_at ? `启动于 ${new Date(proxy.started_at * 1000).toLocaleTimeString()}` : undefined}
+          hint={proxy.started_at != null ? `已捕获 ${proxy.captured} 个 · 启动于 ${new Date(proxy.started_at * 1000).toLocaleTimeString()}` : undefined}
           tone={proxy.running ? 'green' : 'slate'}
         />
         <StatCard

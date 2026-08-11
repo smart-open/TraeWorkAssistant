@@ -46,3 +46,18 @@ pub fn now_ts() -> String {
 pub fn today_prefix() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
+
+/// 追加一行到 data_dir/logs/app.log，用于托盘/通知等关键路径排查。
+pub fn app_log(data_dir: &Path, msg: &str) {
+    let log_path = data_dir.join("logs").join("app.log");
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = writeln!(f, "[{}] {}", now_ts(), msg);
+    }
+}

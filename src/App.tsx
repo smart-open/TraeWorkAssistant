@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import TitleBar from './components/TitleBar';
-import Sidebar, { type ViewKey } from './components/Sidebar';
+import Sidebar from './components/Sidebar';
 import TopBar from './components/TopBar';
 import Toaster from './components/Toaster';
 import { useAppStore } from './store';
@@ -11,7 +11,7 @@ import Credits from './pages/Credits';
 import Logs from './pages/Logs';
 import Settings from './pages/Settings';
 
-function renderView(view: ViewKey) {
+function renderView(view: string) {
   switch (view) {
     case 'dashboard':
       return <Dashboard />;
@@ -29,7 +29,8 @@ function renderView(view: ViewKey) {
 }
 
 export default function App() {
-  const [view, setView] = useState<ViewKey>('dashboard');
+  const view = useAppStore((s) => s.view);
+  const setView = useAppStore((s) => s.setView);
   const init = useAppStore((s) => s.init);
   const settings = useAppStore((s) => s.settings);
 

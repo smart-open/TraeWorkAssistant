@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { sendNotification } from '@tauri-apps/plugin-notification';
 import { api, setupListeners, type CheckinProgressEvent } from './lib/tauri';
 import type {
   AccountView,
@@ -9,6 +10,7 @@ import type {
   LogLine,
   ProxyStatus,
   Settings,
+  ViewKey,
 } from './types';
 
 export type ToastKind = 'info' | 'success' | 'error' | 'warn';
@@ -35,6 +37,7 @@ export interface LogQuery {
 
 interface AppState {
   ready: boolean;
+  view: ViewKey;
   env: EnvStatus | null;
   certInstalled: boolean;
   proxy: ProxyStatus;
@@ -48,6 +51,7 @@ interface AppState {
   toasts: Toast[];
 
   init: () => Promise<void>;
+  setView: (v: ViewKey) => void;
   applyCheckinEvent: (e: CheckinProgressEvent) => void;
 
   refreshEnv: () => Promise<void>;
@@ -71,6 +75,7 @@ interface AppState {
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
   switchTo: (userId: string) => Promise<void>;
+  renewJwt: (userId: string) => Promise<void>;
   startCheckin: (opts: {
     scope: string;
     user_ids?: string[];
@@ -105,6 +110,7 @@ function defaultSettings(): Settings {
 
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
+  view: 'dashboard',
   env: null,
   certInstalled: false,
   proxy: { running: false, port: 0, captured: 0, started_at: null },
@@ -122,12 +128,29 @@ export const useAppStore = create<AppState>((set, get) => ({
       onProxyLog: (line) =>
         set((s) => ({ proxyLog: [...s.proxyLog.slice(-199), line] })),
       onAccountCaptured: (uid) => {
+        // 事件驱动累加捕获数（后端 Arc<AtomicI64> 的实时镜像，避免轮询）
+        set((s) => ({ proxy: { ...s.proxy, captured: s.proxy.captured + 1 } }));
         get().pushToast('success', `已捕获账号 ${uid}`);
         void get().refreshAccounts();
       },
       onCheckinProgress: (e) => get().applyCheckinEvent(e),
       onSwitchProgress: (line) =>
         set((s) => ({ switchProgress: [...s.switchProgress.slice(-49), line] })),
+      // D2：订阅后端 switch-done，给用户明确的切换完成/失败信号
+      onSwitchDone: (e) => {
+        set((s) => ({
+          switchProgress: [
+            ...s.switchProgress.slice(-49),
+            e.success ? '[完成] 登录态切换成功' : '[失败] 登录态切换未完成，请查看日志',
+          ],
+        }));
+        get().pushToast(
+          e.success ? 'success' : 'error',
+          e.success ? '登录态切换完成' : '登录态切换失败，请查看日志',
+        );
+        void get().refreshAccounts();
+        void get().refreshProxy();
+      },
     });
     await Promise.all([
       get().refreshEnv(),
@@ -138,7 +161,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().refreshSettings(),
     ]);
     set({ ready: true });
+
+    // 启动时根据设置自动开启代理
+    const s = get();
+    if (!s.proxy.running && s.settings?.auto_start_proxy) {
+      void s.startProxy();
+    }
   },
+
+  setView: (v) => set({ view: v }),
 
   applyCheckinEvent: (e) => {
     set((s) => {
@@ -332,6 +363,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `切换失败：${String(err)}`);
     }
   },
+  renewJwt: async (userId) => {
+    try {
+      // 若代理未运行则先启动
+      if (!get().proxy.running) {
+        get().pushToast('info', '正在启动代理以续期 JWT…');
+        await get().startProxy();
+      }
+      // 切换到目标账号，TRAE 重启后走代理，新 JWT 会被自动捕获
+      get().pushToast('info', '正在切换账号以捕获新 JWT，请稍候…');
+      await api.switchAccount(userId);
+    } catch (err) {
+      get().pushToast('error', `续期失败：${String(err)}`);
+    }
+  },
   startCheckin: async (opts) => {
     try {
       await api.checkin.start(opts);
@@ -351,9 +396,27 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   pushToast: (kind, msg) => {
-    const id = ++toastSeq;
-    set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }));
-    setTimeout(() => get().dismissToast(id), 4200);
+    const mode = get().settings?.notify ?? 'toast';
+    if (mode === 'none') {
+      console.debug('[notify] 已跳过（mode=none）:', kind, msg);
+      return;
+    }
+
+    if (mode === 'toast' || mode === 'both') {
+      const id = ++toastSeq;
+      set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }));
+      setTimeout(() => get().dismissToast(id), 4200);
+    }
+
+    if (mode === 'system' || mode === 'both') {
+      // sendNotification v2 返回 void（fire-and-forget），用 try-catch 防御同步异常
+      try {
+        sendNotification({ title: 'Trae Work 助手', body: msg });
+        console.debug('[notify] 系统通知已发送:', msg);
+      } catch (e) {
+        console.warn('[notify] sendNotification 异常:', e);
+      }
+    }
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 }));

@@ -1,16 +1,26 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, State};
 
+use crate::fs_utils;
 use crate::state::AppState;
 
 pub struct ProxyHandle {
     pub child: Child,
     pub port: u16,
     pub started_at: i64,
+    pub captured: Arc<AtomicI64>,
+}
+
+impl Drop for ProxyHandle {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -28,6 +38,11 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 安全获取 Mutex 锁，即使中毒也能恢复（避免 panic 级联）。
+fn safe_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[tauri::command]
 pub fn proxy_start(
     app: AppHandle,
@@ -36,7 +51,7 @@ pub fn proxy_start(
     port: u16,
 ) -> Result<ProxyStatus, String> {
     {
-        let guard = proxy_state.lock().unwrap();
+        let guard = safe_lock(&proxy_state);
         if guard.is_some() {
             return Err("代理已在运行".into());
         }
@@ -60,17 +75,28 @@ pub fn proxy_start(
     let stderr = child.stderr.take();
 
     let started_at = now_secs();
+    let captured = Arc::new(AtomicI64::new(0));
     {
-        let mut g = proxy_state.lock().unwrap();
+        let mut g = safe_lock(&proxy_state);
         *g = Some(ProxyHandle {
             child,
             port,
             started_at,
+            captured: captured.clone(),
         });
     }
 
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!("代理已启动: port={port}, pid 已归入 ProxyHandle"),
+    );
+
     let app_for_thread = app.clone();
     let data_dir2 = data_dir.clone();
+    let data_dir3 = data_dir.clone();
+    let captured_thread = captured.clone();
+
+    // stdout 线程：逐行读取 -> 事件 emit + 日志追加
     std::thread::spawn(move || {
         let log_path = std::path::Path::new(&data_dir2).join("logs").join("proxy.log");
         if let Some(parent) = log_path.parent() {
@@ -85,13 +111,28 @@ pub fn proxy_start(
                 }
                 let _ = app_for_thread.emit("proxy-log", &l);
                 if let Some(uid) = extract_uid(&l) {
+                    captured_thread.fetch_add(1, Ordering::Relaxed);
                     let _ = app_for_thread.emit("account-captured", &uid);
                 }
                 let _ = append_log(&log_path, &l);
             }
         }
-        drop(stderr);
     });
+
+    // stderr 线程：单独读取，防止管道缓冲区写满导致子进程死锁
+    if let Some(stderr) = stderr {
+        std::thread::spawn(move || {
+            let log_path =
+                std::path::Path::new(&data_dir3).join("logs").join("proxy.log");
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(l) = line {
+                    let l = format!("[stderr] {}", l.trim());
+                    let _ = append_log(&log_path, &l);
+                }
+            }
+        });
+    }
 
     Ok(ProxyStatus {
         running: true,
@@ -104,22 +145,23 @@ pub fn proxy_start(
 #[tauri::command]
 pub fn proxy_stop(
     _app: AppHandle,
-    _state: State<AppState>,
+    state: State<AppState>,
     proxy_state: State<Mutex<Option<ProxyHandle>>>,
 ) -> Result<ProxyStatus, String> {
-    let mut g = proxy_state.lock().unwrap();
-    let port = match &*g {
-        Some(h) => h.port,
-        None => 0,
+    let mut g = safe_lock(&proxy_state);
+    let (port, captured) = match &*g {
+        Some(h) => (h.port, h.captured.load(Ordering::Relaxed)),
+        None => (0, 0),
     };
-    if let Some(mut h) = g.take() {
-        let _ = h.child.kill();
-        let _ = h.child.wait();
+    if let Some(h) = g.take() {
+        let c = h.captured.load(Ordering::Relaxed);
+        fs_utils::app_log(&state.data_dir, &format!("代理已停止: 共捕获 {c} 个账号"));
+        // h 在此处 drop，Drop trait 会 kill + wait 子进程
     }
     Ok(ProxyStatus {
         running: false,
         port,
-        captured: 0,
+        captured,
         started_at: None,
     })
 }
@@ -130,12 +172,12 @@ pub fn proxy_status(
     _state: State<AppState>,
     proxy_state: State<Mutex<Option<ProxyHandle>>>,
 ) -> ProxyStatus {
-    let g = proxy_state.lock().unwrap();
+    let g = safe_lock(&proxy_state);
     match &*g {
         Some(h) => ProxyStatus {
             running: true,
             port: h.port,
-            captured: 0,
+            captured: h.captured.load(Ordering::Relaxed),
             started_at: Some(h.started_at),
         },
         None => ProxyStatus {
@@ -149,17 +191,27 @@ pub fn proxy_status(
 
 fn extract_uid(line: &str) -> Option<String> {
     // 形如 "...user=4487568582777872..." 或 "user_id=..."
-    let idx = line.find("user=").or_else(|| line.find("user_id="))?;
-    let rest = &line[idx + 5..];
-    let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '_'))
-        .unwrap_or(rest.len());
-    let uid = &rest[..end];
-    if uid.chars().all(|c| c.is_ascii_digit()) && !uid.is_empty() {
-        Some(uid.to_string())
-    } else {
-        None
+    if let Some(idx) = line.find("user=") {
+        let rest = &line[idx + 5..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '_'))
+            .unwrap_or(rest.len());
+        let uid = &rest[..end];
+        if uid.chars().all(|c| c.is_ascii_digit()) && !uid.is_empty() {
+            return Some(uid.to_string());
+        }
     }
+    if let Some(idx) = line.find("user_id=") {
+        let rest = &line[idx + 8..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '_'))
+            .unwrap_or(rest.len());
+        let uid = &rest[..end];
+        if uid.chars().all(|c| c.is_ascii_digit()) && !uid.is_empty() {
+            return Some(uid.to_string());
+        }
+    }
+    None
 }
 
 fn append_log(path: &std::path::Path, line: &str) {

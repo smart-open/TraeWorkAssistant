@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
@@ -152,12 +150,7 @@ pub fn group_update(
 pub fn group_delete(state: State<AppState>, id: String) -> Result<(), String> {
     let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
     groups.groups.retain(|g| g.id != id);
-    for v in groups.membership.values_mut() {
-        if *v == id {
-            *v = String::new();
-        }
-    }
-    groups.membership.retain(|_, v| !v.is_empty());
+    groups.membership.retain(|_, v| *v != id);
     fs_utils::write_json(&state.path("groups.json"), &groups)?;
     Ok(())
 }
@@ -267,7 +260,3 @@ pub fn resolve_user_ids(
         _ => Err("未知的执行范围".into()),
     }
 }
-
-// 让未使用的 HashMap 导入在严格编译下不告警（membership 使用）。
-#[allow(dead_code)]
-fn _unused(_: HashMap<String, String>) {}
