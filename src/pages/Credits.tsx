@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useEffect, useState } from 'react';
 import {
   BarChart,
   Bar,
@@ -28,6 +28,14 @@ export default function Credits() {
   );
   const total = rows.reduce((s, a) => s + (a.credits ?? 0), 0);
   const avg = rows.length === 0 ? 0 : Math.round(total / rows.length);
+
+  const [inviteUrl, setInviteUrl] = useState('');
+  useEffect(() => {
+    api.misc
+      .inviteLink()
+      .then((r) => setInviteUrl(r.url))
+      .catch(() => setInviteUrl(''));
+  }, []);
 
   const invite = async () => {
     try {
@@ -87,7 +95,7 @@ export default function Credits() {
             <Copy size={15} /> 复制邀请链接
           </button>
           <div className="mt-3 break-all rounded-lg bg-slate-100 p-2 text-xs text-slate-500 dark:bg-slate-800">
-            https://www.trae.cn/work-fission/4CP3KDBT5W9A
+            {inviteUrl || '加载邀请链接中…'}
           </div>
         </div>
       </div>

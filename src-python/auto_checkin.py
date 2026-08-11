@@ -39,6 +39,7 @@ import socket
 import gzip
 import zlib
 import argparse
+import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 # 数据目录：优先 TRAEDATA_DIR（由桌面端注入），否则回退到脚本目录（保持独立可用性）
@@ -260,6 +261,20 @@ def signin(name, jwt, device_map, timeout=30):
         return False, f"HTTP {status}: 非 JSON 响应: {body[:200]}", status if status else None
 
 
+def signin_with_retry(name, jwt, device_map, timeout=30, retry=0):
+    """对单个账号执行签到；仅网络层异常（code 为 None）按 retry 次数重试，业务失败不重试。"""
+    last = (False, "无重试", None)
+    for attempt in range(retry + 1):
+        ok, msg, code = signin(name, jwt, device_map, timeout)
+        if ok or code is not None:
+            return ok, msg, code
+        last = (ok, msg, code)
+        if attempt < retry:
+            print(f"  [重试] 第 {attempt + 1} 次签到网络异常，1s 后重试…")
+            time.sleep(1)
+    return last
+
+
 # ----------------- NDJSON 输出（--json-stream） -----------------
 _JSON_STREAM = False
 
@@ -275,6 +290,7 @@ def main():
     parser.add_argument("--json-stream", action="store_true", help="以 NDJSON 输出每账号结果")
     parser.add_argument("--accounts", default="", help="仅签指定 UserID（逗号分隔）")
     parser.add_argument("--scope", default="all", help="兼容参数（all|group:<id>）")
+    parser.add_argument("--retry", type=int, default=0, help="签到网络失败时的重试次数")
     args = parser.parse_args()
     _JSON_STREAM = args.json_stream
     target_uids = (
@@ -365,7 +381,7 @@ def main():
         if not ok_s:
             print(f"  [WARN] status 预检失败 (code={code_s}) {msg_s} —— 仍尝试 claim")
 
-        ok, msg, code = signin(name, jwt, device_map)
+        ok, msg, code = signin_with_retry(name, jwt, device_map, retry=args.retry)
         result = {"name": name, "ok": ok, "code": code, "message": msg, "action": "claim"}
 
         if ok:

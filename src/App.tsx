@@ -39,13 +39,16 @@ export default function App() {
   }, [init]);
 
   useEffect(() => {
-    const theme = settings?.theme ?? 'system';
-    const dark =
-      theme === 'dark' ||
-      (theme === 'system' &&
-        window.matchMedia('(prefers-color-scheme: dark)').matches);
-    document.documentElement.classList.toggle('dark', dark);
-  }, [settings?.theme]);
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const apply = () => {
+      const theme = useAppStore.getState().settings?.theme ?? 'system';
+      const dark = theme === 'dark' || (theme === 'system' && mq.matches);
+      document.documentElement.classList.toggle('dark', dark);
+    };
+    apply();
+    mq.addEventListener('change', apply);
+    return () => mq.removeEventListener('change', apply);
+  }, []);
 
   return (
     <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-slate-950 dark:text-slate-100">

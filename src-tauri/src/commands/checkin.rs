@@ -44,10 +44,15 @@ pub fn checkin_start(
         });
     }
     let accounts_arg = uids.join(",");
+    let retry = state.settings().retry.max(0) as u32;
     let mut args = vec!["--json-stream".to_string()];
     if !accounts_arg.is_empty() {
         args.push("--accounts".to_string());
         args.push(accounts_arg);
+    }
+    if retry > 0 {
+        args.push("--retry".to_string());
+        args.push(retry.to_string());
     }
 
     let mut child = spawn_script(&state, "auto_checkin.py", &args, true)?;

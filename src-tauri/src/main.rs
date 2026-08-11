@@ -60,6 +60,11 @@ fn main() {
         .setup(|app| {
             let state = app.state::<AppState>();
             let settings = state.settings();
+
+            // 启动期日志清理：按 log_retention_days 丢弃过期日志行（消费设置项，避免无限增长）
+            let retention = settings.log_retention_days.max(0) as u64;
+            fs_utils::trim_logs(&state.data_dir, retention);
+
             fs_utils::app_log(
                 &state.data_dir,
                 &format!(

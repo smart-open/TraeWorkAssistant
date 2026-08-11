@@ -14,6 +14,7 @@ export default function Settings() {
   const [time, setTime] = useState('09:00');
   const [taskInfo, setTaskInfo] = useState<string>('');
   const [busyTask, setBusyTask] = useState(false);
+  const [inviteUrl, setInviteUrl] = useState('');
 
   useEffect(() => {
     void refreshSettings();
@@ -30,11 +31,19 @@ export default function Settings() {
     try {
       const r = await api.misc.inviteLink();
       await navigator.clipboard.writeText(r.url);
+      setInviteUrl(r.url);
       toast('success', '邀请链接已复制');
     } catch (e) {
       toast('error', `复制失败：${String(e)}`);
     }
   };
+
+  useEffect(() => {
+    api.misc
+      .inviteLink()
+      .then((r) => setInviteUrl(r.url))
+      .catch(() => setInviteUrl(''));
+  }, []);
 
   const register = async () => {
     setBusyTask(true);
@@ -255,7 +264,7 @@ export default function Settings() {
             <Gift size={15} /> 复制邀请链接
           </button>
           <div className="mt-2 break-all rounded bg-slate-100 p-2 text-xs text-slate-500 dark:bg-slate-800">
-            https://www.trae.cn/work-fission/4CP3KDBT5W9A
+            {inviteUrl || '加载邀请链接中…'}
           </div>
         </section>
 

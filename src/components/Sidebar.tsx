@@ -29,14 +29,14 @@ export default function Sidebar({
   view: ViewKey;
   onNav: (v: ViewKey) => void;
 }) {
-  const invite = useAppStore((s) => s.pushToast);
+  const pushToast = useAppStore((s) => s.pushToast);
   const copyInvite = async () => {
     try {
       const r = await (await import('../lib/tauri')).api.misc.inviteLink();
       await navigator.clipboard.writeText(r.url);
-      invite('success', '邀请链接已复制到剪贴板');
+      pushToast('success', '邀请链接已复制到剪贴板');
     } catch (e) {
-      invite('error', `获取邀请链接失败：${String(e)}`);
+      pushToast('error', `获取邀请链接失败：${String(e)}`);
     }
   };
 

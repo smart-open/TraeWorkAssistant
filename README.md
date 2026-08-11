@@ -141,7 +141,7 @@ npm run tauri dev
 1. Vite 5173 -> Tauri WebView 加载；
 2. Rust 主进程创建 `%APPDATA%\TraeWorkAssistant`；
 3. 注册表 / 文件路径探测 Trae.exe；
-4. 自动加载 `settings.json`（首次为空，使用默认值）。
+4. 自动加载 `app_settings.json`（首次为空，使用默认值）。
 
 ### 打包
 
@@ -195,7 +195,8 @@ python src-python/tests/test_auto_checkin.py
 
 - 不支持 macOS / Linux（Tauri 2 可编译但本项目仅在 Windows 上验证代理证书与 MachineGuid 流程）。
 - 切换登录态依赖 PowerShell 5.1+（Win10/11 自带）。
-- 邀请链接为 `https://www.trae.cn/work-fission/4CP3KDBT5W9A`，固化在 Rust `INVITE_LINK` 常量。
+- 邀请链接固化在 Rust `INVITE_LINK` 常量：`https://www.trae.cn/work-fission/4CP3KDBT5W9A?utm_source=copy_link&utm_medium=friends_invite`（前端展示与复制均取自该常量，保证一致）。
+- 积分看板当前展示「积分总额 / 账号数 / 平均积分 / 账号排行」，需求中的「今日新增 / 近 7 日趋势」尚未实现（规划中）。
 
 ---
 

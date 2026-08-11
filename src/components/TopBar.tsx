@@ -16,13 +16,13 @@ export default function TopBar() {
   const proxy = useAppStore((s) => s.proxy);
   const startProxy = useAppStore((s) => s.startProxy);
   const stopProxy = useAppStore((s) => s.stopProxy);
-  const openSite = useAppStore((s) => s.pushToast);
+  const pushToast = useAppStore((s) => s.pushToast);
 
   const openTrae = async () => {
     try {
       await (await import('../lib/tauri')).api.env.openSite();
     } catch (e) {
-      openSite('error', `打开官网失败：${String(e)}`);
+      pushToast('error', `打开官网失败：${String(e)}`);
     }
   };
 

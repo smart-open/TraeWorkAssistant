@@ -47,6 +47,42 @@ pub fn today_prefix() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// 按保留天数清理日志文件（proxy / checkin / switcher）。
+/// 仅丢弃带 `[YYYY-MM-DD` 前缀且日期早于 cutoff 的行；无日期前缀的行（如部分外部脚本输出）一律保留。
+/// 任何错误静默忽略——日志清理失败不应影响主流程。
+pub fn trim_logs(data_dir: &Path, retention_days: u64) {
+    if retention_days == 0 {
+        return;
+    }
+    let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(retention_days as i64);
+    let logs_dir = data_dir.join("logs");
+    for name in ["proxy.log", "checkin.log", "switcher.log"] {
+        let p = logs_dir.join(name);
+        let content = match fs::read_to_string(&p) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut kept: Vec<&str> = Vec::new();
+        for line in content.lines() {
+            let date_part = line.strip_prefix('[').and_then(|s| s.get(..10));
+            let drop = if let Some(d) = date_part {
+                chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                    .map(|parsed| parsed < cutoff)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if !drop {
+                kept.push(line);
+            }
+        }
+        let new_content = kept.join("\n");
+        if new_content != content {
+            let _ = fs::write(&p, new_content);
+        }
+    }
+}
+
 /// 追加一行到 data_dir/logs/app.log，用于托盘/通知等关键路径排查。
 pub fn app_log(data_dir: &Path, msg: &str) {
     let log_path = data_dir.join("logs").join("app.log");
