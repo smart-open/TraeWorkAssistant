@@ -62,6 +62,18 @@ export default function Dashboard() {
     toast('success', '已刷新');
   };
 
+  const openTrae = async () => {
+    try {
+      if (env?.installed) {
+        await api.env.openApp();
+      } else {
+        await api.env.openSite();
+      }
+    } catch (e) {
+      toast('error', `打开 Trae 失败：${String(e)}`);
+    }
+  };
+
   return (
     <div className="animate-fade-in">
       <PageHeader
@@ -101,10 +113,10 @@ export default function Dashboard() {
             </div>
           </div>
           <button
-            onClick={() => api.env.openSite()}
+            onClick={() => void openTrae()}
             className="btn-outline"
           >
-            <ExternalLink size={15} /> 前往下载
+            <ExternalLink size={15} /> {env?.installed ? '打开 Trae' : '前往下载'}
           </button>
         </div>
       )}

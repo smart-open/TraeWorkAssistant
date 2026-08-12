@@ -18,6 +18,7 @@ export const api = {
   env: {
     check: () => invoke<EnvStatus>('env_check'),
     openSite: () => invoke('open_trae_website'),
+    openApp: () => invoke('open_trae_app'),
   },
   cert: {
     status: () => invoke<{ installed: boolean }>('cert_status'),

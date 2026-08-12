@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { CheckCircle2, Circle, ChevronRight } from 'lucide-react';
+import { CheckCircle2, Circle, ChevronRight, Info } from 'lucide-react';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { Badge } from './ui';
@@ -32,9 +32,13 @@ export default function SetupGuide() {
       title: '安装 Trae 客户端',
       desc: '签到目标客户端，需先安装并登录至少一个账号。',
       done: !!env?.installed,
-      actionLabel: '前往下载',
+      actionLabel: env?.installed ? '打开客户端' : '前往下载',
       run: async () => {
-        await api.env.openSite();
+        if (env?.installed) {
+          await api.env.openApp();
+        } else {
+          await api.env.openSite();
+        }
         await refreshEnv();
       },
     },
@@ -58,6 +62,14 @@ export default function SetupGuide() {
       run: async () => {
         await startProxy();
       },
+    },
+    {
+      key: 'proxy_config',
+      title: '在 Trae 中配置代理',
+      desc: '只有让 Trae 客户端走本地代理，才能自动捕获登录账号。',
+      done: proxy.captured > 0,
+      actionLabel: '已配置',
+      run: () => {},
     },
     {
       key: 'account',
@@ -135,6 +147,25 @@ export default function SetupGuide() {
           </li>
         ))}
       </ol>
+
+      {proxy.running && proxy.captured === 0 && (
+        <div className="border-t border-slate-100 bg-amber-50/60 px-4 py-3 text-sm text-amber-700 dark:border-slate-800 dark:bg-amber-500/10 dark:text-amber-300">
+          <div className="mb-1 flex items-center gap-1.5 font-medium">
+            <Info size={14} /> 代理已启动但未捕获到账号？
+          </div>
+          <div className="space-y-1 text-xs">
+            <p>
+              1. 在 Trae 客户端设置中配置 HTTP/HTTPS 代理为{' '}
+              <code className="rounded bg-amber-100 px-1 py-0.5 font-mono text-amber-800 dark:bg-amber-900/40 dark:text-amber-200">
+                127.0.0.1:{proxy.port}
+              </code>
+              。
+            </p>
+            <p>2. 确保已安装并信任 CA 证书，否则 Trae 会拒绝代理连接。</p>
+            <p>3. 在 Trae 中重新登录或刷新页面，授权头经过代理后会自动写入账号列表。</p>
+          </div>
+        </div>
+      )}
 
       {allDone && (
         <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-slate-800 dark:bg-emerald-500/10 dark:text-emerald-300">

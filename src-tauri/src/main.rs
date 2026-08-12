@@ -32,6 +32,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::env::env_check,
             commands::env::open_trae_website,
+            commands::env::open_trae_app,
             commands::cert::cert_status,
             commands::cert::cert_install,
             commands::proxy::proxy_start,

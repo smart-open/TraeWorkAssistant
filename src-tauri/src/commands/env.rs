@@ -33,6 +33,19 @@ pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+pub fn open_trae_app(_app: AppHandle) -> Result<(), String> {
+    let (installed, path, _) = detect_trae();
+    if !installed {
+        return Err("未检测到本地 Trae 安装".into());
+    }
+    let exe = path.ok_or("未找到 Trae.exe 路径")?;
+    Command::new(&exe)
+        .spawn()
+        .map_err(|e| format!("启动 Trae 失败: {e}"))?;
+    Ok(())
+}
+
 fn detect_trae() -> (bool, Option<String>, Option<String>) {
     let candidates = [
         "%LOCALAPPDATA%\\Programs\\Trae\\Trae.exe",
