@@ -1,9 +1,12 @@
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Minus, Square, X } from 'lucide-react';
+import { useAppStore } from '../store';
 
 const win = getCurrentWindow();
 
 export default function TitleBar() {
+  // 托盘启用时，最小化应隐藏窗口到托盘（而非最小化到任务栏），否则无入口可恢复
+  const trayEnabled = useAppStore((s) => s.settings?.tray ?? false);
   return (
     <div
       className="flex h-9 shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 pl-3 pr-1 dark:border-slate-800 dark:bg-slate-900"
@@ -20,7 +23,9 @@ export default function TitleBar() {
         {/* onMouseDown 阻止冒泡：否则事件冒泡到外层 data-tauri-drag-region，Tauri 会启动窗口拖拽而吞掉 click，导致最小/最大化/关闭无响应 */}
         <button
           onMouseDown={(e) => e.stopPropagation()}
-          onClick={() => void win.minimize()}
+          onClick={() =>
+            trayEnabled ? void win.hide() : void win.minimize()
+          }
           className="flex h-8 w-10 items-center justify-center text-slate-500 transition hover:bg-slate-200/70 active:scale-90 dark:hover:bg-slate-800"
           aria-label="最小化"
         >

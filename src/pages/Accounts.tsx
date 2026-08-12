@@ -394,6 +394,18 @@ function GroupsModal({
 }) {
   const [name, setName] = useState('');
   const [color, setColor] = useState(PRESET_COLORS[0]);
+  const [editingNames, setEditingNames] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    setEditingNames((prev) => {
+      const next = { ...prev };
+      groups.forEach((g) => {
+        if (!(g.id in next)) next[g.id] = g.name;
+      });
+      return next;
+    });
+  }, [groups]);
+
   return (
     <Modal
       open={open}
@@ -442,14 +454,26 @@ function GroupsModal({
           <div key={g.id} className="flex items-center gap-2 rounded-lg border border-slate-200 p-2 dark:border-slate-700">
             <span className="inline-block h-4 w-4 rounded-full" style={{ background: g.color }} />
             <input
-              defaultValue={g.name}
+              value={editingNames[g.id] ?? g.name}
+              onChange={(e) =>
+                setEditingNames((prev) => ({ ...prev, [g.id]: e.target.value }))
+              }
               onBlur={(e) => {
-                if (e.target.value && e.target.value !== g.name) void onRename(g.id, e.target.value);
+                const val = e.target.value.trim();
+                if (val && val !== g.name) {
+                  void onRename(g.id, val).then(() => {
+                    setEditingNames((prev) => {
+                      const next = { ...prev };
+                      delete next[g.id];
+                      return next;
+                    });
+                  });
+                }
               }}
               className="input !py-1 flex-1 !text-xs"
             />
             <select
-              defaultValue={g.color}
+              value={g.color}
               onChange={(e) => void onRecolor(g.id, e.target.value)}
               className="input !py-1 !text-xs w-24"
             >

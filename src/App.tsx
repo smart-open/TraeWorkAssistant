@@ -48,7 +48,7 @@ export default function App() {
     apply();
     mq.addEventListener('change', apply);
     return () => mq.removeEventListener('change', apply);
-  }, []);
+  }, [settings?.theme]);
 
   return (
     <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-slate-950 dark:text-slate-100">
