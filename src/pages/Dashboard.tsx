@@ -10,14 +10,13 @@ import {
   Cell,
 } from 'recharts';
 import {
-  Power,
-  PlayCircle,
   ShieldAlert,
   ExternalLink,
   Gift,
   RefreshCw,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
+import SetupGuide from '../components/SetupGuide';
 import { StatCard, Badge, EmptyState } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
@@ -27,8 +26,6 @@ export default function Dashboard() {
   const env = useAppStore((s) => s.env);
   const proxy = useAppStore((s) => s.proxy);
   const certInstalled = useAppStore((s) => s.certInstalled);
-  const startProxy = useAppStore((s) => s.startProxy);
-  const setView = useAppStore((s) => s.setView);
   const toast = useAppStore((s) => s.pushToast);
 
   const total = accounts.length;
@@ -71,20 +68,9 @@ export default function Dashboard() {
         title="概览"
         desc="Trae 多账号签到工作台 · 一眼掌握状态与快捷入口"
         actions={
-          <>
-            <button onClick={refresh} className="btn-outline">
-              <RefreshCw size={15} /> 刷新
-            </button>
-            {!proxy.running ? (
-              <button onClick={startProxy} className="btn-primary">
-                <Power size={15} /> 启动代理
-              </button>
-            ) : (
-              <button onClick={() => setView('checkin')} className="btn-primary">
-                <PlayCircle size={15} /> 立即签到
-              </button>
-            )}
-          </>
+          <button onClick={refresh} className="btn-outline">
+            <RefreshCw size={15} /> 刷新
+          </button>
         }
       />
 
@@ -137,10 +123,14 @@ export default function Dashboard() {
         </div>
       )}
 
+      <div className="mt-5">
+        <SetupGuide />
+      </div>
+
       <div className="mt-5 grid gap-3 md:grid-cols-3">
-        <div className="card p-4 md:col-span-2">
+        <div className="card p-4 md:col-span-3">
           <div className="mb-3 flex items-center justify-between">
-            <h3 className="font-medium">积分榜 Top 8</h3>
+            <h3 className="font-medium">积分榜 Top 榜</h3>
             <Badge tone="brand">实时</Badge>
           </div>
           {top.length === 0 ? (

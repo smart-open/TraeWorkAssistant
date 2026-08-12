@@ -205,13 +205,13 @@ export default function Settings() {
           </div>
         </section>
 
-        <section className="card p-4 md:col-span-2">
+        <section className="card p-4 md:col-span-1">
           <h3 className="mb-2 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-500">
             通过 Windows 计划任务在指定时间自动运行 Python 签到脚本（无需启动应用界面）。
             需要管理员权限。
           </p>
-          <div className="flex items-end gap-2">
+          <div className="flex flex-wrap items-end gap-2">
             <div>
               <label className="label">时间</label>
               <input
@@ -238,7 +238,7 @@ export default function Settings() {
           )}
         </section>
 
-        <section className="card p-4">
+        <section className="card p-4 md:col-span-2">
           <h3 className="mb-2 font-medium">关于</h3>
           <div className="space-y-1 text-xs text-slate-500">
             <div>应用版本：v1.0.0</div>

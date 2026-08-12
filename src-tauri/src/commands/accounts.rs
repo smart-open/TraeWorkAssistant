@@ -7,7 +7,6 @@ use crate::models::{
     AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, Group, RawAccount,
     CreditsFile, CheckinSummary,
 };
-use std::collections::HashMap;
 
 use crate::state::AppState;
 
