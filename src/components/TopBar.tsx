@@ -22,12 +22,12 @@ export default function TopBar() {
     try {
       const { api } = await import('../lib/tauri');
       if (env?.installed) {
-        await api.env.openApp();
+        await api.env.openApp(proxy.running ? proxy.port : undefined);
       } else {
         await api.env.openSite();
       }
     } catch (e) {
-      pushToast('error', `打开 Trae 失败：${String(e)}`);
+      pushToast('error', `打开 Trae Work 失败：${String(e)}`);
     }
   };
 
@@ -59,7 +59,7 @@ export default function TopBar() {
       </div>
       <div className="flex items-center gap-2">
         <button onClick={openTrae} className="btn-outline">
-          <ExternalLink size={15} /> {env?.installed ? '打开 Trae' : '下载 Trae'}
+          <ExternalLink size={15} /> {env?.installed ? '打开 Trae Work' : '下载 Trae Work'}
         </button>
         {proxy.running ? (
           <button onClick={stopProxy} className="btn-outline">

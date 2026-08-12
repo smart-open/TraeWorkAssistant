@@ -65,12 +65,12 @@ export default function Dashboard() {
   const openTrae = async () => {
     try {
       if (env?.installed) {
-        await api.env.openApp();
+        await api.env.openApp(proxy.running ? proxy.port : undefined);
       } else {
         await api.env.openSite();
       }
     } catch (e) {
-      toast('error', `打开 Trae 失败：${String(e)}`);
+      toast('error', `打开 Trae Work 失败：${String(e)}`);
     }
   };
 
@@ -116,7 +116,7 @@ export default function Dashboard() {
             onClick={() => void openTrae()}
             className="btn-outline"
           >
-            <ExternalLink size={15} /> {env?.installed ? '打开 Trae' : '前往下载'}
+            <ExternalLink size={15} /> {env?.installed ? '打开 Trae Work' : '前往下载'}
           </button>
         </div>
       )}

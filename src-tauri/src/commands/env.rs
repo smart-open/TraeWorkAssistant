@@ -13,8 +13,8 @@ pub struct EnvStatus {
 }
 
 #[tauri::command]
-pub fn env_check(_app: AppHandle, _state: State<AppState>) -> EnvStatus {
-    let (installed, path, version) = detect_trae();
+pub fn env_check(_app: AppHandle, state: State<AppState>) -> EnvStatus {
+    let (installed, path, version) = detect_trae(state.settings().trae_path);
     let running = is_running();
     EnvStatus {
         installed,
@@ -33,21 +33,40 @@ pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 启动本地 Trae Work 客户端。
+/// 若传入 proxy_port（代理运行中），自动注入 `--proxy-server` 让 Trae 走本地代理，
+/// 无需用户在 Trae 设置里手动配置代理。
 #[tauri::command]
-pub fn open_trae_app(_app: AppHandle) -> Result<(), String> {
-    let (installed, path, _) = detect_trae();
+pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
+    let (installed, path, _) = detect_trae(state.settings().trae_path);
     if !installed {
-        return Err("未检测到本地 Trae 安装".into());
+        return Err("未检测到本地 Trae Work 安装，请在「设置 → 代理与签到」中指定 exe 路径".into());
     }
-    let exe = path.ok_or("未找到 Trae.exe 路径")?;
-    Command::new(&exe)
-        .spawn()
-        .map_err(|e| format!("启动 Trae 失败: {e}"))?;
+    let exe = path.ok_or("未找到 Trae Work 可执行文件路径")?;
+    let mut cmd = Command::new(&exe);
+    if let Some(port) = proxy_port {
+        // Electron/Chromium 支持 --proxy-server 启动参数
+        cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
+    }
+    cmd.spawn()
+        .map_err(|e| format!("启动 Trae Work 失败: {e}"))?;
     Ok(())
 }
 
-fn detect_trae() -> (bool, Option<String>, Option<String>) {
+fn detect_trae(custom: Option<String>) -> (bool, Option<String>, Option<String>) {
+    // 优先使用用户在设置中指定的路径（兼容自定义安装目录）
+    if let Some(p) = custom {
+        let p = p.trim().to_string();
+        if !p.is_empty() && std::path::Path::new(&p).is_file() {
+            let version = version_of(&p);
+            return (true, Some(p), version);
+        }
+    }
     let candidates = [
+        "%LOCALAPPDATA%\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
+        "%LOCALAPPDATA%\\Programs\\TRAE SOLO\\TRAE SOLO.exe",
+        "%ProgramFiles%\\TRAE SOLO CN\\TRAE SOLO CN.exe",
+        "%ProgramFiles%\\TRAE SOLO\\TRAE SOLO.exe",
         "%LOCALAPPDATA%\\Programs\\Trae\\Trae.exe",
         "%ProgramFiles%\\Trae\\Trae.exe",
     ];
@@ -89,22 +108,80 @@ fn version_of(path: &str) -> Option<String> {
 }
 
 fn registry_trae_path() -> Option<String> {
-    let out = Command::new("reg")
-        .args([
-            "query",
-            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-            "/s",
-            "/f",
-            "Trae",
-        ])
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    for line in s.lines() {
-        let line = line.trim();
-        if line.starts_with("DisplayIcon") {
-            if let Some(v) = line.split("REG_SZ").nth(1) {
-                return Some(v.trim().to_string());
+    for root in ["HKCU", "HKLM"] {
+        let out = match Command::new("reg")
+            .args([
+                "query",
+                &format!("{root}\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+                "/s",
+                "/f",
+                "TRAE",
+            ])
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let s = String::from_utf8_lossy(&out.stdout);
+        // reg query /s 以 HKEY_ 开头的行分隔每个注册表键，逐键解析
+        let mut icon: Option<String> = None;
+        let mut loc: Option<String> = None;
+        let mut name_ok = false;
+        let mut best: Option<String> = None;
+        for line in s.lines() {
+            let line = line.trim();
+            if line.starts_with("HKEY_") {
+                if name_ok {
+                    if let Some(p) = resolve_reg_candidate(&icon, &loc) {
+                        best = Some(p);
+                        break;
+                    }
+                }
+                icon = None;
+                loc = None;
+                name_ok = false;
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("DisplayName") {
+                if let Some(val) = v.split("REG_SZ").nth(1) {
+                    if val.to_uppercase().contains("TRAE") {
+                        name_ok = true;
+                    }
+                }
+            } else if let Some(v) = line.strip_prefix("DisplayIcon") {
+                if let Some(val) = v.split("REG_SZ").nth(1) {
+                    icon = Some(val.trim().to_string());
+                }
+            } else if let Some(v) = line.strip_prefix("InstallLocation") {
+                if let Some(val) = v.split("REG_SZ").nth(1) {
+                    loc = Some(val.trim().to_string());
+                }
+            }
+        }
+        if name_ok {
+            if let Some(p) = resolve_reg_candidate(&icon, &loc) {
+                best = Some(p);
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
+    None
+}
+
+/// 从注册表 DisplayIcon / InstallLocation 推导 exe 路径
+fn resolve_reg_candidate(icon: &Option<String>, loc: &Option<String>) -> Option<String> {
+    if let Some(icon) = icon {
+        if icon.to_lowercase().ends_with(".exe") && std::path::Path::new(icon).is_file() {
+            return Some(icon.clone());
+        }
+    }
+    if let Some(loc) = loc {
+        for name in ["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"] {
+            let cand = format!("{loc}\\{name}");
+            if std::path::Path::new(&cand).is_file() {
+                return Some(cand);
             }
         }
     }
@@ -113,12 +190,12 @@ fn registry_trae_path() -> Option<String> {
 
 fn is_running() -> bool {
     let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq Trae.exe", "/NH"])
+        .args(["/FI", "IMAGENAME eq TRAE SOLO CN.exe", "/NH"])
         .output();
     match out {
         Ok(o) => {
             let s = String::from_utf8_lossy(&o.stdout);
-            s.contains("Trae.exe")
+            s.contains("TRAE SOLO CN.exe")
         }
         Err(_) => false,
     }

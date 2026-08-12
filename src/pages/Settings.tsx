@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Copy, Calendar, Power, Trash2, Save } from 'lucide-react';
+import { Copy, Calendar, Power, Trash2, Save, Search } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge } from '../components/ui';
 import { useAppStore } from '../store';
@@ -59,6 +59,20 @@ export default function Settings() {
       setTaskInfo(r);
     } catch (e) {
       setTaskInfo(`查询失败：${String(e)}`);
+    }
+  };
+
+  const detectTrae = async () => {
+    try {
+      const r = await api.env.check();
+      if (r.installed && r.path) {
+        update('trae_path', r.path);
+        toast('success', '已自动检测并填入 Trae Work 路径');
+      } else {
+        toast('info', '未检测到 Trae Work，请手动指定 exe 路径');
+      }
+    } catch (e) {
+      toast('error', `检测失败：${String(e)}`);
     }
   };
 
@@ -155,6 +169,24 @@ export default function Settings() {
                 onChange={(e) => update('proxy_port', Number(e.target.value) || 8899)}
                 className="input w-32"
               />
+            </div>
+            <div>
+              <label className="label">Trae Work 安装路径</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={settings.trae_path ?? ''}
+                  onChange={(e) => update('trae_path', e.target.value.trim() || null)}
+                  placeholder="留空则自动检测（默认 C:\Users\你\AppData\Local\Programs\TRAE SOLO CN\TRAE SOLO CN.exe）"
+                  className="input flex-1"
+                />
+                <button onClick={detectTrae} className="btn-outline shrink-0">
+                  <Search size={15} /> 自动检测
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-slate-400">
+                自定义安装目录时请填写 Trae Work 的 exe 路径；留空将自动探测，并在「打开 Trae Work」时优先使用此路径。
+              </p>
             </div>
             <label className="flex items-center gap-2">
               <input
