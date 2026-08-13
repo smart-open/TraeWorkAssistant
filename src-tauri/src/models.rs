@@ -99,6 +99,19 @@ pub struct Settings {
     pub proxy_domains: String,
     #[serde(default)]
     pub proxy_log_path: Option<String>,
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_api_model")]
+    pub api_default_model: String,
+}
+
+fn default_api_port() -> u16 {
+    7864
+}
+fn default_api_model() -> String {
+    "glm-5.2".into()
 }
 
 fn default_port() -> u16 {
@@ -185,4 +198,35 @@ pub struct AccountCooldownsFile {
     pub cooldowns: HashMap<String, CooldownEntry>,
     #[serde(default)]
     pub updated_at: Option<String>,
+}
+
+/// API 池配置文件：api_pool.json
+#[derive(Serialize, Deserialize, Default)]
+pub struct ApiPoolFile {
+    #[serde(default)]
+    pub enabled_uids: Vec<String>,
+}
+
+/// 池中单个账号的运行时状态（给 /status 和前端用）
+#[derive(Serialize, Clone)]
+pub struct PoolStatus {
+    pub uid: String,
+    pub name: String,
+    pub credits: Option<f64>,
+    pub credits_expire_at: Option<i64>,
+    pub cooling: bool,
+    pub cooldown_until: Option<i64>,
+    pub cooldown_reason: Option<String>,
+    pub disabled: bool,
+    pub err_count: i32,
+}
+
+/// API 服务整体状态（给前端用）
+#[derive(Serialize, Clone)]
+pub struct ApiServiceStatus {
+    pub running: bool,
+    pub port: u16,
+    pub total_requests: u64,
+    pub active_uid: Option<String>,
+    pub last_error: Option<String>,
 }

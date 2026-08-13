@@ -120,6 +120,9 @@ function defaultSettings(): Settings {
     log_retention_days: 30,
     proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com',
     proxy_log_path: null,
+    api_port: 7864,
+    api_key: '',
+    api_default_model: 'glm-5.2',
   };
 }
 

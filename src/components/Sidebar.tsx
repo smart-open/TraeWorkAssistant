@@ -6,6 +6,7 @@ import {
   ScrollText,
   Settings,
   Gift,
+  Server,
 } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
@@ -20,6 +21,7 @@ const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'checkin', label: '一键签到', icon: PlayCircle },
   { key: 'credits', label: '积分看板', icon: Coins },
   { key: 'logs', label: '系统日志', icon: ScrollText },
+  { key: 'api-service', label: 'API 服务', icon: Server },
   { key: 'settings', label: '系统设置', icon: Settings },
 ];
 

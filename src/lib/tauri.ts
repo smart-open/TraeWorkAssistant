@@ -2,6 +2,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AccountView,
+  ApiServiceStatus,
+  ApiPoolFile,
   CheckinDone,
   CheckinOpts,
   CreditRecord,
@@ -9,6 +11,7 @@ import type {
   GroupView,
   JwtParseResult,
   LogLine,
+  PoolStatus,
   ProxyLogListResult,
   ProxyStatus,
   Settings,
@@ -101,6 +104,14 @@ export const api = {
   },
   switchAccount: (userId: string) => invoke('switch_account', { userId }),
   resetDeviceIds: () => invoke('reset_device_ids'),
+  apiServer: {
+    start: () => invoke<ApiServiceStatus>('api_server_start'),
+    stop: () => invoke('api_server_stop'),
+    status: () => invoke<ApiServiceStatus>('api_server_status'),
+    poolList: () => invoke<ApiPoolFile>('pool_list'),
+    poolSet: (uids: string[]) => invoke('pool_set', { uids }),
+    poolStatus: () => invoke<PoolStatus[]>('pool_status'),
+  },
 };
 
 // ---- 事件载荷 ----

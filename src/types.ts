@@ -7,6 +7,7 @@ export type ViewKey =
   | 'checkin'
   | 'credits'
   | 'logs'
+  | 'api-service'
   | 'settings';
 
 export interface EnvStatus {
@@ -82,6 +83,9 @@ export interface Settings {
   log_retention_days: number;
   proxy_domains: string;
   proxy_log_path: string | null;
+  api_port: number;
+  api_key: string;
+  api_default_model: string;
 }
 
 export interface CheckinOpts {
@@ -136,4 +140,28 @@ export interface ProxyLogEntry {
 export interface ProxyLogListResult {
   entries: ProxyLogEntry[];
   total: number;
+}
+
+export interface ApiServiceStatus {
+  running: boolean;
+  port: number;
+  total_requests: number;
+  active_uid: string | null;
+  last_error: string | null;
+}
+
+export interface PoolStatus {
+  uid: string;
+  name: string;
+  credits: number | null;
+  credits_expire_at: number | null;
+  cooling: boolean;
+  cooldown_until: number | null;
+  cooldown_reason: string | null;
+  disabled: boolean;
+  err_count: number;
+}
+
+export interface ApiPoolFile {
+  enabled_uids: string[];
 }

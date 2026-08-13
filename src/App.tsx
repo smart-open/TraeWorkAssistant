@@ -10,6 +10,7 @@ import Checkin from './pages/Checkin';
 import Credits from './pages/Credits';
 import Logs from './pages/Logs';
 import Settings from './pages/Settings';
+import ApiService from './pages/ApiService';
 
 function renderView(view: string) {
   switch (view) {
@@ -23,6 +24,8 @@ function renderView(view: string) {
       return <Credits />;
     case 'logs':
       return <Logs />;
+    case 'api-service':
+      return <ApiService />;
     case 'settings':
       return <Settings />;
     default:

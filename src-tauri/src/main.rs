@@ -7,6 +7,7 @@ mod jwt;
 mod models;
 mod python;
 mod state;
+mod api_server;
 
 use state::AppState;
 use std::sync::Mutex;
@@ -29,6 +30,7 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .manage(state)
         .manage(Mutex::new(Option::<commands::proxy::ProxyHandle>::None))
+        .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .invoke_handler(tauri::generate_handler![
             commands::env::env_check,
             commands::env::open_trae_website,
@@ -66,6 +68,12 @@ fn main() {
             commands::misc::task_unregister,
             commands::misc::proxy_logs_list,
             commands::misc::proxy_log_detail,
+            commands::api_server::api_server_start,
+            commands::api_server::api_server_stop,
+            commands::api_server::api_server_status,
+            commands::api_server::pool_list,
+            commands::api_server::pool_set,
+            commands::api_server::pool_status,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -199,6 +207,15 @@ fn main() {
                 let state = app_handle.state::<AppState>();
                 fs_utils::app_log(&state.data_dir, "应用退出：正在清理代理子进程");
                 drop(h); // Drop trait 会 kill + wait 子进程
+            }
+            // 应用退出时停止 API 服务
+            let api_state = app_handle
+                .state::<Mutex<Option<commands::api_server::ApiServerRuntime>>>();
+            let mut ag = api_state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(mut rt) = ag.take() {
+                let state = app_handle.state::<AppState>();
+                fs_utils::app_log(&state.data_dir, "应用退出：正在停止 API 服务");
+                rt.handle.stop();
             }
             // 还原系统代理，避免退出后本机全局断网
             if let Err(e) = commands::proxy::clear_win_proxy() {
