@@ -218,7 +218,7 @@ export default function Accounts() {
                 <th className="px-4 py-2 text-left">冷却</th>
                 <th className="px-4 py-2 text-right">剩余积分</th>
                 <th className="px-4 py-2 text-left">积分过期</th>
-                <th className="px-4 py-2 text-right">今日积分</th>
+                <th className="px-4 py-2 text-right">今日新增积分</th>
                 <th className="px-4 py-2 text-right">操作</th>
               </tr>
             </thead>

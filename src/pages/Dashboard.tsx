@@ -163,7 +163,7 @@ export default function Dashboard() {
                   />
                   <Bar dataKey="credits" radius={[6, 6, 0, 0]}>
                     {top.map((_, i) => (
-                      <Cell key={i} fill={i === 0 ? '#6366f1' : '#818cf8'} />
+                      <Cell key={i} fill={i === 0 ? '#27272a' : '#52525b'} />
                     ))}
                   </Bar>
                 </BarChart>

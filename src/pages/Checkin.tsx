@@ -178,7 +178,7 @@ export default function Checkin() {
                   <th className="px-3 py-1.5 text-left">JWT</th>
                   <th className="px-3 py-1.5 text-left">今日</th>
                   <th className="px-3 py-1.5 text-left">冷却</th>
-                  <th className="px-3 py-1.5 text-right">积分</th>
+                  <th className="px-3 py-1.5 text-right">签到积分</th>
                 </tr>
               </thead>
               <tbody>

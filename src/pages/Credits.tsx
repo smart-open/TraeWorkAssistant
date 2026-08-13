@@ -31,10 +31,10 @@ export default function Credits() {
   const creditsHistory = useAppStore((s) => s.creditsHistory);
 
   const rows = useMemo(
-    () => [...accounts].sort((a, b) => (b.credits ?? -1) - (a.credits ?? -1)),
+    () => [...accounts].sort((a, b) => (b.remaining_credits ?? -1) - (a.remaining_credits ?? -1)),
     [accounts],
   );
-  const total = rows.reduce((s, a) => s + (a.credits ?? 0), 0);
+  const total = rows.reduce((s, a) => s + (a.remaining_credits ?? 0), 0);
   const avg = rows.length === 0 ? 0 : Math.round(total / rows.length);
 
   // 今日新增积分：credits_history 中当天 delta 之和
@@ -72,7 +72,7 @@ export default function Credits() {
 
       <div className="grid gap-3 md:grid-cols-1">
         <div className="card p-4">
-          <h3 className="mb-3 font-medium">账号积分排行</h3>
+          <h3 className="mb-3 font-medium">可用积分排行</h3>
           {rows.length === 0 ? (
             <EmptyState icon={<Coins size={28} />} title="尚无积分数据" hint="添加账号或运行一次签到即可看到。" />
           ) : (
@@ -109,7 +109,7 @@ export default function Credits() {
                   <XAxis dataKey="label" tick={{ fontSize: 11 }} />
                   <YAxis tick={{ fontSize: 11 }} />
                   <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
-                  <Line type="monotone" dataKey="delta" stroke="#6366f1" strokeWidth={2} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="delta" stroke="#27272a" strokeWidth={2} dot={{ r: 3 }} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -147,7 +147,7 @@ export default function Credits() {
                       <span className="text-xs text-slate-400">未分组</span>
                     )}
                   </td>
-                  <td className="px-4 py-2 text-right tabular-nums">{(a.credits ?? 0).toLocaleString()}</td>
+                  <td className="px-4 py-2 text-right tabular-nums">{(a.remaining_credits ?? 0).toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}</td>
                 </tr>
               );
             })}
