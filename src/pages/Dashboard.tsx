@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import SetupGuide from '../components/SetupGuide';
-import { StatCard, Badge, EmptyState } from '../components/ui';
+import { StatCard, EmptyState } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 
@@ -31,7 +31,7 @@ export default function Dashboard() {
   const total = accounts.length;
   const checkedToday = accounts.filter((a) => a.checked_today).length;
   const totalCredits = useMemo(
-    () => accounts.reduce((s, a) => s + (a.credits ?? 0), 0),
+    () => accounts.reduce((s, a) => s + (a.remaining_credits ?? 0), 0),
     [accounts],
   );
   const warned = accounts.filter(
@@ -41,10 +41,10 @@ export default function Dashboard() {
   const top = useMemo(
     () =>
       [...accounts]
-        .filter((a) => a.credits != null)
-        .sort((a, b) => (b.credits ?? 0) - (a.credits ?? 0))
+        .filter((a) => a.remaining_credits != null)
+        .sort((a, b) => (b.remaining_credits ?? 0) - (a.remaining_credits ?? 0))
         .slice(0, 8)
-        .map((a) => ({ name: a.name, credits: a.credits as number })),
+        .map((a) => ({ name: a.name, credits: a.remaining_credits as number })),
     [accounts],
   );
 
@@ -80,7 +80,7 @@ export default function Dashboard() {
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatCard label="账号总数" value={total} hint={`今日已签 ${checkedToday}`} tone="brand" />
-        <StatCard label="积分合计" value={totalCredits.toLocaleString()} tone="amber" />
+        <StatCard label="积分总额" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint="总剩余可用积分" tone="amber" />
         <StatCard
           label="代理状态"
           value={proxy.running ? `运行 :${proxy.port}` : '未启动'}
@@ -144,12 +144,11 @@ export default function Dashboard() {
 
       <div className="mt-5 grid gap-3 md:grid-cols-3">
         <div className="card p-4 md:col-span-3">
-          <div className="mb-3 flex items-center justify-between">
+          <div className="mb-3">
             <h3 className="font-medium">积分榜 Top 榜</h3>
-            <Badge tone="brand">实时</Badge>
           </div>
           {top.length === 0 ? (
-            <EmptyState icon={<Gift size={28} />} title="暂无积分数据" hint="运行签到后这里会显示积分排行。" />
+            <EmptyState icon={<Gift size={28} />} title="暂无积分数据" hint="运行签到后这里会显示可用积分排行。" />
           ) : (
             <div className="h-72">
               <ResponsiveContainer>
