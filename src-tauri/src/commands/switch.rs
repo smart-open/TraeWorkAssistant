@@ -96,3 +96,98 @@ pub fn switch_account(
 
     Ok(())
 }
+
+/// 6 层设备标识重置：调用 PowerShell 脚本的 ResetDeviceIds 动作
+/// 通过 NDJSON 事件流式返回进度，前端订阅 device-reset-progress / device-reset-done
+#[tauri::command]
+pub fn reset_device_ids(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
+        std::path::PathBuf::from(r).join("ps")
+    } else {
+        state.python_dir.join("../ps")
+    };
+    let bridge = ps_dir.join("trae-switch-bridge.ps1");
+    if !bridge.exists() {
+        return Err(format!("找不到切换脚本: {}", bridge.display()));
+    }
+
+    fs_utils::app_log(&state.data_dir, "开始 6 层设备标识重置");
+
+    let mut child = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            &bridge.to_string_lossy(),
+            "-Action",
+            "ResetDeviceIds",
+            "-Json",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动设备标识重置失败: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("设备重置脚本无输出")?;
+    let stderr = child.stderr.take();
+    let app2 = app.clone();
+    let data_dir = state.data_dir.clone();
+
+    // stdout 线程：NDJSON -> device-reset-progress 事件
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let mut done_emitted = false;
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                let l = l.trim().to_string();
+                if l.is_empty() {
+                    continue;
+                }
+                let _ = app2.emit("device-reset-progress", &l);
+                if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
+                    let success = l.contains("\"stage\":\"done\"");
+                    done_emitted = true;
+                    let _ = app2.emit(
+                        "device-reset-done",
+                        serde_json::json!({ "success": success, "raw": l }),
+                    );
+                }
+            }
+        }
+        let exit_status = child.wait();
+        if !done_emitted {
+            let success = matches!(&exit_status, Ok(s) if s.success());
+            let _ = app2.emit(
+                "device-reset-done",
+                serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status) }),
+            );
+        }
+    });
+
+    // stderr 线程：防止管道缓冲区写满导致子进程死锁
+    if let Some(stderr) = stderr {
+        std::thread::spawn(move || {
+            let log_path = data_dir.join("logs").join("switcher.log");
+            let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(l) = line {
+                    let l = format!("[stderr] {}", l.trim());
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path)
+                    {
+                        let _ = writeln!(f, "[{}] {}", fs_utils::now_ts(), l);
+                    }
+                }
+            }
+        });
+    }
+
+    Ok(())
+}

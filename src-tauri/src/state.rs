@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 
 use crate::fs_utils;
 use crate::models::Settings;
@@ -10,6 +11,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub python_dir: PathBuf,
     pub python_exe: String,
+    /// JWT 刷新锁：防止多个并发请求同时 ExchangeToken
+    pub jwt_refresh_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -38,6 +41,7 @@ impl AppState {
             data_dir,
             python_dir,
             python_exe,
+            jwt_refresh_lock: Mutex::new(()),
         })
     }
 

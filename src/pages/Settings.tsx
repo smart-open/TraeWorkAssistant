@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Calendar, Power, Trash2, Save, Search, RotateCcw } from 'lucide-react';
+import { Calendar, Power, Trash2, Save, Search, RotateCcw, Fingerprint } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge } from '../components/ui';
 import { useAppStore } from '../store';
@@ -10,6 +10,9 @@ export default function Settings() {
   const settings = useAppStore((s) => s.settings);
   const saveSettings = useAppStore((s) => s.saveSettings);
   const refreshSettings = useAppStore((s) => s.refreshSettings);
+  const resetDeviceIds = useAppStore((s) => s.resetDeviceIds);
+  const deviceResetActive = useAppStore((s) => s.deviceResetActive);
+  const deviceResetProgress = useAppStore((s) => s.deviceResetProgress);
   const toast = useAppStore((s) => s.pushToast);
 
   const [time, setTime] = useState('09:00');
@@ -103,6 +106,11 @@ export default function Settings() {
     } catch (e) {
       toast('error', `检测失败：${String(e)}`);
     }
+  };
+
+  const handleResetDeviceIds = async () => {
+    if (!confirm('确认执行 6 层设备标识重置？\n\n将重置：machineid / storage.json / TinyStorage / 注册表 MachineGuid / webview 追踪数据。\n建议先关闭 TRAE 再执行。')) return;
+    await resetDeviceIds();
   };
 
   if (!form) {
@@ -339,6 +347,31 @@ export default function Settings() {
           {taskInfo && (
             <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-slate-950">
               {taskInfo}
+            </pre>
+          )}
+        </section>
+
+        <section className="card p-4 md:col-span-2">
+          <h3 className="mb-2 font-medium">6 层设备标识重置</h3>
+          <p className="mb-3 text-xs text-slate-500">
+            重置 TRAE 的全部设备标识层：① machineid 文件 ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。
+            用于账号隔离和防关联。注册表重置需要管理员权限，建议先关闭 TRAE 再执行。
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleResetDeviceIds}
+              disabled={deviceResetActive}
+              className="btn-primary"
+            >
+              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
+            </button>
+            {deviceResetActive && (
+              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
+            )}
+          </div>
+          {deviceResetProgress.length > 0 && (
+            <pre className="mt-3 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-slate-950">
+              {deviceResetProgress.join('\n')}
             </pre>
           )}
         </section>

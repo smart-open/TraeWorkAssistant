@@ -49,6 +49,8 @@ interface AppState {
   creditsHistory: CreditRecord[];
   proxyLog: string[];
   switchProgress: string[];
+  deviceResetProgress: string[];
+  deviceResetActive: boolean;
   checkin: CheckinState;
   toasts: Toast[];
 
@@ -81,6 +83,7 @@ interface AppState {
   resetDevice: (userId: string) => Promise<void>;
   switchTo: (userId: string) => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
+  resetDeviceIds: () => Promise<void>;
   startCheckin: (opts: {
     scope: string;
     user_ids?: string[];
@@ -89,6 +92,7 @@ interface AppState {
   }) => Promise<void>;
   refreshRemainingCredits: () => Promise<void>;
   cooldownClear: (userId: string) => Promise<void>;
+  refreshJwt: (userId: string) => Promise<void>;
   saveSettings: (patch: Partial<Settings>) => Promise<void>;
 
   pushToast: (kind: ToastKind, msg: string) => void;
@@ -132,6 +136,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   creditsHistory: [],
   proxyLog: [],
   switchProgress: [],
+  deviceResetProgress: [],
+  deviceResetActive: false,
   checkin: { active: false, total: 0, index: 0, results: [], done: null },
   toasts: [],
 
@@ -165,6 +171,21 @@ export const useAppStore = create<AppState>((set, get) => ({
         );
         void get().refreshAccounts();
         void get().refreshProxy();
+      },
+      onDeviceResetProgress: (line) =>
+        set((s) => ({ deviceResetProgress: [...s.deviceResetProgress.slice(-99), line] })),
+      onDeviceResetDone: (e) => {
+        set((s) => ({
+          deviceResetActive: false,
+          deviceResetProgress: [
+            ...s.deviceResetProgress.slice(-99),
+            e.success ? '[完成] 6 层设备标识重置成功' : '[失败] 设备标识重置未完成，请查看日志',
+          ],
+        }));
+        get().pushToast(
+          e.success ? 'success' : 'error',
+          e.success ? '6 层设备标识重置完成' : '设备标识重置失败，请查看日志',
+        );
       },
     });
     await Promise.all([
@@ -450,6 +471,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `续期失败：${String(err)}`);
     }
   },
+  resetDeviceIds: async () => {
+    set({ deviceResetActive: true, deviceResetProgress: [] });
+    try {
+      await api.resetDeviceIds();
+      get().pushToast('info', '正在执行 6 层设备标识重置…');
+    } catch (err) {
+      set({ deviceResetActive: false });
+      get().pushToast('error', `设备标识重置失败：${String(err)}`);
+    }
+  },
   startCheckin: async (opts) => {
     // 重置签到状态，避免显示上一次的进度
     set({ checkin: { active: true, total: 0, index: 0, results: [], done: null } });
@@ -478,6 +509,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('success', '已解除冷却');
     } catch (err) {
       get().pushToast('error', `解除冷却失败：${String(err)}`);
+    }
+  },
+  refreshJwt: async (userId) => {
+    try {
+      await api.accounts.refreshJwt(userId);
+      await get().refreshAccounts();
+      get().pushToast('success', 'JWT 已自动刷新');
+    } catch (err) {
+      get().pushToast('error', `JWT 刷新失败：${String(err)}`);
     }
   },
   saveSettings: async (patch) => {

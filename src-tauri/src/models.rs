@@ -16,6 +16,9 @@ pub struct AccountView {
     pub cooldown_type: Option<String>,
     pub cooldown_until: Option<i64>,
     pub cooldown_reason: Option<String>,
+    pub has_refresh_token: bool,
+    pub jwt_auto_refresh: bool,
+    pub credits_expire_at: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -24,6 +27,8 @@ pub struct RawAccount {
     #[serde(rename = "UserID", default)]
     pub user_id: Option<String>,
     pub jwt: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
     #[serde(default)]
     pub added_at: Option<String>,
     #[serde(default)]
@@ -154,6 +159,8 @@ pub struct CheckinSummary {
 pub struct RemainingCreditsFile {
     #[serde(default)]
     pub credits: HashMap<String, f64>,
+    #[serde(default)]
+    pub expire_times: HashMap<String, i64>,
     #[serde(default)]
     pub updated_at: Option<String>,
 }

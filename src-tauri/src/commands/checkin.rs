@@ -59,6 +59,29 @@ pub fn checkin_start(
                 &format!("跳过 {} 个冷却中账号", skipped),
             );
         }
+        // 积分过期感知调度：按 credits_expire_at 升序排列（最近过期的优先签到）
+        // 无过期时间的账号排在最后；过期时间相同的按剩余积分降序
+        let rc: crate::models::RemainingCreditsFile =
+            crate::fs_utils::read_json(&state.path("remaining_credits.json"));
+        uids.sort_by(|a, b| {
+            let ea = rc.expire_times.get(a).copied();
+            let eb = rc.expire_times.get(b).copied();
+            match (ea, eb) {
+                (Some(ta), Some(tb)) => {
+                    if ta == tb {
+                        // 过期时间相同 → 剩余积分降序
+                        let ca = rc.credits.get(a).copied().unwrap_or(0.0);
+                        let cb = rc.credits.get(b).copied().unwrap_or(0.0);
+                        cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        ta.cmp(&tb)
+                    }
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
     }
     let accounts_arg = uids.join(",");
     let retry = state.settings().retry.max(0) as u32;

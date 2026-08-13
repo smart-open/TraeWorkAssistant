@@ -44,6 +44,8 @@ export const api = {
       invoke<number>('refresh_remaining_credits'),
     cooldownClear: (userId: string) =>
       invoke('cooldown_clear', { userId }),
+    refreshJwt: (userId: string) =>
+      invoke<string>('refresh_jwt', { userId }),
   },
   groups: {
     list: () => invoke<GroupView[]>('groups_list'),
@@ -98,6 +100,7 @@ export const api = {
     proxyLogDetail: (id: string) => invoke<string>('proxy_log_detail', { id }),
   },
   switchAccount: (userId: string) => invoke('switch_account', { userId }),
+  resetDeviceIds: () => invoke('reset_device_ids'),
 };
 
 // ---- 事件载荷 ----
@@ -136,12 +139,19 @@ export interface SwitchDoneEvent {
   raw: string;
 }
 
+export interface DeviceResetDoneEvent {
+  success: boolean;
+  raw: string;
+}
+
 export interface ListenerHandlers {
   onProxyLog?: (line: string) => void;
   onAccountCaptured?: (uid: string) => void;
   onCheckinProgress?: (e: CheckinProgressEvent) => void;
   onSwitchProgress?: (line: string) => void;
   onSwitchDone?: (e: SwitchDoneEvent) => void;
+  onDeviceResetProgress?: (line: string) => void;
+  onDeviceResetDone?: (e: DeviceResetDoneEvent) => void;
 }
 
 export async function setupListeners(
@@ -178,6 +188,20 @@ export async function setupListeners(
     unsubs.push(
       await listen<SwitchDoneEvent>('switch-done', (e) =>
         handlers.onSwitchDone!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onDeviceResetProgress) {
+    unsubs.push(
+      await listen<string>('device-reset-progress', (e) =>
+        handlers.onDeviceResetProgress!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onDeviceResetDone) {
+    unsubs.push(
+      await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
+        handlers.onDeviceResetDone!(e.payload),
       ),
     );
   }

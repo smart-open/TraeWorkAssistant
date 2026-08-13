@@ -14,6 +14,7 @@ import {
   Eye,
   Copy,
   Snowflake,
+  Zap,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
@@ -61,6 +62,22 @@ function CooldownBadge({ type, until }: { type: string; until: number | null }) 
   );
 }
 
+function CreditsExpireBadge({ expireAt }: { expireAt: number | null }) {
+  if (!expireAt) return <span className="text-xs text-slate-300">-</span>;
+  const now = Math.floor(Date.now() / 1000);
+  const secs = expireAt - now;
+  if (secs <= 0) return <Badge tone="red">已过期</Badge>;
+  const days = Math.floor(secs / 86400);
+  const hours = Math.floor((secs % 86400) / 3600);
+  const isUrgent = secs < 86400; // < 24h
+  const text = days > 0 ? `${days}d${hours}h` : `${hours}h`;
+  return (
+    <span className={`text-xs ${isUrgent ? 'text-amber-500 font-semibold' : 'text-slate-500'}`}>
+      {text}
+    </span>
+  );
+}
+
 export default function Accounts() {
   const accounts = useAppStore((s) => s.accounts);
   const groups = useAppStore((s) => s.groups);
@@ -78,6 +95,7 @@ export default function Accounts() {
   const renewJwt = useAppStore((s) => s.renewJwt);
   const refreshRemainingCredits = useAppStore((s) => s.refreshRemainingCredits);
   const cooldownClear = useAppStore((s) => s.cooldownClear);
+  const refreshJwt = useAppStore((s) => s.refreshJwt);
   const toast = useAppStore((s) => s.pushToast);
 
   const [filter, setFilter] = useState<string>('all');
@@ -177,6 +195,7 @@ export default function Accounts() {
                 <th className="px-4 py-2 text-left">今日</th>
                 <th className="px-4 py-2 text-left">冷却</th>
                 <th className="px-4 py-2 text-right">剩余积分</th>
+                <th className="px-4 py-2 text-left">积分过期</th>
                 <th className="px-4 py-2 text-right">今日积分</th>
                 <th className="px-4 py-2 text-right">操作</th>
               </tr>
@@ -199,6 +218,11 @@ export default function Accounts() {
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1">
                         <JwtStatusBadge hours={a.jwt_exp_hours} />
+                        {a.has_refresh_token && (
+                          <span title="支持自动刷新" className="text-sky-500">
+                            <Zap size={12} />
+                          </span>
+                        )}
                         <button
                           title="查看 JWT"
                           onClick={() => setJwtTarget(a)}
@@ -228,6 +252,9 @@ export default function Accounts() {
                         ? a.remaining_credits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
                         : '-'}
                     </td>
+                    <td className="px-4 py-3">
+                      <CreditsExpireBadge expireAt={a.credits_expire_at} />
+                    </td>
                     <td className="px-4 py-3 text-right tabular-nums">
                       {a.credits != null ? a.credits.toLocaleString() : '-'}
                     </td>
@@ -252,6 +279,15 @@ export default function Accounts() {
                             className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10"
                           >
                             <KeyRound size={14} />
+                          </button>
+                        )}
+                        {a.has_refresh_token && (
+                          <button
+                            title="刷新 JWT"
+                            onClick={() => void refreshJwt(a.user_id)}
+                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                          >
+                            <Zap size={14} />
                           </button>
                         )}
                         <button title="切换到此账号" onClick={() => void switchTo(a.user_id)} className="btn-ghost !p-2">

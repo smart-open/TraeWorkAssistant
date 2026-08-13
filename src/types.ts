@@ -37,6 +37,9 @@ export interface AccountView {
   cooldown_type: string | null;
   cooldown_until: number | null;
   cooldown_reason: string | null;
+  has_refresh_token: boolean;
+  jwt_auto_refresh: boolean;
+  credits_expire_at: number | null;
 }
 
 export interface GroupView {
@@ -126,6 +129,8 @@ export interface ProxyLogEntry {
   path: string;
   status: string;
   size: number;
+  sse_model?: string;
+  sse_tokens?: string;
 }
 
 export interface ProxyLogListResult {

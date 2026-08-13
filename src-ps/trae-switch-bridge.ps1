@@ -21,7 +21,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Switch', 'ResetMachineId', 'BackupCurrent')]
+    [ValidateSet('Switch', 'ResetMachineId', 'BackupCurrent', 'ResetDeviceIds')]
     [string]$Action,
 
     [Parameter(Mandatory = $false)]
@@ -172,6 +172,137 @@ function Reset-MachineId {
     }
 }
 
+function Reset-DeviceIdsOnly {
+    <#
+    .SYNOPSIS
+        6 层设备标识重置（参考 traework-switcher Reset-DeviceIdsOnly）
+    .DESCRIPTION
+        1. machineid 文件 → 新 hex32 UUID
+        2. storage.json telemetry.machineId / telemetry.sqmId → 替换
+        3. storage.json aha.device.device_id → 替换
+        4. aha/TinyStorage device_id → 清除
+        5. 注册表 MachineGuid → 替换（需管理员）
+        6. trae-webview 追踪数据 → 清除
+        额外：删除 has_device_id_updated_to_aha 标记位
+    #>
+    $traeDir = $Script:TraeDataDir
+    if (-not (Test-Path $traeDir)) {
+        Write-Step -Stage 'device' -Message "TRAE 数据目录不存在: $traeDir" -Status 'error'
+        return
+    }
+
+    $newMachineId = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })
+    $newDeviceId = -join ((1..15) | ForEach-Object { Get-Random -Maximum 10 })
+    $newSqmId = (New-Guid).Guid
+    $resetCount = 0
+
+    # 1. machineid 文件
+    $machineIdFile = Join-Path $traeDir 'machineid'
+    if (Test-Path $machineIdFile) {
+        try {
+            Set-Content -Path $machineIdFile -Value $newMachineId -NoNewline -Encoding UTF8
+            Write-Step -Stage 'device' -Message "[1/6] machineid 已重置" -Status 'ok'
+            $resetCount++
+        } catch {
+            Write-Step -Stage 'device' -Message "[1/6] machineid 重置失败: $_" -Status 'skip'
+        }
+    } else {
+        Write-Step -Stage 'device' -Message "[1/6] machineid 文件不存在，跳过" -Status 'skip'
+    }
+
+    # 2 & 3. storage.json — telemetry.machineId / sqmId + aha.device.device_id
+    $storageFile = Join-Path $traeDir 'storage.json'
+    if (Test-Path $storageFile) {
+        try {
+            $storage = Get-Content $storageFile -Raw | ConvertFrom-Json
+            $changed = $false
+            # telemetry.machineId / telemetry.sqmId
+            if ($storage.telemetry) {
+                if ($storage.telemetry.machineId -ne $null) {
+                    $storage.telemetry.machineId = $newMachineId
+                    $changed = $true
+                }
+                if ($storage.telemetry.sqmId -ne $null) {
+                    $storage.telemetry.sqmId = $newSqmId
+                    $changed = $true
+                }
+            }
+            # aha.device.device_id
+            if ($storage.aha -and $storage.aha.device -and $storage.aha.device.device_id -ne $null) {
+                $storage.aha.device.device_id = $newDeviceId
+                $changed = $true
+            }
+            # 删除 has_device_id_updated_to_aha 标记位
+            if ($storage.aha -and $storage.aha.device -and $storage.aha.device.has_device_id_updated_to_aha -ne $null) {
+                $storage.aha.device.PSObject.Properties.Remove('has_device_id_updated_to_aha')
+                $changed = $true
+            }
+            if ($changed) {
+                $storage | ConvertTo-Json -Depth 20 | Set-Content -Path $storageFile -Encoding UTF8
+                Write-Step -Stage 'device' -Message "[2/3] storage.json 设备标识已重置" -Status 'ok'
+                $resetCount++
+            } else {
+                Write-Step -Stage 'device' -Message "[2/3] storage.json 无需修改" -Status 'skip'
+            }
+        } catch {
+            Write-Step -Stage 'device' -Message "[2/3] storage.json 重置失败: $_" -Status 'skip'
+        }
+    } else {
+        Write-Step -Stage 'device' -Message "[2/3] storage.json 不存在，跳过" -Status 'skip'
+    }
+
+    # 4. aha/TinyStorage device_id — 清除
+    $tinyStorageDir = Join-Path $traeDir 'aha\TinyStorage'
+    if (Test-Path $tinyStorageDir) {
+        try {
+            $tinyFiles = Get-ChildItem -Path $tinyStorageDir -Recurse -File -ErrorAction SilentlyContinue
+            foreach ($f in $tinyFiles) {
+                $content = Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue
+                if ($content -and $content -match 'device_id') {
+                    Remove-Item $f.FullName -Force
+                }
+            }
+            Write-Step -Stage 'device' -Message "[4/6] aha/TinyStorage device_id 已清除" -Status 'ok'
+            $resetCount++
+        } catch {
+            Write-Step -Stage 'device' -Message "[4/6] aha/TinyStorage 清除失败: $_" -Status 'skip'
+        }
+    } else {
+        Write-Step -Stage 'device' -Message "[4/6] aha/TinyStorage 目录不存在，跳过" -Status 'skip'
+    }
+
+    # 5. 注册表 MachineGuid（需管理员）
+    try {
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGuid' -Value $newSqmId -Force
+        Write-Step -Stage 'device' -Message "[5/6] 注册表 MachineGuid 已重置" -Status 'ok'
+        $resetCount++
+    } catch {
+        Write-Step -Stage 'device' -Message "[5/6] 注册表 MachineGuid 重置需要管理员权限，已跳过" -Status 'skip'
+    }
+
+    # 6. trae-webview 追踪数据（Cookies/Local Storage/Session Storage）
+    $webviewDir = Join-Path $traeDir 'Partitions\trae-webview'
+    if (Test-Path $webviewDir) {
+        try {
+            $clearDirs = @('Network', 'Local Storage', 'Session Storage')
+            foreach ($d in $clearDirs) {
+                $target = Join-Path $webviewDir $d
+                if (Test-Path $target) {
+                    Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+            Write-Step -Stage 'device' -Message "[6/6] trae-webview 追踪数据已清除" -Status 'ok'
+            $resetCount++
+        } catch {
+            Write-Step -Stage 'device' -Message "[6/6] trae-webview 清除失败: $_" -Status 'skip'
+        }
+    } else {
+        Write-Step -Stage 'device' -Message "[6/6] trae-webview 目录不存在，跳过" -Status 'skip'
+    }
+
+    Write-Step -Stage 'device' -Message "6 层设备标识重置完成（$resetCount/6 层成功）" -Status $(if ($resetCount -ge 4) { 'ok' } else { 'info' })
+}
+
 function Backup-CurrentProfile {
     param([string]$Slot)
     $dest = Join-Path $Script:ProfilesDir $Slot
@@ -207,7 +338,7 @@ function Restore-Profile {
 
 # ============ 入口 ============
 try {
-    if (-not $UserId -and $Action -ne 'ResetMachineId') {
+    if (-not $UserId -and $Action -ne 'ResetMachineId' -and $Action -ne 'ResetDeviceIds') {
         Write-Step -Stage 'init' -Message '缺少 -UserId 参数' -Status 'error'
         exit 1
     }
@@ -225,6 +356,10 @@ try {
         'ResetMachineId' {
             Reset-MachineId
             Write-Step -Stage 'done' -Message '机器码已重置' -Status 'ok'
+        }
+        'ResetDeviceIds' {
+            Reset-DeviceIdsOnly
+            Write-Step -Stage 'done' -Message '6 层设备标识重置完成' -Status 'ok'
         }
         'BackupCurrent' {
             Backup-CurrentProfile -Slot $UserId

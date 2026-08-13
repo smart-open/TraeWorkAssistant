@@ -10,6 +10,28 @@ use crate::models::{
 
 use crate::state::AppState;
 
+// ---------------- 双 HTTP Client 设计 ----------------
+
+/// 短请求 Agent：总超时 120s，用于签到/积分查询/Token 刷新等 JSON 请求
+fn short_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(120))
+        .max_idle_connections(20)
+        .max_idle_connections_per_host(20)
+        .build()
+}
+
+/// 流式 Agent：无总超时，仅 response_header_timeout 120s，用于 SSE 流式对话
+/// 预留给 Phase 3 OpenAI 兼容 API 使用
+#[allow(dead_code)]
+fn streaming_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_read(std::time::Duration::from_secs(0)) // 无读超时
+        .max_idle_connections(20)
+        .max_idle_connections_per_host(20)
+        .build()
+}
+
 #[tauri::command]
 pub fn accounts_list(state: State<AppState>) -> Vec<AccountView> {
     build_account_views(&state)
@@ -36,6 +58,7 @@ pub fn account_add_manual(
         name: name.clone(),
         user_id: Some(uid.clone()),
         jwt,
+        refresh_token: None,
         added_at: Some(fs_utils::now_iso()),
         updated_at: Some(fs_utils::now_iso()),
     });
@@ -215,18 +238,19 @@ pub fn group_move(
 
 /// 调用 TRAE API 计算剩余积分
 /// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
-/// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），求和后四舍五入保留2位小数
-fn calc_remaining_credits(jwt: &str) -> Result<f64, String> {
+/// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），求和后四舍五入保留2位小数。
+/// 同时返回最近过期的 expire_time（Unix 秒），用于积分过期感知调度。
+fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>), String> {
     let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
         jwt.to_string()
     } else {
         format!("Cloud-IDE-JWT {}", jwt)
     };
-    let resp = ureq::post("https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage")
+    let resp = short_agent()
+        .post("https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage")
         .set("authorization", &auth)
         .set("content-type", "application/json")
         .set("accept", "*/*")
-        .timeout(std::time::Duration::from_secs(15))
         .send_json(ureq::json!({"require_usage": true, "req_source": 2}))
         .map_err(|e| format!("API 请求失败: {}", e))?;
 
@@ -239,6 +263,8 @@ fn calc_remaining_credits(jwt: &str) -> Result<f64, String> {
         .ok_or("响应中缺少 user_entitlement_pack_list")?;
 
     let mut total: f64 = 0.0;
+    let mut earliest_expire: Option<i64> = None;
+    let now_ts = chrono::Local::now().timestamp();
     for pack in packs {
         // 仅对有 credits_limit 的包计入统计
         let credits_limit = pack
@@ -254,11 +280,21 @@ fn calc_remaining_credits(jwt: &str) -> Result<f64, String> {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
             total += (limit - used).max(0.0);
+            // 提取过期时间，取最早的（且未过期的）
+            let expire = pack
+                .get("entitlement_base_info")
+                .and_then(|e| e.get("expire_time"))
+                .and_then(|v| v.as_i64());
+            if let Some(exp) = expire {
+                if exp > now_ts {
+                    earliest_expire = Some(earliest_expire.map_or(exp, |e| e.min(exp)));
+                }
+            }
         }
     }
 
     // 四舍五入保留2位小数
-    Ok((total * 100.0).round() / 100.0)
+    Ok(((total * 100.0).round() / 100.0, earliest_expire))
 }
 
 /// 获取单个账号的剩余积分（实时请求 API）
@@ -271,10 +307,13 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
         .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
         .ok_or("账号不存在")?;
     let jwt = &account.jwt;
-    let credits = calc_remaining_credits(jwt)?;
+    let (credits, expire_at) = calc_remaining_credits(jwt)?;
     // 写入缓存
     let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
-    rc.credits.insert(user_id, credits);
+    rc.credits.insert(user_id.clone(), credits);
+    if let Some(exp) = expire_at {
+        rc.expire_times.insert(user_id, exp);
+    }
     rc.updated_at = Some(fs_utils::now_iso());
     fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
     Ok(credits)
@@ -299,8 +338,11 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
             continue;
         }
         match calc_remaining_credits(&a.jwt) {
-            Ok(credits) => {
+            Ok((credits, expire_at)) => {
                 rc.credits.insert(uid.clone(), credits);
+                if let Some(exp) = expire_at {
+                    rc.expire_times.insert(uid.clone(), exp);
+                }
                 ok_count += 1;
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
                 if credits > 0.0 {
@@ -347,6 +389,119 @@ pub fn cooldown_clear(state: State<AppState>, user_id: String) -> Result<(), Str
         fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
     }
     Ok(())
+}
+
+/// 使用 refresh_token 刷新 JWT（ExchangeToken）
+/// 成功后原子写回新 accessToken + refresh_token，返回新 JWT
+#[tauri::command]
+pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, String> {
+    // 并发安全：持锁防止多个并发请求同时 ExchangeToken
+    let _lock = state
+        .jwt_refresh_lock
+        .lock()
+        .map_err(|_| "JWT 刷新锁获取失败")?;
+
+    // Double-check：持锁后重新读取文件，防止其他线程已刷新
+    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+        .ok_or("账号不存在")?;
+
+    let refresh_token = account
+        .refresh_token
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .ok_or("该账号无 refresh_token，无法自动刷新")?;
+
+    // 调用 ExchangeToken API
+    let resp = short_agent()
+        .post("https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken")
+        .set("content-type", "application/json")
+        .set("accept", "*/*")
+        .send_json(ureq::json!({
+            "ClientID": "en1oxy7wnw8j9n",
+            "RefreshToken": refresh_token,
+            "ClientSecret": "-",
+            "UserID": ""
+        }))
+        .map_err(|e| format!("ExchangeToken 请求失败: {}", e))?;
+
+    let body: serde_json::Value =
+        resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+
+    let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("ExchangeToken 失败 (code={}): {}", code, msg));
+    }
+
+    let data = body
+        .get("data")
+        .ok_or("响应中缺少 data 字段")?;
+
+    // 提取新 accessToken
+    let new_access_token = data
+        .get("access_token")
+        .or_else(|| data.get("token"))
+        .and_then(|v| v.as_str())
+        .ok_or("响应中缺少 access_token")?;
+
+    // 提取新 refresh_token（可能轮换）
+    let new_refresh_token = data
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // 验证新 accessToken 的 user_id 一致
+    let new_jwt_full = if new_access_token.starts_with("Cloud-IDE-JWT ") {
+        new_access_token.to_string()
+    } else {
+        format!("Cloud-IDE-JWT {}", new_access_token)
+    };
+    let new_info = jwt::parse(&new_jwt_full);
+    if let Some(ref new_uid) = new_info.user_id {
+        if new_uid != &user_id {
+            return Err(format!(
+                "刷新后 user_id 不匹配: 期望={}, 实际={}",
+                user_id, new_uid
+            ));
+        }
+    }
+
+    // 原子写回
+    let log_name = {
+        let account = accounts
+            .accounts
+            .iter_mut()
+            .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+            .ok_or("账号不存在")?;
+        account.jwt = new_jwt_full.clone();
+        if let Some(rt) = new_refresh_token {
+            account.refresh_token = Some(rt);
+        }
+        account.updated_at = Some(fs_utils::now_iso());
+        account.name.clone()
+    };
+    fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "JWT 自动刷新成功 [{}]: 新 exp={}",
+            log_name,
+            new_info
+                .exp_hours
+                .map(|h| format!("{:.1}h", h))
+                .unwrap_or_else(|| "?".to_string())
+        ),
+    );
+
+    Ok(new_jwt_full)
 }
 
 // ---------------- 内部工具 ----------------
@@ -431,6 +586,17 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
         } else {
             (None, None, None)
         };
+        let has_rt = a
+            .refresh_token
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        // 自动刷新条件：有 refresh_token 且 JWT 24h 内过期或已过期
+        let need_refresh = has_rt
+            && info
+                .exp_hours
+                .map(|h| h <= 24.0)
+                .unwrap_or(true);
         out.push(AccountView {
             user_id: uid.clone(),
             name: a.name.clone(),
@@ -445,6 +611,9 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
             cooldown_type: cd_type,
             cooldown_until: cd_until,
             cooldown_reason: cd_reason,
+            has_refresh_token: has_rt,
+            jwt_auto_refresh: need_refresh,
+            credits_expire_at: rc.expire_times.get(&uid).copied(),
         });
     }
     out

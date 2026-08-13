@@ -275,6 +275,7 @@ function ProxyLogsTab() {
                   <th className="px-3 py-2 text-left">路径</th>
                   <th className="px-3 py-2 text-left">状态</th>
                   <th className="px-3 py-2 text-right">大小</th>
+                  <th className="px-3 py-2 text-left">SSE摘要</th>
                   <th className="px-3 py-2 text-right">操作</th>
                 </tr>
               </thead>
@@ -307,6 +308,20 @@ function ProxyLogsTab() {
                     </td>
                     <td className="px-3 py-2 text-right text-xs text-slate-400 tabular-nums">
                       {e.size > 1024 ? `${(e.size / 1024).toFixed(1)}KB` : `${e.size}B`}
+                    </td>
+                    <td className="px-3 py-2 text-xs">
+                      {e.sse_model || e.sse_tokens ? (
+                        <div className="flex flex-col gap-0.5">
+                          {e.sse_model && (
+                            <span className="text-sky-500 font-medium">{e.sse_model}</span>
+                          )}
+                          {e.sse_tokens && (
+                            <span className="text-slate-400 font-mono">{e.sse_tokens}</span>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-slate-300">-</span>
+                      )}
                     </td>
                     <td className="px-3 py-2 text-right">
                       <button onClick={() => void showDetail(e.id)} className="btn-ghost !p-1.5" title="查看详情">

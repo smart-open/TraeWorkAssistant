@@ -32,6 +32,10 @@ pub struct ProxyLogEntry {
     pub path: String,
     pub status: String,
     pub size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sse_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sse_tokens: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -113,7 +117,32 @@ fn parse_proxy_entry(raw: &str, file_name: &str, index: usize) -> Option<ProxyLo
         path,
         status,
         size: raw.len(),
+        sse_model: extract_sse_field(raw, "model"),
+        sse_tokens: extract_sse_tokens(raw),
     })
+}
+
+/// 从 SSE Summary 区块中提取指定字段
+fn extract_sse_field(raw: &str, field: &str) -> Option<String> {
+    let in_summary = raw.lines().skip_while(|l| !l.starts_with("--- SSE Summary ---"));
+    for line in in_summary {
+        let line = line.trim();
+        if line.starts_with("--- ") && !line.starts_with("--- SSE Summary") {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix(&format!("  {}: ", field)) {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+/// 提取 token 用量摘要字符串
+fn extract_sse_tokens(raw: &str) -> Option<String> {
+    let pt = extract_sse_field(raw, "prompt_tokens")?;
+    let ct = extract_sse_field(raw, "completion_tokens").unwrap_or_else(|| "?".to_string());
+    let tt = extract_sse_field(raw, "total_tokens").unwrap_or_else(|| "?".to_string());
+    Some(format!("p:{} c:{} t:{}", pt, ct, tt))
 }
 
 fn split_host_path(hp: &str) -> (String, String) {

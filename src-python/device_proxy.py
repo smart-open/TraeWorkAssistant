@@ -52,6 +52,65 @@ PROXY_LOG_DIR = os.environ.get("PROXY_LOG_PATH", "")
 if not PROXY_LOG_DIR:
     PROXY_LOG_DIR = os.path.join(DATA_DIR, "proxy-logs")
 
+def extract_sse_summary(resp_headers, resp_body):
+    """从 SSE 流式响应中提取摘要信息（模型、token 用量等）。
+    仅对 Content-Type: text/event-stream 的响应生效。
+    返回 dict 或 None。"""
+    if not resp_body:
+        return None
+    # 检查响应头是否为 SSE
+    is_sse = False
+    if resp_headers:
+        for k, v in resp_headers:
+            if k.lower() == "content-type" and "event-stream" in v.lower():
+                is_sse = True
+                break
+    if not is_sse:
+        return None
+    body_str = resp_body.decode("utf-8", "replace") if isinstance(resp_body, bytes) else str(resp_body)
+    summary = {}
+    output_count = 0
+    current_event = ""
+    for line in body_str.split("\n"):
+        line = line.strip()
+        if line.startswith("event:"):
+            current_event = line[6:].strip()
+        elif line.startswith("data:"):
+            data_str = line[5:].strip()
+            if not data_str:
+                continue
+            try:
+                data = json.loads(data_str)
+            except Exception:
+                continue
+            if current_event == "metadata":
+                model = data.get("model") or data.get("model_name")
+                if model:
+                    summary["model"] = model
+                session_id = data.get("session_id")
+                if session_id:
+                    summary["session_id"] = session_id[:16] + "..."
+            elif current_event == "output":
+                output_count += 1
+            elif current_event == "token_usage":
+                pt = data.get("prompt_tokens")
+                ct = data.get("completion_tokens")
+                tt = data.get("total_tokens")
+                if pt is not None:
+                    summary["prompt_tokens"] = pt
+                if ct is not None:
+                    summary["completion_tokens"] = ct
+                if tt is not None:
+                    summary["total_tokens"] = tt
+            elif current_event == "done":
+                fr = data.get("finish_reason")
+                if fr:
+                    summary["finish_reason"] = fr
+    if output_count > 0:
+        summary["output_chunks"] = output_count
+    return summary if summary else None
+
+
 class ProxyRequestLogger:
     """将代理抓取到的完整请求/响应记录到明文文件，按 100MB 滚动存储。"""
     def __init__(self, log_dir, max_size_mb=100):
@@ -95,6 +154,12 @@ class ProxyRequestLogger:
                 body_preview = resp_body[:8192].decode("utf-8", "replace") if isinstance(resp_body, bytes) else str(resp_body)[:8192]
                 lines.append(f"--- Response Body ({len(resp_body)} bytes) ---")
                 lines.append(body_preview)
+            # SSE 流摘要：对 llm_utils_chat 请求解析 SSE 事件
+            sse_summary = extract_sse_summary(resp_headers, resp_body)
+            if sse_summary:
+                lines.append(f"--- SSE Summary ---")
+                for k, v in sse_summary.items():
+                    lines.append(f"  {k}: {v}")
             data = "\n".join(lines) + "\n"
             self._fd.write(data)
             self._fd.flush()
@@ -431,6 +496,64 @@ def update_account_jwt(user_id, jwt_full):
         log(f"  [JWT 自动追加新账号] user={user_id} -> name={new_acc['name']} exp={new_exp_str}")
         save_accounts()
         return "appended"
+
+
+def update_account_refresh_token(user_id, refresh_token):
+    """按 user_id 查找账号，更新 refresh_token 字段。
+    仅当新 token 非空且与旧值不同时才写盘。返回 'updated' / 'not_found' / 'unchanged'。"""
+    cfg = load_accounts()
+    with _accounts_lock:
+        accounts = cfg.get("accounts", [])
+        target = None
+        for a in accounts:
+            if str(a.get("UserID", "")) == str(user_id):
+                target = a
+                break
+        if not target:
+            return "not_found"
+        if target.get("refresh_token") == refresh_token:
+            return "unchanged"
+        target["refresh_token"] = refresh_token
+        target["refresh_token_updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        log(f"  [refresh_token 更新] user={user_id} 账号={target.get('name', '?')}")
+        save_accounts()
+        return "updated"
+
+
+def try_capture_refresh_token_from_response(host, path, resp_body):
+    """从 ExchangeToken 响应体中提取 refresh_token 并写回 accounts.json。
+    ExchangeToken 响应格式（参考 traework2api 逆向）：
+    {"code":0,"data":{"access_token":"<jwt>","refresh_token":"<rt>",...}}
+    或 {"code":0,"data":{"token":"<jwt>","refresh_token":"<rt>",...}}
+    """
+    if not resp_body or b"refresh_token" not in resp_body:
+        return
+    try:
+        body_str = resp_body.decode("utf-8", "replace")
+        data = json.loads(body_str)
+    except Exception:
+        return
+    inner = data.get("data", data) if isinstance(data, dict) else None
+    if not isinstance(inner, dict):
+        return
+    rt = inner.get("refresh_token")
+    if not rt or not isinstance(rt, str):
+        return
+    # 尝试从 access_token/token 提取 user_id
+    at = inner.get("access_token") or inner.get("token") or ""
+    if at:
+        validated = _valid_cloud_ide_jwt(at) if not at.startswith("Cloud-IDE-JWT") else at
+        if not validated:
+            validated = _valid_cloud_ide_jwt(at)
+        if validated:
+            uid = extract_user_id(validated)
+            if uid:
+                update_account_jwt(uid, validated)  # 同时更新 accessToken
+                update_account_refresh_token(uid, rt)
+                return
+    # 如果响应中没有 access_token，尝试用请求中的 user_id（由调用方注入）
+    log(f"  [refresh_token] 响应中含 refresh_token 但无法提取 user_id，跳过")
+
 
 # ---------------- 本地 Cookies 解密捕获 JWT (仅 Windows) ----------------
 # 背景：当前版本 TRAE 的鉴权请求(api.trae.cn)不走 Chromium `--proxy-server` 代理，
@@ -837,6 +960,9 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
         resp_body = resp.read()
         log(f"  [forward] <- {resp.status} {resp.reason} ({len(resp_body)} bytes) from {host}{path}")
         send_response(client_sock, resp.status, resp.reason, dict(resp.getheaders()), resp_body)
+        # 捕获 ExchangeToken 响应中的 refresh_token
+        if "ExchangeToken" in path or "oauth" in path.lower():
+            try_capture_refresh_token_from_response(host, path, resp_body)
         # 记录到代理请求日志
         pl = get_proxy_logger()
         if pl:
