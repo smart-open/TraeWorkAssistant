@@ -21,6 +21,232 @@ pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), Strin
     Ok(())
 }
 
+// ---------------- 代理请求日志 ----------------
+
+#[derive(Serialize, Clone)]
+pub struct ProxyLogEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub status: String,
+    pub size: usize,
+}
+
+#[derive(Serialize)]
+pub struct ProxyLogListResult {
+    pub entries: Vec<ProxyLogEntry>,
+    pub total: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyLogQueryOpts {
+    #[serde(default)]
+    pub keyword: Option<String>,
+    #[serde(default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub end_time: Option<String>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+fn proxy_log_dir(state: &State<AppState>) -> std::path::PathBuf {
+    let settings = state.settings();
+    settings
+        .proxy_log_path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| state.data_dir.join("proxy-logs"))
+}
+
+/// 解析单条代理日志，提取摘要信息
+fn parse_proxy_entry(raw: &str, file_name: &str, index: usize) -> Option<ProxyLogEntry> {
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    // 找到时间戳行: [2024-01-15 10:30:00] METHOD host/path
+    // 或: [2024-01-15 10:30:00] [WebSocket Upgrade] host/path
+    let header_line = lines.iter().find(|l| l.starts_with('['))?;
+    let timestamp = header_line
+        .get(1..20)
+        .unwrap_or("")
+        .to_string();
+
+    let rest = &header_line[header_line.find("] ").map(|i| i + 2).unwrap_or(0)..];
+
+    let (method, host, path, status) = if rest.starts_with("[WebSocket") {
+        // WebSocket 条目
+        let hp = rest.find("] ").map(|i| &rest[i + 2..]).unwrap_or(rest);
+        let (host, path) = split_host_path(hp);
+        ("WS".to_string(), host, path, "101 Upgrade".to_string())
+    } else {
+        // 普通请求
+        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+        let method = parts.first().unwrap_or(&"").to_string();
+        let hp = parts.get(1).unwrap_or(&"");
+        let (host, path) = split_host_path(hp);
+        // 从内容中提取状态码
+        let status = raw
+            .lines()
+            .find(|l| l.starts_with("--- Response:"))
+            .and_then(|l| {
+                l.trim_start_matches("--- Response: ")
+                    .trim_end_matches(" ---")
+                    .to_string()
+                    .into()
+            })
+            .unwrap_or_else(|| "-".to_string());
+        (method, host, path, status)
+    };
+
+    Some(ProxyLogEntry {
+        id: format!("{}:{}", file_name, index),
+        timestamp,
+        method,
+        host,
+        path,
+        status,
+        size: raw.len(),
+    })
+}
+
+fn split_host_path(hp: &str) -> (String, String) {
+    // hp 可能是 "api.trae.cn/trae/api/..." 或 "api.trae.cn"
+    if let Some(idx) = hp.find('/') {
+        (hp[..idx].to_string(), hp[idx..].to_string())
+    } else {
+        (hp.to_string(), String::new())
+    }
+}
+
+#[tauri::command]
+pub fn proxy_logs_list(
+    state: State<AppState>,
+    opts: ProxyLogQueryOpts,
+) -> Result<ProxyLogListResult, String> {
+    let log_dir = proxy_log_dir(&state);
+    if !log_dir.exists() {
+        return Ok(ProxyLogListResult {
+            entries: vec![],
+            total: 0,
+        });
+    }
+
+    // 列出所有 .log 文件，按文件名降序（新文件在前）
+    let mut files: Vec<String> = std::fs::read_dir(&log_dir)
+        .map_err(|e| format!("读取代理日志目录失败: {e}"))?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".log") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    files.sort_by(|a, b| b.cmp(a));
+
+    let keyword = opts.keyword.as_deref().unwrap_or("");
+    let start = opts.start_time.as_deref().unwrap_or("");
+    let end = opts.end_time.as_deref().unwrap_or("");
+    let offset = opts.offset.unwrap_or(0);
+    let limit = opts.limit.unwrap_or(50);
+
+    let mut all_entries: Vec<ProxyLogEntry> = Vec::new();
+
+    for file_name in &files {
+        let path = log_dir.join(file_name);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // 按 ====== 分隔条目
+        let mut index = 0;
+        for chunk in content.split("================================================================================") {
+            let chunk = chunk.trim();
+            if chunk.is_empty() {
+                continue;
+            }
+
+            // 时间过滤
+            if !start.is_empty() || !end.is_empty() {
+                let ts = chunk
+                    .lines()
+                    .next()
+                    .and_then(|l| l.get(1..20))
+                    .unwrap_or("");
+                if !start.is_empty() && ts < start {
+                    continue;
+                }
+                if !end.is_empty() && ts > end {
+                    continue;
+                }
+            }
+
+            // 关键字过滤
+            if !keyword.is_empty() && !chunk.to_lowercase().contains(&keyword.to_lowercase()) {
+                continue;
+            }
+
+            if let Some(entry) = parse_proxy_entry(chunk, file_name, index) {
+                all_entries.push(entry);
+            }
+            index += 1;
+        }
+    }
+
+    // 条目已按文件名降序排列（新文件在前），同文件内按出现顺序（也是新的在后）
+    // 反转同文件内的顺序，使最新的在前
+    all_entries.reverse();
+
+    let total = all_entries.len();
+    let entries = all_entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect();
+
+    Ok(ProxyLogListResult { entries, total })
+}
+
+#[tauri::command]
+pub fn proxy_log_detail(state: State<AppState>, id: String) -> Result<String, String> {
+    // id 格式: "filename:index"
+    let parts: Vec<&str> = id.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return Err("无效的日志 ID".into());
+    }
+    let file_name = parts[0];
+    let index: usize = parts[1].parse().map_err(|_| "无效的索引")?;
+
+    let log_dir = proxy_log_dir(&state);
+    let path = log_dir.join(file_name);
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读取日志文件失败: {e}"))?;
+
+    let mut current = 0;
+    for chunk in content.split("================================================================================") {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        if current == index {
+            return Ok(chunk.to_string());
+        }
+        current += 1;
+    }
+
+    Err("找不到指定的日志条目".into())
+}
+
 // ---------------- JWT 解析 ----------------
 
 #[derive(Serialize)]

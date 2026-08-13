@@ -19,8 +19,8 @@ const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'accounts', label: '账号管理', icon: Users },
   { key: 'checkin', label: '一键签到', icon: PlayCircle },
   { key: 'credits', label: '积分看板', icon: Coins },
-  { key: 'logs', label: '运行日志', icon: ScrollText },
-  { key: 'settings', label: '设置', icon: Settings },
+  { key: 'logs', label: '系统日志', icon: ScrollText },
+  { key: 'settings', label: '系统设置', icon: Settings },
 ];
 
 export default function Sidebar({

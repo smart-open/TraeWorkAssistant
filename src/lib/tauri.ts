@@ -9,6 +9,7 @@ import type {
   GroupView,
   JwtParseResult,
   LogLine,
+  ProxyLogListResult,
   ProxyStatus,
   Settings,
 } from '../types';
@@ -73,6 +74,22 @@ export const api = {
     taskRegister: (time: string) => invoke('task_register', { time }),
     taskStatus: () => invoke<string>('task_status'),
     taskUnregister: () => invoke('task_unregister'),
+    proxyLogsList: (opts: {
+      keyword?: string;
+      startTime?: string;
+      endTime?: string;
+      offset?: number;
+      limit?: number;
+    }) => invoke<ProxyLogListResult>('proxy_logs_list', {
+      opts: {
+        keyword: opts.keyword,
+        start_time: opts.startTime,
+        end_time: opts.endTime,
+        offset: opts.offset,
+        limit: opts.limit,
+      },
+    }),
+    proxyLogDetail: (id: string) => invoke<string>('proxy_log_detail', { id }),
   },
   switchAccount: (userId: string) => invoke('switch_account', { userId }),
 };

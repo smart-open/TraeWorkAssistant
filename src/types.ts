@@ -111,3 +111,18 @@ export interface CreditRecord {
   credits: number;
   delta: number;
 }
+
+export interface ProxyLogEntry {
+  id: string;
+  timestamp: string;
+  method: string;
+  host: string;
+  path: string;
+  status: string;
+  size: number;
+}
+
+export interface ProxyLogListResult {
+  entries: ProxyLogEntry[];
+  total: number;
+}

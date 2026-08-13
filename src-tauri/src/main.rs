@@ -59,6 +59,8 @@ fn main() {
             commands::misc::task_register,
             commands::misc::task_status,
             commands::misc::task_unregister,
+            commands::misc::proxy_logs_list,
+            commands::misc::proxy_log_detail,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();
