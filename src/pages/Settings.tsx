@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Copy, Calendar, Power, Trash2, Save, Search } from 'lucide-react';
+import { Calendar, Power, Trash2, Save, Search, RotateCcw } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
+import type { Settings as SettingsType } from '../types';
 
 export default function Settings() {
   const settings = useAppStore((s) => s.settings);
@@ -15,15 +16,43 @@ export default function Settings() {
   const [taskInfo, setTaskInfo] = useState<string>('');
   const [busyTask, setBusyTask] = useState(false);
 
+  // 本地表单状态：用户编辑后点击「保存」才持久化，避免每次按键都写文件
+  const [form, setForm] = useState<SettingsType | null>(null);
+  const [saving, setSaving] = useState(false);
+
   useEffect(() => {
     void refreshSettings();
+    void query();
   }, [refreshSettings]);
 
-  const update = <K extends keyof NonNullable<typeof settings>>(
-    key: K,
-    val: NonNullable<typeof settings>[K],
-  ) => {
-    void saveSettings({ [key]: val } as Partial<NonNullable<typeof settings>>);
+  // settings 从后端加载完毕后同步到本地 form
+  useEffect(() => {
+    if (settings && !form) {
+      setForm(settings);
+    }
+  }, [settings, form]);
+
+  const dirty = form != null && settings != null && JSON.stringify(form) !== JSON.stringify(settings);
+
+  const update = <K extends keyof SettingsType>(key: K, val: SettingsType[K]) => {
+    setForm((prev) => (prev ? { ...prev, [key]: val } : prev));
+  };
+
+  const save = async () => {
+    if (!form) return;
+    setSaving(true);
+    try {
+      await saveSettings(form);
+      toast('success', '设置已保存');
+    } catch {
+      /* toast 已发出 */
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const reset = () => {
+    if (settings) setForm({ ...settings });
   };
 
   const register = async () => {
@@ -76,7 +105,7 @@ export default function Settings() {
     }
   };
 
-  if (!settings) {
+  if (!form) {
     return (
       <div className="animate-fade-in">
         <PageHeader title="设置" />
@@ -90,6 +119,23 @@ export default function Settings() {
       <PageHeader
         title="设置"
         desc="主题、代理端口、定时任务与邀请链接"
+        actions={
+          dirty ? (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-amber-500">有未保存的更改</span>
+              <button onClick={reset} className="btn-outline">
+                <RotateCcw size={15} /> 撤销
+              </button>
+              <button onClick={save} disabled={saving} className="btn-primary">
+                <Save size={15} /> {saving ? '保存中…' : '保存'}
+              </button>
+            </div>
+          ) : (
+            <button onClick={save} disabled={saving || !dirty} className="btn-outline opacity-50">
+              <Save size={15} /> 已保存
+            </button>
+          )
+        }
       />
 
       <div className="grid gap-4 md:grid-cols-2">
@@ -99,7 +145,7 @@ export default function Settings() {
             <div>
               <label className="label">主题</label>
               <select
-                value={settings.theme}
+                value={form.theme}
                 onChange={(e) => update('theme', e.target.value)}
                 className="input"
               >
@@ -111,7 +157,7 @@ export default function Settings() {
             <div>
               <label className="label">语言</label>
               <select
-                value={settings.language}
+                value={form.language}
                 onChange={(e) => update('language', e.target.value)}
                 className="input"
               >
@@ -128,7 +174,7 @@ export default function Settings() {
             <div>
               <label className="label">通知方式</label>
               <select
-                value={settings.notify}
+                value={form.notify}
                 onChange={(e) => update('notify', e.target.value)}
                 className="input"
               >
@@ -141,7 +187,7 @@ export default function Settings() {
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
-                checked={settings.launch_minimized}
+                checked={form.launch_minimized}
                 onChange={(e) => update('launch_minimized', e.target.checked)}
               />
               启动时最小化到托盘
@@ -149,7 +195,7 @@ export default function Settings() {
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
-                checked={settings.tray}
+                checked={form.tray}
                 onChange={(e) => update('tray', e.target.checked)}
               />
               启用系统托盘图标
@@ -165,9 +211,11 @@ export default function Settings() {
               <label className="label">代理端口</label>
               <input
                 type="number"
-                value={settings.proxy_port}
-                onChange={(e) => update('proxy_port', Number(e.target.value) || 8899)}
+                value={form.proxy_port}
+                onChange={(e) => update('proxy_port', Math.min(65535, Math.max(1, Number(e.target.value) || 8899)))}
                 className="input w-32"
+                min={1}
+                max={65535}
               />
             </div>
             <div>
@@ -175,7 +223,7 @@ export default function Settings() {
               <div className="flex items-center gap-2">
                 <input
                   type="text"
-                  value={settings.trae_path ?? ''}
+                  value={form.trae_path ?? ''}
                   onChange={(e) => update('trae_path', e.target.value.trim() || null)}
                   placeholder="留空则自动检测（默认 C:\Users\你\AppData\Local\Programs\TRAE SOLO CN\TRAE SOLO CN.exe）"
                   className="input flex-1"
@@ -191,7 +239,7 @@ export default function Settings() {
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
-                checked={settings.auto_start_proxy}
+                checked={form.auto_start_proxy}
                 onChange={(e) => update('auto_start_proxy', e.target.checked)}
               />
               启动时自动开启代理
@@ -199,7 +247,7 @@ export default function Settings() {
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
-                checked={settings.checkin_skip_checked}
+                checked={form.checkin_skip_checked}
                 onChange={(e) => update('checkin_skip_checked', e.target.checked)}
               />
               签到默认跳过今日已签
@@ -207,7 +255,7 @@ export default function Settings() {
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
-                checked={settings.checkin_skip_expired}
+                checked={form.checkin_skip_expired}
                 onChange={(e) => update('checkin_skip_expired', e.target.checked)}
               />
               签到默认跳过 JWT 过期
@@ -216,8 +264,8 @@ export default function Settings() {
               <label className="label">失败重试次数</label>
               <input
                 type="number"
-                value={settings.retry}
-                onChange={(e) => update('retry', Number(e.target.value) || 0)}
+                value={form.retry}
+                onChange={(e) => update('retry', Math.min(5, Math.max(0, Number(e.target.value) || 0)))}
                 className="input w-24"
                 min={0}
                 max={5}
@@ -227,8 +275,8 @@ export default function Settings() {
               <label className="label">日志保留天数</label>
               <input
                 type="number"
-                value={settings.log_retention_days}
-                onChange={(e) => update('log_retention_days', Number(e.target.value) || 30)}
+                value={form.log_retention_days}
+                onChange={(e) => update('log_retention_days', Math.min(365, Math.max(1, Number(e.target.value) || 30)))}
                 className="input w-24"
                 min={1}
                 max={365}
@@ -283,6 +331,19 @@ export default function Settings() {
           </div>
         </section>
       </div>
+
+      {/* 底部悬浮保存条 */}
+      {dirty && (
+        <div className="mt-4 flex items-center justify-end gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/20">
+          <span className="text-sm text-amber-600 dark:text-amber-400">有未保存的更改</span>
+          <button onClick={reset} className="btn-outline">
+            <RotateCcw size={15} /> 撤销更改
+          </button>
+          <button onClick={save} disabled={saving} className="btn-primary">
+            <Save size={15} /> {saving ? '保存中…' : '保存设置'}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

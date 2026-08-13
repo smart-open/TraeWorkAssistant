@@ -67,8 +67,10 @@ interface AppState {
 
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
+  openTraeWithProxy: () => Promise<void>;
   addAccount: (name: string, jwt: string, groupId?: string) => Promise<void>;
   deleteAccount: (userId: string, deleteProfile: boolean) => Promise<void>;
+  updateAccount: (userId: string, name?: string, jwt?: string) => Promise<void>;
   createGroup: (name: string, color: string) => Promise<void>;
   updateGroup: (
     id: string,
@@ -135,7 +137,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     unsubs = [];
     unsubs = await setupListeners({
       onProxyLog: (line) =>
-        set((s) => ({ proxyLog: [...s.proxyLog.slice(-199), line] })),
+        set((s) => ({ proxyLog: [line, ...s.proxyLog.slice(0, 199)] })),
       onAccountCaptured: (uid) => {
         // 事件驱动累加捕获数（后端 Arc<AtomicI64> 的实时镜像，避免轮询）
         set((s) => ({ proxy: { ...s.proxy, captured: s.proxy.captured + 1 } }));
@@ -292,7 +294,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   startProxy: async () => {
-    const port = get().settings?.proxy_port ?? 8899;
+    const port = get().settings?.proxy_port || 8899;
     try {
       const proxy = await api.proxy.start(port);
       set({ proxy, proxyLog: [] });
@@ -308,6 +310,41 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('info', '代理已停止');
     } catch (err) {
       get().pushToast('error', `停止代理失败：${String(err)}`);
+    }
+  },
+  openTraeWithProxy: async () => {
+    const env = get().env;
+    if (!env?.installed) {
+      get().pushToast('info', '未检测到 Trae Work 安装，正在打开下载页…');
+      try {
+        await api.env.openSite();
+      } catch (err) {
+        get().pushToast('error', `打开下载页失败：${String(err)}`);
+      }
+      return;
+    }
+    // 确保代理在请求路径上：未运行则先启动，否则打开 Trae Work 也不会走代理、无法捕获账号
+    let port: number | undefined = get().proxy.running ? get().proxy.port : undefined;
+    if (!port) {
+      // 可能残留端口为 0 的无效代理，先停掉再以有效端口重启
+      if (get().proxy.running) {
+        try { await get().stopProxy(); } catch { /* ignore */ }
+      }
+      get().pushToast('info', '正在启动代理以确保 Trae Work 走本地代理…');
+      await get().startProxy();
+      port = get().proxy.running ? get().proxy.port : undefined;
+    }
+    try {
+      if (port) {
+        await api.env.openApp(port);
+        get().pushToast('success', `已打开 Trae Work（代理已注入 127.0.0.1:${port}）`);
+      } else {
+        // 代理启动失败：仍打开客户端，但明确告知不会捕获账号
+        await api.env.openApp(undefined);
+        get().pushToast('warn', '代理启动失败，已直接打开 Trae Work（账号不会被自动捕获）');
+      }
+    } catch (err) {
+      get().pushToast('error', `打开 Trae Work 失败：${String(err)}`);
     }
   },
   addAccount: async (name, jwt, groupId) => {
@@ -327,6 +364,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('info', '账号已删除');
     } catch (err) {
       get().pushToast('error', `删除失败：${String(err)}`);
+    }
+  },
+  updateAccount: async (userId, name, jwt) => {
+    try {
+      await api.accounts.update(userId, name, jwt);
+      await get().refreshAccounts();
+      get().pushToast('success', '账号已更新');
+    } catch (err) {
+      get().pushToast('error', `更新失败：${String(err)}`);
+      throw err;
     }
   },
   createGroup: async (name, color) => {
@@ -396,9 +443,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   startCheckin: async (opts) => {
+    // 重置签到状态，避免显示上一次的进度
+    set({ checkin: { active: true, total: 0, index: 0, results: [], done: null } });
     try {
       await api.checkin.start(opts);
     } catch (err) {
+      set((s) => ({ checkin: { ...s.checkin, active: false } }));
       get().pushToast('error', `发起签到失败：${String(err)}`);
     }
   },
@@ -409,6 +459,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       await api.misc.settingsSet(next);
     } catch (err) {
+      // 回滚到修改前的值，避免 UI 显示与后端不一致
+      set({ settings: current });
       get().pushToast('error', `保存设置失败：${String(err)}`);
     }
   },

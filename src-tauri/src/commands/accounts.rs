@@ -71,6 +71,42 @@ pub fn account_delete(
     Ok(())
 }
 
+#[tauri::command]
+pub fn account_update(
+    state: State<AppState>,
+    user_id: String,
+    name: Option<String>,
+    jwt: Option<String>,
+) -> Result<(), String> {
+    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let a = accounts
+        .accounts
+        .iter_mut()
+        .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+        .ok_or("账号不存在")?;
+
+    if let Some(n) = name {
+        let n = n.trim().to_string();
+        if !n.is_empty() {
+            a.name = n;
+        }
+    }
+    if let Some(j) = jwt {
+        let j = j.trim().to_string();
+        if !j.is_empty() {
+            // 更新 JWT 后同步 user_id（JWT 可能换了账号）
+            let info = crate::jwt::parse(&j);
+            if let Some(uid) = info.user_id {
+                a.user_id = Some(uid);
+            }
+            a.jwt = j;
+        }
+    }
+    a.updated_at = Some(fs_utils::now_iso());
+    fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+    Ok(())
+}
+
 // ---------------- 分组 ----------------
 
 #[derive(Serialize)]
@@ -244,7 +280,9 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
             user_id: uid,
             name: a.name.clone(),
             group_id,
+            jwt: a.jwt.clone(),
             jwt_exp_hours: info.exp_hours,
+            jwt_exp_timestamp: info.exp_timestamp,
             checked_today: Some(checked),
             credits: credits_val,
             device_id_masked: device_mask,

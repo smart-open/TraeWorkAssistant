@@ -30,8 +30,9 @@
 
 ## 4. 账号与分组
 
-### `accounts_list()` → `Account[]`
-- `Account`: `{ userId, name, groupId|null, jwtExpHours: number|null, checkedToday: boolean|null, credits: number|null, deviceIdMasked: string|null }`
+### `accounts_list()` -> `Account[]`
+- `Account`: `{ userId, name, groupId|null, jwt: string, jwtExpHours: number|null, jwtExpTimestamp: number|null, checkedToday: boolean|null, credits: number|null, deviceIdMasked: string|null }`
+- `jwt` 为账号完整 JWT 原文（供前端「查看 JWT」弹窗展示与复制）；`jwtExpTimestamp` 为 JWT 过期 Unix 时间戳（秒），供前端格式化过期日期。
 - `credits` 取 `credits_history.json` 中该账号**最新日期**的余额（非历史峰值），无记录时为 `null`。
 
 ### `credits_history()` → `CreditRecord[]`
@@ -39,8 +40,10 @@
 - `CreditRecord`: `{ date: string, user_id: string, credits: number, delta: number }`（`date` 为本地 `YYYY-MM-DD`；`credits`=当日余额，`delta`=当日新增）。
 - 数据源 `credits_history.json` 由 `auto_checkin.py` 在签到时按日期**追加落盘**（自动裁剪到 90 天）。
 
-### `account_add_manual(name, jwt, groupId?)` → `{ ok, error? }`
-### `account_delete(userId, deleteProfile)` → `{ ok, error? }`
+### `account_add_manual(name, jwt, groupId?)` -> `{ ok, error? }`
+### `account_update(userId, name?, jwt?)` -> `{ ok, error? }`
+- 更新账号名称和/或 JWT。传 `jwt` 时重新解析 UserID 并同步写回（JWT 可能换了账号），同时刷新 `updated_at`；`name`/`jwt` 均可选，仅传需要修改的字段。
+### `account_delete(userId, deleteProfile)` -> `{ ok, error? }`
 
 ### `groups_list()` → `Group[]`
 - `Group`: `{ id, name, color, order, count }`
@@ -59,8 +62,11 @@
 
 ## 6. JWT 续期 / 切换 / 设备
 
-### `jwt_parse(jwt)` → `{ userId, expHours, status: "ok"|"warn"|"expired" }`
-### `switch_account(userId)` → `{ ok, error? }`
+### `jwt_parse(jwt)` -> `{ userId, expHours, expTimestamp, status: "ok"|"warn"|"expired"|"unknown" }`
+- `expTimestamp` 为 JWT 过期 Unix 时间戳（秒）。
+- `exp` 兼容整数与浮点数（依次尝试 `as_i64` / `as_f64` / 数字字符串解析）；`userId`（payload `data.id`）兼容字符串与整数。
+
+### `switch_account(userId)` -> `{ ok, error? }`
 - 调 PowerShell 切换器（非交互 `-Action Switch -UserId`）；事件 `switch-progress` 回传步骤。
 ### `device_reset(userId)` → `{ ok, error? }`
 - 删除 `device_map.json` 该条目。

@@ -50,7 +50,6 @@ export default function Dashboard() {
 
   const refresh = async () => {
     toast('info', '刷新中…');
-    // 简单做法：依次触发 store 刷新动作
     const s = useAppStore.getState();
     await Promise.all([
       s.refreshEnv(),
@@ -58,27 +57,20 @@ export default function Dashboard() {
       s.refreshProxy(),
       s.refreshAccounts(),
       s.refreshGroups(),
+      s.refreshCreditsHistory(),
     ]);
     toast('success', '已刷新');
   };
 
   const openTrae = async () => {
-    try {
-      if (env?.installed) {
-        await api.env.openApp(proxy.running ? proxy.port : undefined);
-      } else {
-        await api.env.openSite();
-      }
-    } catch (e) {
-      toast('error', `打开 Trae Work 失败：${String(e)}`);
-    }
+    await useAppStore.getState().openTraeWithProxy();
   };
 
   return (
     <div className="animate-fade-in">
       <PageHeader
         title="概览"
-        desc="Trae 多账号签到工作台 · 一眼掌握状态与快捷入口"
+        desc="Trae Work 多账号签到工作台 · 一眼掌握状态与快捷入口"
         actions={
           <button onClick={refresh} className="btn-outline">
             <RefreshCw size={15} /> 刷新
@@ -108,8 +100,8 @@ export default function Dashboard() {
           <div className="flex items-center gap-3">
             <ShieldAlert className="text-amber-500" />
             <div>
-              <div className="font-medium">未检测到 Trae 安装</div>
-              <div className="text-xs text-slate-500">请先安装 Trae，再启动代理进行账号登录态捕获。</div>
+              <div className="font-medium">未检测到 Trae Work 安装</div>
+              <div className="text-xs text-slate-500">请先安装 Trae Work，再启动代理进行账号登录态捕获。</div>
             </div>
           </div>
           <button
@@ -129,7 +121,18 @@ export default function Dashboard() {
               <div className="text-xs text-slate-500">代理已启动但 TRAE 不信任代理证书将无法拦截签到接口。</div>
             </div>
           </div>
-          <button onClick={() => api.cert.install()} className="btn-primary">
+          <button
+            onClick={async () => {
+              try {
+                await api.cert.install();
+                await useAppStore.getState().refreshCert();
+                toast('success', '证书安装成功');
+              } catch (e) {
+                toast('error', `证书安装失败：${String(e)}`);
+              }
+            }}
+            className="btn-primary"
+          >
             一键安装证书
           </button>
         </div>

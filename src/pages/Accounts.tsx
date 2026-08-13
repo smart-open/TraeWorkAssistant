@@ -10,6 +10,9 @@ import {
   AlertTriangle,
   HelpCircle,
   KeyRound,
+  Pencil,
+  Eye,
+  Copy,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
@@ -35,6 +38,7 @@ export default function Accounts() {
   const refreshGroups = useAppStore((s) => s.refreshGroups);
   const addAccount = useAppStore((s) => s.addAccount);
   const deleteAccount = useAppStore((s) => s.deleteAccount);
+  const updateAccount = useAppStore((s) => s.updateAccount);
   const createGroup = useAppStore((s) => s.createGroup);
   const updateGroup = useAppStore((s) => s.updateGroup);
   const removeGroup = useAppStore((s) => s.removeGroup);
@@ -47,6 +51,8 @@ export default function Accounts() {
   const [filter, setFilter] = useState<string>('all');
   const [addOpen, setAddOpen] = useState(false);
   const [groupOpen, setGroupOpen] = useState(false);
+  const [editTarget, setEditTarget] = useState<AccountView | null>(null);
+  const [jwtTarget, setJwtTarget] = useState<AccountView | null>(null);
 
   const filtered = useMemo(() => {
     if (filter === 'all') return accounts;
@@ -62,6 +68,15 @@ export default function Accounts() {
   const onDelete = async (a: AccountView) => {
     if (!confirm(`确认删除账号「${a.name}」？${a.device_id_masked ? '（会一并清理设备 ID）' : ''}`)) return;
     await deleteAccount(a.user_id, true);
+  };
+
+  const copyJwt = async (jwt: string) => {
+    try {
+      await navigator.clipboard.writeText(jwt);
+      toast('success', 'JWT 已复制到剪贴板');
+    } catch {
+      toast('error', '复制失败，请手动选择文本复制');
+    }
   };
 
   return (
@@ -134,7 +149,6 @@ export default function Accounts() {
             </thead>
             <tbody>
               {filtered.map((a) => {
-                const g = groups.find((x) => x.id === a.group_id);
                 return (
                   <tr key={a.user_id} className="border-t border-slate-200 dark:border-slate-800">
                     <td className="px-4 py-3">
@@ -149,9 +163,18 @@ export default function Accounts() {
                       />
                     </td>
                     <td className="px-4 py-3">
-                      <JwtStatusBadge hours={a.jwt_exp_hours} />
+                      <div className="flex items-center gap-1">
+                        <JwtStatusBadge hours={a.jwt_exp_hours} />
+                        <button
+                          title="查看 JWT"
+                          onClick={() => setJwtTarget(a)}
+                          className="btn-ghost !p-1"
+                        >
+                          <Eye size={13} />
+                        </button>
+                      </div>
                     </td>
-                    <td className="px-4 py-3 font-mono text-xs text-slate-500">{a.device_id_masked ?? '—'}</td>
+                    <td className="px-4 py-3 font-mono text-xs text-slate-500">{a.device_id_masked ?? '-'}</td>
                     <td className="px-4 py-3">
                       {a.checked_today ? (
                         <Badge tone="green">已签</Badge>
@@ -160,10 +183,13 @@ export default function Accounts() {
                       )}
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums">
-                      {a.credits != null ? a.credits.toLocaleString() : '—'}
+                      {a.credits != null ? a.credits.toLocaleString() : '-'}
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1">
+                        <button title="编辑账号" onClick={() => setEditTarget(a)} className="btn-ghost !p-2">
+                          <Pencil size={14} />
+                        </button>
                         {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24) && (
                           <button
                             title="续期 JWT（启动代理并切换账号）"
@@ -204,6 +230,24 @@ export default function Accounts() {
             /* toast 已发出 */
           }
         }}
+      />
+      <EditAccountModal
+        account={editTarget}
+        onClose={() => setEditTarget(null)}
+        onSubmit={async (name, jwt) => {
+          if (!editTarget) return;
+          try {
+            await updateAccount(editTarget.user_id, name, jwt);
+            setEditTarget(null);
+          } catch {
+            /* toast 已发出 */
+          }
+        }}
+      />
+      <JwtViewModal
+        account={jwtTarget}
+        onClose={() => setJwtTarget(null)}
+        onCopy={copyJwt}
       />
       <GroupsModal
         open={groupOpen}
@@ -291,7 +335,7 @@ function AddAccountModal({
         const r = await api.misc.jwtParse(v);
         if (!cancel) setInfo(r);
       } catch {
-        if (!cancel) setInfo({ user_id: null, exp_hours: null, status: 'unknown' });
+        if (!cancel) setInfo({ user_id: null, exp_hours: null, exp_timestamp: null, status: 'unknown' });
       }
     }, 200);
     return () => {
@@ -359,7 +403,9 @@ function AddAccountModal({
               <span className="text-slate-500">UserID</span>
               <span className="font-mono">{info.user_id ?? '无法识别'}</span>
               <span className="text-slate-500">剩余</span>
-              <span>{info.exp_hours != null ? `${info.exp_hours.toFixed(1)} 小时` : '—'}</span>
+              <span>{info.exp_hours != null ? `${info.exp_hours.toFixed(1)} 小时` : '-'}</span>
+              <span className="text-slate-500">过期时间</span>
+              <span>{info.exp_timestamp != null ? new Date(info.exp_timestamp * 1000).toLocaleString('zh-CN') : '-'}</span>
               <span className="text-slate-500">状态</span>
               <span>
                 {info.status === 'ok' && '✅ 健康'}
@@ -370,6 +416,190 @@ function AddAccountModal({
             </div>
           </div>
         )}
+      </div>
+    </Modal>
+  );
+}
+
+function EditAccountModal({
+  account,
+  onClose,
+  onSubmit,
+}: {
+  account: AccountView | null;
+  onClose: () => void;
+  onSubmit: (name?: string, jwt?: string) => Promise<void>;
+}) {
+  const [name, setName] = useState('');
+  const [jwt, setJwt] = useState('');
+  const [info, setInfo] = useState<JwtParseResult | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (account) {
+      setName(account.name);
+      setJwt('');
+      setInfo(null);
+      setBusy(false);
+    }
+  }, [account]);
+
+  useEffect(() => {
+    const v = jwt.trim();
+    if (!v) {
+      setInfo(null);
+      return;
+    }
+    let cancel = false;
+    const t = setTimeout(async () => {
+      try {
+        const r = await api.misc.jwtParse(v);
+        if (!cancel) setInfo(r);
+      } catch {
+        if (!cancel) setInfo({ user_id: null, exp_hours: null, exp_timestamp: null, status: 'unknown' });
+      }
+    }, 200);
+    return () => {
+      cancel = true;
+      clearTimeout(t);
+    };
+  }, [jwt]);
+
+  const submit = async () => {
+    if (!account) return;
+    const nameChanged = name.trim() && name.trim() !== account.name;
+    const jwtChanged = jwt.trim().length > 0;
+    if (!nameChanged && !jwtChanged) {
+      onClose();
+      return;
+    }
+    setBusy(true);
+    try {
+      await onSubmit(
+        nameChanged ? name.trim() : undefined,
+        jwtChanged ? jwt.trim() : undefined,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={!!account}
+      onClose={onClose}
+      title="编辑账号"
+      footer={
+        <>
+          <button onClick={onClose} className="btn-ghost">取消</button>
+          <button onClick={submit} disabled={busy} className="btn-primary">
+            {busy ? '保存中…' : '保存'}
+          </button>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        <div>
+          <label className="label">账号备注名</label>
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="input"
+            placeholder="例如：me_1676"
+          />
+        </div>
+        <div>
+          <label className="label">新 JWT（留空则不修改）</label>
+          <textarea
+            value={jwt}
+            onChange={(e) => setJwt(e.target.value)}
+            className="input min-h-[120px] font-mono text-xs"
+            placeholder="粘贴新 JWT 以替换（支持 Cloud-IDE-JWT 前缀）"
+          />
+        </div>
+        {info && (
+          <div className="rounded-lg border border-slate-200 p-3 text-xs dark:border-slate-700">
+            <div>新 JWT 解析结果：</div>
+            <div className="mt-1 grid grid-cols-2 gap-1">
+              <span className="text-slate-500">UserID</span>
+              <span className="font-mono">{info.user_id ?? '无法识别'}</span>
+              <span className="text-slate-500">剩余</span>
+              <span>{info.exp_hours != null ? `${info.exp_hours.toFixed(1)} 小时` : '-'}</span>
+              <span className="text-slate-500">过期时间</span>
+              <span>{info.exp_timestamp != null ? new Date(info.exp_timestamp * 1000).toLocaleString('zh-CN') : '-'}</span>
+              <span className="text-slate-500">状态</span>
+              <span>
+                {info.status === 'ok' && '✅ 健康'}
+                {info.status === 'warn' && '⚠️ 即将过期'}
+                {info.status === 'expired' && '❌ 已过期'}
+                {info.status === 'unknown' && '❓ 无法解析'}
+              </span>
+            </div>
+          </div>
+        )}
+        {jwt.trim() && info && info.user_id && account && info.user_id !== account.user_id && (
+          <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
+            ⚠️ 新 JWT 的 UserID（{info.user_id}）与当前账号（{account.user_id}）不同，保存后 user_id 将更新。
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function JwtViewModal({
+  account,
+  onClose,
+  onCopy,
+}: {
+  account: AccountView | null;
+  onClose: () => void;
+  onCopy: (jwt: string) => void;
+}) {
+  if (!account) return null;
+  return (
+    <Modal
+      open={!!account}
+      onClose={onClose}
+      title={`JWT - ${account.name}`}
+      footer={
+        <>
+          <button onClick={onClose} className="btn-ghost">关闭</button>
+          <button
+            onClick={() => onCopy(account.jwt)}
+            className="btn-primary"
+          >
+            <Copy size={14} /> 复制 JWT
+          </button>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        <div className="grid grid-cols-2 gap-2 text-xs">
+          <span className="text-slate-500">UserID</span>
+          <span className="font-mono">{account.user_id}</span>
+          <span className="text-slate-500">JWT 剩余</span>
+          <span>
+            {account.jwt_exp_hours != null
+              ? `${account.jwt_exp_hours.toFixed(1)} 小时`
+              : '未知'}
+          </span>
+          <span className="text-slate-500">过期时间</span>
+          <span>
+            {account.jwt_exp_timestamp != null
+              ? new Date(account.jwt_exp_timestamp * 1000).toLocaleString('zh-CN')
+              : '未知'}
+          </span>
+        </div>
+        <div>
+          <label className="label">JWT 原文</label>
+          <textarea
+            readOnly
+            value={account.jwt}
+            className="input min-h-[160px] font-mono text-xs"
+            onClick={(e) => (e.target as HTMLTextAreaElement).select()}
+          />
+        </div>
       </div>
     </Modal>
   );

@@ -19,16 +19,7 @@ export default function TopBar() {
   const pushToast = useAppStore((s) => s.pushToast);
 
   const openTrae = async () => {
-    try {
-      const { api } = await import('../lib/tauri');
-      if (env?.installed) {
-        await api.env.openApp(proxy.running ? proxy.port : undefined);
-      } else {
-        await api.env.openSite();
-      }
-    } catch (e) {
-      pushToast('error', `打开 Trae Work 失败：${String(e)}`);
-    }
+    await useAppStore.getState().openTraeWithProxy();
   };
 
   return (
@@ -36,12 +27,12 @@ export default function TopBar() {
       <div className="flex items-center gap-2">
         {env?.installed ? (
           <Badge tone="green">
-            <MonitorCheck size={13} /> Trae 已安装
+            <MonitorCheck size={13} /> Trae Work 已安装
             {env.version ? ` v${env.version}` : ''}
           </Badge>
         ) : (
           <Badge tone="red">
-            <MonitorX size={13} /> Trae 未安装
+            <MonitorX size={13} /> Trae Work 未安装
           </Badge>
         )}
         {certInstalled ? (

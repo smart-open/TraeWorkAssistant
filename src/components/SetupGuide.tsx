@@ -29,16 +29,12 @@ export default function SetupGuide() {
   const steps: Step[] = [
     {
       key: 'install',
-      title: '安装 Trae 客户端',
+      title: '安装 Trae Work 客户端',
       desc: '签到目标客户端，需先安装并登录至少一个账号。',
       done: !!env?.installed,
       actionLabel: env?.installed ? '打开 Trae Work' : '前往下载',
       run: async () => {
-        if (env?.installed) {
-          await api.env.openApp(proxy.running ? proxy.port : undefined);
-        } else {
-          await api.env.openSite();
-        }
+        await useAppStore.getState().openTraeWithProxy();
         await refreshEnv();
       },
     },
@@ -66,7 +62,7 @@ export default function SetupGuide() {
     {
       key: 'account',
       title: '添加账号',
-      desc: '至少添加一个 Trae 账号，才能执行签到。',
+      desc: '至少添加一个 Trae Work 账号，才能执行签到。',
       done: accounts.length > 0,
       actionLabel: '去添加',
       run: () => setView('accounts'),
@@ -153,7 +149,7 @@ export default function SetupGuide() {
               </code>{' '}
               代理，无需手动配置）。
             </p>
-            <p>2. 在 Trae 中登录账号，授权头经过代理后会自动写入「账号管理」。</p>
+            <p>2. 在 Trae Work 中登录账号，授权头经过代理后会自动写入「账号管理」。</p>
             <p>3. 若仍无账号，请确认 CA 证书已安装并信任。</p>
           </div>
         </div>

@@ -27,7 +27,9 @@ export interface AccountView {
   user_id: string;
   name: string;
   group_id: string | null;
+  jwt: string;
   jwt_exp_hours: number | null;
+  jwt_exp_timestamp: number | null;
   checked_today: boolean | null;
   credits: number | null;
   device_id_masked: string | null;
@@ -46,6 +48,7 @@ export type JwtStatus = 'ok' | 'warn' | 'expired' | 'unknown';
 export interface JwtParseResult {
   user_id: string | null;
   exp_hours: number | null;
+  exp_timestamp: number | null;
   status: JwtStatus;
 }
 

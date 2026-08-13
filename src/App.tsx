@@ -25,6 +25,8 @@ function renderView(view: string) {
       return <Logs />;
     case 'settings':
       return <Settings />;
+    default:
+      return <Dashboard />;
   }
 }
 
@@ -32,10 +34,13 @@ export default function App() {
   const view = useAppStore((s) => s.view);
   const setView = useAppStore((s) => s.setView);
   const init = useAppStore((s) => s.init);
+  const ready = useAppStore((s) => s.ready);
   const settings = useAppStore((s) => s.settings);
 
   useEffect(() => {
-    void init();
+    void init().catch((err) => {
+      console.error('初始化失败:', err);
+    });
   }, [init]);
 
   useEffect(() => {
@@ -49,6 +54,17 @@ export default function App() {
     mq.addEventListener('change', apply);
     return () => mq.removeEventListener('change', apply);
   }, [settings?.theme]);
+
+  if (!ready) {
+    return (
+      <div className="flex h-full items-center justify-center bg-slate-100 dark:bg-slate-950">
+        <div className="flex flex-col items-center gap-3">
+          <div className="h-8 w-8 animate-spin rounded-full border-3 border-brand-500 border-t-transparent" />
+          <span className="text-sm text-slate-500">正在加载…</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-slate-950 dark:text-slate-100">

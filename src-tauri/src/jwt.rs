@@ -6,6 +6,7 @@ use base64::Engine;
 pub struct JwtInfo {
     pub user_id: Option<String>,
     pub exp_hours: Option<f64>,
+    pub exp_timestamp: Option<i64>,
 }
 
 pub fn parse(jwt_full: &str) -> JwtInfo {
@@ -17,6 +18,7 @@ pub fn parse(jwt_full: &str) -> JwtInfo {
         return JwtInfo {
             user_id: None,
             exp_hours: None,
+            exp_timestamp: None,
         };
     }
     // padding 与 Python 一致：(4 - len % 4) % 4
@@ -25,28 +27,45 @@ pub fn parse(jwt_full: &str) -> JwtInfo {
         return JwtInfo {
             user_id: None,
             exp_hours: None,
+            exp_timestamp: None,
         };
     };
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return JwtInfo {
             user_id: None,
             exp_hours: None,
+            exp_timestamp: None,
         };
     };
     let user_id = payload
         .get("data")
         .and_then(|d| d.get("id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .and_then(|v| {
+            v.as_str().map(|s| s.to_string())
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        })
         .or_else(|| payload.get("auth_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
         .or_else(|| payload.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()));
 
-    let exp_hours = payload.get("exp").and_then(|v| v.as_i64()).map(|exp| {
+    // exp 可能是整数或浮点数，依次尝试 as_i64 / as_f64 / as_str(数字字符串)
+    let exp_timestamp = payload
+        .get("exp")
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        });
+
+    let exp_hours = exp_timestamp.map(|exp| {
         let now = chrono::Utc::now().timestamp();
         (exp - now) as f64 / 3600.0
     });
 
-    JwtInfo { user_id, exp_hours }
+    JwtInfo {
+        user_id,
+        exp_hours,
+        exp_timestamp,
+    }
 }
 
 /// 由 exp 剩余小时数推导状态：>24 ok / <=24 && >0 warn / <=0 expired

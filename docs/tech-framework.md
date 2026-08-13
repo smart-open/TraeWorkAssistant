@@ -34,6 +34,16 @@ PowerShell     TraeWorkAccountSwitcher.ps1（登录态切换）
 
 原则：v1.0 分层不含 API 网关；网关为下期独立模块，立项时再以独立进程接入。
 
+### 2.1 前端实现要点
+
+- **启动加载态**：`App.tsx` 在 store `ready` 为 `false` 时渲染全局 Loading（旋转指示器 + 「正在加载…」），待 `init()` 完成后才挂载主界面，避免空状态闪烁。
+- **设置页（显式保存）**：Settings 页使用本地表单状态（`form`），与后端 `settings` 对比得到 `dirty` 标记；用户编辑后需点击「保存」才落盘（非自动保存），并提供「撤销」回退到原始值；底部在 `dirty` 时浮出保存条。
+- **`saveSettings` 回滚**：store 中 `saveSettings` 先乐观更新本地 settings，调用后端 `settings_set` 失败时回滚到修改前的值并提示错误，避免 UI 与后端不一致。
+- **签到页账号列表**：Checkin 页展示候选账号表格（名称/UserID、JWT 状态徽标、今日签到状态、积分），支持全部/分组/手动勾选三种范围与跳过规则；顶部固定「请勿一天内多次签到」防封警告。
+- **`startCheckin` 重置**：发起签到前先重置 checkin 状态（`active:true, total:0, index:0, results:[], done:null`），避免显示上一次的进度残留。
+- **日志页**：Logs 页支持「复制代理日志」与「复制查询日志」（写入剪贴板）；实时代理输出采用最新置顶（新行 `unshift` 到数组头部），最多保留 200 行。
+- **Modal 组件**：弹窗打开时监听 `Escape` 键关闭，并锁定 `body` 滚动（`overflow:hidden`）；关闭时还原，防止背景滚动穿透。
+
 ## 3. 数据模型
 
 统一存于 `%APPDATA%\TraeWorkAssistant\`：

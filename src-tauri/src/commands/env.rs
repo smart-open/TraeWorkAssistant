@@ -43,6 +43,14 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
         return Err("未检测到本地 Trae Work 安装，请在「设置 → 代理与签到」中指定 exe 路径".into());
     }
     let exe = path.ok_or("未找到 Trae Work 可执行文件路径")?;
+    // 代理注入要求 Trae 以 --proxy-server 启动。Electron 单实例下，已运行的窗口会忽略新启动
+    // 参数，再次点击只会聚焦旧窗口，导致全程不走代理、无法捕获账号。故注入代理前先结束现有
+    // 进程，确保参数真正生效。（无代理时正常打开，不杀进程。）
+    if proxy_port.is_some() {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "TRAE SOLO CN.exe"])
+            .output();
+    }
     let mut cmd = Command::new(&exe);
     if let Some(port) = proxy_port {
         // Electron/Chromium 支持 --proxy-server 启动参数

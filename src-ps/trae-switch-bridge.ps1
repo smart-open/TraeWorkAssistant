@@ -31,7 +31,9 @@ param(
     [switch]$Json
 )
 
-#Requires -RunAsAdministrator
+# 注意：不要在此加 `#Requires -RunAsAdministrator`。
+# 仅 Reset-MachineId 写 HKLM 需管理员；Switch/Backup 普通用户即可运行。
+# 若强制要求管理员，普通权限启动的 App 调起脚本会直接 ScriptRequiresElevation 失败。
 
 $ErrorActionPreference = 'Stop'
 
@@ -76,19 +78,18 @@ function Start-Trae {
         Write-Step -Stage 'start' -Message "未找到 Trae: $Script:TraeExe" -Status 'error'
         throw "Trae 可执行文件不存在"
     }
-    Write-Step -Stage 'start' -Message '正在启动 Trae Work（走本地代理）' -Status 'running'
-    Start-Process -FilePath $Script:TraeExe -ArgumentList "--proxy-server=127.0.0.1:8899" -WindowStyle Normal
+    Write-Step -Stage 'start' -Message '正在启动 Trae Work（沿用系统代理）' -Status 'running'
+    Start-Process -FilePath $Script:TraeExe -WindowStyle Normal
 }
 
 function Reset-MachineId {
-    # 重置 6 层机器码中的 MachineGuid（需管理员），使账号被视为新设备
+    # 重置 6 层机器码中的 MachineGuid（需管理员）。非管理员时跳过并提示，不阻断切换。
     $newGuid = (New-Guid).Guid
     try {
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGuid' -Value $newGuid -Force
         Write-Step -Stage 'machine' -Message "机器码已重置为 $newGuid" -Status 'ok'
     } catch {
-        Write-Step -Stage 'machine' -Message "重置机器码失败: $_" -Status 'error'
-        throw $_
+        Write-Step -Stage 'machine' -Message "重置机器码需要管理员权限，已跳过（不影响账号切换）: $_" -Status 'skip'
     }
 }
 
@@ -97,7 +98,8 @@ function Backup-CurrentProfile {
     $dest = Join-Path $Script:ProfilesDir $Slot
     if (Test-Path $Script:TraeDataDir) {
         if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
-        Copy-Item -Path (Join-Path $Script:TraeDataDir '*') -Destination $dest -Recurse -Force
+        $excludeDirs = @('Cache', 'Code Cache', 'GPUCache', 'Service Worker')
+        Get-ChildItem -Path $Script:TraeDataDir | Where-Object { -not ($_.PSIsContainer -and $_.Name -in $excludeDirs) } | Copy-Item -Destination $dest -Recurse -Force
         Write-Step -Stage 'backup' -Message "已备份当前登录态到 $Slot" -Status 'ok'
     } else {
         Write-Step -Stage 'backup' -Message '当前数据目录不存在，跳过备份' -Status 'skip'
@@ -115,9 +117,13 @@ function Restore-Profile {
     }
     if (-not (Test-Path $Script:TraeDataDir)) { New-Item -ItemType Directory -Path $Script:TraeDataDir -Force | Out-Null }
     # 先清空现有，再写入目标快照
-    Get-ChildItem -Path $Script:TraeDataDir -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
-    Copy-Item -Path (Join-Path $src '*') -Destination $Script:TraeDataDir -Recurse -Force
-    Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态" -Status 'ok'
+    try {
+        Get-ChildItem -Path $Script:TraeDataDir -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Copy-Item -Path (Join-Path $src '*') -Destination $Script:TraeDataDir -Recurse -Force
+        Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态" -Status 'ok'
+    } catch {
+        Write-Step -Stage 'restore' -Message "恢复登录态失败，已跳过: $_" -Status 'error'
+    }
 }
 
 # ============ 入口 ============

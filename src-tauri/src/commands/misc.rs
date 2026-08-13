@@ -27,6 +27,7 @@ pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), Strin
 pub struct JwtParseResult {
     pub user_id: Option<String>,
     pub exp_hours: Option<f64>,
+    pub exp_timestamp: Option<i64>,
     pub status: String,
 }
 
@@ -37,6 +38,7 @@ pub fn jwt_parse(_app: AppHandle, _state: State<AppState>, jwt: String) -> JwtPa
     JwtParseResult {
         user_id: info.user_id,
         exp_hours: info.exp_hours,
+        exp_timestamp: info.exp_timestamp,
         status,
     }
 }
@@ -125,6 +127,10 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
     let path = state.path("app_settings.json");
     // 读取现有设置，合并 patch 中出现的字段（真正的 patch 语义）
     let mut current: serde_json::Value = fs_utils::read_json(&path);
+    // 文件不存在或内容为 null 时初始化为空对象，避免 patch 被丢弃
+    if !current.is_object() {
+        current = serde_json::json!({});
+    }
     if let (Some(current_obj), Some(patch_obj)) =
         (current.as_object_mut(), patch.as_object())
     {

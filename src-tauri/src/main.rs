@@ -41,6 +41,7 @@ fn main() {
             commands::accounts::accounts_list,
             commands::accounts::account_add_manual,
             commands::accounts::account_delete,
+            commands::accounts::account_update,
             commands::accounts::groups_list,
             commands::accounts::group_create,
             commands::accounts::group_update,
@@ -191,6 +192,12 @@ fn main() {
                 let state = app_handle.state::<AppState>();
                 fs_utils::app_log(&state.data_dir, "应用退出：正在清理代理子进程");
                 drop(h); // Drop trait 会 kill + wait 子进程
+            }
+            // 还原系统代理，避免退出后本机全局断网
+            if let Err(e) = commands::proxy::clear_win_proxy() {
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    fs_utils::app_log(&state.data_dir, &format!("应用退出：还原系统代理失败(可手动关闭): {e}"));
+                }
             }
         }
     });

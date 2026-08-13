@@ -35,6 +35,8 @@ export const api = {
       invoke('account_add_manual', { name, jwt, groupId }),
     delete: (userId: string, deleteProfile: boolean) =>
       invoke('account_delete', { userId, deleteProfile }),
+    update: (userId: string, name?: string, jwt?: string) =>
+      invoke('account_update', { userId, name, jwt }),
   },
   groups: {
     list: () => invoke<GroupView[]>('groups_list'),

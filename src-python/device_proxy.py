@@ -3,7 +3,9 @@
 r"""
 Trae Work 签到设备ID代理 (方案A) — Trae Work 助手 内置版
 ========================================================
-本地 MITM 代理：透明截获 api.trae.cn 的签到请求，
+本地 MITM 代理：透明截获 TRAE 全量 HTTPS 流量（对抵达代理的所有 CONNECT 域名做
+TLS 解密，覆盖 api.trae.cn / api.trae.com.cn / zijieapi.com /
+bytedance.com / volcengine.com / volces.com / treecode.com 等 TRAE 相关域），
 按账号(从 Authorization JWT 的 data.id 取)注入各自独立的伪 x-device-id /
 x-market-user-id / vscode-sessionid，从而绕过"每设备每天"签到配额。
 
@@ -19,12 +21,15 @@ Windows 受信任根证书颁发机构，TRAE 才会信任代理证书。
 用法：
     python device_proxy.py            # 监听 127.0.0.1:8899
     python device_proxy.py --gen-ca   # 仅生成 CA 证书后退出（供安装流程调用）
+    python device_proxy.py --capture-local   # 从 TRAE 本地 Cookies 解密提取 JWT 写回 accounts.json(仅 Windows)
 """
 import os
 import sys
+import re
 import json
 import ssl
 import socket
+import shutil
 import threading
 import base64
 import random
@@ -32,6 +37,7 @@ import uuid
 import hashlib
 import datetime
 import http.client
+import sqlite3
 
 # ---------------- 配置 ----------------
 LISTEN_HOST = "127.0.0.1"
@@ -40,13 +46,47 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 # 数据目录：优先 TRAEDATA_DIR（由桌面端注入），否则回退到脚本目录（保持独立可用性）
 DATA_DIR = os.environ.get("TRAEDATA_DIR", BASE)
 MAP_FILE = os.path.join(DATA_DIR, "device_map.json")
-LOG_FILE = os.path.join(DATA_DIR, "proxy.log")
+LOG_FILE = os.path.join(DATA_DIR, "logs", "proxy.log")
 CA_DIR = os.path.join(DATA_DIR, "certs")
 SIGNIN_PATH = "/trae/api/v2/ug/checkin_credits/claim"
 STATUS_PATH = "/trae/api/v2/ug/checkin_credits/status"
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "checkin_accounts.json")
 # 默认开启自动捕获 JWT 写回 checkin_accounts.json；设 AUTO_CAPTURE_JWT=0 关闭
 AUTO_CAPTURE_JWT = os.environ.get("AUTO_CAPTURE_JWT", "1") not in ("0", "false", "False", "")
+
+# 鉴权头嗅探去重集合：每个 host 仅提示一次，避免刷屏（用于诊断"代理是否见到鉴权头"）
+_seen_auth_hints = set()
+
+# TRAE 相关域名（后缀匹配）：仅用于日志分类与启动横幅，明确代理覆盖的全部监听域。
+# 注意：JWT 捕获仍保持「不限 host」以保证鲁棒性（兼容未列出的子域 / 未来新域名，
+# 例如实测出现的 trae-api-cn.mchost.gury），这里的清单只做可见性标记，不放宽也不收窄捕获。
+TARGET_DOMAINS = [
+    "trae.cn", "trae.com.cn", "zijieapi.com",
+    "bytedance.com", "volcengine.com", "volces.com", "treecode.com",
+]
+# 已知 TRAE 接口（按 path 子串匹配），在日志中标出接口用途，便于一眼看清「监听接口」
+KNOWN_TRAE_PATHS = [
+    ("/trae/api/v2/ug/checkin_credits/claim", "签到领取"),
+    ("/trae/api/v2/ug/checkin_credits/status", "签到状态"),
+    ("/cloudide/api", "CloudIDE网关"),
+    ("/oauth/", "OAuth"),
+    ("ExchangeToken", "换Token"),
+    ("ide_user_ent_usage", "积分用量"),
+    ("/api/remote/v1/plugins", "插件接口"),
+]
+
+
+def host_in_targets(host):
+    h = (host or "").lower()
+    return any(h == d or h.endswith("." + d) for d in TARGET_DOMAINS)
+
+
+def classify_path(path):
+    p = path or ""
+    for sub, name in KNOWN_TRAE_PATHS:
+        if sub in p:
+            return name
+    return None
 
 # ---------------- 日志 ----------------
 _log_lock = threading.Lock()
@@ -102,26 +142,64 @@ def _stable_rng(seed):
     return random.Random(_normalize_seed(seed))
 
 
+def _seeded_stream(seed, salt, nbytes):
+    """确定性派生均匀字节流（SHA-256）。
+
+    替代 random.Random(seed).choice —— 后者在某些 seed 下会产出
+    连续相同字符的病态序列（如 uid=4487568582777872 时 device_id 全 '2'、
+    session_id 全 '5' 的假占位符）。SHA-256 派生保证均匀且无病态，
+    同时仍由 seed 决定，保证同一 user_id 始终得到同一设备标识。
+    """
+    if seed is None:
+        return None
+    data = f"{salt}:{seed}".encode("utf-8")
+    out = b""
+    i = 0
+    while len(out) < nbytes:
+        out += hashlib.sha256(data + i.to_bytes(4, "big")).digest()
+        i += 1
+    return out[:nbytes]
+
+
 def rand_digits(n, seed=None):
     if seed is None:
         return "".join(random.choice("0123456789") for _ in range(n))
-    return "".join(_stable_rng(seed).choice("0123456789") for _ in range(n))
+    bs = _seeded_stream(seed, "devid", n + 1)
+    return "".join(str(b % 10) for b in bs[:n])
 
 
 def rand_hex(n, seed=None):
     if seed is None:
         return "".join(random.choice("0123456789abcdef") for _ in range(n))
-    return "".join(_stable_rng(seed).choice("0123456789abcdef") for _ in range(n))
+    need = (n + 1) // 2
+    bs = _seeded_stream(seed, "sess", need)
+    return "".join(f"{b:02x}" for b in bs)[:n]
+
+
+def gen_market_uuid(seed):
+    """标准 UUID v4（确定性派生），符合 market_user_id 字段格式。"""
+    if seed is None:
+        return str(uuid.uuid4())
+    bs = bytearray(_seeded_stream(seed, "market", 16))
+    bs[6] = (bs[6] & 0x0F) | 0x40  # version 4
+    bs[8] = (bs[8] & 0x3F) | 0x80  # variant RFC 4122
+    return str(uuid.UUID(bytes=bytes(bs)))
+
+
+DEVICE_GEN = 2  # 设备标识生成算法版本；旧记录(gen 缺失=1)会自动重建
 
 
 def get_device_for(user_id):
+    user_id = str(user_id)
     with _map_lock:
-        if user_id not in _device_map:
+        rec = _device_map.get(user_id)
+        if rec is None or rec.get("gen", 1) < DEVICE_GEN:
             _device_map[user_id] = {
                 "device_id": rand_digits(15, seed=user_id),
-                "market_user_id": str(uuid.UUID(int=_stable_rng(user_id).getrandbits(128))),
+                "market_user_id": gen_market_uuid(user_id),
                 "session_id": rand_hex(64, seed=user_id),
                 "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                "gen": DEVICE_GEN,
             }
             save_map()
             log(f"  >> 新账号注册设备: user={user_id} -> x-device-id={_device_map[user_id]['device_id']}")
@@ -172,7 +250,7 @@ def get_jwt_exp(jwt_full):
         return None, None
 
 
-# ---------------- accounts.json 捕获写回 ----------------
+# ---------------- checkin_accounts.json 捕获写回 ----------------
 _accounts_lock = threading.RLock()  # 用 RLock 以便 update_account_jwt 持锁后再调 save_accounts
 _accounts_cache = None
 _accounts_mtime = None
@@ -265,6 +343,160 @@ def update_account_jwt(user_id, jwt_full):
         log(f"  [JWT 自动追加新账号] user={user_id} -> name={new_acc['name']} exp={new_exp_str}")
         save_accounts()
         return "appended"
+
+# ---------------- 本地 Cookies 解密捕获 JWT (仅 Windows) ----------------
+# 背景：当前版本 TRAE 的鉴权请求(api.trae.cn)不走 Chromium `--proxy-server` 代理，
+# MITM 代理抓不到 Cloud-IDE-JWT。但 TRAE 把登录态存在本地 Cookies(Chromium 格式)，
+# 此处直接在 Windows 侧解密提取并写回 checkin_accounts.json，作为代理方案的兜底。
+def _trae_app_dir():
+    # TRAE SOLO CN 用户数据目录；可用 TRAE_APP_DIR 覆盖
+    return os.environ.get("TRAE_APP_DIR") or os.path.join(
+        os.environ.get("APPDATA", ""), "TRAE SOLO CN")
+
+
+def _chrome_aes_key(app_dir):
+    """读 Local State -> os_crypt.encrypted_key(DPAPI 包裹的 AES-256 密钥)。"""
+    lp = os.path.join(app_dir, "Local State")
+    if not os.path.exists(lp):
+        return None
+    try:
+        with open(lp, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        b64 = state.get("os_crypt", {}).get("encrypted_key")
+        if not b64:
+            return None
+        raw = base64.b64decode(b64)
+        if raw[:5] != b"DPAPI":
+            return None
+        import win32crypt  # 仅 Windows
+        return win32crypt.CryptUnprotectData(raw[5:], None, None, None, 0)[1]
+    except Exception as e:
+        log("  [local] 读取 Chromium AES 密钥失败:", e)
+        return None
+
+
+def _decrypt_cookie(enc, key):
+    if not enc:
+        return None
+    try:
+        if enc[:3] == b"v10":  # 现代 Chromium: AES-256-GCM
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            iv, ct = enc[3:15], enc[15:]
+            return AESGCM(key).decrypt(iv, ct, None).decode("utf-8", "replace")
+        import win32crypt  # 旧格式：直接 DPAPI
+        return win32crypt.CryptUnprotectData(bytes(enc), None, None, None, 0)[1].decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+_JWT_RE = re.compile(r"[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")
+
+
+def _valid_cloud_ide_jwt(tok):
+    """校验单个 JWT 是否为 Cloud-IDE-JWT：头部 alg=RS256 且 payload 含 data.id。
+    满足则返回 'Cloud-IDE-JWT <jwt>'，否则 None。（签名不校验，仅看声明）"""
+    parts = tok.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        h = json.loads(base64.urlsafe_b64decode(parts[0] + "=" * (-len(parts[0]) % 4)))
+        p = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except Exception:
+        return None
+    if h.get("alg") == "RS256" and isinstance(p.get("data"), dict) and p["data"].get("id"):
+        return "Cloud-IDE-JWT " + tok
+    return None
+
+
+def _find_cloud_ide_jwt(blob):
+    """从一段文本里找 Cloud-IDE-JWT。返回 'Cloud-IDE-JWT <jwt>' 或 None。"""
+    if not blob:
+        return None
+    if isinstance(blob, bytes):
+        blob = blob.decode("latin1", "replace")
+    m = re.search(r"Cloud-IDE-JWT\s+([A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)", blob)
+    if m:
+        return _valid_cloud_ide_jwt(m.group(1))
+    for m in _JWT_RE.finditer(blob):
+        r = _valid_cloud_ide_jwt(m.group(0))
+        if r:
+            return r
+    return None
+
+
+def capture_from_local():
+    """解密 TRAE 本地 Cookies + 扫描 Local Storage，提取 Cloud-IDE-JWT 写回 accounts.json。
+    仅 Windows 有效(需 win32crypt + cryptography)。返回新增/更新账号数。"""
+    if AUTO_CAPTURE_JWT:
+        load_accounts()
+    app_dir = _trae_app_dir()
+    log(f"[local] TRAE 数据目录: {app_dir}")
+    if not os.path.isdir(app_dir):
+        log("[local] 目录不存在，跳过")
+        return 0
+    key = _chrome_aes_key(app_dir)
+    if key is None:
+        log("[local] 未取得 AES 密钥(需 Windows 已登录用户 + pywin32)；将仅扫描明文值")
+    found = 0
+    # 1) Cookies 数据库
+    dbs = [os.path.join(app_dir, "Network", "Cookies")]
+    tw = os.path.join(app_dir, "Partitions", "trae-webview", "Cookies")
+    if os.path.exists(tw):
+        dbs.append(tw)
+    for db in dbs:
+        if not os.path.exists(db):
+            continue
+        tmp = os.path.join(DATA_DIR, ".trae_cookies_scan.tmp")
+        try:
+            shutil.copy(db, tmp)
+        except Exception:
+            tmp = db
+        try:
+            con = sqlite3.connect(f"file:{tmp}?mode=ro")
+            for host, name, value, enc in con.execute("SELECT host_key,name,value,encrypted_value FROM cookies"):
+                blob = value or ""
+                if enc:
+                    d = _decrypt_cookie(enc, key) if key else None
+                    if d is not None:
+                        blob = d
+                hit = _find_cloud_ide_jwt(blob)
+                if hit:
+                    uid = extract_user_id(hit)
+                    if uid:
+                        r = update_account_jwt(uid, hit)
+                        log(f"[local] 命中 Cookies host={host} name={name} -> {r}")
+                        found += 1
+            con.close()
+        except Exception as e:
+            log(f"[local] 读取 Cookies 失败 {db}: {e}")
+        finally:
+            if tmp != db and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+    # 2) Local Storage leveldb 明文兜底扫描
+    for ls in (os.path.join(app_dir, "Local Storage", "leveldb"),
+               os.path.join(app_dir, "Partitions", "trae-webview", "Local Storage", "leveldb")):
+        if not os.path.isdir(ls):
+            continue
+        for fn in os.listdir(ls):
+            if not fn.endswith((".ldb", ".log")):
+                continue
+            try:
+                with open(os.path.join(ls, fn), "rb") as f:
+                    data = f.read()
+            except Exception:
+                continue
+            for m in re.finditer(rb"Cloud-IDE-JWT [A-Za-z0-9_\-\.=]+", data):
+                hit = m.group(0).decode("latin1")
+                uid = extract_user_id(hit)
+                if uid:
+                    r = update_account_jwt(uid, hit)
+                    log(f"[local] 命中 leveldb {fn} -> {r}")
+                    found += 1
+    log(f"[local] 本地捕获完成，新增/更新 {found} 个账号")
+    return found
 
 # ---------------- CA / 叶子证书 ----------------
 _ca_cert = _ca_key = None
@@ -426,18 +658,54 @@ def tunnel_https(tls, host, port):
         if req is None:
             break
         method, path, version, headers, body = req
-        log(f"  {method} {path}")
-        # 自动捕获 JWT：凡是带 authorization: Cloud-IDE-JWT 的 api.trae.cn 请求都捕获
-        # （覆盖 sign-in / status / 任意接口），保证 13 天换号时只需在 TRAE 里点一次签到
-        if AUTO_CAPTURE_JWT and host == "api.trae.cn":
-            auth = headers.get("authorization") or headers.get("x-cloudide-token")
-            if auth and auth.strip():
-                uid_c = extract_user_id(auth)
-                if uid_c and auth.strip().startswith("Cloud-IDE-JWT"):
-                    update_account_jwt(uid_c, auth.strip())
-        # 设备头改写（仅签到接口）
+        tag = " [TRAE]" if host_in_targets(host) else ""
+        ep = classify_path(path)
+        ep_tag = f"  <{ep}>" if ep else ""
+        log(f"  {method} {host}{path}{tag}{ep_tag}")
+        # 鉴权头嗅探（仅诊断用）：见到任意鉴权头即打印一次类型，
+        # 用于判断"代理是否真的见到 TRAE 的鉴权流量"。
+        if AUTO_CAPTURE_JWT:
+            _auth_val = None
+            _auth_name = None
+            for _h in ("authorization", "x-cloudide-token", "x-icube-token"):
+                _v = headers.get(_h)
+                if _v:
+                    _auth_name = _h
+                    _auth_val = _v.strip()
+                    break
+            if _auth_val:
+                _k = f"auth:{host}"
+                if _k not in _seen_auth_hints:
+                    _seen_auth_hints.add(_k)
+                    _raw_jwt = _auth_val[len("Cloud-IDE-JWT"):].strip() if _auth_val.startswith("Cloud-IDE-JWT") else _auth_val
+                    _is_valid = bool(_valid_cloud_ide_jwt(_raw_jwt))
+                    log(f"  [JWT-DEBUG] 在 {host} 发现 {_auth_name} 头 (类型: {'Cloud-IDE-JWT ✅可捕获' if _is_valid else '其他/不可识别: ' + _auth_val[:18] + '…'})")
+        # 自动捕获 JWT：兼容 authorization: Cloud-IDE-JWT <jwt>、x-cloudide-token: <jwt>
+        # 以及 x-icube-token: <jwt>。不限 host，覆盖 sign-in / status / 任意接口。
+        if AUTO_CAPTURE_JWT:
+            auth = None
+            for _h in ("authorization", "x-cloudide-token", "x-icube-token"):
+                _v = headers.get(_h)
+                if _v:
+                    auth = _v.strip()
+                    break
+            if auth:
+                jwt_val = auth[len("Cloud-IDE-JWT"):].strip() if auth.startswith("Cloud-IDE-JWT") else auth
+                validated = _valid_cloud_ide_jwt(jwt_val)
+                if validated:
+                    uid_c = extract_user_id(validated)
+                    if uid_c:
+                        update_account_jwt(uid_c, validated)
+        # 设备头改写（仅签到接口）——兼容 authorization / x-cloudide-token / x-icube-token
         if SIGNIN_PATH in path:
-            auth = headers.get("authorization")
+            auth = None
+            for _h in ("authorization", "x-cloudide-token", "x-icube-token"):
+                _v = headers.get(_h)
+                if _v:
+                    auth = _v.strip()
+                    break
+            if auth and auth.startswith("Cloud-IDE-JWT"):
+                auth = auth[len("Cloud-IDE-JWT"):].strip()
             uid = extract_user_id(auth)
             if uid:
                 dev = get_device_for(uid)
@@ -448,6 +716,47 @@ def tunnel_https(tls, host, port):
             else:
                 log("  [签到] 未解析到 user id，未改写")
         forward_upstream(host, port, method, path, headers, body, tls)
+
+# ---------------- 透明隧道（非 TRAE 域，不解密直接放行） ----------------
+def tunnel_raw(client_sock, host, port):
+    """对不在 TARGET_DOMAINS 的 CONNECT，建立到真实服务器的 TCP 隧道并双向转发，
+    不做 TLS 解密。用于把本代理作为系统代理时，让浏览器/其他 App 的流量正常通过。"""
+    try:
+        remote = socket.create_connection((host, port), timeout=30)
+    except Exception as e:
+        log(f"  [tunnel] 连接 {host}:{port} 失败: {e}")
+        return
+
+    def pipe(src, dst):
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+
+    t1 = threading.Thread(target=pipe, args=(client_sock, remote), daemon=True)
+    t2 = threading.Thread(target=pipe, args=(remote, client_sock), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    try:
+        client_sock.close()
+    except Exception:
+        pass
+    try:
+        remote.close()
+    except Exception:
+        pass
+
 
 # ---------------- 明文 HTTP 代理 ----------------
 def handle_plain(conn, buf):
@@ -505,12 +814,19 @@ def handle_client(conn, addr):
             host = target.rsplit(":", 1)[0]
             port = int(target.rsplit(":", 1)[1]) if ":" in target else 443
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            cpath, kpath = leaf_cert(host)
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.load_cert_chain(certfile=cpath, keyfile=kpath)
-            tls = ctx.wrap_socket(conn, server_side=True)
-            log(f"CONNECT {host}:{port}")
-            tunnel_https(tls, host, port)
+            if host_in_targets(host):
+                # TRAE 域名：MITM 解密以捕获 JWT
+                cpath, kpath = leaf_cert(host)
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(certfile=cpath, keyfile=kpath)
+                tls = ctx.wrap_socket(conn, server_side=True)
+                log(f"CONNECT {host}:{port}  [TRAE]")
+                tunnel_https(tls, host, port)
+            else:
+                # 其他域名：透明隧道，不解密直接放行。
+                # 这样把本代理设为 Windows 系统代理时，浏览器/其他 App 流量不受 MITM 影响。
+                log(f"CONNECT {host}:{port}  [tunnel]")
+                tunnel_raw(conn, host, port)
         else:
             handle_plain(conn, buf)
     except Exception as e:
@@ -522,6 +838,34 @@ def handle_client(conn, addr):
             pass
 
 # ---------------- 主入口 ----------------
+def sync_account_devices():
+    """把 checkin_accounts.json 中各账号的 device 字段刷新为当前算法生成的设备标识。
+
+    用于升级历史记录中由旧算法生成的假占位符(device_id 全 '2' / session_id 全 '5')。
+    启动时代理会调用一次；仅当字段确实变化时才写盘。
+    """
+    cfg = load_accounts()
+    accounts = cfg.get("accounts", [])
+    if not accounts:
+        return
+    changed = False
+    for a in accounts:
+        uid = a.get("UserID") or a.get("user_id")
+        if not uid:
+            continue
+        dev = get_device_for(str(uid))
+        if (a.get("device_id") != dev["device_id"]
+                or a.get("session_id") != dev["session_id"]
+                or a.get("market_user_id") != dev["market_user_id"]):
+            a["device_id"] = dev["device_id"]
+            a["session_id"] = dev["session_id"]
+            a["market_user_id"] = dev["market_user_id"]
+            changed = True
+    if changed:
+        save_accounts()
+        log("  [sync] 已刷新 accounts.json 中设备标识字段(旧算法升级)")
+
+
 def main():
     # --gen-ca：仅生成 CA 证书后退出（供桌面端证书安装流程调用）
     if "--gen-ca" in sys.argv:
@@ -529,15 +873,25 @@ def main():
         log("CA 证书已生成，退出。")
         return 0
 
+    # --capture-local：直接从 TRAE 本地 Cookies 解密提取 Cloud-IDE-JWT 写回 accounts.json
+    # （代理方案在当前 TRAE 版本抓不到鉴权请求时的兜底；仅 Windows 有效）
+    if "--capture-local" in sys.argv:
+        n = capture_from_local()
+        log(f"本地捕获结果: {n} 个账号")
+        return 0
+
     ensure_ca()
     load_map()
     if AUTO_CAPTURE_JWT:
         load_accounts()  # 预热 accounts 缓存
+        sync_account_devices()  # 升级历史假占位符设备标识
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((LISTEN_HOST, LISTEN_PORT))
     srv.listen(128)
-    log(f"代理已启动: {LISTEN_HOST}:{LISTEN_PORT}  (仅改写签到接口 {SIGNIN_PATH})")
+    log(f"代理已启动: {LISTEN_HOST}:{LISTEN_PORT}  (TRAE 多域 MITM 拦截 + JWT 自动捕获)")
+    log("监听 TRAE 域名: " + ", ".join("*." + d for d in TARGET_DOMAINS))
+    log("  → 命中上述域名的请求会在面板中以 [TRAE] 标记；JWT 捕获不限 host（兼容未列出的子域）")
     log(f"映射文件: {MAP_FILE}   日志: {LOG_FILE}   accounts: {ACCOUNTS_FILE}")
     log(f"自动捕获 JWT 写回 accounts.json: {'开' if AUTO_CAPTURE_JWT else '关 (AUTO_CAPTURE_JWT=0)'}")
     if AUTO_CAPTURE_JWT:

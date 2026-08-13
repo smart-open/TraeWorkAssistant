@@ -40,6 +40,7 @@ import gzip
 import zlib
 import argparse
 import time
+from typing import Optional
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 # 数据目录：优先 TRAEDATA_DIR（由桌面端注入），否则回退到脚本目录（保持独立可用性）
@@ -68,20 +69,46 @@ def _normalize_seed(seed):
 
 
 def _stable_rng(seed):
-    """基于 seed 的稳定随机数生成器（与 device_proxy.py 保持一致）。"""
+    """遗留兼容：基于 seed 的稳定随机数生成器（旧算法，已被 SHA-256 派生取代）。"""
     return random.Random(_normalize_seed(seed))
+
+
+def _seeded_stream(seed, salt, nbytes):
+    """确定性派生均匀字节流（SHA-256），避免 random.Random(seed) 病态序列。"""
+    if seed is None:
+        return None
+    data = f"{salt}:{seed}".encode("utf-8")
+    out = b""
+    i = 0
+    while len(out) < nbytes:
+        out += hashlib.sha256(data + i.to_bytes(4, "big")).digest()
+        i += 1
+    return out[:nbytes]
 
 
 def rand_digits(n, seed=None):
     if seed is None:
         return "".join(random.choice("0123456789") for _ in range(n))
-    return "".join(_stable_rng(seed).choice("0123456789") for _ in range(n))
+    bs = _seeded_stream(seed, "devid", n + 1)
+    return "".join(str(b % 10) for b in bs[:n])
 
 
 def rand_hex(n, seed=None):
     if seed is None:
         return "".join(random.choice("0123456789abcdef") for _ in range(n))
-    return "".join(_stable_rng(seed).choice("0123456789abcdef") for _ in range(n))
+    need = (n + 1) // 2
+    bs = _seeded_stream(seed, "sess", need)
+    return "".join(f"{b:02x}" for b in bs)[:n]
+
+
+def gen_market_uuid(seed):
+    """标准 UUID v4（确定性派生），符合 market_user_id 字段格式。"""
+    if seed is None:
+        return str(uuid.uuid4())
+    bs = bytearray(_seeded_stream(seed, "market", 16))
+    bs[6] = (bs[6] & 0x0F) | 0x40
+    bs[8] = (bs[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(bs)))
 
 
 def load_json(path, default=None):
@@ -99,9 +126,11 @@ def load_json(path, default=None):
 
 def save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
     except Exception as e:
         print(f"[警告] 写入 {path} 失败: {e}")
 
@@ -177,17 +206,22 @@ def _decode_body(raw, ce):
     return raw.decode("utf-8", "replace")
 
 
+DEVICE_GEN = 2  # 设备标识生成算法版本；旧记录(gen 缺失=1)会自动重建
+
+
 def get_device_for(user_id, device_map):
     """
     复用/生成 device_map.json 中该 user_id 的设备标识。
     结构与 device_proxy.py 完全一致，确保代理和脚本看到的映射相同。
     """
-    if user_id not in device_map:
+    rec = device_map.get(user_id)
+    if rec is None or rec.get("gen", 1) < DEVICE_GEN:
         device_map[user_id] = {
             "device_id": rand_digits(15, seed=user_id),
-            "market_user_id": str(uuid.UUID(int=_stable_rng(user_id).getrandbits(128))),
+            "market_user_id": gen_market_uuid(user_id),
             "session_id": rand_hex(64, seed=user_id),
             "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "gen": DEVICE_GEN,
         }
         save_json(MAP_FILE, device_map)
     return device_map[user_id]
@@ -398,7 +432,7 @@ def main():
 
         ok, msg, code = signin_with_retry(name, jwt, device_map, retry=args.retry)
         result = {"name": name, "ok": ok, "code": code, "message": msg, "action": "claim"}
-        final_credits: int | None = None
+        final_credits: Optional[int] = None
         final_delta = 0
 
         if ok:

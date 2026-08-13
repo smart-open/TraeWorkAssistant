@@ -1,8 +1,16 @@
-import { useMemo, useState } from 'react';
-import { PlayCircle, Square, CheckCircle2, XCircle, Clock, AlertCircle } from 'lucide-react';
+import { useMemo, useState, useEffect } from 'react';
+import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
 import { useAppStore } from '../store';
+import type { AccountView } from '../types';
+
+function MiniJwtBadge({ hours }: { hours: number | null }) {
+  if (hours === null) return <span className="text-xs text-slate-400"><HelpCircle size={11} className="inline" /> 未知</span>;
+  if (hours <= 0) return <span className="text-xs text-rose-500"><XCircle size={11} className="inline" /> 过期</span>;
+  if (hours <= 24) return <span className="text-xs text-amber-500"><AlertTriangle size={11} className="inline" /> {hours.toFixed(1)}h</span>;
+  return <span className="text-xs text-emerald-500"><CheckCircle2 size={11} className="inline" /> {hours.toFixed(0)}h</span>;
+}
 
 export default function Checkin() {
   const accounts = useAppStore((s) => s.accounts);
@@ -17,11 +25,29 @@ export default function Checkin() {
   const [skipChecked, setSkipChecked] = useState(true);
   const [skipExpired, setSkipExpired] = useState(true);
 
+  useEffect(() => {
+    if (settings) {
+      setSkipChecked(settings.checkin_skip_checked);
+      setSkipExpired(settings.checkin_skip_expired);
+    }
+  }, [settings]);
+
+  // groups 加载后自动选中第一个分组
+  useEffect(() => {
+    if (groups.length > 0 && !groupId) setGroupId(groups[0].id);
+  }, [groups, groupId]);
+
+  // 根据范围过滤出候选账号列表
+  const candidateAccounts = useMemo(() => {
+    if (scope === 'all') return accounts;
+    if (scope === 'group') return accounts.filter((a) => a.group_id === groupId);
+    return accounts; // selected 模式下展示全部，通过 checkbox 勾选
+  }, [scope, groupId, accounts]);
+
   const candidateIds = useMemo(() => {
-    if (scope === 'all') return accounts.map((a) => a.user_id);
-    if (scope === 'group') return accounts.filter((a) => a.group_id === groupId).map((a) => a.user_id);
-    return [...selected];
-  }, [scope, groupId, selected, accounts]);
+    if (scope === 'selected') return [...selected];
+    return candidateAccounts.map((a) => a.user_id);
+  }, [scope, selected, candidateAccounts]);
 
   const toggle = (uid: string) => {
     setSelected((prev) => {
@@ -30,6 +56,14 @@ export default function Checkin() {
       else n.add(uid);
       return n;
     });
+  };
+
+  const toggleAll = () => {
+    if (selected.size === accounts.length) {
+      setSelected(new Set());
+    } else {
+      setSelected(new Set(accounts.map((a) => a.user_id)));
+    }
   };
 
   const start = async () => {
@@ -51,6 +85,14 @@ export default function Checkin() {
         title="一键签到"
         desc="按账号范围与跳过规则发起批量签到，实时查看进度"
       />
+
+      <div className="mb-5 flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm dark:border-amber-700 dark:bg-amber-900/20">
+        <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-500" />
+        <div className="text-amber-700 dark:text-amber-300">
+          <div className="font-medium">请勿一天内多次签到</div>
+          <div className="mt-0.5 text-xs">每个账号每天只需签到一次，重复签到可能导致账号被官方禁封。建议开启「跳过今日已签」选项。</div>
+        </div>
+      </div>
 
       <div className="card mb-5 p-4">
         <div className="grid gap-3 md:grid-cols-2">
@@ -82,21 +124,81 @@ export default function Checkin() {
               </select>
             </div>
           )}
-          {scope === 'selected' && (
-            <div className="md:col-span-2">
-              <label className="label">勾选账号（{selected.size}/{accounts.length}）</label>
-              <div className="max-h-32 overflow-auto rounded-lg border border-slate-200 p-2 text-sm dark:border-slate-700">
-                {accounts.map((a) => (
-                  <label key={a.user_id} className="flex items-center gap-2 px-1 py-0.5 hover:bg-slate-50 dark:hover:bg-slate-800">
-                    <input type="checkbox" checked={selected.has(a.user_id)} onChange={() => toggle(a.user_id)} />
-                    <span>{a.name}</span>
-                    <span className="text-xs text-slate-400">{a.user_id}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          )}
         </div>
+
+        {/* 账号列表 - 所有范围都展示 */}
+        <div className="mt-4">
+          <div className="mb-2 flex items-center justify-between">
+            <label className="label">
+              {scope === 'selected'
+                ? `勾选账号（${selected.size}/${accounts.length}）`
+                : `参与签到的账号（${candidateAccounts.length}）`}
+            </label>
+            {scope === 'selected' && (
+              <button onClick={toggleAll} className="text-xs text-brand-500 hover:underline">
+                {selected.size === accounts.length ? '取消全选' : '全选'}
+              </button>
+            )}
+          </div>
+          <div className="max-h-56 overflow-auto rounded-lg border border-slate-200 dark:border-slate-700">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-slate-900">
+                <tr>
+                  {scope === 'selected' && <th className="w-8 px-3 py-1.5"></th>}
+                  <th className="px-3 py-1.5 text-left">账号</th>
+                  <th className="px-3 py-1.5 text-left">JWT</th>
+                  <th className="px-3 py-1.5 text-left">今日</th>
+                  <th className="px-3 py-1.5 text-right">积分</th>
+                </tr>
+              </thead>
+              <tbody>
+                {candidateAccounts.length === 0 ? (
+                  <tr>
+                    <td colSpan={scope === 'selected' ? 5 : 4} className="px-3 py-4 text-center text-xs text-slate-400">
+                      {scope === 'group' ? '该分组下没有账号' : '暂无账号'}
+                    </td>
+                  </tr>
+                ) : (
+                  candidateAccounts.map((a) => {
+                    const isCandidate = scope === 'selected' ? selected.has(a.user_id) : true;
+                    return (
+                      <tr
+                        key={a.user_id}
+                        className={`border-t border-slate-100 dark:border-slate-800 ${scope === 'selected' && !isCandidate ? 'opacity-40' : ''}`}
+                      >
+                        {scope === 'selected' && (
+                          <td className="px-3 py-1.5">
+                            <input
+                              type="checkbox"
+                              checked={selected.has(a.user_id)}
+                              onChange={() => toggle(a.user_id)}
+                            />
+                          </td>
+                        )}
+                        <td className="px-3 py-1.5">
+                          <div className="font-medium">{a.name}</div>
+                          <div className="text-xs text-slate-400">{a.user_id}</div>
+                        </td>
+                        <td className="px-3 py-1.5"><MiniJwtBadge hours={a.jwt_exp_hours} /></td>
+                        <td className="px-3 py-1.5">
+                          {a.checked_today ? (
+                            <Badge tone="green">已签</Badge>
+                          ) : (
+                            <Badge tone="slate">未签</Badge>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-right tabular-nums text-xs">
+                          {a.credits != null ? a.credits.toLocaleString() : '-'}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
           <label className="flex items-center gap-2">
             <input type="checkbox" checked={skipChecked} onChange={(e) => setSkipChecked(e.target.checked)} />
