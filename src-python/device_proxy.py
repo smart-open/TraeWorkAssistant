@@ -823,6 +823,7 @@ def forward_websocket(host, port, method, path, headers, body, client_tls):
         log(f"  {ws_tag} 连接上游失败: {type(e).__name__}: {e}")
 
 def forward_upstream(host, port, method, path, headers, body, client_sock):
+    log(f"  [forward] -> {method} https://{host}:{port}{path} ({len(body) if body else 0} bytes body)")
     ctx = ssl.create_default_context()
     conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=30)
     fwd = {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
@@ -831,26 +832,29 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
         conn.request(method, path, body=body_arg, headers=fwd)
         resp = conn.getresponse()
         resp_body = resp.read()
+        log(f"  [forward] <- {resp.status} {resp.reason} ({len(resp_body)} bytes) from {host}{path}")
         send_response(client_sock, resp.status, resp.reason, dict(resp.getheaders()), resp_body)
         # 记录到代理请求日志
         pl = get_proxy_logger()
         if pl:
             pl.log_request(method, host, path, headers, body, resp.status, resp.reason, resp.getheaders(), resp_body)
     except Exception as e:
-        log("  upstream error:", e)
+        log(f"  [forward] 错误: {type(e).__name__}: {e} (host={host}, path={path})")
         send_response(client_sock, 502, "Bad Gateway", {}, b"Bad Gateway")
     finally:
         conn.close()
 
 # ---------------- 隧道(HTTPS over CONNECT) ----------------
 def tunnel_https(tls, host, port):
+    log(f"  [MITM] 进入 HTTPS 解密隧道: {host}:{port}")
     while True:
         try:
             req = read_http_request(tls)
         except Exception as e:
-            log("  read tls err:", e)
+            log(f"  [MITM] 读取 TLS 请求错误: {type(e).__name__}: {e}")
             break
         if req is None:
+            log(f"  [MITM] 客户端关闭连接: {host}:{port}")
             break
         method, path, version, headers, body = req
         tag = " [TRAE]" if host_in_targets(host) else ""
@@ -921,33 +925,39 @@ def tunnel_https(tls, host, port):
 def tunnel_raw(client_sock, host, port):
     """对不在 TARGET_DOMAINS 的 CONNECT，建立到真实服务器的 TCP 隧道并双向转发，
     不做 TLS 解密。用于把本代理作为系统代理时，让浏览器/其他 App 的流量正常通过。"""
+    log(f"  [tunnel] 连接 {host}:{port}...")
     try:
         remote = socket.create_connection((host, port), timeout=30)
     except Exception as e:
-        log(f"  [tunnel] 连接 {host}:{port} 失败: {e}")
+        log(f"  [tunnel] 连接 {host}:{port} 失败: {type(e).__name__}: {e}")
         return
+    log(f"  [tunnel] 已建立到 {host}:{port} 的 TCP 连接")
 
-    def pipe(src, dst):
+    _raw_stats = {"c2r": 0, "r2c": 0}
+
+    def pipe(src, dst, direction, stats):
         try:
             while True:
                 data = src.recv(65536)
                 if not data:
                     break
+                stats[direction] += len(data)
                 dst.sendall(data)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"  [tunnel] {host}:{port} {direction} 数据转发异常: {type(e).__name__}: {e}")
         finally:
             try:
                 dst.shutdown(socket.SHUT_WR)
             except Exception:
                 pass
 
-    t1 = threading.Thread(target=pipe, args=(client_sock, remote), daemon=True)
-    t2 = threading.Thread(target=pipe, args=(remote, client_sock), daemon=True)
+    t1 = threading.Thread(target=pipe, args=(client_sock, remote, "c2r", _raw_stats), daemon=True)
+    t2 = threading.Thread(target=pipe, args=(remote, client_sock, "r2c", _raw_stats), daemon=True)
     t1.start()
     t2.start()
     t1.join()
     t2.join()
+    log(f"  [tunnel] {host}:{port} 隧道结束: client->remote={_raw_stats['c2r']} bytes, remote->client={_raw_stats['r2c']} bytes")
     try:
         client_sock.close()
     except Exception:
@@ -970,6 +980,7 @@ def handle_plain(conn, buf):
     u = urlparse(target)
     host = u.hostname
     port = u.port or (443 if u.scheme == "https" else 80)
+    log(f"  [plain] {method} {u.scheme}://{host}:{port}{u.path or '/'}")
     headers = {}
     for line in lines[1:]:
         if b":" in line:
@@ -990,13 +1001,14 @@ def handle_plain(conn, buf):
         c.request(method, u.path or "/", body=body if method.upper() != "GET" else None, headers=fwd)
         resp = c.getresponse()
         resp_body = resp.read()
+        log(f"  [plain] <- {resp.status} {resp.reason} ({len(resp_body)} bytes) from {host}{u.path}")
         send_response(conn, resp.status, resp.reason, dict(resp.getheaders()), resp_body)
         # 记录到代理请求日志
         pl = get_proxy_logger()
         if pl:
             pl.log_request(method, host, u.path or "/", headers, body, resp.status, resp.reason, resp.getheaders(), resp_body)
     except Exception as e:
-        log("  plain upstream err:", e)
+        log(f"  [plain] 错误: {type(e).__name__}: {e} (host={host}, path={u.path})")
         send_response(conn, 502, "Bad Gateway", {}, b"Bad Gateway")
     finally:
         c.close()
@@ -1018,24 +1030,24 @@ def handle_client(conn, addr):
             target = head.split(" ")[1]
             host = target.rsplit(":", 1)[0]
             port = int(target.rsplit(":", 1)[1]) if ":" in target else 443
+            is_target = host_in_targets(host)
+            matched = next((d for d in TARGET_DOMAINS if host == d or host.endswith("." + d)), None)
+            log(f"CONNECT {host}:{port}  {'[TRAE/MITM] 匹配域名: ' + matched if is_target else '[tunnel] 非目标域名'}")
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            if host_in_targets(host):
+            if is_target:
                 # TRAE 域名：MITM 解密以捕获 JWT
                 cpath, kpath = leaf_cert(host)
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 ctx.load_cert_chain(certfile=cpath, keyfile=kpath)
                 tls = ctx.wrap_socket(conn, server_side=True)
-                log(f"CONNECT {host}:{port}  [TRAE]")
                 tunnel_https(tls, host, port)
             else:
                 # 其他域名：透明隧道，不解密直接放行。
-                # 这样把本代理设为 Windows 系统代理时，浏览器/其他 App 流量不受 MITM 影响。
-                log(f"CONNECT {host}:{port}  [tunnel]")
                 tunnel_raw(conn, host, port)
         else:
             handle_plain(conn, buf)
     except Exception as e:
-        log("client err:", e)
+        log(f"client err: {type(e).__name__}: {e}")
     finally:
         try:
             conn.close()
