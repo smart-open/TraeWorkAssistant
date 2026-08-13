@@ -11,7 +11,10 @@ import type {
   GroupView,
   JwtParseResult,
   LogLine,
+  OAuthLoginUrl,
+  OAuthLoginResult,
   PoolStatus,
+  ProfileInfo,
   ProxyLogListResult,
   ProxyStatus,
   Settings,
@@ -104,6 +107,20 @@ export const api = {
   },
   switchAccount: (userId: string) => invoke('switch_account', { userId }),
   resetDeviceIds: () => invoke('reset_device_ids'),
+  profiles: {
+    list: () => invoke<ProfileInfo[]>('profile_list'),
+    backup: (userId: string) => invoke('profile_backup', { userId }),
+    restore: (userId: string) => invoke('profile_restore', { userId }),
+    delete: (userId: string) => invoke('profile_delete', { userId }),
+    formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
+  },
+  oauth: {
+    getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),
+    parseCallback: (callbackUrl: string) =>
+      invoke('oauth_parse_callback', { callbackUrl }),
+    login: (callbackUrl: string, accountName?: string, groupId?: string) =>
+      invoke<OAuthLoginResult>('oauth_login', { callbackUrl, accountName, groupId }),
+  },
   apiServer: {
     start: () => invoke<ApiServiceStatus>('api_server_start'),
     stop: () => invoke('api_server_stop'),
@@ -155,6 +172,12 @@ export interface DeviceResetDoneEvent {
   raw: string;
 }
 
+export interface ProfileDoneEvent {
+  success: boolean;
+  raw: string;
+  action: 'backup' | 'restore';
+}
+
 export interface ListenerHandlers {
   onProxyLog?: (line: string) => void;
   onAccountCaptured?: (uid: string) => void;
@@ -163,6 +186,8 @@ export interface ListenerHandlers {
   onSwitchDone?: (e: SwitchDoneEvent) => void;
   onDeviceResetProgress?: (line: string) => void;
   onDeviceResetDone?: (e: DeviceResetDoneEvent) => void;
+  onProfileProgress?: (line: string) => void;
+  onProfileDone?: (e: ProfileDoneEvent) => void;
 }
 
 export async function setupListeners(
@@ -213,6 +238,20 @@ export async function setupListeners(
     unsubs.push(
       await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
         handlers.onDeviceResetDone!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onProfileProgress) {
+    unsubs.push(
+      await listen<string>('profile-progress', (e) =>
+        handlers.onProfileProgress!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onProfileDone) {
+    unsubs.push(
+      await listen<ProfileDoneEvent>('profile-done', (e) =>
+        handlers.onProfileDone!(e.payload),
       ),
     );
   }

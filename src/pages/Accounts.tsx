@@ -15,12 +15,18 @@ import {
   Copy,
   Snowflake,
   Zap,
+  Camera,
+  Download,
+  Upload,
+  Globe,
+  ExternalLink,
+  ArrowRight,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
-import type { AccountView, GroupView, JwtParseResult } from '../types';
+import type { AccountView, GroupView, JwtParseResult, ProfileInfo } from '../types';
 
 const PRESET_COLORS = [
   '#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#0ea5e9', '#a855f7', '#14b8a6',
@@ -97,12 +103,22 @@ export default function Accounts() {
   const cooldownClear = useAppStore((s) => s.cooldownClear);
   const refreshJwt = useAppStore((s) => s.refreshJwt);
   const toast = useAppStore((s) => s.pushToast);
+  const profiles = useAppStore((s) => s.profiles);
+  const profileProgress = useAppStore((s) => s.profileProgress);
+  const profileActive = useAppStore((s) => s.profileActive);
+  const profileBackup = useAppStore((s) => s.profileBackup);
+  const profileRestore = useAppStore((s) => s.profileRestore);
+  const profileDelete = useAppStore((s) => s.profileDelete);
+  const oauthLogin = useAppStore((s) => s.oauthLogin);
+  const refreshProfiles = useAppStore((s) => s.refreshProfiles);
 
   const [filter, setFilter] = useState<string>('all');
   const [addOpen, setAddOpen] = useState(false);
   const [groupOpen, setGroupOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<AccountView | null>(null);
   const [jwtTarget, setJwtTarget] = useState<AccountView | null>(null);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [oauthOpen, setOAuthOpen] = useState(false);
 
   const filtered = useMemo(() => {
     if (filter === 'all') return accounts;
@@ -141,6 +157,12 @@ export default function Accounts() {
             </button>
             <button onClick={() => setGroupOpen(true)} className="btn-outline">
               分组管理
+            </button>
+            <button onClick={() => { void refreshProfiles(); setProfileOpen(true); }} className="btn-outline">
+              <Camera size={15} /> 快照管理
+            </button>
+            <button onClick={() => setOAuthOpen(true)} className="btn-outline">
+              <Globe size={15} /> OAuth 登录
             </button>
             <button onClick={() => setAddOpen(true)} className="btn-primary">
               <Plus size={15} /> 添加账号
@@ -355,6 +377,32 @@ export default function Accounts() {
         }}
         onDelete={async (id) => {
           await removeGroup(id);
+        }}
+      />
+      <ProfileModal
+        open={profileOpen}
+        onClose={() => setProfileOpen(false)}
+        profiles={profiles}
+        profileActive={profileActive}
+        profileProgress={profileProgress}
+        onBackup={(slot) => void profileBackup(slot)}
+        onRestore={(slot) => void profileRestore(slot)}
+        onDelete={async (slot) => {
+          if (!confirm(`确认删除快照「${slot}」？`)) return;
+          await profileDelete(slot);
+        }}
+      />
+      <OAuthLoginModal
+        open={oauthOpen}
+        onClose={() => setOAuthOpen(false)}
+        groups={groups}
+        onLogin={async (callbackUrl, accountName, groupId) => {
+          try {
+            await oauthLogin(callbackUrl, accountName, groupId);
+            setOAuthOpen(false);
+          } catch {
+            /* toast 已发出 */
+          }
         }}
       />
     </div>
@@ -815,6 +863,332 @@ function GroupsModal({
             </button>
           </div>
         ))}
+      </div>
+    </Modal>
+  );
+}
+
+function ProfileSize({ bytes }: { bytes: number }) {
+  const [text, setText] = useState('');
+  useEffect(() => {
+    let cancel = false;
+    api.profiles
+      .formatSize(bytes)
+      .then((t) => {
+        if (!cancel) setText(t);
+      })
+      .catch(() => {
+        if (!cancel) setText(`${bytes} B`);
+      });
+    return () => {
+      cancel = true;
+    };
+  }, [bytes]);
+  return <span>{text || '...'}</span>;
+}
+
+function ProfileModal({
+  open,
+  onClose,
+  profiles,
+  profileActive,
+  profileProgress,
+  onBackup,
+  onRestore,
+  onDelete,
+}: {
+  open: boolean;
+  onClose: () => void;
+  profiles: ProfileInfo[];
+  profileActive: boolean;
+  profileProgress: string[];
+  onBackup: (slot: string) => void;
+  onRestore: (slot: string) => void;
+  onDelete: (slot: string) => Promise<void>;
+}) {
+  return (
+    <Modal open={open} onClose={onClose} title="登录态快照管理">
+      <div className="space-y-3">
+        {profileActive && (
+          <div className="rounded-lg border border-brand-300 bg-brand-50 p-3 dark:border-brand-700 dark:bg-brand-900/20">
+            <div className="mb-1 text-xs font-medium text-brand-700 dark:text-brand-300">
+              正在处理...
+            </div>
+            <div className="max-h-32 space-y-0.5 overflow-auto font-mono text-xs text-brand-600 dark:text-brand-400">
+              {profileProgress.length === 0 ? (
+                <div>等待中...</div>
+              ) : (
+                profileProgress.map((line, i) => <div key={i}>{line}</div>)
+              )}
+            </div>
+          </div>
+        )}
+        {profiles.length === 0 ? (
+          <div className="py-6 text-center text-xs text-slate-400">暂无快照</div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-slate-900">
+              <tr>
+                <th className="px-3 py-2 text-left">账号 (user_id)</th>
+                <th className="px-3 py-2 text-right">文件数</th>
+                <th className="px-3 py-2 text-right">大小</th>
+                <th className="px-3 py-2 text-left">最后修改</th>
+                <th className="px-3 py-2 text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {profiles.map((p) => (
+                <tr
+                  key={p.slot}
+                  className="border-t border-slate-200 dark:border-slate-800"
+                >
+                  <td className="px-3 py-2 font-mono text-xs">{p.slot}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{p.file_count}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    <ProfileSize bytes={p.size_bytes} />
+                  </td>
+                  <td className="px-3 py-2 text-xs text-slate-500">
+                    {p.last_modified || '-'}
+                  </td>
+                  <td className="px-3 py-2">
+                    <div className="flex justify-end gap-1">
+                      <button
+                        title="备份"
+                        onClick={() => onBackup(p.slot)}
+                        disabled={profileActive}
+                        className="btn-ghost !p-2"
+                      >
+                        <Upload size={14} />
+                      </button>
+                      <button
+                        title="恢复"
+                        onClick={() => onRestore(p.slot)}
+                        disabled={profileActive}
+                        className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                      >
+                        <Download size={14} />
+                      </button>
+                      <button
+                        title="删除"
+                        onClick={() => void onDelete(p.slot)}
+                        disabled={profileActive}
+                        className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-500/10"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <div className="text-xs text-slate-400">
+          快照在切换账号时自动备份，也可手动管理
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function OAuthLoginModal({
+  open,
+  onClose,
+  groups,
+  onLogin,
+}: {
+  open: boolean;
+  onClose: () => void;
+  groups: GroupView[];
+  onLogin: (
+    callbackUrl: string,
+    accountName?: string,
+    groupId?: string,
+  ) => Promise<void>;
+}) {
+  const [step, setStep] = useState(1);
+  const [callbackUrl, setCallbackUrl] = useState('');
+  const [accountName, setAccountName] = useState('');
+  const [gid, setGid] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [opening, setOpening] = useState(false);
+  const toast = useAppStore((s) => s.pushToast);
+
+  useEffect(() => {
+    if (!open) {
+      setStep(1);
+      setCallbackUrl('');
+      setAccountName('');
+      setGid('');
+      setBusy(false);
+      setOpening(false);
+    }
+  }, [open]);
+
+  const openLoginPage = async () => {
+    setOpening(true);
+    try {
+      const { url } = await api.oauth.getLoginUrl();
+      window.open(url);
+      setStep(2);
+    } catch (err) {
+      toast('error', `获取登录 URL 失败：${String(err)}`);
+    } finally {
+      setOpening(false);
+    }
+  };
+
+  const finish = async () => {
+    if (!callbackUrl.trim()) return;
+    setBusy(true);
+    try {
+      await onLogin(
+        callbackUrl.trim(),
+        accountName.trim() || undefined,
+        gid || undefined,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="OAuth 登录"
+      footer={
+        <>
+          {step > 1 && (
+            <button
+              onClick={() => setStep((s) => Math.max(1, s - 1))}
+              className="btn-ghost"
+              disabled={busy || opening}
+            >
+              上一步
+            </button>
+          )}
+          <button onClick={onClose} className="btn-ghost" disabled={busy || opening}>
+            取消
+          </button>
+          {step === 1 && (
+            <button
+              onClick={openLoginPage}
+              disabled={opening}
+              className="btn-primary"
+            >
+              {opening ? '正在打开...' : '打开登录页'}
+              {!opening && <ExternalLink size={14} />}
+            </button>
+          )}
+          {step === 2 && (
+            <button
+              onClick={() => setStep(3)}
+              disabled={!callbackUrl.trim()}
+              className="btn-primary"
+            >
+              下一步 <ArrowRight size={14} />
+            </button>
+          )}
+          {step === 3 && (
+            <button
+              onClick={finish}
+              disabled={busy || !callbackUrl.trim()}
+              className="btn-primary"
+            >
+              {busy ? '登录中...' : '完成登录'}
+            </button>
+          )}
+        </>
+      }
+    >
+      <div className="space-y-4">
+        {/* 步骤指示器 */}
+        <div className="flex items-center gap-2">
+          <div
+            className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold ${
+              step >= 1
+                ? 'bg-brand-500 text-white'
+                : 'bg-slate-200 text-slate-500 dark:bg-slate-700'
+            }`}
+          >
+            1
+          </div>
+          <div
+            className={`h-0.5 w-8 ${step > 1 ? 'bg-brand-500' : 'bg-slate-200 dark:bg-slate-700'}`}
+          />
+          <div
+            className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold ${
+              step >= 2
+                ? 'bg-brand-500 text-white'
+                : 'bg-slate-200 text-slate-500 dark:bg-slate-700'
+            }`}
+          >
+            2
+          </div>
+          <div
+            className={`h-0.5 w-8 ${step > 2 ? 'bg-brand-500' : 'bg-slate-200 dark:bg-slate-700'}`}
+          />
+          <div
+            className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold ${
+              step >= 3
+                ? 'bg-brand-500 text-white'
+                : 'bg-slate-200 text-slate-500 dark:bg-slate-700'
+            }`}
+          >
+            3
+          </div>
+        </div>
+
+        {step === 1 && (
+          <div className="text-sm text-slate-600 dark:text-slate-300">
+            点击「打开登录页」在浏览器中发起 OAuth 登录，完成后将自动进入下一步。
+          </div>
+        )}
+
+        {step === 2 && (
+          <div>
+            <label className="label">回调 URL</label>
+            <textarea
+              value={callbackUrl}
+              onChange={(e) => setCallbackUrl(e.target.value)}
+              className="input min-h-[100px] font-mono text-xs"
+              placeholder="http://127.0.0.1:17388/authorize?code=..."
+            />
+            <p className="mt-2 text-xs text-slate-400">
+              登录完成后，浏览器会跳转到 http://127.0.0.1:17388/authorize?... 页面（页面可能显示无法访问），请将地址栏完整 URL 复制粘贴到此处
+            </p>
+          </div>
+        )}
+
+        {step === 3 && (
+          <div className="space-y-3">
+            <div>
+              <label className="label">账号备注名（可选）</label>
+              <input
+                value={accountName}
+                onChange={(e) => setAccountName(e.target.value)}
+                className="input"
+                placeholder="例如：me_1676"
+              />
+            </div>
+            <div>
+              <label className="label">分组（可选）</label>
+              <select
+                value={gid}
+                onChange={(e) => setGid(e.target.value)}
+                className="input"
+              >
+                <option value="">不分组</option>
+                {groups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
       </div>
     </Modal>
   );

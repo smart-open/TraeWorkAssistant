@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { sendNotification } from '@tauri-apps/plugin-notification';
-import { api, setupListeners, type CheckinProgressEvent } from './lib/tauri';
+import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent } from './lib/tauri';
 import type {
   AccountView,
   CheckinAccountResult,
@@ -9,6 +9,7 @@ import type {
   EnvStatus,
   GroupView,
   LogLine,
+  ProfileInfo,
   ProxyStatus,
   Settings,
   ViewKey,
@@ -53,6 +54,9 @@ interface AppState {
   deviceResetActive: boolean;
   checkin: CheckinState;
   toasts: Toast[];
+  profiles: ProfileInfo[];
+  profileProgress: string[];
+  profileActive: boolean;
 
   init: () => Promise<void>;
   setView: (v: ViewKey) => void;
@@ -66,6 +70,7 @@ interface AppState {
   refreshSettings: () => Promise<void>;
   refreshLogs: (q?: LogQuery) => Promise<void>;
   refreshCreditsHistory: () => Promise<void>;
+  refreshProfiles: () => Promise<void>;
 
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
@@ -94,6 +99,10 @@ interface AppState {
   cooldownClear: (userId: string) => Promise<void>;
   refreshJwt: (userId: string) => Promise<void>;
   saveSettings: (patch: Partial<Settings>) => Promise<void>;
+  profileBackup: (userId: string) => Promise<void>;
+  profileRestore: (userId: string) => Promise<void>;
+  profileDelete: (userId: string) => Promise<void>;
+  oauthLogin: (callbackUrl: string, accountName?: string, groupId?: string) => Promise<void>;
 
   pushToast: (kind: ToastKind, msg: string) => void;
   dismissToast: (id: number) => void;
@@ -143,6 +152,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   deviceResetActive: false,
   checkin: { active: false, total: 0, index: 0, results: [], done: null },
   toasts: [],
+  profiles: [],
+  profileProgress: [],
+  profileActive: false,
 
   init: async () => {
     // StrictMode 下 effect 会执行两次：先注销旧监听，避免重复注册导致事件触发两次（如 captured 重复 +1、toast 双发）
@@ -190,6 +202,24 @@ export const useAppStore = create<AppState>((set, get) => ({
           e.success ? '6 层设备标识重置完成' : '设备标识重置失败，请查看日志',
         );
       },
+      onProfileProgress: (line) =>
+        set((s) => ({ profileProgress: [...s.profileProgress.slice(-49), line] })),
+      onProfileDone: (e: ProfileDoneEvent) => {
+        set((s) => ({
+          profileActive: false,
+          profileProgress: [
+            ...s.profileProgress.slice(-49),
+            e.success ? `[完成] ${e.action === 'backup' ? '备份' : '恢复'}成功` : `[失败] ${e.action === 'backup' ? '备份' : '恢复'}失败`,
+          ],
+        }));
+        get().pushToast(
+          e.success ? 'success' : 'error',
+          e.success
+            ? `登录态${e.action === 'backup' ? '备份' : '恢复'}完成`
+            : `登录态${e.action === 'backup' ? '备份' : '恢复'}失败`,
+        );
+        void get().refreshProfiles();
+      },
     });
     await Promise.all([
       get().refreshEnv(),
@@ -199,6 +229,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().refreshGroups(),
       get().refreshSettings(),
       get().refreshCreditsHistory(),
+      get().refreshProfiles(),
     ]);
     set({ ready: true });
 
@@ -533,6 +564,54 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 回滚到修改前的值，避免 UI 显示与后端不一致
       set({ settings: current });
       get().pushToast('error', `保存设置失败：${String(err)}`);
+    }
+  },
+
+  refreshProfiles: async () => {
+    try {
+      const profiles = await api.profiles.list();
+      set({ profiles });
+    } catch {
+      /* ignore */
+    }
+  },
+  profileBackup: async (userId) => {
+    set({ profileActive: true, profileProgress: [] });
+    try {
+      await api.profiles.backup(userId);
+      get().pushToast('info', '正在备份登录态快照…');
+    } catch (err) {
+      set({ profileActive: false });
+      get().pushToast('error', `备份失败：${String(err)}`);
+    }
+  },
+  profileRestore: async (userId) => {
+    set({ profileActive: true, profileProgress: [] });
+    try {
+      await api.profiles.restore(userId);
+      get().pushToast('info', '正在恢复登录态快照…');
+    } catch (err) {
+      set({ profileActive: false });
+      get().pushToast('error', `恢复失败：${String(err)}`);
+    }
+  },
+  profileDelete: async (userId) => {
+    try {
+      await api.profiles.delete(userId);
+      await get().refreshProfiles();
+      get().pushToast('info', '快照已删除');
+    } catch (err) {
+      get().pushToast('error', `删除失败：${String(err)}`);
+    }
+  },
+  oauthLogin: async (callbackUrl, accountName, groupId) => {
+    try {
+      const result = await api.oauth.login(callbackUrl, accountName, groupId);
+      await get().refreshAccounts();
+      get().pushToast('success', `OAuth 登录成功：账号「${result.name}」已添加`);
+    } catch (err) {
+      get().pushToast('error', `OAuth 登录失败：${String(err)}`);
+      throw err;
     }
   },
 

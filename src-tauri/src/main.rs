@@ -74,6 +74,14 @@ fn main() {
             commands::api_server::pool_list,
             commands::api_server::pool_set,
             commands::api_server::pool_status,
+            commands::profile::profile_list,
+            commands::profile::profile_backup,
+            commands::profile::profile_restore,
+            commands::profile::profile_delete,
+            commands::profile::profile_format_size,
+            commands::oauth::oauth_get_login_url,
+            commands::oauth::oauth_parse_callback,
+            commands::oauth::oauth_login,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();

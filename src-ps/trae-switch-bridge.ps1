@@ -21,7 +21,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Switch', 'ResetMachineId', 'BackupCurrent', 'ResetDeviceIds')]
+    [ValidateSet('Switch', 'ResetMachineId', 'BackupCurrent', 'RestoreOnly', 'ResetDeviceIds')]
     [string]$Action,
 
     [Parameter(Mandatory = $false)]
@@ -400,6 +400,12 @@ try {
         'BackupCurrent' {
             Backup-CurrentProfile -Slot $UserId
             Write-Step -Stage 'done' -Message '备份完成' -Status 'ok'
+        }
+        'RestoreOnly' {
+            Stop-Trae
+            Restore-Profile -Slot $UserId
+            Start-Trae
+            Write-Step -Stage 'done' -Message "已恢复账号 $UserId 的登录态" -Status 'ok'
         }
     }
     exit 0

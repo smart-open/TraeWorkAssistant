@@ -165,3 +165,34 @@ export interface PoolStatus {
 export interface ApiPoolFile {
   enabled_uids: string[];
 }
+
+// ---- 登录态快照 ----
+export interface ProfileInfo {
+  slot: string;
+  size_bytes: number;
+  file_count: number;
+  last_modified: string;
+}
+
+// ---- OAuth 登录 ----
+export interface OAuthLoginUrl {
+  url: string;
+  state: string;
+  redirect_uri: string;
+}
+
+export interface OAuthCallbackInfo {
+  refresh_token: string;
+  access_token: string | null;
+  user_id: string | null;
+  user_name: string | null;
+  avatar: string | null;
+}
+
+export interface OAuthLoginResult {
+  user_id: string;
+  name: string;
+  jwt: string;
+  refresh_token: string;
+  has_refresh_token: boolean;
+}
