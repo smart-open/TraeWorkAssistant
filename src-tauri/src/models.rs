@@ -11,7 +11,11 @@ pub struct AccountView {
     pub jwt_exp_timestamp: Option<i64>,
     pub checked_today: Option<bool>,
     pub credits: Option<i64>,
+    pub remaining_credits: Option<f64>,
     pub device_id_masked: Option<String>,
+    pub cooldown_type: Option<String>,
+    pub cooldown_until: Option<i64>,
+    pub cooldown_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -113,8 +117,8 @@ fn default_notify() -> String {
 fn default_retention() -> i32 {
     30
 }
-fn default_proxy_domains() -> String {
-    "trae.cn,trae.com.cn,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com".into()
+pub fn default_proxy_domains() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com".into()
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -143,4 +147,35 @@ pub struct CheckinSummary {
     pub already: i32,
     #[serde(default)]
     pub failed: i32,
+}
+
+/// 剩余积分缓存文件：user_id -> 剩余积分
+#[derive(Serialize, Deserialize, Default)]
+pub struct RemainingCreditsFile {
+    #[serde(default)]
+    pub credits: HashMap<String, f64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// 单个账号的冷却状态
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct CooldownEntry {
+    #[serde(rename = "type", default)]
+    pub error_type: String,
+    #[serde(default)]
+    pub until: i64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub error_count: i32,
+}
+
+/// 冷却状态文件：account_cooldowns.json
+#[derive(Serialize, Deserialize, Default)]
+pub struct AccountCooldownsFile {
+    #[serde(default)]
+    pub cooldowns: HashMap<String, CooldownEntry>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }

@@ -1,5 +1,5 @@
 //! JWT 解析（不校验签名，仅本地展示用途）。
-//! 支持 `Cloud-IDE-JWT <token>` 前缀；payload 取 data.id 与 exp。
+//! 支持 `Cloud-IDE-JWT <token>` / `Bearer <token>` 前缀；payload 取 data.id 与 exp。
 
 use base64::Engine;
 
@@ -10,9 +10,14 @@ pub struct JwtInfo {
 }
 
 pub fn parse(jwt_full: &str) -> JwtInfo {
-    let token = jwt_full
+    // 去除首尾空白（用户粘贴时可能带换行/空格）
+    let trimmed = jwt_full.trim();
+    // 兼容多种前缀：Cloud-IDE-JWT / Bearer / 直接 token
+    let token = trimmed
         .strip_prefix("Cloud-IDE-JWT ")
-        .unwrap_or(jwt_full);
+        .or_else(|| trimmed.strip_prefix("Bearer "))
+        .unwrap_or(trimmed)
+        .trim();
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() < 2 {
         return JwtInfo {
@@ -21,9 +26,9 @@ pub fn parse(jwt_full: &str) -> JwtInfo {
             exp_timestamp: None,
         };
     }
-    // padding 与 Python 一致：(4 - len % 4) % 4
-    let pad = format!("{}{}", parts[1], "=".repeat((4 - parts[1].len() % 4) % 4));
-    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&pad) else {
+    // JWT payload 使用 base64url 无填充编码；strip 残余 '=' 后用 URL_SAFE_NO_PAD 解码
+    let payload_b64 = parts[1].trim_end_matches('=');
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) else {
         return JwtInfo {
             user_id: None,
             exp_hours: None,

@@ -108,7 +108,7 @@ export default function Settings() {
   if (!form) {
     return (
       <div className="animate-fade-in">
-        <PageHeader title="设置" />
+        <PageHeader title="系统设置" />
         <div className="text-sm text-slate-500">加载中…</div>
       </div>
     );
@@ -117,7 +117,7 @@ export default function Settings() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="设置"
+        title="系统设置"
         desc="主题、代理端口、定时任务与邀请链接"
         actions={
           dirty ? (
@@ -288,10 +288,10 @@ export default function Settings() {
                 value={form.proxy_domains}
                 onChange={(e) => update('proxy_domains', e.target.value)}
                 className="input min-h-[60px] text-xs"
-                placeholder="逗号分隔，如：trae.cn,trae.com.cn,zijieapi.com"
+                placeholder="trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com"
               />
               <p className="mt-1 text-xs text-slate-400">
-                逗号分隔的域名后缀列表，匹配的域名将走 MITM 解密。留空则使用默认值。修改后需重启代理生效。
+                逗号分隔的域名后缀列表，匹配的域名将走 MITM 解密并记录日志。未在列表中的域名请求将透明转发但不记录日志，不影响其他 App 正常上网。留空则使用默认值。修改后需重启代理生效。
               </p>
             </div>
             <div>

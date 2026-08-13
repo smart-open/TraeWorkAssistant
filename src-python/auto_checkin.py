@@ -292,31 +292,106 @@ def status_check(name, jwt, device_map, timeout=30):
 
 
 def signin(name, jwt, device_map, timeout=30):
-    """对单个账号执行签到，返回 (success: bool, message: str, code: int|None)。"""
+    """对单个账号执行签到，返回 (success, message, code, http_status)。"""
     user_id = extract_user_id(jwt)
     if not user_id:
-        return False, "无法从 JWT 解析 user id", None
+        return False, "无法从 JWT 解析 user id", None, 0
 
     dev = get_device_for(user_id, device_map)
     status, body = _http_post(SIGNIN_URL, jwt, dev, body=b"{}", timeout=timeout)
 
     if status < 0:
-        return False, body or "网络异常", None
+        return False, body or "网络异常", None, status
     try:
         data = json.loads(body)
-        return data.get("code") == 0, data.get("message", f"HTTP {status}"), data.get("code")
+        return data.get("code") == 0, data.get("message", f"HTTP {status}"), data.get("code"), status
     except Exception:
-        return False, f"HTTP {status}: 非 JSON 响应: {body[:200]}", status if status else None
+        return False, f"HTTP {status}: 非 JSON 响应: {body[:200]}", status if status else None, status
+
+
+def classify_error(http_status, message, code):
+    """根据 HTTP 状态码和业务码分类签到错误，返回 (error_type, cooldown_seconds)。
+    cooldown_seconds: -1=永久, 0=不冷却(仅记录错误计数), >0=冷却秒数"""
+    if http_status == 200 and code == 1005:
+        return "PlanLimit", 43200
+    if http_status == 429:
+        return "SoftRate", 60
+    if http_status == 401:
+        return "SessionDead", -1
+    if http_status == 404:
+        return "NotFound", 60
+    if 500 <= http_status < 600:
+        return "Server", 600
+    if 400 <= http_status < 500:
+        return "Client", 600
+    if code is not None and code != 0:
+        return "BusinessError", 300
+    return "Unknown", 0
+
+
+def save_cooldown(user_id, error_type, cooldown_seconds, reason):
+    """写入/更新账号冷却状态到 account_cooldowns.json"""
+    cooldown_file = os.path.join(DATA_DIR, "account_cooldowns.json")
+    data = {}
+    try:
+        with open(cooldown_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    if not isinstance(data, dict):
+        data = {}
+    if "cooldowns" not in data or not isinstance(data["cooldowns"], dict):
+        data["cooldowns"] = {}
+
+    now = int(time.time())
+
+    if cooldown_seconds == -1:
+        until = 9999999999
+        error_count = 0
+    elif cooldown_seconds == 0:
+        data["cooldowns"].pop(user_id, None)
+        data["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        save_json(cooldown_file, data)
+        return
+    else:
+        existing = data["cooldowns"].get(user_id, {})
+        if error_type in ("Server", "Client"):
+            error_count = existing.get("error_count", 0) + 1
+            if error_count < 3:
+                data["cooldowns"][user_id] = {
+                    "type": error_type, "until": 0,
+                    "reason": reason, "error_count": error_count,
+                }
+                data["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                save_json(cooldown_file, data)
+                return
+            until = now + cooldown_seconds
+            error_count = 0
+        else:
+            until = now + cooldown_seconds
+            error_count = 0
+
+    data["cooldowns"][user_id] = {
+        "type": error_type, "until": until,
+        "reason": reason, "error_count": error_count,
+    }
+    data["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    save_json(cooldown_file, data)
+
+
+def clear_cooldown(user_id):
+    """清除账号冷却状态"""
+    save_cooldown(user_id, "", 0, "")
 
 
 def signin_with_retry(name, jwt, device_map, timeout=30, retry=0):
     """对单个账号执行签到；仅网络层异常（code 为 None）按 retry 次数重试，业务失败不重试。"""
-    last = (False, "无重试", None)
+    last = (False, "无重试", None, 0)
     for attempt in range(retry + 1):
-        ok, msg, code = signin(name, jwt, device_map, timeout)
+        ok, msg, code, status = signin(name, jwt, device_map, timeout)
         if ok or code is not None:
-            return ok, msg, code
-        last = (ok, msg, code)
+            return ok, msg, code, status
+        last = (ok, msg, code, status)
         if attempt < retry:
             print(f"  [重试] 第 {attempt + 1} 次签到网络异常，1s 后重试…")
             time.sleep(1)
@@ -430,12 +505,16 @@ def main():
         if not ok_s:
             print(f"  [WARN] status 预检失败 (code={code_s}) {msg_s} —— 仍尝试 claim")
 
-        ok, msg, code = signin_with_retry(name, jwt, device_map, retry=args.retry)
+        ok, msg, code, http_status = signin_with_retry(name, jwt, device_map, retry=args.retry)
         result = {"name": name, "ok": ok, "code": code, "message": msg, "action": "claim"}
         final_credits: Optional[int] = None
         final_delta = 0
+        emit_error_type = None
+        emit_cooldown_until = None
 
         if ok:
+            # 签到成功 → 清除冷却
+            clear_cooldown(user_id)
             ok2, _checked, credits_after, code2, msg2 = status_check(name, jwt, device_map)
             if ok2 and isinstance(credits_after, int) and isinstance(credits_before, int):
                 delta = credits_after - credits_before
@@ -455,6 +534,17 @@ def main():
                 print(f"  [OK] 签到成功（积分复核失败 code={code2}，已忽略：{msg2}）")
                 result["action"] = "claim_ok"
                 final_credits = credits_after if isinstance(credits_after, int) else None
+        else:
+            # 签到失败 → 分类错误并写入冷却
+            error_type, cooldown_secs = classify_error(http_status, msg, code)
+            if error_type and error_type != "Unknown":
+                save_cooldown(user_id, error_type, cooldown_secs, msg)
+                # 读取冷却状态获取 until 值
+                cooldown_data = load_json(os.path.join(DATA_DIR, "account_cooldowns.json"), default={})
+                cd_entry = cooldown_data.get("cooldowns", {}).get(user_id, {})
+                emit_error_type = error_type
+                emit_cooldown_until = cd_entry.get("until", 0)
+                print(f"  [COOLDOWN] {error_type} 冷却 {cooldown_secs}s (until={emit_cooldown_until})")
 
         results.append(result)
         print(f"  结果: {'成功' if ok else '失败'} (code={code}) {msg}")
@@ -471,6 +561,8 @@ def main():
             "message": msg,
             "credits": final_credits,
             "delta": final_delta if final_delta else None,
+            "error_type": emit_error_type,
+            "cooldown_until": emit_cooldown_until,
         })
         if ok:
             total_ok += 1

@@ -38,6 +38,12 @@ export const api = {
       invoke('account_delete', { userId, deleteProfile }),
     update: (userId: string, name?: string, jwt?: string) =>
       invoke('account_update', { userId, name, jwt }),
+    fetchRemainingCredits: (userId: string) =>
+      invoke<number>('fetch_remaining_credits', { userId }),
+    refreshRemainingCredits: () =>
+      invoke<number>('refresh_remaining_credits'),
+    cooldownClear: (userId: string) =>
+      invoke('cooldown_clear', { userId }),
   },
   groups: {
     list: () => invoke<GroupView[]>('groups_list'),
@@ -110,6 +116,8 @@ export interface CheckinAccountEvent {
   elapsed?: number;
   code?: number;
   message?: string;
+  error_type?: string | null;
+  cooldown_until?: number | null;
 }
 export interface CheckinDoneEvent {
   type: 'done';

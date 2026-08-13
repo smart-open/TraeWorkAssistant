@@ -13,6 +13,7 @@ import {
   Pencil,
   Eye,
   Copy,
+  Snowflake,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
@@ -31,6 +32,35 @@ function JwtStatusBadge({ hours }: { hours: number | null }) {
   return <Badge tone="green"><CheckCircle2 size={12} /> {hours.toFixed(0)}h</Badge>;
 }
 
+const COOLDOWN_LABELS: Record<string, string> = {
+  PlanLimit: '套餐限额',
+  SoftRate: '限流',
+  SessionDead: '会话失效',
+  NotFound: '接口异常',
+  Server: '服务端错误',
+  Client: '客户端错误',
+  BusinessError: '业务错误',
+};
+
+function CooldownBadge({ type, until }: { type: string; until: number | null }) {
+  const label = COOLDOWN_LABELS[type] ?? type;
+  const isPermanent = type === 'SessionDead';
+  let remaining = '';
+  if (!isPermanent && until) {
+    const secs = until - Math.floor(Date.now() / 1000);
+    if (secs > 0) {
+      const h = Math.floor(secs / 3600);
+      const m = Math.floor((secs % 3600) / 60);
+      remaining = h > 0 ? `${h}h${m}m` : `${m}m`;
+    }
+  }
+  return (
+    <Badge tone={isPermanent ? 'red' : 'amber'}>
+      <Snowflake size={12} /> {label}{remaining && ` ${remaining}`}
+    </Badge>
+  );
+}
+
 export default function Accounts() {
   const accounts = useAppStore((s) => s.accounts);
   const groups = useAppStore((s) => s.groups);
@@ -46,6 +76,8 @@ export default function Accounts() {
   const resetDevice = useAppStore((s) => s.resetDevice);
   const switchTo = useAppStore((s) => s.switchTo);
   const renewJwt = useAppStore((s) => s.renewJwt);
+  const refreshRemainingCredits = useAppStore((s) => s.refreshRemainingCredits);
+  const cooldownClear = useAppStore((s) => s.cooldownClear);
   const toast = useAppStore((s) => s.pushToast);
 
   const [filter, setFilter] = useState<string>('all');
@@ -86,7 +118,7 @@ export default function Accounts() {
         desc="维护账号、调整分组、重置设备 ID 与登录态切换"
         actions={
           <>
-            <button onClick={() => { void refreshAccounts(); void refreshGroups(); }} className="btn-outline">
+            <button onClick={() => { void refreshAccounts(); void refreshGroups(); void refreshRemainingCredits(); }} className="btn-outline">
               <RefreshCw size={15} /> 刷新
             </button>
             <button onClick={() => setGroupOpen(true)} className="btn-outline">
@@ -143,7 +175,9 @@ export default function Accounts() {
                 <th className="px-4 py-2 text-left">JWT</th>
                 <th className="px-4 py-2 text-left">设备 ID</th>
                 <th className="px-4 py-2 text-left">今日</th>
-                <th className="px-4 py-2 text-right">积分</th>
+                <th className="px-4 py-2 text-left">冷却</th>
+                <th className="px-4 py-2 text-right">剩余积分</th>
+                <th className="px-4 py-2 text-right">今日积分</th>
                 <th className="px-4 py-2 text-right">操作</th>
               </tr>
             </thead>
@@ -182,6 +216,18 @@ export default function Accounts() {
                         <Badge tone="slate">未签</Badge>
                       )}
                     </td>
+                    <td className="px-4 py-3">
+                      {a.cooldown_type ? (
+                        <CooldownBadge type={a.cooldown_type} until={a.cooldown_until} />
+                      ) : (
+                        <span className="text-xs text-slate-300">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right tabular-nums">
+                      {a.remaining_credits != null
+                        ? a.remaining_credits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
+                        : '-'}
+                    </td>
                     <td className="px-4 py-3 text-right tabular-nums">
                       {a.credits != null ? a.credits.toLocaleString() : '-'}
                     </td>
@@ -190,6 +236,15 @@ export default function Accounts() {
                         <button title="编辑账号" onClick={() => setEditTarget(a)} className="btn-ghost !p-2">
                           <Pencil size={14} />
                         </button>
+                        {a.cooldown_type && (
+                          <button
+                            title="解除冷却"
+                            onClick={() => void cooldownClear(a.user_id)}
+                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                          >
+                            <Snowflake size={14} />
+                          </button>
+                        )}
                         {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24) && (
                           <button
                             title="续期 JWT（启动代理并切换账号）"
@@ -379,12 +434,12 @@ function AddAccountModal({
           />
         </div>
         <div>
-          <label className="label">JWT（支持「Cloud-IDE-JWT 」前缀）</label>
+          <label className="label">JWT（支持「Cloud-IDE-JWT 」/「Bearer 」前缀，或直接粘贴 token）</label>
           <textarea
             value={jwt}
             onChange={(e) => setJwt(e.target.value)}
             className="input min-h-[120px] font-mono text-xs"
-            placeholder="Cloud-IDE-JWT eyJ..."
+            placeholder="eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
           />
         </div>
         <div>
@@ -514,7 +569,7 @@ function EditAccountModal({
             value={jwt}
             onChange={(e) => setJwt(e.target.value)}
             className="input min-h-[120px] font-mono text-xs"
-            placeholder="粘贴新 JWT 以替换（支持 Cloud-IDE-JWT 前缀）"
+            placeholder="粘贴新 JWT 以替换（支持 Cloud-IDE-JWT / Bearer 前缀或直接粘贴 token）"
           />
         </div>
         {info && (

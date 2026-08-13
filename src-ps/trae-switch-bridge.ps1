@@ -37,11 +37,88 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Script:TraeExe = "$env:LOCALAPPDATA\Programs\Trae\Trae.exe"
 $Script:TraeDataDir = "$env:APPDATA\TRAE SOLO CN"
 $Script:AppDataDir = "$env:APPDATA\TraeWorkAssistant"
 $Script:ProfilesDir = "$Script:AppDataDir\profiles"
 $Script:LogFile = "$Script:AppDataDir\logs\switcher.log"
+$Script:_TraeExeCache = $null
+
+function Find-TraeExe {
+    if ($Script:_TraeExeCache) { return $Script:_TraeExeCache }
+
+    # 1. 从 app_settings.json 读取用户自定义路径
+    $settingsFile = Join-Path $Script:AppDataDir 'app_settings.json'
+    if (Test-Path $settingsFile) {
+        try {
+            $settings = Get-Content $settingsFile -Raw | ConvertFrom-Json
+            if ($settings.trae_path -and (Test-Path $settings.trae_path)) {
+                $Script:_TraeExeCache = $settings.trae_path
+                return $Script:_TraeExeCache
+            }
+        } catch {}
+    }
+
+    # 2. 多候选路径探测（与 Rust env.rs 保持一致）
+    $candidates = @(
+        "$env:LOCALAPPDATA\Programs\TRAE SOLO CN\TRAE SOLO CN.exe",
+        "$env:LOCALAPPDATA\Programs\TRAE SOLO\TRAE SOLO.exe",
+        "$env:ProgramFiles\TRAE SOLO CN\TRAE SOLO CN.exe",
+        "$env:ProgramFiles\TRAE SOLO\TRAE SOLO.exe",
+        "$env:LOCALAPPDATA\Programs\Trae\Trae.exe",
+        "$env:ProgramFiles\Trae\Trae.exe"
+    )
+    # 也检查 D 盘等非系统盘
+    if ($env:ProgramFiles -notlike 'D:\*') {
+        $candidates += 'D:\Programs\TRAE SOLO CN\TRAE SOLO CN.exe'
+    }
+    foreach ($c in $candidates) {
+        if (Test-Path $c) {
+            $Script:_TraeExeCache = $c
+            return $Script:_TraeExeCache
+        }
+    }
+
+    # 3. 注册表回退
+    try {
+        $regKeys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        foreach ($key in $regKeys) {
+            $items = Get-ItemProperty $key -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like '*TRAE*' -or $_.DisplayName -like '*Trae*' }
+            foreach ($item in $items) {
+                # 尝试 DisplayIcon
+                if ($item.DisplayIcon) {
+                    $iconPath = $item.DisplayIcon -replace ',', ''
+                    $iconPath = $iconPath.Trim()
+                    if (Test-Path $iconPath) {
+                        $Script:_TraeExeCache = $iconPath
+                        return $Script:_TraeExeCache
+                    }
+                }
+                # 尝试 InstallLocation
+                if ($item.InstallLocation) {
+                    $loc = $item.InstallLocation.Trim()
+                    $exeCandidates = @(
+                        (Join-Path $loc 'TRAE SOLO CN.exe'),
+                        (Join-Path $loc 'TRAE SOLO.exe'),
+                        (Join-Path $loc 'Trae.exe')
+                    )
+                    foreach ($exe in $exeCandidates) {
+                        if (Test-Path $exe) {
+                            $Script:_TraeExeCache = $exe
+                            return $Script:_TraeExeCache
+                        }
+                    }
+                }
+            }
+        }
+    } catch {}
+
+    return $null
+}
 
 function Write-Step {
     param([string]$Stage, [string]$Message, [string]$Status = 'info')
@@ -63,7 +140,8 @@ function Write-Step {
 }
 
 function Stop-Trae {
-    $p = Get-Process -Name 'Trae' -ErrorAction SilentlyContinue
+    # 兼容多种进程名
+    $p = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(Trae|TRAE.*CN.*)$' }
     if ($p) {
         Write-Step -Stage 'stop' -Message '正在关闭 Trae Work' -Status 'running'
         $p | Stop-Process -Force
@@ -74,12 +152,13 @@ function Stop-Trae {
 }
 
 function Start-Trae {
-    if (-not (Test-Path $Script:TraeExe)) {
-        Write-Step -Stage 'start' -Message "未找到 Trae: $Script:TraeExe" -Status 'error'
-        throw "Trae 可执行文件不存在"
+    $exe = Find-TraeExe
+    if (-not $exe) {
+        Write-Step -Stage 'start' -Message '未找到 TRAE 安装路径，请在设置中指定' -Status 'error'
+        throw '未找到 TRAE 可执行文件'
     }
-    Write-Step -Stage 'start' -Message '正在启动 Trae Work（沿用系统代理）' -Status 'running'
-    Start-Process -FilePath $Script:TraeExe -WindowStyle Normal
+    Write-Step -Stage 'start' -Message "正在启动 Trae Work: $exe" -Status 'running'
+    Start-Process -FilePath $exe -WindowStyle Normal
 }
 
 function Reset-MachineId {

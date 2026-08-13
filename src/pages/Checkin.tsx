@@ -1,5 +1,5 @@
 import { useMemo, useState, useEffect } from 'react';
-import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle } from 'lucide-react';
+import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle, Snowflake } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
 import { useAppStore } from '../store';
@@ -10,6 +10,35 @@ function MiniJwtBadge({ hours }: { hours: number | null }) {
   if (hours <= 0) return <span className="text-xs text-rose-500"><XCircle size={11} className="inline" /> 过期</span>;
   if (hours <= 24) return <span className="text-xs text-amber-500"><AlertTriangle size={11} className="inline" /> {hours.toFixed(1)}h</span>;
   return <span className="text-xs text-emerald-500"><CheckCircle2 size={11} className="inline" /> {hours.toFixed(0)}h</span>;
+}
+
+const COOLDOWN_LABELS: Record<string, string> = {
+  PlanLimit: '套餐限额',
+  SoftRate: '限流',
+  SessionDead: '会话失效',
+  NotFound: '接口异常',
+  Server: '服务端错误',
+  Client: '客户端错误',
+  BusinessError: '业务错误',
+};
+
+function MiniCooldownBadge({ type, until }: { type: string; until: number | null }) {
+  const label = COOLDOWN_LABELS[type] ?? type;
+  const isPermanent = type === 'SessionDead';
+  let remaining = '';
+  if (!isPermanent && until) {
+    const secs = until - Math.floor(Date.now() / 1000);
+    if (secs > 0) {
+      const h = Math.floor(secs / 3600);
+      const m = Math.floor((secs % 3600) / 60);
+      remaining = h > 0 ? `${h}h${m}m` : `${m}m`;
+    }
+  }
+  return (
+    <span className={`text-xs ${isPermanent ? 'text-rose-500' : 'text-amber-500'}`}>
+      <Snowflake size={11} className="inline" /> {label}{remaining && ` ${remaining}`}
+    </span>
+  );
 }
 
 export default function Checkin() {
@@ -140,7 +169,7 @@ export default function Checkin() {
               </button>
             )}
           </div>
-          <div className="max-h-56 overflow-auto rounded-lg border border-slate-200 dark:border-slate-700">
+          <div className="rounded-lg border border-slate-200 dark:border-slate-700">
             <table className="w-full text-sm">
               <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-slate-900">
                 <tr>
@@ -148,13 +177,14 @@ export default function Checkin() {
                   <th className="px-3 py-1.5 text-left">账号</th>
                   <th className="px-3 py-1.5 text-left">JWT</th>
                   <th className="px-3 py-1.5 text-left">今日</th>
+                  <th className="px-3 py-1.5 text-left">冷却</th>
                   <th className="px-3 py-1.5 text-right">积分</th>
                 </tr>
               </thead>
               <tbody>
                 {candidateAccounts.length === 0 ? (
                   <tr>
-                    <td colSpan={scope === 'selected' ? 5 : 4} className="px-3 py-4 text-center text-xs text-slate-400">
+                    <td colSpan={scope === 'selected' ? 6 : 5} className="px-3 py-4 text-center text-xs text-slate-400">
                       {scope === 'group' ? '该分组下没有账号' : '暂无账号'}
                     </td>
                   </tr>
@@ -185,6 +215,13 @@ export default function Checkin() {
                             <Badge tone="green">已签</Badge>
                           ) : (
                             <Badge tone="slate">未签</Badge>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5">
+                          {a.cooldown_type ? (
+                            <MiniCooldownBadge type={a.cooldown_type} until={a.cooldown_until} />
+                          ) : (
+                            <span className="text-xs text-slate-300">-</span>
                           )}
                         </td>
                         <td className="px-3 py-1.5 text-right tabular-nums text-xs">
@@ -278,6 +315,11 @@ export default function Checkin() {
                     {r.status === 'already' && `已签 (余额 ${r.credits ?? '?'})`}
                     {r.status === 'fail' && (r.message ?? '失败')}
                   </span>
+                  {r.error_type && (
+                    <span className="text-xs text-amber-500">
+                      <Snowflake size={11} className="inline" /> {COOLDOWN_LABELS[r.error_type] ?? r.error_type}
+                    </span>
+                  )}
                   {r.elapsed != null && <span className="text-xs text-slate-400">{r.elapsed.toFixed(1)}s</span>}
                 </div>
               );

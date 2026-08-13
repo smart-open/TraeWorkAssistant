@@ -42,6 +42,24 @@ pub fn checkin_start(
             keep
         });
     }
+    // 过滤冷却中的账号（SessionDead 永久跳过，其他类型冷却中跳过）
+    {
+        let views = build_account_views(&state);
+        let cooled: std::collections::HashSet<&str> = views
+            .iter()
+            .filter(|v| v.cooldown_type.is_some())
+            .map(|v| v.user_id.as_str())
+            .collect();
+        let before = uids.len();
+        uids.retain(|u| !cooled.contains(u.as_str()));
+        let skipped = before - uids.len();
+        if skipped > 0 {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("跳过 {} 个冷却中账号", skipped),
+            );
+        }
+    }
     let accounts_arg = uids.join(",");
     let retry = state.settings().retry.max(0) as u32;
     let mut args = vec!["--json-stream".to_string()];

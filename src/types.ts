@@ -32,7 +32,11 @@ export interface AccountView {
   jwt_exp_timestamp: number | null;
   checked_today: boolean | null;
   credits: number | null;
+  remaining_credits: number | null;
   device_id_masked: string | null;
+  cooldown_type: string | null;
+  cooldown_until: number | null;
+  cooldown_reason: string | null;
 }
 
 export interface GroupView {
@@ -96,6 +100,8 @@ export interface CheckinAccountResult {
   elapsed?: number;
   code?: number;
   message?: string;
+  error_type?: string | null;
+  cooldown_until?: number | null;
 }
 
 export interface CheckinDone {

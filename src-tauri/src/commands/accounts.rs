@@ -5,7 +5,7 @@ use crate::fs_utils;
 use crate::jwt;
 use crate::models::{
     AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, Group, RawAccount,
-    CreditsFile, CheckinSummary,
+    CreditsFile, CheckinSummary, RemainingCreditsFile, AccountCooldownsFile,
 };
 
 use crate::state::AppState;
@@ -211,14 +211,154 @@ pub fn group_move(
     Ok(())
 }
 
+// ---------------- 剩余积分 ----------------
+
+/// 调用 TRAE API 计算剩余积分
+/// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
+/// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），求和后四舍五入保留2位小数
+fn calc_remaining_credits(jwt: &str) -> Result<f64, String> {
+    let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
+        jwt.to_string()
+    } else {
+        format!("Cloud-IDE-JWT {}", jwt)
+    };
+    let resp = ureq::post("https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage")
+        .set("authorization", &auth)
+        .set("content-type", "application/json")
+        .set("accept", "*/*")
+        .timeout(std::time::Duration::from_secs(15))
+        .send_json(ureq::json!({"require_usage": true, "req_source": 2}))
+        .map_err(|e| format!("API 请求失败: {}", e))?;
+
+    let body: serde_json::Value =
+        resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+
+    let packs = body
+        .get("user_entitlement_pack_list")
+        .and_then(|v| v.as_array())
+        .ok_or("响应中缺少 user_entitlement_pack_list")?;
+
+    let mut total: f64 = 0.0;
+    for pack in packs {
+        // 仅对有 credits_limit 的包计入统计
+        let credits_limit = pack
+            .get("entitlement_base_info")
+            .and_then(|e| e.get("quota"))
+            .and_then(|q| q.get("credits_limit"))
+            .and_then(|v| v.as_f64());
+        if let Some(limit) = credits_limit {
+            let used = pack
+                .get("entitlement_base_info")
+                .and_then(|e| e.get("usage"))
+                .and_then(|u| u.get("credits_amount"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            total += (limit - used).max(0.0);
+        }
+    }
+
+    // 四舍五入保留2位小数
+    Ok((total * 100.0).round() / 100.0)
+}
+
+/// 获取单个账号的剩余积分（实时请求 API）
+#[tauri::command]
+pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Result<f64, String> {
+    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+        .ok_or("账号不存在")?;
+    let jwt = &account.jwt;
+    let credits = calc_remaining_credits(jwt)?;
+    // 写入缓存
+    let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
+    rc.credits.insert(user_id, credits);
+    rc.updated_at = Some(fs_utils::now_iso());
+    fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
+    Ok(credits)
+}
+
+/// 刷新所有账号的剩余积分（批量请求 API），返回成功数量。
+/// 同时执行自动解冻：签到成功且有积分（credits > 0）且冷却类型非 SessionDead → 清除冷却。
+#[tauri::command]
+pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String> {
+    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
+    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let mut ok_count = 0usize;
+    let mut thawed_count = 0usize;
+    for a in &accounts.accounts {
+        let uid = a
+            .user_id
+            .clone()
+            .or_else(|| jwt::parse(&a.jwt).user_id.clone())
+            .unwrap_or_default();
+        if uid.is_empty() {
+            continue;
+        }
+        match calc_remaining_credits(&a.jwt) {
+            Ok(credits) => {
+                rc.credits.insert(uid.clone(), credits);
+                ok_count += 1;
+                // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
+                if credits > 0.0 {
+                    let thaw_type = cd.cooldowns.get(&uid).and_then(|e| {
+                        if e.error_type != "SessionDead" && !e.error_type.is_empty() {
+                            Some(e.error_type.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(et) = thaw_type {
+                        cd.cooldowns.remove(&uid);
+                        thawed_count += 1;
+                        crate::fs_utils::app_log(
+                            &state.data_dir,
+                            &format!("自动解冻 [{}]: 类型={} 积分={}", a.name, et, credits),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("获取剩余积分失败 [{}]: {}", a.name, e),
+                );
+            }
+        }
+    }
+    rc.updated_at = Some(fs_utils::now_iso());
+    fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
+    if thawed_count > 0 {
+        cd.updated_at = Some(fs_utils::now_iso());
+        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+    }
+    Ok(ok_count)
+}
+
+/// 手动清除指定账号的冷却状态
+#[tauri::command]
+pub fn cooldown_clear(state: State<AppState>, user_id: String) -> Result<(), String> {
+    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    if cd.cooldowns.remove(&user_id).is_some() {
+        cd.updated_at = Some(fs_utils::now_iso());
+        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+    }
+    Ok(())
+}
+
 // ---------------- 内部工具 ----------------
 
-/// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到）。
+/// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到 / 冷却状态）。
 pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
     let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
     let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
     let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
     let credits: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
+    let rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
+    let cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
     let summary: CheckinSummary = fs_utils::read_json(&state.path("checkin_summary.json"));
     let summary_today = summary
         .time
@@ -240,6 +380,7 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
         Default::default()
     };
 
+    let now_ts = chrono::Local::now().timestamp();
     let mut out = Vec::new();
     for a in &accounts.accounts {
         let uid = a
@@ -276,8 +417,22 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
         } else {
             false
         };
+        // 冷却状态：until > now 表示仍在冷却中（SessionDead 的 until=9999999999 始终 > now）
+        let (cd_type, cd_until, cd_reason) = if let Some(entry) = cd.cooldowns.get(&uid) {
+            if entry.until > now_ts && !entry.error_type.is_empty() {
+                (
+                    Some(entry.error_type.clone()),
+                    Some(entry.until),
+                    if entry.reason.is_empty() { None } else { Some(entry.reason.clone()) },
+                )
+            } else {
+                (None, None, None)
+            }
+        } else {
+            (None, None, None)
+        };
         out.push(AccountView {
-            user_id: uid,
+            user_id: uid.clone(),
             name: a.name.clone(),
             group_id,
             jwt: a.jwt.clone(),
@@ -285,7 +440,11 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
             jwt_exp_timestamp: info.exp_timestamp,
             checked_today: Some(checked),
             credits: credits_val,
+            remaining_credits: rc.credits.get(&uid).copied(),
             device_id_masked: device_mask,
+            cooldown_type: cd_type,
+            cooldown_until: cd_until,
+            cooldown_reason: cd_reason,
         });
     }
     out

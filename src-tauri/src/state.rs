@@ -47,7 +47,12 @@ impl AppState {
 
     pub fn settings(&self) -> Settings {
         // 统一走 fs_utils::read_json：文件缺失/为空/解析失败均回退默认，行为一致
-        fs_utils::read_json(&self.path("app_settings.json"))
+        let mut s: Settings = fs_utils::read_json(&self.path("app_settings.json"));
+        // proxy_domains 为空时回填默认值，确保设置页始终展示默认监听域名
+        if s.proxy_domains.trim().is_empty() {
+            s.proxy_domains = crate::models::default_proxy_domains();
+        }
+        s
     }
 }
 

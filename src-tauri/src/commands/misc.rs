@@ -84,11 +84,11 @@ fn parse_proxy_entry(raw: &str, file_name: &str, index: usize) -> Option<ProxyLo
         // WebSocket 条目
         let hp = rest.find("] ").map(|i| &rest[i + 2..]).unwrap_or(rest);
         let (host, path) = split_host_path(hp);
-        ("WS".to_string(), host, path, "101 Upgrade".to_string())
+        ("WebSocket".to_string(), host, path, "101 Upgrade".to_string())
     } else {
         // 普通请求
         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-        let method = parts.first().unwrap_or(&"").to_string();
+        let raw_method = parts.first().unwrap_or(&"").to_string();
         let hp = parts.get(1).unwrap_or(&"");
         let (host, path) = split_host_path(hp);
         // 从内容中提取状态码
@@ -102,7 +102,7 @@ fn parse_proxy_entry(raw: &str, file_name: &str, index: usize) -> Option<ProxyLo
                     .into()
             })
             .unwrap_or_else(|| "-".to_string());
-        (method, host, path, status)
+        (format!("HTTP {}", raw_method), host, path, status)
     };
 
     Some(ProxyLogEntry {
@@ -138,7 +138,8 @@ pub fn proxy_logs_list(
         });
     }
 
-    // 列出所有 .log 文件，按文件名降序（新文件在前）
+    // 列出所有 .log 文件，按文件名升序（旧文件在前）
+    // 这样 all_entries 中条目按时间正序排列（旧→新），reverse() 后得到正确的时间倒序（新→旧）
     let mut files: Vec<String> = std::fs::read_dir(&log_dir)
         .map_err(|e| format!("读取代理日志目录失败: {e}"))?
         .filter_map(|e| {
@@ -151,7 +152,7 @@ pub fn proxy_logs_list(
             }
         })
         .collect();
-    files.sort_by(|a, b| b.cmp(a));
+    files.sort_by(|a, b| a.cmp(b));
 
     let keyword = opts.keyword.as_deref().unwrap_or("");
     let start = opts.start_time.as_deref().unwrap_or("");
@@ -203,8 +204,8 @@ pub fn proxy_logs_list(
         }
     }
 
-    // 条目已按文件名降序排列（新文件在前），同文件内按出现顺序（也是新的在后）
-    // 反转同文件内的顺序，使最新的在前
+    // 文件按升序处理（旧→新），同文件内条目按写入顺序也是旧→新，
+    // 因此 all_entries 整体为时间正序（旧→新），reverse() 后得到时间倒序（新→旧）
     all_entries.reverse();
 
     let total = all_entries.len();

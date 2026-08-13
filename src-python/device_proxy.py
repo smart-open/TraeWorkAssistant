@@ -142,8 +142,8 @@ _seen_auth_hints = set()
 # 注意：JWT 捕获仍保持「不限 host」以保证鲁棒性（兼容未列出的子域 / 未来新域名，
 # 例如实测出现的 trae-api-cn.mchost.gury），这里的清单只做可见性标记，不放宽也不收窄捕获。
 TARGET_DOMAINS = [
-    "trae.cn", "trae.com.cn", "zijieapi.com",
-    "bytedance.com", "volcengine.com", "volces.com", "treecode.com",
+    "trae.cn", "trae.com.cn", "mchost.guru",
+    "zijieapi.com", "bytedance.com", "volcengine.com", "volces.com", "treecode.com",
 ]
 # 支持从环境变量覆盖域名列表（桌面端设置页可配置）
 _env_domains = os.environ.get("PROXY_DOMAINS", "")
@@ -157,7 +157,10 @@ KNOWN_TRAE_PATHS = [
     ("/oauth/", "OAuth"),
     ("ExchangeToken", "换Token"),
     ("ide_user_ent_usage", "积分用量"),
+    ("/api/agent/v3/llm_utils_chat", "大模型对话"),
+    ("/api/ide/v1/get_detail_param", "模型列表"),
     ("/api/remote/v1/plugins", "插件接口"),
+    ("/api/remote/v1/skills", "技能列表"),
 ]
 
 
@@ -921,17 +924,15 @@ def tunnel_https(tls, host, port):
             break  # WS 连接已接管，退出 tunnel_https 循环
         forward_upstream(host, port, method, path, headers, body, tls)
 
-# ---------------- 透明隧道（非 TRAE 域，不解密直接放行） ----------------
+# ---------------- 透明隧道（非 TRAE 域，不解密直接放行，静默无日志） ----------------
 def tunnel_raw(client_sock, host, port):
     """对不在 TARGET_DOMAINS 的 CONNECT，建立到真实服务器的 TCP 隧道并双向转发，
-    不做 TLS 解密。用于把本代理作为系统代理时，让浏览器/其他 App 的流量正常通过。"""
-    log(f"  [tunnel] 连接 {host}:{port}...")
+    不做 TLS 解密、不记录任何日志。用于把本代理作为系统代理时，让浏览器/其他 App
+    的流量正常通过而不污染日志。"""
     try:
         remote = socket.create_connection((host, port), timeout=30)
-    except Exception as e:
-        log(f"  [tunnel] 连接 {host}:{port} 失败: {type(e).__name__}: {e}")
+    except Exception:
         return
-    log(f"  [tunnel] 已建立到 {host}:{port} 的 TCP 连接")
 
     _raw_stats = {"c2r": 0, "r2c": 0}
 
@@ -943,8 +944,8 @@ def tunnel_raw(client_sock, host, port):
                     break
                 stats[direction] += len(data)
                 dst.sendall(data)
-        except Exception as e:
-            log(f"  [tunnel] {host}:{port} {direction} 数据转发异常: {type(e).__name__}: {e}")
+        except Exception:
+            pass
         finally:
             try:
                 dst.shutdown(socket.SHUT_WR)
@@ -957,7 +958,6 @@ def tunnel_raw(client_sock, host, port):
     t2.start()
     t1.join()
     t2.join()
-    log(f"  [tunnel] {host}:{port} 隧道结束: client->remote={_raw_stats['c2r']} bytes, remote->client={_raw_stats['r2c']} bytes")
     try:
         client_sock.close()
     except Exception:
@@ -980,7 +980,10 @@ def handle_plain(conn, buf):
     u = urlparse(target)
     host = u.hostname
     port = u.port or (443 if u.scheme == "https" else 80)
-    log(f"  [plain] {method} {u.scheme}://{host}:{port}{u.path or '/'}")
+    # 非目标域名：静默转发，不记录日志
+    _is_target = host_in_targets(host)
+    if _is_target:
+        log(f"  [plain] {method} {u.scheme}://{host}:{port}{u.path or '/'}")
     headers = {}
     for line in lines[1:]:
         if b":" in line:
@@ -1001,14 +1004,17 @@ def handle_plain(conn, buf):
         c.request(method, u.path or "/", body=body if method.upper() != "GET" else None, headers=fwd)
         resp = c.getresponse()
         resp_body = resp.read()
-        log(f"  [plain] <- {resp.status} {resp.reason} ({len(resp_body)} bytes) from {host}{u.path}")
+        if _is_target:
+            log(f"  [plain] <- {resp.status} {resp.reason} ({len(resp_body)} bytes) from {host}{u.path}")
         send_response(conn, resp.status, resp.reason, dict(resp.getheaders()), resp_body)
-        # 记录到代理请求日志
-        pl = get_proxy_logger()
-        if pl:
-            pl.log_request(method, host, u.path or "/", headers, body, resp.status, resp.reason, resp.getheaders(), resp_body)
+        # 仅目标域名记录到代理请求日志
+        if _is_target:
+            pl = get_proxy_logger()
+            if pl:
+                pl.log_request(method, host, u.path or "/", headers, body, resp.status, resp.reason, resp.getheaders(), resp_body)
     except Exception as e:
-        log(f"  [plain] 错误: {type(e).__name__}: {e} (host={host}, path={u.path})")
+        if _is_target:
+            log(f"  [plain] 错误: {type(e).__name__}: {e} (host={host}, path={u.path})")
         send_response(conn, 502, "Bad Gateway", {}, b"Bad Gateway")
     finally:
         c.close()
@@ -1031,20 +1037,21 @@ def handle_client(conn, addr):
             host = target.rsplit(":", 1)[0]
             port = int(target.rsplit(":", 1)[1]) if ":" in target else 443
             is_target = host_in_targets(host)
-            matched = next((d for d in TARGET_DOMAINS if host == d or host.endswith("." + d)), None)
-            log(f"CONNECT {host}:{port}  {'[TRAE/MITM] 匹配域名: ' + matched if is_target else '[tunnel] 非目标域名'}")
-            conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            if is_target:
-                # TRAE 域名：MITM 解密以捕获 JWT
-                cpath, kpath = leaf_cert(host)
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                ctx.load_cert_chain(certfile=cpath, keyfile=kpath)
-                tls = ctx.wrap_socket(conn, server_side=True)
-                tunnel_https(tls, host, port)
-            else:
-                # 其他域名：透明隧道，不解密直接放行。
+            if not is_target:
+                # 非目标域名：透明隧道转发（不解密、不记录日志），保证其他 App 正常上网
                 tunnel_raw(conn, host, port)
+                return
+            matched = next((d for d in TARGET_DOMAINS if host == d or host.endswith("." + d)), None)
+            log(f"CONNECT {host}:{port}  [TRAE/MITM] 匹配域名: {matched}")
+            conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            # TRAE 域名：MITM 解密以捕获 JWT
+            cpath, kpath = leaf_cert(host)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=cpath, keyfile=kpath)
+            tls = ctx.wrap_socket(conn, server_side=True)
+            tunnel_https(tls, host, port)
         else:
+            # 明文 HTTP 请求：全部转发（非目标域名的日志由 handle_plain 内部控制）
             handle_plain(conn, buf)
     except Exception as e:
         log(f"client err: {type(e).__name__}: {e}")
@@ -1109,6 +1116,7 @@ def main():
     log(f"代理已启动: {LISTEN_HOST}:{LISTEN_PORT}  (TRAE 多域 MITM 拦截 + JWT 自动捕获)")
     log("监听 TRAE 域名: " + ", ".join("*." + d for d in TARGET_DOMAINS))
     log("  → 命中上述域名的请求会在面板中以 [TRAE] 标记；JWT 捕获不限 host（兼容未列出的子域）")
+    log("  → 未在监听域名列表中的请求将透明转发（不记录日志），不影响其他 App 正常上网")
     log(f"映射文件: {MAP_FILE}   日志: {LOG_FILE}   accounts: {ACCOUNTS_FILE}")
     log(f"代理请求日志: {PROXY_LOG_DIR} (100MB 滚动)")
     log(f"自动捕获 JWT 写回 accounts.json: {'开' if AUTO_CAPTURE_JWT else '关 (AUTO_CAPTURE_JWT=0)'}")

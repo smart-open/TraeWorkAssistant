@@ -87,6 +87,8 @@ interface AppState {
     skip_checked_in: boolean;
     skip_expired: boolean;
   }) => Promise<void>;
+  refreshRemainingCredits: () => Promise<void>;
+  cooldownClear: (userId: string) => Promise<void>;
   saveSettings: (patch: Partial<Settings>) => Promise<void>;
 
   pushToast: (kind: ToastKind, msg: string) => void;
@@ -112,7 +114,7 @@ function defaultSettings(): Settings {
     trae_path: null,
     data_dir: null,
     log_retention_days: 30,
-    proxy_domains: 'trae.cn,trae.com.cn,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com',
+    proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com',
     proxy_log_path: null,
   };
 }
@@ -205,6 +207,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           elapsed: e.elapsed,
           code: e.code,
           message: e.message,
+          error_type: e.error_type,
+          cooldown_until: e.cooldown_until,
         };
         return { checkin: { ...s.checkin, index: e.index, results } };
       }
@@ -218,6 +222,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
     if (e.type === 'done') {
       void get().refreshAccounts();
+      // 签到完成后静默刷新剩余积分（内部会再次 refreshAccounts）
+      void api.accounts.refreshRemainingCredits().then(() => get().refreshAccounts()).catch(() => {});
       get().pushToast(
         e.failed > 0 ? 'warn' : 'success',
         `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
@@ -452,6 +458,26 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       set((s) => ({ checkin: { ...s.checkin, active: false } }));
       get().pushToast('error', `发起签到失败：${String(err)}`);
+    }
+  },
+  refreshRemainingCredits: async () => {
+    try {
+      const ok = await api.accounts.refreshRemainingCredits();
+      await get().refreshAccounts();
+      if (ok > 0) {
+        get().pushToast('success', `已刷新 ${ok} 个账号的剩余积分`);
+      }
+    } catch (err) {
+      get().pushToast('error', `刷新剩余积分失败：${String(err)}`);
+    }
+  },
+  cooldownClear: async (userId) => {
+    try {
+      await api.accounts.cooldownClear(userId);
+      await get().refreshAccounts();
+      get().pushToast('success', '已解除冷却');
+    } catch (err) {
+      get().pushToast('error', `解除冷却失败：${String(err)}`);
     }
   },
   saveSettings: async (patch) => {
