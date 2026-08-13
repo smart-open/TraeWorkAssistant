@@ -223,15 +223,15 @@ export default function ApiService() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+      <div className="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
         {/* 配置卡片 */}
-        <div className="card p-5">
+        <div className="card flex flex-col p-5">
           <div className="mb-4 flex items-center gap-2">
             <Globe size={18} className="text-brand-500" />
             <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h2>
           </div>
 
-          <div className="space-y-4">
+          <div className="flex-1 space-y-4">
             <div>
               <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
                 监听端口
@@ -303,7 +303,7 @@ export default function ApiService() {
         </div>
 
         {/* 账号池卡片 */}
-        <div className="card p-5">
+        <div className="card flex flex-col p-5">
           <div className="mb-4 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Activity size={18} className="text-brand-500" />
@@ -321,7 +321,7 @@ export default function ApiService() {
           </div>
 
           {accounts.length === 0 ? (
-            <p className="py-8 text-center text-sm text-slate-400">暂无账号，请先在账号管理中添加</p>
+            <p className="flex-1 py-8 text-center text-sm text-slate-400">暂无账号，请先在账号管理中添加</p>
           ) : (
             <>
               <div className="mb-3 flex items-center gap-2">
@@ -345,7 +345,7 @@ export default function ApiService() {
                 </span>
               </div>
 
-              <div className="max-h-64 space-y-1 overflow-auto">
+              <div className="flex-1 space-y-1">
                 {accounts.map((a) => {
                   const checked = enabledUids.has(a.user_id);
                   const poolItem = poolStatus.find((p) => p.uid === a.user_id);

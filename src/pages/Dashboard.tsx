@@ -1,4 +1,4 @@
-﻿import { useMemo } from 'react';
+import { useMemo } from 'react';
 import {
   BarChart,
   Bar,
@@ -8,16 +8,16 @@ import {
   Tooltip,
   CartesianGrid,
   Cell,
+  LabelList,
 } from 'recharts';
 import {
   ShieldAlert,
   ExternalLink,
-  Gift,
   RefreshCw,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import SetupGuide from '../components/SetupGuide';
-import { StatCard, EmptyState } from '../components/ui';
+import { StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 
@@ -41,9 +41,9 @@ export default function Dashboard() {
   const top = useMemo(
     () =>
       [...accounts]
-        .filter((a) => a.remaining_credits != null)
+        .filter((a) => a.remaining_credits != null && a.remaining_credits > 0)
         .sort((a, b) => (b.remaining_credits ?? 0) - (a.remaining_credits ?? 0))
-        .slice(0, 8)
+        .slice(0, 10)
         .map((a) => ({ name: a.name, credits: a.remaining_credits as number })),
     [accounts],
   );
@@ -59,6 +59,8 @@ export default function Dashboard() {
       s.refreshGroups(),
       s.refreshCreditsHistory(),
     ]);
+    // 刷新剩余可用积分（会再次 refreshAccounts 更新 UI）
+    void api.accounts.refreshRemainingCredits().then(() => s.refreshAccounts()).catch(() => {});
     toast('success', '已刷新');
   };
 
@@ -142,35 +144,62 @@ export default function Dashboard() {
         <SetupGuide />
       </div>
 
-      <div className="mt-5 grid gap-3 md:grid-cols-3">
-        <div className="card p-4 md:col-span-3">
-          <div className="mb-3">
-            <h3 className="font-medium">积分榜 Top 榜</h3>
-          </div>
-          {top.length === 0 ? (
-            <EmptyState icon={<Gift size={28} />} title="暂无积分数据" hint="运行签到后这里会显示可用积分排行。" />
-          ) : (
-            <div className="h-72">
-              <ResponsiveContainer>
-                <BarChart data={top} margin={{ top: 8, right: 16, left: 0, bottom: 4 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" opacity={0.4} />
-                  <XAxis dataKey="name" tick={{ fontSize: 11 }} interval={0} angle={-18} textAnchor="end" height={48} />
-                  <YAxis tick={{ fontSize: 11 }} />
-                  <Tooltip
-                    contentStyle={{ fontSize: 12, borderRadius: 8 }}
-                    formatter={(v: number) => v.toLocaleString()}
-                  />
-                  <Bar dataKey="credits" radius={[6, 6, 0, 0]}>
-                    {top.map((_, i) => (
-                      <Cell key={i} fill={i === 0 ? '#27272a' : '#52525b'} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
+      {top.length > 0 && (
+        <div className="mt-5 card p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <h3 className="font-medium">积分榜 Top 榜</h3>
+              <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                Top {top.length}
+              </span>
             </div>
-          )}
+            <span className="text-xs text-slate-400">按可用剩余积分排序</span>
+          </div>
+          <div className="h-72">
+            <ResponsiveContainer>
+              <BarChart data={top} margin={{ top: 24, right: 16, left: 0, bottom: 4 }} barCategoryGap="36%">
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" opacity={0.25} vertical={false} />
+                <XAxis
+                  dataKey="name"
+                  tick={{ fontSize: 11, fill: '#94a3b8' }}
+                  interval={0}
+                  angle={-20}
+                  textAnchor="end"
+                  height={52}
+                  axisLine={{ stroke: '#e2e8f0' }}
+                  tickLine={false}
+                />
+                <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={48} />
+                <Tooltip
+                  cursor={{ fill: 'rgba(0,0,0,0.03)' }}
+                  contentStyle={{
+                    fontSize: 12,
+                    borderRadius: 10,
+                    border: '1px solid #e2e8f0',
+                    boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+                    padding: '8px 12px',
+                  }}
+                  formatter={(v: number) => [v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }), '可用积分']}
+                />
+                <Bar dataKey="credits" radius={[8, 8, 0, 0]} maxBarSize={44}>
+                  {top.map((_, i) => {
+                    // Top 1-3 使用强调色，其余渐淡
+                    const colors = ['#27272a', '#3f3f46', '#52525b'];
+                    const fill = i < 3 ? colors[i] : `rgba(82,82,91,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`;
+                    return <Cell key={i} fill={fill} />;
+                  })}
+                  <LabelList
+                    dataKey="credits"
+                    position="top"
+                    formatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0)}
+                    style={{ fontSize: 10, fill: '#94a3b8', fontWeight: 500 }}
+                  />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

@@ -319,6 +319,31 @@ export default function Settings() {
         </section>
 
         <section className="card p-4 md:col-span-1">
+          <h3 className="mb-2 font-medium">6 层设备标识重置</h3>
+          <p className="mb-3 text-xs text-slate-500">
+            重置 TRAE 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。
+            用于账号隔离和防关联，建议先关闭 TRAE 再执行。
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleResetDeviceIds}
+              disabled={deviceResetActive}
+              className="btn-primary"
+            >
+              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
+            </button>
+            {deviceResetActive && (
+              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
+            )}
+          </div>
+          {deviceResetProgress.length > 0 && (
+            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
+              {deviceResetProgress.join('\n')}
+            </pre>
+          )}
+        </section>
+
+        <section className="card p-4 md:col-span-2">
           <h3 className="mb-2 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-500">
             通过 Windows 计划任务在指定时间自动运行 Python 签到脚本（无需启动应用界面）。
@@ -352,34 +377,9 @@ export default function Settings() {
         </section>
 
         <section className="card p-4 md:col-span-2">
-          <h3 className="mb-2 font-medium">6 层设备标识重置</h3>
-          <p className="mb-3 text-xs text-slate-500">
-            重置 TRAE 的全部设备标识层：① machineid 文件 ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。
-            用于账号隔离和防关联。注册表重置需要管理员权限，建议先关闭 TRAE 再执行。
-          </p>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleResetDeviceIds}
-              disabled={deviceResetActive}
-              className="btn-primary"
-            >
-              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
-            </button>
-            {deviceResetActive && (
-              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
-            )}
-          </div>
-          {deviceResetProgress.length > 0 && (
-            <pre className="mt-3 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
-              {deviceResetProgress.join('\n')}
-            </pre>
-          )}
-        </section>
-
-        <section className="card p-4 md:col-span-2">
           <h3 className="mb-2 font-medium">关于</h3>
           <div className="space-y-1 text-xs text-slate-500">
-            <div>应用版本：v1.0.0</div>
+            <div>应用版本：v2.1.1</div>
             <div>数据目录：<span className="font-mono">%APPDATA%\TraeWorkAssistant\</span></div>
             <div>代理 Python：内置 device_proxy.py / auto_checkin.py</div>
             <div className="flex items-center gap-2 pt-1">
