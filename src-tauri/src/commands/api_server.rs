@@ -37,7 +37,14 @@ pub async fn api_server_start(
     let settings = state.settings();
     let port = settings.api_port;
     let api_key = settings.api_key.clone();
-    let default_model = settings.api_default_model.clone();
+    let default_model = {
+        let m = settings.api_default_model.trim();
+        if m.is_empty() {
+            crate::api_server::DEFAULT_MODEL.to_string()
+        } else {
+            m.to_string()
+        }
+    };
 
     // 读取账号数据、冷却状态、剩余积分
     let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
@@ -66,7 +73,6 @@ pub async fn api_server_start(
         total_requests: std::sync::atomic::AtomicU64::new(0),
         active_uid: Mutex::new(None),
         last_error: Mutex::new(None),
-        data_dir: state.data_dir.clone(),
     });
 
     let handle = start_api_server(port, shared.clone()).await?;

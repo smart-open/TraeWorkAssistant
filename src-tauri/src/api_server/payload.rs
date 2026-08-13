@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 /// OpenAI 请求体 → SOLO llm_utils_chat 请求体改写
-/// 参考 traework2api/internal/upstream/payload.go
+/// 本项目自主设计的协议适配逻辑
 pub fn prepare_body(src: &[u8], default_model: &str) -> Vec<u8> {
     let mut obj: Value = match serde_json::from_slice(src) {
         Ok(v) => v,

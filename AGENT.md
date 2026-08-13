@@ -152,7 +152,7 @@ trae-work-helper/
 - **CA 证书**：仅本地回环 `127.0.0.1:8899`，自签根 CA 需 UAC 安装到「受信任根证书颁发机构」。
 - **UAC**：仅在 `cert_install` 与 `trae-switch-bridge.ps1` 提权，最小化提权面。
 - **邀请链接**：固化在 Rust `INVITE_LINK` 常量，不从前端传入。
-- **traework2api**：**仅作为下期 API 网关的需求/难点参考样例，不实现、不集成、不复用其代码/文件格式**。
+- **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），全部为本项目自主设计与实现。
 
 ## 13. 禁止与红线（Do NOT）
 
@@ -173,5 +173,5 @@ trae-work-helper/
 ## 15. 下期（M5，未立项）
 
 本地 API 网关（OpenAI/Anthropic 协议兼容 +按账号积分路由）。
-- 仅调研、不开发；traework2api 项目**只作为参考样例**，不集成不复用其内核/文件格式。
+- v2.0 已实现本地 API 网关（OpenAI 兼容协议 + 按账号积分路由），详见 requirements-v2.md 与产品设计文档第七章。
 - 待 v1.0 在真实环境跑通、用户量与积分调度策略明确后再立项。

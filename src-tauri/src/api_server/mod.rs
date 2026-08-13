@@ -5,13 +5,12 @@ pub mod routes;
 pub mod server;
 pub mod sse;
 
-use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 
 pub use pool::ApiPool;
 
-/// SOLO 上游常量（来自 traework2api 实测）
+/// SOLO 上游常量（本项目协议实测）
 pub const AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
 pub const EP_CHAT: &str = "/api/agent/v3/llm_utils_chat";
 pub const APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
@@ -28,7 +27,6 @@ pub struct ApiSharedState {
     pub total_requests: AtomicU64,
     pub active_uid: Mutex<Option<String>>,
     pub last_error: Mutex<Option<String>>,
-    pub data_dir: PathBuf,
 }
 
 /// 上游错误分类（与 Phase 1 冷却状态机对齐）

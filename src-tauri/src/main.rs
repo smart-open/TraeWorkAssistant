@@ -86,13 +86,13 @@ fn main() {
             fs_utils::app_log(
                 &state.data_dir,
                 &format!(
-                    "应用启动: tray={}, launch_minimized={}, auto_start_proxy={}",
-                    settings.tray, settings.launch_minimized, settings.auto_start_proxy
+                    "应用启动: tray=enabled, launch_minimized={}, auto_start_proxy={}",
+                    settings.launch_minimized, settings.auto_start_proxy
                 ),
             );
 
-            // 创建系统托盘（仅在设置启用时；失败不阻断启动）
-            if settings.tray {
+            // 创建系统托盘（始终启用，支持最小化到托盘；失败不阻断启动）
+            {
                 let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                     let toggle_item =
                         MenuItem::with_id(app, "toggle", "显示/隐藏", true, None::<&str>)?;
@@ -168,31 +168,23 @@ fn main() {
                 }
             }
 
-            // 启动时最小化（托盘模式下隐藏窗口，否则仅最小化到任务栏）
+            // 启动时最小化到托盘
             if settings.launch_minimized {
                 if let Some(window) = app.get_webview_window("main") {
-                    if settings.tray {
-                        let _ = window.hide();
-                        fs_utils::app_log(&state.data_dir, "启动最小化：窗口已隐藏到托盘");
-                    } else {
-                        let _ = window.minimize();
-                        fs_utils::app_log(&state.data_dir, "启动最小化：窗口已最小化到任务栏");
-                    }
+                    let _ = window.hide();
+                    fs_utils::app_log(&state.data_dir, "启动最小化：窗口已隐藏到托盘");
                 }
             }
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 托盘启用时，关闭按钮隐藏窗口而非退出
+            // 关闭即退出应用（前端已弹确认框；退出时 RunEvent::Exit 自动清理代理与 API 服务）
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let state = window.app_handle().state::<AppState>();
-                let settings = state.settings();
-                if settings.tray {
-                    api.prevent_close();
-                    let _ = window.hide();
-                    fs_utils::app_log(&state.data_dir, "窗口关闭请求被拦截：已隐藏到托盘");
-                }
+                api.prevent_close();
+                let st = window.app_handle().state::<AppState>();
+                fs_utils::app_log(&st.data_dir, "用户确认退出应用");
+                window.app_handle().exit(0);
             }
         })
         .build(tauri::generate_context!())

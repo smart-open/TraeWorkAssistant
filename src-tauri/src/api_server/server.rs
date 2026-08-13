@@ -27,10 +27,6 @@ impl ApiServerHandle {
             h.abort();
         }
     }
-
-    pub fn is_running(&self) -> bool {
-        self.join_handle.is_some()
-    }
 }
 
 impl Drop for ApiServerHandle {

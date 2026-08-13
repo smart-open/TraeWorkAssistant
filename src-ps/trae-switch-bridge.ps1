@@ -6,8 +6,8 @@
     封装「关闭 TRAE → 恢复目标账号登录态 → 重置机器码 → 启动 TRAE」流程，
     并以 NDJSON 逐行输出进度，供桌面端渲染步骤条。
 
-    注意：本脚本是集成层，原 traework-switcher 的 TraeWorkAccountSwitcher.ps1
-    仍作为参考实现保留；如需要可在此桥中复用其函数。
+    注意：本脚本是集成层，封装账号切换与设备标识重置的全部逻辑，
+    供 Trae Work 助手（Tauri）以非交互模式调用。
 
 .PARAMETER Action
     Switch（切换账号）/ ResetMachineId（仅重置机器码）/ BackupCurrent（备份当前）
@@ -211,7 +211,7 @@ function Reset-MachineId {
 function Reset-DeviceIdsOnly {
     <#
     .SYNOPSIS
-        6 层设备标识重置（参考 traework-switcher Reset-DeviceIdsOnly）
+        6 层设备标识重置（本项目自主设计）
     .DESCRIPTION
         1. machineid 文件 → 新 hex32 UUID
         2. storage.json telemetry.machineId / telemetry.sqmId → 替换

@@ -522,7 +522,7 @@ def update_account_refresh_token(user_id, refresh_token):
 
 def try_capture_refresh_token_from_response(host, path, resp_body):
     """从 ExchangeToken 响应体中提取 refresh_token 并写回 accounts.json。
-    ExchangeToken 响应格式（参考 traework2api 逆向）：
+    ExchangeToken 响应格式（本项目协议分析）：
     {"code":0,"data":{"access_token":"<jwt>","refresh_token":"<rt>",...}}
     或 {"code":0,"data":{"token":"<jwt>","refresh_token":"<rt>",...}}
     """

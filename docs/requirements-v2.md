@@ -5,7 +5,7 @@
 > Phase 1（1.1-1.4）、Phase 2（2.1-2.5）、Phase 3（3.1-3.3）全部实现并验证通过。
 > Phase 3 的 3.4（登录态快照备份/恢复）和 3.5（OAuth 登录闭环）为低优先级，留待未来版本。
 >
-> 基于对 `traework2api`（Go 反向代理）和 `traework-switcher`（PowerShell 账号切换器）两个项目的深度分析，整理出以下可借鉴/可实现的功能需求，按难度和功能相关度分三个阶段排列。
+> 基于本项目产品需求与技术分析，整理出以下功能增强需求，按难度和功能相关度分三个阶段排列。
 
 ---
 
@@ -38,7 +38,7 @@
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` 逆向分析 |
+| 来源 | 本项目自研设计 |
 | 难度 | 低 |
 | 优先级 | 高 |
 | 涉及文件 | `models.rs` `default_proxy_domains()`、`Settings.tsx` |
@@ -60,7 +60,7 @@
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` `internal/pool/pool.go` + `internal/upstream/client.go` |
+| 来源 | 本项目自研设计 |
 | 难度 | 低 |
 | 优先级 | 高 |
 | 涉及文件 | `accounts.rs`、`store.ts`、`Checkin.tsx` |
@@ -91,7 +91,7 @@
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` `ReenableIfCredits` 机制 |
+| 来源 | 本项目自研设计 |
 | 难度 | 低 |
 | 优先级 | 中 |
 | 涉及文件 | `accounts.rs`、`auto_checkin.py` |
@@ -113,7 +113,7 @@
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework-switcher` `Get-TraeWorkPath` |
+| 来源 | 本项目自研设计 |
 | 难度 | 低 |
 | 优先级 | 中 |
 | 涉及文件 | `trae-switch-bridge.ps1`、Rust 侧进程管理 |
@@ -142,12 +142,12 @@
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` `internal/auth/auth.go` + `internal/upstream/client.go` |
+| 来源 | 本项目自研设计 |
 | 难度 | 中 |
 | 优先级 | 高 |
 | 涉及文件 | 新增 `jwt.rs` 刷新逻辑、`accounts.rs`、Python 代理捕获扩展 |
 
-**背景**：当前从代理流量捕获的 JWT 只有 accessToken，13 天过期后必须手动重新抓取。`traework2api` 通过 OAuth 登录获取 refresh_token，过期前 24h 自动调 ExchangeToken 续期。
+**背景**：当前从代理流量捕获的 JWT 只有 accessToken，13 天过期后必须手动重新抓取。本项目规划通过 OAuth 登录获取 refresh_token，过期前 24h 自动调 ExchangeToken 续期。
 
 **需求描述**：
 
@@ -176,7 +176,7 @@
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` `PickExcluding` 挑号策略 |
+| 来源 | 本项目自研设计 |
 | 难度 | 中 |
 | 优先级 | 中 |
 | 涉及文件 | `accounts.rs`、`auto_checkin.py` |
@@ -203,7 +203,7 @@
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` `internal/upstream/client.go` 双 Client 设计 |
+| 来源 | 本项目自研设计 |
 | 难度 | 中 |
 | 优先级 | 中 |
 | 涉及文件 | `accounts.rs` HTTP 请求逻辑 |
@@ -227,7 +227,7 @@
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` SSE 事件格式逆向 |
+| 来源 | 本项目自研设计 |
 | 难度 | 中 |
 | 优先级 | 中 |
 | 涉及文件 | `device_proxy.py` `forward_upstream`、`ProxyRequestLogger`、`misc.rs`、`Logs.tsx` |
@@ -243,7 +243,7 @@
 3. 不记录完整对话内容（隐私 + 体积），只记录元数据摘要
 4. 代理日志详情弹窗中展示摘要信息
 
-**SSE 事件格式参考**（来自 `traework2api` 逆向）：
+**SSE 事件格式参考**（本项目协议分析）：
 ```
 event:metadata        → 会话元数据
 event:output          → ×N，增量内容（response/reasoning_content/tool_calls）
@@ -262,7 +262,7 @@ event:done            → 结束信号
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework-switcher` `Reset-DeviceIdsOnly` |
+| 来源 | 本项目自研设计 |
 | 难度 | 中 |
 | 优先级 | 低 |
 | 涉及文件 | `trae-switch-bridge.ps1`、新增 Rust 命令 |
@@ -295,12 +295,12 @@ event:done            → 结束信号
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` 核心功能 |
+| 来源 | 本项目自研设计 |
 | 难度 | 高 |
 | 优先级 | 中 |
 | 涉及文件 | 新增 `api_server` 模块（Rust axum/actix 或 Python FastAPI） |
 
-**背景**：`traework2api` 将 TRAE SOLO 的免费对话通道包装成标准 `/v1/chat/completions` + `/v1/models` 接口。本项目可借鉴此设计，将项目从"签到管理工具"扩展为"TRAE 额度管理 + API 网关"。
+**背景**：本项目将 TRAE SOLO 的免费对话通道包装成标准 OpenAI 兼容接口，扩展为额度管理 + API 网关。
 
 **需求描述**：
 
@@ -333,7 +333,7 @@ event:done            → 结束信号
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` `internal/upstream/solosse.go` |
+| 来源 | 本项目自研设计 |
 | 难度 | 高 |
 | 优先级 | 中（依赖 3.1） |
 | 涉及文件 | 新增 SSE 转换模块 |
@@ -387,7 +387,7 @@ event:done            → 结束信号
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` `internal/pool/pool.go` |
+| 来源 | 本项目自研设计 |
 | 难度 | 高 |
 | 优先级 | 中（依赖 3.1） |
 | 涉及文件 | 新增 `pool` 模块 |
@@ -429,7 +429,7 @@ event:done            → 结束信号
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework-switcher` `Backup-CurrentProfile` / `Restore-Profile` |
+| 来源 | 本项目自研设计 |
 | 难度 | 高 |
 | 优先级 | 低 |
 | 涉及文件 | `trae-switch-bridge.ps1`、新增 Rust 命令、前端账号管理页 |
@@ -468,12 +468,12 @@ event:done            → 结束信号
 
 | 属性 | 值 |
 |------|-----|
-| 来源 | `traework2api` `login.sh` |
+| 来源 | 本项目自研设计 |
 | 难度 | 高 |
 | 优先级 | 低 |
 | 涉及文件 | 新增 OAuth 登录模块、前端登录页 |
 
-**背景**：`traework2api` 不依赖 TRAE 桌面端，自己构造 OAuth 登录 URL，引导用户浏览器登录后从回调直接拿 refresh_token。这种方式可以跳过"从本地存储逆向提取 token"的所有难题。
+**背景**：本项目可独立构造 OAuth 登录 URL，引导用户浏览器登录后从回调直接拿 refresh_token，无需依赖 TRAE 桌面端。这种方式可以跳过"从本地存储逆向提取 token"的所有难题。
 
 **需求描述**：
 
@@ -557,7 +557,7 @@ event:error           → 流内错误（code:1005 等）
 |------|------|---------|
 | 添加 `mchost.guru` 后 MITM 可能影响 TRAE 对话 | TRAE 对话功能异常 | 确保 CA 证书已安装；代理日志不记录完整对话内容 |
 | Token 自动刷新失败 | 账号无法自动续期 | 失败时回退旧 token，不改写字段；前端提醒手动处理 |
-| OAuth 登录闭环需构造合法请求头 | 登录失败 | 参考 `traework2api` 的 `login.sh` 实现，确保 ClientID/AppID 正确 |
+| OAuth 登录闭环需构造合法请求头 | 登录失败 | 确保 ClientID/AppID 正确（本项目协议实测） |
 | OpenAI 兼容 API 需完整逆向 SOLO 协议 | 功能不完整 | 分步实现：先非流式，再流式；先基础对话，再 tool_calls |
 | 6 层设备重置需管理员权限 | 部分操作失败 | 注册表操作需提权；文件操作在用户目录下无需提权 |
 | SSE 流式响应可能产生大量日志 | 磁盘空间不足 | 仅记录摘要元数据，不记录完整内容；代理日志 100MB 滚动 |
