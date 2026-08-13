@@ -86,6 +86,10 @@ pub struct Settings {
     pub data_dir: Option<String>,
     #[serde(default = "default_retention")]
     pub log_retention_days: i32,
+    #[serde(default = "default_proxy_domains")]
+    pub proxy_domains: String,
+    #[serde(default)]
+    pub proxy_log_path: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -108,6 +112,9 @@ fn default_notify() -> String {
 }
 fn default_retention() -> i32 {
     30
+}
+fn default_proxy_domains() -> String {
+    "trae.cn,trae.com.cn,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com".into()
 }
 
 #[derive(Serialize, Deserialize, Default)]

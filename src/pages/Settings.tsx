@@ -282,6 +282,31 @@ export default function Settings() {
                 max={365}
               />
             </div>
+            <div>
+              <label className="label">代理监听域名列表</label>
+              <textarea
+                value={form.proxy_domains}
+                onChange={(e) => update('proxy_domains', e.target.value)}
+                className="input min-h-[60px] text-xs"
+                placeholder="逗号分隔，如：trae.cn,trae.com.cn,zijieapi.com"
+              />
+              <p className="mt-1 text-xs text-slate-400">
+                逗号分隔的域名后缀列表，匹配的域名将走 MITM 解密。留空则使用默认值。修改后需重启代理生效。
+              </p>
+            </div>
+            <div>
+              <label className="label">代理抓取日志路径</label>
+              <input
+                type="text"
+                value={form.proxy_log_path ?? ''}
+                onChange={(e) => update('proxy_log_path', e.target.value.trim() || null)}
+                placeholder="留空则默认 %APPDATA%\TraeWorkAssistant\proxy-logs"
+                className="input"
+              />
+              <p className="mt-1 text-xs text-slate-400">
+                代理拦截到的完整请求/响应将记录到此目录，按 100MB 滚动存储。修改后需重启代理生效。
+              </p>
+            </div>
           </div>
         </section>
 

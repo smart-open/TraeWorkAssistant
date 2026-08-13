@@ -47,6 +47,87 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("TRAEDATA_DIR", BASE)
 MAP_FILE = os.path.join(DATA_DIR, "device_map.json")
 LOG_FILE = os.path.join(DATA_DIR, "logs", "proxy.log")
+
+PROXY_LOG_DIR = os.environ.get("PROXY_LOG_PATH", "")
+if not PROXY_LOG_DIR:
+    PROXY_LOG_DIR = os.path.join(DATA_DIR, "proxy-logs")
+
+class ProxyRequestLogger:
+    """将代理抓取到的完整请求/响应记录到明文文件，按 100MB 滚动存储。"""
+    def __init__(self, log_dir, max_size_mb=100):
+        self.log_dir = log_dir
+        self.max_size = max_size_mb * 1024 * 1024
+        self._lock = threading.Lock()
+        self._fd = None
+        self._file_size = 0
+        os.makedirs(log_dir, exist_ok=True)
+
+    def _ensure_file(self):
+        if self._fd and self._file_size < self.max_size:
+            return
+        if self._fd:
+            self._fd.close()
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(self.log_dir, f"proxy-requests-{ts}.log")
+        self._fd = open(path, "a", encoding="utf-8")
+        self._file_size = os.path.getsize(path) if os.path.exists(path) else 0
+
+    def log_request(self, method, host, path, req_headers, req_body, resp_status, resp_reason, resp_headers, resp_body):
+        with self._lock:
+            self._ensure_file()
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines = [
+                f"\n{'='*80}",
+                f"[{ts}] {method} {host}{path}",
+                f"--- Request Headers ---",
+            ]
+            for k, v in req_headers.items():
+                lines.append(f"  {k}: {v}")
+            if req_body:
+                body_preview = req_body[:4096].decode("utf-8", "replace") if isinstance(req_body, bytes) else str(req_body)[:4096]
+                lines.append(f"--- Request Body ({len(req_body)} bytes) ---")
+                lines.append(body_preview)
+            lines.append(f"--- Response: {resp_status} {resp_reason} ---")
+            if resp_headers:
+                for k, v in resp_headers:
+                    lines.append(f"  {k}: {v}")
+            if resp_body:
+                body_preview = resp_body[:8192].decode("utf-8", "replace") if isinstance(resp_body, bytes) else str(resp_body)[:8192]
+                lines.append(f"--- Response Body ({len(resp_body)} bytes) ---")
+                lines.append(body_preview)
+            data = "\n".join(lines) + "\n"
+            self._fd.write(data)
+            self._fd.flush()
+            self._file_size += len(data.encode("utf-8"))
+
+    def log_websocket(self, host, path, req_headers):
+        with self._lock:
+            self._ensure_file()
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines = [
+                f"\n{'='*80}",
+                f"[{ts}] [WebSocket Upgrade] {host}{path}",
+                f"--- Request Headers ---",
+            ]
+            for k, v in req_headers.items():
+                lines.append(f"  {k}: {v}")
+            lines.append("--- WebSocket tunnel established (bidirectional, content not logged) ---")
+            data = "\n".join(lines) + "\n"
+            self._fd.write(data)
+            self._fd.flush()
+            self._file_size += len(data.encode("utf-8"))
+
+_proxy_logger = None
+def get_proxy_logger():
+    global _proxy_logger
+    if _proxy_logger is None:
+        try:
+            _proxy_logger = ProxyRequestLogger(PROXY_LOG_DIR)
+            log(f"代理请求日志目录: {PROXY_LOG_DIR}")
+        except Exception as e:
+            log(f"代理请求日志初始化失败: {e}")
+    return _proxy_logger
+
 CA_DIR = os.path.join(DATA_DIR, "certs")
 SIGNIN_PATH = "/trae/api/v2/ug/checkin_credits/claim"
 STATUS_PATH = "/trae/api/v2/ug/checkin_credits/status"
@@ -64,6 +145,10 @@ TARGET_DOMAINS = [
     "trae.cn", "trae.com.cn", "zijieapi.com",
     "bytedance.com", "volcengine.com", "volces.com", "treecode.com",
 ]
+# 支持从环境变量覆盖域名列表（桌面端设置页可配置）
+_env_domains = os.environ.get("PROXY_DOMAINS", "")
+if _env_domains:
+    TARGET_DOMAINS = [d.strip() for d in _env_domains.split(",") if d.strip()]
 # 已知 TRAE 接口（按 path 子串匹配），在日志中标出接口用途，便于一眼看清「监听接口」
 KNOWN_TRAE_PATHS = [
     ("/trae/api/v2/ug/checkin_credits/claim", "签到领取"),
@@ -631,6 +716,112 @@ def send_response(sock, status, reason, headers, body):
 
 HOP_BY_HOP = {"proxy-connection", "connection", "keep-alive", "proxy-authorization", "host", "content-length"}
 
+def is_websocket_upgrade(headers):
+    """检测 WebSocket 升级请求"""
+    return headers.get("upgrade", "").lower() == "websocket"
+
+def forward_websocket(host, port, method, path, headers, body, client_tls):
+    """处理 WebSocket 升级：转发升级请求 -> 获取 101 响应 -> 双向原始隧道。"""
+    ws_tag = f"[WebSocket] {host}:{port}{path}"
+    try:
+        # 1. 建立到上游的 TLS 连接
+        log(f"  {ws_tag} 正在连接上游 {host}:{port}...")
+        ctx = ssl.create_default_context()
+        raw_sock = socket.create_connection((host, port), timeout=30)
+        upstream_tls = ctx.wrap_socket(raw_sock, server_hostname=host)
+        log(f"  {ws_tag} 上游 TLS 连接已建立")
+
+        try:
+            # 2. 构建并发送升级请求
+            req_lines = [f"{method} {path} HTTP/1.1"]
+            for k, v in headers.items():
+                if k.lower() not in HOP_BY_HOP:
+                    req_lines.append(f"{k}: {v}")
+            req_data = "\r\n".join(req_lines).encode("latin1") + b"\r\n\r\n"
+            if body:
+                req_data += body
+            log(f"  {ws_tag} 发送升级请求: {method} {path} ({len(req_data)} bytes)")
+            log(f"  {ws_tag} 关键头: Upgrade={headers.get('upgrade','?')} Connection={headers.get('connection','?')} Sec-WebSocket-Key={headers.get('sec-websocket-key','?')[:16]}...")
+            upstream_tls.sendall(req_data)
+
+            # 3. 读取上游响应（应为 101 Switching Protocols）
+            log(f"  {ws_tag} 等待上游响应...")
+            resp_buf = b""
+            while b"\r\n\r\n" not in resp_buf:
+                chunk = upstream_tls.recv(4096)
+                if not chunk:
+                    log(f"  {ws_tag} 上游在响应前关闭了连接 (已收到 {len(resp_buf)} bytes)")
+                    break
+                resp_buf += chunk
+            if not resp_buf:
+                log(f"  {ws_tag} 上游响应为空，放弃")
+                return
+
+            # 4. 转发响应给客户端
+            first_line = resp_buf.split(b"\r\n", 1)[0].decode("latin1", "replace")
+            log(f"  {ws_tag} 收到上游响应: {first_line} ({len(resp_buf)} bytes)")
+            # 检查是否有额外的响应体数据（在 \r\n\r\n 之后的部分）
+            header_end = resp_buf.find(b"\r\n\r\n")
+            extra_body = resp_buf[header_end + 4:] if header_end >= 0 else b""
+            client_tls.sendall(resp_buf)
+            log(f"  {ws_tag} 响应已转发给客户端")
+
+            # 5. 检查是否升级成功
+            if " 101 " not in first_line:
+                log(f"  {ws_tag} 升级失败: {first_line}")
+                return
+
+            log(f"  {ws_tag} 升级成功 (101 Switching Protocols), 开始双向隧道")
+            # 记录到代理日志
+            pl = get_proxy_logger()
+            if pl:
+                pl.log_websocket(host, path, headers)
+
+            # 6. 双向隧道：client_tls <-> upstream_tls
+            # 如果响应中包含额外的 body 数据，需要先把它发给对端
+            if extra_body:
+                log(f"  {ws_tag} 响应中包含 {len(extra_body)} bytes 额外数据, 已包含在转发中")
+
+            tunnel_stats = {"client_to_up": 0, "up_to_client": 0, "closed_by": ""}
+
+            def _pipe(src, dst, direction, stats):
+                try:
+                    while True:
+                        data = src.recv(65536)
+                        if not data:
+                            log(f"  {ws_tag} {direction} 连接关闭 (已转发 {stats[direction]} bytes)")
+                            stats["closed_by"] = direction
+                            break
+                        stats[direction] += len(data)
+                        dst.sendall(data)
+                except Exception as e:
+                    log(f"  {ws_tag} {direction} 隧道异常: {type(e).__name__}: {e}")
+                    stats["closed_by"] = direction + "_error"
+                finally:
+                    try:
+                        dst.shutdown(socket.SHUT_WR)
+                    except Exception:
+                        pass
+
+            t1 = threading.Thread(target=_pipe, args=(client_tls, upstream_tls, "client_to_up", tunnel_stats), daemon=True)
+            t2 = threading.Thread(target=_pipe, args=(upstream_tls, client_tls, "up_to_client", tunnel_stats), daemon=True)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+            log(f"  {ws_tag} 双向隧道结束: client->up={tunnel_stats['client_to_up']} bytes, up->client={tunnel_stats['up_to_client']} bytes, 关闭方={tunnel_stats['closed_by']}")
+
+        except Exception as e:
+            log(f"  {ws_tag} 升级过程异常: {type(e).__name__}: {e}")
+        finally:
+            try:
+                upstream_tls.close()
+                log(f"  {ws_tag} 上游连接已关闭")
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"  {ws_tag} 连接上游失败: {type(e).__name__}: {e}")
+
 def forward_upstream(host, port, method, path, headers, body, client_sock):
     ctx = ssl.create_default_context()
     conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=30)
@@ -641,6 +832,10 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
         resp = conn.getresponse()
         resp_body = resp.read()
         send_response(client_sock, resp.status, resp.reason, dict(resp.getheaders()), resp_body)
+        # 记录到代理请求日志
+        pl = get_proxy_logger()
+        if pl:
+            pl.log_request(method, host, path, headers, body, resp.status, resp.reason, resp.getheaders(), resp_body)
     except Exception as e:
         log("  upstream error:", e)
         send_response(client_sock, 502, "Bad Gateway", {}, b"Bad Gateway")
@@ -715,6 +910,11 @@ def tunnel_https(tls, host, port):
                 log(f"  [签到改写] user={uid} -> x-device-id={dev['device_id']} x-market-user-id={dev['market_user_id'][:8]}... vscode-sessionid={dev['session_id'][:8]}...")
             else:
                 log("  [签到] 未解析到 user id，未改写")
+        # WebSocket 升级检测：如果是 WS 请求则走专用通道
+        if is_websocket_upgrade(headers):
+            log(f"  [WebSocket] 检测到升级请求: {method} {host}:{port}{path} (Connection={headers.get('connection','?')})")
+            forward_websocket(host, port, method, path, headers, body, tls)
+            break  # WS 连接已接管，退出 tunnel_https 循环
         forward_upstream(host, port, method, path, headers, body, tls)
 
 # ---------------- 透明隧道（非 TRAE 域，不解密直接放行） ----------------
@@ -789,7 +989,12 @@ def handle_plain(conn, buf):
     try:
         c.request(method, u.path or "/", body=body if method.upper() != "GET" else None, headers=fwd)
         resp = c.getresponse()
-        send_response(conn, resp.status, resp.reason, dict(resp.getheaders()), resp.read())
+        resp_body = resp.read()
+        send_response(conn, resp.status, resp.reason, dict(resp.getheaders()), resp_body)
+        # 记录到代理请求日志
+        pl = get_proxy_logger()
+        if pl:
+            pl.log_request(method, host, u.path or "/", headers, body, resp.status, resp.reason, resp.getheaders(), resp_body)
     except Exception as e:
         log("  plain upstream err:", e)
         send_response(conn, 502, "Bad Gateway", {}, b"Bad Gateway")
@@ -893,6 +1098,7 @@ def main():
     log("监听 TRAE 域名: " + ", ".join("*." + d for d in TARGET_DOMAINS))
     log("  → 命中上述域名的请求会在面板中以 [TRAE] 标记；JWT 捕获不限 host（兼容未列出的子域）")
     log(f"映射文件: {MAP_FILE}   日志: {LOG_FILE}   accounts: {ACCOUNTS_FILE}")
+    log(f"代理请求日志: {PROXY_LOG_DIR} (100MB 滚动)")
     log(f"自动捕获 JWT 写回 accounts.json: {'开' if AUTO_CAPTURE_JWT else '关 (AUTO_CAPTURE_JWT=0)'}")
     if AUTO_CAPTURE_JWT:
         log("  → TRAE 中点签到时，新 JWT 会自动覆盖到 checkin_accounts.json（按 user_id 匹配，带 exp 防降级）")

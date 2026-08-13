@@ -64,11 +64,19 @@ pub fn proxy_start(
     }
     let data_dir = state.data_dir.to_string_lossy().to_string();
     let port_s = port.to_string();
+    let settings = state.settings();
+    let proxy_domains = settings.proxy_domains.clone();
+    let proxy_log_path = settings.proxy_log_path.clone().unwrap_or_else(|| {
+        // 默认路径：%APPDATA%\TraeWorkAssistant\proxy-logs
+        state.data_dir.join("proxy-logs").to_string_lossy().to_string()
+    });
     let mut cmd = Command::new(&state.python_exe);
     cmd.arg(&script_path)
         .env("TRAEDATA_DIR", &data_dir)
         .env("PROXY_PORT", &port_s)
         .env("AUTO_CAPTURE_JWT", "1")
+        .env("PROXY_DOMAINS", &proxy_domains)
+        .env("PROXY_LOG_PATH", &proxy_log_path)
         .env("PYTHONIOENCODING", "utf-8")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -112,6 +112,8 @@ function defaultSettings(): Settings {
     trae_path: null,
     data_dir: null,
     log_retention_days: 30,
+    proxy_domains: 'trae.cn,trae.com.cn,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com',
+    proxy_log_path: null,
   };
 }
 

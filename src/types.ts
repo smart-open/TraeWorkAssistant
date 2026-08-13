@@ -73,6 +73,8 @@ export interface Settings {
   trae_path: string | null;
   data_dir: string | null;
   log_retention_days: number;
+  proxy_domains: string;
+  proxy_log_path: string | null;
 }
 
 export interface CheckinOpts {
