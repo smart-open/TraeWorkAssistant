@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from 'react';
+﻿import { useMemo, useState, useEffect } from 'react';
 import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle, Snowflake } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
@@ -169,9 +169,9 @@ export default function Checkin() {
               </button>
             )}
           </div>
-          <div className="rounded-lg border border-slate-200 dark:border-slate-700">
+          <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
             <table className="w-full text-sm">
-              <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-slate-900">
+              <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-zinc-900">
                 <tr>
                   {scope === 'selected' && <th className="w-8 px-3 py-1.5"></th>}
                   <th className="px-3 py-1.5 text-left">账号</th>
@@ -194,7 +194,7 @@ export default function Checkin() {
                     return (
                       <tr
                         key={a.user_id}
-                        className={`border-t border-slate-100 dark:border-slate-800 ${scope === 'selected' && !isCandidate ? 'opacity-40' : ''}`}
+                        className={`border-t border-slate-100 dark:border-zinc-800 ${scope === 'selected' && !isCandidate ? 'opacity-40' : ''}`}
                       >
                         {scope === 'selected' && (
                           <td className="px-3 py-1.5">
@@ -283,7 +283,7 @@ export default function Checkin() {
               const r = checkin.results[i];
               if (!r) {
                 return (
-                  <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-slate-700">
+                  <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
                     <Clock size={14} className="text-slate-400" />
                     <span className="text-slate-400">等待中…</span>
                   </div>
@@ -306,7 +306,7 @@ export default function Checkin() {
                   ? XCircle
                   : AlertCircle;
               return (
-                <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-slate-700">
+                <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
                   <Icon size={14} className={tone} />
                   <span className="w-8 text-right text-xs text-slate-400">{r.index}</span>
                   <span className="flex-1 truncate">{r.name}</span>

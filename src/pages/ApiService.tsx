@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+﻿import { useEffect, useState, useCallback } from 'react';
 import {
   Play,
   Square,
@@ -228,12 +228,12 @@ export default function ApiService() {
         <div className="card p-5">
           <div className="mb-4 flex items-center gap-2">
             <Globe size={18} className="text-brand-500" />
-            <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-100">接口配置</h2>
+            <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h2>
           </div>
 
           <div className="space-y-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">
+              <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
                 监听端口
               </label>
               <input
@@ -247,7 +247,7 @@ export default function ApiService() {
             </div>
 
             <div>
-              <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">
+              <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
                 API Key（留空则不鉴权）
               </label>
               <input
@@ -264,7 +264,7 @@ export default function ApiService() {
             </div>
 
             <div>
-              <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">
+              <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
                 默认模型
               </label>
               <select
@@ -281,7 +281,7 @@ export default function ApiService() {
               </select>
             </div>
 
-            <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-slate-800/50 dark:text-slate-400">
+            <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
               <p className="mb-1 font-medium">使用方式：</p>
               <code className="block break-all text-[11px]">
                 POST http://127.0.0.1:{form?.api_port ?? 7864}/v1/chat/completions
@@ -307,7 +307,7 @@ export default function ApiService() {
           <div className="mb-4 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Activity size={18} className="text-brand-500" />
-              <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-100">
+              <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">
                 账号池选择
               </h2>
             </div>
@@ -352,7 +352,7 @@ export default function ApiService() {
                   return (
                     <label
                       key={a.user_id}
-                      className="flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2 transition hover:bg-slate-50 dark:hover:bg-slate-800/50"
+                      className="flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50"
                     >
                       <input
                         type="checkbox"
@@ -361,7 +361,7 @@ export default function ApiService() {
                         onChange={() => toggleUid(a.user_id)}
                       />
                       <div className="min-w-0 flex-1">
-                        <div className="truncate text-sm font-medium text-slate-700 dark:text-slate-200">
+                        <div className="truncate text-sm font-medium text-slate-700 dark:text-zinc-200">
                           {a.name}
                         </div>
                         <div className="truncate text-xs text-slate-400">
@@ -370,7 +370,7 @@ export default function ApiService() {
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
                         {a.remaining_credits != null && (
-                          <span className="text-xs tabular-nums text-slate-500 dark:text-slate-400">
+                          <span className="text-xs tabular-nums text-slate-500 dark:text-zinc-400">
                             {a.remaining_credits.toFixed(0)} 积分
                           </span>
                         )}
@@ -406,14 +406,14 @@ export default function ApiService() {
         <div className="mt-5 card p-5">
           <div className="mb-3 flex items-center gap-2">
             <CheckCircle2 size={18} className="text-emerald-500" />
-            <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-100">
+            <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">
               池实时状态
             </h2>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400">
+                <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
                   <th className="pb-2 pr-4 font-medium">账号</th>
                   <th className="pb-2 pr-4 font-medium">UID</th>
                   <th className="pb-2 pr-4 font-medium">积分</th>
@@ -426,13 +426,13 @@ export default function ApiService() {
                 {poolStatus.map((p) => (
                   <tr
                     key={p.uid}
-                    className="border-b border-slate-100 last:border-0 dark:border-slate-800"
+                    className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
                   >
-                    <td className="py-2 pr-4 font-medium text-slate-700 dark:text-slate-200">
+                    <td className="py-2 pr-4 font-medium text-slate-700 dark:text-zinc-200">
                       {p.name}
                     </td>
                     <td className="py-2 pr-4 text-xs text-slate-400">{p.uid.slice(0, 12)}…</td>
-                    <td className="py-2 pr-4 tabular-nums text-slate-600 dark:text-slate-300">
+                    <td className="py-2 pr-4 tabular-nums text-slate-600 dark:text-zinc-300">
                       {p.credits != null ? p.credits.toFixed(0) : '—'}
                     </td>
                     <td className="py-2 pr-4">

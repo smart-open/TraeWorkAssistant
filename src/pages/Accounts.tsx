@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+﻿import { useEffect, useMemo, useState } from 'react';
 import {
   Plus,
   Trash2,
@@ -208,7 +208,7 @@ export default function Accounts() {
           </div>
         ) : (
           <table className="w-full text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-slate-900">
+            <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
               <tr>
                 <th className="px-4 py-2 text-left">账号</th>
                 <th className="px-4 py-2 text-left">分组</th>
@@ -225,7 +225,7 @@ export default function Accounts() {
             <tbody>
               {filtered.map((a) => {
                 return (
-                  <tr key={a.user_id} className="border-t border-slate-200 dark:border-slate-800">
+                  <tr key={a.user_id} className="border-t border-slate-200 dark:border-zinc-800">
                     <td className="px-4 py-3">
                       <div className="font-medium">{a.name}</div>
                       <div className="text-xs text-slate-400">{a.user_id}</div>
@@ -536,7 +536,7 @@ function AddAccountModal({
           </select>
         </div>
         {info && (
-          <div className="rounded-lg border border-slate-200 p-3 text-xs dark:border-slate-700">
+          <div className="rounded-lg border border-slate-200 p-3 text-xs dark:border-zinc-700">
             <div>解析结果：</div>
             <div className="mt-1 grid grid-cols-2 gap-1">
               <span className="text-slate-500">UserID</span>
@@ -657,7 +657,7 @@ function EditAccountModal({
           />
         </div>
         {info && (
-          <div className="rounded-lg border border-slate-200 p-3 text-xs dark:border-slate-700">
+          <div className="rounded-lg border border-slate-200 p-3 text-xs dark:border-zinc-700">
             <div>新 JWT 解析结果：</div>
             <div className="mt-1 grid grid-cols-2 gap-1">
               <span className="text-slate-500">UserID</span>
@@ -820,7 +820,7 @@ function GroupsModal({
       <div className="max-h-64 space-y-2 overflow-auto">
         {groups.length === 0 && <div className="text-xs text-slate-400">暂无分组</div>}
         {groups.map((g) => (
-          <div key={g.id} className="flex items-center gap-2 rounded-lg border border-slate-200 p-2 dark:border-slate-700">
+          <div key={g.id} className="flex items-center gap-2 rounded-lg border border-slate-200 p-2 dark:border-zinc-700">
             <span className="inline-block h-4 w-4 rounded-full" style={{ background: g.color }} />
             <input
               value={editingNames[g.id] ?? g.name}
@@ -927,7 +927,7 @@ function ProfileModal({
           <div className="py-6 text-center text-xs text-slate-400">暂无快照</div>
         ) : (
           <table className="w-full text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-slate-900">
+            <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
               <tr>
                 <th className="px-3 py-2 text-left">账号 (user_id)</th>
                 <th className="px-3 py-2 text-right">文件数</th>
@@ -940,7 +940,7 @@ function ProfileModal({
               {profiles.map((p) => (
                 <tr
                   key={p.slot}
-                  className="border-t border-slate-200 dark:border-slate-800"
+                  className="border-t border-slate-200 dark:border-zinc-800"
                 >
                   <td className="px-3 py-2 font-mono text-xs">{p.slot}</td>
                   <td className="px-3 py-2 text-right tabular-nums">{p.file_count}</td>
@@ -1109,31 +1109,31 @@ function OAuthLoginModal({
             className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold ${
               step >= 1
                 ? 'bg-brand-500 text-white'
-                : 'bg-slate-200 text-slate-500 dark:bg-slate-700'
+                : 'bg-slate-200 text-slate-500 dark:bg-zinc-700'
             }`}
           >
             1
           </div>
           <div
-            className={`h-0.5 w-8 ${step > 1 ? 'bg-brand-500' : 'bg-slate-200 dark:bg-slate-700'}`}
+            className={`h-0.5 w-8 ${step > 1 ? 'bg-brand-500' : 'bg-slate-200 dark:bg-zinc-700'}`}
           />
           <div
             className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold ${
               step >= 2
                 ? 'bg-brand-500 text-white'
-                : 'bg-slate-200 text-slate-500 dark:bg-slate-700'
+                : 'bg-slate-200 text-slate-500 dark:bg-zinc-700'
             }`}
           >
             2
           </div>
           <div
-            className={`h-0.5 w-8 ${step > 2 ? 'bg-brand-500' : 'bg-slate-200 dark:bg-slate-700'}`}
+            className={`h-0.5 w-8 ${step > 2 ? 'bg-brand-500' : 'bg-slate-200 dark:bg-zinc-700'}`}
           />
           <div
             className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold ${
               step >= 3
                 ? 'bg-brand-500 text-white'
-                : 'bg-slate-200 text-slate-500 dark:bg-slate-700'
+                : 'bg-slate-200 text-slate-500 dark:bg-zinc-700'
             }`}
           >
             3
@@ -1141,7 +1141,7 @@ function OAuthLoginModal({
         </div>
 
         {step === 1 && (
-          <div className="text-sm text-slate-600 dark:text-slate-300">
+          <div className="text-sm text-slate-600 dark:text-zinc-300">
             点击「打开登录页」在浏览器中发起 OAuth 登录，完成后将自动进入下一步。
           </div>
         )}

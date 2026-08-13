@@ -1,4 +1,4 @@
-import { useState } from 'react';
+﻿import { useState } from 'react';
 import { CheckCircle2, Circle, ChevronRight, Info } from 'lucide-react';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
@@ -93,7 +93,7 @@ export default function SetupGuide() {
 
   return (
     <div className="card overflow-hidden">
-      <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 dark:border-slate-800">
+      <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 dark:border-zinc-800">
         <div>
           <h3 className="font-medium">配置导航</h3>
           <p className="text-xs text-slate-500">
@@ -108,11 +108,11 @@ export default function SetupGuide() {
       <ol className="divide-y divide-slate-100 dark:divide-slate-800">
         {steps.map((step, i) => (
           <li key={step.key} className="flex items-center gap-3 px-4 py-3">
-            <div className={step.done ? 'text-emerald-500' : 'text-slate-300 dark:text-slate-600'}>
+            <div className={step.done ? 'text-emerald-500' : 'text-slate-300 dark:text-zinc-600'}>
               {step.done ? <CheckCircle2 size={20} /> : <Circle size={20} />}
             </div>
             <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium text-slate-800 dark:text-slate-100">
+              <div className="text-sm font-medium text-slate-800 dark:text-zinc-100">
                 {i + 1}. {step.title}
               </div>
               <div className="text-xs text-slate-500">{step.desc}</div>
@@ -137,7 +137,7 @@ export default function SetupGuide() {
       </ol>
 
       {proxy.running && proxy.captured === 0 && (
-        <div className="border-t border-slate-100 bg-amber-50/60 px-4 py-3 text-sm text-amber-700 dark:border-slate-800 dark:bg-amber-500/10 dark:text-amber-300">
+        <div className="border-t border-slate-100 bg-amber-50/60 px-4 py-3 text-sm text-amber-700 dark:border-zinc-800 dark:bg-amber-500/10 dark:text-amber-300">
           <div className="mb-1 flex items-center gap-1.5 font-medium">
             <Info size={14} /> 代理已启动但尚未捕获到账号
           </div>
@@ -156,7 +156,7 @@ export default function SetupGuide() {
       )}
 
       {allDone && (
-        <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-slate-800 dark:bg-emerald-500/10 dark:text-emerald-300">
+        <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-zinc-800 dark:bg-emerald-500/10 dark:text-emerald-300">
           🎉 全部配置已完成，去「一键签到」开始使用吧！
         </div>
       )}

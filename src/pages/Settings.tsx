@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+﻿import { useEffect, useState } from 'react';
 import { Calendar, Power, Trash2, Save, Search, RotateCcw, Fingerprint } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge } from '../components/ui';
@@ -345,7 +345,7 @@ export default function Settings() {
             </button>
           </div>
           {taskInfo && (
-            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-slate-950">
+            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
               {taskInfo}
             </pre>
           )}
@@ -370,7 +370,7 @@ export default function Settings() {
             )}
           </div>
           {deviceResetProgress.length > 0 && (
-            <pre className="mt-3 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-slate-950">
+            <pre className="mt-3 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
               {deviceResetProgress.join('\n')}
             </pre>
           )}

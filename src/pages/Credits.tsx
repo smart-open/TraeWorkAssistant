@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+﻿import { useMemo } from 'react';
 import {
   BarChart,
   Bar,
@@ -119,7 +119,7 @@ export default function Credits() {
 
       <div className="mt-5 card overflow-hidden">
         <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-slate-900">
+          <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
             <tr>
               <th className="px-4 py-2 text-left">排名</th>
               <th className="px-4 py-2 text-left">账号</th>
@@ -131,7 +131,7 @@ export default function Credits() {
             {rows.map((a, i) => {
               const g = groups.find((x) => x.id === a.group_id);
               return (
-                <tr key={a.user_id} className="border-t border-slate-200 dark:border-slate-800">
+                <tr key={a.user_id} className="border-t border-slate-200 dark:border-zinc-800">
                   <td className="px-4 py-2">#{i + 1}</td>
                   <td className="px-4 py-2">
                     <div className="font-medium">{a.name}</div>

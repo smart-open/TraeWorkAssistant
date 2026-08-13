@@ -60,9 +60,9 @@ export default function App() {
 
   if (!ready) {
     return (
-      <div className="flex h-full items-center justify-center bg-slate-100 dark:bg-slate-950">
+      <div className="flex h-full items-center justify-center bg-slate-100 dark:bg-zinc-950">
         <div className="flex flex-col items-center gap-3">
-          <div className="h-8 w-8 animate-spin rounded-full border-3 border-brand-500 border-t-transparent" />
+          <div className="h-8 w-8 animate-spin rounded-full border-3 border-zinc-400 border-t-transparent" />
           <span className="text-sm text-slate-500">正在加载…</span>
         </div>
       </div>
@@ -70,12 +70,11 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-slate-950 dark:text-slate-100">
+    <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-zinc-950 dark:text-zinc-100">
       <TitleBar />
       <div className="flex min-h-0 flex-1">
         <Sidebar view={view} onNav={setView} />
         <main className="relative flex min-w-0 flex-1 flex-col">
-          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(60%_50%_at_0%_0%,rgba(99,102,241,0.07),transparent)]" />
           <TopBar />
           <div className="relative min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
         </main>

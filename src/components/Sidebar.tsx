@@ -43,7 +43,7 @@ export default function Sidebar({
   };
 
   return (
-    <aside className="flex w-52 shrink-0 flex-col border-r border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+    <aside className="flex w-52 shrink-0 flex-col border-r border-slate-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
       <nav className="flex-1 space-y-1 p-3">
         {NAV.map((item) => {
           const Icon = item.icon;
@@ -55,8 +55,8 @@ export default function Sidebar({
               className={cn(
                 'flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition active:scale-[0.98]',
                 active
-                  ? 'bg-gradient-to-r from-brand-600 to-brand-500 text-white shadow-[0_8px_20px_-8px_rgba(79,70,229,0.6)]'
-                  : 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800',
+                  ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+                  : 'text-slate-600 hover:bg-slate-100 dark:text-zinc-400 dark:hover:bg-zinc-800',
               )}
             >
               <Icon size={17} />
@@ -65,7 +65,7 @@ export default function Sidebar({
           );
         })}
       </nav>
-      <div className="border-t border-slate-200 p-3 dark:border-slate-800">
+      <div className="border-t border-slate-200 p-3 dark:border-zinc-800">
         <button
           onClick={openInvite}
           className="flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-amber-500 to-amber-400 px-3 py-2 text-sm font-semibold text-white shadow-[0_8px_20px_-8px_rgba(245,158,11,0.5)] transition hover:from-amber-400 hover:to-amber-300 active:scale-[0.98]"

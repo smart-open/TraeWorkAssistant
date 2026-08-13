@@ -23,7 +23,7 @@ export default function TopBar() {
   };
 
   return (
-    <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 dark:border-slate-800 dark:bg-slate-900">
+    <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 dark:border-zinc-800 dark:bg-zinc-950">
       <div className="flex items-center gap-2">
         {env?.installed ? (
           <Badge tone="green">

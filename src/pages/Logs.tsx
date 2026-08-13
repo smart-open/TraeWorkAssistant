@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+﻿import { useEffect, useState, useCallback } from 'react';
 import { RefreshCw, Search, Trash2, Download, Copy, ChevronLeft, ChevronRight, Eye } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, Modal } from '../components/ui';
@@ -123,12 +123,12 @@ function SystemLogsTab() {
             <Copy size={14} />
           </button>
         </div>
-        <div className="flex-1 min-h-0 overflow-auto rounded-lg bg-slate-50 p-2 text-xs dark:bg-slate-950">
+        <div className="flex-1 min-h-0 overflow-auto rounded-lg bg-slate-50 p-2 text-xs dark:bg-zinc-950">
           {logs.length === 0 ? (
             <EmptyState icon={<Trash2 size={28} />} title="暂无日志" hint="尝试调整类型与关键字后查询。" />
           ) : (
             logs.map((l, i) => (
-              <div key={i} className="flex gap-2 border-b border-slate-200 py-1 dark:border-slate-800">
+              <div key={i} className="flex gap-2 border-b border-slate-200 py-1 dark:border-zinc-800">
                 <span className="shrink-0 font-mono text-slate-400">{l.time}</span>
                 <span className={`shrink-0 ${typeColor[l.log_type] ?? 'text-slate-500'}`}>[{l.log_type}]</span>
                 <span className="break-all">{l.message}</span>
@@ -250,7 +250,7 @@ function ProxyLogsTab() {
 
       {/* 列表 */}
       <div className="card flex min-h-0 flex-1 flex-col overflow-hidden">
-        <div className="flex items-center justify-between border-b border-slate-100 px-3 py-2 dark:border-slate-800">
+        <div className="flex items-center justify-between border-b border-slate-100 px-3 py-2 dark:border-zinc-800">
           <span className="text-sm font-medium">
             代理请求日志 {loading ? '(加载中…)' : `(${total} 条)`}
           </span>
@@ -267,7 +267,7 @@ function ProxyLogsTab() {
             </div>
           ) : (
             <table className="w-full text-sm">
-              <thead className="sticky top-0 bg-slate-50 text-xs uppercase text-slate-500 dark:bg-slate-900">
+              <thead className="sticky top-0 bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
                 <tr>
                   <th className="px-3 py-2 text-left">时间</th>
                   <th className="px-3 py-2 text-left">方法</th>
@@ -281,7 +281,7 @@ function ProxyLogsTab() {
               </thead>
               <tbody>
                 {entries.map((e) => (
-                  <tr key={e.id} className="border-t border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/50">
+                  <tr key={e.id} className="border-t border-slate-100 hover:bg-slate-50 dark:border-zinc-800 dark:hover:bg-zinc-800/50">
                     <td className="px-3 py-2 whitespace-nowrap font-mono text-xs text-slate-500">{e.timestamp}</td>
                     <td className="px-3 py-2">
                       <span className={`chip whitespace-nowrap ${
@@ -290,12 +290,12 @@ function ProxyLogsTab() {
                         e.method === 'HTTP POST' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300' :
                         e.method === 'HTTP PUT' || e.method === 'HTTP PATCH' ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300' :
                         e.method === 'HTTP DELETE' ? 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300' :
-                        'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+                        'bg-slate-100 text-slate-600 dark:bg-zinc-800 dark:text-zinc-300'
                       }`}>
                         {e.method}
                       </span>
                     </td>
-                    <td className="px-3 py-2 text-xs font-mono text-slate-600 dark:text-slate-400">{e.host}</td>
+                    <td className="px-3 py-2 text-xs font-mono text-slate-600 dark:text-zinc-400">{e.host}</td>
                     <td className="px-3 py-2 text-xs text-slate-500 max-w-xs truncate" title={e.path}>{e.path}</td>
                     <td className="px-3 py-2">
                       <span className={`text-xs font-mono ${
@@ -336,7 +336,7 @@ function ProxyLogsTab() {
         </div>
         {/* 分页 */}
         {totalPages > 1 && (
-          <div className="flex items-center justify-between border-t border-slate-100 px-3 py-2 dark:border-slate-800">
+          <div className="flex items-center justify-between border-t border-slate-100 px-3 py-2 dark:border-zinc-800">
             <button
               onClick={() => setPage((p) => Math.max(0, p - 1))}
               disabled={page === 0}
@@ -373,7 +373,7 @@ function ProxyLogsTab() {
         {detailLoading ? (
           <div className="py-8 text-center text-sm text-slate-400">加载中…</div>
         ) : (
-          <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-slate-50 p-3 text-xs dark:bg-slate-950">
+          <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
             {detail}
           </pre>
         )}
