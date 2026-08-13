@@ -124,7 +124,7 @@ export default function Credits() {
               <th className="px-4 py-2 text-left">排名</th>
               <th className="px-4 py-2 text-left">账号</th>
               <th className="px-4 py-2 text-left">分组</th>
-              <th className="px-4 py-2 text-right">积分</th>
+              <th className="px-4 py-2 text-right">剩余可用积分</th>
             </tr>
           </thead>
           <tbody>
