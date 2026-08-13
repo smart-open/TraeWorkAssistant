@@ -46,7 +46,20 @@ $Script:_TraeExeCache = $null
 function Find-TraeExe {
     if ($Script:_TraeExeCache) { return $Script:_TraeExeCache }
 
-    # 1. 从 app_settings.json 读取用户自定义路径
+    # 1. 从运行中进程取 Path（如果 TRAE 正在运行）
+    try {
+        $proc = Get-Process -Name 'Trae*','TRAE*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^(Trae|TRAE.*CN.*)$' -and $_.Path }
+        if ($proc) {
+            $exePath = $proc | Select-Object -First 1 -ExpandProperty Path
+            if ($exePath -and (Test-Path $exePath)) {
+                $Script:_TraeExeCache = $exePath
+                return $Script:_TraeExeCache
+            }
+        }
+    } catch {}
+
+    # 2. 从 app_settings.json 读取用户自定义路径
     $settingsFile = Join-Path $Script:AppDataDir 'app_settings.json'
     if (Test-Path $settingsFile) {
         try {
@@ -58,7 +71,7 @@ function Find-TraeExe {
         } catch {}
     }
 
-    # 2. 多候选路径探测（与 Rust env.rs 保持一致）
+    # 3. 多候选路径探测（与 Rust env.rs 保持一致）
     $candidates = @(
         "$env:LOCALAPPDATA\Programs\TRAE SOLO CN\TRAE SOLO CN.exe",
         "$env:LOCALAPPDATA\Programs\TRAE SOLO\TRAE SOLO.exe",
@@ -78,7 +91,30 @@ function Find-TraeExe {
         }
     }
 
-    # 3. 注册表回退
+    # 4. .lnk 快捷方式解析（开始菜单 / 桌面）
+    try {
+        $lnkDirs = @(
+            "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+            "$env:USERPROFILE\Desktop",
+            "$env:PUBLIC\Desktop"
+        )
+        $shell = New-Object -ComObject WScript.Shell
+        foreach ($dir in $lnkDirs) {
+            if (-not (Test-Path $dir)) { continue }
+            $lnks = Get-ChildItem -Path $dir -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like '*TRAE*' -or $_.Name -like '*Trae*' }
+            foreach ($lnk in $lnks) {
+                $shortcut = $shell.CreateShortcut($lnk.FullName)
+                if ($shortcut.TargetPath -and (Test-Path $shortcut.TargetPath)) {
+                    $Script:_TraeExeCache = $shortcut.TargetPath
+                    return $Script:_TraeExeCache
+                }
+            }
+        }
+    } catch {}
+
+    # 5. 注册表回退
     try {
         $regKeys = @(
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
