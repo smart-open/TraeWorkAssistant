@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Trae Work 账号切换集成桥（非交互模式）
 .DESCRIPTION

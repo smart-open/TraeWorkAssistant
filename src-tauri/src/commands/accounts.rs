@@ -273,17 +273,16 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>), String> {
             .and_then(|q| q.get("credits_limit"))
             .and_then(|v| v.as_f64());
         if let Some(limit) = credits_limit {
+            // usage 在 pack 顶层，不在 entitlement_base_info 内
             let used = pack
-                .get("entitlement_base_info")
-                .and_then(|e| e.get("usage"))
+                .get("usage")
                 .and_then(|u| u.get("credits_amount"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
             total += (limit - used).max(0.0);
-            // 提取过期时间，取最早的（且未过期的）
+            // expire_time 也在 pack 顶层，取最早的（且未过期的）
             let expire = pack
-                .get("entitlement_base_info")
-                .and_then(|e| e.get("expire_time"))
+                .get("expire_time")
                 .and_then(|v| v.as_i64());
             if let Some(exp) = expire {
                 if exp > now_ts {
