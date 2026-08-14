@@ -114,7 +114,7 @@
 ### `api_server_start(port, api_key, default_model)` → `{ ok, error? }`
 - 启动内嵌 axum HTTP 服务，监听指定端口（默认 7864）。
 - `api_key` 留空时跳过 Bearer Token 鉴权。
-- `default_model` 为默认对话模型（如 `glm-5.2`）。
+- `default_model` 为默认对话模型（如 `deepseek-v4-flash`）。支持模型：`deepseek-v4-flash`、`deepseek-v4-pro`、`glm-5.2`、`glm-5.3`、`doubao-seed-2.1-pro`、`doubao-seed-2.1-turbo`、`minimax-m3`、`kimi-k2.7-code` 等（大小写不敏感）。
 - 应用退出时自动停止服务释放端口。
 
 ### `api_server_stop()` → `{ ok }`

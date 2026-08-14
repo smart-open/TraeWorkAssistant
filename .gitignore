@@ -17,6 +17,9 @@ Thumbs.db
 # WorkBuddy 自动产物（严禁提交）
 .workbuddy/
 
+# 运行时数据（证书、账号状态等）
+data/
+
 # Python
 __pycache__/
 *.pyc

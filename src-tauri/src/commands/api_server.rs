@@ -4,7 +4,7 @@ use tauri::State;
 
 use crate::fs_utils;
 use crate::models::{
-    AccountCooldownsFile, AccountsFile, ApiPoolFile, ApiServiceStatus, PoolStatus,
+    AccountCooldownsFile, AccountsFile, ApiPoolFile, ApiServiceStatus, DeviceMap, PoolStatus,
     RemainingCreditsFile,
 };
 use crate::state::AppState;
@@ -65,6 +65,7 @@ pub async fn api_server_start(
         fs_utils::read_json(&state.path("account_cooldowns.json"));
     let credits_file: RemainingCreditsFile =
         fs_utils::read_json(&state.path("remaining_credits.json"));
+    let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
 
     // ===== 启动诊断日志：详细记录账号池资源情况 =====
     fs_utils::app_log(
@@ -138,6 +139,7 @@ pub async fn api_server_start(
         &cooldowns_file.cooldowns,
         &credits_file.credits,
         &credits_file.expire_times,
+        &device_map,
     );
 
     let pool_count = pool.count();

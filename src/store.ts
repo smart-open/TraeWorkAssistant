@@ -137,7 +137,7 @@ function defaultSettings(): Settings {
     proxy_log_path: null,
     api_port: 7864,
     api_key: '',
-    api_default_model: 'glm-5.2',
+    api_default_model: 'deepseek-v4-flash',
   };
 }
 

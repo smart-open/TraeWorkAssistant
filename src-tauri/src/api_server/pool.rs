@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::models::{CooldownEntry, PoolStatus};
+use sha2::{Sha256, Digest};
+
+use crate::models::{CooldownEntry, DeviceMap, PoolStatus};
 
 use super::ErrKind;
 
@@ -18,6 +20,8 @@ pub struct PoolEntry {
     /// 冷却截止时间（Unix 秒），0 表示无冷却
     pub until: i64,
     pub reason: String,
+    pub device_id: String,
+    pub machine_id: String,
 }
 
 impl PoolEntry {
@@ -57,6 +61,7 @@ impl ApiPool {
         cooldowns: &HashMap<String, CooldownEntry>,
         remaining_credits: &HashMap<String, f64>,
         expire_times: &HashMap<String, i64>,
+        device_map: &DeviceMap,
     ) {
         let mut entries = safe_lock(&self.entries);
         entries.clear();
@@ -68,18 +73,30 @@ impl ApiPool {
                 }
                 let cd = cooldowns.get(uid).cloned().unwrap_or_default();
                 let disabled = cd.error_type == "SessionDead";
+                let (device_id, machine_id) = device_map
+                    .get(uid)
+                    .map(|d| (d.device_id.clone(), seeded_hex(64, uid, "mach")))
+                    .unwrap_or_else(|| (String::new(), seeded_hex(64, uid, "mach")));
+                let jwt_raw = a.jwt.clone();
+                let jwt_clean = jwt_raw
+                    .strip_prefix("Cloud-IDE-JWT ")
+                    .unwrap_or(&jwt_raw)
+                    .trim()
+                    .to_string();
                 entries.insert(
                     uid.clone(),
                     PoolEntry {
                         uid: uid.clone(),
                         name: a.name.clone(),
-                        jwt: a.jwt.clone(),
+                        jwt: jwt_clean,
                         credits: remaining_credits.get(uid).copied(),
                         credits_expire_at: expire_times.get(uid).copied(),
                         disabled,
                         err_count: cd.error_count,
                         until: cd.until,
                         reason: cd.reason,
+                        device_id,
+                        machine_id,
                     },
                 );
             }
@@ -87,6 +104,8 @@ impl ApiPool {
     }
 
     /// 挑选 healthy 账号中积分过期时间最近者；跳过 tried
+    /// llm_utils_chat 消耗 IDE 积分(product_id 208)
+    /// 零积分账号会被跳过，避免无效请求
     pub fn pick_excluding(&self, tried: &HashSet<String>) -> Option<PickedAccount> {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
@@ -101,12 +120,10 @@ impl ApiPool {
                     continue;
                 }
             }
-            // 跳过零积分且有有效过期时间的
-            if e.credits_expire_at.map_or(false, |exp| exp > 0) {
-                if let Some(c) = e.credits {
-                    if c <= 0.0 {
-                        continue;
-                    }
+            // 跳过零积分账号（IDE 积分耗尽，llm_utils_chat 无法使用）
+            if let Some(c) = e.credits {
+                if c <= 0.0 {
+                    continue;
                 }
             }
             match best {
@@ -131,6 +148,8 @@ impl ApiPool {
         best.map(|e| PickedAccount {
             uid: e.uid.clone(),
             jwt: e.jwt.clone(),
+            device_id: e.device_id.clone(),
+            machine_id: e.machine_id.clone(),
         })
     }
 
@@ -264,6 +283,8 @@ pub struct PoolDiagnosis {
 pub struct PickedAccount {
     pub uid: String,
     pub jwt: String,
+    pub device_id: String,
+    pub machine_id: String,
 }
 
 fn now_ts() -> i64 {
@@ -271,4 +292,22 @@ fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// 确定性派生 hex 字符串（与 device_proxy.py 的 _seeded_stream 算法一致）
+/// 用于从 uid 生成 machine_id，保证同一账号始终得到同一设备标识
+fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
+    let data = format!("{}:{}", salt, seed);
+    let mut out = Vec::new();
+    let mut i: u32 = 0;
+    while out.len() < (n + 1) / 2 {
+        let mut hasher = Sha256::new();
+        hasher.update(data.as_bytes());
+        hasher.update(i.to_be_bytes());
+        out.extend_from_slice(&hasher.finalize());
+        i += 1;
+    }
+    out.truncate((n + 1) / 2);
+    out.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        .chars().take(n).collect()
 }

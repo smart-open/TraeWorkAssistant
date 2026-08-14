@@ -12,7 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::sse;
 use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState, ErrKind,
-            AGENT_HOST, APP_ID, EP_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
+            AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
 const MAX_ROTATE: usize = 3;
 const MAX_BODY_BYTES: usize = 8 << 20;
@@ -143,20 +143,19 @@ pub async fn chat_completions(
         .and_then(|v| v.as_str())
         .unwrap_or(&state.default_model)
         .to_string();
-    let converted = super::payload::prepare_body(&body_vec, &state.default_model);
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
 
     if stream {
-        stream_chat(state_clone, converted, model, stream, start_ts)
+        stream_chat(state_clone, body_vec, model, stream, start_ts)
     } else {
-        aggregate_chat(state_clone, converted, model, stream, start_ts).await
+        aggregate_chat(state_clone, body_vec, model, stream, start_ts).await
     }
 }
 
 // ==================== Streaming ====================
 
-fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant) -> Response {
+fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::task::spawn_blocking(move || {
@@ -171,7 +170,11 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>, model: String, st
             tried.insert(picked.uid.clone());
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
-            match make_upstream_request(&picked.jwt, &picked.uid, &converted) {
+            let converted = super::payload::prepare_llm_chat_body(
+                &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+            );
+
+            match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
                 Ok(reader) => {
                     // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
                     let error_info = sse::stream_convert(reader, tx.clone(), &chat_id);
@@ -279,7 +282,7 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>, model: String, st
 
 // ==================== Non-streaming ====================
 
-async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant) -> Response {
+async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let mut tried = HashSet::new();
 
@@ -291,7 +294,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>, model: S
             tried.insert(picked.uid.clone());
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
-            match make_upstream_request(&picked.jwt, &picked.uid, &converted) {
+            let converted = super::payload::prepare_llm_chat_body(
+                &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+            );
+
+            match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
                 Ok(reader) => {
                     let chat_id = format!("chatcmpl-{}", now_ts());
                     let (resp, error_info) = sse::aggregate(reader, &chat_id);
@@ -410,10 +417,12 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>, model: S
 fn make_upstream_request(
     jwt: &str,
     _uid: &str,
+    device_id: &str,
+    machine_id: &str,
     body: &[u8],
 ) -> Result<Box<dyn Read + Send>, (u16, String)> {
-    let url = format!("{}{}", AGENT_HOST, EP_CHAT);
-    let referer = format!("{}{}", REFERER_BASE, EP_CHAT);
+    let url = format!("{}{}", AGENT_HOST, EP_LLM_CHAT);
+    let referer = format!("{}{}", REFERER_BASE, EP_LLM_CHAT);
     let trace_id = format!(
         "00-{}-{}-01",
         uuid_like_id(),
@@ -437,12 +446,11 @@ fn make_upstream_request(
         .set("x-device-type", "windows")
         .set("x-device-brand", "CREFG-XX")
         .set("x-device-cpu", "Intel")
-        .set("x-device-id", "199439841787403")
-        .set("x-machine-id", "b04f40320d4f2d7173a83374cd9f2df3e635907e386a0cdb4612e4fcb37c97e1")
+        .set("x-device-id", device_id)
+        .set("x-machine-id", machine_id)
         .set("x-os-version", "Windows 11 Home China")
         .set("request-traffic-type", "prod")
         .set("package-type", "stable_cn")
-        .set("x-bridge-transport", "aha")
         .set("x-lgw-req-sdk-type", "3")
         .set("x-lscbd-aid", "787976")
         .set("x-lscbd-platform", "windows")
@@ -530,38 +538,22 @@ fn safe_slice(s: &str, n: usize) -> &str {
 
 fn static_models() -> Vec<Value> {
     let names = [
-        "Doubao-Seed-2.1-Pro",
-        "seed-code-pro-0430",
-        "Doubao-Seed-2.1-Turbo",
-        "Doubao-Seed-2.0-Code",
-        "DeepSeek-V4-Flash-Official",
-        "browser_use_subagent",
+        "doubao-seed-2.1-pro",
+        "doubao-seed-2.1-turbo",
+        "doubao-seed-2.0-code",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
         "glm-5.2",
+        "glm-5.3",
         "glm-5-turbo",
         "glm-5",
-        "DeepSeek-V4-Pro",
-        "DeepSeek-V4-Flash",
-        "kimi-k3",
         "kimi-k2.7-code",
+        "kimi-k3",
         "kimi-k2.6",
         "minimax-m3",
         "qwen-3.7-plus",
         "sagitta",
         "aquila",
-        "custom_model_gemini",
-        "custom_model_placeholder",
-        "custom_model_1M_text",
-        "custom_model_1M",
-        "custom_model_kimi",
-        "custom_model_claude",
-        "custom_model_gpt-5",
-        "custom_model_no-fc",
-        "custom_model_deepseek_chat",
-        "custom_model_deepseek_reasoner",
-        "custom_model_deepseek_v4",
-        "explore_sub_agent_v13",
-        "explore_sub_agent_v2",
-        "summary",
     ];
     names
         .iter()

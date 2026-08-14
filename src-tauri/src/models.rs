@@ -111,7 +111,7 @@ fn default_api_port() -> u16 {
     7864
 }
 fn default_api_model() -> String {
-    "glm-5.2".into()
+    "deepseek-v4-flash".into()
 }
 
 fn default_port() -> u16 {

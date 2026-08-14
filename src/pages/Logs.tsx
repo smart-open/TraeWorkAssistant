@@ -1,9 +1,10 @@
 ﻿import { useEffect, useState, useCallback, useRef } from 'react';
-import { RefreshCw, Search, Trash2, Download, Copy, ChevronLeft, ChevronRight, Eye, Eraser } from 'lucide-react';
+import { RefreshCw, Search, Trash2, Download, Copy, ChevronLeft, ChevronRight, Eye, Eraser, Bug, FileText, X } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, Modal } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
+import { withMinDelay } from '../lib/delay';
 import type { ProxyLogEntry } from '../types';
 
 const TYPES = [
@@ -399,25 +400,279 @@ function ProxyLogsTab() {
   );
 }
 
+// ======================== API 请求日志 Tab ========================
+
+function ApiLogsTab() {
+  const toast = useAppStore((s) => s.pushToast);
+
+  const [dates, setDates] = useState<string[]>([]);
+  const [selected, setSelected] = useState('');
+  const [content, setContent] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [debugEnabled, setDebugEnabled] = useState(false);
+  const [togglingDebug, setTogglingDebug] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [kw, setKw] = useState('');
+  const [startTime, setStartTime] = useState('');
+  const [endTime, setEndTime] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [filtered, setFiltered] = useState(false);
+
+  const loadDates = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const d = await withMinDelay(api.apiServer.logsList());
+      setDates(d);
+      if (d.length > 0 && !selected) {
+        setSelected(d[0]);
+        void loadDetail(d[0]);
+      }
+    } catch {
+      /* ignore */
+    } finally {
+      setRefreshing(false);
+    }
+  }, [selected]);
+
+  const loadDetail = useCallback(async (date: string) => {
+    setLoading(true);
+    setSelected(date);
+    setFiltered(false);
+    setKw('');
+    setStartTime('');
+    setEndTime('');
+    try {
+      const c = await withMinDelay(api.apiServer.logsDetail(date));
+      setContent(c);
+    } catch {
+      setContent(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const search = async () => {
+    if (!selected) return;
+    setSearching(true);
+    setFiltered(true);
+    try {
+      const c = await withMinDelay(api.apiServer.logsSearch({
+        date: selected,
+        startTime: startTime.trim() || undefined,
+        endTime: endTime.trim() || undefined,
+        keyword: kw.trim() || undefined,
+      }));
+      setContent(c);
+    } catch {
+      setContent(null);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const resetSearch = async () => {
+    setKw('');
+    setStartTime('');
+    setEndTime('');
+    setFiltered(false);
+    await loadDetail(selected);
+  };
+
+  const toggleDebug = async () => {
+    setTogglingDebug(true);
+    try {
+      const newVal = await withMinDelay(api.apiServer.debugToggle());
+      setDebugEnabled(newVal);
+      toast(newVal ? 'success' : 'info', `Debug 模式已${newVal ? '开启' : '关闭'}`);
+    } catch (err) {
+      toast('error', `切换 Debug 失败：${String(err)}`);
+    } finally {
+      setTogglingDebug(false);
+    }
+  };
+
+  const checkStatus = useCallback(async () => {
+    try {
+      const s = await api.apiServer.status();
+      setRunning(s.running);
+      if (s.running) {
+        try {
+          setDebugEnabled(await api.apiServer.debugStatus());
+        } catch { /* ignore */ }
+      } else {
+        setDebugEnabled(false);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    void loadDates();
+    void checkStatus();
+    const id = setInterval(() => void checkStatus(), 5000);
+    return () => clearInterval(id);
+  }, [loadDates, checkStatus]);
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {/* 工具栏 */}
+      <div className="card overflow-hidden">
+        <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 dark:border-zinc-800">
+          <div className="flex items-center gap-2">
+            <FileText size={16} className="text-slate-400 dark:text-zinc-500" />
+            <h2 className="text-sm font-semibold text-slate-700 dark:text-zinc-200">API 请求日志</h2>
+            {selected && (
+              <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500 dark:bg-zinc-800 dark:text-zinc-400">
+                {selected}
+              </span>
+            )}
+            <span className={`rounded-md px-2 py-0.5 text-xs font-medium ${
+              running
+                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300'
+                : 'bg-slate-100 text-slate-500 dark:bg-zinc-800 dark:text-zinc-400'
+            }`}>
+              {running ? '服务运行中' : '服务未启动'}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              className={`flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition ${
+                debugEnabled
+                  ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300'
+                  : 'text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:text-zinc-500 dark:hover:bg-zinc-800 dark:hover:text-zinc-300'
+              } ${!running || togglingDebug ? 'cursor-not-allowed opacity-50' : ''}`}
+              onClick={() => void toggleDebug()}
+              disabled={!running || togglingDebug}
+              title={running ? '开启后记录完整请求/响应信息' : '需先启动 API 服务'}
+            >
+              <Bug size={13} className={togglingDebug ? 'animate-pulse' : ''} />
+              {togglingDebug ? '切换中…' : `Debug ${debugEnabled ? 'ON' : 'OFF'}`}
+            </button>
+            <button
+              className="btn-ghost flex items-center gap-1 text-xs"
+              onClick={() => void loadDates()}
+              disabled={refreshing}
+            >
+              <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />
+              {refreshing ? '刷新中…' : '刷新'}
+            </button>
+          </div>
+        </div>
+
+        {dates.length === 0 ? (
+          <p className="py-12 text-center text-sm text-slate-400">暂无日志</p>
+        ) : (
+          <div className="p-4">
+            {/* 日期选择 */}
+            <div className="mb-3 flex flex-wrap gap-1.5">
+              {dates.map((d) => (
+                <button
+                  key={d}
+                  className={`rounded-lg px-2.5 py-1 text-xs font-medium transition-all ${
+                    selected === d
+                      ? 'bg-zinc-800 text-white shadow-soft dark:bg-zinc-200 dark:text-zinc-900'
+                      : 'bg-slate-100 text-slate-500 hover:bg-slate-200 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
+                  }`}
+                  onClick={() => void loadDetail(d)}
+                >
+                  {d}
+                </button>
+              ))}
+            </div>
+
+            {/* 搜索栏 */}
+            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-slate-200/70 bg-slate-50/60 p-2.5 dark:border-zinc-700/50 dark:bg-zinc-800/30">
+              <div className="flex items-center gap-1">
+                <input
+                  type="time"
+                  value={startTime}
+                  onChange={(e) => setStartTime(e.target.value)}
+                  className="input h-8 w-28 py-0 text-xs"
+                  placeholder="开始"
+                />
+                <span className="text-xs text-slate-400">→</span>
+                <input
+                  type="time"
+                  value={endTime}
+                  onChange={(e) => setEndTime(e.target.value)}
+                  className="input h-8 w-28 py-0 text-xs"
+                  placeholder="结束"
+                />
+              </div>
+              <div className="relative flex-1 min-w-[140px]">
+                <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  value={kw}
+                  onChange={(e) => setKw(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void search(); }}
+                  className="input h-8 w-full py-0 pl-7 pr-3 text-xs"
+                  placeholder="关键字搜索（不区分大小写）"
+                />
+              </div>
+              <button
+                className="btn-primary h-8 px-3 py-0 text-xs"
+                onClick={() => void search()}
+                disabled={searching || !selected}
+              >
+                <Search size={12} />
+                {searching ? '搜索中…' : '搜索'}
+              </button>
+              {filtered && (
+                <button
+                  className="btn-outline h-8 px-3 py-0 text-xs"
+                  onClick={() => void resetSearch()}
+                  disabled={searching}
+                >
+                  <X size={12} />
+                  清除
+                </button>
+              )}
+              {filtered && (
+                <span className="rounded-md bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">
+                  已过滤
+                </span>
+              )}
+            </div>
+
+            {/* 日志内容 */}
+            <div className="max-h-[480px] overflow-auto rounded-lg bg-slate-50 p-3 dark:bg-zinc-900/50">
+              {loading || searching ? (
+                <p className="py-4 text-center text-sm text-slate-400">{searching ? '搜索中…' : '加载中…'}</p>
+              ) : content ? (
+                <pre className="whitespace-pre-wrap break-all font-mono text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+                  {content}
+                </pre>
+              ) : (
+                <p className="py-4 text-center text-sm text-slate-400">无内容</p>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ======================== 主页面 ========================
 
 export default function Logs() {
-  const [tab, setTab] = useState<'system' | 'proxy'>('system');
+  const [tab, setTab] = useState<'system' | 'proxy' | 'api'>('system');
 
   return (
     <div className="flex h-full animate-fade-in flex-col">
       <PageHeader
         title="系统日志"
-        desc="查看运行日志与代理请求日志"
+        desc="查看运行日志、代理请求日志与 API 请求日志"
       />
 
-      {/* Tab 切换 */}
-      <div className="mb-3 flex gap-1 border-b border-slate-200 dark:border-zinc-800">
+      {/* Tab 切换 — 分段控件风格 */}
+      <div className="mb-3 inline-flex items-center gap-1 rounded-xl border border-slate-200/80 bg-slate-50/80 p-1 dark:border-zinc-700/60 dark:bg-zinc-800/40">
         <button
           onClick={() => setTab('system')}
-          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors ${
+          className={`flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-sm font-medium transition-all duration-200 ${
             tab === 'system'
-              ? 'border-b-2 border-brand-500 text-brand-600 dark:text-brand-400'
+              ? 'bg-white text-zinc-800 shadow-soft dark:bg-zinc-700 dark:text-zinc-50'
               : 'text-slate-500 hover:text-slate-700 dark:text-zinc-400 dark:hover:text-zinc-200'
           }`}
         >
@@ -425,17 +680,30 @@ export default function Logs() {
         </button>
         <button
           onClick={() => setTab('proxy')}
-          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors ${
+          className={`flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-sm font-medium transition-all duration-200 ${
             tab === 'proxy'
-              ? 'border-b-2 border-brand-500 text-brand-600 dark:text-brand-400'
+              ? 'bg-white text-zinc-800 shadow-soft dark:bg-zinc-700 dark:text-zinc-50'
               : 'text-slate-500 hover:text-slate-700 dark:text-zinc-400 dark:hover:text-zinc-200'
           }`}
         >
           代理日志
         </button>
+        <button
+          onClick={() => setTab('api')}
+          className={`flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-sm font-medium transition-all duration-200 ${
+            tab === 'api'
+              ? 'bg-white text-zinc-800 shadow-soft dark:bg-zinc-700 dark:text-zinc-50'
+              : 'text-slate-500 hover:text-slate-700 dark:text-zinc-400 dark:hover:text-zinc-200'
+          }`}
+        >
+          <FileText size={15} />
+          API 请求日志
+        </button>
       </div>
 
-      {tab === 'system' ? <SystemLogsTab /> : <ProxyLogsTab />}
+      {tab === 'system' && <SystemLogsTab />}
+      {tab === 'proxy' && <ProxyLogsTab />}
+      {tab === 'api' && <ApiLogsTab />}
     </div>
   );
 }

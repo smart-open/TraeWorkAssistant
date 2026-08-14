@@ -1,6 +1,6 @@
 [package]
 name = "trae-work-helper"
-version = "2.2.0"
+version = "2.4.0"
 description = "Trae Work 助手 - 多账号签到与管理桌面端"
 edition = "2021"
 rust-version = "1.77"
@@ -23,6 +23,7 @@ axum = "0.7"
 tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "macros"] }
 tokio-stream = "0.1"
 bytes = "1"
+sha2 = "0.10"
 
 [features]
 # 仅桌面端

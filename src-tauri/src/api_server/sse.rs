@@ -95,6 +95,21 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
                 }
             }
         }
+        "thought" => {
+            // create_agent_task 曾使用 event:thought，llm_utils_chat 使用 event:output
+            // 保留 thought 处理以兼容两种端点
+            if let Some(s) = obj.get("thought").and_then(|v| v.as_str()) {
+                ev.response = s.to_string();
+            }
+            if let Some(s) = obj.get("reasoning_content").and_then(|v| v.as_str()) {
+                ev.reasoning = s.to_string();
+            }
+            if let Some(tc) = obj.get("tool_calls") {
+                if !tc.is_null() {
+                    ev.tool_calls = Some(tc.clone());
+                }
+            }
+        }
         "token_usage" => {
             ev.usage = Some(raw.clone());
         }
@@ -102,6 +117,10 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
             if let Some(s) = obj.get("finish_reason").and_then(|v| v.as_str()) {
                 ev.finish_reason = s.to_string();
             }
+        }
+        "turn_completion" => {
+            // create_agent_task 曾使用 event:turn_completion，保留兼容
+            ev.finish_reason = "stop".to_string();
         }
         "error" => {
             ev.error_code = obj.get("code").and_then(|v| v.as_i64());
@@ -160,7 +179,7 @@ pub fn stream_convert<R: Read + Send>(
         };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
-                "output" => {
+                "output" | "thought" => {
                     let mut delta = Map::new();
                     if !ev.response.is_empty() {
                         delta.insert("content".into(), json!(ev.response));
@@ -204,7 +223,7 @@ pub fn stream_convert<R: Read + Send>(
                 "token_usage" => {
                     pending_usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
                 }
-                "done" => {
+                "done" | "turn_completion" => {
                     let data = write_chunk(json!({}), &ev.finish_reason, &pending_usage);
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
@@ -258,14 +277,14 @@ pub fn aggregate<R: Read + Send>(
         };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
-                "output" => {
+                "output" | "thought" => {
                     content.push_str(&ev.response);
                     reasoning.push_str(&ev.reasoning);
                 }
                 "token_usage" => {
                     usage = Some(json!(ev.usage.unwrap_or(json!({}))));
                 }
-                "done" => {
+                "done" | "turn_completion" => {
                     if !ev.finish_reason.is_empty() {
                         finish_reason = ev.finish_reason;
                     }

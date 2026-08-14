@@ -10,12 +10,9 @@ import {
   Globe,
   Eye,
   EyeOff,
-  FileText,
   Eraser,
   Copy,
-  Bug,
-  Search,
-  X,
+  Info,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, StatCard } from '../components/ui';
@@ -33,13 +30,16 @@ function maskApiKey(key: string): string {
 
 const MODEL_OPTIONS = [
   'glm-5.2',
+  'glm-5.3',
   'glm-5-turbo',
   'glm-5',
-  'DeepSeek-V4-Pro',
-  'DeepSeek-V4-Flash',
+  'deepseek-v4-flash',
+  'deepseek-v4-pro',
+  'kimi-k2.7-code',
   'kimi-k3',
-  'Doubao-Seed-2.1-Pro',
-  'Doubao-Seed-2.0-Code',
+  'doubao-seed-2.1-pro',
+  'doubao-seed-2.1-turbo',
+  'doubao-seed-2.0-code',
   'minimax-m3',
   'qwen-3.7-plus',
 ];
@@ -60,29 +60,16 @@ export default function ApiService() {
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
-  const [apiLogDates, setApiLogDates] = useState<string[]>([]);
-  const [apiLogContent, setApiLogContent] = useState<string | null>(null);
-  const [apiLogSelected, setApiLogSelected] = useState<string>('');
-  const [apiLogLoading, setApiLogLoading] = useState(false);
-  const [debugEnabled, setDebugEnabled] = useState(false);
   const [savingPool, setSavingPool] = useState(false);
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
-  const [togglingDebug, setTogglingDebug] = useState(false);
   const [refreshingPool, setRefreshingPool] = useState(false);
-  const [refreshingLogs, setRefreshingLogs] = useState(false);
   const [copying, setCopying] = useState(false);
-  const [searchKeyword, setSearchKeyword] = useState('');
-  const [searchStart, setSearchStart] = useState('');
-  const [searchEnd, setSearchEnd] = useState('');
-  const [searching, setSearching] = useState(false);
-  const [isFiltered, setIsFiltered] = useState(false);
 
   useEffect(() => {
     void refreshSettings();
     void refreshAccounts();
     void loadPool();
     void refreshStatus();
-    void loadApiLogDates();
   }, [refreshSettings, refreshAccounts]);
 
   useEffect(() => {
@@ -102,15 +89,8 @@ export default function ApiService() {
         } catch {
           /* ignore */
         }
-        try {
-          const dbg = await api.apiServer.debugStatus();
-          setDebugEnabled(dbg);
-        } catch {
-          /* ignore */
-        }
       } else {
         setPoolStatus([]);
-        setDebugEnabled(false);
       }
     } catch {
       /* ignore */
@@ -255,80 +235,6 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
     }
   };
 
-  const loadApiLogDates = async () => {
-    setRefreshingLogs(true);
-    try {
-      const dates = await withMinDelay(api.apiServer.logsList());
-      setApiLogDates(dates);
-      if (dates.length > 0 && !apiLogSelected) {
-        setApiLogSelected(dates[0]);
-        void loadApiLogDetail(dates[0]);
-      }
-    } catch {
-      /* ignore */
-    } finally {
-      setRefreshingLogs(false);
-    }
-  };
-
-  const loadApiLogDetail = async (date: string) => {
-    setApiLogLoading(true);
-    setApiLogSelected(date);
-    // 切换日期时重置过滤状态
-    setIsFiltered(false);
-    setSearchKeyword('');
-    setSearchStart('');
-    setSearchEnd('');
-    try {
-      const content = await withMinDelay(api.apiServer.logsDetail(date));
-      setApiLogContent(content);
-    } catch {
-      setApiLogContent(null);
-    } finally {
-      setApiLogLoading(false);
-    }
-  };
-
-  const searchLogs = async () => {
-    if (!apiLogSelected) return;
-    setSearching(true);
-    setIsFiltered(true);
-    try {
-      const content = await withMinDelay(api.apiServer.logsSearch({
-        date: apiLogSelected,
-        startTime: searchStart.trim() || undefined,
-        endTime: searchEnd.trim() || undefined,
-        keyword: searchKeyword.trim() || undefined,
-      }));
-      setApiLogContent(content);
-    } catch {
-      setApiLogContent(null);
-    } finally {
-      setSearching(false);
-    }
-  };
-
-  const resetSearch = async () => {
-    setSearchKeyword('');
-    setSearchStart('');
-    setSearchEnd('');
-    setIsFiltered(false);
-    await loadApiLogDetail(apiLogSelected);
-  };
-
-  const toggleDebug = async () => {
-    setTogglingDebug(true);
-    try {
-      const newVal = await withMinDelay(api.apiServer.debugToggle());
-      setDebugEnabled(newVal);
-      toast(newVal ? 'success' : 'info', `Debug 模式已${newVal ? '开启' : '关闭'}`);
-    } catch (err) {
-      toast('error', `切换 Debug 失败：${String(err)}`);
-    } finally {
-      setTogglingDebug(false);
-    }
-  };
-
   const running = status?.running ?? false;
   const poolCount = enabledUids.size;
 
@@ -336,7 +242,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
     <div>
       <PageHeader
         title="API 服务"
-        desc="OpenAI 兼容接口，通过账号池轮转实现多账号负载均衡"
+        desc="OpenAI 兼容接口，通过账号池轮转实现多账号负载均衡（消耗 IDE 积分）"
         actions={
           running ? (
             <button
@@ -394,6 +300,19 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
           <span className="truncate">{status.last_error}</span>
         </div>
       )}
+
+      {/* 积分类型说明 — 紧凑横幅 */}
+      <div className="mb-5 flex items-center gap-2.5 rounded-xl border border-amber-300/70 bg-amber-50/80 px-3.5 py-2.5 dark:border-amber-700/40 dark:bg-amber-900/10">
+        <Info size={15} className="shrink-0 text-amber-500 dark:text-amber-400" />
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+          <span className="font-semibold text-amber-800 dark:text-amber-200">IDE 积分</span>
+          <span className="text-amber-700/70 dark:text-amber-300/50">product_id 208 · llm_utils_chat</span>
+          <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-800/40 dark:text-amber-200">本服务使用</span>
+          <span className="text-slate-300 dark:text-zinc-600">|</span>
+          <span className="font-medium text-slate-500 dark:text-zinc-400">Work 积分</span>
+          <span className="text-slate-400 dark:text-zinc-500">product_id 209 · 需 TTNet 加密，未采用</span>
+        </div>
+      </div>
 
       <div className="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
         {/* 配置卡片 */}
@@ -461,11 +380,17 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                   </option>
                 ))}
               </select>
+              <p className="mt-1 text-xs text-slate-400">
+                上游接口：llm_utils_chat（IDE 积分，product_id 208）
+              </p>
             </div>
 
             <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
               <div className="mb-2 flex items-center justify-between">
                 <p className="font-medium">使用方式 & 配置示例</p>
+                <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">
+                  IDE 积分
+                </span>
                 <button
                   className="btn-ghost flex items-center gap-1 !p-1 text-xs"
                   onClick={copyConfigExample}
@@ -682,130 +607,6 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
           </div>
         </div>
       )}
-
-      {/* API 请求日志 */}
-      <div className="mt-5 card p-5">
-        <div className="mb-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <FileText size={18} className="text-brand-500" />
-            <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">
-              API 请求日志
-            </h2>
-          </div>
-          <div className="flex items-center gap-3">
-            <button
-              className={`flex items-center gap-1 text-xs transition ${
-                debugEnabled
-                  ? 'text-amber-600 dark:text-amber-400'
-                  : 'text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300'
-              } ${!running || togglingDebug ? 'cursor-not-allowed opacity-50' : ''}`}
-              onClick={() => void toggleDebug()}
-              disabled={!running || togglingDebug}
-              title={running ? '开启后记录完整请求/响应信息' : '需先启动 API 服务'}
-            >
-              <Bug size={13} className={togglingDebug ? 'animate-pulse' : ''} />
-              {togglingDebug ? '切换中…' : `Debug ${debugEnabled ? 'ON' : 'OFF'}`}
-            </button>
-            <button
-              className="btn-ghost flex items-center gap-1 text-xs"
-              onClick={() => void loadApiLogDates()}
-              disabled={refreshingLogs}
-            >
-              <RefreshCw size={13} className={refreshingLogs ? 'animate-spin' : ''} />
-              {refreshingLogs ? '刷新中…' : '刷新'}
-            </button>
-          </div>
-        </div>
-
-        {apiLogDates.length === 0 ? (
-          <p className="py-8 text-center text-sm text-slate-400">暂无日志</p>
-        ) : (
-          <>
-            <div className="mb-3 flex flex-wrap gap-1">
-              {apiLogDates.map((d) => (
-                <button
-                  key={d}
-                  className={`rounded-md px-2.5 py-1 text-xs transition ${
-                    apiLogSelected === d
-                      ? 'bg-brand-500 text-white'
-                      : 'bg-slate-100 text-slate-500 hover:bg-slate-200 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
-                  }`}
-                  onClick={() => void loadApiLogDetail(d)}
-                >
-                  {d}
-                </button>
-              ))}
-            </div>
-
-            {/* 搜索栏 */}
-            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg bg-slate-50 p-2.5 dark:bg-zinc-800/50">
-              <div className="flex items-center gap-1">
-                <input
-                  type="time"
-                  value={searchStart}
-                  onChange={(e) => setSearchStart(e.target.value)}
-                  className="input h-8 w-28 py-0 text-xs"
-                  placeholder="开始"
-                />
-                <span className="text-xs text-slate-400">→</span>
-                <input
-                  type="time"
-                  value={searchEnd}
-                  onChange={(e) => setSearchEnd(e.target.value)}
-                  className="input h-8 w-28 py-0 text-xs"
-                  placeholder="结束"
-                />
-              </div>
-              <div className="relative flex-1 min-w-[140px]">
-                <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  type="text"
-                  value={searchKeyword}
-                  onChange={(e) => setSearchKeyword(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') void searchLogs(); }}
-                  className="input h-8 w-full py-0 pl-7 pr-3 text-xs"
-                  placeholder="关键字搜索（不区分大小写）"
-                />
-              </div>
-              <button
-                className="btn-primary h-8 px-3 py-0 text-xs"
-                onClick={() => void searchLogs()}
-                disabled={searching || !apiLogSelected}
-              >
-                <Search size={12} />
-                {searching ? '搜索中…' : '搜索'}
-              </button>
-              {isFiltered && (
-                <button
-                  className="btn-outline h-8 px-3 py-0 text-xs"
-                  onClick={() => void resetSearch()}
-                  disabled={searching}
-                >
-                  <X size={12} />
-                  清除
-                </button>
-              )}
-              {isFiltered && (
-                <span className="rounded bg-amber-100 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
-                  已过滤
-                </span>
-              )}
-            </div>
-
-            <div className="max-h-96 overflow-auto rounded-lg bg-slate-50 p-3 dark:bg-zinc-900/50">
-              {apiLogLoading || searching ? (
-                <p className="py-4 text-center text-sm text-slate-400">{searching ? '搜索中…' : '加载中…'}</p>
-              ) : apiLogContent ? (
-                <pre className="whitespace-pre-wrap break-all text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-                  {apiLogContent}
-                </pre>
-              ) : (
-                <p className="py-4 text-center text-sm text-slate-400">无内容</p>
-              )}
-            </div>
-          </>
-        )}
-      </div>
     </div>
   );
 }

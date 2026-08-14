@@ -1006,6 +1006,54 @@ def forward_websocket(host, port, method, path, headers, body, client_tls):
     except Exception as e:
         log(f"  {ws_tag} 连接上游失败: {type(e).__name__}: {e}")
 
+def _stream_response(resp, resp_headers, client_sock, host, method, path, req_headers, req_body):
+    """流式转发 SSE 响应，逐块读取并立即发送给客户端，避免全量缓冲导致超时。"""
+    resp_status = resp.status
+    resp_reason = resp.reason
+
+    head = [f"HTTP/1.1 {resp_status} {resp_reason}".encode("utf-8")]
+    for k, v in resp_headers.items():
+        if k.lower() in ("transfer-encoding", "connection", "keep-alive", "content-length"):
+            continue
+        head.append(f"{k}: {v}".encode("utf-8"))
+    head.append(b"Transfer-Encoding: chunked")
+    head.append(b"Connection: keep-alive")
+    client_sock.sendall(b"\r\n".join(head) + b"\r\n\r\n")
+
+    log(f"  [forward] <- {resp_status} {resp_reason} (streaming) from {host}{path}")
+
+    total_bytes = 0
+    logged_body = bytearray()
+    MAX_LOG_BODY = 10 * 1024 * 1024
+    interrupted = False
+
+    try:
+        while True:
+            chunk = resp.read(8192)
+            if not chunk:
+                break
+            client_sock.sendall(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
+            total_bytes += len(chunk)
+            if len(logged_body) < MAX_LOG_BODY:
+                logged_body.extend(chunk)
+        client_sock.sendall(b"0\r\n\r\n")
+    except Exception as e:
+        interrupted = True
+        log(f"  [forward] 流式转发中断: {type(e).__name__}: {e} (已转发 {total_bytes} bytes)")
+        try:
+            client_sock.sendall(b"0\r\n\r\n")
+        except Exception:
+            pass
+
+    log(f"  [forward] 流式转发{'中断' if interrupted else '完成'}，共 {total_bytes} bytes")
+
+    pl = get_proxy_logger()
+    if pl:
+        pl.log_request(method, host, path, req_headers, req_body, resp_status, resp_reason, resp.getheaders(), bytes(logged_body))
+
+    return not interrupted
+
+
 def forward_upstream(host, port, method, path, headers, body, client_sock):
     log(f"  [forward] -> {method} https://{host}:{port}{path} ({len(body) if body else 0} bytes body)")
     ctx = ssl.create_default_context()
@@ -1018,10 +1066,13 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
         body_arg = body if method.upper() != "GET" else None
         conn.request(method, path, body=body_arg, headers=fwd)
         resp = conn.getresponse()
+        resp_headers = dict(resp.getheaders())
+
+        if is_stream:
+            return _stream_response(resp, resp_headers, client_sock, host, method, path, headers, body)
+
         resp_body = resp.read()
         log(f"  [forward] <- {resp.status} {resp.reason} ({len(resp_body)} bytes) from {host}{path}")
-        # 检测上游是否要求关闭连接
-        resp_headers = dict(resp.getheaders())
         upstream_conn = resp_headers.get("connection", "").lower()
         send_response(client_sock, resp.status, resp.reason, resp_headers, resp_body)
         # 捕获 ExchangeToken 响应中的 refresh_token

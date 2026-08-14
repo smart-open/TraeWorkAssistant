@@ -12,16 +12,15 @@ use std::sync::Mutex;
 pub use api_logger::ApiLogger;
 pub use pool::ApiPool;
 
-/// SOLO 上游常量（本项目协议实测 + MITM 抓包对比）
-/// 真实 Trae 客户端使用 api5-normal.mchost.guru 作为实际请求主机
-/// trae-api-cn.mchost.guru 仅作为 referer 和页面域名
-pub const AGENT_HOST: &str = "https://api5-normal.mchost.guru";
-pub const EP_CHAT: &str = "/api/agent/v3/llm_utils_chat";
+/// SOLO 上游常量
+/// llm_utils_chat 使用 trae-api-cn.mchost.guru（IDE 积分 product_id 208）
+pub const AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
+pub const EP_LLM_CHAT: &str = "/api/agent/v3/llm_utils_chat";
 pub const APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 pub const IDE_VERSION: &str = "0.1.50";
 pub const IDE_VERSION_CODE: &str = "20260811";
 pub const FUNCTION: &str = "solo_work_lite";
-pub const DEFAULT_MODEL: &str = "glm-5.2";
+pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 
 /// API 服务器运行时共享状态（传入 axum State）
@@ -94,6 +93,10 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     // 1005: Plan 套餐额度用尽 → 12 小时冷却
     if code == 1005 || msg_lower.contains("plan") {
         return ErrKind::PlanLimit;
+    }
+    // 4001: 模型配置不存在（model config is empty）→ 不冷却账号，是模型问题非账号问题
+    if code == 4001 || msg_lower.contains("model config is empty") {
+        return ErrKind::None;
     }
     // 4008: 请求频率超限（quota exceeded）→ 60 秒短冷却，避免误杀
     if code == 4008
