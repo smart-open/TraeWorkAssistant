@@ -8,12 +8,28 @@ import {
   XCircle,
   Activity,
   Globe,
+  Eye,
+  EyeOff,
+  FileText,
+  Eraser,
+  Copy,
+  Bug,
+  Search,
+  X,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
+import { withMinDelay } from '../lib/delay';
 import type { Settings, ApiServiceStatus, PoolStatus } from '../types';
+
+/** 将 API Key 打码：保留前4后4，中间用 **** 替代 */
+function maskApiKey(key: string): string {
+  if (!key) return '';
+  if (key.length <= 8) return '****';
+  return `${key.slice(0, 4)}****${key.slice(-4)}`;
+}
 
 const MODEL_OPTIONS = [
   'glm-5.2',
@@ -43,12 +59,30 @@ export default function ApiService() {
   const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [apiLogDates, setApiLogDates] = useState<string[]>([]);
+  const [apiLogContent, setApiLogContent] = useState<string | null>(null);
+  const [apiLogSelected, setApiLogSelected] = useState<string>('');
+  const [apiLogLoading, setApiLogLoading] = useState(false);
+  const [debugEnabled, setDebugEnabled] = useState(false);
+  const [savingPool, setSavingPool] = useState(false);
+  const [clearingCooldowns, setClearingCooldowns] = useState(false);
+  const [togglingDebug, setTogglingDebug] = useState(false);
+  const [refreshingPool, setRefreshingPool] = useState(false);
+  const [refreshingLogs, setRefreshingLogs] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [searchKeyword, setSearchKeyword] = useState('');
+  const [searchStart, setSearchStart] = useState('');
+  const [searchEnd, setSearchEnd] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [isFiltered, setIsFiltered] = useState(false);
 
   useEffect(() => {
     void refreshSettings();
     void refreshAccounts();
     void loadPool();
     void refreshStatus();
+    void loadApiLogDates();
   }, [refreshSettings, refreshAccounts]);
 
   useEffect(() => {
@@ -68,8 +102,15 @@ export default function ApiService() {
         } catch {
           /* ignore */
         }
+        try {
+          const dbg = await api.apiServer.debugStatus();
+          setDebugEnabled(dbg);
+        } catch {
+          /* ignore */
+        }
       } else {
         setPoolStatus([]);
+        setDebugEnabled(false);
       }
     } catch {
       /* ignore */
@@ -83,11 +124,14 @@ export default function ApiService() {
   }, [status?.running, refreshStatus]);
 
   const loadPool = async () => {
+    setRefreshingPool(true);
     try {
-      const pool = await api.apiServer.poolList();
+      const pool = await withMinDelay(api.apiServer.poolList());
       setEnabledUids(new Set(pool.enabled_uids));
     } catch {
       /* ignore */
+    } finally {
+      setRefreshingPool(false);
     }
   };
 
@@ -99,7 +143,7 @@ export default function ApiService() {
     if (!form) return;
     setSaving(true);
     try {
-      await saveSettings(form);
+      await withMinDelay(saveSettings(form));
       toast('success', '配置已保存');
     } catch {
       /* toast 已发出 */
@@ -111,10 +155,12 @@ export default function ApiService() {
   const start = async () => {
     setStarting(true);
     try {
-      const s = await api.apiServer.start();
+      // 启动前自动保存当前勾选的账号池，避免用户忘记点"保存"
+      await api.apiServer.poolSet([...enabledUids]);
+      const s = await withMinDelay(api.apiServer.start());
       setStatus(s);
       useAppStore.setState({ apiStatus: s });
-      toast('success', `API 服务已启动（端口 ${s.port}）`);
+      toast('success', `API 服务已启动（端口 ${s.port}，池内 ${enabledUids.size} 个账号）`);
       void refreshStatus();
     } catch (err) {
       toast('error', `启动失败：${String(err)}`);
@@ -126,7 +172,7 @@ export default function ApiService() {
   const stop = async () => {
     setStopping(true);
     try {
-      await api.apiServer.stop();
+      await withMinDelay(api.apiServer.stop());
       toast('info', 'API 服务已停止');
       setStatus(null);
       setPoolStatus([]);
@@ -148,14 +194,138 @@ export default function ApiService() {
   };
 
   const savePool = async () => {
+    setSavingPool(true);
     try {
-      await api.apiServer.poolSet([...enabledUids]);
+      await withMinDelay(api.apiServer.poolSet([...enabledUids]));
       toast('success', '账号池已更新');
       if (status?.running) {
         toast('info', '需重启 API 服务以应用变更');
       }
     } catch (err) {
       toast('error', `保存账号池失败：${String(err)}`);
+    } finally {
+      setSavingPool(false);
+    }
+  };
+
+  const clearAllCooldowns = async () => {
+    setClearingCooldowns(true);
+    try {
+      const cleared = await withMinDelay(api.accounts.cooldownClearAll());
+      if (cleared > 0) {
+        toast('success', `已清除 ${cleared} 个账号的冷却状态`);
+        void refreshStatus();
+      } else {
+        toast('info', '当前无冷却中的账号');
+      }
+    } catch (err) {
+      toast('error', `清除冷却失败：${String(err)}`);
+    } finally {
+      setClearingCooldowns(false);
+    }
+  };
+
+  const copyConfigExample = async () => {
+    setCopying(true);
+    const port = form?.api_port ?? 7864;
+    const apiKey = form?.api_key ?? '';
+    const maskedKey = apiKey ? maskApiKey(apiKey) : '';
+    const model = form?.api_default_model ?? 'glm-5.2';
+    const example = `# 客户端配置示例（OpenAI 兼容格式）
+接口地址: http://127.0.0.1:${port}/v1
+API Key:  ${maskedKey || '（留空则不鉴权）'}
+模型 ID:  ${model}
+
+# cURL 测试（请将 API Key 替换为完整值）
+curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ${maskedKey || 'your-api-key'}" \\
+  -d '{
+    "model": "${model}",
+    "messages": [{"role": "user", "content": "你好"}],
+    "stream": true
+  }'`;
+    try {
+      await withMinDelay(navigator.clipboard.writeText(example));
+      toast('success', '配置示例已复制到剪贴板');
+    } catch {
+      toast('error', '复制失败');
+    } finally {
+      setCopying(false);
+    }
+  };
+
+  const loadApiLogDates = async () => {
+    setRefreshingLogs(true);
+    try {
+      const dates = await withMinDelay(api.apiServer.logsList());
+      setApiLogDates(dates);
+      if (dates.length > 0 && !apiLogSelected) {
+        setApiLogSelected(dates[0]);
+        void loadApiLogDetail(dates[0]);
+      }
+    } catch {
+      /* ignore */
+    } finally {
+      setRefreshingLogs(false);
+    }
+  };
+
+  const loadApiLogDetail = async (date: string) => {
+    setApiLogLoading(true);
+    setApiLogSelected(date);
+    // 切换日期时重置过滤状态
+    setIsFiltered(false);
+    setSearchKeyword('');
+    setSearchStart('');
+    setSearchEnd('');
+    try {
+      const content = await withMinDelay(api.apiServer.logsDetail(date));
+      setApiLogContent(content);
+    } catch {
+      setApiLogContent(null);
+    } finally {
+      setApiLogLoading(false);
+    }
+  };
+
+  const searchLogs = async () => {
+    if (!apiLogSelected) return;
+    setSearching(true);
+    setIsFiltered(true);
+    try {
+      const content = await withMinDelay(api.apiServer.logsSearch({
+        date: apiLogSelected,
+        startTime: searchStart.trim() || undefined,
+        endTime: searchEnd.trim() || undefined,
+        keyword: searchKeyword.trim() || undefined,
+      }));
+      setApiLogContent(content);
+    } catch {
+      setApiLogContent(null);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const resetSearch = async () => {
+    setSearchKeyword('');
+    setSearchStart('');
+    setSearchEnd('');
+    setIsFiltered(false);
+    await loadApiLogDetail(apiLogSelected);
+  };
+
+  const toggleDebug = async () => {
+    setTogglingDebug(true);
+    try {
+      const newVal = await withMinDelay(api.apiServer.debugToggle());
+      setDebugEnabled(newVal);
+      toast(newVal ? 'success' : 'info', `Debug 模式已${newVal ? '开启' : '关闭'}`);
+    } catch (err) {
+      toast('error', `切换 Debug 失败：${String(err)}`);
+    } finally {
+      setTogglingDebug(false);
     }
   };
 
@@ -252,14 +422,24 @@ export default function ApiService() {
               <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
                 API Key（留空则不鉴权）
               </label>
-              <input
-                type="password"
-                className="input"
-                placeholder="sk-..."
-                value={form?.api_key ?? ''}
-                onChange={(e) => update('api_key', e.target.value)}
-                disabled={running}
-              />
+              <div className="relative">
+                <input
+                  type={showApiKey ? 'text' : 'password'}
+                  className="input pr-10"
+                  placeholder="sk-..."
+                  value={form?.api_key ?? ''}
+                  onChange={(e) => update('api_key', e.target.value)}
+                  disabled={running}
+                />
+                <button
+                  type="button"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300"
+                  onClick={() => setShowApiKey((v) => !v)}
+                  tabIndex={-1}
+                >
+                  {showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
               <p className="mt-1 text-xs text-slate-400">
                 客户端请求需携带 Authorization: Bearer &lt;key&gt;
               </p>
@@ -284,19 +464,45 @@ export default function ApiService() {
             </div>
 
             <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
-              <p className="mb-1 font-medium">使用方式：</p>
-              <code className="block break-all text-[11px]">
-                POST http://127.0.0.1:{form?.api_port ?? 7864}/v1/chat/completions
-              </code>
-              <code className="mt-1 block break-all text-[11px]">
-                GET http://127.0.0.1:{form?.api_port ?? 7864}/v1/models
-              </code>
-              <code className="mt-1 block break-all text-[11px]">
-                GET http://127.0.0.1:{form?.api_port ?? 7864}/health
-              </code>
-              <code className="mt-1 block break-all text-[11px]">
-                GET http://127.0.0.1:{form?.api_port ?? 7864}/status
-              </code>
+              <div className="mb-2 flex items-center justify-between">
+                <p className="font-medium">使用方式 & 配置示例</p>
+                <button
+                  className="btn-ghost flex items-center gap-1 !p-1 text-xs"
+                  onClick={copyConfigExample}
+                  disabled={copying}
+                  title="复制完整配置示例"
+                >
+                  <Copy size={12} className={copying ? 'animate-pulse' : ''} />
+                  {copying ? '复制中…' : '复制示例'}
+                </button>
+              </div>
+              <div className="space-y-1.5">
+                <div>
+                  <span className="text-slate-400">接口地址：</span>
+                  <code className="break-all text-[11px]">
+                    http://127.0.0.1:{form?.api_port ?? 7864}/v1
+                  </code>
+                </div>
+                <div>
+                  <span className="text-slate-400">API Key：</span>
+                  <code className="text-[11px]">
+                    {form?.api_key ? maskApiKey(form.api_key) : '（留空则不鉴权）'}
+                  </code>
+                </div>
+                <div>
+                  <span className="text-slate-400">模型 ID：</span>
+                  <code className="text-[11px]">{form?.api_default_model ?? 'glm-5.2'}</code>
+                </div>
+                <div className="pt-1">
+                  <span className="text-slate-400">其他端点：</span>
+                </div>
+                <code className="block break-all text-[11px]">
+                  GET http://127.0.0.1:{form?.api_port ?? 7864}/v1/models
+                </code>
+                <code className="block break-all text-[11px]">
+                  GET http://127.0.0.1:{form?.api_port ?? 7864}/health
+                </code>
+              </div>
             </div>
 
             <button
@@ -322,9 +528,10 @@ export default function ApiService() {
             <button
               className="btn-ghost flex items-center gap-1 text-xs"
               onClick={() => void loadPool()}
+              disabled={refreshingPool}
             >
-              <RefreshCw size={13} />
-              刷新
+              <RefreshCw size={13} className={refreshingPool ? 'animate-spin' : ''} />
+              {refreshingPool ? '刷新中…' : '刷新'}
             </button>
           </div>
 
@@ -400,9 +607,10 @@ export default function ApiService() {
               <button
                 className="btn-secondary mt-3 flex w-full items-center justify-center gap-2"
                 onClick={savePool}
+                disabled={savingPool}
               >
                 <Save size={15} />
-                保存账号池
+                {savingPool ? '保存中…' : '保存账号池'}
               </button>
             </>
           )}
@@ -412,11 +620,22 @@ export default function ApiService() {
       {/* 运行中池状态详情 */}
       {running && poolStatus.length > 0 && (
         <div className="mt-5 card p-5">
-          <div className="mb-3 flex items-center gap-2">
-            <CheckCircle2 size={18} className="text-emerald-500" />
-            <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">
-              池实时状态
-            </h2>
+          <div className="mb-3 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 size={18} className="text-emerald-500" />
+              <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">
+                池实时状态
+              </h2>
+            </div>
+            <button
+              className="btn-ghost flex items-center gap-1 text-xs"
+              onClick={clearAllCooldowns}
+              disabled={clearingCooldowns}
+              title="清除所有账号的冷却状态"
+            >
+              <Eraser size={13} className={clearingCooldowns ? 'animate-pulse' : ''} />
+              {clearingCooldowns ? '清除中…' : '清除冷却'}
+            </button>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -463,6 +682,130 @@ export default function ApiService() {
           </div>
         </div>
       )}
+
+      {/* API 请求日志 */}
+      <div className="mt-5 card p-5">
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <FileText size={18} className="text-brand-500" />
+            <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">
+              API 请求日志
+            </h2>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              className={`flex items-center gap-1 text-xs transition ${
+                debugEnabled
+                  ? 'text-amber-600 dark:text-amber-400'
+                  : 'text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300'
+              } ${!running || togglingDebug ? 'cursor-not-allowed opacity-50' : ''}`}
+              onClick={() => void toggleDebug()}
+              disabled={!running || togglingDebug}
+              title={running ? '开启后记录完整请求/响应信息' : '需先启动 API 服务'}
+            >
+              <Bug size={13} className={togglingDebug ? 'animate-pulse' : ''} />
+              {togglingDebug ? '切换中…' : `Debug ${debugEnabled ? 'ON' : 'OFF'}`}
+            </button>
+            <button
+              className="btn-ghost flex items-center gap-1 text-xs"
+              onClick={() => void loadApiLogDates()}
+              disabled={refreshingLogs}
+            >
+              <RefreshCw size={13} className={refreshingLogs ? 'animate-spin' : ''} />
+              {refreshingLogs ? '刷新中…' : '刷新'}
+            </button>
+          </div>
+        </div>
+
+        {apiLogDates.length === 0 ? (
+          <p className="py-8 text-center text-sm text-slate-400">暂无日志</p>
+        ) : (
+          <>
+            <div className="mb-3 flex flex-wrap gap-1">
+              {apiLogDates.map((d) => (
+                <button
+                  key={d}
+                  className={`rounded-md px-2.5 py-1 text-xs transition ${
+                    apiLogSelected === d
+                      ? 'bg-brand-500 text-white'
+                      : 'bg-slate-100 text-slate-500 hover:bg-slate-200 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
+                  }`}
+                  onClick={() => void loadApiLogDetail(d)}
+                >
+                  {d}
+                </button>
+              ))}
+            </div>
+
+            {/* 搜索栏 */}
+            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg bg-slate-50 p-2.5 dark:bg-zinc-800/50">
+              <div className="flex items-center gap-1">
+                <input
+                  type="time"
+                  value={searchStart}
+                  onChange={(e) => setSearchStart(e.target.value)}
+                  className="input h-8 w-28 py-0 text-xs"
+                  placeholder="开始"
+                />
+                <span className="text-xs text-slate-400">→</span>
+                <input
+                  type="time"
+                  value={searchEnd}
+                  onChange={(e) => setSearchEnd(e.target.value)}
+                  className="input h-8 w-28 py-0 text-xs"
+                  placeholder="结束"
+                />
+              </div>
+              <div className="relative flex-1 min-w-[140px]">
+                <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  value={searchKeyword}
+                  onChange={(e) => setSearchKeyword(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void searchLogs(); }}
+                  className="input h-8 w-full py-0 pl-7 pr-3 text-xs"
+                  placeholder="关键字搜索（不区分大小写）"
+                />
+              </div>
+              <button
+                className="btn-primary h-8 px-3 py-0 text-xs"
+                onClick={() => void searchLogs()}
+                disabled={searching || !apiLogSelected}
+              >
+                <Search size={12} />
+                {searching ? '搜索中…' : '搜索'}
+              </button>
+              {isFiltered && (
+                <button
+                  className="btn-outline h-8 px-3 py-0 text-xs"
+                  onClick={() => void resetSearch()}
+                  disabled={searching}
+                >
+                  <X size={12} />
+                  清除
+                </button>
+              )}
+              {isFiltered && (
+                <span className="rounded bg-amber-100 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+                  已过滤
+                </span>
+              )}
+            </div>
+
+            <div className="max-h-96 overflow-auto rounded-lg bg-slate-50 p-3 dark:bg-zinc-900/50">
+              {apiLogLoading || searching ? (
+                <p className="py-4 text-center text-sm text-slate-400">{searching ? '搜索中…' : '加载中…'}</p>
+              ) : apiLogContent ? (
+                <pre className="whitespace-pre-wrap break-all text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+                  {apiLogContent}
+                </pre>
+              ) : (
+                <p className="py-4 text-center text-sm text-slate-400">无内容</p>
+              )}
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }

@@ -26,7 +26,7 @@ fn short_agent() -> ureq::Agent {
 #[allow(dead_code)]
 fn streaming_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout_read(std::time::Duration::from_secs(0)) // 无读超时
+        // 不设置 timeout_read（Duration::from_secs(0) 会触发 std 错误）
         .max_idle_connections(20)
         .max_idle_connections_per_host(20)
         .build()
@@ -240,7 +240,7 @@ pub fn group_move(
 /// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
 /// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），求和后四舍五入保留2位小数。
 /// 同时返回最近过期的 expire_time（Unix 秒），用于积分过期感知调度。
-/// 同时返回今日非签到获得的积分（start_time 在今日本地时间内且 package_source_type != 9）。
+/// 同时返回今日购买获得积分（start_time 在今日本地时间内且 charge_amount > 0）。
 fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> {
     let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
         jwt.to_string()
@@ -266,14 +266,19 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
     let mut total: f64 = 0.0;
     let mut earliest_expire: Option<i64> = None;
     let mut today_non_checkin_earned: f64 = 0.0;
-    let now_ts = chrono::Local::now().timestamp();
 
-    // 今日本地时间范围 [00:00:00, 23:59:59]
-    let today_start = chrono::Local::now()
+    // 使用固定 UTC+8 偏移，不依赖 chrono::Local（某些 Windows 环境下可能误判时区）
+    let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let now_ts = chrono::Utc::now().timestamp();
+
+    // 今日北京时间范围 [00:00:00 +08:00, 23:59:59 +08:00]
+    // start_time 来自 API 是 UTC Unix 时间戳，比较时需要按北京时间判定日期
+    let today_start = chrono::Utc::now()
+        .with_timezone(&cst)
         .date_naive()
         .and_hms_opt(0, 0, 0)
         .unwrap()
-        .and_local_timezone(chrono::Local)
+        .and_local_timezone(cst)
         .unwrap()
         .timestamp();
     let today_end = today_start + 86400;
@@ -304,20 +309,22 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
                 }
             }
 
-            // 今日非签到获得的积分：
-            // start_time 在今日本地时间范围内，且 package_source_type != 9（非签到）
+            // 今日购买获得的积分：
+            // start_time 在今日北京时间范围内，且 charge_amount > 0（实际付费购买）
+            // 签到获得的 pack charge_amount=0，不会误判为购买积分
             let start_time = pack
                 .get("entitlement_base_info")
                 .and_then(|e| e.get("start_time"))
                 .and_then(|v| v.as_i64());
-            let source_type = pack
+            let charge_amount = pack
                 .get("entitlement_base_info")
-                .and_then(|e| e.get("product_extra"))
-                .and_then(|pe| pe.get("package_extra"))
-                .and_then(|pk| pk.get("package_source_type"))
-                .and_then(|v| v.as_i64());
-            if let (Some(st), Some(srt)) = (start_time, source_type) {
-                if st >= today_start && st < today_end && srt != 9 {
+                .and_then(|e| e.get("charge_amount"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            // charge_amount > 0 表示付费购买（如会员连续包月），签到 pack charge_amount=0
+            let is_purchased = charge_amount > 0;
+            if let Some(st) = start_time {
+                if st >= today_start && st < today_end && is_purchased {
                     today_non_checkin_earned += limit;
                 }
             }
@@ -423,7 +430,7 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
 
 /// 记录每日积分快照（每天计算一次）：
 /// - total = 所有账号剩余积分之和
-/// - earned = 签到获得积分（credits_history.json delta 之和）+ 非签到获得积分（API 查询）
+/// - earned = 签到获得积分（credits_history.json delta 之和）+ 购买获得积分（API 查询 charge_amount > 0）
 /// - consumed = |total - earned - 昨日total|（取绝对值）
 fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non_checkin_earned: f64) {
     let today = fs_utils::today_prefix(); // "YYYY-MM-DD"
@@ -431,13 +438,6 @@ fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non
     let total = (total * 100.0).round() / 100.0;
 
     let mut file: CreditsDailyFile = fs_utils::read_json(&state.path("credits_daily.json"));
-
-    // 如果今天已有快照，更新 total 但不重复计算 earned/consumed
-    if let Some(existing) = file.snapshots.iter_mut().find(|s| s.date == today) {
-        existing.total = total;
-        let _ = fs_utils::write_json(&state.path("credits_daily.json"), &file);
-        return;
-    }
 
     // earned = 签到获得积分（从 credits_history.json 汇总 delta）+ 非签到获得积分（API 查询）
     let credits_file: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
@@ -449,19 +449,32 @@ fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non
         .sum();
     let earned = ((checkin_earned + non_checkin_earned) * 100.0).round() / 100.0;
 
-    // 昨日积分总数
-    let yesterday_total = file.snapshots.last().map(|s| s.total).unwrap_or(0.0);
+    // 昨日积分总数：取 today 之前最近一条快照
+    let yesterday_total = file
+        .snapshots
+        .iter()
+        .filter(|s| s.date < today)
+        .last()
+        .map(|s| s.total)
+        .unwrap_or(0.0);
 
     // consumed = |total - earned - yesterday_total|
     let consumed = (total - earned - yesterday_total).abs();
     let consumed = (consumed * 100.0).round() / 100.0;
 
-    file.snapshots.push(CreditsDailySnapshot {
-        date: today,
-        total,
-        earned,
-        consumed,
-    });
+    // 如果今天已有快照，更新全部字段（非首次记录也需刷新 earned/consumed）
+    if let Some(existing) = file.snapshots.iter_mut().find(|s| s.date == today) {
+        existing.total = total;
+        existing.earned = earned;
+        existing.consumed = consumed;
+    } else {
+        file.snapshots.push(CreditsDailySnapshot {
+            date: today,
+            total,
+            earned,
+            consumed,
+        });
+    }
 
     // 保留 90 天
     let cutoff = {
@@ -490,6 +503,35 @@ pub fn cooldown_clear(state: State<AppState>, user_id: String) -> Result<(), Str
         fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
     }
     Ok(())
+}
+
+/// 一键清除所有账号的冷却状态（用于所有账号被冷却导致 503 的场景）
+/// 同时清除 JSON 文件中的持久化冷却记录和运行中 API 池的内存冷却状态
+#[tauri::command]
+pub fn cooldown_clear_all(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<usize, String> {
+    let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let file_count = cd.cooldowns.len();
+    if file_count > 0 {
+        cd.cooldowns.clear();
+        cd.updated_at = Some(fs_utils::now_iso());
+        fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
+    }
+
+    // 同时清除运行中 API 池的内存冷却状态
+    let mem_count = {
+        let guard = runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(rt) => rt.shared.pool.clear_cooldowns(),
+            None => 0,
+        }
+    };
+
+    Ok(file_count.max(mem_count))
 }
 
 /// 使用 refresh_token 刷新 JWT（ExchangeToken）

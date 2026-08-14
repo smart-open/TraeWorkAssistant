@@ -38,6 +38,8 @@ import hashlib
 import datetime
 import http.client
 import sqlite3
+import gzip
+import zlib
 
 # ---------------- 配置 ----------------
 LISTEN_HOST = "127.0.0.1"
@@ -45,12 +47,14 @@ LISTEN_PORT = int(os.environ.get("PROXY_PORT", "8899"))
 BASE = os.path.dirname(os.path.abspath(__file__))
 # 数据目录：优先 TRAEDATA_DIR（由桌面端注入），否则回退到脚本目录（保持独立可用性）
 DATA_DIR = os.environ.get("TRAEDATA_DIR", BASE)
-MAP_FILE = os.path.join(DATA_DIR, "device_map.json")
+CONF_DIR = os.path.join(DATA_DIR, "conf")
+DATA_SUBDIR = os.path.join(DATA_DIR, "data")
+MAP_FILE = os.path.join(DATA_SUBDIR, "device_map.json")
 LOG_FILE = os.path.join(DATA_DIR, "logs", "proxy.log")
 
 PROXY_LOG_DIR = os.environ.get("PROXY_LOG_PATH", "")
 if not PROXY_LOG_DIR:
-    PROXY_LOG_DIR = os.path.join(DATA_DIR, "proxy-logs")
+    PROXY_LOG_DIR = os.path.join(DATA_DIR, "logs")
 
 def extract_sse_summary(resp_headers, resp_body):
     """从 SSE 流式响应中提取摘要信息（模型、token 用量等）。
@@ -111,8 +115,47 @@ def extract_sse_summary(resp_headers, resp_body):
     return summary if summary else None
 
 
+def decompress_body(body, resp_headers):
+    """根据 Content-Encoding 头解压响应体，用于日志展示。
+    返回解压后的 bytes；如解压失败则返回原始 body。"""
+    if not body or not resp_headers:
+        return body
+    # resp_headers 可能是 list of tuples 或 dict
+    encoding = None
+    if isinstance(resp_headers, dict):
+        encoding = resp_headers.get("Content-Encoding") or resp_headers.get("content-encoding")
+    else:
+        for k, v in resp_headers:
+            if k.lower() == "content-encoding":
+                encoding = v
+                break
+    if not encoding:
+        return body
+    encoding = encoding.lower().strip()
+    try:
+        if encoding == "gzip":
+            return gzip.decompress(body)
+        elif encoding == "deflate":
+            # raw deflate 或 zlib-wrapped deflate
+            try:
+                return zlib.decompress(body)
+            except zlib.error:
+                return zlib.decompress(body, -zlib.MAX_WBITS)
+        elif encoding == "br":
+            # brotli：尝试导入 brotli 库，不可用时跳过
+            try:
+                import brotli
+                return brotli.decompress(body)
+            except ImportError:
+                return body  # 无法解压，返回原始字节
+    except Exception:
+        pass
+    return body
+
+
 class ProxyRequestLogger:
-    """将代理抓取到的完整请求/响应记录到明文文件，按 100MB 滚动存储。"""
+    """将代理抓取到的完整请求/响应记录到明文文件，按 100MB 滚动存储。
+    文件存放在 logs/ 目录下，文件名前缀 proxy_req_ 以区分 proxy.log 操作日志。"""
     def __init__(self, log_dir, max_size_mb=100):
         self.log_dir = log_dir
         self.max_size = max_size_mb * 1024 * 1024
@@ -127,7 +170,7 @@ class ProxyRequestLogger:
         if self._fd:
             self._fd.close()
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = os.path.join(self.log_dir, f"proxy-requests-{ts}.log")
+        path = os.path.join(self.log_dir, f"proxy_req_{ts}.log")
         self._fd = open(path, "a", encoding="utf-8")
         self._file_size = os.path.getsize(path) if os.path.exists(path) else 0
 
@@ -151,8 +194,10 @@ class ProxyRequestLogger:
                 for k, v in resp_headers:
                     lines.append(f"  {k}: {v}")
             if resp_body:
-                body_preview = resp_body[:8192].decode("utf-8", "replace") if isinstance(resp_body, bytes) else str(resp_body)[:8192]
-                lines.append(f"--- Response Body ({len(resp_body)} bytes) ---")
+                # 先解压再展示，避免 gzip/deflate/br 压缩导致的乱码
+                decompressed = decompress_body(resp_body, resp_headers)
+                body_preview = decompressed[:8192].decode("utf-8", "replace") if isinstance(decompressed, bytes) else str(decompressed)[:8192]
+                lines.append(f"--- Response Body ({len(resp_body)} bytes, decompressed {len(decompressed)} bytes) ---")
                 lines.append(body_preview)
             # SSE 流摘要：对 llm_utils_chat 请求解析 SSE 事件
             sse_summary = extract_sse_summary(resp_headers, resp_body)
@@ -193,10 +238,10 @@ def get_proxy_logger():
             log(f"代理请求日志初始化失败: {e}")
     return _proxy_logger
 
-CA_DIR = os.path.join(DATA_DIR, "certs")
+CA_DIR = os.path.join(DATA_SUBDIR, "certs")
 SIGNIN_PATH = "/trae/api/v2/ug/checkin_credits/claim"
 STATUS_PATH = "/trae/api/v2/ug/checkin_credits/status"
-ACCOUNTS_FILE = os.path.join(DATA_DIR, "checkin_accounts.json")
+ACCOUNTS_FILE = os.path.join(DATA_SUBDIR, "checkin_accounts.json")
 # 默认开启自动捕获 JWT 写回 checkin_accounts.json；设 AUTO_CAPTURE_JWT=0 关闭
 AUTO_CAPTURE_JWT = os.environ.get("AUTO_CAPTURE_JWT", "1") not in ("0", "false", "False", "")
 
@@ -624,7 +669,7 @@ def _find_cloud_ide_jwt(blob):
     if not blob:
         return None
     if isinstance(blob, bytes):
-        blob = blob.decode("latin1", "replace")
+        blob = blob.decode("utf-8", "replace")
     m = re.search(r"Cloud-IDE-JWT\s+([A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)", blob)
     if m:
         return _valid_cloud_ide_jwt(m.group(1))
@@ -700,7 +745,7 @@ def capture_from_local():
             except Exception:
                 continue
             for m in re.finditer(rb"Cloud-IDE-JWT [A-Za-z0-9_\-\.=]+", data):
-                hit = m.group(0).decode("latin1")
+                hit = m.group(0).decode("utf-8", "replace")
                 uid = extract_user_id(hit)
                 if uid:
                     r = update_account_jwt(uid, hit)
@@ -712,6 +757,7 @@ def capture_from_local():
 # ---------------- CA / 叶子证书 ----------------
 _ca_cert = _ca_key = None
 _leaf_cache = {}
+_LEAF_CACHE_MAX = 50  # 最多缓存 50 个域名的叶子证书，防止内存无限增长
 
 def ensure_ca():
     global _ca_cert, _ca_key
@@ -764,7 +810,10 @@ def ensure_ca():
 
 def leaf_cert(host):
     if host in _leaf_cache:
-        return _leaf_cache[host]
+        # LRU: 移到末尾（Python 3.7+ dict 保持插入顺序，删除再插入即为 LRU 更新）
+        val = _leaf_cache.pop(host)
+        _leaf_cache[host] = val
+        return val
     from cryptography import x509
     from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
@@ -788,12 +837,21 @@ def leaf_cert(host):
         f.write(cert.public_bytes(serialization.Encoding.PEM))
     with open(kpath, "wb") as f:
         f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+    # LRU 驱逐：超过上限时删除最旧的条目
+    if len(_leaf_cache) >= _LEAF_CACHE_MAX:
+        oldest = next(iter(_leaf_cache))
+        del _leaf_cache[oldest]
+        log(f"  [leaf_cert] LRU 驱逐: {oldest}")
     _leaf_cache[host] = (cpath, kpath)
     return cpath, kpath
 
 # ---------------- HTTP 请求/响应读写 ----------------
-def recv_until(sock, terminator, buf=b""):
+def recv_until(sock, terminator, buf=b"", max_size=10 * 1024 * 1024):
+    """读取直到遇到 terminator，限制最大 10MB 防止 OOM"""
     while terminator not in buf:
+        if len(buf) > max_size:
+            log(f"  [recv_until] 缓冲区超限 ({len(buf)} > {max_size})，截断")
+            return None
         chunk = sock.recv(4096)
         if not chunk:
             return None
@@ -806,7 +864,7 @@ def read_http_request(sock):
         return None
     header_blob, _, rest = buf.partition(b"\r\n\r\n")
     lines = header_blob.split(b"\r\n")
-    first = lines[0].decode("latin1")
+    first = lines[0].decode("utf-8", "replace")
     parts = first.split(" ")
     method = parts[0]
     path = parts[1] if len(parts) > 1 else "/"
@@ -815,7 +873,7 @@ def read_http_request(sock):
     for line in lines[1:]:
         if b":" in line:
             k, _, v = line.partition(b":")
-            headers[k.decode("latin1").strip().lower()] = v.decode("latin1").strip()
+            headers[k.decode("utf-8", "replace").strip().lower()] = v.decode("utf-8", "replace").strip()
     cl = int(headers.get("content-length", 0) or 0)
     body = rest
     while len(body) < cl:
@@ -835,9 +893,9 @@ def send_response(sock, status, reason, headers, body):
         out[k] = v
     out["Content-Length"] = str(len(body))
     out["Connection"] = "keep-alive"
-    head = [f"HTTP/1.1 {status} {reason}".encode("latin1")]
+    head = [f"HTTP/1.1 {status} {reason}".encode("utf-8")]
     for k, v in out.items():
-        head.append(f"{k}: {v}".encode("latin1"))
+        head.append(f"{k}: {v}".encode("utf-8"))
     sock.sendall(b"\r\n".join(head) + b"\r\n\r\n" + body)
 
 HOP_BY_HOP = {"proxy-connection", "connection", "keep-alive", "proxy-authorization", "host", "content-length"}
@@ -863,7 +921,7 @@ def forward_websocket(host, port, method, path, headers, body, client_tls):
             for k, v in headers.items():
                 if k.lower() not in HOP_BY_HOP:
                     req_lines.append(f"{k}: {v}")
-            req_data = "\r\n".join(req_lines).encode("latin1") + b"\r\n\r\n"
+            req_data = "\r\n".join(req_lines).encode("utf-8") + b"\r\n\r\n"
             if body:
                 req_data += body
             log(f"  {ws_tag} 发送升级请求: {method} {path} ({len(req_data)} bytes)")
@@ -884,7 +942,7 @@ def forward_websocket(host, port, method, path, headers, body, client_tls):
                 return
 
             # 4. 转发响应给客户端
-            first_line = resp_buf.split(b"\r\n", 1)[0].decode("latin1", "replace")
+            first_line = resp_buf.split(b"\r\n", 1)[0].decode("utf-8", "replace")
             log(f"  {ws_tag} 收到上游响应: {first_line} ({len(resp_buf)} bytes)")
             # 检查是否有额外的响应体数据（在 \r\n\r\n 之后的部分）
             header_end = resp_buf.find(b"\r\n\r\n")
@@ -951,7 +1009,10 @@ def forward_websocket(host, port, method, path, headers, body, client_tls):
 def forward_upstream(host, port, method, path, headers, body, client_sock):
     log(f"  [forward] -> {method} https://{host}:{port}{path} ({len(body) if body else 0} bytes body)")
     ctx = ssl.create_default_context()
-    conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=30)
+    # 检测是否为流式请求（SSE）：流式请求使用更长超时
+    is_stream = "llm_utils_chat" in path or "event-stream" in headers.get("accept", "")
+    timeout = 300 if is_stream else 30
+    conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=timeout)
     fwd = {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
     try:
         body_arg = body if method.upper() != "GET" else None
@@ -959,7 +1020,10 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
         resp = conn.getresponse()
         resp_body = resp.read()
         log(f"  [forward] <- {resp.status} {resp.reason} ({len(resp_body)} bytes) from {host}{path}")
-        send_response(client_sock, resp.status, resp.reason, dict(resp.getheaders()), resp_body)
+        # 检测上游是否要求关闭连接
+        resp_headers = dict(resp.getheaders())
+        upstream_conn = resp_headers.get("connection", "").lower()
+        send_response(client_sock, resp.status, resp.reason, resp_headers, resp_body)
         # 捕获 ExchangeToken 响应中的 refresh_token
         if "ExchangeToken" in path or "oauth" in path.lower():
             try_capture_refresh_token_from_response(host, path, resp_body)
@@ -967,9 +1031,18 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
         pl = get_proxy_logger()
         if pl:
             pl.log_request(method, host, path, headers, body, resp.status, resp.reason, resp.getheaders(), resp_body)
+        # 如果上游要求关闭连接，返回 False 通知调用方退出 keep-alive 循环
+        if upstream_conn == "close":
+            return False
+        return True
+    except socket.timeout:
+        log(f"  [forward] 超时 (timeout={timeout}s): {host}{path}")
+        send_response(client_sock, 504, "Gateway Timeout", {}, b"Gateway Timeout")
+        return False
     except Exception as e:
         log(f"  [forward] 错误: {type(e).__name__}: {e} (host={host}, path={path})")
         send_response(client_sock, 502, "Bad Gateway", {}, b"Bad Gateway")
+        return False
     finally:
         conn.close()
 
@@ -1048,7 +1121,9 @@ def tunnel_https(tls, host, port):
             log(f"  [WebSocket] 检测到升级请求: {method} {host}:{port}{path} (Connection={headers.get('connection','?')})")
             forward_websocket(host, port, method, path, headers, body, tls)
             break  # WS 连接已接管，退出 tunnel_https 循环
-        forward_upstream(host, port, method, path, headers, body, tls)
+        keep_alive = forward_upstream(host, port, method, path, headers, body, tls)
+        if keep_alive is False:
+            break  # 上游要求关闭连接或出错，退出 keep-alive 循环
 
 # ---------------- 透明隧道（非 TRAE 域，不解密直接放行，静默无日志） ----------------
 def tunnel_raw(client_sock, host, port):
@@ -1098,7 +1173,7 @@ def tunnel_raw(client_sock, host, port):
 def handle_plain(conn, buf):
     header_blob, _, rest = buf.partition(b"\r\n\r\n")
     lines = header_blob.split(b"\r\n")
-    first = lines[0].decode("latin1")
+    first = lines[0].decode("utf-8", "replace")
     parts = first.split(" ")
     method = parts[0]
     target = parts[1]
@@ -1114,7 +1189,7 @@ def handle_plain(conn, buf):
     for line in lines[1:]:
         if b":" in line:
             k, _, v = line.partition(b":")
-            headers[k.decode("latin1").strip().lower()] = v.decode("latin1").strip()
+            headers[k.decode("utf-8", "replace").strip().lower()] = v.decode("utf-8", "replace").strip()
     cl = int(headers.get("content-length", 0) or 0)
     body = rest
     while len(body) < cl:
@@ -1156,7 +1231,7 @@ def handle_client(conn, addr):
             if not more:
                 break
             buf += more
-        head = buf.split(b"\r\n", 1)[0].decode("latin1")
+        head = buf.split(b"\r\n", 1)[0].decode("utf-8", "replace")
         method = head.split(" ")[0]
         if method == "CONNECT":
             target = head.split(" ")[1]

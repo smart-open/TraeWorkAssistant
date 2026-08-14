@@ -58,8 +58,8 @@ pub fn trim_logs(data_dir: &Path, retention_days: u64) {
     let logs_dir = data_dir.join("logs");
     for name in ["proxy.log", "checkin.log", "switcher.log"] {
         let p = logs_dir.join(name);
-        let content = match fs::read_to_string(&p) {
-            Ok(c) => c,
+        let content = match fs::read(&p) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
             Err(_) => continue,
         };
         let mut kept: Vec<&str> = Vec::new();

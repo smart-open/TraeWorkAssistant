@@ -39,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 
 $Script:TraeDataDir = "$env:APPDATA\TRAE SOLO CN"
 $Script:AppDataDir = "$env:APPDATA\TraeWorkAssistant"
-$Script:ProfilesDir = "$Script:AppDataDir\profiles"
+$Script:ProfilesDir = "$Script:AppDataDir\data\profiles"
 $Script:LogFile = "$Script:AppDataDir\logs\switcher.log"
 $Script:_TraeExeCache = $null
 
@@ -60,7 +60,7 @@ function Find-TraeExe {
     } catch {}
 
     # 2. 从 app_settings.json 读取用户自定义路径
-    $settingsFile = Join-Path $Script:AppDataDir 'app_settings.json'
+    $settingsFile = Join-Path $Script:AppDataDir 'conf\app_settings.json'
     if (Test-Path $settingsFile) {
         try {
             $settings = Get-Content $settingsFile -Raw | ConvertFrom-Json
@@ -171,7 +171,7 @@ function Write-Step {
     }
     try {
         if (-not (Test-Path (Split-Path $Script:LogFile))) { New-Item -ItemType Directory -Path (Split-Path $Script:LogFile) -Force | Out-Null }
-        Add-Content -Path $Script:LogFile -Value "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] [$Stage] $Message"
+        Add-Content -Path $Script:LogFile -Value "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] [$Stage] $Message" -Encoding UTF8
     } catch {}
 }
 

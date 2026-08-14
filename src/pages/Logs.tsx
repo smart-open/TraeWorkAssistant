@@ -1,5 +1,5 @@
 ﻿import { useEffect, useState, useCallback, useRef } from 'react';
-import { RefreshCw, Search, Trash2, Download, Copy, ChevronLeft, ChevronRight, Eye } from 'lucide-react';
+import { RefreshCw, Search, Trash2, Download, Copy, ChevronLeft, ChevronRight, Eye, Eraser } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, Modal } from '../components/ui';
 import { useAppStore } from '../store';
@@ -85,6 +85,10 @@ function SystemLogsTab() {
     URL.revokeObjectURL(url);
   };
 
+  const clearProxyLog = () => {
+    useAppStore.setState({ proxyLog: [] });
+  };
+
   return (
     <div className="grid min-h-0 flex-1 gap-3 md:grid-cols-[1fr_2fr]">
       {/* 实时代理输出 */}
@@ -95,6 +99,9 @@ function SystemLogsTab() {
             <span className="text-xs text-slate-400">{proxyLog.length} 行</span>
             <button onClick={copyProxyLog} disabled={proxyLog.length === 0} className="btn-ghost !p-1" title="复制代理日志">
               <Copy size={13} />
+            </button>
+            <button onClick={clearProxyLog} disabled={proxyLog.length === 0} className="btn-ghost !p-1" title="清屏">
+              <Eraser size={13} />
             </button>
           </div>
         </div>

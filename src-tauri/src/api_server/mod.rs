@@ -1,3 +1,4 @@
+pub mod api_logger;
 pub mod auth;
 pub mod pool;
 pub mod payload;
@@ -8,16 +9,20 @@ pub mod sse;
 use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 
+pub use api_logger::ApiLogger;
 pub use pool::ApiPool;
 
-/// SOLO 上游常量（本项目协议实测）
-pub const AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
+/// SOLO 上游常量（本项目协议实测 + MITM 抓包对比）
+/// 真实 Trae 客户端使用 api5-normal.mchost.guru 作为实际请求主机
+/// trae-api-cn.mchost.guru 仅作为 referer 和页面域名
+pub const AGENT_HOST: &str = "https://api5-normal.mchost.guru";
 pub const EP_CHAT: &str = "/api/agent/v3/llm_utils_chat";
 pub const APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
-pub const IDE_VERSION: &str = "0.1.43";
-pub const IDE_VERSION_CODE: &str = "20260716";
+pub const IDE_VERSION: &str = "0.1.50";
+pub const IDE_VERSION_CODE: &str = "20260811";
 pub const FUNCTION: &str = "solo_work_lite";
 pub const DEFAULT_MODEL: &str = "glm-5.2";
+pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 
 /// API 服务器运行时共享状态（传入 axum State）
 pub struct ApiSharedState {
@@ -27,6 +32,9 @@ pub struct ApiSharedState {
     pub total_requests: AtomicU64,
     pub active_uid: Mutex<Option<String>>,
     pub last_error: Mutex<Option<String>>,
+    pub logger: ApiLogger,
+    /// Debug 模式：开启后记录完整请求/响应到 API 日志
+    pub debug_enabled: std::sync::atomic::AtomicBool,
 }
 
 /// 上游错误分类（与 Phase 1 冷却状态机对齐）
@@ -82,8 +90,18 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
 
 /// 按 SOLO 业务错误码 + message 判定错误类别（流内 error 事件）
 pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
-    if code == 1005 || msg.to_lowercase().contains("plan") {
+    let msg_lower = msg.to_lowercase();
+    // 1005: Plan 套餐额度用尽 → 12 小时冷却
+    if code == 1005 || msg_lower.contains("plan") {
         return ErrKind::PlanLimit;
+    }
+    // 4008: 请求频率超限（quota exceeded）→ 60 秒短冷却，避免误杀
+    if code == 4008
+        || msg_lower.contains("quota")
+        || msg_lower.contains("exceeded")
+        || msg_lower.contains("rate")
+    {
+        return ErrKind::SoftRate;
     }
     match code {
         401 => ErrKind::SessionDead,
@@ -95,10 +113,16 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     }
 }
 
-/// 流式上游 Agent：无总超时，用于 SSE 流式对话
+/// 流式上游 Agent：无总超时，仅 response_header_timeout 120s，用于 SSE 流式对话
+/// 注意：调用方（api_server_start）已设置 NO_PROXY=* 环境变量，
+/// 防止 ureq 走系统代理（127.0.0.1:8899）形成循环
 pub fn streaming_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout_read(std::time::Duration::from_secs(0))
+        // 不设置 timeout_read，ureq 默认无读超时（SSE 流式需要）
+        // 注意：timeout_read(Duration::from_secs(0)) 会触发 Rust std 的
+        // "cannot set a 0 duration timeout" 错误，不能使用
+        .timeout_write(std::time::Duration::from_secs(30)) // 写超时 30s
+        .timeout_connect(std::time::Duration::from_secs(10)) // 连接超时 10s
         .max_idle_connections(20)
         .max_idle_connections_per_host(20)
         .build()

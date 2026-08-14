@@ -170,7 +170,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     unsubs = [];
     unsubs = await setupListeners({
       onProxyLog: (line) =>
-        set((s) => ({ proxyLog: [line, ...s.proxyLog.slice(0, 199)] })),
+        set((s) => ({ proxyLog: [line, ...s.proxyLog.slice(0, 999)] })),
       onAccountCaptured: (uid) => {
         // 事件驱动累加捕获数（后端 Arc<AtomicI64> 的实时镜像，避免轮询）
         set((s) => ({ proxy: { ...s.proxy, captured: s.proxy.captured + 1 } }));

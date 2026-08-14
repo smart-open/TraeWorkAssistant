@@ -67,8 +67,8 @@ pub fn proxy_start(
     let settings = state.settings();
     let proxy_domains = settings.proxy_domains.clone();
     let proxy_log_path = settings.proxy_log_path.clone().unwrap_or_else(|| {
-        // 默认路径：%APPDATA%\TraeWorkAssistant\proxy-logs
-        state.data_dir.join("proxy-logs").to_string_lossy().to_string()
+        // 默认路径：%APPDATA%\TraeWorkAssistant\logs（代理请求日志直接存放在 logs/ 下）
+        state.logs_dir().to_string_lossy().to_string()
     });
     let mut cmd = Command::new(&state.python_exe);
     cmd.arg(&script_path)
@@ -278,6 +278,11 @@ pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     run_reg(key, "ProxyEnable", "REG_DWORD", "1")?;
     run_reg(key, "ProxyServer", "REG_SZ", addr)?;
+    // 关键：设置 ProxyOverride 让 localhost 绕过代理
+    // 这样即使代理开启，客户端仍能直连 127.0.0.1:7864（API 服务）
+    // 代理关闭后客户端也不会尝试通过 127.0.0.1:8899 连接 localhost
+    run_reg(key, "ProxyOverride", "REG_SZ", "127.0.0.1;localhost;<local>")?;
+    notify_wininet_changed();
     Ok(())
 }
 
@@ -285,7 +290,41 @@ pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
 pub(crate) fn clear_win_proxy() -> Result<(), String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     run_reg(key, "ProxyEnable", "REG_DWORD", "0")?;
+    notify_wininet_changed();
     Ok(())
+}
+
+/// 通知 WinINet 代理设置已变更，让运行中的进程立即生效
+/// 不调用此函数的话，已有进程会继续使用缓存的旧代理设置
+#[cfg(target_os = "windows")]
+fn notify_wininet_changed() {
+    #[link(name = "wininet")]
+    extern "system" {
+        fn InternetSetOptionW(
+            h_internet: *mut std::ffi::c_void,
+            option: u32,
+            buffer: *mut std::ffi::c_void,
+            buffer_length: u32,
+        ) -> i32;
+    }
+
+    const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
+    const INTERNET_OPTION_REFRESH: u32 = 37;
+
+    unsafe {
+        InternetSetOptionW(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_SETTINGS_CHANGED,
+            std::ptr::null_mut(),
+            0,
+        );
+        InternetSetOptionW(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_REFRESH,
+            std::ptr::null_mut(),
+            0,
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]

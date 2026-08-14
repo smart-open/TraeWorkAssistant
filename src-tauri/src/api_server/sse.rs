@@ -212,14 +212,16 @@ pub fn stream_convert<R: Read + Send>(
                 }
                 "error" => {
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
-                    let msg = format!(
-                        "solo error code={} msg={}",
-                        ev.error_code.unwrap_or(0),
-                        ev.error_message
-                    );
+                    let error_chunk = json!({
+                        "error": {
+                            "message": ev.error_message,
+                            "type": "api_error",
+                            "code": ev.error_code.unwrap_or(0),
+                        }
+                    });
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
-                        "event: error\ndata: {}\n\n",
-                        serde_json::to_string(&msg).unwrap_or_else(|_| msg.clone())
+                        "data: {}\n\n",
+                        error_chunk
                     ))));
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     saw_done = true;

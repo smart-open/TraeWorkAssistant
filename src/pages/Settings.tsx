@@ -1,9 +1,10 @@
 ﻿import { useEffect, useState } from 'react';
-import { Calendar, Power, Trash2, Save, Search, RotateCcw, Fingerprint } from 'lucide-react';
+import { Calendar, Power, Trash2, Save, Search, RotateCcw, Fingerprint, RefreshCw, Clock, AlertTriangle } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
-import { Badge } from '../components/ui';
+import { Badge, Modal } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
+import { withMinDelay } from '../lib/delay';
 import type { Settings as SettingsType } from '../types';
 
 export default function Settings() {
@@ -18,6 +19,12 @@ export default function Settings() {
   const [time, setTime] = useState('09:00');
   const [taskInfo, setTaskInfo] = useState<string>('');
   const [busyTask, setBusyTask] = useState(false);
+  const [querying, setQuerying] = useState(false);
+  const [detecting, setDetecting] = useState(false);
+
+  // 确认弹窗状态
+  const [confirmUnregister, setConfirmUnregister] = useState(false);
+  const [confirmResetDevice, setConfirmResetDevice] = useState(false);
 
   // 本地表单状态：用户编辑后点击「保存」才持久化，避免每次按键都写文件
   const [form, setForm] = useState<SettingsType | null>(null);
@@ -45,7 +52,7 @@ export default function Settings() {
     if (!form) return;
     setSaving(true);
     try {
-      await saveSettings(form);
+      await withMinDelay(saveSettings(form));
       toast('success', '设置已保存');
     } catch {
       /* toast 已发出 */
@@ -61,21 +68,28 @@ export default function Settings() {
   const register = async () => {
     setBusyTask(true);
     try {
-      await api.misc.taskRegister(time);
+      await withMinDelay(api.misc.taskRegister(time));
       toast('success', `已注册每日 ${time} 自动签到`);
       await query();
     } catch (e) {
-      toast('error', `注册失败：${String(e)}`);
+      const msg = String(e);
+      // 长错误信息（含换行）在 taskInfo 区域展示，toast 只给简短提示
+      if (msg.includes('\n')) {
+        setTaskInfo(`❌ ${msg}`);
+        toast('error', '注册失败：权限不足，请查看下方详细解决方案');
+      } else {
+        toast('error', `注册失败：${msg}`);
+      }
     } finally {
       setBusyTask(false);
     }
   };
 
   const unregister = async () => {
-    if (!confirm('确认删除「TraeWorkAssistant_DailyCheckin」计划任务？')) return;
+    setConfirmUnregister(false);
     setBusyTask(true);
     try {
-      await api.misc.taskUnregister();
+      await withMinDelay(api.misc.taskUnregister());
       toast('info', '计划任务已删除');
       setTaskInfo('');
     } catch (e) {
@@ -86,17 +100,23 @@ export default function Settings() {
   };
 
   const query = async () => {
+    setQuerying(true);
     try {
-      const r = await api.misc.taskStatus();
+      const r = await withMinDelay(api.misc.taskStatus());
       setTaskInfo(r);
+      toast('success', '查询完成');
     } catch (e) {
       setTaskInfo(`查询失败：${String(e)}`);
+      toast('error', `查询失败：${String(e)}`);
+    } finally {
+      setQuerying(false);
     }
   };
 
   const detectTrae = async () => {
+    setDetecting(true);
     try {
-      const r = await api.env.check();
+      const r = await withMinDelay(api.env.check());
       if (r.installed && r.path) {
         update('trae_path', r.path);
         toast('success', '已自动检测并填入 Trae Work 路径');
@@ -105,11 +125,13 @@ export default function Settings() {
       }
     } catch (e) {
       toast('error', `检测失败：${String(e)}`);
+    } finally {
+      setDetecting(false);
     }
   };
 
   const handleResetDeviceIds = async () => {
-    if (!confirm('确认执行 6 层设备标识重置？\n\n将重置：machineid / storage.json / TinyStorage / 注册表 MachineGuid / webview 追踪数据。\n建议先关闭 TRAE 再执行。')) return;
+    setConfirmResetDevice(false);
     await resetDeviceIds();
   };
 
@@ -220,7 +242,7 @@ export default function Settings() {
           </p>
           <div className="flex items-center gap-2">
             <button
-              onClick={handleResetDeviceIds}
+              onClick={() => setConfirmResetDevice(true)}
               disabled={deviceResetActive}
               className="btn-primary"
             >
@@ -243,28 +265,34 @@ export default function Settings() {
             通过 Windows 计划任务在指定时间自动运行 Python 签到脚本（无需启动应用界面）。
             需要管理员权限。
           </p>
-          <div className="flex flex-wrap items-end gap-2">
-            <div>
-              <label className="label">时间</label>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative flex items-center">
+              <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
               <input
                 type="time"
                 value={time}
                 onChange={(e) => setTime(e.target.value)}
-                className="input"
+                className="input h-9 !w-32 pl-8 text-sm"
               />
             </div>
             <button onClick={register} disabled={busyTask} className="btn-primary">
-              <Calendar size={15} /> 注册任务
+              <Calendar size={15} /> {busyTask ? '注册中…' : '注册任务'}
             </button>
-            <button onClick={query} className="btn-outline">
-              <Save size={15} /> 查询
+            <button onClick={query} disabled={querying} className="btn-outline">
+              <Search size={15} /> {querying ? '查询中…' : '查询'}
             </button>
-            <button onClick={unregister} disabled={busyTask} className="btn-danger">
-              <Trash2 size={15} /> 取消
+            <button onClick={() => setConfirmUnregister(true)} disabled={busyTask} className="btn-danger">
+              <Trash2 size={15} /> {busyTask ? '删除中…' : '取消'}
             </button>
           </div>
           {taskInfo && (
-            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
+            <pre
+              className={`mt-3 overflow-auto whitespace-pre-wrap rounded-lg p-3 text-xs ${
+                taskInfo.startsWith('❌')
+                  ? 'max-h-80 border border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300'
+                  : 'max-h-40 bg-slate-50 dark:bg-zinc-950'
+              }`}
+            >
               {taskInfo}
             </pre>
           )}
@@ -294,8 +322,8 @@ export default function Settings() {
                   placeholder="留空则自动检测（默认 C:\Users\你\AppData\Local\Programs\TRAE SOLO CN\TRAE SOLO CN.exe）"
                   className="input flex-1"
                 />
-                <button onClick={detectTrae} className="btn-outline shrink-0">
-                  <Search size={15} /> 自动检测
+                <button onClick={detectTrae} disabled={detecting} className="btn-outline shrink-0">
+                  <Search size={15} /> {detecting ? '检测中…' : '自动检测'}
                 </button>
               </div>
               <p className="mt-1 text-xs text-slate-400">
@@ -366,7 +394,7 @@ export default function Settings() {
                 type="text"
                 value={form.proxy_log_path ?? ''}
                 onChange={(e) => update('proxy_log_path', e.target.value.trim() || null)}
-                placeholder="留空则默认 %APPDATA%\TraeWorkAssistant\proxy-logs"
+                placeholder="留空则默认 %APPDATA%\TraeWorkAssistant\logs"
                 className="input"
               />
               <p className="mt-1 text-xs text-slate-400">
@@ -379,8 +407,9 @@ export default function Settings() {
         <section className="card p-4 md:col-span-2">
           <h3 className="mb-2 font-medium">关于</h3>
           <div className="space-y-1 text-xs text-slate-500">
-            <div>应用版本：v2.1.1</div>
+            <div>应用版本：v2.2.0</div>
             <div>数据目录：<span className="font-mono">%APPDATA%\TraeWorkAssistant\</span></div>
+            <div className="pl-4 text-slate-400">配置：<span className="font-mono">conf\</span> 数据：<span className="font-mono">data\</span> 日志：<span className="font-mono">logs\</span></div>
             <div>代理 Python：内置 device_proxy.py / auto_checkin.py</div>
             <div className="flex items-center gap-2 pt-1">
               <Badge tone="brand">MIT 友好</Badge>
@@ -402,6 +431,56 @@ export default function Settings() {
           </button>
         </div>
       )}
+
+      {/* 确认删除计划任务 */}
+      <Modal
+        open={confirmUnregister}
+        onClose={() => setConfirmUnregister(false)}
+        title="确认删除计划任务"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setConfirmUnregister(false)}>取消</button>
+            <button className="btn-danger" onClick={() => void unregister()}>确认删除</button>
+          </>
+        }
+      >
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
+          <div>
+            <p>确认删除「TraeWorkAssistant_DailyCheckin」计划任务？</p>
+            <p className="mt-2 text-xs text-slate-400">删除后将不再自动执行每日签到。</p>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 确认执行设备标识重置 */}
+      <Modal
+        open={confirmResetDevice}
+        onClose={() => setConfirmResetDevice(false)}
+        title="确认执行 6 层设备标识重置"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setConfirmResetDevice(false)}>取消</button>
+            <button className="btn-primary" onClick={() => void handleResetDeviceIds()}>确认重置</button>
+          </>
+        }
+      >
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
+          <div>
+            <p>将重置以下全部设备标识层：</p>
+            <ul className="mt-2 space-y-0.5 text-xs text-slate-400">
+              <li>① machineid</li>
+              <li>② storage.json telemetry</li>
+              <li>③ storage.json aha.device</li>
+              <li>④ TinyStorage</li>
+              <li>⑤ 注册表 MachineGuid</li>
+              <li>⑥ webview 追踪数据</li>
+            </ul>
+            <p className="mt-2 text-xs text-amber-500">建议先关闭 TRAE 再执行。</p>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

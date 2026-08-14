@@ -64,7 +64,7 @@ fn proxy_log_dir(state: &State<AppState>) -> std::path::PathBuf {
     settings
         .proxy_log_path
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| state.data_dir.join("proxy-logs"))
+        .unwrap_or_else(|| state.logs_dir())
 }
 
 /// 解析单条代理日志，提取摘要信息
@@ -167,14 +167,15 @@ pub fn proxy_logs_list(
         });
     }
 
-    // 列出所有 .log 文件，按文件名升序（旧文件在前）
+    // 列出所有 proxy_req_*.log 文件，按文件名升序（旧文件在前）
     // 这样 all_entries 中条目按时间正序排列（旧→新），reverse() 后得到正确的时间倒序（新→旧）
     let mut files: Vec<String> = std::fs::read_dir(&log_dir)
         .map_err(|e| format!("读取代理日志目录失败: {e}"))?
         .filter_map(|e| {
             let e = e.ok()?;
             let name = e.file_name().to_string_lossy().to_string();
-            if name.ends_with(".log") {
+            // 只匹配 proxy_req_ 前缀，排除 proxy.log（操作日志）和其他日志
+            if name.starts_with("proxy_req_") && name.ends_with(".log") {
                 Some(name)
             } else {
                 None
@@ -193,8 +194,8 @@ pub fn proxy_logs_list(
 
     for file_name in &files {
         let path = log_dir.join(file_name);
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
+        let content = match std::fs::read(&path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
             Err(_) => continue,
         };
 
@@ -259,7 +260,8 @@ pub fn proxy_log_detail(state: State<AppState>, id: String) -> Result<String, St
 
     let log_dir = proxy_log_dir(&state);
     let path = log_dir.join(file_name);
-    let content = std::fs::read_to_string(&path)
+    let content = std::fs::read(&path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
         .map_err(|e| format!("读取日志文件失败: {e}"))?;
 
     let mut current = 0;
@@ -335,7 +337,8 @@ pub fn logs_query(state: State<AppState>, opts: LogsOpts) -> Vec<LogLine> {
             }
         }
         let p = state.path("logs").join(fname);
-        if let Ok(content) = std::fs::read_to_string(&p) {
+        if let Ok(bytes) = std::fs::read(&p) {
+            let content = String::from_utf8_lossy(&bytes);
             for raw in content.lines() {
                 let (time, msg) = split_time(raw);
                 if let Some(ref date) = opts.date {
@@ -434,7 +437,7 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
         script.to_string_lossy().replace('\\', "/")
     );
     let task_name = "TraeWorkAssistant_DailyCheckin";
-    let status = Command::new("schtasks")
+    let output = Command::new("schtasks")
         .args([
             "/Create",
             "/TN",
@@ -449,10 +452,35 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
             "HIGHEST",
             "/F",
         ])
-        .status()
+        .output()
         .map_err(|e| format!("注册计划任务失败: {e}"))?;
-    if !status.success() {
-        return Err("注册计划任务失败（可能需要管理员权限）".into());
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { &stderr } else { &stdout };
+
+        // 检测是否是权限不足
+        let is_access_denied = detail.contains("Access is denied")
+            || detail.contains("ERROR: Access is denied")
+            || detail.contains("拒绝访问")
+            || output.status.code() == Some(5);
+
+        if is_access_denied {
+            return Err(format!(
+                "注册计划任务失败：权限不足（Access Denied）\n\n\
+                 原因：使用 /RL HIGHEST 创建计划任务需要管理员权限，当前应用以普通用户身份运行。\n\n\
+                 解决方法（任选其一）：\n\
+                 1. 右键 TraeWorkAssistant → 「以管理员身份运行」后重新注册\n\
+                 2. 打开「管理员命令提示符」手动执行：\n\
+                    schtasks /Create /TN TraeWorkAssistant_DailyCheckin /TR \"cmd /c set TRAEDATA_DIR={}&\\\"{}\\\" \\\"{}\\\"\" /SC DAILY /ST {} /RL HIGHEST /F\n\
+                 3. 如不需最高权限，可在管理员 CMD 中去掉 /RL HIGHEST 参数后重试\n\n\
+                 详细错误：{detail}",
+                data_dir, py.replace('\\', "/"), script.to_string_lossy().replace('\\', "/"), time,
+            ));
+        }
+
+        return Err(format!("注册计划任务失败：{detail}"));
     }
     Ok(())
 }

@@ -45,12 +45,18 @@ from typing import Optional
 BASE = os.path.dirname(os.path.abspath(__file__))
 # 数据目录：优先 TRAEDATA_DIR（由桌面端注入），否则回退到脚本目录（保持独立可用性）
 DATA_DIR = os.environ.get("TRAEDATA_DIR", BASE)
-ACCOUNTS_FILE = os.path.join(DATA_DIR, "checkin_accounts.json")
-MAP_FILE = os.path.join(DATA_DIR, "device_map.json")
+# 子目录结构：conf/ (配置), data/ (数据), logs/ (日志)
+CONF_DIR = os.path.join(DATA_DIR, "conf")
+DATA_SUBDIR = os.path.join(DATA_DIR, "data")
+LOGS_DIR = os.path.join(DATA_DIR, "logs")
+for _d in (CONF_DIR, DATA_SUBDIR, LOGS_DIR):
+    os.makedirs(_d, exist_ok=True)
+ACCOUNTS_FILE = os.path.join(DATA_SUBDIR, "checkin_accounts.json")
+MAP_FILE = os.path.join(DATA_SUBDIR, "device_map.json")
 SIGNIN_URL = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim"
 STATUS_URL = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status"
 EXPIRY_WARN_HOURS = 24  # JWT 剩余有效期低于该值时发出告警
-LOG_FILE = os.path.join(DATA_DIR, "logs", "checkin.log")
+LOG_FILE = os.path.join(LOGS_DIR, "checkin.log")
 
 # 伪随机但稳定的生成器，保证同一 user_id 在 device_map.json 缺失时也能复现相同 ID
 # 注意：random.Random 是有状态的，必须「每次调用新建」才能保证同 seed 恒等输出，
@@ -138,7 +144,7 @@ def save_json(path, data):
 def save_credits_history(user_id, credits, delta):
     """把账号最新积分与本次新增写入 credits_history.json（按日期追加，自动裁剪到 90 天内）。
     前端积分看板/趋势图消费此文件；此前该文件只被读取而从未写入，导致积分展示恒为 0。"""
-    path = os.path.join(DATA_DIR, "credits_history.json")
+    path = os.path.join(DATA_SUBDIR, "credits_history.json")
     data = load_json(path, default={"records": []})
     recs = data.get("records", [])
     today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -331,7 +337,7 @@ def classify_error(http_status, message, code):
 
 def save_cooldown(user_id, error_type, cooldown_seconds, reason):
     """写入/更新账号冷却状态到 account_cooldowns.json"""
-    cooldown_file = os.path.join(DATA_DIR, "account_cooldowns.json")
+    cooldown_file = os.path.join(DATA_SUBDIR, "account_cooldowns.json")
     data = {}
     try:
         with open(cooldown_file, "r", encoding="utf-8") as f:
@@ -443,7 +449,7 @@ def main():
             "warnings": [],
             "note": "no_accounts_yet",
         }
-        save_json(os.path.join(DATA_DIR, "checkin_summary.json"), summary)
+        save_json(os.path.join(DATA_SUBDIR, "checkin_summary.json"), summary)
         return 0
 
     # 计算本次要处理的账号（受 --accounts 过滤）
@@ -533,7 +539,7 @@ def main():
             if error_type and error_type != "Unknown":
                 save_cooldown(user_id, error_type, cooldown_secs, msg)
                 # 读取冷却状态获取 until 值
-                cooldown_data = load_json(os.path.join(DATA_DIR, "account_cooldowns.json"), default={})
+                cooldown_data = load_json(os.path.join(DATA_SUBDIR, "account_cooldowns.json"), default={})
                 cd_entry = cooldown_data.get("cooldowns", {}).get(user_id, {})
                 emit_error_type = error_type
                 emit_cooldown_until = cd_entry.get("until", 0)
@@ -579,8 +585,8 @@ def main():
         "failed": failed,
         "warnings": warnings,
     }
-    save_json(os.path.join(DATA_DIR, "checkin_summary.json"), summary)
-    print(f"结果摘要已保存: {os.path.join(DATA_DIR, 'checkin_summary.json')}")
+    save_json(os.path.join(DATA_SUBDIR, "checkin_summary.json"), summary)
+    print(f"结果摘要已保存: {os.path.join(DATA_SUBDIR, 'checkin_summary.json')}")
 
     log_line = (
         f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "

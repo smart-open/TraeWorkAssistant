@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState, useCallback } from 'react';
 import {
   LineChart,
   Line,
@@ -8,7 +8,7 @@ import {
   Tooltip,
   CartesianGrid,
 } from 'recharts';
-import { Coins } from 'lucide-react';
+import { Coins, RefreshCw } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { StatCard, Badge, EmptyState } from '../components/ui';
 import { useAppStore } from '../store';
@@ -28,6 +28,31 @@ export default function Credits() {
 
   const creditsDaily = useAppStore((s) => s.creditsDaily);
   const isDark = useIsDark();
+  const refreshRemainingCredits = useAppStore((s) => s.refreshRemainingCredits);
+  const refreshAccounts = useAppStore((s) => s.refreshAccounts);
+  const refreshCreditsDaily = useAppStore((s) => s.refreshCreditsDaily);
+  const refreshCreditsHistory = useAppStore((s) => s.refreshCreditsHistory);
+  const pushToast = useAppStore((s) => s.pushToast);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      // 1. 刷新所有账号剩余积分（后端会更新 credits_daily.json 快照）
+      await refreshRemainingCredits();
+      // 2. 重新加载账号列表（remaining_credits 字段）
+      await refreshAccounts();
+      // 3. 重新加载每日积分快照
+      await refreshCreditsDaily();
+      // 4. 重新加载签到历史
+      await refreshCreditsHistory();
+      pushToast('success', '积分数据已刷新');
+    } catch (err) {
+      pushToast('error', `刷新失败：${String(err)}`);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshRemainingCredits, refreshAccounts, refreshCreditsDaily, refreshCreditsHistory, pushToast]);
 
   const rows = useMemo(
     () =>
@@ -45,18 +70,21 @@ export default function Credits() {
   const total = rows.reduce((s, a) => s + (a.remaining_credits ?? 0), 0);
   const avg = rows.length === 0 ? 0 : Math.round(total / rows.length);
 
-  // 今日新增积分：
-  // - 有 credits_history 记录时，取当天 delta 之和
-  // - 没有历史记录但有可用积分时，用当前总可用积分作为今日数据
+  // 今日新增积分：优先使用 daily snapshot 的 earned 字段（含签到+购买）
+  // 回退：仅签到 history delta
   const today = localDate(new Date());
   const todayNew = useMemo(() => {
+    // 1. 优先从每日快照获取 earned（包含签到 + 非签到获得）
+    const snap = creditsDaily.find((s) => s.date === today);
+    if (snap && snap.earned > 0) return Math.round(snap.earned);
+    // 2. 回退到签到 history delta
     const histVal = creditsHistory
       .filter((r) => r.date === today)
       .reduce((s, r) => s + (r.delta || 0), 0);
     if (histVal > 0) return histVal;
-    if (creditsHistory.length === 0 && total > 0) return Math.round(total);
-    return histVal;
-  }, [creditsHistory, today, total]);
+    // 3. 无任何数据时不显示
+    return 0;
+  }, [creditsDaily, creditsHistory, today]);
 
   // 近 7 日趋势：从 creditsDaily 快照取数据，补齐无数据的日期
   const trend = useMemo(() => {
@@ -87,10 +115,21 @@ export default function Credits() {
 
   return (
     <div className="animate-fade-in">
-      <PageHeader
-        title="积分看板"
-        desc="查看每个账号的积分余额与趋势"
-      />
+      <div className="flex items-center justify-between">
+        <PageHeader
+          title="积分看板"
+          desc="查看每个账号的积分余额与趋势"
+        />
+        <button
+          className="btn-ghost flex items-center gap-1.5 text-sm"
+          onClick={handleRefresh}
+          disabled={refreshing}
+          title={refreshing ? '刷新中…' : '刷新数据'}
+        >
+          <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
+          {refreshing ? '刷新中' : '刷新'}
+        </button>
+      </div>
 
       <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatCard label="可用积分总额" value={total.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint="总剩余可用积分" tone="amber" />

@@ -95,14 +95,14 @@ impl ApiPool {
             if tried.contains(uid) || !e.healthy(now) {
                 continue;
             }
-            // 跳过积分已过期的
+            // 跳过积分已过期的（expire_time=0 视为无过期时间，不跳过）
             if let Some(exp) = e.credits_expire_at {
-                if exp < now {
+                if exp > 0 && exp < now {
                     continue;
                 }
             }
-            // 跳过零积分且有过期时间的
-            if e.credits_expire_at.is_some() {
+            // 跳过零积分且有有效过期时间的
+            if e.credits_expire_at.map_or(false, |exp| exp > 0) {
                 if let Some(c) = e.credits {
                     if c <= 0.0 {
                         continue;
@@ -164,6 +164,22 @@ impl ApiPool {
         }
     }
 
+    /// 清除所有账号的内存冷却状态（不影响 disabled/SessionDead）
+    pub fn clear_cooldowns(&self) -> usize {
+        let mut entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let count = entries
+            .values()
+            .filter(|e| e.until > 0 && now < e.until)
+            .count();
+        for e in entries.values_mut() {
+            e.until = 0;
+            e.reason.clear();
+            e.err_count = 0;
+        }
+        count
+    }
+
     /// 返回池状态列表
     pub fn status_list(&self) -> Vec<PoolStatus> {
         let entries = safe_lock(&self.entries);
@@ -189,6 +205,60 @@ impl ApiPool {
     pub fn count(&self) -> usize {
         safe_lock(&self.entries).len()
     }
+
+    /// 诊断：返回所有账号被过滤的原因（用于 "no healthy account" 排查）
+    pub fn diagnose(&self) -> Vec<PoolDiagnosis> {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        entries
+            .values()
+            .map(|e| {
+                let reason = if e.disabled {
+                    "disabled(SessionDead)".to_string()
+                } else if e.until > 0 && now < e.until {
+                    format!("cooldown(until={} remaining={}s)", e.until, e.until - now)
+                } else if let Some(exp) = e.credits_expire_at {
+                    if exp > 0 && exp < now {
+                        "credits_expired".to_string()
+                    } else if exp > 0 {
+                        if let Some(c) = e.credits {
+                            if c <= 0.0 {
+                                "zero_credits".to_string()
+                            } else {
+                                "healthy".to_string()
+                            }
+                        } else {
+                            "healthy(no_credits_info)".to_string()
+                        }
+                    } else {
+                        "healthy(no_expiry)".to_string()
+                    }
+                } else {
+                    "healthy(no_expiry_info)".to_string()
+                };
+                PoolDiagnosis {
+                    uid: e.uid.clone(),
+                    name: e.name.clone(),
+                    disabled: e.disabled,
+                    until: e.until,
+                    credits: e.credits,
+                    credits_expire_at: e.credits_expire_at,
+                    reason,
+                }
+            })
+            .collect()
+    }
+}
+
+/// 账号池诊断信息
+pub struct PoolDiagnosis {
+    pub uid: String,
+    pub name: String,
+    pub disabled: bool,
+    pub until: i64,
+    pub credits: Option<f64>,
+    pub credits_expire_at: Option<i64>,
+    pub reason: String,
 }
 
 pub struct PickedAccount {

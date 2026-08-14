@@ -12,7 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::sse;
 use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState, ErrKind,
-            AGENT_HOST, APP_ID, EP_CHAT, IDE_VERSION, IDE_VERSION_CODE};
+            AGENT_HOST, APP_ID, EP_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
 const MAX_ROTATE: usize = 3;
 const MAX_BODY_BYTES: usize = 8 << 20;
@@ -138,19 +138,25 @@ pub async fn chat_completions(
     let body_vec = body.to_vec();
     let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
     let stream = peek.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let model = peek
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&state.default_model)
+        .to_string();
     let converted = super::payload::prepare_body(&body_vec, &state.default_model);
     let state_clone = state.clone();
+    let start_ts = std::time::Instant::now();
 
     if stream {
-        stream_chat(state_clone, converted)
+        stream_chat(state_clone, converted, model, stream, start_ts)
     } else {
-        aggregate_chat(state_clone, converted).await
+        aggregate_chat(state_clone, converted, model, stream, start_ts).await
     }
 }
 
 // ==================== Streaming ====================
 
-fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
+fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::task::spawn_blocking(move || {
@@ -169,6 +175,7 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
                 Ok(reader) => {
                     // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
                     let error_info = sse::stream_convert(reader, tx.clone(), &chat_id);
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
                     if let Some((code, msg)) = error_info {
                         let kind = classify_solo_error(code, &msg);
                         if kind != ErrKind::None {
@@ -176,8 +183,22 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
                             *safe_lock(&state.last_error) =
                                 Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
                         }
+                        state.logger.log_request(
+                            "POST", "/v1/chat/completions", &model, stream,
+                            200, &picked.uid, duration_ms, Some(&msg),
+                        );
+                        if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                            state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
+                        }
                     } else {
                         state.pool.note_success(&picked.uid);
+                        state.logger.log_request(
+                            "POST", "/v1/chat/completions", &model, stream,
+                            200, &picked.uid, duration_ms, None,
+                        );
+                        if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                            state.logger.log_debug(&picked.uid, &converted, None, 200, None);
+                        }
                     }
                     return; // 流式结束后直接返回
                 }
@@ -187,12 +208,55 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
                     let preview = safe_slice(&resp_body, 200);
                     *safe_lock(&state.last_error) =
                         Some(format!("uid={} status={} body={}", picked.uid, status, preview));
+                    state.logger.log_request(
+                        "POST", "/v1/chat/completions", &model, stream,
+                        status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                        Some(&format!("upstream status={}", status)),
+                    );
+                    if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&preview));
+                    }
                     continue;
                 }
             }
         }
 
         // 所有账号不可用
+        let duration_ms = start_ts.elapsed().as_millis() as u64;
+        let diag = state.pool.diagnose();
+        let diag_summary: Vec<String> = diag
+            .iter()
+            .map(|d| {
+                let credits_str = d.credits.map(|c| format!("{:.0}", c)).unwrap_or_else(|| "N/A".to_string());
+                let cd_str = if d.until > 0 { format!(",cd={}s", d.until.saturating_sub(now_ts() as i64)) } else { String::new() };
+                let exp_str = d.credits_expire_at.filter(|&e| e > 0).map(|e| format!(",exp={}", e)).unwrap_or_default();
+                let dis_str = if d.disabled { ",DIS" } else { "" };
+                format!("{}({}:{},cr={}{}{}{})", d.name, &d.uid[..d.uid.len().min(8)], d.reason, credits_str, cd_str, exp_str, dis_str)
+            })
+            .collect();
+        state.logger.log_request(
+            "POST", "/v1/chat/completions", &model, stream,
+            503, "none", duration_ms, Some("no healthy account"),
+        );
+        // 写入 app.log 供排查
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let local_ts = now + 8 * 3600;
+            let h = (local_ts % 86400) / 3600;
+            let m = (local_ts % 3600) / 60;
+            let s = local_ts % 60;
+            let diag_line = format!(
+                "NO_HEALTHY_ACCOUNT [{:02}:{:02}:{:02}] tried={} pool={} reasons=[{}]",
+                h, m, s, tried.len(), diag.len(), diag_summary.join(", "),
+            );
+            if let Some(mut f) = state.logger.get_writer() {
+                use std::io::Write;
+                let _ = writeln!(f, "[DEBUG] {}", diag_line);
+            }
+        }
         let _ = tx.blocking_send(Ok(bytes::Bytes::from(
             "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
         )));
@@ -215,7 +279,7 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
 
 // ==================== Non-streaming ====================
 
-async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
+async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let mut tried = HashSet::new();
 
@@ -231,9 +295,17 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Respo
                 Ok(reader) => {
                     let chat_id = format!("chatcmpl-{}", now_ts());
                     let (resp, error_info) = sse::aggregate(reader, &chat_id);
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
                     match (resp, error_info) {
                         (Some(r), None) => {
                             state.pool.note_success(&picked.uid);
+                            state.logger.log_request(
+                                "POST", "/v1/chat/completions", &model, stream,
+                                200, &picked.uid, duration_ms, None,
+                            );
+                            if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                state.logger.log_debug(&picked.uid, &converted, Some(r.to_string().as_bytes()), 200, None);
+                            }
                             return Ok(r);
                         }
                         (None, Some((code, msg))) => {
@@ -241,10 +313,24 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Respo
                             state.pool.note_error(&picked.uid, kind);
                             *safe_lock(&state.last_error) =
                                 Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
+                            state.logger.log_request(
+                                "POST", "/v1/chat/completions", &model, stream,
+                                200, &picked.uid, duration_ms, Some(&msg),
+                            );
+                            if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
+                            }
                             continue;
                         }
                         _ => {
                             state.pool.note_error(&picked.uid, ErrKind::Server);
+                            state.logger.log_request(
+                                "POST", "/v1/chat/completions", &model, stream,
+                                502, &picked.uid, duration_ms, Some("empty response"),
+                            );
+                            if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                state.logger.log_debug(&picked.uid, &converted, None, 502, Some("empty response"));
+                            }
                             continue;
                         }
                     }
@@ -254,11 +340,46 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Respo
                     state.pool.note_error(&picked.uid, kind);
                     *safe_lock(&state.last_error) =
                         Some(format!("uid={} status={}", picked.uid, status));
+                    state.logger.log_request(
+                        "POST", "/v1/chat/completions", &model, stream,
+                        status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                        Some(&format!("upstream status={}", status)),
+                    );
+                    if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                        state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&resp_body));
+                    }
                     continue;
                 }
             }
         }
 
+        let duration_ms = start_ts.elapsed().as_millis() as u64;
+        let diag = state.pool.diagnose();
+        let diag_summary: Vec<String> = diag
+            .iter()
+            .map(|d| {
+                let credits_str = d.credits.map(|c| format!("{:.0}", c)).unwrap_or_else(|| "N/A".to_string());
+                let cd_str = if d.until > 0 { format!(",cd={}s", d.until.saturating_sub(now_ts() as i64)) } else { String::new() };
+                let exp_str = d.credits_expire_at.filter(|&e| e > 0).map(|e| format!(",exp={}", e)).unwrap_or_default();
+                let dis_str = if d.disabled { ",DIS" } else { "" };
+                format!("{}({}:{},cr={}{}{}{})", d.name, &d.uid[..d.uid.len().min(8)], d.reason, credits_str, cd_str, exp_str, dis_str)
+            })
+            .collect();
+        state.logger.log_request(
+            "POST", "/v1/chat/completions", &model, stream,
+            503, "none", duration_ms, Some("no healthy account"),
+        );
+        // 写入诊断日志
+        {
+            if let Some(mut f) = state.logger.get_writer() {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "[DEBUG] NO_HEALTHY_ACCOUNT(non-stream) tried={} pool={} reasons=[{}]",
+                    tried.len(), diag.len(), diag_summary.join(", "),
+                );
+            }
+        }
         Err("no healthy account available".to_string())
     })
     .await;
@@ -288,35 +409,50 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Respo
 
 fn make_upstream_request(
     jwt: &str,
-    uid: &str,
+    _uid: &str,
     body: &[u8],
 ) -> Result<Box<dyn Read + Send>, (u16, String)> {
-    let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
-        jwt.to_string()
-    } else {
-        format!("Cloud-IDE-JWT {}", jwt)
-    };
     let url = format!("{}{}", AGENT_HOST, EP_CHAT);
+    let referer = format!("{}{}", REFERER_BASE, EP_CHAT);
+    let trace_id = format!(
+        "00-{}-{}-01",
+        uuid_like_id(),
+        uuid_like_id()
+    );
+    let request_id = format!("req_{}", uuid_like_id());
 
     let resp = streaming_agent()
         .post(&url)
         .set("content-type", "application/json")
-        .set("accept", "text/event-stream")
-        .set("user-agent", &format!("Trae/{}", IDE_VERSION))
-        .set("authorization", &auth)
-        .set("x-cloudide-token", jwt)
+        .set("accept", "*/*")
+        .set("accept-encoding", "gzip, deflate, br, zstd")
+        .set("user-agent", "TraeClient/TTNet")
         .set("x-ide-token", jwt)
-        .set("x-uid", uid)
         .set("x-app-id", APP_ID)
         .set("x-app-version", "default")
+        .set("x-app-version-code", IDE_VERSION_CODE)
         .set("x-ide-version", IDE_VERSION)
         .set("x-ide-version-code", IDE_VERSION_CODE)
-        .set("x-app-version-code", IDE_VERSION_CODE)
         .set("x-ide-version-type", "stable")
         .set("x-device-type", "windows")
-        .set("x-os-version", "Windows 11 Pro")
-        .set("x-device-brand", "83DG")
+        .set("x-device-brand", "CREFG-XX")
+        .set("x-device-cpu", "Intel")
+        .set("x-device-id", "199439841787403")
+        .set("x-machine-id", "b04f40320d4f2d7173a83374cd9f2df3e635907e386a0cdb4612e4fcb37c97e1")
+        .set("x-os-version", "Windows 11 Home China")
         .set("request-traffic-type", "prod")
+        .set("package-type", "stable_cn")
+        .set("x-bridge-transport", "aha")
+        .set("x-lgw-req-sdk-type", "3")
+        .set("x-lscbd-aid", "787976")
+        .set("x-lscbd-platform", "windows")
+        .set("x-ss-dp", "787976")
+        .set("app-version", IDE_VERSION)
+        .set("x-custom-trace-id", &trace_id[..16])
+        .set("x-flow-traceparent", &format!("04-{}-{}-01", &trace_id[3..35], uuid_like_id()))
+        .set("x-tt-trace-id", &trace_id)
+        .set("x-request-id", &request_id)
+        .set("referer", &referer)
         .send_bytes(body);
 
     match resp {
@@ -325,7 +461,20 @@ fn make_upstream_request(
             let body = response.into_string().unwrap_or_default();
             Err((code, body))
         }
-        Err(e) => Err((502, format!("transport: {}", e))),
+        Err(e) => {
+            let err_str = format!("{}", e);
+            // 区分 DNS 解析失败 / 连接超时 / TLS 错误，提供更精准的诊断
+            let detail = if err_str.contains("dns") || err_str.contains("resolve") || err_str.contains("name resolution") {
+                format!("DNS解析失败（{} 无法解析），请检查网络或代理设置: {}", AGENT_HOST, e)
+            } else if err_str.contains("timed out") || err_str.contains("timeout") {
+                format!("连接超时（{} 10秒内未响应），请检查网络连通性: {}", AGENT_HOST, e)
+            } else if err_str.contains("tls") || err_str.contains("certificate") || err_str.contains("ssl") {
+                format!("TLS证书验证失败: {}", e)
+            } else {
+                format!("传输错误: {}", e)
+            };
+            Err((502, detail))
+        }
     }
 }
 
@@ -356,6 +505,19 @@ fn now_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// 生成类似 UUID 的十六进制字符串，用于 trace-id 等请求头
+fn uuid_like_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let nanos = now.as_nanos();
+    let seed = (nanos as u64).wrapping_mul(0x517cc1b727220a95);
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&seed.to_le_bytes());
+    buf[8..16].copy_from_slice(&(seed.wrapping_add(0x9e3779b97f4a7c15)).to_le_bytes());
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn safe_slice(s: &str, n: usize) -> &str {

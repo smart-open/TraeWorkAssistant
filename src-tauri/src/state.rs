@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use crate::fs_utils;
 use crate::models::Settings;
 
-/// 应用全局状态。data_dir 指向 %APPDATA%\TraeWorkAssistant；
+/// 应用全局状态。base_dir 指向 %APPDATA%\TraeWorkAssistant；
+/// 子目录: conf/ (配置), data/ (数据), logs/ (日志)
 /// python_dir 指向打包后的 python 脚本目录（Tauri resource `python/`）。
 pub struct AppState {
     pub data_dir: PathBuf,
@@ -14,6 +15,9 @@ pub struct AppState {
     /// JWT 刷新锁：防止多个并发请求同时 ExchangeToken
     pub jwt_refresh_lock: Mutex<()>,
 }
+
+/// 配置文件名列表（路由到 conf/ 目录）
+const CONF_FILES: &[&str] = &["app_settings.json"];
 
 impl AppState {
     pub fn new() -> Result<Self, String> {
@@ -24,6 +28,14 @@ impl AppState {
         let data_dir = appdata.join("TraeWorkAssistant");
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
+
+        // 创建子目录结构
+        let conf_dir = data_dir.join("conf");
+        let data_subdir = data_dir.join("data");
+        let logs_dir = data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&conf_dir);
+        let _ = std::fs::create_dir_all(&data_subdir);
+        let _ = std::fs::create_dir_all(&logs_dir);
 
         // python 脚本目录：优先取 Tauri 资源目录下的 python/，否则回退到源码目录
         let python_dir = resolve_python_dir();
@@ -45,13 +57,51 @@ impl AppState {
         })
     }
 
+    /// 配置文件路径：base_dir/conf/name
+    pub fn conf_path(&self, name: &str) -> PathBuf {
+        let dir = self.data_dir.join("conf");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(name)
+    }
+
+    /// 数据文件路径：base_dir/data/name
+    pub fn data_path(&self, name: &str) -> PathBuf {
+        let dir = self.data_dir.join("data");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(name)
+    }
+
+    /// 日志目录路径：base_dir/logs
+    pub fn logs_dir(&self) -> PathBuf {
+        let dir = self.data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// 兼容性 path()：根据文件名自动路由到正确的子目录
+    /// - 配置文件 → conf/
+    /// - 数据文件 → data/
+    /// - logs → logs/（日志根目录）
+    /// - 其他 → data/（默认）
     pub fn path(&self, name: &str) -> PathBuf {
-        self.data_dir.join(name)
+        if CONF_FILES.contains(&name) {
+            self.conf_path(name)
+        } else if name == "logs" {
+            // 日志根目录：base_dir/logs
+            self.logs_dir()
+        } else if name == "profiles" || name == "certs" {
+            // 数据子目录
+            let dir = self.data_path(name);
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        } else {
+            self.data_path(name)
+        }
     }
 
     pub fn settings(&self) -> Settings {
         // 统一走 fs_utils::read_json：文件缺失/为空/解析失败均回退默认，行为一致
-        let mut s: Settings = fs_utils::read_json(&self.path("app_settings.json"));
+        let mut s: Settings = fs_utils::read_json(&self.conf_path("app_settings.json"));
         // proxy_domains 为空时回填默认值，确保设置页始终展示默认监听域名
         if s.proxy_domains.trim().is_empty() {
             s.proxy_domains = crate::models::default_proxy_domains();

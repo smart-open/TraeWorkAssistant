@@ -53,6 +53,8 @@ export const api = {
       invoke<CreditsDailySnapshot[]>('credits_daily_list'),
     cooldownClear: (userId: string) =>
       invoke('cooldown_clear', { userId }),
+    cooldownClearAll: () =>
+      invoke<number>('cooldown_clear_all'),
     refreshJwt: (userId: string) =>
       invoke<string>('refresh_jwt', { userId }),
   },
@@ -131,6 +133,23 @@ export const api = {
     poolList: () => invoke<ApiPoolFile>('pool_list'),
     poolSet: (uids: string[]) => invoke('pool_set', { uids }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
+    logsList: () => invoke<string[]>('api_logs_list'),
+    logsDetail: (date: string) => invoke<string | null>('api_logs_detail', { date }),
+    logsSearch: (opts: {
+      date: string;
+      startTime?: string;
+      endTime?: string;
+      keyword?: string;
+    }) => invoke<string | null>('api_logs_search', {
+      opts: {
+        date: opts.date,
+        start_time: opts.startTime,
+        end_time: opts.endTime,
+        keyword: opts.keyword,
+      },
+    }),
+    debugToggle: () => invoke<boolean>('api_debug_toggle'),
+    debugStatus: () => invoke<boolean>('api_debug_status'),
   },
 };
 
