@@ -174,9 +174,9 @@ export default function Settings() {
               </select>
             </div>
           </div>
-        </section>
 
-        <section className="card p-4">
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
           <h3 className="mb-3 font-medium">通用与通知</h3>
           <div className="space-y-3 text-sm">
             <div>
@@ -210,6 +210,64 @@ export default function Settings() {
             </label>
             <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
           </div>
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          <h3 className="mb-2 font-medium">6 层设备标识重置</h3>
+          <p className="mb-3 text-xs text-slate-500">
+            重置 TRAE 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。
+            用于账号隔离和防关联，建议先关闭 TRAE 再执行。
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleResetDeviceIds}
+              disabled={deviceResetActive}
+              className="btn-primary"
+            >
+              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
+            </button>
+            {deviceResetActive && (
+              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
+            )}
+          </div>
+          {deviceResetProgress.length > 0 && (
+            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
+              {deviceResetProgress.join('\n')}
+            </pre>
+          )}
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          <h3 className="mb-2 font-medium">每日定时签到</h3>
+          <p className="mb-3 text-xs text-slate-500">
+            通过 Windows 计划任务在指定时间自动运行 Python 签到脚本（无需启动应用界面）。
+            需要管理员权限。
+          </p>
+          <div className="flex flex-wrap items-end gap-2">
+            <div>
+              <label className="label">时间</label>
+              <input
+                type="time"
+                value={time}
+                onChange={(e) => setTime(e.target.value)}
+                className="input"
+              />
+            </div>
+            <button onClick={register} disabled={busyTask} className="btn-primary">
+              <Calendar size={15} /> 注册任务
+            </button>
+            <button onClick={query} className="btn-outline">
+              <Save size={15} /> 查询
+            </button>
+            <button onClick={unregister} disabled={busyTask} className="btn-danger">
+              <Trash2 size={15} /> 取消
+            </button>
+          </div>
+          {taskInfo && (
+            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
+              {taskInfo}
+            </pre>
+          )}
         </section>
 
         <section className="card p-4">
@@ -316,64 +374,6 @@ export default function Settings() {
               </p>
             </div>
           </div>
-        </section>
-
-        <section className="card p-4 md:col-span-1">
-          <h3 className="mb-2 font-medium">6 层设备标识重置</h3>
-          <p className="mb-3 text-xs text-slate-500">
-            重置 TRAE 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④ TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。
-            用于账号隔离和防关联，建议先关闭 TRAE 再执行。
-          </p>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleResetDeviceIds}
-              disabled={deviceResetActive}
-              className="btn-primary"
-            >
-              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
-            </button>
-            {deviceResetActive && (
-              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
-            )}
-          </div>
-          {deviceResetProgress.length > 0 && (
-            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
-              {deviceResetProgress.join('\n')}
-            </pre>
-          )}
-        </section>
-
-        <section className="card p-4 md:col-span-2">
-          <h3 className="mb-2 font-medium">每日定时签到</h3>
-          <p className="mb-3 text-xs text-slate-500">
-            通过 Windows 计划任务在指定时间自动运行 Python 签到脚本（无需启动应用界面）。
-            需要管理员权限。
-          </p>
-          <div className="flex flex-wrap items-end gap-2">
-            <div>
-              <label className="label">时间</label>
-              <input
-                type="time"
-                value={time}
-                onChange={(e) => setTime(e.target.value)}
-                className="input"
-              />
-            </div>
-            <button onClick={register} disabled={busyTask} className="btn-primary">
-              <Calendar size={15} /> 注册任务
-            </button>
-            <button onClick={query} className="btn-outline">
-              <Save size={15} /> 查询
-            </button>
-            <button onClick={unregister} disabled={busyTask} className="btn-danger">
-              <Trash2 size={15} /> 取消
-            </button>
-          </div>
-          {taskInfo && (
-            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
-              {taskInfo}
-            </pre>
-          )}
         </section>
 
         <section className="card p-4 md:col-span-2">

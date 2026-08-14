@@ -20,13 +20,26 @@ import SetupGuide from '../components/SetupGuide';
 import { StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
+import { useIsDark } from '../lib/useIsDark';
+
+function formatUptime(startedAt: number | null): string | null {
+  if (startedAt == null) return null;
+  const secs = Math.floor(Date.now() / 1000 - startedAt);
+  if (secs < 60) return `${secs}秒`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}分${secs % 60}秒`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}时${mins % 60}分`;
+}
 
 export default function Dashboard() {
   const accounts = useAppStore((s) => s.accounts);
   const env = useAppStore((s) => s.env);
   const proxy = useAppStore((s) => s.proxy);
+  const apiStatus = useAppStore((s) => s.apiStatus);
   const certInstalled = useAppStore((s) => s.certInstalled);
   const toast = useAppStore((s) => s.pushToast);
+  const isDark = useIsDark();
 
   const total = accounts.length;
   const checkedToday = accounts.filter((a) => a.checked_today).length;
@@ -55,6 +68,7 @@ export default function Dashboard() {
       s.refreshEnv(),
       s.refreshCert(),
       s.refreshProxy(),
+      s.refreshApiStatus(),
       s.refreshAccounts(),
       s.refreshGroups(),
       s.refreshCreditsHistory(),
@@ -80,14 +94,20 @@ export default function Dashboard() {
         }
       />
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard label="账号总数" value={total} hint={`今日已签 ${checkedToday}`} tone="brand" />
         <StatCard label="积分总额" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint="总剩余可用积分" tone="amber" />
         <StatCard
           label="代理状态"
           value={proxy.running ? `运行 :${proxy.port}` : '未启动'}
-          hint={proxy.started_at != null ? `已捕获 ${proxy.captured} 个 · 启动于 ${new Date(proxy.started_at * 1000).toLocaleTimeString()}` : undefined}
+          hint={proxy.running ? `已捕获 ${proxy.captured} 次请求 · 运行 ${formatUptime(proxy.started_at)}` : undefined}
           tone={proxy.running ? 'green' : 'slate'}
+        />
+        <StatCard
+          label="API 服务"
+          value={apiStatus?.running ? `运行 :${apiStatus.port}` : '未启动'}
+          hint={apiStatus?.running ? `请求 ${apiStatus.total_requests} 次 · 运行 ${formatUptime(apiStatus.started_at)}` : undefined}
+          tone={apiStatus?.running ? 'green' : 'slate'}
         />
         <StatCard
           label="JWT 告警"
@@ -140,10 +160,6 @@ export default function Dashboard() {
         </div>
       )}
 
-      <div className="mt-5">
-        <SetupGuide />
-      </div>
-
       {top.length > 0 && (
         <div className="mt-5 card p-5">
           <div className="mb-4 flex items-center justify-between">
@@ -158,24 +174,26 @@ export default function Dashboard() {
           <div className="h-72">
             <ResponsiveContainer>
               <BarChart data={top} margin={{ top: 24, right: 16, left: 0, bottom: 4 }} barCategoryGap="36%">
-                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" opacity={0.25} vertical={false} />
+                <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
                 <XAxis
                   dataKey="name"
-                  tick={{ fontSize: 11, fill: '#94a3b8' }}
+                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
                   interval={0}
                   angle={-20}
                   textAnchor="end"
                   height={52}
-                  axisLine={{ stroke: '#e2e8f0' }}
+                  axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
                   tickLine={false}
                 />
-                <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={48} />
+                <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={48} />
                 <Tooltip
-                  cursor={{ fill: 'rgba(0,0,0,0.03)' }}
+                  cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
                   contentStyle={{
                     fontSize: 12,
                     borderRadius: 10,
-                    border: '1px solid #e2e8f0',
+                    border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                    background: isDark ? '#18181b' : '#fff',
+                    color: isDark ? '#e4e4e7' : '#1e293b',
                     boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
                     padding: '8px 12px',
                   }}
@@ -183,16 +201,20 @@ export default function Dashboard() {
                 />
                 <Bar dataKey="credits" radius={[8, 8, 0, 0]} maxBarSize={44}>
                   {top.map((_, i) => {
-                    // Top 1-3 使用强调色，其余渐淡
-                    const colors = ['#27272a', '#3f3f46', '#52525b'];
-                    const fill = i < 3 ? colors[i] : `rgba(82,82,91,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`;
+                    // Top 1-3 使用强调色，其余渐淡；暗色模式下反转明度
+                    const colors = isDark
+                      ? ['#fafafa', '#e4e4e7', '#d4d4d8']
+                      : ['#27272a', '#3f3f46', '#52525b'];
+                    const fill = i < 3 ? colors[i] : isDark
+                      ? `rgba(212,212,216,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`
+                      : `rgba(82,82,91,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`;
                     return <Cell key={i} fill={fill} />;
                   })}
                   <LabelList
                     dataKey="credits"
                     position="top"
                     formatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0)}
-                    style={{ fontSize: 10, fill: '#94a3b8', fontWeight: 500 }}
+                    style={{ fontSize: 10, fill: isDark ? '#a1a1aa' : '#94a3b8', fontWeight: 500 }}
                   />
                 </Bar>
               </BarChart>
@@ -200,6 +222,10 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      <div className="mt-5">
+        <SetupGuide />
+      </div>
     </div>
   );
 }

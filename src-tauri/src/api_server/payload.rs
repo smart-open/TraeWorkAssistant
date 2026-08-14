@@ -7,7 +7,10 @@ pub fn prepare_body(src: &[u8], default_model: &str) -> Vec<u8> {
         Ok(v) => v,
         Err(_) => return src.to_vec(),
     };
-    let obj_mut = obj.as_object_mut().unwrap();
+    let obj_mut = match obj.as_object_mut() {
+        Some(m) => m,
+        None => return src.to_vec(),
+    };
 
     // 强制 stream + function
     obj_mut.insert("stream".into(), json!(true));

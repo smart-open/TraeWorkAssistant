@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -17,23 +17,98 @@ use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState
 const MAX_ROTATE: usize = 3;
 const MAX_BODY_BYTES: usize = 8 << 20;
 
+/// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
+fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ==================== Handlers ====================
 
 pub async fn healthz() -> &'static str {
     "ok"
 }
 
+pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
+    let pool = state.pool.status_list();
+    let available = pool.iter().filter(|p| !p.disabled && !p.cooling).count();
+    let cooling = pool.iter().filter(|p| p.cooling).count();
+    let disabled = pool.iter().filter(|p| p.disabled).count();
+    let total_credits: f64 = pool.iter().filter_map(|p| p.credits).sum();
+    let total = state.total_requests.load(std::sync::atomic::Ordering::Relaxed);
+    let active = safe_lock(&state.active_uid).clone();
+    let last_err = safe_lock(&state.last_error).clone();
+
+    Json(json!({
+        "status": "ok",
+        "running": true,
+        "total_requests": total,
+        "active_uid": active,
+        "last_error": last_err,
+        "pool": {
+            "total_accounts": pool.len(),
+            "available": available,
+            "cooling": cooling,
+            "disabled": disabled,
+            "total_credits": (total_credits * 100.0).round() / 100.0,
+        }
+    }))
+}
+
 pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
     let pool = state.pool.status_list();
+    let now: i64 = now_ts() as i64;
     let total = state.total_requests.load(std::sync::atomic::Ordering::Relaxed);
-    let active = state.active_uid.lock().unwrap().clone();
-    let last_err = state.last_error.lock().unwrap().clone();
+    let active = safe_lock(&state.active_uid).clone();
+    let last_err = safe_lock(&state.last_error).clone();
+
+    // 汇总统计
+    let total_accounts = pool.len();
+    let available = pool.iter().filter(|p| !p.disabled && !p.cooling).count();
+    let cooling = pool.iter().filter(|p| p.cooling).count();
+    let disabled = pool.iter().filter(|p| p.disabled).count();
+    let total_credits: f64 = pool.iter().filter_map(|p| p.credits).sum();
+    let total_credits = (total_credits * 100.0).round() / 100.0;
+
+    // 账号明细
+    let accounts: Vec<Value> = pool.iter().map(|p| {
+        let status = if p.disabled {
+            "disabled"
+        } else if p.cooling {
+            "cooling"
+        } else if p.credits_expire_at.map_or(false, |exp| exp < now) {
+            "expired"
+        } else if p.credits.map_or(false, |c| c <= 0.0) {
+            "no_credits"
+        } else {
+            "available"
+        };
+        json!({
+            "uid": p.uid,
+            "name": p.name,
+            "status": status,
+            "credits": p.credits,
+            "credits_expire_at": p.credits_expire_at,
+            "cooling": p.cooling,
+            "cooldown_until": p.cooldown_until,
+            "cooldown_reason": p.cooldown_reason,
+            "disabled": p.disabled,
+            "err_count": p.err_count,
+        })
+    }).collect();
+
     Json(json!({
         "running": true,
         "total_requests": total,
         "active_uid": active,
         "last_error": last_err,
-        "pool": pool,
+        "summary": {
+            "total_accounts": total_accounts,
+            "available": available,
+            "cooling": cooling,
+            "disabled": disabled,
+            "total_credits": total_credits,
+        },
+        "accounts": accounts,
     }))
 }
 
@@ -88,7 +163,7 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
                 None => break,
             };
             tried.insert(picked.uid.clone());
-            *state.active_uid.lock().unwrap() = Some(picked.uid.clone());
+            *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             match make_upstream_request(&picked.jwt, &picked.uid, &converted) {
                 Ok(reader) => {
@@ -98,7 +173,7 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
                         let kind = classify_solo_error(code, &msg);
                         if kind != ErrKind::None {
                             state.pool.note_error(&picked.uid, kind);
-                            *state.last_error.lock().unwrap() =
+                            *safe_lock(&state.last_error) =
                                 Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
                         }
                     } else {
@@ -110,7 +185,7 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
                     let kind = classify_error(status, &resp_body);
                     state.pool.note_error(&picked.uid, kind);
                     let preview = safe_slice(&resp_body, 200);
-                    *state.last_error.lock().unwrap() =
+                    *safe_lock(&state.last_error) =
                         Some(format!("uid={} status={} body={}", picked.uid, status, preview));
                     continue;
                 }
@@ -130,7 +205,12 @@ fn stream_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Response {
         .header("cache-control", "no-cache")
         .header("connection", "keep-alive")
         .body(Body::from_stream(stream))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal server error"))
+                .unwrap()
+        })
 }
 
 // ==================== Non-streaming ====================
@@ -145,7 +225,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Respo
                 None => break,
             };
             tried.insert(picked.uid.clone());
-            *state.active_uid.lock().unwrap() = Some(picked.uid.clone());
+            *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             match make_upstream_request(&picked.jwt, &picked.uid, &converted) {
                 Ok(reader) => {
@@ -159,7 +239,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Respo
                         (None, Some((code, msg))) => {
                             let kind = classify_solo_error(code, &msg);
                             state.pool.note_error(&picked.uid, kind);
-                            *state.last_error.lock().unwrap() =
+                            *safe_lock(&state.last_error) =
                                 Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
                             continue;
                         }
@@ -172,7 +252,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Respo
                 Err((status, resp_body)) => {
                     let kind = classify_error(status, &resp_body);
                     state.pool.note_error(&picked.uid, kind);
-                    *state.last_error.lock().unwrap() =
+                    *safe_lock(&state.last_error) =
                         Some(format!("uid={} status={}", picked.uid, status));
                     continue;
                 }
@@ -187,7 +267,12 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, converted: Vec<u8>) -> Respo
         Ok(Ok(resp)) => Response::builder()
             .header("content-type", "application/json")
             .body(Body::from(resp.to_string()))
-            .unwrap(),
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("internal server error"))
+                    .unwrap()
+            }),
         Ok(Err(msg)) => {
             openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg)
         }
@@ -258,7 +343,12 @@ fn openai_error(status: StatusCode, code: &str, msg: &str) -> Response {
         .status(status)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("{\"error\":{\"message\":\"internal error\"}}"))
+                .unwrap()
+        })
 }
 
 fn now_ts() -> u64 {

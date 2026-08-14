@@ -51,6 +51,7 @@ fn main() {
             commands::accounts::group_move,
             commands::accounts::fetch_remaining_credits,
             commands::accounts::refresh_remaining_credits,
+            commands::accounts::credits_daily_list,
             commands::accounts::cooldown_clear,
             commands::accounts::refresh_jwt,
             commands::checkin::checkin_start,
@@ -188,8 +189,7 @@ fn main() {
         })
         .on_window_event(|window, event| {
             // 关闭即退出应用（前端已弹确认框；退出时 RunEvent::Exit 自动清理代理与 API 服务）
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
                 let st = window.app_handle().state::<AppState>();
                 fs_utils::app_log(&st.data_dir, "用户确认退出应用");
                 window.app_handle().exit(0);

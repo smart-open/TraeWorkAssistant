@@ -1,7 +1,8 @@
-# 技术框架方案 — Trae Work 助手 v2.0.0
+# 技术框架方案 — Trae Work 助手 v2.2.0
 
 > 详细界面/交互/数据模型见 `产品设计文档.md`。本文档给出技术选型、架构、进程契约与风险。
-> v2.0.0 新增：本地 API 网关（axum）、SSE 协议转换、账号池智能调度、签到错误冷却状态机、6 层设备标识重置。
+> v2.0 新增：本地 API 网关（axum）、SSE 协议转换、账号池智能调度、签到错误冷却状态机、6 层设备标识重置。
+> v2.1 新增：每日积分快照（total/earned/consumed 三线趋势）、暗色模式图表适配、Mutex 安全锁（poison 恢复）、代理日志竞态修复。
 
 ## 1. 技术选型
 
@@ -48,6 +49,9 @@ v2.0.0 架构变更：API 网关从「下期独立模块」改为内嵌 axum 服
 - **`startCheckin` 重置**：发起签到前先重置 checkin 状态（`active:true, total:0, index:0, results:[], done:null`），避免显示上一次的进度残留。
 - **日志页**：Logs 页支持「复制代理日志」与「复制查询日志」（写入剪贴板）；实时代理输出采用最新置顶（新行 `unshift` 到数组头部），最多保留 200 行。
 - **Modal 组件**：弹窗打开时监听 `Escape` 键关闭，并锁定 `body` 滚动（`overflow:hidden`）；关闭时还原，防止背景滚动穿透。
+- **代理日志竞态修复（v2.1）**：`ProxyLogsTab` 的 `showDetail` 使用 `useRef` 递增请求 ID，关闭弹窗时递增使正在进行的 API 请求失效，防止异步返回后重新打开已关闭的弹窗。
+- **暗色模式图表（v2.1）**：Dashboard 和 Credits 页面的 Recharts 图表通过 `useIsDark()` hook 动态适配暗色模式，切换主题时图表颜色实时更新。
+- **积分趋势三线图（v2.1）**：Credits 页面展示三条折线（积分总数/获得积分/消耗积分），数据来源于每日积分快照 `credits_daily.json`。
 
 ## 3. 数据模型
 
@@ -68,6 +72,7 @@ v2.0.0 架构变更：API 网关从「下期独立模块」改为内嵌 axum 服
 | `remaining_credits.json` | v2.0 新增 | 各账号剩余积分缓存 |
 | `api_pool.json` | v2.0 新增 | API 账号池状态（选中账号、轮转计数） |
 | `proxy_logs/` | v2.0 新增 | 代理日志目录（按日期分割，支持关键字/时间段查询） |
+| `credits_daily.json` | v2.1 新增 | 每日积分快照（total / earned / consumed，三线趋势图数据源） |
 
 账号唯一主键：`UserID`（JWT payload `data.id`，16 位数字）。分组信息独立存储，不污染原 JSON。
 
@@ -97,6 +102,38 @@ API 请求的智能选号策略：
 5. 单请求最多换号 3 次（`MaxRotate`）
 
 状态持久化到 `api_pool.json`，重启后冷却状态保持。
+
+### 3.3 每日积分快照（v2.1 新增）
+
+每天计算一次积分快照并写入 `credits_daily.json`，供积分看板「近 7 日趋势」三线折线图使用：
+
+| 字段 | 说明 | 计算方式 |
+|------|------|---------|
+| `date` | 本地日期 `YYYY-MM-DD` | — |
+| `total` | 当日所有账号剩余积分之和 | 遍历各账号 `calc_remaining_credits` 求和 |
+| `earned` | 当日获得积分 | 签到获得（`credits_history.json` 当天 delta 之和）+ 非签到获得（API 查询 `start_time` 在今日本地时间内且 `package_source_type != 9` 的积分包） |
+| `consumed` | 当日消耗积分 | `|total - earned - 昨日total|`（取绝对值） |
+
+非签到获得积分：通过 TRAE 积分查询接口的 `user_entitlement_pack_list` 中，`start_time` 落在今日本地时间范围内且 `package_source_type` 不为 9（签到来源）的积分包，累加 `credits_limit`。
+
+### 3.4 Mutex 安全锁模式（v2.1 新增）
+
+Rust 后端统一采用 `safe_lock()` 辅助函数替代 `Mutex::lock().unwrap()`，在锁被毒化（panic 导致）时通过 `unwrap_or_else(|e| e.into_inner())` 恢复内部数据继续运行，避免单个 panic 导致整个 API 服务崩溃。此模式应用于：
+
+- `api_server/pool.rs` — 账号池状态读写
+- `api_server/routes.rs` — 请求处理中 `active_uid` / `last_error` 读写
+- `commands/api_server.rs` — API 服务运行时状态读写
+
+同时，`Response::builder()...body().unwrap()` 统一替换为 `unwrap_or_else()` fallback，防止响应构建失败时 panic。
+
+### 3.5 暗色模式图表适配（v2.1 新增）
+
+前端使用共享 `useIsDark()` hook（`src/lib/useIsDark.ts`）监听 `document.documentElement` 的 `class` 属性变化，实时检测暗色模式切换。Recharts 图表（Dashboard 柱状图、Credits 折线图）根据 `isDark` 状态动态调整：
+
+- 网格线/轴线颜色（light: `#e2e8f0` / dark: `#3f3f46`）
+- 文本颜色（light: `#94a3b8` / dark: `#a1a1aa`）
+- 柱状/折线颜色明度反转（暗色模式使用高明度色）
+- Tooltip 背景与边框（light: 白底 / dark: `#18181b` 深色底）
 
 ## 4. 进程与子进程契约
 

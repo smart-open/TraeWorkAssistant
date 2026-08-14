@@ -5,7 +5,7 @@ use crate::fs_utils;
 use crate::jwt;
 use crate::models::{
     AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, Group, RawAccount,
-    CreditsFile, CheckinSummary, RemainingCreditsFile, AccountCooldownsFile,
+    CreditsFile, CreditsDailyFile, CreditsDailySnapshot, CheckinSummary, RemainingCreditsFile, AccountCooldownsFile,
 };
 
 use crate::state::AppState;
@@ -240,7 +240,8 @@ pub fn group_move(
 /// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
 /// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），求和后四舍五入保留2位小数。
 /// 同时返回最近过期的 expire_time（Unix 秒），用于积分过期感知调度。
-fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>), String> {
+/// 同时返回今日非签到获得的积分（start_time 在今日本地时间内且 package_source_type != 9）。
+fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> {
     let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
         jwt.to_string()
     } else {
@@ -264,7 +265,19 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>), String> {
 
     let mut total: f64 = 0.0;
     let mut earliest_expire: Option<i64> = None;
+    let mut today_non_checkin_earned: f64 = 0.0;
     let now_ts = chrono::Local::now().timestamp();
+
+    // 今日本地时间范围 [00:00:00, 23:59:59]
+    let today_start = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .unwrap()
+        .timestamp();
+    let today_end = today_start + 86400;
+
     for pack in packs {
         // 仅对有 credits_limit 的包计入统计
         let credits_limit = pack
@@ -280,6 +293,7 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>), String> {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
             total += (limit - used).max(0.0);
+
             // expire_time 也在 pack 顶层，取最早的（且未过期的）
             let expire = pack
                 .get("expire_time")
@@ -289,11 +303,33 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>), String> {
                     earliest_expire = Some(earliest_expire.map_or(exp, |e| e.min(exp)));
                 }
             }
+
+            // 今日非签到获得的积分：
+            // start_time 在今日本地时间范围内，且 package_source_type != 9（非签到）
+            let start_time = pack
+                .get("entitlement_base_info")
+                .and_then(|e| e.get("start_time"))
+                .and_then(|v| v.as_i64());
+            let source_type = pack
+                .get("entitlement_base_info")
+                .and_then(|e| e.get("product_extra"))
+                .and_then(|pe| pe.get("package_extra"))
+                .and_then(|pk| pk.get("package_source_type"))
+                .and_then(|v| v.as_i64());
+            if let (Some(st), Some(srt)) = (start_time, source_type) {
+                if st >= today_start && st < today_end && srt != 9 {
+                    today_non_checkin_earned += limit;
+                }
+            }
         }
     }
 
     // 四舍五入保留2位小数
-    Ok(((total * 100.0).round() / 100.0, earliest_expire))
+    Ok((
+        (total * 100.0).round() / 100.0,
+        earliest_expire,
+        (today_non_checkin_earned * 100.0).round() / 100.0,
+    ))
 }
 
 /// 获取单个账号的剩余积分（实时请求 API）
@@ -306,7 +342,7 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
         .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
         .ok_or("账号不存在")?;
     let jwt = &account.jwt;
-    let (credits, expire_at) = calc_remaining_credits(jwt)?;
+    let (credits, expire_at, _non_checkin) = calc_remaining_credits(jwt)?;
     // 写入缓存
     let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
     rc.credits.insert(user_id.clone(), credits);
@@ -327,6 +363,7 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
     let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
     let mut ok_count = 0usize;
     let mut thawed_count = 0usize;
+    let mut total_non_checkin_earned: f64 = 0.0;
     for a in &accounts.accounts {
         let uid = a
             .user_id
@@ -337,11 +374,12 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
             continue;
         }
         match calc_remaining_credits(&a.jwt) {
-            Ok((credits, expire_at)) => {
+            Ok((credits, expire_at, non_checkin_earned)) => {
                 rc.credits.insert(uid.clone(), credits);
                 if let Some(exp) = expire_at {
                     rc.expire_times.insert(uid.clone(), exp);
                 }
+                total_non_checkin_earned += non_checkin_earned;
                 ok_count += 1;
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
                 if credits > 0.0 {
@@ -372,11 +410,75 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
     }
     rc.updated_at = Some(fs_utils::now_iso());
     fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
+
+    // 记录每日积分快照（total / earned / consumed）
+    record_daily_snapshot(&state, &rc, total_non_checkin_earned);
+
     if thawed_count > 0 {
         cd.updated_at = Some(fs_utils::now_iso());
         fs_utils::write_json(&state.path("account_cooldowns.json"), &cd)?;
     }
     Ok(ok_count)
+}
+
+/// 记录每日积分快照（每天计算一次）：
+/// - total = 所有账号剩余积分之和
+/// - earned = 签到获得积分（credits_history.json delta 之和）+ 非签到获得积分（API 查询）
+/// - consumed = |total - earned - 昨日total|（取绝对值）
+fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non_checkin_earned: f64) {
+    let today = fs_utils::today_prefix(); // "YYYY-MM-DD"
+    let total: f64 = rc.credits.values().sum();
+    let total = (total * 100.0).round() / 100.0;
+
+    let mut file: CreditsDailyFile = fs_utils::read_json(&state.path("credits_daily.json"));
+
+    // 如果今天已有快照，更新 total 但不重复计算 earned/consumed
+    if let Some(existing) = file.snapshots.iter_mut().find(|s| s.date == today) {
+        existing.total = total;
+        let _ = fs_utils::write_json(&state.path("credits_daily.json"), &file);
+        return;
+    }
+
+    // earned = 签到获得积分（从 credits_history.json 汇总 delta）+ 非签到获得积分（API 查询）
+    let credits_file: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
+    let checkin_earned: f64 = credits_file
+        .records
+        .iter()
+        .filter(|r| r.date == today && r.user_id != "_daily_total")
+        .map(|r| r.delta as f64)
+        .sum();
+    let earned = ((checkin_earned + non_checkin_earned) * 100.0).round() / 100.0;
+
+    // 昨日积分总数
+    let yesterday_total = file.snapshots.last().map(|s| s.total).unwrap_or(0.0);
+
+    // consumed = |total - earned - yesterday_total|
+    let consumed = (total - earned - yesterday_total).abs();
+    let consumed = (consumed * 100.0).round() / 100.0;
+
+    file.snapshots.push(CreditsDailySnapshot {
+        date: today,
+        total,
+        earned,
+        consumed,
+    });
+
+    // 保留 90 天
+    let cutoff = {
+        let now = chrono::Utc::now();
+        let cutoff_date = now - chrono::Duration::days(90);
+        cutoff_date.format("%Y-%m-%d").to_string()
+    };
+    file.snapshots.retain(|s| s.date >= cutoff);
+
+    let _ = fs_utils::write_json(&state.path("credits_daily.json"), &file);
+}
+
+/// 获取每日积分快照列表
+#[tauri::command]
+pub fn credits_daily_list(state: State<AppState>) -> Vec<CreditsDailySnapshot> {
+    let file: CreditsDailyFile = fs_utils::read_json(&state.path("credits_daily.json"));
+    file.snapshots
 }
 
 /// 手动清除指定账号的冷却状态

@@ -153,6 +153,21 @@ pub struct CreditsFile {
     pub records: Vec<CreditRecord>,
 }
 
+/// 每日积分快照：记录当天所有账号的积分总数、获得数、消耗数
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct CreditsDailySnapshot {
+    pub date: String,
+    pub total: f64,
+    pub earned: f64,
+    pub consumed: f64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct CreditsDailyFile {
+    #[serde(default)]
+    pub snapshots: Vec<CreditsDailySnapshot>,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct CheckinSummary {
     #[serde(default)]
@@ -229,4 +244,5 @@ pub struct ApiServiceStatus {
     pub total_requests: u64,
     pub active_uid: Option<String>,
     pub last_error: Option<String>,
+    pub started_at: Option<u64>,
 }

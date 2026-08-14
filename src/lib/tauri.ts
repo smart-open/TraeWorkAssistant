@@ -7,6 +7,7 @@ import type {
   CheckinDone,
   CheckinOpts,
   CreditRecord,
+  CreditsDailySnapshot,
   EnvStatus,
   GroupView,
   JwtParseResult,
@@ -48,6 +49,8 @@ export const api = {
       invoke<number>('fetch_remaining_credits', { userId }),
     refreshRemainingCredits: () =>
       invoke<number>('refresh_remaining_credits'),
+    dailyList: () =>
+      invoke<CreditsDailySnapshot[]>('credits_daily_list'),
     cooldownClear: (userId: string) =>
       invoke('cooldown_clear', { userId }),
     refreshJwt: (userId: string) =>

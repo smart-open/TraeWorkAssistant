@@ -125,6 +125,13 @@ export interface CreditRecord {
   delta: number;
 }
 
+export interface CreditsDailySnapshot {
+  date: string;
+  total: number;
+  earned: number;
+  consumed: number;
+}
+
 export interface ProxyLogEntry {
   id: string;
   timestamp: string;
@@ -148,6 +155,7 @@ export interface ApiServiceStatus {
   total_requests: number;
   active_uid: string | null;
   last_error: string | null;
+  started_at: number | null;
 }
 
 export interface PoolStatus {

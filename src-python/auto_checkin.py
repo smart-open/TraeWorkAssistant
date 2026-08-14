@@ -513,27 +513,20 @@ def main():
         emit_cooldown_until = None
 
         if ok:
-            # 签到成功 → 清除冷却
+            # 签到成功 -> 清除冷却
             clear_cooldown(user_id)
-            ok2, _checked, credits_after, code2, msg2 = status_check(name, jwt, device_map)
-            if ok2 and isinstance(credits_after, int) and isinstance(credits_before, int):
-                delta = credits_after - credits_before
-                final_credits = credits_after
-                final_delta = delta
-                result["credits_before"] = credits_before
-                result["credits_after"] = credits_after
-                result["credits_delta"] = delta
-                print(f"  积分核对: {credits_before} -> {credits_after} (delta={delta:+d})")
-                if delta > 0:
-                    print(f"  [OK] 签到成功，积分 +{delta}")
-                    result["action"] = "claim_ok"
-                else:
-                    print(f"  [OK] 签到成功（积分未变化，可能为幂等返回/今日已发）")
-                    result["action"] = "claim_idempotent"
-            else:
-                print(f"  [OK] 签到成功（积分复核失败 code={code2}，已忽略：{msg2}）")
+            # credits_before 来自 status 接口，表示签到可获得的积分额度
+            # 签到成功后，delta 就是该额度（无需再次请求 status 计算差值）
+            if isinstance(credits_before, int):
+                final_delta = credits_before
+                final_credits = credits_before
+                result["credits"] = credits_before
+                result["credits_delta"] = final_delta
+                print(f"  [OK] 签到成功，积分 +{final_delta}")
                 result["action"] = "claim_ok"
-                final_credits = credits_after if isinstance(credits_after, int) else None
+            else:
+                print(f"  [OK] 签到成功（status 未返回积分额度）")
+                result["action"] = "claim_ok"
         else:
             # 签到失败 → 分类错误并写入冷却
             error_type, cooldown_secs = classify_error(http_status, msg, code)

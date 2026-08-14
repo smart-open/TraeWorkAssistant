@@ -16,7 +16,7 @@ export default function TitleBar() {
         className="flex h-9 shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 pl-3 pr-1 dark:border-zinc-800 dark:bg-zinc-950"
       >
         <div data-tauri-drag-region className="flex flex-1 items-center gap-2">
-          <span className="flex h-5 w-5 items-center justify-center rounded-md bg-zinc-900 text-[11px] font-bold text-white dark:bg-zinc-100 dark:text-zinc-900">
+          <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-brand-700 text-[10px] font-bold tracking-tight text-white shadow-sm dark:from-brand-400 dark:to-brand-600">
             TW
           </span>
           <span className="text-sm font-semibold text-slate-700 dark:text-zinc-200">

@@ -311,8 +311,8 @@ export default function Checkin() {
                   <span className="w-8 text-right text-xs text-slate-400">{r.index}</span>
                   <span className="flex-1 truncate">{r.name}</span>
                   <span className={`text-xs ${tone}`}>
-                    {r.status === 'success' && `+${r.delta ?? 0} (余额 ${r.credits ?? '?'})`}
-                    {r.status === 'already' && `已签 (余额 ${r.credits ?? '?'})`}
+                    {r.status === 'success' && `积分+${r.delta ?? 0}`}
+                    {r.status === 'already' && `积分+${r.credits ?? 0}`}
                     {r.status === 'fail' && (r.message ?? '失败')}
                   </span>
                   {r.error_type && (

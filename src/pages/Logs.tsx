@@ -1,4 +1,4 @@
-﻿import { useEffect, useState, useCallback } from 'react';
+﻿import { useEffect, useState, useCallback, useRef } from 'react';
 import { RefreshCw, Search, Trash2, Download, Copy, ChevronLeft, ChevronRight, Eye } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, Modal } from '../components/ui';
@@ -160,6 +160,7 @@ function ProxyLogsTab() {
   const [loading, setLoading] = useState(false);
   const [detail, setDetail] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const detailReqId = useRef(0);
 
   const fetchList = useCallback(async () => {
     setLoading(true);
@@ -190,16 +191,25 @@ function ProxyLogsTab() {
   };
 
   const showDetail = async (id: string) => {
+    const reqId = ++detailReqId.current;
     setDetailLoading(true);
     setDetail('');
     try {
       const raw = await api.misc.proxyLogDetail(id);
+      if (detailReqId.current !== reqId) return; // 已被取消
       setDetail(raw);
     } catch (e) {
+      if (detailReqId.current !== reqId) return;
       toast('error', `获取详情失败：${String(e)}`);
     } finally {
-      setDetailLoading(false);
+      if (detailReqId.current === reqId) setDetailLoading(false);
     }
+  };
+
+  const closeDetail = () => {
+    detailReqId.current++; // 使正在进行的请求失效
+    setDetail(null);
+    setDetailLoading(false);
   };
 
   const copyDetail = async () => {
@@ -359,11 +369,11 @@ function ProxyLogsTab() {
       {/* 详情弹窗 */}
       <Modal
         open={detail !== null || detailLoading}
-        onClose={() => { setDetail(null); setDetailLoading(false); }}
+        onClose={closeDetail}
         title="请求详情"
         footer={
           <>
-            <button onClick={() => { setDetail(null); setDetailLoading(false); }} className="btn-ghost">关闭</button>
+            <button onClick={closeDetail} className="btn-ghost">关闭</button>
             <button onClick={copyDetail} disabled={!detail} className="btn-primary">
               <Copy size={14} /> 复制
             </button>
@@ -395,16 +405,24 @@ export default function Logs() {
       />
 
       {/* Tab 切换 */}
-      <div className="mb-3 flex gap-2">
+      <div className="mb-3 flex gap-1 border-b border-slate-200 dark:border-zinc-800">
         <button
           onClick={() => setTab('system')}
-          className={`chip border ${tab === 'system' ? 'border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-500/15 dark:text-brand-300' : 'border-slate-300 text-slate-500'}`}
+          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors ${
+            tab === 'system'
+              ? 'border-b-2 border-brand-500 text-brand-600 dark:text-brand-400'
+              : 'text-slate-500 hover:text-slate-700 dark:text-zinc-400 dark:hover:text-zinc-200'
+          }`}
         >
           运行日志
         </button>
         <button
           onClick={() => setTab('proxy')}
-          className={`chip border ${tab === 'proxy' ? 'border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-500/15 dark:text-brand-300' : 'border-slate-300 text-slate-500'}`}
+          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors ${
+            tab === 'proxy'
+              ? 'border-b-2 border-brand-500 text-brand-600 dark:text-brand-400'
+              : 'text-slate-500 hover:text-slate-700 dark:text-zinc-400 dark:hover:text-zinc-200'
+          }`}
         >
           代理日志
         </button>

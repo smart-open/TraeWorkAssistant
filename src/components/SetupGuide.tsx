@@ -86,6 +86,9 @@ export default function SetupGuide() {
     setBusy(step.key);
     try {
       await step.run();
+    } catch (e) {
+      // 错误已由各 step.run() 内部 toast 处理；此处兜底防止未捕获异常
+      console.error(`[SetupGuide] step "${step.key}" failed:`, e);
     } finally {
       setBusy(null);
     }

@@ -1,19 +1,18 @@
 import { useMemo } from 'react';
 import {
-  BarChart,
-  Bar,
+  LineChart,
+  Line,
   XAxis,
   YAxis,
   ResponsiveContainer,
   Tooltip,
   CartesianGrid,
-  Cell,
-  LabelList,
 } from 'recharts';
 import { Coins } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { StatCard, Badge, EmptyState } from '../components/ui';
 import { useAppStore } from '../store';
+import { useIsDark } from '../lib/useIsDark';
 
 function localDate(d: Date): string {
   const y = d.getFullYear();
@@ -27,8 +26,20 @@ export default function Credits() {
   const groups = useAppStore((s) => s.groups);
   const creditsHistory = useAppStore((s) => s.creditsHistory);
 
+  const creditsDaily = useAppStore((s) => s.creditsDaily);
+  const isDark = useIsDark();
+
   const rows = useMemo(
-    () => [...accounts].sort((a, b) => (b.remaining_credits ?? -1) - (a.remaining_credits ?? -1)),
+    () =>
+      [...accounts].sort((a, b) => {
+        const va = a.remaining_credits;
+        const vb = b.remaining_credits;
+        // null 排到最后
+        if (va == null && vb == null) return 0;
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        return vb - va; // 降序
+      }),
     [accounts],
   );
   const total = rows.reduce((s, a) => s + (a.remaining_credits ?? 0), 0);
@@ -47,26 +58,32 @@ export default function Credits() {
     return histVal;
   }, [creditsHistory, today, total]);
 
-  // 近 7 日趋势：
-  // - 有 credits_history 记录时，按日期聚合 delta
-  // - 没有历史记录时，用当前 total 作为今日数据点，其余天为 0
+  // 近 7 日趋势：从 creditsDaily 快照取数据，补齐无数据的日期
   const trend = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const r of creditsHistory) map.set(r.date, (map.get(r.date) || 0) + (r.delta || 0));
-    const days: { label: string; delta: number }[] = [];
+    const map = new Map<string, { total: number; earned: number; consumed: number }>();
+    for (const s of creditsDaily) {
+      map.set(s.date, { total: s.total, earned: s.earned, consumed: s.consumed });
+    }
+    const days: { label: string; total: number; earned: number; consumed: number }[] = [];
     for (let i = 6; i >= 0; i--) {
       const d = new Date(Date.now() - i * 86400000);
       const key = localDate(d);
-      let val = map.get(key) || 0;
-      if (i === 0 && val === 0 && total > 0) {
-        val = Math.round(total);
-      }
-      days.push({ label: `${d.getMonth() + 1}/${d.getDate()}`, delta: val });
+      const snap = map.get(key);
+      days.push({
+        label: `${d.getMonth() + 1}/${d.getDate()}`,
+        total: snap?.total ?? 0,
+        earned: snap?.earned ?? 0,
+        consumed: snap?.consumed ?? 0,
+      });
+    }
+    // 如果今天没有快照，用当前 total 填充
+    if (days.length > 0 && days[days.length - 1].total === 0 && total > 0) {
+      days[days.length - 1].total = Math.round(total);
     }
     return days;
-  }, [creditsHistory, total]);
+  }, [creditsDaily, total]);
 
-  const hasTrend = trend.some((d) => d.delta > 0);
+  const hasTrend = trend.some((d) => d.total > 0 || d.earned > 0 || d.consumed > 0);
 
   return (
     <div className="animate-fade-in">
@@ -90,9 +107,20 @@ export default function Credits() {
               7 Days
             </span>
           </div>
-          <span className="text-xs text-slate-400">
-            {creditsHistory.length > 0 ? '每日新增积分' : '当前可用积分'}
-          </span>
+          <div className="flex items-center gap-3 text-xs text-slate-400">
+            <span className="flex items-center gap-1">
+              <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#6366f1' }} />
+              积分总数
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#22c55e' }} />
+              获得积分
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#f59e0b' }} />
+              消耗积分
+            </span>
+          </div>
         </div>
         {accounts.length === 0 ? (
           <EmptyState icon={<Coins size={28} />} title="尚无账号数据" hint="添加账号后这里会展示积分趋势。" />
@@ -105,50 +133,35 @@ export default function Credits() {
         ) : (
           <div className="h-56">
             <ResponsiveContainer>
-              <BarChart data={trend} margin={{ top: 24, right: 16, left: 0, bottom: 4 }} barCategoryGap="40%">
-                <defs>
-                  <linearGradient id="barGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#3f3f46" />
-                    <stop offset="100%" stopColor="#71717a" />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" opacity={0.25} vertical={false} />
+              <LineChart data={trend} margin={{ top: 24, right: 16, left: 0, bottom: 4 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
                 <XAxis
                   dataKey="label"
-                  tick={{ fontSize: 11, fill: '#94a3b8' }}
-                  axisLine={{ stroke: '#e2e8f0' }}
+                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                  axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
                   tickLine={false}
                 />
-                <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={48} />
+                <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={56} />
                 <Tooltip
-                  cursor={{ fill: 'rgba(0,0,0,0.03)' }}
+                  cursor={{ stroke: isDark ? '#52525b' : '#cbd5e1', strokeWidth: 1, strokeDasharray: '3 3' }}
                   contentStyle={{
                     fontSize: 12,
                     borderRadius: 10,
-                    border: '1px solid #e2e8f0',
+                    border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                    background: isDark ? '#18181b' : '#fff',
+                    color: isDark ? '#e4e4e7' : '#1e293b',
                     boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
                     padding: '8px 12px',
                   }}
-                  formatter={(v: number) => [v.toLocaleString(), '积分']}
+                  formatter={(v: number, name: string) => {
+                    const labels: Record<string, string> = { total: '积分总数', earned: '获得积分', consumed: '消耗积分' };
+                    return [v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }), labels[name] ?? name];
+                  }}
                 />
-                <Bar dataKey="delta" radius={[6, 6, 0, 0]} maxBarSize={36}>
-                  {trend.map((d, i) => {
-                    const isToday = i === trend.length - 1;
-                    return (
-                      <Cell
-                        key={i}
-                        fill={isToday && creditsHistory.length === 0 ? '#71717a' : 'url(#barGradient)'}
-                      />
-                    );
-                  })}
-                  <LabelList
-                    dataKey="delta"
-                    position="top"
-                    formatter={(v: number) => v > 0 ? (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0)) : ''}
-                    style={{ fontSize: 10, fill: '#94a3b8', fontWeight: 500 }}
-                  />
-                </Bar>
-              </BarChart>
+                <Line type="monotone" dataKey="total" stroke="#6366f1" strokeWidth={2.5} dot={{ r: 3, fill: '#6366f1', strokeWidth: 0 }} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="earned" stroke="#22c55e" strokeWidth={2} dot={{ r: 3, fill: '#22c55e', strokeWidth: 0 }} activeDot={{ r: 5 }} />
+                <Line type="monotone" dataKey="consumed" stroke="#f59e0b" strokeWidth={2} dot={{ r: 3, fill: '#f59e0b', strokeWidth: 0 }} activeDot={{ r: 5 }} />
+              </LineChart>
             </ResponsiveContainer>
           </div>
         )}

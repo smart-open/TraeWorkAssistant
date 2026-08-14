@@ -17,6 +17,12 @@ use crate::api_server::ApiSharedState;
 pub struct ApiServerRuntime {
     pub handle: ApiServerHandle,
     pub shared: Arc<ApiSharedState>,
+    pub started_at: u64,
+}
+
+/// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
+fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ==================== 启停命令 ====================
@@ -28,7 +34,7 @@ pub async fn api_server_start(
 ) -> Result<ApiServiceStatus, String> {
     // 检查是否已运行
     {
-        let guard = runtime.lock().unwrap();
+        let guard = safe_lock(&runtime);
         if guard.is_some() {
             return Err("API 服务已在运行".into());
         }
@@ -82,17 +88,24 @@ pub async fn api_server_start(
         &format!("API 服务已启动: port={} pool_accounts={}", port, pool_count),
     );
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     let status = ApiServiceStatus {
         running: true,
         port,
         total_requests: 0,
         active_uid: None,
         last_error: None,
+        started_at: Some(now),
     };
 
-    *runtime.lock().unwrap() = Some(ApiServerRuntime {
+    *safe_lock(&runtime) = Some(ApiServerRuntime {
         handle,
         shared: shared.clone(),
+        started_at: now,
     });
 
     Ok(status)
@@ -103,7 +116,7 @@ pub async fn api_server_stop(
     state: State<'_, AppState>,
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
 ) -> Result<(), String> {
-    let mut guard = runtime.lock().unwrap();
+    let mut guard = safe_lock(&runtime);
     if let Some(mut rt) = guard.take() {
         rt.handle.stop();
         fs_utils::app_log(&state.data_dir, "API 服务已停止");
@@ -116,21 +129,22 @@ pub fn api_server_status(
     state: State<'_, AppState>,
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
 ) -> ApiServiceStatus {
-    let guard = runtime.lock().unwrap();
+    let guard = safe_lock(&runtime);
     match guard.as_ref() {
         Some(rt) => {
             let total = rt
                 .shared
                 .total_requests
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let active = rt.shared.active_uid.lock().unwrap().clone();
-            let last_err = rt.shared.last_error.lock().unwrap().clone();
+            let active = safe_lock(&rt.shared.active_uid).clone();
+            let last_err = safe_lock(&rt.shared.last_error).clone();
             ApiServiceStatus {
                 running: true,
                 port: state.settings().api_port,
                 total_requests: total,
                 active_uid: active,
                 last_error: last_err,
+                started_at: Some(rt.started_at),
             }
         }
         None => {
@@ -141,6 +155,7 @@ pub fn api_server_status(
                 total_requests: 0,
                 active_uid: None,
                 last_error: None,
+                started_at: None,
             }
         }
     }
@@ -165,7 +180,7 @@ pub fn pool_set(state: State<'_, AppState>, uids: Vec<String>) -> Result<(), Str
 /// 返回运行中池的实时状态（冷却/积分等）；服务未运行时返回空数组
 #[tauri::command]
 pub fn pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<PoolStatus> {
-    let guard = runtime.lock().unwrap();
+    let guard = safe_lock(&runtime);
     match guard.as_ref() {
         Some(rt) => rt.shared.pool.status_list(),
         None => vec![],

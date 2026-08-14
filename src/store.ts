@@ -3,9 +3,11 @@ import { sendNotification } from '@tauri-apps/plugin-notification';
 import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent } from './lib/tauri';
 import type {
   AccountView,
+  ApiServiceStatus,
   CheckinAccountResult,
   CheckinDone,
   CreditRecord,
+  CreditsDailySnapshot,
   EnvStatus,
   GroupView,
   LogLine,
@@ -43,11 +45,13 @@ interface AppState {
   env: EnvStatus | null;
   certInstalled: boolean;
   proxy: ProxyStatus;
+  apiStatus: ApiServiceStatus | null;
   accounts: AccountView[];
   groups: GroupView[];
   settings: Settings | null;
   logs: LogLine[];
   creditsHistory: CreditRecord[];
+  creditsDaily: CreditsDailySnapshot[];
   proxyLog: string[];
   switchProgress: string[];
   deviceResetProgress: string[];
@@ -65,11 +69,13 @@ interface AppState {
   refreshEnv: () => Promise<void>;
   refreshCert: () => Promise<void>;
   refreshProxy: () => Promise<void>;
+  refreshApiStatus: () => Promise<void>;
   refreshAccounts: () => Promise<void>;
   refreshGroups: () => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshLogs: (q?: LogQuery) => Promise<void>;
   refreshCreditsHistory: () => Promise<void>;
+  refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
 
   startProxy: () => Promise<void>;
@@ -141,11 +147,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   env: null,
   certInstalled: false,
   proxy: { running: false, port: 0, captured: 0, started_at: null },
+  apiStatus: null,
   accounts: [],
   groups: [],
   settings: null,
   logs: [],
   creditsHistory: [],
+  creditsDaily: [],
   proxyLog: [],
   switchProgress: [],
   deviceResetProgress: [],
@@ -225,10 +233,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().refreshEnv(),
       get().refreshCert(),
       get().refreshProxy(),
+      get().refreshApiStatus(),
       get().refreshAccounts(),
       get().refreshGroups(),
       get().refreshSettings(),
       get().refreshCreditsHistory(),
+      get().refreshCreditsDaily(),
       get().refreshProfiles(),
     ]);
     set({ ready: true });
@@ -278,7 +288,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (e.type === 'done') {
       void get().refreshAccounts();
       // 签到完成后静默刷新剩余积分（内部会再次 refreshAccounts）
-      void api.accounts.refreshRemainingCredits().then(() => get().refreshAccounts()).catch(() => {});
+      void api.accounts.refreshRemainingCredits().then(() => {
+        get().refreshAccounts();
+        get().refreshCreditsDaily();
+      }).catch(() => {});
       get().pushToast(
         e.failed > 0 ? 'warn' : 'success',
         `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
@@ -308,6 +321,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ proxy });
     } catch {
       /* ignore */
+    }
+  },
+  refreshApiStatus: async () => {
+    try {
+      const s = await api.apiServer.status();
+      set({ apiStatus: s });
+    } catch {
+      set({ apiStatus: null });
     }
   },
   refreshAccounts: async () => {
@@ -353,6 +374,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ creditsHistory });
     } catch (err) {
       get().pushToast('error', `读取积分历史失败：${String(err)}`);
+    }
+  },
+  refreshCreditsDaily: async () => {
+    try {
+      const creditsDaily = await api.accounts.dailyList();
+      set({ creditsDaily });
+    } catch {
+      /* ignore */
     }
   },
 

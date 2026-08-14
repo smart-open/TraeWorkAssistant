@@ -6,6 +6,8 @@ import {
   ShieldAlert,
   MonitorCheck,
   MonitorX,
+  Server,
+  Wifi,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { Badge } from './ui';
@@ -14,6 +16,7 @@ export default function TopBar() {
   const env = useAppStore((s) => s.env);
   const certInstalled = useAppStore((s) => s.certInstalled);
   const proxy = useAppStore((s) => s.proxy);
+  const apiStatus = useAppStore((s) => s.apiStatus);
   const startProxy = useAppStore((s) => s.startProxy);
   const stopProxy = useAppStore((s) => s.stopProxy);
   const pushToast = useAppStore((s) => s.pushToast);
@@ -45,7 +48,10 @@ export default function TopBar() {
           </Badge>
         )}
         <Badge tone={proxy.running ? 'blue' : 'slate'}>
-          {proxy.running ? `代理运行中 :${proxy.port}` : '代理未启动'}
+          <Wifi size={13} /> {proxy.running ? `代理运行中 :${proxy.port}` : '代理未启动'}
+        </Badge>
+        <Badge tone={apiStatus?.running ? 'green' : 'slate'}>
+          <Server size={13} /> {apiStatus?.running ? `API 服务 :${apiStatus.port}` : 'API 服务未启动'}
         </Badge>
       </div>
       <div className="flex items-center gap-2">

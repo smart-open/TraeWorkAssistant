@@ -113,6 +113,7 @@ export default function ApiService() {
     try {
       const s = await api.apiServer.start();
       setStatus(s);
+      useAppStore.setState({ apiStatus: s });
       toast('success', `API 服务已启动（端口 ${s.port}）`);
       void refreshStatus();
     } catch (err) {
@@ -129,6 +130,7 @@ export default function ApiService() {
       toast('info', 'API 服务已停止');
       setStatus(null);
       setPoolStatus([]);
+      useAppStore.setState({ apiStatus: null });
     } catch (err) {
       toast('error', `停止失败：${String(err)}`);
     } finally {
@@ -288,6 +290,12 @@ export default function ApiService() {
               </code>
               <code className="mt-1 block break-all text-[11px]">
                 GET http://127.0.0.1:{form?.api_port ?? 7864}/v1/models
+              </code>
+              <code className="mt-1 block break-all text-[11px]">
+                GET http://127.0.0.1:{form?.api_port ?? 7864}/health
+              </code>
+              <code className="mt-1 block break-all text-[11px]">
+                GET http://127.0.0.1:{form?.api_port ?? 7864}/status
               </code>
             </div>
 

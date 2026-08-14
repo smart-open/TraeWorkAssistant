@@ -37,6 +37,11 @@ pub struct ApiPool {
     entries: Mutex<HashMap<String, PoolEntry>>,
 }
 
+/// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
+fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl ApiPool {
     pub fn new() -> Self {
         Self {
@@ -53,7 +58,7 @@ impl ApiPool {
         remaining_credits: &HashMap<String, f64>,
         expire_times: &HashMap<String, i64>,
     ) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = safe_lock(&self.entries);
         entries.clear();
         let enabled: HashSet<&str> = enabled_uids.iter().map(|s| s.as_str()).collect();
         for a in accounts {
@@ -83,7 +88,7 @@ impl ApiPool {
 
     /// 挑选 healthy 账号中积分过期时间最近者；跳过 tried
     pub fn pick_excluding(&self, tried: &HashSet<String>) -> Option<PickedAccount> {
-        let entries = self.entries.lock().unwrap();
+        let entries = safe_lock(&self.entries);
         let now = now_ts();
         let mut best: Option<&PoolEntry> = None;
         for (uid, e) in entries.iter() {
@@ -132,7 +137,7 @@ impl ApiPool {
     /// 记录错误并冷却
     pub fn note_error(&self, uid: &str, kind: ErrKind) {
         let dur = kind.cooldown_duration();
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = safe_lock(&self.entries);
         if let Some(e) = entries.get_mut(uid) {
             if kind == ErrKind::SessionDead {
                 e.disabled = true;
@@ -153,7 +158,7 @@ impl ApiPool {
 
     /// 记录成功
     pub fn note_success(&self, uid: &str) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = safe_lock(&self.entries);
         if let Some(e) = entries.get_mut(uid) {
             e.err_count = 0;
         }
@@ -161,7 +166,7 @@ impl ApiPool {
 
     /// 返回池状态列表
     pub fn status_list(&self) -> Vec<PoolStatus> {
-        let entries = self.entries.lock().unwrap();
+        let entries = safe_lock(&self.entries);
         let now = now_ts();
         let mut out: Vec<PoolStatus> = entries
             .values()
@@ -182,7 +187,7 @@ impl ApiPool {
     }
 
     pub fn count(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        safe_lock(&self.entries).len()
     }
 }
 

@@ -171,3 +171,34 @@
   5. 注册表 `HKLM:\SOFTWARE\Microsoft\Cryptography\MachineGuid` — 替换
   6. `trae-webview` 追踪数据 — 清除
 - 删除 `has_device_id_updated_to_aha` 标记位，强制 TRAE 重新注册设备。
+
+---
+
+## 14. 每日积分快照（v2.1 新增）
+
+### `credits_daily_list()` → `CreditsDailySnapshot[]`
+- 返回每日积分快照列表（供积分看板三线趋势图使用）。
+- `CreditsDailySnapshot`: `{ date: string, total: number, earned: number, consumed: number }`
+  - `date`: 本地日期 `YYYY-MM-DD`
+  - `total`: 当日所有账号剩余积分之和
+  - `earned`: 当日获得积分（签到获得 + 非签到获得）
+  - `consumed`: 当日消耗积分（`|total - earned - 昨日total|`）
+- 数据源 `credits_daily.json`，每次刷新剩余积分时自动记录当天快照，保留 90 天。
+
+---
+
+## 15. 冷却状态管理（v2.1 新增）
+
+### `cooldown_clear(userId)` → `Result<(), String>`
+- 手动清除指定账号的冷却状态。
+- 从 `account_cooldowns.json` 中移除该账号的冷却记录。
+
+---
+
+## 16. JWT 刷新（v2.1 新增）
+
+### `refresh_jwt(userId)` → `Result<String, String>`
+- 使用 `refresh_token` 调用 TRAE OAuth ExchangeToken API 刷新 JWT。
+- 成功后原子写回新的 `accessToken` + `refresh_token` 到 `checkin_accounts.json`，返回新 JWT。
+- 使用 `jwt_refresh_lock` 防止并发刷新，持锁后 double-check 文件防止重复刷新。
+- 无 `refresh_token` 的账号返回错误（需手动重新捕获 JWT）。

@@ -22,9 +22,12 @@ Windows 桌面端多账号签到与管理工具 · Tauri 2 + React 18 + Rust
 - **账号管理**：多账号 JWT 录入/编辑/查看、分组管理、设备 ID 隔离
 - **一键签到**：批量签到、按分组/手动勾选、跳过已签/过期、实时进度
 - **登录态切换**：PowerShell 桥接，关闭 -> 备份 -> 恢复 -> 带代理重启
-- **积分看板**：排行、趋势图、今日新增统计
+- **积分看板**：排行、三线趋势图（总数/获得/消耗）、今日新增统计
 - **本地代理**：MITM 代理自动捕获 JWT、注入独立设备 ID
+- **API 网关**：内嵌 OpenAI 兼容 API 服务，账号池智能调度（积分过期感知 + 冷却状态机）
 - **定时任务**：Windows 计划任务，后台自动签到
+- **6 层设备标识重置**：machineid / storage.json / aha / 注册表 / webview 追踪数据
+- **暗色模式**：全界面暗色主题支持，图表动态适配
 - **数据全部本地存储**，不上传任何服务器
 
 ## 开发
@@ -45,8 +48,13 @@ npm run tauri build    # 打包（msi + nsis）
 ├── device_map.json          # 设备 ID 映射
 ├── groups.json              # 分组
 ├── app_settings.json        # 设置
-├── credits_history.json     # 积分历史
-└── logs/                    # proxy / checkin / switcher 日志
+├── credits_history.json     # 积分历史（签到明细）
+├── credits_daily.json       # 每日积分快照（三线趋势图数据源）
+├── remaining_credits.json   # 各账号剩余积分缓存
+├── account_cooldowns.json   # 签到错误冷却状态
+├── api_pool.json            # API 账号池配置
+├── logs/                    # proxy / checkin / switcher 日志
+└── proxy_logs/              # 代理请求日志（按日期分割）
 ```
 
 ## License
