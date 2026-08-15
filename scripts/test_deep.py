@@ -18,9 +18,9 @@ DEVICE_MAP_FILE = os.path.join(APP_DATA, "device_map.json")
 
 EP_CHAT = "/api/agent/v3/llm_utils_chat"
 APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
-HELPER_HOST = "https://api5-normal.mchost.guru"
-HELPER_IDE_VERSION = "0.1.50"
-HELPER_IDE_VERSION_CODE = "20260811"
+ASSISTANT_HOST = "https://api5-normal.mchost.guru"
+ASSISTANT_IDE_VERSION = "0.1.50"
+ASSISTANT_IDE_VERSION_CODE = "20260811"
 
 CAPTURED_HELIOS = "ZXUAAJY4uyadZMga00bKJuXKYe+N3WVyULzf6GWYGwgUpM5v"
 CAPTURED_MEDUSA = (
@@ -87,16 +87,16 @@ def build_headers(account, device_map, use_hardcoded_device=False):
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
-        "User-Agent": f"Trae/{HELPER_IDE_VERSION}",
+        "User-Agent": f"Trae/{ASSISTANT_IDE_VERSION}",
         "Authorization": f"Cloud-IDE-JWT {jwt_raw}",
         "X-Cloudide-Token": jwt_raw,
         "X-Ide-Token": jwt_raw,
         "X-Uid": uid,
         "X-App-Id": APP_ID,
         "X-App-Version": "default",
-        "X-Ide-Version": HELPER_IDE_VERSION,
-        "X-Ide-Version-Code": HELPER_IDE_VERSION_CODE,
-        "X-App-Version-Code": HELPER_IDE_VERSION_CODE,
+        "X-Ide-Version": ASSISTANT_IDE_VERSION,
+        "X-Ide-Version-Code": ASSISTANT_IDE_VERSION_CODE,
+        "X-App-Version-Code": ASSISTANT_IDE_VERSION_CODE,
         "X-Ide-Version-Type": "stable",
         "X-Device-Type": "windows",
         "X-OS-Version": "Windows 11 Home China",
@@ -112,7 +112,7 @@ def build_headers(account, device_map, use_hardcoded_device=False):
         "X-Neptune": CAPTURED_NEPTUNE,
     }
     return {
-        "url": HELPER_HOST + EP_CHAT,
+        "url": ASSISTANT_HOST + EP_CHAT,
         "headers": headers,
     }
 

@@ -30,9 +30,9 @@ EP_CHAT = "/api/agent/v3/llm_utils_chat"
 APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 
 # trae-work-assistant 版本（当前项目）
-HELPER_HOST = "https://trae-api-cn.mchost.guru"
-HELPER_IDE_VERSION = "0.1.50"
-HELPER_IDE_VERSION_CODE = "20260811"
+ASSISTANT_HOST = "https://trae-api-cn.mchost.guru"
+ASSISTANT_IDE_VERSION = "0.1.50"
+ASSISTANT_IDE_VERSION_CODE = "20260811"
 
 # traework2api 版本（参考项目）
 TW2A_HOST = "https://trae-api-cn.mchost.guru"
@@ -112,7 +112,7 @@ def build_headers_config_a(account, device_map):
     """配置 A：当前 trae-work-assistant 的请求头（硬编码设备ID，仅 x-ide-token）"""
     jwt_raw = normalize_jwt(account["jwt"])
     return {
-        "url": HELPER_HOST + EP_CHAT,
+        "url": ASSISTANT_HOST + EP_CHAT,
         "headers": {
             "content-type": "application/json",
             "accept": "*/*",
@@ -121,9 +121,9 @@ def build_headers_config_a(account, device_map):
             "x-ide-token": jwt_raw,
             "x-app-id": APP_ID,
             "x-app-version": "default",
-            "x-app-version-code": HELPER_IDE_VERSION_CODE,
-            "x-ide-version": HELPER_IDE_VERSION,
-            "x-ide-version-code": HELPER_IDE_VERSION_CODE,
+            "x-app-version-code": ASSISTANT_IDE_VERSION_CODE,
+            "x-ide-version": ASSISTANT_IDE_VERSION,
+            "x-ide-version-code": ASSISTANT_IDE_VERSION_CODE,
             "x-ide-version-type": "stable",
             "x-device-type": "windows",
             "x-device-brand": "CREFG-XX",
@@ -138,7 +138,7 @@ def build_headers_config_a(account, device_map):
             "x-lscbd-aid": "787976",
             "x-lscbd-platform": "windows",
             "x-ss-dp": "787976",
-            "app-version": HELPER_IDE_VERSION,
+            "app-version": ASSISTANT_IDE_VERSION,
             "referer": f"https://trae-api-cn.mchost.guru{EP_CHAT}",
         },
     }
@@ -187,20 +187,20 @@ def build_headers_config_c(account, device_map):
     machine_id = seeded_hex(64, uid, salt="mach")
 
     return {
-        "url": HELPER_HOST + EP_CHAT,
+        "url": ASSISTANT_HOST + EP_CHAT,
         "headers": {
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
-            "User-Agent": f"Trae/{HELPER_IDE_VERSION}",
+            "User-Agent": f"Trae/{ASSISTANT_IDE_VERSION}",
             "Authorization": f"Cloud-IDE-JWT {jwt_raw}",
             "X-Cloudide-Token": jwt_raw,
             "X-Ide-Token": jwt_raw,
             "X-Uid": uid,
             "X-App-Id": APP_ID,
             "X-App-Version": "default",
-            "X-Ide-Version": HELPER_IDE_VERSION,
-            "X-Ide-Version-Code": HELPER_IDE_VERSION_CODE,
-            "X-App-Version-Code": HELPER_IDE_VERSION_CODE,
+            "X-Ide-Version": ASSISTANT_IDE_VERSION,
+            "X-Ide-Version-Code": ASSISTANT_IDE_VERSION_CODE,   
+            "X-App-Version-Code": ASSISTANT_IDE_VERSION_CODE,
             "X-Ide-Version-Type": "stable",
             "X-Device-Type": "windows",
             "X-OS-Version": "Windows 11 Home China",
@@ -225,7 +225,7 @@ def build_headers_config_d(account, device_map):
 
 
 CONFIGS = {
-    "A": ("helper当前配置(硬编码设备)", build_headers_config_a),
+    "A": ("assistant当前配置(硬编码设备)", build_headers_config_a),
     "B": ("tw2a风格(trae-api-cn+完整认证)", build_headers_config_b),
     "C": ("混合(api5+完整认证+每账号设备)", build_headers_config_c),
     "D": ("完整(C+安全头透传)", build_headers_config_d),
