@@ -460,8 +460,7 @@ API 服务页面提供两个 Tab：
 **A**: 所有数据存储在 `%APPDATA%\TraeWorkAssistant\` 目录下：
 - `conf/` — 配置文件
 - `data/` — 账号、积分、快照等数据
-- `logs/` — 运行日志
-- `proxy_logs/` — 代理请求日志
+- `logs/` — 运行日志（proxy / checkin / switcher / api / proxy-requests）
 
 卸载应用不会删除数据目录。如需完全清除，请手动删除该目录。
 

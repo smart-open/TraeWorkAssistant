@@ -59,8 +59,7 @@ npm run tauri build    # 打包（msi + nsis）
 │   └── profiles/                # 登录态快照（按账号 ID 分目录）
 │       ├── current_account.txt  # 当前活跃账号 ID
 │       └── <user_id>/           # 各账号登录态备份
-├── logs/                        # proxy / checkin / switcher 日志
-└── proxy_logs/                  # 代理请求日志（按日期分割）
+└── logs/                        # proxy / checkin / switcher / api / proxy-requests 日志
 ```
 
 ## 文档

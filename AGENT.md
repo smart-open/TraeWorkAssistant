@@ -125,8 +125,7 @@ trae-work-assistant/
 │   └── profiles/                 # 登录态快照
 │       ├── current_account.txt   # 当前活跃账号 ID
 │       └── <user_id>/            # 精准备份的 9 类核心文件
-├── logs/{proxy,checkin,switcher}.log
-└── proxy_logs/                   # 代理请求日志（按日期分割）
+└── logs/                        # proxy / checkin / switcher / api / proxy-requests 日志
 ```
 
 **写入约定**：`fs_utils::write_json` 用 `tmp + rename` 原子替换，避免断电损坏。
