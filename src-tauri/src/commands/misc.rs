@@ -1,3 +1,4 @@
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -449,12 +450,13 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
             "DAILY",
             "/ST",
             &time,
-            "/RL",
-            "HIGHEST",
-            "/F",
-        ])
-        .output()
-        .map_err(|e| format!("注册计划任务失败: {e}"))?;
+        "/RL",
+        "HIGHEST",
+        "/F",
+    ])
+    .creation_flags(0x08000000)
+    .output()
+    .map_err(|e| format!("注册计划任务失败: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -490,6 +492,7 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
 pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, String> {
     let out = Command::new("schtasks")
         .args(["/Query", "/TN", "TraeWorkAssistant_DailyCheckin", "/FO", "LIST"])
+        .creation_flags(0x08000000)
         .output()
         .map_err(|e| format!("查询计划任务失败: {e}"))?;
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -499,6 +502,7 @@ pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, S
 pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
     let _ = Command::new("schtasks")
         .args(["/Delete", "/TN", "TraeWorkAssistant_DailyCheckin", "/F"])
+        .creation_flags(0x08000000)
         .status();
     Ok(())
 }

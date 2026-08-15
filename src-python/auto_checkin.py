@@ -42,6 +42,22 @@ import argparse
 import time
 from typing import Optional
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 关键修复：本脚本自带 JWT 与设备标识注入，应「直连」api.trae.cn，
+# 绝不能走本地 MITM 代理（127.0.0.1:8899）。
+#
+# 背景：开启代理时，Rust 侧会把 Windows 系统代理指向 127.0.0.1:8899。
+# urllib 在 Windows 上会读取该注册表项，于是签到的请求被路由进本地 MITM 代理；
+# 一旦该 Python 代理进程退出（崩溃/被关），端口即变成「死端口」，
+# 签到便报 WinError 10061 无法连接。api_server(Rust/ureq) 早已用 NO_PROXY=*
+# 规避同一问题，这里与之一致：强制忽略一切代理，直连上游。
+# ─────────────────────────────────────────────────────────────────────────────
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
+for _pv in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+    os.environ.pop(_pv, None)
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 # 数据目录：优先 TRAEDATA_DIR（由桌面端注入），否则回退到脚本目录（保持独立可用性）
 DATA_DIR = os.environ.get("TRAEDATA_DIR", BASE)
@@ -265,7 +281,7 @@ def _http_post(url, jwt, dev, body=b"{}", timeout=30):
     headers = _build_headers(jwt, dev)
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
             return resp.status, _decode_body(resp.read(), resp.headers.get("Content-Encoding", ""))
     except urllib.error.HTTPError as e:
         return e.code, _decode_body(e.read(), e.headers.get("Content-Encoding", ""))

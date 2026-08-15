@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 use tauri::{AppHandle, State};
 
@@ -28,6 +29,7 @@ pub fn env_check(_app: AppHandle, state: State<AppState>) -> EnvStatus {
 pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
     Command::new("cmd")
         .args(["/c", "start", "https://www.trae.cn"])
+        .creation_flags(0x08000000)
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -49,6 +51,7 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
     if proxy_port.is_some() {
         let _ = Command::new("taskkill")
             .args(["/F", "/IM", "TRAE SOLO CN.exe"])
+            .creation_flags(0x08000000)
             .output();
     }
     let mut cmd = Command::new(&exe);
@@ -105,6 +108,7 @@ fn version_of(path: &str) -> Option<String> {
     );
     let out = Command::new("powershell")
         .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(0x08000000)
         .output()
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -125,6 +129,7 @@ fn registry_trae_path() -> Option<String> {
                 "/f",
                 "TRAE",
             ])
+            .creation_flags(0x08000000)
             .output()
         {
             Ok(o) => o,
@@ -199,6 +204,7 @@ fn resolve_reg_candidate(icon: &Option<String>, loc: &Option<String>) -> Option<
 fn is_running() -> bool {
     let out = Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq TRAE SOLO CN.exe", "/NH"])
+        .creation_flags(0x08000000)
         .output();
     match out {
         Ok(o) => {

@@ -45,22 +45,14 @@ $Script:LogFile = "$Script:AppDataDir\logs\switcher.log"
 $Script:_TraeExeCache = $null
 
 function Find-TraeExe {
-    if ($Script:_TraeExeCache) { return $Script:_TraeExeCache }
+    # ── 顺序原则（修复「首次切换误用 Trae CN.exe」）─────────────────────────────
+    # 旧逻辑把「运行中进程」作为最高优先级，导致残留/错误的 Trae 进程（如旧的
+    # Trae CN.exe）被优先采用，从而启动错误的 exe。现改为：
+    #   1) 用户显式配置 > 2) 候选路径 > 3) 开始菜单/桌面 lnk > 4) 注册表
+    #   > 5) 运行中进程（最后回退）> 6) 进程缓存（兜底，仅自定义安装且当前未运行时）
+    # 这样正常情况下总是解析到用户真实安装的 TRAE SOLO CN，而非被残留进程带偏。
 
-    # 1. 从运行中进程取 Path（如果 TRAE 正在运行）
-    try {
-        $proc = Get-Process -Name 'Trae*','TRAE*' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^(Trae|TRAE.*CN.*)$' -and $_.Path }
-        if ($proc) {
-            $exePath = $proc | Select-Object -First 1 -ExpandProperty Path
-            if ($exePath -and (Test-Path $exePath)) {
-                $Script:_TraeExeCache = $exePath
-                return $Script:_TraeExeCache
-            }
-        }
-    } catch {}
-
-    # 2. 从 app_settings.json 读取用户自定义路径
+    # 1. 用户显式配置路径（最高优先级）
     $settingsFile = Join-Path $Script:AppDataDir 'conf\app_settings.json'
     if (Test-Path $settingsFile) {
         try {
@@ -72,7 +64,7 @@ function Find-TraeExe {
         } catch {}
     }
 
-    # 3. 多候选路径探测（与 Rust env.rs 保持一致）
+    # 2. 多候选路径探测（与 Rust env.rs 保持一致）
     $candidates = @(
         "$env:LOCALAPPDATA\Programs\TRAE SOLO CN\TRAE SOLO CN.exe",
         "$env:LOCALAPPDATA\Programs\TRAE SOLO\TRAE SOLO.exe",
@@ -92,7 +84,7 @@ function Find-TraeExe {
         }
     }
 
-    # 4. .lnk 快捷方式解析（开始菜单 / 桌面）
+    # 3. .lnk 快捷方式解析（开始菜单 / 桌面）
     try {
         $lnkDirs = @(
             "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
@@ -115,7 +107,7 @@ function Find-TraeExe {
         }
     } catch {}
 
-    # 5. 注册表回退
+    # 4. 注册表回退
     try {
         $regKeys = @(
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -153,6 +145,38 @@ function Find-TraeExe {
             }
         }
     } catch {}
+
+    # 5. 运行中进程（最后回退之一）：仅当以上都找不到时才用，
+    #    避免残留/错误的 Trae 进程误导启动路径。同时排除本助手自身进程
+    #    （进程名以 "Trae" 开头，如 "Trae Work 助手"），避免把 App 本体当成 Trae 启动。
+    try {
+        $selfPid = $PID
+        $parentPid = $selfPid
+        $KnownAppName = 'Trae Work 助手'
+        $parentName = $KnownAppName
+        try {
+            $pp = (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $selfPid" -ErrorAction SilentlyContinue).ParentProcessId
+            if ($pp) {
+                $parentPid = $pp
+                $pproc = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+                if ($pproc) { $parentName = $pproc.Name }
+            }
+        } catch {}
+        $proc = Get-Process -Name 'Trae*','TRAE*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^(Trae|TRAE)' -and $_.Path -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName }
+        if ($proc) {
+            $exePath = $proc | Select-Object -First 1 -ExpandProperty Path
+            if ($exePath -and (Test-Path $exePath)) {
+                $Script:_TraeExeCache = $exePath
+                return $Script:_TraeExeCache
+            }
+        }
+    } catch {}
+
+    # 6. 进程缓存兜底（自定义安装、当前未运行、且上述均未命中时）
+    if ($Script:_TraeExeCache -and (Test-Path $Script:_TraeExeCache)) {
+        return $Script:_TraeExeCache
+    }
 
     return $null
 }
@@ -196,8 +220,23 @@ function Set-CurrentAccount {
 }
 
 function Stop-Trae {
-    # 兼容多种进程名
-    $p = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(Trae|TRAE.*CN.*)$' }
+    # 排除本助手自身进程：本应用进程名以 "Trae" 开头（如 "Trae Work 助手"），
+    # 若不过滤会被 Get-Process -Name 'Trae*' 命中并被 Stop-Process 误杀，导致 App 直接退出。
+    $selfPid = $PID
+    $parentPid = $selfPid
+    $KnownAppName = 'Trae Work 助手'
+    $parentName = $KnownAppName
+    try {
+        $pp = (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $selfPid" -ErrorAction SilentlyContinue).ParentProcessId
+        if ($pp) {
+            $parentPid = $pp
+            $pproc = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+            if ($pproc) { $parentName = $pproc.Name }
+        }
+    } catch {}
+    $p = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^(Trae|TRAE)' -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
+    }
     if ($p) {
         Write-Step -Stage 'stop' -Message '正在关闭 Trae Work' -Status 'running'
         # 在关闭前缓存 exe 路径，供 Start-Trae 使用
@@ -211,7 +250,9 @@ function Stop-Trae {
         while ($waited -lt 8) {
             Start-Sleep -Seconds 1
             $waited++
-            $still = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(Trae|TRAE.*CN.*)$' }
+            $still = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -match '^(Trae|TRAE)' -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
+            }
             if (-not $still) { break }
         }
         if ($waited -ge 8) {

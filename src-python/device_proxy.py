@@ -917,10 +917,26 @@ def forward_websocket(host, port, method, path, headers, body, client_tls):
 
         try:
             # 2. 构建并发送升级请求
+            # 重要：WebSocket 握手必须保留 Connection / Upgrade / Host 头。
+            # 原代码对全部请求套用 HOP_BY_HOP 过滤，会把 "Connection: Upgrade"
+            # 一并去掉，导致上游按普通 HTTP 请求处理并返回 400 Bad Request，
+            # Trae 的实时通道（含"排队提醒"等通知）因此彻底失效、客户端卡死等待。
+            # 这里用 WS 专用的跳过集合，并对接头缺失项做兜底补齐。
+            _WS_SKIP = {"proxy-connection", "proxy-authorization", "content-length", "keep-alive"}
             req_lines = [f"{method} {path} HTTP/1.1"]
+            _seen = set()
             for k, v in headers.items():
-                if k.lower() not in HOP_BY_HOP:
-                    req_lines.append(f"{k}: {v}")
+                kl = k.lower()
+                if kl in _WS_SKIP:
+                    continue
+                req_lines.append(f"{k}: {v}")
+                _seen.add(kl)
+            if "upgrade" not in _seen:
+                req_lines.append("Upgrade: websocket")
+            if "connection" not in _seen:
+                req_lines.append("Connection: Upgrade")
+            log(f"  {ws_tag} 转发升级请求头: " + " | ".join(
+                f"{k}: {v}" for k, v in (h.split(": ", 1) for h in req_lines[1:] if ": " in h)))
             req_data = "\r\n".join(req_lines).encode("utf-8") + b"\r\n\r\n"
             if body:
                 req_data += body
@@ -1377,7 +1393,14 @@ def main():
     log("请把 CA 证书 certs/ca.cer 安装到 Windows 受信任根证书颁发机构(管理员)。")
     try:
         while True:
-            conn, addr = srv.accept()
+            try:
+                conn, addr = srv.accept()
+            except Exception as e:
+                # 单条 accept 出错不应让整个代理进程退出（否则系统代理仍指向死端口）。
+                # 记录后短暂退避再重试，保持服务可用。
+                log(f"[accept] 异常(已忽略并重试): {type(e).__name__}: {e}")
+                time.sleep(0.1)
+                continue
             t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
             t.start()
     except KeyboardInterrupt:

@@ -23,3 +23,30 @@ data/
 # Python
 __pycache__/
 *.pyc
+
+# Embedded Python runtime under src-python/ (build-time prerequisite for bundling;
+# extracted into place, not source — git에서만 제외, 디스크는 빌드에 필요)
+src-python/.extracted
+src-python/DLLs/
+src-python/Lib/
+src-python/Scripts/
+src-python/include/
+src-python/libs/
+src-python/python.exe
+src-python/python3.cmd
+src-python/python3.dll
+src-python/python3.exe
+src-python/python313.dll
+src-python/pythonw.exe
+src-python/vcruntime140.dll
+src-python/vcruntime140_1.dll
+src-python/LICENSE.txt
+
+# Packaging outputs (installers) — disk에 보관(배포용), git에는 제외
+release/
+
+# MSI/NSIS 빌드 중 생성되는 WiX 소스
+*.wxs
+
+# WorkBuddy 산출물
+overview.md

@@ -1,3 +1,4 @@
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 use tauri::{AppHandle, State};
 
@@ -13,6 +14,7 @@ pub struct CertStatus {
 pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
     let out = Command::new("certutil")
         .args(["-store", "Root"])
+        .creation_flags(0x08000000)
         .output();
     let installed = match out {
         Ok(o) => {
@@ -44,6 +46,7 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
     );
     let status = Command::new("powershell")
         .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(0x08000000)
         .status()
         .map_err(|e| format!("启动证书安装失败: {e}"))?;
 

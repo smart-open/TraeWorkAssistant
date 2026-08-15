@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use tauri::{AppHandle, Emitter, State};
 
 use serde::Deserialize;
+use crate::fs_utils;
 use crate::state::AppState;
 use crate::commands::accounts::{build_account_views, resolve_user_ids};
 use crate::python::spawn_script;
@@ -23,6 +24,15 @@ pub fn checkin_start(
     state: State<AppState>,
     opts: CheckinOpts,
 ) -> Result<(), String> {
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "checkin_start 已到达 Rust: python_dir={:?}, python_exe={}, auto_checkin.py 存在={}",
+            state.python_dir,
+            state.python_exe,
+            state.python_dir.join("auto_checkin.py").exists()
+        ),
+    );
     let mut uids = resolve_user_ids(&state, &opts.scope, opts.user_ids)?;
     if opts.skip_checked_in || opts.skip_expired {
         let views = build_account_views(&state);

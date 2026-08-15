@@ -1,5 +1,6 @@
 //! Python 子进程管理辅助。
 use std::path::PathBuf;
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::state::AppState;
@@ -20,6 +21,7 @@ pub fn spawn_script(
     let mut cmd = Command::new(&state.python_exe);
     cmd.arg(&script_path)
         .args(args)
+        .creation_flags(0x08000000)
         .env("TRAEDATA_DIR", &data_dir)
         .env("PYTHONIOENCODING", "utf-8");
     if capture {

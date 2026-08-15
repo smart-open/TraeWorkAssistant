@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 use tauri::{AppHandle, Emitter, State};
 
@@ -11,12 +12,16 @@ pub fn switch_account(
     state: State<AppState>,
     user_id: String,
 ) -> Result<(), String> {
-    let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
-        std::path::PathBuf::from(r).join("ps")
-    } else {
-        state.python_dir.join("../ps")
-    };
+    let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "switch/重置/保存 已到达 Rust: ps_dir={:?}, bridge 存在={}",
+            ps_dir,
+            bridge.exists()
+        ),
+    );
     if !bridge.exists() {
         return Err(format!("找不到切换脚本: {}", bridge.display()));
     }
@@ -38,6 +43,7 @@ pub fn switch_account(
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW：隐藏切换时闪出的黑色控制台窗口
         .spawn()
         .map_err(|e| format!("启动切换失败: {e}"))?;
 
@@ -105,12 +111,16 @@ pub fn save_current_login(
     state: State<AppState>,
     user_id: String,
 ) -> Result<(), String> {
-    let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
-        std::path::PathBuf::from(r).join("ps")
-    } else {
-        state.python_dir.join("../ps")
-    };
+    let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "switch/重置/保存 已到达 Rust: ps_dir={:?}, bridge 存在={}",
+            ps_dir,
+            bridge.exists()
+        ),
+    );
     if !bridge.exists() {
         return Err(format!("找不到切换脚本: {}", bridge.display()));
     }
@@ -132,6 +142,7 @@ pub fn save_current_login(
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW：隐藏控制台窗口
         .spawn()
         .map_err(|e| format!("启动保存登录态失败: {e}"))?;
 
@@ -200,12 +211,16 @@ pub fn reset_device_ids(
     app: AppHandle,
     state: State<AppState>,
 ) -> Result<(), String> {
-    let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
-        std::path::PathBuf::from(r).join("ps")
-    } else {
-        state.python_dir.join("../ps")
-    };
+    let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "switch/重置/保存 已到达 Rust: ps_dir={:?}, bridge 存在={}",
+            ps_dir,
+            bridge.exists()
+        ),
+    );
     if !bridge.exists() {
         return Err(format!("找不到切换脚本: {}", bridge.display()));
     }
@@ -225,6 +240,7 @@ pub fn reset_device_ids(
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW：隐藏控制台窗口
         .spawn()
         .map_err(|e| format!("启动设备标识重置失败: {e}"))?;
 

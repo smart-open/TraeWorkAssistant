@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::sync::Mutex;
 
@@ -110,24 +111,61 @@ impl AppState {
     }
 }
 
-/// 定位 python 脚本目录：先尝试 Tauri 资源（运行期），再尝试开发期相对路径。
+/// 定位 python 脚本目录：覆盖安装版(MSI/NSIS)、便携版(zip 直接运行)、开发期三种布局。
 fn resolve_python_dir() -> PathBuf {
+    // 1) 运行期 Tauri 注入的资源目录：<RESOURCE_DIR>/python
     if let Ok(res) = std::env::var("TAURI_RESOURCE_DIR") {
         let p = PathBuf::from(res).join("python");
         if p.exists() {
             return p;
         }
     }
-    // 开发期：可执行文件旁或仓库 src-python
+    // 2) 可执行文件周边布局（便携版 sidecar / 安装版均可能命中）
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let cand = dir.join("python");
-            if cand.exists() {
-                return cand;
+            // dir/resources/python
+            let c1 = dir.join("resources").join("python");
+            if c1.exists() {
+                return c1;
+            }
+            // dir/python（少数打包方式把 python 放 exe 同级）
+            let c2 = dir.join("python");
+            if c2.exists() {
+                return c2;
+            }
+            // 上层再找 resources/python（如 exe 在 "<App>/Trae Work 助手.exe" 嵌套一层）
+            if let Some(parent) = dir.parent() {
+                let c3 = parent.join("resources").join("python");
+                if c3.exists() {
+                    return c3;
+                }
             }
         }
     }
+    // 3) 开发期：仓库 src-python
     PathBuf::from("src-python")
+}
+
+/// 定位 ps 脚本目录：与 python 目录同级，覆盖安装版/便携版/开发期。
+pub fn resolve_ps_dir() -> PathBuf {
+    let py = resolve_python_dir();
+    // 安装/便携版：python 与 ps 都在 <RESOURCE_DIR> 下，故用 python 的父目录
+    if let Some(parent) = py.parent() {
+        let ps = parent.join("ps");
+        if ps.exists() {
+            return ps;
+        }
+    }
+    // 开发期：python 在 src-python，ps 在 src-ps
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let c = dir.join("resources").join("ps");
+            if c.exists() {
+                return c;
+            }
+        }
+    }
+    PathBuf::from("src-ps")
 }
 
 /// 探测系统可用的 Python 解释器，依次尝试 python / python3 / py。
@@ -136,6 +174,7 @@ fn probe_python_exe() -> String {
     for cand in ["python", "python3", "py"] {
         if Command::new(cand)
             .arg("--version")
+            .creation_flags(0x08000000)
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)

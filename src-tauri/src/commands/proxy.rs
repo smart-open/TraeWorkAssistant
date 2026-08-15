@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader};
+use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,10 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
+
+/// 看门狗标记：用户主动停止代理时置 true，用于区分「主动停止」与「代理进程意外崩溃」。
+/// 代理进程意外退出时，系统代理仍指向死端口 127.0.0.1:8899，需自动还原以避免全局断网。
+static PROXY_INTENTIONAL_STOP: AtomicBool = AtomicBool::new(false);
 
 pub struct ProxyHandle {
     pub child: Child,
@@ -50,6 +55,18 @@ pub fn proxy_start(
     proxy_state: State<Mutex<Option<ProxyHandle>>>,
     port: u16,
 ) -> Result<ProxyStatus, String> {
+    // 标记「非主动停止」，供看门狗区分崩溃与用户停止
+    PROXY_INTENTIONAL_STOP.store(false, Ordering::Relaxed);
+    // [诊断] 记录命令是否到达 Rust 与关键路径解析
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "proxy_start 已到达 Rust: python_dir={:?}, python_exe={}, device_proxy.py 存在={}",
+            state.python_dir,
+            state.python_exe,
+            state.python_dir.join("device_proxy.py").exists()
+        ),
+    );
     {
         let guard = safe_lock(&proxy_state);
         if guard.is_some() {
@@ -72,6 +89,7 @@ pub fn proxy_start(
     });
     let mut cmd = Command::new(&state.python_exe);
     cmd.arg(&script_path)
+        .creation_flags(0x08000000)
         .env("TRAEDATA_DIR", &data_dir)
         .env("PROXY_PORT", &port_s)
         .env("AUTO_CAPTURE_JWT", "1")
@@ -140,6 +158,24 @@ pub fn proxy_start(
                 let _ = append_log(&log_path, &l);
             }
         }
+
+        // ── 看门狗 ────────────────────────────────────────────────────────────
+        // 走到这里说明子进程 stdout 已 EOF（进程退出）。
+        // 若不是「用户主动点击停止」（PROXY_INTENTIONAL_STOP 为 false），
+        // 则说明是代理进程「意外崩溃」。此时系统代理仍指向死端口 127.0.0.1:8899，
+        // 会导致本机全局断网（签到、Trae 自身流量全部 10061 失败）。
+        // 主动还原系统代理并向前端报警。
+        if !PROXY_INTENTIONAL_STOP.load(Ordering::Relaxed) {
+            let _ = app_for_thread.emit(
+                "proxy-log",
+                "[严重] 代理进程异常退出，正在还原系统代理以避免全局断网…",
+            );
+            fs_utils::app_log(std::path::Path::new(&data_dir2), "代理进程异常退出，自动还原系统代理");
+            if let Err(e) = clear_win_proxy() {
+                fs_utils::app_log(std::path::Path::new(&data_dir2), &format!("还原系统代理失败: {e}"));
+            }
+            let _ = app_for_thread.emit("proxy-crashed", "");
+        }
     });
 
     // stderr 线程：单独读取，防止管道缓冲区写满导致子进程死锁
@@ -194,6 +230,8 @@ pub fn proxy_stop(
         None => (0, 0),
     };
     if let Some(h) = g.take() {
+        // 标记「主动停止」，避免看门狗把正常停止误判为崩溃而重复还原代理
+        PROXY_INTENTIONAL_STOP.store(true, Ordering::Relaxed);
         let c = h.captured.load(Ordering::Relaxed);
         fs_utils::app_log(&state.data_dir, &format!("代理已停止: 共捕获 {c} 个账号"));
         // h 在此处 drop，Drop trait 会 kill + wait 子进程
@@ -331,6 +369,7 @@ fn notify_wininet_changed() {
 fn run_reg(key: &str, name: &str, kind: &str, value: &str) -> Result<(), String> {
     let status = Command::new("reg")
         .args(["add", key, "/v", name, "/t", kind, "/d", value, "/f"])
+        .creation_flags(0x08000000)
         .status()
         .map_err(|e| format!("设置系统代理失败: {e}"))?;
     if !status.success() {

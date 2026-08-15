@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::io::Write;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, State};
 
@@ -119,6 +120,7 @@ pub fn profile_backup(
             &user_id,
             "-Json",
         ])
+        .creation_flags(0x08000000)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -222,6 +224,7 @@ pub fn profile_restore(
             &user_id,
             "-Json",
         ])
+        .creation_flags(0x08000000)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
