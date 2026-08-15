@@ -1,5 +1,5 @@
 [package]
-name = "trae-work-helper"
+name = "trae-work-assistant"
 version = "2.4.1"
 description = "Trae Work 助手 - 多账号签到与管理桌面端"
 edition = "2021"

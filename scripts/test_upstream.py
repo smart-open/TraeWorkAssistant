@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-上游 API 请求测试脚本 — 对比 trae-work-helper 与 traework2api 两套请求头配置。
+上游 API 请求测试脚本 — 对比 trae-work-assistant 与 traework2api 两套请求头配置。
 测试目标：定位 "quota exceeded" / "no healthy account" 的根因。
 
 用法:
@@ -29,7 +29,7 @@ DEVICE_MAP_FILE = os.path.join(APP_DATA, "device_map.json")
 EP_CHAT = "/api/agent/v3/llm_utils_chat"
 APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 
-# trae-work-helper 版本（当前项目）
+# trae-work-assistant 版本（当前项目）
 HELPER_HOST = "https://api5-normal.mchost.guru"
 HELPER_IDE_VERSION = "0.1.50"
 HELPER_IDE_VERSION_CODE = "20260811"
@@ -58,7 +58,7 @@ CAPTURED_MEDUSA = (
 )
 CAPTURED_NEPTUNE = "-11|50:51:59:00:09"
 
-# 硬编码的设备指纹（当前 trae-work-helper 使用的值）
+# 硬编码的设备指纹（当前 trae-work-assistant 使用的值）
 HARDCODED_DEVICE_ID = "199439841787403"
 HARDCODED_MACHINE_ID = "b04f40320d4f2d7173a83374cd9f2df3e635907e386a0cdb4612e4fcb37c97e1"
 
@@ -109,7 +109,7 @@ def normalize_jwt(jwt: str) -> str:
 
 
 def build_headers_config_a(account, device_map):
-    """配置 A：当前 trae-work-helper 的请求头（硬编码设备ID，仅 x-ide-token）"""
+    """配置 A：当前 trae-work-assistant 的请求头（硬编码设备ID，仅 x-ide-token）"""
     jwt_raw = normalize_jwt(account["jwt"])
     return {
         "url": HELPER_HOST + EP_CHAT,
