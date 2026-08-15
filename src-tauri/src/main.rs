@@ -57,6 +57,7 @@ fn main() {
             commands::accounts::refresh_jwt,
             commands::checkin::checkin_start,
             commands::switch::switch_account,
+            commands::switch::save_current_login,
             commands::switch::reset_device_ids,
             commands::misc::device_reset,
             commands::misc::jwt_parse,

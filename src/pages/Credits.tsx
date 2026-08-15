@@ -86,6 +86,11 @@ export default function Credits() {
     return 0;
   }, [creditsDaily, creditsHistory, today]);
 
+  const todayConsumed = useMemo(() => {
+    const snap = creditsDaily.find((s) => s.date === today);
+    return snap ? Math.round(snap.consumed) : 0;
+  }, [creditsDaily, today]);
+
   // 近 7 日趋势：从 creditsDaily 快照取数据，补齐无数据的日期
   const trend = useMemo(() => {
     const map = new Map<string, { total: number; earned: number; consumed: number }>();
@@ -131,11 +136,12 @@ export default function Credits() {
         </button>
       </div>
 
-      <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-4">
-        <StatCard label="可用积分总额" value={total.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint="总剩余可用积分" tone="amber" />
+      <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-5">
+        <StatCard label="可用积分总额" value={total.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint="总剩余可用积分" tone="violet" />
         <StatCard label="账号数" value={rows.length} tone="brand" />
         <StatCard label="平均可用积分" value={avg.toLocaleString()} tone="blue" />
         <StatCard label="今日新增积分" value={todayNew.toLocaleString()} tone="green" hint={today} />
+        <StatCard label="今日消耗积分" value={todayConsumed.toLocaleString()} tone="amber" hint={today} />
       </div>
 
       <div className="card p-5">

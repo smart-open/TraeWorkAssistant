@@ -15,9 +15,9 @@ pub struct ProfileInfo {
     pub last_modified: String,
 }
 
-/// profiles 根目录：%APPDATA%\TraeWorkAssistant\profiles\
+/// profiles 根目录：%APPDATA%\TraeWorkAssistant\data\profiles\
 fn profiles_dir(state: &State<AppState>) -> PathBuf {
-    state.data_dir.join("profiles")
+    state.data_dir.join("data").join("profiles")
 }
 
 /// 递归计算目录大小和文件数

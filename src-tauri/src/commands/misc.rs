@@ -365,6 +365,7 @@ pub fn logs_query(state: State<AppState>, opts: LogsOpts) -> Vec<LogLine> {
 }
 
 fn split_time(raw: &str) -> (String, String) {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     if raw.starts_with('[') {
         if let Some(end) = raw.find("] ") {
             let time = raw[1..end].to_string();

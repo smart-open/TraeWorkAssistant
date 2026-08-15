@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { sendNotification } from '@tauri-apps/plugin-notification';
-import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent } from './lib/tauri';
+import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent, type SaveLoginDoneEvent } from './lib/tauri';
 import type {
   AccountView,
   ApiServiceStatus,
@@ -54,6 +54,9 @@ interface AppState {
   creditsDaily: CreditsDailySnapshot[];
   proxyLog: string[];
   switchProgress: string[];
+  switchingTo: string | null;
+  saveLoginProgress: string[];
+  savingLogin: string | null;
   deviceResetProgress: string[];
   deviceResetActive: boolean;
   checkin: CheckinState;
@@ -93,6 +96,7 @@ interface AppState {
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
   switchTo: (userId: string) => Promise<void>;
+  saveCurrentLogin: (userId: string) => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
   resetDeviceIds: () => Promise<void>;
   startCheckin: (opts: {
@@ -156,6 +160,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   creditsDaily: [],
   proxyLog: [],
   switchProgress: [],
+  switchingTo: null,
+  saveLoginProgress: [],
+  savingLogin: null,
   deviceResetProgress: [],
   deviceResetActive: false,
   checkin: { active: false, total: 0, index: 0, results: [], done: null },
@@ -183,6 +190,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // D2：订阅后端 switch-done，给用户明确的切换完成/失败信号
       onSwitchDone: (e) => {
         set((s) => ({
+          switchingTo: null,
           switchProgress: [
             ...s.switchProgress.slice(-49),
             e.success ? '[完成] 登录态切换成功' : '[失败] 登录态切换未完成，请查看日志',
@@ -194,6 +202,22 @@ export const useAppStore = create<AppState>((set, get) => ({
         );
         void get().refreshAccounts();
         void get().refreshProxy();
+      },
+      onSaveLoginProgress: (line) =>
+        set((s) => ({ saveLoginProgress: [...s.saveLoginProgress.slice(-49), line] })),
+      onSaveLoginDone: (e: SaveLoginDoneEvent) => {
+        set((s) => ({
+          savingLogin: null,
+          saveLoginProgress: [
+            ...s.saveLoginProgress.slice(-49),
+            e.success ? '[完成] 登录态保存成功' : '[失败] 登录态保存失败，请查看日志',
+          ],
+        }));
+        get().pushToast(
+          e.success ? 'success' : 'error',
+          e.success ? '登录态已保存，可随时切换回此账号' : '登录态保存失败，请查看日志',
+        );
+        void get().refreshProfiles();
       },
       onDeviceResetProgress: (line) =>
         set((s) => ({ deviceResetProgress: [...s.deviceResetProgress.slice(-99), line] })),
@@ -514,10 +538,22 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   switchTo: async (userId) => {
     try {
+      set({ switchingTo: userId, switchProgress: [] });
       await api.switchAccount(userId);
-      get().pushToast('info', '已发起登录态切换，请稍候…');
+      get().pushToast('info', '正在切换登录态，请稍候…');
     } catch (err) {
+      set({ switchingTo: null });
       get().pushToast('error', `切换失败：${String(err)}`);
+    }
+  },
+  saveCurrentLogin: async (userId) => {
+    try {
+      set({ savingLogin: userId, saveLoginProgress: [] });
+      await api.saveCurrentLogin(userId);
+      get().pushToast('info', '正在保存当前登录态，请稍候…');
+    } catch (err) {
+      set({ savingLogin: null });
+      get().pushToast('error', `保存登录态失败：${String(err)}`);
     }
   },
   renewJwt: async (userId) => {

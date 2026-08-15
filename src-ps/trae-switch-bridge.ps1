@@ -21,7 +21,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Switch', 'ResetMachineId', 'BackupCurrent', 'RestoreOnly', 'ResetDeviceIds')]
+    [ValidateSet('Switch', 'ResetMachineId', 'BackupCurrent', 'RestoreOnly', 'ResetDeviceIds', 'SaveCurrentLogin')]
     [string]$Action,
 
     [Parameter(Mandatory = $false)]
@@ -40,6 +40,7 @@ $ErrorActionPreference = 'Stop'
 $Script:TraeDataDir = "$env:APPDATA\TRAE SOLO CN"
 $Script:AppDataDir = "$env:APPDATA\TraeWorkAssistant"
 $Script:ProfilesDir = "$Script:AppDataDir\data\profiles"
+$Script:CurrentAccountFile = "$Script:ProfilesDir\current_account.txt"
 $Script:LogFile = "$Script:AppDataDir\logs\switcher.log"
 $Script:_TraeExeCache = $null
 
@@ -175,15 +176,56 @@ function Write-Step {
     } catch {}
 }
 
+function Get-CurrentAccount {
+    if (Test-Path $Script:CurrentAccountFile) {
+        try {
+            $id = (Get-Content $Script:CurrentAccountFile -Raw).Trim()
+            if ($id) { return $id }
+        } catch {}
+    }
+    return $null
+}
+
+function Set-CurrentAccount {
+    param([string]$AccountId)
+    try {
+        $dir = Split-Path $Script:CurrentAccountFile
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Set-Content -Path $Script:CurrentAccountFile -Value $AccountId -NoNewline -Encoding UTF8
+    } catch {}
+}
+
 function Stop-Trae {
     # 兼容多种进程名
     $p = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(Trae|TRAE.*CN.*)$' }
     if ($p) {
         Write-Step -Stage 'stop' -Message '正在关闭 Trae Work' -Status 'running'
+        # 在关闭前缓存 exe 路径，供 Start-Trae 使用
+        $exePath = $p | Select-Object -First 1 -ExpandProperty Path -ErrorAction SilentlyContinue
+        if ($exePath -and (Test-Path $exePath)) {
+            $Script:_TraeExeCache = $exePath
+        }
         $p | Stop-Process -Force
-        Start-Sleep -Seconds 2
+        # 等待进程完全退出，最多等 8 秒
+        $waited = 0
+        while ($waited -lt 8) {
+            Start-Sleep -Seconds 1
+            $waited++
+            $still = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(Trae|TRAE.*CN.*)$' }
+            if (-not $still) { break }
+        }
+        if ($waited -ge 8) {
+            Write-Step -Stage 'stop' -Message "进程未在 $waited 秒内退出，可能仍有文件锁" -Status 'warn'
+        }
     } else {
         Write-Step -Stage 'stop' -Message 'Trae Work 未运行' -Status 'skip'
+        # 进程未运行时也尝试查找 exe 路径并缓存
+        if (-not $Script:_TraeExeCache) {
+            $found = Find-TraeExe
+            if ($found) {
+                $Script:_TraeExeCache = $found
+            }
+        }
     }
 }
 
@@ -247,30 +289,29 @@ function Reset-DeviceIdsOnly {
     }
 
     # 2 & 3. storage.json — telemetry.machineId / sqmId + aha.device.device_id
-    $storageFile = Join-Path $traeDir 'storage.json'
+    # 注意：storage.json 在 User\globalStorage\ 下，且使用点号键名（非嵌套对象）
+    $storageFile = Join-Path $traeDir 'User\globalStorage\storage.json'
     if (Test-Path $storageFile) {
         try {
-            $storage = Get-Content $storageFile -Raw | ConvertFrom-Json
+            $raw = Get-Content $storageFile -Raw
+            $storage = $raw | ConvertFrom-Json
             $changed = $false
-            # telemetry.machineId / telemetry.sqmId
-            if ($storage.telemetry) {
-                if ($storage.telemetry.machineId -ne $null) {
-                    $storage.telemetry.machineId = $newMachineId
-                    $changed = $true
-                }
-                if ($storage.telemetry.sqmId -ne $null) {
-                    $storage.telemetry.sqmId = $newSqmId
-                    $changed = $true
-                }
+            # 点号键名访问：$storage.'telemetry.machineId' 而非 $storage.telemetry.machineId
+            if ($storage.'telemetry.machineId' -ne $null) {
+                $storage.'telemetry.machineId' = $newMachineId
+                $changed = $true
             }
-            # aha.device.device_id
-            if ($storage.aha -and $storage.aha.device -and $storage.aha.device.device_id -ne $null) {
-                $storage.aha.device.device_id = $newDeviceId
+            if ($storage.'telemetry.sqmId' -ne $null) {
+                $storage.'telemetry.sqmId' = $newSqmId
+                $changed = $true
+            }
+            if ($storage.'aha.device.device_id' -ne $null) {
+                $storage.'aha.device.device_id' = $newDeviceId
                 $changed = $true
             }
             # 删除 has_device_id_updated_to_aha 标记位
-            if ($storage.aha -and $storage.aha.device -and $storage.aha.device.has_device_id_updated_to_aha -ne $null) {
-                $storage.aha.device.PSObject.Properties.Remove('has_device_id_updated_to_aha')
+            if ($storage.'has_device_id_updated_to_aha' -ne $null) {
+                $storage.PSObject.Properties.Remove('has_device_id_updated_to_aha')
                 $changed = $true
             }
             if ($changed) {
@@ -342,34 +383,108 @@ function Reset-DeviceIdsOnly {
 function Backup-CurrentProfile {
     param([string]$Slot)
     $dest = Join-Path $Script:ProfilesDir $Slot
-    if (Test-Path $Script:TraeDataDir) {
-        if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
-        $excludeDirs = @('Cache', 'Code Cache', 'GPUCache', 'Service Worker')
-        Get-ChildItem -Path $Script:TraeDataDir | Where-Object { -not ($_.PSIsContainer -and $_.Name -in $excludeDirs) } | Copy-Item -Destination $dest -Recurse -Force
-        Write-Step -Stage 'backup' -Message "已备份当前登录态到 $Slot" -Status 'ok'
-    } else {
+    if (-not (Test-Path $Script:TraeDataDir)) {
         Write-Step -Stage 'backup' -Message '当前数据目录不存在，跳过备份' -Status 'skip'
+        return
     }
+    if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+    $src = $Script:TraeDataDir
+    $copied = 0
+
+    # 精准备份：仅复制登录态关键文件（参考 traework-switcher）
+    # 1. storage.json — 设备标识、遥测、认证信息
+    $storageSrc = "$src\User\globalStorage\storage.json"
+    if (Test-Path $storageSrc) { $dir = Split-Path "$dest\User\globalStorage\storage.json" -Parent; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Copy-Item $storageSrc "$dest\User\globalStorage\storage.json" -Force; $copied++ }
+
+    # 2. state.vscdb — 登录令牌数据库
+    $stateDbSrc = "$src\User\globalStorage\state.vscdb"
+    if (Test-Path $stateDbSrc) { $dir = Split-Path "$dest\User\globalStorage\state.vscdb" -Parent; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Copy-Item $stateDbSrc "$dest\User\globalStorage\state.vscdb" -Force; $copied++ }
+    $stateDbBak = "$src\User\globalStorage\state.vscdb.backup"
+    if (Test-Path $stateDbBak) { Copy-Item $stateDbBak "$dest\User\globalStorage\state.vscdb.backup" -Force; $copied++ }
+
+    # 3. machineid — 机器标识
+    $machineIdSrc = "$src\machineid"
+    if (Test-Path $machineIdSrc) { Copy-Item $machineIdSrc "$dest\machineid" -Force; $copied++ }
+
+    # 4. aha\ — 设备认证数据
+    $ahaSrc = "$src\aha"
+    if (Test-Path $ahaSrc) { $ahaDest = "$dest\aha"; if (Test-Path $ahaDest) { Remove-Item $ahaDest -Recurse -Force -ErrorAction SilentlyContinue }; Copy-Item $ahaSrc $ahaDest -Recurse -Force -ErrorAction SilentlyContinue; $copied++ }
+
+    # 5. Preferences / Local State
+    if (Test-Path "$src\Preferences") { Copy-Item "$src\Preferences" "$dest\Preferences" -Force; $copied++ }
+    if (Test-Path "$src\Local State") { Copy-Item "$src\Local State" "$dest\Local State" -Force; $copied++ }
+
+    # 6. Local Storage\leveldb + config.db
+    $lsSrc = "$src\Local Storage\leveldb"
+    if (Test-Path $lsSrc) { $lsDest = "$dest\Local Storage\leveldb"; New-Item -ItemType Directory -Force -Path $lsDest | Out-Null; Copy-Item "$lsSrc\*" $lsDest -Force -ErrorAction SilentlyContinue; $copied++ }
+    $lsConfig = "$src\Local Storage\config.db"
+    if (Test-Path $lsConfig) { $lsParent = "$dest\Local Storage"; if (-not (Test-Path $lsParent)) { New-Item -ItemType Directory -Force -Path $lsParent | Out-Null }; Copy-Item $lsConfig "$lsParent\config.db" -Force; $copied++ }
+
+    # 7. Network\
+    $netSrc = "$src\Network"
+    if (Test-Path $netSrc) { $netDest = "$dest\Network"; if (Test-Path $netDest) { Remove-Item $netDest -Recurse -Force -ErrorAction SilentlyContinue }; Copy-Item $netSrc $netDest -Recurse -Force -ErrorAction SilentlyContinue; $copied++ }
+
+    # 8. Partitions\trae-webview + icube-web-crawler
+    $wvSrc = "$src\Partitions\trae-webview"
+    if (Test-Path $wvSrc) { $wvDest = "$dest\Partitions\trae-webview"; if (Test-Path $wvDest) { Remove-Item $wvDest -Recurse -Force -ErrorAction SilentlyContinue }; $wvParent = Split-Path $wvDest -Parent; New-Item -ItemType Directory -Force -Path $wvParent | Out-Null; Copy-Item $wvSrc $wvDest -Recurse -Force -ErrorAction SilentlyContinue; $copied++ }
+    $icSrc = "$src\Partitions\icube-web-crawler-shared-session-v1.0"
+    if (Test-Path $icSrc) { $icDest = "$dest\Partitions\icube-web-crawler-shared-session-v1.0"; if (Test-Path $icDest) { Remove-Item $icDest -Recurse -Force -ErrorAction SilentlyContinue }; $icParent = Split-Path $icDest -Parent; New-Item -ItemType Directory -Force -Path $icParent | Out-Null; Copy-Item $icSrc $icDest -Recurse -Force -ErrorAction SilentlyContinue; $copied++ }
+
+    # 9. Session Storage\
+    $ssSrc = "$src\Session Storage"
+    if (Test-Path $ssSrc) { $ssDest = "$dest\Session Storage"; if (Test-Path $ssDest) { Remove-Item $ssDest -Recurse -Force -ErrorAction SilentlyContinue }; Copy-Item $ssSrc $ssDest -Recurse -Force -ErrorAction SilentlyContinue; $copied++ }
+
+    Write-Step -Stage 'backup' -Message "已备份当前登录态到 $Slot ($copied 项)" -Status 'ok'
 }
 
 function Restore-Profile {
     param([string]$Slot)
     $src = Join-Path $Script:ProfilesDir $Slot
     if (-not (Test-Path $src)) {
-        # 首次切换该账号：以当前登录态作为它的初始快照
-        Write-Step -Stage 'restore' -Message "目标账号无快照，使用当前登录态初始化" -Status 'info'
-        Backup-CurrentProfile -Slot $Slot
-        return
+        Write-Step -Stage 'restore' -Message "目标账号 $Slot 无快照，请先登录该账号并保存登录态" -Status 'error'
+        throw "目标账号 $Slot 无快照"
     }
-    if (-not (Test-Path $Script:TraeDataDir)) { New-Item -ItemType Directory -Path $Script:TraeDataDir -Force | Out-Null }
-    # 先清空现有，再写入目标快照
-    try {
-        Get-ChildItem -Path $Script:TraeDataDir -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        Copy-Item -Path (Join-Path $src '*') -Destination $Script:TraeDataDir -Recurse -Force
-        Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态" -Status 'ok'
-    } catch {
-        Write-Step -Stage 'restore' -Message "恢复登录态失败，已跳过: $_" -Status 'error'
-    }
+    $dest = $Script:TraeDataDir
+    if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+    $restored = 0
+
+    # 删除 code.lock 防止启动冲突
+    $codeLock = "$dest\code.lock"
+    if (Test-Path $codeLock) { Remove-Item $codeLock -Force -ErrorAction SilentlyContinue }
+
+    # 精准恢复：仅恢复登录态关键文件（与 Backup-CurrentProfile 对称）
+    # 1. storage.json
+    if (Test-Path "$src\User\globalStorage\storage.json") { $dir = "$dest\User\globalStorage"; if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }; Copy-Item "$src\User\globalStorage\storage.json" "$dir\storage.json" -Force; $restored++ }
+
+    # 2. state.vscdb + backup
+    if (Test-Path "$src\User\globalStorage\state.vscdb") { $dir = "$dest\User\globalStorage"; if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }; Copy-Item "$src\User\globalStorage\state.vscdb" "$dir\state.vscdb" -Force; $restored++ }
+    if (Test-Path "$src\User\globalStorage\state.vscdb.backup") { Copy-Item "$src\User\globalStorage\state.vscdb.backup" "$dest\User\globalStorage\state.vscdb.backup" -Force; $restored++ }
+
+    # 3. machineid
+    if (Test-Path "$src\machineid") { Copy-Item "$src\machineid" "$dest\machineid" -Force; $restored++ }
+
+    # 4. aha\
+    if (Test-Path "$src\aha") { $target = "$dest\aha"; if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }; Copy-Item "$src\aha" $target -Recurse -Force -ErrorAction SilentlyContinue; $restored++ }
+
+    # 5. Preferences / Local State
+    if (Test-Path "$src\Preferences") { Copy-Item "$src\Preferences" "$dest\Preferences" -Force; $restored++ }
+    if (Test-Path "$src\Local State") { Copy-Item "$src\Local State" "$dest\Local State" -Force; $restored++ }
+
+    # 6. Local Storage\leveldb + config.db
+    if (Test-Path "$src\Local Storage\leveldb") { $target = "$dest\Local Storage\leveldb"; if (-not (Test-Path $target)) { New-Item -ItemType Directory -Force -Path $target | Out-Null } else { Remove-Item "$target\*" -Force -ErrorAction SilentlyContinue }; Copy-Item "$src\Local Storage\leveldb\*" $target -Force -ErrorAction SilentlyContinue; $restored++ }
+    if (Test-Path "$src\Local Storage\config.db") { $target = "$dest\Local Storage"; if (-not (Test-Path $target)) { New-Item -ItemType Directory -Force -Path $target | Out-Null }; Copy-Item "$src\Local Storage\config.db" "$target\config.db" -Force; $restored++ }
+
+    # 7. Network\
+    if (Test-Path "$src\Network") { $target = "$dest\Network"; if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }; Copy-Item "$src\Network" $target -Recurse -Force -ErrorAction SilentlyContinue; $restored++ }
+
+    # 8. Partitions\trae-webview + icube-web-crawler
+    if (Test-Path "$src\Partitions\trae-webview") { $target = "$dest\Partitions\trae-webview"; if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }; $pParent = Split-Path $target -Parent; if (-not (Test-Path $pParent)) { New-Item -ItemType Directory -Force -Path $pParent | Out-Null }; Copy-Item "$src\Partitions\trae-webview" $target -Recurse -Force -ErrorAction SilentlyContinue; $restored++ }
+    if (Test-Path "$src\Partitions\icube-web-crawler-shared-session-v1.0") { $target = "$dest\Partitions\icube-web-crawler-shared-session-v1.0"; if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }; $pParent = Split-Path $target -Parent; if (-not (Test-Path $pParent)) { New-Item -ItemType Directory -Force -Path $pParent | Out-Null }; Copy-Item "$src\Partitions\icube-web-crawler-shared-session-v1.0" $target -Recurse -Force -ErrorAction SilentlyContinue; $restored++ }
+
+    # 9. Session Storage\
+    if (Test-Path "$src\Session Storage") { $target = "$dest\Session Storage"; if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }; Copy-Item "$src\Session Storage" $target -Recurse -Force -ErrorAction SilentlyContinue; $restored++ }
+
+    Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项)" -Status 'ok'
 }
 
 # ============ 入口 ============
@@ -382,12 +497,35 @@ try {
 
     switch ($Action) {
         'Switch' {
+            # 预检查：目标账号是否有快照（在关闭 Trae 之前检查）
+            $targetProfile = Join-Path $Script:ProfilesDir $UserId
+            if (-not (Test-Path $targetProfile)) {
+                Write-Step -Stage 'fatal' -Message "目标账号 $UserId 无快照，请先登录该账号并点击「保存当前登录态」" -Status 'error'
+                exit 1
+            }
             Stop-Trae
+            # 保存当前登录态到 "last" 槽位（安全备份）
             Backup-CurrentProfile -Slot 'last'
+            # 如果知道当前账号 ID，也备份到该账号的槽位（用于下次切回）
+            $currentAcct = Get-CurrentAccount
+            if ($currentAcct -and $currentAcct -ne $UserId) {
+                Backup-CurrentProfile -Slot $currentAcct
+                Write-Step -Stage 'backup' -Message "当前账号 $currentAcct 的登录态已备份" -Status 'ok'
+            }
+            # 恢复目标账号的登录态（含设备标识）
             Restore-Profile -Slot $UserId
-            Reset-MachineId
+            # 记录当前账号 ID
+            Set-CurrentAccount -AccountId $UserId
             Start-Trae
             Write-Step -Stage 'done' -Message "已切换至账号 $UserId" -Status 'ok'
+        }
+        'SaveCurrentLogin' {
+            # 保存当前登录态：关闭 Trae → 备份 → 启动
+            Stop-Trae
+            Backup-CurrentProfile -Slot $UserId
+            Set-CurrentAccount -AccountId $UserId
+            Start-Trae
+            Write-Step -Stage 'done' -Message "已保存账号 $UserId 的当前登录态" -Status 'ok'
         }
         'ResetMachineId' {
             Reset-MachineId
@@ -399,11 +537,13 @@ try {
         }
         'BackupCurrent' {
             Backup-CurrentProfile -Slot $UserId
+            Set-CurrentAccount -AccountId $UserId
             Write-Step -Stage 'done' -Message '备份完成' -Status 'ok'
         }
         'RestoreOnly' {
             Stop-Trae
             Restore-Profile -Slot $UserId
+            Set-CurrentAccount -AccountId $UserId
             Start-Trae
             Write-Step -Stage 'done' -Message "已恢复账号 $UserId 的登录态" -Status 'ok'
         }

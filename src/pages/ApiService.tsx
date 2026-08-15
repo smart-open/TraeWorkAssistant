@@ -301,16 +301,46 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
         </div>
       )}
 
-      {/* 积分类型说明 — 紧凑横幅 */}
-      <div className="mb-5 flex items-center gap-2.5 rounded-xl border border-amber-300/70 bg-amber-50/80 px-3.5 py-2.5 dark:border-amber-700/40 dark:bg-amber-900/10">
-        <Info size={15} className="shrink-0 text-amber-500 dark:text-amber-400" />
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-          <span className="font-semibold text-amber-800 dark:text-amber-200">IDE 积分</span>
-          <span className="text-amber-700/70 dark:text-amber-300/50">product_id 208 · llm_utils_chat</span>
-          <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-800/40 dark:text-amber-200">本服务使用</span>
-          <span className="text-slate-300 dark:text-zinc-600">|</span>
-          <span className="font-medium text-slate-500 dark:text-zinc-400">Work 积分</span>
-          <span className="text-slate-400 dark:text-zinc-500">product_id 209 · 需 TTNet 加密，未采用</span>
+      {/* 积分类型说明 — 紧凑面板 */}
+      <div className="mb-5 rounded-xl border border-amber-300/70 bg-amber-50/80 px-3.5 py-2.5 dark:border-amber-700/40 dark:bg-amber-900/10">
+        <div className="mb-2 flex items-center gap-2">
+          <Info size={14} className="shrink-0 text-amber-500 dark:text-amber-400" />
+          <span className="text-xs font-semibold text-amber-800 dark:text-amber-200">积分体系说明</span>
+          <span className="text-[11px] text-amber-600/60 dark:text-amber-400/40">本服务仅消耗 IDE 积分</span>
+        </div>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          {/* IDE 积分 */}
+          <div className="rounded-lg border border-amber-300/60 bg-white/60 px-3 py-1.5 dark:border-amber-700/30 dark:bg-amber-900/5">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="text-[11px] font-bold text-amber-800 dark:text-amber-200">IDE 积分（Trae CN）</span>
+              <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-700/50 dark:text-amber-100">本服务使用</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 dark:text-zinc-400">
+              <span className="font-mono text-amber-700 dark:text-amber-300">product_id 208</span>
+              <span className="text-slate-300 dark:text-zinc-600">·</span>
+              <span className="font-mono text-amber-700 dark:text-amber-300">llm_utils_chat</span>
+              <span className="text-slate-300 dark:text-zinc-600">·</span>
+              <span>IDE 套餐</span>
+              <span className="text-slate-300 dark:text-zinc-600">·</span>
+              <span>明文 JSON</span>
+            </div>
+          </div>
+          {/* Work 积分 */}
+          <div className="rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-1.5 dark:border-zinc-700/50 dark:bg-zinc-800/30">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="text-[11px] font-bold text-slate-500 dark:text-zinc-400">Work 积分（Trae Work CN）</span>
+              <span className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-zinc-700 dark:text-zinc-400">未采用</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 dark:text-zinc-400">
+              <span className="font-mono text-slate-500 dark:text-zinc-400">product_id 209</span>
+              <span className="text-slate-300 dark:text-zinc-600">·</span>
+              <span className="font-mono text-slate-500 dark:text-zinc-400">create_agent_task</span>
+              <span className="text-slate-300 dark:text-zinc-600">·</span>
+              <span>签到/购买</span>
+              <span className="text-slate-300 dark:text-zinc-600">·</span>
+              <span>需 TTNet 加密</span>
+            </div>
+          </div>
         </div>
       </div>
 

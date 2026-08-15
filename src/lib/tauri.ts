@@ -111,6 +111,7 @@ export const api = {
     proxyLogDetail: (id: string) => invoke<string>('proxy_log_detail', { id }),
   },
   switchAccount: (userId: string) => invoke('switch_account', { userId }),
+  saveCurrentLogin: (userId: string) => invoke('save_current_login', { userId }),
   resetDeviceIds: () => invoke('reset_device_ids'),
   profiles: {
     list: () => invoke<ProfileInfo[]>('profile_list'),
@@ -189,6 +190,11 @@ export interface SwitchDoneEvent {
   raw: string;
 }
 
+export interface SaveLoginDoneEvent {
+  success: boolean;
+  raw: string;
+}
+
 export interface DeviceResetDoneEvent {
   success: boolean;
   raw: string;
@@ -206,6 +212,8 @@ export interface ListenerHandlers {
   onCheckinProgress?: (e: CheckinProgressEvent) => void;
   onSwitchProgress?: (line: string) => void;
   onSwitchDone?: (e: SwitchDoneEvent) => void;
+  onSaveLoginProgress?: (line: string) => void;
+  onSaveLoginDone?: (e: SaveLoginDoneEvent) => void;
   onDeviceResetProgress?: (line: string) => void;
   onDeviceResetDone?: (e: DeviceResetDoneEvent) => void;
   onProfileProgress?: (line: string) => void;
@@ -246,6 +254,20 @@ export async function setupListeners(
     unsubs.push(
       await listen<SwitchDoneEvent>('switch-done', (e) =>
         handlers.onSwitchDone!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onSaveLoginProgress) {
+    unsubs.push(
+      await listen<string>('save-login-progress', (e) =>
+        handlers.onSaveLoginProgress!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onSaveLoginDone) {
+    unsubs.push(
+      await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
+        handlers.onSaveLoginDone!(e.payload),
       ),
     );
   }

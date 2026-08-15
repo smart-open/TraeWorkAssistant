@@ -15,12 +15,14 @@ import {
   Copy,
   Snowflake,
   Zap,
+  Loader2,
   Camera,
   Download,
   Upload,
   Globe,
   ExternalLink,
   ArrowRight,
+  Save,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
@@ -98,6 +100,9 @@ export default function Accounts() {
   const moveAccount = useAppStore((s) => s.moveAccount);
   const resetDevice = useAppStore((s) => s.resetDevice);
   const switchTo = useAppStore((s) => s.switchTo);
+  const switchingTo = useAppStore((s) => s.switchingTo);
+  const saveCurrentLogin = useAppStore((s) => s.saveCurrentLogin);
+  const savingLogin = useAppStore((s) => s.savingLogin);
   const renewJwt = useAppStore((s) => s.renewJwt);
   const refreshRemainingCredits = useAppStore((s) => s.refreshRemainingCredits);
   const cooldownClear = useAppStore((s) => s.cooldownClear);
@@ -119,6 +124,7 @@ export default function Accounts() {
   const [jwtTarget, setJwtTarget] = useState<AccountView | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [oauthOpen, setOAuthOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const filtered = useMemo(() => {
     if (filter === 'all') return accounts;
@@ -152,6 +158,9 @@ export default function Accounts() {
         desc="维护账号、调整分组、重置设备 ID 与登录态切换"
         actions={
           <>
+            <button onClick={() => setHelpOpen(true)} className="btn-outline" title="使用帮助">
+              <HelpCircle size={15} /> 帮助
+            </button>
             <button onClick={() => { void refreshAccounts(); void refreshGroups(); void refreshRemainingCredits(); }} className="btn-outline">
               <RefreshCw size={15} /> 刷新
             </button>
@@ -312,8 +321,21 @@ export default function Accounts() {
                             <Zap size={14} />
                           </button>
                         )}
-                        <button title="切换到此账号" onClick={() => void switchTo(a.user_id)} className="btn-ghost !p-2">
-                          <LogIn size={14} />
+                        <button
+                          title={switchingTo ? (switchingTo === a.user_id ? '切换中…' : '正在切换其他账号') : '切换到此账号'}
+                          onClick={() => void switchTo(a.user_id)}
+                          disabled={!!switchingTo || !!savingLogin}
+                          className={`btn-ghost !p-2 ${switchingTo === a.user_id ? 'text-amber-500' : ''} ${(switchingTo && switchingTo !== a.user_id) || savingLogin ? 'opacity-40 cursor-not-allowed' : ''}`}
+                        >
+                          {switchingTo === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
+                        </button>
+                        <button
+                          title={savingLogin ? (savingLogin === a.user_id ? '保存中…' : '正在保存其他账号') : '保存当前登录态'}
+                          onClick={() => void saveCurrentLogin(a.user_id)}
+                          disabled={!!switchingTo || !!savingLogin}
+                          className={`btn-ghost !p-2 ${savingLogin === a.user_id ? 'text-amber-500' : ''} ${(savingLogin && savingLogin !== a.user_id) || switchingTo ? 'opacity-40 cursor-not-allowed' : ''}`}
+                        >
+                          {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
                         </button>
                         <button title="重置设备 ID" onClick={() => void resetDevice(a.user_id)} className="btn-ghost !p-2">
                           <RotateCcw size={14} />
@@ -405,6 +427,7 @@ export default function Accounts() {
           }
         }}
       />
+      <HelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
   );
 }
@@ -907,7 +930,7 @@ function ProfileModal({
   onDelete: (slot: string) => Promise<void>;
 }) {
   return (
-    <Modal open={open} onClose={onClose} title="登录态快照管理">
+    <Modal open={open} onClose={onClose} title="登录态快照管理" size="xl">
       <div className="space-y-3">
         {profileActive && (
           <div className="rounded-lg border border-brand-300 bg-brand-50 p-3 dark:border-brand-700 dark:bg-brand-900/20">
@@ -929,11 +952,11 @@ function ProfileModal({
           <table className="w-full text-sm">
             <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
               <tr>
-                <th className="px-3 py-2 text-left">账号 (user_id)</th>
-                <th className="px-3 py-2 text-right">文件数</th>
-                <th className="px-3 py-2 text-right">大小</th>
-                <th className="px-3 py-2 text-left">最后修改</th>
-                <th className="px-3 py-2 text-right">操作</th>
+                <th className="whitespace-nowrap px-3 py-2 text-left">账号 (user_id)</th>
+                <th className="whitespace-nowrap px-3 py-2 text-right">文件数</th>
+                <th className="whitespace-nowrap px-3 py-2 text-right">大小</th>
+                <th className="whitespace-nowrap px-3 py-2 text-left">最后修改</th>
+                <th className="whitespace-nowrap px-3 py-2 text-right">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -942,15 +965,15 @@ function ProfileModal({
                   key={p.slot}
                   className="border-t border-slate-200 dark:border-zinc-800"
                 >
-                  <td className="px-3 py-2 font-mono text-xs">{p.slot}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{p.file_count}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">
+                  <td className="whitespace-nowrap px-3 py-2 font-mono text-xs">{p.slot}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{p.file_count}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">
                     <ProfileSize bytes={p.size_bytes} />
                   </td>
-                  <td className="px-3 py-2 text-xs text-slate-500">
+                  <td className="whitespace-nowrap px-3 py-2 text-xs text-slate-500">
                     {p.last_modified || '-'}
                   </td>
-                  <td className="px-3 py-2">
+                  <td className="whitespace-nowrap px-3 py-2">
                     <div className="flex justify-end gap-1">
                       <button
                         title="备份"
@@ -1029,7 +1052,8 @@ function OAuthLoginModal({
     setOpening(true);
     try {
       const { url } = await api.oauth.getLoginUrl();
-      window.open(url);
+      const { open } = await import('@tauri-apps/plugin-shell');
+      await open(url);
       setStep(2);
     } catch (err) {
       toast('error', `获取登录 URL 失败：${String(err)}`);
@@ -1189,6 +1213,96 @@ function OAuthLoginModal({
             </div>
           </div>
         )}
+      </div>
+    </Modal>
+  );
+}
+
+function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  return (
+    <Modal open={open} onClose={onClose} title="账号管理使用帮助" size="xl">
+      <div className="space-y-4 text-sm">
+        <section className="rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/20">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold text-amber-700 dark:text-amber-300">
+            <Globe size={15} /> OAuth 登录（自动保存账号）
+          </h3>
+          <p className="text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+            点击「OAuth 登录」按钮，在浏览器中完成 Trae Work 账号登录。登录完成后将回调 URL 粘贴回应用，
+            系统会自动解析 JWT 并保存账号信息，无需手动粘贴 token。适合首次添加账号或 JWT 过期后重新登录。
+          </p>
+        </section>
+
+        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
+            <Save size={15} className="text-amber-500" /> 保存当前登录态
+          </h3>
+          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            在 Trae Work 中登录某个账号后，点击该账号行的「保存」图标，系统会关闭 Trae Work → 精准备份 9 类核心登录文件
+            （storage.json、state.vscdb、machineid、aha、Network 等）→ 重新启动 Trae Work。
+            每个账号的登录态独立存储，互不干扰。
+          </p>
+          <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
+            ⚠ 首次使用前，请先在 Trae Work 中登录目标账号，然后点击「保存」图标创建快照。
+          </p>
+        </section>
+
+        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
+            <LogIn size={15} className="text-amber-500" /> 切换账号流程
+          </h3>
+          <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            <li>点击目标账号行的「切换」图标</li>
+            <li>系统自动保存当前登录态到当前账号槽位（如果已知当前账号 ID）</li>
+            <li>同时备份到 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽位作为安全回退</li>
+            <li>恢复目标账号的登录态（含设备标识）</li>
+            <li>重新启动 Trae Work，自动以目标账号登录</li>
+          </ol>
+          <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
+            ⚠ 如果目标账号从未保存过登录态，切换会被中止并提示「无快照」。请先用「保存」图标创建快照。
+          </p>
+        </section>
+
+        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
+            <Camera size={15} className="text-amber-500" /> 快照管理
+          </h3>
+          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            点击「快照管理」按钮可查看所有已保存的登录态快照。每个快照以账号 UserID 命名，
+            显示文件数、大小和最后修改时间。支持手动备份、恢复和删除操作。
+            <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽位是切换时自动创建的安全备份。
+          </p>
+        </section>
+
+        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
+            <RotateCcw size={15} className="text-amber-500" /> 重置设备 ID
+          </h3>
+          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            点击账号行的「重置」图标可重置该账号的设备 ID（用于解决设备绑定问题）。
+            如需全局重置 6 层设备标识（machineid、storage.json、aha、注册表 MachineGuid 等），
+            请到设置页面执行「6 层设备标识重置」。
+          </p>
+        </section>
+
+        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
+            <Zap size={15} className="text-amber-500" /> 代理自动抓取账号
+          </h3>
+          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            启动代理服务后，在 Trae 中登录任何账号，代理会自动捕获 JWT token 并保存到账号列表中。
+            无需手动粘贴 JWT，适合批量导入账号。捕获的账号会自动解析 UserID、过期时间等信息。
+          </p>
+        </section>
+
+        <section className="rounded-lg border border-sky-200 bg-sky-50 p-3 dark:border-sky-700 dark:bg-sky-900/20">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold text-sky-700 dark:text-sky-300">
+            <KeyRound size={15} /> JWT 续期与刷新
+          </h3>
+          <p className="text-xs leading-relaxed text-sky-800 dark:text-sky-200">
+            JWT 默认 13 天过期。带有刷新令牌的账号（显示闪电图标）可点击「刷新」自动续期。
+            不支持自动刷新的账号请点击「续期」图标，系统会启动代理并切换到该账号，通过代理捕获新 JWT。
+          </p>
+        </section>
       </div>
     </Modal>
   );
