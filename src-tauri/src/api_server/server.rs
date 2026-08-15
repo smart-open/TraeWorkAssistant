@@ -68,7 +68,6 @@ pub async fn start_api_server(
 
 fn build_router(state: Arc<ApiSharedState>) -> Router {
     Router::new()
-        .route("/healthz", get(routes::healthz))
         .route("/health", get(routes::health))
         .route("/status", get(routes::status))
         .route("/v1/models", get(routes::models))

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Trae Work Helper API 服务端到端测试
+Trae Work Assistant API 服务端到端测试
 
 测试项目:
-  1. /healthz         — 基础健康检查
-  2. /health          — 详细健康状态（含账号池）
-  3. /status          — 完整状态（含账号明细）
-  4. /v1/models       — 模型列表
-  5. /v1/chat/completions (非流式) — 单轮对话
+  1. /health          — 健康检查（含账号池状态）
+  2. /status          — 完整状态（含账号明细）
+  3. /v1/models       — 模型列表
+  4. /v1/chat/completions (非流式) — 单轮对话
   6. /v1/chat/completions (流式)   — SSE 流式对话
   7. 鉴权测试          — 无 API Key / 错误 Key
   8. 错误处理          — 无效模型
@@ -94,19 +93,9 @@ class ApiTester:
 
     # ── 测试用例 ──────────────────────────────────
 
-    def test_healthz(self):
-        """1. 基础健康检查"""
-        print("\n[1] /healthz — 基础健康检查")
-        try:
-            status, _, body = self._request("GET", "/healthz")
-            self.check("返回 200", status == 200, f"实际 status={status}")
-            self.check("返回 ok", body.decode().strip() == "ok", f"实际 body={body.decode()[:100]}")
-        except Exception as e:
-            self.check("/healthz 请求成功", False, str(e))
-
     def test_health(self):
-        """2. 详细健康状态"""
-        print("\n[2] /health — 详细健康状态")
+        """1. 健康检查（含账号池状态）"""
+        print("\n[1] /health — 健康检查")
         try:
             status, _, body = self._request("GET", "/health")
             self.check("返回 200", status == 200, f"实际 status={status}")
@@ -298,7 +287,7 @@ class ApiTester:
 
     def run_all(self):
         print("=" * 60)
-        print(f"Trae Work Helper API 端到端测试")
+        print(f"Trae Work Assistant API 端到端测试")
         print(f"地址: http://{self.host}:{self.port}")
         print(f"模型: {self.model}")
         print(f"Key:  {self.api_key[:12]}..." if self.api_key else "Key:  (无)")
@@ -307,7 +296,7 @@ class ApiTester:
         # 先检查服务是否在线
         try:
             conn = http.client.HTTPConnection(self.host, self.port, timeout=3)
-            conn.request("GET", "/healthz")
+            conn.request("GET", "/health")
             resp = conn.getresponse()
             conn.close()
         except Exception:
@@ -316,7 +305,6 @@ class ApiTester:
 
         t0 = time.time()
 
-        self.test_healthz()
         self.test_health()
         self.test_status()
         self.test_models()
@@ -334,7 +322,7 @@ class ApiTester:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trae Work Helper API 端到端测试")
+    parser = argparse.ArgumentParser(description="Trae Work Assistant API 端到端测试")
     parser.add_argument("--host", default="127.0.0.1", help="API 服务地址")
     parser.add_argument("--port", type=int, default=7864, help="API 服务端口")
     parser.add_argument("--key", default="sk-72a12ee8-b462-4b03-837f-de0646fb419f-64aad",

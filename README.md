@@ -67,7 +67,7 @@ npm run tauri build    # 打包（msi + nsis）
 - [用户手册](docs/user-manual.md) — 功能说明与使用指南
 - [API 文档](docs/api-doc.md) — Tauri 前后端命令契约
 - [技术框架](docs/tech-framework.md) — 架构设计与数据模型
-- [运行手册](docs/运行手册.md) — 开发环境与部署指南
+- [运行手册](docs/operation-manual.md) — 开发环境与部署指南
 
 ## License
 

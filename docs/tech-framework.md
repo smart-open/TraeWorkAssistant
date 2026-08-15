@@ -1,6 +1,6 @@
-# 技术框架方案 — Trae Work 助手 v2.4.1
+# 技术框架方案 — Trae Work 助手 v2.4.2
 
-> 详细界面/交互/数据模型见 `产品设计文档.md`。本文档给出技术选型、架构、进程契约与风险。
+> 详细界面/交互/数据模型见 `product-design.md`。本文档给出技术选型、架构、进程契约与风险。
 > v2.0 新增：本地 API 网关（axum）、SSE 协议转换、账号池智能调度、签到错误冷却状态机、6 层设备标识重置。
 > v2.1 新增：每日积分快照（total/earned/consumed 三线趋势）、暗色模式图表适配、Mutex 安全锁（poison 恢复）、代理日志竞态修复。
 
@@ -159,7 +159,7 @@ Rust 后端统一采用 `safe_lock()` 辅助函数替代 `Mutex::lock().unwrap()
 
 ### 4.4 API 网关（v2.0 新增）
 - 内嵌 axum HTTP 服务，复用 Tauri tokio runtime，无需独立进程。
-- 端点：`POST /v1/chat/completions`（对话，流式+非流式）、`GET /v1/models`（模型列表）、`GET /status`（账号池状态）、`GET /healthz`（健康检查）。
+- 端点：`POST /v1/chat/completions`（对话，流式+非流式）、`GET /v1/models`（模型列表）、`GET /status`（账号池状态）、`GET /health`（健康检查）。
 - Bearer API Key 鉴权（常量时间比较，防时序攻击）；API Key 留空时跳过鉴权。
 - SSE 协议转换：SOLO 自定义事件（metadata/output/token_usage/done）→ OpenAI 标准 chunk 格式；通过 `spawn_blocking` 包装 ureq 同步请求实现流式转发。
 - 账号池调度：积分过期最近者优先，最多 3 次换号重试；错误分类联动冷却状态机。

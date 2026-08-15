@@ -1,6 +1,6 @@
 # Trae Work Assistant 用户手册
 
-> **版本**: v2.4.1 | **平台**: Windows 10 / 11 | **更新日期**: 2026-08-15
+> **版本**: v2.4.2 | **平台**: Windows 10 / 11 | **更新日期**: 2026-08-15
 
 ## 目录
 
@@ -305,7 +305,7 @@ response = client.chat.completions.create(
 - `POST /v1/chat/completions` — 对话（流式 + 非流式）
 - `GET /v1/models` — 模型列表
 - `GET /status` — 账号池状态
-- `GET /healthz` — 健康检查
+- `GET /health` — 健康检查
 
 ### 7.4 IDE 积分说明
 

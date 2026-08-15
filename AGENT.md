@@ -1,4 +1,4 @@
-# AGENT.md — Trae Work Assistant v2.4.1
+# AGENT.md — Trae Work Assistant v2.4.2
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 
@@ -10,7 +10,7 @@ Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关�
 
 ```powershell
 # 仅 Windows，需要 Node 18+ / Rust stable (MSVC) / VS Build Tools C++ 工作负载 / WebView2
-cd D:\open-tools\trae-work-helper
+cd trae-work-assistant
 npm install
 npm run tauri dev          # 开发模式（Tauri WebView 加载 Vite 5173）
 npm run tauri build        # 打包 MSI + NSIS 到 src-tauri/target/release/bundle/
@@ -35,11 +35,11 @@ cargo test                                    # Rust 单测（需先装工具链
 ## 4. 目录地图
 
 ```
-trae-work-helper/
+trae-work-assistant/
 ├── AGENT.md                      # 本文件（项目速查）
 ├── README.md                     # 用户文档
 ├── package.json / vite.config.ts / tsconfig.json / tailwind.config.js / postcss.config.js / index.html
-├── docs/                         # 设计/技术/API/用户手册/运行手册
+├── docs/                         # 设计/技术/API/用户手册/operation-manual
 ├── src/                          # 前端
 │   ├── App.tsx                   # 外壳（TitleBar + Sidebar + TopBar + 页面切换 + Toaster）
 │   ├── store.ts                  # Zustand 单一真相（init / 刷新 / checkin/switch/saveLogin 事件归约）

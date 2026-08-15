@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use super::ApiSharedState;
 
 /// Bearer Token 鉴权中间件：
-/// - /healthz 跳过鉴权
+/// - /health 跳过鉴权
 /// - api_key 为空时跳过鉴权
 /// - 否则校验 Authorization: Bearer <key>
 pub async fn bearer_auth(
@@ -16,7 +16,7 @@ pub async fn bearer_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path() == "/healthz" {
+    if request.uri().path() == "/health" {
         return next.run(request).await;
     }
     if state.api_key.is_empty() {

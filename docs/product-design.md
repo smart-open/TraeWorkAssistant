@@ -979,10 +979,10 @@ Anthropic Request─┘                    └─→ Anthropic SSE
 | 账号配置模板 | `src-python/tests/（测试数据）` |
 | 设备限制根因分析 | `docs/技术框架（本项目设计）` |
 | 设备 ID 代理方案 | `docs/技术框架（本项目设计）` |
-| JWT 重抓指南 | `docs/运行手册.md` |
+| JWT 重抓指南 | `docs/operation-manual.md` |
 | 账号切换器（命令行） | `src-ps/trae-switch-bridge.ps1` |
 | 账号切换器（GUI） | `src-ps/trae-switch-bridge.ps1（集成模式）` |
-| 功能参考界面 | `docs/产品设计文档.md（界面参考）` |
+| 功能参考界面 | `docs/product-design.md（界面参考）` |
 
 ### 11.2 上游接口清单（v1.0 涉及）
 

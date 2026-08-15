@@ -24,10 +24,6 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 
 // ==================== Handlers ====================
 
-pub async fn healthz() -> &'static str {
-    "ok"
-}
-
 pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
     let pool = state.pool.status_list();
     let available = pool.iter().filter(|p| !p.disabled && !p.cooling).count();
