@@ -1,4 +1,4 @@
-# 技术框架方案 — Trae Work 助手 v2.2.0
+# 技术框架方案 — Trae Work 助手 v2.4.1
 
 > 详细界面/交互/数据模型见 `产品设计文档.md`。本文档给出技术选型、架构、进程契约与风险。
 > v2.0 新增：本地 API 网关（axum）、SSE 协议转换、账号池智能调度、签到错误冷却状态机、6 层设备标识重置。
@@ -55,24 +55,23 @@ v2.0.0 架构变更：API 网关从「下期独立模块」改为内嵌 axum 服
 
 ## 3. 数据模型
 
-统一存于 `%APPDATA%\TraeWorkAssistant\`：
+统一存于 `%APPDATA%\TraeWorkAssistant\`，分三个子目录：
 
 | 文件 | 来源 | 说明 |
 |---|---|---|
-| `checkin_accounts.json` | 沿用原格式 | 账号 + JWT，原脚本与 Python 核心共用 |
-| `device_map.json` | 沿用原格式 | user_id → 虚拟设备身份 |
-| `groups.json` | v1.0 新增 | 分组定义 + membership（UserID→groupId） |
-| `app_settings.json` | v1.0 新增 | 应用设置 |
-| `checkin_summary.json` | 沿用 | 最近一次签到结果 |
-| `credits_history.json` | v1.0 新增 | 积分历史（看板绘图） |
-| `logs/` | v1.0 新增 | proxy.log / checkin.log / switcher.log |
-| `certs/` | 沿用 | 自签 CA |
-| `profiles/<user_id>/` | 沿用 | 各账号 TW 登录态备份 |
-| `account_cooldowns.json` | v2.0 新增 | 签到错误冷却状态（error_type + cooldown_until） |
-| `remaining_credits.json` | v2.0 新增 | 各账号剩余积分缓存 |
-| `api_pool.json` | v2.0 新增 | API 账号池状态（选中账号、轮转计数） |
-| `proxy_logs/` | v2.0 新增 | 代理日志目录（按日期分割，支持关键字/时间段查询） |
-| `credits_daily.json` | v2.1 新增 | 每日积分快照（total / earned / consumed，三线趋势图数据源） |
+| `conf/app_settings.json` | v1.0 新增 | 应用设置 |
+| `data/checkin_accounts.json` | 沿用原格式 | 账号 + JWT，原脚本与 Python 核心共用 |
+| `data/device_map.json` | 沿用原格式 | user_id → 虚拟设备身份 |
+| `data/groups.json` | v1.0 新增 | 分组定义 + membership（UserID→groupId） |
+| `data/checkin_summary.json` | 沿用 | 最近一次签到结果 |
+| `data/credits_history.json` | v1.0 新增 | 积分历史（看板绘图） |
+| `data/account_cooldowns.json` | v2.0 新增 | 签到错误冷却状态（error_type + cooldown_until） |
+| `data/remaining_credits.json` | v2.0 新增 | 各账号剩余积分缓存 |
+| `data/api_pool.json` | v2.0 新增 | API 账号池状态（选中账号、轮转计数） |
+| `data/credits_daily.json` | v2.1 新增 | 每日积分快照（total / earned / consumed，三线趋势图数据源） |
+| `data/certs/` | 沿用 | 自签 CA |
+| `data/profiles/<user_id>/` | 沿用 | 各账号 TW 登录态备份 |
+| `logs/` | v1.0 新增 | proxy.log / checkin.log / switcher.log / api 请求日志 / 代理请求日志 |
 
 账号唯一主键：`UserID`（JWT payload `data.id`，16 位数字）。分组信息独立存储，不污染原 JSON。
 
@@ -149,8 +148,8 @@ Rust 后端统一采用 `safe_lock()` 辅助函数替代 `Mutex::lock().unwrap()
 ### 4.2 `device_proxy.py`
 - 环境变量：`PROXY_PORT`（默认 8899）、`AUTO_CAPTURE_JWT`（默认 1）。
 - 行为：透明 MITM；捕获 `trae.cn` / `trae.com.cn` 带 `Cloud-IDE-JWT` 的请求写回 `checkin_accounts.json`（按 UserID 匹配，exp 防降级）；仅对 `checkin_credits/claim` 改写设备头。
-- **v2.0 增强**：新增 `mchost.guru` 到默认监听域名，MITM 解密 TRAE 对话流量；WebSocket 请求通过 `upgrade: websocket` 头检测并隧道转发（不记录消息内容）；代理日志按日期分割写入 `proxy_logs/` 目录。
-- 日志：`proxy.log`（旧式实时日志）+ `proxy_logs/YYYY-MM-DD.log`（结构化日志，支持关键字/时间段查询），关键标记 `[JWT 自动更新]` / `[JWT 自动追加新账号]`，供 Rust 解析并 `emit` 事件。
+- **v2.0 增强**：新增 `mchost.guru` 到默认监听域名，MITM 解密 TRAE 对话流量；WebSocket 请求通过 `upgrade: websocket` 头检测并隧道转发（不记录消息内容）；代理请求日志按日期分割写入 `logs/` 目录。
+- 日志：`proxy.log`（旧式实时日志）+ `logs/proxy_req_YYYY-MM-DD.log`（结构化日志，支持关键字/时间段查询），关键标记 `[JWT 自动更新]` / `[JWT 自动追加新账号]`，供 Rust 解析并 `emit` 事件。
 
 ### 4.3 `trae-switch-bridge.ps1`
 - **非交互模式**：`-Action <Switch|Save|New|Reset|List|ResetDeviceIds>` + `-Json` + `-UserId <id>`，以 NDJSON 输出每步进度，供 Rust 转发渲染步骤条。

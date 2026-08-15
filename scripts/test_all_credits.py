@@ -8,7 +8,7 @@ device_map = json.load(open(os.path.join(APP_DATA, "device_map.json"), "r", enco
 
 EP_CHAT = "/api/agent/v3/llm_utils_chat"
 APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
-HOST = "https://api5-normal.mchost.guru"
+HOST = "https://trae-api-cn.mchost.guru"
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False

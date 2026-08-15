@@ -30,7 +30,7 @@ EP_CHAT = "/api/agent/v3/llm_utils_chat"
 APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 
 # trae-work-assistant 版本（当前项目）
-HELPER_HOST = "https://api5-normal.mchost.guru"
+HELPER_HOST = "https://trae-api-cn.mchost.guru"
 HELPER_IDE_VERSION = "0.1.50"
 HELPER_IDE_VERSION_CODE = "20260811"
 

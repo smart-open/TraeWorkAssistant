@@ -26,7 +26,7 @@ Windows 桌面端多账号签到与管理工具 · Tauri 2 + React 18 + Rust
 - **本地代理**：MITM 代理自动捕获 JWT、注入独立设备 ID
 - **API 网关**：内嵌 OpenAI 兼容 API 服务，账号池智能调度（积分过期感知 + 冷却状态机）
 - **定时任务**：Windows 计划任务，后台自动签到
-- **6 层设备标识重置**：machineid / storage.json / aha / 注册表 / webview 追踪数据
+- **6 层设备标识重置**：machineid / storage.json 遥测 / aha.device / 注册表 MachineGuid / webview 追踪数据 / aha TinyStorage
 - **快照管理**：查看/备份/恢复/删除账号登录态快照
 - **暗色模式**：全界面暗色主题支持，图表动态适配
 - **数据全部本地存储**，不上传任何服务器
