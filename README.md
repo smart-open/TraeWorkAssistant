@@ -69,7 +69,6 @@ npm run tauri build    # 打包（msi + nsis）
 - [API 文档](docs/api-doc.md) — Tauri 前后端命令契约
 - [技术框架](docs/tech-framework.md) — 架构设计与数据模型
 - [运行手册](docs/operation-manual.md) — 开发环境与部署指南
-- [问题分析报告](docs/issue-analysis-2026-08-16.md) — 代理/VPN 冲突与定时任务问题的根因分析
 
 ## License
 
