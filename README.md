@@ -23,7 +23,7 @@ Windows 桌面端多账号签到与管理工具 · Tauri 2 + React 18 + Rust
 - **登录态切换**：保存当前登录态 → 恢复目标账号 → 启动，精准备份 9 类核心文件
 - **一键签到**：批量签到、按分组/手动勾选、跳过已签/过期、实时进度
 - **积分看板**：排行、三线趋势图（总数/获得/消耗）、今日新增统计
-- **本地代理**：MITM 代理自动捕获 JWT、注入独立设备 ID
+- **本地代理**：MITM 代理自动捕获 JWT、注入独立设备 ID；**自动串联已有系统代理（VPN）作为上游**，开启代理后外网访问不受影响，停止时原样还原系统代理
 - **API 网关**：内嵌 OpenAI 兼容 API 服务，账号池智能调度（积分过期感知 + 冷却状态机）
 - **定时任务**：Windows 计划任务，后台自动签到
 - **6 层设备标识重置**：machineid / storage.json 遥测 / aha.device / 注册表 MachineGuid / webview 追踪数据 / aha TinyStorage
@@ -64,10 +64,12 @@ npm run tauri build    # 打包（msi + nsis）
 
 ## 文档
 
+- [更新日志](CHANGELOG.md) — 各版本变更记录
 - [用户手册](docs/user-manual.md) — 功能说明与使用指南
 - [API 文档](docs/api-doc.md) — Tauri 前后端命令契约
 - [技术框架](docs/tech-framework.md) — 架构设计与数据模型
 - [运行手册](docs/operation-manual.md) — 开发环境与部署指南
+- [问题分析报告](docs/issue-analysis-2026-08-16.md) — 代理/VPN 冲突与定时任务问题的根因分析
 
 ## License
 

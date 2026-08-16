@@ -425,84 +425,126 @@ pub fn invite_link(_app: AppHandle, _state: State<AppState>) -> Invite {
 
 // ---------------- 定时任务 ----------------
 
+// 运行 schtasks 并正确解码输出。
+// 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")
+// 以 GBK 字节输出；若直接 from_utf8_lossy 会读成 ϵͳ... 乱码，导致 "找不到" 永远匹配不上、
+// 错误文案变成乱码。前置 `chcp 65001` 让 schtasks 以 UTF-8 输出，从而能正确匹配与展示。
+// 返回 (成功?, stdout, stderr)，三者均为 UTF-8 字符串。
+fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
+    let mut full: Vec<String> = vec![
+        "/c".to_string(),
+        "chcp".to_string(),
+        "65001".to_string(),
+        ">nul".to_string(),
+        "&&".to_string(),
+        "schtasks".to_string(),
+    ];
+    for a in args {
+        full.push((*a).to_string());
+    }
+    let out = Command::new("cmd")
+        .args(&full)
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|e| format!("执行 schtasks 失败: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    Ok((out.status.success(), stdout, stderr))
+}
+
 #[tauri::command]
 pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
     // 直接调用 python 签到脚本（无界面、可定时），注入数据目录
     let py = state.python_exe.clone();
     let script = state.python_dir.join("auto_checkin.py");
     let data_dir = state.data_dir.to_string_lossy().to_string();
-    // schtasks /TR 不会继承当前进程环境变量，需在命令行中显式设置 TRAEDATA_DIR
+    // schtasks /TR 不会继承当前进程环境变量，需在命令行中显式设置 TRAEDATA_DIR。
+    // 必须用 set "VAR=value"（带引号）以兼容含空格的路径（如 C:\Users\<带空格用户名>\...）；
+    // 用 && 串联，仅当 set 成功后才执行 python。
+    // 不再使用 /RL HIGHEST：签到脚本只读取/写入 %APPDATA% 并运行 python，无需提权，
+    // 否则普通用户会卡在「access denied」而注册失败（详见问题分析报告）。
     let tr = format!(
-        "cmd /c set TRAEDATA_DIR={}&\"{}\" \"{}\"",
+        "cmd /c set \"TRAEDATA_DIR={}\" && \"{}\" \"{}\"",
         data_dir,
         py.replace('\\', "/"),
         script.to_string_lossy().replace('\\', "/")
     );
     let task_name = "TraeWorkAssistant_DailyCheckin";
-    let output = Command::new("schtasks")
-        .args([
-            "/Create",
-            "/TN",
-            task_name,
-            "/TR",
-            &tr,
-            "/SC",
-            "DAILY",
-            "/ST",
-            &time,
-        "/RL",
-        "HIGHEST",
+    let (ok, _stdout, stderr) = run_schtasks(&[
+        "/Create",
+        "/TN",
+        task_name,
+        "/TR",
+        tr.as_str(),
+        "/SC",
+        "DAILY",
+        "/ST",
+        time.as_str(),
         "/F",
-    ])
-    .creation_flags(0x08000000)
-    .output()
-    .map_err(|e| format!("注册计划任务失败: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { &stderr } else { &stdout };
-
-        // 检测是否是权限不足
+    ])?;
+    if !ok {
+        let detail = stderr.trim();
+        // 权限不足：最常见的失败原因（/RL HIGHEST 或普通用户受限）
         let is_access_denied = detail.contains("Access is denied")
             || detail.contains("ERROR: Access is denied")
             || detail.contains("拒绝访问")
-            || output.status.code() == Some(5);
-
+            || detail.contains("权限");
         if is_access_denied {
             return Err(format!(
-                "注册计划任务失败：权限不足（Access Denied）\n\n\
-                 原因：使用 /RL HIGHEST 创建计划任务需要管理员权限，当前应用以普通用户身份运行。\n\n\
+                "权限不足（Access Denied）。\n\n\
                  解决方法（任选其一）：\n\
-                 1. 右键 TraeWorkAssistant → 「以管理员身份运行」后重新注册\n\
+                 1. 右键 TraeWorkAssistant →「以管理员身份运行」后重新点击「注册任务」\n\
                  2. 打开「管理员命令提示符」手动执行：\n\
-                    schtasks /Create /TN TraeWorkAssistant_DailyCheckin /TR \"cmd /c set TRAEDATA_DIR={}&\\\"{}\\\" \\\"{}\\\"\" /SC DAILY /ST {} /RL HIGHEST /F\n\
-                 3. 如不需最高权限，可在管理员 CMD 中去掉 /RL HIGHEST 参数后重试\n\n\
-                 详细错误：{detail}",
-                data_dir, py.replace('\\', "/"), script.to_string_lossy().replace('\\', "/"), time,
+                    schtasks /Create /TN TraeWorkAssistant_DailyCheckin /TR \"cmd /c set TRAEDATA_DIR={}&\\\"{}\\\" \\\"{}\\\"\" /SC DAILY /ST {} /F\n\
+                 3. 如不需最高权限，可去掉 /RL HIGHEST 后重试",
+                data_dir, py.replace('\\', "/"), script.to_string_lossy().replace('\\', "/"), time
             ));
         }
-
-        return Err(format!("注册计划任务失败：{detail}"));
+        return Err(detail.to_string());
     }
     Ok(())
 }
 
 #[tauri::command]
 pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, String> {
-    let out = Command::new("schtasks")
-        .args(["/Query", "/TN", "TraeWorkAssistant_DailyCheckin", "/FO", "LIST"])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|e| format!("查询计划任务失败: {e}"))?;
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    let (ok, stdout, stderr) =
+        run_schtasks(&["/Query", "/TN", "TraeWorkAssistant_DailyCheckin", "/FO", "LIST"])?;
+    if !ok {
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        // 任务本就不存在：返回友好提示而非带乱码的错误，避免前端叠加"查询失败："前缀
+        if detail.contains("can't find")
+            || detail.contains("找不到")
+            || detail.contains("does not exist")
+            || detail.contains("ERROR: The system cannot find")
+            || detail.contains("系统找不到")
+        {
+            return Ok("未注册每日签到任务（请先在设置页点击「注册任务」）。".to_string());
+        }
+        return Err(detail.to_string());
+    }
+    Ok(stdout)
 }
 
 #[tauri::command]
 pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", "TraeWorkAssistant_DailyCheckin", "/F"])
-        .creation_flags(0x08000000)
-        .status();
+    let (ok, _stdout, stderr) =
+        run_schtasks(&["/Delete", "/TN", "TraeWorkAssistant_DailyCheckin", "/F"])?;
+    if !ok {
+        let detail = stderr.trim();
+        // 任务本就不存在：视为已删除，不报错
+        if detail.contains("can't find")
+            || detail.contains("找不到")
+            || detail.contains("does not exist")
+            || detail.contains("ERROR: The system cannot find")
+            || detail.contains("系统找不到")
+        {
+            return Ok(());
+        }
+        return Err(detail.to_string());
+    }
     Ok(())
 }

@@ -56,6 +56,14 @@ PROXY_LOG_DIR = os.environ.get("PROXY_LOG_PATH", "")
 if not PROXY_LOG_DIR:
     PROXY_LOG_DIR = os.path.join(DATA_DIR, "logs")
 
+# 上游代理（可选）：桌面端在启动系统代理前会读取「已有的系统代理」（通常是用户的
+# VPN 梯子，如 Clash/v2rayN 的本地代理），并将其作为上游透传进来。这样本代理只
+# 拦截并解密 Trae 域名，其余流量（google/github 等）经上游 VPN 出去，避免「开代理后
+# 外网打不开」的冲突。格式兼容 Windows 系统代理 ProxyServer：
+#   "127.0.0.1:7890" / "http=127.0.0.1:7890" / "socks=127.0.0.1:7891"
+#   / "http=127.0.0.1:7890;https=127.0.0.1:7890;socks=127.0.0.1:7891"
+UPSTREAM_PROXY = os.environ.get("UPSTREAM_PROXY", "").strip()
+
 def extract_sse_summary(resp_headers, resp_body):
     """从 SSE 流式响应中提取摘要信息（模型、token 用量等）。
     仅对 Content-Type: text/event-stream 的响应生效。
@@ -1192,13 +1200,142 @@ def tunnel_https(tls, host, port):
         if keep_alive is False:
             break  # 上游要求关闭连接或出错，退出 keep-alive 循环
 
+# ---------------- 上游代理透传（解决与 VPN 梯子的冲突） ----------------
+
+def _split_host_port(addr, default_port):
+    """把 'host:port' 拆成 (host, port)；无端口时用 default_port。"""
+    addr = (addr or "").strip()
+    if ":" in addr:
+        h, p = addr.rsplit(":", 1)
+        try:
+            return h, int(p)
+        except ValueError:
+            return addr, default_port
+    return addr, default_port
+
+
+def _parse_upstream(spec):
+    """解析上游代理规格，返回 ('http', addr) / ('socks5', addr) / None。
+    兼容 Windows 系统代理 ProxyServer 的多种写法：
+      - '127.0.0.1:7890'              -> http
+      - 'http=127.0.0.1:7890'         -> http
+      - 'socks=127.0.0.1:7891'        -> socks5
+      - 'http=...;https=...;socks=...' -> 优先 socks5，其次 http
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    parts = [p.strip() for p in spec.split(";") if p.strip()]
+    socks = None
+    http = None
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if k in ("socks", "socks5"):
+                socks = v
+            elif k in ("http", "https"):
+                http = http or v
+        else:
+            http = http or p
+    if socks:
+        return ("socks5", socks)
+    if http:
+        return ("http", http)
+    return None
+
+
+def connect_via_upstream(host, port, upstream):
+    """经上游代理建立到 (host, port) 的 TCP 隧道，返回已建连的 socket。
+    支持 HTTP 代理的 CONNECT，以及 SOCKS5（无认证 / 用户名密码）。"""
+    kind, addr = upstream
+    uh, up = _split_host_port(addr, 1080 if kind == "socks5" else 8080)
+    if kind == "http":
+        s = socket.create_connection((uh, up), timeout=30)
+        req = (
+            f"CONNECT {host}:{port} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Proxy-Connection: keep-alive\r\n\r\n"
+        )
+        s.sendall(req.encode("utf-8"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise RuntimeError("上游代理无响应")
+            buf += chunk
+        head = buf.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+        if not head.startswith("HTTP/1.1 200") and not head.startswith("HTTP/1.0 200"):
+            raise RuntimeError(f"上游代理拒绝 CONNECT: {head}")
+        return s
+    # SOCKS5
+    s = socket.create_connection((uh, up), timeout=30)
+    s.sendall(b"\x05\x02\x00\x02")
+    greet = s.recv(2)
+    if len(greet) < 2 or greet[0] != 0x05:
+        raise RuntimeError("SOCKS5 握手失败")
+    method = greet[1]
+    if method == 0x02:
+        user = os.environ.get("UPSTREAM_PROXY_USER", "").encode("utf-8")[:255]
+        pwd = os.environ.get("UPSTREAM_PROXY_PASS", "").encode("utf-8")[:255]
+        s.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(pwd)]) + pwd)
+        rep = s.recv(2)
+        if len(rep) < 2 or rep[1] != 0x00:
+            raise RuntimeError("SOCKS5 认证失败")
+    elif method != 0x00:
+        raise RuntimeError(f"SOCKS5 不支持的认证方式: {method}")
+    if ":" in host:
+        raise RuntimeError("暂不支持 SOCKS5 IPv6")
+    host_b = host.encode("utf-8")
+    s.sendall(b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + port.to_bytes(2, "big"))
+    rep = s.recv(4)
+    if len(rep) < 4 or rep[1] != 0x00:
+        raise RuntimeError(f"SOCKS5 CONNECT 失败: code={rep[1] if len(rep) >= 2 else '?'}")
+    atyp = rep[3]
+    if atyp == 0x01:
+        s.recv(4)
+    elif atyp == 0x03:
+        n = s.recv(1)[0]
+        s.recv(n)
+    elif atyp == 0x04:
+        s.recv(16)
+    return s
+
+
 # ---------------- 透明隧道（非 TRAE 域，不解密直接放行，静默无日志） ----------------
 def tunnel_raw(client_sock, host, port):
     """对不在 TARGET_DOMAINS 的 CONNECT，建立到真实服务器的 TCP 隧道并双向转发，
     不做 TLS 解密、不记录任何日志。用于把本代理作为系统代理时，让浏览器/其他 App
-    的流量正常通过而不污染日志。"""
+    的流量正常通过而不污染日志。
+
+    关键修复：CONNECT 隧道必须先用 "HTTP/1.1 200 Connection Established" 应答客户端，
+    客户端才会发起 TLS 握手。缺失该应答会导致 github.com 等所有非 Trae 域名的
+    HTTPS 流量无法建立隧道（表现为「代理打开后网站打不开」）。详见问题分析报告。
+    """
+    upstream = _parse_upstream(UPSTREAM_PROXY) if UPSTREAM_PROXY else None
+    remote = None
+    if upstream:
+        try:
+            remote = connect_via_upstream(host, port, upstream)
+            log(f"  [raw-tunnel] 经上游代理 {upstream[1]} 建立隧道 {host}:{port}")
+        except Exception as e:
+            log(f"  [raw-tunnel] 上游代理连接失败({type(e).__name__}: {e})，回退直连")
+            remote = None
+    if remote is None:
+        try:
+            remote = socket.create_connection((host, port), timeout=30)
+        except Exception:
+            # 上游不可达：明确告知客户端，避免浏览器无限等待
+            try:
+                client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            except Exception:
+                pass
+            return
+
+    # 完成 CONNECT 握手：先回 200，客户端随后才会发送 TLS ClientHello
     try:
-        remote = socket.create_connection((host, port), timeout=30)
+        client_sock.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
     except Exception:
         return
 
@@ -1268,6 +1405,22 @@ def handle_plain(conn, buf):
     ctx = ssl.create_default_context() if u.scheme == "https" else None
     c = http.client.HTTPSConnection(host, port, context=ctx, timeout=30) if u.scheme == "https" else http.client.HTTPConnection(host, port, timeout=30)
     fwd = {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
+    # 非目标域名且配置了上游代理：经上游(通常是 VPN)转发，使外网明文 HTTP 也正常可用
+    if (not _is_target) and UPSTREAM_PROXY and u.scheme == "http":
+        _up = _parse_upstream(UPSTREAM_PROXY)
+        if _up and _up[0] == "http":
+            try:
+                _uh, _uport = _split_host_port(_up[1], 8080)
+                _c = http.client.HTTPConnection(_uh, _uport, timeout=30)
+                # 向上游 HTTP 代理发送带绝对 URL 的请求
+                _c.request(method, target, body=body if method.upper() != "GET" else None, headers=fwd)
+                _resp = _c.getresponse()
+                _resp_body = _resp.read()
+                send_response(conn, _resp.status, _resp.reason, dict(_resp.getheaders()), _resp_body)
+                _c.close()
+                return
+            except Exception:
+                pass  # 回退到下面的直连逻辑
     try:
         c.request(method, u.path or "/", body=body if method.upper() != "GET" else None, headers=fwd)
         resp = c.getresponse()

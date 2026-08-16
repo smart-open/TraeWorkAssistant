@@ -1,4 +1,4 @@
-# AGENT.md — Trae Work Assistant v2.4.2
+# AGENT.md — Trae Work Assistant v2.4.3
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 
@@ -155,6 +155,13 @@ trae-work-assistant/
 - **NDJSON**：`--json-stream` 输出 `{"type":"start"|"account"|"done",...}` 单行 JSON。
 - **稳定设备 ID**：`device_map.json` 缺条目时由 `rand_digits(n, seed=user_id)` 派生。
 - **docstring**：包含 Windows 路径时**必须用 raw 字符串 `r"""..."""`**。
+- **上游代理链（v2.4.3）**：`device_proxy.py` 读取 `UPSTREAM_PROXY`（可选 `UPSTREAM_PROXY_USER` / `UPSTREAM_PROXY_PASS`），支持 `http://host:port` 与 `socks5://host:port` 两种形态。**非 Trae 域名**的 CONNECT 隧道（`tunnel_raw`）与明文 HTTP 转发优先经上游出站，上游不可用时回退直连；Trae 域名仍走本地 MITM 解密以捕获 JWT。
+
+## 9.1 代理生命周期约定（v2.4.3）
+
+- `proxy_start` **先**通过 `get_existing_win_proxy()` 读取当前系统代理（即用户的 VPN），作为 `UPSTREAM_PROXY` 注入 Python 进程，**再**用 `set_win_proxy` 改写为 `127.0.0.1:<port>`。顺序不可颠倒，否则会把自己当成上游造成死循环。
+- `proxy_stop` 与看门狗**原样还原**启动前捕获的 `ProxyEnable` / `ProxyServer` / `ProxyOverride`，而非简单置 0，避免破坏 VPN 设置。
+- `tunnel_raw` **必须**先回 `HTTP/1.1 200 Connection Established` 客户端才会发起 TLS 握手；连接上游失败时回 `502 Bad Gateway`，不可静默返回。
 
 ## 10. 前端约定
 
@@ -203,3 +210,7 @@ trae-work-assistant/
 - LLM API 上游必须设置 `NO_PROXY=*` 避免系统代理循环。
 - 日志文件首行可能有 BOM 前缀（PowerShell 5.1 `-Encoding UTF8`），`split_time` 已处理。
 - JWT 默认 13 天过期；带 refresh_token 的账号可自动续期。
+- **`schtasks` 中文输出是 GBK**，直接 `String::from_utf8_lossy` 会乱码。统一走 `misc.rs::run_schtasks()`（前置 `chcp 65001`），**不要**再裸调 `Command::new("schtasks")`。
+- **计划任务不加 `/RL HIGHEST`**：签到脚本只读写 `%APPDATA%` 并运行 Python，加了会让普通用户注册失败（Access Denied）。
+- **错误文案不重复加前缀**：Rust 端返回纯错误描述，`查询失败：` / `注册失败：` 等前缀由前端 `Settings.tsx` 统一拼接。
+- **`src-python/` 会打包进 `resources/python/`**：Python 侧改动在正式版必须 `npm run tauri build` 重新打包才生效；`npm run tauri dev` 直读源码，重启对应功能即生效。

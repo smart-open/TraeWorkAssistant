@@ -14,6 +14,12 @@ use crate::state::AppState;
 /// 代理进程意外退出时，系统代理仍指向死端口 127.0.0.1:8899，需自动还原以避免全局断网。
 static PROXY_INTENTIONAL_STOP: AtomicBool = AtomicBool::new(false);
 
+/// 启动代理前已存在的系统代理（通常是用户的 VPN 梯子，如 Clash/v2rayN 的本地代理）。
+/// 我们启动时会把系统代理全局指向本机 127.0.0.1:8899，并把这个外部代理作为「上游」透传，
+/// 停止时再还原回去，避免覆盖/丢失用户原有的 VPN 代理设置。
+/// 存储 (enabled, server, override)。
+static PREV_SYSTEM_PROXY: Mutex<Option<(bool, String, String)>> = Mutex::new(None);
+
 pub struct ProxyHandle {
     pub child: Child,
     pub port: u16,
@@ -75,6 +81,8 @@ pub fn proxy_start(
     }
     // 兜底：端口为 0 时退化为固定端口 8899，避免注入 TRAE 的代理地址无效（见 store.ts 同款兜底）
     let port = if port == 0 { 8899 } else { port };
+    // 本机代理监听地址（系统代理将指向它）
+    let proxy_addr = format!("127.0.0.1:{port}");
     let script_path = state.python_dir.join("device_proxy.py");
     if !script_path.exists() {
         return Err(format!("找不到脚本: {}", script_path.display()));
@@ -87,6 +95,38 @@ pub fn proxy_start(
         // 默认路径：%APPDATA%\TraeWorkAssistant\logs（代理请求日志直接存放在 logs/ 下）
         state.logs_dir().to_string_lossy().to_string()
     });
+    // 捕获启动前的系统代理（通常是用户的 VPN 梯子，如 Clash/v2rayN 本地代理）。
+    // 启动后我们会把系统代理全局指向本机 127.0.0.1:8899，从而拦截所有流量；
+    // 若不把原本的 VPN 代理作为「上游」透传，外网(google/github)会直接连不通 ——
+    // 这正是「开代理后外网打不开、但关代理+开VPN就正常」的根因。
+    let upstream_proxy: Option<String> = {
+        #[cfg(target_os = "windows")]
+        {
+            match get_existing_win_proxy() {
+                Some((en, sv, ov))
+                    if sv != proxy_addr && !sv.contains(&format!("127.0.0.1:{port}")) =>
+                {
+                    // 这是外部代理(VPN)，作为上游透传，并在停止时还原
+                    *PREV_SYSTEM_PROXY
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) =
+                        Some((en, sv.clone(), ov));
+                    Some(sv)
+                }
+                _ => {
+                    *PREV_SYSTEM_PROXY
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                    None
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    };
+
     let mut cmd = Command::new(&state.python_exe);
     cmd.arg(&script_path)
         .creation_flags(0x08000000)
@@ -95,9 +135,11 @@ pub fn proxy_start(
         .env("AUTO_CAPTURE_JWT", "1")
         .env("PROXY_DOMAINS", &proxy_domains)
         .env("PROXY_LOG_PATH", &proxy_log_path)
-        .env("PYTHONIOENCODING", "utf-8")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("PYTHONIOENCODING", "utf-8");
+    if let Some(up) = &upstream_proxy {
+        cmd.env("UPSTREAM_PROXY", up);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("启动代理失败: {e}"))?;
     let stdout = child.stdout.take().ok_or("代理无标准输出")?;
     let stderr = child.stderr.take();
@@ -196,7 +238,6 @@ pub fn proxy_start(
     }
 
     // 同步把 Windows 系统代理指向本机端口，使 TRAE 鉴权请求(api.trae.cn)汇入本代理
-    let proxy_addr = format!("127.0.0.1:{port}");
     match set_win_proxy(&proxy_addr) {
         Ok(()) => {
             let _ = app.emit(
@@ -236,9 +277,32 @@ pub fn proxy_stop(
         fs_utils::app_log(&state.data_dir, &format!("代理已停止: 共捕获 {c} 个账号"));
         // h 在此处 drop，Drop trait 会 kill + wait 子进程
     }
-    // 还原系统代理，避免本机全局断网
-    if let Err(e) = clear_win_proxy() {
-        fs_utils::app_log(&state.data_dir, &format!("还原系统代理失败(可手动在设置中关闭): {e}"));
+    // 还原系统代理：若启动前存在外部代理(VPN)，则还原之；否则清空，避免本机全局断网
+    #[cfg(target_os = "windows")]
+    {
+        let prev = PREV_SYSTEM_PROXY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let res = match prev {
+            Some((en, sv, ov)) if en => apply_proxy(true, &sv, &ov),
+            _ => clear_win_proxy(),
+        };
+        if let Err(e) = res {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
+            );
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Err(e) = clear_win_proxy() {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
+            );
+        }
     }
     Ok(ProxyStatus {
         running: false,
@@ -312,24 +376,32 @@ fn append_log(path: &std::path::Path, line: &str) {
 // Windows 系统代理(WinINet)。故启动本地代理时同步把系统代理指向本机端口，TRAE 的全部
 // 流量(含鉴权)即汇入我们的 MITM 代理；停止时还原，避免全局断网。
 #[cfg(target_os = "windows")]
-pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
+fn apply_proxy(enable: bool, server: &str, override_: &str) -> Result<(), String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-    run_reg(key, "ProxyEnable", "REG_DWORD", "1")?;
-    run_reg(key, "ProxyServer", "REG_SZ", addr)?;
-    // 关键：设置 ProxyOverride 让 localhost 绕过代理
-    // 这样即使代理开启，客户端仍能直连 127.0.0.1:7864（API 服务）
-    // 代理关闭后客户端也不会尝试通过 127.0.0.1:8899 连接 localhost
-    run_reg(key, "ProxyOverride", "REG_SZ", "127.0.0.1;localhost;<local>")?;
+    run_reg(key, "ProxyEnable", "REG_DWORD", if enable { "1" } else { "0" })?;
+    if enable {
+        run_reg(key, "ProxyServer", "REG_SZ", server)?;
+        // 关键：设置 ProxyOverride 让 localhost 绕过代理
+        // 这样即使代理开启，客户端仍能直连 127.0.0.1:7864（API 服务）
+        let ov = if override_.is_empty() {
+            "127.0.0.1;localhost;<local>"
+        } else {
+            override_
+        };
+        run_reg(key, "ProxyOverride", "REG_SZ", ov)?;
+    }
     notify_wininet_changed();
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
+pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
+    apply_proxy(true, addr, "127.0.0.1;localhost;<local>")
+}
+
+#[cfg(target_os = "windows")]
 pub(crate) fn clear_win_proxy() -> Result<(), String> {
-    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-    run_reg(key, "ProxyEnable", "REG_DWORD", "0")?;
-    notify_wininet_changed();
-    Ok(())
+    apply_proxy(false, "", "")
 }
 
 /// 通知 WinINet 代理设置已变更，让运行中的进程立即生效
@@ -363,6 +435,46 @@ fn notify_wininet_changed() {
             0,
         );
     }
+}
+
+#[cfg(target_os = "windows")]
+fn reg_query_value(key: &str, name: &str) -> Option<String> {
+    let out = Command::new("reg")
+        .args(["query", key, "/v", name])
+        .creation_flags(0x08000000)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix(name) {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            // parts[0] = 类型(REG_SZ/REG_DWORD)，parts[1..] = 值
+            if parts.len() >= 2 {
+                return Some(parts[1..].join(" "));
+            }
+        }
+    }
+    None
+}
+
+/// 读取启动前的系统代理设置。返回 (enabled, server, override)。
+/// 若不存在或未启用则返回 None（表示用户本来就没有系统代理/VPN）。
+#[cfg(target_os = "windows")]
+fn get_existing_win_proxy() -> Option<(bool, String, String)> {
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let enable = reg_query_value(key, "ProxyEnable")
+        .map(|v| v.contains("1"))
+        .unwrap_or(false);
+    if !enable {
+        return None;
+    }
+    let server = reg_query_value(key, "ProxyServer").unwrap_or_default();
+    if server.is_empty() {
+        return None;
+    }
+    let override_ = reg_query_value(key, "ProxyOverride").unwrap_or_default();
+    Some((true, server, override_))
 }
 
 #[cfg(target_os = "windows")]

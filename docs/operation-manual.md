@@ -1,6 +1,6 @@
 # Trae Work 助手 · 运行手册
 
-> 适用版本：v2.4.2 ｜ 平台：**仅 Windows 10 / 11**
+> 适用版本：v2.4.3 ｜ 平台：**仅 Windows 10 / 11**
 > 本文档说明如何准备环境、启动开发、打包发布、日常运行与排错。
 > v2.0 新增：本地 API 网关、代理日志、签到错误冷却状态机、积分过期感知调度、6 层设备标识重置。
 
@@ -260,6 +260,10 @@ Rust 端：需在 Windows 本机执行 `cargo test`（本仓库 CI/沙箱未覆�
 | 提示「未检测到 Python」 | 系统未装 Python 或不在 PATH | 安装 Python ≥ 3.9 并加入 PATH；或确保资源目录内嵌 `python.exe` |
 | 打包后运行报错缺脚本 | resources 未包含 | 确认 `tauri.conf.json` 的 `bundle.resources` 仍指向 `../src-python/` 与 `../src-ps/` |
 | 安装包体积大 | 含 WebView2 引导 / 调试符号 | 属正常；发布用 release 产物即可 |
+| 开启代理后 GitHub / Google 打不开（`ERR_TUNNEL_CONNECTION_FAILED`），baidu / qq 正常 | 系统代理被改写为 `127.0.0.1:8899`，覆盖了 VPN 接管点；非 Trae 域名直连绕过 VPN | v2.4.3 已修复：启动时自动捕获已有系统代理注入 `UPSTREAM_PROXY` 并串联转发。**Python 侧改动需 `npm run tauri build` 重新打包才在正式版生效** |
+| 停止代理后 VPN 失效 | 旧版 `proxy_stop` 只把 `ProxyEnable` 置 0，未还原原 `ProxyServer` | v2.4.3 已改为原样还原启动前的 `ProxyEnable`/`ProxyServer`/`ProxyOverride` |
+| 计划任务查询输出乱码 | `schtasks` 中文输出为 GBK，被按 UTF-8 解读 | v2.4.3 统一走 `misc.rs::run_schtasks()`（前置 `chcp 65001`）；新增 schtasks 调用勿裸调 `Command` |
+| 注册计划任务报 Access Denied | 旧版使用 `/RL HIGHEST` 强制最高权限 | v2.4.3 已移除该参数，任务以当前用户身份运行 |
 
 ---
 
