@@ -40,6 +40,7 @@ import http.client
 import sqlite3
 import gzip
 import zlib
+import struct
 
 # ---------------- 配置 ----------------
 LISTEN_HOST = "127.0.0.1"
@@ -229,7 +230,7 @@ class ProxyRequestLogger:
             ]
             for k, v in req_headers.items():
                 lines.append(f"  {k}: {v}")
-            lines.append("--- WebSocket tunnel established (bidirectional, content not logged) ---")
+            lines.append("--- WebSocket tunnel established: 双向帧载荷将在隧道中按 SEQ 记录 ---")
             data = "\n".join(lines) + "\n"
             self._fd.write(data)
             self._fd.flush()
@@ -766,6 +767,9 @@ def capture_from_local():
 _ca_cert = _ca_key = None
 _leaf_cache = {}
 _LEAF_CACHE_MAX = 50  # 最多缓存 50 个域名的叶子证书，防止内存无限增长
+import tempfile
+import threading
+_leaf_lock = threading.Lock()  # 保护叶子证书生成与缓存，避免并发同名文件覆盖导致 KEY_VALUES_MISMATCH
 
 def ensure_ca():
     global _ca_cert, _ca_key
@@ -817,41 +821,53 @@ def ensure_ca():
     log("已生成自签 CA ->", cert_pem, "/", cer_der)
 
 def leaf_cert(host):
-    if host in _leaf_cache:
-        # LRU: 移到末尾（Python 3.7+ dict 保持插入顺序，删除再插入即为 LRU 更新）
-        val = _leaf_cache.pop(host)
-        _leaf_cache[host] = val
-        return val
-    from cryptography import x509
-    from cryptography.x509.oid import NameOID
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
-        .issuer_name(_ca_cert.subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
-        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .sign(_ca_key, hashes.SHA256())
-    )
-    cpath = os.path.join(CA_DIR, f"leaf_{host}.crt")
-    kpath = os.path.join(CA_DIR, f"leaf_{host}.key")
-    with open(cpath, "wb") as f:
-        f.write(cert.public_bytes(serialization.Encoding.PEM))
-    with open(kpath, "wb") as f:
-        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
-    # LRU 驱逐：超过上限时删除最旧的条目
-    if len(_leaf_cache) >= _LEAF_CACHE_MAX:
-        oldest = next(iter(_leaf_cache))
-        del _leaf_cache[oldest]
-        log(f"  [leaf_cert] LRU 驱逐: {oldest}")
-    _leaf_cache[host] = (cpath, kpath)
-    return cpath, kpath
+    with _leaf_lock:
+        if host in _leaf_cache:
+            # LRU: 移到末尾（Python 3.7+ dict 保持插入顺序，删除再插入即为 LRU 更新）
+            val = _leaf_cache.pop(host)
+            _leaf_cache[host] = val
+            return val
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
+            .issuer_name(_ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .sign(_ca_key, hashes.SHA256())
+        )
+        # 每次生成使用唯一临时文件，避免并发/多进程共享同名文件时
+        # 证书与私钥被交错覆盖，导致客户端握手报 KEY_VALUES_MISMATCH。
+        safe = host.replace(":", "_")
+        fd_c, cpath = tempfile.mkstemp(suffix=".crt", prefix=f"leaf_{safe}_", dir=CA_DIR)
+        fd_k, kpath = tempfile.mkstemp(suffix=".key", prefix=f"leaf_{safe}_", dir=CA_DIR)
+        try:
+            with os.fdopen(fd_c, "wb") as f:
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+            with os.fdopen(fd_k, "wb") as f:
+                f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+        except Exception:
+            for _p in (cpath, kpath):
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+            raise
+        # LRU 驱逐：超过上限时删除最旧的条目（仅移除缓存引用，临时文件留待进程退出清理）
+        if len(_leaf_cache) >= _LEAF_CACHE_MAX:
+            oldest = next(iter(_leaf_cache))
+            _leaf_cache.pop(oldest)
+            log(f"  [leaf_cert] LRU 驱逐: {oldest}")
+        _leaf_cache[host] = (cpath, kpath)
+        return cpath, kpath
 
 # ---------------- HTTP 请求/响应读写 ----------------
 def recv_until(sock, terminator, buf=b"", max_size=10 * 1024 * 1024):
@@ -911,6 +927,159 @@ HOP_BY_HOP = {"proxy-connection", "connection", "keep-alive", "proxy-authorizati
 def is_websocket_upgrade(headers):
     """检测 WebSocket 升级请求"""
     return headers.get("upgrade", "").lower() == "websocket"
+
+
+# --------------------------------------------------------------------------
+# WebSocket 帧解析 + 载荷记录
+# --------------------------------------------------------------------------
+# 原生 Trae 客户端的智能体 / 对话调用全部跑在 WebSocket(pbbp2 + permessage-deflate)
+# 上，device_proxy 原本只记录升级握手、不记录双向载荷，导致最关键的 create_agent_task
+# 等消息被漏掉。这里补充：在双向隧道里解析 WS 帧(含去掩码 / 续帧重组 / permessage-deflate
+# 解压)，把每一帧的十六进制与可打印字符串交给 ws_frame_logger 落盘，供抓包分析。
+# ws_frame_logger 默认写 device_proxy 自身的 log()；test_proxy.py 会覆盖它，
+# 把帧数据写进自己的 test_proxy.log，保证所有抓包记录在一个文件里。
+def _ws_hexdump(data, max_bytes=400):
+    """把二进制数据转成可读性 hex+ascii 文本(截断到 max_bytes)。"""
+    lines = []
+    n = min(len(data), max_bytes)
+    for i in range(0, n, 16):
+        chunk = data[i:i + 16]
+        hexs = " ".join(f"{b:02x}" for b in chunk)
+        asc = "".join(chr(b) if 0x20 <= b <= 0x7e else "." for b in chunk)
+        lines.append(f"    {i:04x}: {hexs:<48}  {asc}")
+    if len(data) > n:
+        lines.append(f"    ... (截断，完整 {len(data)} bytes)")
+    return "\n".join(lines)
+
+
+def _ws_extract_strings(data, min_len=4, max_strings=80):
+    """从二进制里抽取连续可打印 ASCII 串(>=min_len)，用于快速定位字面量字段。"""
+    out = []
+    buf = []
+    for b in data:
+        if 0x20 <= b <= 0x7e:
+            buf.append(chr(b))
+        else:
+            if len(buf) >= min_len:
+                out.append("".join(buf))
+            buf = []
+    if len(buf) >= min_len:
+        out.append("".join(buf))
+    return out[:max_strings]
+
+
+class _WSMessageParser:
+    """流式解析 WebSocket 帧，按消息(含续帧重组)回调 on_message(opcode, raw, direction)。
+    客户端->服务端帧带掩码(本解析器自动去掩码)，服务端->客户端不带掩码。
+    对 binary/text 消息尝试 permessage-deflate 解压(默认开启 context takeover)。"""
+
+    def __init__(self, on_message):
+        self.buf = b""
+        self.frag_opcode = None
+        self.frag_data = b""
+        self.deco = {}          # direction -> zlib.decompressobj(-15)
+        self.on_message = on_message
+
+    def feed(self, data, direction):
+        self.buf += data
+        while True:
+            msg = self._try_parse(direction)
+            if msg is None:
+                break
+            opcode, raw, direction = msg
+            decoded = self._maybe_decompress(direction, raw)
+            self.on_message(opcode, raw, decoded, direction)
+
+    def _try_parse(self, direction):
+        if len(self.buf) < 2:
+            return None
+        b0 = self.buf[0]
+        b1 = self.buf[1]
+        fin = (b0 & 0x80) != 0
+        opcode = b0 & 0x0f
+        masked = (b1 & 0x80) != 0
+        length = b1 & 0x7f
+        idx = 2
+        if length == 126:
+            if len(self.buf) < idx + 2:
+                return None
+            length = struct.unpack(">H", self.buf[idx:idx + 2])[0]
+            idx += 2
+        elif length == 127:
+            if len(self.buf) < idx + 8:
+                return None
+            length = struct.unpack(">Q", self.buf[idx:idx + 8])[0]
+            idx += 8
+        mask = b""
+        if masked:
+            if len(self.buf) < idx + 4:
+                return None
+            mask = self.buf[idx:idx + 4]
+            idx += 4
+        if len(self.buf) < idx + length:
+            return None
+        payload = bytes(self.buf[idx:idx + length])
+        idx += length
+        self.buf = self.buf[idx:]
+        if masked:
+            mask_full = (mask * ((len(payload) // 4) + 1))[:len(payload)]
+            payload = bytes(a ^ b for a, b in zip(payload, mask_full))
+        if opcode == 0x0:                      # 续帧
+            self.frag_data += payload
+            if fin:
+                op = self.frag_opcode
+                data = self.frag_data
+                self.frag_opcode = None
+                self.frag_data = b""
+                return (op, data, direction)
+            return None
+        elif opcode in (0x1, 0x2):             # text / binary
+            if fin:
+                return (opcode, payload, direction)
+            self.frag_opcode = opcode
+            self.frag_data = payload
+            return None
+        else:                                  # 控制帧 close/ping/pong 或未知
+            return (opcode, payload, direction)
+
+    def _maybe_decompress(self, direction, raw):
+        if not raw:
+            return None
+        try:
+            d = self.deco.get(direction)
+            if d is None:
+                d = zlib.decompressobj(-zlib.MAX_WBITS)
+                self.deco[direction] = d
+            out = d.decompress(raw)
+            try:
+                out += d.decompress(b"\x00\x00\xff\xff") + d.flush()
+            except Exception:
+                pass
+            return out if out else None
+        except Exception:
+            return None
+
+
+# ws_frame_logger: (direction, host, path, opcode, raw, decoded) -> None
+# 默认实现写 device_proxy 自身日志；test_proxy.py 会覆盖为写 test_proxy.log。
+ws_frame_logger = None
+
+
+def _default_ws_frame_logger(direction, host, path, opcode, raw, decoded):
+    opname = {0x1: "text", 0x2: "binary", 0x8: "close",
+              0x9: "ping", 0xA: "pong"}.get(opcode, f"0x{opcode:x}")
+    log(f"  [WS FRAME] {direction} {host}{path} op={opname}({opcode}) "
+        f"raw={len(raw)}B dec={len(decoded) if decoded else 0}B")
+    data = decoded if decoded else raw
+    log(_ws_hexdump(data, 256))
+    for s in _ws_extract_strings(data)[:20]:
+        log(f"    | {s}")
+
+
+def set_ws_frame_logger(fn):
+    global ws_frame_logger
+    ws_frame_logger = fn
+
 
 def forward_websocket(host, port, method, path, headers, body, client_tls):
     """处理 WebSocket 升级：转发升级请求 -> 获取 101 响应 -> 双向原始隧道。"""
@@ -990,6 +1159,21 @@ def forward_websocket(host, port, method, path, headers, body, client_tls):
             if extra_body:
                 log(f"  {ws_tag} 响应中包含 {len(extra_body)} bytes 额外数据, 已包含在转发中")
 
+            # WebSocket 帧解析器：分别维护 client->up / up->client 两个方向的状态，
+            # 解析出每一帧(去掩码 + 续帧重组 + permessage-deflate 解压)后交给回调记录。
+            _ws_logger = ws_frame_logger if ws_frame_logger else _default_ws_frame_logger
+
+            def _on_ws_msg(opcode, raw, decoded, direction):
+                try:
+                    _ws_logger(direction, host, path, opcode, raw, decoded)
+                except Exception as e:
+                    log(f"  {ws_tag} WS 帧记录异常(已忽略): {type(e).__name__}: {e}")
+
+            _parsers = {
+                "client_to_up": _WSMessageParser(_on_ws_msg),
+                "up_to_client": _WSMessageParser(_on_ws_msg),
+            }
+
             tunnel_stats = {"client_to_up": 0, "up_to_client": 0, "closed_by": ""}
 
             def _pipe(src, dst, direction, stats):
@@ -1001,6 +1185,7 @@ def forward_websocket(host, port, method, path, headers, body, client_tls):
                             stats["closed_by"] = direction
                             break
                         stats[direction] += len(data)
+                        _parsers[direction].feed(data, direction)
                         dst.sendall(data)
                 except Exception as e:
                     log(f"  {ws_tag} {direction} 隧道异常: {type(e).__name__}: {e}")

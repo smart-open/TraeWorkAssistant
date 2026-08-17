@@ -31,6 +31,9 @@ device_proxy.py，且其依赖 cryptography 可用）。
   python test_proxy.py --log-all      # 对所有域做 MITM 解密并记录(不再透明放行)
   python test_proxy.py --observe      # 观测模式(默认): 对监控域名 TLS 解密并记录全量信息，非监控域透明放行
   python test_proxy.py --save-bodies  # 额外把完整请求/响应体存到 proxy_bodies/
+  python test_proxy.py --upstream 127.0.0.1:7890   # 非监控流量回链到指定上游代理(保留原有联网方式)
+  python test_proxy.py --system-proxy  # 设为 Windows 系统代理(抓 Trae 原生 aha 流量)，自动回链旧代理并退出还原
+  python test_proxy.py --restore-proxy # 手动还原系统代理(崩溃自救): 上次异常退出导致代理指死时，用它一键还原
   python test_proxy.py --max-body 500000          # 日志中单条 body 预览上限(字节)
 
 证书与"零配置"：优先复用桌面端 Trae Work Assistant 已在
@@ -59,6 +62,7 @@ os.environ.setdefault("TRAEDATA_DIR", BASE)
 
 import ctypes
 import subprocess
+import winreg
 
 def _is_admin():
     try:
@@ -77,6 +81,32 @@ def resolve_ca_dir():
 import device_proxy as dp  # 复用 TLS 拦截(ensure_ca/leaf_cert)、解压、SSE 摘要、域名匹配
 dp.CA_DIR = resolve_ca_dir()   # 关键：让 ensure_ca 复用(或生成到)正确的证书目录
 
+# 覆盖 device_proxy 的 WS 帧记录钩子，把 WebSocket 双向帧载荷写进 test_proxy.log，
+# 这样所有抓包(HTTP + WS)都集中在一个文件里，便于后续按 SEQ 顺序分析。
+def _tp_ws_frame_logger(direction, host, path, opcode, raw, decoded):
+    global logger
+    if logger is None:
+        return
+    opname = {0x1: "text", 0x2: "binary", 0x8: "close",
+              0x9: "ping", 0xA: "pong"}.get(opcode, f"0x{opcode:x}")
+    data = decoded if (decoded and len(decoded) >= 1) else raw
+    lines = [
+        "\n" + "=" * 70,
+        f"[WS-FRAME] {direction} {host}{path}  op={opname}({opcode})  "
+        f"raw={len(raw)}B  decoded={len(decoded) if decoded else 0}B",
+        "  -- hex (head 400B) --",
+        dp._ws_hexdump(data, 400),
+    ]
+    strs = dp._ws_extract_strings(data)
+    if strs:
+        lines.append("  -- printable strings --")
+        lines.extend("    " + s for s in strs)
+    with logger._lock:
+        logger._fd.write("\n".join(lines) + "\n")
+        logger._fd.flush()
+
+dp.ws_frame_logger = _tp_ws_frame_logger
+
 def install_ca_to_root():
     """把代理 CA 安装到 Windows 受信任根证书颁发机构，实现真正的零配置解密。
     需要管理员权限；非管理员时返回 (False, 提示)。"""
@@ -94,6 +124,126 @@ def install_ca_to_root():
         return False, (e.stderr or e.stdout or str(e))
     except Exception as e:
         return False, str(e)
+
+
+# --------------------------------------------------------------------------
+# Windows 系统代理管理：让 test_proxy 作为"系统代理"截获 Trae 原生(aha)流量时，
+# 把非监控域名回链到用户原本的代理(如 Clash 7890)，从而既抓到 Trae、又不影响
+# 正常上网。--system-proxy 启动时自动保存旧代理、退出(Ctrl+C)时还原。
+# --------------------------------------------------------------------------
+def _strip_scheme(addr):
+    addr = (addr or "").strip()
+    if addr.lower().startswith("http://"):
+        addr = addr[len("http://"):]
+    elif addr.lower().startswith("https://"):
+        addr = addr[len("https://"):]
+    return addr
+
+
+def read_system_proxy():
+    """返回 (enable:int, server:str, override:str)；enable=0 表示未启用系统代理。"""
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                           0, winreg.KEY_READ)
+        try:
+            enable = winreg.QueryValueEx(k, "ProxyEnable")[0]
+        except FileNotFoundError:
+            enable = 0
+        try:
+            server = winreg.QueryValueEx(k, "ProxyServer")[0]
+        except FileNotFoundError:
+            server = ""
+        try:
+            override = winreg.QueryValueEx(k, "ProxyOverride")[0]
+        except FileNotFoundError:
+            override = ""
+        winreg.CloseKey(k)
+        return int(enable), server, override
+    except Exception:
+        return 0, "", ""
+
+
+def _broadcast_proxy_change():
+    try:
+        wininet = ctypes.windll.wininet
+        wininet.InternetSetOptionW(0, 39, 0, 0)  # INTERNET_OPTION_SETTINGS_CHANGED
+        wininet.InternetSetOptionW(0, 37, 0, 0)  # INTERNET_OPTION_REFRESH
+    except Exception:
+        pass
+
+
+def set_system_proxy(enable, server, override="<local>"):
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                           0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, int(enable))
+        winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, str(server))
+        winreg.SetValueEx(k, "ProxyOverride", 0, winreg.REG_SZ, str(override))
+        winreg.CloseKey(k)
+        _broadcast_proxy_change()
+        return True
+    except Exception as e:
+        print("警告: 设置系统代理失败:", e)
+        return False
+
+
+_SAVED_SYSTEM_PROXY = None
+# 崩溃自愈：把"进入 --system-proxy 前的旧代理"持久化到恢复文件，这样即使进程被
+# kill -9 / 异常退出导致 atexit 与信号都来不及跑，也能靠 `test_proxy.py --restore-proxy`
+# 或下次正常启动时的自动清理把系统代理还原，避免整台机器断网、只能重启。
+_PROXY_RECOVERY_FILE = os.path.join(BASE, ".proxy_recovery.json")
+
+
+def _save_recovery(enable, server, override):
+    try:
+        with open(_PROXY_RECOVERY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"enable": enable, "server": server, "override": override}, f)
+    except Exception:
+        pass
+
+
+def _load_recovery():
+    try:
+        with open(_PROXY_RECOVERY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _clear_recovery():
+    try:
+        os.remove(_PROXY_RECOVERY_FILE)
+    except Exception:
+        pass
+
+
+def restore_proxy_from_recovery(verbose=True):
+    """从恢复文件还原系统代理(手动逃生 / 自动自愈用)。返回是否成功还原。"""
+    rec = _load_recovery()
+    if not rec:
+        if verbose:
+            print("没有找到代理恢复记录，无需还原。")
+        return False
+    set_system_proxy(rec.get("enable", 0), rec.get("server", ""), rec.get("override", ""))
+    _clear_recovery()
+    if verbose:
+        print(f"已从恢复记录还原系统代理: ProxyEnable={rec.get('enable')} "
+              f"ProxyServer={rec.get('server')!r}")
+    return True
+
+
+def _restore_system_proxy():
+    global _SAVED_SYSTEM_PROXY
+    if _SAVED_SYSTEM_PROXY is None:
+        return
+    enable, server, override = _SAVED_SYSTEM_PROXY
+    set_system_proxy(enable, server, override)
+    _SAVED_SYSTEM_PROXY = None
+    _clear_recovery()   # 内存态已还原，清理恢复文件避免误用
+    print(f"\n已还原系统代理: ProxyEnable={enable} ProxyServer={server!r}")
+
 
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("PROXY_PORT", "8899"))
@@ -332,6 +482,36 @@ def forward_stream_logged(host, port, method, path, headers, body, client_sock, 
         conn.close()
 
 
+def forward_plain_via_upstream(upstream, method, target, headers, body, client_sock, seq, t0):
+    """非监控明文 HTTP：经上游 HTTP 代理转发(保持用户原有联网方式)，不记录。"""
+    uh, up = dp._split_host_port(upstream, 8080)
+    c = http.client.HTTPConnection(uh, up, timeout=30)
+    fwd = {k: v for k, v in headers.items() if k.lower() not in dp.HOP_BY_HOP}
+    try:
+        c.request(method, target, body=body if method.upper() != "GET" else None, headers=fwd)
+        resp = c.getresponse()
+        resp_body = resp.read()
+        dp.send_response(client_sock, resp.status, resp.reason, dict(resp.getheaders()), resp_body)
+        if seq is not None:
+            duration = int((time.time() - t0) * 1000)
+            decompressed = dp.decompress_body(resp_body, resp.getheaders())
+            sse = dp.extract_sse_summary(resp.getheaders(), resp_body)
+            logger.log_response(seq, datetime.datetime.now(), duration, resp.status,
+                               resp.reason, resp.getheaders(), decompressed, sse, len(resp_body))
+        return True
+    except Exception as e:
+        if seq is not None:
+            logger.log_response(seq, datetime.datetime.now(), int((time.time() - t0) * 1000), 0,
+                                f"{type(e).__name__}: {e}", [], b"", None, 0)
+        try:
+            dp.send_response(client_sock, 502, "Bad Gateway", {}, b"Bad Gateway")
+        except Exception:
+            pass
+        return False
+    finally:
+        c.close()
+
+
 def tunnel_https_logged(tls, host, port):
     while True:
         try:
@@ -393,6 +573,11 @@ def handle_plain_logged(conn, buf):
         logger.log_request(seq, datetime.datetime.now(), method, host, u.path or "/", ep, headers, body)
     else:
         seq = t0 = None
+
+    # 非监控明文 HTTP：若配置上游代理，则经上游转发，保留用户原有联网方式
+    if (not monitored) and dp.UPSTREAM_PROXY and u.scheme == "http":
+        forward_plain_via_upstream(dp.UPSTREAM_PROXY, method, target, headers, body, conn, seq, t0)
+        return
 
     ctx = ssl.create_default_context() if u.scheme == "https" else None
     c = (http.client.HTTPSConnection(host, port, context=ctx, timeout=30)
@@ -478,9 +663,21 @@ def main():
     parser.add_argument("--log-all", action="store_true", help="对所有域做 MITM 解密并记录")
     parser.add_argument("--save-bodies", action="store_true", help="把完整请求/响应体另存 proxy_bodies/")
     parser.add_argument("--max-body", type=int, default=200000, help="日志内单条 body 预览上限(字节)")
+    parser.add_argument("--upstream", type=str, default="",
+                        help="上游代理(非监控流量回链), 如 127.0.0.1:7890 或 socks=127.0.0.1:7891")
+    parser.add_argument("--system-proxy", action="store_true",
+                        help="把本代理设为 Windows 系统代理(用于截获 Trae 原生 aha 流量)，"
+                             "并自动把非监控流量回链到原有代理；退出时还原系统代理")
+    parser.add_argument("--restore-proxy", action="store_true",
+                        help="手动还原系统代理(崩溃自救): 读取上次 --system-proxy 保存的代理配置并还原，然后退出")
     parser.add_argument("--gen-ca", action="store_true", help="仅生成 CA 证书后退出")
     parser.add_argument("--install-ca", action="store_true", help="将 CA 装入 Windows 受信任根证书颁发机构(需管理员)")
     args = parser.parse_args()
+
+    # 手动还原优先：不依赖其他逻辑，专门用于"上次崩溃导致系统代理指死"的逃生
+    if args.restore_proxy:
+        restore_proxy_from_recovery()
+        return 0
 
     if args.install_ca:
         dp.ensure_ca()
@@ -497,6 +694,45 @@ def main():
     if args.domains:
         MONITOR_DOMAINS[:] = [d.strip() for d in args.domains.split(",") if d.strip()]
     LOG_ALL = args.log_all
+
+    # ---- 系统代理模式 ----
+    # 关键顺序：先保存旧代理(内存 + 恢复文件)，【暂不】设置系统代理；
+    # 必须等下面 socket 真正监听成功后再把系统代理指过来，否则会出现
+    # "代理指向 8899 但无人监听" -> 整台机器断网。
+    _sysproxy = args.system_proxy
+    if _sysproxy:
+        # 自愈：若上次运行异常退出，系统代理可能仍指向本端口(死代理)。
+        # 先按恢复文件还原，再重新开始，避免叠加 / 残留。
+        if _load_recovery():
+            restore_proxy_from_recovery(verbose=False)
+        _enable, _server, _override = read_system_proxy()
+        _SAVED_SYSTEM_PROXY = (_enable, _server, _override)
+        _save_recovery(_enable, _server, _override)   # 持久化，供崩溃后自愈
+        import atexit
+        atexit.register(_restore_system_proxy)
+        # 非监控流量回链：复用 device_proxy 已解决的"VPN 冲突"机制 ——
+        # 把旧系统代理(若有，通常是用户的 VPN 梯子)作为上游透传，避免外网打不开。
+        if not args.upstream:
+            _old = _strip_scheme(_server)
+            if _enable == 1 and _old and _old != f"{LISTEN_HOST}:{args.port}":
+                dp.UPSTREAM_PROXY = _old
+                print(f"非监控流量回链到原系统代理(VPN): {_old}")
+            else:
+                print("未检测到原系统代理，非监控流量将直连")
+    if args.upstream:
+        dp.UPSTREAM_PROXY = _strip_scheme(args.upstream)
+        print(f"非监控流量回链到上游代理: {dp.UPSTREAM_PROXY}")
+
+    # 无论 Ctrl+C(SIGINT) 还是 kill(SIGTERM) 都能还原系统代理，避免"代理设成 8899 却无人监听"导致断网
+    import signal as _signal
+    def _on_sigterm(_signum, _frame):
+        _restore_system_proxy()
+        sys.exit(0)
+    try:
+        _signal.signal(_signal.SIGTERM, _on_sigterm)
+    except Exception:
+        pass
+
     OBSERVE = True  # 观测模式为默认行为：监控域名解密记录全量，非监控透明放行
 
     dp.ensure_ca()
@@ -521,6 +757,12 @@ def main():
     logger.log_event(f"日志: {LOG_FILE}")
     logger.log_event("Ctrl+C 停止。")
 
+    # ★ 关键：确认已监听成功，才把系统代理指过来，杜绝"设了 8899 却没人监听"
+    if _sysproxy:
+        set_system_proxy(1, f"{LISTEN_HOST}:{args.port}", "<local>")
+        print(f"已将系统代理指向本代理 {LISTEN_HOST}:{args.port}（退出时自动还原；"
+              f"若异常卡死可用 `python test_proxy.py --restore-proxy` 手动还原）")
+
     try:
         while True:
             try:
@@ -535,7 +777,10 @@ def main():
         logger.log_event("代理停止(Ctrl+C)")
         logger.log_session_end()
         print(f"\n已停止。本次共记录 {logger.count} 条请求，日志: {LOG_FILE}")
-        return 0
+    finally:
+        # 无论正常退出、Ctrl+C 还是未捕获异常，都还原系统代理，避免遗留死代理
+        _restore_system_proxy()
+    return 0
 
 
 if __name__ == "__main__":

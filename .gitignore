@@ -22,6 +22,8 @@ data/
 
 # test_proxy 抓包产物（完整体另存目录）
 proxy_bodies/
+# test_proxy 系统代理崩溃自愈恢复记录
+.proxy_recovery.json
 
 # Python
 __pycache__/
