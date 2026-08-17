@@ -20,6 +20,9 @@ Thumbs.db
 # 运行时数据（证书、账号状态等）
 data/
 
+# test_proxy 抓包产物（完整体另存目录）
+proxy_bodies/
+
 # Python
 __pycache__/
 *.pyc
