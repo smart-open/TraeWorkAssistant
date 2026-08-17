@@ -4,10 +4,10 @@
 测试目标：定位 "quota exceeded" / "no healthy account" 的根因。
 
 用法:
-  python scripts/test_upstream.py                         # 测试所有配置 × 所有账号
-  python scripts/test_upstream.py --account liu_gs        # 只测试指定账号
-  python scripts/test_upstream.py --config B              # 只测试指定配置
-  python scripts/test_upstream.py --matrix                # 模型名×function 矩阵测试
+  python test_upstream.py                                # 测试所有配置 × 所有账号
+  python test_upstream.py --account liu_gs               # 只测试指定账号
+  python test_upstream.py --config B                     # 只测试指定配置
+  python test_upstream.py --matrix                       # 模型名×function 矩阵测试
 """
 
 import json
