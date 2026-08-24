@@ -57,6 +57,7 @@ export const api = {
       invoke<number>('cooldown_clear_all'),
     refreshJwt: (userId: string) =>
       invoke<string>('refresh_jwt', { userId }),
+    exportRaw: () => invoke<Record<string, unknown>>('accounts_export_raw'),
   },
   groups: {
     list: () => invoke<GroupView[]>('groups_list'),
@@ -109,6 +110,8 @@ export const api = {
       },
     }),
     proxyLogDetail: (id: string) => invoke<string>('proxy_log_detail', { id }),
+    writeTextFile: (path: string, content: string) =>
+      invoke('write_text_file', { path, content }),
   },
   switchAccount: (userId: string) => invoke('switch_account', { userId }),
   saveCurrentLogin: (userId: string) => invoke('save_current_login', { userId }),

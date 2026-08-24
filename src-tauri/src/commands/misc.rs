@@ -423,6 +423,13 @@ pub fn invite_link(_app: AppHandle, _state: State<AppState>) -> Invite {
     }
 }
 
+// ---------------- 文件导出 ----------------
+
+#[tauri::command]
+pub fn write_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
+}
+
 // ---------------- 定时任务 ----------------
 
 // 运行 schtasks 并正确解码输出。

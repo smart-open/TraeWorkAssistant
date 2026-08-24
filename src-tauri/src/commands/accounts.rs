@@ -37,6 +37,79 @@ pub fn accounts_list(state: State<AppState>) -> Vec<AccountView> {
     build_account_views(&state)
 }
 
+/// 导出所有账号原始数据，字段名对齐参考 JSON（camelCase），供前端一键导出使用。
+#[tauri::command]
+pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+    let views = build_account_views(&state);
+
+    let merged: Vec<serde_json::Value> = views
+        .iter()
+        .map(|v| {
+            let raw = accounts
+                .accounts
+                .iter()
+                .find(|a| a.user_id.as_deref() == Some(&v.user_id));
+            let refresh_token = raw
+                .and_then(|a| a.refresh_token.clone())
+                .unwrap_or_default();
+            let has_rt = !refresh_token.is_empty();
+
+            let device_id = device_map
+                .get(&v.user_id)
+                .map(|d| d.device_id.clone())
+                .unwrap_or_default();
+
+            let jwt_source = if has_rt { "session" } else { "manual" };
+
+            serde_json::json!({
+                "name": v.name,
+                "cloudIdeJwt": v.jwt,
+                "deviceId": device_id,
+                "jwtExp": v.jwt_exp_timestamp,
+                "balance": v.credits,
+                "refreshToken": refresh_token,
+                "jwtSource": jwt_source,
+                "userId": v.user_id,
+                "groupId": v.group_id,
+                "jwtExpHours": v.jwt_exp_hours,
+                "checkedToday": v.checked_today,
+                "remainingCredits": v.remaining_credits,
+                "deviceIdMasked": v.device_id_masked,
+                "cooldownType": v.cooldown_type,
+                "cooldownUntil": v.cooldown_until,
+                "cooldownReason": v.cooldown_reason,
+                "hasRefreshToken": v.has_refresh_token,
+                "jwtAutoRefresh": v.jwt_auto_refresh,
+                "creditsExpireAt": v.credits_expire_at,
+            })
+        })
+        .collect();
+
+    let groups_arr: Vec<serde_json::Value> = groups
+        .groups
+        .iter()
+        .map(|g| {
+            serde_json::json!({
+                "id": g.id,
+                "name": g.name,
+                "color": g.color,
+                "order": g.order,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "exportedAt": fs_utils::now_iso(),
+        "appVersion": "2.4.4",
+        "accountCount": merged.len(),
+        "accounts": merged,
+        "groups": groups_arr,
+    }))
+}
+
 #[tauri::command]
 pub fn account_add_manual(
     state: State<AppState>,
