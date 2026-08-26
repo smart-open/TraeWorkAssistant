@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
+import { save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import type { AccountView, GroupView, JwtParseResult, ProfileInfo } from '../types';
@@ -151,6 +152,27 @@ export default function Accounts() {
     }
   };
 
+  const exportAccounts = async () => {
+    if (accounts.length === 0) {
+      toast('warn', '没有账号可导出');
+      return;
+    }
+    try {
+      const payload = await api.accounts.exportRaw();
+      const content = JSON.stringify(payload, null, 2);
+      const fileStamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+      const filePath = await save({
+        defaultPath: `trae-accounts-${fileStamp}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!filePath) return;
+      await api.misc.writeTextFile(filePath, content);
+      toast('success', `已导出 ${accounts.length} 个账号到 ${filePath}`);
+    } catch (err) {
+      toast('error', `导出失败：${String(err)}`);
+    }
+  };
+
   return (
     <div className="animate-fade-in">
       <PageHeader
@@ -158,6 +180,9 @@ export default function Accounts() {
         desc="维护账号、调整分组、重置设备 ID 与登录态切换"
         actions={
           <>
+            <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
+              <Download size={15} /> 导出
+            </button>
             <button onClick={() => setHelpOpen(true)} className="btn-outline" title="使用帮助">
               <HelpCircle size={15} /> 帮助
             </button>
