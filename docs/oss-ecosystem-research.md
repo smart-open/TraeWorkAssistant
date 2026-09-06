@@ -1,0 +1,155 @@
+# 开源生态深挖调研：WorkBuddy / CodeBuddy / Trae / 豆包 可扩展能力归纳
+
+> **文档版本**: 2026-09-06 · 调研分支 `feat/traecode_doubao`
+> **调研方式**: 6 个开源仓库全量浅克隆 + 源码级精读（非 README 转述），所有结论均标注来源仓库与文件路径
+> **用途**: 为本项目（Trae Work Assistant）后续扩展——API 暴露、DeepSeek Harness 接入、签到、账号管理/切换、会话保存续期、积分管理——提供可落地的参考实现索引
+
+---
+
+## 0. 来源清单与定位
+
+| # | 仓库 | 语言/形态 | 定位 | 对本项目价值 |
+|---|---|---|---|---|
+| 1 | [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | Go + Docker | WorkBuddy OpenAI 兼容反向代理：OAuth 登录、多账号轮转、签到调度 | ★★★★★ API 暴露/账号池的权威参考 |
+| 2 | [corrinehu/dsh-workbuddy-connect](https://github.com/corinnehu/dsh-workbuddy-connect) | TypeScript (DSH 插件) | 把 WorkBuddy 模型接入 DeepSeek Harness（DSH） | ★★★★★ Harness 接入唯一开源实现 |
+| 3 | [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch) | Rust (Tauri) + npm | 账号切换/会话复制/Token 保活/积分到期轮换/官方用量统计 | ★★★★★ 账号管理与会话数据模型 |
+| 4 | [qinchangxv/antigravity-tools](https://github.com/hailinzhao/antigravity-tools)（同项目，发布于 qinchangxv） | Python (PySide) | WorkBuddy/CodeBuddy 批量签到、`ck_xxx` API Key 代理池 | ★★★★ API Key 模式 + 代理池设计 |
+| 5 | [88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin) | Python 单文件 | 签到 + **成长中心**自动化（Buddy 旅行/盲盒/任务） | ★★★★ 成长中心端点独家 |
+| 6 | [GitOfUser/workbuddy-checkin](https://github.com/GitOfUser/workbuddy-checkin) | PS/Python/Shell | UI 坐标点击模拟签到（无 API） | ★★ 仅作兜底思路（无 API 时的最后手段） |
+
+克隆件位置：`%TEMP%\oss-research\<repo>`（含完整源码，可随时查阅）。
+
+---
+
+## 1. 跨仓库交叉验证的 API 全集（按主题归纳）
+
+### 1.1 对话上游（★ API 暴露的核心，三仓库一致）
+
+**来源**: workbuddy2api `internal/upstream/client.go:138-283`；dsh-workbuddy-connect `src/upstream.ts:110-112,432-483`（后者注明"wire behavior ported from Sliverkiss/workbuddy2api"）；antigravity-tools `src/modules/api_client.py:37-48`
+
+| 用途 | 端点 | 说明 |
+|---|---|---|
+| 对话补全 | `POST https://copilot.tencent.com/v2/chat/completions` | **CN 区对话上游**（非 codebuddy.cn！），上游只回 SSE，非流式需本地聚合 |
+| 模型目录 | `GET {chatBase}/console/enterprises/personal/models` | 返回模型 id/名称/上下文窗口/图片能力/思考强度（low/medium/high/xhigh/max）/积分倍率/促销徽章 |
+| Token 刷新 | `POST {chatBase}/v2/plugin/auth/token/refresh` | `X-Refresh-Token` + `X-Auth-Refresh-Source: workbuddy` 头 |
+| 积分资源 | `POST {billingBase}/v2/billing/meter/get-user-resource` | `ProductCode: p_tcaca`，响应 `data.Response.Data.Accounts[]` |
+| 支付类型 | `POST /v2/billing/meter/get-payment-type` | 仅 antigravity-tools 使用 |
+| 用量通知 | `POST /v2/billing/meter/get-dosage-notify` | 仅 antigravity-tools 使用 |
+| 官方请求用量 | `POST https://www.workbuddy.cn/billing/meter/get-user-request-usage` | 返回 `usageToday/usage7Days/usageThisMonth`（workbuddy-switch `official_usage.rs:19`） |
+| 活动横幅 | `POST /v2/activity/banner` | 仅 antigravity-tools 使用 |
+
+**域名区域路由**（workbuddy2api `auth.go:37-48` + dsh `upstream.ts:249-257`）：
+- CN 区（`domain` 不含 `.workbuddy.ai`）：chat = `copilot.tencent.com`，billing = `www.codebuddy.cn`（dsh 与 antigravity 用 copilot.tencent.com 做 billing 也通，两域均可实测）。
+- Global 区（`domain` 含 `.workbuddy.ai`）：全部走 `www.workbuddy.ai`。
+
+**对话请求头**（dsh `upstream.ts:271-284`，官方 CLI 同款）：
+```
+Authorization: Bearer <accessToken>
+User-Agent: CLI/2.63.2 CodeBuddy/2.63.2      ← 伪装官方 CLI
+X-Requested-With: XMLHttpRequest
+X-User-Id: <uid>        （无 uid 时用 X-No-User-Id: 1）
+X-Enterprise-Id: <eid>  （无则 X-No-Enterprise-Id: 1）
+X-Domain: <domain>      （无则 X-No-Department-Info: 1）
+X-Product: SaaS
+```
+
+**错误分类**（dsh `upstream.ts:118-131` 硬编码标记词）：积分耗尽类（`积分不足/额度不足/insufficient credit/quota exceeded`…）→ `hard_credit`（触发换号/冷却）；限频类 → `soft_rate`；401/403 → `session_dead`（触发刷新重试）。
+
+### 1.2 认证、续期与多端共存
+
+**来源**: dsh-workbuddy-connect `src/auth.ts`（全文）；workbuddy2api `internal/auth/auth.go`
+
+- **双源凭证共存策略**（auth.ts 模块注释，最优雅的设计）：桌面 App 的 `workbuddy-desktop.info` **只读**；插件在 `$DSH_HOME/.workbuddy-auth.json` 维护自己的副本（带 `version` 字段，拒绝未知格式）；**生效凭证 = 两者中 `expiresAtMs` 更晚者**——任何一方刷新都胜出，互不覆盖。避免"工具写桌面文件被 App 重写冲突"（本项目 workbuddy-switch-plan §4 的痛点）。
+- 刷新落盘用**原子写**（`@deepseek-ai/dsh-atomic-write` 的 `writeFileAtomic` + `withFileLock` 文件锁）。
+- **Keycloak 原生端点确认可用**（antigravity-tools `api_client.py:57`）：`KEYCLOAK_TOKEN_URL = https://www.codebuddy.cn/auth/realms/copilot/protocol/openid-connect/token`——印证 workbuddy-switch-plan §2.3 的备选路径真实存在。
+- **跨平台/WSL 凭证路径候选**（auth.ts:80-100）：Windows `%LOCALAPPDATA%`、macOS `~/Library/Application Support`、Linux `~/.config` + `~/.workbuddy/auth/` 兜底 + WSL `/mnt/c` 映射 + `WORKBUDDY_AUTH_FILE` 环境变量覆盖——可直接抄进我们的 `app_locate`。
+
+### 1.3 签到与成长中心（88lin 独家端点）
+
+**来源**: workbuddy-auto-signin `signin.py:4-5,177-350`；workbuddy-switch `modules/checkin.rs`；antigravity-tools `modules/checkin.py`
+
+签到主流程（与 workbuddy-switch-plan §2.5 一致）：`POST /v2/billing/meter/checkin-activity-status` → 未签则 `POST /v2/billing/meter/daily-checkin`；88lin 实测 `DEFAULT_ENDPOINT = https://copilot.tencent.com` 同样可用。
+
+**成长中心自动化**（`/v2/activity/growth/*`，全部已实测）：
+
+| 操作 | 端点 | 说明 |
+|---|---|---|
+| Buddy 旅行状态 | `GET /v2/activity/growth/buddy/travel/status` | `state`: arrived/traveling/idle + `record_id` |
+| 领旅行礼物 | `POST .../buddy/travel/claim` `{record_id}` | 返回 `reward_credit` |
+| 旅行目的地配置 | `GET .../buddy/travel/config` | `locations[]`，取第一个 |
+| 派 Buddy 出发 | `POST .../buddy/travel/depart` `{location_id}` | 返回目的地/时长 |
+| 盲盒次数 | `GET .../lottery/chances` | `balance` |
+| 开盲盒 | `POST .../lottery/draw` `{}` | 返回 `prize_name` |
+| 任务列表 | `GET .../tasks` | `tasks[]`（progress/accept_status/has_reward/reward_credit/reward_energy） |
+| 领任务奖 | `POST .../tasks/accept` `{task_code}` | |
+| 能量余额 | `GET .../energy` | `balance` |
+| 连签天数 | `GET .../streak` | `streak.days` |
+
+额外经验（signin.py）：兼容"已签"两种返回形态；识别 401/403 登录态过期（报 NO_SESSION）；识别非签到季；签到包名含"运营裂变包"用于统计连签积分（antigravity `checkin.py:93`）。
+
+### 1.4 会话数据模型与复制（workbuddy-switch 独家）
+
+**来源**: workbuddy-switch `crates/wb-switch-core/src/modules/session.rs:1-15`
+
+**WorkBuddy 5.x 会话三件套（缺一不可）**——这是"会话保存/迁移/复制"的完整数据模型：
+1. **正文**: `~/.workbuddy/projects/{workspace}/{cid}.jsonl`（JSONL，每行含 `sessionId` 字段）
+2. **元数据**: `~/.workbuddy/workbuddy.db` 的 `sessions` 表（id = conversation id = UUID）
+3. **云端映射**: `~/.workbuddy/edge-sync-mapping-v2.db` 的 `edge_sync_mapping` 表（`session_id`=conversation_id，`msg_channel=convmsg:{uid}` **决定云端归属**）
+
+**会话复制算法**（路径 B：生成新 id，云端可正常同步）：读源账号 jsonl → 替换 sessionId 为新 UUID → 写入目标账号 projects 目录 → 在 workbuddy.db sessions 表插入新行 → 在 edge_sync_mapping 注册 `convmsg:{目标uid}` 映射。复制前 `backup_workbuddy_db`。另有 `export_import.rs`（会话导出/导入）。
+
+### 1.5 CodeBuddy CLI 账号体系（workbuddy-switch 独家）
+
+**来源**: workbuddy-switch `modules/codebuddy_cli.rs`、`rotate.rs`
+
+- **CLI 切号**：Windows 直接维护 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN`（绕过 `apiKeyHelper` 的 Windows 路径坑）；macOS/Linux 用 `~/.codebuddy-rotate/helper.cjs`（Node shebang 脚本，`include_str!` 内嵌 STANDARD_HELPER）。与 WorkBuddy App 复用同一账号库但**当前账号独立**；不修改运行中会话。
+- **自动轮换**（防积分过期浪费，rotate.rs）：周期检查各账号积分到期时间 → 切到"最早到期且仍有剩余"的账号。**防抖动两约束**：① 冷却期（切换后 cooldown_minutes 内不再切）；② 到期差异阈值（目标比当前早到期超过 min_gap_hours 才切，避免三个账号都明天到期时来回横跳）。状态落 `~/.codebuddy-rotate/state.json`。
+
+### 1.6 账号池调度（workbuddy2api 权威实现）
+
+**来源**: workbuddy2api `internal/pool/pool.go`、`internal/scheduler/scheduler.go`、`README.md`
+
+- **三因子加权随机选号**：`credits 占比×10 + 闲置时长补偿（每小时+权重，封顶） + 成功率×3`（成功率 = successCount/(successCount+errTotal)，累计不清零）→ 先取 Top5 短名单，再在名单内按同权重加权随机——防热点 + 防惊群（100ms 窗口去重）。
+- **熔断器**：错误阈值 + 冷却（冷却时长指数递增至 cooldownMax）；`hard_credit` 冷却到次日，积分耗尽账号由调度器 04:00 自动恢复探测。
+- **定时器**：每日 09:00/21:00 双时段签到 + 积分查询；保活刷新独立开关。
+- **对外接口**：`/v1/chat/completions`（流式透传/非流式聚合）、`/v1/models`、`/status`（total/healthy/cooling/disabled + 每账号画像）、`/healthz`（无健康账号 503，可接 LB）、请求级日志（seq/TTFB/uid/tokens/latency）。
+- **子 Key 体系**（antigravity-tools `proxy_server.py:103-157`，2143 行）：上游真实 Key（sk-xxx/ck_xxx）与对外分发的子 Key 分离，子 Key 可限定可用上游、调用模式二选一（专一模式=用完再换 / 临期优先=先用最快过期的），按日统计 token 与 credits 消耗，健康检测带时间戳。
+
+---
+
+## 2. DeepSeek Harness（DSH）接入机制（dsh-workbuddy-connect 独家）
+
+**来源**: `src/adapter.ts`、`src/index.ts`、`src/shim.ts`、`src/host-heartbeat.ts`、`src/loopback.ts`、`src/catalog.ts`
+
+- **接入原理**：DSH 的插件机制暴露 `dsh-llm-pi-ai` 扩展点（`createProvider` / `openAICompletionsApi`）。本插件注册一个名为 `workbuddy` 的 pi-ai provider，把 WorkBuddy 的模型目录映射进 DSH 模型选择器——**WorkBuddy 上游本身就是 OpenAI 兼容协议**（`/v2/chat/completions`），适配层很薄。
+- **模型元数据透传**：上下文窗口/maxTokens/`supportsImages`（缺失按 false，宁缺勿滥——避免发图后被上游拒绝在消息已持久化之后）/思考强度（`supportedEfforts` 映射到 pi-ai thinking levels）/积分倍率归一化为 `x0.79` 无语言形式/促销徽章 `badge:限时免费:#FF0000` 解析。
+- **每次 DSH 启动同步目录**：徽章/倍率以服务端为准（catalog.ts）。
+- **版本强对应**：插件 0.3.0+ 要求 DSH 核心 `0.1.2-rc.1+`；安装：`dsh plugin --profile web|desktop|dsh-tui add dsh-workbuddy-connect`。
+- **loopback 架构**（loopback.ts + shim.ts）：provider 经本地回环 shim 转发到上游，shim 负责错误分类到不同 HTTP 答案 + 流超时（idle 300s）。
+- **心跳**（host-heartbeat.ts）：与 DSH host 保活，避免长流被回收。
+- **对本项目的意义**：若 Trae Work Assistant 要做"Harness 接入"，最短路径是**复用本项目现有 API 网关**（已是 OpenAI 兼容）+ 参照 dsh 的 catalog/adapter 元数据映射写一个 DSH provider；或直接引导用户安装 dsh-workbuddy-connect 连我们的网关。
+
+---
+
+## 3. 对本项目的扩展路线建议（按优先级）
+
+| 优先级 | 扩展项 | 参考 | 说明 |
+|---|---|---|---|
+| P0 | **API 暴露升级**：现 API 网关 + workbuddy 账号池 | workbuddy2api 全套 | 上游改 `copilot.tencent.com/v2/chat/completions`；抄三因子加权随机 + 熔断冷却 + `/status`/`/healthz` + UA/X-No-* 头规范；非流式本地聚合 |
+| P0 | **签到增强：成长中心** | 88lin signin.py | 旅行/盲盒/任务三自动化，纯增量积分 |
+| P1 | **会话复制/迁移** | workbuddy-switch session.rs | 三件套数据模型 + 新 id 复制算法；也可先做会话备份/恢复 |
+| P1 | **Token 保活双源化** | dsh auth.ts | 工具侧凭证副本 + "谁新用谁"，避免与桌面 App 写冲突 |
+| P1 | **积分到期轮换** | workbuddy-switch rotate.rs | CLI 切号桥 + 冷却/差异阈值防抖 |
+| P2 | **官方用量统计** | workbuddy-switch official_usage.rs | `get-user-request-usage` 拉日/周/月用量 + 本地 jsonl token 统计（token_stats.rs 遍历 projects/*.jsonl） |
+| P2 | **DSH/Harness 接入** | dsh-workbuddy-connect | 网关就绪后做 provider 元数据映射；或文档引导装 dsh 插件 |
+| P2 | **API Key（ck_xxx）模式** | antigravity-tools | `ck_xxx` 可直接调 /v2/billing/meter/*，账号导入门槛更低 |
+| P3 | **Global 区支持** | workbuddy2api auth.go | domain 含 `.workbuddy.ai` 走 `www.workbuddy.ai` |
+| P3 | **豆包/Trae 延伸** | —— | 本批仓库未覆盖豆包/Trae CN；沿用 doubao-trae-switch-plan.md，Trae 侧可借鉴本批的"到期轮换+三因子选号"思路 |
+
+## 4. 风险与注意事项
+
+1. **协议非公开**：以上全部端点为逆向/实测所得（多仓库、多语言、多作者交叉一致，可信度高），但腾讯可随时变更——实现时保持 workbuddy-switch-plan §4 的"接口层独立 + 失败明示"策略。
+2. **UA 伪装**：对话上游校验 `User-Agent: CLI/x CodeBuddy/x` 形态（workbuddy2api/dsh 均硬编码 `CLI/2.63.2 CodeBuddy/2.63.2`），版本号升级需跟踪。
+3. **copilot.tencent.com 域名勘误**：此前 workbuddy-switch-plan §1.3 记录"copilot.tencent.com 404"——本批实测它就是 CN 区对话与签到主域（workbuddy2api/88lin/antigravity 三源一致），特此更正；实现时保留 codebuddy.cn 双域探测即可。
+4. **合规**：所有仓库均声明仅供本人账号管理。workbuddy2api 的多账号池用于 API 服务时注意不要演变为对外售卖转租。
+5. **许可证**：6 仓库均为 MIT，可合规借鉴代码（保留版权声明）。
