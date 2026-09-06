@@ -153,3 +153,75 @@ X-Product: SaaS
 3. **copilot.tencent.com 域名勘误**：此前 workbuddy-switch-plan §1.3 记录"copilot.tencent.com 404"——本批实测它就是 CN 区对话与签到主域（workbuddy2api/88lin/antigravity 三源一致），特此更正；实现时保留 codebuddy.cn 双域探测即可。
 4. **合规**：所有仓库均声明仅供本人账号管理。workbuddy2api 的多账号池用于 API 服务时注意不要演变为对外售卖转租。
 5. **许可证**：6 仓库均为 MIT，可合规借鉴代码（保留版权声明）。
+
+---
+
+## 5. 二次深挖补充（第二轮精读，未覆盖文件）
+
+### 5.1 workbuddy2api 补充（OAuth 工具 / 请求改写 / 会话粘性）
+
+- **OAuth 设备流细节**（`cmd/login/main.go`）：`POST copilot.tencent.com/v2/plugin/auth/state?platform=CLI`——注意 **platform=CLI**（dsh 插件用 `platform=workbuddy`，两种都有效）；**无 PKCE**（state 由服务端签发）；每个登录流程独立 cookie jar（多账号互不串会话）；state 落盘后 `login poll` 子命令轮询 `auth/token?state=`，再 `login/account?state=` 取 uid/nickname；Origin/Referer = `https://www.codebuddy.cn`。
+- **请求头三条铁律**（`internal/upstream/headers.go`）：
+  1. `Origin` + `Referer` 必须带（CN=codebuddy.cn / Global=workbuddy.ai，按账号 region 切换）；
+  2. 缺省字段有显式 `X-No-*` 占位（`X-No-Authorization/X-No-User-Id/X-No-Enterprise-Id/X-No-Department-Info: 1`）；
+  3. **安全红线：chat 请求绝不携带 `X-Refresh-Token`**（只允许出现在 refresh 端点，配 `X-Auth-Refresh-Source: workbuddy`）。
+- **请求体改写**（`internal/upstream/payload.go`）：① 上游**拒绝非流式** → 强制 `stream:true`（非流式由本地聚合）；② `tool_choice` 必须是 **string**（对象形式报 400 `code=11101`，需归一化：`{"type":"function","function":{"name":X}}` → `"X"`）；③ `reasoning_effort` 按模型 `supportedEfforts` 自动降级（档位序 off<minimal<low<medium<high<xhigh<max，snake/camel 双字段兼容）。
+- **指纹清洗**（`internal/upstream/sanitize.go`，可开关 `sanitize_blacklist_fingerprints`）：剥离消息中的 Claude Code 痕迹——身份句改写（"official CLI for"→"official CLI tool for"）、"Main branch"→"Default branch"、`cc_xxx=...;` 键值对循环剥离、`X-Anthropic-*` 头引用剥离；零分配预检（先 `strings.Contains` 快路径再正则兜底）。
+- **SSE 处理**（`internal/upstream/sse.go`）：非流式 `Aggregate`（tool_calls delta 按 index 合并、帧归一化）+ 流式 `Stream` 透传。
+- **会话粘性路由**（`internal/session/session.go`）：conversationId/metadata 键 → 账号绑定；**双段分配**（优先"空闲账号"哈希，其次全池哈希）；写锁 re-check 防 TOCTOU；TTL 30m + LastActive 滚动续期 + redis 异步镜像防重启丢粘性。
+- **完整配置 schema**（`config.example.json`，权威）：`pool.max_in_flight=3`、`breaker_threshold=3`、`breaker_cooldown=30m`（递增至 `6h`）、`idle_weight_per_hour=0.5/max=5.0`、`session_sticky.ttl=30m`、`cooldown.soft_rate=60s`、`schedule.checkin_hours=[9,21]`、`keepalive_hours=[22]`、upstash redis 可选。
+
+### 5.2 dsh-workbuddy-connect 补充（模型目录 / 图片模态 / 注册机制）
+
+- **静态模型目录 15 个**（`src/catalog.ts`，2026-09-01 与线上核验，可作离线兜底/参考值）：
+
+| id | 上下文 | maxTokens | 图片 | 思考档位 | 倍率 |
+|---|---|---|---|---|---|
+| auto | 168K | 32K | ✅ | 默认 high，不可关 | — |
+| hy3 / hy4-preview | 192K / 1M | 64K | ✅ | high（hy4 仅 high） | **x0.00 限时免费** |
+| glm-5.3 / -flash | 1M | 48K / 32K | ✅ | low/high/xhigh；flash low/high/max | x0.79 / **x0.06** |
+| glm-5.2 | 1M | 48K | ✅ | medium | x0.79 夜间折扣 |
+| glm-5.1 | 200K | 48K | ❌ | medium | x0.79 |
+| glm-5v-turbo | 200K | 64K | ✅ | medium | x0.71 |
+| kimi-k3-1 | 1M | 32K | ✅ | medium | x1.62 |
+| kimi-k2.7-code / k2.6 | 256K | 32K | ✅ | medium | x0.57 / x0.52 |
+| minimax-m3 | 512K | 128K | ✅ | medium | x0.25 |
+| deepseek-v4-flash / -pro | 1M | 50K | ✅ | high | x0.17 / x0.51 |
+| hy3-x | 192K | 64K | ✅ | low/high | x0.05 |
+
+  目录结构分新旧两代：旧代 `{effort, summary}`（无 supportedEfforts，多数拒绝 off）；新代含 `supportedEfforts` + `canDisableThinking`。**设计模式：静态兜底目录 + 启动后动态替换**（首拉在途/离线时 provider 仍可用）。
+- **图片模态案例研究**（`docs/image-modality-gap.md`，完整排障记录）："渠道不支持图片" **100% 是宿主本地拦截**（DSH host `dsh-host-apiproxy` 经 `resolveModelInfo` 检查 `inputModalities`，不含 image 直接拒，消息不落库不发出）；上游模型目录本就带 `inputModalities:["text","image"]` 字段。修复 = 读上游字段而非硬编码。**教训：能力声明永远以上游目录为准**。
+- **插件注册**（`cordis.patch.yml`）：DSH 用 cordis patch 声明式注册 provider（`insert: llm-workbuddy`），不改动用户当前默认模型。
+
+### 5.3 workbuddy-switch 补充（进程管理 / token 统计 / 快照体系）
+
+- **进程管理**（`modules/process.rs`）：Windows 关闭 = 枚举进程行（映像名匹配 `WorkBuddy.exe`/`CodeBuddy.exe` + **crashpad helper 识别 + 自身排除**）→ `taskkill /PID x /T`（树杀，宽限 8s）→ 残留 `/F` 强杀 → 仍存活则报错让人工介入；启动 = 认证文件里的 app 路径（`persist_workbuddy_exe` 持久化上次路径兜底）+ `CREATE_NO_WINDOW` 静默拉起。切换主流程（`switch.rs`）：备份 → close(20s) → 写 auth 文件 → launch，全程进度回调。
+- **本地 token 统计契约**（`.trellis/spec/wb-switch-core/backend/token-statistics.md`）：数据源 = `~/.workbuddy/projects` + `~/.codebuddy/projects` 的 **JSONL 事件流**，解码出 input/output/cacheRead/cacheWrite/uncachedInput/records/cacheHitRate，按模型/项目/会话三维聚合，`days ∈ {7,30,90}`，Tauri 与 HTTP（`GET /api/token-stats`）同构双暴露。
+- **积分用量快照**（`credit_usage.rs`）：本地快照（total/remaining 时序）+ 签到日志 → 推导每日用量窗口，官方用量不可用时的回退数据源。
+- **账号库导入导出**（`export_import.rs`）：JSON 格式 preview/merge（按 token 去重追加/更新）/按索引导入，纯逻辑无文件系统依赖便于单测。
+
+### 5.4 antigravity-tools 补充（旧版登录态考古 / 代理协议细则）
+
+- **WorkBuddy 旧版登录态考古**（`src/modules/oauth.py`）：客户端曾是 **VSCode fork（Electron）**，旧版凭证在 `%APPDATA%/WorkBuddy/User/globalStorage/state.vscdb`——AccessToken 用 **Chromium v10 加密**（`Local State → os_crypt.encrypted_key`（DPAPI）→ AES-256-GCM 解密：去 3 字节 `v10` 前缀 + 12B nonce），另有 `.neodata_token` 兼容回退。**16+ 项认证残留清理清单**（`_clear_all_auth`）：vscdb 各认证 key、`Tencent-Cloud.coding-copilot` 产品缓存、`__$__targetStorageMarker`、vscdb.backup 等——做"彻底登出/环境重置"时的完整 checklist。Keycloak 登出 = `{issuer}/protocol/openid-connect/logout`。
+- **代理调度协议细则**（`docs/proxy_optimization_design.md`，17 项优化的工程协议）：
+  - **错误分类三态**：`RETRY_SAME`（502/503/超时→同 Key 重试 1 次）/ `SWITCH_KEY`（401/403/429→直接换）/ `FATAL`（400 context_too_long→终止）；
+  - **模型级冷却**：按 model 记冷却（渐进退避 10→20→40s），优先级高于 Key 级状态；
+  - **流式保活**：15s 一次 SSE 注释行 `: keep-alive\n\n`；首字超时 10s（可故障转移）；空闲 60s 主动断；
+  - **断连兜底**：`_drain_upstream` 客户端断开后继续读完上游（保 usage 统计完整）；
+  - **健康检测**：5min + 0-60s 随机抖动，发 `/v1/models` 轻量请求；
+  - **sticky session 提取优先级**：`X-Session-ID` 头 > messages cache_control hash > 内容摘要；key_mode=4 = 粘性会话模式；
+  - 非流式响应 50MB 上限；`MODEL_CONTEXT_LENGTHS["auto"]=168000` 与目录一致。
+
+### 5.5 workbuddy-auto-signin 补充
+
+- 鉴权头极简版可用：`User-Agent: WorkBuddy`（桌面端 UA）+ Bearer + X-User-Id（+X-Enterprise-Id/X-Tenant-Id/X-Domain）即可调 billing/activity 接口（`signin.py:62-77`）。
+- `dig()` 信封解包工具：字段可能被 `data/result/resp/response` 任意一层包裹，递归查找——解析层的通用兜底模式。
+
+### 5.6 二次深挖对扩展路线的增量影响
+
+| 扩展项 | 增量结论 |
+|---|---|
+| API 暴露（P0） | 增加硬约束：Origin/Referer、tool_choice string 化、强制 stream、effort 降级、指纹清洗（可选）；粘性会话用 workbuddy2api 的双段分配方案 |
+| DSH 接入（P2） | 有现成 15 模型静态目录可当兜底；能力声明读上游 `inputModalities/supportedEfforts`，勿硬编码 |
+| 环境重置（新增） | antigravity 的 16 项残留清理清单 + state.vscdb v10 解密路径，可用于"彻底登出/多账号隔离"功能 |
+| 切号流程 | 关进程用"树杀+宽限+强杀"三级，映像名匹配须排除 crashpad helper 与工具自身 |
