@@ -225,3 +225,62 @@ X-Product: SaaS
 | DSH 接入（P2） | 有现成 15 模型静态目录可当兜底；能力声明读上游 `inputModalities/supportedEfforts`，勿硬编码 |
 | 环境重置（新增） | antigravity 的 16 项残留清理清单 + state.vscdb v10 解密路径，可用于"彻底登出/多账号隔离"功能 |
 | 切号流程 | 关进程用"树杀+宽限+强杀"三级，映像名匹配须排除 crashpad helper 与工具自身 |
+
+## 6. 第三轮调研：Trae Work 与 DSH/Codex 的接入现状（2026-09-07）
+
+> 调研问题：① Trae Work 支不支持 DSH？② Trae Work 支不支持 Codex？③ WorkBuddy 支不支持 Codex？
+> 方法：网络检索 + 已克隆仓库交叉引用 + 本机实测（WorkBuddy app.asar 字符串分析、Codex CLI 本机配置取证）。
+
+### 6.1 Trae Work ↔ DSH：已有成熟社区插件，双积分体系都被覆盖
+
+**结论：Trae 官方不原生支持 DSH，但社区插件已把"本机登录的 Trae 模型"完整接入 DSH，且能读取 Work 积分。**
+
+- **`dingminhua/dsh-connect-trae`**（MIT，npm v1.2.0，[awesome-dsh-plugin 收录](https://awesome-dsh-plugin.com/p/dingminhua/dsh-connect-trae)）：
+  - 把本机登录的 Trae CN / **TRAE SOLO CN** 模型注册为 DSH 的 `trae` provider（DeepSeek-V4-Flash/Pro 等）；
+  - **DSH 本地工具循环**：Trae 只生成结构化 `tool_calls`，bash/read/write 由 DSH 本地执行再回传——绕开了 Trae 上游不执行工具的限制；
+  - **多账号切换**：自动发现 `%APPDATA%\Trae CN` / `%APPDATA%\TRAE SOLO CN` 的 `User/globalStorage/storage.json` 登录账号，Token 不写入 DSH 设置；
+  - **只读积分面板：Work 积分与通用积分分开显示**（走 `https://api.trae.cn/trae/api/v2/pay/*` 与 `/ug/*`，只读查询不消耗积分）——与我们项目的积分 API 结论一致（IDE 208 / Work 209 两套）；
+  - 上游链路：`https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat` → Trae SSE/pending function_call → OpenAI SSE tool_calls → DSH；
+  - 安全设计：随机端口 + 进程内随机 secret 的 loopback shim，真实 Trae token 不交给 pi-ai 层；
+  - 参考实现致谢：`Wang-JQ77/dsh-trae-api`（MIT，Trae 认证/会话/模型协议研究）。
+- **`@casually/dsh-trae-api`**（npm，双形态）：
+  - 既可作 DSH 插件（默认 `http://localhost:9220`，端口/Key 可在 `cordis.patch.yml` 配置），也可独立运行；
+  - 首启自动从本机 Trae IDE `storage.json` **解密认证数据**存入 `.env`；
+  - 暴露 **OpenAI 兼容 `/v1`**，同时给出 Claude Code（`ANTHROPIC_BASE_URL`）、Cursor、Cline/Roo、Windsurf 的接入配置——**这实质上就是"Trae Work 的 API 暴露"现成方案**，与我们 P0 扩展项高度同构；
+  - 模型名可任意填（如 `claude-sonnet-4-6`），由 Trae 侧 `auto` 路由。
+- 对我们的意义：**Trae 侧 DSH 接入不必自研**——安装 `dsh-connect-trae` 即用；而它对 Trae 认证解密、`llm_utils_chat` 协议、积分只读接口的实现可直接参照（与我们 `docs/doubao-trae-switch-plan.md` 的 Trae 方案互为印证）。
+
+### 6.2 Trae Work ↔ Codex：无原生支持，需经协议转换层
+
+- Trae 上游是自有协议（`llm_utils_chat` + SSE function_call），**不提供 OpenAI Responses API**，因此 Codex CLI（新版走 `wire_api = "responses"`）**无法直连 Trae**。
+- 可行路径（同 6.1 的 `@casually/dsh-trae-api` 或自建转换器）：Trae → 本地转换器补齐 `/v1/responses` 投影 → Codex CLI `config.toml` 指向 `base_url`。**截至调研时点未见现成的 "trae2codex" / Trae Responses API 转换器开源实现**——若要做，参考 `tonny0812/workbuddy2api` 的 converter（见 6.3，其 `/v1/responses` 投影逻辑可整体复用，只换上游适配层）。
+
+### 6.3 WorkBuddy ↔ Codex：无原生集成，但两条社区链路均已跑通
+
+**结论：WorkBuddy 桌面端本身不支持 Codex 模型（本机 `app.asar` 内 236 处 codex 命中全部来自内置 OpenAI SDK 的类型定义，如 `gpt-5.1-codex-max` 枚举，无任何 Codex 集成代码）。** 但社区双向链路都已存在：
+
+**链路 A：WorkBuddy/CodeBuddy 订阅 → 当作 Codex CLI 的模型后端**（把腾讯订阅喂给 Codex）
+- **`tonny0812/workbuddy2api`**（另见 GitHub 同名仓库，Python converter.py）：**已实现 `/v1/responses` 端点投影**，Codex CLI 直配即可用 WorkBuddy 模型（`codex-codebuddy.example.toml`）：
+  - `~/.codex/config.toml`：`[model_providers.workbuddy]` + `base_url="http://127.0.0.1:8787/v1"` + `wire_api="responses"`；`[profiles.workbuddy]` model = glm-5.2 / kimi-k2.7 / deepseek-v4-pro / auto；
+  - 同一转换器还内置 **Anthropic `/v1/messages` 适配层**（CC Switch 接 Claude Code）与 OpenAI 兼容 `/v1/chat/completions`（Cherry Studio 等）——一份转换器三协议；
+  - 配套 `--desensitize` 脱敏（防后端审核拦截）、`--no-compact` 保留完整 system prompt、脱敏仍命中审核时自动退回紧凑模式重试。
+- **`workbuddy-mcp`**（npm，[LobeHub 收录](https://lobehub.com/mcp/linhaij-workbuddy-mcp)）：反方向——把 WorkBuddy（驱动 `@tencent-ai/codebuddy-code` CLI）注册为 **Codex/Claude Code/Cursor/OpenCode 的 MCP 工具**（`codex mcp add workbuddy -- node server.js`），agent 说"用 workbuddy 做 X"即调用 `run_workbuddy_task`；`WB_SKIP_PERMISSIONS=true` 时无人值守执行。
+- **WorkBuddyProxy**（社区方案，见 ima.qq.com《WorkBuddy接入Codex解决方案》及变现营课程）：Electron 本地代理，WorkBuddy 走 OpenAI 兼容接口 `127.0.0.1:<port>/v1` → 代理持 **Codex OAuth access token**（存 `%APPDATA%\WorkBuddyProxy\config.json`）→ 调 Codex 后端——即"WorkBuddy 当驾驶舱、Codex 当执行器"。
+
+**链路 B：Codex（ChatGPT 订阅）→ 当作 DSH 的模型后端**（与 WorkBuddy 无关，但属同族）
+- `franksong2702/dsh-codex-connect`（Apache-2.0，alpha 4.26）：ChatGPT OAuth 登录 → `openai-codex` 模型目录进 DSH；Fast Mode（1.5×）、5 小时/每周双配额窗口显示、可选搜索/图片工具；DSH 插件结构的参照实现（dsh-workbuddy-connect 即仿它组装 provider）。
+
+### 6.4 本机现状取证（2026-09-07）
+
+- **Codex CLI 已安装**：`~/AppData/Roaming/npm/codex` + `~/.codex/`（auth.json、archived_sessions、automations 等）；
+- **Codex 当前走 CC Switch 本地代理**：`~/.codex/config.toml` → `base_url = "http://127.0.0.1:15721/v1"`，`wire_api="responses"`，`experimental_bearer_token="PROXY_MANAGED"`，model=`z-ai/glm-5.3-free`；15721 端口实为 **`D:/software/CC Switch\cc-switch.exe`**（PID 实测）——即用户已在用"代理托管 OAuth + 模型切换器"的模式，WorkBuddyProxy 属同类形态；
+- **WorkBuddy 桌面端无 Codex 集成**（asar 字符串分析，见 6.3）。
+
+### 6.5 对本项目的落地建议（增量）
+
+| 方向 | 建议 | 参考 |
+|---|---|---|
+| Trae Work → DSH | 不自研，直接装 `dsh-connect-trae`；若要产品化多账号切换，参照其 storage.json 发现 + loopback shim 设计 | dingminhua/dsh-connect-trae |
+| Trae Work API 暴露 | `@casually/dsh-trae-api` 的解密+OpenAI 兼容层即现成方案；与本项目 P0 同构，可吸收其 Anthropic 适配思路 | @casually/dsh-trae-api、Wang-JQ77/dsh-trae-api |
+| WorkBuddy → Codex 后端 | 复用 `tonny0812/workbuddy2api` converter（/v1/responses 投影 + 三协议 + 脱敏），替换上游适配层即可让 Codex CLI 吃 WorkBuddy 积分 | tonny0812/workbuddy2api |
+| Codex 集成进本项目 | 用户已有 CC Switch 管理多 provider；本项目可做"账号池视角"的补充——把 WorkBuddy/Trae 转换端点注册进 CC Switch 配置而非自建切换器 | 本机 config.toml 取证 |
