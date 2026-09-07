@@ -26,10 +26,11 @@ import {
   Save,
   ScanSearch,
   Crown,
+  Tags,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
-import { save } from '@tauri-apps/plugin-dialog';
+import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import type { AccountView, CreditDetail, DiscoveredAccount, GroupView, JwtParseResult, ProfileInfo } from '../types';
@@ -365,36 +366,65 @@ export default function Accounts() {
     }
   };
 
+  const importAccounts = async () => {
+    try {
+      const filePath = await open({
+        multiple: false,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!filePath || typeof filePath !== 'string') return;
+      const content = await api.misc.readTextFile(filePath);
+      const report = await api.accounts.importAccounts(content);
+      if (report.added === 0 && report.skipped > 0) {
+        toast('warn', `未新增账号：${report.skipped} 个均已存在${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}`);
+      } else {
+        toast(
+          'success',
+          `导入完成：新增 ${report.added} 个账号，跳过 ${report.skipped} 个重复${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}`,
+        );
+      }
+      void refreshAccounts();
+      void refreshGroups();
+    } catch (err) {
+      toast('error', `导入失败：${String(err)}`);
+    }
+  };
+
   return (
     <div className="animate-fade-in">
       <PageHeader
         title="账号管理"
         desc="维护账号、调整分组、重置设备 ID 与登录态切换"
+        leftExtra={
+          <button onClick={() => setHelpOpen(true)} className="btn-ghost !p-2" title="使用帮助">
+            <HelpCircle size={16} />
+          </button>
+        }
         actions={
           <>
-            <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
-              <Download size={15} /> 导出
+            <button onClick={() => void refreshAccountsAndPay()} className="btn-outline" title="刷新账号列表、套餐与积分数据">
+              <RefreshCw size={15} /> 刷新数据
             </button>
             <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae Work / Trae 已登录账号，一键加入账号池">
               <ScanSearch size={15} /> 扫描本机
             </button>
-            <button onClick={() => setHelpOpen(true)} className="btn-outline" title="使用帮助">
-              <HelpCircle size={15} /> 帮助
-            </button>
-            <button onClick={() => void refreshAccountsAndPay()} className="btn-outline">
-              <RefreshCw size={15} /> 刷新
-            </button>
-            <button onClick={() => setGroupOpen(true)} className="btn-outline">
-              分组管理
-            </button>
-            <button onClick={() => { void refreshProfiles(); setProfileOpen(true); }} className="btn-outline">
-              <Camera size={15} /> 快照管理
-            </button>
-            <button onClick={() => setOAuthOpen(true)} className="btn-outline">
+            <button onClick={() => setOAuthOpen(true)} className="btn-outline" title="通过 OAuth 授权登录添加账号">
               <Globe size={15} /> OAuth 登录
             </button>
-            <button onClick={() => setAddOpen(true)} className="btn-primary">
+            <button onClick={() => setAddOpen(true)} className="btn-outline" title="手动粘贴 JWT 添加账号">
               <Plus size={15} /> 添加账号
+            </button>
+            <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
+              <Download size={15} /> 导出账户
+            </button>
+            <button onClick={() => void importAccounts()} className="btn-outline" title="从导出的 JSON 文件导入账号（自动去重）">
+              <Upload size={15} /> 导入账号
+            </button>
+            <button onClick={() => setGroupOpen(true)} className="btn-outline" title="管理账号分组">
+              <Tags size={15} /> 分组管理
+            </button>
+            <button onClick={() => { void refreshProfiles(); setProfileOpen(true); }} className="btn-outline" title="查看/备份/恢复登录态快照">
+              <Camera size={15} /> 快照管理
             </button>
           </>
         }

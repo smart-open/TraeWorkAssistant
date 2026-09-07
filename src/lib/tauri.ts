@@ -14,6 +14,7 @@ import type {
   GroupView,
   JwtParseResult,
   LocalEntitlement,
+  ImportReport,
   LogLine,
   OAuthLoginUrl,
   OAuthLoginResult,
@@ -65,6 +66,8 @@ export const api = {
     refreshJwt: (userId: string) =>
       invoke<string>('refresh_jwt', { userId }),
     exportRaw: () => invoke<Record<string, unknown>>('accounts_export_raw'),
+    importAccounts: (content: string) =>
+      invoke<ImportReport>('accounts_import', { content }),
     // F-08 双应用账号自动发现
     discover: () => invoke<DiscoveredAccount[]>('apps_accounts_discover'),
     addDiscovered: (userId: string, name: string, app: string, dcUid?: string | null) =>
@@ -128,6 +131,7 @@ export const api = {
     proxyLogDetail: (id: string) => invoke<string>('proxy_log_detail', { id }),
     writeTextFile: (path: string, content: string) =>
       invoke('write_text_file', { path, content }),
+    readTextFile: (path: string) => invoke<string>('read_text_file', { path }),
   },
   switchAccount: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
     invoke('switch_account', { userId, targetApp: targetApp ?? null }),

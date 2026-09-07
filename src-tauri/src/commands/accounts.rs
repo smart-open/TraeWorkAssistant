@@ -74,7 +74,9 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
                 "refreshToken": refresh_token,
                 "jwtSource": jwt_source,
                 "userId": v.user_id,
+                "dcId": raw.and_then(|a| a.dc_id.clone()),
                 "groupId": v.group_id,
+                "addedAt": raw.and_then(|a| a.added_at.clone()),
                 "jwtExpHours": v.jwt_exp_hours,
                 "checkedToday": v.checked_today,
                 "remainingCredits": v.remaining_credits,
@@ -85,6 +87,28 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
                 "hasRefreshToken": v.has_refresh_token,
                 "jwtAutoRefresh": v.jwt_auto_refresh,
                 "creditsExpireAt": v.credits_expire_at,
+            })
+        })
+        .collect();
+
+    // 兜底：视图未覆盖的原始账号（如既无 user_id 又无有效 JWT 的坏行）也导出，保证数据不丢
+    let view_uids: std::collections::HashSet<&str> =
+        views.iter().map(|v| v.user_id.as_str()).collect();
+    let extras: Vec<serde_json::Value> = accounts
+        .accounts
+        .iter()
+        .filter(|a| {
+            let uid = a.user_id.as_deref().unwrap_or("");
+            !view_uids.contains(uid)
+        })
+        .map(|a| {
+            serde_json::json!({
+                "name": a.name,
+                "cloudIdeJwt": a.jwt,
+                "refreshToken": a.refresh_token.clone().unwrap_or_default(),
+                "userId": a.user_id,
+                "dcId": a.dc_id,
+                "addedAt": a.added_at,
             })
         })
         .collect();
@@ -102,13 +126,175 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
         })
         .collect();
 
+    let mut all_accounts = merged;
+    all_accounts.extend(extras);
+
     Ok(serde_json::json!({
         "exportedAt": fs_utils::now_iso(),
-        "appVersion": "2.4.4",
-        "accountCount": merged.len(),
-        "accounts": merged,
+        "appVersion": env!("CARGO_PKG_VERSION"),
+        "accountCount": all_accounts.len(),
+        "accounts": all_accounts,
         "groups": groups_arr,
     }))
+}
+
+/// 导入结果报告
+#[derive(serde::Serialize)]
+pub struct ImportReport {
+    /// 文件中的账号总数
+    pub total: usize,
+    /// 实际新增数量
+    pub added: usize,
+    /// 跳过（重复）数量
+    pub skipped: usize,
+    /// 跳过的账号标识（uid 或名称），用于前端提示
+    pub skipped_names: Vec<String>,
+    /// 新增分组数量
+    pub groups_added: usize,
+}
+
+/// 从字段取第一个非空字符串值（兼容导出格式与原始格式两套键名）
+fn pick_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| v.get(*k))
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 导入账号：兼容三种格式 ——
+/// 1. 本应用导出格式 `{accounts:[{userId, cloudIdeJwt, refreshToken, dcId, groupId,...}], groups:[...]}`
+/// 2. 原始账号池格式 `{accounts:[{name, UserID, jwt, refresh_token?, dc_id?}]}`
+/// 3. 裸数组 `[{...}]`
+/// 按 uid（user_id 字段或 JWT 解析）去重；分组按 id 合并，不存在则新增。
+#[tauri::command]
+pub fn accounts_import(state: State<AppState>, content: String) -> Result<ImportReport, String> {
+    let root: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("JSON 解析失败: {e}"))?;
+    let empty = Vec::new();
+    let accounts_arr = match &root {
+        serde_json::Value::Array(arr) => arr,
+        serde_json::Value::Object(obj) => obj
+            .get("accounts")
+            .and_then(|v| v.as_array())
+            .ok_or("缺少 accounts 数组：请使用本应用导出的 JSON 文件")?,
+        _ => return Err("无法识别的导入格式：需要对象或数组".into()),
+    };
+    let groups_arr = root
+        .get("groups")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+
+    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+
+    // 已有 uid 集合（user_id 字段 + JWT 解析），与自动发现共用同一去重口径
+    let mut known: std::collections::HashSet<String> = accounts
+        .accounts
+        .iter()
+        .flat_map(|a| {
+            let mut ids = Vec::new();
+            if let Some(uid) = a.user_id.clone().filter(|s| !s.is_empty()) {
+                ids.push(uid);
+            }
+            if !a.jwt.trim().is_empty() {
+                if let Some(uid) = jwt::parse(&a.jwt).user_id {
+                    ids.push(uid);
+                }
+            }
+            ids
+        })
+        .collect();
+
+    // 合并分组：按 id 去重，缺失即新增
+    let mut groups_added = 0usize;
+    let existing_group_ids: std::collections::HashSet<String> =
+        groups.groups.iter().map(|g| g.id.clone()).collect();
+    for g in groups_arr {
+        let Some(id) = pick_str(g, &["id"]).or_else(|| pick_str(g, &["Id"])) else {
+            continue;
+        };
+        if existing_group_ids.contains(&id) {
+            continue;
+        }
+        groups.groups.push(crate::models::Group {
+            id: id.clone(),
+            name: pick_str(g, &["name"]).unwrap_or_else(|| format!("分组 {}", &id[..4.min(id.len())])),
+            color: pick_str(g, &["color"]).unwrap_or_else(|| "#6366f1".into()),
+            order: g.get("order").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        });
+        groups_added += 1;
+    }
+    let group_ids: std::collections::HashSet<String> =
+        groups.groups.iter().map(|g| g.id.clone()).collect();
+
+    let mut report = ImportReport {
+        total: accounts_arr.len(),
+        added: 0,
+        skipped: 0,
+        skipped_names: Vec::new(),
+        groups_added,
+    };
+
+    for entry in accounts_arr {
+        // 兼容导出格式(userId/cloudIdeJwt/dcId)与原始格式(UserID/jwt/dc_id)
+        let user_id = pick_str(entry, &["userId", "UserID", "user_id", "uid"]);
+        let jwt = pick_str(entry, &["cloudIdeJwt", "jwt"]).unwrap_or_default();
+        // 无 user_id 字段时尝试从 JWT 解析
+        let uid = match user_id {
+            Some(u) => Some(u),
+            None if !jwt.trim().is_empty() => jwt::parse(&jwt).user_id,
+            _ => None,
+        };
+        let Some(uid) = uid else {
+            report.skipped += 1;
+            report
+                .skipped_names
+                .push(pick_str(entry, &["name"]).unwrap_or_else(|| "(无 ID)".into()));
+            continue;
+        };
+        if known.contains(&uid) {
+            report.skipped += 1;
+            report
+                .skipped_names
+                .push(pick_str(entry, &["name"]).unwrap_or_else(|| uid.clone()));
+            continue;
+        }
+        known.insert(uid.clone());
+
+        let name = pick_str(entry, &["name"]).unwrap_or_else(|| {
+            let tail = &uid[uid.len().saturating_sub(4)..];
+            format!("导入-…{tail}")
+        });
+        // 分组映射：仅当目标分组存在（原有或本次导入）才记录
+        let group_id = pick_str(entry, &["groupId", "group_id"]).filter(|gid| group_ids.contains(gid));
+        if let Some(gid) = &group_id {
+            groups.membership.insert(uid.clone(), gid.clone());
+        }
+        accounts.accounts.push(RawAccount {
+            name,
+            user_id: Some(uid),
+            jwt,
+            refresh_token: pick_str(entry, &["refreshToken", "refresh_token"]),
+            added_at: Some(fs_utils::now_iso()),
+            updated_at: Some(fs_utils::now_iso()),
+            dc_id: pick_str(entry, &["dcId", "DcID", "dc_id"]),
+        });
+        report.added += 1;
+    }
+
+    if report.added > 0 || report.groups_added > 0 {
+        fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+        fs_utils::write_json(&state.path("groups.json"), &groups)?;
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "导入账号: 新增 {} 跳过 {} 新增分组 {}",
+                report.added, report.skipped, report.groups_added
+            ),
+        );
+    }
+    Ok(report)
 }
 
 #[tauri::command]

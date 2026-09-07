@@ -54,6 +54,20 @@ export interface AccountView {
 }
 
 // ---- F-08 双应用账号自动发现 ----
+/** 账号导入结果报告 */
+export interface ImportReport {
+  /** 文件中的账号总数 */
+  total: number;
+  /** 实际新增数量 */
+  added: number;
+  /** 跳过（重复）数量 */
+  skipped: number;
+  /** 跳过的账号标识（uid 或名称） */
+  skipped_names: string[];
+  /** 新增分组数量 */
+  groups_added: number;
+}
+
 export interface DiscoveredAccount {
   user_id: string;
   /** 账户中心（dc）uid —— 与账号池 Cloud-IDE id 体系不同，仅诊断展示 */

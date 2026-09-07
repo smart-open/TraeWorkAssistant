@@ -430,6 +430,14 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
 }
 
+/// 读取本地文本文件（配合导入账号：文件选择后由 Rust 侧读取，避免前端路径权限问题）
+#[tauri::command]
+pub fn read_text_file(path: String) -> Result<String, String> {
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+    String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".into())
+}
+
 // ---------------- 定时任务 ----------------
 
 // 运行 schtasks 并正确解码输出。

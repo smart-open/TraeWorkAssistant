@@ -10,9 +10,11 @@
 
 | 功能 | 说明 | 实现要点 |
 |---|---|---|
-| **F-47 进程管理增强** | 三级关闭 + exe 路径持久化 | Rust `commands/process.rs`：优雅关闭（taskkill 不带 /F，等 8s）→ 树杀强杀（/T /F，等 3s）→ 人工介入提示；「打开应用注入代理」与 PS 桥 `Stop-Trae`（CloseMainWindow 优先）均已接入；自动探测成功的 exe 路径持久化到 `app_settings.json` 兜底 |
-| **F-08 双应用账号自动发现** | 扫描本机两个 Trae 应用的登录账号 | Rust `commands/trae_apps.rs`：解析 `%APPDATA%\TRAE SOLO CN` / `%APPDATA%\Trae CN` 的 `User/globalStorage/storage.json` 中 `iCubeAuthInfo://icube-dc:<uid>` 键（uid 明文）；账号管理页「扫描本机」弹框展示、标记已入池、一键加入（占位入库，代理捕获后自动回填 JWT） |
-| **Trae 会员/套餐信息展示** | 账号级 + 本机应用级双视图 | ① 账号级：`ide_user_pay_status` API（实测 `user_pay_identity_str` = Free/Lite/Pro）批量刷新缓存 `pay_status.json`，账号列表名称旁展示套餐徽标；② 本机级：storage.json 明文键 `iCubeServerData://icube.cloudide` → `entitlementInfo`（零 API），概览页新增「本机套餐」卡片 |
+| **F-47 进程管理增强** | 三级关闭 + exe 路径持久化 + 等待缩短 | Rust `commands/process.rs`：优雅关闭（taskkill 不带 /F，等 **3s**）→ 树杀强杀（/T /F，等 2s，轮询 250ms）→ 人工介入提示；「打开应用注入代理」与 PS 桥 `Stop-Trae`（CloseMainWindow 优先）均已接入；自动探测成功的 exe 路径持久化到 `app_settings.json` 兜底 |
+| **F-08 双应用账号自动发现** | 扫描本机两个 Trae 应用的登录账号 + uid 体系修复 | Rust `commands/trae_apps.rs`：解析双应用 `storage.json`；`iCubeAuthInfo://icube-dc:<uid>` 实测为设备/数据中心级标识，当前登录账号的 Cloud-IDE uid 由本机使用痕迹推导（Trae CN `icube_gtm.users`、Trae Work vscdb `allowControl` 时间戳+键名证据），去重同时匹配 user_id 字段与 JWT 解析 uid；「扫描本机」弹框展示、标记已入池、一键加入 |
+| **Trae 会员/套餐信息展示** | 账号级 + 本机应用级双视图 + 到期时间 | ① 账号级：`ide_user_pay_status` API 批量刷新缓存，账号列表套餐徽标；② 本机级：storage.json 明文键 `iCubeServerData://icube.cloudide` → `entitlementInfo`（零 API），概览页「本机套餐」卡片；③ 到期时间：`ide_user_ent_usage` 会员包提取 `expire_time`/`next_billing_time`，徽标显示「Lite · M/D到期」 |
+| **账户中心 dc id 预留记录** | `RawAccount.DcID` 字段（只记录不展示） | 切换/保存登录态成功后自动回填（live storage.json → 快照）；发现入池随写；实测 dc id 为设备/数据中心级标识，仅作未来对账预留，不参与去重合并 |
+| **F-46 账号库导入导出（基础版）** | 导出完整性优化 + JSON 导入 | 导出：版本号取 `CARGO_PKG_VERSION`、补 `dcId`/`addedAt` 字段、兜底纳入视图外原始账号；导入：`accounts_import` 命令兼容导出格式/原始格式/裸数组，按 uid+JWT 去重，分组按 id 合并，前端「导入账号」按钮选文件一键导入并报告新增/跳过数量 |
 
 ---
 
@@ -23,7 +25,6 @@
 | F-39 | **Trae API 暴露** | 参照 `@casually/dsh-trae-api`：解密 storage.json 认证 → OpenAI 兼容 `/v1`（+Anthropic 适配思路）；与现有网关同构可合并实施 | 1~2 天 | P1 |
 | F-38 | **Trae → DSH 引导（不自研）** | 引导用户安装 `dingminhua/dsh-connect-trae`（装即用）；产品化时参照其 storage.json 发现 + loopback shim 设计 | ≈0 | P1 |
 | F-41 | trae2codex 转换器 | Trae 上游为自有 `llm_utils_chat` 协议、无 Responses API，Codex CLI 不能直连；复用 `tonny0812/workbuddy2api` 投影逻辑换上游——社区空白机会 | 3 天 | P3 |
-| 增量 | 套餐到期时间 | 当前 `ide_user_pay_status` 无订阅到期字段；后续可从 `ide_user_ent_usage` 付费积分包（charge_amount>0）取最大 expire_time 作为会员权益到期参考 | 0.5 天 | P2 |
 
 ## 三、跨应用通用基建
 
@@ -35,7 +36,7 @@
 | F-13 | 到期日历 | 各账号 JWT/积分/会员到期绝对时间入库 + UI 日历 + 到期前桌面提醒 | 1 天 | P1 |
 | F-19 | 失败通知渠道扩展 | 桌面通知之外接入企业微信 / Server酱 | 0.5 天 | P2 |
 | F-43 | CC Switch 协同 | 用户已用 CC Switch 管理多 provider；把本项目转换端点注册进其配置，不自建切换器 | 0.5 天 | P2 |
-| F-46 | 账号库导入导出增强 | JSON preview/merge（按 token 去重）/按索引导入 | 1 天 | P2 |
+| F-46 残余 | 账号库导入导出增强（残余项） | 基础版导入导出已完成（见 §一）；剩余：导入前 JSON preview 预览确认、按索引导入 | 0.5 天 | P3 |
 
 ## 四、WorkBuddy / CodeBuddy 应用（34 项，按批次）
 
