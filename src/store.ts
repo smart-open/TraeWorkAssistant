@@ -85,6 +85,7 @@ interface AppState {
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
   openTraeWithProxy: () => Promise<void>;
+  openTraeCn: () => Promise<void>;
   addAccount: (name: string, jwt: string, groupId?: string) => Promise<void>;
   deleteAccount: (userId: string, deleteProfile: boolean) => Promise<void>;
   updateAccount: (userId: string, name?: string, jwt?: string) => Promise<void>;
@@ -96,8 +97,8 @@ interface AppState {
   removeGroup: (id: string) => Promise<void>;
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
-  switchTo: (userId: string) => Promise<void>;
-  saveCurrentLogin: (userId: string) => Promise<void>;
+  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
   resetDeviceIds: () => Promise<void>;
   startCheckin: (opts: {
@@ -136,6 +137,7 @@ function defaultSettings(): Settings {
     retry: 1,
     notify: 'toast',
     trae_path: null,
+    trae_cn_path: null,
     data_dir: null,
     log_retention_days: 30,
     proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com',
@@ -464,6 +466,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `打开 Trae Work 失败：${String(err)}`);
     }
   },
+  openTraeCn: async () => {
+    try {
+      await api.env.openCnApp();
+      get().pushToast('success', '已打开 Trae');
+    } catch (err) {
+      get().pushToast('error', `打开 Trae 失败：${String(err)}`);
+    }
+  },
   addAccount: async (name, jwt, groupId) => {
     try {
       await api.accounts.addManual(name, jwt, groupId);
@@ -537,20 +547,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `重置失败：${String(err)}`);
     }
   },
-  switchTo: async (userId) => {
+  switchTo: async (userId, targetApp) => {
     try {
       set({ switchingTo: userId, switchProgress: [] });
-      await api.switchAccount(userId);
-      get().pushToast('info', '正在切换登录态，请稍候…');
+      await api.switchAccount(userId, targetApp);
+      get().pushToast('info', `正在切换登录态${targetApp === 'Trae' ? '（Trae）' : ''}，请稍候…`);
     } catch (err) {
       set({ switchingTo: null });
       get().pushToast('error', `切换失败：${String(err)}`);
     }
   },
-  saveCurrentLogin: async (userId) => {
+  saveCurrentLogin: async (userId, targetApp) => {
     try {
       set({ savingLogin: userId, saveLoginProgress: [] });
-      await api.saveCurrentLogin(userId);
+      await api.saveCurrentLogin(userId, targetApp);
       get().pushToast('info', '正在保存当前登录态，请稍候…');
     } catch (err) {
       set({ savingLogin: null });

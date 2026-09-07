@@ -64,6 +64,51 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
     Ok(())
 }
 
+/// 检测 Trae CN IDE（与 Trae Work/SOLO CN 是两个独立应用）
+#[tauri::command]
+pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
+    let (installed, path, version) = detect_trae_cn(state.settings().trae_cn_path.clone());
+    let running = is_running_cn();
+    EnvStatus { installed, running, version, path }
+}
+
+/// 打开 Trae CN IDE（普通启动，不注入代理）
+#[tauri::command]
+pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let (installed, path, _) = detect_trae_cn(state.settings().trae_cn_path.clone());
+    if !installed {
+        return Err("未检测到 Trae 安装，请在「设置 → 代理与签到」中指定 Trae 安装路径".into());
+    }
+    let exe = path.ok_or("未找到 Trae 可执行文件路径")?;
+    Command::new(&exe)
+        .spawn()
+        .map_err(|e| format!("启动 Trae 失败: {e}"))?;
+    Ok(())
+}
+
+fn detect_trae_cn(custom: Option<String>) -> (bool, Option<String>, Option<String>) {
+    if let Some(p) = custom {
+        let p = p.trim().to_string();
+        if !p.is_empty() && std::path::Path::new(&p).is_file() {
+            let version = version_of(&p);
+            return (true, Some(p), version);
+        }
+    }
+    let candidates = [
+        "%LOCALAPPDATA%\\Programs\\Trae CN\\Trae CN.exe",
+        "%ProgramFiles%\\Trae CN\\Trae CN.exe",
+        "D:////Programs////Trae CN////Trae CN.exe",
+    ];
+    for c in candidates {
+        let expanded = expand_env(c);
+        if std::path::Path::new(&expanded).exists() {
+            let version = version_of(&expanded);
+            return (true, Some(expanded), version);
+        }
+    }
+    (false, None, None)
+}
+
 fn detect_trae(custom: Option<String>) -> (bool, Option<String>, Option<String>) {
     // 优先使用用户在设置中指定的路径（兼容自定义安装目录）
     if let Some(p) = custom {
@@ -199,6 +244,20 @@ fn resolve_reg_candidate(icon: &Option<String>, loc: &Option<String>) -> Option<
         }
     }
     None
+}
+
+fn is_running_cn() -> bool {
+    let out = Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq Trae CN.exe", "/NH"])
+        .creation_flags(0x08000000)
+        .output();
+    match out {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.contains("Trae CN.exe")
+        }
+        Err(_) => false,
+    }
 }
 
 fn is_running() -> bool {

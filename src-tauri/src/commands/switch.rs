@@ -11,6 +11,7 @@ pub fn switch_account(
     app: AppHandle,
     state: State<AppState>,
     user_id: String,
+    target_app: Option<String>,
 ) -> Result<(), String> {
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
@@ -39,6 +40,8 @@ pub fn switch_account(
             "Switch",
             "-UserId",
             &user_id,
+            "-TargetApp",
+            target_app.as_deref().unwrap_or("TraeWork"),
             "-Json",
         ])
         .stdout(std::process::Stdio::piped())
@@ -110,6 +113,7 @@ pub fn save_current_login(
     app: AppHandle,
     state: State<AppState>,
     user_id: String,
+    target_app: Option<String>,
 ) -> Result<(), String> {
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
@@ -138,6 +142,8 @@ pub fn save_current_login(
             "SaveCurrentLogin",
             "-UserId",
             &user_id,
+            "-TargetApp",
+            target_app.as_deref().unwrap_or("TraeWork"),
             "-Json",
         ])
         .stdout(std::process::Stdio::piped())

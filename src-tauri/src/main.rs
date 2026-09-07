@@ -35,6 +35,8 @@ fn main() {
             commands::env::env_check,
             commands::env::open_trae_website,
             commands::env::open_trae_app,
+            commands::env::env_check_trae_cn,
+            commands::env::open_trae_cn_app,
             commands::cert::cert_status,
             commands::cert::cert_install,
             commands::proxy::proxy_start,

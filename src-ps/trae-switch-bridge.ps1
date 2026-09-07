@@ -28,6 +28,10 @@ param(
     [string]$UserId,
 
     [Parameter(Mandatory = $false)]
+    [ValidateSet('TraeWork', 'Trae')]
+    [string]$TargetApp = 'TraeWork',
+
+    [Parameter(Mandatory = $false)]
     [switch]$Json
 )
 
@@ -37,12 +41,55 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Script:TraeDataDir = "$env:APPDATA\TRAE SOLO CN"
 $Script:AppDataDir = "$env:APPDATA\TraeWorkAssistant"
-$Script:ProfilesDir = "$Script:AppDataDir\data\profiles"
-$Script:CurrentAccountFile = "$Script:ProfilesDir\current_account.txt"
 $Script:LogFile = "$Script:AppDataDir\logs\switcher.log"
 $Script:_TraeExeCache = $null
+
+# ── 目标应用档案（TraeWork = TRAE SOLO CN 客户端 / Trae = Trae CN IDE）────────
+# 两者同为 icube 内核的 VSCode fork，登录态文件结构完全同构
+# （storage.json / state.vscdb / machineid / aha / Network 等），
+# 仅 exe 名称、数据目录与快照存储位置不同，按档案参数化即可复用全部切换逻辑。
+switch ($TargetApp) {
+    'Trae' {
+        $Script:AppName         = 'Trae'
+        $Script:TraeDataDir     = "$env:APPDATA\Trae CN"
+        $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles_trae"
+        $Script:SettingsPathKey = 'trae_cn_path'
+        $Script:ProcNames       = @('Trae CN')
+        $Script:ExeNames        = @('Trae CN.exe')
+        $Script:ExeCandidates   = @(
+            "$env:LOCALAPPDATA\Programs\Trae CN\Trae CN.exe",
+            "$env:ProgramFiles\Trae CN\Trae CN.exe",
+            'D:\Programs\Trae CN\Trae CN.exe'
+        )
+    }
+    default {
+        $Script:AppName         = 'Trae Work'
+        $Script:TraeDataDir     = "$env:APPDATA\TRAE SOLO CN"
+        $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles"
+        $Script:SettingsPathKey = 'trae_path'
+        $Script:ProcNames       = @('TRAE SOLO CN', 'TRAE SOLO', 'Trae')
+        $Script:ExeNames        = @('TRAE SOLO CN.exe', 'TRAE SOLO.exe', 'Trae.exe')
+        $Script:ExeCandidates   = @(
+            "$env:LOCALAPPDATA\Programs\TRAE SOLO CN\TRAE SOLO CN.exe",
+            "$env:LOCALAPPDATA\Programs\TRAE SOLO\TRAE SOLO.exe",
+            "$env:ProgramFiles\TRAE SOLO CN\TRAE SOLO CN.exe",
+            "$env:ProgramFiles\TRAE SOLO\TRAE SOLO.exe",
+            "$env:LOCALAPPDATA\Programs\Trae\Trae.exe",
+            "$env:ProgramFiles\Trae\Trae.exe",
+            'D:\Programs\TRAE SOLO CN\TRAE SOLO CN.exe'
+        )
+    }
+}
+$Script:CurrentAccountFile = "$Script:ProfilesDir\current_account.txt"
+
+# 校验候选 exe 路径是否属于当前目标应用（防止 lnk/注册表/进程回退解析到另一个应用）
+function Test-ExeMatchesApp {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $name = [System.IO.Path]::GetFileName($Path)
+    return $Script:ExeNames -contains $name
+}
 
 function Find-TraeExe {
     # ── 顺序原则（修复「首次切换误用 Trae CN.exe」）─────────────────────────────
@@ -57,27 +104,16 @@ function Find-TraeExe {
     if (Test-Path $settingsFile) {
         try {
             $settings = Get-Content $settingsFile -Raw | ConvertFrom-Json
-            if ($settings.trae_path -and (Test-Path $settings.trae_path)) {
-                $Script:_TraeExeCache = $settings.trae_path
+            $customPath = $settings.$($Script:SettingsPathKey)
+            if ($customPath -and (Test-Path $customPath)) {
+                $Script:_TraeExeCache = $customPath
                 return $Script:_TraeExeCache
             }
         } catch {}
     }
 
     # 2. 多候选路径探测（与 Rust env.rs 保持一致）
-    $candidates = @(
-        "$env:LOCALAPPDATA\Programs\TRAE SOLO CN\TRAE SOLO CN.exe",
-        "$env:LOCALAPPDATA\Programs\TRAE SOLO\TRAE SOLO.exe",
-        "$env:ProgramFiles\TRAE SOLO CN\TRAE SOLO CN.exe",
-        "$env:ProgramFiles\TRAE SOLO\TRAE SOLO.exe",
-        "$env:LOCALAPPDATA\Programs\Trae\Trae.exe",
-        "$env:ProgramFiles\Trae\Trae.exe"
-    )
-    # 也检查 D 盘等非系统盘
-    if ($env:ProgramFiles -notlike 'D:\*') {
-        $candidates += 'D:\Programs\TRAE SOLO CN\TRAE SOLO CN.exe'
-    }
-    foreach ($c in $candidates) {
+    foreach ($c in $Script:ExeCandidates) {
         if (Test-Path $c) {
             $Script:_TraeExeCache = $c
             return $Script:_TraeExeCache
@@ -99,7 +135,7 @@ function Find-TraeExe {
                 Where-Object { $_.Name -like '*TRAE*' -or $_.Name -like '*Trae*' }
             foreach ($lnk in $lnks) {
                 $shortcut = $shell.CreateShortcut($lnk.FullName)
-                if ($shortcut.TargetPath -and (Test-Path $shortcut.TargetPath)) {
+                if ($shortcut.TargetPath -and (Test-Path $shortcut.TargetPath) -and (Test-ExeMatchesApp -Path $shortcut.TargetPath)) {
                     $Script:_TraeExeCache = $shortcut.TargetPath
                     return $Script:_TraeExeCache
                 }
@@ -122,7 +158,7 @@ function Find-TraeExe {
                 if ($item.DisplayIcon) {
                     $iconPath = $item.DisplayIcon -replace ',', ''
                     $iconPath = $iconPath.Trim()
-                    if (Test-Path $iconPath) {
+                    if ((Test-Path $iconPath) -and (Test-ExeMatchesApp -Path $iconPath)) {
                         $Script:_TraeExeCache = $iconPath
                         return $Script:_TraeExeCache
                     }
@@ -130,12 +166,8 @@ function Find-TraeExe {
                 # 尝试 InstallLocation
                 if ($item.InstallLocation) {
                     $loc = $item.InstallLocation.Trim()
-                    $exeCandidates = @(
-                        (Join-Path $loc 'TRAE SOLO CN.exe'),
-                        (Join-Path $loc 'TRAE SOLO.exe'),
-                        (Join-Path $loc 'Trae.exe')
-                    )
-                    foreach ($exe in $exeCandidates) {
+                    foreach ($exeName in $Script:ExeNames) {
+                        $exe = Join-Path $loc $exeName
                         if (Test-Path $exe) {
                             $Script:_TraeExeCache = $exe
                             return $Script:_TraeExeCache
@@ -166,7 +198,7 @@ function Find-TraeExe {
             Where-Object { $_.Name -match '^(Trae|TRAE)' -and $_.Path -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName }
         if ($proc) {
             $exePath = $proc | Select-Object -First 1 -ExpandProperty Path
-            if ($exePath -and (Test-Path $exePath)) {
+            if ((Test-Path $exePath) -and (Test-ExeMatchesApp -Path $exePath)) {
                 $Script:_TraeExeCache = $exePath
                 return $Script:_TraeExeCache
             }
@@ -234,14 +266,14 @@ function Stop-Trae {
             if ($pproc) { $parentName = $pproc.Name }
         }
     } catch {}
-    $p = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match '^(Trae|TRAE)' -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
+    $p = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
+        $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
     }
     if ($p) {
-        Write-Step -Stage 'stop' -Message '正在关闭 Trae Work' -Status 'running'
+        Write-Step -Stage 'stop' -Message "正在关闭 $($Script:AppName)" -Status 'running'
         # 在关闭前缓存 exe 路径，供 Start-Trae 使用
         $exePath = $p | Select-Object -First 1 -ExpandProperty Path -ErrorAction SilentlyContinue
-        if ($exePath -and (Test-Path $exePath)) {
+        if ((Test-Path $exePath) -and (Test-ExeMatchesApp -Path $exePath)) {
             $Script:_TraeExeCache = $exePath
         }
         $p | Stop-Process -Force
@@ -250,8 +282,8 @@ function Stop-Trae {
         while ($waited -lt 8) {
             Start-Sleep -Seconds 1
             $waited++
-            $still = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object {
-                $_.Name -match '^(Trae|TRAE)' -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
+            $still = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
+                $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
             }
             if (-not $still) { break }
         }
@@ -259,7 +291,7 @@ function Stop-Trae {
             Write-Step -Stage 'stop' -Message "进程未在 $waited 秒内退出，可能仍有文件锁" -Status 'warn'
         }
     } else {
-        Write-Step -Stage 'stop' -Message 'Trae Work 未运行' -Status 'skip'
+        Write-Step -Stage 'stop' -Message "$($Script:AppName) 未运行" -Status 'skip'
         # 进程未运行时也尝试查找 exe 路径并缓存
         if (-not $Script:_TraeExeCache) {
             $found = Find-TraeExe
@@ -273,10 +305,10 @@ function Stop-Trae {
 function Start-Trae {
     $exe = Find-TraeExe
     if (-not $exe) {
-        Write-Step -Stage 'start' -Message '未找到 TRAE 安装路径，请在设置中指定' -Status 'error'
-        throw '未找到 TRAE 可执行文件'
+        Write-Step -Stage 'start' -Message "未找到 $($Script:AppName) 安装路径，请在设置中指定" -Status 'error'
+        throw "未找到 $($Script:AppName) 可执行文件"
     }
-    Write-Step -Stage 'start' -Message "正在启动 Trae Work: $exe" -Status 'running'
+    Write-Step -Stage 'start' -Message "正在启动 $($Script:AppName): $exe" -Status 'running'
     Start-Process -FilePath $exe -WindowStyle Normal
 }
 
@@ -534,7 +566,7 @@ try {
         Write-Step -Stage 'init' -Message '缺少 -UserId 参数' -Status 'error'
         exit 1
     }
-    Write-Step -Stage 'init' -Message "开始操作: $Action (userId=$UserId)" -Status 'info'
+    Write-Step -Stage 'init' -Message "开始操作: $Action (userId=$UserId, targetApp=$TargetApp → $($Script:AppName))" -Status 'info'
 
     switch ($Action) {
         'Switch' {

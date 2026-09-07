@@ -21,6 +21,7 @@ export default function Settings() {
   const [busyTask, setBusyTask] = useState(false);
   const [querying, setQuerying] = useState(false);
   const [detecting, setDetecting] = useState(false);
+  const [detectingCn, setDetectingCn] = useState(false);
 
   // 确认弹窗状态
   const [confirmUnregister, setConfirmUnregister] = useState(false);
@@ -127,6 +128,23 @@ export default function Settings() {
       toast('error', `检测失败：${String(e)}`);
     } finally {
       setDetecting(false);
+    }
+  };
+
+  const detectTraeCn = async () => {
+    setDetectingCn(true);
+    try {
+      const r = await withMinDelay(api.env.checkCn());
+      if (r.installed && r.path) {
+        update('trae_cn_path', r.path);
+        toast('success', '已自动检测并填入 Trae 路径');
+      } else {
+        toast('info', '未检测到 Trae，请手动指定 exe 路径');
+      }
+    } catch (e) {
+      toast('error', `检测失败：${String(e)}`);
+    } finally {
+      setDetectingCn(false);
     }
   };
 
@@ -313,6 +331,24 @@ export default function Settings() {
               />
             </div>
             <div>
+              <label className="label">Trae 安装路径</label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={form.trae_cn_path ?? ''}
+                  onChange={(e) => update('trae_cn_path', e.target.value.trim() || null)}
+                  placeholder="留空则自动检测（默认 C://Users//你//AppData//Local//Programs//Trae CN\Trae CN.exe）"
+                  className="input flex-1"
+                />
+                <button onClick={detectTraeCn} disabled={detectingCn} className="btn-outline shrink-0">
+                  <Search size={15} /> {detectingCn ? '检测中…' : '自动检测'}
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-slate-400">
+                Trae CN IDE 的 exe 路径，用于「打开 Trae」与「切换到 Trae」；留空将自动探测。
+              </p>
+            </div>
+            <div>
               <label className="label">Trae Work 安装路径</label>
               <div className="flex items-center gap-2">
                 <input
@@ -404,19 +440,6 @@ export default function Settings() {
           </div>
         </section>
 
-        <section className="card p-4 md:col-span-2">
-          <h3 className="mb-2 font-medium">关于</h3>
-          <div className="space-y-1 text-xs text-slate-500">
-            <div>应用版本：v2.2.0</div>
-            <div>数据目录：<span className="font-mono">%APPDATA%\TraeWorkAssistant\</span></div>
-            <div className="pl-4 text-slate-400">配置：<span className="font-mono">conf\</span> 数据：<span className="font-mono">data\</span> 日志：<span className="font-mono">logs\</span></div>
-            <div>代理 Python：内置 device_proxy.py / auto_checkin.py</div>
-            <div className="flex items-center gap-2 pt-1">
-              <Badge tone="brand">MIT 友好</Badge>
-              <Badge tone="slate">仅本地运行</Badge>
-            </div>
-          </div>
-        </section>
       </div>
 
       {/* 底部悬浮保存条 */}

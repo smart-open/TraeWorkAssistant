@@ -79,6 +79,7 @@ export interface Settings {
   retry: number;
   notify: string;
   trae_path: string | null;
+  trae_cn_path: string | null;
   data_dir: string | null;
   log_retention_days: number;
   proxy_domains: string;

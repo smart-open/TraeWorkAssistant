@@ -24,6 +24,9 @@ export default function TopBar() {
   const openTrae = async () => {
     await useAppStore.getState().openTraeWithProxy();
   };
+  const openTraeCn = async () => {
+    await useAppStore.getState().openTraeCn();
+  };
 
   return (
     <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 dark:border-zinc-800 dark:bg-zinc-950">
@@ -55,6 +58,9 @@ export default function TopBar() {
         </Badge>
       </div>
       <div className="flex items-center gap-2">
+        <button onClick={openTraeCn} className="btn-outline" title="打开 Trae CN IDE">
+          <ExternalLink size={15} /> 打开 Trae
+        </button>
         <button onClick={openTrae} className="btn-outline">
           <ExternalLink size={15} /> {env?.installed ? '打开 Trae Work' : '下载 Trae Work'}
         </button>

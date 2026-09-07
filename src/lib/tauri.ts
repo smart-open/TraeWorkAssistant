@@ -25,8 +25,10 @@ import type {
 export const api = {
   env: {
     check: () => invoke<EnvStatus>('env_check'),
+    checkCn: () => invoke<EnvStatus>('env_check_trae_cn'),
     openSite: () => invoke('open_trae_website'),
     openApp: (proxyPort?: number) => invoke('open_trae_app', { proxyPort }),
+    openCnApp: () => invoke('open_trae_cn_app'),
   },
   cert: {
     status: () => invoke<{ installed: boolean }>('cert_status'),
@@ -113,8 +115,10 @@ export const api = {
     writeTextFile: (path: string, content: string) =>
       invoke('write_text_file', { path, content }),
   },
-  switchAccount: (userId: string) => invoke('switch_account', { userId }),
-  saveCurrentLogin: (userId: string) => invoke('save_current_login', { userId }),
+  switchAccount: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+    invoke('switch_account', { userId, targetApp: targetApp ?? null }),
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+    invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: () => invoke('reset_device_ids'),
   profiles: {
     list: () => invoke<ProfileInfo[]>('profile_list'),
