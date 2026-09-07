@@ -4,6 +4,14 @@
 
 ---
 
+## [未发布]
+
+### 修复
+
+- **检查更新只匹配本产品线（≥ 3.0.0）**：同一仓库同时发布 2.x（Trae Work 助手）与 3.x（AI Work 助手）两条产品线、是两个不同产品，`releases/latest` 会指向最近发布的那条线。改为拉取 releases 列表（跳过 draft / prerelease），只认 ≥ 3.0.0 的 release 并取版本最高者；`release_page` 改指具体 release 页；发布页链接改为 `…/releases`（不再用 `/latest`）。
+
+---
+
 ## [3.2.0] - 2026-09-07
 
 ### 变更

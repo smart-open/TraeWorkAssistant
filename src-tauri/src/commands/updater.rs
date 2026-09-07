@@ -18,8 +18,8 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 const RELEASES_API: &str =
-    "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases/latest";
-const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases/latest";
+    "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
+const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
 
 #[derive(Serialize, Clone)]
 pub struct UpdateCheckResult {
@@ -84,7 +84,7 @@ fn build_agent(timeout: Duration) -> ureq::Agent {
     builder.build()
 }
 
-fn fetch_latest_release() -> Result<serde_json::Value, String> {
+fn fetch_releases() -> Result<Vec<serde_json::Value>, String> {
     let agent = build_agent(Duration::from_secs(20));
     let resp = agent
         .get(RELEASES_API)
@@ -97,7 +97,7 @@ fn fetch_latest_release() -> Result<serde_json::Value, String> {
                 e, RELEASES_PAGE
             )
         })?;
-    resp.into_json::<serde_json::Value>()
+    resp.into_json::<Vec<serde_json::Value>>()
         .map_err(|e| format!("解析 release 响应失败: {e}"))
 }
 
@@ -127,28 +127,67 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
         .map(|(name, url, size, _)| (name, url, size))
 }
 
-/// 检查 GitHub Releases 上的最新版本，与当前应用版本比较。
+/// 本产品（AI Work 助手）产品线起点：只认 >= 3.0.0 的 release。
+/// 同一仓库还发布 2.x 产品线（Trae Work 助手，另一个产品），必须排除。
+const PRODUCT_MIN_VERSION: (u64, u64, u64) = (3, 0, 0);
+
+/// 检查 GitHub Releases 上本产品线（>= 3.0.0）的最新版本，与当前应用版本比较。
 #[tauri::command]
 pub fn update_check() -> Result<UpdateCheckResult, String> {
     let current = parse_version(env!("CARGO_PKG_VERSION"))
         .ok_or("内置版本号解析失败")?;
-    let rel = fetch_latest_release()?;
-    // 版本号优先取 tag（v3.0.1）；tag 不合法时从资产名推导
-    let tag = rel
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let assets = rel
-        .get("assets")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let releases = fetch_releases()?;
+
+    // 收集本产品线候选 release：(版本, tag, html_url, assets)
+    let mut candidates: Vec<((u64, u64, u64), String, String, Vec<serde_json::Value>)> =
+        Vec::new();
+    for rel in &releases {
+        if rel.get("draft").and_then(|v| v.as_bool()).unwrap_or(false)
+            || rel.get("prerelease").and_then(|v| v.as_bool()).unwrap_or(false)
+        {
+            continue;
+        }
+        let tag = rel
+            .get("tag_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let html_url = rel
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or(RELEASES_PAGE)
+            .to_string();
+        let assets = rel
+            .get("assets")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // 版本优先取 tag（v3.0.1）；tag 不合法时从资产名推导
+        let version = parse_version(&tag)
+            .or_else(|| pick_asset(&assets).and_then(|(name, _, _)| version_from_asset(&name)));
+        if let Some(v) = version {
+            if v >= PRODUCT_MIN_VERSION {
+                candidates.push((v, tag, html_url, assets));
+            }
+        }
+    }
+    // 本产品线内取版本最高者
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    let min_ver =
+        format!("{}.{}.{}", PRODUCT_MIN_VERSION.0, PRODUCT_MIN_VERSION.1, PRODUCT_MIN_VERSION.2);
+    let (latest, tag, release_page, assets) = candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("发布页上没有找到本产品线（v{min_ver} 起）的 release。可手动查看：{RELEASES_PAGE}"))?;
+
     let (asset_name, download_url, size) = pick_asset(&assets)
         .ok_or_else(|| format!("最新 release（{tag}）中没有可用的安装包资产。可手动查看：{RELEASES_PAGE}"))?;
-    let latest = parse_version(&tag)
-        .or_else(|| version_from_asset(&asset_name))
-        .ok_or_else(|| format!("无法从 tag「{tag}」或资产名解析版本号"))?;
+    // 防御：资产名版本必须与 release 版本一致，避免误装其他产品线的安装包
+    if version_from_asset(&asset_name) != Some(latest) {
+        return Err(format!(
+            "release（{tag}）的资产版本与 release 版本不一致，已中止。可手动查看：{RELEASES_PAGE}"
+        ));
+    }
 
     let has_update = cmp_version(latest, current) == std::cmp::Ordering::Greater;
     Ok(UpdateCheckResult {
@@ -158,7 +197,7 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         asset_name,
         download_url,
         size,
-        release_page: RELEASES_PAGE.to_string(),
+        release_page,
     })
 }
 
