@@ -58,7 +58,7 @@ from urllib.parse import urlparse
 # 脚本所在目录。但为了让用户"零配置"即可解密(不必再装一次证书)，优先复用桌面端
 # AI Work 助手 已生成、且多半已安装信任的 CA(位于 %APPDATA%\AIWorkAssistant\data\certs)。
 BASE = os.path.dirname(os.path.abspath(__file__))
-os.environ.setdefault("TRAEDATA_DIR", BASE)
+os.environ.setdefault("AIWORKDATA_DIR", BASE)
 
 import ctypes
 import subprocess

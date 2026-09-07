@@ -518,7 +518,7 @@ fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
                  解决方法（任选其一）：\n\
                  1. 右键 AI Work 助手 →「以管理员身份运行」后重新点击「注册任务」\n\
                  2. 打开「管理员命令提示符」手动执行：\n\
-                    schtasks /Create /TN {TASK_NAME} /TR \"cmd /c set AIWORKDATA_DIR={}&\\\"{}\\\" \\\"{}\\\"\" /SC DAILY /ST {time} /F\n\
+                    schtasks /Create /TN {TASK_NAME} /TR \"cmd /c set \\\"AIWORKDATA_DIR={}\\\" && \\\"{}\\\" \\\"{}\\\"\" /SC DAILY /ST {time} /F\n\
                  3. 如不需最高权限，可去掉 /RL HIGHEST 后重试",
                 state.data_dir.to_string_lossy(),
                 state.python_exe.replace('\\', "/"),

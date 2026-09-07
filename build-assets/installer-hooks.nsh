@@ -4,8 +4,11 @@
 ; 注意：本文件需保存为 UTF-8 with BOM，否则 NSIS Unicode 编译中文会乱码。
 
 !macro NSIS_HOOK_PREINSTALL
-  ; 1) 结束旧品牌进程，避免文件占用导致清理失败
+  ; 1) 结束旧品牌/旧命名进程，避免文件占用导致清理失败
+  ;    （含本地重打包的过渡版主程序 "AI Work 助手.exe"，防止其运行中锁住 POSTINSTALL 清理）
   nsExec::Exec 'taskkill /F /IM "Trae Work 助手.exe" /T'
+  Pop $R9
+  nsExec::Exec 'taskkill /F /IM "AI Work 助手.exe" /T'
   Pop $R9
   nsExec::Exec 'taskkill /F /IM "trae-work-assistant.exe" /T'
   Pop $R9

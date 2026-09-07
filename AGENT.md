@@ -57,7 +57,7 @@ ai-work-assistant/
 │       ├── models.rs             # DTO（含 CheckinSummary.time 字段）
 │       ├── fs_utils.rs           # 原子 read_json / write_json / mask / 时间辅助
 │       ├── jwt.rs                # parse() + status_of() + refresh() + oauth_parse()
-│       ├── python.rs             # spawn_script（注入 TRAEDATA_DIR）
+│       ├── python.rs             # spawn_script（注入 AIWORKDATA_DIR）
 │       ├── api_server/           # API 网关模块
 │       │   ├── mod.rs            # 常量 + 路由注册
 │       │   ├── server.rs         # axum 服务器启停
@@ -68,7 +68,7 @@ ai-work-assistant/
 │       │   └── api_logger.rs     # API 请求日志
 │       └── commands/             # env / cert / accounts / checkin / proxy / switch / misc / profile / api_server / oauth
 ├── src-python/
-│   ├── device_proxy.py           # MITM 代理（env TRAEDATA_DIR、--gen-ca）
+│   ├── device_proxy.py           # MITM 代理（env AIWORKDATA_DIR、--gen-ca）
 │   ├── auto_checkin.py           # 批量签到（--json-stream / --accounts / --scope）
 │   ├── requirements.txt          # cryptography
 │   └── tests/test_auto_checkin.py
@@ -153,7 +153,7 @@ ai-work-assistant/
 
 ## 9. Python 约定
 
-- **数据目录**：通过 `os.environ["TRAEDATA_DIR"]` 注入（Rust `spawn_script` 负责），缺省回退到脚本所在目录。
+- **数据目录**：通过 `os.environ["AIWORKDATA_DIR"]` 注入（Rust `spawn_script` 负责；Python 侧兼容读旧变量名 `TRAEDATA_DIR`），缺省回退到脚本所在目录。
 - **NDJSON**：`--json-stream` 输出 `{"type":"start"|"account"|"done",...}` 单行 JSON。
 - **稳定设备 ID**：`device_map.json` 缺条目时由 `rand_digits(n, seed=user_id)` 派生。
 - **docstring**：包含 Windows 路径时**必须用 raw 字符串 `r"""..."""`**。
