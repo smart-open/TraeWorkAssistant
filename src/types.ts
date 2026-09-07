@@ -45,6 +45,32 @@ export interface AccountView {
   general_credits: number | null;
   /** Work 积分（product_id == 209）剩余 */
   work_credits: number | null;
+  /** 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存） */
+  pay_identity?: string | null;
+}
+
+// ---- F-08 双应用账号自动发现 ----
+export interface DiscoveredAccount {
+  user_id: string;
+  /** TraeWork | Trae */
+  app: string;
+  app_label: string;
+  in_pool: boolean;
+  storage_path: string;
+}
+
+// ---- Trae 会员/套餐信息 ----
+export interface AppEntitlement {
+  app: string;
+  app_label: string;
+  identity_str: string | null;
+  identity: number | null;
+  last_sync_time: number | null;
+}
+
+export interface LocalEntitlement {
+  work: AppEntitlement | null;
+  cn: AppEntitlement | null;
 }
 
 /** 积分明细条目（仅剩余 > 0 且未过期的积分包） */

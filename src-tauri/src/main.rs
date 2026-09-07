@@ -95,6 +95,10 @@ fn main() {
             commands::oauth::oauth_get_login_url,
             commands::oauth::oauth_parse_callback,
             commands::oauth::oauth_login,
+            commands::trae_apps::apps_accounts_discover,
+            commands::trae_apps::apps_account_add,
+            commands::trae_apps::apps_entitlement_read,
+            commands::trae_apps::refresh_pay_status,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();

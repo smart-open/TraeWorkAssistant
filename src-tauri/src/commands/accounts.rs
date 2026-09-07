@@ -888,7 +888,7 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
 
 // ---------------- 内部工具 ----------------
 
-/// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到 / 冷却状态）。
+/// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到 / 冷却状态 / 套餐身份）。
 pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
     let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
     let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
@@ -896,6 +896,8 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
     let credits: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
     let rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
     let cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let pay: crate::commands::trae_apps::PayStatusFile =
+        fs_utils::read_json(&state.path("pay_status.json"));
     let summary: CheckinSummary = fs_utils::read_json(&state.path("checkin_summary.json"));
     let summary_today = summary
         .time
@@ -998,6 +1000,10 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
             credits_expire_at: rc.expire_times.get(&uid).copied(),
             general_credits: rc.general.get(&uid).copied(),
             work_credits: rc.work.get(&uid).copied(),
+            pay_identity: pay
+                .statuses
+                .get(&uid)
+                .map(|p| p.identity_str.clone()),
         });
     }
     out

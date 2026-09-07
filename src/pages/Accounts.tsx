@@ -24,13 +24,15 @@ import {
   ExternalLink,
   ArrowRight,
   Save,
+  ScanSearch,
+  Crown,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
 import { save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
-import type { AccountView, CreditDetail, GroupView, JwtParseResult, ProfileInfo } from '../types';
+import type { AccountView, CreditDetail, DiscoveredAccount, GroupView, JwtParseResult, ProfileInfo } from '../types';
 
 const PRESET_COLORS = [
   '#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#0ea5e9', '#a855f7', '#14b8a6',
@@ -95,6 +97,24 @@ function CreditsExpireBadge({ expireAt }: { expireAt: number | null }) {
 
 const fmtCredits = (v: number) =>
   v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+
+/** 套餐身份徽标（Free / Lite / Pro ...，悬停展示说明） */
+function PayIdentityBadge({ identity }: { identity: string | null | undefined }) {
+  if (!identity) return null;
+  const paid = identity.toLowerCase() !== 'free';
+  return (
+    <span
+      title={`当前订阅套餐：${identity}`}
+      className={`inline-flex cursor-help items-center gap-0.5 rounded-full px-1.5 py-px text-[10px] font-semibold ${
+        paid
+          ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400'
+          : 'bg-slate-100 text-slate-500 dark:bg-zinc-800 dark:text-zinc-400'
+      }`}
+    >
+      <Crown size={9} /> {identity}
+    </span>
+  );
+}
 
 /** 可用积分单元格：鼠标悬停展示积分明细（仅剩余 > 0 且未过期的积分包，按到期时间升序） */
 function CreditCell({ account }: { account: AccountView }) {
@@ -239,6 +259,48 @@ export default function Accounts() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [oauthOpen, setOAuthOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  // F-08 自动发现：扫描本机两个 Trae 应用 storage.json 的登录账号
+  const [scanOpen, setScanOpen] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [discovered, setDiscovered] = useState<DiscoveredAccount[] | null>(null);
+
+  const runDiscover = async () => {
+    setScanOpen(true);
+    setScanning(true);
+    try {
+      const list = await api.accounts.discover();
+      setDiscovered(list);
+    } catch (err) {
+      setDiscovered([]);
+      toast('error', `扫描本机账号失败：${String(err)}`);
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const addDiscovered = async (d: DiscoveredAccount) => {
+    try {
+      await api.accounts.addDiscovered(d.user_id, '', d.app);
+      toast('success', `账号 ${d.user_id} 已加入账号池`);
+      const list = await api.accounts.discover();
+      setDiscovered(list);
+      void refreshAccounts();
+    } catch (err) {
+      toast('error', `加入失败：${String(err)}`);
+    }
+  };
+
+  /** 刷新账号 + 套餐身份（先拉套餐缓存，再重建账号视图） */
+  const refreshAccountsAndPay = async () => {
+    try {
+      await api.accounts.refreshPayStatus();
+    } catch {
+      /* 套餐刷新失败不阻断账号刷新 */
+    }
+    void refreshAccounts();
+    void refreshGroups();
+    void refreshRemainingCredits();
+  };
 
   const filtered = useMemo(() => {
     if (filter === 'all') return accounts;
@@ -296,10 +358,13 @@ export default function Accounts() {
             <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
               <Download size={15} /> 导出
             </button>
+            <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae Work / Trae 已登录账号，一键加入账号池">
+              <ScanSearch size={15} /> 扫描本机
+            </button>
             <button onClick={() => setHelpOpen(true)} className="btn-outline" title="使用帮助">
               <HelpCircle size={15} /> 帮助
             </button>
-            <button onClick={() => { void refreshAccounts(); void refreshGroups(); void refreshRemainingCredits(); }} className="btn-outline">
+            <button onClick={() => void refreshAccountsAndPay()} className="btn-outline">
               <RefreshCw size={15} /> 刷新
             </button>
             <button onClick={() => setGroupOpen(true)} className="btn-outline">
@@ -374,7 +439,10 @@ export default function Accounts() {
                 return (
                   <tr key={a.user_id} className="border-t border-slate-200 dark:border-zinc-800">
                     <td className="px-4 py-3">
-                      <div className="font-medium">{a.name}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-medium">{a.name}</span>
+                        <PayIdentityBadge identity={a.pay_identity} />
+                      </div>
                       <div className="text-xs text-slate-400">{a.user_id}</div>
                     </td>
                     <td className="px-4 py-3">
@@ -614,6 +682,14 @@ export default function Accounts() {
         }}
       />
       <HelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
+      <DiscoverModal
+        open={scanOpen}
+        scanning={scanning}
+        discovered={discovered}
+        onClose={() => setScanOpen(false)}
+        onAdd={(d) => void addDiscovered(d)}
+        onRescan={() => void runDiscover()}
+      />
     </div>
   );
 }
@@ -1398,6 +1474,95 @@ function OAuthLoginModal({
               </select>
             </div>
           </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/** F-08 自动发现弹框：展示本机 Trae Work / Trae 登录账号，一键加入账号池 */
+function DiscoverModal({
+  open,
+  scanning,
+  discovered,
+  onClose,
+  onAdd,
+  onRescan,
+}: {
+  open: boolean;
+  scanning: boolean;
+  discovered: DiscoveredAccount[] | null;
+  onClose: () => void;
+  onAdd: (d: DiscoveredAccount) => void;
+  onRescan: () => void;
+}) {
+  const apps = ['TraeWork', 'Trae'] as const;
+  const notInPool = discovered?.filter((d) => !d.in_pool).length ?? 0;
+  return (
+    <Modal open={open} onClose={onClose} title="扫描本机登录账号" size="lg">
+      <div className="space-y-3 text-sm">
+        <p className="text-xs leading-relaxed text-slate-500 dark:text-zinc-400">
+          扫描本机 Trae Work（TRAE SOLO CN）与 Trae 的 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">storage.json</code>，
+          读取当前已登录的账号列表。未入池的账号可一键加入（先以占位形式入库，
+          之后启动代理打开对应应用时，JWT 会被自动捕获回填）。
+        </p>
+
+        {scanning && (
+          <div className="flex items-center gap-2 py-4 text-sm text-slate-500">
+            <Loader2 size={15} className="animate-spin" /> 正在扫描本机应用…
+          </div>
+        )}
+
+        {!scanning && discovered && discovered.length === 0 && (
+          <div className="py-4 text-center text-sm text-slate-400">
+            未发现已登录账号（两个应用均未登录或未安装）
+          </div>
+        )}
+
+        {!scanning && discovered && discovered.length > 0 && (
+          <>
+            {apps.map((app) => {
+              const list = discovered.filter((d) => d.app === app);
+              if (list.length === 0) return null;
+              return (
+                <div key={app} className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="font-semibold">{list[0].app_label}</span>
+                    <span className="text-xs text-slate-400">{list.length} 个登录账号</span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {list.map((d) => (
+                      <div
+                        key={`${d.app}-${d.user_id}`}
+                        className="flex items-center justify-between gap-2 rounded bg-slate-50 px-2 py-1.5 dark:bg-zinc-900"
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate font-mono text-xs">{d.user_id}</div>
+                        </div>
+                        {d.in_pool ? (
+                          <Badge tone="green">
+                            <CheckCircle2 size={12} /> 已入池
+                          </Badge>
+                        ) : (
+                          <button onClick={() => onAdd(d)} className="btn-outline !px-2 !py-1 text-xs">
+                            <Plus size={12} /> 加入
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+            <div className="flex items-center justify-between pt-1">
+              <span className="text-xs text-slate-400">
+                {notInPool > 0 ? `${notInPool} 个账号未入池` : '所有登录账号均已入池'}
+              </span>
+              <button onClick={onRescan} className="btn-outline text-xs">
+                <RefreshCw size={12} /> 重新扫描
+              </button>
+            </div>
+          </>
         )}
       </div>
     </Modal>

@@ -5,6 +5,8 @@ pub mod checkin;
 pub mod env;
 pub mod misc;
 pub mod oauth;
+pub mod process;
 pub mod profile;
 pub mod proxy;
 pub mod switch;
+pub mod trae_apps;

@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useEffect } from 'react';
 import {
   BarChart,
   Bar,
@@ -35,9 +35,12 @@ function formatUptime(startedAt: number | null): string | null {
 export default function Dashboard() {
   const accounts = useAppStore((s) => s.accounts);
   const env = useAppStore((s) => s.env);
+  const envCn = useAppStore((s) => s.envCn);
   const proxy = useAppStore((s) => s.proxy);
   const apiStatus = useAppStore((s) => s.apiStatus);
   const certInstalled = useAppStore((s) => s.certInstalled);
+  const localEntitlement = useAppStore((s) => s.localEntitlement);
+  const refreshLocalEntitlement = useAppStore((s) => s.refreshLocalEntitlement);
   const toast = useAppStore((s) => s.pushToast);
   const isDark = useIsDark();
 
@@ -84,11 +87,30 @@ export default function Dashboard() {
       s.refreshAccounts(),
       s.refreshGroups(),
       s.refreshCreditsHistory(),
+      s.refreshLocalEntitlement(),
     ]);
     // 刷新剩余可用积分（会再次 refreshAccounts 更新 UI）
     void api.accounts.refreshRemainingCredits().then(() => s.refreshAccounts()).catch(() => {});
     toast('success', '已刷新');
   };
+
+  // 本机套餐徽标：两个 Trae 应用当前登录账号的套餐（storage.json 明文缓存）
+  const entHint =
+    localEntitlement?.work || localEntitlement?.cn
+      ? [
+          localEntitlement?.work?.identity_str
+            ? `Work ${localEntitlement.work.identity_str}`
+            : null,
+          localEntitlement?.cn?.identity_str ? `Trae ${localEntitlement.cn.identity_str}` : null,
+        ]
+          .filter(Boolean)
+          .join(' · ')
+      : env?.installed || envCn?.installed
+        ? '本机应用未读取到套餐'
+        : undefined;
+  useEffect(() => {
+    void refreshLocalEntitlement();
+  }, [refreshLocalEntitlement]);
 
   const openTrae = async () => {
     await useAppStore.getState().openTraeWithProxy();
@@ -106,7 +128,7 @@ export default function Dashboard() {
         }
       />
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
         <StatCard label="账号总数" value={total} hint={`今日已签 ${checkedToday}`} tone="brand" />
         <StatCard label="可用总积分" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={creditsHint} tone="amber" />
         <StatCard
@@ -126,6 +148,14 @@ export default function Dashboard() {
           value={warned}
           hint="24h 内将过期"
           tone={warned > 0 ? 'red' : 'slate'}
+        />
+        <StatCard
+          label="本机套餐"
+          value={
+            localEntitlement?.work?.identity_str ?? localEntitlement?.cn?.identity_str ?? (env?.installed || envCn?.installed ? '—' : '未安装')
+          }
+          hint={entHint}
+          tone="violet"
         />
       </div>
 

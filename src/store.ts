@@ -11,6 +11,7 @@ import type {
   CreditsDailySnapshot,
   EnvStatus,
   GroupView,
+  LocalEntitlement,
   LogLine,
   ProfileInfo,
   ProxyStatus,
@@ -66,6 +67,8 @@ interface AppState {
   profiles: ProfileInfo[];
   profileProgress: string[];
   profileActive: boolean;
+  /** 本机两个 Trae 应用当前登录账号的套餐信息（storage.json 明文，零 API） */
+  localEntitlement: LocalEntitlement | null;
 
   init: () => Promise<void>;
   setView: (v: ViewKey) => void;
@@ -82,6 +85,7 @@ interface AppState {
   refreshCreditsHistory: () => Promise<void>;
   refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
+  refreshLocalEntitlement: () => Promise<void>;
 
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
@@ -175,6 +179,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   profiles: [],
   profileProgress: [],
   profileActive: false,
+  localEntitlement: null,
 
   init: async () => {
     // StrictMode 下 effect 会执行两次：先注销旧监听，避免重复注册导致事件触发两次（如 captured 重复 +1、toast 双发）
@@ -272,6 +277,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().refreshCreditsHistory(),
       get().refreshCreditsDaily(),
       get().refreshProfiles(),
+      get().refreshLocalEntitlement(),
     ]);
     set({ ready: true });
 
@@ -676,6 +682,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const profiles = await api.profiles.list();
       set({ profiles });
+    } catch {
+      /* ignore */
+    }
+  },
+  refreshLocalEntitlement: async () => {
+    try {
+      const localEntitlement = await api.traeApps.localEntitlement();
+      set({ localEntitlement });
     } catch {
       /* ignore */
     }

@@ -25,6 +25,9 @@ pub struct AccountView {
     /// Work 积分（product_id == 209）剩余
     #[serde(default)]
     pub work_credits: Option<f64>,
+    /// 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存）
+    #[serde(default)]
+    pub pay_identity: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
