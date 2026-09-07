@@ -350,7 +350,7 @@ export default function Accounts() {
             <EmptyState
               icon={<Plus size={28} />}
               title={filter === 'all' ? '还没有账号' : '此分组下没有账号'}
-              hint="点击右上角「添加账号」粘贴 JWT，或先启动代理让 TRAE 自动捕获。"
+              hint="点击右上角「添加账号」粘贴 JWT，或先启动代理，在 Trae Work / Trae 中登录后自动捕获。"
             />
           </div>
         ) : (
@@ -1413,8 +1413,9 @@ function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
             <Globe size={15} /> OAuth 登录（自动保存账号）
           </h3>
           <p className="text-xs leading-relaxed text-amber-800 dark:text-amber-200">
-            点击「OAuth 登录」按钮，在浏览器中完成 Trae Work 账号登录。登录完成后将回调 URL 粘贴回应用，
-            系统会自动解析 JWT 并保存账号信息，无需手动粘贴 token。适合首次添加账号或 JWT 过期后重新登录。
+            点击「OAuth 登录」按钮，在浏览器中完成 Trae 账号登录（Trae Work 与 Trae 同一账号体系，登录任一应用均可）。
+            登录完成后将回调 URL 粘贴回应用，系统会自动解析 JWT 并保存账号信息，无需手动粘贴 token。
+            适合首次添加账号或 JWT 过期后重新登录。
           </p>
         </section>
 
@@ -1423,12 +1424,12 @@ function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
             <Save size={15} className="text-amber-500" /> 保存当前登录态
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            在 Trae Work 中登录某个账号后，点击该账号行的「保存」图标，系统会关闭 Trae Work → 精准备份 9 类核心登录文件
-            （storage.json、state.vscdb、machineid、aha、Network 等）→ 重新启动 Trae Work。
-            每个账号的登录态独立存储，互不干扰。
+            在 Trae Work 或 Trae 中登录某个账号后，点击该账号行的「保存」图标并选择目标应用（Trae Work / Trae），
+            系统会关闭所选应用 → 精准备份 9 类核心登录文件（storage.json、state.vscdb、machineid、aha、Network 等）
+            → 重新启动所选应用。每个账号的登录态独立存储，互不干扰。
           </p>
           <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
-            ⚠ 首次使用前，请先在 Trae Work 中登录目标账号，然后点击「保存」图标创建快照。
+            ⚠ 首次使用前，请先在对应应用中登录目标账号，然后点击「保存」图标并选择该应用创建快照。
           </p>
         </section>
 
@@ -1437,14 +1438,17 @@ function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
             <LogIn size={15} className="text-amber-500" /> 切换账号流程
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            <li>点击目标账号行的「切换」图标</li>
+            <li>点击目标账号行的「切换」图标，并选择目标应用（Trae Work 或 Trae）</li>
             <li>系统自动保存当前登录态到当前账号槽位（如果已知当前账号 ID）</li>
             <li>同时备份到 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽位作为安全回退</li>
-            <li>恢复目标账号的登录态（含设备标识）</li>
-            <li>重新启动 Trae Work，自动以目标账号登录</li>
+            <li>恢复目标账号在该应用的登录态（含设备标识）</li>
+            <li>重新启动所选应用，自动以目标账号登录</li>
           </ol>
+          <p className="mt-1 text-xs leading-relaxed text-slate-500 dark:text-zinc-400">
+            同一账号可分别为 Trae Work 与 Trae 创建快照，两应用快照相互独立、可分别切换。
+          </p>
           <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
-            ⚠ 如果目标账号从未保存过登录态，切换会被中止并提示「无快照」。请先用「保存」图标创建快照。
+            ⚠ 如果目标账号在所选应用下从未保存过登录态，切换会被中止并提示「无快照」。请先用「保存」图标在该应用下创建快照。
           </p>
         </section>
 

@@ -135,7 +135,7 @@ export default function Dashboard() {
             <ShieldAlert className="text-amber-500" />
             <div>
               <div className="font-medium">未检测到 Trae Work 安装</div>
-              <div className="text-xs text-slate-500">请先安装 Trae Work，再启动代理进行账号登录态捕获。</div>
+              <div className="text-xs text-slate-500">代理捕获与账号切换同时支持 Trae Work 与 Trae，安装任一应用即可开始。</div>
             </div>
           </div>
           <button
@@ -152,7 +152,7 @@ export default function Dashboard() {
             <ShieldAlert className="text-amber-500" />
             <div>
               <div className="font-medium">CA 证书尚未安装</div>
-              <div className="text-xs text-slate-500">代理已启动但 TRAE 不信任代理证书将无法拦截签到接口。</div>
+              <div className="text-xs text-slate-500">代理已启动但 Trae 应用不信任代理证书将无法拦截签到接口。</div>
             </div>
           </div>
           <button
