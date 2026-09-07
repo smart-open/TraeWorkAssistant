@@ -735,7 +735,7 @@ function ScanModal({
     <Modal open={open} onClose={onClose} title="扫描本机账号">
       <div className="space-y-3">
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
-          扫描本机 Trae Work 的 storage.json 登录痕迹。当前版本仅支持 Trae Work，暂不支持其他应用。
+          扫描本机 Trae Work 登录痕迹（运行日志 / state.vscdb / storage.json）。当前登录账号可直接入池；多账号历史痕迹无法区分当前，需代理捕获 JWT 后确认。当前版本仅支持 Trae Work。
         </div>
         {scanning ? (
           <div className="py-6 text-center text-sm text-slate-400">扫描中…</div>

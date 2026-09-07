@@ -301,32 +301,23 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
         </div>
       )}
 
-      {/* 积分类型说明 — 紧凑面板 */}
+      {/* 积分类型说明 — 紧凑单行面板 */}
       <div className="mb-5 rounded-xl border border-amber-300/70 bg-amber-50/80 px-3.5 py-2.5 dark:border-amber-700/40 dark:bg-amber-900/10">
-        <div className="mb-2 flex items-center gap-2">
+        <div className="mb-1.5 flex items-center gap-2">
           <Info size={14} className="shrink-0 text-amber-500 dark:text-amber-400" />
           <span className="text-xs font-semibold text-amber-800 dark:text-amber-200">积分体系说明</span>
-          <span className="text-[11px] text-amber-600/60 dark:text-amber-400/40">本服务消耗通用积分</span>
+          <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-700/50 dark:text-amber-100">本服务消耗通用积分</span>
         </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-1">
-          {/* 通用积分 */}
-          <div className="rounded-lg border border-amber-300/60 bg-white/60 px-3 py-1.5 dark:border-amber-700/30 dark:bg-amber-900/5">
-            <div className="mb-1 flex items-center justify-between">
-              <span className="text-[11px] font-bold text-amber-800 dark:text-amber-200">通用积分</span>
-              <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-700/50 dark:text-amber-100">本服务使用</span>
-            </div>
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 dark:text-zinc-400">
-              <span className="font-mono text-amber-700 dark:text-amber-300">product_id 208</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>签到/登录/购买均计入</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>IDE 聊天与本 API 共用</span>
-            </div>
-          </div>
-          {/* Work 积分提示 */}
-          <div className="flex items-center gap-x-2 gap-y-0.5 px-1 text-[11px] text-slate-400 dark:text-zinc-500">
-            <span>Work 积分（product_id 209）为 Trae Work 套餐内专用，本服务不消耗、不展示。</span>
-          </div>
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
+          <p className="min-w-0 flex-1 text-[11px] leading-relaxed text-slate-500 dark:text-zinc-400">
+            Trae 通用积分（<span className="font-mono text-amber-700 dark:text-amber-300">product_id 208</span>）为账号统一积分：签到奖励、每月登录赠送与购买套餐均计入；IDE 聊天与本 API 服务共用扣减；上游接口 <span className="font-mono text-amber-700 dark:text-amber-300">llm_utils_chat</span>，明文 JSON。
+          </p>
+          <span className="shrink-0 text-[11px] text-slate-500 dark:text-zinc-400">
+            当前全部账号通用积分总余额：
+            <span className="ml-1 font-mono text-sm font-bold tabular-nums text-amber-600 dark:text-amber-300">
+              {accounts.reduce((s, a) => s + (a.general_credits ?? 0), 0).toLocaleString()}
+            </span>
+          </span>
         </div>
       </div>
 
@@ -404,9 +395,6 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
             <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
               <div className="mb-2 flex items-center justify-between">
                 <p className="font-medium">使用方式 & 配置示例</p>
-                <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">
-                  通用积分
-                </span>
                 <button
                   className="btn-ghost flex items-center gap-1 !p-1 text-xs"
                   onClick={copyConfigExample}

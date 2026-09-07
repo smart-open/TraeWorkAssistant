@@ -18,6 +18,34 @@ export default {
           900: '#18181b',
           950: '#09090b',
         },
+        // slate / zinc 关键档位变量化：主题换肤通过 html[data-theme] 覆盖 CSS 变量实现
+        // （见 index.css :root 与各主题覆盖块；默认值 = Tailwind 原色）
+        slate: {
+          50: 'rgb(var(--c-slate-50) / <alpha-value>)',
+          100: 'rgb(var(--c-slate-100) / <alpha-value>)',
+          200: 'rgb(var(--c-slate-200) / <alpha-value>)',
+          300: 'rgb(var(--c-slate-300) / <alpha-value>)',
+          400: '#94a3b8',
+          500: '#64748b',
+          600: '#475569',
+          700: '#334155',
+          800: '#1e293b',
+          900: '#0f172a',
+          950: '#020617',
+        },
+        zinc: {
+          50: '#fafafa',
+          100: 'rgb(var(--c-zinc-100) / <alpha-value>)',
+          200: 'rgb(var(--c-zinc-200) / <alpha-value>)',
+          300: '#d4d4d8',
+          400: '#a1a1aa',
+          500: '#71717a',
+          600: '#52525b',
+          700: 'rgb(var(--c-zinc-700) / <alpha-value>)',
+          800: 'rgb(var(--c-zinc-800) / <alpha-value>)',
+          900: 'rgb(var(--c-zinc-900) / <alpha-value>)',
+          950: 'rgb(var(--c-zinc-950) / <alpha-value>)',
+        },
       },
       fontFamily: {
         sans: [

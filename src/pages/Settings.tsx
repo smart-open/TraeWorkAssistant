@@ -5,10 +5,11 @@ import { Modal } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
+import { THEMES } from '../lib/themes';
 import type { Settings as SettingsType } from '../types';
 
 /**
- * 系统设置：应用环境与代理、签到行为与定时任务、设备标识重置、外观与通知。
+ * 系统设置：通用配置 / 设备标识重置（左列），签到行为 / 每日定时签到 / 代理配置（右列）。
  * 关于信息已移至左下角「软件说明」弹框。
  */
 
@@ -153,7 +154,7 @@ export default function Settings() {
     <div className="animate-fade-in">
       <PageHeader
         title="系统设置"
-        desc="应用环境、签到行为、定时任务与设备标识"
+        desc="通用配置、代理、签到行为、定时任务与设备标识"
         actions={
           dirty ? (
             <div className="flex items-center gap-2">
@@ -174,13 +175,66 @@ export default function Settings() {
       />
 
       <div className="grid items-start gap-4 md:grid-cols-2">
-        {/* 左列：应用环境与代理 + 设备标识重置 */}
+        {/* 左列：通用配置 + 代理配置 + 设备标识重置 */}
+        <div className="space-y-4">
         <section className="card p-4">
-          <h3 className="mb-1 font-medium">应用环境与代理</h3>
-          <p className="mb-3 text-xs text-slate-400">
-            Trae Work 安装路径用于「打开应用」与「切换账号」时定位 exe；留空将自动探测。
-          </p>
+          <h3 className="mb-1 font-medium">通用配置</h3>
+          <p className="mb-3 text-xs text-slate-400">主题、语言、通知与 Trae Work 应用路径等常规选项。</p>
           <div className="space-y-3 text-sm">
+            <div>
+              <label className="label">主题</label>
+              <select
+                value={form.theme}
+                onChange={(e) => update('theme', e.target.value)}
+                className="input"
+              >
+                <option value="system">跟随系统</option>
+                {THEMES.map((t) => (
+                  <option key={t.id} value={t.id}>{t.name}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="label">语言</label>
+              <select
+                value={form.language}
+                onChange={(e) => update('language', e.target.value)}
+                className="input"
+              >
+                <option value="zh-CN">简体中文</option>
+                <option value="en-US">English</option>
+              </select>
+            </div>
+            <div>
+              <label className="label">通知方式</label>
+              <select
+                value={form.notify}
+                onChange={(e) => update('notify', e.target.value)}
+                className="input"
+              >
+                <option value="toast">应用内 Toast</option>
+                <option value="system">系统通知</option>
+                <option value="both">Toast + 系统通知</option>
+                <option value="none">不通知</option>
+              </select>
+            </div>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.launch_minimized}
+                onChange={(e) => update('launch_minimized', e.target.checked)}
+              />
+              启动时最小化到托盘
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.tray}
+                onChange={(e) => update('tray', e.target.checked)}
+              />
+              启用系统托盘图标
+            </label>
+            <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
             <div>
               <label className="label">Trae Work 安装路径</label>
               <div className="flex items-center gap-2">
@@ -199,6 +253,126 @@ export default function Settings() {
                 TRAE SOLO CN 的 exe 路径，自定义安装目录时需填写。
               </p>
             </div>
+            <div>
+              <label className="label">日志保留天数</label>
+              <input
+                type="number"
+                value={form.log_retention_days}
+                onChange={(e) => update('log_retention_days', Math.min(365, Math.max(1, Number(e.target.value) || 30)))}
+                className="input w-24"
+                min={1}
+                max={365}
+              />
+            </div>
+          </div>
+        </section>
+
+        <section className="card p-4">
+          <h3 className="mb-1 font-medium">设备标识重置</h3>
+          <p className="mb-3 text-xs text-slate-500">
+            一次性重置 Trae Work 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
+            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭 Trae Work。
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setConfirmResetDevice(true)}
+              disabled={deviceResetActive}
+              className="btn-primary"
+            >
+              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行重置'}
+            </button>
+            {deviceResetActive && (
+              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
+            )}
+          </div>
+          {deviceResetProgress.length > 0 && (
+            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
+              {deviceResetProgress.join('\n')}
+            </pre>
+          )}
+        </section>
+        </div>
+
+        {/* 右列：签到行为 + 每日定时签到 + 代理配置 */}
+        <div className="space-y-4">
+        <section className="card p-4">
+          <h3 className="mb-1 font-medium">签到行为</h3>
+          <p className="mb-3 text-xs text-slate-400">批量签到时的默认跳过策略与重试参数，对所有签到入口生效。</p>
+          <div className="space-y-3 text-sm">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.checkin_skip_checked}
+                onChange={(e) => update('checkin_skip_checked', e.target.checked)}
+              />
+              默认跳过今日已签账号
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.checkin_skip_expired}
+                onChange={(e) => update('checkin_skip_expired', e.target.checked)}
+              />
+              默认跳过 JWT 过期账号
+            </label>
+            <div>
+              <label className="label">失败重试次数（签到失败后的重试次数）</label>
+              <input
+                type="number"
+                value={form.retry}
+                onChange={(e) => update('retry', Math.min(5, Math.max(0, Number(e.target.value) || 0)))}
+                className="input w-24"
+                min={0}
+                max={5}
+              />
+            </div>
+          </div>
+
+        </section>
+
+        <section className="card p-4">
+          <h3 className="mb-1 font-medium">每日定时签到</h3>
+          <p className="mb-3 text-xs text-slate-400">
+            通过 Windows 计划任务在指定时间自动运行签到脚本，无需启动应用界面。注册/删除需要管理员权限。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative flex items-center">
+              <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
+              <input
+                type="time"
+                value={time}
+                onChange={(e) => setTime(e.target.value)}
+                className="input h-9 !w-32 pl-8 text-sm"
+              />
+            </div>
+            <button onClick={register} disabled={busyTask} className="btn-primary">
+              <Calendar size={15} /> {busyTask ? '注册中…' : '注册任务'}
+            </button>
+            <button onClick={query} disabled={querying} className="btn-outline">
+              <Search size={15} /> {querying ? '查询中…' : '查询'}
+            </button>
+            <button onClick={() => setConfirmUnregister(true)} disabled={busyTask} className="btn-danger">
+              <Trash2 size={15} /> {busyTask ? '删除中…' : '取消'}
+            </button>
+          </div>
+          {taskInfo && (
+            <pre
+              className={`mt-3 overflow-auto whitespace-pre-wrap rounded-lg p-3 text-xs ${
+                taskInfo.startsWith('❌')
+                  ? 'max-h-80 border border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300'
+                  : 'max-h-40 bg-slate-50 dark:bg-zinc-950'
+              }`}
+            >
+              {taskInfo}
+            </pre>
+          )}
+
+        </section>
+
+        <section className="card p-4">
+          <h3 className="mb-1 font-medium">代理配置</h3>
+          <p className="mb-3 text-xs text-slate-400">MITM 代理端口与监听域名，修改后需重启代理生效。</p>
+          <div className="space-y-3 text-sm">
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
@@ -243,176 +417,9 @@ export default function Settings() {
                 代理拦截到的完整请求/响应将记录到此目录，按 100MB 滚动存储。修改后需重启代理生效。
               </p>
             </div>
-            <div>
-              <label className="label">日志保留天数</label>
-              <input
-                type="number"
-                value={form.log_retention_days}
-                onChange={(e) => update('log_retention_days', Math.min(365, Math.max(1, Number(e.target.value) || 30)))}
-                className="input w-24"
-                min={1}
-                max={365}
-              />
-            </div>
-          </div>
-
-          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
-
-          <h3 className="mb-1 font-medium">6 层设备标识重置</h3>
-          <p className="mb-3 text-xs text-slate-500">
-            一次性重置 Trae Work 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
-            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭 Trae Work。
-          </p>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setConfirmResetDevice(true)}
-              disabled={deviceResetActive}
-              className="btn-primary"
-            >
-              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
-            </button>
-            {deviceResetActive && (
-              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
-            )}
-          </div>
-          {deviceResetProgress.length > 0 && (
-            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
-              {deviceResetProgress.join('\n')}
-            </pre>
-          )}
-        </section>
-
-        {/* 右列：签到行为 + 每日定时签到（同一面板） */}
-        <section className="card p-4">
-          <h3 className="mb-1 font-medium">签到行为</h3>
-          <p className="mb-3 text-xs text-slate-400">批量签到时的默认跳过策略与重试参数，对所有签到入口生效。</p>
-          <div className="space-y-3 text-sm">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.checkin_skip_checked}
-                onChange={(e) => update('checkin_skip_checked', e.target.checked)}
-              />
-              默认跳过今日已签账号
-            </label>
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.checkin_skip_expired}
-                onChange={(e) => update('checkin_skip_expired', e.target.checked)}
-              />
-              默认跳过 JWT 过期账号
-            </label>
-            <div>
-              <label className="label">失败重试次数（签到失败后的重试次数）</label>
-              <input
-                type="number"
-                value={form.retry}
-                onChange={(e) => update('retry', Math.min(5, Math.max(0, Number(e.target.value) || 0)))}
-                className="input w-24"
-                min={0}
-                max={5}
-              />
-            </div>
-          </div>
-
-          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
-
-          <h3 className="mb-1 font-medium">每日定时签到</h3>
-          <p className="mb-3 text-xs text-slate-400">
-            通过 Windows 计划任务在指定时间自动运行签到脚本，无需启动应用界面。注册/删除需要管理员权限。
-          </p>
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="relative flex items-center">
-              <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
-              <input
-                type="time"
-                value={time}
-                onChange={(e) => setTime(e.target.value)}
-                className="input h-9 !w-32 pl-8 text-sm"
-              />
-            </div>
-            <button onClick={register} disabled={busyTask} className="btn-primary">
-              <Calendar size={15} /> {busyTask ? '注册中…' : '注册任务'}
-            </button>
-            <button onClick={query} disabled={querying} className="btn-outline">
-              <Search size={15} /> {querying ? '查询中…' : '查询'}
-            </button>
-            <button onClick={() => setConfirmUnregister(true)} disabled={busyTask} className="btn-danger">
-              <Trash2 size={15} /> {busyTask ? '删除中…' : '取消'}
-            </button>
-          </div>
-          {taskInfo && (
-            <pre
-              className={`mt-3 overflow-auto whitespace-pre-wrap rounded-lg p-3 text-xs ${
-                taskInfo.startsWith('❌')
-                  ? 'max-h-80 border border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300'
-                  : 'max-h-40 bg-slate-50 dark:bg-zinc-950'
-              }`}
-            >
-              {taskInfo}
-            </pre>
-          )}
-
-          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
-
-          <h3 className="mb-1 font-medium">外观与通知</h3>
-          <div className="space-y-3 text-sm">
-            <div>
-              <label className="label">主题</label>
-              <select
-                value={form.theme}
-                onChange={(e) => update('theme', e.target.value)}
-                className="input"
-              >
-                <option value="system">跟随系统</option>
-                <option value="light">浅色</option>
-                <option value="dark">深色</option>
-              </select>
-            </div>
-            <div>
-              <label className="label">语言</label>
-              <select
-                value={form.language}
-                onChange={(e) => update('language', e.target.value)}
-                className="input"
-              >
-                <option value="zh-CN">简体中文</option>
-                <option value="en-US">English</option>
-              </select>
-            </div>
-            <div>
-              <label className="label">通知方式</label>
-              <select
-                value={form.notify}
-                onChange={(e) => update('notify', e.target.value)}
-                className="input"
-              >
-                <option value="toast">应用内 Toast</option>
-                <option value="system">系统通知</option>
-                <option value="both">Toast + 系统通知</option>
-                <option value="none">不通知</option>
-              </select>
-            </div>
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.launch_minimized}
-                onChange={(e) => update('launch_minimized', e.target.checked)}
-              />
-              启动时最小化到托盘
-            </label>
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.tray}
-                onChange={(e) => update('tray', e.target.checked)}
-              />
-              启用系统托盘图标
-            </label>
-            <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
           </div>
         </section>
+        </div>
       </div>
 
       {/* 底部悬浮保存条 */}
@@ -453,7 +460,7 @@ export default function Settings() {
       <Modal
         open={confirmResetDevice}
         onClose={() => setConfirmResetDevice(false)}
-        title="确认执行 6 层设备标识重置"
+        title="确认执行设备标识重置"
         footer={
           <>
             <button className="btn-outline" onClick={() => setConfirmResetDevice(false)}>取消</button>

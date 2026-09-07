@@ -15,6 +15,7 @@ import {
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
+import { THEMES, nextTheme } from '../lib/themes';
 import { LINK_REPO, LINK_BLOG } from '../lib/about';
 import type { ViewKey } from '../types';
 import AboutDialog from './AboutDialog';
@@ -29,13 +30,6 @@ const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'api-service', label: 'API 服务', icon: Server },
   { key: 'logs', label: '系统日志', icon: ScrollText },
   { key: 'settings', label: '系统设置', icon: Settings },
-];
-
-/** 主题轮询顺序（与系统设置页选项一致） */
-const THEME_CYCLE: { id: string; name: string }[] = [
-  { id: 'system', name: '跟随系统' },
-  { id: 'light', name: '浅色' },
-  { id: 'dark', name: '深色' },
 ];
 
 export default function Sidebar({
@@ -56,12 +50,11 @@ export default function Sidebar({
     }
   };
 
-  // 主题轮询：system → light → dark 循环切换并持久化
+  // 主题轮询：按 THEMES 顺序循环切换并持久化（旧值自动归一化）
   const cycleTheme = async () => {
     const { settings, saveSettings } = useAppStore.getState();
     if (!settings) return;
-    const idx = THEME_CYCLE.findIndex((t) => t.id === settings.theme);
-    const next = THEME_CYCLE[(idx + 1 + THEME_CYCLE.length) % THEME_CYCLE.length];
+    const next = nextTheme(settings.theme);
     try {
       await saveSettings({ ...settings, theme: next.id });
       pushToast('success', `主题已切换：${next.name}`);
@@ -117,7 +110,7 @@ export default function Sidebar({
           onClick={() => void cycleTheme()}
           className={toolBtn}
           aria-label="切换主题"
-          title="切换主题（跟随系统 / 浅色 / 深色 轮询）"
+          title={`切换主题（${THEMES.map((t) => t.name).join(' → ')} 轮询）`}
         >
           <Palette size={17} />
         </button>
