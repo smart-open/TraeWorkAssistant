@@ -119,7 +119,8 @@ fn main() {
             commands::trae_apps::refresh_pay_status,
             commands::trae_apps::accounts_backfill_dc_ids,
             commands::updater::update_check,
-            commands::updater::update_install,
+            commands::updater::update_download,
+            commands::updater::update_run_installer,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();

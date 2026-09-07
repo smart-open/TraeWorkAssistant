@@ -1,12 +1,16 @@
-// ---------------- 应用自更新（检查 / 下载 / 静默安装） ----------------
+// ---------------- 应用自更新（检查 / 下载 / 安装，两步确认制） ----------------
 //
 // 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.py）：
 //   AI Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
 //   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
 //
-// 流程：update_check 解析最新 release 并与 CARGO_PKG_VERSION 比较；
-//       update_install 下载资产到临时目录（emit update-download-progress），
-//       启动 NSIS 静默安装（/S，走 installer-hooks.nsh 自动清理旧版），随后应用退出。
+// 流程（下载与安装拆分，UI 两处确认）：
+//   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；
+//   update_download    下载资产到临时目录（emit update-download-progress），完成后返回文件路径，
+//                      由前端确认后再安装（确认一：下载 / 确认二：安装）；
+//   update_run_installer 以 /P /UPDATE /R 启动 NSIS 安装器：
+//                      /P 被动模式（仅显示进度条）+ /UPDATE 跳过卸载直接覆盖 + /R 安装完成后自动重启应用
+//                      （自定义模板 build-assets/installer.nsi 支持上述标志），随后应用退出。
 
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -158,18 +162,23 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
     })
 }
 
-/// 下载资产到临时目录并启动静默安装，随后应用自动退出。
-#[tauri::command]
-pub fn update_install(
-    app: AppHandle,
-    download_url: String,
-    asset_name: String,
-    expected_version: String,
-) -> Result<(), String> {
-    // 防御：资产名里的版本必须与检查结果一致，且大于当前版本
-    let asset_ver = version_from_asset(&asset_name)
+/// 下载结果（供前端「确认二：安装」使用）
+#[derive(Serialize, Clone)]
+pub struct UpdateDownloaded {
+    /// 安装包在本地磁盘的完整路径
+    pub file_path: String,
+    pub asset_name: String,
+    /// 安装包字节数（实际下载大小）
+    pub size: u64,
+    /// 目标版本
+    pub version: String,
+}
+
+/// 校验下载目标：资产名版本必须与检查结果一致，且大于当前版本。
+fn validate_target(asset_name: &str, expected_version: &str) -> Result<(u64, u64, u64), String> {
+    let asset_ver = version_from_asset(asset_name)
         .ok_or_else(|| format!("资产名无法解析版本号: {asset_name}"))?;
-    let expected = parse_version(&expected_version).ok_or("目标版本号解析失败")?;
+    let expected = parse_version(expected_version).ok_or("目标版本号解析失败")?;
     if asset_ver != expected {
         return Err(format!(
             "资产版本 {asset_ver:?} 与检查到的目标版本 {expected:?} 不一致，已中止"
@@ -179,6 +188,18 @@ pub fn update_install(
     if cmp_version(asset_ver, current) != std::cmp::Ordering::Greater {
         return Err("目标版本不大于当前版本，无需更新".to_string());
     }
+    Ok(asset_ver)
+}
+
+/// 第一步：下载安装包到临时目录（不安装）。完成后前端确认，再调 update_run_installer。
+#[tauri::command]
+pub fn update_download(
+    app: AppHandle,
+    download_url: String,
+    asset_name: String,
+    expected_version: String,
+) -> Result<UpdateDownloaded, String> {
+    validate_target(&asset_name, &expected_version)?;
 
     // 下载目录：%TEMP%\ai-work-assistant-update\
     let dir = std::env::temp_dir().join("ai-work-assistant-update");
@@ -238,14 +259,44 @@ pub fn update_install(
         DownloadProgress { received, total, percent: 100 },
     );
 
-    // 启动 NSIS 静默安装（/S）：安装钩子会先结束本进程并自动清理/迁移，无需人工干预
-    std::process::Command::new(&dest)
-        .arg("/S")
-        .spawn()
-        .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{:?}）", dest))?;
+    Ok(UpdateDownloaded {
+        file_path: dest.to_string_lossy().into_owned(),
+        asset_name: asset_name.clone(),
+        size: received,
+        version: expected_version,
+    })
+}
 
-    // 提示前端后退出，让安装器接管
-    let _ = app.emit("update-installing", asset_name.clone());
+/// 第二步：启动 NSIS 安装器（/P /UPDATE /R）——被动模式显示进度条，
+/// /UPDATE 跳过卸载直接覆盖，/R 安装完成后自动重启本应用；随后当前进程退出。
+#[tauri::command]
+pub fn update_run_installer(
+    app: AppHandle,
+    file_path: String,
+    asset_name: String,
+) -> Result<(), String> {
+    // 防御：只允许运行本应用临时更新目录内的安装包，且版本必须大于当前版本
+    let path = std::path::Path::new(&file_path);
+    let expected_dir = std::env::temp_dir().join("ai-work-assistant-update");
+    if !path.is_file()
+        || path.parent() != Some(expected_dir.as_path())
+    {
+        return Err(format!("非法的安装包路径，已中止：{file_path}"));
+    }
+    let current = parse_version(env!("CARGO_PKG_VERSION")).unwrap();
+    match version_from_asset(&asset_name) {
+        Some(v) if cmp_version(v, current) == std::cmp::Ordering::Greater => {}
+        _ => return Err("安装包版本不大于当前版本，已中止".to_string()),
+    }
+
+    // /P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用
+    std::process::Command::new(path)
+        .args(["/P", "/UPDATE", "/R"])
+        .spawn()
+        .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+
+    // 提示前端后退出，让安装器接管（安装钩子会兜底结束本进程解锁文件占用）
+    let _ = app.emit("update-installing", asset_name);
     std::thread::sleep(Duration::from_millis(800));
     std::process::exit(0);
 }

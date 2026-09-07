@@ -24,6 +24,7 @@ import type {
   ProxyStatus,
   Settings,
   UpdateCheckResult,
+  UpdateDownloaded,
   UpdateDownloadProgress,
 } from '../types';
 
@@ -182,8 +183,12 @@ export const api = {
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),
-    install: (p: { downloadUrl: string; assetName: string; version: string }) =>
-      invoke<void>('update_install', p),
+    // 第一步：下载安装包（完成后返回本地路径，等待用户确认安装）
+    download: (p: { downloadUrl: string; assetName: string; version: string }) =>
+      invoke<UpdateDownloaded>('update_download', p),
+    // 第二步：启动安装器（/P /UPDATE /R，完成后自动重启应用）
+    runInstaller: (p: { filePath: string; assetName: string }) =>
+      invoke<void>('update_run_installer', p),
     onDownloadProgress: async (
       cb: (e: UpdateDownloadProgress) => void,
     ): Promise<UnlistenFn> =>

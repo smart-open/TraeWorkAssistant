@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 import { Modal } from './ui';
 import { api } from '../lib/tauri';
-import type { UpdateCheckResult, UpdateDownloadProgress } from '../types';
+import type { UpdateCheckResult, UpdateDownloadProgress, UpdateDownloaded } from '../types';
 import {
   APP_NAME,
   APP_TAGLINE,
@@ -31,7 +31,11 @@ type UpdateState =
   | { k: 'idle' }
   | { k: 'checking' }
   | { k: 'latest'; currentVersion: string }
+  // 确认一：发现新版本，等待用户确认下载
+  | { k: 'available'; info: UpdateCheckResult }
   | { k: 'downloading'; info: UpdateCheckResult; percent: number }
+  // 确认二：下载完成，等待用户确认安装（/P /UPDATE /R，完成后自动重启）
+  | { k: 'downloaded'; info: UpdateCheckResult; file: UpdateDownloaded }
   | { k: 'installing' }
   | { k: 'error'; msg: string };
 
@@ -85,15 +89,28 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
     };
   }, [open]);
 
-  const startInstall = (info: UpdateCheckResult) => {
+  // 第一步：下载更新包（确认一后触发；下载在 Rust 侧进行，进度经事件回推，完成后回到确认二）
+  const startDownload = (info: UpdateCheckResult) => {
     setUpd({ k: 'downloading', info, percent: 0 });
-    // 下载在 Rust 侧进行，进度经 update-download-progress 事件回推；完成后自动静默安装并退出应用
     void api.updater
-      .install({
+      .download({
         downloadUrl: info.download_url,
         assetName: info.asset_name,
         version: info.latest_version,
       })
+      .then((file) => {
+        setUpd((s) =>
+          s.k === 'downloading' ? { k: 'downloaded', info: s.info, file } : s,
+        );
+      })
+      .catch((e) => setUpd({ k: 'error', msg: String(e) }));
+  };
+
+  // 第二步：启动安装器（确认二后触发；/P /UPDATE /R，安装完成后自动重启应用）
+  const runInstaller = (file: UpdateDownloaded) => {
+    setUpd({ k: 'installing' });
+    void api.updater
+      .runInstaller({ filePath: file.file_path, assetName: file.asset_name })
       .catch((e) => setUpd({ k: 'error', msg: String(e) }));
   };
 
@@ -103,8 +120,8 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
     try {
       const r = await api.updater.check();
       if (r.has_update) {
-        // 有新版本：自动开始下载安装（需求约定）
-        startInstall(r);
+        // 有新版本：停在「确认一」，由用户决定是否下载
+        setUpd({ k: 'available', info: r });
       } else {
         setUpd({ k: 'latest', currentVersion: r.current_version });
       }
@@ -144,12 +161,12 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
               <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-semibold text-slate-500 dark:bg-zinc-800 dark:text-zinc-400">
                 v{appVersion}
               </span>
-              {/* 检查更新：分析 GitHub Releases，发现比当前更大的版本自动下载并静默安装 */}
+              {/* 检查更新：分析 GitHub Releases，发现新版本后两步确认（下载 → 安装） */}
               <button
                 onClick={() => void checkUpdate()}
                 disabled={busy}
                 className="inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-600 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400 dark:hover:bg-sky-500/20"
-                title="检查更新（发现新版本自动下载安装）"
+                title="检查更新（发现新版本后确认下载与安装）"
               >
                 {upd.k === 'checking' || upd.k === 'downloading' || upd.k === 'installing' ? (
                   <Loader2 size={12} className="animate-spin" />
@@ -166,11 +183,32 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
                 <CheckCircle2 size={13} /> 当前已是最新版本（v{upd.currentVersion}）
               </div>
             )}
+            {/* 确认一：发现新版本，等用户确认下载 */}
+            {upd.k === 'available' && (
+              <div className="mt-1.5 flex max-w-sm flex-wrap items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                <Download size={13} />
+                <span>
+                  发现新版本 v{upd.info.latest_version}（{fmtSize(upd.info.size)}）
+                </span>
+                <button
+                  onClick={() => startDownload(upd.info)}
+                  className="rounded-md bg-sky-600 px-2 py-0.5 text-[11px] font-semibold text-white transition hover:bg-sky-700 dark:bg-sky-500 dark:hover:bg-sky-400"
+                >
+                  下载更新
+                </button>
+                <button
+                  onClick={() => setUpd({ k: 'idle' })}
+                  className="rounded-md border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-500 transition hover:bg-slate-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                >
+                  忽略
+                </button>
+              </div>
+            )}
             {upd.k === 'downloading' && (
               <div className="mt-1.5 w-64">
                 <div className="mb-1 flex items-center justify-between text-xs font-medium text-sky-600 dark:text-sky-400">
                   <span className="inline-flex items-center gap-1">
-                    <Download size={13} /> 发现新版本 v{upd.info.latest_version}，正在下载…
+                    <Download size={13} /> 正在下载更新包 v{upd.info.latest_version}…
                   </span>
                   <span>{upd.percent}%</span>
                 </div>
@@ -181,13 +219,34 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
                   />
                 </div>
                 <div className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
-                  {upd.info.asset_name} · {fmtSize(upd.info.size)} · 完成后自动安装
+                  {upd.info.asset_name} · {fmtSize(upd.info.size)} · 完成后将询问是否安装
                 </div>
+              </div>
+            )}
+            {/* 确认二：下载完成，等用户确认安装 */}
+            {upd.k === 'downloaded' && (
+              <div className="mt-1.5 flex max-w-sm flex-wrap items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 size={13} />
+                <span>
+                  更新包下载完成（v{upd.info.latest_version} · {fmtSize(upd.file.size)}）
+                </span>
+                <button
+                  onClick={() => runInstaller(upd.file)}
+                  className="rounded-md bg-sky-600 px-2 py-0.5 text-[11px] font-semibold text-white transition hover:bg-sky-700 dark:bg-sky-500 dark:hover:bg-sky-400"
+                >
+                  立即安装并重启
+                </button>
+                <button
+                  onClick={() => setUpd({ k: 'idle' })}
+                  className="rounded-md border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-500 transition hover:bg-slate-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                >
+                  稍后
+                </button>
               </div>
             )}
             {upd.k === 'installing' && (
               <div className="mt-1.5 flex items-center gap-1 text-xs font-medium text-sky-600 dark:text-sky-400">
-                <Loader2 size={13} className="animate-spin" /> 正在启动安装程序，应用即将退出…
+                <Loader2 size={13} className="animate-spin" /> 正在安装更新（进度条安装中），完成后应用将自动重启…
               </div>
             )}
             {upd.k === 'error' && (

@@ -293,3 +293,11 @@ export interface UpdateDownloadProgress {
   total: number;
   percent: number;
 }
+
+// 下载完成后的安装包信息（update_download 返回，供「确认安装」使用）
+export interface UpdateDownloaded {
+  file_path: string;
+  asset_name: string;
+  size: number;
+  version: string;
+}
