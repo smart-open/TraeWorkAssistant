@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 把 release 构建产物打包为 portable zip：
-  <ProductName>_<version>_x64_portable.zip
+  Trae Work 助手_<version>_x64_portable.zip
 内容布局（与 Tauri 安装包一致，exe 直接读取同目录 resources/）：
-  <ProductName>.exe
-  resources/python/   (来自 src-python/)
-  resources/ps/      (来自 src-ps/)
+  Trae Work 助手/               ← 顶层目录用产品名（APP 显示名称）
+    trae-work-assistant.exe     ← 主程序名（未配置 mainBinaryName 时用 cargo 包名）
+    resources/python/            (来自 src-python/)
+    resources/ps/                (来自 src-ps/)
 """
 import json
 import os
@@ -17,8 +18,13 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_TAURI = os.path.join(ROOT, "src-tauri")
 CONF = os.path.join(SRC_TAURI, "tauri.conf.json")
-RELEASE_EXE = os.path.join(SRC_TAURI, "target", "release", "trae-work-assistant.exe")
 OUT_DIR = os.path.join(ROOT, "release")
+
+# 主程序候选：优先 mainBinaryName 命名的产物，兼容旧的 cargo 包名产物
+EXE_CANDIDATES = [
+    os.path.join(SRC_TAURI, "target", "release", "trae-work-assistant.exe"),
+    os.path.join(SRC_TAURI, "target", "release", "ai-work-assistant.exe"),
+]
 
 
 def load_conf():
@@ -42,6 +48,7 @@ def main():
     conf = load_conf()
     product = conf["productName"]
     version = conf["version"]
+    binary_name = conf.get("mainBinaryName") or "trae-work-assistant"
     resources = conf["bundle"]["resources"]
     # resources 形如 {"../src-python/": "python/", "../src-ps/": "ps/"}
     abs_res = {}
@@ -49,11 +56,13 @@ def main():
         src_abs = os.path.normpath(os.path.join(SRC_TAURI, src_rel))
         abs_res[src_abs] = dest.strip("/\\")
 
-    if not os.path.isfile(RELEASE_EXE):
-        print("ERROR: release exe 不存在:", RELEASE_EXE, file=sys.stderr)
+    release_exe = next((p for p in EXE_CANDIDATES if os.path.isfile(p)), None)
+    if release_exe is None:
+        print("ERROR: release exe 不存在，已尝试:", EXE_CANDIDATES, file=sys.stderr)
         sys.exit(1)
 
     os.makedirs(OUT_DIR, exist_ok=True)
+    # 产物文件名使用中文产品名（如 Trae Work 助手_2.6.0_x64_portable.zip）
     zip_name = f"{product}_{version}_x64_portable.zip"
     zip_path = os.path.join(OUT_DIR, zip_name)
 
@@ -63,8 +72,8 @@ def main():
     stage_app = os.path.join(tmp_root, product)
     os.makedirs(stage_app, exist_ok=True)
 
-    # 1) exe 重命名为产品名
-    shutil.copy2(RELEASE_EXE, os.path.join(stage_app, product + ".exe"))
+    # 1) 主程序按 mainBinaryName 命名放入产品目录
+    shutil.copy2(release_exe, os.path.join(stage_app, binary_name + ".exe"))
 
     # 2) 资源按 Tauri 布局放入 resources/
     res_dir = os.path.join(stage_app, "resources")

@@ -15,6 +15,14 @@
   - 「关于」页版本号后新增「检查更新」按钮：检查中（转圈）→ 已最新（绿字）/ 发现新版本自动下载（进度条 + 资产名/大小）→ 启动安装程序并退出；失败时展示错误与手动下载回退
 - **开发端口随机化**：新增 `scripts/dev.mjs` 开发入口（`npm run dev`），在 5000-6000 范围随机挑选空闲端口，经 `VITE_PORT` 环境变量 + `.tauri-dev-config.json`（devUrl 覆盖，已 gitignore）联动 `tauri dev`；`npm run dev:vite` 保留 5173 固定端口回退，`beforeDevCommand` 相应调整为 `dev:vite`
 
+### 修复
+
+- **MSI 打包失败**：产品名含中文而 WiX 默认 en-US 代码页（1252）无法编码，`light.exe` 报 LGHT0311 静默失败。`tauri.conf.json` 配置 `bundle.windows.wix.language = "zh-CN"`（代码页 936），MSI 产物名相应为 `*_x64_zh-CN.msi`
+
+### 构建
+
+- 发布流水线：新增 `scripts/rename_release.py`（安装包统一复制到 `release/`）与 `scripts/package_portable.py`（便携 zip：产品目录 + exe + resources/python|ps）；移除旧 `scripts/make_portable_zip.py`（旧机器绝对路径，已被替代）。`npm run tauri build` 后执行两个脚本即得 release/ 三件套：NSIS 安装包 / MSI / 便携 zip
+
 ### 变更文件
 
 | 文件 | 说明 |
@@ -22,8 +30,9 @@
 | `src-tauri/src/commands/updater.rs`（新增）/ `mod.rs` / `main.rs` | 自更新命令实现与注册 |
 | `src/types.ts` / `src/lib/tauri.ts` / `src/components/AboutDialog.tsx` | 更新类型、`api.updater` 绑定与检查更新 UI |
 | `scripts/dev.mjs`（新增）/ `vite.config.ts` / `package.json` / `tauri.conf.json` / `.gitignore` | 动态开发端口方案 |
+| `tauri.conf.json`（wix.language）/ `scripts/rename_release.py` / `scripts/package_portable.py`（新增）/ 移除 `make_portable_zip.py` | MSI 中文代码页修复与 release/ 发布流水线 |
 | `package.json` / `tauri.conf.json` / `Cargo.toml` / `Cargo.lock` / `about.ts` / `accounts.rs` | 版本号 2.5.0 → 2.6.0 同步 |
-| `AGENT.md` / `docs/*.md` / `scripts/make_portable_zip.py` | 文档版本标注与便携包文件名同步 |
+| `AGENT.md` / `docs/*.md` | 文档版本标注同步 |
 
 ---
 

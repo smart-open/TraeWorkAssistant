@@ -43,6 +43,9 @@
       "nsis": {
         "displayLanguageSelector": false,
         "languages": ["SimpChinese"]
+      },
+      "wix": {
+        "language": "zh-CN"
       }
     }
   },
