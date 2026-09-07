@@ -17,7 +17,8 @@ use tauri::Manager;
 
 fn main() {
     // 品牌迁移（老版本 Trae Work Assistant → AI Work 助手）：
-    // 必须在 AppState::new 创建新数据目录之前执行，才能整体重命名旧数据目录
+    // 必须在 AppState::new 创建新数据目录之前执行；迁移为「复制」语义，
+    // 旧数据目录原地保留（老应用可继续使用，两版并存），已迁移过则自动跳过
     let migrate_note = state::migrate_legacy_dirs();
 
     let state = match AppState::new() {
@@ -33,8 +34,8 @@ fn main() {
         eprintln!("{note}");
     }
 
-    // 旧版计划任务迁移（TraeWorkAssistant_DailyCheckin → AIWorkAssistant_DailyCheckin）：
-    // 保留原触发时间，重建为新任务名后删除旧任务；任何一步失败都静默跳过
+    // 旧版计划任务迁移（并存语义）：按旧任务触发时间重建 AIWorkAssistant_DailyCheckin，
+    // 旧任务保留供老应用继续使用；任何一步失败都静默跳过
     if let Some(note) = commands::misc::try_migrate_legacy_task(&state) {
         fs_utils::app_log(&state.data_dir, &note);
     }

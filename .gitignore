@@ -55,3 +55,5 @@ release/
 
 # WorkBuddy 산출물
 overview.md
+# tauri dev 动态端口合并配置（scripts/dev-tauri.mjs 生成）
+tauri.dev.conf.json

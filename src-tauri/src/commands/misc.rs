@@ -592,45 +592,36 @@ fn legacy_task_start_time(name: &str) -> Option<String> {
     if ok { Some(hh_mm.to_string()) } else { None }
 }
 
-/// 旧版计划任务自动迁移（品牌迁移）：
-/// TraeWorkAssistant_DailyCheckin（指向旧 exe/旧数据目录）→ AIWorkAssistant_DailyCheckin。
-/// 保留原触发时间；任何一步失败都不删除旧任务，返回的说明会写入启动日志。
+/// 旧版计划任务自动迁移（品牌迁移，**并存语义**）：
+/// 检测到 TraeWorkAssistant_DailyCheckin（指向旧 exe/旧数据目录）时，
+/// 按其原触发时间重建 AIWorkAssistant_DailyCheckin；**旧任务始终保留**，
+/// 供老应用继续使用（两版并存，各自独立签到）。任何一步失败都静默跳过。
 pub fn try_migrate_legacy_task(state: &AppState) -> Option<String> {
     let legacy = task_exists(LEGACY_TASK_NAME);
     if !legacy {
         return None;
     }
     if task_exists(TASK_NAME) {
-        // 新旧并存（如用户手动注册过新任务）：直接清理旧任务
-        let (ok, _o, _e) =
-            run_schtasks(&["/Delete", "/TN", LEGACY_TASK_NAME, "/F"]).unwrap_or((false, String::new(), String::new()));
-        return Some(if ok {
-            "任务迁移：新旧计划任务并存，已删除旧任务 TraeWorkAssistant_DailyCheckin".to_string()
-        } else {
-            "任务迁移：新旧计划任务并存，旧任务 TraeWorkAssistant_DailyCheckin 删除失败（可手动删除）".to_string()
-        });
+        // 新旧并存（如用户手动注册过新任务）：旧任务属老应用，保留不动
+        return Some(
+            "任务迁移：新旧计划任务并存，各自服务对应应用（旧任务保留给老应用）".to_string(),
+        );
     }
     let time = match legacy_task_start_time(LEGACY_TASK_NAME) {
         Some(t) => t,
         None => {
             return Some(
-                "任务迁移：检测到旧任务 TraeWorkAssistant_DailyCheckin，但未能解析其触发时间，请在设置页重新注册后删除旧任务"
+                "任务迁移：检测到旧任务 TraeWorkAssistant_DailyCheckin，但未能解析其触发时间，请在设置页手动注册新任务"
                     .to_string(),
             )
         }
     };
     match register_daily_task(state, &time) {
-        Ok(()) => {
-            let (ok, _o, _e) =
-                run_schtasks(&["/Delete", "/TN", LEGACY_TASK_NAME, "/F"]).unwrap_or((false, String::new(), String::new()));
-            Some(if ok {
-                format!("任务迁移：计划任务已由 {LEGACY_TASK_NAME} 迁移至 {TASK_NAME}（每日 {time}）")
-            } else {
-                format!("任务迁移：新任务 {TASK_NAME} 已创建（每日 {time}），旧任务删除失败（可手动删除）")
-            })
-        }
+        Ok(()) => Some(format!(
+            "任务迁移：已按旧任务触发时间创建新任务 {TASK_NAME}（每日 {time}）；旧任务保留供老应用继续使用"
+        )),
         Err(e) => Some(format!(
-            "任务迁移：检测到旧任务 {LEGACY_TASK_NAME}，重建新任务失败（{e}），旧任务已保留，请在设置页重新注册"
+            "任务迁移：检测到旧任务 {LEGACY_TASK_NAME}，创建新任务失败（{e}），可在设置页手动注册"
         )),
     }
 }
@@ -668,10 +659,11 @@ pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, St
 
 #[tauri::command]
 pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
-    // 同时清理新旧两个任务名，任一删除成功即视为成功
+    // 只删除本应用的新任务名；旧任务 TraeWorkAssistant_DailyCheckin 属老应用，
+    // 两版并存时不得越权删除（老应用的签到计划需继续工作）
     let mut last_detail = String::new();
     let mut deleted = false;
-    for name in [TASK_NAME, LEGACY_TASK_NAME] {
+    for name in [TASK_NAME] {
         let (ok, _stdout, stderr) = run_schtasks(&["/Delete", "/TN", name, "/F"])?;
         if ok {
             deleted = true;

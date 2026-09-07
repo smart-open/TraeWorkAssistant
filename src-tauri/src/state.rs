@@ -15,50 +15,39 @@ pub const LEGACY_IDENTIFIER: &str = "com.traework.assistant";
 /// 新版 bundle identifier
 pub const IDENTIFIER: &str = "com.aiwork.assistant";
 
-/// 品牌迁移：老版本遗留目录就地重命名到新目录（零拷贝，秒级完成）。
+/// 品牌迁移：老版本遗留目录**复制**到新目录（旧目录原地保留，老应用可继续使用，两版可并存）。
 /// 覆盖两处：
 /// 1. 数据目录 %APPDATA%\TraeWorkAssistant → %APPDATA%\AIWorkAssistant
 /// 2. WebView2 用户数据目录 %LOCALAPPDATA%\com.traework.assistant → com.aiwork.assistant
 ///    （保存 localStorage 等界面偏好）
 ///
-/// 策略：目标目录不存在（或为空）时才重命名；老应用仍在运行导致目录被占用时
-/// 重命名会失败，此时静默跳过（下次启动再试），绝不影响本次启动。
+/// 策略：
+/// - 目标目录已存在且有数据 → 视为「已迁移过」，跳过，绝不再次覆盖老应用数据；
+/// - 否则递归复制旧目录 → 新目录（**复制而非移动**，旧目录保持完整）；
+/// - 任一步失败静默跳过（下次启动重试），绝不影响本次启动。
 /// 返回迁移结果说明（无迁移时为 None），供启动日志记录。
 pub fn migrate_legacy_dirs() -> Option<String> {
     let mut notes: Vec<String> = Vec::new();
 
-    // 1) 数据目录迁移
+    // 1) 数据目录迁移（复制语义）
     if let Ok(appdata) = std::env::var("APPDATA") {
         let legacy = PathBuf::from(&appdata).join(LEGACY_DATA_DIR_NAME);
         let new_dir = PathBuf::from(&appdata).join(DATA_DIR_NAME);
         if legacy.is_dir() {
             if new_dir.is_dir() && dir_is_empty(&new_dir) == Some(false) {
                 notes.push(format!(
-                    "品牌迁移：新数据目录已存在且有数据，跳过迁移（旧目录保留于 {}）",
+                    "品牌迁移：新数据目录已存在且有数据，跳过迁移（老应用数据原地保留于 {}，两版并存）",
                     legacy.display()
                 ));
-            } else if new_dir.is_dir() {
-                let _ = std::fs::remove_dir(&new_dir); // 新目录为空，先移除再整体重命名
-                match std::fs::rename(&legacy, &new_dir) {
-                    Ok(()) => notes.push(format!(
-                        "品牌迁移：数据目录已由 {} 迁移至 {}",
-                        legacy.display(),
-                        new_dir.display()
-                    )),
-                    Err(e) => notes.push(format!(
-                        "品牌迁移：数据目录迁移失败（{e}），本次使用新目录，旧目录保留于 {}",
-                        legacy.display()
-                    )),
-                }
             } else {
-                match std::fs::rename(&legacy, &new_dir) {
-                    Ok(()) => notes.push(format!(
-                        "品牌迁移：数据目录已由 {} 迁移至 {}",
+                match copy_dir_recursive(&legacy, &new_dir) {
+                    Ok(n) => notes.push(format!(
+                        "品牌迁移：数据目录已由 {} 复制迁移至 {}（{n} 个文件；旧目录原地保留，老应用可继续使用）",
                         legacy.display(),
                         new_dir.display()
                     )),
                     Err(e) => notes.push(format!(
-                        "品牌迁移：数据目录迁移失败（{e}），旧目录保留于 {}",
+                        "品牌迁移：数据目录复制迁移失败（{e}），本次使用新目录，旧目录保留于 {}",
                         legacy.display()
                     )),
                 }
@@ -66,21 +55,47 @@ pub fn migrate_legacy_dirs() -> Option<String> {
         }
     }
 
-    // 2) WebView2 用户数据目录迁移（identifier 变更所致；失败不影响启动）
+    // 2) WebView2 用户数据目录迁移（identifier 变更所致；复制语义，失败不影响启动）
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         let legacy = PathBuf::from(&local).join(LEGACY_IDENTIFIER);
         let new_dir = PathBuf::from(&local).join(IDENTIFIER);
-        if legacy.is_dir() && !new_dir.exists() {
-            match std::fs::rename(&legacy, &new_dir) {
-                Ok(()) => notes.push("品牌迁移：WebView2 界面偏好目录已迁移".to_string()),
-                Err(_) => notes.push(
-                    "品牌迁移：WebView2 目录迁移失败（可能旧应用仍在运行），界面偏好将重置".to_string(),
-                ),
+        if legacy.is_dir() && dir_is_empty(&new_dir) != Some(false) {
+            match copy_dir_recursive(&legacy, &new_dir) {
+                Ok(_) => notes.push("品牌迁移：WebView2 界面偏好目录已复制迁移（旧目录保留）".to_string()),
+                Err(e) => notes.push(format!(
+                    "品牌迁移：WebView2 目录复制失败（{e}），界面偏好将重置（旧目录保留）"
+                )),
             }
         }
     }
 
     if notes.is_empty() { None } else { Some(notes.join("；")) }
+}
+
+/// 递归复制目录（复制而非移动：源目录保持完整，老应用可继续使用）。
+/// 目标目录不存在则创建；同名文件直接覆盖（仅在首次迁移时发生）。
+/// 返回复制的文件数。
+fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<usize, String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("创建目录 {} 失败: {e}", dst.display()))?;
+    let mut copied = 0usize;
+    let entries = std::fs::read_dir(src).map_err(|e| format!("读取 {} 失败: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("遍历 {} 失败: {e}", src.display()))?;
+        let sp = entry.path();
+        let dp = dst.join(entry.file_name());
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("读取 {} 类型失败: {e}", sp.display()))?;
+        if ft.is_dir() {
+            copied += copy_dir_recursive(&sp, &dp)?;
+        } else if ft.is_file() {
+            std::fs::copy(&sp, &dp)
+                .map_err(|e| format!("复制 {} 失败: {e}", sp.display()))?;
+            copied += 1;
+        }
+        // 符号链接等特殊类型跳过（Windows 数据目录中基本不存在）
+    }
+    Ok(copied)
 }
 
 /// 目录是否为空：None 表示读取失败

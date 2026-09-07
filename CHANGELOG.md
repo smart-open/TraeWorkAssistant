@@ -13,8 +13,8 @@
 - **品牌统一**：代码注释、界面文案、README、AGENT.md、docs 全部文档由 Trae Work Assistant / trae-work-assistant 统一为 AI Work 助手 / ai-work-assistant。
 - **打包标识**：identifier `com.traework.assistant` → `com.aiwork.assistant`，`mainBinaryName` → `ai-work-assistant`（主程序 ai-work-assistant.exe），Cargo 包名与 package.json 同步；新增 `scripts/rename_release.py` 将安装包统一输出到 `release/`，产物使用中文产品名命名（如 `AI Work 助手_3.0.0_x64-setup.exe` / `AI Work 助手_3.0.0_x64_zh-CN.msi` / `AI Work 助手_3.0.0_x64_portable.zip`）。
 - **老应用升级兼容（NSIS）**：新增 `build-assets/installer-hooks.nsh`，安装时自动结束旧进程、静默卸载旧品牌「Trae Work 助手」并清理残留目录 / 卸载键 / 快捷方式 / 旧命名主程序。判定依据为安装时产品名而非版本号：已发布的 v2.4.4 及更早安装包均为旧品牌，同样被自动清理；仅「AI Work 助手」品牌（v3.0.0 起）走 NSIS 原生原地升级。
-- **老应用数据自动迁移（启动时）**：`state.rs::migrate_legacy_dirs()` 将 `%APPDATA%\TraeWorkAssistant` 就地重命名为 `%APPDATA%\AIWorkAssistant`（零拷贝），并迁移 WebView2 界面偏好目录（identifier 变更所致）；失败不影响启动。
-- **计划任务自动迁移**：`misc.rs::try_migrate_legacy_task()` 启动时将 `TraeWorkAssistant_DailyCheckin` 迁移为 `AIWorkAssistant_DailyCheckin`（保留原触发时间，重建后删除旧任务）；任务查询 / 注册 / 删除均兼容双任务名。
+- **老应用数据自动迁移（启动时，复制语义）**：`state.rs::migrate_legacy_dirs()` 将 `%APPDATA%\TraeWorkAssistant` **递归复制**为 `%APPDATA%\AIWorkAssistant`，并复制 WebView2 界面偏好目录（identifier 变更所致）；**旧目录原地保留，老应用可继续使用，新旧两版可并存**；新目录已有数据则自动跳过（不重复迁移）；失败不影响启动。
+- **计划任务并存迁移**：`misc.rs::try_migrate_legacy_task()` 检测到旧任务时按其原触发时间重建 `AIWorkAssistant_DailyCheckin`，**旧任务保留**供老应用继续使用；「取消注册」只删除新任务名。
 - **环境变量**：`TRAEDATA_DIR` → `AIWORKDATA_DIR`（Python 脚本与 PowerShell 桥接脚本兼容读取旧变量名）。
 - **版本线划分**：新版本自 3.0.0 起维护，**之前所有 2.x 版本升级到 3.x 均需数据迁移**（安装 / 首次启动自动完成）；原「Trae Work 助手」产品通过 `trae_work_main` 分支维护（仅 Trae Work 单应用，2.x.x，仅必要修复）。
 - **界面**：账号管理页「使用帮助」按钮改为与页头描述文字水平对齐，并以圆形色块徽章突出展示（PageHeader 的 leftExtra 移入描述行内，与描述行垂直居中）。
@@ -24,7 +24,7 @@
 ### 说明
 
 - **老 MSI 安装包无法原地升级**：MSI UpgradeCode 随 identifier 变化，老版本 MSI 用户请先卸载后安装新版，或改用 NSIS 安装包（-setup.exe）升级（推荐，自动迁移）。
-- 旧数据目录迁移采用「整体重命名」：迁移后旧目录不再保留；若旧应用仍在运行导致目录被占用，本次跳过迁移、下次启动自动重试。
+- 旧数据目录迁移采用「复制」：迁移后旧目录原地保留（老应用可继续使用，两版并存）；迁移只在首次启动执行一次，之后新目录已有数据即跳过。
 
 ### 审查修正（发布前全量审查）
 
