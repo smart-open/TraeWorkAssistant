@@ -174,14 +174,15 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
     })
 }
 
-/// 下载资产到临时目录并启动静默安装，随后应用自动退出。
+/// 下载更新包到临时目录（仅下载，不安装），返回落盘路径。
+/// 进度经 update-download-progress 事件回推；安装由前端确认后调用 update_run_installer。
 #[tauri::command]
-pub fn update_install(
+pub fn update_download(
     app: AppHandle,
     download_url: String,
     asset_name: String,
     expected_version: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     // 防御：资产名里的版本必须与检查结果一致，且大于当前版本
     let asset_ver = version_from_asset(&asset_name)
         .ok_or_else(|| format!("资产名无法解析版本号: {asset_name}"))?;
@@ -261,15 +262,30 @@ pub fn update_install(
             percent: 100,
         },
     );
+    Ok(dest.to_string_lossy().to_string())
+}
 
-    // 启动 NSIS 静默安装（/S），安装器接管后本进程退出
-    std::process::Command::new(&dest)
-        .arg("/S")
+/// 启动更新安装器并退出应用。
+/// 安装器以被动模式运行（/P：仅显示进度条、不弹任何询问），/UPDATE 覆盖安装不卸载，
+/// /R 安装成功后自动重启应用（见 NSIS 模板 .onInstSuccess）。
+#[tauri::command]
+pub fn update_run_installer(app: AppHandle, path: String) -> Result<(), String> {
+    if !std::path::Path::new(&path).is_file() {
+        return Err(format!("更新包不存在，请重新下载：{path}"));
+    }
+    std::process::Command::new(&path)
+        .args(["/P", "/UPDATE", "/R"])
         .spawn()
-        .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{:?}）", dest))?;
+        .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{path}）"))?;
 
     // 提示前端后退出，让安装器接管
-    let _ = app.emit("update-installing", asset_name.clone());
+    let _ = app.emit(
+        "update-installing",
+        std::path::Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    );
     std::thread::sleep(Duration::from_millis(800));
     std::process::exit(0);
 }

@@ -175,8 +175,9 @@ export const api = {
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),
-    install: (p: { downloadUrl: string; assetName: string; expectedVersion: string }) =>
-      invoke<void>('update_install', p),
+    download: (p: { downloadUrl: string; assetName: string; expectedVersion: string }) =>
+      invoke<string>('update_download', p),
+    runInstaller: (path: string) => invoke<void>('update_run_installer', { path }),
     onDownloadProgress: async (
       cb: (e: UpdateDownloadProgress) => void,
     ): Promise<UnlistenFn> =>

@@ -1,4 +1,4 @@
-# AGENT.md — Trae Work Assistant v2.7.1
+# AGENT.md — Trae Work Assistant v2.7.2
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 

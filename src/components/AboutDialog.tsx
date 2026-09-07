@@ -31,7 +31,9 @@ type UpdateState =
   | { k: 'idle' }
   | { k: 'checking' }
   | { k: 'latest'; currentVersion: string }
+  | { k: 'available'; info: UpdateCheckResult }
   | { k: 'downloading'; info: UpdateCheckResult; percent: number }
+  | { k: 'downloaded'; info: UpdateCheckResult; path: string }
   | { k: 'installing' }
   | { k: 'error'; msg: string };
 
@@ -77,16 +79,23 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
     };
   }, [open]);
 
-  const startInstall = (info: UpdateCheckResult) => {
+  // 第一步：下载更新包（不自动安装，完成后由用户确认）
+  const startDownload = (info: UpdateCheckResult) => {
     setUpd({ k: 'downloading', info, percent: 0 });
-    // 下载在 Rust 侧进行，进度经 update-download-progress 事件回推；完成后自动静默安装并退出应用
     void api.updater
-      .install({
+      .download({
         downloadUrl: info.download_url,
         assetName: info.asset_name,
         expectedVersion: info.latest_version,
       })
+      .then((path) => setUpd({ k: 'downloaded', info, path }))
       .catch((e) => setUpd({ k: 'error', msg: String(e) }));
+  };
+
+  // 第二步：用户确认后启动安装器（被动模式 + 完成后自动重启应用）
+  const confirmInstall = (info: UpdateCheckResult, path: string) => {
+    setUpd({ k: 'installing' });
+    void api.updater.runInstaller(path).catch((e) => setUpd({ k: 'error', msg: String(e) }));
   };
 
   const checkUpdate = async () => {
@@ -95,8 +104,8 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
     try {
       const r = await api.updater.check();
       if (r.has_update) {
-        // 有新版本：自动开始下载安装（需求约定）
-        startInstall(r);
+        // 有新版本：先展示版本信息，由用户决定是否下载
+        setUpd({ k: 'available', info: r });
       } else {
         setUpd({ k: 'latest', currentVersion: r.current_version });
       }
@@ -105,7 +114,10 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
     }
   };
 
-  const busy = upd.k === 'checking' || upd.k === 'downloading' || upd.k === 'installing';
+  const busy =
+    upd.k === 'checking' ||
+    upd.k === 'downloading' ||
+    upd.k === 'installing';
 
   const openUrl = async (url: string) => {
     try {
@@ -141,7 +153,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
                 onClick={() => void checkUpdate()}
                 disabled={busy}
                 className="inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-600 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400 dark:hover:bg-sky-500/20"
-                title="检查更新（发现新版本自动下载安装）"
+                title="检查更新（发现新版本时由用户确认下载与安装）"
               >
                 {busy ? (
                   <Loader2 size={12} className="animate-spin" />
