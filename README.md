@@ -1,19 +1,29 @@
-# Trae Work Assistant
+<div align="center">
 
-Windows 桌面端多账号签到与管理工具 · Tauri 2 + React 18 + Rust
+<img src="build-assets/app-icon.png" alt="AI Work 助手" width="128" />
 
-> ⚠️ 本工具与 Trae Work 官方无任何关联，仅供学习研究。使用本工具可能违反 Trae Work 服务条款，风险自担。请仅管理本人合法持有的账号。
+# AI Work 助手（AI Work Assistant）
+
+Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 18 + Rust
+
+**GitHub**：[github.com/smart-open](https://github.com/smart-open) · **个人博客**：[blog.sopenai.cn](https://blog.sopenai.cn/)
+
+</div>
+
+> 当前深度支持 **Trae Work**（多账号签到、登录态切换、积分看板、OpenAI 兼容 API 网关）；后续规划扩展 **WorkBuddy / CodeBuddy / 豆包** 等更多 AI 应用的账号管理与自动化能力。
+>
+> ⚠️ 本工具与 Trae Work / WorkBuddy / 豆包等官方均无任何关联，仅供学习研究。使用本工具可能违反相关服务条款，风险自担。请仅管理本人合法持有的账号。
 
 ## 免责声明
 
 > 本工具仅供学习研究和个人使用，使用者需自行承担一切风险与后果。
 
-1. **非官方申明**：本工具与 Trae / TRAE Work 官方**无任何隶属、合作或关联关系**，系个人开源项目，不代表官方立场。
+1. **非官方申明**：本工具与 Trae / TRAE Work 等相关产品官方**无任何隶属、合作或关联关系**，系个人开源项目，不代表官方立场。
 2. **使用风险**：使用本工具可能违反 Trae Work 的服务条款；由此产生的任何后果（包括但不限于账号封禁、积分清零/扣除、功能限制、数据异常等）均由使用者自行承担。
 3. **责任范围**：本工具不对因使用（或无法使用）本工具所导致的任何直接、间接、附带或后果性损失负责。
 4. **合规义务**：使用前请务必仔细阅读 Trae Work 的服务条款，并自行判断是否使用；请确保仅用于管理本人合法持有的账号，遵守所在地法律法规。
 5. **作者免责**：本工具作者对任何因使用、误用或滥用本工具而引发的纠纷、争议或问题不承担任何责任。
-6. **侵权处理**：若您是 Trae Work 官方且认为本工具侵犯了您的合法权益，请通过项目渠道联系作者，我们将在核实后及时下架处理。
+6. **侵权处理**：若您是相关官方且认为本工具侵犯了您的合法权益，请通过项目渠道联系作者，我们将在核实后及时下架处理。
 
 **使用本工具即表示你已阅读、理解并同意上述全部免责声明。**
 
@@ -69,6 +79,15 @@ npm run tauri build    # 打包（msi + nsis）
 - [API 文档](docs/api-doc.md) — Tauri 前后端命令契约
 - [技术框架](docs/tech-framework.md) — 架构设计与数据模型
 - [运行手册](docs/operation-manual.md) — 开发环境与部署指南
+
+## 赞赏
+
+如果这个项目对你有帮助，欢迎请作者喝杯快乐水 ☕
+
+<div align="center">
+<img src="src/assets/donate-qr.jpg" alt="赞赏码" width="220" />
+<p><sub>“打赏一杯快乐水，代码更新不摆烂”</sub></p>
+</div>
 
 ## License
 
