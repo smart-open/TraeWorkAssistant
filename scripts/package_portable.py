@@ -53,7 +53,7 @@ def main():
     else:
         import re as _re
         with open(os.path.join(SRC_TAURI, "Cargo.toml"), "r", encoding="utf-8") as f:
-            m = _re.search(r'^version\s*=\s*"(\d+\.\d+\.\d+)"', f.read(), re.M)
+            m = _re.search(r'^version\s*=\s*"(\d+\.\d+\.\d+)"', f.read(), _re.M)
         if not m:
             sys.exit("ERROR: 无法从 Cargo.toml 读取版本号")
         version = m.group(1)
