@@ -1,6 +1,18 @@
+import { useEffect, useState } from 'react';
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
-import { Github, Globe, Heart } from 'lucide-react';
+import {
+  AlertCircle,
+  CheckCircle2,
+  Download,
+  Github,
+  Globe,
+  Heart,
+  Loader2,
+  RefreshCw,
+} from 'lucide-react';
 import { Modal } from './ui';
+import { api } from '../lib/tauri';
+import type { UpdateCheckResult, UpdateDownloadProgress } from '../types';
 import {
   APP_NAME,
   APP_VERSION,
@@ -15,7 +27,86 @@ import {
   donateQr,
 } from '../lib/about';
 
+type UpdateState =
+  | { k: 'idle' }
+  | { k: 'checking' }
+  | { k: 'latest'; currentVersion: string }
+  | { k: 'downloading'; info: UpdateCheckResult; percent: number }
+  | { k: 'installing' }
+  | { k: 'error'; msg: string };
+
+function fmtSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${bytes} B`;
+}
+
 export default function AboutDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [upd, setUpd] = useState<UpdateState>({ k: 'idle' });
+
+  // 重置状态 & 订阅下载进度（关闭对话框即取消 UI 订阅；下载在 Rust 侧继续不受影响）
+  useEffect(() => {
+    if (!open) {
+      setUpd({ k: 'idle' });
+      return;
+    }
+    let un1: (() => void) | undefined;
+    let un2: (() => void) | undefined;
+    let alive = true;
+    void (async () => {
+      const u1 = await api.updater.onDownloadProgress((p: UpdateDownloadProgress) => {
+        setUpd((s) =>
+          s.k === 'downloading' ? { ...s, percent: p.percent } : s,
+        );
+      });
+      const u2 = await api.updater.onInstalling(() => {
+        if (alive) setUpd({ k: 'installing' });
+      });
+      if (alive) {
+        un1 = u1;
+        un2 = u2;
+      } else {
+        u1();
+        u2();
+      }
+    })();
+    return () => {
+      alive = false;
+      un1?.();
+      un2?.();
+    };
+  }, [open]);
+
+  const startInstall = (info: UpdateCheckResult) => {
+    setUpd({ k: 'downloading', info, percent: 0 });
+    // 下载在 Rust 侧进行，进度经 update-download-progress 事件回推；完成后自动静默安装并退出应用
+    void api.updater
+      .install({
+        downloadUrl: info.download_url,
+        assetName: info.asset_name,
+        version: info.latest_version,
+      })
+      .catch((e) => setUpd({ k: 'error', msg: String(e) }));
+  };
+
+  const checkUpdate = async () => {
+    if (upd.k === 'checking' || upd.k === 'downloading' || upd.k === 'installing') return;
+    setUpd({ k: 'checking' });
+    try {
+      const r = await api.updater.check();
+      if (r.has_update) {
+        // 有新版本：自动开始下载安装（需求约定）
+        startInstall(r);
+      } else {
+        setUpd({ k: 'latest', currentVersion: r.current_version });
+      }
+    } catch (e) {
+      setUpd({ k: 'error', msg: String(e) });
+    }
+  };
+
+  const busy = upd.k === 'checking' || upd.k === 'downloading' || upd.k === 'installing';
+
   const openUrl = async (url: string) => {
     try {
       await shellOpen(url);
@@ -40,10 +131,63 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
             </svg>
           </span>
           <div>
-            <div className="text-base font-bold text-slate-800 dark:text-zinc-100">
-              {APP_NAME} <span className="ml-1 rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-semibold text-slate-500 dark:bg-zinc-800 dark:text-zinc-400">v{APP_VERSION}</span>
+            <div className="flex flex-wrap items-center gap-1.5 text-base font-bold text-slate-800 dark:text-zinc-100">
+              {APP_NAME}
+              <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-semibold text-slate-500 dark:bg-zinc-800 dark:text-zinc-400">
+                v{APP_VERSION}
+              </span>
+              {/* 检查更新：分析 GitHub Releases，发现比当前更大的版本自动下载并静默安装 */}
+              <button
+                onClick={() => void checkUpdate()}
+                disabled={busy}
+                className="inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-600 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400 dark:hover:bg-sky-500/20"
+                title="检查更新（发现新版本自动下载安装）"
+              >
+                {busy ? (
+                  <Loader2 size={12} className="animate-spin" />
+                ) : (
+                  <RefreshCw size={12} />
+                )}
+                检查更新
+              </button>
             </div>
-            <div className="text-xs text-slate-500 dark:text-zinc-400">{APP_TAGLINE}</div>
+            <div className="mt-0.5 text-xs text-slate-500 dark:text-zinc-400">{APP_TAGLINE}</div>
+            {/* 更新状态行 */}
+            {upd.k === 'latest' && (
+              <div className="mt-1.5 flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 size={13} /> 当前已是最新版本（v{upd.currentVersion}）
+              </div>
+            )}
+            {upd.k === 'downloading' && (
+              <div className="mt-1.5 w-64">
+                <div className="mb-1 flex items-center justify-between text-xs font-medium text-sky-600 dark:text-sky-400">
+                  <span className="inline-flex items-center gap-1">
+                    <Download size={13} /> 发现新版本 v{upd.info.latest_version}，正在下载…
+                  </span>
+                  <span>{upd.percent}%</span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-zinc-700">
+                  <div
+                    className="h-full rounded-full bg-sky-500 transition-all"
+                    style={{ width: `${upd.percent}%` }}
+                  />
+                </div>
+                <div className="mt-0.5 truncate text-[11px] text-slate-400 dark:text-zinc-500">
+                  {upd.info.asset_name} · {fmtSize(upd.info.size)} · 完成后自动安装
+                </div>
+              </div>
+            )}
+            {upd.k === 'installing' && (
+              <div className="mt-1.5 flex items-center gap-1 text-xs font-medium text-sky-600 dark:text-sky-400">
+                <Loader2 size={13} className="animate-spin" /> 正在启动安装程序，应用即将退出…
+              </div>
+            )}
+            {upd.k === 'error' && (
+              <div className="mt-1.5 flex max-w-sm items-start gap-1 text-xs text-rose-600 dark:text-rose-400">
+                <AlertCircle size={13} className="mt-0.5 shrink-0" />
+                <span className="whitespace-pre-wrap leading-relaxed">{upd.msg}</span>
+              </div>
+            )}
           </div>
         </div>
 

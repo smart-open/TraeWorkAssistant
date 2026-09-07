@@ -88,6 +88,8 @@ fn main() {
             commands::api_server::pool_status,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
+            commands::updater::update_check,
+            commands::updater::update_install,
             commands::api_server::api_logs_search,
             commands::api_server::api_debug_toggle,
             commands::api_server::api_debug_status,

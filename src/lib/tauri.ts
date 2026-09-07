@@ -23,6 +23,8 @@ import type {
   ProxyLogListResult,
   ProxyStatus,
   Settings,
+  UpdateCheckResult,
+  UpdateDownloadProgress,
 } from '../types';
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
@@ -170,6 +172,19 @@ export const api = {
   },
   traeLocal: {
     entitlement: () => invoke<AppEntitlement | null>('apps_entitlement_read'),
+  },
+  updater: {
+    check: () => invoke<UpdateCheckResult>('update_check'),
+    install: (p: { downloadUrl: string; assetName: string; version: string }) =>
+      invoke<void>('update_install', p),
+    onDownloadProgress: async (
+      cb: (e: UpdateDownloadProgress) => void,
+    ): Promise<UnlistenFn> =>
+      listen<UpdateDownloadProgress>('update-download-progress', (ev) =>
+        cb(ev.payload),
+      ),
+    onInstalling: async (cb: (assetName: string) => void): Promise<UnlistenFn> =>
+      listen<string>('update-installing', (ev) => cb(ev.payload)),
   },
 };
 

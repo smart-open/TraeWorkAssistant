@@ -265,3 +265,24 @@ export interface OAuthLoginResult {
   refresh_token: string;
   has_refresh_token: boolean;
 }
+
+// ---- 应用自更新 ----
+
+export interface UpdateCheckResult {
+  has_update: boolean;
+  current_version: string;
+  latest_version: string;
+  /** 资产文件名，如 "Trae Work 助手_2.5.1_x64-setup.exe" */
+  asset_name: string;
+  /** 资产下载直链（browser_download_url） */
+  download_url: string;
+  /** 资产字节数 */
+  size: number;
+  release_page: string;
+}
+
+export interface UpdateDownloadProgress {
+  received: number;
+  total: number;
+  percent: number;
+}
