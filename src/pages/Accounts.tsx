@@ -1,4 +1,5 @@
-﻿import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Plus,
   Trash2,
@@ -23,13 +24,15 @@ import {
   ExternalLink,
   ArrowRight,
   Save,
+  ScanSearch,
+  Crown,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
-import { save } from '@tauri-apps/plugin-dialog';
+import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
-import type { AccountView, GroupView, JwtParseResult, ProfileInfo } from '../types';
+import type { AccountView, CreditDetail, DiscoveredAccount, GroupView, JwtParseResult, ProfileInfo } from '../types';
 
 const PRESET_COLORS = [
   '#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#0ea5e9', '#a855f7', '#14b8a6',
@@ -79,11 +82,156 @@ function CreditsExpireBadge({ expireAt }: { expireAt: number | null }) {
   const days = Math.floor(secs / 86400);
   const hours = Math.floor((secs % 86400) / 3600);
   const isUrgent = secs < 86400; // < 24h
-  const text = days > 0 ? `${days}d${hours}h` : `${hours}h`;
+  // 最近一条仍有剩余的积分包到期，展示距离现在的剩余时间
+  const text = days > 0 ? `${days} 天后过期` : `${hours} 小时后过期`;
+  const expireTime = new Date(expireAt * 1000).toLocaleString('zh-CN');
   return (
-    <span className={`text-xs ${isUrgent ? 'text-amber-500 font-semibold' : 'text-slate-500'}`}>
+    <span
+      className={`cursor-help text-xs ${isUrgent ? 'text-amber-500 font-semibold' : 'text-slate-500'}`}
+      title={`最近到期积分包：${expireTime}`}
+    >
       {text}
     </span>
+  );
+}
+
+const fmtCredits = (v: number) =>
+  v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+
+/** 套餐身份徽标（Free / Lite / Pro ...，悬停展示说明） */
+function PayIdentityBadge({
+  identity,
+  expire,
+  nextBilling,
+}: {
+  identity: string | null | undefined;
+  expire?: number | null;
+  nextBilling?: number | null;
+}) {
+  if (!identity) return null;
+  const paid = identity.toLowerCase() !== 'free';
+  const fmtDay = (ts: number) =>
+    new Date(ts * 1000).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+  const expTip = expire
+    ? `套餐到期：${new Date(expire * 1000).toLocaleDateString('zh-CN')}`
+    : '';
+  const billTip = nextBilling
+    ? `${expTip ? '\n' : ''}下次自动续费：${new Date(nextBilling * 1000).toLocaleDateString('zh-CN')}`
+    : '';
+  return (
+    <span
+      title={expTip || billTip ? `当前订阅套餐：${identity}\n${expTip}${billTip}` : `当前订阅套餐：${identity}`}
+      className={`inline-flex cursor-help items-center gap-0.5 rounded-full px-1.5 py-px text-[10px] font-semibold ${
+        paid
+          ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400'
+          : 'bg-slate-100 text-slate-500 dark:bg-zinc-800 dark:text-zinc-400'
+      }`}
+    >
+      <Crown size={9} /> {identity}
+      {expire ? <span className="font-normal opacity-80">· {fmtDay(expire)}到期</span> : null}
+    </span>
+  );
+}
+
+/** 可用积分单元格：鼠标悬停展示积分明细（仅剩余 > 0 且未过期的积分包，按到期时间升序） */
+function CreditCell({ account }: { account: AccountView }) {
+  const [detail, setDetail] = useState<CreditDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const fetchedRef = useRef(false);
+
+  const loadDetail = () => {
+    if (fetchedRef.current) return;
+    fetchedRef.current = true;
+    setLoading(true);
+    api.accounts
+      .creditDetail(account.user_id)
+      .then(setDetail)
+      .catch(() => setDetail(null))
+      .finally(() => setLoading(false));
+  };
+
+  const enter = (e: React.MouseEvent<HTMLElement>) => {
+    if (account.remaining_credits == null) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    // 卡片约 300x340，靠屏幕边缘时向内收
+    const top = Math.min(r.bottom, window.innerHeight - 360);
+    const left = Math.min(r.right - 300, window.innerWidth - 320);
+    setPos({ top: Math.max(8, top), left: Math.max(8, left) });
+    loadDetail();
+  };
+
+  const value = account.remaining_credits;
+  return (
+    <>
+      <div
+        className="cursor-help tabular-nums"
+        onMouseEnter={enter}
+        onMouseLeave={() => setPos(null)}
+        title="悬停查看积分明细"
+      >
+        {value != null ? value.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) : '-'}
+      </div>
+      {pos &&
+        createPortal(
+          <div
+            className="fixed z-50 w-[300px] rounded-lg border border-slate-200 bg-white p-3 text-slate-700 shadow-xl dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+            style={{ top: pos.top, left: pos.left }}
+            onMouseEnter={() => setPos(pos)}
+            onMouseLeave={() => setPos(null)}
+          >
+            <div className="mb-2 flex items-center justify-between text-xs">
+              <span className="font-semibold">{account.name} 积分明细</span>
+              {loading && <span className="text-slate-400">加载中…</span>}
+            </div>
+            {!loading && detail && detail.packs.length === 0 && (
+              <div className="py-2 text-xs text-slate-400">暂无可用积分包</div>
+            )}
+            {detail && (
+              <>
+                <div className="mb-2 grid grid-cols-2 gap-1.5 text-xs">
+                  <div className="rounded bg-slate-50 px-2 py-1 dark:bg-zinc-900">
+                    <span className="text-slate-400">通用积分</span>
+                    <div className="font-semibold tabular-nums">{fmtCredits(detail.general)}</div>
+                  </div>
+                  <div className="rounded bg-slate-50 px-2 py-1 dark:bg-zinc-900">
+                    <span className="text-slate-400">Work 积分</span>
+                    <div className="font-semibold tabular-nums">{fmtCredits(detail.work)}</div>
+                  </div>
+                </div>
+                {detail.packs.length > 0 && (
+                  <div className="max-h-44 space-y-1 overflow-auto">
+                    {detail.packs.map((p, i) => {
+                      const days = Math.max(0, Math.floor((p.expire_time - Date.now() / 1000) / 86400));
+                      const hours = Math.max(0, Math.floor(((p.expire_time - Date.now() / 1000) % 86400) / 3600));
+                      return (
+                        <div key={i} className="flex items-center justify-between gap-2 text-xs">
+                          <div className="flex min-w-0 items-center gap-1.5">
+                            <Badge tone={p.kind === 'Work' ? 'violet' : 'blue'}>
+                              {p.kind === 'Work' ? 'Work' : '通用'}
+                            </Badge>
+                            <span className="truncate text-slate-500">{p.source}</span>
+                          </div>
+                          <div className="shrink-0 text-right tabular-nums">
+                            <span className="font-medium">{fmtCredits(p.remaining)}</span>
+                            <span className="ml-1 text-slate-400">
+                              {days > 0 ? `${days}天后过期` : `${hours}小时后过期`}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+            {!loading && !detail && (
+              <div className="py-2 text-xs text-slate-400">明细加载失败</div>
+            )}
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }
 
@@ -126,6 +274,48 @@ export default function Accounts() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [oauthOpen, setOAuthOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  // 本机扫描：扫描 Trae Work storage.json 的登录账号
+  const [scanOpen, setScanOpen] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [discovered, setDiscovered] = useState<DiscoveredAccount[] | null>(null);
+
+  const runDiscover = async () => {
+    setScanOpen(true);
+    setScanning(true);
+    try {
+      const list = await api.accounts.discover();
+      setDiscovered(list);
+    } catch (err) {
+      setDiscovered([]);
+      toast('error', `扫描本机账号失败：${String(err)}`);
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const addDiscovered = async (d: DiscoveredAccount) => {
+    try {
+      await api.accounts.addDiscovered(d.user_id, '');
+      toast('success', `账号 ${d.user_id} 已加入账号池`);
+      const list = await api.accounts.discover();
+      setDiscovered(list);
+      void refreshAccounts();
+    } catch (err) {
+      toast('error', `加入失败：${String(err)}`);
+    }
+  };
+
+  /** 刷新账号 + 套餐身份（先拉套餐缓存，再重建账号视图） */
+  const refreshAccountsAndPay = async () => {
+    try {
+      await api.accounts.refreshPayStatus();
+    } catch {
+      /* 套餐刷新失败不阻断账号刷新 */
+    }
+    void refreshAccounts();
+    void refreshGroups();
+    void refreshRemainingCredits();
+  };
 
   const filtered = useMemo(() => {
     if (filter === 'all') return accounts;
@@ -173,6 +363,30 @@ export default function Accounts() {
     }
   };
 
+  const importAccounts = async () => {
+    try {
+      const filePath = await open({
+        multiple: false,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!filePath || typeof filePath !== 'string') return;
+      const content = await api.misc.readTextFile(filePath);
+      const report = await api.accounts.importAccounts(content);
+      if (report.added === 0 && report.skipped > 0) {
+        toast('warn', `未新增账号：${report.skipped} 个均已存在${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}`);
+      } else {
+        toast(
+          'success',
+          `导入完成：新增 ${report.added} 个账号，跳过 ${report.skipped} 个重复${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}`,
+        );
+      }
+      void refreshAccounts();
+      void refreshGroups();
+    } catch (err) {
+      toast('error', `导入失败：${String(err)}`);
+    }
+  };
+
   return (
     <div className="animate-fade-in">
       <PageHeader
@@ -180,26 +394,32 @@ export default function Accounts() {
         desc="维护账号、调整分组、重置设备 ID 与登录态切换"
         actions={
           <>
+            <button onClick={() => void refreshAccountsAndPay()} className="btn-outline" title="刷新账号列表、套餐与积分数据">
+              <RefreshCw size={15} /> 刷新数据
+            </button>
+            <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae Work 已登录账号，一键加入账号池">
+              <ScanSearch size={15} /> 扫描本机
+            </button>
+            <button onClick={() => setOAuthOpen(true)} className="btn-outline" title="通过 OAuth 授权登录添加账号">
+              <Globe size={15} /> OAuth 登录
+            </button>
+            <button onClick={() => setAddOpen(true)} className="btn-outline" title="手动粘贴 JWT 添加账号">
+              <Plus size={15} /> 添加账号
+            </button>
             <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
-              <Download size={15} /> 导出
+              <Download size={15} /> 导出账户
+            </button>
+            <button onClick={() => void importAccounts()} className="btn-outline" title="从导出的 JSON 文件导入账号（自动去重）">
+              <Upload size={15} /> 导入账号
+            </button>
+            <button onClick={() => setGroupOpen(true)} className="btn-outline" title="管理账号分组">
+              分组管理
+            </button>
+            <button onClick={() => { void refreshProfiles(); setProfileOpen(true); }} className="btn-outline" title="查看/备份/恢复登录态快照">
+              <Camera size={15} /> 快照管理
             </button>
             <button onClick={() => setHelpOpen(true)} className="btn-outline" title="使用帮助">
               <HelpCircle size={15} /> 帮助
-            </button>
-            <button onClick={() => { void refreshAccounts(); void refreshGroups(); void refreshRemainingCredits(); }} className="btn-outline">
-              <RefreshCw size={15} /> 刷新
-            </button>
-            <button onClick={() => setGroupOpen(true)} className="btn-outline">
-              分组管理
-            </button>
-            <button onClick={() => { void refreshProfiles(); setProfileOpen(true); }} className="btn-outline">
-              <Camera size={15} /> 快照管理
-            </button>
-            <button onClick={() => setOAuthOpen(true)} className="btn-outline">
-              <Globe size={15} /> OAuth 登录
-            </button>
-            <button onClick={() => setAddOpen(true)} className="btn-primary">
-              <Plus size={15} /> 添加账号
             </button>
           </>
         }
@@ -250,7 +470,7 @@ export default function Accounts() {
                 <th className="px-4 py-2 text-left">设备 ID</th>
                 <th className="px-4 py-2 text-left">今日</th>
                 <th className="px-4 py-2 text-left">冷却</th>
-                <th className="px-4 py-2 text-right">剩余积分</th>
+                <th className="px-4 py-2 text-right">可用积分</th>
                 <th className="px-4 py-2 text-left">积分过期</th>
                 <th className="px-4 py-2 text-right">今日新增积分</th>
                 <th className="px-4 py-2 text-right">操作</th>
@@ -261,7 +481,14 @@ export default function Accounts() {
                 return (
                   <tr key={a.user_id} className="border-t border-slate-200 dark:border-zinc-800">
                     <td className="px-4 py-3">
-                      <div className="font-medium">{a.name}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-medium">{a.name}</span>
+                        <PayIdentityBadge
+                          identity={a.pay_identity}
+                          expire={a.membership_expire}
+                          nextBilling={a.membership_next_billing}
+                        />
+                      </div>
                       <div className="text-xs text-slate-400">{a.user_id}</div>
                     </td>
                     <td className="px-4 py-3">
@@ -303,10 +530,8 @@ export default function Accounts() {
                         <span className="text-xs text-slate-300">-</span>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-right tabular-nums">
-                      {a.remaining_credits != null
-                        ? a.remaining_credits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
-                        : '-'}
+                    <td className="px-4 py-3 text-right">
+                      <CreditCell account={a} />
                     </td>
                     <td className="px-4 py-3">
                       <CreditsExpireBadge expireAt={a.credits_expire_at} />
@@ -453,6 +678,14 @@ export default function Accounts() {
         }}
       />
       <HelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
+      <ScanModal
+        open={scanOpen}
+        scanning={scanning}
+        discovered={discovered}
+        onClose={() => setScanOpen(false)}
+        onAdd={addDiscovered}
+        onRescan={() => void runDiscover()}
+      />
     </div>
   );
 }
@@ -479,6 +712,79 @@ function GroupSelect({
         </option>
       ))}
     </select>
+  );
+}
+
+/** 扫描本机账号结果弹窗（当前仅支持 Trae Work 单应用） */
+function ScanModal({
+  open,
+  scanning,
+  discovered,
+  onClose,
+  onAdd,
+  onRescan,
+}: {
+  open: boolean;
+  scanning: boolean;
+  discovered: DiscoveredAccount[] | null;
+  onClose: () => void;
+  onAdd: (d: DiscoveredAccount) => Promise<void>;
+  onRescan: () => void;
+}) {
+  return (
+    <Modal open={open} onClose={onClose} title="扫描本机账号">
+      <div className="space-y-3">
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
+          扫描本机 Trae Work 的 storage.json 登录痕迹。当前版本仅支持 Trae Work，暂不支持其他应用。
+        </div>
+        {scanning ? (
+          <div className="py-6 text-center text-sm text-slate-400">扫描中…</div>
+        ) : !discovered || discovered.length === 0 ? (
+          <div className="py-6 text-center text-sm text-slate-400">
+            未发现本机登录账号（可能未登录或未安装 Trae Work）
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {discovered.map((d) => (
+              <div
+                key={d.user_id}
+                className="flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-2 dark:border-zinc-700"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <span className="font-mono">{d.user_id}</span>
+                    <Badge tone="slate">{d.app_label}</Badge>
+                    {d.in_pool && <Badge tone="green">已在账号池</Badge>}
+                    {!d.uid_confident && !d.in_pool && (
+                      <Badge tone="amber">uid 待确认</Badge>
+                    )}
+                  </div>
+                  <div className="truncate text-xs text-slate-400" title={d.storage_path}>
+                    {d.storage_path || '未找到 storage.json'}
+                  </div>
+                </div>
+                {!d.in_pool && (
+                  <button
+                    className="btn-primary shrink-0 !px-3 !py-1 text-xs"
+                    disabled={!d.uid_confident}
+                    title={d.uid_confident ? '加入账号池（待代理捕获 JWT 后自动回填）' : '本机存在多个候选账号，无法确认唯一 uid，暂不可入池'}
+                    onClick={() => void onAdd(d)}
+                  >
+                    <Plus size={13} /> 入池
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex justify-between">
+          <button onClick={onRescan} className="btn-ghost text-xs" disabled={scanning}>
+            <RefreshCw size={13} className={scanning ? 'animate-spin' : ''} /> 重新扫描
+          </button>
+          <button onClick={onClose} className="btn-ghost text-xs">关闭</button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

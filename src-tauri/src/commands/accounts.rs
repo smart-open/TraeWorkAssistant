@@ -6,6 +6,7 @@ use crate::jwt;
 use crate::models::{
     AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, Group, RawAccount,
     CreditsFile, CreditsDailyFile, CreditsDailySnapshot, CheckinSummary, RemainingCreditsFile, AccountCooldownsFile,
+    CreditDetail, CreditPackDetail,
 };
 
 use crate::state::AppState;
@@ -142,6 +143,164 @@ pub fn account_add_manual(
         fs_utils::write_json(&state.path("groups.json"), &groups)?;
     }
     Ok(())
+}
+
+/// 导入报告
+#[derive(serde::Serialize)]
+pub struct ImportReport {
+    /// 文件中的账号总数
+    pub total: usize,
+    /// 实际新增数量
+    pub added: usize,
+    /// 跳过（重复）数量
+    pub skipped: usize,
+    /// 跳过的账号标识（uid 或名称）
+    pub skipped_names: Vec<String>,
+    /// 新增分组数量
+    pub groups_added: usize,
+}
+
+/// 从字段取第一个非空字符串值（兼容导出格式与原始格式两套键名）
+fn pick_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| v.get(*k))
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 导入账号：兼容三种格式 ——
+/// 1. 本应用导出格式 `{accounts:[{userId, cloudIdeJwt, refreshToken, groupId,...}], groups:[...]}`
+/// 2. 原始账号池格式 `{accounts:[{name, UserID, jwt, refresh_token?}]}`
+/// 3. 裸数组 `[{...}]`
+/// 按 uid（user_id 字段或 JWT 解析）去重；分组按 id 合并，不存在则新增。
+#[tauri::command]
+pub fn accounts_import(state: State<AppState>, content: String) -> Result<ImportReport, String> {
+    let root: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("JSON 解析失败: {e}"))?;
+    let empty = Vec::new();
+    let accounts_arr = match &root {
+        serde_json::Value::Array(arr) => arr,
+        serde_json::Value::Object(obj) => obj
+            .get("accounts")
+            .and_then(|v| v.as_array())
+            .ok_or("缺少 accounts 数组：请使用本应用导出的 JSON 文件")?,
+        _ => return Err("无法识别的导入格式：需要对象或数组".into()),
+    };
+    let groups_arr = root
+        .get("groups")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+
+    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+
+    // 已有 uid 集合（user_id 字段 + JWT 解析），与自动发现共用同一去重口径
+    let mut known: std::collections::HashSet<String> = accounts
+        .accounts
+        .iter()
+        .flat_map(|a| {
+            let mut ids = Vec::new();
+            if let Some(uid) = a.user_id.clone().filter(|s| !s.is_empty()) {
+                ids.push(uid);
+            }
+            if !a.jwt.trim().is_empty() {
+                if let Some(uid) = jwt::parse(&a.jwt).user_id {
+                    ids.push(uid);
+                }
+            }
+            ids
+        })
+        .collect();
+
+    // 合并分组：按 id 去重，缺失即新增
+    let mut groups_added = 0usize;
+    let existing_group_ids: std::collections::HashSet<String> =
+        groups.groups.iter().map(|g| g.id.clone()).collect();
+    for g in groups_arr {
+        let Some(id) = pick_str(g, &["id"]).or_else(|| pick_str(g, &["Id"])) else {
+            continue;
+        };
+        if existing_group_ids.contains(&id) {
+            continue;
+        }
+        groups.groups.push(Group {
+            id: id.clone(),
+            name: pick_str(g, &["name"]).unwrap_or_else(|| format!("分组 {}", &id[..4.min(id.len())])),
+            color: pick_str(g, &["color"]).unwrap_or_else(|| "#6366f1".into()),
+            order: g.get("order").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        });
+        groups_added += 1;
+    }
+    let group_ids: std::collections::HashSet<String> =
+        groups.groups.iter().map(|g| g.id.clone()).collect();
+
+    let mut report = ImportReport {
+        total: accounts_arr.len(),
+        added: 0,
+        skipped: 0,
+        skipped_names: Vec::new(),
+        groups_added,
+    };
+
+    for entry in accounts_arr {
+        // 兼容导出格式(userId/cloudIdeJwt)与原始格式(UserID/jwt)
+        let user_id = pick_str(entry, &["userId", "UserID", "user_id", "uid"]);
+        let jwt = pick_str(entry, &["cloudIdeJwt", "jwt"]).unwrap_or_default();
+        // 无 user_id 字段时尝试从 JWT 解析
+        let uid = match user_id {
+            Some(u) => Some(u),
+            None if !jwt.trim().is_empty() => jwt::parse(&jwt).user_id,
+            _ => None,
+        };
+        let Some(uid) = uid else {
+            report.skipped += 1;
+            report
+                .skipped_names
+                .push(pick_str(entry, &["name"]).unwrap_or_else(|| "(无 ID)".into()));
+            continue;
+        };
+        if known.contains(&uid) {
+            report.skipped += 1;
+            report
+                .skipped_names
+                .push(pick_str(entry, &["name"]).unwrap_or_else(|| uid.clone()));
+            continue;
+        }
+        known.insert(uid.clone());
+
+        let name = pick_str(entry, &["name"]).unwrap_or_else(|| {
+            let tail = &uid[uid.len().saturating_sub(4)..];
+            format!("导入-…{tail}")
+        });
+        // 分组映射：仅当目标分组存在（原有或本次导入）才记录
+        let group_id = pick_str(entry, &["groupId", "group_id"]).filter(|gid| group_ids.contains(gid));
+        if let Some(gid) = &group_id {
+            groups.membership.insert(uid.clone(), gid.clone());
+        }
+        accounts.accounts.push(RawAccount {
+            name,
+            user_id: Some(uid),
+            jwt,
+            refresh_token: pick_str(entry, &["refreshToken", "refresh_token"]),
+            added_at: Some(fs_utils::now_iso()),
+            updated_at: Some(fs_utils::now_iso()),
+        });
+        report.added += 1;
+    }
+
+    if report.added > 0 || report.groups_added > 0 {
+        fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+        fs_utils::write_json(&state.path("groups.json"), &groups)?;
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "导入账号: 新增 {} 跳过 {} 新增分组 {}",
+                report.added, report.skipped, report.groups_added
+            ),
+        );
+    }
+    Ok(report)
 }
 
 #[tauri::command]
@@ -307,14 +466,37 @@ pub fn group_move(
     Ok(())
 }
 
-// ---------------- 剩余积分 ----------------
+// ---------------- 可用积分 ----------------
 
-/// 调用 TRAE API 计算剩余积分
-/// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
-/// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），求和后四舍五入保留2位小数。
-/// 同时返回最近过期的 expire_time（Unix 秒），用于积分过期感知调度。
-/// 同时返回今日购买获得积分（start_time 在今日本地时间内且 charge_amount > 0）。
-fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> {
+/// 积分统计结果（区分通用积分 / Work 积分）
+///
+/// 官方积分体系（2026-09 实测）：
+/// - product_id 208 = 通用积分（IDE 使用）、209 = Work 积分（SOLO Agent 使用），
+///   其余带 credits_limit 的包（如 221 每月登录积分）归入通用积分。
+/// - 注意：签到积分归属会变动——2026-09-04 前签到发 209（Work，200/天），
+///   之后改为发 208（通用，150/天），分类必须按 product_id 动态判断，不可写死来源。
+/// - 积分来源（pack 顶层 group_name / display_desc / group_type）：
+///   每日签到（group_type=1）、每月登录（group_type=3）、
+///   会员/购买（charge_amount>0）、兑换等。
+struct CreditStats {
+    /// 全部可用积分（通用 + Work）
+    total: f64,
+    /// 通用积分剩余
+    general: f64,
+    /// Work 积分剩余
+    work: f64,
+    /// 最近一个仍未用完且未过期的积分包过期时间（Unix 秒）
+    earliest_expire: Option<i64>,
+    /// 今日购买获得积分（charge_amount > 0 且 start_time 在今日）
+    today_non_checkin_earned: f64,
+    /// 会员套餐到期时间（Unix 秒，如「会员 Lite 连续包月」包的 end_time）
+    membership_expire: Option<i64>,
+    /// 会员套餐下次自动续费扣款时间（Unix 秒，next_billing_time）
+    membership_next_billing: Option<i64>,
+}
+
+/// 调用 TRAE API 拉取积分包列表
+fn query_ent_packs(jwt: &str) -> Result<Vec<serde_json::Value>, String> {
     let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
         jwt.to_string()
     } else {
@@ -331,14 +513,69 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
     let body: serde_json::Value =
         resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
 
-    let packs = body
-        .get("user_entitlement_pack_list")
-        .and_then(|v| v.as_array())
-        .ok_or("响应中缺少 user_entitlement_pack_list")?;
+    body.get("user_entitlement_pack_list")
+        .and_then(|v| v.as_array().cloned())
+        .ok_or_else(|| "响应中缺少 user_entitlement_pack_list".to_string())
+}
+
+/// 归一化积分包来源标签（明细悬浮展示用）
+///
+/// 识别规则（按优先级）：
+/// 1. charge_amount > 0 → 付费获得（会员连续包月赠送 / 购买）
+/// 2. group_name / display_desc 关键词匹配 → 每日签到、每月登录、兑换
+/// 3. fallback：原样展示 group_name → display_desc → "积分包"
+fn classify_source(pack: &serde_json::Value) -> String {
+    let charge = pack
+        .get("entitlement_base_info")
+        .and_then(|e| e.get("charge_amount"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let group_name = pack
+        .get("group_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let display_desc = pack
+        .get("display_desc")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let combined = format!("{}{}", group_name, display_desc);
+
+    if charge > 0 {
+        // 付费包：会员连续包月赠送、直接购买
+        return "会员/购买".to_string();
+    }
+    if combined.contains("签到") {
+        return "每日签到".to_string();
+    }
+    if combined.contains("登录") {
+        return "每月登录".to_string();
+    }
+    if combined.contains("兑换") || combined.contains("redeem") {
+        return "兑换".to_string();
+    }
+    if !group_name.is_empty() {
+        return group_name.to_string();
+    }
+    if !display_desc.is_empty() {
+        return display_desc.to_string();
+    }
+    "积分包".to_string()
+}
+
+/// 计算剩余积分（区分通用 / Work）
+///
+/// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
+/// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），按 product_id 分类求和。
+fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
+    let packs = query_ent_packs(jwt)?;
 
     let mut total: f64 = 0.0;
+    let mut general: f64 = 0.0;
+    let mut work: f64 = 0.0;
     let mut earliest_expire: Option<i64> = None;
     let mut today_non_checkin_earned: f64 = 0.0;
+    let mut membership_expire: Option<i64> = None;
+    let mut membership_next_billing: Option<i64> = None;
 
     // 使用固定 UTC+8 偏移，不依赖 chrono::Local（某些 Windows 环境下可能误判时区）
     let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
@@ -356,7 +593,31 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
         .timestamp();
     let today_end = today_start + 86400;
 
-    for pack in packs {
+    for pack in &packs {
+        // ---- 会员套餐到期时间（不限积分包，扫描全部权益包）----
+        // 实测（2026-09）：连续包月会员包 display_desc="会员 Lite 连续包月"、
+        // group_name="会员积分"，end_time/expire_time=到期日，next_billing_time=下次扣款日。
+        let group_name = pack.get("group_name").and_then(|v| v.as_str()).unwrap_or("");
+        let display_desc = pack.get("display_desc").and_then(|v| v.as_str()).unwrap_or("");
+        if group_name.contains("会员") || display_desc.contains("会员") {
+            let end = pack
+                .get("entitlement_base_info")
+                .and_then(|e| e.get("end_time"))
+                .and_then(|v| v.as_i64())
+                .or_else(|| pack.get("expire_time").and_then(|v| v.as_i64()));
+            if let Some(end) = end {
+                if membership_expire.map_or(true, |cur| end > cur) {
+                    membership_expire = Some(end);
+                    // next_billing_time：0 / 1970 时间戳表示无自动续费
+                    let nb = pack
+                        .get("next_billing_time")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    membership_next_billing = if nb > 86400 { Some(nb) } else { None };
+                }
+            }
+        }
+
         // 仅对有 credits_limit 的包计入统计
         let credits_limit = pack
             .get("entitlement_base_info")
@@ -370,14 +631,27 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
                 .and_then(|u| u.get("credits_amount"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-            total += (limit - used).max(0.0);
+            let remaining = (limit - used).max(0.0);
+            total += remaining;
 
-            // expire_time 也在 pack 顶层，取最早的（且未过期的）
+            // product_id == 209 → Work 积分，其余归入通用积分
+            let product_id = pack
+                .get("entitlement_base_info")
+                .and_then(|e| e.get("product_id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if product_id == 209 {
+                work += remaining;
+            } else {
+                general += remaining;
+            }
+
+            // expire_time 在 pack 顶层，取最近的（仅统计仍有剩余且未过期的包）
             let expire = pack
                 .get("expire_time")
                 .and_then(|v| v.as_i64());
             if let Some(exp) = expire {
-                if exp > now_ts {
+                if exp > now_ts && remaining > 0.0 {
                     earliest_expire = Some(earliest_expire.map_or(exp, |e| e.min(exp)));
                 }
             }
@@ -404,12 +678,90 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
         }
     }
 
-    // 四舍五入保留2位小数
-    Ok((
-        (total * 100.0).round() / 100.0,
+    let r2 = |v: f64| (v * 100.0).round() / 100.0;
+    Ok(CreditStats {
+        total: r2(total),
+        general: r2(general),
+        work: r2(work),
         earliest_expire,
-        (today_non_checkin_earned * 100.0).round() / 100.0,
-    ))
+        today_non_checkin_earned: r2(today_non_checkin_earned),
+        membership_expire,
+        membership_next_billing,
+    })
+}
+
+/// 获取单账号积分明细（悬浮展示用）：
+/// 仅返回剩余 > 0 且未过期的积分包，按过期时间升序。
+#[tauri::command]
+pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<CreditDetail, String> {
+    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+        .ok_or("账号不存在")?;
+    let packs = query_ent_packs(&account.jwt)?;
+
+    let now_ts = chrono::Utc::now().timestamp();
+    let mut detail_packs: Vec<CreditPackDetail> = Vec::new();
+    for pack in &packs {
+        let base = pack.get("entitlement_base_info");
+        let limit = base
+            .and_then(|e| e.get("quota"))
+            .and_then(|q| q.get("credits_limit"))
+            .and_then(|v| v.as_f64());
+        let Some(limit) = limit else { continue };
+        let used = pack
+            .get("usage")
+            .and_then(|u| u.get("credits_amount"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let remaining = (limit - used).max(0.0);
+        // 已用完的积分包不展示
+        if remaining <= 0.0 {
+            continue;
+        }
+        // 已过期的积分包不展示
+        let Some(expire) = pack.get("expire_time").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        if expire <= now_ts {
+            continue;
+        }
+        let product_id = base
+            .and_then(|e| e.get("product_id"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let kind = if product_id == 209 { "Work" } else { "通用" }.to_string();
+        let source = classify_source(pack);
+        detail_packs.push(CreditPackDetail {
+            kind,
+            source,
+            remaining: (remaining * 100.0).round() / 100.0,
+            expire_time: expire,
+        });
+    }
+    detail_packs.sort_by_key(|p| p.expire_time);
+
+    let general: f64 = detail_packs
+        .iter()
+        .filter(|p| p.kind == "通用")
+        .map(|p| p.remaining)
+        .sum();
+    let work: f64 = detail_packs
+        .iter()
+        .filter(|p| p.kind == "Work")
+        .map(|p| p.remaining)
+        .sum();
+    let r2 = |v: f64| (v * 100.0).round() / 100.0;
+    let general = r2(general);
+    let work = r2(work);
+    Ok(CreditDetail {
+        general,
+        work,
+        total: r2(general + work),
+        packs: detail_packs,
+    })
 }
 
 /// 获取单个账号的剩余积分（实时请求 API）
@@ -422,16 +774,34 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
         .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
         .ok_or("账号不存在")?;
     let jwt = &account.jwt;
-    let (credits, expire_at, _non_checkin) = calc_remaining_credits(jwt)?;
+    let stats = calc_remaining_credits(jwt)?;
     // 写入缓存
     let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
-    rc.credits.insert(user_id.clone(), credits);
-    if let Some(exp) = expire_at {
-        rc.expire_times.insert(user_id, exp);
+    rc.credits.insert(user_id.clone(), stats.total);
+    rc.general.insert(user_id.clone(), stats.general);
+    rc.work.insert(user_id.clone(), stats.work);
+    if let Some(exp) = stats.earliest_expire {
+        rc.expire_times.insert(user_id.clone(), exp);
+    }
+    match stats.membership_expire {
+        Some(v) => {
+            rc.membership_expire.insert(user_id.clone(), v);
+        }
+        None => {
+            rc.membership_expire.remove(&user_id);
+        }
+    }
+    match stats.membership_next_billing {
+        Some(v) => {
+            rc.membership_next_billing.insert(user_id.clone(), v);
+        }
+        None => {
+            rc.membership_next_billing.remove(&user_id);
+        }
     }
     rc.updated_at = Some(fs_utils::now_iso());
     fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
-    Ok(credits)
+    Ok(stats.total)
 }
 
 /// 刷新所有账号的剩余积分（批量请求 API），返回成功数量。
@@ -454,15 +824,33 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
             continue;
         }
         match calc_remaining_credits(&a.jwt) {
-            Ok((credits, expire_at, non_checkin_earned)) => {
-                rc.credits.insert(uid.clone(), credits);
-                if let Some(exp) = expire_at {
+            Ok(stats) => {
+                rc.credits.insert(uid.clone(), stats.total);
+                rc.general.insert(uid.clone(), stats.general);
+                rc.work.insert(uid.clone(), stats.work);
+                if let Some(exp) = stats.earliest_expire {
                     rc.expire_times.insert(uid.clone(), exp);
                 }
-                total_non_checkin_earned += non_checkin_earned;
+                match stats.membership_expire {
+                    Some(v) => {
+                        rc.membership_expire.insert(uid.clone(), v);
+                    }
+                    None => {
+                        rc.membership_expire.remove(&uid);
+                    }
+                }
+                match stats.membership_next_billing {
+                    Some(v) => {
+                        rc.membership_next_billing.insert(uid.clone(), v);
+                    }
+                    None => {
+                        rc.membership_next_billing.remove(&uid);
+                    }
+                }
+                total_non_checkin_earned += stats.today_non_checkin_earned;
                 ok_count += 1;
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
-                if credits > 0.0 {
+                if stats.total > 0.0 {
                     let thaw_type = cd.cooldowns.get(&uid).and_then(|e| {
                         if e.error_type != "SessionDead" && !e.error_type.is_empty() {
                             Some(e.error_type.clone())
@@ -475,7 +863,7 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
                         thawed_count += 1;
                         crate::fs_utils::app_log(
                             &state.data_dir,
-                            &format!("自动解冻 [{}]: 类型={} 积分={}", a.name, et, credits),
+                            &format!("自动解冻 [{}]: 类型={} 积分={}", a.name, et, stats.total),
                         );
                     }
                 }
@@ -722,7 +1110,7 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
 
 // ---------------- 内部工具 ----------------
 
-/// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到 / 冷却状态）。
+/// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到 / 冷却状态 / 套餐身份）。
 pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
     let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
     let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
@@ -730,6 +1118,8 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
     let credits: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
     let rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
     let cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
+    let pay: crate::commands::pay_status::PayStatusFile =
+        fs_utils::read_json(&state.path("pay_status.json"));
     let summary: CheckinSummary = fs_utils::read_json(&state.path("checkin_summary.json"));
     let summary_today = summary
         .time
@@ -830,6 +1220,14 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
             has_refresh_token: has_rt,
             jwt_auto_refresh: need_refresh,
             credits_expire_at: rc.expire_times.get(&uid).copied(),
+            general_credits: rc.general.get(&uid).copied(),
+            work_credits: rc.work.get(&uid).copied(),
+            pay_identity: pay
+                .statuses
+                .get(&uid)
+                .map(|p| p.identity_str.clone()),
+            membership_expire: rc.membership_expire.get(&uid).copied(),
+            membership_next_billing: rc.membership_next_billing.get(&uid).copied(),
         });
     }
     out

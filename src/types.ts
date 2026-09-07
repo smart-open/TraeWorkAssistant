@@ -41,6 +41,67 @@ export interface AccountView {
   has_refresh_token: boolean;
   jwt_auto_refresh: boolean;
   credits_expire_at: number | null;
+  /** 通用积分（product_id != 209）剩余 */
+  general_credits: number | null;
+  /** Work 积分（product_id == 209）剩余 */
+  work_credits: number | null;
+  /** 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存） */
+  pay_identity?: string | null;
+  /** 会员套餐到期时间（Unix 秒，来自 ent_usage 会员包） */
+  membership_expire?: number | null;
+  /** 会员套餐下次自动续费时间（Unix 秒，无自动续费为空） */
+  membership_next_billing?: number | null;
+}
+
+/** 账号导入结果报告 */
+export interface ImportReport {
+  /** 文件中的账号总数 */
+  total: number;
+  /** 实际新增数量 */
+  added: number;
+  /** 跳过（重复）数量 */
+  skipped: number;
+  /** 跳过的账号标识（uid 或名称） */
+  skipped_names: string[];
+  /** 新增分组数量 */
+  groups_added: number;
+}
+
+export interface DiscoveredAccount {
+  user_id: string;
+  /** uid 是否经本机使用证据确认（false 时本机存在多个候选账号，不可入池） */
+  uid_confident: boolean;
+  /** TraeWork */
+  app: string;
+  app_label: string;
+  in_pool: boolean;
+  storage_path: string;
+}
+
+/** 本机 Trae Work 套餐信息（storage.json 明文，零 API） */
+export interface AppEntitlement {
+  identity_str: string | null;
+  identity: number | null;
+  last_sync_time: number | null;
+}
+
+/** 积分明细条目（仅剩余 > 0 且未过期的积分包） */
+export interface CreditPackDetail {
+  /** '通用' | 'Work' */
+  kind: string;
+  /** 来源名称（如「每日签到」「每月登录积分」） */
+  source: string;
+  remaining: number;
+  /** 过期时间（Unix 秒） */
+  expire_time: number;
+}
+
+/** 单账号积分明细 */
+export interface CreditDetail {
+  general: number;
+  work: number;
+  total: number;
+  packs: CreditPackDetail[];
 }
 
 export interface GroupView {

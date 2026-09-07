@@ -6,10 +6,14 @@ import type {
   ApiPoolFile,
   CheckinDone,
   CheckinOpts,
+  AppEntitlement,
+  CreditDetail,
   CreditRecord,
   CreditsDailySnapshot,
+  DiscoveredAccount,
   EnvStatus,
   GroupView,
+  ImportReport,
   JwtParseResult,
   LogLine,
   OAuthLoginUrl,
@@ -58,6 +62,14 @@ export const api = {
     refreshJwt: (userId: string) =>
       invoke<string>('refresh_jwt', { userId }),
     exportRaw: () => invoke<Record<string, unknown>>('accounts_export_raw'),
+    importAccounts: (content: string) =>
+      invoke<ImportReport>('accounts_import', { content }),
+    creditDetail: (userId: string) =>
+      invoke<CreditDetail>('fetch_credit_detail', { userId }),
+    refreshPayStatus: () => invoke<number>('refresh_pay_status'),
+    discover: () => invoke<DiscoveredAccount[]>('apps_accounts_discover'),
+    addDiscovered: (userId: string, name: string) =>
+      invoke('apps_account_add', { userId, name }),
   },
   groups: {
     list: () => invoke<GroupView[]>('groups_list'),
@@ -112,6 +124,7 @@ export const api = {
     proxyLogDetail: (id: string) => invoke<string>('proxy_log_detail', { id }),
     writeTextFile: (path: string, content: string) =>
       invoke('write_text_file', { path, content }),
+    readTextFile: (path: string) => invoke<string>('read_text_file', { path }),
   },
   switchAccount: (userId: string) => invoke('switch_account', { userId }),
   saveCurrentLogin: (userId: string) => invoke('save_current_login', { userId }),
@@ -154,6 +167,9 @@ export const api = {
     }),
     debugToggle: () => invoke<boolean>('api_debug_toggle'),
     debugStatus: () => invoke<boolean>('api_debug_status'),
+  },
+  traeLocal: {
+    entitlement: () => invoke<AppEntitlement | null>('apps_entitlement_read'),
   },
 };
 

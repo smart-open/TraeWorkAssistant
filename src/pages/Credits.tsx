@@ -69,6 +69,12 @@ export default function Credits() {
   );
   const total = rows.reduce((s, a) => s + (a.remaining_credits ?? 0), 0);
   const avg = rows.length === 0 ? 0 : Math.round(total / rows.length);
+  const generalTotal = rows.reduce((s, a) => s + (a.general_credits ?? 0), 0);
+  const workTotal = rows.reduce((s, a) => s + (a.work_credits ?? 0), 0);
+  const fmt = (v: number) => v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+  const totalHint = accounts.some((a) => a.general_credits != null || a.work_credits != null)
+    ? `通用 ${fmt(generalTotal)} · Work ${fmt(workTotal)}`
+    : '总剩余可用积分';
 
   // 今日新增积分：优先使用 daily snapshot 的 earned 字段（含签到+购买）
   // 回退：仅签到 history delta
@@ -137,7 +143,7 @@ export default function Credits() {
       </div>
 
       <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-5">
-        <StatCard label="可用积分总额" value={total.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint="总剩余可用积分" tone="violet" />
+        <StatCard label="可用总积分" value={total.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={totalHint} tone="violet" />
         <StatCard label="账号数" value={rows.length} tone="brand" />
         <StatCard label="平均可用积分" value={avg.toLocaleString()} tone="blue" />
         <StatCard label="今日新增积分" value={todayNew.toLocaleString()} tone="green" hint={today} />
@@ -222,7 +228,7 @@ export default function Credits() {
               <th className="px-4 py-2 text-left">排名</th>
               <th className="px-4 py-2 text-left">账号</th>
               <th className="px-4 py-2 text-left">分组</th>
-              <th className="px-4 py-2 text-right">剩余可用积分</th>
+              <th className="px-4 py-2 text-right">可用积分</th>
             </tr>
           </thead>
           <tbody>
@@ -245,7 +251,14 @@ export default function Credits() {
                       <span className="text-xs text-slate-400">未分组</span>
                     )}
                   </td>
-                  <td className="px-4 py-2 text-right tabular-nums">{(a.remaining_credits ?? 0).toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}</td>
+                  <td className="px-4 py-2 text-right tabular-nums">
+                    {(a.remaining_credits ?? 0).toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}
+                    {(a.general_credits != null || a.work_credits != null) && (
+                      <div className="text-[11px] text-slate-400">
+                        通用 {fmt(a.general_credits ?? 0)} · Work {fmt(a.work_credits ?? 0)}
+                      </div>
+                    )}
+                  </td>
                 </tr>
               );
             })}

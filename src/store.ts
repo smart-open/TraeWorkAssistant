@@ -4,6 +4,7 @@ import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent, 
 import type {
   AccountView,
   ApiServiceStatus,
+  AppEntitlement,
   CheckinAccountResult,
   CheckinDone,
   CreditRecord,
@@ -64,6 +65,8 @@ interface AppState {
   profiles: ProfileInfo[];
   profileProgress: string[];
   profileActive: boolean;
+  /** 本机 Trae Work 套餐（storage.json 明文，零 API） */
+  localEntitlement: AppEntitlement | null;
 
   init: () => Promise<void>;
   setView: (v: ViewKey) => void;
@@ -80,6 +83,7 @@ interface AppState {
   refreshCreditsHistory: () => Promise<void>;
   refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
+  refreshLocalEntitlement: () => Promise<void>;
 
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
@@ -170,6 +174,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   profiles: [],
   profileProgress: [],
   profileActive: false,
+  localEntitlement: null,
+
+  refreshLocalEntitlement: async () => {
+    try {
+      const ent = await api.traeLocal.entitlement();
+      set({ localEntitlement: ent });
+    } catch {
+      set({ localEntitlement: null });
+    }
+  },
 
   init: async () => {
     // StrictMode 下 effect 会执行两次：先注销旧监听，避免重复注册导致事件触发两次（如 captured 重复 +1、toast 双发）

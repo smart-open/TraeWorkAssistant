@@ -1,4 +1,4 @@
-﻿import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import {
   Play,
   Square,
@@ -242,7 +242,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
     <div>
       <PageHeader
         title="API 服务"
-        desc="OpenAI 兼容接口，通过账号池轮转实现多账号负载均衡（消耗 IDE 积分）"
+        desc="OpenAI 兼容接口，通过账号池轮转实现多账号负载均衡（消耗通用积分）"
         actions={
           running ? (
             <button
@@ -306,40 +306,26 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
         <div className="mb-2 flex items-center gap-2">
           <Info size={14} className="shrink-0 text-amber-500 dark:text-amber-400" />
           <span className="text-xs font-semibold text-amber-800 dark:text-amber-200">积分体系说明</span>
-          <span className="text-[11px] text-amber-600/60 dark:text-amber-400/40">本服务仅消耗 IDE 积分</span>
+          <span className="text-[11px] text-amber-600/60 dark:text-amber-400/40">本服务消耗通用积分</span>
         </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-          {/* IDE 积分 */}
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-1">
+          {/* 通用积分 */}
           <div className="rounded-lg border border-amber-300/60 bg-white/60 px-3 py-1.5 dark:border-amber-700/30 dark:bg-amber-900/5">
             <div className="mb-1 flex items-center justify-between">
-              <span className="text-[11px] font-bold text-amber-800 dark:text-amber-200">IDE 积分（Trae CN）</span>
+              <span className="text-[11px] font-bold text-amber-800 dark:text-amber-200">通用积分</span>
               <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-700/50 dark:text-amber-100">本服务使用</span>
             </div>
             <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 dark:text-zinc-400">
               <span className="font-mono text-amber-700 dark:text-amber-300">product_id 208</span>
               <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span className="font-mono text-amber-700 dark:text-amber-300">llm_utils_chat</span>
+              <span>签到/登录/购买均计入</span>
               <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>IDE 套餐</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>明文 JSON</span>
+              <span>IDE 聊天与本 API 共用</span>
             </div>
           </div>
-          {/* Work 积分 */}
-          <div className="rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-1.5 dark:border-zinc-700/50 dark:bg-zinc-800/30">
-            <div className="mb-1 flex items-center justify-between">
-              <span className="text-[11px] font-bold text-slate-500 dark:text-zinc-400">Work 积分（Trae Work CN）</span>
-              <span className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-zinc-700 dark:text-zinc-400">未采用</span>
-            </div>
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 dark:text-zinc-400">
-              <span className="font-mono text-slate-500 dark:text-zinc-400">product_id 209</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span className="font-mono text-slate-500 dark:text-zinc-400">create_agent_task</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>签到/购买</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>需 TTNet 加密</span>
-            </div>
+          {/* Work 积分提示 */}
+          <div className="flex items-center gap-x-2 gap-y-0.5 px-1 text-[11px] text-slate-400 dark:text-zinc-500">
+            <span>Work 积分（product_id 209）为 Trae Work 套餐内专用，本服务不消耗、不展示。</span>
           </div>
         </div>
       </div>
@@ -411,7 +397,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                 ))}
               </select>
               <p className="mt-1 text-xs text-slate-400">
-                上游接口：llm_utils_chat（IDE 积分，product_id 208）
+                上游接口：llm_utils_chat（消耗通用积分，product_id 208）
               </p>
             </div>
 
@@ -419,7 +405,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
               <div className="mb-2 flex items-center justify-between">
                 <p className="font-medium">使用方式 & 配置示例</p>
                 <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">
-                  IDE 积分
+                  通用积分
                 </span>
                 <button
                   className="btn-ghost flex items-center gap-1 !p-1 text-xs"
@@ -539,9 +525,9 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
-                        {a.remaining_credits != null && (
+                        {a.general_credits != null && (
                           <span className="text-xs tabular-nums text-slate-500 dark:text-zinc-400">
-                            {a.remaining_credits.toFixed(0)} 积分
+                            {a.general_credits.toFixed(0)} 通用积分
                           </span>
                         )}
                         {poolItem?.cooling && (
@@ -598,7 +584,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                 <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
                   <th className="pb-2 pr-4 font-medium">账号</th>
                   <th className="pb-2 pr-4 font-medium">UID</th>
-                  <th className="pb-2 pr-4 font-medium">积分</th>
+                  <th className="pb-2 pr-4 font-medium">通用积分</th>
                   <th className="pb-2 pr-4 font-medium">状态</th>
                   <th className="pb-2 pr-4 font-medium">错误次数</th>
                   <th className="pb-2 font-medium">冷却原因</th>
