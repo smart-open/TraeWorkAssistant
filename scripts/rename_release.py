@@ -31,10 +31,10 @@ def main():
     jobs = [
         (os.path.join(SRC_TAURI, "target", "release", "bundle", "nsis",
                       f"{product}_{version}_x64-setup.exe"),
-         os.path.join(out_dir, f"{binary}_{version}_x64-setup.exe")),
+         os.path.join(out_dir, f"{product}_{version}_x64-setup.exe")),
         (os.path.join(SRC_TAURI, "target", "release", "bundle", "msi",
                       f"{product}_{version}_x64_zh-CN.msi"),
-         os.path.join(out_dir, f"{binary}_{version}_x64_zh-CN.msi")),
+         os.path.join(out_dir, f"{product}_{version}_x64_zh-CN.msi")),
     ]
     moved = 0
     for src, dst in jobs:
