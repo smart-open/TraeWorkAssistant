@@ -10,7 +10,8 @@
 
 ### 变更
 
-- **安装包默认覆盖安装**：自定义 NSIS 模板（`src-tauri/windows/installer.nsi`），检测到已安装旧版本时跳过「卸载旧版本 / 覆盖安装」询问页，直接覆盖安装，保留用户数据与配置；WiX 迁移场景仍走先卸载流程
+- **安装包默认覆盖安装**：自定义 NSIS 模板（`src-tauri/windows/installer.nsi`，基于 tauri-cli v2.11.4 官方模板），检测到已安装旧版本时跳过「卸载旧版本 / 覆盖安装」询问页，直接覆盖安装，保留用户数据与配置；WiX 迁移场景仍走先卸载流程；模板使用 handlebars 占位符，路径与文件清单由构建时注入，可跨机器构建
+- **版本号单源化**：新增 `npm run set-version <x.y.z>` 一键同步脚本（package.json / Cargo.toml / Cargo.lock / AGENT.md / docs 头部）；版本单一来源为 `src-tauri/Cargo.toml`（tauri.conf.json 回退、Rust `env!("CARGO_PKG_VERSION")`、前端 package.json 导入均自动取）
 - `tauri.conf.json` NSIS 增加 `template` 配置指向项目模板（随 Tauri CLI 升级需同步维护）
 
 ---

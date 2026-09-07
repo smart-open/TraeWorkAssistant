@@ -6,15 +6,18 @@ ManifestDPIAware true
 ; https://github.com/tauri-apps/tauri/pull/10106
 ManifestDPIAwareness PerMonitorV2
 
-!if "lzma" == "none"
+!if "{{compression}}" == "none"
   SetCompress off
 !else
   ; Set the compression algorithm. We default to LZMA.
-  SetCompressor /SOLID "lzma"
+  SetCompressor /SOLID "{{compression}}"
 !endif
 
 ; Keep above !include to stay ahead of any plugin command
 ; see https://github.com/tauri-apps/tauri/pull/15422#discussion_r3289239624
+{{#if signed_plugins_path}}
+!addplugindir "{{signed_plugins_path}}"
+{{/if}}
 
 !include MUI2.nsh
 !include FileFunc.nsh
@@ -28,41 +31,44 @@ ManifestDPIAwareness PerMonitorV2
 ${StrCase}
 ${StrLoc}
 
+{{#if installer_hooks}}
+!include "{{installer_hooks}}"
+{{/if}}
 
 !define WEBVIEW2APPGUID "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
-!define MANUFACTURER "Trae Work 助手"
-!define PRODUCTNAME "Trae Work 助手"
-!define VERSION "2.7.0"
-!define VERSIONWITHBUILD "2.7.0.0"
-!define HOMEPAGE ""
-!define INSTALLMODE "currentUser"
-!define LICENSE ""
-!define INSTALLERICON ""
-!define SIDEBARIMAGE ""
-!define HEADERIMAGE ""
-!define UNINSTALLERICON ""
-!define UNINSTALLERHEADERIMAGE ""
-!define MAINBINARYNAME "trae-work-assistant"
-!define MAINBINARYSRCPATH "D:\TraeWorkAssistant\src-tauri\target\release\trae-work-assistant.exe"
-!define BUNDLEID "com.traework.assistant"
-!define COPYRIGHT ""
-!define OUTFILE "nsis-output.exe"
-!define ARCH "x64"
-!define ADDITIONALPLUGINSPATH "C:\Users\tianw\AppData\Local\tauri\NSIS\Plugins\x86-unicode\additional"
-!define ALLOWDOWNGRADES "true"
-!define DISPLAYLANGUAGESELECTOR "false"
-!define INSTALLWEBVIEW2MODE "downloadBootstrapper"
-!define WEBVIEW2INSTALLERARGS "/silent"
-!define WEBVIEW2BOOTSTRAPPERPATH ""
-!define WEBVIEW2INSTALLERPATH ""
-!define MINIMUMWEBVIEW2VERSION ""
+!define MANUFACTURER "{{manufacturer}}"
+!define PRODUCTNAME "{{product_name}}"
+!define VERSION "{{version}}"
+!define VERSIONWITHBUILD "{{version_with_build}}"
+!define HOMEPAGE "{{homepage}}"
+!define INSTALLMODE "{{install_mode}}"
+!define LICENSE "{{license}}"
+!define INSTALLERICON "{{installer_icon}}"
+!define SIDEBARIMAGE "{{sidebar_image}}"
+!define HEADERIMAGE "{{header_image}}"
+!define UNINSTALLERICON "{{uninstaller_icon}}"
+!define UNINSTALLERHEADERIMAGE "{{uninstaller_header_image}}"
+!define MAINBINARYNAME "{{main_binary_name}}"
+!define MAINBINARYSRCPATH "{{main_binary_path}}"
+!define BUNDLEID "{{bundle_id}}"
+!define COPYRIGHT "{{copyright}}"
+!define OUTFILE "{{out_file}}"
+!define ARCH "{{arch}}"
+!define ADDITIONALPLUGINSPATH "{{additional_plugins_path}}"
+!define ALLOWDOWNGRADES "{{allow_downgrades}}"
+!define DISPLAYLANGUAGESELECTOR "{{display_language_selector}}"
+!define INSTALLWEBVIEW2MODE "{{install_webview2_mode}}"
+!define WEBVIEW2INSTALLERARGS "{{webview2_installer_args}}"
+!define WEBVIEW2BOOTSTRAPPERPATH "{{webview2_bootstrapper_path}}"
+!define WEBVIEW2INSTALLERPATH "{{webview2_installer_path}}"
+!define MINIMUMWEBVIEW2VERSION "{{minimum_webview2_version}}"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}"
 !define MANUKEY "Software\${MANUFACTURER}"
 !define MANUPRODUCTKEY "${MANUKEY}\${PRODUCTNAME}"
-!define UNINSTALLERSIGNCOMMAND ""
-!define ESTIMATEDSIZE "16354"
-!define STARTMENUFOLDER ""
+!define UNINSTALLERSIGNCOMMAND "{{uninstaller_sign_cmd}}"
+!define ESTIMATEDSIZE "{{estimated_size}}"
+!define STARTMENUFOLDER "{{start_menu_folder}}"
 
 Var PassiveMode
 Var UpdateMode
@@ -255,6 +261,7 @@ Function PageReinstall
   ; 项目定制：跳过「卸载旧版本 / 覆盖安装」询问页
   ; 检测到已有安装时直接覆盖安装（保留用户数据与配置；
   ; WiX 迁移场景仍走先卸载流程）。逻辑与被动模式（/P）一致。
+  ; 模板基于 tauri-cli v2.11.4 官方 installer.nsi，升级 CLI 时需同步维护。
   Call PageLeaveReinstall
 FunctionEnd
 Function PageReinstallUpdateSelection
@@ -424,9 +431,13 @@ FunctionEnd
 !insertmacro MUI_UNPAGE_INSTFILES
 
 ;Languages
-!insertmacro MUI_LANGUAGE "SimpChinese"
+{{#each languages}}
+!insertmacro MUI_LANGUAGE "{{this}}"
+{{/each}}
 !insertmacro MUI_RESERVEFILE_LANGDLL
-  !include "D:\TraeWorkAssistant\src-tauri\target\release\nsis\x64\SimpChinese.nsh"
+{{#each language_files}}
+  !include "{{this}}"
+{{/each}}
 
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
@@ -602,26 +613,32 @@ Section Install
   File "${MAINBINARYSRCPATH}"
 
   ; Copy resources
-    CreateDirectory "$INSTDIR\python"
-    CreateDirectory "$INSTDIR\python\tests"
-    CreateDirectory "$INSTDIR\ps"
-    File /a "/oname=ps\trae-switch-bridge.ps1" "D:\TraeWorkAssistant\src-tauri\..\src-ps\trae-switch-bridge.ps1"
-    File /a "/oname=python\auto_checkin.py" "D:\TraeWorkAssistant\src-tauri\..\src-python\auto_checkin.py"
-    File /a "/oname=python\device_proxy.py" "D:\TraeWorkAssistant\src-tauri\..\src-python\device_proxy.py"
-    File /a "/oname=python\requirements.txt" "D:\TraeWorkAssistant\src-tauri\..\src-python\requirements.txt"
-    File /a "/oname=python\tests\test_all_credits.py" "D:\TraeWorkAssistant\src-tauri\..\src-python\tests\test_all_credits.py"
-    File /a "/oname=python\tests\test_api_server.py" "D:\TraeWorkAssistant\src-tauri\..\src-python\tests\test_api_server.py"
-    File /a "/oname=python\tests\test_auto_checkin.py" "D:\TraeWorkAssistant\src-tauri\..\src-python\tests\test_auto_checkin.py"
-    File /a "/oname=python\tests\test_ba_ide_credits.py" "D:\TraeWorkAssistant\src-tauri\..\src-python\tests\test_ba_ide_credits.py"
-    File /a "/oname=python\tests\test_deep.py" "D:\TraeWorkAssistant\src-tauri\..\src-python\tests\test_deep.py"
-    File /a "/oname=python\tests\test_proxy.py" "D:\TraeWorkAssistant\src-tauri\..\src-python\tests\test_proxy.py"
-    File /a "/oname=python\tests\test_upstream.py" "D:\TraeWorkAssistant\src-tauri\..\src-python\tests\test_upstream.py"
+  {{#each resources_dirs}}
+    CreateDirectory "$INSTDIR\\{{this}}"
+  {{/each}}
+  {{#each resources}}
+    File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
+  {{/each}}
 
   ; Copy external binaries
+  {{#each binaries}}
+    File /a "/oname={{this}}" "{{no-escape @key}}"
+  {{/each}}
 
   ; Create file associations
+  {{#each file_associations as |association| ~}}
+    {{#each association.ext as |ext| ~}}
+       !insertmacro APP_ASSOCIATE "{{ext}}" "{{or association.name ext}}" "{{association-description association.description ext}}" "$INSTDIR\${MAINBINARYNAME}.exe,0" "Open with ${PRODUCTNAME}" "$INSTDIR\${MAINBINARYNAME}.exe $\"%1$\""
+    {{/each}}
+  {{/each}}
 
   ; Register deep links
+  {{#each deep_link_protocols as |protocol| ~}}
+    WriteRegStr SHCTX "Software\Classes\\{{protocol}}" "URL Protocol" ""
+    WriteRegStr SHCTX "Software\Classes\\{{protocol}}" "" "URL:${BUNDLEID} protocol"
+    WriteRegStr SHCTX "Software\Classes\\{{protocol}}\DefaultIcon" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\",0"
+    WriteRegStr SHCTX "Software\Classes\\{{protocol}}\shell\open\command" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
+  {{/each}}
 
   ; Create uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -734,31 +751,37 @@ Section Uninstall
   Delete "$INSTDIR\${MAINBINARYNAME}.exe"
 
   ; Delete resources
-    Delete "$INSTDIR\ps\trae-switch-bridge.ps1"
-    Delete "$INSTDIR\python\auto_checkin.py"
-    Delete "$INSTDIR\python\device_proxy.py"
-    Delete "$INSTDIR\python\requirements.txt"
-    Delete "$INSTDIR\python\tests\test_all_credits.py"
-    Delete "$INSTDIR\python\tests\test_api_server.py"
-    Delete "$INSTDIR\python\tests\test_auto_checkin.py"
-    Delete "$INSTDIR\python\tests\test_ba_ide_credits.py"
-    Delete "$INSTDIR\python\tests\test_deep.py"
-    Delete "$INSTDIR\python\tests\test_proxy.py"
-    Delete "$INSTDIR\python\tests\test_upstream.py"
+  {{#each resources}}
+    Delete "$INSTDIR\\{{this.[1]}}"
+  {{/each}}
 
   ; Delete external binaries
+  {{#each binaries}}
+    Delete "$INSTDIR\\{{this}}"
+  {{/each}}
 
   ; Delete app associations
+  {{#each file_associations as |association| ~}}
+    {{#each association.ext as |ext| ~}}
+      !insertmacro APP_UNASSOCIATE "{{ext}}" "{{or association.name ext}}"
+    {{/each}}
+  {{/each}}
 
   ; Delete deep links
+  {{#each deep_link_protocols as |protocol| ~}}
+    ReadRegStr $R7 SHCTX "Software\Classes\\{{protocol}}\shell\open\command" ""
+    ${If} $R7 == "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
+      DeleteRegKey SHCTX "Software\Classes\\{{protocol}}"
+    ${EndIf}
+  {{/each}}
 
 
   ; Delete uninstaller
   Delete "$INSTDIR\uninstall.exe"
 
-  RMDir /REBOOTOK "$INSTDIR\python\tests"
-  RMDir /REBOOTOK "$INSTDIR\ps"
-  RMDir /REBOOTOK "$INSTDIR\python"
+  {{#each resources_ancestors}}
+  RMDir /REBOOTOK "$INSTDIR\\{{this}}"
+  {{/each}}
   RMDir "$INSTDIR"
 
   ; Remove shortcuts if not updating

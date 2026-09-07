@@ -4,6 +4,7 @@
   "version": "2.7.1",
   "type": "module",
   "scripts": {
+    "set-version": "node scripts/set-version.mjs",
     "dev": "node scripts/dev.mjs",
     "dev:vite": "vite",
     "build": "tsc && vite build",

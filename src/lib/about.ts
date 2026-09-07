@@ -1,10 +1,11 @@
 // 赞赏码 base64 内嵌（来自 src/assets/donate-qr.base64.ts）：
 // dev server 关闭后弹窗图片仍可显示，不依赖运行中的静态服务器
 import { donate_qr_base64 as donateQr } from '../assets/donate-qr.base64';
+import pkg from '../../package.json';
 
-/** 应用品牌与关于信息（集中管理，改名/升版只改这里） */
+/** 应用品牌与关于信息（集中管理，改名/升版只改这里）；版本号随 package.json（npm run set-version 同步） */
 export const APP_NAME = 'Trae Work Assistant';
-export const APP_VERSION = '2.7.1';
+export const APP_VERSION = pkg.version;
 export const APP_TAGLINE = 'Trae Work 多账号管理与增强工具';
 export const APP_OVERVIEW =
   '面向 Trae Work（TRAE SOLO CN）的 Windows 桌面端多账号管理工具，' +

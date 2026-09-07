@@ -194,7 +194,8 @@ trae-work-assistant/
 | 修复 bug / 功能优化 / 微小功能新增或调整 | **低位（PATCH）** | 2.7.0 → 2.7.1 |
 
 - 大位（MAJOR）仅在重大架构/破坏性变更时升级
-- 升版提交需同步：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`（trae-work-assistant 块）、`src/lib/about.ts`（APP_VERSION）、`src-tauri/src/commands/accounts.rs`（appVersion）、`AGENT.md`/`docs` 头部标注、`CHANGELOG.md` 新条目
+- 升版提交执行 `npm run set-version <x.y.z>` 一键同步（package.json / Cargo.toml / Cargo.lock / AGENT.md / docs 头部）；CHANGELOG.md 手动新增条目
+- 版本号单一来源为 `src-tauri/Cargo.toml`：tauri.conf.json 不写 version（自动回退），Rust 端 `env!("CARGO_PKG_VERSION")` 自动取，前端经 package.json 导入自动取
 - 一个提交包含多类变更时，按最高级别升位；版本同步提交本身不再升位
 
 ## 12. 安全与合规
