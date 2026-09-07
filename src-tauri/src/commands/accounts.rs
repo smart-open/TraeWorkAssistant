@@ -6,6 +6,7 @@ use crate::jwt;
 use crate::models::{
     AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, Group, RawAccount,
     CreditsFile, CreditsDailyFile, CreditsDailySnapshot, CheckinSummary, RemainingCreditsFile, AccountCooldownsFile,
+    CreditDetail, CreditPackDetail,
 };
 
 use crate::state::AppState;
@@ -307,14 +308,27 @@ pub fn group_move(
     Ok(())
 }
 
-// ---------------- 剩余积分 ----------------
+// ---------------- 可用积分 ----------------
 
-/// 调用 TRAE API 计算剩余积分
-/// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
-/// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），求和后四舍五入保留2位小数。
-/// 同时返回最近过期的 expire_time（Unix 秒），用于积分过期感知调度。
-/// 同时返回今日购买获得积分（start_time 在今日本地时间内且 charge_amount > 0）。
-fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> {
+/// 积分统计结果（区分通用积分 / Work 积分）
+///
+/// 官方积分体系：product_id 208 = 通用积分（IDE 使用）、209 = Work 积分（SOLO Agent 使用），
+/// 其余带 credits_limit 的包（如 221 每月登录积分）归入通用积分。
+struct CreditStats {
+    /// 全部可用积分（通用 + Work）
+    total: f64,
+    /// 通用积分剩余
+    general: f64,
+    /// Work 积分剩余
+    work: f64,
+    /// 最近一个仍未用完且未过期的积分包过期时间（Unix 秒）
+    earliest_expire: Option<i64>,
+    /// 今日购买获得积分（charge_amount > 0 且 start_time 在今日）
+    today_non_checkin_earned: f64,
+}
+
+/// 调用 TRAE API 拉取积分包列表
+fn query_ent_packs(jwt: &str) -> Result<Vec<serde_json::Value>, String> {
     let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
         jwt.to_string()
     } else {
@@ -331,12 +345,21 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
     let body: serde_json::Value =
         resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
 
-    let packs = body
-        .get("user_entitlement_pack_list")
-        .and_then(|v| v.as_array())
-        .ok_or("响应中缺少 user_entitlement_pack_list")?;
+    body.get("user_entitlement_pack_list")
+        .and_then(|v| v.as_array().cloned())
+        .ok_or_else(|| "响应中缺少 user_entitlement_pack_list".to_string())
+}
+
+/// 计算剩余积分（区分通用 / Work）
+///
+/// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
+/// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），按 product_id 分类求和。
+fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
+    let packs = query_ent_packs(jwt)?;
 
     let mut total: f64 = 0.0;
+    let mut general: f64 = 0.0;
+    let mut work: f64 = 0.0;
     let mut earliest_expire: Option<i64> = None;
     let mut today_non_checkin_earned: f64 = 0.0;
 
@@ -356,7 +379,7 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
         .timestamp();
     let today_end = today_start + 86400;
 
-    for pack in packs {
+    for pack in &packs {
         // 仅对有 credits_limit 的包计入统计
         let credits_limit = pack
             .get("entitlement_base_info")
@@ -370,14 +393,27 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
                 .and_then(|u| u.get("credits_amount"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-            total += (limit - used).max(0.0);
+            let remaining = (limit - used).max(0.0);
+            total += remaining;
 
-            // expire_time 也在 pack 顶层，取最早的（且未过期的）
+            // product_id == 209 → Work 积分，其余归入通用积分
+            let product_id = pack
+                .get("entitlement_base_info")
+                .and_then(|e| e.get("product_id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if product_id == 209 {
+                work += remaining;
+            } else {
+                general += remaining;
+            }
+
+            // expire_time 在 pack 顶层，取最近的（仅统计仍有剩余且未过期的包）
             let expire = pack
                 .get("expire_time")
                 .and_then(|v| v.as_i64());
             if let Some(exp) = expire {
-                if exp > now_ts {
+                if exp > now_ts && remaining > 0.0 {
                     earliest_expire = Some(earliest_expire.map_or(exp, |e| e.min(exp)));
                 }
             }
@@ -404,12 +440,95 @@ fn calc_remaining_credits(jwt: &str) -> Result<(f64, Option<i64>, f64), String> 
         }
     }
 
-    // 四舍五入保留2位小数
-    Ok((
-        (total * 100.0).round() / 100.0,
+    let r2 = |v: f64| (v * 100.0).round() / 100.0;
+    Ok(CreditStats {
+        total: r2(total),
+        general: r2(general),
+        work: r2(work),
         earliest_expire,
-        (today_non_checkin_earned * 100.0).round() / 100.0,
-    ))
+        today_non_checkin_earned: r2(today_non_checkin_earned),
+    })
+}
+
+/// 获取单账号积分明细（悬浮展示用）：
+/// 仅返回剩余 > 0 且未过期的积分包，按过期时间升序。
+#[tauri::command]
+pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<CreditDetail, String> {
+    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+        .ok_or("账号不存在")?;
+    let packs = query_ent_packs(&account.jwt)?;
+
+    let now_ts = chrono::Utc::now().timestamp();
+    let mut detail_packs: Vec<CreditPackDetail> = Vec::new();
+    for pack in &packs {
+        let base = pack.get("entitlement_base_info");
+        let limit = base
+            .and_then(|e| e.get("quota"))
+            .and_then(|q| q.get("credits_limit"))
+            .and_then(|v| v.as_f64());
+        let Some(limit) = limit else { continue };
+        let used = pack
+            .get("usage")
+            .and_then(|u| u.get("credits_amount"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let remaining = (limit - used).max(0.0);
+        // 已用完的积分包不展示
+        if remaining <= 0.0 {
+            continue;
+        }
+        // 已过期的积分包不展示
+        let Some(expire) = pack.get("expire_time").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        if expire <= now_ts {
+            continue;
+        }
+        let product_id = base
+            .and_then(|e| e.get("product_id"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let kind = if product_id == 209 { "Work" } else { "通用" }.to_string();
+        let source = pack
+            .get("group_name")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                pack.get("display_desc").and_then(|v| v.as_str())
+            })
+            .unwrap_or("积分包")
+            .to_string();
+        detail_packs.push(CreditPackDetail {
+            kind,
+            source,
+            remaining: (remaining * 100.0).round() / 100.0,
+            expire_time: expire,
+        });
+    }
+    detail_packs.sort_by_key(|p| p.expire_time);
+
+    let general: f64 = detail_packs
+        .iter()
+        .filter(|p| p.kind == "通用")
+        .map(|p| p.remaining)
+        .sum();
+    let work: f64 = detail_packs
+        .iter()
+        .filter(|p| p.kind == "Work")
+        .map(|p| p.remaining)
+        .sum();
+    let r2 = |v: f64| (v * 100.0).round() / 100.0;
+    let general = r2(general);
+    let work = r2(work);
+    Ok(CreditDetail {
+        general,
+        work,
+        total: r2(general + work),
+        packs: detail_packs,
+    })
 }
 
 /// 获取单个账号的剩余积分（实时请求 API）
@@ -422,16 +541,18 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
         .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
         .ok_or("账号不存在")?;
     let jwt = &account.jwt;
-    let (credits, expire_at, _non_checkin) = calc_remaining_credits(jwt)?;
+    let stats = calc_remaining_credits(jwt)?;
     // 写入缓存
     let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
-    rc.credits.insert(user_id.clone(), credits);
-    if let Some(exp) = expire_at {
+    rc.credits.insert(user_id.clone(), stats.total);
+    rc.general.insert(user_id.clone(), stats.general);
+    rc.work.insert(user_id.clone(), stats.work);
+    if let Some(exp) = stats.earliest_expire {
         rc.expire_times.insert(user_id, exp);
     }
     rc.updated_at = Some(fs_utils::now_iso());
     fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
-    Ok(credits)
+    Ok(stats.total)
 }
 
 /// 刷新所有账号的剩余积分（批量请求 API），返回成功数量。
@@ -454,15 +575,17 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
             continue;
         }
         match calc_remaining_credits(&a.jwt) {
-            Ok((credits, expire_at, non_checkin_earned)) => {
-                rc.credits.insert(uid.clone(), credits);
-                if let Some(exp) = expire_at {
+            Ok(stats) => {
+                rc.credits.insert(uid.clone(), stats.total);
+                rc.general.insert(uid.clone(), stats.general);
+                rc.work.insert(uid.clone(), stats.work);
+                if let Some(exp) = stats.earliest_expire {
                     rc.expire_times.insert(uid.clone(), exp);
                 }
-                total_non_checkin_earned += non_checkin_earned;
+                total_non_checkin_earned += stats.today_non_checkin_earned;
                 ok_count += 1;
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
-                if credits > 0.0 {
+                if stats.total > 0.0 {
                     let thaw_type = cd.cooldowns.get(&uid).and_then(|e| {
                         if e.error_type != "SessionDead" && !e.error_type.is_empty() {
                             Some(e.error_type.clone())
@@ -475,7 +598,7 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
                         thawed_count += 1;
                         crate::fs_utils::app_log(
                             &state.data_dir,
-                            &format!("自动解冻 [{}]: 类型={} 积分={}", a.name, et, credits),
+                            &format!("自动解冻 [{}]: 类型={} 积分={}", a.name, et, stats.total),
                         );
                     }
                 }
@@ -830,6 +953,8 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
             has_refresh_token: has_rt,
             jwt_auto_refresh: need_refresh,
             credits_expire_at: rc.expire_times.get(&uid).copied(),
+            general_credits: rc.general.get(&uid).copied(),
+            work_credits: rc.work.get(&uid).copied(),
         });
     }
     out

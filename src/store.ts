@@ -44,6 +44,7 @@ interface AppState {
   ready: boolean;
   view: ViewKey;
   env: EnvStatus | null;
+  envCn: EnvStatus | null;
   certInstalled: boolean;
   proxy: ProxyStatus;
   apiStatus: ApiServiceStatus | null;
@@ -152,6 +153,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
   view: 'dashboard',
   env: null,
+  envCn: null,
   certInstalled: false,
   proxy: { running: false, port: 0, captured: 0, started_at: null },
   apiStatus: null,
@@ -332,6 +334,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ env });
     } catch (err) {
       get().pushToast('error', `环境检测失败：${String(err)}`);
+    }
+    // Trae CN IDE 环境检测（独立应用，失败不影响主检测）
+    try {
+      const envCn = await api.env.checkCn();
+      set({ envCn });
+    } catch {
+      set({ envCn: null });
     }
   },
   refreshCert: async () => {
@@ -606,10 +615,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       const ok = await api.accounts.refreshRemainingCredits();
       await get().refreshAccounts();
       if (ok > 0) {
-        get().pushToast('success', `已刷新 ${ok} 个账号的剩余积分`);
+        get().pushToast('success', `已刷新 ${ok} 个账号的可用积分`);
       }
     } catch (err) {
-      get().pushToast('error', `刷新剩余积分失败：${String(err)}`);
+      get().pushToast('error', `刷新可用积分失败：${String(err)}`);
     }
   },
   cooldownClear: async (userId) => {

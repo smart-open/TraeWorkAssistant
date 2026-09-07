@@ -19,6 +19,12 @@ pub struct AccountView {
     pub has_refresh_token: bool,
     pub jwt_auto_refresh: bool,
     pub credits_expire_at: Option<i64>,
+    /// 通用积分（product_id != 209）剩余
+    #[serde(default)]
+    pub general_credits: Option<f64>,
+    /// Work 积分（product_id == 209）剩余
+    #[serde(default)]
+    pub work_credits: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -191,11 +197,40 @@ pub struct RemainingCreditsFile {
     pub credits: HashMap<String, f64>,
     #[serde(default)]
     pub expire_times: HashMap<String, i64>,
+    /// 通用积分（product_id != 209）剩余缓存
+    #[serde(default)]
+    pub general: HashMap<String, f64>,
+    /// Work 积分（product_id == 209）剩余缓存
+    #[serde(default)]
+    pub work: HashMap<String, f64>,
     #[serde(default)]
     pub updated_at: Option<String>,
 }
 
-/// 单个账号的冷却状态
+/// 积分明细条目（仅剩余 > 0 且未过期的积分包）
+#[derive(Serialize, Clone)]
+pub struct CreditPackDetail {
+    /// "ͨ用" | "Work"
+    pub kind: String,
+    /// 来源名称（如「每日签到」「每月登录积分」）
+    pub source: String,
+    /// 该包剩余积分 = credits_limit - usage.credits_amount
+    pub remaining: f64,
+    /// 过期时间（Unix 秒）
+    pub expire_time: i64,
+}
+
+/// 单账号积分明细（悬浮展示用）
+#[derive(Serialize, Clone)]
+pub struct CreditDetail {
+    pub general: f64,
+    pub work: f64,
+    pub total: f64,
+    /// 按过期时间升序
+    pub packs: Vec<CreditPackDetail>,
+}
+
+/// 单个账号的冷却状鎬?
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct CooldownEntry {
     #[serde(rename = "type", default)]
@@ -224,7 +259,7 @@ pub struct ApiPoolFile {
     pub enabled_uids: Vec<String>,
 }
 
-/// 池中单个账号的运行时状态（给 /status 和前端用）
+/// 池中单个账号的运行时状态（缁? /status 鍜屽墠绔�鐢�锛?
 #[derive(Serialize, Clone)]
 pub struct PoolStatus {
     pub uid: String,
@@ -238,7 +273,7 @@ pub struct PoolStatus {
     pub err_count: i32,
 }
 
-/// API 服务整体状态（给前端用）
+/// API 服务整体状态（给前端用锛?
 #[derive(Serialize, Clone)]
 pub struct ApiServiceStatus {
     pub running: bool,

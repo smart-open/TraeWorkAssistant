@@ -53,6 +53,7 @@ fn main() {
             commands::accounts::group_delete,
             commands::accounts::group_move,
             commands::accounts::fetch_remaining_credits,
+            commands::accounts::fetch_credit_detail,
             commands::accounts::refresh_remaining_credits,
             commands::accounts::credits_daily_list,
             commands::accounts::cooldown_clear,

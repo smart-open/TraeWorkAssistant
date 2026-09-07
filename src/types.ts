@@ -41,6 +41,29 @@ export interface AccountView {
   has_refresh_token: boolean;
   jwt_auto_refresh: boolean;
   credits_expire_at: number | null;
+  /** 通用积分（product_id != 209）剩余 */
+  general_credits: number | null;
+  /** Work 积分（product_id == 209）剩余 */
+  work_credits: number | null;
+}
+
+/** 积分明细条目（仅剩余 > 0 且未过期的积分包） */
+export interface CreditPackDetail {
+  /** '通用' | 'Work' */
+  kind: string;
+  /** 来源名称（如「每日签到」「每月登录积分」） */
+  source: string;
+  remaining: number;
+  /** 过期时间（Unix 秒） */
+  expire_time: number;
+}
+
+/** 单账号积分明细 */
+export interface CreditDetail {
+  general: number;
+  work: number;
+  total: number;
+  packs: CreditPackDetail[];
 }
 
 export interface GroupView {

@@ -1,4 +1,5 @@
-﻿import { useEffect, useMemo, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Plus,
   Trash2,
@@ -29,7 +30,7 @@ import { Badge, EmptyState, Modal } from '../components/ui';
 import { save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
-import type { AccountView, GroupView, JwtParseResult, ProfileInfo } from '../types';
+import type { AccountView, CreditDetail, GroupView, JwtParseResult, ProfileInfo } from '../types';
 
 const PRESET_COLORS = [
   '#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#0ea5e9', '#a855f7', '#14b8a6',
@@ -79,11 +80,121 @@ function CreditsExpireBadge({ expireAt }: { expireAt: number | null }) {
   const days = Math.floor(secs / 86400);
   const hours = Math.floor((secs % 86400) / 3600);
   const isUrgent = secs < 86400; // < 24h
-  const text = days > 0 ? `${days}d${hours}h` : `${hours}h`;
+  // 最近一条仍有剩余的积分包到期，展示距离现在的剩余时间
+  const text = days > 0 ? `${days} 天后过期` : `${hours} 小时后过期`;
+  const expireTime = new Date(expireAt * 1000).toLocaleString('zh-CN');
   return (
-    <span className={`text-xs ${isUrgent ? 'text-amber-500 font-semibold' : 'text-slate-500'}`}>
+    <span
+      className={`cursor-help text-xs ${isUrgent ? 'text-amber-500 font-semibold' : 'text-slate-500'}`}
+      title={`最近到期积分包：${expireTime}`}
+    >
       {text}
     </span>
+  );
+}
+
+const fmtCredits = (v: number) =>
+  v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+
+/** 可用积分单元格：鼠标悬停展示积分明细（仅剩余 > 0 且未过期的积分包，按到期时间升序） */
+function CreditCell({ account }: { account: AccountView }) {
+  const [detail, setDetail] = useState<CreditDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const fetchedRef = useRef(false);
+
+  const loadDetail = () => {
+    if (fetchedRef.current) return;
+    fetchedRef.current = true;
+    setLoading(true);
+    api.accounts
+      .creditDetail(account.user_id)
+      .then(setDetail)
+      .catch(() => setDetail(null))
+      .finally(() => setLoading(false));
+  };
+
+  const enter = (e: React.MouseEvent<HTMLElement>) => {
+    if (account.remaining_credits == null) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    // 卡片约 300x340，靠屏幕边缘时向内收
+    const top = Math.min(r.bottom, window.innerHeight - 360);
+    const left = Math.min(r.right - 300, window.innerWidth - 320);
+    setPos({ top: Math.max(8, top), left: Math.max(8, left) });
+    loadDetail();
+  };
+
+  const value = account.remaining_credits;
+  return (
+    <>
+      <div
+        className="cursor-help tabular-nums"
+        onMouseEnter={enter}
+        onMouseLeave={() => setPos(null)}
+        title="悬停查看积分明细"
+      >
+        {value != null ? value.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) : '-'}
+      </div>
+      {pos &&
+        createPortal(
+          <div
+            className="fixed z-50 w-[300px] rounded-lg border border-slate-200 bg-white p-3 shadow-xl dark:border-zinc-700 dark:bg-zinc-800"
+            style={{ top: pos.top, left: pos.left }}
+            onMouseEnter={() => setPos(pos)}
+            onMouseLeave={() => setPos(null)}
+          >
+            <div className="mb-2 flex items-center justify-between text-xs">
+              <span className="font-semibold">{account.name} 积分明细</span>
+              {loading && <span className="text-slate-400">加载中…</span>}
+            </div>
+            {!loading && detail && detail.packs.length === 0 && (
+              <div className="py-2 text-xs text-slate-400">暂无可用积分包</div>
+            )}
+            {detail && (
+              <>
+                <div className="mb-2 grid grid-cols-2 gap-1.5 text-xs">
+                  <div className="rounded bg-slate-50 px-2 py-1 dark:bg-zinc-900">
+                    <span className="text-slate-400">通用积分</span>
+                    <div className="font-semibold tabular-nums">{fmtCredits(detail.general)}</div>
+                  </div>
+                  <div className="rounded bg-slate-50 px-2 py-1 dark:bg-zinc-900">
+                    <span className="text-slate-400">Work 积分</span>
+                    <div className="font-semibold tabular-nums">{fmtCredits(detail.work)}</div>
+                  </div>
+                </div>
+                {detail.packs.length > 0 && (
+                  <div className="max-h-44 space-y-1 overflow-auto">
+                    {detail.packs.map((p, i) => {
+                      const days = Math.max(0, Math.floor((p.expire_time - Date.now() / 1000) / 86400));
+                      const hours = Math.max(0, Math.floor(((p.expire_time - Date.now() / 1000) % 86400) / 3600));
+                      return (
+                        <div key={i} className="flex items-center justify-between gap-2 text-xs">
+                          <div className="flex min-w-0 items-center gap-1.5">
+                            <Badge tone={p.kind === 'Work' ? 'violet' : 'blue'}>
+                              {p.kind === 'Work' ? 'Work' : '通用'}
+                            </Badge>
+                            <span className="truncate text-slate-500">{p.source}</span>
+                          </div>
+                          <div className="shrink-0 text-right tabular-nums">
+                            <span className="font-medium">{fmtCredits(p.remaining)}</span>
+                            <span className="ml-1 text-slate-400">
+                              {days > 0 ? `${days}天后过期` : `${hours}小时后过期`}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+            {!loading && !detail && (
+              <div className="py-2 text-xs text-slate-400">明细加载失败</div>
+            )}
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }
 
@@ -252,7 +363,7 @@ export default function Accounts() {
                 <th className="px-4 py-2 text-left">设备 ID</th>
                 <th className="px-4 py-2 text-left">今日</th>
                 <th className="px-4 py-2 text-left">冷却</th>
-                <th className="px-4 py-2 text-right">剩余积分</th>
+                <th className="px-4 py-2 text-right">可用积分</th>
                 <th className="px-4 py-2 text-left">积分过期</th>
                 <th className="px-4 py-2 text-right">今日新增积分</th>
                 <th className="px-4 py-2 text-right">操作</th>
@@ -305,10 +416,8 @@ export default function Accounts() {
                         <span className="text-xs text-slate-300">-</span>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-right tabular-nums">
-                      {a.remaining_credits != null
-                        ? a.remaining_credits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
-                        : '-'}
+                    <td className="px-4 py-3 text-right">
+                      <CreditCell account={a} />
                     </td>
                     <td className="px-4 py-3">
                       <CreditsExpireBadge expireAt={a.credits_expire_at} />

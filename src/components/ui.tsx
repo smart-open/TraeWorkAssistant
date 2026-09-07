@@ -45,12 +45,18 @@ export function Badge({
   children,
   tone = 'slate',
   className,
+  title,
 }: {
   children: ReactNode;
   tone?: Tone;
   className?: string;
+  title?: string;
 }) {
-  return <span className={cn('chip', toneMap[tone], className)}>{children}</span>;
+  return (
+    <span className={cn('chip', toneMap[tone], className)} title={title}>
+      {children}
+    </span>
+  );
 }
 
 export function Spinner({ className }: { className?: string }) {

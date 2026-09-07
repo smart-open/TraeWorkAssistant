@@ -7,6 +7,7 @@ import type {
   CheckinDone,
   CheckinOpts,
   CreditRecord,
+  CreditDetail,
   CreditsDailySnapshot,
   EnvStatus,
   GroupView,
@@ -49,6 +50,8 @@ export const api = {
       invoke('account_update', { userId, name, jwt }),
     fetchRemainingCredits: (userId: string) =>
       invoke<number>('fetch_remaining_credits', { userId }),
+    creditDetail: (userId: string) =>
+      invoke<CreditDetail>('fetch_credit_detail', { userId }),
     refreshRemainingCredits: () =>
       invoke<number>('refresh_remaining_credits'),
     dailyList: () =>

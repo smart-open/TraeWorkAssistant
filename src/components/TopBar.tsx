@@ -14,6 +14,7 @@ import { Badge } from './ui';
 
 export default function TopBar() {
   const env = useAppStore((s) => s.env);
+  const envCn = useAppStore((s) => s.envCn);
   const certInstalled = useAppStore((s) => s.certInstalled);
   const proxy = useAppStore((s) => s.proxy);
   const apiStatus = useAppStore((s) => s.apiStatus);
@@ -31,10 +32,18 @@ export default function TopBar() {
   return (
     <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 dark:border-zinc-800 dark:bg-zinc-950">
       <div className="flex items-center gap-2">
+        {envCn?.installed ? (
+          <Badge tone="green" title={envCn.version ? `Trae 当前版本：v${envCn.version}` : '未检测到 Trae 版本号'}>
+            <MonitorCheck size={13} /> Trae 已安装
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> Trae 未安装
+          </Badge>
+        )}
         {env?.installed ? (
-          <Badge tone="green">
+          <Badge tone="green" title={env.version ? `Trae Work 当前版本：v${env.version}` : '未检测到 Trae Work 版本号'}>
             <MonitorCheck size={13} /> Trae Work 已安装
-            {env.version ? ` v${env.version}` : ''}
           </Badge>
         ) : (
           <Badge tone="red">

@@ -47,6 +47,18 @@ export default function Dashboard() {
     () => accounts.reduce((s, a) => s + (a.remaining_credits ?? 0), 0),
     [accounts],
   );
+  const generalCredits = useMemo(
+    () => accounts.reduce((s, a) => s + (a.general_credits ?? 0), 0),
+    [accounts],
+  );
+  const workCredits = useMemo(
+    () => accounts.reduce((s, a) => s + (a.work_credits ?? 0), 0),
+    [accounts],
+  );
+  const fmt = (v: number) => v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+  const creditsHint = accounts.some((a) => a.general_credits != null || a.work_credits != null)
+    ? `通用 ${fmt(generalCredits)} 积分 · Work ${fmt(workCredits)} 积分`
+    : '总剩余可用积分';
   const warned = accounts.filter(
     (a) => a.jwt_exp_hours !== null && a.jwt_exp_hours <= 24,
   ).length;
@@ -96,7 +108,7 @@ export default function Dashboard() {
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard label="账号总数" value={total} hint={`今日已签 ${checkedToday}`} tone="brand" />
-        <StatCard label="积分总额" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint="总剩余可用积分" tone="amber" />
+        <StatCard label="可用总积分" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={creditsHint} tone="amber" />
         <StatCard
           label="代理状态"
           value={proxy.running ? `运行 :${proxy.port}` : '未启动'}
@@ -169,7 +181,7 @@ export default function Dashboard() {
                 Top {top.length}
               </span>
             </div>
-            <span className="text-xs text-slate-400">按可用剩余积分排序</span>
+            <span className="text-xs text-slate-400">按可用积分排序</span>
           </div>
           <div className="h-72">
             <ResponsiveContainer>
