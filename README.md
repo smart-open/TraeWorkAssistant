@@ -61,7 +61,7 @@ python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64
 
 ## 从老版本升级
 
-> **提示**：如果你只使用 Trae Work（不需要 TRAE SOLO / WorkBuddy 等新支持的应用），可以不升级——原「Trae Work 助手」产品通过 `trae_work_main` 分支维护（2.x.x，仅必要修复），继续使用 v2.4.4 即可，功能完全一致。
+> **提示**：如果你只使用 Trae Work（不需要 TRAE SOLO / WorkBuddy 等新支持的应用），可以不升级——原「Trae Work 助手」产品线在 `trae_work_main` 分支维护（2.x.x，仅必要修复），使用 v2.x.x 最新版本即可，功能完全一致。
 >
 > **新版本从 3.0.0 开始**：之前所有版本（2.x 全系）升级到 3.x 都需要迁移数据，迁移在安装 / 首次启动时自动完成。
 
