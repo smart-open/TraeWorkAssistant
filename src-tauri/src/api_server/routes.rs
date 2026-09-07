@@ -17,6 +17,22 @@ use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState
 const MAX_ROTATE: usize = 3;
 const MAX_BODY_BYTES: usize = 8 << 20;
 
+/// 客户端协议：决定响应/流事件的输出格式（请求侧均已统一转为 OpenAI 内部格式）
+#[derive(Clone, Copy, PartialEq)]
+pub enum Protocol {
+    OpenAi,
+    Anthropic,
+}
+
+impl Protocol {
+    fn log_path(self) -> &'static str {
+        match self {
+            Protocol::OpenAi => "/v1/chat/completions",
+            Protocol::Anthropic => "/v1/messages",
+        }
+    }
+}
+
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
 fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -143,19 +159,77 @@ pub async fn chat_completions(
     let start_ts = std::time::Instant::now();
 
     if stream {
-        stream_chat(state_clone, body_vec, model, stream, start_ts)
+        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi)
     } else {
-        aggregate_chat(state_clone, body_vec, model, stream, start_ts).await
+        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi).await
+    }
+}
+
+/// Anthropic Messages 端点（F-39：+Anthropic 适配）
+/// 请求：POST /v1/messages，鉴权支持 x-api-key 或 Authorization: Bearer
+pub async fn messages(
+    State(state): State<Arc<ApiSharedState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if body.len() > MAX_BODY_BYTES {
+        return anthropic_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            "request body exceeds 8MB limit",
+        );
+    }
+
+    state
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // 校验 JSON 并预读 stream/model，再整体转为 OpenAI 内部格式复用现有链路
+    let peek: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("invalid JSON body: {}", e),
+            )
+        }
+    };
+    if peek.get("messages").and_then(|m| m.as_array()).is_none() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "messages: field required",
+        );
+    }
+    let stream = peek.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let model = peek
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&state.default_model)
+        .to_string();
+
+    let body_vec = super::payload::anthropic_to_openai(&body);
+    let state_clone = state.clone();
+    let start_ts = std::time::Instant::now();
+
+    if stream {
+        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic)
+    } else {
+        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic).await
     }
 }
 
 // ==================== Streaming ====================
 
-fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant) -> Response {
+fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::task::spawn_blocking(move || {
-        let chat_id = format!("chatcmpl-{}", now_ts());
+        let chat_id = match proto {
+            Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+            Protocol::Anthropic => format!("msg_{}", now_ts()),
+        };
         let mut tried = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
@@ -173,7 +247,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
                 Ok(reader) => {
                     // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
-                    let error_info = sse::stream_convert(reader, tx.clone(), &chat_id);
+                    let error_info = match proto {
+                        Protocol::OpenAi => sse::stream_convert(reader, tx.clone(), &chat_id),
+                        Protocol::Anthropic => {
+                            sse::stream_convert_anthropic(reader, tx.clone(), &chat_id, &model)
+                        }
+                    };
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     if let Some((code, msg)) = error_info {
                         let kind = classify_solo_error(code, &msg);
@@ -183,7 +262,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
                         }
                         state.logger.log_request(
-                            "POST", "/v1/chat/completions", &model, stream,
+                            "POST", proto.log_path(), &model, stream,
                             200, &picked.uid, duration_ms, Some(&msg),
                         );
                         if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -192,7 +271,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     } else {
                         state.pool.note_success(&picked.uid);
                         state.logger.log_request(
-                            "POST", "/v1/chat/completions", &model, stream,
+                            "POST", proto.log_path(), &model, stream,
                             200, &picked.uid, duration_ms, None,
                         );
                         if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -208,7 +287,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     *safe_lock(&state.last_error) =
                         Some(format!("uid={} status={} body={}", picked.uid, status, preview));
                     state.logger.log_request(
-                        "POST", "/v1/chat/completions", &model, stream,
+                        "POST", proto.log_path(), &model, stream,
                         status, &picked.uid, start_ts.elapsed().as_millis() as u64,
                         Some(&format!("upstream status={}", status)),
                     );
@@ -234,7 +313,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             })
             .collect();
         state.logger.log_request(
-            "POST", "/v1/chat/completions", &model, stream,
+            "POST", proto.log_path(), &model, stream,
             503, "none", duration_ms, Some("no healthy account"),
         );
         // 写入 app.log 供排查
@@ -256,10 +335,27 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 let _ = writeln!(f, "[DEBUG] {}", diag_line);
             }
         }
-        let _ = tx.blocking_send(Ok(bytes::Bytes::from(
-            "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
-        )));
-        let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        match proto {
+            Protocol::OpenAi => {
+                let _ = tx.blocking_send(Ok(bytes::Bytes::from(
+                    "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
+                )));
+                let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+            }
+            Protocol::Anthropic => {
+                let err = json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "no healthy account available",
+                    },
+                });
+                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                    "event: error\ndata: {}\n\n",
+                    err
+                ))));
+            }
+        }
     });
 
     let stream = ReceiverStream::new(rx);
@@ -278,7 +374,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
 // ==================== Non-streaming ====================
 
-async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant) -> Response {
+async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let mut tried = HashSet::new();
 
@@ -296,14 +392,20 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
 
             match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
                 Ok(reader) => {
-                    let chat_id = format!("chatcmpl-{}", now_ts());
-                    let (resp, error_info) = sse::aggregate(reader, &chat_id);
+                    let chat_id = match proto {
+                        Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+                        Protocol::Anthropic => format!("msg_{}", now_ts()),
+                    };
+                    let (resp, error_info) = match proto {
+                        Protocol::OpenAi => sse::aggregate(reader, &chat_id),
+                        Protocol::Anthropic => sse::aggregate_anthropic(reader, &chat_id, &model),
+                    };
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     match (resp, error_info) {
                         (Some(r), None) => {
                             state.pool.note_success(&picked.uid);
                             state.logger.log_request(
-                                "POST", "/v1/chat/completions", &model, stream,
+                                "POST", proto.log_path(), &model, stream,
                                 200, &picked.uid, duration_ms, None,
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -317,7 +419,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             *safe_lock(&state.last_error) =
                                 Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
                             state.logger.log_request(
-                                "POST", "/v1/chat/completions", &model, stream,
+                                "POST", proto.log_path(), &model, stream,
                                 200, &picked.uid, duration_ms, Some(&msg),
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -328,7 +430,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         _ => {
                             state.pool.note_error(&picked.uid, ErrKind::Server);
                             state.logger.log_request(
-                                "POST", "/v1/chat/completions", &model, stream,
+                                "POST", proto.log_path(), &model, stream,
                                 502, &picked.uid, duration_ms, Some("empty response"),
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -344,7 +446,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     *safe_lock(&state.last_error) =
                         Some(format!("uid={} status={}", picked.uid, status));
                     state.logger.log_request(
-                        "POST", "/v1/chat/completions", &model, stream,
+                        "POST", proto.log_path(), &model, stream,
                         status, &picked.uid, start_ts.elapsed().as_millis() as u64,
                         Some(&format!("upstream status={}", status)),
                     );
@@ -369,7 +471,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             })
             .collect();
         state.logger.log_request(
-            "POST", "/v1/chat/completions", &model, stream,
+            "POST", proto.log_path(), &model, stream,
             503, "none", duration_ms, Some("no healthy account"),
         );
         // 写入诊断日志
@@ -397,9 +499,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     .body(Body::from("internal server error"))
                     .unwrap()
             }),
-        Ok(Err(msg)) => {
-            openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg)
-        }
+        Ok(Err(msg)) => match proto {
+            Protocol::OpenAi => openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg),
+            Protocol::Anthropic => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &msg),
+        },
         Err(e) => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -500,6 +603,27 @@ fn openai_error(status: StatusCode, code: &str, msg: &str) -> Response {
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from("{\"error\":{\"message\":\"internal error\"}}"))
+                .unwrap()
+        })
+}
+
+/// Anthropic 错误响应格式：{"type":"error","error":{"type","message"}}
+fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> Response {
+    let body = json!({
+        "type": "error",
+        "error": {
+            "type": err_type,
+            "message": msg,
+        }
+    });
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"internal error\"}}"))
                 .unwrap()
         })
 }

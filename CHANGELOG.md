@@ -4,6 +4,37 @@
 
 ---
 
+## [未发布]
+
+### 变更
+
+- **NSIS 安装包升级体验优化**：升级安装（检测到旧版本）时不再弹出「卸载后安装 / 不卸载直接安装」选择页（原默认推荐先卸载），改为**跳过该页直接覆盖安装**；同版本重装与降级仍显示选择页。实现方式：新增自定义 NSIS 模板 `build-assets/installer.nsi`（基于 tauri v2.11.4 上游模板定制），经 `tauri.conf.json` 的 `bundle.windows.nsis.template` 启用。
+- **版本号收敛为单源**：单一来源 = `src-tauri/Cargo.toml`。
+  - `tauri.conf.json` 移除 `version` 字段（Tauri 自动回读 Cargo.toml）；
+  - 关于页版本号改为运行时 `getVersion()` 读取，移除 `about.ts` 中的 `APP_VERSION` 硬编码；
+  - 新增 `scripts/sync_version.py`：一条命令把版本同步到 package.json / AGENT.md 标题 / Cargo.lock；
+  - `rename_release.py` / `package_portable.py` 版本读取改为 Cargo.toml 回退。
+
+### 新增
+
+- **API 服务新增 Anthropic 兼容端点 `POST /v1/messages`**（F-39「+Anthropic 适配」落地）：
+  - 请求侧 `payload::anthropic_to_openai` 将 Anthropic Messages 请求（system / text blocks / tool_use / tool_result / tools / tool_choice）转换为 OpenAI 内部格式，复用既有账号池调度与 llm_utils_chat 链路；
+  - 响应侧 `sse::stream_convert_anthropic` / `aggregate_anthropic` 输出 Anthropic 协议（流式 message_start → content_block_start/delta/stop → message_delta → message_stop 事件序列，支持 tool_use 块；非流式 message 对象含 usage）；
+  - 鉴权支持 `x-api-key`（Anthropic 风格）与 `Authorization: Bearer`（OpenAI 风格）双风格；
+  - 单元测试覆盖 text 与 tool 往返转换（`cargo test` 2 项通过）。
+- API 服务页「使用方式 & 配置示例」补充 Anthropic 端点说明与 /v1/messages cURL 测试示例。
+
+### 文档
+
+- `docs/future-roadmap.md`：F-39「Trae API 暴露」标记完成并从待办排序移除（核心能力随 v3.1.0 网关 + F-08 双应用发现天然达成，本次补齐 Anthropic 适配）。
+- `AGENT.md`：API 网关模块结构与端点契约同步（/v1/messages、双风格鉴权、账号池 app 无关说明）。
+
+### 排查
+
+- `src-ps/trae-switch-bridge.ps1` 编码排查：文件头已含 UTF-8 BOM（EF BB BF），不存在 PowerShell 5.1 按 GBK 误读问题，无需调整。
+
+---
+
 ## [3.1.0] - 2026-09-07
 
 API 服务页界面微调。

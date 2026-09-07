@@ -223,3 +223,245 @@ fn normalize_tools(obj: &mut serde_json::Map<String, Value>) {
         *raw = Value::Array(out);
     }
 }
+
+// ==================== Anthropic 协议输入（F-39：+Anthropic 适配） ====================
+
+/// Anthropic Messages 请求体 → OpenAI 内部格式（随后复用 OpenAI → llm_utils_chat 链路）
+/// 支持：system（字符串/blocks）、text blocks、tool_use/tool_result、tools、tool_choice
+/// 不支持：image 等多模态 block（跳过）；max_tokens 由 prepare_llm_chat_body 统一设 4096
+pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
+    let v: Value = match serde_json::from_slice(src) {
+        Ok(v) => v,
+        Err(_) => return src.to_vec(),
+    };
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return src.to_vec(),
+    };
+
+    let mut out = serde_json::Map::new();
+    if let Some(m) = obj.get("model") {
+        out.insert("model".into(), m.clone());
+    }
+    if let Some(s) = obj.get("stream") {
+        out.insert("stream".into(), s.clone());
+    }
+
+    let mut messages: Vec<Value> = Vec::new();
+
+    // system → 首条 system 消息
+    match obj.get("system") {
+        Some(Value::String(s)) => {
+            messages.push(json!({ "role": "system", "content": s }));
+        }
+        Some(Value::Array(blocks)) => {
+            let text = blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("");
+            if !text.is_empty() {
+                messages.push(json!({ "role": "system", "content": text }));
+            }
+        }
+        _ => {}
+    }
+
+    for msg in obj
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let role = msg
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("user")
+            .to_string();
+        match msg.get("content") {
+            Some(Value::String(s)) => {
+                messages.push(json!({ "role": role, "content": s }));
+            }
+            Some(Value::Array(blocks)) => {
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                let mut tool_results: Vec<Value> = Vec::new();
+                for b in blocks {
+                    let btype = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match btype {
+                        "text" => {
+                            if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                text_parts.push(t.to_string());
+                            }
+                        }
+                        "tool_use" => {
+                            let args = b.get("input").cloned().unwrap_or(json!({}));
+                            tool_calls.push(json!({
+                                "id": b.get("id").cloned()
+                                    .unwrap_or(json!(format!("toolu_{}", tool_calls.len()))),
+                                "type": "function",
+                                "function": {
+                                    "name": b.get("name").cloned().unwrap_or(json!("")),
+                                    "arguments": serde_json::to_string(&args).unwrap_or_default(),
+                                },
+                            }));
+                        }
+                        "tool_result" => {
+                            let content_str = match b.get("content") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Array(arr)) => arr
+                                    .iter()
+                                    .filter_map(|c| c.get("text"))
+                                    .filter_map(|t| t.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(""),
+                                _ => String::new(),
+                            };
+                            tool_results.push(json!({
+                                "role": "tool",
+                                "tool_call_id": b.get("tool_use_id").cloned().unwrap_or(json!("")),
+                                "content": content_str,
+                            }));
+                        }
+                        _ => {} // image 等不支持类型跳过
+                    }
+                }
+                if !tool_results.is_empty() {
+                    // tool_result 属于 user 回合：先输出 tool 消息，再输出剩余文本
+                    for tr in tool_results {
+                        messages.push(tr);
+                    }
+                    if !text_parts.is_empty() {
+                        messages.push(json!({ "role": role, "content": text_parts.join("") }));
+                    }
+                } else if !tool_calls.is_empty() {
+                    let mut m = json!({
+                        "role": "assistant",
+                        "content": if text_parts.is_empty() { Value::Null } else { json!(text_parts.join("")) },
+                    });
+                    m["tool_calls"] = json!(tool_calls);
+                    messages.push(m);
+                } else if !text_parts.is_empty() {
+                    messages.push(json!({ "role": role, "content": text_parts.join("") }));
+                }
+            }
+            _ => {}
+        }
+    }
+    out.insert("messages".into(), json!(messages));
+
+    // tools: Anthropic {name, description, input_schema} → OpenAI function 格式
+    if let Some(Value::Array(ts)) = obj.get("tools") {
+        let converted: Vec<Value> = ts
+            .iter()
+            .filter_map(|t| {
+                let name = t.get("name")?.as_str()?.to_string();
+                Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": t.get("description").cloned().unwrap_or(json!("")),
+                        "parameters": t.get("input_schema").cloned().unwrap_or(json!({"type":"object"})),
+                    },
+                }))
+            })
+            .collect();
+        if !converted.is_empty() {
+            out.insert("tools".into(), json!(converted));
+        }
+    }
+
+    // tool_choice: auto/any/tool
+    if let Some(tc) = obj.get("tool_choice") {
+        match tc {
+            Value::String(s) => {
+                out.insert("tool_choice".into(), json!(s));
+            }
+            Value::Object(m) => {
+                let typ = m.get("type").and_then(|t| t.as_str()).unwrap_or("auto");
+                match typ {
+                    "any" => {
+                        out.insert("tool_choice".into(), json!("required"));
+                    }
+                    "tool" => {
+                        out.insert(
+                            "tool_choice".into(),
+                            json!({
+                                "type": "function",
+                                "function": { "name": m.get("name").cloned().unwrap_or(json!("")) },
+                            }),
+                        );
+                    }
+                    _ => {
+                        out.insert("tool_choice".into(), json!("auto"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    serde_json::to_vec(&Value::Object(out)).unwrap_or_else(|_| src.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn anthropic_basic_text_conversion() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "system": "你是助手",
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": [{"type": "text", "text": "你好！"}]},
+                {"role": "user", "content": [{"type": "text", "text": "继续"}]}
+            ]
+        });
+        let out: Value = serde_json::from_slice(&anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice())).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "你是助手");
+        assert_eq!(msgs[1]["content"], "你好");
+        assert_eq!(msgs[2]["content"], "你好！");
+        assert_eq!(msgs[3]["content"], "继续");
+        assert_eq!(out["model"], "glm-5.2");
+    }
+
+    #[test]
+    fn anthropic_tool_roundtrip_conversion() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "tools": [{"name": "get_weather", "description": "查天气", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "北京天气"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "北京"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "晴 25 度"}
+                ]}
+            ]
+        });
+        let out: Value = serde_json::from_slice(&anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice())).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        // user / assistant(tool_calls) / tool
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "get_weather");
+        let args: Value = serde_json::from_str(msgs[1]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "北京");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "toolu_1");
+        assert_eq!(msgs[2]["content"], "晴 25 度");
+        // tools → OpenAI function 格式
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+    }
+}

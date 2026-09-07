@@ -61,10 +61,11 @@ ai-work-assistant/
 │       ├── api_server/           # API 网关模块
 │       │   ├── mod.rs            # 常量 + 路由注册
 │       │   ├── server.rs         # axum 服务器启停
-│       │   ├── routes.rs         # OpenAI 兼容路由（SSE 流式 + 非流式）
-│       │   ├── pool.rs           # 账号池调度（积分感知 + 冷却状态机 + 账号轮换）
-│       │   ├── sse.rs            # SSE 协议转换（SOLO → OpenAI chunk）
-│       │   ├── auth.rs           # Bearer Token 鉴权
+│       │   ├── routes.rs         # OpenAI /v1/chat/completions + Anthropic /v1/messages（SSE 流式 + 非流式，双协议输出）
+│       │   ├── pool.rs           # 账号池调度（积分感知 + 冷却状态机 + 账号轮换，app 无关）
+│       │   ├── payload.rs        # OpenAI/Anthropic 请求 → llm_utils_chat 改写（anthropic_to_openai 先转内部格式）
+│       │   ├── sse.rs            # SSE 协议转换（SOLO → OpenAI chunk / Anthropic 事件流）
+│       │   ├── auth.rs           # API Key 鉴权（Bearer + x-api-key 双风格）
 │       │   └── api_logger.rs     # API 请求日志
 │       └── commands/             # env / cert / accounts / checkin / proxy / switch / misc / profile / api_server / oauth
 ├── src-python/
@@ -191,8 +192,8 @@ ai-work-assistant/
 - **零外发**：不连接任何自有后端。
 - **CA 证书**：仅本地回环 `127.0.0.1:8899`，自签根 CA 需 UAC 安装。
 - **UAC**：仅在 `cert_install` 提权，切换桥已改为普通用户可运行。
-- **API Key**：留空时跳过 Bearer Token 鉴权；配置时在前端掩码显示（前 4 + 后 4 + ****）。
-- **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。
+- **API Key**：留空时跳过鉴权；配置时在前端掩码显示（前 4 + 后 4 + ****）。鉴权头支持 `Authorization: Bearer <key>`（OpenAI 风格）与 `x-api-key: <key>`（Anthropic 风格）双风格。
+- **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。端点：`GET /health`（免鉴权）、`GET /status`、`GET /v1/models`、`POST /v1/chat/completions`（OpenAI 协议）、`POST /v1/messages`（Anthropic Messages 协议，F-39）。请求侧统一转 OpenAI 内部格式复用池调度链路，响应侧按协议分别输出；Anthropic 流式事件序列 message_start → content_block_* → message_delta → message_stop，reasoning_content 暂不输出（thinking 块需签名）。账号池 app 无关：Trae / Trae Work 账号入池即被同一网关服务，扣通用积分（product_id 208）。
 
 ## 13. 禁止与红线（Do NOT）
 
@@ -222,8 +223,14 @@ ai-work-assistant/
 
 ## 15. 版本升级规则（每次提交适用）
 
-同步位置：`src-tauri/tauri.conf.json` / `package.json` / `src-tauri/Cargo.toml`（三处一致）+ 本文件标题版本号。
+**单一版本源 = `src-tauri/Cargo.toml`**。同步其余位置用一条命令：`python scripts/sync_version.py`（读 Cargo.toml 同步 package.json / AGENT.md 标题 / Cargo.lock），或 `python scripts/sync_version.py 3.2.0`（先改 Cargo.toml 再同步）。
+
+- `src-tauri/tauri.conf.json`：**不写 version 字段**（Tauri 自动回读 Cargo.toml）。
+- `src/lib/about.ts`：**不写版本号**（关于页运行时经 `getVersion()` 读取）。
+- NSIS / MSI 安装包版本号同样自动跟随 Cargo.toml。
 
 - **中位版本 +1**（x.**Y**.0）：提交中新增了一个**完整、有意义的功能**（如自动发现、套餐展示、账号导入）。
 - **低位版本 +1**（x.Y.**Z**）：bug 修复、功能优化、微小功能新增或调整（UI 文案/样式、参数微调、重构不改变行为）。
 - 判断口径以**提交整体**为准：一次提交含多个改动时，取其中最高级别；纯文档/注释改动不升级。
+
+**NSIS 安装器**：使用自定义模板 `build-assets/installer.nsi`（基于 tauri v2.11.4 上游模板，配置于 tauri.conf.json `bundle.windows.nsis.template`）——升级安装时跳过「卸载旧版/不卸载」选择页，**默认直接覆盖安装**（同版本重装/降级仍显示选择页）。升级 Tauri CLI 后如构建报错，需从对应版本 tag 的 `crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi` 重新同步模板并重做定制。

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { getVersion } from '@tauri-apps/api/app';
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
 import {
   AlertCircle,
@@ -15,7 +16,6 @@ import { api } from '../lib/tauri';
 import type { UpdateCheckResult, UpdateDownloadProgress } from '../types';
 import {
   APP_NAME,
-  APP_VERSION,
   APP_TAGLINE,
   APP_OVERVIEW,
   APP_AUTHOR,
@@ -43,6 +43,14 @@ function fmtSize(bytes: number): string {
 
 export default function AboutDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [upd, setUpd] = useState<UpdateState>({ k: 'idle' });
+  // 版本号运行时读取（Tauri getVersion() ← Cargo.toml 单一来源），不再前端硬编码
+  const [appVersion, setAppVersion] = useState('');
+
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion('dev'));
+  }, []);
 
   // 重置状态 & 订阅下载进度（关闭对话框即取消 UI 订阅；下载在 Rust 侧继续不受影响）
   useEffect(() => {
@@ -134,7 +142,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
             <div className="flex items-center gap-2 text-base font-bold text-slate-800 dark:text-zinc-100">
               {APP_NAME}
               <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-semibold text-slate-500 dark:bg-zinc-800 dark:text-zinc-400">
-                v{APP_VERSION}
+                v{appVersion}
               </span>
               {/* 检查更新：分析 GitHub Releases，发现比当前更大的版本自动下载并静默安装 */}
               <button

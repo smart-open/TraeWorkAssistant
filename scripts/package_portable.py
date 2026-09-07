@@ -47,7 +47,16 @@ def walk_copy(src, dst, skip_dirs=("__pycache__", ".git")):
 def main():
     conf = load_conf()
     product = conf["productName"]
-    version = conf["version"]
+    # 版本单源 = Cargo.toml；tauri.conf.json 里的 version 字段已移除（自动回读 Cargo.toml）
+    if conf.get("version"):
+        version = conf["version"]
+    else:
+        import re as _re
+        with open(os.path.join(SRC_TAURI, "Cargo.toml"), "r", encoding="utf-8") as f:
+            m = _re.search(r'^version\s*=\s*"(\d+\.\d+\.\d+)"', f.read(), re.M)
+        if not m:
+            sys.exit("ERROR: 无法从 Cargo.toml 读取版本号")
+        version = m.group(1)
     binary_name = conf.get("mainBinaryName") or "ai-work-assistant"
     resources = conf["bundle"]["resources"]
     # resources 形如 {"../src-python/": "python/", "../src-ps/": "ps/"}

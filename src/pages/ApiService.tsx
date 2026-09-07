@@ -216,6 +216,10 @@ export default function ApiService() {
 API Key:  ${maskedKey || '（留空则不鉴权）'}
 模型 ID:  ${model}
 
+# Anthropic 兼容端点（Claude Code 等工具直连）
+POST http://127.0.0.1:${port}/v1/messages
+鉴权头: x-api-key: ${maskedKey || 'your-api-key'} 或 Authorization: Bearer
+
 # cURL 测试（请将 API Key 替换为完整值）
 curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
@@ -224,6 +228,17 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
     "model": "${model}",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
+  }'
+
+# Anthropic /v1/messages 测试
+curl -X POST http://127.0.0.1:${port}/v1/messages \\
+  -H "Content-Type: application/json" \\
+  -H "x-api-key: ${maskedKey || 'your-api-key'}" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{
+    "model": "${model}",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "你好"}]
   }'`;
     try {
       await withMinDelay(navigator.clipboard.writeText(example));
@@ -435,6 +450,9 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                 <div className="pt-1">
                   <span className="text-slate-400">其他端点：</span>
                 </div>
+                <code className="block break-all text-[11px]">
+                  POST http://127.0.0.1:{form?.api_port ?? 7864}/v1/messages（Anthropic 兼容，x-api-key 鉴权）
+                </code>
                 <code className="block break-all text-[11px]">
                   GET http://127.0.0.1:{form?.api_port ?? 7864}/v1/models
                 </code>

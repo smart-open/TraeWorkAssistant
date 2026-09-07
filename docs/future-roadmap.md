@@ -15,6 +15,7 @@
 | **Trae 会员/套餐信息展示** | 账号级 + 本机应用级双视图 + 到期时间 | ① 账号级：`ide_user_pay_status` API 批量刷新缓存，账号列表套餐徽标；② 本机级：storage.json 明文键 `iCubeServerData://icube.cloudide` → `entitlementInfo`（零 API），概览页「本机套餐」卡片；③ 到期时间：`ide_user_ent_usage` 会员包提取 `expire_time`/`next_billing_time`，徽标显示「Lite · M/D到期」 |
 | **账户中心 dc id 预留记录** | `RawAccount.DcID` 字段（只记录不展示） | 切换/保存登录态成功后自动回填（live storage.json → 快照）；发现入池随写；实测 dc id 为设备/数据中心级标识，仅作未来对账预留，不参与去重合并 |
 | **F-46 账号库导入导出（基础版）** | 导出完整性优化 + JSON 导入 | 导出：版本号取 `CARGO_PKG_VERSION`、补 `dcId`/`addedAt` 字段、兜底纳入视图外原始账号；导入：`accounts_import` 命令兼容导出格式/原始格式/裸数组，按 uid+JWT 去重，分组按 id 合并，前端「导入账号」按钮选文件一键导入并报告新增/跳过数量 |
+| **F-39 Trae API 暴露** | ✅ 已并入现有网关（随通用积分语义统一天然覆盖双应用） | 账号池 app 无关（uid+JWT+设备指纹），上游统一 `trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`（通用积分 208，Trae/Trae Work 共享扣减）；F-08 扫描发现的 Trae（CN）账号入池即可被 `/v1` 服务；Anthropic 适配：新增 `POST /v1/messages`（Anthropic Messages 协议，x-api-key/Bearer 双鉴权），请求侧 `payload::anthropic_to_openai` 转 OpenAI 内部格式复用链路，输出侧 `sse::stream_convert_anthropic`/`aggregate_anthropic` 转换（message_start/content_block/message_delta/message_stop 事件序列 + tool_use 块），单元测试覆盖 text 与 tool 往返转换 |
 
 ---
 
@@ -22,7 +23,7 @@
 
 | 编号 | 功能点 | 说明 | 预估 | 优先级 |
 |---|---|---|---|---|
-| F-39 | **Trae API 暴露** | 参照 `@casually/dsh-trae-api`：解密 storage.json 认证 → OpenAI 兼容 `/v1`（+Anthropic 适配思路）；与现有网关同构可合并实施 | 1~2 天 | P1 |
+| ~~F-39~~ | ~~**Trae API 暴露**~~ | ✅ **已完成**（2026-09-07）：核心能力随 v3.1.0 网关 + F-08 双应用发现天然达成；Anthropic `/v1/messages` 适配已补齐，详见「本轮已完成」 | — | — |
 | F-38 | **Trae → DSH 引导（不自研）** | 引导用户安装 `dingminhua/dsh-connect-trae`（装即用）；产品化时参照其 storage.json 发现 + loopback shim 设计 | ≈0 | P1 |
 | F-41 | trae2codex 转换器 | Trae 上游为自有 `llm_utils_chat` 协议、无 Responses API，Codex CLI 不能直连；复用 `tonny0812/workbuddy2api` 投影逻辑换上游——社区空白机会 | 3 天 | P3 |
 
@@ -58,11 +59,12 @@
 
 ## 六、建议排序（近期 2 周）
 
-1. **F-39 Trae API 暴露** —— Trae 侧价值最高，与现有网关同构，可复用账号池/冷却/调度
-2. **F-13 到期日历** —— 套餐展示已落地，到期时间入日历是自然延伸（含 F-49 解析加固）
-3. **F-01 app_locate + F-48 桥参数化收敛** —— 为 WorkBuddy/豆包批次铺路
-4. **WorkBuddy 批次 1** —— 端点全有开源佐证，风险最低
-5. **F-38 DSH 引导页** —— 成本≈0，随手带上
+1. **F-13 到期日历** —— 套餐展示已落地，到期时间入日历是自然延伸（含 F-49 解析加固）
+2. **F-01 app_locate + F-48 桥参数化收敛** —— 为 WorkBuddy/豆包批次铺路
+3. **WorkBuddy 批次 1** —— 端点全有开源佐证，风险最低
+4. **F-38 DSH 引导页** —— 成本≈0，随手带上
+
+> 注：原排序第 1 的 **F-39 Trae API 暴露已完成**（OpenAI `/v1` + Anthropic `/v1/messages`），从待办移除。
 
 ## 七、风险与合规（继承全量盘点）
 

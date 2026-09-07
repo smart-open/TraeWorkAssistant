@@ -333,3 +333,439 @@ fn now_ts() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+// ==================== Anthropic 协议输出（F-39：+Anthropic 适配） ====================
+
+/// 工具调用缓冲：跨事件合并同名/同序工具的分片参数
+#[derive(Default)]
+struct ToolBuf {
+    id: String,
+    name: String,
+    args: String,
+    /// 上游分片的 index（无 index 时按事件内位置）
+    slot: usize,
+}
+
+fn anthropic_stop_reason(finish: &str) -> &'static str {
+    match finish {
+        "length" => "max_tokens",
+        "tool_calls" | "function_call" => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+fn usage_i64(u: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|k| u.get(*k).and_then(|v| v.as_i64()))
+}
+
+fn anthropic_event(name: &str, data: &Value) -> String {
+    format!("event: {}\ndata: {}\n\n", name, data)
+}
+
+/// 流式转换：SOLO SSE → Anthropic Messages SSE（/v1/messages）
+/// 事件序列：message_start → content_block_start/delta/stop… → message_delta → message_stop
+/// 注：reasoning_content 暂不输出（Anthropic thinking 块需签名，严格客户端会拒绝未签名的 thinking_delta）
+// 宏内末次赋值（message_started/text_block_open）在收尾路径后不再读取，属预期行为
+#[allow(unused_assignments)]
+pub fn stream_convert_anthropic<R: Read + Send>(
+    reader: R,
+    sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    msg_id: &str,
+    model: &str,
+) -> Option<(i64, String)> {
+    let br = BufReader::new(reader);
+    let mut st = SseState::new();
+    let mut message_started = false;
+    let mut text_block_open = false;
+    let mut block_index: i64 = -1;
+    let mut tools: Vec<ToolBuf> = Vec::new();
+    let mut usage: Option<Value> = None;
+    let mut finish_reason = String::new();
+    let mut saw_done = false;
+    let mut error_info: Option<(i64, String)> = None;
+
+    macro_rules! send {
+        ($s:expr) => {
+            let _ = sender.blocking_send(Ok(bytes::Bytes::from($s)));
+        };
+    }
+
+    macro_rules! send_event {
+        ($name:expr, $data:expr) => {
+            send!(anthropic_event($name, &$data));
+        };
+    }
+
+    macro_rules! start_message {
+        () => {
+            if !message_started {
+                message_started = true;
+                send_event!(
+                    "message_start",
+                    json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "model": model,
+                            "content": [],
+                            "stop_reason": null,
+                            "stop_sequence": null,
+                            "usage": { "input_tokens": 0, "output_tokens": 0 },
+                        },
+                    })
+                );
+            }
+        };
+    }
+
+    macro_rules! open_text_block {
+        () => {{
+            block_index += 1;
+            text_block_open = true;
+            send_event!(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": { "type": "text", "text": "" },
+                })
+            );
+        }};
+    }
+
+    macro_rules! close_text_block {
+        () => {
+            if text_block_open {
+                text_block_open = false;
+                send_event!(
+                    "content_block_stop",
+                    json!({ "type": "content_block_stop", "index": block_index })
+                );
+            }
+        };
+    }
+
+    macro_rules! finish_stream {
+        () => {{
+            close_text_block!();
+            // 工具块：text 之后统一追加（content_block_start + input_json_delta + stop）
+            for (i, t) in tools.iter().enumerate() {
+                let idx = block_index + 1 + i as i64;
+                let id = if t.id.is_empty() {
+                    format!("toolu_{}_{}", msg_id, i)
+                } else {
+                    t.id.clone()
+                };
+                send_event!(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": { "type": "tool_use", "id": id, "name": t.name, "input": {} },
+                    })
+                );
+                if !t.args.is_empty() {
+                    send_event!(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": { "type": "input_json_delta", "partial_json": t.args },
+                        })
+                    );
+                }
+                send_event!(
+                    "content_block_stop",
+                    json!({ "type": "content_block_stop", "index": idx })
+                );
+            }
+            let mut out_tokens = None;
+            if let Some(u) = &usage {
+                out_tokens = usage_i64(u, &["output_tokens", "completion_tokens"]);
+            }
+            let mut message_delta = json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": anthropic_stop_reason(&finish_reason),
+                    "stop_sequence": null,
+                },
+                "usage": {},
+            });
+            if let Some(o) = out_tokens {
+                message_delta["usage"]["output_tokens"] = json!(o);
+            }
+            send_event!("message_delta", message_delta);
+            send_event!("message_stop", json!({ "type": "message_stop" }));
+        }};
+    }
+
+    for line in br.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
+            match ev.event.as_str() {
+                "output" | "thought" => {
+                    if !ev.response.is_empty() {
+                        start_message!();
+                        if !text_block_open {
+                            open_text_block!();
+                        }
+                        send_event!(
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": { "type": "text_delta", "text": ev.response },
+                            })
+                        );
+                    }
+                    // reasoning_content：跳过（见函数注释）
+                    if let Some(tc) = &ev.tool_calls {
+                        if let Some(arr) = tc.as_array() {
+                            for (pos, call) in arr.iter().enumerate() {
+                                let mut c = call.clone();
+                                if let Some(fc) = c.get("function_call").cloned() {
+                                    if let Some(obj) = c.as_object_mut() {
+                                        obj.insert("function".into(), fc);
+                                        obj.remove("function_call");
+                                    }
+                                }
+                                let fn_obj = c.get("function").and_then(|f| f.as_object()).cloned();
+                                let fn_obj = match fn_obj {
+                                    Some(mut f) => {
+                                        f.remove("namespace");
+                                        f.remove("partial_arguments");
+                                        f
+                                    }
+                                    None => continue,
+                                };
+                                let name = fn_obj
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let args = fn_obj
+                                    .get("arguments")
+                                    .and_then(|a| a.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let id = c
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let idx = c
+                                    .get("index")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize)
+                                    .unwrap_or(pos);
+                                // 找到同 index 的缓冲（或新建）
+                                if let Some(existing) = tools.iter_mut().find(|t| t.slot == idx) {
+                                    if existing.name.is_empty() {
+                                        existing.name = name;
+                                    }
+                                    if existing.id.is_empty() {
+                                        existing.id = id;
+                                    }
+                                    existing.args.push_str(&args);
+                                } else {
+                                    tools.push(ToolBuf {
+                                        id,
+                                        name,
+                                        args: args,
+                                        slot: idx,
+                                    });
+                                }
+                                // 工具调用出现时先收口文本块
+                                close_text_block!();
+                            }
+                        }
+                    }
+                }
+                "token_usage" => {
+                    usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
+                }
+                "done" | "turn_completion" => {
+                    if !ev.finish_reason.is_empty() {
+                        finish_reason = ev.finish_reason;
+                    }
+                    start_message!();
+                    finish_stream!();
+                    saw_done = true;
+                }
+                "error" => {
+                    error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
+                    send_event!(
+                        "error",
+                        json!({
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": ev.error_message,
+                            },
+                        })
+                    );
+                    saw_done = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !saw_done {
+        if message_started || !tools.is_empty() {
+            // 上游未发 done 即断流：把已收到的内容按正常收尾发出，避免客户端挂起
+            finish_stream!();
+        } else if error_info.is_none() {
+            // 空流：发一个空的合法 message
+            start_message!();
+            finish_stream!();
+        }
+    }
+
+    error_info.map(|(code, msg)| (code, msg))
+}
+
+/// 非流式聚合：SOLO SSE → Anthropic message 对象（/v1/messages）
+pub fn aggregate_anthropic<R: Read + Send>(
+    reader: R,
+    msg_id: &str,
+    model: &str,
+) -> (Option<Value>, Option<(i64, String)>) {
+    let br = BufReader::new(reader);
+    let mut st = SseState::new();
+    let mut content = String::new();
+    let mut finish_reason = "stop".to_string();
+    let mut usage: Option<Value> = None;
+    let mut tools: Vec<ToolBuf> = Vec::new();
+    let mut error_info: Option<(i64, String)> = None;
+
+    for line in br.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
+            match ev.event.as_str() {
+                "output" | "thought" => {
+                    content.push_str(&ev.response);
+                    if let Some(tc) = &ev.tool_calls {
+                        if let Some(arr) = tc.as_array() {
+                            for (pos, call) in arr.iter().enumerate() {
+                                let mut c = call.clone();
+                                if let Some(fc) = c.get("function_call").cloned() {
+                                    if let Some(obj) = c.as_object_mut() {
+                                        obj.insert("function".into(), fc);
+                                        obj.remove("function_call");
+                                    }
+                                }
+                                let fn_obj = c.get("function").and_then(|f| f.as_object()).cloned();
+                                let fn_obj = match fn_obj {
+                                    Some(mut f) => {
+                                        f.remove("namespace");
+                                        f.remove("partial_arguments");
+                                        f
+                                    }
+                                    None => continue,
+                                };
+                                let name = fn_obj
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let args = fn_obj
+                                    .get("arguments")
+                                    .and_then(|a| a.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let id = c
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let idx = c
+                                    .get("index")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|v| v as usize)
+                                    .unwrap_or(pos);
+                                if let Some(existing) = tools.iter_mut().find(|t| t.slot == idx) {
+                                    if existing.name.is_empty() {
+                                        existing.name = name;
+                                    }
+                                    if existing.id.is_empty() {
+                                        existing.id = id;
+                                    }
+                                    existing.args.push_str(&args);
+                                } else {
+                                    tools.push(ToolBuf {
+                                        id,
+                                        name,
+                                        args,
+                                        slot: idx,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                "token_usage" => {
+                    usage = Some(json!(ev.usage.unwrap_or(json!({}))));
+                }
+                "done" | "turn_completion" => {
+                    if !ev.finish_reason.is_empty() {
+                        finish_reason = ev.finish_reason;
+                    }
+                }
+                "error" => {
+                    error_info = Some((ev.error_code.unwrap_or(0), ev.error_message));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some((code, msg)) = &error_info {
+        return (None, Some((*code, msg.clone())));
+    }
+
+    let mut blocks: Vec<Value> = Vec::new();
+    if !content.is_empty() {
+        blocks.push(json!({ "type": "text", "text": content }));
+    }
+    for (i, t) in tools.iter().enumerate() {
+        let input: Value = serde_json::from_str(t.args.trim()).unwrap_or(json!({}));
+        let id = if t.id.is_empty() {
+            format!("toolu_{}_{}", msg_id, i)
+        } else {
+            t.id.clone()
+        };
+        blocks.push(json!({ "type": "tool_use", "id": id, "name": t.name, "input": input }));
+    }
+
+    let mut usage_obj = json!({ "input_tokens": 0, "output_tokens": 0 });
+    if let Some(u) = &usage {
+        if let Some(v) = usage_i64(u, &["input_tokens", "prompt_tokens"]) {
+            usage_obj["input_tokens"] = json!(v);
+        }
+        if let Some(v) = usage_i64(u, &["output_tokens", "completion_tokens"]) {
+            usage_obj["output_tokens"] = json!(v);
+        }
+    }
+
+    let resp = json!({
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": blocks,
+        "stop_reason": anthropic_stop_reason(&finish_reason),
+        "stop_sequence": null,
+        "usage": usage_obj,
+    });
+
+    (Some(resp), None)
+}
