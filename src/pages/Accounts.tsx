@@ -138,7 +138,7 @@ function CreditCell({ account }: { account: AccountView }) {
       {pos &&
         createPortal(
           <div
-            className="fixed z-50 w-[300px] rounded-lg border border-slate-200 bg-white p-3 shadow-xl dark:border-zinc-700 dark:bg-zinc-800"
+            className="fixed z-50 w-[300px] rounded-lg border border-slate-200 bg-white p-3 text-slate-700 shadow-xl dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
             style={{ top: pos.top, left: pos.left }}
             onMouseEnter={() => setPos(pos)}
             onMouseLeave={() => setPos(null)}
@@ -503,7 +503,7 @@ export default function Accounts() {
         !savingLogin &&
         createPortal(
           <div
-            className="fixed z-50 w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-800"
+            className="fixed z-50 w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 text-slate-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
             style={{
               left: Math.max(8, appMenu.x - 176),
               top: (() => {
