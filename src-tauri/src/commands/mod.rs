@@ -10,3 +10,4 @@ pub mod profile;
 pub mod proxy;
 pub mod switch;
 pub mod trae_apps;
+pub mod updater;

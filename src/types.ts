@@ -276,3 +276,20 @@ export interface OAuthLoginResult {
   refresh_token: string;
   has_refresh_token: boolean;
 }
+
+// ---- 应用自更新 ----
+export interface UpdateCheckResult {
+  has_update: boolean;
+  current_version: string;
+  latest_version: string;
+  asset_name: string;
+  download_url: string;
+  size: number;
+  release_page: string;
+}
+
+export interface UpdateDownloadProgress {
+  received: number;
+  total: number;
+  percent: number;
+}
