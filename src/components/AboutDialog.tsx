@@ -116,7 +116,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
   const busy = upd.k === 'checking' || upd.k === 'downloading' || upd.k === 'installing';
 
   return (
-    <Modal open={open} onClose={onClose} title={`关于 ${APP_NAME}`}>
+    <Modal open={open} onClose={onClose} title="关于">
       <div className="space-y-4 text-sm text-slate-600 dark:text-zinc-300">
         {/* 品牌头 */}
         <div className="flex items-center gap-3">
