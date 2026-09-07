@@ -197,6 +197,7 @@ trae-work-assistant/
 - 升版提交执行 `npm run set-version <x.y.z>` 一键同步（package.json / Cargo.toml / Cargo.lock / AGENT.md / docs 头部）；CHANGELOG.md 手动新增条目
 - 版本号单一来源为 `src-tauri/Cargo.toml`：tauri.conf.json 不写 version（自动回退），Rust 端 `env!("CARGO_PKG_VERSION")` 自动取，前端经 package.json 导入自动取
 - 一个提交包含多类变更时，按最高级别升位；版本同步提交本身不再升位
+- **GitHub Release 标题固定格式**：`v{MAJOR}.{MINOR}.{PATCH} 版本发布`（如 `v2.7.2 版本发布`），不额外加描述后缀
 
 ## 12. 安全与合规
 
