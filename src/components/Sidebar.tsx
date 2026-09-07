@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   LayoutDashboard,
   Users,
@@ -5,13 +6,17 @@ import {
   Coins,
   ScrollText,
   Settings,
-  Gift,
   Server,
+  Github,
+  Globe,
+  Info,
 } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
+import { LINK_GITHUB, LINK_BLOG } from '../lib/about';
 import type { ViewKey } from '../types';
+import AboutDialog from './AboutDialog';
 
 export type { ViewKey };
 
@@ -33,12 +38,13 @@ export default function Sidebar({
   onNav: (v: ViewKey) => void;
 }) {
   const pushToast = useAppStore((s) => s.pushToast);
-  const openInvite = async () => {
+  const [showAbout, setShowAbout] = useState(false);
+
+  const openExternal = async (url: string, label: string) => {
     try {
-      const r = await (await import('../lib/tauri')).api.misc.inviteLink();
-      await open(r.url);
+      await open(url);
     } catch (e) {
-      pushToast('error', `打开邀请链接失败：${String(e)}`);
+      pushToast('error', `打开${label}失败：${String(e)}`);
     }
   };
 
@@ -65,15 +71,33 @@ export default function Sidebar({
           );
         })}
       </nav>
-      <div className="border-t border-slate-200 p-3 dark:border-zinc-800">
+      <div className="flex items-center justify-center gap-1 border-t border-slate-200 p-3 dark:border-zinc-800">
         <button
-          onClick={openInvite}
-          className="flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-amber-500 to-amber-400 px-3 py-2 text-sm font-semibold text-white shadow-[0_8px_20px_-8px_rgba(245,158,11,0.5)] transition hover:from-amber-400 hover:to-amber-300 active:scale-[0.98]"
+          onClick={() => void openExternal(LINK_GITHUB, 'GitHub 主页')}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+          aria-label="GitHub 主页"
+          title="GitHub 主页（github.com/smart-open）"
         >
-          <Gift size={16} />
-          邀请得 5000 积分
+          <Github size={17} />
+        </button>
+        <button
+          onClick={() => void openExternal(LINK_BLOG, '个人博客')}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+          aria-label="个人博客"
+          title="个人博客（blog.sopenai.cn）"
+        >
+          <Globe size={17} />
+        </button>
+        <button
+          onClick={() => setShowAbout(true)}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+          aria-label="软件说明"
+          title="软件说明（版本 / 概述 / 作者 / 版权）"
+        >
+          <Info size={17} />
         </button>
       </div>
+      <AboutDialog open={showAbout} onClose={() => setShowAbout(false)} />
     </aside>
   );
 }

@@ -3,8 +3,36 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Minus, Square, X } from 'lucide-react';
 import { useAppStore } from '../store';
 import { Modal } from './ui';
+import { APP_NAME } from '../lib/about';
 
 const win = getCurrentWindow();
+
+/** 品牌图标：渐变圆角方块内的机器人（AI）图形 */
+export function BrandMark({ size = 24, iconSize = 14 }: { size?: number; iconSize?: number }) {
+  return (
+    <span
+      className="flex shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-sm dark:from-brand-400 dark:to-brand-600"
+      style={{ width: size, height: size }}
+    >
+      <svg
+        viewBox="0 0 24 24"
+        style={{ width: iconSize, height: iconSize }}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M12 8V4H8" />
+        <rect width="16" height="12" x="4" y="8" rx="2" />
+        <path d="M2 14h2" />
+        <path d="M20 14h2" />
+        <path d="M15 13v2" />
+        <path d="M9 13v2" />
+      </svg>
+    </span>
+  );
+}
 
 export default function TitleBar() {
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
@@ -16,11 +44,9 @@ export default function TitleBar() {
         className="flex h-9 shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 pl-3 pr-1 dark:border-zinc-800 dark:bg-zinc-950"
       >
         <div data-tauri-drag-region className="flex flex-1 items-center gap-2">
-          <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-brand-700 text-[10px] font-bold tracking-tight text-white shadow-sm dark:from-brand-400 dark:to-brand-600">
-            TW
-          </span>
+          <BrandMark />
           <span className="text-sm font-semibold text-slate-700 dark:text-zinc-200">
-            Trae Work 助手
+            {APP_NAME}
           </span>
         </div>
         <div className="flex items-center">
@@ -72,10 +98,10 @@ export default function TitleBar() {
           <p>
             检测到代理正在运行，退出时将自动关闭代理并还原系统代理设置。
             <br />
-            确认退出 Trae Work 助手？
+            确认退出 {APP_NAME}？
           </p>
         ) : (
-          <p>确认退出 Trae Work 助手？</p>
+          <p>确认退出 {APP_NAME}？</p>
         )}
       </Modal>
     </>

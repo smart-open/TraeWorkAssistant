@@ -86,7 +86,7 @@ export default function Dashboard() {
     <div className="animate-fade-in">
       <PageHeader
         title="概览"
-        desc="Trae Work 多账号签到工作台 · 一眼掌握状态与快捷入口"
+        desc="多账号签到与账号管理一站式工作台 · 一眼掌握状态与快捷入口"
         actions={
           <button onClick={refresh} className="btn-outline">
             <RefreshCw size={15} /> 刷新

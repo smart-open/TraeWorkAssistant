@@ -126,7 +126,7 @@ fn main() {
 
                     TrayIconBuilder::new()
                         .icon(icon)
-                        .tooltip("Trae Work 助手")
+                        .tooltip("AI Work 助手")
                         .menu(&menu)
                         .on_tray_icon_event(|tray, event| {
                             if let TrayIconEvent::Click {

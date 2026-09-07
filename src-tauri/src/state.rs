@@ -133,7 +133,7 @@ fn resolve_python_dir() -> PathBuf {
             if c2.exists() {
                 return c2;
             }
-            // 上层再找 resources/python（如 exe 在 "<App>/Trae Work 助手.exe" 嵌套一层）
+            // 上层再找 resources/python（如 exe 在 "<App>/AI Work 助手.exe" 嵌套一层）
             if let Some(parent) = dir.parent() {
                 let c3 = parent.join("resources").join("python");
                 if c3.exists() {

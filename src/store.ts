@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { APP_NAME } from './lib/about';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent, type SaveLoginDoneEvent } from './lib/tauri';
 import type {
@@ -696,7 +697,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (mode === 'system' || mode === 'both') {
       // sendNotification v2 返回 void（fire-and-forget），用 try-catch 防御同步异常
       try {
-        sendNotification({ title: 'Trae Work 助手', body: msg });
+        sendNotification({ title: APP_NAME, body: msg });
         console.debug('[notify] 系统通知已发送:', msg);
       } catch (e) {
         console.warn('[notify] sendNotification 异常:', e);
