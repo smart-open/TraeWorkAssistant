@@ -104,7 +104,7 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
 
     Ok(serde_json::json!({
         "exportedAt": fs_utils::now_iso(),
-        "appVersion": "2.4.6",
+        "appVersion": "2.5.0",
         "accountCount": merged.len(),
         "accounts": merged,
         "groups": groups_arr,

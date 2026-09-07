@@ -1,7 +1,7 @@
 import zipfile, os
 
 base = r"D:\ai_work\trae-work-assistant\release\Trae Work 助手"
-zip_path = r"D:\ai_work\trae-work-assistant\release\Trae Work 助手_2.4.6_x64_portable.zip"
+zip_path = r"D:\ai_work\trae-work-assistant\release\Trae Work 助手_2.5.0_x64_portable.zip"
 
 if os.path.exists(zip_path):
     os.remove(zip_path)

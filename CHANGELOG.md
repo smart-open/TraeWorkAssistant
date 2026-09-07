@@ -4,6 +4,45 @@
 
 ---
 
+## [2.5.0] - 2026-09-07
+
+积分双轨改造（通用积分 / Work 积分区分）、多主题换肤与本机扫描修复，次要版本升级（2.4.6 → 2.5.0）。
+
+### 新增
+
+- **积分双轨体系**：全链路区分通用积分（product_id 208，本服务消耗）与 Work 积分（product_id 209，套餐专用）：
+  - 后端积分解析双轨化（`CreditStats` 拆分 total/general/work + 最早过期 + 套餐信息），`AccountView` 新增 `general_credits` / `work_credits` / `pay_identity` / `membership_expire` / `membership_next_billing` 字段
+  - 新增 `pay_status.rs`：套餐身份查询与缓存；新增 `fetch_credit_detail` 积分明细命令（各积分包剩余与到期）
+  - 概览页「可用总积分」悬停拆分通用/Work，新增「本机套餐」卡片（storage.json 明文，零 API）
+  - 账号管理：套餐徽标（Free/付费，悬停显示到期与续费日）、积分单元格悬停明细卡、「积分过期」列改为「X 天后过期」
+  - 积分看板：总积分卡拆分提示 + 明细行小字拆分；API 服务：账号池积分显示统一为「通用积分」
+- **多主题换肤**（参考 `feat/traecode_doubao` 分支）：新增 6 主题（石墨灰/炭黑/暗夜紫/墨绿/琥珀暖夜/科技蓝），tailwind slate/zinc 关键档位变量化 + `data-theme` CSS 覆盖；设置页支持「跟随系统」，左下角按钮仅轮询 6 主题
+- **账号导入**：新增 `accounts_import` 命令与前端「导入账号」按钮（自动去重，报告新增/跳过/新增分组数）
+
+### 修复
+
+- **扫描本机账号**：TRAE SOLO CN 的 storage.json 无 `icube_gtm` 键导致扫描恒为空。重构证据链：① 会话日志 `&uid=` 参数（当前登录，置信可入池）② `state.vscdb` 键名痕迹字节扫描（历史候选，多账号不置信）③ `icube_gtm.users`（IDE 变体兼容保留）；并澄清 `iCubeAuthInfo://icube-dc:<did>` 为设备 id，不可入池
+
+### 变更
+
+- **系统设置重排**：左列 = 通用配置（主题/语言/通知/托盘 + Trae Work 安装路径 + 日志保留天数）/ 设备标识重置；右列 = 签到行为 / 每日定时签到 / 代理配置；移除「关于」区块（已在左下角软件说明弹框）
+- **API 服务**：积分体系说明改为紧凑单行（product_id 208 / 计入规则 / 上游接口）+ 右侧实时「当前全部账号通用积分总余额」；移除「使用方式 & 配置示例」右侧徽标
+- 「关于」弹框：标题简化为「关于」，概述明确面向 Trae Work（TRAE SOLO CN）
+
+### 变更文件
+
+| 文件 | 说明 |
+|---|---|
+| `src-tauri/src/models.rs` / `commands/accounts.rs` | 积分双轨解析、`accounts_import`、`fetch_credit_detail` |
+| `src-tauri/src/commands/pay_status.rs` / `trae_local.rs` | 套餐身份查询缓存；本机扫描证据链重构 |
+| `src/types.ts` / `src/lib/tauri.ts` / `src/store.ts` | 前端类型/绑定/状态扩展 |
+| `src/pages/Dashboard.tsx` / `Accounts.tsx` / `Credits.tsx` / `ApiService.tsx` / `Settings.tsx` | 各页面积分双轨展示与布局调整 |
+| `src/lib/themes.ts`（新增）/ `tailwind.config.js` / `src/index.css` / `App.tsx` / `Sidebar.tsx` | 6 主题换肤体系 |
+| `package.json` / `tauri.conf.json` / `Cargo.toml` / `Cargo.lock` / `about.ts` | 版本号 2.4.6 → 2.5.0 同步 |
+| `AGENT.md` / `docs/*.md` | 文档版本标注同步 |
+
+---
+
 ## [2.4.6] - 2026-09-07
 
 界面优化与版本号升级（2.4.4 → 2.4.6，一次跳过 2 个小版本号）。
