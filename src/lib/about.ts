@@ -4,7 +4,7 @@ import { donate_qr_base64 as donateQr } from '../assets/donate-qr.base64';
 
 /** 应用品牌与关于信息（集中管理，改名/升版只改这里） */
 export const APP_NAME = 'Trae Work Assistant';
-export const APP_VERSION = '2.7.0';
+export const APP_VERSION = '2.7.1';
 export const APP_TAGLINE = 'Trae Work 多账号管理与增强工具';
 export const APP_OVERVIEW =
   '面向 Trae Work（TRAE SOLO CN）的 Windows 桌面端多账号管理工具，' +
