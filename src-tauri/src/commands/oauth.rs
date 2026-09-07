@@ -325,6 +325,7 @@ pub fn oauth_login(
             refresh_token: Some(final_refresh_token.clone()),
             added_at: Some(fs_utils::now_iso()),
             updated_at: Some(fs_utils::now_iso()),
+            dc_id: None,
         });
         fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
 

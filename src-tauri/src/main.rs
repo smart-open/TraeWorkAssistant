@@ -99,6 +99,7 @@ fn main() {
             commands::trae_apps::apps_account_add,
             commands::trae_apps::apps_entitlement_read,
             commands::trae_apps::refresh_pay_status,
+            commands::trae_apps::accounts_backfill_dc_ids,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();

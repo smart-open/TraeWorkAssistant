@@ -297,7 +297,7 @@ export default function Accounts() {
 
   const addDiscovered = async (d: DiscoveredAccount) => {
     try {
-      await api.accounts.addDiscovered(d.user_id, '', d.app);
+      await api.accounts.addDiscovered(d.user_id, '', d.app, d.dc_uid);
       toast('success', `账号 ${d.user_id} 已加入账号池`);
       const list = await api.accounts.discover();
       setDiscovered(list);

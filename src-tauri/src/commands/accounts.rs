@@ -135,6 +135,7 @@ pub fn account_add_manual(
         refresh_token: None,
         added_at: Some(fs_utils::now_iso()),
         updated_at: Some(fs_utils::now_iso()),
+        dc_id: None,
     });
     fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
     if let Some(g) = group_id {

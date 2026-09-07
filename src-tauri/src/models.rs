@@ -48,6 +48,10 @@ pub struct RawAccount {
     pub added_at: Option<String>,
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// 账户中心（icube-dc）id。实测为本机设备/数据中心级标识（跨账号恒定，不具备账号区分度），
+    /// 仅记录预留供未来与外部数据源对账合并，不参与去重/合并/展示（用户确认 2026-09-07）
+    #[serde(rename = "DcID", default)]
+    pub dc_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]

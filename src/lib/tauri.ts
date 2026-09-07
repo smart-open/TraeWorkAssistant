@@ -67,8 +67,8 @@ export const api = {
     exportRaw: () => invoke<Record<string, unknown>>('accounts_export_raw'),
     // F-08 双应用账号自动发现
     discover: () => invoke<DiscoveredAccount[]>('apps_accounts_discover'),
-    addDiscovered: (userId: string, name: string, app: string) =>
-      invoke('apps_account_add', { userId, name, app }),
+    addDiscovered: (userId: string, name: string, app: string, dcUid?: string | null) =>
+      invoke('apps_account_add', { userId, name, app, dcId: dcUid ?? null }),
     // 会员/套餐信息
     refreshPayStatus: () => invoke<number>('refresh_pay_status'),
   },

@@ -347,6 +347,97 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
     out
 }
 
+/// 补充指定账号的账户中心（icube-dc）id —— **只记录、不展示**（用户确认 2026-09-07）。
+///
+/// 背景与结论（本机全量实测）：`iCubeAuthInfo://icube-dc:<uid>` 在 8 个不同账号的
+/// 快照与两应用 live 数据中恒为同一值（199439841787403），且跨设备标识重置不变——
+/// 它是设备/数据中心级标识而非账号 id，不具备账号区分度。按用户要求预留记录，
+/// 供未来与外部数据源对账合并；不参与去重/合并/展示。
+///
+/// 来源优先级：live 应用 storage.json（当前登录最准）→ profiles[_trae]/<uid> 快照。
+pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<String> {
+    let uid = user_id.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    let accounts_path = data_dir.join("checkin_accounts.json");
+    let accounts: crate::models::AccountsFile = fs_utils::read_json(&accounts_path);
+    // 已记录则跳过
+    if accounts
+        .accounts
+        .iter()
+        .any(|a| a.user_id.as_deref() == Some(uid) && a.dc_id.is_some())
+    {
+        return None;
+    }
+    // 候选来源：live 两应用 → 该账号两体系快照
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for kind in ["TraeWork", "Trae"] {
+        for dir in app_data_dirs(kind) {
+            candidates.push(dir.join(STORAGE_SUFFIX));
+        }
+    }
+    for prof in ["profiles", "profiles_trae"] {
+        candidates.push(
+            data_dir
+                .join("data")
+                .join(prof)
+                .join(uid)
+                .join(STORAGE_SUFFIX),
+        );
+    }
+    let mut found = None;
+    for p in candidates {
+        if !p.is_file() {
+            continue;
+        }
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(dc) = extract_dc_uids(&v).into_iter().next() {
+                    found = Some(dc);
+                    break;
+                }
+            }
+        }
+    }
+    let dc = found?;
+    let mut accounts = accounts;
+    if let Some(a) = accounts
+        .accounts
+        .iter_mut()
+        .find(|a| a.user_id.as_deref() == Some(uid) && a.dc_id.is_none())
+    {
+        a.dc_id = Some(dc.clone());
+        a.updated_at = Some(fs_utils::now_iso());
+        if fs_utils::write_json(&accounts_path, &accounts).is_ok() {
+            fs_utils::app_log(
+                data_dir,
+                &format!("已记录账户中心id(预留): user_id={uid} dc={dc}"),
+            );
+            return Some(dc);
+        }
+    }
+    None
+}
+
+/// 批量补充所有缺失 dc_id 的账号（有快照或本机登录痕迹即可补全），返回补充数量。
+#[tauri::command]
+pub fn accounts_backfill_dc_ids(state: State<AppState>) -> usize {
+    let accounts: crate::models::AccountsFile =
+        fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut n = 0usize;
+    for a in &accounts.accounts {
+        let Some(uid) = a.user_id.clone() else { continue };
+        if a.dc_id.is_some() {
+            continue;
+        }
+        if backfill_dc_id_for(&state.data_dir, &uid).is_some() {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// F-08：把本机发现的账号加入账号池（无 JWT 占位，待代理捕获后自动回填）。
 #[tauri::command]
 pub fn apps_account_add(
@@ -354,6 +445,7 @@ pub fn apps_account_add(
     user_id: String,
     name: String,
     app: String,
+    dc_id: Option<String>,
 ) -> Result<(), String> {
     let uid = user_id.trim().to_string();
     if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
@@ -378,6 +470,8 @@ pub fn apps_account_add(
         refresh_token: None,
         added_at: Some(fs_utils::now_iso()),
         updated_at: Some(fs_utils::now_iso()),
+        // 预留记录账户中心 id（仅当发现结果置信时传入；实测该值设备级恒定，不作账号区分）
+        dc_id: dc_id.filter(|s| !s.trim().is_empty()),
     });
     fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
     fs_utils::app_log(

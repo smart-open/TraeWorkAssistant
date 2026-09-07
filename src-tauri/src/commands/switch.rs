@@ -54,6 +54,8 @@ pub fn switch_account(
     let stderr = child.stderr.take();
     let app2 = app.clone();
     let data_dir = state.data_dir.clone();
+    let uid_for_dc = user_id.clone();
+    let dc_dir = data_dir.clone();
 
     // stdout 线程：NDJSON -> switch-progress 事件
     std::thread::spawn(move || {
@@ -71,6 +73,10 @@ pub fn switch_account(
                     let success = l.contains("\"stage\":\"done\"");
                     done_emitted = true;
                     let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": l }));
+                    // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
+                    if success {
+                        let _ = crate::commands::trae_apps::backfill_dc_id_for(&dc_dir, &uid_for_dc);
+                    }
                 }
             }
         }
@@ -156,6 +162,8 @@ pub fn save_current_login(
     let stderr = child.stderr.take();
     let app2 = app.clone();
     let data_dir = state.data_dir.clone();
+    let uid_for_dc = user_id.clone();
+    let dc_dir = data_dir.clone();
 
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -174,6 +182,10 @@ pub fn save_current_login(
                         "save-login-done",
                         serde_json::json!({ "success": success, "raw": l }),
                     );
+                    // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
+                    if success {
+                        let _ = crate::commands::trae_apps::backfill_dc_id_for(&dc_dir, &uid_for_dc);
+                    }
                 }
             }
         }
