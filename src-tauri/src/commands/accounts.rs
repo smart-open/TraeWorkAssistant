@@ -312,8 +312,14 @@ pub fn group_move(
 
 /// 积分统计结果（区分通用积分 / Work 积分）
 ///
-/// 官方积分体系：product_id 208 = 通用积分（IDE 使用）、209 = Work 积分（SOLO Agent 使用），
-/// 其余带 credits_limit 的包（如 221 每月登录积分）归入通用积分。
+/// 官方积分体系（2026-09 实测）：
+/// - product_id 208 = 通用积分（IDE 使用）、209 = Work 积分（SOLO Agent 使用），
+///   其余带 credits_limit 的包（如 221 每月登录积分）归入通用积分。
+/// - 注意：签到积分归属会变动——2026-09-04 前签到发 209（Work，200/天），
+///   之后改为发 208（通用，150/天），分类必须按 product_id 动态判断，不可写死来源。
+/// - 积分来源（pack 顶层 group_name / display_desc / group_type）：
+///   每日签到（group_type=1）、每月登录（group_type=3）、
+///   会员/购买（charge_amount>0）、兑换等。
 struct CreditStats {
     /// 全部可用积分（通用 + Work）
     total: f64,
@@ -348,6 +354,50 @@ fn query_ent_packs(jwt: &str) -> Result<Vec<serde_json::Value>, String> {
     body.get("user_entitlement_pack_list")
         .and_then(|v| v.as_array().cloned())
         .ok_or_else(|| "响应中缺少 user_entitlement_pack_list".to_string())
+}
+
+/// 归一化积分包来源标签（明细悬浮展示用）
+///
+/// 识别规则（按优先级）：
+/// 1. charge_amount > 0 → 付费获得（会员连续包月赠送 / 购买）
+/// 2. group_name / display_desc 关键词匹配 → 每日签到、每月登录、兑换
+/// 3. fallback：原样展示 group_name → display_desc → "积分包"
+fn classify_source(pack: &serde_json::Value) -> String {
+    let charge = pack
+        .get("entitlement_base_info")
+        .and_then(|e| e.get("charge_amount"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let group_name = pack
+        .get("group_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let display_desc = pack
+        .get("display_desc")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let combined = format!("{}{}", group_name, display_desc);
+
+    if charge > 0 {
+        // 付费包：会员连续包月赠送、直接购买
+        return "会员/购买".to_string();
+    }
+    if combined.contains("签到") {
+        return "每日签到".to_string();
+    }
+    if combined.contains("登录") {
+        return "每月登录".to_string();
+    }
+    if combined.contains("兑换") || combined.contains("redeem") {
+        return "兑换".to_string();
+    }
+    if !group_name.is_empty() {
+        return group_name.to_string();
+    }
+    if !display_desc.is_empty() {
+        return display_desc.to_string();
+    }
+    "积分包".to_string()
 }
 
 /// 计算剩余积分（区分通用 / Work）
@@ -493,14 +543,7 @@ pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<Cr
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         let kind = if product_id == 209 { "Work" } else { "通用" }.to_string();
-        let source = pack
-            .get("group_name")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                pack.get("display_desc").and_then(|v| v.as_str())
-            })
-            .unwrap_or("积分包")
-            .to_string();
+        let source = classify_source(pack);
         detail_packs.push(CreditPackDetail {
             kind,
             source,
