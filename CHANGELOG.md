@@ -16,6 +16,7 @@
 - **老应用数据自动迁移（启动时）**：`state.rs::migrate_legacy_dirs()` 将 `%APPDATA%\TraeWorkAssistant` 就地重命名为 `%APPDATA%\AIWorkAssistant`（零拷贝），并迁移 WebView2 界面偏好目录（identifier 变更所致）；失败不影响启动。
 - **计划任务自动迁移**：`misc.rs::try_migrate_legacy_task()` 启动时将 `TraeWorkAssistant_DailyCheckin` 迁移为 `AIWorkAssistant_DailyCheckin`（保留原触发时间，重建后删除旧任务）；任务查询 / 注册 / 删除均兼容双任务名。
 - **环境变量**：`TRAEDATA_DIR` → `AIWORKDATA_DIR`（Python 脚本与 PowerShell 桥接脚本兼容读取旧变量名）。
+- **版本线划分**：新版本自 3.0.0 起维护，**之前所有 2.x 版本升级到 3.x 均需数据迁移**（安装 / 首次启动自动完成）；原「Trae Work 助手」产品通过 `trae_work_main` 分支维护（仅 Trae Work 单应用，2.x.x，仅必要修复）。
 - **界面**：账号管理页「使用帮助」按钮改为与页头描述文字水平对齐，并以圆形色块徽章突出展示（PageHeader 的 leftExtra 移入描述行内，与描述行垂直居中）。
 - 版本号 2.5.0 → **3.0.0**（品牌迁移后的新版本起点；`package.json` / `tauri.conf.json` / `Cargo.toml` / `about.ts` 同步）。
 
