@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tauri::State;
@@ -132,12 +133,19 @@ pub async fn api_server_start(
     }
 
     // 创建池并同步
+    // 池积分语义 = 通用积分（product_id 208，llm_utils_chat 实际扣减的类别）：
+    // 优先取 general 表，账号未重新刷新过缓存时回退旧的总积分表
+    let pool_credits: HashMap<String, f64> = credits_file
+        .credits
+        .iter()
+        .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
+        .collect();
     let pool = ApiPool::new();
     pool.sync_from_accounts(
         &accounts.accounts,
         &pool_file.enabled_uids,
         &cooldowns_file.cooldowns,
-        &credits_file.credits,
+        &pool_credits,
         &credits_file.expire_times,
         &device_map,
     );

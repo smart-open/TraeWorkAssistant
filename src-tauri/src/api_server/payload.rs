@@ -39,7 +39,7 @@ fn gen_uuid_like() -> String {
 }
 
 /// OpenAI 请求体 → llm_utils_chat 请求体改写
-/// llm_utils_chat 消耗 IDE 积分(product_id 208)
+/// llm_utils_chat 消耗通用积分(product_id 208)
 pub fn prepare_llm_chat_body(
     src: &[u8],
     default_model: &str,

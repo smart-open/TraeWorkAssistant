@@ -1,4 +1,4 @@
-﻿import { useEffect, useState, useCallback } from 'react';
+﻿import { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   Play,
   Square,
@@ -237,12 +237,21 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
 
   const running = status?.running ?? false;
   const poolCount = enabledUids.size;
+  // 账号池仅展示/可选有通用积分的账号（本服务消耗通用积分，零积分账号无法服务请求）
+  const poolAccounts = useMemo(
+    () => accounts.filter((a) => (a.general_credits ?? 0) > 0),
+    [accounts],
+  );
+  const totalGeneral = useMemo(
+    () => accounts.reduce((s, a) => s + (a.general_credits ?? 0), 0),
+    [accounts],
+  );
 
   return (
     <div>
       <PageHeader
         title="API 服务"
-        desc="OpenAI 兼容接口，通过账号池轮转实现多账号负载均衡（消耗 IDE 积分）"
+        desc="OpenAI 兼容接口，通过账号池轮转实现多账号负载均衡（消耗通用积分）"
         actions={
           running ? (
             <button
@@ -301,46 +310,25 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
         </div>
       )}
 
-      {/* 积分类型说明 — 紧凑面板 */}
+      {/* 积分体系说明 — 紧凑面板 */}
       <div className="mb-5 rounded-xl border border-amber-300/70 bg-amber-50/80 px-3.5 py-2.5 dark:border-amber-700/40 dark:bg-amber-900/10">
-        <div className="mb-2 flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Info size={14} className="shrink-0 text-amber-500 dark:text-amber-400" />
           <span className="text-xs font-semibold text-amber-800 dark:text-amber-200">积分体系说明</span>
-          <span className="text-[11px] text-amber-600/60 dark:text-amber-400/40">本服务仅消耗 IDE 积分</span>
+          <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-700/50 dark:text-amber-100">本服务消耗通用积分</span>
         </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-          {/* IDE 积分 */}
-          <div className="rounded-lg border border-amber-300/60 bg-white/60 px-3 py-1.5 dark:border-amber-700/30 dark:bg-amber-900/5">
-            <div className="mb-1 flex items-center justify-between">
-              <span className="text-[11px] font-bold text-amber-800 dark:text-amber-200">IDE 积分（Trae CN）</span>
-              <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-700/50 dark:text-amber-100">本服务使用</span>
-            </div>
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 dark:text-zinc-400">
-              <span className="font-mono text-amber-700 dark:text-amber-300">product_id 208</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span className="font-mono text-amber-700 dark:text-amber-300">llm_utils_chat</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>IDE 套餐</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>明文 JSON</span>
-            </div>
-          </div>
-          {/* Work 积分 */}
-          <div className="rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-1.5 dark:border-zinc-700/50 dark:bg-zinc-800/30">
-            <div className="mb-1 flex items-center justify-between">
-              <span className="text-[11px] font-bold text-slate-500 dark:text-zinc-400">Work 积分（Trae Work CN）</span>
-              <span className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-zinc-700 dark:text-zinc-400">未采用</span>
-            </div>
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 dark:text-zinc-400">
-              <span className="font-mono text-slate-500 dark:text-zinc-400">product_id 209</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span className="font-mono text-slate-500 dark:text-zinc-400">create_agent_task</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>签到/购买</span>
-              <span className="text-slate-300 dark:text-zinc-600">·</span>
-              <span>需 TTNet 加密</span>
-            </div>
-          </div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500 dark:text-zinc-400">
+          <span>
+            Trae 通用积分（product_id 208）为账号统一积分：签到奖励、每月登录赠送与购买套餐均计入，IDE 聊天与本 API 服务共用扣减；上游接口{' '}
+            <code className="font-mono text-amber-700 dark:text-amber-300">llm_utils_chat</code>，明文 JSON。
+          </span>
+          <span className="text-slate-300 dark:text-zinc-600">·</span>
+          <span>
+            当前全部账号通用积分总余额：
+            <span className="font-bold tabular-nums text-amber-700 dark:text-amber-300">
+              {totalGeneral.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}
+            </span>
+          </span>
         </div>
       </div>
 
@@ -411,7 +399,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                 ))}
               </select>
               <p className="mt-1 text-xs text-slate-400">
-                上游接口：llm_utils_chat（IDE 积分，product_id 208）
+                上游接口：llm_utils_chat（通用积分，product_id 208）
               </p>
             </div>
 
@@ -419,7 +407,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
               <div className="mb-2 flex items-center justify-between">
                 <p className="font-medium">使用方式 & 配置示例</p>
                 <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">
-                  IDE 积分
+                  通用积分
                 </span>
                 <button
                   className="btn-ghost flex items-center gap-1 !p-1 text-xs"
@@ -490,15 +478,17 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
             </button>
           </div>
 
-          {accounts.length === 0 ? (
-            <p className="flex-1 py-8 text-center text-sm text-slate-400">暂无账号，请先在账号管理中添加</p>
+          {poolAccounts.length === 0 ? (
+            <p className="flex-1 py-8 text-center text-sm text-slate-400">
+              暂无含通用积分的账号，请先签到或刷新积分后重试
+            </p>
           ) : (
             <>
               <div className="mb-3 flex items-center gap-2">
                 <button
                   className="text-xs text-brand-600 hover:underline dark:text-brand-400"
                   onClick={() =>
-                    setEnabledUids(new Set(accounts.map((a) => a.user_id)))
+                    setEnabledUids(new Set(poolAccounts.map((a) => a.user_id)))
                   }
                 >
                   全选
@@ -511,12 +501,12 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                   清空
                 </button>
                 <span className="ml-auto text-xs text-slate-400">
-                  已选 {enabledUids.size} / {accounts.length}
+                  已选 {enabledUids.size} / {poolAccounts.length}
                 </span>
               </div>
 
               <div className="flex-1 space-y-1">
-                {accounts.map((a) => {
+                {poolAccounts.map((a) => {
                   const checked = enabledUids.has(a.user_id);
                   const poolItem = poolStatus.find((p) => p.uid === a.user_id);
                   return (
@@ -539,9 +529,9 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
-                        {a.remaining_credits != null && (
+                        {(a.general_credits ?? 0) > 0 && (
                           <span className="text-xs tabular-nums text-slate-500 dark:text-zinc-400">
-                            {a.remaining_credits.toFixed(0)} 积分
+                            {(a.general_credits ?? 0).toFixed(0)} 通用积分
                           </span>
                         )}
                         {poolItem?.cooling && (
@@ -598,7 +588,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                 <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
                   <th className="pb-2 pr-4 font-medium">账号</th>
                   <th className="pb-2 pr-4 font-medium">UID</th>
-                  <th className="pb-2 pr-4 font-medium">积分</th>
+                  <th className="pb-2 pr-4 font-medium">通用积分</th>
                   <th className="pb-2 pr-4 font-medium">状态</th>
                   <th className="pb-2 pr-4 font-medium">错误次数</th>
                   <th className="pb-2 font-medium">冷却原因</th>

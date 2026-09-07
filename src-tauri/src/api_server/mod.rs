@@ -13,7 +13,7 @@ pub use api_logger::ApiLogger;
 pub use pool::ApiPool;
 
 /// SOLO 上游常量
-/// llm_utils_chat 使用 trae-api-cn.mchost.guru（IDE 积分 product_id 208）
+/// llm_utils_chat 使用 trae-api-cn.mchost.guru（通用积分 product_id 208）
 pub const AGENT_HOST: &str = "https://trae-api-cn.mchost.guru";
 pub const EP_LLM_CHAT: &str = "/api/agent/v3/llm_utils_chat";
 pub const APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
