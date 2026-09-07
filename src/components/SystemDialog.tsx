@@ -24,7 +24,7 @@ export default function SystemDialog({ open, onClose }: { open: boolean; onClose
   ];
 
   return (
-    <Modal open={open} onClose={onClose} title="系统设置与系统日志" size="xl">
+    <Modal open={open} onClose={onClose} title="系统设置与系统日志" size="2xl">
       <div className="flex h-[72vh] flex-col">
         {/* Tab 切换 — 分段控件风格 */}
         <div className="mb-3 inline-flex shrink-0 items-center gap-1 self-start rounded-xl border border-slate-200/80 bg-slate-50/80 p-1 dark:border-zinc-700/60 dark:bg-zinc-800/40">

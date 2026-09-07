@@ -8,13 +8,15 @@ import {
   Server,
   Github,
   Globe,
-  Cog,
+  SlidersHorizontal,
+  Palette,
   Info,
 } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
 import { LINK_REPO, LINK_BLOG } from '../lib/about';
+import { nextTheme } from '../lib/themes';
 import type { ViewKey } from '../types';
 import AboutDialog from './AboutDialog';
 import SystemDialog from './SystemDialog';
@@ -46,6 +48,19 @@ export default function Sidebar({
       await open(url);
     } catch (e) {
       pushToast('error', `打开${label}失败：${String(e)}`);
+    }
+  };
+
+  // 主题轮询：每次点击切换到下一个主题并持久化
+  const cycleTheme = async () => {
+    const { settings, saveSettings } = useAppStore.getState();
+    if (!settings) return;
+    const next = nextTheme(settings.theme);
+    try {
+      await saveSettings({ ...settings, theme: next.id });
+      pushToast('success', `主题已切换：${next.name}`);
+    } catch {
+      /* toast 已发出 */
     }
   };
 
@@ -95,7 +110,15 @@ export default function Sidebar({
           aria-label="系统设置与系统日志查看"
           title="系统设置与系统日志查看"
         >
-          <Cog size={17} />
+          <SlidersHorizontal size={17} />
+        </button>
+        <button
+          onClick={() => void cycleTheme()}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+          aria-label="切换主题"
+          title="切换主题（在所有主题间轮询）"
+        >
+          <Palette size={17} />
         </button>
         <button
           onClick={() => setShowAbout(true)}

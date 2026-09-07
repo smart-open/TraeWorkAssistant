@@ -105,7 +105,7 @@ export function Modal({
   title: string;
   children: ReactNode;
   footer?: ReactNode;
-  size?: 'lg' | 'xl';
+  size?: 'lg' | 'xl' | '2xl';
 }) {
   useEffect(() => {
     if (!open) return;
@@ -124,7 +124,7 @@ export function Modal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className={`card relative z-10 w-full ${size === 'xl' ? 'max-w-4xl' : size === 'lg' ? 'max-w-2xl' : 'max-w-lg'} animate-fade-in p-5 shadow-xl`} role="dialog" aria-modal="true">
+      <div className={`card relative z-10 w-full ${size === '2xl' ? 'max-w-[78rem]' : size === 'xl' ? 'max-w-4xl' : size === 'lg' ? 'max-w-2xl' : 'max-w-lg'} animate-fade-in p-5 shadow-xl`} role="dialog" aria-modal="true">
         <div className="mb-3 flex items-center justify-between">
           <h3 className="text-base font-semibold text-slate-800 dark:text-zinc-100">{title}</h3>
           <button className="btn-ghost h-8 w-8 !p-0" onClick={onClose} aria-label="关闭">

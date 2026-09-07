@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Save, RotateCcw } from 'lucide-react';
 import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
+import { THEMES } from '../lib/themes';
 import type { Settings as SettingsType } from '../types';
 
 /**
@@ -24,7 +25,9 @@ export default function GeneralSettingsPanel() {
 
   useEffect(() => {
     if (settings && !form) {
-      setForm(settings);
+      // 兼容旧主题值：light→graphite、dark→charcoal
+      const theme = settings.theme === 'light' ? 'graphite' : settings.theme === 'dark' ? 'charcoal' : settings.theme;
+      setForm({ ...settings, theme });
     }
   }, [settings, form]);
 
@@ -65,8 +68,11 @@ export default function GeneralSettingsPanel() {
             <label className="label">主题</label>
             <select value={form.theme} onChange={(e) => update('theme', e.target.value)} className="input">
               <option value="system">跟随系统</option>
-              <option value="light">浅色</option>
-              <option value="dark">深色</option>
+              {THEMES.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
             </select>
           </div>
           <div>
@@ -105,6 +111,20 @@ export default function GeneralSettingsPanel() {
             启用系统托盘图标
           </label>
           <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
+          <div>
+            <label className="label">日志保留天数</label>
+            <input
+              type="number"
+              value={form.log_retention_days}
+              onChange={(e) => update('log_retention_days', Math.min(365, Math.max(1, Number(e.target.value) || 30)))}
+              className="input w-24"
+              min={1}
+              max={365}
+            />
+            <p className="mt-1 text-xs text-slate-400">
+              应用启动时自动清理超过保留天数的运行日志（代理 / 签到 / 切换日志）。
+            </p>
+          </div>
         </div>
       </section>
 

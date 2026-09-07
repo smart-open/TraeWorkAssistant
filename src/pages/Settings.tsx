@@ -191,7 +191,7 @@ export default function Settings() {
       />
 
       <div className="grid items-start gap-4 md:grid-cols-2">
-        {/* 左列：应用环境 + 签到行为 */}
+        {/* 左列：应用环境 + 设备标识重置 */}
         <section className="card p-4">
           <h3 className="mb-1 font-medium">应用环境</h3>
           <p className="mb-3 text-xs text-slate-400">
@@ -236,6 +236,32 @@ export default function Settings() {
 
           <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
 
+          <h3 className="mb-1 font-medium">6 层设备标识重置</h3>
+          <p className="mb-3 text-xs text-slate-500">
+            一次性重置 TRAE 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
+            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭 TRAE。
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setConfirmResetDevice(true)}
+              disabled={deviceResetActive}
+              className="btn-primary"
+            >
+              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
+            </button>
+            {deviceResetActive && (
+              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
+            )}
+          </div>
+          {deviceResetProgress.length > 0 && (
+            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
+              {deviceResetProgress.join('\n')}
+            </pre>
+          )}
+        </section>
+
+        {/* 右列：签到行为 + 每日定时签到（同一面板） */}
+        <section className="card p-4">
           <h3 className="mb-1 font-medium">签到行为</h3>
           <p className="mb-3 text-xs text-slate-400">批量签到时的默认跳过策略与重试参数，对所有签到入口生效。</p>
           <div className="space-y-3 text-sm">
@@ -255,35 +281,21 @@ export default function Settings() {
               />
               默认跳过 JWT 过期账号
             </label>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div>
-                <label className="label">失败重试次数</label>
-                <input
-                  type="number"
-                  value={form.retry}
-                  onChange={(e) => update('retry', Math.min(5, Math.max(0, Number(e.target.value) || 0)))}
-                  className="input w-24"
-                  min={0}
-                  max={5}
-                />
-              </div>
-              <div>
-                <label className="label">日志保留天数</label>
-                <input
-                  type="number"
-                  value={form.log_retention_days}
-                  onChange={(e) => update('log_retention_days', Math.min(365, Math.max(1, Number(e.target.value) || 30)))}
-                  className="input w-24"
-                  min={1}
-                  max={365}
-                />
-              </div>
+            <div>
+              <label className="label">失败重试次数（签到失败后的重试次数）</label>
+              <input
+                type="number"
+                value={form.retry}
+                onChange={(e) => update('retry', Math.min(5, Math.max(0, Number(e.target.value) || 0)))}
+                className="input w-24"
+                min={0}
+                max={5}
+              />
             </div>
           </div>
-        </section>
 
-        {/* 右列：定时签到 + 设备标识重置 */}
-        <section className="card p-4">
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
           <h3 className="mb-1 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-400">
             通过 Windows 计划任务在指定时间自动运行签到脚本，无需启动应用界面。注册/删除需要管理员权限。
@@ -317,31 +329,6 @@ export default function Settings() {
               }`}
             >
               {taskInfo}
-            </pre>
-          )}
-
-          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
-
-          <h3 className="mb-1 font-medium">6 层设备标识重置</h3>
-          <p className="mb-3 text-xs text-slate-500">
-            一次性重置 TRAE 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
-            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭 TRAE。
-          </p>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setConfirmResetDevice(true)}
-              disabled={deviceResetActive}
-              className="btn-primary"
-            >
-              <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
-            </button>
-            {deviceResetActive && (
-              <span className="text-xs text-amber-500 animate-pulse">正在执行，请勿关闭应用…</span>
-            )}
-          </div>
-          {deviceResetProgress.length > 0 && (
-            <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
-              {deviceResetProgress.join('\n')}
             </pre>
           )}
         </section>

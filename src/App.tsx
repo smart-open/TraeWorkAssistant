@@ -4,6 +4,7 @@ import Sidebar from './components/Sidebar';
 import TopBar from './components/TopBar';
 import Toaster from './components/Toaster';
 import { useAppStore } from './store';
+import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
 import Accounts from './pages/Accounts';
 import Checkin from './pages/Checkin';
@@ -49,9 +50,10 @@ export default function App() {
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
     const apply = () => {
-      const theme = useAppStore.getState().settings?.theme ?? 'system';
-      const dark = theme === 'dark' || (theme === 'system' && mq.matches);
-      document.documentElement.classList.toggle('dark', dark);
+      const theme = useAppStore.getState().settings?.theme;
+      const t = resolveTheme(theme, mq.matches);
+      document.documentElement.classList.toggle('dark', t.dark);
+      document.documentElement.dataset.theme = t.id;
     };
     apply();
     mq.addEventListener('change', apply);

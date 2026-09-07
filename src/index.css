@@ -4,6 +4,76 @@
 
 :root {
   color-scheme: light dark;
+
+  /* 主题基色变量（RGB 三段格式，供 rgb(var(--c) / alpha) 使用）
+     默认 = Tailwind 原色：slate（浅色 UI 面）、zinc（深色 UI 面） */
+  --c-slate-50: 248 250 252;
+  --c-slate-100: 241 245 249;
+  --c-slate-200: 226 232 240;
+  --c-slate-300: 203 213 225;
+  --c-zinc-100: 244 244 245;
+  --c-zinc-200: 228 228 231;
+  --c-zinc-700: 63 63 70;
+  --c-zinc-800: 39 39 42;
+  --c-zinc-900: 24 24 27;
+  --c-zinc-950: 9 9 11;
+}
+
+/* ---------- 主题覆盖 ---------- */
+
+/* 石墨灰（浅色）：冷灰基调的浅色主题 */
+html[data-theme='graphite'] {
+  color-scheme: light;
+  --c-slate-50: 247 247 248;
+  --c-slate-100: 234 234 237;
+  --c-slate-200: 216 216 221;
+  --c-slate-300: 183 183 190;
+}
+
+/* 炭黑（深色）：默认 zinc，无需覆盖 */
+
+/* 暗夜紫（深色） */
+html.dark[data-theme='violet-night'] {
+  color-scheme: dark;
+  --c-zinc-950: 13 8 23;
+  --c-zinc-900: 22 16 40;
+  --c-zinc-800: 36 26 62;
+  --c-zinc-700: 55 42 89;
+  --c-zinc-200: 230 221 247;
+  --c-zinc-100: 215 201 245;
+}
+
+/* 墨绿（深色） */
+html.dark[data-theme='ink-green'] {
+  color-scheme: dark;
+  --c-zinc-950: 7 19 14;
+  --c-zinc-900: 14 32 25;
+  --c-zinc-800: 23 51 39;
+  --c-zinc-700: 36 77 58;
+  --c-zinc-200: 217 239 228;
+  --c-zinc-100: 196 232 214;
+}
+
+/* 琥珀暖夜（深色） */
+html.dark[data-theme='amber-night'] {
+  color-scheme: dark;
+  --c-zinc-950: 23 16 8;
+  --c-zinc-900: 36 26 14;
+  --c-zinc-800: 58 44 23;
+  --c-zinc-700: 87 67 34;
+  --c-zinc-200: 243 232 211;
+  --c-zinc-100: 238 221 185;
+}
+
+/* 科技蓝（深色） */
+html.dark[data-theme='tech-blue'] {
+  color-scheme: dark;
+  --c-zinc-950: 6 13 26;
+  --c-zinc-900: 12 23 41;
+  --c-zinc-800: 20 36 63;
+  --c-zinc-700: 30 56 96;
+  --c-zinc-200: 216 230 251;
+  --c-zinc-100: 194 217 250;
 }
 
 html,
