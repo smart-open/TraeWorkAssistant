@@ -322,8 +322,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
             Trae 通用积分（product_id 208）为账号统一积分：签到奖励、每月登录赠送与购买套餐均计入，IDE 聊天与本 API 服务共用扣减；上游接口{' '}
             <code className="font-mono text-amber-700 dark:text-amber-300">llm_utils_chat</code>，明文 JSON。
           </span>
-          <span className="text-slate-300 dark:text-zinc-600">·</span>
-          <span>
+          <span className="ml-auto">
             当前全部账号通用积分总余额：
             <span className="font-bold tabular-nums text-amber-700 dark:text-amber-300">
               {totalGeneral.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}
@@ -406,9 +405,6 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
             <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
               <div className="mb-2 flex items-center justify-between">
                 <p className="font-medium">使用方式 & 配置示例</p>
-                <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">
-                  通用积分
-                </span>
                 <button
                   className="btn-ghost flex items-center gap-1 !p-1 text-xs"
                   onClick={copyConfigExample}

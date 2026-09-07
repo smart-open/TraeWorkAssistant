@@ -4,7 +4,7 @@ import { donate_qr_base64 as donateQr } from '../assets/donate-qr.base64';
 
 /** 应用品牌与关于信息（集中管理，改名/升版只改这里） */
 export const APP_NAME = 'AI Work 助手';
-export const APP_VERSION = '3.0.0';
+export const APP_VERSION = '3.1.0';
 export const APP_TAGLINE = '多账号签到与管理 · 一站式工作台';
 export const APP_OVERVIEW =
   'Windows 桌面端多账号签到与管理工具（Tauri 2 + React 18 + Rust）。' +

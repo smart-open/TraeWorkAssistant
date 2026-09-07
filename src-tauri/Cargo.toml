@@ -1,6 +1,6 @@
 [package]
 name = "ai-work-assistant"
-version = "3.0.0"
+version = "3.1.0"
 description = "AI Work 助手 - 多账号签到与管理桌面端"
 edition = "2021"
 rust-version = "1.77"
