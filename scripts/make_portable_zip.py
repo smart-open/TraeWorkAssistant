@@ -1,18 +1,15 @@
-import zipfile, os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""（已废弃的一次性脚本）重新打包 release 目录为 portable zip。
+现在统一使用 package_portable.py（自动读取 tauri.conf.json 命名为
+AI Work 助手_<version>_x64_portable.zip）。本脚本仅保留兼容入口。
+"""
+import runpy
+import os
+import sys
 
-base = r"D:\ai_work\trae-work-assistant\release\Trae Work 助手"
-zip_path = r"D:\ai_work\trae-work-assistant\release\Trae Work 助手_2.4.4_x64_portable.zip"
-
-if os.path.exists(zip_path):
-    os.remove(zip_path)
-
-parent = os.path.dirname(base)
-count = 0
-with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
-    for root, dirs, files in os.walk(base):
-        for f in files:
-            full = os.path.join(root, f)
-            rel = os.path.relpath(full, parent)  # "Trae Work 助手/..."
-            z.write(full, rel)
-            count += 1
-print("created", zip_path, os.path.getsize(zip_path), "files:", count)
+if __name__ == "__main__":
+    print("提示：make_portable_zip.py 已由 package_portable.py 取代，转交执行...\n")
+    pkg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "package_portable.py")
+    sys.argv = [pkg]
+    runpy.run_path(pkg, run_name="__main__")

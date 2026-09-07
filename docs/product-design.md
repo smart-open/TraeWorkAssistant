@@ -1,9 +1,9 @@
-# Trae Work 助手 · 产品设计文档
+# AI Work 助手 · 产品设计文档
 
 > 版本：v2.0
 > 更新日期：2026-08-13
 > v2.0.0 已实现：本地 API 网关、代理日志、签到错误冷却、积分过期调度、6 层设备标识重置。
-> 产品名称：**Trae Work 助手**
+> 产品名称：**AI Work 助手**
 > 定位：整合「多账号签到」「登录态切换」「设备隔离」「账号分组」的 Windows 桌面端一体化工具。
 > 范围声明：v1.0 聚焦桌面端管理工具；v2.0 已实现本地 API 网关（OpenAI 兼容协议）、账号池智能调度、SSE 协议转换，全部为本项目自主设计与实现。
 
@@ -13,7 +13,7 @@
 
 ### 1.1 一句话定义
 
-Trae Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工具，把原本散落在多个脚本中的**签到、代理捕获、账号切换、设备隔离、账号分组**能力收敛到一个简约美观的图形界面中。
+AI Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工具，把原本散落在多个脚本中的**签到、代理捕获、账号切换、设备隔离、账号分组**能力收敛到一个简约美观的图形界面中。
 
 ### 1.2 现状与痛点
 
@@ -110,7 +110,7 @@ Trae Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工�
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│ ● ● ●    Trae Work 助手                    🔍 搜索   🌙  ⚙️  ─ □ ✕ │  48px
+│ ● ● ●    AI Work 助手                    🔍 搜索   🌙  ⚙️  ─ □ ✕ │  48px
 ├───────────┬────────────────────────────────────────────────────────┤
 │           │                                                        │
 │  ⚡ 概览   │                                                        │
@@ -463,7 +463,7 @@ Trae Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工�
 数据统一存放在用户数据目录，不与程序目录混杂：
 
 ```
-%APPDATA%\TraeWorkAssistant\
+%APPDATA%\AIWorkAssistant\
 ├── checkin_accounts.json      # 账号 + JWT（沿用原格式，保持脚本兼容）
 ├── device_map.json            # user_id → 虚拟设备身份映射
 ├── groups.json                # 【本期新增】分组定义与归属关系
@@ -693,10 +693,10 @@ notify crate 监听 checkin_accounts.json / device_map.json / groups.json
 #### 6.3.8 定时任务
 
 ```
-注册：schtasks /Create /TN "TraeWorkAssistant_DailyCheckin" /TR "<exe> --silent-checkin" 
+注册：schtasks /Create /TN "AIWorkAssistant_DailyCheckin" /TR "<exe> --silent-checkin" 
       /SC DAILY /ST 09:00 /RL HIGHEST /F
-查询：schtasks /Query /TN "TraeWorkAssistant_DailyCheckin" /FO LIST
-删除：schtasks /Delete /TN "TraeWorkAssistant_DailyCheckin" /F
+查询：schtasks /Query /TN "AIWorkAssistant_DailyCheckin" /FO LIST
+删除：schtasks /Delete /TN "AIWorkAssistant_DailyCheckin" /F
 ```
 
 应用以 `--silent-checkin` 启动时不显示窗口，直接执行签到后退出，结果写入日志并发系统通知。
@@ -726,7 +726,7 @@ notify crate 监听 checkin_accounts.json / device_map.json / groups.json
 | 透明切换 | 根据各账号积分余额、冷却状态、分组策略，自动选号、轮转、重试；上层无需感知具体是哪一个账号、走哪一种协议 |
 | 用户价值 | 在任意支持 OpenAI/Anthropic 的客户端（Cursor、Claude Desktop、自建 Agent 等）填入一个本地地址即可，无需逐账号复制 token；积分用尽自动切换，避免单号被打满 |
 | 监控（G03） | 实时展示请求量、token 消耗、积分扣减、各账号健康度（冷却/错误计数） |
-| 与桌面端关系 | 由 Trae Work 助手托管其生命周期（启动/停止/端口协商/账号共享），在桌面端新增「API 网关」页做状态可视化 |
+| 与桌面端关系 | 由 AI Work 助手托管其生命周期（启动/停止/端口协商/账号共享），在桌面端新增「API 网关」页做状态可视化 |
 
 ### 7.2 从参考样例中提炼的"问题域信号"
 
@@ -879,7 +879,7 @@ Anthropic Request─┘                    └─→ Anthropic SSE
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  Trae Work 助手（Tauri 桌面端）                           │
+│  AI Work 助手（Tauri 桌面端）                           │
 │  概览 / 账号 / 分组 / 签到 / 积分 / 日志 / 【API 服务】   │
 └────────────────────────┬─────────────────────────────────┘
                          │ 内嵌 axum（tokio runtime）

@@ -16,6 +16,10 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::Manager;
 
 fn main() {
+    // 品牌迁移（老版本 Trae Work Assistant → AI Work 助手）：
+    // 必须在 AppState::new 创建新数据目录之前执行，才能整体重命名旧数据目录
+    let migrate_note = state::migrate_legacy_dirs();
+
     let state = match AppState::new() {
         Ok(s) => s,
         Err(e) => {
@@ -23,6 +27,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    if let Some(note) = &migrate_note {
+        fs_utils::app_log(&state.data_dir, note);
+        eprintln!("{note}");
+    }
+
+    // 旧版计划任务迁移（TraeWorkAssistant_DailyCheckin → AIWorkAssistant_DailyCheckin）：
+    // 保留原触发时间，重建为新任务名后删除旧任务；任何一步失败都静默跳过
+    if let Some(note) = commands::misc::try_migrate_legacy_task(&state) {
+        fs_utils::app_log(&state.data_dir, &note);
+    }
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())

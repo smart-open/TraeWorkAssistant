@@ -36,8 +36,8 @@ device_proxy.py，且其依赖 cryptography 可用）。
   python test_proxy.py --restore-proxy # 手动还原系统代理(崩溃自救): 上次异常退出导致代理指死时，用它一键还原
   python test_proxy.py --max-body 500000          # 日志中单条 body 预览上限(字节)
 
-证书与"零配置"：优先复用桌面端 Trae Work Assistant 已在
-%APPDATA%\\TraeWorkAssistant\\data\\certs 生成、且多半已安装信任的自签 CA，因此通常
+证书与"零配置"：优先复用桌面端 AI Work 助手 已在
+%APPDATA%\AIWorkAssistant\data\certs 生成、且多半已安装信任的自签 CA，因此通常
 无需任何额外配置即可对监控域名做 TLS 解密。若本机尚未信任该 CA，以管理员身份执行一次
 `python test_proxy.py --install-ca` 即可完成信任(或手动安装同目录 ca.cer)。
 """
@@ -56,7 +56,7 @@ from urllib.parse import urlparse
 
 # 本测试工具默认"自包含"：把 device_proxy 的 artifacts(CA / 其自身 proxy.log) 落到本
 # 脚本所在目录。但为了让用户"零配置"即可解密(不必再装一次证书)，优先复用桌面端
-# Trae Work Assistant 已生成、且多半已安装信任的 CA(位于 %APPDATA%\TraeWorkAssistant\data\certs)。
+# AI Work 助手 已生成、且多半已安装信任的 CA(位于 %APPDATA%\AIWorkAssistant\data\certs)。
 BASE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("TRAEDATA_DIR", BASE)
 
@@ -71,7 +71,7 @@ def _is_admin():
         return False
 
 # 优先复用桌面端已信任的 CA；不存在时退回本脚本 data/certs 自生成
-APP_CERT_DIR = os.path.join(os.environ.get("APPDATA", ""), "TraeWorkAssistant", "data", "certs")
+APP_CERT_DIR = os.path.join(os.environ.get("AIWORKDATA_DIR") or os.path.join(os.environ.get("APPDATA", ""), "AIWorkAssistant", "data"), "certs")
 
 def resolve_ca_dir():
     if os.path.isfile(os.path.join(APP_CERT_DIR, "ca.crt")):

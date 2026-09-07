@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AI Work 助手",
-  "version": "2.5.0",
-  "identifier": "com.traework.assistant",
+  "mainBinaryName": "ai-work-assistant",
+  "version": "2.6.0",
+  "identifier": "com.aiwork.assistant",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -42,7 +43,8 @@
     "windows": {
       "nsis": {
         "displayLanguageSelector": false,
-        "languages": ["SimpChinese"]
+        "languages": ["SimpChinese"],
+        "installerHooks": "../build-assets/installer-hooks.nsh"
       }
     }
   },

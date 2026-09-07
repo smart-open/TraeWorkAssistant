@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 
 use crate::state::AppState;
 
-/// 启动一个 python 脚本，注入 TRAEDATA_DIR（指向应用数据目录）。
+/// 启动一个 python 脚本，注入 AIWORKDATA_DIR（指向应用数据目录）。
 /// `script` 为 python 目录下的文件名（如 "device_proxy.py"）。
 pub fn spawn_script(
     state: &AppState,
@@ -22,7 +22,7 @@ pub fn spawn_script(
     cmd.arg(&script_path)
         .args(args)
         .creation_flags(0x08000000)
-        .env("TRAEDATA_DIR", &data_dir)
+        .env("AIWORKDATA_DIR", &data_dir)
         .env("PYTHONIOENCODING", "utf-8");
     if capture {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());

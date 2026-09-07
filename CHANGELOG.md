@@ -1,6 +1,42 @@
 # 更新日志
 
-本文件记录 Trae Work Assistant 的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
+本文件记录 AI Work 助手（ai-work-assistant，原 Trae Work Assistant）的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
+
+---
+
+## [2.6.0] - 2026-09-07
+
+品牌定位迁移：产品更名为 **AI Work 助手（ai-work-assistant）**，面向多个 work 工具提供功能支持；同时清理全部旧品牌痕迹并保证老应用升级兼容。
+
+### 变更
+
+- **品牌统一**：代码注释、界面文案、README、AGENT.md、docs 全部文档由 Trae Work Assistant / trae-work-assistant 统一为 AI Work 助手 / ai-work-assistant。
+- **打包标识**：identifier `com.traework.assistant` → `com.aiwork.assistant`，`mainBinaryName` → `ai-work-assistant`（主程序 ai-work-assistant.exe），Cargo 包名与 package.json 同步；新增 `scripts/rename_release.py` 将安装包统一输出到 `release/`，产物使用中文产品名命名（如 `AI Work 助手_2.6.0_x64-setup.exe` / `AI Work 助手_2.6.0_x64_zh-CN.msi` / `AI Work 助手_2.6.0_x64_portable.zip`）。
+- **老应用升级兼容（NSIS）**：新增 `build-assets/installer-hooks.nsh`，安装时自动结束旧进程、静默卸载旧品牌「Trae Work 助手」并清理残留目录 / 卸载键 / 快捷方式 / 旧命名主程序。判定依据为安装时产品名而非版本号：已发布的 v2.4.4 及更早安装包均为旧品牌，同样被自动清理；仅「AI Work 助手」品牌（v2.6.0 起）走 NSIS 原生原地升级。
+- **老应用数据自动迁移（启动时）**：`state.rs::migrate_legacy_dirs()` 将 `%APPDATA%\TraeWorkAssistant` 就地重命名为 `%APPDATA%\AIWorkAssistant`（零拷贝），并迁移 WebView2 界面偏好目录（identifier 变更所致）；失败不影响启动。
+- **计划任务自动迁移**：`misc.rs::try_migrate_legacy_task()` 启动时将 `TraeWorkAssistant_DailyCheckin` 迁移为 `AIWorkAssistant_DailyCheckin`（保留原触发时间，重建后删除旧任务）；任务查询 / 注册 / 删除均兼容双任务名。
+- **环境变量**：`TRAEDATA_DIR` → `AIWORKDATA_DIR`（Python 脚本与 PowerShell 桥接脚本兼容读取旧变量名）。
+- 版本号 2.5.0 → 2.6.0（`package.json` / `tauri.conf.json` / `Cargo.toml` / `about.ts` 同步）。
+
+### 说明
+
+- **老 MSI 安装包无法原地升级**：MSI UpgradeCode 随 identifier 变化，老版本 MSI 用户请先卸载后安装新版，或改用 NSIS 安装包（-setup.exe）升级（推荐，自动迁移）。
+- 旧数据目录迁移采用「整体重命名」：迁移后旧目录不再保留；若旧应用仍在运行导致目录被占用，本次跳过迁移、下次启动自动重试。
+
+---
+
+## [2.5.0] - 2026-09-06
+
+功能版本：账号导入 + 导出优化 + 工具栏重排（提交 bddfdf0）。
+
+### 变更
+
+- 账号管理工具栏重排：右侧依次为 刷新数据 / 扫描本机 / OAuth 登录 / 添加账户 / 导出账户 / 导入账户 / 分组管理 / 快照管理，帮助按钮纯图标移至描述后（PageHeader 新增 leftExtra 插槽）。
+- 导出账户增强：携带应用版本、dcId、addedAt，兜底导出视图外原始账号；新增「导入账户」按钮与 `accounts_import` 命令（三种格式兼容，uid+JWT 去重，分组按 id 合并）。
+- 账号池预留记录数据中心级 id（icube-dc）：`RawAccount.DcID` + 切换 / 保存登录态时自动回填 + 批量回填命令。
+- F-08 双应用账号自动发现修复：本机证据推导 Cloud-IDE uid（Trae CN 读 storage.json，SOLO 读 state.vscdb）；套餐到期时间从会员包 expire_time 提取。
+- F-47 进程关闭等待缩短为 3s / 2s（轮询 250ms）。
+- AGENT.md 新增 §15 版本升级规则（完整功能 = 中位 +1，修复 / 优化 / 微小 = 低位 +1）。
 
 ---
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-Trae Work 多账号自动签到脚本 — Trae Work 助手 内置版
+Trae Work 多账号自动签到脚本 — AI Work 助手 内置版
 =====================================================
 读取 checkin_accounts.json 中保存的各账号 JWT，按账号分配稳定伪设备 ID
 （与 device_proxy.py 共用 device_map.json），批量调用签到接口领取积分。
@@ -11,7 +11,7 @@ JWT 获取方式：
 2. 在 TRAE 里切换每个账号并点击签到；
 3. 代理日志 (proxy.log) 会打印出 [JWT 自动更新] user=... 及对应的 Authorization 头。
 
-环境变量 TRAEDATA_DIR 可重定向数据文件位置（桌面端用它指向 %APPDATA%\TraeWorkAssistant）。
+环境变量 AIWORKDATA_DIR 可重定向数据文件位置（桌面端用它指向 %APPDATA%\AIWorkAssistant；兼容旧变量名 TRAEDATA_DIR）。
 
 命令行参数：
     --json-stream   以单行 JSON（NDJSON）输出每账号结果，供桌面端逐条渲染
@@ -59,8 +59,8 @@ for _pv in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-# 数据目录：优先 TRAEDATA_DIR（由桌面端注入），否则回退到脚本目录（保持独立可用性）
-DATA_DIR = os.environ.get("TRAEDATA_DIR", BASE)
+# 数据目录：优先 AIWORKDATA_DIR（由桌面端注入，兼容旧变量名 TRAEDATA_DIR），否则回退到脚本目录（保持独立可用性）
+DATA_DIR = os.environ.get("AIWORKDATA_DIR") or os.environ.get("TRAEDATA_DIR") or BASE
 # 子目录结构：conf/ (配置), data/ (数据), logs/ (日志)
 CONF_DIR = os.path.join(DATA_DIR, "conf")
 DATA_SUBDIR = os.path.join(DATA_DIR, "data")

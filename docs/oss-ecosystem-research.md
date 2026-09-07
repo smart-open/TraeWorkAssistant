@@ -2,7 +2,7 @@
 
 > **文档版本**: 2026-09-06 · 调研分支 `feat/traecode_doubao`
 > **调研方式**: 6 个开源仓库全量浅克隆 + 源码级精读（非 README 转述），所有结论均标注来源仓库与文件路径
-> **用途**: 为本项目（Trae Work Assistant）后续扩展——API 暴露、DeepSeek Harness 接入、签到、账号管理/切换、会话保存续期、积分管理——提供可落地的参考实现索引
+> **用途**: 为本项目（AI Work 助手）后续扩展——API 暴露、DeepSeek Harness 接入、签到、账号管理/切换、会话保存续期、积分管理——提供可落地的参考实现索引
 
 ---
 
@@ -127,7 +127,7 @@ X-Product: SaaS
 - **版本强对应**：插件 0.3.0+ 要求 DSH 核心 `0.1.2-rc.1+`；安装：`dsh plugin --profile web|desktop|dsh-tui add dsh-workbuddy-connect`。
 - **loopback 架构**（loopback.ts + shim.ts）：provider 经本地回环 shim 转发到上游，shim 负责错误分类到不同 HTTP 答案 + 流超时（idle 300s）。
 - **心跳**（host-heartbeat.ts）：与 DSH host 保活，避免长流被回收。
-- **对本项目的意义**：若 Trae Work Assistant 要做"Harness 接入"，最短路径是**复用本项目现有 API 网关**（已是 OpenAI 兼容）+ 参照 dsh 的 catalog/adapter 元数据映射写一个 DSH provider；或直接引导用户安装 dsh-workbuddy-connect 连我们的网关。
+- **对本项目的意义**：若 AI Work 助手 要做"Harness 接入"，最短路径是**复用本项目现有 API 网关**（已是 OpenAI 兼容）+ 参照 dsh 的 catalog/adapter 元数据映射写一个 DSH provider；或直接引导用户安装 dsh-workbuddy-connect 连我们的网关。
 
 ---
 

@@ -6,7 +6,91 @@ use std::sync::Mutex;
 use crate::fs_utils;
 use crate::models::Settings;
 
-/// 应用全局状态。base_dir 指向 %APPDATA%\TraeWorkAssistant；
+/// 应用数据目录名（品牌 ai-work-assistant）
+pub const DATA_DIR_NAME: &str = "AIWorkAssistant";
+/// 旧版数据目录名（品牌迁移前为 Trae Work Assistant），启动时自动迁移到新版目录
+pub const LEGACY_DATA_DIR_NAME: &str = "TraeWorkAssistant";
+/// 旧版 bundle identifier（品牌迁移前），其 WebView2 数据目录同样需要迁移
+pub const LEGACY_IDENTIFIER: &str = "com.traework.assistant";
+/// 新版 bundle identifier
+pub const IDENTIFIER: &str = "com.aiwork.assistant";
+
+/// 品牌迁移：老版本遗留目录就地重命名到新目录（零拷贝，秒级完成）。
+/// 覆盖两处：
+/// 1. 数据目录 %APPDATA%\TraeWorkAssistant → %APPDATA%\AIWorkAssistant
+/// 2. WebView2 用户数据目录 %LOCALAPPDATA%\com.traework.assistant → com.aiwork.assistant
+///    （保存 localStorage 等界面偏好）
+///
+/// 策略：目标目录不存在（或为空）时才重命名；老应用仍在运行导致目录被占用时
+/// 重命名会失败，此时静默跳过（下次启动再试），绝不影响本次启动。
+/// 返回迁移结果说明（无迁移时为 None），供启动日志记录。
+pub fn migrate_legacy_dirs() -> Option<String> {
+    let mut notes: Vec<String> = Vec::new();
+
+    // 1) 数据目录迁移
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let legacy = PathBuf::from(&appdata).join(LEGACY_DATA_DIR_NAME);
+        let new_dir = PathBuf::from(&appdata).join(DATA_DIR_NAME);
+        if legacy.is_dir() {
+            if new_dir.is_dir() && dir_is_empty(&new_dir) == Some(false) {
+                notes.push(format!(
+                    "品牌迁移：新数据目录已存在且有数据，跳过迁移（旧目录保留于 {}）",
+                    legacy.display()
+                ));
+            } else if new_dir.is_dir() {
+                let _ = std::fs::remove_dir(&new_dir); // 新目录为空，先移除再整体重命名
+                match std::fs::rename(&legacy, &new_dir) {
+                    Ok(()) => notes.push(format!(
+                        "品牌迁移：数据目录已由 {} 迁移至 {}",
+                        legacy.display(),
+                        new_dir.display()
+                    )),
+                    Err(e) => notes.push(format!(
+                        "品牌迁移：数据目录迁移失败（{e}），本次使用新目录，旧目录保留于 {}",
+                        legacy.display()
+                    )),
+                }
+            } else {
+                match std::fs::rename(&legacy, &new_dir) {
+                    Ok(()) => notes.push(format!(
+                        "品牌迁移：数据目录已由 {} 迁移至 {}",
+                        legacy.display(),
+                        new_dir.display()
+                    )),
+                    Err(e) => notes.push(format!(
+                        "品牌迁移：数据目录迁移失败（{e}），旧目录保留于 {}",
+                        legacy.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    // 2) WebView2 用户数据目录迁移（identifier 变更所致；失败不影响启动）
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let legacy = PathBuf::from(&local).join(LEGACY_IDENTIFIER);
+        let new_dir = PathBuf::from(&local).join(IDENTIFIER);
+        if legacy.is_dir() && !new_dir.exists() {
+            match std::fs::rename(&legacy, &new_dir) {
+                Ok(()) => notes.push("品牌迁移：WebView2 界面偏好目录已迁移".to_string()),
+                Err(_) => notes.push(
+                    "品牌迁移：WebView2 目录迁移失败（可能旧应用仍在运行），界面偏好将重置".to_string(),
+                ),
+            }
+        }
+    }
+
+    if notes.is_empty() { None } else { Some(notes.join("；")) }
+}
+
+/// 目录是否为空：None 表示读取失败
+fn dir_is_empty(dir: &PathBuf) -> Option<bool> {
+    std::fs::read_dir(dir)
+        .ok()
+        .map(|mut entries| entries.next().is_none())
+}
+
+/// 应用全局状态。base_dir 指向 %APPDATA%\AIWorkAssistant；
 /// 子目录: conf/ (配置), data/ (数据), logs/ (日志)
 /// python_dir 指向打包后的 python 脚本目录（Tauri resource `python/`）。
 pub struct AppState {
@@ -22,11 +106,11 @@ const CONF_FILES: &[&str] = &["app_settings.json"];
 
 impl AppState {
     pub fn new() -> Result<Self, String> {
-        // 数据目录：%APPDATA%\TraeWorkAssistant，不存在则创建
+        // 数据目录：%APPDATA%\AIWorkAssistant，不存在则创建
         let appdata = std::env::var("APPDATA")
             .map(PathBuf::from)
             .map_err(|_| "无法读取 APPDATA 环境变量".to_string())?;
-        let data_dir = appdata.join("TraeWorkAssistant");
+        let data_dir = appdata.join(DATA_DIR_NAME);
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
 
@@ -133,7 +217,7 @@ fn resolve_python_dir() -> PathBuf {
             if c2.exists() {
                 return c2;
             }
-            // 上层再找 resources/python（如 exe 在 "<App>/AI Work 助手.exe" 嵌套一层）
+            // 上层再找 resources/python（如 exe 在 "<App>/ai-work-assistant.exe" 嵌套一层）
             if let Some(parent) = dir.parent() {
                 let c3 = parent.join("resources").join("python");
                 if c3.exists() {

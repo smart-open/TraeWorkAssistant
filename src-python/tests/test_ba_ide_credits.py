@@ -17,7 +17,7 @@ APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 IDE_VERSION = "0.1.50"
 IDE_VERSION_CODE = "20260811"
 
-APP_DATA = Path(os.environ.get("APPDATA", "")) / "TraeWorkAssistant" / "data"
+APP_DATA = Path(os.environ.get("AIWORKDATA_DIR") or os.path.join(os.environ.get("APPDATA", ""), "AIWorkAssistant")) / "data"
 
 
 def load_ba_accounts():

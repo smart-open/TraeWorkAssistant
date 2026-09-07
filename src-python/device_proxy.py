@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-Trae Work 签到设备ID代理 (方案A) — Trae Work 助手 内置版
+Trae Work 签到设备ID代理 (方案A) — AI Work 助手 内置版
 ========================================================
 本地 MITM 代理：透明截获 TRAE 全量 HTTPS 流量（对抵达代理的所有 CONNECT 域名做
 TLS 解密，覆盖 api.trae.cn / api.trae.com.cn / zijieapi.com /
@@ -16,7 +16,7 @@ Windows 受信任根证书颁发机构，TRAE 才会信任代理证书。
 环境变量：
     PROXY_PORT        监听端口（默认 8899）
     AUTO_CAPTURE_JWT  是否自动捕获写回 accounts.json（默认 1）
-    TRAEDATA_DIR      数据目录（默认脚本所在目录）；应用通过此变量指向 %APPDATA%\TraeWorkAssistant
+    AIWORKDATA_DIR    数据目录（默认脚本所在目录）；应用通过此变量指向 %APPDATA%\AIWorkAssistant（兼容旧变量名 TRAEDATA_DIR）
 
 用法：
     python device_proxy.py            # 监听 127.0.0.1:8899
@@ -46,8 +46,8 @@ import struct
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("PROXY_PORT", "8899"))
 BASE = os.path.dirname(os.path.abspath(__file__))
-# 数据目录：优先 TRAEDATA_DIR（由桌面端注入），否则回退到脚本目录（保持独立可用性）
-DATA_DIR = os.environ.get("TRAEDATA_DIR", BASE)
+# 数据目录：优先 AIWORKDATA_DIR（由桌面端注入，兼容旧变量名 TRAEDATA_DIR），否则回退到脚本目录（保持独立可用性）
+DATA_DIR = os.environ.get("AIWORKDATA_DIR") or os.environ.get("TRAEDATA_DIR") or BASE
 CONF_DIR = os.path.join(DATA_DIR, "conf")
 DATA_SUBDIR = os.path.join(DATA_DIR, "data")
 MAP_FILE = os.path.join(DATA_SUBDIR, "device_map.json")

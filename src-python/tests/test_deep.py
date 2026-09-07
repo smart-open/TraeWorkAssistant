@@ -12,7 +12,7 @@ import urllib.request
 import urllib.error
 import ssl
 
-APP_DATA = os.path.join(os.environ.get("APPDATA", ""), "TraeWorkAssistant", "data")
+APP_DATA = os.environ.get("AIWORKDATA_DIR") or os.path.join(os.environ.get("APPDATA", ""), "AIWorkAssistant", "data")
 ACCOUNTS_FILE = os.path.join(APP_DATA, "checkin_accounts.json")
 DEVICE_MAP_FILE = os.path.join(APP_DATA, "device_map.json")
 

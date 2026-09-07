@@ -1,4 +1,4 @@
-# Trae Work 助手 · 运行手册
+# AI Work 助手 · 运行手册
 
 > 适用版本：v2.4.4 ｜ 平台：**仅 Windows 10 / 11**
 > 本文档说明如何准备环境、启动开发、打包发布、日常运行与排错。
@@ -9,7 +9,7 @@
 ## 0. 一句话流程
 
 ```powershell
-git clone <repo> && cd trae-work-assistant
+git clone <repo> && cd ai-work-assistant
 npm install                 # 装前端依赖
 npm run tauri dev           # 开发模式（带 Rust 热重载）
 # 发布：
@@ -54,8 +54,8 @@ Win11 已内置；Win10 到 [Microsoft WebView2 下载页](https://developer.mic
 ## 2. 获取代码与安装依赖
 
 ```powershell
-git clone <your-repo-url> trae-work-assistant
-cd trae-work-assistant
+git clone <your-repo-url> ai-work-assistant
+cd ai-work-assistant
 npm install
 ```
 
@@ -110,14 +110,14 @@ src-tauri/target/release/bundle/
 └── nsis/  *.exe
 ```
 
-安装后即可从开始菜单启动「Trae Work 助手」，无需 Node / Rust 环境。
+安装后即可从开始菜单启动「AI Work 助手」，无需 Node / Rust 环境。
 
 ---
 
 ## 5. 日常运行（已安装用户视角）
 
 1. 安装并启动一次 **Trae Work**，登录任意账号产生登录态；
-2. 打开 **Trae Work 助手** → 顶栏提示「未安装 CA 证书」→ 点「一键安装证书」（弹 UAC）；
+2. 打开 **AI Work 助手** → 顶栏提示「未安装 CA 证书」→ 点「一键安装证书」（弹 UAC）；
 3. 点顶栏「启动代理」→ 日志页可见 `[代理] listening 127.0.0.1:8899`；
 4. 在 Trae Work 中切换账号，代理自动捕获 JWT 写回本地；
 5. 「账号管理」核对列表/分组；「一键签到」选择范围实时进度；「积分看板」看排行；
@@ -205,10 +205,10 @@ src-tauri/target/release/bundle/
 
 ## 6. 数据目录与配置
 
-所有数据仅存本机 `%APPDATA%\TraeWorkAssistant\`，分三个子目录：
+所有数据仅存本机 `%APPDATA%\AIWorkAssistant\`，分三个子目录：
 
 ```
-%APPDATA%\TraeWorkAssistant\
+%APPDATA%\AIWorkAssistant\
 ├── conf/
 │   └── app_settings.json       # 主题/端口/跳过策略/retry/log_retention_days…
 ├── data/

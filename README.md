@@ -47,14 +47,28 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 npm install
 npm run tauri dev      # 开发模式
 npm run tauri build    # 打包（msi + nsis）
+python scripts/rename_release.py   # 安装包统一输出到 release/，命名 AI Work 助手_<版本>_x64*
+python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64_portable.zip）
 ```
 
 前置：Node.js 18+、Rust 1.75+、Python 3.9+、WebView2 Runtime、VS Build Tools (C++)
 
+## 从老版本升级
+
+> **提示**：如果你只使用 Trae Work（不需要 TRAE SOLO / WorkBuddy 等新支持的应用），可以不升级，继续使用 v2.4.4 版本即可，功能完全一致。
+
+升级兼容按**安装时的产品名**判定，与版本号无关：
+
+- **旧品牌「Trae Work 助手」（已发布的 v2.4.4 及更早）**：新版安装时会自动结束旧进程、**静默卸载**并清理残留（安装目录 / 卸载键 / 快捷方式），首次启动自动完成数据迁移，无需手动操作。
+- **新品牌「AI Work 助手」（v2.6.0 起）**：产品名一致，直接双击新安装包即走**原生原地升级**，用户数据不受影响。
+- **自动迁移内容**：数据目录 `%APPDATA%\TraeWorkAssistant` → `%APPDATA%\AIWorkAssistant`（就地重命名，零拷贝）、界面偏好、每日签到计划任务（保留原触发时间）。
+- **MSI 安装包**：因产品标识变更，老版 MSI 无法原地升级，请先卸载旧版再安装（或改用 NSIS 安装包，推荐）。
+- 旧版定时任务如未自动迁移，请在「设置 → 定时任务」重新注册一次。
+
 ## 数据目录
 
 ```
-%APPDATA%\TraeWorkAssistant\
+%APPDATA%\AIWorkAssistant\
 ├── conf/
 │   └── app_settings.json        # 设置
 ├── data/

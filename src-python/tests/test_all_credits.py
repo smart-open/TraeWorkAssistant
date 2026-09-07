@@ -2,7 +2,7 @@
 """快速检查所有账号的 ide_credits vs work_credits"""
 import json, os, ssl, urllib.request, time, hashlib, re
 
-APP_DATA = os.path.join(os.environ.get("APPDATA", ""), "TraeWorkAssistant", "data")
+APP_DATA = os.environ.get("AIWORKDATA_DIR") or os.path.join(os.environ.get("APPDATA", ""), "AIWorkAssistant", "data")
 accounts = json.load(open(os.path.join(APP_DATA, "checkin_accounts.json"), "r", encoding="utf-8"))["accounts"]
 device_map = json.load(open(os.path.join(APP_DATA, "device_map.json"), "r", encoding="utf-8"))
 

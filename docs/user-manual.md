@@ -1,4 +1,4 @@
-# Trae Work Assistant 用户手册
+# AI Work 助手 用户手册
 
 > **版本**: v2.4.4 | **平台**: Windows 10 / 11 | **更新日期**: 2026-08-16
 
@@ -20,7 +20,7 @@
 
 ## 1. 软件简介
 
-Trae Work Assistant 是一款 Windows 桌面端多账号管理工具，为 Trae Work 用户提供账号管理、自动签到、登录态切换、积分看板、本地 API 网关等功能。所有数据存储在本地，不上传任何服务器。
+AI Work 助手 是一款 Windows 桌面端多账号管理工具，为 Trae Work 用户提供账号管理、自动签到、登录态切换、积分看板、本地 API 网关等功能。所有数据存储在本地，不上传任何服务器。
 
 **核心功能**：
 
@@ -447,7 +447,7 @@ v2.4.3 起，代理启动时会**自动读取你已有的系统代理作为上�
 
 ### Q: 快照管理中看不到已保存的快照？
 
-**A**: 快照存储在 `%APPDATA%\TraeWorkAssistant\data\profiles\` 目录下。如果看不到快照，请确认应用已更新到最新版本（v2.4.1+），旧版本可能存在路径不一致的问题。
+**A**: 快照存储在 `%APPDATA%\AIWorkAssistant\data\profiles\` 目录下。如果看不到快照，请确认应用已更新到最新版本（v2.4.1+），旧版本可能存在路径不一致的问题。
 
 ### Q: JWT 过期了怎么办？
 
@@ -480,7 +480,7 @@ v2.4.3 起，代理启动时会**自动读取你已有的系统代理作为上�
 
 ### Q: 数据存储在哪里？
 
-**A**: 所有数据存储在 `%APPDATA%\TraeWorkAssistant\` 目录下：
+**A**: 所有数据存储在 `%APPDATA%\AIWorkAssistant\` 目录下：
 - `conf/` — 配置文件
 - `data/` — 账号、积分、快照等数据
 - `logs/` — 运行日志（proxy / checkin / switcher / api / proxy-requests）

@@ -2,12 +2,12 @@
 .SYNOPSIS
     Trae Work 账号切换集成桥（非交互模式）
 .DESCRIPTION
-    供 Trae Work 助手（Tauri）调用的非交互切换层。
+    供 AI Work 助手（Tauri）调用的非交互切换层。
     封装「关闭 TRAE → 恢复目标账号登录态 → 重置机器码 → 启动 TRAE」流程，
     并以 NDJSON 逐行输出进度，供桌面端渲染步骤条。
 
     注意：本脚本是集成层，封装账号切换与设备标识重置的全部逻辑，
-    供 Trae Work 助手（Tauri）以非交互模式调用。
+    供 AI Work 助手（Tauri）以非交互模式调用。
 
 .PARAMETER Action
     Switch（切换账号）/ ResetMachineId（仅重置机器码）/ BackupCurrent（备份当前）
@@ -41,7 +41,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Script:AppDataDir = "$env:APPDATA\TraeWorkAssistant"
+# 数据目录：优先 AIWORKDATA_DIR（由桌面端注入），否则回退 %APPDATA%\AIWorkAssistant
+$Script:AppDataDir = if ($env:AIWORKDATA_DIR) { $env:AIWORKDATA_DIR } else { "$env:APPDATA\AIWorkAssistant" }
 $Script:LogFile = "$Script:AppDataDir\logs\switcher.log"
 $Script:_TraeExeCache = $null
 
@@ -180,11 +181,12 @@ function Find-TraeExe {
 
     # 5. 运行中进程（最后回退之一）：仅当以上都找不到时才用，
     #    避免残留/错误的 Trae 进程误导启动路径。同时排除本助手自身进程
-    #    （进程名以 "Trae" 开头，如 "Trae Work 助手"），避免把 App 本体当成 Trae 启动。
+    #    （本应用进程名为 "ai-work-assistant"，不以 Trae 开头，不会被 Trae* 过滤命中，
+    #    保留排除逻辑以防旧版运行残留），避免把 App 本体当成 Trae 启动。
     try {
         $selfPid = $PID
         $parentPid = $selfPid
-        $KnownAppName = 'Trae Work 助手'
+        $KnownAppName = 'ai-work-assistant'
         $parentName = $KnownAppName
         try {
             $pp = (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $selfPid" -ErrorAction SilentlyContinue).ParentProcessId
@@ -252,11 +254,12 @@ function Set-CurrentAccount {
 }
 
 function Stop-Trae {
-    # 排除本助手自身进程：本应用进程名以 "Trae" 开头（如 "Trae Work 助手"），
-    # 若不过滤会被 Get-Process -Name 'Trae*' 命中并被 Stop-Process 误杀，导致 App 直接退出。
+    # 排除本助手自身进程：本应用进程名为 "ai-work-assistant"（旧版为 "Trae Work 助手"，以
+    # "Trae" 开头、会被 Get-Process -Name 'Trae*' 命中并被 Stop-Process 误杀导致 App 退出；
+    # 新版不以 Trae 开头，保留排除逻辑兼容旧版运行场景）。
     $selfPid = $PID
     $parentPid = $selfPid
-    $KnownAppName = 'Trae Work 助手'
+    $KnownAppName = 'ai-work-assistant'
     $parentName = $KnownAppName
     try {
         $pp = (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $selfPid" -ErrorAction SilentlyContinue).ParentProcessId

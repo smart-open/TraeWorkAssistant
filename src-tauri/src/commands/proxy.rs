@@ -94,7 +94,7 @@ pub fn proxy_start(
     let settings = state.settings();
     let proxy_domains = settings.proxy_domains.clone();
     let proxy_log_path = settings.proxy_log_path.clone().unwrap_or_else(|| {
-        // 默认路径：%APPDATA%\TraeWorkAssistant\logs（代理请求日志直接存放在 logs/ 下）
+        // 默认路径：%APPDATA%\AIWorkAssistant\logs（代理请求日志直接存放在 logs/ 下）
         state.logs_dir().to_string_lossy().to_string()
     });
     // 捕获启动前的系统代理（通常是用户的 VPN 梯子，如 Clash/v2rayN 本地代理）。
@@ -132,7 +132,7 @@ pub fn proxy_start(
     let mut cmd = Command::new(&state.python_exe);
     cmd.arg(&script_path)
         .creation_flags(0x08000000)
-        .env("TRAEDATA_DIR", &data_dir)
+        .env("AIWORKDATA_DIR", &data_dir)
         .env("PROXY_PORT", &port_s)
         .env("AUTO_CAPTURE_JWT", "1")
         .env("PROXY_DOMAINS", &proxy_domains)

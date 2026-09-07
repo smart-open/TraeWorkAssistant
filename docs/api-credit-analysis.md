@@ -2,7 +2,7 @@
 
 > **文档版本**: 2026-08-14
 > **分析来源**: MITM 代理抓包日志 + 项目代码实现 + 明文 JSON 测试验证
-> **涉及项目**: trae-work-assistant (TraeWorkAssistant)
+> **涉及项目**: ai-work-assistant (AIWorkAssistant)
 
 ---
 

@@ -16,7 +16,7 @@ pub struct ProfileInfo {
     pub last_modified: String,
 }
 
-/// profiles 根目录：%APPDATA%\TraeWorkAssistant\data\profiles\
+/// profiles 根目录：%APPDATA%\AIWorkAssistant\data\profiles\
 fn profiles_dir(state: &State<AppState>) -> PathBuf {
     state.data_dir.join("data").join("profiles")
 }

@@ -372,7 +372,7 @@ export default function Settings() {
         <div className="flex items-start gap-3">
           <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
           <div>
-            <p>确认删除「TraeWorkAssistant_DailyCheckin」计划任务？</p>
+            <p>确认删除「AIWorkAssistant_DailyCheckin」计划任务？</p>
             <p className="mt-2 text-xs text-slate-400">删除后将不再自动执行每日签到。</p>
           </div>
         </div>

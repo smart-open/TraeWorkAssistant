@@ -1,4 +1,4 @@
-# Trae Work Assistant 功能增强需求计划
+# AI Work 助手 功能增强需求计划
 
 > **版本**: v2.4.2 | **状态**: 已完成 | **完成日期**: 2026-08-15
 >
@@ -454,7 +454,7 @@ event:done            → 结束信号
 1. 切换前：关闭 TRAE → 备份当前账号 profile → 恢复目标账号 profile → 启动 TRAE
 2. 新建账号：关闭 TRAE → 重置设备 ID（Phase 2.5）→ 备份空 profile → 启动 TRAE → 用户登录 → 保存 profile
 
-**数据存储**：`%APPDATA%\TraeWorkAssistant\profiles\<account_id>\`
+**数据存储**：`%APPDATA%\AIWorkAssistant\profiles\<account_id>\`
 
 **验收标准**：
 - 账号切换无需重新输入验证码

@@ -1,19 +1,21 @@
-# AGENT.md — Trae Work Assistant v2.5.0
+# AGENT.md — AI Work 助手 (ai-work-assistant) v2.6.0
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
+> 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
 
 ## 1. 一句话
 
-Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关工具。**所有数据仅存在 `%APPDATA%\TraeWorkAssistant\`，零外部网络**。
+Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关工具。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
 
 ## 2. Quick Start
 
 ```powershell
 # 仅 Windows，需要 Node 18+ / Rust stable (MSVC) / VS Build Tools C++ 工作负载 / WebView2
-cd trae-work-assistant
+cd ai-work-assistant   # 本机目录暂为 trae-work-assistant，见文首说明
 npm install
 npm run tauri dev          # 开发模式（Tauri WebView 加载 Vite 5173）
 npm run tauri build        # 打包 MSI + NSIS 到 src-tauri/target/release/bundle/
+python scripts/rename_release.py   # 产物统一输出到 release/，中文命名 AI Work 助手_<版本>_x64*
 ```
 
 测试：
@@ -35,7 +37,7 @@ cargo test                                    # Rust 单测（需先装工具链
 ## 4. 目录地图
 
 ```
-trae-work-assistant/
+ai-work-assistant/
 ├── AGENT.md                      # 本文件（项目速查）
 ├── README.md                     # 用户文档
 ├── package.json / vite.config.ts / tsconfig.json / tailwind.config.js / postcss.config.js / index.html
@@ -51,7 +53,7 @@ trae-work-assistant/
 │   ├── tauri.conf.json           # 无装饰窗 / bundle.resources = ../src-python/ + ../src-ps/
 │   └── src/
 │       ├── main.rs               # 注册全部命令
-│       ├── state.rs              # AppState（%APPDATA%\TraeWorkAssistant + python_dir）
+│       ├── state.rs              # AppState（%APPDATA%\AIWorkAssistant + python_dir）
 │       ├── models.rs             # DTO（含 CheckinSummary.time 字段）
 │       ├── fs_utils.rs           # 原子 read_json / write_json / mask / 时间辅助
 │       ├── jwt.rs                # parse() + status_of() + refresh() + oauth_parse()
@@ -118,7 +120,7 @@ trae-work-assistant/
 ## 7. 数据文件
 
 ```
-%APPDATA%\TraeWorkAssistant\
+%APPDATA%\AIWorkAssistant\
 ├── conf/
 │   └── app_settings.json         # Settings 全字段（snake_case）
 ├── data/
@@ -142,7 +144,7 @@ trae-work-assistant/
 
 - **非交互模式**：不需要 `#Requires RunAsAdministrator`，普通用户即可运行。
 - `-Json` 时输出 NDJSON 单行 `{"stage":"...","status":"...","message":"...","time":"..."}`。
-- 入口目录：`$env:APPDATA\TRAE SOLO CN` + `$env:APPDATA\TraeWorkAssistant\data\profiles`。
+- 入口目录：`$env:APPDATA\TRAE SOLO CN` + `$env:APPDATA\AIWorkAssistant\data\profiles`。
 - **Action 参数**：`Switch` / `SaveCurrentLogin` / `ResetMachineId` / `ResetDeviceIds` / `BackupCurrent` / `RestoreOnly`。
 - **精准备份**：仅复制 9 类核心登录文件（storage.json / state.vscdb / machineid / aha / Network 等），非全量镜像。
 - **Switch 流程**：预检查目标快照 → 关闭 Trae Work → 保存当前到 last + 当前账号槽位 → 恢复目标 → 启动。
@@ -214,6 +216,8 @@ trae-work-assistant/
 - **计划任务不加 `/RL HIGHEST`**：签到脚本只读写 `%APPDATA%` 并运行 Python，加了会让普通用户注册失败（Access Denied）。
 - **错误文案不重复加前缀**：Rust 端返回纯错误描述，`查询失败：` / `注册失败：` 等前缀由前端 `Settings.tsx` 统一拼接。
 - **`src-python/` 会打包进 `resources/python/`**：Python 侧改动在正式版必须 `npm run tauri build` 重新打包才生效；`npm run tauri dev` 直读源码，重启对应功能即生效。
+- **品牌迁移（v2.6.0）**：identifier `com.traework.assistant`→`com.aiwork.assistant`，数据目录 `%APPDATA%\TraeWorkAssistant`→`AIWorkAssistant`（`state.rs::migrate_legacy_dirs` 启动时自动就地重命名迁移，含 WebView2 目录），计划任务由 `misc.rs::try_migrate_legacy_task` 启动时自动迁移。环境变量统一为 `AIWORKDATA_DIR`（Python 侧兼容读旧 `TRAEDATA_DIR`）。
+- **老安装包升级**：升级兼容按**安装时产品名**判定（非版本号）。NSIS 通过 `build-assets/installer-hooks.nsh` 静默卸载清理旧品牌「Trae Work 助手」安装（已发布的 v2.4.4 及更早均属旧品牌，UTF-8 with BOM）；「AI Work 助手」品牌（v2.6.0 起）走 NSIS 原生原地升级；老 MSI 因 UpgradeCode 随 identifier 变化无法原地升级，需先卸载或改用 NSIS 包升级。打包产物统一输出到 `release/`，使用中文产品名命名 `AI Work 助手_<版本>_x64*`（`scripts/rename_release.py`）。仅使用 Trae Work 的用户可不升级，继续使用 v2.4.4。
 
 ## 15. 版本升级规则（每次提交适用）
 

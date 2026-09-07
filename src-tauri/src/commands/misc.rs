@@ -440,6 +440,11 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 
 // ---------------- 定时任务 ----------------
 
+/// 新版每日签到计划任务名（品牌 ai-work-assistant）
+pub const TASK_NAME: &str = "AIWorkAssistant_DailyCheckin";
+/// 旧版计划任务名（品牌迁移前），启动时自动迁移到新任务名
+pub const LEGACY_TASK_NAME: &str = "TraeWorkAssistant_DailyCheckin";
+
 // 运行 schtasks 并正确解码输出。
 // 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")
 // 以 GBK 字节输出；若直接 from_utf8_lossy 会读成 ϵͳ... 乱码，导致 "找不到" 永远匹配不上、
@@ -467,34 +472,37 @@ fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     Ok((out.status.success(), stdout, stderr))
 }
 
-#[tauri::command]
-pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
-    // 直接调用 python 签到脚本（无界面、可定时），注入数据目录
+/// 构造计划任务的 /TR 命令行（直接调用 python 签到脚本，注入数据目录）
+fn build_task_tr(state: &AppState) -> String {
     let py = state.python_exe.clone();
     let script = state.python_dir.join("auto_checkin.py");
     let data_dir = state.data_dir.to_string_lossy().to_string();
-    // schtasks /TR 不会继承当前进程环境变量，需在命令行中显式设置 TRAEDATA_DIR。
+    // schtasks /TR 不会继承当前进程环境变量，需在命令行中显式设置 AIWORKDATA_DIR。
     // 必须用 set "VAR=value"（带引号）以兼容含空格的路径（如 C:\Users\<带空格用户名>\...）；
     // 用 && 串联，仅当 set 成功后才执行 python。
     // 不再使用 /RL HIGHEST：签到脚本只读取/写入 %APPDATA% 并运行 python，无需提权，
     // 否则普通用户会卡在「access denied」而注册失败（详见问题分析报告）。
-    let tr = format!(
-        "cmd /c set \"TRAEDATA_DIR={}\" && \"{}\" \"{}\"",
+    format!(
+        "cmd /c set \"AIWORKDATA_DIR={}\" && \"{}\" \"{}\"",
         data_dir,
         py.replace('\\', "/"),
         script.to_string_lossy().replace('\\', "/")
-    );
-    let task_name = "TraeWorkAssistant_DailyCheckin";
+    )
+}
+
+/// 注册每日签到任务（新任务名），供命令与旧任务迁移共用
+fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
+    let tr = build_task_tr(state);
     let (ok, _stdout, stderr) = run_schtasks(&[
         "/Create",
         "/TN",
-        task_name,
+        TASK_NAME,
         "/TR",
         tr.as_str(),
         "/SC",
         "DAILY",
         "/ST",
-        time.as_str(),
+        time,
         "/F",
     ])?;
     if !ok {
@@ -508,11 +516,13 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
             return Err(format!(
                 "权限不足（Access Denied）。\n\n\
                  解决方法（任选其一）：\n\
-                 1. 右键 TraeWorkAssistant →「以管理员身份运行」后重新点击「注册任务」\n\
+                 1. 右键 AI Work 助手 →「以管理员身份运行」后重新点击「注册任务」\n\
                  2. 打开「管理员命令提示符」手动执行：\n\
-                    schtasks /Create /TN TraeWorkAssistant_DailyCheckin /TR \"cmd /c set TRAEDATA_DIR={}&\\\"{}\\\" \\\"{}\\\"\" /SC DAILY /ST {} /F\n\
+                    schtasks /Create /TN {TASK_NAME} /TR \"cmd /c set AIWORKDATA_DIR={}&\\\"{}\\\" \\\"{}\\\"\" /SC DAILY /ST {time} /F\n\
                  3. 如不需最高权限，可去掉 /RL HIGHEST 后重试",
-                data_dir, py.replace('\\', "/"), script.to_string_lossy().replace('\\', "/"), time
+                state.data_dir.to_string_lossy(),
+                state.python_exe.replace('\\', "/"),
+                state.python_dir.join("auto_checkin.py").to_string_lossy().replace('\\', "/")
             ));
         }
         return Err(detail.to_string());
@@ -521,9 +531,113 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
 }
 
 #[tauri::command]
-pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, String> {
-    let (ok, stdout, stderr) =
-        run_schtasks(&["/Query", "/TN", "TraeWorkAssistant_DailyCheckin", "/FO", "LIST"])?;
+pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    register_daily_task(&state, &time)?;
+    // 注册成功后清理旧版计划任务（品牌迁移），失败不影响本次注册
+    let _ = run_schtasks(&["/Delete", "/TN", LEGACY_TASK_NAME, "/F"]);
+    Ok(())
+}
+
+/// 查询计划任务是否存在
+fn task_exists(name: &str) -> bool {
+    let (ok, _stdout, _stderr) = match run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"]) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    ok
+}
+
+/// 导出计划任务 XML 并解析每日触发时间（HH:MM）。
+/// schtasks /XML 输出为 UTF-16LE（带 BOM），需按 UTF-16 解码；解析失败返回 None。
+fn legacy_task_start_time(name: &str) -> Option<String> {
+    let out = Command::new("cmd")
+        .args([
+            "/c",
+            "chcp",
+            "65001",
+            ">nul",
+            "&&",
+            "schtasks",
+            "/Query",
+            "/TN",
+            name,
+            "/XML",
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let xml = if out.stdout.starts_with(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = out.stdout[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let start = xml
+        .split("<StartBoundary>")
+        .nth(1)?
+        .split("</StartBoundary>")
+        .next()?;
+    // 形如 2026-09-07T09:30:00 → 取 T 后的 HH:MM
+    let time = start.split('T').nth(1)?;
+    let hh_mm = time.get(0..5)?;
+    let ok = hh_mm.len() == 5
+        && hh_mm.as_bytes()[2] == b':'
+        && hh_mm.chars().all(|c| c.is_ascii_digit() || c == ':');
+    if ok { Some(hh_mm.to_string()) } else { None }
+}
+
+/// 旧版计划任务自动迁移（品牌迁移）：
+/// TraeWorkAssistant_DailyCheckin（指向旧 exe/旧数据目录）→ AIWorkAssistant_DailyCheckin。
+/// 保留原触发时间；任何一步失败都不删除旧任务，返回的说明会写入启动日志。
+pub fn try_migrate_legacy_task(state: &AppState) -> Option<String> {
+    let legacy = task_exists(LEGACY_TASK_NAME);
+    if !legacy {
+        return None;
+    }
+    if task_exists(TASK_NAME) {
+        // 新旧并存（如用户手动注册过新任务）：直接清理旧任务
+        let (ok, _o, _e) =
+            run_schtasks(&["/Delete", "/TN", LEGACY_TASK_NAME, "/F"]).unwrap_or((false, String::new(), String::new()));
+        return Some(if ok {
+            "任务迁移：新旧计划任务并存，已删除旧任务 TraeWorkAssistant_DailyCheckin".to_string()
+        } else {
+            "任务迁移：新旧计划任务并存，旧任务 TraeWorkAssistant_DailyCheckin 删除失败（可手动删除）".to_string()
+        });
+    }
+    let time = match legacy_task_start_time(LEGACY_TASK_NAME) {
+        Some(t) => t,
+        None => {
+            return Some(
+                "任务迁移：检测到旧任务 TraeWorkAssistant_DailyCheckin，但未能解析其触发时间，请在设置页重新注册后删除旧任务"
+                    .to_string(),
+            )
+        }
+    };
+    match register_daily_task(state, &time) {
+        Ok(()) => {
+            let (ok, _o, _e) =
+                run_schtasks(&["/Delete", "/TN", LEGACY_TASK_NAME, "/F"]).unwrap_or((false, String::new(), String::new()));
+            Some(if ok {
+                format!("任务迁移：计划任务已由 {LEGACY_TASK_NAME} 迁移至 {TASK_NAME}（每日 {time}）")
+            } else {
+                format!("任务迁移：新任务 {TASK_NAME} 已创建（每日 {time}），旧任务删除失败（可手动删除）")
+            })
+        }
+        Err(e) => Some(format!(
+            "任务迁移：检测到旧任务 {LEGACY_TASK_NAME}，重建新任务失败（{e}），旧任务已保留，请在设置页重新注册"
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, String> {
+    let (ok, stdout, stderr) = run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])?;
     if !ok {
         let detail = if !stderr.trim().is_empty() {
             stderr.trim()
@@ -537,6 +651,14 @@ pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, S
             || detail.contains("ERROR: The system cannot find")
             || detail.contains("系统找不到")
         {
+            // 尝试顺带迁移旧任务；迁移成功则再次查询
+            if try_migrate_legacy_task(&state).is_some() && task_exists(TASK_NAME) {
+                let (ok2, stdout2, _e2) =
+                    run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])?;
+                if ok2 {
+                    return Ok(stdout2);
+                }
+            }
             return Ok("未注册每日签到任务（请先在设置页点击「注册任务」）。".to_string());
         }
         return Err(detail.to_string());
@@ -546,9 +668,15 @@ pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, S
 
 #[tauri::command]
 pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
-    let (ok, _stdout, stderr) =
-        run_schtasks(&["/Delete", "/TN", "TraeWorkAssistant_DailyCheckin", "/F"])?;
-    if !ok {
+    // 同时清理新旧两个任务名，任一删除成功即视为成功
+    let mut last_detail = String::new();
+    let mut deleted = false;
+    for name in [TASK_NAME, LEGACY_TASK_NAME] {
+        let (ok, _stdout, stderr) = run_schtasks(&["/Delete", "/TN", name, "/F"])?;
+        if ok {
+            deleted = true;
+            continue;
+        }
         let detail = stderr.trim();
         // 任务本就不存在：视为已删除，不报错
         if detail.contains("can't find")
@@ -557,9 +685,12 @@ pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), S
             || detail.contains("ERROR: The system cannot find")
             || detail.contains("系统找不到")
         {
-            return Ok(());
+            continue;
         }
-        return Err(detail.to_string());
+        last_detail = detail.to_string();
+    }
+    if !deleted && !last_detail.is_empty() {
+        return Err(last_detail);
     }
     Ok(())
 }

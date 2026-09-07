@@ -30,6 +30,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-work-assistant"
+version = "2.6.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-shell",
+ "tokio",
+ "tokio-stream",
+ "ureq",
+ "urlencoding",
+]
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4415,29 +4438,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
-]
-
-[[package]]
-name = "trae-work-assistant"
-version = "2.5.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-notification",
- "tauri-plugin-shell",
- "tokio",
- "tokio-stream",
- "ureq",
- "urlencoding",
 ]
 
 [[package]]

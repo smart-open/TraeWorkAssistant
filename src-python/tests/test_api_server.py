@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Trae Work Assistant API 服务端到端测试
+AI Work 助手 API 服务端到端测试
 
 测试项目:
   1. /health          — 健康检查（含账号池状态）
@@ -287,7 +287,7 @@ class ApiTester:
 
     def run_all(self):
         print("=" * 60)
-        print(f"Trae Work Assistant API 端到端测试")
+        print(f"AI Work 助手 API 端到端测试")
         print(f"地址: http://{self.host}:{self.port}")
         print(f"模型: {self.model}")
         print(f"Key:  {self.api_key[:12]}..." if self.api_key else "Key:  (无)")
@@ -322,7 +322,7 @@ class ApiTester:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trae Work Assistant API 端到端测试")
+    parser = argparse.ArgumentParser(description="AI Work 助手 API 端到端测试")
     parser.add_argument("--host", default="127.0.0.1", help="API 服务地址")
     parser.add_argument("--port", type=int, default=7864, help="API 服务端口")
     parser.add_argument("--key", default="sk-72a12ee8-b462-4b03-837f-de0646fb419f-64aad",

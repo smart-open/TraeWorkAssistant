@@ -173,7 +173,7 @@ export default function GeneralSettingsPanel() {
               type="text"
               value={form.proxy_log_path ?? ''}
               onChange={(e) => update('proxy_log_path', e.target.value.trim() || null)}
-              placeholder="留空则默认 %APPDATA%\TraeWorkAssistant\logs"
+              placeholder="留空则默认 %APPDATA%\AIWorkAssistant\logs"
               className="input"
             />
             <p className="mt-1 text-xs text-slate-400">
