@@ -45,14 +45,15 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
         return Err("未检测到本地 Trae Work 安装，请在「设置 → 代理与签到」中指定 exe 路径".into());
     }
     let exe = path.ok_or("未找到 Trae Work 可执行文件路径")?;
+    // F-47：自动探测成功的 exe 路径持久化到 app_settings.json 兜底，
+    // 之后即使注册表/默认目录变化，也能用上次成功的路径直接启动
+    persist_detected_path(&state, "trae_path", &exe);
     // 代理注入要求 Trae 以 --proxy-server 启动。Electron 单实例下，已运行的窗口会忽略新启动
-    // 参数，再次点击只会聚焦旧窗口，导致全程不走代理、无法捕获账号。故注入代理前先结束现有
-    // 进程，确保参数真正生效。（无代理时正常打开，不杀进程。）
+    // 参数，再次点击只会聚焦旧窗口，导致全程不走代理、无法捕获账号。故注入代理前先关闭现有
+    // 进程，确保参数真正生效（F-47 三级关闭：优雅关闭→树杀强杀→人工介入提示）。
+    // （无代理时正常打开，不杀进程。）
     if proxy_port.is_some() {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", "TRAE SOLO CN.exe"])
-            .creation_flags(0x08000000)
-            .output();
+        crate::commands::process::graceful_kill_app("TraeWork")?;
     }
     let mut cmd = Command::new(&exe);
     if let Some(port) = proxy_port {
@@ -62,6 +63,28 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
     cmd.spawn()
         .map_err(|e| format!("启动 Trae Work 失败: {e}"))?;
     Ok(())
+}
+
+/// exe 路径持久化兜底（F-47）：自动探测成功时把结果写入 app_settings.json，
+/// 之后即使注册表/默认目录变化，也能用上次成功的路径直接启动。
+/// 用户手动指定（设置页）优先级更高，且仅在探测值与存量值不同时写盘。
+fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
+    let path = state.path("app_settings.json");
+    let mut current: serde_json::Value = crate::fs_utils::read_json(&path);
+    if !current.is_object() {
+        current = serde_json::json!({});
+    }
+    let changed = current
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s != exe)
+        .unwrap_or(true);
+    if changed {
+        if let Some(obj) = current.as_object_mut() {
+            obj.insert(key.to_string(), serde_json::json!(exe));
+        }
+        let _ = crate::fs_utils::write_json(&path, &current);
+    }
 }
 
 fn detect_trae(custom: Option<String>) -> (bool, Option<String>, Option<String>) {

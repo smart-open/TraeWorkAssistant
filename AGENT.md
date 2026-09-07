@@ -1,4 +1,4 @@
-# AGENT.md — Trae Work Assistant v2.6.0
+# AGENT.md — Trae Work Assistant v2.7.0
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 
@@ -183,6 +183,19 @@ trae-work-assistant/
 | 重置设备 ID | Accounts 行 → RotateCcw 图标 → `device_reset(userId)` |
 | 注册定时签到 | Settings 页 → 输入 `HH:MM` → 注册任务 |
 | API 服务 | ApiService 页 → 配置端口/API Key → 选账号池 → 启动 |
+
+## 11.1 版本号升级规则（每次提交）
+
+语义化版本 `MAJOR.MINOR.PATCH`（如 2.7.0），按本次提交内容判断：
+
+| 提交内容 | 升级位 | 示例 |
+|---|---|---|
+| 新增一个完整的有意义的功能 | **中位（MINOR）** | 2.6.0 → 2.7.0 |
+| 修复 bug / 功能优化 / 微小功能新增或调整 | **低位（PATCH）** | 2.7.0 → 2.7.1 |
+
+- 大位（MAJOR）仅在重大架构/破坏性变更时升级
+- 升版提交需同步：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`（trae-work-assistant 块）、`src/lib/about.ts`（APP_VERSION）、`src-tauri/src/commands/accounts.rs`（appVersion）、`AGENT.md`/`docs` 头部标注、`CHANGELOG.md` 新条目
+- 一个提交包含多类变更时，按最高级别升位；版本同步提交本身不再升位
 
 ## 12. 安全与合规
 

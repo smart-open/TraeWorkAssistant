@@ -8,6 +8,7 @@ pub mod oauth;
 pub mod pay_status;
 pub mod profile;
 pub mod proxy;
+pub mod process;
 pub mod switch;
 pub mod trae_local;
 pub mod updater;

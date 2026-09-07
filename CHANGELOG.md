@@ -4,6 +4,31 @@
 
 ---
 
+## [2.7.0] - 2026-09-07
+
+F-47 进程管理增强（移植自 `feat/traecode_doubao` 分支），完整新功能升级中位版本（2.6.0 → 2.7.0）。
+
+### 新增
+
+- **F-47 进程管理增强**：新增 `commands/process.rs` 三级关闭策略——
+  1. 优雅关闭（taskkill 不带 /F 发送 WM_CLOSE，让 Electron 正常落盘，最长等 3s，轮询 250ms）
+  2. 树杀强杀（taskkill /T /F，最长等 2s）
+  3. 人工介入提示（仍存活则返回错误，前端 toast 提示手动关闭）
+  - 「打开应用注入代理」接入：Electron 单实例下旧窗口会忽略 `--proxy-server` 新参数，注入前先三级关闭确保生效（原先为直接 `taskkill /F` 强杀）
+  - PS 桥 `Stop-Trae` 接入：`CloseMainWindow` 优雅关闭优先（最长 3s）→ 强杀 → 等待 3s 并给出人工介入提示（原先为立即 `Stop-Process -Force` 等 8s）
+  - **exe 路径持久化兜底**：自动探测成功的 Trae Work 路径写入 `app_settings.json`（仅在变化时写盘，用户手动指定优先），注册表/默认目录变化后仍可启动
+
+### 变更文件
+
+| 文件 | 说明 |
+|---|---|
+| `src-tauri/src/commands/process.rs`（新增）/ `mod.rs` | 三级关闭策略实现与模块注册 |
+| `src-tauri/src/commands/env.rs` | `open_trae_app` 接入三级关闭 + `persist_detected_path` |
+| `src-ps/trae-switch-bridge.ps1` | `Stop-Trae` 优雅关闭优先 |
+| `AGENT.md` | 新增 §11.1 版本号升级规则（完整功能升中位，修复/优化/微小调整升低位） |
+
+---
+
 ## [2.6.0] - 2026-09-07
 
 应用自更新（检查更新）与开发体验优化，次要版本升级（2.5.0 → 2.6.0）。
