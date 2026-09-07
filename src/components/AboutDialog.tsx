@@ -84,7 +84,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
       .install({
         downloadUrl: info.download_url,
         assetName: info.asset_name,
-        version: info.latest_version,
+        expectedVersion: info.latest_version,
       })
       .catch((e) => setUpd({ k: 'error', msg: String(e) }));
   };

@@ -175,7 +175,7 @@ export const api = {
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),
-    install: (p: { downloadUrl: string; assetName: string; version: string }) =>
+    install: (p: { downloadUrl: string; assetName: string; expectedVersion: string }) =>
       invoke<void>('update_install', p),
     onDownloadProgress: async (
       cb: (e: UpdateDownloadProgress) => void,

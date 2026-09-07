@@ -39,13 +39,16 @@ struct DownloadProgress {
     percent: u64,
 }
 
-/// 解析 "v2.5.1" / "2.5.1" → (2,5,1)。不合法返回 None。
+/// 仅允许 2.x.x 系列自更新（不跨大版本升级）
+const SUPPORTED_MAJOR: u64 = 2;
+
+/// 解析 "v2.5.1" / "2.5.1" → (2,5,1)。必须是严格的三段纯数字（2.x.x）。
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let t = s.trim().trim_start_matches(['v', 'V']);
     let mut it = t.split('.');
     let a: u64 = it.next()?.trim().parse().ok()?;
     let b: u64 = it.next()?.trim().parse().ok()?;
-    let c: u64 = it.next().unwrap_or("0").trim().parse().ok()?;
+    let c: u64 = it.next()?.trim().parse().ok()?;
     if it.next().is_some() {
         return None;
     }
@@ -157,7 +160,9 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         .or_else(|| version_from_asset(&asset_name))
         .ok_or_else(|| format!("无法从 tag「{tag}」或资产名解析版本号"))?;
 
-    let has_update = cmp_version(latest, current) == std::cmp::Ordering::Greater;
+    // 仅在 2.x.x 系列内自更新：最新版本非 2.x.x（如 3.x）时不提示升级
+    let has_update =
+        latest.0 == SUPPORTED_MAJOR && cmp_version(latest, current) == std::cmp::Ordering::Greater;
     Ok(UpdateCheckResult {
         has_update,
         current_version: env!("CARGO_PKG_VERSION").to_string(),
