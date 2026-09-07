@@ -59,10 +59,11 @@ trae-work-assistant/
 │       ├── api_server/           # API 网关模块
 │       │   ├── mod.rs            # 常量 + 路由注册
 │       │   ├── server.rs         # axum 服务器启停
-│       │   ├── routes.rs         # OpenAI 兼容路由（SSE 流式 + 非流式）
+│       │   ├── routes.rs         # OpenAI/Anthropic 兼容路由（SSE 流式 + 非流式，Protocol 分发）
+│       │   ├── payload.rs        # 请求体改写（OpenAI/Anthropic → llm_utils_chat）
 │       │   ├── pool.rs           # 账号池调度（积分感知 + 冷却状态机 + 账号轮换）
-│       │   ├── sse.rs            # SSE 协议转换（SOLO → OpenAI chunk）
-│       │   ├── auth.rs           # Bearer Token 鉴权
+│       │   ├── sse.rs            # SSE 协议转换（SOLO → OpenAI chunk / Anthropic 事件流）
+│       │   ├── auth.rs           # API Key 鉴权（Bearer + x-api-key）
 │       │   └── api_logger.rs     # API 请求日志
 │       └── commands/             # env / cert / accounts / checkin / proxy / switch / misc / profile / api_server / oauth
 ├── src-python/
@@ -99,6 +100,7 @@ trae-work-assistant/
 | API | `api_server_start(port)` / `api_server_stop()` / `api_server_status()` | API 网关启停 |
 | API | `pool_list` / `pool_set` / `pool_status` | 账号池管理 |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
+| API | `api_models_list` / `api_models_sync` | 模型列表读取 / 重放 `batch_get_detail_param` 同步官网列表 |
 | 日志 | `logs_query({ opts: { log_type, date, keyword, limit } })` → `LogLine[]` | `split_time` 会 strip BOM 前缀 |
 | 设置 | `settings_get()` / `settings_set(patch: Settings)` | Settings 全部 snake_case |
 | 计划 | `task_register(time)` / `task_status()` / `task_unregister()` | `schtasks` 注册每日签到 |

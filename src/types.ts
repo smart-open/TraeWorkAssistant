@@ -219,6 +219,12 @@ export interface ApiServiceStatus {
   started_at: number | null;
 }
 
+/** 模型选项：id = 上游 config_name，label = 官方展示名 */
+export interface ModelOption {
+  id: string;
+  label: string;
+}
+
 export interface PoolStatus {
   uid: string;
   name: string;

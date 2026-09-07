@@ -19,7 +19,7 @@ import { Badge, StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
-import type { Settings, ApiServiceStatus, PoolStatus } from '../types';
+import type { Settings, ApiServiceStatus, PoolStatus, ModelOption } from '../types';
 
 /** 将 API Key 打码：保留前4后4，中间用 **** 替代 */
 function maskApiKey(key: string): string {
@@ -27,22 +27,6 @@ function maskApiKey(key: string): string {
   if (key.length <= 8) return '****';
   return `${key.slice(0, 4)}****${key.slice(-4)}`;
 }
-
-const MODEL_OPTIONS = [
-  'glm-5.2',
-  'glm-5.3',
-  'glm-5-turbo',
-  'glm-5',
-  'deepseek-v4-flash',
-  'deepseek-v4-pro',
-  'kimi-k2.7-code',
-  'kimi-k3',
-  'doubao-seed-2.1-pro',
-  'doubao-seed-2.1-turbo',
-  'doubao-seed-2.0-code',
-  'minimax-m3',
-  'qwen-3.7-plus',
-];
 
 export default function ApiService() {
   const settings = useAppStore((s) => s.settings);
@@ -64,12 +48,15 @@ export default function ApiService() {
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
   const [refreshingPool, setRefreshingPool] = useState(false);
   const [copying, setCopying] = useState(false);
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [syncingModels, setSyncingModels] = useState(false);
 
   useEffect(() => {
     void refreshSettings();
     void refreshAccounts();
     void loadPool();
     void refreshStatus();
+    void loadModels();
   }, [refreshSettings, refreshAccounts]);
 
   useEffect(() => {
@@ -112,6 +99,30 @@ export default function ApiService() {
       /* ignore */
     } finally {
       setRefreshingPool(false);
+    }
+  };
+
+  // 加载模型列表（api_models.json，缺失时后端写入默认列表）
+  const loadModels = async () => {
+    try {
+      setModels(await api.apiServer.modelsList());
+    } catch {
+      /* 加载失败保留空列表，用户可点同步按钮重试 */
+    }
+  };
+
+  // 从官网同步最新模型列表（batch_get_detail_param 配置接口，不消耗积分）
+  const syncModels = async () => {
+    if (syncingModels) return;
+    setSyncingModels(true);
+    try {
+      const list = await withMinDelay(api.apiServer.modelsSync());
+      setModels(list);
+      toast('success', `官网模型同步成功（共 ${list.length} 个）`);
+    } catch (e) {
+      toast('error', `官网模型同步失败: ${String(e).slice(0, 120)}`);
+    } finally {
+      setSyncingModels(false);
     }
   };
 
@@ -375,18 +386,38 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
               <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
                 默认模型
               </label>
-              <select
-                className="input"
-                value={form?.api_default_model ?? 'glm-5.2'}
-                onChange={(e) => update('api_default_model', e.target.value)}
-                disabled={running}
-              >
-                {MODEL_OPTIONS.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
+              <div className="flex items-center gap-2">
+                <select
+                  className="input flex-1"
+                  value={form?.api_default_model ?? 'glm-5.2'}
+                  onChange={(e) => update('api_default_model', e.target.value)}
+                  disabled={running}
+                >
+                  {(models.some((m) => m.id === (form?.api_default_model ?? 'glm-5.2'))
+                    ? models
+                    : [
+                        {
+                          id: form?.api_default_model ?? 'glm-5.2',
+                          label: form?.api_default_model ?? 'glm-5.2',
+                        },
+                        ...models,
+                      ]
+                  ).map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn-ghost flex shrink-0 items-center gap-1 !p-2 text-xs"
+                  onClick={syncModels}
+                  disabled={syncingModels}
+                  title="从官网拉取最新模型列表（不消耗积分）"
+                >
+                  <RefreshCw size={13} className={syncingModels ? 'animate-spin' : ''} />
+                  {syncingModels ? '同步中…' : '同步官网模型'}
+                </button>
+              </div>
               <p className="mt-1 text-xs text-slate-400">
                 上游接口：llm_utils_chat（消耗通用积分，product_id 208）
               </p>
@@ -425,6 +456,9 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                 <div className="pt-1">
                   <span className="text-slate-400">其他端点：</span>
                 </div>
+                <code className="block break-all text-[11px]">
+                  POST http://127.0.0.1:{form?.api_port ?? 7864}/v1/messages（Anthropic 兼容，x-api-key 鉴权）
+                </code>
                 <code className="block break-all text-[11px]">
                   GET http://127.0.0.1:{form?.api_port ?? 7864}/v1/models
                 </code>

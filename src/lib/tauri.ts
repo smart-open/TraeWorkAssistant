@@ -16,6 +16,7 @@ import type {
   ImportReport,
   JwtParseResult,
   LogLine,
+  ModelOption,
   OAuthLoginUrl,
   OAuthLoginResult,
   PoolStatus,
@@ -169,6 +170,8 @@ export const api = {
     }),
     debugToggle: () => invoke<boolean>('api_debug_toggle'),
     debugStatus: () => invoke<boolean>('api_debug_status'),
+    modelsList: () => invoke<ModelOption[]>('api_models_list'),
+    modelsSync: () => invoke<ModelOption[]>('api_models_sync'),
   },
   traeLocal: {
     entitlement: () => invoke<AppEntitlement | null>('apps_entitlement_read'),

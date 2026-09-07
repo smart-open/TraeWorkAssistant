@@ -104,7 +104,7 @@ impl ApiPool {
     }
 
     /// 挑选 healthy 账号中积分过期时间最近者；跳过 tried
-    /// llm_utils_chat 消耗 IDE 积分(product_id 208)
+    /// llm_utils_chat 消耗通用积分(product_id 208)
     /// 零积分账号会被跳过，避免无效请求
     pub fn pick_excluding(&self, tried: &HashSet<String>) -> Option<PickedAccount> {
         let entries = safe_lock(&self.entries);
@@ -120,7 +120,7 @@ impl ApiPool {
                     continue;
                 }
             }
-            // 跳过零积分账号（IDE 积分耗尽，llm_utils_chat 无法使用）
+            // 跳过零通用积分账号（通用积分耗尽，llm_utils_chat 无法使用）
             if let Some(c) = e.credits {
                 if c <= 0.0 {
                     continue;
@@ -296,7 +296,7 @@ fn now_ts() -> i64 {
 
 /// 确定性派生 hex 字符串（与 device_proxy.py 的 _seeded_stream 算法一致）
 /// 用于从 uid 生成 machine_id，保证同一账号始终得到同一设备标识
-fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
+pub(crate) fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
     let data = format!("{}:{}", salt, seed);
     let mut out = Vec::new();
     let mut i: u32 = 0;

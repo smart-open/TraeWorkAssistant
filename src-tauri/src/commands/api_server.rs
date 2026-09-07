@@ -9,6 +9,7 @@ use crate::models::{
 };
 use crate::state::AppState;
 
+use crate::api_server::models_sync;
 use crate::api_server::pool::ApiPool;
 use crate::api_server::server::{start_api_server, ApiServerHandle};
 use crate::api_server::{ApiLogger, ApiSharedState};
@@ -362,4 +363,24 @@ pub fn api_debug_status(
             .load(std::sync::atomic::Ordering::Relaxed),
         None => false,
     }
+}
+
+// ==================== 模型列表命令 ====================
+
+/// 读取模型列表（api_models.json，缺失时写入默认列表）
+#[tauri::command]
+pub fn api_models_list(state: State<'_, AppState>) -> Vec<models_sync::ModelOption> {
+    models_sync::load_models(&state.data_dir)
+}
+
+/// 从官网配置接口同步模型列表（batch_get_detail_param，不消耗积分）
+#[tauri::command]
+pub async fn api_models_sync(
+    state: State<'_, AppState>,
+) -> Result<Vec<models_sync::ModelOption>, String> {
+    let data_dir = state.data_dir.clone();
+    // 阻塞网络请求放入阻塞线程池，避免卡住异步运行时
+    tauri::async_runtime::spawn_blocking(move || models_sync::fetch_official(&data_dir))
+        .await
+        .map_err(|e| format!("同步任务执行失败: {e}"))?
 }

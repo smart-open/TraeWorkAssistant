@@ -1,13 +1,15 @@
 // ---------------- 应用自更新（检查 / 下载 / 静默安装） ----------------
 //
 // 数据源：GitHub Releases（api.github.com，本仓库 smart-open/TraeWorkAssistant）。
+// 注意：仓库中 v3.x.x 是另一产品线的 release，本应用只关注 2.x.x 系列，
+//       因此不能用 releases/latest（会被 3.x 遮蔽），必须拉取完整列表过滤取最大 2.x.x。
 // 资产命名约定（Tauri NSIS 默认产物）：
-//   Trae Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持 /S 静默原地升级）
+//   Trae Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持 /P 被动原地升级）
 //   Trae Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选）
 //
-// 流程：update_check 解析最新 release 并与 CARGO_PKG_VERSION 比较；
-//       update_install 下载资产到临时目录（emit update-download-progress），
-//       启动 NSIS 静默安装（/S），随后应用退出由安装器接管。
+// 流程：update_check 拉取 releases 列表 → 过滤 2.x.x → 取最大版本与 CARGO_PKG_VERSION 比较；
+//       update_download 下载资产到临时目录（emit update-download-progress），
+//       update_run_installer 启动 NSIS 被动安装（/P /UPDATE /R），应用退出由安装器接管。
 
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -15,8 +17,8 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 const RELEASES_API: &str =
-    "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases/latest";
-const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases/latest";
+    "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
+const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
 
 #[derive(Serialize, Clone)]
 pub struct UpdateCheckResult {
@@ -84,7 +86,7 @@ fn build_agent(timeout: Duration) -> ureq::Agent {
     builder.build()
 }
 
-fn fetch_latest_release() -> Result<serde_json::Value, String> {
+fn fetch_releases() -> Result<Vec<serde_json::Value>, String> {
     let agent = build_agent(Duration::from_secs(20));
     let resp = agent
         .get(RELEASES_API)
@@ -97,7 +99,7 @@ fn fetch_latest_release() -> Result<serde_json::Value, String> {
                 e, RELEASES_PAGE
             )
         })?;
-    resp.into_json::<serde_json::Value>()
+    resp.into_json::<Vec<serde_json::Value>>()
         .map_err(|e| format!("解析 release 响应失败: {e}"))
 }
 
@@ -135,12 +137,43 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
         .map(|(name, url, size, _)| (name, url, size))
 }
 
-/// 检查 GitHub Releases 上的最新版本，与当前应用版本比较。
+/// 检查 GitHub Releases 上的最新 2.x.x 版本，与当前应用版本比较。
+/// 仓库中 v3.x.x 是另一产品线，直接忽略（不能用 releases/latest，会被 3.x 遮蔽）。
 #[tauri::command]
 pub fn update_check() -> Result<UpdateCheckResult, String> {
     let current = parse_version(env!("CARGO_PKG_VERSION")).ok_or("内置版本号解析失败")?;
-    let rel = fetch_latest_release()?;
-    // 版本号优先取 tag（v2.5.1）；tag 不合法时从资产名推导
+    let releases = fetch_releases()?;
+
+    // 遍历全部 release，保留 2.x.x 系列，取版本最大者
+    let mut best: Option<((u64, u64, u64), &serde_json::Value)> = None;
+    for rel in &releases {
+        let tag = rel.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
+        let assets = rel
+            .get("assets")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // 版本号优先取 tag（v2.5.1）；tag 不合法时从资产名推导
+        let ver_from_assets = || {
+            assets
+                .iter()
+                .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
+                .find_map(version_from_asset)
+        };
+        let Some(ver) = parse_version(tag).or_else(ver_from_assets) else {
+            continue;
+        };
+        if ver.0 != SUPPORTED_MAJOR {
+            continue;
+        }
+        if best.map_or(true, |(v, _)| cmp_version(ver, v) == std::cmp::Ordering::Greater) {
+            best = Some((ver, rel));
+        }
+    }
+    let (latest, rel) = best.ok_or_else(|| {
+        format!("Releases 列表中没有 2.x.x 版本。可手动查看：{RELEASES_PAGE}")
+    })?;
+
     let tag = rel
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -153,16 +186,12 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         .unwrap_or_default();
     let (asset_name, download_url, size) = pick_asset(&assets).ok_or_else(|| {
         format!(
-            "最新 release（{tag}）中没有可用的安装包资产。可手动查看：{RELEASES_PAGE}"
+            "最新 2.x.x release（{tag}）中没有可用的安装包资产。可手动查看：{RELEASES_PAGE}"
         )
     })?;
-    let latest = parse_version(&tag)
-        .or_else(|| version_from_asset(&asset_name))
-        .ok_or_else(|| format!("无法从 tag「{tag}」或资产名解析版本号"))?;
 
-    // 仅在 2.x.x 系列内自更新：最新版本非 2.x.x（如 3.x）时不提示升级
-    let has_update =
-        latest.0 == SUPPORTED_MAJOR && cmp_version(latest, current) == std::cmp::Ordering::Greater;
+    // 仅在 2.x.x 系列内自更新（best 已过滤大版本，此处双保险）
+    let has_update = cmp_version(latest, current) == std::cmp::Ordering::Greater;
     Ok(UpdateCheckResult {
         has_update,
         current_version: env!("CARGO_PKG_VERSION").to_string(),

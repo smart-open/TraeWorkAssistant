@@ -4,6 +4,25 @@
 
 ---
 
+## [2.8.0] - 2026-09-07
+
+API 服务新增 Anthropic 兼容端点（F-39「+Anthropic 适配思路」落地，移植自 main 分支），完整新功能升级中位版本（2.7.2 → 2.8.0）。
+
+### 新增
+
+- **Anthropic Messages API 兼容端点 `POST /v1/messages`**：Claude Code 等原生 Anthropic 客户端可直连本地网关——
+  - 请求侧：Anthropic 请求体（system 顶层字段 / text blocks / `tool_use` / `tool_result` / `tools` / `tool_choice`）转换为 OpenAI 内部格式，复用现有 llm_utils_chat 链路与账号池调度
+  - 流式响应：SOLO SSE → Anthropic 事件流（`message_start` → `content_block_start/delta/stop` → `message_delta` → `message_stop`），工具调用经 `input_json_delta` 输出；上游断流时按已收内容正常收尾，避免客户端挂起
+  - 非流式响应：聚合为 Anthropic message 对象（content blocks + `stop_reason` + usage）
+  - 鉴权同时支持 `x-api-key`（Anthropic 风格）与 `Authorization: Bearer`（OpenAI 风格）
+  - 错误响应采用 Anthropic `{"type":"error","error":{...}}` 格式
+  - 已知限制：`reasoning_content` 暂不输出（Anthropic thinking 块需签名）；image 等多模态 block 跳过
+- **API 服务页配置示例**：新增 Anthropic 端点说明与 `/v1/messages` cURL 测试示例，「其他端点」展示增加 Anthropic 兼容端点
+- **模型列表配置化 + 官网同步按钮**：默认模型列表不再硬编码前端，持久化到 `api_models.json`（18 个经 llm_utils_chat 实测可用的模型，覆盖客户端截图全部模型：Seed-Code / GLM-5.3-Flash / Qwen3.8-Flash 等）；API 服务页「默认模型」旁新增「同步官网模型」按钮，重放客户端 `batch_get_detail_param` 配置接口拉取最新列表（不消耗积分，带 loading 与成功/失败 toast 反馈）
+- **网关按模型分发上游 function**：`glm-5.3-flash`、`qwen3.8-flash`、`Doubao-Seed-Code` 经实测仅在 `solo_agent` 下可用，其余模型仍走 `solo_work_lite`；同步修正模型白名单映射（payload.rs）与 `/v1/models` 端点列表
+
+---
+
 ## [2.7.2] - 2026-09-07
 
 更新安装体验优化，升低位版本（2.7.1 → 2.7.2）。
