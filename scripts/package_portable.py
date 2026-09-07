@@ -62,7 +62,7 @@ def main():
         sys.exit(1)
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    # 产物文件名使用中文产品名（如 AI Work 助手_2.6.0_x64_portable.zip）
+    # 产物文件名使用中文产品名（如 AI Work 助手_3.0.0_x64_portable.zip）
     zip_name = f"{product}_{version}_x64_portable.zip"
     zip_path = os.path.join(OUT_DIR, zip_name)
 

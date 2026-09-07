@@ -396,8 +396,12 @@ export default function Accounts() {
         title="账号管理"
         desc="维护账号、调整分组、重置设备 ID 与登录态切换"
         leftExtra={
-          <button onClick={() => setHelpOpen(true)} className="btn-ghost !p-2" title="使用帮助">
-            <HelpCircle size={16} />
+          <button
+            onClick={() => setHelpOpen(true)}
+            title="使用帮助"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sky-100 text-sky-600 shadow-sm transition hover:bg-sky-200 hover:shadow dark:bg-sky-500/15 dark:text-sky-300 dark:hover:bg-sky-500/25"
+          >
+            <HelpCircle size={17} />
           </button>
         }
         actions={

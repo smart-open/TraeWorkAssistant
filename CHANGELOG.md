@@ -4,19 +4,20 @@
 
 ---
 
-## [2.6.0] - 2026-09-07
+## [3.0.0] - 2026-09-07
 
 品牌定位迁移：产品更名为 **AI Work 助手（ai-work-assistant）**，面向多个 work 工具提供功能支持；同时清理全部旧品牌痕迹并保证老应用升级兼容。
 
 ### 变更
 
 - **品牌统一**：代码注释、界面文案、README、AGENT.md、docs 全部文档由 Trae Work Assistant / trae-work-assistant 统一为 AI Work 助手 / ai-work-assistant。
-- **打包标识**：identifier `com.traework.assistant` → `com.aiwork.assistant`，`mainBinaryName` → `ai-work-assistant`（主程序 ai-work-assistant.exe），Cargo 包名与 package.json 同步；新增 `scripts/rename_release.py` 将安装包统一输出到 `release/`，产物使用中文产品名命名（如 `AI Work 助手_2.6.0_x64-setup.exe` / `AI Work 助手_2.6.0_x64_zh-CN.msi` / `AI Work 助手_2.6.0_x64_portable.zip`）。
-- **老应用升级兼容（NSIS）**：新增 `build-assets/installer-hooks.nsh`，安装时自动结束旧进程、静默卸载旧品牌「Trae Work 助手」并清理残留目录 / 卸载键 / 快捷方式 / 旧命名主程序。判定依据为安装时产品名而非版本号：已发布的 v2.4.4 及更早安装包均为旧品牌，同样被自动清理；仅「AI Work 助手」品牌（v2.6.0 起）走 NSIS 原生原地升级。
+- **打包标识**：identifier `com.traework.assistant` → `com.aiwork.assistant`，`mainBinaryName` → `ai-work-assistant`（主程序 ai-work-assistant.exe），Cargo 包名与 package.json 同步；新增 `scripts/rename_release.py` 将安装包统一输出到 `release/`，产物使用中文产品名命名（如 `AI Work 助手_3.0.0_x64-setup.exe` / `AI Work 助手_3.0.0_x64_zh-CN.msi` / `AI Work 助手_3.0.0_x64_portable.zip`）。
+- **老应用升级兼容（NSIS）**：新增 `build-assets/installer-hooks.nsh`，安装时自动结束旧进程、静默卸载旧品牌「Trae Work 助手」并清理残留目录 / 卸载键 / 快捷方式 / 旧命名主程序。判定依据为安装时产品名而非版本号：已发布的 v2.4.4 及更早安装包均为旧品牌，同样被自动清理；仅「AI Work 助手」品牌（v3.0.0 起）走 NSIS 原生原地升级。
 - **老应用数据自动迁移（启动时）**：`state.rs::migrate_legacy_dirs()` 将 `%APPDATA%\TraeWorkAssistant` 就地重命名为 `%APPDATA%\AIWorkAssistant`（零拷贝），并迁移 WebView2 界面偏好目录（identifier 变更所致）；失败不影响启动。
 - **计划任务自动迁移**：`misc.rs::try_migrate_legacy_task()` 启动时将 `TraeWorkAssistant_DailyCheckin` 迁移为 `AIWorkAssistant_DailyCheckin`（保留原触发时间，重建后删除旧任务）；任务查询 / 注册 / 删除均兼容双任务名。
 - **环境变量**：`TRAEDATA_DIR` → `AIWORKDATA_DIR`（Python 脚本与 PowerShell 桥接脚本兼容读取旧变量名）。
-- 版本号 2.5.0 → 2.6.0（`package.json` / `tauri.conf.json` / `Cargo.toml` / `about.ts` 同步）。
+- **界面**：账号管理页「使用帮助」按钮改为与页头描述文字水平对齐，并以圆形色块徽章突出展示（PageHeader 的 leftExtra 移入描述行内，与描述行垂直居中）。
+- 版本号 2.5.0 → **3.0.0**（品牌迁移后的新版本起点；`package.json` / `tauri.conf.json` / `Cargo.toml` / `about.ts` 同步）。
 
 ### 说明
 

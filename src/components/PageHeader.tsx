@@ -18,9 +18,13 @@ export default function PageHeader({
         <div className="h-7 w-1 rounded-full bg-zinc-800 dark:bg-zinc-200" />
         <div>
           <h1 className="text-xl font-semibold tracking-tight text-slate-800 dark:text-zinc-100">{title}</h1>
-          {desc && <p className="mt-1 text-sm text-slate-500 dark:text-zinc-400">{desc}</p>}
+          {(desc || leftExtra) && (
+            <div className="mt-1 flex items-center gap-3">
+              {desc && <p className="text-sm text-slate-500 dark:text-zinc-400">{desc}</p>}
+              {leftExtra}
+            </div>
+          )}
         </div>
-        {leftExtra}
       </div>
       {actions && <div className="flex items-center gap-2">{actions}</div>}
     </div>
