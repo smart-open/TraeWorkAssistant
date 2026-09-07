@@ -656,15 +656,17 @@ function ApiLogsTab() {
 
 // ======================== 主页面 ========================
 
-export default function Logs() {
+export default function Logs({ embedded = false }: { embedded?: boolean }) {
   const [tab, setTab] = useState<'system' | 'proxy' | 'api'>('system');
 
   return (
     <div className="flex h-full animate-fade-in flex-col">
-      <PageHeader
-        title="系统日志"
-        desc="查看运行日志、代理请求日志与 API 请求日志"
-      />
+      {!embedded && (
+        <PageHeader
+          title="系统日志"
+          desc="查看运行日志、代理请求日志与 API 请求日志"
+        />
+      )}
 
       {/* Tab 切换 — 分段控件风格 */}
       <div className="mb-3 inline-flex items-center gap-1 rounded-xl border border-slate-200/80 bg-slate-50/80 p-1 dark:border-zinc-700/60 dark:bg-zinc-800/40">

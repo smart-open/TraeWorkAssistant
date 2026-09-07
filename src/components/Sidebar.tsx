@@ -4,19 +4,20 @@ import {
   Users,
   PlayCircle,
   Coins,
-  ScrollText,
   Settings,
   Server,
   Github,
   Globe,
+  Cog,
   Info,
 } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
-import { LINK_GITHUB, LINK_BLOG } from '../lib/about';
+import { LINK_REPO, LINK_BLOG } from '../lib/about';
 import type { ViewKey } from '../types';
 import AboutDialog from './AboutDialog';
+import SystemDialog from './SystemDialog';
 
 export type { ViewKey };
 
@@ -26,8 +27,7 @@ const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'checkin', label: '一键签到', icon: PlayCircle },
   { key: 'credits', label: '积分看板', icon: Coins },
   { key: 'api-service', label: 'API 服务', icon: Server },
-  { key: 'logs', label: '系统日志', icon: ScrollText },
-  { key: 'settings', label: '系统设置', icon: Settings },
+  { key: 'settings', label: '环境配置', icon: Settings },
 ];
 
 export default function Sidebar({
@@ -39,6 +39,7 @@ export default function Sidebar({
 }) {
   const pushToast = useAppStore((s) => s.pushToast);
   const [showAbout, setShowAbout] = useState(false);
+  const [showSystem, setShowSystem] = useState(false);
 
   const openExternal = async (url: string, label: string) => {
     try {
@@ -73,20 +74,28 @@ export default function Sidebar({
       </nav>
       <div className="flex items-center justify-center gap-1 border-t border-slate-200 p-3 dark:border-zinc-800">
         <button
-          onClick={() => void openExternal(LINK_GITHUB, 'GitHub 主页')}
+          onClick={() => void openExternal(LINK_REPO, '软件 Github 地址')}
           className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
-          aria-label="GitHub 主页"
-          title="GitHub 主页（github.com/smart-open）"
+          aria-label="软件 Github 地址"
+          title="软件 Github 地址"
         >
           <Github size={17} />
         </button>
         <button
-          onClick={() => void openExternal(LINK_BLOG, '个人博客')}
+          onClick={() => void openExternal(LINK_BLOG, '作者博客主页')}
           className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
-          aria-label="个人博客"
-          title="个人博客（blog.sopenai.cn）"
+          aria-label="作者博客主页"
+          title="作者博客主页"
         >
           <Globe size={17} />
+        </button>
+        <button
+          onClick={() => setShowSystem(true)}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+          aria-label="系统设置与系统日志查看"
+          title="系统设置与系统日志查看"
+        >
+          <Cog size={17} />
         </button>
         <button
           onClick={() => setShowAbout(true)}
@@ -98,6 +107,7 @@ export default function Sidebar({
         </button>
       </div>
       <AboutDialog open={showAbout} onClose={() => setShowAbout(false)} />
+      <SystemDialog open={showSystem} onClose={() => setShowSystem(false)} />
     </aside>
   );
 }
