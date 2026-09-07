@@ -234,7 +234,7 @@ export default function Accounts() {
   const [groupOpen, setGroupOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<AccountView | null>(null);
   // 双应用切换/保存菜单：{ userId, kind } —— kind='switch' 切换登录态 / 'save' 保存登录态
-  const [appMenu, setAppMenu] = useState<{ userId: string; kind: 'switch' | 'save' } | null>(null);
+  const [appMenu, setAppMenu] = useState<{ userId: string; kind: 'switch' | 'save'; x: number; y: number } | null>(null);
   const [jwtTarget, setJwtTarget] = useState<AccountView | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [oauthOpen, setOAuthOpen] = useState(false);
@@ -457,10 +457,13 @@ export default function Accounts() {
                             <Zap size={14} />
                           </button>
                         )}
-                        <div className="relative flex items-center" onMouseLeave={() => setAppMenu(null)}>
+                        <div className="relative flex items-center">
                           <button
                             title={switchingTo ? (switchingTo === a.user_id ? '切换中…' : '正在切换其他账号') : '切换此账号（选择目标应用）'}
-                            onClick={() => setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'switch' ? null : { userId: a.user_id, kind: 'switch' })}
+                            onClick={(e) => {
+                              const r = e.currentTarget.getBoundingClientRect();
+                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'switch' ? null : { userId: a.user_id, kind: 'switch', x: r.right, y: r.bottom });
+                            }}
                             disabled={!!switchingTo || !!savingLogin}
                             className={`btn-ghost !p-2 ${switchingTo === a.user_id ? 'text-amber-500' : ''} ${(switchingTo && switchingTo !== a.user_id) || savingLogin ? 'opacity-40 cursor-not-allowed' : ''}`}
                           >
@@ -468,37 +471,15 @@ export default function Accounts() {
                           </button>
                           <button
                             title={savingLogin ? (savingLogin === a.user_id ? '保存中…' : '正在保存其他账号') : '保存当前登录态（选择目标应用）'}
-                            onClick={() => setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'save' ? null : { userId: a.user_id, kind: 'save' })}
+                            onClick={(e) => {
+                              const r = e.currentTarget.getBoundingClientRect();
+                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'save' ? null : { userId: a.user_id, kind: 'save', x: r.right, y: r.bottom });
+                            }}
                             disabled={!!switchingTo || !!savingLogin}
                             className={`btn-ghost !p-2 ${savingLogin === a.user_id ? 'text-amber-500' : ''} ${(savingLogin && savingLogin !== a.user_id) || switchingTo ? 'opacity-40 cursor-not-allowed' : ''}`}
                           >
                             {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
                           </button>
-                          {appMenu?.userId === a.user_id && !switchingTo && !savingLogin && (
-                            <div className="absolute right-0 top-full z-20 mt-1 w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-800">
-                              <div className="px-3 py-1 text-[11px] font-semibold text-slate-400 dark:text-zinc-500">
-                                {appMenu.kind === 'switch' ? '切换此账号到…' : '保存当前登录态到…'}
-                              </div>
-                              {([{ app: 'Trae', label: 'Trae', desc: 'Trae CN IDE' }, { app: 'TraeWork', label: 'Trae Work', desc: 'TRAE SOLO CN' }] as const).map((opt) => (
-                                <button
-                                  key={opt.app}
-                                  onClick={() => {
-                                    const kind = appMenu.kind;
-                                    setAppMenu(null);
-                                    if (kind === 'switch') {
-                                      void switchTo(a.user_id, opt.app);
-                                    } else {
-                                      void saveCurrentLogin(a.user_id, opt.app);
-                                    }
-                                  }}
-                                  className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs transition hover:bg-slate-100 dark:hover:bg-zinc-700"
-                                >
-                                  <span className="font-medium">{opt.label}</span>
-                                  <span className="text-[10px] text-slate-400">{opt.desc}</span>
-                                </button>
-                              ))}
-                            </div>
-                          )}
                         </div>
                         <button title="重置设备 ID" onClick={() => void resetDevice(a.user_id)} className="btn-ghost !p-2">
                           <RotateCcw size={14} />
@@ -515,6 +496,48 @@ export default function Accounts() {
           </table>
         )}
       </div>
+
+      {/* 应用选择下拉菜单：Portal + fixed 定位，避免被表格容器 overflow 裁剪或被后续行遮盖 */}
+      {appMenu &&
+        !switchingTo &&
+        !savingLogin &&
+        createPortal(
+          <div
+            className="fixed z-50 w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-800"
+            style={{
+              left: Math.max(8, appMenu.x - 176),
+              top: (() => {
+                const MENU_H = 96;
+                const below = appMenu.y + 4 + MENU_H;
+                return below > window.innerHeight ? appMenu.y - MENU_H - 8 : appMenu.y + 4;
+              })(),
+            }}
+            onMouseLeave={() => setAppMenu(null)}
+          >
+            <div className="px-3 py-1 text-[11px] font-semibold text-slate-400 dark:text-zinc-500">
+              {appMenu.kind === 'switch' ? '切换此账号到…' : '保存当前登录态到…'}
+            </div>
+            {([{ app: 'Trae', label: 'Trae', desc: 'Trae CN IDE' }, { app: 'TraeWork', label: 'Trae Work', desc: 'TRAE SOLO CN' }] as const).map((opt) => (
+              <button
+                key={opt.app}
+                onClick={() => {
+                  const { userId, kind } = appMenu;
+                  setAppMenu(null);
+                  if (kind === 'switch') {
+                    void switchTo(userId, opt.app);
+                  } else {
+                    void saveCurrentLogin(userId, opt.app);
+                  }
+                }}
+                className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs transition hover:bg-slate-100 dark:hover:bg-zinc-700"
+              >
+                <span className="font-medium">{opt.label}</span>
+                <span className="text-[10px] text-slate-400">{opt.desc}</span>
+              </button>
+            ))}
+          </div>,
+          document.body,
+        )}
 
       <AddAccountModal
         open={addOpen}

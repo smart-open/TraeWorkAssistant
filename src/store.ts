@@ -194,16 +194,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         set((s) => ({ switchProgress: [...s.switchProgress.slice(-49), line] })),
       // D2：订阅后端 switch-done，给用户明确的切换完成/失败信号
       onSwitchDone: (e) => {
+        // 提取脚本 [fatal] 行的原文（如「目标账号 xxx 无快照，请先登录该账号并点击保存当前登录态」）
+        const reason = e.success ? null : (e.raw.match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
         set((s) => ({
           switchingTo: null,
           switchProgress: [
             ...s.switchProgress.slice(-49),
-            e.success ? '[完成] 登录态切换成功' : '[失败] 登录态切换未完成，请查看日志',
+            e.success ? '[完成] 登录态切换成功' : `[失败] ${reason ?? '登录态切换未完成，请查看日志'}`,
           ],
         }));
         get().pushToast(
           e.success ? 'success' : 'error',
-          e.success ? '登录态切换完成' : '登录态切换失败，请查看日志',
+          e.success ? '登录态切换完成' : `切换失败：${reason ?? '请查看系统日志'}`,
         );
         void get().refreshAccounts();
         void get().refreshProxy();
@@ -211,16 +213,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       onSaveLoginProgress: (line) =>
         set((s) => ({ saveLoginProgress: [...s.saveLoginProgress.slice(-49), line] })),
       onSaveLoginDone: (e: SaveLoginDoneEvent) => {
+        const reason = e.success ? null : (e.raw.match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
         set((s) => ({
           savingLogin: null,
           saveLoginProgress: [
             ...s.saveLoginProgress.slice(-49),
-            e.success ? '[完成] 登录态保存成功' : '[失败] 登录态保存失败，请查看日志',
+            e.success ? '[完成] 登录态保存成功' : `[失败] ${reason ?? '登录态保存失败，请查看日志'}`,
           ],
         }));
         get().pushToast(
           e.success ? 'success' : 'error',
-          e.success ? '登录态已保存，可随时切换回此账号' : '登录态保存失败，请查看日志',
+          e.success ? '登录态已保存，可随时切换回此账号' : `保存失败：${reason ?? '请查看系统日志'}`,
         );
         void get().refreshProfiles();
       },
