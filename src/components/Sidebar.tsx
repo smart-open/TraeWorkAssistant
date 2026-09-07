@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   LayoutDashboard,
   Users,
@@ -5,13 +6,18 @@ import {
   Coins,
   ScrollText,
   Settings,
-  Gift,
   Server,
+  Github,
+  Globe,
+  Palette,
+  Info,
 } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
+import { LINK_REPO, LINK_BLOG } from '../lib/about';
 import type { ViewKey } from '../types';
+import AboutDialog from './AboutDialog';
 
 export type { ViewKey };
 
@@ -25,6 +31,13 @@ const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'settings', label: '系统设置', icon: Settings },
 ];
 
+/** 主题轮询顺序（与系统设置页选项一致） */
+const THEME_CYCLE: { id: string; name: string }[] = [
+  { id: 'system', name: '跟随系统' },
+  { id: 'light', name: '浅色' },
+  { id: 'dark', name: '深色' },
+];
+
 export default function Sidebar({
   view,
   onNav,
@@ -33,14 +46,32 @@ export default function Sidebar({
   onNav: (v: ViewKey) => void;
 }) {
   const pushToast = useAppStore((s) => s.pushToast);
-  const openInvite = async () => {
+  const [showAbout, setShowAbout] = useState(false);
+
+  const openExternal = async (url: string, label: string) => {
     try {
-      const r = await (await import('../lib/tauri')).api.misc.inviteLink();
-      await open(r.url);
+      await open(url);
     } catch (e) {
-      pushToast('error', `打开邀请链接失败：${String(e)}`);
+      pushToast('error', `打开${label}失败：${String(e)}`);
     }
   };
+
+  // 主题轮询：system → light → dark 循环切换并持久化
+  const cycleTheme = async () => {
+    const { settings, saveSettings } = useAppStore.getState();
+    if (!settings) return;
+    const idx = THEME_CYCLE.findIndex((t) => t.id === settings.theme);
+    const next = THEME_CYCLE[(idx + 1 + THEME_CYCLE.length) % THEME_CYCLE.length];
+    try {
+      await saveSettings({ ...settings, theme: next.id });
+      pushToast('success', `主题已切换：${next.name}`);
+    } catch {
+      /* toast 已发出 */
+    }
+  };
+
+  const toolBtn =
+    'flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200';
 
   return (
     <aside className="flex w-52 shrink-0 flex-col border-r border-slate-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
@@ -65,15 +96,41 @@ export default function Sidebar({
           );
         })}
       </nav>
-      <div className="border-t border-slate-200 p-3 dark:border-zinc-800">
+      <div className="flex items-center justify-center gap-1 border-t border-slate-200 p-3 dark:border-zinc-800">
         <button
-          onClick={openInvite}
-          className="flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-amber-500 to-amber-400 px-3 py-2 text-sm font-semibold text-white shadow-[0_8px_20px_-8px_rgba(245,158,11,0.5)] transition hover:from-amber-400 hover:to-amber-300 active:scale-[0.98]"
+          onClick={() => void openExternal(LINK_REPO, '软件 Github 地址')}
+          className={toolBtn}
+          aria-label="软件 Github 地址"
+          title="软件 Github 地址"
         >
-          <Gift size={16} />
-          邀请得 5000 积分
+          <Github size={17} />
+        </button>
+        <button
+          onClick={() => void openExternal(LINK_BLOG, '作者博客主页')}
+          className={toolBtn}
+          aria-label="作者博客主页"
+          title="作者博客主页"
+        >
+          <Globe size={17} />
+        </button>
+        <button
+          onClick={() => void cycleTheme()}
+          className={toolBtn}
+          aria-label="切换主题"
+          title="切换主题（跟随系统 / 浅色 / 深色 轮询）"
+        >
+          <Palette size={17} />
+        </button>
+        <button
+          onClick={() => setShowAbout(true)}
+          className={toolBtn}
+          aria-label="软件说明"
+          title="软件说明（版本 / 概述 / 作者 / 版权）"
+        >
+          <Info size={17} />
         </button>
       </div>
+      <AboutDialog open={showAbout} onClose={() => setShowAbout(false)} />
     </aside>
   );
 }
