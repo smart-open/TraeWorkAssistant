@@ -4,6 +4,40 @@
 
 ---
 
+## [2.4.6] - 2026-09-07
+
+界面优化与版本号升级（2.4.4 → 2.4.6，一次跳过 2 个小版本号）。
+
+### 变更
+
+- **侧栏底部改版**：移除「邀请得 5000 积分」横幅（及对应 `openInvite` 前端调用），替换为 4 个居中排列的图标按钮：
+  - **软件 Github 地址**：打开项目仓库 `smart-open/TraeWorkAssistant`
+  - **作者博客主页**：打开 `blog.sopenai.cn`
+  - **切换主题**：跟随系统 → 浅色 → 深色 三态轮询并持久化，带 toast 反馈
+  - **软件说明**：新增「关于」对话框（品牌与版本、概述、GitHub/博客/仓库链接、赞赏码、作者与 MIT 版权、免责声明）
+- 新增 `src/lib/about.ts` 集中管理应用品牌信息（名称/版本/概述/作者/版权/链接），改名或升版只改此处。
+- 新增 `src/components/AboutDialog.tsx` 与赞赏码资产 `src/assets/donate-qr.base64.ts`（base64 内嵌，不依赖运行中的静态服务器）。
+- 后端 `invite_link` 命令保留，仅前端移除调用。
+
+### 变更文件
+
+| 文件 | 说明 |
+|---|---|
+| `src/components/Sidebar.tsx` | 移除邀请横幅，底部改为 4 个图标按钮（居中），内联主题三态轮询 |
+| `src/lib/about.ts` | 新增：应用品牌与关于信息集中管理 |
+| `src/components/AboutDialog.tsx` | 新增：软件说明对话框 |
+| `src/assets/donate-qr.base64.ts` | 新增：赞赏码 base64 资产 |
+| `package.json` / `tauri.conf.json` / `Cargo.toml` / `Cargo.lock` | 版本号 2.4.4 → 2.4.6 同步 |
+| `src-tauri/src/commands/accounts.rs` | 应用内版本标注同步 |
+| `AGENT.md` / `docs/*.md` / `scripts/make_portable_zip.py` | 文档版本标注与便携包文件名同步 |
+
+### 说明
+
+- 功能实现参考 `feat/traecode_doubao` 分支（v2.6.0 品牌迁移版）的侧栏工具栏与关于对话框，并按本工程实际调整：主题切换沿用本工程既有的 `system/light/dark` 三态机制（未引入 6 主题 data-theme 体系），品牌信息以 Trae Work Assistant v2.4.6 为准。
+- 后续版本号由 `src/lib/about.ts` 的 `APP_VERSION` 驱动「关于」弹窗显示。
+
+---
+
 ## [2.4.4] - 2026-08-16
 
 维护版本：清理临时文档并同步版本号。
