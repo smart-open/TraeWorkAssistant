@@ -13,6 +13,7 @@
 """
 import json
 import os
+import re
 import shutil
 import sys
 
@@ -20,10 +21,23 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_TAURI = os.path.join(ROOT, "src-tauri")
 
 
-def main():
+def read_version():
+    # 版本号单源化：tauri.conf.json 不再写 version，回退到 Cargo.toml
     with open(os.path.join(SRC_TAURI, "tauri.conf.json"), "r", encoding="utf-8") as f:
         conf = json.load(f)
-    version = conf["version"]
+    if conf.get("version"):
+        return conf["version"]
+    with open(os.path.join(SRC_TAURI, "Cargo.toml"), "r", encoding="utf-8") as f:
+        m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+    if not m:
+        raise SystemExit("无法从 tauri.conf.json / Cargo.toml 读取版本号")
+    return m.group(1)
+
+
+def main():
+    version = read_version()
+    with open(os.path.join(SRC_TAURI, "tauri.conf.json"), "r", encoding="utf-8") as f:
+        conf = json.load(f)
     product = conf["productName"]
     out_dir = os.path.join(ROOT, "release")
     os.makedirs(out_dir, exist_ok=True)

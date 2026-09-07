@@ -11,6 +11,7 @@
 """
 import json
 import os
+import re
 import shutil
 import sys
 import zipfile
@@ -47,7 +48,14 @@ def walk_copy(src, dst, skip_dirs=("__pycache__", ".git")):
 def main():
     conf = load_conf()
     product = conf["productName"]
-    version = conf["version"]
+    # 版本号单源化：tauri.conf.json 不再写 version，回退到 Cargo.toml
+    version = conf.get("version")
+    if not version:
+        with open(os.path.join(SRC_TAURI, "Cargo.toml"), "r", encoding="utf-8") as f:
+            m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+        if not m:
+            raise SystemExit("无法从 tauri.conf.json / Cargo.toml 读取版本号")
+        version = m.group(1)
     binary_name = conf.get("mainBinaryName") or "trae-work-assistant"
     resources = conf["bundle"]["resources"]
     # resources 形如 {"../src-python/": "python/", "../src-ps/": "ps/"}
