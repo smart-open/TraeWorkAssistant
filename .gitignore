@@ -29,8 +29,9 @@ proxy_bodies/
 __pycache__/
 *.pyc
 
-# Embedded Python runtime under src-python/ (build-time prerequisite for bundling;
-# extracted into place, not source — git에서만 제외, 디스크는 빌드에 필요)
+# Python 运行时残骸防误提交：v3.2.x 曾因 src-python/ 混入残缺 Python 运行时（缺 Lib/encodings）
+# 被打包进 resources/python/，state.rs 优先内嵌导致签到必崩（v3.2.3 修复：已移除运行时，
+# 探测改用 import encodings 自举验证）。若未来支持内嵌 Python，须先保证可完整自举。
 src-python/.extracted
 src-python/DLLs/
 src-python/Lib/
@@ -42,6 +43,8 @@ src-python/python3.cmd
 src-python/python3.dll
 src-python/python3.exe
 src-python/python313.dll
+src-python/python313.zip
+src-python/python313._pth
 src-python/pythonw.exe
 src-python/vcruntime140.dll
 src-python/vcruntime140_1.dll
