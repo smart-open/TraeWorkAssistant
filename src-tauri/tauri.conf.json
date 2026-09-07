@@ -40,8 +40,8 @@
     "longDescription": "整合多账号签到、登录态切换、设备隔离与账号分组的 Windows 桌面端工具，支持 Trae / WorkBuddy / 豆包等多应用扩展。",
     "publisher": "AI Work 助手",
     "windows": {
-      "msi": {
-        "languages": ["zh-CN"]
+      "wix": {
+        "language": "zh-CN"
       },
       "nsis": {
         "displayLanguageSelector": false,
