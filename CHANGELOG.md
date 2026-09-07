@@ -4,6 +4,14 @@
 
 ---
 
+## [未发布]
+
+### 修复
+
+- **检查更新下载步骤必报错（3.1.0 / 3.2.x 全部受影响）**：前端 invoke `update_download` 时参数 key 传了 `version`，而 Tauri 2 顶层参数按驼峰匹配 Rust 参数 `expected_version` → `expectedVersion`，导致「下载更新包」必报 `missing required key expectedVersion`（v3.1.0 的 `update_install` 同一问题，应用内更新从未成功）。修正为 `expectedVersion`。
+
+---
+
 ## [3.2.1] - 2026-09-07
 
 ### 修复

@@ -184,7 +184,8 @@ export const api = {
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),
     // 第一步：下载安装包（完成后返回本地路径，等待用户确认安装）
-    download: (p: { downloadUrl: string; assetName: string; version: string }) =>
+    // 注意：key 必须是 expectedVersion（Rust 参数 expected_version 的 Tauri 驼峰匹配），传 version 会报 missing required key
+    download: (p: { downloadUrl: string; assetName: string; expectedVersion: string }) =>
       invoke<UpdateDownloaded>('update_download', p),
     // 第二步：启动安装器（/P /UPDATE /R，完成后自动重启应用）
     runInstaller: (p: { filePath: string; assetName: string }) =>

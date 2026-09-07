@@ -96,7 +96,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
       .download({
         downloadUrl: info.download_url,
         assetName: info.asset_name,
-        version: info.latest_version,
+        expectedVersion: info.latest_version,
       })
       .then((file) => {
         setUpd((s) =>
