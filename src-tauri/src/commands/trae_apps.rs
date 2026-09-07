@@ -4,13 +4,21 @@
 //! - `%APPDATA%\TRAE SOLO CN\User\globalStorage\storage.json`（Trae Work）
 //! - `%APPDATA%\Trae CN\User\globalStorage\storage.json`（Trae CN IDE）
 //!
-//! 两个应用的 storage.json 同构：
-//! - 登录账号：键 `iCubeAuthInfo://icube-dc:<uid>`（uid 明文在键名中，值为 aha_kit 加密
-//!   blob，不做解密——沿用"快照/恢复"策略）。一个文件里可能出现多个账号键。
-//! - 套餐信息：键 `iCubeServerData://icube.cloudide`，值为 JSON 字符串（明文），
-//!   `entitlementInfo.identityStr` / `identity` 即当前登录账号的套餐
-//!   （Free=0 / Lite=5 / Pro=...），与 `ide_user_pay_status` 接口的
-//!   `user_pay_identity_str` 同源。
+//! **两套 uid 体系（重要）**：
+//! - `iCubeAuthInfo://icube-dc:<uid>` 键名中的 uid 是**账户中心（dc）id 空间**，
+//!   与账号池 / JWT `data.id` 的 **Cloud-IDE id 空间不是同一体系**（实测同一登录账号
+//!   dc=199439841787403 vs Cloud-IDE=2328112497170937），直接用会导致重复入池。
+//! - 因此当前登录账号的 Cloud-IDE uid 由本机使用痕迹推导：
+//!   1. Trae CN：storage.json `icube_gtm.users` 键名（仅记录当前/近期使用用户）；
+//!   2. Trae Work：state.vscdb（SQLite ItemTable）`solo.mobile.allowControl` 的
+//!      per-uid `updatedTime` 最新者，辅以 `<uid>:*` / `:user:<uid>` 键名证据计数；
+//!   3. 两应用证据合并取（最新时间, 证据数）最大者。
+//! - 推导失败时回退展示 dc uid，但标记 `uid_confident=false` 并禁止入池，
+//!   避免再产生跨体系的重复账号。
+//!
+//! 套餐信息：storage.json 键 `iCubeServerData://icube.cloudide`（明文 JSON），
+//! `entitlementInfo.identityStr` / `identity` 与 `ide_user_pay_status` 接口的
+//! `user_pay_identity_str` 同源。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,6 +28,7 @@ use crate::fs_utils;
 use crate::state::AppState;
 
 const STORAGE_SUFFIX: &str = r"User\globalStorage\storage.json";
+const VSCDB_SUFFIX: &str = r"User\globalStorage\state.vscdb";
 
 /// 单个应用的数据目录候选（按优先级）
 fn app_data_dirs(app_kind: &str) -> Vec<std::path::PathBuf> {
@@ -57,8 +66,9 @@ fn read_storage_json(app_kind: &str) -> Option<serde_json::Value> {
     None
 }
 
-/// 从 storage.json 提取登录账号 uid 列表（键名 `iCubeAuthInfo://icube-dc:<uid>`）
-fn extract_uids(storage: &serde_json::Value) -> Vec<String> {
+/// 从 storage.json 提取登录账号的账户中心 uid 列表（键名 `iCubeAuthInfo://icube-dc:<uid>`）。
+/// 注意：这是账户中心 id 空间，不能与账号池（Cloud-IDE uid）直接比对。
+fn extract_dc_uids(storage: &serde_json::Value) -> Vec<String> {
     let mut uids = Vec::new();
     if let Some(obj) = storage.as_object() {
         for key in obj.keys() {
@@ -75,29 +85,217 @@ fn extract_uids(storage: &serde_json::Value) -> Vec<String> {
     uids
 }
 
+// ---------------- Cloud-IDE uid 推导 ----------------
+
+/// 单个 Cloud-IDE uid 的本机使用证据
+#[derive(Default, Clone)]
+struct UidEvidence {
+    /// 最新使用时间（Unix 毫秒；无时间戳证据为 0）
+    latest_ts_ms: i64,
+    /// 出现次数（键名证据计数）
+    count: i64,
+}
+
+/// 判断 token 是否为 15~16 位纯数字 id
+fn is_uid_token(t: &str) -> bool {
+    (15..=16).contains(&t.chars().count()) && t.chars().all(|c| c.is_ascii_digit())
+}
+
+/// 把 "YYYY-MM" 转为近似时间戳（当月 1 日 0 点，Unix 秒→毫秒），用于与毫秒时间戳同维度比较
+fn month_to_ts_ms(month: &str) -> i64 {
+    let parts: Vec<&str> = month.split('-').collect();
+    if parts.len() != 2 {
+        return 0;
+    }
+    let (Ok(y), Ok(m)) = (parts[0].parse::<i32>(), parts[1].parse::<u32>()) else {
+        return 0;
+    };
+    if !(1..=12).contains(&m) {
+        return 0;
+    }
+    chrono::NaiveDate::from_ymd_opt(y, m, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc().timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// 从 state.vscdb（SQLite ItemTable）提取 per-uid 使用证据。
+/// 覆盖的键模式（本机实测）：
+/// - `solo.mobile.allowControl`：JSON `{uid: {updatedTime}}`，含精确毫秒时间戳（最强证据）
+/// - `<uid>:...` 键名前缀（如 `<uid>:AI.agent.model...`）
+/// - `*:user:<uid>[:YYYY-MM]`（如 `commercial-banner-popup:...:user:<uid>:2026-09`）
+/// - `solo-lite-mode-state-map-<uid>`
+fn vscdb_uid_evidence(app_kind: &str) -> HashMap<String, UidEvidence> {
+    let mut out: HashMap<String, UidEvidence> = HashMap::new();
+    let Some(db_path) = app_data_dirs(app_kind)
+        .into_iter()
+        .map(|d| d.join(VSCDB_SUFFIX))
+        .find(|p| p.is_file())
+    else {
+        return out;
+    };
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return out;
+    };
+    // 简化：直接查询全部键值
+    let mut stmt = match conn.prepare("SELECT key, value FROM ItemTable") {
+        Ok(s) => s,
+        Err(_) => return out,
+    };
+    let rows = stmt.query_map([], |row| {
+        let key: String = row.get(0)?;
+        let value: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+        Ok((key, value))
+    });
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    for row in rows.flatten() {
+        let (key, value) = row;
+        // 1) solo.mobile.allowControl：JSON {uid: {updatedTime}} —— 精确时间戳
+        if key == "solo.mobile.allowControl" {
+            if let Ok(map) = serde_json::from_str::<serde_json::Value>(&value) {
+                if let Some(obj) = map.as_object() {
+                    for (uid, info) in obj {
+                        if !is_uid_token(uid) {
+                            continue;
+                        }
+                        let ts = info
+                            .get("updatedTime")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let e = out.entry(uid.clone()).or_default();
+                        e.latest_ts_ms = e.latest_ts_ms.max(ts);
+                        e.count += 2;
+                    }
+                }
+            }
+            continue;
+        }
+        // 2) `solo-lite-mode-state-map-<uid>`
+        if let Some(rest) = key.strip_prefix("solo-lite-mode-state-map-") {
+            if is_uid_token(rest.trim()) {
+                let e = out.entry(rest.trim().to_string()).or_default();
+                e.count += 2;
+            }
+            continue;
+        }
+        // 3) 键名冒号分段扫描：`<uid>:...` 前缀 与 `:user:<uid>[:YYYY-MM]`
+        let tokens: Vec<&str> = key.split(':').collect();
+        for (i, t) in tokens.iter().enumerate() {
+            let tt = t.trim();
+            // `user:<uid>` 模式：优先取 user 后面的 uid（避免把月份段误判）
+            let _is_user_pattern = i > 0 && tokens[i - 1].trim() == "user";
+            if !is_uid_token(tt) {
+                continue;
+            }
+            let e = out.entry(tt.to_string()).or_default();
+            e.count += 1;
+            // 紧随 uid 的 YYYY-MM 段 → 月度时间证据
+            if let Some(next) = tokens.get(i + 1) {
+                let nt = next.trim();
+                if nt.len() == 7 && nt.as_bytes()[4] == b'-' {
+                    let ts = month_to_ts_ms(nt);
+                    e.latest_ts_ms = e.latest_ts_ms.max(ts);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 从 storage.json 提取 Cloud-IDE uid 证据：
+/// `icube_gtm.users` 键名仅记录当前/近期使用的用户（本机实测恒为当前登录账号）。
+fn storage_uid_evidence(storage: &serde_json::Value) -> HashMap<String, UidEvidence> {
+    let mut out = HashMap::new();
+    if let Some(users) = storage
+        .get("icube_gtm")
+        .and_then(|g| g.get("users"))
+        .and_then(|u| u.as_object())
+    {
+        for uid in users.keys() {
+            if is_uid_token(uid) {
+                let e: &mut UidEvidence = out.entry(uid.clone()).or_default();
+                // gtm.users 是强证据：权重 3
+                e.count += 3;
+            }
+        }
+    }
+    out
+}
+
+/// 合并证据并选出当前登录账号的 Cloud-IDE uid：
+/// 主排序 = 最新时间戳（无时间戳证据按 count 折算），次排序 = 证据数。
+fn select_cloud_uid(evidence: HashMap<String, UidEvidence>) -> Option<String> {
+    // 近似折算：无时间戳的证据视作 3 个月前，保证带真实时间戳的证据优先
+    let fallback_ts = chrono::Utc::now().timestamp_millis() - 90 * 24 * 3600 * 1000;
+    evidence
+        .into_iter()
+        .max_by_key(|(_, e)| (if e.latest_ts_ms > 0 { e.latest_ts_ms } else { fallback_ts }, e.count))
+        .map(|(uid, _)| uid)
+}
+
+/// 推导应用当前登录账号的 Cloud-IDE uid（合并 storage.json 与 state.vscdb 证据）
+fn infer_cloud_uid(app_kind: &str, storage: &serde_json::Value) -> Option<String> {
+    let mut merged = vscdb_uid_evidence(app_kind);
+    for (uid, e) in storage_uid_evidence(storage) {
+        let slot = merged.entry(uid).or_default();
+        slot.count += e.count;
+        slot.latest_ts_ms = slot.latest_ts_ms.max(e.latest_ts_ms);
+    }
+    select_cloud_uid(merged)
+}
+
 #[derive(Serialize, Clone)]
 pub struct DiscoveredAccount {
+    /// 账号池体系（Cloud-IDE）uid。uid_confident=false 时为账户中心 uid（仅展示，不可入池）
     pub user_id: String,
+    /// 账户中心（dc）uid —— 与账号池 id 体系不同，仅作诊断展示
+    pub dc_uid: Option<String>,
+    /// Cloud-IDE uid 是否经本机使用证据确认（false 时 user_id 实为 dc uid，入池会重复）
+    pub uid_confident: bool,
     /// 应用类别：TraeWork | Trae
     pub app: String,
     /// 展示名：Trae Work / Trae
     pub app_label: String,
     /// 是否已在账号池
     pub in_pool: bool,
-    /// 该应用本机登录的账号总数（含已入池）
+    /// 命中的 storage.json 路径
     pub storage_path: String,
 }
 
-/// F-08：扫描本机两个 Trae 应用的 storage.json，返回登录账号列表（标记是否已入池）。
+/// 账号池已有 uid 集合：包含 user_id 字段与 JWT 解析出的 data.id（部分账号 user_id 为空）
+fn pool_uid_set(accounts: &crate::models::AccountsFile) -> std::collections::HashSet<String> {
+    accounts
+        .accounts
+        .iter()
+        .flat_map(|a| {
+            let mut ids = Vec::new();
+            if let Some(uid) = a.user_id.clone() {
+                if !uid.is_empty() {
+                    ids.push(uid);
+                }
+            }
+            if !a.jwt.trim().is_empty() {
+                if let Some(uid) = crate::jwt::parse(&a.jwt).user_id {
+                    ids.push(uid);
+                }
+            }
+            ids
+        })
+        .collect()
+}
+
+/// F-08：扫描本机两个 Trae 应用的登录账号（推导 Cloud-IDE uid，标记是否已入池）。
 #[tauri::command]
 pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> {
     let accounts: crate::models::AccountsFile =
         fs_utils::read_json(&state.path("checkin_accounts.json"));
-    let known: std::collections::HashSet<String> = accounts
-        .accounts
-        .iter()
-        .filter_map(|a| a.user_id.clone())
-        .collect();
+    let known = pool_uid_set(&accounts);
 
     let mut out = Vec::new();
     for kind in ["TraeWork", "Trae"] {
@@ -110,15 +308,39 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
                 break;
             }
         }
-        if let Some(storage) = read_storage_json(kind) {
-            for uid in extract_uids(&storage) {
+        let Some(storage) = read_storage_json(kind) else {
+            continue;
+        };
+        let dc_uids = extract_dc_uids(&storage);
+        if dc_uids.is_empty() {
+            // 未登录任何账号
+            continue;
+        }
+        // 推导当前登录账号的 Cloud-IDE uid；失败则回退 dc uid（标记不置信，禁止入池）
+        match infer_cloud_uid(kind, &storage) {
+            Some(cloud_uid) => {
                 out.push(DiscoveredAccount {
-                    in_pool: known.contains(&uid),
-                    user_id: uid,
+                    in_pool: known.contains(&cloud_uid),
+                    dc_uid: dc_uids.first().cloned(),
+                    uid_confident: true,
+                    user_id: cloud_uid,
                     app: kind.to_string(),
                     app_label: app_label(kind).to_string(),
                     storage_path: path_display.clone(),
                 });
+            }
+            None => {
+                for dc in &dc_uids {
+                    out.push(DiscoveredAccount {
+                        in_pool: false,
+                        dc_uid: Some(dc.clone()),
+                        uid_confident: false,
+                        user_id: dc.clone(),
+                        app: kind.to_string(),
+                        app_label: app_label(kind).to_string(),
+                        storage_path: path_display.clone(),
+                    });
+                }
             }
         }
     }
@@ -139,11 +361,8 @@ pub fn apps_account_add(
     }
     let mut accounts: crate::models::AccountsFile =
         fs_utils::read_json(&state.path("checkin_accounts.json"));
-    if accounts
-        .accounts
-        .iter()
-        .any(|a| a.user_id.as_deref() == Some(uid.as_str()))
-    {
+    let known = pool_uid_set(&accounts);
+    if known.contains(&uid) {
         return Err("该账号已在账号池中".into());
     }
     let display_name = if name.trim().is_empty() {

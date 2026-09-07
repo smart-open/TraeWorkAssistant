@@ -24,6 +24,8 @@ tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "macros"] }
 tokio-stream = "0.1"
 bytes = "1"
 sha2 = "0.10"
+# 读 Trae 应用的 state.vscdb（SQLite）——自动发现当前登录账号的 Cloud-IDE uid
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 # 仅桌面端

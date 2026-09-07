@@ -277,14 +277,15 @@ function Stop-Trae {
             $Script:_TraeExeCache = $exePath
         }
         # F-47 三级关闭：先优雅关闭（CloseMainWindow 发送 WM_CLOSE，让 Electron 正常落盘，
-        # 避免强杀导致 leveldb/vscdb 文件锁），等待最长 8 秒；仍未退出再强制结束。
+        # 避免强杀导致 leveldb/vscdb 文件锁），等待最长 3 秒（实测通常 1s 内退出）；
+        # 仍未退出再强制结束。
         $graceful = $p | Where-Object { -not $_.HasExited } | ForEach-Object {
             try { $_.CloseMainWindow() | Out-Null; $_ } catch {}
         }
         if ($graceful) {
-            Write-Step -Stage 'stop' -Message '已发送优雅关闭请求，等待进程退出（最长 8 秒）' -Status 'running'
+            Write-Step -Stage 'stop' -Message '已发送优雅关闭请求，等待进程退出（最长 3 秒）' -Status 'running'
             $waited = 0
-            while ($waited -lt 8) {
+            while ($waited -lt 3) {
                 Start-Sleep -Seconds 1
                 $waited++
                 $still = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
@@ -301,9 +302,9 @@ function Stop-Trae {
             Write-Step -Stage 'stop' -Message '优雅关闭超时，强制结束进程' -Status 'warn'
             $p | Stop-Process -Force
         }
-        # 等待进程完全退出，最多等 8 秒
+        # 等待进程完全退出，最多等 3 秒
         $waited = 0
-        while ($waited -lt 8) {
+        while ($waited -lt 3) {
             Start-Sleep -Seconds 1
             $waited++
             $still = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
@@ -311,7 +312,7 @@ function Stop-Trae {
             }
             if (-not $still) { break }
         }
-        if ($waited -ge 8) {
+        if ($waited -ge 3) {
             Write-Step -Stage 'stop' -Message "进程未在 $waited 秒内退出，可能仍有文件锁，请手动关闭后重试" -Status 'error'
         }
     } else {

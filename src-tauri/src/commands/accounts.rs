@@ -331,6 +331,10 @@ struct CreditStats {
     earliest_expire: Option<i64>,
     /// 今日购买获得积分（charge_amount > 0 且 start_time 在今日）
     today_non_checkin_earned: f64,
+    /// 会员套餐到期时间（Unix 秒，如「会员 Lite 连续包月」包的 end_time）
+    membership_expire: Option<i64>,
+    /// 会员套餐下次自动续费扣款时间（Unix 秒，next_billing_time）
+    membership_next_billing: Option<i64>,
 }
 
 /// 调用 TRAE API 拉取积分包列表
@@ -412,6 +416,8 @@ fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
     let mut work: f64 = 0.0;
     let mut earliest_expire: Option<i64> = None;
     let mut today_non_checkin_earned: f64 = 0.0;
+    let mut membership_expire: Option<i64> = None;
+    let mut membership_next_billing: Option<i64> = None;
 
     // 使用固定 UTC+8 偏移，不依赖 chrono::Local（某些 Windows 环境下可能误判时区）
     let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
@@ -430,6 +436,30 @@ fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
     let today_end = today_start + 86400;
 
     for pack in &packs {
+        // ---- 会员套餐到期时间（不限积分包，扫描全部权益包）----
+        // 实测（2026-09）：连续包月会员包 display_desc="会员 Lite 连续包月"、
+        // group_name="会员积分"，end_time/expire_time=到期日，next_billing_time=下次扣款日。
+        let group_name = pack.get("group_name").and_then(|v| v.as_str()).unwrap_or("");
+        let display_desc = pack.get("display_desc").and_then(|v| v.as_str()).unwrap_or("");
+        if group_name.contains("会员") || display_desc.contains("会员") {
+            let end = pack
+                .get("entitlement_base_info")
+                .and_then(|e| e.get("end_time"))
+                .and_then(|v| v.as_i64())
+                .or_else(|| pack.get("expire_time").and_then(|v| v.as_i64()));
+            if let Some(end) = end {
+                if membership_expire.map_or(true, |cur| end > cur) {
+                    membership_expire = Some(end);
+                    // next_billing_time：0 / 1970 时间戳表示无自动续费
+                    let nb = pack
+                        .get("next_billing_time")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    membership_next_billing = if nb > 86400 { Some(nb) } else { None };
+                }
+            }
+        }
+
         // 仅对有 credits_limit 的包计入统计
         let credits_limit = pack
             .get("entitlement_base_info")
@@ -497,6 +527,8 @@ fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
         work: r2(work),
         earliest_expire,
         today_non_checkin_earned: r2(today_non_checkin_earned),
+        membership_expire,
+        membership_next_billing,
     })
 }
 
@@ -591,7 +623,23 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
     rc.general.insert(user_id.clone(), stats.general);
     rc.work.insert(user_id.clone(), stats.work);
     if let Some(exp) = stats.earliest_expire {
-        rc.expire_times.insert(user_id, exp);
+        rc.expire_times.insert(user_id.clone(), exp);
+    }
+    match stats.membership_expire {
+        Some(v) => {
+            rc.membership_expire.insert(user_id.clone(), v);
+        }
+        None => {
+            rc.membership_expire.remove(&user_id);
+        }
+    }
+    match stats.membership_next_billing {
+        Some(v) => {
+            rc.membership_next_billing.insert(user_id.clone(), v);
+        }
+        None => {
+            rc.membership_next_billing.remove(&user_id);
+        }
     }
     rc.updated_at = Some(fs_utils::now_iso());
     fs_utils::write_json(&state.path("remaining_credits.json"), &rc)?;
@@ -624,6 +672,22 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
                 rc.work.insert(uid.clone(), stats.work);
                 if let Some(exp) = stats.earliest_expire {
                     rc.expire_times.insert(uid.clone(), exp);
+                }
+                match stats.membership_expire {
+                    Some(v) => {
+                        rc.membership_expire.insert(uid.clone(), v);
+                    }
+                    None => {
+                        rc.membership_expire.remove(&uid);
+                    }
+                }
+                match stats.membership_next_billing {
+                    Some(v) => {
+                        rc.membership_next_billing.insert(uid.clone(), v);
+                    }
+                    None => {
+                        rc.membership_next_billing.remove(&uid);
+                    }
                 }
                 total_non_checkin_earned += stats.today_non_checkin_earned;
                 ok_count += 1;
@@ -1004,6 +1068,8 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
                 .statuses
                 .get(&uid)
                 .map(|p| p.identity_str.clone()),
+            membership_expire: rc.membership_expire.get(&uid).copied(),
+            membership_next_billing: rc.membership_next_billing.get(&uid).copied(),
         });
     }
     out

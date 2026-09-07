@@ -28,6 +28,12 @@ pub struct AccountView {
     /// 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存）
     #[serde(default)]
     pub pay_identity: Option<String>,
+    /// 会员套餐到期时间（Unix 秒，来自 ent_usage 会员包）
+    #[serde(default)]
+    pub membership_expire: Option<i64>,
+    /// 会员套餐下次自动续费时间（Unix 秒，无自动续费为 None）
+    #[serde(default)]
+    pub membership_next_billing: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -206,6 +212,12 @@ pub struct RemainingCreditsFile {
     /// Work 积分（product_id == 209）剩余缓存
     #[serde(default)]
     pub work: HashMap<String, f64>,
+    /// 会员套餐到期时间缓存（Unix 秒，来自 ent_usage 会员包 end_time）
+    #[serde(default)]
+    pub membership_expire: HashMap<String, i64>,
+    /// 会员套餐下次自动续费时间缓存（Unix 秒，next_billing_time）
+    #[serde(default)]
+    pub membership_next_billing: HashMap<String, i64>,
     #[serde(default)]
     pub updated_at: Option<String>,
 }

@@ -99,12 +99,28 @@ const fmtCredits = (v: number) =>
   v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
 
 /** 套餐身份徽标（Free / Lite / Pro ...，悬停展示说明） */
-function PayIdentityBadge({ identity }: { identity: string | null | undefined }) {
+function PayIdentityBadge({
+  identity,
+  expire,
+  nextBilling,
+}: {
+  identity: string | null | undefined;
+  expire?: number | null;
+  nextBilling?: number | null;
+}) {
   if (!identity) return null;
   const paid = identity.toLowerCase() !== 'free';
+  const fmtDay = (ts: number) =>
+    new Date(ts * 1000).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+  const expTip = expire
+    ? `套餐到期：${new Date(expire * 1000).toLocaleDateString('zh-CN')}`
+    : '';
+  const billTip = nextBilling
+    ? `${expTip ? '\n' : ''}下次自动续费：${new Date(nextBilling * 1000).toLocaleDateString('zh-CN')}`
+    : '';
   return (
     <span
-      title={`当前订阅套餐：${identity}`}
+      title={expTip || billTip ? `当前订阅套餐：${identity}\n${expTip}${billTip}` : `当前订阅套餐：${identity}`}
       className={`inline-flex cursor-help items-center gap-0.5 rounded-full px-1.5 py-px text-[10px] font-semibold ${
         paid
           ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400'
@@ -112,6 +128,7 @@ function PayIdentityBadge({ identity }: { identity: string | null | undefined })
       }`}
     >
       <Crown size={9} /> {identity}
+      {expire ? <span className="font-normal opacity-80">· {fmtDay(expire)}到期</span> : null}
     </span>
   );
 }
@@ -441,7 +458,11 @@ export default function Accounts() {
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
                         <span className="font-medium">{a.name}</span>
-                        <PayIdentityBadge identity={a.pay_identity} />
+                        <PayIdentityBadge
+                          identity={a.pay_identity}
+                          expire={a.membership_expire}
+                          nextBilling={a.membership_next_billing}
+                        />
                       </div>
                       <div className="text-xs text-slate-400">{a.user_id}</div>
                     </td>
@@ -1502,9 +1523,10 @@ function DiscoverModal({
     <Modal open={open} onClose={onClose} title="扫描本机登录账号" size="lg">
       <div className="space-y-3 text-sm">
         <p className="text-xs leading-relaxed text-slate-500 dark:text-zinc-400">
-          扫描本机 Trae Work（TRAE SOLO CN）与 Trae 的 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">storage.json</code>，
-          读取当前已登录的账号列表。未入池的账号可一键加入（先以占位形式入库，
-          之后启动代理打开对应应用时，JWT 会被自动捕获回填）。
+          扫描本机 Trae Work（TRAE SOLO CN）与 Trae 的 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">storage.json</code> 与
+          {' '}<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">state.vscdb</code>，
+          识别当前已登录账号（Cloud-IDE uid，与账号池同体系）。未入池的账号可一键加入
+          （先以占位形式入库，之后启动代理打开对应应用时，JWT 会被自动捕获回填）。
         </p>
 
         {scanning && (
@@ -1538,15 +1560,28 @@ function DiscoverModal({
                       >
                         <div className="min-w-0">
                           <div className="truncate font-mono text-xs">{d.user_id}</div>
+                          {d.uid_confident ? (
+                            d.dc_uid ? (
+                              <div className="truncate text-[10px] text-slate-400 dark:text-zinc-500">
+                                账户中心 uid：{d.dc_uid}（与账号池 id 体系不同，仅作参考）
+                              </div>
+                            ) : null
+                          ) : (
+                            <div className="text-[10px] text-amber-600 dark:text-amber-400">
+                              无法确认账号池 uid（仅识别到账户中心 id），暂不能入池
+                            </div>
+                          )}
                         </div>
                         {d.in_pool ? (
                           <Badge tone="green">
                             <CheckCircle2 size={12} /> 已入池
                           </Badge>
-                        ) : (
+                        ) : d.uid_confident ? (
                           <button onClick={() => onAdd(d)} className="btn-outline !px-2 !py-1 text-xs">
                             <Plus size={12} /> 加入
                           </button>
+                        ) : (
+                          <span className="text-[10px] text-slate-400">不可入池</span>
                         )}
                       </div>
                     ))}

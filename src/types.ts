@@ -47,11 +47,19 @@ export interface AccountView {
   work_credits: number | null;
   /** 套餐身份（Free / Lite / Pro ...，来自 ide_user_pay_status 缓存） */
   pay_identity?: string | null;
+  /** 会员套餐到期时间（Unix 秒，来自 ent_usage 会员包） */
+  membership_expire?: number | null;
+  /** 会员套餐下次自动续费时间（Unix 秒，无自动续费为空） */
+  membership_next_billing?: number | null;
 }
 
 // ---- F-08 双应用账号自动发现 ----
 export interface DiscoveredAccount {
   user_id: string;
+  /** 账户中心（dc）uid —— 与账号池 Cloud-IDE id 体系不同，仅诊断展示 */
+  dc_uid?: string | null;
+  /** Cloud-IDE uid 是否经本机使用证据确认（false 时 user_id 实为 dc uid，不可入池） */
+  uid_confident: boolean;
   /** TraeWork | Trae */
   app: string;
   app_label: string;

@@ -1,9 +1,10 @@
 //! F-47 进程管理增强：三级关闭策略
 //!
 //! 参考社区实现（oss-ecosystem-research §5.3 rotate.rs）的三级关闭思路：
-//! 1. **优雅关闭**：taskkill（不带 /F）向主窗口发送 WM_CLOSE，等待最长 8s，
-//!    让 Electron 正常落盘（避免强杀导致 leveldb/vscdb 文件锁与数据损坏）；
-//! 2. **强杀进程树**：taskkill /T /F，等待最长 3s；
+//! 1. **优雅关闭**：taskkill（不带 /F）向主窗口发送 WM_CLOSE，等待最长 3s，
+//!    让 Electron 尽量正常落盘（避免强杀导致 leveldb/vscdb 文件锁与数据损坏）；
+//!    实测 Electron 收到 WM_CLOSE 后通常 1s 内退出，3s 足够且不拖慢切换体验；
+//! 2. **强杀进程树**：taskkill /T /F，等待最长 2s；
 //! 3. **人工介入**：仍存活则返回 Err，由前端 toast 提示用户手动关闭。
 //!
 //! 匹配策略：仅按主程序映像名精确匹配（tasklist/taskkill 的 IMAGENAME），
@@ -51,29 +52,29 @@ pub fn graceful_kill_images(images: &[&str]) -> Result<(), String> {
         return Ok(());
     }
 
-    // ---- 第一级：优雅关闭（WM_CLOSE），最长等待 8s ----
+    // ---- 第一级：优雅关闭（WM_CLOSE），最长等待 3s ----
     for img in &alive {
         // taskkill 不带 /F：向有窗口的进程发送关闭消息
         run_taskkill(&["/IM", img]);
-    }
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline {
-        if images_running(images).is_empty() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    // ---- 第二级：强杀进程树（/T /F），最长等待 3s ----
-    for img in &alive {
-        run_taskkill(&["/T", "/F", "/IM", img]);
     }
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         if images_running(images).is_empty() {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // ---- 第二级：强杀进程树（/T /F），最长等待 2s ----
+    for img in &alive {
+        run_taskkill(&["/T", "/F", "/IM", img]);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if images_running(images).is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 
     // ---- 第三级：人工介入 ----
