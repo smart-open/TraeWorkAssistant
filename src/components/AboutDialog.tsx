@@ -83,11 +83,8 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
           <img
             src={donateQr}
             alt="赞赏码"
-            className="mx-auto w-44 rounded-lg border border-white shadow-sm dark:border-zinc-700"
+            className="mx-auto w-64 rounded-lg border border-white shadow-sm dark:border-zinc-700"
           />
-          <div className="mt-2 text-[11px] text-slate-500 dark:text-zinc-400">
-            “打赏一杯快乐水，代码更新不摆烂”
-          </div>
         </div>
 
         {/* 作者与版权 */}
