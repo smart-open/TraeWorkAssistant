@@ -4,6 +4,29 @@
 
 ---
 
+## [2.6.0] - 2026-09-07
+
+应用自更新（检查更新）与开发体验优化，次要版本升级（2.5.0 → 2.6.0）。
+
+### 新增
+
+- **检查更新**（移植自 `feat/traecode_doubao` 分支并按本工程适配）：
+  - 后端新增 `updater.rs`：`update_check`（GitHub Releases latest 解析，tag/资产名双路版本比较，NSIS 优先于 MSI）与 `update_install`（版本一致性防御校验、流式下载 + `update-download-progress` 进度事件、NSIS `/S` 静默安装后应用退出）
+  - 「关于」页版本号后新增「检查更新」按钮：检查中（转圈）→ 已最新（绿字）/ 发现新版本自动下载（进度条 + 资产名/大小）→ 启动安装程序并退出；失败时展示错误与手动下载回退
+- **开发端口随机化**：新增 `scripts/dev.mjs` 开发入口（`npm run dev`），在 5000-6000 范围随机挑选空闲端口，经 `VITE_PORT` 环境变量 + `.tauri-dev-config.json`（devUrl 覆盖，已 gitignore）联动 `tauri dev`；`npm run dev:vite` 保留 5173 固定端口回退，`beforeDevCommand` 相应调整为 `dev:vite`
+
+### 变更文件
+
+| 文件 | 说明 |
+|---|---|
+| `src-tauri/src/commands/updater.rs`（新增）/ `mod.rs` / `main.rs` | 自更新命令实现与注册 |
+| `src/types.ts` / `src/lib/tauri.ts` / `src/components/AboutDialog.tsx` | 更新类型、`api.updater` 绑定与检查更新 UI |
+| `scripts/dev.mjs`（新增）/ `vite.config.ts` / `package.json` / `tauri.conf.json` / `.gitignore` | 动态开发端口方案 |
+| `package.json` / `tauri.conf.json` / `Cargo.toml` / `Cargo.lock` / `about.ts` / `accounts.rs` | 版本号 2.5.0 → 2.6.0 同步 |
+| `AGENT.md` / `docs/*.md` / `scripts/make_portable_zip.py` | 文档版本标注与便携包文件名同步 |
+
+---
+
 ## [2.5.0] - 2026-09-07
 
 积分双轨改造（通用积分 / Work 积分区分）、多主题换肤与本机扫描修复，次要版本升级（2.4.6 → 2.5.0）。
