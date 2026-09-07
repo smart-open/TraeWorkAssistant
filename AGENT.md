@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.1.0
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.2.0
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -105,6 +105,7 @@ ai-work-assistant/
 | 日志 | `logs_query({ opts: { log_type, date, keyword, limit } })` → `LogLine[]` | `split_time` 会 strip BOM 前缀 |
 | 设置 | `settings_get()` / `settings_set(patch: Settings)` | Settings 全部 snake_case |
 | 计划 | `task_register(time)` / `task_status()` / `task_unregister()` | `schtasks` 注册每日签到 |
+| 更新 | `update_check()` / `update_download(...)` → `UpdateDownloaded` / `update_run_installer({file_path, asset_name})` | 两步确认制：下载（确认一）→ 安装（确认二）。安装器参数 `/P /UPDATE /R`：被动进度条 + 跳过卸载直接覆盖 + 完成后自动重启应用；`run_installer` 校验路径必须位于临时更新目录 |
 
 ## 6. Tauri 事件（Rust → 前端）
 
@@ -117,6 +118,8 @@ ai-work-assistant/
 | `switch-done` | `{ success: boolean, raw: string }` |
 | `save-login-progress` | `string`（PowerShell NDJSON 单行） |
 | `save-login-done` | `{ success: boolean, raw: string }` |
+| `update-download-progress` | `{ received, total, percent }`（更新包下载进度） |
+| `update-installing` | `string`（asset_name，安装器已启动、应用即将退出） |
 
 ## 7. 数据文件
 
@@ -187,6 +190,21 @@ ai-work-assistant/
 | 注册定时签到 | Settings 页 → 输入 `HH:MM` → 注册任务 |
 | API 服务 | ApiService 页 → 配置端口/API Key → 选账号池 → 启动 |
 
+## 11.1 版本号升级规则（每次提交）
+
+语义化版本 `MAJOR.MINOR.PATCH`（如 3.1.0），按本次提交内容判断：
+
+| 提交内容 | 升级位 | 示例 |
+|---|---|---|
+| 新增一个完整的有意义的功能 | **中位（MINOR）** | 3.0.0 → 3.1.0 |
+| 修复 bug / 功能优化 / 微小功能新增或调整 | **低位（PATCH）** | 3.1.0 → 3.1.1 |
+
+- 大位（MAJOR）仅在重大架构/破坏性变更时升级
+- 升版提交执行 `npm run set-version <x.y.z>` 一键同步（底层 `scripts/sync_version.py`：package.json / Cargo.toml / Cargo.lock / AGENT.md 标题）；CHANGELOG.md 手动新增条目
+- 版本号单一来源为 `src-tauri/Cargo.toml`：tauri.conf.json 不写 version（自动回退），Rust 端 `env!("CARGO_PKG_VERSION")` 自动取，前端关于页运行时经 `getVersion()` 读取（about.ts 不写版本号），NSIS / MSI 安装包版本号自动跟随
+- 一个提交包含多类变更时，按最高级别升位；纯文档/注释改动不升级；版本同步提交本身不再升位
+- **GitHub Release 标题固定格式**：`v{MAJOR}.{MINOR}.{PATCH} 版本发布`（如 `v3.1.1 版本发布`），不额外加描述后缀
+
 ## 12. 安全与合规
 
 - **零外发**：不连接任何自有后端。
@@ -220,17 +238,4 @@ ai-work-assistant/
 - **品牌迁移（v3.0.0）**：identifier `com.traework.assistant`→`com.aiwork.assistant`，数据目录 `%APPDATA%\TraeWorkAssistant`→`AIWorkAssistant`（`state.rs::migrate_legacy_dirs` 启动时**复制**迁移——旧目录原地保留，老应用可继续使用、两版并存；新目录已有数据则跳过；含 WebView2 目录），计划任务由 `misc.rs::try_migrate_legacy_task` 按旧触发时间重建（**旧任务保留**，`task_unregister` 只删新任务）。环境变量统一为 `AIWORKDATA_DIR`（Python 侧兼容读旧 `TRAEDATA_DIR`）。
 - **老安装包升级**：升级兼容按**安装时产品名**判定（非版本号）。NSIS 通过 `build-assets/installer-hooks.nsh` 静默卸载清理旧品牌「Trae Work 助手」安装（已发布的 v2.4.4 及更早均属旧品牌，UTF-8 with BOM）；「AI Work 助手」品牌（v3.0.0 起）走 NSIS 原生原地升级；老 MSI 因 UpgradeCode 随 identifier 变化无法原地升级，需先卸载或改用 NSIS 包升级。打包产物统一输出到 `release/`，使用中文产品名命名 `AI Work 助手_<版本>_x64*`（`scripts/rename_release.py`）。
 - **版本线与数据迁移**：新版本自 v3.0.0 起，**之前所有 2.x 版本升级到 3.x 均需数据迁移（安装/首次启动自动完成）**；原「Trae Work 助手」产品线在 `trae_work_main` 分支维护（仅 Trae Work 单应用，2.x.x，仅必要修复），仅使用 Trae Work 的用户可不升级，用该分支的 v2.x.x 最新版本即可。
-
-## 15. 版本升级规则（每次提交适用）
-
-**单一版本源 = `src-tauri/Cargo.toml`**。同步其余位置用一条命令：`python scripts/sync_version.py`（读 Cargo.toml 同步 package.json / AGENT.md 标题 / Cargo.lock），或 `python scripts/sync_version.py 3.2.0`（先改 Cargo.toml 再同步）。
-
-- `src-tauri/tauri.conf.json`：**不写 version 字段**（Tauri 自动回读 Cargo.toml）。
-- `src/lib/about.ts`：**不写版本号**（关于页运行时经 `getVersion()` 读取）。
-- NSIS / MSI 安装包版本号同样自动跟随 Cargo.toml。
-
-- **中位版本 +1**（x.**Y**.0）：提交中新增了一个**完整、有意义的功能**（如自动发现、套餐展示、账号导入）。
-- **低位版本 +1**（x.Y.**Z**）：bug 修复、功能优化、微小功能新增或调整（UI 文案/样式、参数微调、重构不改变行为）。
-- 判断口径以**提交整体**为准：一次提交含多个改动时，取其中最高级别；纯文档/注释改动不升级。
-
-**NSIS 安装器**：使用自定义模板 `build-assets/installer.nsi`（基于 tauri v2.11.4 上游模板，配置于 tauri.conf.json `bundle.windows.nsis.template`）——升级安装时跳过「卸载旧版/不卸载」选择页，**默认直接覆盖安装**（同版本重装/降级仍显示选择页）。升级 Tauri CLI 后如构建报错，需从对应版本 tag 的 `crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi` 重新同步模板并重做定制。
+- **NSIS 安装器**：使用自定义模板 `build-assets/installer.nsi`（基于 tauri v2.11.4 上游模板，配置于 tauri.conf.json `bundle.windows.nsis.template`）——升级安装时跳过「卸载旧版/不卸载」选择页，**默认直接覆盖安装**（同版本重装/降级仍显示选择页）。升级 Tauri CLI 后如构建报错，需从对应版本 tag 的 `crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi` 重新同步模板并重做定制。

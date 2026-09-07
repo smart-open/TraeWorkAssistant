@@ -1,13 +1,14 @@
 {
   "name": "ai-work-assistant",
   "private": true,
-  "version": "3.1.0",
+  "version": "3.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "node scripts/dev-tauri.mjs"
+    "tauri": "node scripts/dev-tauri.mjs",
+    "set-version": "python scripts/sync_version.py"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
