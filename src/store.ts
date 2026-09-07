@@ -476,9 +476,26 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   openTraeCn: async () => {
+    // 与 openTraeWithProxy 同款逻辑：先确保代理在运行并注入，Trae 的流量才走本地 MITM 代理
+    let port: number | undefined = get().proxy.running ? get().proxy.port : undefined;
+    if (!port) {
+      // 可能残留端口为 0 的无效代理，先停掉再以有效端口重启
+      if (get().proxy.running) {
+        try { await get().stopProxy(); } catch { /* ignore */ }
+      }
+      get().pushToast('info', '正在启动代理以确保 Trae 走本地代理…');
+      await get().startProxy();
+      port = get().proxy.running ? get().proxy.port : undefined;
+    }
     try {
-      await api.env.openCnApp();
-      get().pushToast('success', '已打开 Trae');
+      if (port) {
+        await api.env.openCnApp(port);
+        get().pushToast('success', `已打开 Trae（代理已注入 127.0.0.1:${port}）`);
+      } else {
+        // 代理启动失败：仍打开客户端，但明确告知不走代理
+        await api.env.openCnApp(undefined);
+        get().pushToast('warn', '代理启动失败，已直接打开 Trae（流量不会经过本地代理）');
+      }
     } catch (err) {
       get().pushToast('error', `打开 Trae 失败：${String(err)}`);
     }

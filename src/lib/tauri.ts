@@ -29,7 +29,7 @@ export const api = {
     checkCn: () => invoke<EnvStatus>('env_check_trae_cn'),
     openSite: () => invoke('open_trae_website'),
     openApp: (proxyPort?: number) => invoke('open_trae_app', { proxyPort }),
-    openCnApp: () => invoke('open_trae_cn_app'),
+    openCnApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
   },
   cert: {
     status: () => invoke<{ installed: boolean }>('cert_status'),

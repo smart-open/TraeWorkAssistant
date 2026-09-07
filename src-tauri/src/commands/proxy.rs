@@ -81,6 +81,8 @@ pub fn proxy_start(
     }
     // 兜底：端口为 0 时退化为固定端口 8899，避免注入 TRAE 的代理地址无效（见 store.ts 同款兜底）
     let port = if port == 0 { 8899 } else { port };
+    // 记录本次使用的端口：cleanup_stale_local_proxy 据此识别「指向已停止本地代理的残留系统代理」
+    let _ = std::fs::write(state.data_dir.join("last_proxy_port.txt"), port.to_string());
     // 本机代理监听地址（系统代理将指向它）
     let proxy_addr = format!("127.0.0.1:{port}");
     let script_path = state.python_dir.join("device_proxy.py");
@@ -403,6 +405,38 @@ pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
 pub(crate) fn clear_win_proxy() -> Result<(), String> {
     apply_proxy(false, "", "")
 }
+
+/// 直开应用前的防御：若系统代理仍指向本机「我们上次使用的端口」而本地代理已停止
+/// （应用异常退出等场景可能未还原），提前清除，避免 Trae 全部请求 ERR_CONNECTION_RESET。
+/// 只匹配我们自己写盘记录的端口，不会误伤用户自己的 VPN 本地代理（如 Clash 7890）。
+#[cfg(target_os = "windows")]
+pub(crate) fn cleanup_stale_local_proxy(state: &AppState) {
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let enable = reg_query_value(key, "ProxyEnable")
+        .map(|v| v.contains("1"))
+        .unwrap_or(false);
+    if !enable {
+        return;
+    }
+    let server = reg_query_value(key, "ProxyServer").unwrap_or_default();
+    let last_port = std::fs::read_to_string(state.data_dir.join("last_proxy_port.txt"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok());
+    let Some(port) = last_port else { return };
+    let ours = format!("127.0.0.1:{port}");
+    if server.contains(&ours) {
+        match clear_win_proxy() {
+            Ok(()) => fs_utils::app_log(
+                &state.data_dir,
+                &format!("已清理指向已停止本地代理的残留系统代理({ours})"),
+            ),
+            Err(e) => fs_utils::app_log(&state.data_dir, &format!("清理残留系统代理失败: {e}")),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn cleanup_stale_local_proxy(_state: &AppState) {}
 
 /// 通知 WinINet 代理设置已变更，让运行中的进程立即生效
 /// 不调用此函数的话，已有进程会继续使用缓存的旧代理设置

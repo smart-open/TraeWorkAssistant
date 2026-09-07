@@ -42,9 +42,13 @@ pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
 pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
     let (installed, path, _) = detect_trae(state.settings().trae_path);
     if !installed {
-        return Err("未检测到本地 Trae Work 安装，请在「设置 → 代理与签到」中指定 exe 路径".into());
+        return Err("未检测到本地 Trae Work 安装，请在「环境配置」中指定 exe 路径".into());
     }
     let exe = path.ok_or("未找到 Trae Work 可执行文件路径")?;
+    // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理，避免请求被 RESET
+    if proxy_port.is_none() {
+        crate::commands::proxy::cleanup_stale_local_proxy(&state);
+    }
     // 代理注入要求 Trae 以 --proxy-server 启动。Electron 单实例下，已运行的窗口会忽略新启动
     // 参数，再次点击只会聚焦旧窗口，导致全程不走代理、无法捕获账号。故注入代理前先结束现有
     // 进程，确保参数真正生效。（无代理时正常打开，不杀进程。）
@@ -72,17 +76,31 @@ pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
     EnvStatus { installed, running, version, path }
 }
 
-/// 打开 Trae CN IDE（普通启动，不注入代理）
+/// 打开 Trae CN IDE。与 Trae Work 同款代理注入：传入 proxy_port 时以 --proxy-server 启动，
+/// 让 Trae 的流量也走本地 MITM 代理（捕获账号/观察请求）。
 #[tauri::command]
-pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>) -> Result<(), String> {
+pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
     let (installed, path, _) = detect_trae_cn(state.settings().trae_cn_path.clone());
     if !installed {
-        return Err("未检测到 Trae 安装，请在「设置 → 代理与签到」中指定 Trae 安装路径".into());
+        return Err("未检测到 Trae 安装，请在「环境配置」中指定 Trae 安装路径".into());
     }
     let exe = path.ok_or("未找到 Trae 可执行文件路径")?;
-    Command::new(&exe)
-        .spawn()
-        .map_err(|e| format!("启动 Trae 失败: {e}"))?;
+    // 直开前清理可能指向已停止本地代理的残留系统代理
+    if proxy_port.is_none() {
+        crate::commands::proxy::cleanup_stale_local_proxy(&state);
+    }
+    // Electron 单实例：已运行的窗口会忽略新启动参数，注入代理前先结束现有进程确保生效
+    if proxy_port.is_some() {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "Trae CN.exe"])
+            .creation_flags(0x08000000)
+            .output();
+    }
+    let mut cmd = Command::new(&exe);
+    if let Some(port) = proxy_port {
+        cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
+    }
+    cmd.spawn().map_err(|e| format!("启动 Trae 失败: {e}"))?;
     Ok(())
 }
 
