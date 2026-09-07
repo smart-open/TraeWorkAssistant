@@ -212,19 +212,26 @@ pub fn save_current_login(
 
 /// 6 层设备标识重置：调用 PowerShell 脚本的 ResetDeviceIds 动作
 /// 通过 NDJSON 事件流式返回进度，前端订阅 device-reset-progress / device-reset-done
+/// target_app：TraeWork（默认，TRAE SOLO CN）/ Trae（Trae CN IDE），决定清理哪个应用的数据目录
 #[tauri::command]
 pub fn reset_device_ids(
     app: AppHandle,
     state: State<AppState>,
+    target_app: Option<String>,
 ) -> Result<(), String> {
+    let target = match target_app.as_deref() {
+        Some("Trae") => "Trae",
+        _ => "TraeWork",
+    };
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "switch/重置/保存 已到达 Rust: ps_dir={:?}, bridge 存在={}",
+            "switch/重置/保存 已到达 Rust: ps_dir={:?}, bridge 存在={}, target_app={}",
             ps_dir,
-            bridge.exists()
+            bridge.exists(),
+            target
         ),
     );
     if !bridge.exists() {
@@ -242,6 +249,8 @@ pub fn reset_device_ids(
             &bridge.to_string_lossy(),
             "-Action",
             "ResetDeviceIds",
+            "-TargetApp",
+            target,
             "-Json",
         ])
         .stdout(std::process::Stdio::piped())

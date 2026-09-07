@@ -24,6 +24,7 @@ export default function Settings() {
   const [taskInfo, setTaskInfo] = useState<string>('');
   const [busyTask, setBusyTask] = useState(false);
   const [querying, setQuerying] = useState(false);
+  const [deviceTarget, setDeviceTarget] = useState<'TraeWork' | 'Trae'>('TraeWork');
   const [detecting, setDetecting] = useState(false);
   const [detectingCn, setDetectingCn] = useState(false);
 
@@ -154,7 +155,7 @@ export default function Settings() {
 
   const handleResetDeviceIds = async () => {
     setConfirmResetDevice(false);
-    await resetDeviceIds();
+    await resetDeviceIds(deviceTarget);
   };
 
   if (!form) {
@@ -238,10 +239,19 @@ export default function Settings() {
 
           <h3 className="mb-1 font-medium">6 层设备标识重置</h3>
           <p className="mb-3 text-xs text-slate-500">
-            一次性重置 TRAE 的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
-            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭 TRAE。
+            一次性重置所选应用的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
+            TinyStorage ⑤ 注册表 MachineGuid ⑥ webview 追踪数据。用于账号隔离与防关联，执行前请先关闭对应应用。
           </p>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              value={deviceTarget}
+              onChange={(e) => setDeviceTarget(e.target.value as 'TraeWork' | 'Trae')}
+              disabled={deviceResetActive}
+              className="input h-9 w-36 text-sm"
+            >
+              <option value="TraeWork">Trae Work</option>
+              <option value="Trae">Trae</option>
+            </select>
             <button
               onClick={() => setConfirmResetDevice(true)}
               disabled={deviceResetActive}
@@ -383,7 +393,9 @@ export default function Settings() {
         <div className="flex items-start gap-3">
           <AlertTriangle size={20} className="mt-0.5 shrink-0 text-amber-500" />
           <div>
-            <p>将重置以下全部设备标识层：</p>
+            <p>
+              将重置 <span className="font-semibold">{deviceTarget === 'Trae' ? 'Trae（Trae CN IDE）' : 'Trae Work（TRAE SOLO CN）'}</span> 的以下全部设备标识层：
+            </p>
             <ul className="mt-2 space-y-0.5 text-xs text-slate-400">
               <li>① machineid</li>
               <li>② storage.json telemetry</li>

@@ -122,7 +122,8 @@ export const api = {
     invoke('switch_account', { userId, targetApp: targetApp ?? null }),
   saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
-  resetDeviceIds: () => invoke('reset_device_ids'),
+  resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
+    invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   profiles: {
     list: () => invoke<ProfileInfo[]>('profile_list'),
     backup: (userId: string) => invoke('profile_backup', { userId }),

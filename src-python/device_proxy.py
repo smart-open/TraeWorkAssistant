@@ -613,10 +613,15 @@ def try_capture_refresh_token_from_response(host, path, resp_body):
 # 背景：当前版本 TRAE 的鉴权请求(api.trae.cn)不走 Chromium `--proxy-server` 代理，
 # MITM 代理抓不到 Cloud-IDE-JWT。但 TRAE 把登录态存在本地 Cookies(Chromium 格式)，
 # 此处直接在 Windows 侧解密提取并写回 checkin_accounts.json，作为代理方案的兜底。
-def _trae_app_dir():
-    # TRAE SOLO CN 用户数据目录；可用 TRAE_APP_DIR 覆盖
-    return os.environ.get("TRAE_APP_DIR") or os.path.join(
-        os.environ.get("APPDATA", ""), "TRAE SOLO CN")
+def _trae_app_dirs():
+    """候选应用数据目录：TRAE SOLO CN（Trae Work）+ Trae CN（Trae IDE）。
+    两个应用同为 Chromium 结构、同一账号体系，登录态都可能存在本地 Cookies。
+    设置 TRAE_APP_DIR 时只扫指定目录（兼容旧环境变量）。"""
+    env = os.environ.get("TRAE_APP_DIR")
+    if env:
+        return [env]
+    base = os.environ.get("APPDATA", "")
+    return [os.path.join(base, "TRAE SOLO CN"), os.path.join(base, "Trae CN")]
 
 
 def _chrome_aes_key(app_dir):
@@ -691,10 +696,23 @@ def _find_cloud_ide_jwt(blob):
 
 def capture_from_local():
     """解密 TRAE 本地 Cookies + 扫描 Local Storage，提取 Cloud-IDE-JWT 写回 accounts.json。
-    仅 Windows 有效(需 win32crypt + cryptography)。返回新增/更新账号数。"""
+    遍历 TRAE SOLO CN 与 Trae CN 两个应用的数据目录。仅 Windows 有效(需 win32crypt + cryptography)。
+    返回新增/更新账号数。"""
     if AUTO_CAPTURE_JWT:
         load_accounts()
-    app_dir = _trae_app_dir()
+    total = 0
+    for app_dir in _trae_app_dirs():
+        try:
+            total += _capture_from_app_dir(app_dir)
+        except Exception as e:
+            log(f"[local] 目录 {app_dir} 捕获失败: {e}")
+    log(f"[local] 本地捕获完成，新增/更新 {total} 个账号")
+    return total
+
+
+def _capture_from_app_dir(app_dir):
+    """对单个应用数据目录执行 Cookies 解密 + leveldb 明文扫描。返回新增/更新账号数。"""
+    found = 0
     log(f"[local] TRAE 数据目录: {app_dir}")
     if not os.path.isdir(app_dir):
         log("[local] 目录不存在，跳过")
@@ -702,7 +720,6 @@ def capture_from_local():
     key = _chrome_aes_key(app_dir)
     if key is None:
         log("[local] 未取得 AES 密钥(需 Windows 已登录用户 + pywin32)；将仅扫描明文值")
-    found = 0
     # 1) Cookies 数据库
     dbs = [os.path.join(app_dir, "Network", "Cookies")]
     tw = os.path.join(app_dir, "Partitions", "trae-webview", "Cookies")
@@ -760,7 +777,6 @@ def capture_from_local():
                     r = update_account_jwt(uid, hit)
                     log(f"[local] 命中 leveldb {fn} -> {r}")
                     found += 1
-    log(f"[local] 本地捕获完成，新增/更新 {found} 个账号")
     return found
 
 # ---------------- CA / 叶子证书 ----------------

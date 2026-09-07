@@ -101,7 +101,7 @@ interface AppState {
   switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
   saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
-  resetDeviceIds: () => Promise<void>;
+  resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
   startCheckin: (opts: {
     scope: string;
     user_ids?: string[];
@@ -610,11 +610,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `续期失败：${String(err)}`);
     }
   },
-  resetDeviceIds: async () => {
+  resetDeviceIds: async (targetApp) => {
     set({ deviceResetActive: true, deviceResetProgress: [] });
     try {
-      await api.resetDeviceIds();
-      get().pushToast('info', '正在执行 6 层设备标识重置…');
+      await api.resetDeviceIds(targetApp);
+      get().pushToast('info', `正在执行 6 层设备标识重置（${targetApp === 'Trae' ? 'Trae' : 'Trae Work'}）…`);
     } catch (err) {
       set({ deviceResetActive: false });
       get().pushToast('error', `设备标识重置失败：${String(err)}`);
