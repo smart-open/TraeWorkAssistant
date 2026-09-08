@@ -68,6 +68,38 @@ export interface ImportReport {
   groups_added: number;
 }
 
+// ---- F-46 导入预览（按索引导入）----
+/** 导入预览条目；index 为文件中 accounts 数组下标 */
+export interface ImportPreviewAccount {
+  index: number;
+  user_id: string | null;
+  /** 展示名：name 字段 > uid > "(无 ID)" */
+  name: string;
+  has_jwt: boolean;
+  group_id: string | null;
+  /** uid 已存在于账号池（默认不勾选） */
+  exists: boolean;
+}
+
+/** 导入预览报告 */
+export interface ImportPreview {
+  total: number;
+  accounts: ImportPreviewAccount[];
+  /** 将新增的分组 */
+  new_groups: { id: string; name: string; color: string; order: number }[];
+}
+
+// ---- F-01 安装位置自动识别（跨应用通用三级探测）----
+export interface AppLocate {
+  app: string;
+  exe: string | null;
+  user_data_dir: string;
+  version: string | null;
+  /** settings | registry | default | process | not_found */
+  source: string;
+}
+
+
 export interface DiscoveredAccount {
   user_id: string;
   /** 账户中心（dc）uid —— 与账号池 Cloud-IDE id 体系不同，仅诊断展示 */

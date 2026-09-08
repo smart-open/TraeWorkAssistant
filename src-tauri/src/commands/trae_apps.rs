@@ -582,9 +582,9 @@ fn query_pay_status(jwt: &str) -> Result<PayStatusEntry, String> {
     let body: serde_json::Value =
         resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
     // 业务异常响应（2xx 但缺关键字段）必须报错而非静默降级为 Free，
-    // 否则 refresh 会用错误的 "Free" 覆盖缓存中的正确套餐
-    let identity_str = body
-        .get("user_pay_identity_str")
+    // 否则 refresh 会用错误的 "Free" 覆盖缓存中的正确套餐。
+    // F-49 宽容解析：dig 沿 data/result 等包裹键下钻，抗官方信封变动
+    let identity_str = crate::fs_utils::dig(&body, &["user_pay_identity_str"])
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
             format!(
@@ -592,8 +592,7 @@ fn query_pay_status(jwt: &str) -> Result<PayStatusEntry, String> {
                 serde_json::to_string(&body).unwrap_or_default().chars().take(120).collect::<String>()
             )
         })?;
-    let identity = body
-        .get("user_pay_identity")
+    let identity = crate::fs_utils::dig(&body, &["user_pay_identity"])
         .and_then(|v| v.as_i64())
         .ok_or_else(|| "套餐响应异常（缺少 user_pay_identity）".to_string())?;
     Ok(PayStatusEntry {

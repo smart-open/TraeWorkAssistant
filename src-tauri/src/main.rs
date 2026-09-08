@@ -69,6 +69,7 @@ fn main() {
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .invoke_handler(tauri::generate_handler![
             commands::env::env_check,
+            commands::env::app_locate,
             commands::env::open_trae_website,
             commands::env::open_trae_app,
             commands::env::env_check_trae_cn,
@@ -81,6 +82,7 @@ fn main() {
             commands::accounts::accounts_list,
             commands::accounts::accounts_export_raw,
             commands::accounts::accounts_import,
+            commands::accounts::accounts_import_preview,
             commands::accounts::account_add_manual,
             commands::accounts::account_delete,
             commands::accounts::account_update,

@@ -4,6 +4,7 @@ import type {
   AccountView,
   ApiServiceStatus,
   ApiPoolFile,
+  AppLocate,
   CheckinDone,
   CheckinOpts,
   CreditRecord,
@@ -15,6 +16,7 @@ import type {
   JwtParseResult,
   LocalEntitlement,
   ImportReport,
+  ImportPreview,
   LogLine,
   ModelOption,
   OAuthLoginUrl,
@@ -34,6 +36,8 @@ export const api = {
   env: {
     check: () => invoke<EnvStatus>('env_check'),
     checkCn: () => invoke<EnvStatus>('env_check_trae_cn'),
+    // F-01：跨应用安装位置自动识别（trae_work | trae | doubao | workbuddy）
+    locate: (targetApp?: string) => invoke<AppLocate>('app_locate', { targetApp }),
     openSite: () => invoke('open_trae_website'),
     openApp: (proxyPort?: number) => invoke('open_trae_app', { proxyPort }),
     openCnApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
@@ -70,8 +74,10 @@ export const api = {
     refreshJwt: (userId: string) =>
       invoke<string>('refresh_jwt', { userId }),
     exportRaw: () => invoke<Record<string, unknown>>('accounts_export_raw'),
-    importAccounts: (content: string) =>
-      invoke<ImportReport>('accounts_import', { content }),
+    importAccounts: (content: string, only?: number[]) =>
+      invoke<ImportReport>('accounts_import', { content, only }),
+    // F-46：导入前预览（解析账号/分组、标记已存在，不写盘）
+    importPreview: (content: string) => invoke<ImportPreview>('accounts_import_preview', { content }),
     // F-08 双应用账号自动发现
     discover: () => invoke<DiscoveredAccount[]>('apps_accounts_discover'),
     addDiscovered: (userId: string, name: string, app: string, dcUid?: string | null) =>

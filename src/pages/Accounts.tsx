@@ -34,7 +34,7 @@ import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { cn } from '../lib/cn';
-import type { AccountView, CreditDetail, DiscoveredAccount, GroupView, JwtParseResult, ProfileInfo } from '../types';
+import type { AccountView, CreditDetail, DiscoveredAccount, GroupView, ImportPreview, JwtParseResult, ProfileInfo } from '../types';
 
 const PRESET_COLORS = [
   '#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#0ea5e9', '#a855f7', '#14b8a6',
@@ -298,6 +298,10 @@ export default function Accounts() {
   const [addingUid, setAddingUid] = useState<string | null>(null);
   // 导入账号进行中（按钮 loading，防重复点击）
   const [importing, setImporting] = useState(false);
+  // F-46 导入预览：文件内容 + 预览数据 + 勾选的账号下标
+  const [importContent, setImportContent] = useState('');
+  const [importPreviewData, setImportPreviewData] = useState<ImportPreview | null>(null);
+  const [importSelected, setImportSelected] = useState<Set<number>>(new Set());
 
   const runDiscover = async () => {
     setScanOpen(true);
@@ -397,17 +401,53 @@ export default function Accounts() {
       });
       if (!filePath || typeof filePath !== 'string') return;
       const content = await api.misc.readTextFile(filePath);
-      const report = await api.accounts.importAccounts(content);
-      if (report.total === 0) {
+      // F-46：先预览解析，再由用户勾选确认后按索引导入
+      const preview = await api.accounts.importPreview(content);
+      if (preview.total === 0) {
         toast('warn', '导入文件中没有账号，请核对文件内容');
-      } else if (report.added === 0 && report.skipped > 0) {
-        toast('warn', `未新增账号：${report.skipped} 个均已存在${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}`);
-      } else {
-        toast(
-          'success',
-          `导入完成：新增 ${report.added} 个账号，跳过 ${report.skipped} 个重复${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}`,
-        );
+        return;
       }
+      setImportContent(content);
+      setImportPreviewData(preview);
+      // 默认勾选：账号池中不存在且带 JWT 的账号；已存在的默认不勾
+      setImportSelected(
+        new Set(preview.accounts.filter((a) => !a.exists && a.has_jwt).map((a) => a.index)),
+      );
+    } catch (err) {
+      toast('error', `读取导入文件失败：${String(err)}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const toggleImportItem = (index: number) => {
+    setImportSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) {
+        next.delete(index);
+      } else {
+        next.add(index);
+      }
+      return next;
+    });
+  };
+
+  const confirmImport = async () => {
+    if (!importPreviewData || importing) return;
+    const only = [...importSelected];
+    if (only.length === 0) {
+      toast('warn', '请至少勾选一个要导入的账号');
+      return;
+    }
+    setImporting(true);
+    try {
+      const report = await api.accounts.importAccounts(importContent, only);
+      toast(
+        'success',
+        `导入完成：新增 ${report.added} 个账号，跳过 ${report.skipped} 个重复${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}`,
+      );
+      setImportPreviewData(null);
+      setImportContent('');
       void refreshAccounts();
       void refreshGroups();
     } catch (err) {
@@ -780,6 +820,85 @@ export default function Accounts() {
         onAdd={(d) => void addDiscovered(d)}
         onRescan={() => void runDiscover()}
       />
+      {/* F-46 导入预览：勾选确认后按索引导入 */}
+      <Modal
+        open={!!importPreviewData}
+        onClose={() => setImportPreviewData(null)}
+        title="导入预览"
+        size="lg"
+        footer={
+          <>
+            <button onClick={() => setImportPreviewData(null)} className="btn-ghost">
+              取消
+            </button>
+            <button onClick={() => void confirmImport()} disabled={importing} className="btn-primary">
+              {importing ? '导入中…' : `导入所选（${importSelected.size}）`}
+            </button>
+          </>
+        }
+      >
+        {importPreviewData && (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+              <span>
+                共 {importPreviewData.total} 个账号，
+                已在账号池 {importPreviewData.accounts.filter((a) => a.exists).length} 个
+              </span>
+              {importPreviewData.new_groups.length > 0 && (
+                <span className="text-violet-600 dark:text-violet-300">
+                  将新增分组：{importPreviewData.new_groups.map((g) => g.name).join('、')}
+                </span>
+              )}
+              <button
+                onClick={() =>
+                  setImportSelected(
+                    new Set(importPreviewData.accounts.filter((a) => !a.exists).map((a) => a.index)),
+                  )
+                }
+                className="ml-auto text-sky-600 hover:underline dark:text-sky-400"
+              >
+                全选未存在
+              </button>
+            </div>
+            <div className="max-h-80 space-y-1.5 overflow-y-auto pr-1">
+              {importPreviewData.accounts.map((a) => (
+                <label
+                  key={a.index}
+                  className={`flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2 text-sm transition ${
+                    importSelected.has(a.index)
+                      ? 'border-sky-300 bg-sky-50 dark:border-sky-500/40 dark:bg-sky-500/10'
+                      : 'border-slate-200 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800/60'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={importSelected.has(a.index)}
+                    onChange={() => toggleImportItem(a.index)}
+                    className="h-4 w-4 accent-sky-500"
+                  />
+                  <span className="min-w-0 flex-1 truncate font-medium">{a.name}</span>
+                  {a.user_id && (
+                    <span className="shrink-0 font-mono text-xs text-slate-400">
+                      {a.user_id.length > 12 ? `…${a.user_id.slice(-8)}` : a.user_id}
+                    </span>
+                  )}
+                  {a.group_id && <Badge tone="slate">分组</Badge>}
+                  {a.exists ? (
+                    <Badge tone="amber">已存在</Badge>
+                  ) : a.has_jwt ? (
+                    <Badge tone="green">可导入</Badge>
+                  ) : (
+                    <Badge tone="slate">无 JWT</Badge>
+                  )}
+                </label>
+              ))}
+            </div>
+            <p className="text-xs text-slate-400">
+              默认勾选未在账号池中的账号；已存在账号勾选导入也不会重复添加（按 uid+JWT 去重）。
+            </p>
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }

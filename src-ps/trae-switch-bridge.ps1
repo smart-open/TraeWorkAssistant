@@ -28,7 +28,8 @@ param(
     [string]$UserId,
 
     [Parameter(Mandatory = $false)]
-    [ValidateSet('TraeWork', 'Trae')]
+    # F-48：档案表驱动四应用（Work/Ide 已完整接入；Doubao/WorkBuddy 定位/启停已就绪，快照管线随各自批次接入）
+    [ValidateSet('TraeWork', 'Trae', 'Doubao', 'WorkBuddy')]
     [string]$TargetApp = 'TraeWork',
 
     [Parameter(Mandatory = $false)]
@@ -46,13 +47,18 @@ $Script:AppDataDir = if ($env:AIWORKDATA_DIR) { $env:AIWORKDATA_DIR } else { "$e
 $Script:LogFile = "$Script:AppDataDir\logs\switcher.log"
 $Script:_TraeExeCache = $null
 
-# ── 目标应用档案（TraeWork = TRAE SOLO CN 客户端 / Trae = Trae CN IDE）────────
-# 两者同为 icube 内核的 VSCode fork，登录态文件结构完全同构
+# ── 目标应用档案（F-48 表驱动）─────────────────────────────────────────────
+# icube 布局（TraeWork/Trae）：同为 icube 内核的 VSCode fork，登录态文件结构完全同构
 # （storage.json / state.vscdb / machineid / aha / Network 等），
 # 仅 exe 名称、数据目录与快照存储位置不同，按档案参数化即可复用全部切换逻辑。
+# chromium/authfile 布局（Doubao/WorkBuddy）：登录态结构不同——
+#   Doubao  = Chromium User Data 目录级快照（Local State + Default/Network/Cookies，方案见 doubao-trae-switch-plan.md §2.1）
+#   WorkBuddy = auth 文件快照 + 用户数据目录双层恢复（方案见 workbuddy-switch-plan.md §2.2）
+# 两者的快照/恢复/设备重置管线随各自应用批次接入（SnapshotLayout 非 icube 时显式报错）。
 switch ($TargetApp) {
     'Trae' {
         $Script:AppName         = 'Trae'
+        $Script:SnapshotLayout  = 'icube'
         $Script:TraeDataDir     = "$env:APPDATA\Trae CN"
         $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles_trae"
         $Script:SettingsPathKey = 'trae_cn_path'
@@ -64,8 +70,36 @@ switch ($TargetApp) {
             'D:\Programs\Trae CN\Trae CN.exe'
         )
     }
+    'Doubao' {
+        # 豆包桌面版（doubao-trae-switch-plan.md §1.1 实测布局）
+        $Script:AppName         = '豆包'
+        $Script:SnapshotLayout  = 'chromium'
+        $Script:TraeDataDir     = "$env:LOCALAPPDATA\Doubao\User Data"
+        $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles_doubao"
+        $Script:SettingsPathKey = 'doubao_path'
+        $Script:ProcNames       = @('Doubao')
+        $Script:ExeNames        = @('Doubao.exe')
+        $Script:ExeCandidates   = @(
+            "$env:LOCALAPPDATA\Doubao\Application\Doubao.exe",
+            "$env:ProgramFiles\Doubao\Application\Doubao.exe"
+        )
+    }
+    'WorkBuddy' {
+        # WorkBuddy 桌面版（workbuddy-switch-plan.md §1.1 实测布局）
+        $Script:AppName         = 'WorkBuddy'
+        $Script:SnapshotLayout  = 'authfile'
+        $Script:TraeDataDir     = "$env:USERPROFILE\.workbuddy"
+        $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles_workbuddy"
+        $Script:SettingsPathKey = 'workbuddy_path'
+        $Script:ProcNames       = @('WorkBuddy')
+        $Script:ExeNames        = @('WorkBuddy.exe')
+        $Script:ExeCandidates   = @(
+            "$env:LOCALAPPDATA\Programs\WorkBuddy\WorkBuddy.exe"
+        )
+    }
     default {
         $Script:AppName         = 'Trae Work'
+        $Script:SnapshotLayout  = 'icube'
         $Script:TraeDataDir     = "$env:APPDATA\TRAE SOLO CN"
         $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles"
         $Script:SettingsPathKey = 'trae_path'
@@ -352,6 +386,11 @@ function Reset-MachineId {
 }
 
 function Reset-DeviceIdsOnly {
+    # F-48：6 层重置针对 icube 布局（storage.json/machineid/vscdb），其他布局随各自批次接入
+    if ($Script:SnapshotLayout -ne 'icube') {
+        Write-Step -Stage 'device' -Message "$($Script:AppName) 布局为 '$($Script:SnapshotLayout)'，设备重置管线尚未接入（F-48 预留）" -Status 'error'
+        throw "$($Script:AppName) 的设备重置尚未实现（布局=$($Script:SnapshotLayout)）"
+    }
     <#
     .SYNOPSIS
         6 层设备标识重置（本项目自主设计）
@@ -483,6 +522,11 @@ function Reset-DeviceIdsOnly {
 
 function Backup-CurrentProfile {
     param([string]$Slot)
+    # F-48：精准白名单快照针对 icube 布局，chromium/authfile 布局随各自批次接入
+    if ($Script:SnapshotLayout -ne 'icube') {
+        Write-Step -Stage 'backup' -Message "$($Script:AppName) 布局为 '$($Script:SnapshotLayout)'，快照管线尚未接入（F-48 预留）" -Status 'error'
+        throw "$($Script:AppName) 的快照备份尚未实现（布局=$($Script:SnapshotLayout)）"
+    }
     $dest = Join-Path $Script:ProfilesDir $Slot
     if (-not (Test-Path $Script:TraeDataDir)) {
         Write-Step -Stage 'backup' -Message '当前数据目录不存在，跳过备份' -Status 'skip'
@@ -540,6 +584,11 @@ function Backup-CurrentProfile {
 
 function Restore-Profile {
     param([string]$Slot)
+    # F-48：精准白名单恢复针对 icube 布局，chromium/authfile 布局随各自批次接入
+    if ($Script:SnapshotLayout -ne 'icube') {
+        Write-Step -Stage 'restore' -Message "$($Script:AppName) 布局为 '$($Script:SnapshotLayout)'，快照管线尚未接入（F-48 预留）" -Status 'error'
+        throw "$($Script:AppName) 的快照恢复尚未实现（布局=$($Script:SnapshotLayout)）"
+    }
     $src = Join-Path $Script:ProfilesDir $Slot
     if (-not (Test-Path $src)) {
         Write-Step -Stage 'restore' -Message "目标账号 $Slot 无快照，请先登录该账号并保存登录态" -Status 'error'

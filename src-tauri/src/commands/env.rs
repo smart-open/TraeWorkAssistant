@@ -313,3 +313,266 @@ fn is_running() -> bool {
         Err(_) => false,
     }
 }
+
+// ── F-01：安装位置自动识别 app_locate（跨应用通用，三级探测）────────────────
+// 探测顺序：用户手动指定（app_settings.json 持久化值）→ 注册表卸载键 → 默认路径候选
+// → 运行进程反查。方案依据 doubao-trae-switch-plan.md §1.3 / workbuddy-switch-plan.md §2.1。
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppLocate {
+    /// 应用标识：trae_work | trae | doubao | workbuddy
+    pub app: String,
+    pub exe: Option<String>,
+    pub user_data_dir: String,
+    pub version: Option<String>,
+    /// settings | registry | default | process | not_found
+    pub source: String,
+}
+
+struct AppProfile {
+    display: &'static str,
+    /// 注册表 DisplayName 匹配片段（按顺序尝试，大小写不敏感）
+    reg_patterns: &'static [&'static str],
+    /// 注册表 InstallLocation 下尝试的 exe 名
+    reg_exe_names: &'static [&'static str],
+    exe_candidates: &'static [&'static str],
+    /// 进程名（不带 .exe）
+    proc_names: &'static [&'static str],
+    user_data_dir: String,
+    /// 设置页手动路径的 settings 键（无则跳过 settings 级）
+    settings_key: Option<&'static str>,
+}
+
+fn app_profile(target_app: Option<&str>) -> AppProfile {
+    let key = target_app.unwrap_or("trae_work").to_lowercase();
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    match key.as_str() {
+        "trae" | "trae_cn" | "traecn" | "ide" => AppProfile {
+            display: "Trae",
+            reg_patterns: &["Trae CN"],
+            reg_exe_names: &["Trae CN.exe"],
+            exe_candidates: &[
+                "%LOCALAPPDATA%\\Programs\\Trae CN\\Trae CN.exe",
+                "%ProgramFiles%\\Trae CN\\Trae CN.exe",
+                "D:\\Programs\\Trae CN\\Trae CN.exe",
+            ],
+            proc_names: &["Trae CN"],
+            user_data_dir: format!("{appdata}\\Trae CN"),
+            settings_key: Some("trae_cn_path"),
+        },
+        "doubao" => AppProfile {
+            display: "豆包",
+            reg_patterns: &["Doubao", "豆包"],
+            reg_exe_names: &["Doubao.exe"],
+            exe_candidates: &[
+                "%LOCALAPPDATA%\\Doubao\\Application\\Doubao.exe",
+                "%ProgramFiles%\\Doubao\\Application\\Doubao.exe",
+            ],
+            proc_names: &["Doubao"],
+            user_data_dir: format!("{local}\\Doubao\\User Data"),
+            settings_key: None,
+        },
+        "workbuddy" | "codebuddy" => AppProfile {
+            display: "WorkBuddy",
+            reg_patterns: &["WorkBuddy", "CodeBuddy"],
+            reg_exe_names: &["WorkBuddy.exe"],
+            exe_candidates: &["%LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddy.exe"],
+            proc_names: &["WorkBuddy"],
+            user_data_dir: format!("{home}\\.workbuddy"),
+            settings_key: None,
+        },
+        // trae_work / traework / work / solo 及其它值 → 默认 Trae Work
+        _ => AppProfile {
+            display: "Trae Work",
+            reg_patterns: &["TRAE SOLO", "Trae Work"],
+            reg_exe_names: &["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"],
+            exe_candidates: &[
+                "%LOCALAPPDATA%\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
+                "%LOCALAPPDATA%\\Programs\\TRAE SOLO\\TRAE SOLO.exe",
+                "%ProgramFiles%\\TRAE SOLO CN\\TRAE SOLO CN.exe",
+                "%ProgramFiles%\\TRAE SOLO\\TRAE SOLO.exe",
+                "%LOCALAPPDATA%\\Programs\\Trae\\Trae.exe",
+                "%ProgramFiles%\\Trae\\Trae.exe",
+                "D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
+            ],
+            proc_names: &["TRAE SOLO CN", "TRAE SOLO", "Trae"],
+            user_data_dir: format!("{appdata}\\TRAE SOLO CN"),
+            settings_key: Some("trae_path"),
+        },
+    }
+}
+
+/// 安装位置自动识别：统一返回 {exe, userDataDir, version, source}。
+/// async 派发：内部有注册表全量搜索与 PowerShell 调用，同步会冻结 UI。
+#[tauri::command(async)]
+pub fn app_locate(state: State<AppState>, target_app: Option<String>) -> AppLocate {
+    let profile = app_profile(target_app.as_deref());
+
+    // 第 0 级：用户手动指定（设置页持久化值）——优先级最高
+    if let Some(sk) = profile.settings_key {
+        let settings = state.settings();
+        let custom = match sk {
+            "trae_path" => settings.trae_path,
+            "trae_cn_path" => settings.trae_cn_path,
+            _ => None,
+        };
+        if let Some(p) = custom {
+            let p = p.trim().to_string();
+            if !p.is_empty() && std::path::Path::new(&p).is_file() {
+                return finish_locate(&profile, p, "settings", None);
+            }
+        }
+    }
+
+    // 第 1 级：注册表卸载键（官方安装器都会写）
+    if let Some(exe) = registry_app_path(&profile) {
+        return finish_locate(&profile, exe, "registry", None);
+    }
+
+    // 第 2 级：默认路径候选
+    for c in profile.exe_candidates {
+        let expanded = c
+            .replace("%LOCALAPPDATA%", &std::env::var("LOCALAPPDATA").unwrap_or_default())
+            .replace("%ProgramFiles%", &std::env::var("ProgramFiles").unwrap_or_default());
+        if std::path::Path::new(&expanded).is_file() {
+            return finish_locate(&profile, expanded, "default", None);
+        }
+    }
+
+    // 第 3 级：运行进程反查（应用正在运行时最准）
+    if let Some(exe) = process_exe_path(profile.proc_names) {
+        return finish_locate(&profile, exe, "process", None);
+    }
+
+    AppLocate {
+        app: target_app.unwrap_or_else(|| "trae_work".into()),
+        exe: None,
+        user_data_dir: profile.user_data_dir,
+        version: None,
+        source: "not_found".into(),
+    }
+}
+
+/// 命中后统一补齐版本号并组装结果
+fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Option<String>) -> AppLocate {
+    let version = version.or_else(|| version_of(&exe));
+    AppLocate {
+        app: profile.display.to_lowercase().replace(' ', "_"),
+        exe: Some(exe),
+        user_data_dir: profile.user_data_dir.clone(),
+        version,
+        source: source.into(),
+    }
+}
+
+/// 注册表卸载键搜索（按应用档案的 DisplayName 片段与 exe 名参数化）
+fn registry_app_path(profile: &AppProfile) -> Option<String> {
+    for pattern in profile.reg_patterns {
+        for root in ["HKCU", "HKLM"] {
+            let out = match Command::new("reg")
+                .args([
+                    "query",
+                    &format!("{root}\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+                    "/s",
+                    "/f",
+                    pattern,
+                ])
+                .creation_flags(0x08000000)
+                .output()
+            {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            let s = String::from_utf8_lossy(&out.stdout);
+            let pat_upper = pattern.to_uppercase();
+            let mut icon: Option<String> = None;
+            let mut loc: Option<String> = None;
+            let mut name_ok = false;
+            for line in s.lines() {
+                let line = line.trim();
+                if line.starts_with("HKEY_") {
+                    if name_ok {
+                        if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
+                            return Some(hit);
+                        }
+                    }
+                    icon = None;
+                    loc = None;
+                    name_ok = false;
+                    continue;
+                }
+                if let Some(v) = line.strip_prefix("DisplayName") {
+                    if let Some(val) = v.split("REG_SZ").nth(1) {
+                        if val.to_uppercase().contains(&pat_upper) {
+                            name_ok = true;
+                        }
+                    }
+                } else if let Some(v) = line.strip_prefix("DisplayIcon") {
+                    if let Some(val) = v.split("REG_SZ").nth(1) {
+                        icon = Some(val.trim().to_string());
+                    }
+                } else if let Some(v) = line.strip_prefix("InstallLocation") {
+                    if let Some(val) = v.split("REG_SZ").nth(1) {
+                        loc = Some(val.trim().to_string());
+                    }
+                }
+            }
+            if name_ok {
+                if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
+                    return Some(hit);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 从注册表 DisplayIcon / InstallLocation 推导 exe 路径（按档案 exe 名匹配）
+fn resolve_reg_profile_candidate(
+    icon: &Option<String>,
+    loc: &Option<String>,
+    profile: &AppProfile,
+) -> Option<String> {
+    if let Some(icon) = icon {
+        // DisplayIcon 可能带 ",0" 图标索引后缀
+        let clean = icon.split(',').next().unwrap_or(icon).trim().to_string();
+        if clean.to_lowercase().ends_with(".exe") && std::path::Path::new(&clean).is_file() {
+            return Some(clean);
+        }
+    }
+    if let Some(loc) = loc {
+        for name in profile.reg_exe_names {
+            let cand = format!("{loc}\\{name}");
+            if std::path::Path::new(&cand).is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// 运行进程反查 exe 路径（Get-Process 取 Path，应用运行中时最准）
+fn process_exe_path(proc_names: &[&str]) -> Option<String> {
+    let names = proc_names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let ps = format!(
+        "(Get-Process -Name @({names}) -ErrorAction SilentlyContinue | Where-Object {{ $_.Path }} | Select-Object -First 1).Path"
+    );
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(0x08000000)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || !std::path::Path::new(&s).is_file() {
+        None
+    } else {
+        Some(s)
+    }
+}

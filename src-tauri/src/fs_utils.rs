@@ -102,3 +102,39 @@ pub fn app_log(data_dir: &Path, msg: &str) {
         let _ = writeln!(f, "[{}] {}", now_ts(), msg);
     }
 }
+
+// ── F-49：响应宽容解析（信封解包 + 递归键查找）────────────────────────────
+// 官方接口字段可能被 data/result/resp/response 等包裹键任意一层包裹
+// （参考 oss-ecosystem-research.md §5.5 dig() 规范），解析层统一采用以抗字段变动。
+// 语义：对 keys 逐个尝试；每个键先在当前层查找，未命中则沿包裹键逐层下钻
+//（数组元素同层展开），限深 8 层防止病态响应拖垮解析。
+
+const ENVELOPE_KEYS: [&str; 5] = ["data", "result", "resp", "response", "info"];
+const DIG_MAX_DEPTH: usize = 8;
+
+/// 在 `v` 中按顺序查找 keys 中的任一键，返回第一个命中值。
+pub fn dig<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a serde_json::Value> {
+    keys.iter().find_map(|k| dig_key(v, k, 0))
+}
+
+fn dig_key<'a>(v: &'a serde_json::Value, key: &str, depth: usize) -> Option<&'a serde_json::Value> {
+    if depth > DIG_MAX_DEPTH {
+        return None;
+    }
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(hit) = map.get(key) {
+                return Some(hit);
+            }
+            // 沿信封包裹键下钻
+            ENVELOPE_KEYS
+                .iter()
+                .find_map(|wk| map.get(*wk).and_then(|child| dig_key(child, key, depth + 1)))
+        }
+        // 列表包裹：同层展开各元素查找
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .find_map(|item| dig_key(item, key, depth + 1)),
+        _ => None,
+    }
+}

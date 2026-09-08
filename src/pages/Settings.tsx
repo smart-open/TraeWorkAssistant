@@ -119,13 +119,21 @@ export default function Settings() {
     }
   };
 
+  // F-01 探测来源中文标签
+  const LOCATE_SOURCE_LABEL: Record<string, string> = {
+    settings: '手动指定',
+    registry: '注册表',
+    default: '默认路径',
+    process: '运行进程',
+  };
+
   const detectTrae = async () => {
     setDetecting(true);
     try {
-      const r = await withMinDelay(api.env.check());
-      if (r.installed && r.path) {
-        update('trae_path', r.path);
-        toast('success', '已自动检测并填入 Trae Work 路径');
+      const r = await withMinDelay(api.env.locate('trae_work'));
+      if (r.exe) {
+        update('trae_path', r.exe);
+        toast('success', `已自动定位并填入 Trae Work 路径（${LOCATE_SOURCE_LABEL[r.source] ?? r.source}${r.version ? `，版本 ${r.version}` : ''}）`);
       } else {
         toast('info', '未检测到 Trae Work，请手动指定 exe 路径');
       }
@@ -139,10 +147,10 @@ export default function Settings() {
   const detectTraeCn = async () => {
     setDetectingCn(true);
     try {
-      const r = await withMinDelay(api.env.checkCn());
-      if (r.installed && r.path) {
-        update('trae_cn_path', r.path);
-        toast('success', '已自动检测并填入 Trae 路径');
+      const r = await withMinDelay(api.env.locate('trae'));
+      if (r.exe) {
+        update('trae_cn_path', r.exe);
+        toast('success', `已自动定位并填入 Trae 路径（${LOCATE_SOURCE_LABEL[r.source] ?? r.source}${r.version ? `，版本 ${r.version}` : ''}）`);
       } else {
         toast('info', '未检测到 Trae，请手动指定 exe 路径');
       }

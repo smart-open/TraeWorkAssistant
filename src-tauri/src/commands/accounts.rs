@@ -168,50 +168,26 @@ fn pick_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
 /// 2. 原始账号池格式 `{accounts:[{name, UserID, jwt, refresh_token?, dc_id?}]}`
 /// 3. 裸数组 `[{...}]`
 /// 按 uid（user_id 字段或 JWT 解析）去重；分组按 id 合并，不存在则新增。
+/// `only`：F-46 按索引导入——仅导入指定下标的账号（下标为文件中 accounts 数组顺序）。
 #[tauri::command]
-pub fn accounts_import(state: State<AppState>, content: String) -> Result<ImportReport, String> {
-    let root: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("JSON 解析失败: {e}"))?;
-    let empty = Vec::new();
-    let accounts_arr = match &root {
-        serde_json::Value::Array(arr) => arr,
-        serde_json::Value::Object(obj) => obj
-            .get("accounts")
-            .and_then(|v| v.as_array())
-            .ok_or("缺少 accounts 数组：请使用本应用导出的 JSON 文件")?,
-        _ => return Err("无法识别的导入格式：需要对象或数组".into()),
-    };
-    let groups_arr = root
-        .get("groups")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&empty);
+pub fn accounts_import(
+    state: State<AppState>,
+    content: String,
+    only: Option<Vec<usize>>,
+) -> Result<ImportReport, String> {
+    let (accounts_arr, groups_arr) = parse_import_file(&content)?;
 
     let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
     let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
 
     // 已有 uid 集合（user_id 字段 + JWT 解析），与自动发现共用同一去重口径
-    let mut known: std::collections::HashSet<String> = accounts
-        .accounts
-        .iter()
-        .flat_map(|a| {
-            let mut ids = Vec::new();
-            if let Some(uid) = a.user_id.clone().filter(|s| !s.is_empty()) {
-                ids.push(uid);
-            }
-            if !a.jwt.trim().is_empty() {
-                if let Some(uid) = jwt::parse(&a.jwt).user_id {
-                    ids.push(uid);
-                }
-            }
-            ids
-        })
-        .collect();
+    let mut known: std::collections::HashSet<String> = build_known_uids(&accounts);
 
     // 合并分组：按 id 去重，缺失即新增
     let mut groups_added = 0usize;
     let existing_group_ids: std::collections::HashSet<String> =
         groups.groups.iter().map(|g| g.id.clone()).collect();
-    for g in groups_arr {
+    for g in &groups_arr {
         let Some(id) = pick_str(g, &["id"]).or_else(|| pick_str(g, &["Id"])) else {
             continue;
         };
@@ -232,15 +208,25 @@ pub fn accounts_import(state: State<AppState>, content: String) -> Result<Import
     let group_ids: std::collections::HashSet<String> =
         groups.groups.iter().map(|g| g.id.clone()).collect();
 
+    // F-46：按索引过滤——only 为 None 时导入全部
+    let selected: Vec<(usize, &serde_json::Value)> = match &only {
+        Some(indexes) => accounts_arr
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| indexes.contains(i))
+            .collect(),
+        None => accounts_arr.iter().enumerate().collect(),
+    };
+
     let mut report = ImportReport {
-        total: accounts_arr.len(),
+        total: selected.len(),
         added: 0,
         skipped: 0,
         skipped_names: Vec::new(),
         groups_added,
     };
 
-    for entry in accounts_arr {
+    for (_, entry) in selected {
         // 兼容导出格式(userId/cloudIdeJwt/dcId)与原始格式(UserID/jwt/dc_id)
         let user_id = pick_str(entry, &["userId", "UserID", "user_id", "uid"]);
         let jwt = pick_str(entry, &["cloudIdeJwt", "jwt"]).unwrap_or_default();
@@ -267,7 +253,8 @@ pub fn accounts_import(state: State<AppState>, content: String) -> Result<Import
         known.insert(uid.clone());
 
         let name = pick_str(entry, &["name"]).unwrap_or_else(|| {
-            let tail = &uid[uid.len().saturating_sub(4)..];
+            // 按字符取尾部（字节切片在多字节 UTF-8 边界处会 panic）
+            let tail: String = uid.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
             format!("导入-…{tail}")
         });
         // 分组映射：仅当目标分组存在（原有或本次导入）才记录
@@ -299,6 +286,139 @@ pub fn accounts_import(state: State<AppState>, content: String) -> Result<Import
         );
     }
     Ok(report)
+}
+
+// ── F-46 残余：导入前 JSON 预览 + 按索引导入 ──────────────────────────────
+
+/// 解析导入文件：返回 (账号数组, 分组数组)，兼容三种格式（所有者为返回值，便于按索引过滤）
+fn parse_import_file(
+    content: &str,
+) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), String> {
+    let root: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| format!("JSON 解析失败: {e}"))?;
+    let accounts_arr: Vec<serde_json::Value> = match &root {
+        serde_json::Value::Array(arr) => arr.clone(),
+        serde_json::Value::Object(obj) => obj
+            .get("accounts")
+            .and_then(|v| v.as_array())
+            .ok_or("缺少 accounts 数组：请使用本应用导出的 JSON 文件")?
+            .clone(),
+        _ => return Err("无法识别的导入格式：需要对象或数组".into()),
+    };
+    let groups_arr: Vec<serde_json::Value> = root
+        .get("groups")
+        .and_then(|v| v.as_array())
+        .map(|a| a.clone())
+        .unwrap_or_default();
+    Ok((accounts_arr, groups_arr))
+}
+
+/// 账号池已有 uid 集合（user_id 字段 + JWT 解析）
+fn build_known_uids(accounts: &AccountsFile) -> std::collections::HashSet<String> {
+    accounts
+        .accounts
+        .iter()
+        .flat_map(|a| {
+            let mut ids = Vec::new();
+            if let Some(uid) = a.user_id.clone().filter(|s| !s.is_empty()) {
+                ids.push(uid);
+            }
+            if !a.jwt.trim().is_empty() {
+                if let Some(uid) = jwt::parse(&a.jwt).user_id {
+                    ids.push(uid);
+                }
+            }
+            ids
+        })
+        .collect()
+}
+
+/// 预览条目：index 为文件中 accounts 数组下标，供按索引导入回传
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPreviewAccount {
+    pub index: usize,
+    pub user_id: Option<String>,
+    /// 展示名：name 字段 > uid > "(无 ID)"
+    pub name: String,
+    pub has_jwt: bool,
+    pub group_id: Option<String>,
+    /// uid 已存在于账号池（默认不勾选）
+    pub exists: bool,
+}
+
+/// 导入预览报告
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPreview {
+    pub total: usize,
+    pub accounts: Vec<ImportPreviewAccount>,
+    /// 将新增的分组（不在现有分组中）
+    pub new_groups: Vec<crate::models::Group>,
+}
+
+/// 导入前预览：解析文件内容，标记每个账号的 uid / 是否已存在，不写盘
+#[tauri::command]
+pub fn accounts_import_preview(
+    state: State<AppState>,
+    content: String,
+) -> Result<ImportPreview, String> {
+    let (accounts_arr, groups_arr) = parse_import_file(&content)?;
+    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let known = build_known_uids(&accounts);
+    let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
+    let existing_group_ids: std::collections::HashSet<String> =
+        groups.groups.iter().map(|g| g.id.clone()).collect();
+
+    // 待新增分组（与 accounts_import 的合并逻辑口径一致）
+    let new_groups: Vec<crate::models::Group> = groups_arr
+        .iter()
+        .filter_map(|g| {
+            let id = pick_str(g, &["id"]).or_else(|| pick_str(g, &["Id"]))?;
+            if existing_group_ids.contains(&id) {
+                return None;
+            }
+            Some(crate::models::Group {
+                name: pick_str(g, &["name"]).unwrap_or_else(|| {
+                    format!("分组 {}", id.chars().take(4).collect::<String>())
+                }),
+                id,
+                color: pick_str(g, &["color"]).unwrap_or_else(|| "#6366f1".into()),
+                order: g.get("order").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            })
+        })
+        .collect();
+
+    let items = accounts_arr
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let user_id = pick_str(entry, &["userId", "UserID", "user_id", "uid"]);
+            let jwt = pick_str(entry, &["cloudIdeJwt", "jwt"]).unwrap_or_default();
+            let uid = match user_id {
+                Some(u) => Some(u),
+                None if !jwt.trim().is_empty() => jwt::parse(&jwt).user_id,
+                _ => None,
+            };
+            let exists = uid.as_ref().map(|u| known.contains(u)).unwrap_or(false);
+            ImportPreviewAccount {
+                index,
+                name: pick_str(entry, &["name"])
+                    .or_else(|| uid.clone())
+                    .unwrap_or_else(|| "(无 ID)".into()),
+                user_id: uid,
+                has_jwt: !jwt.trim().is_empty(),
+                group_id: pick_str(entry, &["groupId", "group_id"]),
+                exists,
+            }
+        })
+        .collect();
+
+    Ok(ImportPreview {
+        total: accounts_arr.len(),
+        accounts: items,
+        new_groups,
+    })
 }
 
 #[tauri::command]
@@ -546,7 +666,8 @@ fn query_ent_packs(jwt: &str) -> Result<Vec<serde_json::Value>, String> {
     let body: serde_json::Value =
         resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
 
-    body.get("user_entitlement_pack_list")
+    // F-49 宽容解析：字段可能被 data 等包裹键包裹，dig 自动下钻
+    crate::fs_utils::dig(&body, &["user_entitlement_pack_list"])
         .and_then(|v| v.as_array().cloned())
         .ok_or_else(|| "响应中缺少 user_entitlement_pack_list".to_string())
 }
@@ -1083,20 +1204,13 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
         return Err(format!("ExchangeToken 失败 (code={}): {}", code, msg));
     }
 
-    let data = body
-        .get("data")
-        .ok_or("响应中缺少 data 字段")?;
-
-    // 提取新 accessToken
-    let new_access_token = data
-        .get("access_token")
-        .or_else(|| data.get("token"))
+    // F-49 宽容解析：data 信封内字段直接 dig 查找，兼容嵌套包裹
+    let new_access_token = crate::fs_utils::dig(&body, &["access_token", "token"])
         .and_then(|v| v.as_str())
         .ok_or("响应中缺少 access_token")?;
 
     // 提取新 refresh_token（可能轮换）
-    let new_refresh_token = data
-        .get("refresh_token")
+    let new_refresh_token = crate::fs_utils::dig(&body, &["refresh_token"])
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
