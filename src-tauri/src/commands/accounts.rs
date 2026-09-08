@@ -334,8 +334,8 @@ fn build_known_uids(accounts: &AccountsFile) -> std::collections::HashSet<String
 }
 
 /// 预览条目：index 为文件中 accounts 数组下标，供按索引导入回传
+/// 注意：项目 DTO 约定为蛇形命名上线（与前端 types.ts 对齐），勿加 camelCase 改名
 #[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ImportPreviewAccount {
     pub index: usize,
     pub user_id: Option<String>,
@@ -347,9 +347,8 @@ pub struct ImportPreviewAccount {
     pub exists: bool,
 }
 
-/// 导入预览报告
+/// 导入预览报告（蛇形命名上线，与前端 types.ts 对齐）
 #[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ImportPreview {
     pub total: usize,
     pub accounts: Vec<ImportPreviewAccount>,

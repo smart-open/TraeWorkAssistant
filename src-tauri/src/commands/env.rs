@@ -319,7 +319,6 @@ fn is_running() -> bool {
 // → 运行进程反查。方案依据 doubao-trae-switch-plan.md §1.3 / workbuddy-switch-plan.md §2.1。
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AppLocate {
     /// 应用标识：trae_work | trae | doubao | workbuddy
     pub app: String,
