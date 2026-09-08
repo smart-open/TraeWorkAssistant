@@ -461,7 +461,7 @@ fn reg_query_value(key: &str, name: &str) -> Option<String> {
 /// 读取启动前的系统代理设置。返回 (enabled, server, override)。
 /// 若不存在或未启用则返回 None（表示用户本来就没有系统代理/VPN）。
 #[cfg(target_os = "windows")]
-fn get_existing_win_proxy() -> Option<(bool, String, String)> {
+pub(crate) fn get_existing_win_proxy() -> Option<(bool, String, String)> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     let enable = reg_query_value(key, "ProxyEnable")
         .map(|v| v.contains("1"))
