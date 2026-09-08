@@ -1,6 +1,6 @@
-// 赞赏码 base64 内嵌（来自 src/assets/donate-qr.base64.ts）：
+// 软件宣传图 base64 内嵌（来自 src/assets/promo.base64.ts）：
 // dev server 关闭后弹窗图片仍可显示，不依赖运行中的静态服务器
-import { donate_qr_base64 as donateQr } from '../assets/donate-qr.base64';
+import { promo_jpg_base64 as promoImg } from '../assets/promo.base64';
 import pkg from '../../package.json';
 
 /** 应用品牌与关于信息（集中管理，改名/升版只改这里）；版本号随 package.json（npm run set-version 同步） */
@@ -21,4 +21,4 @@ export const LINK_GITHUB = 'https://github.com/smart-open';
 export const LINK_BLOG = 'https://blog.sopenai.cn/';
 export const LINK_REPO = 'https://github.com/smart-open/TraeWorkAssistant';
 
-export { donateQr };
+export { promoImg };

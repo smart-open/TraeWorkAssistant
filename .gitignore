@@ -3,6 +3,8 @@ dist/
 node_modules/
 src-tauri/target/
 src-tauri/gen/
+# 临时出图目录（AI 生图源图，内嵌后即无用）
+out/
 
 # Logs
 *.log
