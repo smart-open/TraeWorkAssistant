@@ -132,7 +132,13 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
 pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     let msg_lower = msg.to_lowercase();
     // 1005: Plan 套餐额度用尽 → 12 小时冷却
-    if code == 1005 || msg_lower.contains("plan") {
+    // 仅匹配 "plan limit/plan_limit/plan quota" 短语：宽泛 contains("plan") 会把
+    // "planned maintenance" 等消息误判为套餐耗尽、触发 12 小时冷却
+    if code == 1005
+        || msg_lower.contains("plan limit")
+        || msg_lower.contains("plan_limit")
+        || msg_lower.contains("plan quota")
+    {
         return ErrKind::PlanLimit;
     }
     // 4001: 模型配置不存在（model config is empty）→ 不冷却账号，是模型问题非账号问题

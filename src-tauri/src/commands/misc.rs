@@ -474,7 +474,8 @@ fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     Ok((out.status.success(), stdout, stderr))
 }
 
-#[tauri::command]
+/// 注册每日签到任务。async 派发：schtasks 调用约 1s，避免阻塞主线程
+#[tauri::command(async)]
 pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
     // 直接调用 python 签到脚本（无界面、可定时），注入数据目录
     let py = state.python_exe.clone();
