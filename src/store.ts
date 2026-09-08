@@ -17,7 +17,9 @@ import type {
   ProxyStatus,
   Settings,
   ViewKey,
+  AppKey,
 } from './types';
+import { APP_HOME_VIEW } from './types';
 
 export type ToastKind = 'info' | 'success' | 'error' | 'warn';
 export interface Toast {
@@ -44,6 +46,8 @@ export interface LogQuery {
 interface AppState {
   ready: boolean;
   view: ViewKey;
+  /** 侧边栏应用切换（trae = 现有菜单；buddy = 后期扩展置灰；doubao = 豆包页） */
+  activeApp: AppKey;
   env: EnvStatus | null;
   envCn: EnvStatus | null;
   certInstalled: boolean;
@@ -74,6 +78,8 @@ interface AppState {
 
   init: () => Promise<void>;
   setView: (v: ViewKey) => void;
+  /** 切换侧边栏应用 Tab，并跳到该应用默认首页 */
+  setActiveApp: (app: AppKey) => void;
   applyCheckinEvent: (e: CheckinProgressEvent) => void;
 
   refreshEnv: () => Promise<void>;
@@ -105,8 +111,8 @@ interface AppState {
   removeGroup: (id: string) => Promise<void>;
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
-  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
+  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') => Promise<void>;
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
   startCheckin: (opts: {
@@ -146,6 +152,8 @@ function defaultSettings(): Settings {
     notify: 'toast',
     trae_path: null,
     trae_cn_path: null,
+    doubao_path: null,
+    doubao_renew_url: null,
     data_dir: null,
     log_retention_days: 30,
     proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com',
@@ -159,6 +167,7 @@ function defaultSettings(): Settings {
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
   view: 'dashboard',
+  activeApp: 'trae',
   env: null,
   envCn: null,
   certInstalled: false,
@@ -293,6 +302,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setView: (v) => set({ view: v }),
+  setActiveApp: (app) => set({ activeApp: app, view: APP_HOME_VIEW[app] }),
 
   applyCheckinEvent: (e) => {
     set((s) => {

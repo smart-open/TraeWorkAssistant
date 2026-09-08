@@ -112,6 +112,12 @@ pub struct Settings {
     pub trae_path: Option<String>,
     #[serde(default)]
     pub trae_cn_path: Option<String>,
+    /// 豆包桌面版 exe 手动路径（环境配置页持久化；app_locate doubao 档案读取）
+    #[serde(default)]
+    pub doubao_path: Option<String>,
+    /// 豆包会话续期保活端点（P3；空 = 用 doubao.com 首页滑动续期）
+    #[serde(default)]
+    pub doubao_renew_url: Option<String>,
     #[serde(default)]
     pub data_dir: Option<String>,
     #[serde(default = "default_retention")]

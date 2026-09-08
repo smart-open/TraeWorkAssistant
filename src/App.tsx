@@ -12,6 +12,9 @@ import Credits from './pages/Credits';
 import Logs from './pages/Logs';
 import Settings from './pages/Settings';
 import ApiService from './pages/ApiService';
+import DoubaoOverview from './pages/doubao/DoubaoOverview';
+import DoubaoAccounts from './pages/doubao/DoubaoAccounts';
+import DoubaoSettings from './pages/doubao/DoubaoSettings';
 
 function renderView(view: string) {
   switch (view) {
@@ -29,6 +32,12 @@ function renderView(view: string) {
       return <ApiService />;
     case 'settings':
       return <Settings />;
+    case 'doubao-overview':
+      return <DoubaoOverview />;
+    case 'doubao-accounts':
+      return <DoubaoAccounts />;
+    case 'doubao-settings':
+      return <DoubaoSettings />;
     default:
       return <Dashboard />;
   }

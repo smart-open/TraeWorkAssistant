@@ -1,6 +1,7 @@
 # 豆包 + Trae CN 账号切换 / 会话续期 / 余额展示 实现方案
 
 > **文档版本**: 2026-09-06 · 调研分支 `feat/traecode_doubao`
+> **P2/P3 实施修订（2026-09-08）**: §2.3 的"解密 cookie 续期"路径经实机验证需修订——豆包桌面客户端（Chromium 147）的 cookie 值在 Chromium os_crypt（v10/DPAPI+AES-256-GCM，已验证可解）之下**还有一层客户端级加密**：AES-GCM tag 验证通过但明文为二进制密文（sessionid 64 字节非 ASCII、sid_guard 156 字节膨胀），无法离线获得明文 sessionid。因此 P3 续期主路径改为 **KeepAlive**（定时启动豆包 25s 由客户端自己联网滑动续期，PS 桥 `-Action KeepAlive`），探活巡检仅对手动录入凭证生效；合规红线（不破解）得到坚持。
 > **调研方式**: 本机实测侦察（Win11 实机文件系统 / 注册表 / 数据库）+ 项目已有 Trae Work 抓包资产（`api-credit-analysis.md`）+ 开源社区资料交叉验证
 > **结论先行**: 两个目标均可行。豆包为 Chromium 壳 + v10(DPAPI) 加密 Cookie，可用"整目录快照 + 无感注入"方案；Trae CN 与本项目已实现的 Trae Work 同构，账号切换/余额展示可直接复用现有快照桥与积分 API，属**低成本移植**。
 

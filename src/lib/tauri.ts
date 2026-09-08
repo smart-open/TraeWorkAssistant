@@ -11,6 +11,8 @@ import type {
   CreditDetail,
   CreditsDailySnapshot,
   DiscoveredAccount,
+  DoubaoAccountView,
+  DoubaoRenewSummary,
   EnvStatus,
   GroupView,
   JwtParseResult,
@@ -143,22 +145,43 @@ export const api = {
       invoke('write_text_file', { path, content }),
     readTextFile: (path: string) => invoke<string>('read_text_file', { path }),
   },
-  switchAccount: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+  switchAccount: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
     invoke('switch_account', { userId, targetApp: targetApp ?? null }),
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   profiles: {
-    list: (targetApp?: 'TraeWork' | 'Trae') =>
+    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
       invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null }),
-    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
       invoke('profile_backup', { userId, targetApp: targetApp ?? null }),
-    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
       invoke('profile_restore', { userId, targetApp: targetApp ?? null }),
-    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
       invoke('profile_delete', { userId, targetApp: targetApp ?? null }),
     formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
+  },
+  // ---- 豆包账号池（P2，Rust doubao.rs；字段名严格 snake_case）----
+  doubao: {
+    accountsList: () => invoke<DoubaoAccountView[]>('doubao_accounts_list'),
+    accountSave: (userId: string, name?: string, note?: string) =>
+      invoke('doubao_account_save', { userId, name: name ?? null, note: note ?? null }),
+    accountRemove: (userId: string) => invoke('doubao_account_remove', { userId }),
+    detectUid: () => invoke<string | null>('doubao_detect_uid'),
+    // ---- P3 会话续期 ----
+    renewRun: (syncOnly?: boolean) =>
+      invoke<DoubaoRenewSummary>('doubao_renew_run', { syncOnly: syncOnly ?? false }),
+    keepaliveRun: () => invoke('doubao_keepalive_run'),
+    accountSetCredential: (userId: string, sessionId?: string, sidGuard?: string) =>
+      invoke('doubao_account_set_credential', {
+        userId,
+        sessionId: sessionId ?? null,
+        sidGuard: sidGuard ?? null,
+      }),
+    taskRegister: (time: string) => invoke('doubao_renew_task_register', { time }),
+    taskStatus: () => invoke<string>('doubao_renew_task_status'),
+    taskUnregister: () => invoke('doubao_renew_task_unregister'),
   },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),

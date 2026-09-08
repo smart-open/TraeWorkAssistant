@@ -372,7 +372,7 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             ],
             proc_names: &["Doubao"],
             user_data_dir: format!("{local}\\Doubao\\User Data"),
-            settings_key: None,
+            settings_key: Some("doubao_path"),
         },
         "workbuddy" | "codebuddy" => AppProfile {
             display: "WorkBuddy",

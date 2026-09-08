@@ -108,7 +108,6 @@ python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64
 
 <div align="center">
 <img src="src/assets/donate-qr.jpg" alt="赞赏码" width="220" />
-<p><sub>“打赏一杯快乐水，代码更新不摆烂”</sub></p>
 </div>
 
 ## License

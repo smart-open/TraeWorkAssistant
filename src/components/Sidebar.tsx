@@ -11,13 +11,16 @@ import {
   SlidersHorizontal,
   Palette,
   Info,
+  Sparkles,
+  Bot,
+  LayoutGrid,
 } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
 import { LINK_REPO, LINK_BLOG } from '../lib/about';
 import { nextTheme } from '../lib/themes';
-import type { ViewKey } from '../types';
+import type { ViewKey, AppKey } from '../types';
 import AboutDialog from './AboutDialog';
 import SystemDialog from './SystemDialog';
 
@@ -32,6 +35,20 @@ const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'settings', label: '环境配置', icon: Settings },
 ];
 
+/** 豆包应用菜单（doubao-trae-switch-plan.md：概述 / 账号管理 / 环境配置） */
+const DOUBAO_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
+  { key: 'doubao-overview', label: '概述', icon: LayoutDashboard },
+  { key: 'doubao-accounts', label: '账号管理', icon: Users },
+  { key: 'doubao-settings', label: '环境配置', icon: Settings },
+];
+
+/** 应用切换 Tab：trae = 当前菜单；buddy = 后期扩展（置灰）；doubao = 接入中 */
+const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disabled?: boolean; title?: string }[] = [
+  { key: 'trae', label: 'Trae', icon: Sparkles },
+  { key: 'buddy', label: 'Buddy', icon: Bot, disabled: true, title: '后期扩展（WorkBuddy / CodeBuddy）' },
+  { key: 'doubao', label: '豆包', icon: LayoutGrid },
+];
+
 export default function Sidebar({
   view,
   onNav,
@@ -40,8 +57,13 @@ export default function Sidebar({
   onNav: (v: ViewKey) => void;
 }) {
   const pushToast = useAppStore((s) => s.pushToast);
+  const activeApp = useAppStore((s) => s.activeApp);
+  const setActiveApp = useAppStore((s) => s.setActiveApp);
   const [showAbout, setShowAbout] = useState(false);
   const [showSystem, setShowSystem] = useState(false);
+
+  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 概述/账号管理/环境配置
+  const nav = activeApp === 'doubao' ? DOUBAO_NAV : NAV;
 
   const openExternal = async (url: string, label: string) => {
     try {
@@ -67,7 +89,7 @@ export default function Sidebar({
   return (
     <aside className="flex w-52 shrink-0 flex-col border-r border-slate-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
       <nav className="flex-1 space-y-1 p-3">
-        {NAV.map((item) => {
+        {nav.map((item) => {
           const Icon = item.icon;
           const active = view === item.key;
           return (
@@ -87,6 +109,33 @@ export default function Sidebar({
           );
         })}
       </nav>
+      {/* 应用切换 Tab（位于左下角工具图标行上方） */}
+      <div className="border-t border-slate-200 p-3 dark:border-zinc-800">
+        <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
+          {APP_TABS.map((tab) => {
+            const TabIcon = tab.icon;
+            const active = activeApp === tab.key;
+            return (
+              <button
+                key={tab.key}
+                disabled={tab.disabled}
+                onClick={() => setActiveApp(tab.key)}
+                title={tab.title ?? tab.label}
+                className={cn(
+                  'flex flex-col items-center gap-0.5 rounded-md px-1 py-1.5 text-[11px] font-medium transition active:scale-[0.97]',
+                  tab.disabled && 'cursor-not-allowed opacity-40',
+                  active
+                    ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100'
+                    : 'text-slate-500 hover:text-slate-700 dark:text-zinc-500 dark:hover:text-zinc-300',
+                )}
+              >
+                <TabIcon size={15} />
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
       <div className="flex items-center justify-center gap-1 border-t border-slate-200 p-3 dark:border-zinc-800">
         <button
           onClick={() => void openExternal(LINK_REPO, '软件 Github 地址')}

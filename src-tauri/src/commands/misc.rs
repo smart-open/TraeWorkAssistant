@@ -452,13 +452,15 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 pub const TASK_NAME: &str = "AIWorkAssistant_DailyCheckin";
 /// 旧版计划任务名（品牌迁移前），启动时自动迁移到新任务名
 pub const LEGACY_TASK_NAME: &str = "TraeWorkAssistant_DailyCheckin";
+/// 豆包会话续期每日计划任务名（P3）
+pub const DOUBAO_TASK_NAME: &str = "AIWorkAssistant_DoubaoRenew";
 
 // 运行 schtasks 并正确解码输出。
 // 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")
 // 以 GBK 字节输出；若直接 from_utf8_lossy 会读成 ϵͳ... 乱码，导致 "找不到" 永远匹配不上、
 // 错误文案变成乱码。前置 `chcp 65001` 让 schtasks 以 UTF-8 输出，从而能正确匹配与展示。
 // 返回 (成功?, stdout, stderr)，三者均为 UTF-8 字符串。
-fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
+pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     let mut full: Vec<String> = vec![
         "/c".to_string(),
         "chcp".to_string(),

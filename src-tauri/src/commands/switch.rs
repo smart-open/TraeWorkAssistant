@@ -74,7 +74,8 @@ pub fn switch_account(
                     done_emitted = true;
                     let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": l }));
                     // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
-                    if success {
+                    // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
+                    if success && target_app.as_deref() != Some("Doubao") {
                         let _ = crate::commands::trae_apps::backfill_dc_id_for(&dc_dir, &uid_for_dc);
                     }
                 }
@@ -183,7 +184,8 @@ pub fn save_current_login(
                         serde_json::json!({ "success": success, "raw": l }),
                     );
                     // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
-                    if success {
+                    // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
+                    if success && target_app.as_deref() != Some("Doubao") {
                         let _ = crate::commands::trae_apps::backfill_dc_id_for(&dc_dir, &uid_for_dc);
                     }
                 }

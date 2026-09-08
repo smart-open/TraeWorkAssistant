@@ -21,7 +21,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Switch', 'ResetMachineId', 'BackupCurrent', 'RestoreOnly', 'ResetDeviceIds', 'SaveCurrentLogin')]
+    [ValidateSet('Switch', 'ResetMachineId', 'BackupCurrent', 'RestoreOnly', 'ResetDeviceIds', 'SaveCurrentLogin', 'KeepAlive')]
     [string]$Action,
 
     [Parameter(Mandatory = $false)]
@@ -64,6 +64,9 @@ switch ($TargetApp) {
         $Script:SettingsPathKey = 'trae_cn_path'
         $Script:ProcNames       = @('Trae CN')
         $Script:ExeNames        = @('Trae CN.exe')
+        $Script:LnkPatterns     = @('*TRAE*', '*Trae*')
+        $Script:RegPatterns     = @('*TRAE*', '*Trae*')
+        $Script:ProcPatterns    = @('Trae*', 'TRAE*')
         $Script:ExeCandidates   = @(
             "$env:LOCALAPPDATA\Programs\Trae CN\Trae CN.exe",
             "$env:ProgramFiles\Trae CN\Trae CN.exe",
@@ -79,6 +82,10 @@ switch ($TargetApp) {
         $Script:SettingsPathKey = 'doubao_path'
         $Script:ProcNames       = @('Doubao')
         $Script:ExeNames        = @('Doubao.exe')
+        # P2：lnk/注册表/进程回退的过滤词随应用参数化（旧版写死 Trae，对豆包三步回退全部失效）
+        $Script:LnkPatterns     = @('*Doubao*', '*豆包*')
+        $Script:RegPatterns     = @('*Doubao*', '*豆包*')
+        $Script:ProcPatterns    = @('Doubao*')
         $Script:ExeCandidates   = @(
             "$env:LOCALAPPDATA\Doubao\Application\Doubao.exe",
             "$env:ProgramFiles\Doubao\Application\Doubao.exe"
@@ -93,6 +100,9 @@ switch ($TargetApp) {
         $Script:SettingsPathKey = 'workbuddy_path'
         $Script:ProcNames       = @('WorkBuddy')
         $Script:ExeNames        = @('WorkBuddy.exe')
+        $Script:LnkPatterns     = @('*WorkBuddy*')
+        $Script:RegPatterns     = @('*WorkBuddy*')
+        $Script:ProcPatterns    = @('WorkBuddy*')
         $Script:ExeCandidates   = @(
             "$env:LOCALAPPDATA\Programs\WorkBuddy\WorkBuddy.exe"
         )
@@ -105,6 +115,9 @@ switch ($TargetApp) {
         $Script:SettingsPathKey = 'trae_path'
         $Script:ProcNames       = @('TRAE SOLO CN', 'TRAE SOLO', 'Trae')
         $Script:ExeNames        = @('TRAE SOLO CN.exe', 'TRAE SOLO.exe', 'Trae.exe')
+        $Script:LnkPatterns     = @('*TRAE*', '*Trae*')
+        $Script:RegPatterns     = @('*TRAE*', '*Trae*')
+        $Script:ProcPatterns    = @('Trae*', 'TRAE*')
         $Script:ExeCandidates   = @(
             "$env:LOCALAPPDATA\Programs\TRAE SOLO CN\TRAE SOLO CN.exe",
             "$env:LOCALAPPDATA\Programs\TRAE SOLO\TRAE SOLO.exe",
@@ -167,7 +180,11 @@ function Find-TraeExe {
         foreach ($dir in $lnkDirs) {
             if (-not (Test-Path $dir)) { continue }
             $lnks = Get-ChildItem -Path $dir -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -like '*TRAE*' -or $_.Name -like '*Trae*' }
+                Where-Object {
+                    $lnkName = $_.Name
+                    foreach ($p in $Script:LnkPatterns) { if ($lnkName -like $p) { return $true } }
+                    return $false
+                }
             foreach ($lnk in $lnks) {
                 $shortcut = $shell.CreateShortcut($lnk.FullName)
                 if ($shortcut.TargetPath -and (Test-Path $shortcut.TargetPath) -and (Test-ExeMatchesApp -Path $shortcut.TargetPath)) {
@@ -187,7 +204,11 @@ function Find-TraeExe {
         )
         foreach ($key in $regKeys) {
             $items = Get-ItemProperty $key -ErrorAction SilentlyContinue |
-                Where-Object { $_.DisplayName -like '*TRAE*' -or $_.DisplayName -like '*Trae*' }
+                Where-Object {
+                    $dn = $_.DisplayName
+                    foreach ($p in $Script:RegPatterns) { if ($dn -like $p) { return $true } }
+                    return $false
+                }
             foreach ($item in $items) {
                 # 尝试 DisplayIcon
                 if ($item.DisplayIcon) {
@@ -230,8 +251,11 @@ function Find-TraeExe {
                 if ($pproc) { $parentName = $pproc.Name }
             }
         } catch {}
-        $proc = Get-Process -Name 'Trae*','TRAE*' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^(Trae|TRAE)' -and $_.Path -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName }
+        $proc = Get-Process -Name $Script:ProcPatterns -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Path -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName -and
+                (Test-ExeMatchesApp -Path $_.Path)
+            }
         if ($proc) {
             $exePath = $proc | Select-Object -First 1 -ExpandProperty Path
             if ((Test-Path $exePath) -and (Test-ExeMatchesApp -Path $exePath)) {
@@ -387,6 +411,12 @@ function Reset-MachineId {
 
 function Reset-DeviceIdsOnly {
     # F-48：6 层重置针对 icube 布局（storage.json/machineid/vscdb），其他布局随各自批次接入
+    if ($Script:SnapshotLayout -eq 'chromium') {
+        # 豆包为 Chromium 壳，登录态与 machineId 等设备标识无强绑定（plan §0：设备隔离风险低），
+        # 目录级快照恢复即完成账号隔离，无需（也没有）6 层重置语义。
+        Write-Step -Stage 'device' -Message "$($Script:AppName) 为 Chromium 布局，登录态与设备标识无强绑定，无需重置（快照恢复即完成隔离）" -Status 'skip'
+        return
+    }
     if ($Script:SnapshotLayout -ne 'icube') {
         Write-Step -Stage 'device' -Message "$($Script:AppName) 布局为 '$($Script:SnapshotLayout)'，设备重置管线尚未接入（F-48 预留）" -Status 'error'
         throw "$($Script:AppName) 的设备重置尚未实现（布局=$($Script:SnapshotLayout)）"
@@ -520,9 +550,97 @@ function Reset-DeviceIdsOnly {
     Write-Step -Stage 'device' -Message "6 层设备标识重置完成（$resetCount/6 层成功）" -Status $(if ($resetCount -ge 4) { 'ok' } else { 'info' })
 }
 
+# ── chromium 布局快照（豆包，P2）───────────────────────────────────────────
+# 白名单依据 doubao-trae-switch-plan.md §2.1：
+#   必选  Local State（saman 账号缓存 + cookie 解密密钥元数据，缺失则恢复后 cookie 无法解密）
+#         Default/Network/Cookies*（登录 cookie，含 journal）
+#         Default/Local Storage/leveldb/（web 侧登录/偏好 KV）
+#   建议  Default/Session Storage/、Default/DoubaoStorage/、saman_app_state、saman_shell_db_storage/
+#   排除  Default/IndexedDB/（体积大，默认排除）
+# 结构相对 User Data 镜像存放，恢复时对称回写；切换流程的 'last' 槽位即回滚保护。
+
+# 白名单项复制（文件/目录自适应）：返回复制后目标是否真实存在
+function Copy-SnapshotItem {
+    param([string]$SrcPath, [string]$DestPath)
+    if (-not (Test-Path $SrcPath)) { return $false }
+    if (Test-Path $SrcPath -PathType Container) {
+        if (Test-Path $DestPath) { Remove-Item $DestPath -Recurse -Force -ErrorAction SilentlyContinue }
+        $parent = Split-Path $DestPath -Parent
+        if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        Copy-Item $SrcPath $DestPath -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+    } else {
+        $parent = Split-Path $DestPath -Parent
+        if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        Copy-Item $SrcPath $DestPath -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    return (Test-Path $DestPath)
+}
+
+function Backup-ChromiumProfile {
+    param([string]$Slot)
+    $dest = Join-Path $Script:ProfilesDir $Slot
+    if (-not (Test-Path $Script:TraeDataDir)) {
+        Write-Step -Stage 'backup' -Message '当前数据目录不存在，跳过备份' -Status 'skip'
+        return
+    }
+    if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+    $src = $Script:TraeDataDir
+    $copied = 0
+
+    # 必选 1: Local State
+    if (Copy-SnapshotItem -SrcPath "$src\Local State" -DestPath "$dest\Local State") { $copied++ }
+    # 必选 2: Default/Network/Cookies*（登录 cookie + journal）
+    Get-ChildItem -Path "$src\Default\Network" -Filter 'Cookies*' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        if (Copy-SnapshotItem -SrcPath $_.FullName -DestPath "$dest\Default\Network\$($_.Name)") { $copied++ }
+    }
+    # 必选 3: Default/Local Storage/leveldb
+    if (Copy-SnapshotItem -SrcPath "$src\Default\Local Storage\leveldb" -DestPath "$dest\Default\Local Storage\leveldb") { $copied++ }
+    # 建议: Default/Session Storage、Default/DoubaoStorage
+    if (Copy-SnapshotItem -SrcPath "$src\Default\Session Storage" -DestPath "$dest\Default\Session Storage") { $copied++ }
+    if (Copy-SnapshotItem -SrcPath "$src\Default\DoubaoStorage" -DestPath "$dest\Default\DoubaoStorage") { $copied++ }
+    # 建议: saman 账号体系状态（文件/目录均有，Copy-SnapshotItem 自适应）
+    if (Copy-SnapshotItem -SrcPath "$src\saman_app_state" -DestPath "$dest\saman_app_state") { $copied++ }
+    if (Copy-SnapshotItem -SrcPath "$src\saman_shell_db_storage" -DestPath "$dest\saman_shell_db_storage") { $copied++ }
+
+    if ($copied -eq 0) {
+        Write-Step -Stage 'backup' -Message '未发现任何可备份的登录态文件（豆包可能未登录或数据目录为空）' -Status 'warn'
+    } else {
+        Write-Step -Stage 'backup' -Message "已备份当前登录态到 $Slot ($copied 项)" -Status 'ok'
+    }
+}
+
+function Restore-ChromiumProfile {
+    param([string]$Slot)
+    $src = Join-Path $Script:ProfilesDir $Slot
+    if (-not (Test-Path $src)) {
+        Write-Step -Stage 'restore' -Message "目标账号 $Slot 无快照，请先登录该账号并保存登录态" -Status 'error'
+        throw "目标账号 $Slot 无快照"
+    }
+    $dest = $Script:TraeDataDir
+    if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+    $restored = 0
+
+    if (Copy-SnapshotItem -SrcPath "$src\Local State" -DestPath "$dest\Local State") { $restored++ }
+    Get-ChildItem -Path "$src\Default\Network" -Filter 'Cookies*' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        if (Copy-SnapshotItem -SrcPath $_.FullName -DestPath "$dest\Default\Network\$($_.Name)") { $restored++ }
+    }
+    if (Copy-SnapshotItem -SrcPath "$src\Default\Local Storage\leveldb" -DestPath "$dest\Default\Local Storage\leveldb") { $restored++ }
+    if (Copy-SnapshotItem -SrcPath "$src\Default\Session Storage" -DestPath "$dest\Default\Session Storage") { $restored++ }
+    if (Copy-SnapshotItem -SrcPath "$src\Default\DoubaoStorage" -DestPath "$dest\Default\DoubaoStorage") { $restored++ }
+    if (Copy-SnapshotItem -SrcPath "$src\saman_app_state" -DestPath "$dest\saman_app_state") { $restored++ }
+    if (Copy-SnapshotItem -SrcPath "$src\saman_shell_db_storage" -DestPath "$dest\saman_shell_db_storage") { $restored++ }
+
+    Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项)" -Status 'ok'
+}
+
 function Backup-CurrentProfile {
     param([string]$Slot)
-    # F-48：精准白名单快照针对 icube 布局，chromium/authfile 布局随各自批次接入
+    # P2：chromium 布局（豆包）走白名单目录级快照
+    if ($Script:SnapshotLayout -eq 'chromium') {
+        Backup-ChromiumProfile -Slot $Slot
+        return
+    }
+    # F-48：精准白名单快照针对 icube 布局，authfile 布局随各自批次接入
     if ($Script:SnapshotLayout -ne 'icube') {
         Write-Step -Stage 'backup' -Message "$($Script:AppName) 布局为 '$($Script:SnapshotLayout)'，快照管线尚未接入（F-48 预留）" -Status 'error'
         throw "$($Script:AppName) 的快照备份尚未实现（布局=$($Script:SnapshotLayout)）"
@@ -584,7 +702,12 @@ function Backup-CurrentProfile {
 
 function Restore-Profile {
     param([string]$Slot)
-    # F-48：精准白名单恢复针对 icube 布局，chromium/authfile 布局随各自批次接入
+    # P2：chromium 布局（豆包）走白名单目录级恢复
+    if ($Script:SnapshotLayout -eq 'chromium') {
+        Restore-ChromiumProfile -Slot $Slot
+        return
+    }
+    # F-48：精准白名单恢复针对 icube 布局，authfile 布局随各自批次接入
     if ($Script:SnapshotLayout -ne 'icube') {
         Write-Step -Stage 'restore' -Message "$($Script:AppName) 布局为 '$($Script:SnapshotLayout)'，快照管线尚未接入（F-48 预留）" -Status 'error'
         throw "$($Script:AppName) 的快照恢复尚未实现（布局=$($Script:SnapshotLayout)）"
@@ -639,7 +762,7 @@ function Restore-Profile {
 
 # ============ 入口 ============
 try {
-    if (-not $UserId -and $Action -ne 'ResetMachineId' -and $Action -ne 'ResetDeviceIds') {
+    if (-not $UserId -and $Action -ne 'ResetMachineId' -and $Action -ne 'ResetDeviceIds' -and $Action -ne 'KeepAlive') {
         Write-Step -Stage 'init' -Message '缺少 -UserId 参数' -Status 'error'
         exit 1
     }
@@ -696,6 +819,21 @@ try {
             Set-CurrentAccount -AccountId $UserId
             Start-Trae
             Write-Step -Stage 'done' -Message "已恢复账号 $UserId 的登录态" -Status 'ok'
+        }
+        'KeepAlive' {
+            # P3 豆包会话保活：sid_guard 30 天滑动续期由豆包客户端自己完成（cookie 值为客户端级
+            # 加密，外部无法离线续写），本动作仅负责"启动→等待联网刷新→关闭"。
+            $proc = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue
+            if ($proc) {
+                Write-Step -Stage 'keepalive' -Message "$($Script:AppName) 正在运行，客户端会话活跃，本次跳过" -Status 'ok'
+                Write-Step -Stage 'done' -Message '保活检查完成（应用运行中）' -Status 'ok'
+                exit 0
+            }
+            Start-Trae
+            Write-Step -Stage 'keepalive' -Message '已启动，等待会话联网刷新（25 秒）' -Status 'running'
+            Start-Sleep -Seconds 25
+            Stop-Trae
+            Write-Step -Stage 'done' -Message '保活完成（启动 25 秒 → 优雅关闭，sid_guard 已滑动续期）' -Status 'ok'
         }
     }
     exit 0

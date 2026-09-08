@@ -48,6 +48,7 @@ export default function ApiService() {
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
   const [refreshingPool, setRefreshingPool] = useState(false);
   const [copying, setCopying] = useState(false);
+  const [copyingKey, setCopyingKey] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [syncingModels, setSyncingModels] = useState(false);
 
@@ -261,6 +262,24 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
     }
   };
 
+  // 复制完整 API Key 到剪贴板
+  const copyApiKey = async () => {
+    const apiKey = form?.api_key ?? '';
+    if (!apiKey) {
+      toast('info', 'API Key 为空，无可复制内容');
+      return;
+    }
+    setCopyingKey(true);
+    try {
+      await withMinDelay(navigator.clipboard.writeText(apiKey));
+      toast('success', 'API Key 已复制到剪贴板');
+    } catch {
+      toast('error', '复制失败');
+    } finally {
+      setCopyingKey(false);
+    }
+  };
+
   const running = status?.running ?? false;
   const poolCount = enabledUids.size;
   // 账号池仅展示/可选有通用积分的账号（本服务消耗通用积分，零积分账号无法服务请求）
@@ -387,12 +406,21 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
               <div className="relative">
                 <input
                   type={showApiKey ? 'text' : 'password'}
-                  className="input pr-10"
+                  className="input pr-16"
                   placeholder="sk-..."
                   value={form?.api_key ?? ''}
                   onChange={(e) => update('api_key', e.target.value)}
                   disabled={running}
                 />
+                <button
+                  type="button"
+                  className="absolute right-9 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300"
+                  onClick={copyApiKey}
+                  title="复制 API Key"
+                  tabIndex={-1}
+                >
+                  <Copy size={16} className={copyingKey ? 'animate-pulse' : ''} />
+                </button>
                 <button
                   type="button"
                   className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300"

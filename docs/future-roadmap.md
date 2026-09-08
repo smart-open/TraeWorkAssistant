@@ -1,6 +1,8 @@
 # 未来规划（Roadmap）
 
-> **文档版本**: 2026-09-08 v1.3 · 调研分支 `feat/traecode_doubao`（已并入 `main`）
+> **文档版本**: 2026-09-08 v1.5 · 调研分支 `feat/traecode_doubao`（已并入 `main`）
+> **v1.5 变更**: 豆包 P3 落地——F-11 会话续期完成（KeepAlive 保活主路径 + schtasks 每日任务 + 手动凭证探活巡检 + cookie 诊断），移入「已完成」。实施中实测发现：豆包桌面客户端 cookie 值存在客户端级二次加密（v10/DPAPI 解出仍为密文），"解密 cookie 续期"原方案不可行，已修订（详见 doubao-trae-switch-plan.md 文档头注）。
+> **v1.4 变更**: 豆包 P2 落地——F-05 目录级快照账号切换完成（PS 桥 chromium 布局白名单快照/恢复 + `doubao_accounts.json` 账号池 + 账号管理页真实操作 + `doubao_detect_uid` 自动探测），移入「已完成」；F-48 的 chromium 布局快照管线同步启用。
 > **v1.3 变更**: 经代码核实并实施——F-01 `app_locate`（四应用三级探测）、F-49 `dig()` 宽容解析、F-46 残余（导入预览+按索引导入）已完成；F-48 完成档案表扩豆包/WorkBuddy（定位/启停就绪，快照管线随各自批次接入），移入「已完成」。
 > **v1.2 变更**: 经代码核实，F-03 / F-12 / F-23 已实现（F-03 的快照管理参数化于同日补齐：`profile_*` 命令与快照管理弹框支持 `-TargetApp`），移入「已完成」；快照目录以实际实现 `data/profiles_trae/` 为准（非原计划的 `trae_ide_profiles`）。
 > **v1.1 变更**: 补遗 8 项遗漏（F-03/F-12/F-23 Trae CN 移植、F-10、F-37/F-40、F-42/F-52）；修正 §四计数（34→35）；F-53 豁免说明。对照 `product-enhancement-inventory.md` 逐编号审查后修订。
@@ -21,6 +23,8 @@
 | **F-46 残余 导入预览 + 按索引导入** | ✅ 已完成（2026-09-08） | `accounts_import_preview` 命令解析文件、标记 uid/是否已存在/待新增分组（不写盘）；`accounts_import` 增 `only` 索引过滤；前端导入改两步式——选文件 → 预览弹框勾选（已存在默认不勾、可全选未存在）→ 按索引导入 |
 | **F-03/F-12/F-23 Trae CN 移植三件套** | ✅ 已完成（2026-09-08 核实，F-03 快照管理参数化同日补齐） | ① 切换移植（F-03）：PS 桥 `-TargetApp TraeWork\|Trae` 全参数化（数据目录 / 快照根 `data\profiles_trae` / 进程名 / exe 候选表驱动），`switch_account` / `save_current_login` / `reset_device_ids` 带 `target_app`，Accounts 行「切换/保存到…」应用选择菜单；快照管理 `profile_*` 四命令与弹框支持目标应用切换（本次补齐）② 会话续期（F-12）：快照即保存；发现/入池账号与 Trae Work 共用账号池，`refresh_jwt` 自动续期，无 refresh_token 账号走 JWT 到期检测 + 提醒 ③ 余额展示（F-23）：剩余积分按 `product_id`（208 通用 / 209 Work）分类缓存，AccountView `general_credits`/`work_credits` 双字段，Credits 页与概览页「通用 X · Work Y」双展示 |
 | **F-39 Trae API 暴露** | ✅ 已并入现有网关（随通用积分语义统一天然覆盖双应用） | 账号池 app 无关（uid+JWT+设备指纹），上游统一 `trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`（通用积分 208，Trae/Trae Work 共享扣减）；F-08 扫描发现的 Trae（CN）账号入池即可被 `/v1` 服务；Anthropic 适配：新增 `POST /v1/messages`（Anthropic Messages 协议，x-api-key/Bearer 双鉴权），请求侧 `payload::anthropic_to_openai` 转 OpenAI 内部格式复用链路，输出侧 `sse::stream_convert_anthropic`/`aggregate_anthropic` 转换（message_start/content_block/message_delta/message_stop 事件序列 + tool_use 块），单元测试覆盖 text 与 tool 往返转换 |
+| **F-05 豆包目录级快照账号切换（P2）** | ✅ 已完成（2026-09-08） | ① PS 桥 chromium 布局：`Backup/Restore-ChromiumProfile` 白名单目录级快照（必选 Local State + `Default/Network/Cookies*` + `Default/Local Storage/leveldb`；建议 Session Storage / DoubaoStorage / saman 状态；排除 IndexedDB），结构相对 `User Data` 镜像存放，'last' 槽位即回滚保护；`ResetDeviceIds` 对 chromium 布局明确 skip（豆包无设备强绑定）；② `Find-TraeExe` 回退过滤词（lnk/注册表/进程）随应用参数化（旧版写死 Trae）；③ Rust：`profile_*` 与切换命令 `target_app` 扩 Doubao（`profiles_doubao`），新增 `commands/doubao.rs`——`doubao_accounts_list`（账号池 ∪ 快照槽合并视图 + 当前账号标记）、`doubao_account_save/remove`（`data/doubao_accounts.json`，P2 仅存元数据）、`doubao_detect_uid`（读 `%APPDATA%\Doubao\public_config.json` dig 解析 user_id）；④ 前端：豆包账号管理页真实操作（保存当前登录态/切换/恢复/删除快照/别名备注），概述页统计接真实数据；切换进度复用全局 NDJSON 事件管线；`backfill_dc_id_for` 对 Doubao 跳过（无 storage.json） |
+| **F-11 豆包会话续期（P3）** | ✅ 已完成（2026-09-08，方案经实机验证修订） | **实测发现**：豆包桌面客户端 cookie 值在 Chromium os_crypt（v10/DPAPI+AES-GCM，本机验证可解）之下还有客户端级二次加密（GCM 通过但明文为二进制密文），无法离线获得明文 sessionid → **续期主路径改为 KeepAlive**：PS 桥新动作 `KeepAlive`（启动豆包 25s 联网滑动续期 → 优雅关闭；运行中跳过），`doubao_renew_task_register` 注册 schtasks 每日任务 `AIWorkAssistant_DoubaoRenew`（/TR 调 PS 桥），成功后记池级 `last_keepalive_at`，超 25 天桌面提醒；**探活巡检**（`doubao_renew.py`，仅对手动录入凭证生效）：GET 可配置端点（settings.doubao_renew_url，默认 doubao.com 首页），Set-Cookie 新值回写、302→passport/401 判过期；**凭证手动录入**：`doubao_account_set_credential`（编辑弹框可选字段，sessionid/sid_guard）；**Cookie 诊断**：解密模块保留为诊断用途（校验 User Data/快照可解性）；前端：账号页「立即保活/续期巡检」+ 会话状态列 + 到期提醒，设置页续期配置区 |
 
 ---
 
@@ -40,7 +44,7 @@
 | 编号 | 功能点 | 说明 | 预估 | 优先级 |
 |---|---|---|---|---|
 | F-01 | **安装位置自动识别 `app_locate`** | ✅ 已完成（2026-09-08）：Rust `env.rs::app_locate`——手动指定（settings 持久化值优先）→ 注册表卸载键 → 默认路径候选 → 运行进程反查（Get-Process Path），统一返回 `{exe, userDataDir, version, source}`；档案表驱动四应用（trae_work/trae/doubao/workbuddy）；设置页两处「自动检测」按钮已改走该命令并显示探测来源与版本 | — | — |
-| F-48 | 快照桥参数化 | ✅ 已完成（2026-09-08）：桥档案表扩至四应用 `-TargetApp TraeWork\|Trae\|Doubao\|WorkBuddy`（数据目录/进程名/exe 候选/快照根按实测布局就绪）；`SnapshotLayout` 布局标记（icube/chromium/authfile），非 icube 布局的快照/恢复/设备重置显式报错待接入——豆包（User Data 目录快照，doubao §2.1）与 WorkBuddy（auth 文件双层恢复，workbuddy §2.2）的快照管线随各自应用批次实现 | — | — |
+| F-48 | 快照桥参数化 | ✅ 已完成（2026-09-08）：桥档案表扩至四应用 `-TargetApp TraeWork\|Trae\|Doubao\|WorkBuddy`（数据目录/进程名/exe 候选/快照根按实测布局就绪）；`SnapshotLayout` 布局标记（icube/chromium/authfile）——icube 完整管线；chromium（豆包）快照/恢复已随 F-05 接入（2026-09-08）；authfile（WorkBuddy）快照管线随 WorkBuddy 批次实现 | — | — |
 | F-49 | 响应宽容解析工具 | ✅ 已完成（2026-09-08）：`fs_utils::dig()`——沿 data/result/resp/response/info 包裹键递归下钻（限深 8 层，数组同层展开）；已采纳到 `query_ent_packs`、`query_pay_status`、ExchangeToken 解析，抗官方信封字段变动 | — | — |
 | F-13 | 到期日历 | 各账号 JWT/积分/会员到期绝对时间入库 + UI 日历 + 到期前桌面提醒 | 1 天 | P1 |
 | F-19 | 失败通知渠道扩展 | 桌面通知之外接入企业微信 / Server酱 | 0.5 天 | P2 |
@@ -62,10 +66,10 @@
 
 前置事实与方案见 `doubao-trae-switch-plan.md` §2：
 
-- F-05 目录级快照账号切换（3~4 天，P1）
-- F-11 cookie 续期定时任务（1~2 天，P2）
+- ~~F-05 目录级快照账号切换~~ ✅ **已完成**（2026-09-08，P2 落地），详见「本轮已完成」
+- ~~F-11 cookie 续期定时任务~~ ✅ **已完成**（2026-09-08，P3 落地；方案修订为 KeepAlive 保活，详见「本轮已完成」）
 - F-24 会员额度展示（MITM 抓包路径，2~3 天，P2）
-- F-07 cookie 级热切换（1~2 天，P3）
+- F-07 cookie 级热切换（1~2 天，P3；⚠ 受客户端二次加密影响，sessionid 池化需先验证网页版 cookie 通道）
 
 ## 六、建议排序（近期 2 周）
 

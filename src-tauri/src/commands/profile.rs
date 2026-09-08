@@ -17,24 +17,27 @@ pub struct ProfileInfo {
 }
 
 /// profiles 根目录：%APPDATA%\AIWorkAssistant\data\profiles\（Trae Work）
-/// 或 data\profiles_trae\（Trae CN IDE，与切换桥 -TargetApp 参数化一致）
+/// 或 data\profiles_trae\（Trae CN IDE）、data\profiles_doubao\（豆包，P2），
+/// 与切换桥 -TargetApp 参数化一致
 fn profiles_dir(state: &State<AppState>, target_app: Option<&str>) -> PathBuf {
     match target_app {
         Some("Trae") => state.data_dir.join("data").join("profiles_trae"),
+        Some("Doubao") => state.data_dir.join("data").join("profiles_doubao"),
         _ => state.data_dir.join("data").join("profiles"),
     }
 }
 
-/// 归一化 target_app：仅接受 "Trae"（Trae CN IDE），其余一律视为 TraeWork
+/// 归一化 target_app：仅接受 "Trae"（Trae CN IDE）/ "Doubao"（豆包），其余一律视为 TraeWork
 fn normalize_target_app(target_app: Option<&str>) -> &'static str {
     match target_app {
         Some("Trae") => "Trae",
+        Some("Doubao") => "Doubao",
         _ => "TraeWork",
     }
 }
 
 /// 递归计算目录大小和文件数
-fn dir_stats(path: &std::path::Path) -> (u64, u64) {
+pub(crate) fn dir_stats(path: &std::path::Path) -> (u64, u64) {
     let mut size = 0u64;
     let mut count = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {

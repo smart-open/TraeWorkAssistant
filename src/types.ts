@@ -8,7 +8,22 @@ export type ViewKey =
   | 'credits'
   | 'logs'
   | 'api-service'
-  | 'settings';
+  | 'settings'
+  // 豆包应用页面（侧边栏应用切换 Tab → 豆包）
+  | 'doubao-overview'
+  | 'doubao-accounts'
+  | 'doubao-settings';
+
+/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy 后期扩展 / 豆包 接入中 */
+export type AppKey = 'trae' | 'buddy' | 'doubao';
+
+/** 各应用的默认落地页 */
+export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
+  trae: 'dashboard',
+  buddy: 'dashboard',
+  doubao: 'doubao-overview',
+};
+
 
 export interface EnvStatus {
   installed: boolean;
@@ -183,6 +198,9 @@ export interface Settings {
   notify: string;
   trae_path: string | null;
   trae_cn_path: string | null;
+  doubao_path: string | null;
+  /** 豆包会话续期保活端点（P3；null = 用 doubao.com 首页滑动续期） */
+  doubao_renew_url: string | null;
   data_dir: string | null;
   log_retention_days: number;
   proxy_domains: string;
@@ -291,6 +309,41 @@ export interface ProfileInfo {
   file_count: number;
   last_modified: string;
 }
+
+// ---- 豆包账号池（P2：快照槽 + 别名元数据合并视图，对应 Rust doubao.rs DoubaoAccountView）----
+export interface DoubaoAccountView {
+  user_id: string;
+  name: string;
+  note: string;
+  has_snapshot: boolean;
+  size_bytes: number;
+  file_count: number;
+  last_modified: string;
+  is_current: boolean;
+  added_at: string | null;
+  /** 会话状态（P3）：ok=有效 / expired=已过期 / unknown=未探活 / none=无 sessionid */
+  session_state: 'ok' | 'expired' | 'unknown' | 'none';
+  session_expire_at: string | null;
+  cookies_synced_at: string | null;
+  last_renew_at: string | null;
+  session_source: string | null;
+  /** 池级：最近一次 KeepAlive 保活时间（所有行同值） */
+  last_keepalive_at: string | null;
+}
+
+/** doubao_renew.py 摘要 JSON（P3 巡检/诊断结果） */
+export interface DoubaoRenewSummary {
+  mode: 'full' | 'diagnose';
+  finished_at: string;
+  renew_url?: string;
+  sync: { synced: number; sources: { source: string; decryptable: boolean; cookies?: string[]; ascii_values?: number; note?: string; detail?: string }[] };
+  renew?: { ok: number; expired: number; error: number; skipped: number };
+  accounts?: { user_id: string; status: string; detail?: string; renewed?: boolean }[];
+  logs?: string[];
+}
+
+/** 豆包切换/保存的目标应用参数（与 switch_account / save_current_login 的 target_app 对齐） */
+export type DoubaoTargetApp = 'Doubao';
 
 // ---- OAuth 登录 ----
 export interface OAuthLoginUrl {
