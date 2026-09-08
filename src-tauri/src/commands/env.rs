@@ -13,7 +13,10 @@ pub struct EnvStatus {
     pub path: Option<String>,
 }
 
-#[tauri::command]
+/// 环境探测。async 派发：detect_trae 回退路径含 reg query /s /f TRAE
+/// （全注册表递归搜索，可达数秒）与 PowerShell version_of（冷启动数百 ms），
+/// 同步命令跑主线程会冻结 UI
+#[tauri::command(async)]
 pub fn env_check(_app: AppHandle, state: State<AppState>) -> EnvStatus {
     let (installed, path, version) = detect_trae(state.settings().trae_path);
     let running = is_running();

@@ -430,9 +430,17 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
 }
 
-/// 读取本地文本文件（配合导入账号：文件选择后由 Rust 侧读取，避免前端路径权限问题）
+/// 读取文本文件。仅允许 .json：当前唯一用途是账号导入（前端经文件对话框选择），
+/// 收紧扩展名可避免前端被注入后借此读取任意敏感文件
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if ext != "json" {
+        return Err("仅允许读取 .json 文件".into());
+    }
     let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?;
     String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".into())
 }
@@ -519,7 +527,8 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
     Ok(())
 }
 
-#[tauri::command]
+/// 查询每日签到任务状态。async 派发：schtasks 调用约 1s，避免阻塞主线程
+#[tauri::command(async)]
 pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, String> {
     let (ok, stdout, stderr) =
         run_schtasks(&["/Query", "/TN", "TraeWorkAssistant_DailyCheckin", "/FO", "LIST"])?;
@@ -543,7 +552,8 @@ pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, S
     Ok(stdout)
 }
 
-#[tauri::command]
+/// 注销每日签到任务。async 派发：schtasks 调用约 1s，避免阻塞主线程
+#[tauri::command(async)]
 pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
     let (ok, _stdout, stderr) =
         run_schtasks(&["/Delete", "/TN", "TraeWorkAssistant_DailyCheckin", "/F"])?;

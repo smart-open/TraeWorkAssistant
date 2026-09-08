@@ -162,7 +162,25 @@ pub async fn chat_completions(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let body_vec = body.to_vec();
-    let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
+    // 校验 JSON 并预读 stream/model（与 /v1/messages 对齐）：
+    // 非法 JSON 直接 400，避免透传原始 body 后客户端拿到 502
+    let peek: Value = match serde_json::from_slice(&body_vec) {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("invalid JSON body: {}", e),
+            )
+        }
+    };
+    if peek.get("messages").and_then(|m| m.as_array()).is_none() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "messages: field required",
+        );
+    }
     let stream = peek.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let model = peek
         .get("model")
@@ -712,12 +730,11 @@ fn uuid_like_id() -> String {
     buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// UTF-8 安全截断：n 超长或落在多字节字符中间时回退完整字符串。
+/// 不可用 &s[..n]：上游错误 JSON 含中文（每字符 3 字节）时，
+/// 200 恰好落在多字节中间会导致 spawn_blocking 任务 panic
 fn safe_slice(s: &str, n: usize) -> &str {
-    if s.len() > n {
-        &s[..n]
-    } else {
-        s
-    }
+    s.get(..n).unwrap_or(s)
 }
 
 /// 流式场景：向客户端下发上游错误并结束流（仅在尚未发送任何数据时使用）

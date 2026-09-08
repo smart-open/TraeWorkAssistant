@@ -45,11 +45,11 @@ pub async fn api_server_start(
     let port = settings.api_port;
     let api_key = settings.api_key.clone();
 
-    // 关键：设置 NO_PROXY 环境变量，防止 ureq 走系统代理（127.0.0.1:8899）
-    // 当代理开启时，系统代理会将 API 服务的上游请求也拦截，形成循环导致超时
-    // ureq 2.x 在 AgentBuilder::build() 时读取 HTTP_PROXY/HTTPS_PROXY/NO_PROXY
-    std::env::set_var("NO_PROXY", "*");
-    std::env::set_var("no_proxy", "*");
+    // 代理循环说明：ureq 2.12 未启用 proxy-from-env feature，构建 Agent 时
+    // 既不读 HTTP(S)_PROXY/NO_PROXY 环境变量、也不读系统代理，Agent 未显式
+    // 配置 proxy 即直连，不会形成 127.0.0.1:8899 回环。
+    // 旧实现曾进程级 set_var("NO_PROXY","*")：多线程下 setenv 有竞态
+    // （Rust 2024 已标 unsafe），且污染 python 签到等子进程的代理行为，已移除
     let default_model = {
         let m = settings.api_default_model.trim();
         if m.is_empty() {

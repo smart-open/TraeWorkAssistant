@@ -22,7 +22,7 @@ fn short_agent() -> ureq::Agent {
         .build()
 }
 
-/// 流式 Agent：无总超时，仅 response_header_timeout 120s，用于 SSE 流式对话
+/// 流式 Agent（死代码预留）：未设置任何超时，启用前需补齐读/写/连接超时
 /// 预留给 Phase 3 OpenAI 兼容 API 使用
 #[allow(dead_code)]
 fn streaming_agent() -> ureq::Agent {

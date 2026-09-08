@@ -111,7 +111,11 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
     if is_model_config_mismatch(body) {
         return ErrKind::None;
     }
-    if body.contains("\"code\":1005") || (body.contains("1005") && body.to_lowercase().contains("plan")) {
+    // 1005：精确匹配 JSON 键 + plan limit 短语（避免任意 "1005"/"plan" 字样误判）
+    let lower_body = body.to_lowercase();
+    if (body.contains("\"code\":1005") || body.contains("\"code\": 1005"))
+        && (lower_body.contains("plan limit") || lower_body.contains("plan_limit"))
+    {
         return ErrKind::PlanLimit;
     }
     match status {
@@ -153,14 +157,16 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     }
 }
 
-/// 流式上游 Agent：无总超时，仅 response_header_timeout 120s，用于 SSE 流式对话
-/// 注意：ureq 2.12 默认不读环境变量/系统代理（需显式 proxy-from_env feature），
+/// 流式上游 Agent：无总超时；连接 10s / 写 30s / 空闲读 300s，用于 SSE 流式对话
+/// 注意：ureq 2.12 默认不读环境变量/系统代理（需显式 proxy-from-env feature），
 /// 本 crate 未启用该 feature，天然直连，不会走本应用 127.0.0.1:8899 形成循环
 pub fn streaming_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        // 不设置 timeout_read，ureq 默认无读超时（SSE 流式需要）
+        // 空闲读超时仅约束单次 read 等待，SSE 正常流式（持续出包）不受影响；
+        // 防止上游建立连接后长期不发数据，spawn_blocking 线程与客户端连接永久挂起。
         // 注意：timeout_read(Duration::from_secs(0)) 会触发 Rust std 的
-        // "cannot set a 0 duration timeout" 错误，不能使用
+        // "cannot set a 0 duration timeout" 错误，不能以 0 表示"禁用"
+        .timeout_read(std::time::Duration::from_secs(300))
         .timeout_write(std::time::Duration::from_secs(30)) // 写超时 30s
         .timeout_connect(std::time::Duration::from_secs(10)) // 连接超时 10s
         .max_idle_connections(20)
