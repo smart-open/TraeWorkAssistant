@@ -307,18 +307,24 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
     })?;
 
     // 版本回填：资产名版本低于 tag 版本 → 按目标版本重命名资产名，
-    // 下载时写入临时目录的文件名随之更新，版本前置校验才能通过
+    // 下载时写入临时目录的文件名随之更新，版本前置校验才能通过。
+    // 注意必须「替换」倒数第二段版本段（而非追加后缀）：
+    // version_from_asset 固定按下划线倒数第二段解析，
+    // 追加成 `X_2.8.1_x64-setup_2.8.2.exe` 会使解析段变为 x64-setup 而失败
     if let Some(asset_ver) = version_from_asset(&asset_name) {
         if cmp_version(asset_ver, latest) == std::cmp::Ordering::Less {
-            if let Some(stripped) = asset_name.strip_suffix(".exe") {
-                let renamed = format!("{}_{}.exe", stripped, tag.trim_start_matches(['v', 'V']));
-                asset_name = renamed;
-            }
+            let mut parts: Vec<String> =
+                asset_name.split('_').map(|s| s.to_string()).collect();
+            // version_from_asset 已保证至少 2 段
+            let n = parts.len();
+            parts[n - 2] = format!("{}.{}.{}", latest.0, latest.1, latest.2);
+            let renamed = parts.join("_");
             // 大小不可靠（资产是旧版本产物），置 0 让前端以未知大小处理
             size = 0;
             log::warn!(
-                "release {tag} 资产版本低于 tag 版本，已回填资产名: {asset_name}（size 置 0）"
+                "release {tag} 资产版本低于 tag 版本，已回填资产名: {asset_name} -> {renamed}（size 置 0）"
             );
+            asset_name = renamed;
         }
     }
 

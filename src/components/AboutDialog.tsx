@@ -38,6 +38,8 @@ type UpdateState =
   | { k: 'error'; msg: string };
 
 function fmtSize(bytes: number): string {
+  // 0 = 后端版本回填时置 0（资产为旧版本产物，大小不可靠）
+  if (bytes <= 0) return '未知大小';
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${bytes} B`;

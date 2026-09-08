@@ -154,8 +154,8 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
 }
 
 /// 流式上游 Agent：无总超时，仅 response_header_timeout 120s，用于 SSE 流式对话
-/// 注意：代理排除依赖 api_server_start 启动时写入的 NO_PROXY=* 环境变量，
-/// 防止 ureq 走系统代理（127.0.0.1:8899）形成循环
+/// 注意：ureq 2.12 默认不读环境变量/系统代理（需显式 proxy-from_env feature），
+/// 本 crate 未启用该 feature，天然直连，不会走本应用 127.0.0.1:8899 形成循环
 pub fn streaming_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         // 不设置 timeout_read，ureq 默认无读超时（SSE 流式需要）

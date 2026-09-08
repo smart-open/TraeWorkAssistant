@@ -264,10 +264,21 @@ Function PageReinstall
   ; 模板基于 tauri-cli v2.11.4 官方 installer.nsi，升级 CLI 时需同步维护。
   ;
   ; 非 WiX 场景：create 阶段 Abort 跳过整页（不会触发 leave 回调），
-  ; 版本决策推迟到 PageLeaveReinstall 内集中处理。
+  ; 因此降级拦截必须在跳过前就地完成（页面回调中 Abort 仅跳过页面，
+  ; 终止安装须用 Quit）；同版本/升级直接覆盖安装。
   ${If} $WixMode = 1
     Call PageLeaveReinstall
   ${Else}
+    ${If} $R0 = -1
+    ${AndIf} $UpdateMode <> 1
+      ; 与静默模式 EarlyChecks 行为一致：非白名单场景禁止降级覆盖，
+      ; 避免 DisplayVersion 回写旧版本后更新器反复推送。
+      ; 自更新模式（/UPDATE）不拦截：更新器侧已保证只升不降。
+      !if "${ALLOWDOWNGRADES}" != "true"
+        MessageBox MB_ICONEXCLAMATION "$(newerVersionInstalled)"
+        Quit
+      !endif
+    ${EndIf}
     Abort
   ${EndIf}
 FunctionEnd

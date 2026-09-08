@@ -647,8 +647,10 @@ pub fn stream_convert_anthropic<R: Read + Send>(
     }
 
     // sent_any 仅统计真实发出过的事件：
-    // tools 只是聚合缓冲（input 尚未发送），不能视为已向客户端输出
-    let sent_any = message_started;
+    // tools 只是聚合缓冲（input 尚未发送），不能视为已向客户端输出；
+    // 但「工具已缓冲 + 中途错误」时 error 分支已就地透传错误事件，
+    // 需计入 sent_any，否则调用方会重复下发 error / 误触发重试重放
+    let sent_any = message_started || (!tools.is_empty() && error_info.is_some());
     (error_info.map(|(code, msg)| (code, msg)), sent_any)
 }
 

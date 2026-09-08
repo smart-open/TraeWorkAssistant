@@ -1,6 +1,6 @@
 //! 模型列表配置化与官网同步
 //!
-//! - 模型下拉列表持久化在 `api_models.json`，不硬编码在前端
+//! - 模型下拉列表持久化在 `data/api_models.json`（data/ 子目录），不硬编码在前端
 //! - 「同步官网模型」双源合并：
 //!   1) `batch_get_detail_param` 配置接口 → 用户可见模型 + 官方展示名（verified）
 //!   2) `get_skill_detail` 的 `skill_payload.meta.models` → 全量模型注册表
@@ -9,7 +9,7 @@
 //! - 未验证模型调用返回 4001（model config is empty）时，运行时自动改用
 //!   solo_agent 重试一次；成功后将 model→function 覆盖自学习持久化
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,31 @@ use crate::models::{AccountsFile, DeviceMap};
 /// 都是「读 → 改 → 写」，并发时后写会覆盖先写；write_json 的临时文件 + rename
 /// 只保证单次写入原子性，需额外串行化整个读改写周期
 static MODELS_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+/// api_models.json 统一存放路径：<data_dir>/data/api_models.json。
+/// 与其他数据文件（checkin_accounts.json 等）一致落 data/ 子目录；
+/// 旧版本曾直接放在数据根目录，此处顺带做幂等迁移。
+fn models_path(data_dir: &Path) -> PathBuf {
+    let dir = data_dir.join("data");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("api_models.json");
+    let legacy = data_dir.join("api_models.json");
+    if legacy.is_file() {
+        if !path.exists() {
+            // 升级迁移：旧位置 → data/ 子目录（同盘 rename，几乎不会失败）
+            if let Err(e) = std::fs::rename(&legacy, &path) {
+                fs_utils::app_log(
+                    data_dir,
+                    &format!("api_models.json 迁移到 data/ 失败（保留旧文件）: {e}"),
+                );
+            }
+        } else {
+            // 新位置已是权威数据，旧位置文件为升级残留
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
+    path
+}
 
 /// 客户端内置模型专用的上游 function（4001 自学习重试目标）
 pub const SOLO_AGENT_FUNCTION: &str = "solo_agent";
@@ -106,7 +131,7 @@ pub fn function_for_model(model_lower: &str) -> &'static str {
 
 /// 读取模型的 function 覆盖（自学习结果）；未配置时返回 None
 pub fn function_override(data_dir: &Path, model_lower: &str) -> Option<String> {
-    let list: Vec<ModelOption> = fs_utils::read_json(&data_dir.join("api_models.json"));
+    let list: Vec<ModelOption> = fs_utils::read_json(&models_path(data_dir));
     list.into_iter()
         .find(|m| m.id.to_lowercase() == model_lower)
         .and_then(|m| m.function)
@@ -116,7 +141,7 @@ pub fn function_override(data_dir: &Path, model_lower: &str) -> Option<String> {
 /// 自学习持久化：模型在指定 function 下请求成功后记录覆盖，并标记为已验证
 pub fn learn_function_override(data_dir: &Path, model: &str, function: &str) {
     let model_lower = model.to_lowercase();
-    let path = data_dir.join("api_models.json");
+    let path = models_path(data_dir);
     let _guard = MODELS_FILE_LOCK.lock();
     let mut list: Vec<ModelOption> = fs_utils::read_json(&path);
     match list.iter_mut().find(|m| m.id.to_lowercase() == model_lower) {
@@ -143,7 +168,7 @@ pub fn learn_function_override(data_dir: &Path, model: &str, function: &str) {
 
 /// 读取模型列表；文件缺失或为空时写入默认列表
 pub fn load_models(data_dir: &Path) -> Vec<ModelOption> {
-    let path = data_dir.join("api_models.json");
+    let path = models_path(data_dir);
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(list) = serde_json::from_str::<Vec<ModelOption>>(&text) {
             if !list.is_empty() {
@@ -255,7 +280,12 @@ pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
         return Err("没有可用账号（缺少 JWT），请先在账号管理中添加账号".into());
     }
 
+    // 显式禁用环境变量代理探测：ureq 2.12 默认不读 HTTP(S)_PROXY（需
+    // proxy-from-env feature），此处显式声明意图，防止未来误启该 feature
+    // 导致请求绕进用户环境变量里的代理（原实现依赖进程级 NO_PROXY=* 已移除，
+    // set_var 会污染 Trae 等子进程环境，使其 --proxy-server 注入失效）
     let agent = ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
         .timeout(std::time::Duration::from_secs(30))
         .build();
     let batch_body = json!({
@@ -338,7 +368,7 @@ pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
     // 落盘前合并本地 function 覆盖（自学习结果），避免同步整体覆盖丢失
     {
         let _guard = MODELS_FILE_LOCK.lock();
-        let existing: Vec<ModelOption> = fs_utils::read_json(&data_dir.join("api_models.json"));
+        let existing: Vec<ModelOption> = fs_utils::read_json(&models_path(data_dir));
         for m in list.iter_mut() {
             if m.function.is_some() {
                 continue;
@@ -353,7 +383,7 @@ pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
                 }
             }
         }
-        fs_utils::write_json(&data_dir.join("api_models.json"), &list)?;
+        fs_utils::write_json(&models_path(data_dir), &list)?;
     }
     fs_utils::app_log(
         data_dir,
@@ -635,13 +665,28 @@ mod tests {
         );
         // 已收录模型：学习后 verified 翻转
         let defaults = default_models();
-        fs_utils::write_json(&dir.join("api_models.json"), &defaults).unwrap();
+        fs_utils::write_json(&models_path(&dir), &defaults).unwrap();
         learn_function_override(&dir, "GLM-5.2", "solo_agent");
         let list: Vec<ModelOption> =
-            fs_utils::read_json(&dir.join("api_models.json"));
+            fs_utils::read_json(&models_path(&dir));
         let m = list.iter().find(|m| m.id == "glm-5.2").unwrap();
         assert_eq!(m.function.as_deref(), Some("solo_agent"));
         assert!(m.verified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_root_file_migrates_to_data_subdir() {
+        let dir = std::env::temp_dir().join(format!("twa_models_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        // 旧版本布局：api_models.json 直接放在数据根目录
+        fs_utils::write_json(&dir.join("api_models.json"), &default_models()).unwrap();
+        // 任一访问入口触发幂等迁移
+        let list = load_models(&dir);
+        assert!(!list.is_empty());
+        assert!(!dir.join("api_models.json").exists());
+        assert!(dir.join("data").join("api_models.json").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

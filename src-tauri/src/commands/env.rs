@@ -38,7 +38,9 @@ pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
 /// 启动本地 Trae Work 客户端。
 /// 若传入 proxy_port（代理运行中），自动注入 `--proxy-server` 让 Trae 走本地代理，
 /// 无需用户在 Trae 设置里手动配置代理。
-#[tauri::command]
+/// async 派发：注入代理前会执行 F-47 三级关闭（最长约 5s 轮询等待），
+/// 同步命令跑主线程会冻结 UI。
+#[tauri::command(async)]
 pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
     let (installed, path, _) = detect_trae(state.settings().trae_path);
     if !installed {

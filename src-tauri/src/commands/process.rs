@@ -78,8 +78,15 @@ pub fn graceful_kill_images(images: &[&str]) -> Result<(), String> {
     }
 
     // ---- 第三级：人工介入 ----
-    let still = images_running(images).join("、");
+    // 终判兜底：等待循环的最后一次探测与超时退出之间存在竞态窗口，
+    // 进程可能在窗口内恰好全部退出 —— 此时不应误报失败，
+    // 否则上层（如 open_trae_app 的 ? 传播）会中止本应继续的启动流程。
+    let still = images_running(images);
+    if still.is_empty() {
+        return Ok(());
+    }
     Err(format!(
-        "进程 {still} 未能自动关闭（优雅关闭与强制结束均失败），请手动关闭后重试"
+        "进程 {} 未能自动关闭（优雅关闭与强制结束均失败），请手动关闭后重试",
+        still.join("、")
     ))
 }
