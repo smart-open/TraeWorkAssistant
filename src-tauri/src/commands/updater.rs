@@ -69,36 +69,82 @@ fn cmp_version(a: (u64, u64, u64), b: (u64, u64, u64)) -> std::cmp::Ordering {
     a.cmp(&b)
 }
 
-/// 构建带超时的 ureq Agent（默认直连；若系统设置了 HTTPS_PROXY/HTTP_PROXY 环境变量则走代理）。
-fn build_agent(timeout: Duration) -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new().timeout(timeout);
-    if let Ok(p) = std::env::var("HTTPS_PROXY")
+/// 读当前 Windows 系统代理（即用户 VPN）为 ureq 可用的代理 URL；未启用或格式异常返回 None。
+/// 注册表 ProxyServer 有两种形态："host:port" 或 "http=..;https=..;ftp=.."（按协议区分）。
+fn system_proxy_url() -> Option<String> {
+    let (_, server, _) = crate::commands::proxy::get_existing_win_proxy()?;
+    let server = server.trim();
+    if server.is_empty() {
+        return None;
+    }
+    let addr = if server.contains('=') {
+        server
+            .split(';')
+            .find_map(|s| {
+                let s = s.trim();
+                s.strip_prefix("https=")
+                    .or_else(|| s.strip_prefix("http="))
+                    .map(|v| v.trim().to_string())
+            })
+            .unwrap_or_else(|| server.to_string())
+    } else {
+        server.to_string()
+    };
+    let url = if addr.contains("://") {
+        addr
+    } else {
+        format!("http://{addr}")
+    };
+    ureq::Proxy::new(&url).ok().map(|_| url)
+}
+
+/// 按优先级构建尝试序列：系统代理（用户 VPN）→ 环境变量代理 → 直连。
+/// 每项带标签，用于日志与报错文案；`finish` 为各场景的收尾超时配置。
+fn attempt_agents(finish: impl Fn(ureq::AgentBuilder) -> ureq::Agent) -> Vec<(&'static str, ureq::Agent)> {
+    let mut out: Vec<(&'static str, ureq::Agent)> = Vec::new();
+    if let Some(url) = system_proxy_url() {
+        if let Ok(p) = ureq::Proxy::new(&url) {
+            out.push(("系统代理", finish(ureq::AgentBuilder::new().proxy(p))));
+        }
+    }
+    let env_proxy = std::env::var("HTTPS_PROXY")
         .or_else(|_| std::env::var("https_proxy"))
         .or_else(|_| std::env::var("HTTP_PROXY"))
         .or_else(|_| std::env::var("http_proxy"))
-    {
+        .ok();
+    if let Some(p) = env_proxy {
         if let Ok(proxy) = ureq::Proxy::new(&p) {
-            builder = builder.proxy(proxy);
+            out.push(("环境变量代理", finish(ureq::AgentBuilder::new().proxy(proxy))));
         }
     }
-    builder.build()
+    out.push(("直连", finish(ureq::AgentBuilder::new())));
+    out
 }
 
 fn fetch_releases() -> Result<Vec<serde_json::Value>, String> {
-    let agent = build_agent(Duration::from_secs(20));
-    let resp = agent
-        .get(RELEASES_API)
-        .set("User-Agent", "ai-work-assistant-updater")
-        .set("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|e| {
-            format!(
-                "无法访问 GitHub Releases（{}）。\n请检查网络或代理后重试；也可手动打开发布页下载：{}",
-                e, RELEASES_PAGE
-            )
-        })?;
-    resp.into_json::<Vec<serde_json::Value>>()
-        .map_err(|e| format!("解析 release 响应失败: {e}"))
+    // 检查是小请求：连接 10s + 整体 20s，逐通道尝试（系统代理 → 环境变量代理 → 直连）
+    let mut last_err = String::new();
+    for (label, agent) in
+        attempt_agents(|b| b.timeout_connect(Duration::from_secs(10)).timeout(Duration::from_secs(20)).build())
+    {
+        match agent
+            .get(RELEASES_API)
+            .set("User-Agent", "ai-work-assistant-updater")
+            .set("Accept", "application/vnd.github+json")
+            .call()
+        {
+            Ok(resp) => {
+                return resp
+                    .into_json::<Vec<serde_json::Value>>()
+                    .map_err(|e| format!("解析 release 响应失败: {e}"));
+            }
+            Err(e) => last_err = format!("[{label}] {e}"),
+        }
+    }
+    Err(format!(
+        "无法访问 GitHub Releases（{last_err}）。\n请检查网络或代理后重试；也可手动打开发布页下载：{}",
+        RELEASES_PAGE
+    ))
 }
 
 /// 在 release 资产中挑选安装包：优先 NSIS（x64-setup.exe），退而求其次 MSI。
@@ -247,19 +293,56 @@ pub fn update_download(
     // 清理同名旧文件（可能是不完整下载）
     let _ = std::fs::remove_file(&dest);
 
-    // 下载（不做整体超时，只限制连接超时；流式写盘 + 进度事件）
-    let agent = build_agent(Duration::from_secs(30));
+    // 逐通道尝试下载（系统代理 → 环境变量代理 → 直连）。
+    // 超时策略：连接 10s + 读 60s，不设整体超时（大文件慢速下载不能被整体超时掐断）。
+    // 每次尝试都从 0 重新流式写盘并重发进度事件（进度条回跳属预期）。
+    let mut last_err = String::new();
+    for (label, agent) in
+        attempt_agents(|b| b.timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(60)).build())
+    {
+        match download_via(&app, &agent, &download_url, &dest) {
+            Ok(received) => {
+                let _ = app.emit(
+                    "update-download-progress",
+                    DownloadProgress { received, total: received, percent: 100 },
+                );
+                return Ok(UpdateDownloaded {
+                    file_path: dest.to_string_lossy().into_owned(),
+                    asset_name: asset_name.clone(),
+                    size: received,
+                    version: expected_version,
+                });
+            }
+            Err(e) => {
+                last_err = format!("[{label}] {e}");
+                let _ = std::fs::remove_file(&dest);
+            }
+        }
+    }
+    Err(format!(
+        "下载安装包失败（{last_err}）。\n若你开启了 VPN/代理仍失败，请确认代理可用后重试；也可手动下载：{}",
+        RELEASES_PAGE
+    ))
+}
+
+/// 单通道完整下载：请求 → 流式写盘 → 进度事件 → 完整性校验，返回实际接收字节数。
+fn download_via(
+    app: &AppHandle,
+    agent: &ureq::Agent,
+    download_url: &str,
+    dest: &std::path::Path,
+) -> Result<u64, String> {
     let resp = agent
-        .get(&download_url)
+        .get(download_url)
         .set("User-Agent", "ai-work-assistant-updater")
         .call()
-        .map_err(|e| format!("下载安装包失败（{}）。可手动下载：{}", e, RELEASES_PAGE))?;
+        .map_err(|e| format!("连接失败: {e}"))?;
     let total = resp
         .header("Content-Length")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let file = std::fs::File::create(&dest).map_err(|e| format!("创建安装包文件失败: {e}"))?;
+    let file = std::fs::File::create(dest).map_err(|e| format!("创建安装包文件失败: {e}"))?;
     let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut reader = resp.into_reader();
     let mut buf = [0u8; 64 * 1024];
@@ -293,17 +376,7 @@ pub fn update_download(
             "下载不完整（{received}/{total} 字节），请重试或手动下载：{RELEASES_PAGE}"
         ));
     }
-    let _ = app.emit(
-        "update-download-progress",
-        DownloadProgress { received, total, percent: 100 },
-    );
-
-    Ok(UpdateDownloaded {
-        file_path: dest.to_string_lossy().into_owned(),
-        asset_name: asset_name.clone(),
-        size: received,
-        version: expected_version,
-    })
+    Ok(received)
 }
 
 /// 第二步：启动 NSIS 安装器（/P /UPDATE /R）——被动模式显示进度条，
