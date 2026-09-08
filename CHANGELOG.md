@@ -4,6 +4,34 @@
 
 ---
 
+## [3.2.7] - 2026-09-08
+
+### 新增
+
+- **安装位置自动识别（F-01）**：新增 `app_locate(target_app)` 命令——手动指定 → 注册表卸载键 → 默认路径 → 运行进程反查 四级探测，统一返回 `{exe, userDataDir, version, source}`；档案表驱动四应用（Trae Work / Trae CN / 豆包 / WorkBuddy），设置页「自动检测」按钮改走该命令。
+- **响应宽容解析（F-49）**：`fs_utils::dig()` 沿 data/result/resp/response/info 包裹键递归下钻（限深 8 层），采纳到积分包、套餐身份、ExchangeToken 三处解析点，抗官方信封字段变动。
+- **账号导入预览（F-46 残余）**：新增 `accounts_import_preview` 命令（解析文件、标记已存在账号与待新增分组，不写盘）；导入改两步式——选文件 → 预览弹框逐条勾选 → 按索引导入。
+- **快照桥扩展（F-48 部分）**：PS 桥档案表扩至四应用（`-TargetApp TraeWork|Trae|Doubao|WorkBuddy`），引入 `SnapshotLayout` 布局标记，非 icube 布局的快照/设备重置显式报错待各应用批次接入。
+
+### 修复
+
+- **导入预览弹框必崩**：`ImportPreview` / `ImportPreviewAccount` / `AppLocate` 三个新 DTO 误加 serde `camelCase` 改名，与项目蛇形命名约定及前端失配（`new_groups` 等字段为 undefined），渲染时抛 TypeError——移除改名恢复蛇形上线。
+- **分组默认名多字节 panic**：分组 id 含多字节字符时 `&id[..4]` 字节切片越界 panic，改按字符截断；账号 uid 尾部摘要同类隐患一并修复。
+- **悬停积分明细 / 刷新积分 / 刷新套餐 / 扫描本机账号冻结 UI**：`fetch_credit_detail`、`fetch_remaining_credits`、`refresh_remaining_credits`、`refresh_pay_status`、`apps_accounts_discover` 五条同步网络命令改 `#[tauri::command(async)]`。
+- **套餐刷新静默降级 Free**：`query_pay_status` 对 2xx 但缺关键字段的异常响应返回错误，不再用 "Free" 覆盖缓存中的正确套餐。
+- **卸载「删除应用数据」删不干净**：NSIS 卸载钩子补删 `%APPDATA%\AIWorkAssistant`（含旧 TraeWorkAssistant 遗留），此前只删 WebView2 的 identifier 目录。
+- **并发写 JSON 踩踏临时文件**：`write_json` 临时文件名加 pid+纳秒唯一化；模型列表损坏时记日志 + `.bak` 备份 + 默认配置自愈，不再静默覆盖。
+- **更新器残留与路径防御**：下载前清理 `%TEMP%` 旧版本安装包残留；拒绝含路径分隔符 / `..` 的资产名（防临时目录逃逸）。
+- **积分明细口径不一**：无 `expire_time` 的积分包计入明细（显示「长期有效」），与统计口径对齐；明细失败后下次悬停可重试。
+- **导入 / 入池交互**：导入空文件明确提示且按钮加载态防重复点击；发现账号入池按钮 per-item pending；更新包大小为 0 时显示「未知大小」而非 0 B。
+- **安装器边缘**：被动模式（/P）同/升级直接覆盖安装、降级遵循 ALLOWDOWNGRADES，不再误触发旧版卸载器；`rename_release.py` 单产物缺失输出 WARNING 并支持 `--strict`。
+
+### 文档
+
+- AGENT.md 对照 v3.2.6 代码库校准（目录地图、命令契约表、双 uid 红线、主题约定）；`future-roadmap.md` 升 v1.3（F-01/F-03/F-12/F-23/F-46 残余/F-48/F-49 移入已完成）。
+
+---
+
 ## [3.2.6] - 2026-09-08
 
 ### 修复
