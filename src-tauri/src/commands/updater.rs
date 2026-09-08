@@ -178,7 +178,8 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
 const PRODUCT_MIN_VERSION: (u64, u64, u64) = (3, 0, 0);
 
 /// 检查 GitHub Releases 上本产品线（>= 3.0.0）的最新版本，与当前应用版本比较。
-#[tauri::command]
+/// async 派发：网络请求最坏 90s（3 通道 × 30s），同步命令默认跑主线程会冻住 UI，必须异步执行。
+#[tauri::command(async)]
 pub fn update_check() -> Result<UpdateCheckResult, String> {
     let current = parse_version(env!("CARGO_PKG_VERSION"))
         .ok_or("内置版本号解析失败")?;
@@ -277,7 +278,8 @@ fn validate_target(asset_name: &str, expected_version: &str) -> Result<(u64, u64
 }
 
 /// 第一步：下载安装包到临时目录（不安装）。完成后前端确认，再调 update_run_installer。
-#[tauri::command]
+/// async 派发：下载耗时不可控（最坏 3 通道各连+读超时），同步命令跑主线程会冻住 UI。
+#[tauri::command(async)]
 pub fn update_download(
     app: AppHandle,
     download_url: String,
