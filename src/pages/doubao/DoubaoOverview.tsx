@@ -1,19 +1,10 @@
 import { useEffect, useState } from 'react';
-import { RefreshCw, ShieldCheck, Users, FolderOpen } from 'lucide-react';
+import { RefreshCw, ShieldCheck, Users, ExternalLink } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
-import { StatCard, Badge } from '../../components/ui';
+import { StatCard } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import type { AppLocate, DoubaoAccountView } from '../../types';
-
-/** 豆包接入路线（doubao-trae-switch-plan.md §4 实施计划；已落地：P0 环境识别 + P2 快照切换/账号池） */
-const ROADMAP: { phase: string; title: string; desc: string; done?: boolean }[] = [
-  { phase: 'P0', title: '安装位置自动识别', desc: 'app_locate 四级探测已支持豆包档案（注册表 → 默认路径 → 进程反查）', done: true },
-  { phase: 'P2', title: '目录级快照切换', desc: 'User Data 白名单快照（Cookies / Local State / leveldb…）+ doubao_accounts.json 账号池', done: true },
-  { phase: 'P3', title: '会话续期定时任务', desc: 'sid_guard 30 天滑动续期，每日轻量接口保活 + 到期桌面通知' },
-  { phase: 'P4', title: '会员额度展示', desc: 'MITM 抓包固化订阅额度接口，额度条展示（专业版/生图/视频）' },
-  { phase: 'P5', title: 'Cookie 级热切换', desc: 'v10/DPAPI 解密 sessionid 池化，进程内重写 Cookies 表免重启切换' },
-];
 
 export default function DoubaoOverview() {
   const pushToast = useAppStore((s) => s.pushToast);
@@ -58,15 +49,28 @@ export default function DoubaoOverview() {
   const snapshotCount = accounts.filter((a) => a.has_snapshot).length;
   const currentAccount = accounts.find((a) => a.is_current);
 
+  const launch = async () => {
+    try {
+      await api.doubao.launch();
+    } catch (err) {
+      pushToast('error', `打开豆包失败：${String(err)}`);
+    }
+  };
+
   return (
     <div className="animate-fade-in">
       <PageHeader
         title="豆包 · 概述"
-        desc="豆包桌面版账号管理与自动化 · 接入开发中（方案见 doubao-trae-switch-plan.md）"
+        desc="豆包桌面版多账号管理 · 快照切换 / 会话保活 / 会员额度"
         actions={
-          <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
-            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
-          </button>
+          <>
+            <button onClick={() => void launch()} className="btn-outline" disabled={!installed}>
+              <ExternalLink size={15} /> 打开豆包
+            </button>
+            <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
+              <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
+            </button>
+          </>
         }
       />
 
@@ -88,7 +92,7 @@ export default function DoubaoOverview() {
         <StatCard
           label="安装情况"
           value={installed ? '已安装' : '未检测到'}
-          hint={locate?.version ? `${sourceText} · ${locate.version}` : sourceText}
+          hint={locate?.version ? `${sourceText} · v${locate.version}` : sourceText}
           tone={installed ? 'green' : 'amber'}
         />
         <button className="text-left" onClick={() => setView('doubao-accounts')}>
@@ -107,31 +111,48 @@ export default function DoubaoOverview() {
         />
       </div>
 
-      <div className="mt-5 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <ShieldCheck size={16} className="text-emerald-500" />
-          <span className="text-sm font-medium">接入路线（doubao-trae-switch-plan.md §4）</span>
-        </div>
-        <div className="space-y-2">
-          {ROADMAP.map((r) => (
-            <div key={r.phase} className="flex items-start gap-3 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-              <Badge tone={r.done ? 'green' : 'slate'}>{r.phase}</Badge>
-              <div className="min-w-0 flex-1">
-                <div className="text-sm font-medium">
-                  {r.title}
-                  {r.done && <span className="ml-2 text-xs font-normal text-emerald-600 dark:text-emerald-400">已完成</span>}
+      {accounts.length > 0 && (
+        <div className="mt-5 card p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <Users size={16} className="text-violet-500" />
+            <span className="text-sm font-medium">账号概览</span>
+          </div>
+          <div className="space-y-2">
+            {accounts.slice(0, 5).map((a) => (
+              <button
+                key={a.user_id}
+                onClick={() => setView('doubao-accounts')}
+                className="flex w-full items-center gap-3 rounded-lg border border-slate-100 p-3 text-left transition hover:bg-slate-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    {a.name}
+                    {a.is_current && (
+                      <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
+                        当前账号
+                      </span>
+                    )}
+                  </div>
+                  <div className="font-mono text-xs text-slate-400">{a.user_id}</div>
                 </div>
-                <div className="text-xs text-slate-500">{r.desc}</div>
-              </div>
-            </div>
-          ))}
+                <div className="text-xs text-slate-400">
+                  {a.has_snapshot ? `快照 ${a.last_modified || '—'}` : '无快照'}
+                </div>
+              </button>
+            ))}
+            {accounts.length > 5 && (
+              <button onClick={() => setView('doubao-accounts')} className="text-xs text-brand-600 hover:underline dark:text-brand-400">
+                查看全部 {accounts.length} 个账号 →
+              </button>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       <div className="mt-4 flex items-start gap-2 rounded-lg border border-slate-100 p-3 text-xs text-slate-500 dark:border-zinc-800">
-        <Users size={14} className="mt-0.5 shrink-0" />
+        <ShieldCheck size={14} className="mt-0.5 shrink-0" />
         <span>
-          合规说明：豆包 / Trae 均为第三方账号体系，本工具仅管理本人合法持有的账号，不破解、不绕过付费；会员额度接口仅做展示。sessionid 等凭证等同密码，入库文件本地存储并全程掩码展示。
+          合规说明：本工具仅管理本人合法持有的豆包账号，不破解、不绕过付费；会员额度仅做展示。会话凭证等同密码，仅本地存储并全程掩码展示。
         </span>
       </div>
     </div>

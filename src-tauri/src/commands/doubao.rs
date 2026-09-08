@@ -283,33 +283,120 @@ pub fn doubao_account_remove(state: State<AppState>, user_id: String) -> Result<
     save_pool(&state, &pool)
 }
 
-/// 探测豆包当前登录账号：%APPDATA%\Doubao\public_config.json 含 user_id 明文（plan §1.1）。
-/// 结构无公开文档，dig 宽容解析（user_id / uid 键），找不到返回 None 由用户手动输入。
+/// 探测豆包当前登录账号。
+/// 来源①（主）：%APPDATA%\Doubao\public_config.json —— 实测结构无公开文档且嵌套不定
+///   （本机实测 user_id 位于 text_picker.current_user / text_picker.users[] 下），
+///   因此做全树递归搜索 user_id/uid/user_id_str 键，候选优先级：
+///   a) 祖先链含 current_user（明确"当前用户"语义）> b) user_action_time 最大者（最近活跃）。
+/// 来源②（兜底）：profiles_doubao/current_account.txt（PS 桥保存/切换后写入）。
 #[tauri::command]
-pub fn doubao_detect_uid() -> Result<Option<String>, String> {
+pub fn doubao_detect_uid(state: State<AppState>) -> Result<Option<String>, String> {
+    if let Ok(Some(uid)) = detect_uid_from_public_config() {
+        return Ok(Some(uid));
+    }
+    Ok(read_current_uid(&state))
+}
+
+/// 从 public_config.json 全树递归收集 uid 候选并择优。文件缺失/解析失败返回 Ok(None)。
+fn detect_uid_from_public_config() -> Result<Option<String>, String> {
     let appdata = std::env::var("APPDATA").map_err(|e| format!("读取 APPDATA 环境变量失败: {e}"))?;
-    let path = PathBuf::from(appdata)
-        .join("Doubao")
-        .join("public_config.json");
+    let path = PathBuf::from(appdata).join("Doubao").join("public_config.json");
     if !path.exists() {
         return Ok(None);
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取 public_config.json 失败: {e}"))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("解析 public_config.json 失败: {e}"))?;
-    for key in ["user_id", "uid", "user_id_str"] {
-        if let Some(hit) = fs_utils::dig(&v, &[key]) {
-            let s = match hit {
-                serde_json::Value::String(s) => s.trim().to_string(),
-                serde_json::Value::Number(n) => n.to_string(),
-                _ => continue,
-            };
-            if !s.is_empty() {
-                return Ok(Some(s));
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            // 坏文件不该锁死保存流程：记日志后视为未识别（走 current_account.txt 兜底）
+            eprintln!("public_config.json 解析失败（忽略）: {e}");
+            return Ok(None);
+        }
+    };
+    let mut candidates: Vec<UidCandidate> = Vec::new();
+    collect_uid_candidates(&v, false, &mut candidates);
+    candidates.sort_by(|a, b| {
+        b.from_current_user
+            .cmp(&a.from_current_user)
+            .then(b.numeric.cmp(&a.numeric))
+            .then(b.action_time.cmp(&a.action_time))
+    });
+    Ok(candidates.into_iter().next().map(|c| c.user_id))
+}
+
+#[derive(Debug)]
+struct UidCandidate {
+    user_id: String,
+    /// 值是否为纯数字（user_id 实测为数字串；用于过滤误命中）
+    numeric: bool,
+    /// 祖先链是否含 current_user 键
+    from_current_user: bool,
+    /// 关联的 user_action_time（毫秒时间戳，越大越新）
+    action_time: Option<i64>,
+}
+
+const UID_KEYS: [&str; 3] = ["user_id", "uid", "user_id_str"];
+const UID_MAX_DEPTH: usize = 12;
+
+fn collect_uid_candidates(v: &serde_json::Value, in_current_user: bool, out: &mut Vec<UidCandidate>) {
+    collect_uid_candidates_impl(v, in_current_user, 0, out);
+}
+
+fn collect_uid_candidates_impl(
+    v: &serde_json::Value,
+    in_current_user: bool,
+    depth: usize,
+    out: &mut Vec<UidCandidate>,
+) {
+    if depth > UID_MAX_DEPTH {
+        return;
+    }
+    match v {
+        serde_json::Value::Object(map) => {
+            // 本对象若同时含 uid 键与 user_action_time，则合并为一条候选
+            let uid_val = UID_KEYS.iter().find_map(|k| map.get(*k));
+            if let Some(uid_val) = uid_val {
+                if let Some(uid) = value_to_uid(uid_val) {
+                    let action_time = map
+                        .get("user_action_time")
+                        .and_then(|t| t.as_i64().or_else(|| t.as_str().and_then(|s| s.parse().ok())));
+                    let numeric = matches!(uid_val, serde_json::Value::Number(_))
+                        || uid.chars().all(|c| c.is_ascii_digit());
+                    if !out.iter().any(|c| c.user_id == uid) {
+                        out.push(UidCandidate { user_id: uid, numeric, from_current_user: in_current_user, action_time });
+                    }
+                }
+            }
+            for (k, child) in map {
+                if UID_KEYS.contains(&k.as_str()) {
+                    continue; // 已在对象层取值，不把 uid 值当子树再搜
+                }
+                // 仅当下降进入 current_user 对象本身时才置位（不能污染兄弟子树，
+                // 如 text_picker.current_user 与 text_picker.users 是平级语义）
+                let child_in_current = in_current_user || k == "current_user";
+                collect_uid_candidates_impl(child, child_in_current, depth + 1, out);
             }
         }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_uid_candidates_impl(item, in_current_user, depth + 1, out);
+            }
+        }
+        _ => {}
     }
-    Ok(None)
+}
+
+/// uid 值规整：字符串去空白 / 数字转字符串；空值或超长视为无效。
+fn value_to_uid(v: &serde_json::Value) -> Option<String> {
+    let s = match v {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    if s.is_empty() || s.len() > 32 {
+        return None;
+    }
+    Some(s)
 }
 
 // ── P3 会话续期 ──────────────────────────────────────────────────────────────
@@ -410,6 +497,62 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
     Ok(())
 }
 
+// ── P4 会员额度 ──────────────────────────────────────────────────────────────
+//
+// 端点现状：豆包会员额度接口为 www.doubao.com 已登录 XHR，社区无公开文档，
+// 须用户抓包（device_proxy.py）固化后填入 settings.doubao_quota_url。
+// 本命令为框架：凭证（手动录入 sessionid）+ 可配置端点 + 宽容解析，
+// 端点就绪后前端即可展示会员等级 / 到期时间 / 剩余额度条。
+
+/// 查询账号会员额度（调 doubao_quota.py；网络请求可达数秒，async 派发避免阻塞 UI）
+#[tauri::command(async)]
+pub fn doubao_quota_fetch(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+    let url = state
+        .settings()
+        .doubao_quota_url
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .ok_or("会员额度接口未配置：请先在豆包「环境配置」填入抓包固化的额度接口地址")?;
+    if !url.starts_with("http") {
+        return Err(format!("额度接口地址无效: {url}（需以 http(s):// 开头）"));
+    }
+    let script = state.python_dir.join("doubao_quota.py");
+    if !script.exists() {
+        return Err(format!("找不到额度脚本: {}", script.display()));
+    }
+    let out = std::process::Command::new(&state.python_exe)
+        .arg(&script)
+        .args(["--uid", user_id.trim(), "--url", url.as_str()])
+        .env("AIWORKDATA_DIR", &state.data_dir)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .map_err(|e| format!("运行额度脚本失败: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // 脚本约定：stdout 最后一行（以 { 开头）为摘要 JSON；错误也以 JSON 摘要输出（ok=false）
+    let summary_line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'));
+    if let Some(line) = summary_line {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+            if ok {
+                return Ok(v);
+            }
+            let err = v
+                .get("error")
+                .and_then(|s| s.as_str())
+                .unwrap_or("额度查询失败（脚本未给出原因）")
+                .to_string();
+            return Err(err);
+        }
+    }
+    let stderr_tail: String = String::from_utf8_lossy(&out.stderr).lines().rev().take(3).collect::<Vec<_>>().join("\n");
+    Err(format!(
+        "额度脚本未输出摘要（exit={:?}）{}",
+        out.status.code(),
+        if stderr_tail.is_empty() { String::new() } else { format!(":\n{stderr_tail}") }
+    ))
+}
+
 /// 更新账号的手动录入会话凭证（可选高级功能；有凭证的账号才能走探活巡检）
 #[tauri::command]
 pub fn doubao_account_set_credential(
@@ -419,11 +562,28 @@ pub fn doubao_account_set_credential(
     sid_guard: Option<String>,
 ) -> Result<(), String> {
     let mut pool = load_pool(&state);
+    // 仅快照、未入池的账号（PS 桥自动备份产生）允许直接补凭证：自动入池
+    if !pool.accounts.iter().any(|a| a.user_id == user_id) {
+        pool.accounts.push(DoubaoAccount {
+            name: user_id.clone(),
+            note: String::new(),
+            user_id: user_id.clone(),
+            added_at: fs_utils::now_ts(),
+            last_active_at: None,
+            session_id: None,
+            sid_guard: None,
+            session_expire_at: None,
+            expired: None,
+            cookies_synced_at: None,
+            last_renew_at: None,
+            session_source: None,
+        });
+    }
     let acc = pool
         .accounts
         .iter_mut()
         .find(|a| a.user_id == user_id)
-        .ok_or_else(|| format!("账号 {user_id} 不在账号池中"))?;
+        .ok_or_else(|| format!("账号 {user_id} 入池失败"))?;
     acc.session_id = session_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     acc.sid_guard = sid_guard.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     acc.session_expire_at = if acc.sid_guard.is_some() {
@@ -568,4 +728,72 @@ pub fn doubao_renew_task_unregister(state: State<AppState>) -> Result<(), String
     }
     fs_utils::app_log(&state.data_dir, "豆包续期定时任务已注销");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 本机实测结构（2026-09-08，Doubao 2.27）：user_id 嵌在 text_picker.current_user 下
+    const REAL_LIKE_JSON: &str = r#"{
+       "text_picker": {
+          "current_user": {
+             "enable": true,
+             "modify_version": "2.27.12",
+             "user_action_time": "1788530411262",
+             "user_id": "340177329338890"
+          },
+          "pid": "26664",
+          "raw_input_hwnd": "0x51d0e60",
+          "users": [ {
+             "enable": true,
+             "user_action_time": 1788530411262,
+             "user_id": "340177329338890"
+          } ]
+       }
+    }"#;
+
+    #[test]
+    fn detect_uid_finds_nested_user_id() {
+        let v: serde_json::Value = serde_json::from_str(REAL_LIKE_JSON).unwrap();
+        let mut cands = Vec::new();
+        collect_uid_candidates(&v, false, &mut cands);
+        cands.sort_by(|a, b| {
+            b.from_current_user
+                .cmp(&a.from_current_user)
+                .then(b.action_time.cmp(&a.action_time))
+        });
+        let best = cands.first().expect("应至少识别出一个候选");
+        assert_eq!(best.user_id, "340177329338890");
+        assert!(best.numeric);
+        assert!(best.from_current_user);
+    }
+
+    #[test]
+    fn detect_uid_prefers_current_user_over_stale() {
+        // 两个不同 uid：current_user 下的是旧时间戳，也应胜出
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"text_picker":{
+                 "users":[{"user_id":"111","user_action_time":999}],
+                 "current_user":{"user_id":"222","user_action_time":1}
+               }}"#,
+        )
+        .unwrap();
+        let mut cands = Vec::new();
+        collect_uid_candidates(&v, false, &mut cands);
+        cands.sort_by(|a, b| {
+            b.from_current_user
+                .cmp(&a.from_current_user)
+                .then(b.action_time.cmp(&a.action_time))
+        });
+        assert_eq!(cands.first().unwrap().user_id, "222");
+    }
+
+    #[test]
+    fn uid_value_filters_garbage() {
+        assert_eq!(value_to_uid(&serde_json::json!(" 12345 ")), Some("12345".into()));
+        assert_eq!(value_to_uid(&serde_json::json!(12345)), Some("12345".into()));
+        assert_eq!(value_to_uid(&serde_json::json!("")), None);
+        assert_eq!(value_to_uid(&serde_json::json!(true)), None);
+    }
 }

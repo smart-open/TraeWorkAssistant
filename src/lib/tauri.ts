@@ -13,6 +13,7 @@ import type {
   DiscoveredAccount,
   DoubaoAccountView,
   DoubaoRenewSummary,
+  DoubaoQuotaResult,
   EnvStatus,
   GroupView,
   JwtParseResult,
@@ -162,14 +163,15 @@ export const api = {
       invoke('profile_delete', { userId, targetApp: targetApp ?? null }),
     formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
   },
-  // ---- 豆包账号池（P2，Rust doubao.rs；字段名严格 snake_case）----
+  // ---- 豆包账号池（Rust doubao.rs；字段名严格 snake_case）----
   doubao: {
     accountsList: () => invoke<DoubaoAccountView[]>('doubao_accounts_list'),
     accountSave: (userId: string, name?: string, note?: string) =>
       invoke('doubao_account_save', { userId, name: name ?? null, note: note ?? null }),
     accountRemove: (userId: string) => invoke('doubao_account_remove', { userId }),
     detectUid: () => invoke<string | null>('doubao_detect_uid'),
-    // ---- P3 会话续期 ----
+    launch: () => invoke('open_doubao_app'),
+    // ---- 会话续期 ----
     renewRun: (syncOnly?: boolean) =>
       invoke<DoubaoRenewSummary>('doubao_renew_run', { syncOnly: syncOnly ?? false }),
     keepaliveRun: () => invoke('doubao_keepalive_run'),
@@ -182,6 +184,8 @@ export const api = {
     taskRegister: (time: string) => invoke('doubao_renew_task_register', { time }),
     taskStatus: () => invoke<string>('doubao_renew_task_status'),
     taskUnregister: () => invoke('doubao_renew_task_unregister'),
+    // ---- 会员额度 ----
+    fetchQuota: (userId: string) => invoke<DoubaoQuotaResult>('doubao_quota_fetch', { userId }),
   },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),

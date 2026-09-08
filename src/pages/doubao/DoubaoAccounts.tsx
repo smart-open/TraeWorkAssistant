@@ -6,7 +6,6 @@ import {
   Repeat,
   Timer,
   Coins,
-  Cookie,
   Save,
   Pencil,
   Trash2,
@@ -18,23 +17,7 @@ import PageHeader from '../../components/PageHeader';
 import { Badge, Modal } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { DoubaoAccountView, DoubaoRenewSummary } from '../../types';
-
-/** P4-P5 待接入功能（P2 快照/切换、P3 会话续期已落地，不再展示） */
-const PENDING_FEATURES: { phase: string; title: string; icon: typeof Users; desc: string }[] = [
-  {
-    phase: 'P4',
-    title: '会员额度',
-    icon: Coins,
-    desc: 'MITM 抓包固化订阅额度接口（专业版 / 生图 / 视频日额度），额度条展示，仅展示不代刷。',
-  },
-  {
-    phase: 'P5',
-    title: 'Cookie 级热切换',
-    icon: Cookie,
-    desc: '实测 cookie 加密为 v10（AES-256-GCM + DPAPI，当前用户可解密）；sessionid 池化后进程内重写 Cookies 表，免重启切换（二期增强项）。',
-  },
-];
+import type { DoubaoAccountView, DoubaoQuotaResult, DoubaoRenewSummary } from '../../types';
 
 function fmtSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -66,6 +49,8 @@ export default function DoubaoAccounts() {
   const [renewSummary, setRenewSummary] = useState<DoubaoRenewSummary | null>(null);
   const [keepaliveRunning, setKeepaliveRunning] = useState(false);
   const [keepaliveProgress, setKeepaliveProgress] = useState<string[]>([]);
+  const [quotaRunningFor, setQuotaRunningFor] = useState<string | null>(null);
+  const [quotaResult, setQuotaResult] = useState<{ userId: string; result: DoubaoQuotaResult } | null>(null);
   // 保存当前登录态表单
   const [uidInput, setUidInput] = useState('');
   const [nameInput, setNameInput] = useState('');
@@ -130,7 +115,7 @@ export default function DoubaoAccounts() {
       setBusy(false);
       void reload();
     }).then((u) => cleanups.push(u));
-    // 保活进度（P3）
+    // 保活进度
     void listen('keepalive-progress', (e) =>
       setKeepaliveProgress((prev) => [...prev.slice(-49), e.payload as string]),
     ).then((u) => cleanups.push(u));
@@ -186,10 +171,8 @@ export default function DoubaoAccounts() {
     setDialog(null);
     // 沿用现有管线：关豆包 → 快照到 profiles_doubao/<uid> → 重启（NDJSON 进度）
     await saveCurrentLogin(uid, 'Doubao');
-    if (nameInput.trim()) {
-      // 别名异步入池，失败不影响保存
-      api.doubao.accountSave(uid, nameInput.trim()).catch(() => {});
-    }
+    // 无论是否填别名都入池（快照已生成，池里有元数据后可直接编辑别名/凭证）
+    api.doubao.accountSave(uid, nameInput.trim() || undefined).catch(() => {});
   };
 
   const submitEdit = async () => {
@@ -264,7 +247,21 @@ export default function DoubaoAccounts() {
 
   const anyBusy = busy || renewRunning || keepaliveRunning || !!switchingTo || !!savingLogin;
 
-  /** 会话状态徽标（P3） */
+  /** 查询会员额度（需该账号已录入 sessionid 凭证且环境配置已固化额度接口） */
+  const doFetchQuota = async (a: DoubaoAccountView) => {
+    setQuotaRunningFor(a.user_id);
+    setQuotaResult(null);
+    try {
+      const r = await api.doubao.fetchQuota(a.user_id);
+      setQuotaResult({ userId: a.user_id, result: r });
+    } catch (err) {
+      pushToast('error', `额度查询失败：${String(err)}`);
+    } finally {
+      setQuotaRunningFor(null);
+    }
+  };
+
+  /** 会话状态徽标 */
   const sessionBadge = (a: DoubaoAccountView) => {
     if (a.session_state === 'ok') {
       return <Badge tone="green">有效{a.session_expire_at ? ` · ${a.session_expire_at.slice(0, 10)}` : ''}</Badge>;
@@ -278,7 +275,7 @@ export default function DoubaoAccounts() {
     <div className="animate-fade-in">
       <PageHeader
         title="豆包 · 账号管理"
-        desc="快照切换（P2）+ 会话续期（P3）· 快照存 data/profiles_doubao/<uid>/"
+        desc="多账号快照保存与一键切换 · 快照存 data/profiles_doubao/<uid>/"
         actions={
           <>
             <button onClick={() => void reload()} className="btn-outline" disabled={loading}>
@@ -339,7 +336,7 @@ export default function DoubaoAccounts() {
         </div>
       )}
 
-      {/* 续期巡检摘要（P3） */}
+      {/* 续期巡检摘要 */}
       {renewSummary && (
         <div className="mt-5 card p-4 text-xs text-slate-500 dark:text-zinc-400">
           <div className="mb-1 flex items-center gap-2 text-sm font-medium text-slate-700 dark:text-zinc-200">
@@ -372,7 +369,6 @@ export default function DoubaoAccounts() {
         <div className="mb-3 flex items-center gap-2">
           <Users size={16} className="text-violet-500" />
           <span className="text-sm font-medium">账号池</span>
-          <Badge tone="green">P2 已接入</Badge>
           <span className="text-xs text-slate-400">{accounts.length} 个账号</span>
         </div>
         {accounts.length === 0 ? (
@@ -440,6 +436,14 @@ export default function DoubaoAccounts() {
                           <History size={14} />
                         </button>
                         <button
+                          title="会员额度"
+                          onClick={() => void doFetchQuota(a)}
+                          disabled={anyBusy || a.session_state === 'none' || quotaRunningFor === a.user_id}
+                          className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:opacity-30 dark:hover:bg-amber-500/10"
+                        >
+                          <Coins size={14} className={quotaRunningFor === a.user_id ? 'animate-pulse' : ''} />
+                        </button>
+                        <button
                           title="编辑别名 / 备注 / 会话凭证"
                           onClick={() => {
                             setEditName(a.name === a.user_id ? '' : a.name);
@@ -478,41 +482,76 @@ export default function DoubaoAccounts() {
           </div>
         )}
         <div className="mt-3 text-xs text-slate-400">
-          切换流程：关闭豆包 → 当前登录态自动备份（last 槽 + 原账号槽）→ 恢复目标快照 → 重启豆包。会话状态由续期巡检判定
-          （sid_guard 滑动续期，到期前 7 天提醒）；保活端点与每日定时任务在「环境配置」页设置。快照与 Trae 相互独立。
+          切换流程：关闭豆包 → 当前登录态自动备份（last 槽 + 原账号槽）→ 恢复目标快照 → 重启豆包。会话保活与每日定时任务在
+          「环境配置」页设置；额度查询需先录入会话凭证并固化额度接口。
         </div>
       </div>
 
-      {/* P3-P5 待接入功能 */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <Users size={16} className="text-slate-400" />
-          <span className="text-sm font-medium">后续路线</span>
-          <Badge tone="amber">待接入</Badge>
-        </div>
-        <div className="space-y-2">
-          {PENDING_FEATURES.map((f) => {
-            const Icon = f.icon;
-            return (
-              <div
-                key={f.title}
-                className="flex items-start gap-3 rounded-lg border border-slate-100 p-3 dark:border-zinc-800"
-              >
-                <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-500 dark:bg-zinc-800 dark:text-zinc-400">
-                  <Icon size={15} />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium">{f.title}</span>
-                    <Badge tone="slate">{f.phase}</Badge>
-                  </div>
-                  <div className="mt-0.5 text-xs text-slate-500">{f.desc}</div>
-                </div>
+      {/* 会员额度结果弹框 */}
+      <Modal
+        open={!!quotaResult}
+        onClose={() => setQuotaResult(null)}
+        title={`会员额度 · ${accounts.find((a) => a.user_id === quotaResult?.userId)?.name ?? quotaResult?.userId ?? ''}`}
+        size="lg"
+      >
+        {quotaResult && (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              {quotaResult.result.parsed.level != null ? (
+                <Badge tone="violet">会员等级：{quotaResult.result.parsed.level}</Badge>
+              ) : (
+                <Badge tone="slate">未识别到会员等级字段</Badge>
+              )}
+              {quotaResult.result.parsed.expire_at && (
+                <Badge tone="green">到期：{quotaResult.result.parsed.expire_at}</Badge>
+              )}
+              <Badge tone="slate">HTTP {quotaResult.result.http_status}</Badge>
+            </div>
+            {quotaResult.result.parsed.items.length > 0 ? (
+              <div className="space-y-2">
+                {quotaResult.result.parsed.items.map((it, i) => {
+                  const total = Number(it.total);
+                  const left = it.left != null ? Number(it.left) : null;
+                  const pct = Number.isFinite(total) && total > 0 && left != null && Number.isFinite(left) ? Math.max(0, Math.min(100, (left / total) * 100)) : null;
+                  return (
+                    <div key={i} className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="font-medium">{it.name}</span>
+                        <span className="text-xs text-slate-500">
+                          {left != null ? `剩余 ${it.left} / ${it.total}` : `总量 ${it.total}`}
+                          {it.used != null ? ` · 已用 ${it.used}` : ''}
+                        </span>
+                      </div>
+                      {pct != null && (
+                        <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-zinc-800">
+                          <div
+                            className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
-            );
-          })}
-        </div>
-      </div>
+            ) : (
+              <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-900 dark:text-zinc-400">
+                未从响应中识别出额度条目。若接口返回结构与预期不同，请根据下方键路径调整接口地址后重试。
+              </div>
+            )}
+            {quotaResult.result.raw_keys.length > 0 && (
+              <details className="text-xs text-slate-400">
+                <summary className="cursor-pointer select-none">响应结构（调试）</summary>
+                <div className="mt-1 max-h-32 space-y-0.5 overflow-auto font-mono">
+                  {quotaResult.result.raw_keys.map((k, i) => (
+                    <div key={i}>{k}</div>
+                  ))}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
+      </Modal>
 
       {/* 保存当前登录态弹框 */}
       <Modal open={dialog?.mode === 'save-login'} onClose={() => setDialog(null)} title="保存当前豆包登录态" size="lg">

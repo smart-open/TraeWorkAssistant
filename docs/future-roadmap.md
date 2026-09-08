@@ -1,6 +1,7 @@
 # 未来规划（Roadmap）
 
-> **文档版本**: 2026-09-08 v1.5 · 调研分支 `feat/traecode_doubao`（已并入 `main`）
+> **文档版本**: 2026-09-08 v1.6 · 调研分支 `feat/traecode_doubao`（已并入 `main`）
+> **v1.6 变更**: 豆包生产化冲刺——① 修复 `doubao_detect_uid`（实测 user_id 嵌在 public_config.json `text_picker.current_user` 下，原 dig 信封键解析找不到导致"账号无法自动识别"；改为全树递归 + current_user 优先 + current_account.txt 兜底，含单元测试）；② 修复 `app_locate` 第 0 级漏接 doubao_path/workbuddy_path（手动指定路径此前不生效）；③ F-24 会员额度框架落地（doubao_quota.py + doubao_quota_fetch + 前端额度条，端点待抓包固化填入 doubao_quota_url）；④ 豆包专区 UI 生产化：TopBar 豆包模式只显示豆包信息、新增 `open_doubao_app`/打开豆包、去除全部 P 阶段标注与开发文档引用。
 > **v1.5 变更**: 豆包 P3 落地——F-11 会话续期完成（KeepAlive 保活主路径 + schtasks 每日任务 + 手动凭证探活巡检 + cookie 诊断），移入「已完成」。实施中实测发现：豆包桌面客户端 cookie 值存在客户端级二次加密（v10/DPAPI 解出仍为密文），"解密 cookie 续期"原方案不可行，已修订（详见 doubao-trae-switch-plan.md 文档头注）。
 > **v1.4 变更**: 豆包 P2 落地——F-05 目录级快照账号切换完成（PS 桥 chromium 布局白名单快照/恢复 + `doubao_accounts.json` 账号池 + 账号管理页真实操作 + `doubao_detect_uid` 自动探测），移入「已完成」；F-48 的 chromium 布局快照管线同步启用。
 > **v1.3 变更**: 经代码核实并实施——F-01 `app_locate`（四应用三级探测）、F-49 `dig()` 宽容解析、F-46 残余（导入预览+按索引导入）已完成；F-48 完成档案表扩豆包/WorkBuddy（定位/启停就绪，快照管线随各自批次接入），移入「已完成」。
@@ -68,7 +69,7 @@
 
 - ~~F-05 目录级快照账号切换~~ ✅ **已完成**（2026-09-08，P2 落地），详见「本轮已完成」
 - ~~F-11 cookie 续期定时任务~~ ✅ **已完成**（2026-09-08，P3 落地；方案修订为 KeepAlive 保活，详见「本轮已完成」）
-- F-24 会员额度展示（MITM 抓包路径，2~3 天，P2）
+- ~~F-24 会员额度展示~~ ✅ **框架已完成**（2026-09-08）：`doubao_quota.py` + `doubao_quota_fetch` + 前端额度条/等级/到期展示已就绪；**剩余前置**：会员额度 XHR 端点须经 MITM 抓包（device_proxy.py）固化后填入 settings.doubao_quota_url 即用，解析层已按 entitlement 常见结构宽容适配
 - F-07 cookie 级热切换（1~2 天，P3；⚠ 受客户端二次加密影响，sessionid 池化需先验证网页版 cookie 通道）
 
 ## 六、建议排序（近期 2 周）

@@ -102,6 +102,7 @@ ai-work-assistant/
 | 分组 | `groups_list` / `group_create` / `group_update` / `group_delete` / `group_move` | 删除分组时账号回落「未分组」 |
 | 签到 | `checkin_start(opts)` → NDJSON 事件 | `opts: { scope, user_ids?, skip_checked_in, skip_expired }` |
 | 环境 | `app_locate(targetApp)` → `AppLocate` | 四应用安装位置四级探测（手动指定→注册表→默认路径→进程反查，F-01）；`targetApp: trae_work\|trae\|doubao\|workbuddy` |
+| 环境 | `open_doubao_app()` | 启动豆包桌面版（复用 app_locate 豆包档案探测） |
 | 切换 | `switch_account(userId)` | 调 `trae-switch-bridge.ps1 -Action Switch`（进程三级关闭策略）；`target_app` 支持 TraeWork/Trae/Doubao |
 | 切换 | `reset_device_ids(userId)` | switch 模块：重置设备指纹（区别于 misc 的 `device_reset` 只删映射）；仅 icube 布局 |
 | 保存 | `save_current_login(userId)` | 调 `trae-switch-bridge.ps1 -Action SaveCurrentLogin`；`target_app` 支持 TraeWork/Trae/Doubao |
@@ -110,11 +111,12 @@ ai-work-assistant/
 | 快照 | `profile_format_size(...)` | 快照体积格式化 |
 | 豆包 | `doubao_accounts_list` → `DoubaoAccountView[]` | 账号池 ∪ profiles_doubao 快照槽合并视图 + 当前账号标记 + 会话状态（last 槽不展示） |
 | 豆包 | `doubao_account_save(userId, name?, note?)` / `doubao_account_remove(userId)` | 豆包账号池 upsert / 移除（data/doubao_accounts.json） |
-| 豆包 | `doubao_account_set_credential(userId, sessionId?, sidGuard?)` | 手动录入会话凭证（可选高级功能；仅手动来源参与探活巡检） |
-| 豆包 | `doubao_detect_uid()` | 读 %APPDATA%\Doubao\public_config.json 宽容解析 user_id（dig user_id/uid/user_id_str） |
-| 豆包 | `doubao_keepalive_run()` | **P3 续期主路径**：调 PS 桥 `-Action KeepAlive`（启动豆包 25s 联网滑动续期 → 优雅关闭，运行中跳过），NDJSON → keepalive-progress/done 事件，成功后记池级 last_keepalive_at |
+| 豆包 | `doubao_account_set_credential(userId, sessionId?, sidGuard?)` | 手动录入会话凭证（可选高级功能；仅手动来源参与探活巡检；账号不在池时自动入池） |
+| 豆包 | `doubao_detect_uid()` | 读 %APPDATA%\Doubao\public_config.json **全树递归**搜 user_id/uid（实测嵌在 text_picker.current_user 下；current_user 优先 → 数字 uid 优先 → user_action_time 最新），兜底 profiles_doubao/current_account.txt；含单元测试 |
+| 豆包 | `doubao_keepalive_run()` | 续期主路径：调 PS 桥 `-Action KeepAlive`（启动豆包 25s 联网滑动续期 → 优雅关闭，运行中跳过），NDJSON → keepalive-progress/done 事件，成功后记池级 last_keepalive_at |
 | 豆包 | `doubao_renew_run(syncOnly?)` | 调 python doubao_renew.py：探活巡检（仅手动录入凭证的账号，200=有效/302→passport=过期）或 cookie 诊断（--sync-only，实测客户端 cookie 为二次加密密文，不能当凭证） |
 | 豆包 | `doubao_renew_task_register(time)` / `..._status()` / `..._unregister()` | schtasks 每日保活任务 AIWorkAssistant_DoubaoRenew（/TR 调 PS 桥 KeepAlive） |
+| 豆包 | `doubao_quota_fetch(userId)` | 调 python doubao_quota.py 查会员额度：需 settings.doubao_quota_url（抓包固化）+ 账号手动凭证；宽容解析等级/到期/额度条目 |
 | 日志 | `proxy_logs_list(...)` / `proxy_log_detail(...)` | 代理请求日志列表 / 详情 |
 | 文件 | `read_text_file(path)` / `write_text_file(...)` | 前端通用文本读写（read 有 10MB 上限 + 常规文件校验） |
 | 双应用 | `apps_accounts_discover` / `apps_account_add` / `apps_entitlement_read` | 本机 Trae Work + Trae CN 账号自动发现 / 入池 / 套餐读取（F-08，见 §5.1） |

@@ -154,6 +154,8 @@ function defaultSettings(): Settings {
     trae_cn_path: null,
     doubao_path: null,
     doubao_renew_url: null,
+    doubao_quota_url: null,
+    workbuddy_path: null,
     data_dir: null,
     log_retention_days: 30,
     proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com',

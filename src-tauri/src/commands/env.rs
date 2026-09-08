@@ -404,18 +404,28 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
     }
 }
 
-/// 安装位置自动识别：统一返回 {exe, userDataDir, version, source}。
-/// async 派发：内部有注册表全量搜索与 PowerShell 调用，同步会冻结 UI。
+/// 打开豆包桌面版（复用 app_locate 豆包档案四级探测；命中即回写设置以便下次直开）
 #[tauri::command(async)]
-pub fn app_locate(state: State<AppState>, target_app: Option<String>) -> AppLocate {
-    let profile = app_profile(target_app.as_deref());
+pub fn open_doubao_app(state: State<AppState>) -> Result<(), String> {
+    let loc = app_locate_inner(&state, "doubao");
+    let exe = loc.exe.ok_or("未检测到豆包安装，请在豆包「环境配置」中指定 Doubao.exe 路径")?;
+    Command::new(&exe)
+        .spawn()
+        .map_err(|e| format!("启动豆包失败: {e}"))?;
+    Ok(())
+}
 
-    // 第 0 级：用户手动指定（设置页持久化值）——优先级最高
+/// app_locate 的内部版本（供 open_* 命令复用；无需 Option 包装）
+fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate {
+    let profile = app_profile(Some(app));
+
     if let Some(sk) = profile.settings_key {
         let settings = state.settings();
         let custom = match sk {
             "trae_path" => settings.trae_path,
             "trae_cn_path" => settings.trae_cn_path,
+            "doubao_path" => settings.doubao_path,
+            "workbuddy_path" => settings.workbuddy_path,
             _ => None,
         };
         if let Some(p) = custom {
@@ -425,13 +435,9 @@ pub fn app_locate(state: State<AppState>, target_app: Option<String>) -> AppLoca
             }
         }
     }
-
-    // 第 1 级：注册表卸载键（官方安装器都会写）
     if let Some(exe) = registry_app_path(&profile) {
         return finish_locate(&profile, exe, "registry", None);
     }
-
-    // 第 2 级：默认路径候选
     for c in profile.exe_candidates {
         let expanded = c
             .replace("%LOCALAPPDATA%", &std::env::var("LOCALAPPDATA").unwrap_or_default())
@@ -440,19 +446,23 @@ pub fn app_locate(state: State<AppState>, target_app: Option<String>) -> AppLoca
             return finish_locate(&profile, expanded, "default", None);
         }
     }
-
-    // 第 3 级：运行进程反查（应用正在运行时最准）
     if let Some(exe) = process_exe_path(profile.proc_names) {
         return finish_locate(&profile, exe, "process", None);
     }
-
     AppLocate {
-        app: target_app.unwrap_or_else(|| "trae_work".into()),
+        app: app.to_string(),
         exe: None,
         user_data_dir: profile.user_data_dir,
         version: None,
         source: "not_found".into(),
     }
+}
+
+/// 安装位置自动识别：统一返回 {exe, userDataDir, version, source}。
+/// async 派发：内部有注册表全量搜索与 PowerShell 调用，同步会冻结 UI。
+#[tauri::command(async)]
+pub fn app_locate(state: State<AppState>, target_app: Option<String>) -> AppLocate {
+    app_locate_inner(&state, target_app.as_deref().unwrap_or("trae_work"))
 }
 
 /// 命中后统一补齐版本号并组装结果

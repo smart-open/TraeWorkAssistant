@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react';
-import { FolderSearch, Save, Clock3, MapPin, ShieldCheck, RefreshCw, Timer } from 'lucide-react';
+import { FolderSearch, Save, Clock3, MapPin, ShieldCheck, RefreshCw, Timer, Coins } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import type { AppLocate, DoubaoRenewSummary } from '../../types';
 
-/** 豆包环境配置：应用位置配置（app_locate + 手动路径持久化）+ 会话续期（P3：端点/定时任务/手动巡检） */
+/** 豆包环境配置：应用位置配置 + 会话保活 + 会员额度接口 */
 export default function DoubaoSettings() {
   const settings = useAppStore((s) => s.settings);
   const saveSettings = useAppStore((s) => s.saveSettings);
@@ -17,13 +17,16 @@ export default function DoubaoSettings() {
   const [detecting, setDetecting] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // ── 续期 ──
+  // ── 会话保活 ──
   const [renewUrl, setRenewUrl] = useState('');
   const [taskTime, setTaskTime] = useState('09:00');
   const [taskState, setTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
   const [taskTimeShown, setTaskTimeShown] = useState('');
   const [running, setRunning] = useState(false);
   const [summary, setSummary] = useState<DoubaoRenewSummary | null>(null);
+
+  // ── 会员额度 ──
+  const [quotaUrl, setQuotaUrl] = useState('');
 
   const refreshTaskStatus = async () => {
     try {
@@ -42,9 +45,10 @@ export default function DoubaoSettings() {
   useEffect(() => {
     if (settings?.doubao_path) setPath(settings.doubao_path);
     if (settings?.doubao_renew_url) setRenewUrl(settings.doubao_renew_url);
+    if (settings?.doubao_quota_url) setQuotaUrl(settings.doubao_quota_url);
     void refreshTaskStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url]);
 
   const detect = async () => {
     setDetecting(true);
@@ -85,6 +89,16 @@ export default function DoubaoSettings() {
     }
     await saveSettings({ doubao_renew_url: v || null });
     pushToast('success', v ? '保活端点已保存' : '已恢复默认端点（doubao.com 首页滑动续期）');
+  };
+
+  const saveQuotaUrl = async () => {
+    const v = quotaUrl.trim();
+    if (v && !v.startsWith('http')) {
+      pushToast('warn', '接口地址需以 http(s):// 开头');
+      return;
+    }
+    await saveSettings({ doubao_quota_url: v || null });
+    pushToast('success', v ? '会员额度接口已保存' : '已清空会员额度接口');
   };
 
   const registerTask = async () => {
@@ -134,7 +148,7 @@ export default function DoubaoSettings() {
     <div className="animate-fade-in">
       <PageHeader
         title="豆包 · 环境配置"
-        desc="应用位置配置与会话续期（P3 已接入）"
+        desc="应用位置、会话保活与会员额度接口"
       />
 
       {/* 应用位置配置 */}
@@ -168,16 +182,15 @@ export default function DoubaoSettings() {
         </div>
 
         <p className="mt-2 text-xs text-slate-400">
-          自动检测顺序：手动指定 → 注册表卸载键 → 默认路径（%LOCALAPPDATA%\Doubao\Application）→ 运行进程反查（doubao-trae-switch-plan.md §1.3）。
+          自动检测顺序：手动指定 → 注册表卸载键 → 默认路径 → 运行进程反查。
         </p>
       </div>
 
-      {/* 会话续期（P3） */}
+      {/* 会话保活 */}
       <div className="mt-4 card p-4">
         <div className="mb-3 flex items-center gap-2">
           <Clock3 size={16} className="text-emerald-500" />
-          <span className="text-sm font-medium">会话续期</span>
-          <Badge tone="green">P3 已接入</Badge>
+          <span className="text-sm font-medium">会话保活</span>
         </div>
 
         <div className="space-y-3 text-xs text-slate-500">
@@ -268,6 +281,35 @@ export default function DoubaoSettings() {
               )}
             </div>
           )}
+        </div>
+      </div>
+
+      {/* 会员额度 */}
+      <div className="mt-4 card p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <Coins size={16} className="text-amber-500" />
+          <span className="text-sm font-medium">会员额度</span>
+        </div>
+
+        <div className="space-y-3 text-xs text-slate-500">
+          <p>
+            豆包订阅/生图/视频额度接口无公开文档，需先经抓包工具（如本项目自带代理）登录豆包后捕获会员中心的
+            已登录 XHR 地址，将其填入下方并保存。之后即可在「账号管理」中对已录入会话凭证的账号点击额度按钮查询
+            （会员等级 / 到期时间 / 剩余额度条）。
+          </p>
+
+          <div className="flex items-center gap-2">
+            <span className="shrink-0 text-slate-500">额度接口</span>
+            <input
+              value={quotaUrl}
+              onChange={(e) => setQuotaUrl(e.target.value)}
+              placeholder="https://www.doubao.com/...（抓包固化的会员额度 XHR 地址）"
+              className="input flex-1 font-mono text-xs"
+            />
+            <button onClick={() => void saveQuotaUrl()} className="btn-outline shrink-0">
+              <Save size={14} /> 保存
+            </button>
+          </div>
         </div>
       </div>
     </div>

@@ -199,8 +199,12 @@ export interface Settings {
   trae_path: string | null;
   trae_cn_path: string | null;
   doubao_path: string | null;
-  /** 豆包会话续期保活端点（P3；null = 用 doubao.com 首页滑动续期） */
+  /** 豆包会话续期保活端点（null = 用 doubao.com 首页滑动续期） */
   doubao_renew_url: string | null;
+  /** 豆包会员额度接口（抓包固化后填入；null = 额度查询不可用） */
+  doubao_quota_url: string | null;
+  /** WorkBuddy 桌面版 exe 手动路径（随后续批次接入） */
+  workbuddy_path: string | null;
   data_dir: string | null;
   log_retention_days: number;
   proxy_domains: string;
@@ -344,6 +348,23 @@ export interface DoubaoRenewSummary {
 
 /** 豆包切换/保存的目标应用参数（与 switch_account / save_current_login 的 target_app 对齐） */
 export type DoubaoTargetApp = 'Doubao';
+
+/** doubao_quota.py 摘要 JSON（会员额度查询结果；字段由宽容解析尽力得到，均可为 null） */
+export interface DoubaoQuotaResult {
+  ok: boolean;
+  http_status: number;
+  url: string;
+  user_id: string;
+  parsed: {
+    level: string | number | null;
+    expire_at: string | null;
+    items: { name: string; total: string | number; left: string | number | null; used: string | number | null }[];
+  };
+  /** 响应顶层键路径摘要（端点调试用） */
+  raw_keys: string[];
+  raw_preview: string;
+  finished_at: string;
+}
 
 // ---- OAuth 登录 ----
 export interface OAuthLoginUrl {

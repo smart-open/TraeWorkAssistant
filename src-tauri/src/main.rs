@@ -70,6 +70,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::env::env_check,
             commands::env::app_locate,
+            commands::env::open_doubao_app,
             commands::env::open_trae_website,
             commands::env::open_trae_app,
             commands::env::env_check_trae_cn,
@@ -138,6 +139,7 @@ fn main() {
             commands::doubao::doubao_account_save,
             commands::doubao::doubao_account_remove,
             commands::doubao::doubao_detect_uid,
+            commands::doubao::doubao_quota_fetch,
             commands::doubao::doubao_renew_run,
             commands::doubao::doubao_keepalive_run,
             commands::doubao::doubao_account_set_credential,
