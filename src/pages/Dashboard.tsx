@@ -159,12 +159,12 @@ export default function Dashboard() {
         />
       </div>
 
-      {!env?.installed && (
+      {!env?.installed && !envCn?.installed && (
         <div className="mt-5 card flex items-center justify-between gap-4 p-4">
           <div className="flex items-center gap-3">
             <ShieldAlert className="text-amber-500" />
             <div>
-              <div className="font-medium">未检测到 Trae Work 安装</div>
+              <div className="font-medium">未检测到 Trae Work / Trae 安装</div>
               <div className="text-xs text-slate-500">代理捕获与账号切换同时支持 Trae Work 与 Trae，安装任一应用即可开始。</div>
             </div>
           </div>
@@ -172,11 +172,11 @@ export default function Dashboard() {
             onClick={() => void openTrae()}
             className="btn-outline"
           >
-            <ExternalLink size={15} /> {env?.installed ? '打开 Trae Work' : '前往下载'}
+            <ExternalLink size={15} /> 前往下载
           </button>
         </div>
       )}
-      {!certInstalled && env?.installed && (
+      {!certInstalled && (env?.installed || envCn?.installed) && (
         <div className="mt-3 card flex items-center justify-between gap-4 p-4">
           <div className="flex items-center gap-3">
             <ShieldAlert className="text-amber-500" />

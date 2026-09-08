@@ -5,7 +5,7 @@
 
 ## 1. 一句话
 
-Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关工具。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
+Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae Work 与 Trae（Trae CN IDE）双应用**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；桥档案表已预留豆包 / WorkBuddy）。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
 
 ## 2. Quick Start
 

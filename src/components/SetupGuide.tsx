@@ -15,6 +15,7 @@ interface Step {
 
 export default function SetupGuide() {
   const env = useAppStore((s) => s.env);
+  const envCn = useAppStore((s) => s.envCn);
   const certInstalled = useAppStore((s) => s.certInstalled);
   const proxy = useAppStore((s) => s.proxy);
   const accounts = useAppStore((s) => s.accounts);
@@ -29,12 +30,23 @@ export default function SetupGuide() {
   const steps: Step[] = [
     {
       key: 'install',
-      title: '安装 Trae Work 客户端',
-      desc: '签到目标客户端，需先安装并登录至少一个账号。',
-      done: !!env?.installed,
-      actionLabel: env?.installed ? '打开 Trae Work' : '前往下载',
+      title: '安装 Trae Work / Trae 客户端',
+      desc: '签到目标客户端（两者其一即可），需先安装并登录至少一个账号。',
+      done: !!(env?.installed || envCn?.installed),
+      actionLabel: env?.installed
+        ? '打开 Trae Work'
+        : envCn?.installed
+          ? '打开 Trae'
+          : '前往下载',
       run: async () => {
-        await useAppStore.getState().openTraeWithProxy();
+        // 优先打开已安装的那个；都未安装时走 Trae Work 下载页
+        if (env?.installed) {
+          await useAppStore.getState().openTraeWithProxy();
+        } else if (envCn?.installed) {
+          await useAppStore.getState().openTraeCn();
+        } else {
+          await useAppStore.getState().openTraeWithProxy();
+        }
         await refreshEnv();
       },
     },
@@ -62,7 +74,7 @@ export default function SetupGuide() {
     {
       key: 'account',
       title: '添加账号',
-      desc: '至少添加一个 Trae Work 账号，才能执行签到。',
+      desc: '至少添加一个 Trae Work 或 Trae 账号，才能执行签到（可用「扫描本机」自动发现）。',
       done: accounts.length > 0,
       actionLabel: '去添加',
       run: () => setView('accounts'),
@@ -146,13 +158,13 @@ export default function SetupGuide() {
           </div>
           <div className="space-y-1 text-xs">
             <p>
-              点击上方「打开 Trae Work」启动客户端即可（代理运行时会自动注入{' '}
+              点击上方按钮启动已安装的客户端（Trae Work 或 Trae）即可（代理运行时会自动注入{' '}
               <code className="rounded bg-amber-100 px-1 py-0.5 font-mono text-amber-800 dark:bg-amber-900/40 dark:text-amber-200">
                 127.0.0.1:{proxy.port}
               </code>{' '}
               代理，无需手动配置）。
             </p>
-            <p>2. 在 Trae Work 中登录账号，授权头经过代理后会自动写入「账号管理」。</p>
+            <p>2. 在 Trae Work 或 Trae 中登录账号，授权头经过代理后会自动写入「账号管理」。</p>
             <p>3. 若仍无账号，请确认 CA 证书已安装并信任。</p>
           </div>
         </div>
