@@ -4374,6 +4374,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "log",
  "serde",
  "serde_json",
  "sha2",

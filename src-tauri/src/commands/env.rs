@@ -53,7 +53,13 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
     // 进程，确保参数真正生效（F-47 三级关闭：优雅关闭→树杀强杀→人工介入提示）。
     // （无代理时正常打开，不杀进程。）
     if proxy_port.is_some() {
-        crate::commands::process::graceful_kill_app("TraeWork")?;
+        // 仅按检测到的 exe 映像名查杀：避免按整个候选列表（含国际版 Trae.exe）
+        // 误杀用户其他版本
+        let img = std::path::Path::new(&exe)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .ok_or("无法解析 Trae Work 可执行文件名")?;
+        crate::commands::process::graceful_kill_images(&[img.as_str()])?;
     }
     let mut cmd = Command::new(&exe);
     if let Some(port) = proxy_port {

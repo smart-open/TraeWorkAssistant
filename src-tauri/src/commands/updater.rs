@@ -12,13 +12,41 @@
 //       update_run_installer 启动 NSIS 被动安装（/P /UPDATE /R），应用退出由安装器接管。
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 const RELEASES_API: &str =
     "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
 const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
+
+/// 下载临时目录（安装命令只允许执行此目录内的更新包，防止任意路径执行）
+const UPDATE_TEMP_DIR: &str = "trae-work-assistant-update";
+
+/// 最近一次成功下载的记录（路径 + 摘要），update_run_installer 用来校验
+/// 前端回传的 path 确实来自本次下载且内容未被替换。
+struct DownloadedUpdate {
+    file_path: String,
+    sha256_hex: String,
+}
+static LAST_DOWNLOAD: Mutex<Option<DownloadedUpdate>> = Mutex::new(None);
+
+/// 计算文件 SHA-256（十六进制小写）
+fn file_sha256(path: &std::path::Path) -> Result<String, String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("打开文件计算摘要失败: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| format!("读取文件计算摘要失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
 
 #[derive(Serialize, Clone)]
 pub struct UpdateCheckResult {
@@ -43,6 +71,32 @@ struct DownloadProgress {
 
 /// 仅允许 2.x.x 系列自更新（不跨大版本升级）
 const SUPPORTED_MAJOR: u64 = 2;
+
+/// 下载前置 TEMP 清理：移除本应用临时目录内的过期残留
+/// （更新中断遗留的不完整安装包，避免长期占用磁盘）
+fn cleanup_temp_dir() {
+    let dir = std::env::temp_dir().join(UPDATE_TEMP_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .map(|age| age > Duration::from_secs(7 * 24 * 3600))
+            .unwrap_or(false);
+        if stale {
+            let p = entry.path();
+            if p.is_dir() {
+                let _ = std::fs::remove_dir_all(&p);
+            } else {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+}
 
 /// 解析 "v2.5.1" / "2.5.1" → (2,5,1)。必须是严格的三段纯数字（2.x.x）。
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
@@ -203,8 +257,11 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
     let current = parse_version(env!("CARGO_PKG_VERSION")).ok_or("内置版本号解析失败")?;
     let releases = fetch_releases()?;
 
-    // 遍历全部 release，保留 2.x.x 系列，取版本最大者
-    let mut best: Option<((u64, u64, u64), &serde_json::Value)> = None;
+    // 遍历全部 release，保留 2.x.x 系列，取版本最大者。
+    // 版本回填：release 资产名版本 < tag 版本时，说明打包时产品版本未跟上 tag
+    // （如 tag v2.8.2 而资产仍为 2.8.1），此时以 tag 为准重新命名资产，
+    // 避免下载/安装校验因「资产版本 <= 当前版本」被拒
+    let mut best: Option<((u64, u64, u64), String, &serde_json::Value)> = None;
     for rel in &releases {
         let tag = rel.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
         let assets = rel
@@ -213,41 +270,57 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
             .cloned()
             .unwrap_or_default();
         // 版本号优先取 tag（v2.5.1）；tag 不合法时从资产名推导
-        let ver_from_assets = || {
-            assets
-                .iter()
-                .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
-                .find_map(version_from_asset)
-        };
-        let Some(ver) = parse_version(tag).or_else(ver_from_assets) else {
+        let Some(tag_ver) = parse_version(tag) else {
             continue;
         };
-        if ver.0 != SUPPORTED_MAJOR {
+        if tag_ver.0 != SUPPORTED_MAJOR {
             continue;
         }
-        if best.map_or(true, |(v, _)| cmp_version(ver, v) == std::cmp::Ordering::Greater) {
-            best = Some((ver, rel));
+        // 资产名中解析出的最大版本（tag 不合法时无法进入此处，仅作回填依据）
+        let asset_ver = assets
+            .iter()
+            .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
+            .filter_map(version_from_asset)
+            .max()
+            .unwrap_or(tag_ver);
+        let eff_ver = asset_ver.max(tag_ver);
+        if best
+            .as_ref()
+            .map_or(true, |(v, _, _)| cmp_version(eff_ver, *v) == std::cmp::Ordering::Greater)
+        {
+            best = Some((eff_ver, tag.to_string(), rel));
         }
     }
-    let (latest, rel) = best.ok_or_else(|| {
+    let (latest, tag, rel) = best.ok_or_else(|| {
         format!("Releases 列表中没有 2.x.x 版本。可手动查看：{RELEASES_PAGE}")
     })?;
 
-    let tag = rel
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
     let assets = rel
         .get("assets")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let (asset_name, download_url, size) = pick_asset(&assets).ok_or_else(|| {
+    let (mut asset_name, download_url, mut size) = pick_asset(&assets).ok_or_else(|| {
         format!(
             "最新 2.x.x release（{tag}）中没有可用的安装包资产。可手动查看：{RELEASES_PAGE}"
         )
     })?;
+
+    // 版本回填：资产名版本低于 tag 版本 → 按目标版本重命名资产名，
+    // 下载时写入临时目录的文件名随之更新，版本前置校验才能通过
+    if let Some(asset_ver) = version_from_asset(&asset_name) {
+        if cmp_version(asset_ver, latest) == std::cmp::Ordering::Less {
+            if let Some(stripped) = asset_name.strip_suffix(".exe") {
+                let renamed = format!("{}_{}.exe", stripped, tag.trim_start_matches(['v', 'V']));
+                asset_name = renamed;
+            }
+            // 大小不可靠（资产是旧版本产物），置 0 让前端以未知大小处理
+            size = 0;
+            log::warn!(
+                "release {tag} 资产版本低于 tag 版本，已回填资产名: {asset_name}（size 置 0）"
+            );
+        }
+    }
 
     // 仅在 2.x.x 系列内自更新（best 已过滤大版本，此处双保险）
     let has_update = cmp_version(latest, current) == std::cmp::Ordering::Greater;
@@ -286,9 +359,16 @@ pub fn update_download(
         return Err("目标版本不大于当前版本，无需更新".to_string());
     }
 
+    // 防御：资产名只允许纯文件名（禁止路径分隔符/父目录分量，防 join 逃逸临时目录）
+    if asset_name.contains(['/', '\\']) || asset_name == ".." || asset_name.contains("..") {
+        return Err(format!("非法的资产文件名: {asset_name}"));
+    }
+
     // 下载目录：%TEMP%\trae-work-assistant-update\
-    let dir = std::env::temp_dir().join("trae-work-assistant-update");
+    let dir = std::env::temp_dir().join(UPDATE_TEMP_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+    // 顺手清理过期残留（更新中断遗留的不完整安装包，7 天以上才删）
+    cleanup_temp_dir();
     let dest = dir.join(&asset_name);
     // 清理同名旧文件（可能是不完整下载）
     let _ = std::fs::remove_file(&dest);
@@ -304,6 +384,17 @@ pub fn update_download(
     }) {
         match download_via(&app, &agent, &download_url, &dest) {
             Ok(received) => {
+                // 完整性校验：计算 SHA-256 摘要并记录，安装时二次校验
+                let sha = file_sha256(&dest).map_err(|e| {
+                    let _ = std::fs::remove_file(&dest);
+                    e
+                })?;
+                if let Ok(mut last) = LAST_DOWNLOAD.lock() {
+                    *last = Some(DownloadedUpdate {
+                        file_path: dest.to_string_lossy().to_string(),
+                        sha256_hex: sha,
+                    });
+                }
                 let _ = app.emit(
                     "update-download-progress",
                     DownloadProgress {
@@ -387,11 +478,40 @@ fn download_via(
 /// 启动更新安装器并退出应用。
 /// 安装器以被动模式运行（/P：仅显示进度条、不弹任何询问），/UPDATE 覆盖安装不卸载，
 /// /R 安装成功后自动重启应用（见 NSIS 模板 .onInstSuccess）。
+/// 安全约束：path 必须指向下载临时目录内的文件，且摘要与最近一次下载记录一致
+/// （防止 webview 被注入后借本命令执行任意路径的程序）。
 #[tauri::command]
 pub fn update_run_installer(app: AppHandle, path: String) -> Result<(), String> {
-    if !std::path::Path::new(&path).is_file() {
+    let p = std::path::Path::new(&path);
+    if !p.is_file() {
         return Err(format!("更新包不存在，请重新下载：{path}"));
     }
+    // 路径绑定：必须是本应用的下载临时目录
+    let allowed_dir = std::env::temp_dir().join(UPDATE_TEMP_DIR);
+    let parent_ok = p
+        .parent()
+        .map(|d| d == allowed_dir)
+        .unwrap_or(false);
+    if !parent_ok {
+        return Err("更新包位置异常（不在下载临时目录内），已拒绝安装".to_string());
+    }
+    // 完整性绑定：与最近一次下载的 SHA-256 比对，防下载后被替换
+    {
+        let last = LAST_DOWNLOAD
+            .lock()
+            .map_err(|_| "内部状态异常，请重启应用后重试".to_string())?;
+        let Some(rec) = last.as_ref() else {
+            return Err("未找到本次会话的下载记录，请先在「检查更新」中下载更新包".to_string());
+        };
+        if rec.file_path != path {
+            return Err("更新包与最近下载记录不一致，请重新下载".to_string());
+        }
+        let now_sha = file_sha256(p)?;
+        if now_sha != rec.sha256_hex {
+            return Err("更新包校验失败（内容与下载时不一致），已拒绝安装".to_string());
+        }
+    }
+
     std::process::Command::new(&path)
         .args(["/P", "/UPDATE", "/R"])
         .spawn()

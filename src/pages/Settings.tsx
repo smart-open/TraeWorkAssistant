@@ -184,7 +184,14 @@ export default function Settings() {
             <div>
               <label className="label">主题</label>
               <select
-                value={form.theme}
+                /* 旧值归一化命中有效 option（light→graphite、dark/未知脏值→charcoal），避免 select 显示为空 */
+                value={
+                  form.theme === 'system' || THEMES.some((t) => t.id === form.theme)
+                    ? form.theme
+                    : form.theme === 'light'
+                      ? 'graphite'
+                      : 'charcoal'
+                }
                 onChange={(e) => update('theme', e.target.value)}
                 className="input"
               >

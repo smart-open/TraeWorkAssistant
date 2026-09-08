@@ -273,7 +273,8 @@ fn pool_uid_set(accounts: &crate::models::AccountsFile) -> std::collections::Has
 /// 证据链（按目录逐个尝试，首个有结果的目录生效）：
 /// 1. 会话日志 `&uid=` → 当前登录（置信）；
 /// 2. state.vscdb 历史痕迹 + storage.json `icube_gtm.users` → 历史候选（多个时不置信）。
-#[tauri::command]
+/// 文件扫描命令（vscdb 可达数十 MB），标记 async 交由异步线程池派发，避免阻塞主线程。
+#[tauri::command(async)]
 pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> {
     let accounts: crate::models::AccountsFile =
         fs_utils::read_json(&state.path("checkin_accounts.json"));

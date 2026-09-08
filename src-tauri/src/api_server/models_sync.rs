@@ -10,12 +10,19 @@
 //!   solo_agent 重试一次；成功后将 model→function 覆盖自学习持久化
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::fs_utils;
 use crate::models::{AccountsFile, DeviceMap};
+
+/// api_models.json 读改写互斥：
+/// learn_function_override（请求成功时自学习）与 fetch_official（官网同步）
+/// 都是「读 → 改 → 写」，并发时后写会覆盖先写；write_json 的临时文件 + rename
+/// 只保证单次写入原子性，需额外串行化整个读改写周期
+static MODELS_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// 客户端内置模型专用的上游 function（4001 自学习重试目标）
 pub const SOLO_AGENT_FUNCTION: &str = "solo_agent";
@@ -110,6 +117,7 @@ pub fn function_override(data_dir: &Path, model_lower: &str) -> Option<String> {
 pub fn learn_function_override(data_dir: &Path, model: &str, function: &str) {
     let model_lower = model.to_lowercase();
     let path = data_dir.join("api_models.json");
+    let _guard = MODELS_FILE_LOCK.lock();
     let mut list: Vec<ModelOption> = fs_utils::read_json(&path);
     match list.iter_mut().find(|m| m.id.to_lowercase() == model_lower) {
         Some(m) => {
@@ -225,10 +233,6 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
 
 /// 重放 batch_get_detail_param 拉取官网最新模型列表并落盘（双源合并）
 pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
-    // 防止 ureq 走系统代理（同 api_server_start 的处理）
-    std::env::set_var("NO_PROXY", "*");
-    std::env::set_var("no_proxy", "*");
-
     // 取第一个可用账号（最多尝试 3 个）
     let accounts: AccountsFile = fs_utils::read_json(&data_dir.join("checkin_accounts.json"));
     let device_map: DeviceMap = fs_utils::read_json(&data_dir.join("device_map.json"));
@@ -279,7 +283,15 @@ pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
                     break;
                 }
                 Ok(_) => last_err = "官网返回模型列表为空".into(),
-                Err(e) => last_err = e,
+                Err(e) => {
+                    // HTTP 成功但解析失败：响应结构可能已变更，记录响应片段便于排查
+                    let preview: String = text.chars().take(300).collect();
+                    fs_utils::app_log(
+                        data_dir,
+                        &format!("batch_get_detail_param 解析失败: {e}；响应片段: {preview}"),
+                    );
+                    last_err = e;
+                }
             },
             Err(e) => last_err = e,
         }
@@ -322,8 +334,27 @@ pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
         }
     }
 
-    let list = normalize_order(list);
-    fs_utils::write_json(&data_dir.join("api_models.json"), &list)?;
+    let mut list = normalize_order(list);
+    // 落盘前合并本地 function 覆盖（自学习结果），避免同步整体覆盖丢失
+    {
+        let _guard = MODELS_FILE_LOCK.lock();
+        let existing: Vec<ModelOption> = fs_utils::read_json(&data_dir.join("api_models.json"));
+        for m in list.iter_mut() {
+            if m.function.is_some() {
+                continue;
+            }
+            if let Some(old) = existing
+                .iter()
+                .find(|o| o.id.eq_ignore_ascii_case(&m.id))
+                .cloned()
+            {
+                if old.function.is_some() {
+                    m.function = old.function;
+                }
+            }
+        }
+        fs_utils::write_json(&data_dir.join("api_models.json"), &list)?;
+    }
     fs_utils::app_log(
         data_dir,
         &format!("官网模型列表同步成功: {} 个模型", list.len()),

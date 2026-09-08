@@ -76,14 +76,33 @@ impl ErrKind {
 }
 
 /// 4001/model config is empty：模型在当前 function 下不可用（模型问题非账号问题）
-/// 判定依据：SOLO 业务错误码 4001 或上游 message 关键字
+/// 判定依据：SOLO 业务错误码 4001 或上游 message 关键字。
+/// 注意边界：`"code":4001` 后必须紧跟非数字字符，避免误匹配 40012 等其它错误码
 pub fn is_model_config_mismatch(text: &str) -> bool {
     let lower = text.to_lowercase();
-    lower.contains("model config is empty")
-        || lower.contains("\"code\":4001")
-        || lower.contains("\"code\": 4001")
-        || lower.contains("\"error_code\":4001")
-        || lower.contains("\"error_code\": 4001")
+    if lower.contains("model config is empty") {
+        return true;
+    }
+    let is_code_4001 = |key: &str| {
+        let bytes = lower.as_bytes();
+        let key_bytes = key.as_bytes();
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(key) {
+            let after = from + pos + key_bytes.len();
+            let ok = bytes
+                .get(after)
+                .map_or(true, |b| !(b.is_ascii_digit() || *b == b'.'));
+            if ok {
+                return true;
+            }
+            from = after;
+        }
+        false
+    };
+    is_code_4001("\"code\":4001")
+        || is_code_4001("\"code\": 4001")
+        || is_code_4001("\"error_code\":4001")
+        || is_code_4001("\"error_code\": 4001")
 }
 
 /// 按 HTTP 状态码 + body 判定错误类别
@@ -135,7 +154,7 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
 }
 
 /// 流式上游 Agent：无总超时，仅 response_header_timeout 120s，用于 SSE 流式对话
-/// 注意：调用方（api_server_start）已设置 NO_PROXY=* 环境变量，
+/// 注意：代理排除依赖 api_server_start 启动时写入的 NO_PROXY=* 环境变量，
 /// 防止 ureq 走系统代理（127.0.0.1:8899）形成循环
 pub fn streaming_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()

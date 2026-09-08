@@ -226,7 +226,10 @@ pub fn accounts_import(state: State<AppState>, content: String) -> Result<Import
         }
         groups.groups.push(Group {
             id: id.clone(),
-            name: pick_str(g, &["name"]).unwrap_or_else(|| format!("分组 {}", &id[..4.min(id.len())])),
+            name: pick_str(g, &["name"]).unwrap_or_else(|| {
+                let head: String = id.chars().take(4).collect();
+                format!("分组 {head}")
+            }),
             color: pick_str(g, &["color"]).unwrap_or_else(|| "#6366f1".into()),
             order: g.get("order").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
         });
@@ -270,7 +273,8 @@ pub fn accounts_import(state: State<AppState>, content: String) -> Result<Import
         known.insert(uid.clone());
 
         let name = pick_str(entry, &["name"]).unwrap_or_else(|| {
-            let tail = &uid[uid.len().saturating_sub(4)..];
+            let skip = uid.chars().count().saturating_sub(4);
+            let tail: String = uid.chars().skip(skip).collect();
             format!("导入-…{tail}")
         });
         // 分组映射：仅当目标分组存在（原有或本次导入）才记录
@@ -692,7 +696,8 @@ fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
 
 /// 获取单账号积分明细（悬浮展示用）：
 /// 仅返回剩余 > 0 且未过期的积分包，按过期时间升序。
-#[tauri::command]
+/// 网络请求命令，标记 async 交由异步线程池派发，避免阻塞主线程。
+#[tauri::command(async)]
 pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<CreditDetail, String> {
     let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
     let account = accounts
@@ -894,7 +899,14 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
 /// - earned = 签到获得积分（credits_history.json delta 之和）+ 购买获得积分（API 查询 charge_amount > 0）
 /// - consumed = |total - earned - 昨日total|（取绝对值）
 fn record_daily_snapshot(state: &State<AppState>, rc: &RemainingCreditsFile, non_checkin_earned: f64) {
-    let today = fs_utils::today_prefix(); // "YYYY-MM-DD"
+    // 日期口径统一为固定 UTC+8：与 calc_remaining_credits 的"今日"判定、
+    // 签到脚本写入 credits_history.json 的本地日期（目标用户均为北京时间）保持一致。
+    // chrono::Local 在部分 Windows 环境下会误判时区（回退 UTC），导致快照日期
+    // 与签到记录 / 非签到积分的日期归属错位，earned 出现多计或漏计。
+    let today = {
+        let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        chrono::Utc::now().with_timezone(&cst).format("%Y-%m-%d").to_string()
+    };
     let total: f64 = rc.credits.values().sum();
     let total = (total * 100.0).round() / 100.0;
 

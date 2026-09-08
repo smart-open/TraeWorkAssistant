@@ -83,21 +83,3 @@ pub fn graceful_kill_images(images: &[&str]) -> Result<(), String> {
         "进程 {still} 未能自动关闭（优雅关闭与强制结束均失败），请手动关闭后重试"
     ))
 }
-
-/// 按应用类别返回候选映像名（与 env.rs 的安装探测保持一致）。
-pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
-    match app_kind {
-        // Trae Work（SOLO CN）及其历史版本名
-        "TraeWork" => vec!["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"],
-        _ => vec![],
-    }
-}
-
-/// 便捷入口：按应用类别三级关闭
-pub fn graceful_kill_app(app_kind: &str) -> Result<(), String> {
-    let images = images_for_app(app_kind);
-    if images.is_empty() {
-        return Err(format!("未知的应用类别: {app_kind}"));
-    }
-    graceful_kill_images(&images)
-}

@@ -262,7 +262,14 @@ Function PageReinstall
   ; 检测到已有安装时直接覆盖安装（保留用户数据与配置；
   ; WiX 迁移场景仍走先卸载流程）。逻辑与被动模式（/P）一致。
   ; 模板基于 tauri-cli v2.11.4 官方 installer.nsi，升级 CLI 时需同步维护。
-  Call PageLeaveReinstall
+  ;
+  ; 非 WiX 场景：create 阶段 Abort 跳过整页（不会触发 leave 回调），
+  ; 版本决策推迟到 PageLeaveReinstall 内集中处理。
+  ${If} $WixMode = 1
+    Call PageLeaveReinstall
+  ${Else}
+    Abort
+  ${EndIf}
 FunctionEnd
 Function PageReinstallUpdateSelection
   ${NSD_GetState} $R2 $R1
@@ -273,7 +280,12 @@ Function PageReinstallUpdateSelection
   ${EndIf}
 FunctionEnd
 Function PageLeaveReinstall
-  ${NSD_GetState} $R2 $R1
+  ; 项目定制：不再读取询问页单选状态（页面已跳过），
+  ; 按版本比较结果集中决策：
+  ;   WiX 迁移  => 先卸载旧版（官方行为）
+  ;   更新模式  => 直接覆盖
+  ;   同版本/升级 => 直接覆盖安装（保留用户数据与配置）
+  ;   降级且未允许 => 拦截（与静默模式 EarlyChecks 行为一致）
 
   ; If migrating from Wix, always uninstall
   ${If} $WixMode = 1
@@ -286,27 +298,19 @@ Function PageLeaveReinstall
   ${EndIf}
 
   ; $R0 holds whether same(0)/upgrading(1)/downgrading(-1) version
-  ; $R1 holds the radio buttons state:
-  ;   1 => first choice was selected
-  ;   0 => second choice was selected
-  ${If} $R0 = 0 ; Same version, proceed
-    ${If} $R1 = 1              ; User chose to add/reinstall
-      Goto reinst_done
-    ${Else}                    ; User chose to uninstall
-      Goto reinst_uninstall
-    ${EndIf}
-  ${ElseIf} $R0 = 1 ; Upgrading
-    ${If} $R1 = 1              ; User chose to uninstall
-      Goto reinst_uninstall
-    ${Else}
-      Goto reinst_done         ; User chose NOT to uninstall
-    ${EndIf}
+  ${If} $R0 = 0 ; Same version, proceed (overwrite, keep user data)
+    Goto reinst_done
+  ${ElseIf} $R0 = 1 ; Upgrading, proceed (overwrite, keep user data)
+    Goto reinst_done
   ${ElseIf} $R0 = -1 ; Downgrading
-    ${If} $R1 = 1              ; User chose to uninstall
-      Goto reinst_uninstall
-    ${Else}
-      Goto reinst_done         ; User chose NOT to uninstall
-    ${EndIf}
+    !if "${ALLOWDOWNGRADES}" != "true"
+      ; 与 EarlyChecks 静默拦截对齐：非白名单场景禁止降级覆盖，
+      ; 避免 DisplayVersion 回写旧版本后更新器反复推送
+      MessageBox MB_ICONEXCLAMATION "$(newerVersionInstalled)"
+      Abort
+    !else
+      Goto reinst_done
+    !endif
   ${EndIf}
 
   reinst_uninstall:
@@ -844,6 +848,9 @@ Section Uninstall
     DeleteRegKey /ifempty HKCU "${MANUKEY}"
 
     SetShellVarContext current
+    ; 应用真实数据目录（state.rs：appdata.join("TraeWorkAssistant")，含 conf/data/logs 与登录态）
+    RmDir /r "$APPDATA\TraeWorkAssistant"
+    ; Tauri 框架默认 identifier 目录（WebView 缓存等）
     RmDir /r "$APPDATA\${BUNDLEID}"
     RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
   ${EndIf}

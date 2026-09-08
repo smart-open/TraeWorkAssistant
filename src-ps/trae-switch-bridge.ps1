@@ -281,7 +281,9 @@ function Stop-Trae {
             if (-not $still) { break }
         }
         if ($waited -ge 3) {
-            Write-Step -Stage 'stop' -Message "进程未在 $waited 秒内退出，可能仍有文件锁，请手动关闭后重试" -Status 'error'
+            # 进程未退出 → 文件锁大概率未释放，后续 Backup/Restore 必然读到半写状态。
+            # throw 让主流程 catch 捕获并 exit 1，上层 switch 命令据此判定失败（而非静默成功）。
+            throw "Trae Work 进程未在 $waited 秒内退出，可能仍有文件锁，请手动关闭后重试"
         }
     } else {
         Write-Step -Stage 'stop' -Message 'Trae Work 未运行' -Status 'skip'

@@ -25,6 +25,7 @@ tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "macros"] }
 tokio-stream = "0.1"
 bytes = "1"
 sha2 = "0.10"
+log = "0.4"
 
 [features]
 # 仅桌面端

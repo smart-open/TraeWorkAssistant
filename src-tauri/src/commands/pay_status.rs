@@ -50,12 +50,21 @@ fn query_pay_status(jwt: &str) -> Result<PayStatusEntry, String> {
         .map_err(|e| format!("API 请求失败: {}", e))?;
     let body: serde_json::Value =
         resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+    // 严格化：仅接受响应中明确携带的套餐字段。鉴权失效 / 限流等错误响应
+    // 不含 user_pay_identity 字段，若兜底为 "Free" 会把有效缓存覆盖成错误值。
+    let Some(identity_str) = body
+        .get("user_pay_identity_str")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    else {
+        return Err(format!(
+            "响应缺少 user_pay_identity_str（code={:?} msg={:?}）",
+            body.get("code").and_then(|v| v.as_i64()),
+            body.get("msg").or_else(|| body.get("message")).and_then(|v| v.as_str())
+        ));
+    };
     Ok(PayStatusEntry {
-        identity_str: body
-            .get("user_pay_identity_str")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Free")
-            .to_string(),
+        identity_str,
         identity: body
             .get("user_pay_identity")
             .and_then(|v| v.as_i64())
@@ -73,8 +82,8 @@ fn query_pay_status(jwt: &str) -> Result<PayStatusEntry, String> {
 }
 
 /// 刷新所有账号的套餐身份（批量调用 ide_user_pay_status，写入 pay_status.json 缓存）。
-/// 返回成功数量。
-#[tauri::command]
+/// 返回成功数量。网络请求命令，标记 async 交由异步线程池派发，避免阻塞主线程。
+#[tauri::command(async)]
 pub fn refresh_pay_status(state: State<AppState>) -> Result<usize, String> {
     let accounts: crate::models::AccountsFile =
         fs_utils::read_json(&state.path("checkin_accounts.json"));

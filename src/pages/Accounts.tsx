@@ -147,7 +147,11 @@ function CreditCell({ account }: { account: AccountView }) {
     api.accounts
       .creditDetail(account.user_id)
       .then(setDetail)
-      .catch(() => setDetail(null))
+      .catch(() => {
+        setDetail(null);
+        // 失败时允许下次悬停重试（否则 fetchedRef 锁死后永远显示"加载失败"）
+        fetchedRef.current = false;
+      })
       .finally(() => setLoading(false));
   };
 
@@ -715,6 +719,53 @@ function GroupSelect({
   );
 }
 
+/** 扫描结果单行：入池请求进行中禁用按钮并显示加载态，防止重复提交 */
+function DiscoveredRow({
+  d,
+  onAdd,
+}: {
+  d: DiscoveredAccount;
+  onAdd: (d: DiscoveredAccount) => Promise<void>;
+}) {
+  const [adding, setAdding] = useState(false);
+  const add = async () => {
+    if (adding) return;
+    setAdding(true);
+    try {
+      await onAdd(d);
+    } finally {
+      setAdding(false);
+    }
+  };
+  return (
+    <div className="flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-2 dark:border-zinc-700">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <span className="font-mono">{d.user_id}</span>
+          <Badge tone="slate">{d.app_label}</Badge>
+          {d.in_pool && <Badge tone="green">已在账号池</Badge>}
+          {!d.uid_confident && !d.in_pool && (
+            <Badge tone="amber">uid 待确认</Badge>
+          )}
+        </div>
+        <div className="truncate text-xs text-slate-400" title={d.storage_path}>
+          {d.storage_path || '未找到 storage.json'}
+        </div>
+      </div>
+      {!d.in_pool && (
+        <button
+          className="btn-primary shrink-0 !px-3 !py-1 text-xs"
+          disabled={!d.uid_confident || adding}
+          title={d.uid_confident ? '加入账号池（待代理捕获 JWT 后自动回填）' : '本机存在多个候选账号，无法确认唯一 uid，暂不可入池'}
+          onClick={() => void add()}
+        >
+          <Plus size={13} /> {adding ? '入池中…' : '入池'}
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** 扫描本机账号结果弹窗（当前仅支持 Trae Work 单应用） */
 function ScanModal({
   open,
@@ -746,34 +797,7 @@ function ScanModal({
         ) : (
           <div className="space-y-2">
             {discovered.map((d) => (
-              <div
-                key={d.user_id}
-                className="flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-2 dark:border-zinc-700"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    <span className="font-mono">{d.user_id}</span>
-                    <Badge tone="slate">{d.app_label}</Badge>
-                    {d.in_pool && <Badge tone="green">已在账号池</Badge>}
-                    {!d.uid_confident && !d.in_pool && (
-                      <Badge tone="amber">uid 待确认</Badge>
-                    )}
-                  </div>
-                  <div className="truncate text-xs text-slate-400" title={d.storage_path}>
-                    {d.storage_path || '未找到 storage.json'}
-                  </div>
-                </div>
-                {!d.in_pool && (
-                  <button
-                    className="btn-primary shrink-0 !px-3 !py-1 text-xs"
-                    disabled={!d.uid_confident}
-                    title={d.uid_confident ? '加入账号池（待代理捕获 JWT 后自动回填）' : '本机存在多个候选账号，无法确认唯一 uid，暂不可入池'}
-                    onClick={() => void onAdd(d)}
-                  >
-                    <Plus size={13} /> 入池
-                  </button>
-                )}
-              </div>
+              <DiscoveredRow key={d.user_id} d={d} onAdd={onAdd} />
             ))}
           </div>
         )}

@@ -93,6 +93,7 @@ export function Modal({
   children,
   footer,
   size,
+  locked = false,
 }: {
   open: boolean;
   onClose: () => void;
@@ -100,11 +101,13 @@ export function Modal({
   children: ReactNode;
   footer?: ReactNode;
   size?: 'lg' | 'xl';
+  /** 锁定时忽略 Escape / 背景点击关闭，右上角关闭按钮禁用（用于下载/安装等不可中断流程） */
+  locked?: boolean;
 }) {
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape' && !locked) onClose();
     };
     document.addEventListener('keydown', onKey);
     document.body.style.overflow = 'hidden';
@@ -112,16 +115,16 @@ export function Modal({
       document.removeEventListener('keydown', onKey);
       document.body.style.overflow = '';
     };
-  }, [open, onClose]);
+  }, [open, locked, onClose]);
 
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={locked ? undefined : onClose} />
       <div className={`card relative z-10 w-full ${size === 'xl' ? 'max-w-4xl' : size === 'lg' ? 'max-w-2xl' : 'max-w-lg'} animate-fade-in p-5 shadow-xl`} role="dialog" aria-modal="true">
         <div className="mb-3 flex items-center justify-between">
           <h3 className="text-base font-semibold text-slate-800 dark:text-zinc-100">{title}</h3>
-          <button className="btn-ghost h-8 w-8 !p-0" onClick={onClose} aria-label="关闭">
+          <button className="btn-ghost h-8 w-8 !p-0" onClick={onClose} disabled={locked} aria-label="关闭">
             <X size={16} />
           </button>
         </div>

@@ -224,6 +224,12 @@ pub fn stream_convert<R: Read + Send>(
                         let data = write_chunk(Value::Object(delta), "", &pending_usage);
                         let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
                         sent_any = true;
+                    } else if !sent_any {
+                        // 空 delta 的首个 output：上游已开始产出，
+                        // 发出仅含 role 的空 chunk 占位，让 sent_any 语义与真实下发一致
+                        let data = write_chunk(json!({ "role": "assistant" }), "", &pending_usage);
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        sent_any = true;
                     }
                 }
                 "token_usage" => {
@@ -640,7 +646,9 @@ pub fn stream_convert_anthropic<R: Read + Send>(
         }
     }
 
-    let sent_any = message_started || !tools.is_empty();
+    // sent_any 仅统计真实发出过的事件：
+    // tools 只是聚合缓冲（input 尚未发送），不能视为已向客户端输出
+    let sent_any = message_started;
     (error_info.map(|(code, msg)| (code, msg)), sent_any)
 }
 

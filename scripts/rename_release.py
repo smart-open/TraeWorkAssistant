@@ -51,15 +51,25 @@ def main():
          os.path.join(out_dir, f"{product}_{version}_x64_zh-CN.msi")),
     ]
     moved = 0
+    missing = []
     for src, dst in jobs:
         if os.path.isfile(src):
             shutil.copy2(src, dst)
             print("OK:", dst)
             moved += 1
         else:
+            missing.append(src)
             print("SKIP（不存在）:", src, file=sys.stderr)
-    if moved == 0:
-        print("未找到任何安装包产物，请先执行 npm run tauri build", file=sys.stderr)
+    # 严格退出码：bundle.targets 同时声明 msi + nsis，产物必须齐全。
+    # 部分缺失（只迁一个）说明构建不完整，发布脚本必须失败而非静默通过。
+    if moved < len(jobs):
+        print(
+            f"安装包产物不完整：仅找到 {moved}/{len(jobs)} 个，缺失：",
+            file=sys.stderr,
+        )
+        for src in missing:
+            print("  ", src, file=sys.stderr)
+        print("请先完整执行 npm run tauri build", file=sys.stderr)
         sys.exit(1)
 
 

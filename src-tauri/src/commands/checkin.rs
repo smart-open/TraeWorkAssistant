@@ -94,12 +94,23 @@ pub fn checkin_start(
         });
     }
     let accounts_arg = uids.join(",");
+    // 过滤后为空（全部已签/过期/冷却中）时不启动脚本：
+    // 脚本在无 --accounts 参数时会回退为签全部账号，会绕过跳过规则并造成重复签到风险。
+    // 直接向前端 emit 空轮次事件，UI 显示 0/0/0 的完成态。
+    if uids.is_empty() {
+        crate::fs_utils::app_log(&state.data_dir, "签到未启动: 过滤后无候选账号（全部已签/过期/冷却中）");
+        let app3 = app.clone();
+        std::thread::spawn(move || {
+            let _ = app3.emit("checkin-progress", serde_json::json!({ "type": "start", "total": 0 }));
+            let _ = app3.emit("checkin-progress", serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0 }));
+            let _ = app3.emit("checkin-done", serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0 }));
+        });
+        return Ok(());
+    }
     let retry = state.settings().retry.max(0) as u32;
     let mut args = vec!["--json-stream".to_string()];
-    if !accounts_arg.is_empty() {
-        args.push("--accounts".to_string());
-        args.push(accounts_arg);
-    }
+    args.push("--accounts".to_string());
+    args.push(accounts_arg);
     if retry > 0 {
         args.push("--retry".to_string());
         args.push(retry.to_string());
