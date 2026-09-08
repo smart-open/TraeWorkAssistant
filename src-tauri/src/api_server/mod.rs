@@ -29,6 +29,8 @@ pub struct ApiSharedState {
     pub pool: ApiPool,
     pub api_key: String,
     pub default_model: String,
+    /// 数据目录（%APPDATA%\AIWorkAssistant），供 /v1/models 读取 api_models.json
+    pub data_dir: std::path::PathBuf,
     pub total_requests: AtomicU64,
     pub active_uid: Mutex<Option<String>>,
     pub last_error: Mutex<Option<String>>,
@@ -92,7 +94,14 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
 pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     let msg_lower = msg.to_lowercase();
     // 1005: Plan 套餐额度用尽 → 12 小时冷却
-    if code == 1005 || msg_lower.contains("plan") {
+    // 注意：不能宽泛匹配 "plan"（如 "planned maintenance" 会误判导致 12h 冷却），
+    // 仅精确匹配 code 或计划额度相关短语
+    if code == 1005
+        || msg_lower.contains("plan limit")
+        || msg_lower.contains("plan_limit")
+        || msg_lower.contains("额度用尽")
+        || msg_lower.contains("套餐额度")
+    {
         return ErrKind::PlanLimit;
     }
     // 4001: 模型配置不存在（model config is empty）→ 不冷却账号，是模型问题非账号问题
@@ -117,14 +126,14 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     }
 }
 
-/// 流式上游 Agent：无总超时，仅 response_header_timeout 120s，用于 SSE 流式对话
-/// 注意：调用方（api_server_start）已设置 NO_PROXY=* 环境变量，
-/// 防止 ureq 走系统代理（127.0.0.1:8899）形成循环
+/// 流式上游 Agent：无整体超时，读超时 300s（防上游挂起导致线程与请求永久阻塞，
+/// 同时容忍推理模型的长间隔 token），用于 SSE 流式对话。
+/// 代理说明：项目未启用 ureq 的 proxy-from-env feature，Agent 默认直连，
+/// 不读环境变量/系统代理，不会被本地 MITM 代理（127.0.0.1:8899）拦截形成循环
 pub fn streaming_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        // 不设置 timeout_read，ureq 默认无读超时（SSE 流式需要）
-        // 注意：timeout_read(Duration::from_secs(0)) 会触发 Rust std 的
-        // "cannot set a 0 duration timeout" 错误，不能使用
+        // 读超时 300s：SSE 正常 token 间隔远小于此；上游完全挂起时 5 分钟内释放线程
+        .timeout_read(std::time::Duration::from_secs(300))
         .timeout_write(std::time::Duration::from_secs(30)) // 写超时 30s
         .timeout_connect(std::time::Duration::from_secs(10)) // 连接超时 10s
         .max_idle_connections(20)

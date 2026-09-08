@@ -4,6 +4,35 @@
 
 ---
 
+## [3.2.6] - 2026-09-08
+
+### 修复
+
+- **官网模型同步必然失败**：`fetch_official` 误从数据根目录读取 `checkin_accounts.json` / `device_map.json`（实际位于 `data/` 子目录），导致恒报「没有可用账号（缺少 JWT）」；同时 `api_models.json` 统一移至 `data/` 子目录（与 `AppState::path()` 路由一致），旧位置自动兼容迁移。
+- **`/v1/models` 与应用配置不一致**：原返回硬编码静态列表（缺 glm-5.3-flash / qwen3.8-flash / Doubao-Seed-Code 三个内置模型），改为与 `api_models.json` 同源——官网同步后无需重启 API 服务即可通过 `/v1/models` 看到最新列表。
+- **上游中文错误响应可致 panic**：日志预览 `safe_slice` 按字节截断，第 200 字节落在 UTF-8 多字节字符中间（中文错误 JSON 常见）即 panic——流式客户端收到截断空流、非流式返回 500。改为按字符边界截断，账号 uid 摘要同步安全化。
+- **环境检测 / 打开 Trae 应用期间 UI 卡顿**：`env_check`（注册表全量搜索可达数秒 + PowerShell 取版本）、`open_trae_app`（代理注入时进程优雅关闭最长 5s 轮询）、`task_*`（schtasks 子进程调用）均为同步命令在主线程执行，全部改 `#[tauri::command(async)]` 派发线程池（与 3.2.5 updater 冻结修复同因）。
+- **OpenAI 端点对无效 JSON 请求返回 502**：原 `unwrap_or(json!({}))` 后仍转发原始 body 到上游；现校验失败直接返回 400 `invalid_request_error`（与 `/v1/messages` 行为对齐）。
+- **错误分类误冷却**：`classify_solo_error` 宽泛匹配 `contains("plan")`，"planned maintenance" 等消息会被误判 PlanLimit 导致账号冷却 12 小时；收紧为 code 1005 / `plan limit` / `额度用尽` / `套餐额度` 精确匹配。
+- **流式上游 Agent 无读超时**：连接建立后若上游不发数据，请求与线程永久挂起；增加 300s 读超时（正常 SSE token 间隔远小于此），并修正与实现不符的 `response_header_timeout` 注释。
+- **`read_text_file` 无大小限制**：增加 10MB 上限与常规文件校验，防误选超大文件拖垮前端。
+- `models.rs` 两处 GBK 乱码注释修复。
+
+### 变更
+
+- 移除进程级 `NO_PROXY` 环境变量设置：项目未启用 ureq 的 `proxy-from-env` feature，Agent 默认直连不读代理环境变量，原设置本就无效（删除无行为变化）；updater「直连」通道语义同步澄清。
+- **品牌迁移健壮性增强**：目录复制失败时回滚半成品（避免下次启动误判「已迁移」导致文件缺失）；WebView2 用户数据目录迁移排除 Cache / GPUCache / Crashpad 等 8 类缓存子目录（体积可达 GB 级且常被运行中的老应用锁定，新版本首启自动重建）；数据已迁移后静默跳过，不再每次启动输出提示。
+
+### 安装器
+
+- **不再静默卸载老品牌「Trae Work 助手」**：原 NSIS 安装钩子在安装/升级时会执行老品牌卸载器并清理其安装目录、注册表卸载键与快捷方式（且强杀老品牌进程）；现全部移除——两版并存、互不干扰，用户数据目录复制迁移逻辑不变（老版本数据原地保留）。
+
+### 文案
+
+- API 网关描述统一为「OpenAI / Anthropic 兼容接口」：API 服务页页头、关于页简介、README、用户手册。
+
+---
+
 ## [3.2.5] - 2026-09-08
 
 ### 新增

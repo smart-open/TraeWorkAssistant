@@ -35,36 +35,43 @@ pub fn migrate_legacy_dirs() -> Option<String> {
         let new_dir = PathBuf::from(&appdata).join(DATA_DIR_NAME);
         if legacy.is_dir() {
             if new_dir.is_dir() && dir_is_empty(&new_dir) == Some(false) {
-                notes.push(format!(
-                    "品牌迁移：新数据目录已存在且有数据，跳过迁移（老应用数据原地保留于 {}，两版并存）",
-                    legacy.display()
-                ));
+                // 已迁移过：跳过（老应用数据原地保留，两版并存）
             } else {
-                match copy_dir_recursive(&legacy, &new_dir) {
+                // 数据目录不排除任何子目录（完整迁移）；排除清单仅用于 WebView2 缓存
+                match copy_dir_recursive(&legacy, &new_dir, &[]) {
                     Ok(n) => notes.push(format!(
                         "品牌迁移：数据目录已由 {} 复制迁移至 {}（{n} 个文件；旧目录原地保留，老应用可继续使用）",
                         legacy.display(),
                         new_dir.display()
                     )),
-                    Err(e) => notes.push(format!(
-                        "品牌迁移：数据目录复制迁移失败（{e}），本次使用新目录，旧目录保留于 {}",
-                        legacy.display()
-                    )),
+                    Err(e) => {
+                        // 清理复制一半的半成品：避免下次启动误判「已迁移」而丢失部分文件
+                        let _ = std::fs::remove_dir_all(&new_dir);
+                        notes.push(format!(
+                            "品牌迁移：数据目录复制迁移失败（{e}），已回滚半成品，下次启动重试；旧目录保留于 {}",
+                            legacy.display()
+                        ))
+                    }
                 }
             }
         }
     }
 
     // 2) WebView2 用户数据目录迁移（identifier 变更所致；复制语义，失败不影响启动）
+    //    排除缓存类子目录（Cache/GPUCache 等）：体积可达 GB 级且常被运行中的老应用锁定，
+    //    跳过后由新版本首次运行时自动重建，界面偏好等关键文件仍完整迁移
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         let legacy = PathBuf::from(&local).join(LEGACY_IDENTIFIER);
         let new_dir = PathBuf::from(&local).join(IDENTIFIER);
         if legacy.is_dir() && dir_is_empty(&new_dir) != Some(false) {
-            match copy_dir_recursive(&legacy, &new_dir) {
+            match copy_dir_recursive(&legacy, &new_dir, &WEBVIEW_CACHE_DIRS) {
                 Ok(_) => notes.push("品牌迁移：WebView2 界面偏好目录已复制迁移（旧目录保留）".to_string()),
-                Err(e) => notes.push(format!(
-                    "品牌迁移：WebView2 目录复制失败（{e}），界面偏好将重置（旧目录保留）"
-                )),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&new_dir);
+                    notes.push(format!(
+                        "品牌迁移：WebView2 目录复制失败（{e}），已回滚半成品，界面偏好将重置（旧目录保留）"
+                    ))
+                }
             }
         }
     }
@@ -73,9 +80,10 @@ pub fn migrate_legacy_dirs() -> Option<String> {
 }
 
 /// 递归复制目录（复制而非移动：源目录保持完整，老应用可继续使用）。
-/// 目标目录不存在则创建；同名文件直接覆盖（仅在首次迁移时发生）。
+/// 目标目录不存在则创建；同名文件直接覆盖（仅在首次迁移时发生）；
+/// 遇到 exclude_dirs 中的目录名则整目录跳过（用于排除 WebView2 缓存）。
 /// 返回复制的文件数。
-fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<usize, String> {
+fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf, exclude_dirs: &[&str]) -> Result<usize, String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("创建目录 {} 失败: {e}", dst.display()))?;
     let mut copied = 0usize;
     let entries = std::fs::read_dir(src).map_err(|e| format!("读取 {} 失败: {e}", src.display()))?;
@@ -87,7 +95,11 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<usize, String> {
             .file_type()
             .map_err(|e| format!("读取 {} 类型失败: {e}", sp.display()))?;
         if ft.is_dir() {
-            copied += copy_dir_recursive(&sp, &dp)?;
+            // 排除缓存类目录：体积大、常被锁定、可由应用自动重建
+            if exclude_dirs.contains(&entry.file_name().to_string_lossy().as_ref()) {
+                continue;
+            }
+            copied += copy_dir_recursive(&sp, &dp, exclude_dirs)?;
         } else if ft.is_file() {
             std::fs::copy(&sp, &dp)
                 .map_err(|e| format!("复制 {} 失败: {e}", sp.display()))?;
@@ -97,6 +109,18 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<usize, String> {
     }
     Ok(copied)
 }
+
+/// WebView2 用户数据目录中可跳过的缓存类子目录（迁移时排除，运行时自动重建）
+const WEBVIEW_CACHE_DIRS: [&str; 8] = [
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "DawnCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "ShaderCache",
+    "Crashpad",
+];
 
 /// 目录是否为空：None 表示读取失败
 fn dir_is_empty(dir: &PathBuf) -> Option<bool> {

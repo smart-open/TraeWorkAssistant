@@ -13,7 +13,10 @@ pub struct EnvStatus {
     pub path: Option<String>,
 }
 
-#[tauri::command]
+// 以下命令含耗时操作（注册表全量搜索、PowerShell 进程调用、最多 5s 的进程关闭轮询），
+// 一律标记 async 派发到线程池执行，避免阻塞 UI 主线程（与 updater 冻结修复同因）。
+
+#[tauri::command(async)]
 pub fn env_check(_app: AppHandle, state: State<AppState>) -> EnvStatus {
     let (installed, path, version) = detect_trae(state.settings().trae_path);
     let running = is_running();
@@ -38,7 +41,7 @@ pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
 /// 启动本地 Trae Work 客户端。
 /// 若传入 proxy_port（代理运行中），自动注入 `--proxy-server` 让 Trae 走本地代理，
 /// 无需用户在 Trae 设置里手动配置代理。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
     let (installed, path, _) = detect_trae(state.settings().trae_path);
     if !installed {
@@ -68,7 +71,7 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
 }
 
 /// 检测 Trae CN IDE（与 Trae Work/SOLO CN 是两个独立应用）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
     let (installed, path, version) = detect_trae_cn(state.settings().trae_cn_path.clone());
     let running = is_running_cn();
@@ -77,7 +80,7 @@ pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
 
 /// 打开 Trae CN IDE。与 Trae Work 同款代理注入：传入 proxy_port 时以 --proxy-server 启动，
 /// 让 Trae 的流量也走本地 MITM 代理（捕获账号/观察请求）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
     let (installed, path, _) = detect_trae_cn(state.settings().trae_cn_path.clone());
     if !installed {

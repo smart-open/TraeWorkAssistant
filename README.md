@@ -10,7 +10,7 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 </div>
 
-> 当前深度支持 **Trae Work 与 Trae（Trae CN IDE）双应用**（多账号签到、登录态切换、积分看板、OpenAI 兼容 API 网关、6 层设备标识重置等，两应用同一账号体系可分别切换）；后续规划扩展 **WorkBuddy / CodeBuddy / 豆包** 等更多 AI 应用的账号管理与自动化能力。
+> 当前深度支持 **Trae Work 与 Trae（Trae CN IDE）双应用**（多账号签到、登录态切换、积分看板、OpenAI / Anthropic 兼容 API 网关、6 层设备标识重置等，两应用同一账号体系可分别切换）；后续规划扩展 **WorkBuddy / CodeBuddy / 豆包** 等更多 AI 应用的账号管理与自动化能力。
 >
 > ⚠️ 本工具与 Trae Work / WorkBuddy / 豆包等官方均无任何关联，仅供学习研究。使用本工具可能违反相关服务条款，风险自担。请仅管理本人合法持有的账号。
 
@@ -40,7 +40,7 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 - **一键签到**：批量签到、按分组/手动勾选、跳过已签/过期、实时进度
 - **积分看板**：排行、三线趋势图（总数/获得/消耗）、今日新增统计
 - **本地代理**：MITM 代理自动捕获 JWT、注入独立设备 ID；**自动串联已有系统代理（VPN）作为上游**，开启代理后外网访问不受影响，停止时原样还原系统代理
-- **API 网关**：内嵌 OpenAI 兼容 API 服务，账号池智能调度（积分过期感知 + 冷却状态机）
+- **API 网关**：内嵌 OpenAI / Anthropic 兼容 API 服务，账号池智能调度（积分过期感知 + 冷却状态机）
 - **定时任务**：Windows 计划任务，后台自动签到
 - **6 层设备标识重置**：machineid / storage.json 遥测 / aha.device / 注册表 MachineGuid / webview 追踪数据 / aha TinyStorage
 - **快照管理**：查看/备份/恢复/删除账号登录态快照

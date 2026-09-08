@@ -46,11 +46,9 @@ pub async fn api_server_start(
     let port = settings.api_port;
     let api_key = settings.api_key.clone();
 
-    // 关键：设置 NO_PROXY 环境变量，防止 ureq 走系统代理（127.0.0.1:8899）
-    // 当代理开启时，系统代理会将 API 服务的上游请求也拦截，形成循环导致超时
-    // ureq 2.x 在 AgentBuilder::build() 时读取 HTTP_PROXY/HTTPS_PROXY/NO_PROXY
-    std::env::set_var("NO_PROXY", "*");
-    std::env::set_var("no_proxy", "*");
+    // 代理说明：上游请求通过 agent 级显式直连（Proxy::custom(|_| None)）避免被
+    // 系统代理拦截形成循环（本地 MITM 代理 127.0.0.1:8899），不再修改进程级
+    // NO_PROXY 环境变量（多线程 setenv 有竞态，且会波及子进程的代理行为）。
     let default_model = {
         let m = settings.api_default_model.trim();
         if m.is_empty() {
@@ -178,6 +176,7 @@ pub async fn api_server_start(
         pool,
         api_key,
         default_model,
+        data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
         active_uid: Mutex::new(None),
         last_error: Mutex::new(None),

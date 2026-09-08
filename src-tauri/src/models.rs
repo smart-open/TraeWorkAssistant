@@ -278,7 +278,7 @@ pub struct ApiPoolFile {
     pub enabled_uids: Vec<String>,
 }
 
-/// 池中单个账号的运行时状态（缁? /status 鍜屽墠绔�鐢�锛?
+/// 池中单个账号的运行时状态（给 /status 和前端使用）
 #[derive(Serialize, Clone)]
 pub struct PoolStatus {
     pub uid: String,
@@ -292,7 +292,7 @@ pub struct PoolStatus {
     pub err_count: i32,
 }
 
-/// API 服务整体状态（给前端用锛?
+/// API 服务整体状态（给前端用）
 #[derive(Serialize, Clone)]
 pub struct ApiServiceStatus {
     pub running: bool,

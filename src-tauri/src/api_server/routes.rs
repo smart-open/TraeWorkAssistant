@@ -124,11 +124,26 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     }))
 }
 
-pub async fn models() -> impl IntoResponse {
-    Json(json!({
-        "object": "list",
-        "data": static_models(),
-    }))
+pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
+    // 与应用配置同源：读取 api_models.json（缺失时写入默认列表），
+    // 官网同步后无需重启 API 服务即可通过 /v1/models 看到最新列表
+    let data_dir = state.data_dir.clone();
+    let list = tokio::task::spawn_blocking(move || super::models_sync::load_models(&data_dir))
+        .await
+        .unwrap_or_default();
+    let data: Vec<Value> = list
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "object": "model",
+                "created": 1753600000,
+                "owned_by": "trae-solo",
+                "context_length": 131072,
+            })
+        })
+        .collect();
+    Json(json!({ "object": "list", "data": data }))
 }
 
 pub async fn chat_completions(
@@ -148,7 +163,17 @@ pub async fn chat_completions(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let body_vec = body.to_vec();
-    let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
+    // 校验 JSON：无效请求体直接 400，不转发上游（与 /v1/messages 行为对齐）
+    let peek: Value = match serde_json::from_slice(&body_vec) {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("invalid JSON body: {}", e),
+            )
+        }
+    };
     let stream = peek.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let model = peek
         .get("model")
@@ -309,7 +334,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 let cd_str = if d.until > 0 { format!(",cd={}s", d.until.saturating_sub(now_ts() as i64)) } else { String::new() };
                 let exp_str = d.credits_expire_at.filter(|&e| e > 0).map(|e| format!(",exp={}", e)).unwrap_or_default();
                 let dis_str = if d.disabled { ",DIS" } else { "" };
-                format!("{}({}:{},cr={}{}{}{})", d.name, &d.uid[..d.uid.len().min(8)], d.reason, credits_str, cd_str, exp_str, dis_str)
+                format!("{}({}:{},cr={}{}{}{})", d.name, d.uid.get(..8).unwrap_or(&d.uid), d.reason, credits_str, cd_str, exp_str, dis_str)
             })
             .collect();
         state.logger.log_request(
@@ -467,7 +492,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 let cd_str = if d.until > 0 { format!(",cd={}s", d.until.saturating_sub(now_ts() as i64)) } else { String::new() };
                 let exp_str = d.credits_expire_at.filter(|&e| e > 0).map(|e| format!(",exp={}", e)).unwrap_or_default();
                 let dis_str = if d.disabled { ",DIS" } else { "" };
-                format!("{}({}:{},cr={}{}{}{})", d.name, &d.uid[..d.uid.len().min(8)], d.reason, credits_str, cd_str, exp_str, dis_str)
+                format!("{}({}:{},cr={}{}{}{})", d.name, d.uid.get(..8).unwrap_or(&d.uid), d.reason, credits_str, cd_str, exp_str, dis_str)
             })
             .collect();
         state.logger.log_request(
@@ -649,41 +674,7 @@ fn uuid_like_id() -> String {
 }
 
 fn safe_slice(s: &str, n: usize) -> &str {
-    if s.len() > n {
-        &s[..n]
-    } else {
-        s
-    }
-}
-
-fn static_models() -> Vec<Value> {
-    let names = [
-        "Doubao-Seed-Evolving",
-        "Doubao-Seed-2.1-Pro",
-        "Doubao-Seed-2.1-Turbo",
-        "glm-5.3",
-        "glm-5.2",
-        "DeepSeek-V4-Flash-Official",
-        "DeepSeek-V4-Flash",
-        "DeepSeek-V4-Pro-Official",
-        "DeepSeek-V4-Pro",
-        "kimi-k3",
-        "kimi-k2.7-code",
-        "kimi-k2.6",
-        "minimax-m3",
-        "qwen3.8-max",
-        "qwen-3.7-plus",
-    ];
-    names
-        .iter()
-        .map(|name| {
-            json!({
-                "id": name,
-                "object": "model",
-                "created": 1753600000,
-                "owned_by": "trae-solo",
-                "context_length": 131072,
-            })
-        })
-        .collect()
+    // 按字符边界截断：字节切片 &s[..n] 在多字节字符中间会 panic
+    // （上游错误 JSON 常含中文，200 字节处极可能落在 UTF-8 序列中间）
+    s.get(..n).unwrap_or(s)
 }

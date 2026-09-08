@@ -40,7 +40,7 @@ pub struct OAuthLoginResult {
     pub has_refresh_token: bool,
 }
 
-/// 短请求 Agent
+/// 短请求 Agent（项目未启用 ureq 的 proxy-from-env feature，Agent 默认直连）
 fn short_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(120))

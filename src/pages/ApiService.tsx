@@ -277,7 +277,7 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
     <div>
       <PageHeader
         title="API 服务"
-        desc="OpenAI 兼容接口，通过账号池轮转实现多账号负载均衡（消耗通用积分）"
+        desc="OpenAI / Anthropic 兼容接口，通过账号池轮转实现多账号负载均衡（消耗通用积分）"
         actions={
           running ? (
             <button

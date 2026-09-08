@@ -14,6 +14,7 @@ use crate::state::AppState;
 // ---------------- 双 HTTP Client 设计 ----------------
 
 /// 短请求 Agent：总超时 120s，用于签到/积分查询/Token 刷新等 JSON 请求
+/// （项目未启用 ureq 的 proxy-from-env feature，Agent 默认直连，不会被本地代理拦截）
 fn short_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(120))
@@ -22,12 +23,12 @@ fn short_agent() -> ureq::Agent {
         .build()
 }
 
-/// 流式 Agent：无总超时，仅 response_header_timeout 120s，用于 SSE 流式对话
-/// 预留给 Phase 3 OpenAI 兼容 API 使用
+/// 流式 Agent：无整体超时，读超时 300s（容忍长间隔 token 并防上游挂起），
+/// 用于 SSE 流式对话。预留给 Phase 3 OpenAI 兼容 API 使用
 #[allow(dead_code)]
 fn streaming_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        // 不设置 timeout_read（Duration::from_secs(0) 会触发 std 错误）
+        .timeout_read(std::time::Duration::from_secs(300))
         .max_idle_connections(20)
         .max_idle_connections_per_host(20)
         .build()

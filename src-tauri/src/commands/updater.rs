@@ -117,6 +117,8 @@ fn attempt_agents(finish: impl Fn(ureq::AgentBuilder) -> ureq::Agent) -> Vec<(&'
             out.push(("环境变量代理", finish(ureq::AgentBuilder::new().proxy(proxy))));
         }
     }
+    // 「直连」通道无需显式禁用代理：项目未启用 ureq 的 proxy-from-env feature，
+    // AgentBuilder::new() 默认不读环境变量代理，天然直连
     out.push(("直连", finish(ureq::AgentBuilder::new())));
     out
 }

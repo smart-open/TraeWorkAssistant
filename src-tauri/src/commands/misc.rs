@@ -433,6 +433,14 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
 /// 读取本地文本文件（配合导入账号：文件选择后由 Rust 侧读取，避免前端路径权限问题）
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+    if !meta.is_file() {
+        return Err("路径不是常规文件".into());
+    }
+    // 大小上限 10MB：导入的账号/配置 JSON 远小于此，防止误选超大文件拖垮前端
+    if meta.len() > 10 * 1024 * 1024 {
+        return Err("文件过大（超过 10MB），请确认选择的是账号/配置 JSON 文件".into());
+    }
     let bytes =
         std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?;
     String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".into())
@@ -530,7 +538,8 @@ fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+// 计划任务命令含 schtasks 子进程调用（可达数秒），标记 async 派发到线程池执行，避免阻塞 UI
+#[tauri::command(async)]
 pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
     register_daily_task(&state, &time)?;
     // 注册成功后清理旧版计划任务（品牌迁移），失败不影响本次注册
@@ -626,7 +635,7 @@ pub fn try_migrate_legacy_task(state: &AppState) -> Option<String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, String> {
     let (ok, stdout, stderr) = run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])?;
     if !ok {
@@ -657,7 +666,7 @@ pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, St
     Ok(stdout)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
     // 只删除本应用的新任务名；旧任务 TraeWorkAssistant_DailyCheckin 属老应用，
     // 两版并存时不得越权删除（老应用的签到计划需继续工作）

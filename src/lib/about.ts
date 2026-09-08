@@ -7,7 +7,7 @@ export const APP_NAME = 'AI Work 助手';
 export const APP_TAGLINE = '多账号签到与管理 · 一站式工作台';
 export const APP_OVERVIEW =
   'Windows 桌面端多账号签到与管理工具（Tauri 2 + React 18 + Rust）。' +
-  '支持多账号签到、登录态切换、设备隔离、积分看板与 OpenAI 兼容 API 网关，数据全部本地存储。';
+  '支持多账号签到、登录态切换、设备隔离、积分看板与 OpenAI / Anthropic 兼容 API 网关，数据全部本地存储。';
 export const APP_AUTHOR = '朱天伟';
 export const APP_COPYRIGHT = `Copyright © 2026 ${APP_AUTHOR} · MIT License`;
 export const APP_DISCLAIMER =

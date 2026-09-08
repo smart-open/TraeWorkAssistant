@@ -70,12 +70,35 @@ pub fn function_for_model(model_lower: &str) -> &'static str {
     }
 }
 
-/// 读取模型列表；文件缺失或为空时写入默认列表
+/// 模型列表文件路径：base_dir/data/api_models.json（数据文件统一放 data/ 子目录）
+fn models_file(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("data").join("api_models.json")
+}
+
+/// 数据文件路径：base_dir/data/name（与 AppState::path() 的路由保持一致）
+fn data_file(data_dir: &Path, name: &str) -> std::path::PathBuf {
+    data_dir.join("data").join(name)
+}
+
+/// 读取模型列表；文件缺失或为空时写入默认列表。
+/// 兼容旧位置（base_dir/api_models.json）：命中则迁移内容到 data/ 子目录（旧文件保留不动）。
 pub fn load_models(data_dir: &Path) -> Vec<ModelOption> {
-    let path = data_dir.join("api_models.json");
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(list) = serde_json::from_str::<Vec<ModelOption>>(&text) {
-            if !list.is_empty() {
+    let path = models_file(data_dir);
+    let read_list = |p: &Path| -> Option<Vec<ModelOption>> {
+        let text = std::fs::read_to_string(p).ok()?;
+        match serde_json::from_str::<Vec<ModelOption>>(&text) {
+            Ok(list) if !list.is_empty() => Some(list),
+            _ => None,
+        }
+    };
+    if let Some(list) = read_list(&path) {
+        return list;
+    }
+    // 旧位置兼容迁移（v3.2.5 曾存放在数据根目录）
+    let legacy = data_dir.join("api_models.json");
+    if path != legacy {
+        if let Some(list) = read_list(&legacy) {
+            if fs_utils::write_json(&path, &list).is_ok() {
                 return list;
             }
         }
@@ -145,13 +168,9 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
 
 /// 重放 batch_get_detail_param 拉取官网最新模型列表并落盘
 pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
-    // 防止 ureq 走系统代理（同 api_server_start 的处理）
-    std::env::set_var("NO_PROXY", "*");
-    std::env::set_var("no_proxy", "*");
-
     // 取第一个可用账号（最多尝试 3 个）
-    let accounts: AccountsFile = fs_utils::read_json(&data_dir.join("checkin_accounts.json"));
-    let device_map: DeviceMap = fs_utils::read_json(&data_dir.join("device_map.json"));
+    let accounts: AccountsFile = fs_utils::read_json(&data_file(data_dir, "checkin_accounts.json"));
+    let device_map: DeviceMap = fs_utils::read_json(&data_file(data_dir, "device_map.json"));
     let candidates: Vec<(&crate::models::RawAccount, String, String)> = accounts
         .accounts
         .iter()
@@ -171,6 +190,8 @@ pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
         return Err("没有可用账号（缺少 JWT），请先在账号管理中添加账号".into());
     }
 
+    // 项目未启用 ureq 的 proxy-from-env feature：Agent 默认直连，
+    // 不读环境变量/系统代理，不会被本地 MITM 代理拦截形成循环
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
         .build();
@@ -245,7 +266,7 @@ pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
     })?;
 
     let list = normalize_order(fetched);
-    fs_utils::write_json(&data_dir.join("api_models.json"), &list)?;
+    fs_utils::write_json(&models_file(data_dir), &list)?;
     fs_utils::app_log(
         data_dir,
         &format!("官网模型列表同步成功: {} 个模型", list.len()),
