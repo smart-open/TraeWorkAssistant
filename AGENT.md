@@ -46,14 +46,15 @@ ai-work-assistant/
 │   ├── App.tsx                   # 外壳（TitleBar + Sidebar + TopBar + 页面切换 + Toaster）
 │   ├── store.ts                  # Zustand 单一真相（init / 刷新 / checkin/switch/saveLogin 事件归约）
 │   ├── types.ts                  # 与 Rust DTO 对齐（snake_case）
-│   ├── lib/tauri.ts              # invoke 封装 + 事件订阅（setupListeners）
-│   ├── components/               # TitleBar/Sidebar/TopBar/Toaster/PageHeader/SetupGuide/ui
+│   ├── lib/                      # tauri.ts(invoke 封装+事件订阅) / themes.ts(主题) / delay.ts(withMinDelay) / cn.ts / about.ts / useIsDark.ts
+│   ├── components/               # TitleBar/Sidebar/TopBar/Toaster/PageHeader/SetupGuide/ui + SystemDialog(系统设置+系统日志弹框)/GeneralSettingsPanel/AboutDialog
 │   └── pages/                    # Dashboard / Accounts / Checkin / Credits / Logs / ApiService / Settings
+├── scripts/                      # dev-tauri.mjs(tauri 脚本入口) / sync_version.py / rename_release.py / package_portable.py / make_portable_zip.py / gen_asset_base64.py
 ├── src-tauri/
 │   ├── tauri.conf.json           # 无装饰窗 / bundle.resources = ../src-python/ + ../src-ps/
 │   └── src/
 │       ├── main.rs               # 注册全部命令
-│       ├── state.rs              # AppState（%APPDATA%\AIWorkAssistant + python_dir）
+│       ├── state.rs              # AppState（%APPDATA%\AIWorkAssistant + python_dir + 旧目录迁移）
 │       ├── models.rs             # DTO（含 CheckinSummary.time 字段）
 │       ├── fs_utils.rs           # 原子 read_json / write_json / mask / 时间辅助
 │       ├── jwt.rs                # parse() + status_of() + refresh() + oauth_parse()
@@ -66,8 +67,9 @@ ai-work-assistant/
 │       │   ├── payload.rs        # OpenAI/Anthropic 请求 → llm_utils_chat 改写（anthropic_to_openai 先转内部格式）
 │       │   ├── sse.rs            # SSE 协议转换（SOLO → OpenAI chunk / Anthropic 事件流）
 │       │   ├── auth.rs           # API Key 鉴权（Bearer + x-api-key 双风格）
+│       │   ├── models_sync.rs    # 模型列表配置化（api_models.json）+ 官网 batch_get_detail_param 同步
 │       │   └── api_logger.rs     # API 请求日志
-│       └── commands/             # env / cert / accounts / checkin / proxy / switch / misc / profile / api_server / oauth
+│       └── commands/             # env / cert / proxy / accounts / checkin / switch / misc / profile / api_server / oauth / trae_apps(双应用发现) / process(三级关闭) / updater
 ├── src-python/
 │   ├── device_proxy.py           # MITM 代理（env AIWORKDATA_DIR、--gen-ca）
 │   ├── auto_checkin.py           # 批量签到（--json-stream / --accounts / --scope）
@@ -82,31 +84,50 @@ ai-work-assistant/
 
 | 模块 | 命令 | 说明 |
 |---|---|---|
-| 环境 | `env_check` → `EnvStatus` | `installed/running/version/path` |
+| 环境 | `env_check` → `EnvStatus` | `installed/running/version/path`；async 命令（注册表全量搜索较慢，避免 UI 卡顿） |
+| 环境 | `open_trae_website()` / `open_trae_app()` | 打开 Trae 官网 / 启动 Trae Work（代理注入时优雅关闭进程最长 5s，async） |
+| 环境 | `env_check_trae_cn()` / `open_trae_cn_app()` | Trae CN IDE 环境检测 / 启动（双应用支持） |
 | 证书 | `cert_status` / `cert_install` | 安装走 UAC `certutil -addstore -f Root` |
 | 代理 | `proxy_start(port)` / `proxy_stop()` / `proxy_status()` | ProxyStatus：`running/port/captured/started_at` |
 | 账号 | `accounts_list` → `AccountView[]` | 聚合 JWT / 分组 / 设备 / 积分 / 今日 |
 | 账号 | `account_add_manual(name, jwt, groupId?)` | 解析 JWT → userId 入库 |
 | 账号 | `account_delete(userId, deleteProfile)` | 同时清分组；`deleteProfile=true` 删 profiles/<uid> |
+| 账号 | `account_update(...)` / `accounts_export_raw()` / `accounts_import(...)` | 编辑账号 / 原始 JSON 导出 / 导入 |
+| 积分 | `fetch_remaining_credits` / `fetch_credit_detail` / `refresh_remaining_credits` | 剩余积分查询 / 明细 / 刷新 |
+| 积分 | `credits_daily_list` / `credits_history` / `invite_link()` | 每日快照 / 历史记录 / 邀请链接 |
+| 冷却 | `cooldown_clear(userId?)` / `cooldown_clear_all()` | 清除签到错误冷却状态 |
 | 账号 | `account_oauth_add` → 实际为 `oauth_login(callback_url, account_name?, group_id?)` | 从 OAuth 回调 URL 解析 token + userInfo |
 | OAuth | `oauth_get_login_url()` → `{ url }` | 构造 Trae 登录 URL |
 | OAuth | `oauth_parse_callback(callback_url)` → `{ user_id, ... }` | 解析回调 URL 中的 token |
 | 分组 | `groups_list` / `group_create` / `group_update` / `group_delete` / `group_move` | 删除分组时账号回落「未分组」 |
 | 签到 | `checkin_start(opts)` → NDJSON 事件 | `opts: { scope, user_ids?, skip_checked_in, skip_expired }` |
-| 切换 | `switch_account(userId)` | 调 `trae-switch-bridge.ps1 -Action Switch` |
+| 切换 | `switch_account(userId)` | 调 `trae-switch-bridge.ps1 -Action Switch`（进程三级关闭策略） |
+| 切换 | `reset_device_ids(userId)` | switch 模块：重置设备指纹（区别于 misc 的 `device_reset` 只删映射） |
 | 保存 | `save_current_login(userId)` | 调 `trae-switch-bridge.ps1 -Action SaveCurrentLogin` |
 | 快照 | `profile_list` → `ProfileInfo[]` | 列出 data/profiles/ 下所有快照 |
 | 快照 | `profile_backup(userId)` / `profile_restore(userId)` / `profile_delete(slot)` | 手动备份/恢复/删除 |
+| 快照 | `profile_format_size(...)` | 快照体积格式化 |
+| 日志 | `proxy_logs_list(...)` / `proxy_log_detail(...)` | 代理请求日志列表 / 详情 |
+| 文件 | `read_text_file(path)` / `write_text_file(...)` | 前端通用文本读写（read 有 10MB 上限 + 常规文件校验） |
+| 双应用 | `apps_accounts_discover` / `apps_account_add` / `apps_entitlement_read` | 本机 Trae Work + Trae CN 账号自动发现 / 入池 / 套餐读取（F-08，见 §5.1） |
+| 双应用 | `refresh_pay_status(...)` / `accounts_backfill_dc_ids(...)` | 会员支付状态刷新 / 已有账号回填 dc id |
 | 设备 | `device_reset(userId)` | 删 `device_map.json[ uid ]` |
 | JWT | `jwt_parse(jwt)` / `refresh_jwt(userId)` | 解析 / 自动刷新（需 refresh_token） |
 | API | `api_server_start(port)` / `api_server_stop()` / `api_server_status()` | API 网关启停 |
 | API | `pool_list` / `pool_set` / `pool_status` | 账号池管理 |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
-| API | `api_models_list()` / `api_models_sync()` | 模型列表读取（api_models.json）/ 官网同步（不消耗积分，最多试 3 账号） |
+| API | `api_models_list()` / `api_models_sync()` | 模型列表读取（data/api_models.json）/ 官网同步（不消耗积分，最多试 3 账号） |
+| API | `api_logs_list(...)` / `api_logs_detail(...)` / `api_logs_search(...)` | API 请求日志查询 / 详情 / 搜索 |
 | 日志 | `logs_query({ opts: { log_type, date, keyword, limit } })` → `LogLine[]` | `split_time` 会 strip BOM 前缀 |
 | 设置 | `settings_get()` / `settings_set(patch: Settings)` | Settings 全部 snake_case |
 | 计划 | `task_register(time)` / `task_status()` / `task_unregister()` | `schtasks` 注册每日签到 |
 | 更新 | `update_check()` / `update_download(...)` → `UpdateDownloaded` / `update_run_installer({file_path, asset_name})` | 两步确认制：下载（确认一）→ 安装（确认二）。安装器参数 `/P /UPDATE /R`：被动进度条 + 跳过卸载直接覆盖 + 完成后自动重启应用；`run_installer` 校验路径必须位于临时更新目录 |
+
+### 5.1 双应用与双 uid 体系（F-08，trae_apps.rs）
+
+- 数据源：`%APPDATA%\TRAE SOLO CN`（Trae Work）与 `%APPDATA%\Trae CN`（Trae CN IDE）各自的 `User\globalStorage\storage.json` / `state.vscdb`。
+- **两套 uid 体系不通用（红线）**：`iCubeAuthInfo://icube-dc:<uid>` 键名中的 uid 是**账户中心（dc）id 空间**；账号池 / JWT `data.id` 用的是 **Cloud-IDE id 空间**。同一登录账号两者数值不同，直接混用会导致重复入池。
+- 当前登录账号的 Cloud-IDE uid 由使用痕迹推导（Trae CN 看 `icube_gtm.users` 键名；Trae Work 看 state.vscdb `solo.mobile.allowControl` per-uid 最新 `updatedTime` + 键名证据计数），推导失败时回退展示 dc uid 并标记 `uid_confident=false`、**禁止入池**。
 
 ## 6. Tauri 事件（Rust → 前端）
 
@@ -137,6 +158,7 @@ ai-work-assistant/
 │   ├── remaining_credits.json    # 各账号剩余积分缓存
 │   ├── account_cooldowns.json    # 签到错误冷却状态（error_type + cooldown_until）
 │   ├── api_pool.json             # API 账号池配置 + 状态
+│   ├── api_models.json           # 模型下拉列表（id=config_name 原样透传，label=官方展示名；3.2.6 起位于 data/ 子目录，旧位置自动兼容迁移）
 │   └── profiles/                 # 登录态快照
 │       ├── current_account.txt   # 当前活跃账号 ID
 │       └── <user_id>/            # 精准备份的 9 类核心文件
@@ -173,7 +195,7 @@ ai-work-assistant/
 ## 10. 前端约定
 
 - **store 单例**：`useAppStore` 聚合所有状态；`init()` 在 `App.tsx` `useEffect` 启动一次。
-- **样式**：Tailwind 3 + `darkMode:'class'`；amber 色系为视觉强调色。
+- **主题系统**：Tailwind 3 + `darkMode:'class'`；`lib/themes.ts` 定义 6 套主题（石墨灰浅色 / 炭黑 / 暗夜紫 / 墨绿 / 琥珀暖夜 / 科技蓝，默认 charcoal），通过 `data-theme` 属性驱动，与 `index.css` 中的覆盖块一一对应——新增主题必须两处同步。左下角系统图标弹框（SystemDialog）= Tab1 系统设置（GeneralSettingsPanel：外观/语言/通知/代理）+ Tab2 系统日志（复用 Logs 页）。
 - **snake_case**：前端类型定义（`types.ts`）的字段名与 Rust DTO 完全一致。
 - **路由**：极简 `useState`，不引 react-router。
 - **Modal**：不支持 `window.confirm()`，使用自定义 `Modal` 组件（支持 `size="lg"|"xl"`）。
@@ -214,7 +236,7 @@ ai-work-assistant/
 - **CA 证书**：仅本地回环 `127.0.0.1:8899`，自签根 CA 需 UAC 安装。
 - **UAC**：仅在 `cert_install` 提权，切换桥已改为普通用户可运行。
 - **API Key**：留空时跳过鉴权；配置时在前端掩码显示（前 4 + 后 4 + ****）。鉴权头支持 `Authorization: Bearer <key>`（OpenAI 风格）与 `x-api-key: <key>`（Anthropic 风格）双风格。
-- **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。端点：`GET /health`（免鉴权）、`GET /status`、`GET /v1/models`、`POST /v1/chat/completions`（OpenAI 协议）、`POST /v1/messages`（Anthropic Messages 协议，F-39）。请求侧统一转 OpenAI 内部格式复用池调度链路，响应侧按协议分别输出；Anthropic 流式事件序列 message_start → content_block_* → message_delta → message_stop，reasoning_content 暂不输出（thinking 块需签名）。账号池 app 无关：Trae / Trae Work 账号入池即被同一网关服务，扣通用积分（product_id 208）。
+- **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。端点：`GET /health`（免鉴权）、`GET /status`、`GET /v1/models`（与 `data/api_models.json` 同源，官网同步后无需重启即可见最新列表）、`POST /v1/chat/completions`（OpenAI 协议）、`POST /v1/messages`（Anthropic Messages 协议，F-39）。请求侧统一转 OpenAI 内部格式复用池调度链路，响应侧按协议分别输出；Anthropic 流式事件序列 message_start → content_block_* → message_delta → message_stop，reasoning_content 暂不输出（thinking 块需签名）。账号池 app 无关：Trae / Trae Work 账号入池即被同一网关服务，扣通用积分（product_id 208）。
 
 ## 13. 禁止与红线（Do NOT）
 
@@ -224,7 +246,8 @@ ai-work-assistant/
 - ❌ 提交 `.workbuddy/`、`dist/`、`node_modules/`、`src-tauri/target/`、`__pycache__/`、`data/`（已在 `.gitignore`）。
 - ❌ 使用 `window.confirm()` → Tauri WebView 不支持，用自定义 Modal。
 - ❌ 使用 `api.prevent_close()` → 会导致 Chromium 1412 错误。
-- ❌ 用 `npm run dev` 直接跑 Vite → 白屏，必须 `npm run tauri dev`。
+- ❌ 用 `npm run dev` 直接跑 Vite → 白屏，必须 `npm run tauri dev`（实际入口为 `scripts/dev-tauri.mjs`）。
+- ❌ 混用 dc uid 与 Cloud-IDE uid 入池 → 两套 id 空间不通用，会产生重复账号（见 §5.1）。
 
 ## 14. 已知约束
 
@@ -239,7 +262,9 @@ ai-work-assistant/
 - **错误文案不重复加前缀**：Rust 端返回纯错误描述，`查询失败：` / `注册失败：` 等前缀由前端 `Settings.tsx` 统一拼接。
 - **`src-python/` 会打包进 `resources/python/`**：Python 侧改动在正式版必须 `npm run tauri build` 重新打包才生效；`npm run tauri dev` 直读源码，重启对应功能即生效。
 - **`src-python/` 严禁混入 Python 运行时**（python.exe / python313.dll / Lib / libs 等）：会被打进 resources，且 `state.rs` 优先内嵌解释器。解释器探测（内嵌与系统 python/python3/py）统一用 `import encodings` 自举验证（`python_can_bootstrap`），`--version` 不触发 stdlib 导入、残缺运行时也能通过；内嵌不可用时自动回退系统解释器（v3.2.3 教训：3.2.0–3.2.2 携带缺 encodings 的残缺运行时致签到必崩，NSIS 覆盖安装不清理旧资源文件，靠自举回退兜底）。
-- **品牌迁移（v3.0.0）**：identifier `com.traework.assistant`→`com.aiwork.assistant`，数据目录 `%APPDATA%\TraeWorkAssistant`→`AIWorkAssistant`（`state.rs::migrate_legacy_dirs` 启动时**复制**迁移——旧目录原地保留，老应用可继续使用、两版并存；新目录已有数据则跳过；含 WebView2 目录），计划任务由 `misc.rs::try_migrate_legacy_task` 按旧触发时间重建（**旧任务保留**，`task_unregister` 只删新任务）。环境变量统一为 `AIWORKDATA_DIR`（Python 侧兼容读旧 `TRAEDATA_DIR`）。
+- **进程三级关闭策略（F-47，process.rs）**：优雅关闭（taskkill 不带 /F 发 WM_CLOSE，等 3s 让 Electron 正常落盘）→ 树杀（/T /F，等 2s）→ 仍存活则返回 Err 由前端提示人工介入。仅按主程序映像名精确匹配；所有子进程以 CREATE_NO_WINDOW 拉起。
+- **API 模型同步**：官网同步重放 Trae 客户端 `batch_get_detail_param` 配置接口；内置模型 glm-5.3-flash / qwen3.8-flash / Doubao-Seed-Code 不在配置接口响应中，需经 llm_utils_chat 以 `function=solo_agent` 调用补齐。
+- **品牌迁移（v3.0.0）**：identifier `com.traework.assistant`→`com.aiwork.assistant`，数据目录 `%APPDATA%\TraeWorkAssistant`→`AIWorkAssistant`（`state.rs::migrate_legacy_dirs` 启动时**复制**迁移——旧目录原地保留，老应用可继续使用、两版并存；新目录已有数据则跳过；含 WebView2 目录，排除 Cache/GPUCache 等 8 类缓存子目录，复制失败回滚半成品），计划任务由 `misc.rs::try_migrate_legacy_task` 按旧触发时间重建（**旧任务保留**，`task_unregister` 只删新任务）。环境变量统一为 `AIWORKDATA_DIR`（Python 侧兼容读旧 `TRAEDATA_DIR`）。
 - **老安装包升级**：升级兼容按**安装时产品名**判定（非版本号）。NSIS 通过 `build-assets/installer-hooks.nsh` 静默卸载清理旧品牌「Trae Work 助手」安装（已发布的 v2.4.4 及更早均属旧品牌，UTF-8 with BOM）；「AI Work 助手」品牌（v3.0.0 起）走 NSIS 原生原地升级；老 MSI 因 UpgradeCode 随 identifier 变化无法原地升级，需先卸载或改用 NSIS 包升级。打包产物统一输出到 `release/`，使用中文产品名命名 `AI Work 助手_<版本>_x64*`（`scripts/rename_release.py`）。
 - **版本线与数据迁移**：新版本自 v3.0.0 起，**之前所有 2.x 版本升级到 3.x 均需数据迁移（安装/首次启动自动完成）**；原「Trae Work 助手」产品线在 `trae_work_main` 分支维护（仅 Trae Work 单应用，2.x.x，仅必要修复），仅使用 Trae Work 的用户可不升级，用该分支的 v2.x.x 最新版本即可。
 - **NSIS 安装器**：使用自定义模板 `build-assets/installer.nsi`（基于 tauri v2.11.4 上游模板，配置于 tauri.conf.json `bundle.windows.nsis.template`）——升级安装时跳过「卸载旧版/不卸载」选择页，**默认直接覆盖安装**（同版本重装/降级仍显示选择页）。升级 Tauri CLI 后如构建报错，需从对应版本 tag 的 `crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi` 重新同步模板并重做定制。
