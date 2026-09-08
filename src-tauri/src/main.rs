@@ -40,12 +40,12 @@ fn main() {
         fs_utils::app_log(&state.data_dir, &note);
     }
 
-    let mut builder = tauri::Builder::default();
-
     // 单实例防护（仅正式版）：第二个进程启动时，本回调在首个实例中执行——把主窗口
     // 还原/显示/聚焦后，第二进程由插件自动退出。必须第一个注册（在创建窗口前持有互斥锁）。
     // dev 模式不启用：dev 与已安装版共用 identifier，启用会导致 `npm run tauri dev`
     // 与已安装应用互相顶替退出，干扰开发调试。
+    #[cfg_attr(debug_assertions, allow(unused_mut))] // dev 不注册单实例插件
+    let mut builder = tauri::Builder::default();
     #[cfg(not(debug_assertions))]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -53,6 +53,9 @@ fn main() {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
+            }
+            if let Some(state) = app.try_state::<AppState>() {
+                fs_utils::app_log(&state.data_dir, "检测到重复启动：已聚焦已有实例窗口");
             }
         }));
     }
