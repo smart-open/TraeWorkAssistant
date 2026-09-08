@@ -7,7 +7,6 @@ import {
   Download,
   Github,
   Globe,
-  Heart,
   Loader2,
   RefreshCw,
 } from 'lucide-react';
@@ -24,7 +23,7 @@ import {
   LINK_GITHUB,
   LINK_BLOG,
   LINK_REPO,
-  donateQr,
+  promoBanner,
 } from '../lib/about';
 
 type UpdateState =
@@ -288,15 +287,12 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
           </button>
         </div>
 
-        {/* 打赏 */}
-        <div className="rounded-xl border border-amber-200/70 bg-amber-50/60 p-3 text-center dark:border-amber-500/20 dark:bg-amber-500/5">
-          <div className="mb-2 inline-flex items-center gap-1 text-xs font-bold text-amber-600 dark:text-amber-400">
-            <Heart size={13} className="fill-amber-400 text-amber-400" /> 请作者喝杯快乐水
-          </div>
+        {/* 软件宣传图 */}
+        <div className="overflow-hidden rounded-xl border border-slate-200 dark:border-zinc-700">
           <img
-            src={donateQr}
-            alt="赞赏码"
-            className="mx-auto w-64 rounded-lg border border-white shadow-sm dark:border-zinc-700"
+            src={promoBanner}
+            alt="AI Work 助手 — 多账号签到与管理一站式工作台"
+            className="w-full"
           />
         </div>
 

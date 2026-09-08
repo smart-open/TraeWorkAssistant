@@ -1,6 +1,6 @@
-// 赞赏码 base64 内嵌（由 scripts/gen_asset_base64.py 从 donate-qr.jpg 生成）：
+// 软件宣传图 base64 内嵌（由 scripts/gen_asset_base64.py 从 promo_banner.jpg 生成）：
 // dev server 关闭后弹窗图片仍可显示，不依赖运行中的静态服务器
-import { donate_qr_base64 as donateQr } from '../assets/donate-qr.base64';
+import { promo_banner_base64 as promoBanner } from '../assets/promo-banner.base64';
 
 /** 应用品牌与关于信息（集中管理，改名只改这里；版本号不再硬编码——运行时经 getVersion() 读 Cargo.toml 单一来源） */
 export const APP_NAME = 'AI Work 助手';
@@ -17,4 +17,4 @@ export const LINK_GITHUB = 'https://github.com/smart-open';
 export const LINK_BLOG = 'https://blog.sopenai.cn/';
 export const LINK_REPO = 'https://github.com/smart-open/TraeWorkAssistant';
 
-export { donateQr };
+export { promoBanner };

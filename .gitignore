@@ -60,3 +60,5 @@ release/
 overview.md
 # tauri dev 动态端口合并配置（scripts/dev-tauri.mjs 生成）
 tauri.dev.conf.json
+# 本地素材导出产物（promo banner 等）
+out/
