@@ -177,6 +177,7 @@ pub async fn api_server_start(
         pool,
         api_key,
         default_model,
+        data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
         active_uid: Mutex::new(None),
         last_error: Mutex::new(None),

@@ -124,10 +124,24 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     }))
 }
 
-pub async fn models() -> impl IntoResponse {
+pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
+    // 动态返回 api_models.json 中的模型列表（与官网同步结果一致）
+    let list = super::models_sync::load_models(&state.data_dir);
+    let data: Vec<Value> = list
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "object": "model",
+                "created": 1753600000,
+                "owned_by": "trae-solo",
+                "context_length": 131072,
+            })
+        })
+        .collect();
     Json(json!({
         "object": "list",
-        "data": static_models(),
+        "data": data,
     }))
 }
 
@@ -231,6 +245,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             Protocol::Anthropic => format!("msg_{}", now_ts()),
         };
         let mut tried = HashSet::new();
+        // 4001（模型在当前 function 下不可用）时的强制 function 重试（只重试一次）
+        let mut fn_forced: Option<&'static str> = None;
 
         for _ in 0..MAX_ROTATE {
             let picked = match state.pool.pick_excluding(&tried) {
@@ -242,12 +258,13 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
             let converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                Some(&state.data_dir), fn_forced,
             );
 
             match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
                 Ok(reader) => {
                     // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
-                    let error_info = match proto {
+                    let (error_info, sent_any) = match proto {
                         Protocol::OpenAi => sse::stream_convert(reader, tx.clone(), &chat_id),
                         Protocol::Anthropic => {
                             sse::stream_convert_anthropic(reader, tx.clone(), &chat_id, &model)
@@ -261,6 +278,20 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             *safe_lock(&state.last_error) =
                                 Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
                         }
+                        // 尚未向客户端发出任何数据且模型与 function 不匹配 →
+                        // 改用 solo_agent 同模型重试（可能是新内置模型，成功后自学习持久化）
+                        if !sent_any
+                            && fn_forced.is_none()
+                            && (code == 4001 || super::is_model_config_mismatch(&msg))
+                        {
+                            fn_forced = Some(super::models_sync::SOLO_AGENT_FUNCTION);
+                            tried.remove(&picked.uid); // 允许同账号立即重试
+                            continue;
+                        }
+                        if !sent_any {
+                            // 流未开始：错误延迟下发（重试失败/不可重试时到达此处）
+                            send_stream_error(&tx, proto, code, &msg);
+                        }
                         state.logger.log_request(
                             "POST", proto.log_path(), &model, stream,
                             200, &picked.uid, duration_ms, Some(&msg),
@@ -269,6 +300,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
                         }
                     } else {
+                        // 请求成功：若经历过 function 强制重试，自学习持久化覆盖
+                        if let Some(f) = fn_forced {
+                            super::models_sync::learn_function_override(&state.data_dir, &model, f);
+                        }
                         state.pool.note_success(&picked.uid);
                         state.logger.log_request(
                             "POST", proto.log_path(), &model, stream,
@@ -281,6 +316,13 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     return; // 流式结束后直接返回
                 }
                 Err((status, resp_body)) => {
+                    // 4001/model config is empty：模型问题非账号问题，不冷却；
+                    // 改用 solo_agent 同模型重试一次（单账号池也能重试）
+                    if fn_forced.is_none() && super::is_model_config_mismatch(&resp_body) {
+                        fn_forced = Some(super::models_sync::SOLO_AGENT_FUNCTION);
+                        tried.remove(&picked.uid);
+                        continue;
+                    }
                     let kind = classify_error(status, &resp_body);
                     state.pool.note_error(&picked.uid, kind);
                     let preview = safe_slice(&resp_body, 200);
@@ -377,6 +419,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let mut tried = HashSet::new();
+        // 4001（模型在当前 function 下不可用）时的强制 function 重试（只重试一次）
+        let mut fn_forced: Option<&'static str> = None;
 
         for _ in 0..MAX_ROTATE {
             let picked = match state.pool.pick_excluding(&tried) {
@@ -388,6 +432,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
 
             let converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                Some(&state.data_dir), fn_forced,
             );
 
             match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
@@ -403,6 +448,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     match (resp, error_info) {
                         (Some(r), None) => {
+                            // 请求成功：若经历过 function 强制重试，自学习持久化覆盖
+                            if let Some(f) = fn_forced {
+                                super::models_sync::learn_function_override(&state.data_dir, &model, f);
+                            }
                             state.pool.note_success(&picked.uid);
                             state.logger.log_request(
                                 "POST", proto.log_path(), &model, stream,
@@ -414,6 +463,14 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             return Ok(r);
                         }
                         (None, Some((code, msg))) => {
+                            // 模型与 function 不匹配 → 改用 solo_agent 同模型重试一次
+                            if fn_forced.is_none()
+                                && (code == 4001 || super::is_model_config_mismatch(&msg))
+                            {
+                                fn_forced = Some(super::models_sync::SOLO_AGENT_FUNCTION);
+                                tried.remove(&picked.uid);
+                                continue;
+                            }
                             let kind = classify_solo_error(code, &msg);
                             state.pool.note_error(&picked.uid, kind);
                             *safe_lock(&state.last_error) =
@@ -441,6 +498,13 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     }
                 }
                 Err((status, resp_body)) => {
+                    // 4001/model config is empty：模型问题非账号问题，不冷却；
+                    // 改用 solo_agent 同模型重试一次（单账号池也能重试）
+                    if fn_forced.is_none() && super::is_model_config_mismatch(&resp_body) {
+                        fn_forced = Some(super::models_sync::SOLO_AGENT_FUNCTION);
+                        tried.remove(&picked.uid);
+                        continue;
+                    }
                     let kind = classify_error(status, &resp_body);
                     state.pool.note_error(&picked.uid, kind);
                     *safe_lock(&state.last_error) =
@@ -656,34 +720,30 @@ fn safe_slice(s: &str, n: usize) -> &str {
     }
 }
 
-fn static_models() -> Vec<Value> {
-    let names = [
-        "Doubao-Seed-Evolving",
-        "Doubao-Seed-2.1-Pro",
-        "Doubao-Seed-2.1-Turbo",
-        "glm-5.3",
-        "glm-5.2",
-        "DeepSeek-V4-Flash-Official",
-        "DeepSeek-V4-Flash",
-        "DeepSeek-V4-Pro-Official",
-        "DeepSeek-V4-Pro",
-        "kimi-k3",
-        "kimi-k2.7-code",
-        "kimi-k2.6",
-        "minimax-m3",
-        "qwen3.8-max",
-        "qwen-3.7-plus",
-    ];
-    names
-        .iter()
-        .map(|name| {
-            json!({
-                "id": name,
-                "object": "model",
-                "created": 1753600000,
-                "owned_by": "trae-solo",
-                "context_length": 131072,
-            })
-        })
-        .collect()
+/// 流式场景：向客户端下发上游错误并结束流（仅在尚未发送任何数据时使用）
+fn send_stream_error(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    proto: Protocol,
+    code: i64,
+    msg: &str,
+) {
+    match proto {
+        Protocol::OpenAi => {
+            let body = json!({
+                "error": { "message": msg, "type": "api_error", "code": code }
+            });
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        }
+        Protocol::Anthropic => {
+            let err = json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": msg },
+            });
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: error\ndata: {}\n\n",
+                err
+            ))));
+        }
+    }
 }

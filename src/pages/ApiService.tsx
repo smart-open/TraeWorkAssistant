@@ -399,12 +399,13 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                         {
                           id: form?.api_default_model ?? 'glm-5.2',
                           label: form?.api_default_model ?? 'glm-5.2',
+                          verified: true,
                         },
                         ...models,
                       ]
                   ).map((m) => (
                     <option key={m.id} value={m.id}>
-                      {m.label}
+                      {m.verified === false ? `${m.label}（未验证）` : m.label}
                     </option>
                   ))}
                 </select>

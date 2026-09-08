@@ -223,6 +223,8 @@ export interface ApiServiceStatus {
 export interface ModelOption {
   id: string;
   label: string;
+  /** 是否经实测/官方可见性确认；get_skill_detail 注册表补集发现的为 false（未验证） */
+  verified?: boolean;
 }
 
 export interface PoolStatus {

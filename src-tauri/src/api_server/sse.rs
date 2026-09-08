@@ -136,15 +136,20 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
 }
 
 /// 流式转换：SOLO SSE → OpenAI SSE chunks，逐 chunk 通过 sender 发送
+///
+/// 返回 (错误信息, 是否已向客户端发送过数据)。
+/// 若上游首个事件即 error（尚未发送任何数据），错误不下发，
+/// 由调用方决定重试（如 4001 改 function）或透传给客户端。
 pub fn stream_convert<R: Read + Send>(
     reader: R,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
-) -> Option<(i64, String)> {
+) -> (Option<(i64, String)>, bool) {
     let br = BufReader::new(reader);
     let mut st = SseState::new();
     let mut pending_usage: Option<Value> = None;
     let mut saw_done = false;
+    let mut sent_any = false;
     let mut error_info: Option<(i64, String)> = None;
 
     let write_chunk = |delta: Value, finish: &str, pending_usage: &Option<Value>| -> String {
@@ -218,6 +223,7 @@ pub fn stream_convert<R: Read + Send>(
                     if !delta.is_empty() {
                         let data = write_chunk(Value::Object(delta), "", &pending_usage);
                         let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        sent_any = true;
                     }
                 }
                 "token_usage" => {
@@ -228,33 +234,37 @@ pub fn stream_convert<R: Read + Send>(
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     saw_done = true;
+                    sent_any = true;
                 }
                 "error" => {
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
-                    let error_chunk = json!({
-                        "error": {
-                            "message": ev.error_message,
-                            "type": "api_error",
-                            "code": ev.error_code.unwrap_or(0),
-                        }
-                    });
-                    let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
-                        "data: {}\n\n",
-                        error_chunk
-                    ))));
-                    let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-                    saw_done = true;
+                    // 已有数据流出：就地透传错误并结束；否则延迟给调用方决策（可重试）
+                    if sent_any {
+                        let error_chunk = json!({
+                            "error": {
+                                "message": ev.error_message,
+                                "type": "api_error",
+                                "code": ev.error_code.unwrap_or(0),
+                            }
+                        });
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            error_chunk
+                        ))));
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                        saw_done = true;
+                    }
                 }
                 _ => {}
             }
         }
     }
 
-    if !saw_done {
+    if !saw_done && error_info.is_none() {
         let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
     }
 
-    error_info.map(|(code, msg)| (code, msg))
+    (error_info.map(|(code, msg)| (code, msg)), sent_any)
 }
 
 /// 非流式聚合：读取完整 SOLO SSE，聚合为单个 OpenAI chat.completion
@@ -372,7 +382,7 @@ pub fn stream_convert_anthropic<R: Read + Send>(
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     msg_id: &str,
     model: &str,
-) -> Option<(i64, String)> {
+) -> (Option<(i64, String)>, bool) {
     let br = BufReader::new(reader);
     let mut st = SseState::new();
     let mut message_started = false;
@@ -599,17 +609,20 @@ pub fn stream_convert_anthropic<R: Read + Send>(
                 }
                 "error" => {
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
-                    send_event!(
-                        "error",
-                        json!({
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": ev.error_message,
-                            },
-                        })
-                    );
-                    saw_done = true;
+                    // 已有内容发出：就地透传错误并结束；否则延迟给调用方决策（可重试）
+                    if message_started || !tools.is_empty() {
+                        send_event!(
+                            "error",
+                            json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": ev.error_message,
+                                },
+                            })
+                        );
+                        saw_done = true;
+                    }
                 }
                 _ => {}
             }
@@ -627,7 +640,8 @@ pub fn stream_convert_anthropic<R: Read + Send>(
         }
     }
 
-    error_info.map(|(code, msg)| (code, msg))
+    let sent_any = message_started || !tools.is_empty();
+    (error_info.map(|(code, msg)| (code, msg)), sent_any)
 }
 
 /// 非流式聚合：SOLO SSE → Anthropic message 对象（/v1/messages）

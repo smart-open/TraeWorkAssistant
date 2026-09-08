@@ -29,6 +29,8 @@ pub struct ApiSharedState {
     pub pool: ApiPool,
     pub api_key: String,
     pub default_model: String,
+    /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
+    pub data_dir: std::path::PathBuf,
     pub total_requests: AtomicU64,
     pub active_uid: Mutex<Option<String>>,
     pub last_error: Mutex<Option<String>>,
@@ -73,8 +75,23 @@ impl ErrKind {
     }
 }
 
+/// 4001/model config is empty：模型在当前 function 下不可用（模型问题非账号问题）
+/// 判定依据：SOLO 业务错误码 4001 或上游 message 关键字
+pub fn is_model_config_mismatch(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("model config is empty")
+        || lower.contains("\"code\":4001")
+        || lower.contains("\"code\": 4001")
+        || lower.contains("\"error_code\":4001")
+        || lower.contains("\"error_code\": 4001")
+}
+
 /// 按 HTTP 状态码 + body 判定错误类别
 pub fn classify_error(status: u16, body: &str) -> ErrKind {
+    // 4001：模型问题非账号问题，不冷却账号
+    if is_model_config_mismatch(body) {
+        return ErrKind::None;
+    }
     if body.contains("\"code\":1005") || (body.contains("1005") && body.to_lowercase().contains("plan")) {
         return ErrKind::PlanLimit;
     }

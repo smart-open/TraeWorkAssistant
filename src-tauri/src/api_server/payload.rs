@@ -2,30 +2,40 @@ use serde_json::{json, Value};
 
 /// 模型显示名 → (canonical config_name, 内部 model_name) 映射
 /// 大小写不敏感：客户端可传入 "doubao-seed-2.1-turbo" 或 "Doubao-Seed-2.1-Turbo"
-/// 与上游 batch_get_detail_param（solo_work_lite，2026-09 实测）同步
-fn model_config(model: &str) -> (&'static str, &'static str) {
-    match model.to_lowercase().as_str() {
-        "doubao-seed-evolving" => ("Doubao-Seed-Evolving", "Doubao-Seed-Evolving__dev"),
-        "doubao-seed-2.1-pro" | "seed-code-pro-0430" => ("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev"),
-        "doubao-seed-2.1-turbo" => ("Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev"),
-        "doubao-seed-code" => ("Doubao-Seed-Code", "Doubao-Seed-Code__dev"),
-        "glm-5.3-flash" => ("glm-5.3-flash", "glm-5.3-flash__dev"),
-        "qwen3.8-flash" => ("qwen3.8-flash", "qwen3.8-flash__dev"),
-        "glm-5.2" => ("glm-5.2", "glm-5.2__dev"),
-        "glm-5.3" => ("glm-5.3", "glm-5.3__dev"),
-        "glm-5" => ("glm-5", "glm-5__dev"),
-        "glm-5-turbo" => ("glm-5-turbo", "glm-5-turbo__dev"),
-        "deepseek-v4-flash" => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
-        "deepseek-v4-flash-official" => ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash-Official__dev"),
-        "deepseek-v4-pro" => ("DeepSeek-V4-Pro", "deepseek_v4_pro__dev"),
-        "deepseek-v4-pro-official" => ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro-Official__dev"),
-        "kimi-k2.6" => ("kimi-k2.6", "kimi-k2.6__dev"),
-        "kimi-k2.7-code" => ("kimi-k2.7-code", "kimi-k2.7-code__dev"),
-        "kimi-k3" => ("kimi-k3", "kimi-k3__dev"),
-        "minimax-m3" => ("minimax-m3", "minimax-m3__dev"),
-        "qwen3.8-max" => ("qwen3.8-max", "qwen3.8-max__dev"),
-        "qwen-3.7-plus" => ("qwen-3.7-plus", "qwen-3.7-plus__dev"),
-        _ => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
+/// 与上游 batch_get_detail_param（solo_work_lite，2026-09 实测）同步；
+/// 未知模型（官网同步新增）原样透传，model_name 采用 __dev 后缀约定
+fn model_config(model: &str) -> (String, String) {
+    let known: Option<(&'static str, &'static str)> = match model.to_lowercase().as_str() {
+        "doubao-seed-evolving" => Some(("Doubao-Seed-Evolving", "Doubao-Seed-Evolving__dev")),
+        "doubao-seed-2.1-pro" | "seed-code-pro-0430" => Some(("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev")),
+        "doubao-seed-2.1-turbo" => Some(("Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev")),
+        "doubao-seed-code" => Some(("Doubao-Seed-Code", "Doubao-Seed-Code__dev")),
+        "glm-5.3-flash" => Some(("glm-5.3-flash", "glm-5.3-flash__dev")),
+        "qwen3.8-flash" => Some(("qwen3.8-flash", "qwen3.8-flash__dev")),
+        "glm-5.2" => Some(("glm-5.2", "glm-5.2__dev")),
+        "glm-5.3" => Some(("glm-5.3", "glm-5.3__dev")),
+        "glm-5" => Some(("glm-5", "glm-5__dev")),
+        "glm-5-turbo" => Some(("glm-5-turbo", "glm-5-turbo__dev")),
+        "deepseek-v4-flash" => Some(("DeepSeek-V4-Flash", "deepseek_v4_flash__dev")),
+        "deepseek-v4-flash-official" => Some(("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash-Official__dev")),
+        "deepseek-v4-pro" => Some(("DeepSeek-V4-Pro", "deepseek_v4_pro__dev")),
+        "deepseek-v4-pro-official" => Some(("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro-Official__dev")),
+        "kimi-k2.6" => Some(("kimi-k2.6", "kimi-k2.6__dev")),
+        "kimi-k2.7-code" => Some(("kimi-k2.7-code", "kimi-k2.7-code__dev")),
+        "kimi-k3" => Some(("kimi-k3", "kimi-k3__dev")),
+        "minimax-m3" => Some(("minimax-m3", "minimax-m3__dev")),
+        "qwen3.8-max" => Some(("qwen3.8-max", "qwen3.8-max__dev")),
+        "qwen-3.7-plus" => Some(("qwen-3.7-plus", "qwen-3.7-plus__dev")),
+        _ => None,
+    };
+    match known {
+        Some((cfg, mn)) => (cfg.to_string(), mn.to_string()),
+        None => {
+            // 未知模型（官网同步新增）：config_name 原样透传，model_name 采用 __dev 后缀约定
+            let cfg = model.to_string();
+            let mn = format!("{}__dev", cfg);
+            (cfg, mn)
+        }
     }
 }
 
@@ -52,12 +62,17 @@ fn gen_uuid_like() -> String {
 
 /// OpenAI 请求体 → llm_utils_chat 请求体改写
 /// llm_utils_chat 消耗通用积分(product_id 208)
+///
+/// - `data_dir`：Some 时启用 function 覆盖的自学习配置（api_models.json）
+/// - `force_function`：Some 时强制使用指定 function（4001 模型不可用重试场景）
 pub fn prepare_llm_chat_body(
     src: &[u8],
     default_model: &str,
     uid: &str,
     device_id: &str,
     machine_id: &str,
+    data_dir: Option<&std::path::Path>,
+    force_function: Option<&str>,
 ) -> Vec<u8> {
     let mut obj: Value = match serde_json::from_slice(src) {
         Ok(v) => v,
@@ -122,8 +137,12 @@ pub fn prepare_llm_chat_body(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default_model.to_string());
     let (config_name, model_name) = model_config(&model);
-    // 部分客户端内置模型仅在 solo_agent 下可用（实测），按模型分发 function
-    let function = super::models_sync::function_for_model(&model.to_lowercase());
+    // function 分派优先级：4001 重试强制 > api_models.json 自学习覆盖 > 内置兜底规则
+    let model_lower = model.to_lowercase();
+    let function = force_function
+        .map(str::to_string)
+        .or_else(|| data_dir.and_then(|d| super::models_sync::function_override(d, &model_lower)))
+        .unwrap_or_else(|| super::models_sync::function_for_model(&model_lower).to_string());
 
     // normalize tool_choice and tools (reuse existing logic)
     normalize_tool_choice(obj_mut);
