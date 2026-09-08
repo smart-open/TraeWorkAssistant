@@ -31,7 +31,7 @@ cargo test                                    # Rust 单测（需先装工具链
 |---|---|
 | 外壳 | Tauri 2.x (Rust 1.75+ MSVC) |
 | 前端 | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 + lucide-react |
-| 后端 | Rust (serde / chrono / axum / ureq / tauri-plugin-{shell,dialog,notification}) |
+| 后端 | Rust (serde / chrono / axum / ureq / tauri-plugin-{shell,dialog,notification,single-instance}) |
 | 辅助 | Python 3.9+（仅标准库 + `cryptography`）+ PowerShell 5.1+（系统自带） |
 
 ## 4. 目录地图

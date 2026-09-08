@@ -13,6 +13,8 @@ tauri = { version = "2", features = [ "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
+# 单实例防护：第二进程启动时聚焦已有实例主窗口后自动退出（仅正式版注册，见 main.rs）
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
