@@ -48,6 +48,7 @@ export default function ApiService() {
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
   const [refreshingPool, setRefreshingPool] = useState(false);
   const [copying, setCopying] = useState(false);
+  const [copyingKey, setCopyingKey] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [syncingModels, setSyncingModels] = useState(false);
 
@@ -246,6 +247,18 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
     }
   };
 
+  const copyApiKey = async () => {
+    if (!form?.api_key) return;
+    try {
+      await navigator.clipboard.writeText(form.api_key);
+      toast('success', 'API Key 已复制到剪贴板');
+      setCopyingKey(true);
+      setTimeout(() => setCopyingKey(false), 1200);
+    } catch {
+      toast('error', '复制失败');
+    }
+  };
+
   const running = status?.running ?? false;
   const poolCount = enabledUids.size;
 
@@ -362,20 +375,38 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
               <div className="relative">
                 <input
                   type={showApiKey ? 'text' : 'password'}
-                  className="input pr-10"
+                  className="input pr-16"
                   placeholder="sk-..."
                   value={form?.api_key ?? ''}
                   onChange={(e) => update('api_key', e.target.value)}
                   disabled={running}
                 />
-                <button
-                  type="button"
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300"
-                  onClick={() => setShowApiKey((v) => !v)}
-                  tabIndex={-1}
-                >
-                  {showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}
-                </button>
+                <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
+                  {form?.api_key && (
+                    <button
+                      type="button"
+                      className="text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300"
+                      onClick={copyApiKey}
+                      tabIndex={-1}
+                      title="复制 API Key"
+                    >
+                      {copyingKey ? (
+                        <CheckCircle2 size={16} className="text-emerald-500" />
+                      ) : (
+                        <Copy size={16} />
+                      )}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300"
+                    onClick={() => setShowApiKey((v) => !v)}
+                    tabIndex={-1}
+                    title={showApiKey ? '隐藏 API Key' : '查看 API Key'}
+                  >
+                    {showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
               </div>
               <p className="mt-1 text-xs text-slate-400">
                 客户端请求需携带 Authorization: Bearer &lt;key&gt;
