@@ -102,6 +102,7 @@ ai-work-assistant/
 | API | `api_server_start(port)` / `api_server_stop()` / `api_server_status()` | API 网关启停 |
 | API | `pool_list` / `pool_set` / `pool_status` | 账号池管理 |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
+| API | `api_models_list()` / `api_models_sync()` | 模型列表读取（api_models.json）/ 官网同步（不消耗积分，最多试 3 账号） |
 | 日志 | `logs_query({ opts: { log_type, date, keyword, limit } })` → `LogLine[]` | `split_time` 会 strip BOM 前缀 |
 | 设置 | `settings_get()` / `settings_set(patch: Settings)` | Settings 全部 snake_case |
 | 计划 | `task_register(time)` / `task_status()` / `task_unregister()` | `schtasks` 注册每日签到 |

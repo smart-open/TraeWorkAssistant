@@ -296,7 +296,7 @@ fn now_ts() -> i64 {
 
 /// 确定性派生 hex 字符串（与 device_proxy.py 的 _seeded_stream 算法一致）
 /// 用于从 uid 生成 machine_id，保证同一账号始终得到同一设备标识
-fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
+pub(crate) fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
     let data = format!("{}:{}", salt, seed);
     let mut out = Vec::new();
     let mut i: u32 = 0;

@@ -16,6 +16,7 @@ import type {
   LocalEntitlement,
   ImportReport,
   LogLine,
+  ModelOption,
   OAuthLoginUrl,
   OAuthLoginResult,
   PoolStatus,
@@ -180,6 +181,8 @@ export const api = {
     }),
     debugToggle: () => invoke<boolean>('api_debug_toggle'),
     debugStatus: () => invoke<boolean>('api_debug_status'),
+    modelsList: () => invoke<ModelOption[]>('api_models_list'),
+    modelsSync: () => invoke<ModelOption[]>('api_models_sync'),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),

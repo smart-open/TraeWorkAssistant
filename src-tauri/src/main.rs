@@ -125,6 +125,8 @@ fn main() {
             commands::api_server::api_logs_search,
             commands::api_server::api_debug_toggle,
             commands::api_server::api_debug_status,
+            commands::api_server::api_models_list,
+            commands::api_server::api_models_sync,
             commands::profile::profile_list,
             commands::profile::profile_backup,
             commands::profile::profile_restore,

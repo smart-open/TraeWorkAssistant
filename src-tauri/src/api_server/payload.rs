@@ -2,17 +2,29 @@ use serde_json::{json, Value};
 
 /// 模型显示名 → (canonical config_name, 内部 model_name) 映射
 /// 大小写不敏感：客户端可传入 "doubao-seed-2.1-turbo" 或 "Doubao-Seed-2.1-Turbo"
+/// 与上游 batch_get_detail_param（solo_work_lite，2026-09 实测）同步
 fn model_config(model: &str) -> (&'static str, &'static str) {
     match model.to_lowercase().as_str() {
+        "doubao-seed-evolving" => ("Doubao-Seed-Evolving", "Doubao-Seed-Evolving__dev"),
+        "doubao-seed-2.1-pro" | "seed-code-pro-0430" => ("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev"),
+        "doubao-seed-2.1-turbo" => ("Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev"),
+        "doubao-seed-code" => ("Doubao-Seed-Code", "Doubao-Seed-Code__dev"),
+        "glm-5.3-flash" => ("glm-5.3-flash", "glm-5.3-flash__dev"),
+        "qwen3.8-flash" => ("qwen3.8-flash", "qwen3.8-flash__dev"),
+        "glm-5.2" => ("glm-5.2", "glm-5.2__dev"),
+        "glm-5.3" => ("glm-5.3", "glm-5.3__dev"),
+        "glm-5" => ("glm-5", "glm-5__dev"),
+        "glm-5-turbo" => ("glm-5-turbo", "glm-5-turbo__dev"),
         "deepseek-v4-flash" => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
         "deepseek-v4-flash-official" => ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash-Official__dev"),
         "deepseek-v4-pro" => ("DeepSeek-V4-Pro", "deepseek_v4_pro__dev"),
-        "glm-5.2" => ("glm-5.2", "glm-5.2__dev"),
-        "glm-5.3" => ("glm-5.3", "glm-5.3__dev"),
-        "doubao-seed-2.1-pro" | "seed-code-pro-0430" => ("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev"),
-        "doubao-seed-2.1-turbo" => ("Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev"),
+        "deepseek-v4-pro-official" => ("DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro-Official__dev"),
+        "kimi-k2.6" => ("kimi-k2.6", "kimi-k2.6__dev"),
         "kimi-k2.7-code" => ("kimi-k2.7-code", "kimi-k2.7-code__dev"),
+        "kimi-k3" => ("kimi-k3", "kimi-k3__dev"),
         "minimax-m3" => ("minimax-m3", "minimax-m3__dev"),
+        "qwen3.8-max" => ("qwen3.8-max", "qwen3.8-max__dev"),
+        "qwen-3.7-plus" => ("qwen-3.7-plus", "qwen-3.7-plus__dev"),
         _ => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
     }
 }
@@ -119,7 +131,9 @@ pub fn prepare_llm_chat_body(
     obj_mut.insert("config_name".into(), json!(config_name));
     obj_mut.insert("model_name".into(), json!(model_name));
     obj_mut.insert("stream".into(), json!(true));
-    obj_mut.insert("function".into(), json!(super::FUNCTION));
+    // 部分客户端内置模型仅在 solo_agent 下可用（实测），按模型分发 function
+    let function = super::models_sync::function_for_model(&model.to_lowercase());
+    obj_mut.insert("function".into(), json!(function));
     obj_mut.insert("max_tokens".into(), json!(4096));
     obj_mut.insert("conversation_id".into(), json!(gen_uuid_like()));
     obj_mut.insert("user_id".into(), json!(uid));

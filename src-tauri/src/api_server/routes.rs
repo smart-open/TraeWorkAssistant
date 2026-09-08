@@ -658,22 +658,21 @@ fn safe_slice(s: &str, n: usize) -> &str {
 
 fn static_models() -> Vec<Value> {
     let names = [
-        "doubao-seed-2.1-pro",
-        "doubao-seed-2.1-turbo",
-        "doubao-seed-2.0-code",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "glm-5.2",
+        "Doubao-Seed-Evolving",
+        "Doubao-Seed-2.1-Pro",
+        "Doubao-Seed-2.1-Turbo",
         "glm-5.3",
-        "glm-5-turbo",
-        "glm-5",
-        "kimi-k2.7-code",
+        "glm-5.2",
+        "DeepSeek-V4-Flash-Official",
+        "DeepSeek-V4-Flash",
+        "DeepSeek-V4-Pro-Official",
+        "DeepSeek-V4-Pro",
         "kimi-k3",
+        "kimi-k2.7-code",
         "kimi-k2.6",
         "minimax-m3",
+        "qwen3.8-max",
         "qwen-3.7-plus",
-        "sagitta",
-        "aquila",
     ];
     names
         .iter()

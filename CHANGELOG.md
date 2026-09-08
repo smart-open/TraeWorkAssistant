@@ -8,6 +8,7 @@
 
 ### 新增
 
+- **模型列表配置化与官网同步**（自 2.x v2.8.0 移植）：新增 `models_sync` 模块——模型下拉列表持久化在 `api_models.json`（缺失时写入内置默认 18 个模型）；ApiService 页新增「同步官网模型」按钮，重放 Trae 客户端 `batch_get_detail_param` 配置接口获取权威列表（不消耗积分，自动跳过内部/隐藏模型并按默认顺序归位）；`payload` 模型映射表同步扩充至官网最新（新增 Doubao-Seed-Evolving / Doubao-Seed-Code / DeepSeek-V4-Pro-Official / kimi-k2.6 / kimi-k3 / qwen3.8-flash / qwen3.8-max 等）；实测 glm-5.3-flash / qwen3.8-flash / Doubao-Seed-Code 仅在 `function=solo_agent` 下可用，改为按模型分发 function；`/v1/models` 静态列表同步更新（移除已下线的 sagitta / aquila / doubao-seed-2.0-code / glm-5 / glm-5-turbo）。
 - **单实例防护**：重复启动应用（双击/自启动后再点）时，不再产生第二个进程——已有实例的主窗口自动还原、显示并聚焦，新进程自动退出。基于官方 `tauri-plugin-single-instance` 实现，仅正式版启用（dev 模式与已安装版共用 identifier，启用会互相顶替干扰调试）。
 
 ### 修复

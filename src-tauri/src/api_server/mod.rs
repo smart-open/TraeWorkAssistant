@@ -1,5 +1,6 @@
 pub mod api_logger;
 pub mod auth;
+pub mod models_sync;
 pub mod pool;
 pub mod payload;
 pub mod routes;
