@@ -1,4 +1,4 @@
-# AGENT.md — Trae Work Assistant v2.7.2
+# AGENT.md — Trae Work Assistant v2.8.0
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 
@@ -201,6 +201,17 @@ trae-work-assistant/
 - 一个提交包含多类变更时，按最高级别升位；版本同步提交本身不再升位
 - **GitHub Release 标题固定格式**：`v{MAJOR}.{MINOR}.{PATCH} 版本发布`（如 `v2.7.2 版本发布`），不额外加描述后缀
 
+**版本升级触发与全流程**（硬约束）：
+
+- **不主动升版本**：仅当用户明确说「升级版本」时才升版；普通提交一律不动版本号
+- 用户说「升级版本」后，按序执行完整发布流程，不可跳步：
+  1. **调整版本**：`npm run set-version <x.y.z>` 同步全部文件 + CHANGELOG.md 手动新增条目
+  2. **编译**：`npm run tauri build` → `python scripts/package_portable.py` → `python scripts/rename_release.py`（产物进 `release/`）
+  3. **提交**：按 11.1 规则升位并 commit
+  4. **推送分支**
+  5. **打 tag 并推送**：`git tag -a vX.Y.Z -m "vX.Y.Z 版本发布"` + `git push origin vX.Y.Z`
+  6. **发布 Release**：创建 `vX.Y.Z 版本发布` release（notes 取自 CHANGELOG 对应条目），并上传 3 个资产：`*_x64-setup.exe`（NSIS）、`*_x64_portable.zip`、`*_x64_zh-CN.msi`——Release 不带资产则自更新无法安装
+
 ## 12. 安全与合规
 
 - **零外发**：不连接任何自有后端。
@@ -221,6 +232,7 @@ trae-work-assistant/
 
 ## 14. 已知约束
 
+- **单实例**：经 `tauri-plugin-single-instance`（main.rs 最先注册，仅正式版启用）——二次启动不新开进程，插件通知已有实例唤起主窗口（unminimize + show + focus）后自身退出；dev 与已安装版共用 identifier，dev 模式不启用以免互相顶替干扰调试。
 - 仅 Windows（代理证书安装 + MachineGuid 重置只在 Windows 验证）。
 - PowerShell 切换桥需 Win10/11 自带 PowerShell 5.1+。
 - `profiles_dir` 路径为 `data_dir.join("data").join("profiles")`，注意 `data/` 子目录。
