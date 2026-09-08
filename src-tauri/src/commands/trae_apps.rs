@@ -291,7 +291,8 @@ fn pool_uid_set(accounts: &crate::models::AccountsFile) -> std::collections::Has
 }
 
 /// F-08：扫描本机两个 Trae 应用的登录账号（推导 Cloud-IDE uid，标记是否已入池）。
-#[tauri::command]
+/// async 派发：全表读取 state.vscdb（可达数十 MB）+ storage.json，同步命令会冻住 UI。
+#[tauri::command(async)]
 pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> {
     let accounts: crate::models::AccountsFile =
         fs_utils::read_json(&state.path("checkin_accounts.json"));
@@ -580,16 +581,24 @@ fn query_pay_status(jwt: &str) -> Result<PayStatusEntry, String> {
         .map_err(|e| format!("API 请求失败: {}", e))?;
     let body: serde_json::Value =
         resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+    // 业务异常响应（2xx 但缺关键字段）必须报错而非静默降级为 Free，
+    // 否则 refresh 会用错误的 "Free" 覆盖缓存中的正确套餐
+    let identity_str = body
+        .get("user_pay_identity_str")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "套餐响应异常（缺少 user_pay_identity_str）：{}",
+                serde_json::to_string(&body).unwrap_or_default().chars().take(120).collect::<String>()
+            )
+        })?;
+    let identity = body
+        .get("user_pay_identity")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "套餐响应异常（缺少 user_pay_identity）".to_string())?;
     Ok(PayStatusEntry {
-        identity_str: body
-            .get("user_pay_identity_str")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Free")
-            .to_string(),
-        identity: body
-            .get("user_pay_identity")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
+        identity_str: identity_str.to_string(),
+        identity,
         is_pay_freshman: body
             .get("is_pay_freshman")
             .and_then(|v| v.as_bool())
@@ -604,7 +613,8 @@ fn query_pay_status(jwt: &str) -> Result<PayStatusEntry, String> {
 
 /// 刷新所有账号的套餐身份（批量调用 ide_user_pay_status，写入 pay_status.json 缓存）。
 /// 返回成功数量。
-#[tauri::command]
+/// async 派发：逐账号串行网络请求（每个最长 60s），同步命令跑主线程会冻住 UI。
+#[tauri::command(async)]
 pub fn refresh_pay_status(state: State<AppState>) -> Result<usize, String> {
     let accounts: crate::models::AccountsFile =
         fs_utils::read_json(&state.path("checkin_accounts.json"));

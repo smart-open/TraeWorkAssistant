@@ -33,6 +33,7 @@ import { Badge, EmptyState, Modal } from '../components/ui';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
+import { cn } from '../lib/cn';
 import type { AccountView, CreditDetail, DiscoveredAccount, GroupView, JwtParseResult, ProfileInfo } from '../types';
 
 const PRESET_COLORS = [
@@ -148,9 +149,18 @@ function CreditCell({ account }: { account: AccountView }) {
     api.accounts
       .creditDetail(account.user_id)
       .then(setDetail)
-      .catch(() => setDetail(null))
+      .catch(() => {
+        setDetail(null);
+        fetchedRef.current = false; // 失败后允许下次悬停重试
+      })
       .finally(() => setLoading(false));
   };
+
+  // 积分数据刷新后清除过期明细缓存，下次悬停重新拉取
+  useEffect(() => {
+    fetchedRef.current = false;
+    setDetail(null);
+  }, [account.remaining_credits]);
 
   const enter = (e: React.MouseEvent<HTMLElement>) => {
     if (account.remaining_credits == null) return;
@@ -203,6 +213,7 @@ function CreditCell({ account }: { account: AccountView }) {
                 {detail.packs.length > 0 && (
                   <div className="max-h-44 space-y-1 overflow-auto">
                     {detail.packs.map((p, i) => {
+                      const noExpire = p.expire_time >= 4102444800; // 长期有效哨兵（2100-01-01）
                       const days = Math.max(0, Math.floor((p.expire_time - Date.now() / 1000) / 86400));
                       const hours = Math.max(0, Math.floor(((p.expire_time - Date.now() / 1000) % 86400) / 3600));
                       return (
@@ -216,7 +227,7 @@ function CreditCell({ account }: { account: AccountView }) {
                           <div className="shrink-0 text-right tabular-nums">
                             <span className="font-medium">{fmtCredits(p.remaining)}</span>
                             <span className="ml-1 text-slate-400">
-                              {days > 0 ? `${days}天后过期` : `${hours}小时后过期`}
+                              {noExpire ? '长期有效' : days > 0 ? `${days}天后过期` : `${hours}小时后过期`}
                             </span>
                           </div>
                         </div>
@@ -261,6 +272,8 @@ export default function Accounts() {
   const profiles = useAppStore((s) => s.profiles);
   const profileProgress = useAppStore((s) => s.profileProgress);
   const profileActive = useAppStore((s) => s.profileActive);
+  const profileApp = useAppStore((s) => s.profileApp);
+  const setProfileApp = useAppStore((s) => s.setProfileApp);
   const profileBackup = useAppStore((s) => s.profileBackup);
   const profileRestore = useAppStore((s) => s.profileRestore);
   const profileDelete = useAppStore((s) => s.profileDelete);
@@ -281,6 +294,10 @@ export default function Accounts() {
   const [scanOpen, setScanOpen] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [discovered, setDiscovered] = useState<DiscoveredAccount[] | null>(null);
+  // 正在入池的账号（per-item loading，防重复点击）
+  const [addingUid, setAddingUid] = useState<string | null>(null);
+  // 导入账号进行中（按钮 loading，防重复点击）
+  const [importing, setImporting] = useState(false);
 
   const runDiscover = async () => {
     setScanOpen(true);
@@ -297,6 +314,8 @@ export default function Accounts() {
   };
 
   const addDiscovered = async (d: DiscoveredAccount) => {
+    if (addingUid) return;
+    setAddingUid(d.user_id);
     try {
       await api.accounts.addDiscovered(d.user_id, '', d.app, d.dc_uid);
       toast('success', `账号 ${d.user_id} 已加入账号池`);
@@ -305,6 +324,8 @@ export default function Accounts() {
       void refreshAccounts();
     } catch (err) {
       toast('error', `加入失败：${String(err)}`);
+    } finally {
+      setAddingUid(null);
     }
   };
 
@@ -367,6 +388,8 @@ export default function Accounts() {
   };
 
   const importAccounts = async () => {
+    if (importing) return;
+    setImporting(true);
     try {
       const filePath = await open({
         multiple: false,
@@ -375,7 +398,9 @@ export default function Accounts() {
       if (!filePath || typeof filePath !== 'string') return;
       const content = await api.misc.readTextFile(filePath);
       const report = await api.accounts.importAccounts(content);
-      if (report.added === 0 && report.skipped > 0) {
+      if (report.total === 0) {
+        toast('warn', '导入文件中没有账号，请核对文件内容');
+      } else if (report.added === 0 && report.skipped > 0) {
         toast('warn', `未新增账号：${report.skipped} 个均已存在${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}`);
       } else {
         toast(
@@ -387,6 +412,8 @@ export default function Accounts() {
       void refreshGroups();
     } catch (err) {
       toast('error', `导入失败：${String(err)}`);
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -421,8 +448,13 @@ export default function Accounts() {
             <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
               <Download size={15} /> 导出账户
             </button>
-            <button onClick={() => void importAccounts()} className="btn-outline" title="从导出的 JSON 文件导入账号（自动去重）">
-              <Upload size={15} /> 导入账号
+            <button
+              onClick={() => void importAccounts()}
+              disabled={importing}
+              className={importing ? 'btn-outline cursor-not-allowed opacity-60' : 'btn-outline'}
+              title="从导出的 JSON 文件导入账号（自动去重）"
+            >
+              {importing ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />} 导入账号
             </button>
             <button onClick={() => setGroupOpen(true)} className="btn-outline" title="管理账号分组">
               <Tags size={15} /> 分组管理
@@ -716,6 +748,8 @@ export default function Accounts() {
         profiles={profiles}
         profileActive={profileActive}
         profileProgress={profileProgress}
+        profileApp={profileApp}
+        onSwitchApp={(app) => void setProfileApp(app)}
         onBackup={(slot) => void profileBackup(slot)}
         onRestore={(slot) => void profileRestore(slot)}
         onDelete={async (slot) => {
@@ -741,6 +775,7 @@ export default function Accounts() {
         open={scanOpen}
         scanning={scanning}
         discovered={discovered}
+        addingUid={addingUid}
         onClose={() => setScanOpen(false)}
         onAdd={(d) => void addDiscovered(d)}
         onRescan={() => void runDiscover()}
@@ -1233,6 +1268,8 @@ function ProfileModal({
   profiles,
   profileActive,
   profileProgress,
+  profileApp,
+  onSwitchApp,
   onBackup,
   onRestore,
   onDelete,
@@ -1242,6 +1279,8 @@ function ProfileModal({
   profiles: ProfileInfo[];
   profileActive: boolean;
   profileProgress: string[];
+  profileApp: 'TraeWork' | 'Trae';
+  onSwitchApp: (app: 'TraeWork' | 'Trae') => void;
   onBackup: (slot: string) => void;
   onRestore: (slot: string) => void;
   onDelete: (slot: string) => Promise<void>;
@@ -1249,6 +1288,32 @@ function ProfileModal({
   return (
     <Modal open={open} onClose={onClose} title="登录态快照管理" size="xl">
       <div className="space-y-3">
+        {/* 目标应用切换：快照按应用隔离存储（profiles / profiles_trae），F-03 参数化 */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-slate-500 dark:text-zinc-400">目标应用</span>
+          <div className="flex overflow-hidden rounded-lg border border-slate-200 dark:border-zinc-700">
+            {([
+              { app: 'TraeWork', label: 'Trae Work' },
+              { app: 'Trae', label: 'Trae CN' },
+            ] as const).map((opt) => (
+              <button
+                key={opt.app}
+                disabled={profileActive}
+                onClick={() => {
+                  if (opt.app !== profileApp) onSwitchApp(opt.app);
+                }}
+                className={cn(
+                  'px-3 py-1 text-xs transition',
+                  profileApp === opt.app
+                    ? 'bg-brand-600 text-white'
+                    : 'bg-white text-slate-600 hover:bg-slate-50 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700',
+                )}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
         {profileActive && (
           <div className="rounded-lg border border-brand-300 bg-brand-50 p-3 dark:border-brand-700 dark:bg-brand-900/20">
             <div className="mb-1 text-xs font-medium text-brand-700 dark:text-brand-300">
@@ -1540,6 +1605,7 @@ function DiscoverModal({
   open,
   scanning,
   discovered,
+  addingUid,
   onClose,
   onAdd,
   onRescan,
@@ -1547,6 +1613,7 @@ function DiscoverModal({
   open: boolean;
   scanning: boolean;
   discovered: DiscoveredAccount[] | null;
+  addingUid: string | null;
   onClose: () => void;
   onAdd: (d: DiscoveredAccount) => void;
   onRescan: () => void;
@@ -1611,8 +1678,20 @@ function DiscoverModal({
                             <CheckCircle2 size={12} /> 已入池
                           </Badge>
                         ) : d.uid_confident ? (
-                          <button onClick={() => onAdd(d)} className="btn-outline !px-2 !py-1 text-xs">
-                            <Plus size={12} /> 加入
+                          <button
+                            onClick={() => onAdd(d)}
+                            disabled={addingUid === d.user_id}
+                            className="btn-outline !px-2 !py-1 text-xs disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {addingUid === d.user_id ? (
+                              <>
+                                <Loader2 size={12} className="animate-spin" /> 加入中
+                              </>
+                            ) : (
+                              <>
+                                <Plus size={12} /> 加入
+                              </>
+                            )}
                           </button>
                         ) : (
                           <span className="text-[10px] text-slate-400">不可入池</span>

@@ -82,25 +82,48 @@ fn data_file(data_dir: &Path, name: &str) -> std::path::PathBuf {
 
 /// 读取模型列表；文件缺失或为空时写入默认列表。
 /// 兼容旧位置（base_dir/api_models.json）：命中则迁移内容到 data/ 子目录（旧文件保留不动）。
+/// 文件损坏（JSON 解析失败）：记录日志、备份为 .bak 后写入默认列表自愈，不静默。
 pub fn load_models(data_dir: &Path) -> Vec<ModelOption> {
     let path = models_file(data_dir);
-    let read_list = |p: &Path| -> Option<Vec<ModelOption>> {
-        let text = std::fs::read_to_string(p).ok()?;
+    // Ok(Some(list)) 读取成功；Ok(None) 文件缺失或空列表；Err(原因) 文件存在但损坏
+    let read_list = |p: &Path| -> Result<Option<Vec<ModelOption>>, String> {
+        let text = match std::fs::read_to_string(p) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
         match serde_json::from_str::<Vec<ModelOption>>(&text) {
-            Ok(list) if !list.is_empty() => Some(list),
-            _ => None,
+            Ok(list) if !list.is_empty() => Ok(Some(list)),
+            Ok(_) => Ok(None),
+            Err(e) => Err(format!("{} 解析失败: {e}", p.display())),
         }
     };
-    if let Some(list) = read_list(&path) {
-        return list;
+    match read_list(&path) {
+        Ok(Some(list)) => return list,
+        Err(e) => {
+            fs_utils::app_log(
+                data_dir,
+                &format!("模型列表文件损坏，备份后回退默认列表: {e}"),
+            );
+            let _ = std::fs::rename(&path, path.with_extension("json.bak"));
+        }
+        Ok(None) => {}
     }
     // 旧位置兼容迁移（v3.2.5 曾存放在数据根目录）
     let legacy = data_dir.join("api_models.json");
     if path != legacy {
-        if let Some(list) = read_list(&legacy) {
-            if fs_utils::write_json(&path, &list).is_ok() {
-                return list;
+        match read_list(&legacy) {
+            Ok(Some(list)) => {
+                if fs_utils::write_json(&path, &list).is_ok() {
+                    return list;
+                }
             }
+            Err(e) => {
+                fs_utils::app_log(data_dir, &format!("旧位置模型列表损坏，忽略: {e}"));
+            }
+            Ok(None) => {}
         }
     }
     let defaults = default_models();

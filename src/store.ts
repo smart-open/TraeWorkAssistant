@@ -67,6 +67,8 @@ interface AppState {
   profiles: ProfileInfo[];
   profileProgress: string[];
   profileActive: boolean;
+  /** 快照管理当前查看的目标应用：TraeWork=TRAE SOLO CN / Trae=Trae CN IDE（F-03 参数化） */
+  profileApp: 'TraeWork' | 'Trae';
   /** 本机两个 Trae 应用当前登录账号的套餐信息（storage.json 明文，零 API） */
   localEntitlement: LocalEntitlement | null;
 
@@ -85,6 +87,7 @@ interface AppState {
   refreshCreditsHistory: () => Promise<void>;
   refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
+  setProfileApp: (app: 'TraeWork' | 'Trae') => Promise<void>;
   refreshLocalEntitlement: () => Promise<void>;
 
   startProxy: () => Promise<void>;
@@ -179,6 +182,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   profiles: [],
   profileProgress: [],
   profileActive: false,
+  profileApp: 'TraeWork',
   localEntitlement: null,
 
   init: async () => {
@@ -680,11 +684,15 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   refreshProfiles: async () => {
     try {
-      const profiles = await api.profiles.list();
+      const profiles = await api.profiles.list(get().profileApp);
       set({ profiles });
     } catch {
       /* ignore */
     }
+  },
+  setProfileApp: async (app) => {
+    set({ profileApp: app, profiles: [] });
+    await get().refreshProfiles();
   },
   refreshLocalEntitlement: async () => {
     try {
@@ -697,7 +705,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   profileBackup: async (userId) => {
     set({ profileActive: true, profileProgress: [] });
     try {
-      await api.profiles.backup(userId);
+      await api.profiles.backup(userId, get().profileApp);
       get().pushToast('info', '正在备份登录态快照…');
     } catch (err) {
       set({ profileActive: false });
@@ -707,7 +715,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   profileRestore: async (userId) => {
     set({ profileActive: true, profileProgress: [] });
     try {
-      await api.profiles.restore(userId);
+      await api.profiles.restore(userId, get().profileApp);
       get().pushToast('info', '正在恢复登录态快照…');
     } catch (err) {
       set({ profileActive: false });
@@ -716,7 +724,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   profileDelete: async (userId) => {
     try {
-      await api.profiles.delete(userId);
+      await api.profiles.delete(userId, get().profileApp);
       await get().refreshProfiles();
       get().pushToast('info', '快照已删除');
     } catch (err) {

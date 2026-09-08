@@ -220,7 +220,10 @@ pub fn accounts_import(state: State<AppState>, content: String) -> Result<Import
         }
         groups.groups.push(crate::models::Group {
             id: id.clone(),
-            name: pick_str(g, &["name"]).unwrap_or_else(|| format!("分组 {}", &id[..4.min(id.len())])),
+            // 按字符截断（字节切片在多字节 UTF-8 边界处会 panic）
+            name: pick_str(g, &["name"]).unwrap_or_else(|| {
+                format!("分组 {}", id.chars().take(4).collect::<String>())
+            }),
             color: pick_str(g, &["color"]).unwrap_or_else(|| "#6366f1".into()),
             order: g.get("order").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
         });
@@ -722,7 +725,8 @@ fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
 
 /// 获取单账号积分明细（悬浮展示用）：
 /// 仅返回剩余 > 0 且未过期的积分包，按过期时间升序。
-#[tauri::command]
+/// async 派发：内部走网络请求（最长 120s），同步命令跑主线程会冻住 UI。
+#[tauri::command(async)]
 pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<CreditDetail, String> {
     let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
     let account = accounts
@@ -751,12 +755,12 @@ pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<Cr
         if remaining <= 0.0 {
             continue;
         }
-        // 已过期的积分包不展示
-        let Some(expire) = pack.get("expire_time").and_then(|v| v.as_i64()) else {
-            continue;
-        };
-        if expire <= now_ts {
-            continue;
+        // 已过期的积分包不展示；无 expire_time 视为长期有效（与 calc_remaining_credits 统计口径一致），
+        // 以 2100-01-01 哨兵时间戳参与排序，前端识别该值显示「长期有效」
+        if let Some(expire) = pack.get("expire_time").and_then(|v| v.as_i64()) {
+            if expire <= now_ts {
+                continue;
+            }
         }
         let product_id = base
             .and_then(|e| e.get("product_id"))
@@ -768,7 +772,11 @@ pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<Cr
             kind,
             source,
             remaining: (remaining * 100.0).round() / 100.0,
-            expire_time: expire,
+            // 无 expire_time → 长期有效哨兵（2100-01-01），排序靠后且前端特殊展示
+            expire_time: pack
+                .get("expire_time")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(4102444800),
         });
     }
     detail_packs.sort_by_key(|p| p.expire_time);
@@ -795,7 +803,8 @@ pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<Cr
 }
 
 /// 获取单个账号的剩余积分（实时请求 API）
-#[tauri::command]
+/// async 派发：内部走网络请求（最长 120s），同步命令跑主线程会冻住 UI。
+#[tauri::command(async)]
 pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Result<f64, String> {
     let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
     let account = accounts
@@ -836,7 +845,7 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
 
 /// 刷新所有账号的剩余积分（批量请求 API），返回成功数量。
 /// 同时执行自动解冻：签到成功且有积分（credits > 0）且冷却类型非 SessionDead → 清除冷却。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String> {
     let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
     let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));

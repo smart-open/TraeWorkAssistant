@@ -1,6 +1,8 @@
 # 未来规划（Roadmap）
 
-> **文档版本**: 2026-09-07 v1 · 分支 `feat/traecode_doubao`
+> **文档版本**: 2026-09-08 v1.2 · 调研分支 `feat/traecode_doubao`（已并入 `main`）
+> **v1.2 变更**: 经代码核实，F-03 / F-12 / F-23 已实现（F-03 的快照管理参数化于同日补齐：`profile_*` 命令与快照管理弹框支持 `-TargetApp`），移入「已完成」；快照目录以实际实现 `data/profiles_trae/` 为准（非原计划的 `trae_ide_profiles`）。
+> **v1.1 变更**: 补遗 8 项遗漏（F-03/F-12/F-23 Trae CN 移植、F-10、F-37/F-40、F-42/F-52）；修正 §四计数（34→35）；F-53 豁免说明。对照 `product-enhancement-inventory.md` 逐编号审查后修订。
 > **定位**: 记录已评估但**尚未实施**的功能项，作为后续迭代的排期依据。功能点编号、来源与详细方案见 `product-enhancement-inventory.md`（53 项全量盘点）、`oss-ecosystem-research.md`、`doubao-trae-switch-plan.md`。
 > **已完成基线**: 见 `product-enhancement-inventory.md` §0 及 git 提交历史。
 
@@ -15,6 +17,7 @@
 | **Trae 会员/套餐信息展示** | 账号级 + 本机应用级双视图 + 到期时间 | ① 账号级：`ide_user_pay_status` API 批量刷新缓存，账号列表套餐徽标；② 本机级：storage.json 明文键 `iCubeServerData://icube.cloudide` → `entitlementInfo`（零 API），概览页「本机套餐」卡片；③ 到期时间：`ide_user_ent_usage` 会员包提取 `expire_time`/`next_billing_time`，徽标显示「Lite · M/D到期」 |
 | **账户中心 dc id 预留记录** | `RawAccount.DcID` 字段（只记录不展示） | 切换/保存登录态成功后自动回填（live storage.json → 快照）；发现入池随写；实测 dc id 为设备/数据中心级标识，仅作未来对账预留，不参与去重合并 |
 | **F-46 账号库导入导出（基础版）** | 导出完整性优化 + JSON 导入 | 导出：版本号取 `CARGO_PKG_VERSION`、补 `dcId`/`addedAt` 字段、兜底纳入视图外原始账号；导入：`accounts_import` 命令兼容导出格式/原始格式/裸数组，按 uid+JWT 去重，分组按 id 合并，前端「导入账号」按钮选文件一键导入并报告新增/跳过数量 |
+| **F-03/F-12/F-23 Trae CN 移植三件套** | ✅ 已完成（2026-09-08 核实，F-03 快照管理参数化同日补齐） | ① 切换移植（F-03）：PS 桥 `-TargetApp TraeWork\|Trae` 全参数化（数据目录 / 快照根 `data\profiles_trae` / 进程名 / exe 候选表驱动），`switch_account` / `save_current_login` / `reset_device_ids` 带 `target_app`，Accounts 行「切换/保存到…」应用选择菜单；快照管理 `profile_*` 四命令与弹框支持目标应用切换（本次补齐）② 会话续期（F-12）：快照即保存；发现/入池账号与 Trae Work 共用账号池，`refresh_jwt` 自动续期，无 refresh_token 账号走 JWT 到期检测 + 提醒 ③ 余额展示（F-23）：剩余积分按 `product_id`（208 通用 / 209 Work）分类缓存，AccountView `general_credits`/`work_credits` 双字段，Credits 页与概览页「通用 X · Work Y」双展示 |
 | **F-39 Trae API 暴露** | ✅ 已并入现有网关（随通用积分语义统一天然覆盖双应用） | 账号池 app 无关（uid+JWT+设备指纹），上游统一 `trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`（通用积分 208，Trae/Trae Work 共享扣减）；F-08 扫描发现的 Trae（CN）账号入池即可被 `/v1` 服务；Anthropic 适配：新增 `POST /v1/messages`（Anthropic Messages 协议，x-api-key/Bearer 双鉴权），请求侧 `payload::anthropic_to_openai` 转 OpenAI 内部格式复用链路，输出侧 `sse::stream_convert_anthropic`/`aggregate_anthropic` 转换（message_start/content_block/message_delta/message_stop 事件序列 + tool_use 块），单元测试覆盖 text 与 tool 往返转换 |
 
 ---
@@ -24,6 +27,9 @@
 | 编号 | 功能点 | 说明 | 预估 | 优先级 |
 |---|---|---|---|---|
 | ~~F-39~~ | ~~**Trae API 暴露**~~ | ✅ **已完成**（2026-09-07）：核心能力随 v3.1.0 网关 + F-08 双应用发现天然达成；Anthropic `/v1/messages` 适配已补齐，详见「本轮已完成」 | — | — |
+| ~~F-03~~ | ~~**Trae CN 账号切换移植**~~ | ✅ **已完成**（2026-09-08）：PS 桥 `-TargetApp` 参数化 + Rust 三命令 `target_app` + 前端应用选择菜单；快照管理参数化同日补齐，详见「本轮已完成」 | — | — |
+| ~~F-12~~ | ~~Trae CN 会话续期~~ | ✅ **已完成**（2026-09-08 核实）：共用账号池 + `refresh_jwt` 自动续期 + 到期检测提醒，详见「本轮已完成」 | — | — |
+| ~~F-23~~ | ~~**Trae CN 余额展示**~~ | ✅ **已完成**（2026-09-08 核实）：`product_id` 208/209 分类 → `general_credits`/`work_credits` 双字段 + Credits/概览页展示，详见「本轮已完成」 | — | — |
 | F-38 | **Trae → DSH 引导（不自研）** | 引导用户安装 `dingminhua/dsh-connect-trae`（装即用）；产品化时参照其 storage.json 发现 + loopback shim 设计 | ≈0 | P1 |
 | F-41 | trae2codex 转换器 | Trae 上游为自有 `llm_utils_chat` 协议、无 Responses API，Codex CLI 不能直连；复用 `tonny0812/workbuddy2api` 投影逻辑换上游——社区空白机会 | 3 天 | P3 |
 
@@ -39,14 +45,16 @@
 | F-43 | CC Switch 协同 | 用户已用 CC Switch 管理多 provider；把本项目转换端点注册进其配置，不自建切换器 | 0.5 天 | P2 |
 | F-46 残余 | 账号库导入导出增强（残余项） | 基础版导入导出已完成（见 §一）；剩余：导入前 JSON preview 预览确认、按索引导入 | 0.5 天 | P3 |
 
-## 四、WorkBuddy / CodeBuddy 应用（34 项，按批次）
+## 四、WorkBuddy / CodeBuddy 应用（35 项，按批次）
 
 主体清单见 `product-enhancement-inventory.md` §一，按其路线图分四批：
 
 - **批次 1（快赢，~1.5 周）**：F-02 账号切换、F-04 多账号池、F-09 token 续期、F-15 一键签到、F-20 余额展示、F-22 多账号聚合趋势
-- **批次 2（API 暴露 + 成长中心）**：F-28 网关上游、F-29 调度引擎、F-30 请求规范、F-32 运维接口、F-33 错误三态、F-16 调度增强、F-17 成长中心自动化
+- **批次 2（API 暴露 + 成长中心）**：F-28 网关上游、F-29 调度引擎、F-30 请求规范、F-32 运维接口、F-33 错误三态、F-16 调度增强、F-17 成长中心自动化、F-10 token 保活双源化（dsh auth.ts「谁新用谁」方案，随本批通用项实施）
 - **批次 3（会话数据 + 用量 + CLI 桥）**：F-44 会话备份、F-45 会话复制、F-25 官方用量、F-26 本地 token 统计、F-06 CLI 切号桥、F-31 会话粘性、F-34 代理工程化、F-14 环境重置、F-50 OAuth 工具
-- **批次 4 / 远期**：F-35 ck_xxx API Key、F-21 本地 quota 兜底、F-18 UI 坐标签到、F-27 用量快照回退、F-51 活动展示、F-36 Global 区
+- **批次 4 / 远期**：F-35 ck_xxx API Key、F-40 Codex 后端转换器（F-41 trae2codex 的前置，复用其 `/v1/responses` 投影）、F-37 DSH provider（15 模型静态目录兜底）、F-21 本地 quota 兜底、F-18 UI 坐标签到、F-27 用量快照回退、F-51 活动展示、F-36 Global 区、F-42 workbuddy-mcp 模式、F-52 WorkBuddyProxy 模式
+
+> 注：F-53（dsh-codex-connect 参考定位）为纯参考项、无实施动作，不列入排期。
 
 ## 五、豆包应用（4 项，二期）
 
@@ -60,7 +68,7 @@
 ## 六、建议排序（近期 2 周）
 
 1. **F-13 到期日历** —— 套餐展示已落地，到期时间入日历是自然延伸（含 F-49 解析加固）
-2. **F-01 app_locate + F-48 桥参数化收敛** —— 为 WorkBuddy/豆包批次铺路
+2. **F-01 app_locate + F-48 桥剩余应用参数化（豆包/WorkBuddy）** —— Work/Ide 已参数化完成，扩展剩余两应用即铺平后续批次路径
 3. **WorkBuddy 批次 1** —— 端点全有开源佐证，风险最低
 4. **F-38 DSH 引导页** —— 成本≈0，随手带上
 

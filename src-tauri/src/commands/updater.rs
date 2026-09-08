@@ -263,7 +263,14 @@ pub struct UpdateDownloaded {
 }
 
 /// 校验下载目标：资产名版本必须与检查结果一致，且大于当前版本。
+/// 同时防御路径注入：资产名只允许安全文件名字符（来自 GitHub API，纵深防御）。
 fn validate_target(asset_name: &str, expected_version: &str) -> Result<(u64, u64, u64), String> {
+    if asset_name.contains(['/', '\\', ':'])
+        || asset_name.split(['.', ' ']).any(|seg| seg == "..")
+        || asset_name.contains("..")
+    {
+        return Err(format!("资产名不合法，已中止: {asset_name}"));
+    }
     let asset_ver = version_from_asset(asset_name)
         .ok_or_else(|| format!("资产名无法解析版本号: {asset_name}"))?;
     let expected = parse_version(expected_version).ok_or("目标版本号解析失败")?;
@@ -293,6 +300,19 @@ pub fn update_download(
     // 下载目录：%TEMP%\ai-work-assistant-update\
     let dir = std::env::temp_dir().join("ai-work-assistant-update");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+    // 清理历史版本残留（只删本目录下的安装包文件，保留当前目标文件）
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+            if name.as_deref() != Some(asset_name.as_str())
+                && p.is_file()
+                && p.extension().map(|e| e == "exe" || e == "msi").unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
     let dest = dir.join(&asset_name);
     // 清理同名旧文件（可能是不完整下载）
     let _ = std::fs::remove_file(&dest);

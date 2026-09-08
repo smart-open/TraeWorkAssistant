@@ -16,9 +16,21 @@ pub struct ProfileInfo {
     pub last_modified: String,
 }
 
-/// profiles 根目录：%APPDATA%\AIWorkAssistant\data\profiles\
-fn profiles_dir(state: &State<AppState>) -> PathBuf {
-    state.data_dir.join("data").join("profiles")
+/// profiles 根目录：%APPDATA%\AIWorkAssistant\data\profiles\（Trae Work）
+/// 或 data\profiles_trae\（Trae CN IDE，与切换桥 -TargetApp 参数化一致）
+fn profiles_dir(state: &State<AppState>, target_app: Option<&str>) -> PathBuf {
+    match target_app {
+        Some("Trae") => state.data_dir.join("data").join("profiles_trae"),
+        _ => state.data_dir.join("data").join("profiles"),
+    }
+}
+
+/// 归一化 target_app：仅接受 "Trae"（Trae CN IDE），其余一律视为 TraeWork
+fn normalize_target_app(target_app: Option<&str>) -> &'static str {
+    match target_app {
+        Some("Trae") => "Trae",
+        _ => "TraeWork",
+    }
 }
 
 /// 递归计算目录大小和文件数
@@ -54,10 +66,10 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// 列出所有已保存的登录态快照
+/// 列出所有已保存的登录态快照（target_app: TraeWork=TRAE SOLO CN / Trae=Trae CN IDE）
 #[tauri::command]
-pub fn profile_list(state: State<AppState>) -> Vec<ProfileInfo> {
-    let dir = profiles_dir(&state);
+pub fn profile_list(state: State<AppState>, target_app: Option<String>) -> Vec<ProfileInfo> {
+    let dir = profiles_dir(&state, target_app.as_deref());
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -94,7 +106,9 @@ pub fn profile_backup(
     app: AppHandle,
     state: State<AppState>,
     user_id: String,
+    target_app: Option<String>,
 ) -> Result<(), String> {
+    let target = normalize_target_app(target_app.as_deref());
     let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
         PathBuf::from(r).join("ps")
     } else {
@@ -105,7 +119,10 @@ pub fn profile_backup(
         return Err(format!("找不到切换脚本: {}", bridge.display()));
     }
 
-    fs_utils::app_log(&state.data_dir, &format!("开始备份登录态: user_id={user_id}"));
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!("开始备份登录态: user_id={user_id}, target_app={target}"),
+    );
 
     let mut child = std::process::Command::new("powershell")
         .args([
@@ -118,6 +135,8 @@ pub fn profile_backup(
             "BackupCurrent",
             "-UserId",
             &user_id,
+            "-TargetApp",
+            target,
             "-Json",
         ])
         .creation_flags(0x08000000)
@@ -192,12 +211,14 @@ pub fn profile_restore(
     app: AppHandle,
     state: State<AppState>,
     user_id: String,
+    target_app: Option<String>,
 ) -> Result<(), String> {
-    // 检查快照是否存在
-    let slot_dir = profiles_dir(&state).join(&user_id);
+    // 检查快照是否存在（按目标应用的 profiles 根目录）
+    let slot_dir = profiles_dir(&state, target_app.as_deref()).join(&user_id);
     if !slot_dir.exists() {
         return Err(format!("账号 {} 的登录态快照不存在", user_id));
     }
+    let target = normalize_target_app(target_app.as_deref());
 
     let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
         PathBuf::from(r).join("ps")
@@ -209,7 +230,10 @@ pub fn profile_restore(
         return Err(format!("找不到切换脚本: {}", bridge.display()));
     }
 
-    fs_utils::app_log(&state.data_dir, &format!("开始恢复登录态: user_id={user_id}"));
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!("开始恢复登录态: user_id={user_id}, target_app={target}"),
+    );
 
     let mut child = std::process::Command::new("powershell")
         .args([
@@ -222,6 +246,8 @@ pub fn profile_restore(
             "RestoreOnly",
             "-UserId",
             &user_id,
+            "-TargetApp",
+            target,
             "-Json",
         ])
         .creation_flags(0x08000000)
@@ -290,8 +316,12 @@ pub fn profile_restore(
 
 /// 删除指定 slot 的登录态快照
 #[tauri::command]
-pub fn profile_delete(state: State<AppState>, user_id: String) -> Result<(), String> {
-    let slot_dir = profiles_dir(&state).join(&user_id);
+pub fn profile_delete(
+    state: State<AppState>,
+    user_id: String,
+    target_app: Option<String>,
+) -> Result<(), String> {
+    let slot_dir = profiles_dir(&state, target_app.as_deref()).join(&user_id);
     if !slot_dir.exists() {
         return Ok(()); // 不存在视为已删除
     }

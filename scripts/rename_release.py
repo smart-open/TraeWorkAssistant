@@ -4,7 +4,8 @@
 打包产物统一命名：把 `npm run tauri build` 产出的安装包复制到 release/，
 统一使用中文产品名命名（APP 名称标识）。
 
-用法：python scripts/rename_release.py
+用法：python scripts/rename_release.py [--strict]
+  --strict  任一产物缺失时以非零码退出（默认仅告警）
   src-tauri/target/release/bundle/nsis/AI Work 助手_<ver>_x64-setup.exe
       → release/AI Work 助手_<ver>_x64-setup.exe
   src-tauri/target/release/bundle/msi/AI Work 助手_<ver>_x64_zh-CN.msi
@@ -49,6 +50,7 @@ def main():
          os.path.join(out_dir, f"{product}_{version}_x64_zh-CN.msi")),
     ]
     moved = 0
+    missing = []
     for src, dst in jobs:
         if os.path.isfile(src):
             shutil.copy2(src, dst)
@@ -56,9 +58,20 @@ def main():
             moved += 1
         else:
             print("SKIP（不存在）:", src, file=sys.stderr)
+            missing.append(src)
     if moved == 0:
         print("未找到任何安装包产物，请先执行 npm run tauri build", file=sys.stderr)
         sys.exit(1)
+    if missing:
+        print(
+            "WARNING: 有 %d 个产物缺失，上传 release 前请核对清单：" % len(missing),
+            file=sys.stderr,
+        )
+        for m in missing:
+            print("  -", m, file=sys.stderr)
+        if "--strict" in sys.argv:
+            print("--strict：缺失产物视为失败", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":

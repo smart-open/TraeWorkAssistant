@@ -144,10 +144,14 @@ export const api = {
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   profiles: {
-    list: () => invoke<ProfileInfo[]>('profile_list'),
-    backup: (userId: string) => invoke('profile_backup', { userId }),
-    restore: (userId: string) => invoke('profile_restore', { userId }),
-    delete: (userId: string) => invoke('profile_delete', { userId }),
+    list: (targetApp?: 'TraeWork' | 'Trae') =>
+      invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null }),
+    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+      invoke('profile_backup', { userId, targetApp: targetApp ?? null }),
+    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+      invoke('profile_restore', { userId, targetApp: targetApp ?? null }),
+    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae') =>
+      invoke('profile_delete', { userId, targetApp: targetApp ?? null }),
     formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
   },
   oauth: {

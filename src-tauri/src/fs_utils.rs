@@ -12,8 +12,13 @@ pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
 }
 
 /// 原子写：先写临时文件再 rename，避免断电损坏。
+/// 临时文件名带 pid+纳秒后缀：并发写者（如模型列表的读取自愈与官网同步）互不踩踏。
 pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let tmp = path.with_extension("tmp");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), nanos));
     {
         let mut f = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
         let buf = serde_json::to_vec_pretty(value).map_err(|e| format!("序列化失败: {e}"))?;

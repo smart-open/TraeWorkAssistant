@@ -324,6 +324,17 @@ Function PageLeaveReinstall
     Goto reinst_done
   ${EndIf}
 
+  ; [custom AI Work 助手] 被动模式（/P）且非更新模式：未显示选择页（$R1 无意义），
+  ; 按版本比较决策——同版本/升级 → 直接覆盖安装；降级 → 遵循 ALLOWDOWNGRADES
+  ${If} $PassiveMode = 1
+    ${If} $R0 = -1
+      !if "${ALLOWDOWNGRADES}" == "false"
+        Abort
+      !endif
+    ${EndIf}
+    Goto reinst_done
+  ${EndIf}
+
   ; $R0 holds whether same(0)/upgrading(1)/downgrading(-1) version
   ; $R1 holds the radio buttons state:
   ;   1 => first choice was selected
@@ -885,6 +896,13 @@ Section Uninstall
     SetShellVarContext current
     RmDir /r "$APPDATA\${BUNDLEID}"
     RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
+    ; [custom AI Work 助手] 业务数据目录为 %APPDATA%\AIWorkAssistant（自定义于 state.rs），
+    ; Tauri 模板默认只删 BUNDLEID 目录（WebView2 数据），此处补删真实数据目录；
+    ; 含品牌迁移前（Trae Work 助手）的遗留目录
+    RmDir /r "$APPDATA\AIWorkAssistant"
+    RmDir /r "$LOCALAPPDATA\AIWorkAssistant"
+    RmDir /r "$APPDATA\TraeWorkAssistant"
+    RmDir /r "$LOCALAPPDATA\TraeWorkAssistant"
   ${EndIf}
 
   !ifmacrodef NSIS_HOOK_POSTUNINSTALL
