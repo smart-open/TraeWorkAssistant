@@ -40,6 +40,8 @@ type UpdateState =
   | { k: 'error'; msg: string };
 
 function fmtSize(bytes: number): string {
+  // GitHub API 异常时 size 可能为 0：显示「未知大小」而非误导性的 "0 B"
+  if (bytes <= 0) return '未知大小';
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${bytes} B`;
