@@ -114,7 +114,7 @@ ai-work-assistant/
 | 双应用 | `refresh_pay_status(...)` / `accounts_backfill_dc_ids(...)` | 会员支付状态刷新 / 已有账号回填 dc id |
 | 设备 | `device_reset(userId)` | 删 `device_map.json[ uid ]` |
 | JWT | `jwt_parse(jwt)` / `refresh_jwt(userId)` | 解析 / 自动刷新（需 refresh_token） |
-| API | `api_server_start(port)` / `api_server_stop()` / `api_server_status()` | API 网关启停 |
+| API | `api_server_start()` / `api_server_stop()` / `api_server_status()` | API 网关启停（端口/默认模型由设置页提供；鉴权统一走 API Keys 列表） |
 | API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy` / `group_ids`（T10 调度策略与分组筛选） |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
 | API | `api_models_list()` / `api_models_sync()` | 模型列表读取（data/api_models.json）/ 官网同步（不消耗积分，最多试 3 账号） |

@@ -2,6 +2,11 @@
 
 > 创建时间：2026-09-09。本文档为本轮开发的任务清单与验收标准，按清单逐项开发。
 > 约束：不主动升版本号；每项完成后跑 `cargo test` + `cargo check` + `tsc/vite build` 验证。
+>
+> **分支移植说明**：本计划为 trae_work_main（v2.8.4 之后 → v2.9.0）的原始开发计划，随 T1-T11 一并归档至本分支
+> （fix_trae_optimization，基于 v3.2.7）。正文保留原始设计口径；其中 T2 的「主 Key 双轨校验 / 保留主 Key 展示」
+> 已被 **T15 追加调整（移除主 API Key，鉴权统一走 API Keys 列表）** 取代，最终实现以
+> [optimization-implementation.md](optimization-implementation.md)（含第 15 节）为准。
 
 ## 任务总览
 
