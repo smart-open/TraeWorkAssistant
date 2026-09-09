@@ -116,6 +116,13 @@ impl DayStats {
         self.models.entry(model.to_string()).or_default().add(ok);
         self.accounts.entry(uid.to_string()).or_default().add(ok);
         self.keys.entry(key_id.to_string()).or_default().add(ok);
+        // 按 Key 的 token 用量记账（审查修复：原实现（含参考分支）遗漏此写入，
+        // 导致前端 Key 表「今日已用(次/tok)」的 token 部分恒为空）
+        {
+            let kt = self.key_tokens.entry(key_id.to_string()).or_insert((0, 0));
+            kt.0 += prompt_tokens;
+            kt.1 += completion_tokens;
+        }
     }
 }
 
@@ -316,6 +323,9 @@ mod tests {
         assert_eq!(d.accounts.get("u2").unwrap().requests, 1);
         assert_eq!(d.keys.get("master").unwrap().requests, 2);
         assert_eq!(d.keys.get("k2").unwrap().requests, 1);
+        // 按 Key 的 token 用量记账（m1/u1/master 两请求：10+0 prompt、20+0 completion）
+        assert_eq!(d.key_tokens.get("master"), Some(&(10, 20)));
+        assert_eq!(d.key_tokens.get("k2"), Some(&(5, 8)));
         // 平均耗时 = (100+300+50)/3 = 150
         let view = UsageDayView::from_day(&today, d);
         assert_eq!(view.avg_duration_ms, 150);

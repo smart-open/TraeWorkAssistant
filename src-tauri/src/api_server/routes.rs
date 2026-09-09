@@ -788,7 +788,8 @@ fn openai_error(status: StatusCode, code: &str, msg: &str) -> Response {
 }
 
 /// Anthropic 错误响应格式：{"type":"error","error":{"type","message"}}
-fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> Response {    let body = json!({
+fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> Response {
+    let body = json!({
         "type": "error",
         "error": {
             "type": err_type,
