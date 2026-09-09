@@ -203,6 +203,8 @@ export interface Settings {
   doubao_renew_url: string | null;
   /** 豆包会员额度接口（抓包固化后填入；null = 额度查询不可用） */
   doubao_quota_url: string | null;
+  /** 豆包快照可选纳入 Default/IndexedDB（对话历史等完整状态随账号迁移；体积代价大） */
+  doubao_snapshot_include_idb: boolean;
   /** WorkBuddy 桌面版 exe 手动路径（随后续批次接入） */
   workbuddy_path: string | null;
   data_dir: string | null;
@@ -327,6 +329,18 @@ export interface DoubaoAccountView {
   added_at: string | null;
   /** 会话状态（P3）：ok=有效 / expired=已过期 / unknown=未探活 / none=无 sessionid */
   session_state: 'ok' | 'expired' | 'unknown' | 'none';
+  /** 明文 sessionid（编辑弹框回填用，仅本地） */
+  session_id: string | null;
+  /** sid_guard 原文（编辑弹框回填用） */
+  sid_guard: string | null;
+  /** 会员等级（null = 免费或未识别；quota_checked_at 非空表示已查询过） */
+  quota_level: string | null;
+  /** 会员到期时间（免费账号为 null） */
+  quota_expire_at: string | null;
+  /** 额度状态一句话（如 "图片 80/100 · 视频 3/10"） */
+  quota_summary: string | null;
+  /** 最近一次额度查询时间 */
+  quota_checked_at: string | null;
   session_expire_at: string | null;
   cookies_synced_at: string | null;
   last_renew_at: string | null;
@@ -349,6 +363,14 @@ export interface DoubaoRenewSummary {
 /** 豆包切换/保存的目标应用参数（与 switch_account / save_current_login 的 target_app 对齐） */
 export type DoubaoTargetApp = 'Doubao';
 
+/** 代理自动抓到的豆包会话凭证（device_proxy.py 写 doubao_captured_credentials.json，Rust doubao.rs 透传） */
+export interface DoubaoCapturedCredential {
+  session_id: string;
+  sid_guard: string;
+  host: string;
+  captured_at: string;
+}
+
 /** doubao_quota.py 摘要 JSON（会员额度查询结果；字段由宽容解析尽力得到，均可为 null） */
 export interface DoubaoQuotaResult {
   ok: boolean;
@@ -358,12 +380,43 @@ export interface DoubaoQuotaResult {
   parsed: {
     level: string | number | null;
     expire_at: string | null;
-    items: { name: string; total: string | number; left: string | number | null; used: string | number | null }[];
+    is_gift?: boolean | null;
+    has_subscription?: boolean | null;
+    /** 订阅记录（对齐客户端「订阅记录」页；免费账号为 null） */
+    subscription: {
+      name: string | null;
+      period_days: number | null;
+      start_at: string | null;
+      expire_at: string | null;
+      is_gift: boolean | null;
+      active: boolean;
+    } | null;
+    items: (
+      | { name: string; total: string | number; left: string | number | null; used: string | number | null }
+      | { name: string; used_percent: number; exhausted: boolean; reset_at: string | null }
+    )[];
   };
-  /** 响应顶层键路径摘要（端点调试用） */
-  raw_keys: string[];
-  raw_preview: string;
-  finished_at: string;
+  finished_at?: string;
+}
+
+/** 豆包运维历史事件（keepalive/renew/quota；doubao_health_history.json） */
+export interface DoubaoHistoryEvent {
+  ts: string;
+  kind: 'keepalive' | 'renew' | 'quota';
+  ok: boolean;
+  uid?: string;
+  level?: string | null;
+  summary?: string | null;
+  windows?: { name: string; used_percent: number; reset_at: string }[];
+  source?: string;
+}
+
+/** 豆包快照版本元数据（C3：snapshot_meta.json + Last Version；schema_version 0 = 旧版快照无元数据） */
+export interface DoubaoSnapshotMeta {
+  schema_version: number;
+  created_at: string;
+  chromium_version: string;
+  include_idb: boolean;
 }
 
 // ---- OAuth 登录 ----

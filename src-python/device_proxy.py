@@ -31,6 +31,7 @@ import ssl
 import socket
 import shutil
 import threading
+import time
 import base64
 import random
 import uuid
@@ -157,6 +158,13 @@ def decompress_body(body, resp_headers):
                 return brotli.decompress(body)
             except ImportError:
                 return body  # 无法解压，返回原始字节
+        elif encoding == "zstd":
+            # zstd：尝试导入 zstandard 库，不可用时跳过（accept-encoding 已降级，正常不会走到）
+            try:
+                import zstandard
+                return zstandard.ZstdDecompressor().decompress(body, max_output_size=max(len(body) * 40, 1 << 22))
+            except ImportError:
+                return body
     except Exception:
         pass
     return body
@@ -263,6 +271,7 @@ _seen_auth_hints = set()
 TARGET_DOMAINS = [
     "trae.cn", "trae.com.cn", "mchost.guru",
     "zijieapi.com", "bytedance.com", "volcengine.com", "volces.com", "treecode.com",
+    "doubao.com",
 ]
 # 支持从环境变量覆盖域名列表（桌面端设置页可配置）
 _env_domains = os.environ.get("PROXY_DOMAINS", "")
@@ -609,6 +618,70 @@ def try_capture_refresh_token_from_response(host, path, resp_body):
     log(f"  [refresh_token] 响应中含 refresh_token 但无法提取 user_id，跳过")
 
 
+# ---------------- 豆包会话凭证自动抓取（sessionid / sid_guard） ----------------
+# 豆包桌面客户端 cookie 为客户端级二次加密、无法离线提取明文，手动抓包对用户门槛过高。
+# 代理在 MITM 解密 doubao.com 请求时，直接从请求 Cookie 头提取 sessionid / sid_guard
+# （网页版登录后浏览器每次请求都会携带），落盘 data/doubao_captured_credentials.json，
+# 供编辑弹框「从代理抓包自动填充」一键读取。凭证等同密码，仅存本地。
+DOUBAO_CREDENTIAL_FILE = os.path.join(DATA_SUBDIR, "doubao_captured_credentials.json")
+DOUBAO_CREDENTIAL_COOKIES = ("sessionid", "sid_guard")
+_doubao_captured_cache = {}  # 进程内去重：内容未变化不重写文件
+
+
+def _parse_cookie_header(cookie_str):
+    """Cookie 请求头 → dict（宽松解析，容忍空段与引号）。"""
+    out = {}
+    for part in (cookie_str or "").split(";"):
+        if "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        k = k.strip()
+        if k:
+            out[k] = v.strip().strip('"')
+    return out
+
+
+def try_capture_doubao_credentials(host, req_headers, resp_headers):
+    """doubao.com 域请求的 Cookie 中提取会话凭证，变化时写抓包文件。"""
+    try:
+        h = (host or "").lower()
+        if not h.endswith(DOUBAO_HOST_SUFFIX):
+            return
+        cookie = req_headers.get("Cookie") or req_headers.get("cookie") or ""
+        jar = _parse_cookie_header(cookie)
+        # 兜底：响应 Set-Cookie 里也可能带新签发的 sessionid / sid_guard
+        for k, v in resp_headers.items() if isinstance(resp_headers, dict) else resp_headers:
+            if (k or "").lower() != "set-cookie":
+                continue
+            first = (v or "").split(";")[0]
+            if "=" in first:
+                ck, _, cv = first.partition("=")
+                ck = ck.strip()
+                if ck in DOUBAO_CREDENTIAL_COOKIES and not jar.get(ck):
+                    jar[ck] = cv.strip()
+        session_id = jar.get("sessionid", "")
+        sid_guard = jar.get("sid_guard", "")
+        if not session_id:
+            return
+        captured = {
+            "session_id": session_id,
+            "sid_guard": sid_guard,
+            "host": h,
+            "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if _doubao_captured_cache.get("session_id") == session_id and \
+                _doubao_captured_cache.get("sid_guard") == sid_guard:
+            return  # 未变化不重写
+        _doubao_captured_cache.update(captured)
+        os.makedirs(DATA_SUBDIR, exist_ok=True)
+        with open(DOUBAO_CREDENTIAL_FILE, "w", encoding="utf-8") as f:
+            json.dump(captured, f, ensure_ascii=False, indent=2)
+        log(f"  [doubao] 抓到会话凭证: sessionid={len(session_id)} 字符"
+            + (f"，sid_guard={len(sid_guard)} 字符" if sid_guard else ""))
+    except Exception as e:  # noqa: BLE001
+        log(f"  [doubao] 凭证抓取异常: {e}")
+
+
 # ---------------- 本地 Cookies 解密捕获 JWT (仅 Windows) ----------------
 # 背景：当前版本 TRAE 的鉴权请求(api.trae.cn)不走 Chromium `--proxy-server` 代理，
 # MITM 代理抓不到 Cloud-IDE-JWT。但 TRAE 把登录态存在本地 Cookies(Chromium 格式)，
@@ -785,6 +858,7 @@ _leaf_cache = {}
 _LEAF_CACHE_MAX = 50  # 最多缓存 50 个域名的叶子证书，防止内存无限增长
 import tempfile
 import threading
+import time
 _leaf_lock = threading.Lock()  # 保护叶子证书生成与缓存，避免并发同名文件覆盖导致 KEY_VALUES_MISMATCH
 
 def ensure_ca():
@@ -1287,6 +1361,11 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
     timeout = 300 if is_stream else 30
     conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=timeout)
     fwd = {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
+    # accept-encoding 降级为 gzip/deflate：br/zstd 无标准库解压支持，会让响应体在
+    # 请求日志里不可读、豆包端点嗅探失效；客户端本就声明支持 gzip，降级对业务透明。
+    for k in list(fwd):
+        if k.lower() == "accept-encoding":
+            fwd[k] = "gzip, deflate"
     try:
         body_arg = body if method.upper() != "GET" else None
         conn.request(method, path, body=body_arg, headers=fwd)
@@ -1303,6 +1382,8 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
         # 捕获 ExchangeToken 响应中的 refresh_token
         if "ExchangeToken" in path or "oauth" in path.lower():
             try_capture_refresh_token_from_response(host, path, resp_body)
+        # 豆包会话凭证抓取（sessionid / sid_guard，自动回写当前账号）
+        try_capture_doubao_credentials(host, headers, resp.getheaders())
         # 记录到代理请求日志
         pl = get_proxy_logger()
         if pl:

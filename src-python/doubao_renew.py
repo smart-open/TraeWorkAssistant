@@ -15,7 +15,7 @@
   1. --sync-only（诊断模式）：解密当前 User Data 与各快照槽的目标 cookie，报告可解性与明文
      特征（不写入账号池——密文不能当 sessionid 用）。
   2. 默认模式：对池内手动录入 sessionid 的账号探活保活端点（settings.doubao_renew_url，
-     默认 https://www.doubao.com/）；200=有效（Set-Cookie 新值回写），302→passport / 401=
+     默认 https://www.doubao.com/info/v2/）；200=有效（Set-Cookie 新值回写），302→passport / 401=
      标记过期；sid_guard 到期时间一并解析。
   3. 结果写 <data_dir>/data/doubao_renew_result.json，stdout 输出一行摘要 JSON。
 
@@ -33,13 +33,21 @@ import os
 import shutil
 import sqlite3
 import sys
+
+# 中文 Windows 管道默认 GBK：强制 stdout/stderr UTF-8，供桌面端按 UTF-8 解码
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except AttributeError:
+    pass
 import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_RENEW_URL = "https://www.doubao.com/"
+# 轻量探活端点（必须登录）：200=有效 / 302→passport=过期；代理日志实测确认
+DEFAULT_RENEW_URL = "https://www.doubao.com/info/v2/"
 TARGET_COOKIES = ("sessionid", "sessionid_ss", "sid_tt", "uid_tt", "sid_guard")
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 

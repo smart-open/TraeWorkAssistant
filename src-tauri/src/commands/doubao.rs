@@ -53,6 +53,19 @@ pub struct DoubaoAccount {
     /// 会话来源：live=当前 User Data / snapshot=快照槽解密
     #[serde(default)]
     pub session_source: Option<String>,
+    // ── P4 会员额度缓存（doubao_quota_fetch 成功后回写，供列表徽标/悬停提示展示）──
+    /// 会员等级（None = 免费或未识别）
+    #[serde(default)]
+    pub quota_level: Option<String>,
+    /// 会员到期时间
+    #[serde(default)]
+    pub quota_expire_at: Option<String>,
+    /// 额度状态一句话（如 "图片 80/100 · 视频 3/10"）
+    #[serde(default)]
+    pub quota_summary: Option<String>,
+    /// 最近一次额度查询时间（Some = 已查询过，据此展示免费/会员标识）
+    #[serde(default)]
+    pub quota_checked_at: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
@@ -79,10 +92,19 @@ pub struct DoubaoAccountView {
     // ── P3 会话状态 ──
     /// ok=有效 / expired=已过期 / unknown=未探活 / none=无 sessionid
     pub session_state: String,
+    /// 明文 sessionid（本地应用，编辑弹框回填用）
+    pub session_id: Option<String>,
+    /// sid_guard 原文（编辑弹框回填用）
+    pub sid_guard: Option<String>,
     pub session_expire_at: Option<String>,
     pub cookies_synced_at: Option<String>,
     pub last_renew_at: Option<String>,
     pub session_source: Option<String>,
+    // ── P4 会员额度缓存 ──
+    pub quota_level: Option<String>,
+    pub quota_expire_at: Option<String>,
+    pub quota_summary: Option<String>,
+    pub quota_checked_at: Option<String>,
     /// 池级：最近一次 KeepAlive 保活时间（所有行同值，供前端提醒判断）
     pub last_keepalive_at: Option<String>,
 }
@@ -166,10 +188,16 @@ pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountV
             is_current: current.as_deref() == Some(a.user_id.as_str()),
             added_at: if a.added_at.is_empty() { None } else { Some(a.added_at.clone()) },
             session_state: session_state_of(a),
+            session_id: a.session_id.clone(),
+            sid_guard: a.sid_guard.clone(),
             session_expire_at: a.session_expire_at.clone(),
             cookies_synced_at: a.cookies_synced_at.clone(),
             last_renew_at: a.last_renew_at.clone(),
             session_source: a.session_source.clone(),
+            quota_level: a.quota_level.clone(),
+            quota_expire_at: a.quota_expire_at.clone(),
+            quota_summary: a.quota_summary.clone(),
+            quota_checked_at: a.quota_checked_at.clone(),
             last_keepalive_at: keepalive_at.clone(),
         })
         .collect();
@@ -212,10 +240,16 @@ pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountV
                     is_current: current.as_deref() == Some(entry.file_name().to_string_lossy().as_ref()),
                     added_at: None,
                     session_state: "none".to_string(),
+                    session_id: None,
+                    sid_guard: None,
                     session_expire_at: None,
                     cookies_synced_at: None,
                     last_renew_at: None,
                     session_source: None,
+                    quota_level: None,
+                    quota_expire_at: None,
+                    quota_summary: None,
+                    quota_checked_at: None,
                     last_keepalive_at: keepalive_at.clone(),
                 });
             }
@@ -266,6 +300,10 @@ pub fn doubao_account_save(
             cookies_synced_at: None,
             last_renew_at: None,
             session_source: None,
+            quota_level: None,
+            quota_expire_at: None,
+            quota_summary: None,
+            quota_checked_at: None,
         });
     }
     save_pool(&state, &pool)
@@ -407,7 +445,7 @@ fn value_to_uid(v: &serde_json::Value) -> Option<String> {
 // 明文 sessionid。因此续期主路径为 KeepAlive（让豆包客户端自己联网滑动续期 sid_guard），
 // 探活巡检仅对用户手动录入的 sessionid（高级功能）生效。
 
-/// 运行 PS 桥 KeepAlive：启动豆包 → 等待会话联网刷新（25s）→ 优雅关闭（运行中则跳过）。
+/// 运行 PS 桥 KeepAlive：启动豆包 → 等待会话联网刷新（8s）→ 优雅关闭（运行中则跳过）。
 /// NDJSON 进度走 keepalive-progress / keepalive-done 事件，完成后记录池级保活时间戳。
 #[tauri::command]
 pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<(), String> {
@@ -455,7 +493,7 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
                 done_emitted = true;
                 let _ = app2.emit("keepalive-done", serde_json::json!({ "success": success, "raw": l }));
                 if success {
-                    // 记录池级保活时间戳（写入失败不影响保活结果）
+                    // 记录池级保活时间戳 + 运维历史（写入失败不影响保活结果）
                     let pool_path = data_dir.join("data").join("doubao_accounts.json");
                     if let Ok(raw) = std::fs::read_to_string(&pool_path) {
                         if let Ok(mut pool) = serde_json::from_str::<DoubaoAccountPool>(&raw) {
@@ -463,6 +501,13 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
                             let _ = fs_utils::write_json(&pool_path, &pool);
                         }
                     }
+                    append_history_event(
+                        &data_dir,
+                        serde_json::json!({
+                            "ts": fs_utils::now_ts(), "kind": "keepalive", "ok": true,
+                            "summary": "KeepAlive 保活完成", "source": "app",
+                        }),
+                    );
                 }
             }
         }
@@ -524,6 +569,9 @@ pub fn doubao_quota_fetch(state: State<AppState>, user_id: String) -> Result<ser
         .arg(&script)
         .args(["--uid", user_id.trim(), "--url", url.as_str()])
         .env("AIWORKDATA_DIR", &state.data_dir)
+        // 中文 Windows 下 Python 管道输出默认 GBK，必须强制 UTF-8，否则中文错误信息到前端变乱码
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output()
         .map_err(|e| format!("运行额度脚本失败: {e}"))?;
@@ -535,6 +583,29 @@ pub fn doubao_quota_fetch(state: State<AppState>, user_id: String) -> Result<ser
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
             let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
             if ok {
+                // 成功后把解析结果回写账号池（额度缓存），供列表徽标/悬停提示展示
+                if let Some(parsed) = v.get("parsed") {
+                    match update_quota_cache(&state, user_id.trim(), parsed) {
+                        Ok(summary) => {
+                            append_history(
+                                &state,
+                                serde_json::json!({
+                                    "ts": fs_utils::now_ts(),
+                                    "kind": "quota",
+                                    "uid": user_id.trim(),
+                                    "ok": true,
+                                    "level": parsed.get("level"),
+                                    "summary": summary,
+                                    "windows": windows_of_parsed(parsed),
+                                    "source": "app",
+                                }),
+                            );
+                        }
+                        Err(e) => {
+                            fs_utils::app_log(&state.data_dir, &format!("额度缓存回写失败: {e}"));
+                        }
+                    }
+                }
                 return Ok(v);
             }
             let err = v
@@ -553,21 +624,204 @@ pub fn doubao_quota_fetch(state: State<AppState>, user_id: String) -> Result<ser
     ))
 }
 
-/// 更新账号的手动录入会话凭证（可选高级功能；有凭证的账号才能走探活巡检）
+/// 把额度查询解析结果回写账号池（quota_level/expire/summary/checked_at）。
+/// level 为空 = 免费或未识别，仍记录 checked_at，前端据此显示「免费」标识。
+/// 成功时返回一句话摘要（供运维历史事件复用）。
+fn update_quota_cache(state: &State<AppState>, uid: &str, parsed: &serde_json::Value) -> Result<Option<String>, String> {
+    let mut pool = load_pool(state);
+    let Some(acc) = pool.accounts.iter_mut().find(|a| a.user_id == uid) else {
+        // 未入池账号（仅快照）不缓存额度；入池后首次查询即可
+        return Ok(None);
+    };
+    let level = parsed.get("level").and_then(|l| match l {
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    });
+    let expire = parsed
+        .get("expire_at")
+        .and_then(|e| e.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // 额度条目 → 一句话摘要，兼容两种条目形态（最多 4 条）：
+    // ① quota/summary 窗口结构：{name, used_percent, exhausted, reset_at} → "当前时段 已用完(9-13 20:32重置)"
+    // ② 宽容结构：{name, total, left, used} → "图片 80/100"
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(items) = parsed.get("items").and_then(|i| i.as_array()) {
+        for it in items.iter().take(4) {
+            let name = it.get("name").and_then(|s| s.as_str()).unwrap_or("额度").to_string();
+            if let Some(pct) = it.get("used_percent").and_then(|p| p.as_f64()) {
+                let state_txt = if it.get("exhausted").and_then(|e| e.as_bool()).unwrap_or(false) || pct >= 100.0 {
+                    "已用完".to_string()
+                } else {
+                    format!("已用 {}%", pct as i64)
+                };
+                let reset = it
+                    .get("reset_at")
+                    .and_then(|r| r.as_str())
+                    .map(|s| format!("（{} 重置）", s.get(5..).unwrap_or(s)))
+                    .unwrap_or_default();
+                parts.push(format!("{name} {state_txt}{reset}"));
+                continue;
+            }
+            let total = fmt_quota_num(it.get("total"));
+            let left = fmt_quota_num(it.get("left"));
+            match (&left, &total) {
+                (Some(l), Some(t)) => parts.push(format!("{name} {l}/{t}")),
+                (None, Some(t)) => parts.push(format!("{name} 总量 {t}")),
+                _ => {}
+            }
+        }
+    }
+    let summary = if parts.is_empty() { None } else { Some(parts.join(" · ")) };
+    acc.quota_level = level;
+    acc.quota_expire_at = expire;
+    acc.quota_summary = summary.clone();
+    acc.quota_checked_at = Some(fs_utils::now_ts());
+    save_pool(state, &pool)?;
+    Ok(summary)
+}
+
+/// 额度数值归一为字符串（数字/字符串均可；None/空 → None）
+fn fmt_quota_num(v: Option<&serde_json::Value>) -> Option<String> {
+    match v {
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        _ => None,
+    }
+}
+
+// ── 运维历史（B2 健康度 / A2 额度趋势的数据源）───────────────────────────────
+// data/doubao_health_history.json：{events: [...]}，滚动保留最近 HISTORY_MAX 条。
+// 事件 schema（与 doubao_quota.py --all 模式同构）：
+//   { ts, kind: "keepalive"|"renew"|"quota", ok, uid?, level?, summary, windows?, source? }
+
+const HISTORY_MAX: usize = 400;
+
+/// 追加一条运维历史事件（data_dir 为应用数据根目录；写入失败静默，不影响主流程）
+fn append_history_event(data_dir: &std::path::Path, event: serde_json::Value) {
+    let path = data_dir.join("data").join("doubao_health_history.json");
+    let mut events: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("events").and_then(|e| e.as_array()).cloned())
+        .unwrap_or_default();
+    events.push(event);
+    if events.len() > HISTORY_MAX {
+        events.drain(0..events.len() - HISTORY_MAX);
+    }
+    let _ = fs_utils::write_json(&path, &serde_json::json!({ "events": events }));
+}
+
+fn append_history(state: &AppState, event: serde_json::Value) {
+    append_history_event(&state.data_dir, event);
+}
+
+/// 读取运维历史（旧→新），前端据此渲染健康度卡与额度趋势
 #[tauri::command]
-pub fn doubao_account_set_credential(
-    state: State<AppState>,
-    user_id: String,
+pub fn doubao_history(state: State<AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let path = state.data_dir.join("data").join("doubao_health_history.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let events = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("events").and_then(|e| e.as_array()).cloned())
+        .unwrap_or_default();
+    Ok(events)
+}
+
+/// 从额度解析结果提取窗口数组（A2 趋势图数据点）
+fn windows_of_parsed(parsed: &serde_json::Value) -> Vec<serde_json::Value> {
+    parsed
+        .get("items")
+        .and_then(|i| i.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| {
+                    let pct = it.get("used_percent")?.as_f64()?;
+                    Some(serde_json::json!({
+                        "name": it.get("name").and_then(|s| s.as_str()).unwrap_or("额度"),
+                        "used_percent": pct,
+                        "reset_at": it.get("reset_at").and_then(|s| s.as_str()).unwrap_or_default(),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 代理自动抓到的豆包会话凭证（device_proxy.py 写 data/doubao_captured_credentials.json）。
+/// 流程：启动代理 → 浏览器走系统代理登录网页版 doubao.com → 代理从 Cookie 中提取
+/// sessionid / sid_guard 落盘 → 本命令读取最新一份，供编辑弹框一键填充。
+#[derive(serde::Serialize, Clone)]
+pub struct DoubaoCapturedCredential {
+    pub session_id: String,
+    pub sid_guard: String,
+    pub host: String,
+    pub captured_at: String,
+}
+
+#[tauri::command]
+pub fn doubao_captured_credential(state: State<AppState>) -> Result<Option<DoubaoCapturedCredential>, String> {
+    let path = state.data_dir.join("data").join("doubao_captured_credentials.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let session_id = v
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if session_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(DoubaoCapturedCredential {
+        session_id,
+        sid_guard: v
+            .get("sid_guard")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        host: v
+            .get("host")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        captured_at: v
+            .get("captured_at")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    }))
+}
+
+/// 写入账号会话凭证的公共实现（不存在则自动入池；session_source 标记来源）。
+/// session_id / sid_guard 传 None 或空串 = 清除该字段。
+fn apply_credential(
+    state: &State<AppState>,
+    pool: &mut DoubaoAccountPool,
+    user_id: &str,
     session_id: Option<String>,
     sid_guard: Option<String>,
+    source: &str,
 ) -> Result<(), String> {
-    let mut pool = load_pool(&state);
     // 仅快照、未入池的账号（PS 桥自动备份产生）允许直接补凭证：自动入池
     if !pool.accounts.iter().any(|a| a.user_id == user_id) {
         pool.accounts.push(DoubaoAccount {
-            name: user_id.clone(),
+            name: user_id.to_string(),
             note: String::new(),
-            user_id: user_id.clone(),
+            user_id: user_id.to_string(),
             added_at: fs_utils::now_ts(),
             last_active_at: None,
             session_id: None,
@@ -577,6 +831,10 @@ pub fn doubao_account_set_credential(
             cookies_synced_at: None,
             last_renew_at: None,
             session_source: None,
+            quota_level: None,
+            quota_expire_at: None,
+            quota_summary: None,
+            quota_checked_at: None,
         });
     }
     let acc = pool
@@ -594,9 +852,81 @@ pub fn doubao_account_set_credential(
     };
     acc.expired = None;
     if acc.session_id.is_some() {
-        acc.session_source = Some("manual".to_string());
+        acc.session_source = Some(source.to_string());
     }
-    save_pool(&state, &pool)
+    save_pool(state, pool)
+}
+
+/// 更新账号的手动录入会话凭证（可选高级功能；有凭证的账号才能走探活巡检）
+#[tauri::command]
+pub fn doubao_account_set_credential(
+    state: State<AppState>,
+    user_id: String,
+    session_id: Option<String>,
+    sid_guard: Option<String>,
+) -> Result<(), String> {
+    let mut pool = load_pool(&state);
+    apply_credential(&state, &mut pool, user_id.trim(), session_id, sid_guard, "manual")
+}
+
+/// 代理抓包凭证自动回写当前账号。
+/// 流程：启动代理 → 豆包客户端/网页版流量经过代理 → device_proxy.py 抓到 sessionid/sid_guard
+/// 落盘 → 本命令把最新凭证写入「当前登录账号」（幂等：内容未变化不重复写）。
+/// 目标账号：current_account.txt 标记的当前账号；无标记但池中仅一个账号时兜底取该账号。
+/// 返回 Some(说明) = 本次发生了写入（前端据此提示并刷新）；None = 无凭证/无目标/内容未变。
+#[tauri::command]
+pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<String>, String> {
+    // 读最新抓包凭证
+    let path = state.data_dir.join("data").join("doubao_captured_credentials.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let session_id = v
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if session_id.is_empty() {
+        return Ok(None);
+    }
+    let sid_guard = v
+        .get("sid_guard")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let captured_at = v
+        .get("captured_at")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let mut pool = load_pool(&state);
+    // 目标账号：当前账号优先，其次池中唯一账号兜底
+    let target = match read_current_uid(&state) {
+        Some(uid) if !uid.is_empty() => Some(uid),
+        _ => {
+            if pool.accounts.len() == 1 {
+                Some(pool.accounts[0].user_id.clone())
+            } else {
+                None
+            }
+        }
+    };
+    let Some(uid) = target else {
+        return Ok(None);
+    };
+    // 幂等：sessionid 与 sid_guard 均未变化则跳过（sid_guard 会随滑动续期变化，需一并比对）
+    if let Some(acc) = pool.accounts.iter().find(|a| a.user_id == uid) {
+        if acc.session_id.as_deref() == Some(session_id.as_str())
+            && acc.sid_guard.as_deref() == Some(sid_guard.as_str())
+        {
+            return Ok(None);
+        }
+    }
+    apply_credential(&state, &mut pool, &uid, Some(session_id), Some(sid_guard), "proxy")?;
+    Ok(Some(format!("{uid}（{captured_at} 抓到）")))
 }
 
 /// 运行续期巡检脚本（解密同步 cookie + 探活续期，模式由 sync_only 决定）。
@@ -616,6 +946,9 @@ pub fn doubao_renew_run(
         cmd.arg("--sync-only");
     }
     cmd.env("AIWORKDATA_DIR", &state.data_dir)
+        // 中文 Windows 下 Python 管道输出默认 GBK，必须强制 UTF-8，否则中文日志到前端变乱码
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -628,6 +961,26 @@ pub fn doubao_renew_run(
     let summary_line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'));
     if let Some(line) = summary_line {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            // 记录运维历史（B2）：巡检摘要一句话化
+            let summary_txt = if v.get("renew").is_some() {
+                let r = &v["renew"];
+                format!(
+                    "有效 {} · 过期 {} · 异常 {} · 跳过 {}",
+                    r.get("ok").and_then(|n| n.as_i64()).unwrap_or(0),
+                    r.get("expired").and_then(|n| n.as_i64()).unwrap_or(0),
+                    r.get("error").and_then(|n| n.as_i64()).unwrap_or(0),
+                    r.get("skipped").and_then(|n| n.as_i64()).unwrap_or(0),
+                )
+            } else {
+                "Cookie 诊断".to_string()
+            };
+            append_history(
+                &state,
+                serde_json::json!({
+                    "ts": fs_utils::now_ts(), "kind": "renew", "ok": true,
+                    "summary": summary_txt, "source": "app",
+                }),
+            );
             return Ok(v);
         }
     }
@@ -647,7 +1000,7 @@ pub fn doubao_renew_run(
     ))
 }
 
-/// 注册豆包会话续期每日计划任务（schtasks 调 PS 桥 KeepAlive：启动豆包 25s 联网滑动续期后关闭）
+/// 注册豆包会话续期每日计划任务（schtasks 调 PS 桥 KeepAlive：启动豆包 8s 联网滑动续期后关闭）
 #[tauri::command(async)]
 pub fn doubao_renew_task_register(state: State<AppState>, time: String) -> Result<(), String> {
     if !time.contains(':') || time.len() < 4 {
@@ -728,6 +1081,254 @@ pub fn doubao_renew_task_unregister(state: State<AppState>) -> Result<(), String
     }
     fs_utils::app_log(&state.data_dir, "豆包续期定时任务已注销");
     Ok(())
+}
+
+// ── 额度定时巡检（A1/B4）：schtasks 每日调 doubao_quota.py --all ─────────────
+// 脚本自行遍历池内有凭证账号：查额度 → 回写账号池缓存 + 运维历史；应用启动后
+// 概述页健康度卡 / 账号页自动查询会读取历史与缓存展示。
+
+/// 注册豆包额度巡检每日计划任务（schtasks 直接调 python + doubao_quota.py --all）
+#[tauri::command(async)]
+pub fn doubao_quota_task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    if !time.contains(':') || time.len() < 4 {
+        return Err(format!("时间格式无效: {time}（应为 HH:MM）"));
+    }
+    let script = state.python_dir.join("doubao_quota.py");
+    if !script.exists() {
+        return Err(format!("找不到额度脚本: {}", script.display()));
+    }
+    let data_dir = state.data_dir.to_string_lossy();
+    // /TR 不继承环境变量：显式 set AIWORKDATA_DIR；python_exe 为绝对路径（资源内嵌），
+    // 探测回退的裸名（python）依赖任务环境 PATH，亦可接受
+    let tr = format!(
+        "cmd /c set \"AIWORKDATA_DIR={data_dir}\" && set \"PYTHONIOENCODING=utf-8\" && \"{}\" \"{}\" --all",
+        state.python_exe,
+        script.to_string_lossy()
+    );
+    let (ok, _stdout, stderr) = crate::commands::misc::run_schtasks(&[
+        "/Create",
+        "/TN",
+        crate::commands::misc::DOUBAO_QUOTA_TASK_NAME,
+        "/TR",
+        tr.as_str(),
+        "/SC",
+        "DAILY",
+        "/ST",
+        time.as_str(),
+        "/F",
+    ])?;
+    if !ok {
+        let detail = stderr.trim();
+        let is_access_denied = detail.contains("Access is denied")
+            || detail.contains("ERROR: Access is denied")
+            || detail.contains("拒绝访问")
+            || detail.contains("权限");
+        if is_access_denied {
+            return Err("权限不足（Access Denied）：请以管理员身份运行本应用后重新注册任务".to_string());
+        }
+        return Err(detail.to_string());
+    }
+    fs_utils::app_log(&state.data_dir, &format!("豆包额度巡检定时任务已注册: {time}"));
+    Ok(())
+}
+
+/// 查询豆包额度巡检计划任务状态
+#[tauri::command(async)]
+pub fn doubao_quota_task_status(_state: State<AppState>) -> Result<String, String> {
+    let name = crate::commands::misc::DOUBAO_QUOTA_TASK_NAME;
+    let (ok, stdout, _stderr) =
+        crate::commands::misc::run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"])?;
+    if !ok {
+        return Ok("not_registered".to_string());
+    }
+    let time = stdout
+        .lines()
+        .find_map(|l| {
+            let idx = l.find(": ")?;
+            let v = &l[idx + 2..];
+            let hhmm: String = v.chars().take(5).collect();
+            if hhmm.len() == 5 && hhmm.as_bytes()[2] == b':' {
+                Some(hhmm)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+    Ok(format!("registered:{time}"))
+}
+
+/// 注销豆包额度巡检计划任务
+#[tauri::command(async)]
+pub fn doubao_quota_task_unregister(state: State<AppState>) -> Result<(), String> {
+    let name = crate::commands::misc::DOUBAO_QUOTA_TASK_NAME;
+    let (ok, _stdout, stderr) =
+        crate::commands::misc::run_schtasks(&["/Delete", "/TN", name, "/F"])?;
+    if !ok && !stderr.contains("不存在") && !stderr.contains("does not exist") {
+        return Err(stderr.trim().to_string());
+    }
+    fs_utils::app_log(&state.data_dir, "豆包额度巡检定时任务已注销");
+    Ok(())
+}
+
+// ── C1 一键以账号打开 / C3 快照版本元数据 ────────────────────────────────────
+
+/// 一键「以账号 X 打开豆包」：恢复该账号快照后直接拉起客户端（复用桥 Switch 动作，
+/// 等价于「切换 → 等待 → 打开」两步合并为一步）。代理运行中时注入 --proxy-server，
+/// 行为对齐 open_doubao_app。NDJSON 进度复用 switch-progress / switch-done 事件管线。
+#[tauri::command]
+pub fn doubao_open_as_account(
+    app: AppHandle,
+    state: State<AppState>,
+    user_id: String,
+    proxy_port: Option<u16>,
+) -> Result<(), String> {
+    let uid = user_id.trim().to_string();
+    if uid.is_empty() {
+        return Err("user_id 不能为空".to_string());
+    }
+    // 本地预检（桥 Switch 动作在关闭豆包前也会检查，这里提前给出明确错误）
+    let slot = profiles_root(&state).join(&uid);
+    if !slot.exists() {
+        return Err(format!("账号 {uid} 无快照，请先登录该账号并保存登录态"));
+    }
+    let bridge = crate::state::resolve_ps_dir().join("trae-switch-bridge.ps1");
+    if !bridge.exists() {
+        return Err(format!("找不到切换脚本: {}", bridge.display()));
+    }
+    let include_idb = state.settings().doubao_snapshot_include_idb;
+
+    fs_utils::app_log(&state.data_dir, &format!("一键以账号打开豆包: user_id={uid}"));
+
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &bridge.to_string_lossy(),
+        "-Action",
+        "Switch",
+        "-UserId",
+        &uid,
+        "-TargetApp",
+        "Doubao",
+        "-Json",
+    ]);
+    if let Some(p) = proxy_port.filter(|p| *p > 0) {
+        cmd.args(["-ProxyPort", &p.to_string()]);
+    }
+    if include_idb {
+        cmd.arg("-IncludeIndexedDB");
+    }
+    let mut child = cmd
+        .creation_flags(0x08000000)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动切换脚本失败: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("切换脚本无输出")?;
+    let stderr = child.stderr.take();
+    let app2 = app.clone();
+    let stderr_dir = state.data_dir.clone();
+
+    // stdout 线程：NDJSON -> switch-progress / switch-done（与切换管线完全一致）
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        let mut done_emitted = false;
+        for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+            let l = line.trim().to_string();
+            if l.is_empty() {
+                continue;
+            }
+            let _ = app2.emit("switch-progress", &l);
+            if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
+                let success = l.contains("\"stage\":\"done\"");
+                done_emitted = true;
+                let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": l }));
+            }
+        }
+        let exit_status = child.wait();
+        if !done_emitted {
+            let success = matches!(&exit_status, Ok(s) if s.success());
+            let _ = app2.emit(
+                "switch-done",
+                serde_json::json!({ "success": success, "raw": format!("exit: {:?}", exit_status) }),
+            );
+        }
+    });
+
+    // stderr 线程：防管道写满死锁，落 switcher.log
+    if let Some(stderr) = stderr {
+        std::thread::spawn(move || {
+            let log_path = stderr_dir.join("logs").join("switcher.log");
+            let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
+            for line in std::io::BufRead::lines(std::io::BufReader::new(stderr)).map_while(Result::ok) {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    use std::io::Write;
+                    let _ = f.write_all(format!("[{}] [open-as][stderr] {}\n", fs_utils::now_ts(), line.trim()).as_bytes());
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+/// 豆包快照版本元数据（C3）：读取槽位内 snapshot_meta.json + Last Version，
+/// 供前端快照列悬停展示（schema 版本 / Chromium 版本 / 生成时间）。
+/// 旧版快照无元数据 → 返回 None（前端展示「旧版快照」）。
+#[derive(serde::Serialize, Clone)]
+pub struct DoubaoSnapshotMeta {
+    pub schema_version: i64,
+    pub created_at: String,
+    pub chromium_version: String,
+    pub include_idb: bool,
+}
+
+#[tauri::command]
+pub fn doubao_snapshot_meta(state: State<AppState>, user_id: String) -> Result<Option<DoubaoSnapshotMeta>, String> {
+    let slot = profiles_root(&state).join(user_id.trim());
+    if !slot.exists() {
+        return Ok(None);
+    }
+    // Last Version：快照生成时的豆包（Chromium 内核）版本
+    let chromium_version = std::fs::read_to_string(slot.join("Last Version"))
+        .map(|s| s.trim().trim_start_matches('\u{feff}').to_string())
+        .unwrap_or_default();
+    let meta_path = slot.join("snapshot_meta.json");
+    if !meta_path.exists() {
+        // 旧版快照：无元数据文件，仅有 Last Version 时也如实返回
+        if chromium_version.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(DoubaoSnapshotMeta {
+            schema_version: 0, // 0 = 无元数据（旧版快照）
+            created_at: String::new(),
+            chromium_version,
+            include_idb: false,
+        }));
+    }
+    let raw = std::fs::read_to_string(&meta_path).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    Ok(Some(DoubaoSnapshotMeta {
+        schema_version: v.get("schemaVersion").and_then(|s| s.as_i64()).unwrap_or(0),
+        created_at: v
+            .get("createdAt")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        chromium_version: v
+            .get("chromiumVersion")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(chromium_version),
+        include_idb: v.get("includeIndexedDB").and_then(|b| b.as_bool()).unwrap_or(false),
+    }))
 }
 
 #[cfg(test)]

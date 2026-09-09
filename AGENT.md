@@ -111,12 +111,19 @@ ai-work-assistant/
 | 快照 | `profile_format_size(...)` | 快照体积格式化 |
 | 豆包 | `doubao_accounts_list` → `DoubaoAccountView[]` | 账号池 ∪ profiles_doubao 快照槽合并视图 + 当前账号标记 + 会话状态（last 槽不展示） |
 | 豆包 | `doubao_account_save(userId, name?, note?)` / `doubao_account_remove(userId)` | 豆包账号池 upsert / 移除（data/doubao_accounts.json） |
-| 豆包 | `doubao_account_set_credential(userId, sessionId?, sidGuard?)` | 手动录入会话凭证（可选高级功能；仅手动来源参与探活巡检；账号不在池时自动入池） |
+| 豆包 | `doubao_account_set_credential(userId, sessionId?, sidGuard?)` | 编辑弹框保存会话凭证（已存值回填；清空保存即删除；账号不在池时自动入池） |
+| 豆包 | `doubao_captured_credential()` / `doubao_credential_auto_apply()` | 读 device_proxy.py 抓包落盘的 data/doubao_captured_credentials.json（doubao.com Cookie 中的 sessionid/sid_guard）；auto_apply 把最新凭证幂等回写当前登录账号（无当前标记时兜底池中唯一账号，来源 proxy），前端账号页每 20s 轮询；另有 `doubao_captured_credential` 供编辑弹框手动填充 |
 | 豆包 | `doubao_detect_uid()` | 读 %APPDATA%\Doubao\public_config.json **全树递归**搜 user_id/uid（实测嵌在 text_picker.current_user 下；current_user 优先 → 数字 uid 优先 → user_action_time 最新），兜底 profiles_doubao/current_account.txt；含单元测试 |
-| 豆包 | `doubao_keepalive_run()` | 续期主路径：调 PS 桥 `-Action KeepAlive`（启动豆包 25s 联网滑动续期 → 优雅关闭，运行中跳过），NDJSON → keepalive-progress/done 事件，成功后记池级 last_keepalive_at |
-| 豆包 | `doubao_renew_run(syncOnly?)` | 调 python doubao_renew.py：探活巡检（仅手动录入凭证的账号，200=有效/302→passport=过期）或 cookie 诊断（--sync-only，实测客户端 cookie 为二次加密密文，不能当凭证） |
+| 豆包 | `doubao_keepalive_run()` | 续期主路径：调 PS 桥 `-Action KeepAlive`（启动豆包 8s 联网滑动续期 → 优雅关闭，运行中跳过），NDJSON → keepalive-progress/done 事件，成功后记池级 last_keepalive_at + 运维历史 |
+| 豆包 | `doubao_renew_run(syncOnly?)` | 调 python doubao_renew.py：探活巡检（仅手动录入凭证的账号，200=有效/302→passport=过期）或 cookie 诊断（--sync-only，实测客户端 cookie 为二次加密密文，不能当凭证）；结果记运维历史 |
 | 豆包 | `doubao_renew_task_register(time)` / `..._status()` / `..._unregister()` | schtasks 每日保活任务 AIWorkAssistant_DoubaoRenew（/TR 调 PS 桥 KeepAlive） |
-| 豆包 | `doubao_quota_fetch(userId)` | 调 python doubao_quota.py 查会员额度：需 settings.doubao_quota_url（抓包固化）+ 账号手动凭证；宽容解析等级/到期/额度条目 |
+| 豆包 | `doubao_quota_fetch(userId)` | 调 python doubao_quota.py 查会员额度：POST 默认接口 `/alice/commerce/sale/subscription/quota/summary/`（body `{"product_line":"membership"}`，settings.doubao_quota_url 可改）+ 账号凭证；精确解析（套餐/到期/活动赠送/订阅记录/当前时段+近7天窗口含重置时间）+ 宽容兜底，成功后回写账号池额度缓存与运维历史；保活端点默认 `/info/v2/`（settings.doubao_renew_url 可改；state.rs 启动迁移回填默认值） |
+| 豆包 | `doubao_quota_task_register(time)` / `..._status()` / `..._unregister()` | schtasks 每日额度巡检任务 AIWorkAssistant_DoubaoQuotaCheck（/TR 调 `doubao_quota.py --all`：批量查池内有凭证账号 → 回写缓存 + 运维历史 + 用完记录） |
+| 豆包 | `doubao_history()` | 读 data/doubao_health_history.json 运维事件（keepalive/renew/quota，滚动 400 条；quota 事件含 windows 额度窗口），概述页额度趋势图与健康度卡数据源；写入方：keepalive_run/renew_run/quota_fetch（source=app）+ 定时任务（source=task） |
+| 豆包 | `open_doubao_app(proxyPort?)` | 打开豆包桌面版；proxy_port 存在时注入 `--proxy-server`（启动前三级关闭现有进程确保参数生效，对齐 Trae 打开逻辑），凭证/额度抓取不依赖系统代理 |
+| 豆包 | `doubao_open_as_account(userId, proxyPort?)` | **C1 一键以账号打开**：调 PS 桥 `-Action Switch -TargetApp Doubao -ProxyPort <port>`（恢复该账号快照后直接拉起客户端，把「切换 → 等待 → 打开」两步合并为一步）；proxyPort>0 时桥层注入 `--proxy-server`；NDJSON 进度复用 switch-progress / switch-done 事件管线（前端走 store.openDoubaoAs，与 switchTo 互斥共用 switchingTo 状态） |
+| 豆包 | `doubao_snapshot_meta(userId)` → `DoubaoSnapshotMeta?` | **C3 快照版本校验**：读 `profiles_doubao/<uid>/snapshot_meta.json`（schemaVersion / createdAt / chromiumVersion / includeIndexedDB），无元数据文件时回退读快照内 `Last Version`（返回 schema_version=0 标记为旧版快照）；账号页快照列「已保存」处悬停展示版本信息 |
+| 豆包 | `settings.doubao_snapshot_include_idb` | **C4 IndexedDB 可选纳入快照**：默认 false（体积大，默认排除）；开启后 profile_backup / profile_restore / switch_account / save_current_login 透传 `-IncludeIndexedDB` 给 PS 桥；桥层备份时纳入 `Default/IndexedDB`，恢复时**只要快照内含就回写**（不看当前开关，保证快照完整回写） |
 | 日志 | `proxy_logs_list(...)` / `proxy_log_detail(...)` | 代理请求日志列表 / 详情 |
 | 文件 | `read_text_file(path)` / `write_text_file(...)` | 前端通用文本读写（read 有 10MB 上限 + 常规文件校验） |
 | 双应用 | `apps_accounts_discover` / `apps_account_add` / `apps_entitlement_read` | 本机 Trae Work + Trae CN 账号自动发现 / 入池 / 套餐读取（F-08，见 §5.1） |
@@ -182,11 +189,14 @@ ai-work-assistant/
 - **非交互模式**：不需要 `#Requires RunAsAdministrator`，普通用户即可运行。
 - `-Json` 时输出 NDJSON 单行 `{"stage":"...","status":"...","message":"...","time":"..."}`。
 - 入口目录：`$env:APPDATA\TRAE SOLO CN` + `$env:APPDATA\AIWorkAssistant\data\profiles`。
-- **Action 参数**：`Switch` / `SaveCurrentLogin` / `ResetMachineId` / `ResetDeviceIds` / `BackupCurrent` / `RestoreOnly`。
+- **Action 参数**：`Switch` / `SaveCurrentLogin` / `ResetMachineId` / `ResetDeviceIds` / `BackupCurrent` / `RestoreOnly` / `KeepAlive`。
+- **通用参数**：`-TargetApp TraeWork|Trae|Doubao|WorkBuddy`、`-Json`、`-ProxyPort <int>`（C1：>0 时启动应用注入 `--proxy-server`）、`-IncludeIndexedDB`（C4：备份纳入 `Default/IndexedDB`）。
 - **精准备份**：仅复制 9 类核心登录文件（storage.json / state.vscdb / machineid / aha / Network 等），非全量镜像。
 - **Switch 流程**：预检查目标快照 → 关闭 Trae Work → 保存当前到 last + 当前账号槽位 → 恢复目标 → 启动。
 - **SaveCurrentLogin 流程**：关闭 Trae Work → 精准备份到 userId 槽位 → 启动。
 - storage.json 路径：`User\globalStorage\storage.json`，键名用点号访问（`$storage.'telemetry.machineId'`）。
+- **豆包数据目录**：`%LOCALAPPDATA%\Doubao\User Data`（Trae 系用 `%APPDATA%`）；备份项含 Local State / Network/Cookies* / Local Storage/leveldb / Session Storage / DoubaoStorage / saman_app_state / saman_shell_db_storage，`Last Version`（C3 版本基线）。
+- **C3 快照元数据与校验**：备份时写 `snapshot_meta.json`（`schemaVersion=1` / createdAt / chromiumVersion / includeIndexedDB）并复制 `Last Version`；恢复前 `Test-SnapshotIntegrity` 三层校验——① schemaVersion ≠ 1 直接中止（无元数据文件的旧快照仅 warn 并跳过）② leveldb 缺 CURRENT 或 CURRENT 指向的 MANIFEST 缺失 → 中止 ③ 快照版本 ≠ 当前安装版本 → 仅 warn 继续恢复。
 
 ## 9. Python 约定
 

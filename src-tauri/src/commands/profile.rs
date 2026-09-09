@@ -127,21 +127,26 @@ pub fn profile_backup(
         &format!("开始备份登录态: user_id={user_id}, target_app={target}"),
     );
 
-    let mut child = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &bridge.to_string_lossy(),
-            "-Action",
-            "BackupCurrent",
-            "-UserId",
-            &user_id,
-            "-TargetApp",
-            target,
-            "-Json",
-        ])
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &bridge.to_string_lossy(),
+        "-Action",
+        "BackupCurrent",
+        "-UserId",
+        &user_id,
+        "-TargetApp",
+        target,
+        "-Json",
+    ]);
+    // C4：豆包快照可选纳入 IndexedDB
+    if target == "Doubao" && state.settings().doubao_snapshot_include_idb {
+        cmd.arg("-IncludeIndexedDB");
+    }
+    let mut child = cmd
         .creation_flags(0x08000000)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -238,21 +243,26 @@ pub fn profile_restore(
         &format!("开始恢复登录态: user_id={user_id}, target_app={target}"),
     );
 
-    let mut child = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &bridge.to_string_lossy(),
-            "-Action",
-            "RestoreOnly",
-            "-UserId",
-            &user_id,
-            "-TargetApp",
-            target,
-            "-Json",
-        ])
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &bridge.to_string_lossy(),
+        "-Action",
+        "RestoreOnly",
+        "-UserId",
+        &user_id,
+        "-TargetApp",
+        target,
+        "-Json",
+    ]);
+    // C4：豆包快照可选纳入 IndexedDB（恢复侧桥脚本对快照内含 IndexedDB 一律回写，此开关主要影响备份）
+    if target == "Doubao" && state.settings().doubao_snapshot_include_idb {
+        cmd.arg("-IncludeIndexedDB");
+    }
+    let mut child = cmd
         .creation_flags(0x08000000)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

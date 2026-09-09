@@ -80,9 +80,13 @@ function TraeTopBar() {
   );
 }
 
-/** 豆包专区顶栏：仅豆包安装状态 + 打开豆包（证书/代理/API 服务与豆包无关，不展示） */
+/** 豆包专区顶栏：豆包安装状态 + 证书信任/代理状态（会员额度抓包用）+ 打开豆包/启动代理 */
 function DoubaoTopBar() {
   const pushToast = useAppStore((s) => s.pushToast);
+  const certInstalled = useAppStore((s) => s.certInstalled);
+  const proxy = useAppStore((s) => s.proxy);
+  const startProxy = useAppStore((s) => s.startProxy);
+  const stopProxy = useAppStore((s) => s.stopProxy);
   const [locate, setLocate] = useState<AppLocate | null>(null);
 
   useEffect(() => {
@@ -98,7 +102,8 @@ function DoubaoTopBar() {
 
   const launch = async () => {
     try {
-      await api.doubao.launch();
+      // 代理运行中时注入 --proxy-server：客户端流量必走本地代理，凭证/额度抓取不依赖系统代理
+      await api.doubao.launch(proxy.running ? proxy.port : undefined);
     } catch (err) {
       pushToast('error', `打开豆包失败：${String(err)}`);
     }
@@ -116,11 +121,32 @@ function DoubaoTopBar() {
             <MonitorX size={13} /> 豆包未检测到
           </Badge>
         )}
+        {certInstalled ? (
+          <Badge tone="green" title="系统已信任抓包代理 CA 证书（会员额度接口抓包需要）">
+            <ShieldCheck size={13} /> 证书已信任
+          </Badge>
+        ) : (
+          <Badge tone="amber" title="未安装/未信任抓包代理 CA 证书，会员额度接口抓包前需先安装">
+            <ShieldAlert size={13} /> 证书未信任
+          </Badge>
+        )}
+        <Badge tone={proxy.running ? 'blue' : 'slate'} title={proxy.running ? '抓包代理运行中' : '抓包代理未启动'}>
+          <Wifi size={13} /> {proxy.running ? `代理运行中 :${proxy.port}` : '代理未启动'}
+        </Badge>
       </div>
       <div className="flex items-center gap-2">
         <button onClick={() => void launch()} className="btn-primary" disabled={!locate?.exe}>
           <ExternalLink size={15} /> 打开豆包
         </button>
+        {proxy.running ? (
+          <button onClick={stopProxy} className="btn-outline">
+            <PowerOff size={15} /> 停止代理
+          </button>
+        ) : (
+          <button onClick={startProxy} className="btn-outline">
+            <Power size={15} /> 启动代理
+          </button>
+        )}
       </div>
     </>
   );

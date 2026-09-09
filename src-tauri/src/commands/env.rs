@@ -404,14 +404,26 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
     }
 }
 
-/// 打开豆包桌面版（复用 app_locate 豆包档案四级探测；命中即回写设置以便下次直开）
+/// 打开豆包桌面版（复用 app_locate 豆包档案四级探测；命中即回写设置以便下次直开）。
+/// 与 Trae 同款代理注入：proxy_port 存在时以 --proxy-server 启动，让豆包客户端流量
+/// 必走本地 MITM 代理（凭证/额度自动抓取不再依赖系统代理设置）。
 #[tauri::command(async)]
-pub fn open_doubao_app(state: State<AppState>) -> Result<(), String> {
+pub fn open_doubao_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
     let loc = app_locate_inner(&state, "doubao");
     let exe = loc.exe.ok_or("未检测到豆包安装，请在豆包「环境配置」中指定 Doubao.exe 路径")?;
-    Command::new(&exe)
-        .spawn()
-        .map_err(|e| format!("启动豆包失败: {e}"))?;
+    // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理
+    if proxy_port.is_none() {
+        crate::commands::proxy::cleanup_stale_local_proxy(&state);
+    }
+    // Chromium 单实例：已运行的窗口会忽略新启动参数，注入代理前先关闭现有进程确保生效
+    if proxy_port.is_some() {
+        crate::commands::process::graceful_kill_app("Doubao")?;
+    }
+    let mut cmd = Command::new(&exe);
+    if let Some(port) = proxy_port {
+        cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
+    }
+    cmd.spawn().map_err(|e| format!("启动豆包失败: {e}"))?;
     Ok(())
 }
 

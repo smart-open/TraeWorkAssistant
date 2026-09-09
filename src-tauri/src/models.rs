@@ -115,12 +115,15 @@ pub struct Settings {
     /// 豆包桌面版 exe 手动路径（环境配置页持久化；app_locate doubao 档案读取）
     #[serde(default)]
     pub doubao_path: Option<String>,
-    /// 豆包会话续期保活端点（空 = 用 doubao.com 首页滑动续期）
+    /// 豆包会话续期保活端点（探活巡检用；KeepAlive 不依赖此项；空值由 state 迁移回填默认）
     #[serde(default)]
     pub doubao_renew_url: Option<String>,
-    /// 豆包会员额度接口（抓包固化后填入；空 = 额度查询不可用）
+    /// 豆包会员额度接口（会员额度汇总 XHR；空 = 额度查询不可用，由 state 迁移回填默认）
     #[serde(default)]
     pub doubao_quota_url: Option<String>,
+    /// 豆包快照可选纳入 Default/IndexedDB（C4：对话历史等完整状态随账号迁移；体积代价大，默认排除）
+    #[serde(default)]
+    pub doubao_snapshot_include_idb: bool,
     /// WorkBuddy 桌面版 exe 手动路径（切换桥 workbuddy 档案 settings_key；页面随后续批次接入）
     #[serde(default)]
     pub workbuddy_path: Option<String>,
@@ -169,7 +172,30 @@ fn default_retention() -> i32 {
     30
 }
 pub fn default_proxy_domains() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
+}
+
+/// 旧版默认域名列表（未含 doubao.com）：用于把升级前已持久化的旧默认无缝迁移到新默认
+pub fn legacy_proxy_domains() -> String {
     "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com".into()
+}
+
+/// 豆包保活端点默认值：GET /info/v2/（通知未读数，轻量、必须登录，200=有效 / 302=过期）。
+/// 实测字节 passport 为 30 天滑动续期（服务端按会话活跃内部刷新，不回发新 cookie），
+/// 探活只需携带凭证访问一个"必须登录"的轻量端点即可判定有效性。
+pub fn default_doubao_renew_url() -> String {
+    "https://www.doubao.com/info/v2/".into()
+}
+
+/// 豆包会员额度接口默认值：POST /alice/commerce/sale/subscription/quota/summary/
+/// （请求体 {"product_line":"membership"}，200 JSON 会员额度汇总；代理日志实测确认）
+pub fn default_doubao_quota_url() -> String {
+    "https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/".into()
+}
+
+/// 旧版保活端点默认值（doubao.com 首页）：升级时迁移到新默认
+pub fn legacy_doubao_renew_url() -> String {
+    "https://www.doubao.com/".into()
 }
 
 #[derive(Serialize, Deserialize, Default)]

@@ -454,6 +454,8 @@ pub const TASK_NAME: &str = "AIWorkAssistant_DailyCheckin";
 pub const LEGACY_TASK_NAME: &str = "TraeWorkAssistant_DailyCheckin";
 /// 豆包会话续期每日计划任务名（P3）
 pub const DOUBAO_TASK_NAME: &str = "AIWorkAssistant_DoubaoRenew";
+/// 豆包额度巡检每日计划任务名（批量查额度 + 回写缓存/历史 + 用完记录）
+pub const DOUBAO_QUOTA_TASK_NAME: &str = "AIWorkAssistant_DoubaoQuotaCheck";
 
 // 运行 schtasks 并正确解码输出。
 // 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")

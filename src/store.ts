@@ -112,6 +112,8 @@ interface AppState {
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
   switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') => Promise<void>;
+  /** C1：一键以账号 X 打开豆包（恢复快照后拉起客户端；代理运行中时注入代理） */
+  openDoubaoAs: (userId: string, proxyPort?: number) => Promise<void>;
   saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
@@ -153,12 +155,13 @@ function defaultSettings(): Settings {
     trae_path: null,
     trae_cn_path: null,
     doubao_path: null,
-    doubao_renew_url: null,
-    doubao_quota_url: null,
+    doubao_renew_url: 'https://www.doubao.com/info/v2/',
+    doubao_quota_url: 'https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/',
+    doubao_snapshot_include_idb: false,
     workbuddy_path: null,
     data_dir: null,
     log_retention_days: 30,
-    proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com',
+    proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com',
     proxy_log_path: null,
     api_port: 7864,
     api_key: '',
@@ -616,6 +619,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       set({ savingLogin: null });
       get().pushToast('error', `保存登录态失败：${String(err)}`);
+    }
+  },
+  openDoubaoAs: async (userId, proxyPort) => {
+    try {
+      set({ switchingTo: userId, switchProgress: [] });
+      await api.doubao.openAs(userId, proxyPort);
+      get().pushToast('info', `正在恢复账号 ${userId} 的快照并启动豆包，请稍候…`);
+    } catch (err) {
+      set({ switchingTo: null });
+      get().pushToast('error', `以账号打开失败：${String(err)}`);
     }
   },
   renewJwt: async (userId) => {

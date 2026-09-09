@@ -91,6 +91,8 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
         "TraeWork" => vec!["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"],
         // Trae CN IDE
         "Trae" => vec!["Trae CN.exe"],
+        // 豆包桌面版（Chromium 壳，主进程即 Doubao.exe）
+        "Doubao" => vec!["Doubao.exe"],
         _ => vec![],
     }
 }

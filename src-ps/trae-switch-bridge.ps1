@@ -33,6 +33,14 @@ param(
     [string]$TargetApp = 'TraeWork',
 
     [Parameter(Mandatory = $false)]
+    # C1：>0 时启动应用注入 --proxy-server（一键以账号打开走代理抓包，行为对齐 open_doubao_app）
+    [int]$ProxyPort = 0,
+
+    [Parameter(Mandatory = $false)]
+    # C4：快照备份时纳入 Default/IndexedDB（对话历史等完整状态随账号迁移，体积代价大）
+    [switch]$IncludeIndexedDB,
+
+    [Parameter(Mandatory = $false)]
     [switch]$Json
 )
 
@@ -130,6 +138,8 @@ switch ($TargetApp) {
     }
 }
 $Script:CurrentAccountFile = "$Script:ProfilesDir\current_account.txt"
+# C1：启动代理端口（>0 = 启动时注入 --proxy-server，供一键以账号打开复用切换管线）
+$Script:LaunchProxyPort = $ProxyPort
 
 # 校验候选 exe 路径是否属于当前目标应用（防止 lnk/注册表/进程回退解析到另一个应用）
 function Test-ExeMatchesApp {
@@ -394,8 +404,13 @@ function Start-Trae {
         Write-Step -Stage 'start' -Message "未找到 $($Script:AppName) 安装路径，请在设置中指定" -Status 'error'
         throw "未找到 $($Script:AppName) 可执行文件"
     }
-    Write-Step -Stage 'start' -Message "正在启动 $($Script:AppName): $exe" -Status 'running'
-    Start-Process -FilePath $exe -WindowStyle Normal
+    if ($Script:LaunchProxyPort -gt 0) {
+        Write-Step -Stage 'start' -Message "正在启动 $($Script:AppName)（注入代理 127.0.0.1:$($Script:LaunchProxyPort)）: $exe" -Status 'running'
+        Start-Process -FilePath $exe -ArgumentList "--proxy-server=http://127.0.0.1:$($Script:LaunchProxyPort)" -WindowStyle Normal
+    } else {
+        Write-Step -Stage 'start' -Message "正在启动 $($Script:AppName): $exe" -Status 'running'
+        Start-Process -FilePath $exe -WindowStyle Normal
+    }
 }
 
 function Reset-MachineId {
@@ -556,7 +571,8 @@ function Reset-DeviceIdsOnly {
 #         Default/Network/Cookies*（登录 cookie，含 journal）
 #         Default/Local Storage/leveldb/（web 侧登录/偏好 KV）
 #   建议  Default/Session Storage/、Default/DoubaoStorage/、saman_app_state、saman_shell_db_storage/
-#   排除  Default/IndexedDB/（体积大，默认排除）
+#   排除  Default/IndexedDB/（体积大，默认排除；C4 可经 -IncludeIndexedDB 纳入，恢复时快照内含即回写）
+#   元数据 snapshot_meta.json（C3）：schemaVersion + Chromium 版本，恢复前做完整性校验
 # 结构相对 User Data 镜像存放，恢复时对称回写；切换流程的 'last' 槽位即回滚保护。
 
 # 白名单项复制（文件/目录自适应）：返回复制后目标是否真实存在
@@ -602,10 +618,86 @@ function Backup-ChromiumProfile {
     if (Copy-SnapshotItem -SrcPath "$src\saman_app_state" -DestPath "$dest\saman_app_state") { $copied++ }
     if (Copy-SnapshotItem -SrcPath "$src\saman_shell_db_storage" -DestPath "$dest\saman_shell_db_storage") { $copied++ }
 
+    # C4：可选纳入 Default/IndexedDB（对话历史等完整状态；体积大，默认排除）
+    if ($IncludeIndexedDB) {
+        if (Copy-SnapshotItem -SrcPath "$src\Default\IndexedDB" -DestPath "$dest\Default\IndexedDB") { $copied++ }
+    }
+
+    # C3：快照版本元数据（恢复前校验用，防豆包升级后旧快照损坏）
+    $snapshotVer = ''
+    if (Copy-SnapshotItem -SrcPath "$src\Last Version" -DestPath "$dest\Last Version") { $copied++ }
+    try {
+        if (Test-Path "$dest\Last Version") { $snapshotVer = (Get-Content "$dest\Last Version" -Raw -ErrorAction SilentlyContinue).Trim() }
+    } catch {}
+    try {
+        $meta = [ordered]@{
+            schemaVersion    = 1
+            layout           = 'chromium'
+            app              = $Script:AppName
+            chromiumVersion  = $snapshotVer
+            includeIndexedDB = [bool]$IncludeIndexedDB
+            createdAt        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        }
+        $meta | ConvertTo-Json -Compress | Set-Content -Path (Join-Path $dest 'snapshot_meta.json') -Encoding UTF8
+    } catch {
+        Write-Step -Stage 'backup' -Message "快照元数据写入失败（不影响快照本身）: $_" -Status 'warn'
+    }
+
     if ($copied -eq 0) {
         Write-Step -Stage 'backup' -Message '未发现任何可备份的登录态文件（豆包可能未登录或数据目录为空）' -Status 'warn'
     } else {
         Write-Step -Stage 'backup' -Message "已备份当前登录态到 $Slot ($copied 项)" -Status 'ok'
+    }
+}
+
+# C3：恢复前快照完整性校验（防豆包升级/复制中断后旧快照损坏）：
+#   ① schemaVersion：本工具仅支持 1，不兼容直接中止；
+#   ② leveldb 完整性：Local Storage/leveldb 的 CURRENT 必须存在且指向的 MANIFEST 文件在快照内；
+#   ③ 版本差异：快照 Chromium 版本 ≠ 当前安装版本时警告（继续恢复，异常时重新登录保存）。
+function Test-SnapshotIntegrity {
+    param([string]$Slot)
+    $src = Join-Path $Script:ProfilesDir $Slot
+
+    # ① schemaVersion
+    $metaFile = Join-Path $src 'snapshot_meta.json'
+    $snapshotVer = ''
+    try {
+        if (Test-Path (Join-Path $src 'Last Version')) { $snapshotVer = (Get-Content (Join-Path $src 'Last Version') -Raw -ErrorAction SilentlyContinue).Trim() }
+    } catch {}
+    if (Test-Path $metaFile) {
+        $meta = $null
+        try { $meta = Get-Content $metaFile -Raw | ConvertFrom-Json } catch {}
+        if ($meta -and $meta.schemaVersion -ne 1) {
+            Write-Step -Stage 'restore' -Message "快照 schemaVersion=$($meta.schemaVersion)，本工具仅支持 1：快照由不兼容版本生成，已中止恢复（请重新登录该账号并保存登录态）" -Status 'error'
+            throw "快照 schemaVersion 不兼容（$($meta.schemaVersion) != 1）"
+        }
+    } else {
+        Write-Step -Stage 'restore' -Message '快照缺少版本元数据（旧版本工具生成），已跳过 schemaVersion 校验' -Status 'warn'
+    }
+
+    # ② leveldb 完整性（CURRENT → MANIFEST 指向校验）
+    $ldb = Join-Path $src 'Default\Local Storage\leveldb'
+    if (Test-Path $ldb) {
+        $currentFile = Join-Path $ldb 'CURRENT'
+        if (-not (Test-Path $currentFile)) {
+            Write-Step -Stage 'restore' -Message "快照 leveldb 缺少 CURRENT 文件，疑似不完整/损坏，已中止恢复（请重新登录该账号并保存登录态）" -Status 'error'
+            throw "快照 leveldb 缺少 CURRENT（槽位 $Slot）"
+        }
+        $manifestName = ''
+        try { $manifestName = (Get-Content $currentFile -Raw -ErrorAction SilentlyContinue).Trim() } catch {}
+        if ($manifestName -and -not (Test-Path (Join-Path $ldb $manifestName))) {
+            Write-Step -Stage 'restore' -Message "快照 leveldb CURRENT 指向的 $manifestName 缺失，疑似不完整/损坏，已中止恢复（请重新登录该账号并保存登录态）" -Status 'error'
+            throw "快照 leveldb MANIFEST 缺失（槽位 $Slot）"
+        }
+    }
+
+    # ③ 版本差异警告（不阻断）
+    $currentVer = ''
+    try {
+        if (Test-Path "$($Script:TraeDataDir)\Last Version") { $currentVer = (Get-Content "$($Script:TraeDataDir)\Last Version" -Raw -ErrorAction SilentlyContinue).Trim() }
+    } catch {}
+    if ($snapshotVer -and $currentVer -and ($snapshotVer -ne $currentVer)) {
+        Write-Step -Stage 'restore' -Message "豆包版本已从快照的 $snapshotVer 升级到 $currentVer：旧快照通常兼容，若恢复后登录异常请重新登录并保存登录态" -Status 'warn'
     }
 }
 
@@ -616,6 +708,8 @@ function Restore-ChromiumProfile {
         Write-Step -Stage 'restore' -Message "目标账号 $Slot 无快照，请先登录该账号并保存登录态" -Status 'error'
         throw "目标账号 $Slot 无快照"
     }
+    # C3：恢复前完整性校验（schemaVersion / leveldb CURRENT→MANIFEST / 版本差异警告）
+    Test-SnapshotIntegrity -Slot $Slot
     $dest = $Script:TraeDataDir
     if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
     $restored = 0
@@ -627,8 +721,13 @@ function Restore-ChromiumProfile {
     if (Copy-SnapshotItem -SrcPath "$src\Default\Local Storage\leveldb" -DestPath "$dest\Default\Local Storage\leveldb") { $restored++ }
     if (Copy-SnapshotItem -SrcPath "$src\Default\Session Storage" -DestPath "$dest\Default\Session Storage") { $restored++ }
     if (Copy-SnapshotItem -SrcPath "$src\Default\DoubaoStorage" -DestPath "$dest\Default\DoubaoStorage") { $restored++ }
+    # C4：快照内含 IndexedDB 时一并恢复（无论当前开关状态，保证快照内容完整回写）
+    if (Test-Path "$src\Default\IndexedDB") {
+        if (Copy-SnapshotItem -SrcPath "$src\Default\IndexedDB" -DestPath "$dest\Default\IndexedDB") { $restored++ }
+    }
     if (Copy-SnapshotItem -SrcPath "$src\saman_app_state" -DestPath "$dest\saman_app_state") { $restored++ }
     if (Copy-SnapshotItem -SrcPath "$src\saman_shell_db_storage" -DestPath "$dest\saman_shell_db_storage") { $restored++ }
+    if (Copy-SnapshotItem -SrcPath "$src\Last Version" -DestPath "$dest\Last Version") { $restored++ }
 
     Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项)" -Status 'ok'
 }
@@ -814,11 +913,15 @@ try {
             Write-Step -Stage 'done' -Message '备份完成' -Status 'ok'
         }
         'RestoreOnly' {
+            # 与 Switch 的区别：只做「以目标快照覆盖当前」，不把当前登录态备份到原账号槽——
+            # 适合当前登录态无需保留（或原账号快照不愿被覆盖）的场景。当前登录态仍会
+            # 先备份到 "last" 槽（安全回退），避免未保存的登录被直接覆盖丢失。
             Stop-Trae
+            Backup-CurrentProfile -Slot 'last'
             Restore-Profile -Slot $UserId
             Set-CurrentAccount -AccountId $UserId
             Start-Trae
-            Write-Step -Stage 'done' -Message "已恢复账号 $UserId 的登录态" -Status 'ok'
+            Write-Step -Stage 'done' -Message "已恢复账号 $UserId 的登录态（当前登录态已备份到 last 槽）" -Status 'ok'
         }
         'KeepAlive' {
             # P3 豆包会话保活：sid_guard 30 天滑动续期由豆包客户端自己完成（cookie 值为客户端级
@@ -830,10 +933,10 @@ try {
                 exit 0
             }
             Start-Trae
-            Write-Step -Stage 'keepalive' -Message '已启动，等待会话联网刷新（25 秒）' -Status 'running'
-            Start-Sleep -Seconds 25
+            Write-Step -Stage 'keepalive' -Message '已启动，等待会话联网刷新（8 秒）' -Status 'running'
+            Start-Sleep -Seconds 8
             Stop-Trae
-            Write-Step -Stage 'done' -Message '保活完成（启动 25 秒 → 优雅关闭，sid_guard 已滑动续期）' -Status 'ok'
+            Write-Step -Stage 'done' -Message '保活完成（启动 8 秒 → 优雅关闭，sid_guard 已滑动续期）' -Status 'ok'
         }
     }
     exit 0

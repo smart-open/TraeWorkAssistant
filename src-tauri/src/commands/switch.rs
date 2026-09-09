@@ -12,6 +12,7 @@ pub fn switch_account(
     state: State<AppState>,
     user_id: String,
     target_app: Option<String>,
+    proxy_port: Option<u16>,
 ) -> Result<(), String> {
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
@@ -29,21 +30,34 @@ pub fn switch_account(
 
     fs_utils::app_log(&state.data_dir, &format!("开始切换账号: user_id={user_id}"));
 
-    let mut child = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &bridge.to_string_lossy(),
-            "-Action",
-            "Switch",
-            "-UserId",
-            &user_id,
-            "-TargetApp",
-            target_app.as_deref().unwrap_or("TraeWork"),
-            "-Json",
-        ])
+    // C4：豆包快照可选纳入 IndexedDB（设置开关控制，其他应用不受影响）
+    let include_idb = target_app.as_deref() == Some("Doubao")
+        && state.settings().doubao_snapshot_include_idb;
+    // C1：一键以账号打开时注入代理（>0 才传给桥）
+    let inject_port = proxy_port.filter(|p| *p > 0);
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &bridge.to_string_lossy(),
+        "-Action",
+        "Switch",
+        "-UserId",
+        &user_id,
+        "-TargetApp",
+        target_app.as_deref().unwrap_or("TraeWork"),
+        "-Json",
+    ]);
+    if let Some(p) = inject_port {
+        cmd.args(["-ProxyPort", &p.to_string()]);
+    }
+    if include_idb {
+        cmd.arg("-IncludeIndexedDB");
+    }
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW：隐藏切换时闪出的黑色控制台窗口
@@ -138,21 +152,29 @@ pub fn save_current_login(
 
     fs_utils::app_log(&state.data_dir, &format!("开始保存当前登录态: user_id={user_id}"));
 
-    let mut child = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &bridge.to_string_lossy(),
-            "-Action",
-            "SaveCurrentLogin",
-            "-UserId",
-            &user_id,
-            "-TargetApp",
-            target_app.as_deref().unwrap_or("TraeWork"),
-            "-Json",
-        ])
+    // C4：豆包快照可选纳入 IndexedDB
+    let include_idb = target_app.as_deref() == Some("Doubao")
+        && state.settings().doubao_snapshot_include_idb;
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &bridge.to_string_lossy(),
+        "-Action",
+        "SaveCurrentLogin",
+        "-UserId",
+        &user_id,
+        "-TargetApp",
+        target_app.as_deref().unwrap_or("TraeWork"),
+        "-Json",
+    ]);
+    if include_idb {
+        cmd.arg("-IncludeIndexedDB");
+    }
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW：隐藏控制台窗口

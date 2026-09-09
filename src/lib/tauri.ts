@@ -12,8 +12,11 @@ import type {
   CreditsDailySnapshot,
   DiscoveredAccount,
   DoubaoAccountView,
+  DoubaoCapturedCredential,
   DoubaoRenewSummary,
   DoubaoQuotaResult,
+  DoubaoHistoryEvent,
+  DoubaoSnapshotMeta,
   EnvStatus,
   GroupView,
   JwtParseResult,
@@ -170,7 +173,23 @@ export const api = {
       invoke('doubao_account_save', { userId, name: name ?? null, note: note ?? null }),
     accountRemove: (userId: string) => invoke('doubao_account_remove', { userId }),
     detectUid: () => invoke<string | null>('doubao_detect_uid'),
-    launch: () => invoke('open_doubao_app'),
+    launch: (proxyPort?: number) => invoke('open_doubao_app', { proxyPort: proxyPort ?? null }),
+    /** C1：一键以账号打开（恢复快照后拉起客户端；代理运行中时注入 --proxy-server） */
+    openAs: (userId: string, proxyPort?: number) =>
+      invoke('doubao_open_as_account', { userId, proxyPort: proxyPort ?? null }),
+    /** C3：快照版本元数据（旧版快照返回 schema_version=0 或 null） */
+    snapshotMeta: (userId: string) =>
+      invoke<DoubaoSnapshotMeta | null>('doubao_snapshot_meta', { userId }),
+    /** 运维历史（keepalive/renew/quota 事件，旧→新；健康度卡与额度趋势数据源） */
+    history: () => invoke<DoubaoHistoryEvent[]>('doubao_history'),
+    // ---- 额度定时巡检任务（A1/B4） ----
+    quotaTaskRegister: (time: string) => invoke('doubao_quota_task_register', { time }),
+    quotaTaskStatus: () => invoke<string>('doubao_quota_task_status'),
+    quotaTaskUnregister: () => invoke('doubao_quota_task_unregister'),
+    // ---- 会话凭证（代理自动抓包） ----
+    capturedCredential: () => invoke<DoubaoCapturedCredential | null>('doubao_captured_credential'),
+    /** 抓包凭证自动回写当前账号（幂等）；返回写入说明或 null（无凭证/无目标/内容未变） */
+    credentialAutoApply: () => invoke<string | null>('doubao_credential_auto_apply'),
     // ---- 会话续期 ----
     renewRun: (syncOnly?: boolean) =>
       invoke<DoubaoRenewSummary>('doubao_renew_run', { syncOnly: syncOnly ?? false }),

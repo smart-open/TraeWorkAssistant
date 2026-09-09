@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { FolderSearch, Save, Clock3, MapPin, ShieldCheck, RefreshCw, Timer, Coins } from 'lucide-react';
+import { FolderSearch, Save, Clock3, MapPin, ShieldCheck, RefreshCw, Timer, Coins, Database } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -27,6 +27,29 @@ export default function DoubaoSettings() {
 
   // ── 会员额度 ──
   const [quotaUrl, setQuotaUrl] = useState('');
+  // ── 额度巡检定时任务 ──
+  const [quotaTaskTime, setQuotaTaskTime] = useState('09:30');
+  const [quotaTaskState, setQuotaTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
+  const [quotaTaskTimeShown, setQuotaTaskTimeShown] = useState('');
+
+  // ── 快照设置（C4：IndexedDB 可选纳入）──
+  const [includeIdb, setIncludeIdb] = useState(false);
+
+  const toggleIncludeIdb = async (v: boolean) => {
+    setIncludeIdb(v);
+    try {
+      await saveSettings({ doubao_snapshot_include_idb: v });
+      pushToast(
+        'success',
+        v
+          ? '已开启：之后的保存/切换会纳入 IndexedDB（对话历史随账号迁移，快照体积会明显增大）；已有快照需重新保存登录态后生效'
+          : '已关闭：快照恢复默认白名单（不含 IndexedDB）',
+      );
+    } catch (err) {
+      setIncludeIdb(!v);
+      pushToast('error', `保存设置失败：${String(err)}`);
+    }
+  };
 
   const refreshTaskStatus = async () => {
     try {
@@ -42,13 +65,29 @@ export default function DoubaoSettings() {
     }
   };
 
+  const refreshQuotaTaskStatus = async () => {
+    try {
+      const s = await api.doubao.quotaTaskStatus();
+      if (s.startsWith('registered:')) {
+        setQuotaTaskState('registered');
+        setQuotaTaskTimeShown(s.slice('registered:'.length));
+      } else {
+        setQuotaTaskState('not_registered');
+      }
+    } catch {
+      setQuotaTaskState('not_registered');
+    }
+  };
+
   useEffect(() => {
     if (settings?.doubao_path) setPath(settings.doubao_path);
     if (settings?.doubao_renew_url) setRenewUrl(settings.doubao_renew_url);
     if (settings?.doubao_quota_url) setQuotaUrl(settings.doubao_quota_url);
+    if (settings) setIncludeIdb(!!settings.doubao_snapshot_include_idb);
     void refreshTaskStatus();
+    void refreshQuotaTaskStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb]);
 
   const detect = async () => {
     setDetecting(true);
@@ -88,7 +127,7 @@ export default function DoubaoSettings() {
       return;
     }
     await saveSettings({ doubao_renew_url: v || null });
-    pushToast('success', v ? '保活端点已保存' : '已恢复默认端点（doubao.com 首页滑动续期）');
+    pushToast('success', v ? '保活端点已保存' : '已恢复默认端点（info/v2 轻量探活）');
   };
 
   const saveQuotaUrl = async () => {
@@ -98,7 +137,7 @@ export default function DoubaoSettings() {
       return;
     }
     await saveSettings({ doubao_quota_url: v || null });
-    pushToast('success', v ? '会员额度接口已保存' : '已清空会员额度接口');
+    pushToast('success', v ? '会员额度接口已保存' : '已恢复默认会员额度接口');
   };
 
   const registerTask = async () => {
@@ -120,6 +159,30 @@ export default function DoubaoSettings() {
       await api.doubao.taskUnregister();
       await refreshTaskStatus();
       pushToast('info', '豆包续期任务已注销');
+    } catch (err) {
+      pushToast('error', `注销失败：${String(err)}`);
+    }
+  };
+
+  const registerQuotaTask = async () => {
+    if (!/^\d{2}:\d{2}$/.test(quotaTaskTime)) {
+      pushToast('warn', '时间格式应为 HH:MM');
+      return;
+    }
+    try {
+      await api.doubao.quotaTaskRegister(quotaTaskTime);
+      await refreshQuotaTaskStatus();
+      pushToast('success', `额度巡检任务已注册（每日 ${quotaTaskTime}）`);
+    } catch (err) {
+      pushToast('error', `注册失败：${String(err)}`);
+    }
+  };
+
+  const unregisterQuotaTask = async () => {
+    try {
+      await api.doubao.quotaTaskUnregister();
+      await refreshQuotaTaskStatus();
+      pushToast('info', '额度巡检任务已注销');
     } catch (err) {
       pushToast('error', `注销失败：${String(err)}`);
     }
@@ -148,7 +211,7 @@ export default function DoubaoSettings() {
     <div className="animate-fade-in">
       <PageHeader
         title="豆包 · 环境配置"
-        desc="应用位置、会话保活与会员额度接口"
+        desc="应用位置、快照设置、会话保活与会员额度接口"
       />
 
       {/* 应用位置配置 */}
@@ -196,7 +259,7 @@ export default function DoubaoSettings() {
         <div className="space-y-3 text-xs text-slate-500">
           <p>
             续期原理：字节 passport 为 <b>sid_guard 30 天滑动续期</b>。实测豆包桌面客户端 cookie 为客户端级加密
-            （外部无法离线续写），因此<b>主路径为每日保活</b>——注册定时任务后自动「启动豆包 25 秒 → 优雅关闭」，
+            （外部无法离线续写），因此<b>主路径为每日保活</b>——注册定时任务后自动「启动豆包 8 秒 → 优雅关闭」，
             由客户端自己联网刷新会话；运行中则自动跳过。此外可对手动录入的 sessionid（账号管理 → 编辑 → 会话凭证）做探活巡检。
           </p>
 
@@ -206,7 +269,7 @@ export default function DoubaoSettings() {
             <input
               value={renewUrl}
               onChange={(e) => setRenewUrl(e.target.value)}
-              placeholder="默认 https://www.doubao.com/（探活巡检用，KeepAlive 不依赖此项）"
+              placeholder="https://www.doubao.com/info/v2/（默认，探活巡检用；KeepAlive 不依赖此项）"
               className="input flex-1 font-mono text-xs"
             />
             <button onClick={() => void saveRenewUrl()} className="btn-outline shrink-0">
@@ -284,6 +347,37 @@ export default function DoubaoSettings() {
         </div>
       </div>
 
+      {/* 快照设置（C3/C4） */}
+      <div className="mt-4 card p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <Database size={16} className="text-sky-500" />
+          <span className="text-sm font-medium">快照设置</span>
+        </div>
+
+        <div className="space-y-3 text-xs text-slate-500">
+          <p>
+            快照自带<b>版本元数据</b>（schemaVersion + 豆包内核版本），恢复前自动校验完整性（leveldb 结构），
+            豆包升级后若旧快照不兼容会中止并提示重新保存；在「账号管理」悬停快照列可查看版本信息。
+          </p>
+          <label className="flex cursor-pointer items-start gap-2.5">
+            <input
+              type="checkbox"
+              checked={includeIdb}
+              onChange={(e) => void toggleIncludeIdb(e.target.checked)}
+              className="mt-0.5 h-4 w-4 shrink-0 accent-sky-500"
+            />
+            <span>
+              <span className="font-medium text-slate-600 dark:text-zinc-200">快照纳入 IndexedDB（对话历史等完整状态）</span>
+              <span className="mt-0.5 block leading-relaxed">
+                默认排除以控制体积。开启后，保存/切换会把 Default/IndexedDB 一并纳入快照，
+                对话历史等完整状态随账号迁移；代价是快照体积明显增大（可达数百 MB），保存/切换耗时也会变长。
+                已有快照需重新「保存当前登录态」后才会纳入。
+              </span>
+            </span>
+          </label>
+        </div>
+      </div>
+
       {/* 会员额度 */}
       <div className="mt-4 card p-4">
         <div className="mb-3 flex items-center gap-2">
@@ -293,8 +387,8 @@ export default function DoubaoSettings() {
 
         <div className="space-y-3 text-xs text-slate-500">
           <p>
-            豆包订阅/生图/视频额度接口无公开文档，需先经抓包工具（如本项目自带代理）登录豆包后捕获会员中心的
-            已登录 XHR 地址，将其填入下方并保存。之后即可在「账号管理」中对已录入会话凭证的账号点击额度按钮查询
+            会员额度接口已按代理抓包实测固化（<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">/alice/commerce/sale/subscription/quota/summary/</code>），
+            默认即可用。豆包若更新接口，可在此修改。之后即可在「账号管理」中对已录入会话凭证的账号点击额度按钮查询
             （会员等级 / 到期时间 / 剩余额度条）。
           </p>
 
@@ -303,13 +397,40 @@ export default function DoubaoSettings() {
             <input
               value={quotaUrl}
               onChange={(e) => setQuotaUrl(e.target.value)}
-              placeholder="https://www.doubao.com/...（抓包固化的会员额度 XHR 地址）"
+              placeholder="https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/（默认）"
               className="input flex-1 font-mono text-xs"
             />
             <button onClick={() => void saveQuotaUrl()} className="btn-outline shrink-0">
               <Save size={14} /> 保存
             </button>
           </div>
+
+          {/* 每日额度巡检任务 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="shrink-0 text-slate-500">每日巡检</span>
+            <input
+              value={quotaTaskTime}
+              onChange={(e) => setQuotaTaskTime(e.target.value)}
+              placeholder="HH:MM"
+              className="input w-24 text-xs"
+            />
+            <button onClick={() => void registerQuotaTask()} className="btn-outline shrink-0">
+              <Timer size={14} /> 注册
+            </button>
+            {quotaTaskState === 'registered' && (
+              <>
+                <Badge tone="green">已注册 {quotaTaskTimeShown}</Badge>
+                <button onClick={() => void unregisterQuotaTask()} className="btn-ghost text-rose-500">
+                  注销
+                </button>
+              </>
+            )}
+            {quotaTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+          </div>
+          <p>
+            注册后每日定时批量查询池内全部有凭证账号的会员额度：自动回写缓存与历史（概述页趋势图/健康度卡的数据源），
+            额度用完的账号会在应用内提醒。
+          </p>
         </div>
       </div>
     </div>

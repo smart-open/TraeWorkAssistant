@@ -226,9 +226,21 @@ impl AppState {
     pub fn settings(&self) -> Settings {
         // 统一走 fs_utils::read_json：文件缺失/为空/解析失败均回退默认，行为一致
         let mut s: Settings = fs_utils::read_json(&self.conf_path("app_settings.json"));
-        // proxy_domains 为空时回填默认值，确保设置页始终展示默认监听域名
-        if s.proxy_domains.trim().is_empty() {
+        // proxy_domains 为空时回填默认值，确保设置页始终展示默认监听域名；
+        // 仍为旧默认（未含 doubao.com）时也迁移到新默认（用户未自定义过才替换）
+        if s.proxy_domains.trim().is_empty()
+            || s.proxy_domains == crate::models::legacy_proxy_domains()
+        {
             s.proxy_domains = crate::models::default_proxy_domains();
+        }
+        // 豆包端点已实测固化，回填默认值；旧默认（doubao.com 首页）也迁移到新默认（用户未自定义才替换）
+        if s.doubao_renew_url.clone().unwrap_or_default().trim().is_empty()
+            || s.doubao_renew_url.clone().unwrap_or_default() == crate::models::legacy_doubao_renew_url()
+        {
+            s.doubao_renew_url = Some(crate::models::default_doubao_renew_url());
+        }
+        if s.doubao_quota_url.clone().unwrap_or_default().trim().is_empty() {
+            s.doubao_quota_url = Some(crate::models::default_doubao_quota_url());
         }
         s
     }

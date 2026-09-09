@@ -160,7 +160,7 @@ export default function GeneralSettingsPanel() {
               value={form.proxy_domains}
               onChange={(e) => update('proxy_domains', e.target.value)}
               className="input min-h-[60px] text-xs"
-              placeholder="trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com"
+              placeholder="trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com"
             />
             <p className="mt-1 text-xs text-slate-400">
               逗号分隔的域名后缀列表，匹配的域名将走 MITM 解密并记录日志。未在列表中的域名请求将透明转发但不记录日志，不影响其他 App
