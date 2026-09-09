@@ -350,6 +350,7 @@ pub fn logs_query(state: State<AppState>, opts: LogsOpts) -> Vec<LogLine> {
         ("proxy", "proxy.log"),
         ("checkin", "checkin.log"),
         ("switch", "switcher.log"),
+        ("app", "app.log"),
     ];
     let mut out = Vec::new();
     for (t, fname) in files {
@@ -397,7 +398,7 @@ fn split_time(raw: &str) -> (String, String) {
     ("".to_string(), raw.to_string())
 }
 
-/// 清理指定类型日志文件（proxy/checkin/switch；all 为全清）。
+/// 清理指定类型日志文件（proxy/checkin/switch/app；all 为全清）。
 /// 各写入方均为「每次追加时重新打开」，删除后文件按需自动重建，无需特殊处理。
 /// 返回实际删除的文件数。
 #[tauri::command]
@@ -406,6 +407,7 @@ pub fn logs_clear(state: State<AppState>, log_type: String) -> Result<u32, Strin
         ("proxy", "proxy.log"),
         ("checkin", "checkin.log"),
         ("switch", "switcher.log"),
+        ("app", "app.log"),
     ];
     let mut removed = 0u32;
     for (t, fname) in files {

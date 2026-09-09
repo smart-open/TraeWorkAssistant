@@ -52,7 +52,7 @@ pub fn today_prefix() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// 按保留天数清理日志文件（proxy / checkin / switcher）。
+/// 按保留天数清理日志文件（proxy / checkin / switcher / app）。
 /// 仅丢弃带 `[YYYY-MM-DD` 前缀且日期早于 cutoff 的行；无日期前缀的行（如部分外部脚本输出）一律保留。
 /// 任何错误静默忽略——日志清理失败不应影响主流程。
 pub fn trim_logs(data_dir: &Path, retention_days: u64) {
@@ -61,7 +61,7 @@ pub fn trim_logs(data_dir: &Path, retention_days: u64) {
     }
     let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(retention_days as i64);
     let logs_dir = data_dir.join("logs");
-    for name in ["proxy.log", "checkin.log", "switcher.log"] {
+    for name in ["proxy.log", "checkin.log", "switcher.log", "app.log"] {
         let p = logs_dir.join(name);
         let content = match fs::read(&p) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),

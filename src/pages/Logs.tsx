@@ -1,4 +1,4 @@
-﻿import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { RefreshCw, Search, Trash2, Copy, ChevronLeft, ChevronRight, Eye, Eraser, Bug, FileText, X } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, Modal } from '../components/ui';
@@ -12,12 +12,14 @@ const TYPES = [
   { v: 'proxy', label: '代理' },
   { v: 'checkin', label: '签到' },
   { v: 'switch', label: '切换' },
+  { v: 'app', label: '应用' },
 ];
 
 const typeColor: Record<string, string> = {
   proxy: 'text-sky-600 dark:text-sky-300',
   checkin: 'text-emerald-600 dark:text-emerald-300',
   switch: 'text-violet-600 dark:text-violet-300',
+  app: 'text-amber-600 dark:text-amber-300',
   system: 'text-slate-500',
   error: 'text-rose-600 dark:text-rose-300',
 };
