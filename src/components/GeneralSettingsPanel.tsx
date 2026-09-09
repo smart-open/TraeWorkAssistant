@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Save, RotateCcw } from 'lucide-react';
 import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
+import { api } from '../lib/tauri';
 import { THEMES } from '../lib/themes';
 import type { Settings as SettingsType } from '../types';
 
@@ -18,10 +19,32 @@ export default function GeneralSettingsPanel() {
 
   const [form, setForm] = useState<SettingsType | null>(null);
   const [saving, setSaving] = useState(false);
+  // 开机自启（T11）：注册表 Run 项即时生效，不随「保存设置」提交
+  const [autostart, setAutostart] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
 
   useEffect(() => {
     void refreshSettings();
+    api.misc
+      .autostartStatus()
+      .then(setAutostart)
+      .catch(() => setAutostart(false));
   }, [refreshSettings]);
+
+  const toggleAutostart = async () => {
+    if (autostartBusy) return;
+    setAutostartBusy(true);
+    const next = !autostart;
+    try {
+      await api.misc.autostartSet(next);
+      setAutostart(next);
+      toast('success', next ? '已开启开机自启' : '已关闭开机自启');
+    } catch (e) {
+      toast('error', `设置开机自启失败：${String(e)}`);
+    } finally {
+      setAutostartBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (settings && !form) {
@@ -109,6 +132,25 @@ export default function GeneralSettingsPanel() {
           <label className="flex items-center gap-2">
             <input type="checkbox" checked={form.tray} onChange={(e) => update('tray', e.target.checked)} />
             启用系统托盘图标
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={autostart}
+              onChange={() => void toggleAutostart()}
+              disabled={autostartBusy}
+            />
+            开机自启
+            <span className="text-xs text-slate-400">（开关即时生效，无需保存）</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={form.silent_checkin}
+              onChange={(e) => update('silent_checkin', e.target.checked)}
+            />
+            启动静默签到
+            <span className="text-xs text-slate-400">（启动 60 秒后自动为未签到账号签到）</span>
           </label>
           <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
           <div>

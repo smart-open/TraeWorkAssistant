@@ -289,7 +289,7 @@ AI Work 助手 是一款 Windows 桌面端多账号管理一站式工作台，**
 
 ### 7.3 使用方式
 
-API 服务启动后，可使用标准 OpenAI SDK 调用：
+API 服务启动后，可使用标准 OpenAI SDK 调用（`api_key` 使用应用「API 服务 → API Keys 管理」中创建的 Key；未配置启用 Key 时不鉴权）：
 
 ```python
 from openai import OpenAI
@@ -309,9 +309,12 @@ response = client.chat.completions.create(
 **支持接口**：
 
 - `POST /v1/chat/completions` — 对话（流式 + 非流式）
+- `POST /v1/completions` — legacy 文本补全（prompt 转 user message 复用对话链路）
+- `POST /v1/messages` — Anthropic 兼容端点（Claude Code 等工具直连）
 - `GET /v1/models` — 模型列表
 - `GET /status` — 账号池状态
 - `GET /health` — 健康检查
+- `POST /v1/embeddings` — 上游无向量能力，固定返回 501
 
 ### 7.4 IDE 积分说明
 

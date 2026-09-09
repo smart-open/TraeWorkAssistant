@@ -8,25 +8,40 @@ import {
   XCircle,
   Activity,
   Globe,
-  Eye,
-  EyeOff,
   Eraser,
   Copy,
   Info,
+  BarChart3,
+  KeyRound,
+  Plus,
+  Trash2,
+  Power,
 } from 'lucide-react';
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import PageHeader from '../components/PageHeader';
 import { Badge, StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
-import type { Settings, ApiServiceStatus, PoolStatus, ModelOption } from '../types';
-
-/** 将 API Key 打码：保留前4后4，中间用 **** 替代 */
-function maskApiKey(key: string): string {
-  if (!key) return '';
-  if (key.length <= 8) return '****';
-  return `${key.slice(0, 4)}****${key.slice(-4)}`;
-}
+import { maskApiKey, fmtTokens } from '../lib/format';
+import type {
+  Settings,
+  ApiServiceStatus,
+  PoolStatus,
+  ModelOption,
+  UsageDayView,
+  ApiKeyEntry,
+  GroupView,
+} from '../types';
 
 export default function ApiService() {
   const settings = useAppStore((s) => s.settings);
@@ -41,16 +56,25 @@ export default function ApiService() {
   const [status, setStatus] = useState<ApiServiceStatus | null>(null);
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
+  const [poolStrategy, setPoolStrategy] = useState('expire_first');
+  const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
+  const [groups, setGroups] = useState<GroupView[]>([]);
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
-  const [showApiKey, setShowApiKey] = useState(false);
   const [savingPool, setSavingPool] = useState(false);
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
   const [refreshingPool, setRefreshingPool] = useState(false);
   const [copying, setCopying] = useState(false);
-  const [copyingKey, setCopyingKey] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [syncingModels, setSyncingModels] = useState(false);
+  const [usage, setUsage] = useState<UsageDayView[]>([]);
+  const [usageDays, setUsageDays] = useState(14);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([]);
+  const [keysSaving, setKeysSaving] = useState(false);
+  const [newKeyName, setNewKeyName] = useState('');
+  const [newKeyLimit, setNewKeyLimit] = useState(0);
+  const [newKeyValue, setNewKeyValue] = useState('');
 
   useEffect(() => {
     void refreshSettings();
@@ -58,6 +82,7 @@ export default function ApiService() {
     void loadPool();
     void refreshStatus();
     void loadModels();
+    void loadGroups();
   }, [refreshSettings, refreshAccounts]);
 
   useEffect(() => {
@@ -65,6 +90,112 @@ export default function ApiService() {
       setForm(settings);
     }
   }, [settings, form]);
+
+  // 用量统计：直接读落盘数据，服务未运行也可查看
+  const loadUsage = useCallback(async (days: number) => {
+    setUsageLoading(true);
+    try {
+      setUsage(await api.apiServer.usageStats(days));
+    } catch {
+      /* 加载失败保留上次数据 */
+    } finally {
+      setUsageLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadUsage(usageDays);
+  }, [usageDays, loadUsage]);
+
+  // ---- 多 API Key 管理 ----
+  const loadKeys = useCallback(async () => {
+    try {
+      setApiKeys(await api.apiServer.keysList());
+    } catch {
+      /* 保留空列表 */
+    }
+  }, []);
+
+  /** 生成 sk- 前缀随机 Key（前端 crypto 随机源） */
+  const generateKeyValue = useCallback(() => {
+    const buf = new Uint8Array(24);
+    crypto.getRandomValues(buf);
+    setNewKeyValue('sk-' + [...buf].map((b) => b.toString(16).padStart(2, '0')).join(''));
+  }, []);
+
+  useEffect(() => {
+    void loadKeys();
+    generateKeyValue();
+  }, [loadKeys, generateKeyValue]);
+
+  const saveKeys = async (next: ApiKeyEntry[], msg: string) => {
+    setKeysSaving(true);
+    try {
+      await api.apiServer.keysSave(next);
+      setApiKeys(next);
+      toast('success', msg);
+    } catch (e) {
+      toast('error', `保存 Key 失败：${String(e).slice(0, 120)}`);
+    } finally {
+      setKeysSaving(false);
+    }
+  };
+
+  const addKey = () => {
+    const name = newKeyName.trim();
+    if (!name) {
+      toast('error', '请填写 Key 名称');
+      return;
+    }
+    if (!newKeyValue.startsWith('sk-')) {
+      toast('error', 'Key 值无效，请重新生成');
+      return;
+    }
+    if (apiKeys.some((k) => k.key === newKeyValue)) {
+      toast('error', 'Key 值与现有条目重复');
+      return;
+    }
+    const entry: ApiKeyEntry = {
+      id: crypto.randomUUID(),
+      name,
+      key: newKeyValue,
+      enabled: true,
+      daily_limit: Math.max(0, Math.floor(newKeyLimit) || 0),
+      created_at: Math.floor(Date.now() / 1000),
+      used_date: '',
+      used_today: 0,
+    };
+    void saveKeys([...apiKeys, entry], `Key「${name}」已添加`);
+    setNewKeyName('');
+    setNewKeyLimit(0);
+    generateKeyValue();
+  };
+
+  const toggleKey = (id: string) => {
+    const next = apiKeys.map((k) => (k.id === id ? { ...k, enabled: !k.enabled } : k));
+    void saveKeys(next, 'Key 状态已更新');
+  };
+
+  const deleteKey = (k: ApiKeyEntry) => {
+    if (!confirm(`确认删除 Key「${k.name}」？使用该 Key 的客户端将立即无法访问。`)) return;
+    void saveKeys(apiKeys.filter((x) => x.id !== k.id), `Key「${k.name}」已删除`);
+  };
+
+  const updateKeyLimit = (id: string, limit: number) => {
+    const v = Math.max(0, Math.floor(limit) || 0);
+    const cur = apiKeys.find((k) => k.id === id);
+    if (!cur || cur.daily_limit === v) return;
+    void saveKeys(apiKeys.map((k) => (k.id === id ? { ...k, daily_limit: v } : k)), '限额已更新');
+  };
+
+  const copyKeyValue = async (k: ApiKeyEntry) => {
+    try {
+      await navigator.clipboard.writeText(k.key);
+      toast('success', 'Key 已复制到剪贴板');
+    } catch {
+      toast('error', '复制失败');
+    }
+  };
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -96,12 +227,53 @@ export default function ApiService() {
     try {
       const pool = await withMinDelay(api.apiServer.poolList());
       setEnabledUids(new Set(pool.enabled_uids));
+      setPoolStrategy(pool.strategy || 'expire_first');
+      setPoolGroups(new Set(pool.group_ids ?? []));
     } catch {
       /* ignore */
     } finally {
       setRefreshingPool(false);
     }
   };
+
+  // 分组列表（供账号池分组筛选使用）
+  const loadGroups = async () => {
+    try {
+      setGroups(await api.groups.list());
+    } catch {
+      /* 保留空列表 */
+    }
+  };
+
+  // 分组筛选实时预览（T10）：按当前勾选 + 所选分组即时计算将纳入池中的账号，
+  // 让「点选分组」有立即可见的过滤反馈（实际入池在保存并重启 API 服务后生效）
+  const groupUidSets = useMemo(
+    () => groups.map((g) => ({ id: g.id, uids: new Set(g.uids ?? []) })),
+    [groups],
+  );
+  const poolPreview = useMemo(() => {
+    if (poolGroups.size === 0) return { inPool: enabledUids.size, excluded: 0 };
+    let inPool = 0;
+    let excluded = 0;
+    for (const uid of enabledUids) {
+      if (groupUidSets.some((g) => poolGroups.has(g.id) && g.uids.has(uid))) inPool += 1;
+      else excluded += 1;
+    }
+    return { inPool, excluded };
+  }, [enabledUids, poolGroups, groupUidSets]);
+  // 判断账号在当前分组筛选下是否参与调度（账号列表标记用）
+  const inPoolFilter = (uid: string) =>
+    poolGroups.size === 0 || groupUidSets.some((g) => poolGroups.has(g.id) && g.uids.has(uid));
+
+  // 今日按 Key 的 token 用量（Keys 表「今日已用」并列展示；日期口径与后端一致 = 本地时区 YYYY-MM-DD）
+  const todayKey = new Date().toLocaleDateString('sv-SE');
+  const todayKeyTokens = useMemo(() => {
+    const m = new Map<string, { prompt: number; completion: number }>();
+    usage.find((d) => d.date === todayKey)?.key_tokens.forEach((t) =>
+      m.set(t.name, { prompt: t.prompt_tokens, completion: t.completion_tokens }),
+    );
+    return m;
+  }, [usage, todayKey]);
 
   // 加载模型列表（api_models.json，缺失时后端写入默认列表）
   const loadModels = async () => {
@@ -148,7 +320,7 @@ export default function ApiService() {
     setStarting(true);
     try {
       // 启动前自动保存当前勾选的账号池，避免用户忘记点"保存"
-      await api.apiServer.poolSet([...enabledUids]);
+      await api.apiServer.poolSet([...enabledUids], poolStrategy, [...poolGroups]);
       const s = await withMinDelay(api.apiServer.start());
       setStatus(s);
       useAppStore.setState({ apiStatus: s });
@@ -188,7 +360,7 @@ export default function ApiService() {
   const savePool = async () => {
     setSavingPool(true);
     try {
-      await withMinDelay(api.apiServer.poolSet([...enabledUids]));
+      await withMinDelay(api.apiServer.poolSet([...enabledUids], poolStrategy, [...poolGroups]));
       toast('success', '账号池已更新');
       if (status?.running) {
         toast('info', '需重启 API 服务以应用变更');
@@ -220,22 +392,20 @@ export default function ApiService() {
   const copyConfigExample = async () => {
     setCopying(true);
     const port = form?.api_port ?? 7864;
-    const apiKey = form?.api_key ?? '';
-    const maskedKey = apiKey ? maskApiKey(apiKey) : '';
     const model = form?.api_default_model ?? 'glm-5.2';
     const example = `# 客户端配置示例（OpenAI 兼容格式）
 接口地址: http://127.0.0.1:${port}/v1
-API Key:  ${maskedKey || '（留空则不鉴权）'}
+API Key:  <在下方「API Keys 管理」中创建并复制>
 模型 ID:  ${model}
 
 # Anthropic 兼容端点（Claude Code 等工具直连）
 POST http://127.0.0.1:${port}/v1/messages
-鉴权头: x-api-key: ${maskedKey || 'your-api-key'} 或 Authorization: Bearer
+鉴权头: x-api-key: your-api-key 或 Authorization: Bearer
 
-# cURL 测试（请将 API Key 替换为完整值）
+# cURL 测试（请将 API Key 替换为列表中的完整值）
 curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${maskedKey || 'your-api-key'}" \\
+  -H "Authorization: Bearer your-api-key" \\
   -d '{
     "model": "${model}",
     "messages": [{"role": "user", "content": "你好"}],
@@ -245,7 +415,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
 # Anthropic /v1/messages 测试
 curl -X POST http://127.0.0.1:${port}/v1/messages \\
   -H "Content-Type: application/json" \\
-  -H "x-api-key: ${maskedKey || 'your-api-key'}" \\
+  -H "x-api-key: your-api-key" \\
   -H "anthropic-version: 2023-06-01" \\
   -d '{
     "model": "${model}",
@@ -262,26 +432,48 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
     }
   };
 
-  // 复制完整 API Key 到剪贴板
-  const copyApiKey = async () => {
-    const apiKey = form?.api_key ?? '';
-    if (!apiKey) {
-      toast('info', 'API Key 为空，无可复制内容');
-      return;
-    }
-    setCopyingKey(true);
-    try {
-      await withMinDelay(navigator.clipboard.writeText(apiKey));
-      toast('success', 'API Key 已复制到剪贴板');
-    } catch {
-      toast('error', '复制失败');
-    } finally {
-      setCopyingKey(false);
-    }
-  };
-
   const running = status?.running ?? false;
   const poolCount = enabledUids.size;
+
+  // 用量汇总（跨天聚合）+ 图表数据
+  const usageSummary = useMemo(() => {
+    const models = new Map<string, { requests: number; ok: number; errors: number }>();
+    const t = usage.reduce(
+      (acc, d) => {
+        acc.requests += d.total_requests;
+        acc.ok += d.ok;
+        acc.errors += d.errors;
+        acc.prompt += d.prompt_tokens;
+        acc.completion += d.completion_tokens;
+        acc.weightedDuration += d.avg_duration_ms * d.total_requests;
+        for (const m of d.models) {
+          const e = models.get(m.name) ?? { requests: 0, ok: 0, errors: 0 };
+          e.requests += m.requests;
+          e.ok += m.ok;
+          e.errors += m.errors;
+          models.set(m.name, e);
+        }
+        return acc;
+      },
+      { requests: 0, ok: 0, errors: 0, prompt: 0, completion: 0, weightedDuration: 0 },
+    );
+    const topModels = [...models.entries()]
+      .sort((a, b) => b[1].requests - a[1].requests)
+      .slice(0, 5)
+      .map(([name, v]) => ({ name, ...v }));
+    return {
+      ...t,
+      topModels,
+      successRate: t.requests > 0 ? ((t.ok / t.requests) * 100).toFixed(1) : '—',
+      avgDuration: t.requests > 0 ? Math.round(t.weightedDuration / t.requests) : 0,
+    };
+  }, [usage]);
+
+  const usageChartData = useMemo(
+    () => usage.map((d) => ({ date: d.date.slice(5), 成功: d.ok, 失败: d.errors })),
+    [usage],
+  );
+
   // 账号池仅展示/可选有通用积分的账号（本服务消耗通用积分，零积分账号无法服务请求）
   const poolAccounts = useMemo(
     () => accounts.filter((a) => (a.general_credits ?? 0) > 0),
@@ -401,42 +593,6 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
 
             <div>
               <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
-                API Key（留空则不鉴权）
-              </label>
-              <div className="relative">
-                <input
-                  type={showApiKey ? 'text' : 'password'}
-                  className="input pr-16"
-                  placeholder="sk-..."
-                  value={form?.api_key ?? ''}
-                  onChange={(e) => update('api_key', e.target.value)}
-                  disabled={running}
-                />
-                <button
-                  type="button"
-                  className="absolute right-9 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300"
-                  onClick={copyApiKey}
-                  title="复制 API Key"
-                  tabIndex={-1}
-                >
-                  <Copy size={16} className={copyingKey ? 'animate-pulse' : ''} />
-                </button>
-                <button
-                  type="button"
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:text-zinc-500 dark:hover:text-zinc-300"
-                  onClick={() => setShowApiKey((v) => !v)}
-                  tabIndex={-1}
-                >
-                  {showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}
-                </button>
-              </div>
-              <p className="mt-1 text-xs text-slate-400">
-                客户端请求需携带 Authorization: Bearer &lt;key&gt;
-              </p>
-            </div>
-
-            <div>
-              <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
                 默认模型
               </label>
               <div className="flex items-center gap-2">
@@ -498,9 +654,7 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                 </div>
                 <div>
                   <span className="text-slate-400">API Key：</span>
-                  <code className="text-[11px]">
-                    {form?.api_key ? maskApiKey(form.api_key) : '（留空则不鉴权）'}
-                  </code>
+                  <code className="text-[11px]">在下方「API Keys 管理」中创建并复制</code>
                 </div>
                 <div>
                   <span className="text-slate-400">模型 ID：</span>
@@ -557,6 +711,65 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
             </p>
           ) : (
             <>
+              {/* 调度策略 + 分组筛选（T10，保存后需重启 API 服务生效） */}
+              <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+                <div className="flex items-center gap-2">
+                  <label className="shrink-0 text-xs text-slate-500 dark:text-zinc-400">调度策略</label>
+                  <select
+                    className="h-7 flex-1 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                    value={poolStrategy}
+                    onChange={(e) => setPoolStrategy(e.target.value)}
+                  >
+                    <option value="expire_first">积分先过期优先（默认）</option>
+                    <option value="credit_first">剩余积分多优先</option>
+                    <option value="random">随机</option>
+                  </select>
+                </div>
+                {groups.length > 0 && (
+                  <div className="flex items-start gap-2">
+                    <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">
+                      分组筛选
+                    </label>
+                    <div className="flex flex-1 flex-wrap gap-1">
+                      {groups.map((g) => {
+                        const active = poolGroups.has(g.id);
+                        return (
+                          <button
+                            key={g.id}
+                            type="button"
+                            className={`rounded-full border px-2 py-0.5 text-xs transition ${
+                              active
+                                ? 'border-brand-400 bg-brand-50 text-brand-700 dark:border-brand-500 dark:bg-brand-500/15 dark:text-brand-300'
+                                : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-600'
+                            }`}
+                            onClick={() =>
+                              setPoolGroups((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(g.id)) next.delete(g.id);
+                                else next.add(g.id);
+                                return next;
+                              })
+                            }
+                          >
+                            {g.name}
+                          </button>
+                        );
+                      })}
+                      {poolGroups.size > 0 && (
+                        <span className="pt-0.5 text-xs text-slate-400">
+                          将纳入 {poolPreview.inPool} 个账号
+                          {poolPreview.excluded > 0 &&
+                            `，${poolPreview.excluded} 个分组外账号不参与调度`}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+                <p className="text-xs text-slate-400 dark:text-zinc-500">
+                  分组筛选与调度策略作用于网关取号范围，保存后需重启 API 服务生效；不选分组 = 全部参与
+                </p>
+              </div>
+
               <div className="mb-3 flex items-center gap-2">
                 <button
                   className="text-xs text-brand-600 hover:underline dark:text-brand-400"
@@ -582,10 +795,13 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                 {poolAccounts.map((a) => {
                   const checked = enabledUids.has(a.user_id);
                   const poolItem = poolStatus.find((p) => p.uid === a.user_id);
+                  const filteredOut = !inPoolFilter(a.user_id);
                   return (
                     <label
                       key={a.user_id}
-                      className="flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50"
+                      className={`flex cursor-pointer items-center gap-3 rounded-lg px-3 py-2 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50 ${
+                        filteredOut ? 'opacity-50' : ''
+                      }`}
                     >
                       <input
                         type="checkbox"
@@ -602,6 +818,7 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
+                        {filteredOut && <Badge tone="slate">分组外</Badge>}
                         {(a.general_credits ?? 0) > 0 && (
                           <span className="text-xs tabular-nums text-slate-500 dark:text-zinc-400">
                             {(a.general_credits ?? 0).toFixed(0)} 通用积分
@@ -633,6 +850,171 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
             </>
           )}
         </div>
+      </div>
+
+      {/* API Keys 管理（多 Key + 每日配额，改动立即生效） */}
+      <div className="mt-5 card p-5">
+        <div className="mb-4 flex items-center gap-2">
+          <KeyRound size={18} className="text-brand-500" />
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">API Keys 管理</h2>
+          <span className="hidden text-xs text-slate-400 sm:inline">
+            多个 Key 独立签发并设置每日配额；增删/启停立即生效
+          </span>
+        </div>
+
+        {/* 新增表单 */}
+        <div className="mb-4 flex flex-wrap items-end gap-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+          <div className="w-36">
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">名称</label>
+            <input
+              className="input"
+              placeholder="如：cli / 小工具"
+              value={newKeyName}
+              onChange={(e) => setNewKeyName(e.target.value)}
+            />
+          </div>
+          <div className="min-w-64 flex-1">
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">Key 值</label>
+            <input
+              className="input font-mono text-xs"
+              value={newKeyValue}
+              onChange={(e) => setNewKeyValue(e.target.value)}
+            />
+          </div>
+          <button
+            className="btn-ghost flex items-center gap-1 !p-2 text-xs"
+            onClick={generateKeyValue}
+            title="重新生成 Key 值"
+          >
+            <RefreshCw size={13} />
+            重新生成
+          </button>
+          <div className="w-36">
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
+              日限额/次（0=不限）
+            </label>
+            <input
+              type="number"
+              min={0}
+              className="input"
+              value={newKeyLimit}
+              onChange={(e) => setNewKeyLimit(parseInt(e.target.value) || 0)}
+            />
+          </div>
+          <button
+            className="btn-primary flex items-center gap-1 !px-3 text-xs"
+            onClick={addKey}
+            disabled={keysSaving}
+          >
+            <Plus size={14} />
+            添加 Key
+          </button>
+        </div>
+
+        {apiKeys.length === 0 ? (
+          <p className="py-4 text-center text-sm text-slate-400">
+            暂无 Key — 添加后客户端凭 Key 调用，未配置启用 Key 时不鉴权
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
+                  <th className="pb-2 pr-4 font-medium">名称</th>
+                  <th className="pb-2 pr-4 font-medium">Key</th>
+                  <th className="pb-2 pr-4 font-medium">日限额(次)</th>
+                  <th className="pb-2 pr-4 font-medium">今日已用(次/tok)</th>
+                  <th className="pb-2 pr-4 font-medium">状态</th>
+                  <th className="pb-2 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {apiKeys.map((k) => {
+                  const exhausted = k.daily_limit > 0 && k.used_today >= k.daily_limit;
+                  const kt = todayKeyTokens.get(k.id);
+                  const ktTotal = kt ? kt.prompt + kt.completion : 0;
+                  return (
+                    <tr
+                      key={k.id}
+                      className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
+                    >
+                      <td className="py-2 pr-4 font-medium text-slate-700 dark:text-zinc-200">
+                        {k.name}
+                      </td>
+                      <td className="py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400">
+                        {maskApiKey(k.key)}
+                      </td>
+                      <td className="py-2 pr-4">
+                        <input
+                          type="number"
+                          min={0}
+                          className="input !w-24 !px-2 !py-1 text-xs"
+                          defaultValue={k.daily_limit}
+                          onBlur={(e) => {
+                            const raw = e.target.value.trim();
+                            if (!/^\d+$/.test(raw)) {
+                              // 空/非法输入不落 0（不限），还原显示并提示
+                              e.target.value = String(k.daily_limit);
+                              toast('error', '日限额需为非负整数，已还原原值');
+                              return;
+                            }
+                            updateKeyLimit(k.id, parseInt(raw, 10));
+                          }}
+                          title="0 表示不限；失焦自动保存"
+                        />
+                      </td>
+                      <td
+                        className={
+                          'py-2 pr-4 tabular-nums ' +
+                          (exhausted
+                            ? 'font-semibold text-amber-600 dark:text-amber-400'
+                            : 'text-slate-500 dark:text-zinc-400')
+                        }
+                      >
+                        {k.used_today}
+                        {k.daily_limit > 0 ? ` / ${k.daily_limit}` : ''} 次
+                        {ktTotal > 0 && ` · ${fmtTokens(ktTotal)} tok`}
+                      </td>
+                      <td className="py-2 pr-4">
+                        {k.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
+                      </td>
+                      <td className="py-2">
+                        <div className="flex items-center gap-1">
+                          <button
+                            className="btn-ghost !p-1.5"
+                            title={k.enabled ? '禁用' : '启用'}
+                            onClick={() => toggleKey(k.id)}
+                            disabled={keysSaving}
+                          >
+                            <Power
+                              size={14}
+                              className={k.enabled ? 'text-emerald-500' : 'text-slate-400'}
+                            />
+                          </button>
+                          <button
+                            className="btn-ghost !p-1.5"
+                            title="复制完整 Key"
+                            onClick={() => void copyKeyValue(k)}
+                          >
+                            <Copy size={14} />
+                          </button>
+                          <button
+                            className="btn-ghost !p-1.5"
+                            title="删除"
+                            onClick={() => deleteKey(k)}
+                            disabled={keysSaving}
+                          >
+                            <Trash2 size={14} className="text-rose-500" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* 运行中池状态详情 */}
@@ -700,6 +1082,146 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
           </div>
         </div>
       )}
+
+      {/* 用量统计（落盘数据，服务未运行也可查看） */}
+      <div className="mt-5 card p-5">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <BarChart3 size={18} className="text-brand-500" />
+            <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">用量统计</h2>
+            <span className="hidden text-xs text-slate-400 sm:inline">按日落盘 · 独立于服务运行状态</span>
+          </div>
+          <div className="flex items-center gap-1">
+            {[7, 14, 30].map((d) => (
+              <button
+                key={d}
+                className={
+                  'rounded-md px-2 py-1 text-xs transition ' +
+                  (usageDays === d
+                    ? 'bg-brand-500/10 font-medium text-brand-600 dark:text-brand-400'
+                    : 'text-slate-500 hover:bg-slate-100 dark:text-zinc-400 dark:hover:bg-zinc-800')
+                }
+                onClick={() => setUsageDays(d)}
+              >
+                {d}天
+              </button>
+            ))}
+            <button
+              className="btn-ghost ml-1 flex items-center gap-1 text-xs"
+              onClick={() => void loadUsage(usageDays)}
+              disabled={usageLoading}
+            >
+              <RefreshCw size={13} className={usageLoading ? 'animate-spin' : ''} />
+              刷新
+            </button>
+          </div>
+        </div>
+
+        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <StatCard
+            label="总请求数"
+            value={usageSummary.requests}
+            tone="brand"
+            hint={`近 ${usageDays} 天`}
+          />
+          <StatCard
+            label="成功率"
+            value={usageSummary.successRate === '—' ? '—' : `${usageSummary.successRate}%`}
+            tone="green"
+            hint={`失败 ${usageSummary.errors} 次`}
+          />
+          <StatCard
+            label="Token 消耗"
+            value={fmtTokens(usageSummary.prompt + usageSummary.completion)}
+            tone="amber"
+            hint={`输入 ${fmtTokens(usageSummary.prompt)} / 输出 ${fmtTokens(usageSummary.completion)}`}
+          />
+          <StatCard
+            label="平均耗时"
+            value={usageSummary.requests > 0 ? `${usageSummary.avgDuration}ms` : '—'}
+            tone="blue"
+            hint="按请求加权"
+          />
+        </div>
+
+        {usageSummary.requests > 0 ? (
+          <div className="h-56 text-slate-500 dark:text-zinc-400">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={usageChartData} margin={{ top: 4, right: 8, bottom: 0, left: -16 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.15} vertical={false} />
+                <XAxis dataKey="date" tick={{ fill: 'currentColor', fontSize: 11 }} tickLine={false} />
+                <YAxis allowDecimals={false} tick={{ fill: 'currentColor', fontSize: 11 }} tickLine={false} />
+                <Tooltip
+                  contentStyle={{
+                    borderRadius: 8,
+                    border: '1px solid rgba(120,120,120,0.25)',
+                    fontSize: 12,
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="成功" stackId="s" fill="#10b981" radius={[0, 0, 0, 0]} />
+                <Bar dataKey="失败" stackId="s" fill="#f43f5e" radius={[3, 3, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        ) : (
+          <p className="py-6 text-center text-sm text-slate-400">
+            暂无请求数据 — 发起一次 API 调用后这里会展示按日趋势
+          </p>
+        )}
+
+        {usageSummary.topModels.length > 0 && (
+          <div className="mt-4">
+            <p className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-400">
+              模型分布（近 {usageDays} 天 Top 5）
+            </p>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
+                    <th className="pb-2 pr-4 font-medium">模型</th>
+                    <th className="pb-2 pr-4 font-medium">请求数</th>
+                    <th className="pb-2 pr-4 font-medium">成功</th>
+                    <th className="pb-2 pr-4 font-medium">失败</th>
+                    <th className="pb-2 font-medium">占比</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {usageSummary.topModels.map((m) => {
+                    const pct = usageSummary.requests > 0 ? (m.requests / usageSummary.requests) * 100 : 0;
+                    return (
+                      <tr
+                        key={m.name}
+                        className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
+                      >
+                        <td className="py-2 pr-4 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
+                          {m.name}
+                        </td>
+                        <td className="py-2 pr-4 tabular-nums text-slate-600 dark:text-zinc-300">{m.requests}</td>
+                        <td className="py-2 pr-4 tabular-nums text-emerald-600 dark:text-emerald-400">{m.ok}</td>
+                        <td className="py-2 pr-4 tabular-nums text-rose-600 dark:text-rose-400">{m.errors}</td>
+                        <td className="w-40 py-2">
+                          <div className="flex items-center gap-2">
+                            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100 dark:bg-zinc-800">
+                              <div
+                                className="h-full rounded-full bg-brand-500"
+                                style={{ width: `${Math.min(100, pct)}%` }}
+                              />
+                            </div>
+                            <span className="w-12 shrink-0 text-right text-xs tabular-nums text-slate-400">
+                              {pct.toFixed(1)}%
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

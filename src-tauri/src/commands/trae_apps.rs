@@ -294,8 +294,7 @@ fn pool_uid_set(accounts: &crate::models::AccountsFile) -> std::collections::Has
 /// async 派发：全表读取 state.vscdb（可达数十 MB）+ storage.json，同步命令会冻住 UI。
 #[tauri::command(async)]
 pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> {
-    let accounts: crate::models::AccountsFile =
-        fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let accounts = crate::vault::load_accounts(&state);
     let known = pool_uid_set(&accounts);
 
     let mut out = Vec::new();
@@ -452,8 +451,7 @@ pub fn apps_account_add(
     if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
         return Err("无效的 UserID".into());
     }
-    let mut accounts: crate::models::AccountsFile =
-        fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut accounts = crate::vault::load_accounts(&state);
     let known = pool_uid_set(&accounts);
     if known.contains(&uid) {
         return Err("该账号已在账号池中".into());
@@ -474,7 +472,7 @@ pub fn apps_account_add(
         // 预留记录账户中心 id（仅当发现结果置信时传入；实测该值设备级恒定，不作账号区分）
         dc_id: dc_id.filter(|s| !s.trim().is_empty()),
     });
-    fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+    crate::vault::save_accounts(&state, &mut accounts)?;
     fs_utils::app_log(
         &state.data_dir,
         &format!("自动发现入池 [{}]: uid={} app={}", display_name, uid, app),
@@ -615,8 +613,7 @@ fn query_pay_status(jwt: &str) -> Result<PayStatusEntry, String> {
 /// async 派发：逐账号串行网络请求（每个最长 60s），同步命令跑主线程会冻住 UI。
 #[tauri::command(async)]
 pub fn refresh_pay_status(state: State<AppState>) -> Result<usize, String> {
-    let accounts: crate::models::AccountsFile =
-        fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let accounts = crate::vault::load_accounts(&state);
     let mut file: PayStatusFile = fs_utils::read_json(&state.path("pay_status.json"));
     let mut ok = 0usize;
     for a in &accounts.accounts {

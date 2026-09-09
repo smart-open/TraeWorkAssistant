@@ -3,7 +3,7 @@ use tauri::State;
 
 use crate::fs_utils;
 use crate::jwt;
-use crate::models::{AccountsFile, RawAccount};
+use crate::models::RawAccount;
 use crate::state::AppState;
 
 /// OAuth 常量
@@ -295,7 +295,7 @@ pub fn oauth_login(
         .unwrap_or_else(|| callback_info.refresh_token.clone());
 
     // 7. 检查账号是否已存在
-    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut accounts = crate::vault::load_accounts(&state);
     if accounts
         .accounts
         .iter()
@@ -310,7 +310,7 @@ pub fn oauth_login(
         acct.jwt = jwt.clone();
         acct.refresh_token = Some(final_refresh_token.clone());
         acct.updated_at = Some(fs_utils::now_iso());
-        fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+        crate::vault::save_accounts(&state, &mut accounts)?;
 
         fs_utils::app_log(
             &state.data_dir,
@@ -327,7 +327,7 @@ pub fn oauth_login(
             updated_at: Some(fs_utils::now_iso()),
             dc_id: None,
         });
-        fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+        crate::vault::save_accounts(&state, &mut accounts)?;
 
         // 设置分组
         if let Some(g) = group_id {

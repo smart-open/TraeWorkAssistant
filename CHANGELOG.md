@@ -4,6 +4,37 @@
 
 ---
 
+## [Unreleased]
+
+### 新增（T1-T11 自 trae_work_main 手工移植合入，未使用 merge/cherry-pick）
+
+- **API 网关用量统计（T1）**：`data/api_usage.json` 按日落盘（模型 / 上游账号 / API Key / 流式 / 成败 / 耗时 / token 多维聚合，保留 90 天）；`api_usage_stats(days)` 命令 + API 服务页「用量统计」面板（StatCard ×4 + 堆叠柱状图 + 模型分布 Top5 表）。
+- **多 API Key + 每日配额（T2，含 T15 调整）**：`data/api_keys.json` 多 Key 独立签发与每日限额（0=不限），超配额返回 429；移除主 API Key 双轨校验，鉴权统一走 Key 列表（未配置启用 Key 时不鉴权，携带未知 Key 放行记 anonymous）；前端「API Keys 管理」卡片（生成 / 启停 / 限额失焦保存 / 删除 / 复制）。
+- **托盘菜单增强（T3）**：托盘「立即签到」与「启动/停止 API 服务」（动态文本）+ 完成系统通知；与页面操作共用防重入锁，不冲突。
+- **敏感数据加密（T4）**：jwt / refresh_token 迁入 Stronghold vault（`conf/vault.stronghold`），主密码经 Windows DPAPI 保护（`conf/vault_key.bin`，仅本机当前用户可解）；JSON 落盘占位化，读写统一 `vault::load_accounts / save_accounts`（vault 写失败降级明文 + 下次启动重试迁移）；Python 签到脚本走临时解密文件（`--accounts-file`，用后即删 + 启动按前缀清理崩溃残留）。
+- **签到失败自动重试（T5）**：最多 2 轮（间隔 30s / 90s）仅重试失败账号；`CheckinGuard`（tokio::sync::Mutex）应用级防重入，页面 / 托盘 / 静默签到共用；per-uid 最终态合并保证 `ok+already+failed==total`；前端重试倒计时横幅。
+- **日志按类型清理（T6）**：`logs_clear(log_type)` 命令（all/proxy/checkin/switch），日志页「清理」按钮 + 确认弹窗；不做导出（明确排除）。
+- **前端测试基建（T7）**：抽取 `src/lib/format.ts`（maskApiKey / fmtTokens），新增 vitest@^2（`npm run test`），cn / delay / format 共 13 个纯函数用例。
+- **签到成功率趋势（T8）**：`data/checkin_results.json` 按日 per-uid 落库最终态（保留 90 天）；`checkin_trends(days)` 命令 + Dashboard「近 30 天签到结果」堆叠柱状图（成功绿 / 已签蓝 / 失败红）。
+- **OpenAI 兼容端点扩展（T9）**：新增 `POST /v1/completions`（legacy text completion，prompt 转 user message 复用现有链路，流式 / 非流式）；`/v1/embeddings` 明确返回 501（不做假实现）。
+- **账号池调度策略 + 分组筛选（T10）**：`api_pool.json` 扩展 `strategy`（expire_first / credit_first / random）与 `group_ids`（空=全部参与）；策略纯函数化 + 分组同步期过滤；前端策略下拉 + 分组多选 + 实时预览（分组外账号置灰标记）。
+- **开机自启 + 启动静默签到（T11）**：`tauri-plugin-autostart`（开关即时生效）+ 启动延迟 60s 对未签到账号自动签到（复用统一签到链路，skip_checked_in=true 幂等，完成发系统通知）。
+
+### 变更
+
+- 高版本适配：RawAccount 新增 `dc_id` 字段的构造点补齐（pool.rs 单测等）；自启 / 静默签到开关落在 `GeneralSettingsPanel.tsx`（高版本设置面板）；`trae_apps.rs` 接入 vault（高版本无 pay_status.rs / trae_local.rs）。
+- `Settings` 移除 `api_key` 字段（serde 默认忽略旧配置残留字段，该 Key 不再参与鉴权）。
+- `pool_set` 扩展 `strategy` / `group_ids` 参数；`models_sync::fetch_official` 签名改为调用方预解密账号；`/v1/completions`、`/v1/embeddings` 路由注册。
+- `Cargo.toml` 新增 `tauri-plugin-stronghold`、`tauri-plugin-autostart`、windows-sys（DPAPI）与 `[profile.dev.package."*"] opt-level = 2`；`package.json` 新增 `vitest@^2.1.9` 与 `test` script。
+
+### 文档
+
+- 新增 `docs/optimization-implementation.md`（T1-T11 需求 / 价值 / 实现逻辑 / 代码参考，按本分支适配）与 `docs/optimization-plan.md`；AGENT.md 命令契约表、api-doc.md 新增命令章节与过时签名同步修正。
+
+### 验证
+
+- `cargo test` 30/30、`npx tsc --noEmit` 通过、`npm run test`（vitest）13/13、`npx vite build` 成功。
+
 ## [3.2.7] - 2026-09-08
 
 ### 新增

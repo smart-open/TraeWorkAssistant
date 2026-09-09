@@ -42,7 +42,7 @@ pub fn accounts_list(state: State<AppState>) -> Vec<AccountView> {
 /// 导出所有账号原始数据，字段名对齐参考 JSON（camelCase），供前端一键导出使用。
 #[tauri::command]
 pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, String> {
-    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let accounts = crate::vault::load_accounts(&state);
     let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
     let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
     let views = build_account_views(&state);
@@ -177,7 +177,7 @@ pub fn accounts_import(
 ) -> Result<ImportReport, String> {
     let (accounts_arr, groups_arr) = parse_import_file(&content)?;
 
-    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut accounts = crate::vault::load_accounts(&state);
     let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
 
     // 已有 uid 集合（user_id 字段 + JWT 解析），与自动发现共用同一去重口径
@@ -275,7 +275,7 @@ pub fn accounts_import(
     }
 
     if report.added > 0 || report.groups_added > 0 {
-        fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+        crate::vault::save_accounts(&state, &mut accounts)?;
         fs_utils::write_json(&state.path("groups.json"), &groups)?;
         fs_utils::app_log(
             &state.data_dir,
@@ -363,7 +363,7 @@ pub fn accounts_import_preview(
     content: String,
 ) -> Result<ImportPreview, String> {
     let (accounts_arr, groups_arr) = parse_import_file(&content)?;
-    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let accounts = crate::vault::load_accounts(&state);
     let known = build_known_uids(&accounts);
     let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
     let existing_group_ids: std::collections::HashSet<String> =
@@ -429,7 +429,7 @@ pub fn account_add_manual(
 ) -> Result<(), String> {
     let info = jwt::parse(&jwt);
     let uid = info.user_id.ok_or("无法从 JWT 解析 UserID，请检查格式")?;
-    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut accounts = crate::vault::load_accounts(&state);
     if accounts
         .accounts
         .iter()
@@ -446,7 +446,7 @@ pub fn account_add_manual(
         updated_at: Some(fs_utils::now_iso()),
         dc_id: None,
     });
-    fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+    crate::vault::save_accounts(&state, &mut accounts)?;
     if let Some(g) = group_id {
         let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
         groups.membership.insert(uid, g);
@@ -461,11 +461,13 @@ pub fn account_delete(
     user_id: String,
     delete_profile: bool,
 ) -> Result<(), String> {
-    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut accounts = crate::vault::load_accounts(&state);
     accounts
         .accounts
         .retain(|a| a.user_id.as_deref() != Some(user_id.as_str()));
-    fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+    crate::vault::save_accounts(&state, &mut accounts)?;
+    // 同步清理 vault 中的凭据记录（失败仅记录日志，不阻断删除）
+    crate::vault::remove_secret(&state, &user_id);
 
     let mut groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
     groups.membership.remove(&user_id);
@@ -485,7 +487,7 @@ pub fn account_update(
     name: Option<String>,
     jwt: Option<String>,
 ) -> Result<(), String> {
-    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut accounts = crate::vault::load_accounts(&state);
     let a = accounts
         .accounts
         .iter_mut()
@@ -510,7 +512,7 @@ pub fn account_update(
         }
     }
     a.updated_at = Some(fs_utils::now_iso());
-    fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+    crate::vault::save_accounts(&state, &mut accounts)?;
     Ok(())
 }
 
@@ -523,6 +525,8 @@ pub struct GroupView {
     pub color: String,
     pub order: i32,
     pub count: usize,
+    /// 组内账号 uid 列表（供账号池分组筛选实时预览，T10）
+    pub uids: Vec<String>,
 }
 
 #[tauri::command]
@@ -532,17 +536,20 @@ pub fn groups_list(state: State<AppState>) -> Vec<GroupView> {
         .groups
         .iter()
         .map(|g| {
-            let count = groups
+            let uids: Vec<String> = groups
                 .membership
-                .values()
-                .filter(|v| *v == &g.id)
-                .count();
+                .iter()
+                .filter(|(_, v)| *v == &g.id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            let count = uids.len();
             GroupView {
                 id: g.id.clone(),
                 name: g.name.clone(),
                 color: g.color.clone(),
                 order: g.order,
                 count,
+                uids,
             }
         })
         .collect()
@@ -848,7 +855,7 @@ fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
 /// async 派发：内部走网络请求（最长 120s），同步命令跑主线程会冻住 UI。
 #[tauri::command(async)]
 pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<CreditDetail, String> {
-    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let accounts = crate::vault::load_accounts(&state);
     let account = accounts
         .accounts
         .iter()
@@ -926,7 +933,7 @@ pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<Cr
 /// async 派发：内部走网络请求（最长 120s），同步命令跑主线程会冻住 UI。
 #[tauri::command(async)]
 pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Result<f64, String> {
-    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let accounts = crate::vault::load_accounts(&state);
     let account = accounts
         .accounts
         .iter()
@@ -967,7 +974,7 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
 /// 同时执行自动解冻：签到成功且有积分（credits > 0）且冷却类型非 SessionDead → 清除冷却。
 #[tauri::command(async)]
 pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String> {
-    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let accounts = crate::vault::load_accounts(&state);
     let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
     let mut cd: AccountCooldownsFile = fs_utils::read_json(&state.path("account_cooldowns.json"));
     let mut ok_count = 0usize;
@@ -1165,7 +1172,7 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
         .map_err(|_| "JWT 刷新锁获取失败")?;
 
     // Double-check：持锁后重新读取文件，防止其他线程已刷新
-    let mut accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let mut accounts = crate::vault::load_accounts(&state);
     let account = accounts
         .accounts
         .iter()
@@ -1243,7 +1250,7 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
         account.updated_at = Some(fs_utils::now_iso());
         account.name.clone()
     };
-    fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+    crate::vault::save_accounts(&state, &mut accounts)?;
 
     crate::fs_utils::app_log(
         &state.data_dir,
@@ -1263,8 +1270,8 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
 // ---------------- 内部工具 ----------------
 
 /// 构建账号视图（聚合 JWT / 分组 / 设备 / 积分 / 今日签到 / 冷却状态 / 套餐身份）。
-pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
-    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
+    let accounts = crate::vault::load_accounts(&state);
     let groups: GroupsFile = fs_utils::read_json(&state.path("groups.json"));
     let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
     let credits: CreditsFile = fs_utils::read_json(&state.path("credits_history.json"));
@@ -1387,7 +1394,7 @@ pub fn build_account_views(state: &State<AppState>) -> Vec<AccountView> {
 
 /// 根据 scope 解析目标 user_id 列表。
 pub fn resolve_user_ids(
-    state: &State<AppState>,
+    state: &AppState,
     scope: &str,
     selected: Option<Vec<String>>,
 ) -> Result<Vec<String>, String> {

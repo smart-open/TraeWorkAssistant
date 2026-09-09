@@ -136,15 +136,20 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
 }
 
 /// 流式转换：SOLO SSE → OpenAI SSE chunks，逐 chunk 通过 sender 发送
+///
+/// 返回 (错误信息, 是否已向客户端发送过数据, 上游 token usage)。
+/// 若上游首个事件即 error（尚未发送任何数据），错误不下发，
+/// 由调用方决定重试（如 4001 改 function）或透传给客户端。
 pub fn stream_convert<R: Read + Send>(
     reader: R,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
-) -> Option<(i64, String)> {
+) -> (Option<(i64, String)>, bool, Option<Value>) {
     let br = BufReader::new(reader);
     let mut st = SseState::new();
     let mut pending_usage: Option<Value> = None;
     let mut saw_done = false;
+    let mut sent_any = false;
     let mut error_info: Option<(i64, String)> = None;
 
     let write_chunk = |delta: Value, finish: &str, pending_usage: &Option<Value>| -> String {
@@ -218,6 +223,13 @@ pub fn stream_convert<R: Read + Send>(
                     if !delta.is_empty() {
                         let data = write_chunk(Value::Object(delta), "", &pending_usage);
                         let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        sent_any = true;
+                    } else if !sent_any {
+                        // 空 delta 的首个 output：上游已开始产出，
+                        // 发出仅含 role 的空 chunk 占位，让 sent_any 语义与真实下发一致
+                        let data = write_chunk(json!({ "role": "assistant" }), "", &pending_usage);
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        sent_any = true;
                     }
                 }
                 "token_usage" => {
@@ -228,47 +240,75 @@ pub fn stream_convert<R: Read + Send>(
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     saw_done = true;
+                    sent_any = true;
                 }
                 "error" => {
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
-                    let error_chunk = json!({
-                        "error": {
-                            "message": ev.error_message,
-                            "type": "api_error",
-                            "code": ev.error_code.unwrap_or(0),
-                        }
-                    });
-                    let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
-                        "data: {}\n\n",
-                        error_chunk
-                    ))));
-                    let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-                    saw_done = true;
+                    // 已有数据流出：就地透传错误并结束；否则延迟给调用方决策（可重试）
+                    if sent_any {
+                        let error_chunk = json!({
+                            "error": {
+                                "message": ev.error_message,
+                                "type": "api_error",
+                                "code": ev.error_code.unwrap_or(0),
+                            }
+                        });
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            error_chunk
+                        ))));
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                        saw_done = true;
+                    }
                 }
                 _ => {}
             }
         }
     }
 
-    if !saw_done {
+    if !saw_done && error_info.is_none() {
         let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
     }
 
-    error_info.map(|(code, msg)| (code, msg))
+    (
+        error_info.map(|(code, msg)| (code, msg)),
+        sent_any,
+        pending_usage,
+    )
 }
 
-/// 非流式聚合：读取完整 SOLO SSE，聚合为单个 OpenAI chat.completion
-pub fn aggregate<R: Read + Send>(
+/// 流式转换：SOLO SSE → OpenAI legacy text completion SSE（/v1/completions，T9）
+/// delta.content → choices[].text 块；reasoning_content 无对应字段，跳过
+pub fn stream_convert_text<R: Read + Send>(
     reader: R,
-    chat_id: &str,
-) -> (Option<Value>, Option<(i64, String)>) {
+    sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    completion_id: &str,
+    model: &str,
+) -> (Option<(i64, String)>, bool, Option<Value>) {
     let br = BufReader::new(reader);
     let mut st = SseState::new();
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut finish_reason = "stop".to_string();
-    let mut usage: Option<Value> = None;
+    let mut pending_usage: Option<Value> = None;
+    let mut saw_done = false;
+    let mut sent_any = false;
     let mut error_info: Option<(i64, String)> = None;
+
+    let write_chunk = |text: &str, finish: &str, usage: &Option<Value>| -> String {
+        let mut choice = json!({ "text": text, "index": 0 });
+        if !finish.is_empty() {
+            choice["finish_reason"] = json!(finish);
+        }
+        let mut chunk = json!({
+            "id": completion_id,
+            "object": "text_completion",
+            "created": now_ts(),
+            "model": model,
+            "choices": [choice],
+        });
+        if let Some(u) = usage {
+            chunk["usage"] = u.clone();
+        }
+        format!("data: {}\n\n", chunk)
+    };
 
     for line in br.lines() {
         let line = match line {
@@ -278,35 +318,118 @@ pub fn aggregate<R: Read + Send>(
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
-                    content.push_str(&ev.response);
-                    reasoning.push_str(&ev.reasoning);
-                }
-                "token_usage" => {
-                    usage = Some(json!(ev.usage.unwrap_or(json!({}))));
-                }
-                "done" | "turn_completion" => {
-                    if !ev.finish_reason.is_empty() {
-                        finish_reason = ev.finish_reason;
+                    if !ev.response.is_empty() {
+                        let data = write_chunk(&ev.response, "", &pending_usage);
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        sent_any = true;
                     }
                 }
+                "token_usage" => {
+                    pending_usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
+                }
+                "done" | "turn_completion" => {
+                    let data = write_chunk("", &ev.finish_reason, &pending_usage);
+                    let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                    let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    saw_done = true;
+                    sent_any = true;
+                }
                 "error" => {
-                    error_info = Some((ev.error_code.unwrap_or(0), ev.error_message));
+                    error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
+                    // 已有文本流出：就地透传错误并结束；否则延迟给调用方决策（可重试）
+                    if sent_any {
+                        let error_chunk = json!({
+                            "error": {
+                                "message": ev.error_message,
+                                "type": "api_error",
+                                "code": ev.error_code.unwrap_or(0),
+                            }
+                        });
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            error_chunk
+                        ))));
+                        let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                        saw_done = true;
+                    }
                 }
                 _ => {}
             }
         }
     }
 
-    if let Some((code, msg)) = &error_info {
+    if !saw_done && error_info.is_none() {
+        let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+    }
+
+    (error_info, sent_any, pending_usage)
+}
+
+/// 纯文本收集器：output/thought 文本 + usage + error（无 tool_calls 场景）
+struct PlainCollect {
+    content: String,
+    reasoning: String,
+    finish_reason: String,
+    usage: Option<Value>,
+    error_info: Option<(i64, String)>,
+}
+
+/// 读取完整 SOLO SSE，收集文本/结束原因/用量/错误
+fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
+    let br = BufReader::new(reader);
+    let mut st = SseState::new();
+    let mut out = PlainCollect {
+        content: String::new(),
+        reasoning: String::new(),
+        finish_reason: "stop".to_string(),
+        usage: None,
+        error_info: None,
+    };
+    for line in br.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
+            match ev.event.as_str() {
+                "output" | "thought" => {
+                    out.content.push_str(&ev.response);
+                    out.reasoning.push_str(&ev.reasoning);
+                }
+                "token_usage" => {
+                    out.usage = Some(json!(ev.usage.unwrap_or(json!({}))));
+                }
+                "done" | "turn_completion" => {
+                    if !ev.finish_reason.is_empty() {
+                        out.finish_reason = ev.finish_reason;
+                    }
+                }
+                "error" => {
+                    out.error_info = Some((ev.error_code.unwrap_or(0), ev.error_message));
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// 非流式聚合：读取完整 SOLO SSE，聚合为单个 OpenAI chat.completion
+pub fn aggregate<R: Read + Send>(
+    reader: R,
+    chat_id: &str,
+) -> (Option<Value>, Option<(i64, String)>) {
+    let c = collect_plain(reader);
+    if let Some((code, msg)) = &c.error_info {
         return (None, Some((*code, msg.clone())));
     }
 
     let mut message = json!({
         "role": "assistant",
-        "content": content,
+        "content": c.content,
     });
-    if !reasoning.is_empty() {
-        message["reasoning_content"] = json!(reasoning);
+    if !c.reasoning.is_empty() {
+        message["reasoning_content"] = json!(c.reasoning);
     }
 
     let mut resp = json!({
@@ -317,10 +440,40 @@ pub fn aggregate<R: Read + Send>(
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": finish_reason,
+            "finish_reason": c.finish_reason,
         }],
     });
-    if let Some(u) = usage {
+    if let Some(u) = c.usage {
+        resp["usage"] = u;
+    }
+
+    (Some(resp), None)
+}
+
+/// 非流式聚合：SOLO SSE → OpenAI legacy text completion（/v1/completions，T9）
+pub fn aggregate_text<R: Read + Send>(
+    reader: R,
+    completion_id: &str,
+    model: &str,
+) -> (Option<Value>, Option<(i64, String)>) {
+    let c = collect_plain(reader);
+    if let Some((code, msg)) = &c.error_info {
+        return (None, Some((*code, msg.clone())));
+    }
+
+    let mut resp = json!({
+        "id": completion_id,
+        "object": "text_completion",
+        "created": now_ts(),
+        "model": model,
+        "choices": [{
+            "text": c.content,
+            "index": 0,
+            "logprobs": null,
+            "finish_reason": c.finish_reason,
+        }],
+    });
+    if let Some(u) = c.usage {
         resp["usage"] = u;
     }
 
@@ -372,7 +525,7 @@ pub fn stream_convert_anthropic<R: Read + Send>(
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     msg_id: &str,
     model: &str,
-) -> Option<(i64, String)> {
+) -> (Option<(i64, String)>, bool, Option<Value>) {
     let br = BufReader::new(reader);
     let mut st = SseState::new();
     let mut message_started = false;
@@ -599,17 +752,20 @@ pub fn stream_convert_anthropic<R: Read + Send>(
                 }
                 "error" => {
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
-                    send_event!(
-                        "error",
-                        json!({
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": ev.error_message,
-                            },
-                        })
-                    );
-                    saw_done = true;
+                    // 已有内容发出：就地透传错误并结束；否则延迟给调用方决策（可重试）
+                    if message_started || !tools.is_empty() {
+                        send_event!(
+                            "error",
+                            json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": ev.error_message,
+                                },
+                            })
+                        );
+                        saw_done = true;
+                    }
                 }
                 _ => {}
             }
@@ -627,7 +783,16 @@ pub fn stream_convert_anthropic<R: Read + Send>(
         }
     }
 
-    error_info.map(|(code, msg)| (code, msg))
+    // sent_any 仅统计真实发出过的事件：
+    // tools 只是聚合缓冲（input 尚未发送），不能视为已向客户端输出；
+    // 但「工具已缓冲 + 中途错误」时 error 分支已就地透传错误事件，
+    // 需计入 sent_any，否则调用方会重复下发 error / 误触发重试重放
+    let sent_any = message_started || (!tools.is_empty() && error_info.is_some());
+    (
+        error_info.map(|(code, msg)| (code, msg)),
+        sent_any,
+        usage,
+    )
 }
 
 /// 非流式聚合：SOLO SSE → Anthropic message 对象（/v1/messages）

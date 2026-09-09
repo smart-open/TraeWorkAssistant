@@ -15,6 +15,10 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 # 单实例防护：第二进程启动时聚焦已有实例主窗口后自动退出（仅正式版注册，见 main.rs）
 tauri-plugin-single-instance = "2"
+# 开机自启（T11）：Windows 写注册表 Run 项
+tauri-plugin-autostart = "2"
+# 敏感数据加密（T4）：Stronghold 快照 + DPAPI 主密码
+tauri-plugin-stronghold = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -28,6 +32,13 @@ bytes = "1"
 sha2 = "0.10"
 # 读 Trae 应用的 state.vscdb（SQLite）——自动发现当前登录账号的 Cloud-IDE uid
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+# dev/test 构建对依赖开优化：Stronghold 快照加密派生等在未优化下极慢（写一次 ~100s）
+[profile.dev.package."*"]
+opt-level = 2
 
 [features]
 # 仅桌面端
