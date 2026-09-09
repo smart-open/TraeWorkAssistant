@@ -41,6 +41,13 @@ param(
     [switch]$IncludeIndexedDB,
 
     [Parameter(Mandatory = $false)]
+    # 防误覆盖守卫（豆包）：桌面端在关闭应用前检测到的当前登录 uid（Local Storage
+    # client_device_info / 抓包 multi_sids）。Switch 回写账号槽前须与 current_account.txt
+    # 一致才执行——标记文件残留旧 uid（客户端手动重登）时，旧流程会把"当前态"反复刷进
+    # 错误槽位，实测曾把 B 账号快照覆盖成混乱状态。为空或不一致 = 只备份 last 并警告。
+    [string]$ExpectedCurrentUid = '',
+
+    [Parameter(Mandatory = $false)]
     [switch]$Json
 )
 
@@ -49,6 +56,13 @@ param(
 # 若强制要求管理员，普通权限启动的 App 调起脚本会直接 ScriptRequiresElevation 失败。
 
 $ErrorActionPreference = 'Stop'
+
+# stdout 被重定向时 PS 5.1 默认用 OEM 代码页（中文系统 GBK/936），下游 Tauri 按 UTF-8 解码会乱码。
+# 统一切 UTF-8：NDJSON 进度行中文在桌面端正常显示（读取端 lossy 解码兼容）。
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {}
 
 # 数据目录：优先 AIWORKDATA_DIR（由桌面端注入），否则回退 %APPDATA%\AIWorkAssistant
 $Script:AppDataDir = if ($env:AIWORKDATA_DIR) { $env:AIWORKDATA_DIR } else { "$env:APPDATA\AIWorkAssistant" }
@@ -90,6 +104,9 @@ switch ($TargetApp) {
         $Script:SettingsPathKey = 'doubao_path'
         $Script:ProcNames       = @('Doubao')
         $Script:ExeNames        = @('Doubao.exe')
+        # 豆包优雅关闭等待 8 秒（chromium 壳退出前要落盘 leveldb/cookie，3 秒实测经常不够，
+        # 强杀导致文件锁 → 备份静默缺文件 → 恢复后登录态丢失）
+        $Script:GracefulWaitSecs = 8
         # P2：lnk/注册表/进程回退的过滤词随应用参数化（旧版写死 Trae，对豆包三步回退全部失效）
         $Script:LnkPatterns     = @('*Doubao*', '*豆包*')
         $Script:RegPatterns     = @('*Doubao*', '*豆包*')
@@ -118,6 +135,7 @@ switch ($TargetApp) {
     default {
         $Script:AppName         = 'Trae Work'
         $Script:SnapshotLayout  = 'icube'
+        $Script:GracefulWaitSecs = 3
         $Script:TraeDataDir     = "$env:APPDATA\TRAE SOLO CN"
         $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles"
         $Script:SettingsPathKey = 'trae_path'
@@ -354,9 +372,10 @@ function Stop-Trae {
             try { $_.CloseMainWindow() | Out-Null; $_ } catch {}
         }
         if ($graceful) {
-            Write-Step -Stage 'stop' -Message '已发送优雅关闭请求，等待进程退出（最长 3 秒）' -Status 'running'
+            $gw = if ($Script:GracefulWaitSecs) { $Script:GracefulWaitSecs } else { 3 }
+            Write-Step -Stage 'stop' -Message "已发送优雅关闭请求，等待进程退出（最长 $gw 秒）" -Status 'running'
             $waited = 0
-            while ($waited -lt 3) {
+            while ($waited -lt $gw) {
                 Start-Sleep -Seconds 1
                 $waited++
                 $still = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
@@ -373,9 +392,9 @@ function Stop-Trae {
             Write-Step -Stage 'stop' -Message '优雅关闭超时，强制结束进程' -Status 'warn'
             $p | Stop-Process -Force
         }
-        # 等待进程完全退出，最多等 3 秒
+        # 等待进程完全退出，最多再等 5 秒（强杀后 handle 释放）
         $waited = 0
-        while ($waited -lt 3) {
+        while ($waited -lt 5) {
             Start-Sleep -Seconds 1
             $waited++
             $still = Get-Process -Name $Script:ProcNames -ErrorAction SilentlyContinue | Where-Object {
@@ -383,8 +402,8 @@ function Stop-Trae {
             }
             if (-not $still) { break }
         }
-        if ($waited -ge 3) {
-            Write-Step -Stage 'stop' -Message "进程未在 $waited 秒内退出，可能仍有文件锁，请手动关闭后重试" -Status 'error'
+        if ($waited -ge 5) {
+            Write-Step -Stage 'stop' -Message "进程未在 $waited 秒内完全退出，可能仍有文件锁，请手动关闭后重试" -Status 'error'
         }
     } else {
         Write-Step -Stage 'stop' -Message "$($Script:AppName) 未运行" -Status 'skip'
@@ -566,13 +585,16 @@ function Reset-DeviceIdsOnly {
 }
 
 # ── chromium 布局快照（豆包，P2）───────────────────────────────────────────
-# 白名单依据 doubao-trae-switch-plan.md §2.1：
-#   必选  Local State（saman 账号缓存 + cookie 解密密钥元数据，缺失则恢复后 cookie 无法解密）
-#         Default/Network/Cookies*（登录 cookie，含 journal）
-#         Default/Local Storage/leveldb/（web 侧登录/偏好 KV）
-#   建议  Default/Session Storage/、Default/DoubaoStorage/、saman_app_state、saman_shell_db_storage/
-#   排除  Default/IndexedDB/（体积大，默认排除；C4 可经 -IncludeIndexedDB 纳入，恢复时快照内含即回写）
-#   元数据 snapshot_meta.json（C3）：schemaVersion + Chromium 版本，恢复前做完整性校验
+# 白名单依据 doubao-trae-switch-plan.md §2.1 + 多账号隔离实测（2026-09-09）：
+#   必选  Local State（活跃 Profile 指针 profile.last_used + cookie 解密密钥元数据，缺失则恢复后 cookie 无法解密）
+#         <每个 Profile>/Network/Cookies*（登录 cookie，含 journal；旧布局兜底 <profile>/Cookies*）
+#         <每个 Profile>/Local Storage/leveldb/（web 侧登录/偏好 KV）
+#   建议  <每个 Profile>/Session Storage/、DoubaoStorage/、Preferences、
+#         saman_app_state、saman_shell_db_storage/（User Data 根，跨 Profile 共享）
+#   排除  <每个 Profile>/IndexedDB/（体积大，默认排除；C4 可经 -IncludeIndexedDB 纳入，恢复时快照内含即回写）
+#   元数据 snapshot_meta.json（C3）：schemaVersion + Chromium 版本 + Profile 数，恢复前做完整性校验
+# 多 Profile：豆包自带账号隔离（saman.account_isolation_config），登录会话可能位于任意
+# Profile——只抓 Default 会漏掉活跃会话，恢复后客户端打开的活跃 Profile 未登录（实测根因）。
 # 结构相对 User Data 镜像存放，恢复时对称回写；切换流程的 'last' 槽位即回滚保护。
 
 # 白名单项复制（文件/目录自适应）：返回复制后目标是否真实存在
@@ -587,9 +609,25 @@ function Copy-SnapshotItem {
     } else {
         $parent = Split-Path $DestPath -Parent
         if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        # 先删旧目标再拷贝：若源文件被锁导致 Copy-Item 失败，避免旧文件残留冒充"备份成功"
+        # （曾导致快照里留下陈旧 cookie 文件且校验通过，恢复后登录态错乱）
+        if (Test-Path $DestPath) { Remove-Item $DestPath -Force -ErrorAction SilentlyContinue }
         Copy-Item $SrcPath $DestPath -Force -ErrorAction SilentlyContinue | Out-Null
     }
     return (Test-Path $DestPath)
+}
+
+# 列出 Chromium User Data 布局下的 Profile 目录（Default + Profile N，与 doubao_chats.py 对齐）
+function Get-ChromiumProfileDirs {
+    param([string]$Base)
+    if (-not (Test-Path $Base)) { return @() }
+    try {
+        return @(Get-ChildItem -Path $Base -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' } |
+            Sort-Object Name)
+    } catch {
+        return @()
+    }
 }
 
 function Backup-ChromiumProfile {
@@ -599,29 +637,60 @@ function Backup-ChromiumProfile {
         Write-Step -Stage 'backup' -Message '当前数据目录不存在，跳过备份' -Status 'skip'
         return
     }
+    # 单代回滚保护：覆盖已有槽位前，把现有快照整体挪到 <slot>.bak（上一代 .bak 直接淘汰）。
+    # 背景：Switch 的"备份当前登录态到来源槽"依赖 current_account.txt 与客户端实际登录一致；
+    # 一旦不一致（客户端手动重登/保存错槽），会把错误状态反复刷进该槽且不可恢复——实测曾把
+    # B 账号的快照覆盖成混乱状态。有 .bak 后任何一次覆盖都可回退一代。
+    if (Test-Path $dest) {
+        $bakDir = "$dest.bak"
+        try {
+            if (Test-Path $bakDir) { Remove-Item $bakDir -Recurse -Force -ErrorAction SilentlyContinue }
+            Move-Item $dest $bakDir -Force -ErrorAction Stop
+            Write-Step -Stage 'backup' -Message "原 $Slot 快照已备份到 $Slot.bak（可回滚一代）" -Status 'info'
+        } catch {
+            Write-Step -Stage 'backup' -Message "旧快照挪移失败（将直接覆盖）: $_" -Status 'warn'
+        }
+    }
     if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
     $src = $Script:TraeDataDir
     $copied = 0
 
-    # 必选 1: Local State
+    # 必选 1: Local State（活跃 Profile 指针 profile.last_used + cookie 解密密钥元数据）
     if (Copy-SnapshotItem -SrcPath "$src\Local State" -DestPath "$dest\Local State") { $copied++ }
-    # 必选 2: Default/Network/Cookies*（登录 cookie + journal）
-    Get-ChildItem -Path "$src\Default\Network" -Filter 'Cookies*' -File -ErrorAction SilentlyContinue | ForEach-Object {
-        if (Copy-SnapshotItem -SrcPath $_.FullName -DestPath "$dest\Default\Network\$($_.Name)") { $copied++ }
+
+    # 多 Profile 遍历（豆包自带账号隔离，登录会话可能位于任意 Profile——只抓 Default 会
+    # 漏掉活跃会话，恢复后客户端打开的活跃 Profile 未登录，实测根因）。
+    # 结构相对 User Data 镜像存放（<snapshot>\<Profile>\...），恢复时对称回写。
+    $profiles = Get-ChromiumProfileDirs -Base $src
+    foreach ($p in $profiles) {
+        $n = $p.Name
+        # 必选 2: Cookies*（新布局 <profile>\Network\；旧布局兜底 <profile>\Cookies*，统一归位快照 Network\）
+        $ckBase = if (Test-Path (Join-Path $p.FullName 'Network\Cookies')) { Join-Path $p.FullName 'Network' } else { $p.FullName }
+        Get-ChildItem -Path $ckBase -Filter 'Cookies*' -File -ErrorAction SilentlyContinue | ForEach-Object {
+            if (Copy-SnapshotItem -SrcPath $_.FullName -DestPath "$dest\$n\Network\$($_.Name)") { $copied++ }
+        }
+        # 必选 3: <profile>/Local Storage/leveldb（web 侧登录/偏好 KV）
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'Local Storage\leveldb') -DestPath "$dest\$n\Local Storage\leveldb") { $copied++ }
+        # 建议: Session Storage、DoubaoStorage、Preferences（per-profile）
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'Session Storage') -DestPath "$dest\$n\Session Storage") { $copied++ }
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'DoubaoStorage') -DestPath "$dest\$n\DoubaoStorage") { $copied++ }
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'Preferences') -DestPath "$dest\$n\Preferences") { $copied++ }
+        # 建议: <profile>/saman_shell_db_storage（saman 账号体系客户端级数据库 per-profile 存一份，
+        # 实测 Live User Data 的 Default/Profile N 下均有同名目录——仅抓根级会丢各 Profile 的
+        # shell 侧账号状态，切换后可能触发客户端重建该 Profile 的账号数据）
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'saman_shell_db_storage') -DestPath "$dest\$n\saman_shell_db_storage") { $copied++ }
+        # C4：可选纳入 <profile>/IndexedDB（对话历史等完整状态；体积大，默认排除）
+        if ($IncludeIndexedDB) {
+            if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'IndexedDB') -DestPath "$dest\$n\IndexedDB") { $copied++ }
+        }
     }
-    # 必选 3: Default/Local Storage/leveldb
-    if (Copy-SnapshotItem -SrcPath "$src\Default\Local Storage\leveldb" -DestPath "$dest\Default\Local Storage\leveldb") { $copied++ }
-    # 建议: Default/Session Storage、Default/DoubaoStorage
-    if (Copy-SnapshotItem -SrcPath "$src\Default\Session Storage" -DestPath "$dest\Default\Session Storage") { $copied++ }
-    if (Copy-SnapshotItem -SrcPath "$src\Default\DoubaoStorage" -DestPath "$dest\Default\DoubaoStorage") { $copied++ }
-    # 建议: saman 账号体系状态（文件/目录均有，Copy-SnapshotItem 自适应）
+    if (@($profiles).Count -eq 0) {
+        Write-Step -Stage 'backup' -Message '未发现任何 Profile 目录（Default / Profile N），豆包可能从未启动过' -Status 'warn'
+    }
+
+    # 建议: saman 账号体系状态（User Data 根，文件/目录均有，Copy-SnapshotItem 自适应）
     if (Copy-SnapshotItem -SrcPath "$src\saman_app_state" -DestPath "$dest\saman_app_state") { $copied++ }
     if (Copy-SnapshotItem -SrcPath "$src\saman_shell_db_storage" -DestPath "$dest\saman_shell_db_storage") { $copied++ }
-
-    # C4：可选纳入 Default/IndexedDB（对话历史等完整状态；体积大，默认排除）
-    if ($IncludeIndexedDB) {
-        if (Copy-SnapshotItem -SrcPath "$src\Default\IndexedDB" -DestPath "$dest\Default\IndexedDB") { $copied++ }
-    }
 
     # C3：快照版本元数据（恢复前校验用，防豆包升级后旧快照损坏）
     $snapshotVer = ''
@@ -636,6 +705,7 @@ function Backup-ChromiumProfile {
             app              = $Script:AppName
             chromiumVersion  = $snapshotVer
             includeIndexedDB = [bool]$IncludeIndexedDB
+            profileCount     = @($profiles).Count
             createdAt        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         }
         $meta | ConvertTo-Json -Compress | Set-Content -Path (Join-Path $dest 'snapshot_meta.json') -Encoding UTF8
@@ -646,17 +716,21 @@ function Backup-ChromiumProfile {
     if ($copied -eq 0) {
         Write-Step -Stage 'backup' -Message '未发现任何可备份的登录态文件（豆包可能未登录或数据目录为空）' -Status 'warn'
     } else {
-        Write-Step -Stage 'backup' -Message "已备份当前登录态到 $Slot ($copied 项)" -Status 'ok'
+        Write-Step -Stage 'backup' -Message "已备份当前登录态到 $Slot ($copied 项, $($profiles.Count) 个 Profile)" -Status 'ok'
     }
 }
 
 # C3：恢复前快照完整性校验（防豆包升级/复制中断后旧快照损坏）：
 #   ① schemaVersion：本工具仅支持 1，不兼容直接中止；
-#   ② leveldb 完整性：Local Storage/leveldb 的 CURRENT 必须存在且指向的 MANIFEST 文件在快照内；
+#   ② leveldb 完整性：快照内每个 Profile 的 Local Storage/leveldb 的 CURRENT 必须存在
+#     且指向的 MANIFEST 文件在快照内（多 Profile 快照逐个校验）；
+#   ②b 登录 Cookie 存在性：快照内所有 Profile 均无 Cookies 时警告（可能为未登录态保存）；
 #   ③ 版本差异：快照 Chromium 版本 ≠ 当前安装版本时警告（继续恢复，异常时重新登录保存）。
 function Test-SnapshotIntegrity {
-    param([string]$Slot)
-    $src = Join-Path $Script:ProfilesDir $Slot
+    param([string]$Path)
+    # $Path 为快照目录的最终路径（主槽或 .bak 回退槽，由调用方解析）
+    $src = $Path
+    $slotLabel = Split-Path $Path -Leaf
 
     # ① schemaVersion
     $metaFile = Join-Path $src 'snapshot_meta.json'
@@ -675,20 +749,29 @@ function Test-SnapshotIntegrity {
         Write-Step -Stage 'restore' -Message '快照缺少版本元数据（旧版本工具生成），已跳过 schemaVersion 校验' -Status 'warn'
     }
 
-    # ② leveldb 完整性（CURRENT → MANIFEST 指向校验）
-    $ldb = Join-Path $src 'Default\Local Storage\leveldb'
-    if (Test-Path $ldb) {
-        $currentFile = Join-Path $ldb 'CURRENT'
-        if (-not (Test-Path $currentFile)) {
-            Write-Step -Stage 'restore' -Message "快照 leveldb 缺少 CURRENT 文件，疑似不完整/损坏，已中止恢复（请重新登录该账号并保存登录态）" -Status 'error'
-            throw "快照 leveldb 缺少 CURRENT（槽位 $Slot）"
+    # ② leveldb 完整性（CURRENT → MANIFEST 指向校验，逐 Profile）
+    $hasCookies = $false
+    foreach ($p in (Get-ChromiumProfileDirs -Base $src)) {
+        $ldb = Join-Path $p.FullName 'Local Storage\leveldb'
+        if (Test-Path $ldb) {
+            $currentFile = Join-Path $ldb 'CURRENT'
+            if (-not (Test-Path $currentFile)) {
+                Write-Step -Stage 'restore' -Message "快照 $($p.Name)/Local Storage/leveldb 缺少 CURRENT 文件，疑似不完整/损坏，已中止恢复（请重新登录该账号并保存登录态）" -Status 'error'
+                throw "快照 leveldb 缺少 CURRENT（槽位 $slotLabel，Profile $($p.Name)）"
+            }
+            $manifestName = ''
+            try { $manifestName = (Get-Content $currentFile -Raw -ErrorAction SilentlyContinue).Trim() } catch {}
+            if ($manifestName -and -not (Test-Path (Join-Path $ldb $manifestName))) {
+                Write-Step -Stage 'restore' -Message "快照 $($p.Name)/Local Storage/leveldb CURRENT 指向的 $manifestName 缺失，疑似不完整/损坏，已中止恢复（请重新登录该账号并保存登录态）" -Status 'error'
+                throw "快照 leveldb MANIFEST 缺失（槽位 $slotLabel，Profile $($p.Name)）"
+            }
         }
-        $manifestName = ''
-        try { $manifestName = (Get-Content $currentFile -Raw -ErrorAction SilentlyContinue).Trim() } catch {}
-        if ($manifestName -and -not (Test-Path (Join-Path $ldb $manifestName))) {
-            Write-Step -Stage 'restore' -Message "快照 leveldb CURRENT 指向的 $manifestName 缺失，疑似不完整/损坏，已中止恢复（请重新登录该账号并保存登录态）" -Status 'error'
-            throw "快照 leveldb MANIFEST 缺失（槽位 $Slot）"
-        }
+        # ②b 登录 Cookie 存在性统计（新布局 <profile>\Network\；旧布局 <profile>\Cookies）
+        if (Test-Path (Join-Path $p.FullName 'Network\Cookies')) { $hasCookies = $true }
+        elseif (Test-Path (Join-Path $p.FullName 'Cookies')) { $hasCookies = $true }
+    }
+    if (-not $hasCookies) {
+        Write-Step -Stage 'restore' -Message "快照内所有 Profile 均未检测到 Cookies 文件——该快照可能保存的是未登录状态，恢复后豆包将未登录" -Status 'warn'
     }
 
     # ③ 版本差异警告（不阻断）
@@ -701,35 +784,93 @@ function Test-SnapshotIntegrity {
     }
 }
 
+# 快照 Local State 的 profile.last_used 指向的 Profile 不在快照内时（旧版快照只抓 Default、
+# 而客户端活跃 Profile 已漂移到 Profile N），改写为快照内存在的 Profile（优先 Default）。
+# 否则客户端启动会打开一个空白 Profile → 未登录（实测"切换成功但没登录"根因之一）。
+# 仅在需要时改写（新代码快照的活跃 Profile 必在快照内，不触发 JSON 重写，零风险）。
+function Repair-LocalStateActiveProfile {
+    param([string]$UserdataDir, [string[]]$SnapshotProfiles)
+    if (-not $SnapshotProfiles -or @($SnapshotProfiles).Count -eq 0) { return }
+    $lsPath = Join-Path $UserdataDir 'Local State'
+    if (-not (Test-Path $lsPath)) { return }
+    try {
+        # 必须显式 UTF-8：Chromium Local State 为无 BOM UTF-8，PS 5.1 默认按 ANSI/GBK 解码，
+        # 中文昵称（如"周天伟"）的 UTF-8 字节被 GBK 成对吞并时会吃掉闭合引号 → JSON 解析必败
+        # （实测 A 槽恢复每次都报"传入的对象无效，应为":"或"}""，改写活跃 Profile 指针被静默跳过）
+        $j = Get-Content $lsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $j.profile) { return }
+        $used = ''
+        try { $used = [string]$j.profile.last_used } catch {}
+        if (-not $used -or (@($SnapshotProfiles) -contains $used)) { return }
+        $fallback = if (@($SnapshotProfiles) -contains 'Default') { 'Default' } else { [string]@($SnapshotProfiles)[0] }
+        $j.profile.last_used = $fallback
+        # last_active_profiles 同步过滤到快照内存在的 Profile，避免客户端恢复陈旧多开列表
+        try {
+            $lap = @($j.profile.last_active_profiles) | Where-Object { @($SnapshotProfiles) -contains $_ }
+            if (@($lap).Count -gt 0) { $j.profile.last_active_profiles = @($lap) }
+        } catch {}
+        # 无 BOM UTF-8 写临时文件再替换（PS 5.1 Set-Content -Encoding UTF8 带 BOM，避免 Chromium 解析异常）
+        $json = $j | ConvertTo-Json -Depth 100
+        $tmp = "$lsPath.awtmp"
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item $tmp $lsPath -Force
+        Write-Step -Stage 'restore' -Message "快照活跃 Profile '$used' 不在快照内，已改写 Local State 指向 '$fallback'（防客户端启动打开空 Profile 未登录）" -Status 'info'
+    } catch {
+        Write-Step -Stage 'restore' -Message "Local State 活跃 Profile 校验/改写失败（忽略）: $_" -Status 'warn'
+    }
+}
+
 function Restore-ChromiumProfile {
     param([string]$Slot)
     $src = Join-Path $Script:ProfilesDir $Slot
     if (-not (Test-Path $src)) {
-        Write-Step -Stage 'restore' -Message "目标账号 $Slot 无快照，请先登录该账号并保存登录态" -Status 'error'
-        throw "目标账号 $Slot 无快照"
+        # 单代回滚保护：主槽不存在时回退用 .bak（上次覆盖前的旧快照）
+        $bakDir = "$src.bak"
+        if (Test-Path $bakDir) {
+            Write-Step -Stage 'restore' -Message "账号 $Slot 主快照缺失，回退使用上一次覆盖前的备份（$Slot.bak）" -Status 'warn'
+            $src = $bakDir
+        } else {
+            Write-Step -Stage 'restore' -Message "目标账号 $Slot 无快照，请先登录该账号并保存登录态" -Status 'error'
+            throw "目标账号 $Slot 无快照"
+        }
     }
-    # C3：恢复前完整性校验（schemaVersion / leveldb CURRENT→MANIFEST / 版本差异警告）
-    Test-SnapshotIntegrity -Slot $Slot
+    # C3：恢复前完整性校验（schemaVersion / leveldb CURRENT→MANIFEST / Cookies 存在性 / 版本差异警告）
+    Test-SnapshotIntegrity -Path $src
     $dest = $Script:TraeDataDir
     if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
     $restored = 0
 
+    # 顶层: Local State / saman_* / Last Version
     if (Copy-SnapshotItem -SrcPath "$src\Local State" -DestPath "$dest\Local State") { $restored++ }
-    Get-ChildItem -Path "$src\Default\Network" -Filter 'Cookies*' -File -ErrorAction SilentlyContinue | ForEach-Object {
-        if (Copy-SnapshotItem -SrcPath $_.FullName -DestPath "$dest\Default\Network\$($_.Name)") { $restored++ }
-    }
-    if (Copy-SnapshotItem -SrcPath "$src\Default\Local Storage\leveldb" -DestPath "$dest\Default\Local Storage\leveldb") { $restored++ }
-    if (Copy-SnapshotItem -SrcPath "$src\Default\Session Storage" -DestPath "$dest\Default\Session Storage") { $restored++ }
-    if (Copy-SnapshotItem -SrcPath "$src\Default\DoubaoStorage" -DestPath "$dest\Default\DoubaoStorage") { $restored++ }
-    # C4：快照内含 IndexedDB 时一并恢复（无论当前开关状态，保证快照内容完整回写）
-    if (Test-Path "$src\Default\IndexedDB") {
-        if (Copy-SnapshotItem -SrcPath "$src\Default\IndexedDB" -DestPath "$dest\Default\IndexedDB") { $restored++ }
-    }
     if (Copy-SnapshotItem -SrcPath "$src\saman_app_state" -DestPath "$dest\saman_app_state") { $restored++ }
     if (Copy-SnapshotItem -SrcPath "$src\saman_shell_db_storage" -DestPath "$dest\saman_shell_db_storage") { $restored++ }
     if (Copy-SnapshotItem -SrcPath "$src\Last Version" -DestPath "$dest\Last Version") { $restored++ }
 
-    Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项)" -Status 'ok'
+    # 多 Profile 对称回写：快照里有哪些 Profile 就恢复哪些（旧版快照只有 Default 也适用）
+    $snapProfiles = Get-ChromiumProfileDirs -Base $src
+    foreach ($p in $snapProfiles) {
+        $n = $p.Name
+        # Cookies*（快照统一存于 <profile>\Network\；兼容旧布局 <profile>\Cookies*）
+        $ckBase = if (Test-Path (Join-Path $p.FullName 'Network\Cookies')) { Join-Path $p.FullName 'Network' } else { $p.FullName }
+        Get-ChildItem -Path $ckBase -Filter 'Cookies*' -File -ErrorAction SilentlyContinue | ForEach-Object {
+            if (Copy-SnapshotItem -SrcPath $_.FullName -DestPath "$dest\$n\Network\$($_.Name)") { $restored++ }
+        }
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'Local Storage\leveldb') -DestPath "$dest\$n\Local Storage\leveldb") { $restored++ }
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'Session Storage') -DestPath "$dest\$n\Session Storage") { $restored++ }
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'DoubaoStorage') -DestPath "$dest\$n\DoubaoStorage") { $restored++ }
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'Preferences') -DestPath "$dest\$n\Preferences") { $restored++ }
+        # 建议: <profile>/saman_shell_db_storage（与 Backup-ChromiumProfile 白名单对称，快照没有则跳过）
+        if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'saman_shell_db_storage') -DestPath "$dest\$n\saman_shell_db_storage") { $restored++ }
+        # C4：快照内含 IndexedDB 时一并恢复（无论当前开关状态，保证快照内容完整回写）
+        if (Test-Path (Join-Path $p.FullName 'IndexedDB')) {
+            if (Copy-SnapshotItem -SrcPath (Join-Path $p.FullName 'IndexedDB') -DestPath "$dest\$n\IndexedDB") { $restored++ }
+        }
+    }
+
+    # 快照活跃 Profile 指针修复（防客户端启动打开快照外的空 Profile → 未登录）
+    Repair-LocalStateActiveProfile -UserdataDir $dest -SnapshotProfiles @($snapProfiles | ForEach-Object { $_.Name })
+
+    Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项, $($snapProfiles.Count) 个 Profile)" -Status 'ok'
 }
 
 function Backup-CurrentProfile {
@@ -869,20 +1010,28 @@ try {
 
     switch ($Action) {
         'Switch' {
-            # 预检查：目标账号是否有快照（在关闭 Trae 之前检查）
+            # 预检查：目标账号是否有快照（在关闭 Trae 之前检查；主槽缺失时允许 .bak 回退槽）
             $targetProfile = Join-Path $Script:ProfilesDir $UserId
-            if (-not (Test-Path $targetProfile)) {
+            if (-not (Test-Path $targetProfile) -and -not (Test-Path "$targetProfile.bak")) {
                 Write-Step -Stage 'fatal' -Message "目标账号 $UserId 无快照，请先登录该账号并点击「保存当前登录态」" -Status 'error'
                 exit 1
             }
             Stop-Trae
             # 保存当前登录态到 "last" 槽位（安全备份）
             Backup-CurrentProfile -Slot 'last'
-            # 如果知道当前账号 ID，也备份到该账号的槽位（用于下次切回）
+            # 如果知道当前账号 ID，也备份到该账号的槽位（用于下次切回）。
+            # 防误覆盖守卫：仅当桌面端检测到的当前登录（-ExpectedCurrentUid）与标记文件
+            # 一致时才回写账号槽。不一致/未检测到 = 客户端很可能已手动重登或处于未登录态，
+            # 此时把"当前态"刷进标记槽会把错误内容覆盖掉该账号的快照（实测 B 被覆盖根因），
+            # 故跳过并警告——last 槽始终有完整备份可回退。
             $currentAcct = Get-CurrentAccount
             if ($currentAcct -and $currentAcct -ne $UserId) {
-                Backup-CurrentProfile -Slot $currentAcct
-                Write-Step -Stage 'backup' -Message "当前账号 $currentAcct 的登录态已备份" -Status 'ok'
+                if ($ExpectedCurrentUid -and $ExpectedCurrentUid -eq $currentAcct) {
+                    Backup-CurrentProfile -Slot $currentAcct
+                    Write-Step -Stage 'backup' -Message "当前账号 $currentAcct 的登录态已备份" -Status 'ok'
+                } else {
+                    Write-Step -Stage 'backup' -Message "检测到的当前登录（$(if ($ExpectedCurrentUid) { $ExpectedCurrentUid } else { '未识别或未检测到登录会话' })）与标记账号 $currentAcct 不一致，已跳过回写该账号槽位（当前态仍备份到 last），防止误覆盖" -Status 'warn'
+                }
             }
             # 恢复目标账号的登录态（含设备标识）
             Restore-Profile -Slot $UserId

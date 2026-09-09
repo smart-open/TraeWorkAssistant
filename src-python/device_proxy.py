@@ -624,7 +624,8 @@ def try_capture_refresh_token_from_response(host, path, resp_body):
 # （网页版登录后浏览器每次请求都会携带），落盘 data/doubao_captured_credentials.json，
 # 供编辑弹框「从代理抓包自动填充」一键读取。凭证等同密码，仅存本地。
 DOUBAO_CREDENTIAL_FILE = os.path.join(DATA_SUBDIR, "doubao_captured_credentials.json")
-DOUBAO_CREDENTIAL_COOKIES = ("sessionid", "sid_guard")
+DOUBAO_CREDENTIAL_COOKIES = ("sessionid", "sid_guard", "ttwid")
+DOUBAO_HOST_SUFFIX = ".doubao.com"  # 凭证抓取域后缀匹配（www.doubao.com / lime.doubao.com 等）
 _doubao_captured_cache = {}  # 进程内去重：内容未变化不重写文件
 
 
@@ -639,6 +640,31 @@ def _parse_cookie_header(cookie_str):
         if k:
             out[k] = v.strip().strip('"')
     return out
+
+
+def _doubao_uid_from_multi_sids(cookie: str, session_id: str) -> str:
+    """从 multi_sids cookie 解析当前登录 uid。
+    multi_sids 为客户端全部已登录账号的 uid→sessionid 映射，形如
+    'uid1:sid1|uid2:sid2'（URL 编码态为 %7C 分隔；亦有 ; 分隔变体）。
+    取 sessionid 匹配项的 uid 即当前登录账号——豆包客户端同 profile
+    重新登录后 Local State 的 saman.user_id 不更新，此 cookie 是唯一可靠来源。"""
+    try:
+        m = re.search(r"multi_sids=([^;\s]+)", cookie or "")
+        if not m:
+            return ""
+        from urllib.parse import unquote
+
+        raw = unquote(m.group(1))
+        for pair in re.split(r"[|;]", raw):
+            if ":" not in pair:
+                continue
+            uid, _, sid = pair.partition(":")
+            uid = uid.strip()
+            if uid.isdigit() and sid.strip() == session_id:
+                return uid
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 def try_capture_doubao_credentials(host, req_headers, resp_headers):
@@ -661,23 +687,31 @@ def try_capture_doubao_credentials(host, req_headers, resp_headers):
                     jar[ck] = cv.strip()
         session_id = jar.get("sessionid", "")
         sid_guard = jar.get("sid_guard", "")
+        ttwid = jar.get("ttwid", "")
         if not session_id:
             return
+        uid = _doubao_uid_from_multi_sids(cookie, session_id)
         captured = {
             "session_id": session_id,
             "sid_guard": sid_guard,
+            "ttwid": ttwid,
+            "uid": uid,
             "host": h,
             "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         if _doubao_captured_cache.get("session_id") == session_id and \
-                _doubao_captured_cache.get("sid_guard") == sid_guard:
+                _doubao_captured_cache.get("sid_guard") == sid_guard and \
+                _doubao_captured_cache.get("ttwid") == ttwid and \
+                _doubao_captured_cache.get("uid") == uid:
             return  # 未变化不重写
         _doubao_captured_cache.update(captured)
         os.makedirs(DATA_SUBDIR, exist_ok=True)
         with open(DOUBAO_CREDENTIAL_FILE, "w", encoding="utf-8") as f:
             json.dump(captured, f, ensure_ascii=False, indent=2)
         log(f"  [doubao] 抓到会话凭证: sessionid={len(session_id)} 字符"
-            + (f"，sid_guard={len(sid_guard)} 字符" if sid_guard else ""))
+            + (f"，sid_guard={len(sid_guard)} 字符" if sid_guard else "")
+            + (f"，ttwid={len(ttwid)} 字符" if ttwid else "")
+            + (f"，uid={uid}" if uid else "（uid 未识别）"))
     except Exception as e:  # noqa: BLE001
         log(f"  [doubao] 凭证抓取异常: {e}")
 
@@ -922,6 +956,14 @@ def leaf_cert(host):
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        # AKI：OpenSSL 3.2+ 严格校验非自签证书必须带 Authority Key Identifier
+        # （缺失报 MISSING_AUTHORITY_KEY_IDENTIFIER，如 Python 3.13 客户端直连 MITM 时）。
+        # 只给叶子补 AKI、不动 CA 证书——CA 已被用户安装信任，改 CA 内容会使其失效。
+        try:
+            ski = _ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+            aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski)
+        except x509.ExtensionNotFound:
+            aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(_ca_key.public_key())
         cert = (
             x509.CertificateBuilder()
             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)]))
@@ -932,6 +974,7 @@ def leaf_cert(host):
             .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650))
             .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(aki, critical=False)
             .sign(_ca_key, hashes.SHA256())
         )
         # 每次生成使用唯一临时文件，避免并发/多进程共享同名文件时
@@ -1000,16 +1043,18 @@ def read_http_request(sock):
 def send_response(sock, status, reason, headers, body):
     if isinstance(body, str):
         body = body.encode("utf-8")
-    out = {}
-    for k, v in headers.items():
-        if k.lower() in ("transfer-encoding", "connection", "keep-alive"):
-            continue
-        out[k] = v
-    out["Content-Length"] = str(len(body))
-    out["Connection"] = "keep-alive"
+    # headers 支持 dict 或 (name, value) 列表。必须保留重复头：
+    # 登录接口一次下发 20+ 条 Set-Cookie（sessionid/sid_guard/uid_tt 等），Chromium
+    # 依赖每条独立生效。dict 折叠同名头后只剩最后一条（实测 sms_login 场景是
+    # reg-store-region 删除指令），sessionid 全部丢失 → "登录验证成功但客户端始终非登录态"。
+    pairs = headers.items() if isinstance(headers, dict) else headers
     head = [f"HTTP/1.1 {status} {reason}".encode("utf-8")]
-    for k, v in out.items():
+    for k, v in pairs:
+        if k.lower() in ("transfer-encoding", "connection", "keep-alive", "content-length"):
+            continue
         head.append(f"{k}: {v}".encode("utf-8"))
+    head.append(f"Content-Length: {len(body)}".encode("utf-8"))
+    head.append(b"Connection: keep-alive")
     sock.sendall(b"\r\n".join(head) + b"\r\n\r\n" + body)
 
 HOP_BY_HOP = {"proxy-connection", "connection", "keep-alive", "proxy-authorization", "host", "content-length"}
@@ -1311,7 +1356,8 @@ def _stream_response(resp, resp_headers, client_sock, host, method, path, req_he
     resp_reason = resp.reason
 
     head = [f"HTTP/1.1 {resp_status} {resp_reason}".encode("utf-8")]
-    for k, v in resp_headers.items():
+    pairs = resp_headers.items() if isinstance(resp_headers, dict) else resp_headers
+    for k, v in pairs:
         if k.lower() in ("transfer-encoding", "connection", "keep-alive", "content-length"):
             continue
         head.append(f"{k}: {v}".encode("utf-8"))
@@ -1370,15 +1416,18 @@ def forward_upstream(host, port, method, path, headers, body, client_sock):
         body_arg = body if method.upper() != "GET" else None
         conn.request(method, path, body=body_arg, headers=fwd)
         resp = conn.getresponse()
-        resp_headers = dict(resp.getheaders())
+        # 响应头保持 (name, value) 原始列表：dict() 会折叠同名重复头，
+        # 导致登录响应的多条 Set-Cookie 只剩最后一条、sessionid 丢失（详见 send_response）
+        resp_header_pairs = resp.getheaders()
+        resp_header_lookup = {k.lower(): v for k, v in resp_header_pairs}
 
         if is_stream:
-            return _stream_response(resp, resp_headers, client_sock, host, method, path, headers, body)
+            return _stream_response(resp, resp_header_pairs, client_sock, host, method, path, headers, body)
 
         resp_body = resp.read()
         log(f"  [forward] <- {resp.status} {resp.reason} ({len(resp_body)} bytes) from {host}{path}")
-        upstream_conn = resp_headers.get("connection", "").lower()
-        send_response(client_sock, resp.status, resp.reason, resp_headers, resp_body)
+        upstream_conn = resp_header_lookup.get("connection", "").lower()
+        send_response(client_sock, resp.status, resp.reason, resp_header_pairs, resp_body)
         # 捕获 ExchangeToken 响应中的 refresh_token
         if "ExchangeToken" in path or "oauth" in path.lower():
             try_capture_refresh_token_from_response(host, path, resp_body)
@@ -1698,7 +1747,7 @@ def handle_plain(conn, buf):
                 _c.request(method, target, body=body if method.upper() != "GET" else None, headers=fwd)
                 _resp = _c.getresponse()
                 _resp_body = _resp.read()
-                send_response(conn, _resp.status, _resp.reason, dict(_resp.getheaders()), _resp_body)
+                send_response(conn, _resp.status, _resp.reason, _resp.getheaders(), _resp_body)
                 _c.close()
                 return
             except Exception:
@@ -1709,7 +1758,7 @@ def handle_plain(conn, buf):
         resp_body = resp.read()
         if _is_target:
             log(f"  [plain] <- {resp.status} {resp.reason} ({len(resp_body)} bytes) from {host}{u.path}")
-        send_response(conn, resp.status, resp.reason, dict(resp.getheaders()), resp_body)
+        send_response(conn, resp.status, resp.reason, resp.getheaders(), resp_body)
         # 仅目标域名记录到代理请求日志
         if _is_target:
             pl = get_proxy_logger()

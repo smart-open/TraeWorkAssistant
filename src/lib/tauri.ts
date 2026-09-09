@@ -13,6 +13,9 @@ import type {
   DiscoveredAccount,
   DoubaoAccountView,
   DoubaoCapturedCredential,
+  DoubaoChatdataInfo,
+  DoubaoChatdataResult,
+  DoubaoExportResult,
   DoubaoRenewSummary,
   DoubaoQuotaResult,
   DoubaoHistoryEvent,
@@ -194,12 +197,23 @@ export const api = {
     renewRun: (syncOnly?: boolean) =>
       invoke<DoubaoRenewSummary>('doubao_renew_run', { syncOnly: syncOnly ?? false }),
     keepaliveRun: () => invoke('doubao_keepalive_run'),
-    accountSetCredential: (userId: string, sessionId?: string, sidGuard?: string) =>
+    accountSetCredential: (userId: string, sessionId?: string, sidGuard?: string, ttwid?: string) =>
       invoke('doubao_account_set_credential', {
         userId,
         sessionId: sessionId ?? null,
         sidGuard: sidGuard ?? null,
+        ttwid: ttwid ?? null,
       }),
+    // ---- D1 对话数据（客户端状态）独立备份/恢复 ----
+    /** 备份对话数据：IndexedDB / DoubaoStorage → data/doubao_chats/<uid>/（自动先关豆包） */
+    chatdataBackup: (userId: string) => invoke<DoubaoChatdataResult>('doubao_chatdata_backup', { userId }),
+    /** 恢复对话数据备份到豆包 User Data（自动先关豆包） */
+    chatdataRestore: (userId: string) => invoke<DoubaoChatdataResult>('doubao_chatdata_restore', { userId }),
+    /** 对话数据备份状态（backed / files / size_bytes / backed_at） */
+    chatdataInfo: (userId: string) => invoke<DoubaoChatdataInfo>('doubao_chatdata_info', { userId }),
+    // ---- D2 对话记录导出（官方 API 拉取 → markdown/json） ----
+    /** 导出对话记录：需要账号已录入凭证（sessionid/sid_guard/ttwid），输出到 data/exports/ */
+    exportChats: (userId: string) => invoke<DoubaoExportResult>('doubao_export_chats', { userId }),
     taskRegister: (time: string) => invoke('doubao_renew_task_register', { time }),
     taskStatus: () => invoke<string>('doubao_renew_task_status'),
     taskUnregister: () => invoke('doubao_renew_task_unregister'),

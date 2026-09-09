@@ -83,7 +83,7 @@ pub fn migrate_legacy_dirs() -> Option<String> {
 /// 目标目录不存在则创建；同名文件直接覆盖（仅在首次迁移时发生）；
 /// 遇到 exclude_dirs 中的目录名则整目录跳过（用于排除 WebView2 缓存）。
 /// 返回复制的文件数。
-fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf, exclude_dirs: &[&str]) -> Result<usize, String> {
+pub(crate) fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf, exclude_dirs: &[&str]) -> Result<usize, String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("创建目录 {} 失败: {e}", dst.display()))?;
     let mut copied = 0usize;
     let entries = std::fs::read_dir(src).map_err(|e| format!("读取 {} 失败: {e}", src.display()))?;

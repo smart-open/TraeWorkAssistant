@@ -260,10 +260,10 @@ export default function DoubaoSettings() {
           <p>
             续期原理：字节 passport 为 <b>sid_guard 30 天滑动续期</b>。实测豆包桌面客户端 cookie 为客户端级加密
             （外部无法离线续写），因此<b>主路径为每日保活</b>——注册定时任务后自动「启动豆包 8 秒 → 优雅关闭」，
-            由客户端自己联网刷新会话；运行中则自动跳过。此外可对手动录入的 sessionid（账号管理 → 编辑 → 会话凭证）做探活巡检。
+            由客户端自己联网刷新会话；运行中则自动跳过。此外可对池内<b>明文 sessionid 凭证</b>（代理抓包自动写入或手动录入，账号管理 → 编辑 → 会话凭证可查看）做探活巡检。
           </p>
 
-          {/* 保活端点（仅对手动录入凭证的探活生效） */}
+          {/* 保活端点（对明文凭证的探活生效：manual / proxy 来源均可） */}
           <div className="flex items-center gap-2">
             <span className="shrink-0 text-slate-500">保活端点</span>
             <input

@@ -79,16 +79,17 @@ C:\Users\<user>\AppData\Roaming\Trae CN\
 
 **原理**：豆包全部登录态都在 `User Data\` 下，且加密密钥（DPAPI）与机器+用户绑定但**不与目录路径绑定**——同机同用户下整目录快照/恢复即完成账号切换。
 
-**快照白名单**（精准备份，非全量镜像，控制体积）：
+**快照白名单**（精准备份，非全量镜像，控制体积；2026-09-09 起多 Profile 动态遍历，`Default`/`Profile N` 全部按 `<snapshot>\<Profile>\` 镜像存放）：
 | 项 | 路径（相对 User Data） | 作用 |
 |---|---|---|
-| 必选 | `Default/Network/Cookies*` | 登录 cookie（sessionid 等） |
-| 必选 | `Local State` | saman 账号缓存 + 加密密钥句柄元数据 |
-| 必选 | `Default/Local Storage/leveldb/` | web 侧登录/偏好 KV |
-| 建议 | `Default/Session Storage/` | 会话级状态 |
-| 建议 | `Default/DoubaoStorage/` | 豆包业务数据（对话偏好等） |
-| 建议 | `saman_app_state`、`saman_shell_db_storage/` | saman 账号体系状态 |
-| 可选 | `Default/IndexedDB/` | 体积大，默认排除 |
+| 必选 | `<Profile>/Network/Cookies*` | 登录 cookie（sessionid 等），逐 Profile |
+| 必选 | `Local State` | saman 账号缓存 + 加密密钥句柄元数据 + `profile.last_used` 活跃 Profile 指针 |
+| 必选 | `<Profile>/Local Storage/leveldb/` | web 侧登录/偏好 KV，逐 Profile |
+| 建议 | `<Profile>/Session Storage/`、`<Profile>/Preferences` | 会话级状态 / 偏好，逐 Profile |
+| 建议 | `<Profile>/DoubaoStorage/` | 豆包业务数据（对话偏好等），逐 Profile |
+| 建议 | `<Profile>/saman_shell_db_storage/` | saman 账号体系客户端级数据库，**per-profile 各一份**（实测 Default/Profile N 下均有，仅抓根级会丢各 Profile 的 shell 侧账号状态） |
+| 建议 | `saman_app_state`、`saman_shell_db_storage/`（根级） | saman 账号体系全局状态 |
+| 可选 | `<Profile>/IndexedDB/` | 体积大，默认排除（设置开关） |
 
 **流程**（与 `trae-switch-bridge.ps1` Switch 流程同构）：
 1. 检测 `Doubao.exe` 运行中 → 优雅关闭（`CloseMainWindow` → 超时 `taskkill /IM Doubao.exe`）。
@@ -126,6 +127,38 @@ C:\Users\<user>\AppData\Roaming\Trae CN\
   2. 打开会员/订阅页面，抓取额度 XHR（建议关键词过滤 `membership|entitlement|quota|remaining|benefit`）。
   3. 固化端点 + 字段后，实现 `credits` 页的"豆包"Tab：会员等级 / 到期时间 / 各能力剩余额度条。
 - **降级方案**：若接口带强风控签名无法直调，用"网页视图内嵌 + 数据注入"或仅展示抓包缓存值并标注更新时间。
+
+### 2.5 会话吊销与保活规程（2026-09-09 实测，重要）
+
+**实测发现：快照文件完好 ≠ 会话有效。** 豆包客户端内的「退出登录」（及部分重登/切换账号路径）会调
+`passport/web/logout` **吊销该账号的服务端会话**——此前保存的快照文件全部完好，但里面的会话已被
+服务端判死（额度接口返回 `code=710012001`），恢复后客户端一联网即被 `SESSION_EXPIRED` 强制登出，
+表现为「切换成功但豆包未登录」。实测不对称现象：只有被登出过的账号中招，未被登出的账号一切正常。
+
+**探测方案**（`doubao_renew.py --probe-user-data <dir> --probe-uid <uid>`）：
+- 会话来源优先读 Local State 的 `saman.local_storage_app_for_web.enterprise` 内嵌
+  `x-tt-multi-sids`（uid → 明文 sessionid 映射，客户端把全部账号会话明文缓存在此；Cookies 解出的
+  是客户端级二次加密密文不可用）；
+- 携带 sid POST 额度接口 `alice/commerce/sale/subscription/quota/summary/`：
+  `code=0`=有效 / `code=710012001`=已吊销或过期 / 302→passport、401=失效；
+- 探测不可用（脚本缺失/网络故障/无法验证）一律 fail-open 不阻断。
+
+**三道防线**（均已实现，含网络 I/O 的命令均标 `#[tauri::command(async)]`）：
+1. **切换前**：`switch_account` / `doubao_open_as_account` 探测目标槽位（主槽缺失跟随 `.bak` 回退），
+   `expired` 时中止切换并提示重登 + 重新保存；
+2. **保存前**：`save_current_login` 在 Cookie 存在性校验之外，探测 Live 客户端当前会话，
+   `expired` 时拒绝保存（防止把死会话存进槽位，之后每次切换都未登录）；
+3. **回写守卫**：检测到的当前登录与标记账号不一致（或无登录会话/游客态）时只备份 last 槽，
+   不回写账号槽。
+
+**双账号保活规程**（毒源只有一个：客户端内的登出类操作）：
+1. 一次性建档：登录 A → 保存 A → 登录 B（豆包客户端**左下角头像 → 切换账号 → 添加账号**，
+   **不要点「退出登录」**）→ 保存 B；若登录 B 时 A 会话被顶掉，重登 A 再保存一次（一次性成本）；
+2. 此后账号轮换**全部走工具切换**，客户端内不做任何登录/登出/账号切换——每次以某账号运行时
+   会话自动滑动续期，每次切走时桥把最新态回写进该账号槽，槽位永远是新鲜活会话；
+3. 某账号接近 30 天未使用会自然过期，切过去用一次即续期；
+4. 客户端内热切换会导致 `current_account.txt` 与实际登录不一致，回写守卫会跳过槽位回写
+   （槽位会话变旧但仍有效），建议避免。
 
 ---
 

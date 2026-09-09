@@ -99,6 +99,8 @@ export function Modal({
   children,
   footer,
   size,
+  widthClass,
+  bodyClass,
 }: {
   open: boolean;
   onClose: () => void;
@@ -106,6 +108,10 @@ export function Modal({
   children: ReactNode;
   footer?: ReactNode;
   size?: 'lg' | 'xl' | '2xl';
+  /** 覆盖默认宽度类（如 max-w-[63rem]）；不传按 size 映射 */
+  widthClass?: string;
+  /** 附加到内容区（如 max-h-[80vh] overflow-y-auto，长内容弹框限制高度内部滚动） */
+  bodyClass?: string;
 }) {
   useEffect(() => {
     if (!open) return;
@@ -124,14 +130,14 @@ export function Modal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className={`card relative z-10 w-full ${size === '2xl' ? 'max-w-[78rem]' : size === 'xl' ? 'max-w-4xl' : size === 'lg' ? 'max-w-2xl' : 'max-w-lg'} animate-fade-in p-5 shadow-xl`} role="dialog" aria-modal="true">
+      <div className={`card relative z-10 w-full ${widthClass ?? (size === '2xl' ? 'max-w-[78rem]' : size === 'xl' ? 'max-w-4xl' : size === 'lg' ? 'max-w-2xl' : 'max-w-lg')} animate-fade-in p-5 shadow-xl`} role="dialog" aria-modal="true">
         <div className="mb-3 flex items-center justify-between">
           <h3 className="text-base font-semibold text-slate-800 dark:text-zinc-100">{title}</h3>
           <button className="btn-ghost h-8 w-8 !p-0" onClick={onClose} aria-label="关闭">
             <X size={16} />
           </button>
         </div>
-        <div className="text-sm text-slate-600 dark:text-zinc-300">{children}</div>
+        <div className={`text-sm text-slate-600 dark:text-zinc-300 ${bodyClass ?? ''}`}>{children}</div>
         {footer && <div className="mt-5 flex justify-end gap-2">{footer}</div>}
       </div>
     </div>

@@ -6,7 +6,9 @@ use tauri::{AppHandle, Emitter, State};
 use crate::fs_utils;
 use crate::state::AppState;
 
-#[tauri::command]
+// async：内含 python 探测子进程（网络 I/O，最长 ~15s）与 detect_guard_uid_strict 子进程，
+// 同步命令会冻结 UI（项目约定：阻塞型命令一律 #[tauri::command(async)]）
+#[tauri::command(async)]
 pub fn switch_account(
     app: AppHandle,
     state: State<AppState>,
@@ -31,10 +33,33 @@ pub fn switch_account(
     fs_utils::app_log(&state.data_dir, &format!("开始切换账号: user_id={user_id}"));
 
     // C4：豆包快照可选纳入 IndexedDB（设置开关控制，其他应用不受影响）
-    let include_idb = target_app.as_deref() == Some("Doubao")
-        && state.settings().doubao_snapshot_include_idb;
+    let is_doubao = target_app.as_deref() == Some("Doubao");
+    let include_idb = is_doubao && state.settings().doubao_snapshot_include_idb;
     // C1：一键以账号打开时注入代理（>0 才传给桥）
     let inject_port = proxy_port.filter(|p| *p > 0);
+    // 切换前服务端会话预检（仅豆包）：目标槽位快照里的会话若已被服务端吊销——常见于
+    // 在豆包客户端内退出登录/重登该账号（passport logout 吊销旧会话，快照文件却完好）——
+    // 恢复后客户端一联网即被 SESSION_EXPIRED 强制登出，表现为「切换成功但豆包未登录」。
+    // 实测不对称现象根因：2026-09-09 A 槽探测 code=710012001（expired）、B 槽 code=0（ok）。
+    // 提前拦截给出补救指引，避免白切一场；探测不可用 fail-open 不阻断（见函数内实现）。
+    if is_doubao {
+        crate::commands::doubao::probe_slot_session_alive(
+            &state.data_dir,
+            &state.python_dir,
+            &state.python_exe,
+            &user_id,
+        )?;
+    }
+
+    // 防误覆盖守卫（仅豆包）：把关闭客户端前检测到的当前登录 uid 传给桥，桥仅在它与
+    // current_account.txt 一致时才把"当前态"回写进该账号槽。严格版还要求 Live Cookies
+    // 里验证到登录会话——uid 检测可能被快照 localStorage 残留骗过（实测未登录时检测链
+    // 仍返回旧账号，导致未登录态被回写进账号槽反复污染），Cookie 存在性无法伪造
+    let expected_uid = if is_doubao {
+        crate::commands::doubao::detect_guard_uid_strict(&state)
+    } else {
+        String::new()
+    };
 
     let mut cmd = Command::new("powershell");
     cmd.args([
@@ -57,6 +82,11 @@ pub fn switch_account(
     if include_idb {
         cmd.arg("-IncludeIndexedDB");
     }
+    if !expected_uid.is_empty() {
+        cmd.args(["-ExpectedCurrentUid", &expected_uid]);
+    }
+    // 数据目录注入：桥的 ProfilesDir/日志按 AIWORKDATA_DIR 解析（便携模式/默认 %APPDATA% 均一致）
+    cmd.env("AIWORKDATA_DIR", &state.data_dir);
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -73,25 +103,32 @@ pub fn switch_account(
 
     // stdout 线程：NDJSON -> switch-progress 事件
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
+        let mut reader = BufReader::new(stdout);
         let mut done_emitted = false;
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    continue;
-                }
-                let _ = app2.emit("switch-progress", &l);
-                // 检测 done / fatal 行，emit switch-done 事件
-                if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
-                    let success = l.contains("\"stage\":\"done\"");
-                    done_emitted = true;
-                    let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": l }));
-                    // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
-                    // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
-                    if success && target_app.as_deref() != Some("Doubao") {
-                        let _ = crate::commands::trae_apps::backfill_dc_id_for(&dc_dir, &uid_for_dc);
-                    }
+        // 不能用 BufRead::lines()：桥 stdout 若回退为 GBK（中文系统重定向），首行含中文即
+        // Err 且 for-lines 直接终止——done 信号丢失。字节级 read_until + lossy 解码（同 doubao.rs）
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let l = String::from_utf8_lossy(&buf).trim().to_string();
+            if l.is_empty() {
+                continue;
+            }
+            let _ = app2.emit("switch-progress", &l);
+            // 检测 done / fatal 行，emit switch-done 事件
+            if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
+                let success = l.contains("\"stage\":\"done\"");
+                done_emitted = true;
+                let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": l }));
+                // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
+                // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
+                if success && !is_doubao {
+                    let _ = crate::commands::trae_apps::backfill_dc_id_for(&dc_dir, &uid_for_dc);
                 }
             }
         }
@@ -108,17 +145,23 @@ pub fn switch_account(
         std::thread::spawn(move || {
             let log_path = data_dir.join("logs").join("switcher.log");
             let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    let l = format!("[stderr] {}", l.trim());
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_path)
-                    {
-                        let _ = writeln!(f, "[{}] {}", fs_utils::now_ts(), l);
-                    }
+            let mut reader = BufReader::new(stderr);
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let l = String::from_utf8_lossy(&buf);
+                let l = format!("[stderr] {}", l.trim());
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = writeln!(f, "[{}] {}", fs_utils::now_ts(), l);
                 }
             }
         });
@@ -129,7 +172,8 @@ pub fn switch_account(
 
 /// 保存当前登录态：关闭 Trae → 精准备份到 userId 槽位 → 重新启动
 /// 通过 NDJSON 事件流式返回进度，前端订阅 save-login-progress / save-login-done
-#[tauri::command]
+// async：豆包分支含会话预检 python 子进程（网络 I/O），同步命令会冻结 UI
+#[tauri::command(async)]
 pub fn save_current_login(
     app: AppHandle,
     state: State<AppState>,
@@ -148,6 +192,17 @@ pub fn save_current_login(
     );
     if !bridge.exists() {
         return Err(format!("找不到切换脚本: {}", bridge.display()));
+    }
+
+    // 保存前预检（仅豆包）：Live profile 必须持有登录会话 Cookie。没有 = 客户端当前未登录，
+    // 保存只会把未登录状态存进账号槽（实测 908 槽被未登录态覆盖后"切换成功但永远没登录"），
+    // 直接拒绝并告知补救方式。客户端此时仍在运行，Cookies 被锁由 python 复制到临时目录读取。
+    if target_app.as_deref() == Some("Doubao") {
+        crate::commands::doubao::ensure_live_has_login_session(&state)?;
+        // 服务端会话预检：本地 Cookie 存在≠会话有效。会话可能早已被服务端吊销
+        // （客户端内退出过/被新登录顶替），存进去就是死会话，之后每次切换该账号都未登录
+        //（实测 A 槽事故：20:43 保存的快照当时已是/随后被吊销的死会话）。expired 拒绝保存。
+        crate::commands::doubao::probe_live_session_alive(&state, &user_id)?;
     }
 
     fs_utils::app_log(&state.data_dir, &format!("开始保存当前登录态: user_id={user_id}"));
@@ -174,6 +229,8 @@ pub fn save_current_login(
     if include_idb {
         cmd.arg("-IncludeIndexedDB");
     }
+    // 数据目录注入（同 switch_account）
+    cmd.env("AIWORKDATA_DIR", &state.data_dir);
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -189,27 +246,33 @@ pub fn save_current_login(
     let dc_dir = data_dir.clone();
 
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
+        let mut reader = BufReader::new(stdout);
         let mut done_emitted = false;
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let l = l.trim().to_string();
-                if l.is_empty() {
-                    continue;
-                }
-                let _ = app2.emit("save-login-progress", &l);
-                if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
-                    let success = l.contains("\"stage\":\"done\"");
-                    done_emitted = true;
-                    let _ = app2.emit(
-                        "save-login-done",
-                        serde_json::json!({ "success": success, "raw": l }),
-                    );
-                    // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
-                    // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
-                    if success && target_app.as_deref() != Some("Doubao") {
-                        let _ = crate::commands::trae_apps::backfill_dc_id_for(&dc_dir, &uid_for_dc);
-                    }
+        // 同 switch_account：字节级读取 + lossy，防 GBK 回退时丢行/丢 done 信号
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let l = String::from_utf8_lossy(&buf).trim().to_string();
+            if l.is_empty() {
+                continue;
+            }
+            let _ = app2.emit("save-login-progress", &l);
+            if l.contains("\"stage\":\"done\"") || l.contains("\"stage\":\"fatal\"") {
+                let success = l.contains("\"stage\":\"done\"");
+                done_emitted = true;
+                let _ = app2.emit(
+                    "save-login-done",
+                    serde_json::json!({ "success": success, "raw": l }),
+                );
+                // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
+                // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
+                if success && target_app.as_deref() != Some("Doubao") {
+                    let _ = crate::commands::trae_apps::backfill_dc_id_for(&dc_dir, &uid_for_dc);
                 }
             }
         }
@@ -227,17 +290,23 @@ pub fn save_current_login(
         std::thread::spawn(move || {
             let log_path = data_dir.join("logs").join("switcher.log");
             let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    let l = format!("[stderr] {}", l.trim());
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_path)
-                    {
-                        let _ = writeln!(f, "[{}] {}", fs_utils::now_ts(), l);
-                    }
+            let mut reader = BufReader::new(stderr);
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let l = String::from_utf8_lossy(&buf);
+                let l = format!("[stderr] {}", l.trim());
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = writeln!(f, "[{}] {}", fs_utils::now_ts(), l);
                 }
             }
         });
@@ -289,6 +358,8 @@ pub fn reset_device_ids(
             target,
             "-Json",
         ])
+        // 数据目录注入：桥日志按 AIWORKDATA_DIR 解析，与主进程保持一致
+        .env("AIWORKDATA_DIR", &state.data_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW：隐藏控制台窗口

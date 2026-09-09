@@ -333,6 +333,8 @@ export interface DoubaoAccountView {
   session_id: string | null;
   /** sid_guard 原文（编辑弹框回填用） */
   sid_guard: string | null;
+  /** ttwid 设备 Cookie（对话导出 API 必需；代理抓包或手动录入） */
+  ttwid: string | null;
   /** 会员等级（null = 免费或未识别；quota_checked_at 非空表示已查询过） */
   quota_level: string | null;
   /** 会员到期时间（免费账号为 null） */
@@ -369,6 +371,33 @@ export interface DoubaoCapturedCredential {
   sid_guard: string;
   host: string;
   captured_at: string;
+  /** ttwid 设备 Cookie（对话导出 API 必需） */
+  ttwid: string;
+}
+
+/** D1：对话数据备份/恢复结果（doubao_chatdata_backup / doubao_chatdata_restore） */
+export interface DoubaoChatdataResult {
+  ok: boolean;
+  files: number;
+  /** 备份目录（仅 backup 返回） */
+  path?: string;
+}
+
+/** D1：对话数据备份状态（doubao_chatdata_info） */
+export interface DoubaoChatdataInfo {
+  backed: boolean;
+  files?: number;
+  size_bytes?: number;
+  backed_at?: string | null;
+}
+
+/** D2：对话记录导出结果（doubao_chats.py stdout 末行 JSON） */
+export interface DoubaoExportResult {
+  ok: boolean;
+  conversations: number;
+  messages: number;
+  md_path: string;
+  json_path: string;
 }
 
 /** doubao_quota.py 摘要 JSON（会员额度查询结果；字段由宽容解析尽力得到，均可为 null） */

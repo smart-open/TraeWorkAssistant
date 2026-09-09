@@ -325,14 +325,20 @@ def query_account(url: str, sid: str, sid_guard: str | None) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        # 显式绕过系统代理（同 doubao_renew.renew_probe）：直连 API，避免走 MITM 代理
+        # 撞上动态证书兼容性问题（OpenSSL 3.x 拒绝缺 AKI 扩展的代理叶子证书）
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=TIMEOUT) as resp:
             data = json.loads(resp.read(512 * 1024).decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
         return {"ok": False, "error": f"HTTP {e.code}"}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"请求失败: {e}"}
     if not isinstance(data, dict) or data.get("code") not in (0, None):
-        return {"ok": False, "error": f"接口返回异常 code={data.get('code') if isinstance(data, dict) else '?'}"}
+        code = data.get("code") if isinstance(data, dict) else "?"
+        # 常见码提示：710012001 = 登录态失效（凭证过期/不属于当前登录账号）
+        hint = "登录态已失效，请开启代理重新抓取凭证或重新保存该账号登录态" if code == 710012001 else ""
+        return {"ok": False, "error": f"接口返回异常 code={code}{('：' + hint) if hint else ''}"}
     return {"ok": True, "parsed": parse_quota(data)}
 
 
