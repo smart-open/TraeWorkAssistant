@@ -190,9 +190,9 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
 }
 
 /// 重放 batch_get_detail_param 拉取官网最新模型列表并落盘
-pub fn fetch_official(data_dir: &Path) -> Result<Vec<ModelOption>, String> {
+/// `accounts` 由调用方预先经 vault 解密（含明文 jwt）
+pub fn fetch_official(data_dir: &Path, accounts: AccountsFile) -> Result<Vec<ModelOption>, String> {
     // 取第一个可用账号（最多尝试 3 个）
-    let accounts: AccountsFile = fs_utils::read_json(&data_file(data_dir, "checkin_accounts.json"));
     let device_map: DeviceMap = fs_utils::read_json(&data_file(data_dir, "device_map.json"));
     let candidates: Vec<(&crate::models::RawAccount, String, String)> = accounts
         .accounts

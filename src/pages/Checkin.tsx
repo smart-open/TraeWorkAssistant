@@ -1,5 +1,5 @@
-﻿import { useMemo, useState, useEffect } from 'react';
-import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle, Snowflake } from 'lucide-react';
+import { useMemo, useState, useEffect } from 'react';
+import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
 import { useAppStore } from '../store';
@@ -53,6 +53,15 @@ export default function Checkin() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [skipChecked, setSkipChecked] = useState(true);
   const [skipExpired, setSkipExpired] = useState(true);
+  // 重试倒计时：每秒刷新一次本地时钟（仅重试等待期间启用定时器）
+  const [now, setNow] = useState(Date.now());
+  const retryActive = checkin.retry != null && checkin.active;
+  useEffect(() => {
+    if (!retryActive) return;
+    setNow(Date.now());
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [retryActive]);
 
   useEffect(() => {
     if (settings) {
@@ -264,14 +273,30 @@ export default function Checkin() {
         <div className="card p-4">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="font-medium">实时进度</h3>
-            {checkin.active ? (
-              <Badge tone="blue">运行中</Badge>
-            ) : checkin.done ? (
-              <Badge tone={checkin.done.failed > 0 ? 'amber' : 'green'}>
-                完成：成功 {checkin.done.ok}，已签 {checkin.done.already}，失败 {checkin.done.failed}
-              </Badge>
-            ) : null}
+            <div className="flex items-center gap-3">
+              {checkin.active ? (
+                <Badge tone="blue">运行中</Badge>
+              ) : checkin.done ? (
+                <Badge tone={checkin.done.failed > 0 ? 'amber' : 'green'}>
+                  完成：成功 {checkin.done.ok}，已签 {checkin.done.already}，失败 {checkin.done.failed}
+                </Badge>
+              ) : null}
+              {checkin.done && checkin.done.failed > 0 ? (
+                <span className="text-xs text-slate-400">失败账号已自动重试 2 轮</span>
+              ) : null}
+            </div>
           </div>
+          {retryActive && checkin.retry && (
+            <div className="mb-3 flex items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
+              <RefreshCw size={15} className="shrink-0 animate-spin" style={{ animationDuration: '3s' }} />
+              <span>
+                {checkin.retry.total} 个账号签到失败，
+                {now < checkin.retry.until
+                  ? `${Math.max(1, Math.ceil((checkin.retry.until - now) / 1000))}s 后自动开始第 ${checkin.retry.round} 轮重试…`
+                  : `第 ${checkin.retry.round} 轮重试进行中…`}
+              </span>
+            </div>
+          )}
           <div className="mb-3">
             <Progress value={checkin.index} max={checkin.total || 1} />
             <div className="mt-1 text-xs text-slate-500">

@@ -2,11 +2,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod checkin_results;
 mod fs_utils;
 mod jwt;
 mod models;
+mod notify;
 mod python;
 mod state;
+mod vault;
 mod api_server;
 
 use state::AppState;
@@ -14,6 +17,11 @@ use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
+
+/// 托盘菜单句柄：API 启停项文本随服务状态动态切换（do_start/do_stop 内同步）
+pub struct TrayMenu {
+    pub api_item: MenuItem<tauri::Wry>,
+}
 
 fn main() {
     // 品牌迁移（老版本 Trae Work Assistant → AI Work 助手）：
@@ -64,9 +72,14 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(state)
         .manage(Mutex::new(Option::<commands::proxy::ProxyHandle>::None))
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
+        .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
             commands::env::env_check,
             commands::env::app_locate,
@@ -99,12 +112,16 @@ fn main() {
             commands::accounts::cooldown_clear_all,
             commands::accounts::refresh_jwt,
             commands::checkin::checkin_start,
+            commands::checkin::checkin_trends,
             commands::switch::switch_account,
             commands::switch::save_current_login,
             commands::switch::reset_device_ids,
             commands::misc::device_reset,
+            commands::misc::autostart_status,
+            commands::misc::autostart_set,
             commands::misc::jwt_parse,
             commands::misc::logs_query,
+            commands::misc::logs_clear,
             commands::misc::settings_get,
             commands::misc::settings_set,
             commands::misc::invite_link,
@@ -129,6 +146,9 @@ fn main() {
             commands::api_server::api_debug_status,
             commands::api_server::api_models_list,
             commands::api_server::api_models_sync,
+            commands::api_server::api_usage_stats,
+            commands::api_server::api_keys_list,
+            commands::api_server::api_keys_save,
             commands::profile::profile_list,
             commands::profile::profile_backup,
             commands::profile::profile_restore,
@@ -154,6 +174,12 @@ fn main() {
             let retention = settings.log_retention_days.max(0) as u64;
             fs_utils::trim_logs(&state.data_dir, retention);
 
+            // 清理上次运行残留的临时凭据文件（崩溃时未及删除的明文文件，失败不阻断启动）
+            vault::cleanup_temp_accounts(&state);
+
+            // 敏感数据迁移：checkin_accounts.json 明文 jwt/refresh_token → Stronghold vault（幂等，失败不阻断启动）
+            vault::migrate_on_startup(&state);
+
             fs_utils::app_log(
                 &state.data_dir,
                 &format!(
@@ -167,10 +193,18 @@ fn main() {
                 let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                     let toggle_item =
                         MenuItem::with_id(app, "toggle", "显示/隐藏", true, None::<&str>)?;
+                    let checkin_item =
+                        MenuItem::with_id(app, "checkin", "立即签到", true, None::<&str>)?;
+                    let api_item =
+                        MenuItem::with_id(app, "api-toggle", "启动 API 服务", true, None::<&str>)?;
                     let sep = PredefinedMenuItem::separator(app)?;
                     let quit_item =
                         MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-                    let menu = Menu::with_items(app, &[&toggle_item, &sep, &quit_item])?;
+                    let menu = Menu::with_items(
+                        app,
+                        &[&toggle_item, &sep, &checkin_item, &api_item, &sep, &quit_item],
+                    )?;
+                    app.manage(TrayMenu { api_item });
 
                     let icon = app
                         .default_window_icon()
@@ -218,6 +252,58 @@ fn main() {
                                     }
                                 }
                             }
+                            "checkin" => {
+                                // 托盘一键签到：后台线程执行，防重入锁内完成；
+                                // 跳过已签/冷却账号，完成后发系统通知
+                                let app2 = app.clone();
+                                std::thread::spawn(move || {
+                                    let st = app2.state::<AppState>();
+                                    let opts = commands::checkin::CheckinOpts {
+                                        scope: "all".into(),
+                                        user_ids: None,
+                                        skip_checked_in: true,
+                                        skip_expired: false,
+                                    };
+                                    if let Err(e) = commands::checkin::start_checkin_core(
+                                        &app2, &st, opts, true,
+                                    ) {
+                                        fs_utils::app_log(
+                                            &st.data_dir,
+                                            &format!("托盘签到失败: {e}"),
+                                        );
+                                        notify::notify(&app2, "签到启动失败", &e);
+                                    }
+                                });
+                            }
+                            "api-toggle" => {
+                                // 托盘启停 API 服务：block_on 等待快速启停完成，
+                                // 菜单文本与通知由 do_start/do_stop 内统一处理
+                                let st = app.state::<AppState>();
+                                let runtime = app
+                                    .state::<Mutex<Option<commands::api_server::ApiServerRuntime>>>();
+                                let running = runtime
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .is_some();
+                                let result = if running {
+                                    tauri::async_runtime::block_on(
+                                        commands::api_server::do_stop(app, &st, &runtime),
+                                    )
+                                    .map(|_| ())
+                                } else {
+                                    tauri::async_runtime::block_on(
+                                        commands::api_server::do_start(app, &st, &runtime),
+                                    )
+                                    .map(|_| ())
+                                };
+                                if let Err(e) = result {
+                                    fs_utils::app_log(
+                                        &st.data_dir,
+                                        &format!("托盘 API 服务操作失败: {e}"),
+                                    );
+                                    notify::notify(app, "API 服务操作失败", &e);
+                                }
+                            }
                             "quit" => {
                                 let st = app.state::<AppState>();
                                 fs_utils::app_log(&st.data_dir, "菜单：用户请求退出应用");
@@ -245,6 +331,28 @@ fn main() {
                     let _ = window.hide();
                     fs_utils::app_log(&state.data_dir, "启动最小化：窗口已隐藏到托盘");
                 }
+            }
+
+            // 启动静默签到（T11）：延迟 60s 后对未签到账号自动执行一轮签到，
+            // 复用托盘签到链路（含防重入锁，与手动/托盘签到天然互斥）；
+            // skip_checked_in=true 保证幂等，重复开机不会重复签
+            if settings.silent_checkin {
+                let app2 = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    let st = app2.state::<AppState>();
+                    fs_utils::app_log(&st.data_dir, "静默签到：启动延迟到期，开始检查签到");
+                    let opts = commands::checkin::CheckinOpts {
+                        scope: "all".into(),
+                        user_ids: None,
+                        skip_checked_in: true,
+                        skip_expired: false,
+                    };
+                    if let Err(e) = commands::checkin::start_checkin_core(&app2, &st, opts, true) {
+                        fs_utils::app_log(&st.data_dir, &format!("静默签到失败: {e}"));
+                        notify::notify(&app2, "静默签到失败", &e);
+                    }
+                });
             }
 
             Ok(())

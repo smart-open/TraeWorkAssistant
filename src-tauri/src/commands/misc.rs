@@ -22,6 +22,27 @@ pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), Strin
     Ok(())
 }
 
+// ---------------- 开机自启（T11，tauri-plugin-autostart：Windows 写注册表 Run 项） ----------------
+
+/// 查询开机自启状态
+#[tauri::command]
+pub fn autostart_status(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+/// 设置开机自启（即时生效，安装版/便携版均写当前 exe 路径）
+#[tauri::command]
+pub fn autostart_set(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch.enable().map_err(|e| e.to_string())
+    } else {
+        autolaunch.disable().map_err(|e| e.to_string())
+    }
+}
+
 // ---------------- 代理请求日志 ----------------
 
 #[derive(Serialize, Clone)]
@@ -374,6 +395,35 @@ fn split_time(raw: &str) -> (String, String) {
         }
     }
     ("".to_string(), raw.to_string())
+}
+
+/// 清理指定类型日志文件（proxy/checkin/switch；all 为全清）。
+/// 各写入方均为「每次追加时重新打开」，删除后文件按需自动重建，无需特殊处理。
+/// 返回实际删除的文件数。
+#[tauri::command]
+pub fn logs_clear(state: State<AppState>, log_type: String) -> Result<u32, String> {
+    let files = [
+        ("proxy", "proxy.log"),
+        ("checkin", "checkin.log"),
+        ("switch", "switcher.log"),
+    ];
+    let mut removed = 0u32;
+    for (t, fname) in files {
+        if log_type != "all" && log_type != t {
+            continue;
+        }
+        let p = state.path("logs").join(fname);
+        match std::fs::remove_file(&p) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("删除 {fname} 失败: {e}")),
+        }
+    }
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!("已清理日志: {log_type}（删除 {removed} 个文件）"),
+    );
+    Ok(removed)
 }
 
 // ---------------- 设置 ----------------

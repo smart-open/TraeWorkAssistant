@@ -1,3 +1,4 @@
+pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
 pub mod models_sync;
@@ -6,6 +7,7 @@ pub mod payload;
 pub mod routes;
 pub mod server;
 pub mod sse;
+pub mod usage;
 
 use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
@@ -27,9 +29,8 @@ pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 /// API 服务器运行时共享状态（传入 axum State）
 pub struct ApiSharedState {
     pub pool: ApiPool,
-    pub api_key: String,
     pub default_model: String,
-    /// 数据目录（%APPDATA%\AIWorkAssistant），供 /v1/models 读取 api_models.json
+    /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
     pub total_requests: AtomicU64,
     pub active_uid: Mutex<Option<String>>,
@@ -37,6 +38,33 @@ pub struct ApiSharedState {
     pub logger: ApiLogger,
     /// Debug 模式：开启后记录完整请求/响应到 API 日志
     pub debug_enabled: std::sync::atomic::AtomicBool,
+    /// 用量统计（内存累积，每次请求后落盘）
+    pub usage: Mutex<usage::UsageFile>,
+}
+
+impl ApiSharedState {
+    /// 记录一次请求用量并原子落盘；写盘失败静默忽略，不影响主流程
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record(
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+        );
+        usage::save(&self.data_dir, &guard);
+    }
 }
 
 /// 上游错误分类（与 Phase 1 冷却状态机对齐）
@@ -75,9 +103,47 @@ impl ErrKind {
     }
 }
 
+/// 4001/model config is empty：模型在当前 function 下不可用（模型问题非账号问题）
+/// 判定依据：SOLO 业务错误码 4001 或上游 message 关键字。
+/// 注意边界：`"code":4001` 后必须紧跟非数字字符，避免误匹配 40012 等其它错误码
+pub fn is_model_config_mismatch(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("model config is empty") {
+        return true;
+    }
+    let is_code_4001 = |key: &str| {
+        let bytes = lower.as_bytes();
+        let key_bytes = key.as_bytes();
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(key) {
+            let after = from + pos + key_bytes.len();
+            let ok = bytes
+                .get(after)
+                .map_or(true, |b| !(b.is_ascii_digit() || *b == b'.'));
+            if ok {
+                return true;
+            }
+            from = after;
+        }
+        false
+    };
+    is_code_4001("\"code\":4001")
+        || is_code_4001("\"code\": 4001")
+        || is_code_4001("\"error_code\":4001")
+        || is_code_4001("\"error_code\": 4001")
+}
+
 /// 按 HTTP 状态码 + body 判定错误类别
 pub fn classify_error(status: u16, body: &str) -> ErrKind {
-    if body.contains("\"code\":1005") || (body.contains("1005") && body.to_lowercase().contains("plan")) {
+    // 4001：模型问题非账号问题，不冷却账号
+    if is_model_config_mismatch(body) {
+        return ErrKind::None;
+    }
+    // 1005：精确匹配 JSON 键 + plan limit 短语（避免任意 "1005"/"plan" 字样误判）
+    let lower_body = body.to_lowercase();
+    if (body.contains("\"code\":1005") || body.contains("\"code\": 1005"))
+        && (lower_body.contains("plan limit") || lower_body.contains("plan_limit"))
+    {
         return ErrKind::PlanLimit;
     }
     match status {
@@ -94,13 +160,12 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
 pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     let msg_lower = msg.to_lowercase();
     // 1005: Plan 套餐额度用尽 → 12 小时冷却
-    // 注意：不能宽泛匹配 "plan"（如 "planned maintenance" 会误判导致 12h 冷却），
-    // 仅精确匹配 code 或计划额度相关短语
+    // 仅匹配 "plan limit/plan_limit/plan quota" 短语：宽泛 contains("plan") 会把
+    // "planned maintenance" 等消息误判为套餐耗尽、触发 12 小时冷却
     if code == 1005
         || msg_lower.contains("plan limit")
         || msg_lower.contains("plan_limit")
-        || msg_lower.contains("额度用尽")
-        || msg_lower.contains("套餐额度")
+        || msg_lower.contains("plan quota")
     {
         return ErrKind::PlanLimit;
     }
@@ -126,13 +191,15 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     }
 }
 
-/// 流式上游 Agent：无整体超时，读超时 300s（防上游挂起导致线程与请求永久阻塞，
-/// 同时容忍推理模型的长间隔 token），用于 SSE 流式对话。
-/// 代理说明：项目未启用 ureq 的 proxy-from-env feature，Agent 默认直连，
-/// 不读环境变量/系统代理，不会被本地 MITM 代理（127.0.0.1:8899）拦截形成循环
+/// 流式上游 Agent：无总超时；连接 10s / 写 30s / 空闲读 300s，用于 SSE 流式对话
+/// 注意：ureq 2.12 默认不读环境变量/系统代理（需显式 proxy-from-env feature），
+/// 本 crate 未启用该 feature，天然直连，不会走本应用 127.0.0.1:8899 形成循环
 pub fn streaming_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        // 读超时 300s：SSE 正常 token 间隔远小于此；上游完全挂起时 5 分钟内释放线程
+        // 空闲读超时仅约束单次 read 等待，SSE 正常流式（持续出包）不受影响；
+        // 防止上游建立连接后长期不发数据，spawn_blocking 线程与客户端连接永久挂起。
+        // 注意：timeout_read(Duration::from_secs(0)) 会触发 Rust std 的
+        // "cannot set a 0 duration timeout" 错误，不能以 0 表示"禁用"
         .timeout_read(std::time::Duration::from_secs(300))
         .timeout_write(std::time::Duration::from_secs(30)) // 写超时 30s
         .timeout_connect(std::time::Duration::from_secs(10)) // 连接超时 10s

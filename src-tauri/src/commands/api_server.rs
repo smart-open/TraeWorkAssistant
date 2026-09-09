@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::fs_utils;
 use crate::models::{
-    AccountCooldownsFile, AccountsFile, ApiPoolFile, ApiServiceStatus, DeviceMap, PoolStatus,
+    AccountCooldownsFile, ApiPoolFile, ApiServiceStatus, DeviceMap, PoolStatus,
     RemainingCreditsFile,
 };
 use crate::state::AppState;
@@ -29,14 +28,16 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 
 // ==================== 启停命令 ====================
 
-#[tauri::command]
-pub async fn api_server_start(
-    state: State<'_, AppState>,
-    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+/// 启动 API 服务核心逻辑（页面命令 / 托盘菜单共用）。
+/// 成功后同步托盘菜单文本并发送系统通知。
+pub async fn do_start(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
 ) -> Result<ApiServiceStatus, String> {
     // 检查是否已运行
     {
-        let guard = safe_lock(&runtime);
+        let guard = safe_lock(runtime);
         if guard.is_some() {
             return Err("API 服务已在运行".into());
         }
@@ -44,11 +45,12 @@ pub async fn api_server_start(
 
     let settings = state.settings();
     let port = settings.api_port;
-    let api_key = settings.api_key.clone();
 
-    // 代理说明：上游请求通过 agent 级显式直连（Proxy::custom(|_| None)）避免被
-    // 系统代理拦截形成循环（本地 MITM 代理 127.0.0.1:8899），不再修改进程级
-    // NO_PROXY 环境变量（多线程 setenv 有竞态，且会波及子进程的代理行为）。
+    // 代理循环说明：ureq 2.12 未启用 proxy-from-env feature，构建 Agent 时
+    // 既不读 HTTP(S)_PROXY/NO_PROXY 环境变量、也不读系统代理，Agent 未显式
+    // 配置 proxy 即直连，不会形成 127.0.0.1:8899 回环。
+    // 旧实现曾进程级 set_var("NO_PROXY","*")：多线程下 setenv 有竞态
+    // （Rust 2024 已标 unsafe），且污染 python 签到等子进程的代理行为，已移除
     let default_model = {
         let m = settings.api_default_model.trim();
         if m.is_empty() {
@@ -58,22 +60,28 @@ pub async fn api_server_start(
         }
     };
 
-    // 读取账号数据、冷却状态、剩余积分
-    let accounts: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
+    // 读取账号数据、冷却状态、剩余积分（账号经 vault 解密还原明文 jwt）
+    let accounts = crate::vault::load_accounts(state);
     let pool_file: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
+    let groups_file: crate::models::GroupsFile = fs_utils::read_json(&state.path("groups.json"));
     let cooldowns_file: AccountCooldownsFile =
         fs_utils::read_json(&state.path("account_cooldowns.json"));
     let credits_file: RemainingCreditsFile =
         fs_utils::read_json(&state.path("remaining_credits.json"));
     let device_map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
 
+    // 调度策略（T10）：api_pool.json.strategy，空/未知值回退 expire_first
+    let strategy = crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy);
+
     // ===== 启动诊断日志：详细记录账号池资源情况 =====
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "API服务启动-账号池诊断: total_accounts={} enabled_in_pool={} cooldowns={} credits_entries={}",
+            "API服务启动-账号池诊断: total_accounts={} enabled_in_pool={} strategy={} group_filter={} cooldowns={} credits_entries={}",
             accounts.accounts.len(),
             pool_file.enabled_uids.len(),
+            strategy.as_str(),
+            if pool_file.group_ids.is_empty() { "all".to_string() } else { pool_file.group_ids.join(",") },
             cooldowns_file.cooldowns.len(),
             credits_file.credits.len(),
         ),
@@ -82,6 +90,11 @@ pub async fn api_server_start(
     // 逐账号诊断：哪些会被加入池，哪些会被跳过及原因
     let enabled_set: std::collections::HashSet<&str> =
         pool_file.enabled_uids.iter().map(|s| s.as_str()).collect();
+    let group_filter: Option<std::collections::HashSet<&str>> = if pool_file.group_ids.is_empty() {
+        None
+    } else {
+        Some(pool_file.group_ids.iter().map(|s| s.as_str()).collect())
+    };
     for a in &accounts.accounts {
         let uid = a.user_id.as_deref().unwrap_or("(none)");
         let name = &a.name;
@@ -89,6 +102,13 @@ pub async fn api_server_start(
             fs_utils::app_log(
                 &state.data_dir,
                 &format!("  账号池跳过: name={} uid={} reason=not_in_enabled_list", name, uid),
+            );
+        } else if !group_filter.as_ref().map_or(true, |f| {
+            groups_file.membership.get(uid).map_or(false, |g| f.contains(g.as_str()))
+        }) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("  账号池跳过: name={} uid={} reason=not_in_selected_group", name, uid),
             );
         } else {
             // 检查冷却和积分状态
@@ -131,18 +151,21 @@ pub async fn api_server_start(
         }
     }
 
-    // 创建池并同步
+    // 创建池并同步（含调度策略与分组筛选）
+    let pool = ApiPool::new();
+    pool.set_strategy(strategy);
     // 池积分语义 = 通用积分（product_id 208，llm_utils_chat 实际扣减的类别）：
     // 优先取 general 表，账号未重新刷新过缓存时回退旧的总积分表
-    let pool_credits: HashMap<String, f64> = credits_file
+    let pool_credits: std::collections::HashMap<String, f64> = credits_file
         .credits
         .iter()
         .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
         .collect();
-    let pool = ApiPool::new();
     pool.sync_from_accounts(
         &accounts.accounts,
         &pool_file.enabled_uids,
+        &pool_file.group_ids,
+        &groups_file.membership,
         &cooldowns_file.cooldowns,
         &pool_credits,
         &credits_file.expire_times,
@@ -174,7 +197,6 @@ pub async fn api_server_start(
 
     let shared = Arc::new(ApiSharedState {
         pool,
-        api_key,
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -182,6 +204,7 @@ pub async fn api_server_start(
         last_error: Mutex::new(None),
         logger: ApiLogger::new(state.logs_dir()),
         debug_enabled: std::sync::atomic::AtomicBool::new(false),
+        usage: Mutex::new(crate::api_server::usage::load(&state.data_dir)),
     });
 
     let handle = start_api_server(port, shared.clone()).await?;
@@ -205,26 +228,65 @@ pub async fn api_server_start(
         started_at: Some(now),
     };
 
-    *safe_lock(&runtime) = Some(ApiServerRuntime {
+    *safe_lock(runtime) = Some(ApiServerRuntime {
         handle,
         shared: shared.clone(),
         started_at: now,
     });
 
+    // 同步托盘菜单文本 + 系统通知
+    sync_tray_api_text(app, true);
+    crate::notify::notify(
+        app,
+        "API 服务已启动",
+        &format!("端口 {port}，池内 {pool_count} 个账号"),
+    );
+
     Ok(status)
 }
 
 #[tauri::command]
-pub async fn api_server_stop(
+pub async fn api_server_start(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Result<ApiServiceStatus, String> {
+    do_start(&app, &state, &runtime).await
+}
+
+/// 停止 API 服务核心逻辑（页面命令 / 托盘菜单共用）
+pub async fn do_stop(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
 ) -> Result<(), String> {
-    let mut guard = safe_lock(&runtime);
+    let mut guard = safe_lock(runtime);
     if let Some(mut rt) = guard.take() {
         rt.handle.stop();
         fs_utils::app_log(&state.data_dir, "API 服务已停止");
+        drop(guard);
+        sync_tray_api_text(app, false);
+        crate::notify::notify(app, "API 服务已停止", "本地网关已关闭");
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn api_server_stop(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Result<(), String> {
+    do_stop(&app, &state, &runtime).await
+}
+
+/// 同步托盘「API 服务」菜单文本（服务未运行显示"启动"，运行中显示"停止"）
+fn sync_tray_api_text(app: &tauri::AppHandle, running: bool) {
+    if let Some(tray) = app.try_state::<crate::TrayMenu>() {
+        let _ = tray
+            .api_item
+            .set_text(if running { "停止 API 服务" } else { "启动 API 服务" });
+    }
 }
 
 #[tauri::command]
@@ -271,11 +333,18 @@ pub fn pool_list(state: State<'_, AppState>) -> ApiPoolFile {
     fs_utils::read_json(&state.path("api_pool.json"))
 }
 
-/// 批量设置池中的账号 UID 列表
+/// 批量设置池中的账号 UID 列表 + 调度策略 + 分组筛选（T10）
 #[tauri::command]
-pub fn pool_set(state: State<'_, AppState>, uids: Vec<String>) -> Result<(), String> {
+pub fn pool_set(
+    state: State<'_, AppState>,
+    uids: Vec<String>,
+    strategy: Option<String>,
+    group_ids: Option<Vec<String>>,
+) -> Result<(), String> {
     let pool_file = ApiPoolFile {
         enabled_uids: uids,
+        strategy: strategy.unwrap_or_default(),
+        group_ids: group_ids.unwrap_or_default(),
     };
     fs_utils::write_json(&state.path("api_pool.json"), &pool_file)
 }
@@ -379,8 +448,36 @@ pub async fn api_models_sync(
     state: State<'_, AppState>,
 ) -> Result<Vec<models_sync::ModelOption>, String> {
     let data_dir = state.data_dir.clone();
+    // 预先在调用方解密账号（vault 依赖 AppState，阻塞线程内不便访问）
+    let accounts = crate::vault::load_accounts(&state);
     // 阻塞网络请求放入阻塞线程池，避免卡住异步运行时
-    tauri::async_runtime::spawn_blocking(move || models_sync::fetch_official(&data_dir))
+    tauri::async_runtime::spawn_blocking(move || models_sync::fetch_official(&data_dir, accounts))
         .await
         .map_err(|e| format!("同步任务执行失败: {e}"))?
+}
+
+/// 查询最近 N 天的 API 用量统计（按日聚合，直接读盘，服务未运行也可查）
+#[tauri::command]
+pub fn api_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    crate::api_server::usage::query_recent(&state.data_dir, days)
+}
+
+// ==================== 多 API Key 命令 ====================
+
+/// 读取 API Key 列表
+#[tauri::command]
+pub fn api_keys_list(state: State<'_, AppState>) -> Vec<crate::api_server::api_keys::ApiKeyEntry> {
+    crate::api_server::api_keys::load(&state.data_dir).keys
+}
+
+/// 保存 API Key 列表（整表写盘；每次请求重读文件，改动立即生效）
+#[tauri::command]
+pub fn api_keys_save(
+    state: State<'_, AppState>,
+    keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
+) -> Result<(), String> {
+    let file = crate::api_server::api_keys::ApiKeysFile { keys };
+    crate::api_server::api_keys::save(&state.data_dir, &file);
+    Ok(())
 }
