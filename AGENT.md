@@ -1,4 +1,4 @@
-# AGENT.md — Trae Work Assistant v2.8.4
+# AGENT.md — Trae Work Assistant v2.9.0
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 
@@ -91,6 +91,8 @@ trae-work-assistant/
 | OAuth | `oauth_parse_callback(callback_url)` → `{ user_id, ... }` | 解析回调 URL 中的 token |
 | 分组 | `groups_list` / `group_create` / `group_update` / `group_delete` / `group_move` | 删除分组时账号回落「未分组」 |
 | 签到 | `checkin_start(opts)` → NDJSON 事件 | `opts: { scope, user_ids?, skip_checked_in, skip_expired }` |
+| 签到 | `checkin_trends(days)` → `[{date,ok,already,failed}]` | 每日签到结果趋势（落盘 `data/checkin_results.json`，重试轮合并为最终态） |
+| 日志 | `logs_clear(log_type)` → 删除行数 | 按类型清理日志（`all` 全清）；`log_type` 同 logs_query |
 | 切换 | `switch_account(userId)` | 调 `trae-switch-bridge.ps1 -Action Switch` |
 | 保存 | `save_current_login(userId)` | 调 `trae-switch-bridge.ps1 -Action SaveCurrentLogin` |
 | 快照 | `profile_list` → `ProfileInfo[]` | 列出 data/profiles/ 下所有快照 |
@@ -98,12 +100,15 @@ trae-work-assistant/
 | 设备 | `device_reset(userId)` | 删 `device_map.json[ uid ]` |
 | JWT | `jwt_parse(jwt)` / `refresh_jwt(userId)` | 解析 / 自动刷新（需 refresh_token） |
 | API | `api_server_start(port)` / `api_server_stop()` / `api_server_status()` | API 网关启停 |
-| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理 |
+| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`api_pool.json` 含 `strategy`（`expire_first`/`credit_first`/`random`，默认 expire_first）与 `group_ids`（空=全部分组），保存后需重启 API 服务生效 |
+| API | `api_usage_stats(days?)` → `UsageDayView[]` | 用量统计（按日聚合，落盘 `data/api_usage.json`，保留 90 天） |
+| API | `api_keys_list()` / `api_keys_save(keys)` | 多 API Key 管理（含 `daily_limit`，0=不限；统一列表校验，无主 Key） |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
 | API | `api_models_list` / `api_models_sync` | 模型列表读取 / 官网同步：`batch_get_detail_param`（可见模型+展示名）∪ `get_skill_detail` 的 `meta.models` 全量注册表补集（含内置模型，标记 verified=false），版本头 3.3.98/20260901 |
 | 日志 | `logs_query({ opts: { log_type, date, keyword, limit } })` → `LogLine[]` | `split_time` 会 strip BOM 前缀 |
 | 设置 | `settings_get()` / `settings_set(patch: Settings)` | Settings 全部 snake_case |
 | 计划 | `task_register(time)` / `task_status()` / `task_unregister()` | `schtasks` 注册每日签到 |
+| 系统 | `autostart_status()` / `autostart_set(enabled)` | 开机自启（tauri-plugin-autostart，注册表 Run 项） |
 
 ## 6. Tauri 事件（Rust → 前端）
 
@@ -111,7 +116,7 @@ trae-work-assistant/
 |---|---|
 | `proxy-log` | `string`（代理 stdout 逐行） |
 | `account-captured` | `string`（新捕获的 userId） |
-| `checkin-progress` | `{type:'start',total}` / `{type:'account',...}` / `{type:'done',ok,already,failed}` |
+| `checkin-progress` | `{type:'start',total}` / `{type:'account',...}` / `{type:'retry',round,delay,total}`（重试横幅倒计时）/ `{type:'done',ok,already,failed}` |
 | `switch-progress` | `string`（PowerShell NDJSON 单行） |
 | `switch-done` | `{ success: boolean, raw: string }` |
 | `save-login-progress` | `string`（PowerShell NDJSON 单行） |
@@ -122,20 +127,26 @@ trae-work-assistant/
 ```
 %APPDATA%\TraeWorkAssistant\
 ├── conf/
-│   └── app_settings.json         # Settings 全字段（snake_case）
+│   ├── app_settings.json         # Settings 全字段（snake_case）
+│   ├── vault.stronghold          # Stronghold 快照：各账号 jwt / refresh_token 权威加密存储（主密码经 DPAPI 加密于 vault_key.bin）
+│   └── vault_key.bin             # vault 主密码（Windows DPAPI，仅本机当前用户可解）
 ├── data/
-│   ├── checkin_accounts.json     # { accounts: [{name, UserID, jwt, refresh_token?, added_at}] }
+│   ├── checkin_accounts.json     # { accounts: [{name, UserID, jwt(迁移后为占位), refresh_token?(占位), added_at}] }；凭据权威在 vault
 │   ├── device_map.json           # { <userId>: { device_id, market_user_id, session_id } }
 │   ├── groups.json               # { groups: [...], membership: {<uid>:<gid>} }
 │   ├── credits_history.json      # { records: [{date,user_id,credits,delta}] }
 │   ├── credits_daily.json        # 每日积分快照
 │   ├── remaining_credits.json    # 各账号剩余积分缓存
 │   ├── account_cooldowns.json    # 签到错误冷却状态（error_type + cooldown_until）
-│   ├── api_pool.json             # API 账号池配置 + 状态
+│   ├── checkin_results.json      # 每日签到结果（per-uid 最终态，重试轮自然合并；保留 90 天）
+│   ├── api_pool.json             # API 账号池配置（strategy/group_ids）+ 状态
+│   ├── api_keys.json             # 多 API Key（id/name/key/enabled/daily_limit，0=不限；启用 Key 为空则不鉴权）
+│   ├── api_usage.json            # API 用量按日聚合（日期/协议/模型/账号/Key/成败/流式/耗时；保留 90 天）
+│   ├── api_models.json           # 模型列表（官网同步 ∪ 内置补集；含 function 自学习覆盖）
 │   └── profiles/                 # 登录态快照
 │       ├── current_account.txt   # 当前活跃账号 ID
 │       └── <user_id>/            # 精准备份的 9 类核心文件
-└── logs/                        # proxy / checkin / switcher / api / proxy-requests 日志
+└── logs/                        # proxy / checkin / switcher / api / proxy-requests / app 日志
 ```
 
 **写入约定**：`fs_utils::write_json` 用 `tmp + rename` 原子替换，避免断电损坏。
@@ -239,6 +250,8 @@ trae-work-assistant/
 - LLM API 上游必须设置 `NO_PROXY=*` 避免系统代理循环。
 - 日志文件首行可能有 BOM 前缀（PowerShell 5.1 `-Encoding UTF8`），`split_time` 已处理。
 - JWT 默认 13 天过期；带 refresh_token 的账号可自动续期。
+- **账号凭据权威存储在 Stronghold vault**（`conf/vault.stronghold`，主密码经 DPAPI 加密）：Rust 侧读写账号必须走 `vault` 模块的加解密路径；删除 vault 文件属数据丢失场景（需重新录入账号），升级/迁移前应提示用户备份 `%APPDATA%\TraeWorkAssistant\conf\`。
+- **Python 签到脚本读临时解密文件**：spawn `auto_checkin.py` 前把 vault 凭据解密写入临时 accounts 文件（`--accounts-file`），进程结束即删除；不要恢复明文字段到 `checkin_accounts.json`。
 - **`schtasks` 中文输出是 GBK**，直接 `String::from_utf8_lossy` 会乱码。统一走 `misc.rs::run_schtasks()`（前置 `chcp 65001`），**不要**再裸调 `Command::new("schtasks")`。
 - **计划任务不加 `/RL HIGHEST`**：签到脚本只读写 `%APPDATA%` 并运行 Python，加了会让普通用户注册失败（Access Denied）。
 - **错误文案不重复加前缀**：Rust 端返回纯错误描述，`查询失败：` / `注册失败：` 等前缀由前端 `Settings.tsx` 统一拼接。

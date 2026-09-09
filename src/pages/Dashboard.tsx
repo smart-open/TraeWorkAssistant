@@ -1,4 +1,4 @@
-import { useMemo, useEffect } from 'react';
+import { useMemo, useEffect, useState } from 'react';
 import {
   BarChart,
   Bar,
@@ -9,6 +9,7 @@ import {
   CartesianGrid,
   Cell,
   LabelList,
+  Legend,
 } from 'recharts';
 import {
   ShieldAlert,
@@ -21,6 +22,7 @@ import { StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { useIsDark } from '../lib/useIsDark';
+import type { CheckinTrendPoint } from '../types';
 
 function formatUptime(startedAt: number | null): string | null {
   if (startedAt == null) return null;
@@ -42,6 +44,19 @@ export default function Dashboard() {
   const refreshLocalEntitlement = useAppStore((s) => s.refreshLocalEntitlement);
   const toast = useAppStore((s) => s.pushToast);
   const isDark = useIsDark();
+  // 近 30 天签到结果趋势（堆叠柱状图数据）
+  const [trends, setTrends] = useState<CheckinTrendPoint[]>([]);
+
+  const loadTrends = async () => {
+    try {
+      setTrends(await api.checkin.trends(30));
+    } catch {
+      /* 查询失败保持空态展示 */
+    }
+  };
+  useEffect(() => {
+    void loadTrends();
+  }, []);
 
   const total = accounts.length;
   const checkedToday = accounts.filter((a) => a.checked_today).length;
@@ -87,6 +102,7 @@ export default function Dashboard() {
       s.refreshGroups(),
       s.refreshCreditsHistory(),
       s.refreshLocalEntitlement(),
+      loadTrends(),
     ]);
     // 刷新剩余可用积分（会再次 refreshAccounts 更新 UI）
     void api.accounts.refreshRemainingCredits().then(() => s.refreshAccounts()).catch(() => {});
@@ -190,6 +206,51 @@ export default function Dashboard() {
           </button>
         </div>
       )}
+
+      {/* 近 30 天签到结果趋势（无数据显示空态） */}
+      <div className="mt-5 card p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="font-medium">近 30 天签到结果</h3>
+          <span className="text-xs text-slate-400">按日汇总 · 成功 / 已签 / 失败</span>
+        </div>
+        {trends.length === 0 ? (
+          <div className="flex h-40 items-center justify-center text-sm text-slate-400">
+            暂无签到记录，完成一次签到后这里会显示趋势。
+          </div>
+        ) : (
+          <div className="h-64">
+            <ResponsiveContainer>
+              <BarChart data={trends} margin={{ top: 8, right: 16, left: 0, bottom: 4 }} barCategoryGap="24%">
+                <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(v: string) => v.slice(5)}
+                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                  axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                  tickLine={false}
+                />
+                <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={36} />
+                <Tooltip
+                  cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                  contentStyle={{
+                    fontSize: 12,
+                    borderRadius: 10,
+                    border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                    background: isDark ? '#18181b' : '#fff',
+                    color: isDark ? '#e4e4e7' : '#1e293b',
+                    boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+                    padding: '8px 12px',
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="ok" name="成功" stackId="trend" fill="#10b981" maxBarSize={28} />
+                <Bar dataKey="already" name="已签" stackId="trend" fill="#0ea5e9" maxBarSize={28} />
+                <Bar dataKey="failed" name="失败" stackId="trend" fill="#f43f5e" maxBarSize={28} radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </div>
 
       {top.length > 0 && (
         <div className="mt-5 card p-5">

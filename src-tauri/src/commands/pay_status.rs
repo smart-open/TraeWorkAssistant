@@ -85,8 +85,7 @@ fn query_pay_status(jwt: &str) -> Result<PayStatusEntry, String> {
 /// 返回成功数量。网络请求命令，标记 async 交由异步线程池派发，避免阻塞主线程。
 #[tauri::command(async)]
 pub fn refresh_pay_status(state: State<AppState>) -> Result<usize, String> {
-    let accounts: crate::models::AccountsFile =
-        fs_utils::read_json(&state.path("checkin_accounts.json"));
+    let accounts = crate::vault::load_accounts(&state);
     let mut file: PayStatusFile = fs_utils::read_json(&state.path("pay_status.json"));
     let mut ok = 0usize;
     for a in &accounts.accounts {

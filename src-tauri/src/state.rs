@@ -1,3 +1,4 @@
+//! 应用全局状态与目录布局（conf/data/logs 子目录路由、python/ps 资源定位）。
 use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
 use std::process::Command;

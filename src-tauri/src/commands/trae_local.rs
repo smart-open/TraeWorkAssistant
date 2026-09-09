@@ -356,7 +356,7 @@ pub fn apps_account_add(state: State<AppState>, user_id: String, name: String) -
         added_at: Some(fs_utils::now_iso()),
         updated_at: Some(fs_utils::now_iso()),
     });
-    fs_utils::write_json(&state.path("checkin_accounts.json"), &accounts)?;
+    crate::vault::save_accounts(&state, &mut accounts)?;
     fs_utils::app_log(
         &state.data_dir,
         &format!("本机发现入池 [{}]: uid={}", display_name, uid),

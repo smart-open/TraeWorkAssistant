@@ -1,6 +1,6 @@
 [package]
 name = "trae-work-assistant"
-version = "2.8.4"
+version = "2.9.0"
 description = "Trae Work 助手 - 多账号签到与管理桌面端"
 edition = "2021"
 rust-version = "1.77"
@@ -11,9 +11,11 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [ "tray-icon"] }
 tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-stronghold = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -26,6 +28,13 @@ tokio-stream = "0.1"
 bytes = "1"
 sha2 = "0.10"
 log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+# dev/test 构建对依赖开优化：Stronghold 快照加密派生等在未优化下极慢（写一次 ~100s）
+[profile.dev.package."*"]
+opt-level = 2
 
 [features]
 # 仅桌面端

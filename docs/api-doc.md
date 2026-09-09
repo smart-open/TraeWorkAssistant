@@ -120,8 +120,8 @@
 ### `api_server_stop()` → `{ ok }`
 - 停止 API 服务。
 
-### `api_server_status()` → `{ running: boolean, port: number, api_key: string, default_model: string, pool_size: number }`
-- 返回 API 服务运行状态和账号池信息。
+### `api_server_status()` → `{ running, port, total_requests, active_uid, last_error, started_at }`
+- 返回 API 服务运行状态；鉴权 Key 统一由 `api_keys_list()` / `api_keys_save()` 管理（无主 Key）。
 
 ### `api_pool_list()` → `PoolAccount[]`
 - 返回可选入账号池的账号列表。

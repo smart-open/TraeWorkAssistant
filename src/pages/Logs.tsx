@@ -1,5 +1,5 @@
-﻿import { useEffect, useState, useCallback, useRef } from 'react';
-import { RefreshCw, Search, Trash2, Download, Copy, ChevronLeft, ChevronRight, Eye, Eraser, Bug, FileText, X } from 'lucide-react';
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { RefreshCw, Search, Trash2, Copy, ChevronLeft, ChevronRight, Eye, Eraser, Bug, FileText, X } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, Modal } from '../components/ui';
 import { useAppStore } from '../store';
@@ -35,6 +35,8 @@ function SystemLogsTab() {
   const [kw, setKw] = useState('');
   const [date, setDate] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [clearConfirm, setClearConfirm] = useState(false);
+  const [clearing, setClearing] = useState(false);
 
   useEffect(() => {
     void refreshLogs({ logType: type, date: date || undefined });
@@ -73,21 +75,22 @@ function SystemLogsTab() {
     }
   };
 
-  const exportLogs = () => {
-    if (logs.length === 0) return;
-    const header = '时间\t类型\t内容\n';
-    const body = logs.map((l) => `${l.time}\t${l.log_type}\t${l.message}`).join('\n');
-    const blob = new Blob(['\ufeff' + header + body], { type: 'text/csv;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `trae-work-logs-${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
   const clearProxyLog = () => {
     useAppStore.setState({ proxyLog: [] });
+  };
+
+  const doClearLogs = async () => {
+    setClearing(true);
+    try {
+      const removed = await api.misc.logsClear(type);
+      toast('success', `日志已清理（删除 ${removed} 个文件）`);
+      setClearConfirm(false);
+      void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined });
+    } catch (e) {
+      toast('error', `清理日志失败：${String(e)}`);
+    } finally {
+      setClearing(false);
+    }
   };
 
   return (
@@ -130,6 +133,14 @@ function SystemLogsTab() {
           <button onClick={copyLogs} disabled={logs.length === 0} className="btn-ghost !p-1.5" title="复制日志">
             <Copy size={14} />
           </button>
+          <button
+            onClick={() => setClearConfirm(true)}
+            disabled={clearing}
+            className="btn-ghost !p-1.5 text-rose-500 hover:text-rose-600"
+            title="清理当前类型日志"
+          >
+            <Trash2 size={14} />
+          </button>
         </div>
         <div className="flex-1 min-h-0 overflow-auto rounded-lg bg-slate-50 p-2 text-xs dark:bg-zinc-950">
           {logs.length === 0 ? (
@@ -149,6 +160,28 @@ function SystemLogsTab() {
       {autoRefresh && proxyLog.length > 0 && (
         <div className="text-xs text-slate-400">实时模式已开启：代理输出最新置顶显示。</div>
       )}
+
+      {/* 清理日志确认弹窗 */}
+      <Modal
+        open={clearConfirm}
+        onClose={() => !clearing && setClearConfirm(false)}
+        title="清理日志"
+        footer={
+          <>
+            <button onClick={() => setClearConfirm(false)} disabled={clearing} className="btn-ghost">
+              取消
+            </button>
+            <button onClick={() => void doClearLogs()} disabled={clearing} className="btn-primary">
+              <Trash2 size={14} /> {clearing ? '清理中…' : '确认清理'}
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm">
+          将删除类型为「{TYPES.find((t) => t.v === type)?.label ?? type}」的日志文件，删除后不可恢复。
+        </p>
+        <p className="mt-1 text-xs text-slate-400">日志文件会在后续写入时自动重建，不影响应用运行。</p>
+      </Modal>
     </div>
   );
 }

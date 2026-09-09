@@ -6,11 +6,12 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::sse;
+use super::usage::{extract_tokens, KeyId};
 use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState, ErrKind,
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
@@ -21,6 +22,8 @@ const MAX_BODY_BYTES: usize = 8 << 20;
 #[derive(Clone, Copy, PartialEq)]
 pub enum Protocol {
     OpenAi,
+    /// OpenAI legacy text completions（/v1/completions）
+    OpenAiText,
     Anthropic,
 }
 
@@ -28,6 +31,7 @@ impl Protocol {
     fn log_path(self) -> &'static str {
         match self {
             Protocol::OpenAi => "/v1/chat/completions",
+            Protocol::OpenAiText => "/v1/completions",
             Protocol::Anthropic => "/v1/messages",
         }
     }
@@ -147,6 +151,7 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
 
 pub async fn chat_completions(
     State(state): State<Arc<ApiSharedState>>,
+    key_id: Option<Extension<KeyId>>,
     body: axum::body::Bytes,
 ) -> Response {
     if body.len() > MAX_BODY_BYTES {
@@ -189,11 +194,12 @@ pub async fn chat_completions(
         .to_string();
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
+    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
     if stream {
-        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi)
+        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi, key_str)
     } else {
-        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi).await
+        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi, key_str).await
     }
 }
 
@@ -201,6 +207,7 @@ pub async fn chat_completions(
 /// 请求：POST /v1/messages，鉴权支持 x-api-key 或 Authorization: Bearer
 pub async fn messages(
     State(state): State<Arc<ApiSharedState>>,
+    key_id: Option<Extension<KeyId>>,
     body: axum::body::Bytes,
 ) -> Response {
     if body.len() > MAX_BODY_BYTES {
@@ -244,22 +251,123 @@ pub async fn messages(
     let body_vec = super::payload::anthropic_to_openai(&body);
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
+    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
     if stream {
-        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic)
+        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic, key_str)
     } else {
-        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic).await
+        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic, key_str).await
     }
+}
+
+/// OpenAI legacy text completions 端点（T9）
+/// prompt（string 或 string[]）转单条 user message 复用现有链路，响应包装回
+/// text_completion 结构。suffix/echo/logprobs/n 等参数不支持（忽略，上游单次补全）
+pub async fn completions(
+    State(state): State<Arc<ApiSharedState>>,
+    key_id: Option<Extension<KeyId>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if body.len() > MAX_BODY_BYTES {
+        return openai_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "request body exceeds 8MB limit",
+        );
+    }
+
+    state
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let peek: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("invalid JSON body: {}", e),
+            )
+        }
+    };
+    let prompt_text = match peek.get("prompt") {
+        Some(Value::String(s)) => s.clone(),
+        // 多段 prompt：拼接为单个 prompt（上游一次只产出一个补全，无法返回多 choice）
+        Some(Value::Array(arr)) => {
+            let parts: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            if parts.is_empty() {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "prompt: array must contain strings",
+                );
+            }
+            parts.join("\n\n")
+        }
+        _ => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "prompt: field required",
+            )
+        }
+    };
+    if prompt_text.trim().is_empty() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "prompt: must not be empty",
+        );
+    }
+    let stream = peek.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let model = peek
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&state.default_model)
+        .to_string();
+
+    // prompt → user message，复用 /v1/chat/completions 内部链路
+    let internal = json!({
+        "model": model,
+        "stream": stream,
+        "messages": [{ "role": "user", "content": prompt_text }],
+    });
+    let body_vec = internal.to_string().into_bytes();
+
+    let state_clone = state.clone();
+    let start_ts = std::time::Instant::now();
+    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+
+    if stream {
+        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAiText, key_str)
+    } else {
+        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAiText, key_str).await
+    }
+}
+
+/// /v1/embeddings：上游 SOLO 无向量能力，明确返回 501（不做假实现）
+pub async fn embeddings() -> Response {
+    openai_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "not_supported",
+        "上游服务无 embeddings 能力，本网关不支持 /v1/embeddings，请使用 /v1/chat/completions 或 /v1/completions",
+    )
 }
 
 // ==================== Streaming ====================
 
-fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol) -> Response {
+#[allow(clippy::too_many_arguments)]
+fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::task::spawn_blocking(move || {
         let chat_id = match proto {
             Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+            Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
             Protocol::Anthropic => format!("msg_{}", now_ts()),
         };
         let mut tried = HashSet::new();
@@ -282,13 +390,31 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
                 Ok(reader) => {
                     // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
-                    let (error_info, sent_any) = match proto {
-                        Protocol::OpenAi => sse::stream_convert(reader, tx.clone(), &chat_id),
+                    let (error_info, sent_any, up_usage) = match proto {
+                        Protocol::OpenAi => {
+                            let (e, s, u) = sse::stream_convert(reader, tx.clone(), &chat_id);
+                            (e, s, u)
+                        }
+                        Protocol::OpenAiText => {
+                            let (e, s, u) =
+                                sse::stream_convert_text(reader, tx.clone(), &chat_id, &model);
+                            (e, s, u)
+                        }
                         Protocol::Anthropic => {
-                            sse::stream_convert_anthropic(reader, tx.clone(), &chat_id, &model)
+                            let (e, s, u) =
+                                sse::stream_convert_anthropic(reader, tx.clone(), &chat_id, &model);
+                            (e, s, u)
                         }
                     };
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    // 用量记账（流式结束即落盘）
+                    {
+                        let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
+                        state.record_usage(
+                            &model, &picked.uid, &key_id, error_info.is_none(), true,
+                            duration_ms, pt, ct,
+                        );
+                    }
                     if let Some((code, msg)) = error_info {
                         let kind = classify_solo_error(code, &msg);
                         if kind != ErrKind::None {
@@ -361,6 +487,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
         // 所有账号不可用
         let duration_ms = start_ts.elapsed().as_millis() as u64;
+        state.record_usage(&model, "none", &key_id, false, true, duration_ms, 0, 0);
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
             .iter()
@@ -396,7 +523,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             }
         }
         match proto {
-            Protocol::OpenAi => {
+            Protocol::OpenAi | Protocol::OpenAiText => {
                 let _ = tx.blocking_send(Ok(bytes::Bytes::from(
                     "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
                 )));
@@ -434,7 +561,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
 // ==================== Non-streaming ====================
 
-async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol) -> Response {
+async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let mut tried = HashSet::new();
         // 4001（模型在当前 function 下不可用）时的强制 function 重试（只重试一次）
@@ -457,10 +584,12 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 Ok(reader) => {
                     let chat_id = match proto {
                         Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+                        Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
                         Protocol::Anthropic => format!("msg_{}", now_ts()),
                     };
                     let (resp, error_info) = match proto {
                         Protocol::OpenAi => sse::aggregate(reader, &chat_id),
+                        Protocol::OpenAiText => sse::aggregate_text(reader, &chat_id, &model),
                         Protocol::Anthropic => sse::aggregate_anthropic(reader, &chat_id, &model),
                     };
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
@@ -470,6 +599,12 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             if let Some(f) = fn_forced {
                                 super::models_sync::learn_function_override(&state.data_dir, &model, f);
                             }
+                            // 用量记账（成功：token 数从聚合响应 usage 提取）
+                            let (pt, ct) = r.get("usage").map(extract_tokens).unwrap_or((0, 0));
+                            state.record_usage(
+                                &model, &picked.uid, &key_id, true, stream,
+                                duration_ms, pt, ct,
+                            );
                             state.pool.note_success(&picked.uid);
                             state.logger.log_request(
                                 "POST", proto.log_path(), &model, stream,
@@ -493,6 +628,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             state.pool.note_error(&picked.uid, kind);
                             *safe_lock(&state.last_error) =
                                 Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
+                            state.record_usage(
+                                &model, &picked.uid, &key_id, false, stream,
+                                duration_ms, 0, 0,
+                            );
                             state.logger.log_request(
                                 "POST", proto.log_path(), &model, stream,
                                 200, &picked.uid, duration_ms, Some(&msg),
@@ -504,6 +643,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         }
                         _ => {
                             state.pool.note_error(&picked.uid, ErrKind::Server);
+                            state.record_usage(
+                                &model, &picked.uid, &key_id, false, stream,
+                                duration_ms, 0, 0,
+                            );
                             state.logger.log_request(
                                 "POST", proto.log_path(), &model, stream,
                                 502, &picked.uid, duration_ms, Some("empty response"),
@@ -527,6 +670,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     state.pool.note_error(&picked.uid, kind);
                     *safe_lock(&state.last_error) =
                         Some(format!("uid={} status={}", picked.uid, status));
+                    state.record_usage(
+                        &model, &picked.uid, &key_id, false, stream,
+                        start_ts.elapsed().as_millis() as u64, 0, 0,
+                    );
                     state.logger.log_request(
                         "POST", proto.log_path(), &model, stream,
                         status, &picked.uid, start_ts.elapsed().as_millis() as u64,
@@ -542,6 +689,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
 
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         let diag = state.pool.diagnose();
+        // 用量记账（所有账号不可用）
+        state.record_usage(&model, "none", &key_id, false, stream, duration_ms, 0, 0);
         let diag_summary: Vec<String> = diag
             .iter()
             .map(|d| {
@@ -582,7 +731,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     .unwrap()
             }),
         Ok(Err(msg)) => match proto {
-            Protocol::OpenAi => openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg),
+            Protocol::OpenAi | Protocol::OpenAiText => {
+                openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg)
+            }
             Protocol::Anthropic => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &msg),
         },
         Err(e) => openai_error(
@@ -745,7 +896,7 @@ fn send_stream_error(
     msg: &str,
 ) {
     match proto {
-        Protocol::OpenAi => {
+        Protocol::OpenAi | Protocol::OpenAiText => {
             let body = json!({
                 "error": { "message": msg, "type": "api_error", "code": code }
             });

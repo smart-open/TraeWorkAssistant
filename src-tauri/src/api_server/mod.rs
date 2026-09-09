@@ -1,3 +1,4 @@
+pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
 pub mod models_sync;
@@ -6,6 +7,7 @@ pub mod payload;
 pub mod routes;
 pub mod server;
 pub mod sse;
+pub mod usage;
 
 use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
@@ -27,7 +29,6 @@ pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 /// API 服务器运行时共享状态（传入 axum State）
 pub struct ApiSharedState {
     pub pool: ApiPool,
-    pub api_key: String,
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
@@ -37,6 +38,33 @@ pub struct ApiSharedState {
     pub logger: ApiLogger,
     /// Debug 模式：开启后记录完整请求/响应到 API 日志
     pub debug_enabled: std::sync::atomic::AtomicBool,
+    /// 用量统计（内存累积，每次请求后落盘）
+    pub usage: Mutex<usage::UsageFile>,
+}
+
+impl ApiSharedState {
+    /// 记录一次请求用量并原子落盘；写盘失败静默忽略，不影响主流程
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record(
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+        );
+        usage::save(&self.data_dir, &guard);
+    }
 }
 
 /// 上游错误分类（与 Phase 1 冷却状态机对齐）

@@ -110,6 +110,8 @@ export interface GroupView {
   color: string;
   order: number;
   count: number;
+  /** 组内账号 uid 列表（账号池分组筛选实时预览用） */
+  uids: string[];
 }
 
 export type JwtStatus = 'ok' | 'warn' | 'expired' | 'unknown';
@@ -132,6 +134,8 @@ export interface Settings {
   proxy_port: number;
   theme: string;
   launch_minimized: boolean;
+  /** 启动静默签到：启动 60s 后对未签到账号自动执行一轮签到 */
+  silent_checkin: boolean;
   auto_start_proxy: boolean;
   tray: boolean;
   language: string;
@@ -145,7 +149,6 @@ export interface Settings {
   proxy_domains: string;
   proxy_log_path: string | null;
   api_port: number;
-  api_key: string;
   api_default_model: string;
 }
 
@@ -177,6 +180,14 @@ export interface CheckinDone {
   already: number;
   failed: number;
   total?: number;
+}
+
+/** 单日签到结果趋势点（Dashboard 堆叠图） */
+export interface CheckinTrendPoint {
+  date: string;
+  ok: number;
+  already: number;
+  failed: number;
 }
 
 export interface CreditRecord {
@@ -241,6 +252,53 @@ export interface PoolStatus {
 
 export interface ApiPoolFile {
   enabled_uids: string[];
+  /** 调度策略：expire_first（默认）/ credit_first / random */
+  strategy?: string;
+  /** 参与调度的分组 id 列表；空 = 不限分组 */
+  group_ids?: string[];
+}
+
+/** 用量统计计数（按模型/账号/Key 维度） */
+export interface UsageCounterView {
+  name: string;
+  requests: number;
+  ok: number;
+  errors: number;
+}
+
+/** 按 Key 的 token 用量 */
+export interface UsageKeyTokenView {
+  name: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+/** 单日用量统计（api_usage_stats 返回，按日期升序） */
+export interface UsageDayView {
+  date: string;
+  total_requests: number;
+  ok: number;
+  errors: number;
+  stream_requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  avg_duration_ms: number;
+  models: UsageCounterView[];
+  accounts: UsageCounterView[];
+  keys: UsageCounterView[];
+  key_tokens: UsageKeyTokenView[];
+}
+
+/** API Key 条目（data/api_keys.json；daily_limit=0 表示不限） */
+export interface ApiKeyEntry {
+  id: string;
+  name: string;
+  key: string;
+  enabled: boolean;
+  daily_limit: number;
+  created_at: number;
+  used_date: string;
+  used_today: number;
 }
 
 // ---- 登录态快照 ----

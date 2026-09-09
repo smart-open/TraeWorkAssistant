@@ -434,6 +434,11 @@ def main():
     parser = argparse.ArgumentParser(description="Trae Work 多账号自动签到")
     parser.add_argument("--json-stream", action="store_true", help="以 NDJSON 输出每账号结果")
     parser.add_argument("--accounts", default="", help="仅签指定 UserID（逗号分隔）")
+    parser.add_argument(
+        "--accounts-file",
+        default=None,
+        help="账号文件路径（桌面端提供的解密临时文件；缺省用 data/checkin_accounts.json）",
+    )
     parser.add_argument("--scope", default="all", help="兼容参数（all|group:<id>）")
     parser.add_argument("--retry", type=int, default=0, help="签到网络失败时的重试次数")
     args = parser.parse_args()
@@ -448,7 +453,8 @@ def main():
     print("Trae Work 多账号自动签到")
     print("=" * 60)
 
-    accounts_cfg = load_json(ACCOUNTS_FILE, default={"accounts": []})
+    accounts_path = args.accounts_file or ACCOUNTS_FILE
+    accounts_cfg = load_json(accounts_path, default={"accounts": []})
     accounts = accounts_cfg.get("accounts", [])
 
     if not accounts:

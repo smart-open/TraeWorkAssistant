@@ -8,6 +8,37 @@ use crate::models::{CooldownEntry, DeviceMap, PoolStatus};
 
 use super::ErrKind;
 
+/// 账号池调度策略（T10）
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum PoolStrategy {
+    /// 积分先过期优先（默认，保持既有行为）
+    #[default]
+    ExpireFirst,
+    /// 剩余通用积分多优先
+    CreditFirst,
+    /// 随机取号
+    Random,
+}
+
+impl PoolStrategy {
+    /// 解析配置字符串（空/未知值回退 expire_first）
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "credit_first" => Self::CreditFirst,
+            "random" => Self::Random,
+            _ => Self::ExpireFirst,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExpireFirst => "expire_first",
+            Self::CreditFirst => "credit_first",
+            Self::Random => "random",
+        }
+    }
+}
+
 /// 池中单个账号的运行时状态
 pub struct PoolEntry {
     pub uid: String,
@@ -39,6 +70,7 @@ impl PoolEntry {
 /// 账号池：内存索引 + 冷却/禁用状态机
 pub struct ApiPool {
     entries: Mutex<HashMap<String, PoolEntry>>,
+    strategy: Mutex<PoolStrategy>,
 }
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
@@ -50,14 +82,24 @@ impl ApiPool {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            strategy: Mutex::new(PoolStrategy::ExpireFirst),
         }
     }
 
-    /// 从已有账号文件同步池：只加入 enabled_uids 中的账号
+    /// 设置调度策略（启动时由 api_pool.json 决定）
+    pub fn set_strategy(&self, s: PoolStrategy) {
+        *safe_lock(&self.strategy) = s;
+    }
+
+    /// 从已有账号文件同步池：只加入 enabled_uids 中的账号；
+    /// group_ids 非空时仅纳入所选分组的账号（未分组账号不参与，T10）
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_from_accounts(
         &self,
         accounts: &[crate::models::RawAccount],
         enabled_uids: &[String],
+        group_ids: &[String],
+        membership: &HashMap<String, String>,
         cooldowns: &HashMap<String, CooldownEntry>,
         remaining_credits: &HashMap<String, f64>,
         expire_times: &HashMap<String, i64>,
@@ -66,10 +108,23 @@ impl ApiPool {
         let mut entries = safe_lock(&self.entries);
         entries.clear();
         let enabled: HashSet<&str> = enabled_uids.iter().map(|s| s.as_str()).collect();
+        let group_filter: Option<HashSet<&str>> = if group_ids.is_empty() {
+            None
+        } else {
+            Some(group_ids.iter().map(|s| s.as_str()).collect())
+        };
         for a in accounts {
             if let Some(uid) = &a.user_id {
                 if !enabled.contains(uid.as_str()) {
                     continue;
+                }
+                if let Some(filter) = &group_filter {
+                    let in_group = membership
+                        .get(uid)
+                        .map_or(false, |g| filter.contains(g.as_str()));
+                    if !in_group {
+                        continue;
+                    }
                 }
                 let cd = cooldowns.get(uid).cloned().unwrap_or_default();
                 let disabled = cd.error_type == "SessionDead";
@@ -103,49 +158,23 @@ impl ApiPool {
         }
     }
 
-    /// 挑选 healthy 账号中积分过期时间最近者；跳过 tried
+    /// 按当前策略挑选 healthy 账号；跳过 tried
     /// llm_utils_chat 消耗通用积分(product_id 208)
     /// 零积分账号会被跳过，避免无效请求
     pub fn pick_excluding(&self, tried: &HashSet<String>) -> Option<PickedAccount> {
         let entries = safe_lock(&self.entries);
+        let strategy = *safe_lock(&self.strategy);
         let now = now_ts();
-        let mut best: Option<&PoolEntry> = None;
-        for (uid, e) in entries.iter() {
-            if tried.contains(uid) || !e.healthy(now) {
-                continue;
-            }
-            // 跳过积分已过期的（expire_time=0 视为无过期时间，不跳过）
-            if let Some(exp) = e.credits_expire_at {
-                if exp > 0 && exp < now {
-                    continue;
-                }
-            }
-            // 跳过零通用积分账号（通用积分耗尽，llm_utils_chat 无法使用）
-            if let Some(c) = e.credits {
-                if c <= 0.0 {
-                    continue;
-                }
-            }
-            match best {
-                None => best = Some(e),
-                Some(b) => {
-                    let be = b.credits_expire_at.is_some();
-                    let ee = e.credits_expire_at.is_some();
-                    if ee && !be {
-                        best = Some(e);
-                    } else if ee && be {
-                        if e.credits_expire_at < b.credits_expire_at {
-                            best = Some(e);
-                        } else if e.credits_expire_at == b.credits_expire_at {
-                            if e.credits.unwrap_or(0.0) > b.credits.unwrap_or(0.0) {
-                                best = Some(e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        best.map(|e| PickedAccount {
+        let cands: Vec<&PoolEntry> = entries
+            .values()
+            .filter(|e| selectable(e, tried, now))
+            .collect();
+        // Random 用纳秒级时间做种子（无需密码学随机，仅打散取号顺序）
+        let rand_seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            .unwrap_or(0);
+        pick_by_strategy(&cands, strategy, rand_seed).map(|e| PickedAccount {
             uid: e.uid.clone(),
             jwt: e.jwt.clone(),
             device_id: e.device_id.clone(),
@@ -287,6 +316,63 @@ pub struct PickedAccount {
     pub machine_id: String,
 }
 
+/// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分
+fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64) -> bool {
+    if tried.contains(&e.uid) || !e.healthy(now) {
+        return false;
+    }
+    // 跳过积分已过期的（expire_time=0 视为无过期时间，不跳过）
+    if let Some(exp) = e.credits_expire_at {
+        if exp > 0 && exp < now {
+            return false;
+        }
+    }
+    // 跳过零通用积分账号（通用积分耗尽，llm_utils_chat 无法使用）
+    if let Some(c) = e.credits {
+        if c <= 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// 按策略从候选集中挑选（纯函数，便于单测）
+fn pick_by_strategy<'a>(
+    cands: &[&'a PoolEntry],
+    strategy: PoolStrategy,
+    rand_seed: u64,
+) -> Option<&'a PoolEntry> {
+    if cands.is_empty() {
+        return None;
+    }
+    match strategy {
+        PoolStrategy::Random => Some(cands[(rand_seed as usize) % cands.len()]),
+        PoolStrategy::CreditFirst => cands.iter().copied().max_by(|a, b| {
+            a.credits
+                .unwrap_or(0.0)
+                .partial_cmp(&b.credits.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        PoolStrategy::ExpireFirst => cands.iter().copied().min_by(|a, b| {
+            // 有过期时间者优先（现状语义）→ 更早过期优先 → 平手积分多者优先
+            let ha = a.credits_expire_at.map_or(false, |t| t > 0);
+            let hb = b.credits_expire_at.map_or(false, |t| t > 0);
+            hb.cmp(&ha)
+                .then_with(|| {
+                    a.credits_expire_at
+                        .unwrap_or(0)
+                        .cmp(&b.credits_expire_at.unwrap_or(0))
+                })
+                .then_with(|| {
+                    b.credits
+                        .unwrap_or(0.0)
+                        .partial_cmp(&a.credits.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        }),
+    }
+}
+
 fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -310,4 +396,168 @@ pub(crate) fn seeded_hex(n: usize, seed: &str, salt: &str) -> String {
     out.truncate((n + 1) / 2);
     out.iter().map(|b| format!("{:02x}", b)).collect::<String>()
         .chars().take(n).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acct(name: &str, uid: &str) -> crate::models::RawAccount {
+        crate::models::RawAccount {
+            name: name.to_string(),
+            user_id: Some(uid.to_string()),
+            jwt: String::new(),
+            refresh_token: None,
+            added_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// 建池：accounts 为 (uid, credits, expire) 三元组，全部 enabled
+    fn build_pool(entries: &[(&str, f64, i64)]) -> ApiPool {
+        let pool = ApiPool::new();
+        let accounts: Vec<crate::models::RawAccount> = entries
+            .iter()
+            .map(|(uid, _, _)| acct(uid, uid))
+            .collect();
+        let enabled: Vec<String> = entries.iter().map(|(uid, _, _)| uid.to_string()).collect();
+        let mut credits = HashMap::new();
+        let mut expires = HashMap::new();
+        for (uid, c, e) in entries {
+            credits.insert(uid.to_string(), *c);
+            expires.insert(uid.to_string(), *e);
+        }
+        pool.sync_from_accounts(
+            &accounts,
+            &enabled,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &credits,
+            &expires,
+            &HashMap::new(),
+        );
+        pool
+    }
+
+    #[test]
+    fn strategy_parse_defaults_to_expire_first() {
+        assert_eq!(PoolStrategy::parse(""), PoolStrategy::ExpireFirst);
+        assert_eq!(PoolStrategy::parse("unknown"), PoolStrategy::ExpireFirst);
+        assert_eq!(PoolStrategy::parse("credit_first"), PoolStrategy::CreditFirst);
+        assert_eq!(PoolStrategy::parse("random"), PoolStrategy::Random);
+        assert_eq!(PoolStrategy::default(), PoolStrategy::ExpireFirst);
+    }
+
+    #[test]
+    fn expire_first_prefers_soonest_expiry() {
+        // 两个都有过期时间（均在未来）：更早过期者胜
+        let pool = build_pool(&[
+            ("uid_a", 100.0, 4_000_001_000),
+            ("uid_b", 100.0, 3_900_000_000),
+        ]);
+        pool.set_strategy(PoolStrategy::ExpireFirst);
+        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+        assert_eq!(picked.uid, "uid_b");
+        // 排除后取另一个
+        let mut tried = HashSet::new();
+        tried.insert("uid_b".to_string());
+        let picked = pool.pick_excluding(&tried).unwrap();
+        assert_eq!(picked.uid, "uid_a");
+    }
+
+    #[test]
+    fn expire_first_prefers_has_expiry_and_more_credits_on_tie() {
+        // 有过期时间者优先于无过期时间
+        let pool = build_pool(&[("uid_a", 999.0, 0), ("uid_b", 10.0, 4_000_000_000)]);
+        pool.set_strategy(PoolStrategy::ExpireFirst);
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+        // 过期时间相同：积分多者胜
+        let pool = build_pool(&[
+            ("uid_a", 50.0, 4_000_000_000),
+            ("uid_b", 200.0, 4_000_000_000),
+        ]);
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+    }
+
+    #[test]
+    fn credit_first_prefers_more_credits() {
+        let pool = build_pool(&[
+            ("uid_a", 50.0, 3_900_000_000),
+            ("uid_b", 300.0, 4_000_000_000),
+        ]);
+        pool.set_strategy(PoolStrategy::CreditFirst);
+        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+        assert_eq!(picked.uid, "uid_b");
+    }
+
+    #[test]
+    fn random_strategy_only_picks_candidates() {
+        let pool = build_pool(&[
+            ("uid_a", 50.0, 3_900_000_000),
+            ("uid_b", 300.0, 4_000_000_000),
+        ]);
+        pool.set_strategy(PoolStrategy::Random);
+        // 连续取号（排除已选）能遍历完所有候选后枯竭
+        let mut tried = HashSet::new();
+        for _ in 0..2 {
+            let p = pool.pick_excluding(&tried).unwrap();
+            tried.insert(p.uid);
+        }
+        assert!(pool.pick_excluding(&tried).is_none());
+    }
+
+    #[test]
+    fn zero_credit_and_expired_are_skipped() {
+        // 零积分账号不参与取号
+        let pool = build_pool(&[("uid_a", 0.0, 0), ("uid_b", 10.0, 0)]);
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+        // 积分已过期账号不参与取号（now 之后才会过期的不受影响）
+        let pool = build_pool(&[("uid_a", 10.0, 1), ("uid_b", 10.0, 0)]);
+        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+    }
+
+    #[test]
+    fn group_filter_excludes_unselected_groups() {
+        let pool = ApiPool::new();
+        let accounts = vec![acct("A", "uid_a"), acct("B", "uid_b"), acct("C", "uid_c")];
+        let enabled: Vec<String> = vec!["uid_a".into(), "uid_b".into(), "uid_c".into()];
+        let mut membership = HashMap::new();
+        membership.insert("uid_a".to_string(), "g1".to_string());
+        membership.insert("uid_b".to_string(), "g2".to_string());
+        // uid_c 未分组
+        pool.sync_from_accounts(
+            &accounts,
+            &enabled,
+            &["g2".to_string()],
+            &membership,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(pool.count(), 1);
+        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+        assert_eq!(picked.uid, "uid_b");
+    }
+
+    #[test]
+    fn empty_group_filter_keeps_all() {
+        let pool = ApiPool::new();
+        let accounts = vec![acct("A", "uid_a"), acct("B", "uid_b")];
+        let enabled: Vec<String> = vec!["uid_a".into(), "uid_b".into()];
+        let mut membership = HashMap::new();
+        membership.insert("uid_a".to_string(), "g1".to_string());
+        pool.sync_from_accounts(
+            &accounts,
+            &enabled,
+            &[], // 空 = 不限分组（旧配置默认行为）
+            &membership,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(pool.count(), 2);
+    }
 }

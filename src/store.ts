@@ -25,12 +25,23 @@ export interface Toast {
   msg: string;
 }
 
+export interface CheckinRetryInfo {
+  /** 第几轮重试（1 起） */
+  round: number;
+  /** 本轮重试的失败账号数 */
+  total: number;
+  /** 本轮开始时刻（Date.now() 毫秒），用于倒计时展示 */
+  until: number;
+}
+
 export interface CheckinState {
   active: boolean;
   total: number;
   index: number;
   results: CheckinAccountResult[];
   done: CheckinDone | null;
+  /** 失败自动重试状态（非 null 时展示重试横幅/倒计时） */
+  retry: CheckinRetryInfo | null;
 }
 
 export interface LogQuery {
@@ -131,6 +142,7 @@ function defaultSettings(): Settings {
     proxy_port: 8899,
     theme: 'system',
     launch_minimized: false,
+    silent_checkin: false,
     auto_start_proxy: true,
     tray: true,
     language: 'zh-CN',
@@ -144,7 +156,6 @@ function defaultSettings(): Settings {
     proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com',
     proxy_log_path: null,
     api_port: 7864,
-    api_key: '',
     api_default_model: 'deepseek-v4-flash',
   };
 }
@@ -169,7 +180,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   savingLogin: null,
   deviceResetProgress: [],
   deviceResetActive: false,
-  checkin: { active: false, total: 0, index: 0, results: [], done: null },
+  checkin: { active: false, total: 0, index: 0, results: [], done: null, retry: null },
   toasts: [],
   profiles: [],
   profileProgress: [],
@@ -293,8 +304,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   applyCheckinEvent: (e) => {
     set((s) => {
       if (e.type === 'start') {
+        // 重试轮也会发 start（仅含失败账号）：保留 retry 横幅，重置进度列表
         return {
-          checkin: { active: true, total: e.total, index: 0, results: [], done: null },
+          checkin: { active: true, total: e.total, index: 0, results: [], done: null, retry: s.checkin.retry },
+        };
+      }
+      if (e.type === 'retry') {
+        return {
+          checkin: {
+            ...s.checkin,
+            active: true,
+            retry: { round: e.round, total: e.total, until: Date.now() + e.delay * 1000 },
+          },
         };
       }
       if (e.type === 'account') {
@@ -319,6 +340,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         checkin: {
           ...s.checkin,
           active: false,
+          retry: null,
           done: { ok: e.ok, already: e.already, failed: e.failed, total: e.total },
         },
       };
@@ -596,7 +618,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   startCheckin: async (opts) => {
     // 重置签到状态，避免显示上一次的进度
-    set({ checkin: { active: true, total: 0, index: 0, results: [], done: null } });
+    set({ checkin: { active: true, total: 0, index: 0, results: [], done: null, retry: null } });
     try {
       await api.checkin.start(opts);
     } catch (err) {

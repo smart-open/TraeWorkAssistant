@@ -4,8 +4,10 @@ import type {
   AccountView,
   ApiServiceStatus,
   ApiPoolFile,
+  ApiKeyEntry,
   CheckinDone,
   CheckinOpts,
+  CheckinTrendPoint,
   AppEntitlement,
   CreditDetail,
   CreditRecord,
@@ -26,6 +28,7 @@ import type {
   Settings,
   UpdateCheckResult,
   UpdateDownloadProgress,
+  UsageDayView,
 } from '../types';
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
@@ -84,9 +87,15 @@ export const api = {
   },
   checkin: {
     start: (opts: CheckinOpts) => invoke('checkin_start', { opts }),
+    /** 近 N 天签到结果趋势（默认 30 天，按日期升序） */
+    trends: (days?: number) => invoke<CheckinTrendPoint[]>('checkin_trends', { days }),
   },
   misc: {
     deviceReset: (userId: string) => invoke('device_reset', { userId }),
+    /** 查询开机自启状态（注册表 Run 项） */
+    autostartStatus: () => invoke<boolean>('autostart_status'),
+    /** 设置开机自启（即时生效） */
+    autostartSet: (enabled: boolean) => invoke('autostart_set', { enabled }),
     jwtParse: (jwt: string) => invoke<JwtParseResult>('jwt_parse', { jwt }),
     logsQuery: (opts: {
       logType?: string;
@@ -102,6 +111,8 @@ export const api = {
           limit: opts.limit,
         },
       }),
+    /** 清理指定类型日志文件（all 为全清），返回删除的文件数 */
+    logsClear: (logType: string) => invoke<number>('logs_clear', { logType }),
     settingsGet: () => invoke<Settings>('settings_get'),
     settingsSet: (patch: Settings) => invoke('settings_set', { patch }),
     creditsHistory: () => invoke<CreditRecord[]>('credits_history'),
@@ -151,7 +162,8 @@ export const api = {
     stop: () => invoke('api_server_stop'),
     status: () => invoke<ApiServiceStatus>('api_server_status'),
     poolList: () => invoke<ApiPoolFile>('pool_list'),
-    poolSet: (uids: string[]) => invoke('pool_set', { uids }),
+    poolSet: (uids: string[], strategy?: string, groupIds?: string[]) =>
+      invoke('pool_set', { uids, strategy, groupIds }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
     logsList: () => invoke<string[]>('api_logs_list'),
     logsDetail: (date: string) => invoke<string | null>('api_logs_detail', { date }),
@@ -172,6 +184,10 @@ export const api = {
     debugStatus: () => invoke<boolean>('api_debug_status'),
     modelsList: () => invoke<ModelOption[]>('api_models_list'),
     modelsSync: () => invoke<ModelOption[]>('api_models_sync'),
+    usageStats: (days?: number) =>
+      invoke<UsageDayView[]>('api_usage_stats', { days: days ?? 14 }),
+    keysList: () => invoke<ApiKeyEntry[]>('api_keys_list'),
+    keysSave: (keys: ApiKeyEntry[]) => invoke('api_keys_save', { keys }),
   },
   traeLocal: {
     entitlement: () => invoke<AppEntitlement | null>('apps_entitlement_read'),
@@ -218,9 +234,20 @@ export interface CheckinDoneEvent {
   failed: number;
   total?: number;
 }
+/** 失败重试轮次事件（Rust 层发起，最多 2 轮，间隔逐轮加长） */
+export interface CheckinRetryEvent {
+  type: 'retry';
+  /** 第几轮重试（1 起） */
+  round: number;
+  /** 本轮开始前的等待秒数 */
+  delay: number;
+  /** 本轮重试的失败账号数 */
+  total: number;
+}
 export type CheckinProgressEvent =
   | CheckinStartEvent
   | CheckinAccountEvent
+  | CheckinRetryEvent
   | CheckinDoneEvent;
 
 export interface SwitchDoneEvent {
