@@ -111,27 +111,25 @@
 
 ## 10. API 服务（v2.0 新增）
 
-### `api_server_start(port, api_key, default_model)` → `{ ok, error? }`
-- 启动内嵌 axum HTTP 服务，监听指定端口（默认 7864）。
-- `api_key` 留空时跳过 Bearer Token 鉴权。
-- `default_model` 为默认对话模型（如 `deepseek-v4-flash`）。支持模型：`deepseek-v4-flash`、`deepseek-v4-pro`、`glm-5.2`、`glm-5.3`、`doubao-seed-2.1-pro`、`doubao-seed-2.1-turbo`、`minimax-m3`、`kimi-k2.7-code` 等（大小写不敏感）。
+### `api_server_start()` → `ApiServiceStatus`
+- 启动内嵌 axum HTTP 服务，监听端口与默认模型由设置页「接口配置」提供（`api_port` / `api_default_model`）。
+- 鉴权统一由「API Keys 管理」列表决定（见第 17 节）：未配置启用 Key 时不鉴权。
 - 应用退出时自动停止服务释放端口。
 
 ### `api_server_stop()` → `{ ok }`
 - 停止 API 服务。
 
-### `api_server_status()` → `{ running: boolean, port: number, api_key: string, default_model: string, pool_size: number }`
-- 返回 API 服务运行状态和账号池信息。
+### `api_server_status()` → `ApiServiceStatus`
+- 返回 API 服务运行状态（`running` / `port` / `total_requests` / `active_uid` / `last_error` 等），不再返回 `api_key`（T15 主 Key 已移除）。
 
-### `api_pool_list()` → `PoolAccount[]`
-- 返回可选入账号池的账号列表。
-- `PoolAccount`: `{ userId, name, selected: boolean, remainingCredits: number|null, cooldown: CooldownInfo|null }`
+### `pool_list()` → `ApiPoolFile`
+- 返回账号池配置：`{ enabled_uids: string[], strategy: string, group_ids: string[] }`（T10 扩展）。
 
-### `api_pool_set(userIds)` → `{ ok }`
-- 设置账号池选中的账号（持久化到 `api_pool.json`）。
+### `pool_set(uids, strategy?, group_ids?)` → `{ ok }`
+- 设置账号池选中账号与调度策略 / 分组筛选（T10），持久化到 `api_pool.json`；详见第 17 节。
 
-### `api_pool_status()` → `{ accounts: PoolAccount[], activeAccount: string|null, totalRequests: number }`
-- 返回账号池详细状态。
+### `pool_status()` → `PoolStatus[]`
+- 返回账号池实时状态（`uid` / `name` / `credits` / `disabled` / `cooling` / `cooldown_reason` / `err_count`）。
 
 ---
 
@@ -202,3 +200,36 @@
 - 成功后原子写回新的 `accessToken` + `refresh_token` 到 `checkin_accounts.json`，返回新 JWT。
 - 使用 `jwt_refresh_lock` 防止并发刷新，持锁后 double-check 文件防止重复刷新。
 - 无 `refresh_token` 的账号返回错误（需手动重新捕获 JWT）。
+---
+
+## 17. 优化 T1-T11 新增命令（自 trae_work_main 手工移植）
+
+### `checkin_trends(days?)` → `CheckinTrendPoint[]`
+- 近 N 天签到结果按日汇总（默认 30），`CheckinTrendPoint`: `{ date, ok, already, failed }`。
+- 数据源 `data/checkin_results.json`（per-uid 最终态按日落库，保留 90 天，重试轮覆盖为最终态）。
+
+### `api_usage_stats(days?)` → `UsageDayView[]`
+- 网关用量按日统计（默认 14，上限 90），直读落盘，服务未运行也可查询。
+- 数据源 `data/api_usage.json`：按 日期 / 模型 / 上游账号 / API Key / 流式 / 成败 / 耗时 / token 多维聚合，保留 90 天。
+
+### `api_keys_list()` → `ApiKeyEntry[]` / `api_keys_save(keys)` → `{ ok }`
+- 多 API Key 列表管理（T2）。`ApiKeyEntry`: `{ id, name, key, enabled, daily_limit, created_at, used_date, used_today }`。
+- 鉴权统一走 Key 列表（T15：主 Key 双轨已移除）；无启用 Key 时不鉴权（携带未知 Key 放行记 anonymous）；`daily_limit=0` 不限，跨天自动重置计数，超限返回 429 + 可读 message；每请求重读文件，增删 / 启停立即生效。
+
+### `logs_clear(log_type)` → `u32`
+- 按类型删除日志文件（`all` / `proxy` / `checkin` / `switch`），返回删除数量；文件不存在视为成功（幂等）。
+
+### `autostart_status()` → `bool` / `autostart_set(enabled)` → `{ ok }`
+- 开机自启查询 / 开关（tauri-plugin-autostart），即时生效，安装版 / 便携版均写当前 exe 路径。
+- 配套 `settings.silent_checkin`：开启后应用启动延迟 60s 对未签到账号自动执行一轮签到（复用统一签到链路 + 防重入锁，`skip_checked_in=true` 幂等，完成发系统通知）。
+
+### 数据文件扩展
+
+| 数据文件 | 结构 | 说明 |
+|----------|------|------|
+| `conf/vault.stronghold` | Stronghold 快照 | jwt / refresh_token 权威存储（按 uid 键） |
+| `conf/vault_key.bin` | DPAPI 加密 blob | vault 主密码（32 字节，仅本机当前用户可解） |
+| `data/api_usage.json` | `{ days: { 日期: DayStats } }` | 用量统计，保留 90 天 |
+| `data/api_keys.json` | `{ keys: ApiKeyEntry[] }` | Key 列表 + 当日用量记账 |
+| `data/checkin_results.json` | `{ days: { 日期: { accounts: { uid: 结果 } } } }` | 签到最终态，保留 90 天 |
+| `data/api_pool.json`（扩展） | `{ enabled_uids, strategy, group_ids }` | 旧文件无新字段时默认行为不变 |

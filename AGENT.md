@@ -100,7 +100,8 @@ ai-work-assistant/
 | OAuth | `oauth_get_login_url()` → `{ url }` | 构造 Trae 登录 URL |
 | OAuth | `oauth_parse_callback(callback_url)` → `{ user_id, ... }` | 解析回调 URL 中的 token |
 | 分组 | `groups_list` / `group_create` / `group_update` / `group_delete` / `group_move` | 删除分组时账号回落「未分组」 |
-| 签到 | `checkin_start(opts)` → NDJSON 事件 | `opts: { scope, user_ids?, skip_checked_in, skip_expired }` |
+| 签到 | `checkin_start(opts)` → NDJSON 事件 | `opts: { scope, user_ids?, skip_checked_in, skip_expired }`；失败自动重试最多 2 轮（30s/90s，T5） |
+| 签到 | `checkin_trends(days?)` → `CheckinTrendPoint[]` | 近 N 天签到结果按日汇总（T8，data/checkin_results.json，保留 90 天） |
 | 切换 | `switch_account(userId)` | 调 `trae-switch-bridge.ps1 -Action Switch`（进程三级关闭策略） |
 | 切换 | `reset_device_ids(userId)` | switch 模块：重置设备指纹（区别于 misc 的 `device_reset` 只删映射） |
 | 保存 | `save_current_login(userId)` | 调 `trae-switch-bridge.ps1 -Action SaveCurrentLogin` |
@@ -114,12 +115,16 @@ ai-work-assistant/
 | 设备 | `device_reset(userId)` | 删 `device_map.json[ uid ]` |
 | JWT | `jwt_parse(jwt)` / `refresh_jwt(userId)` | 解析 / 自动刷新（需 refresh_token） |
 | API | `api_server_start(port)` / `api_server_stop()` / `api_server_status()` | API 网关启停 |
-| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理 |
+| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy` / `group_ids`（T10 调度策略与分组筛选） |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
 | API | `api_models_list()` / `api_models_sync()` | 模型列表读取（data/api_models.json）/ 官网同步（不消耗积分，最多试 3 账号） |
 | API | `api_logs_list(...)` / `api_logs_detail(...)` / `api_logs_search(...)` | API 请求日志查询 / 详情 / 搜索 |
+| API | `api_usage_stats(days?)` → `UsageDayView[]` | 网关用量按日统计（T1，data/api_usage.json，保留 90 天，直读落盘） |
+| API | `api_keys_list()` / `api_keys_save(keys)` | 多 API Key 列表管理（T2，data/api_keys.json，每日配额；主 Key 双轨已移除） |
 | 日志 | `logs_query({ opts: { log_type, date, keyword, limit } })` → `LogLine[]` | `split_time` 会 strip BOM 前缀 |
+| 日志 | `logs_clear(log_type)` → `u32` | 按类型删除日志文件（all/proxy/checkin/switch，T6，幂等） |
 | 设置 | `settings_get()` / `settings_set(patch: Settings)` | Settings 全部 snake_case |
+| 设置 | `autostart_status()` / `autostart_set(enabled)` | 开机自启查询 / 开关（T11，即时生效）；配套 `settings.silent_checkin` 启动静默签到 |
 | 计划 | `task_register(time)` / `task_status()` / `task_unregister()` | `schtasks` 注册每日签到 |
 | 更新 | `update_check()` / `update_download(...)` → `UpdateDownloaded` / `update_run_installer({file_path, asset_name})` | 两步确认制：下载（确认一）→ 安装（确认二）。安装器参数 `/P /UPDATE /R`：被动进度条 + 跳过卸载直接覆盖 + 完成后自动重启应用；`run_installer` 校验路径必须位于临时更新目录 |
 
