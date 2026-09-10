@@ -17,7 +17,8 @@ pub const USAGE_FILE: &str = "api_usage.json";
 pub const RETENTION_DAYS: i64 = 90;
 
 /// 请求命中的 API Key 标识（鉴权中间件解析后插入 request extensions，
-/// handler 取出用于按 Key 维度记账；服务未启用鉴权时为 "anonymous"）
+/// handler 取出用于按 Key 维度记账；未配置启用 Key 的请求会被中间件拒绝，不会到达 handler。
+/// "anonymous" 仅作 routes.rs 取值失败的防御性兜底，正常流程不会出现）
 #[derive(Clone, Debug)]
 pub struct KeyId(pub String);
 
@@ -82,7 +83,7 @@ pub struct DayStats {
     /// 按上游账号统计（"none" 表示未取到账号，如无健康账号）
     #[serde(default)]
     pub accounts: HashMap<String, Counter>,
-    /// 按 API Key 统计（"anonymous" 表示服务未启用鉴权）
+    /// 按 API Key 统计（正常流程均有 Key；"anonymous" 仅历史数据/兜底）
     #[serde(default)]
     pub keys: HashMap<String, Counter>,
     /// 按 API Key 统计 token 用量：(prompt, completion)

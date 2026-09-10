@@ -136,6 +136,9 @@ interface AppState {
 let toastSeq = 0;
 // 已注册的事件监听取消函数；StrictMode 下 init 会执行两次，靠它先注销旧监听避免重复注册
 let unsubs: Array<() => void> = [];
+// 日志查询并发序号（最新请求胜出）与连续失败 toast 去重标记
+let logsReqSeq = 0;
+let logsErrToasted = false;
 
 function defaultSettings(): Settings {
   return {
@@ -416,6 +419,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   refreshLogs: async (q) => {
+    // 最新请求胜出：旧响应直接丢弃，防止慢响应覆盖新数据
+    // （日志页 2s 轮询与手动查询/筛选切换可能并发）
+    const seq = ++logsReqSeq;
     try {
       const logs = await api.misc.logsQuery({
         logType: q?.logType,
@@ -423,9 +429,17 @@ export const useAppStore = create<AppState>((set, get) => ({
         keyword: q?.keyword,
         limit: q?.limit ?? 500,
       });
+      if (seq !== logsReqSeq) return;
       set({ logs });
+      logsErrToasted = false; // 恢复成功后重置，下次失败可再次提示
     } catch (err) {
-      get().pushToast('error', `读取日志失败：${String(err)}`);
+      if (seq !== logsReqSeq) return;
+      // 失败去风暴：连续失败只弹一次 toast（恢复成功后重置），
+      // 避免文件锁/权限异常期间每 2s 弹一次无法消除
+      if (!logsErrToasted) {
+        logsErrToasted = true;
+        get().pushToast('error', `读取日志失败：${String(err)}`);
+      }
     }
   },
   refreshCreditsHistory: async () => {

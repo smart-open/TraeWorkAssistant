@@ -344,6 +344,8 @@ export interface UpdateCheckResult {
   download_url: string;
   /** 资产字节数 */
   size: number;
+  /** 发布方 SHA-256（取自 release 校验清单 latest.json，下载完成后强制比对） */
+  sha256: string;
   release_page: string;
 }
 

@@ -8,7 +8,10 @@
 //   Trae Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选）
 //
 // 流程：update_check 拉取 releases 列表 → 过滤 2.x.x → 取最大版本与 CARGO_PKG_VERSION 比较；
+//       同时下载该 release 的校验清单 latest.json（发布脚本 rename_release.py 生成并随 Release 上传），
+//       取出安装包的发布方 SHA-256（fail-closed：清单缺失/损坏即阻止自动更新，引导手动下载）；
 //       update_download 下载资产到临时目录（emit update-download-progress），
+//       下载完成后与发布方 SHA-256 比对（不匹配即删除并报错），
 //       update_run_installer 启动 NSIS 被动安装（/P /UPDATE /R），应用退出由安装器接管。
 
 use serde::Serialize;
@@ -21,6 +24,9 @@ use tauri::{AppHandle, Emitter};
 const RELEASES_API: &str =
     "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
 const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
+
+/// 发布校验清单资产名（scripts/rename_release.py 生成，随 Release 上传）
+const MANIFEST_ASSET: &str = "latest.json";
 
 /// 下载临时目录（安装命令只允许执行此目录内的更新包，防止任意路径执行）
 const UPDATE_TEMP_DIR: &str = "trae-work-assistant-update";
@@ -59,6 +65,8 @@ pub struct UpdateCheckResult {
     pub download_url: String,
     /// 资产字节数
     pub size: u64,
+    /// 发布方 SHA-256（取自 release 校验清单 latest.json，下载完成后强制比对）
+    pub sha256: String,
     pub release_page: String,
 }
 
@@ -249,6 +257,116 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
         .map(|(name, url, size, _)| (name, url, size))
 }
 
+// ---------------- 发布校验清单（latest.json） ----------------
+
+/// 发布校验清单结构（scripts/rename_release.py 生成并随 Release 上传）：
+/// `{ "version": "2.9.2", "assets": { "<资产文件名>": "<sha256hex>" } }`
+#[derive(serde::Deserialize)]
+struct UpdateManifest {
+    version: String,
+    assets: std::collections::BTreeMap<String, String>,
+}
+
+/// 64 位十六进制 SHA-256 格式校验
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 宽松键：仅保留 ASCII 字母数字（小写），其余字符一律折叠为单个 '_'。
+/// GitHub 上传会重写资产名（空格 → '.'、非 ASCII 字符 → '_'，
+/// 如 "Trae Work 助手_2.9.2_x64-setup.exe" → "Trae.Work._2.9.2_x64-setup.exe"），
+/// 清单键保存的是本地文件名，用宽松键对两侧归一后即可匹配。
+fn relaxed_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_underscore = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_underscore = false;
+        } else if !last_underscore {
+            out.push('_');
+            last_underscore = true;
+        }
+    }
+    out
+}
+
+/// 从清单中查找资产的 SHA-256（不存在或格式非法返回 None）：
+/// 先按原始文件名精确匹配，再用宽松键归一匹配（兼容 GitHub 的资产名重写）。
+fn lookup_manifest_hash(m: &UpdateManifest, asset_name: &str) -> Option<String> {
+    if let Some(h) = m.assets.get(asset_name).filter(|h| is_sha256_hex(h)) {
+        return Some(h.to_ascii_lowercase());
+    }
+    let key = relaxed_key(asset_name);
+    m.assets
+        .iter()
+        .find(|(k, _)| relaxed_key(k) == key)
+        .map(|(_, h)| h.to_ascii_lowercase())
+        .filter(|h| is_sha256_hex(h))
+}
+
+/// 下载并解析 release 的校验清单，返回目标资产的发布方 SHA-256。
+/// fail-closed：清单缺失、版本不符、损坏或未收录该资产时返回 Err 阻止自动更新（引导手动下载）。
+fn fetch_manifest_hash(
+    assets: &[serde_json::Value],
+    asset_name: &str,
+    expected_ver: (u64, u64, u64),
+) -> Result<String, String> {
+    let url = assets
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name").and_then(|v| v.as_str())?;
+            (name == MANIFEST_ASSET)
+                .then(|| a.get("browser_download_url").and_then(|v| v.as_str()))
+                .flatten()
+        })
+        .next()
+        .ok_or_else(|| {
+            format!("新版本缺少校验清单（{MANIFEST_ASSET}），为防安装包被篡改已阻止自动更新。请手动下载：{RELEASES_PAGE}")
+        })?;
+
+    // 小文件：连接 10s + 整体 20s，逐通道尝试（系统代理 → 环境变量代理 → 直连）
+    let mut text: Option<String> = None;
+    let mut last_err = String::new();
+    for (label, agent) in attempt_agents(|b| {
+        b.timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build()
+    }) {
+        match agent
+            .get(url)
+            .set("User-Agent", "trae-work-assistant-updater")
+            .call()
+        {
+            Ok(resp) => {
+                let mut s = String::new();
+                match resp.into_reader().read_to_string(&mut s) {
+                    Ok(_) => {
+                        text = Some(s);
+                        break;
+                    }
+                    Err(e) => last_err = format!("[{label}] 读取失败: {e}"),
+                }
+            }
+            Err(e) => last_err = format!("[{label}] {e}"),
+        }
+    }
+    let text = text
+        .ok_or_else(|| format!("下载校验清单失败（{last_err}），请重试或手动下载：{RELEASES_PAGE}"))?;
+
+    let manifest: UpdateManifest = serde_json::from_str(&text).map_err(|e| {
+        format!("校验清单损坏（{MANIFEST_ASSET} 解析失败: {e}），已阻止自动更新。请手动下载：{RELEASES_PAGE}")
+    })?;
+    if parse_version(&manifest.version) != Some(expected_ver) {
+        return Err(format!(
+            "校验清单版本（{}）与目标版本不一致，已阻止自动更新。请手动下载：{RELEASES_PAGE}",
+            manifest.version
+        ));
+    }
+    lookup_manifest_hash(&manifest, asset_name)
+        .ok_or_else(|| format!("校验清单中未收录该安装包的 SHA-256，已阻止自动更新。请手动下载：{RELEASES_PAGE}"))
+}
+
 /// 检查 GitHub Releases 上的最新 2.x.x 版本，与当前应用版本比较。
 /// 仓库中 v3.x.x 是另一产品线，直接忽略（不能用 releases/latest，会被 3.x 遮蔽）。
 /// async 派发：网络重试最坏 90s（3 通道 × 30s），同步命令默认跑主线程会冻住 UI。
@@ -306,6 +424,12 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         )
     })?;
 
+    // 发布方完整性校验（S1 insecure_update 纵深防御）：
+    // 下载校验清单 latest.json 取该资产的发布方 SHA-256，fail-closed——
+    // 清单缺失/损坏/未收录时直接报错阻止自动更新，引导手动下载。
+    // 必须在回填重命名之前查找：哈希绑定的是 release 里的原始资产文件名。
+    let expected_sha = fetch_manifest_hash(&assets, &asset_name, latest)?;
+
     // 版本回填：资产名版本低于 tag 版本 → 按目标版本重命名资产名，
     // 下载时写入临时目录的文件名随之更新，版本前置校验才能通过。
     // 注意必须「替换」倒数第二段版本段（而非追加后缀）：
@@ -337,12 +461,15 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         asset_name,
         download_url,
         size,
+        sha256: expected_sha,
         release_page: RELEASES_PAGE.to_string(),
     })
 }
 
 /// 下载更新包到临时目录（仅下载，不安装），返回落盘路径。
 /// 进度经 update-download-progress 事件回推；安装由前端确认后调用 update_run_installer。
+/// `expected_sha256` 为发布方清单（latest.json）给出的安装包摘要，下载完成后强制比对，
+/// 不匹配即删除并报错（S1 insecure_update：更新包完整性校验，fail-closed）。
 /// async 派发：下载耗时不可控（最坏 3 通道各连+读超时），同步命令跑主线程会冻住 UI。
 #[tauri::command(async)]
 pub fn update_download(
@@ -350,7 +477,14 @@ pub fn update_download(
     download_url: String,
     asset_name: String,
     expected_version: String,
+    expected_sha256: String,
 ) -> Result<String, String> {
+    // 防御：发布方摘要必须为合法 SHA-256 格式（update_check 已 fail-closed 保证存在，此处双保险）
+    let expected_sha = expected_sha256.trim().to_ascii_lowercase();
+    if !is_sha256_hex(&expected_sha) {
+        return Err("发布方 SHA-256 缺失或格式非法，已中止下载。请重新检查更新，或手动下载安装".to_string());
+    }
+
     // 防御：资产名里的版本必须与检查结果一致，且大于当前版本
     let asset_ver = version_from_asset(&asset_name)
         .ok_or_else(|| format!("资产名无法解析版本号: {asset_name}"))?;
@@ -390,11 +524,18 @@ pub fn update_download(
     }) {
         match download_via(&app, &agent, &download_url, &dest) {
             Ok(received) => {
-                // 完整性校验：计算 SHA-256 摘要并记录，安装时二次校验
+                // 完整性校验：先与发布方清单（latest.json）比对——不匹配即删除并中止；
+                // 通过后计算摘要记录，安装时再二次校验（防下载后被替换）
                 let sha = file_sha256(&dest).map_err(|e| {
                     let _ = std::fs::remove_file(&dest);
                     e
                 })?;
+                if sha != expected_sha {
+                    let _ = std::fs::remove_file(&dest);
+                    return Err(format!(
+                        "更新包校验失败（SHA-256 与发布清单不一致），已拒绝安装并删除下载文件。\n请重试或手动下载：{RELEASES_PAGE}"
+                    ));
+                }
                 if let Ok(mut last) = LAST_DOWNLOAD.lock() {
                     *last = Some(DownloadedUpdate {
                         file_path: dest.to_string_lossy().to_string(),
@@ -533,4 +674,74 @@ pub fn update_run_installer(app: AppHandle, path: String) -> Result<(), String> 
     );
     std::thread::sleep(Duration::from_millis(800));
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_hex_format() {
+        let h = "a".repeat(64);
+        assert!(is_sha256_hex(&h));
+        assert!(is_sha256_hex(&"0123456789ABCDEF".repeat(4)));
+        assert!(!is_sha256_hex(&"a".repeat(63))); // 不足 64 位
+        assert!(!is_sha256_hex(&"g".repeat(64))); // 非十六进制字符
+        assert!(!is_sha256_hex(""));
+    }
+
+    #[test]
+    fn manifest_parse_and_exact_lookup() {
+        let text = r#"{
+            "version": "2.9.2",
+            "assets": {
+                "Trae Work 助手_2.9.2_x64-setup.exe": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "Trae Work 助手_2.9.2_x64_portable.zip": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+            }
+        }"#;
+        let m: UpdateManifest = serde_json::from_str(text).unwrap();
+        assert_eq!(parse_version(&m.version), Some((2, 9, 2)));
+        // 清单键为本地文件名（含空格），按原样可精确命中
+        let h = lookup_manifest_hash(&m, "Trae Work 助手_2.9.2_x64-setup.exe").unwrap();
+        assert_eq!(h, "a".repeat(64));
+        // 未收录 / 哈希格式非法 → None
+        assert!(lookup_manifest_hash(&m, "Trae Work 助手_2.9.2_x64_zh-CN.msi").is_none());
+        assert!(lookup_manifest_hash(&m, "不存在.exe").is_none());
+    }
+
+    #[test]
+    fn manifest_lookup_normalizes_github_asset_name() {
+        // GitHub 上传会重写资产名：空格 → '.'、非 ASCII（助手）→ '_'
+        let text = r#"{
+            "version": "2.9.2",
+            "assets": {
+                "Trae Work 助手_2.9.2_x64-setup.exe": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            }
+        }"#;
+        let m: UpdateManifest = serde_json::from_str(text).unwrap();
+        let gh_name = "Trae.Work._2.9.2_x64-setup.exe";
+        let h = lookup_manifest_hash(&m, gh_name).unwrap();
+        assert_eq!(h, "a".repeat(64));
+        // 大小写归一：GitHub 侧哈希为大写时同样命中
+        let text2 = r#"{
+            "version": "2.9.2",
+            "assets": {
+                "Trae Work 助手_2.9.2_x64-setup.exe": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }"#;
+        let m2: UpdateManifest = serde_json::from_str(text2).unwrap();
+        assert_eq!(lookup_manifest_hash(&m2, gh_name).unwrap(), "a".repeat(64));
+        // 无论清单侧大小写，输出统一小写
+        assert_eq!(
+            lookup_manifest_hash(&m, gh_name).unwrap(),
+            lookup_manifest_hash(&m2, gh_name).unwrap()
+        );
+    }
+
+    #[test]
+    fn manifest_version_mismatch_detected() {
+        let text = r#"{ "version": "2.8.2", "assets": {} }"#;
+        let m: UpdateManifest = serde_json::from_str(text).unwrap();
+        assert_ne!(parse_version(&m.version), Some((2, 9, 2)));
+    }
 }

@@ -140,7 +140,7 @@ trae-work-assistant/
 │   ├── account_cooldowns.json    # 签到错误冷却状态（error_type + cooldown_until）
 │   ├── checkin_results.json      # 每日签到结果（per-uid 最终态，重试轮自然合并；保留 90 天）
 │   ├── api_pool.json             # API 账号池配置（strategy/group_ids）+ 状态
-│   ├── api_keys.json             # 多 API Key（id/name/key/enabled/daily_limit，0=不限；启用 Key 为空则不鉴权）
+│   ├── api_keys.json             # 多 API Key（id/name/key/enabled/daily_limit，0=不限；启用 Key 为空则拒绝所有业务请求 401）
 │   ├── api_usage.json            # API 用量按日聚合（日期/协议/模型/账号/Key/成败/流式/耗时；保留 90 天）
 │   ├── api_models.json           # 模型列表（官网同步 ∪ 内置补集；含 function 自学习覆盖）
 │   └── profiles/                 # 登录态快照
@@ -221,14 +221,15 @@ trae-work-assistant/
   3. **提交**：按 11.1 规则升位并 commit
   4. **推送分支**
   5. **打 tag 并推送**：`git tag -a vX.Y.Z -m "vX.Y.Z 版本发布"` + `git push origin vX.Y.Z`
-  6. **发布 Release**：创建 `vX.Y.Z 版本发布` release（notes 取自 CHANGELOG 对应条目），并上传 3 个资产：`*_x64-setup.exe`（NSIS）、`*_x64_portable.zip`、`*_x64_zh-CN.msi`——Release 不带资产则自更新无法安装
+  6. **发布 Release**：创建 `vX.Y.Z 版本发布` release（notes 取自 CHANGELOG 对应条目），并上传 4 个资产：`*_x64-setup.exe`（NSIS）、`*_x64_portable.zip`、`*_x64_zh-CN.msi`、`latest.json`（校验清单，rename_release.py 生成）——Release 不带资产则自更新无法安装；缺 `latest.json` 时更新器 fail-closed 拒绝自动更新（S1 更新包完整性校验）
 
 ## 12. 安全与合规
 
 - **零外发**：不连接任何自有后端。
 - **CA 证书**：仅本地回环 `127.0.0.1:8899`，自签根 CA 需 UAC 安装。
 - **UAC**：仅在 `cert_install` 提权，切换桥已改为普通用户可运行。
-- **API Key**：留空时跳过 Bearer Token 鉴权；配置时在前端掩码显示（前 4 + 后 4 + ****）。
+- **API Key**：多 Key 列表管理（data/api_keys.json）；未配置任何启用 Key 时 API 服务默认拒绝所有业务请求（401 auth_not_configured，防本机任意进程无鉴权消耗上游额度），仅 /health 豁免；前端掩码显示（前 4 + 后 4 + ****）。
+- **更新包完整性**：Release 必须附带 `latest.json` 校验清单（各资产 SHA-256，rename_release.py 生成）；更新器下载后强制比对，不匹配拒绝安装；安装前再与下载记录二次比对（防替换）。
 - **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。
 
 ## 13. 禁止与红线（Do NOT）

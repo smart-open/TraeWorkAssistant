@@ -886,7 +886,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
 
         {apiKeys.length === 0 ? (
           <p className="py-4 text-center text-sm text-slate-400">
-            暂无 Key — 添加后客户端凭 Key 调用，未配置启用 Key 时不鉴权
+            暂无 Key — 添加并启用 Key 后客户端凭 Key 调用；未配置启用 Key 时 API 服务拒绝所有请求（401）
           </p>
         ) : (
           <div className="overflow-x-auto">

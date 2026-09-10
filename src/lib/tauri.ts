@@ -194,7 +194,7 @@ export const api = {
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),
-    download: (p: { downloadUrl: string; assetName: string; expectedVersion: string }) =>
+    download: (p: { downloadUrl: string; assetName: string; expectedVersion: string; expectedSha256: string }) =>
       invoke<string>('update_download', p),
     runInstaller: (path: string) => invoke<void>('update_run_installer', { path }),
     onDownloadProgress: async (

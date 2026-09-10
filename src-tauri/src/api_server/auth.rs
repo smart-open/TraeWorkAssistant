@@ -14,7 +14,8 @@ use super::ApiSharedState;
 /// - /health 跳过鉴权
 /// - Key 统一在 data/api_keys.json 列表中维护（带每日配额），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
-/// - 未配置任何启用的 Key 时不鉴权：一律放行并记为 anonymous（携带未知 Key 亦放行，兼容关闭鉴权场景）
+/// - 未配置任何启用的 Key 时默认拒绝所有业务请求（401 auth_not_configured）：
+///   防止本机任意进程无鉴权借用用户上游凭证消耗额度（S2 missing_authz，fail-closed）
 /// - Key 每次命中即累加当日用量并写盘，超配额返回 429
 /// - 每次请求重读 api_keys.json：新增/删除/禁用立即生效
 /// 校验通过后向 request extensions 插入命中的 Key 标识（KeyId），供 handler 用量记账
@@ -42,15 +43,13 @@ pub async fn bearer_auth(
         .map(|s| s.to_string());
     let presented = bearer.or(xkey);
 
-    // 存在启用的 Key 时才要求鉴权
+    // 未配置任何启用的 Key → 默认拒绝（不区分是否携带 Key），提示先配置
     let mut keys: ApiKeysFile = api_keys::load(&state.data_dir);
-    let auth_required = keys.has_enabled();
+    if !keys.has_enabled() {
+        return auth_not_configured();
+    }
 
     let Some(presented) = presented else {
-        if !auth_required {
-            request.extensions_mut().insert(KeyId("anonymous".into()));
-            return next.run(request).await;
-        }
         return (StatusCode::UNAUTHORIZED, "missing api key").into_response();
     };
 
@@ -59,21 +58,28 @@ pub async fn bearer_auth(
         KeyCheck::Ok(id) => {
             api_keys::save(&state.data_dir, &keys);
             request.extensions_mut().insert(KeyId(id));
-            return next.run(request).await;
+            next.run(request).await
         }
-        KeyCheck::QuotaExceeded { limit } => {
-            return quota_exceeded(limit);
-        }
-        KeyCheck::Invalid => {}
+        KeyCheck::QuotaExceeded { limit } => quota_exceeded(limit),
+        KeyCheck::Invalid => (StatusCode::UNAUTHORIZED, "invalid api key").into_response(),
     }
-    // 未配置任何鉴权时放行携带未知 Key 的请求并记为 anonymous：
-    // 与旧版「无 Key 即全放行」行为一致，兼容用户关闭鉴权后客户端仍带着旧 Key 的场景
-    if !auth_required {
-        request.extensions_mut().insert(KeyId("anonymous".into()));
-        return next.run(request).await;
-    }
+}
 
-    (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
+/// 401 未配置鉴权响应（JSON 错误体，OpenAI/Anthropic 客户端均可解析 message）
+fn auth_not_configured() -> Response {
+    let body = json!({
+        "error": {
+            "message": "API 服务未配置任何启用的 API Key，已拒绝请求（防止本机任意进程无鉴权调用）。请在 Trae Work 助手「API 服务」页的「API Keys 管理」中添加并启用 Key",
+            "type": "auth_not_configured",
+            "code": "auth_not_configured",
+        }
+    });
+    (
+        StatusCode::UNAUTHORIZED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// 429 配额超限响应（JSON 错误体，OpenAI/Anthropic 客户端均可解析 message）

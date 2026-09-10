@@ -92,6 +92,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
         downloadUrl: info.download_url,
         assetName: info.asset_name,
         expectedVersion: info.latest_version,
+        expectedSha256: info.sha256,
       })
       .then((path) => openRef.current && setUpd({ k: 'downloaded', info, path }))
       .catch((e) => openRef.current && setUpd({ k: 'error', msg: String(e) }));

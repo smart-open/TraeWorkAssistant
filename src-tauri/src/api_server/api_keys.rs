@@ -1,7 +1,7 @@
 //! 多 API Key 管理与每日配额。
 //!
 //! 数据落盘 `data/api_keys.json`；`daily_limit = 0` 表示不限。
-//! 所有 Key 统一在列表中维护（无主/子之分）；未配置任何启用的 Key 时不鉴权。
+//! 所有 Key 统一在列表中维护（无主/子之分）；未配置任何启用的 Key 时拒绝所有业务请求（fail-closed）。
 //! 每次鉴权命中 Key 即累加当日用量并原子写盘（与 usage.rs 同策略：个人频率低）。
 
 use std::path::{Path, PathBuf};
