@@ -43,7 +43,7 @@ pub async fn bearer_auth(
     let presented = bearer.or(xkey);
 
     // 存在启用的 Key 时才要求鉴权
-    let mut keys: ApiKeysFile = api_keys::load(&state.data_dir);
+    let keys: ApiKeysFile = api_keys::load(&state.data_dir);
     let auth_required = keys.has_enabled();
 
     let Some(presented) = presented else {
@@ -54,10 +54,9 @@ pub async fn bearer_auth(
         return (StatusCode::UNAUTHORIZED, "missing api key").into_response();
     };
 
-    // 校验 Key（含每日配额 + F-35 按日统计）
-    match keys.verify_and_consume(&presented, &super::usage::today_key()) {
+    // 校验 Key（含每日配额 + F-35 按日统计）；读-改-写走进程级锁（审查 P1-2）
+    match api_keys::verify_and_consume_locked(&state.data_dir, &presented, &super::usage::today_key()) {
         KeyCheck::Ok(rk) => {
-            api_keys::save(&state.data_dir, &keys);
             let id = rk.id.clone();
             request.extensions_mut().insert(rk);
             request.extensions_mut().insert(KeyId(id));

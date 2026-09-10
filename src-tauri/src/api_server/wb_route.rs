@@ -738,6 +738,16 @@ fn internal_error_response() -> Response {
         .unwrap()
 }
 
+/// 字符边界安全截断（审查 P2-2）：字节落点在多字节字符内时回退到前一个边界，
+/// 而非返回整个串（避免超长上游响应体整段进入错误消息/日志）
 fn safe_slice(s: &str, n: usize) -> &str {
-    s.get(..n).unwrap_or(s)
+    if let Some(t) = s.get(..n) {
+        return t;
+    }
+    // n 落在字符边界内：向前找最近的合法边界（最多回退 3 字节，UTF-8 最长 4 字节）
+    let mut end = n.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }

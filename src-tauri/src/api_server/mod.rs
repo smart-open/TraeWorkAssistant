@@ -63,6 +63,10 @@ pub struct ApiSharedState {
     pub debug_enabled: std::sync::atomic::AtomicBool,
     /// 用量统计（内存累积，每次请求后落盘）
     pub usage: Mutex<usage::UsageFile>,
+    /// WB 上游健康探针（F-34 ④/§2.2 频控）：最近探测 Unix 毫秒；-1 = 尚未探测
+    pub wb_probe_ts_ms: std::sync::atomic::AtomicI64,
+    /// WB 上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
+    pub wb_probe_ok: std::sync::atomic::AtomicI64,
 }
 
 impl ApiSharedState {

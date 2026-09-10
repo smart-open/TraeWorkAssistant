@@ -149,37 +149,52 @@ def _billing_urls(domain):
             base + "/v2/billing/meter/get-user-resource")
 
 
-def fetch_credits_once(creds, acct_id=None):
-    """一次取数：三件套（带 web 头）→ 全 401 刷新一次仅重试失败分支 → 旧接口回退。
-    summary 只取余额不产包（其容量字段是池级汇总，入包会制造脏行）。
-    返回 (packages, balance, source, new_creds|None)"""
-    headers = wb.build_auth_headers(creds, web_platform=True)
-    summary_url, paid_url, free_url, old_url = _billing_urls(creds.get("domain", ""))
+def _fetch_round(headers, urls):
+    """单轮三件套取数；返回 (pkgs, balance, net_down)——net_down=全部网络不可达"""
     pkgs = []
     balance = None
     saw_auth = False
-    for url in (summary_url, paid_url, free_url):
+    net_down = True
+    for url in urls:
         status, body, _ = wb.post_json(url, headers, {})
+        if status == 0:
+            continue  # 网络不可达 → 尝试下一个（供双探测判定）
+        net_down = False
         if status == 401:
             saw_auth = True
             continue
         if status == 200 and isinstance(body, dict):
-            if url == summary_url:
+            if url == urls[0]:
                 balance = _balance_from_summary(body)
             else:
                 pkgs.extend(_packages_from(body))
+    return pkgs, balance, saw_auth, net_down
+
+
+def fetch_credits_once(creds, acct_id=None):
+    """一次取数：三件套（带 web 头）→ 全 401 刷新一次仅重试失败分支 → 旧接口回退。
+    主域名整体网络不可达时切备用域名重试一轮（§2.2 域名双探测，仅一次、不循环）。
+    summary 只取余额不产包（其容量字段是池级汇总，入包会制造脏行）。
+    返回 (packages, balance, source, new_creds|None)"""
+    headers = wb.build_auth_headers(creds, web_platform=True)
+    summary_url, paid_url, free_url, old_url = _billing_urls(creds.get("domain", ""))
+    pkgs, balance, saw_auth, net_down = _fetch_round(headers, (summary_url, paid_url, free_url))
+    if net_down and not pkgs and balance is None:
+        # 双探测（§2.2）：主域名网络不可达 → 备用域名重试一轮
+        alt_base = wb.billing_bases(creds.get("domain", ""))[-1]
+        summary_url, paid_url, free_url, old_url = (
+            alt_base + "/billing/meter/get-user-resource-summary",
+            alt_base + "/billing/meter/get-user-resource-paid-packages",
+            alt_base + "/billing/meter/get-user-resource-free-packages",
+            alt_base + "/v2/billing/meter/get-user-resource",
+        )
+        pkgs, balance, saw_auth, net_down = _fetch_round(headers, (summary_url, paid_url, free_url))
     new_creds = None
     if saw_auth and not pkgs and balance is None:
         new_creds = wb.refresh_token_once(creds)
         if new_creds:
             headers = wb.build_auth_headers(new_creds, web_platform=True)
-            for url in (summary_url, paid_url, free_url):
-                status, body, _ = wb.post_json(url, headers, {})
-                if status == 200 and isinstance(body, dict):
-                    if url == summary_url:
-                        balance = _balance_from_summary(body)
-                    else:
-                        pkgs.extend(_packages_from(body))
+            pkgs, balance, saw_auth, _ = _fetch_round(headers, (summary_url, paid_url, free_url))
     if pkgs or balance is not None:
         return pkgs, balance, "cloud", new_creds
     # 旧接口回退（F-20）

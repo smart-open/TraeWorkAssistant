@@ -157,7 +157,19 @@ fn bump_daily_stats(e: &mut ApiKeyEntry, today: &str) {
 impl ApiKeysFile {
     /// 按呈现的 Key 校验并记账（命中即 +1 + 按日统计）。调用方负责把结果写盘。
     pub fn verify_and_consume(&mut self, presented: &str, today: &str) -> KeyCheck {
-        let Some(e) = self.keys.iter_mut().find(|k| k.enabled && k.key == presented) else {
+        // 常量时间比较（审查 P2-3）：对两侧求 sha256 再比对，避免逐字节提前返回泄露前缀匹配长度
+        let digest = |s: &str| {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(s.as_bytes());
+            h.finalize()
+        };
+        let pd = digest(presented);
+        let Some(e) = self
+            .keys
+            .iter_mut()
+            .find(|k| k.enabled && digest(&k.key) == pd)
+        else {
             return KeyCheck::Invalid;
         };
         if let Err(limit) = quota_left(e, today) {
@@ -221,6 +233,20 @@ pub fn load(data_dir: &Path) -> ApiKeysFile {
 /// 原子写盘
 pub fn save(data_dir: &Path, f: &ApiKeysFile) {
     let _ = fs_utils::write_json(&keys_path(data_dir), f);
+}
+
+/// 进程级写锁（审查 P1-2）：api_keys.json 的「读-改-写」（verify 记账 + save）必须
+/// 原子完成，否则并发请求互相覆盖 used_today/daily_stats——配额可被穿透、统计少记。
+static KEYS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 鉴权记账原子操作：锁内 load → verify_and_consume → save。
+/// auth 中间件每请求调用本函数，禁止绕开锁直接 load+save。
+pub fn verify_and_consume_locked(data_dir: &Path, presented: &str, today: &str) -> KeyCheck {
+    let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = load(data_dir);
+    let r = f.verify_and_consume(presented, today);
+    save(data_dir, &f);
+    r
 }
 
 #[cfg(test)]

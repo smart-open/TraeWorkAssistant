@@ -282,6 +282,15 @@ def is_global_region(domain):
     return ".workbuddy.ai" in (domain or "")
 
 
+def billing_bases(domain):
+    """域名双探测（§2.2 接口稳定性）：主域名在前、备用域名在后。
+    腾讯可能整体迁移 API 域名（codebuddy.cn ↔ workbuddy.ai），
+    主域名网络不可达时调用方应依次尝试备用域名。"""
+    main = region_billing_base(domain)
+    alt = BILLING_BASE_GLOBAL if main == BILLING_BASE_CN else BILLING_BASE_CN
+    return [main, alt]
+
+
 def refresh_token_once(creds: dict):
     """调 plugin refresh 端点（X-Refresh-Token 仅允许出现在此端点）。
     返回新 creds dict 或 None（失败原因可从返回 None 后由调用方按 401 判定）"""

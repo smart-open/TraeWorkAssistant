@@ -1627,10 +1627,31 @@ fn wb_chat_backup_root(state: &AppState) -> PathBuf {
     state.data_dir.join("data").join("workbuddy_chats")
 }
 
+/// 会话三件套命令的 user_id 入参防护（审查 P0-1）：路径段只允许池内账号 id，
+/// 且必须匹配白名单字符集——杜绝 `..`/绝对路径/分隔符注入导致的目录逃逸
+/// （backup 对该路径有 remove_dir_all，逃逸即任意目录删除，restore/info 可读任意路径）。
+fn wb_chat_uid_guard(state: &AppState, user_id: &str) -> Result<(), String> {
+    if user_id.is_empty()
+        || user_id.len() > 64
+        || !user_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || user_id.contains("..")
+    {
+        return Err(format!("非法账号标识: {user_id}"));
+    }
+    let pool = load_pool(state);
+    if !pool.accounts.iter().any(|a| a.id == user_id) {
+        return Err(format!("账号不在池中: {user_id}"));
+    }
+    Ok(())
+}
+
 /// 备份当前 ~/.workbuddy 会话三件套（先优雅关闭 WorkBuddy）。
 /// 覆盖式备份（保留最新一份），返回 {ok, files, path}。
 #[tauri::command(async)]
 pub fn workbuddy_chatdata_backup(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+    wb_chat_uid_guard(&state, &user_id)?;
     if !wb_data_dir().is_dir() {
         return Err("未找到 WorkBuddy 数据目录（~/.workbuddy），请先安装并登录".into());
     }
@@ -1640,13 +1661,15 @@ pub fn workbuddy_chatdata_backup(state: State<AppState>, user_id: String) -> Res
     crate::commands::process::graceful_kill_app("WorkBuddy")?;
 
     let dest_root = wb_chat_backup_root(&state).join(&user_id);
-    let _ = std::fs::remove_dir_all(&dest_root);
-    std::fs::create_dir_all(&dest_root).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    // 先写临时目录（.staging）：复制中断不毁旧备份；校验通过后原子替换（审查 P1-3）
+    let staging = wb_chat_backup_root(&state).join(format!("{user_id}.staging"));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| format!("创建备份目录失败: {e}"))?;
 
     // ① 会话正文整目录
     let files = crate::state::copy_dir_recursive(
         &wb_chats_dir(),
-        &dest_root.join("projects"),
+        &staging.join("projects"),
         &[],
     )?;
     // ②③ 双 db 快照（SQLite 文件级拷贝；客户端已关闭保证一致性）
@@ -1654,14 +1677,14 @@ pub fn workbuddy_chatdata_backup(state: State<AppState>, user_id: String) -> Res
     for db in ["workbuddy.db", "edge-sync-mapping-v2.db"] {
         let src = wb_data_dir().join(db);
         if src.is_file() {
-            std::fs::copy(&src, dest_root.join(db)).map_err(|e| format!("复制 {db} 失败: {e}"))?;
+            std::fs::copy(&src, staging.join(db)).map_err(|e| format!("复制 {db} 失败: {e}"))?;
             db_files += 1;
         }
     }
     // 三件套完整性：正文必须有，双 db 至少其一（旧版本客户端可能无 edge db）
     if files == 0 || db_files == 0 {
-        let _ = std::fs::remove_dir_all(&dest_root);
-        return Err("备份不完整（正文或 workbuddy.db 缺失），已回滚".into());
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("备份不完整（正文或 workbuddy.db 缺失），已放弃写入（旧备份保持原状）".into());
     }
     let meta = serde_json::json!({
         "schemaVersion": 1, "user_id": user_id, "files": files + db_files,
@@ -1669,9 +1692,15 @@ pub fn workbuddy_chatdata_backup(state: State<AppState>, user_id: String) -> Res
         "backedAt": fs_utils::now_ts(),
     });
     let _ = std::fs::write(
-        dest_root.join("chat_backup_meta.json"),
+        staging.join("chat_backup_meta.json"),
         serde_json::to_string_pretty(&meta).unwrap_or_default(),
     );
+    // 校验通过 → 替换旧份（旧份删除失败不致命：目录被占用时保留旧份，下次覆盖）
+    let _ = std::fs::remove_dir_all(&dest_root);
+    std::fs::rename(&staging, &dest_root).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging);
+        format!("备份目录替换失败: {e}")
+    })?;
     fs_utils::app_log(&state.data_dir, &format!("workbuddy: 会话三件套已备份 {user_id}（{files} 正文 + {db_files} db）"));
     Ok(serde_json::json!({ "ok": true, "files": files + db_files, "path": dest_root.display().to_string() }))
 }
@@ -1679,6 +1708,7 @@ pub fn workbuddy_chatdata_backup(state: State<AppState>, user_id: String) -> Res
 /// 恢复会话三件套到 ~/.workbuddy（先优雅关闭 WorkBuddy；恢复前自动快照现有数据到 .bak）。
 #[tauri::command(async)]
 pub fn workbuddy_chatdata_restore(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+    wb_chat_uid_guard(&state, &user_id)?;
     let backup = wb_chat_backup_root(&state).join(&user_id);
     if !backup.is_dir() {
         return Err(format!("该账号没有会话备份：{}", backup.display()));
@@ -1703,12 +1733,42 @@ pub fn workbuddy_chatdata_restore(state: State<AppState>, user_id: String) -> Re
         }
     }
 
-    let files = crate::state::copy_dir_recursive(&projects_backup, &wb_chats_dir(), &[])?;
+    // 恢复复制阶段失败 → 自动从 .bak 回滚（审查 P1-1：防"半恢复 + db 已挪走"悬挂态）
+    macro_rules! rollback_on_fail {
+        ($expr:expr, $msg:expr) => {
+            match $expr {
+                Ok(v) => v,
+                Err(e) => {
+                    // 回滚：projects.bak → projects、*.db.bak → *.db
+                    let bak = wb_data_dir().join("projects.bak");
+                    if bak.is_dir() {
+                        let _ = std::fs::remove_dir_all(wb_chats_dir());
+                        let _ = std::fs::rename(&bak, wb_chats_dir());
+                    }
+                    for db in ["workbuddy.db", "edge-sync-mapping-v2.db"] {
+                        let dbbak = wb_data_dir().join(format!("{db}.bak"));
+                        if dbbak.is_file() && !wb_data_dir().join(db).exists() {
+                            let _ = std::fs::rename(&dbbak, wb_data_dir().join(db));
+                        }
+                    }
+                    return Err(format!("{}: {e}（已自动回滚到恢复前现场）", $msg));
+                }
+            }
+        };
+    }
+
+    let files = rollback_on_fail!(
+        crate::state::copy_dir_recursive(&projects_backup, &wb_chats_dir(), &[]),
+        "恢复会话正文失败"
+    );
     let mut db_files = 0usize;
     for db in ["workbuddy.db", "edge-sync-mapping-v2.db"] {
         let src = backup.join(db);
         if src.is_file() {
-            std::fs::copy(&src, wb_data_dir().join(db)).map_err(|e| format!("恢复 {db} 失败: {e}"))?;
+            rollback_on_fail!(
+                std::fs::copy(&src, wb_data_dir().join(db)).map(|_| ()),
+                format!("恢复 {db} 失败").as_str()
+            );
             db_files += 1;
         }
     }
@@ -1722,6 +1782,7 @@ pub fn workbuddy_chatdata_restore(state: State<AppState>, user_id: String) -> Re
 /// 会话备份状态（供账号卡片展示：是否有备份 / 时间 / 体积）。
 #[tauri::command]
 pub fn workbuddy_chatdata_info(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+    wb_chat_uid_guard(&state, &user_id)?;
     let dir = wb_chat_backup_root(&state).join(&user_id);
     if !dir.is_dir() {
         return Ok(serde_json::json!({ "backed": false }));
@@ -1734,6 +1795,12 @@ pub fn workbuddy_chatdata_info(state: State<AppState>, user_id: String) -> Resul
         "backed_at": meta.get("backedAt").and_then(|s| s.as_str()),
         "has_edge_mapping": meta.get("has_edge_mapping").and_then(|b| b.as_bool()).unwrap_or(false),
     }))
+}
+
+/// SQL 标识符引号包裹（审查 P2-4）：内嵌双引号转义为两个双引号，防列名/表名
+/// 含 `"` 时拼接畸形 SQL（列名来自 PRAGMA table_info，非完全可控）
+fn sql_quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 // ── M8 会话复制/迁移·新 id 算法（F-45，批次3 T3.2）─────────────────────────
@@ -1911,7 +1978,7 @@ pub fn workbuddy_chatdata_copy(
                 for it in &mut items {
                     let sel = format!(
                         "SELECT {} FROM sessions WHERE id = ?1",
-                        cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ")
+                        cols.iter().map(|c| sql_quote_ident(c)).collect::<Vec<_>>().join(", ")
                     );
                     let Ok(mut stmt) = conn.prepare(&sel) else { continue };
                     let mut row_vals: Option<Vec<rusqlite::types::Value>> = None;
@@ -1927,7 +1994,7 @@ pub fn workbuddy_chatdata_copy(
                     let Some(vals) = row_vals else { continue };
                     // 组装 INSERT：id 列替换为新 UUID，其余整行复制
                     let id_idx = cols.iter().position(|c| c == "id").unwrap_or(0);
-                    let col_list = cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+                    let col_list = cols.iter().map(|c| sql_quote_ident(c)).collect::<Vec<_>>().join(", ");
                     let ph = vec!["?"; cols.len()].join(", ");
                     let ins = format!("INSERT OR IGNORE INTO sessions ({col_list}) VALUES ({ph})");
                     if let Ok(mut ins_stmt) = conn.prepare(&ins) {
@@ -1977,7 +2044,7 @@ pub fn workbuddy_chatdata_copy(
                 }
                 let cols: Vec<String> = {
                     let mut out = Vec::new();
-                    if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info(\"{table}\")")) {
+                    if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({})", sql_quote_ident(&table))) {
                         if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) {
                             for name in rows.flatten() {
                                 out.push(name);
@@ -1990,8 +2057,8 @@ pub fn workbuddy_chatdata_copy(
                     continue;
                 }
                 // 找出文本列中命中旧 channel 的行，整行克隆替换
-                let col_list = cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
-                let Ok(mut stmt) = conn.prepare(&format!("SELECT rowid, {col_list} FROM \"{table}\"")) else { continue };
+                let col_list = cols.iter().map(|c| sql_quote_ident(c)).collect::<Vec<_>>().join(", ");
+                let Ok(mut stmt) = conn.prepare(&format!("SELECT rowid, {col_list} FROM {}", sql_quote_ident(&table))) else { continue };
                 let mut hits: Vec<(i64, Vec<rusqlite::types::Value>)> = Vec::new();
                 if let Ok(mut rows) = stmt.query([]) {
                     while let Ok(Some(row)) = rows.next() {
@@ -2014,7 +2081,7 @@ pub fn workbuddy_chatdata_copy(
                 }
                 for (_, vals) in hits {
                     let ph = vec!["?"; cols.len()].join(", ");
-                    let ins = format!("INSERT OR IGNORE INTO \"{table}\" ({col_list}) VALUES ({ph})");
+                    let ins = format!("INSERT OR IGNORE INTO {} ({col_list}) VALUES ({ph})", sql_quote_ident(&table));
                     if let Ok(mut ins_stmt) = conn.prepare(&ins) {
                         let params: Vec<rusqlite::types::Value> = vals
                             .into_iter()

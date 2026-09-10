@@ -37,9 +37,9 @@ def _u(path):
     return _CURRENT_BASE[0] + path
 
 
-def _urls():
-    """当前账号区域下的全部端点（签到 + 成长中心，T4.5/F-36 §5.2）"""
-    b = _CURRENT_BASE[0]
+def _urls_for(base):
+    """指定基座下的全部端点（签到 + 成长中心，T4.5/F-36 §5.2）"""
+    b = base
     g = b + "/v2/activity/growth"
     return {
         "checkin_status": b + "/v2/billing/meter/checkin-activity-status",
@@ -56,6 +56,18 @@ def _urls():
         "energy": g + "/energy",
         "streak": g + "/streak",
     }
+
+
+def _urls():
+    """当前账号区域端点表"""
+    return _urls_for(_CURRENT_BASE[0])
+
+
+def _alt_urls():
+    """备用域名端点表（§2.2 域名双探测）：当前主域名网络不可达时切换重试一次"""
+    bases = wb.billing_bases(None)
+    alt = bases[1] if bases[0] == _CURRENT_BASE[0] else bases[0]
+    return _urls_for(alt)
 
 # 盲盒抽取循环上限（防接口异常时死循环；正常 balance 会归零）
 LOTTERY_MAX_DRAWS = 20
@@ -87,6 +99,11 @@ def checkin_status(headers, urls):
 def checkin_do(headers, urls):
     """执行签到。返回 (kind, message)：success / already / fail"""
     status, body, raw = wb.post_json(urls["checkin_do"], headers, {})
+    if status == 0:
+        # 域名双探测（§2.2）：主域名网络不可达 → 备用域名重试一次
+        alt = _alt_urls()["checkin_do"]
+        if alt != urls["checkin_do"]:
+            status, body, raw = wb.post_json(alt, headers, {})
     if status == 401:
         return "auth", "登录态失效（401）"
     code = None
@@ -196,7 +213,7 @@ def growth_travel(headers, urls):
     if status == 401:
         return "auth", "登录态失效（401）"
     if status != 200 or not isinstance(body, dict):
-        return "fail", "travel/status 不可用（HTTP %s）" % status if status else raw[:60]
+        return "fail", ("travel/status 不可用（HTTP %s）" % status) if status else ("travel/status 不可用: %s" % raw[:60])
     arrived = wb.dig(body, "arrived", "is_arrived", "has_arrived")
     record_id = wb.dig(body, "record_id", "recordId")
     if not arrived:
@@ -225,7 +242,7 @@ def growth_lottery(headers, urls):
     if status == 401:
         return "auth", "登录态失效（401）"
     if status != 200 or not isinstance(body, dict):
-        return "fail", "lottery/chances 不可用（HTTP %s）" % status if status else raw[:60]
+        return "fail", ("lottery/chances 不可用（HTTP %s）" % status) if status else ("lottery/chances 不可用: %s" % raw[:60])
     balance = wb.dig(body, "balance", "chances", "count", "remain")
     try:
         balance = int(balance)
@@ -254,7 +271,7 @@ def growth_tasks(headers, urls):
     if status == 401:
         return "auth", "登录态失效（401）"
     if status != 200 or not isinstance(body, dict):
-        return "fail", "tasks 不可用（HTTP %s）" % status if status else raw[:60]
+        return "fail", ("tasks 不可用（HTTP %s）" % status) if status else ("tasks 不可用: %s" % raw[:60])
     tasks = wb.dig(body, "tasks", "list", "records")
     if not isinstance(tasks, list):
         tasks = []

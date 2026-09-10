@@ -229,6 +229,8 @@ pub async fn do_start(
         logger: ApiLogger::new(state.logs_dir()),
         debug_enabled: std::sync::atomic::AtomicBool::new(false),
         usage: Mutex::new(crate::api_server::usage::load(&state.data_dir)),
+        wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
     });
 
     let handle = start_api_server(port, shared.clone()).await?;

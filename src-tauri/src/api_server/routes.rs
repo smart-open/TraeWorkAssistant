@@ -203,6 +203,9 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "accounts": wb_accounts,
             "model_cooldowns": model_cooldowns,
             "sticky_sessions": state.wb_sticky.len(),
+            // 上游健康探针（F-34 ④/§2.2）：-1 未探测 / 0 不可达 / 1 在线
+            "probe_ok": state.wb_probe_ok.load(std::sync::atomic::Ordering::Relaxed),
+            "probe_ts_ms": state.wb_probe_ts_ms.load(std::sync::atomic::Ordering::Relaxed),
         },
     }))
 }
