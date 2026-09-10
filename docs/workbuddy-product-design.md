@@ -85,7 +85,7 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 | F-15 ✅ | 一键签到：状态查询（旧路径回退）→ 执行 → `code:10001`/已签容错 → 401 刷新重试一次 | NDJSON 事件；零 token 输出；冷却复用 `account_cooldowns.json` |
 | F-16 ✅ | 签到调度增强（P1）：每日 09:00/21:00 双时段 schtasks；token 保活独立开关 | 定时可注册/查询/卸载；失败桌面通知 |
 | F-17 ✅ | 成长中心自动化（P1）：Buddy 旅行（状态/出发/领奖）、盲盒（次数/抽取）、任务领奖、能量、连签天数 | 全流程可单独开关；纯增量积分；奖励数额以接口返回为准不硬编码 |
-| F-18 | UI 坐标点击签到兜底（P3）：无 API 可用时的最后手段 | 仅手动触发，默认关闭 |
+| F-18 ✅ | UI 坐标点击签到兜底（P3）：无 API 可用时的最后手段 | 仅手动触发，默认关闭 |
 
 #### D. 积分余额与用量（P0/P1/P2）
 
@@ -96,8 +96,8 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 | F-21 | 本地 quota API 兜底（P2）：`GET 127.0.0.1:<port>/api/v1/quota` | 端口发现 = 扫 `~/.workbuddy/*.port` + 端口段探测；按 `remaining` 特征确认 |
 | F-25 ✅ | 官方用量统计（P2）：`get-user-request-usage` 日/周/月用量 | 与本地 token 统计并列展示 |
 | F-26 ✅ | 本地 token 统计（P2）：解析 `~/.workbuddy/projects` + `~/.codebuddy/projects` JSONL | input/output/cacheRead/cacheWrite/cacheHitRate，按模型/项目/会话聚合，days∈{7,30,90} |
-| F-27 | 积分用量快照回退（P3）：本地时序 + 签到日志推导每日用量 | 官方用量不可用时自动切换数据源并标注 |
-| F-51 | 活动信息展示（P3）：`/v2/activity/banner` + payment-type + dosage-notify | 低频附加展示 |
+| F-27 ✅ | 积分用量快照回退（P3）：本地时序 + 签到日志推导每日用量 | 官方用量不可用时自动切换数据源并标注 |
+| F-51 ✅ | 活动信息展示（P3）：`/v2/activity/banner` + payment-type + dosage-notify | 低频附加展示 |
 
 #### E. API 暴露与网关升级（P0/P1/P2）
 
@@ -118,7 +118,7 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 |---|---|---|
 | F-06 ✅ | CodeBuddy CLI 切号桥 + 积分到期自动轮换（P2）：维护 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN` | 自动轮换 = 切到「最早到期且仍有剩余」账号；防抖双约束（冷却期 + 到期差异阈值 min_gap_hours） |
 | F-37 | DSH provider（P2）：15 模型静态目录兜底 + 启动动态替换 | 元数据透传 inputModalities/supportedEfforts/倍率/徽章；能力读上游勿硬编码 |
-| F-40 | Codex 后端转换器（P2）：`/v1/responses` 投影 + Anthropic `/v1/messages` + OpenAI 兼容三协议一份 | `--desensitize` 脱敏、失败退回紧凑模式；Codex CLI `config.toml` 直配可用 |
+| F-40 ✅ | Codex 后端转换器（P2）：`/v1/responses` 投影 + Anthropic `/v1/messages` + OpenAI 兼容三协议一份 | `--desensitize` 脱敏、失败退回紧凑模式；Codex CLI `config.toml` 直配可用 |
 | F-42 | workbuddy-mcp 模式（P3）：把 WorkBuddy 注册为 Codex/CC/Cursor 的 MCP 工具 | `WB_SKIP_PERMISSIONS` 可控 |
 | F-43 | CC Switch 协同（P2）：把本项目转换端点注册进 CC Switch 配置 | 不自建切换器 |
 | F-52 | WorkBuddyProxy 模式（P3）：WorkBuddy 驾驶舱 + Codex 执行器 | 与 F-40 方向相反，远期评估 |
@@ -529,12 +529,12 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 
 | # | 任务 | 预估 |
 |---|---|---|
-| T4.1 | Codex `/v1/responses` 投影转换器 + 脱敏（F-40） | 2.5d |
-| T4.2 | UI 坐标点击签到兜底（F-18） | 1d |
-| T4.3 | 积分用量快照回退（F-27） | 1d |
-| T4.4 | 活动信息展示（F-51） | 0.5d |
-| T4.5 | Global 区上游域名路由（F-36）：domain 含 `.workbuddy.ai` 的账号全走 `www.workbuddy.ai` | 0.5d |
-| T4.6 | 批次 4 收尾审查 + 文档 + 分拆提交 | — |
+| T4.1 ✅ | Codex `/v1/responses` 投影转换器 + 脱敏（F-40） | 2.5d |
+| T4.2 ✅ | UI 坐标点击签到兜底（F-18） | 1d |
+| T4.3 ✅ | 积分用量快照回退（F-27） | 1d |
+| T4.4 ✅ | 活动信息展示（F-51） | 0.5d |
+| T4.5 ✅ | Global 区上游域名路由（F-36）：domain 含 `.workbuddy.ai` 的账号全走 `www.workbuddy.ai` | 0.5d |
+| T4.6 ✅ | 批次 4 收尾审查 + 文档 + 分拆提交 | — |
 
 > 顺延（批次 5/按需）：DSH provider（F-37）、CC Switch 协同（F-43）、quota 端口发现兜底（F-21）、workbuddy-mcp（F-42）、WorkBuddyProxy（F-52）、trae2codex（F-41）。
 
