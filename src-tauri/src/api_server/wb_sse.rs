@@ -492,6 +492,9 @@ pub fn stream_forward<L: Iterator<Item = String>>(
                         crate::api_server::routes::Protocol::Anthropic => unreachable!(),
                         crate::api_server::routes::Protocol::Responses => {
                             resp_ensure_created!();
+                            // created 帧已下发：后续流内错误必须就地 response.failed，
+                            // 不得再走「未发送数据」换号重试路径（否则客户端收到重复流）
+                            sent_any = true;
                             // 文本增量 → message 输出项 + output_text.delta
                             if let Some(t) = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
                                 if !resp_msg_open {
@@ -553,15 +556,7 @@ pub fn stream_forward<L: Iterator<Item = String>>(
         }
     }
 
-    // 上游断流但客户端尚无任何数据且无错误：不发 [DONE]，交由上层判定空响应
-    if error_info.is_none() && sent_any {
-        match proto {
-            crate::api_server::routes::Protocol::Anthropic => {}
-            _ => {
-                // 上游未发 [DONE] 就断流：补发收尾，避免客户端悬挂
-            }
-        }
-    }
+    // 上游断流：error_info / sent_any 状态交由上层判定（故障转移或已收尾）
 
     (error_info, sent_any, usage)
 }
@@ -881,5 +876,30 @@ mod tests {
         assert!(completed.contains("\"input_tokens\":3"));
         assert!(completed.contains("\"output_tokens\":2"));
         assert!(!body.contains("[DONE]"), "Responses 流不应出现 OpenAI [DONE] 帧");
+    }
+
+    /// 回归（F-40 审查修复）：文本已流出后遇错误帧 → created 已发即 sent_any=true，
+    /// 错误就地 response.failed，不返回 error_info（否则上层换号重试会造成重复流）
+    #[test]
+    fn stream_forward_responses_instream_error_after_content_fails_inplace() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"部分输出\"}}]}",
+            "",
+            "data: {\"error\":{\"message\":\"中途失败\",\"code\":1001}}",
+            "",
+        ]);
+        let (err, sent_any, _usage) =
+            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m");
+        assert!(err.is_none(), "流内错误已就地下发，不得上抛触发换号重试");
+        assert!(sent_any);
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(body.contains("event: response.created"));
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("中途失败"));
     }
 }

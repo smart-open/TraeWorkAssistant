@@ -191,6 +191,13 @@ pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str) -> Value {
         .and_then(|f| f.as_str())
         .unwrap_or("stop")
         .to_string();
+    // 截断（finish_reason=length）→ status=incomplete + incomplete_details（Responses 规范），
+    // 客户端据此区分「正常完成」与「max_output_tokens 截断」
+    let (status, incomplete_details) = if finish == "length" {
+        ("incomplete", json!({"reason": "max_output_tokens"}))
+    } else {
+        ("completed", Value::Null)
+    };
     let mut output: Vec<Value> = Vec::new();
     if let Some(t) = message.get("content").and_then(|c| c.as_str()) {
         if !t.is_empty() {
@@ -220,13 +227,13 @@ pub fn completion_to_responses(v: &Value, resp_id: &str, model: &str) -> Value {
         "id": resp_id,
         "object": "response",
         "created_at": now_ts(),
-        "status": "completed",
+        "status": status,
         "model": model,
         "output": output,
         "parallel_tool_calls": true,
         "tool_choice": "auto",
         "tools": [],
-        "incomplete_details": null,
+        "incomplete_details": incomplete_details,
         "error": null,
         "usage": {
             "input_tokens": it,
@@ -343,5 +350,23 @@ mod tests {
         assert_eq!(resp["output"][0]["type"], json!("function_call"));
         assert_eq!(resp["output"][0]["call_id"], json!("call_x"));
         assert_eq!(resp["stop_reason"], json!("tool_use"));
+    }
+
+    /// finish_reason=length（max_output_tokens 截断）→ status=incomplete + incomplete_details
+    #[test]
+    fn completion_maps_length_truncation_to_incomplete() {
+        let v = json!({
+            "choices": [{"index": 0, "finish_reason": "length",
+                         "message": {"role": "assistant", "content": "truncat"}}],
+        });
+        let resp = completion_to_responses(&v, "resp_3", "m");
+        assert_eq!(resp["status"], json!("incomplete"));
+        assert_eq!(resp["incomplete_details"]["reason"], json!("max_output_tokens"));
+        // 正常完成仍是 completed + incomplete_details=null
+        let mut v2 = v.clone();
+        v2["choices"][0]["finish_reason"] = json!("stop");
+        let resp2 = completion_to_responses(&v2, "resp_4", "m");
+        assert_eq!(resp2["status"], json!("completed"));
+        assert!(resp2["incomplete_details"].is_null());
     }
 }
