@@ -8,6 +8,10 @@ src-tauri/gen/
 *.log
 logs/
 
+# 临时文件
+tmp/
+temp
+
 # OS / Editor
 .DS_Store
 Thumbs.db
