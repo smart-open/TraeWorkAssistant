@@ -12,6 +12,7 @@
 - **证书安装失败原因透出**：`cert_install` 生成 CA 改为捕获子进程输出，失败时截取 stderr 透传真实原因（如 `ModuleNotFoundError: No module named 'cryptography'`）；配置导航「安装证书」步骤失败弹 toast（原静默只写 console）。
 - **certutil 调用修正**：路径内嵌双引号（含空格目录不再拆参）；改用 `-PassThru` 以 certutil 真实退出码判定成败（原 `-Wait` 下 certutil 失败仍误报「安装成功」）。
 - **定时任务路径漂移校验**：`task_register` 会把注册时刻的解释器与脚本绝对路径硬编码进计划任务，升级迁移安装目录后旧任务会静默失效。`task_status` 现以 `schtasks /FO CSV /V` 读取真实 `/TR` 与当前布局比对（CSV 单行不折行避免误判，大小写/斜杠归一化），脚本路径失效提示「定时签到将静默失败，请重新注册」，仅绑定旧版解释器时提示「建议重新注册切换到内置 Python 运行时」；开发期相对路径与裸解释器名（PATH 解析）跳过校验不误报。附 5 例单元测试。
+- **安装包瘦身（-16 MB）**：内嵌运行时改为按发布白名单装配到 `build/python-bundle/`（`tauri.conf.json` 资源映射同步切换），与源目录 `src-python/` 解耦——`tests/`、`requirements.txt`、`pythonw.exe`、`python.cat` 不再进入安装包；site-packages 裁剪 pywin32 的 IDE/COM/文档附属（pythonwin/win32com*/adodbapi/isapi/bin/PyWin32.chm/dist-info）。暂存 56 MB/1388 文件 → 40 MB/624 文件，装配后以内嵌解释器自检（cryptography/win32crypt/sqlite3）防裁剪误伤。源目录与开发流程完全不受影响。
 
 ## [2.9.0] - 2026-09-09
 

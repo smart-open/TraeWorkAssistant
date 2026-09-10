@@ -313,7 +313,7 @@ rustup target add x86_64-pc-windows-msvc   # MSVC 目标（Windows 默认）
 Python 双角色：
 
 - **构建机 Python 3.13.x**（必须，ABI 要求）：运行 `scripts/prepare_python_runtime.py` 准备内嵌运行时（用其 pip 拉取与 embeddable 同版本 ABI 的 wheel）。
-- **应用内嵌运行时**：`npm run tauri build` 的 `beforeBuildCommand` 会自动执行准备脚本——下载 Windows embeddable Python 解压到 `src-python/`（解释器 + 标准库 + 预装 `requirements.txt` 依赖），随后随 `bundle.resources` 整体打进安装包。运行期 Rust 优先使用资源目录的 `python/python.exe`，不存在才回退系统解释器（兼容 dev 环境）。
+- **应用内嵌运行时**：`npm run tauri build` 的 `beforeBuildCommand` 会自动执行准备脚本——下载 Windows embeddable Python 解压到 `src-python/`（解释器 + 标准库 + 预装 `requirements.txt` 依赖），再按发布白名单装配到 `build/python-bundle/`，随后随 `bundle.resources` 打进安装包。运行期 Rust 优先使用资源目录的 `python/python.exe`，不存在才回退系统解释器（兼容 dev 环境）。
 
 运行时文件不入 git（`.gitignore` 已按 embeddable 产物清单忽略）；embeddable zip 缓存于 `%LOCALAPPDATA%/TraeWorkAssistant/build-cache`，脚本分层幂等（已就绪则秒级跳过）。
 
@@ -333,9 +333,13 @@ npm run tauri build    # 产出 msi / nsis 安装包
 ```
 
 流程：`beforeBuildCommand` = `python scripts/prepare_python_runtime.py && npm run build`
-（①准备内嵌 Python 运行时 → ②tsc + vite 产出 `dist/`）→ 编译 Rust release → 按 `bundle.targets` 打包 →
-`src-python/`（此时含内嵌解释器与依赖）→ `python/`、`src-ps/` → `ps/` 作为资源打入。产物在 `src-tauri/target/release/bundle/`。
-安装包体积增加约 25-30 MB（embeddable 10 MB + site-packages 35 MB，NSIS 压缩后）。
+（①准备内嵌 Python 运行时 → ②按白名单装配打包暂存 `build/python-bundle/` 并自检 → ③tsc + vite 产出 `dist/`）→
+编译 Rust release → 按 `bundle.targets` 打包 → `build/python-bundle/` → `python/`、`src-ps/` → `ps/` 作为资源打入。
+产物在 `src-tauri/target/release/bundle/`。
+打包暂存与源目录 `src-python/` 解耦：只复制解释器 + 标准库 + 两个业务脚本 + `Lib/`，排除 `tests/`、
+`requirements.txt`、`pythonw.exe`、`python.cat`，并裁剪 site-packages 中 pywin32 的 IDE/COM/文档附属
+（pythonwin/win32com*/adodbapi/isapi/bin/PyWin32.chm/dist-info，约 16 MB）——运行脚本仅用
+`win32crypt`（依赖 `win32/` 与顶层 pywin32 DLL，均保留）。安装包体积增加约 15-20 MB（NSIS 压缩后）。
 
 ### 7.4 测试
 
