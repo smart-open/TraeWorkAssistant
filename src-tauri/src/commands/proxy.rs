@@ -54,6 +54,45 @@ fn safe_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 结束与本应用 device_proxy.py 同脚本路径的遗留 python 进程（父进程已死的孤儿代理），
+/// 返回被结束的 PID 列表。按完整脚本路径匹配，不误伤其他程序/其他安装副本。
+#[cfg(target_os = "windows")]
+fn kill_stale_proxy_processes(script_path: &std::path::Path) -> Vec<u32> {
+    let me = script_path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+        ])
+        .creation_flags(0x08000000)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Ok(items) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return Vec::new();
+    };
+    let items = match items {
+        serde_json::Value::Array(a) => a,
+        v @ serde_json::Value::Object(_) => vec![v],
+        _ => return Vec::new(),
+    };
+    let mut killed = Vec::new();
+    for it in items {
+        let cl = it["CommandLine"].as_str().unwrap_or("").replace('/', "\\").to_lowercase();
+        let pid = it["ProcessId"].as_u64().unwrap_or(0) as u32;
+        if pid != 0 && cl.contains(&me) && Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).creation_flags(0x08000000).output().map(|o| o.status.success()).unwrap_or(false) {
+            killed.push(pid);
+        }
+    }
+    killed
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_stale_proxy_processes(_script_path: &std::path::Path) -> Vec<u32> {
+    Vec::new()
+}
+
 #[tauri::command]
 pub fn proxy_start(
     app: AppHandle,
@@ -89,6 +128,30 @@ pub fn proxy_start(
     if !script_path.exists() {
         return Err(format!("找不到脚本: {}", script_path.display()));
     }
+
+    // 端口预检：Python 侧已改独占绑定（bind 失败即退出），此处先探测真实占用并
+    // 清理遗留孤儿代理进程（issue #7：曾因 SO_REUSEADDR 出现「假启动」+ 孤儿接客）
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => drop(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let killed = kill_stale_proxy_processes(&script_path);
+            if !killed.is_empty() {
+                fs_utils::app_log(&state.data_dir, &format!("已清理遗留代理进程 PID: {killed:?}"));
+            }
+            // 给被终止进程一点释放端口的时间，再验证端口是否真正可用
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if let Err(e2) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                if e2.kind() == std::io::ErrorKind::AddrInUse {
+                    return Err(format!(
+                        "端口 {port} 被其他程序占用且无法自动清理，请修改代理端口或手动结束后重试"
+                    ));
+                }
+                return Err(format!("端口探测失败: {e2}"));
+            }
+        }
+        Err(e) => return Err(format!("端口探测失败: {e}")),
+    }
+
     let data_dir = state.data_dir.to_string_lossy().to_string();
     let port_s = port.to_string();
     let settings = state.settings();
@@ -143,6 +206,9 @@ pub fn proxy_start(
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("启动代理失败: {e}"))?;
+    // 挂入 Job Object（kill-on-close）：应用崩溃/被强杀时 OS 自动回收子进程，
+    // 与 RunEvent::Exit 的 Drop 清理互补，彻底杜绝孤儿代理（issue #7）
+    crate::python::assign_job_object(&child);
     let stdout = child.stdout.take().ok_or("代理无标准输出")?;
     let stderr = child.stderr.take();
 

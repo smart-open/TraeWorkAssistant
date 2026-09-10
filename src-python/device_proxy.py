@@ -30,6 +30,7 @@ import json
 import ssl
 import socket
 import shutil
+import subprocess
 import threading
 import time
 import base64
@@ -313,11 +314,29 @@ def log(*a):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] " + " ".join(str(x) for x in a)
     with _log_lock:
-        print(line, flush=True)
+        # stdout 管道随父进程退出而断开时 print 会抛 OSError 并向上传播，
+        # 曾导致连接线程静默死亡、日志也无从记录（issue #7）——print 必须同样兜底
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
         try:
             _logf.write(line + "\n")
         except Exception:
             pass
+
+
+def port_pids(port):
+    """查询监听指定端口的进程 PID 列表（探测失败返回空表，仅供诊断输出）"""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue)"
+             ".OwningProcess | Sort-Object -Unique"],
+            capture_output=True, text=True, timeout=15, creationflags=0x08000000).stdout
+        return [int(x) for x in out.split() if x.strip().isdigit()]
+    except Exception:
+        return []
 
 # ---------------- 每账号设备映射 ----------------
 _map_lock = threading.Lock()
@@ -1794,8 +1813,10 @@ def handle_client(conn, addr):
                 tunnel_raw(conn, host, port)
                 return
             matched = next((d for d in TARGET_DOMAINS if host == d or host.endswith("." + d)), None)
-            log(f"CONNECT {host}:{port}  [TRAE/MITM] 匹配域名: {matched}")
+            # 先握手后记日志（与 tunnel_raw 一致）：避免日志/证书等任何异常把 CONNECT
+            # 握手拖死导致客户端 EOF（issue #7）
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            log(f"CONNECT {host}:{port}  [TRAE/MITM] 匹配域名: {matched}")
             # TRAE 域名：MITM 解密以捕获 JWT
             cpath, kpath = leaf_cert(host)
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1862,8 +1883,18 @@ def main():
         load_accounts()  # 预热 accounts 缓存
         sync_account_devices()  # 升级历史假占位符设备标识
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((LISTEN_HOST, LISTEN_PORT))
+    # Windows 的 SO_REUSEADDR 允许多个 socket 绑定同一端口：孤儿代理进程继续接客、
+    # 新进程「假启动」，前端仍显示已启动（issue #7 根因）——改为独占绑定，
+    # 端口被占时 bind 明确失败并带占用 PID 退出，交由看门狗上报启动失败
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    try:
+        srv.bind((LISTEN_HOST, LISTEN_PORT))
+    except OSError:
+        pids = port_pids(LISTEN_PORT)
+        log(f"[fatal] 端口 {LISTEN_HOST}:{LISTEN_PORT} 绑定失败，占用进程 PID: {pids or '未知'}")
+        print(f"代理端口 {LISTEN_PORT} 被占用（PID: {pids or '未知'}），"
+              f"通常由上一次未退出的代理进程导致，请结束后重试", file=sys.stderr, flush=True)
+        return 2
     srv.listen(128)
     log(f"代理已启动: {LISTEN_HOST}:{LISTEN_PORT}  (TRAE 多域 MITM 拦截 + JWT 自动捕获)")
     log("监听 TRAE 域名: " + ", ".join("*." + d for d in TARGET_DOMAINS))
