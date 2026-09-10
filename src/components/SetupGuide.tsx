@@ -23,6 +23,7 @@ export default function SetupGuide() {
   const startProxy = useAppStore((s) => s.startProxy);
   const refreshEnv = useAppStore((s) => s.refreshEnv);
   const refreshCert = useAppStore((s) => s.refreshCert);
+  const pushToast = useAppStore((s) => s.pushToast);
 
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -99,8 +100,10 @@ export default function SetupGuide() {
     try {
       await step.run();
     } catch (e) {
-      // 错误已由各 step.run() 内部 toast 处理；此处兜底防止未捕获异常
+      // 并非每个 step.run() 内部都会 toast（如 cert 一步只抛错），
+      // 此处必须兜底提示，否则用户点击后界面毫无反应，无法定位失败原因。
       console.error(`[SetupGuide] step "${step.key}" failed:`, e);
+      pushToast('error', `「${step.title}」失败：${String(e)}`);
     } finally {
       setBusy(null);
     }

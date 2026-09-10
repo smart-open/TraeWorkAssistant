@@ -313,7 +313,14 @@ def log(*a):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] " + " ".join(str(x) for x in a)
     with _log_lock:
-        print(line, flush=True)
+        # print 必须同样容错：父进程（Rust 侧）退出后本进程可能成为孤儿，
+        # 其 stdout 管道断开会让 print(..., flush=True) 抛 OSError。
+        # 一旦抛出，调用方（如 handle_client）的线程会被直接杀死，
+        # 表现为客户端连接被静默掐断、且日志里查不到任何线索。
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
         try:
             _logf.write(line + "\n")
         except Exception:
@@ -1794,8 +1801,11 @@ def handle_client(conn, addr):
                 tunnel_raw(conn, host, port)
                 return
             matched = next((d for d in TARGET_DOMAINS if host == d or host.endswith("." + d)), None)
-            log(f"CONNECT {host}:{port}  [TRAE/MITM] 匹配域名: {matched}")
+            # 先回 200 再记日志：与 tunnel_raw() 保持一致。
+            # 若反过来（先 log 后 sendall），日志异常会先把线程打死，
+            # 客户端永远等不到 200 —— 表现为「目标域名全部打不开且日志无任何记录」。
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            log(f"CONNECT {host}:{port}  [TRAE/MITM] 匹配域名: {matched}")
             # TRAE 域名：MITM 解密以捕获 JWT
             cpath, kpath = leaf_cert(host)
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1862,8 +1872,16 @@ def main():
         load_accounts()  # 预热 accounts 缓存
         sync_account_devices()  # 升级历史假占位符设备标识
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((LISTEN_HOST, LISTEN_PORT))
+    # 不设 SO_REUSEADDR：Windows 上它允许多个套接字绑定同一 addr:port 且不报错，
+    # 导致上一次泄漏的代理进程仍在接客、本次却「启动成功」，
+    # 而新实例收不到任何连接（表现为目标域名全部打不开、日志无记录）。
+    # 去掉后端口被占用时 bind() 会直接报 WSAEADDRINUSE，便于上层暴露真实错误。
+    try:
+        srv.bind((LISTEN_HOST, LISTEN_PORT))
+    except OSError as e:
+        log(f"[fatal] 端口 {LISTEN_HOST}:{LISTEN_PORT} 绑定失败（{e}）。"
+            f"通常由上一次未退出的代理进程占用，请结束后重试。")
+        return 2
     srv.listen(128)
     log(f"代理已启动: {LISTEN_HOST}:{LISTEN_PORT}  (TRAE 多域 MITM 拦截 + JWT 自动捕获)")
     log("监听 TRAE 域名: " + ", ".join("*." + d for d in TARGET_DOMAINS))

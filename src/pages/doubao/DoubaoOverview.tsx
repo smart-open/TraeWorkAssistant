@@ -93,6 +93,7 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
       await step.run();
     } catch (e) {
       console.error(`[DoubaoSetupGuide] step "${step.key}" failed:`, e);
+      pushToast('error', `「${step.title}」失败：${String(e)}`);
     } finally {
       setBusy(null);
     }
