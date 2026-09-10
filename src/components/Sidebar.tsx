@@ -42,10 +42,19 @@ const DOUBAO_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'doubao-settings', label: '环境配置', icon: Settings },
 ];
 
-/** 应用切换 Tab：trae = 当前菜单；buddy = 后期扩展（置灰）；doubao = 接入中 */
+/** Buddy 应用菜单（workbuddy-product-design.md §3.7.0：五页应用级子导航，批次1） */
+const BUDDY_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
+  { key: 'buddy-overview', label: '概述', icon: LayoutDashboard },
+  { key: 'buddy-accounts', label: '账号管理', icon: Users },
+  { key: 'buddy-checkin', label: '签到与成长', icon: PlayCircle },
+  { key: 'buddy-credits', label: '积分与统计', icon: Coins },
+  { key: 'buddy-settings', label: '环境配置', icon: Settings },
+];
+
+/** 应用切换 Tab：trae = 当前菜单；buddy = 批次1接入；doubao = 接入中 */
 const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disabled?: boolean; title?: string }[] = [
   { key: 'trae', label: 'Trae', icon: Sparkles },
-  { key: 'buddy', label: 'Buddy', icon: Bot, disabled: true, title: '后期扩展（WorkBuddy / CodeBuddy）' },
+  { key: 'buddy', label: 'Buddy', icon: Bot, title: 'WorkBuddy / CodeBuddy' },
   { key: 'doubao', label: '豆包', icon: LayoutGrid },
 ];
 
@@ -62,8 +71,8 @@ export default function Sidebar({
   const [showAbout, setShowAbout] = useState(false);
   const [showSystem, setShowSystem] = useState(false);
 
-  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 概述/账号管理/环境配置
-  const nav = activeApp === 'doubao' ? DOUBAO_NAV : NAV;
+  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 5 页（批次1）
+  const nav = activeApp === 'doubao' ? DOUBAO_NAV : activeApp === 'buddy' ? BUDDY_NAV : NAV;
 
   const openExternal = async (url: string, label: string) => {
     try {

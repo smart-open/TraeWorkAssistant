@@ -873,14 +873,185 @@ function Restore-ChromiumProfile {
     Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项, $($snapProfiles.Count) 个 Profile)" -Status 'ok'
 }
 
+# ── authfile 布局快照（WorkBuddy，批次1）───────────────────────────────────
+# 依据 workbuddy-product-design.md §3.3（M2 账号切换 authfile 布局）：
+#   L1 必选  %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
+#           （登录态明文 JSON；客户端启动时会重写并生成历史快照 workbuddy-desktop.<ts>.<pid>.<uuid>.info，
+#             作交叉校验，不入快照槽）
+#   L2 体验  ~\.workbuddy\storage\user-<uid>* 目录（用户级数据，随账号迁移）
+#   元数据  slot\meta.json：uid / savedAt（供 Rust 端校验与账号池回填）
+# 快照/恢复前客户端须已关闭（入口 Switch/SaveCurrentLogin 已先 Stop-Trae）。
+
+$Script:WbAuthDir  = "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth"
+$Script:WbAuthFile = "$Script:WbAuthDir\workbuddy-desktop.info"
+
+# 从 auth 文件 JSON 提取 uid（兼容 account.uid / uid / auth.account.uid 嵌套）
+function Get-AuthFileUid {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $null }
+    try {
+        $j = Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($v in @($j.account.uid, $j.uid, $j.auth.account.uid, $j.auth.uid)) {
+            if ($v) { return [string]$v }
+        }
+    } catch {}
+    return $null
+}
+
+function Backup-AuthFileProfile {
+    param([string]$Slot)
+    $dest = Join-Path $Script:ProfilesDir $Slot
+    if (-not (Test-Path $Script:WbAuthFile)) {
+        Write-Step -Stage 'backup' -Message "auth 文件不存在（可能从未登录）：$($Script:WbAuthFile)" -Status 'warn'
+        return
+    }
+    # 单代回滚保护（对齐豆包：覆盖前挪 .bak）
+    if (Test-Path $dest) {
+        $bakDir = "$dest.bak"
+        try {
+            if (Test-Path $bakDir) { Remove-Item $bakDir -Recurse -Force -ErrorAction SilentlyContinue }
+            Move-Item $dest $bakDir -Force -ErrorAction Stop
+            Write-Step -Stage 'backup' -Message "原 $Slot 快照已备份到 $Slot.bak（可回滚一代）" -Status 'info'
+        } catch {
+            Write-Step -Stage 'backup' -Message "旧快照挪移失败（将直接覆盖）: $_" -Status 'warn'
+        }
+    }
+    New-Item -ItemType Directory -Path (Join-Path $dest 'auth') -Force | Out-Null
+    $copied = 0
+    # L1 必选：auth 文件
+    try {
+        Copy-Item $Script:WbAuthFile (Join-Path $dest 'auth\workbuddy-desktop.info') -Force
+        $copied++
+        Write-Step -Stage 'backup' -Message 'L1 auth 文件已备份' -Status 'ok'
+    } catch {
+        Write-Step -Stage 'backup' -Message "auth 文件备份失败: $_" -Status 'error'
+        throw "auth 文件备份失败"
+    }
+    # L2 体验：~\.workbuddy\storage\user-<uid>* 目录
+    $uid = Get-AuthFileUid -Path $Script:WbAuthFile
+    if ($uid) {
+        $storageDir = Join-Path $Script:TraeDataDir 'storage'
+        if (Test-Path $storageDir) {
+            $userDirs = Get-ChildItem -Path $storageDir -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "user-$uid*" }
+            foreach ($d in $userDirs) {
+                $target = Join-Path $dest ("storage\" + $d.Name)
+                if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }
+                New-Item -ItemType Directory -Path (Split-Path $target -Parent) -Force | Out-Null
+                Copy-Item $d.FullName $target -Recurse -Force -ErrorAction SilentlyContinue
+                if (Test-Path $target) { $copied++ }
+            }
+            if (@($userDirs).Count -gt 0) {
+                Write-Step -Stage 'backup' -Message "L2 用户数据已备份（$(@($userDirs).Count) 个目录）" -Status 'ok'
+            } else {
+                Write-Step -Stage 'backup' -Message 'L2 用户数据目录不存在，跳过（首次登录前正常）' -Status 'skip'
+            }
+        }
+    } else {
+        Write-Step -Stage 'backup' -Message 'auth 文件中未能解析 uid（JSON 结构变化？），L2 跳过' -Status 'warn'
+    }
+    # 元数据
+    try {
+        $meta = [ordered]@{
+            schemaVersion = 1
+            layout        = 'authfile'
+            app           = 'WorkBuddy'
+            uid           = $uid
+            savedAt       = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        }
+        $meta | ConvertTo-Json -Compress | Set-Content -Path (Join-Path $dest 'meta.json') -Encoding UTF8
+    } catch {
+        Write-Step -Stage 'backup' -Message "meta.json 写入失败（不影响快照）: $_" -Status 'warn'
+    }
+    Write-Step -Stage 'backup' -Message "已备份当前登录态到 $Slot ($copied 项)" -Status 'ok'
+}
+
+function Restore-AuthFileProfile {
+    param([string]$Slot)
+    $src = Join-Path $Script:ProfilesDir $Slot
+    if (-not (Test-Path $src)) {
+        $bakDir = "$src.bak"
+        if (Test-Path $bakDir) {
+            Write-Step -Stage 'restore' -Message "账号 $Slot 主快照缺失，回退使用上一次覆盖前的备份（$Slot.bak）" -Status 'warn'
+            $src = $bakDir
+        } else {
+            Write-Step -Stage 'restore' -Message "目标账号 $Slot 无快照，请先登录该账号并保存登录态" -Status 'error'
+            throw "目标账号 $Slot 无快照"
+        }
+    }
+    $authSrc = Join-Path $src 'auth\workbuddy-desktop.info'
+    if (-not (Test-Path $authSrc)) {
+        Write-Step -Stage 'restore' -Message "快照缺少 auth 文件，疑似不完整快照，已中止恢复" -Status 'error'
+        throw "快照缺少 auth 文件（槽位 $Slot）"
+    }
+    $restored = 0
+    # L1 必选：回写 auth 文件
+    try {
+        if (-not (Test-Path $Script:WbAuthDir)) { New-Item -ItemType Directory -Path $Script:WbAuthDir -Force | Out-Null }
+        Copy-Item $authSrc $Script:WbAuthFile -Force
+        $restored++
+        Write-Step -Stage 'restore' -Message 'L1 auth 文件已恢复' -Status 'ok'
+    } catch {
+        Write-Step -Stage 'restore' -Message "auth 文件恢复失败: $_" -Status 'error'
+        throw "auth 文件恢复失败"
+    }
+    # L2 体验：storage\user-* 目录对称回写
+    $slotStorage = Join-Path $src 'storage'
+    if (Test-Path $slotStorage) {
+        $destStorage = Join-Path $Script:TraeDataDir 'storage'
+        New-Item -ItemType Directory -Path $destStorage -Force | Out-Null
+        Get-ChildItem -Path $slotStorage -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $target = Join-Path $destStorage $_.Name
+            if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }
+            Copy-Item $_.FullName $target -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path $target) { $restored++ }
+        }
+        Write-Step -Stage 'restore' -Message 'L2 用户数据已恢复' -Status 'ok'
+    }
+    Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项)" -Status 'ok'
+}
+
+# 批次1：authfile 切换后轮询 account-snapshot.json.uid 确认（F-02 验收项，超时 30s）。
+# 客户端启动后首次联网刷新快照；uid 与目标槽 meta.json 一致 = 切换真正生效（fail-open：超时仅警告）。
+function Confirm-AuthFileSwitch {
+    param([string]$Slot)
+    $snapFile = Join-Path $Script:TraeDataDir 'storage\skeleton\account-snapshot.json'
+    $metaFile = Join-Path (Join-Path $Script:ProfilesDir $Slot) 'meta.json'
+    $expectUid = $null
+    try { $expectUid = [string]((Get-Content $metaFile -Raw -Encoding UTF8 | ConvertFrom-Json).uid) } catch {}
+    if (-not $expectUid) { $expectUid = $Slot }
+    Write-Step -Stage 'verify' -Message '等待客户端刷新登录快照（最长 30 秒）…' -Status 'running'
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+        if (Test-Path $snapFile) {
+            try {
+                $j = Get-Content $snapFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                $uid = $null
+                foreach ($v in @($j.uid, $j.account.uid, $j.accountId)) { if ($v) { $uid = [string]$v; break } }
+                if ($uid -eq $expectUid) {
+                    Write-Step -Stage 'verify' -Message '登录身份已确认为目标账号' -Status 'ok'
+                    return
+                }
+            } catch {}
+        }
+    }
+    Write-Step -Stage 'verify' -Message '30 秒内未确认到目标 uid（客户端可能未启动/未联网），请打开客户端核实' -Status 'warn'
+}
+
 function Backup-CurrentProfile {
     param([string]$Slot)
+    # 批次1：authfile 布局（WorkBuddy）走 auth 文件 + 用户数据双层快照
+    if ($Script:SnapshotLayout -eq 'authfile') {
+        Backup-AuthFileProfile -Slot $Slot
+        return
+    }
     # P2：chromium 布局（豆包）走白名单目录级快照
     if ($Script:SnapshotLayout -eq 'chromium') {
         Backup-ChromiumProfile -Slot $Slot
         return
     }
-    # F-48：精准白名单快照针对 icube 布局，authfile 布局随各自批次接入
+    # F-48：精准白名单快照针对 icube 布局
     if ($Script:SnapshotLayout -ne 'icube') {
         Write-Step -Stage 'backup' -Message "$($Script:AppName) 布局为 '$($Script:SnapshotLayout)'，快照管线尚未接入（F-48 预留）" -Status 'error'
         throw "$($Script:AppName) 的快照备份尚未实现（布局=$($Script:SnapshotLayout)）"
@@ -942,12 +1113,17 @@ function Backup-CurrentProfile {
 
 function Restore-Profile {
     param([string]$Slot)
+    # 批次1：authfile 布局（WorkBuddy）走 auth 文件 + 用户数据双层恢复
+    if ($Script:SnapshotLayout -eq 'authfile') {
+        Restore-AuthFileProfile -Slot $Slot
+        return
+    }
     # P2：chromium 布局（豆包）走白名单目录级恢复
     if ($Script:SnapshotLayout -eq 'chromium') {
         Restore-ChromiumProfile -Slot $Slot
         return
     }
-    # F-48：精准白名单恢复针对 icube 布局，authfile 布局随各自批次接入
+    # F-48：精准白名单恢复针对 icube 布局
     if ($Script:SnapshotLayout -ne 'icube') {
         Write-Step -Stage 'restore' -Message "$($Script:AppName) 布局为 '$($Script:SnapshotLayout)'，快照管线尚未接入（F-48 预留）" -Status 'error'
         throw "$($Script:AppName) 的快照恢复尚未实现（布局=$($Script:SnapshotLayout)）"
@@ -1038,6 +1214,7 @@ try {
             # 记录当前账号 ID
             Set-CurrentAccount -AccountId $UserId
             Start-Trae
+            if ($Script:SnapshotLayout -eq 'authfile') { Confirm-AuthFileSwitch -Slot $UserId }
             Write-Step -Stage 'done' -Message "已切换至账号 $UserId" -Status 'ok'
         }
         'SaveCurrentLogin' {

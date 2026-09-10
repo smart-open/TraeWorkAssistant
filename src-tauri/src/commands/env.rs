@@ -427,8 +427,8 @@ pub fn open_doubao_app(state: State<AppState>, proxy_port: Option<u16>) -> Resul
     Ok(())
 }
 
-/// app_locate 的内部版本（供 open_* 命令复用；无需 Option 包装）
-fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate {
+/// app_locate 的内部版本（供 open_* 命令与 workbuddy 模块复用；无需 Option 包装）
+pub(crate) fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate {
     let profile = app_profile(Some(app));
 
     if let Some(sk) = profile.settings_key {

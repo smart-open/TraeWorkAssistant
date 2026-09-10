@@ -189,6 +189,25 @@ fn main() {
             commands::updater::update_check,
             commands::updater::update_download,
             commands::updater::update_run_installer,
+            commands::workbuddy::workbuddy_env_check,
+            commands::workbuddy::workbuddy_accounts_list,
+            commands::workbuddy::workbuddy_account_save,
+            commands::workbuddy::workbuddy_account_remove,
+            commands::workbuddy::workbuddy_scan_auth_file,
+            commands::workbuddy::workbuddy_account_import_auth,
+            commands::workbuddy::workbuddy_refresh_token,
+            commands::workbuddy::workbuddy_checkin_start,
+            commands::workbuddy::workbuddy_growth_run,
+            commands::workbuddy::workbuddy_checkin_results,
+            commands::workbuddy::workbuddy_checkin_task_register,
+            commands::workbuddy::workbuddy_checkin_task_status,
+            commands::workbuddy::workbuddy_checkin_task_unregister,
+            commands::workbuddy::workbuddy_renew_task_register,
+            commands::workbuddy::workbuddy_renew_task_status,
+            commands::workbuddy::workbuddy_renew_task_unregister,
+            commands::workbuddy::workbuddy_credits_fetch,
+            commands::workbuddy::workbuddy_settings_get,
+            commands::workbuddy::workbuddy_settings_set,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -381,6 +400,14 @@ fn main() {
                         notify::notify(&app2, "静默签到失败", &e);
                     }
                 });
+            }
+
+            // WorkBuddy 启动自动补签（F-55）：延迟 60s 核验未签账号并补签，
+            // 复用 python 签到脚本（--skip-checked 幂等），独立于 Trae 静默签到
+            {
+                let app2 = app.handle().clone();
+                let st = app.state::<AppState>();
+                commands::workbuddy::startup_auto_checkin(&app2, &st);
             }
 
             Ok(())

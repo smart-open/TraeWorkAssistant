@@ -12,15 +12,21 @@ export type ViewKey =
   // 豆包应用页面（侧边栏应用切换 Tab → 豆包）
   | 'doubao-overview'
   | 'doubao-accounts'
-  | 'doubao-settings';
+  | 'doubao-settings'
+  // Buddy 应用页面（侧边栏应用切换 Tab → Buddy，批次1）
+  | 'buddy-overview'
+  | 'buddy-accounts'
+  | 'buddy-checkin'
+  | 'buddy-credits'
+  | 'buddy-settings';
 
-/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy 后期扩展 / 豆包 接入中 */
+/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy 批次1接入 / 豆包 接入中 */
 export type AppKey = 'trae' | 'buddy' | 'doubao';
 
 /** 各应用的默认落地页 */
 export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
   trae: 'dashboard',
-  buddy: 'dashboard',
+  buddy: 'buddy-overview',
   doubao: 'doubao-overview',
 };
 
@@ -552,4 +558,97 @@ export interface UpdateDownloaded {
   asset_name: string;
   size: number;
   version: string;
+}
+
+// ---- WorkBuddy 账号池（批次1；对应 Rust workbuddy.rs WorkBuddyAccountView）----
+export interface WorkBuddyAccountView {
+  id: string;
+  uid: string;
+  nickname: string;
+  phone_masked: string;
+  edition_type: string;
+  access_token_expires_at: number | null;
+  refresh_token_expires_at: number | null;
+  auth_saved_at: number | null;
+  needs_relogin: boolean;
+  relogin_reason: string;
+  group_id: string;
+  note: string;
+  credits_balance: number | null;
+  credits_fetched_at: string | null;
+  /** 在线 = 本机 auth 文件当前生效账号 */
+  is_current: boolean;
+  has_credential: boolean;
+  has_snapshot: boolean;
+}
+
+export interface WorkBuddyEnvCheck {
+  installed: boolean;
+  running: boolean;
+  version: string | null;
+  exe: string | null;
+  auth_file_exists: boolean;
+  data_dir_exists: boolean;
+  snapshot_uid: string | null;
+  snapshot_nickname: string | null;
+  snapshot_edition: string | null;
+}
+
+export interface WorkBuddyScanResult {
+  id: string;
+  uid: string;
+  nickname: string;
+  edition_type: string;
+  has_access_token: boolean;
+  has_refresh_token: boolean;
+  access_token_expires_at: number | null;
+  exists: boolean;
+}
+
+export interface WorkBuddySettings {
+  auto_checkin: boolean;
+  keepalive_days: number;
+  lazy_refresh_hours: number;
+  growth_travel: boolean;
+  growth_lottery: boolean;
+  growth_tasks: boolean;
+}
+
+/** 积分包（workbuddy_credits.py 宽容解析输出） */
+export interface WbCreditPackage {
+  name: string;
+  remaining: number;
+  total: number;
+  used: number;
+  end_time: string | null;
+  expire_ts: number | null;
+  expire_soon?: boolean;
+}
+
+export interface WbCreditAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  message?: string;
+  balance: number | null;
+  packages: WbCreditPackage[];
+  source: string;
+  fetched_at?: string;
+}
+
+export interface WbCreditsResult {
+  ok: boolean;
+  cached?: boolean;
+  accounts: WbCreditAccount[];
+  total_balance?: number;
+}
+
+/** WorkBuddy 签到日志（90 天存储） */
+export interface WbCheckinRecord {
+  date: string;
+  time: string;
+  user_id: string;
+  name: string;
+  status: string;
+  message: string;
 }

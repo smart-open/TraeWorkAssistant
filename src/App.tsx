@@ -15,6 +15,11 @@ import ApiService from './pages/ApiService';
 import DoubaoOverview from './pages/doubao/DoubaoOverview';
 import DoubaoAccounts from './pages/doubao/DoubaoAccounts';
 import DoubaoSettings from './pages/doubao/DoubaoSettings';
+import BuddyOverview from './pages/buddy/BuddyOverview';
+import BuddyAccounts from './pages/buddy/BuddyAccounts';
+import BuddyCheckin from './pages/buddy/BuddyCheckin';
+import BuddyCredits from './pages/buddy/BuddyCredits';
+import BuddySettings from './pages/buddy/BuddySettings';
 
 function renderView(view: string) {
   switch (view) {
@@ -38,6 +43,16 @@ function renderView(view: string) {
       return <DoubaoAccounts />;
     case 'doubao-settings':
       return <DoubaoSettings />;
+    case 'buddy-overview':
+      return <BuddyOverview />;
+    case 'buddy-accounts':
+      return <BuddyAccounts />;
+    case 'buddy-checkin':
+      return <BuddyCheckin />;
+    case 'buddy-credits':
+      return <BuddyCredits />;
+    case 'buddy-settings':
+      return <BuddySettings />;
     default:
       return <Dashboard />;
   }

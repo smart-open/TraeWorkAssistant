@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""WorkBuddy 公共库：数据目录 / 账号池 / 双源凭证 / 统一请求头 / 宽容解析 / token 刷新。
+
+方案依据 docs/workbuddy-product-design.md §5.1~§5.4：
+- 凭证双源化（F-10）：工具侧副本 token_store 与桌面 auth 文件「谁新用谁」（expiresAtMs 晚者胜出）
+- 统一请求头（§5.3）+ 宽容解析 dig()（§5.4，对齐 Rust fs_utils::dig 语义）
+- 红线：chat 请求绝不携带 X-Refresh-Token；本库仅 refresh 端点携带
+仅标准库，零第三方依赖。
+"""
+
+import datetime
+import hashlib
+import json
+import os
+import urllib.error
+import urllib.request
+
+# ── 路径 ────────────────────────────────────────────────────────────────────
+
+def data_dir() -> str:
+    return os.environ.get("AIWORKDATA_DIR") or os.path.join(
+        os.environ.get("APPDATA", ""), "AIWorkAssistant")
+
+
+def auth_file_path() -> str:
+    """桌面端 auth 文件（只读；写入仅限客户端关闭窗口期，由 PS 桥/Rust 控制）"""
+    local = os.environ.get("LOCALAPPDATA", "")
+    return os.path.join(local, "CodeBuddyExtension", "Data", "Public", "auth",
+                        "workbuddy-desktop.info")
+
+
+def wb_data_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".workbuddy")
+
+
+def pool_path() -> str:
+    return os.path.join(data_dir(), "workbuddy_accounts.json")
+
+
+def token_store_path() -> str:
+    return os.path.join(data_dir(), "workbuddy_token_store.json")
+
+
+def checkin_results_path() -> str:
+    return os.path.join(data_dir(), "workbuddy_checkin_results.json")
+
+
+def credits_cache_path() -> str:
+    return os.path.join(data_dir(), "workbuddy_credits_cache.json")
+
+
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        if not raw.strip():
+            return default
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+def write_json_atomic(path, obj):
+    """原子写：tmp + rename（对齐 fs_utils::write_json 语义）"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def now_ts() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str() -> str:
+    return datetime.date.today().strftime("%Y-%m-%d")
+
+
+# ── 账号池 ──────────────────────────────────────────────────────────────────
+
+def load_pool() -> dict:
+    return load_json(pool_path(), {"accounts": []})
+
+
+def save_pool(pool: dict) -> None:
+    write_json_atomic(pool_path(), pool)
+
+
+def account_id_of(token: str) -> str:
+    """账号 id = wb- + sha256(token) 前 12 位（同 token 稳定同 id，F-04）"""
+    return "wb-" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+
+# ── 双源凭证（F-10）────────────────────────────────────────────────────────
+
+def read_auth_file() -> dict:
+    """读桌面 auth 文件（宽容解析嵌套形态）；不存在返回 {}"""
+    if not os.path.exists(auth_file_path()):
+        return {}
+    return load_json(auth_file_path(), {})
+
+
+def _dig(v, key, depth=0):
+    """递归键查找（对齐 Rust dig：信封键逐层下钻 + 数组展开，限深 8）"""
+    if depth > 8 or not isinstance(v, (dict, list)):
+        return None
+    if isinstance(v, list):
+        for item in v:
+            hit = _dig(item, key, depth + 1)
+            if hit is not None:
+                return hit
+        return None
+    if key in v:
+        return v[key]
+    for wk in ("data", "result", "resp", "response", "info"):
+        if wk in v:
+            hit = _dig(v[wk], key, depth + 1)
+            if hit is not None:
+                return hit
+    return None
+
+
+def dig(v, *keys):
+    """按顺序查找任一键，返回第一个命中"""
+    for k in keys:
+        hit = _dig(v, k)
+        if hit is not None:
+            return hit
+    return None
+
+
+def creds_of(source: dict) -> dict:
+    """从 auth 文件 / token store 记录中提取凭证字段（兼容多种嵌套形态，F-04）。
+    返回 {access_token, refresh_token, expires_at_ms, refresh_expires_at_ms, uid, domain, nickname, edition}
+    """
+    if not isinstance(source, dict) or not source:
+        return {}
+
+    def _s(v):
+        return v if isinstance(v, str) else None
+
+    def _i(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    auth = source.get("auth") if isinstance(source.get("auth"), dict) else source
+    account = source.get("account") if isinstance(source.get("account"), dict) else source
+    return {
+        "access_token": _s(dig(auth, "accessToken", "access_token", "token")),
+        "refresh_token": _s(dig(auth, "refreshToken", "refresh_token")),
+        "expires_at_ms": _i(dig(auth, "expiresAtMs", "expires_at_ms", "expiresAt",
+                                "expires_in_ms", "accessTokenExpiresAtMs")),
+        "refresh_expires_at_ms": _i(dig(auth, "refreshExpiresAtMs", "refresh_expires_at_ms",
+                                        "refreshExpiresAt")),
+        "uid": _s(dig(account, "uid", "userId", "user_id", "id")),
+        "domain": _s(dig(source, "domain")),
+        "nickname": _s(dig(account, "nickname", "nickname", "name", "displayName")),
+        "edition": _s(dig(account, "editionType", "edition_type", "edition")),
+    }
+
+
+def effective_creds(acct: dict) -> dict:
+    """生效凭证 = auth 文件与 token store 中 expiresAtMs 更晚者（F-10 谁新用谁）。
+    acct: 账号池记录（含 id/uid）；返回 creds dict（可能为空 = 无可用凭证）"""
+    store = load_json(token_store_path(), {})
+    recs = store.get("tokens", {}) if isinstance(store, dict) else {}
+    store_rec = recs.get(acct.get("id", "")) or {}
+    store_creds = creds_of(store_rec)
+    # auth 文件仅当其 uid 与账号匹配时参与双源比较（桌面当前登录态）
+    file_creds = creds_of(read_auth_file())
+    if acct.get("uid") and file_creds.get("uid") and file_creds["uid"] != acct["uid"]:
+        file_creds = {}
+    a, b = store_creds.get("expires_at_ms"), file_creds.get("expires_at_ms")
+    if file_creds.get("access_token") and (not a or (b and b >= a)):
+        return file_creds
+    return store_creds
+
+
+def save_token_store(id_: str, creds: dict) -> None:
+    """写工具侧凭证副本（version 字段拒绝未知格式）"""
+    store = load_json(token_store_path(), {})
+    if not isinstance(store, dict):
+        store = {}
+    if store.get("version") not in (None, 1):
+        raise RuntimeError("token_store 版本不识别，拒绝写入")
+    store["version"] = 1
+    tokens = store.setdefault("tokens", {})
+    rec = tokens.get(id_, {})
+    rec.update(creds)
+    rec["updated_at"] = now_ts()
+    tokens[id_] = rec
+    write_json_atomic(token_store_path(), store)
+
+
+# ── 统一请求头（§5.3）───────────────────────────────────────────────────────
+
+def build_auth_headers(creds: dict, web_platform: bool = False) -> dict:
+    """统一认证头：Bearer + X-User-Id（缺省 X-No-* 占位）。
+    web_platform=True 时附加 X-Client-Platform: web（积分三件套必需）"""
+    h = {
+        "Authorization": "Bearer " + (creds.get("access_token") or ""),
+        "User-Agent": "WorkBuddy",
+        "Content-Type": "application/json",
+    }
+    uid = creds.get("uid")
+    if uid:
+        h["X-User-Id"] = uid
+    else:
+        h["X-No-User-Id"] = "1"
+    if web_platform:
+        h["X-Client-Platform"] = "web"
+    return h
+
+
+def post_json(url, headers, body=None, timeout=30):
+    """POST JSON，返回 (http_status, parsed_or_None, raw_text)；HTTPError 也返回状态码"""
+    data = json.dumps(body if body is not None else {}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return resp.status, _try_json(raw), raw
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        return e.code, _try_json(raw), raw
+    except Exception as e:  # 网络异常：0 表示不可达
+        return 0, None, str(e)
+
+
+def _try_json(raw):
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+# ── token 刷新（F-09）──────────────────────────────────────────────────────
+
+REFRESH_URL = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh"
+
+
+def refresh_token_once(creds: dict):
+    """调 plugin refresh 端点（X-Refresh-Token 仅允许出现在此端点）。
+    返回新 creds dict 或 None（失败原因可从返回 None 后由调用方按 401 判定）"""
+    if not creds.get("refresh_token"):
+        return None
+    h = build_auth_headers(creds)
+    h["X-Refresh-Token"] = creds["refresh_token"]
+    h["X-Auth-Refresh-Source"] = "workbuddy"
+    status, body, _ = post_json(REFRESH_URL, h, {})
+    if status != 200 or not isinstance(body, dict):
+        return None
+    acc = dig(body, "accessToken")
+    ref = dig(body, "refreshToken")
+    exp_in = dig(body, "expiresIn")
+    ref_exp_in = dig(body, "refreshExpiresIn")
+    if not acc:
+        return None
+    now_ms = int(datetime.datetime.now().timestamp() * 1000)
+    out = dict(creds)
+    out["access_token"] = acc
+    if ref:
+        out["refresh_token"] = ref
+    try:
+        out["expires_at_ms"] = now_ms + int(exp_in) * 1000 if exp_in else None
+    except (TypeError, ValueError):
+        out["expires_at_ms"] = None
+    try:
+        out["refresh_expires_at_ms"] = now_ms + int(ref_exp_in) * 1000 if ref_exp_in else None
+    except (TypeError, ValueError):
+        out["refresh_expires_at_ms"] = None
+    return out
+
+
+def ensure_fresh(acct: dict, lazy_hours: int = 24) -> tuple:
+    """惰性刷新（F-09/F-55）：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
+    返回 (creds, refreshed: bool, note: str)"""
+    creds = effective_creds(acct)
+    if not creds.get("access_token"):
+        return creds, False, "no_credential"
+    exp = creds.get("expires_at_ms")
+    if exp:
+        remain_h = (exp - int(datetime.datetime.now().timestamp() * 1000)) / 3600000.0
+        if remain_h > lazy_hours:
+            return creds, False, "fresh"
+        if remain_h < 0 and not creds.get("refresh_token"):
+            return creds, False, "expired_needs_relogin"
+    new = refresh_token_once(creds)
+    if new:
+        save_token_store(acct.get("id", ""), new)
+        return new, True, "refreshed"
+    return creds, False, "refresh_failed"

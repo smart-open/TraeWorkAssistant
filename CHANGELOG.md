@@ -4,6 +4,23 @@
 
 ---
 
+## [未发布] · feature/buddy 批次 1（WorkBuddy 接入快赢闭环）
+
+### 新增
+
+- **Buddy 应用级子导航**：Sidebar 底部应用 Tab 的「Buddy」项启用（对齐豆包先例），新增 概述 / 账号管理 / 签到与成长 / 积分与统计 / 环境配置 五页（`src/pages/buddy/`，视图键 `buddy-*`）；到期日历通用组件 `ExpiryCalendar`（F-13）
+- **WorkBuddy 账号池与切换**：`workbuddy_env_check` 环境检测（auth 文件 / `~/.workbuddy` 快照解析）；auth 文件扫描入池（id = `wb-<sha256(token)前12位>`，F-04）；PS 桥 authfile 布局快照/恢复（L1 auth 文件 + L2 用户数据，单代 .bak 回滚，切换后 30s uid 轮询确认，F-02）——切换/保存登录态复用既有 `switch_account` / `save_current_login`（`target_app=WorkBuddy`）
+- **凭证续期（F-09/F-10）**：`workbuddy_refresh_token`（plugin refresh 端点，X-Refresh-Token 仅限该端点）；工具侧凭证副本 `workbuddy_token_store.json` 与桌面 auth 文件「谁新用谁」；schtasks 每周兜底任务 `AIWorkAssistant_WorkBuddyRenew`（python --renew-only 惰性刷新）
+- **一键签到（F-15/F-16）**：python `workbuddy_checkin.py`（状态查询新路径回退旧路径 / code:10001 已签容错 / 401 刷新一次重试 / NDJSON `wb-checkin-progress` 独立管线 / 零 token 输出）；每日 09:00/21:00 双时段 schtasks；启动自动补签（F-55，延迟 60s 静默执行）
+- **积分余额（F-20）**：python `workbuddy_credits.py`（积分三件套 + 旧接口回退 + 容量字段链宽容解析 + ≥5min 缓存）；`workbuddy_credits_fetch` 命令 + buddy-credits 页（KPI / 逐账号余额 / 积分包到期日历）；buddy-accounts 双态账号卡片（F-54，当前/备用 + 余额大字 + 活跃明细前 2 包 + 积分包明细弹窗 F-56 + 聚合迁移入口 F-60）
+- **自动签到配置化（F-55）**：`workbuddy_settings.json`（auto_checkin / keepalive_days / lazy_refresh_hours / growth_* 开关）+ buddy-settings 配置页
+- 新增 Python 公共库 `wb_common.py`（双源凭证 / dig 宽容解析 / 统一请求头 / token 刷新），均仅标准库
+
+### 说明
+
+- 成长中心执行器（旅行/盲盒/任务链式，F-17）与 Token 统计（F-57）、官方用量（F-25）按设计文档批次 2/3 交付，本期 UI 已预留入口与开关
+- 到期日历已接入 WorkBuddy 五页；Trae / 豆包侧挂载随批次 2 补齐
+
 ## [3.3.2] - 2026-09-10
 
 ### 修复

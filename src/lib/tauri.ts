@@ -41,6 +41,12 @@ import type {
   UpdateDownloaded,
   UpdateDownloadProgress,
   UsageDayView,
+  WorkBuddyAccountView,
+  WorkBuddyEnvCheck,
+  WorkBuddyScanResult,
+  WorkBuddySettings,
+  WbCreditsResult,
+  WbCheckinRecord,
 } from '../types';
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
@@ -163,9 +169,9 @@ export const api = {
       invoke('write_text_file', { path, content }),
     readTextFile: (path: string) => invoke<string>('read_text_file', { path }),
   },
-  switchAccount: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
+  switchAccount: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy') =>
     invoke('switch_account', { userId, targetApp: targetApp ?? null }),
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
@@ -230,6 +236,35 @@ export const api = {
     taskUnregister: () => invoke('doubao_renew_task_unregister'),
     // ---- 会员额度 ----
     fetchQuota: (userId: string) => invoke<DoubaoQuotaResult>('doubao_quota_fetch', { userId }),
+  },
+  // ---- WorkBuddy（批次1；Rust workbuddy.rs；字段名严格 snake_case）----
+  workbuddy: {
+    envCheck: () => invoke<WorkBuddyEnvCheck>('workbuddy_env_check'),
+    accountsList: () => invoke<WorkBuddyAccountView[]>('workbuddy_accounts_list'),
+    accountSave: (userId: string, name?: string, note?: string) =>
+      invoke('workbuddy_account_save', { userId, name: name ?? null, note: note ?? null }),
+    accountRemove: (userId: string, deleteSnapshot?: boolean) =>
+      invoke('workbuddy_account_remove', { userId, deleteSnapshot: deleteSnapshot ?? null }),
+    scanAuthFile: () => invoke<WorkBuddyScanResult | null>('workbuddy_scan_auth_file'),
+    accountImportAuth: (name?: string) =>
+      invoke<WorkBuddyAccountView>('workbuddy_account_import_auth', { name: name ?? null }),
+    refreshToken: (userId: string) => invoke<string>('workbuddy_refresh_token', { userId }),
+    checkinStart: (opts: { user_ids?: string[]; skip_checked_in: boolean; skip_expired: boolean }) =>
+      invoke('workbuddy_checkin_start', { opts }),
+    growthRun: () => invoke('workbuddy_growth_run'),
+    checkinResults: (days?: number) =>
+      invoke<WbCheckinRecord[]>('workbuddy_checkin_results', { days: days ?? null }),
+    checkinTaskRegister: (times: string[]) =>
+      invoke('workbuddy_checkin_task_register', { times }),
+    checkinTaskStatus: () => invoke<string[]>('workbuddy_checkin_task_status'),
+    checkinTaskUnregister: () => invoke('workbuddy_checkin_task_unregister'),
+    renewTaskRegister: (day?: string) => invoke('workbuddy_renew_task_register', { day: day ?? null }),
+    renewTaskStatus: () => invoke<boolean>('workbuddy_renew_task_status'),
+    renewTaskUnregister: () => invoke('workbuddy_renew_task_unregister'),
+    creditsFetch: (userId?: string, fresh?: boolean) =>
+      invoke<WbCreditsResult>('workbuddy_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
+    settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
+    settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),
   },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),

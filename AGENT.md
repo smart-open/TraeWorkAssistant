@@ -146,6 +146,17 @@ ai-work-assistant/
 | 设置 | `autostart_status()` / `autostart_set(enabled)` | 开机自启查询 / 开关（T11，即时生效）；配套 `settings.silent_checkin` 启动静默签到 |
 | 计划 | `task_register(time)` / `task_status()` / `task_unregister()` | `schtasks` 注册每日签到 |
 | 更新 | `update_check()` / `update_download(...)` → `UpdateDownloaded` / `update_run_installer({file_path, asset_name})` | 两步确认制：下载（确认一）→ 安装（确认二）。安装器参数 `/P /UPDATE /R`：被动进度条 + 跳过卸载直接覆盖 + 完成后自动重启应用；`run_installer` 校验路径必须位于临时更新目录 |
+| WorkBuddy | `workbuddy_env_check()` → `WorkBuddyEnvCheck` | 客户端安装/运行/版本 + auth 文件存在性 + `~/.workbuddy` 快照解析（uid/昵称/editionType）；复用 app_locate 四级探测 |
+| WorkBuddy | `workbuddy_accounts_list` → `WorkBuddyAccountView[]` | 账号池（data/workbuddy_accounts.json）+ 在线标记（auth 文件 uid 匹配）+ 快照/凭证副本存在性；id = `wb-<sha256(token)前12位>`（同 token 稳定同 id） |
+| WorkBuddy | `workbuddy_account_save/remove` / `workbuddy_scan_auth_file` / `workbuddy_account_import_auth` | 别名备注 / 删除 / auth 文件扫描预览 / 确认入池（凭证入 token store 副本，零明文出 Rust） |
+| WorkBuddy | `workbuddy_refresh_token(userId)` | plugin refresh 端点（X-Refresh-Token 仅限此端点）+ 回写 token store 与账号池过期时间；失败提示需重登 |
+| WorkBuddy | `workbuddy_checkin_start(opts)` → NDJSON `wb-checkin-progress` | 调 python workbuddy_checkin.py（状态查询回退旧路径 / code:10001 已签容错 / 401 刷新一次重试 / 零 token 输出）；opts: `{ user_ids?, skip_checked_in, skip_expired, lazy_hours? }` |
+| WorkBuddy | `workbuddy_growth_run()` | 成长中心执行入口（旅行/盲盒/任务开关从 workbuddy_settings.json 读取；python 执行器随批次 2 接入） |
+| WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（data/workbuddy_checkin_results.json 90 天滚动，默认展示 30 天） |
+| WorkBuddy | `workbuddy_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日双时段签到任务 AIWorkAssistant_WorkBuddyCheckin_<HHMM>（09:00/21:00） |
+| WorkBuddy | `workbuddy_renew_task_register(day) / _status / _unregister` | schtasks 每周凭证续期兜底任务 AIWorkAssistant_WorkBuddyRenew（周日 10:30，python --renew-only 惰性刷新） |
+| WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | 调 python workbuddy_credits.py：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥5min 缓存；成功回写账号池余额缓存 |
+| WorkBuddy | `workbuddy_settings_get / workbuddy_settings_set(patch)` | data/workbuddy_settings.json：auto_checkin（启动补签）/ keepalive_days / lazy_refresh_hours / growth_* 开关 |
 
 ### 5.1 双应用与双 uid 体系（F-08，trae_apps.rs）
 
@@ -166,6 +177,7 @@ ai-work-assistant/
 | `save-login-done` | `{ success: boolean, raw: string }` |
 | `update-download-progress` | `{ received, total, percent }`（更新包下载进度） |
 | `update-installing` | `string`（asset_name，安装器已启动、应用即将退出） |
+| `wb-checkin-progress` | `{"type":"start",total}` / `{"type":"account",index,user_id,name,status,message}` / `{"type":"done",ok,already,failed}` / `{"type":"exit",ok}`（WorkBuddy 签到独立管线，与 Trae checkin-progress 互不串扰） |
 
 ## 7. 数据文件
 
@@ -175,6 +187,12 @@ ai-work-assistant/
 │   └── app_settings.json         # Settings 全字段（snake_case）
 ├── data/
 │   ├── checkin_accounts.json     # { accounts: [{name, UserID, jwt, refresh_token?, added_at}] }
+│   ├── workbuddy_accounts.json   # WorkBuddy 账号池（id=wb-<sha256(token)前12位>，凭证仅存 token store）
+│   ├── workbuddy_token_store.json# WorkBuddy 工具侧凭证副本（version=1 + expiresAtMs；与桌面 auth 文件谁新用谁）
+│   ├── workbuddy_settings.json   # WorkBuddy 配置（auto_checkin / keepalive_days / lazy_refresh_hours / growth_*）
+│   ├── workbuddy_credits_cache.json # 积分查询缓存（≥5min）
+│   ├── workbuddy_checkin_results.json # WorkBuddy 签到结果（90 天滚动）
+│   ├── profiles_workbuddy/       # WorkBuddy 快照槽（auth/ + storage/ + meta.json + current_account.txt）
 │   ├── device_map.json           # { <userId>: { device_id, market_user_id, session_id } }
 │   ├── groups.json               # { groups: [...], membership: {<uid>:<gid>} }
 │   ├── credits_history.json      # { records: [{date,user_id,credits,delta}] }
@@ -207,6 +225,7 @@ ai-work-assistant/
 - **单代回滚保护（chromium 布局）**：`Backup-ChromiumProfile` 覆盖已有槽位前把旧快照整体 `Move-Item` 到 `<slot>.bak`（旧 .bak 淘汰）；`Restore-ChromiumProfile` 主槽缺失时回退用 .bak，Switch 预检查同样放行 .bak。背景：Switch 的"备份当前到来源槽"依赖 current_account.txt 与客户端实际登录一致，不一致时会把错误状态反复刷进该槽且不可恢复（实测把 B 快照覆盖成混乱状态）。`Copy-SnapshotItem` 文件分支先删旧目标再拷贝——文件被锁拷贝失败时不会留下旧文件冒充成功；`Copy-SnapshotItem`/`Test-SnapshotIntegrity` 的参数为最终路径（`-Path`），由调用方解析主槽或 .bak。豆包优雅关闭等待 `GracefulWaitSecs=8`（chromium 落盘慢，3 秒强杀会导致文件锁/未落盘）。
 - **防误覆盖守卫（ExpectedCurrentUid，chromium 布局）**：桌面端 Switch 前用 `detect_guard_uid_strict`（Local Storage/抓包新鲜度链检测 uid + **Live Cookies 登录会话验证**）取当前登录，经 `-ExpectedCurrentUid` 传给桥；桥仅在它与 current_account.txt **一致**时才把"当前态"回写进来源账号槽，否则只备份 last 槽并 warn（客户端手动重登/未登录/检测失败时保护账号快照不被错误状态覆盖）。`doubao_open_as_account` 与 `switch_account`（豆包路径）均接入。.bak/last 槽不在账号列表展示（`doubao_accounts_list` 过滤 `*.bak`）。
 - **登录会话 Cookie 检测（doubao_chats.py `--check-login-cookie <dir>`）**：Chromium Cookies 库的 cookie **名**为明文（值加密不影响），sqlite 判定 `host_key like %doubao.com` 且 name∈(sessionid,sid_guard) 是否存在；客户端运行中先复制 Cookies* 到临时目录再读。返回 `{ok, doubao_cookies, has_session}`。用途①`save_current_login` 保存前预检 Live profile（无登录会话 → 拒绝保存，防止未登录态入槽）；用途②`doubao_open_as_account` 目标槽预检（快照无登录会话 → 拦截并提示重存）；用途③切换守卫严格版（uid 检测可能被快照 localStorage 残留骗过——实测未登录客户端仍报旧 uid 导致守卫误放行，Cookie 存在性无法伪造）。Rust 侧 `check_profile_login_cookie` 返回 None（脚本缺失/读库失败）时一律不阻断，保持可用性。
+- **authfile 布局（WorkBuddy，批次1）**：`Backup-AuthFileProfile` / `Restore-AuthFileProfile`——L1 必选 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`；L2 体验 `~\.workbuddy\storage\user-<uid>*` 目录；槽位元数据 `meta.json`（schemaVersion=1 / uid / savedAt）。单代回滚保护对齐豆包（覆盖前挪 `<slot>.bak`）；恢复前校验 auth 文件存在（缺失即中止）；Switch 后 `Confirm-AuthFileSwitch` 轮询 `~/.workbuddy/storage/skeleton/account-snapshot.json` uid（30s 超时，fail-open 仅 warn）。客户端历史快照 `workbuddy-desktop.<ts>.<pid>.<uuid>.info` 不入快照槽。
 
 ## 9. Python 约定
 
