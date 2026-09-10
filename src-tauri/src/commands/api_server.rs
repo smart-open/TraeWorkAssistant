@@ -465,19 +465,25 @@ pub fn api_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<cra
 
 // ==================== 多 API Key 命令 ====================
 
-/// 读取 API Key 列表
+/// 读取 API Key 列表与鉴权开关
 #[tauri::command]
-pub fn api_keys_list(state: State<'_, AppState>) -> Vec<crate::api_server::api_keys::ApiKeyEntry> {
-    crate::api_server::api_keys::load(&state.data_dir).keys
+pub fn api_keys_list(state: State<'_, AppState>) -> crate::api_server::api_keys::ApiKeysFile {
+    crate::api_server::api_keys::load(&state.data_dir)
 }
 
-/// 保存 API Key 列表（整表写盘；每次请求重读文件，改动立即生效）
+/// 保存 API Key 列表（整表写盘；每次请求重读文件，改动立即生效）。
+/// `auth_disabled` 不传时保留现值（避免整表保存覆盖鉴权开关）。
 #[tauri::command]
 pub fn api_keys_save(
     state: State<'_, AppState>,
     keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
+    auth_disabled: Option<bool>,
 ) -> Result<(), String> {
-    let file = crate::api_server::api_keys::ApiKeysFile { keys };
+    let prev = crate::api_server::api_keys::load(&state.data_dir);
+    let file = crate::api_server::api_keys::ApiKeysFile {
+        keys,
+        auth_disabled: auth_disabled.unwrap_or(prev.auth_disabled),
+    };
     crate::api_server::api_keys::save(&state.data_dir, &file);
     Ok(())
 }

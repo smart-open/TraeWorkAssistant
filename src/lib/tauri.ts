@@ -5,6 +5,7 @@ import type {
   ApiServiceStatus,
   ApiPoolFile,
   ApiKeyEntry,
+  ApiKeysFileView,
   CheckinDone,
   CheckinOpts,
   CheckinTrendPoint,
@@ -186,8 +187,10 @@ export const api = {
     modelsSync: () => invoke<ModelOption[]>('api_models_sync'),
     usageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_usage_stats', { days: days ?? 14 }),
-    keysList: () => invoke<ApiKeyEntry[]>('api_keys_list'),
-    keysSave: (keys: ApiKeyEntry[]) => invoke('api_keys_save', { keys }),
+    keysList: () => invoke<ApiKeysFileView>('api_keys_list'),
+    // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）
+    keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
+      invoke('api_keys_save', { keys, authDisabled: authDisabled ?? null }),
   },
   traeLocal: {
     entitlement: () => invoke<AppEntitlement | null>('apps_entitlement_read'),

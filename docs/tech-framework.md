@@ -58,7 +58,7 @@ PowerShell     trae-switch-bridge.ps1（登录态切换 + 6 层设备标识重�
 ### 2.2 API 网关实现要点（v2.9.0 T1-T11）
 
 - **用量统计（T1）**：`data/api_usage.json` 按日落盘（模型/上游账号/API Key/流式/成败/耗时/token 多维聚合，保留 90 天），`api_usage_stats(days)` 直读落盘（服务未运行也可查）。
-- **多 API Key（T2/T15）**：`data/api_keys.json` 多 Key 独立签发 + 每日配额（0=不限，跨天重置，超限 429）；每请求重读文件，增删/启停立即生效；主 Key 双轨已移除，鉴权统一走 Key 列表（未配置启用 Key 时默认拒绝所有业务请求并返回 401 auth_not_configured，防本机任意进程无鉴权消耗上游额度；仅 /health 豁免）。
+- **多 API Key（T2/T15）**：`data/api_keys.json` 多 Key 独立签发 + 每日配额（0=不限，跨天重置，超限 429）；每请求重读文件，增删/启停/开关立即生效；主 Key 双轨已移除，鉴权统一走 Key 列表（未配置启用 Key 时默认拒绝并返回 401 JSON 引导文案，防本机任意进程无鉴权消耗上游额度；可在「API 服务」页显式关闭鉴权（auth_disabled，不推荐），存在启用 Key 时开关无效；仅 /health 豁免）。
 - **签到重试（T5）**：最多 2 轮（30s/90s），仅重试失败账号；`CheckinGuard`（tokio::sync::Mutex）应用级防重入，页面/托盘/静默签到共用；per-uid 最终态合并保证 `ok+already+failed==total`。
 - **凭据加密（T4）**：jwt/refresh_token 迁入 Stronghold vault（`conf/vault.stronghold`），主密码经 DPAPI 保护（`conf/vault_key.bin`）；JSON 落盘占位化；vault 写失败降级明文 + 下次启动重试迁移；Python 签到走临时解密文件（`--accounts-file`，用后即删 + 启动清理崩溃残留）。
 - **池调度策略（T10）**：`api_pool.json` 扩展 `strategy`（expire_first / credit_first / random）与 `group_ids`（空=全部参与）；策略纯函数化，分组同步期过滤。

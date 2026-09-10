@@ -140,7 +140,7 @@ trae-work-assistant/
 │   ├── account_cooldowns.json    # 签到错误冷却状态（error_type + cooldown_until）
 │   ├── checkin_results.json      # 每日签到结果（per-uid 最终态，重试轮自然合并；保留 90 天）
 │   ├── api_pool.json             # API 账号池配置（strategy/group_ids）+ 状态
-│   ├── api_keys.json             # 多 API Key（id/name/key/enabled/daily_limit，0=不限；启用 Key 为空则拒绝所有业务请求 401）
+│   ├── api_keys.json             # 多 API Key（id/name/key/enabled/daily_limit，0=不限；启用 Key 为空时默认拒绝 401，可显式关闭鉴权 auth_disabled）
 │   ├── api_usage.json            # API 用量按日聚合（日期/协议/模型/账号/Key/成败/流式/耗时；保留 90 天）
 │   ├── api_models.json           # 模型列表（官网同步 ∪ 内置补集；含 function 自学习覆盖）
 │   └── profiles/                 # 登录态快照
@@ -228,7 +228,7 @@ trae-work-assistant/
 - **零外发**：不连接任何自有后端。
 - **CA 证书**：仅本地回环 `127.0.0.1:8899`，自签根 CA 需 UAC 安装。
 - **UAC**：仅在 `cert_install` 提权，切换桥已改为普通用户可运行。
-- **API Key**：多 Key 列表管理（data/api_keys.json）；未配置任何启用 Key 时 API 服务默认拒绝所有业务请求（401 auth_not_configured，防本机任意进程无鉴权消耗上游额度），仅 /health 豁免；前端掩码显示（前 4 + 后 4 + ****）。
+- **API Key**：多 Key 列表管理（data/api_keys.json）；未配置任何启用 Key 时默认拒绝业务请求（401 JSON 引导文案，防本机任意进程无鉴权消耗上游额度），可在「API 服务」页显式关闭鉴权（不推荐，存在启用 Key 时开关无效）；仅 /health 豁免；前端掩码显示（前 4 + 后 4 + ****）。
 - **更新包完整性**：Release 必须附带 `latest.json` 校验清单（各资产 SHA-256，rename_release.py 生成）；更新器下载后强制比对，不匹配拒绝安装；安装前再与下载记录二次比对（防替换）。
 - **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。
 

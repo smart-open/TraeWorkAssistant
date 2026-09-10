@@ -90,7 +90,7 @@ interface AppState {
   refreshAccounts: () => Promise<void>;
   refreshGroups: () => Promise<void>;
   refreshSettings: () => Promise<void>;
-  refreshLogs: (q?: LogQuery) => Promise<void>;
+  refreshLogs: (q?: LogQuery, manual?: boolean) => Promise<void>;
   refreshCreditsHistory: () => Promise<void>;
   refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
@@ -136,9 +136,12 @@ interface AppState {
 let toastSeq = 0;
 // 已注册的事件监听取消函数；StrictMode 下 init 会执行两次，靠它先注销旧监听避免重复注册
 let unsubs: Array<() => void> = [];
-// 日志查询并发序号（最新请求胜出）与连续失败 toast 去重标记
+// 日志查询并发控制：轮询在飞时跳过本轮（防 2s 轮询堆积）；序号保证最新请求胜出
+// （手动刷新与轮询可并发，旧响应丢弃防乱序覆盖）
 let logsReqSeq = 0;
-let logsErrToasted = false;
+let logsPollInflight = false;
+// 同因 toast 限频：读取持续失败期间每 60s 最多弹一次（防 toast 风暴）；手动查询直通即时反馈
+let lastLogsErrToastAt = 0;
 
 function defaultSettings(): Settings {
   return {
@@ -418,10 +421,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ settings: defaultSettings() });
     }
   },
-  refreshLogs: async (q) => {
-    // 最新请求胜出：旧响应直接丢弃，防止慢响应覆盖新数据
-    // （日志页 2s 轮询与手动查询/筛选切换可能并发）
+  refreshLogs: async (q, manual) => {
+    // 轮询在飞时跳过本轮（防 2s 轮询堆积）；手动查询不受限
+    if (logsPollInflight && !manual) return;
+    // 序号保证最新请求胜出：手动与轮询并发时丢弃旧响应，防乱序覆盖
     const seq = ++logsReqSeq;
+    const poll = !manual;
+    if (poll) logsPollInflight = true;
     try {
       const logs = await api.misc.logsQuery({
         logType: q?.logType,
@@ -431,15 +437,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
       if (seq !== logsReqSeq) return;
       set({ logs });
-      logsErrToasted = false; // 恢复成功后重置，下次失败可再次提示
     } catch (err) {
       if (seq !== logsReqSeq) return;
-      // 失败去风暴：连续失败只弹一次 toast（恢复成功后重置），
-      // 避免文件锁/权限异常期间每 2s 弹一次无法消除
-      if (!logsErrToasted) {
-        logsErrToasted = true;
+      // 同因 toast 限频：持续失败期间每 60s 最多弹一次（防 toast 风暴）；手动查询直通即时反馈
+      const now = Date.now();
+      if (manual || now - lastLogsErrToastAt > 60_000) {
+        lastLogsErrToastAt = now;
         get().pushToast('error', `读取日志失败：${String(err)}`);
       }
+    } finally {
+      if (poll) logsPollInflight = false;
     }
   },
   refreshCreditsHistory: async () => {

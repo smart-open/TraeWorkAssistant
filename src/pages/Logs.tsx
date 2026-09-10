@@ -39,7 +39,7 @@ function SystemLogsTab() {
   const [clearing, setClearing] = useState(false);
 
   useEffect(() => {
-    void refreshLogs({ logType: type, date: date || undefined });
+    void refreshLogs({ logType: type, date: date || undefined }, true);
   }, [type, date, refreshLogs]);
 
   useEffect(() => {
@@ -51,7 +51,7 @@ function SystemLogsTab() {
   }, [autoRefresh, type, date, kw, refreshLogs]);
 
   const onSearch = () => {
-    void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined });
+    void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined }, true);
   };
 
   const copyProxyLog = async () => {

@@ -1,7 +1,8 @@
 //! 多 API Key 管理与每日配额。
 //!
 //! 数据落盘 `data/api_keys.json`；`daily_limit = 0` 表示不限。
-//! 所有 Key 统一在列表中维护（无主/子之分）；未配置任何启用的 Key 时拒绝所有业务请求（fail-closed）。
+//! 所有 Key 统一在列表中维护（无主/子之分）；未配置任何启用的 Key 时：
+//! `auth_disabled = true`（显式关闭鉴权）放行并记为 anonymous，否则拒绝请求（默认，fail-closed）。
 //! 每次鉴权命中 Key 即累加当日用量并原子写盘（与 usage.rs 同策略：个人频率低）。
 
 use std::path::{Path, PathBuf};
@@ -57,6 +58,10 @@ fn default_true() -> bool {
 pub struct ApiKeysFile {
     #[serde(default)]
     pub keys: Vec<ApiKeyEntry>,
+    /// 显式关闭鉴权：仅当没有任何启用 Key 时生效（true = 无 Key 放行；默认 false = 无 Key 拒绝）。
+    /// 存在启用 Key 时本开关无效，一律要求鉴权。
+    #[serde(default)]
+    pub auth_disabled: bool,
 }
 
 /// 当日是否仍有配额；跨天自动重置计数
@@ -128,6 +133,7 @@ mod tests {
     fn verify_matches_enabled_key_and_counts() {
         let mut f = ApiKeysFile {
             keys: vec![entry("k1", "sk-a", true, 0)],
+            auth_disabled: false,
         };
         assert!(matches!(f.verify_and_consume("sk-a", "2026-09-09"), KeyCheck::Ok(id) if id == "k1"));
         assert_eq!(f.keys[0].used_today, 1);
@@ -138,6 +144,7 @@ mod tests {
     fn verify_rejects_disabled_or_unknown() {
         let mut f = ApiKeysFile {
             keys: vec![entry("k1", "sk-a", false, 0), entry("k2", "sk-b", true, 0)],
+            auth_disabled: false,
         };
         assert!(matches!(f.verify_and_consume("sk-a", "d"), KeyCheck::Invalid));
         assert!(matches!(f.verify_and_consume("sk-c", "d"), KeyCheck::Invalid));
@@ -147,6 +154,7 @@ mod tests {
     fn quota_blocks_at_limit_and_resets_next_day() {
         let mut f = ApiKeysFile {
             keys: vec![entry("k1", "sk-a", true, 2)],
+            auth_disabled: false,
         };
         assert!(matches!(f.verify_and_consume("sk-a", "d1"), KeyCheck::Ok(_)));
         assert!(matches!(f.verify_and_consume("sk-a", "d1"), KeyCheck::Ok(_)));

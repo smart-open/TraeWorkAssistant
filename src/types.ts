@@ -301,6 +301,13 @@ export interface ApiKeyEntry {
   used_today: number;
 }
 
+// API Key 数据文件视图（api_keys_list 返回：列表 + 鉴权开关）
+export interface ApiKeysFileView {
+  keys: ApiKeyEntry[];
+  // 显式关闭鉴权：仅当无启用 Key 时生效（true=放行，默认 false=拒绝）
+  auth_disabled: boolean;
+}
+
 // ---- 登录态快照 ----
 export interface ProfileInfo {
   slot: string;

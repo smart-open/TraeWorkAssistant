@@ -14,8 +14,8 @@ use super::ApiSharedState;
 /// - /health 跳过鉴权
 /// - Key 统一在 data/api_keys.json 列表中维护（带每日配额），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
-/// - 未配置任何启用的 Key 时默认拒绝所有业务请求（401 auth_not_configured）：
-///   防止本机任意进程无鉴权借用用户上游凭证消耗额度（S2 missing_authz，fail-closed）
+/// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权，UI 标注风险）
+///   放行并记为 anonymous，否则拒绝（默认，fail-closed）并返回引导提示
 /// - Key 每次命中即累加当日用量并写盘，超配额返回 429
 /// - 每次请求重读 api_keys.json：新增/删除/禁用立即生效
 /// 校验通过后向 request extensions 插入命中的 Key 标识（KeyId），供 handler 用量记账
@@ -43,9 +43,14 @@ pub async fn bearer_auth(
         .map(|s| s.to_string());
     let presented = bearer.or(xkey);
 
-    // 未配置任何启用的 Key → 默认拒绝（不区分是否携带 Key），提示先配置
+    // 未配置任何启用的 Key：显式关闭鉴权时放行记 anonymous（用户主动选择，UI 已标注风险）；
+    // 否则默认拒绝（fail-closed，防本机任意进程无鉴权借用上游凭证消耗额度，S2 missing_authz）
     let mut keys: ApiKeysFile = api_keys::load(&state.data_dir);
     if !keys.has_enabled() {
+        if keys.auth_disabled {
+            request.extensions_mut().insert(KeyId("anonymous".into()));
+            return next.run(request).await;
+        }
         return auth_not_configured();
     }
 
@@ -65,13 +70,15 @@ pub async fn bearer_auth(
     }
 }
 
-/// 401 未配置鉴权响应（JSON 错误体，OpenAI/Anthropic 客户端均可解析 message）
+/// 401 未配置鉴权响应：无启用 Key 且未显式关闭鉴权。
+/// JSON 错误体给出两条出路（创建启用 Key / 显式关闭鉴权），OpenAI/Anthropic 客户端均可解析 message。
 fn auth_not_configured() -> Response {
     let body = json!({
         "error": {
-            "message": "API 服务未配置任何启用的 API Key，已拒绝请求（防止本机任意进程无鉴权调用）。请在 Trae Work 助手「API 服务」页的「API Keys 管理」中添加并启用 Key",
-            "type": "auth_not_configured",
-            "code": "auth_not_configured",
+            "message": "API 服务已启用鉴权：请在应用的「API 服务」页创建并启用 API Key，\
+                        或在该页显式关闭鉴权（不推荐，任何本机程序均可调用）",
+            "type": "invalid_request_error",
+            "code": "api_key_required",
         }
     });
     (
