@@ -4,6 +4,29 @@
 
 ---
 
+## [未发布] · feature/buddy 批次 3（会话数据 + 用量 + CLI 桥 + 生态）
+
+### 新增
+
+- **CLI 切号桥 + 五重防护轮换（T3.4/F-06/F-59）**：新增 `src-tauri/src/workbuddy_cli.rs`（决策纯函数 `decide_target`：有效候选过滤 → 紧迫排序 → 紧迫阈值 → 当前即目标 → 冷却期 → CLI 活跃保护（jsonl mtime）→ 最小剩余积分 → 最小横跳间隔，13 单测）；`commands/workbuddy.rs` CLI 桥：`workbuddy_cli_status`（含 environment_override 进程 env 警告）/ `workbuddy_cli_bridge_set`（写 `~/.codebuddy/settings.json` env 直桥）/ `workbuddy_cli_rotate_run` / `workbuddy_cli_rotate_logs`（cap 50）；后台轮换线程按 settings 七个 `cli_*` 参数独立运行，Windows 路线绕过 apiKeyHelper 直写 env；BuddySettings 新增 CliRotateCard（状态行 + 参数网格 + 立即检查 + 轮换日志）
+- **会话三件套备份/恢复 + 复制迁移（T3.1/T3.2/F-44/F-45）**：`workbuddy_chatdata_backup/restore/info`（正文 `~/.workbuddy/projects` + workbuddy.db + edge-sync-mapping-v2.db → `data/workbuddy_chats/<uid>/`；恢复前 `.bak` 单代保护 + 完整性校验失败自动回滚）与 `workbuddy_chatdata_copy`（jsonl 逐行 sessionId 换全新 UUID——`pseudo_uuid_v4` sha256 纳秒源纯函数；sessions 表动态列整行克隆；edge 映射全表扫描 convmsg 替换；`.pre-copy.bak` 双 db 预备份）；账号卡菜单 + 表视图操作接入
+- **官方用量 + Token 统计增强（T3.3/F-25/26/57/58）**：新增 `commands/workbuddy_stats.rs`——本地 JSONL 统计合并 `~/.workbuddy/projects` 与 `~/.codebuddy/projects`（跳过 subagents；usage 取值 message.usage > providerData.usage > 顶层；cache_read 别名链优先正值防陈旧 0 掩盖；cache_write 仅认显式别名；365 天窗口，6 单测）；`workbuddy_usage_official` 官方请求用量（`POST <domain>/billing/meter/get-user-request-usage` 近 31 天分页 requestId 去重，今日/近7天/本月 + 逐日按模型，10min 缓存，prompt/input 字段脱敏不落盘）；TokenStatsPanel（四指标卡 + 构成堆叠条 + ComposedChart 双轴趋势[堆叠柱四类构成 + 调用次数虚线] + GitHub 风格年度热力图 + 模型排行 Top8；官方用量区含剩余/今日/近7天/本月 KPI + 按模型堆叠柱 + 官方模型排行）；BuddyCredits「Token 统计」Tab 占位转正
+- **OAuth 扫码登录 + 环境重置（T3.5/F-50/F-14）**：`workbuddy_oauth_login`（`auth/state?platform=CLI` → 系统浏览器 → `auth/token?state=` 轮询 ≤300s → `login/account?state=` 取资料 → 自动入池 + 凭证回写 token store；每流程独立 cookie jar = Set-Cookie 手工捕获回传，零新依赖；事件 wb-oauth-progress/done）；`workbuddy_env_reset_items/_env_reset`（16 项认证残留清理清单——对齐 oss-research antigravity-tools 17 物理位置，「认证文件」合并两文件；Keycloak SSO 注销先于清理（JWT iss → 浏览器 logout）；执行前自动关闭 WorkBuddy；单项失败不中断）；账号页聚合区 OAuth 按钮激活 + PageHeader 环境重置入口（勾选预览 + 二次确认弹框）
+- **账号库导入导出 + 通知渠道（T3.6/F-19/F-46）**：`workbuddy_accounts_export/import`（kind 标记 `aiwork-workbuddy-pool`、按 id 去重、凭证可选随行并回写 token store）；notify.rs 重写为 `NotifyChannels`（企业微信 webhook + Server酱 sendkey），`push_notify` 统一入口，渠道失败静默记日志；BuddySettings 通知渠道卡
+- **ck_ 子 Key 体系（T3.7/F-35）**：`api_keys.rs` 扩展——子 Key `ck_` 前缀生成（旧 sk- 兼容）、`allowed_accounts` 限定上游白名单、`schedule_mode` 专一/临期优先两模式（`dedicated_account` 绑定）、`daily_stats` 按日请求统计（cap 90）；鉴权中间件下发 `ResolvedKey` 快照，wb_route 流式/非流式统一走 `pick_excluding_constrained`（专一锁定 > 白名单过滤 > 池策略；粘性账号不在白名单时忽略粘性）；ApiService Key 表新增调度列 + 配置弹框（模式切换/专一账号/上游多选/近 7 日统计迷你柱图）；Key 删除确认改弹框（移除 window.confirm 红线违例）
+
+### 变更
+
+- `upsert_token_store` 签名放宽为 `&AppState`（OAuth 后台线程复用）；`process.rs` 映像表新增 WorkBuddy.exe（三级关闭）
+- `main.rs` 注册 12 个新命令 + `workbuddy_cli` / `workbuddy_stats` 模块；启动线程挂载 CLI 轮换
+- BuddyCheckin settings 类型对齐 `WorkBuddySettings`（修 TS2345）
+
+### 说明
+
+- OAuth 三端点与官方用量的响应结构按设计文档 §3.10/§7.1 宽容解析（dig 多 key 回退），首次真实登录联调前字段名可能需按实测微调
+- 环境重置清理项基于 oss-research 实测清单 Rust 化重写（learn-the-design 不抄码）；对 state.vscdb / workbuddy.db 的 DELETE 均在客户端关闭后执行
+- 本地 Token 统计口径：input 已含缓存读取（供应商语义），总 Token = input + output + cache_write 不重复计 read；缓存命中率 = cache_read / input
+
 ## [未发布] · feature/buddy 批次 2（API 暴露 + 成长中心）
 
 ### 新增

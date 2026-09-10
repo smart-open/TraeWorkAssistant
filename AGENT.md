@@ -157,6 +157,13 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_renew_task_register(day) / _status / _unregister` | schtasks 每周凭证续期兜底任务 AIWorkAssistant_WorkBuddyRenew（周日 10:30，python --renew-only 惰性刷新） |
 | WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | 调 python workbuddy_credits.py：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥5min 缓存；成功回写账号池余额缓存 |
 | WorkBuddy | `workbuddy_settings_get / workbuddy_settings_set(patch)` | data/workbuddy_settings.json：auto_checkin（启动补签）/ keepalive_days / lazy_refresh_hours / growth_* 开关 |
+| WorkBuddy | `workbuddy_cli_status / _bridge_set(userId) / _rotate_run / _rotate_logs(limit?)` | CLI 切号桥（F-06/F-59，批次3）：桥接状态（含 environment_override 警告）/ 写 `~/.codebuddy/settings.json` env 直桥 / 手动触发五重防护轮换 / 轮换日志（cap 50）；后台轮换线程 `start_cli_rotate_thread()` 按 settings.cli_* 配置独立运行（`workbuddy_cli.rs` 决策纯函数 `decide_target` 13 单测） |
+| WorkBuddy | `workbuddy_chatdata_backup/restore/info(userId)` / `_copy(source,target)` | 会话三件套（F-44/F-45，批次3）：正文 projects/ + workbuddy.db + edge-sync-mapping-v2.db → `data/workbuddy_chats/<uid>/`（restore 前 .bak 单代保护 + 完整性校验回滚）；copy = jsonl 逐行 sessionId 换新 UUID（pseudo_uuid_v4 纯函数）+ sessions 整行克隆 + edge 映射 convmsg 替换（`.pre-copy.bak` 预备份） |
+| WorkBuddy | `workbuddy_accounts_export(includeCredentials?) / _import(payload)` | 账号库导入导出（F-46 扩展，批次3）：kind 标记 `aiwork-workbuddy-pool`、按 id 去重、含凭证导出时回写 token store；凭证是否随行由用户勾选 |
+| WorkBuddy | `workbuddy_oauth_login()` | OAuth 扫码登录（F-50，批次3）：`POST /v2/plugin/auth/state?platform=CLI` → 系统浏览器打开 authUrl → 轮询 `GET /v2/plugin/auth/token?state=`（≤300s/3s）→ `GET /v2/plugin/login/account?state=` 取 uid/nickname → 自动入池 + 凭证回写 token store；每流程独立 cookie jar（Set-Cookie 手工捕获，零新依赖）；事件 wb-oauth-progress / wb-oauth-done |
+| WorkBuddy | `workbuddy_env_reset_items()` / `_env_reset(items, keycloakLogout)` | 环境重置（F-14，批次3）：16 项认证残留清理清单（对齐 oss-research 17 物理位置，勾选预览 + 存在性标注）+ Keycloak SSO 注销（JWT iss → 浏览器 logout，先于清理执行）；执行前自动关闭 WorkBuddy，单项失败不中断 |
+| WorkBuddy | `workbuddy_usage_official(userId?, fresh?)` | 官方请求用量（F-25，批次3）：`POST <domain>/billing/meter/get-user-request-usage` 近 31 天分页（pageSize 3000，≤20 页，requestId 去重）→ 今日/近7天/本月 + 逐日按模型聚合；缓存 10min（data/workbuddy_usage_official_cache.json）；上游 prompt/input 字段一律不复制（脱敏红线） |
+| WorkBuddy | `workbuddy_token_stats()` | 本地 Token 统计（F-26/F-57，批次3）：合并 `~/.workbuddy/projects` + `~/.codebuddy/projects` JSONL（跳过 subagents/），usage 取值 message.usage > providerData.usage > 顶层，cache_read 别名链优先正值（cache_read_input_tokens→prompt_cache_hit_tokens），固定 365 天窗口；输出 summary/models/projects/daily/daily_by_model（snake_case，`commands/workbuddy_stats.rs` 6 单测） |
 
 ### 5.1 双应用与双 uid 体系（F-08，trae_apps.rs）
 
@@ -174,6 +181,7 @@ ai-work-assistant/
 - **会话粘性（wb_sticky.rs，仅 WB）**：显式 `conversation_id` 绑定（TTL 30m 滚动续期）+ 无 id 时指纹模式（前 3 消息 SHA256 前 6 位 + 60s 窗）；绑定含上游 conversation_id（双段分配），Mutex 内 re-check 防 TOCTOU；持久化 wb_sticky_sessions.json。
 - **工程化（T2.7/F-34）**：模型级冷却 10→20→40s 渐进退避（优先级高于 Key 级，成功清除）；SSE keep-alive 15s 注释行（SOLO 与 WB 流式均已接入）；首字超时 10s 故障转移（转发线程 + recv_timeout，Agent 300s 读超时兜底 detach）；客户端断连后继续消费上游保 usage 完整（wb_sse 忽略 send 失败直至 EOF）。
 - **运维接口（T2.3/F-32）**：`/healthz`（无健康账号 503）；`/v1/models` 合并 WB 目录（owned_by=workbuddy）；`/status`、`/health` 增加 `wb` 段（池画像/模型冷却/粘性会话数）；WB 请求日志含 TTFB。
+- **ck_ 子 Key 体系（F-35，批次3）**：对外子 Key（`ck_` 前缀，`generate_sub_key` sha256 纳秒源；旧 `sk-` 兼容）与上游真实凭证分离。`api_keys.json` 条目扩展：`allowed_accounts`（上游 uid 白名单，空=不限）、`schedule_mode`（`expire_first` 临期优先默认 / `dedicated` 专一固定 `dedicated_account`）、`daily_stats`（按日请求统计 cap 90 天）。鉴权中间件把 `ResolvedKey` 快照注入 extensions；wb_route 流式/非流式取号统一走 `pick_excluding_constrained`（专一锁定 > 白名单过滤 > 池策略），粘性绑定不白名单内时忽略粘性。
 
 ## 6. Tauri 事件（Rust → 前端）
 
@@ -189,6 +197,8 @@ ai-work-assistant/
 | `update-download-progress` | `{ received, total, percent }`（更新包下载进度） |
 | `update-installing` | `string`（asset_name，安装器已启动、应用即将退出） |
 | `wb-checkin-progress` | `{"type":"start",total,mode?}` / `{"type":"account",index,user_id,name,status,message}` / `{"type":"growth",index,user_id,name,status,travel?,lottery?,tasks?,energy?,streak?}` / `{"type":"done",ok,already,failed,mode?}` / `{"type":"exit",ok}`（WorkBuddy 签到/成长中心独立管线：`mode:"growth"` 标记成长事件，与 Trae checkin-progress 互不串扰） |
+| `wb-oauth-progress` | `{stage:'init'|'browser'|'polling'|'success'|'error', message, auth_url?}`（OAuth 扫码流程进度；auth_url 仅 browser 阶段携带） |
+| `wb-oauth-done` | `{ok, id?, nickname?, message}`（扫码结果；成功已入池，凭证不出 Rust） |
 
 ## 7. 数据文件
 
@@ -203,6 +213,9 @@ ai-work-assistant/
 │   ├── workbuddy_settings.json   # WorkBuddy 配置（auto_checkin / keepalive_days / lazy_refresh_hours / growth_*）
 │   ├── workbuddy_credits_cache.json # 积分查询缓存（≥5min）
 │   ├── workbuddy_checkin_results.json # WorkBuddy 签到结果（90 天滚动）
+│   ├── workbuddy_chats/          # WorkBuddy 会话三件套备份（<uid>/projects/ + 双 db + chat_backup_meta.json）
+│   ├── workbuddy_cli_rotate_state.json # CLI 轮换状态（last_switch_at_ms + logs cap 50）
+│   ├── workbuddy_usage_official_cache.json # 官方请求用量缓存（10min）
 │   ├── wb_model_catalog.json     # WB 上游模型目录（15 模型静态兜底 + supported_efforts/effort_override）
 │   ├── wb_template_map.json      # 审核模板黑名单映射表（mtime 热更新；缺失用内置兜底）
 │   ├── wb_sticky_sessions.json   # WB 会话粘性绑定（显式 30m TTL / 指纹 60s 窗）
