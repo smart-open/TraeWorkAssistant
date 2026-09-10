@@ -265,6 +265,23 @@ def _try_json(raw):
 REFRESH_URL = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh"
 
 
+# ── 区域路由（T4.5/F-36，§5.2 域名路由规则）────────────────────────────────
+# CN：billing/积分 + 活动接口走 www.codebuddy.cn；Global（domain 含 .workbuddy.ai）：
+# 全走 www.workbuddy.ai。plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
+
+BILLING_BASE_CN = "https://www.codebuddy.cn"
+BILLING_BASE_GLOBAL = "https://www.workbuddy.ai"
+
+
+def region_billing_base(domain):
+    """按账号 token domain 字段返回 billing/activity 域名"""
+    return BILLING_BASE_GLOBAL if ".workbuddy.ai" in (domain or "") else BILLING_BASE_CN
+
+
+def is_global_region(domain):
+    return ".workbuddy.ai" in (domain or "")
+
+
 def refresh_token_once(creds: dict):
     """调 plugin refresh 端点（X-Refresh-Token 仅允许出现在此端点）。
     返回新 creds dict 或 None（失败原因可从返回 None 后由调用方按 401 判定）"""

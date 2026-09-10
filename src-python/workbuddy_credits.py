@@ -25,13 +25,9 @@ import wb_common as wb
 
 CN_BILLING = "https://www.codebuddy.cn"
 # 旧接口参数（F-20 回退路径）
-OLD_RESOURCE_URL = CN_BILLING + "/v2/billing/meter/get-user-resource"
 OLD_BODY = {"ProductCode": "p_tcaca", "Status": [0, 3],
             "PackageEndTimeRange": {"StartTime": "2000-01-01T00:00:00Z",
                                     "EndTime": "2099-12-31T23:59:59Z"}}
-SUMMARY_URL = CN_BILLING + "/billing/meter/get-user-resource-summary"
-PAID_URL = CN_BILLING + "/billing/meter/get-user-resource-paid-packages"
-FREE_URL = CN_BILLING + "/billing/meter/get-user-resource-free-packages"
 CACHE_TTL = 5 * 60  # ≥5min 缓存（频控红线）
 
 
@@ -143,21 +139,32 @@ def _balance_from_summary(body):
     return _num(v)
 
 
+def _billing_urls(domain):
+    """区域路由（T4.5/F-36，§5.2）：Global 账号 billing 走 www.workbuddy.ai。
+    返回 (summary, paid, free, old_resource) 四元组"""
+    base = wb.region_billing_base(domain)
+    return (base + "/billing/meter/get-user-resource-summary",
+            base + "/billing/meter/get-user-resource-paid-packages",
+            base + "/billing/meter/get-user-resource-free-packages",
+            base + "/v2/billing/meter/get-user-resource")
+
+
 def fetch_credits_once(creds, acct_id=None):
     """一次取数：三件套（带 web 头）→ 全 401 刷新一次仅重试失败分支 → 旧接口回退。
     summary 只取余额不产包（其容量字段是池级汇总，入包会制造脏行）。
     返回 (packages, balance, source, new_creds|None)"""
     headers = wb.build_auth_headers(creds, web_platform=True)
+    summary_url, paid_url, free_url, old_url = _billing_urls(creds.get("domain", ""))
     pkgs = []
     balance = None
     saw_auth = False
-    for url in (SUMMARY_URL, PAID_URL, FREE_URL):
+    for url in (summary_url, paid_url, free_url):
         status, body, _ = wb.post_json(url, headers, {})
         if status == 401:
             saw_auth = True
             continue
         if status == 200 and isinstance(body, dict):
-            if url == SUMMARY_URL:
+            if url == summary_url:
                 balance = _balance_from_summary(body)
             else:
                 pkgs.extend(_packages_from(body))
@@ -166,17 +173,17 @@ def fetch_credits_once(creds, acct_id=None):
         new_creds = wb.refresh_token_once(creds)
         if new_creds:
             headers = wb.build_auth_headers(new_creds, web_platform=True)
-            for url in (SUMMARY_URL, PAID_URL, FREE_URL):
+            for url in (summary_url, paid_url, free_url):
                 status, body, _ = wb.post_json(url, headers, {})
                 if status == 200 and isinstance(body, dict):
-                    if url == SUMMARY_URL:
+                    if url == summary_url:
                         balance = _balance_from_summary(body)
                     else:
                         pkgs.extend(_packages_from(body))
     if pkgs or balance is not None:
         return pkgs, balance, "cloud", new_creds
     # 旧接口回退（F-20）
-    status, body, _ = wb.post_json(OLD_RESOURCE_URL, headers, OLD_BODY)
+    status, body, _ = wb.post_json(old_url, headers, OLD_BODY)
     if status == 200 and isinstance(body, dict):
         pkgs = _packages_from(body)
         if pkgs:

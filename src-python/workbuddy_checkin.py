@@ -22,22 +22,41 @@ import sys
 import wb_common as wb
 
 BASE = "https://www.codebuddy.cn"
-CHECKIN_STATUS_URL = BASE + "/v2/billing/meter/checkin-activity-status"
-CHECKIN_STATUS_URL_OLD = BASE + "/v2/billing/meter/checkin-status"
-CHECKIN_DO_URL = BASE + "/v2/billing/meter/daily-checkin"
+GLOBAL_BILLING = "https://www.workbuddy.ai"
 
-# ── 成长中心（F-17，/v2/activity/growth/*）────────────────────────────────
-GROWTH_BASE = BASE + "/v2/activity/growth"
-TRAVEL_STATUS_URL = GROWTH_BASE + "/buddy/travel/status"
-TRAVEL_CLAIM_URL = GROWTH_BASE + "/buddy/travel/claim"
-TRAVEL_CONFIG_URL = GROWTH_BASE + "/buddy/travel/config"
-TRAVEL_DEPART_URL = GROWTH_BASE + "/buddy/travel/depart"
-LOTTERY_CHANCES_URL = GROWTH_BASE + "/lottery/chances"
-LOTTERY_DRAW_URL = GROWTH_BASE + "/lottery/draw"
-TASKS_URL = GROWTH_BASE + "/tasks"
-TASKS_ACCEPT_URL = GROWTH_BASE + "/tasks/accept"
-ENERGY_URL = GROWTH_BASE + "/energy"
-STREAK_URL = GROWTH_BASE + "/streak"
+# 当前账号区域基址（T4.5/F-36）：process_account/process_account_growth 入口按
+# token domain 切换；单线程串行处理账号，模块级状态安全。
+_CURRENT_BASE = [BASE]
+
+
+def _set_region(domain):
+    _CURRENT_BASE[0] = wb.region_billing_base(domain)
+
+
+def _u(path):
+    return _CURRENT_BASE[0] + path
+
+
+def _urls():
+    """当前账号区域下的全部端点（签到 + 成长中心，T4.5/F-36 §5.2）"""
+    b = _CURRENT_BASE[0]
+    g = b + "/v2/activity/growth"
+    return {
+        "checkin_status": b + "/v2/billing/meter/checkin-activity-status",
+        "checkin_status_old": b + "/v2/billing/meter/checkin-status",
+        "checkin_do": b + "/v2/billing/meter/daily-checkin",
+        "travel_status": g + "/buddy/travel/status",
+        "travel_claim": g + "/buddy/travel/claim",
+        "travel_config": g + "/buddy/travel/config",
+        "travel_depart": g + "/buddy/travel/depart",
+        "lottery_chances": g + "/lottery/chances",
+        "lottery_draw": g + "/lottery/draw",
+        "tasks": g + "/tasks",
+        "tasks_accept": g + "/tasks/accept",
+        "energy": g + "/energy",
+        "streak": g + "/streak",
+    }
+
 # 盲盒抽取循环上限（防接口异常时死循环；正常 balance 会归零）
 LOTTERY_MAX_DRAWS = 20
 
@@ -47,9 +66,9 @@ def emit(obj):
     sys.stdout.flush()
 
 
-def checkin_status(headers):
+def checkin_status(headers, urls):
     """查询今日是否已签：新路径回退旧路径；返回 (today_checked_in|None, status_ok: bool)"""
-    for url in (CHECKIN_STATUS_URL, CHECKIN_STATUS_URL_OLD):
+    for url in (urls["checkin_status"], urls["checkin_status_old"]):
         status, body, _ = wb.post_json(url, headers, {})
         if status == 401:
             return None, False
@@ -65,9 +84,9 @@ def checkin_status(headers):
     return None, False
 
 
-def checkin_do(headers):
+def checkin_do(headers, urls):
     """执行签到。返回 (kind, message)：success / already / fail"""
-    status, body, raw = wb.post_json(CHECKIN_DO_URL, headers, {})
+    status, body, raw = wb.post_json(urls["checkin_do"], headers, {})
     if status == 401:
         return "auth", "登录态失效（401）"
     code = None
@@ -103,18 +122,20 @@ def process_account(acct, skip_checked, skip_expired, lazy_hours):
         return {**base_ev, "status": "fail", "message": "无可用凭证（%s）" % note}
     if refreshed:
         _sync_pool_expiry(aid, creds)
+    _set_region(creds.get("domain", ""))
+    urls = _urls()
     headers = wb.build_auth_headers(creds)
-    checked, ok = checkin_status(headers)
+    checked, ok = checkin_status(headers, urls)
     if ok and checked is True:
         return {**base_ev, "status": "already", "message": "今日已签到"}
-    kind, message = checkin_do(headers)
+    kind, message = checkin_do(headers, urls)
     if kind == "auth":
         # 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）
         new = wb.refresh_token_once(creds)
         if new:
             wb.save_token_store(aid, new)
             _sync_pool_expiry(aid, new)
-            kind, message = checkin_do(wb.build_auth_headers(new))
+            kind, message = checkin_do(wb.build_auth_headers(new), urls)
         else:
             kind, message = "fail", "登录态失效且刷新失败，需重新登录"
     ev = {**base_ev, "status": {"success": "success", "already": "already"}.get(kind, "fail"),
@@ -169,9 +190,9 @@ def _reward_text(body, raw):
     return "+%s" % r if r is not None else (raw[:60] or "ok")
 
 
-def growth_travel(headers):
+def growth_travel(headers, urls):
     """Buddy 旅行：status → arrived 则 claim → config → depart（各步独立容错）"""
-    status, body, raw = wb.get_json(TRAVEL_STATUS_URL, headers)
+    status, body, raw = wb.get_json(urls["travel_status"], headers)
     if status == 401:
         return "auth", "登录态失效（401）"
     if status != 200 or not isinstance(body, dict):
@@ -183,24 +204,24 @@ def growth_travel(headers):
         dest = wb.dig(body, "destination", "name", "target")
         return "skip", "旅行在途%s" % ("（%s）" % dest if dest else "")
     # 领奖
-    st1, b1, r1 = wb.post_json(TRAVEL_CLAIM_URL, headers,
+    st1, b1, r1 = wb.post_json(urls["travel_claim"], headers,
                                {"record_id": record_id} if record_id is not None else {})
     if st1 == 401:
         return "auth", "登录态失效（401）"
     claim_txt = _reward_text(b1, r1) if st1 in (200, 201) else "claim 失败（HTTP %s）" % st1
     # 查目的地配置并出发（config 失败不阻塞 depart）
-    st2, b2, _ = wb.get_json(TRAVEL_CONFIG_URL, headers)
+    st2, b2, _ = wb.get_json(urls["travel_config"], headers)
     dest = wb.dig(b2, "destination", "name", "target") if isinstance(b2, dict) else None
-    st3, b3, r3 = wb.post_json(TRAVEL_DEPART_URL, headers,
+    st3, b3, r3 = wb.post_json(urls["travel_depart"], headers,
                                {"destination": dest} if dest is not None else {})
     if st3 in (200, 201):
         return "ok", "领奖%s，已出发%s" % (claim_txt, "（%s）" % dest if dest else "")
     return "ok", "领奖%s；depart 失败（HTTP %s）" % (claim_txt, st3)
 
 
-def growth_lottery(headers):
+def growth_lottery(headers, urls):
     """盲盒：chances(balance>0) → draw 循环（可开关）"""
-    status, body, raw = wb.get_json(LOTTERY_CHANCES_URL, headers)
+    status, body, raw = wb.get_json(urls["lottery_chances"], headers)
     if status == 401:
         return "auth", "登录态失效（401）"
     if status != 200 or not isinstance(body, dict):
@@ -214,7 +235,7 @@ def growth_lottery(headers):
         return "skip", "无可用次数"
     draws, rewards = 0, []
     while balance > 0 and draws < LOTTERY_MAX_DRAWS:
-        st, b, r = wb.post_json(LOTTERY_DRAW_URL, headers, {})
+        st, b, r = wb.post_json(urls["lottery_draw"], headers, {})
         if st == 401:
             return "auth", "登录态失效（401，已抽 %d 次）" % draws
         if st not in (200, 201):
@@ -227,9 +248,9 @@ def growth_lottery(headers):
     return "ok", "抽取 %d 次（奖励 %s）" % (draws, "/".join(str(x) for x in rewards if x is not None) or "见响应")
 
 
-def growth_tasks(headers):
+def growth_tasks(headers, urls):
     """任务领奖：tasks → 过滤 has_reward && 未领取 → accept {task_code}（可开关）"""
-    status, body, raw = wb.get_json(TASKS_URL, headers)
+    status, body, raw = wb.get_json(urls["tasks"], headers)
     if status == 401:
         return "auth", "登录态失效（401）"
     if status != 200 or not isinstance(body, dict):
@@ -248,7 +269,7 @@ def growth_tasks(headers):
             skipped += 1
             continue
         code = t.get("task_code", t.get("taskCode", t.get("code")))
-        st, b, r = wb.post_json(TASKS_ACCEPT_URL, headers, {"task_code": code} if code is not None else {})
+        st, b, r = wb.post_json(urls["tasks_accept"], headers, {"task_code": code} if code is not None else {})
         if st == 401:
             return "auth", "登录态失效（401，已领 %d 项）" % claimed
         if st in (200, 201):
@@ -258,15 +279,15 @@ def growth_tasks(headers):
     return "ok", "领取 %d 项任务奖励" % claimed
 
 
-def growth_info(headers):
+def growth_info(headers, urls):
     """能量与连签天数（页面附注展示）"""
     info = {}
-    st, b, _ = wb.get_json(ENERGY_URL, headers)
+    st, b, _ = wb.get_json(urls["energy"], headers)
     if st == 200 and isinstance(b, dict):
         v = wb.dig(b, "energy", "value", "balance", "num")
         if v is not None:
             info["energy"] = v
-    st, b, _ = wb.get_json(STREAK_URL, headers)
+    st, b, _ = wb.get_json(urls["streak"], headers)
     if st == 200 and isinstance(b, dict):
         v = wb.dig(b, "streak", "days", "continuous_days", "count")
         if v is not None:
@@ -282,16 +303,18 @@ def process_account_growth(acct, flags):
     creds, refreshed, note = wb.ensure_fresh(acct, 24)
     if not creds.get("access_token"):
         return {**base_ev, "status": "fail", "message": "无可用凭证（%s）" % note}
+    _set_region(creds.get("domain", ""))
+    urls = _urls()
     headers = wb.build_auth_headers(creds)
 
     def with_retry(fn):
-        kind, msg = fn(headers)
+        kind, msg = fn(headers, urls)
         if kind == "auth":
             new = wb.refresh_token_once(creds)
             if new:
                 wb.save_token_store(aid, new)
                 _sync_pool_expiry(aid, new)
-                return fn(wb.build_auth_headers(new))
+                return fn(wb.build_auth_headers(new), urls)
             return "fail", "登录态失效且刷新失败"
         return kind, msg
 
@@ -305,7 +328,7 @@ def process_account_growth(acct, flags):
     if flags.get("tasks"):
         kind, msg = with_retry(growth_tasks)
         result["tasks"] = "fail" if kind == "fail" else msg
-    result.update(growth_info(headers))
+    result.update(growth_info(headers, urls))
     fails = sum(1 for v in (result.get("travel"), result.get("lottery"), result.get("tasks"))
                 if v == "fail")
     return {**base_ev,

@@ -1,21 +1,22 @@
 import { useEffect, useState } from 'react';
-import { RefreshCw, ExternalLink, ArrowRight } from 'lucide-react';
+import { RefreshCw, ExternalLink, ArrowRight, Megaphone } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import PageHeader from '../../components/PageHeader';
 import { StatCard, Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import type { WorkBuddyEnvCheck, WorkBuddyAccountView, WbCreditsResult } from '../../types';
+import type { WorkBuddyEnvCheck, WorkBuddyAccountView, WbCreditsResult, WbActivityInfo } from '../../types';
 import type { ExpiryItem as ExpiryEntry } from '../../components/ExpiryCalendar';
 
-/** WorkBuddy 概述页（§3.7.1）：四指标卡 + 环境卡 + 到期提醒条 + 快捷入口 */
+/** WorkBuddy 概述页（§3.7.1）：四指标卡 + 环境卡 + 到期提醒条 + 活动信息（F-51）+ 快捷入口 */
 export default function BuddyOverview() {
   const pushToast = useAppStore((s) => s.pushToast);
   const setView = useAppStore((s) => s.setView);
   const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [credits, setCredits] = useState<WbCreditsResult | null>(null);
+  const [activity, setActivity] = useState<WbActivityInfo | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
   const refresh = async () => {
@@ -32,6 +33,11 @@ export default function BuddyOverview() {
         .creditsFetch()
         .then((r) => setCredits(r))
         .catch(() => setCredits(null));
+      // 活动信息（F-51，低频附加展示，失败静默）
+      api.workbuddy
+        .activityInfo()
+        .then(setActivity)
+        .catch(() => setActivity(null));
     } catch (err) {
       pushToast('error', `WorkBuddy 环境检测失败：${String(err)}`);
     } finally {
@@ -200,6 +206,53 @@ export default function BuddyOverview() {
               </span>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* 活动信息卡（F-51：banner + 付费类型 + 用量提醒，低频附加展示） */}
+      {activity && (activity.banners.length > 0 || activity.payment_type || activity.dosage_notify) && (
+        <div className="mt-4 card p-4">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="flex items-center gap-2 text-sm font-medium">
+              <Megaphone size={15} className="text-brand-500" /> 活动信息
+            </span>
+            <div className="flex items-center gap-2">
+              {activity.payment_type && <Badge tone="violet">{activity.payment_type}</Badge>}
+              {activity.errors.length > 0 && (
+                <span className="text-xs text-slate-400">部分数据源不可用</span>
+              )}
+            </div>
+          </div>
+          {activity.banners.length > 0 && (
+            <div className="flex gap-2 overflow-x-auto pb-1">
+              {activity.banners.map((b, i) => (
+                <div
+                  key={`${b.title}-${i}`}
+                  className="min-w-56 max-w-80 shrink-0 rounded-lg border border-slate-100 p-3 text-xs dark:border-zinc-800"
+                >
+                  <div className="font-medium text-slate-700 dark:text-zinc-200">{b.title || '活动'}</div>
+                  {b.content && <div className="mt-1 line-clamp-2 text-slate-500 dark:text-zinc-400">{b.content}</div>}
+                  {b.url && (
+                    <button
+                      className="mt-1 flex items-center gap-1 text-brand-600 hover:underline dark:text-brand-400"
+                      onClick={() => void open(b.url).catch(() => pushToast('warn', '链接无法打开'))}
+                    >
+                      查看详情 <ExternalLink size={11} />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {activity.dosage_notify != null && Object.keys(activity.dosage_notify).length > 0 && (
+            <div className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
+              用量提醒：{Object.entries(activity.dosage_notify)
+                .filter(([, v]) => v != null && v !== '')
+                .slice(0, 4)
+                .map(([k, v]) => `${k}=${String(v)}`)
+                .join(' · ')}
+            </div>
+          )}
         </div>
       )}
 

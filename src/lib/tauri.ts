@@ -56,6 +56,8 @@ import type {
   WbResetResult,
   WbTokenStats,
   WbUsageOfficial,
+  WbUsageFallback,
+  WbActivityInfo,
   WbPoolImportResult,
 } from '../types';
 
@@ -275,6 +277,9 @@ export const api = {
       invoke<WbCreditsResult>('workbuddy_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
     settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
     settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),
+    // UI 坐标点击签到兜底（F-18，批次4）：仅手动触发、默认关闭
+    uiClickCapture: () => invoke<{ ok: boolean; x: number; y: number; message: string }>('workbuddy_ui_click_capture'),
+    uiClickCheckin: () => invoke<{ ok: boolean; x: number; y: number; message: string }>('workbuddy_ui_click_checkin'),
     // CLI 切号桥 + 五重防护轮换（F-06/F-59，批次3）
     cliStatus: () => invoke<WbCliStatus>('workbuddy_cli_status'),
     cliBridgeSet: (userId: string) => invoke<WbCliStatus>('workbuddy_cli_bridge_set', { userId }),
@@ -309,7 +314,10 @@ export const api = {
     // 官方用量 + 本地 Token 统计（F-25/26/57/58，批次3）
     usageOfficial: (userId?: string, fresh?: boolean) =>
       invoke<WbUsageOfficial>('workbuddy_usage_official', { userId: userId ?? null, fresh: fresh ?? null }),
+    usageFallback: () => invoke<WbUsageFallback>('workbuddy_usage_fallback'),
     tokenStats: () => invoke<WbTokenStats>('workbuddy_token_stats'),
+    activityInfo: (userId?: string, fresh?: boolean) =>
+      invoke<WbActivityInfo>('workbuddy_activity_info', { userId: userId ?? null, refresh: fresh ?? null }),
   },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),

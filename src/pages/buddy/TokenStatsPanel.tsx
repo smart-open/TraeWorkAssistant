@@ -17,7 +17,7 @@ import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import { useIsDark } from '../../lib/useIsDark';
-import type { WbTokenStats, WbUsageOfficial, WbUsageModelPoint, WbTokenAgg } from '../../types';
+import type { WbTokenStats, WbUsageOfficial, WbUsageModelPoint, WbTokenAgg, WbUsageFallback } from '../../types';
 
 /**
  * Token 统计面板（F-57/F-58/F-25，批次3）：
@@ -75,6 +75,7 @@ export default function TokenStatsPanel({ remainingCredits }: { remainingCredits
   const [stats, setStats] = useState<WbTokenStats | null>(null);
   const [statsLoading, setStatsLoading] = useState(false);
   const [usage, setUsage] = useState<WbUsageOfficial | null>(null);
+  const [fallback, setFallback] = useState<WbUsageFallback | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
   const [usageError, setUsageError] = useState('');
   const [range, setRange] = useState<RangeKey>('7d');
@@ -100,8 +101,18 @@ export default function TokenStatsPanel({ remainingCredits }: { remainingCredits
       try {
         const r = await api.workbuddy.usageOfficial(undefined, fresh);
         setUsage(r);
+        setFallback(null);
       } catch (err) {
-        setUsageError(String(err));
+        // 官方用量不可用 → 自动切换快照回退数据源（F-27），仍失败才报错
+        setUsage(null);
+        try {
+          const fb = await api.workbuddy.usageFallback();
+          setFallback(fb);
+          setUsageError('');
+        } catch {
+          setUsageError(String(err));
+          setFallback(null);
+        }
       } finally {
         setUsageLoading(false);
       }
@@ -486,6 +497,34 @@ export default function TokenStatsPanel({ remainingCredits }: { remainingCredits
             官方用量查询失败：{usageError}
             <div className="mt-1 text-slate-400">请确认账号已录入凭证且在有效期内；本地 Token 统计不受影响。</div>
           </div>
+        ) : !usage && fallback ? (
+          <>
+            {/* 快照回退数据源（F-27）：官方不可用时自动切换，口径明示 */}
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Badge tone="amber">快照回退数据源</Badge>
+              <span className="text-xs text-slate-400">{fallback.note} · 本地时序 {fallback.snapshot_days} 天</span>
+            </div>
+            <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
+              <StatCard label="剩余积分" value={remainingCredits != null ? remainingCredits.toFixed(2) : '—'} hint="来自积分三件套缓存" tone="amber" />
+              <StatCard label="今日消耗" value={fallback.summary.usage_today.toFixed(2)} hint="快照推导" tone="red" />
+              <StatCard label="近 7 天" value={fallback.summary.usage_7days.toFixed(2)} hint="快照推导" tone="violet" />
+              <StatCard label="本月" value={fallback.summary.usage_this_month.toFixed(2)} hint="快照推导" tone="brand" />
+            </div>
+            <div className="mt-4 h-48">
+              <ResponsiveContainer>
+                <BarChart data={fallback.daily.map((d) => ({ date: d.date.slice(5), usage: d.usage }))} margin={{ top: 8, right: 8, left: 0, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+                  <XAxis dataKey="date" {...axisProps} minTickGap={24} />
+                  <YAxis {...axisProps} axisLine={false} width={48} />
+                  <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => [v.toFixed(2), '积分']} />
+                  <Bar dataKey="usage" name="每日消耗" fill="#f59e0b" maxBarSize={22} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="mt-2 text-xs text-slate-400">
+              推导口径：当日消耗 = 前一日总余额 − 当日总余额 + 当日签到奖励；充值包到账日显示为 0，精确请求数请以官方口径为准。
+            </div>
+          </>
         ) : !usage ? (
           <div className="py-6 text-center text-xs text-slate-400">{usageLoading ? '加载中…' : '暂无官方用量数据'}</div>
         ) : (

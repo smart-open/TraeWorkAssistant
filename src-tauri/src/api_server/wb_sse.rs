@@ -134,6 +134,44 @@ fn parse_data(data: &str) -> Option<WbEvent> {
 
 type Sender = tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>;
 
+// ==================== Responses SSE 投影（T4.1/F-40） ====================
+
+/// Responses SSE 事件帧：event + data（type 与 event 同名，Codex 按 data.type 解析）
+fn resp_send(tx: &Sender, event: &str, data: Value) {
+    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+        "event: {}\ndata: {}\n\n",
+        event, data
+    ))));
+}
+
+/// 构造 Responses response 对象（created/in_progress/completed/failed 共用骨架）
+fn responses_object(id: &str, model: &str, status: &str, output: Vec<Value>, usage: Option<&Value>) -> Value {
+    let mut obj = json!({
+        "id": id,
+        "object": "response",
+        "created_at": now_ts(),
+        "status": status,
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": true,
+        "tool_choice": "auto",
+        "tools": [],
+        "incomplete_details": null,
+        "error": null,
+    });
+    if let Some(u) = usage {
+        let (it, ot) = u64_pair(u);
+        obj["usage"] = json!({
+            "input_tokens": it,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": ot,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": it + ot,
+        });
+    }
+    obj
+}
+
 /// 流式转发：WB SSE → 客户端协议帧
 ///
 /// 返回 (流内错误, 是否已发送过数据, usage)。错误在「尚未发送任何数据」时
@@ -183,6 +221,29 @@ pub fn stream_forward<L: Iterator<Item = String>>(
 
     // Anthropic tool_use 块缓冲（index → (id,name,args)）
     let mut tool_buf: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
+
+    // Responses 输出状态（T4.1/F-40）
+    let mut resp_created = false;
+    let mut resp_msg_open = false;
+    let mut resp_text = String::new();
+    let mut resp_output_index: i64 = -1;
+
+    macro_rules! resp_ensure_created {
+        () => {
+            if !resp_created {
+                resp_created = true;
+                resp_send(
+                    tx,
+                    "response.created",
+                    json!({
+                        "type": "response.created",
+                        "response": responses_object(chat_id, model, "in_progress", vec![], None),
+                        "sequence_number": 0,
+                    }),
+                );
+            }
+        };
+    }
 
     loop {
         match parser.next_event() {
@@ -234,6 +295,68 @@ pub fn stream_forward<L: Iterator<Item = String>>(
                         ))));
                         let _ = (it, ot);
                     }
+                    crate::api_server::routes::Protocol::Responses => {
+                        // 未产出任何 chunk 也补 created，保证事件序列完整
+                        resp_ensure_created!();
+                        let mut output: Vec<Value> = Vec::new();
+                        if resp_msg_open {
+                            output.push(json!({
+                                "id": format!("{}_msg_0", chat_id),
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": resp_text, "annotations": []}],
+                            }));
+                            resp_send(tx, "response.output_item.done", json!({
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": output[0],
+                            }));
+                        }
+                        // 工具调用缓冲统一在文本项之后完整输出
+                        for (i, (_k, (tid, name, args))) in tool_buf.iter().enumerate() {
+                            let idx = output.len() as i64;
+                            let item_id = if tid.is_empty() {
+                                format!("{}_fc_{}", chat_id, i)
+                            } else {
+                                tid.clone()
+                            };
+                            let item = json!({
+                                "id": item_id,
+                                "type": "function_call",
+                                "status": "completed",
+                                "call_id": if tid.is_empty() { format!("call_{}_{}", chat_id, i) } else { tid.clone() },
+                                "name": name,
+                                "arguments": args,
+                            });
+                            let mut added = item.clone();
+                            added["status"] = json!("in_progress");
+                            added["arguments"] = json!("");
+                            resp_send(tx, "response.output_item.added", json!({
+                                "type": "response.output_item.added",
+                                "output_index": idx,
+                                "item": added,
+                            }));
+                            if !args.is_empty() {
+                                resp_send(tx, "response.function_call_arguments.delta", json!({
+                                    "type": "response.function_call_arguments.delta",
+                                    "item_id": item["id"],
+                                    "output_index": idx,
+                                    "delta": args,
+                                }));
+                            }
+                            resp_send(tx, "response.output_item.done", json!({
+                                "type": "response.output_item.done",
+                                "output_index": idx,
+                                "item": item,
+                            }));
+                            output.push(item);
+                        }
+                        resp_send(tx, "response.completed", json!({
+                            "type": "response.completed",
+                            "response": responses_object(chat_id, model, "completed", output, usage.as_ref()),
+                        }));
+                    }
                     _ => {
                         let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     }
@@ -248,6 +371,16 @@ pub fn stream_forward<L: Iterator<Item = String>>(
                         crate::api_server::routes::Protocol::Anthropic => {
                             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
                             send!(format!("event: error\ndata: {}\n\n", err));
+                        }
+                        crate::api_server::routes::Protocol::Responses => {
+                            // 流内错误 → response.failed（Responses 无 [DONE] 帧）
+                            resp_ensure_created!();
+                            let mut resp = responses_object(chat_id, model, "failed", vec![], None);
+                            resp["error"] = json!({"code": code.to_string(), "message": msg});
+                            resp_send(tx, "response.failed", json!({
+                                "type": "response.failed",
+                                "response": resp,
+                            }));
                         }
                         _ => {
                             let body = json!({"error":{"message":msg,"type":"api_error","code":code}});
@@ -357,6 +490,63 @@ pub fn stream_forward<L: Iterator<Item = String>>(
                             }
                         }
                         crate::api_server::routes::Protocol::Anthropic => unreachable!(),
+                        crate::api_server::routes::Protocol::Responses => {
+                            resp_ensure_created!();
+                            // 文本增量 → message 输出项 + output_text.delta
+                            if let Some(t) = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
+                                if !resp_msg_open {
+                                    resp_msg_open = true;
+                                    resp_output_index += 1;
+                                    resp_send(tx, "response.output_item.added", json!({
+                                        "type": "response.output_item.added",
+                                        "output_index": resp_output_index,
+                                        "item": {
+                                            "id": format!("{}_msg_0", chat_id),
+                                            "type": "message",
+                                            "status": "in_progress",
+                                            "role": "assistant",
+                                            "content": [],
+                                        },
+                                    }));
+                                }
+                                resp_text.push_str(t);
+                                resp_send(tx, "response.output_text.delta", json!({
+                                    "type": "response.output_text.delta",
+                                    "item_id": format!("{}_msg_0", chat_id),
+                                    "output_index": resp_output_index,
+                                    "content_index": 0,
+                                    "delta": t,
+                                }));
+                            }
+                            // 工具调用增量：按 index 缓冲，completed 时统一输出完整项
+                            if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                                for tc in tcs {
+                                    let idx = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(tool_buf.len() as i64);
+                                    let e = tool_buf.entry(idx).or_default();
+                                    if let Some(i) = tc.get("id").and_then(|i| i.as_str()) {
+                                        if !i.is_empty() {
+                                            e.0 = i.to_string();
+                                        }
+                                    }
+                                    if let Some(n) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+                                        if !n.is_empty() {
+                                            e.1 = n.to_string();
+                                        }
+                                    }
+                                    if let Some(a) = tc.get("function").and_then(|f| f.get("arguments")) {
+                                        match a {
+                                            Value::String(s) => e.2.push_str(s),
+                                            v if !v.is_null() => {
+                                                if let Ok(s) = serde_json::to_string(v) {
+                                                    e.2.push_str(&s);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -656,5 +846,40 @@ mod tests {
         let txt = completion_to_text(&v, "glm-5.3");
         assert_eq!(txt["choices"][0]["text"], json!("你好"));
         assert_eq!(txt["object"], json!("text_completion"));
+    }
+
+    /// Responses 流式投影：created → item.added → text.delta → item.done → completed
+    #[test]
+    fn stream_forward_emits_responses_event_sequence() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, usage) =
+            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_1", "glm-5.3");
+        assert!(err.is_none());
+        assert!(sent_any);
+        assert!(usage.is_some());
+        drop(tx);
+
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(body.contains("event: response.created"));
+        assert!(body.contains("event: response.output_item.added"));
+        assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("\"delta\":\"he\""));
+        assert!(body.contains("event: response.output_item.done"));
+        let completed = body.split("event: response.completed").nth(1).unwrap_or("");
+        assert!(completed.contains("\"status\":\"completed\""));
+        assert!(completed.contains("\"input_tokens\":3"));
+        assert!(completed.contains("\"output_tokens\":2"));
+        assert!(!body.contains("[DONE]"), "Responses 流不应出现 OpenAI [DONE] 帧");
     }
 }

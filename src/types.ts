@@ -637,6 +637,10 @@ export interface WorkBuddySettings {
   /** 失败通知渠道（F-19）：空 = 关闭 */
   notify_wechat_webhook: string | null;
   notify_serverchan_sendkey: string | null;
+  /** UI 坐标点击签到兜底（F-18）：仅手动触发，默认关闭 */
+  ui_click_enabled: boolean;
+  ui_click_x: number;
+  ui_click_y: number;
 }
 
 /** 账号库导入结果（F-46 扩展） */
@@ -766,6 +770,26 @@ export interface WbUsageOfficial {
   summary: { usage_today: number; usage_7days: number; usage_this_month: number };
   daily: { date: string; usage: number; models: WbUsageModelPoint[] }[];
   models: WbUsageModelPoint[];
+}
+
+/** 活动信息三端点聚合（F-51）：banner（公开）+ 付费类型 + 用量提醒 */
+export interface WbActivityInfo {
+  account_id: string | null;
+  payment_type: string | null;
+  dosage_notify: Record<string, unknown> | null;
+  banners: { title: string; content: string; url: string; start_time: string; end_time: string }[];
+  errors: string[];
+  fetched_at_ms: number;
+}
+
+/** 积分用量快照回退（F-27）：官方用量不可用时的本地推导数据源 */
+export interface WbUsageFallback {
+  status: 'snapshot';
+  snapshot_days: number;
+  summary: { usage_today: number; usage_7days: number; usage_this_month: number };
+  daily: { date: string; usage: number }[];
+  note: string;
+  fetched_at_ms: number;
 }
 
 /** 积分包（workbuddy_credits.py 宽容解析输出） */

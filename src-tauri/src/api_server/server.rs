@@ -76,6 +76,7 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/v1/completions", post(routes::completions))
         .route("/v1/embeddings", post(routes::embeddings))
         .route("/v1/messages", post(routes::messages))
+        .route("/v1/responses", post(routes::responses_api))
         .layer(from_fn_with_state(state.clone(), auth::bearer_auth))
         .with_state(state)
 }

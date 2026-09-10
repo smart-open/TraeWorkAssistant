@@ -208,6 +208,8 @@ fn main() {
             commands::workbuddy::workbuddy_renew_task_unregister,
             commands::workbuddy::workbuddy_credits_fetch,
             commands::workbuddy::workbuddy_settings_get,
+            commands::workbuddy::workbuddy_ui_click_capture,
+            commands::workbuddy::workbuddy_ui_click_checkin,
             commands::workbuddy::workbuddy_settings_set,
             commands::workbuddy::workbuddy_cli_status,
             commands::workbuddy::workbuddy_cli_bridge_set,
@@ -223,6 +225,8 @@ fn main() {
             commands::workbuddy::workbuddy_env_reset_items,
             commands::workbuddy::workbuddy_env_reset,
             commands::workbuddy::workbuddy_usage_official,
+            commands::workbuddy::workbuddy_usage_fallback,
+            commands::workbuddy::workbuddy_activity_info,
             commands::workbuddy_stats::workbuddy_token_stats,
         ])
         .setup(|app| {

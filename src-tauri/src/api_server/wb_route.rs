@@ -165,6 +165,7 @@ pub fn wb_stream_chat(
             Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
             Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
             Protocol::Anthropic => format!("msg_{}", now_ts()),
+            Protocol::Responses => format!("resp_{}", now_ts()),
         };
 
         // SSE keep-alive 15s（T2.7/F-34 §5.5 #7：防中间层回收长流）；
@@ -667,6 +668,11 @@ pub async fn wb_aggregate_chat(
                     &model_out,
                 ),
                 Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_out),
+                Protocol::Responses => super::wb_responses::completion_to_responses(
+                    &resp,
+                    &format!("resp_{}", now_ts()),
+                    &model_out,
+                ),
                 Protocol::OpenAi => resp,
             };
             Response::builder()
@@ -700,6 +706,21 @@ fn send_stream_error_wb(
             let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
                 "event: error\ndata: {}\n\n",
                 err
+            ))));
+        }
+        Protocol::Responses => {
+            // 取号失败/无健康账号等入口错误 → response.failed（Responses 无 [DONE] 帧）
+            let resp = json!({
+                "id": format!("resp_{}", now_ts()),
+                "object": "response",
+                "status": "failed",
+                "output": [],
+                "error": {"code": code.to_string(), "message": msg},
+            });
+            let body = json!({"type": "response.failed", "response": resp});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: response.failed\ndata: {}\n\n",
+                body
             ))));
         }
         _ => {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { PlayCircle, CalendarClock, ScrollText, Sparkles } from 'lucide-react';
+import { PlayCircle, CalendarClock, ScrollText, Sparkles, MousePointerClick } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -379,6 +379,68 @@ export default function BuddyCheckin() {
               </button>
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* UI 坐标点击签到兜底（F-18）：仅手动触发、默认关闭 */}
+      <div className="mt-4 card p-4">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <MousePointerClick size={16} className="text-amber-500" />
+            <span className="text-sm font-medium">UI 坐标点击兜底</span>
+            <Badge tone={settings?.ui_click_enabled ? 'amber' : 'slate'}>
+              {settings?.ui_click_enabled ? '已启用' : '默认关闭'}
+            </Badge>
+          </div>
+          <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-500">
+            <input
+              type="checkbox"
+              checked={settings?.ui_click_enabled ?? false}
+              onChange={(e) => void saveSettings({ ui_click_enabled: e.target.checked })}
+            />
+            启用（最后手段）
+          </label>
+        </div>
+        <p className="mb-2 text-xs text-slate-400">
+          签到 API 不可用时的最后手段：驱动鼠标对客户端「立即签到」按钮做坐标点击。
+          使用方法：打开客户端签到页 → 把鼠标悬停在签到按钮上 → 点「取点」记录坐标 → 回到本页点「执行点击」。
+          全程仅手动触发，不会自动连点。
+        </p>
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="rounded-md border border-slate-100 px-2 py-1 font-mono dark:border-zinc-800">
+            坐标：{settings?.ui_click_x ? `${settings.ui_click_x}, ${settings.ui_click_y}` : '未配置'}
+          </span>
+          <button
+            className="btn-outline !px-2 !py-1"
+            onClick={() =>
+              void api.workbuddy
+                .uiClickCapture()
+                .then((r) => {
+                  if (r.ok && settings) {
+                    void saveSettings({ ui_click_x: r.x, ui_click_y: r.y });
+                    pushToast('success', r.message);
+                  } else {
+                    pushToast('warn', r.message);
+                  }
+                })
+                .catch((e) => pushToast('error', String(e)))
+            }
+          >
+            取点（3 秒倒计时）
+          </button>
+          <button
+            className="btn-outline !px-2 !py-1"
+            disabled={!settings?.ui_click_enabled}
+            title={settings?.ui_click_enabled ? '' : '先在上方启用后才可执行（F-18 默认关闭）'}
+            onClick={() =>
+              void api.workbuddy
+                .uiClickCheckin()
+                .then((r) => pushToast(r.ok ? 'success' : 'warn', r.message))
+                .catch((e) => pushToast('error', String(e)))
+            }
+          >
+            执行点击
+          </button>
         </div>
       </div>
 

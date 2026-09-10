@@ -27,6 +27,8 @@ pub enum Protocol {
     /// OpenAI legacy text completions（/v1/completions）
     OpenAiText,
     Anthropic,
+    /// Codex Responses API（/v1/responses，T4.1/F-40）
+    Responses,
 }
 
 impl Protocol {
@@ -35,6 +37,7 @@ impl Protocol {
             Protocol::OpenAi => "/v1/chat/completions",
             Protocol::OpenAiText => "/v1/completions",
             Protocol::Anthropic => "/v1/messages",
+            Protocol::Responses => "/v1/responses",
         }
     }
 }
@@ -305,6 +308,90 @@ pub async fn chat_completions(
     }
 }
 
+/// Codex Responses API 端点（T4.1/F-40）：POST /v1/responses
+///
+/// 请求投影为 OpenAI 内部格式后复用 WB 上游既有管线（取号/重试/粘性/脱敏一份）。
+/// 仅支持 WB 上游模型（Codex CLI `wire_api="responses"` 直配 base_url 的目标场景）；
+/// 脱敏沿用全局 `wb_sanitize` 开关，审核命中按既有分级重试表退回重试。
+pub async fn responses_api(
+    State(state): State<Arc<ApiSharedState>>,
+    key_id: Option<Extension<KeyId>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if body.len() > MAX_BODY_BYTES {
+        return openai_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "request body exceeds 8MB limit",
+        );
+    }
+
+    state
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let peek: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("invalid JSON body: {}", e),
+            )
+        }
+    };
+    let stream = peek.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let model = peek
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&state.default_model)
+        .to_string();
+
+    // Responses → OpenAI chat 内部格式（纯投影，失败即 400）
+    let chat_body: Value = match super::wb_responses::responses_to_chat(&peek) {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &e);
+        }
+    };
+
+    let state_clone = state.clone();
+    let start_ts = std::time::Instant::now();
+    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+
+    if !wb_model_requested(&state, &model) {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "model_not_found",
+            &format!(
+                "model {} is not a WorkBuddy upstream model（/v1/responses 仅支持 WB 上游模型，目录见 /v1/models）",
+                model
+            ),
+        );
+    }
+    if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "wb_upstream_disabled",
+            "WB 上游未启用（api_pool.json wb_enabled）",
+        );
+    }
+    if wb_route::model_cooling_remaining(&state, &model).is_some() {
+        return model_cooling_response(&state, &model, Protocol::Responses);
+    }
+
+    let mut chat_body = chat_body;
+    chat_body["stream"] = json!(stream);
+    let body_vec = serde_json::to_vec(&chat_body).unwrap_or_default();
+
+    if stream {
+        wb_route::wb_stream_chat(state_clone, body_vec, model, start_ts, Protocol::Responses, key_str)
+    } else {
+        wb_route::wb_aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Responses, key_str).await
+    }
+}
+
 /// Anthropic Messages 端点（F-39：+Anthropic 适配）
 /// 请求：POST /v1/messages，鉴权支持 x-api-key 或 Authorization: Bearer
 pub async fn messages(
@@ -527,6 +614,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
             Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
             Protocol::Anthropic => format!("msg_{}", now_ts()),
+            // Responses 仅走 WB 上游；solo 管线不会收到，兜底给 resp_ id
+            Protocol::Responses => format!("resp_{}", now_ts()),
         };
         let mut tried = HashSet::new();
 
@@ -558,6 +647,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         Protocol::Anthropic => {
                             let (e, s, u) =
                                 sse::stream_convert_anthropic(reader, tx.clone(), &chat_id, &model);
+                            (e, s, u)
+                        }
+                        // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 透传
+                        Protocol::Responses => {
+                            let (e, s, u) = sse::stream_convert(reader, tx.clone(), &chat_id);
                             (e, s, u)
                         }
                     };
@@ -676,6 +770,22 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     err
                 ))));
             }
+            Protocol::Responses => {
+                let body = json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": format!("resp_{}", now_ts()),
+                        "object": "response",
+                        "status": "failed",
+                        "output": [],
+                        "error": {"code": "no_healthy_account", "message": "no healthy account available"},
+                    },
+                });
+                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                    "event: response.failed\ndata: {}\n\n",
+                    body
+                ))));
+            }
         }
     });
 
@@ -717,11 +827,14 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
                         Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
                         Protocol::Anthropic => format!("msg_{}", now_ts()),
+                        Protocol::Responses => format!("resp_{}", now_ts()),
                     };
                     let (resp, error_info) = match proto {
                         Protocol::OpenAi => sse::aggregate(reader, &chat_id),
                         Protocol::OpenAiText => sse::aggregate_text(reader, &chat_id, &model),
                         Protocol::Anthropic => sse::aggregate_anthropic(reader, &chat_id, &model),
+                        // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 聚合
+                        Protocol::Responses => sse::aggregate(reader, &chat_id),
                     };
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     match (resp, error_info) {
@@ -843,7 +956,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     .unwrap()
             }),
         Ok(Err(msg)) => match proto {
-            Protocol::OpenAi | Protocol::OpenAiText => {
+            Protocol::OpenAi | Protocol::OpenAiText | Protocol::Responses => {
                 openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg)
             }
             Protocol::Anthropic => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &msg),
@@ -997,6 +1110,22 @@ fn send_stream_error(
             let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
                 "event: error\ndata: {}\n\n",
                 err
+            ))));
+        }
+        Protocol::Responses => {
+            let body = json!({
+                "type": "response.failed",
+                "response": {
+                    "id": format!("resp_{}", now_ts()),
+                    "object": "response",
+                    "status": "failed",
+                    "output": [],
+                    "error": {"code": code.to_string(), "message": msg},
+                },
+            });
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: response.failed\ndata: {}\n\n",
+                body
             ))));
         }
     }

@@ -11,6 +11,7 @@ pub mod sse;
 pub mod usage;
 pub mod wb_catalog;
 pub mod wb_payload;
+pub mod wb_responses;
 pub mod wb_route;
 pub mod wb_sse;
 pub mod wb_sticky;
