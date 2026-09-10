@@ -3,6 +3,8 @@ dist/
 node_modules/
 src-tauri/target/
 src-tauri/gen/
+# 打包暂存（prepare_python_runtime.py 装配产物，构建时重建）
+build/
 # 临时出图目录（AI 生图源图，内嵌后即无用）
 out/
 
@@ -67,3 +69,5 @@ release/
 overview.md
 # tauri dev 动态端口配置覆盖（scripts/dev.mjs 生成）
 .tauri-dev-config.json
+# vite 加载配置时的临时转译产物（每次 tauri dev/build 生成）
+vite.config.ts.timestamp-*.mjs

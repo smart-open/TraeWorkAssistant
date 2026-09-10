@@ -32,7 +32,7 @@
     "targets": ["msi", "nsis"],
     "icon": ["icons/icon.ico"],
     "resources": {
-      "../src-python/": "python/",
+      "../build/python-bundle/": "python/",
       "../src-ps/": "ps/"
     },
     "shortDescription": "Trae Work 多账号签到与管理助手",
