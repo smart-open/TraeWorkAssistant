@@ -5,9 +5,11 @@
 //   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
 //
 // 流程（下载与安装拆分，UI 两处确认）：
-//   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；
-//   update_download    下载资产到临时目录（emit update-download-progress），完成后返回文件路径，
-//                      由前端确认后再安装（确认一：下载 / 确认二：安装）；
+//   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
+//                      latest.json（scripts/rename_release.py 生成随 Release 上传）取安装包 SHA256，
+//                      清单存在即 fail-closed（缺失/损坏/版本不符均阻止自动更新），无清单回退正文约定行；
+//   update_download    下载资产到临时目录（emit update-download-progress），完成后与发布方
+//                      SHA256 比对（不匹配即删除并报错），返回文件路径由前端确认后再安装；
 //   update_run_installer 以 /P /UPDATE /R 启动 NSIS 安装器：
 //                      /P 被动模式（仅显示进度条）+ /UPDATE 跳过卸载直接覆盖 + /R 安装完成后自动重启应用
 //                      （自定义模板 build-assets/installer.nsi 支持上述标志），随后应用退出。
@@ -21,6 +23,10 @@ const RELEASES_API: &str =
     "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
 const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
 
+/// 发布校验清单资产名（scripts/rename_release.py 生成，随 Release 上传）：
+/// `{ "version": "x.y.z", "assets": { "<资产文件名>": "<sha256hex>" } }`
+const MANIFEST_ASSET: &str = "latest.json";
+
 #[derive(Serialize, Clone)]
 pub struct UpdateCheckResult {
     pub has_update: bool,
@@ -33,7 +39,8 @@ pub struct UpdateCheckResult {
     /// 资产字节数
     pub size: u64,
     pub release_page: String,
-    /// 发布方提供的安装包 SHA256（取自 release 正文约定行；旧版本无此行时为 None，跳过校验）
+    /// 发布方提供的安装包 SHA256（优先取发布校验清单 latest.json，回退 release 正文约定行；
+    /// 存量旧 release 两者皆无时为 None，跳过校验）
     pub sha256: Option<String>,
 }
 
@@ -177,6 +184,122 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
         .map(|(name, url, size, _)| (name, url, size))
 }
 
+// ---------------- 发布校验清单（latest.json） ----------------
+
+/// 发布校验清单结构（scripts/rename_release.py 生成并随 Release 上传）
+#[derive(serde::Deserialize)]
+struct UpdateManifest {
+    version: String,
+    assets: std::collections::BTreeMap<String, String>,
+}
+
+/// 64 位十六进制 SHA-256 格式校验
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 宽松键：仅保留 ASCII 字母数字（小写），其余字符一律折叠为单个 '_'。
+/// GitHub 上传会重写资产名（空格 → '.'、非 ASCII 字符 → '_'，
+/// 如 "AI Work 助手_3.3.3_x64-setup.exe" → "AI.Work._3.3.3_x64-setup.exe"），
+/// 清单键保存的是本地原始文件名，用宽松键对两侧归一后即可匹配。
+fn relaxed_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_underscore = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_underscore = false;
+        } else if !last_underscore {
+            out.push('_');
+            last_underscore = true;
+        }
+    }
+    out
+}
+
+/// 从清单中查找资产的 SHA-256（不存在或格式非法返回 None）：
+/// 先按原始文件名精确匹配，再用宽松键归一匹配（兼容 GitHub 的资产名重写）。
+fn lookup_manifest_hash(m: &UpdateManifest, asset_name: &str) -> Option<String> {
+    if let Some(h) = m.assets.get(asset_name).filter(|h| is_sha256_hex(h)) {
+        return Some(h.to_ascii_lowercase());
+    }
+    let key = relaxed_key(asset_name);
+    m.assets
+        .iter()
+        .find(|(k, _)| relaxed_key(k) == key)
+        .map(|(_, h)| h.to_ascii_lowercase())
+        .filter(|h| is_sha256_hex(h))
+}
+
+/// 下载并解析 release 的校验清单，返回目标资产的发布方 SHA-256：
+/// - Ok(Some(hash))：清单命中
+/// - Ok(None)：release 没有 latest.json 资产（旧版发布方式），调用方回退正文提取
+/// - Err(msg)：清单存在但不可用（下载失败/损坏/版本不符/未收录资产）——
+///   fail-closed 直接报错阻止自动更新，引导手动下载（S1 insecure_update 纵深防御）
+fn fetch_manifest_hash(
+    assets: &[serde_json::Value],
+    asset_name: &str,
+    expected_ver: (u64, u64, u64),
+) -> Result<Option<String>, String> {
+    let url = assets
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name").and_then(|v| v.as_str())?;
+            (name == MANIFEST_ASSET)
+                .then(|| a.get("browser_download_url").and_then(|v| v.as_str()))
+                .flatten()
+        })
+        .next();
+    let Some(url) = url else {
+        return Ok(None);
+    };
+
+    // 小文件：连接 10s + 整体 20s，逐通道尝试（系统代理 → 环境变量代理 → 直连）
+    let mut text: Option<String> = None;
+    let mut last_err = String::new();
+    for (label, agent) in attempt_agents(|b| {
+        b.timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build()
+    }) {
+        match agent
+            .get(url)
+            .set("User-Agent", "ai-work-assistant-updater")
+            .call()
+        {
+            Ok(resp) => {
+                let mut s = String::new();
+                match resp.into_reader().read_to_string(&mut s) {
+                    Ok(_) => {
+                        text = Some(s);
+                        break;
+                    }
+                    Err(e) => last_err = format!("[{label}] 读取失败: {e}"),
+                }
+            }
+            Err(e) => last_err = format!("[{label}] {e}"),
+        }
+    }
+    let text = text.ok_or_else(|| {
+        format!("下载校验清单失败（{last_err}），已阻止自动更新。请重试或手动下载：{RELEASES_PAGE}")
+    })?;
+
+    let manifest: UpdateManifest = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "校验清单损坏（{MANIFEST_ASSET} 解析失败: {e}），已阻止自动更新。请手动下载：{RELEASES_PAGE}"
+        )
+    })?;
+    if parse_version(&manifest.version) != Some(expected_ver) {
+        return Err(format!(
+            "校验清单版本（{}）与目标版本不一致，已阻止自动更新。请手动下载：{RELEASES_PAGE}",
+            manifest.version
+        ));
+    }
+    lookup_manifest_hash(&manifest, asset_name).ok_or_else(|| {
+        format!("校验清单中未收录该安装包的 SHA-256，已阻止自动更新。请手动下载：{RELEASES_PAGE}")
+    }).map(Some)
+}
+
 /// 本产品（AI Work 助手）产品线起点：只认 >= 3.0.0 的 release。
 /// 同一仓库还发布 2.x 产品线（Trae Work 助手，另一个产品），必须排除。
 const PRODUCT_MIN_VERSION: (u64, u64, u64) = (3, 0, 0);
@@ -244,8 +367,16 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
             "release（{tag}）的资产版本与 release 版本不一致，已中止。可手动查看：{RELEASES_PAGE}"
         ));
     }
-    // 完整性校验：从 release 正文提取本资产的 SHA256（发布约定行；旧版本正文无此行则跳过校验）
-    let sha256 = extract_sha256(&body, &asset_name);
+    // 完整性校验（S1 insecure_update 纵深防御），优先级：
+    // ① 发布校验清单 latest.json（机器可读 + 版本绑定）：存在即强制走清单且 fail-closed——
+    //    下载失败/损坏/版本不符/未收录资产任一情况直接报错阻止自动更新，引导手动下载
+    // ② 回退 release 正文约定行（宽松文本匹配，兼容 3.3.2 的发布方式）
+    // ③ 两者皆无（存量旧 release）：跳过校验（兼容过渡）
+    let sha256 = match fetch_manifest_hash(&assets, &asset_name, latest) {
+        Ok(h) => h,
+        Err(e) => return Err(e),
+    }
+    .or_else(|| extract_sha256(&body, &asset_name));
 
     let has_update = cmp_version(latest, current) == std::cmp::Ordering::Greater;
     Ok(UpdateCheckResult {
@@ -359,6 +490,21 @@ pub fn update_download(
 ) -> Result<UpdateDownloaded, String> {
     validate_target(&asset_name, &expected_version)?;
 
+    // 防御：发布方摘要必须为合法 SHA-256 格式（update_check 已 fail-closed 保证存在，此处双保险）
+    let expected = match expected_sha256.as_deref() {
+        Some(s) => {
+            let s = s.trim().to_ascii_lowercase();
+            if !is_sha256_hex(&s) {
+                return Err(
+                    "发布方 SHA-256 缺失或格式非法，已中止下载。请重新检查更新，或手动下载安装"
+                        .to_string(),
+                );
+            }
+            Some(s)
+        }
+        None => None,
+    };
+
     // 下载目录：%TEMP%\ai-work-assistant-update\
     let dir = std::env::temp_dir().join("ai-work-assistant-update");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
@@ -389,7 +535,7 @@ pub fn update_download(
         match download_via(&app, &agent, &download_url, &dest) {
             Ok(received) => {
                 // 完整性校验：发布方提供 SHA256 时必须匹配，不匹配删除文件并中止（防供应链篡改）
-                if let Some(expected) = expected_sha256.as_deref().map(str::to_lowercase) {
+                if let Some(expected) = expected.as_deref() {
                     let actual = file_sha256(&dest).unwrap_or_default();
                     if actual != expected {
                         let _ = std::fs::remove_file(&dest);
@@ -508,4 +654,76 @@ pub fn update_run_installer(
     let _ = app.emit("update-installing", asset_name);
     std::thread::sleep(Duration::from_millis(800));
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_hex_format() {
+        let h = "a".repeat(64);
+        assert!(is_sha256_hex(&h));
+        assert!(is_sha256_hex(&"0123456789ABCDEF".repeat(4)));
+        assert!(!is_sha256_hex(&"a".repeat(63))); // 不足 64 位
+        assert!(!is_sha256_hex(&"g".repeat(64))); // 非十六进制字符
+        assert!(!is_sha256_hex(""));
+    }
+
+    #[test]
+    fn manifest_parse_and_exact_lookup() {
+        let text = r#"{
+            "version": "3.3.3",
+            "assets": {
+                "AI Work 助手_3.3.3_x64-setup.exe": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "AI Work 助手_3.3.3_x64_portable.zip": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+            }
+        }"#;
+        let m: UpdateManifest = serde_json::from_str(text).unwrap();
+        assert_eq!(parse_version(&m.version), Some((3, 3, 3)));
+        // 清单键为本地原始文件名（含空格），按原样可精确命中
+        let h = lookup_manifest_hash(&m, "AI Work 助手_3.3.3_x64-setup.exe").unwrap();
+        assert_eq!(h, "a".repeat(64));
+        // 未收录 / 哈希格式非法 → None
+        assert!(lookup_manifest_hash(&m, "AI Work 助手_3.3.3_x64_zh-CN.msi").is_none());
+        assert!(lookup_manifest_hash(&m, "不存在.exe").is_none());
+    }
+
+    #[test]
+    fn manifest_lookup_normalizes_github_asset_name() {
+        // GitHub 上传会重写资产名：空格 → '.'、非 ASCII（助手）→ '_'
+        let text = r#"{
+            "version": "3.3.3",
+            "assets": {
+                "AI Work 助手_3.3.3_x64-setup.exe": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            }
+        }"#;
+        let m: UpdateManifest = serde_json::from_str(text).unwrap();
+        let gh_name = "AI.Work._3.3.3_x64-setup.exe";
+        let h = lookup_manifest_hash(&m, gh_name).unwrap();
+        assert_eq!(h, "a".repeat(64));
+        // 大小写归一：清单侧哈希大小写任意，输出统一小写
+        let text2 = r#"{
+            "version": "3.3.3",
+            "assets": {
+                "AI Work 助手_3.3.3_x64-setup.exe": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }"#;
+        let m2: UpdateManifest = serde_json::from_str(text2).unwrap();
+        assert_eq!(lookup_manifest_hash(&m2, gh_name).unwrap(), h);
+        // 格式非法（长度不足）的哈希不命中
+        let text3 = r#"{
+            "version": "3.3.3",
+            "assets": { "AI Work 助手_3.3.3_x64-setup.exe": "zz" }
+        }"#;
+        let m3: UpdateManifest = serde_json::from_str(text3).unwrap();
+        assert!(lookup_manifest_hash(&m3, gh_name).is_none());
+    }
+
+    #[test]
+    fn manifest_version_mismatch_detected() {
+        let text = r#"{ "version": "3.2.9", "assets": {} }"#;
+        let m: UpdateManifest = serde_json::from_str(text).unwrap();
+        assert_ne!(parse_version(&m.version), Some((3, 3, 3)));
+    }
 }

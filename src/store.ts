@@ -182,6 +182,8 @@ function defaultSettings(): Settings {
 
 // 日志轮询去重：上一轮未返回时跳过本轮（防 2s 轮询堆积与旧响应乱序覆盖）
 let logsPollInflight = false;
+// 日志查询并发序号（最新请求胜出）：手动刷新与轮询并发时，旧响应直接丢弃
+let logsReqSeq = 0;
 // 同因 toast 限频：读取持续失败期间每 60s 最多弹一次（防 toast 风暴）；手动调用直通
 let lastLogsErrToastAt = 0;
 
@@ -452,6 +454,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   refreshLogs: async (q, manual) => {
     if (logsPollInflight && !manual) return;
     logsPollInflight = true;
+    // 最新请求胜出：手动刷新绕过 inflight 防护会与轮询并发，旧响应不得覆盖新数据
+    const seq = ++logsReqSeq;
     try {
       const logs = await api.misc.logsQuery({
         logType: q?.logType,
@@ -459,8 +463,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         keyword: q?.keyword,
         limit: q?.limit ?? 500,
       });
+      if (seq !== logsReqSeq) return;
       set({ logs });
     } catch (err) {
+      if (seq !== logsReqSeq) return;
       const now = Date.now();
       if (manual || now - lastLogsErrToastAt > 60_000) {
         lastLogsErrToastAt = now;
