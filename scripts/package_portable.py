@@ -33,7 +33,9 @@ def load_conf():
         return json.load(f)
 
 
-def walk_copy(src, dst, skip_dirs=("__pycache__", ".git")):
+def walk_copy(src, dst, skip_dirs=(".git",)):
+    # __pycache__ 必须保留（与 NSIS 安装包一致）：portable 同样部署在只读目录，
+    # 字节码缓存无法运行时重建，剔除会拖慢首次 import（Issue #6 打包审计结论）
     os.makedirs(dst, exist_ok=True)
     for root, dirs, files in os.walk(src):
         dirs[:] = [d for d in dirs if d not in skip_dirs]

@@ -32,6 +32,8 @@
 - **命令 async 化**：`cert_status` / `cert_install` 改为异步命令，certutil 查询与安装（秒级~几十秒）不再阻塞主线程。
 - **构建默认国内镜像**：embeddable Python zip 下载默认走 npmmirror（`PYTHON_EMBED_URL` 可覆盖回官方源），pip 依赖默认清华 TUNA 源（`PIP_INDEX_URL` 可覆盖）——python.org 直链在国内网络常超时。
 - **portable 打包缺失指引**：`package_portable.py` 在 `build/python-bundle/` 未装配时给出明确修复指引（先运行 prepare_python_runtime.py），不再输出模糊 WARN。
+- **打包审计结论（dist-info / `__pycache__`）**：`dist-info`（~0.4MB）与 pip 保持排除——自愈判定用 `import` 测试而非 pip 元数据，且内置运行时不含 pip，排除不影响任何功能（实测 import cryptography/win32crypt/sqlite3 全过）；`__pycache__`（3.5MB）确认必留——只读安装目录无法重建字节码缓存，并修正 `package_portable.py` 误剔 `__pycache__` 导致 portable 包与 NSIS 不一致的问题。
+- **自愈提示按场景区分**：内置 embeddable 运行时不含 pip，依赖缺失（安装目录被损坏）时提示「重新安装应用恢复」，仅 dev 系统 Python 场景才引导手动 `pip install`（原提示对内置运行时无效且误导）。
 
 ## [2.9.0] - 2026-09-09
 
