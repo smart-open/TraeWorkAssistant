@@ -10,7 +10,7 @@ pub struct CertStatus {
     pub installed: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
     let out = Command::new("certutil")
         .args(["-store", "Root"])
@@ -24,6 +24,36 @@ pub fn cert_status(_app: AppHandle, _state: State<AppState>) -> CertStatus {
         Err(_) => false,
     };
     CertStatus { installed }
+}
+
+/// 检查当前解析到的 Python 环境能否导入指定模块。
+/// dev 环境回退系统 Python 时，cryptography 缺失是 --gen-ca 失败的头号原因。
+fn python_import_ok(state: &AppState, module: &str) -> bool {
+    Command::new(&state.python_exe)
+        .args(["-c", &format!("import {module}")])
+        .creation_flags(0x08000000)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// 用当前 Python 环境安装依赖包（cryptography 缺失时自愈，吸收 main a3301c7）。
+fn pip_install(state: &AppState, pkgs: &[&str]) -> Result<(), String> {
+    let out = Command::new(&state.python_exe)
+        .args(["-m", "pip", "install", "--disable-pip-version-check", "--no-input"])
+        .args(pkgs)
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|e| format!("启动 pip 失败: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = tail_400(&String::from_utf8_lossy(&out.stderr));
+    Err(format!(
+        "exit {}：{}",
+        out.status.code().unwrap_or(-1),
+        if err.is_empty() { "无错误输出".to_string() } else { err }
+    ))
 }
 
 /// 截取输出尾部（最多 400 字符），用于把子进程真实报错带回给前端 toast。
@@ -40,8 +70,19 @@ fn tail_400(s: &str) -> String {
     chars.collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus, String> {
+    // 0. 依赖自检（吸收 main a3301c7）：dev 环境回退系统 Python 时 cryptography
+    //    缺失是 --gen-ca 失败的头号原因，先自愈再继续；已内置运行时则秒过。
+    if !python_import_ok(&state, "cryptography") {
+        pip_install(&state, &["cryptography>=42.0.0", "pywin32>=306"]).map_err(|e| {
+            format!(
+                "Python 缺少 cryptography 模块且自动安装失败（{}）。请手动执行：\"{}\" -m pip install cryptography pywin32",
+                e, state.python_exe
+            )
+        })?;
+    }
+
     // 1. 确保 CA 证书已生成（data_dir/certs/ca.cer）
     let cer = state.path("certs").join("ca.cer");
     if !cer.exists() {
@@ -65,7 +106,16 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
                     out.status.code()
                 ));
             }
-            return Err(format!("CA 证书生成失败: {}", detail));
+            // 依赖自愈已跑过仍报 No module named：环境异常，给出可执行的手动修复指引
+            let hint = if detail.contains("No module named") {
+                format!(
+                    "。提示：Python 依赖缺失，请在 \"{}\" 中执行 -m pip install cryptography pywin32 后重试（解释器路径可查 app.log 的 python_exe= 行）",
+                    state.python_exe
+                )
+            } else {
+                String::new()
+            };
+            return Err(format!("CA 证书生成失败: {}{}", detail, hint));
         }
     }
     if !cer.exists() {
@@ -93,8 +143,15 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
             status.code()
         ));
     }
-    let _ = app;
-    Ok(cert_status(app, state))
+    // 3. 安装后复查根存储（吸收 main a3301c7）：certutil 报成功但证书未实际
+    //    入库（组策略拦截/存储重定向）时不能误报「安装成功」。
+    let result = cert_status(app, state);
+    if !result.installed {
+        return Err(
+            "证书安装命令已执行，但根证书存储中未找到 TraeDeviceProxyCA，请检查系统策略".into(),
+        );
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
