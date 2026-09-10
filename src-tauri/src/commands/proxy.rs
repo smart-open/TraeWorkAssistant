@@ -54,6 +54,55 @@ fn safe_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 结束与本应用 device_proxy.py 同脚本路径的遗留 python 进程（父进程已死的
+/// 孤儿代理），返回被结束的 PID 列表。按完整脚本路径匹配 CommandLine，不会
+/// 误伤其他程序或其他安装副本的 python 进程（吸收 main f9649c2）。
+#[cfg(target_os = "windows")]
+fn kill_stale_proxy_processes(script_path: &std::path::Path) -> Vec<u32> {
+    let me = script_path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+        ])
+        .creation_flags(0x08000000)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // 单个结果时 ConvertTo-Json 输出对象而非数组，统一成数组处理
+    let Ok(items) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return Vec::new();
+    };
+    let items = match items {
+        serde_json::Value::Array(a) => a,
+        v @ serde_json::Value::Object(_) => vec![v],
+        _ => return Vec::new(),
+    };
+    let mut killed = Vec::new();
+    for it in items {
+        let cl = it["CommandLine"].as_str().unwrap_or("").replace('/', "\\").to_lowercase();
+        let pid = it["ProcessId"].as_u64().unwrap_or(0) as u32;
+        if pid != 0
+            && cl.contains(&me)
+            && Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .creation_flags(0x08000000)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        {
+            killed.push(pid);
+        }
+    }
+    killed
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_stale_proxy_processes(_script_path: &std::path::Path) -> Vec<u32> {
+    Vec::new()
+}
+
 #[tauri::command]
 pub fn proxy_start(
     app: AppHandle,
@@ -87,17 +136,36 @@ pub fn proxy_start(
     if !script_path.exists() {
         return Err(format!("找不到脚本: {}", script_path.display()));
     }
-    // ── 端口占用预检（Issue #7 根因 1 的第一道防线）─────────────────────
+    // ── 端口占用预检 + 孤儿自愈（Issue #7）─────────────────────────────
     // spawn 前用一次性 TcpListener 试绑目标端口：已被占用（如上次泄漏的孤儿
-    // 代理进程仍在监听）时立刻给出明确错误并返回，绝不进入「假启动」状态
-    // ——此前 SO_REUSEADDR 允许重复绑定，新进程收不到任何连接却报「已启动」。
+    // 代理进程仍在监听）时，先按脚本路径自动清理本应用的遗留代理进程再重试；
+    // 仍占用才报错，绝不进入「假启动」状态——此前 SO_REUSEADDR 允许重复绑定，
+    // 新进程收不到任何连接却报「已启动」。
     {
         use std::net::TcpListener;
         if let Err(e) = TcpListener::bind(("127.0.0.1", port)) {
-            return Err(format!(
-                "端口 127.0.0.1:{port} 已被占用（{e}），代理未启动。\
-                 可能是上一次未正常退出的代理进程仍在监听：请结束对应的 python 进程后重试。"
-            ));
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                let killed = kill_stale_proxy_processes(&script_path);
+                if !killed.is_empty() {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("已清理遗留代理进程 PID: {killed:?}"),
+                    );
+                }
+                // 给被终止进程一点释放端口的时间，再验证端口是否真正可用
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                if let Err(e2) = TcpListener::bind(("127.0.0.1", port)) {
+                    if e2.kind() == std::io::ErrorKind::AddrInUse {
+                        return Err(format!(
+                            "端口 127.0.0.1:{port} 被其他程序占用且无法自动清理，\
+                             请修改代理端口或手动结束后重试"
+                        ));
+                    }
+                    return Err(format!("端口探测失败: {e2}"));
+                }
+            } else {
+                return Err(format!("端口探测失败: {e}"));
+            }
         }
         // 预检句柄立刻释放，让位给子进程的正式绑定
     }
@@ -159,9 +227,9 @@ pub fn proxy_start(
     // ── 根治孤儿进程（Issue #7 根因 2）：把子进程纳入 KILL_ON_JOB_CLOSE 的 Job ──
     // 应用非正常退出（崩溃/任务管理器强杀）时 Drop 清理不会执行，子进程会成为
     // 孤儿继续占用端口。分配进 Job 后，无论父进程以何种方式退出，OS 都会杀掉
-    // Job 内全部进程。零新增依赖，FFI 声明见下方 job_object 模块。
+    // Job 内全部进程。实现见 python::assign_job_object（windows-sys 类型化 API）。
     #[cfg(target_os = "windows")]
-    job_object::assign(&child);
+    crate::python::assign_job_object(&child);
 
     // ── 秒退检测（配合 python 端 bind 失败 return 2）────────────────────
     // 进程若在 1s 内退出（典型：端口绑定失败），绝不返回「已启动」，
@@ -417,118 +485,6 @@ fn wait_exit_quick(child: &mut Child) -> Option<std::process::ExitStatus> {
         }
     }
     None
-}
-
-// ── 子进程泄漏根治：Job Object（Issue #7 根因 2）────────────────────────
-// 把代理子进程分配进「KILL_ON_JOB_CLOSE」的 Job：父进程无论正常退出、崩溃
-// 还是被任务管理器强杀，OS 都会在 Job 句柄关闭时杀掉 Job 内全部进程，从根
-// 上消灭「孤儿代理继续占端口接客」的泄漏链。直接 FFI 声明 kernel32，零新增
-// 依赖（同 notify_wininet_changed 先例）。
-#[cfg(target_os = "windows")]
-mod job_object {
-    use std::ffi::c_void;
-    use std::mem::{size_of, zeroed};
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Child;
-    use std::sync::Mutex;
-
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
-    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct IoCounters([u64; 6]);
-
-    #[repr(C)]
-    struct BasicLimitInformation {
-        per_process_user_time_limit: i64,
-        per_job_user_time_limit: i64,
-        limit_flags: u32,
-        minimum_working_set_size: usize,
-        maximum_working_set_size: usize,
-        active_process_limit: u32,
-        affinity: usize,
-        priority_class: u32,
-        scheduling_class: u32,
-    }
-
-    #[repr(C)]
-    struct ExtendedLimitInformation {
-        basic: BasicLimitInformation,
-        io: IoCounters,
-        process_memory_limit: usize,
-        job_memory_limit: usize,
-        peak_process_memory_used: usize,
-        peak_job_memory_used: usize,
-    }
-
-    extern "system" {
-        fn CreateJobObjectW(lp_job_attributes: *mut c_void, lp_name: *const u16) -> *mut c_void;
-        fn SetInformationJobObject(
-            h_job: *mut c_void,
-            job_object_information_class: i32,
-            lp_job_object_information: *mut c_void,
-            cb_job_object_information_length: u32,
-        ) -> i32;
-        fn AssignProcessToJobObject(h_job: *mut c_void, h_process: *mut c_void) -> i32;
-    }
-
-    /// 全局 Job 句柄（懒创建；0 = 未创建）。句柄由父进程持有，父进程退出时
-    /// OS 关闭句柄并按 KILL_ON_JOB_CLOSE 杀掉 Job 内全部进程。
-    static JOB_HANDLE: Mutex<usize> = Mutex::new(0);
-
-    /// 创建带 KILL_ON_JOB_CLOSE 的 Job 对象；失败返回 null。
-    /// 单独抽出便于单测验证 FFI 结构布局（SetInformationJobObject 失败即布局错误）。
-    fn create_kill_on_close_job() -> *mut c_void {
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-            if job.is_null() {
-                return std::ptr::null_mut();
-            }
-            let mut info: ExtendedLimitInformation = zeroed();
-            info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let ok = SetInformationJobObject(
-                job,
-                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-                &mut info as *mut _ as *mut c_void,
-                size_of::<ExtendedLimitInformation>() as u32,
-            );
-            if ok == 0 {
-                return std::ptr::null_mut();
-            }
-            job
-        }
-    }
-
-    /// 把子进程分配进全局 Job。创建/分配失败不阻断启动（仅退化为无 Job 保护，
-    /// 仍有端口预检 + 秒退检测两道防线兜底）。
-    pub fn assign(child: &Child) {
-        let mut h = JOB_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if *h == 0 {
-            let job = create_kill_on_close_job();
-            if job.is_null() {
-                return;
-            }
-            *h = job as usize;
-        }
-        unsafe {
-            // Child 句柄具备 PROCESS_SET_QUOTA | PROCESS_TERMINATE 权限（全权限打开）
-            AssignProcessToJobObject(*h as *mut c_void, child.as_raw_handle() as *mut c_void);
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        /// FFI 结构布局自检：CreateJobObjectW 非空且 SetInformationJobObject 成功
-        ///（返回 0 表示 JOBOBJECT_EXTENDED_LIMIT_INFORMATION 布局与系统期望不符）。
-        #[test]
-        fn create_kill_on_close_job_succeeds() {
-            let job = create_kill_on_close_job();
-            assert!(!job.is_null(), "Job 创建/配置失败：FFI 结构布局可能错误");
-        }
-    }
 }
 
 // ---------------- Windows 系统代理设置 ----------------

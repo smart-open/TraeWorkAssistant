@@ -30,6 +30,7 @@ import json
 import ssl
 import socket
 import shutil
+import subprocess
 import threading
 import base64
 import random
@@ -315,6 +316,25 @@ def log(*a):
             _logf.write(line + "\n")
         except Exception:
             pass
+
+
+def port_pids(port):
+    """查询监听指定端口的进程 PID 列表（探测失败返回空表，仅供 bind 失败时诊断输出）。
+
+    吸收 main f9649c2：端口被占的报错若不带 PID，用户无从下手；带 PID 即可
+    在任务管理器一眼定位（通常是上一次未退出的孤儿代理进程）。
+    """
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue)"
+             ".OwningProcess | Sort-Object -Unique"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=0x08000000).stdout
+        return [int(x) for x in out.split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
 
 # ---------------- 每账号设备映射 ----------------
 _map_lock = threading.Lock()
@@ -1734,9 +1754,13 @@ def main():
         srv.bind((LISTEN_HOST, LISTEN_PORT))
     except OSError as e:
         # 失败必须立刻退出并带回明确原因（Rust 侧另有存活检测兜底，
-        # 不会把「进程秒退」误报成「启动成功」）。
-        log(f"[fatal] 端口 {LISTEN_HOST}:{LISTEN_PORT} 绑定失败（{e}）。"
+        # 不会把「进程秒退」误报成「启动成功」）。附带占用进程 PID，
+        # 用户可在任务管理器一眼定位（吸收 main f9649c2 的诊断改进）。
+        pids = port_pids(LISTEN_PORT)
+        log(f"[fatal] 端口 {LISTEN_HOST}:{LISTEN_PORT} 绑定失败（{e}），占用进程 PID: {pids or '未知'}。"
             f"通常由上一次未退出的代理进程占用，请结束后重试。")
+        print(f"代理端口 {LISTEN_PORT} 被占用（PID: {pids or '未知'}），"
+              f"通常由上一次未退出的代理进程导致，请结束后重试", file=sys.stderr, flush=True)
         return 2
     srv.listen(128)
     log(f"代理已启动: {LISTEN_HOST}:{LISTEN_PORT}  (TRAE 多域 MITM 拦截 + JWT 自动捕获)")
