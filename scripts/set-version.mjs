@@ -46,7 +46,6 @@ for (const f of [
   'AGENT.md',
   'docs/tech-framework.md',
   'docs/user-manual.md',
-  'docs/operation-manual.md',
 ]) {
   edit(f, (s) => s.replace(/v\d+\.\d+\.\d+/, `v${ver}`));
 }
