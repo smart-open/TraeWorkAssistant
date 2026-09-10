@@ -578,9 +578,59 @@ pub fn task_register(state: State<AppState>, time: String) -> Result<(), String>
     Ok(())
 }
 
+/// 归一化路径用于比对：统一正斜杠 + 小写（Windows 路径大小写不敏感）。
+fn norm_path(s: &str) -> String {
+    s.replace('\\', "/").to_lowercase()
+}
+
+/// 基于已注册任务的 CSV /V 查询输出，校验其 /TR 是否仍指向当前安装布局。
+/// 背景：task_register 把注册时刻的 python_exe 与 python_dir 绝对路径硬编码进
+/// schtasks /TR；覆盖升级一般目录不变故仍有效，但 MSI→NSIS 迁移或手动更换
+/// 安装目录后，旧任务指向失效路径，且任务"存在"≠"可运行"（schtasks 静默失败）。
+/// 用 `/FO CSV /V` 取真实 /TR 做包含校验——CSV 单行不折行，规避 LIST 输出按
+/// 控制台宽度换行导致的误判。仅接受绝对路径参与比对。
+/// 返回 None 表示路径正常或无法校验；Some(警告文案) 为路径漂移提示。
+fn drift_from_csv(csv_out: &str, py_exe: &str, script_path: &std::path::Path) -> Option<String> {
+    let out = norm_path(csv_out);
+    let script = norm_path(&script_path.to_string_lossy());
+    if !out.contains(&script) {
+        return Some(format!(
+            "\n⚠️ 签到任务指向的脚本路径已失效（可能因升级迁移了安装目录），定时签到将静默失败，请重新「注册任务」。\n当前脚本位置: {}",
+            script_path.display()
+        ));
+    }
+    let script_dir_py = std::path::Path::new(py_exe);
+    if script_dir_py.is_absolute() {
+        let py = norm_path(py_exe);
+        if !out.contains(&py) {
+            return Some(
+                "\n⚠️ 签到任务仍绑定旧版解释器路径，建议重新「注册任务」以切换到内置 Python 运行时。".to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// 包装：实际发起 CSV /V 查询后做路径校验；查询失败不阻塞状态展示（返回 None）。
+fn task_path_drift(py_exe: &str, script_path: &std::path::Path) -> Option<String> {
+    let (ok, csv, _stderr) = run_schtasks(&[
+        "/Query",
+        "/TN",
+        "TraeWorkAssistant_DailyCheckin",
+        "/FO",
+        "CSV",
+        "/V",
+    ])
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    drift_from_csv(&csv, py_exe, script_path)
+}
+
 /// 查询每日签到任务状态。async 派发：schtasks 调用约 1s，避免阻塞主线程
 #[tauri::command(async)]
-pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, String> {
+pub fn task_status(_app: AppHandle, state: State<AppState>) -> Result<String, String> {
     let (ok, stdout, stderr) =
         run_schtasks(&["/Query", "/TN", "TraeWorkAssistant_DailyCheckin", "/FO", "LIST"])?;
     if !ok {
@@ -600,7 +650,16 @@ pub fn task_status(_app: AppHandle, _state: State<AppState>) -> Result<String, S
         }
         return Err(detail.to_string());
     }
-    Ok(stdout)
+    // 路径漂移校验：仅在脚本目录为绝对路径（安装/便携版）时执行；
+    // 开发期 python_dir 为相对路径（src-python），与任务内绝对路径不具可比性。
+    let mut info = stdout;
+    if state.python_dir.is_absolute() {
+        let script = state.python_dir.join("auto_checkin.py");
+        if let Some(warn) = task_path_drift(&state.python_exe, &script) {
+            info.push_str(&warn);
+        }
+    }
+    Ok(info)
 }
 
 /// 注销每日签到任务。async 派发：schtasks 调用约 1s，避免阻塞主线程
@@ -622,4 +681,86 @@ pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), S
         return Err(detail.to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod task_status_tests {
+    use super::{drift_from_csv, norm_path};
+    use std::path::Path;
+
+    const PY: &str = "C:\\Program Files\\Trae Work 助手\\python\\python.exe";
+    const SCRIPT: &str = "C:\\Program Files\\Trae Work 助手\\python\\auto_checkin.py";
+
+    /// 构造模拟 schtasks /FO CSV /V 的输出行（Task To Run 字段含目标命令）
+    fn csv_with(task_to_run: &str) -> String {
+        format!(
+            "\"主机名\",\"任务名\",\"2026/9/10 8:00:00\",\"就绪\",\"task_host\",...,\"{}\",\"tianw\",\"已启用\"",
+            task_to_run
+        )
+    }
+
+    #[test]
+    fn paths_match_returns_none() {
+        let tr = format!(
+            "set \"TRAEDATA_DIR=C:/Users/tianw/AppData/Roaming/TraeWorkAssistant\" && \"{}\" \"{}\"",
+            PY, SCRIPT
+        );
+        assert_eq!(
+            drift_from_csv(&csv_with(&tr), PY, Path::new(SCRIPT)),
+            None
+        );
+    }
+
+    #[test]
+    fn case_and_slash_insensitive_match() {
+        // 任务里是全小写 + 正斜杠（task_register 落库形态），当前布局是反斜杠
+        let tr = format!(
+            "set \"TRAEDATA_DIR=c:/users/tianw/appdata/roaming/traeworkassistant\" && \"{}\" \"{}\"",
+            norm_path(PY),
+            norm_path(SCRIPT)
+        );
+        assert_eq!(
+            drift_from_csv(&csv_with(&tr), PY, Path::new(SCRIPT)),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_script_dir_reports_stale() {
+        // MSI→NSIS 迁移：任务仍指向旧安装目录
+        let old_script = "D:\\Old\\Trae Work 助手\\python\\auto_checkin.py";
+        let tr = format!(
+            "set \"TRAEDATA_DIR=C:/Users/tianw/AppData/Roaming/TraeWorkAssistant\" && \"{}\" \"{}\"",
+            PY, old_script
+        );
+        let r = drift_from_csv(&csv_with(&tr), PY, Path::new(SCRIPT))
+            .expect("应检测到脚本路径漂移");
+        assert!(r.contains("脚本路径已失效"));
+    }
+
+    #[test]
+    fn old_system_python_reports_stale() {
+        // 脚本路径仍在原目录，但任务绑定的是旧版系统 Python
+        let sys_py = "C:/Users/tianw/AppData/Local/Programs/Python/Python312/python.exe";
+        let tr = format!(
+            "set \"TRAEDATA_DIR=C:/Users/tianw/AppData/Roaming/TraeWorkAssistant\" && \"{}\" \"{}\"",
+            sys_py, SCRIPT
+        );
+        let r = drift_from_csv(&csv_with(&tr), PY, Path::new(SCRIPT))
+            .expect("应检测到解释器路径漂移");
+        assert!(r.contains("旧版解释器"));
+    }
+
+    #[test]
+    fn bare_python_name_skips_interpreter_check() {
+        // python_exe 为裸名（PATH 解析）时无法校验，不应误报
+        let tr = format!(
+            "set \"TRAEDATA_DIR=C:/Users/tianw/AppData/Roaming/TraeWorkAssistant\" && \"python\" \"{}\"",
+            SCRIPT
+        );
+        assert_eq!(
+            drift_from_csv(&csv_with(&tr), "python", Path::new(SCRIPT)),
+            None
+        );
+    }
 }
