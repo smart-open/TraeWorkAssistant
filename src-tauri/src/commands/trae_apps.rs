@@ -562,23 +562,14 @@ pub struct PayStatusFile {
     pub updated_at: Option<String>,
 }
 
-fn query_pay_status(jwt: &str) -> Result<PayStatusEntry, String> {
-    let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
-        jwt.to_string()
-    } else {
-        format!("Cloud-IDE-JWT {}", jwt.trim())
-    };
-    let resp = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .post("https://api.trae.cn/trae/api/v2/pay/ide_user_pay_status")
-        .set("authorization", &auth)
-        .set("content-type", "application/json")
-        .set("accept", "*/*")
-        .send_json(ureq::json!({"req_source": 2}))
-        .map_err(|e| format!("API 请求失败: {}", e))?;
-    let body: serde_json::Value =
-        resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+fn query_pay_status(jwt: &str, dev: &crate::models::DeviceEntry) -> Result<PayStatusEntry, String> {
+    let body = crate::commands::accounts::ide_query_post(
+        &crate::commands::accounts::pay_status_agent(),
+        "https://api.trae.cn/trae/api/v2/pay/ide_user_pay_status",
+        jwt,
+        dev,
+        ureq::json!({"req_source": 2}),
+    )?;
     // 业务异常响应（2xx 但缺关键字段）必须报错而非静默降级为 Free，
     // 否则 refresh 会用错误的 "Free" 覆盖缓存中的正确套餐。
     // F-49 宽容解析：dig 沿 data/result 等包裹键下钻，抗官方信封变动
@@ -622,7 +613,8 @@ pub fn refresh_pay_status(state: State<AppState>) -> Result<usize, String> {
             continue;
         }
         let Some(uid) = a.user_id.clone() else { continue };
-        match query_pay_status(&a.jwt) {
+        let dev = crate::commands::accounts::resolve_device(&state, &uid);
+        match query_pay_status(&a.jwt, &dev) {
             Ok(entry) => {
                 file.statuses.insert(uid, entry);
                 ok += 1;
