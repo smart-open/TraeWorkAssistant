@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Plus,
@@ -34,6 +34,7 @@ import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { cn } from '../lib/cn';
+import { fmtCredits } from '../lib/format';
 import type { AccountView, CreditDetail, DiscoveredAccount, GroupView, ImportPreview, JwtParseResult, ProfileInfo } from '../types';
 
 const PRESET_COLORS = [
@@ -96,9 +97,6 @@ function CreditsExpireBadge({ expireAt }: { expireAt: number | null }) {
     </span>
   );
 }
-
-const fmtCredits = (v: number) =>
-  v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
 
 /** 套餐身份徽标（Free / Lite / Pro ...，悬停展示说明） */
 function PayIdentityBadge({
@@ -181,7 +179,7 @@ function CreditCell({ account }: { account: AccountView }) {
         onMouseLeave={() => setPos(null)}
         title="悬停查看积分明细"
       >
-        {value != null ? value.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) : '-'}
+        {value != null ? fmtCredits(value) : '-'}
       </div>
       {pos &&
         createPortal(

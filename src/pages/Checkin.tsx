@@ -3,6 +3,7 @@ import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, Aler
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
 import { useAppStore } from '../store';
+import { normZero } from '../lib/format';
 import type { AccountView } from '../types';
 
 function MiniJwtBadge({ hours }: { hours: number | null }) {
@@ -234,7 +235,7 @@ export default function Checkin() {
                           )}
                         </td>
                         <td className="px-3 py-1.5 text-right tabular-nums text-xs">
-                          {a.credits != null ? a.credits.toLocaleString() : '-'}
+                          {a.credits != null ? normZero(a.credits).toLocaleString() : '-'}
                         </td>
                       </tr>
                     );

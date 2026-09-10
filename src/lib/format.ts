@@ -16,3 +16,13 @@ export function fmtTokens(n: number): string {
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
 }
+
+/** 归一化 -0 → 0（-0 经 toLocaleString 会显示成 "-0"） */
+export function normZero(n: number): number {
+  return Object.is(n, -0) ? 0 : n;
+}
+
+/** 积分格式化：千分位 + 最多 2 位小数，-0 显示为 0 */
+export function fmtCredits(n: number): string {
+  return normZero(n).toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+}

@@ -13,6 +13,7 @@ import PageHeader from '../components/PageHeader';
 import { StatCard, Badge, EmptyState } from '../components/ui';
 import { useAppStore } from '../store';
 import { useIsDark } from '../lib/useIsDark';
+import { fmtCredits, normZero } from '../lib/format';
 
 function localDate(d: Date): string {
   const y = d.getFullYear();
@@ -71,9 +72,8 @@ export default function Credits() {
   const avg = rows.length === 0 ? 0 : Math.round(total / rows.length);
   const generalTotal = rows.reduce((s, a) => s + (a.general_credits ?? 0), 0);
   const workTotal = rows.reduce((s, a) => s + (a.work_credits ?? 0), 0);
-  const fmt = (v: number) => v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
   const totalHint = accounts.some((a) => a.general_credits != null || a.work_credits != null)
-    ? `通用 ${fmt(generalTotal)} 积分 · Work ${fmt(workTotal)} 积分`
+    ? `通用 ${fmtCredits(generalTotal)} 积分 · Work ${fmtCredits(workTotal)} 积分`
     : '总剩余可用积分';
 
   // 今日新增积分：优先使用 daily snapshot 的 earned 字段（含签到+购买）
@@ -143,11 +143,11 @@ export default function Credits() {
       </div>
 
       <div className="mb-5 grid grid-cols-2 gap-3 md:grid-cols-5">
-        <StatCard label="可用总积分" value={total.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={totalHint} tone="violet" />
+        <StatCard label="可用总积分" value={fmtCredits(total)} hint={totalHint} tone="violet" />
         <StatCard label="账号数" value={rows.length} tone="brand" />
-        <StatCard label="平均可用积分" value={avg.toLocaleString()} tone="blue" />
-        <StatCard label="今日新增积分" value={todayNew.toLocaleString()} tone="green" hint={today} />
-        <StatCard label="今日消耗积分" value={todayConsumed.toLocaleString()} tone="amber" hint={today} />
+        <StatCard label="平均可用积分" value={normZero(avg).toLocaleString()} tone="blue" />
+        <StatCard label="今日新增积分" value={normZero(todayNew).toLocaleString()} tone="green" hint={today} />
+        <StatCard label="今日消耗积分" value={normZero(todayConsumed).toLocaleString()} tone="amber" hint={today} />
       </div>
 
       <div className="card p-5">
@@ -206,7 +206,7 @@ export default function Credits() {
                   }}
                   formatter={(v: number, name: string) => {
                     const labels: Record<string, string> = { total: '积分总数', earned: '获得积分', consumed: '消耗积分' };
-                    return [v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }), labels[name] ?? name];
+                    return [normZero(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 }), labels[name] ?? name];
                   }}
                 />
                 <Line type="monotone" dataKey="total" stroke="#6366f1" strokeWidth={2.5} dot={{ r: 3, fill: '#6366f1', strokeWidth: 0 }} activeDot={{ r: 5 }} />
@@ -252,10 +252,10 @@ export default function Credits() {
                     )}
                   </td>
                   <td className="px-4 py-2 text-right tabular-nums">
-                    {(a.remaining_credits ?? 0).toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}
+                    {fmtCredits(a.remaining_credits ?? 0)}
                     {(a.general_credits != null || a.work_credits != null) && (
                       <div className="text-[11px] text-slate-400">
-                        通用 {fmt(a.general_credits ?? 0)} · Work {fmt(a.work_credits ?? 0)}
+                        通用 {fmtCredits(a.general_credits ?? 0)} · Work {fmtCredits(a.work_credits ?? 0)}
                       </div>
                     )}
                   </td>

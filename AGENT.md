@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.2.7
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.3.0
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -41,7 +41,7 @@ ai-work-assistant/
 ├── AGENT.md                      # 本文件（项目速查）
 ├── README.md                     # 用户文档
 ├── package.json / vite.config.ts / tsconfig.json / tailwind.config.js / postcss.config.js / index.html
-├── docs/                         # user-manual / tech-framework / product-design / workbuddy-product-design / product-optimization-backlog
+├── docs/                         # user-manual / tech-framework / product-design / workbuddy-product-design / product-optimization-backlog / doubao-api-feasibility
 ├── src/                          # 前端
 │   ├── App.tsx                   # 外壳（TitleBar + Sidebar + TopBar + 页面切换 + Toaster）
 │   ├── store.ts                  # Zustand 单一真相（init / 刷新 / checkin/switch/saveLogin 事件归约）

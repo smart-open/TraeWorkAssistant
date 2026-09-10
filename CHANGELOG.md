@@ -4,7 +4,7 @@
 
 ---
 
-## [Unreleased]
+## [3.3.0] - 2026-09-10
 
 ### 新增（T1-T11 自 trae_work_main 手工移植合入，未使用 merge/cherry-pick）
 
@@ -27,13 +27,17 @@
 - `pool_set` 扩展 `strategy` / `group_ids` 参数；`models_sync::fetch_official` 签名改为调用方预解密账号；`/v1/completions`、`/v1/embeddings` 路由注册。
 - `Cargo.toml` 新增 `tauri-plugin-stronghold`、`tauri-plugin-autostart`、windows-sys（DPAPI）与 `[profile.dev.package."*"] opt-level = 2`；`package.json` 新增 `vitest@^2.1.9` 与 `test` script。
 
+### 修复
+
+- **积分 0 显示为 "-0"**：账号管理悬停明细（通用/Work 积分与积分包）、积分看板统计卡/趋势 tooltip/明细表、签到页积分列——JS `(-0).toLocaleString()` 输出 "-0" 且 `JSON.parse("-0.0")` 得负零，Rust `(v*100).round()/100` 舍入亦保留负零。前端新增共享 `normZero`/`fmtCredits` 在全部积分展示点归一化；后端 `calc_remaining_credits` / `fetch_credit_detail` 的 r2 舍入结果归一为 +0.0，落盘与 IPC 不再出现 "-0.0"。
+
 ### 文档
 
 - 新增 `docs/optimization-implementation.md`（T1-T11 需求 / 价值 / 实现逻辑 / 代码参考，按本分支适配）与 `docs/optimization-plan.md`；AGENT.md 命令契约表、api-doc.md 新增命令章节与过时签名同步修正。
 
 ### 验证
 
-- `cargo test` 30/30、`npx tsc --noEmit` 通过、`npm run test`（vitest）13/13、`npx vite build` 成功。
+- `cargo test` 通过、`npx tsc --noEmit` 通过、`npm run test`（vitest）18/18（含 normZero/fmtCredits 回归用例）、`npx vite build` 成功。
 
 ## [3.2.7] - 2026-09-08
 

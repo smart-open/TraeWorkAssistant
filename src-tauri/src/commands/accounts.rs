@@ -838,7 +838,11 @@ fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
         }
     }
 
-    let r2 = |v: f64| (v * 100.0).round() / 100.0;
+    // 保留 2 位小数；结果为 0 时归一为 +0.0，避免序列化成 -0.0 导致前端显示 "-0"
+    let r2 = |v: f64| {
+        let r = (v * 100.0).round() / 100.0;
+        if r == 0.0 { 0.0 } else { r }
+    };
     Ok(CreditStats {
         total: r2(total),
         general: r2(general),
@@ -918,7 +922,11 @@ pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<Cr
         .filter(|p| p.kind == "Work")
         .map(|p| p.remaining)
         .sum();
-    let r2 = |v: f64| (v * 100.0).round() / 100.0;
+    // 保留 2 位小数；结果为 0 时归一为 +0.0，避免序列化成 -0.0 导致前端显示 "-0"
+    let r2 = |v: f64| {
+        let r = (v * 100.0).round() / 100.0;
+        if r == 0.0 { 0.0 } else { r }
+    };
     let general = r2(general);
     let work = r2(work);
     Ok(CreditDetail {
