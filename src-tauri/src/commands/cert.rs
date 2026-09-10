@@ -37,6 +37,24 @@ fn python_import_ok(state: &AppState, module: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 当前解释器是否为应用内嵌 embeddable 运行时（以特征文件 python3*._pth 判定）。
+/// 内嵌运行时不含 pip（构建期已装齐依赖），自愈失败时应提示重装应用而非手动 pip。
+fn is_embedded_runtime(state: &AppState) -> bool {
+    std::path::Path::new(&state.python_exe)
+        .parent()
+        .map(|dir| {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries.filter_map(|e| e.ok()).any(|e| {
+                        e.file_name().to_string_lossy().starts_with("python3")
+                            && e.file_name().to_string_lossy().ends_with("._pth")
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 /// 用当前 Python 环境安装依赖包（cryptography 缺失时自愈，吸收 main a3301c7）。
 fn pip_install(state: &AppState, pkgs: &[&str]) -> Result<(), String> {
     let out = Command::new(&state.python_exe)
@@ -76,10 +94,19 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
     //    缺失是 --gen-ca 失败的头号原因，先自愈再继续；已内置运行时则秒过。
     if !python_import_ok(&state, "cryptography") {
         pip_install(&state, &["cryptography>=42.0.0", "pywin32>=306"]).map_err(|e| {
-            format!(
-                "Python 缺少 cryptography 模块且自动安装失败（{}）。请手动执行：\"{}\" -m pip install cryptography pywin32",
-                e, state.python_exe
-            )
+            // 内嵌 embeddable 运行时不含 pip（构建期已装齐依赖）：依赖缺失说明
+            // 安装目录被损坏（如杀软误删），提示重装而非引导手动 pip（无 pip 可用）
+            if is_embedded_runtime(&state) {
+                format!(
+                    "应用内置 Python 运行时依赖异常且无法自动修复（{}）。内置运行时已随安装包自带全部依赖，请重新安装本应用恢复。",
+                    e
+                )
+            } else {
+                format!(
+                    "Python 缺少 cryptography 模块且自动安装失败（{}）。请手动执行：\"{}\" -m pip install cryptography pywin32",
+                    e, state.python_exe
+                )
+            }
         })?;
     }
 
@@ -106,12 +133,16 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
                     out.status.code()
                 ));
             }
-            // 依赖自愈已跑过仍报 No module named：环境异常，给出可执行的手动修复指引
+            // 依赖自愈已跑过仍报 No module named：环境异常，按场景给出可执行的修复指引
             let hint = if detail.contains("No module named") {
-                format!(
-                    "。提示：Python 依赖缺失，请在 \"{}\" 中执行 -m pip install cryptography pywin32 后重试（解释器路径可查 app.log 的 python_exe= 行）",
-                    state.python_exe
-                )
+                if is_embedded_runtime(&state) {
+                    "。提示：内置运行时已随安装包自带全部依赖，报缺模块说明安装目录被损坏（如杀软误删），请重新安装本应用恢复。".to_string()
+                } else {
+                    format!(
+                        "。提示：Python 依赖缺失，请在 \"{}\" 中执行 -m pip install cryptography pywin32 后重试（解释器路径可查 app.log 的 python_exe= 行）",
+                        state.python_exe
+                    )
+                }
             } else {
                 String::new()
             };
