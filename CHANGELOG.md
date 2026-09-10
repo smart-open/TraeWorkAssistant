@@ -21,6 +21,17 @@
 - **根治孤儿进程（Job Object）**：代理子进程分配进 `KILL_ON_JOB_CLOSE` 的 Windows Job（FFI 声明 kernel32，零新增依赖），父进程无论正常退出、崩溃还是被强杀，OS 都会杀掉 Job 内全部子进程，从源头消灭「孤儿代理继续占端口接客」的泄漏链。附 FFI 结构布局单测。
 - **`log()` 永不抛异常**：`print(..., flush=True)` 包进 try/except——父进程退出后孤儿的 stdout 管道断开时不再把调用方线程杀死（此前目标域名分支先 log 后应答，日志异常直接掐断 CONNECT 握手，且兜底 except 里的 log 同样抛异常导致日志无记录）。
 - **CONNECT 先应答后记日志**：目标域名 MITM 分支调整为先回 `200 Connection Established` 再 `log()`，与 `tunnel_raw()` 对齐，任何日志/证书异常都不会再拖死握手。
+- **孤儿自愈清理（吸收 main f9649c2）**：`proxy_start` 端口预检发现被占时，按完整脚本路径匹配 `Win32_Process` CommandLine 自动结束本应用的遗留代理进程（不误伤其他程序），300ms 后重试绑定，仍被其他程序占用才报错——从「让用户手动结束进程」升级为自动恢复。
+- **端口占用带 PID 诊断**：`device_proxy.py` bind 失败时经 `Get-NetTCPConnection` 查询监听进程 PID，`[fatal]` 日志与 stderr 均带占用 PID，可在任务管理器一眼定位。
+- **Job Object 统一挂载**：子进程纳入 kill-on-close Job 的挂载点从代理启动路径统一到 `spawn_script`（windows-sys 类型化 API，既有依赖仅启用 features）——device_proxy、`--gen-ca`、定时签到等全部 Python 子进程均受父进程异常退出保护。
+
+### 修复（Issue #6 补强，吸收 main a3301c7）
+
+- **证书安装后复查根存储**：`cert_install` 在 certutil 退出成功后复查根证书存储，`TraeDeviceProxyCA` 未实际入库（组策略拦截/存储重定向）时报错而非误报「安装成功」。
+- **依赖自愈**：安装证书前检查当前 Python 能否导入 cryptography，缺失时自动 `pip install cryptography pywin32`（dev 环境回退系统 Python 场景的兜底；已内置运行时则秒过）；自愈后仍报 `No module named` 时附手动修复指引。
+- **命令 async 化**：`cert_status` / `cert_install` 改为异步命令，certutil 查询与安装（秒级~几十秒）不再阻塞主线程。
+- **构建默认国内镜像**：embeddable Python zip 下载默认走 npmmirror（`PYTHON_EMBED_URL` 可覆盖回官方源），pip 依赖默认清华 TUNA 源（`PIP_INDEX_URL` 可覆盖）——python.org 直链在国内网络常超时。
+- **portable 打包缺失指引**：`package_portable.py` 在 `build/python-bundle/` 未装配时给出明确修复指引（先运行 prepare_python_runtime.py），不再输出模糊 WARN。
 
 ## [2.9.0] - 2026-09-09
 
