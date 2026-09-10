@@ -4,6 +4,28 @@
 
 ---
 
+## [未发布] · feature/buddy §2.2 非功能需求补齐 + 批次 1-4 九大类黑盒审查修复
+
+### Added
+- **健康检测（F-34 ④/§2.2 频控）**：API 网关启动即派健康探针线程——每 5min + 0-60s 抖动对 WB 上游 CN 主域名发无凭证轻量 GET（任何 HTTP 响应=在线，仅连接失败判不可达，零凭证暴露、单次单请求不重试）；结果经 `/status` 的 `wb.probe_ok`/`wb.probe_ts_ms` 透出（-1 未探测/0 不可达/1 在线）。
+- **域名双探测（§2.2 接口稳定性）**：`wb_common.billing_bases(domain)` 返回主/备域名（codebuddy.cn ↔ workbuddy.ai）；积分三件套主域名整体网络不可达时切备用重试一轮（`_fetch_round` 抽取）；签到 `checkin_do` 网络不可达时切备用重试一次。
+
+### Fixed
+- **[P0] 会话三件套命令路径逃逸**：`workbuddy_chatdata_backup/restore/info` 的 `user_id` 入参新增 `wb_chat_uid_guard`（字符白名单 + 池内存在性校验），杜绝 `..`/绝对路径注入导致 backup 的 `remove_dir_all` 任意目录删除（与 `workbuddy_chatdata_copy` 同类防护对齐）。
+- **[P1] 会话备份改原子替换**：先写 `<uid>.staging` 临时目录，完整性校验通过后才替换旧份——复制中断不再毁掉唯一备份。
+- **[P1] 会话恢复失败自动回滚**：`copy_dir_recursive`/db 复制失败时自动从 `.bak` 还原 projects 与双 db，消除"半恢复 + db 已挪走"悬挂态（对齐 CHANGELOG 批次 3 声称的自动回滚语义）。
+- **[P1] API Key 记账并发覆盖**：`api_keys.json` 读-改-写改为进程级锁内原子的 `verify_and_consume_locked`，并发请求不再互相覆盖 `used_today`/`daily_stats`（配额防穿透）。
+- **[P2] Key 比较常量时间化**：子 Key 校验对两侧求 sha256 后比对，防逐字节提前返回泄露前缀匹配长度。
+- **[P2] `safe_slice` 字符边界截断**：字节落点在多字节字符内时回退到最近合法边界，不再把整个超长上游响应体放进错误消息/日志。
+- **[P2] 成长中心错误消息三元优先级**：`"...HTTP %s" % status if status else raw` 三处修正括号归属，网络不可达时不再丢失上下文。
+- **[P2] sessions/edge 克隆 SQL 标识符转义**：新增 `sql_quote_ident`（内嵌双引号转义），列名/表名含 `"` 时不再拼接畸形 SQL。
+
+### 备注
+- 黑盒审查机制：无会话上下文子代理按九大类清单独立审查批次 1-4 热区，双轴结论（规格轴/标准轴）均为「有条件通过」，上述问题全部修复闭环。
+- 已知技术债（记录不阻塞）：ck_ 子 Key 明文落盘（data/ 不入库，涉存量迁移后置）；wb_route 流式/非流式取号循环 ~180 行重复（重构后置）。
+
+---
+
 ## [未发布] · feature/buddy 批次 4（Codex 投影 + 区域路由 + 快照回退 + 活动展示 + UI 兜底）
 
 ### 新增
