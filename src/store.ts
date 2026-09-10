@@ -373,7 +373,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       }).catch(() => {});
       get().pushToast(
         e.failed > 0 ? 'warn' : 'success',
-        `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
+        // 空轮次：过滤后无候选（全部已签/过期/冷却中），给用户明确文案而非「成功 0 已签 0 失败 0」
+        (e as { empty?: boolean }).empty
+          ? '没有需要签到的账号（全部已签/过期/冷却中）'
+          : `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
       );
     }
   },

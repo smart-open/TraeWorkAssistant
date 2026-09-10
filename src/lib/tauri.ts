@@ -318,6 +318,8 @@ export interface CheckinDoneEvent {
   already: number;
   failed: number;
   total?: number;
+  /** true=过滤后无候选账号（全部已签/过期/冷却中），未启动签到脚本 */
+  empty?: boolean;
 }
 /** 失败自动重试倒计时事件（T5） */
 export interface CheckinRetryEvent {

@@ -292,11 +292,11 @@ fn run_checkin_worker(
         let _ = app.emit("checkin-progress", serde_json::json!({ "type": "start", "total": 0 }));
         let _ = app.emit(
             "checkin-progress",
-            serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0 }),
+            serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0, "empty": true }),
         );
         let _ = app.emit(
             "checkin-done",
-            serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0 }),
+            serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0, "empty": true }),
         );
         if notify_done {
             crate::notify::notify(app, "签到完成", "没有需要签到的账号（全部已签/冷却中）");

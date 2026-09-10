@@ -308,9 +308,13 @@ export default function Checkin() {
               {checkin.active ? (
                 <Badge tone="blue">运行中</Badge>
               ) : checkin.done ? (
-                <Badge tone={checkin.done.failed > 0 ? 'amber' : 'green'}>
-                  完成：成功 {checkin.done.ok}，已签 {checkin.done.already}，失败 {checkin.done.failed}
-                </Badge>
+                checkin.done.total === 0 ? (
+                  <Badge tone="blue">没有需要签到的账号（全部已签/过期/冷却中）</Badge>
+                ) : (
+                  <Badge tone={checkin.done.failed > 0 ? 'amber' : 'green'}>
+                    完成：成功 {checkin.done.ok}，已签 {checkin.done.already}，失败 {checkin.done.failed}
+                  </Badge>
+                )
               ) : null}
               {checkin.done && checkin.done.failed > 0 ? (
                 <span className="text-xs text-slate-400">失败账号已自动重试 2 轮</span>
