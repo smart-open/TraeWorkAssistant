@@ -62,7 +62,7 @@ ai-work-assistant/
 │       ├── api_server/           # API 网关模块
 │       │   ├── mod.rs            # 常量 + 路由注册
 │       │   ├── server.rs         # axum 服务器启停
-│       │   ├── routes.rs         # OpenAI /v1/chat/completions + Anthropic /v1/messages（SSE 流式 + 非流式，双协议输出）
+│       │   ├── routes.rs         # OpenAI /v1/chat/completions + Anthropic /v1/messages + Codex /v1/responses（SSE 流式 + 非流式，三协议输出）
 │       │   ├── pool.rs           # 账号池调度（积分感知 + 冷却状态机 + 账号轮换，app 无关）
 │       │   ├── payload.rs        # OpenAI/Anthropic 请求 → llm_utils_chat 改写（anthropic_to_openai 先转内部格式）
 │       │   ├── sse.rs            # SSE 协议转换（SOLO → OpenAI chunk / Anthropic 事件流）
@@ -164,6 +164,9 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_env_reset_items()` / `_env_reset(items, keycloakLogout)` | 环境重置（F-14，批次3）：16 项认证残留清理清单（对齐 oss-research 17 物理位置，勾选预览 + 存在性标注）+ Keycloak SSO 注销（JWT iss → 浏览器 logout，先于清理执行）；执行前自动关闭 WorkBuddy，单项失败不中断 |
 | WorkBuddy | `workbuddy_usage_official(userId?, fresh?)` | 官方请求用量（F-25，批次3）：`POST <domain>/billing/meter/get-user-request-usage` 近 31 天分页（pageSize 3000，≤20 页，requestId 去重）→ 今日/近7天/本月 + 逐日按模型聚合；缓存 10min（data/workbuddy_usage_official_cache.json）；上游 prompt/input 字段一律不复制（脱敏红线） |
 | WorkBuddy | `workbuddy_token_stats()` | 本地 Token 统计（F-26/F-57，批次3）：合并 `~/.workbuddy/projects` + `~/.codebuddy/projects` JSONL（跳过 subagents/），usage 取值 message.usage > providerData.usage > 顶层，cache_read 别名链优先正值（cache_read_input_tokens→prompt_cache_hit_tokens），固定 365 天窗口；输出 summary/models/projects/daily/daily_by_model（snake_case，`commands/workbuddy_stats.rs` 6 单测） |
+| WorkBuddy | `workbuddy_usage_fallback()` | 积分用量快照回退（F-27，批次4）：官方用量不可用时自动切换——本地余额时序差分（data/workbuddy_credits_history.json，credits_fetch 非缓存时按日追加 cap 365）+ 签到日志「+N」奖励推导当日充值；口径明示「快照回退」非官方逐请求 |
+| WorkBuddy | `workbuddy_activity_info(userId?, refresh?)` | 活动信息三端点聚合（F-51，批次4）：公开 GET `/v2/activity/banner` + billing POST `get-payment-type`/`get-dosage-notify`；宽容解析逐项容错（errors[] 明示），缓存 10min（data/workbuddy_activity_cache.json） |
+| WorkBuddy | `workbuddy_ui_click_capture()` / `workbuddy_ui_click_checkin()` | UI 坐标点击签到兜底（F-18，批次4）：ctypes user32 驱动鼠标（零新依赖）；仅手动触发、默认关闭（settings.ui_click_enabled）；取点 3 秒倒计时记录坐标，执行单次单击不循环 |
 
 ### 5.1 双应用与双 uid 体系（F-08，trae_apps.rs）
 
@@ -216,6 +219,8 @@ ai-work-assistant/
 │   ├── workbuddy_chats/          # WorkBuddy 会话三件套备份（<uid>/projects/ + 双 db + chat_backup_meta.json）
 │   ├── workbuddy_cli_rotate_state.json # CLI 轮换状态（last_switch_at_ms + logs cap 50）
 │   ├── workbuddy_usage_official_cache.json # 官方请求用量缓存（10min）
+│   ├── workbuddy_credits_history.json # 每日积分余额快照（F-27 回退数据源，按日去重 cap 365）
+│   ├── workbuddy_activity_cache.json # 活动信息缓存（F-51，10min）
 │   ├── wb_model_catalog.json     # WB 上游模型目录（15 模型静态兜底 + supported_efforts/effort_override）
 │   ├── wb_template_map.json      # 审核模板黑名单映射表（mtime 热更新；缺失用内置兜底）
 │   ├── wb_sticky_sessions.json   # WB 会话粘性绑定（显式 30m TTL / 指纹 60s 窗）
@@ -314,7 +319,9 @@ ai-work-assistant/
 - **CA 证书**：仅本地回环 `127.0.0.1:8899`，自签根 CA 需 UAC 安装。
 - **UAC**：仅在 `cert_install` 提权，切换桥已改为普通用户可运行。
 - **API Key**：留空时跳过鉴权；配置时在前端掩码显示（前 4 + 后 4 + ****）。鉴权头支持 `Authorization: Bearer <key>`（OpenAI 风格）与 `x-api-key: <key>`（Anthropic 风格）双风格。
-- **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。端点：`GET /health`（免鉴权）、`GET /status`、`GET /v1/models`（与 `data/api_models.json` 同源，官网同步后无需重启即可见最新列表）、`POST /v1/chat/completions`（OpenAI 协议）、`POST /v1/messages`（Anthropic Messages 协议，F-39）。请求侧统一转 OpenAI 内部格式复用池调度链路，响应侧按协议分别输出；Anthropic 流式事件序列 message_start → content_block_* → message_delta → message_stop，reasoning_content 暂不输出（thinking 块需签名）。账号池 app 无关：Trae / Trae Work 账号入池即被同一网关服务，扣通用积分（product_id 208）。
+- **API 网关**：v2.0 已实现本地 API 网关（axum + ureq），上游 `trae-api-cn.mchost.guru`。端点：`GET /health`（免鉴权）、`GET /status`、`GET /v1/models`（与 `data/api_models.json` 同源，官网同步后无需重启即可见最新列表）、`POST /v1/chat/completions`（OpenAI 协议）、`POST /v1/messages`（Anthropic Messages 协议，F-39）、`POST /v1/responses`（Codex Responses API，F-40 批次4，仅 WB 上游模型）。请求侧统一转 OpenAI 内部格式复用池调度链路，响应侧按协议分别输出；Anthropic 流式事件序列 message_start → content_block_* → message_delta → message_stop，reasoning_content 暂不输出（thinking 块需签名）。账号池 app 无关：Trae / Trae Work 账号入池即被同一网关服务，扣通用积分（product_id 208）。
+- **Codex Responses 投影（F-40，批次4）**：`api_server/wb_responses.rs`（7 单测）——请求投影 instructions→system、input items（message/function_call/function_call_output/reasoning 跳过）→ messages、tools 平铺→function 包裹、max_output_tokens→max_tokens、reasoning.effort→reasoning_effort；流式投影在 `wb_sse.rs` `Protocol::Responses` 分支（response.created → output_item.added → output_text.delta → output_item.done → response.completed，错误→response.failed，无 [DONE] 帧）。Codex CLI `~/.codex/config.toml` 直配：`model_provider` 的 `base_url = "http://127.0.0.1:<port>/v1"`、`wire_api = "responses"`。脱敏沿用全局 wb_sanitize 开关与既有审核退回管线。
+- **区域路由（F-36，批次4）**：token domain 含 `.workbuddy.ai` → Global 账号，chat 全走 `www.workbuddy.ai`（wb_upstream 双域名常量 + 单测）；billing/积分（credits 三件套）、签到/成长中心（checkin 脚本 `_urls()`）、活动接口（activity_info）、官方用量（usage_official）均按账号区域切换域名；plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
 
 ## 13. 禁止与红线（Do NOT）
 

@@ -4,6 +4,26 @@
 
 ---
 
+## [未发布] · feature/buddy 批次 4（Codex 投影 + 区域路由 + 快照回退 + 活动展示 + UI 兜底）
+
+### 新增
+
+- **Codex `/v1/responses` 投影转换器（T4.1/F-40）**：新增 `api_server/wb_responses.rs`（7 单测）——请求投影 instructions→system、input（string | items）→ messages（message/function_call→tool_calls/function_call_output→tool/reasoning 跳过）、tools 平铺→function 包裹、`max_output_tokens`→`max_tokens`、`reasoning.effort`→`reasoning_effort`；非流式投影 completion→response 对象（output_text / function_call items + usage input/output/total_tokens）；流式投影 `Protocol::Responses`（wb_sse.rs：response.created → output_item.added → output_text.delta → output_item.done → response.completed，流内错误→response.failed，无 [DONE] 帧，6 处 solo 管线 match 兜底补全）；`server.rs` 注册 `/v1/responses`（仅 WB 上游模型，明确报错提示）；Codex CLI `config.toml` 直配 `wire_api="responses"` + `base_url=http://127.0.0.1:<port>/v1`；脱敏沿用全局 wb_sanitize 与既有审核退回管线（三协议一份）
+- **区域路由 Global 区（T4.5/F-36）**：对话上游 CN/Global 双域名（wb_upstream，批次2 已备）；本批补齐——积分三件套（workbuddy_credits.py `_billing_urls` 按账号 domain）、签到 + 成长中心（workbuddy_checkin.py `_urls()` 按账号区域切换全部端点）、官方用量（usage_official Global 账号修正为 `www.workbuddy.ai`，修复原 `https://.workbuddy.ai` 坏 URL）、活动接口随账号区域；`wb_common.py` 沉淀 `region_billing_base`/`is_global_region`；plugin 网关（token refresh）固定 codebuddy.cn 不随区域
+- **积分用量快照回退（T4.3/F-27）**：credits_fetch 非缓存命中时追加每日余额快照（`data/workbuddy_credits_history.json`，按日去重 cap 365）；`workbuddy_usage_fallback` 官方用量不可用时自动切换——快照差分 + 签到日志「+N」奖励推导当日充值（负差值记 0），今日/近7天/本月聚合口径与官方对齐；TokenStatsPanel 官方请求失败自动回退渲染（amber「快照回退数据源」标注 + KPI + 每日消耗柱图 + 推导口径说明）
+- **活动信息展示（T4.4/F-51）**：`workbuddy_activity_info` 三端点聚合——公开 GET `/v2/activity/banner`（宽容解析 banners/banner/list，只保留展示字段）+ billing POST `get-payment-type`（paymentType 徽标）+ `get-dosage-notify`（透传 data）；逐项容错 errors[] 明示；10min 缓存；BuddyOverview 活动信息卡（banner 横滑 + 付费类型徽标 + 用量提醒条）
+- **UI 坐标点击签到兜底（T4.2/F-18）**：新增 `src-python/workbuddy_ui_click.py`（ctypes user32 SetCursorPos/mouse_event，零新依赖）；`workbuddy_ui_click_capture`（3 秒倒计时取点）/ `workbuddy_ui_click_checkin`（单次单击，settings `ui_click_enabled` 默认关闭 + `ui_click_x/y` 坐标校验）；BuddyCheckin 兜底卡（启用开关 + 取点 + 执行 + 使用说明）
+
+### 变更
+
+- `Protocol` 枚举新增 `Responses` 变体（log_path `/v1/responses`）；wb_route chat_id 生成 `resp_` 前缀；`WorkBuddySettings` +3 字段（ui_click_*，serde default 向后兼容）；types.ts 新增 WbActivityInfo/WbUsageFallback
+
+### 说明
+
+- `/v1/responses` 仅支持 WB 上游模型（Codex 直配目标场景）；非 WB 模型返回明确 400 提示
+- 快照回退从本版起积累时序（需 ≥2 天快照），历史数据无法回溯推导
+- UI 坐标点击为 P3 兜底：分辨率/缩放/DPI 变化会使预存坐标失效，需重新取点
+
 ## [未发布] · feature/buddy 批次 3（会话数据 + 用量 + CLI 桥 + 生态）
 
 ### 新增

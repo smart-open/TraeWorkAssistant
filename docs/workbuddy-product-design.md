@@ -66,36 +66,36 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 
 | 编号 | 需求 | 验收标准 |
 |---|---|---|
-| F-02 | WorkBuddy 账号切换：auth 文件快照 + 用户数据双层恢复（L1 必选 / L2 体验 / L3 可选） | 切换后重启客户端登录身份变为目标账号；轮询 `account-snapshot.json.uid` 确认；客户端运行中先三级关闭；全程 NDJSON 进度 |
-| F-04 | 多账号池入库：`workbuddy_accounts.json`（.gitignore），uid/昵称/手机掩码/editionType/凭证/快照时间 | 账号 id = `wb-` + token 哈希（同 token 稳定同 id）；auth 导入兼容 `account.uid/auth.accessToken` 等多种嵌套形态；凭证不在 UI 明文 |
-| F-50 | OAuth 扫码登录工具（P2 批次 3）：`auth/state` → 浏览器扫码 → `auth/token` 轮询 → `login/account` 取 uid | 每流程独立 cookie jar 防串号；扫码成功账号自动入池 |
+| F-02 ✅ | WorkBuddy 账号切换：auth 文件快照 + 用户数据双层恢复（L1 必选 / L2 体验 / L3 可选） | 切换后重启客户端登录身份变为目标账号；轮询 `account-snapshot.json.uid` 确认；客户端运行中先三级关闭；全程 NDJSON 进度 |
+| F-04 ✅ | 多账号池入库：`workbuddy_accounts.json`（.gitignore），uid/昵称/手机掩码/editionType/凭证/快照时间 | 账号 id = `wb-` + token 哈希（同 token 稳定同 id）；auth 导入兼容 `account.uid/auth.accessToken` 等多种嵌套形态；凭证不在 UI 明文 |
+| F-50 ✅ | OAuth 扫码登录工具（P2 批次 3）：`auth/state` → 浏览器扫码 → `auth/token` 轮询 → `login/account` 取 uid | 每流程独立 cookie jar 防串号；扫码成功账号自动入池 |
 
 #### B. 会话与凭证续期（P0）
 
 | 编号 | 需求 | 验收标准 |
 |---|---|---|
-| F-09 | token 续期：首选 `POST /v2/plugin/auth/token/refresh`（`X-Refresh-Token` 头）；备选 Keycloak 原生端点 | 惰性刷新（临期 <24h 才刷）+ **过期前主动刷新**（v1.2 吸收 trae2api-web：每日兜底任务对临期账号不等 401、主动刷新——「过期前刷新」比「过期后补救」更稳）；每账号互斥锁；失败标 `needs_relogin` + 原因 + 桌面通知；schtasks 每周兜底 |
-| F-10 | Token 保活双源化：工具侧凭证副本与桌面 auth 文件「谁新用谁」（`expiresAtMs` 晚者胜出） | 原子写 + 文件锁；任何一方刷新后另一方读取时自动采纳新凭证，互不覆盖 |
-| F-14 | 环境重置/彻底登出（P2）：16 项认证残留清理清单 + Keycloak logout | 清理项可勾选预览；执行前二次确认；清理后客户端回到未登录态 |
+| F-09 ✅ | token 续期：首选 `POST /v2/plugin/auth/token/refresh`（`X-Refresh-Token` 头）；备选 Keycloak 原生端点 | 惰性刷新（临期 <24h 才刷）+ **过期前主动刷新**（v1.2 吸收 trae2api-web：每日兜底任务对临期账号不等 401、主动刷新——「过期前刷新」比「过期后补救」更稳）；每账号互斥锁；失败标 `needs_relogin` + 原因 + 桌面通知；schtasks 每周兜底 |
+| F-10 ✅ | Token 保活双源化：工具侧凭证副本与桌面 auth 文件「谁新用谁」（`expiresAtMs` 晚者胜出） | 原子写 + 文件锁；任何一方刷新后另一方读取时自动采纳新凭证，互不覆盖 |
+| F-14 ✅ | 环境重置/彻底登出（P2）：16 项认证残留清理清单 + Keycloak logout | 清理项可勾选预览；执行前二次确认；清理后客户端回到未登录态 |
 
 #### C. 签到与积分增值（P0/P1）
 
 | 编号 | 需求 | 验收标准 |
 |---|---|---|
-| F-15 | 一键签到：状态查询（旧路径回退）→ 执行 → `code:10001`/已签容错 → 401 刷新重试一次 | NDJSON 事件；零 token 输出；冷却复用 `account_cooldowns.json` |
-| F-16 | 签到调度增强（P1）：每日 09:00/21:00 双时段 schtasks；token 保活独立开关 | 定时可注册/查询/卸载；失败桌面通知 |
-| F-17 | 成长中心自动化（P1）：Buddy 旅行（状态/出发/领奖）、盲盒（次数/抽取）、任务领奖、能量、连签天数 | 全流程可单独开关；纯增量积分；奖励数额以接口返回为准不硬编码 |
+| F-15 ✅ | 一键签到：状态查询（旧路径回退）→ 执行 → `code:10001`/已签容错 → 401 刷新重试一次 | NDJSON 事件；零 token 输出；冷却复用 `account_cooldowns.json` |
+| F-16 ✅ | 签到调度增强（P1）：每日 09:00/21:00 双时段 schtasks；token 保活独立开关 | 定时可注册/查询/卸载；失败桌面通知 |
+| F-17 ✅ | 成长中心自动化（P1）：Buddy 旅行（状态/出发/领奖）、盲盒（次数/抽取）、任务领奖、能量、连签天数 | 全流程可单独开关；纯增量积分；奖励数额以接口返回为准不硬编码 |
 | F-18 | UI 坐标点击签到兜底（P3）：无 API 可用时的最后手段 | 仅手动触发，默认关闭 |
 
 #### D. 积分余额与用量（P0/P1/P2）
 
 | 编号 | 需求 | 验收标准 |
 |---|---|---|
-| F-20 | 余额展示：云端积分三件套（summary/paid/free-packages）+ 旧接口回退 | 免 MITM；宽容解析（6 种嵌套路径 + 容量字段链式取值）；`DeductionEndTime` 7 天内到期提醒；查询 ≥5min 缓存 |
-| F-22 | 多账号余额聚合 + 趋势图（P1）：buddy-credits 页 | 余额大字 + 月度消耗趋势 + 各账号对比条形图 |
+| F-20 ✅ | 余额展示：云端积分三件套（summary/paid/free-packages）+ 旧接口回退 | 免 MITM；宽容解析（6 种嵌套路径 + 容量字段链式取值）；`DeductionEndTime` 7 天内到期提醒；查询 ≥5min 缓存 |
+| F-22 ✅ | 多账号余额聚合 + 趋势图（P1）：buddy-credits 页 | 余额大字 + 月度消耗趋势 + 各账号对比条形图 |
 | F-21 | 本地 quota API 兜底（P2）：`GET 127.0.0.1:<port>/api/v1/quota` | 端口发现 = 扫 `~/.workbuddy/*.port` + 端口段探测；按 `remaining` 特征确认 |
-| F-25 | 官方用量统计（P2）：`get-user-request-usage` 日/周/月用量 | 与本地 token 统计并列展示 |
-| F-26 | 本地 token 统计（P2）：解析 `~/.workbuddy/projects` + `~/.codebuddy/projects` JSONL | input/output/cacheRead/cacheWrite/cacheHitRate，按模型/项目/会话聚合，days∈{7,30,90} |
+| F-25 ✅ | 官方用量统计（P2）：`get-user-request-usage` 日/周/月用量 | 与本地 token 统计并列展示 |
+| F-26 ✅ | 本地 token 统计（P2）：解析 `~/.workbuddy/projects` + `~/.codebuddy/projects` JSONL | input/output/cacheRead/cacheWrite/cacheHitRate，按模型/项目/会话聚合，days∈{7,30,90} |
 | F-27 | 积分用量快照回退（P3）：本地时序 + 签到日志推导每日用量 | 官方用量不可用时自动切换数据源并标注 |
 | F-51 | 活动信息展示（P3）：`/v2/activity/banner` + payment-type + dosage-notify | 低频附加展示 |
 
@@ -103,20 +103,20 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 
 | 编号 | 需求 | 验收标准 |
 |---|---|---|
-| F-28 | 网关上游接入：对话上游 `POST copilot.tencent.com/v2/chat/completions`（CN 区），只回 SSE → 非流式本地聚合 | UA 伪装 `CLI/2.63.2 CodeBuddy/2.63.2`；模型目录接口同步进 `api_models.json`；Global 区（domain 含 `.workbuddy.ai`）全走 `www.workbuddy.ai`（F-36） |
-| F-29 | 账号池调度引擎（P1，v1.2 升级）：三因子加权随机选号（credits×10 + 闲置补偿 + 成功率×3 → Top5 二次加权）+ 熔断；**账号五态机**（v1.2 吸收 antigravity-tools：`Available` / `QuotaProtection`（配额<阈值自动剔除）/ `RateLimited`（429 指数退避自动过期恢复）/ `Forbidden`（403 封禁需人工介入标注）/ `ProxyDisabled`），替换现有「冷却/禁用」二元态；**P2C 备选策略**（Power-of-Two-Choices 随机选二取优，作为三因子加权的可切换策略对比吸收） | hard_credit 冷却到次日 04:00 自动恢复；soft_rate 60s；100ms 窗口去重防惊群；五态迁移全部落 `/status` 账号画像 |
-| F-30 | 请求规范与改写层（P1，v1.2 升级）：Origin/Referer 必带、`X-No-*` 占位、强制 stream、`tool_choice` string 化、effort 降级、指纹清洗（可开关）；**指纹清洗 v2 = 精确匹配黑名单 + 最小改写**（v1.2 吸收 workbuddy-cliproxy：腾讯审核把 Claude Code 两句固定 system 模板**逐字入黑名单**，命中即拒答、任何一字改动即绕过——清洗层由「正则剥离为主」升级为「模板句映射表精确匹配 + 最小改写」（CLI→CLI tool、Main branch→Default branch），**映射表外置可热更新**（cat-and-mouse，不硬编码进二进制） | **红线：chat 请求绝不携带 X-Refresh-Token**；违反任一规范的上游 400 类错误在联调清单中逐项验证；模板映射表随 UA 常量一并集中维护 |
-| F-31 | 会话粘性路由（P2，v1.2 升级为**双模式**）：① 显式模式——conversationId → 账号绑定，双段分配（先空闲账号哈希再全池哈希）；② 指纹模式（v1.2 吸收 antigravity-tools）——无 conversationId 时对**前 3 条消息内容做 SHA256 取 6 位指纹** + 60s 时间窗锁定，同一会话恒落同一账号 | TTL 30m 滚动续期；写锁 re-check 防 TOCTOU；指纹模式注意：Buddy 上游 prompt cache 对代理流量**不生效**（§5.5 #10），指纹模式价值在会话一致性与上游侧缓存（若有），积分成本模型仍按冷启动估算，不做缓存命中承诺 |
-| F-32 | 网关运维接口（P1）：`/v1/models`、`/status`（每账号画像）、`/healthz`（无健康账号 503） | 请求级日志（seq/TTFB/uid/tokens/latency） |
-| F-33 | 错误三态分类（P1，v1.2 升级）：`RETRY_SAME` / `SWITCH_KEY` / `FATAL` + **分级重试策略表**（v1.2 吸收 antigravity-tools：429 → 优先解析 `Retry-After`，缺省线性退避 1/2/3s；503/529 → 指数退避；400 且含 `thinking.signature` → 固定 200ms 重试一次；其余 → 换号） | 硬编码标记词表（积分不足/insufficient credit/quota exceeded…）集中维护；重试表可配置，默认值按上表 |
-| F-34 | 代理协议工程化（P2）：模型级冷却渐进退避 10→20→40s；SSE keep-alive 15s；首字超时 10s 故障转移；断连 `_drain_upstream` 保 usage | 健康检测 5min + 抖动 |
-| F-35 | `ck_xxx` API Key 模式（P2）：API Key 直连 billing；子 Key 体系（限定上游、专一/临期优先两模式、按日统计） | 对外子 Key 与上游真实凭证分离 |
+| F-28 ✅ | 网关上游接入：对话上游 `POST copilot.tencent.com/v2/chat/completions`（CN 区），只回 SSE → 非流式本地聚合 | UA 伪装 `CLI/2.63.2 CodeBuddy/2.63.2`；模型目录接口同步进 `api_models.json`；Global 区（domain 含 `.workbuddy.ai`）全走 `www.workbuddy.ai`（F-36） |
+| F-29 ✅ | 账号池调度引擎（P1，v1.2 升级）：三因子加权随机选号（credits×10 + 闲置补偿 + 成功率×3 → Top5 二次加权）+ 熔断；**账号五态机**（v1.2 吸收 antigravity-tools：`Available` / `QuotaProtection`（配额<阈值自动剔除）/ `RateLimited`（429 指数退避自动过期恢复）/ `Forbidden`（403 封禁需人工介入标注）/ `ProxyDisabled`），替换现有「冷却/禁用」二元态；**P2C 备选策略**（Power-of-Two-Choices 随机选二取优，作为三因子加权的可切换策略对比吸收） | hard_credit 冷却到次日 04:00 自动恢复；soft_rate 60s；100ms 窗口去重防惊群；五态迁移全部落 `/status` 账号画像 |
+| F-30 ✅ | 请求规范与改写层（P1，v1.2 升级）：Origin/Referer 必带、`X-No-*` 占位、强制 stream、`tool_choice` string 化、effort 降级、指纹清洗（可开关）；**指纹清洗 v2 = 精确匹配黑名单 + 最小改写**（v1.2 吸收 workbuddy-cliproxy：腾讯审核把 Claude Code 两句固定 system 模板**逐字入黑名单**，命中即拒答、任何一字改动即绕过——清洗层由「正则剥离为主」升级为「模板句映射表精确匹配 + 最小改写」（CLI→CLI tool、Main branch→Default branch），**映射表外置可热更新**（cat-and-mouse，不硬编码进二进制） | **红线：chat 请求绝不携带 X-Refresh-Token**；违反任一规范的上游 400 类错误在联调清单中逐项验证；模板映射表随 UA 常量一并集中维护 |
+| F-31 ✅ | 会话粘性路由（P2，v1.2 升级为**双模式**）：① 显式模式——conversationId → 账号绑定，双段分配（先空闲账号哈希再全池哈希）；② 指纹模式（v1.2 吸收 antigravity-tools）——无 conversationId 时对**前 3 条消息内容做 SHA256 取 6 位指纹** + 60s 时间窗锁定，同一会话恒落同一账号 | TTL 30m 滚动续期；写锁 re-check 防 TOCTOU；指纹模式注意：Buddy 上游 prompt cache 对代理流量**不生效**（§5.5 #10），指纹模式价值在会话一致性与上游侧缓存（若有），积分成本模型仍按冷启动估算，不做缓存命中承诺 |
+| F-32 ✅ | 网关运维接口（P1）：`/v1/models`、`/status`（每账号画像）、`/healthz`（无健康账号 503） | 请求级日志（seq/TTFB/uid/tokens/latency） |
+| F-33 ✅ | 错误三态分类（P1，v1.2 升级）：`RETRY_SAME` / `SWITCH_KEY` / `FATAL` + **分级重试策略表**（v1.2 吸收 antigravity-tools：429 → 优先解析 `Retry-After`，缺省线性退避 1/2/3s；503/529 → 指数退避；400 且含 `thinking.signature` → 固定 200ms 重试一次；其余 → 换号） | 硬编码标记词表（积分不足/insufficient credit/quota exceeded…）集中维护；重试表可配置，默认值按上表 |
+| F-34 ✅ | 代理协议工程化（P2）：模型级冷却渐进退避 10→20→40s；SSE keep-alive 15s；首字超时 10s 故障转移；断连 `_drain_upstream` 保 usage | 健康检测 5min + 抖动 |
+| F-35 ✅ | `ck_xxx` API Key 模式（P2）：API Key 直连 billing；子 Key 体系（限定上游、专一/临期优先两模式、按日统计） | 对外子 Key 与上游真实凭证分离 |
 
 #### F. 生态接入（P2/P3）
 
 | 编号 | 需求 | 验收标准 |
 |---|---|---|
-| F-06 | CodeBuddy CLI 切号桥 + 积分到期自动轮换（P2）：维护 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN` | 自动轮换 = 切到「最早到期且仍有剩余」账号；防抖双约束（冷却期 + 到期差异阈值 min_gap_hours） |
+| F-06 ✅ | CodeBuddy CLI 切号桥 + 积分到期自动轮换（P2）：维护 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN` | 自动轮换 = 切到「最早到期且仍有剩余」账号；防抖双约束（冷却期 + 到期差异阈值 min_gap_hours） |
 | F-37 | DSH provider（P2）：15 模型静态目录兜底 + 启动动态替换 | 元数据透传 inputModalities/supportedEfforts/倍率/徽章；能力读上游勿硬编码 |
 | F-40 | Codex 后端转换器（P2）：`/v1/responses` 投影 + Anthropic `/v1/messages` + OpenAI 兼容三协议一份 | `--desensitize` 脱敏、失败退回紧凑模式；Codex CLI `config.toml` 直配可用 |
 | F-42 | workbuddy-mcp 模式（P3）：把 WorkBuddy 注册为 Codex/CC/Cursor 的 MCP 工具 | `WB_SKIP_PERMISSIONS` 可控 |
@@ -127,27 +127,27 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 
 | 编号 | 需求 | 验收标准 |
 |---|---|---|
-| F-44 | 会话备份/恢复（P1）：三件套 = `projects/{ws}/{cid}.jsonl` 正文 + `workbuddy.db` sessions + `edge-sync-mapping-v2.db` 云端映射 | 缺一不可；备份/恢复前校验客户端已关闭 |
-| F-45 | 会话复制/迁移（P2）：新 id 复制算法（替换 sessionId → 写目标 projects → db 插行 → edge_sync_mapping 注册） | 复制前 `backup_workbuddy_db`；复制后云端可正常同步 |
+| F-44 ✅ | 会话备份/恢复（P1）：三件套 = `projects/{ws}/{cid}.jsonl` 正文 + `workbuddy.db` sessions + `edge-sync-mapping-v2.db` 云端映射 | 缺一不可；备份/恢复前校验客户端已关闭 |
+| F-45 ✅ | 会话复制/迁移（P2）：新 id 复制算法（替换 sessionId → 写目标 projects → db 插行 → edge_sync_mapping 注册） | 复制前 `backup_workbuddy_db`；复制后云端可正常同步 |
 
 #### H. 跨应用通用（随批次嵌入）
 
 | 编号 | 需求 | 验收标准 |
 |---|---|---|
-| F-13 | 到期日历（P1）：各账号 token/积分到期绝对时间入库 + UI 日历 + 到期前提醒 | WorkBuddy/Trae/豆包共用一套 |
-| F-19 | 失败通知渠道扩展（P2）：企业微信 / Server酱 | 桌面通知之外的可选渠道 |
+| F-13 ✅ | 到期日历（P1）：各账号 token/积分到期绝对时间入库 + UI 日历 + 到期前提醒 | WorkBuddy/Trae/豆包共用一套 |
+| F-19 ✅ | 失败通知渠道扩展（P2）：企业微信 / Server酱 | 桌面通知之外的可选渠道 |
 
 #### I. 补充需求（v1.1，基于 workbuddy-switch v0.3.1 截图实测 + 源码核对）
 
 | 编号 | 需求 | 说明 / 验收标准 | 预估 | 优先级 |
 |---|---|---|---|---|
-| F-54 | 账号卡片双态与在线状态 | 卡片式账号管理：登录源头像（QQ/微信）+ 昵称 + uid 掩码 + 在线/离线徽标 +「设为当前 / 设为备用」双态操作；当前账号卡片高亮、备用一键提升；对齐本项目「切换」语义（当前=本机 auth 生效账号） | 1.5 天 | P1 |
-| F-55 | 自动签到配置化 + 启动自动补签 | ① 启用开关：应用启动时立即核验服务端签到状态，未签到账号自动补签（对齐 workbuddy-switch「启动时立即核验…自动补签」）；② 保活阈值 `keepalive_days`（天，0=每天无条件刷新全部带 refreshToken 账号）；③ 惰性刷新 `lazy_refresh_hours`（小时，默认 24）——刷新参数由硬编码 24h 改为配置化 | 1 天 | P1 |
-| F-56 | 积分包明细弹窗 | 「查看全部积分包」弹窗：逐包展示 包名 / 剩余/总量 / 已用 / 到期日 / 进度条，滚动列表；数据源=积分三件套（paid/free-packages），包级 `DeductionEndTime` 直接入到期日历（F-13） | 1 天 | P1 |
-| F-57 | Token 统计增强（F-26 升级） | ① 总览四指标卡：总 Token / 输入 / 输出 / **缓存命中率**（`cache_hit_rate = cache_read/(input+cache_read)`）；② Token 构成堆叠条（缓存读取/新增输入/输出/缓存写入 占比）；③ Token 与调用趋势**双轴图**（堆叠柱=四类构成，虚线=调用次数；模型筛选 + 今天/近7天/近30天/本月）；④ **年度活动热力图**（GitHub 风格，每日粒度，最近一年） | 1.5 天 | P2 |
-| F-58 | 按模型积分分类排行 | 官方用量（F-25）+ 本地 token 统计按模型映射：四 KPI 卡（剩余/今日消耗/近7天/本月）+ 官方消耗堆叠柱（按模型）+ 模型排行（请求数/合计积分/占比+进度条，展示 Top8、其余计入合计）；口径标注「来自 WorkBuddy 官方请求用量」 | 1 天 | P2 |
-| F-59 | CLI 自动轮换五重防护（F-06 升级） | 在原冷却期 + 到期差异阈值基础上，补齐 workbuddy-switch `rotate.rs` 完整防护：③ 到期紧迫阈值 `min_urgency`（目标到期剩余超过该值=都还早，不切）；④ 活跃保护 `active_guard`（CLI 最近对话 N 分钟内不切，防打断工作中会话）；⑤ 最小剩余积分 `min_remaining`（目标低于该值不切）；+ 检查间隔（分钟）配置 | 1 天 | P2 |
-| F-60 | 「添加与迁移账号」聚合入口 | 账号页顶部聚合卡：OAuth 扫码添加（F-50）/ 导入本机账号（扫 auth 文件+CLI）/ 导入备份（账号库导入，F-46 扩展）/ 导出——四入口一键直达 | 0.5 天 | P1 |
+| F-54 ✅ | 账号卡片双态与在线状态 | 卡片式账号管理：登录源头像（QQ/微信）+ 昵称 + uid 掩码 + 在线/离线徽标 +「设为当前 / 设为备用」双态操作；当前账号卡片高亮、备用一键提升；对齐本项目「切换」语义（当前=本机 auth 生效账号） | 1.5 天 | P1 |
+| F-55 ✅ | 自动签到配置化 + 启动自动补签 | ① 启用开关：应用启动时立即核验服务端签到状态，未签到账号自动补签（对齐 workbuddy-switch「启动时立即核验…自动补签」）；② 保活阈值 `keepalive_days`（天，0=每天无条件刷新全部带 refreshToken 账号）；③ 惰性刷新 `lazy_refresh_hours`（小时，默认 24）——刷新参数由硬编码 24h 改为配置化 | 1 天 | P1 |
+| F-56 ✅ | 积分包明细弹窗 | 「查看全部积分包」弹窗：逐包展示 包名 / 剩余/总量 / 已用 / 到期日 / 进度条，滚动列表；数据源=积分三件套（paid/free-packages），包级 `DeductionEndTime` 直接入到期日历（F-13） | 1 天 | P1 |
+| F-57 ✅ | Token 统计增强（F-26 升级） | ① 总览四指标卡：总 Token / 输入 / 输出 / **缓存命中率**（`cache_hit_rate = cache_read/(input+cache_read)`）；② Token 构成堆叠条（缓存读取/新增输入/输出/缓存写入 占比）；③ Token 与调用趋势**双轴图**（堆叠柱=四类构成，虚线=调用次数；模型筛选 + 今天/近7天/近30天/本月）；④ **年度活动热力图**（GitHub 风格，每日粒度，最近一年） | 1.5 天 | P2 |
+| F-58 ✅ | 按模型积分分类排行 | 官方用量（F-25）+ 本地 token 统计按模型映射：四 KPI 卡（剩余/今日消耗/近7天/本月）+ 官方消耗堆叠柱（按模型）+ 模型排行（请求数/合计积分/占比+进度条，展示 Top8、其余计入合计）；口径标注「来自 WorkBuddy 官方请求用量」 | 1 天 | P2 |
+| F-59 ✅ | CLI 自动轮换五重防护（F-06 升级） | 在原冷却期 + 到期差异阈值基础上，补齐 workbuddy-switch `rotate.rs` 完整防护：③ 到期紧迫阈值 `min_urgency`（目标到期剩余超过该值=都还早，不切）；④ 活跃保护 `active_guard`（CLI 最近对话 N 分钟内不切，防打断工作中会话）；⑤ 最小剩余积分 `min_remaining`（目标低于该值不切）；+ 检查间隔（分钟）配置 | 1 天 | P2 |
+| F-60 ✅ | 「添加与迁移账号」聚合入口 | 账号页顶部聚合卡：OAuth 扫码添加（F-50）/ 导入本机账号（扫 auth 文件+CLI）/ 导入备份（账号库导入，F-46 扩展）/ 导出——四入口一键直达 | 0.5 天 | P1 |
 
 > **源码核对要点**（克隆件 `%TEMP%\oss-research\workbuddy-switch`，commit bb46e90 · 2026-09-04 · v0.3.1）：`refresh.rs:127` 惰性刷新（剩余 < `lazy_refresh_hours` 才刷）与 `refresh.rs:149` 保活检查（每日一次，`keepalive_days<=0` 无条件刷全部）——F-55 的两个参数名与语义直接沿用；`rotate.rs::decide_target` 为纯函数（候选按 `urgency_key` 排序：到期越早越紧迫、无到期排最后 → 五重防护逐层过滤），**可纯逻辑单测**，移植时保持该形态；`token_stats.rs:46` 缓存命中率公式 + `:92-99` cache_read 别名链（`cache_read_input_tokens` 优先取正值，防 stale 0 掩盖 `prompt_cache_hit_tokens`，兼容嵌套 provider details）——F-57 解析层直接照抄。
 
@@ -489,50 +489,54 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 
 | # | 任务 | 涉及 | 预估 | DoD 摘要 |
 |---|---|---|---|---|
-| T1.0 | **Buddy 应用级子导航骨架（§3.7.0）**：Sidebar Buddy Tab 启用 + `buddy-*` 五页路由 + `src/pages/buddy/` 目录 + store Buddy 分区状态（空页占位） | types.ts、Sidebar.tsx、App.tsx、store.ts | 0.5d | 五页可达，PageHeader/版式对齐豆包先例；Trae/豆包页面零改动 |
-| T1.1 | `workbuddy_env_check` + buddy-overview 概述页 | commands/workbuddy.rs（新建）、pages/buddy/Overview.tsx | 0.5d | 四级探测返回 exe/authDir/dataDir；四指标卡 + 环境卡 + 到期提醒条 |
-| T1.2 | auth 文件扫描入池（F-04） | workbuddy/mod.rs、accounts | 1d | 嵌套字段链兼容；token 哈希稳定 id；凭证掩码 |
-| T1.3 | PS 桥 authfile 布局快照/恢复 + 切换/保存命令（F-02） | trae-switch-bridge.ps1、profile_*、前端账号行 | 2d | 切换后 uid 轮询确认；防误覆盖守卫；NDJSON 进度 |
-| T1.4 | token 续期（F-09）+ 每周兜底任务 | workbuddy/mod.rs、misc.rs | 1.5d | 惰性刷新；互斥锁；needs_relogin 通知；实测刷新一轮 |
-| T1.5 | workbuddy_checkin.py + buddy-checkin 签到与成长页（F-15） | src-python、pages/buddy/Checkin.tsx | 2d | 已签容错；401 刷新重试；NDJSON；零 token 输出 |
-| T1.6 | 积分三件套 + 旧接口回退 + buddy-credits 页（F-20/F-22） | workbuddy_credits.py、pages/buddy/Credits.tsx | 2d | 双域路由；6 种嵌套解析；5min 缓存；到期提醒 |
-| T1.7 | 到期日历（F-13，跨应用） | 新组件 + 三应用接入 | 1d | token/积分/会员三类到期统一日历 + 提醒 |
-| T1.9 | buddy-accounts 页 UI：双态卡片 + 积分包明细弹窗 + 聚合迁移入口（F-54/F-56/F-60） | pages/buddy/Accounts.tsx、AccountCard 组件 | 2d | 卡片布局/在线徽标/余额大字/活跃明细对齐 §3.7.2；明细弹窗逐包进度条；版式/组件对齐 §3.7.0 复用清单 |
-| T1.10 | 自动签到配置化 + 启动补签（F-55） | pages/buddy/Settings.tsx、checkin 管线 | 1d | keepalive_days / lazy_refresh_hours 参数化；启动核验未签自动补签；签到日志 30 天滚动 |
-| T1.8 | 批次 1 集成测试 + 文档同步（AGENT.md/CHANGELOG） | docs | 0.5d | 全链路手工回归清单通过 |
+| T1.0 ✅ | **Buddy 应用级子导航骨架（§3.7.0）**：Sidebar Buddy Tab 启用 + `buddy-*` 五页路由 + `src/pages/buddy/` 目录 + store Buddy 分区状态（空页占位） | types.ts、Sidebar.tsx、App.tsx、store.ts | 0.5d | 五页可达，PageHeader/版式对齐豆包先例；Trae/豆包页面零改动 |
+| T1.1 ✅ | `workbuddy_env_check` + buddy-overview 概述页 | commands/workbuddy.rs（新建）、pages/buddy/Overview.tsx | 0.5d | 四级探测返回 exe/authDir/dataDir；四指标卡 + 环境卡 + 到期提醒条 |
+| T1.2 ✅ | auth 文件扫描入池（F-04） | workbuddy/mod.rs、accounts | 1d | 嵌套字段链兼容；token 哈希稳定 id；凭证掩码 |
+| T1.3 ✅ | PS 桥 authfile 布局快照/恢复 + 切换/保存命令（F-02） | trae-switch-bridge.ps1、profile_*、前端账号行 | 2d | 切换后 uid 轮询确认；防误覆盖守卫；NDJSON 进度 |
+| T1.4 ✅ | token 续期（F-09）+ 每周兜底任务 | workbuddy/mod.rs、misc.rs | 1.5d | 惰性刷新；互斥锁；needs_relogin 通知；实测刷新一轮 |
+| T1.5 ✅ | workbuddy_checkin.py + buddy-checkin 签到与成长页（F-15） | src-python、pages/buddy/Checkin.tsx | 2d | 已签容错；401 刷新重试；NDJSON；零 token 输出 |
+| T1.6 ✅ | 积分三件套 + 旧接口回退 + buddy-credits 页（F-20/F-22） | workbuddy_credits.py、pages/buddy/Credits.tsx | 2d | 双域路由；6 种嵌套解析；5min 缓存；到期提醒 |
+| T1.7 ✅ | 到期日历（F-13，跨应用） | 新组件 + 三应用接入 | 1d | token/积分/会员三类到期统一日历 + 提醒 |
+| T1.9 ✅ | buddy-accounts 页 UI：双态卡片 + 积分包明细弹窗 + 聚合迁移入口（F-54/F-56/F-60） | pages/buddy/Accounts.tsx、AccountCard 组件 | 2d | 卡片布局/在线徽标/余额大字/活跃明细对齐 §3.7.2；明细弹窗逐包进度条；版式/组件对齐 §3.7.0 复用清单 |
+| T1.10 ✅ | 自动签到配置化 + 启动补签（F-55） | pages/buddy/Settings.tsx、checkin 管线 | 1d | keepalive_days / lazy_refresh_hours 参数化；启动核验未签自动补签；签到日志 30 天滚动 |
+| T1.8 ✅ | 批次 1 集成测试 + 文档同步（AGENT.md/CHANGELOG） | docs | 0.5d | 全链路手工回归清单通过 |
 
 ### 批次 2 · API 暴露 + 成长中心（≈11~13 天）
 
 | # | 任务 | 涉及 | 预估 |
 |---|---|---|---|
-| T2.1 | WorkBuddy 上游适配：headers 三铁律 + 强制 stream + tool_choice/effort 改写 + 非流式聚合 + **审核模板黑名单最小改写（映射表热更新）**（F-28/F-30 v1.2） | api_server/payload.rs、新 upstream | 3.5d |
-| T2.2 | 调度引擎：三因子加权 + **P2C 备选策略 + 账号五态机** + 熔断 + 04:00 恢复（F-29 v1.2）+ 错误三态与**分级重试策略表**（F-33 v1.2） | api_server/pool.rs | 3d |
-| T2.3 | 运维接口 /v1/models /status /healthz + 请求级日志（F-32） | api_server/routes.rs | 1d |
-| T2.4 | 会话粘性**双模式**：conversationId 绑定 + 前 3 消息 SHA256 指纹 60s 窗 + TTL（F-31 v1.2） | api_server | 1.5d |
-| T2.5 | 成长中心自动化：旅行/盲盒/任务链式 + 独立开关（F-17）+ 双时段调度（F-16） | workbuddy_checkin.py、Checkin.tsx | 2d |
-| T2.6 | 双源化 token 保活（F-10） | workbuddy/mod.rs | 1d |
-| T2.7 | 工程化：模型级冷却退避 + SSE keep-alive + 首字超时 + _drain_upstream（F-34） | api_server | 1.5d |
+| T2.1 ✅ | WorkBuddy 上游适配：headers 三铁律 + 强制 stream + tool_choice/effort 改写 + 非流式聚合 + **审核模板黑名单最小改写（映射表热更新）**（F-28/F-30 v1.2） | api_server/payload.rs、新 upstream | 3.5d |
+| T2.2 ✅ | 调度引擎：三因子加权 + **P2C 备选策略 + 账号五态机** + 熔断 + 04:00 恢复（F-29 v1.2）+ 错误三态与**分级重试策略表**（F-33 v1.2） | api_server/pool.rs | 3d |
+| T2.3 ✅ | 运维接口 /v1/models /status /healthz + 请求级日志（F-32） | api_server/routes.rs | 1d |
+| T2.4 ✅ | 会话粘性**双模式**：conversationId 绑定 + 前 3 消息 SHA256 指纹 60s 窗 + TTL（F-31 v1.2） | api_server | 1.5d |
+| T2.5 ✅ | 成长中心自动化：旅行/盲盒/任务链式 + 独立开关（F-17）+ 双时段调度（F-16） | workbuddy_checkin.py、Checkin.tsx | 2d |
+| T2.6 ✅ | 双源化 token 保活（F-10） | workbuddy/mod.rs | 1d |
+| T2.7 ✅ | 工程化：模型级冷却退避 + SSE keep-alive + 首字超时 + _drain_upstream（F-34） | api_server | 1.5d |
 
 ### 批次 3 · 会话数据 + 用量 + CLI 桥（≈12~15 天）
 
 | # | 任务 | 预估 |
 |---|---|---|
-| T3.1 | 会话三件套备份/恢复（F-44） | 1.5d |
-| T3.2 | 会话复制/迁移新 id 算法（F-45） | 2d |
-| T3.3 | 官方用量 get-user-request-usage（F-25）+ Token 统计增强版（F-26/F-57/F-58：四指标+缓存命中率+双轴趋势+年度热力图+按模型排行） | 3.5d |
-| T3.4 | CLI 切号桥 + 五重防护轮换 decide_target 纯函数 + 单测（F-06/F-59） | 2d |
-| T3.5 | OAuth 扫码工具（F-50）+ 环境重置 16 项清理（F-14） | 2.5d |
-| T3.6 | 账号导入导出扩展 + 通知渠道企业微信/Server酱（F-19） | 1.5d |
-| T3.7 | ck_xxx API Key 子 Key 体系（F-35） | 2d |
+| T3.1 ✅ | 会话三件套备份/恢复（F-44） | 1.5d |
+| T3.2 ✅ | 会话复制/迁移新 id 算法（F-45） | 2d |
+| T3.3 ✅ | 官方用量 get-user-request-usage（F-25）+ Token 统计增强版（F-26/F-57/F-58：四指标+缓存命中率+双轴趋势+年度热力图+按模型排行） | 3.5d |
+| T3.4 ✅ | CLI 切号桥 + 五重防护轮换 decide_target 纯函数 + 单测（F-06/F-59） | 2d |
+| T3.5 ✅ | OAuth 扫码工具（F-50）+ 环境重置 16 项清理（F-14） | 2.5d |
+| T3.6 ✅ | 账号导入导出扩展 + 通知渠道企业微信/Server酱（F-19） | 1.5d |
+| T3.7 ✅ | ck_xxx API Key 子 Key 体系（F-35） | 2d |
 
 ### 批次 4 · 生态与远期（≈6~8 天 + 机会项）
 
 | # | 任务 | 预估 |
 |---|---|---|
 | T4.1 | Codex `/v1/responses` 投影转换器 + 脱敏（F-40） | 2.5d |
-| T4.2 | DSH provider：15 模型静态目录 + 动态替换（F-37） | 2d |
-| T4.3 | CC Switch 端点注册（F-43）+ 本地 quota 端口发现兜底（F-21） | 1d |
-| T4.4 | 机会项（按需）：Global 区（F-36）、UI 坐标签到（F-18）、用量快照回退（F-27）、活动展示（F-51）、workbuddy-mcp（F-42）、WorkBuddyProxy（F-52）、trae2codex（F-41） | — |
+| T4.2 | UI 坐标点击签到兜底（F-18） | 1d |
+| T4.3 | 积分用量快照回退（F-27） | 1d |
+| T4.4 | 活动信息展示（F-51） | 0.5d |
+| T4.5 | Global 区上游域名路由（F-36）：domain 含 `.workbuddy.ai` 的账号全走 `www.workbuddy.ai` | 0.5d |
+| T4.6 | 批次 4 收尾审查 + 文档 + 分拆提交 | — |
+
+> 顺延（批次 5/按需）：DSH provider（F-37）、CC Switch 协同（F-43）、quota 端口发现兜底（F-21）、workbuddy-mcp（F-42）、WorkBuddyProxy（F-52）、trae2codex（F-41）。
 
 ---
 
