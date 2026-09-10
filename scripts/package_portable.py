@@ -84,10 +84,17 @@ def main():
     shutil.copy2(release_exe, os.path.join(stage_app, binary_name + ".exe"))
 
     # 2) 资源按 Tauri 布局放入 resources/
+    # 注意：内嵌 Python 运行时改造后，tauri.conf.json 的 python/ 资源来自
+    # build/python-bundle/（由 scripts/prepare_python_runtime.py 白名单装配），
+    # 该目录缺失时 portable 包将不含内嵌解释器（安装后回退系统 Python）。
     res_dir = os.path.join(stage_app, "resources")
     for src_abs, dest in abs_res.items():
         if not os.path.isdir(src_abs):
-            print("WARN: 资源目录缺失:", src_abs, file=sys.stderr)
+            hint = ""
+            if "python-bundle" in os.path.basename(src_abs):
+                hint = "（内嵌 Python 运行时未装配，请先运行: python scripts/prepare_python_runtime.py；" \
+                       "否则 portable 包将回退系统 Python）"
+            print("WARN: 资源目录缺失:", src_abs, hint, file=sys.stderr)
             continue
         target = os.path.join(res_dir, dest)
         walk_copy(src_abs, target)

@@ -23,8 +23,9 @@
   - CI 中请用 actions/setup-python 钉同一版本（见 .github/workflows/build-windows.yml）。
 
 下载源:
-  https://www.python.org/ftp/python/{ver}/python-{ver}-embed-amd64.zip
-  可用环境变量 PYTHON_EMBED_URL 覆盖；zip 缓存于 %LOCALAPPDATA%/TraeWorkAssistant/build-cache。
+  默认 npmmirror 国内镜像: https://registry.npmmirror.com/-/binary/python/{ver}/...
+  可用环境变量 PYTHON_EMBED_URL 覆盖回官方源；zip 缓存于 %LOCALAPPDATA%/TraeWorkAssistant/build-cache。
+  pip 依赖默认清华 TUNA 源，PIP_INDEX_URL 可覆盖。
 """
 
 import argparse
@@ -78,10 +79,14 @@ def cache_dir(explicit: str | None) -> Path:
 
 
 def download_embed_zip(py_version: str, cache: Path) -> Path:
-    """下载 embeddable zip（命中缓存则直接复用）。"""
+    """下载 embeddable zip（命中缓存则直接复用）。
+
+    默认走 npmmirror 国内镜像（吸收 main a3301c7：python.org 直链在国内网络
+    常超时）；设置 PYTHON_EMBED_URL 可覆盖回官方源。
+    """
     url = os.environ.get(
         "PYTHON_EMBED_URL",
-        f"https://www.python.org/ftp/python/{py_version}/python-{py_version}-embed-amd64.zip",
+        f"https://registry.npmmirror.com/-/binary/python/{py_version}/python-{py_version}-embed-amd64.zip",
     )
     dest = cache / f"python-{py_version}-embed-amd64.zip"
     if dest.exists() and dest.stat().st_size > 1_000_000:
@@ -161,19 +166,22 @@ def install_deps(py_version: str) -> None:
     target = SRC_PYTHON / "Lib" / "site-packages"
     if target.exists():
         shutil.rmtree(target)  # 清掉上次可能残留的半成品
+    # 默认 TUNA 镜像（吸收 main a3301c7），PIP_INDEX_URL 环境变量可覆盖
+    pip_index = os.environ.get("PIP_INDEX_URL", "https://pypi.tuna.tsinghua.edu.cn/simple")
     cmd = [
         sys.executable, "-m", "pip", "install",
         "-r", str(REQUIREMENTS),
         "--target", str(target),
         "--only-binary", ":all:",
         "--no-warn-script-location",
+        "-i", pip_index,
     ]
     info(f"安装依赖: {' '.join(cmd[2:])}")
     r = subprocess.run(cmd)
     if r.returncode != 0:
         fail(
             "pip 安装依赖失败。\n"
-            "  国内网络可设置镜像: set PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple"
+            f"  当前源: {pip_index}（可用环境变量 PIP_INDEX_URL 覆盖）"
         )
     # pywin32 后处理：其运行需要 pywin32_system32 下的 DLL，Windows DLL 搜索
     # 不走 sys.path，把它们复制到 python.exe 同目录（永远在搜索路径上）。
