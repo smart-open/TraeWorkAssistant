@@ -300,7 +300,8 @@ export default function Checkin() {
         </>
       )}
 
-      {checkin.active || checkin.total > 0 ? (
+      {/* 空轮（全部已签/过期/冷却中）结束后也保留卡片，避免提示一闪而过 */}
+      {checkin.active || checkin.total > 0 || checkin.done?.total === 0 ? (
         <div className="card p-4">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="font-medium">实时进度</h3>
@@ -338,6 +339,12 @@ export default function Checkin() {
               {checkin.index}/{checkin.total}
             </div>
           </div>
+          {!checkin.active && checkin.done?.total === 0 && (
+            <div className="mb-3 flex items-center gap-2 rounded border border-sky-300 bg-sky-50 px-3 py-2 text-sm text-sky-700 dark:border-sky-700 dark:bg-sky-900/20 dark:text-sky-300">
+              <AlertCircle size={15} className="shrink-0" />
+              <span>本轮没有发起签到：所有账号均已签到 / JWT 过期 / 冷却中，被「跳过规则」过滤，无候选账号</span>
+            </div>
+          )}
           <div className="max-h-80 space-y-1 overflow-auto">
             {Array.from({ length: checkin.total }).map((_, i) => {
               const r = checkin.results[i];
