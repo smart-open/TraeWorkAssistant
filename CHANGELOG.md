@@ -14,6 +14,14 @@
 - **定时任务路径漂移校验**：`task_register` 会把注册时刻的解释器与脚本绝对路径硬编码进计划任务，升级迁移安装目录后旧任务会静默失效。`task_status` 现以 `schtasks /FO CSV /V` 读取真实 `/TR` 与当前布局比对（CSV 单行不折行避免误判，大小写/斜杠归一化），脚本路径失效提示「定时签到将静默失败，请重新注册」，仅绑定旧版解释器时提示「建议重新注册切换到内置 Python 运行时」；开发期相对路径与裸解释器名（PATH 解析）跳过校验不误报。附 5 例单元测试。
 - **安装包瘦身（-16 MB）**：内嵌运行时改为按发布白名单装配到 `build/python-bundle/`（`tauri.conf.json` 资源映射同步切换），与源目录 `src-python/` 解耦——`tests/`、`requirements.txt`、`pythonw.exe`、`python.cat` 不再进入安装包；site-packages 裁剪 pywin32 的 IDE/COM/文档附属（pythonwin/win32com*/adodbapi/isapi/bin/PyWin32.chm/dist-info）。暂存 56 MB/1388 文件 → 40 MB/624 文件，装配后以内嵌解释器自检（cryptography/win32crypt/sqlite3）防裁剪误伤。源目录与开发流程完全不受影响。
 
+### 修复（Issue #7：代理孤儿进程泄漏导致端口被重复绑定、目标域名全打不开）
+
+- **端口绑定改显式独占**：`device_proxy.py` 监听套接字弃用 `SO_REUSEADDR`（Windows 上它允许多套接字绑定同一端口且不报错，是「假启动」的直接诱因），改用 `SO_EXCLUSIVEADDRUSE`；绑定失败打 `[fatal]` 日志并以退出码 2 立即退出。已实测：端口被占时秒退 + 明确报错。
+- **Rust 侧双防线防假启动**：`proxy_start` spawn 前用一次性 TcpListener 试绑目标端口（被占即返回明确错误，不污染系统代理状态）；spawn 后轮询 1s 做秒退检测（进程立即退出则丢弃启动状态并带回真实退出码）——补齐了 PR 思路中只改 Python 端仍会假启动的缺口。
+- **根治孤儿进程（Job Object）**：代理子进程分配进 `KILL_ON_JOB_CLOSE` 的 Windows Job（FFI 声明 kernel32，零新增依赖），父进程无论正常退出、崩溃还是被强杀，OS 都会杀掉 Job 内全部子进程，从源头消灭「孤儿代理继续占端口接客」的泄漏链。附 FFI 结构布局单测。
+- **`log()` 永不抛异常**：`print(..., flush=True)` 包进 try/except——父进程退出后孤儿的 stdout 管道断开时不再把调用方线程杀死（此前目标域名分支先 log 后应答，日志异常直接掐断 CONNECT 握手，且兜底 except 里的 log 同样抛异常导致日志无记录）。
+- **CONNECT 先应答后记日志**：目标域名 MITM 分支调整为先回 `200 Connection Established` 再 `log()`，与 `tunnel_raw()` 对齐，任何日志/证书异常都不会再拖死握手。
+
 ## [2.9.0] - 2026-09-09
 
 ### 新增
