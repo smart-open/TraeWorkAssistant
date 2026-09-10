@@ -98,9 +98,10 @@ python scripts/package_portable.py # 便携版 zip（AI Work 助手_<版本>_x64
 
 - [更新日志](CHANGELOG.md) — 各版本变更记录
 - [用户手册](docs/user-manual.md) — 功能说明与使用指南
-- [API 文档](docs/api-doc.md) — Tauri 前后端命令契约
-- [技术框架](docs/tech-framework.md) — 架构设计与数据模型
-- [运行手册](docs/operation-manual.md) — 开发环境与部署指南
+- [产品设计](docs/product-design.md) — 需求与产品设计基线（v1.0/v2.0）
+- [WorkBuddy 接入设计](docs/workbuddy-product-design.md) — WorkBuddy/CodeBuddy 全量接入蓝图
+- [产品优化需求清单](docs/product-optimization-backlog.md) — 未排期优化项待办
+- [技术架构设计](docs/tech-framework.md) — 架构/数据模型/协议参考/开发运维（含原 API 文档与运行手册）
 
 ## 赞赏
 

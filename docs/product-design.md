@@ -1,11 +1,10 @@
 # AI Work 助手 · 产品设计文档
 
-> 版本：v2.0
-> 更新日期：2026-08-13
-> v2.0.0 已实现：本地 API 网关、代理日志、签到错误冷却、积分过期调度、6 层设备标识重置。
-> 产品名称：**AI Work 助手**
+> 版本：v2.0（基线）· 2026-09-10 校订
+> 产品名称：**AI Work 助手**（当前产品版本 v3.2.7）
 > 定位：整合「多账号签到」「登录态切换」「设备隔离」「账号分组」的 Windows 桌面端一体化工具。
 > 范围声明：v1.0 聚焦桌面端管理工具；v2.0 已实现本地 API 网关（OpenAI 兼容协议）、账号池智能调度、SSE 协议转换，全部为本项目自主设计与实现。
+> 文档定位：本文是**需求产品设计**主文档（v1.0/v2.0 设计基线）；3.x 增量功能见 `CHANGELOG.md` 与根目录 `AGENT.md`，WorkBuddy 接入设计见 [workbuddy-product-design.md](workbuddy-product-design.md)，未排期优化项见 [product-optimization-backlog.md](product-optimization-backlog.md)。
 
 ---
 
@@ -85,7 +84,7 @@ AI Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工具�
 | **G06** | 剩余积分 | 实时查询各账号剩余可用积分，签到后自动刷新 | 已实现 |
 | **G07** | 6 层设备重置 | 全量重置设备标识（machineid/storage.json/aha/注册表/webview），防止多账号关联 | 已实现 |
 
-> **说明**：G01~G07 在 v2.0.0 全部实现并验证通过。详细需求见 `requirements-v2.md`。
+> **说明**：G01~G07 在 v2.0.0 全部实现并验证通过（原 `requirements-v2.md` 需求规格已于文档精简中归档删除）。
 
 ---
 
@@ -979,7 +978,7 @@ Anthropic Request─┘                    └─→ Anthropic SSE
 | 账号配置模板 | `src-python/tests/（测试数据）` |
 | 设备限制根因分析 | `docs/技术框架（本项目设计）` |
 | 设备 ID 代理方案 | `docs/技术框架（本项目设计）` |
-| JWT 重抓指南 | `docs/operation-manual.md` |
+| JWT 重抓指南 | `docs/tech-framework.md`（开发与运维） |
 | 账号切换器（命令行） | `src-ps/trae-switch-bridge.ps1` |
 | 账号切换器（GUI） | `src-ps/trae-switch-bridge.ps1（集成模式）` |
 | 功能参考界面 | `docs/product-design.md（界面参考）` |
