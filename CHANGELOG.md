@@ -4,6 +4,32 @@
 
 ---
 
+## [未发布] · feature/buddy 批次 2（API 暴露 + 成长中心）
+
+### 新增
+
+- **WorkBuddy 网关上游适配（T2.1/F-28/F-30）**：新增 `api_server/wb_catalog.rs`（15 模型静态目录：上下文/maxTokens/图片模态/supported_efforts/effort_override 修正层/倍率）、`wb_payload.rs`（强制 stream:true；tool_choice 对象→string；effort 按目录降级；指纹清洗 cc_xxx/x-anthropic-* 剥离；审核模板黑名单最小改写——映射表 `wb_template_map.json` mtime 热更新，内置兜底 CLI→CLI tool、Main branch→Default branch；连续同角色消息合并）、`wb_sse.rs`（WB OpenAI 风格 SSE 解析：多行 data/紧凑流/注释行兼容；tool_calls 按 index 合并聚合；OpenAI/text/Anthropic 三协议流式与聚合输出）、`wb_upstream.rs`（headers 三铁律：Origin/Referer 按区域必带 + X-No-* 占位 + **chat 绝不带 X-Refresh-Token 红线**；UA `CLI/2.63.2 CodeBuddy/2.63.2`；CN/Global 双域路由）、`wb_route.rs`（WB 请求主路径）
+- **调度引擎扩展（T2.2/F-29/F-33）**：pool.rs 新增 `weighted`（三因子加权：积分占比×10 + 闲置补偿 0.5/h 封顶 5.0 + 成功率×3，Top5 二次加权随机）与 `p2c`（随机选二取优）策略；账号五态机（Available/QuotaProtection/RateLimited/Forbidden/ProxyDisabled，随 PoolStatus.state 下发）；hard_credit 冷却至次日 04:00 自动恢复；熔断 30m 起指数递增封顶 6h；防惊群 100ms 窗口；新增 `retry.rs` 分级重试表（429 Retry-After/线性、503/529 指数 10/20/40s、400+thinking.signature 200ms 一次、401/403 换号、400 Fatal），纯函数 5 组单测
+- **会话粘性双模式（T2.4/F-31）**：`wb_sticky.rs` 显式 conversationId 绑定（TTL 30m 滚动续期）+ 前 3 消息 SHA256 指纹 60s 窗；上游 conversation_id 双段分配；Mutex 内 re-check 防 TOCTOU；持久化 `wb_sticky_sessions.json`（含 5 组单测）
+- **成长中心自动化（T2.5/F-17）**：`workbuddy_checkin.py --growth` 执行器——Buddy 旅行（status→claim→config→depart 链式）/ 盲盒（chances→draw 循环，上限 20）/ 任务领奖（tasks→accept 过滤未领）/ 能量与连签天数展示；各步独立容错 + 401 刷新一次重试；奖励数额以接口返回为准；NDJSON 复用 wb-checkin-progress 管线（`mode:"growth"` 分流）；buddy-checkin 页接线「立即执行成长任务」+ 逐账号明细（旅行/盲盒/任务结果 + 能量/连签）
+- **双源 token 保活（T2.6）**：网关 401 自动刷新——WB 上游 401 时调 refresh 端点（X-Refresh-Token 红线约束）刷新工具侧副本并同号重试一次（每账号每请求一次），与桌面 auth 文件谁新用谁（F-10）
+- **运维接口（T2.3/F-32）**：`/healthz`（无健康账号 503）；`/v1/models` 合并 WB 目录（owned_by=workbuddy）；`/status` `/health` 新增 `wb` 段（池画像/模型冷却/粘性会话数）；WB 请求日志含 TTFB
+- **工程化（T2.7/F-34）**：模型级冷却渐进退避 10→20→40s（优先级高于 Key 级）；SSE keep-alive 15s 注释行（SOLO 与 WB 流式均接入）；首字超时 10s 故障转移（转发线程 + recv_timeout，Agent 300s 读超时兜底）；客户端断连后继续消费上游保 usage 完整
+- `wb_common.py` 新增 `get_json`（GET 请求，对齐 post_json 容错语义）
+- **到期日历 Trae / 豆包侧挂载（F-13 批次 1 遗留补齐）**：Trae「积分看板」新增到期日历卡（token JWT / 积分包 / 会员三类，Unix 秒直读）；豆包「概述」新增到期日历卡（会员 quota_expire_at / 会话 session_expire_at，本地时间字符串转 Unix 秒）
+
+### 变更
+
+- `ApiPoolFile`（api_pool.json）新增 `wb_enabled` 字段（默认 false）；`pool_set` 命令扩展可选 `wb_enabled` 参数（向后兼容）
+- 模型路由：请求模型命中 wb_model_catalog → WB 上游；wb_enabled=false 时返回 400 明确报错
+- `workbuddy_growth_run` 不再是占位：实际驱动 python 成长中心执行器
+
+### 说明
+
+- WB 上游未接入真实账号联调（需账号池含 token store 凭证副本 + wb_enabled 开启）；协议要点均按设计文档 §3.9/§5.5/§5.6 落地并附单测
+- 会话粘性在 Buddy 上游的价值为会话一致性与上游侧缓存（若有）；代理流量 prompt cache 恒不命中（§5.5 #10），成本模型按无缓存估算
+- Codex /v1/responses 投影、DSH provider 动态目录同步、CC Switch 注册按设计文档归批次 3/4
+
 ## [未发布] · feature/buddy 批次 1（WorkBuddy 接入快赢闭环）
 
 ### 新增
@@ -19,9 +45,7 @@
 ### 说明
 
 - 成长中心执行器（旅行/盲盒/任务链式，F-17）与 Token 统计（F-57）、官方用量（F-25）按设计文档批次 2/3 交付，本期 UI 已预留入口与开关
-- 到期日历已接入 WorkBuddy 五页；Trae / 豆包侧挂载随批次 2 补齐
-
-## [3.3.2] - 2026-09-10
+- 到期日历已接入 WorkBuddy 五页；Trae / 豆包侧挂载随批次 2 补齐## [3.3.2] - 2026-09-10
 
 ### 修复
 

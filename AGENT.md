@@ -134,7 +134,7 @@ ai-work-assistant/
 | 设备 | `device_reset(userId)` | 删 `device_map.json[ uid ]` |
 | JWT | `jwt_parse(jwt)` / `refresh_jwt(userId)` | 解析 / 自动刷新（需 refresh_token） |
 | API | `api_server_start()` / `api_server_stop()` / `api_server_status()` | API 网关启停（端口/默认模型由设置页提供；鉴权统一走 API Keys 列表） |
-| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy` / `group_ids`（T10 调度策略与分组筛选） |
+| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy`（expire_first/credit_first/random/**weighted/p2c**）/ `group_ids` / `wb_enabled`（T2.1 WB 上游开关） |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
 | API | `api_models_list()` / `api_models_sync()` | 模型列表读取（data/api_models.json）/ 官网同步（不消耗积分，最多试 3 账号） |
 | API | `api_logs_list(...)` / `api_logs_detail(...)` / `api_logs_search(...)` | API 请求日志查询 / 详情 / 搜索 |
@@ -151,7 +151,7 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_account_save/remove` / `workbuddy_scan_auth_file` / `workbuddy_account_import_auth` | 别名备注 / 删除 / auth 文件扫描预览 / 确认入池（凭证入 token store 副本，零明文出 Rust） |
 | WorkBuddy | `workbuddy_refresh_token(userId)` | plugin refresh 端点（X-Refresh-Token 仅限此端点）+ 回写 token store 与账号池过期时间；失败提示需重登 |
 | WorkBuddy | `workbuddy_checkin_start(opts)` → NDJSON `wb-checkin-progress` | 调 python workbuddy_checkin.py（状态查询回退旧路径 / code:10001 已签容错 / 401 刷新一次重试 / 零 token 输出）；opts: `{ user_ids?, skip_checked_in, skip_expired, lazy_hours? }` |
-| WorkBuddy | `workbuddy_growth_run()` | 成长中心执行入口（旅行/盲盒/任务开关从 workbuddy_settings.json 读取；python 执行器随批次 2 接入） |
+| WorkBuddy | `workbuddy_growth_run()` | 成长中心执行入口（旅行/盲盒/任务开关从 workbuddy_settings.json 读取；python `--growth` 链式执行：travel status→claim→config→depart / lottery chances→draw 循环（上限 20）/ tasks→accept，各步独立容错、401 刷新一次重试、奖励数额以接口返回为准） |
 | WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（data/workbuddy_checkin_results.json 90 天滚动，默认展示 30 天） |
 | WorkBuddy | `workbuddy_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日双时段签到任务 AIWorkAssistant_WorkBuddyCheckin_<HHMM>（09:00/21:00） |
 | WorkBuddy | `workbuddy_renew_task_register(day) / _status / _unregister` | schtasks 每周凭证续期兜底任务 AIWorkAssistant_WorkBuddyRenew（周日 10:30，python --renew-only 惰性刷新） |
@@ -163,6 +163,17 @@ ai-work-assistant/
 - 数据源：`%APPDATA%\TRAE SOLO CN`（Trae Work）与 `%APPDATA%\Trae CN`（Trae CN IDE）各自的 `User\globalStorage\storage.json` / `state.vscdb`。
 - **两套 uid 体系不通用（红线）**：`iCubeAuthInfo://icube-dc:<uid>` 键名中的 uid 是**账户中心（dc）id 空间**；账号池 / JWT `data.id` 用的是 **Cloud-IDE id 空间**。同一登录账号两者数值不同，直接混用会导致重复入池。
 - 当前登录账号的 Cloud-IDE uid 由使用痕迹推导（Trae CN 看 `icube_gtm.users` 键名；Trae Work 看 state.vscdb `solo.mobile.allowControl` per-uid 最新 `updatedTime` + 键名证据计数），推导失败时回退展示 dc uid 并标记 `uid_confident=false`、**禁止入池**。
+
+### 5.2 API 网关双上游与 WorkBuddy 适配（批次 2，T2.1~T2.4/T2.7）
+
+- **双上游路由**：`api_server/pool.rs` 调度引擎同时服务 SOLO 池与 WB 池（`ApiSharedState.wb_pool`，两实例并存）。请求模型命中 `wb_model_catalog.json`（15 模型静态兜底 + 人工/动态可替换）→ WB 上游 `POST {chatBase}/v2/chat/completions`（CN=copilot.tencent.com / Global=www.workbuddy.ai，按账号 domain 含 `.workbuddy.ai` 判定）；否则走既有 SOLO `llm_utils_chat`。`api_pool.json.wb_enabled=false` 时 WB 模型返回 400。
+- **WB headers 三铁律（wb_upstream.rs，红线）**：① Origin/Referer 必带按区域；② 缺省字段显式 `X-No-User-Id/X-No-Enterprise-Id/X-No-Department-Info: 1` 占位；③ **chat 请求绝不携带 `X-Refresh-Token`**（仅 refresh 端点，配 `X-Auth-Refresh-Source: workbuddy`）。UA 伪装 `CLI/2.63.2 CodeBuddy/2.63.2`。
+- **请求体改写（wb_payload.rs）**：强制 `stream:true`（上游只回 SSE，非流式本地聚合 wb_sse::aggregate，tool_calls delta 按 index 合并）；tool_choice 对象→string；reasoning_effort 按目录 `supported_efforts` 降级（`effort_override` 修正层最优先，如 hy3-*→high）；指纹清洗（默认开）：cc_xxx 键值/x-anthropic-* 引用剥离 + 审核模板黑名单最小改写（映射表 `wb_template_map.json` mtime 热更新，缺失用内置兜底：CLI→CLI tool、Main branch→Default branch）；连续同角色消息自动合并。
+- **调度扩展（pool.rs）**：策略新增 `weighted`（三因子=积分占比×10+闲置补偿 0.5/h 封顶 5.0+成功率×3，Top5 加权随机）与 `p2c`（随机选二取优），保留 expire_first/credit_first/random；100ms 防惊群窗口。五态机：Available/QuotaProtection（hard_credit 冷却至**次日 04:00** 自动恢复）/RateLimited/Forbidden（403/SessionDead 禁用）/ProxyDisabled，随 PoolStatus.state 下发。熔断：连续 3 错 30m 起指数递增（×2）封顶 6h，成功重置。
+- **分级重试（retry.rs 纯函数）**：429=Retry-After 优先/线性 1/2/3s→耗尽换号；503/529=10/20/40s 指数；400+thinking.signature=200ms 重试一次；502 同号重试 1 次；401/403=换号（**WB 401 先刷新一次凭证同号重试，T2.6**）；400=context_too_long 类 Fatal 透传。
+- **会话粘性（wb_sticky.rs，仅 WB）**：显式 `conversation_id` 绑定（TTL 30m 滚动续期）+ 无 id 时指纹模式（前 3 消息 SHA256 前 6 位 + 60s 窗）；绑定含上游 conversation_id（双段分配），Mutex 内 re-check 防 TOCTOU；持久化 wb_sticky_sessions.json。
+- **工程化（T2.7/F-34）**：模型级冷却 10→20→40s 渐进退避（优先级高于 Key 级，成功清除）；SSE keep-alive 15s 注释行（SOLO 与 WB 流式均已接入）；首字超时 10s 故障转移（转发线程 + recv_timeout，Agent 300s 读超时兜底 detach）；客户端断连后继续消费上游保 usage 完整（wb_sse 忽略 send 失败直至 EOF）。
+- **运维接口（T2.3/F-32）**：`/healthz`（无健康账号 503）；`/v1/models` 合并 WB 目录（owned_by=workbuddy）；`/status`、`/health` 增加 `wb` 段（池画像/模型冷却/粘性会话数）；WB 请求日志含 TTFB。
 
 ## 6. Tauri 事件（Rust → 前端）
 
@@ -177,7 +188,7 @@ ai-work-assistant/
 | `save-login-done` | `{ success: boolean, raw: string }` |
 | `update-download-progress` | `{ received, total, percent }`（更新包下载进度） |
 | `update-installing` | `string`（asset_name，安装器已启动、应用即将退出） |
-| `wb-checkin-progress` | `{"type":"start",total}` / `{"type":"account",index,user_id,name,status,message}` / `{"type":"done",ok,already,failed}` / `{"type":"exit",ok}`（WorkBuddy 签到独立管线，与 Trae checkin-progress 互不串扰） |
+| `wb-checkin-progress` | `{"type":"start",total,mode?}` / `{"type":"account",index,user_id,name,status,message}` / `{"type":"growth",index,user_id,name,status,travel?,lottery?,tasks?,energy?,streak?}` / `{"type":"done",ok,already,failed,mode?}` / `{"type":"exit",ok}`（WorkBuddy 签到/成长中心独立管线：`mode:"growth"` 标记成长事件，与 Trae checkin-progress 互不串扰） |
 
 ## 7. 数据文件
 
@@ -192,6 +203,9 @@ ai-work-assistant/
 │   ├── workbuddy_settings.json   # WorkBuddy 配置（auto_checkin / keepalive_days / lazy_refresh_hours / growth_*）
 │   ├── workbuddy_credits_cache.json # 积分查询缓存（≥5min）
 │   ├── workbuddy_checkin_results.json # WorkBuddy 签到结果（90 天滚动）
+│   ├── wb_model_catalog.json     # WB 上游模型目录（15 模型静态兜底 + supported_efforts/effort_override）
+│   ├── wb_template_map.json      # 审核模板黑名单映射表（mtime 热更新；缺失用内置兜底）
+│   ├── wb_sticky_sessions.json   # WB 会话粘性绑定（显式 30m TTL / 指纹 60s 窗）
 │   ├── profiles_workbuddy/       # WorkBuddy 快照槽（auth/ + storage/ + meta.json + current_account.txt）
 │   ├── device_map.json           # { <userId>: { device_id, market_user_id, session_id } }
 │   ├── groups.json               # { groups: [...], membership: {<uid>:<gid>} }
@@ -199,7 +213,7 @@ ai-work-assistant/
 │   ├── credits_daily.json        # 每日积分快照
 │   ├── remaining_credits.json    # 各账号剩余积分缓存
 │   ├── account_cooldowns.json    # 签到错误冷却状态（error_type + cooldown_until）
-│   ├── api_pool.json             # API 账号池配置 + 状态
+│   ├── api_pool.json             # API 账号池配置 + 状态（strategy 含 weighted/p2c；wb_enabled 开关）
 │   ├── api_models.json           # 模型下拉列表（id=config_name 原样透传，label=官方展示名；3.2.6 起位于 data/ 子目录，旧位置自动兼容迁移）
 │   └── profiles/                 # 登录态快照
 │       ├── current_account.txt   # 当前活跃账号 ID
