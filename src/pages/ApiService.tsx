@@ -222,7 +222,7 @@ export default function ApiService() {
     return () => clearInterval(id);
   }, [status?.running, refreshStatus]);
 
-  const loadPool = async () => {
+  const loadPool = async (manual = false) => {
     setRefreshingPool(true);
     try {
       const pool = await withMinDelay(api.apiServer.poolList());
@@ -230,7 +230,8 @@ export default function ApiService() {
       setPoolStrategy(pool.strategy || 'expire_first');
       setPoolGroups(new Set(pool.group_ids ?? []));
     } catch {
-      /* ignore */
+      // 初始化加载失败静默保留空列表；手动点击刷新失败需给出提示
+      if (manual) toast('error', '加载账号池失败，请重试');
     } finally {
       setRefreshingPool(false);
     }
@@ -697,7 +698,7 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
             </div>
             <button
               className="btn-ghost flex items-center gap-1 text-xs"
-              onClick={() => void loadPool()}
+              onClick={() => void loadPool(true)}
               disabled={refreshingPool}
             >
               <RefreshCw size={13} className={refreshingPool ? 'animate-spin' : ''} />

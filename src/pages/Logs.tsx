@@ -57,7 +57,10 @@ function SystemLogsTab() {
   };
 
   const copyProxyLog = async () => {
-    if (proxyLog.length === 0) return;
+    if (proxyLog.length === 0) {
+      toast('error', '暂无代理日志可复制');
+      return;
+    }
     try {
       await navigator.clipboard.writeText(proxyLog.join('\n'));
       toast('success', '代理日志已复制');
@@ -67,7 +70,10 @@ function SystemLogsTab() {
   };
 
   const copyLogs = async () => {
-    if (logs.length === 0) return;
+    if (logs.length === 0) {
+      toast('error', '暂无日志可复制');
+      return;
+    }
     const text = logs.map((l) => `[${l.time}] [${l.log_type}] ${l.message}`).join('\n');
     try {
       await navigator.clipboard.writeText(text);

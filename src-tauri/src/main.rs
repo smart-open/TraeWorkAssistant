@@ -331,6 +331,10 @@ fn main() {
                             "quit" => {
                                 let st = app.state::<AppState>();
                                 fs_utils::app_log(&st.data_dir, "菜单：用户请求退出应用");
+                                // 与窗口关闭一致：先隐藏主窗口再退出，避免 WebView2 销毁期间窗口冻结
+                                if let Some(w) = app.get_webview_window("main") {
+                                    let _ = w.hide();
+                                }
                                 app.exit(0);
                             }
                             _ => {}
@@ -383,9 +387,16 @@ fn main() {
         })
         .on_window_event(|window, event| {
             // 关闭即退出应用（前端已弹确认框；退出时 RunEvent::Exit 自动清理代理与 API 服务）
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            // 先隐藏窗口再退出：exit(0) 内部的 WebView2 销毁可能耗时数秒（运行越久越明显），
+            // 若直接退出，用户会看到窗口冻结「卡死」。隐藏后清理再慢也无感（issue：关闭卡死）。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
+                api.prevent_close();
                 let st = window.app_handle().state::<AppState>();
                 fs_utils::app_log(&st.data_dir, "用户确认退出应用");
+                let _ = window.hide();
                 window.app_handle().exit(0);
             }
         })

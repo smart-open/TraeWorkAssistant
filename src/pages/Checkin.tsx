@@ -1,5 +1,5 @@
 import { useMemo, useState, useEffect } from 'react';
-import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw } from 'lucide-react';
+import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw, Users } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
 import { useAppStore } from '../store';
@@ -48,6 +48,8 @@ export default function Checkin() {
   const settings = useAppStore((s) => s.settings);
   const checkin = useAppStore((s) => s.checkin);
   const startCheckin = useAppStore((s) => s.startCheckin);
+  const pushToast = useAppStore((s) => s.pushToast);
+  const setView = useAppStore((s) => s.setView);
 
   const [scope, setScope] = useState<'all' | 'group' | 'selected'>('all');
   const [groupId, setGroupId] = useState<string>(groups[0]?.id ?? '');
@@ -106,7 +108,17 @@ export default function Checkin() {
   };
 
   const start = async () => {
-    if (candidateIds.length === 0) return;
+    // 无候选账号时给出精确指引（此前为静默返回 + 按钮 disabled，用户表现为「点了没反应」）
+    if (candidateIds.length === 0) {
+      if (accounts.length === 0) {
+        pushToast('error', '暂无账号，请先在「账号管理」添加账号后再签到');
+      } else if (scope === 'group') {
+        pushToast('error', '所选分组下没有账号，请切换分组或在「账号管理」调整');
+      } else {
+        pushToast('error', '请先勾选要签到的账号');
+      }
+      return;
+    }
     let scopeArg: string = 'all';
     if (scope === 'group') scopeArg = `group:${groupId}`;
     if (scope === 'selected') scopeArg = 'selected';
@@ -118,6 +130,9 @@ export default function Checkin() {
     });
   };
 
+  // 无账号时展示引导空态，隐藏签到表单（避免「按钮点了没反应」）
+  const noAccounts = accounts.length === 0 && !checkin.active;
+
   return (
     <div className="animate-fade-in">
       <PageHeader
@@ -125,7 +140,20 @@ export default function Checkin() {
         desc="按账号范围与跳过规则发起批量签到，实时查看进度"
       />
 
-      <div className="mb-5 flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm dark:border-amber-700 dark:bg-amber-900/20">
+      {noAccounts ? (
+        <div className="card flex flex-col items-center gap-3 p-10 text-center">
+          <Users size={40} className="text-slate-300 dark:text-zinc-600" />
+          <div>
+            <div className="font-medium">还没有账号</div>
+            <div className="mt-1 text-sm text-slate-500">先在「账号管理」添加账号，然后就可以在这里一键批量签到</div>
+          </div>
+          <button className="btn-primary" onClick={() => setView('accounts')}>
+            <Users size={15} /> 前往账号管理添加
+          </button>
+        </div>
+      ) : (
+        <>
+          <div className="mb-5 flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm dark:border-amber-700 dark:bg-amber-900/20">
         <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-500" />
         <div className="text-amber-700 dark:text-amber-300">
           <div className="font-medium">请勿一天内多次签到</div>
@@ -262,13 +290,15 @@ export default function Checkin() {
         <div className="mt-4 flex justify-end">
           <button
             onClick={start}
-            disabled={checkin.active || candidateIds.length === 0}
+            disabled={checkin.active}
             className="btn-primary"
           >
             <PlayCircle size={16} /> {checkin.active ? '签到进行中…' : '开始签到'}
           </button>
         </div>
       </div>
+        </>
+      )}
 
       {checkin.active || checkin.total > 0 ? (
         <div className="card p-4">
