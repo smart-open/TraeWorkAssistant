@@ -4,10 +4,17 @@ pub mod auth;
 pub mod models_sync;
 pub mod pool;
 pub mod payload;
+pub mod retry;
 pub mod routes;
 pub mod server;
 pub mod sse;
 pub mod usage;
+pub mod wb_catalog;
+pub mod wb_payload;
+pub mod wb_route;
+pub mod wb_sse;
+pub mod wb_sticky;
+pub mod wb_upstream;
 
 use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
@@ -28,7 +35,22 @@ pub const REFERER_BASE: &str = "https://trae-api-cn.mchost.guru";
 
 /// API 服务器运行时共享状态（传入 axum State）
 pub struct ApiSharedState {
+    /// SOLO 上游账号池（trae llm_utils_chat）
     pub pool: ApiPool,
+    /// WorkBuddy 上游账号池（copilot /v2/chat/completions，T2.1）；
+    /// 与 SOLO 池并存，按模型目录路由（wb_catalog 命中 → WB 池）
+    pub wb_pool: ApiPool,
+    /// WB 上游开关（api_pool.json.wb_enabled；关闭时 WB 模型返回 400）
+    pub wb_enabled: std::sync::atomic::AtomicBool,
+    /// WB 指纹清洗开关（F-30，默认开；wb_template_map 清洗联动）
+    pub wb_sanitize: std::sync::atomic::AtomicBool,
+    /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
+    pub wb_sticky: wb_sticky::StickyStore,
+    /// 模型级冷却（F-34）：model → (until 秒, 连续失败次数)；10→20→40s 渐进退避，
+    /// 优先级高于 Key 级冷却
+    pub model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
+    /// 审核模板映射表热更新缓存：(文件 mtime, 映射)；None = 用内置兜底
+    pub wb_template_cache: Mutex<Option<(std::time::SystemTime, Vec<(String, String)>)>>,
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
@@ -67,7 +89,7 @@ impl ApiSharedState {
     }
 }
 
-/// 上游错误分类（与 Phase 1 冷却状态机对齐）
+/// 上游错误分类（与 Phase 1 冷却状态机对齐；T2.2 扩展 HardCredit/Forbidden）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ErrKind {
     None,
@@ -77,16 +99,24 @@ pub enum ErrKind {
     NotFound,
     Server,
     Client,
+    /// 积分耗尽（F-29 v1.2）：冷却到次日 04:00 自动恢复探测
+    HardCredit,
+    /// 403 封禁（F-29 v1.2）：禁用账号，标注需人工确认
+    Forbidden,
 }
 
 impl ErrKind {
     pub fn cooldown_duration(self) -> std::time::Duration {
         match self {
             ErrKind::PlanLimit => std::time::Duration::from_secs(12 * 3600),
+            // soft_rate：60s 短冷却（§3.9 ②）
             ErrKind::SoftRate | ErrKind::NotFound => std::time::Duration::from_secs(60),
             ErrKind::SessionDead => std::time::Duration::from_secs(24 * 3600),
-            ErrKind::Client | ErrKind::Server => std::time::Duration::from_secs(10 * 60),
-            ErrKind::None => std::time::Duration::ZERO,
+            // 熔断基础时长 30m；指数递增在 pool::note_error 内按 cb_trips 计算
+            ErrKind::Server => std::time::Duration::from_secs(30 * 60),
+            ErrKind::Client => std::time::Duration::from_secs(10 * 60),
+            // 由 note_error 特殊处理（次日 04:00 / 直接禁用），无固定时长
+            ErrKind::HardCredit | ErrKind::Forbidden | ErrKind::None => std::time::Duration::ZERO,
         }
     }
 
@@ -99,6 +129,8 @@ impl ErrKind {
             ErrKind::NotFound => "NotFound",
             ErrKind::Server => "Server",
             ErrKind::Client => "Client",
+            ErrKind::HardCredit => "HardCredit",
+            ErrKind::Forbidden => "Forbidden",
         }
     }
 }

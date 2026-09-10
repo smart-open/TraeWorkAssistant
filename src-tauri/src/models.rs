@@ -315,12 +315,15 @@ pub struct AccountCooldownsFile {
 pub struct ApiPoolFile {
     #[serde(default)]
     pub enabled_uids: Vec<String>,
-    /// 调度策略：expire_first（默认）/ credit_first / random
+    /// 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c
     #[serde(default)]
     pub strategy: String,
     /// 参与调度的分组 id 列表；空 = 不限分组
     #[serde(default)]
     pub group_ids: Vec<String>,
+    /// WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池
+    #[serde(default)]
+    pub wb_enabled: bool,
 }
 
 /// 池中单个账号的运行时状态（给 /status 和前端使用）
@@ -335,6 +338,9 @@ pub struct PoolStatus {
     pub cooldown_reason: Option<String>,
     pub disabled: bool,
     pub err_count: i32,
+    /// 账号五态机（T2.2/F-29 v1.2）：Available/QuotaProtection/RateLimited/Forbidden/ProxyDisabled
+    #[serde(default)]
+    pub state: String,
 }
 
 /// API 服务整体状态（给前端用）

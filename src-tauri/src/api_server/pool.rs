@@ -8,7 +8,7 @@ use crate::models::{CooldownEntry, DeviceMap, PoolStatus};
 
 use super::ErrKind;
 
-/// 账号池调度策略（T10）
+/// 账号池调度策略（T10 + T2.2 扩展）
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum PoolStrategy {
     /// 积分先过期优先（默认，保持既有行为）
@@ -18,6 +18,12 @@ pub enum PoolStrategy {
     CreditFirst,
     /// 随机取号
     Random,
+    /// 三因子加权随机（T2.2/F-29 v1.2）：积分占比×10 + 闲置补偿（每小时+0.5
+    /// 封顶 5.0）+ 成功率×3 → Top5 短名单内二次加权随机——防热点 + 防惊群
+    Weighted,
+    /// P2C（Power-of-Two-Choices，T2.2 v1.2）：随机选二取优——antigravity-tools
+    /// 实证延迟优于轮询/加权随机；与三因子加权并存，实测对比后取默认
+    P2C,
 }
 
 impl PoolStrategy {
@@ -26,6 +32,8 @@ impl PoolStrategy {
         match s {
             "credit_first" => Self::CreditFirst,
             "random" => Self::Random,
+            "weighted" => Self::Weighted,
+            "p2c" => Self::P2C,
             _ => Self::ExpireFirst,
         }
     }
@@ -35,6 +43,8 @@ impl PoolStrategy {
             Self::ExpireFirst => "expire_first",
             Self::CreditFirst => "credit_first",
             Self::Random => "random",
+            Self::Weighted => "weighted",
+            Self::P2C => "p2c",
         }
     }
 }
@@ -53,6 +63,20 @@ pub struct PoolEntry {
     pub reason: String,
     pub device_id: String,
     pub machine_id: String,
+    // ── T2.2 五态机与调度因子 ──
+    /// hard_credit（积分耗尽）冷却截止：次日 04:00 自动恢复探测（F-29 v1.2）
+    pub hard_until: i64,
+    /// 最近一次被选中时间（Unix 秒；三因子加权闲置补偿因子）
+    pub last_used: i64,
+    /// 成功/失败计数（三因子加权成功率因子）
+    pub successes: u64,
+    pub failures: u64,
+    /// 连续熔断次数（Server 错误 30m 起指数递增至 6h）
+    pub cb_trips: u32,
+    // ── WorkBuddy 上游凭证头字段（T2.1；SOLO 账号为空串/false）──
+    pub domain: String,
+    pub enterprise_id: String,
+    pub global_region: bool,
 }
 
 impl PoolEntry {
@@ -63,7 +87,45 @@ impl PoolEntry {
         if self.until > 0 && now_ts < self.until {
             return false;
         }
+        // hard_credit 冷却：次日 04:00 前不参与（04:00 恢复探测由到期自然放开）
+        if self.hard_until > 0 && now_ts < self.hard_until {
+            return false;
+        }
         true
+    }
+
+    /// 账号五态机（F-29 v1.2）：Available / QuotaProtection / RateLimited /
+    /// Forbidden / ProxyDisabled（供 /status 画像与状态迁移观测）
+    pub fn state_str(&self, now_ts: i64) -> &'static str {
+        if self.disabled {
+            "Forbidden"
+        } else if self.hard_until > 0 && now_ts < self.hard_until {
+            "QuotaProtection"
+        } else if self.until > 0 && now_ts < self.until {
+            "RateLimited"
+        } else {
+            "Available"
+        }
+    }
+
+    /// 三因子得分（T2.2）：积分占比×10 + 闲置补偿×0.5/h（封顶 5.0）+ 成功率×3
+    /// 纯函数；`total_credits` 为候选集积分总和（0 时积分因子取 0）
+    fn weighted_score(&self, total_credits: f64, now_ts: i64) -> f64 {
+        let credit_factor = if total_credits > 0.0 {
+            (self.credits.unwrap_or(0.0).max(0.0) / total_credits) * 10.0
+        } else {
+            0.0
+        };
+        let idle_hours = if self.last_used > 0 {
+            ((now_ts - self.last_used).max(0) as f64) / 3600.0
+        } else {
+            // 从未被选用：按满闲置补偿（鼓励冷启动账号）
+            10.0
+        };
+        let idle_factor = (idle_hours * 0.5).min(5.0);
+        let total = self.successes + self.failures;
+        let success_rate = if total == 0 { 0.5 } else { self.successes as f64 / total as f64 };
+        credit_factor + idle_factor + success_rate * 3.0
     }
 }
 
@@ -71,6 +133,8 @@ impl PoolEntry {
 pub struct ApiPool {
     entries: Mutex<HashMap<String, PoolEntry>>,
     strategy: Mutex<PoolStrategy>,
+    /// 防惊群（T2.2）：100ms 内重复选中同一 uid 且存在其他候选时让位
+    recent_pick: Mutex<(String, i64)>, // (uid, 毫秒时间戳)
 }
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
@@ -83,6 +147,7 @@ impl ApiPool {
         Self {
             entries: Mutex::new(HashMap::new()),
             strategy: Mutex::new(PoolStrategy::ExpireFirst),
+            recent_pick: Mutex::new((String::new(), 0)),
         }
     }
 
@@ -152,9 +217,57 @@ impl ApiPool {
                         reason: cd.reason,
                         device_id,
                         machine_id,
+                        hard_until: 0,
+                        last_used: 0,
+                        successes: 0,
+                        failures: 0,
+                        cb_trips: 0,
+                        domain: String::new(),
+                        enterprise_id: String::new(),
+                        global_region: false,
                     },
                 );
             }
+        }
+    }
+
+    /// 从 WorkBuddy 账号同步池（T2.1/F-28）：WB 上游账号进同一调度引擎，
+    /// 携带区域/企业域信息供上游 headers 使用
+    pub fn sync_from_wb(&self, accounts: &[WbSyncAccount], enabled: &[String]) {
+        let mut entries = safe_lock(&self.entries);
+        // 仅替换 WB 形态的条目：以 domain/global_region 任一非空/true 识别。
+        // 实际部署中 SOLO 与 WB 不同时入池（api 服务单实例二选一上游），
+        // 但这里保持防御性：不清空非 WB 条目。
+        entries.retain(|_, e| e.domain.is_empty() && !e.global_region);
+        let enabled_set: HashSet<&str> = enabled.iter().map(|s| s.as_str()).collect();
+        for a in accounts {
+            if !enabled_set.contains(a.uid.as_str()) || a.token.is_empty() {
+                continue;
+            }
+            entries.insert(
+                a.uid.clone(),
+                PoolEntry {
+                    uid: a.uid.clone(),
+                    name: a.name.clone(),
+                    jwt: a.token.clone(),
+                    credits: a.credits,
+                    credits_expire_at: None,
+                    disabled: a.needs_relogin,
+                    err_count: 0,
+                    until: 0,
+                    reason: String::new(),
+                    device_id: String::new(),
+                    machine_id: String::new(),
+                    hard_until: 0,
+                    last_used: 0,
+                    successes: 0,
+                    failures: 0,
+                    cb_trips: 0,
+                    domain: a.domain.clone(),
+                    enterprise_id: a.enterprise_id.clone(),
+                    global_region: a.global_region,
+                },
+            );
         }
     }
 
@@ -162,7 +275,7 @@ impl ApiPool {
     /// llm_utils_chat 消耗通用积分(product_id 208)
     /// 零积分账号会被跳过，避免无效请求
     pub fn pick_excluding(&self, tried: &HashSet<String>) -> Option<PickedAccount> {
-        let entries = safe_lock(&self.entries);
+        let mut entries = safe_lock(&self.entries);
         let strategy = *safe_lock(&self.strategy);
         let now = now_ts();
         let cands: Vec<&PoolEntry> = entries
@@ -174,41 +287,123 @@ impl ApiPool {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
             .unwrap_or(0);
-        pick_by_strategy(&cands, strategy, rand_seed).map(|e| PickedAccount {
+        let mut picked = pick_by_strategy(&cands, strategy, rand_seed, now).map(|e| PickedAccount {
             uid: e.uid.clone(),
             jwt: e.jwt.clone(),
             device_id: e.device_id.clone(),
             machine_id: e.machine_id.clone(),
+            domain: e.domain.clone(),
+            enterprise_id: e.enterprise_id.clone(),
+            global_region: e.global_region,
+        })?;
+
+        // 防惊群：100ms 内重复选中同一 uid 且还有其他候选 → 让位（T2.2）
+        if cands.len() > 1 {
+            let mut recent = safe_lock(&self.recent_pick);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if recent.0 == picked.uid && now_ms - recent.1 < 100 {
+                if let Some(alt) = pick_by_strategy(
+                    &cands
+                        .iter()
+                        .copied()
+                        .filter(|e| e.uid != picked.uid)
+                        .collect::<Vec<_>>(),
+                    strategy,
+                    rand_seed.wrapping_add(1),
+                    now,
+                ) {
+                    picked = PickedAccount {
+                        uid: alt.uid.clone(),
+                        jwt: alt.jwt.clone(),
+                        device_id: alt.device_id.clone(),
+                        machine_id: alt.machine_id.clone(),
+                        domain: alt.domain.clone(),
+                        enterprise_id: alt.enterprise_id.clone(),
+                        global_region: alt.global_region,
+                    };
+                }
+            }
+            *recent = (picked.uid.clone(), now_ms);
+        }
+
+        // 记录取号时间（三因子加权闲置补偿因子）
+        if let Some(e) = entries.get_mut(&picked.uid) {
+            e.last_used = now;
+        }
+        Some(picked)
+    }
+
+    /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None
+    pub fn pick_by_uid(&self, uid: &str) -> Option<PickedAccount> {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let tried = HashSet::new();
+        entries.get(uid).filter(|e| selectable(e, &tried, now)).map(|e| PickedAccount {
+            uid: e.uid.clone(),
+            jwt: e.jwt.clone(),
+            device_id: e.device_id.clone(),
+            machine_id: e.machine_id.clone(),
+            domain: e.domain.clone(),
+            enterprise_id: e.enterprise_id.clone(),
+            global_region: e.global_region,
         })
     }
 
-    /// 记录错误并冷却
-    pub fn note_error(&self, uid: &str, kind: ErrKind) {
-        let dur = kind.cooldown_duration();
+    /// 更新账号凭证（T2.6：网关 401 刷新后回填，后续取号即用新 token）
+    pub fn update_jwt(&self, uid: &str, jwt: &str) {
         let mut entries = safe_lock(&self.entries);
         if let Some(e) = entries.get_mut(uid) {
-            if kind == ErrKind::SessionDead {
-                e.disabled = true;
-            } else if kind == ErrKind::PlanLimit || kind == ErrKind::SoftRate || kind == ErrKind::NotFound {
-                e.until = now_ts() + dur.as_secs() as i64;
-                e.reason = kind.as_str().to_string();
-                e.err_count = 0;
-            } else {
-                e.err_count += 1;
-                if e.err_count >= 3 {
-                    e.until = now_ts() + dur.as_secs() as i64;
-                    e.reason = "consecutive_errors".to_string();
+            e.jwt = jwt.to_string();
+        }
+    }
+
+    /// 记录错误并冷却（T2.2 错误三态 + 分级冷却）
+    pub fn note_error(&self, uid: &str, kind: ErrKind) {
+        let mut entries = safe_lock(&self.entries);
+        if let Some(e) = entries.get_mut(uid) {
+            e.failures = e.failures.saturating_add(1);
+            match kind {
+                ErrKind::SessionDead | ErrKind::Forbidden => {
+                    e.disabled = true;
+                    e.reason = kind.as_str().to_string();
+                }
+                ErrKind::HardCredit => {
+                    // 积分耗尽：冷却到次日 04:00，到期自动恢复探测（F-29 v1.2）
+                    e.hard_until = next_0400(now_ts());
+                    e.reason = "hard_credit".to_string();
                     e.err_count = 0;
+                }
+                ErrKind::PlanLimit | ErrKind::SoftRate | ErrKind::NotFound => {
+                    e.until = now_ts() + kind.cooldown_duration().as_secs() as i64;
+                    e.reason = kind.as_str().to_string();
+                    e.err_count = 0;
+                    e.cb_trips = 0;
+                }
+                _ => {
+                    e.err_count += 1;
+                    if e.err_count >= 3 {
+                        // 熔断器：30m 起指数递增（×2/次），封顶 6h
+                        let exp = 30 * 60u64 << e.cb_trips.min(4);
+                        e.until = now_ts() + exp.min(6 * 3600) as i64;
+                        e.reason = "consecutive_errors".to_string();
+                        e.err_count = 0;
+                        e.cb_trips = e.cb_trips.saturating_add(1);
+                    }
                 }
             }
         }
     }
 
-    /// 记录成功
+    /// 记录成功（重置熔断与错误计数）
     pub fn note_success(&self, uid: &str) {
         let mut entries = safe_lock(&self.entries);
         if let Some(e) = entries.get_mut(uid) {
             e.err_count = 0;
+            e.cb_trips = 0;
+            e.successes = e.successes.saturating_add(1);
         }
     }
 
@@ -218,10 +413,11 @@ impl ApiPool {
         let now = now_ts();
         let count = entries
             .values()
-            .filter(|e| e.until > 0 && now < e.until)
+            .filter(|e| (e.until > 0 && now < e.until) || (e.hard_until > 0 && now < e.hard_until))
             .count();
         for e in entries.values_mut() {
             e.until = 0;
+            e.hard_until = 0;
             e.reason.clear();
             e.err_count = 0;
         }
@@ -244,6 +440,7 @@ impl ApiPool {
                 cooldown_reason: if e.reason.is_empty() { None } else { Some(e.reason.clone()) },
                 disabled: e.disabled,
                 err_count: e.err_count,
+                state: e.state_str(now).to_string(),
             })
             .collect();
         out.sort_by(|a, b| a.uid.cmp(&b.uid));
@@ -263,6 +460,8 @@ impl ApiPool {
             .map(|e| {
                 let reason = if e.disabled {
                     "disabled(SessionDead)".to_string()
+                } else if e.hard_until > 0 && now < e.hard_until {
+                    format!("hard_credit(until_0400={}s)", e.hard_until - now)
                 } else if e.until > 0 && now < e.until {
                     format!("cooldown(until={} remaining={}s)", e.until, e.until - now)
                 } else if let Some(exp) = e.credits_expire_at {
@@ -314,9 +513,25 @@ pub struct PickedAccount {
     pub jwt: String,
     pub device_id: String,
     pub machine_id: String,
+    // WorkBuddy 上游凭证头字段（T2.1；SOLO 账号为空串/false）
+    pub domain: String,
+    pub enterprise_id: String,
+    pub global_region: bool,
 }
 
-/// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分
+/// WorkBuddy 账号入池同步结构（T2.1）
+pub struct WbSyncAccount {
+    pub uid: String,
+    pub name: String,
+    pub token: String,
+    pub domain: String,
+    pub enterprise_id: String,
+    pub global_region: bool,
+    pub credits: Option<f64>,
+    pub needs_relogin: bool,
+}
+
+/// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
 fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64) -> bool {
     if tried.contains(&e.uid) || !e.healthy(now) {
         return false;
@@ -341,12 +556,15 @@ fn pick_by_strategy<'a>(
     cands: &[&'a PoolEntry],
     strategy: PoolStrategy,
     rand_seed: u64,
+    now: i64,
 ) -> Option<&'a PoolEntry> {
     if cands.is_empty() {
         return None;
     }
     match strategy {
         PoolStrategy::Random => Some(cands[(rand_seed as usize) % cands.len()]),
+        PoolStrategy::Weighted => pick_weighted(cands, rand_seed, now),
+        PoolStrategy::P2C => pick_p2c(cands, rand_seed, now),
         PoolStrategy::CreditFirst => cands.iter().copied().max_by(|a, b| {
             a.credits
                 .unwrap_or(0.0)
@@ -371,6 +589,57 @@ fn pick_by_strategy<'a>(
                 })
         }),
     }
+}
+
+/// 三因子加权随机（T2.2）：积分占比×10 + 闲置补偿（每小时+0.5 封顶 5.0，
+/// 从未使用按满额）+ 成功率×3 → Top5 短名单内按得分二次加权随机
+fn pick_weighted<'a>(cands: &[&'a PoolEntry], rand_seed: u64, now: i64) -> Option<&'a PoolEntry> {
+    let total_credits: f64 = cands.iter().filter_map(|e| e.credits).sum();
+    let mut scored: Vec<(&'a PoolEntry, f64)> = cands
+        .iter()
+        .map(|e| (*e, e.weighted_score(total_credits, now)))
+        .collect();
+    // 得分降序，取 Top5 短名单
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(5);
+    // 短名单内按得分加权随机（最低权重 0.1 防零分账号永不出场）
+    let weights: Vec<f64> = scored.iter().map(|(_, s)| s.max(0.1)).collect();
+    let sum: f64 = weights.iter().sum();
+    let mut point = (rand_seed % 10_000) as f64 / 10_000.0 * sum;
+    for (e, w) in scored.iter().zip(weights.iter()) {
+        point -= w;
+        if point <= 0.0 {
+            return Some(e.0);
+        }
+    }
+    scored.last().map(|(e, _)| *e)
+}
+
+/// P2C：随机选二取优（T2.2 v1.2，antigravity-tools 实证延迟优于轮询/加权随机）
+/// 「优」= 三因子得分高者；仅一名候选时直接返回
+fn pick_p2c<'a>(cands: &[&'a PoolEntry], rand_seed: u64, now: i64) -> Option<&'a PoolEntry> {
+    if cands.len() == 1 {
+        return Some(cands[0]);
+    }
+    let total_credits: f64 = cands.iter().filter_map(|e| e.credits).sum();
+    let a = cands[(rand_seed as usize) % cands.len()];
+    let b = cands[((rand_seed >> 32) as usize) % cands.len()];
+    if a.uid == b.uid {
+        // 撞号：退化为随机一个
+        return Some(cands[(rand_seed as usize) % cands.len()]);
+    }
+    let sa = a.weighted_score(total_credits, now);
+    let sb = b.weighted_score(total_credits, now);
+    Some(if sa >= sb { a } else { b })
+}
+
+/// 次日 04:00（本地东八区，与代码库其它处 local_ts 约定一致）的 Unix 秒
+pub fn next_0400(now: i64) -> i64 {
+    let local = now + 8 * 3600;
+    let day_start = local - (local % 86400);
+    let today_0400 = day_start + 4 * 3600;
+    let target = if local < today_0400 { today_0400 } else { today_0400 + 86400 };
+    target - 8 * 3600
 }
 
 fn now_ts() -> i64 {
@@ -447,6 +716,8 @@ mod tests {
         assert_eq!(PoolStrategy::parse("unknown"), PoolStrategy::ExpireFirst);
         assert_eq!(PoolStrategy::parse("credit_first"), PoolStrategy::CreditFirst);
         assert_eq!(PoolStrategy::parse("random"), PoolStrategy::Random);
+        assert_eq!(PoolStrategy::parse("weighted"), PoolStrategy::Weighted);
+        assert_eq!(PoolStrategy::parse("p2c"), PoolStrategy::P2C);
         assert_eq!(PoolStrategy::default(), PoolStrategy::ExpireFirst);
     }
 
@@ -560,5 +831,205 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(pool.count(), 2);
+    }
+
+    // ==================== T2.2 新增 ====================
+
+    #[test]
+    fn weighted_prefers_more_credits_and_idle() {
+        // 同成功率基线（无历史 0.5）+ 无闲置差（last_used=0 满额）→ 积分多者得分高
+        let pool = build_pool(&[
+            ("uid_a", 10.0, 0),
+            ("uid_b", 900.0, 0),
+        ]);
+        pool.set_strategy(PoolStrategy::Weighted);
+        // Top5 短名单只有两名，uid_b 得分显著更高；多次取样必然覆盖 uid_b
+        let mut seen_b = false;
+        for i in 0..32u64 {
+            let _ = i;
+            if pool.pick_excluding(&HashSet::new()).unwrap().uid == "uid_b" {
+                seen_b = true;
+                break;
+            }
+        }
+        assert!(seen_b, "weighted 策略应能取到高分账号 uid_b");
+        // 闲置补偿：uid_a 刚被用过、uid_b 闲置 3h → uid_b 得分更高
+        // 直接对 pick_weighted 纯函数做断言（不依赖随机落点）
+        let e_a = crate::api_server::pool::PoolEntry {
+            uid: "a".into(), name: String::new(), jwt: String::new(),
+            credits: Some(100.0), credits_expire_at: None, disabled: false,
+            err_count: 0, until: 0, reason: String::new(),
+            device_id: String::new(), machine_id: String::new(),
+            hard_until: 0, last_used: 1000, successes: 0, failures: 0, cb_trips: 0,
+            domain: String::new(), enterprise_id: String::new(), global_region: false,
+        };
+        let e_b = crate::api_server::pool::PoolEntry {
+            last_used: 1000 - 3 * 3600, // 闲置 3 小时
+            ..crate::api_server::pool::PoolEntry {
+                uid: "b".into(), name: String::new(), jwt: String::new(),
+                credits: Some(100.0), credits_expire_at: None, disabled: false,
+                err_count: 0, until: 0, reason: String::new(),
+                device_id: String::new(), machine_id: String::new(),
+                hard_until: 0, last_used: 0, successes: 0, failures: 0, cb_trips: 0,
+                domain: String::new(), enterprise_id: String::new(), global_region: false,
+            }
+        };
+        let now = 1000 + 60;
+        let sa = e_a.weighted_score(200.0, now);
+        let sb = e_b.weighted_score(200.0, now);
+        assert!(sb > sa, "闲置 3h 的账号得分应高于刚用过的账号（{} vs {}）", sb, sa);
+    }
+
+    #[test]
+    fn p2c_picks_better_of_two() {
+        // 纯函数语义：随机选二取优（得分高者胜）；两候选相同时退化为随机
+        let e_a = test_entry("a", 10.0, 1000);
+        let e_b = test_entry("b", 900.0, 1000);
+        let cands = vec![&e_a, &e_b];
+        let now = 2000;
+        // 两候选不同时（奇数种子 → 索引 (1,0)），恒选得分更高的 b
+        for seed in (1..200u64).step_by(2) {
+            assert_eq!(pick_p2c(&cands, seed, now).unwrap().uid, "b");
+        }
+        // 撞号（两索引相同）→ 不 panic，返回任一候选
+        for seed in (0..200u64).step_by(2) {
+            let picked = pick_p2c(&cands, seed, now).unwrap();
+            assert!(picked.uid == "a" || picked.uid == "b");
+        }
+        // 单候选：直接返回
+        let single = vec![&e_b];
+        assert_eq!(pick_p2c(&single, 7, now).unwrap().uid, "b");
+    }
+
+    /// 测试用 PoolEntry 快速构造
+    fn test_entry(uid: &str, credits: f64, last_used: i64) -> PoolEntry {
+        PoolEntry {
+            uid: uid.to_string(),
+            name: String::new(),
+            jwt: String::new(),
+            credits: Some(credits),
+            credits_expire_at: None,
+            disabled: false,
+            err_count: 0,
+            until: 0,
+            reason: String::new(),
+            device_id: String::new(),
+            machine_id: String::new(),
+            hard_until: 0,
+            last_used,
+            successes: 0,
+            failures: 0,
+            cb_trips: 0,
+            domain: String::new(),
+            enterprise_id: String::new(),
+            global_region: false,
+        }
+    }
+
+    #[test]
+    fn hard_credit_cools_until_next_0400() {
+        let pool = build_pool(&[("uid_a", 0.0, 0), ("uid_b", 5.0, 0)]);
+        // 强制注入：模拟积分耗尽（hard_credit 由上游错误触发，不走 selectable 的零积分捷径）
+        pool.note_error("uid_b", ErrKind::HardCredit);
+        // uid_b 进入 QuotaProtection
+        assert_eq!(pool.status_list()[1].state, "QuotaProtection");
+        // diagnose 给出 hard_credit 原因
+        let d = pool.diagnose().into_iter().find(|x| x.uid == "uid_b").unwrap();
+        assert!(d.reason.starts_with("hard_credit"));
+        // 恢复探测：把 hard_until 手动置为过去 → 重新可选
+        {
+            let mut entries = safe_lock(&pool.entries);
+            if let Some(e) = entries.get_mut("uid_b") {
+                e.hard_until = now_ts() - 1;
+            }
+        }
+        assert_eq!(pool.status_list()[1].state, "Available");
+    }
+
+    #[test]
+    fn forbidden_disables_account() {
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        pool.note_error("uid_b", ErrKind::Forbidden);
+        assert_eq!(pool.status_list()[1].state, "Forbidden");
+        assert!(pool.pick_excluding(&HashSet::new()).unwrap().uid != "uid_b");
+    }
+
+    #[test]
+    fn server_circuit_breaker_backs_off_exponentially() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        // 三次连续 Server 错误触发第一次熔断（30m）
+        for _ in 0..3 {
+            pool.note_error("uid_a", ErrKind::Server);
+        }
+        let s1 = pool.status_list()[0].cooldown_until.unwrap() - now_ts();
+        assert!((1799..=1801).contains(&s1), "首次熔断应约 30m，实际 {}s", s1);
+        // 手动解除后再触发第二次 → 指数递增到 1h
+        pool.clear_cooldowns();
+        // clear_cooldowns 重置 until 但 cb_trips 保留（指数递增的记忆）
+        {
+            let mut entries = safe_lock(&pool.entries);
+            entries.get_mut("uid_a").unwrap().cb_trips = 1;
+        }
+        for _ in 0..3 {
+            pool.note_error("uid_a", ErrKind::Server);
+        }
+        let s2 = pool.status_list()[0].cooldown_until.unwrap() - now_ts();
+        assert!((3599..=3601).contains(&s2), "第二次熔断应约 1h，实际 {}s", s2);
+        // 成功重置熔断
+        pool.clear_cooldowns();
+        pool.note_success("uid_a");
+        {
+            let entries = safe_lock(&pool.entries);
+            assert_eq!(entries.get("uid_a").unwrap().cb_trips, 0);
+        }
+    }
+
+    #[test]
+    fn next_0400_is_between_1s_and_24h_away() {
+        let now = now_ts();
+        for offset in [0i64, 3600, 61_200, 86_399] {
+            let t = next_0400(now + offset);
+            let delta = t - (now + offset);
+            assert!(delta > 0, "必须在未来");
+            assert!(delta <= 24 * 3600);
+            // 目标时刻的本地时钟（东八区）恰好落在 04:00
+            let local = t + 8 * 3600;
+            assert_eq!(local % 86400, 4 * 3600);
+        }
+    }
+
+    #[test]
+    fn wb_sync_and_pick_carries_region_fields() {
+        let pool = ApiPool::new();
+        pool.sync_from_wb(
+            &[crate::api_server::pool::WbSyncAccount {
+                uid: "wb-abc".into(),
+                name: "WB账号".into(),
+                token: "tk".into(),
+                domain: "workbuddy.ai".into(),
+                enterprise_id: "e1".into(),
+                global_region: true,
+                credits: Some(50.0),
+                needs_relogin: false,
+            }],
+            &["wb-abc".to_string()],
+        );
+        pool.set_strategy(PoolStrategy::CreditFirst);
+        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+        assert_eq!(picked.uid, "wb-abc");
+        assert!(picked.global_region);
+        assert_eq!(picked.domain, "workbuddy.ai");
+        assert_eq!(picked.enterprise_id, "e1");
+        // needs_relogin → Forbidden，不参与取号
+        let pool2 = ApiPool::new();
+        pool2.sync_from_wb(
+            &[crate::api_server::pool::WbSyncAccount {
+                uid: "wb-x".into(), name: String::new(), token: "tk".into(),
+                domain: String::new(), enterprise_id: String::new(),
+                global_region: false, credits: None, needs_relogin: true,
+            }],
+            &["wb-x".to_string()],
+        );
+        assert!(pool2.pick_excluding(&HashSet::new()).is_none());
     }
 }

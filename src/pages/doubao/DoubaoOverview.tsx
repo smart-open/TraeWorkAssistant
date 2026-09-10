@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw, ShieldCheck, Users, CheckCircle2, Circle, ChevronRight, TrendingUp, HeartPulse } from 'lucide-react';
+import { RefreshCw, ShieldCheck, Users, CheckCircle2, Circle, ChevronRight, TrendingUp, HeartPulse, CalendarClock } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { StatCard, Badge } from '../../components/ui';
+import ExpiryCalendar, { type ExpiryItem } from '../../components/ExpiryCalendar';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import type { AppLocate, DoubaoAccountView, DoubaoHistoryEvent } from '../../types';
@@ -292,6 +293,42 @@ export default function DoubaoOverview() {
   const snapshotCount = accounts.filter((a) => a.has_snapshot).length;
   const currentAccount = accounts.find((a) => a.is_current);
 
+  // 到期日历（F-13 批次 2 补挂豆包侧）：会员（quota_expire_at）+ 会话（session_expire_at）
+  // 豆包侧时间为本地格式字符串（YYYY-MM-DD HH:MM:SS），转 Unix 秒
+  const parseLocal = (s: string | null): number | null => {
+    if (!s) return null;
+    const t = new Date(s.replace(' ', 'T')).getTime();
+    return Number.isNaN(t) ? null : Math.floor(t / 1000);
+  };
+  const expiryItems = useMemo<ExpiryItem[]>(
+    () =>
+      accounts.flatMap((a) => {
+        const items: ExpiryItem[] = [];
+        const memberTs = parseLocal(a.quota_expire_at);
+        if (memberTs != null) {
+          items.push({
+            key: `${a.user_id}-member`,
+            label: a.name,
+            kind: '会员',
+            expire_ts: memberTs,
+            note: a.quota_level ? `等级 ${a.quota_level}` : null,
+          });
+        }
+        const sessionTs = parseLocal(a.session_expire_at);
+        if (sessionTs != null) {
+          items.push({
+            key: `${a.user_id}-session`,
+            label: a.name,
+            kind: '会话',
+            expire_ts: sessionTs,
+            note: a.session_state === 'expired' ? '会话已判定过期，请重新登录' : null,
+          });
+        }
+        return items;
+      }),
+    [accounts],
+  );
+
   return (
     <div className="animate-fade-in">
       <PageHeader
@@ -376,6 +413,17 @@ export default function DoubaoOverview() {
               </button>
             )}
           </div>
+        </div>
+      )}
+
+      {/* 到期日历（F-13） */}
+      {accounts.length > 0 && (
+        <div className="mt-5 card p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <CalendarClock size={16} className="text-rose-500" />
+            <span className="text-sm font-medium">到期日历</span>
+          </div>
+          <ExpiryCalendar items={expiryItems} emptyHint="暂无到期项：查询会员额度或录入会话凭证后展示会员/会话到期时间。" />
         </div>
       )}
 

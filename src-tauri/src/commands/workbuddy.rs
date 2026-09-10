@@ -568,6 +568,42 @@ pub fn workbuddy_refresh_token(state: State<AppState>, user_id: String) -> Resul
     Ok("凭证已续期".into())
 }
 
+// ── API 网关 WB 上游取号（T2.1）───────────────────────────────────────────
+
+/// 汇总 WB 上游账号：账号池启用账号 + token store 凭证 → WbSyncAccount。
+/// 区域判定（§5.2）：domain 含 `.workbuddy.ai` → Global（chat 全走 www.workbuddy.ai）。
+/// 仅纳入有工具侧凭证副本的账号（auth 文件为只读态，不在此兜底）。
+pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::pool::WbSyncAccount> {
+    let pool = load_pool(state);
+    let store: serde_json::Value = fs_utils::read_json(&token_store_path(state));
+    let tokens = store
+        .get("tokens")
+        .and_then(|t| t.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for a in &pool.accounts {
+        let rec = tokens.get(&a.id).cloned().unwrap_or_default();
+        let token = as_str(&dig(&rec, &["access_token"])).unwrap_or_default();
+        if token.is_empty() {
+            continue;
+        }
+        let domain = as_str(&dig(&rec, &["domain"])).unwrap_or_default();
+        let eid = as_str(&dig(&rec, &["enterprise_id", "enterpriseId"])).unwrap_or_default();
+        out.push(crate::api_server::pool::WbSyncAccount {
+            uid: a.id.clone(),
+            name: if a.nickname.is_empty() { a.id.clone() } else { a.nickname.clone() },
+            token,
+            domain: domain.clone(),
+            enterprise_id: eid,
+            global_region: domain.contains(".workbuddy.ai"),
+            credits: a.credits_balance,
+            needs_relogin: a.needs_relogin,
+        });
+    }
+    out
+}
+
 // ── M4 签到（F-15，python NDJSON 管线）─────────────────────────────────────
 
 #[derive(serde::Deserialize)]

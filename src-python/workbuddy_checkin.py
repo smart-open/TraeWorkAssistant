@@ -26,6 +26,21 @@ CHECKIN_STATUS_URL = BASE + "/v2/billing/meter/checkin-activity-status"
 CHECKIN_STATUS_URL_OLD = BASE + "/v2/billing/meter/checkin-status"
 CHECKIN_DO_URL = BASE + "/v2/billing/meter/daily-checkin"
 
+# ── 成长中心（F-17，/v2/activity/growth/*）────────────────────────────────
+GROWTH_BASE = BASE + "/v2/activity/growth"
+TRAVEL_STATUS_URL = GROWTH_BASE + "/buddy/travel/status"
+TRAVEL_CLAIM_URL = GROWTH_BASE + "/buddy/travel/claim"
+TRAVEL_CONFIG_URL = GROWTH_BASE + "/buddy/travel/config"
+TRAVEL_DEPART_URL = GROWTH_BASE + "/buddy/travel/depart"
+LOTTERY_CHANCES_URL = GROWTH_BASE + "/lottery/chances"
+LOTTERY_DRAW_URL = GROWTH_BASE + "/lottery/draw"
+TASKS_URL = GROWTH_BASE + "/tasks"
+TASKS_ACCEPT_URL = GROWTH_BASE + "/tasks/accept"
+ENERGY_URL = GROWTH_BASE + "/energy"
+STREAK_URL = GROWTH_BASE + "/streak"
+# 盲盒抽取循环上限（防接口异常时死循环；正常 balance 会归零）
+LOTTERY_MAX_DRAWS = 20
+
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -146,6 +161,177 @@ def append_results(events):
     wb.write_json_atomic(path, data)
 
 
+# ── 成长中心自动化（T2.5/F-17）────────────────────────────────────────────
+
+def _reward_text(body, raw):
+    """奖励数额一律以接口返回为准，不硬编码（F-17 红线）"""
+    r = wb.dig(body, "reward", "credits", "points", "amount", "value")
+    return "+%s" % r if r is not None else (raw[:60] or "ok")
+
+
+def growth_travel(headers):
+    """Buddy 旅行：status → arrived 则 claim → config → depart（各步独立容错）"""
+    status, body, raw = wb.get_json(TRAVEL_STATUS_URL, headers)
+    if status == 401:
+        return "auth", "登录态失效（401）"
+    if status != 200 or not isinstance(body, dict):
+        return "fail", "travel/status 不可用（HTTP %s）" % status if status else raw[:60]
+    arrived = wb.dig(body, "arrived", "is_arrived", "has_arrived")
+    record_id = wb.dig(body, "record_id", "recordId")
+    if not arrived:
+        # 未到达：报告在途状态即可
+        dest = wb.dig(body, "destination", "name", "target")
+        return "skip", "旅行在途%s" % ("（%s）" % dest if dest else "")
+    # 领奖
+    st1, b1, r1 = wb.post_json(TRAVEL_CLAIM_URL, headers,
+                               {"record_id": record_id} if record_id is not None else {})
+    if st1 == 401:
+        return "auth", "登录态失效（401）"
+    claim_txt = _reward_text(b1, r1) if st1 in (200, 201) else "claim 失败（HTTP %s）" % st1
+    # 查目的地配置并出发（config 失败不阻塞 depart）
+    st2, b2, _ = wb.get_json(TRAVEL_CONFIG_URL, headers)
+    dest = wb.dig(b2, "destination", "name", "target") if isinstance(b2, dict) else None
+    st3, b3, r3 = wb.post_json(TRAVEL_DEPART_URL, headers,
+                               {"destination": dest} if dest is not None else {})
+    if st3 in (200, 201):
+        return "ok", "领奖%s，已出发%s" % (claim_txt, "（%s）" % dest if dest else "")
+    return "ok", "领奖%s；depart 失败（HTTP %s）" % (claim_txt, st3)
+
+
+def growth_lottery(headers):
+    """盲盒：chances(balance>0) → draw 循环（可开关）"""
+    status, body, raw = wb.get_json(LOTTERY_CHANCES_URL, headers)
+    if status == 401:
+        return "auth", "登录态失效（401）"
+    if status != 200 or not isinstance(body, dict):
+        return "fail", "lottery/chances 不可用（HTTP %s）" % status if status else raw[:60]
+    balance = wb.dig(body, "balance", "chances", "count", "remain")
+    try:
+        balance = int(balance)
+    except (TypeError, ValueError):
+        return "skip", "无可用次数"
+    if balance <= 0:
+        return "skip", "无可用次数"
+    draws, rewards = 0, []
+    while balance > 0 and draws < LOTTERY_MAX_DRAWS:
+        st, b, r = wb.post_json(LOTTERY_DRAW_URL, headers, {})
+        if st == 401:
+            return "auth", "登录态失效（401，已抽 %d 次）" % draws
+        if st not in (200, 201):
+            break
+        draws += 1
+        rewards.append(wb.dig(b, "reward", "credits", "points", "amount"))
+        balance -= 1
+    if draws == 0:
+        return "fail", "draw 不可用"
+    return "ok", "抽取 %d 次（奖励 %s）" % (draws, "/".join(str(x) for x in rewards if x is not None) or "见响应")
+
+
+def growth_tasks(headers):
+    """任务领奖：tasks → 过滤 has_reward && 未领取 → accept {task_code}（可开关）"""
+    status, body, raw = wb.get_json(TASKS_URL, headers)
+    if status == 401:
+        return "auth", "登录态失效（401）"
+    if status != 200 or not isinstance(body, dict):
+        return "fail", "tasks 不可用（HTTP %s）" % status if status else raw[:60]
+    tasks = wb.dig(body, "tasks", "list", "records")
+    if not isinstance(tasks, list):
+        tasks = []
+    claimed, skipped = 0, 0
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        if not t.get("has_reward") and wb.dig(t, "hasReward") is None:
+            continue
+        accept_status = str(t.get("accept_status", wb.dig(t, "acceptStatus", "status") or ""))
+        if accept_status in ("1", "2", "claimed", "accepted", "已领取", "true", "True"):
+            skipped += 1
+            continue
+        code = t.get("task_code", t.get("taskCode", t.get("code")))
+        st, b, r = wb.post_json(TASKS_ACCEPT_URL, headers, {"task_code": code} if code is not None else {})
+        if st == 401:
+            return "auth", "登录态失效（401，已领 %d 项）" % claimed
+        if st in (200, 201):
+            claimed += 1
+    if claimed == 0:
+        return "skip", "无可领奖励（已领 %d 项）" % skipped
+    return "ok", "领取 %d 项任务奖励" % claimed
+
+
+def growth_info(headers):
+    """能量与连签天数（页面附注展示）"""
+    info = {}
+    st, b, _ = wb.get_json(ENERGY_URL, headers)
+    if st == 200 and isinstance(b, dict):
+        v = wb.dig(b, "energy", "value", "balance", "num")
+        if v is not None:
+            info["energy"] = v
+    st, b, _ = wb.get_json(STREAK_URL, headers)
+    if st == 200 and isinstance(b, dict):
+        v = wb.dig(b, "streak", "days", "continuous_days", "count")
+        if v is not None:
+            info["streak"] = v
+    return info
+
+
+def process_account_growth(acct, flags):
+    """单账号成长中心链式执行（旅行→盲盒→任务，各步独立容错；401 刷新一次重试）"""
+    aid = acct.get("id", "")
+    name = acct.get("nickname") or acct.get("uid", "")[:8] or aid
+    base_ev = {"type": "growth", "user_id": aid, "name": name}
+    creds, refreshed, note = wb.ensure_fresh(acct, 24)
+    if not creds.get("access_token"):
+        return {**base_ev, "status": "fail", "message": "无可用凭证（%s）" % note}
+    headers = wb.build_auth_headers(creds)
+
+    def with_retry(fn):
+        kind, msg = fn(headers)
+        if kind == "auth":
+            new = wb.refresh_token_once(creds)
+            if new:
+                wb.save_token_store(aid, new)
+                _sync_pool_expiry(aid, new)
+                return fn(wb.build_auth_headers(new))
+            return "fail", "登录态失效且刷新失败"
+        return kind, msg
+
+    result = {}
+    if flags.get("travel"):
+        kind, msg = with_retry(growth_travel)
+        result["travel"] = "fail" if kind == "fail" else msg
+    if flags.get("lottery"):
+        kind, msg = with_retry(growth_lottery)
+        result["lottery"] = "fail" if kind == "fail" else msg
+    if flags.get("tasks"):
+        kind, msg = with_retry(growth_tasks)
+        result["tasks"] = "fail" if kind == "fail" else msg
+    result.update(growth_info(headers))
+    fails = sum(1 for v in (result.get("travel"), result.get("lottery"), result.get("tasks"))
+                if v == "fail")
+    return {**base_ev,
+            "status": "fail" if fails == len([k for k in ("travel", "lottery", "tasks") if k in result]) and fails > 0 else "ok",
+            **result}
+
+
+def run_growth(uids, flags):
+    """成长中心整轮：NDJSON 输出（wb-checkin-progress 管线复用）"""
+    pool = wb.load_pool()
+    accounts = pool.get("accounts", [])
+    if uids:
+        sel = set(uids)
+        accounts = [a for a in accounts if a.get("id") in sel]
+    emit({"type": "start", "total": len(accounts), "mode": "growth"})
+    for i, acct in enumerate(accounts, 1):
+        try:
+            ev = process_account_growth(acct, flags)
+        except Exception as e:  # 单账号异常不中断整轮
+            ev = {"type": "growth", "user_id": acct.get("id", ""),
+                  "name": acct.get("nickname") or "", "status": "fail", "message": "异常: %s" % e}
+        ev["index"] = i
+        emit(ev)
+    emit({"type": "done", "mode": "growth"})
+
+
 def run_renew_only(lazy_hours, keepalive_days):
     """每周兜底（schtasks）：对全部带 refreshToken 的账号执行惰性刷新。
     keepalive_days<=0 = 每天无条件刷新全部（F-55）；过期前主动刷新（v1.2）。
@@ -171,6 +357,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json-stream", action="store_true")
     ap.add_argument("--renew-only", action="store_true")
+    ap.add_argument("--growth", action="store_true", help="成长中心整轮（T2.5/F-17）")
+    ap.add_argument("--growth-travel", action="store_true")
+    ap.add_argument("--growth-lottery", action="store_true")
+    ap.add_argument("--growth-tasks", action="store_true")
     ap.add_argument("--uid", action="append", default=None)
     ap.add_argument("--skip-checked", action="store_true")
     ap.add_argument("--skip-expired", action="store_true")
@@ -180,6 +370,15 @@ def main():
 
     if args.renew_only:
         run_renew_only(args.lazy_hours, args.keepalive_days)
+        return
+
+    # 成长中心模式：独立于签到流程，事件走同一 NDJSON 管线
+    if args.growth:
+        run_growth(args.uid, {
+            "travel": args.growth_travel,
+            "lottery": args.growth_lottery,
+            "tasks": args.growth_tasks,
+        })
         return
 
     pool = wb.load_pool()

@@ -11,6 +11,7 @@ import {
 import { Coins, RefreshCw } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { StatCard, Badge, EmptyState } from '../components/ui';
+import ExpiryCalendar, { type ExpiryItem } from '../components/ExpiryCalendar';
 import { useAppStore } from '../store';
 import { useIsDark } from '../lib/useIsDark';
 import { fmtCredits, normZero } from '../lib/format';
@@ -123,6 +124,31 @@ export default function Credits() {
   }, [creditsDaily, total]);
 
   const hasTrend = trend.some((d) => d.total > 0 || d.earned > 0 || d.consumed > 0);
+
+  // 到期日历（F-13 批次 2 补挂 Trae 侧）：token（JWT）+ 积分包 + 会员三类，均 Unix 秒
+  const expiryItems = useMemo<ExpiryItem[]>(
+    () =>
+      accounts.flatMap((a) => {
+        const items: ExpiryItem[] = [];
+        if (a.jwt_exp_timestamp != null) {
+          items.push({ key: `${a.user_id}-jwt`, label: a.name, kind: 'token', expire_ts: a.jwt_exp_timestamp });
+        }
+        if (a.credits_expire_at != null) {
+          items.push({ key: `${a.user_id}-credits`, label: a.name, kind: '积分包', expire_ts: a.credits_expire_at, note: `剩余 ${fmtCredits(a.remaining_credits ?? 0)} 积分` });
+        }
+        if (a.membership_expire != null) {
+          items.push({
+            key: `${a.user_id}-membership`,
+            label: a.name,
+            kind: '会员',
+            expire_ts: a.membership_expire,
+            note: a.pay_identity ? `套餐 ${a.pay_identity}` : null,
+          });
+        }
+        return items;
+      }),
+    [accounts],
+  );
 
   return (
     <div className="animate-fade-in">
@@ -264,6 +290,12 @@ export default function Credits() {
             })}
           </tbody>
         </table>
+      </div>
+
+      {/* 到期日历（F-13） */}
+      <div className="mt-5 card p-4">
+        <h3 className="mb-3 font-medium">到期日历</h3>
+        <ExpiryCalendar items={expiryItems} emptyHint="暂无到期项：待账号完成签到/积分查询后展示 token、积分包与会员到期时间。" />
       </div>
     </div>
   );

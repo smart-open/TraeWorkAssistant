@@ -182,6 +182,24 @@ pub async fn do_start(
         ),
     );
 
+    // ===== WorkBuddy 上游池装配（T2.1）=====
+    let wb_accounts = crate::commands::workbuddy::wb_upstream_accounts(state);
+    let wb_pool = ApiPool::new();
+    wb_pool.sync_from_wb(&wb_accounts, &pool_file.enabled_uids);
+    let wb_count = wb_pool.count();
+    let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-WB上游池: enabled={} accounts={} healthy={} strategy={}",
+            pool_file.wb_enabled,
+            wb_count,
+            wb_healthy,
+            crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy).as_str(),
+        ),
+    );
+    wb_pool.set_strategy(strategy);
+
     // 池为空时给出明确警告
     if pool_count == 0 {
         fs_utils::app_log(
@@ -197,6 +215,12 @@ pub async fn do_start(
 
     let shared = Arc::new(ApiSharedState {
         pool,
+        wb_pool,
+        wb_enabled: std::sync::atomic::AtomicBool::new(pool_file.wb_enabled),
+        wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+        wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
+        model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        wb_template_cache: Mutex::new(None),
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -333,18 +357,20 @@ pub fn pool_list(state: State<'_, AppState>) -> ApiPoolFile {
     fs_utils::read_json(&state.path("api_pool.json"))
 }
 
-/// 批量设置池中的账号 UID 列表 + 调度策略 + 分组筛选（T10）
+/// 批量设置池中的账号 UID 列表 + 调度策略 + 分组筛选（T10）+ WB 上游开关（T2.1）
 #[tauri::command]
 pub fn pool_set(
     state: State<'_, AppState>,
     uids: Vec<String>,
     strategy: Option<String>,
     group_ids: Option<Vec<String>>,
+    wb_enabled: Option<bool>,
 ) -> Result<(), String> {
     let pool_file = ApiPoolFile {
         enabled_uids: uids,
         strategy: strategy.unwrap_or_default(),
         group_ids: group_ids.unwrap_or_default(),
+        wb_enabled: wb_enabled.unwrap_or(false),
     };
     fs_utils::write_json(&state.path("api_pool.json"), &pool_file)
 }

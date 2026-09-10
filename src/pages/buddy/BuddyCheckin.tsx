@@ -20,7 +20,28 @@ interface WbAccountLine {
   message?: string;
 }
 
-function parseLine(raw: string): (WbAccountLine | { type: 'start'; total: number } | { type: 'done'; ok: number; already: number; failed: number } | null) {
+interface WbGrowthLine {
+  type: 'growth';
+  index: number;
+  user_id: string;
+  name: string;
+  status: 'ok' | 'fail';
+  message?: string;
+  travel?: string;
+  lottery?: string;
+  tasks?: string;
+  energy?: unknown;
+  streak?: unknown;
+}
+
+type ParsedEvent =
+  | { type: 'start'; total: number; mode?: string }
+  | { type: 'done'; ok: number; already: number; failed: number; mode?: string }
+  | { type: 'exit' }
+  | WbAccountLine
+  | WbGrowthLine;
+
+function parseLine(raw: string): ParsedEvent | null {
   try {
     return JSON.parse(raw);
   } catch {
@@ -49,6 +70,9 @@ export default function BuddyCheckin() {
   const [tasks, setTasks] = useState<string[]>([]);
   const [renewOn, setRenewOn] = useState(false);
   const [settings, setSettings] = useState<{ auto_checkin: boolean; keepalive_days: number; lazy_refresh_hours: number; growth_travel: boolean; growth_lottery: boolean; growth_tasks: boolean } | null>(null);
+  const [growthRunning, setGrowthRunning] = useState(false);
+  const [growthLines, setGrowthLines] = useState<WbGrowthLine[]>([]);
+  const [growthSummary, setGrowthSummary] = useState<string | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
 
   const refresh = useCallback(async () => {
@@ -78,13 +102,34 @@ export default function BuddyCheckin() {
       const parsed = parseLine(ev.payload);
       if (!parsed || typeof parsed !== 'object') return;
       if ('type' in parsed && parsed.type === 'start') {
-        setLines([]);
-        setSummary(null);
+        // 成长中心与签到共用管线：按 mode 分流，互不干扰
+        if (parsed.mode === 'growth') {
+          setGrowthLines([]);
+          setGrowthSummary(null);
+          setGrowthRunning(true);
+        } else {
+          setLines([]);
+          setSummary(null);
+        }
       } else if ('type' in parsed && parsed.type === 'done') {
-        setSummary(`成功 ${parsed.ok} · 已签 ${parsed.already} · 失败 ${parsed.failed}`);
-        setRunning(false);
-        void refresh();
-        pushToast(parsed.failed > 0 ? 'warn' : 'success', `WorkBuddy 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}`);
+        if (parsed.mode === 'growth') {
+          setGrowthSummary('成长中心执行完成');
+          setGrowthRunning(false);
+          void refresh();
+          pushToast('success', '成长中心执行完成（旅行/盲盒/任务结果见下方明细）');
+        } else {
+          setSummary(`成功 ${parsed.ok} · 已签 ${parsed.already} · 失败 ${parsed.failed}`);
+          setRunning(false);
+          void refresh();
+          pushToast(parsed.failed > 0 ? 'warn' : 'success', `WorkBuddy 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}`);
+        }
+      } else if ('type' in parsed && parsed.type === 'growth') {
+        const line = parsed as WbGrowthLine;
+        setGrowthLines((prev) => {
+          const next = prev.slice();
+          next[line.index - 1] = line;
+          return next;
+        });
       } else if ('index' in parsed && parsed.index != null) {
         const line = parsed as WbAccountLine;
         setLines((prev) => {
@@ -94,6 +139,7 @@ export default function BuddyCheckin() {
         });
       } else if ('type' in parsed && parsed.type === 'exit') {
         setRunning(false);
+        setGrowthRunning(false);
       }
     }).then((u) => {
       if (disposed) u();
@@ -119,6 +165,22 @@ export default function BuddyCheckin() {
     } catch (err) {
       setRunning(false);
       pushToast('error', `发起签到失败：${String(err)}`);
+    }
+  };
+
+  const runGrowth = async () => {
+    if (accounts.length === 0) {
+      pushToast('warn', '账号池为空：请先在「账号管理」导入本机账号');
+      return;
+    }
+    setGrowthRunning(true);
+    setGrowthLines([]);
+    setGrowthSummary(null);
+    try {
+      await api.workbuddy.growthRun();
+    } catch (err) {
+      setGrowthRunning(false);
+      pushToast('error', `发起成长任务失败：${String(err)}`);
     }
   };
 
@@ -195,15 +257,21 @@ export default function BuddyCheckin() {
         )}
       </div>
 
-      {/* 成长中心卡（F-17：开关批次1可配置，执行器批次2开放） */}
+      {/* 成长中心卡（F-17：三开关 + 立即执行，T2.5 执行器） */}
       <div className="mt-4 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <Sparkles size={16} className="text-violet-500" />
-          <span className="text-sm font-medium">成长中心</span>
-          <Badge tone="amber">执行器随批次 2 开放</Badge>
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Sparkles size={16} className="text-violet-500" />
+            <span className="text-sm font-medium">成长中心</span>
+            {growthRunning && <Badge tone="blue">执行中</Badge>}
+            {growthSummary && !growthRunning && <span className="text-xs text-slate-400">{growthSummary}</span>}
+          </div>
+          <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => void runGrowth()} disabled={growthRunning}>
+            <Sparkles size={13} /> {growthRunning ? '执行中…' : '立即执行成长任务'}
+          </button>
         </div>
         <p className="mb-3 text-xs text-slate-400">
-          Buddy 旅行 / 盲盒 / 任务领奖为纯增量积分自动化；开关状态随本页保存，批次 2 执行器上线后立即生效。
+          Buddy 旅行 / 盲盒 / 任务领奖为纯增量积分自动化，按下方开关逐账号链式执行；奖励数额以接口返回为准。
         </p>
         <div className="grid gap-3 lg:grid-cols-3">
           <label className="flex items-start gap-2 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
@@ -243,6 +311,32 @@ export default function BuddyCheckin() {
             </span>
           </label>
         </div>
+        {/* 成长任务执行明细 */}
+        {growthLines.length > 0 && (
+          <div className="mt-3 space-y-1.5">
+            {growthLines.map((g, i) => (
+              <div key={i} className="rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800">
+                <div className="flex items-center gap-3">
+                  <Badge tone={g.status === 'fail' ? 'red' : 'green'}>{g.status === 'fail' ? '失败' : '完成'}</Badge>
+                  <span className="min-w-0 flex-1 truncate font-medium">{g.name || g.user_id}</span>
+                  {(g.energy != null || g.streak != null) && (
+                    <span className="text-xs text-violet-500">
+                      {g.energy != null && `能量 ${g.energy}`}
+                      {g.energy != null && g.streak != null && ' · '}
+                      {g.streak != null && `连签 ${g.streak} 天`}
+                    </span>
+                  )}
+                </div>
+                <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-slate-400">
+                  {g.travel && <span>旅行：{g.travel}</span>}
+                  {g.lottery && <span>盲盒：{g.lottery}</span>}
+                  {g.tasks && <span>任务：{g.tasks}</span>}
+                  {g.status === 'fail' && g.message && <span className="text-red-500">{g.message}</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* 定时任务卡（F-16） */}

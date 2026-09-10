@@ -235,6 +235,24 @@ def post_json(url, headers, body=None, timeout=30):
         return 0, None, str(e)
 
 
+def get_json(url, headers, timeout=30):
+    """GET 请求，返回 (http_status, parsed_or_None, raw_text)；HTTPError 也返回状态码（F-17 成长中心等 GET 端点）"""
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return resp.status, _try_json(raw), raw
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        return e.code, _try_json(raw), raw
+    except Exception as e:  # 网络异常：0 表示不可达
+        return 0, None, str(e)
+
+
 def _try_json(raw):
     try:
         return json.loads(raw)

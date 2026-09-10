@@ -12,6 +12,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::sse;
 use super::usage::{extract_tokens, KeyId};
+use super::wb_catalog;
+use super::wb_route;
 use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState, ErrKind,
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
@@ -44,8 +46,24 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 
 // ==================== Handlers ====================
 
+/// WB 上游模型路由判定（T2.1）：wb_model_catalog.json 命中即属 WB 上游
+fn wb_model_requested(state: &ApiSharedState, model: &str) -> bool {
+    wb_catalog::find(&wb_catalog::load(&state.data_dir), model).is_some()
+}
+
+/// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）
+fn model_cooling_response(state: &ApiSharedState, model: &str, proto: Protocol) -> Response {
+    let rem = wb_route::model_cooling_remaining(state, model).unwrap_or(0);
+    let msg = format!("model {} cooling down, retry after {}s", model, rem);
+    match proto {
+        Protocol::Anthropic => anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg),
+        _ => openai_error(StatusCode::TOO_MANY_REQUESTS, "model_cooldown", &msg),
+    }
+}
+
 pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
     let pool = state.pool.status_list();
+    let wb_pool = state.wb_pool.status_list();
     let available = pool.iter().filter(|p| !p.disabled && !p.cooling).count();
     let cooling = pool.iter().filter(|p| p.cooling).count();
     let disabled = pool.iter().filter(|p| p.disabled).count();
@@ -53,6 +71,8 @@ pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     let total = state.total_requests.load(std::sync::atomic::Ordering::Relaxed);
     let active = safe_lock(&state.active_uid).clone();
     let last_err = safe_lock(&state.last_error).clone();
+    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let wb_available = wb_pool.iter().filter(|p| !p.disabled && !p.cooling).count();
 
     Json(json!({
         "status": "ok",
@@ -66,8 +86,35 @@ pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "cooling": cooling,
             "disabled": disabled,
             "total_credits": (total_credits * 100.0).round() / 100.0,
+        },
+        "wb": {
+            "enabled": wb_enabled,
+            "total_accounts": wb_pool.len(),
+            "available": wb_available,
         }
     }))
+}
+
+/// /healthz（T2.3/F-32）：无健康账号（两个池都没有）→ 503，供探活/看门狗
+pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
+    let pool = state.pool.status_list();
+    let wb_pool = state.wb_pool.status_list();
+    let solo_ok = pool.iter().any(|p| !p.disabled && !p.cooling);
+    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let wb_ok = wb_pool.iter().any(|p| !p.disabled && !p.cooling);
+    if solo_ok || (wb_enabled && wb_ok) {
+        (
+            StatusCode::OK,
+            axum::Json(json!({ "status": "ok", "solo_available": solo_ok, "wb_available": wb_ok })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({ "status": "unavailable", "reason": "no healthy account" })),
+        )
+            .into_response()
+    }
 }
 
 pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
@@ -109,8 +156,30 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "cooldown_reason": p.cooldown_reason,
             "disabled": p.disabled,
             "err_count": p.err_count,
+            "state": p.state,
         })
     }).collect();
+
+    // WB 池画像（T2.3/F-32）
+    let wb_pool = state.wb_pool.status_list();
+    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let wb_accounts: Vec<Value> = wb_pool.iter().map(|p| {
+        json!({
+            "uid": p.uid, "name": p.name, "credits": p.credits,
+            "cooling": p.cooling, "cooldown_until": p.cooldown_until,
+            "cooldown_reason": p.cooldown_reason, "disabled": p.disabled,
+            "err_count": p.err_count, "state": p.state,
+        })
+    }).collect();
+    let model_cooldowns: Vec<Value> = {
+        let map = safe_lock(&state.model_cooldowns);
+        map.iter()
+            .filter(|(_, (until, _))| *until > now)
+            .map(|(m, (until, fails))| json!({
+                "model": m, "until": until, "remaining_s": until - now, "fails": fails,
+            }))
+            .collect()
+    };
 
     Json(json!({
         "running": true,
@@ -125,6 +194,13 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "total_credits": total_credits,
         },
         "accounts": accounts,
+        "wb": {
+            "enabled": wb_enabled,
+            "total_accounts": wb_pool.len(),
+            "accounts": wb_accounts,
+            "model_cooldowns": model_cooldowns,
+            "sticky_sessions": state.wb_sticky.len(),
+        },
     }))
 }
 
@@ -135,7 +211,7 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     let list = tokio::task::spawn_blocking(move || super::models_sync::load_models(&data_dir))
         .await
         .unwrap_or_default();
-    let data: Vec<Value> = list
+    let mut data: Vec<Value> = list
         .iter()
         .map(|m| {
             json!({
@@ -147,6 +223,21 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             })
         })
         .collect();
+    // WB 上游模型目录合并（T2.1/T2.3）：启用时并入，owned_by=workbuddy；
+    // 能力字段读目录（supportedEfforts 等，批次 4 F-37 动态替换）
+    if state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        for m in wb_catalog::load(&state.data_dir) {
+            data.push(json!({
+                "id": m.id,
+                "object": "model",
+                "created": 1753600000,
+                "owned_by": "workbuddy",
+                "context_length": m.context_length,
+                "max_tokens": m.max_tokens,
+                "rate": m.rate,
+            }));
+        }
+    }
     Json(json!({ "object": "list", "data": data }))
 }
 
@@ -188,6 +279,24 @@ pub async fn chat_completions(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+
+    // 模型路由（T2.1）：WB 目录命中 → WB 上游
+    if wb_model_requested(&state, &model) {
+        if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "wb_upstream_disabled",
+                "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）",
+            );
+        }
+        if wb_route::model_cooling_remaining(&state, &model).is_some() {
+            return model_cooling_response(&state, &model, Protocol::OpenAi);
+        }
+        if stream {
+            return wb_route::wb_stream_chat(state_clone, body_vec, model, start_ts, Protocol::OpenAi, key_str);
+        }
+        return wb_route::wb_aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi, key_str).await;
+    }
 
     if stream {
         stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi, key_str)
@@ -245,6 +354,24 @@ pub async fn messages(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+
+    // 模型路由（T2.1）：WB 目录命中 → WB 上游（body 已转为 OpenAI 内部格式）
+    if wb_model_requested(&state, &model) {
+        if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）",
+            );
+        }
+        if wb_route::model_cooling_remaining(&state, &model).is_some() {
+            return model_cooling_response(&state, &model, Protocol::Anthropic);
+        }
+        if stream {
+            return wb_route::wb_stream_chat(state_clone, body_vec, model, start_ts, Protocol::Anthropic, key_str);
+        }
+        return wb_route::wb_aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic, key_str).await;
+    }
 
     if stream {
         stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic, key_str)
@@ -335,6 +462,24 @@ pub async fn completions(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
+    // 模型路由（T2.1）：WB 目录命中 → WB 上游
+    if wb_model_requested(&state, &model) {
+        if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "wb_upstream_disabled",
+                "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）",
+            );
+        }
+        if wb_route::model_cooling_remaining(&state, &model).is_some() {
+            return model_cooling_response(&state, &model, Protocol::OpenAiText);
+        }
+        if stream {
+            return wb_route::wb_stream_chat(state_clone, body_vec, model, start_ts, Protocol::OpenAiText, key_str);
+        }
+        return wb_route::wb_aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAiText, key_str).await;
+    }
+
     if stream {
         stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAiText, key_str)
     } else {
@@ -356,6 +501,26 @@ pub async fn embeddings() -> Response {
 #[allow(clippy::too_many_arguments)]
 fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    // SSE keep-alive 15s（T2.7/F-34 §5.5 #7）：防中间层回收长流；
+    // 客户端断连/[DONE] 后发送失败自然退出
+    {
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            tick.tick().await; // 首个 tick 立即返回，跳过
+            loop {
+                tick.tick().await;
+                if tx2
+                    .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
 
     tokio::task::spawn_blocking(move || {
         let chat_id = match proto {
@@ -767,8 +932,8 @@ fn make_upstream_request(
 
 // ==================== Helpers ====================
 
-fn openai_error(status: StatusCode, code: &str, msg: &str) -> Response {
-    let body = json!({
+/// OpenAI 错误响应格式（wb_route 复用）
+pub(crate) fn openai_error(status: StatusCode, code: &str, msg: &str) -> Response {    let body = json!({
         "error": {
             "message": msg,
             "type": "api_error",
@@ -787,8 +952,8 @@ fn openai_error(status: StatusCode, code: &str, msg: &str) -> Response {
         })
 }
 
-/// Anthropic 错误响应格式：{"type":"error","error":{"type","message"}}
-fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> Response {
+/// Anthropic 错误响应格式：{"type":"error","error":{"type","message"}}（wb_route 复用）
+pub(crate) fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> Response {
     let body = json!({
         "type": "error",
         "error": {
