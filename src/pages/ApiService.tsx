@@ -910,13 +910,13 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
           <button
             className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
               authDisabled
-                ? 'bg-amber-500/90 text-white hover:bg-amber-500'
-                : 'bg-emerald-500/90 text-white hover:bg-emerald-500'
+                ? 'bg-emerald-500/90 text-white hover:bg-emerald-500'
+                : 'bg-amber-500/90 text-white hover:bg-amber-500'
             }`}
             onClick={toggleAuthDisabled}
             disabled={keysSaving}
           >
-            {authDisabled ? '关闭鉴权' : '开启鉴权'}
+            {authDisabled ? '开启鉴权' : '关闭鉴权'}
           </button>
         </div>
 
