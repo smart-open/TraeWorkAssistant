@@ -4,6 +4,18 @@
 
 ---
 
+## [3.3.1] - 2026-09-10
+
+### 修复
+
+- **证书安装（#6）**：cert_install 前置依赖自检并自动 pip 自愈；gen_ca 捕获子进程真实报错（含 `No module named` 修复指引）；certutil 路径加引号防空格拆参、`-PassThru` 取真实退出码；安装后复查根存储；前端 handleRun 兜底 toast，消除「点了没反应」
+- **代理生命周期（#7）**：`SO_EXCLUSIVEADDRUSE` 独占绑定，端口被占时带占用 PID 诊断并退出（不再「假启动」）；`log()` print 纳入容错；CONNECT 先握手后记日志；proxy_start 端口预检 + 清理遗留孤儿进程；python 子进程统一挂 Job Object（kill-on-close）防崩溃/强杀泄漏
+
+### 新增
+
+- 安装/portable 包内置精简 Python 3.12 运行时 + cryptography/pywin32，不再依赖系统 Python（新增 `scripts/prepare_python_runtime.py`）
+- 运行时精简：剔除 pywin32 自带 IDE/COM 扩展/帮助文档等无用项（净减 ~10.7MB 未压缩），保留 dist-info 与 `__pycache__`
+
 ## [3.3.0] - 2026-09-10
 
 ### 新增（T1-T11 自 trae_work_main 手工移植合入，未使用 merge/cherry-pick）

@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "ai-work-assistant"
-version = "3.3.0"
+version = "3.3.1"
 dependencies = [
  "axum",
  "base64 0.22.1",

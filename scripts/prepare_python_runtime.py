@@ -78,7 +78,7 @@ def runtime_ok() -> bool:
     if not exe.exists():
         return False
     r = subprocess.run(
-        [str(exe), "-c", "import cryptography, win32crypt"],
+        [str(exe), "-c", "import cryptography, win32crypt, sqlite3"],
         capture_output=True, creationflags=CREATE_NO_WINDOW,
     )
     return r.returncode == 0
@@ -156,14 +156,26 @@ def prepare() -> None:
             shutil.copy2(dll, RUNTIME_DIR / dll.name)
             log(f"DLL 平移: {dll.name}")
 
-    # 5. 清理无用产物（pip 脚本目录、测试缓存、字节码），压缩产物体积
-    #    仅删根级垃圾，不动 site-packages 内部（-m pip 仍可用于运行时自愈安装）
-    for name in ("Scripts", "tests", ".pytest_cache", "logs"):
+    # 5. 清理无用产物，压缩产物体积（实测净减 ~10.7MB 未压缩）：
+    #    根级：pywin32 安装器残留 python.cat（Windows 目录签名文件，运行时无用）、
+    #          pythonw.exe（无 GUI 场景）
+    #    site-packages 级：pywin32 自带的 IDE/COM 扩展/帮助文档等——业务仅用 win32crypt
+    #          （DPAPI），依赖链只涉及 win32/ 与 pywin32_system32，其余均可删
+    #    必须保留：dist-info（运行时自愈 pip install 依赖其识别已装包，避免无谓重装）、
+    #          __pycache__（只读安装目录下无法重生成，预置字节码可加速首次 import）
+    for name in ("Scripts", "tests", ".pytest_cache", "logs", "pythonw.exe", "python.cat"):
         p = RUNTIME_DIR / name
-        if p.exists():
+        if p.is_dir():
             shutil.rmtree(p, ignore_errors=True)
-    for pycache in RUNTIME_DIR.rglob("__pycache__"):
-        shutil.rmtree(pycache, ignore_errors=True)
+        elif p.exists():
+            p.unlink(missing_ok=True)
+    sp = RUNTIME_DIR / "Lib" / "site-packages"
+    for name in ("pythonwin", "win32comext", "win32com", "adodbapi", "isapi", "bin", "PyWin32.chm"):
+        p = sp / name
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.exists():
+            p.unlink(missing_ok=True)
 
     # 6. 终验：关键依赖必须可导入，否则视为失败并清理半成品
     if not runtime_ok():
