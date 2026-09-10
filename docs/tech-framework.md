@@ -310,7 +310,12 @@ rustup toolchain install stable && rustup default stable
 rustup target add x86_64-pc-windows-msvc   # MSVC 目标（Windows 默认）
 ```
 
-Python 仅运行时需要：`src-python/` 随 `bundle.resources` 打包，运行期 Rust 探测系统解释器（`python` → `python3` → `py`），资源目录内嵌 `python.exe` 则优先。
+Python 双角色：
+
+- **构建机 Python 3.13.x**（必须，ABI 要求）：运行 `scripts/prepare_python_runtime.py` 准备内嵌运行时（用其 pip 拉取与 embeddable 同版本 ABI 的 wheel）。
+- **应用内嵌运行时**：`npm run tauri build` 的 `beforeBuildCommand` 会自动执行准备脚本——下载 Windows embeddable Python 解压到 `src-python/`（解释器 + 标准库 + 预装 `requirements.txt` 依赖），随后随 `bundle.resources` 整体打进安装包。运行期 Rust 优先使用资源目录的 `python/python.exe`，不存在才回退系统解释器（兼容 dev 环境）。
+
+运行时文件不入 git（`.gitignore` 已按 embeddable 产物清单忽略）；embeddable zip 缓存于 `%LOCALAPPDATA%/TraeWorkAssistant/build-cache`，脚本分层幂等（已就绪则秒级跳过）。
 
 ### 7.2 开发模式
 
@@ -327,8 +332,10 @@ npm run build          # tsc 类型检查 + vite 生产打包到 dist/
 npm run tauri build    # 产出 msi / nsis 安装包
 ```
 
-流程：`beforeBuildCommand` 产出 `dist/` → 编译 Rust release → 按 `bundle.targets` 打包 →
-`src-python/` → `python/`、`src-ps/` → `ps/` 作为资源打入。产物在 `src-tauri/target/release/bundle/`。
+流程：`beforeBuildCommand` = `python scripts/prepare_python_runtime.py && npm run build`
+（①准备内嵌 Python 运行时 → ②tsc + vite 产出 `dist/`）→ 编译 Rust release → 按 `bundle.targets` 打包 →
+`src-python/`（此时含内嵌解释器与依赖）→ `python/`、`src-ps/` → `ps/` 作为资源打入。产物在 `src-tauri/target/release/bundle/`。
+安装包体积增加约 25-30 MB（embeddable 10 MB + site-packages 35 MB，NSIS 压缩后）。
 
 ### 7.4 测试
 
@@ -359,7 +366,8 @@ python src-python/tests/test_auto_checkin.py    # Python 单测（JWT 解析/过
 | 启动白屏 / `invoke` 不存在 | 直接在浏览器打开 5173，未走 Tauri 外壳 | 用 `npm run tauri dev` 启动 |
 | `cargo check/test` 写 target 拒绝访问 (os error 5) | IDE/杀软锁 target 目录 | 直接重试；必要时关闭占用进程 |
 | 代理启动失败 / 捕获不到 JWT | 未装 CA 证书，或 Trae 未走本地代理 | 「一键安装证书」（UAC）→ 启动代理 → 确认日志 listening |
-| 提示「未检测到 Python」 | 系统无 Python 或不在 PATH | 安装 Python ≥ 3.9 并加入 PATH；或内嵌 `python.exe` |
+| 提示「未检测到 Python」 | 系统无 Python 或不在 PATH | 安装包已内置 Python 运行时；仅 dev 模式需要本机 Python |
+| 证书安装无反应 / 代理启动即退 | 旧版本包未带 Python 依赖（缺 cryptography） | 已修复：安装包内置运行时 + 失败原因经 toast 透出；旧包临时规避 `python -m pip install cryptography pywin32`（装到 app.log `python_exe=` 指向的解释器） |
 | 打包后运行缺脚本 | `bundle.resources` 未包含 | 确认指向 `../src-python/` 与 `../src-ps/` |
 | 计划任务查询输出乱码 | `schtasks` GBK 输出被按 UTF-8 解读 | 统一走 `misc.rs::run_schtasks()`（前置 `chcp 65001`），勿裸调 `Command` |
 | 注册计划任务 Access Denied | `/RL HIGHEST` 强制最高权限 | 已移除该参数，任务以当前用户身份运行 |

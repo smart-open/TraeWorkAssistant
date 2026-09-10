@@ -4,6 +4,14 @@
 
 ---
 
+## [Unreleased]
+
+### 修复（Issue #6：点击「安装证书」无任何反应）
+
+- **安装包内置 Python 运行时（根治）**：新增 `scripts/prepare_python_runtime.py`——构建期自动下载 Windows embeddable Python（默认 3.13.12，zip 本地缓存）解压到 `src-python/`，启用 site 后以构建机 pip 预装 `cryptography` / `pywin32`（`--only-binary` 保证 wheel ABI 匹配）并做 pywin32 DLL 后处理；随 `bundle.resources` 一并打入安装包，运行期不再依赖系统 Python。脚本分层幂等（已就绪秒级跳过），`beforeBuildCommand` 自动执行；CI workflow 补 `setup-python@v5`（3.13，ABI 对齐）与 embeddable zip 缓存。安装包体积增加约 25-30 MB（压缩后）。
+- **证书安装失败原因透出**：`cert_install` 生成 CA 改为捕获子进程输出，失败时截取 stderr 透传真实原因（如 `ModuleNotFoundError: No module named 'cryptography'`）；配置导航「安装证书」步骤失败弹 toast（原静默只写 console）。
+- **certutil 调用修正**：路径内嵌双引号（含空格目录不再拆参）；改用 `-PassThru` 以 certutil 真实退出码判定成败（原 `-Wait` 下 certutil 失败仍误报「安装成功」）。
+
 ## [2.9.0] - 2026-09-09
 
 ### 新增
