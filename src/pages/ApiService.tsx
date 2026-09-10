@@ -71,6 +71,7 @@ export default function ApiService() {
   const [usageDays, setUsageDays] = useState(14);
   const [usageLoading, setUsageLoading] = useState(false);
   const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([]);
+  const [authDisabled, setAuthDisabled] = useState(false);
   const [keysSaving, setKeysSaving] = useState(false);
   const [newKeyName, setNewKeyName] = useState('');
   const [newKeyLimit, setNewKeyLimit] = useState(0);
@@ -110,7 +111,9 @@ export default function ApiService() {
   // ---- 多 API Key 管理 ----
   const loadKeys = useCallback(async () => {
     try {
-      setApiKeys(await api.apiServer.keysList());
+      const view = await api.apiServer.keysList();
+      setApiKeys(view.keys);
+      setAuthDisabled(view.auth_disabled);
     } catch {
       /* 保留空列表 */
     }
@@ -128,17 +131,27 @@ export default function ApiService() {
     generateKeyValue();
   }, [loadKeys, generateKeyValue]);
 
-  const saveKeys = async (next: ApiKeyEntry[], msg: string) => {
+  const saveKeys = async (next: ApiKeyEntry[], msg: string, nextAuthDisabled?: boolean) => {
     setKeysSaving(true);
     try {
-      await api.apiServer.keysSave(next);
+      await api.apiServer.keysSave(next, nextAuthDisabled);
       setApiKeys(next);
+      if (nextAuthDisabled !== undefined) setAuthDisabled(nextAuthDisabled);
       toast('success', msg);
     } catch (e) {
       toast('error', `保存 Key 失败：${String(e).slice(0, 120)}`);
     } finally {
       setKeysSaving(false);
     }
+  };
+
+  const toggleAuthDisabled = () => {
+    const next = !authDisabled;
+    void saveKeys(
+      apiKeys,
+      next ? '已关闭鉴权：无启用 Key 时任何本机程序均可调用（不推荐）' : '已开启鉴权：未配置启用 Key 时请求将被拒绝',
+      next,
+    );
   };
 
   const addKey = () => {
@@ -912,9 +925,34 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
           </button>
         </div>
 
+        {/* 鉴权开关：无启用 Key 时的行为（默认拒绝；显式关闭后才放行） */}
+        <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-800/50">
+          <div>
+            <p className="font-medium text-slate-700 dark:text-zinc-200">鉴权开关</p>
+            <p className="text-slate-400 dark:text-zinc-500">
+              {authDisabled
+                ? '已关闭：未配置启用 Key 时任何本机程序均可调用（不推荐）'
+                : '已开启：未配置启用 Key 时请求将被拒绝并提示创建 Key'}
+            </p>
+          </div>
+          <button
+            className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
+              authDisabled
+                ? 'bg-amber-500/90 text-white hover:bg-amber-500'
+                : 'bg-emerald-500/90 text-white hover:bg-emerald-500'
+            }`}
+            onClick={toggleAuthDisabled}
+            disabled={keysSaving}
+          >
+            {authDisabled ? '关闭鉴权' : '开启鉴权'}
+          </button>
+        </div>
+
         {apiKeys.length === 0 ? (
           <p className="py-4 text-center text-sm text-slate-400">
-            暂无 Key — 添加后客户端凭 Key 调用，未配置启用 Key 时不鉴权
+            {authDisabled
+              ? '暂无 Key — 鉴权已关闭，任何本机程序无需 Key 即可调用'
+              : '暂无 Key — 请求将被拒绝；请添加并启用 Key，或关闭鉴权'}
           </p>
         ) : (
           <div className="overflow-x-auto">

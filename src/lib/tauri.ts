@@ -5,6 +5,7 @@ import type {
   ApiServiceStatus,
   ApiPoolFile,
   ApiKeyEntry,
+  ApiKeysFileView,
   AppLocate,
   CheckinDone,
   CheckinOpts,
@@ -270,15 +271,21 @@ export const api = {
     usageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_usage_stats', { days: days ?? null }),
     // T2：多 API Key 管理（统一列表，无主/子之分）
-    keysList: () => invoke<ApiKeyEntry[]>('api_keys_list'),
-    keysSave: (keys: ApiKeyEntry[]) => invoke('api_keys_save', { keys }),
+    keysList: () => invoke<ApiKeysFileView>('api_keys_list'),
+    // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）
+    keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
+      invoke('api_keys_save', { keys, authDisabled: authDisabled ?? null }),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),
     // 第一步：下载安装包（完成后返回本地路径，等待用户确认安装）
     // 注意：key 必须是 expectedVersion（Rust 参数 expected_version 的 Tauri 驼峰匹配），传 version 会报 missing required key
-    download: (p: { downloadUrl: string; assetName: string; expectedVersion: string }) =>
-      invoke<UpdateDownloaded>('update_download', p),
+    download: (p: {
+      downloadUrl: string;
+      assetName: string;
+      expectedVersion: string;
+      expectedSha256?: string | null;
+    }) => invoke<UpdateDownloaded>('update_download', p),
     // 第二步：启动安装器（/P /UPDATE /R，完成后自动重启应用）
     runInstaller: (p: { filePath: string; assetName: string }) =>
       invoke<void>('update_run_installer', p),

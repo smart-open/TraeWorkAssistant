@@ -33,6 +33,8 @@ pub struct UpdateCheckResult {
     /// 资产字节数
     pub size: u64,
     pub release_page: String,
+    /// 发布方提供的安装包 SHA256（取自 release 正文约定行；旧版本无此行时为 None，跳过校验）
+    pub sha256: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -187,8 +189,8 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         .ok_or("内置版本号解析失败")?;
     let releases = fetch_releases()?;
 
-    // 收集本产品线候选 release：(版本, tag, html_url, assets)
-    let mut candidates: Vec<((u64, u64, u64), String, String, Vec<serde_json::Value>)> =
+    // 收集本产品线候选 release：(版本, tag, html_url, assets, 正文)
+    let mut candidates: Vec<((u64, u64, u64), String, String, Vec<serde_json::Value>, String)> =
         Vec::new();
     for rel in &releases {
         if rel.get("draft").and_then(|v| v.as_bool()).unwrap_or(false)
@@ -206,6 +208,11 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
             .and_then(|v| v.as_str())
             .unwrap_or(RELEASES_PAGE)
             .to_string();
+        let body = rel
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let assets = rel
             .get("assets")
             .and_then(|v| v.as_array())
@@ -216,7 +223,7 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
             .or_else(|| pick_asset(&assets).and_then(|(name, _, _)| version_from_asset(&name)));
         if let Some(v) = version {
             if v >= PRODUCT_MIN_VERSION {
-                candidates.push((v, tag, html_url, assets));
+                candidates.push((v, tag, html_url, assets, body));
             }
         }
     }
@@ -224,7 +231,7 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
     let min_ver =
         format!("{}.{}.{}", PRODUCT_MIN_VERSION.0, PRODUCT_MIN_VERSION.1, PRODUCT_MIN_VERSION.2);
-    let (latest, tag, release_page, assets) = candidates
+    let (latest, tag, release_page, assets, body) = candidates
         .into_iter()
         .next()
         .ok_or_else(|| format!("发布页上没有找到本产品线（v{min_ver} 起）的 release。可手动查看：{RELEASES_PAGE}"))?;
@@ -237,6 +244,8 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
             "release（{tag}）的资产版本与 release 版本不一致，已中止。可手动查看：{RELEASES_PAGE}"
         ));
     }
+    // 完整性校验：从 release 正文提取本资产的 SHA256（发布约定行；旧版本正文无此行则跳过校验）
+    let sha256 = extract_sha256(&body, &asset_name);
 
     let has_update = cmp_version(latest, current) == std::cmp::Ordering::Greater;
     Ok(UpdateCheckResult {
@@ -247,7 +256,59 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         download_url,
         size,
         release_page,
+        sha256,
     })
+}
+
+/// 从 release 正文提取指定资产的 SHA256（64 位 hex）。
+/// 发布约定行：正文含同时出现资产名与 64 位 hex 的行（如 `SHA256(<资产名>): <hex>`）。
+/// 宽松匹配以兼容 `<hex> <资产名>`（sha256sum 风格）与 `SHA256: <hex> <资产名>` 等写法；
+/// 找不到（旧版本 release）返回 None，调用方跳过校验。
+fn extract_sha256(body: &str, asset_name: &str) -> Option<String> {
+    for line in body.lines() {
+        if line.contains(asset_name) {
+            if let Some(hex) = find_sha256_hex(line) {
+                return Some(hex);
+            }
+        }
+    }
+    None
+}
+
+/// 在单行内查找连续 64 位 hex（前后不接 hex 字符），避免把版本号数字等混入拼接。
+fn find_sha256_hex(line: &str) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let is_hex = |c: char| c.is_ascii_hexdigit();
+    let n = chars.len();
+    if n < 64 {
+        return None;
+    }
+    for i in 0..=(n - 64) {
+        if chars[i..i + 64].iter().all(|c| is_hex(*c))
+            && (i == 0 || !is_hex(chars[i - 1]))
+            && (i + 64 == n || !is_hex(chars[i + 64]))
+        {
+            return Some(chars[i..i + 64].iter().collect::<String>().to_lowercase());
+        }
+    }
+    None
+}
+
+/// 流式计算文件 SHA256（64KB 缓冲，支持大安装包）。
+fn file_sha256(path: &std::path::Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("打开安装包失败: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| format!("读取安装包失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// 下载结果（供前端「确认二：安装」使用）
@@ -294,6 +355,7 @@ pub fn update_download(
     download_url: String,
     asset_name: String,
     expected_version: String,
+    expected_sha256: Option<String>,
 ) -> Result<UpdateDownloaded, String> {
     validate_target(&asset_name, &expected_version)?;
 
@@ -326,6 +388,17 @@ pub fn update_download(
     {
         match download_via(&app, &agent, &download_url, &dest) {
             Ok(received) => {
+                // 完整性校验：发布方提供 SHA256 时必须匹配，不匹配删除文件并中止（防供应链篡改）
+                if let Some(expected) = expected_sha256.as_deref().map(str::to_lowercase) {
+                    let actual = file_sha256(&dest).unwrap_or_default();
+                    if actual != expected {
+                        let _ = std::fs::remove_file(&dest);
+                        return Err(format!(
+                            "安装包完整性校验失败（SHA256 不匹配），已删除下载文件。\
+                             可能为网络劫持或下载损坏，请重试或手动下载：{RELEASES_PAGE}"
+                        ));
+                    }
+                }
                 let _ = app.emit(
                     "update-download-progress",
                     DownloadProgress { received, total: received, percent: 100 },

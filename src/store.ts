@@ -100,7 +100,7 @@ interface AppState {
   refreshAccounts: () => Promise<void>;
   refreshGroups: () => Promise<void>;
   refreshSettings: () => Promise<void>;
-  refreshLogs: (q?: LogQuery) => Promise<void>;
+  refreshLogs: (q?: LogQuery, manual?: boolean) => Promise<void>;
   refreshCreditsHistory: () => Promise<void>;
   refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
@@ -179,6 +179,11 @@ function defaultSettings(): Settings {
     api_default_model: 'deepseek-v4-flash',
   };
 }
+
+// 日志轮询去重：上一轮未返回时跳过本轮（防 2s 轮询堆积与旧响应乱序覆盖）
+let logsPollInflight = false;
+// 同因 toast 限频：读取持续失败期间每 60s 最多弹一次（防 toast 风暴）；手动调用直通
+let lastLogsErrToastAt = 0;
 
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
@@ -374,7 +379,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast(
         e.failed > 0 ? 'warn' : 'success',
         // 空轮次：过滤后无候选（全部已签/过期/冷却中），给用户明确文案而非「成功 0 已签 0 失败 0」
-        (e as { empty?: boolean }).empty
+        e.empty
           ? '没有需要签到的账号（全部已签/过期/冷却中）'
           : `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
       );
@@ -444,7 +449,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ settings: defaultSettings() });
     }
   },
-  refreshLogs: async (q) => {
+  refreshLogs: async (q, manual) => {
+    if (logsPollInflight && !manual) return;
+    logsPollInflight = true;
     try {
       const logs = await api.misc.logsQuery({
         logType: q?.logType,
@@ -454,7 +461,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
       set({ logs });
     } catch (err) {
-      get().pushToast('error', `读取日志失败：${String(err)}`);
+      const now = Date.now();
+      if (manual || now - lastLogsErrToastAt > 60_000) {
+        lastLogsErrToastAt = now;
+        get().pushToast('error', `读取日志失败：${String(err)}`);
+      }
+    } finally {
+      logsPollInflight = false;
     }
   },
   refreshCreditsHistory: async () => {
