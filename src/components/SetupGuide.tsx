@@ -22,6 +22,7 @@ export default function SetupGuide() {
   const startProxy = useAppStore((s) => s.startProxy);
   const refreshEnv = useAppStore((s) => s.refreshEnv);
   const refreshCert = useAppStore((s) => s.refreshCert);
+  const toast = useAppStore((s) => s.pushToast);
 
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -45,8 +46,16 @@ export default function SetupGuide() {
       done: certInstalled,
       actionLabel: '安装证书',
       run: async () => {
-        await api.cert.install();
-        await refreshCert();
+        try {
+          await api.cert.install();
+          await refreshCert();
+          toast('success', '证书安装成功');
+        } catch (e) {
+          // Rust 侧 cert_install 已带真实原因（如缺 cryptography 依赖），
+          // 这里必须弹 toast，否则用户看到的就是「点了没反应」
+          toast('error', `证书安装失败：${String(e)}`);
+          throw e;
+        }
       },
     },
     {
