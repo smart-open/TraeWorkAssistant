@@ -304,7 +304,13 @@ def log(*a):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] " + " ".join(str(x) for x in a)
     with _log_lock:
-        print(line, flush=True)
+        # print 必须同样容错：父进程（Rust 侧）退出后本进程可能成为孤儿，
+        # stdout 管道断开会让 print(..., flush=True) 抛 OSError 并把调用方线程
+        # 直接杀死——表现为客户端连接被静默掐断、且日志查不到任何线索（Issue #7）。
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
         try:
             _logf.write(line + "\n")
         except Exception:
@@ -1648,8 +1654,11 @@ def handle_client(conn, addr):
                 tunnel_raw(conn, host, port)
                 return
             matched = next((d for d in TARGET_DOMAINS if host == d or host.endswith("." + d)), None)
-            log(f"CONNECT {host}:{port}  [TRAE/MITM] 匹配域名: {matched}")
+            # 先回 200 再记日志：与 tunnel_raw() 保持一致（Issue #7）。
+            # 若反过来（先 log 后 sendall），任何日志异常都会先把线程打死，
+            # 客户端永远等不到 200——表现为「目标域名全部打不开且日志无记录」。
             conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            log(f"CONNECT {host}:{port}  [TRAE/MITM] 匹配域名: {matched}")
             # TRAE 域名：MITM 解密以捕获 JWT
             cpath, kpath = leaf_cert(host)
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1716,8 +1725,19 @@ def main():
         load_accounts()  # 预热 accounts 缓存
         sync_account_devices()  # 升级历史假占位符设备标识
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((LISTEN_HOST, LISTEN_PORT))
+    # 不用 SO_REUSEADDR（Issue #7 根因 1）：Windows 上它允许多个套接字绑定同一
+    # addr:port 且不报错，会让上次泄漏的代理进程仍在接客、本次却「假启动」，
+    # 新实例收不到任何连接（目标域名全部打不开、日志无记录）。
+    # SO_EXCLUSIVEADDRUSE：Windows 专用，显式独占——端口被占时 bind 直接 WSAEADDRINUSE。
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    try:
+        srv.bind((LISTEN_HOST, LISTEN_PORT))
+    except OSError as e:
+        # 失败必须立刻退出并带回明确原因（Rust 侧另有存活检测兜底，
+        # 不会把「进程秒退」误报成「启动成功」）。
+        log(f"[fatal] 端口 {LISTEN_HOST}:{LISTEN_PORT} 绑定失败（{e}）。"
+            f"通常由上一次未退出的代理进程占用，请结束后重试。")
+        return 2
     srv.listen(128)
     log(f"代理已启动: {LISTEN_HOST}:{LISTEN_PORT}  (TRAE 多域 MITM 拦截 + JWT 自动捕获)")
     log("监听 TRAE 域名: " + ", ".join("*." + d for d in TARGET_DOMAINS))
