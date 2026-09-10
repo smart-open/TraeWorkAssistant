@@ -50,7 +50,7 @@ fn short_agent() -> ureq::Agent {
 }
 
 /// 生成随机 hex 字符串
-fn random_hex(len: usize) -> String {
+pub(crate) fn random_hex(len: usize) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
