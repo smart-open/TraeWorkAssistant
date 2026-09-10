@@ -44,6 +44,30 @@ def walk_copy(src, dst, skip_dirs=("__pycache__", ".git")):
             shutil.copy2(s, t)
 
 
+def _glob_has_match(pattern):
+    import glob as _glob
+    return bool(_glob.glob(pattern))
+
+
+def copy_resource(src_abs, dest, res_dir):
+    """resources key 既可为目录（递归复制），也可为 glob 模式（逐文件平铺/按相对路径复制）"""
+    import glob as _glob
+    target = os.path.join(res_dir, dest)
+    if os.path.isdir(src_abs):
+        walk_copy(src_abs, target)
+        return
+    matches = _glob.glob(src_abs)
+    if not matches:
+        print("WARN: 资源模式无匹配:", src_abs, file=sys.stderr)
+        return
+    os.makedirs(target, exist_ok=True)
+    for m in matches:
+        if os.path.isdir(m):
+            walk_copy(m, os.path.join(target, os.path.basename(m)))
+        else:
+            shutil.copy2(m, os.path.join(target, os.path.basename(m)))
+
+
 def main():
     conf = load_conf()
     product = conf["productName"]
@@ -87,11 +111,10 @@ def main():
     # 2) 资源按 Tauri 布局放入 resources/
     res_dir = os.path.join(stage_app, "resources")
     for src_abs, dest in abs_res.items():
-        if not os.path.isdir(src_abs):
+        if not os.path.isdir(src_abs) and not _glob_has_match(src_abs):
             print("WARN: 资源目录缺失:", src_abs, file=sys.stderr)
             continue
-        target = os.path.join(res_dir, dest)
-        walk_copy(src_abs, target)
+        copy_resource(src_abs, dest, res_dir)
 
     # 3) 打包（保留内部目录结构，顶层为产品名文件夹）
     print("正在打包:", zip_path)

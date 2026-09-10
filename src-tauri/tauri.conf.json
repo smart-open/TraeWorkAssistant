@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": "python scripts/prepare_python_runtime.py && npm run dev",
+    "beforeBuildCommand": "python scripts/prepare_python_runtime.py && npm run build"
   },
   "app": {
     "windows": [
@@ -33,8 +33,8 @@
     "targets": ["msi", "nsis"],
     "icon": ["icons/icon.ico"],
     "resources": {
-      "../src-python/": "python/",
-      "../src-ps/": "ps/"
+      "../src-ps/": "ps/",
+      "target/python-runtime/": "python/"
     },
     "shortDescription": "AI Work 多账号签到与管理助手",
     "longDescription": "整合多账号签到、登录态切换、设备隔离与账号分组的 Windows 桌面端工具，支持 Trae / WorkBuddy / 豆包等多应用扩展。",

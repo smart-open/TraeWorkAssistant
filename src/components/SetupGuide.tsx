@@ -1,4 +1,4 @@
-﻿import { useState } from 'react';
+import { useState } from 'react';
 import { CheckCircle2, Circle, ChevronRight, Info } from 'lucide-react';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
@@ -92,6 +92,8 @@ export default function SetupGuide() {
   const completed = steps.filter((s) => s.done).length;
   const allDone = completed === steps.length;
 
+  const toast = useAppStore((s) => s.pushToast);
+
   // 未完成 + 当前非 busy 才允许执行；校验失败（done=true）时按钮不渲染，天然禁止重复处理
   const handleRun = async (step: Step) => {
     if (step.done || busy) return;
@@ -99,8 +101,8 @@ export default function SetupGuide() {
     try {
       await step.run();
     } catch (e) {
-      // 错误已由各 step.run() 内部 toast 处理；此处兜底防止未捕获异常
-      console.error(`[SetupGuide] step "${step.key}" failed:`, e);
+      // proxy 等步骤内部已有 toast；cert 等纯 invoke 步骤的错误在此兜底弹出（issue #6：静默吞错导致"点了没反应"）
+      toast('error', String(e));
     } finally {
       setBusy(null);
     }

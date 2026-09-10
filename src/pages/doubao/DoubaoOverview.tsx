@@ -92,7 +92,8 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
     try {
       await step.run();
     } catch (e) {
-      console.error(`[DoubaoSetupGuide] step "${step.key}" failed:`, e);
+      // 兜底弹出真实错误（issue #6：静默吞错导致"点了没反应"）
+      pushToast('error', String(e));
     } finally {
       setBusy(null);
     }
