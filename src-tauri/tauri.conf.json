@@ -6,7 +6,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "npm run dev:vite",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "python scripts/prepare_python_runtime.py && npm run build"
   },
   "app": {
     "windows": [

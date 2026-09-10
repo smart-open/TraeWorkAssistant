@@ -20,6 +20,19 @@ jobs:
           node-version: 20
           cache: npm
 
+      # 内嵌 Python 运行时的 ABI 依赖：构建机 Python 版本必须与
+      # scripts/prepare_python_runtime.py 的 --py-version 默认值一致
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Cache embeddable Python zip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\TraeWorkAssistant\build-cache
+          key: python-embed-3.13.12-amd64
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
