@@ -360,7 +360,7 @@ export interface UsageDayView {
   key_tokens: UsageKeyTokenView[];
 }
 
-/** API Key 条目（data/api_keys.json；daily_limit=0 表示不限，T2） */
+/** API Key 条目（data/api_keys.json；daily_limit=0 表示不限，T2；F-35 子 Key 体系批次3） */
 export interface ApiKeyEntry {
   id: string;
   name: string;
@@ -370,6 +370,20 @@ export interface ApiKeyEntry {
   created_at: number;
   used_date: string;
   used_today: number;
+  /** 限定上游（WB 上游账号 uid 白名单；空 = 不限） */
+  allowed_accounts: string[];
+  /** 调度模式：expire_first（默认，临期优先）| dedicated（专一） */
+  schedule_mode: string;
+  /** 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个） */
+  dedicated_account: string;
+  /** 按日请求统计（升序，保留最近 90 天） */
+  daily_stats: ApiKeyDailyStat[];
+}
+
+/** 子 Key 按日统计项（F-35） */
+export interface ApiKeyDailyStat {
+  date: string;
+  requests: number;
 }
 
 // ---- 登录态快照 ----
@@ -612,6 +626,146 @@ export interface WorkBuddySettings {
   growth_travel: boolean;
   growth_lottery: boolean;
   growth_tasks: boolean;
+  /** CLI 五重防护自动轮换（F-59） */
+  cli_rotate_enabled: boolean;
+  cli_rotate_interval_minutes: number;
+  cli_cooldown_minutes: number;
+  cli_min_gap_hours: number;
+  cli_min_urgency_hours: number;
+  cli_active_guard_minutes: number;
+  cli_min_remaining_credits: number;
+  /** 失败通知渠道（F-19）：空 = 关闭 */
+  notify_wechat_webhook: string | null;
+  notify_serverchan_sendkey: string | null;
+}
+
+/** 账号库导入结果（F-46 扩展） */
+export interface WbPoolImportResult {
+  added: number;
+  skipped: number;
+  with_credentials: number;
+}
+
+// ---- CodeBuddy CLI 切号桥（F-06/F-59，批次3；Rust workbuddy_cli.rs + commands）----
+export interface WbCliStatus {
+  settings_present: boolean;
+  env_token_present: boolean;
+  /** 进程环境变量 CODEBUDDY_AUTH_TOKEN 存在（会覆盖 settings.json，需删除） */
+  environment_override: boolean;
+  active_account_id: string | null;
+  active_account_name: string | null;
+  /** CLI 最近会话写入时间（Unix 毫秒；活跃保护数据源） */
+  recent_activity_ms: number | null;
+  last_switch_at_ms: number | null;
+  config: Pick<
+    WorkBuddySettings,
+    | 'cli_rotate_enabled'
+    | 'cli_rotate_interval_minutes'
+    | 'cli_cooldown_minutes'
+    | 'cli_min_gap_hours'
+    | 'cli_min_urgency_hours'
+    | 'cli_active_guard_minutes'
+    | 'cli_min_remaining_credits'
+  >;
+}
+
+export interface WbCliRotateResult {
+  status: 'switched' | 'skipped' | 'error';
+  reason?: string;
+  error?: string;
+  to?: { id: string; name: string };
+}
+
+export interface WbCliRotateLog {
+  ts: number;
+  action: 'noop' | 'skipped' | 'switched' | 'error' | 'manual';
+  reason: string | null;
+  from: string | null;
+  to: { id: string; name: string } | null;
+  detail?: { name: string; remaining: number; soonest_expire_at: number | null; valid: boolean; error: string | null }[];
+}
+
+// ---- OAuth 扫码 + 环境重置（F-50/F-14，批次3）----
+/** OAuth 流程进度事件（wb-oauth-progress） */
+export interface WbOauthProgress {
+  stage: 'init' | 'browser' | 'polling' | 'success' | 'error';
+  message: string;
+  auth_url?: string | null;
+}
+
+/** OAuth 流程结果事件（wb-oauth-done） */
+export interface WbOauthDone {
+  ok: boolean;
+  id?: string;
+  nickname?: string;
+  message: string;
+}
+
+/** 环境重置清单项（F-14：16 项认证残留清理） */
+export interface WbResetItem {
+  id: string;
+  label: string;
+  detail: string;
+  exists: boolean;
+}
+
+/** 环境重置单项执行结果 */
+export interface WbResetResult {
+  id: string;
+  ok: boolean;
+  detail: string;
+}
+
+// ---- 本地 Token 统计 + 官方用量（F-25/26/57/58，批次3）----
+/** 聚合数字组（本地统计各组通用，snake_case 对齐 Rust 输出） */
+export interface WbTokenAgg {
+  total: number;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  uncached_input: number;
+  calls: number;
+  cache_hit_rate?: number | null;
+  date?: string;
+  key?: string;
+}
+
+/** 本地 Token 统计（F-26：JSONL 解析合并双源，365 天窗口） */
+export interface WbTokenStats {
+  source: string;
+  summary: WbTokenAgg;
+  models: WbTokenAgg[];
+  projects: WbTokenAgg[];
+  daily: WbTokenAgg[];
+  daily_by_model: Record<string, WbTokenAgg[]>;
+  files_scanned: number;
+  parse_errors: number;
+  coverage_start_at: number | null;
+  coverage_end_at: number | null;
+  generated_at: number;
+  window_days: number;
+}
+
+/** 官方按模型用量点（get-user-request-usage） */
+export interface WbUsageModelPoint {
+  model: string;
+  request_count: number;
+  credit: number;
+}
+
+/** 官方请求用量（F-25：近 31 天窗口） */
+export interface WbUsageOfficial {
+  status: 'complete' | 'unavailable';
+  account_id: string;
+  domain: string;
+  range_start: string;
+  range_end: string;
+  fetched_at_ms: number;
+  request_count_total: number;
+  summary: { usage_today: number; usage_7days: number; usage_this_month: number };
+  daily: { date: string; usage: number; models: WbUsageModelPoint[] }[];
+  models: WbUsageModelPoint[];
 }
 
 /** 积分包（workbuddy_credits.py 宽容解析输出） */

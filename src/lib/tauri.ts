@@ -47,6 +47,16 @@ import type {
   WorkBuddySettings,
   WbCreditsResult,
   WbCheckinRecord,
+  WbCliStatus,
+  WbCliRotateResult,
+  WbCliRotateLog,
+  WbOauthDone,
+  WbOauthProgress,
+  WbResetItem,
+  WbResetResult,
+  WbTokenStats,
+  WbUsageOfficial,
+  WbPoolImportResult,
 } from '../types';
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
@@ -265,6 +275,41 @@ export const api = {
       invoke<WbCreditsResult>('workbuddy_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
     settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
     settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),
+    // CLI 切号桥 + 五重防护轮换（F-06/F-59，批次3）
+    cliStatus: () => invoke<WbCliStatus>('workbuddy_cli_status'),
+    cliBridgeSet: (userId: string) => invoke<WbCliStatus>('workbuddy_cli_bridge_set', { userId }),
+    cliRotateRun: () => invoke<WbCliRotateResult>('workbuddy_cli_rotate_run'),
+    cliRotateLogs: (limit?: number) =>
+      invoke<WbCliRotateLog[]>('workbuddy_cli_rotate_logs', { limit: limit ?? null }),
+    // 会话三件套备份/恢复 + 复制迁移（F-44/F-45，批次3）
+    chatdataBackup: (userId: string) =>
+      invoke<{ ok: boolean; files: number; path: string }>('workbuddy_chatdata_backup', { userId }),
+    chatdataRestore: (userId: string) =>
+      invoke<{ ok: boolean; files: number }>('workbuddy_chatdata_restore', { userId }),
+    chatdataInfo: (userId: string) =>
+      invoke<{ backed: boolean; size_bytes?: number; files?: number; backed_at?: string; has_edge_mapping?: boolean }>(
+        'workbuddy_chatdata_info',
+        { userId },
+      ),
+    chatdataCopy: (sourceUserId: string, targetUserId: string) =>
+      invoke<{ ok: boolean; copied: number; total_lines: number; sessions_cloned: number; mappings_registered: number }>(
+        'workbuddy_chatdata_copy',
+        { sourceUserId, targetUserId },
+      ),
+    // 账号库导入导出扩展（F-46，批次3）
+    accountsExport: (includeCredentials?: boolean) =>
+      invoke<Record<string, unknown>>('workbuddy_accounts_export', { includeCredentials: includeCredentials ?? null }),
+    accountsImport: (payload: Record<string, unknown>) =>
+      invoke<WbPoolImportResult>('workbuddy_accounts_import', { payload }),
+    // OAuth 扫码 + 环境重置（F-50/F-14，批次3）
+    oauthLogin: () => invoke<void>('workbuddy_oauth_login'),
+    envResetItems: () => invoke<WbResetItem[]>('workbuddy_env_reset_items'),
+    envReset: (items: string[], keycloakLogout: boolean) =>
+      invoke<WbResetResult[]>('workbuddy_env_reset', { items, keycloakLogout }),
+    // 官方用量 + 本地 Token 统计（F-25/26/57/58，批次3）
+    usageOfficial: (userId?: string, fresh?: boolean) =>
+      invoke<WbUsageOfficial>('workbuddy_usage_official', { userId: userId ?? null, fresh: fresh ?? null }),
+    tokenStats: () => invoke<WbTokenStats>('workbuddy_token_stats'),
   },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),

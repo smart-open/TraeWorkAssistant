@@ -93,6 +93,8 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
         "Trae" => vec!["Trae CN.exe"],
         // 豆包桌面版（Chromium 壳，主进程即 Doubao.exe）
         "Doubao" => vec!["Doubao.exe"],
+        // WorkBuddy 桌面版（批次3 会话备份/恢复前置关闭）
+        "WorkBuddy" => vec!["WorkBuddy.exe"],
         _ => vec![],
     }
 }

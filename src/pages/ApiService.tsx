@@ -28,7 +28,7 @@ import {
   YAxis,
 } from 'recharts';
 import PageHeader from '../components/PageHeader';
-import { Badge, StatCard } from '../components/ui';
+import { Badge, StatCard, Modal } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
@@ -75,6 +75,12 @@ export default function ApiService() {
   const [newKeyName, setNewKeyName] = useState('');
   const [newKeyLimit, setNewKeyLimit] = useState(0);
   const [newKeyValue, setNewKeyValue] = useState('');
+  // F-35 子 Key 配置弹框 + 删除确认（禁 window.confirm，红线）
+  const [editKey, setEditKey] = useState<ApiKeyEntry | null>(null);
+  const [editAllowed, setEditAllowed] = useState<Set<string>>(new Set());
+  const [editMode, setEditMode] = useState('expire_first');
+  const [editDedicated, setEditDedicated] = useState('');
+  const [deleteForKey, setDeleteForKey] = useState<ApiKeyEntry | null>(null);
 
   useEffect(() => {
     void refreshSettings();
@@ -120,7 +126,8 @@ export default function ApiService() {
   const generateKeyValue = useCallback(() => {
     const buf = new Uint8Array(24);
     crypto.getRandomValues(buf);
-    setNewKeyValue('sk-' + [...buf].map((b) => b.toString(16).padStart(2, '0')).join(''));
+    // F-35：子 Key 统一 ck_ 前缀（旧 sk- Key 仍兼容鉴权）
+    setNewKeyValue('ck_' + [...buf].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32));
   }, []);
 
   useEffect(() => {
@@ -147,8 +154,8 @@ export default function ApiService() {
       toast('error', '请填写 Key 名称');
       return;
     }
-    if (!newKeyValue.startsWith('sk-')) {
-      toast('error', 'Key 值无效，请重新生成');
+    if (!newKeyValue.startsWith('ck_') && !newKeyValue.startsWith('sk-')) {
+      toast('error', 'Key 值无效（需 ck_ 或 sk- 前缀），请重新生成');
       return;
     }
     if (apiKeys.some((k) => k.key === newKeyValue)) {
@@ -164,6 +171,10 @@ export default function ApiService() {
       created_at: Math.floor(Date.now() / 1000),
       used_date: '',
       used_today: 0,
+      allowed_accounts: [],
+      schedule_mode: 'expire_first',
+      dedicated_account: '',
+      daily_stats: [],
     };
     void saveKeys([...apiKeys, entry], `Key「${name}」已添加`);
     setNewKeyName('');
@@ -177,8 +188,38 @@ export default function ApiService() {
   };
 
   const deleteKey = (k: ApiKeyEntry) => {
-    if (!confirm(`确认删除 Key「${k.name}」？使用该 Key 的客户端将立即无法访问。`)) return;
-    void saveKeys(apiKeys.filter((x) => x.id !== k.id), `Key「${k.name}」已删除`);
+    setDeleteForKey(k);
+  };
+
+  const confirmDeleteKey = async () => {
+    if (!deleteForKey) return;
+    const k = deleteForKey;
+    setDeleteForKey(null);
+    await saveKeys(apiKeys.filter((x) => x.id !== k.id), `Key「${k.name}」已删除`);
+  };
+
+  // 子 Key 配置弹框（F-35）：限定上游 + 专一/临期优先 + 按日统计展示
+  const openKeyEdit = (k: ApiKeyEntry) => {
+    setEditKey(k);
+    setEditAllowed(new Set(k.allowed_accounts));
+    setEditMode(k.schedule_mode || 'expire_first');
+    setEditDedicated(k.dedicated_account || '');
+  };
+
+  const confirmKeyEdit = () => {
+    if (!editKey) return;
+    const next = apiKeys.map((k) =>
+      k.id === editKey.id
+        ? {
+            ...k,
+            allowed_accounts: [...editAllowed],
+            schedule_mode: editMode,
+            dedicated_account: editMode === 'dedicated' ? editDedicated : '',
+          }
+        : k,
+    );
+    void saveKeys(next, `Key「${editKey.name}」调度配置已更新`);
+    setEditKey(null);
   };
 
   const updateKeyLimit = (id: string, limit: number) => {
@@ -925,6 +966,7 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                   <th className="pb-2 pr-4 font-medium">Key</th>
                   <th className="pb-2 pr-4 font-medium">日限额(次)</th>
                   <th className="pb-2 pr-4 font-medium">今日已用(次/tok)</th>
+                  <th className="pb-2 pr-4 font-medium">调度</th>
                   <th className="pb-2 pr-4 font-medium">状态</th>
                   <th className="pb-2 font-medium">操作</th>
                 </tr>
@@ -977,6 +1019,18 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                         {ktTotal > 0 && ` · ${fmtTokens(ktTotal)} tok`}
                       </td>
                       <td className="py-2 pr-4">
+                        {(k.schedule_mode || 'expire_first') === 'dedicated' ? (
+                          <Badge tone="violet">专一</Badge>
+                        ) : (
+                          <Badge tone="slate">临期优先</Badge>
+                        )}
+                        {k.allowed_accounts.length > 0 && (
+                          <span className="ml-1 text-xs text-slate-400" title={k.allowed_accounts.join(', ')}>
+                            限{k.allowed_accounts.length}账号
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2 pr-4">
                         {k.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
                       </td>
                       <td className="py-2">
@@ -1001,6 +1055,13 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                           </button>
                           <button
                             className="btn-ghost !p-1.5"
+                            title="调度配置（限定上游 / 专一 / 临期优先）"
+                            onClick={() => openKeyEdit(k)}
+                          >
+                            <BarChart3 size={14} />
+                          </button>
+                          <button
+                            className="btn-ghost !p-1.5"
                             title="删除"
                             onClick={() => deleteKey(k)}
                             disabled={keysSaving}
@@ -1017,6 +1078,122 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
           </div>
         )}
       </div>
+
+      {/* 子 Key 调度配置弹框（F-35：限定上游 + 专一/临期优先 + 按日统计） */}
+      <Modal
+        open={editKey != null}
+        onClose={() => setEditKey(null)}
+        title={`调度配置 · ${editKey?.name ?? ''}`}
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setEditKey(null)}>取消</button>
+            <button className="btn-primary" onClick={confirmKeyEdit} disabled={keysSaving}>保存</button>
+          </>
+        }
+      >
+        <div className="space-y-4 text-sm">
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-slate-500">调度模式</div>
+            <div className="flex gap-2">
+              {[
+                { key: 'expire_first', label: '临期优先', desc: '按积分最早到期取上游' },
+                { key: 'dedicated', label: '专一', desc: '固定绑定单一上游账号' },
+              ].map((m) => (
+                <button
+                  key={m.key}
+                  className={`flex-1 rounded-lg border p-2.5 text-left text-xs ${editMode === m.key ? 'border-indigo-400 bg-indigo-50 dark:bg-indigo-500/10' : 'border-slate-200 dark:border-zinc-700'}`}
+                  onClick={() => setEditMode(m.key)}
+                >
+                  <div className="font-medium">{m.label}</div>
+                  <div className="mt-0.5 text-slate-400">{m.desc}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+          {editMode === 'dedicated' && (
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-500">专一账号</span>
+              <select className="input w-full" value={editDedicated} onChange={(e) => setEditDedicated(e.target.value)}>
+                <option value="">— 默认取限定上游首个 —</option>
+                {poolStatus.map((p) => (
+                  <option key={p.uid} value={p.uid}>
+                    {p.name || p.uid}
+                    {p.credits != null ? `（${p.credits.toFixed(1)} 积分）` : ''}
+                  </option>
+                ))}
+              </select>
+              {poolStatus.length === 0 && (
+                <span className="mt-1 block text-xs text-amber-500">服务未运行，暂无上游账号候选；可保存后稍后调整。</span>
+              )}
+            </label>
+          )}
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-slate-500">
+              限定上游<span className="ml-1 font-normal text-slate-400">（不勾选 = 使用全部上游账号）</span>
+            </div>
+            <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2 dark:border-zinc-700">
+              {poolStatus.length === 0 ? (
+                <div className="py-2 text-center text-xs text-slate-400">服务未运行，暂无上游账号候选</div>
+              ) : (
+                poolStatus.map((p) => (
+                  <label key={p.uid} className="flex items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={editAllowed.has(p.uid)}
+                      onChange={() => {
+                        const next = new Set(editAllowed);
+                        if (next.has(p.uid)) next.delete(p.uid);
+                        else next.add(p.uid);
+                        setEditAllowed(next);
+                      }}
+                    />
+                    <span className="truncate">{p.name || p.uid}</span>
+                    {p.credits != null && <span className="ml-auto tabular-nums text-slate-400">{p.credits.toFixed(1)}</span>}
+                  </label>
+                ))
+              )}
+            </div>
+          </div>
+          {editKey && (editKey.daily_stats?.length ?? 0) > 0 && (
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-slate-500">近 7 日请求统计</div>
+              <div className="flex items-end gap-1.5">
+                {editKey.daily_stats.slice(-7).map((d) => {
+                  const max = Math.max(...editKey.daily_stats.slice(-7).map((x) => x.requests), 1);
+                  return (
+                    <div key={d.date} className="flex flex-1 flex-col items-center gap-1" title={`${d.date}：${d.requests} 次`}>
+                      <span className="text-[10px] tabular-nums text-slate-400">{d.requests}</span>
+                      <div
+                        className="w-full rounded-t bg-indigo-400"
+                        style={{ height: `${Math.max(4, (d.requests / max) * 40)}px` }}
+                      />
+                      <span className="text-[10px] text-slate-400">{d.date.slice(5)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      </Modal>
+
+      {/* Key 删除确认弹框（禁 window.confirm，红线） */}
+      <Modal
+        open={deleteForKey != null}
+        onClose={() => setDeleteForKey(null)}
+        title="删除 API Key"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setDeleteForKey(null)}>取消</button>
+            <button className="btn-primary !bg-rose-600 hover:!bg-rose-500" onClick={() => void confirmDeleteKey()}>确认删除</button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          确认删除 Key「{deleteForKey?.name}」？
+          <div className="mt-1 text-xs text-slate-400">使用该 Key 的客户端将立即无法访问（401）。</div>
+        </div>
+      </Modal>
 
       {/* 运行中池状态详情 */}
       {running && poolStatus.length > 0 && (

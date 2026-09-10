@@ -1,17 +1,35 @@
-import { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, Download, Upload, UserPlus, ScanLine, LayoutGrid, Rows3 } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  RefreshCw,
+  Download,
+  Upload,
+  UserPlus,
+  ScanLine,
+  LayoutGrid,
+  Rows3,
+  ShieldAlert,
+} from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState, Modal, Spinner } from '../../components/ui';
 import { Users } from 'lucide-react';
+import { listen } from '@tauri-apps/api/event';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import AccountCard from './AccountCard';
-import type { WorkBuddyAccountView, WbCreditPackage, WbCreditsResult } from '../../types';
+import type {
+  WorkBuddyAccountView,
+  WbCreditPackage,
+  WbCreditsResult,
+  WbOauthDone,
+  WbOauthProgress,
+  WbResetItem,
+  WbResetResult,
+} from '../../types';
 
 /**
- * buddy-accounts 账号管理（§3.7.2，F-54/F-56/F-60）：
- * 聚合迁移入口（导入本机账号 / 导出）+ 双态卡片区 + 积分包明细弹窗。
+ * buddy-accounts 账号管理（§3.7.2，F-54/F-56/F-60/F-50/F-14）：
+ * 聚合迁移入口（OAuth 扫码 / 导入本机账号 / 导入导出）+ 双态卡片区 + 积分包明细弹窗 + 环境重置。
  */
 export default function BuddyAccounts() {
   const pushToast = useAppStore((s) => s.pushToast);
@@ -26,9 +44,28 @@ export default function BuddyAccounts() {
   const [scanPreview, setScanPreview] = useState<{ nickname: string; uid: string; exists: boolean } | null>(null);
   const [detailFor, setDetailFor] = useState<WorkBuddyAccountView | null>(null);
   const [deleteFor, setDeleteFor] = useState<WorkBuddyAccountView | null>(null);
+  const [restoreFor, setRestoreFor] = useState<WorkBuddyAccountView | null>(null);
+  const [copyFor, setCopyFor] = useState<WorkBuddyAccountView | null>(null);
+  const [copyTarget, setCopyTarget] = useState('');
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportWithCreds, setExportWithCreds] = useState(false);
+  const importFileRef = useRef<HTMLInputElement>(null);
   const [editFor, setEditFor] = useState<WorkBuddyAccountView | null>(null);
   const [editName, setEditName] = useState('');
   const [cardView, setCardView] = useState(true);
+  // OAuth 扫码（F-50）：事件驱动弹框（后端全流程，进度经 wb-oauth-progress / 结果 wb-oauth-done）
+  const [oauthOpen, setOauthOpen] = useState(false);
+  const [oauthStage, setOauthStage] = useState('');
+  const [oauthMessage, setOauthMessage] = useState('');
+  const [oauthAuthUrl, setOauthAuthUrl] = useState<string | null>(null);
+  // 环境重置（F-14）：16 项勾选预览 → 二次确认 → 执行结果
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetItems, setResetItems] = useState<WbResetItem[]>([]);
+  const [resetChecked, setResetChecked] = useState<Set<string>>(new Set());
+  const [resetKeycloak, setResetKeycloak] = useState(true);
+  const [resetConfirming, setResetConfirming] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetResults, setResetResults] = useState<WbResetResult[] | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -55,6 +92,91 @@ export default function BuddyAccounts() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // OAuth 事件监听（F-50）：仅弹框打开期间订阅，关闭即解绑
+  useEffect(() => {
+    if (!oauthOpen) return;
+    const un1 = listen<WbOauthProgress>('wb-oauth-progress', (e) => {
+      setOauthStage(e.payload.stage);
+      setOauthMessage(e.payload.message);
+      if (e.payload.auth_url) setOauthAuthUrl(e.payload.auth_url);
+    });
+    const un2 = listen<WbOauthDone>('wb-oauth-done', (e) => {
+      if (e.payload.ok) {
+        setOauthStage('success');
+        setOauthMessage(e.payload.message);
+        pushToast('success', e.payload.message);
+        void refresh();
+        setTimeout(() => setOauthOpen(false), 1200);
+      } else {
+        setOauthStage('error');
+        setOauthMessage(e.payload.message);
+      }
+    });
+    return () => {
+      void un1.then((f) => f());
+      void un2.then((f) => f());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [oauthOpen]);
+
+  // 发起 OAuth 扫码（后端打开浏览器 + 轮询 + 自动入池）
+  const startOauth = async () => {
+    setOauthStage('init');
+    setOauthMessage('正在发起扫码登录…');
+    setOauthAuthUrl(null);
+    setOauthOpen(true);
+    try {
+      await api.workbuddy.oauthLogin();
+    } catch (err) {
+      setOauthStage('error');
+      setOauthMessage(String(err));
+    }
+  };
+
+  // 打开环境重置弹框：拉取 16 项清单（默认勾选所有存在项）
+  const openEnvReset = async () => {
+    try {
+      const items = await api.workbuddy.envResetItems();
+      setResetItems(items);
+      setResetChecked(new Set(items.filter((x) => x.exists).map((x) => x.id)));
+      setResetResults(null);
+      setResetConfirming(false);
+      setResetOpen(true);
+    } catch (err) {
+      pushToast('error', `读取清理清单失败：${String(err)}`);
+    }
+  };
+
+  const toggleResetItem = (id: string) => {
+    setResetChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // 执行环境重置（二次确认后；单项失败不中断）
+  const confirmEnvReset = async () => {
+    setResetBusy(true);
+    try {
+      const results = await withMinDelay(
+        api.workbuddy.envReset([...resetChecked], resetKeycloak),
+        1500,
+      );
+      setResetResults(results);
+      setResetConfirming(false);
+      const fail = results.filter((r) => !r.ok).length;
+      if (fail === 0) pushToast('success', `环境重置完成（${results.length} 项全部成功）`);
+      else pushToast('warn', `环境重置完成，${fail} 项失败，请查看详情`);
+      await refresh();
+    } catch (err) {
+      pushToast('error', `环境重置失败：${String(err)}`);
+    } finally {
+      setResetBusy(false);
+    }
+  };
 
   // 导入本机账号（F-04）：扫描 auth 文件 → 预览确认 → 入池
   const importFromAuth = async () => {
@@ -111,6 +233,54 @@ export default function BuddyAccounts() {
     }
   };
 
+  // 设为 CLI 账号（F-06）：token store 凭证 → ~/.codebuddy/settings.json env
+  const handleSetCli = async (a: WorkBuddyAccountView) => {
+    try {
+      await withMinDelay(api.workbuddy.cliBridgeSet(a.id), 800);
+      pushToast('success', `「${a.nickname || a.id}」已设为 CodeBuddy CLI 账号（重启 CLI 后生效）`);
+    } catch (err) {
+      pushToast('error', `CLI 桥接失败：${String(err)}`);
+    }
+  };
+
+  // 会话三件套备份（F-44）：projects + 双 db 快照；执行前自动关闭 WorkBuddy
+  const handleBackupChats = async (a: WorkBuddyAccountView) => {
+    try {
+      const r = await withMinDelay(api.workbuddy.chatdataBackup(a.id), 1200);
+      pushToast('success', `「${a.nickname || a.id}」会话已备份（${r.files} 个文件）`);
+    } catch (err) {
+      pushToast('error', `会话备份失败：${String(err)}`);
+    }
+  };
+
+  // 恢复会话（二次确认后执行；覆盖现有 ~/.workbuddy 会话数据）
+  const confirmRestoreChats = async () => {
+    if (!restoreFor) return;
+    try {
+      const r = await withMinDelay(api.workbuddy.chatdataRestore(restoreFor.id), 1200);
+      pushToast('success', `会话已恢复（${r.files} 个文件）；原有数据保留于 ~/.workbuddy/*.bak`);
+    } catch (err) {
+      pushToast('error', `会话恢复失败：${String(err)}`);
+    } finally {
+      setRestoreFor(null);
+    }
+  };
+
+  // 复制会话到目标账号（F-45）：新 id 复制 + 云端映射注册
+  const confirmCopyChats = async () => {
+    if (!copyFor || !copyTarget) return;
+    try {
+      const r = await withMinDelay(api.workbuddy.chatdataCopy(copyFor.id, copyTarget), 1500);
+      pushToast(
+        'success',
+        `已复制 ${r.copied} 个会话（sessions 克隆 ${r.sessions_cloned}，云端映射 ${r.mappings_registered}）到目标账号`,
+      );
+      setCopyFor(null);
+    } catch (err) {
+      pushToast('error', `会话复制失败：${String(err)}`);
+    }
+  };
+
   const handleDelete = (a: WorkBuddyAccountView) => {
     setDeleteFor(a);
   };
@@ -145,24 +315,41 @@ export default function BuddyAccounts() {
   };
 
   const exportPool = () => {
-    // 导出账号元数据（掩码凭证：不含 token，仅 uid/昵称/过期时间）
-    const data = accounts.map((a) => ({
-      id: a.id,
-      uid: a.uid,
-      nickname: a.nickname,
-      edition_type: a.edition_type,
-      access_token_expires_at: a.access_token_expires_at,
-      refresh_token_expires_at: a.refresh_token_expires_at,
-      note: a.note,
-    }));
-    const blob = new Blob([JSON.stringify({ accounts: data }, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `workbuddy_accounts_${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    pushToast('success', '账号元数据已导出（凭证不导出）');
+    setExportOpen(true);
+  };
+
+  // 导出确认（F-46 扩展）：可选是否附带凭证副本（迁移场景用）
+  const confirmExport = async () => {
+    try {
+      const data = await api.workbuddy.accountsExport(exportWithCreds);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `workbuddy_accounts_${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      pushToast(
+        'success',
+        exportWithCreds ? '账号池已导出（含凭证，文件等同密码请妥善保管）' : '账号元数据已导出（凭证不导出）',
+      );
+      setExportOpen(false);
+    } catch (err) {
+      pushToast('error', `导出失败：${String(err)}`);
+    }
+  };
+
+  // 导入备份（F-46 扩展）：选择导出文件 → 解析入池（含凭证回写）
+  const importBackupFile = async (file: File) => {
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text) as Record<string, unknown>;
+      const r = await withMinDelay(api.workbuddy.accountsImport(payload), 1000);
+      pushToast('success', `导入完成：新增 ${r.added}，跳过 ${r.skipped}（已在池中），带凭证 ${r.with_credentials}`);
+      await refresh();
+    } catch (err) {
+      pushToast('error', `导入失败：${String(err)}`);
+    }
   };
 
   return (
@@ -178,6 +365,9 @@ export default function BuddyAccounts() {
             <button className="btn-outline" onClick={() => setCardView((v) => !v)} title="切换视图">
               {cardView ? <Rows3 size={15} /> : <LayoutGrid size={15} />}
               {cardView ? '列表' : '卡片'}
+            </button>
+            <button className="btn-outline !text-rose-600 hover:!border-rose-300" onClick={() => void openEnvReset()}>
+              <ShieldAlert size={15} /> 环境重置
             </button>
           </>
         }
@@ -197,10 +387,21 @@ export default function BuddyAccounts() {
             <button className="btn-outline" onClick={exportPool} disabled={accounts.length === 0}>
               <Download size={15} /> 导出
             </button>
-            <button className="btn-outline" onClick={() => pushToast('info', '导入备份 / OAuth 扫码将随后续批次开放')} disabled>
+            <button className="btn-outline" onClick={() => importFileRef.current?.click()}>
               <Upload size={15} /> 导入备份
             </button>
-            <button className="btn-outline" onClick={() => pushToast('info', 'OAuth 扫码添加将随后续批次开放')} disabled>
+            <input
+              ref={importFileRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void importBackupFile(f);
+                e.target.value = '';
+              }}
+            />
+            <button className="btn-outline" onClick={() => void startOauth()}>
               <UserPlus size={15} /> OAuth 扫码
             </button>
           </div>
@@ -227,6 +428,13 @@ export default function BuddyAccounts() {
               onSwitch={() => handleSwitch(a)}
               onSaveLogin={() => handleSave(a)}
               onRefreshToken={() => void handleRefreshToken(a)}
+              onSetCli={() => void handleSetCli(a)}
+              onBackupChats={() => void handleBackupChats(a)}
+              onRestoreChats={() => setRestoreFor(a)}
+              onCopyChats={() => {
+                setCopyFor(a);
+                setCopyTarget('');
+              }}
               onEdit={() => handleEdit(a)}
               onDelete={() => handleDelete(a)}
               onViewPackages={() => setDetailFor(a)}
@@ -264,9 +472,14 @@ export default function BuddyAccounts() {
                     {a.is_current ? <Badge tone="green">当前</Badge> : a.needs_relogin ? <Badge tone="red">需重登</Badge> : <Badge tone="slate">备用</Badge>}
                   </td>
                   <td className="px-4 py-2.5 text-right">
-                    <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => handleSwitch(a)} disabled={a.is_current}>
-                      {a.is_current ? '当前' : '设为当前'}
-                    </button>
+                    <div className="flex justify-end gap-1.5">
+                      <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => handleSwitch(a)} disabled={a.is_current}>
+                        {a.is_current ? '当前' : '设为当前'}
+                      </button>
+                      <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void handleSetCli(a)} disabled={!a.has_credential} title={a.has_credential ? '写入 ~/.codebuddy/settings.json 供 CLI 使用' : '需先导入凭证副本'}>
+                        CLI
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -315,6 +528,56 @@ export default function BuddyAccounts() {
         </div>
       </Modal>
 
+      {/* 会话恢复确认弹框（F-44，覆盖性操作二次确认） */}
+      <Modal
+        open={restoreFor != null}
+        onClose={() => setRestoreFor(null)}
+        title="恢复会话数据"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setRestoreFor(null)}>取消</button>
+            <button className="btn-primary !bg-amber-600 hover:!bg-amber-500" onClick={() => void confirmRestoreChats()}>确认恢复</button>
+          </>
+        }
+      >
+        <div className="space-y-1 text-sm">
+          <div>把「{restoreFor?.nickname || restoreFor?.id}」的会话备份恢复到 ~/.workbuddy？</div>
+          <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+            将覆盖现有会话数据（原数据自动保留为 .bak）；执行时会先自动关闭 WorkBuddy 客户端。
+          </div>
+        </div>
+      </Modal>
+
+      {/* 会话复制弹框（F-45：选择目标账号） */}
+      <Modal
+        open={copyFor != null}
+        onClose={() => setCopyFor(null)}
+        title={`复制会话 · ${copyFor?.nickname || copyFor?.id || ''}`}
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setCopyFor(null)}>取消</button>
+            <button className="btn-primary" onClick={() => void confirmCopyChats()} disabled={!copyTarget}>开始复制</button>
+          </>
+        }
+      >
+        <div className="space-y-2 text-sm">
+          <div>选择目标账号：源会话将以全新会话 id 复制过去，并注册到目标账号的云端映射（复制前自动快照数据库）。</div>
+          <select className="input w-full" value={copyTarget} onChange={(e) => setCopyTarget(e.target.value)}>
+            <option value="">— 选择目标账号 —</option>
+            {accounts
+              .filter((x) => x.id !== copyFor?.id)
+              .map((x) => (
+                <option key={x.id} value={x.id}>
+                  {x.nickname || x.id}
+                </option>
+              ))}
+          </select>
+          <div className="text-xs text-slate-400">
+            数据来源：该账号的会话备份（如有）或当前 ~/.workbuddy/projects；执行时会先自动关闭 WorkBuddy 客户端。
+          </div>
+        </div>
+      </Modal>
+
       {/* 编辑弹框（禁 window.prompt，红线） */}
       <Modal
         open={editFor != null}
@@ -336,6 +599,148 @@ export default function BuddyAccounts() {
             placeholder="账号显示名"
           />
         </label>
+      </Modal>
+
+      {/* 导出选项弹框（F-46 扩展：凭证是否随导出） */}
+      <Modal
+        open={exportOpen}
+        onClose={() => setExportOpen(false)}
+        title="导出账号池"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setExportOpen(false)}>取消</button>
+            <button className="btn-primary" onClick={() => void confirmExport()}>确认导出</button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-sm">
+          <div>导出账号池为 JSON 文件，可用于备份或迁移到其他设备。</div>
+          <label className="flex items-start gap-2">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={exportWithCreds}
+              onChange={(e) => setExportWithCreds(e.target.checked)}
+            />
+            <span>
+              包含凭证副本（refreshToken / accessToken）
+              <span className="mt-0.5 block text-xs text-amber-600 dark:text-amber-400">
+                含凭证的导出文件等同密码：仅用于本机迁移，请勿分享；不含凭证的导出仅恢复元数据（需重新续期登录）。
+              </span>
+            </span>
+          </label>
+        </div>
+      </Modal>
+
+      {/* OAuth 扫码弹框（F-50：后端全流程，事件驱动进度展示） */}
+      <Modal
+        open={oauthOpen}
+        onClose={() => setOauthOpen(false)}
+        title="OAuth 扫码登录"
+      >
+        <div className="space-y-3 text-sm">
+          <div className="flex items-center gap-2">
+            {oauthStage === 'success' ? (
+              <Badge tone="green">完成</Badge>
+            ) : oauthStage === 'error' ? (
+              <Badge tone="red">失败</Badge>
+            ) : (
+              <>
+                <Spinner />
+                <span className="text-xs text-slate-400">流程进行中（最长 300 秒）</span>
+              </>
+            )}
+          </div>
+          <div className="rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-900">{oauthMessage || '等待开始…'}</div>
+          {oauthAuthUrl && oauthStage !== 'success' && (
+            <div className="text-xs text-slate-400">
+              未自动打开浏览器？<span className="font-mono break-all">{oauthAuthUrl.slice(0, 80)}…</span>
+            </div>
+          )}
+          <div className="text-xs text-slate-400">
+            登录成功后账号自动入池，凭证仅写入本地 token store（全程掩码，不上传）。
+          </div>
+        </div>
+      </Modal>
+
+      {/* 环境重置弹框（F-14：16 项勾选预览 + 二次确认 + Keycloak 注销开关） */}
+      <Modal
+        open={resetOpen}
+        onClose={() => setResetOpen(false)}
+        size="lg"
+        bodyClass="max-h-[75vh] overflow-y-auto"
+        title="环境重置 / 彻底登出"
+      >
+        {resetResults ? (
+          <div className="space-y-2 text-sm">
+            <div className="font-medium">执行结果</div>
+            {resetResults.map((r) => (
+              <div key={r.id} className="flex items-start gap-2 rounded-lg bg-slate-50 p-2.5 text-xs dark:bg-zinc-900">
+                {r.ok ? <Badge tone="green">成功</Badge> : <Badge tone="red">失败</Badge>}
+                <div>
+                  <div className="font-medium">{resetItems.find((x) => x.id === r.id)?.label ?? r.id}</div>
+                  <div className="mt-0.5 text-slate-500">{r.detail}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="space-y-3 text-sm">
+            <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+              将清除本机 WorkBuddy 的全部认证残留（客户端回到未登录态）。执行时会自动关闭 WorkBuddy；
+              账号池与已备份的会话数据不受影响。请逐项确认：
+            </div>
+            <div className="space-y-1.5">
+              {resetItems.map((item, i) => (
+                <label key={item.id} className="flex items-start gap-2 rounded-lg border border-slate-100 p-2.5 dark:border-zinc-800">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={resetChecked.has(item.id)}
+                    onChange={() => toggleResetItem(item.id)}
+                  />
+                  <span className="min-w-0">
+                    <span className="text-xs font-medium">
+                      {String(i + 1).padStart(2, '0')}. {item.label}
+                    </span>
+                    {!item.exists && <Badge tone="slate">未检测到</Badge>}
+                    <span className="mt-0.5 block text-xs text-slate-400">{item.detail}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            <label className="flex items-start gap-2">
+              <input type="checkbox" className="mt-0.5" checked={resetKeycloak} onChange={(e) => setResetKeycloak(e.target.checked)} />
+              <span>
+                同时注销 Keycloak SSO 会话（浏览器打开注销页，需当前 accessToken）
+                <span className="mt-0.5 block text-xs text-slate-400">先于清理执行；找不到可用凭证时自动跳过。</span>
+              </span>
+            </label>
+            {!resetConfirming ? (
+              <button
+                className="btn-outline !border-rose-300 !text-rose-600"
+                disabled={resetChecked.size === 0 && !resetKeycloak}
+                onClick={() => setResetConfirming(true)}
+              >
+                执行清理（已选 {resetChecked.size + (resetKeycloak ? 1 : 0)} 项）
+              </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-rose-600">⚠️ 不可逆操作：所选残留将被永久清除，确认执行？</span>
+                <button className="btn-outline" onClick={() => setResetConfirming(false)} disabled={resetBusy}>
+                  再想想
+                </button>
+                <button
+                  className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+                  onClick={() => void confirmEnvReset()}
+                  disabled={resetBusy}
+                >
+                  {resetBusy ? <Spinner /> : null} 确认执行
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </Modal>
 
       {/* 积分包明细弹窗（F-56） */}

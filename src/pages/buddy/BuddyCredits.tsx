@@ -1,16 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
 import { RefreshCw, Coins } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
-import { StatCard, Badge, Progress, EmptyState } from '../../components/ui';
+import { StatCard, Badge, EmptyState } from '../../components/ui';
 import ExpiryCalendar from '../../components/ExpiryCalendar';
+import TokenStatsPanel from './TokenStatsPanel';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import type { WbCreditsResult, WbCreditAccount, WbCreditPackage } from '../../types';
 
 /**
- * buddy-credits 积分与统计（§3.7.4，F-20/F-22/F-56）：
- * 批次1 = 余额 KPI + 逐账号余额/包明细 + 到期日历；官方用量/Token 统计 Tab 随批次 3 开放。
+ * buddy-credits 积分与统计（§3.7.4，F-20/F-22/F-56/F-57/F-58/F-25）：
+ * 积分 Tab = 余额 KPI + 逐账号余额/包明细 + 到期日历；Token 统计 Tab = 本地 JSONL 统计 + 官方用量。
  */
 export default function BuddyCredits() {
   const pushToast = useAppStore((s) => s.pushToast);
@@ -75,12 +76,7 @@ export default function BuddyCredits() {
       />
 
       {tab === 'stats' ? (
-        <div className="card p-8 text-center">
-          <p className="text-sm font-medium">Token 统计（F-57）</p>
-          <p className="mt-1 text-xs text-slate-400">
-            本地 token 统计（~/.workbuddy/projects 与 ~/.codebuddy/projects JSONL 解析、缓存命中率、双轴趋势、年度热力图）随批次 3 开放。
-          </p>
-        </div>
+        <TokenStatsPanel remainingCredits={result ? total : null} />
       ) : (
         <>
           {/* KPI 卡 */}

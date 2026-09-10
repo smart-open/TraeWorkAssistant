@@ -1,4 +1,4 @@
-import { MoreHorizontal, Pencil, Trash2, CheckCircle2, RefreshCw } from 'lucide-react';
+import { MoreHorizontal, Pencil, Trash2, CheckCircle2, RefreshCw, TerminalSquare, DatabaseBackup, ArchiveRestore, Copy } from 'lucide-react';
 import { Badge, Progress } from '../../components/ui';
 import { cn } from '../../lib/cn';
 import type { WorkBuddyAccountView, WbCreditPackage } from '../../types';
@@ -34,6 +34,10 @@ export default function AccountCard({
   onSwitch,
   onSaveLogin,
   onRefreshToken,
+  onSetCli,
+  onBackupChats,
+  onRestoreChats,
+  onCopyChats,
   onEdit,
   onDelete,
   onViewPackages,
@@ -44,6 +48,10 @@ export default function AccountCard({
   onSwitch: () => void;
   onSaveLogin: () => void;
   onRefreshToken: () => void;
+  onSetCli: () => void;
+  onBackupChats: () => void;
+  onRestoreChats: () => void;
+  onCopyChats: () => void;
   onEdit: () => void;
   onDelete: () => void;
   onViewPackages: () => void;
@@ -93,6 +101,34 @@ export default function AccountCard({
               className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-slate-50 dark:hover:bg-zinc-800"
             >
               <RefreshCw size={13} /> 续期凭证
+            </button>
+            <button
+              onClick={onSetCli}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-slate-50 dark:hover:bg-zinc-800"
+              title="写入 ~/.codebuddy/settings.json 供 CodeBuddy CLI 使用"
+            >
+              <TerminalSquare size={13} /> 设为 CLI 账号
+            </button>
+            <button
+              onClick={onBackupChats}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-slate-50 dark:hover:bg-zinc-800"
+              title="会话三件套：正文 jsonl + workbuddy.db + 云端映射 db"
+            >
+              <DatabaseBackup size={13} /> 备份会话
+            </button>
+            <button
+              onClick={onRestoreChats}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-slate-50 dark:hover:bg-zinc-800"
+              title="恢复会话三件套到 ~/.workbuddy（覆盖现有数据）"
+            >
+              <ArchiveRestore size={13} /> 恢复会话
+            </button>
+            <button
+              onClick={onCopyChats}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-slate-50 dark:hover:bg-zinc-800"
+              title="以新会话 id 复制到目标账号（含云端映射注册）"
+            >
+              <Copy size={13} /> 复制会话到…
             </button>
             <button
               onClick={onDelete}

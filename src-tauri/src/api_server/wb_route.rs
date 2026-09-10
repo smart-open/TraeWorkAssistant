@@ -226,11 +226,33 @@ fn run_wb_stream(
     let templates = load_templates(state);
     let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
-    // 粘性首轮：命中绑定且账号 healthy → 锁定账号与上游会话（双段分配）
+    // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）
+    let key_constraints = super::api_keys::constraints_for(&state.data_dir, key_id);
+    let allowed_set: Option<HashSet<String>> = key_constraints
+        .as_ref()
+        .map(|k| k.allowed_accounts.iter().cloned().collect())
+        .filter(|s: &HashSet<String>| !s.is_empty());
+    let dedicated: Option<String> = key_constraints
+        .as_ref()
+        .filter(|k| k.schedule_mode == super::api_keys::MODE_DEDICATED)
+        .map(|k| {
+            if k.dedicated_account.is_empty() {
+                k.allowed_accounts.first().cloned().unwrap_or_default()
+            } else {
+                k.dedicated_account.clone()
+            }
+        })
+        .filter(|s: &String| !s.is_empty());
+
+    // 粘性首轮：命中绑定且账号 healthy → 锁定账号与上游会话（双段分配）；
+    // 子 Key 限定上游不含粘性账号时忽略粘性
     let sticky0: Option<(String, String)> = state
         .wb_sticky
         .resolve(&sticky_key, now_ts())
         .and_then(|b| {
+            if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
+                return None;
+            }
             state
                 .wb_pool
                 .pick_by_uid(&b.uid)
@@ -241,17 +263,20 @@ fn run_wb_stream(
         .as_ref()
         .map(|(_, c)| c.clone())
         .unwrap_or_default();
-    let mut first_pick: Option<PickedAccount> =
-        sticky0.as_ref().and_then(|(u, _)| state.wb_pool.pick_by_uid(u));
+    // 首选：粘性 > 专一绑定 > 调度策略
+    let mut first_pick: Option<PickedAccount> = sticky0
+        .as_ref()
+        .and_then(|(u, _)| state.wb_pool.pick_by_uid(u))
+        .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
 
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
 
     loop {
-        // ── 取号：粘性命中优先，否则调度策略；换号后仅走策略 ──
+        // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
         let picked = match first_pick.take() {
             Some(p) => p,
-            None => match state.wb_pool.pick_excluding(&tried) {
+            None => match state.wb_pool.pick_excluding_constrained(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
                 Some(p) => p,
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
@@ -433,10 +458,31 @@ pub async fn wb_aggregate_chat(
         let templates = load_templates(&state);
         let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
+        // F-35 子 Key 约束（与非流式同款）
+        let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_id);
+        let allowed_set: Option<HashSet<String>> = key_constraints
+            .as_ref()
+            .map(|k| k.allowed_accounts.iter().cloned().collect())
+            .filter(|s: &HashSet<String>| !s.is_empty());
+        let dedicated: Option<String> = key_constraints
+            .as_ref()
+            .filter(|k| k.schedule_mode == super::api_keys::MODE_DEDICATED)
+            .map(|k| {
+                if k.dedicated_account.is_empty() {
+                    k.allowed_accounts.first().cloned().unwrap_or_default()
+                } else {
+                    k.dedicated_account.clone()
+                }
+            })
+            .filter(|s: &String| !s.is_empty());
+
         let sticky0: Option<(String, String)> = state
             .wb_sticky
             .resolve(&sticky_key, now_ts())
             .and_then(|b| {
+                if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
+                    return None;
+                }
                 state
                     .wb_pool
                     .pick_by_uid(&b.uid)
@@ -447,8 +493,10 @@ pub async fn wb_aggregate_chat(
             .as_ref()
             .map(|(_, c)| c.clone())
             .unwrap_or_default();
-        let mut first_pick: Option<PickedAccount> =
-            sticky0.as_ref().and_then(|(u, _)| state.wb_pool.pick_by_uid(u));
+        let mut first_pick: Option<PickedAccount> = sticky0
+            .as_ref()
+            .and_then(|(u, _)| state.wb_pool.pick_by_uid(u))
+            .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
@@ -456,7 +504,7 @@ pub async fn wb_aggregate_chat(
         loop {
             let picked = match first_pick.take() {
                 Some(p) => p,
-                None => match state.wb_pool.pick_excluding(&tried) {
+                None => match state.wb_pool.pick_excluding_constrained(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
                     Some(p) => p,
                     None => {
                         state.record_usage(&model, "none", &key_id, false, stream,

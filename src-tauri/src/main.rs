@@ -11,6 +11,7 @@ mod python;
 mod state;
 mod vault;
 mod api_server;
+mod workbuddy_cli;
 
 use state::AppState;
 use std::sync::Mutex;
@@ -208,6 +209,21 @@ fn main() {
             commands::workbuddy::workbuddy_credits_fetch,
             commands::workbuddy::workbuddy_settings_get,
             commands::workbuddy::workbuddy_settings_set,
+            commands::workbuddy::workbuddy_cli_status,
+            commands::workbuddy::workbuddy_cli_bridge_set,
+            commands::workbuddy::workbuddy_cli_rotate_run,
+            commands::workbuddy::workbuddy_cli_rotate_logs,
+            commands::workbuddy::workbuddy_chatdata_backup,
+            commands::workbuddy::workbuddy_chatdata_restore,
+            commands::workbuddy::workbuddy_chatdata_info,
+            commands::workbuddy::workbuddy_chatdata_copy,
+            commands::workbuddy::workbuddy_accounts_export,
+            commands::workbuddy::workbuddy_accounts_import,
+            commands::workbuddy::workbuddy_oauth_login,
+            commands::workbuddy::workbuddy_env_reset_items,
+            commands::workbuddy::workbuddy_env_reset,
+            commands::workbuddy::workbuddy_usage_official,
+            commands::workbuddy_stats::workbuddy_token_stats,
         ])
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -409,6 +425,10 @@ fn main() {
                 let st = app.state::<AppState>();
                 commands::workbuddy::startup_auto_checkin(&app2, &st);
             }
+
+            // CodeBuddy CLI 五重防护自动轮换（F-59）：独立后台线程按检查间隔执行，
+            // 开关关闭时空转；decide_target 纯函数判定，切号写 ~/.codebuddy/settings.json
+            commands::workbuddy::start_cli_rotate_thread();
 
             Ok(())
         })

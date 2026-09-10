@@ -5,7 +5,7 @@ import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { WbCheckinRecord, WorkBuddyAccountView } from '../../types';
+import type { WbCheckinRecord, WorkBuddyAccountView, WorkBuddySettings } from '../../types';
 
 /**
  * buddy-checkin 签到与成长（§3.7.3，F-15/F-16/F-55）：
@@ -69,7 +69,7 @@ export default function BuddyCheckin() {
   const [results, setResults] = useState<WbCheckinRecord[]>([]);
   const [tasks, setTasks] = useState<string[]>([]);
   const [renewOn, setRenewOn] = useState(false);
-  const [settings, setSettings] = useState<{ auto_checkin: boolean; keepalive_days: number; lazy_refresh_hours: number; growth_travel: boolean; growth_lottery: boolean; growth_tasks: boolean } | null>(null);
+  const [settings, setSettings] = useState<WorkBuddySettings | null>(null);
   const [growthRunning, setGrowthRunning] = useState(false);
   const [growthLines, setGrowthLines] = useState<WbGrowthLine[]>([]);
   const [growthSummary, setGrowthSummary] = useState<string | null>(null);

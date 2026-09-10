@@ -54,10 +54,12 @@ pub async fn bearer_auth(
         return (StatusCode::UNAUTHORIZED, "missing api key").into_response();
     };
 
-    // 校验 Key（含每日配额）
+    // 校验 Key（含每日配额 + F-35 按日统计）
     match keys.verify_and_consume(&presented, &super::usage::today_key()) {
-        KeyCheck::Ok(id) => {
+        KeyCheck::Ok(rk) => {
             api_keys::save(&state.data_dir, &keys);
+            let id = rk.id.clone();
+            request.extensions_mut().insert(rk);
             request.extensions_mut().insert(KeyId(id));
             return next.run(request).await;
         }

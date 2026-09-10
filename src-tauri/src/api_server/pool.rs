@@ -352,6 +352,58 @@ impl ApiPool {
         })
     }
 
+    /// 带 Key 约束取号（F-35 子 Key 体系，批次3）：
+    /// - `dedicated`：专一模式绑定 uid（healthy 即直接锁定，绕过策略）
+    /// - `allowed`：上游白名单过滤（None/空 = 不限）
+    /// - 调度策略沿用池当前策略（子 Key「临期优先」= 池默认 expire_first，
+    ///   池策略本身即用户可选的临期/积分/加权等模式；约束仅做过滤与锁定）
+    pub fn pick_excluding_constrained(
+        &self,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+        dedicated: Option<&str>,
+    ) -> Option<PickedAccount> {
+        // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定
+        if let Some(uid) = dedicated {
+            if !tried.contains(uid) {
+                if let Some(p) = self.pick_by_uid(uid) {
+                    let mut entries = safe_lock(&self.entries);
+                    if let Some(e) = entries.get_mut(uid) {
+                        e.last_used = now_ts();
+                    }
+                    return Some(p);
+                }
+            }
+        }
+        let mut entries = safe_lock(&self.entries);
+        let strategy = *safe_lock(&self.strategy);
+        let now = now_ts();
+        let cands: Vec<&PoolEntry> = entries
+            .values()
+            .filter(|e| selectable(e, tried, now))
+            .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .collect();
+        let rand_seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            .unwrap_or(0);
+        let picked = pick_by_strategy(&cands, strategy, rand_seed, now)?;
+        let account = PickedAccount {
+            uid: picked.uid.clone(),
+            jwt: picked.jwt.clone(),
+            device_id: picked.device_id.clone(),
+            machine_id: picked.machine_id.clone(),
+            domain: picked.domain.clone(),
+            enterprise_id: picked.enterprise_id.clone(),
+            global_region: picked.global_region,
+        };
+        drop(cands); // 释放 entries 不可变借用后再更新 last_used
+        if let Some(e) = entries.get_mut(&account.uid) {
+            e.last_used = now;
+        }
+        Some(account)
+    }
+
     /// 更新账号凭证（T2.6：网关 401 刷新后回填，后续取号即用新 token）
     pub fn update_jwt(&self, uid: &str, jwt: &str) {
         let mut entries = safe_lock(&self.entries);

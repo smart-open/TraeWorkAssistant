@@ -13,3 +13,4 @@ pub mod switch;
 pub mod trae_apps;
 pub mod updater;
 pub mod workbuddy;
+pub mod workbuddy_stats;
