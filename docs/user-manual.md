@@ -424,6 +424,42 @@ API 服务页面提供两个 Tab：
 - 日志目录配置
 - 数据目录查看
 - 暗色模式切换
+### 10.5 数据目录与配置
+
+所有数据仅存本机 `%APPDATA%\TraeWorkAssistant\`：
+
+```text
+%APPDATA%\TraeWorkAssistant\
+├── conf/
+│   ├── app_settings.json       # 主题/端口/跳过策略/retry/log_retention_days 等设置
+│   ├── vault.stronghold        # 账号凭据加密快照（jwt/refresh_token，v2.9.0 起）
+│   └── vault_key.bin           # vault 主密码（Windows DPAPI 保护，仅本机当前用户可解）
+├── data/
+│   ├── checkin_accounts.json   # 账号列表（凭据已占位化，明文权威在 vault）
+│   ├── device_map.json         # 每账号独立伪设备 ID
+│   ├── groups.json             # 分组定义
+│   ├── credits_history.json    # 积分落盘（自动裁剪 90 天）
+│   ├── credits_daily.json      # 每日积分快照（趋势图数据源）
+│   ├── checkin_summary.json    # 最近一次签到结果（今日已签徽章）
+│   ├── checkin_results.json    # 签到结果按日落库（趋势图数据源，保留 90 天）
+│   ├── account_cooldowns.json  # 签到错误冷却状态
+│   ├── remaining_credits.json  # 各账号剩余积分缓存
+│   ├── api_pool.json           # API 账号池（选中账号/调度策略/分组筛选）
+│   ├── api_usage.json          # API 网关用量按日统计（保留 90 天）
+│   ├── api_keys.json           # API Key 列表与每日配额
+│   ├── certs/                  # 自签 CA 证书
+│   └── profiles/<user_id>/     # 切换登录态时备份/恢复的 TRAE Profile 快照
+└── logs/
+    ├── proxy.log               # 实时代理输出
+    ├── checkin.log             # 签到日志
+    ├── switcher.log            # 切换日志
+    ├── proxy_req_YYYY-MM-DD.log # 结构化代理请求日志
+    └── api_*.log               # API 服务请求日志
+```
+
+- 配置项在「系统设置」页修改，落盘到 `conf/app_settings.json`。
+- 日志按 `log_retention_days`（设置项）在应用启动期自动清理过期行；设为 `0` 表示不清理。
+- 如需备份或迁移，整体复制 `%APPDATA%\TraeWorkAssistant\` 即可（vault 凭据仅在本机当前 Windows 用户下可解密，跨机器需重新捕获 JWT）。
 
 ---
 

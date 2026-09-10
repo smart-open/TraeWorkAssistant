@@ -39,7 +39,7 @@ trae-work-assistant/
 ├── AGENT.md                      # 本文件（项目速查）
 ├── README.md                     # 用户文档
 ├── package.json / vite.config.ts / tsconfig.json / tailwind.config.js / postcss.config.js / index.html
-├── docs/                         # 设计/技术/API/用户手册/operation-manual
+├── docs/                         # 用户手册 / 产品设计 / 技术架构设计
 ├── src/                          # 前端
 │   ├── App.tsx                   # 外壳（TitleBar + Sidebar + TopBar + 页面切换 + Toaster）
 │   ├── store.ts                  # Zustand 单一真相（init / 刷新 / checkin/switch/saveLogin 事件归约）
