@@ -129,7 +129,7 @@ interface AppState {
   profileDelete: (userId: string) => Promise<void>;
   oauthLogin: (callbackUrl: string, accountName?: string, groupId?: string) => Promise<void>;
 
-  pushToast: (kind: ToastKind, msg: string) => void;
+  pushToast: (kind: ToastKind, msg: string, opts?: { sticky?: boolean }) => void;
   dismissToast: (id: number) => void;
 }
 
@@ -358,9 +358,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         get().refreshAccounts();
         get().refreshCreditsDaily();
       }).catch(() => {});
+      // 全跳过（无任何实际签到）时用 sticky 提示 + 明确原因，避免 toast 一闪而过用户不知道为何没签到
+      const allSkipped = e.ok === 0 && e.already === 0 && e.failed === 0;
       get().pushToast(
-        e.failed > 0 ? 'warn' : 'success',
-        `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
+        allSkipped ? 'warn' : e.failed > 0 ? 'warn' : 'success',
+        allSkipped
+          ? '签到完成：全部账号已跳过（今日已签 / JWT 过期 / 冷却中），没有账号实际签到'
+          : `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
+        allSkipped ? { sticky: true } : undefined,
       );
     }
   },
@@ -737,7 +742,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  pushToast: (kind, msg) => {
+  pushToast: (kind, msg, opts) => {
     const mode = get().settings?.notify ?? 'toast';
     if (mode === 'none') {
       console.debug('[notify] 已跳过（mode=none）:', kind, msg);
@@ -747,7 +752,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (mode === 'toast' || mode === 'both') {
       const id = ++toastSeq;
       set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }));
-      setTimeout(() => get().dismissToast(id), 4200);
+      // sticky：不自动消失，需用户手动关闭（如签到全跳过的结果提示）
+      if (!opts?.sticky) setTimeout(() => get().dismissToast(id), 4200);
     }
 
     if (mode === 'system' || mode === 'both') {

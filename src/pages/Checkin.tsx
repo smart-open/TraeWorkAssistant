@@ -269,7 +269,7 @@ export default function Checkin() {
         </div>
       </div>
 
-      {checkin.active || checkin.total > 0 ? (
+      {checkin.active || checkin.total > 0 || checkin.done != null ? (
         <div className="card p-4">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="font-medium">实时进度</h3>
@@ -295,6 +295,12 @@ export default function Checkin() {
                   ? `${Math.max(1, Math.ceil((checkin.retry.until - now) / 1000))}s 后自动开始第 ${checkin.retry.round} 轮重试…`
                   : `第 ${checkin.retry.round} 轮重试进行中…`}
               </span>
+            </div>
+          )}
+          {checkin.done && checkin.total === 0 && (
+            <div className="mb-3 flex items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
+              <AlertTriangle size={15} className="shrink-0" />
+              <span>全部账号已跳过（今日已签 / JWT 过期 / 冷却中），没有账号实际签到</span>
             </div>
           )}
           <div className="mb-3">
