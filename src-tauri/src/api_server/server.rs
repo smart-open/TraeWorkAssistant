@@ -78,6 +78,9 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/v1/embeddings", post(routes::embeddings))
         .route("/v1/messages", post(routes::messages))
         .route("/v1/responses", post(routes::responses_api))
+        // T5.4/F-63 生图双端点投影
+        .route("/v1/images/generations", post(routes::images_generations))
+        .route("/v1/images/edits", post(routes::images_edits))
         .layer(from_fn_with_state(state.clone(), auth::bearer_auth))
         .with_state(state)
 }

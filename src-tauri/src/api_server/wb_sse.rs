@@ -199,6 +199,8 @@ pub fn stream_forward<L: Iterator<Item = String>>(
     // Anthropic 输出状态
     let mut message_started = false;
     let mut text_block_open = false;
+    // T5.3/F-62：思考链 thinking 块（在文本块之前输出）
+    let mut thinking_block_open = false;
     let mut block_index: i64 = -1;
 
     let anthropic_start = |tx: &Sender, message_started: &mut bool, chat_id: &str, model: &str| {
@@ -252,6 +254,13 @@ pub fn stream_forward<L: Iterator<Item = String>>(
                 match proto {
                     crate::api_server::routes::Protocol::Anthropic => {
                         anthropic_start(tx, &mut message_started, chat_id, model);
+                        if thinking_block_open {
+                            thinking_block_open = false;
+                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                                "event: content_block_stop\ndata: {}\n\n",
+                                json!({"type":"content_block_stop","index":block_index})
+                            ))));
+                        }
                         if text_block_open {
                             text_block_open = false;
                             let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
@@ -400,8 +409,42 @@ pub fn stream_forward<L: Iterator<Item = String>>(
                 }
                 if proto == crate::api_server::routes::Protocol::Anthropic {
                     anthropic_start(tx, &mut message_started, chat_id, model);
+                    // T5.3/F-62：思考链增量 → thinking block（先于文本块）
+                    if let Some(t) = delta.get("reasoning_content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
+                        if !thinking_block_open {
+                            // 文本块已开则先关闭（上游先文本后思考的异常次序兜底）
+                            if text_block_open {
+                                text_block_open = false;
+                                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                                    "event: content_block_stop\ndata: {}\n\n",
+                                    json!({"type":"content_block_stop","index":block_index})
+                                ))));
+                            }
+                            block_index += 1;
+                            thinking_block_open = true;
+                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                                "event: content_block_start\ndata: {}\n\n",
+                                json!({"type":"content_block_start","index":block_index,
+                                       "content_block":{"type":"thinking","thinking":""}})
+                            ))));
+                        }
+                        let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                            "event: content_block_delta\ndata: {}\n\n",
+                            json!({"type":"content_block_delta","index":block_index,
+                                   "delta":{"type":"thinking_delta","thinking":t}})
+                        ))));
+                        sent_any = true;
+                    }
                     // 文本增量
                     if let Some(t) = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
+                        // thinking 块先收口，再开文本块
+                        if thinking_block_open {
+                            thinking_block_open = false;
+                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                                "event: content_block_stop\ndata: {}\n\n",
+                                json!({"type":"content_block_stop","index":block_index})
+                            ))));
+                        }
                         if !text_block_open {
                             block_index += 1;
                             text_block_open = true;
@@ -668,6 +711,14 @@ pub fn completion_to_anthropic(v: &Value, msg_id: &str, model: &str) -> Value {
         .unwrap_or(json!({}));
     let message = choice.get("message").cloned().unwrap_or(json!({}));
     let mut content: Vec<Value> = Vec::new();
+    // T5.3/F-62：reasoning_content → thinking block（置于 text 之前）
+    if let Some(t) = message
+        .get("reasoning_content")
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        content.push(json!({"type":"thinking","thinking":t}));
+    }
     if let Some(t) = message.get("content").and_then(|c| c.as_str()) {
         if !t.is_empty() {
             content.push(json!({"type":"text","text":t}));

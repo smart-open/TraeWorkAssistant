@@ -291,6 +291,121 @@ def billing_bases(domain):
     return [main, alt]
 
 
+# ── 本地 quota 端口发现兜底（T5.8/F-21）────────────────────────────────────
+# 云端 billing 全链失败时的最后兜底：WorkBuddy/CodeBuddy 桌面端本地服务会
+# 在 127.0.0.1 暴露 quota 查询端点。发现顺序：
+# ① 扫 ~/.workbuddy/*.port 文件（服务启动时落盘的端口声明）；
+# ② 固定候选端口 + 有界端口段探测；
+# ③ GET /api/v1/quota，按响应含 remaining/credits/quota/balance 特征确认。
+# 红线：单次单发不重试、每端口 0.8s 超时、候选总数有界（最坏 ~15s）。
+
+_QUOTA_PATH = "/api/v1/quota"
+_QUOTA_PORT_CANDIDATES = [18789, 11101, 8890, 8899]
+_QUOTA_PORT_RANGE = range(18780, 18796)
+_QUOTA_KEYS = ("remaining", "credits", "quota", "balance")
+
+
+def _quota_looks_valid(v, depth=0):
+    """响应含 remaining/credits/quota/balance 任一键即认定 quota 端点（浅层宽容）"""
+    if depth > 3 or not isinstance(v, dict):
+        return False
+    for k, val in v.items():
+        if isinstance(k, str) and k.lower() in _QUOTA_KEYS:
+            return True
+        if _quota_looks_valid(val, depth + 1):
+            return True
+    return False
+
+
+def _quota_probe_port(port, timeout=0.8):
+    """单端口 quota 探测；命中返回响应 dict，未命中/不可达返回 None"""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:%s%s" % (port, _QUOTA_PATH),
+            headers={"User-Agent": "WorkBuddy", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(65536).decode("utf-8", "replace")
+        v = _try_json(raw)
+        if _quota_looks_valid(v):
+            return v
+    except Exception:
+        pass
+    return None
+
+
+def discover_local_quota_services(limit=3):
+    """发现本机 quota 服务：*.port 声明端口 → 固定候选 → 有界端口段。
+    返回 [(port, quota_dict), ...]（已确认可用的端口，按发现序）"""
+    found = []
+    seen = set()
+
+    def try_port(p):
+        if p in seen or not (0 < p < 65536):
+            return
+        seen.add(p)
+        if len(found) >= limit:
+            return
+        v = _quota_probe_port(p)
+        if v is not None:
+            found.append((p, v))
+
+    # ① ~/.workbuddy/*.port
+    import glob
+    import os
+    for f in sorted(glob.glob(os.path.join(os.path.expanduser("~"), ".workbuddy", "*.port")))[:16]:
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                txt = fh.read().strip()
+            port = int(txt.split()[0])
+        except Exception:
+            continue
+        try_port(port)
+        if len(found) >= limit:
+            return found
+    # ② 固定候选 + ③ 有界端口段
+    for p in list(_QUOTA_PORT_CANDIDATES) + list(_QUOTA_PORT_RANGE):
+        try_port(p)
+        if len(found) >= limit:
+            return found
+    return found
+
+
+def local_quota_balance():
+    """本地 quota 兜底余额：首个可用端点的 remaining 求和；无可用端点返回 None"""
+    for _port, v in discover_local_quota_services(limit=2):
+        total = dig(v, "remaining", "RemainingCapacity", "credits", "balance")
+        num = _dig_num(total)
+        if num is not None:
+            return num
+    return None
+
+
+def _dig_num(v):
+    """宽容取数：递归摘出首个数值（含数字字符串）"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except Exception:
+            return None
+    if isinstance(v, dict):
+        for val in v.values():
+            n = _dig_num(val)
+            if n is not None:
+                return n
+    if isinstance(v, list):
+        for val in v:
+            n = _dig_num(val)
+            if n is not None:
+                return n
+    return None
+
+
 def refresh_token_once(creds: dict):
     """调 plugin refresh 端点（X-Refresh-Token 仅允许出现在此端点）。
     返回新 creds dict 或 None（失败原因可从返回 None 后由调用方按 401 判定）"""

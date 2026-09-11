@@ -203,6 +203,13 @@ def fetch_credits_once(creds, acct_id=None):
         pkgs = _packages_from(body)
         if pkgs:
             return pkgs, sum(p["remaining"] for p in pkgs), "legacy", new_creds
+    # 本地 quota 端口发现兜底（T5.8/F-21）：云端全链失败 → 探测本机桌面服务
+    try:
+        local = wb.local_quota_balance()
+    except Exception:
+        local = None
+    if local is not None:
+        return None, local, "local_quota", new_creds
     return None, None, "fetch_failed", new_creds
 
 

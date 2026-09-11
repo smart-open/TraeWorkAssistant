@@ -10,11 +10,14 @@ pub mod server;
 pub mod sse;
 pub mod usage;
 pub mod wb_catalog;
+pub mod wb_images;
+pub mod wb_model_route;
 pub mod wb_payload;
 pub mod wb_responses;
 pub mod wb_route;
 pub mod wb_sse;
 pub mod wb_sticky;
+pub mod wb_toolexec;
 pub mod wb_upstream;
 
 use std::sync::atomic::AtomicU64;
@@ -45,6 +48,12 @@ pub struct ApiSharedState {
     pub wb_enabled: std::sync::atomic::AtomicBool,
     /// WB 指纹清洗开关（F-30，默认开；wb_template_map 清洗联动）
     pub wb_sanitize: std::sync::atomic::AtomicBool,
+    /// 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high
+    pub wb_default_thinking: std::sync::atomic::AtomicBool,
+    /// 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行
+    pub wb_tool_exec: std::sync::atomic::AtomicBool,
+    /// 后台任务降级（T5.6③/F-65）：标题/摘要类短请求路由到目录最低倍率模型
+    pub wb_bg_downgrade: std::sync::atomic::AtomicBool,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
     /// 模型级冷却（F-34）：model → (until 秒, 连续失败次数)；10→20→40s 渐进退避，

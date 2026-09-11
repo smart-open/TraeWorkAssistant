@@ -218,6 +218,10 @@ pub async fn do_start(
         wb_pool,
         wb_enabled: std::sync::atomic::AtomicBool::new(pool_file.wb_enabled),
         wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+        // T5.3/T5.5/T5.6③ 开关（api_pool.json，serde default 兼容旧文件）
+        wb_default_thinking: std::sync::atomic::AtomicBool::new(pool_file.wb_default_thinking),
+        wb_tool_exec: std::sync::atomic::AtomicBool::new(pool_file.wb_tool_exec),
+        wb_bg_downgrade: std::sync::atomic::AtomicBool::new(pool_file.wb_bg_downgrade),
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         wb_template_cache: Mutex::new(None),
@@ -360,6 +364,7 @@ pub fn pool_list(state: State<'_, AppState>) -> ApiPoolFile {
 }
 
 /// 批量设置池中的账号 UID 列表 + 调度策略 + 分组筛选（T10）+ WB 上游开关（T2.1）
+/// + T5.3 默认深度思考 / T5.5 工具代执行 / T5.6③ 后台任务降级（未传字段保留原值）
 #[tauri::command]
 pub fn pool_set(
     state: State<'_, AppState>,
@@ -367,12 +372,19 @@ pub fn pool_set(
     strategy: Option<String>,
     group_ids: Option<Vec<String>>,
     wb_enabled: Option<bool>,
+    wb_default_thinking: Option<bool>,
+    wb_tool_exec: Option<bool>,
+    wb_bg_downgrade: Option<bool>,
 ) -> Result<(), String> {
+    let existing: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
     let pool_file = ApiPoolFile {
         enabled_uids: uids,
         strategy: strategy.unwrap_or_default(),
         group_ids: group_ids.unwrap_or_default(),
-        wb_enabled: wb_enabled.unwrap_or(false),
+        wb_enabled: wb_enabled.unwrap_or(existing.wb_enabled),
+        wb_default_thinking: wb_default_thinking.unwrap_or(existing.wb_default_thinking),
+        wb_tool_exec: wb_tool_exec.unwrap_or(existing.wb_tool_exec),
+        wb_bg_downgrade: wb_bg_downgrade.unwrap_or(existing.wb_bg_downgrade),
     };
     fs_utils::write_json(&state.path("api_pool.json"), &pool_file)
 }

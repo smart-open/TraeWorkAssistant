@@ -692,6 +692,348 @@ pub async fn wb_aggregate_chat(
     }
 }
 
+// ==================== T5.5/F-64 网关工具代执行编排 ====================
+
+/// Responses 工具代执行主流程（仅 /v1/responses 且声明 web_search 类工具时进入）：
+/// 上游请求内部固定非流式（stream:false）→ 聚合 → 提取代执行工具调用 → 本地执行
+/// → 结果回喂 → 循环直至最终回复（上限 MAX_ROUNDS 防积分失控）。
+///
+/// 输出投影：
+/// - 历史代执行搜索轮 → 原生 `web_search_call` 输出项（置于 message 之前）；
+/// - 最终回复 → 既有 completion_to_responses 投影；
+/// - 客户端 stream=true 时按 Responses SSE 事件序列（created → items → completed）
+///   由聚合结果合成下发；stream=false 直接返回 JSON。
+///
+/// 简化说明：本路径不复用粘性绑定（多轮工具回喂非单轮会话语义），账号选取与
+/// Key 约束/分级重试与非流式管线同一套规则。
+pub async fn wb_tool_exec_chat(
+    state: Arc<ApiSharedState>,
+    mut chat_body: Value,
+    model: String,
+    stream: bool,
+    start_ts: Instant,
+    key_id: String,
+) -> Response {
+    let model_inner = model.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let model = model_inner;
+        let templates = load_templates(&state);
+        let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        super::wb_toolexec::inject_proxy_tools(&mut chat_body);
+
+        // F-35 子 Key 约束（与非流式同款）
+        let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_id);
+        let allowed_set: Option<HashSet<String>> = key_constraints
+            .as_ref()
+            .map(|k| k.allowed_accounts.iter().cloned().collect())
+            .filter(|s: &HashSet<String>| !s.is_empty());
+        let dedicated: Option<String> = key_constraints
+            .as_ref()
+            .filter(|k| k.schedule_mode == super::api_keys::MODE_DEDICATED)
+            .map(|k| {
+                if k.dedicated_account.is_empty() {
+                    k.allowed_accounts.first().cloned().unwrap_or_default()
+                } else {
+                    k.dedicated_account.clone()
+                }
+            })
+            .filter(|s: &String| !s.is_empty());
+
+        let catalog = super::wb_catalog::load(&state.data_dir);
+        let effort = super::wb_catalog::find(&catalog, &model)
+            .and_then(|m| m.resolve_effort(chat_body.get("reasoning_effort").and_then(|v| v.as_str())));
+
+        let mut tried: HashSet<String> = HashSet::new();
+        let mut refreshed: HashSet<String> = HashSet::new();
+        let mut records: Vec<super::wb_toolexec::SearchRecord> = Vec::new();
+        let mut final_completion: Option<Value> = None;
+        let mut last_err: Option<String> = None;
+        let resp_id = format!("resp_{}", now_ts());
+
+        'accounts: loop {
+            let picked = match state
+                .wb_pool
+                .pick_excluding_constrained(&tried, allowed_set.as_ref(), dedicated.as_deref())
+            {
+                Some(p) => p,
+                None => break,
+            };
+            tried.insert(picked.uid.clone());
+            *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+            let conv_id = gen_conv_id();
+            let mut creds = WbCreds {
+                id: picked.uid.clone(),
+                uid: picked.uid.clone(),
+                name: String::new(),
+                token: picked.jwt.clone(),
+                domain: picked.domain.clone(),
+                enterprise_id: picked.enterprise_id.clone(),
+                global_region: picked.global_region,
+            };
+            let mut same_attempt: u32 = 0;
+
+            // 工具代执行轮次循环（每轮 = 一次上游请求）
+            let mut round: usize = 0;
+            let outcome = loop {
+                if round >= super::wb_toolexec::MAX_ROUNDS {
+                    break Err(format!(
+                        "工具代执行轮数已达上限（{} 轮），上游仍未产出最终回复；已执行 {} 次搜索/读取",
+                        super::wb_toolexec::MAX_ROUNDS,
+                        records.len()
+                    ));
+                }
+                round += 1;
+
+                let body_bytes = serde_json::to_vec(&chat_body).unwrap_or_default();
+                let converted = wb_payload::prepare_wb_chat_body(
+                    &body_bytes, &model, &conv_id, effort.as_deref(), sanitize, &templates,
+                );
+
+                match wb_upstream::make_wb_request(&creds, &converted) {
+                    Ok(reader) => {
+                        let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
+                            Ok(l) => l,
+                            Err(()) => {
+                                state.wb_pool.note_error(&picked.uid, ErrKind::Server);
+                                note_model_failure(&state, &model);
+                                break Err("上游首字超时".to_string());
+                            }
+                        };
+                        let (completion, error_info) =
+                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
+                        if let Some((code, msg)) = error_info {
+                            let kind = classify_wb_error(code, &msg);
+                            if kind != ErrKind::None {
+                                state.wb_pool.note_error(&picked.uid, kind);
+                                note_model_failure(&state, &model);
+                            }
+                            *safe_lock(&state.last_error) =
+                                Some(format!("wb-toolexec uid={} code={} msg={}", picked.uid, code, msg));
+                            break Err(msg);
+                        }
+                        let Some(completion) = completion else {
+                            break Err("上游返回空响应".to_string());
+                        };
+                        let calls = super::wb_toolexec::extract_proxy_calls(&completion);
+                        if calls.is_empty() {
+                            break Ok(completion); // 最终回复
+                        }
+                        // 本地代执行 + 回喂
+                        let mut tool_msgs: Vec<Value> = Vec::new();
+                        let assistant_msg = completion
+                            .pointer("/choices/0/message")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        for (call_id, name, args) in &calls {
+                            let (output, ok) = super::wb_toolexec::execute(name, args);
+                            let query = serde_json::from_str::<Value>(args)
+                                .ok()
+                                .and_then(|a| {
+                                    a.get("query")
+                                        .or_else(|| a.get("url"))
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string)
+                                })
+                                .unwrap_or_default();
+                            records.push(super::wb_toolexec::SearchRecord {
+                                tool: name.clone(),
+                                query,
+                                ok,
+                            });
+                            tool_msgs.push(json!({
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": output,
+                            }));
+                        }
+                        if let Some(msgs) = chat_body
+                            .get_mut("messages")
+                            .and_then(|m| m.as_array_mut())
+                        {
+                            msgs.push(assistant_msg);
+                            msgs.extend(tool_msgs);
+                        }
+                        continue;
+                    }
+                    Err((status, resp_body, retry_after)) => {
+                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                            RetryAction::RetrySame { delay_ms } => {
+                                same_attempt += 1;
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    delay_ms.min(60_000),
+                                ));
+                                continue;
+                            }
+                            RetryAction::SwitchKey => {
+                                if status == 401 && !refreshed.contains(&picked.uid) {
+                                    refreshed.insert(picked.uid.clone());
+                                    match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid) {
+                                        Ok(new_token) => {
+                                            state.wb_pool.update_jwt(&picked.uid, &new_token);
+                                            creds.token = new_token;
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            *safe_lock(&state.last_error) = Some(format!(
+                                                "wb-toolexec refresh uid={} err={}",
+                                                picked.uid, e
+                                            ));
+                                        }
+                                    }
+                                }
+                                let kind = classify_error(status, &resp_body);
+                                state.wb_pool.note_error(&picked.uid, kind);
+                                note_model_failure(&state, &model);
+                                break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 200)));
+                            }
+                            RetryAction::Fatal => {
+                                break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 300)));
+                            }
+                        }
+                    }
+                }
+            };
+
+            match outcome {
+                Ok(c) => {
+                    state.wb_pool.note_success(&picked.uid);
+                    clear_model_failure(&state, &model);
+                    final_completion = Some(c);
+                    break 'accounts;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue; // 换号
+                }
+            }
+        }
+
+        let duration_ms = start_ts.elapsed().as_millis() as u64;
+        match final_completion {
+            Some(mut completion) => {
+                let (pt, ct) = completion.get("usage").map(|u| (
+                    u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                    u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                )).unwrap_or((0, 0));
+                state.record_usage(&model, "wb-toolexec", &key_id, true, stream, duration_ms, pt, ct);
+                state.logger.log_request(
+                    "POST", "/v1/responses", &model, stream, 200, "wb-toolexec",
+                    duration_ms, Some(&format!("rounds={} searches={}", records.len(), records.iter().filter(|r| r.tool == super::wb_toolexec::TOOL_SEARCH).count())),
+                );
+                // Responses 投影：web_search_call 历史项前置
+                completion["model"] = json!(model.clone());
+                let ws_items = super::wb_toolexec::search_call_items(&records, &resp_id);
+                Ok((completion, ws_items, resp_id))
+            }
+            None => {
+                state.record_usage(&model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);
+                state.logger.log_request(
+                    "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
+                    duration_ms, last_err.as_deref(),
+                );
+                Err(last_err.unwrap_or_else(|| "no healthy account available".to_string()))
+            }
+        }
+    })
+    .await;
+
+    let (final_completion, ws_items, resp_id) = match result {
+        Ok(Ok(t)) => t,
+        Ok(Err(msg)) => {
+            return openai_error(StatusCode::BAD_GATEWAY, "tool_exec_error", &msg);
+        }
+        Err(e) => {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                &format!("task join error: {}", e),
+            );
+        }
+    };
+
+    let resp_obj = {
+        let mut r = super::wb_responses::completion_to_responses(&final_completion, &resp_id, &model);
+        if !ws_items.is_empty() {
+            let mut output = ws_items;
+            if let Some(old) = r.get("output").and_then(|o| o.as_array()).cloned() {
+                output.extend(old);
+            }
+            r["output"] = json!(output);
+        }
+        r
+    };
+
+    if stream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        // 由聚合结果合成 Responses SSE 事件序列（created → items → completed）
+        tokio::task::spawn_blocking(move || {
+            let send = |event: &str, data: &Value| {
+                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                    "event: {}\ndata: {}\n\n",
+                    event, data
+                ))));
+            };
+            let mut created = resp_obj.clone();
+            created["status"] = json!("in_progress");
+            created["output"] = json!([]);
+            send("response.created", &json!({"type": "response.created", "response": created}));
+            let output_items = resp_obj.get("output").and_then(|o| o.as_array()).cloned().unwrap_or_default();
+            for (i, item) in output_items.iter().enumerate() {
+                send("response.output_item.added", &json!({
+                    "type": "response.output_item.added",
+                    "output_index": i,
+                    "item": item,
+                }));
+                // message 文本增量（整段一次下发，聚合投影无逐 token 流）
+                if item.get("type").and_then(|v| v.as_str()) == Some("message") {
+                    if let Some(text) = item
+                        .pointer("/content/0/text")
+                        .and_then(|t| t.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        send("response.output_text.delta", &json!({
+                            "type": "response.output_text.delta",
+                            "item_id": item.get("id").cloned().unwrap_or(json!("")),
+                            "output_index": i,
+                            "content_index": 0,
+                            "delta": text,
+                        }));
+                    }
+                }
+                // function_call 参数增量
+                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                    if let Some(args) = item.get("arguments").and_then(|a| a.as_str()).filter(|s| !s.is_empty()) {
+                        send("response.function_call_arguments.delta", &json!({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item.get("id").cloned().unwrap_or(json!("")),
+                            "output_index": i,
+                            "delta": args,
+                        }));
+                    }
+                }
+                send("response.output_item.done", &json!({
+                    "type": "response.output_item.done",
+                    "output_index": i,
+                    "item": item,
+                }));
+            }
+            send("response.completed", &json!({"type": "response.completed", "response": resp_obj}));
+        });
+        let stream = ReceiverStream::new(rx);
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| internal_error_response())
+    } else {
+        Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(resp_obj.to_string()))
+            .unwrap_or_else(|_| internal_error_response())
+    }
+}
+
 // ==================== 小工具 ====================
 
 fn send_stream_error_wb(

@@ -331,9 +331,27 @@ export const api = {
     stop: () => invoke('api_server_stop'),
     status: () => invoke<ApiServiceStatus>('api_server_status'),
     poolList: () => invoke<ApiPoolFile>('pool_list'),
-    // T10：池设置扩展调度策略与分组筛选
-    poolSet: (uids: string[], strategy?: string, groupIds?: string[]) =>
-      invoke('pool_set', { uids, strategy: strategy ?? null, groupIds: groupIds ?? null }),
+    // T10：池设置扩展调度策略与分组筛选；T5.2/T5.3/T5.5/T5.6③ 扩展 WB 开关组
+    poolSet: (
+      uids: string[],
+      strategy?: string,
+      groupIds?: string[],
+      wbFlags?: {
+        wbEnabled?: boolean;
+        wbDefaultThinking?: boolean;
+        wbToolExec?: boolean;
+        wbBgDowngrade?: boolean;
+      },
+    ) =>
+      invoke('pool_set', {
+        uids,
+        strategy: strategy ?? null,
+        groupIds: groupIds ?? null,
+        wbEnabled: wbFlags?.wbEnabled ?? null,
+        wbDefaultThinking: wbFlags?.wbDefaultThinking ?? null,
+        wbToolExec: wbFlags?.wbToolExec ?? null,
+        wbBgDowngrade: wbFlags?.wbBgDowngrade ?? null,
+      }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
     logsList: () => invoke<string[]>('api_logs_list'),
     logsDetail: (date: string) => invoke<string | null>('api_logs_detail', { date }),

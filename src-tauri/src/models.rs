@@ -324,6 +324,15 @@ pub struct ApiPoolFile {
     /// WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池
     #[serde(default)]
     pub wb_enabled: bool,
+    /// 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high
+    #[serde(default)]
+    pub wb_default_thinking: bool,
+    /// 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行
+    #[serde(default = "default_true")]
+    pub wb_tool_exec: bool,
+    /// 后台任务降级（T5.6③/F-65）：标题/摘要类短请求路由到目录最低倍率模型
+    #[serde(default)]
+    pub wb_bg_downgrade: bool,
 }
 
 /// 池中单个账号的运行时状态（给 /status 和前端使用）

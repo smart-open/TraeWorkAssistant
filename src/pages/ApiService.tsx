@@ -58,6 +58,13 @@ export default function ApiService() {
   const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
   const [poolStrategy, setPoolStrategy] = useState('expire_first');
   const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
+  // T5.2/T5.3/T5.5/T5.6③ WB 上游开关组（api_pool.json，保存后重启生效）
+  const [wbFlags, setWbFlags] = useState({
+    wbEnabled: false,
+    wbDefaultThinking: false,
+    wbToolExec: true,
+    wbBgDowngrade: false,
+  });
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -270,6 +277,12 @@ export default function ApiService() {
       setEnabledUids(new Set(pool.enabled_uids));
       setPoolStrategy(pool.strategy || 'expire_first');
       setPoolGroups(new Set(pool.group_ids ?? []));
+      setWbFlags({
+        wbEnabled: !!pool.wb_enabled,
+        wbDefaultThinking: !!pool.wb_default_thinking,
+        wbToolExec: pool.wb_tool_exec !== false,
+        wbBgDowngrade: !!pool.wb_bg_downgrade,
+      });
     } catch {
       // 初始化加载失败静默保留空列表；手动点击刷新失败需给出提示
       if (manual) toast('error', '加载账号池失败，请重试');
@@ -362,7 +375,12 @@ export default function ApiService() {
     setStarting(true);
     try {
       // 启动前自动保存当前勾选的账号池，避免用户忘记点"保存"
-      await api.apiServer.poolSet([...enabledUids], poolStrategy, [...poolGroups]);
+      await api.apiServer.poolSet([...enabledUids], poolStrategy, [...poolGroups], {
+        wbEnabled: wbFlags.wbEnabled,
+        wbDefaultThinking: wbFlags.wbDefaultThinking,
+        wbToolExec: wbFlags.wbToolExec,
+        wbBgDowngrade: wbFlags.wbBgDowngrade,
+      });
       const s = await withMinDelay(api.apiServer.start());
       setStatus(s);
       useAppStore.setState({ apiStatus: s });
@@ -402,7 +420,12 @@ export default function ApiService() {
   const savePool = async () => {
     setSavingPool(true);
     try {
-      await withMinDelay(api.apiServer.poolSet([...enabledUids], poolStrategy, [...poolGroups]));
+      await withMinDelay(api.apiServer.poolSet([...enabledUids], poolStrategy, [...poolGroups], {
+        wbEnabled: wbFlags.wbEnabled,
+        wbDefaultThinking: wbFlags.wbDefaultThinking,
+        wbToolExec: wbFlags.wbToolExec,
+        wbBgDowngrade: wbFlags.wbBgDowngrade,
+      }));
       toast('success', '账号池已更新');
       if (status?.running) {
         toast('info', '需重启 API 服务以应用变更');
@@ -807,6 +830,45 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                     </div>
                   </div>
                 )}
+                {/* WB 上游开关组（T5.2/T5.3/T5.5/T5.6③） */}
+                <div className="space-y-1.5 rounded-lg border border-slate-100 p-2.5 dark:border-zinc-700/60">
+                  <p className="text-xs font-medium text-slate-600 dark:text-zinc-300">WorkBuddy 上游</p>
+                  {([
+                    {
+                      key: 'wbEnabled' as const,
+                      label: '启用 WB 上游',
+                      desc: 'WB 目录模型（/v1/models owned_by=workbuddy）路由到 WB 账号池',
+                    },
+                    {
+                      key: 'wbDefaultThinking' as const,
+                      label: '默认深度思考',
+                      desc: '客户端未显式请求 reasoning_effort 时默认注入 high（T5.3）',
+                    },
+                    {
+                      key: 'wbToolExec' as const,
+                      label: '网关工具代执行',
+                      desc: '/v1/responses 声明 web_search 时由代理侧执行搜索并回喂（T5.5，最多 3 轮）',
+                    },
+                    {
+                      key: 'wbBgDowngrade' as const,
+                      label: '后台任务降级',
+                      desc: '标题/摘要类短请求（≤128 token 且 ≤512 字符）路由到最低倍率模型（T5.6③）',
+                    },
+                  ]).map((item) => (
+                    <label key={item.key} className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                        checked={wbFlags[item.key]}
+                        onChange={() => setWbFlags((prev) => ({ ...prev, [item.key]: !prev[item.key] }))}
+                      />
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">{item.desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
                 <p className="text-xs text-slate-400 dark:text-zinc-500">
                   分组筛选与调度策略作用于网关取号范围，保存后需重启 API 服务生效；不选分组 = 全部参与
                 </p>

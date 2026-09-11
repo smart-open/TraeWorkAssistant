@@ -13,6 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::sse;
 use super::usage::{extract_tokens, KeyId};
 use super::wb_catalog;
+use super::wb_model_route;
 use super::wb_route;
 use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState, ErrKind,
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
@@ -49,9 +50,66 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 
 // ==================== Handlers ====================
 
-/// WB 上游模型路由判定（T2.1）：wb_model_catalog.json 命中即属 WB 上游
+/// WB 上游模型目录命中（T2.1 原始判定，保留供 /v1/models 与诊断复用）
+#[allow(dead_code)]
 fn wb_model_requested(state: &ApiSharedState, model: &str) -> bool {
     wb_catalog::find(&wb_catalog::load(&state.data_dir), model).is_some()
+}
+
+fn internal_error_response() -> Response {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from("{\"error\":{\"message\":\"internal error\"}}"))
+        .unwrap()
+}
+
+/// T5.2/F-61 四段模型路由解析（别名→规则→系列通配→后缀）+ T5.6③ 后台任务降级。
+/// 返回 (最终模型, 路由级 effort 注入提示)；全未命中目录 → None（走 SOLO 上游）。
+fn resolve_wb_target(
+    state: &ApiSharedState,
+    model: &str,
+    body: &Value,
+) -> Option<(String, Option<String>)> {
+    let cfg = wb_model_route::load_config(&state.data_dir);
+    let catalog = wb_catalog::load(&state.data_dir);
+    let r = wb_model_route::resolve(&cfg, &catalog, model);
+    if wb_catalog::find(&catalog, &r.model).is_none() {
+        return None;
+    }
+    // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
+    let final_model = if state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+        && wb_model_route::is_background_task(body)
+    {
+        wb_model_route::cheapest_catalog_model(&catalog).unwrap_or(r.model)
+    } else {
+        r.model
+    };
+    Some((final_model, r.effort_hint))
+}
+
+/// T5.3/F-62 默认深度思考：客户端未显式请求 effort 且无路由级提示时默认 high。
+/// `explicit_effort` 由调用方按协议判定（OpenAI: reasoning_effort 字段；Anthropic: thinking 参数）
+fn effective_effort_hint(
+    state: &ApiSharedState,
+    route_hint: Option<String>,
+    explicit_effort: bool,
+) -> Option<String> {
+    if route_hint.is_some() {
+        return route_hint;
+    }
+    if !explicit_effort
+        && state
+            .wb_default_thinking
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Some("high".to_string());
+    }
+    None
+}
+
+/// 注入 effort 提示到请求体字节流（T5.2④/T5.3）
+fn apply_effort_hint(body_vec: Vec<u8>, hint: Option<String>) -> Vec<u8> {
+    wb_model_route::inject_effort_hint(&body_vec, &hint)
 }
 
 /// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）
@@ -250,6 +308,7 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
 pub async fn chat_completions(
     State(state): State<Arc<ApiSharedState>>,
     key_id: Option<Extension<KeyId>>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     if body.len() > MAX_BODY_BYTES {
@@ -257,6 +316,16 @@ pub async fn chat_completions(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
             "request body exceeds 8MB limit",
+        );
+    }
+
+    // T5.6② 单端口协议区分：anthropic-version 头出现 → 客户端实为 Anthropic
+    // Messages 协议，按路径分流给出明确指引（避免三协议混投后字段级静默错乱）
+    if headers.contains_key("anthropic-version") {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "wrong_endpoint",
+            "检测到 anthropic-version 头：该请求应为 Anthropic Messages 协议，请改用 POST /v1/messages（本网关单端口三协议按路径区分）",
         );
     }
 
@@ -286,8 +355,8 @@ pub async fn chat_completions(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
-    // 模型路由（T2.1）：WB 目录命中 → WB 上游
-    if wb_model_requested(&state, &model) {
+    // 模型路由（T5.2/F-61 四段管线）：解析成功 → WB 上游；未命中 → SOLO
+    if let Some((resolved_model, route_hint)) = resolve_wb_target(&state, &model, &peek) {
         if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             return openai_error(
                 StatusCode::BAD_REQUEST,
@@ -295,13 +364,17 @@ pub async fn chat_completions(
                 "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）",
             );
         }
-        if wb_route::model_cooling_remaining(&state, &model).is_some() {
-            return model_cooling_response(&state, &model, Protocol::OpenAi);
+        if wb_route::model_cooling_remaining(&state, &resolved_model).is_some() {
+            return model_cooling_response(&state, &resolved_model, Protocol::OpenAi);
         }
+        // T5.3 默认深度思考：客户端未带 reasoning_effort 时注入 high
+        let explicit = peek.get("reasoning_effort").and_then(|v| v.as_str()).is_some();
+        let hint = effective_effort_hint(&state, route_hint, explicit);
+        let body_vec = apply_effort_hint(body_vec, hint);
         if stream {
-            return wb_route::wb_stream_chat(state_clone, body_vec, model, start_ts, Protocol::OpenAi, key_str);
+            return wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::OpenAi, key_str);
         }
-        return wb_route::wb_aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi, key_str).await;
+        return wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::OpenAi, key_str).await;
     }
 
     if stream {
@@ -363,16 +436,20 @@ pub async fn responses_api(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
-    if !wb_model_requested(&state, &model) {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "model_not_found",
-            &format!(
-                "model {} is not a WorkBuddy upstream model（/v1/responses 仅支持 WB 上游模型，目录见 /v1/models）",
-                model
-            ),
-        );
-    }
+    // T5.2/F-61 四段路由解析（Responses 仅支持 WB 上游模型）
+    let (resolved_model, route_hint) = match resolve_wb_target(&state, &model, &chat_body) {
+        Some(t) => t,
+        None => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "model_not_found",
+                &format!(
+                    "model {} is not a WorkBuddy upstream model（/v1/responses 仅支持 WB 上游模型，目录见 /v1/models）",
+                    model
+                ),
+            );
+        }
+    };
     if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -380,18 +457,35 @@ pub async fn responses_api(
             "WB 上游未启用（api_pool.json wb_enabled）",
         );
     }
-    if wb_route::model_cooling_remaining(&state, &model).is_some() {
-        return model_cooling_response(&state, &model, Protocol::Responses);
+    if wb_route::model_cooling_remaining(&state, &resolved_model).is_some() {
+        return model_cooling_response(&state, &resolved_model, Protocol::Responses);
     }
 
     let mut chat_body = chat_body;
+    // T5.5/F-64 工具代执行：客户端声明 web_search 类工具且开关开启 → 代理侧代执行编排
+    if state.wb_tool_exec.load(std::sync::atomic::Ordering::Relaxed)
+        && super::wb_toolexec::responses_declares_web_search(&peek)
+    {
+        return wb_route::wb_tool_exec_chat(
+            state_clone,
+            chat_body,
+            resolved_model,
+            stream,
+            start_ts,
+            key_str,
+        )
+        .await;
+    }
     chat_body["stream"] = json!(stream);
-    let body_vec = serde_json::to_vec(&chat_body).unwrap_or_default();
+    // T5.3 默认深度思考（Responses: reasoning.effort 已投影为 reasoning_effort）
+    let explicit = chat_body.get("reasoning_effort").and_then(|v| v.as_str()).is_some();
+    let hint = effective_effort_hint(&state, route_hint, explicit);
+    let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
     if stream {
-        wb_route::wb_stream_chat(state_clone, body_vec, model, start_ts, Protocol::Responses, key_str)
+        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str)
     } else {
-        wb_route::wb_aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Responses, key_str).await
+        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str).await
     }
 }
 
@@ -445,8 +539,8 @@ pub async fn messages(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
-    // 模型路由（T2.1）：WB 目录命中 → WB 上游（body 已转为 OpenAI 内部格式）
-    if wb_model_requested(&state, &model) {
+    // 模型路由（T5.2/F-61 四段管线；body 已转为 OpenAI 内部格式）
+    if let Some((resolved_model, route_hint)) = resolve_wb_target(&state, &model, &peek) {
         if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             return anthropic_error(
                 StatusCode::BAD_REQUEST,
@@ -454,13 +548,17 @@ pub async fn messages(
                 "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）",
             );
         }
-        if wb_route::model_cooling_remaining(&state, &model).is_some() {
-            return model_cooling_response(&state, &model, Protocol::Anthropic);
+        if wb_route::model_cooling_remaining(&state, &resolved_model).is_some() {
+            return model_cooling_response(&state, &resolved_model, Protocol::Anthropic);
         }
+        // T5.3 默认深度思考：Anthropic 侧 thinking 参数视为显式请求
+        let explicit = peek.get("thinking").map_or(false, |t| !t.is_null());
+        let hint = effective_effort_hint(&state, route_hint, explicit);
+        let body_vec = apply_effort_hint(body_vec, hint);
         if stream {
-            return wb_route::wb_stream_chat(state_clone, body_vec, model, start_ts, Protocol::Anthropic, key_str);
+            return wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Anthropic, key_str);
         }
-        return wb_route::wb_aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic, key_str).await;
+        return wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Anthropic, key_str).await;
     }
 
     if stream {
@@ -552,8 +650,8 @@ pub async fn completions(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
-    // 模型路由（T2.1）：WB 目录命中 → WB 上游
-    if wb_model_requested(&state, &model) {
+    // 模型路由（T5.2/F-61 四段管线）
+    if let Some((resolved_model, route_hint)) = resolve_wb_target(&state, &model, &internal) {
         if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             return openai_error(
                 StatusCode::BAD_REQUEST,
@@ -561,13 +659,16 @@ pub async fn completions(
                 "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）",
             );
         }
-        if wb_route::model_cooling_remaining(&state, &model).is_some() {
-            return model_cooling_response(&state, &model, Protocol::OpenAiText);
+        if wb_route::model_cooling_remaining(&state, &resolved_model).is_some() {
+            return model_cooling_response(&state, &resolved_model, Protocol::OpenAiText);
         }
+        // T5.3 默认深度思考（text completions 无 effort 字段 → 默认思考直接生效）
+        let hint = effective_effort_hint(&state, route_hint, false);
+        let body_vec = apply_effort_hint(body_vec, hint);
         if stream {
-            return wb_route::wb_stream_chat(state_clone, body_vec, model, start_ts, Protocol::OpenAiText, key_str);
+            return wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::OpenAiText, key_str);
         }
-        return wb_route::wb_aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAiText, key_str).await;
+        return wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::OpenAiText, key_str).await;
     }
 
     if stream {
@@ -584,6 +685,120 @@ pub async fn embeddings() -> Response {
         "not_supported",
         "上游服务无 embeddings 能力，本网关不支持 /v1/embeddings，请使用 /v1/chat/completions 或 /v1/completions",
     )
+}
+
+/// /v1/images/generations 文生图（T5.4/F-63）：投影 WB 上游生图端点
+pub async fn images_generations(
+    State(state): State<Arc<ApiSharedState>>,
+    key_id: Option<Extension<KeyId>>,
+    body: axum::body::Bytes,
+) -> Response {
+    images_entry(state, key_id, body, false).await
+}
+
+/// /v1/images/edits 图生图（T5.4/F-63）：接受 JSON（image 为 base64/data URL）。
+/// 注：OpenAI SDK 默认 multipart/form-data；本端点仅接受 JSON 变体（零新增依赖红线），
+/// 客户端需将图像读为 base64 后以 JSON 提交。
+pub async fn images_edits(
+    State(state): State<Arc<ApiSharedState>>,
+    key_id: Option<Extension<KeyId>>,
+    body: axum::body::Bytes,
+) -> Response {
+    images_entry(state, key_id, body, true).await
+}
+
+async fn images_entry(
+    state: Arc<ApiSharedState>,
+    key_id: Option<Extension<KeyId>>,
+    body: axum::body::Bytes,
+    is_edit: bool,
+) -> Response {
+    state
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if body.len() > MAX_BODY_BYTES {
+        return openai_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", "request body exceeds 8MB limit");
+    }
+    let peek: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &format!("invalid JSON body: {}", e)),
+    };
+    let model = peek
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("hy4")
+        .to_string();
+    let prompt = peek.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let image_b64 = peek.get("image").and_then(|v| v.as_str()).map(str::to_string);
+    let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    let start_ts = std::time::Instant::now();
+
+    // 校验（目录命中 + 图片模态 + prompt/image 非空）
+    let catalog = wb_catalog::load(&state.data_dir);
+    if let Err((code, msg)) = super::wb_images::validate(
+        &catalog,
+        &model,
+        &prompt,
+        if is_edit { Some(image_b64.as_deref().unwrap_or("")) } else { None },
+    ) {
+        return openai_error(
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            "invalid_request_error",
+            &msg,
+        );
+    }
+
+    // 取健康 WB 账号（生图无粘性语义，任一健康账号）
+    let picked = {
+        let tried = HashSet::new();
+        state.wb_pool.pick_excluding_constrained(&tried, None, None)
+    };
+    let Some(picked) = picked else {
+        return openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", "no healthy WB account available");
+    };
+    let creds = super::wb_upstream::WbCreds {
+        id: picked.uid.clone(),
+        uid: picked.uid.clone(),
+        name: String::new(),
+        token: picked.jwt.clone(),
+        domain: picked.domain.clone(),
+        enterprise_id: picked.enterprise_id.clone(),
+        global_region: picked.global_region,
+    };
+
+    let result = tokio::task::spawn_blocking(move || super::wb_images::generate(&creds, &peek))
+        .await
+        .unwrap_or_else(|e| Err((500u16, format!("task join error: {e}"))));
+    let duration_ms = start_ts.elapsed().as_millis() as u64;
+    match result {
+        Ok(resp) => {
+            state.record_usage(&model, &picked.uid, &key_str, true, false, duration_ms, 0, 0);
+            state.wb_pool.note_success(&picked.uid);
+            state.logger.log_request(
+                "POST",
+                if is_edit { "/v1/images/edits" } else { "/v1/images/generations" },
+                &model, false, 200, &picked.uid, duration_ms, None,
+            );
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(resp.to_string()))
+                .unwrap_or_else(|_| internal_error_response())
+        }
+        Err((code, msg)) => {
+            state.record_usage(&model, &picked.uid, &key_str, false, false, duration_ms, 0, 0);
+            state.logger.log_request(
+                "POST",
+                if is_edit { "/v1/images/edits" } else { "/v1/images/generations" },
+                &model, false, code, &picked.uid, duration_ms, Some(&msg),
+            );
+            openai_error(
+                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+                "upstream_error",
+                &msg,
+            )
+        }
+    }
 }
 
 // ==================== Streaming ====================

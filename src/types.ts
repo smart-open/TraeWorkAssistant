@@ -327,6 +327,14 @@ export interface ApiPoolFile {
   strategy?: string;
   /** 参与调度的分组 id 列表；空 = 不限分组（T10） */
   group_ids?: string[];
+  /** WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池 */
+  wb_enabled?: boolean;
+  /** 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high */
+  wb_default_thinking?: boolean;
+  /** 工具代执行（T5.5/F-64）：客户端声明 web_search 类工具时代理侧代执行 */
+  wb_tool_exec?: boolean;
+  /** 后台任务降级（T5.6③/F-65）：标题/摘要类短请求路由到目录最低倍率模型 */
+  wb_bg_downgrade?: boolean;
 }
 
 /** 用量统计计数（按模型/账号/Key 维度，T1） */
