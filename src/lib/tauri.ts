@@ -5,6 +5,7 @@ import type {
   ApiServiceStatus,
   ApiPoolFile,
   ApiKeyEntry,
+  CcSwitchStatus,
   AppLocate,
   CheckinDone,
   CheckinOpts,
@@ -372,6 +373,17 @@ export const api = {
     debugStatus: () => invoke<boolean>('api_debug_status'),
     modelsList: () => invoke<ModelOption[]>('api_models_list'),
     modelsSync: () => invoke<ModelOption[]>('api_models_sync'),
+    // T5.1/F-37：WB 上游模型目录动态替换（手动触发；网关启动时已自动做一次）
+    wbCatalogSync: () => invoke<number>('api_wb_catalog_sync'),
+    // T5.7/F-43：CC Switch 协同（注册网关 provider 条目，不自建切换器）
+    ccSwitchStatus: () => invoke<CcSwitchStatus>('ccswitch_status'),
+    ccSwitchRegister: (appType: 'claude' | 'codex', apiKey?: string, model?: string) =>
+      invoke<string>('ccswitch_register', {
+        appType,
+        apiKey: apiKey ?? null,
+        model: model ?? null,
+        port: null,
+      }),
     // T1：近 N 天 API 用量统计（按日聚合，服务未运行也可查）
     usageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_usage_stats', { days: days ?? null }),

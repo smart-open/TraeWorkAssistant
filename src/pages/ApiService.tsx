@@ -354,6 +354,40 @@ export default function ApiService() {
     }
   };
 
+  // T5.1/F-37：WB 上游模型目录动态替换（手动触发）
+  const [syncingWbCatalog, setSyncingWbCatalog] = useState(false);
+  // T5.7/F-43：CC Switch 注册状态
+  const [ccBusy, setCcBusy] = useState<'claude' | 'codex' | null>(null);
+  const [ecoNote, setEcoNote] = useState('');
+
+  const syncWbCatalog = async () => {
+    if (syncingWbCatalog) return;
+    setSyncingWbCatalog(true);
+    setEcoNote('');
+    try {
+      const n = await withMinDelay(api.apiServer.wbCatalogSync());
+      setEcoNote(`✓ WB 模型目录已更新（${n} 个模型），/v1/models 与路由即时生效`);
+    } catch (e) {
+      setEcoNote(`✗ WB 模型目录同步失败：${String(e).slice(0, 120)}`);
+    } finally {
+      setSyncingWbCatalog(false);
+    }
+  };
+
+  const registerCcSwitch = async (appType: 'claude' | 'codex') => {
+    if (ccBusy) return;
+    setCcBusy(appType);
+    setEcoNote('');
+    try {
+      const msg = await withMinDelay(api.apiServer.ccSwitchRegister(appType));
+      setEcoNote(`✓ ${msg}`);
+    } catch (e) {
+      setEcoNote(`✗ CC Switch 注册失败：${String(e).slice(0, 160)}`);
+    } finally {
+      setCcBusy(null);
+    }
+  };
+
   const update = <K extends keyof Settings>(key: K, val: Settings[K]) => {
     setForm((prev) => (prev ? { ...prev, [key]: val } : prev));
   };
@@ -694,6 +728,49 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
               </div>
               <p className="mt-1 text-xs text-slate-400">
                 上游接口：llm_utils_chat（通用积分，product_id 208）
+              </p>
+            </div>
+
+            {/* T5.1/T5.7 生态接入：WB 模型目录动态替换 + CC Switch 协同 */}
+            <div className="rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+              <p className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-400">
+                生态接入
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  className="btn-ghost flex items-center gap-1 !p-2 text-xs"
+                  onClick={() => void syncWbCatalog()}
+                  disabled={syncingWbCatalog}
+                  title="从 WB 上游模型目录接口拉取并替换 wb_model_catalog.json（倍率/思考档位/图片模态以服务端为准）"
+                >
+                  <RefreshCw size={13} className={syncingWbCatalog ? 'animate-spin' : ''} />
+                  {syncingWbCatalog ? '同步中…' : '同步 WB 模型目录'}
+                </button>
+                <button
+                  className="btn-ghost !p-2 text-xs"
+                  onClick={() => void registerCcSwitch('claude')}
+                  disabled={ccBusy !== null}
+                  title="把网关 Anthropic 端点（/v1/messages）注册进 CC Switch，由 CC Switch 负责切换"
+                >
+                  注册到 CC Switch（Claude Code）
+                </button>
+                <button
+                  className="btn-ghost !p-2 text-xs"
+                  onClick={() => void registerCcSwitch('codex')}
+                  disabled={ccBusy !== null}
+                  title="把网关 Responses 端点（/v1/responses）注册进 CC Switch，由 CC Switch 负责切换"
+                >
+                  注册到 CC Switch（Codex）
+                </button>
+              </div>
+              {ecoNote && (
+                <p className="mt-2 break-all text-[11px] leading-4 text-slate-500 dark:text-zinc-400">
+                  {ecoNote}
+                </p>
+              )}
+              <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
+                CC Switch 注册会先整库备份至 ~/.cc-switch/backups/，仅写入本网关条目、不改其它
+                provider；写入后需重启 CC Switch 生效。
               </p>
             </div>
 

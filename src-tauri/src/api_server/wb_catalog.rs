@@ -9,6 +9,7 @@
 //!   优先级：修正层 > 客户端请求 > 上游默认。
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// 单个模型的能力声明
@@ -155,6 +156,144 @@ pub fn find<'a>(catalog: &'a [WbModel], model: &str) -> Option<&'a WbModel> {
     catalog.iter().find(|m| m.id == lower)
 }
 
+// ==================== T5.1/F-37 动态目录替换 ====================
+
+/// 上游目录响应 → 模型列表（宽容解析：字段链逐级探测，能力字段读上游勿硬编码）。
+/// 兼容三种容器形态：根数组 / {data: []} / {models: []}（值可为 list 或含 list 字段）。
+/// 解析产出 0 条视为失败（不产脏目录），由调用方决定回退行为。
+pub fn parse_upstream_catalog(body: &Value) -> Vec<WbModel> {
+    let items: Vec<Value> = match body {
+        Value::Array(arr) => arr.clone(),
+        v => v
+            .get("data")
+            .or_else(|| v.get("models"))
+            .or_else(|| v.get("list"))
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let dig_str = |v: &Value, keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| {
+            v.get(*k).and_then(|x| x.as_str()).map(str::to_string).or_else(|| {
+                v.get(*k).and_then(|x| x.as_i64()).map(|n| n.to_string())
+            })
+        })
+    };
+    let dig_u64 = |v: &Value, keys: &[&str]| -> Option<u64> {
+        keys.iter().find_map(|k| {
+            v.get(*k)
+                .and_then(|x| x.as_u64())
+                .or_else(|| v.get(*k).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()))
+        })
+    };
+    let dig_f64 = |v: &Value, keys: &[&str]| -> Option<f64> {
+        keys.iter().find_map(|k| {
+            v.get(*k)
+                .and_then(|x| x.as_f64())
+                .or_else(|| v.get(*k).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()))
+        })
+    };
+    let dig_strs = |v: &Value, keys: &[&str]| -> Vec<String> {
+        keys.iter()
+            .find_map(|k| {
+                v.get(*k)
+                    .and_then(|x| x.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|a| !a.is_empty())
+            })
+            .unwrap_or_default()
+    };
+
+    let mut out = Vec::new();
+    for item in &items {
+        if !item.is_object() {
+            continue;
+        }
+        let Some(id) = dig_str(item, &["id", "model", "modelId", "name"])
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let modalities = dig_strs(item, &["inputModalities", "input_modalities", "modalities"]);
+        let supports_image = modalities
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case("image") || m.eq_ignore_ascii_case("image_url"));
+        let model = WbModel {
+            display: dig_str(item, &["displayName", "display", "name"]).unwrap_or_else(|| id.clone()),
+            context_length: dig_u64(item, &["contextLength", "context_length", "inputTokenLimit"]).unwrap_or(0),
+            max_tokens: dig_u64(item, &["maxTokens", "max_tokens", "maxOutputTokens"]).unwrap_or(0),
+            supports_image,
+            supported_efforts: dig_strs(item, &["supportedEfforts", "supported_efforts", "efforts"])
+                .into_iter()
+                .map(|e| e.to_lowercase())
+                .collect(),
+            effort_override: None, // 修正层仅人工/实测维护，不从上游读
+            rate: dig_f64(item, &["rate", "ratio", "price", "creditRate"]).unwrap_or(0.0),
+            id,
+        };
+        out.push(model);
+    }
+    out
+}
+
+/// 从上游模型目录接口拉取并全量替换本地目录（T5.1/F-37 启动动态替换）。
+/// 失败返回 Err（本地目录保持不动——静态兜底永远不因网络抖动被清掉）。
+pub fn fetch_and_replace(
+    data_dir: &Path,
+    uid: &str,
+    token: &str,
+    domain: &str,
+    enterprise_id: &str,
+    global_region: bool,
+) -> Result<usize, String> {
+    use super::wb_upstream::{build_chat_headers, wb_agent, WbCreds};
+    let creds = WbCreds {
+        id: String::new(),
+        uid: uid.to_string(),
+        name: String::new(),
+        token: token.to_string(),
+        domain: domain.to_string(),
+        enterprise_id: enterprise_id.to_string(),
+        global_region,
+    };
+    let url = format!("{}/console/enterprises/personal/models", creds.chat_base());
+    let mut req = wb_agent().get(&url).timeout(std::time::Duration::from_secs(20));
+    for (k, v) in build_chat_headers(&creds) {
+        // 目录为 GET JSON：accept 覆盖 build_chat_headers 的 text/event-stream 默认
+        let v = if k.eq_ignore_ascii_case("accept") { "application/json".into() } else { v };
+        req = req.set(k, &v);
+    }
+    let body: Value = match req.call() {
+        Ok(r) => r.into_json().map_err(|e| format!("目录响应解析失败: {e}"))?,
+        Err(ureq::Error::Status(code, _)) => return Err(format!("目录接口 HTTP {code}")),
+        Err(e) => return Err(format!("目录请求失败: {e}")),
+    };
+    let models = parse_upstream_catalog(&body);
+    if models.is_empty() {
+        return Err("上游目录解析产出 0 个模型（响应结构与预期不符），本地目录保持不变".into());
+    }
+    let count = models.len();
+    crate::fs_utils::write_json(
+        &catalog_path(data_dir),
+        &WbCatalogFile {
+            models,
+            fetched_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            ),
+        },
+    )
+    .map_err(|e| format!("写目录文件失败: {e}"))?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +337,64 @@ mod tests {
         assert!(find(&c, "GLM-5.3").is_some());
         assert!(find(&c, "glm-5.3").is_some());
         assert!(find(&c, "not-a-model").is_none());
+    }
+
+    // ==================== T5.1/F-37 动态解析 ====================
+
+    #[test]
+    fn parse_upstream_catalog_three_container_shapes() {
+        let entry = serde_json::json!({
+            "id": "GLM-5.5",
+            "displayName": "GLM 5.5",
+            "contextLength": 200000,
+            "maxTokens": 96000,
+            "inputModalities": ["text", "image"],
+            "supportedEfforts": ["low", "medium", "high"],
+            "rate": 0.99,
+        });
+        let root = serde_json::json!([entry.clone()]);
+        let data = serde_json::json!({"data": [entry.clone()]});
+        let models = serde_json::json!({"models": [entry.clone()]});
+        for body in [root, data, models] {
+            let out = parse_upstream_catalog(&body);
+            assert_eq!(out.len(), 1, "container shape");
+            let m = &out[0];
+            assert_eq!(m.id, "glm-5.5");
+            assert_eq!(m.display, "GLM 5.5");
+            assert_eq!(m.context_length, 200000);
+            assert_eq!(m.max_tokens, 96000);
+            assert!(m.supports_image, "inputModalities 含 image");
+            assert_eq!(m.supported_efforts, vec!["low", "medium", "high"]);
+            assert!((m.rate - 0.99).abs() < 1e-9);
+            assert!(m.effort_override.is_none(), "修正层不从上游读");
+        }
+    }
+
+    #[test]
+    fn parse_upstream_catalog_tolerates_missing_fields_and_garbage() {
+        // 缺能力字段 → 零值默认，不报错
+        let out = parse_upstream_catalog(&serde_json::json!({"data": [{"id": "M1"}, {"model": "M2"}]}));
+        assert_eq!(out.len(), 2);
+        assert!(out[0].id == "m1" && out[1].id == "m2");
+        assert!(!out[0].supports_image);
+        assert!(out[0].supported_efforts.is_empty());
+        // 非 dict 条目 / 缺 id → 跳过
+        let out = parse_upstream_catalog(&serde_json::json!({"data": ["junk", {"displayName": "无id"}, 42]}));
+        assert!(out.is_empty());
+        // 完全无关结构 → 空列表（调用方保持本地目录不变）
+        assert!(parse_upstream_catalog(&serde_json::json!({"foo": 1})).is_empty());
+        assert!(parse_upstream_catalog(&serde_json::json!("text")).is_empty());
+    }
+
+    #[test]
+    fn parse_upstream_catalog_numeric_and_string_fields() {
+        let body = serde_json::json!({"data": [
+            {"id": "hy5", "contextLength": "1000000", "rate": "0.35", "modalities": ["image_url"]},
+        ]});
+        let out = parse_upstream_catalog(&body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].context_length, 1_000_000, "字符串数值宽容解析");
+        assert!((out[0].rate - 0.35).abs() < 1e-9);
+        assert!(out[0].supports_image, "modalities 别名键");
     }
 }

@@ -337,6 +337,14 @@ export interface ApiPoolFile {
   wb_bg_downgrade?: boolean;
 }
 
+/** CC Switch 协同状态（T5.7/F-43） */
+export interface CcSwitchStatus {
+  installed: boolean;
+  dbPath: string;
+  claudeRegistered: boolean;
+  codexRegistered: boolean;
+}
+
 /** 用量统计计数（按模型/账号/Key 维度，T1） */
 export interface UsageCounterView {
   name: string;

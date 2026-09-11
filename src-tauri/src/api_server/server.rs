@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use super::auth;
 use super::routes;
+use super::wb_catalog;
 use super::ApiSharedState;
 
 /// API 服务器句柄：用于优雅停止
@@ -92,6 +93,38 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
 fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
+        // T5.1/F-37：启动即做一次上游目录动态替换（best effort，失败不影响启动——
+        // 本地静态兜底目录保持不动）；取任一健康 WB 账号的凭证拉取
+        {
+            let picked = state.wb_pool.pick_excluding_constrained(
+                &std::collections::HashSet::new(),
+                None,
+                None,
+            );
+            if let Some(p) = picked {
+                match wb_catalog::fetch_and_replace(
+                    &state.data_dir,
+                    &p.uid,
+                    &p.jwt,
+                    &p.domain,
+                    &p.enterprise_id,
+                    p.global_region,
+                ) {
+                    Ok(n) => {
+                        crate::fs_utils::app_log(
+                            &state.data_dir,
+                            &format!("WB 模型目录动态替换成功: {} 个模型", n),
+                        );
+                    }
+                    Err(e) => {
+                        crate::fs_utils::app_log(
+                            &state.data_dir,
+                            &format!("WB 模型目录动态替换失败（保持静态兜底）: {}", e),
+                        );
+                    }
+                }
+            }
+        }
         // 探测目标：WB 上游对话主域名（CN）的轻量 GET 路径
         const PROBE_URL: &str =
             concat!("https://copilot.tencent.com", "/console/enterprises/personal/models");

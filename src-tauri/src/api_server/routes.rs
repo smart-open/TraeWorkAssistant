@@ -288,7 +288,8 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
         })
         .collect();
     // WB 上游模型目录合并（T2.1/T2.3）：启用时并入，owned_by=workbuddy；
-    // 能力字段读目录（supportedEfforts 等，批次 4 F-37 动态替换）
+    // 能力字段读目录（T5.1/F-37：inputModalities→supports_image、supportedEfforts、
+    // 倍率透传——徽章/降级判定由客户端按元数据自决，勿硬编码）
     if state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
         for m in wb_catalog::load(&state.data_dir) {
             data.push(json!({
@@ -299,6 +300,8 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
                 "context_length": m.context_length,
                 "max_tokens": m.max_tokens,
                 "rate": m.rate,
+                "supports_image": m.supports_image,
+                "supported_efforts": m.supported_efforts,
             }));
         }
     }

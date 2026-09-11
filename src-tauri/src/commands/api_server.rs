@@ -496,6 +496,27 @@ pub async fn api_models_sync(
         .map_err(|e| format!("同步任务执行失败: {e}"))?
 }
 
+/// 从 WB 上游模型目录接口同步 wb_model_catalog.json（T5.1/F-37，动态替换；
+/// 网关启动时已自动做一次，此命令供手动刷新）。取任一含凭证的 WB 账号。
+#[tauri::command]
+pub async fn api_wb_catalog_sync(state: State<'_, AppState>) -> Result<usize, String> {
+    let data_dir = state.data_dir.clone();
+    let accounts = crate::commands::workbuddy::wb_upstream_accounts(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let acct = accounts.first().ok_or("无可用 WB 账号凭证，无法拉取上游目录")?;
+        crate::api_server::wb_catalog::fetch_and_replace(
+            &data_dir,
+            &acct.uid,
+            &acct.token,
+            &acct.domain,
+            &acct.enterprise_id,
+            acct.global_region,
+        )
+    })
+    .await
+    .map_err(|e| format!("同步任务执行失败: {e}"))?
+}
+
 /// 查询最近 N 天的 API 用量统计（按日聚合，直接读盘，服务未运行也可查）
 #[tauri::command]
 pub fn api_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
