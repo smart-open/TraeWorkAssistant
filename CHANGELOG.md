@@ -22,6 +22,21 @@
 - **CC Switch 协同（T5.7/F-43）**：新增 `commands/ccswitch.rs`（3 单测）——不自建切换器，把网关端点作为 provider 条目 upsert 进 `~/.cc-switch/cc-switch.db`（固定 id `aiwork-gateway-<app_type>`）：claude=扁平 env（ANTHROPIC_BASE_URL 不带 /v1 + 模型映射）/ codex=auth+config.toml（wire_api=responses）；写前整库备份至 `~/.cc-switch/backups/`、只动自有条目、Key 不入日志；`ccswitch_status`/`ccswitch_register` 命令 + ApiService 生态接入区 UI（同步 WB 目录 / 注册 Claude / 注册 Codex）
 - **测试基线**：cargo 108→**136** 单测全绿（wb_model_route 12 + wb_toolexec 8 + wb_images 4 + wb_catalog 3 + ccswitch 3 新增）；vitest 18/18、npm build、src-python py_compile 全绿
 
+### 修复（批次 5 全面审查，commit 832704a）
+
+- **[P2] 四段路由 `strip_suffix_ci` 字符边界**：字节切片 `&name[..len-suffix.len()]` 在自定义后缀含多字节字符且大小写转换改变字节长度时可能越过字符边界 panic（网络请求路径）；改为纯字符级切分并补多字节回归单测。
+- **[P2] 工具代执行账号归因**：`wb_tool_exec_chat` 的 `record_usage`/请求日志 uid 由常量 `wb-toolexec` 改为真实成功账号 uid，按账号用量统计不再失真。
+- **[P3] `is_background_task` 补检 `max_completion_tokens`**（OpenAI 新字段），后台任务降级覆盖更全。
+- **[P3] `percent_decode` 冗余重复条件清理；`open_url` 死变量 `cleaned` 删除**（省一次整页 `to_lowercase` 分配）。
+
+### 已审查通过项（全面审查，未发现问题的维度）
+
+- **业务正确性**：四段路由每级命中即止 + 目录校验兜底、生图 501 红线明示、工具代执行 MAX_ROUNDS=3 积分上界、后台降级仅显式开关生效、CC Switch 只动自有条目 + 写前整库备份——均符合设计文档 F-61~F-65/F-21/F-37/F-43 验收口径。
+- **安全**：pool_set 未传开关保留原值（默认值不回退）、CC Switch API Key 不入日志不回显、quota 兜底仅 127.0.0.1 探测 + 响应 64KB 上限 + 递归深度限制、`/v1/images` 走既有 Key 鉴权中间件。
+- **异常健壮性**：目录动态替换产出 0 条不落盘（静态兜底永不被网络抖动清掉）、上游全形态错误映射（401 刷新重试/分级冷却/换号）、spawn_blocking 隔离全部阻塞网络调用。
+- **性能**：wb_model_route 通配零正则依赖、DDG 解析字符串定位无 HTML 解析器分配放大。
+- **审查后校验基线**：cargo **137/137**（+2 回归单测）、vitest 18/18、npm build、py_compile 全绿、零编译告警。
+
 ---
 
 ## [未发布] · feature/buddy §2.2 非功能需求补齐 + 批次 1-4 九大类黑盒审查修复
