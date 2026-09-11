@@ -18,7 +18,9 @@
 ### 变更
 
 - **WB 上游开关组 UI（T5.2/T5.3/T5.5/T5.6③ 配套）**：ApiService 池设置卡新增 4 开关（启用 WB 上游/默认深度思考/网关工具代执行/后台任务降级），`pool_set` 命令未传字段保留原值（serde default 兼容旧 api_pool.json）；wb_tool_exec 默认开
-- **测试基线**：cargo 108→**130** 单测全绿（wb_model_route 12 + wb_toolexec 8 + wb_images 4 新增）；vitest 18/18、npm build、src-python py_compile 全绿
+- **DSH provider 目录动态替换（T5.1/F-37）**：`wb_catalog.rs` 新增 `parse_upstream_catalog`（宽容解析：根数组/data/models 三容器形态，字段链逐级探测 id/display/contextLength/maxTokens/inputModalities→supports_image/supportedEfforts/rate，字符串数值宽容，产出 0 条不落盘）+ `fetch_and_replace`（GET `{chatBase}/console/enterprises/personal/models`，headers 三铁律 accept 换 JSON）；网关启动自动做一次（best effort，失败保持静态兜底）+ `api_wb_catalog_sync` 手动命令；`/v1/models` WB 条目透传 `supports_image`/`supported_efforts` 元数据
+- **CC Switch 协同（T5.7/F-43）**：新增 `commands/ccswitch.rs`（3 单测）——不自建切换器，把网关端点作为 provider 条目 upsert 进 `~/.cc-switch/cc-switch.db`（固定 id `aiwork-gateway-<app_type>`）：claude=扁平 env（ANTHROPIC_BASE_URL 不带 /v1 + 模型映射）/ codex=auth+config.toml（wire_api=responses）；写前整库备份至 `~/.cc-switch/backups/`、只动自有条目、Key 不入日志；`ccswitch_status`/`ccswitch_register` 命令 + ApiService 生态接入区 UI（同步 WB 目录 / 注册 Claude / 注册 Codex）
+- **测试基线**：cargo 108→**136** 单测全绿（wb_model_route 12 + wb_toolexec 8 + wb_images 4 + wb_catalog 3 + ccswitch 3 新增）；vitest 18/18、npm build、src-python py_compile 全绿
 
 ---
 

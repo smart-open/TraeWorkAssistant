@@ -556,13 +556,13 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 
 | # | 任务 | 涉及 | 预估 |
 |---|---|---|---|
-| T5.1 | DSH provider：15 模型静态目录兜底 + 启动动态替换（F-37，元数据透传 inputModalities/supportedEfforts/倍率/徽章，能力读上游勿硬编码） | `wb_model_catalog.json`、api_server | 2d |
+| T5.1 ✅ | DSH provider：15 模型静态目录兜底 + 启动动态替换（F-37，元数据透传 inputModalities/supportedEfforts/倍率/徽章，能力读上游勿硬编码） | `wb_model_catalog.json`、api_server | 2d |
 | T5.2 ✅ | 四段模型路由管线：别名静态映射 → 用户自定义正则 → 系列通配 → 后缀检测注入参数（F-61） | api_server | 1.5d |
 | T5.3 ✅ | reasoning_content 思考链透传 + 默认深度思考开关（F-62） | api_server、buddy-settings | 1d |
 | T5.4 ✅ | 生图双端点投影：`/v1/images/generations` + `/v1/images/edits`（F-63） | api_server/routes.rs | 1.5d |
 | T5.5 ✅ | 网关工具代执行：上游不支持工具（web_search）代理侧代执行 + 结果回喂 + 原生事件返回（F-64） | api_server | 2d |
 | T5.6 ✅ | 协议细节补强：连续同角色消息合并 / 单端口三协议 anthropic-version 区分 / 后台任务识别降级（F-65） | api_server | 1d |
-| T5.7 | CC Switch 协同：把本项目转换端点注册进 CC Switch 配置，不自建切换器（F-43） | commands + 前端 | 0.5d |
+| T5.7 ✅ | CC Switch 协同：把本项目转换端点注册进 CC Switch 配置，不自建切换器（F-43） | commands + 前端 | 0.5d |
 | T5.8 ✅ | 本地 quota API 兜底：扫 `~/.workbuddy/*.port` + 端口段探测 + `remaining` 特征确认（F-21） | commands/workbuddy.rs | 1d |
 | T5.9 ✅ | 批次 5 收尾审查（九大类黑盒复查）+ 文档同步 + 分拆提交 | — | — |
 

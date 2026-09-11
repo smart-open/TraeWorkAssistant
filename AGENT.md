@@ -329,6 +329,8 @@ ai-work-assistant/
   - **工具代执行（F-64，`wb_toolexec.rs`）**：`/v1/responses` 声明 `web_search` 且 `api_pool.json.wb_tool_exec`（默认开）→ 代理注入 web_search/open_url function + 本地代执行（DDG lite + 页面抓取）→ 回喂循环上限 3 轮；历史轮以 `web_search_call` 输出项返回。**仅代理注入的两工具会被代执行**，客户端真实 function 照常透传。
   - **后台任务降级（F-65③）**：`api_pool.json.wb_bg_downgrade`（默认关）——max_tokens≤128 且全文≤512 字符 → 目录最低倍率模型；`/v1/chat/completions` 收到 `anthropic-version` 头 → 400 明示改走 `/v1/messages`。
   - **本地 quota 兜底（F-21，`wb_common.py`）**：credits 云端全链失败 → 扫 `~/.workbuddy/*.port` + 候选/有界端口段 → GET `/api/v1/quota` 按 remaining 特征确认（source=`local_quota`）。
+  - **DSH provider 目录动态替换（F-37，`wb_catalog.rs`）**：`parse_upstream_catalog` 宽容解析（三容器形态/字段链探测/产出 0 条不落盘）+ `fetch_and_replace`（GET `{chatBase}/console/enterprises/personal/models`）；网关启动自动一次（失败保持静态兜底）+ `api_wb_catalog_sync` 手动命令；`/v1/models` WB 条目透传 `supports_image`/`supported_efforts`。
+  - **CC Switch 协同（F-43，`commands/ccswitch.rs`）**：不自建切换器——upsert 固定 id `aiwork-gateway-<claude|codex>` 进 `~/.cc-switch/cc-switch.db` providers 表（claude=扁平 env，base 不带 /v1；codex=auth+config.toml，wire_api=responses）；写前整库备份至 `~/.cc-switch/backups/`、**只动自有条目**、Key 不入日志；CC Switch 运行中写入后需重启其生效。
 
 ## 13. 禁止与红线（Do NOT）
 
