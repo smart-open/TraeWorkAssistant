@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw, ShieldCheck, Users, CheckCircle2, Circle, ChevronRight, TrendingUp, HeartPulse, CalendarClock } from 'lucide-react';
+import { RefreshCw, ShieldCheck, Users, CheckCircle2, Circle, ChevronRight, TrendingUp, HeartPulse } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { StatCard, Badge } from '../../components/ui';
-import ExpiryCalendar, { type ExpiryItem } from '../../components/ExpiryCalendar';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import type { AppLocate, DoubaoAccountView, DoubaoHistoryEvent } from '../../types';
@@ -247,6 +246,42 @@ function DoubaoInsights({ events }: { events: DoubaoHistoryEvent[] }) {
   );
 }
 
+/** 会员状态块（到期日历并入账号概览行）：过期红 / ≤7 天临期琥珀 / 其余灰 */
+function MemberExpiry({ a }: { a: DoubaoAccountView }) {
+  if (!a.quota_checked_at) {
+    return <div className="shrink-0 text-[11px] text-slate-300 dark:text-zinc-600">未查额度</div>;
+  }
+  if (!a.quota_expire_at) {
+    return <div className="shrink-0 text-xs text-slate-300 dark:text-zinc-600">免费账号</div>;
+  }
+  const ts = new Date(a.quota_expire_at.replace(' ', 'T')).getTime();
+  if (Number.isNaN(ts)) return null;
+  const days = Math.ceil((ts - Date.now()) / 86400000);
+  const date = a.quota_expire_at.slice(0, 10);
+  if (days <= 0) {
+    return (
+      <div className="shrink-0 text-right text-xs font-medium text-rose-500" title={`会员已于 ${date} 过期`}>
+        会员已过期
+        <div className="text-[11px] font-normal text-rose-400">{date}</div>
+      </div>
+    );
+  }
+  if (days <= 7) {
+    return (
+      <div className="shrink-0 text-right text-xs font-medium text-amber-500" title={`会员 ${date} 到期，剩余 ${days} 天`}>
+        {days} 天后到期
+        <div className="text-[11px] font-normal text-slate-400">{date}</div>
+      </div>
+    );
+  }
+  return (
+    <div className="shrink-0 text-right text-xs text-slate-500 dark:text-zinc-400" title={`会员 ${date} 到期`}>
+      会员到期
+      <div className="text-[11px] text-slate-400">{date}</div>
+    </div>
+  );
+}
+
 export default function DoubaoOverview() {
   const pushToast = useAppStore((s) => s.pushToast);
   const setView = useAppStore((s) => s.setView);
@@ -292,42 +327,6 @@ export default function DoubaoOverview() {
             : '未检测到';
   const snapshotCount = accounts.filter((a) => a.has_snapshot).length;
   const currentAccount = accounts.find((a) => a.is_current);
-
-  // 到期日历（F-13 批次 2 补挂豆包侧）：会员（quota_expire_at）+ 会话（session_expire_at）
-  // 豆包侧时间为本地格式字符串（YYYY-MM-DD HH:MM:SS），转 Unix 秒
-  const parseLocal = (s: string | null): number | null => {
-    if (!s) return null;
-    const t = new Date(s.replace(' ', 'T')).getTime();
-    return Number.isNaN(t) ? null : Math.floor(t / 1000);
-  };
-  const expiryItems = useMemo<ExpiryItem[]>(
-    () =>
-      accounts.flatMap((a) => {
-        const items: ExpiryItem[] = [];
-        const memberTs = parseLocal(a.quota_expire_at);
-        if (memberTs != null) {
-          items.push({
-            key: `${a.user_id}-member`,
-            label: a.name,
-            kind: '会员',
-            expire_ts: memberTs,
-            note: a.quota_level ? `等级 ${a.quota_level}` : null,
-          });
-        }
-        const sessionTs = parseLocal(a.session_expire_at);
-        if (sessionTs != null) {
-          items.push({
-            key: `${a.user_id}-session`,
-            label: a.name,
-            kind: '会话',
-            expire_ts: sessionTs,
-            note: a.session_state === 'expired' ? '会话已判定过期，请重新登录' : null,
-          });
-        }
-        return items;
-      }),
-    [accounts],
-  );
 
   return (
     <div className="animate-fade-in">
@@ -378,6 +377,10 @@ export default function DoubaoOverview() {
         />
       </div>
 
+      {/* 洞察卡（额度趋势 + 运维健康）上移至账号概览之前 */}
+      {(history.length > 0 || accounts.length > 0) && <DoubaoInsights events={history} />}
+
+      {/* 账号概览：会员等级/到期状态并入行内（原到期日历信息） */}
       {accounts.length > 0 && (
         <div className="mt-5 card p-4">
           <div className="mb-3 flex items-center gap-2">
@@ -390,6 +393,7 @@ export default function DoubaoOverview() {
                 key={a.user_id}
                 onClick={() => setView('doubao-accounts')}
                 className="flex w-full items-center gap-3 rounded-lg border border-slate-100 p-3 text-left transition hover:bg-slate-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
+                title={a.quota_summary ? `额度：${a.quota_summary}${a.quota_checked_at ? `（${a.quota_checked_at} 查询）` : ''}` : undefined}
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 text-sm font-medium">
@@ -399,10 +403,16 @@ export default function DoubaoOverview() {
                         当前账号
                       </span>
                     )}
+                    {a.quota_level ? (
+                      <Badge tone="violet">{a.quota_level}</Badge>
+                    ) : a.quota_checked_at ? (
+                      <Badge tone="slate">免费</Badge>
+                    ) : null}
                   </div>
                   <div className="font-mono text-xs text-slate-400">{a.user_id}</div>
                 </div>
-                <div className="text-xs text-slate-400">
+                <MemberExpiry a={a} />
+                <div className="shrink-0 text-xs text-slate-400">
                   {a.has_snapshot ? `快照 ${a.last_modified || '—'}` : '无快照'}
                 </div>
               </button>
@@ -415,19 +425,6 @@ export default function DoubaoOverview() {
           </div>
         </div>
       )}
-
-      {/* 到期日历（F-13） */}
-      {accounts.length > 0 && (
-        <div className="mt-5 card p-4">
-          <div className="mb-3 flex items-center gap-2">
-            <CalendarClock size={16} className="text-rose-500" />
-            <span className="text-sm font-medium">到期日历</span>
-          </div>
-          <ExpiryCalendar items={expiryItems} emptyHint="暂无到期项：查询会员额度或录入会话凭证后展示会员/会话到期时间。" />
-        </div>
-      )}
-
-      {(history.length > 0 || accounts.length > 0) && <DoubaoInsights events={history} />}
 
       <DoubaoSetupGuide installed={installed} accounts={accounts} />
 
