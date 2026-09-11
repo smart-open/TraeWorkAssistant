@@ -1,5 +1,5 @@
 import { useMemo, useState, useEffect } from 'react';
-import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw, Users } from 'lucide-react';
+import { PlayCircle, CheckCircle2, XCircle, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw, Users } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
 import { useAppStore } from '../store';
@@ -300,7 +300,8 @@ export default function Checkin() {
         </>
       )}
 
-      {checkin.active || checkin.total > 0 ? (
+      {/* 空轮（全部已签/过期/冷却中）结束后也保留卡片，避免提示一闪而过 */}
+      {checkin.active || checkin.total > 0 || checkin.done?.total === 0 ? (
         <div className="card p-4">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="font-medium">实时进度</h3>
@@ -308,9 +309,13 @@ export default function Checkin() {
               {checkin.active ? (
                 <Badge tone="blue">运行中</Badge>
               ) : checkin.done ? (
-                <Badge tone={checkin.done.failed > 0 ? 'amber' : 'green'}>
-                  完成：成功 {checkin.done.ok}，已签 {checkin.done.already}，失败 {checkin.done.failed}
-                </Badge>
+                checkin.done.total === 0 ? (
+                  <Badge tone="blue">没有需要签到的账号（全部已签/过期/冷却中）</Badge>
+                ) : (
+                  <Badge tone={checkin.done.failed > 0 ? 'amber' : 'green'}>
+                    完成：成功 {checkin.done.ok}，已签 {checkin.done.already}，失败 {checkin.done.failed}
+                  </Badge>
+                )
               ) : null}
               {checkin.done && checkin.done.failed > 0 ? (
                 <span className="text-xs text-slate-400">失败账号已自动重试 2 轮</span>
@@ -334,17 +339,15 @@ export default function Checkin() {
               {checkin.index}/{checkin.total}
             </div>
           </div>
+          {!checkin.active && checkin.done?.total === 0 && (
+            <div className="mb-3 flex items-center gap-2 rounded border border-sky-300 bg-sky-50 px-3 py-2 text-sm text-sky-700 dark:border-sky-700 dark:bg-sky-900/20 dark:text-sky-300">
+              <AlertCircle size={15} className="shrink-0" />
+              <span>本轮没有发起签到：所有账号均已签到 / JWT 过期 / 冷却中，被「跳过规则」过滤，无候选账号</span>
+            </div>
+          )}
           <div className="max-h-80 space-y-1 overflow-auto">
-            {Array.from({ length: checkin.total }).map((_, i) => {
-              const r = checkin.results[i];
-              if (!r) {
-                return (
-                  <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
-                    <Clock size={14} className="text-slate-400" />
-                    <span className="text-slate-400">等待中…</span>
-                  </div>
-                );
-              }
+            {checkin.results.map((r) => {
+              if (!r) return null;
               const tone =
                 r.status === 'success'
                   ? 'text-emerald-600 dark:text-emerald-300'
@@ -360,16 +363,30 @@ export default function Checkin() {
                   ? CheckCircle2
                   : r.status === 'fail'
                   ? XCircle
+                  : r.status === 'skip'
+                  ? CheckCircle2
                   : AlertCircle;
+              const skipLabel =
+                r.skip_reason === 'checked_in'
+                  ? '已签到，本轮跳过'
+                  : r.skip_reason === 'expired'
+                  ? 'JWT 已过期，本轮跳过'
+                  : r.skip_reason === 'cooldown'
+                  ? '冷却中，本轮跳过'
+                  : '本轮跳过';
               return (
-                <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
+                <div key={r.user_id} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
                   <Icon size={14} className={tone} />
                   <span className="w-8 text-right text-xs text-slate-400">{r.index}</span>
                   <span className="flex-1 truncate">{r.name}</span>
-                  <span className={`text-xs ${tone}`}>
+                  <span className={`text-xs ${tone}`} title={r.message ?? undefined}>
                     {r.status === 'success' && `积分+${r.delta ?? 0}`}
                     {r.status === 'already' && `积分+${r.credits ?? 0}`}
-                    {r.status === 'fail' && (r.message ?? '失败')}
+                    {r.status === 'skip' && skipLabel}
+                    {r.status === 'fail' &&
+                      (r.error_type === 'SessionDead'
+                        ? 'JWT 已被服务端吊销，请重新登录该账号并保存'
+                        : (r.message ?? '失败'))}
                   </span>
                   {r.error_type && (
                     <span className="text-xs text-amber-500">

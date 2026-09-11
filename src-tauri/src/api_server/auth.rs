@@ -14,9 +14,10 @@ use super::ApiSharedState;
 /// - /health 跳过鉴权
 /// - Key 统一在 data/api_keys.json 列表中维护（带每日配额），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
-/// - 未配置任何启用的 Key 时不鉴权：一律放行并记为 anonymous（携带未知 Key 亦放行，兼容关闭鉴权场景）
+/// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权）放行记 anonymous，
+///   否则拒绝（默认）并返回引导提示
 /// - Key 每次命中即累加当日用量并写盘，超配额返回 429
-/// - 每次请求重读 api_keys.json：新增/删除/禁用立即生效
+/// - 每次请求重读 api_keys.json：新增/删除/禁用/开关立即生效
 /// 校验通过后向 request extensions 插入命中的 Key 标识（KeyId），供 handler 用量记账
 pub async fn bearer_auth(
     State(state): State<Arc<ApiSharedState>>,
@@ -42,16 +43,16 @@ pub async fn bearer_auth(
         .map(|s| s.to_string());
     let presented = bearer.or(xkey);
 
-    // 存在启用的 Key 时才要求鉴权
     let keys: ApiKeysFile = api_keys::load(&state.data_dir);
-    let auth_required = keys.has_enabled();
+    // 存在启用 Key 时必须鉴权；无启用 Key 时由显式开关决定放行或拒绝
+    let auth_required = keys.has_enabled() || !keys.auth_disabled;
 
     let Some(presented) = presented else {
         if !auth_required {
             request.extensions_mut().insert(KeyId("anonymous".into()));
             return next.run(request).await;
         }
-        return (StatusCode::UNAUTHORIZED, "missing api key").into_response();
+        return auth_required_rejected().into_response();
     };
 
     // 校验 Key（含每日配额 + F-35 按日统计）；读-改-写走进程级锁（审查 P1-2）
@@ -67,14 +68,32 @@ pub async fn bearer_auth(
         }
         KeyCheck::Invalid => {}
     }
-    // 未配置任何鉴权时放行携带未知 Key 的请求并记为 anonymous：
-    // 与旧版「无 Key 即全放行」行为一致，兼容用户关闭鉴权后客户端仍带着旧 Key 的场景
+    // 无启用 Key 且显式关闭鉴权：放行携带未知 Key 的请求并记为 anonymous
     if !auth_required {
         request.extensions_mut().insert(KeyId("anonymous".into()));
         return next.run(request).await;
     }
 
     (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
+}
+
+/// 401：要求鉴权但不满足（未配置启用 Key 且未显式关闭鉴权，或未携带 Key）。
+/// JSON 错误体给出下一步指引（OpenAI/Anthropic 客户端均可解析 message）。
+fn auth_required_rejected() -> axum::response::Response {
+    let body = json!({
+        "error": {
+            "message": "API 服务已启用鉴权：请在应用的「API 服务」页创建并启用 API Key，\
+                        或在该页显式关闭鉴权（不推荐，任何本机程序均可调用）",
+            "type": "invalid_request_error",
+            "code": "api_key_required",
+        }
+    });
+    (
+        StatusCode::UNAUTHORIZED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// 429 配额超限响应（JSON 错误体，OpenAI/Anthropic 客户端均可解析 message）

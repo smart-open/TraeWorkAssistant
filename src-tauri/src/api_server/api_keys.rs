@@ -1,7 +1,8 @@
 //! 多 API Key 管理与每日配额（T2）+ ck_xxx 子 Key 体系（F-35，批次3）。
 //!
 //! 数据落盘 `data/api_keys.json`；`daily_limit = 0` 表示不限。
-//! 所有 Key 统一在列表中维护；未配置任何启用的 Key 时不鉴权。
+//! 所有 Key 统一在列表中维护（无主/子之分）；未配置任何启用的 Key 时：
+//! `auth_disabled = true`（显式关闭鉴权）放行并记为 anonymous，否则拒绝请求（默认）。
 //! 每次鉴权命中 Key 即累加当日用量并原子写盘（与 usage.rs 同策略：个人频率低）。
 //!
 //! F-35 子 Key 体系（对外子 Key 与上游真实凭证分离）：
@@ -104,10 +105,19 @@ fn default_true() -> bool {
 }
 
 /// 数据文件根结构
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ApiKeysFile {
     #[serde(default)]
     pub keys: Vec<ApiKeyEntry>,
+    /// 显式关闭鉴权：仅当没有任何启用 Key 时生效（true = 无 Key 放行；默认 false = 无 Key 拒绝）
+    #[serde(default)]
+    pub auth_disabled: bool,
+}
+
+impl Default for ApiKeysFile {
+    fn default() -> Self {
+        Self { keys: Vec::new(), auth_disabled: false }
+    }
 }
 
 impl ApiKeyEntry {
@@ -274,6 +284,7 @@ mod tests {
     fn verify_matches_enabled_key_and_counts() {
         let mut f = ApiKeysFile {
             keys: vec![entry("k1", "ck-a", true, 0)],
+            auth_disabled: false,
         };
         assert!(matches!(f.verify_and_consume("ck-a", "2026-09-09"), KeyCheck::Ok(r) if r.id == "k1"));
         assert_eq!(f.keys[0].used_today, 1);
@@ -286,6 +297,7 @@ mod tests {
     fn verify_rejects_disabled_or_unknown() {
         let mut f = ApiKeysFile {
             keys: vec![entry("k1", "ck-a", false, 0), entry("k2", "ck-b", true, 0)],
+            auth_disabled: false,
         };
         assert!(matches!(f.verify_and_consume("ck-a", "d"), KeyCheck::Invalid));
         assert!(matches!(f.verify_and_consume("ck-c", "d"), KeyCheck::Invalid));
@@ -295,6 +307,7 @@ mod tests {
     fn quota_blocks_at_limit_and_resets_next_day() {
         let mut f = ApiKeysFile {
             keys: vec![entry("k1", "ck-a", true, 2)],
+            auth_disabled: false,
         };
         assert!(matches!(f.verify_and_consume("ck-a", "d1"), KeyCheck::Ok(_)));
         assert!(matches!(f.verify_and_consume("ck-a", "d1"), KeyCheck::Ok(_)));
@@ -314,6 +327,7 @@ mod tests {
     fn daily_stats_capped_at_90() {
         let mut f = ApiKeysFile {
             keys: vec![entry("k1", "ck-a", true, 0)],
+            auth_disabled: false,
         };
         for i in 0..120 {
             let date = format!("d{i}");

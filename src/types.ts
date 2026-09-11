@@ -232,13 +232,17 @@ export interface CheckinOpts {
   skip_expired: boolean;
 }
 
-export type CheckinAccountStatus = 'pending' | 'already' | 'success' | 'fail';
+export type CheckinAccountStatus = 'pending' | 'already' | 'success' | 'fail' | 'skip';
+/** 跳过原因（status=skip 时）：checked_in=已签 / expired=JWT 过期 / cooldown=冷却中 */
+export type CheckinSkipReason = 'checked_in' | 'expired' | 'cooldown';
 
 export interface CheckinAccountResult {
   index: number;
   user_id: string;
   name: string;
   status: CheckinAccountStatus;
+  /** 本账号被跳过的原因（仅 status=skip） */
+  skip_reason?: CheckinSkipReason | null;
   credits?: number;
   delta?: number;
   elapsed?: number;
@@ -574,6 +578,15 @@ export interface UpdateCheckResult {
   download_url: string;
   size: number;
   release_page: string;
+  // 发布方提供的安装包 SHA256（release 正文约定行；旧版本无此行时缺省，跳过校验）
+  sha256?: string | null;
+}
+
+// API Key 数据文件视图（api_keys_list 返回：列表 + 鉴权开关）
+export interface ApiKeysFileView {
+  keys: ApiKeyEntry[];
+  // 显式关闭鉴权：仅当无启用 Key 时生效（true=放行，默认 false=拒绝）
+  auth_disabled: boolean;
 }
 
 export interface UpdateDownloadProgress {

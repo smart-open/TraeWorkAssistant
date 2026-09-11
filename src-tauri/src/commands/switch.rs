@@ -15,6 +15,9 @@ pub fn switch_account(
     user_id: String,
     target_app: Option<String>,
     proxy_port: Option<u16>,
+    // 续期 JWT 流程专用：目标账号 JWT 本就可能已吊销（续期正是为了重抓），
+    // 跳过 TRAE 切换前 JWT 预检，否则预检 401 会把续期链路拦死
+    skip_jwt_probe: Option<bool>,
 ) -> Result<(), String> {
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
@@ -34,6 +37,9 @@ pub fn switch_account(
 
     // C4：豆包快照可选纳入 IndexedDB（设置开关控制，其他应用不受影响）
     let is_doubao = target_app.as_deref() == Some("Doubao");
+    // JWT 预检仅 TRAE 双应用（TraeWork/Trae，含默认）：WorkBuddy 会话模型不同，
+    // 且其 uid 与 TRAE 账号池撞库时会被误探活错误拦截
+    let is_trae = matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae"));
     let include_idb = is_doubao && state.settings().doubao_snapshot_include_idb;
     // C1：一键以账号打开时注入代理（>0 才传给桥）
     let inject_port = proxy_port.filter(|p| *p > 0);
@@ -49,6 +55,11 @@ pub fn switch_account(
             &state.python_exe,
             &user_id,
         )?;
+    } else if is_trae && !skip_jwt_probe.unwrap_or(false) {
+        // TRAE（TraeWork/Trae）：切换前 JWT 服务端预检（issue #9）——目标账号 JWT 被服务端
+        // 吊销时本地快照仍完好，切换恢复后 IDE 一联网即被登出，用户感知为「切换了但没反应」。
+        // 401 判死时提前中止并给出补救指引；网络故障 fail-open 不阻断（见函数内实现）。
+        crate::commands::accounts::probe_trae_jwt_alive(&state, &user_id)?;
     }
 
     // 防误覆盖守卫（仅豆包）：把关闭客户端前检测到的当前登录 uid 传给桥，桥仅在它与

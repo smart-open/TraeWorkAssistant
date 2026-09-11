@@ -100,7 +100,7 @@ interface AppState {
   refreshAccounts: () => Promise<void>;
   refreshGroups: () => Promise<void>;
   refreshSettings: () => Promise<void>;
-  refreshLogs: (q?: LogQuery) => Promise<void>;
+  refreshLogs: (q?: LogQuery, manual?: boolean) => Promise<void>;
   refreshCreditsHistory: () => Promise<void>;
   refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
@@ -179,6 +179,13 @@ function defaultSettings(): Settings {
     api_default_model: 'deepseek-v4-flash',
   };
 }
+
+// 日志轮询去重：上一轮未返回时跳过本轮（防 2s 轮询堆积与旧响应乱序覆盖）
+let logsPollInflight = false;
+// 日志查询并发序号（最新请求胜出）：手动刷新与轮询并发时，旧响应直接丢弃
+let logsReqSeq = 0;
+// 同因 toast 限频：读取持续失败期间每 60s 最多弹一次（防 toast 风暴）；手动调用直通
+let lastLogsErrToastAt = 0;
 
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
@@ -323,10 +330,27 @@ export const useAppStore = create<AppState>((set, get) => ({
   applyCheckinEvent: (e) => {
     set((s) => {
       if (e.type === 'start') {
-        // 重试轮也会发 start（仅含失败账号）：保留 retry 横幅，重置进度列表
-        return {
-          checkin: { active: true, total: e.total, index: 0, results: [], done: null, retry: s.checkin.retry },
-        };
+        // Rust 侧 start 带 scope 内全集清单（候选 pending / 跳过带原因 / 重试轮沿用上轮状态），
+        // 重建列表使被跳过的账号也可见；Python 转发的 start（无 accounts）仅同步候选总数
+        if (e.accounts) {
+          return {
+            checkin: {
+              active: true,
+              total: e.total,
+              index: 0,
+              results: e.accounts.map((a, i) => ({
+                index: i + 1,
+                user_id: a.user_id,
+                name: a.name,
+                status: a.status,
+                skip_reason: a.skip_reason ?? null,
+              })),
+              done: null,
+              retry: s.checkin.retry,
+            },
+          };
+        }
+        return { checkin: { ...s.checkin, active: true, total: e.total } };
       }
       if (e.type === 'retry') {
         return {
@@ -339,12 +363,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       if (e.type === 'account') {
         const results = s.checkin.results.slice();
-        const i = e.index - 1;
-        results[i] = {
-          index: e.index,
+        // 按 user_id 匹配行：事件 index 是本轮候选内的序号，与全集列表位置无关
+        const i = results.findIndex((r) => r.user_id === e.user_id);
+        const row = {
+          index: i >= 0 ? results[i].index : results.length + 1,
           user_id: e.user_id,
           name: e.name,
           status: e.status,
+          skip_reason: null,
           credits: e.credits,
           delta: e.delta,
           elapsed: e.elapsed,
@@ -353,7 +379,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           error_type: e.error_type,
           cooldown_until: e.cooldown_until,
         };
-        return { checkin: { ...s.checkin, index: e.index, results } };
+        if (i >= 0) results[i] = row;
+        else results.push(row);
+        // index 累计本轮已处理候选数，驱动进度条（total 口径=本轮候选数）
+        return { checkin: { ...s.checkin, index: s.checkin.index + 1, results } };
       }
       return {
         checkin: {
@@ -366,6 +395,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
     if (e.type === 'done') {
       void get().refreshAccounts();
+      // JWT 吊销类失败的精确提示（issue #9）：401=服务端已吊销 JWT，重新登录+保存即可恢复，
+      // 不再让用户面对笼统的「失败 N」自己摸索原因
+      const deadCount = get().checkin.results.filter(
+        (r) => r?.status === 'fail' && r.error_type === 'SessionDead',
+      ).length;
       // 签到完成后静默刷新剩余积分（内部会再次 refreshAccounts）
       void api.accounts.refreshRemainingCredits().then(() => {
         get().refreshAccounts();
@@ -373,8 +407,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       }).catch(() => {});
       get().pushToast(
         e.failed > 0 ? 'warn' : 'success',
-        `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
+        // 空轮次：过滤后无候选（全部已签/过期/冷却中），给用户明确文案而非「成功 0 已签 0 失败 0」
+        e.empty
+          ? '没有需要签到的账号（全部已签/过期/冷却中）'
+          : `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
       );
+      if (deadCount > 0) {
+        get().pushToast(
+          'error',
+          `${deadCount} 个账号 JWT 已被服务端吊销（该账号在别处重新登录/IDE 内退出过登录）：请在 TRAE 中重新登录该账号并「保存当前登录态」，再点「续期 JWT」重新捕获`,
+        );
+      }
     }
   },
 
@@ -441,7 +484,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ settings: defaultSettings() });
     }
   },
-  refreshLogs: async (q) => {
+  refreshLogs: async (q, manual) => {
+    if (logsPollInflight && !manual) return;
+    logsPollInflight = true;
+    // 最新请求胜出：手动刷新绕过 inflight 防护会与轮询并发，旧响应不得覆盖新数据
+    const seq = ++logsReqSeq;
     try {
       const logs = await api.misc.logsQuery({
         logType: q?.logType,
@@ -449,9 +496,17 @@ export const useAppStore = create<AppState>((set, get) => ({
         keyword: q?.keyword,
         limit: q?.limit ?? 500,
       });
+      if (seq !== logsReqSeq) return;
       set({ logs });
     } catch (err) {
-      get().pushToast('error', `读取日志失败：${String(err)}`);
+      if (seq !== logsReqSeq) return;
+      const now = Date.now();
+      if (manual || now - lastLogsErrToastAt > 60_000) {
+        lastLogsErrToastAt = now;
+        get().pushToast('error', `读取日志失败：${String(err)}`);
+      }
+    } finally {
+      logsPollInflight = false;
     }
   },
   refreshCreditsHistory: async () => {
@@ -661,8 +716,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         await get().startProxy();
       }
       // 切换到目标账号，TRAE 重启后走代理，新 JWT 会被自动捕获
+      // skipJwtProbe=true：续期场景目标账号 JWT 本就可能已被服务端吊销，跳过切换前预检
       get().pushToast('info', '正在切换账号以捕获新 JWT，请稍候…');
-      await api.switchAccount(userId);
+      await api.switchAccount(userId, undefined, true);
     } catch (err) {
       get().pushToast('error', `续期失败：${String(err)}`);
     }

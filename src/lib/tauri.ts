@@ -6,6 +6,7 @@ import type {
   ApiPoolFile,
   ApiKeyEntry,
   CcSwitchStatus,
+  ApiKeysFileView,
   AppLocate,
   CheckinDone,
   CheckinOpts,
@@ -182,8 +183,17 @@ export const api = {
       invoke('write_text_file', { path, content }),
     readTextFile: (path: string) => invoke<string>('read_text_file', { path }),
   },
-  switchAccount: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy') =>
-    invoke('switch_account', { userId, targetApp: targetApp ?? null }),
+  switchAccount: (
+    userId: string,
+    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy',
+    skipJwtProbe?: boolean,
+  ) =>
+    invoke('switch_account', {
+      userId,
+      targetApp: targetApp ?? null,
+      // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
+      skipJwtProbe: skipJwtProbe ?? false,
+    }),
   saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
@@ -388,15 +398,21 @@ export const api = {
     usageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_usage_stats', { days: days ?? null }),
     // T2：多 API Key 管理（统一列表，无主/子之分）
-    keysList: () => invoke<ApiKeyEntry[]>('api_keys_list'),
-    keysSave: (keys: ApiKeyEntry[]) => invoke('api_keys_save', { keys }),
+    keysList: () => invoke<ApiKeysFileView>('api_keys_list'),
+    // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）
+    keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
+      invoke('api_keys_save', { keys, authDisabled: authDisabled ?? null }),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),
     // 第一步：下载安装包（完成后返回本地路径，等待用户确认安装）
     // 注意：key 必须是 expectedVersion（Rust 参数 expected_version 的 Tauri 驼峰匹配），传 version 会报 missing required key
-    download: (p: { downloadUrl: string; assetName: string; expectedVersion: string }) =>
-      invoke<UpdateDownloaded>('update_download', p),
+    download: (p: {
+      downloadUrl: string;
+      assetName: string;
+      expectedVersion: string;
+      expectedSha256?: string | null;
+    }) => invoke<UpdateDownloaded>('update_download', p),
     // 第二步：启动安装器（/P /UPDATE /R，完成后自动重启应用）
     runInstaller: (p: { filePath: string; assetName: string }) =>
       invoke<void>('update_run_installer', p),
@@ -412,9 +428,18 @@ export const api = {
 };
 
 // ---- 事件载荷 ----
+/** start 事件账号清单项（Rust 侧发出，scope 内全集：候选 pending / 跳过带原因 / 重试轮沿用上轮状态） */
+export interface CheckinStartAccount {
+  user_id: string;
+  name: string;
+  status: 'pending' | 'skip' | 'success' | 'already' | 'fail';
+  skip_reason?: 'checked_in' | 'expired' | 'cooldown' | null;
+}
 export interface CheckinStartEvent {
   type: 'start';
   total: number;
+  /** scope 内全集清单；Python 脚本转发的 start 无此字段，前端仅同步 total 不重建列表 */
+  accounts?: CheckinStartAccount[];
 }
 export interface CheckinAccountEvent {
   type: 'account';
@@ -436,6 +461,8 @@ export interface CheckinDoneEvent {
   already: number;
   failed: number;
   total?: number;
+  /** true=过滤后无候选账号（全部已签/过期/冷却中），未启动签到脚本 */
+  empty?: boolean;
 }
 /** 失败自动重试倒计时事件（T5） */
 export interface CheckinRetryEvent {

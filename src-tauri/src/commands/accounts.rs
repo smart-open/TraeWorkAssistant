@@ -34,6 +34,122 @@ fn streaming_agent() -> ureq::Agent {
         .build()
 }
 
+/// 按账号 uid 确定性派生字节流（对齐 auto_checkin.py `_seeded_stream`：
+/// SHA-256("salt:uid" + 4 字节大端计数器) 级联），保证 Rust 与签到脚本
+/// 对同一账号生成完全一致的设备标识。
+fn seeded_stream(seed: &str, salt: &str, nbytes: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let prefix = format!("{}:{}", salt, seed).into_bytes();
+    let mut out = Vec::with_capacity(nbytes + 32);
+    let mut counter: u32 = 0;
+    while out.len() < nbytes {
+        let mut h = Sha256::new();
+        h.update(&prefix);
+        h.update(counter.to_be_bytes());
+        out.extend_from_slice(&h.finalize());
+        counter = counter.wrapping_add(1);
+    }
+    out.truncate(nbytes);
+    out
+}
+
+/// 由 uid 派生设备三元组（算法对齐 auto_checkin.py `get_device_for` gen=2）
+pub fn derive_device(uid: &str) -> DeviceEntry {
+    let device_id: String = seeded_stream(uid, "devid", 15)
+        .iter()
+        .map(|b| char::from(b'0' + b % 10))
+        .collect();
+    let session_id: String = seeded_stream(uid, "sess", 32)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let mut m = seeded_stream(uid, "market", 16);
+    m[6] = (m[6] & 0x0F) | 0x40; // UUID v4 版本位
+    m[8] = (m[8] & 0x3F) | 0x80; // UUID v4 变体位
+    let market_user_id = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]
+    );
+    DeviceEntry {
+        device_id,
+        market_user_id: Some(market_user_id),
+        session_id: Some(session_id),
+    }
+}
+
+/// 解析账号设备标识：device_map.json 已有条目（代理捕获/切换流程写入）优先，
+/// 否则按 uid 确定性派生（与签到脚本同算法，无需写盘）。
+/// 参数为 &AppState（tauri State 经 Deref 自动传入，测试也可直接构造）
+pub fn resolve_device(state: &crate::state::AppState, uid: &str) -> DeviceEntry {
+    let map: DeviceMap = fs_utils::read_json(&state.path("device_map.json"));
+    map.get(uid)
+        .cloned()
+        .unwrap_or_else(|| derive_device(uid))
+}
+
+/// 套餐查询 Agent：总超时 60s（原 query_pay_status 用的独立短超时 agent）
+pub fn pay_status_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+}
+
+/// IDE 查询类 POST 统一入口（积分/套餐等 api.trae.cn 接口）：
+/// 挂完整客户端指纹头（对齐 auto_checkin.py `_build_headers`）。
+/// 2026-09 实测：重新登录签发的新 JWT 会校验设备指纹，仅带 authorization 会 401；
+/// 老账号 JWT 宽容放行，因此此前仅 3 个头的请求部分账号可正常返回。
+pub fn ide_query_post(
+    agent: &ureq::Agent,
+    url: &str,
+    jwt: &str,
+    dev: &DeviceEntry,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
+        jwt.to_string()
+    } else {
+        format!("Cloud-IDE-JWT {}", jwt.trim())
+    };
+    let request_id = crate::commands::oauth::random_hex(32);
+    let trace_id = format!("00-{}-01", crate::commands::oauth::random_hex(16));
+    let mut req = agent
+        .post(url)
+        .set("accept", "*/*")
+        .set("accept-language", "zh-CN")
+        .set("authorization", &auth)
+        .set("content-type", "application/json")
+        .set("user-agent", "VSCode 1.107.1 (TRAE SOLO CN)")
+        .set("x-market-client-id", "VSCode 1.107.1")
+        .set("x-market-user-id", dev.market_user_id.as_deref().unwrap_or(""))
+        .set("x-user-region", "CN")
+        .set("x-device-id", &dev.device_id)
+        .set("x-lgw-req-sdk-type", "3")
+        .set("package-type", "stable_cn")
+        .set("x-request-id", &request_id)
+        .set("x-lscbd-aid", "787976")
+        .set("x-lscbd-platform", "windows")
+        .set("app-version", "0.1.45")
+        .set("x-tt-trace-id", &trace_id)
+        .set("sec-fetch-dest", "empty")
+        .set("sec-fetch-mode", "no-cors")
+        .set("sec-fetch-site", "none");
+    if let Some(sid) = dev.session_id.as_deref() {
+        if !sid.is_empty() {
+            req = req.set("vscode-sessionid", sid);
+        }
+    }
+    let resp = req.send_json(body).map_err(|e| match e {
+        // HTTP 错误：读出响应体附带服务端错误码（区分 token 过期/吊销/风控）
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            format!("API 请求失败: status code {}，响应: {}", code, snippet)
+        }
+        other => format!("API 请求失败: {}", other),
+    })?;
+    resp.into_json().map_err(|e| format!("解析响应失败: {}", e))
+}
+
 #[tauri::command]
 pub fn accounts_list(state: State<AppState>) -> Vec<AccountView> {
     build_account_views(&state)
@@ -655,27 +771,72 @@ struct CreditStats {
 }
 
 /// 调用 TRAE API 拉取积分包列表
-fn query_ent_packs(jwt: &str) -> Result<Vec<serde_json::Value>, String> {
-    let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
-        jwt.to_string()
-    } else {
-        format!("Cloud-IDE-JWT {}", jwt)
-    };
-    let resp = short_agent()
-        .post("https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage")
-        .set("authorization", &auth)
-        .set("content-type", "application/json")
-        .set("accept", "*/*")
-        .send_json(ureq::json!({"require_usage": true, "req_source": 2}))
-        .map_err(|e| format!("API 请求失败: {}", e))?;
-
-    let body: serde_json::Value =
-        resp.into_json().map_err(|e| format!("解析响应失败: {}", e))?;
+fn query_ent_packs(jwt: &str, dev: &DeviceEntry) -> Result<Vec<serde_json::Value>, String> {
+    let body = ide_query_post(
+        &short_agent(),
+        "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage",
+        jwt,
+        dev,
+        ureq::json!({"require_usage": true, "req_source": 2}),
+    )?;
 
     // F-49 宽容解析：字段可能被 data 等包裹键包裹，dig 自动下钻
     crate::fs_utils::dig(&body, &["user_entitlement_pack_list"])
         .and_then(|v| v.as_array().cloned())
         .ok_or_else(|| "响应中缺少 user_entitlement_pack_list".to_string())
+}
+
+/// TRAE 切换/一键打开前预检：账号池中该 uid 的 JWT 在服务端是否仍有效。
+/// 背景（issue #9，2026-09-11 诊断）：TRAE 服务端会吊销 JWT（该账号在别处重新登录被顶替、
+/// IDE 内退出登录、风控等），本地快照文件完好但服务端已判死——切换恢复后 IDE 一联网即被
+/// 强制登出，表现为「切换成功但账号没变/未登录」。调签到 status 轻量只读接口探活：
+/// HTTP 401 判死 → 中止切换并给补救指引；无 JWT/网络故障/其他错误一律 fail-open 不阻断
+/// （与豆包 probe_slot_session_alive 策略对齐）。
+pub(crate) fn probe_trae_jwt_alive(state: &AppState, user_id: &str) -> Result<(), String> {
+    let accounts = crate::vault::load_accounts(state);
+    let Some(account) = accounts
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id))
+    else {
+        return Ok(()); // 账号池无此账号（纯快照场景）→ 不预检，交给快照管线
+    };
+    if account.jwt.trim().is_empty() {
+        return Ok(()); // 无 JWT 无法探活 → fail-open
+    }
+    // 预检专用短超时（15s）：网络故障时 fail-open 快速放行，不让用户点切换后白等
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let dev = resolve_device(state, user_id);
+    // 判死文案：name(user_id) 双标识——toast 面向用户用账号名可读，日志保留 uid 便于排查
+    let dead_msg = format!(
+        "账号 {}({}) 的 JWT 已被服务端吊销（常见原因：该账号在别处重新登录、在 IDE 内退出登录或触发风控），\
+         本地保存的登录态已失效，切换后必然未登录。请先在 TRAE 中重新登录该账号并「保存当前登录态」，\
+         或开启代理重新捕获 JWT 后再切换",
+        account.name, user_id
+    );
+    match ide_query_post(
+        &agent,
+        "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status",
+        &account.jwt,
+        &dev,
+        ureq::json!({}),
+    ) {
+        Ok(body) => {
+            // 不能仅凭 HTTP 200 判活：服务端对吊销 JWT 也可能回 200 + 顶层通用鉴权失败码 1001
+            // （docs/product-design.md 记录的形态；对齐 Python status_check 顶层取 code 的口径，
+            // 不用 dig 深挖以免误伤嵌套业务对象里的 code）。其余业务码（如 1005 套餐限额）
+            // 说明 JWT 鉴权仍通过 → 放行
+            if body.get("code").and_then(|v| v.as_i64()) == Some(1001) {
+                Err(dead_msg)
+            } else {
+                Ok(())
+            }
+        }
+        Err(e) if e.contains("status code 401") => Err(dead_msg),
+        Err(_) => Ok(()), // 网络故障/其他错误 fail-open，不阻断切换
+    }
 }
 
 /// 归一化积分包来源标签（明细悬浮展示用）
@@ -726,8 +887,8 @@ fn classify_source(pack: &serde_json::Value) -> String {
 ///
 /// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
 /// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），按 product_id 分类求和。
-fn calc_remaining_credits(jwt: &str) -> Result<CreditStats, String> {
-    let packs = query_ent_packs(jwt)?;
+fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, String> {
+    let packs = query_ent_packs(jwt, dev)?;
 
     let mut total: f64 = 0.0;
     let mut general: f64 = 0.0;
@@ -865,7 +1026,8 @@ pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<Cr
         .iter()
         .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
         .ok_or("账号不存在")?;
-    let packs = query_ent_packs(&account.jwt)?;
+    let dev = resolve_device(&state, &user_id);
+    let packs = query_ent_packs(&account.jwt, &dev)?;
 
     let now_ts = chrono::Utc::now().timestamp();
     let mut detail_packs: Vec<CreditPackDetail> = Vec::new();
@@ -948,7 +1110,8 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
         .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
         .ok_or("账号不存在")?;
     let jwt = &account.jwt;
-    let stats = calc_remaining_credits(jwt)?;
+    let dev = resolve_device(&state, &user_id);
+    let stats = calc_remaining_credits(jwt, &dev)?;
     // 写入缓存
     let mut rc: RemainingCreditsFile = fs_utils::read_json(&state.path("remaining_credits.json"));
     rc.credits.insert(user_id.clone(), stats.total);
@@ -997,7 +1160,8 @@ pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String
         if uid.is_empty() {
             continue;
         }
-        match calc_remaining_credits(&a.jwt) {
+        let dev = resolve_device(&state, &uid);
+        match calc_remaining_credits(&a.jwt, &dev) {
             Ok(stats) => {
                 rc.credits.insert(uid.clone(), stats.total);
                 rc.general.insert(uid.clone(), stats.general);
@@ -1173,6 +1337,11 @@ pub fn cooldown_clear_all(
 /// 成功后原子写回新 accessToken + refresh_token，返回新 JWT
 #[tauri::command]
 pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, String> {
+    refresh_jwt_impl(&state, &user_id)
+}
+
+/// refresh_jwt 核心逻辑（&AppState，供命令与测试探针共用）
+pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, String> {
     // 并发安全：持锁防止多个并发请求同时 ExchangeToken
     let _lock = state
         .jwt_refresh_lock
@@ -1180,11 +1349,11 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
         .map_err(|_| "JWT 刷新锁获取失败")?;
 
     // Double-check：持锁后重新读取文件，防止其他线程已刷新
-    let mut accounts = crate::vault::load_accounts(&state);
+    let mut accounts = crate::vault::load_accounts(state);
     let account = accounts
         .accounts
         .iter()
-        .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+        .find(|a| a.user_id.as_deref() == Some(user_id))
         .ok_or("账号不存在")?;
 
     let refresh_token = account
@@ -1236,7 +1405,7 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
     };
     let new_info = jwt::parse(&new_jwt_full);
     if let Some(ref new_uid) = new_info.user_id {
-        if new_uid != &user_id {
+        if new_uid.as_str() != user_id {
             return Err(format!(
                 "刷新后 user_id 不匹配: 期望={}, 实际={}",
                 user_id, new_uid
@@ -1249,7 +1418,7 @@ pub fn refresh_jwt(state: State<AppState>, user_id: String) -> Result<String, St
         let account = accounts
             .accounts
             .iter_mut()
-            .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+            .find(|a| a.user_id.as_deref() == Some(user_id))
             .ok_or("账号不存在")?;
         account.jwt = new_jwt_full.clone();
         if let Some(rt) = new_refresh_token {
@@ -1419,5 +1588,94 @@ pub fn resolve_user_ids(
         }
         "selected" => Ok(selected.unwrap_or_default()),
         _ => Err("未知的执行范围".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// derive_device 必须与 auto_checkin.py `get_device_for`（gen=2）产出完全一致，
+    /// 否则 Rust 积分请求与 Python 签到请求的设备指纹漂移，新 JWT 会被服务端 401。
+    /// 期望值由 python -c 调用 auto_checkin.get_device_for 实测得出（2026-09-11）。
+    #[test]
+    fn test_derive_device_matches_python() {
+        let dev = derive_device("2117003799429594");
+        assert_eq!(dev.device_id, "924145245134852");
+        assert_eq!(
+            dev.market_user_id.as_deref(),
+            Some("6955401e-d035-4d36-94f7-3d747b751147")
+        );
+        assert_eq!(
+            dev.session_id.as_deref(),
+            Some("93a43272d6671b20fe2391827aa2954272ccbc253ccc197d9bbae6060dee5b03")
+        );
+    }
+
+    #[test]
+    fn test_derive_device_stable_and_fmt() {
+        let a = derive_device("12345");
+        let b = derive_device("12345");
+        assert_eq!(a.device_id, b.device_id);
+        assert_eq!(a.device_id.len(), 15);
+        assert!(a.device_id.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(a.session_id.unwrap().len(), 64);
+        // UUID v4 格式与版本/变体位
+        let mu = a.market_user_id.unwrap();
+        assert_eq!(mu.len(), 36);
+        assert_eq!(&mu[14..15], "4");
+        assert!(matches!(&mu[19..20], "8" | "9" | "a" | "b"));
+    }
+
+    /// 实测探针（默认忽略）：用真实数据目录 + vault 凭据验证积分接口设备指纹修复。
+    /// 运行：cargo test probe_credit -- --ignored --nocapture
+    /// 注意：应用正在运行时 vault 快照可能被锁，load_accounts 会降级读不到 JWT（探针报错无害）。
+    #[test]
+    #[ignore]
+    fn probe_credit_query_real_accounts() {
+        let state = crate::state::AppState::new().expect("构造 AppState 失败");
+        let accounts = crate::vault::load_accounts(&state);
+        let target = accounts
+            .accounts
+            .iter()
+            .find(|a| a.name == "liu_1676")
+            .expect("账号列表中未找到 liu_1676");
+        let uid = target.user_id.clone().expect("liu_1676 无 user_id");
+        assert!(!target.jwt.trim().is_empty(), "liu_1676 JWT 为空（vault 被锁或未保存）");
+        let dev = resolve_device(&state, &uid);
+        println!("uid = {}", uid);
+        println!("device_id = {} (device_map={})", dev.device_id, state.path("device_map.json").display());
+        // 解码 JWT claims（不打印完整 token）：核对 user_id 是否串号、exp 判断时效
+        let info = crate::jwt::parse(&target.jwt);
+        println!("jwt.user_id = {:?}", info.user_id);
+        println!("jwt.exp = {:?}", info.exp_timestamp);
+        println!(
+            "refresh_token = {}",
+            if target.refresh_token.as_deref().map_or(true, |s| s.is_empty()) { "无" } else { "有" }
+        );
+        match query_ent_packs(&target.jwt, &dev) {
+            Ok(list) => println!("RESULT: OK，{} 个积分包（旧 JWT 仍有效）", list.len()),
+            Err(e) => {
+                println!("STEP1 旧 JWT 查询: FAIL — {}", e);
+                // 尝试 refresh_token 自愈：ExchangeToken 换新 JWT 后重试
+                match refresh_jwt_impl(&state, &uid) {
+                    Ok(new_jwt) => {
+                        let ni = crate::jwt::parse(&new_jwt);
+                        println!(
+                            "STEP2 ExchangeToken: OK，新 exp={:?}，重试积分查询...",
+                            ni.exp_timestamp
+                        );
+                        match query_ent_packs(&new_jwt, &dev) {
+                            Ok(list) => println!(
+                                "RESULT: FIXED — 刷新后查询 OK，{} 个积分包（根因=vault 旧 JWT 被吊销）",
+                                list.len()
+                            ),
+                            Err(e2) => println!("RESULT: STILL FAIL — 刷新后仍失败: {}", e2),
+                        }
+                    }
+                    Err(re) => println!("RESULT: FAIL — refresh_token 也已失效: {}", re),
+                }
+            }
+        }
     }
 }

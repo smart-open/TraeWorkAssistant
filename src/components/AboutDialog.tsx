@@ -98,6 +98,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
         downloadUrl: info.download_url,
         assetName: info.asset_name,
         expectedVersion: info.latest_version,
+        expectedSha256: info.sha256 ?? null,
       })
       .then((file) => {
         setUpd((s) =>
