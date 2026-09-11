@@ -47,7 +47,7 @@ const BUDDY_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'buddy-overview', label: '概述', icon: LayoutDashboard },
   { key: 'buddy-accounts', label: '账号管理', icon: Users },
   { key: 'buddy-checkin', label: '签到与成长', icon: PlayCircle },
-  { key: 'buddy-credits', label: '积分与统计', icon: Coins },
+  { key: 'buddy-credits', label: '积分看板', icon: Coins },
   { key: 'buddy-settings', label: '环境配置', icon: Settings },
 ];
 

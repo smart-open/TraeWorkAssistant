@@ -38,7 +38,6 @@ export default function Dashboard() {
   const accounts = useAppStore((s) => s.accounts);
   const env = useAppStore((s) => s.env);
   const envCn = useAppStore((s) => s.envCn);
-  const proxy = useAppStore((s) => s.proxy);
   const apiStatus = useAppStore((s) => s.apiStatus);
   const certInstalled = useAppStore((s) => s.certInstalled);
   const localEntitlement = useAppStore((s) => s.localEntitlement);
@@ -144,15 +143,9 @@ export default function Dashboard() {
         }
       />
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard label="账号总数" value={total} hint={`今日已签 ${checkedToday}`} tone="brand" />
         <StatCard label="可用总积分" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={creditsHint} tone="amber" />
-        <StatCard
-          label="代理状态"
-          value={proxy.running ? `运行 :${proxy.port}` : '未启动'}
-          hint={proxy.running ? `已捕获 ${proxy.captured} 次请求 · 运行 ${formatUptime(proxy.started_at)}` : undefined}
-          tone={proxy.running ? 'green' : 'slate'}
-        />
         <StatCard
           label="API 服务"
           value={apiStatus?.running ? `运行 :${apiStatus.port}` : '未启动'}

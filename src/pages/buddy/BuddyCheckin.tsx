@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { PlayCircle, CalendarClock, ScrollText, Sparkles, MousePointerClick } from 'lucide-react';
+import { PlayCircle, Sparkles } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
-import { Badge, EmptyState } from '../../components/ui';
+import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { WbCheckinRecord, WorkBuddyAccountView, WorkBuddySettings } from '../../types';
+import type { WorkBuddyAccountView, WorkBuddySettings } from '../../types';
 
 /**
  * buddy-checkin 签到与成长（§3.7.3，F-15/F-16/F-55）：
- * 签到控制卡（NDJSON 进度）+ 成长中心卡（开关随批次2开放）+ 定时任务卡 + 签到日志卡。
+ * 签到控制卡（NDJSON 进度）+ 成长中心卡。
+ * 近 30 天签到日志在概述页；定时任务与坐标点击兜底在环境配置「签到配置」面板。
  */
 
 interface WbAccountLine {
@@ -66,9 +67,6 @@ export default function BuddyCheckin() {
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<WbAccountLine[]>([]);
   const [summary, setSummary] = useState<string | null>(null);
-  const [results, setResults] = useState<WbCheckinRecord[]>([]);
-  const [tasks, setTasks] = useState<string[]>([]);
-  const [renewOn, setRenewOn] = useState(false);
   const [settings, setSettings] = useState<WorkBuddySettings | null>(null);
   const [growthRunning, setGrowthRunning] = useState(false);
   const [growthLines, setGrowthLines] = useState<WbGrowthLine[]>([]);
@@ -77,17 +75,11 @@ export default function BuddyCheckin() {
 
   const refresh = useCallback(async () => {
     try {
-      const [accs, recs, tks, renew, st] = await Promise.all([
+      const [accs, st] = await Promise.all([
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
-        api.workbuddy.checkinResults(30).catch(() => [] as WbCheckinRecord[]),
-        api.workbuddy.checkinTaskStatus().catch(() => [] as string[]),
-        api.workbuddy.renewTaskStatus().catch(() => false),
         api.workbuddy.settingsGet().catch(() => null),
       ]);
       setAccounts(accs);
-      setResults(recs);
-      setTasks(tks);
-      setRenewOn(renew);
       setSettings(st);
     } catch (err) {
       pushToast('error', `读取签到数据失败：${String(err)}`);
@@ -195,37 +187,11 @@ export default function BuddyCheckin() {
     }
   };
 
-  const registerTasks = async () => {
-    try {
-      await api.workbuddy.checkinTaskRegister(['09:00', '21:00']);
-      setTasks(await api.workbuddy.checkinTaskStatus());
-      pushToast('success', '已注册每日 09:00 / 21:00 双时段签到任务');
-    } catch (err) {
-      pushToast('error', `注册任务失败：${String(err)}`);
-    }
-  };
-
-  const toggleRenew = async () => {
-    try {
-      if (renewOn) {
-        await api.workbuddy.renewTaskUnregister();
-        setRenewOn(false);
-        pushToast('info', '已卸载每周续期任务');
-      } else {
-        await api.workbuddy.renewTaskRegister('SUN');
-        setRenewOn(true);
-        pushToast('success', '已注册每周日 10:30 凭证续期任务');
-      }
-    } catch (err) {
-      pushToast('error', `续期任务操作失败：${String(err)}`);
-    }
-  };
-
   return (
     <div className="animate-fade-in">
       <PageHeader
         title="WorkBuddy · 签到与成长"
-        desc="一键签到 · 双时段定时 · 成长中心"
+        desc="一键签到 · 成长中心 · 定时任务见环境配置"
         actions={
           <button className="btn-primary" onClick={() => void startCheckin()} disabled={running}>
             <PlayCircle size={15} /> {running ? '签到中…' : '立即签到'}
@@ -333,134 +299,6 @@ export default function BuddyCheckin() {
                   {g.tasks && <span>任务：{g.tasks}</span>}
                   {g.status === 'fail' && g.message && <span className="text-red-500">{g.message}</span>}
                 </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* 定时任务卡（F-16） */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <CalendarClock size={16} className="text-brand-500" />
-          <span className="text-sm font-medium">定时任务</span>
-        </div>
-        <div className="grid gap-3 lg:grid-cols-2">
-          <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm font-medium">每日签到 · 09:00 / 21:00 双时段</div>
-                <div className="text-xs text-slate-400">
-                  {tasks.length > 0 ? `已注册：${tasks.join('、')}` : '未注册'}
-                </div>
-              </div>
-              <div className="flex gap-2">
-                {tasks.length === 0 ? (
-                  <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void registerTasks()}>注册</button>
-                ) : (
-                  <button
-                    className="btn-outline !px-2 !py-1 text-xs"
-                    onClick={() => void api.workbuddy.checkinTaskUnregister().then(refresh).catch((e) => pushToast('error', String(e)))}
-                  >
-                    卸载
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-          <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm font-medium">token 每周兜底续期（周日 10:30）</div>
-                <div className="text-xs text-slate-400">{renewOn ? '已注册：惰性刷新临期账号凭证' : '未注册：凭证临期后需手动续期'}</div>
-              </div>
-              <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void toggleRenew()}>
-                {renewOn ? '卸载' : '注册'}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* UI 坐标点击签到兜底（F-18）：仅手动触发、默认关闭 */}
-      <div className="mt-4 card p-4">
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <MousePointerClick size={16} className="text-amber-500" />
-            <span className="text-sm font-medium">UI 坐标点击兜底</span>
-            <Badge tone={settings?.ui_click_enabled ? 'amber' : 'slate'}>
-              {settings?.ui_click_enabled ? '已启用' : '默认关闭'}
-            </Badge>
-          </div>
-          <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-500">
-            <input
-              type="checkbox"
-              checked={settings?.ui_click_enabled ?? false}
-              onChange={(e) => void saveSettings({ ui_click_enabled: e.target.checked })}
-            />
-            启用（最后手段）
-          </label>
-        </div>
-        <p className="mb-2 text-xs text-slate-400">
-          签到 API 不可用时的最后手段：驱动鼠标对客户端「立即签到」按钮做坐标点击。
-          使用方法：打开客户端签到页 → 把鼠标悬停在签到按钮上 → 点「取点」记录坐标 → 回到本页点「执行点击」。
-          全程仅手动触发，不会自动连点。
-        </p>
-        <div className="flex flex-wrap items-center gap-2 text-xs">
-          <span className="rounded-md border border-slate-100 px-2 py-1 font-mono dark:border-zinc-800">
-            坐标：{settings?.ui_click_x ? `${settings.ui_click_x}, ${settings.ui_click_y}` : '未配置'}
-          </span>
-          <button
-            className="btn-outline !px-2 !py-1"
-            onClick={() =>
-              void api.workbuddy
-                .uiClickCapture()
-                .then((r) => {
-                  if (r.ok && settings) {
-                    void saveSettings({ ui_click_x: r.x, ui_click_y: r.y });
-                    pushToast('success', r.message);
-                  } else {
-                    pushToast('warn', r.message);
-                  }
-                })
-                .catch((e) => pushToast('error', String(e)))
-            }
-          >
-            取点（3 秒倒计时）
-          </button>
-          <button
-            className="btn-outline !px-2 !py-1"
-            disabled={!settings?.ui_click_enabled}
-            title={settings?.ui_click_enabled ? '' : '先在上方启用后才可执行（F-18 默认关闭）'}
-            onClick={() =>
-              void api.workbuddy
-                .uiClickCheckin()
-                .then((r) => pushToast(r.ok ? 'success' : 'warn', r.message))
-                .catch((e) => pushToast('error', String(e)))
-            }
-          >
-            执行点击
-          </button>
-        </div>
-      </div>
-
-      {/* 签到日志卡（30 天滚动） */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <ScrollText size={16} className="text-slate-400" />
-          <span className="text-sm font-medium">签到日志 · 近 30 天</span>
-          <span className="text-xs text-slate-400">（底层存储 90 天滚动）</span>
-        </div>
-        {results.length === 0 ? (
-          <EmptyState icon={<PlayCircle size={22} />} title="暂无签到记录" hint="执行签到或注册定时任务后，这里会逐账号展示结果。" />
-        ) : (
-          <div className="max-h-72 space-y-1.5 overflow-y-auto pr-1">
-            {results.map((r, i) => (
-              <div key={i} className="flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-1.5 text-xs dark:border-zinc-800">
-                <Badge tone={statusTone[r.status] ?? 'slate'}>{statusText[r.status] ?? r.status}</Badge>
-                <span className="min-w-0 flex-1 truncate">{r.name || r.user_id}</span>
-                <span className="max-w-[40%] truncate text-slate-400">{r.message}</span>
-                <span className="shrink-0 font-mono text-slate-400">{r.time}</span>
               </div>
             ))}
           </div>

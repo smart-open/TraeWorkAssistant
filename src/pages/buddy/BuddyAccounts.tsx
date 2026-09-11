@@ -5,18 +5,26 @@ import {
   Upload,
   UserPlus,
   ScanLine,
-  LayoutGrid,
-  Rows3,
   ShieldAlert,
+  LogIn,
+  Save,
+  KeyRound,
+  TerminalSquare,
+  DatabaseBackup,
+  ArchiveRestore,
+  Copy,
+  Pencil,
+  Trash2,
+  Loader2,
+  Coins,
+  Users,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState, Modal, Spinner } from '../../components/ui';
-import { Users } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import AccountCard from './AccountCard';
 import type {
   WorkBuddyAccountView,
   WbCreditPackage,
@@ -29,8 +37,28 @@ import type {
 
 /**
  * buddy-accounts 账号管理（§3.7.2，F-54/F-56/F-60/F-50/F-14）：
- * 聚合迁移入口（OAuth 扫码 / 导入本机账号 / 导入导出）+ 双态卡片区 + 积分包明细弹窗 + 环境重置。
+ * 列表式账号池（对齐 Trae 账号管理）+ 聚合迁移入口 + 积分包明细弹窗 + 环境重置。
  */
+
+function maskUid(uid: string): string {
+  if (uid.length <= 14) return uid || '—';
+  return `${uid.slice(0, 8)}…${uid.slice(-6)}`;
+}
+
+function fmtExpire(ts: number | null): string {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function tokenTone(ts: number | null): string {
+  if (ts == null) return 'text-slate-400';
+  const days = (ts * 1000 - Date.now()) / 86400000;
+  if (days < 0) return 'text-rose-500';
+  if (days < 1) return 'text-amber-500';
+  return 'text-emerald-600 dark:text-emerald-400';
+}
+
 export default function BuddyAccounts() {
   const pushToast = useAppStore((s) => s.pushToast);
   const switchTo = useAppStore((s) => s.switchTo);
@@ -52,7 +80,6 @@ export default function BuddyAccounts() {
   const importFileRef = useRef<HTMLInputElement>(null);
   const [editFor, setEditFor] = useState<WorkBuddyAccountView | null>(null);
   const [editName, setEditName] = useState('');
-  const [cardView, setCardView] = useState(true);
   // OAuth 扫码（F-50）：事件驱动弹框（后端全流程，进度经 wb-oauth-progress / 结果 wb-oauth-done）
   const [oauthOpen, setOauthOpen] = useState(false);
   const [oauthStage, setOauthStage] = useState('');
@@ -352,6 +379,8 @@ export default function BuddyAccounts() {
     }
   };
 
+  const busy = !!switchingTo || !!savingLogin;
+
   return (
     <div className="animate-fade-in">
       <PageHeader
@@ -362,27 +391,11 @@ export default function BuddyAccounts() {
             <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
-            <button className="btn-outline" onClick={() => setCardView((v) => !v)} title="切换视图">
-              {cardView ? <Rows3 size={15} /> : <LayoutGrid size={15} />}
-              {cardView ? '列表' : '卡片'}
-            </button>
-            <button className="btn-outline !text-rose-600 hover:!border-rose-300" onClick={() => void openEnvReset()}>
-              <ShieldAlert size={15} /> 环境重置
-            </button>
-          </>
-        }
-      />
-
-      {/* 顶部聚合区「添加与迁移账号」（F-60） */}
-      <div className="card p-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <div className="text-sm font-medium">添加与迁移账号</div>
-            <div className="text-xs text-slate-400">快速导入账号，或从已有环境恢复</div>
-          </div>
-          <div className="flex flex-wrap gap-2">
             <button className="btn-outline" onClick={() => void importFromAuth()} disabled={importing}>
               {importing ? <Spinner /> : <ScanLine size={15} />} 导入本机账号
+            </button>
+            <button className="btn-outline" onClick={() => void startOauth()}>
+              <UserPlus size={15} /> OAuth 扫码
             </button>
             <button className="btn-outline" onClick={exportPool} disabled={accounts.length === 0}>
               <Download size={15} /> 导出
@@ -401,14 +414,14 @@ export default function BuddyAccounts() {
                 e.target.value = '';
               }}
             />
-            <button className="btn-outline" onClick={() => void startOauth()}>
-              <UserPlus size={15} /> OAuth 扫码
+            <button className="btn-outline !text-rose-600 hover:!border-rose-300" onClick={() => void openEnvReset()}>
+              <ShieldAlert size={15} /> 环境重置
             </button>
-          </div>
-        </div>
-      </div>
+          </>
+        }
+      />
 
-      {/* 账号卡片区 */}
+      {/* 账号列表（对齐 Trae 账号管理表格） */}
       {accounts.length === 0 ? (
         <div className="mt-5">
           <EmptyState
@@ -417,72 +430,148 @@ export default function BuddyAccounts() {
             hint="先在 WorkBuddy 客户端登录，然后点击上方「导入本机账号」自动扫描入池；切换/保存登录态会在账号管理中生成快照。"
           />
         </div>
-      ) : cardView ? (
-        <div className="mt-5 grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
-          {accounts.map((a) => (
-            <AccountCard
-              key={a.id}
-              account={a}
-              packages={credits.get(a.id) ?? []}
-              switching={switchingTo === a.id || savingLogin === a.id}
-              onSwitch={() => handleSwitch(a)}
-              onSaveLogin={() => handleSave(a)}
-              onRefreshToken={() => void handleRefreshToken(a)}
-              onSetCli={() => void handleSetCli(a)}
-              onBackupChats={() => void handleBackupChats(a)}
-              onRestoreChats={() => setRestoreFor(a)}
-              onCopyChats={() => {
-                setCopyFor(a);
-                setCopyTarget('');
-              }}
-              onEdit={() => handleEdit(a)}
-              onDelete={() => handleDelete(a)}
-              onViewPackages={() => setDetailFor(a)}
-            />
-          ))}
-        </div>
       ) : (
-        <div className="mt-5 card overflow-hidden">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-slate-100 text-left text-xs text-slate-400 dark:border-zinc-800">
-                <th className="px-4 py-2.5 font-medium">账号</th>
-                <th className="px-4 py-2.5 font-medium">版本</th>
-                <th className="px-4 py-2.5 font-medium">余额</th>
-                <th className="px-4 py-2.5 font-medium">token 到期</th>
-                <th className="px-4 py-2.5 font-medium">状态</th>
-                <th className="px-4 py-2.5 text-right font-medium">操作</th>
+        <div className="mt-5 card overflow-x-auto">
+          <table className="w-full min-w-[860px] text-sm">
+            <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
+              <tr>
+                <th className="px-4 py-2 text-left">账号</th>
+                <th className="px-4 py-2 text-left">版本</th>
+                <th className="px-4 py-2 text-right">可用积分</th>
+                <th className="px-4 py-2 text-left">token 到期</th>
+                <th className="px-4 py-2 text-left">积分包</th>
+                <th className="px-4 py-2 text-left">状态</th>
+                <th className="px-4 py-2 text-right">操作</th>
               </tr>
             </thead>
             <tbody>
-              {accounts.map((a) => (
-                <tr key={a.id} className="row-hover border-b border-slate-50 last:border-0 dark:border-zinc-800/60">
-                  <td className="px-4 py-2.5">
-                    <div className="font-medium">{a.nickname || a.id}</div>
-                    <div className="font-mono text-xs text-slate-400">{a.uid.slice(0, 8)}…</div>
-                  </td>
-                  <td className="px-4 py-2.5">{a.edition_type || '—'}</td>
-                  <td className="px-4 py-2.5 tabular-nums">{a.credits_balance?.toFixed(2) ?? '—'}</td>
-                  <td className="px-4 py-2.5 text-xs">
-                    {a.access_token_expires_at
-                      ? new Date(a.access_token_expires_at * 1000).toLocaleDateString()
-                      : '—'}
-                  </td>
-                  <td className="px-4 py-2.5">
-                    {a.is_current ? <Badge tone="green">当前</Badge> : a.needs_relogin ? <Badge tone="red">需重登</Badge> : <Badge tone="slate">备用</Badge>}
-                  </td>
-                  <td className="px-4 py-2.5 text-right">
-                    <div className="flex justify-end gap-1.5">
-                      <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => handleSwitch(a)} disabled={a.is_current}>
-                        {a.is_current ? '当前' : '设为当前'}
-                      </button>
-                      <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void handleSetCli(a)} disabled={!a.has_credential} title={a.has_credential ? '写入 ~/.codebuddy/settings.json 供 CLI 使用' : '需先导入凭证副本'}>
-                        CLI
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+              {accounts.map((a) => {
+                const pkgs = credits.get(a.id) ?? [];
+                const switching = switchingTo === a.id || savingLogin === a.id;
+                return (
+                  <tr key={a.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-medium">{a.nickname || a.id}</span>
+                        {a.is_current && <Badge tone="green">当前</Badge>}
+                        {a.needs_relogin && (
+                          <span title={a.relogin_reason} className="text-rose-500">
+                            <ShieldAlert size={12} />
+                          </span>
+                        )}
+                      </div>
+                      <div className="font-mono text-xs text-slate-400">{maskUid(a.uid)}</div>
+                    </td>
+                    <td className="px-4 py-3">
+                      {a.edition_type ? (
+                        <Badge tone={a.edition_type.toLowerCase() === 'pro' ? 'blue' : 'slate'}>{a.edition_type}</Badge>
+                      ) : (
+                        <span className="text-xs text-slate-300">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-right tabular-nums">
+                      {a.credits_balance != null ? a.credits_balance.toFixed(2) : '-'}
+                    </td>
+                    <td className="px-4 py-3 text-xs">
+                      <div className={tokenTone(a.access_token_expires_at)}>{fmtExpire(a.access_token_expires_at)}</div>
+                      {a.refresh_token_expires_at && (
+                        <div className="text-slate-400">RT {fmtExpire(a.refresh_token_expires_at)}</div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      {pkgs.length > 0 ? (
+                        <button
+                          className="flex items-center gap-1 text-xs text-brand-600 hover:underline dark:text-brand-400"
+                          onClick={() => setDetailFor(a)}
+                        >
+                          <Coins size={13} /> {pkgs.length} 个包
+                        </button>
+                      ) : (
+                        <span className="text-xs text-slate-300">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      {a.is_current ? (
+                        <Badge tone="green">在线</Badge>
+                      ) : a.needs_relogin ? (
+                        <Badge tone="red">需重登</Badge>
+                      ) : (
+                        <Badge tone="slate">备用</Badge>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex justify-end gap-1">
+                        <button
+                          title={a.is_current ? '当前在线账号' : a.needs_relogin ? '需重新登录后才能切换' : '设为当前（切换客户端登录）'}
+                          onClick={() => handleSwitch(a)}
+                          disabled={a.is_current || busy || a.needs_relogin}
+                          className={`btn-ghost !p-2 ${switching ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${(a.is_current || busy || a.needs_relogin) && !switching ? 'opacity-40 cursor-not-allowed' : ''}`}
+                        >
+                          {switching ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
+                        </button>
+                        <button
+                          title="保存当前登录态（快照客户端当前登录到该账号）"
+                          onClick={() => handleSave(a)}
+                          disabled={busy}
+                          className="btn-ghost !p-2"
+                        >
+                          <Save size={14} />
+                        </button>
+                        <button
+                          title="凭证续期（refreshToken 换新 accessToken）"
+                          onClick={() => void handleRefreshToken(a)}
+                          disabled={!a.has_credential}
+                          className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10"
+                        >
+                          <KeyRound size={14} />
+                        </button>
+                        <button
+                          title={a.has_credential ? '设为 CodeBuddy CLI 账号（写入 ~/.codebuddy/settings.json）' : '需先导入凭证副本'}
+                          onClick={() => void handleSetCli(a)}
+                          disabled={!a.has_credential}
+                          className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                        >
+                          <TerminalSquare size={14} />
+                        </button>
+                        <button
+                          title="备份会话（projects + 双 db 快照）"
+                          onClick={() => void handleBackupChats(a)}
+                          className="btn-ghost !p-2"
+                        >
+                          <DatabaseBackup size={14} />
+                        </button>
+                        <button
+                          title="从备份恢复会话"
+                          onClick={() => setRestoreFor(a)}
+                          className="btn-ghost !p-2"
+                        >
+                          <ArchiveRestore size={14} />
+                        </button>
+                        <button
+                          title="复制会话到其他账号"
+                          onClick={() => {
+                            setCopyFor(a);
+                            setCopyTarget('');
+                          }}
+                          className="btn-ghost !p-2"
+                        >
+                          <Copy size={14} />
+                        </button>
+                        <button title="编辑账号" onClick={() => handleEdit(a)} className="btn-ghost !p-2">
+                          <Pencil size={14} />
+                        </button>
+                        <button
+                          title="删除账号"
+                          onClick={() => handleDelete(a)}
+                          className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-500/10"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -753,7 +842,7 @@ export default function BuddyAccounts() {
       >
         {(credits.get(detailFor?.id ?? '') ?? []).length === 0 ? (
           <p className="py-6 text-center text-xs text-slate-400">
-            暂无积分包明细：请先在「积分与统计」页查询（需账号已录入凭证）
+            暂无积分包明细：请先在「积分看板」页查询（需账号已录入凭证）
           </p>
         ) : (
           <div className="space-y-3">

@@ -308,7 +308,9 @@ fn dig(v: &serde_json::Value, keys: &[&str]) -> Option<serde_json::Value> {
                 if let Some(hit) = m.get(key) {
                     return Some(hit.clone());
                 }
-                for wk in ["data", "result", "resp", "response", "info"] {
+                // 新版客户端 auth 文件为嵌套结构：token/到期在 .auth.*，账号信息在 .account.*
+                // （实测 2026-09 结构 {account, accounts, allAccounts, auth}），穿透这两层兼容新旧
+                for wk in ["data", "result", "resp", "response", "info", "auth", "account"] {
                     if let Some(child) = m.get(wk) {
                         if let Some(hit) = find(child, key, depth + 1) {
                             return Some(hit);
@@ -515,7 +517,7 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
             nickname,
             edition_type: as_str(&dig(&raw, &["editionType", "edition"])).unwrap_or_default(),
             access_token_expires_at: as_ts_seconds(&dig(&raw, &["expiresAtMs", "expiresAt", "expires_in_ms"])),
-            refresh_token_expires_at: None,
+            refresh_token_expires_at: as_ts_seconds(&dig(&raw, &["refreshExpiresAt", "refresh_expires_at"])),
             auth_saved_at: Some(chrono::Utc::now().timestamp()),
             ..Default::default()
         });

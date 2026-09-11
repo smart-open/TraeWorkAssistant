@@ -1,25 +1,18 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Save, FolderOpen, RefreshCw, TerminalSquare, Play } from 'lucide-react';
+import { Save, FolderOpen, RefreshCw, TerminalSquare, Play, CalendarClock, MousePointerClick } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import { localDataDir } from '@tauri-apps/api/path';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner } from '../../components/ui';
-import ExpiryCalendar from '../../components/ExpiryCalendar';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import type {
-  WorkBuddySettings,
-  WorkBuddyEnvCheck,
-  WorkBuddyAccountView,
-  WbCreditsResult,
-  WbCliStatus,
-  WbCliRotateLog,
-} from '../../types';
+import type { WorkBuddySettings, WorkBuddyEnvCheck, WbCliStatus, WbCliRotateLog } from '../../types';
 
 /**
  * buddy-settings 环境配置（§3.7.5，F-55/F-59/F-13）：
- * 环境卡 + 自动签到配置卡（F-55 参数化）+ CLI 五重防护轮换卡（F-59）+ 到期日历。
+ * 环境卡 + 签到配置卡（自动签到 + 定时任务 + 坐标点击兜底）+ CLI 五重防护轮换卡。
+ * 到期日历统一收敛在「积分看板」页。
  */
 
 /** CLI 最近活动的人类可读文案 */
@@ -173,27 +166,240 @@ function CliRotateCard({
     </div>
   );
 }
+
+/** 签到配置卡（F-55/F-16/F-18）：自动签到参数 + 定时任务注册 + UI 坐标点击兜底 */
+function CheckinConfigCard({
+  settings,
+  patch,
+}: {
+  settings: WorkBuddySettings | null;
+  patch: (p: Partial<WorkBuddySettings>) => void;
+}) {
+  const pushToast = useAppStore((s) => s.pushToast);
+  const [tasks, setTasks] = useState<string[]>([]);
+  const [renewOn, setRenewOn] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
+
+  const refreshTasks = useCallback(() => {
+    api.workbuddy.checkinTaskStatus().then(setTasks).catch(() => setTasks([]));
+    api.workbuddy.renewTaskStatus().then(setRenewOn).catch(() => setRenewOn(false));
+  }, []);
+
+  useEffect(() => {
+    refreshTasks();
+  }, [refreshTasks]);
+
+  // settings 单项保存（走 settingsSet 全量 patch，与父页「保存配置」同通道）
+  const savePatch = async (p: Partial<WorkBuddySettings>) => {
+    if (!settings) return;
+    setSavingSettings(true);
+    try {
+      patch(p);
+      await api.workbuddy.settingsSet({ ...settings, ...p });
+    } catch (err) {
+      pushToast('error', `保存设置失败：${String(err)}`);
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const registerTasks = async () => {
+    try {
+      await api.workbuddy.checkinTaskRegister(['09:00', '21:00']);
+      setTasks(await api.workbuddy.checkinTaskStatus());
+      pushToast('success', '已注册每日 09:00 / 21:00 双时段签到任务');
+    } catch (err) {
+      pushToast('error', `注册任务失败：${String(err)}`);
+    }
+  };
+
+  const toggleRenew = async () => {
+    try {
+      if (renewOn) {
+        await api.workbuddy.renewTaskUnregister();
+        setRenewOn(false);
+        pushToast('info', '已卸载每周续期任务');
+      } else {
+        await api.workbuddy.renewTaskRegister('SUN');
+        setRenewOn(true);
+        pushToast('success', '已注册每周日 10:30 凭证续期任务');
+      }
+    } catch (err) {
+      pushToast('error', `续期任务操作失败：${String(err)}`);
+    }
+  };
+
+  return (
+    <div className="mt-4 card p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <CalendarClock size={16} className="text-brand-500" />
+        <span className="text-sm font-medium">签到配置</span>
+      </div>
+      <div className="space-y-3">
+        {/* 自动签到（F-55） */}
+        <label className="flex items-start gap-2">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={settings?.auto_checkin ?? false}
+            onChange={(e) => patch({ auto_checkin: e.target.checked })}
+          />
+          <span className="text-sm">
+            启用自动签到（启动补签）
+            <span className="block text-xs text-slate-400">应用启动时立即核验服务端状态，未签到账号会自动补签</span>
+          </span>
+        </label>
+        <div className="grid gap-3 lg:grid-cols-2">
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium text-slate-500">保活阈值（天）</span>
+            <input
+              type="number"
+              min={0}
+              className="input w-full"
+              value={settings?.keepalive_days ?? 0}
+              onChange={(e) => patch({ keepalive_days: Number(e.target.value) || 0 })}
+            />
+            <span className="mt-1 block text-xs text-slate-400">0 = 每天无条件刷新全部带 refreshToken 账号</span>
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium text-slate-500">惰性刷新（小时）</span>
+            <input
+              type="number"
+              min={1}
+              className="input w-full"
+              value={settings?.lazy_refresh_hours ?? 24}
+              onChange={(e) => patch({ lazy_refresh_hours: Number(e.target.value) || 24 })}
+            />
+            <span className="mt-1 block text-xs text-slate-400">剩余有效期低于该值才触发刷新（默认 24）</span>
+          </label>
+        </div>
+
+        {/* 定时任务（F-16） */}
+        <div className="grid gap-3 lg:grid-cols-2">
+          <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">每日签到 · 09:00 / 21:00 双时段</div>
+                <div className="text-xs text-slate-400">
+                  {tasks.length > 0 ? `已注册：${tasks.join('、')}` : '未注册'}
+                </div>
+              </div>
+              <div className="flex gap-2">
+                {tasks.length === 0 ? (
+                  <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void registerTasks()}>注册</button>
+                ) : (
+                  <button
+                    className="btn-outline !px-2 !py-1 text-xs"
+                    onClick={() =>
+                      void api.workbuddy
+                        .checkinTaskUnregister()
+                        .then(() => {
+                          setTasks([]);
+                          pushToast('info', '已卸载定时签到任务');
+                        })
+                        .catch((e) => pushToast('error', String(e)))
+                    }
+                  >
+                    卸载
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+          <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">token 每周兜底续期（周日 10:30）</div>
+                <div className="text-xs text-slate-400">{renewOn ? '已注册：惰性刷新临期账号凭证' : '未注册：凭证临期后需手动续期'}</div>
+              </div>
+              <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void toggleRenew()}>
+                {renewOn ? '卸载' : '注册'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* UI 坐标点击签到兜底（F-18）：仅手动触发、默认关闭 */}
+        <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <MousePointerClick size={15} className="text-amber-500" />
+              <span className="text-sm font-medium">UI 坐标点击兜底</span>
+              <Badge tone={settings?.ui_click_enabled ? 'amber' : 'slate'}>
+                {settings?.ui_click_enabled ? '已启用' : '默认关闭'}
+              </Badge>
+            </div>
+            <label className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-500">
+              <input
+                type="checkbox"
+                checked={settings?.ui_click_enabled ?? false}
+                onChange={(e) => void savePatch({ ui_click_enabled: e.target.checked })}
+              />
+              启用（最后手段）
+            </label>
+          </div>
+          <p className="mb-2 text-xs text-slate-400">
+            签到 API 不可用时的最后手段：驱动鼠标对客户端「立即签到」按钮做坐标点击。
+            使用方法：打开客户端签到页 → 把鼠标悬停在签到按钮上 → 点「取点」记录坐标 → 回来点「执行点击」。
+            全程仅手动触发，不会自动连点。
+          </p>
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="rounded-md border border-slate-100 px-2 py-1 font-mono dark:border-zinc-800">
+              坐标：{settings?.ui_click_x ? `${settings.ui_click_x}, ${settings.ui_click_y}` : '未配置'}
+            </span>
+            <button
+              className="btn-outline !px-2 !py-1"
+              disabled={savingSettings}
+              onClick={() =>
+                void api.workbuddy
+                  .uiClickCapture()
+                  .then((r) => {
+                    if (r.ok) {
+                      void savePatch({ ui_click_x: r.x, ui_click_y: r.y });
+                      pushToast('success', r.message);
+                    } else {
+                      pushToast('warn', r.message);
+                    }
+                  })
+                  .catch((e) => pushToast('error', String(e)))
+              }
+            >
+              取点（3 秒倒计时）
+            </button>
+            <button
+              className="btn-outline !px-2 !py-1"
+              disabled={!settings?.ui_click_enabled || savingSettings}
+              title={settings?.ui_click_enabled ? '' : '先启用后才可执行（F-18 默认关闭）'}
+              onClick={() =>
+                void api.workbuddy
+                  .uiClickCheckin()
+                  .then((r) => pushToast(r.ok ? 'success' : 'warn', r.message))
+                  .catch((e) => pushToast('error', String(e)))
+              }
+            >
+              执行点击
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function BuddySettings() {
   const pushToast = useAppStore((s) => s.pushToast);
   const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
-  const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
-  const [credits, setCredits] = useState<WbCreditsResult | null>(null);
   const [settings, setSettings] = useState<WorkBuddySettings | null>(null);
   const [saving, setSaving] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const [e, accs, st, cr] = await Promise.all([
+      const [e, st] = await Promise.all([
         api.workbuddy.envCheck(),
-        api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
         api.workbuddy.settingsGet().catch(() => null),
-        // 积分包到期条目随首屏一并就绪（失败静默：日历仅降级为 token 条目）
-        api.workbuddy.creditsFetch().catch(() => null),
       ]);
       setEnv(e);
-      setAccounts(accs);
       setSettings(st);
-      setCredits(cr);
     } catch (err) {
       pushToast('error', `环境检测失败：${String(err)}`);
     }
@@ -221,46 +427,11 @@ export default function BuddySettings() {
     setSettings((prev) => (prev ? { ...prev, ...p } : prev));
   };
 
-  // 到期日历条目：token（access/refresh 双轨）+ 积分包
-  const items = accounts.flatMap((a) => {
-    const out = [] as Parameters<typeof ExpiryCalendar>[0]['items'];
-    if (a.access_token_expires_at) {
-      out.push({
-        key: `acc-${a.id}`,
-        label: `${a.nickname || a.id} · accessToken`,
-        kind: 'token',
-        expire_ts: a.access_token_expires_at,
-        note: null,
-      });
-    }
-    if (a.refresh_token_expires_at) {
-      out.push({
-        key: `ref-${a.id}`,
-        label: `${a.nickname || a.id} · refreshToken`,
-        kind: 'token',
-        expire_ts: a.refresh_token_expires_at,
-        note: null,
-      });
-    }
-    return out;
-  });
-  for (const acc of credits?.accounts ?? []) {
-    for (const p of acc.packages) {
-      items.push({
-        key: `pkg-${acc.user_id}-${p.name}-${p.expire_ts ?? 0}`,
-        label: `${acc.name} · ${p.name}`,
-        kind: '积分包',
-        expire_ts: p.expire_ts,
-        note: `剩余 ${p.remaining.toFixed(2)}`,
-      });
-    }
-  }
-
   return (
     <div className="animate-fade-in">
       <PageHeader
         title="WorkBuddy · 环境配置"
-        desc="客户端环境 · 自动签到 · 到期日历"
+        desc="客户端环境 · 签到配置 · 通知与轮换"
         actions={
           <>
             <button className="btn-outline" onClick={() => void refresh()}>
@@ -311,48 +482,8 @@ export default function BuddySettings() {
         </div>
       </div>
 
-      {/* 自动签到配置卡（F-55） */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 text-sm font-medium">自动签到</div>
-        <div className="space-y-3">
-          <label className="flex items-start gap-2">
-            <input
-              type="checkbox"
-              className="mt-0.5"
-              checked={settings?.auto_checkin ?? false}
-              onChange={(e) => patch({ auto_checkin: e.target.checked })}
-            />
-            <span className="text-sm">
-              启用自动签到（启动补签）
-              <span className="block text-xs text-slate-400">应用启动时立即核验服务端状态，未签到账号会自动补签</span>
-            </span>
-          </label>
-          <div className="grid gap-3 lg:grid-cols-2">
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-500">保活阈值（天）</span>
-              <input
-                type="number"
-                min={0}
-                className="input w-full"
-                value={settings?.keepalive_days ?? 0}
-                onChange={(e) => patch({ keepalive_days: Number(e.target.value) || 0 })}
-              />
-              <span className="mt-1 block text-xs text-slate-400">0 = 每天无条件刷新全部带 refreshToken 账号</span>
-            </label>
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-500">惰性刷新（小时）</span>
-              <input
-                type="number"
-                min={1}
-                className="input w-full"
-                value={settings?.lazy_refresh_hours ?? 24}
-                onChange={(e) => patch({ lazy_refresh_hours: Number(e.target.value) || 24 })}
-              />
-              <span className="mt-1 block text-xs text-slate-400">剩余有效期低于该值才触发刷新（默认 24）</span>
-            </label>
-          </div>
-        </div>
-      </div>
+      {/* 签到配置（F-55/F-16/F-18）：自动签到 + 定时任务 + 坐标点击兜底 */}
+      <CheckinConfigCard settings={settings} patch={patch} />
 
       {/* 通知渠道（F-19） */}
       <div className="mt-4 card p-4">
@@ -386,12 +517,6 @@ export default function BuddySettings() {
 
       {/* CLI 五重防护自动轮换（F-06/F-59，批次3） */}
       <CliRotateCard settings={settings} patch={patch} />
-
-      {/* 到期日历 */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 text-sm font-medium">到期日历</div>
-        <ExpiryCalendar items={items} />
-      </div>
     </div>
   );
 }
