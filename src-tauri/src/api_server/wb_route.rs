@@ -747,6 +747,7 @@ pub async fn wb_tool_exec_chat(
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut records: Vec<super::wb_toolexec::SearchRecord> = Vec::new();
         let mut final_completion: Option<Value> = None;
+        let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
         let mut last_err: Option<String> = None;
         let resp_id = format!("resp_{}", now_ts());
 
@@ -898,6 +899,7 @@ pub async fn wb_tool_exec_chat(
                 Ok(c) => {
                     state.wb_pool.note_success(&picked.uid);
                     clear_model_failure(&state, &model);
+                    success_uid = Some(picked.uid.clone());
                     final_completion = Some(c);
                     break 'accounts;
                 }
@@ -915,9 +917,10 @@ pub async fn wb_tool_exec_chat(
                     u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                     u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                 )).unwrap_or((0, 0));
-                state.record_usage(&model, "wb-toolexec", &key_id, true, stream, duration_ms, pt, ct);
+                let usage_uid = success_uid.as_deref().unwrap_or("wb-toolexec");
+                state.record_usage(&model, usage_uid, &key_id, true, stream, duration_ms, pt, ct);
                 state.logger.log_request(
-                    "POST", "/v1/responses", &model, stream, 200, "wb-toolexec",
+                    "POST", "/v1/responses", &model, stream, 200, usage_uid,
                     duration_ms, Some(&format!("rounds={} searches={}", records.len(), records.iter().filter(|r| r.tool == super::wb_toolexec::TOOL_SEARCH).count())),
                 );
                 // Responses 投影：web_search_call 历史项前置
@@ -926,8 +929,7 @@ pub async fn wb_tool_exec_chat(
                 Ok((completion, ws_items, resp_id))
             }
             None => {
-                state.record_usage(&model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);
-                state.logger.log_request(
+                state.record_usage(&model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);                state.logger.log_request(
                     "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
                     duration_ms, last_err.as_deref(),
                 );

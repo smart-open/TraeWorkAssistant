@@ -181,19 +181,28 @@ pub fn resolve(cfg: &WbRouteFile, catalog: &[super::wb_catalog::WbModel], reques
     RouteResult::direct(req)
 }
 
-/// 大小写不敏感剥离后缀；剥离后为空返回 None
+/// 大小写不敏感剥离后缀；剥离后为空返回 None。
+/// 按字符计数回推切分点（字节切片在多字节后缀 + 大小写转换改变字节长度时会
+/// 越过字符边界导致 panic——审查修复：改为纯字符级切分，任何输入不 panic）
 fn strip_suffix_ci(name: &str, suffix: &str) -> Option<String> {
-    if suffix.is_empty() || name.len() <= suffix.len() {
+    if suffix.is_empty() {
         return None;
     }
-    if name.to_lowercase().ends_with(&suffix.to_lowercase()) {
-        let base = &name[..name.len() - suffix.len()];
-        if base.trim().is_empty() {
-            return None;
-        }
-        return Some(base.trim_end_matches(['-', '_']).to_string());
+    let name_chars: Vec<char> = name.chars().collect();
+    let suffix_chars: Vec<char> = suffix.chars().collect();
+    if name_chars.len() <= suffix_chars.len() {
+        return None;
     }
-    None
+    let split = name_chars.len() - suffix_chars.len();
+    let base: String = name_chars[..split].iter().collect();
+    let tail: String = name_chars[split..].iter().collect();
+    if !tail.to_lowercase().eq(&suffix.to_lowercase()) {
+        return None;
+    }
+    if base.trim().is_empty() {
+        return None;
+    }
+    Some(base.trim_end_matches(['-', '_']).to_string())
 }
 
 /// 目录内倍率最低的模型（后台任务降级目标，T5.6③/F-65）；
@@ -212,6 +221,7 @@ pub fn is_background_task(body: &serde_json::Value) -> bool {
     let max_tokens = body
         .get("max_tokens")
         .and_then(|v| v.as_u64())
+        .or_else(|| body.get("max_completion_tokens").and_then(|v| v.as_u64()))
         .or_else(|| body.get("max_output_tokens").and_then(|v| v.as_u64()));
     let Some(mt) = max_tokens else { return false };
     if mt > 128 {
@@ -334,6 +344,20 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_custom_suffix_is_safe() {
+        // 审查修复回归：多字节后缀（含大小写转换会改变字节长度的 İ）不得 panic
+        let mut cfg = empty_cfg();
+        cfg.suffixes.push(RouteSuffix { suffix: "中".into(), effort: None });
+        assert_eq!(strip_suffix_ci("glm-5.3中", "中").as_deref(), Some("glm-5.3"));
+        let mut cfg2 = empty_cfg();
+        cfg2.suffixes.push(RouteSuffix { suffix: "İ".into(), effort: None });
+        let _ = strip_suffix_ci("modelİ", "İ"); // 任何输入不 panic 即达标
+        assert_eq!(strip_suffix_ci("modelİ", "İ").as_deref(), Some("model"));
+        // 大小写不敏感仍生效
+        assert_eq!(strip_suffix_ci("HY4-THINKING", "-thinking").as_deref(), Some("HY4"));
+    }
+
+    #[test]
     fn custom_suffix_rules_apply_after_builtin() {
         let mut cfg = empty_cfg();
         cfg.suffixes.push(RouteSuffix { suffix: "-xhigh".into(), effort: Some("medium".into()) });
@@ -371,6 +395,9 @@ mod tests {
         // 缺 max_tokens → 非后台
         let none = json!({"messages":[{"role":"user","content":"hi"}]});
         assert!(!is_background_task(&none));
+        // max_completion_tokens（OpenAI 新字段）同样识别
+        let mct = json!({"max_completion_tokens": 64, "messages":[{"role":"user","content":"总结"}]});
+        assert!(is_background_task(&mct));
         // content blocks 形态
         let blocks = json!({"max_tokens": 100, "messages":[{"role":"user","content":[{"type":"text","text":"短"}]}]});
         assert!(is_background_task(&blocks));

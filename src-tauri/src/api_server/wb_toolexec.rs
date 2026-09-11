@@ -241,7 +241,7 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() + 1 && i + 2 < bytes.len() + 1 {
+        if bytes[i] == b'%' {
             if let (Some(h), Some(l)) = (hex_val(bytes.get(i + 1).copied()), hex_val(bytes.get(i + 2).copied())) {
                 out.push(h * 16 + l);
                 i += 3;
@@ -313,9 +313,7 @@ fn open_url(url: &str) -> Result<String, String> {
         .map_err(|e| format!("页面请求失败: {e}"))?
         .into_string()
         .map_err(|e| format!("页面读取失败: {e}"))?;
-    // script/style 块整体剔除
-    let mut cleaned = html.to_lowercase();
-    let _ = &mut cleaned;
+    // script/style 块整体剔除（审查修复：删除死变量 cleaned——整页 to_lowercase 白耗分配）
     let body = remove_blocks(&html, "<script", "</script>");
     let body = remove_blocks(&body, "<style", "</style>");
     let mut text = strip_tags(&body);
