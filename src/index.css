@@ -88,6 +88,28 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* 选区色：跟随主题的中性强调（浅色石墨 / 深色随 zinc 变量） */
+::selection {
+  background: rgba(113, 113, 122, 0.22);
+}
+html.dark ::selection {
+  background: rgba(212, 212, 216, 0.24);
+}
+
+/* 键盘导航焦点环：仅 focus-visible（鼠标点击不打扰），随主题中性色 */
+button:focus-visible,
+a:focus-visible,
+[role='button']:focus-visible,
+[role='tab']:focus-visible {
+  outline: 2px solid rgba(113, 113, 122, 0.65);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+html.dark button:focus-visible,
+html.dark a:focus-visible {
+  outline-color: rgba(212, 212, 216, 0.7);
+}
+
 /* 滚动条（简约风） */
 ::-webkit-scrollbar {
   width: 8px;
@@ -128,5 +150,13 @@ body {
   }
   .chip {
     @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium;
+  }
+  /* 可交互卡片悬浮反馈（配合 cursor-pointer 使用；静态卡不加） */
+  .card-hover {
+    @apply cursor-pointer transition-all duration-200 hover:-translate-y-0.5 hover:shadow-soft-lg;
+  }
+  /* 数据表行悬浮反馈（统一 Logs 表既有手感，浅色 slate-50 / 深色 zinc-800/40） */
+  .row-hover {
+    @apply transition-colors hover:bg-slate-50/80 dark:hover:bg-zinc-800/40;
   }
 }

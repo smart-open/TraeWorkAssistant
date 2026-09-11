@@ -1118,7 +1118,7 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                   return (
                     <tr
                       key={k.id}
-                      className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
+                      className="row-hover border-b border-slate-100 last:border-0 dark:border-zinc-800"
                     >
                       <td className="py-2 pr-4 font-medium text-slate-700 dark:text-zinc-200">
                         {k.name}

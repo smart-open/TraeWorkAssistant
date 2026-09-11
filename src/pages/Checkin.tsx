@@ -232,7 +232,7 @@ export default function Checkin() {
                     return (
                       <tr
                         key={a.user_id}
-                        className={`border-t border-slate-100 dark:border-zinc-800 ${scope === 'selected' && !isCandidate ? 'opacity-40' : ''}`}
+                        className={`row-hover border-t border-slate-100 dark:border-zinc-800 ${scope === 'selected' && !isCandidate ? 'opacity-40' : ''}`}
                       >
                         {scope === 'selected' && (
                           <td className="px-3 py-1.5">

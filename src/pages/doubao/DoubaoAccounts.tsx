@@ -650,7 +650,7 @@ export default function DoubaoAccounts() {
               </thead>
               <tbody>
                 {accounts.map((a) => (
-                  <tr key={a.user_id} className="border-t border-slate-200 dark:border-zinc-800">
+                  <tr key={a.user_id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
                     <td className="px-3 py-2">
                       <div className="flex items-center gap-2" title={quotaTip(a)}>
                         <span className="font-medium">{a.name}</span>

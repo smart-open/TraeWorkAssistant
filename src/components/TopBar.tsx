@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
-import { ExternalLink, Power, PowerOff, ShieldCheck, ShieldAlert, MonitorCheck, MonitorX, Server, Wifi } from 'lucide-react';
+import { ExternalLink, Power, PowerOff, ShieldCheck, ShieldAlert, MonitorCheck, MonitorX, Server, Wifi, KeyRound, FileCheck } from 'lucide-react';
+import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
 import { Badge } from './ui';
 import { api } from '../lib/tauri';
-import type { AppLocate } from '../types';
+import type { AppLocate, WorkBuddyEnvCheck, WorkBuddyAccountView } from '../types';
 
 /** Trae 专区顶栏：双应用安装状态 + 证书/代理/API 服务 + 打开应用 */
 function TraeTopBar() {
@@ -152,11 +153,76 @@ function DoubaoTopBar() {
   );
 }
 
+/** Buddy 专区顶栏：客户端状态 + auth 登录态 + 账号池概览 + 打开客户端（Buddy 工作区与 Trae/豆包顶栏同构，上下文不串） */
+function BuddyTopBar() {
+  const pushToast = useAppStore((s) => s.pushToast);
+  const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
+  const [accountCount, setAccountCount] = useState<number | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.workbuddy
+      .envCheck()
+      .then((e) => alive && setEnv(e))
+      .catch(() => {});
+    api.workbuddy
+      .accountsList()
+      .then((a) => alive && setAccountCount(a.length))
+      .catch(() => alive && setAccountCount(0));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const openClient = async () => {
+    const exe = env?.exe;
+    if (!exe) {
+      pushToast('warn', '未检测到 WorkBuddy 客户端，请先安装');
+      return;
+    }
+    try {
+      if (exe) await open(`file:///${exe}`);
+    } catch (e) {
+      pushToast('error', `打开客户端失败：${String(e)}`);
+    }
+  };
+
+  return (
+    <>
+      <div className="flex items-center gap-2">
+        {env?.installed ? (
+          <Badge tone="green" title={env.version ? `WorkBuddy 当前版本：v${env.version}` : 'WorkBuddy 客户端'}>
+            <MonitorCheck size={13} /> 客户端已安装
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> 客户端未检测到
+          </Badge>
+        )}
+        <Badge tone={env?.running ? 'green' : 'slate'} title="WorkBuddy 桌面客户端运行状态">
+          <Server size={13} /> {env?.running ? '运行中' : '未运行'}
+        </Badge>
+        <Badge tone={env?.auth_file_exists ? 'green' : 'amber'} title="登录态文件（workbuddy-desktop.info）">
+          <FileCheck size={13} /> {env?.auth_file_exists ? '登录态正常' : '登录态缺失'}
+        </Badge>
+        <Badge tone={accountCount && accountCount > 0 ? 'blue' : 'slate'} title="账号池账号数量（账号管理页维护）">
+          <KeyRound size={13} /> 账号池 {accountCount ?? '—'} 个
+        </Badge>
+      </div>
+      <div className="flex items-center gap-2">
+        <button onClick={() => void openClient()} className="btn-primary" disabled={!env?.exe}>
+          <ExternalLink size={15} /> 打开客户端
+        </button>
+      </div>
+    </>
+  );
+}
+
 export default function TopBar() {
   const activeApp = useAppStore((s) => s.activeApp);
   return (
     <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 dark:border-zinc-800 dark:bg-zinc-950">
-      {activeApp === 'doubao' ? <DoubaoTopBar /> : <TraeTopBar />}
+      {activeApp === 'doubao' ? <DoubaoTopBar /> : activeApp === 'buddy' ? <BuddyTopBar /> : <TraeTopBar />}
     </div>
   );
 }

@@ -261,7 +261,7 @@ export default function Credits() {
             {rows.map((a, i) => {
               const g = groups.find((x) => x.id === a.group_id);
               return (
-                <tr key={a.user_id} className="border-t border-slate-200 dark:border-zinc-800">
+                <tr key={a.user_id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
                   <td className="px-4 py-2">#{i + 1}</td>
                   <td className="px-4 py-2">
                     <div className="font-medium">{a.name}</div>

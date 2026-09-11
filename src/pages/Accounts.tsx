@@ -558,7 +558,7 @@ export default function Accounts() {
             <tbody>
               {filtered.map((a) => {
                 return (
-                  <tr key={a.user_id} className="border-t border-slate-200 dark:border-zinc-800">
+                  <tr key={a.user_id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
                         <span className="font-medium">{a.name}</span>
@@ -1462,7 +1462,7 @@ function ProfileModal({
               {profiles.map((p) => (
                 <tr
                   key={p.slot}
-                  className="border-t border-slate-200 dark:border-zinc-800"
+                  className="row-hover border-t border-slate-200 dark:border-zinc-800"
                 >
                   <td className="whitespace-nowrap px-3 py-2 font-mono text-xs">{p.slot}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums">{p.file_count}</td>

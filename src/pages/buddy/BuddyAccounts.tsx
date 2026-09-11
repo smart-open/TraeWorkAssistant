@@ -456,7 +456,7 @@ export default function BuddyAccounts() {
             </thead>
             <tbody>
               {accounts.map((a) => (
-                <tr key={a.id} className="border-b border-slate-50 last:border-0 dark:border-zinc-800/60">
+                <tr key={a.id} className="row-hover border-b border-slate-50 last:border-0 dark:border-zinc-800/60">
                   <td className="px-4 py-2.5">
                     <div className="font-medium">{a.nickname || a.id}</div>
                     <div className="font-mono text-xs text-slate-400">{a.uid.slice(0, 8)}…</div>

@@ -116,7 +116,7 @@ export default function BuddyOverview() {
 
       {/* 四指标卡 */}
       <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
-        <button className="text-left" onClick={() => setView('buddy-accounts')}>
+        <button className="card-hover rounded-2xl text-left" onClick={() => setView('buddy-accounts')}>
           <StatCard
             label="当前账号"
             value={current ? current.nickname || current.id : '未切换'}
@@ -124,7 +124,7 @@ export default function BuddyOverview() {
             tone="brand"
           />
         </button>
-        <button className="text-left" onClick={() => setView('buddy-accounts')}>
+        <button className="card-hover rounded-2xl text-left" onClick={() => setView('buddy-accounts')}>
           <StatCard
             label="池内账号"
             value={String(accounts.length)}
