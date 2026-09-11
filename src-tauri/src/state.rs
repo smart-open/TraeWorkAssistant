@@ -1,4 +1,4 @@
-//! 应用全局状态与目录布局（conf/data/logs 子目录路由、python/ps 资源定位）。
+﻿//! 应用全局状态与目录布局（conf/data/logs 子目录路由、python/ps 资源定位）。
 use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
@@ -114,6 +114,16 @@ impl AppState {
 
 /// 定位 python 脚本目录：覆盖安装版(MSI/NSIS)、便携版(zip 直接运行)、开发期三种布局。
 fn resolve_python_dir() -> PathBuf {
+    // 0) 开发期构建：优先仓库源码目录。target/debug 下可能残留旧的 python/、ps/ 资源
+    //    拷贝（Tauri dev 不更新它们），会劫持下面的周边布局解析，导致 dev 跑的是
+    //    过期脚本（真实案例：切换桥脚本/签到脚本逻辑漂移引发故障）。
+    #[cfg(debug_assertions)]
+    if let Some(root) = find_project_root() {
+        let p = root.join("src-python");
+        if p.exists() {
+            return p;
+        }
+    }
     // 1) 运行期 Tauri 注入的资源目录：<RESOURCE_DIR>/python
     if let Ok(res) = std::env::var("TAURI_RESOURCE_DIR") {
         let p = PathBuf::from(res).join("python");
@@ -147,9 +157,36 @@ fn resolve_python_dir() -> PathBuf {
     PathBuf::from("src-python")
 }
 
+/// 开发期从 exe 路径（<root>/src-tauri/target/debug/）向上定位仓库根目录，
+/// 根目录特征：同时存在 src-python/ 与 src-ps/。
+#[cfg(debug_assertions)]
+fn find_project_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?.to_path_buf();
+    for _ in 0..6 {
+        if dir.join("src-python").exists() && dir.join("src-ps").exists() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
 /// 定位 ps 脚本目录：与 python 目录同级，覆盖安装版/便携版/开发期。
 pub fn resolve_ps_dir() -> PathBuf {
     let py = resolve_python_dir();
+    // 开发期构建：python 目录在仓库 src-python，ps 取同级 src-ps（始终最新）
+    #[cfg(debug_assertions)]
+    {
+        if py.file_name().and_then(|n| n.to_str()) == Some("src-python") {
+            if let Some(root) = py.parent() {
+                let ps = root.join("src-ps");
+                if ps.exists() {
+                    return ps;
+                }
+            }
+        }
+    }
     // 安装/便携版：python 与 ps 都在 <RESOURCE_DIR> 下，故用 python 的父目录
     if let Some(parent) = py.parent() {
         let ps = parent.join("ps");

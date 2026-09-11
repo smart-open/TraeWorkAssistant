@@ -6,6 +6,21 @@
 
 ## [Unreleased]
 
+## [2.9.4] - 2026-09-11
+
+### 修复（吸收 main 分支 dcef5b0 / 9f8b68a / 96bdefa 三项修复，按单应用结构手工适配）
+
+- **签到摘要同日合并**：`auto_checkin.py` 新增 `save_summary_merged()`——本轮未覆盖的账号（被桌面端按「跳过已签」规则跳过）沿用当日旧记录，第二轮整份覆盖不再丢失「今日已签」状态；统计按合并后结果重算，跨天整份覆盖。附同日合并/跨天覆盖冒烟验证。
+- **签到进度列表全集模型**：Rust 侧 start 事件携带 scope 内全集账号清单（候选 pending / 跳过带原因 checked_in·expired·cooldown / 重试轮沿用上轮最终状态），被跳过的账号在进度列表中明示原因不再凭空消失；account 事件改按 user_id 匹配行（事件序号不再与全集列表位置错位），进度条以本轮候选数为准（checkin.rs + store.ts + Checkin.tsx + types.ts）。
+- **TRAE 切换前 JWT 服务端预检与快照恢复后校验（issue #9）**：切换前调签到 status 轻量只读接口探活，JWT 被服务端吊销（401 / 顶层 code=1001）时中止切换并给出补救指引，网络故障 fail-open 不阻断；续期 JWT 流程传 `skipJwtProbe` 跳过预检避免拦死续期链路；桥脚本恢复目标账号快照后校验恢复项数与关键登录态文件（storage.json / state.vscdb），快照无效自动从 last 槽回滚并 fatal 明示；签到完成的 SessionDead 账号弹精确指引 toast、账号卡常显「续期 JWT」入口、重试轮不再重试 SessionDead 永久失效账号（accounts.rs + switch.rs + checkin.rs + store.ts + trae-switch-bridge.ps1）。
+- **切换/续期误关 Trae CN IDE**：桥脚本 `Stop-Trae`/`Find-TraeExe` 原以 `Get-Process -Name 'Trae*'` 通配匹配，与 Trae CN IDE（进程名 `Trae`）同开时会被一并误杀。改为精确映像名查杀（`TRAE SOLO CN`/`TRAE SOLO`，以解析到的目标 exe 映像名优先，对齐 Rust 侧 env.rs F-47 策略），仅管理本应用目标 IDE。
+- **switch_account 改 async**：切换前 JWT 预检含网络调用（最长 15s），同步命令会冻结 UI，按项目约定改 `#[tauri::command(async)]`。
+
+### 修复
+
+- **开发期脚本资源漂移**：`resolve_python_dir`/`resolve_ps_dir` 在 debug 构建下优先解析仓库源码目录（向上定位项目根），不再被 `target/debug/` 下残留的旧资源拷贝劫持——真实案例：dev 运行的桥脚本/签到脚本为旧版本导致修复未生效。安装版/便携版解析链路不变（state.rs）。
+- **积分明细「-0」显示**：服务端积分包 usage 与 limit 的浮点误差经 Rust `round()` 后可能产生 `-0.0`（JSON `-0.0`），前端 `toLocaleString` 渲染为 "-0"。Rust 端 r2 归一/明细包 remaining/每日快照共 6 处统一 `+ 0.0` 消除负零（IEEE 754：-0.0 + 0.0 = +0.0），前端 `fmtCredits` 先按展示精度归一再渲染——「可用积分」列与悬停明细的通用/Work 积分为 0 时统一显示 "0"（accounts.rs + Accounts.tsx）。
+
 ## [2.9.3] - 2026-09-10
 
 ### 修复

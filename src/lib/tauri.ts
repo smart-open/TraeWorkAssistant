@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+﻿import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AccountView,
@@ -141,7 +141,12 @@ export const api = {
       invoke('write_text_file', { path, content }),
     readTextFile: (path: string) => invoke<string>('read_text_file', { path }),
   },
-  switchAccount: (userId: string) => invoke('switch_account', { userId }),
+  switchAccount: (userId: string, skipJwtProbe?: boolean) =>
+    invoke('switch_account', {
+      userId,
+      // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
+      skipJwtProbe: skipJwtProbe ?? false,
+    }),
   saveCurrentLogin: (userId: string) => invoke('save_current_login', { userId }),
   resetDeviceIds: () => invoke('reset_device_ids'),
   profiles: {
@@ -212,9 +217,18 @@ export const api = {
 };
 
 // ---- 事件载荷 ----
+/** start 事件账号清单项（Rust 侧发出，scope 内全集：候选 pending / 跳过带原因 / 重试轮沿用上轮状态） */
+export interface CheckinStartAccount {
+  user_id: string;
+  name: string;
+  status: 'pending' | 'skip' | 'success' | 'already' | 'fail';
+  skip_reason?: 'checked_in' | 'expired' | 'cooldown' | null;
+}
 export interface CheckinStartEvent {
   type: 'start';
   total: number;
+  /** scope 内全集清单；Python 脚本转发的 start 无此字段，前端仅同步 total 不重建列表 */
+  accounts?: CheckinStartAccount[];
 }
 export interface CheckinAccountEvent {
   type: 'account';

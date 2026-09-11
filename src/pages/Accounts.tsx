@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Plus,
@@ -95,8 +95,12 @@ function CreditsExpireBadge({ expireAt }: { expireAt: number | null }) {
   );
 }
 
-const fmtCredits = (v: number) =>
-  v.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+// 积分格式化：先按展示精度归一再渲染。服务端 usage/limit 的浮点误差经 Rust 端
+// round 后可能是 -0.0（JSON "-0.0"），toLocaleString 会显示 "-0"；归一为正零统一显示 "0"
+const fmtCredits = (v: number) => {
+  const n = Math.round(v * 100) / 100;
+  return (n === 0 ? 0 : n).toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+};
 
 /** 套餐身份徽标（Free / Lite / Pro ...，悬停展示说明） */
 function PayIdentityBadge({
@@ -166,6 +170,8 @@ function CreditCell({ account }: { account: AccountView }) {
   };
 
   const value = account.remaining_credits;
+  // 可用积分列与明细同口径：归一负零/极小负数后再渲染（避免 "-0"）
+  const valueText = value != null ? fmtCredits(value) : '-';
   return (
     <>
       <div
@@ -174,7 +180,7 @@ function CreditCell({ account }: { account: AccountView }) {
         onMouseLeave={() => setPos(null)}
         title="悬停查看积分明细"
       >
-        {value != null ? value.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) : '-'}
+        {valueText}
       </div>
       {pos &&
         createPortal(
@@ -557,7 +563,9 @@ export default function Accounts() {
                             <Snowflake size={14} />
                           </button>
                         )}
-                        {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24) && (
+                        {/* SessionDead（JWT 被服务端吊销）时 exp 往往未到，必须常显续期入口，
+                            否则与签到/切换失败的「点续期 JWT」指引断链（issue #9 审查项） */}
+                        {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead') && (
                           <button
                             title="续期 JWT（启动代理并切换账号）"
                             onClick={() => void renewJwt(a.user_id)}

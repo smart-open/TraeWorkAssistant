@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+﻿use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 use tauri::{AppHandle, Emitter, State};
@@ -6,11 +6,16 @@ use tauri::{AppHandle, Emitter, State};
 use crate::fs_utils;
 use crate::state::AppState;
 
-#[tauri::command]
+// async：切换前 JWT 预检含网络调用（最长 15s），同步命令会冻结 UI
+// （项目约定：阻塞型命令一律 #[tauri::command(async)]）
+#[tauri::command(async)]
 pub fn switch_account(
     app: AppHandle,
     state: State<AppState>,
     user_id: String,
+    // 续期 JWT 流程专用：目标账号 JWT 本就可能已吊销（续期正是为了重抓），
+    // 跳过 TRAE 切换前 JWT 预检，否则预检 401 会把续期链路拦死
+    skip_jwt_probe: Option<bool>,
 ) -> Result<(), String> {
     let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
@@ -24,6 +29,13 @@ pub fn switch_account(
     );
     if !bridge.exists() {
         return Err(format!("找不到切换脚本: {}", bridge.display()));
+    }
+
+    if !skip_jwt_probe.unwrap_or(false) {
+        // TRAE 切换前 JWT 服务端预检（issue #9）——目标账号 JWT 被服务端吊销时本地快照仍完好，
+        // 切换恢复后 IDE 一联网即被登出，用户感知为「切换了但没反应」。
+        // 401 判死时提前中止并给出补救指引；网络故障 fail-open 不阻断（见函数内实现）。
+        crate::commands::accounts::probe_trae_jwt_alive(&state, &user_id)?;
     }
 
     fs_utils::app_log(&state.data_dir, &format!("开始切换账号: user_id={user_id}"));

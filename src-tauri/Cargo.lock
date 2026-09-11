@@ -5262,7 +5262,7 @@ dependencies = [
 
 [[package]]
 name = "trae-work-assistant"
-version = "2.9.3"
+version = "2.9.4"
 dependencies = [
  "axum",
  "base64 0.22.1",

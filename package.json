@@ -1,7 +1,7 @@
-{
+﻿{
   "name": "trae-work-assistant",
   "private": true,
-  "version": "2.9.3",
+  "version": "2.9.4",
   "type": "module",
   "scripts": {
     "set-version": "node scripts/set-version.mjs",

@@ -38,6 +38,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Script:TraeDataDir = "$env:APPDATA\TRAE SOLO CN"
+# 目标应用精确映像名（进程名 = exe 文件名去扩展名）：本助手只管理 TRAE SOLO 系列变体。
+# 严禁用 'Trae*' 通配 —— 用户可能同时开着 Trae CN IDE（进程名 "Trae"），通配会在
+# 切换/续期/保存时把无关的 CN IDE 一起杀掉（真实案例：点续期误关 Trae CN IDE）。
+# 与 Rust 侧 open_trae_app 的按映像名精确查杀策略（env.rs F-47）保持一致。
+$Script:TargetProcNames = @('TRAE SOLO CN', 'TRAE SOLO')
 $Script:AppDataDir = "$env:APPDATA\TraeWorkAssistant"
 $Script:ProfilesDir = "$Script:AppDataDir\data\profiles"
 $Script:CurrentAccountFile = "$Script:ProfilesDir\current_account.txt"
@@ -162,8 +167,10 @@ function Find-TraeExe {
                 if ($pproc) { $parentName = $pproc.Name }
             }
         } catch {}
-        $proc = Get-Process -Name 'Trae*','TRAE*' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^(Trae|TRAE)' -and $_.Path -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName }
+        # 精确映像名匹配：仅解析 TRAE SOLO 系列进程，绝不把 Trae CN IDE（进程名 "Trae"）
+        # 或本助手进程误当作目标 IDE 启动路径
+        $proc = Get-Process -Name 'TRAE SOLO*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName }
         if ($proc) {
             $exePath = $proc | Select-Object -First 1 -ExpandProperty Path
             if ($exePath -and (Test-Path $exePath)) {
@@ -220,8 +227,11 @@ function Set-CurrentAccount {
 }
 
 function Stop-Trae {
+    # 精确映像名查杀（对齐 env.rs F-47）：以解析到的目标 exe 映像名为主，
+    # 叠加静态候选名单（覆盖 exe 未解析成功的场景）。仅命中 TRAE SOLO 系列进程，
+    # 绝不影响同时开着的 Trae CN IDE（进程名 "Trae"）或本助手。
     # 排除本助手自身进程：本应用进程名以 "Trae" 开头（如 "Trae Work 助手"），
-    # 若不过滤会被 Get-Process -Name 'Trae*' 命中并被 Stop-Process 误杀，导致 App 直接退出。
+    # 若不过滤会被旧版 Get-Process -Name 'Trae*' 命中并被 Stop-Process 误杀，导致 App 直接退出。
     $selfPid = $PID
     $parentPid = $selfPid
     $KnownAppName = 'Trae Work 助手'
@@ -234,8 +244,14 @@ function Stop-Trae {
             if ($pproc) { $parentName = $pproc.Name }
         }
     } catch {}
-    $p = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match '^(Trae|TRAE)' -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
+    $names = $Script:TargetProcNames
+    if (-not $Script:_TraeExeCache) { $null = Find-TraeExe }
+    if ($Script:_TraeExeCache) {
+        $img = [System.IO.Path]::GetFileNameWithoutExtension($Script:_TraeExeCache)
+        if ($img -and ($names -notcontains $img)) { $names = @($img) + @($names) }
+    }
+    $p = Get-Process -Name $names -ErrorAction SilentlyContinue | Where-Object {
+        $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
     }
     if ($p) {
         Write-Step -Stage 'stop' -Message '正在关闭 Trae Work' -Status 'running'
@@ -256,15 +272,15 @@ function Stop-Trae {
             while ($waited -lt 3) {
                 Start-Sleep -Seconds 1
                 $waited++
-                $still = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object {
-                    $_.Name -match '^(Trae|TRAE)' -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
+                $still = Get-Process -Name $names -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
                 }
                 if (-not $still) { break }
             }
         }
         # 第二级：仍有存活进程 → 强杀
-        $p = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -match '^(Trae|TRAE)' -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
+        $p = Get-Process -Name $names -ErrorAction SilentlyContinue | Where-Object {
+            $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
         }
         if ($p) {
             Write-Step -Stage 'stop' -Message '优雅关闭超时，强制结束进程' -Status 'warn'
@@ -275,8 +291,8 @@ function Stop-Trae {
         while ($waited -lt 3) {
             Start-Sleep -Seconds 1
             $waited++
-            $still = Get-Process -Name 'Trae*' -ErrorAction SilentlyContinue | Where-Object {
-                $_.Name -match '^(Trae|TRAE)' -and $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
+            $still = Get-Process -Name $names -ErrorAction SilentlyContinue | Where-Object {
+                $_.Id -ne $selfPid -and $_.Id -ne $parentPid -and $_.Name -ne $parentName
             }
             if (-not $still) { break }
         }
@@ -507,6 +523,8 @@ function Backup-CurrentProfile {
 
 function Restore-Profile {
     param([string]$Slot)
+    # 恢复项计数（供 Switch 恢复后校验）：-1=未校验，函数结尾写入实际恢复数；0 = 快照空/损坏
+    $Script:_LastRestoredCount = -1
     $src = Join-Path $Script:ProfilesDir $Slot
     if (-not (Test-Path $src)) {
         Write-Step -Stage 'restore' -Message "目标账号 $Slot 无快照，请先登录该账号并保存登录态" -Status 'error'
@@ -552,6 +570,7 @@ function Restore-Profile {
     # 9. Session Storage\
     if (Test-Path "$src\Session Storage") { $target = "$dest\Session Storage"; if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }; Copy-Item "$src\Session Storage" $target -Recurse -Force -ErrorAction SilentlyContinue; $restored++ }
 
+    $Script:_LastRestoredCount = $restored
     Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项)" -Status 'ok'
 }
 
@@ -582,6 +601,25 @@ try {
             }
             # 恢复目标账号的登录态（含设备标识）
             Restore-Profile -Slot $UserId
+            # 恢复后校验（issue #9）：①0 项恢复=快照空/损坏；②恢复后数据目录缺
+            # storage.json / state.vscdb = 快照不含关键登录态，或 TRAE 新版把登录态迁移到了
+            # 白名单之外（布局漂移）。两种情况启动 TRAE 都只会「切了个寂寞」——从 last 槽
+            # 回滚到切换前状态并重启，报 fatal 明示原因，避免用户面对静默无效的切换。
+            $missing = @()
+            if ($Script:_LastRestoredCount -le 0) {
+                $missing += '（快照为空或损坏，0 项恢复）'
+            } else {
+                foreach ($f in @('User\globalStorage\storage.json', 'User\globalStorage\state.vscdb')) {
+                    if (-not (Test-Path (Join-Path $Script:TraeDataDir $f))) { $missing += $f }
+                }
+            }
+            if ($missing.Count -gt 0) {
+                Write-Step -Stage 'restore' -Message "目标快照无效（$($missing -join '；')），正在从 last 槽回滚到切换前状态…" -Status 'warn'
+                Restore-Profile -Slot 'last'
+                Start-Trae
+                Write-Step -Stage 'fatal' -Message "账号 $UserId 的快照无效（$($missing -join '；')），已回滚到切换前状态。请登录该账号后重新「保存当前登录态」；若重新保存后仍报此错，可能是 TRAE 新版登录态布局变化，请携带日志反馈" -Status 'error'
+                exit 1
+            }
             # 记录当前账号 ID
             Set-CurrentAccount -AccountId $UserId
             Start-Trae

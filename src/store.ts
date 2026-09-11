@@ -1,4 +1,4 @@
-import { create } from 'zustand';
+﻿import { create } from 'zustand';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent, type SaveLoginDoneEvent } from './lib/tauri';
 import type {
@@ -310,6 +310,26 @@ export const useAppStore = create<AppState>((set, get) => ({
   applyCheckinEvent: (e) => {
     set((s) => {
       if (e.type === 'start') {
+        // Rust 侧 start 带 scope 内全集清单（候选 pending / 跳过带原因 / 重试轮沿用上轮状态），
+        // 重建列表使被跳过的账号也可见；Python 转发的 start（无 accounts）仅同步候选总数
+        if (e.accounts) {
+          return {
+            checkin: {
+              active: true,
+              total: e.total,
+              index: 0,
+              results: e.accounts.map((a, i) => ({
+                index: i + 1,
+                user_id: a.user_id,
+                name: a.name,
+                status: a.status,
+                skip_reason: a.skip_reason ?? null,
+              })),
+              done: null,
+              retry: s.checkin.retry,
+            },
+          };
+        }
         // 重试轮也会发 start（仅含失败账号）：保留 retry 横幅，重置进度列表
         return {
           checkin: { active: true, total: e.total, index: 0, results: [], done: null, retry: s.checkin.retry },
@@ -326,12 +346,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       if (e.type === 'account') {
         const results = s.checkin.results.slice();
-        const i = e.index - 1;
-        results[i] = {
-          index: e.index,
+        // 按 user_id 匹配行：事件 index 是本轮候选内的序号，与全集列表位置无关
+        const i = results.findIndex((r) => r.user_id === e.user_id);
+        const row = {
+          index: i >= 0 ? results[i].index : results.length + 1,
           user_id: e.user_id,
           name: e.name,
           status: e.status,
+          skip_reason: null,
           credits: e.credits,
           delta: e.delta,
           elapsed: e.elapsed,
@@ -340,7 +362,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           error_type: e.error_type,
           cooldown_until: e.cooldown_until,
         };
-        return { checkin: { ...s.checkin, index: e.index, results } };
+        if (i >= 0) results[i] = row;
+        else results.push(row);
+        // index 累计本轮已处理候选数，驱动进度条（total 口径=本轮候选数）
+        return { checkin: { ...s.checkin, index: s.checkin.index + 1, results } };
       }
       return {
         checkin: {
@@ -353,6 +378,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
     if (e.type === 'done') {
       void get().refreshAccounts();
+      // JWT 吊销类失败的精确提示（issue #9）：401=服务端已吊销 JWT，重新登录+保存即可恢复，
+      // 不再让用户面对笼统的「失败 N」自己摸索原因
+      const deadCount = get().checkin.results.filter(
+        (r) => r?.status === 'fail' && r.error_type === 'SessionDead',
+      ).length;
       // 签到完成后静默刷新剩余积分（内部会再次 refreshAccounts）
       void api.accounts.refreshRemainingCredits().then(() => {
         get().refreshAccounts();
@@ -367,6 +397,12 @@ export const useAppStore = create<AppState>((set, get) => ({
           : `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
         allSkipped ? { sticky: true } : undefined,
       );
+      if (deadCount > 0) {
+        get().pushToast(
+          'error',
+          `${deadCount} 个账号 JWT 已被服务端吊销（该账号在别处重新登录/IDE 内退出过登录）：请在 TRAE 中重新登录该账号并「保存当前登录态」，再点「续期 JWT」重新捕获`,
+        );
+      }
     }
   },
 
@@ -626,8 +662,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         await get().startProxy();
       }
       // 切换到目标账号，TRAE 重启后走代理，新 JWT 会被自动捕获
+      // skipJwtProbe=true：续期场景目标账号 JWT 本就可能已被服务端吊销，跳过切换前预检
       get().pushToast('info', '正在切换账号以捕获新 JWT，请稍候…');
-      await api.switchAccount(userId);
+      await api.switchAccount(userId, true);
     } catch (err) {
       get().pushToast('error', `续期失败：${String(err)}`);
     }

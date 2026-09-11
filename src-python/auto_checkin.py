@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
 Trae Work 多账号自动签到脚本 — Trae Work 助手 内置版
@@ -429,6 +429,29 @@ def emit(obj):
         print(json.dumps(obj, ensure_ascii=False), flush=True)
 
 
+def save_summary_merged(results, warnings, note=None):
+    """保存签到结果摘要（同日合并）：本轮未覆盖的账号（被桌面端跳过的已签账号）
+    沿用当日旧记录，避免第二轮整份覆盖后丢失「今日已签」状态。"""
+    path = os.path.join(DATA_SUBDIR, "checkin_summary.json")
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    merged = [{k: v for k, v in r.items() if k != "jwt"} for r in results]
+    old = load_json(path, default={})
+    if isinstance(old.get("results"), list) and str(old.get("time", "")).startswith(today):
+        names = {r.get("name") for r in merged}
+        merged += [r for r in old["results"] if r.get("name") not in names]
+    summary = {
+        "time": datetime.datetime.now().isoformat(timespec="seconds"),
+        "results": merged,
+        "total_ok": sum(1 for r in merged if r.get("ok")),
+        "already": sum(1 for r in merged if r.get("action") == "skip_already"),
+        "failed": sum(1 for r in merged if not r.get("ok")),
+        "warnings": warnings,
+    }
+    if note:
+        summary["note"] = note
+    save_json(path, summary)
+
+
 def main():
     global _JSON_STREAM
     parser = argparse.ArgumentParser(description="Trae Work 多账号自动签到")
@@ -462,16 +485,7 @@ def main():
         print("ℹ️  checkin_accounts.json 中暂无账号，无需签到。")
         emit({"type": "start", "total": 0})
         emit({"type": "done", "ok": 0, "already": 0, "failed": 0})
-        summary = {
-            "time": datetime.datetime.now().isoformat(timespec="seconds"),
-            "results": [],
-            "total_ok": 0,
-            "already": 0,
-            "failed": 0,
-            "warnings": [],
-            "note": "no_accounts_yet",
-        }
-        save_json(os.path.join(DATA_SUBDIR, "checkin_summary.json"), summary)
+        save_summary_merged([], [], note="no_accounts_yet")
         return 0
 
     # 计算本次要处理的账号（受 --accounts 过滤）
@@ -599,15 +613,7 @@ def main():
         for w in warnings:
             print(f"   - {w}")
 
-    summary = {
-        "time": datetime.datetime.now().isoformat(timespec="seconds"),
-        "results": [{k: v for k, v in r.items() if k != "jwt"} for r in results],
-        "total_ok": total_ok,
-        "already": already,
-        "failed": failed,
-        "warnings": warnings,
-    }
-    save_json(os.path.join(DATA_SUBDIR, "checkin_summary.json"), summary)
+    save_summary_merged(results, warnings)
     print(f"结果摘要已保存: {os.path.join(DATA_SUBDIR, 'checkin_summary.json')}")
 
     log_line = (

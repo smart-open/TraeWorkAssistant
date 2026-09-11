@@ -1,4 +1,4 @@
-// 与 Rust 端 DTO 对齐的类型定义。注意：Tauri 命令参数默认使用 snake_case，
+﻿// 与 Rust 端 DTO 对齐的类型定义。注意：Tauri 命令参数默认使用 snake_case，
 // 嵌套对象（CheckinOpts / LogsOpts / Settings）的字段必须保持 snake_case。
 
 export type ViewKey =
@@ -159,13 +159,17 @@ export interface CheckinOpts {
   skip_expired: boolean;
 }
 
-export type CheckinAccountStatus = 'pending' | 'already' | 'success' | 'fail';
+export type CheckinAccountStatus = 'pending' | 'already' | 'success' | 'fail' | 'skip';
+/** 跳过原因（status=skip 时）：checked_in=已签 / expired=JWT 过期 / cooldown=冷却中 */
+export type CheckinSkipReason = 'checked_in' | 'expired' | 'cooldown';
 
 export interface CheckinAccountResult {
   index: number;
   user_id: string;
   name: string;
   status: CheckinAccountStatus;
+  /** 本账号被跳过的原因（仅 status=skip） */
+  skip_reason?: CheckinSkipReason | null;
   credits?: number;
   delta?: number;
   elapsed?: number;
