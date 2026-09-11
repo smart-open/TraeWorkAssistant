@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+﻿use std::collections::HashSet;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
@@ -779,7 +779,7 @@ async fn images_entry(
             state.record_usage(false, &model, &picked.uid, &key_str, true, false, duration_ms, 0, 0);
             state.wb_pool.note_success(&picked.uid);
             state.logger.log_request(
-                "POST",
+                "trae", "POST",
                 if is_edit { "/v1/images/edits" } else { "/v1/images/generations" },
                 &model, false, 200, &picked.uid, duration_ms, None,
             );
@@ -791,7 +791,7 @@ async fn images_entry(
         Err((code, msg)) => {
             state.record_usage(false, &model, &picked.uid, &key_str, false, false, duration_ms, 0, 0);
             state.logger.log_request(
-                "POST",
+                "trae", "POST",
                 if is_edit { "/v1/images/edits" } else { "/v1/images/generations" },
                 &model, false, code, &picked.uid, duration_ms, Some(&msg),
             );
@@ -897,7 +897,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             send_stream_error(&tx, proto, code, &msg);
                         }
                         state.logger.log_request(
-                            "POST", proto.log_path(), &model, stream,
+                            "trae", "POST", proto.log_path(), &model, stream,
                             200, &picked.uid, duration_ms, Some(&msg),
                         );
                         if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -906,7 +906,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     } else {
                         state.pool.note_success(&picked.uid);
                         state.logger.log_request(
-                            "POST", proto.log_path(), &model, stream,
+                            "trae", "POST", proto.log_path(), &model, stream,
                             200, &picked.uid, duration_ms, None,
                         );
                         if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -922,7 +922,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     *safe_lock(&state.last_error) =
                         Some(format!("uid={} status={} body={}", picked.uid, status, preview));
                     state.logger.log_request(
-                        "POST", proto.log_path(), &model, stream,
+                        "trae", "POST", proto.log_path(), &model, stream,
                         status, &picked.uid, start_ts.elapsed().as_millis() as u64,
                         Some(&format!("upstream status={}", status)),
                     );
@@ -949,7 +949,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             })
             .collect();
         state.logger.log_request(
-            "POST", proto.log_path(), &model, stream,
+            "trae", "POST", proto.log_path(), &model, stream,
             503, "none", duration_ms, Some("no healthy account"),
         );
         // 写入 app.log 供排查
@@ -1068,7 +1068,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             );
                             state.pool.note_success(&picked.uid);
                             state.logger.log_request(
-                                "POST", proto.log_path(), &model, stream,
+                                "trae", "POST", proto.log_path(), &model, stream,
                                 200, &picked.uid, duration_ms, None,
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1086,7 +1086,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 duration_ms, 0, 0,
                             );
                             state.logger.log_request(
-                                "POST", proto.log_path(), &model, stream,
+                                "trae", "POST", proto.log_path(), &model, stream,
                                 200, &picked.uid, duration_ms, Some(&msg),
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1101,7 +1101,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 duration_ms, 0, 0,
                             );
                             state.logger.log_request(
-                                "POST", proto.log_path(), &model, stream,
+                                "trae", "POST", proto.log_path(), &model, stream,
                                 502, &picked.uid, duration_ms, Some("empty response"),
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1121,7 +1121,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         start_ts.elapsed().as_millis() as u64, 0, 0,
                     );
                     state.logger.log_request(
-                        "POST", proto.log_path(), &model, stream,
+                        "trae", "POST", proto.log_path(), &model, stream,
                         status, &picked.uid, start_ts.elapsed().as_millis() as u64,
                         Some(&format!("upstream status={}", status)),
                     );
@@ -1148,7 +1148,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             })
             .collect();
         state.logger.log_request(
-            "POST", proto.log_path(), &model, stream,
+            "trae", "POST", proto.log_path(), &model, stream,
             503, "none", duration_ms, Some("no healthy account"),
         );
         // 写入诊断日志

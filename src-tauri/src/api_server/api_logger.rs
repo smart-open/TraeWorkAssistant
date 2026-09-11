@@ -58,8 +58,10 @@ impl ApiLogger {
     }
 
     /// 记录一条 API 请求日志
+    /// `pool`：资源标识（"trae" / "wb"），区分该请求由哪个上游资源池服务
     pub fn log_request(
         &self,
+        pool: &str,
         method: &str,
         path: &str,
         model: &str,
@@ -85,9 +87,9 @@ impl ApiLogger {
         };
 
         let line = format!(
-            "[{:02}:{:02}:{:02}] {} {} model={} stream={} status={} uid={} {}ms{}\n",
+            "[{:02}:{:02}:{:02}] {} {} pool={} model={} stream={} status={} uid={} {}ms{}\n",
             h, m, s,
-            method, path, model, stream, status, uid_short, duration_ms, err_part,
+            method, path, pool, model, stream, status, uid_short, duration_ms, err_part,
         );
 
         if let Some(mut f) = self.get_writer() {
@@ -406,4 +408,40 @@ fn reverse_log_blocks(content: &str) -> String {
 
     blocks.reverse();
     blocks.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn today() -> String {
+        let now = Local::now();
+        format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day())
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("api_logger_test_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn log_line_contains_pool_and_model() {
+        let dir = tmp_dir("pool");
+        let logger = ApiLogger::new(dir.clone());
+        logger.log_request(
+            "wb", "POST", "/v1/chat/completions", "glm-5.3", true, 200,
+            "user-1234567890abcdef", 42, None,
+        );
+        logger.log_request(
+            "trae", "POST", "/v1/chat/completions", "glm-5.2", false, 503,
+            "none", 8, Some("no healthy account"),
+        );
+        let content = logger.read_log(&today()).expect("log written");
+        assert!(content.contains("pool=wb model=glm-5.3"), "wb 行需含资源标识与模型: {content}");
+        assert!(content.contains("pool=trae model=glm-5.2"), "trae 行需含资源标识与模型: {content}");
+        assert!(content.contains("error=no healthy account"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
