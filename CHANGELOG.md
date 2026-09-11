@@ -4,6 +4,24 @@
 
 ---
 
+## [未发布] · feature/buddy 批次 5（生态吸收与网关增强，T5.2~T5.6/T5.8）
+
+### 新增
+
+- **四段模型路由管线（T5.2/F-61）**：新增 `api_server/wb_model_route.rs`（12 单测）——① 别名静态映射（`data/wb_model_route.json.aliases`，大小写不敏感）→ ② 用户自定义通配规则（`rules[].pattern`，`*`/`?` 通配零正则依赖）→ ③ 内置系列通配（claude-*/gemini-*→glm-5.3、gpt-*→deepseek-v4-pro、o1*/o3*/o4*→hy4）→ ④ 后缀检测（内置 `-thinking` 注入 effort=high + 自定义 `suffixes[]`）；每级命中即止，映射目标一律校验目录命中防打空；四端点（chat/completions/messages/responses）统一经 `resolve_wb_target` 解析，全未命中回落原名走 SOLO
+- **reasoning_content 思考链透传 + 默认深度思考（T5.3/F-62）**：OpenAI 协议思考链天然透传（stream delta 整体转发 + aggregate 保留 reasoning_content，批次 2 已具备）；本批补齐 Anthropic 侧——流式 thinking block（thinking_delta/content_block_start/stop，先于文本块、次序异常兜底收口）+ 非流式 completion_to_anthropic 前置 thinking block；「默认深度思考」开关（`api_pool.json.wb_default_thinking`，默认关）：客户端未显式请求 effort 且无路由级提示时注入 high（Responses/Anthropic/OpenAI 三协议判定各自显式语义）
+- **生图双端点投影（T5.4/F-63）**：新增 `api_server/wb_images.rs`（4 单测）+ `/v1/images/generations`（文生图）与 `/v1/images/edits`（图生图，JSON 变体：image 为 base64/data URL，OpenAI multipart 不接受——零新增依赖红线）——目录校验（模型存在 + supports_image + prompt/image 非空）→ 上游 `{chat_base}/v2/images/generations`（headers 三铁律，Accept 换 JSON）；**上游不支持明示 501 不静默**（404/not found/不支持 关键词判定）；响应宽容归一（data[].url / b64_json / image_url 三形态 → OpenAI images 格式）
+- **网关工具代执行（T5.5/F-64）**：新增 `api_server/wb_toolexec.rs`（8 单测）+ `wb_route.wb_tool_exec_chat` 编排——/v1/responses 声明 `type:"web_search"` 且开关开启时代理侧注入 function 工具（web_search/open_url）+ system 提示，上游 function 调用 → 本地代执行（DuckDuckGo HTML lite 搜索 + 页面抓取剥 script/style 剥标签截断 4000 字，ureq 已有零新增依赖）→ tool 消息回喂循环（**上限 3 轮防积分失控**）→ 历史搜索轮以原生 `web_search_call` 输出项返回（stream 按 created→items→completed 合成 SSE，非流式 completion_to_responses 前置 ws 项）；仅代理注入的这两个工具会被代执行，客户端真实 function 照常透传
+- **协议细节补强（T5.6/F-65）**：① 连续同角色消息自动合并（批次 2 wb_payload 已具备，本轮核对确认）；② 单端口三协议区分——/v1/chat/completions 收到 `anthropic-version` 头返回 400 明示改走 /v1/messages（防协议混投字段级静默错乱）；③ 后台任务降级——`wb_bg_downgrade` 开启时标题/摘要类短请求（max_tokens≤128 且全文≤512 字符，保守启发式）路由到目录最低倍率模型（`cheapest_catalog_model`）
+- **本地 quota 端口发现兜底（T5.8/F-21）**：`wb_common.py` 新增 `discover_local_quota_services`/`local_quota_balance`——① 扫 `~/.workbuddy/*.port` 端口声明文件 → ② 固定候选端口（18789/11101/8890/8899）+ 有界端口段（18780-18795）探测 → ③ GET `/api/v1/quota` 按 remaining/credits/quota/balance 特征确认（urllib 单发 0.8s 超时，最坏 ~15s 有界）；credits_fetch 云端三件套+旧接口全失败后最后兜底（source=`local_quota`）
+
+### 变更
+
+- **WB 上游开关组 UI（T5.2/T5.3/T5.5/T5.6③ 配套）**：ApiService 池设置卡新增 4 开关（启用 WB 上游/默认深度思考/网关工具代执行/后台任务降级），`pool_set` 命令未传字段保留原值（serde default 兼容旧 api_pool.json）；wb_tool_exec 默认开
+- **测试基线**：cargo 108→**130** 单测全绿（wb_model_route 12 + wb_toolexec 8 + wb_images 4 新增）；vitest 18/18、npm build、src-python py_compile 全绿
+
+---
+
 ## [未发布] · feature/buddy §2.2 非功能需求补齐 + 批次 1-4 九大类黑盒审查修复
 
 ### Added

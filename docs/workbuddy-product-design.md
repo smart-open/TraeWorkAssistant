@@ -156,11 +156,11 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 
 | 编号 | 需求 | 说明 / 验收标准 | 优先级 |
 |---|---|---|---|
-| F-61 | 四段模型路由管线（P1） | 「任意模型名 → 上游真实模型」四级路由：① 别名静态映射（`wb_model_catalog.json`）→ ② 用户自定义正则 → ③ 系列通配（如 `claude-sonnet-*` → glm/hy 系列）→ ④ 后缀检测注入参数（`-thinking`/`-quality` 等注入思考/画质参数）；每级命中即止，全未命中回落 `/v1/models` 目录原名。来源：antigravity-tools（同栈平行实现实证） | P1 |
-| F-62 | reasoning_content 思考链透传（P2） | 网关 OpenAI 输出透传上游思考链 `reasoning_content` 字段 + 「默认深度思考」开关（设置项，默认关）；Anthropic 协议侧映射为 thinking block。来源：Tom6814/WorkBuddy2API | P2 |
-| F-63 | 生图双端点（P2） | `/v1/images/generations`（文生图）+ `/v1/images/edits`（图生图）投影至上游生图能力；上游不支持时明示报错不静默；与 F-61 路由管线联动（生图模型识别）。来源：Tom6814/WorkBuddy2API | P2 |
-| F-64 | 网关工具代执行（P2） | 客户端下发上游不支持的工具（如 Codex 发 `type:"web_search"`）时代理侧代执行：搜索/页面读取 → 结果回喂上游 → 按原生 `web_search_call` 事件流返回——「上游不支持的工具调用在代理侧补齐」完整范式，跨上游通用。来源：muskke/trae-api-proxy v0.5.1 | P2 |
-| F-65 | 协议细节补强（P1） | ① 连续同角色消息自动合并（上游要求消息交替，改写层在透传前合并）；② 单端口三协议靠 `anthropic-version` 头/路径双维度区分（防路径嗅探误判）；③ 后台任务（生成标题/摘要类短请求）识别并降级（低优先级账号/低成本模型）。来源：antigravity-tools | P1 |
+| F-61 ✅ | 四段模型路由管线（P1） | 「任意模型名 → 上游真实模型」四级路由：① 别名静态映射（`wb_model_catalog.json`）→ ② 用户自定义正则 → ③ 系列通配（如 `claude-sonnet-*` → glm/hy 系列）→ ④ 后缀检测注入参数（`-thinking`/`-quality` 等注入思考/画质参数）；每级命中即止，全未命中回落 `/v1/models` 目录原名。来源：antigravity-tools（同栈平行实现实证） | P1 |
+| F-62 ✅ | reasoning_content 思考链透传（P2） | 网关 OpenAI 输出透传上游思考链 `reasoning_content` 字段 + 「默认深度思考」开关（设置项，默认关）；Anthropic 协议侧映射为 thinking block。来源：Tom6814/WorkBuddy2API | P2 |
+| F-63 ✅ | 生图双端点（P2） | `/v1/images/generations`（文生图）+ `/v1/images/edits`（图生图）投影至上游生图能力；上游不支持时明示报错不静默；与 F-61 路由管线联动（生图模型识别）。来源：Tom6814/WorkBuddy2API | P2 |
+| F-64 ✅ | 网关工具代执行（P2） | 客户端下发上游不支持的工具（如 Codex 发 `type:"web_search"`）时代理侧代执行：搜索/页面读取 → 结果回喂上游 → 按原生 `web_search_call` 事件流返回——「上游不支持的工具调用在代理侧补齐」完整范式，跨上游通用。来源：muskke/trae-api-proxy v0.5.1 | P2 |
+| F-65 ✅ | 协议细节补强（P1） | ① 连续同角色消息自动合并（上游要求消息交替，改写层在透传前合并）；② 单端口三协议靠 `anthropic-version` 头/路径双维度区分（防路径嗅探误判）；③ 后台任务（生成标题/摘要类短请求）识别并降级（低优先级账号/低成本模型）。来源：antigravity-tools | P1 |
 | F-66 | CLI 多账号环境隔离（P3 评估项） | 每账号独立 `CODEX_HOME`/`CLAUDE_CONFIG_DIR`/`KIMI_CODE_HOME` 环境目录 + 全局同名变量剥离 + 「严格账号模式」（无激活账号即报错、不回落本机登录态）+ 接口返回一律脱敏；与 F-06 CLI 切号桥互补（写 token vs 隔目录），做 dsh/CC 多 CLI 场景扩展评估。来源：xiaolizi0v0/CliProxy | P3 |
 
 ### 2.2 非功能需求
@@ -557,14 +557,14 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 | # | 任务 | 涉及 | 预估 |
 |---|---|---|---|
 | T5.1 | DSH provider：15 模型静态目录兜底 + 启动动态替换（F-37，元数据透传 inputModalities/supportedEfforts/倍率/徽章，能力读上游勿硬编码） | `wb_model_catalog.json`、api_server | 2d |
-| T5.2 | 四段模型路由管线：别名静态映射 → 用户自定义正则 → 系列通配 → 后缀检测注入参数（F-61） | api_server | 1.5d |
-| T5.3 | reasoning_content 思考链透传 + 默认深度思考开关（F-62） | api_server、buddy-settings | 1d |
-| T5.4 | 生图双端点投影：`/v1/images/generations` + `/v1/images/edits`（F-63） | api_server/routes.rs | 1.5d |
-| T5.5 | 网关工具代执行：上游不支持工具（web_search）代理侧代执行 + 结果回喂 + 原生事件返回（F-64） | api_server | 2d |
-| T5.6 | 协议细节补强：连续同角色消息合并 / 单端口三协议 anthropic-version 区分 / 后台任务识别降级（F-65） | api_server | 1d |
+| T5.2 ✅ | 四段模型路由管线：别名静态映射 → 用户自定义正则 → 系列通配 → 后缀检测注入参数（F-61） | api_server | 1.5d |
+| T5.3 ✅ | reasoning_content 思考链透传 + 默认深度思考开关（F-62） | api_server、buddy-settings | 1d |
+| T5.4 ✅ | 生图双端点投影：`/v1/images/generations` + `/v1/images/edits`（F-63） | api_server/routes.rs | 1.5d |
+| T5.5 ✅ | 网关工具代执行：上游不支持工具（web_search）代理侧代执行 + 结果回喂 + 原生事件返回（F-64） | api_server | 2d |
+| T5.6 ✅ | 协议细节补强：连续同角色消息合并 / 单端口三协议 anthropic-version 区分 / 后台任务识别降级（F-65） | api_server | 1d |
 | T5.7 | CC Switch 协同：把本项目转换端点注册进 CC Switch 配置，不自建切换器（F-43） | commands + 前端 | 0.5d |
-| T5.8 | 本地 quota API 兜底：扫 `~/.workbuddy/*.port` + 端口段探测 + `remaining` 特征确认（F-21） | commands/workbuddy.rs | 1d |
-| T5.9 | 批次 5 收尾审查（九大类黑盒复查）+ 文档同步 + 分拆提交 | — | — |
+| T5.8 ✅ | 本地 quota API 兜底：扫 `~/.workbuddy/*.port` + 端口段探测 + `remaining` 特征确认（F-21） | commands/workbuddy.rs | 1d |
+| T5.9 ✅ | 批次 5 收尾审查（九大类黑盒复查）+ 文档同步 + 分拆提交 | — | — |
 
 > 机会项（按需评估，不阻塞批次 5 验收）：workbuddy-mcp（F-42，P3）、WorkBuddyProxy（F-52，P3 远期）、CLI 多账号环境隔离（F-66，P3 评估）、trae2codex（F-41，按需）。
 
