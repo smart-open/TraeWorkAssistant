@@ -1113,8 +1113,10 @@ function Backup-CurrentProfile {
 
 function Restore-Profile {
     param([string]$Slot)
-    # 恢复项计数（供 Switch 恢复后校验）：-1=未校验（chromium/authfile 布局有自己的完整性校验），
-    # icube 分支结尾写入实际恢复数；0 = 快照空/损坏
+    # 恢复项计数（Switch 恢复后校验用）：每次恢复先重置为 -1；仅 icube 布局在恢复
+    # 结尾写入实际拷贝项数（≥0），authfile/chromium 分支直接 return、保持 -1
+    # （两者各有独立的完整性校验，不读此值）。校验处用 -le 0 拦截：icube 下等价于
+    # 0 项拷贝=快照目录虽在但白名单九项全缺（空/损坏）；-1 作为防御一并拦下。
     $Script:_LastRestoredCount = -1
     # 批次1：authfile 布局（WorkBuddy）走 auth 文件 + 用户数据双层恢复
     if ($Script:SnapshotLayout -eq 'authfile') {
