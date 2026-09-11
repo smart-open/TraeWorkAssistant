@@ -431,14 +431,22 @@ def emit(obj):
 
 def save_summary_merged(results, warnings, note=None):
     """保存签到结果摘要（同日合并）：本轮未覆盖的账号（被桌面端跳过的已签账号）
-    沿用当日旧记录，避免第二轮整份覆盖后丢失「今日已签」状态。"""
+    沿用当日旧记录，避免第二轮整份覆盖后丢失「今日已签」状态。
+    去重键 user_id 优先（同名账号不互吞）；旧记录无 user_id 时回退按 name 匹配。"""
     path = os.path.join(DATA_SUBDIR, "checkin_summary.json")
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     merged = [{k: v for k, v in r.items() if k != "jwt"} for r in results]
     old = load_json(path, default={})
     if isinstance(old.get("results"), list) and str(old.get("time", "")).startswith(today):
-        names = {r.get("name") for r in merged}
-        merged += [r for r in old["results"] if r.get("name") not in names]
+        new_uids = {r.get("user_id") for r in merged if r.get("user_id")}
+        new_names = {r.get("name") for r in merged}
+
+        def superseded(r):
+            if r.get("user_id"):
+                return r["user_id"] in new_uids
+            return r.get("name") in new_names
+
+        merged += [r for r in old["results"] if not superseded(r)]
     summary = {
         "time": datetime.datetime.now().isoformat(timespec="seconds"),
         "results": merged,
@@ -512,7 +520,7 @@ def main():
         print(f"\n[{idx}/{len(pending)}] 账号: {name}")
         if not jwt:
             print(f"  结果: 跳过（未配置 jwt）")
-            results.append({"name": name, "ok": False, "message": "未配置 jwt"})
+            results.append({"name": name, "user_id": acc.get("UserID", ""), "ok": False, "message": "未配置 jwt"})
             failed += 1
             emit({"type": "account", "index": idx, "user_id": acc.get("UserID", ""), "name": name, "status": "fail", "message": "未配置 jwt"})
             continue
@@ -536,7 +544,7 @@ def main():
         if ok_s and checked_in:
             print(f"  [OK] 已签到（credits={credits_before}），跳过 claim")
             results.append({
-                "name": name, "ok": True, "code": 0,
+                "name": name, "user_id": user_id, "ok": True, "code": 0,
                 "action": "skip_already", "credits": credits_before,
                 "message": msg_s or "已签到",
             })
@@ -548,7 +556,7 @@ def main():
             print(f"  [WARN] status 预检失败 (code={code_s}) {msg_s} —— 仍尝试 claim")
 
         ok, msg, code, http_status = signin_with_retry(name, jwt, device_map, retry=args.retry)
-        result = {"name": name, "ok": ok, "code": code, "message": msg, "action": "claim"}
+        result = {"name": name, "user_id": user_id, "ok": ok, "code": code, "message": msg, "action": "claim"}
         final_credits: Optional[int] = None
         final_delta = 0
         emit_error_type = None

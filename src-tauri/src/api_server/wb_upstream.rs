@@ -166,23 +166,30 @@ pub fn lines_with_first_byte_timeout<R: Read + Send + 'static>(
 
 // ==================== T2.6 双源 token 保活（网关 401 路径） ====================
 
+/// token store 进程级写锁（读-改-写分段持锁，网络刷新段不持锁防长阻塞）：
+/// 并发刷新不同账号时防止整份 store 互相覆盖丢更新（与 api_keys::KEYS_LOCK 同策略）
+static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 网关侧刷新（T2.6）：读 token store → POST refresh → 原子回写工具侧副本。
 /// 与 commands::workbuddy::workbuddy_refresh_token 同一端点/红线；此处面向
 /// API 网关 401 自动续期（无 Tauri State 依赖，仅 data_dir）。
 /// 成功返回新 accessToken；失败返回 Err（调用方按 SwitchKey 换号）。
 pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Result<String, String> {
     let store_path = data_dir.join("workbuddy_token_store.json");
-    let store: serde_json::Value = fs_utils::read_json(&store_path);
-    let rec = store
-        .get("tokens")
-        .and_then(|t| t.get(account_id))
-        .cloned()
-        .unwrap_or_default();
-    let refresh = rec
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or("该账号无 refreshToken（不可刷新，需重新登录）")?;
+    let refresh = {
+        let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store: serde_json::Value = fs_utils::read_json(&store_path);
+        let rec = store
+            .get("tokens")
+            .and_then(|t| t.get(account_id))
+            .cloned()
+            .unwrap_or_default();
+        rec.get("refresh_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or("该账号无 refreshToken（不可刷新，需重新登录）")?
+            .to_string()
+    };
 
     // 红线：X-Refresh-Token 仅出现在 refresh 端点
     let resp = ureq::AgentBuilder::new()
@@ -192,7 +199,7 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
         .post(WB_REFRESH_URL)
         .set("Authorization", "Bearer")
         .set("User-Agent", "WorkBuddy")
-        .set("X-Refresh-Token", refresh)
+        .set("X-Refresh-Token", &refresh)
         .set("X-Auth-Refresh-Source", "workbuddy")
         .set("Content-Type", "application/json")
         .send_string("{}");
@@ -231,34 +238,38 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    // 原子回写工具侧副本（F-10 双源谁新用谁：expiresAtMs 更晚者胜出）
-    let mut store = store;
-    if !store.is_object() {
-        store = serde_json::json!({});
-    }
-    let obj = store.as_object_mut().ok_or("token store 结构异常")?;
-    obj.entry("version".to_string()).or_insert(serde_json::json!(1));
-    let tokens = obj.entry("tokens".to_string()).or_insert_with(|| serde_json::json!({}));
-    if let Some(t) = tokens.as_object_mut() {
-        let mut r = t.get(account_id).cloned().unwrap_or(serde_json::json!({}));
-        if let Some(rm) = r.as_object_mut() {
-            rm.insert("access_token".into(), serde_json::json!(new_access));
-            if let Some(nr) = &new_refresh {
-                if !nr.is_empty() {
-                    rm.insert("refresh_token".into(), serde_json::json!(nr));
-                }
-            }
-            if let Some(s) = expires_in {
-                rm.insert("expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
-            }
-            if let Some(s) = refresh_expires_in {
-                rm.insert("refresh_expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
-            }
-            rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
+    // 原子回写工具侧副本（F-10 双源谁新用谁：expiresAtMs 更晚者胜出）：
+    // 锁内重读最新 store 再合并写回（网络段已释放锁），并发刷新不丢他账号更新
+    {
+        let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut store: serde_json::Value = fs_utils::read_json(&store_path);
+        if !store.is_object() {
+            store = serde_json::json!({});
         }
-        t.insert(account_id.to_string(), r);
+        let obj = store.as_object_mut().ok_or("token store 结构异常")?;
+        obj.entry("version".to_string()).or_insert(serde_json::json!(1));
+        let tokens = obj.entry("tokens".to_string()).or_insert_with(|| serde_json::json!({}));
+        if let Some(t) = tokens.as_object_mut() {
+            let mut r = t.get(account_id).cloned().unwrap_or(serde_json::json!({}));
+            if let Some(rm) = r.as_object_mut() {
+                rm.insert("access_token".into(), serde_json::json!(new_access));
+                if let Some(nr) = &new_refresh {
+                    if !nr.is_empty() {
+                        rm.insert("refresh_token".into(), serde_json::json!(nr));
+                    }
+                }
+                if let Some(s) = expires_in {
+                    rm.insert("expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
+                }
+                if let Some(s) = refresh_expires_in {
+                    rm.insert("refresh_expires_at_ms".into(), serde_json::json!(now_ms + s * 1000));
+                }
+                rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
+            }
+            t.insert(account_id.to_string(), r);
+        }
+        fs_utils::write_json(&store_path, &store).map_err(|e| format!("回写 token store 失败: {e}"))?;
     }
-    fs_utils::write_json(&store_path, &store).map_err(|e| format!("回写 token store 失败: {e}"))?;
     Ok(new_access)
 }
 

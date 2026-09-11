@@ -6,7 +6,7 @@
 //! 每次鉴权命中 Key 即累加当日用量并原子写盘（与 usage.rs 同策略：个人频率低）。
 //!
 //! F-35 子 Key 体系（对外子 Key 与上游真实凭证分离）：
-//! - `ck_` 前缀子 Key（`generate_sub_key` 生成；旧 `sk-` Key 继续兼容）
+//! - `ck_` 前缀子 Key（前端 crypto 随机源生成；旧 `sk-` Key 继续兼容）
 //! - `allowed_accounts`：限定上游（WB 上游账号 uid 白名单，空 = 不限）
 //! - `schedule_mode`：`expire_first`（默认，临期优先）| `dedicated`（专一，固定
 //!   `dedicated_account` 或 allowed_accounts 首个）
@@ -15,15 +15,11 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::fs_utils;
 
 /// 数据文件名（位于 data/ 目录）
 pub const KEYS_FILE: &str = "api_keys.json";
-
-/// 子 Key 前缀（F-35）
-pub const SUB_KEY_PREFIX: &str = "ck_";
 
 /// 按日统计保留天数
 const DAILY_STATS_CAP: usize = 90;
@@ -201,22 +197,6 @@ impl ApiKeysFile {
     }
 }
 
-/// 生成子 Key（`ck_` + 32 hex；sha256(纳秒 + 计数器 + pid)，与 pseudo_uuid_v4 同源思路）
-pub fn generate_sub_key() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let mut h = Sha256::new();
-    h.update(now.as_nanos().to_le_bytes());
-    h.update(n.to_le_bytes());
-    h.update(std::process::id().to_le_bytes());
-    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    format!("{SUB_KEY_PREFIX}{}", &hex[..32])
-}
-
 /// 按 Key 条目 id 解析约束快照（WB 路由层每流程调用一次；Key 不存在返回 None）
 pub fn constraints_for(data_dir: &Path, key_id: &str) -> Option<ResolvedKey> {
     let f: ApiKeysFile = load(data_dir);
@@ -344,15 +324,6 @@ mod tests {
         e.schedule_mode = MODE_DEDICATED.into();
         e.allowed_accounts = vec!["wb-1".into()];
         assert_eq!(e.schedule_mode(), MODE_DEDICATED);
-    }
-
-    #[test]
-    fn sub_key_prefix_and_uniqueness() {
-        let a = generate_sub_key();
-        let b = generate_sub_key();
-        assert!(a.starts_with("ck_"));
-        assert_ne!(a, b);
-        assert_eq!(a.len(), 3 + 32);
     }
 
     #[test]

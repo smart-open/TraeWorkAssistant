@@ -171,7 +171,7 @@ def _fetch_round(headers, urls):
     return pkgs, balance, saw_auth, net_down
 
 
-def fetch_credits_once(creds, acct_id=None):
+def fetch_credits_once(creds):
     """一次取数：三件套（带 web 头）→ 全 401 刷新一次仅重试失败分支 → 旧接口回退。
     主域名整体网络不可达时切备用域名重试一轮（§2.2 域名双探测，仅一次、不循环）。
     summary 只取余额不产包（其容量字段是池级汇总，入包会制造脏行）。
@@ -220,7 +220,7 @@ def fetch_account(acct):
     if not creds.get("access_token"):
         return {"user_id": aid, "name": name, "ok": False,
                 "message": "无可用凭证", "balance": None, "packages": [], "source": "none"}
-    pkgs, balance, source, new_creds = fetch_credits_once(creds, acct.get("id"))
+    pkgs, balance, source, new_creds = fetch_credits_once(creds)
     if new_creds:
         # 刷新成功 → 回写工具侧副本（F-10 谁新用谁）
         try:

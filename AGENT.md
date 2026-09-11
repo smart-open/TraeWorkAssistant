@@ -184,7 +184,7 @@ ai-work-assistant/
 - **会话粘性（wb_sticky.rs，仅 WB）**：显式 `conversation_id` 绑定（TTL 30m 滚动续期）+ 无 id 时指纹模式（前 3 消息 SHA256 前 6 位 + 60s 窗）；绑定含上游 conversation_id（双段分配），Mutex 内 re-check 防 TOCTOU；持久化 wb_sticky_sessions.json。
 - **工程化（T2.7/F-34）**：模型级冷却 10→20→40s 渐进退避（优先级高于 Key 级，成功清除）；SSE keep-alive 15s 注释行（SOLO 与 WB 流式均已接入）；首字超时 10s 故障转移（转发线程 + recv_timeout，Agent 300s 读超时兜底 detach）；客户端断连后继续消费上游保 usage 完整（wb_sse 忽略 send 失败直至 EOF）。
 - **运维接口（T2.3/F-32）**：`/healthz`（无健康账号 503）；`/v1/models` 合并 WB 目录（owned_by=workbuddy）；`/status`、`/health` 增加 `wb` 段（池画像/模型冷却/粘性会话数/上游健康探针 `probe_ok`+`probe_ts_ms`：-1 未探测/0 不可达/1 在线，§2.2 频控 5min+0-60s 抖动）；WB 请求日志含 TTFB。
-- **ck_ 子 Key 体系（F-35，批次3）**：对外子 Key（`ck_` 前缀，`generate_sub_key` sha256 纳秒源；旧 `sk-` 兼容）与上游真实凭证分离。`api_keys.json` 条目扩展：`allowed_accounts`（上游 uid 白名单，空=不限）、`schedule_mode`（`expire_first` 临期优先默认 / `dedicated` 专一固定 `dedicated_account`）、`daily_stats`（按日请求统计 cap 90 天）。鉴权中间件把 `ResolvedKey` 快照注入 extensions；wb_route 流式/非流式取号统一走 `pick_excluding_constrained`（专一锁定 > 白名单过滤 > 池策略），粘性绑定不白名单内时忽略粘性。
+- **ck_ 子 Key 体系（F-35，批次3）**：对外子 Key（`ck_` 前缀，前端 crypto 随机源生成；旧 `sk-` 兼容）与上游真实凭证分离。`api_keys.json` 条目扩展：`allowed_accounts`（上游 uid 白名单，空=不限）、`schedule_mode`（`expire_first` 临期优先默认 / `dedicated` 专一固定 `dedicated_account`）、`daily_stats`（按日请求统计 cap 90 天）。鉴权中间件把 `ResolvedKey` 快照注入 extensions；wb_route 流式/非流式取号统一走 `pick_excluding_constrained`（专一锁定 > 白名单过滤 > 池策略），粘性绑定不白名单内时忽略粘性。
 
 ## 6. Tauri 事件（Rust → 前端）
 

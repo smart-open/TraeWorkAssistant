@@ -30,8 +30,8 @@ interface WbGrowthLine {
   travel?: string;
   lottery?: string;
   tasks?: string;
-  energy?: unknown;
-  streak?: unknown;
+  energy?: number | string;
+  streak?: number | string;
 }
 
 type ParsedEvent =

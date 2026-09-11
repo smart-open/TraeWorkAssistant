@@ -183,18 +183,17 @@ export default function BuddySettings() {
 
   const refresh = useCallback(async () => {
     try {
-      const [e, accs, st] = await Promise.all([
+      const [e, accs, st, cr] = await Promise.all([
         api.workbuddy.envCheck(),
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
         api.workbuddy.settingsGet().catch(() => null),
+        // 积分包到期条目随首屏一并就绪（失败静默：日历仅降级为 token 条目）
+        api.workbuddy.creditsFetch().catch(() => null),
       ]);
       setEnv(e);
       setAccounts(accs);
       setSettings(st);
-      api.workbuddy
-        .creditsFetch()
-        .then(setCredits)
-        .catch(() => setCredits(null));
+      setCredits(cr);
     } catch (err) {
       pushToast('error', `环境检测失败：${String(err)}`);
     }
@@ -219,7 +218,7 @@ export default function BuddySettings() {
   };
 
   const patch = (p: Partial<WorkBuddySettings>) => {
-    if (settings) setSettings({ ...settings, ...p });
+    setSettings((prev) => (prev ? { ...prev, ...p } : prev));
   };
 
   // 到期日历条目：token（access/refresh 双轨）+ 积分包

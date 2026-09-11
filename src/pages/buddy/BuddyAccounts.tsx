@@ -72,7 +72,7 @@ export default function BuddyAccounts() {
     try {
       const accs = await api.workbuddy.accountsList();
       setAccounts(accs);
-      // 积分缓存查询（≥5min 缓存，失败不阻断）
+      // 积分缓存查询（≥5min 缓存，失败不阻断列表展示）
       api.workbuddy
         .creditsFetch()
         .then((r: WbCreditsResult) => {
@@ -80,7 +80,7 @@ export default function BuddyAccounts() {
           for (const a of r.accounts) m.set(a.user_id, a.packages ?? []);
           setCredits(m);
         })
-        .catch(() => {});
+        .catch(() => pushToast('warn', '积分缓存查询失败，积分包列为空'));
     } catch (err) {
       pushToast('error', `读取账号失败：${String(err)}`);
     } finally {

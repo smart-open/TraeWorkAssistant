@@ -145,6 +145,11 @@ pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
     if code >= 500 {
         return ErrKind::Server;
     }
+    // 未识别的 4xx：客户端侧错误（换号重试无意义），Client 短冷却即可；
+    // 归 Server 会误触 30m 账号熔断。code<400 的未知业务码维持 Server 保守判定。
+    if code >= 400 {
+        return ErrKind::Client;
+    }
     ErrKind::Server
 }
 
@@ -929,7 +934,8 @@ pub async fn wb_tool_exec_chat(
                 Ok((completion, ws_items, resp_id))
             }
             None => {
-                state.record_usage(&model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);                state.logger.log_request(
+                state.record_usage(&model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);
+                state.logger.log_request(
                     "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
                     duration_ms, last_err.as_deref(),
                 );
@@ -1094,4 +1100,23 @@ fn safe_slice(s: &str, n: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_wb_error_ranges() {
+        assert!(matches!(classify_wb_error(401, "x"), ErrKind::SessionDead));
+        assert!(matches!(classify_wb_error(429, "x"), ErrKind::SoftRate));
+        assert!(matches!(classify_wb_error(503, "x"), ErrKind::Server));
+        // 未识别 4xx 归 Client（10m 短冷却），不误触 30m 熔断
+        assert!(matches!(classify_wb_error(400, "bad request"), ErrKind::Client));
+        assert!(matches!(classify_wb_error(404, "nope"), ErrKind::Client));
+        // 未知业务码（<400）维持 Server 保守判定
+        assert!(matches!(classify_wb_error(0, "weird"), ErrKind::Server));
+        // message 关键词优先级不受 code 分段影响
+        assert!(matches!(classify_wb_error(200, "积分不足"), ErrKind::HardCredit));
+    }
 }
