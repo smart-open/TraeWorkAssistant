@@ -1,5 +1,5 @@
 import { useMemo, useState, useEffect } from 'react';
-import { PlayCircle, CheckCircle2, XCircle, Clock, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw, Users } from 'lucide-react';
+import { PlayCircle, CheckCircle2, XCircle, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw, Users } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
 import { useAppStore } from '../store';
@@ -346,16 +346,8 @@ export default function Checkin() {
             </div>
           )}
           <div className="max-h-80 space-y-1 overflow-auto">
-            {Array.from({ length: checkin.total }).map((_, i) => {
-              const r = checkin.results[i];
-              if (!r) {
-                return (
-                  <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
-                    <Clock size={14} className="text-slate-400" />
-                    <span className="text-slate-400">等待中…</span>
-                  </div>
-                );
-              }
+            {checkin.results.map((r) => {
+              if (!r) return null;
               const tone =
                 r.status === 'success'
                   ? 'text-emerald-600 dark:text-emerald-300'
@@ -371,15 +363,26 @@ export default function Checkin() {
                   ? CheckCircle2
                   : r.status === 'fail'
                   ? XCircle
+                  : r.status === 'skip'
+                  ? CheckCircle2
                   : AlertCircle;
+              const skipLabel =
+                r.skip_reason === 'checked_in'
+                  ? '已签到，本轮跳过'
+                  : r.skip_reason === 'expired'
+                  ? 'JWT 已过期，本轮跳过'
+                  : r.skip_reason === 'cooldown'
+                  ? '冷却中，本轮跳过'
+                  : '本轮跳过';
               return (
-                <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
+                <div key={r.user_id} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
                   <Icon size={14} className={tone} />
                   <span className="w-8 text-right text-xs text-slate-400">{r.index}</span>
                   <span className="flex-1 truncate">{r.name}</span>
                   <span className={`text-xs ${tone}`} title={r.message ?? undefined}>
                     {r.status === 'success' && `积分+${r.delta ?? 0}`}
                     {r.status === 'already' && `积分+${r.credits ?? 0}`}
+                    {r.status === 'skip' && skipLabel}
                     {r.status === 'fail' &&
                       (r.error_type === 'SessionDead'
                         ? 'JWT 已被服务端吊销，请重新登录该账号并保存'

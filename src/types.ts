@@ -226,13 +226,17 @@ export interface CheckinOpts {
   skip_expired: boolean;
 }
 
-export type CheckinAccountStatus = 'pending' | 'already' | 'success' | 'fail';
+export type CheckinAccountStatus = 'pending' | 'already' | 'success' | 'fail' | 'skip';
+/** 跳过原因（status=skip 时）：checked_in=已签 / expired=JWT 过期 / cooldown=冷却中 */
+export type CheckinSkipReason = 'checked_in' | 'expired' | 'cooldown';
 
 export interface CheckinAccountResult {
   index: number;
   user_id: string;
   name: string;
   status: CheckinAccountStatus;
+  /** 本账号被跳过的原因（仅 status=skip） */
+  skip_reason?: CheckinSkipReason | null;
   credits?: number;
   delta?: number;
   elapsed?: number;

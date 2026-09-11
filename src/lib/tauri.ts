@@ -310,9 +310,18 @@ export const api = {
 };
 
 // ---- 事件载荷 ----
+/** start 事件账号清单项（Rust 侧发出，scope 内全集：候选 pending / 跳过带原因 / 重试轮沿用上轮状态） */
+export interface CheckinStartAccount {
+  user_id: string;
+  name: string;
+  status: 'pending' | 'skip' | 'success' | 'already' | 'fail';
+  skip_reason?: 'checked_in' | 'expired' | 'cooldown' | null;
+}
 export interface CheckinStartEvent {
   type: 'start';
   total: number;
+  /** scope 内全集清单；Python 脚本转发的 start 无此字段，前端仅同步 total 不重建列表 */
+  accounts?: CheckinStartAccount[];
 }
 export interface CheckinAccountEvent {
   type: 'account';

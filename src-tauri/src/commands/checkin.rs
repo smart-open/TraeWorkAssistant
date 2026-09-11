@@ -235,34 +235,56 @@ fn run_checkin_worker(
             return;
         }
     };
+    // 全集视图一次构建：跳过原因登记与 start 事件全集清单共用
+    let views_all = build_account_views(state);
+    // scope 内全集（跳过规则过滤前快照）：start 事件清单只覆盖本次签到范围，
+    // 避免把范围外账号误显示为「跳过」
+    let scope_all: Vec<String> = uids.clone();
+    let name_of = |uid: &str| -> String {
+        views_all
+            .iter()
+            .find(|v| v.user_id == uid)
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| uid.to_string())
+    };
+    // uid -> 跳过原因（checked_in=已签 / expired=JWT 过期 / cooldown=冷却中）。
+    // start 事件携带全集清单：被跳过的账号也在进度列表中显示原因，不再凭空消失
+    // （用户反馈：已签账号被跳过却「看起来没签到」，且下一轮列表行数/行序错乱）
+    let mut skip_reasons: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
     if opts.skip_checked_in || opts.skip_expired {
-        let views = build_account_views(state);
         uids.retain(|u| {
-            let v = views.iter().find(|a| &a.user_id == u);
-            let mut keep = true;
-            if let Some(v) = v {
-                if opts.skip_checked_in && v.checked_today == Some(true) {
-                    keep = false;
-                }
-                if opts.skip_expired
-                    && (v.jwt_exp_hours.is_none() || v.jwt_exp_hours.unwrap() <= 0.0)
-                {
-                    keep = false;
-                }
+            let Some(v) = views_all.iter().find(|a| a.user_id == *u) else {
+                return true;
+            };
+            if opts.skip_checked_in && v.checked_today == Some(true) {
+                skip_reasons.insert(u.clone(), "checked_in");
+                return false;
             }
-            keep
+            if opts.skip_expired && (v.jwt_exp_hours.is_none() || v.jwt_exp_hours.unwrap() <= 0.0)
+            {
+                skip_reasons.insert(u.clone(), "expired");
+                return false;
+            }
+            true
         });
     }
     // 过滤冷却中的账号（SessionDead 永久跳过，其他类型冷却中跳过）
     {
-        let views = build_account_views(state);
-        let cooled: std::collections::HashSet<&str> = views
+        let cooled: std::collections::HashSet<&str> = views_all
             .iter()
             .filter(|v| v.cooldown_type.is_some())
             .map(|v| v.user_id.as_str())
             .collect();
         let before = uids.len();
-        uids.retain(|u| !cooled.contains(u.as_str()));
+        uids.retain(|u| {
+            if cooled.contains(u.as_str()) {
+                skip_reasons.insert(u.clone(), "cooldown");
+                false
+            } else {
+                true
+            }
+        });
         let skipped = before - uids.len();
         if skipped > 0 {
             crate::fs_utils::app_log(
@@ -294,6 +316,32 @@ fn run_checkin_worker(
             }
         });
     }
+    // 全集账号清单构造（scope 内）：final_st 提供时非候选行沿用其最终状态（重试轮
+    // 列表连续），否则非候选一律按登记的跳过原因显示；候选行统一 pending
+    let accounts_payload =
+        |final_st: Option<&std::collections::HashMap<String, &'static str>>| -> Vec<serde_json::Value> {
+            scope_all
+                .iter()
+                .map(|u| {
+                    let uid = u.as_str();
+                    let (status, skip_reason) = if uids.iter().any(|x| x == uid) {
+                        (serde_json::json!("pending"), serde_json::Value::Null)
+                    } else if let Some(reason) = skip_reasons.get(uid) {
+                        (serde_json::json!("skip"), serde_json::json!(reason))
+                    } else if let Some(st) = final_st.and_then(|m| m.get(uid)) {
+                        (serde_json::json!(st), serde_json::Value::Null)
+                    } else {
+                        (serde_json::json!("skip"), serde_json::Value::Null)
+                    };
+                    serde_json::json!({
+                        "user_id": uid,
+                        "name": name_of(uid),
+                        "status": status,
+                        "skip_reason": skip_reason,
+                    })
+                })
+                .collect()
+        };
     // 过滤后为空（全部已签/过期/冷却中）时不启动脚本：
     // 脚本在无 --accounts 参数时会回退为签全部账号，会绕过跳过规则并造成重复签到风险。
     // 直接向前端 emit 空轮次事件，UI 显示 0/0/0 的完成态。
@@ -302,7 +350,10 @@ fn run_checkin_worker(
             &state.data_dir,
             "签到未启动: 过滤后无候选账号（全部已签/过期/冷却中）",
         );
-        let _ = app.emit("checkin-progress", serde_json::json!({ "type": "start", "total": 0 }));
+        let _ = app.emit(
+            "checkin-progress",
+            serde_json::json!({ "type": "start", "total": 0, "accounts": accounts_payload(None) }),
+        );
         let _ = app.emit(
             "checkin-progress",
             serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0, "empty": true }),
@@ -333,6 +384,11 @@ fn run_checkin_worker(
         }
     };
     let total_all = uids.len();
+    // 主轮 start：候选 pending、跳过账号带原因（scope 内全集），先于 Python 事件发出
+    let _ = app.emit(
+        "checkin-progress",
+        serde_json::json!({ "type": "start", "total": total_all, "accounts": accounts_payload(None) }),
+    );
     crate::fs_utils::app_log(&state.data_dir, &format!("签到已启动: {} 个账号", total_all));
     // 启动阶段完成，通知调用方（页面/托盘只关心是否成功拉起）
     let _ = tx.send(Ok(()));
@@ -381,6 +437,15 @@ fn run_checkin_worker(
         std::thread::sleep(std::time::Duration::from_secs(delay));
         match spawn_round(state, &failed_uids) {
             Ok(p) => {
+                // 重试轮 start：候选置 pending，其余行沿用上轮最终状态/跳过原因，
+                // 列表跨轮连续（不会把已签账号重置成「等待中」）
+                let _ = app.emit(
+                    "checkin-progress",
+                    serde_json::json!({
+                        "type": "start", "total": failed_uids.len(),
+                        "accounts": accounts_payload(Some(&final_status))
+                    }),
+                );
                 let o = consume_round(app, p, &log_path);
                 // 重试轮结果覆盖对应 uid 的旧状态：非 fail 同步清除旧失败类型登记
                 for (uid, st) in o.statuses {

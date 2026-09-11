@@ -330,10 +330,27 @@ export const useAppStore = create<AppState>((set, get) => ({
   applyCheckinEvent: (e) => {
     set((s) => {
       if (e.type === 'start') {
-        // 重试轮也会发 start（仅含失败账号）：保留 retry 横幅，重置进度列表
-        return {
-          checkin: { active: true, total: e.total, index: 0, results: [], done: null, retry: s.checkin.retry },
-        };
+        // Rust 侧 start 带 scope 内全集清单（候选 pending / 跳过带原因 / 重试轮沿用上轮状态），
+        // 重建列表使被跳过的账号也可见；Python 转发的 start（无 accounts）仅同步候选总数
+        if (e.accounts) {
+          return {
+            checkin: {
+              active: true,
+              total: e.total,
+              index: 0,
+              results: e.accounts.map((a, i) => ({
+                index: i + 1,
+                user_id: a.user_id,
+                name: a.name,
+                status: a.status,
+                skip_reason: a.skip_reason ?? null,
+              })),
+              done: null,
+              retry: s.checkin.retry,
+            },
+          };
+        }
+        return { checkin: { ...s.checkin, active: true, total: e.total } };
       }
       if (e.type === 'retry') {
         return {
@@ -346,12 +363,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       if (e.type === 'account') {
         const results = s.checkin.results.slice();
-        const i = e.index - 1;
-        results[i] = {
-          index: e.index,
+        // 按 user_id 匹配行：事件 index 是本轮候选内的序号，与全集列表位置无关
+        const i = results.findIndex((r) => r.user_id === e.user_id);
+        const row = {
+          index: i >= 0 ? results[i].index : results.length + 1,
           user_id: e.user_id,
           name: e.name,
           status: e.status,
+          skip_reason: null,
           credits: e.credits,
           delta: e.delta,
           elapsed: e.elapsed,
@@ -360,7 +379,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           error_type: e.error_type,
           cooldown_until: e.cooldown_until,
         };
-        return { checkin: { ...s.checkin, index: e.index, results } };
+        if (i >= 0) results[i] = row;
+        else results.push(row);
+        // index 累计本轮已处理候选数，驱动进度条（total 口径=本轮候选数）
+        return { checkin: { ...s.checkin, index: s.checkin.index + 1, results } };
       }
       return {
         checkin: {
