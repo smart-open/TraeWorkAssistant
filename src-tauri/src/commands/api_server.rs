@@ -523,11 +523,18 @@ pub fn api_wb_catalog_list(state: State<'_, AppState>) -> Vec<crate::api_server:
     crate::api_server::wb_catalog::load(&state.data_dir)
 }
 
-/// 查询最近 N 天的 API 用量统计（按日聚合，直接读盘，服务未运行也可查）
+/// 查询最近 N 天的 API 用量统计（Trae 模型请求桶，按日聚合，直接读盘，服务未运行也可查）
 #[tauri::command]
 pub fn api_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
     let days = days.unwrap_or(14).clamp(1, 90);
-    crate::api_server::usage::query_recent(&state.data_dir, days)
+    crate::api_server::usage::query_recent(&state.data_dir, days, false)
+}
+
+/// 查询最近 N 天的 WB 上游用量统计（wb_days 桶，Buddy「API 服务」页专用，与 Trae 侧分账）
+#[tauri::command]
+pub fn api_wb_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    crate::api_server::usage::query_recent(&state.data_dir, days, true)
 }
 
 // ==================== 多 API Key 命令 ====================

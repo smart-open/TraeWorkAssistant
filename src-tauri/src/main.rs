@@ -149,6 +149,7 @@ fn main() {
             commands::api_server::api_models_list,
             commands::api_server::api_models_sync,
             commands::api_server::api_usage_stats,
+            commands::api_server::api_wb_usage_stats,
             commands::api_server::api_keys_list,
             commands::api_server::api_keys_save,
             commands::api_server::api_wb_catalog_sync,

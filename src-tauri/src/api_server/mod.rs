@@ -79,10 +79,12 @@ pub struct ApiSharedState {
 }
 
 impl ApiSharedState {
-    /// 记录一次请求用量并原子落盘；写盘失败静默忽略，不影响主流程
+    /// 记录一次请求用量并原子落盘；写盘失败静默忽略，不影响主流程。
+    /// `is_wb`：WB 上游路由的请求记入独立 wb_days 桶（与 Trae 侧分账，页面互不串数）
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage(
         &self,
+        is_wb: bool,
         model: &str,
         uid: &str,
         key_id: &str,
@@ -97,7 +99,7 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         guard.record(
-            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+            is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
         );
         usage::save(&self.data_dir, &guard);
     }

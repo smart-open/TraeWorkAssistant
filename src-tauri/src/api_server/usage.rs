@@ -126,18 +126,24 @@ impl DayStats {
     }
 }
 
-/// 用量数据根结构：日期 → 单日统计
+/// 用量数据根结构：日期 → 单日统计。
+/// 按应用侧分桶：days = Trae 模型请求；wb_days = WB 上游请求（serde default，
+/// 旧文件无 wb_days 时视为空——历史混入数据无法追溯分离，从启用时点起分账）。
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct UsageFile {
     #[serde(default)]
     pub days: HashMap<String, DayStats>,
+    #[serde(default)]
+    pub wb_days: HashMap<String, DayStats>,
 }
 
 impl UsageFile {
     /// 记录一次请求并返回是否需要写盘（总是 true，留给调用方统一处理）
+    /// `is_wb`：WB 上游路由的请求记入 wb_days 桶，与 Trae 侧分账
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
+        is_wb: bool,
         model: &str,
         uid: &str,
         key_id: &str,
@@ -147,22 +153,25 @@ impl UsageFile {
         prompt_tokens: u64,
         completion_tokens: u64,
     ) {
-        let day = self.days.entry(today_key()).or_default();
+        let days = if is_wb { &mut self.wb_days } else { &mut self.days };
+        let day = days.entry(today_key()).or_default();
         day.record(
             model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
         );
     }
 
-    /// 裁剪保留期之外的历史日期
+    /// 裁剪保留期之外的历史日期（两桶同规则）
     pub fn trim(&mut self, keep_days: i64) {
         let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(keep_days);
         let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
         self.days.retain(|d, _| d.as_str() >= cutoff_str.as_str());
+        self.wb_days.retain(|d, _| d.as_str() >= cutoff_str.as_str());
     }
 
     /// 按日期升序取最近 N 天（含今日），不足 N 天只返回已有的
-    pub fn recent_days(&self, days: u32) -> Vec<(&String, &DayStats)> {
-        let mut sorted: Vec<(&String, &DayStats)> = self.days.iter().collect();
+    pub fn recent_days(&self, days: u32, is_wb: bool) -> Vec<(&String, &DayStats)> {
+        let bucket = if is_wb { &self.wb_days } else { &self.days };
+        let mut sorted: Vec<(&String, &DayStats)> = bucket.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(b.0));
         let skip = sorted.len().saturating_sub(days as usize);
         sorted.into_iter().skip(skip).collect()
@@ -287,13 +296,14 @@ fn view(name: &str, c: &Counter) -> CounterView {
     }
 }
 
-/// 查询最近 N 天统计（按日期升序），供 `api_usage_stats` 命令使用。
+/// 查询最近 N 天统计（按日期升序），供 `api_usage_stats` / `api_wb_usage_stats` 命令使用。
+/// `is_wb`：查 WB 上游桶（Buddy 页）；false 查 Trae 桶（Trae 页）。
 /// 直接读盘，服务未运行时也可查询。
-pub fn query_recent(data_dir: &Path, days: u32) -> Vec<UsageDayView> {
+pub fn query_recent(data_dir: &Path, days: u32, is_wb: bool) -> Vec<UsageDayView> {
     let mut usage: UsageFile = load(data_dir);
     usage.trim(RETENTION_DAYS);
     usage
-        .recent_days(days)
+        .recent_days(days, is_wb)
         .into_iter()
         .map(|(date, d)| UsageDayView::from_day(date, d))
         .collect()
@@ -306,9 +316,9 @@ mod tests {
     #[test]
     fn record_aggregates_dimensions() {
         let mut f = UsageFile::default();
-        f.record("m1", "u1", "master", true, true, 100, 10, 20);
-        f.record("m1", "u1", "master", false, true, 300, 0, 0);
-        f.record("m2", "u2", "k2", true, false, 50, 5, 8);
+        f.record(false, "m1", "u1", "master", true, true, 100, 10, 20);
+        f.record(false, "m1", "u1", "master", false, true, 300, 0, 0);
+        f.record(false, "m2", "u2", "k2", true, false, 50, 5, 8);
         let today = today_key();
         let d = f.days.get(&today).expect("当日统计应存在");
         assert_eq!(d.total.requests, 3);
@@ -332,16 +342,36 @@ mod tests {
     }
 
     #[test]
+    fn wb_requests_go_to_separate_bucket() {
+        let mut f = UsageFile::default();
+        f.record(false, "glm-5.3", "u1", "k", true, true, 100, 10, 20);
+        f.record(true, "hy4", "wb-1", "k", true, true, 100, 7, 9);
+        let today = today_key();
+        // Trae 桶只有 Trae 请求；WB 请求进 wb_days 桶
+        let trae = f.days.get(&today).expect("Trae 当日统计应存在");
+        assert_eq!(trae.total.requests, 1);
+        assert_eq!(trae.models.get("glm-5.3").unwrap().requests, 1);
+        let wb = f.wb_days.get(&today).expect("WB 当日统计应存在");
+        assert_eq!(wb.total.requests, 1);
+        assert_eq!(wb.models.get("hy4").unwrap().requests, 1);
+        assert_eq!(f.recent_days(7, false).len(), 1);
+        assert_eq!(f.recent_days(7, true).len(), 1);
+    }
+
+    #[test]
     fn trim_drops_old_days() {
         let mut f = UsageFile::default();
         let old = (chrono::Local::now().date_naive() - chrono::Duration::days(120))
             .format("%Y-%m-%d")
             .to_string();
-        f.days.insert(old, DayStats::default());
+        f.days.insert(old.clone(), DayStats::default());
         f.days.insert(today_key(), DayStats::default());
+        f.wb_days.insert(old, DayStats::default());
+        f.wb_days.insert(today_key(), DayStats::default());
         f.trim(RETENTION_DAYS);
         assert_eq!(f.days.len(), 1);
         assert!(f.days.contains_key(&today_key()));
+        assert_eq!(f.wb_days.len(), 1);
     }
 
     #[test]
@@ -354,7 +384,7 @@ mod tests {
             f.days.insert(d, DayStats::default());
         }
         f.days.insert(today_key(), DayStats::default());
-        let got = f.recent_days(3);
+        let got = f.recent_days(3, false);
         assert_eq!(got.len(), 3);
         // 升序：最后一天应为今日
         assert_eq!(got.last().unwrap().0.as_str(), today_key().as_str());
@@ -367,7 +397,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("twa_usage_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(dir.join("data"));
         let mut f = UsageFile::default();
-        f.record("m", "u", "k", true, false, 10, 1, 2);
+        f.record(false, "m", "u", "k", true, false, 10, 1, 2);
         save(&dir, &f);
         let loaded = load(&dir);
         let d = loaded.days.get(&today_key()).expect("应能读回当日数据");

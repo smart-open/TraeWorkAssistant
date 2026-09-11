@@ -776,7 +776,7 @@ async fn images_entry(
     let duration_ms = start_ts.elapsed().as_millis() as u64;
     match result {
         Ok(resp) => {
-            state.record_usage(&model, &picked.uid, &key_str, true, false, duration_ms, 0, 0);
+            state.record_usage(false, &model, &picked.uid, &key_str, true, false, duration_ms, 0, 0);
             state.wb_pool.note_success(&picked.uid);
             state.logger.log_request(
                 "POST",
@@ -789,7 +789,7 @@ async fn images_entry(
                 .unwrap_or_else(|_| internal_error_response())
         }
         Err((code, msg)) => {
-            state.record_usage(&model, &picked.uid, &key_str, false, false, duration_ms, 0, 0);
+            state.record_usage(false, &model, &picked.uid, &key_str, false, false, duration_ms, 0, 0);
             state.logger.log_request(
                 "POST",
                 if is_edit { "/v1/images/edits" } else { "/v1/images/generations" },
@@ -881,7 +881,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     {
                         let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
                         state.record_usage(
-                            &model, &picked.uid, &key_id, error_info.is_none(), true,
+                            false, &model, &picked.uid, &key_id, error_info.is_none(), true,
                             duration_ms, pt, ct,
                         );
                     }
@@ -936,7 +936,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
         // 所有账号不可用
         let duration_ms = start_ts.elapsed().as_millis() as u64;
-        state.record_usage(&model, "none", &key_id, false, true, duration_ms, 0, 0);
+        state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
             .iter()
@@ -1063,7 +1063,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             // 用量记账（成功：token 数从聚合响应 usage 提取）
                             let (pt, ct) = r.get("usage").map(extract_tokens).unwrap_or((0, 0));
                             state.record_usage(
-                                &model, &picked.uid, &key_id, true, stream,
+                                false, &model, &picked.uid, &key_id, true, stream,
                                 duration_ms, pt, ct,
                             );
                             state.pool.note_success(&picked.uid);
@@ -1082,7 +1082,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             *safe_lock(&state.last_error) =
                                 Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
                             state.record_usage(
-                                &model, &picked.uid, &key_id, false, stream,
+                                false, &model, &picked.uid, &key_id, false, stream,
                                 duration_ms, 0, 0,
                             );
                             state.logger.log_request(
@@ -1097,7 +1097,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         _ => {
                             state.pool.note_error(&picked.uid, ErrKind::Server);
                             state.record_usage(
-                                &model, &picked.uid, &key_id, false, stream,
+                                false, &model, &picked.uid, &key_id, false, stream,
                                 duration_ms, 0, 0,
                             );
                             state.logger.log_request(
@@ -1117,7 +1117,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     *safe_lock(&state.last_error) =
                         Some(format!("uid={} status={}", picked.uid, status));
                     state.record_usage(
-                        &model, &picked.uid, &key_id, false, stream,
+                        false, &model, &picked.uid, &key_id, false, stream,
                         start_ts.elapsed().as_millis() as u64, 0, 0,
                     );
                     state.logger.log_request(
@@ -1136,7 +1136,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         let diag = state.pool.diagnose();
         // 用量记账（所有账号不可用）
-        state.record_usage(&model, "none", &key_id, false, stream, duration_ms, 0, 0);
+        state.record_usage(false, &model, "none", &key_id, false, stream, duration_ms, 0, 0);
         let diag_summary: Vec<String> = diag
             .iter()
             .map(|d| {

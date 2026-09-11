@@ -404,9 +404,12 @@ export const api = {
         model: model ?? null,
         port: null,
       }),
-    // T1：近 N 天 API 用量统计（按日聚合，服务未运行也可查）
+    // T1：近 N 天 API 用量统计（Trae 模型请求桶；按日聚合，服务未运行也可查）
     usageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_usage_stats', { days: days ?? null }),
+    // WB 上游用量统计（wb_days 桶，Buddy「API 服务」页专用，与 Trae 侧分账）
+    wbUsageStats: (days?: number) =>
+      invoke<UsageDayView[]>('api_wb_usage_stats', { days: days ?? null }),
     // T2：多 API Key 管理（统一列表，无主/子之分）
     keysList: () => invoke<ApiKeysFileView>('api_keys_list'),
     // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）

@@ -286,7 +286,7 @@ fn run_wb_stream(
                 Some(p) => p,
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage(model, "none", key_id, false, true, duration_ms, 0, 0);
+                    state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
                     state.logger.log_request(
                         "POST", "/v2/chat/completions", model, true, 503, "none",
                         duration_ms, Some("no healthy account"),
@@ -354,7 +354,7 @@ fn run_wb_stream(
                                 )
                             })
                             .unwrap_or((0, 0));
-                        state.record_usage(model, &picked.uid, key_id, error_info.is_none(), true, duration_ms, pt, ct);
+                        state.record_usage(true, model, &picked.uid, key_id, error_info.is_none(), true, duration_ms, pt, ct);
                     }
                     match error_info {
                         Some((code, msg)) => {
@@ -513,7 +513,7 @@ pub async fn wb_aggregate_chat(
                 None => match state.wb_pool.pick_excluding_constrained(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
                     Some(p) => p,
                     None => {
-                        state.record_usage(&model, "none", &key_id, false, stream,
+                        state.record_usage(true, &model, "none", &key_id, false, stream,
                             start_ts.elapsed().as_millis() as u64, 0, 0);
                         return Err("no healthy account available".to_string());
                     }
@@ -569,7 +569,7 @@ pub async fn wb_aggregate_chat(
                                     u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                                     u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                                 )).unwrap_or((0, 0));
-                                state.record_usage(&model, &picked.uid, &key_id, true, stream, duration_ms, pt, ct);
+                                state.record_usage(true, &model, &picked.uid, &key_id, true, stream, duration_ms, pt, ct);
                                 state.wb_pool.note_success(&picked.uid);
                                 clear_model_failure(&state, &model);
                                 state.wb_sticky.bind(&sticky_key, &picked.uid, &conv_id, now_ts());
@@ -588,7 +588,7 @@ pub async fn wb_aggregate_chat(
                                 }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", picked.uid, code, msg));
-                                state.record_usage(&model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
+                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
                                 state.logger.log_request(
                                     "POST", "/v2/chat/completions", &model, stream, 200, &picked.uid,
                                     duration_ms, Some(&msg),
@@ -599,7 +599,7 @@ pub async fn wb_aggregate_chat(
                             _ => {
                                 state.wb_pool.note_error(&picked.uid, ErrKind::Server);
                                 note_model_failure(&state, &model);
-                                state.record_usage(&model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
+                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
                                 state.logger.log_request(
                                     "POST", "/v2/chat/completions", &model, stream, 502, &picked.uid,
                                     duration_ms, Some("empty response"),
@@ -635,7 +635,7 @@ pub async fn wb_aggregate_chat(
                                 note_model_failure(&state, &model);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
-                                state.record_usage(&model, &picked.uid, &key_id, false, stream,
+                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
                                     start_ts.elapsed().as_millis() as u64, 0, 0);
                                 state.logger.log_request(
                                     "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
@@ -923,7 +923,7 @@ pub async fn wb_tool_exec_chat(
                     u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                 )).unwrap_or((0, 0));
                 let usage_uid = success_uid.as_deref().unwrap_or("wb-toolexec");
-                state.record_usage(&model, usage_uid, &key_id, true, stream, duration_ms, pt, ct);
+                state.record_usage(true, &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct);
                 state.logger.log_request(
                     "POST", "/v1/responses", &model, stream, 200, usage_uid,
                     duration_ms, Some(&format!("rounds={} searches={}", records.len(), records.iter().filter(|r| r.tool == super::wb_toolexec::TOOL_SEARCH).count())),
@@ -934,7 +934,7 @@ pub async fn wb_tool_exec_chat(
                 Ok((completion, ws_items, resp_id))
             }
             None => {
-                state.record_usage(&model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);
+                state.record_usage(true, &model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);
                 state.logger.log_request(
                     "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
                     duration_ms, last_err.as_deref(),

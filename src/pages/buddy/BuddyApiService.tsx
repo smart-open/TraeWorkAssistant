@@ -1,13 +1,25 @@
-import { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, Play, Square, Save, Copy, Coins, TerminalSquare, Plug } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { RefreshCw, Play, Square, Save, Copy, Coins, TerminalSquare, Plug, BarChart3 } from 'lucide-react';
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import PageHeader from '../../components/PageHeader';
-import { Badge, Spinner } from '../../components/ui';
+import { Badge, Spinner, StatCard } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
+import { fmtTokens } from '../../lib/format';
 import type {
   ApiServiceStatus,
   ApiPoolFile,
+  UsageDayView,
   WbModelInfo,
   WorkBuddyAccountView,
 } from '../../types';
@@ -62,6 +74,9 @@ export default function BuddyApiService() {
   const [refreshing, setRefreshing] = useState(false);
   const [ccBusy, setCcBusy] = useState<'claude' | 'codex' | null>(null);
   const [ecoNote, setEcoNote] = useState('');
+  const [usage, setUsage] = useState<UsageDayView[]>([]);
+  const [usageDays, setUsageDays] = useState(14);
+  const [usageLoading, setUsageLoading] = useState(false);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -95,6 +110,22 @@ export default function BuddyApiService() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // WB 上游用量统计：读独立 wb_days 落盘桶，与 Trae 模型用量（days 桶）互不混淆
+  const loadUsage = useCallback(async (days: number) => {
+    setUsageLoading(true);
+    try {
+      setUsage(await api.apiServer.wbUsageStats(days));
+    } catch {
+      /* 加载失败保留上次数据 */
+    } finally {
+      setUsageLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadUsage(usageDays);
+  }, [usageDays, loadUsage]);
 
   // 保存 WB 上游开关：uids/strategy/groups 原样回传（本页不改 Trae 池配置）
   const saveFlags = async () => {
@@ -206,6 +237,45 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
 
   const credAccounts = accounts.filter((a) => a.has_credential);
   const running = status?.running ?? false;
+
+  // WB 用量汇总（跨天聚合）+ 图表数据
+  const usageSummary = useMemo(() => {
+    const models = new Map<string, { requests: number; ok: number; errors: number }>();
+    const t = usage.reduce(
+      (acc, d) => {
+        acc.requests += d.total_requests;
+        acc.ok += d.ok;
+        acc.errors += d.errors;
+        acc.prompt += d.prompt_tokens;
+        acc.completion += d.completion_tokens;
+        acc.weightedDuration += d.avg_duration_ms * d.total_requests;
+        for (const m of d.models) {
+          const e = models.get(m.name) ?? { requests: 0, ok: 0, errors: 0 };
+          e.requests += m.requests;
+          e.ok += m.ok;
+          e.errors += m.errors;
+          models.set(m.name, e);
+        }
+        return acc;
+      },
+      { requests: 0, ok: 0, errors: 0, prompt: 0, completion: 0, weightedDuration: 0 },
+    );
+    const topModels = [...models.entries()]
+      .sort((a, b) => b[1].requests - a[1].requests)
+      .slice(0, 5)
+      .map(([name, v]) => ({ name, ...v }));
+    return {
+      ...t,
+      topModels,
+      successRate: t.requests > 0 ? ((t.ok / t.requests) * 100).toFixed(1) : '—',
+      avgDuration: t.requests > 0 ? Math.round(t.weightedDuration / t.requests) : 0,
+    };
+  }, [usage]);
+
+  const usageChartData = useMemo(
+    () => usage.map((d) => ({ date: d.date.slice(5), 成功: d.ok, 失败: d.errors })),
+    [usage],
+  );
 
   return (
     <div className="animate-fade-in">
@@ -367,6 +437,143 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
                 </span>
               </div>
             ))}
+          </div>
+        )}
+      </div>
+
+      {/* WB 用量统计（独立 wb_days 桶落盘，仅统计 WB 上游请求，服务未运行也可查看） */}
+      <div className="mt-4 card p-4">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <BarChart3 size={16} className="text-brand-500" />
+            <span className="text-sm font-medium">WB 用量统计</span>
+            <span className="hidden text-xs text-slate-400 sm:inline">仅 WB 上游请求 · 独立于服务运行状态</span>
+          </div>
+          <div className="flex items-center gap-1">
+            {[7, 14, 30].map((d) => (
+              <button
+                key={d}
+                className={
+                  'rounded-md px-2 py-1 text-xs transition ' +
+                  (usageDays === d
+                    ? 'bg-brand-500/10 font-medium text-brand-600 dark:text-brand-400'
+                    : 'text-slate-500 hover:bg-slate-100 dark:text-zinc-400 dark:hover:bg-zinc-800')
+                }
+                onClick={() => setUsageDays(d)}
+              >
+                {d}天
+              </button>
+            ))}
+            <button
+              className="btn-ghost ml-1 flex items-center gap-1 text-xs"
+              onClick={() => void loadUsage(usageDays)}
+              disabled={usageLoading}
+            >
+              <RefreshCw size={13} className={usageLoading ? 'animate-spin' : ''} />
+              刷新
+            </button>
+          </div>
+        </div>
+
+        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <StatCard
+            label="WB 请求数"
+            value={usageSummary.requests}
+            tone="brand"
+            hint={`近 ${usageDays} 天`}
+          />
+          <StatCard
+            label="成功率"
+            value={usageSummary.successRate === '—' ? '—' : `${usageSummary.successRate}%`}
+            tone="green"
+            hint={`失败 ${usageSummary.errors} 次`}
+          />
+          <StatCard
+            label="Token 消耗"
+            value={fmtTokens(usageSummary.prompt + usageSummary.completion)}
+            tone="amber"
+            hint={`输入 ${fmtTokens(usageSummary.prompt)} / 输出 ${fmtTokens(usageSummary.completion)}`}
+          />
+          <StatCard
+            label="平均耗时"
+            value={usageSummary.requests > 0 ? `${usageSummary.avgDuration}ms` : '—'}
+            tone="blue"
+            hint="按请求加权"
+          />
+        </div>
+
+        {usageSummary.requests > 0 ? (
+          <div className="h-48 text-slate-500 dark:text-zinc-400">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={usageChartData} margin={{ top: 4, right: 8, bottom: 0, left: -16 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.15} vertical={false} />
+                <XAxis dataKey="date" tick={{ fill: 'currentColor', fontSize: 11 }} tickLine={false} />
+                <YAxis allowDecimals={false} tick={{ fill: 'currentColor', fontSize: 11 }} tickLine={false} />
+                <Tooltip
+                  contentStyle={{
+                    borderRadius: 8,
+                    border: '1px solid rgba(120,120,120,0.25)',
+                    fontSize: 12,
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="成功" stackId="s" fill="#10b981" />
+                <Bar dataKey="失败" stackId="s" fill="#f43f5e" radius={[3, 3, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        ) : (
+          <p className="py-5 text-center text-xs text-slate-400">
+            暂无 WB 请求数据 — 通过本网关调用 WB 目录模型（消耗 WB 积分）后，这里会展示按日趋势
+          </p>
+        )}
+
+        {usageSummary.topModels.length > 0 && (
+          <div className="mt-3">
+            <p className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-400">
+              模型分布（近 {usageDays} 天 Top 5）
+            </p>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
+                    <th className="pb-2 pr-4 font-medium">模型</th>
+                    <th className="pb-2 pr-4 font-medium">请求数</th>
+                    <th className="pb-2 pr-4 font-medium">成功</th>
+                    <th className="pb-2 pr-4 font-medium">失败</th>
+                    <th className="pb-2 font-medium">占比</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {usageSummary.topModels.map((m) => {
+                    const pct = usageSummary.requests > 0 ? (m.requests / usageSummary.requests) * 100 : 0;
+                    return (
+                      <tr key={m.name} className="border-b border-slate-100 last:border-0 dark:border-zinc-800">
+                        <td className="py-1.5 pr-4 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
+                          {m.name}
+                        </td>
+                        <td className="py-1.5 pr-4 tabular-nums text-slate-600 dark:text-zinc-300">{m.requests}</td>
+                        <td className="py-1.5 pr-4 tabular-nums text-emerald-600 dark:text-emerald-400">{m.ok}</td>
+                        <td className="py-1.5 pr-4 tabular-nums text-rose-600 dark:text-rose-400">{m.errors}</td>
+                        <td className="w-40 py-1.5">
+                          <div className="flex items-center gap-2">
+                            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100 dark:bg-zinc-800">
+                              <div
+                                className="h-full rounded-full bg-brand-500"
+                                style={{ width: `${Math.min(100, pct)}%` }}
+                              />
+                            </div>
+                            <span className="w-12 shrink-0 text-right text-xs tabular-nums text-slate-400">
+                              {pct.toFixed(1)}%
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
       </div>
