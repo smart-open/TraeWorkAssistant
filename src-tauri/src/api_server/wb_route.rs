@@ -288,7 +288,7 @@ fn run_wb_stream(
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
                     state.logger.log_request(
-                        "wb", "POST", "/v2/chat/completions", model, true, 503, "none",
+                        "buddy", "POST", "/v2/chat/completions", model, true, 503, "none",
                         duration_ms, Some("no healthy account"),
                     );
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from(
@@ -370,7 +370,7 @@ fn run_wb_stream(
                                 break;
                             }
                             state.logger.log_request(
-                                "wb", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
+                                "buddy", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
                                 duration_ms, Some(&format!("ttfb={}ms msg={}", ttfb_ms, msg)),
                             );
                             return; // 已有数据流出：就地收尾
@@ -382,7 +382,7 @@ fn run_wb_stream(
                             state.wb_sticky.bind(&sticky_key, &picked.uid, &conv_id, now_ts());
                             state.wb_sticky.save(&state.data_dir);
                             state.logger.log_request(
-                                "wb", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
+                                "buddy", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
                                 duration_ms, Some(&format!("ttfb={}ms", ttfb_ms)),
                             );
                             return;
@@ -423,7 +423,7 @@ fn run_wb_stream(
                                 safe_slice(&resp_body, 200)
                             ));
                             state.logger.log_request(
-                                "wb", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
+                                "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
                                 start_ts.elapsed().as_millis() as u64,
                                 Some(&format!("upstream status={}", status)),
                             );
@@ -432,7 +432,7 @@ fn run_wb_stream(
                         RetryAction::Fatal => {
                             let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
                             state.logger.log_request(
-                                "wb", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
+                                "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
                                 start_ts.elapsed().as_millis() as u64,
                                 Some(&msg),
                             );
@@ -575,7 +575,7 @@ pub async fn wb_aggregate_chat(
                                 state.wb_sticky.bind(&sticky_key, &picked.uid, &conv_id, now_ts());
                                 state.wb_sticky.save(&state.data_dir);
                                 state.logger.log_request(
-                                    "wb", "POST", "/v2/chat/completions", &model, stream, 200, &picked.uid,
+                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 200, &picked.uid,
                                     duration_ms, None,
                                 );
                                 return Ok(r);
@@ -590,7 +590,7 @@ pub async fn wb_aggregate_chat(
                                     Some(format!("wb uid={} code={} msg={}", picked.uid, code, msg));
                                 state.record_usage(true, &model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
                                 state.logger.log_request(
-                                    "wb", "POST", "/v2/chat/completions", &model, stream, 200, &picked.uid,
+                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 200, &picked.uid,
                                     duration_ms, Some(&msg),
                                 );
                                 // 流内错误且未产出内容 → 换号重试
@@ -601,7 +601,7 @@ pub async fn wb_aggregate_chat(
                                 note_model_failure(&state, &model);
                                 state.record_usage(true, &model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
                                 state.logger.log_request(
-                                    "wb", "POST", "/v2/chat/completions", &model, stream, 502, &picked.uid,
+                                    "buddy", "POST", "/v2/chat/completions", &model, stream, 502, &picked.uid,
                                     duration_ms, Some("empty response"),
                                 );
                                 break;
@@ -638,7 +638,7 @@ pub async fn wb_aggregate_chat(
                                 state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
                                     start_ts.elapsed().as_millis() as u64, 0, 0);
                                 state.logger.log_request(
-                                    "wb", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
+                                    "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
                                     Some(&format!("upstream status={}", status)),
                                 );
@@ -646,7 +646,7 @@ pub async fn wb_aggregate_chat(
                             }
                             RetryAction::Fatal => {
                                 state.logger.log_request(
-                                    "wb", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
+                                    "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
                                     Some(&safe_slice(&resp_body, 300)),
                                 );
@@ -925,7 +925,7 @@ pub async fn wb_tool_exec_chat(
                 let usage_uid = success_uid.as_deref().unwrap_or("wb-toolexec");
                 state.record_usage(true, &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct);
                 state.logger.log_request(
-                    "wb", "POST", "/v1/responses", &model, stream, 200, usage_uid,
+                    "buddy", "POST", "/v1/responses", &model, stream, 200, usage_uid,
                     duration_ms, Some(&format!("rounds={} searches={}", records.len(), records.iter().filter(|r| r.tool == super::wb_toolexec::TOOL_SEARCH).count())),
                 );
                 // Responses 投影：web_search_call 历史项前置
@@ -936,7 +936,7 @@ pub async fn wb_tool_exec_chat(
             None => {
                 state.record_usage(true, &model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);
                 state.logger.log_request(
-                    "wb", "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
+                    "buddy", "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
                     duration_ms, last_err.as_deref(),
                 );
                 Err(last_err.unwrap_or_else(|| "no healthy account available".to_string()))

@@ -58,7 +58,7 @@ impl ApiLogger {
     }
 
     /// 记录一条 API 请求日志
-    /// `pool`：资源标识（"trae" / "wb"），区分该请求由哪个上游资源池服务
+    /// `pool`：资源标识（"trae" / "buddy"），区分该请求由哪个上游资源池服务
     pub fn log_request(
         &self,
         pool: &str,
@@ -431,7 +431,7 @@ mod tests {
         let dir = tmp_dir("pool");
         let logger = ApiLogger::new(dir.clone());
         logger.log_request(
-            "wb", "POST", "/v1/chat/completions", "glm-5.3", true, 200,
+            "buddy", "POST", "/v1/chat/completions", "glm-5.3", true, 200,
             "user-1234567890abcdef", 42, None,
         );
         logger.log_request(
@@ -439,7 +439,7 @@ mod tests {
             "none", 8, Some("no healthy account"),
         );
         let content = logger.read_log(&today()).expect("log written");
-        assert!(content.contains("pool=wb model=glm-5.3"), "wb 行需含资源标识与模型: {content}");
+        assert!(content.contains("pool=buddy model=glm-5.3"), "buddy 行需含资源标识与模型: {content}");
         assert!(content.contains("pool=trae model=glm-5.2"), "trae 行需含资源标识与模型: {content}");
         assert!(content.contains("error=no healthy account"));
         let _ = fs::remove_dir_all(&dir);
