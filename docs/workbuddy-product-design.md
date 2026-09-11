@@ -1,6 +1,7 @@
 # Buddy（WorkBuddy / CodeBuddy）需求产品设计文档
 
-> **文档版本**: v1.2 · 2026-09-10
+> **文档版本**: v1.3 · 2026-09-11
+> **v1.3 变更**: 批次 5 立项（开源生态价值点纳入）：① 依据 `docs/tmp/oss-ecosystem-value-analysis.md`（升级 v1.1，✅ 标记同步）新增 J 节补充需求 **F-61~F-66**（四段模型路由管线 / reasoning_content 思考链透传 / 生图双端点 / 网关工具代执行 / 协议细节补强 / CLI 多账号环境隔离评估）；② 任务清单新增「批次 5 · 生态吸收与网关增强」——顺延项 F-37/F-43/F-21 转正式任务，F-42/F-52/F-41 转机会项；③ §5.8 参照表新增 #11~#16，§7.2 参考仓库新增 3 项；④ 实施顺序结论补批次 5。
 > **v1.2 变更**: ① §3.7 UI 设计对齐本应用既有「Trae 页面布局」——启用 Sidebar 底部应用切换 Tab 的 Buddy 项（代码已预留），Buddy 采用与豆包同款**应用级子导航**（概述/账号管理/签到与成长/积分与统计/环境配置 五页，buddy-* 视图），替换 v1.1「散落进 Trae 各页做分区/Tab」的方案，并补齐组件复用清单与版式规范；② 吸收 2026-09-10 开源生态调研（`docs/tmp/oss-ecosystem-value-analysis.md`）：F-29/F-30/F-31/F-33 就地升级（P2C 调度、账号五态机、审核模板黑名单最小改写、会话粘性双模式、分级重试表），§5.5 避坑清单新增 2 条，§5.6 补按模型族思考参数映射，新增 §5.8 调度与粘性工程参照，§7.2 新增 2 个参考仓库。
 > **v1.1 变更**: 结合开源项目 [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)（v0.3.1 运行截图 5 张 + 本地克隆件源码核对）补充——① 新增补充需求 F-54~F-60（账号双态卡片/启动自动补签/积分包明细/Token 统计增强/按模型积分排行/CLI 轮换四重防护/聚合迁移入口）；② §3.7 UI 设计扩写为逐页可落地规格（信息架构 + 字段级组件清单）；③ §3.10 CLI 轮换由双约束扩为五重防护；④ 新增 §5.7 统计与调度实现细节（源码级）；⑤ 任务清单批次 1/3 相应扩项。
 > **产品归属**: AI Work 助手（ai-work-assistant，当前 v3.2.7）
@@ -150,6 +151,17 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 | F-60 ✅ | 「添加与迁移账号」聚合入口 | 账号页顶部聚合卡：OAuth 扫码添加（F-50）/ 导入本机账号（扫 auth 文件+CLI）/ 导入备份（账号库导入，F-46 扩展）/ 导出——四入口一键直达 | 0.5 天 | P1 |
 
 > **源码核对要点**（克隆件 `%TEMP%\oss-research\workbuddy-switch`，commit bb46e90 · 2026-09-04 · v0.3.1）：`refresh.rs:127` 惰性刷新（剩余 < `lazy_refresh_hours` 才刷）与 `refresh.rs:149` 保活检查（每日一次，`keepalive_days<=0` 无条件刷全部）——F-55 的两个参数名与语义直接沿用；`rotate.rs::decide_target` 为纯函数（候选按 `urgency_key` 排序：到期越早越紧迫、无到期排最后 → 五重防护逐层过滤），**可纯逻辑单测**，移植时保持该形态；`token_stats.rs:46` 缓存命中率公式 + `:92-99` cache_read 别名链（`cache_read_input_tokens` 优先取正值，防 stale 0 掩盖 `prompt_cache_hit_tokens`，兼容嵌套 provider details）——F-57 解析层直接照抄。
+
+#### J. 生态吸收补充需求（v1.3 批次 5 立项，源自 `docs/tmp/oss-ecosystem-value-analysis.md` v1.1 未吸收价值点）
+
+| 编号 | 需求 | 说明 / 验收标准 | 优先级 |
+|---|---|---|---|
+| F-61 | 四段模型路由管线（P1） | 「任意模型名 → 上游真实模型」四级路由：① 别名静态映射（`wb_model_catalog.json`）→ ② 用户自定义正则 → ③ 系列通配（如 `claude-sonnet-*` → glm/hy 系列）→ ④ 后缀检测注入参数（`-thinking`/`-quality` 等注入思考/画质参数）；每级命中即止，全未命中回落 `/v1/models` 目录原名。来源：antigravity-tools（同栈平行实现实证） | P1 |
+| F-62 | reasoning_content 思考链透传（P2） | 网关 OpenAI 输出透传上游思考链 `reasoning_content` 字段 + 「默认深度思考」开关（设置项，默认关）；Anthropic 协议侧映射为 thinking block。来源：Tom6814/WorkBuddy2API | P2 |
+| F-63 | 生图双端点（P2） | `/v1/images/generations`（文生图）+ `/v1/images/edits`（图生图）投影至上游生图能力；上游不支持时明示报错不静默；与 F-61 路由管线联动（生图模型识别）。来源：Tom6814/WorkBuddy2API | P2 |
+| F-64 | 网关工具代执行（P2） | 客户端下发上游不支持的工具（如 Codex 发 `type:"web_search"`）时代理侧代执行：搜索/页面读取 → 结果回喂上游 → 按原生 `web_search_call` 事件流返回——「上游不支持的工具调用在代理侧补齐」完整范式，跨上游通用。来源：muskke/trae-api-proxy v0.5.1 | P2 |
+| F-65 | 协议细节补强（P1） | ① 连续同角色消息自动合并（上游要求消息交替，改写层在透传前合并）；② 单端口三协议靠 `anthropic-version` 头/路径双维度区分（防路径嗅探误判）；③ 后台任务（生成标题/摘要类短请求）识别并降级（低优先级账号/低成本模型）。来源：antigravity-tools | P1 |
+| F-66 | CLI 多账号环境隔离（P3 评估项） | 每账号独立 `CODEX_HOME`/`CLAUDE_CONFIG_DIR`/`KIMI_CODE_HOME` 环境目录 + 全局同名变量剥离 + 「严格账号模式」（无激活账号即报错、不回落本机登录态）+ 接口返回一律脱敏；与 F-06 CLI 切号桥互补（写 token vs 隔目录），做 dsh/CC 多 CLI 场景扩展评估。来源：xiaolizi0v0/CliProxy | P3 |
 
 ### 2.2 非功能需求
 
@@ -481,7 +493,7 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 
 ---
 
-## 四、任务清单（WBS · 4 批次）
+## 四、任务清单（WBS · 5 批次）
 
 > 每批独立可验收；预估为净开发人日。DoD 统一含：UTF-8 校验通过、单测通过（cargo test + python tests）、中文文案规范、commit 按 [feature]/[fix] 分拆附显式路径。
 
@@ -536,7 +548,25 @@ AI Work 助手已实现 Trae Work / Trae CN 双应用的「多账号签到 + 登
 | T4.5 ✅ | Global 区上游域名路由（F-36）：domain 含 `.workbuddy.ai` 的账号全走 `www.workbuddy.ai` | 0.5d |
 | T4.6 ✅ | 批次 4 收尾审查 + 文档 + 分拆提交 | — |
 
-> 顺延（批次 5/按需）：DSH provider（F-37）、CC Switch 协同（F-43）、quota 端口发现兜底（F-21）、workbuddy-mcp（F-42）、WorkBuddyProxy（F-52）、trae2codex（F-41）。
+> 顺延注记（v1.3 更新）：批次 5 已正式立项（见下）——F-37/F-43/F-21 转批次 5 正式任务；F-42/F-52/F-41 转机会项。
+
+### 批次 5 · 生态吸收与网关增强（≈11~13 天）——目标：开源生态价值点全量落地
+
+> 依据 `docs/tmp/oss-ecosystem-value-analysis.md` v1.1（✅ 标记同步）：批次 1-4 已吸收高价值项（审核黑名单/粘性指纹/P2C/五态机/分级重试/hy3 effort/prompt cache 口径等）之外，剩余可纳入价值点在本批次收口。
+
+| # | 任务 | 涉及 | 预估 |
+|---|---|---|---|
+| T5.1 | DSH provider：15 模型静态目录兜底 + 启动动态替换（F-37，元数据透传 inputModalities/supportedEfforts/倍率/徽章，能力读上游勿硬编码） | `wb_model_catalog.json`、api_server | 2d |
+| T5.2 | 四段模型路由管线：别名静态映射 → 用户自定义正则 → 系列通配 → 后缀检测注入参数（F-61） | api_server | 1.5d |
+| T5.3 | reasoning_content 思考链透传 + 默认深度思考开关（F-62） | api_server、buddy-settings | 1d |
+| T5.4 | 生图双端点投影：`/v1/images/generations` + `/v1/images/edits`（F-63） | api_server/routes.rs | 1.5d |
+| T5.5 | 网关工具代执行：上游不支持工具（web_search）代理侧代执行 + 结果回喂 + 原生事件返回（F-64） | api_server | 2d |
+| T5.6 | 协议细节补强：连续同角色消息合并 / 单端口三协议 anthropic-version 区分 / 后台任务识别降级（F-65） | api_server | 1d |
+| T5.7 | CC Switch 协同：把本项目转换端点注册进 CC Switch 配置，不自建切换器（F-43） | commands + 前端 | 0.5d |
+| T5.8 | 本地 quota API 兜底：扫 `~/.workbuddy/*.port` + 端口段探测 + `remaining` 特征确认（F-21） | commands/workbuddy.rs | 1d |
+| T5.9 | 批次 5 收尾审查（九大类黑盒复查）+ 文档同步 + 分拆提交 | — | — |
+
+> 机会项（按需评估，不阻塞批次 5 验收）：workbuddy-mcp（F-42，P3）、WorkBuddyProxy（F-52，P3 远期）、CLI 多账号环境隔离（F-66，P3 评估）、trae2codex（F-41，按需）。
 
 ---
 
@@ -664,6 +694,12 @@ X-Client-Platform: web           # 仅积分三件套需要（缺了被网关拒
 | 8 | 分级重试表（429 Retry-After/线性、503/529 指数、400+thinking.signature 200ms） | antigravity-tools | F-33 重试策略表 |
 | 9 | 协议细节：连续同角色消息自动合并、单端口三协议靠 `anthropic-version` 头/路径区分、后台任务（生成标题/摘要）识别降级 | antigravity-tools | §3.9 ① 改写层 + §5.5 后续联调补充位 |
 | 10 | token 过期前主动刷新（不等 401） | trae2api-web | F-09 + §3.4 调度 |
+| 11 | **四段模型路由管线**：别名静态映射 → 用户自定义正则 → 系列通配 → 后缀检测注入参数（v1.3 新增） | antigravity-tools | F-61（批次 5） |
+| 12 | **reasoning_content 思考链透传 + 默认深度思考开关**（v1.3 新增） | Tom6814/WorkBuddy2API | F-62（批次 5） |
+| 13 | **生图双端点**（generations + edits 图生图投影）（v1.3 新增） | Tom6814/WorkBuddy2API | F-63（批次 5） |
+| 14 | **Responses API 工具代执行**：上游不支持的工具代理侧代执行、结果回喂、原生 `web_search_call` 事件返回（v1.3 新增） | muskke/trae-api-proxy | F-64（批次 5） |
+| 15 | **协议细节**：连续同角色消息自动合并、单端口三协议 `anthropic-version` 头/路径区分、后台任务识别降级（v1.3 独立立项，原 #9 拆出） | antigravity-tools | F-65（批次 5） |
+| 16 | **多 CLI 账号环境隔离**：独立 `CODEX_HOME`/`CLAUDE_CONFIG_DIR` + 全局变量剥离 + 严格账号模式（v1.3 新增，评估项） | xiaolizi0v0/CliProxy | F-66（批次 5 机会项） |
 
 **与既有设计的冲突调和**：#5 粘性指纹的 cache 收益宣称（+300%）来自 Gemini 上游（antigravity-tools）；Buddy 上游为腾讯 copilot，代理流量缓存恒不命中（#4）——因此指纹模式在 Buddy 场景的价值是**会话一致性与上游侧缓存（若有）**，积分成本模型统一按无缓存估算，两处结论已在 F-31 验收标准中写明口径，避免实现期自相矛盾。
 
@@ -719,6 +755,9 @@ X-Client-Platform: web           # 仅积分三件套需要（缺了被网关拒
 | qinchangxv/antigravity-tools（Python） | 旧版考古/16 项清理/子 Key/协议细则 | src/modules/{api_client,checkin,oauth}.py |
 | 88lin/workbuddy-auto-signin（Python） | 成长中心端点/极简头/dig 模式 | signin.py |
 | tonny0812/workbuddy2api（Python） | Codex /v1/responses 投影/三协议/脱敏 | converter.py |
+| **Tom6814/WorkBuddy2API**（v1.3 新增） | reasoning_content 思考链透传 + 默认深度思考、生图双端点（generations + edits）、反封号组合拳（E1 风控引用） | F-62/F-63 输出层与生图投影设计（learn-the-design） |
+| **muskke/trae-api-proxy**（v1.3 新增，Go，2026-09 活跃） | Responses API 工具代执行完整范式（web_search 代理侧代执行/回喂/原生事件返回）、抓包 header 环境变量注入 | F-64 工具代执行设计（跨上游通用，不抄码） |
+| **xiaolizi0v0/CliProxy**（v1.3 新增） | 多 CLI 账号环境隔离 + 严格账号模式 + 接口脱敏 | F-66 评估参照 |
 | trae2api-web / trae-local-api 等其余 Trae 生态 | 见 `docs/tmp/oss-ecosystem-value-analysis.md` §3~§5（W-01/tc 解密/Responses 工具代执行等） | 一次性调研快照，实施前拉取最新源码核对 |
 
 ### 7.3 开源克隆件位置
@@ -729,4 +768,4 @@ X-Client-Platform: web           # 仅积分三件套需要（缺了被网关拒
 
 ## 八、实施顺序结论
 
-> **WorkBuddy 端点全有可运行开源佐证（风险最低）**，且 F-01/F-48/F-49/F-47/F-46 等基建已就绪——批次 1 可立即开工。与豆包批次并行度低（豆包仅剩 F-07 热切换与 F-24 端点抓包两项二期），推荐按 **批次 1 → 2 → 3 → 4** 串行推进，批次 2 的网关改造与 Trae 侧既有网关回归测试同步进行。
+> **WorkBuddy 端点全有可运行开源佐证（风险最低）**，且 F-01/F-48/F-49/F-47/F-46 等基建已就绪——批次 1 可立即开工。与豆包批次并行度低（豆包仅剩 F-07 热切换与 F-24 端点抓包两项二期），推荐按 **批次 1 → 2 → 3 → 4 → 5** 串行推进，批次 2 的网关改造与 Trae 侧既有网关回归测试同步进行。批次 1-4 已全部完成（✅），当前处于批次 5（生态吸收与网关增强，v1.3 立项）待启动状态。
