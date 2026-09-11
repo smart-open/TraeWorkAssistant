@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, Play, Square, Save, Copy, Coins, TerminalSquare } from 'lucide-react';
+import { RefreshCw, Play, Square, Save, Copy, Coins, TerminalSquare, Plug } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -15,7 +15,7 @@ import type {
 /**
  * buddy-api-service API 服务（WB 上游管理，方案A UI 隔离）：
  * 与 Trae「API 服务」共用同一网关实例（同端口/同 Keys），本页聚焦 WB 上游：
- * WB 路由开关 + 模型目录 + WB 账号池状态 + 接入示例。
+ * WB 路由开关 + 模型目录 + WB 账号池状态 + 接入示例 + CC Switch（WB 侧独立条目）。
  * Trae 页的「WorkBuddy 上游」开关组与「同步 WB 模型目录」已迁回此处。
  */
 
@@ -60,6 +60,8 @@ export default function BuddyApiService() {
   const [stopping, setStopping] = useState(false);
   const [copying, setCopying] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [ccBusy, setCcBusy] = useState<'claude' | 'codex' | null>(null);
+  const [ecoNote, setEcoNote] = useState('');
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -180,6 +182,25 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
       pushToast('error', '复制失败');
     } finally {
       setCopying(false);
+    }
+  };
+
+  // CC Switch 协同（WB 侧条目 aiwork-wb-gateway-*，与 Trae 侧条目互不覆盖）
+  const registerCcSwitch = async (appType: 'claude' | 'codex') => {
+    if (ccBusy) return;
+    setCcBusy(appType);
+    setEcoNote('');
+    try {
+      const model = catalog[0]?.id;
+      const msg = await withMinDelay(
+        api.apiServer.ccSwitchRegister(appType, 'wb', undefined, model),
+        600,
+      );
+      setEcoNote(`✓ ${msg}`);
+    } catch (e) {
+      setEcoNote(`✗ CC Switch 注册失败：${String(e).slice(0, 160)}`);
+    } finally {
+      setCcBusy(null);
     }
   };
 
@@ -369,9 +390,44 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
             模型 ID：<code className="text-[11px]">{catalog[0]?.id ?? '（同步目录后展示）'}</code> 及上表其他 WB 模型
           </div>
           <div className="mt-2 text-[11px]">
-            Claude Code / Codex CLI 用户：可在 Trae「API 服务」页把网关端点注册进 CC Switch（生态接入），WB 模型经同一端点使用。
+            Claude Code / Codex CLI 用户：可用下方「生态接入」把 WB 端点注册进 CC Switch（注册的是 WB 侧独立条目，与 Trae 侧互不影响）。
           </div>
         </div>
+      </div>
+
+      {/* 生态接入：CC Switch 协同（WB 侧独立条目） */}
+      <div className="mt-4 card p-4">
+        <div className="mb-2 flex items-center gap-2">
+          <Plug size={16} className="text-emerald-500" />
+          <span className="text-sm font-medium">生态接入</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            className="btn-outline !py-1.5 text-xs"
+            onClick={() => void registerCcSwitch('claude')}
+            disabled={ccBusy !== null}
+            title="把网关 Anthropic 端点注册进 CC Switch（WB 侧条目「WorkBuddy 网关」，默认模型取 WB 目录首个）"
+          >
+            注册到 CC Switch（Claude Code）
+          </button>
+          <button
+            className="btn-outline !py-1.5 text-xs"
+            onClick={() => void registerCcSwitch('codex')}
+            disabled={ccBusy !== null}
+            title="把网关 Responses 端点注册进 CC Switch（WB 侧条目「WorkBuddy 网关」，默认模型取 WB 目录首个）"
+          >
+            注册到 CC Switch（Codex）
+          </button>
+        </div>
+        {ecoNote && (
+          <p className="mt-2 break-all text-[11px] leading-4 text-slate-500 dark:text-zinc-400">
+            {ecoNote}
+          </p>
+        )}
+        <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
+          WB 侧注册「WorkBuddy 网关」独立条目（默认模型 {catalog[0]?.id ?? 'hy4'}），与 Trae「API 服务」页注册的「AI Work 助手网关」互不覆盖；
+          CC Switch 注册会先整库备份至 ~/.cc-switch/backups/，仅写入本网关条目，写入后需重启 CC Switch 生效。
+        </p>
       </div>
     </div>
   );

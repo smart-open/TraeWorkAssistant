@@ -354,7 +354,7 @@ export default function ApiService() {
     }
   };
 
-  // T5.7/F-43：CC Switch 注册状态（网关端点注册，Trae/WB 模型共用）
+  // T5.7/F-43：CC Switch 注册状态（注册 Trae 侧条目；WB 侧条目在 Buddy「API 服务」页）
   const [ccBusy, setCcBusy] = useState<'claude' | 'codex' | null>(null);
   const [ecoNote, setEcoNote] = useState('');
 
@@ -363,7 +363,7 @@ export default function ApiService() {
     setCcBusy(appType);
     setEcoNote('');
     try {
-      const msg = await withMinDelay(api.apiServer.ccSwitchRegister(appType));
+      const msg = await withMinDelay(api.apiServer.ccSwitchRegister(appType, 'trae'));
       setEcoNote(`✓ ${msg}`);
     } catch (e) {
       setEcoNote(`✗ CC Switch 注册失败：${String(e).slice(0, 160)}`);
@@ -716,7 +716,7 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                   className="btn-ghost !p-2 text-xs"
                   onClick={() => void registerCcSwitch('claude')}
                   disabled={ccBusy !== null}
-                  title="把网关 Anthropic 端点（/v1/messages）注册进 CC Switch，由 CC Switch 负责切换"
+                  title="把网关 Anthropic 端点（/v1/messages）注册进 CC Switch（Trae 侧条目「AI Work 助手网关」），由 CC Switch 负责切换"
                 >
                   注册到 CC Switch（Claude Code）
                 </button>
@@ -724,7 +724,7 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                   className="btn-ghost !p-2 text-xs"
                   onClick={() => void registerCcSwitch('codex')}
                   disabled={ccBusy !== null}
-                  title="把网关 Responses 端点（/v1/responses）注册进 CC Switch，由 CC Switch 负责切换"
+                  title="把网关 Responses 端点（/v1/responses）注册进 CC Switch（Trae 侧条目「AI Work 助手网关」），由 CC Switch 负责切换"
                 >
                   注册到 CC Switch（Codex）
                 </button>
@@ -736,7 +736,8 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
               )}
               <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
                 CC Switch 注册会先整库备份至 ~/.cc-switch/backups/，仅写入本网关条目、不改其它
-                provider；写入后需重启 CC Switch 生效。
+                provider；写入后需重启 CC Switch 生效。此处注册的是 Trae 模型网关条目（默认模型 glm-5.3），
+                WB 上游的 CC Switch 条目在 Buddy「API 服务」页注册，互不覆盖。
               </p>
             </div>
 

@@ -389,10 +389,17 @@ export const api = {
     // WB 目录模型列表（Buddy API 服务页展示）
     wbCatalogList: () => invoke<WbModelInfo[]>('api_wb_catalog_list'),
     // T5.7/F-43：CC Switch 协同（注册网关 provider 条目，不自建切换器）
+    // side：trae（Trae 模型网关）/ wb（WB 上游网关），两套条目互不覆盖
     ccSwitchStatus: () => invoke<CcSwitchStatus>('ccswitch_status'),
-    ccSwitchRegister: (appType: 'claude' | 'codex', apiKey?: string, model?: string) =>
+    ccSwitchRegister: (
+      appType: 'claude' | 'codex',
+      side: 'trae' | 'wb' = 'trae',
+      apiKey?: string,
+      model?: string,
+    ) =>
       invoke<string>('ccswitch_register', {
         appType,
+        side,
         apiKey: apiKey ?? null,
         model: model ?? null,
         port: null,

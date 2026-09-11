@@ -348,6 +348,9 @@ export interface CcSwitchStatus {
   dbPath: string;
   claudeRegistered: boolean;
   codexRegistered: boolean;
+  /** WB 侧条目（aiwork-wb-gateway-*）注册状态，与 Trae 侧互不覆盖 */
+  wbClaudeRegistered: boolean;
+  wbCodexRegistered: boolean;
 }
 
 /** 用量统计计数（按模型/账号/Key 维度，T1） */

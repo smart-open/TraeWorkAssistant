@@ -14,9 +14,12 @@
 
 use rusqlite::Connection;
 
-/// 本项目条目的固定 id 前缀（upsert 依据）
+/// 本项目条目的固定 id 前缀（upsert 依据）；Trae 与 WB 各一套，互不覆盖
 const PROVIDER_ID_PREFIX: &str = "aiwork-gateway-";
+const PROVIDER_WB_ID_PREFIX: &str = "aiwork-wb-gateway-";
 const DEFAULT_MODEL: &str = "glm-5.3";
+/// WB 侧条目未显式传模型时的兜底（wb_model_catalog.json 首个模型）
+const DEFAULT_WB_MODEL: &str = "hy4";
 /// CC Switch 数据库相对 home 的路径
 const DB_REL: &str = ".cc-switch/cc-switch.db";
 
@@ -27,9 +30,11 @@ pub struct CcSwitchStatus {
     pub db_path: String,
     pub claude_registered: bool,
     pub codex_registered: bool,
+    pub wb_claude_registered: bool,
+    pub wb_codex_registered: bool,
 }
 
-/// 查询 CC Switch 安装状态与本条目注册情况（只读；库不存在 → installed=false）
+/// 查询 CC Switch 安装状态与两侧条目注册情况（只读；库不存在 → installed=false）
 #[tauri::command]
 pub fn ccswitch_status() -> CcSwitchStatus {
     let db = home_db_path();
@@ -38,25 +43,34 @@ pub fn ccswitch_status() -> CcSwitchStatus {
         db_path: db.display().to_string(),
         claude_registered: false,
         codex_registered: false,
+        wb_claude_registered: false,
+        wb_codex_registered: false,
     };
     if st.installed {
         if let Ok(conn) = Connection::open_with_flags(
             &db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         ) {
-            for app in ["claude", "codex"] {
-                let id = format!("{}{}", PROVIDER_ID_PREFIX, app);
-                let ok = conn
-                    .query_row(
-                        "SELECT 1 FROM providers WHERE id = ?1",
-                        rusqlite::params![id],
-                        |_| Ok(()),
-                    )
-                    .is_ok();
-                if app == "claude" {
-                    st.claude_registered = ok;
-                } else {
-                    st.codex_registered = ok;
+            for (prefix, (claude_field, codex_field)) in [
+                (
+                    PROVIDER_ID_PREFIX,
+                    (&mut st.claude_registered, &mut st.codex_registered),
+                ),
+                (
+                    PROVIDER_WB_ID_PREFIX,
+                    (&mut st.wb_claude_registered, &mut st.wb_codex_registered),
+                ),
+            ] {
+                for (app, registered) in [("claude", claude_field), ("codex", codex_field)] {
+                    let id = format!("{}{}", prefix, app);
+                    let ok = conn
+                        .query_row(
+                            "SELECT 1 FROM providers WHERE id = ?1",
+                            rusqlite::params![id],
+                            |_| Ok(()),
+                        )
+                        .is_ok();
+                    *registered = ok;
                 }
             }
         }
@@ -66,6 +80,7 @@ pub fn ccswitch_status() -> CcSwitchStatus {
 
 /// 注册/更新网关 provider 条目到 CC Switch。
 /// `app_type`：claude（Anthropic 协议 /v1/messages）或 codex（Responses /v1/responses）。
+/// `side`：trae（Trae 模型网关，缺省）或 wb（WB 上游网关）——两侧条目 id 不同，互不覆盖。
 /// `api_key`：网关 API Key（网关未配 Key 时可空）；`model`：默认模型 id；
 /// `port`：网关端口（缺省用应用设置 api_port）。
 /// 返回说明文案（含备份路径；提醒重启 CC Switch 生效）。
@@ -73,6 +88,7 @@ pub fn ccswitch_status() -> CcSwitchStatus {
 pub fn ccswitch_register(
     state: tauri::State<'_, crate::state::AppState>,
     app_type: String,
+    side: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
     port: Option<u16>,
@@ -80,6 +96,13 @@ pub fn ccswitch_register(
     let app = match app_type.as_str() {
         "claude" | "codex" => app_type.as_str(),
         other => return Err(format!("不支持的 app_type: {other}（仅 claude / codex）")),
+    };
+    let is_wb = match side.as_deref() {
+        None | Some("trae") => false,
+        Some("wb") => true,
+        Some(other) => {
+            return Err(format!("不支持的 side: {other}（仅 trae / wb）"));
+        }
     };
     let db = home_db_path();
     if !db.is_file() {
@@ -89,7 +112,13 @@ pub fn ccswitch_register(
     let model = model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| {
+            if is_wb {
+                DEFAULT_WB_MODEL.to_string()
+            } else {
+                DEFAULT_MODEL.to_string()
+            }
+        });
     let key = api_key.unwrap_or_default();
 
     // 红线：写前整库备份（沿用 CC Switch 自身 backups 目录）
@@ -105,15 +134,24 @@ pub fn ccswitch_register(
     let backup_path = backup_dir.join(format!("cc-switch.db.bak_aiwork_{}", ts));
     std::fs::copy(&db, &backup_path).map_err(|e| format!("备份 CC Switch 数据库失败: {e}"))?;
 
-    let entry_id = format!("{}{}", PROVIDER_ID_PREFIX, app);
+    let entry_id = if is_wb {
+        format!("{}{}", PROVIDER_WB_ID_PREFIX, app)
+    } else {
+        format!("{}{}", PROVIDER_ID_PREFIX, app)
+    };
     let settings_config = match app {
         "claude" => claude_settings_config(port, &model, &key),
-        "codex" => codex_settings_config(port, &model, &key),
+        "codex" => codex_settings_config(port, &model, &key, is_wb),
         _ => unreachable!(),
     };
-    let name = format!("AI Work 助手网关（{}）", if app == "claude" { "Anthropic" } else { "Codex" });
+    let name = format!(
+        "{}（{}）",
+        if is_wb { "WorkBuddy 网关" } else { "AI Work 助手网关" },
+        if app == "claude" { "Anthropic" } else { "Codex" }
+    );
     let notes = format!(
-        "AI Work 助手本地网关注入（自动生成，可安全删除；base=http://127.0.0.1:{}，写入时间 {}）",
+        "{}本地网关注入（自动生成，可安全删除；base=http://127.0.0.1:{}，写入时间 {}）",
+        if is_wb { "WorkBuddy 上游 " } else { "AI Work 助手 " },
         port,
         crate::fs_utils::now_iso()
     );
@@ -211,18 +249,20 @@ fn claude_settings_config(port: u16, model: &str, key: &str) -> serde_json::Valu
 }
 
 /// codex 条目：auth + config.toml（wire_api=responses，直连 /v1/responses）
-fn codex_settings_config(port: u16, model: &str, key: &str) -> serde_json::Value {
+fn codex_settings_config(port: u16, model: &str, key: &str, is_wb: bool) -> serde_json::Value {
     let toml = format!(
-        "model_provider = \"aiwork\"\n\
+        "model_provider = \"{provider_id}\"\n\
          model = \"{model}\"\n\
          model_reasoning_effort = \"high\"\n\
          disable_response_storage = true\n\
          \n\
-         [model_providers.aiwork]\n\
-         name = \"AI Work 助手网关\"\n\
+         [model_providers.{provider_id}]\n\
+         name = \"{provider_name}\"\n\
          base_url = \"http://127.0.0.1:{port}/v1\"\n\
          wire_api = \"responses\"\n\
          requires_openai_auth = true\n",
+        provider_id = if is_wb { "aiwork-wb" } else { "aiwork" },
+        provider_name = if is_wb { "WorkBuddy 网关" } else { "AI Work 助手网关" },
         model = model,
         port = port,
     );
@@ -248,12 +288,22 @@ mod tests {
 
     #[test]
     fn codex_config_toml_has_wire_api_and_base_v1() {
-        let cfg = codex_settings_config(8899, "hy4", "");
+        let cfg = codex_settings_config(8899, "hy4", "", false);
         assert_eq!(cfg["auth"]["OPENAI_API_KEY"], serde_json::json!("aiwork-local"), "空 Key 用占位");
         let toml = cfg["config"].as_str().unwrap();
         assert!(toml.contains("base_url = \"http://127.0.0.1:8899/v1\""));
         assert!(toml.contains("wire_api = \"responses\""));
         assert!(toml.contains("model = \"hy4\""));
+        assert!(toml.contains("model_provider = \"aiwork\""));
+    }
+
+    #[test]
+    fn wb_codex_config_uses_wb_provider_id() {
+        let cfg = codex_settings_config(8899, "hy4", "", true);
+        let toml = cfg["config"].as_str().unwrap();
+        assert!(toml.contains("model_provider = \"aiwork-wb\""), "WB 侧 provider id 独立");
+        assert!(toml.contains("WorkBuddy 网关"));
+        assert!(!toml.contains("model_provider = \"aiwork\"\n"), "不得回落到 Trae 侧 provider id");
     }
 
     #[test]
