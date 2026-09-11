@@ -33,6 +33,8 @@ const RETRY_DELAYS: [u64; 2] = [30, 90];
 struct RoundOutcome {
     /// uid -> "success" | "already" | "fail"
     statuses: std::collections::HashMap<String, &'static str>,
+    /// uid -> 失败类型（Python 事件 error_type，如 "SessionDead"），重试筛选据此排除永久失效账号
+    error_types: std::collections::HashMap<String, String>,
 }
 
 /// 一轮签到的子进程句柄（含解密临时账号文件路径，消费结束后删除）
@@ -152,7 +154,18 @@ fn consume_round(app: &AppHandle, mut proc: RoundProc, log_path: &Path) -> Round
                                     _ => "fail",
                                 };
                                 if !uid.is_empty() {
-                                    outcome.statuses.insert(uid, st);
+                                    outcome.statuses.insert(uid.clone(), st);
+                                    // 保留失败类型供重试筛选：SessionDead（JWT 被服务端吊销）为
+                                    // 永久失效，重试必然再 401，不进重试轮白等 30+90s
+                                    if st == "fail" {
+                                        if let Some(et) = v.get("error_type").and_then(|x| x.as_str()) {
+                                            if !et.is_empty() {
+                                                outcome.error_types.insert(uid.clone(), et.to_string());
+                                            }
+                                        }
+                                    } else {
+                                        outcome.error_types.remove(&uid);
+                                    }
                                 }
                             }
                             let _ = app.emit("checkin-progress", &v);
@@ -331,6 +344,8 @@ fn run_checkin_worker(
         .map(|u| (u.clone(), "fail"))
         .collect();
     let outcome = consume_round(app, proc, &log_path);
+    // 跨轮失败类型登记（重试轮覆盖旧值），供重试筛选排除 SessionDead 等永久失效账号
+    let mut round_error_types: std::collections::HashMap<String, String> = outcome.error_types;
     for (uid, st) in outcome.statuses {
         final_status.insert(uid, st);
     }
@@ -341,6 +356,8 @@ fn run_checkin_worker(
         let mut failed_uids: Vec<String> = final_status
             .iter()
             .filter(|(_, st)| **st == "fail")
+            // SessionDead（JWT 被服务端吊销）为永久失效：重试必然再次 401，跳过以免白等
+            .filter(|(uid, _)| round_error_types.get(*uid).map(|e| e.as_str()) != Some("SessionDead"))
             .map(|(uid, _)| uid.clone())
             .collect();
         if failed_uids.is_empty() {
@@ -365,9 +382,15 @@ fn run_checkin_worker(
         match spawn_round(state, &failed_uids) {
             Ok(p) => {
                 let o = consume_round(app, p, &log_path);
-                // 重试轮结果覆盖对应 uid 的旧状态
+                // 重试轮结果覆盖对应 uid 的旧状态：非 fail 同步清除旧失败类型登记
                 for (uid, st) in o.statuses {
-                    final_status.insert(uid, st);
+                    final_status.insert(uid.clone(), st);
+                    if st != "fail" {
+                        round_error_types.remove(&uid);
+                    }
+                }
+                for (uid, et) in o.error_types {
+                    round_error_types.insert(uid, et);
                 }
             }
             Err(e) => {

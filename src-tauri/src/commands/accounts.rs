@@ -786,6 +786,59 @@ fn query_ent_packs(jwt: &str, dev: &DeviceEntry) -> Result<Vec<serde_json::Value
         .ok_or_else(|| "响应中缺少 user_entitlement_pack_list".to_string())
 }
 
+/// TRAE 切换/一键打开前预检：账号池中该 uid 的 JWT 在服务端是否仍有效。
+/// 背景（issue #9，2026-09-11 诊断）：TRAE 服务端会吊销 JWT（该账号在别处重新登录被顶替、
+/// IDE 内退出登录、风控等），本地快照文件完好但服务端已判死——切换恢复后 IDE 一联网即被
+/// 强制登出，表现为「切换成功但账号没变/未登录」。调签到 status 轻量只读接口探活：
+/// HTTP 401 判死 → 中止切换并给补救指引；无 JWT/网络故障/其他错误一律 fail-open 不阻断
+/// （与豆包 probe_slot_session_alive 策略对齐）。
+pub(crate) fn probe_trae_jwt_alive(state: &AppState, user_id: &str) -> Result<(), String> {
+    let accounts = crate::vault::load_accounts(state);
+    let Some(account) = accounts
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id))
+    else {
+        return Ok(()); // 账号池无此账号（纯快照场景）→ 不预检，交给快照管线
+    };
+    if account.jwt.trim().is_empty() {
+        return Ok(()); // 无 JWT 无法探活 → fail-open
+    }
+    // 预检专用短超时（15s）：网络故障时 fail-open 快速放行，不让用户点切换后白等
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let dev = resolve_device(state, user_id);
+    // 判死文案：name(user_id) 双标识——toast 面向用户用账号名可读，日志保留 uid 便于排查
+    let dead_msg = format!(
+        "账号 {}({}) 的 JWT 已被服务端吊销（常见原因：该账号在别处重新登录、在 IDE 内退出登录或触发风控），\
+         本地保存的登录态已失效，切换后必然未登录。请先在 TRAE 中重新登录该账号并「保存当前登录态」，\
+         或开启代理重新捕获 JWT 后再切换",
+        account.name, user_id
+    );
+    match ide_query_post(
+        &agent,
+        "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status",
+        &account.jwt,
+        &dev,
+        ureq::json!({}),
+    ) {
+        Ok(body) => {
+            // 不能仅凭 HTTP 200 判活：服务端对吊销 JWT 也可能回 200 + 顶层通用鉴权失败码 1001
+            // （docs/product-design.md 记录的形态；对齐 Python status_check 顶层取 code 的口径，
+            // 不用 dig 深挖以免误伤嵌套业务对象里的 code）。其余业务码（如 1005 套餐限额）
+            // 说明 JWT 鉴权仍通过 → 放行
+            if body.get("code").and_then(|v| v.as_i64()) == Some(1001) {
+                Err(dead_msg)
+            } else {
+                Ok(())
+            }
+        }
+        Err(e) if e.contains("status code 401") => Err(dead_msg),
+        Err(_) => Ok(()), // 网络故障/其他错误 fail-open，不阻断切换
+    }
+}
+
 /// 归一化积分包来源标签（明细悬浮展示用）
 ///
 /// 识别规则（按优先级）：

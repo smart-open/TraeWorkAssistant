@@ -942,6 +942,9 @@ function Backup-CurrentProfile {
 
 function Restore-Profile {
     param([string]$Slot)
+    # 恢复项计数（供 Switch 恢复后校验）：-1=未校验（chromium 布局有自己的完整性校验），
+    # icube 分支结尾写入实际恢复数；0 = 快照空/损坏
+    $Script:_LastRestoredCount = -1
     # P2：chromium 布局（豆包）走白名单目录级恢复
     if ($Script:SnapshotLayout -eq 'chromium') {
         Restore-ChromiumProfile -Slot $Slot
@@ -997,6 +1000,7 @@ function Restore-Profile {
     # 9. Session Storage\
     if (Test-Path "$src\Session Storage") { $target = "$dest\Session Storage"; if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }; Copy-Item "$src\Session Storage" $target -Recurse -Force -ErrorAction SilentlyContinue; $restored++ }
 
+    $Script:_LastRestoredCount = $restored
     Write-Step -Stage 'restore' -Message "已恢复账号 $Slot 的登录态 ($restored 项)" -Status 'ok'
 }
 
@@ -1035,6 +1039,27 @@ try {
             }
             # 恢复目标账号的登录态（含设备标识）
             Restore-Profile -Slot $UserId
+            # 恢复后校验（issue #9，仅 icube 布局）：①0 项恢复=快照空/损坏；②恢复后数据目录缺
+            # storage.json / state.vscdb = 快照不含关键登录态，或 TRAE 新版把登录态迁移到了白名单
+            # 之外（布局漂移）。两种情况启动 TRAE 都只会「切了个寂寞」——从 last 槽回滚到切换前
+            # 状态并重启，报 fatal 明示原因，避免用户面对静默无效的切换。
+            if ($Script:SnapshotLayout -eq 'icube') {
+                $missing = @()
+                if ($Script:_LastRestoredCount -le 0) {
+                    $missing += '（快照为空或损坏，0 项恢复）'
+                } else {
+                    foreach ($f in @('User\globalStorage\storage.json', 'User\globalStorage\state.vscdb')) {
+                        if (-not (Test-Path (Join-Path $Script:TraeDataDir $f))) { $missing += $f }
+                    }
+                }
+                if ($missing.Count -gt 0) {
+                    Write-Step -Stage 'restore' -Message "目标快照无效（$($missing -join '；')），正在从 last 槽回滚到切换前状态…" -Status 'warn'
+                    Restore-Profile -Slot 'last'
+                    Start-Trae
+                    Write-Step -Stage 'fatal' -Message "账号 $UserId 的快照无效（$($missing -join '；')），已回滚到切换前状态。请登录该账号后重新「保存当前登录态」；若重新保存后仍报此错，可能是 TRAE 新版登录态布局变化，请携带日志反馈" -Status 'error'
+                    exit 1
+                }
+            }
             # 记录当前账号 ID
             Set-CurrentAccount -AccountId $UserId
             Start-Trae

@@ -27,6 +27,8 @@ import {
   ScanSearch,
   Crown,
   Tags,
+  SquareTerminal,
+  AppWindow,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, EmptyState, Modal } from '../components/ui';
@@ -632,7 +634,9 @@ export default function Accounts() {
                             <Snowflake size={14} />
                           </button>
                         )}
-                        {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24) && (
+                        {/* SessionDead（JWT 被服务端吊销）时 exp 往往未到，必须常显续期入口，
+                            否则与签到/切换失败的「点续期 JWT」指引断链（issue #9 审查项） */}
+                        {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead') && (
                           <button
                             title="续期 JWT（启动代理并切换账号）"
                             onClick={() => void renewJwt(a.user_id)}
@@ -690,44 +694,54 @@ export default function Accounts() {
         )}
       </div>
 
-      {/* 应用选择下拉菜单：Portal + fixed 定位，避免被表格容器 overflow 裁剪或被后续行遮盖 */}
+      {/* 应用选择菜单：Portal + fixed 定位，避免被表格容器 overflow 裁剪或被后续行遮盖。
+          issue #9 反馈：原来的窄下拉两项太小易点错，改为左右两块大按钮（带图标+描述），
+          hover 用 amber 高亮让目标区域醒目不易误触 */}
       {appMenu &&
         !switchingTo &&
         !savingLogin &&
         createPortal(
           <div
-            className="fixed z-50 w-44 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 text-slate-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+            className="fixed z-50 w-[420px] overflow-hidden rounded-lg border border-slate-200 bg-white text-slate-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
             style={{
-              left: Math.max(8, appMenu.x - 176),
+              left: Math.max(8, appMenu.x - 420),
               top: (() => {
-                const MENU_H = 96;
+                const MENU_H = 150;
                 const below = appMenu.y + 4 + MENU_H;
                 return below > window.innerHeight ? appMenu.y - MENU_H - 8 : appMenu.y + 4;
               })(),
             }}
             onMouseLeave={() => setAppMenu(null)}
           >
-            <div className="px-3 py-1 text-[11px] font-semibold text-slate-400 dark:text-zinc-500">
+            <div className="px-4 pb-1 pt-3 text-[11px] font-semibold text-slate-400 dark:text-zinc-500">
               {appMenu.kind === 'switch' ? '切换此账号到…' : '保存当前登录态到…'}
             </div>
-            {([{ app: 'Trae', label: 'Trae', desc: 'Trae CN IDE' }, { app: 'TraeWork', label: 'Trae Work', desc: 'TRAE SOLO CN' }] as const).map((opt) => (
-              <button
-                key={opt.app}
-                onClick={() => {
-                  const { userId, kind } = appMenu;
-                  setAppMenu(null);
-                  if (kind === 'switch') {
-                    void switchTo(userId, opt.app);
-                  } else {
-                    void saveCurrentLogin(userId, opt.app);
-                  }
-                }}
-                className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs transition hover:bg-slate-100 dark:hover:bg-zinc-700"
-              >
-                <span className="font-medium">{opt.label}</span>
-                <span className="text-[10px] text-slate-400">{opt.desc}</span>
-              </button>
-            ))}
+            <div className="grid grid-cols-2 gap-2 p-3 pt-1.5">
+              {([
+                { app: 'Trae', label: 'Trae CN', desc: 'Trae CN IDE 客户端', Icon: SquareTerminal },
+                { app: 'TraeWork', label: 'TRAE SOLO CN', desc: 'Trae Work 桌面端', Icon: AppWindow },
+              ] as const).map((opt) => (
+                <button
+                  key={opt.app}
+                  onClick={() => {
+                    const { userId, kind } = appMenu;
+                    setAppMenu(null);
+                    if (kind === 'switch') {
+                      void switchTo(userId, opt.app);
+                    } else {
+                      void saveCurrentLogin(userId, opt.app);
+                    }
+                  }}
+                  className="group flex flex-col items-start gap-1 rounded-lg border border-slate-200 bg-white px-4 py-3 text-left transition hover:border-amber-400 hover:bg-amber-50 hover:shadow-sm dark:border-zinc-700 dark:bg-zinc-800 dark:hover:border-amber-500 dark:hover:bg-amber-500/10"
+                >
+                  <span className="flex items-center gap-2 text-sm font-semibold">
+                    <opt.Icon size={16} className="text-slate-500 transition group-hover:text-amber-500 dark:text-zinc-400" />
+                    {opt.label}
+                  </span>
+                  <span className="text-[11px] text-slate-400 dark:text-zinc-500">{opt.desc}</span>
+                </button>
+              ))}
+            </div>
           </div>,
           document.body,
         )}

@@ -164,8 +164,17 @@ export const api = {
       invoke('write_text_file', { path, content }),
     readTextFile: (path: string) => invoke<string>('read_text_file', { path }),
   },
-  switchAccount: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
-    invoke('switch_account', { userId, targetApp: targetApp ?? null }),
+  switchAccount: (
+    userId: string,
+    targetApp?: 'TraeWork' | 'Trae' | 'Doubao',
+    skipJwtProbe?: boolean,
+  ) =>
+    invoke('switch_account', {
+      userId,
+      targetApp: targetApp ?? null,
+      // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
+      skipJwtProbe: skipJwtProbe ?? false,
+    }),
   saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>

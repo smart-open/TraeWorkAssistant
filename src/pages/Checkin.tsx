@@ -377,10 +377,13 @@ export default function Checkin() {
                   <Icon size={14} className={tone} />
                   <span className="w-8 text-right text-xs text-slate-400">{r.index}</span>
                   <span className="flex-1 truncate">{r.name}</span>
-                  <span className={`text-xs ${tone}`}>
+                  <span className={`text-xs ${tone}`} title={r.message ?? undefined}>
                     {r.status === 'success' && `积分+${r.delta ?? 0}`}
                     {r.status === 'already' && `积分+${r.credits ?? 0}`}
-                    {r.status === 'fail' && (r.message ?? '失败')}
+                    {r.status === 'fail' &&
+                      (r.error_type === 'SessionDead'
+                        ? 'JWT 已被服务端吊销，请重新登录该账号并保存'
+                        : (r.message ?? '失败'))}
                   </span>
                   {r.error_type && (
                     <span className="text-xs text-amber-500">

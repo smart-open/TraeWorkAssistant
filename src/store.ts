@@ -373,6 +373,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
     if (e.type === 'done') {
       void get().refreshAccounts();
+      // JWT 吊销类失败的精确提示（issue #9）：401=服务端已吊销 JWT，重新登录+保存即可恢复，
+      // 不再让用户面对笼统的「失败 N」自己摸索原因
+      const deadCount = get().checkin.results.filter(
+        (r) => r?.status === 'fail' && r.error_type === 'SessionDead',
+      ).length;
       // 签到完成后静默刷新剩余积分（内部会再次 refreshAccounts）
       void api.accounts.refreshRemainingCredits().then(() => {
         get().refreshAccounts();
@@ -385,6 +390,12 @@ export const useAppStore = create<AppState>((set, get) => ({
           ? '没有需要签到的账号（全部已签/过期/冷却中）'
           : `签到完成：成功 ${e.ok}，已签 ${e.already}，失败 ${e.failed}`,
       );
+      if (deadCount > 0) {
+        get().pushToast(
+          'error',
+          `${deadCount} 个账号 JWT 已被服务端吊销（该账号在别处重新登录/IDE 内退出过登录）：请在 TRAE 中重新登录该账号并「保存当前登录态」，再点「续期 JWT」重新捕获`,
+        );
+      }
     }
   },
 
@@ -683,8 +694,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         await get().startProxy();
       }
       // 切换到目标账号，TRAE 重启后走代理，新 JWT 会被自动捕获
+      // skipJwtProbe=true：续期场景目标账号 JWT 本就可能已被服务端吊销，跳过切换前预检
       get().pushToast('info', '正在切换账号以捕获新 JWT，请稍候…');
-      await api.switchAccount(userId);
+      await api.switchAccount(userId, undefined, true);
     } catch (err) {
       get().pushToast('error', `续期失败：${String(err)}`);
     }
