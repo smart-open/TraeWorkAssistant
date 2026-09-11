@@ -37,6 +37,12 @@
 - **性能**：wb_model_route 通配零正则依赖、DDG 解析字符串定位无 HTML 解析器分配放大。
 - **审查后校验基线**：cargo **137/137**（+2 回归单测）、vitest 18/18、npm build、py_compile 全绿、零编译告警。
 
+### UI 布局全面审查与美化（commit f48bd95）
+
+- **Buddy 顶栏上下文修复**：TopBar 原仅双分支（doubao/Trae），Buddy 工作区误显示 Trae 安装状态与代理按钮——新增 `BuddyTopBar`（客户端安装/运行/登录态/账号池徽标 + 打开客户端），三应用各自上下文独立。
+- **全局微交互统一**：`index.css` 新增 `.row-hover`/`.card-hover` 组件类；六个数据表行 hover 补齐（原仅 Logs 有，Accounts 主表/Credits/DoubaoAccounts/BuddyAccounts/ApiService 子Key/Checkin 均无）；`::selection` 主题中性选区色；`focus-visible` 键盘焦点环（a11y，鼠标点击不打扰）。
+- **可点击指标卡反馈**：BuddyOverview 两处包 StatCard 的跳转按钮补 cursor+上浮+阴影悬浮反馈。
+
 ---
 
 ## [未发布] · feature/buddy §2.2 非功能需求补齐 + 批次 1-4 九大类黑盒审查修复
