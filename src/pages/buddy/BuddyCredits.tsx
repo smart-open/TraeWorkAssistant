@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+﻿import { useCallback, useEffect, useState } from 'react';
 import {
   LineChart,
   Line,
@@ -78,7 +78,7 @@ export default function BuddyCredits() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="WorkBuddy · 积分看板"
+        title="Buddy · 积分看板"
         desc="积分余额 · 积分明细 · 到期日历"
         actions={
           <>

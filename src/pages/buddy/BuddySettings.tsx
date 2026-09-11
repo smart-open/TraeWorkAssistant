@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+﻿import { useCallback, useEffect, useState } from 'react';
 import { Save, FolderOpen, RefreshCw, TerminalSquare, Play, CalendarClock, MousePointerClick } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import { localDataDir } from '@tauri-apps/api/path';
@@ -430,7 +430,7 @@ export default function BuddySettings() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="WorkBuddy · 环境配置"
+        title="Buddy · 环境配置"
         desc="客户端环境 · 签到配置 · 通知与轮换"
         actions={
           <>

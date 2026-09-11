@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+﻿import { useEffect, useState, useCallback, useRef } from 'react';
 import { RefreshCw, Search, Trash2, Copy, ChevronLeft, ChevronRight, Eye, Eraser, Bug, FileText, X } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, Modal } from '../components/ui';
@@ -705,7 +705,7 @@ export default function Logs({ embedded = false }: { embedded?: boolean }) {
     <div className="flex h-full animate-fade-in flex-col">
       {!embedded && (
         <PageHeader
-          title="系统日志"
+          title="Trae · 系统日志"
           desc="查看运行日志、代理请求日志与 API 请求日志"
         />
       )}

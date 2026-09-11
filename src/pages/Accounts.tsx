@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Plus,
@@ -460,7 +460,7 @@ export default function Accounts() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="账号管理"
+        title="Trae · 账号管理"
         desc="维护账号、调整分组、重置设备 ID 与登录态切换"
         leftExtra={
           <button

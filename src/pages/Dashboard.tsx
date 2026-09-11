@@ -1,4 +1,4 @@
-import { useMemo, useEffect, useState } from 'react';
+﻿import { useMemo, useEffect, useState } from 'react';
 import {
   BarChart,
   Bar,
@@ -134,7 +134,7 @@ export default function Dashboard() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="概览"
+        title="Trae · 概览"
         desc="多账号签到与账号管理一站式工作台 · 一眼掌握状态与快捷入口"
         actions={
           <button onClick={refresh} className="btn-outline">

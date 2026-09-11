@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+﻿import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { PlayCircle, Sparkles } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
@@ -190,7 +190,7 @@ export default function BuddyCheckin() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="WorkBuddy · 签到与成长"
+        title="Buddy · 签到与成长"
         desc="一键签到 · 成长中心 · 定时任务见环境配置"
         actions={
           <button className="btn-primary" onClick={() => void startCheckin()} disabled={running}>

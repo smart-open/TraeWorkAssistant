@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from 'react';
+﻿import { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   Play,
   Square,
@@ -16,6 +16,7 @@ import {
   Plus,
   Trash2,
   Power,
+  Plug,
 } from 'lucide-react';
 import {
   Bar,
@@ -561,7 +562,7 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
   return (
     <div>
       <PageHeader
-        title="API 服务"
+        title="Trae · API 服务"
         desc="OpenAI / Anthropic 兼容接口，通过账号池轮转实现多账号负载均衡（消耗通用积分）"
         actions={
           running ? (
@@ -706,41 +707,6 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
               </p>
             </div>
 
-            {/* T5.7 生态接入：CC Switch 协同（WB 模型目录同步已迁至 Buddy「API 服务」页） */}
-            <div className="rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
-              <p className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-400">
-                生态接入
-              </p>
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  className="btn-ghost !p-2 text-xs"
-                  onClick={() => void registerCcSwitch('claude')}
-                  disabled={ccBusy !== null}
-                  title="把网关 Anthropic 端点（/v1/messages）注册进 CC Switch（Trae 侧条目「AI Work 助手网关」），由 CC Switch 负责切换"
-                >
-                  注册到 CC Switch（Claude Code）
-                </button>
-                <button
-                  className="btn-ghost !p-2 text-xs"
-                  onClick={() => void registerCcSwitch('codex')}
-                  disabled={ccBusy !== null}
-                  title="把网关 Responses 端点（/v1/responses）注册进 CC Switch（Trae 侧条目「AI Work 助手网关」），由 CC Switch 负责切换"
-                >
-                  注册到 CC Switch（Codex）
-                </button>
-              </div>
-              {ecoNote && (
-                <p className="mt-2 break-all text-[11px] leading-4 text-slate-500 dark:text-zinc-400">
-                  {ecoNote}
-                </p>
-              )}
-              <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
-                CC Switch 注册会先整库备份至 ~/.cc-switch/backups/，仅写入本网关条目、不改其它
-                provider；写入后需重启 CC Switch 生效。此处注册的是 Trae 模型网关条目（默认模型 glm-5.3），
-                WB 上游的 CC Switch 条目在 Buddy「API 服务」页注册，互不覆盖。
-              </p>
-            </div>
-
             <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
               <div className="mb-2 flex items-center justify-between">
                 <p className="font-medium">使用方式 & 配置示例</p>
@@ -793,6 +759,42 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
               {saving ? '保存中…' : '保存配置'}
             </button>
           </div>
+        </div>
+
+        {/* T5.7 生态接入：CC Switch 协同（独立面板，结构对齐 Buddy「API 服务」页） */}
+        <div className="mt-5 card p-5">
+          <div className="mb-2 flex items-center gap-2">
+            <Plug size={16} className="text-emerald-500" />
+            <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">生态接入</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              className="btn-outline !py-1.5 text-xs"
+              onClick={() => void registerCcSwitch('claude')}
+              disabled={ccBusy !== null}
+              title="把网关 Anthropic 端点（/v1/messages）注册进 CC Switch（Trae 侧条目「AI Work 助手网关」），由 CC Switch 负责切换"
+            >
+              注册到 CC Switch（Claude Code）
+            </button>
+            <button
+              className="btn-outline !py-1.5 text-xs"
+              onClick={() => void registerCcSwitch('codex')}
+              disabled={ccBusy !== null}
+              title="把网关 Responses 端点（/v1/responses）注册进 CC Switch（Trae 侧条目「AI Work 助手网关」），由 CC Switch 负责切换"
+            >
+              注册到 CC Switch（Codex）
+            </button>
+          </div>
+          {ecoNote && (
+            <p className="mt-2 break-all text-[11px] leading-4 text-slate-500 dark:text-zinc-400">
+              {ecoNote}
+            </p>
+          )}
+          <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
+            CC Switch 注册会先整库备份至 ~/.cc-switch/backups/，仅写入本网关条目、不改其它
+            provider；写入后需重启 CC Switch 生效。此处注册的是 Trae 模型网关条目（默认模型 glm-5.3），
+            WB 上游的 CC Switch 条目在 Buddy「API 服务」页注册，互不覆盖。
+          </p>
         </div>
 
         {/* 账号池卡片 */}

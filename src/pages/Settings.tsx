@@ -169,7 +169,7 @@ export default function Settings() {
   if (!form) {
     return (
       <div className="animate-fade-in">
-        <PageHeader title="环境配置" />
+        <PageHeader title="Trae · 环境配置" />
         <div className="text-sm text-slate-500">加载中…</div>
       </div>
     );
@@ -178,7 +178,7 @@ export default function Settings() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="环境配置"
+        title="Trae · 环境配置"
         desc="应用安装路径、签到行为、定时任务与设备标识"
         actions={
           dirty ? (

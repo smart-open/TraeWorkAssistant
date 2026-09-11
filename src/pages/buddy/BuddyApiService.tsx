@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+﻿import { useCallback, useEffect, useMemo, useState } from 'react';
 import { RefreshCw, Play, Square, Save, Copy, Coins, TerminalSquare, Plug, BarChart3 } from 'lucide-react';
 import {
   Bar,
@@ -280,7 +280,7 @@ curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="WorkBuddy · API 服务"
+        title="Buddy · API 服务"
         desc="WB 积分转标准 API · 网关 WB 上游管理"
         actions={
           <>

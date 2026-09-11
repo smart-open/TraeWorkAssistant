@@ -1,4 +1,4 @@
-import { useMemo, useState, useCallback } from 'react';
+﻿import { useMemo, useState, useCallback } from 'react';
 import {
   LineChart,
   Line,
@@ -154,7 +154,7 @@ export default function Credits() {
     <div className="animate-fade-in">
       <div className="flex items-center justify-between">
         <PageHeader
-          title="积分看板"
+          title="Trae · 积分看板"
           desc="查看每个账号的积分余额与趋势"
         />
         <button

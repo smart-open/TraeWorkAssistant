@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+﻿import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   RefreshCw,
   Download,
@@ -384,7 +384,7 @@ export default function BuddyAccounts() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="WorkBuddy · 账号管理"
+        title="Buddy · 账号管理"
         desc="多账号入池 · 切换登录 · 凭证续期"
         actions={
           <>

@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from 'react';
+﻿import { useMemo, useState, useEffect } from 'react';
 import { PlayCircle, CheckCircle2, XCircle, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw, Users } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
@@ -136,7 +136,7 @@ export default function Checkin() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="一键签到"
+        title="Trae · 一键签到"
         desc="按账号范围与跳过规则发起批量签到，实时查看进度"
       />
 

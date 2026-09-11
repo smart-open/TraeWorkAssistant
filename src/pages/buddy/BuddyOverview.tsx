@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+﻿import { useEffect, useMemo, useState } from 'react';
 import { RefreshCw, ExternalLink, CheckCircle2, Circle, ChevronRight, Coins } from 'lucide-react';
 import {
   BarChart,
@@ -184,7 +184,7 @@ export default function BuddyOverview() {
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="WorkBuddy · 概述"
+        title="Buddy · 概述"
         desc="WorkBuddy / CodeBuddy 多账号管理 · 切换 / 续期 / 签到 / 积分"
         actions={
           <>
