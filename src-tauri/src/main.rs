@@ -152,6 +152,7 @@ fn main() {
             commands::api_server::api_keys_list,
             commands::api_server::api_keys_save,
             commands::api_server::api_wb_catalog_sync,
+            commands::api_server::api_wb_catalog_list,
             commands::ccswitch::ccswitch_status,
             commands::ccswitch::ccswitch_register,
             commands::profile::profile_list,

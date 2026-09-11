@@ -61,6 +61,7 @@ import type {
   WbUsageFallback,
   WbActivityInfo,
   WbPoolImportResult,
+  WbModelInfo,
 } from '../types';
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
@@ -385,6 +386,8 @@ export const api = {
     modelsSync: () => invoke<ModelOption[]>('api_models_sync'),
     // T5.1/F-37：WB 上游模型目录动态替换（手动触发；网关启动时已自动做一次）
     wbCatalogSync: () => invoke<number>('api_wb_catalog_sync'),
+    // WB 目录模型列表（Buddy API 服务页展示）
+    wbCatalogList: () => invoke<WbModelInfo[]>('api_wb_catalog_list'),
     // T5.7/F-43：CC Switch 协同（注册网关 provider 条目，不自建切换器）
     ccSwitchStatus: () => invoke<CcSwitchStatus>('ccswitch_status'),
     ccSwitchRegister: (appType: 'claude' | 'codex', apiKey?: string, model?: string) =>

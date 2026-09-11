@@ -19,6 +19,7 @@ import BuddyOverview from './pages/buddy/BuddyOverview';
 import BuddyAccounts from './pages/buddy/BuddyAccounts';
 import BuddyCheckin from './pages/buddy/BuddyCheckin';
 import BuddyCredits from './pages/buddy/BuddyCredits';
+import BuddyApiService from './pages/buddy/BuddyApiService';
 import BuddySettings from './pages/buddy/BuddySettings';
 
 function renderView(view: string) {
@@ -51,6 +52,8 @@ function renderView(view: string) {
       return <BuddyCheckin />;
     case 'buddy-credits':
       return <BuddyCredits />;
+    case 'buddy-api-service':
+      return <BuddyApiService />;
     case 'buddy-settings':
       return <BuddySettings />;
     default:

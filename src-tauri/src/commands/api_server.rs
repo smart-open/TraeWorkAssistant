@@ -517,6 +517,12 @@ pub async fn api_wb_catalog_sync(state: State<'_, AppState>) -> Result<usize, St
     .map_err(|e| format!("同步任务执行失败: {e}"))?
 }
 
+/// 列出 wb_model_catalog.json 中的 WB 模型（Buddy API 服务页展示模型 id/倍率/档位）
+#[tauri::command]
+pub fn api_wb_catalog_list(state: State<'_, AppState>) -> Vec<crate::api_server::wb_catalog::WbModel> {
+    crate::api_server::wb_catalog::load(&state.data_dir)
+}
+
 /// 查询最近 N 天的 API 用量统计（按日聚合，直接读盘，服务未运行也可查）
 #[tauri::command]
 pub fn api_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {

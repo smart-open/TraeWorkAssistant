@@ -18,6 +18,7 @@ export type ViewKey =
   | 'buddy-accounts'
   | 'buddy-checkin'
   | 'buddy-credits'
+  | 'buddy-api-service'
   | 'buddy-settings';
 
 /** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy 批次1接入 / 豆包 接入中 */
@@ -858,4 +859,16 @@ export interface WbCheckinRecord {
   name: string;
   status: string;
   message: string;
+}
+
+/** WB 上游模型目录条目（Rust wb_catalog::WbModel，snake_case 对齐） */
+export interface WbModelInfo {
+  id: string;
+  display: string;
+  context_length: number;
+  max_tokens: number;
+  supports_image: boolean;
+  supported_efforts: string[];
+  effort_override: string | null;
+  rate: number;
 }
