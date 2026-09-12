@@ -111,12 +111,11 @@ pub fn profile_backup(
     user_id: String,
     target_app: Option<String>,
 ) -> Result<(), String> {
+    // uid 直接作为快照槽目录名传给 PS 桥，先做防路径注入校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let target = normalize_target_app(target_app.as_deref());
-    let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
-        PathBuf::from(r).join("ps")
-    } else {
-        state.python_dir.join("../ps")
-    };
+    // 复用全局解析（便携模式 TAURI_RESOURCE_DIR / 默认资源目录），与 switch.rs 同源
+    let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
     if !bridge.exists() {
         return Err(format!("找不到切换脚本: {}", bridge.display()));
@@ -226,13 +225,12 @@ pub fn profile_restore(
     if !slot_dir.exists() {
         return Err(format!("账号 {} 的登录态快照不存在", user_id));
     }
+    // uid 直接作为快照槽目录名传给 PS 桥，先做防路径注入校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let target = normalize_target_app(target_app.as_deref());
 
-    let ps_dir = if let Ok(r) = std::env::var("TAURI_RESOURCE_DIR") {
-        PathBuf::from(r).join("ps")
-    } else {
-        state.python_dir.join("../ps")
-    };
+    // 复用全局解析（便携模式 TAURI_RESOURCE_DIR / 默认资源目录），与 switch.rs 同源
+    let ps_dir = crate::state::resolve_ps_dir();
     let bridge = ps_dir.join("trae-switch-bridge.ps1");
     if !bridge.exists() {
         return Err(format!("找不到切换脚本: {}", bridge.display()));
@@ -334,6 +332,8 @@ pub fn profile_delete(
     user_id: String,
     target_app: Option<String>,
 ) -> Result<(), String> {
+    // uid 直接拼进 profiles 根目录路径且本命令整目录删除（remove_dir_all），必须先校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let slot_dir = profiles_dir(&state, target_app.as_deref()).join(&user_id);
     if !slot_dir.exists() {
         return Ok(()); // 不存在视为已删除

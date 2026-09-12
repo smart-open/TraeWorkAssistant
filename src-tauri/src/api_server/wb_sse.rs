@@ -172,21 +172,25 @@ fn responses_object(id: &str, model: &str, status: &str, output: Vec<Value>, usa
     obj
 }
 
-/// 流式转发：WB SSE → 客户端协议帧
+/// 流式转发：WB SSE → 客户端协议帧（扩展返回）
 ///
-/// 返回 (流内错误, 是否已发送过数据, usage)。错误在「尚未发送任何数据」时
-/// 不下发（留给调用方故障转移），与 sse.rs 同一语义。
+/// 返回 (流内错误, 是否已发送过数据, 流内失败已就地下发, usage)：
+/// - error_info：尚未向下游发送任何数据时捕获的流内错误（调用方据此换号重试）；
+/// - failed_inline：流内失败事件（response.failed / error 帧）已就地透传客户端——
+///   调用方不得再按成功收尾（不记成功、不清冷却、不绑定粘性），也不应重试
+///   （错误已原样给到客户端，重试会造成重复流）。
 // 宏内末次赋值（text_block_open）在收尾路径后不再读取，属预期行为（对齐 sse.rs）
 #[allow(unused_assignments)]
-pub fn stream_forward<L: Iterator<Item = String>>(
+pub fn stream_forward_ex<L: Iterator<Item = String>>(
     lines: L,
     tx: &Sender,
     proto: crate::api_server::routes::Protocol,
     chat_id: &str,
     model: &str,
-) -> (Option<(i64, String)>, bool, Option<Value>) {
+) -> (Option<(i64, String)>, bool, bool, Option<Value>) {
     let mut parser = WbSseParser::new(lines);
     let mut sent_any = false;
+    let mut failed_inline = false;
     let mut usage: Option<Value> = None;
     let mut error_info: Option<(i64, String)> = None;
 
@@ -295,14 +299,13 @@ pub fn stream_forward<L: Iterator<Item = String>>(
                             json!({
                                 "type":"message_delta",
                                 "delta":{"stop_reason":"end_turn","stop_sequence":null},
-                                "usage":{"output_tokens":ot},
+                                "usage":{"input_tokens":it,"output_tokens":ot},
                             })
                         ))));
                         let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
                             "event: message_stop\ndata: {}\n\n",
                             json!({"type":"message_stop"})
                         ))));
-                        let _ = (it, ot);
                     }
                     crate::api_server::routes::Protocol::Responses => {
                         // 未产出任何 chunk 也补 created，保证事件序列完整
@@ -375,7 +378,7 @@ pub fn stream_forward<L: Iterator<Item = String>>(
             }
             Some(WbEvent::Error { code, msg }) => {
                 if sent_any {
-                    // 已有数据流出：就地透传错误并收尾
+                    // 已有数据流出：就地透传错误并收尾（failed_inline 标记给调用方）
                     match proto {
                         crate::api_server::routes::Protocol::Anthropic => {
                             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
@@ -398,6 +401,7 @@ pub fn stream_forward<L: Iterator<Item = String>>(
                         }
                     }
                     sent_any = true;
+                    failed_inline = true;
                 } else {
                     error_info = Some((code, msg));
                 }
@@ -599,8 +603,23 @@ pub fn stream_forward<L: Iterator<Item = String>>(
         }
     }
 
-    // 上游断流：error_info / sent_any 状态交由上层判定（故障转移或已收尾）
+    // 上游断流：error_info / sent_any / failed_inline 状态交由上层判定
+    // （故障转移，或流内失败已收尾）
 
+    (error_info, sent_any, failed_inline, usage)
+}
+
+/// 兼容封装：旧三元组返回（既有调用方不感知流内失败标记；
+/// 新调用方请用 stream_forward_ex）
+pub fn stream_forward<L: Iterator<Item = String>>(
+    lines: L,
+    tx: &Sender,
+    proto: crate::api_server::routes::Protocol,
+    chat_id: &str,
+    model: &str,
+) -> (Option<(i64, String)>, bool, Option<Value>) {
+    let (error_info, sent_any, _failed_inline, usage) =
+        stream_forward_ex(lines, tx, proto, chat_id, model);
     (error_info, sent_any, usage)
 }
 
@@ -930,7 +949,8 @@ mod tests {
     }
 
     /// 回归（F-40 审查修复）：文本已流出后遇错误帧 → created 已发即 sent_any=true，
-    /// 错误就地 response.failed，不返回 error_info（否则上层换号重试会造成重复流）
+    /// 错误就地 response.failed，不返回 error_info（否则上层换号重试会造成重复流）；
+    /// failed_inline=true 供调用方跳过成功收尾（不记成功/不清冷却/不绑粘性）
     #[test]
     fn stream_forward_responses_instream_error_after_content_fails_inplace() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
@@ -940,10 +960,11 @@ mod tests {
             "data: {\"error\":{\"message\":\"中途失败\",\"code\":1001}}",
             "",
         ]);
-        let (err, sent_any, _usage) =
-            stream_forward(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m");
+        let (err, sent_any, failed_inline, _usage) =
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m");
         assert!(err.is_none(), "流内错误已就地下发，不得上抛触发换号重试");
         assert!(sent_any);
+        assert!(failed_inline, "流内失败必须以 failed_inline 上报调用方");
         drop(tx);
         let mut body = String::new();
         while let Ok(frame) = rx.try_recv() {
@@ -952,5 +973,102 @@ mod tests {
         assert!(body.contains("event: response.created"));
         assert!(body.contains("event: response.failed"));
         assert!(body.contains("中途失败"));
+    }
+
+    /// 正常完成流：failed_inline 必须为 false（不得误报流内失败）
+    #[test]
+    fn stream_forward_success_reports_no_inline_failure() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, failed_inline, usage) =
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_2", "m");
+        assert!(err.is_none());
+        assert!(sent_any);
+        assert!(!failed_inline);
+        assert!(usage.is_none(), "上游未下发 usage 时不得伪造");
+    }
+
+    /// 流内失败标记对 Anthropic 协议同样生效（event: error 就地下发）
+    #[test]
+    fn stream_forward_anthropic_instream_error_marks_failed_inline() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"部分\"}}]}",
+            "",
+            "data: {\"error\":{\"message\":\"中途失败\",\"code\":7}}",
+            "",
+        ]);
+        let (err, _sent_any, failed_inline, _usage) =
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_3", "m");
+        assert!(err.is_none());
+        assert!(failed_inline);
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(body.contains("event: error"));
+    }
+
+    /// 流开始前遇错误：错误上抛（error_info）、无 failed_inline（调用方换号重试）
+    #[test]
+    fn stream_forward_error_before_stream_uplifts() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]);
+        let (err, sent_any, failed_inline, _usage) =
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m");
+        assert_eq!(err.unwrap(), (9, "boom".to_string()));
+        assert!(!sent_any);
+        assert!(!failed_inline);
+    }
+
+    /// Anthropic message_delta 的 usage 附带 input_tokens（上游已知时）
+    #[test]
+    fn anthropic_message_delta_includes_input_tokens_when_known() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}",
+            "",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, failed_inline, _u) =
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_4", "m");
+        assert!(err.is_none() && sent_any && !failed_inline);
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        let md = body.split("event: message_delta").nth(1).unwrap_or("");
+        assert!(md.contains("\"input_tokens\":7"), "message_delta 需携带 input_tokens: {md}");
+        assert!(md.contains("\"output_tokens\":3"));
+    }
+
+    /// 上游未下发 usage 时 message_delta 的 input_tokens 保持 0
+    #[test]
+    fn anthropic_message_delta_input_tokens_zero_when_unknown() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let _ = stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_5", "m");
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        let md = body.split("event: message_delta").nth(1).unwrap_or("");
+        assert!(md.contains("\"input_tokens\":0"));
     }
 }

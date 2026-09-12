@@ -318,7 +318,9 @@ export default function Checkin() {
                 )
               ) : null}
               {checkin.done && checkin.done.failed > 0 ? (
-                <span className="text-xs text-slate-400">失败账号已自动重试 2 轮</span>
+                <span className="text-xs text-slate-400">
+                  失败账号已自动重试 {settings?.retry ?? 1} 轮
+                </span>
               ) : null}
             </div>
           </div>

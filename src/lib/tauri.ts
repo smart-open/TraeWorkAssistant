@@ -118,8 +118,10 @@ export const api = {
     importPreview: (content: string) => invoke<ImportPreview>('accounts_import_preview', { content }),
     // F-08 双应用账号自动发现
     discover: () => invoke<DiscoveredAccount[]>('apps_accounts_discover'),
-    addDiscovered: (userId: string, name: string, app: string, dcUid?: string | null) =>
-      invoke('apps_account_add', { userId, name, app, dcId: dcUid ?? null }),
+    addDiscovered: (userId: string, name: string, app: string, dcUid?: string | null, uidConfident?: boolean) =>
+      invoke('apps_account_add', { userId, name, app, dcId: dcUid ?? null, uidConfident: uidConfident ?? null }),
+    // 按需取完整 JWT（列表接口只回掩码值；弹窗/复制场景调用）
+    getJwt: (userId: string) => invoke<string>('account_get_jwt', { userId }),
     // 会员/套餐信息
     refreshPayStatus: () => invoke<number>('refresh_pay_status'),
   },
@@ -265,6 +267,12 @@ export const api = {
     taskUnregister: () => invoke('doubao_renew_task_unregister'),
     // ---- 会员额度 ----
     fetchQuota: (userId: string) => invoke<DoubaoQuotaResult>('doubao_quota_fetch', { userId }),
+    // 按需取完整会话凭证（列表接口只回掩码值；编辑弹框回填场景调用）
+    getCredential: (userId: string) =>
+      invoke<{ session_id: string | null; sid_guard: string | null; ttwid: string | null }>(
+        'doubao_account_get_credential',
+        { userId },
+      ),
   },
   // ---- WorkBuddy（批次1；Rust workbuddy.rs；字段名严格 snake_case）----
   workbuddy: {
@@ -350,7 +358,8 @@ export const api = {
     stop: () => invoke('api_server_stop'),
     status: () => invoke<ApiServiceStatus>('api_server_status'),
     poolList: () => invoke<ApiPoolFile>('pool_list'),
-    // T10：池设置扩展调度策略与分组筛选；T5.2/T5.3/T5.5/T5.6③ 扩展 WB 开关组
+    // T10：池设置扩展调度策略与分组筛选；T5.2/T5.3/T5.5/T5.6③ 扩展 WB 开关组；
+    // 任务7：wbStrategy 为 Buddy 池独立策略（空串 = 跟随 Trae 池策略）
     poolSet: (
       uids: string[],
       strategy?: string,
@@ -361,6 +370,7 @@ export const api = {
         wbToolExec?: boolean;
         wbBgDowngrade?: boolean;
       },
+      wbStrategy?: string,
     ) =>
       invoke('pool_set', {
         uids,
@@ -370,6 +380,7 @@ export const api = {
         wbDefaultThinking: wbFlags?.wbDefaultThinking ?? null,
         wbToolExec: wbFlags?.wbToolExec ?? null,
         wbBgDowngrade: wbFlags?.wbBgDowngrade ?? null,
+        wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
     logsList: () => invoke<string[]>('api_logs_list'),

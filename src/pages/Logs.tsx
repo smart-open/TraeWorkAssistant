@@ -39,6 +39,8 @@ function SystemLogsTab() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [clearConfirm, setClearConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
+  // 自动刷新轮询读取的关键字快照：输入经 onSearch/回车确认后才生效，避免每键重建 interval
+  const kwRef = useRef('');
 
   useEffect(() => {
     void refreshLogs({ logType: type, date: date || undefined }, true);
@@ -47,12 +49,13 @@ function SystemLogsTab() {
   useEffect(() => {
     if (!autoRefresh) return;
     const id = setInterval(() => {
-      void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined });
+      void refreshLogs({ logType: type, date: date || undefined, keyword: kwRef.current || undefined });
     }, 2000);
     return () => clearInterval(id);
-  }, [autoRefresh, type, date, kw, refreshLogs]);
+  }, [autoRefresh, type, date, refreshLogs]);
 
   const onSearch = () => {
+    kwRef.current = kw;
     void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined }, true);
   };
 
@@ -94,6 +97,7 @@ function SystemLogsTab() {
       const removed = await api.misc.logsClear(type);
       toast('success', `日志已清理（删除 ${removed} 个文件）`);
       setClearConfirm(false);
+      kwRef.current = kw;
       void refreshLogs({ logType: type, date: date || undefined, keyword: kw || undefined });
     } catch (e) {
       toast('error', `清理日志失败：${String(e)}`);
@@ -444,6 +448,9 @@ function ProxyLogsTab() {
 
 // ======================== API 请求日志 Tab ========================
 
+/** 整日日志内容渲染软上限：超过时截断展示，避免超大 <pre> 卡死主线程 */
+const MAX_API_LOG_CHARS = 200_000;
+
 function ApiLogsTab() {
   const toast = useAppStore((s) => s.pushToast);
 
@@ -461,12 +468,16 @@ function ApiLogsTab() {
   const [searching, setSearching] = useState(false);
   const [filtered, setFiltered] = useState(false);
 
+  // 当前选中日期的 ref：loadDates 不再依赖 selected 状态，避免 selected 变化导致 effect 二次拉取
+  const selectedRef = useRef('');
+
   const loadDates = useCallback(async () => {
     setRefreshing(true);
     try {
       const d = await withMinDelay(api.apiServer.logsList());
       setDates(d);
-      if (d.length > 0 && !selected) {
+      if (d.length > 0 && !selectedRef.current) {
+        selectedRef.current = d[0];
         setSelected(d[0]);
         void loadDetail(d[0]);
       }
@@ -475,10 +486,12 @@ function ApiLogsTab() {
     } finally {
       setRefreshing(false);
     }
-  }, [selected]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const loadDetail = useCallback(async (date: string) => {
     setLoading(true);
+    selectedRef.current = date;
     setSelected(date);
     setFiltered(false);
     setKw('');
@@ -682,9 +695,16 @@ function ApiLogsTab() {
               {loading || searching ? (
                 <p className="py-4 text-center text-sm text-slate-400">{searching ? '搜索中…' : '加载中…'}</p>
               ) : content ? (
-                <pre className="whitespace-pre-wrap break-all font-mono text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-                  {content}
-                </pre>
+                <>
+                  {content.length > MAX_API_LOG_CHARS && (
+                    <p className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
+                      日志过长（共 {content.length.toLocaleString()} 字符），仅显示前 200,000 字符。请用关键字 / 时间段过滤缩小范围。
+                    </p>
+                  )}
+                  <pre className="whitespace-pre-wrap break-all font-mono text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+                    {content.length > MAX_API_LOG_CHARS ? content.slice(0, MAX_API_LOG_CHARS) : content}
+                  </pre>
+                </>
               ) : (
                 <p className="py-4 text-center text-sm text-slate-400">无内容</p>
               )}

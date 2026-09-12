@@ -615,7 +615,6 @@ mod tests {
             wb_bg_downgrade: AtomicBool::new(false),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(HashMap::new()),
-            wb_template_cache: std::sync::Mutex::new(None),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
             total_requests: std::sync::atomic::AtomicU64::new(0),

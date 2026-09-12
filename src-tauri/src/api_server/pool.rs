@@ -38,6 +38,16 @@ impl PoolStrategy {
         }
     }
 
+    /// Buddy 池生效策略：wb_strategy 独立配置优先；空 = 跟随 Trae 池策略。
+    /// 启动（api_server_start）与热应用（pool_set）共用此语义，保证两处行为一致。
+    pub fn resolve_wb(strategy: &str, wb_strategy: &str) -> Self {
+        Self::parse(if wb_strategy.is_empty() {
+            strategy
+        } else {
+            wb_strategy
+        })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExpireFirst => "expire_first",
@@ -457,7 +467,8 @@ impl ApiPool {
                     e.until = now_ts() + kind.cooldown_duration().as_secs() as i64;
                     e.reason = kind.as_str().to_string();
                     e.err_count = 0;
-                    e.cb_trips = 0;
+                    // P2 修复10：不重置 cb_trips——熔断记忆只应在 note_success 重置，
+                    // 否则 Server 熔断记忆被非 Server 错误意外清零
                 }
                 _ => {
                     e.err_count += 1;
@@ -809,6 +820,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_wb_follows_trae_when_wb_empty() {
+        // Buddy 池 wb_strategy 空 = 跟随 Trae 池策略（启动/热应用共用语义）
+        assert_eq!(PoolStrategy::resolve_wb("weighted", ""), PoolStrategy::Weighted);
+        assert_eq!(PoolStrategy::resolve_wb("p2c", ""), PoolStrategy::P2C);
+        // Trae 池也为空/未知 → 默认 expire_first
+        assert_eq!(PoolStrategy::resolve_wb("", ""), PoolStrategy::ExpireFirst);
+        assert_eq!(PoolStrategy::resolve_wb("unknown", ""), PoolStrategy::ExpireFirst);
+    }
+
+    #[test]
+    fn resolve_wb_prefers_explicit_wb() {
+        // Buddy 池显式配置优先于 Trae 池（含 Trae 为空串时仍生效）
+        assert_eq!(PoolStrategy::resolve_wb("expire_first", "p2c"), PoolStrategy::P2C);
+        assert_eq!(PoolStrategy::resolve_wb("", "weighted"), PoolStrategy::Weighted);
+        // 显式未知值回退默认（与 parse 语义一致）
+        assert_eq!(PoolStrategy::resolve_wb("weighted", "unknown"), PoolStrategy::ExpireFirst);
+    }
+
+    #[test]
     fn expire_first_prefers_soonest_expiry() {
         // 两个都有过期时间（均在未来）：更早过期者胜
         let pool = build_pool(&[
@@ -1082,6 +1112,46 @@ mod tests {
             // 目标时刻的本地时钟（东八区）恰好落在 04:00
             let local = t + 8 * 3600;
             assert_eq!(local % 86400, 4 * 3600);
+        }
+    }
+
+    // ==================== P2 修复10：cb_trips 不被非 Server 错误重置 ====================
+
+    #[test]
+    fn plan_limit_cooldown_keeps_circuit_memory() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        // 预置熔断记忆（此前被 PlanLimit/SoftRate/NotFound 分支误重置）
+        {
+            let mut entries = safe_lock(&pool.entries);
+            entries.get_mut("uid_a").unwrap().cb_trips = 2;
+        }
+        // 三类非 Server 错误均不应清掉 cb_trips（各自冷却时长照常生效）
+        pool.note_error("uid_a", ErrKind::PlanLimit);
+        assert!(pool.status_list()[0].cooling, "PlanLimit 应进入 12h 冷却");
+        {
+            let entries = safe_lock(&pool.entries);
+            assert_eq!(
+                entries.get("uid_a").unwrap().cb_trips,
+                2,
+                "PlanLimit 不得重置熔断记忆"
+            );
+        }
+        // SoftRate 冷却结束后再验证
+        {
+            let mut entries = safe_lock(&pool.entries);
+            entries.get_mut("uid_a").unwrap().until = 0;
+        }
+        pool.note_error("uid_a", ErrKind::SoftRate);
+        assert!(pool.status_list()[0].cooling, "SoftRate 应进入 60s 冷却");
+        {
+            let entries = safe_lock(&pool.entries);
+            assert_eq!(entries.get("uid_a").unwrap().cb_trips, 2);
+        }
+        // note_success 仍是唯一重置点
+        pool.note_success("uid_a");
+        {
+            let entries = safe_lock(&pool.entries);
+            assert_eq!(entries.get("uid_a").unwrap().cb_trips, 0);
         }
     }
 

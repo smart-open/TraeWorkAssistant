@@ -281,8 +281,24 @@ pub fn proxy_start(
                 "[严重] 代理进程异常退出，正在还原系统代理以避免全局断网…",
             );
             fs_utils::app_log(std::path::Path::new(&data_dir2), "代理进程异常退出，自动还原系统代理");
-            if let Err(e) = clear_win_proxy() {
-                fs_utils::app_log(std::path::Path::new(&data_dir2), &format!("还原系统代理失败: {e}"));
+            // 还原策略与 proxy_stop 一致：启动前存在启用的外部代理（用户 VPN 梯子）→ 原样还原，
+            // 否则清空系统代理。peek 克隆（不 take）：PREV_SYSTEM_PROXY 必须保留给后续
+            // proxy_stop 继续还原（看门狗不消费快照，仅消费其副本）。
+            let res = {
+                let prev = PREV_SYSTEM_PROXY
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                match prev {
+                    Some((en, sv, ov)) if en => apply_proxy(true, &sv, &ov),
+                    _ => clear_win_proxy(),
+                }
+            };
+            if let Err(e) = res {
+                fs_utils::app_log(
+                    std::path::Path::new(&data_dir2),
+                    &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
+                );
             }
             let _ = app_for_thread.emit("proxy-crashed", "");
         }
@@ -449,14 +465,11 @@ fn apply_proxy(enable: bool, server: &str, override_: &str) -> Result<(), String
     run_reg(key, "ProxyEnable", "REG_DWORD", if enable { "1" } else { "0" })?;
     if enable {
         run_reg(key, "ProxyServer", "REG_SZ", server)?;
-        // 关键：设置 ProxyOverride 让 localhost 绕过代理
-        // 这样即使代理开启，客户端仍能直连 127.0.0.1:7864（API 服务）
-        let ov = if override_.is_empty() {
-            "127.0.0.1;localhost;<local>"
-        } else {
-            override_
-        };
-        run_reg(key, "ProxyOverride", "REG_SZ", ov)?;
+        // ProxyOverride 一律原样写回：还原路径（proxy_stop/看门狗）必须保留捕获到的
+        // 用户原值（含空值），否则会把用户原本为空的排除列表改写成默认白名单。
+        // 「空串填默认白名单（localhost 绕过代理、直连 127.0.0.1:7864 API 服务）」
+        // 仅在 set_win_proxy 首次设置路径由调用方显式传入。
+        run_reg(key, "ProxyOverride", "REG_SZ", override_)?;
     }
     notify_wininet_changed();
     Ok(())

@@ -264,8 +264,9 @@ Function PageReinstall
   ; of this function because we need to populate some variables
   ; related to current installed version if detected and whether
   ; we are downgrading or not.
-  ; [custom AI Work 助手] 升级安装（检测到更低版本）时跳过「卸载后安装 / 不卸载直接安装」
-  ; 选择页：与 update 模式同路径，直接覆盖安装，不再推荐用户先卸载旧版。
+  ; [custom AI Work Assistant] On upgrade install (a lower version is detected), skip the
+  ; "uninstall then install / install without uninstalling" choice page: take the same path
+  ; as update mode, overwrite directly and stop recommending users to uninstall the old version first.
   ${If} $PassiveMode = 1
     Call PageLeaveReinstall
   ${ElseIf} $R0 = 1
@@ -324,8 +325,9 @@ Function PageLeaveReinstall
     Goto reinst_done
   ${EndIf}
 
-  ; [custom AI Work 助手] 被动模式（/P）且非更新模式：未显示选择页（$R1 无意义），
-  ; 按版本比较决策——同版本/升级 → 直接覆盖安装；降级 → 遵循 ALLOWDOWNGRADES
+  ; [custom AI Work Assistant] Passive mode (/P) and not update mode: the choice page was not
+  ; shown ($R1 is meaningless), decide by version comparison - same version/upgrade -> overwrite
+  ; directly; downgrade -> follow ALLOWDOWNGRADES.
   ${If} $PassiveMode = 1
     ${If} $R0 = -1
       !if "${ALLOWDOWNGRADES}" == "false"
@@ -896,9 +898,10 @@ Section Uninstall
     SetShellVarContext current
     RmDir /r "$APPDATA\${BUNDLEID}"
     RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
-    ; [custom AI Work 助手] 业务数据目录为 %APPDATA%\AIWorkAssistant（自定义于 state.rs），
-    ; Tauri 模板默认只删 BUNDLEID 目录（WebView2 数据），此处补删真实数据目录；
-    ; 含品牌迁移前（Trae Work 助手）的遗留目录
+    ; [custom AI Work Assistant] The app data directory is %APPDATA%\AIWorkAssistant
+    ; (customized in state.rs). The Tauri template only deletes the BUNDLEID directories
+    ; (WebView2 data); delete the real data directories here, including legacy directories
+    ; from before the brand migration (Trae Work Assistant).
     RmDir /r "$APPDATA\AIWorkAssistant"
     RmDir /r "$LOCALAPPDATA\AIWorkAssistant"
     RmDir /r "$APPDATA\TraeWorkAssistant"

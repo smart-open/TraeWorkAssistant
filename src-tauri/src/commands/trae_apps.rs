@@ -250,6 +250,14 @@ fn infer_cloud_uid(app_kind: &str, storage: &serde_json::Value) -> Option<String
     select_cloud_uid(merged)
 }
 
+/// 推导指定 Trae 应用当前登录账号的 Cloud-IDE uid（switch.rs 切换守卫复用，
+/// 与 apps_accounts_discover 同源实现）。同步实现（读本机 storage.json + state.vscdb），
+/// 调用方应在 async 命令/后台线程中使用；推导失败返回 None（调用方 fail-open）。
+pub(crate) fn infer_current_cloud_uid(app_kind: &str) -> Option<String> {
+    let storage = read_storage_json(app_kind)?;
+    infer_cloud_uid(app_kind, &storage)
+}
+
 #[derive(Serialize, Clone)]
 pub struct DiscoveredAccount {
     /// 账号池体系（Cloud-IDE）uid。uid_confident=false 时为账户中心 uid（仅展示，不可入池）
@@ -439,6 +447,9 @@ pub fn accounts_backfill_dc_ids(state: State<AppState>) -> usize {
 }
 
 /// F-08：把本机发现的账号加入账号池（无 JWT 占位，待代理捕获后自动回填）。
+/// `uid_confident`：顶层参数（前端传 uidConfident，Tauri 自动映射蛇形签名）。
+/// None = 保持现状允许入池；Some(false) = uid 未经验证（实为账户中心 dc id 或推导失败），
+/// 入池会与 Cloud-IDE 账号体系产生重复账号 → 拒绝并返回明确错误。
 #[tauri::command]
 pub fn apps_account_add(
     state: State<AppState>,
@@ -446,10 +457,17 @@ pub fn apps_account_add(
     name: String,
     app: String,
     dc_id: Option<String>,
+    uid_confident: Option<bool>,
 ) -> Result<(), String> {
     let uid = user_id.trim().to_string();
     if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
         return Err("无效的 UserID".into());
+    }
+    if uid_confident == Some(false) {
+        return Err(format!(
+            "账号 {uid} 的 Cloud-IDE uid 未能验证（发现流程标记不置信，可能是账户中心 id），\
+             已拒绝入池以避免重复账号；请在该应用内登录后重新「自动发现」，或改用手动添加"
+        ));
     }
     let mut accounts = crate::vault::load_accounts(&state);
     let known = pool_uid_set(&accounts);

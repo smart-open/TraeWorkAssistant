@@ -12,6 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::custom_route;
 use super::dispatch::{self, DispatchError, TargetPool};
+use super::retry::{retry_plan, RetryAction};
 use super::sse;
 use super::unified_catalog;
 use super::usage::{extract_tokens, KeyId};
@@ -50,6 +51,24 @@ impl Protocol {
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
 fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// keep-alive 退出信号（P1 修复）：主任务（spawn_blocking）结束时 Drop 触发
+/// watch 通知，ticker 收到后退出 → sender 全部关闭 → 流可正常终结。
+/// Drop 兜底覆盖 panic 展开与提前 return 路径
+struct DoneSignal(tokio::sync::watch::Sender<bool>);
+
+impl Drop for DoneSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
+/// 聚合路径失败（P1 修复1）：区分「无健康账号」（维持原 503/格式）与
+/// 「Fatal 上游错误透传」（携带上游状态码与错误体摘要）
+enum AggregateFail {
+    NoHealthy(String),
+    Upstream(u16, String),
 }
 
 // ==================== Handlers ====================
@@ -391,6 +410,7 @@ pub async fn chat_completions(
     let model = peek
         .get("model")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
     let state_clone = state.clone();
@@ -828,10 +848,33 @@ async fn images_entry(
         );
     }
 
-    // 取健康 WB 账号（生图无粘性语义，任一健康账号）
+    // 取健康 WB 账号（生图无粘性语义，任一健康账号）；携带当前请求 Key 的
+    // 约束（P1 修复4c）：白名单 allowed_accounts 过滤 + dedicated 专一锁定，
+    // 与 wb_route 同款解析；Key 无约束/匿名（constraints_for 为 None）时不限制
+    let (allowed_set, dedicated) = {
+        let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_str);
+        let allowed: Option<HashSet<String>> = key_constraints
+            .as_ref()
+            .map(|k| k.allowed_accounts.iter().cloned().collect())
+            .filter(|s: &HashSet<String>| !s.is_empty());
+        let dedicated: Option<String> = key_constraints
+            .as_ref()
+            .filter(|k| k.schedule_mode == super::api_keys::MODE_DEDICATED)
+            .map(|k| {
+                if k.dedicated_account.is_empty() {
+                    k.allowed_accounts.first().cloned().unwrap_or_default()
+                } else {
+                    k.dedicated_account.clone()
+                }
+            })
+            .filter(|s: &String| !s.is_empty());
+        (allowed, dedicated)
+    };
     let picked = {
         let tried = HashSet::new();
-        state.wb_pool.pick_excluding_constrained(&tried, None, None)
+        state
+            .wb_pool
+            .pick_excluding_constrained(&tried, allowed_set.as_ref(), dedicated.as_deref())
     };
     let Some(picked) = picked else {
         return openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", "no healthy WB account available");
@@ -852,10 +895,12 @@ async fn images_entry(
     let duration_ms = start_ts.elapsed().as_millis() as u64;
     match result {
         Ok(resp) => {
-            state.record_usage(false, &model, &picked.uid, &key_str, true, false, duration_ms, 0, 0);
+            // P1 修复4a：WB 账号服务的请求记 wb 桶（is_wb=true），与 Trae 侧分账
+            state.record_usage(true, &model, &picked.uid, &key_str, true, false, duration_ms, 0, 0);
             state.wb_pool.note_success(&picked.uid);
+            // P1 修复4b：上游池为 buddy，日志池归属同步纠正
             state.logger.log_request(
-                "trae", "POST",
+                "buddy", "POST",
                 if is_edit { "/v1/images/edits" } else { "/v1/images/generations" },
                 &model, false, 200, &picked.uid, duration_ms, None,
             );
@@ -865,9 +910,9 @@ async fn images_entry(
                 .unwrap_or_else(|_| internal_error_response())
         }
         Err((code, msg)) => {
-            state.record_usage(false, &model, &picked.uid, &key_str, false, false, duration_ms, 0, 0);
+            state.record_usage(true, &model, &picked.uid, &key_str, false, false, duration_ms, 0, 0);
             state.logger.log_request(
-                "trae", "POST",
+                "buddy", "POST",
                 if is_edit { "/v1/images/edits" } else { "/v1/images/generations" },
                 &model, false, code, &picked.uid, duration_ms, Some(&msg),
             );
@@ -886,21 +931,30 @@ async fn images_entry(
 fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-    // SSE keep-alive 15s（T2.7/F-34 §5.5 #7）：防中间层回收长流；
-    // 客户端断连/[DONE] 后发送失败自然退出
+    // SSE keep-alive 15s（T2.7/F-34 §5.5 #7）：防中间层回收长流。
+    // P1 修复：原 ticker 独占持有 sender 克隆，主任务发完 [DONE] 后流因
+    // sender 未全部关闭而无法终结（普通 HTTP 客户端只能靠断连收尾）。
+    // 改用 tokio::sync::watch：主任务结束（DoneSignal Drop）置 done=true，
+    // ticker select! 收到退出信号即退出 → rx 关闭 → 流正常结束
+    let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
     {
         let tx2 = tx.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             tick.tick().await; // 首个 tick 立即返回，跳过
             loop {
-                tick.tick().await;
-                if tx2
-                    .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
-                    .await
-                    .is_err()
-                {
-                    break;
+                tokio::select! {
+                    _ = tick.tick() => {
+                        if tx2
+                            .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // 主任务已结束：ticker 退出，放行流终结
+                    _ = done_rx.changed() => break,
                 }
             }
         });
@@ -910,6 +964,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // inflight guard 随后台任务存续至流结束（§4.5：客户端断连/流终止由
         // 任务结束 Drop 兜底释放）
         let _inflight = guard;
+        // 主任务结束（含 panic 展开）→ 通知 keep-alive ticker 退出（P1 修复3）
+        let _done = DoneSignal(done_tx);
         let chat_id = match proto {
             Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
             Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
@@ -931,84 +987,156 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
             );
 
-            match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
-                Ok(reader) => {
-                    // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
-                    let (error_info, sent_any, up_usage) = match proto {
-                        Protocol::OpenAi => {
-                            let (e, s, u) = sse::stream_convert(reader, tx.clone(), &chat_id);
-                            (e, s, u)
+            // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
+            // 重试计数，换号后随新账号归零；总轮换上限仍受 MAX_ROTATE 约束
+            let mut same_attempt: u32 = 0;
+            loop {
+                // TTFB 计时（请求发起 → 上游首行到达，与 wb_route 同语义）：
+                // AtomicU64 0 哨兵 = 尚未读到首行（首字超时等失败路径不产出 ttfb）
+                let ttfb_start = std::time::Instant::now();
+                let ttfb_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
+                    Ok(reader) => {
+                        // 首字超时 10s（T2.7/F-34，与 wb_upstream 同款包装）：建连后
+                        // 首字节 10s 未到视为上游故障 → 冷却换号；首字节到达后正常
+                        // 流速不受限（后续行无超时）
+                        let lines = match super::wb_upstream::lines_with_first_byte_timeout(reader) {
+                            Ok(l) => l,
+                            Err(()) => {
+                                state.pool.note_error(&picked.uid, ErrKind::Server);
+                                *safe_lock(&state.last_error) =
+                                    Some(format!("uid={} first-byte timeout(10s)", picked.uid));
+                                state.logger.log_request(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    504, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    Some("first byte timeout"),
+                                );
+                                break; // 换号
+                            }
+                        };
+                        // 首行打点包装：首次成功读到上游行即记录 ttfb（0 哨兵防重复
+                        // 覆盖；叠加首字超时包装，语义为「请求发起 → 首行到达」）
+                        let lines = {
+                            let ttfb_flag = ttfb_us.clone();
+                            lines.map(move |l| {
+                                let _ = ttfb_flag.compare_exchange(
+                                    0,
+                                    ttfb_start.elapsed().as_micros() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                l
+                            })
+                        };
+                        let lines =
+                            Box::new(lines) as Box<dyn Iterator<Item = String> + Send>;
+                        // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
+                        let (error_info, sent_any, up_usage) = match proto {
+                            Protocol::OpenAi => {
+                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id);
+                                (e, s, u)
+                            }
+                            Protocol::OpenAiText => {
+                                let (e, s, u) =
+                                    sse::stream_convert_text_lines(lines, tx.clone(), &chat_id, &model);
+                                (e, s, u)
+                            }
+                            Protocol::Anthropic => {
+                                let (e, s, u) =
+                                    sse::stream_convert_anthropic_lines(lines, tx.clone(), &chat_id, &model);
+                                (e, s, u)
+                            }
+                            // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 透传
+                            Protocol::Responses => {
+                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id);
+                                (e, s, u)
+                            }
+                        };
+                        let duration_ms = start_ts.elapsed().as_millis() as u64;
+                        // TTFB：首行到达耗时（未读到首行 → None，不输出该字段）
+                        let ttfb_ms = {
+                            let us = ttfb_us.load(std::sync::atomic::Ordering::Relaxed);
+                            if us == 0 { None } else { Some(us / 1000) }
+                        };
+                        // 用量记账（流式结束即落盘）
+                        {
+                            let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
+                            state.record_usage(
+                                false, &model, &picked.uid, &key_id, error_info.is_none(), true,
+                                duration_ms, pt, ct,
+                            );
                         }
-                        Protocol::OpenAiText => {
-                            let (e, s, u) =
-                                sse::stream_convert_text(reader, tx.clone(), &chat_id, &model);
-                            (e, s, u)
+                        if let Some((code, msg)) = error_info {
+                            let kind = classify_solo_error(code, &msg);
+                            if kind != ErrKind::None {
+                                state.pool.note_error(&picked.uid, kind);
+                                *safe_lock(&state.last_error) =
+                                    Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
+                            }
+                            if !sent_any {
+                                // 流未开始：错误延迟下发（sse 层未透传，由这里统一发）
+                                send_stream_error(&tx, proto, code, &msg);
+                            }
+                            state.logger.log_request_ttfb(
+                                "trae", "POST", proto.log_path(), &model, stream,
+                                200, &picked.uid, duration_ms, ttfb_ms, Some(&msg),
+                            );
+                            if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
+                            }
+                        } else {
+                            state.pool.note_success(&picked.uid);
+                            state.logger.log_request_ttfb(
+                                "trae", "POST", proto.log_path(), &model, stream,
+                                200, &picked.uid, duration_ms, ttfb_ms, None,
+                            );
+                            if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                state.logger.log_debug(&picked.uid, &converted, None, 200, None);
+                            }
                         }
-                        Protocol::Anthropic => {
-                            let (e, s, u) =
-                                sse::stream_convert_anthropic(reader, tx.clone(), &chat_id, &model);
-                            (e, s, u)
-                        }
-                        // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 透传
-                        Protocol::Responses => {
-                            let (e, s, u) = sse::stream_convert(reader, tx.clone(), &chat_id);
-                            (e, s, u)
-                        }
-                    };
-                    let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    // 用量记账（流式结束即落盘）
-                    {
-                        let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
-                        state.record_usage(
-                            false, &model, &picked.uid, &key_id, error_info.is_none(), true,
-                            duration_ms, pt, ct,
-                        );
+                        return; // 流式结束后直接返回
                     }
-                    if let Some((code, msg)) = error_info {
-                        let kind = classify_solo_error(code, &msg);
-                        if kind != ErrKind::None {
-                            state.pool.note_error(&picked.uid, kind);
-                            *safe_lock(&state.last_error) =
-                                Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
-                        }
-                        if !sent_any {
-                            // 流未开始：错误延迟下发（sse 层未透传，由这里统一发）
-                            send_stream_error(&tx, proto, code, &msg);
-                        }
-                        state.logger.log_request(
-                            "trae", "POST", proto.log_path(), &model, stream,
-                            200, &picked.uid, duration_ms, Some(&msg),
-                        );
-                        if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                            state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
-                        }
-                    } else {
-                        state.pool.note_success(&picked.uid);
-                        state.logger.log_request(
-                            "trae", "POST", proto.log_path(), &model, stream,
-                            200, &picked.uid, duration_ms, None,
-                        );
-                        if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                            state.logger.log_debug(&picked.uid, &converted, None, 200, None);
+                    Err((status, resp_body, retry_after)) => {
+                        // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
+                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                            RetryAction::RetrySame { delay_ms } => {
+                                // 同账号重试：不 note_error 不冷却
+                                same_attempt += 1;
+                                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
+                                continue;
+                            }
+                            RetryAction::SwitchKey => {
+                                let kind = classify_error(status, &resp_body);
+                                state.pool.note_error(&picked.uid, kind);
+                                let preview = safe_slice(&resp_body, 200);
+                                *safe_lock(&state.last_error) =
+                                    Some(format!("uid={} status={} body={}", picked.uid, status, preview));
+                                state.logger.log_request(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    Some(&format!("upstream status={}", status)),
+                                );
+                                if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&preview));
+                                }
+                                break; // 换号（same_attempt 随新账号归零）
+                            }
+                            RetryAction::Fatal => {
+                                // 不冷却：请求本身问题（换号无意义），终止并透传上游错误体
+                                let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                                state.logger.log_request(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    Some(&msg),
+                                );
+                                if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&msg));
+                                }
+                                send_stream_error(&tx, proto, status as i64, &msg);
+                                return;
+                            }
                         }
                     }
-                    return; // 流式结束后直接返回
-                }
-                Err((status, resp_body)) => {
-                    let kind = classify_error(status, &resp_body);
-                    state.pool.note_error(&picked.uid, kind);
-                    let preview = safe_slice(&resp_body, 200);
-                    *safe_lock(&state.last_error) =
-                        Some(format!("uid={} status={} body={}", picked.uid, status, preview));
-                    state.logger.log_request(
-                        "trae", "POST", proto.log_path(), &model, stream,
-                        status, &picked.uid, start_ts.elapsed().as_millis() as u64,
-                        Some(&format!("upstream status={}", status)),
-                    );
-                    if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&preview));
-                    }
-                    continue;
                 }
             }
         }
@@ -1123,93 +1251,122 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
             );
 
-            match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
-                Ok(reader) => {
-                    let chat_id = match proto {
-                        Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
-                        Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
-                        Protocol::Anthropic => format!("msg_{}", now_ts()),
-                        Protocol::Responses => format!("resp_{}", now_ts()),
-                    };
-                    let (resp, error_info) = match proto {
-                        Protocol::OpenAi => sse::aggregate(reader, &chat_id),
-                        Protocol::OpenAiText => sse::aggregate_text(reader, &chat_id, &model),
-                        Protocol::Anthropic => sse::aggregate_anthropic(reader, &chat_id, &model),
-                        // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 聚合
-                        Protocol::Responses => sse::aggregate(reader, &chat_id),
-                    };
-                    let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    match (resp, error_info) {
-                        (Some(r), None) => {
-                            // 用量记账（成功：token 数从聚合响应 usage 提取）
-                            let (pt, ct) = r.get("usage").map(extract_tokens).unwrap_or((0, 0));
-                            state.record_usage(
-                                false, &model, &picked.uid, &key_id, true, stream,
-                                duration_ms, pt, ct,
-                            );
-                            state.pool.note_success(&picked.uid);
-                            state.logger.log_request(
-                                "trae", "POST", proto.log_path(), &model, stream,
-                                200, &picked.uid, duration_ms, None,
-                            );
-                            if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                                state.logger.log_debug(&picked.uid, &converted, Some(r.to_string().as_bytes()), 200, None);
+            // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
+            // 重试计数，换号后随新账号归零；总轮换上限仍受 MAX_ROTATE 约束
+            let mut same_attempt: u32 = 0;
+            loop {
+                match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
+                    Ok(reader) => {
+                        let chat_id = match proto {
+                            Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+                            Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
+                            Protocol::Anthropic => format!("msg_{}", now_ts()),
+                            Protocol::Responses => format!("resp_{}", now_ts()),
+                        };
+                        let (resp, error_info) = match proto {
+                            Protocol::OpenAi => sse::aggregate(reader, &chat_id),
+                            Protocol::OpenAiText => sse::aggregate_text(reader, &chat_id, &model),
+                            Protocol::Anthropic => sse::aggregate_anthropic(reader, &chat_id, &model),
+                            // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 聚合
+                            Protocol::Responses => sse::aggregate(reader, &chat_id),
+                        };
+                        let duration_ms = start_ts.elapsed().as_millis() as u64;
+                        match (resp, error_info) {
+                            (Some(r), None) => {
+                                // 用量记账（成功：token 数从聚合响应 usage 提取）
+                                let (pt, ct) = r.get("usage").map(extract_tokens).unwrap_or((0, 0));
+                                state.record_usage(
+                                    false, &model, &picked.uid, &key_id, true, stream,
+                                    duration_ms, pt, ct,
+                                );
+                                state.pool.note_success(&picked.uid);
+                                state.logger.log_request(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    200, &picked.uid, duration_ms, None,
+                                );
+                                if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    state.logger.log_debug(&picked.uid, &converted, Some(r.to_string().as_bytes()), 200, None);
+                                }
+                                return Ok(r);
                             }
-                            return Ok(r);
-                        }
-                        (None, Some((code, msg))) => {
-                            let kind = classify_solo_error(code, &msg);
-                            state.pool.note_error(&picked.uid, kind);
-                            *safe_lock(&state.last_error) =
-                                Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
-                            state.record_usage(
-                                false, &model, &picked.uid, &key_id, false, stream,
-                                duration_ms, 0, 0,
-                            );
-                            state.logger.log_request(
-                                "trae", "POST", proto.log_path(), &model, stream,
-                                200, &picked.uid, duration_ms, Some(&msg),
-                            );
-                            if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                                state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
+                            (None, Some((code, msg))) => {
+                                let kind = classify_solo_error(code, &msg);
+                                state.pool.note_error(&picked.uid, kind);
+                                *safe_lock(&state.last_error) =
+                                    Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
+                                state.record_usage(
+                                    false, &model, &picked.uid, &key_id, false, stream,
+                                    duration_ms, 0, 0,
+                                );
+                                state.logger.log_request(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    200, &picked.uid, duration_ms, Some(&msg),
+                                );
+                                if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
+                                }
+                                break; // 流内错误：冷却换号
                             }
-                            continue;
-                        }
-                        _ => {
-                            state.pool.note_error(&picked.uid, ErrKind::Server);
-                            state.record_usage(
-                                false, &model, &picked.uid, &key_id, false, stream,
-                                duration_ms, 0, 0,
-                            );
-                            state.logger.log_request(
-                                "trae", "POST", proto.log_path(), &model, stream,
-                                502, &picked.uid, duration_ms, Some("empty response"),
-                            );
-                            if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                                state.logger.log_debug(&picked.uid, &converted, None, 502, Some("empty response"));
+                            _ => {
+                                state.pool.note_error(&picked.uid, ErrKind::Server);
+                                state.record_usage(
+                                    false, &model, &picked.uid, &key_id, false, stream,
+                                    duration_ms, 0, 0,
+                                );
+                                state.logger.log_request(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    502, &picked.uid, duration_ms, Some("empty response"),
+                                );
+                                if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    state.logger.log_debug(&picked.uid, &converted, None, 502, Some("empty response"));
+                                }
+                                break; // 换号
                             }
-                            continue;
                         }
                     }
-                }
-                Err((status, resp_body)) => {
-                    let kind = classify_error(status, &resp_body);
-                    state.pool.note_error(&picked.uid, kind);
-                    *safe_lock(&state.last_error) =
-                        Some(format!("uid={} status={}", picked.uid, status));
-                    state.record_usage(
-                        false, &model, &picked.uid, &key_id, false, stream,
-                        start_ts.elapsed().as_millis() as u64, 0, 0,
-                    );
-                    state.logger.log_request(
-                        "trae", "POST", proto.log_path(), &model, stream,
-                        status, &picked.uid, start_ts.elapsed().as_millis() as u64,
-                        Some(&format!("upstream status={}", status)),
-                    );
-                    if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&resp_body));
+                    Err((status, resp_body, retry_after)) => {
+                        // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
+                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                            RetryAction::RetrySame { delay_ms } => {
+                                // 同账号重试：不 note_error 不冷却
+                                same_attempt += 1;
+                                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
+                                continue;
+                            }
+                            RetryAction::SwitchKey => {
+                                let kind = classify_error(status, &resp_body);
+                                state.pool.note_error(&picked.uid, kind);
+                                *safe_lock(&state.last_error) =
+                                    Some(format!("uid={} status={}", picked.uid, status));
+                                state.record_usage(
+                                    false, &model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                );
+                                state.logger.log_request(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    Some(&format!("upstream status={}", status)),
+                                );
+                                if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&resp_body));
+                                }
+                                break; // 换号（same_attempt 随新账号归零）
+                            }
+                            RetryAction::Fatal => {
+                                // 不冷却：请求本身问题（换号无意义），终止并透传上游错误体
+                                let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                                state.logger.log_request(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    Some(&msg),
+                                );
+                                if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    state.logger.log_debug(&picked.uid, &converted, Some(resp_body.as_bytes()), status, Some(&msg));
+                                }
+                                return Err(AggregateFail::Upstream(status, msg));
+                            }
+                        }
                     }
-                    continue;
                 }
             }
         }
@@ -1243,7 +1400,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 );
             }
         }
-        Err("no healthy account available".to_string())
+        Err(AggregateFail::NoHealthy("no healthy account available".to_string()))
     })
     .await;
 
@@ -1257,12 +1414,20 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                     .body(Body::from("internal server error"))
                     .unwrap()
             }),
-        Ok(Err(msg)) => match proto {
+        Ok(Err(AggregateFail::NoHealthy(msg))) => match proto {
             Protocol::OpenAi | Protocol::OpenAiText | Protocol::Responses => {
                 openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", &msg)
             }
             Protocol::Anthropic => anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &msg),
         },
+        Ok(Err(AggregateFail::Upstream(status, msg))) => {
+            // Fatal：上游错误体透传（不冷却），按协议格式化并保留上游状态码
+            let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            match proto {
+                Protocol::Anthropic => anthropic_error(sc, "api_error", &msg),
+                _ => openai_error(sc, "upstream_error", &msg),
+            }
+        }
         Err(e) => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -1273,13 +1438,26 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
 
 // ==================== Upstream Request ====================
 
+/// 上游错误体读取上限（P2 修复11）：防止上游异常回包把整响应读进内存
+const MAX_UPSTREAM_ERR_BYTES: usize = 64 * 1024;
+
+/// 限量读取上游错误体（P2 修复11）：最多 MAX_UPSTREAM_ERR_BYTES，读满截断
+fn read_limited_body(response: ureq::Response) -> String {
+    let mut buf = Vec::new();
+    let mut limited = response
+        .into_reader()
+        .take(MAX_UPSTREAM_ERR_BYTES as u64);
+    let _ = limited.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn make_upstream_request(
     jwt: &str,
     _uid: &str,
     device_id: &str,
     machine_id: &str,
     body: &[u8],
-) -> Result<Box<dyn Read + Send>, (u16, String)> {
+) -> Result<Box<dyn Read + Send>, (u16, String, Option<u64>)> {
     let url = format!("{}{}", AGENT_HOST, EP_LLM_CHAT);
     let referer = format!("{}{}", REFERER_BASE, EP_LLM_CHAT);
     let trace_id = format!(
@@ -1325,8 +1503,13 @@ fn make_upstream_request(
     match resp {
         Ok(r) => Ok(Box::new(r.into_reader())),
         Err(ureq::Error::Status(code, response)) => {
-            let body = response.into_string().unwrap_or_default();
-            Err((code, body))
+            // Retry-After（秒）解析（P1 修复1）：供分级重试表 429 退避决策；
+            // header 需在 into_reader 消费响应前读取
+            let retry_after = response
+                .header("retry-after")
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let body = read_limited_body(response);
+            Err((code, body, retry_after))
         }
         Err(e) => {
             let err_str = format!("{}", e);
@@ -1340,7 +1523,7 @@ fn make_upstream_request(
             } else {
                 format!("传输错误: {}", e)
             };
-            Err((502, detail))
+            Err((502, detail, None))
         }
     }
 }
@@ -1454,7 +1637,54 @@ fn uuid_like_id() -> String {
 }
 
 fn safe_slice(s: &str, n: usize) -> &str {
-    // 按字符边界截断：字节切片 &s[..n] 在多字节字符中间会 panic
-    // （上游错误 JSON 常含中文，200 字节处极可能落在 UTF-8 序列中间）
-    s.get(..n).unwrap_or(s)
+    // P2 修复6：沿字符边界向前找 <=n 的最大可截断点。原实现非字符边界时
+    // 回退返回整串（可能超长），且字节切片 &s[..n] 在多字节字符中间会 panic
+    // （上游错误 JSON 常含中文）；现保证输出永不超过 n 字节且不 panic
+    if n >= s.len() {
+        return s;
+    }
+    let mut cut = 0;
+    for (i, _) in s.char_indices().take_while(|(i, _)| *i <= n) {
+        cut = i;
+    }
+    &s[..cut]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== P2 修复6：safe_slice 字符边界截断 ====================
+
+    #[test]
+    fn safe_slice_cuts_on_char_boundary() {
+        // ASCII：n 在串内 → 精确截断
+        assert_eq!(safe_slice("hello world", 5), "hello");
+        // n 超长 → 原文
+        assert_eq!(safe_slice("abc", 100), "abc");
+        // n 等于串长 → 原文
+        assert_eq!(safe_slice("abc", 3), "abc");
+        // n=0 → 空串（原实现会 panic）
+        assert_eq!(safe_slice("中文", 0), "");
+    }
+
+    #[test]
+    fn safe_slice_never_returns_overlong_or_panics() {
+        // 200 落在多字节字符中间：沿边界向前取最近可截断点，不 panic、不回退整串
+        let s = format!("{}{}", "a".repeat(199), "中文中文中文");
+        let out = safe_slice(&s, 200);
+        assert!(out.len() <= 200, "输出不得超过 n 字节");
+        assert_eq!(out.len(), 199, "应回退到最近字符边界（199 处）");
+        // n=1/2 落在 3 字节「中」的中间 → 边界回退到 0
+        assert_eq!(safe_slice("中文", 1), "");
+        assert_eq!(safe_slice("中文", 2), "");
+        assert_eq!(safe_slice("中文", 3), "中");
+        // 任意 n 都不 panic 且不超长
+        let body = "上游错误：{\"code\":1005,\"message\":\"套餐额度用尽\"}";
+        for n in 0..=body.len() {
+            let out = safe_slice(body, n);
+            assert!(out.len() <= n);
+            assert!(body.starts_with(out));
+        }
+    }
 }

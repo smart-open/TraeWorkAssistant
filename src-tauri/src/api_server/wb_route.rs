@@ -93,31 +93,19 @@ pub fn clear_model_failure(state: &ApiSharedState, model: &str) {
 
 // ==================== 审核模板映射热更新（T2.1） ====================
 
-/// 每请求检查 wb_template_map.json 的 mtime，变化时重载；缺失用内置兜底
+/// 每请求读取外置映射表（fs_utils::read_json_cached：mtime+size 线程安全缓存，
+/// 免自建缓存结构与 Mutex 内磁盘 IO）；data/ 新路径缺失回退旧根路径（存量数据
+/// 兼容）；文件缺失/损坏/空表用内置兜底
 pub fn load_templates(state: &ApiSharedState) -> Vec<(String, String)> {
-    let path = state.data_dir.join("wb_template_map.json");
-    let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-    let mut cache = safe_lock(&state.wb_template_cache);
-    match mtime {
-        Some(mt) => {
-            if let Some((cached_mt, cached_map)) = cache.as_ref() {
-                if *cached_mt == mt {
-                    return cached_map.clone();
-                }
-            }
-            let fresh = wb_payload::read_template_file(&state.data_dir)
-                .unwrap_or_else(wb_payload::default_template_map);
-            *cache = Some((mt, fresh.clone()));
-            fresh
-        }
-        None => {
-            // 文件被删除：清缓存走内置兜底
-            if cache.is_some() {
-                *cache = None;
-            }
-            wb_payload::default_template_map()
-        }
-    }
+    let new_path = wb_payload::template_map_path(&state.data_dir);
+    let effective = if new_path.exists() {
+        new_path
+    } else {
+        wb_payload::template_map_path_legacy(&state.data_dir)
+    };
+    crate::fs_utils::read_json_cached::<wb_payload::TemplateMapFile>(&effective)
+        .and_then(|f| f.into_rules())
+        .unwrap_or_else(wb_payload::default_template_map)
 }
 
 // ==================== 错误分类（WB 上游） ====================
@@ -344,8 +332,8 @@ fn run_wb_stream(
                         }
                     };
                     let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
-                    let (error_info, sent_any, usage) =
-                        wb_sse::stream_forward(lines, tx, proto, chat_id, model);
+                    let (error_info, sent_any, failed_inline, usage) =
+                        wb_sse::stream_forward_ex(lines, tx, proto, chat_id, model);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         let (pt, ct) = usage
@@ -357,7 +345,7 @@ fn run_wb_stream(
                                 )
                             })
                             .unwrap_or((0, 0));
-                        state.record_usage(true, model, &picked.uid, key_id, error_info.is_none(), true, duration_ms, pt, ct);
+                        state.record_usage(true, model, &picked.uid, key_id, error_info.is_none() && !failed_inline, true, duration_ms, pt, ct);
                     }
                     match error_info {
                         Some((code, msg)) => {
@@ -372,21 +360,32 @@ fn run_wb_stream(
                                 // 流未开始：错误不下发，允许换号重试
                                 break;
                             }
-                            state.logger.log_request(
+                            state.logger.log_request_ttfb(
                                 "buddy", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
-                                duration_ms, Some(&format!("ttfb={}ms msg={}", ttfb_ms, msg)),
+                                duration_ms, Some(ttfb_ms), Some(&msg),
                             );
                             return; // 已有数据流出：就地收尾
                         }
                         None => {
+                            if failed_inline {
+                                // 流内失败已就地透传客户端（response.failed / error 事件
+                                // 已下发）：不重试、不 note_success、不清模型冷却、不绑定
+                                // 粘性会话；亦不 note_error——错误已原样给到客户端，内容类
+                                // 失败计入冷却会造成账号过度冷却
+                                state.logger.log_request_ttfb(
+                                    "buddy", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
+                                    duration_ms, Some(ttfb_ms), Some("流内失败已透传客户端"),
+                                );
+                                return;
+                            }
                             state.wb_pool.note_success(&picked.uid);
                             clear_model_failure(state, model);
                             // 绑定粘性会话（Mutex 内 re-check 防 TOCTOU）
                             state.wb_sticky.bind(&sticky_key, &picked.uid, &conv_id, now_ts());
                             state.wb_sticky.save(&state.data_dir);
-                            state.logger.log_request(
+                            state.logger.log_request_ttfb(
                                 "buddy", "POST", "/v2/chat/completions", model, true, 200, &picked.uid,
-                                duration_ms, Some(&format!("ttfb={}ms", ttfb_ms)),
+                                duration_ms, Some(ttfb_ms), None,
                             );
                             return;
                         }
@@ -789,6 +788,9 @@ pub async fn wb_tool_exec_chat(
 
             // 工具代执行轮次循环（每轮 = 一次上游请求）
             let mut round: usize = 0;
+            // 各轮上游 usage 累加（含最终轮），成功时写回最终 completion——
+            // 多轮回喂的真实消耗 = 各轮之和，只记最终轮会少计中间轮
+            let mut acc_usage = (0u64, 0u64);
             let outcome = loop {
                 if round >= super::wb_toolexec::MAX_ROUNDS {
                     break Err(format!(
@@ -829,8 +831,31 @@ pub async fn wb_tool_exec_chat(
                         let Some(completion) = completion else {
                             break Err("上游返回空响应".to_string());
                         };
+                        if let Some(u) = completion.get("usage") {
+                            acc_usage = (
+                                acc_usage.0 + u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                                acc_usage.1 + u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                            );
+                        }
                         let calls = super::wb_toolexec::extract_proxy_calls(&completion);
                         if calls.is_empty() {
+                            // 最终回复：usage 写回全部轮次累加值（中间轮消耗计入总账）
+                            let mut completion = completion;
+                            match completion.get_mut("usage") {
+                                Some(u) => {
+                                    u["prompt_tokens"] = json!(acc_usage.0);
+                                    u["completion_tokens"] = json!(acc_usage.1);
+                                    if u.get("total_tokens").is_some() {
+                                        u["total_tokens"] = json!(acc_usage.0 + acc_usage.1);
+                                    }
+                                }
+                                None => {
+                                    completion["usage"] = json!({
+                                        "prompt_tokens": acc_usage.0,
+                                        "completion_tokens": acc_usage.1,
+                                    });
+                                }
+                            }
                             break Ok(completion); // 最终回复
                         }
                         // 本地代执行 + 回喂

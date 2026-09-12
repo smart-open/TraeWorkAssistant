@@ -229,13 +229,22 @@ pub fn save(data_dir: &Path, f: &ApiKeysFile) {
 /// 原子完成，否则并发请求互相覆盖 used_today/daily_stats——配额可被穿透、统计少记。
 static KEYS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 鉴权记账原子操作：锁内 load → verify_and_consume → save。
+/// 序列化对比：verify 后文件是否发生变化（P1 修复5a）。
+/// 无变化（Invalid 等只读路径）跳过写盘，消除鉴权热路径的无效磁盘写
+fn keys_file_changed(before: &[u8], f: &ApiKeysFile) -> bool {
+    serde_json::to_vec(f).map(|b| b != before).unwrap_or(true)
+}
+
+/// 鉴权记账原子操作：锁内 load → verify_and_consume → 有变化才 save。
 /// auth 中间件每请求调用本函数，禁止绕开锁直接 load+save。
 pub fn verify_and_consume_locked(data_dir: &Path, presented: &str, today: &str) -> KeyCheck {
     let _guard = KEYS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut f = load(data_dir);
+    let before = serde_json::to_vec(&f).unwrap_or_default();
     let r = f.verify_and_consume(presented, today);
-    save(data_dir, &f);
+    if keys_file_changed(&before, &f) {
+        save(data_dir, &f);
+    }
     r
 }
 
@@ -342,6 +351,46 @@ mod tests {
         assert_eq!(loaded.keys[0].daily_limit, 5);
         assert_eq!(loaded.keys[0].allowed_accounts, vec!["wb-9"]);
         assert_eq!(loaded.keys[0].schedule_mode(), MODE_DEDICATED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==================== P1 修复5a：无变化跳过写盘 ====================
+
+    #[test]
+    fn changed_detects_consume_but_not_invalid() {
+        let mut f = ApiKeysFile {
+            keys: vec![entry("k1", "ck-a", true, 0)],
+            auth_disabled: false,
+        };
+        let before = serde_json::to_vec(&f).unwrap();
+        assert!(!keys_file_changed(&before, &f), "未变更不应触发写盘");
+        let _ = f.verify_and_consume("ck-a", "d1");
+        assert!(keys_file_changed(&before, &f), "记账后应触发写盘");
+    }
+
+    #[test]
+    fn locked_verify_skips_write_when_unchanged() {
+        // Invalid 路径不改写文件；命中记账路径正常落盘
+        let dir = std::env::temp_dir().join(format!("twa_keys_locked_{}", std::process::id()));
+        let f = ApiKeysFile {
+            keys: vec![entry("k1", "ck-a", true, 0)],
+            auth_disabled: false,
+        };
+        save(&dir, &f);
+        let before = std::fs::read(keys_path(&dir)).unwrap();
+        assert!(matches!(
+            verify_and_consume_locked(&dir, "ck-wrong", "d1"),
+            KeyCheck::Invalid
+        ));
+        let after = std::fs::read(keys_path(&dir)).unwrap();
+        assert_eq!(before, after, "Invalid 路径不应改写文件");
+        // 命中记账：文件应更新
+        assert!(matches!(
+            verify_and_consume_locked(&dir, "ck-a", "d1"),
+            KeyCheck::Ok(_)
+        ));
+        let updated = load(&dir);
+        assert_eq!(updated.keys[0].used_today, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,10 +1,15 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use tauri::State;
 
 use crate::fs_utils;
 use crate::jwt;
 use crate::models::RawAccount;
 use crate::state::AppState;
+
+/// 最近签发的 OAuth state（CSRF 防护）：oauth_get_login_url 签发时记录，
+/// oauth_parse_callback 在回调携带 state 且本进程签发过时强校验一致性
+static LAST_OAUTH_STATE: Mutex<Option<String>> = Mutex::new(None);
 
 /// OAuth 常量
 const OAUTH_CLIENT_ID: &str = "en1oxy7wnw8j9n";
@@ -49,8 +54,39 @@ fn short_agent() -> ureq::Agent {
         .build()
 }
 
-/// 生成随机 hex 字符串
+/// 生成随机 hex 字符串。
+/// 熵源：OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG）。旧 LCG 以时间戳作种子，
+/// 输出可预测，不适合 OAuth state / machine_id 等安全场景（审查 P2）；BCrypt 失败时
+/// 保留 LCG 兜底（仅影响随机性，不中断流程）。
 pub(crate) fn random_hex(len: usize) -> String {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        let mut bytes = vec![0u8; len.div_ceil(2)];
+        let halg: windows_sys::Win32::Security::Cryptography::BCRYPT_ALG_HANDLE =
+            unsafe { std::mem::zeroed() };
+        // STATUS_SUCCESS == 0
+        let status = unsafe {
+            BCryptGenRandom(halg, bytes.as_mut_ptr(), bytes.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+        };
+        if status == 0 {
+            let mut out = String::with_capacity(len);
+            for b in bytes {
+                if out.len() >= len {
+                    break;
+                }
+                out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+                if out.len() >= len {
+                    break;
+                }
+                out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
+            }
+            return out;
+        }
+    }
+    // 兜底：旧 LCG（仅非 Windows 或 BCrypt 调用失败时）
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -101,7 +137,11 @@ pub fn oauth_get_login_url() -> OAuthLoginUrl {
 
     OAuthLoginUrl {
         url,
-        state,
+        // 记录最近签发的 state 供回调校验（CSRF）
+        state: {
+            *LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(state.clone());
+            state
+        },
         redirect_uri: OAUTH_REDIRECT_URI.to_string(),
     }
 }
@@ -153,6 +193,18 @@ pub fn oauth_parse_callback(callback_url: String) -> Result<OAuthCallbackInfo, S
         .cloned();
 
     let avatar = params.get("avatar").cloned();
+
+    // CSRF 校验（审查 P2）：回调携带 state 且本进程签发过 state 时，两者必须一致；
+    // 不一致的回调 URL 可能来自伪造/重放，直接拒绝。回调不带 state（旧流程/第三方拼 URL）
+    // 或本进程从未签发过（如重启后直接粘贴回调）时保持宽容，不阻断正常登录
+    if let Some(cb_state) = params.get("state") {
+        let issued = LAST_OAUTH_STATE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(expected) = issued {
+            if !expected.is_empty() && cb_state != &expected {
+                return Err("OAuth state 校验失败：回调 URL 与本机发起的登录请求不匹配（可能为伪造或重放），已拒绝".into());
+            }
+        }
+    }
 
     Ok(OAuthCallbackInfo {
         refresh_token,
@@ -288,7 +340,11 @@ pub fn oauth_login(
                 .map(|(uid, uname)| if uname.is_empty() { uid } else { uname })
                 .ok()
         })
-        .unwrap_or_else(|| format!("账号_{}", &user_id[..user_id.len().min(8)]));
+        .unwrap_or_else(|| {
+            // 按字符截取（字节切片在多字节 UTF-8 边界处会 panic）
+            let head: String = user_id.chars().take(8).collect();
+            format!("账号_{head}")
+        });
 
     // 6. 确定最终的 refresh_token（优先使用 ExchangeToken 返回的新 token）
     let final_refresh_token = new_refresh_token

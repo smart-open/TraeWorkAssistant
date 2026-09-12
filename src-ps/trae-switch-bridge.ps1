@@ -1188,6 +1188,12 @@ try {
         Write-Step -Stage 'init' -Message '缺少 -UserId 参数' -Status 'error'
         exit 1
     }
+    # 入参防护：UserId 会被拼进快照路径/日志/命令行，仅允许字母、数字、下划线、连字符（4~64 位），
+    # 拦截路径穿越与特殊字符注入。不匹配报 fatal NDJSON 并走现有 fatal 退出路径。
+    if ($UserId -and ($UserId -notmatch '^[A-Za-z0-9_\-]{4,64}$')) {
+        Write-Step -Stage 'fatal' -Message "UserId 参数格式非法（仅允许 A-Z a-z 0-9 _ -，长度 4~64 位）: $UserId" -Status 'error'
+        exit 1
+    }
     Write-Step -Stage 'init' -Message "开始操作: $Action (userId=$UserId, targetApp=$TargetApp → $($Script:AppName))" -Status 'info'
 
     switch ($Action) {

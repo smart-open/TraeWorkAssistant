@@ -184,6 +184,8 @@ pub async fn do_start(
     wb_pool.sync_from_wb(&wb_accounts, &pool_file.enabled_uids);
     let wb_count = wb_pool.count();
     let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
+    // Buddy 池策略：wb_strategy 独立配置优先；空 = 跟随 Trae 池（与 pool_set 热应用逻辑一致）
+    let wb_strategy = crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy);
     fs_utils::app_log(
         &state.data_dir,
         &format!(
@@ -191,10 +193,10 @@ pub async fn do_start(
             pool_file.wb_enabled,
             wb_count,
             wb_healthy,
-            crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy).as_str(),
+            wb_strategy.as_str(),
         ),
     );
-    wb_pool.set_strategy(strategy);
+    wb_pool.set_strategy(wb_strategy);
 
     // 池为空时给出明确警告
     if pool_count == 0 {
@@ -221,7 +223,6 @@ pub async fn do_start(
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
-        wb_template_cache: Mutex::new(None),
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -360,13 +361,42 @@ pub fn pool_list(state: State<'_, AppState>) -> ApiPoolFile {
     fs_utils::read_json(&state.path("api_pool.json"))
 }
 
+/// pool_set 字段合并（纯函数，便于单测）：未传（None）保留 existing 原值，传值覆盖。
+/// 注意 strategy/wb_strategy 的显式空串是合法值（"跟随默认"语义），与 None（未传）区分；
+/// group_ids 显式空数组 = 清空分组，None = 保留（语义与其他字段统一）。
+fn merge_pool_set(
+    existing: &ApiPoolFile,
+    uids: Vec<String>,
+    strategy: Option<String>,
+    wb_strategy: Option<String>,
+    group_ids: Option<Vec<String>>,
+    wb_enabled: Option<bool>,
+    wb_default_thinking: Option<bool>,
+    wb_tool_exec: Option<bool>,
+    wb_bg_downgrade: Option<bool>,
+) -> ApiPoolFile {
+    ApiPoolFile {
+        enabled_uids: uids,
+        strategy: strategy.unwrap_or_else(|| existing.strategy.clone()),
+        wb_strategy: wb_strategy.unwrap_or_else(|| existing.wb_strategy.clone()),
+        group_ids: group_ids.unwrap_or_else(|| existing.group_ids.clone()),
+        wb_enabled: wb_enabled.unwrap_or(existing.wb_enabled),
+        wb_default_thinking: wb_default_thinking.unwrap_or(existing.wb_default_thinking),
+        wb_tool_exec: wb_tool_exec.unwrap_or(existing.wb_tool_exec),
+        wb_bg_downgrade: wb_bg_downgrade.unwrap_or(existing.wb_bg_downgrade),
+    }
+}
+
 /// 批量设置池中的账号 UID 列表 + 调度策略 + 分组筛选（T10）+ WB 上游开关（T2.1）
-/// + T5.3 默认深度思考 / T5.5 工具代执行 / T5.6③ 后台任务降级（未传字段保留原值）
+/// + T5.3 默认深度思考 / T5.5 工具代执行 / T5.6③ 后台任务降级（未传字段保留原值）。
+/// 策略部分热应用：运行中池立即生效（成员/分组变更仍需重启重建池）。
 #[tauri::command]
 pub fn pool_set(
     state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     uids: Vec<String>,
     strategy: Option<String>,
+    wb_strategy: Option<String>,
     group_ids: Option<Vec<String>>,
     wb_enabled: Option<bool>,
     wb_default_thinking: Option<bool>,
@@ -374,16 +404,28 @@ pub fn pool_set(
     wb_bg_downgrade: Option<bool>,
 ) -> Result<(), String> {
     let existing: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
-    let pool_file = ApiPoolFile {
-        enabled_uids: uids,
-        strategy: strategy.unwrap_or_default(),
-        group_ids: group_ids.unwrap_or_default(),
-        wb_enabled: wb_enabled.unwrap_or(existing.wb_enabled),
-        wb_default_thinking: wb_default_thinking.unwrap_or(existing.wb_default_thinking),
-        wb_tool_exec: wb_tool_exec.unwrap_or(existing.wb_tool_exec),
-        wb_bg_downgrade: wb_bg_downgrade.unwrap_or(existing.wb_bg_downgrade),
-    };
-    fs_utils::write_json(&state.path("api_pool.json"), &pool_file)
+    let pool_file = merge_pool_set(
+        &existing,
+        uids,
+        strategy,
+        wb_strategy,
+        group_ids,
+        wb_enabled,
+        wb_default_thinking,
+        wb_tool_exec,
+        wb_bg_downgrade,
+    );
+    fs_utils::write_json(&state.path("api_pool.json"), &pool_file)?;
+    // 热应用：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
+    if let Some(rt) = safe_lock(&runtime).as_ref() {
+        rt.shared
+            .pool
+            .set_strategy(crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy));
+        rt.shared.wb_pool.set_strategy(
+            crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy),
+        );
+    }
+    Ok(())
 }
 
 /// 返回运行中池的实时状态（冷却/积分等）；服务未运行时返回空数组
@@ -698,4 +740,114 @@ pub fn trae_model_meta_get(
 #[tauri::command]
 pub fn trae_model_meta_clear(state: State<'_, AppState>, model: String) -> Result<bool, String> {
     crate::api_server::unified_catalog::meta_clear(&state.data_dir, &model)
+}
+
+// ==================== 单元测试：pool_set 合并语义（调度策略收口） ====================
+
+#[cfg(test)]
+mod pool_merge_tests {
+    use super::merge_pool_set;
+    use crate::models::ApiPoolFile;
+
+    /// 模拟已存在的 api_pool.json（各字段均非默认值，验证"保留"是否生效）
+    fn existing() -> ApiPoolFile {
+        ApiPoolFile {
+            enabled_uids: vec!["u1".into()],
+            strategy: "weighted".into(),
+            wb_strategy: "p2c".into(),
+            group_ids: vec!["g1".into()],
+            wb_enabled: true,
+            wb_default_thinking: true,
+            wb_tool_exec: false,
+            wb_bg_downgrade: false,
+        }
+    }
+
+    #[test]
+    fn none_fields_preserve_existing() {
+        // 只改成员（uids 必传覆盖），其余未传 → 全部保留原值
+        let m = merge_pool_set(
+            &existing(),
+            vec!["u2".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
+        assert_eq!(m.strategy, "weighted");
+        assert_eq!(m.wb_strategy, "p2c");
+        assert_eq!(m.group_ids, vec!["g1".to_string()]);
+        assert!(m.wb_enabled);
+        assert!(m.wb_default_thinking);
+        assert!(!m.wb_tool_exec);
+        assert!(!m.wb_bg_downgrade);
+    }
+
+    #[test]
+    fn some_fields_override_and_empty_string_is_legal_value() {
+        // 显式空串 = "跟随默认"合法值（区别于 None 未传）；显式空数组 = 清空分组
+        let m = merge_pool_set(
+            &existing(),
+            vec![],
+            Some("p2c".into()),
+            Some("".into()),
+            Some(vec![]),
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(true),
+        );
+        assert_eq!(m.strategy, "p2c");
+        assert_eq!(m.wb_strategy, "");
+        assert!(m.group_ids.is_empty());
+        assert!(!m.wb_enabled);
+        assert!(!m.wb_default_thinking);
+        assert!(m.wb_tool_exec);
+        assert!(m.wb_bg_downgrade);
+    }
+
+    #[test]
+    fn strategy_only_caller_does_not_touch_wb_and_flags() {
+        // Trae 资源调度页收口后只保存成员/分组：不传 strategy/wb_strategy/开关组 → 均保留
+        let m = merge_pool_set(
+            &existing(),
+            vec!["u1".into(), "u3".into()],
+            None,
+            None,
+            Some(vec!["g2".into()]),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(m.enabled_uids.len(), 2);
+        assert_eq!(m.group_ids, vec!["g2".to_string()]);
+        assert_eq!(m.strategy, "weighted");
+        assert_eq!(m.wb_strategy, "p2c");
+        assert!(m.wb_enabled);
+    }
+
+    #[test]
+    fn empty_existing_preserves_nothing_but_fills_defaults() {
+        // 旧版 api_pool.json（无策略字段）+ 只传成员：策略落为空串（运行时 parse 回退 expire_first）
+        let m = merge_pool_set(
+            &ApiPoolFile::default(),
+            vec!["u1".into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(m.strategy, "");
+        assert_eq!(m.wb_strategy, "");
+        assert!(m.group_ids.is_empty());
+        assert!(!m.wb_enabled);
+    }
 }

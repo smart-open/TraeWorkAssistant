@@ -70,10 +70,21 @@ impl RouteResult {
     }
 }
 
-/// 读取路由配置；缺失/损坏 → 空配置（四级中 ①②④ 用户部分退化为内置层）
+/// 读取路由配置；缺失/损坏 → 空配置（四级中 ①②④ 用户部分退化为内置层）。
+/// data/ 新路径优先，不存在时回退旧根路径（存量用户数据兼容）；
+/// 写入方（配置命令）负责落盘到 data/ 新路径
 pub fn load_config(data_dir: &Path) -> WbRouteFile {
-    // 带解析缓存（每请求热路径）：write_json 逐出 + mtime 兜底保证新鲜
-    crate::fs_utils::read_json_cached(&data_dir.join(ROUTE_FILE)).unwrap_or_default()
+    let new_path = data_dir.join("data").join(ROUTE_FILE);
+    if let Some(cfg) = crate::fs_utils::read_json_cached::<WbRouteFile>(&new_path) {
+        return cfg;
+    }
+    if !new_path.exists() {
+        let legacy = data_dir.join(ROUTE_FILE);
+        if legacy.exists() {
+            return crate::fs_utils::read_json_cached::<WbRouteFile>(&legacy).unwrap_or_default();
+        }
+    }
+    WbRouteFile::default()
 }
 
 /// 内置系列通配（③）：知名闭源模型族 → 目录代表模型。
@@ -417,5 +428,40 @@ mod tests {
         assert_eq!(v2["reasoning_effort"], json!("low"));
         // None 提示原样返回
         assert_eq!(inject_effort_hint(&body, &None), body);
+    }
+
+    /// 配置读取迁移：data/ 新路径优先，缺失回退旧根路径，全缺失为空配置
+    #[test]
+    fn load_config_reads_data_subdir_with_legacy_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_route_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        // 双路径全缺失 → 空配置
+        let empty = load_config(&dir);
+        assert!(empty.aliases.is_empty() && empty.rules.is_empty());
+        // 仅旧根路径存在 → 回退读取（存量用户数据兼容）
+        std::fs::write(
+            dir.join(ROUTE_FILE),
+            json!({"aliases": {"gpt-4o": "glm-5.3"}}).to_string(),
+        )
+        .unwrap();
+        let cfg = load_config(&dir);
+        assert_eq!(cfg.aliases.get("gpt-4o").map(String::as_str), Some("glm-5.3"));
+        // data/ 新路径存在 → 优先于旧路径
+        std::fs::write(
+            dir.join("data").join(ROUTE_FILE),
+            json!({"aliases": {"claude-x": "hy4"}}).to_string(),
+        )
+        .unwrap();
+        let cfg = load_config(&dir);
+        assert!(cfg.aliases.contains_key("claude-x"));
+        assert!(!cfg.aliases.contains_key("gpt-4o"), "新路径存在时不再回退旧路径");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import threading
 import time
+import atexit
 import base64
 import random
 import uuid
@@ -171,26 +172,62 @@ def decompress_body(body, resp_headers):
     return body
 
 
+# 脱敏红线：日志禁止明文落盘的凭证头清单（键比较不区分大小写）
+_SENSITIVE_HEADERS = {"authorization", "cookie", "set-cookie", "x-api-key", "proxy-authorization"}
+
+
+def _mask_header_value(name, value):
+    """凭证头掩码：len>16 取前8+"…"+后4，否则 "***"；非凭证头原样返回。
+    请求行/路径中的 token 查询参数暂不处理（已确认可接受）。"""
+    try:
+        if (name or "").lower() in _SENSITIVE_HEADERS:
+            v = str(value or "")
+            if len(v) > 16:
+                return v[:8] + "…" + v[-4:]
+            return "***"
+    except Exception:
+        return "***"
+    return value
+
+
 class ProxyRequestLogger:
-    """将代理抓取到的完整请求/响应记录到明文文件，按 100MB 滚动存储。
-    文件存放在 logs/ 目录下，文件名前缀 proxy_req_ 以区分 proxy.log 操作日志。"""
+    """将代理抓取到的完整请求/响应记录到明文文件。
+    按日命名（proxy_req_%Y-%m-%d.log，同日追加），单日超 100MB 时换 .log.N 序号文件继续追加。
+    文件存放在 logs/ 目录下，文件名前缀 proxy_req_ 以区分 proxy.log 操作日志。
+
+    脱敏红线：本文件是明文落盘日志，任何凭证类请求/响应头（authorization/cookie/
+    set-cookie/x-api-key/proxy-authorization）写入前必须经 _mask_header_value 掩码，
+    禁止明文落盘。"""
     def __init__(self, log_dir, max_size_mb=100):
         self.log_dir = log_dir
         self.max_size = max_size_mb * 1024 * 1024
         self._lock = threading.Lock()
         self._fd = None
         self._file_size = 0
+        self._day = None
+        self._seq = 0
         os.makedirs(log_dir, exist_ok=True)
 
     def _ensure_file(self):
-        if self._fd and self._file_size < self.max_size:
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        if self._fd and self._day == today and self._file_size < self.max_size:
             return
         if self._fd:
             self._fd.close()
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = os.path.join(self.log_dir, f"proxy_req_{ts}.log")
+            self._fd = None
+        # 跨日换新文件（序号归零）；同日单文件超 100MB 时换 .N 序号文件继续追加
+        if self._day != today:
+            self._day = today
+            self._seq = 0
+        base = os.path.join(self.log_dir, f"proxy_req_{self._day}.log")
+        while True:
+            path = base if self._seq == 0 else f"{base}.{self._seq}"
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            if size < self.max_size:
+                break
+            self._seq += 1
         self._fd = open(path, "a", encoding="utf-8")
-        self._file_size = os.path.getsize(path) if os.path.exists(path) else 0
+        self._file_size = size
 
     def log_request(self, method, host, path, req_headers, req_body, resp_status, resp_reason, resp_headers, resp_body):
         with self._lock:
@@ -202,7 +239,8 @@ class ProxyRequestLogger:
                 f"--- Request Headers ---",
             ]
             for k, v in req_headers.items():
-                lines.append(f"  {k}: {v}")
+                # 脱敏红线：凭证头掩码后落盘，禁止明文（见类注释）
+                lines.append(f"  {k}: {_mask_header_value(k, v)}")
             if req_body:
                 body_preview = req_body[:4096].decode("utf-8", "replace") if isinstance(req_body, bytes) else str(req_body)[:4096]
                 lines.append(f"--- Request Body ({len(req_body)} bytes) ---")
@@ -210,7 +248,8 @@ class ProxyRequestLogger:
             lines.append(f"--- Response: {resp_status} {resp_reason} ---")
             if resp_headers:
                 for k, v in resp_headers:
-                    lines.append(f"  {k}: {v}")
+                    # 脱敏红线：Set-Cookie 等凭证头掩码后落盘
+                    lines.append(f"  {k}: {_mask_header_value(k, v)}")
             if resp_body:
                 # 先解压再展示，避免 gzip/deflate/br 压缩导致的乱码
                 decompressed = decompress_body(resp_body, resp_headers)
@@ -238,7 +277,8 @@ class ProxyRequestLogger:
                 f"--- Request Headers ---",
             ]
             for k, v in req_headers.items():
-                lines.append(f"  {k}: {v}")
+                # 脱敏红线：升级请求同样携带 Authorization 等凭证头，掩码后落盘
+                lines.append(f"  {k}: {_mask_header_value(k, v)}")
             lines.append("--- WebSocket tunnel established: 双向帧载荷将在隧道中按 SEQ 记录 ---")
             data = "\n".join(lines) + "\n"
             self._fd.write(data)
@@ -646,6 +686,9 @@ DOUBAO_CREDENTIAL_FILE = os.path.join(DATA_SUBDIR, "doubao_captured_credentials.
 DOUBAO_CREDENTIAL_COOKIES = ("sessionid", "sid_guard", "ttwid")
 DOUBAO_HOST_SUFFIX = ".doubao.com"  # 凭证抓取域后缀匹配（www.doubao.com / lime.doubao.com 等）
 _doubao_captured_cache = {}  # 进程内去重：内容未变化不重写文件
+# 保护「缓存比对-更新-文件落盘」读改写序列：每连接一线程并发抓包时，
+# 无锁会导致交错写文件（半行 JSON / 缓存与文件内容不一致）
+_doubao_capture_lock = threading.Lock()
 
 
 def _parse_cookie_header(cookie_str):
@@ -718,15 +761,17 @@ def try_capture_doubao_credentials(host, req_headers, resp_headers):
             "host": h,
             "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        if _doubao_captured_cache.get("session_id") == session_id and \
-                _doubao_captured_cache.get("sid_guard") == sid_guard and \
-                _doubao_captured_cache.get("ttwid") == ttwid and \
-                _doubao_captured_cache.get("uid") == uid:
-            return  # 未变化不重写
-        _doubao_captured_cache.update(captured)
-        os.makedirs(DATA_SUBDIR, exist_ok=True)
-        with open(DOUBAO_CREDENTIAL_FILE, "w", encoding="utf-8") as f:
-            json.dump(captured, f, ensure_ascii=False, indent=2)
+        # 读改写全程持锁：多连接线程并发抓到凭证时保证缓存与落盘文件一致
+        with _doubao_capture_lock:
+            if _doubao_captured_cache.get("session_id") == session_id and \
+                    _doubao_captured_cache.get("sid_guard") == sid_guard and \
+                    _doubao_captured_cache.get("ttwid") == ttwid and \
+                    _doubao_captured_cache.get("uid") == uid:
+                return  # 未变化不重写
+            _doubao_captured_cache.update(captured)
+            os.makedirs(DATA_SUBDIR, exist_ok=True)
+            with open(DOUBAO_CREDENTIAL_FILE, "w", encoding="utf-8") as f:
+                json.dump(captured, f, ensure_ascii=False, indent=2)
         log(f"  [doubao] 抓到会话凭证: sessionid={len(session_id)} 字符"
             + (f"，sid_guard={len(sid_guard)} 字符" if sid_guard else "")
             + (f"，ttwid={len(ttwid)} 字符" if ttwid else "")
@@ -914,8 +959,61 @@ import threading
 import time
 _leaf_lock = threading.Lock()  # 保护叶子证书生成与缓存，避免并发同名文件覆盖导致 KEY_VALUES_MISMATCH
 
+# 本进程创建的叶子证书/私钥临时文件登记表：进程退出（含异常退出路径）时经 atexit 统一删除。
+# 叶子私钥等同临时凭证，不允许在 data/certs/ 下长期残留（历史行为是留待进程退出清理但无钩子）。
+_leaf_temp_files = set()
+
+
+def _cleanup_leaf_temp_files():
+    """atexit 钩子：删除本进程创建的全部 leaf_*.crt/.key 临时文件。"""
+    for p in list(_leaf_temp_files):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        _leaf_temp_files.discard(p)
+
+
+atexit.register(_cleanup_leaf_temp_files)
+
+
+def _sweep_stale_leaf_files():
+    """启动时清扫 data/certs/ 下残留的 leaf_*.crt/.key（上次进程崩溃/被杀未及清理的孤儿文件）。"""
+    try:
+        if not os.path.isdir(CA_DIR):
+            return
+        n = 0
+        for name in os.listdir(CA_DIR):
+            if name.startswith("leaf_") and (name.endswith(".crt") or name.endswith(".key")):
+                try:
+                    os.remove(os.path.join(CA_DIR, name))
+                    n += 1
+                except OSError:
+                    pass
+        if n:
+            log(f"  [leaf_cert] 清扫残留叶子证书临时文件 {n} 个")
+    except Exception as e:  # noqa: BLE001
+        log(f"  [leaf_cert] 残留清扫失败(已忽略): {e}")
+
+
+def _harden_ca_dir():
+    """收紧 CA 目录 ACL（仅 Windows）：移除继承、仅保留当前用户完全控制，
+    防止同机其他低权限账户读取 CA 私钥。失败静默（不影响代理功能）。"""
+    if os.name != "nt":
+        return
+    try:
+        r = subprocess.run(
+            ["icacls", CA_DIR, "/inheritance:r", "/grant:r", f"{os.environ.get('USERNAME', '')}:F"],
+            capture_output=True, timeout=15, creationflags=0x08000000)
+        if r.returncode == 0:
+            log(f"  [ca] 已收紧 CA 目录权限（仅当前用户）: {CA_DIR}")
+    except Exception:  # noqa: BLE001
+        pass  # 静默：ACL 收紧失败不影响功能
+
+
 def ensure_ca():
     global _ca_cert, _ca_key
+    _sweep_stale_leaf_files()
     cert_pem = os.path.join(CA_DIR, "ca.crt")
     key_pem = os.path.join(CA_DIR, "ca.key")
     cer_der = os.path.join(CA_DIR, "ca.cer")
@@ -962,6 +1060,8 @@ def ensure_ca():
         f.write(cert.public_bytes(serialization.Encoding.DER))
     _ca_cert, _ca_key = cert, key
     log("已生成自签 CA ->", cert_pem, "/", cer_der)
+    # 生成 CA 后收紧目录权限（已存在 CA 的启动路径不重复执行，避免反复改 ACL）
+    _harden_ca_dir()
 
 def leaf_cert(host):
     with _leaf_lock:
@@ -1013,6 +1113,9 @@ def leaf_cert(host):
                 except OSError:
                     pass
             raise
+        # 登记本进程创建的临时文件，atexit 钩子退出时统一删除（私钥不留盘残留）
+        _leaf_temp_files.add(cpath)
+        _leaf_temp_files.add(kpath)
         # LRU 驱逐：超过上限时删除最旧的条目（仅移除缓存引用，临时文件留待进程退出清理）
         if len(_leaf_cache) >= _LEAF_CACHE_MAX:
             oldest = next(iter(_leaf_cache))
@@ -1122,6 +1225,10 @@ def _ws_extract_strings(data, min_len=4, max_strings=80):
     return out[:max_strings]
 
 
+# WS 解析缓冲上限（10MB）：feed 累积超过即断开连接，防畸形超长帧打爆内存
+_WS_BUF_MAX = 10 * 1024 * 1024
+
+
 class _WSMessageParser:
     """流式解析 WebSocket 帧，按消息(含续帧重组)回调 on_message(opcode, raw, direction)。
     客户端->服务端帧带掩码(本解析器自动去掩码)，服务端->客户端不带掩码。
@@ -1136,6 +1243,10 @@ class _WSMessageParser:
 
     def feed(self, data, direction):
         self.buf += data
+        # 缓冲上限：畸形超长帧/声明超大长度却不发数据的流会让 buf 无限增长，
+        # 超限直接抛错断开隧道（调用方 _pipe 捕获后关闭双向连接），防止内存被打爆
+        if len(self.buf) > _WS_BUF_MAX:
+            raise ValueError(f"WS 解析缓冲超限 ({len(self.buf)} > {_WS_BUF_MAX})，断开连接")
         while True:
             msg = self._try_parse(direction)
             if msg is None:
@@ -1303,6 +1414,12 @@ def forward_websocket(host, port, method, path, headers, body, client_tls):
                 return
 
             log(f"  {ws_tag} 升级成功 (101 Switching Protocols), 开始双向隧道")
+            # WS 隧道建立后解除握手期的 300s 连接超时：空闲 WS 长连接不应被超时切断
+            try:
+                client_tls.settimeout(None)
+                upstream_tls.settimeout(None)
+            except Exception:
+                pass
             # 记录到代理日志
             pl = get_proxy_logger()
             if pl:
@@ -1689,6 +1806,13 @@ def tunnel_raw(client_sock, host, port):
     except Exception:
         return
 
+    # 隧道建立后解除握手期的 300s 连接超时：长下载/长连接不因空闲被超时切断
+    try:
+        client_sock.settimeout(None)
+        remote.settimeout(None)
+    except Exception:
+        pass
+
     _raw_stats = {"c2r": 0, "r2c": 0}
 
     def pipe(src, dst, direction, stats):
@@ -1769,8 +1893,24 @@ def handle_plain(conn, buf):
                 send_response(conn, _resp.status, _resp.reason, _resp.getheaders(), _resp_body)
                 _c.close()
                 return
-            except Exception:
-                pass  # 回退到下面的直连逻辑
+            except Exception as e:
+                # 回退到下面的直连逻辑（原为静默回退，排查无据——现记录一行）
+                log(f"  [plain] http 上游转发失败({type(e).__name__}: {e})，回退直连: {host}{u.path}")
+        elif _up and _up[0] == "socks5":
+            # SOCKS5 上游：复用 CONNECT 隧道同款 SOCKS5 建连辅助（connect_via_upstream），
+            # 经上游建连到目标 host:port 后发送原请求（origin-form）。失败回退直连。
+            try:
+                _s = connect_via_upstream(host, port, _up)
+                _c = http.client.HTTPConnection(host, port, timeout=30)
+                _c.sock = _s  # 复用经 SOCKS5 上游建连的 socket，http.client 在其上收发
+                _c.request(method, u.path or "/", body=body if method.upper() != "GET" else None, headers=fwd)
+                _resp = _c.getresponse()
+                _resp_body = _resp.read()
+                send_response(conn, _resp.status, _resp.reason, _resp.getheaders(), _resp_body)
+                _c.close()
+                return
+            except Exception as e:
+                log(f"  [plain] socks5 上游转发失败({type(e).__name__}: {e})，回退直连: {host}{u.path}")
     try:
         c.request(method, u.path or "/", body=body if method.upper() != "GET" else None, headers=fwd)
         resp = c.getresponse()
@@ -1791,8 +1931,17 @@ def handle_plain(conn, buf):
         c.close()
 
 # ---------------- 客户端连接分发 ----------------
+# 每连接一线程且无上限：异常/恶意客户端可无限消耗线程与 fd。信号量限制并发连接数，
+# 获取不到（并发 >128）时直接关闭新连接，保证代理自身不被打挂。
+_CONN_SEMAPHORE = threading.Semaphore(128)
+# 客户端 socket 默认超时：防止握手/收头慢的连接永久挂死线程。长连接场景（隧道建立后）
+# 在 tunnel_raw / forward_websocket 中会按需重置为 None，不影响长下载/WS 长连接。
+_CONN_TIMEOUT = 300
+
+
 def handle_client(conn, addr):
     try:
+        conn.settimeout(_CONN_TIMEOUT)
         buf = conn.recv(4096)
         if not buf:
             return
@@ -1916,10 +2065,26 @@ def main():
                 log(f"[accept] 异常(已忽略并重试): {type(e).__name__}: {e}")
                 time.sleep(0.1)
                 continue
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            # 并发连接数超限（信号量获取不到）时直接关闭新连接，不再无限开线程
+            if not _CONN_SEMAPHORE.acquire(blocking=False):
+                log(f"[overload] 并发连接已达上限 128，拒绝来自 {addr} 的新连接")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                continue
+            t = threading.Thread(target=_handle_client_guarded, args=(conn, addr), daemon=True)
             t.start()
     except KeyboardInterrupt:
         log("代理停止")
+
+
+def _handle_client_guarded(conn, addr):
+    """handle_client 的信号量守护包装：处理结束（含异常）后必须归还信号量。"""
+    try:
+        handle_client(conn, addr)
+    finally:
+        _CONN_SEMAPHORE.release()
 
 if __name__ == "__main__":
     sys.exit(main() or 0)

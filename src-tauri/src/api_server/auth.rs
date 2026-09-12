@@ -43,30 +43,44 @@ pub async fn bearer_auth(
         .map(|s| s.to_string());
     let presented = bearer.or(xkey);
 
-    let keys: ApiKeysFile = api_keys::load(&state.data_dir);
-    // 存在启用 Key 时必须鉴权；无启用 Key 时由显式开关决定放行或拒绝
-    let auth_required = keys.has_enabled() || !keys.auth_disabled;
-
-    let Some(presented) = presented else {
-        if !auth_required {
-            request.extensions_mut().insert(KeyId("anonymous".into()));
-            return next.run(request).await;
-        }
-        return auth_required_rejected().into_response();
+    // 鉴权热路径（P1 修复5b）：load + verify_and_consume_locked（内含记账写盘）
+    // 全为同步磁盘 IO，整体移入 spawn_blocking（参数转 owned），避免阻塞
+    // async 调度线程；锁与原子语义不变（verify_and_consume_locked 进程级锁内完成）
+    let (auth_required, check) = {
+        let data_dir = state.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let keys: ApiKeysFile = api_keys::load(&data_dir);
+            // 存在启用 Key 时必须鉴权；无启用 Key 时由显式开关决定放行或拒绝
+            let auth_required = keys.has_enabled() || !keys.auth_disabled;
+            let check = presented.map(|p| {
+                api_keys::verify_and_consume_locked(&data_dir, &p, &super::usage::today_key())
+            });
+            (auth_required, check)
+        })
+        .await
+        // join 失败（panic 等）按最严格处理：要求鉴权 + 视为无效 Key → 401
+        .unwrap_or((true, Some(KeyCheck::Invalid)))
     };
 
-    // 校验 Key（含每日配额 + F-35 按日统计）；读-改-写走进程级锁（审查 P1-2）
-    match api_keys::verify_and_consume_locked(&state.data_dir, &presented, &super::usage::today_key()) {
-        KeyCheck::Ok(rk) => {
+    match check {
+        Some(KeyCheck::Ok(rk)) => {
             let id = rk.id.clone();
             request.extensions_mut().insert(rk);
             request.extensions_mut().insert(KeyId(id));
             return next.run(request).await;
         }
-        KeyCheck::QuotaExceeded { limit } => {
+        Some(KeyCheck::QuotaExceeded { limit }) => {
             return quota_exceeded(limit);
         }
-        KeyCheck::Invalid => {}
+        Some(KeyCheck::Invalid) => {}
+        None => {
+            // 未携带 Key
+            if !auth_required {
+                request.extensions_mut().insert(KeyId("anonymous".into()));
+                return next.run(request).await;
+            }
+            return auth_required_rejected().into_response();
+        }
     }
     // 无启用 Key 且显式关闭鉴权：放行携带未知 Key 的请求并记为 anonymous
     if !auth_required {

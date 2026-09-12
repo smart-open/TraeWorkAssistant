@@ -477,9 +477,92 @@ pub fn invite_link(_app: AppHandle, _state: State<AppState>) -> Invite {
 
 // ---------------- 文件导出 ----------------
 
+/// 可执行/脚本扩展名（小写无点）：导出到应用数据目录之外一律拒绝，
+/// 防止「用户自选导出路径」被滥用为开机/登录持久化植入
+const BLOCKED_EXEC_EXTS: &[&str] = &[
+    "exe", "dll", "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse",
+    "wsf", "hta", "scr", "lnk", "msi", "com", "pif",
+];
+
+/// Windows 路径归一化（仅用于前缀比较）：分隔符统一为 `\`、剥离 verbatim
+/// `\\?\` / `\\?\UNC\` 前缀、去尾部分隔符、转小写（Windows 不区分大小写）
+fn normalize_win_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().replace('/', "\\");
+    let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    };
+    s.trim_end_matches('\\').to_lowercase()
+}
+
+/// 目录前缀匹配：相等，或 path 位于 prefix 的子目录内
+/// （避免 `C:\Windows` 误伤 `C:\Windows-Empire` 这类兄弟目录）
+fn starts_with_dir(path_norm: &str, prefix_norm: &str) -> bool {
+    if prefix_norm.is_empty() {
+        return false;
+    }
+    path_norm == prefix_norm || path_norm.starts_with(&format!("{prefix_norm}\\"))
+}
+
+/// 收集需禁止写入的系统目录前缀：Windows 系统目录、Program Files、
+/// 开始菜单（含用户/公共启动文件夹）。环境变量缺失时用常见默认值兜底
+fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
+    let env_or = |k: &str, fb: &str| std::env::var(k).unwrap_or_else(|_| fb.to_string());
+    let mut v = Vec::new();
+    v.push(std::path::PathBuf::from(env_or("SystemRoot", r"C:\Windows")));
+    v.push(std::path::PathBuf::from(env_or("ProgramFiles", r"C:\Program Files")));
+    v.push(std::path::PathBuf::from(env_or("ProgramFiles(x86)", r"C:\Program Files (x86)")));
+    let program_data = env_or("ProgramData", r"C:\ProgramData");
+    v.push(std::path::PathBuf::from(&program_data).join(r"Microsoft\Windows\Start Menu"));
+    v.push(std::path::PathBuf::from(&program_data)
+        .join(r"Microsoft\Windows\Start Menu\Programs\Startup"));
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        v.push(std::path::PathBuf::from(appdata)
+            .join(r"Microsoft\Windows\Start Menu\Programs\Startup"));
+    }
+    v
+}
+
+/// 导出路径校验（canonicalize 失败时对原路径做前缀判断）：
+/// ① 命中系统目录/启动文件夹前缀 → 拒绝；
+/// ② 可执行/脚本扩展名且不在应用数据目录下 → 拒绝
+fn check_export_path(
+    path: &std::path::Path,
+    data_dir: &std::path::Path,
+    blocked: &[std::path::PathBuf],
+) -> Result<(), String> {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let norm = normalize_win_path(&canon);
+    for b in blocked {
+        if starts_with_dir(&norm, &normalize_win_path(b)) {
+            return Err(
+                "拒绝写入：目标位于系统目录或启动文件夹，为防止持久化滥用不允许导出到该位置".into(),
+            );
+        }
+    }
+    let exec_ok = || -> bool {
+        let data_canon = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+        starts_with_dir(&norm, &normalize_win_path(&data_canon))
+    };
+    let is_exec = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| BLOCKED_EXEC_EXTS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false);
+    if is_exec && !exec_ok() {
+        return Err("拒绝写入：可执行/脚本文件仅允许导出到应用数据目录内".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
-pub fn write_text_file(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
+pub fn write_text_file(state: State<AppState>, path: String, content: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    check_export_path(&p, &state.data_dir, &blocked_system_dirs())?;
+    std::fs::write(&p, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
 }
 
 /// 读取本地文本文件（配合导入账号：文件选择后由 Rust 侧读取，避免前端路径权限问题）
@@ -536,27 +619,45 @@ pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), Stri
     Ok((out.status.success(), stdout, stderr))
 }
 
-/// 构造计划任务的 /TR 命令行（直接调用 python 签到脚本，注入数据目录）
-fn build_task_tr(state: &AppState) -> String {
+/// 把计划任务的长命令写入数据目录的 .cmd 启动器，返回启动器路径。
+/// 公共实现（自 doubao.rs 提升，签到任务与豆包续期/额度任务共用）：
+/// 背景（实测 2026-09-09）：schtasks /TR 参数上限 **261 字符**，dev 构建的
+/// python/脚本绝对路径拼出的命令达 273 字符 → schtasks 报参数错误，注册失败，
+/// 而错误 toast 仅显示 4 秒，被用户感知为「点击注册没有反应」。改用启动器后
+/// /TR 只需 ~74 字符。
+pub(crate) fn write_task_launcher(
+    state: &AppState,
+    name: &str,
+    body: String,
+) -> Result<String, String> {
+    let path = state.data_dir.join(format!("task_{name}.cmd"));
+    std::fs::write(&path, format!("@echo off\r\n{body}\r\n"))
+        .map_err(|e| format!("写入任务启动器脚本失败: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 构造每日签到计划任务的 /TR（复用 .cmd 启动器方案，见 write_task_launcher，
+/// 消除直接拼 python 长命令再次触碰 /TR 261 字符上限的回归）
+fn build_task_tr(state: &AppState) -> Result<String, String> {
     let py = state.python_exe.clone();
     let script = state.python_dir.join("auto_checkin.py");
     let data_dir = state.data_dir.to_string_lossy().to_string();
-    // schtasks /TR 不会继承当前进程环境变量，需在命令行中显式设置 AIWORKDATA_DIR。
-    // 必须用 set "VAR=value"（带引号）以兼容含空格的路径（如 C:\Users\<带空格用户名>\...）；
-    // 用 && 串联，仅当 set 成功后才执行 python。
-    // 不再使用 /RL HIGHEST：签到脚本只读取/写入 %APPDATA% 并运行 python，无需提权，
-    // 否则普通用户会卡在「access denied」而注册失败（详见问题分析报告）。
-    format!(
-        "cmd /c set \"AIWORKDATA_DIR={}\" && \"{}\" \"{}\"",
-        data_dir,
-        py.replace('\\', "/"),
-        script.to_string_lossy().replace('\\', "/")
+    // schtasks /TR 不会继承当前进程环境变量，启动器内显式 set AIWORKDATA_DIR。
+    // 必须用 set "VAR=value"（带引号）以兼容含空格的路径；不再使用 /RL HIGHEST：
+    // 签到脚本只读取/写入 %APPDATA% 并运行 python，无需提权（详见问题分析报告）。
+    write_task_launcher(
+        state,
+        "daily_checkin",
+        format!(
+            "set \"AIWORKDATA_DIR={data_dir}\"\r\nset \"PYTHONIOENCODING=utf-8\"\r\n\"{py}\" \"{}\"",
+            script.to_string_lossy()
+        ),
     )
 }
 
 /// 注册每日签到任务（新任务名），供命令与旧任务迁移共用
 fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
-    let tr = build_task_tr(state);
+    let tr = build_task_tr(state)?;
     let (ok, _stdout, stderr) = run_schtasks(&[
         "/Create",
         "/TN",
@@ -750,4 +851,49 @@ pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), S
         return Err(last_detail);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 临时目录（独占 tag，避免测试间互踩）
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("misc_export_test_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 拒绝写入启动文件夹下的 .json（拦截的是位置而非扩展名）
+    #[test]
+    fn export_rejects_json_under_startup() {
+        let base = tmp_dir("startup");
+        let startup = base.join("Startup");
+        std::fs::create_dir_all(&startup).unwrap();
+        let err = check_export_path(&startup.join("cfg.json"), &base, &[startup]).unwrap_err();
+        assert!(err.contains("启动文件夹"), "实际错误: {err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 拒绝在应用数据目录之外导出可执行/脚本类型
+    #[test]
+    fn export_rejects_bat_outside_data_dir() {
+        let data = tmp_dir("datadir");
+        let other = tmp_dir("other");
+        let err = check_export_path(&other.join("evil.bat"), &data, &[]).unwrap_err();
+        assert!(err.contains("可执行"), "实际错误: {err}");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// 放行普通目录下的 .json 导出
+    #[test]
+    fn export_allows_plain_json() {
+        let dir = tmp_dir("plain");
+        assert!(check_export_path(&dir.join("export.json"), &dir, &[]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

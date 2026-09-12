@@ -142,7 +142,7 @@ def load_json(path, default=None):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        print(f"[警告] 读取 {path} 失败: {e}")
+        print(f"[警告] 读取 {path} 失败: {e}", file=sys.stderr, flush=True)
         return default
 
 
@@ -154,7 +154,7 @@ def save_json(path, data):
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     except Exception as e:
-        print(f"[警告] 写入 {path} 失败: {e}")
+        print(f"[警告] 写入 {path} 失败: {e}", file=sys.stderr, flush=True)
 
 
 def save_credits_history(user_id, credits, delta):
@@ -313,22 +313,32 @@ def status_check(name, jwt, device_map, timeout=30):
     return True, bool(checked_in), credits, code, msg
 
 
-def signin(name, jwt, device_map, timeout=30):
-    """对单个账号执行签到，返回 (success, message, code, http_status)。"""
+def _signin_request(name, jwt, device_map, timeout=30):
+    """底层签到请求 + 响应解析，返回 (ok, msg, code, http_status, data)。
+    data 为解析出的 JSON dict（网络异常/非 JSON 响应时为 None），供奖励字段提取。"""
     user_id = extract_user_id(jwt)
     if not user_id:
-        return False, "无法从 JWT 解析 user id", None, 0
+        return False, "无法从 JWT 解析 user id", None, 0, None
 
     dev = get_device_for(user_id, device_map)
     status, body = _http_post(SIGNIN_URL, jwt, dev, body=b"{}", timeout=timeout)
 
     if status < 0:
-        return False, body or "网络异常", None, status
+        return False, body or "网络异常", None, status, None
     try:
         data = json.loads(body)
-        return data.get("code") == 0, data.get("message", f"HTTP {status}"), data.get("code"), status
+        return data.get("code") == 0, data.get("message", f"HTTP {status}"), data.get("code"), status, data
     except Exception:
-        return False, f"HTTP {status}: 非 JSON 响应: {body[:200]}", status if status else None, status
+        # 非 JSON 响应：不把 HTTP 状态码塞进业务 code 字段——那会让 classify_error 的
+        # 业务码分支误判（如 200+HTML 被当成 code=200 业务错误）。code 返回 None，
+        # Server/Client 等错误类型由 classify_error 沿用 HTTP status 判定。
+        # 注意：code=None 同时是传输层异常的标记，signin_with_retry 会按 retry 次数重试。
+        return False, f"HTTP {status}: 非 JSON 响应: {body[:200]}", None, status, None
+
+
+def signin(name, jwt, device_map, timeout=30):
+    """对单个账号执行签到，返回 (success, message, code, http_status)。"""
+    return _signin_request(name, jwt, device_map, timeout)[:4]
 
 
 def classify_error(http_status, message, code):
@@ -406,18 +416,83 @@ def clear_cooldown(user_id):
     save_cooldown(user_id, "", 0, "")
 
 
-def signin_with_retry(name, jwt, device_map, timeout=30, retry=0):
-    """对单个账号执行签到；仅网络层异常（code 为 None）按 retry 次数重试，业务失败不重试。"""
-    last = (False, "无重试", None, 0)
+def signin_with_retry(name, jwt, device_map, timeout=30, retry=0, with_data=False):
+    """对单个账号执行签到；仅网络层异常（code 为 None）按 retry 次数重试，业务失败不重试。
+    with_data=True 时额外返回第 5 个元素：claim 响应解析出的 JSON dict（供奖励字段提取）。"""
+    last = (False, "无重试", None, 0, None)
     for attempt in range(retry + 1):
-        ok, msg, code, status = signin(name, jwt, device_map, timeout)
+        last = _signin_request(name, jwt, device_map, timeout)
+        ok, code = last[0], last[2]
         if ok or code is not None:
-            return ok, msg, code, status
-        last = (ok, msg, code, status)
+            return last if with_data else last[:4]
         if attempt < retry:
-            print(f"  [重试] 第 {attempt + 1} 次签到网络异常，1s 后重试…")
+            tout(f"  [重试] 第 {attempt + 1} 次签到网络异常，1s 后重试…")
             time.sleep(1)
-    return last
+    return last if with_data else last[:4]
+
+
+# ----------------- 签到积分归属解析（三层兜底，纯函数便于单测） -----------------
+# claim 响应中疑似「本次奖励」的候选字段（按优先级排列；data 层优先于顶层）。
+# 说明：status 接口顶层 credits 无法离线确证是「签到后余额」还是「可领奖励额度」，
+# 因此不再依赖它充当 delta——delta 优先取 claim 响应自身的奖励字段（接口返回为准）。
+_CLAIM_REWARD_KEYS = (
+    "reward", "reward_credits", "claim_credits", "checkin_credits",
+    "delta", "increase", "obtain", "gained", "credits", "amount",
+)
+
+
+def parse_claim_reward(data):
+    """从 claim 响应 JSON 中提取本次签到奖励值（纯函数）。
+    依次在 data 层与顶层查找候选奖励字段，仅接受整数型数值（int / 整值 float / 数字串），
+    排除 bool 与负值；无可用奖励字段时返回 None。"""
+    if not isinstance(data, dict):
+        return None
+    nested = data.get("data")
+    scopes = [nested] if isinstance(nested, dict) else []
+    scopes.append(data)
+    for scope in scopes:
+        for key in _CLAIM_REWARD_KEYS:
+            val = scope.get(key)
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, int) and val >= 0:
+                return val
+            if isinstance(val, float) and val.is_integer() and val >= 0:
+                return int(val)
+            if isinstance(val, str) and val.isdigit():
+                return int(val)
+    return None
+
+
+def resolve_claim_credits(claim_data, credits_before, recheck=None):
+    """签到成功后解析 (final_credits, final_delta, source)（纯函数，recheck 可注入）。
+    三层兜底判定顺序：
+      层1 claim 响应奖励字段优先（接口返回为准）：parse_claim_reward 命中即作 delta，
+          credits 沿用签到前 status 余额（credits_before 非整数时余额记 None）；
+      层2 claim 无奖励字段 → 复查一次 status 取当前余额作 final_credits，
+          delta = 复查余额 - credits_before（credits_before 非整数不做复查；
+          delta 为负或复查失败/异常则落入层3）；
+      层3 保底维持旧行为：delta = credits_before、final_credits = credits_before
+          （credits_before 非整数时为 (None, 0)）。
+    返回值 source ∈ {"claim_reward", "balance_diff", "legacy"}，仅用于日志说明来源。"""
+    # 层1：claim 响应奖励字段
+    reward = parse_claim_reward(claim_data)
+    if reward is not None:
+        return (credits_before if isinstance(credits_before, int) else None), reward, "claim_reward"
+    # 层2：签到后复查 status，用两次余额差求 delta（失败可容忍，不影响签到成功判定）
+    if recheck is not None and isinstance(credits_before, int):
+        try:
+            ok_r, _checked, credits_after, _code_r, _msg_r = recheck()
+        except Exception:
+            ok_r, credits_after = False, None
+        if ok_r and isinstance(credits_after, int):
+            delta = credits_after - credits_before
+            if delta >= 0:
+                return credits_after, delta, "balance_diff"
+    # 层3：保底维持旧行为
+    if isinstance(credits_before, int):
+        return credits_before, credits_before, "legacy"
+    return None, 0, "legacy"
 
 
 # ----------------- NDJSON 输出（--json-stream） -----------------
@@ -427,6 +502,12 @@ _JSON_STREAM = False
 def emit(obj):
     if _JSON_STREAM:
         print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def tout(msg):
+    """人读进度/横幅输出：--json-stream 模式转 stderr，保证 stdout 仅含 NDJSON
+    （桌面端逐行 JSON 解析不容许混入明文）；普通模式仍走 stdout。"""
+    print(msg, file=sys.stderr if _JSON_STREAM else sys.stdout, flush=True)
 
 
 def save_summary_merged(results, warnings, note=None):
@@ -480,17 +561,17 @@ def main():
         else None
     )
 
-    print("=" * 60)
-    print("Trae Work 多账号自动签到")
-    print("=" * 60)
+    tout("=" * 60)
+    tout("Trae Work 多账号自动签到")
+    tout("=" * 60)
 
     accounts_path = args.accounts_file or ACCOUNTS_FILE
     accounts_cfg = load_json(accounts_path, default={"accounts": []})
     accounts = accounts_cfg.get("accounts", [])
 
     if not accounts:
-        print()
-        print("ℹ️  checkin_accounts.json 中暂无账号，无需签到。")
+        tout("")
+        tout("ℹ️  checkin_accounts.json 中暂无账号，无需签到。")
         emit({"type": "start", "total": 0})
         emit({"type": "done", "ok": 0, "already": 0, "failed": 0})
         save_summary_merged([], [], note="no_accounts_yet")
@@ -517,32 +598,32 @@ def main():
     for idx, acc in enumerate(pending, 1):
         name = acc.get("name", f"账号{idx}")
         jwt = acc.get("jwt", "")
-        print(f"\n[{idx}/{len(pending)}] 账号: {name}")
+        tout(f"\n[{idx}/{len(pending)}] 账号: {name}")
         if not jwt:
-            print(f"  结果: 跳过（未配置 jwt）")
+            tout(f"  结果: 跳过（未配置 jwt）")
             results.append({"name": name, "user_id": acc.get("UserID", ""), "ok": False, "message": "未配置 jwt"})
             failed += 1
             emit({"type": "account", "index": idx, "user_id": acc.get("UserID", ""), "name": name, "status": "fail", "message": "未配置 jwt"})
             continue
 
         user_id = extract_user_id(jwt)
-        print(f"  user_id: {user_id}")
+        tout(f"  user_id: {user_id}")
 
         exp_dt, remaining = get_jwt_exp(jwt)
         if remaining is not None:
             if remaining < 0:
-                print(f"  [WARN] JWT 已过期（{exp_dt:%Y-%m-%d %H:%M}），需重新抓取！")
+                tout(f"  [WARN] JWT 已过期（{exp_dt:%Y-%m-%d %H:%M}），需重新抓取！")
                 warnings.append(f"{name}: JWT 已过期({exp_dt:%Y-%m-%d %H:%M})，请重新抓取")
             elif remaining < EXPIRY_WARN_HOURS:
-                print(f"  [WARN] JWT 将于 {remaining:.1f} 小时后过期（{exp_dt:%Y-%m-%d %H:%M}），请尽快重新抓取")
+                tout(f"  [WARN] JWT 将于 {remaining:.1f} 小时后过期（{exp_dt:%Y-%m-%d %H:%M}），请尽快重新抓取")
                 warnings.append(f"{name}: JWT 将于 {remaining:.1f}h 后过期({exp_dt:%Y-%m-%d %H:%M})，请重新抓取")
 
         dev = get_device_for(user_id, device_map)
-        print(f"  x-device-id: {dev['device_id']} (from device_map.json)")
+        tout(f"  x-device-id: {dev['device_id']} (from device_map.json)")
 
         ok_s, checked_in, credits_before, code_s, msg_s = status_check(name, jwt, device_map)
         if ok_s and checked_in:
-            print(f"  [OK] 已签到（credits={credits_before}），跳过 claim")
+            tout(f"  [OK] 已签到（credits={credits_before}），跳过 claim")
             results.append({
                 "name": name, "user_id": user_id, "ok": True, "code": 0,
                 "action": "skip_already", "credits": credits_before,
@@ -553,9 +634,11 @@ def main():
             save_credits_history(user_id, credits_before, 0)
             continue
         if not ok_s:
-            print(f"  [WARN] status 预检失败 (code={code_s}) {msg_s} —— 仍尝试 claim")
+            tout(f"  [WARN] status 预检失败 (code={code_s}) {msg_s} —— 仍尝试 claim")
 
-        ok, msg, code, http_status = signin_with_retry(name, jwt, device_map, retry=args.retry)
+        ok, msg, code, http_status, claim_data = signin_with_retry(
+            name, jwt, device_map, retry=args.retry, with_data=True
+        )
         result = {"name": name, "user_id": user_id, "ok": ok, "code": code, "message": msg, "action": "claim"}
         final_credits: Optional[int] = None
         final_delta = 0
@@ -565,18 +648,26 @@ def main():
         if ok:
             # 签到成功 -> 清除冷却
             clear_cooldown(user_id)
-            # credits_before 来自 status 接口，表示签到可获得的积分额度
-            # 签到成功后，delta 就是该额度（无需再次请求 status 计算差值）
-            if isinstance(credits_before, int):
-                final_delta = credits_before
-                final_credits = credits_before
-                result["credits"] = credits_before
+            # 积分归属三层兜底（自洽化，不依赖对 status 顶层 credits 语义的猜测）：
+            #   层1 claim 响应奖励字段优先（接口返回为准）：命中即作 delta，credits 沿用签到前余额；
+            #   层2 claim 无奖励字段 → claim 成功后再查一次 status 取当前余额，
+            #       delta = 复查余额 - credits_before（为负或解析失败则落入层3）；
+            #   层3 保底维持旧行为：delta = credits_before、credits = credits_before。
+            # 复查 status 失败可容忍（仅影响精度，不判签到失败）；already 分支不复查。
+            # credits_history 落盘的 {credits, delta} 语义为「最新余额 + 本次新增」。
+            final_credits, final_delta, credits_src = resolve_claim_credits(
+                claim_data,
+                credits_before,
+                recheck=lambda: status_check(name, jwt, device_map),
+            )
+            result["action"] = "claim_ok"
+            if final_credits is not None:
+                result["credits"] = final_credits
                 result["credits_delta"] = final_delta
-                print(f"  [OK] 签到成功，积分 +{final_delta}")
-                result["action"] = "claim_ok"
+            if final_delta:
+                tout(f"  [OK] 签到成功，积分 +{final_delta} ({credits_src})")
             else:
-                print(f"  [OK] 签到成功（status 未返回积分额度）")
-                result["action"] = "claim_ok"
+                tout(f"  [OK] 签到成功（未获取到积分额度）")
         else:
             # 签到失败 → 分类错误并写入冷却
             error_type, cooldown_secs = classify_error(http_status, msg, code)
@@ -587,10 +678,10 @@ def main():
                 cd_entry = cooldown_data.get("cooldowns", {}).get(user_id, {})
                 emit_error_type = error_type
                 emit_cooldown_until = cd_entry.get("until", 0)
-                print(f"  [COOLDOWN] {error_type} 冷却 {cooldown_secs}s (until={emit_cooldown_until})")
+                tout(f"  [COOLDOWN] {error_type} 冷却 {cooldown_secs}s (until={emit_cooldown_until})")
 
         results.append(result)
-        print(f"  结果: {'成功' if ok else '失败'} (code={code}) {msg}")
+        tout(f"  结果: {'成功' if ok else '失败'} (code={code}) {msg}")
         # 落盘积分历史（供前端看板/趋势），并回传余额让实时进度不再显示「余额 ?」
         if final_credits is not None:
             save_credits_history(user_id, final_credits, final_delta)
@@ -612,17 +703,17 @@ def main():
         else:
             failed += 1
 
-    print("\n" + "=" * 60)
-    print(f"签到完成: 成功 {total_ok} / 已签到 {already} / 失败 {failed} / 总计 {len(pending)}")
-    print("=" * 60)
+    tout("\n" + "=" * 60)
+    tout(f"签到完成: 成功 {total_ok} / 已签到 {already} / 失败 {failed} / 总计 {len(pending)}")
+    tout("=" * 60)
 
     if warnings:
-        print("\n[WARN]  JWT 过期告警：")
+        tout("\n[WARN]  JWT 过期告警：")
         for w in warnings:
-            print(f"   - {w}")
+            tout(f"   - {w}")
 
     save_summary_merged(results, warnings)
-    print(f"结果摘要已保存: {os.path.join(DATA_SUBDIR, 'checkin_summary.json')}")
+    tout(f"结果摘要已保存: {os.path.join(DATA_SUBDIR, 'checkin_summary.json')}")
 
     log_line = (
         f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
@@ -634,7 +725,7 @@ def main():
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(log_line)
     except Exception as e:
-        print(f"[警告] 写入 {LOG_FILE} 失败: {e}")
+        tout(f"[警告] 写入 {LOG_FILE} 失败: {e}")
 
     emit({"type": "done", "ok": total_ok, "already": already, "failed": failed})
     return 0

@@ -19,14 +19,32 @@ pub struct ApiServerHandle {
 }
 
 impl ApiServerHandle {
-    /// 发送 shutdown 信号并 abort 线程
+    /// 发送 shutdown 信号并等待优雅退出（最多 3s，每 50ms 轮询一次），
+    /// 超时才 abort（P2 修复9：原实现 send 后立即 abort，优雅停机被自身取消，
+    /// 在途请求被硬断）
     pub fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
         if let Some(h) = self.join_handle.take() {
-            h.abort();
+            if !wait_task_finished(&h, std::time::Duration::from_secs(3)) {
+                h.abort();
+            }
         }
+    }
+}
+
+/// 轮询任务是否已结束（每 50ms 一次，最多 max）；P2 修复9 优雅停机用
+fn wait_task_finished(h: &JoinHandle<()>, max: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + max;
+    loop {
+        if h.is_finished() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -84,6 +102,34 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/v1/images/edits", post(routes::images_edits))
         .layer(from_fn_with_state(state.clone(), auth::bearer_auth))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== P2 修复9：优雅停机轮询 ====================
+
+    #[test]
+    fn wait_task_finished_detects_completion_and_timeout() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        // 已完成任务：立即判定结束
+        let done = rt.spawn(async {});
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(wait_task_finished(&done, std::time::Duration::from_secs(1)));
+        // 长任务：达到 max 轮询上限判定未结束（不再立即 abort）
+        let slow = rt.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let started = std::time::Instant::now();
+        assert!(!wait_task_finished(&slow, std::time::Duration::from_millis(150)));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150));
+        slow.abort();
+    }
 }
 
 /// WB 上游健康检测线程（F-34 ④/§2.2 频控维度）：每 5min + 0-60s 抖动对 CN 主域名

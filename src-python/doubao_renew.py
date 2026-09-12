@@ -15,9 +15,10 @@
 职责：
   1. --sync-only（诊断模式）：解密当前 User Data 与各快照槽的目标 cookie，报告可解性与明文
      特征（不写入账号池——密文不能当 sessionid 用）。
-  2. 默认模式：对池内有明文 sessionid 的账号探活保活端点（settings.doubao_renew_url，
-     默认 https://www.doubao.com/info/v2/）；200=有效（Set-Cookie 新值回写），302→passport / 401=
-     标记过期；sid_guard 到期时间一并解析。
+  2. 默认模式：对池内有明文 sessionid 的账号先用已登录 JSON 端点（DEFAULT_PROBE_URL）
+     权威判定会话有效性，判定有效后再请求保活端点（settings.doubao_renew_url，
+     默认 https://www.doubao.com/info/v2/，仅作保活与 Set-Cookie 抓取——其 200 恒真
+     不可用于有效性判定）回写新值；判定失效标记过期；sid_guard 到期时间一并解析。
   3. 结果写 <data_dir>/data/doubao_renew_result.json，stdout 输出一行摘要 JSON。
 
 依赖：标准库 + cryptography（device_proxy.py 同款，已在 requirements.txt）。
@@ -58,10 +59,12 @@ def now_str() -> str:
 
 
 def app_data_dir() -> Path:
-    env = os.environ.get("AIWORKDATA_DIR")
+    """数据目录，与 device_proxy.py 同链：AIWORKDATA_DIR → 旧 TRAEDATA_DIR → 脚本所在目录
+    （读取 env 时兼容新旧两个变量名，保证独立运行与桌面端注入两种场景一致）。"""
+    env = os.environ.get("AIWORKDATA_DIR") or os.environ.get("TRAEDATA_DIR")
     if env:
         return Path(env)
-    return Path(os.environ["APPDATA"]) / "AIWorkAssistant"
+    return Path(__file__).resolve().parent
 
 
 # ── DPAPI / AES-GCM 解密 ────────────────────────────────────────────────────
@@ -432,9 +435,17 @@ def sync_cookie_state(data_dir: Path, log) -> dict:
 
 
 def run_renewal(data_dir: Path, renew_url: str, log) -> dict:
-    """对池内有明文 sessionid 的账号做续期探活。
+    """对池内有明文 sessionid 的账号做两段式探活续期。
     来源不限：手动录入（manual）与代理抓包自动回写（proxy）同为明文凭证，同等参与探活；
-    池内不存在密文来源（cookie 诊断只报告不写池）。"""
+    池内不存在密文来源（cookie 诊断只报告不写池）。
+
+    两段式（修复「死会话被洗白」）：
+      ① 先用已登录 JSON 端点 api_probe(DEFAULT_PROBE_URL) 判定会话有效性——
+         info/v2/（默认 renew_url）对任意 sid（含垃圾值）一律 200+SPA HTML，
+         200 恒真不可用于有效性判定（实测 2026-09-09，见 DEFAULT_PROBE_URL 处注释），
+         直接按 200=有效会把已吊销会话洗白回 expired=False；
+      ② 判定 ok 后才调 renew_probe(renew_url) 做保活请求并抓取 Set-Cookie 回写
+         （renew_url 仅作保活用途）；判定 expired 置 expired=True；error 不改状态。"""
     pool_path = data_dir / "data" / "doubao_accounts.json"
     pool = load_pool(pool_path)
     accounts = pool["accounts"]
@@ -446,7 +457,26 @@ def run_renewal(data_dir: Path, renew_url: str, log) -> dict:
         if not sid:
             skipped_n += 1
             continue
-        probe = renew_probe(sid, renew_url)
+        # ① 权威判定：已登录 JSON 端点（code=0 有效 / 710012001 失效）
+        first = api_probe(sid, DEFAULT_PROBE_URL)
+        if first["status"] == "ok":
+            # ② 会话有效 → 保活请求抓续期 Cookie（renew_url/info/v2/ 仅作保活用途）
+            second = renew_probe(sid, renew_url)
+            if second["status"] == "ok":
+                probe = second
+            elif second["status"] == "expired":
+                # 保活端点 302→passport/401 是明确失效信号，推翻 ok 判定按过期处理
+                probe = second
+            else:
+                # 保活请求网络失败：会话刚被权威端点判定有效，不因保活失败改状态，
+                # 仅跳过 Cookie 回写（status=ok、无 new_cookies）
+                probe = {"status": "ok", "new_cookies": {},
+                         "detail": f"probe ok; renew: {second['detail']}"}
+        elif first["status"] == "expired":
+            probe = {"status": "expired", "new_cookies": {}, "detail": first["detail"]}
+        else:
+            # error / unknown：无法判定会话状态，不改状态（不洗白也不误杀）
+            probe = {"status": "error", "new_cookies": {}, "detail": first["detail"]}
         entry = {"user_id": uid, "status": probe["status"], "detail": probe["detail"]}
         if probe["status"] == "ok":
             ok_n += 1

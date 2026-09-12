@@ -137,7 +137,6 @@ fn detect_trae_cn(custom: Option<String>) -> (bool, Option<String>, Option<Strin
     let candidates = [
         "%LOCALAPPDATA%\\Programs\\Trae CN\\Trae CN.exe",
         "%ProgramFiles%\\Trae CN\\Trae CN.exe",
-        "D:////Programs////Trae CN////Trae CN.exe",
     ];
     for c in candidates {
         let expanded = expand_env(c);
@@ -356,7 +355,6 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             exe_candidates: &[
                 "%LOCALAPPDATA%\\Programs\\Trae CN\\Trae CN.exe",
                 "%ProgramFiles%\\Trae CN\\Trae CN.exe",
-                "D:\\Programs\\Trae CN\\Trae CN.exe",
             ],
             proc_names: &["Trae CN"],
             user_data_dir: format!("{appdata}\\Trae CN"),
@@ -405,7 +403,6 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
                 "%ProgramFiles%\\TRAE SOLO\\TRAE SOLO.exe",
                 "%LOCALAPPDATA%\\Programs\\Trae\\Trae.exe",
                 "%ProgramFiles%\\Trae\\Trae.exe",
-                "D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
             ],
             proc_names: &["TRAE SOLO CN", "TRAE SOLO", "Trae"],
             user_data_dir: format!("{appdata}\\TRAE SOLO CN"),

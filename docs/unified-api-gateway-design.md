@@ -1,7 +1,7 @@
 # 统一 API 网关与资源调度 · 设计方案
 
 > 版本：v1.2（2026-09-11，v1.1 基础上：池标识 wb → buddy；补 Trae 历史数据兼容清单，Buddy 侧不保历史）
-> 状态：待评审
+> 状态：已实施（Phase 1~3 全部落地，2026-09-12 通过九大类黑盒审查并完成修复轮）
 > 关联：work-credit-pool-design.md（积分池）、workbuddy-product-design.md（Buddy 产品设计）
 
 ---

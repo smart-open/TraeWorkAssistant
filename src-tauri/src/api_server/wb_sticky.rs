@@ -7,9 +7,11 @@
 //!   实证设计；Buddy 上游代理流量缓存恒不命中 §5.5 #10，价值在会话一致性）。
 //!
 //! 线程安全：单 Mutex 内完成 resolve+bind（写锁 re-check，防 TOCTOU）。
-//! 持久化：`wb_sticky_sessions.json`（TTL 内的绑定，原子写）。
+//! 持久化：`data/wb_sticky_sessions.json`（TTL 内的绑定，原子写 + 1s 节流；
+//! 旧根路径文件仅作启动加载兼容）。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
@@ -18,6 +20,18 @@ use sha2::{Digest, Sha256};
 pub const EXPLICIT_TTL_SECS: i64 = 30 * 60;
 /// 指纹模式时间窗
 pub const FINGERPRINT_WINDOW_SECS: i64 = 60;
+/// 落盘文件名（迁移至 data/ 子目录，与全仓数据文件约定一致；旧根路径仅作读取兼容）
+const STICKY_FILE: &str = "wb_sticky_sessions.json";
+/// 落盘节流间隔：距上次成功保存不足该时长则跳过本次写盘
+const SAVE_THROTTLE_MS: u64 = 1000;
+
+fn sticky_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("data").join(STICKY_FILE)
+}
+
+fn sticky_path_legacy(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(STICKY_FILE)
+}
 
 /// 一条绑定：uid + 上游 conversation_id + 最后命中时间
 #[derive(Debug, Clone)]
@@ -32,6 +46,8 @@ pub struct Binding {
 #[derive(Default)]
 pub struct StickyStore {
     inner: Mutex<HashMap<String, Binding>>,
+    /// 上次成功落盘时刻（节流，见 save）：Some 之前的 save 一律跳过写盘
+    last_save: Mutex<Option<std::time::Instant>>,
 }
 
 /// 会话键：显式 conversationId 或消息指纹
@@ -172,24 +188,49 @@ impl StickyStore {
 
     // ---------- 持久化 ----------
 
-    /// 落盘（原子写；小文件，每次 bind 后调用成本可忽略）
+    /// 落盘（原子写 + 节流，写入 data/ 子目录）。
+    ///
+    /// 节流取舍：bind 后高频全量重写浪费 IO——距上次成功保存不足
+    /// SAVE_THROTTLE_MS 时跳过本次落盘。内存态照常更新（resolve 不受影响），
+    /// 跳过的落盘由下一次间隔超过阈值的请求兜底；代价是进程崩溃时可能丢失
+    /// 最近约 1s 的绑定——粘性绑定本就有 TTL，丢失仅导致个别会话重新取号，
+    /// 可接受。
     pub fn save(&self, data_dir: &std::path::Path) {
-        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let file = serde_json::json!({
-            "version": 1,
-            "saved_at": now_ts(),
-            "bindings": map.iter().map(|(k, b)| serde_json::json!({
-                "key": k, "uid": b.uid, "conv_id": b.conv_id,
-                "last_seen": b.last_seen, "explicit": b.explicit,
-            })).collect::<Vec<_>>(),
-        });
-        let _ = crate::fs_utils::write_json(&data_dir.join("wb_sticky_sessions.json"), &file);
+        {
+            let last = self.last_save.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(t) = *last {
+                if t.elapsed() < std::time::Duration::from_millis(SAVE_THROTTLE_MS) {
+                    return;
+                }
+            }
+        }
+        let file = {
+            let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            serde_json::json!({
+                "version": 1,
+                "saved_at": now_ts(),
+                "bindings": map.iter().map(|(k, b)| serde_json::json!({
+                    "key": k, "uid": b.uid, "conv_id": b.conv_id,
+                    "last_seen": b.last_seen, "explicit": b.explicit,
+                })).collect::<Vec<_>>(),
+            })
+        };
+        if crate::fs_utils::write_json(&sticky_path(data_dir), &file).is_ok() {
+            let mut last = self.last_save.lock().unwrap_or_else(|e| e.into_inner());
+            *last = Some(std::time::Instant::now());
+        }
     }
 
-    /// 启动时加载（过期的条目在 resolve 时自然失效）
+    /// 启动时加载（过期的条目在 resolve 时自然失效）。
+    /// data/ 新路径不存在时回退旧根路径（存量用户数据兼容）
     pub fn load(data_dir: &std::path::Path) -> Self {
-        let file: serde_json::Value =
-            crate::fs_utils::read_json(&data_dir.join("wb_sticky_sessions.json"));
+        let new_path = sticky_path(data_dir);
+        let path = if new_path.exists() {
+            new_path
+        } else {
+            sticky_path_legacy(data_dir)
+        };
+        let file: serde_json::Value = crate::fs_utils::read_json(&path);
         let mut map = HashMap::new();
         if let Some(list) = file.get("bindings").and_then(|b| b.as_array()) {
             for item in list {
@@ -207,7 +248,10 @@ impl StickyStore {
                 map.insert(key, Binding { uid, conv_id, last_seen, explicit });
             }
         }
-        Self { inner: Mutex::new(map) }
+        Self {
+            inner: Mutex::new(map),
+            last_save: Mutex::new(None),
+        }
     }
 }
 
@@ -303,5 +347,64 @@ mod tests {
         store.bind(&k2, "u2", "v2", 2000);
         assert_eq!(store.evict_expired(1000 + EXPLICIT_TTL_SECS + 10), 1);
         assert_eq!(store.len(), 1);
+    }
+
+    /// 落盘写入 data/ 子目录；1s 节流窗口内的重复 save 跳过写盘（内存态照常更新）
+    #[test]
+    fn save_writes_data_subdir_and_throttles_within_one_second() {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_sticky_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let store = StickyStore::new();
+        let key = SessionKey::from_body(&body_with(Some("c"), json!([{"role":"user","content":"x"}])));
+        store.bind(&key, "u1", "v1", 1000);
+        store.save(&dir);
+        let path = dir.join("data").join("wb_sticky_sessions.json");
+        assert!(path.exists(), "落盘应写入 data/ 子目录");
+        assert!(!dir.join("wb_sticky_sessions.json").exists(), "不得再写旧根路径");
+        let snapshot1 = std::fs::read_to_string(&path).unwrap();
+        // 1s 内再次 bind + save：落盘被节流跳过，文件内容不变
+        store.bind(&key, "u2", "v2", 1006);
+        store.save(&dir);
+        let snapshot2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(snapshot1, snapshot2, "距上次成功保存 <1000ms 应跳过落盘");
+        // 内存态已更新（resolve 读到新绑定）
+        assert_eq!(store.resolve(&key, 1007).unwrap().uid, "u2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读取兼容：data/ 新路径不存在时回退旧根路径（存量用户数据），save 迁移写新路径
+    #[test]
+    fn load_falls_back_to_legacy_root_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_sticky_legacy_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(
+            dir.join("wb_sticky_sessions.json"),
+            json!({"version": 1, "bindings": [
+                {"key": "cid:legacy", "uid": "u9", "conv_id": "c9", "last_seen": 500, "explicit": true}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let store = StickyStore::load(&dir);
+        let key = SessionKey::Explicit("legacy".into());
+        assert_eq!(store.resolve(&key, 600).unwrap().conv_id, "c9");
+        // save 一律写新路径（迁移完成）
+        store.save(&dir);
+        assert!(dir.join("data").join("wb_sticky_sessions.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

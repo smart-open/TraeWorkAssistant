@@ -33,7 +33,7 @@ pub fn default_template_map() -> Vec<(String, String)> {
 }
 
 /// 模板映射文件结构：wb_template_map.json
-#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
 pub struct TemplateMapFile {
     #[serde(default)]
     pub templates: Vec<TemplateRule>,
@@ -41,34 +41,44 @@ pub struct TemplateMapFile {
     pub updated_at: Option<i64>,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct TemplateRule {
     pub from: String,
     pub to: String,
 }
 
-/// 读取外置映射表；文件缺失/损坏返回 None（调用方用内置兜底）
-pub fn read_template_file(data_dir: &std::path::Path) -> Option<Vec<(String, String)>> {
-    let file: TemplateMapFile =
-        crate::fs_utils::read_json(&data_dir.join("wb_template_map.json"));
-    if file.templates.is_empty() {
-        return None;
-    }
-    Some(
-        file.templates
+impl TemplateMapFile {
+    /// 转换为 (from, to) 规则表：剔除空 from；全空 → None（调用方走内置兜底）
+    pub fn into_rules(self) -> Option<Vec<(String, String)>> {
+        let rules: Vec<(String, String)> = self
+            .templates
             .into_iter()
             .filter(|r| !r.from.is_empty())
             .map(|r| (r.from, r.to))
-            .collect(),
-    )
+            .collect();
+        if rules.is_empty() {
+            None
+        } else {
+            Some(rules)
+        }
+    }
 }
 
-/// 审核模板黑名单最小改写：零分配预检（仅在内容含指纹关键词时才做替换）
+/// 模板映射文件路径（迁移至 data/ 子目录，与全仓数据文件约定一致）
+pub fn template_map_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("data").join("wb_template_map.json")
+}
+
+/// 旧根路径（历史落盘位置，仅作读取兼容）
+pub fn template_map_path_legacy(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("wb_template_map.json")
+}
+
+/// 审核模板黑名单最小改写：映射表为空才跳过（不做硬编码关键词预检——
+/// 外置映射表新增规则的命中词可能不含内置三短语，预检会永久漏改）；
+/// 条目少（个位数），逐条 contains 代价可接受
 pub fn apply_template_map(text: &str, templates: &[(String, String)]) -> String {
-    let needs_check = text.contains("Claude Code")
-        || text.contains("Main branch")
-        || text.contains("official CLI");
-    if !needs_check {
+    if templates.is_empty() {
         return text.to_string();
     }
     let mut out = text.to_string();
@@ -185,16 +195,21 @@ pub fn prepare_wb_chat_body(
     // 模型归一化（目录 id 为小写规范名）
     m.insert("model".into(), json!(model));
 
-    // 连续同角色消息合并 + 指纹清洗
+    // 连续同角色消息合并 + 指纹清洗。
+    // role:"tool" 一律不参与合并（无论当前还是上一条）：tool_call_id 必须逐条
+    // 保留，合并会丢失 id 使上游无法把结果对齐到对应调用
     if let Some(msgs) = m.get_mut("messages").and_then(|v| v.as_array_mut()) {
         let mut merged: Vec<Value> = Vec::with_capacity(msgs.len());
         for msg in msgs.drain(..) {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
-            if let Some(last) = merged.last_mut() {
-                let last_role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                if !role.is_empty() && role == last_role {
-                    merge_message(last, msg);
-                    continue;
+            let mergeable = !role.is_empty() && role != "tool";
+            if mergeable {
+                if let Some(last) = merged.last_mut() {
+                    let last_role = last.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if !last_role.is_empty() && last_role != "tool" && role == last_role {
+                        merge_message(last, msg);
+                        continue;
+                    }
                 }
             }
             merged.push(msg);
@@ -202,6 +217,20 @@ pub fn prepare_wb_chat_body(
         for msg in merged.iter_mut() {
             if let Some(c) = msg.get_mut("content") {
                 sanitize_content(c, templates, sanitize);
+            }
+            // 指纹清洗覆盖 tool_calls[].function.arguments（审核模板最小改写；
+            // 不套用 strip_cc_fingerprints——其删段语义可能破坏 JSON 结构）
+            if let Some(tcs) = msg.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+                for tc in tcs.iter_mut() {
+                    if let Some(Value::String(s)) = tc
+                        .get_mut("function")
+                        .and_then(|f| f.get_mut("arguments"))
+                    {
+                        if sanitize {
+                            *s = apply_template_map(s, templates);
+                        }
+                    }
+                }
             }
         }
         m.insert("messages".into(), Value::Array(merged));
@@ -276,7 +305,9 @@ fn join_content(base: &mut Value, extra: Value) {
 }
 
 /// tool_choice 归一化（对象形式上游报 400 code=11101）：
-/// {"type":"function","function":{"name":X}} → "X"；auto/none/required 原样 string
+/// {"type":"function","function":{"name":X}} → "X"；auto/none/required 原样 string；
+/// 带 function.name 的对象（含未知 type 形态）一律归一为该 name；
+/// 其余未知形态归 auto
 pub fn normalize_tool_choice(m: &mut Map<String, Value>) {
     let tc = match m.remove("tool_choice") {
         Some(v) => v,
@@ -299,12 +330,15 @@ pub fn normalize_tool_choice(m: &mut Map<String, Value>) {
                 .or_else(|| map.get("name").and_then(|n| n.as_str()))
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            let value = match (typ.as_str(), name) {
-                ("none", _) => "none".to_string(),
-                ("auto", _) => "auto".to_string(),
-                ("any" | "required", _) => "required".to_string(),
-                ("function", Some(n)) => n.to_string(),
-                _ => "auto".to_string(),
+            let value = match name {
+                // 带 name 的对象：无论 type 为何（function/未知形态）都保留指定意图
+                Some(n) => n.to_string(),
+                None => match typ.as_str() {
+                    "none" => "none".to_string(),
+                    "any" | "required" => "required".to_string(),
+                    // auto 与其余未知形态一律归 auto
+                    _ => "auto".to_string(),
+                },
             };
             m.insert("tool_choice".into(), json!(value));
         }
@@ -416,5 +450,95 @@ mod tests {
         let out = prepare_wb_chat_body(&src_bytes, "m", "", None, false, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["messages"][0]["content"], json!("You are Claude Code, Anthropic's official CLI for Claude."));
+    }
+
+    /// 回归：连续两条 role:"tool" 消息不合并，tool_call_id 逐条保留；
+    /// 连续 role:"user" 仍合并（既有语义）；tool 之后跟 user 也不得并入 tool
+    #[test]
+    fn tool_messages_never_merge_and_keep_call_ids() {
+        let out = rewrite(json!({"messages":[
+            {"role":"assistant","content":null,
+             "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"r1"},
+            {"role":"tool","tool_call_id":"c2","content":"r2"},
+        ]}), None);
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3, "连续两条 role:tool 不合并");
+        assert_eq!(msgs[1]["tool_call_id"], json!("c1"));
+        assert_eq!(msgs[2]["tool_call_id"], json!("c2"));
+        // 连续 user 仍合并
+        let out = rewrite(json!({"messages":[
+            {"role":"user","content":"a"},
+            {"role":"user","content":"b"},
+        ]}), None);
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["content"], json!("a\n\nb"));
+        // tool 之后的 user 消息不得并入 tool 消息
+        let out = rewrite(json!({"messages":[
+            {"role":"tool","tool_call_id":"c1","content":"r"},
+            {"role":"user","content":"继续"},
+        ]}), None);
+        assert_eq!(out["messages"].as_array().unwrap().len(), 2);
+    }
+
+    /// 外置映射表新增规则不再被硬编码预检短路：规则命中词不含内置三短语也生效
+    #[test]
+    fn external_template_rules_apply_without_hardcoded_precheck() {
+        let tpl = vec![("FooBar".to_string(), "Baz".to_string())];
+        assert_eq!(apply_template_map("hello FooBar world", &tpl), "hello Baz world");
+        // 空映射表 → 原样
+        assert_eq!(apply_template_map("Claude Code", NO_TPL), "Claude Code");
+        // 无规则命中的内容零改动（原「预检短路」语义由无命中自然保证）
+        let plain = "普通中文内容不清洗";
+        assert_eq!(apply_template_map(plain, &default_template_map()), plain);
+    }
+
+    /// 指纹清洗覆盖 tool_calls[].function.arguments（最小改写、JSON 结构不破坏）
+    #[test]
+    fn sanitize_covers_tool_call_arguments() {
+        let src = json!({"messages":[
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"note",
+                 "arguments":"{\"prompt\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}"}}
+            ]}
+        ]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let tpl = default_template_map();
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, true, &tpl);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let args = v["messages"][0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        assert!(args.contains("CLI tool"));
+        assert!(!args.contains("official CLI for Claude."));
+        // arguments 仍是合法 JSON（结构未被清洗破坏）
+        let parsed: Value = serde_json::from_str(args).unwrap();
+        assert_eq!(
+            parsed["prompt"],
+            json!("You are Claude Code, Anthropic's official CLI tool for Claude.")
+        );
+        // sanitize=false 不清洗
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, false, &tpl);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(v["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("official CLI for Claude."));
+    }
+
+    /// tool_choice 带 function.name 的对象（含未知 type / 缺 type 形态）归一为该 name
+    #[test]
+    fn tool_choice_name_bearing_objects_normalize_to_name() {
+        // 缺 type 的 function 对象 → name（旧实现误归 auto 丢失指定意图）
+        let out = rewrite(json!({"messages":[],"tool_choice":{"function":{"name":"get_weather"}}}), None);
+        assert_eq!(out["tool_choice"], json!("get_weather"));
+        // 未知 type 但带 function.name → name
+        let out = rewrite(json!({"messages":[],"tool_choice":{"type":"custom","function":{"name":"t"}}}), None);
+        assert_eq!(out["tool_choice"], json!("t"));
+        // 既有形态回归：type=function → name
+        let out = rewrite(json!({"messages":[],"tool_choice":{"type":"function","function":{"name":"f"}}}), None);
+        assert_eq!(out["tool_choice"], json!("f"));
+        // 无 name 的未知形态 → auto
+        let out = rewrite(json!({"messages":[],"tool_choice":{"type":"weird"}}), None);
+        assert_eq!(out["tool_choice"], json!("auto"));
     }
 }

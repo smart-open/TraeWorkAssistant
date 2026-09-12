@@ -174,6 +174,8 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
                 .and_then(|a| a.refresh_token.clone())
                 .unwrap_or_default();
             let has_rt = !refresh_token.is_empty();
+            // 导出必须给完整 JWT：视图 jwt 字段已改为掩码（防下发），此处从原始账号取
+            let jwt_full = raw.map(|a| a.jwt.clone()).unwrap_or_default();
 
             let device_id = device_map
                 .get(&v.user_id)
@@ -184,7 +186,7 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
 
             serde_json::json!({
                 "name": v.name,
-                "cloudIdeJwt": v.jwt,
+                "cloudIdeJwt": jwt_full,
                 "deviceId": device_id,
                 "jwtExp": v.jwt_exp_timestamp,
                 "balance": v.credits,
@@ -590,10 +592,30 @@ pub fn account_delete(
     fs_utils::write_json(&state.path("groups.json"), &groups)?;
 
     if delete_profile {
+        // P0 防目录逃逸：user_id 直接拼进 profiles/ 路径并整目录删除，先做字符集白名单校验
+        fs_utils::ensure_uid_safe(&user_id)?;
         let p = state.path("profiles").join(&user_id);
         let _ = std::fs::remove_dir_all(p);
     }
     Ok(())
+}
+
+/// 按 UserID 查询单账号完整 JWT（编辑弹框按需回填；列表接口只返回掩码，凭据不下发全量列表）。
+/// 顶层参数命名遵循仓库约定：Rust 签名 user_id，前端 invoke 传 userId 自动映射。
+#[tauri::command(async)]
+pub fn account_get_jwt(state: State<AppState>, user_id: String) -> Result<String, String> {
+    fs_utils::ensure_uid_safe(&user_id)?;
+    let accounts = crate::vault::load_accounts(&state);
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+        .ok_or_else(|| format!("账号 {user_id} 不在账号池中"))?;
+    let jwt = account.jwt.trim();
+    if jwt.is_empty() {
+        return Err(format!("账号 {user_id} 无有效 JWT（可能未被 vault 解密回填）"));
+    }
+    Ok(jwt.to_string())
 }
 
 #[tauri::command]
@@ -1543,7 +1565,9 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             user_id: uid.clone(),
             name: a.name.clone(),
             group_id,
-            jwt: a.jwt.clone(),
+            // 审查 P1：列表/导出视图不再下发完整 JWT，仅掩码展示；
+            // 需要完整凭据的场景（编辑回填）走 account_get_jwt 按需获取
+            jwt: fs_utils::mask_secret(&a.jwt),
             jwt_exp_hours: info.exp_hours,
             jwt_exp_timestamp: info.exp_timestamp,
             checked_today: Some(checked),

@@ -71,6 +71,40 @@ impl ApiLogger {
         duration_ms: u64,
         error: Option<&str>,
     ) {
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, None, error)
+    }
+
+    /// 记录一条 API 请求日志（流式请求带 TTFB 首字耗时字段）
+    /// `ttfb_ms`：请求发起 → 上游首行到达的耗时；None 不输出该字段（旧格式兼容）
+    pub fn log_request_ttfb(
+        &self,
+        pool: &str,
+        method: &str,
+        path: &str,
+        model: &str,
+        stream: bool,
+        status: u16,
+        uid: &str,
+        duration_ms: u64,
+        ttfb_ms: Option<u64>,
+        error: Option<&str>,
+    ) {
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, ttfb_ms, error)
+    }
+
+    fn log_request_inner(
+        &self,
+        pool: &str,
+        method: &str,
+        path: &str,
+        model: &str,
+        stream: bool,
+        status: u16,
+        uid: &str,
+        duration_ms: u64,
+        ttfb_ms: Option<u64>,
+        error: Option<&str>,
+    ) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -81,15 +115,19 @@ impl ApiLogger {
         let s = local_ts % 60;
 
         let uid_short = &uid[..uid.len().min(12)];
+        let ttfb_part = match ttfb_ms {
+            Some(t) => format!(" ttfb={t}ms"),
+            None => String::new(),
+        };
         let err_part = match error {
             Some(e) => format!(" error={}", e),
             None => String::new(),
         };
 
         let line = format!(
-            "[{:02}:{:02}:{:02}] {} {} pool={} model={} stream={} status={} uid={} {}ms{}\n",
+            "[{:02}:{:02}:{:02}] {} {} pool={} model={} stream={} status={} uid={} {}ms{}{}\n",
             h, m, s,
-            method, path, pool, model, stream, status, uid_short, duration_ms, err_part,
+            method, path, pool, model, stream, status, uid_short, duration_ms, ttfb_part, err_part,
         );
 
         if let Some(mut f) = self.get_writer() {

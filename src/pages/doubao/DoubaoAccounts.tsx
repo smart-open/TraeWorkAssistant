@@ -20,6 +20,7 @@ import {
 import PageHeader from '../../components/PageHeader';
 import { Badge, Modal } from '../../components/ui';
 import { api } from '../../lib/tauri';
+import { withMinDelay } from '../../lib/delay';
 import { useAppStore } from '../../store';
 import type {
   DoubaoAccountView,
@@ -38,8 +39,11 @@ function fmtSize(bytes: number): string {
 
 type DialogState =
   | { mode: 'save-login' }
-  | { mode: 'edit'; userId: string; name: string; note: string; sessionId: string; sidGuard: string; ttwid: string }
+  | { mode: 'edit'; userId: string; name: string; note: string }
   | null;
+
+/** 对话数据备份/恢复/导出的确认弹框目标（禁 window.confirm，红线） */
+type ChatConfirm = { kind: 'backup' | 'restore' | 'export'; account: DoubaoAccountView } | null;
 
 export default function DoubaoAccounts() {
   const pushToast = useAppStore((s) => s.pushToast);
@@ -75,6 +79,15 @@ export default function DoubaoAccounts() {
   const [editSidGuard, setEditSidGuard] = useState('');
   const [editTtwid, setEditTtwid] = useState('');
   const [helpOpen, setHelpOpen] = useState(false);
+  // 删除账号确认弹框（禁 window.confirm，红线；原两次 confirm 合并为单次弹框确认）
+  const [removeTarget, setRemoveTarget] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
+  // 对话备份/恢复/导出确认弹框
+  const [chatConfirm, setChatConfirm] = useState<ChatConfirm>(null);
+  const [chatConfirmBusy, setChatConfirmBusy] = useState(false);
+  // 编辑弹框凭证回填：loading 态 + 请求序号守卫（快速切换账号时仅最后一次请求回填）
+  const [credLoading, setCredLoading] = useState(false);
+  const credReqRef = useRef(0);
 
   /** 到期提醒：
    *  ① 池级保活：距 last_keepalive_at 超过 25 天（sid_guard 30 天滑动窗口临近耗尽）；
@@ -266,7 +279,36 @@ export default function DoubaoAccounts() {
     // 沿用现有管线：关豆包 → 快照到 profiles_doubao/<uid> → 重启（NDJSON 进度）
     await saveCurrentLogin(uid, 'Doubao');
     // 无论是否填别名都入池（快照已生成，池里有元数据后可直接编辑别名/凭证）
-    api.doubao.accountSave(uid, nameInput.trim() || undefined).catch(() => {});
+    api.doubao.accountSave(uid, nameInput.trim() || undefined).catch((err) => {
+      pushToast('error', `账号 ${uid} 入池失败：${String(err)}`);
+    });
+  };
+
+  /** 打开编辑弹框：凭证字段按需从后端取完整值回填（列表接口只回掩码值，不可直接当原文编辑） */
+  const openEditDialog = (a: DoubaoAccountView) => {
+    setEditName(a.name === a.user_id ? '' : a.name);
+    setEditNote(a.note);
+    setEditSessionId('');
+    setEditSidGuard('');
+    setEditTtwid('');
+    setDialog({ mode: 'edit', userId: a.user_id, name: a.name, note: a.note });
+    const seq = ++credReqRef.current;
+    setCredLoading(true);
+    api.doubao
+      .getCredential(a.user_id)
+      .then((c) => {
+        if (credReqRef.current !== seq) return;
+        setEditSessionId(c.session_id ?? '');
+        setEditSidGuard(c.sid_guard ?? '');
+        setEditTtwid(c.ttwid ?? '');
+      })
+      .catch((err) => {
+        if (credReqRef.current !== seq) return;
+        pushToast('error', `读取会话凭证失败：${String(err)}`);
+      })
+      .finally(() => {
+        if (credReqRef.current === seq) setCredLoading(false);
+      });
   };
 
   /** 从代理抓包文件读取最新抓到的豆包会话凭证，预填编辑弹框（免手动抄写） */
@@ -312,24 +354,30 @@ export default function DoubaoAccounts() {
     }
   };
 
-  /** 删除账号：移出账号池 + 删除该账号快照文件（双重确认，不可恢复） */
-  const doRemove = async (uid: string) => {
-    if (
-      !confirm(
-        `删除账号 ${uid}？\n\n将同时执行：\n· 移出账号池（清除别名 / 备注 / 凭证）\n· 删除快照文件（登录态不可恢复，再使用需重新登录）`,
-      )
-    )
-      return;
-    if (!confirm(`⚠ 二次确认：账号 ${uid} 的登录态快照将被永久删除、无法恢复。\n\n确定删除吗？`)) return;
+  /** 删除账号：移出账号池 + 删除该账号快照文件（弹框确认，不可恢复） */
+  const doRemove = (uid: string) => {
+    setRemoveTarget(uid);
+  };
+
+  const confirmRemove = async () => {
+    const uid = removeTarget;
+    if (!uid || removing) return;
+    setRemoving(true);
     try {
-      await api.doubao.accountRemove(uid);
-      if (accounts.find((a) => a.user_id === uid)?.has_snapshot) {
-        await api.profiles.delete(uid, 'Doubao');
-      }
+      const hasSnapshot = accounts.find((a) => a.user_id === uid)?.has_snapshot;
+      await withMinDelay((async () => {
+        await api.doubao.accountRemove(uid);
+        if (hasSnapshot) {
+          await api.profiles.delete(uid, 'Doubao');
+        }
+      })());
       pushToast('info', `账号 ${uid} 已删除（含快照）`);
       await reload();
     } catch (err) {
       pushToast('error', `删除失败：${String(err)}`);
+    } finally {
+      setRemoving(false);
+      setRemoveTarget(null);
     }
   };
 
@@ -388,45 +436,17 @@ export default function DoubaoAccounts() {
   };
 
   /** D1：备份对话数据（IndexedDB / DoubaoStorage 客户端状态；自动先关豆包，覆盖式备份） */
-  const doChatBackup = async (a: DoubaoAccountView) => {
-    if (
-      !confirm(
-        `备份账号 ${a.name} 的对话数据（IndexedDB / DoubaoStorage）？\n\n将自动关闭豆包 → 覆盖式备份到 data/doubao_chats/${a.user_id}/ → 之后需重新打开豆包。\n\n说明：对话正文保存在云端，本地备份的是客户端状态（换机/重装后恢复快照+登录即可同步对话）。`,
-      )
-    )
-      return;
-    setChatBusyFor(a.user_id);
-    try {
-      const r = await api.doubao.chatdataBackup(a.user_id);
-      pushToast('success', `对话数据备份完成：${r.files} 个文件（data/doubao_chats/）`);
-      await reload();
-    } catch (err) {
-      pushToast('error', `对话数据备份失败：${String(err)}`);
-    } finally {
-      setChatBusyFor(null);
-    }
+  const doChatBackup = (a: DoubaoAccountView) => {
+    setChatConfirm({ kind: 'backup', account: a });
   };
 
   /** D1：恢复对话数据备份到豆包（自动先关豆包；恢复后打开豆包会从云端同步最新对话） */
-  const doChatRestore = async (a: DoubaoAccountView) => {
-    const info = chatdataInfos[a.user_id];
-    if (!confirm(
-      `恢复账号 ${a.name} 的对话数据备份到本机豆包？${info?.backed_at ? `\n\n备份时间：${info.backed_at}（${info.files} 文件）` : ''}\n\n将自动关闭豆包 → 回写备份内的 IndexedDB / DoubaoStorage → 重新打开豆包即生效。`,
-    ))
-      return;
-    setChatBusyFor(a.user_id);
-    try {
-      const r = await api.doubao.chatdataRestore(a.user_id);
-      pushToast('success', `对话数据恢复完成：${r.files} 个文件，重新打开豆包即可生效`);
-    } catch (err) {
-      pushToast('error', `对话数据恢复失败：${String(err)}`);
-    } finally {
-      setChatBusyFor(null);
-    }
+  const doChatRestore = (a: DoubaoAccountView) => {
+    setChatConfirm({ kind: 'restore', account: a });
   };
 
   /** D2：导出对话记录（官方 API 拉取会话列表+消息 → markdown/json 到 data/exports/） */
-  const doExportChats = async (a: DoubaoAccountView) => {
+  const doExportChats = (a: DoubaoAccountView) => {
     if (a.session_state === 'none') {
       pushToast(
         'warn',
@@ -434,17 +454,36 @@ export default function DoubaoAccounts() {
       );
       return;
     }
-    if (!confirm(`导出账号 ${a.name} 的对话记录？\n\n将从豆包官方接口拉取最近会话与消息，生成 markdown + json 到 data/exports/。会话较多时需要一些时间。`)) return;
+    setChatConfirm({ kind: 'export', account: a });
+  };
+
+  /** 确认弹框统一执行入口：原 confirm 后逻辑保持不变（补 withMinDelay 保证忙碌态可见） */
+  const runChatConfirm = async () => {
+    if (!chatConfirm || chatConfirmBusy) return;
+    const { kind, account: a } = chatConfirm;
+    setChatConfirmBusy(true);
     setChatBusyFor(a.user_id);
-    pushToast('info', `正在导出 ${a.name} 的对话记录，请稍候…`);
     try {
-      const r = await api.doubao.exportChats(a.user_id);
-      pushToast('success', `导出完成：${r.conversations} 个会话 / ${r.messages} 条消息 → ${r.md_path}`);
-      await reload();
+      if (kind === 'backup') {
+        const r = await withMinDelay(api.doubao.chatdataBackup(a.user_id));
+        pushToast('success', `对话数据备份完成：${r.files} 个文件（data/doubao_chats/）`);
+        await reload();
+      } else if (kind === 'restore') {
+        const r = await withMinDelay(api.doubao.chatdataRestore(a.user_id));
+        pushToast('success', `对话数据恢复完成：${r.files} 个文件，重新打开豆包即可生效`);
+      } else {
+        pushToast('info', `正在导出 ${a.name} 的对话记录，请稍候…`);
+        const r = await withMinDelay(api.doubao.exportChats(a.user_id));
+        pushToast('success', `导出完成：${r.conversations} 个会话 / ${r.messages} 条消息 → ${r.md_path}`);
+        await reload();
+      }
     } catch (err) {
-      pushToast('error', `对话导出失败：${String(err)}`);
+      const label = kind === 'backup' ? '对话数据备份失败' : kind === 'restore' ? '对话数据恢复失败' : '对话导出失败';
+      pushToast('error', `${label}：${String(err)}`);
     } finally {
       setChatBusyFor(null);
+      setChatConfirmBusy(false);
+      setChatConfirm(null);
     }
   };
 
@@ -747,23 +786,15 @@ export default function DoubaoAccounts() {
                         </button>
                         <button
                           title="编辑别名 / 备注 / 会话凭证"
-                          onClick={() => {
-                            setEditName(a.name === a.user_id ? '' : a.name);
-                            setEditNote(a.note);
-                            // 回填已存凭证（本地应用明文展示；清空后保存即删除）
-                            setEditSessionId(a.session_id ?? '');
-                            setEditSidGuard(a.sid_guard ?? '');
-                            setEditTtwid(a.ttwid ?? '');
-                            setDialog({ mode: 'edit', userId: a.user_id, name: a.name, note: a.note, sessionId: a.session_id ?? '', sidGuard: a.sid_guard ?? '', ttwid: a.ttwid ?? '' });
-                          }}
+                          onClick={() => openEditDialog(a)}
                           disabled={anyBusy}
                           className="btn-ghost !p-2"
                         >
                           <Pencil size={14} />
                         </button>
                         <button
-                          title="删除账号（含快照，需二次确认）"
-                          onClick={() => void doRemove(a.user_id)}
+                          title="删除账号（含快照，不可恢复）"
+                          onClick={() => doRemove(a.user_id)}
                           disabled={anyBusy}
                           className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 disabled:opacity-30 dark:hover:bg-rose-500/10"
                         >
@@ -946,24 +977,27 @@ export default function DoubaoAccounts() {
             </div>
             <div>
               <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
-                会话凭证 sessionid（代理自动回写，可手动修改）
+                会话凭证 sessionid（代理自动回写，可手动修改）{credLoading ? ' · 完整凭证加载中…' : ''}
               </label>
               <input
                 value={editSessionId}
                 onChange={(e) => setEditSessionId(e.target.value)}
-                placeholder="启动代理登录豆包后自动写入；也可手动粘贴"
+                disabled={credLoading}
+                placeholder={credLoading ? '加载中…' : '启动代理登录豆包后自动写入；也可手动粘贴'}
                 className="input font-mono text-xs"
               />
               <input
                 value={editSidGuard}
                 onChange={(e) => setEditSidGuard(e.target.value)}
-                placeholder="sid_guard（格式 sid|创建时间|有效期|…，用于到期提醒）"
+                disabled={credLoading}
+                placeholder={credLoading ? '加载中…' : 'sid_guard（格式 sid|创建时间|有效期|…，用于到期提醒）'}
                 className="input mt-2 font-mono text-xs"
               />
               <input
                 value={editTtwid}
                 onChange={(e) => setEditTtwid(e.target.value)}
-                placeholder="ttwid（设备级 Cookie，对话导出 API 必需；清空此处保存不会删除已存 ttwid）"
+                disabled={credLoading}
+                placeholder={credLoading ? '加载中…' : 'ttwid（设备级 Cookie，对话导出 API 必需；清空此处保存不会删除已存 ttwid）'}
                 className="input mt-2 font-mono text-xs"
               />
               <div className="mt-2 rounded-lg border border-slate-200 p-2.5 dark:border-zinc-700">
@@ -988,6 +1022,94 @@ export default function DoubaoAccounts() {
               <button onClick={() => void submitEdit()} className="btn-primary">
                 保存
               </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* 删除账号确认弹框（禁 window.confirm，红线；原两次 confirm 合并为单次弹框确认） */}
+      <Modal
+        open={removeTarget != null}
+        onClose={() => !removing && setRemoveTarget(null)}
+        title="删除账号"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setRemoveTarget(null)} disabled={removing}>取消</button>
+            <button className="btn-primary !bg-rose-600 hover:!bg-rose-500" onClick={() => void confirmRemove()} disabled={removing}>
+              {removing ? '删除中…' : '确认删除'}
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-2 text-sm">
+          <div>确定删除账号 <span className="font-mono">{removeTarget}</span>？将同时执行：</div>
+          <ul className="ml-4 list-disc space-y-0.5 text-xs text-slate-500 dark:text-zinc-400">
+            <li>移出账号池（清除别名 / 备注 / 凭证）</li>
+            <li>删除快照文件（登录态不可恢复，再使用需重新登录）</li>
+          </ul>
+          <div className="rounded-lg bg-rose-50 p-3 text-xs font-medium text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">
+            ⚠ 该账号的登录态快照将被永久删除、无法恢复。
+          </div>
+        </div>
+      </Modal>
+
+      {/* 对话数据备份 / 恢复 / 导出确认弹框（禁 window.confirm，红线） */}
+      <Modal
+        open={chatConfirm != null}
+        onClose={() => !chatConfirmBusy && setChatConfirm(null)}
+        title={
+          chatConfirm?.kind === 'backup'
+            ? '备份对话数据'
+            : chatConfirm?.kind === 'restore'
+              ? '恢复对话数据'
+              : '导出对话记录'
+        }
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setChatConfirm(null)} disabled={chatConfirmBusy}>取消</button>
+            <button
+              className={chatConfirm?.kind === 'restore' ? 'btn-primary !bg-amber-600 hover:!bg-amber-500' : 'btn-primary'}
+              onClick={() => void runChatConfirm()}
+              disabled={chatConfirmBusy}
+            >
+              {chatConfirmBusy
+                ? '处理中…'
+                : chatConfirm?.kind === 'backup'
+                  ? '确认备份'
+                  : chatConfirm?.kind === 'restore'
+                    ? '确认恢复'
+                    : '确认导出'}
+            </button>
+          </>
+        }
+      >
+        {chatConfirm?.kind === 'backup' && (
+          <div className="space-y-2 text-sm">
+            <div>备份账号「{chatConfirm.account.name}」的对话数据（IndexedDB / DoubaoStorage）？</div>
+            <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-900 dark:text-zinc-400">
+              将自动关闭豆包 → 覆盖式备份到 data/doubao_chats/{chatConfirm.account.user_id}/ → 之后需重新打开豆包。
+              对话正文保存在云端，本地备份的是客户端状态（换机/重装后恢复快照+登录即可同步对话）。
+            </div>
+          </div>
+        )}
+        {chatConfirm?.kind === 'restore' && (
+          <div className="space-y-2 text-sm">
+            <div>
+              恢复账号「{chatConfirm.account.name}」的对话数据备份到本机豆包？
+              {chatdataInfos[chatConfirm.account.user_id]?.backed_at
+                ? `备份时间：${chatdataInfos[chatConfirm.account.user_id]?.backed_at}（${chatdataInfos[chatConfirm.account.user_id]?.files} 文件）`
+                : ''}
+            </div>
+            <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+              将自动关闭豆包 → 回写备份内的 IndexedDB / DoubaoStorage → 重新打开豆包即生效。
+            </div>
+          </div>
+        )}
+        {chatConfirm?.kind === 'export' && (
+          <div className="space-y-2 text-sm">
+            <div>导出账号「{chatConfirm.account.name}」的对话记录？</div>
+            <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-900 dark:text-zinc-400">
+              将从豆包官方接口拉取最近会话与消息，生成 markdown + json 到 data/exports/。会话较多时需要一些时间。
             </div>
           </div>
         )}

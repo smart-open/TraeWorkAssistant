@@ -171,7 +171,8 @@ fn read_current_uid(state: &State<AppState>) -> Option<String> {
 
 /// 豆包账号合并视图：账号池 ∪ 快照槽目录，标注当前账号。
 /// 账号池可含无快照的账号（如手动收录待登录）；快照槽也可含未入池账号（如 PS 桥自动备份的 last）。
-#[tauri::command]
+// async：列表构建含快照目录遍历/目录大小统计，避免 UI 冻结（内部逻辑不变）
+#[tauri::command(async)]
 pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountView>, String> {
     let pool = load_pool(&state);
     let current = read_current_uid(&state);
@@ -193,13 +194,14 @@ pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountV
             is_current: current.as_deref() == Some(a.user_id.as_str()),
             added_at: if a.added_at.is_empty() { None } else { Some(a.added_at.clone()) },
             session_state: session_state_of(a),
-            session_id: a.session_id.clone(),
-            sid_guard: a.sid_guard.clone(),
+            // 审查 P1：凭证等同密码，列表全程掩码展示；完整值走 doubao_account_get_credential 按需获取
+            session_id: a.session_id.as_deref().map(fs_utils::mask_secret),
+            sid_guard: a.sid_guard.as_deref().map(fs_utils::mask_secret),
             session_expire_at: a.session_expire_at.clone(),
             cookies_synced_at: a.cookies_synced_at.clone(),
             last_renew_at: a.last_renew_at.clone(),
             session_source: a.session_source.clone(),
-            ttwid: a.ttwid.clone(),
+            ttwid: a.ttwid.as_deref().map(fs_utils::mask_secret),
             quota_level: a.quota_level.clone(),
             quota_expire_at: a.quota_expire_at.clone(),
             quota_summary: a.quota_summary.clone(),
@@ -288,6 +290,8 @@ pub fn doubao_account_save(
     if user_id.is_empty() {
         return Err("user_id 不能为空".to_string());
     }
+    // uid 后续会被拼进快照槽/备份等文件路径，入口统一做字符集白名单校验
+    fs_utils::ensure_uid_safe(&user_id)?;
     let mut pool = load_pool(&state);
     if let Some(acc) = pool.accounts.iter_mut().find(|a| a.user_id == user_id) {
         if let Some(n) = name {
@@ -323,6 +327,8 @@ pub fn doubao_account_save(
 /// 从账号池移除（不动快照目录；快照删除走 profile_delete）
 #[tauri::command]
 pub fn doubao_account_remove(state: State<AppState>, user_id: String) -> Result<(), String> {
+    // uid 是快照槽/备份目录名的唯一键，入口先做防路径注入校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let mut pool = load_pool(&state);
     let before = pool.accounts.len();
     pool.accounts.retain(|a| a.user_id != user_id);
@@ -341,7 +347,8 @@ pub fn doubao_account_remove(state: State<AppState>, user_id: String) -> Result<
 ///   → `profile.info_cache[*].saman`（取最近活跃 Profile）。
 /// 来源②（兜底）：`%APPDATA%\Doubao\public_config.json` 全树递归搜 user_id/uid（text_picker）。
 /// 来源③（最后兜底）：profiles_doubao/current_account.txt（PS 桥保存/切换后写入）。
-#[tauri::command]
+// async：探测链含 leveldb/文件遍历，避免 UI 冻结（内部逻辑不变）
+#[tauri::command(async)]
 pub fn doubao_detect_uid(state: State<AppState>) -> Result<Option<String>, String> {
     // 首选：豆包客户端 Local Storage 的 client_device_info.userId（客户端每次启动自写，
     // **不依赖代理**；与抓包文件按时间戳比新鲜度取新者）——修复无代理时重新登录识别不到
@@ -902,6 +909,8 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
 /// 查询账号会员额度（调 doubao_quota.py；网络请求可达数秒，async 派发避免阻塞 UI）
 #[tauri::command(async)]
 pub fn doubao_quota_fetch(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+    // uid 会传给脚本并作为额度缓存/运维历史的账号键，入口先做防注入校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let url = state
         .settings()
         .doubao_quota_url
@@ -1239,6 +1248,28 @@ pub fn doubao_account_set_credential(
     apply_credential(&state, &mut pool, user_id.trim(), session_id, sid_guard, ttwid, "manual", true)
 }
 
+/// 按 UserID 查询单账号完整会话凭证（session_id/sid_guard/ttwid）。
+/// 列表接口已改为掩码展示（审查 P1），编辑弹框按需回填走本命令。
+/// 顶层参数命名遵循仓库约定：Rust 签名 user_id，前端 invoke 传 userId 自动映射。
+#[tauri::command(async)]
+pub fn doubao_account_get_credential(
+    state: State<AppState>,
+    user_id: String,
+) -> Result<serde_json::Value, String> {
+    fs_utils::ensure_uid_safe(user_id.trim())?;
+    let pool = load_pool(&state);
+    let acc = pool
+        .accounts
+        .iter()
+        .find(|a| a.user_id == user_id.trim())
+        .ok_or_else(|| format!("账号 {user_id} 不在豆包账号池中"))?;
+    Ok(serde_json::json!({
+        "session_id": acc.session_id.clone().unwrap_or_default(),
+        "sid_guard": acc.sid_guard.clone().unwrap_or_default(),
+        "ttwid": acc.ttwid.clone().unwrap_or_default(),
+    }))
+}
+
 /// 代理抓包凭证自动回写已入池账号。
 /// 流程：启动代理 → 豆包客户端/网页版流量经过代理 → device_proxy.py 抓到 sessionid/sid_guard
 /// 落盘（multi_sids 按该 sessionid 解析出 uid）→ 本命令把凭证写入**该 uid 且必须已入池**的账号。
@@ -1388,11 +1419,30 @@ pub fn doubao_renew_run(
 /// python/脚本绝对路径拼出的命令达 273 字符 → schtasks 报参数错误，注册失败，
 /// 而错误 toast 仅显示 4 秒，被用户感知为「点击注册没有反应」。改用启动器后
 /// /TR 只需 ~74 字符。
-fn write_task_launcher(state: &State<AppState>, name: &str, body: String) -> Result<String, String> {
-    let path = state.data_dir.join(format!("task_{name}.cmd"));
-    std::fs::write(&path, format!("@echo off\r\n{body}\r\n"))
-        .map_err(|e| format!("写入任务启动器脚本失败: {e}"))?;
-    Ok(path.to_string_lossy().to_string())
+/// （审查 P2 修复：实现提升为 misc.rs 公共函数，签到任务与豆包任务共用同一方案，
+/// 消除 misc.rs build_task_tr 拼长命令再次超限的回归）
+use crate::commands::misc::write_task_launcher;
+
+/// 从 schtasks /FO LIST 输出提取首个 HH:MM（等价正则 \d{2}:\d{2}；
+/// 仓库未引入 regex crate，手写字符扫描。旧实现按 ": " 切片在本地化输出
+/// "Start Time: 08:30:00" / 中文行混排时可能截到错误字段）。
+/// 匹配到 ASCII 数字即处于字符边界，字节切片安全。
+fn extract_hhmm(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i + 5 <= n {
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2] == b':'
+            && bytes[i + 3].is_ascii_digit()
+            && bytes[i + 4].is_ascii_digit()
+        {
+            return text[i..i + 5].to_string();
+        }
+        i += 1;
+    }
+    String::new()
 }
 
 /// schtasks /Create 失败的统一处理：记入 app_log（注册失败原本无任何痕迹）并转译常见错误。
@@ -1458,20 +1508,8 @@ pub fn doubao_renew_task_status(_state: State<AppState>) -> Result<String, Strin
     if !ok {
         return Ok("not_registered".to_string());
     }
-    // 输出形如 "Start Time: HH:MM:SS"（本地化系统可能是「开始时间:」），取 HH:MM 部分
-    let time = stdout
-        .lines()
-        .find_map(|l| {
-            let idx = l.find(": ")?;
-            let v = &l[idx + 2..];
-            let hhmm: String = v.chars().take(5).collect();
-            if hhmm.len() == 5 && hhmm.as_bytes()[2] == b':' {
-                Some(hhmm)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    // 输出形如 "Start Time: HH:MM:SS"（本地化系统可能是「开始时间:」），提取首个 HH:MM
+    let time = extract_hhmm(&stdout);
     Ok(format!("registered:{time}"))
 }
 
@@ -1542,19 +1580,7 @@ pub fn doubao_quota_task_status(_state: State<AppState>) -> Result<String, Strin
     if !ok {
         return Ok("not_registered".to_string());
     }
-    let time = stdout
-        .lines()
-        .find_map(|l| {
-            let idx = l.find(": ")?;
-            let v = &l[idx + 2..];
-            let hhmm: String = v.chars().take(5).collect();
-            if hhmm.len() == 5 && hhmm.as_bytes()[2] == b':' {
-                Some(hhmm)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let time = extract_hhmm(&stdout);
     Ok(format!("registered:{time}"))
 }
 
@@ -1588,6 +1614,8 @@ pub fn doubao_open_as_account(
     if uid.is_empty() {
         return Err("user_id 不能为空".to_string());
     }
+    // uid 直接拼进快照槽路径，先做防路径注入校验
+    fs_utils::ensure_uid_safe(&uid)?;
     // 本地预检（桥 Switch 动作在关闭豆包前也会检查，这里提前给出明确错误）
     let slot = profiles_root(&state).join(&uid);
     if !slot.exists() {
@@ -1747,6 +1775,8 @@ pub struct DoubaoSnapshotMeta {
 
 #[tauri::command]
 pub fn doubao_snapshot_meta(state: State<AppState>, user_id: String) -> Result<Option<DoubaoSnapshotMeta>, String> {
+    // uid 直接拼进快照槽路径，先做防路径注入校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let slot = profiles_root(&state).join(user_id.trim());
     if !slot.exists() {
         return Ok(None);
@@ -1842,6 +1872,8 @@ fn chat_source_dirs(user_data: &std::path::Path) -> Vec<(String, PathBuf)> {
 /// 覆盖式备份（保留最新一份），结果 {ok, files, path}。
 #[tauri::command(async)]
 pub fn doubao_chatdata_backup(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+    // uid 直接拼进备份根目录且本命令会整目录删除（remove_dir_all），必须先校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let user_data = doubao_user_data_dir();
     if !user_data.is_dir() {
         return Err("未找到豆包数据目录（%LOCALAPPDATA%\\Doubao\\User Data），请先安装并登录豆包".into());
@@ -1881,6 +1913,8 @@ pub fn doubao_chatdata_backup(state: State<AppState>, user_id: String) -> Result
 /// 恢复对话数据备份到豆包 User Data（自动先关闭豆包）。
 #[tauri::command(async)]
 pub fn doubao_chatdata_restore(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+    // uid 直接拼进备份目录路径，先做防路径注入校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let backup = chat_backup_dir(&state, &user_id);
     if !backup.is_dir() {
         return Err(format!("该账号没有对话数据备份：{}", backup.display()));
@@ -1914,6 +1948,8 @@ pub fn doubao_chatdata_restore(state: State<AppState>, user_id: String) -> Resul
 /// 查询对话数据备份状态（供账号行展示：是否有备份 / 时间 / 文件数）
 #[tauri::command]
 pub fn doubao_chatdata_info(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+    // uid 直接拼进备份目录路径，先做防路径注入校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let dir = chat_backup_dir(&state, &user_id);
     if !dir.is_dir() {
         return Ok(serde_json::json!({ "backed": false }));
@@ -1933,6 +1969,8 @@ pub fn doubao_chatdata_info(state: State<AppState>, user_id: String) -> Result<s
 /// 输出 markdown + json 到 data/exports/。需要账号已录入凭证（sessionid/sid_guard/ttwid）。
 #[tauri::command(async)]
 pub fn doubao_export_chats(state: State<AppState>, user_id: String) -> Result<serde_json::Value, String> {
+    // uid 作为脚本参数（脚本内部按 uid 构造导出路径），入口先做防注入校验
+    fs_utils::ensure_uid_safe(user_id.trim())?;
     let script = state.python_dir.join("doubao_chats.py");
     if !script.exists() {
         return Err(format!("找不到对话导出脚本: {}", script.display()));

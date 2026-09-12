@@ -23,6 +23,8 @@ pub const MAX_ROUNDS: usize = 3;
 const PAGE_TEXT_LIMIT: usize = 4000;
 /// 搜索结果条数上限
 const SEARCH_RESULTS_LIMIT: usize = 5;
+/// 抓取响应体读取上限（2MB）：恶意/异常超大页面不得拖垮代理内存与模型上下文
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Responses 请求是否声明了上游不支持的 web_search 类工具
 pub fn responses_declares_web_search(body: &Value) -> bool {
@@ -161,21 +163,125 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+// ==================== SSRF 防护（抓取前 host 校验） ====================
+
+/// 抓取 URL 校验（SSRF 防护）：拒绝非 http/https、拒绝 IP 字面量私网/环回/
+/// 链路本地（127. / 10. / 192.168. / 172.16-31. / 169.254. / 0. / ::1 /
+/// fc/fd 开头 / fe80）、拒绝 host == "localhost"
+pub fn url_allowed(url: &str) -> Result<(), String> {
+    let lower = url.trim().to_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("http://") {
+        r
+    } else if let Some(r) = lower.strip_prefix("https://") {
+        r
+    } else {
+        return Err("仅支持 http/https URL".into());
+    };
+    // authority：到第一个 / ? # 为止；剥离 userinfo（user@host）
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_part = authority.rsplit('@').next().unwrap_or("");
+    // 剥端口：IPv6 字面量必须带 []（[::1]:8080），否则按首个 ':' 截断
+    let host = if host_part.starts_with('[') {
+        host_part[1..].split(']').next().unwrap_or("")
+    } else {
+        host_part.split(':').next().unwrap_or("")
+    };
+    if host_allowed(host) {
+        Ok(())
+    } else {
+        Err("拒绝访问受限地址（SSRF 防护）".into())
+    }
+}
+
+/// host 白名单判定（纯函数，供单测）：true = 允许抓取
+fn host_allowed(host: &str) -> bool {
+    let h = host.trim().to_lowercase();
+    // IPv6 字面量：剥 [] 括号
+    let h = h.strip_prefix('[').and_then(|s| s.split(']').next()).unwrap_or(&h);
+    if h.is_empty() {
+        return false;
+    }
+    if h == "localhost" || h.ends_with(".localhost") {
+        return false;
+    }
+    if h.contains(':') {
+        // IPv6：环回（::1）/ 未指定（::）/ 唯一本地（fc/fd）/ 链路本地（fe80）
+        if h == "::1" || h == "::" || h.starts_with("fc") || h.starts_with("fd") || h.starts_with("fe80") {
+            return false;
+        }
+        // IPv4 映射形（::ffff:127.0.0.1）：尾段点分 IPv4 复检
+        if let Some(p) = h.find("ffff:") {
+            let tail = h[p + 5..].trim_start_matches(':');
+            if tail.contains('.') {
+                return ipv4_allowed(tail);
+            }
+        }
+        return true;
+    }
+    // 纯数字整型 IP 字面量（如 2130706433 = 127.0.0.1）：主机名不可能全数字
+    if !h.is_empty() && h.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    ipv4_allowed(h)
+}
+
+/// 点分 IPv4 私网/环回/链路本地/未指定判定
+fn ipv4_allowed(h: &str) -> bool {
+    if h.starts_with("0.")
+        || h.starts_with("10.")
+        || h.starts_with("127.")
+        || h.starts_with("169.254.")
+        || h.starts_with("192.168.")
+    {
+        return false;
+    }
+    if let Some(rest) = h.strip_prefix("172.") {
+        if let Ok(n) = rest.split('.').next().unwrap_or("").parse::<u8>() {
+            if (16..=31).contains(&n) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 限量读取响应体：累计达 MAX_BODY_BYTES 即截断；无效 UTF-8 宽容替换
+fn read_body_limited(resp: ureq::Response) -> Result<String, String> {
+    use std::io::Read;
+    let mut reader = resp.into_reader();
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let remain = MAX_BODY_BYTES.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..n.min(remain)]);
+                if buf.len() >= MAX_BODY_BYTES {
+                    break; // 截断
+                }
+            }
+            Err(e) => return Err(format!("响应读取失败: {e}")),
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
 /// DuckDuckGo HTML 搜索（lite 端点；单发不重试，失败明示）
 fn web_search(query: &str) -> Result<String, String> {
     let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
+    url_allowed(&url)?;
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(15))
         .build();
-    let html = agent
+    let resp = agent
         .get(&url)
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
         .call()
-        .map_err(|e| format!("搜索请求失败: {e}"))?
-        .into_string()
-        .map_err(|e| format!("搜索响应读取失败: {e}"))?;
+        .map_err(|e| format!("搜索请求失败: {e}"))?;
+    let html = read_body_limited(resp)?;
     let results = parse_ddg_results(&html);
     if results.is_empty() {
         return Err("搜索无结果（上游可能限流，可稍后重试）".into());
@@ -297,22 +403,19 @@ fn strip_tags(html: &str) -> String {
         .to_string()
 }
 
-/// 页面抓取 → 可读文本（script/style 剔除 + 剥标签 + 截断）
+/// 页面抓取 → 可读文本（SSRF host 校验 + script/style 剔除 + 剥标签 + 截断）
 fn open_url(url: &str) -> Result<String, String> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err("仅支持 http/https URL".into());
-    }
+    url_allowed(url)?;
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(20))
         .build();
-    let html = agent
+    let resp = agent
         .get(url)
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .call()
-        .map_err(|e| format!("页面请求失败: {e}"))?
-        .into_string()
-        .map_err(|e| format!("页面读取失败: {e}"))?;
+        .map_err(|e| format!("页面请求失败: {e}"))?;
+    let html = read_body_limited(resp)?;
     // script/style 块整体剔除（审查修复：删除死变量 cleaned——整页 to_lowercase 白耗分配）
     let body = remove_blocks(&html, "<script", "</script>");
     let body = remove_blocks(&body, "<style", "</style>");
@@ -462,5 +565,53 @@ mod tests {
         let (out, ok) = execute("shell", "{}");
         assert!(!ok);
         assert!(out.contains("unknown proxy tool"));
+    }
+
+    /// SSRF 防护：host 校验纯函数——私网/环回/链路本地/localhost/非 http(s) 全拒
+    #[test]
+    fn url_allowed_blocks_private_and_loopback_hosts() {
+        assert!(url_allowed("https://example.com/page?q=1").is_ok());
+        assert!(url_allowed("https://EXAMPLE.com:8443/x").is_ok());
+        assert!(url_allowed("https://user@example.com/").is_ok());
+        // 非 http/https
+        assert!(url_allowed("ftp://example.com").is_err());
+        assert!(url_allowed("file:///etc/passwd").is_err());
+        assert!(url_allowed("javascript:alert(1)").is_err());
+        // IPv4 私网/环回/链路本地/未指定
+        for host in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.9",
+            "172.16.0.1",
+            "172.31.255.1",
+            "169.254.169.254",
+            "0.0.0.0",
+        ] {
+            assert!(url_allowed(&format!("http://{host}/")).is_err(), "应拒绝 {host}");
+        }
+        // 172.32 属公网 → 放行
+        assert!(url_allowed("http://172.32.0.1/").is_ok());
+        // localhost（含带端口/子域）
+        assert!(url_allowed("http://localhost/").is_err());
+        assert!(url_allowed("http://localhost:8080/x").is_err());
+        assert!(url_allowed("http://api.localhost/").is_err());
+        // IPv6 环回/未指定/唯一本地/链路本地/IPv4 映射环回
+        for host in ["[::1]", "[::]", "[fc00::1]", "[fd12::a]", "[fe80::1]", "[::ffff:127.0.0.1]"] {
+            assert!(url_allowed(&format!("http://{host}/")).is_err(), "应拒绝 {host}");
+        }
+        // 纯数字整型 IP 字面量（2130706433 = 127.0.0.1）与空 host
+        assert!(url_allowed("http://2130706433/").is_err());
+        assert!(url_allowed("http://").is_err());
+    }
+
+    /// open_url 抓取受限地址在发起请求前即被拒绝（不触网）
+    #[test]
+    fn open_url_rejects_restricted_url_before_fetch() {
+        let (out, ok) = execute(TOOL_OPEN_URL, r#"{"url":"http://127.0.0.1:9000/admin"}"#);
+        assert!(!ok);
+        assert!(out.contains("受限"));
+        let (out, ok) = execute(TOOL_OPEN_URL, r#"{"url":"http://169.254.169.254/latest/meta-data"}"#);
+        assert!(!ok);
+        assert!(out.contains("受限"));
     }
 }

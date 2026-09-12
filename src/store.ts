@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { APP_NAME } from './lib/about';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent, type SaveLoginDoneEvent } from './lib/tauri';
+import { withMinDelay } from './lib/delay';
 import type {
   AccountView,
   ApiServiceStatus,
@@ -229,7 +230,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     unsubs = [];
     unsubs = await setupListeners({
       onProxyLog: (line) =>
-        set((s) => ({ proxyLog: [line, ...s.proxyLog.slice(0, 999)] })),
+        set((s) => ({ proxyLog: [line, ...s.proxyLog.slice(0, 199)] })),
       onAccountCaptured: (uid) => {
         // 事件驱动累加捕获数（后端 Arc<AtomicI64> 的实时镜像，避免轮询）
         set((s) => ({ proxy: { ...s.proxy, captured: s.proxy.captured + 1 } }));
@@ -242,7 +243,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       // D2：订阅后端 switch-done，给用户明确的切换完成/失败信号
       onSwitchDone: (e) => {
         // 提取脚本 [fatal] 行的原文（如「目标账号 xxx 无快照，请先登录该账号并点击保存当前登录态」）
-        const reason = e.success ? null : (e.raw.match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
+        // raw 兜底空串：后端偶发缺 payload 时避免 TypeError 把 switchingTo 永久锁死
+        const reason = e.success ? null : ((e.raw ?? '').match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
         set((s) => ({
           switchingTo: null,
           switchProgress: [
@@ -260,7 +262,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       onSaveLoginProgress: (line) =>
         set((s) => ({ saveLoginProgress: [...s.saveLoginProgress.slice(-49), line] })),
       onSaveLoginDone: (e: SaveLoginDoneEvent) => {
-        const reason = e.success ? null : (e.raw.match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
+        // 同上：raw 缺失时兜底空串，避免 savingLogin 被锁死
+        const reason = e.success ? null : ((e.raw ?? '').match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
         set((s) => ({
           savingLogin: null,
           saveLoginProgress: [
@@ -357,7 +360,8 @@ export const useAppStore = create<AppState>((set, get) => ({
             },
           };
         }
-        return { checkin: { ...s.checkin, active: true, total: e.total } };
+        // Python 转发的 start（无 accounts）同样重置进度与旧结果，避免上一轮残留干扰本轮展示
+        return { checkin: { ...s.checkin, active: true, total: e.total, index: 0, results: [], done: null } };
       }
       if (e.type === 'retry') {
         return {
@@ -688,7 +692,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   switchTo: async (userId, targetApp) => {
     try {
       set({ switchingTo: userId, switchProgress: [] });
-      await api.switchAccount(userId, targetApp);
+      // withMinDelay：切换是高风险操作，保证 busy 态至少可见 1s（避免瞬间完成导致闪烁/误触连点）
+      await withMinDelay(api.switchAccount(userId, targetApp));
       get().pushToast('info', `正在切换登录态${targetApp === 'Trae' ? '（Trae）' : ''}，请稍候…`);
     } catch (err) {
       set({ switchingTo: null });
@@ -708,7 +713,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   openDoubaoAs: async (userId, proxyPort) => {
     try {
       set({ switchingTo: userId, switchProgress: [] });
-      await api.doubao.openAs(userId, proxyPort);
+      await withMinDelay(api.doubao.openAs(userId, proxyPort));
       get().pushToast('info', `正在恢复账号 ${userId} 的快照并启动豆包，请稍候…`);
     } catch (err) {
       set({ switchingTo: null });
@@ -789,6 +794,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 回滚到修改前的值，避免 UI 显示与后端不一致
       set({ settings: current });
       get().pushToast('error', `保存设置失败：${String(err)}`);
+      // rethrow：让调用方 catch 感知失败，避免误弹「已保存」成功提示
+      throw err;
     }
   },
 

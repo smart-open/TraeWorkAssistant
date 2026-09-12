@@ -60,11 +60,12 @@ def now_str() -> str:
 
 
 def data_dir() -> Path:
+    """数据目录，与 device_proxy.py 同链：AIWORKDATA_DIR → 旧 TRAEDATA_DIR → 脚本所在目录。"""
     import os
-    env = os.environ.get("AIWORKDATA_DIR")
+    env = os.environ.get("AIWORKDATA_DIR") or os.environ.get("TRAEDATA_DIR")
     if env:
         return Path(env)
-    return Path.home() / "AppData" / "Roaming" / "AIWorkAssistant"
+    return Path(__file__).resolve().parent
 
 
 def dig(v, keys, depth=0):

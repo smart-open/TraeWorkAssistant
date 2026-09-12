@@ -116,6 +116,8 @@ fn vendor_of(canonical: &str) -> &'static str {
         ("deepseek", "DeepSeek"),
         ("kimi", "Moonshot"),
         ("doubao", "字节·豆包"),
+        ("hy3", "腾讯·混元"),
+        ("hy4", "腾讯·混元"),
         ("qwen", "阿里·通义"),
         ("minimax", "MiniMax"),
         ("claude", "Anthropic"),
@@ -436,7 +438,11 @@ pub fn unified_models(
                 if let Some(t) = cmt {
                     u.max_tokens = Some(t);
                 }
-                u.supports_image = Some(m.supports_image);
+                // 审查修复：disabled 自定义条目不参与顶层 supports_image 覆盖
+                // （停用模型的多模态声明不得改变聚合视图展示，仅 enabled 条目参与）
+                if m.enabled {
+                    u.supports_image = Some(m.supports_image);
+                }
             }
             None => {
                 order.push(canonical.clone());
@@ -893,5 +899,37 @@ mod tests {
         let g = find(&list2, "glm-5.3");
         assert_eq!(g.display, "glm-5.3", "命中 trae → Trae 侧展示名");
         assert_eq!(g.supports_image, Some(true), "Trae 侧未声明退 WB 兜底");
+    }
+
+    /// disabled 自定义条目不得覆盖聚合视图顶层 supports_image（仅 enabled 参与）。
+    /// 用不在内置目录的唯一模型名，避开 wb_catalog 缺失自愈内置表的干扰
+    #[test]
+    fn t13_disabled_custom_entry_does_not_override_supports_image() {
+        // Trae 侧 L4 对 my-vision-model 无图片推断 → supports_image = None；
+        // disabled 自定义条目声明 supports_image=true → 不得覆盖
+        let f = fixture(&[("my-vision-model", None)], &[], None);
+        std::fs::write(
+            f.dir.join("data").join("custom_models.json"),
+            json!({"models": [{"id": "cm1", "name": "my-vision-model", "base_url": "https://x",
+                               "enabled": false, "supports_image": true}]})
+                .to_string(),
+        )
+        .unwrap();
+        let list = unified_models(&f.dir, true, true, true);
+        assert_eq!(
+            find(&list, "my-vision-model").supports_image,
+            None,
+            "disabled 条目不覆盖顶层 supports_image"
+        );
+        // enabled 条目参与覆盖 → true
+        std::fs::write(
+            f.dir.join("data").join("custom_models.json"),
+            json!({"models": [{"id": "cm1", "name": "my-vision-model", "base_url": "https://x",
+                               "enabled": true, "supports_image": true}]})
+                .to_string(),
+        )
+        .unwrap();
+        let list = unified_models(&f.dir, true, true, true);
+        assert_eq!(find(&list, "my-vision-model").supports_image, Some(true));
     }
 }

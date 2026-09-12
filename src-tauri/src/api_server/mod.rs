@@ -67,8 +67,6 @@ pub struct ApiSharedState {
     /// 模型级冷却（F-34）：model → (until 秒, 连续失败次数)；10→20→40s 渐进退避，
     /// 优先级高于 Key 级冷却
     pub model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
-    /// 审核模板映射表热更新缓存：(文件 mtime, 映射)；None = 用内置兜底
-    pub wb_template_cache: Mutex<Option<(std::time::SystemTime, Vec<(String, String)>)>>,
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
@@ -367,7 +365,6 @@ mod inflight_tests {
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
-            wb_template_cache: Mutex::new(None),
             default_model: String::new(),
             data_dir: dir.clone(),
             total_requests: AtomicU64::new(0),

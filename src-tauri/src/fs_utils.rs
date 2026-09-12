@@ -95,6 +95,37 @@ pub fn mask(s: &str) -> String {
     format!("{}…{}", head, tail)
 }
 
+/// 凭证级掩码（审查 P1）：无论长度一律不返回原文——短 token 也全掩码。
+/// 用于 JWT / sessionid / sid_guard / ttwid 等等同密码的字段的列表展示。
+pub fn mask_secret(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= 8 {
+        return "****".to_string();
+    }
+    let head: String = chars.iter().take(4).collect();
+    let tail: String = chars.iter().skip(chars.len() - 4).collect();
+    format!("{}****{}", head, tail)
+}
+
+/// user_id / 账号 id 作文件系统路径段时的安全校验（审查 P0-1 全仓统一入口）。
+/// 只做字符集白名单（字母数字 - _），杜绝 `..`、绝对路径、分隔符注入导致的目录逃逸；
+/// 池内存在性校验由各调用方按各自账号池补充（wb_chat_uid_guard 模式）。
+pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
+    if uid.is_empty()
+        || uid.len() > 64
+        || !uid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || uid.contains("..")
+    {
+        return Err(format!("非法账号标识: {}", &uid.chars().take(24).collect::<String>()));
+    }
+    Ok(())
+}
+
 pub fn now_iso() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
@@ -164,7 +195,10 @@ pub fn app_log(data_dir: &Path, msg: &str) {
 // 语义：对 keys 逐个尝试；每个键先在当前层查找，未命中则沿包裹键逐层下钻
 //（数组元素同层展开），限深 8 层防止病态响应拖垮解析。
 
-const ENVELOPE_KEYS: [&str; 5] = ["data", "result", "resp", "response", "info"];
+// "auth"/"account"：CodeBuddy 桌面端 auth 文件为嵌套结构（token/到期在 .auth.*，
+// 账号信息在 .account.*，实测 2026-09 结构 {account, accounts, allAccounts, auth}），
+// 追加这两个包裹键后 dig() 为原 workbuddy 本地实现的超集，语义安全。
+const ENVELOPE_KEYS: [&str; 7] = ["data", "result", "resp", "response", "info", "auth", "account"];
 const DIG_MAX_DEPTH: usize = 8;
 
 /// 在 `v` 中按顺序查找 keys 中的任一键，返回第一个命中值。

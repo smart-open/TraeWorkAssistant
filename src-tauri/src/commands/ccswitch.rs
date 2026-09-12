@@ -136,6 +136,20 @@ pub fn ccswitch_register(
         .as_secs();
     let backup_path = backup_dir.join(format!("cc-switch.db.bak_aiwork_{}", ts));
     std::fs::copy(&db, &backup_path).map_err(|e| format!("备份 CC Switch 数据库失败: {e}"))?;
+    // 整库备份需连带 WAL/SHM：SQLite 未 checkpoint 时部分数据仍在 -wal 中，
+    // 只拷 .db 会得到缺提交的旧快照，恢复后丢最近写入（审查 P2）
+    for suffix in ["-wal", "-shm"] {
+        let side = std::path::PathBuf::from(format!("{}{}", db.display(), suffix));
+        if side.is_file() {
+            let side_backup = backup_dir.join(format!("cc-switch.db{}.bak_aiwork_{}", suffix, ts));
+            if let Err(e) = std::fs::copy(&side, &side_backup) {
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("备份 CC Switch {suffix} 文件失败（忽略）: {e}"),
+                );
+            }
+        }
+    }
 
     let entry_id = if is_wb {
         format!("{}{}", PROVIDER_WB_ID_PREFIX, app)

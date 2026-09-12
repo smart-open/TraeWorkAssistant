@@ -16,11 +16,19 @@ import os
 import urllib.error
 import urllib.request
 
+# 显式空代理 opener（与 auto_checkin.py:46-58 同源故障模式）：开启本地 MITM 代理时，
+# Windows 系统代理指向 127.0.0.1:8899，urllib 默认 opener 会读取该设置把请求路由进
+# 本地代理；代理进程一旦退出即成"死端口"，报 WinError 10061。本库所有出网请求
+# （billing/积分/token 刷新/quota 探测）强制直连，绕过一切系统/环境代理。
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 # ── 路径 ────────────────────────────────────────────────────────────────────
 
 def data_dir() -> str:
-    return os.environ.get("AIWORKDATA_DIR") or os.path.join(
-        os.environ.get("APPDATA", ""), "AIWorkAssistant")
+    """数据目录，与 device_proxy.py 同链：AIWORKDATA_DIR → 旧 TRAEDATA_DIR → 脚本所在目录
+    （读取 env 时兼容新旧两个变量名；独立运行时随脚本目录，保持自包含可用）。"""
+    return (os.environ.get("AIWORKDATA_DIR") or os.environ.get("TRAEDATA_DIR")
+            or os.path.dirname(os.path.abspath(__file__)))
 
 
 def data_subdir() -> str:
@@ -226,11 +234,12 @@ def build_auth_headers(creds: dict, web_platform: bool = False) -> dict:
 
 
 def post_json(url, headers, body=None, timeout=30):
-    """POST JSON，返回 (http_status, parsed_or_None, raw_text)；HTTPError 也返回状态码"""
+    """POST JSON，返回 (http_status, parsed_or_None, raw_text)；HTTPError 也返回状态码。
+    经模块级 OPENER 直连（绕系统/环境代理），HTTPError 语义与默认 opener 完全一致。"""
     data = json.dumps(body if body is not None else {}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
             return resp.status, _try_json(raw), raw
     except urllib.error.HTTPError as e:
@@ -245,10 +254,11 @@ def post_json(url, headers, body=None, timeout=30):
 
 
 def get_json(url, headers, timeout=30):
-    """GET 请求，返回 (http_status, parsed_or_None, raw_text)；HTTPError 也返回状态码（F-17 成长中心等 GET 端点）"""
+    """GET 请求，返回 (http_status, parsed_or_None, raw_text)；HTTPError 也返回状态码（F-17 成长中心等 GET 端点）。
+    经模块级 OPENER 直连（绕系统/环境代理）。"""
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
             return resp.status, _try_json(raw), raw
     except urllib.error.HTTPError as e:
@@ -327,14 +337,14 @@ def _quota_looks_valid(v, depth=0):
 
 
 def _quota_probe_port(port, timeout=0.8):
-    """单端口 quota 探测；命中返回响应 dict，未命中/不可达返回 None"""
-    import urllib.request
+    """单端口 quota 探测；命中返回响应 dict，未命中/不可达返回 None。
+    同样经 OPENER 直连：本机 127.0.0.1 请求绝不能被系统代理劫持到 MITM 死端口。"""
     try:
         req = urllib.request.Request(
             "http://127.0.0.1:%s%s" % (port, _QUOTA_PATH),
             headers={"User-Agent": "WorkBuddy", "Accept": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with OPENER.open(req, timeout=timeout) as r:
             raw = r.read(65536).decode("utf-8", "replace")
         v = _try_json(raw)
         if _quota_looks_valid(v):

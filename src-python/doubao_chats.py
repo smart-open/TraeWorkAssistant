@@ -422,7 +422,8 @@ class _V8:
                     continue
                 out.append(self.value())
                 n += 1
-            # 尾随命名属性（少见）：读到 '$'
+            # 尾随命名属性（少见）：读到 '$'。props 按原语义丢弃（不影响对话提取），
+            # 原处为恒假死代码（`out.append(props) if False else None`），已清理
             props: dict = {}
             while b[self.i] != 0x24:  # '$'
                 k = self.value()
@@ -430,9 +431,6 @@ class _V8:
             self.i += 1
             self._read_varint()  # expected num props
             self._read_varint()  # expected length
-            if props:
-                out.append(props) if False else None
-                out = out  # 命名属性丢弃（不影响对话提取）
             return out
         if tag == 0x44:  # 'D' date
             return {"__date__": self._double()}
@@ -542,8 +540,6 @@ def load_db_structured(db_dir: Path):
                     pass
             continue
         data.setdefault(db, {}).setdefault(os_, {})
-        if idx == _OS_META_TYPE and os_ == 0 and idx == 0:
-            pass
         if key[1] != db:  # 防御
             continue
         entry = data[db].setdefault(os_, {})
@@ -557,7 +553,8 @@ def load_db_structured(db_dir: Path):
                 k = rest.hex()
             entry.setdefault("data", {})[repr(k)] = (seq, val)
         elif idx == _OS_EXISTS_INDEX_ID:
-            entry.setdefault("exists", {})[repr(k if (k := None) else rest.hex())] = seq
+            # 原 `repr(k if (k := None) else rest.hex())` 为恒取 else 分支的死代码写法，等价清理
+            entry.setdefault("exists", {})[rest.hex()] = seq
     return {"db_names": db_names, "stores": data}
 
 
@@ -1131,17 +1128,19 @@ def detect_uid_from_local_storage() -> dict:
             if uid.isdigit() and len(uid) >= 10:
                 cand = (int(lm) if isinstance(lm, (int, float)) else 0, seq, uid)
                 # idx=0 即活跃 Profile（或无 Local State 时的 Default）：命中即用；
-                # 否则与现有 best 比 launch_ms 取新
+                # 否则与现有 best 比 launch_ms 取新。
+                # （原内层 `if best is None or idx == 0 or cand[0] > best[0]:` 恒被外层
+                # 条件蕴含——外层真时内层必真——属冗余死分支，等价合并，行为不变）
                 if best is None or (idx == 0 and best[2] != uid and active_name) or cand[0] > best[0]:
-                    if best is None or idx == 0 or cand[0] > best[0]:
-                        best = cand
+                    best = cand
         if best and idx == 0 and active_name:
             break  # 活跃 Profile 已给出 uid，无需再扫
     if best:
         ls_uid, ls_ts = best[2], best[0] / 1000.0
     # 抓包文件新鲜度
     cap_uid, cap_ts = None, 0.0
-    data_dir = Path(os.environ.get("AIWORKDATA_DIR") or os.path.join(os.environ.get("APPDATA", ""), "AIWorkAssistant"))
+    data_dir = Path(os.environ.get("AIWORKDATA_DIR") or os.environ.get("TRAEDATA_DIR")
+                    or os.path.dirname(os.path.abspath(__file__)))
     cap_file = data_dir / "data" / "doubao_captured_credentials.json"
     if cap_file.is_file():
         try:
@@ -1210,7 +1209,8 @@ def main() -> int:
         if not uid:
             print("缺少 --uid", file=sys.stderr)
             return 1
-        data_dir = Path(os.environ.get("AIWORKDATA_DIR") or os.path.join(os.environ.get("APPDATA", ""), "AIWorkAssistant"))
+        data_dir = Path(os.environ.get("AIWORKDATA_DIR") or os.environ.get("TRAEDATA_DIR")
+                    or os.path.dirname(os.path.abspath(__file__)))
         summary = export_account(data_dir, uid, limit_convs=args.limit_convs, max_pages=args.max_pages)
         print(json.dumps(summary, ensure_ascii=False))
         return 0

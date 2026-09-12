@@ -62,12 +62,20 @@ pub fn switch_account(
         crate::commands::accounts::probe_trae_jwt_alive(&state, &user_id)?;
     }
 
-    // 防误覆盖守卫（仅豆包）：把关闭客户端前检测到的当前登录 uid 传给桥，桥仅在它与
-    // current_account.txt 一致时才把"当前态"回写进该账号槽。严格版还要求 Live Cookies
-    // 里验证到登录会话——uid 检测可能被快照 localStorage 残留骗过（实测未登录时检测链
-    // 仍返回旧账号，导致未登录态被回写进账号槽反复污染），Cookie 存在性无法伪造
+    // 防误覆盖守卫：把关闭客户端前检测到的当前登录 uid 传给桥，桥仅在它与
+    // current_account.txt 一致时才把"当前态"回写进该账号槽。豆包走严格版（还要求
+    // Live Cookies 里验证到登录会话——uid 检测可能被快照 localStorage 残留骗过，
+    // Cookie 存在性无法伪造）；icube 布局（TraeWork/Trae）走本机使用证据推导（见下）
     let expected_uid = if is_doubao {
         crate::commands::doubao::detect_guard_uid_strict(&state)
+    } else if is_trae {
+        // icube 布局（TraeWork/Trae）切换守卫：此前恒为空串（fail-open），桥不会收到
+        // -ExpectedCurrentUid，关闭客户端前的"当前态"可能被回写进错误账号槽。现复用
+        // trae_apps 的本机使用证据推导（apps_accounts_discover 同源实现）填充当前 uid；
+        // 推导失败（None）→ 维持空串 fail-open 不阻断切换。switch_account 为 async 命令，
+        // vscdb/storage 同步读取在工作线程执行，不冻结 UI
+        let kind = target_app.as_deref().unwrap_or("TraeWork");
+        crate::commands::trae_apps::infer_current_cloud_uid(kind).unwrap_or_default()
     } else {
         String::new()
     };

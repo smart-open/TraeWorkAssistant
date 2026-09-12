@@ -170,8 +170,13 @@ fn consume_round(app: &AppHandle, mut proc: RoundProc, log_path: &Path) -> Round
                             }
                             let _ = app.emit("checkin-progress", &v);
                         }
-                        // done 事件不转发：由调用方汇总后统一发
-                        _ => {}
+                        // done 事件不转发：由调用方汇总后统一发（避免重复计数）
+                        "done" => {}
+                        // 其余未知/扩展类型事件原样转发 payload 给前端，不再静默丢弃
+                        // （脚本侧新增事件类型时前端可渐进消费，本地日志仍全量落盘）
+                        _ => {
+                            let _ = app.emit("checkin-progress", &v);
+                        }
                     }
                 }
                 if let Ok(mut f) = std::fs::OpenOptions::new()

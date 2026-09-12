@@ -49,6 +49,11 @@ impl SseState {
     }
 }
 
+/// 行源抽象（P1 修复2）：上游已经 wb_upstream::lines_with_first_byte_timeout
+/// 包装（首字节 10s 超时 → 故障转移）产出的行迭代器。迭代器读错误等同 EOF
+/// 终止转换（包装层已把读错误折叠为流结束）
+type LineSrc = Box<dyn Iterator<Item = String> + Send>;
+
 /// 处理一行，返回触发的事件（空行时解析并返回）
 fn scan_line(st: &mut SseState, line: &str) -> Option<SoloEvent> {
     if line.is_empty() {
@@ -140,12 +145,21 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
 /// 返回 (错误信息, 是否已向客户端发送过数据, 上游 token usage)。
 /// 若上游首个事件即 error（尚未发送任何数据），错误不下发，
 /// 由调用方决定重试（如 4001 改 function）或透传给客户端。
-pub fn stream_convert<R: Read + Send>(
-    reader: R,
+/// 行源：wb_upstream::lines_with_first_byte_timeout 包装（首字 10s 超时 →
+/// 故障转移）产出的行迭代器
+pub fn stream_convert_lines(
+    lines: Box<dyn Iterator<Item = String> + Send>,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    let br = BufReader::new(reader);
+    stream_convert_src(lines, sender, chat_id)
+}
+
+fn stream_convert_src(
+    mut src: LineSrc,
+    sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    chat_id: &str,
+) -> (Option<(i64, String)>, bool, Option<Value>) {
     let mut st = SseState::new();
     let mut pending_usage: Option<Value> = None;
     let mut saw_done = false;
@@ -177,11 +191,7 @@ pub fn stream_convert<R: Read + Send>(
         format!("data: {}\n\n", chunk)
     };
 
-    for line in br.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+    while let Some(line) = src.next() {
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
@@ -279,13 +289,21 @@ pub fn stream_convert<R: Read + Send>(
 
 /// 流式转换：SOLO SSE → OpenAI legacy text completion SSE（/v1/completions，T9）
 /// delta.content → choices[].text 块；reasoning_content 无对应字段，跳过
-pub fn stream_convert_text<R: Read + Send>(
-    reader: R,
+pub fn stream_convert_text_lines(
+    lines: Box<dyn Iterator<Item = String> + Send>,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     completion_id: &str,
     model: &str,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    let br = BufReader::new(reader);
+    stream_convert_text_src(lines, sender, completion_id, model)
+}
+
+fn stream_convert_text_src(
+    mut src: LineSrc,
+    sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    completion_id: &str,
+    model: &str,
+) -> (Option<(i64, String)>, bool, Option<Value>) {
     let mut st = SseState::new();
     let mut pending_usage: Option<Value> = None;
     let mut saw_done = false;
@@ -310,11 +328,7 @@ pub fn stream_convert_text<R: Read + Send>(
         format!("data: {}\n\n", chunk)
     };
 
-    for line in br.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+    while let Some(line) = src.next() {
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
@@ -516,17 +530,25 @@ fn anthropic_event(name: &str, data: &Value) -> String {
 }
 
 /// 流式转换：SOLO SSE → Anthropic Messages SSE（/v1/messages）
-/// 事件序列：message_start → content_block_start/delta/stop… → message_delta → message_stop
-/// 注：reasoning_content 暂不输出（Anthropic thinking 块需签名，严格客户端会拒绝未签名的 thinking_delta）
-// 宏内末次赋值（message_started/text_block_open）在收尾路径后不再读取，属预期行为
-#[allow(unused_assignments)]
-pub fn stream_convert_anthropic<R: Read + Send>(
-    reader: R,
+pub fn stream_convert_anthropic_lines(
+    lines: Box<dyn Iterator<Item = String> + Send>,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     msg_id: &str,
     model: &str,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    let br = BufReader::new(reader);
+    stream_convert_anthropic_src(lines, sender, msg_id, model)
+}
+
+/// 事件序列：message_start → content_block_start/delta/stop… → message_delta → message_stop
+/// 注：reasoning_content 暂不输出（Anthropic thinking 块需签名，严格客户端会拒绝未签名的 thinking_delta）
+// 宏内末次赋值（message_started/text_block_open）在收尾路径后不再读取，属预期行为
+#[allow(unused_assignments)]
+fn stream_convert_anthropic_src(
+    mut src: LineSrc,
+    sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    msg_id: &str,
+    model: &str,
+) -> (Option<(i64, String)>, bool, Option<Value>) {
     let mut st = SseState::new();
     let mut message_started = false;
     let mut text_block_open = false;
@@ -654,11 +676,7 @@ pub fn stream_convert_anthropic<R: Read + Send>(
         }};
     }
 
-    for line in br.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+    while let Some(line) = src.next() {
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
@@ -754,6 +772,10 @@ pub fn stream_convert_anthropic<R: Read + Send>(
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
                     // 已有内容发出：就地透传错误并结束；否则延迟给调用方决策（可重试）
                     if message_started || !tools.is_empty() {
+                        // P2 修复8：先收口打开的 content_block，再发 event:error——
+                        // 此前直接 error 且置 saw_done 跳过 finish_stream，未闭合的
+                        // content_block 会让严格客户端挂起/报错；不补发 message_stop
+                        close_text_block!();
                         send_event!(
                             "error",
                             json!({
@@ -933,4 +955,112 @@ pub fn aggregate_anthropic<R: Read + Send>(
     });
 
     (Some(resp), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 收集转换输出的全部 SSE 事件（空行分段）；tx 在被测函数返回时 drop，
+    /// 本测试运行于非 async 上下文，blocking_recv/blocking_send 均合法
+    fn collect_events(
+        mut rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(chunk) = rx.blocking_recv() {
+            let s = String::from_utf8_lossy(&chunk.unwrap()).to_string();
+            for part in s.split("\n\n") {
+                if !part.is_empty() {
+                    out.push(part.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// 去掉 created 时间戳字段（跨秒边界两次调用可能不同），其余内容应一致
+    fn without_created(s: &str) -> String {
+        const MARKER: &str = "\"created\":";
+        let mut res = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(pos) = rest.find(MARKER) {
+            res.push_str(&rest[..pos + MARKER.len()]);
+            let after = &rest[pos + MARKER.len()..];
+            let digit_len = after.chars().take_while(|c| c.is_ascii_digit()).count();
+            rest = &after[digit_len..];
+        }
+        res.push_str(rest);
+        res
+    }
+
+    // ==================== P2 修复8：Anthropic 流内错误收口 ====================
+
+    #[test]
+    fn anthropic_midstream_error_closes_open_block_without_message_stop() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"hello\"}\n\n\
+                     event: error\ndata: {\"code\":500,\"message\":\"boom\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            Box::new(input.lines().map(str::to_string)),
+            tx,
+            "msg_t",
+            "m",
+        );
+        assert_eq!(error_info, Some((500, "boom".to_string())));
+        assert!(sent_any, "已有内容发出时 sent_any 应为 true");
+        let events = collect_events(rx);
+        let joined = events.join("\n");
+        // P2 修复8：error 前必须先 content_block_stop 收口打开的文本块
+        let stop_pos = events
+            .iter()
+            .position(|e| e.starts_with("event: content_block_stop"))
+            .expect("应先发 content_block_stop 收口");
+        let err_pos = events
+            .iter()
+            .position(|e| e.starts_with("event: error"))
+            .expect("应发 event:error");
+        assert!(stop_pos < err_pos, "content_block_stop 必须先于 event:error");
+        assert!(joined.contains("event: message_start"));
+        assert!(joined.contains("event: content_block_delta"));
+        assert!(!joined.contains("message_stop"), "error 收口不重复补发 message_stop");
+    }
+
+    #[test]
+    fn anthropic_error_before_message_start_is_deferred() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: error\ndata: {\"code\":4001,\"message\":\"model config is empty\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            Box::new(input.lines().map(str::to_string)),
+            tx,
+            "msg_t",
+            "m",
+        );
+        assert_eq!(error_info, Some((4001, "model config is empty".to_string())));
+        assert!(!sent_any, "流未开始：错误延迟给调用方决策（可重试）");
+        assert!(collect_events(rx).is_empty());
+    }
+
+    // ==================== 行源等价性：IO 逐行读 vs 内存切分 ====================
+
+    #[test]
+    fn lines_entry_io_cursor_and_split_agree() {
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        // IO 逐行读形态（std::io::Cursor::lines，等价真实 reader 场景）
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let cursor_lines =
+            std::io::Cursor::new(input).lines().map(|l| l.expect("读行失败"));
+        let (e1, s1, _) = stream_convert_lines(Box::new(cursor_lines), tx, "c1");
+        // 内存切分形态（首字超时包装产物形态）
+        let (tx2, rx2) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let lines: Box<dyn Iterator<Item = String> + Send> =
+            Box::new(input.lines().map(str::to_string));
+        let (e2, s2, _) = stream_convert_lines(lines, tx2, "c1");
+        assert_eq!(e1, e2);
+        assert_eq!(s1, s2);
+        let a = collect_events(rx).join("\n");
+        let b = collect_events(rx2).join("\n");
+        assert_eq!(without_created(&a), without_created(&b));
+        assert!(a.contains("\"finish_reason\":\"stop\""));
+        assert!(a.ends_with("data: [DONE]"));
+    }
 }
