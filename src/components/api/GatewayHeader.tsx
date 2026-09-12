@@ -9,6 +9,7 @@ import { Badge } from '../ui';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
 import { useAppStore } from '../../store';
+import GatewayHelpModal, { GatewayHelpButton } from './GatewayHelpModal';
 import type { ApiServiceStatus } from '../../types';
 
 /** 紧凑指标单元（弹窗头部不做大号 StatCard） */
@@ -29,6 +30,7 @@ export default function GatewayHeader() {
   const [keyCount, setKeyCount] = useState(0);
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -91,25 +93,28 @@ export default function GatewayHeader() {
             统一网关 127.0.0.1:{status?.port ?? 7864} · 请求按模型 ID 匹配资源池（未运行时端口为配置值）
           </p>
         </div>
-        {running ? (
-          <button
-            className="btn-danger flex shrink-0 items-center gap-1.5 !py-1.5 text-xs"
-            onClick={() => void stop()}
-            disabled={stopping}
-          >
-            <Square size={14} />
-            {stopping ? '停止中…' : '停止网关'}
-          </button>
-        ) : (
-          <button
-            className="btn-outline flex shrink-0 items-center gap-1.5 !py-1.5 text-xs"
-            onClick={() => void start()}
-            disabled={starting}
-          >
-            <Play size={14} />
-            {starting ? '启动中…' : '启动网关'}
-          </button>
-        )}
+        <div className="flex shrink-0 items-center gap-1">
+          {running ? (
+            <button
+              className="btn-danger flex items-center gap-1.5 !py-1.5 text-xs"
+              onClick={() => void stop()}
+              disabled={stopping}
+            >
+              <Square size={14} />
+              {stopping ? '停止中…' : '停止网关'}
+            </button>
+          ) : (
+            <button
+              className="btn-outline flex items-center gap-1.5 !py-1.5 text-xs"
+              onClick={() => void start()}
+              disabled={starting}
+            >
+              <Play size={14} />
+              {starting ? '启动中…' : '启动网关'}
+            </button>
+          )}
+          <GatewayHelpButton onClick={() => setHelpOpen(true)} />
+        </div>
       </div>
 
       <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -135,6 +140,8 @@ export default function GatewayHeader() {
           最近错误：{status.last_error}
         </p>
       )}
+
+      <GatewayHelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
   );
 }

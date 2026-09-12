@@ -3,8 +3,8 @@ import {
   RefreshCw,
   Download,
   Upload,
-  UserPlus,
-  ScanLine,
+  ScanSearch,
+  Globe,
   ShieldAlert,
   LogIn,
   Save,
@@ -400,10 +400,10 @@ export default function BuddyAccounts() {
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
             <button className="btn-outline" onClick={() => void importFromAuth()} disabled={importing}>
-              {importing ? <Spinner /> : <ScanLine size={15} />} 导入本机账号
+              {importing ? <Spinner /> : <ScanSearch size={15} />} 导入本机账号
             </button>
             <button className="btn-outline" onClick={() => void startOauth()}>
-              <UserPlus size={15} /> OAuth 扫码
+              <Globe size={15} /> OAuth 扫码
             </button>
             <button className="btn-outline" onClick={exportPool} disabled={accounts.length === 0}>
               <Download size={15} /> 导出
@@ -473,8 +473,12 @@ export default function BuddyAccounts() {
                     <td className="px-4 py-3">
                       {a.edition_type ? (
                         <Badge tone={a.edition_type.toLowerCase() === 'pro' ? 'blue' : 'slate'}>{a.edition_type}</Badge>
+                      ) : !a.has_credential ? (
+                        <Badge tone="amber">无凭证</Badge>
+                      ) : a.phone_masked ? (
+                        <span className="font-mono text-xs text-slate-400">{a.phone_masked}</span>
                       ) : (
-                        <span className="text-xs text-slate-300">-</span>
+                        <span className="text-xs text-slate-300">未知版本</span>
                       )}
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums">

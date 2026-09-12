@@ -822,6 +822,9 @@ pub struct WbCheckinRecord {
     pub name: String,
     pub status: String,
     pub message: String,
+    /// 签到获得积分（接口返回或前后余额差值兜底；无则为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reward: Option<f64>,
 }
 
 /// 签到日志（90 天存储，UI 默认展示 30 天）
@@ -846,6 +849,7 @@ pub fn workbuddy_checkin_results(state: State<AppState>, days: Option<i64>) -> R
                 name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
                 status: r.get("status").and_then(|v| v.as_str()).unwrap_or("").into(),
                 message: r.get("message").and_then(|v| v.as_str()).unwrap_or("").into(),
+                reward: r.get("reward").and_then(|v| v.as_f64()),
             });
         }
     }

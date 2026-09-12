@@ -97,7 +97,7 @@ def checkin_status(headers, urls):
 
 
 def checkin_do(headers, urls):
-    """执行签到。返回 (kind, message)：success / already / fail"""
+    """执行签到。返回 (kind, message, reward)：success / already / fail"""
     status, body, raw = wb.post_json(urls["checkin_do"], headers, {})
     if status == 0:
         # 域名双探测（§2.2）：主域名网络不可达 → 备用域名重试一次
@@ -105,26 +105,68 @@ def checkin_do(headers, urls):
         if alt != urls["checkin_do"]:
             status, body, raw = wb.post_json(alt, headers, {})
     if status == 401:
-        return "auth", "登录态失效（401）"
+        return "auth", "登录态失效（401）", None
     code = None
     message = None
     if isinstance(body, dict):
         code = body.get("code", wb.dig(body, "code"))
         message = wb.dig(body, "message", "msg")
     if status in (0,):
-        return "fail", "网络不可达: %s" % raw[:120]
+        return "fail", "网络不可达: %s" % raw[:120], None
     if status in (200, 201) or (isinstance(code, int) and code in (0, 200)):
-        # 奖励数额以接口返回为准，不硬编码
-        reward = wb.dig(body, "reward", "credits", "points", "amount")
-        msg = "签到成功"
-        if reward is not None:
-            msg += " +%s" % reward
-        return "success", msg
+        # 奖励数额以接口返回为准，不硬编码（F-17）；键候选覆盖常见命名，
+        # 兜底走签到前后余额差值（process_account）。数额走独立 reward 字段展示。
+        reward = wb.dig(body, "reward", "credits", "points", "amount",
+                        "integral", "score", "bonus", "reward_amount",
+                        "add_integral", "addCredits", "earned")
+        return "success", "签到成功", _num_or_none(reward)
     # 已签容错（F-15）：code:10001 / message 含「已签到」/「repeat」
     if (isinstance(code, int) and code == 10001) or \
        (message and any(k in str(message).lower() for k in ("已签到", "repeat", "already"))):
-        return "already", "今日已签到"
-    return "fail", "%s（code=%s）" % (message or raw[:120] or "HTTP %s" % status, code)
+        return "already", "今日已签到", None
+    return "fail", "%s（code=%s）" % (message or raw[:120] or "HTTP %s" % status, code), None
+
+
+def _num_or_none(v):
+    """奖励/余额数值归一：数字或纯数字字符串 → float，其余 None"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _scalar_of(v):
+    """嵌套对象按常用数值键归一（energy/streak 兼容 {current:..} 等对象返回，
+    修复前端「连签 [object Object] 天」展示）"""
+    if isinstance(v, dict):
+        for k in ("current", "days", "count", "value", "num", "total", "streak", "energy"):
+            if v.get(k) is not None:
+                return _scalar_of(v[k])
+        return None
+    return _num_or_none(v)
+
+
+def fetch_balance(headers):
+    """查询当前通用积分余额（get-user-resource-summary，与积分页同口径）。
+    网络失败/解析失败返回 None——仅用于签到获得积分差值兜底，不阻塞签到。"""
+    summary_url = _u("/billing/meter/get-user-resource-summary")
+    status, body, _ = wb.post_json(summary_url, headers, {})
+    if status == 0:
+        bases = wb.billing_bases(None)
+        alt_base = bases[1] if bases and bases[0] == _CURRENT_BASE[0] else (bases[0] if bases else "")
+        if alt_base and alt_base != _CURRENT_BASE[0]:
+            status, body, _ = wb.post_json(alt_base + "/billing/meter/get-user-resource-summary", headers, {})
+    if status != 200 or not isinstance(body, dict):
+        return None
+    total = wb.dig(body, "RemainingCapacity", "remaining", "TotalRemaining",
+                   "Balance", "balance")
+    return _num_or_none(total)
 
 
 def process_account(acct, skip_checked, skip_expired, lazy_hours):
@@ -145,18 +187,29 @@ def process_account(acct, skip_checked, skip_expired, lazy_hours):
     checked, ok = checkin_status(headers, urls)
     if ok and checked is True:
         return {**base_ev, "status": "already", "message": "今日已签到"}
-    kind, message = checkin_do(headers, urls)
+    # 签到前余额（获得积分差值兜底数据源；查询失败不阻塞签到）
+    pre_balance = fetch_balance(headers)
+    kind, message, reward = checkin_do(headers, urls)
     if kind == "auth":
         # 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）
         new = wb.refresh_token_once(creds)
         if new:
             wb.save_token_store(aid, new)
             _sync_pool_expiry(aid, new)
-            kind, message = checkin_do(wb.build_auth_headers(new), urls)
+            headers = wb.build_auth_headers(new)
+            kind, message, reward = checkin_do(headers, urls)
         else:
-            kind, message = "fail", "登录态失效且刷新失败，需重新登录"
+            kind, message, reward = "fail", "登录态失效且刷新失败，需重新登录", None
+    # 获得积分兜底（F-17）：接口未返回奖励数额时用签到前后余额差值；
+    # 仅差值>0 才采信（防并发扣减/查询时点差造成负值误报）
+    if kind == "success" and reward is None and pre_balance is not None:
+        post = fetch_balance(headers)
+        if post is not None and post > pre_balance:
+            reward = round(post - pre_balance, 2)
     ev = {**base_ev, "status": {"success": "success", "already": "already"}.get(kind, "fail"),
           "message": message}
+    if reward is not None:
+        ev["reward"] = reward
     if kind == "success" and note == "refreshed":
         ev["message"] = message + "（凭证已续期）"
     return ev
@@ -190,11 +243,14 @@ def append_results(events):
     kept = [r for r in results if r.get("date", "") >= (datetime.date.today() -
             datetime.timedelta(days=90)).strftime("%Y-%m-%d")]
     for ev in events:
-        kept.append({
+        rec = {
             "date": today, "time": wb.now_ts(), "user_id": ev.get("user_id", ""),
             "name": ev.get("name", ""), "status": ev.get("status", ""),
             "message": ev.get("message", ""),
-        })
+        }
+        if ev.get("reward") is not None:
+            rec["reward"] = ev.get("reward")
+        kept.append(rec)
     data["results"] = kept
     wb.write_json_atomic(path, data)
 
@@ -297,16 +353,16 @@ def growth_tasks(headers, urls):
 
 
 def growth_info(headers, urls):
-    """能量与连签天数（页面附注展示）"""
+    """能量与连签天数（页面附注展示；对象响应归一为标量，防 [object Object]）"""
     info = {}
     st, b, _ = wb.get_json(urls["energy"], headers)
     if st == 200 and isinstance(b, dict):
-        v = wb.dig(b, "energy", "value", "balance", "num")
+        v = _scalar_of(wb.dig(b, "energy", "value", "balance", "num"))
         if v is not None:
             info["energy"] = v
     st, b, _ = wb.get_json(urls["streak"], headers)
     if st == 200 and isinstance(b, dict):
-        v = wb.dig(b, "streak", "days", "continuous_days", "count")
+        v = _scalar_of(wb.dig(b, "streak", "days", "continuous_days", "count"))
         if v is not None:
             info["streak"] = v
     return info

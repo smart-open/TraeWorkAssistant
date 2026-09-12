@@ -43,6 +43,7 @@ import type {
   UpdateDownloaded,
   UpdateDownloadProgress,
   GatewaySettings,
+  DispatchPolicy,
   TraeModelMeta,
   UnifiedModel,
   UsageDayView,
@@ -430,6 +431,11 @@ export const api = {
     // 顶层参数用 camelCase（availableOnly），嵌套结构体字段保持 snake_case
     unifiedModels: (availableOnly?: boolean) =>
       invoke<UnifiedModel[]>('api_unified_models', { availableOnly: availableOnly ?? null }),
+    // 池间调度策略（dispatch_policy.json：strategy/priority/per_model/fallback）
+    dispatchPolicyGet: () => invoke<DispatchPolicy>('dispatch_policy_get'),
+    // 返回规范化后的生效值（前端展示以返回值为准）；落盘即时生效无需重启网关
+    dispatchPolicySet: (policy: DispatchPolicy) =>
+      invoke<DispatchPolicy>('dispatch_policy_set', { policy }),
     gatewaySettingsGet: () => invoke<GatewaySettings>('gateway_settings_get'),
     // 返回规范化后的生效值（前端展示以返回值为准）；端口改动下次启动 API 服务后生效
     gatewaySettingsSet: (settings: GatewaySettings) =>

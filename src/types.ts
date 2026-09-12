@@ -326,6 +326,8 @@ export interface UnifiedModelSource {
 export interface UnifiedModel {
   id: string;
   display: string;
+  /** 供应商：自定义模型用户填写值优先，否则按模型名系列推断（空串 = 未知） */
+  vendor: string;
   /** 实际生效倍率 = 当前调度策略命中的来源侧 */
   rate: number | null;
   /** 思考档位（双语义合并展示，仅 Buddy 池作为请求参数下发） */
@@ -336,6 +338,19 @@ export interface UnifiedModel {
   /** L1 人工维护标记 */
   manual: boolean;
   sources: UnifiedModelSource[];
+}
+
+/** 池间调度策略（data/dispatch_policy.json；dispatch_policy_get/set） */
+export interface DispatchPolicy {
+  /** smart = 智能调度（默认：到期→倍率/免费→积分多）；priority = 固定优先级 */
+  strategy: 'smart' | 'priority';
+  /** 池优先级（priority 模式或 smart 并列时生效；取值 trae/buddy） */
+  priority: string[];
+  /** 模型级覆盖（键 canonical_id；显式覆盖不做智能重排） */
+  per_model: Record<string, string[]>;
+  /** 双源首选池不可用时按序回退 */
+  fallback: boolean;
+  updated_at: number;
 }
 
 /** 网关设置（data/api_gateway_settings.json；gateway_settings_get/set） */
@@ -356,6 +371,8 @@ export interface CustomModel {
   base_url: string;
   /** API Key（Bearer） */
   api_key: string;
+  /** 供应商（展示用，如 OpenAI / DeepSeek / 智谱） */
+  vendor: string;
   enabled: boolean;
   context_length: number;
   max_tokens: number;
@@ -933,6 +950,8 @@ export interface WbCheckinRecord {
   name: string;
   status: string;
   message: string;
+  /** 签到获得积分（接口返回或前后余额差值兜底） */
+  reward?: number;
 }
 
 /** WB 上游模型目录条目（Rust wb_catalog::WbModel，snake_case 对齐） */

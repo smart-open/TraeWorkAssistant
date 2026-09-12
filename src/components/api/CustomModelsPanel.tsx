@@ -20,6 +20,7 @@ const EMPTY_FORM: CustomModel = {
   name: '',
   base_url: '',
   api_key: '',
+  vendor: '',
   enabled: true,
   context_length: 0,
   max_tokens: 0,
@@ -28,6 +29,26 @@ const EMPTY_FORM: CustomModel = {
   note: '',
   updated_at: 0,
 };
+
+/** 常用供应商预设（datalist 建议，可自由输入其他值） */
+const VENDOR_PRESETS = [
+  'OpenAI',
+  'Anthropic',
+  'Google',
+  'DeepSeek',
+  '智谱AI',
+  'Moonshot（月之暗面）',
+  '阿里云百炼（通义）',
+  '火山方舟（豆包）',
+  'MiniMax',
+  '腾讯混元',
+  '百度千帆',
+  'SiliconFlow 硅基流动',
+  'OpenRouter',
+  'xAI',
+  'Ollama',
+  'Groq',
+];
 
 export default function CustomModelsPanel({
   onSubModalChange,
@@ -80,6 +101,7 @@ export default function CustomModelsPanel({
         ...form,
         name: form.name.trim(),
         base_url: form.base_url.trim(),
+        vendor: form.vendor.trim(),
       });
       setModels(next);
       setForm(null);
@@ -165,7 +187,10 @@ export default function CustomModelsPanel({
                   className="row-hover border-b border-slate-100 last:border-0 dark:border-zinc-800"
                 >
                   <td className="py-2 pr-4">
-                    <div className="font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">{m.name}</div>
+                    <div className="font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
+                      {m.name}
+                      {m.vendor && <Badge tone="slate" className="ml-1.5 !px-1.5 !text-[10px]">{m.vendor}</Badge>}
+                    </div>
                     {m.note && <div className="mt-0.5 max-w-48 truncate text-[11px] text-slate-400" title={m.note}>{m.note}</div>}
                   </td>
                   <td className="max-w-56 truncate py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400" title={m.base_url}>
@@ -296,6 +321,22 @@ export default function CustomModelsPanel({
               />
             </label>
             <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-500">供应商</span>
+              <input
+                className="input"
+                list="vendor-presets"
+                placeholder="选择或输入，如 DeepSeek"
+                value={form.vendor}
+                onChange={(e) => set('vendor', e.target.value)}
+              />
+              <datalist id="vendor-presets">
+                {VENDOR_PRESETS.map((v) => (
+                  <option key={v} value={v} />
+                ))}
+              </datalist>
+              <span className="mt-1 block text-[11px] text-slate-400">展示用，可选预设或自由输入</span>
+            </label>
+            <label className="block sm:col-span-2">
               <span className="mb-1 block text-xs font-medium text-slate-500">备注</span>
               <input
                 className="input"

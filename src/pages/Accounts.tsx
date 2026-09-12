@@ -20,6 +20,8 @@ import {
   Camera,
   Download,
   Upload,
+  DatabaseBackup,
+  ArchiveRestore,
   Globe,
   ExternalLink,
   ArrowRight,
@@ -1489,20 +1491,20 @@ function ProfileModal({
                   <td className="whitespace-nowrap px-3 py-2">
                     <div className="flex justify-end gap-1">
                       <button
-                        title="备份"
+                        title="备份（将当前登录态备份到该槽位）"
                         onClick={() => onBackup(p.slot)}
                         disabled={profileActive}
                         className="btn-ghost !p-2"
                       >
-                        <Upload size={14} />
+                        <DatabaseBackup size={14} />
                       </button>
                       <button
-                        title="恢复"
+                        title="恢复（将该槽位快照恢复到客户端）"
                         onClick={() => onRestore(p.slot)}
                         disabled={profileActive}
                         className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
                       >
-                        <Download size={14} />
+                        <ArchiveRestore size={14} />
                       </button>
                       <button
                         title="删除"

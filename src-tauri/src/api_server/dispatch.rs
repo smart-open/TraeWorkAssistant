@@ -60,14 +60,33 @@ impl TargetPool {
 
 // ==================== 调度策略配置（§4.2） ====================
 
-/// `data/dispatch_policy.json`：池优先级 + 模型级覆盖 + 回退开关。
-/// 缺失回退默认 `["buddy","trae"]`（与现状路由行为一致，§9.1）。
+/// 池间调度策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchStrategy {
+    /// 智能调度（默认）：按请求模型对可用源池排序——
+    /// ① 池内最早积分到期优先（无到期数据视为最晚，后置）
+    /// ② 该模型倍率小者优先（0 = 免费最优；未声明视为最大，后置）
+    /// ③ 池内健康账号剩余积分总和多优先
+    /// 全并列时回退固定优先级序（Buddy 优先现状）；per_model 显式覆盖不受重排影响
+    #[default]
+    Smart,
+    /// 固定优先级（改造前现状）：严格按 priority/per_model 顺序取首个可用池
+    Priority,
+}
+
+/// `data/dispatch_policy.json`：池间策略 + 池优先级 + 模型级覆盖 + 回退开关。
+/// 优先级缺失回退默认 `["buddy","trae"]`（与现状路由行为一致，§9.1）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DispatchPolicy {
-    /// 池优先级顺序数组（取值 `trae` / `buddy`）
+    /// 池间调度策略（缺省 smart）
+    #[serde(default)]
+    pub strategy: DispatchStrategy,
+    /// 池优先级顺序数组（取值 `trae` / `buddy`；priority 模式或 smart 并列时生效）
     #[serde(default = "default_priority")]
     pub priority: Vec<String>,
-    /// 模型级覆盖（键为 canonical_id，值同为优先级数组），优先于 priority
+    /// 模型级覆盖（键为 canonical_id，值同为优先级数组），优先于 priority；
+    /// 显式覆盖的模型不做智能重排（用户显式配置优先）
     #[serde(default)]
     pub per_model: HashMap<String, Vec<String>>,
     /// 双源模型首选池不可用时按序回退；关闭后仅用首选池
@@ -84,6 +103,7 @@ fn default_true() -> bool {
 impl Default for DispatchPolicy {
     fn default() -> Self {
         DispatchPolicy {
+            strategy: DispatchStrategy::Smart,
             priority: default_priority(),
             per_model: HashMap::new(),
             fallback: true,
@@ -309,6 +329,15 @@ pub fn resolve_target(
             order.push(p);
         }
     }
+    // ④+ 智能调度（strategy=smart）：双源可用且无 per_model 显式覆盖时，
+    // 按请求模型对候选池重排（到期 → 倍率/免费 → 积分多；并列保持优先级序）
+    if policy.strategy == DispatchStrategy::Smart
+        && policy.per_model.get(&canonical).is_none()
+        && sources.is_dual()
+        && wb_enabled
+    {
+        order = smart_pool_order(state, &order, &canonical, &catalog, &sources);
+    }
 
     let preferred = order
         .iter()
@@ -372,6 +401,53 @@ fn pool_session_key(body: &Value) -> Option<String> {
     let key = super::wb_sticky::SessionKey::from_body(body).cache_key();
     // 空指纹的 cache_key 为 "fp:"（无内容后缀）→ 不可粘
     (!key.is_empty() && !key.ends_with(':')).then_some(key)
+}
+
+// ==================== 智能调度（§4.2 DispatchStrategy::Smart） ====================
+
+/// 智能调度排序键：①最早积分到期（升序，无到期数据 = i64::MAX 后置）
+/// ②模型倍率（升序，0 = 免费最优，未声明 = f64::MAX 后置）③健康积分总和多优先（负值升序）
+type SmartKey = (i64, f64, f64);
+
+/// 双源候选池按「到期 → 倍率/免费 → 积分多」复合键稳定排序；
+/// 全并列保持传入序（= priority/per_model 固定优先级，Buddy 优先现状）。
+fn smart_pool_order(
+    state: &Arc<ApiSharedState>,
+    order: &[TargetPool],
+    canonical: &str,
+    catalog: &[super::wb_catalog::WbModel],
+    sources: &ModelSources,
+) -> Vec<TargetPool> {
+    let trae_stats = state.pool.stats();
+    let wb_stats = state.wb_pool.stats();
+    // 倍率数据源：Buddy = wb 目录原始值（0 = 免费）；Trae = 官网同步声明值（None = 未声明）。
+    // 两份列表均为 read_json_cached 内存缓存，热路径零磁盘读
+    let trae_rate = models_sync::load_models(&state.data_dir)
+        .iter()
+        .find(|m| canonical_id(&m.id) == canonical)
+        .and_then(|m| m.rate);
+    let buddy_rate = sources
+        .buddy
+        .as_ref()
+        .and_then(|(m, _)| catalog.iter().find(|c| c.id == *m))
+        .map(|c| c.rate);
+    let key_of = |p: TargetPool| -> SmartKey {
+        let (earliest, total) = if p == TargetPool::Trae { trae_stats } else { wb_stats };
+        let rate = if p == TargetPool::Trae { trae_rate } else { buddy_rate };
+        (
+            earliest.unwrap_or(i64::MAX),
+            rate.unwrap_or(f64::MAX),
+            -total,
+        )
+    };
+    let mut sorted = order.to_vec();
+    sorted.sort_by(|a, b| {
+        let (ka, kb) = (key_of(*a), key_of(*b));
+        ka.0.cmp(&kb.0)
+            .then_with(|| ka.1.partial_cmp(&kb.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| ka.2.partial_cmp(&kb.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    sorted
 }
 
 /// 首选池健康检查：Buddy 池额外检查模型级冷却（优先级高于账号级）
@@ -629,10 +705,11 @@ mod tests {
         assert!(r.fallback_from.is_none());
     }
 
-    /// 策略 ["trae","buddy"] + 双源健康 → Trae
+    /// 策略 ["trae","buddy"] + 双源健康 → Trae（priority 模式验证）
     #[test]
     fn t02_trae_first_policy_goes_trae() {
         let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
         p.priority = vec!["trae".into(), "buddy".into()];
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
         f.seed_healthy(true);
@@ -710,10 +787,11 @@ mod tests {
         assert!(f.app_log_contains("dispatch fallback: model=glm-5.3 preferred=buddy actual=trae reason=no_healthy_account"));
     }
 
-    /// 双源 + Trae 池耗尽（策略 trae 优先）→ 回退 Buddy
+    /// 双源 + Trae 池耗尽（priority 模式 trae 优先）→ 回退 Buddy
     #[test]
     fn t09_dual_trae_exhausted_falls_back_buddy() {
         let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
         p.priority = vec!["trae".into(), "buddy".into()];
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
         f.seed_healthy(false);
@@ -854,6 +932,7 @@ mod tests {
         // 这里验证粘性键按会话隔离：仅会话 A 续期，B 不受 A 影响（两者池一致故对比 fallback）
         // 直接改策略后 B 应走 trae（未被 A 的粘性污染）
         let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
         p.priority = vec!["trae".into(), "buddy".into()];
         std::fs::write(
             f.dir.join("data").join("dispatch_policy.json"),
@@ -1004,5 +1083,44 @@ mod tests {
         assert_eq!(t.pool, TargetPool::Trae);
         assert_eq!(t.model, "Kimi-K3");
         assert!(t.effort_hint.is_none());
+    }
+
+    // ---------- 智能调度（DispatchStrategy::Smart） ----------
+
+    /// smart：Buddy 声明倍率 0.5 < Trae 未声明（后置）→ 即使 priority trae 优先也选 Buddy
+    #[test]
+    fn t28_smart_prefers_declared_rate() {
+        let mut p = policy_default();
+        p.priority = vec!["trae".into(), "buddy".into()];
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+    }
+
+    /// smart：Trae 声明更低倍率 0.3 < Buddy 0.5 → Trae 胜出（倍率序反向验证）
+    #[test]
+    fn t29_smart_lower_rate_wins() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        // 给 Trae 侧 api_models 条目补 rate=0.3（fixture 默认不带 rate）
+        std::fs::write(
+            f.dir.join("data").join("api_models.json"),
+            json!([{"id": "glm-5.3", "label": "glm-5.3", "rate": 0.3}]).to_string(),
+        )
+        .unwrap();
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Trae);
+    }
+
+    /// smart：per_model 显式覆盖不做智能重排（用户显式配置优先）
+    #[test]
+    fn t30_smart_skips_per_model_override() {
+        let mut p = policy_default();
+        p.per_model.insert("glm-5.3".into(), vec!["trae".into()]);
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Trae);
     }
 }

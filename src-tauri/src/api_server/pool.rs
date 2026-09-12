@@ -156,6 +156,31 @@ impl ApiPool {
         *safe_lock(&self.strategy) = s;
     }
 
+    /// 健康账号池画像（智能调度因子，dispatch::smart_pool_order 数据源）：
+    /// (最早积分到期时间, 健康账号剩余积分总和)；无到期数据 → None
+    pub fn stats(&self) -> (Option<i64>, f64) {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let mut earliest: Option<i64> = None;
+        let mut total = 0.0;
+        for e in entries.values() {
+            if !e.healthy(now) {
+                continue;
+            }
+            if let Some(c) = e.credits {
+                if c > 0.0 {
+                    total += c;
+                }
+            }
+            if let Some(exp) = e.credits_expire_at {
+                if exp > 0 && earliest.map_or(true, |cur| exp < cur) {
+                    earliest = Some(exp);
+                }
+            }
+        }
+        (earliest, total)
+    }
+
     /// 从已有账号文件同步池：只加入 enabled_uids 中的账号；
     /// group_ids 非空时仅纳入所选分组的账号（未分组账号不参与，T10）
     #[allow(clippy::too_many_arguments)]

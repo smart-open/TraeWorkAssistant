@@ -33,6 +33,9 @@ pub struct CustomModel {
     /// API Key（Bearer）
     #[serde(default)]
     pub api_key: String,
+    /// 供应商（展示用，如 OpenAI / DeepSeek / 智谱；用户可自由输入）
+    #[serde(default)]
+    pub vendor: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -57,6 +60,7 @@ impl Default for CustomModel {
             name: String::new(),
             base_url: String::new(),
             api_key: String::new(),
+            vendor: String::new(),
             // 新建条目默认启用（serde 缺字段与 Default::default() 口径一致）
             enabled: true,
             context_length: 0,
@@ -112,6 +116,7 @@ pub fn save_list(data_dir: &Path, models: Vec<CustomModel>) -> Result<(), String
 pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, String> {
     m.name = m.name.trim().to_string();
     m.base_url = m.base_url.trim().trim_end_matches('/').to_string();
+    m.vendor = m.vendor.trim().to_string();
     if m.name.is_empty() {
         return Err("模型名称不能为空".into());
     }

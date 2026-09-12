@@ -19,6 +19,7 @@ interface WbAccountLine {
   name: string;
   status: 'success' | 'already' | 'fail';
   message?: string;
+  reward?: number;
 }
 
 interface WbGrowthLine {
@@ -31,8 +32,8 @@ interface WbGrowthLine {
   travel?: string;
   lottery?: string;
   tasks?: string;
-  energy?: number | string;
-  streak?: number | string;
+  energy?: number;
+  streak?: number;
 }
 
 type ParsedEvent =
@@ -41,6 +42,22 @@ type ParsedEvent =
   | { type: 'exit' }
   | WbAccountLine
   | WbGrowthLine;
+
+/** 能量/连签标量归一：接口可能返回 {current:..} 等嵌套对象（修复「连签 [object Object] 天」展示） */
+function scalarNum(v: unknown, depth = 0): number | null {
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    return isNaN(n) ? null : n;
+  }
+  if (v && typeof v === 'object' && depth < 3) {
+    for (const k of ['current', 'days', 'count', 'value', 'num', 'total', 'streak', 'energy']) {
+      const n = scalarNum((v as Record<string, unknown>)[k], depth + 1);
+      if (n != null) return n;
+    }
+  }
+  return null;
+}
 
 function parseLine(raw: string): ParsedEvent | null {
   try {
@@ -124,16 +141,20 @@ export default function BuddyCheckin() {
         }
       } else if ('type' in parsed && parsed.type === 'growth') {
         const line = parsed as WbGrowthLine;
+        // 能量/连签归一为标量（接口返回嵌套对象时防 [object Object] 展示）
+        const energy = scalarNum(line.energy);
+        const streak = scalarNum(line.streak);
         setGrowthLines((prev) => {
           const next = prev.slice();
-          next[line.index - 1] = line;
+          next[line.index - 1] = { ...line, energy: energy ?? undefined, streak: streak ?? undefined };
           return next;
         });
       } else if ('index' in parsed && parsed.index != null) {
         const line = parsed as WbAccountLine;
+        const reward = scalarNum(line.reward);
         setLines((prev) => {
           const next = prev.slice();
-          next[line.index - 1] = line;
+          next[line.index - 1] = { ...line, reward: reward ?? undefined };
           return next;
         });
       } else if ('type' in parsed && parsed.type === 'exit') {
@@ -193,6 +214,9 @@ export default function BuddyCheckin() {
       pushToast('error', `保存设置失败：${String(err)}`);
     }
   };
+
+  // 本轮累计获得积分（汇总徽标展示；防浮点求和误差）
+  const earned = Math.round(lines.reduce((s, l) => s + (l.reward ?? 0), 0) * 100) / 100;
 
   return (
     <div className="animate-fade-in">
@@ -287,7 +311,9 @@ export default function BuddyCheckin() {
             <span className="text-sm font-medium">一键签到</span>
             {running && <Badge tone="blue">执行中</Badge>}
             {!running && summary && (
-              <Badge tone={summary.includes('失败 0') ? 'green' : 'amber'}>{summary}</Badge>
+              <Badge tone={summary.includes('失败 0') ? 'green' : 'amber'}>
+                {earned > 0 ? `${summary} · 获得 ${earned} 积分` : summary}
+              </Badge>
             )}
           </div>
           {accounts.length > 0 && !running && (
@@ -321,7 +347,19 @@ export default function BuddyCheckin() {
                       <div className="text-xs text-slate-400">{a.phone_masked || a.id}</div>
                     </td>
                     <td className="px-3 py-1.5"><MiniTokenBadge a={a} /></td>
-                    <td className="px-3 py-1.5 text-xs text-slate-500">{a.edition_type || '-'}</td>
+                    <td className="px-3 py-1.5 text-xs text-slate-500">
+                      {a.edition_type ? (
+                        a.edition_type.toLowerCase() === 'pro' ? (
+                          <span className="font-medium text-sky-600 dark:text-sky-400">{a.edition_type}</span>
+                        ) : (
+                          a.edition_type
+                        )
+                      ) : !a.has_credential ? (
+                        <span className="text-amber-500">无凭证</span>
+                      ) : (
+                        '未知版本'
+                      )}
+                    </td>
                     <td className="px-3 py-1.5 text-right tabular-nums text-xs">
                       {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
                     </td>
@@ -348,6 +386,11 @@ export default function BuddyCheckin() {
                   <Icon size={14} className={tone} />
                   <span className="w-8 text-right text-xs text-slate-400">{l.index}</span>
                   <span className="flex-1 truncate">{l.name || l.user_id}</span>
+                  {l.reward != null && (
+                    <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-300">
+                      +{l.reward} 积分
+                    </span>
+                  )}
                   <span className={`max-w-[50%] truncate text-xs ${tone}`} title={l.message}>
                     {statusText[l.status] === '成功' ? (l.message || '签到成功') : (l.message || statusText[l.status])}
                   </span>

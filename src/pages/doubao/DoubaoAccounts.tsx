@@ -4,7 +4,7 @@ import {
   Users,
   UserPlus,
   RefreshCw,
-  Repeat,
+  LogIn,
   Rocket,
   Timer,
   Coins,
@@ -14,7 +14,7 @@ import {
   ShieldCheck,
   HelpCircle,
   DatabaseBackup,
-  Upload,
+  ArchiveRestore,
   Download,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
@@ -703,7 +703,7 @@ export default function DoubaoAccounts() {
                           disabled={anyBusy || !a.has_snapshot}
                           className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 disabled:opacity-30 dark:hover:bg-sky-500/10"
                         >
-                          <Repeat size={14} />
+                          <LogIn size={14} />
                         </button>
                         <button
                           title="查询/刷新会员额度（结果缓存后悬停账号名可查看额度状态 / 会员 / 到期时间）"
@@ -735,7 +735,7 @@ export default function DoubaoAccounts() {
                           disabled={anyBusy || chatBusyFor === a.user_id || !chatdataInfos[a.user_id]?.backed}
                           className="btn-ghost !p-2 text-sky-600 hover:bg-sky-50 disabled:opacity-30 dark:hover:bg-sky-500/10"
                         >
-                          <Upload size={14} />
+                          <ArchiveRestore size={14} />
                         </button>
                         <button
                           title="导出对话记录（官方接口拉取会话与消息 → data/exports/ 生成 markdown + json；需已录入凭证）"
@@ -1053,7 +1053,7 @@ function DoubaoHelpModal({ open, onClose }: { open: boolean; onClose: () => void
 
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
           <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <Repeat size={15} className="text-amber-500" /> 切换账号流程
+            <LogIn size={15} className="text-amber-500" /> 切换账号流程
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             <li>点击目标账号行的「切换」图标</li>

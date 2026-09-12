@@ -109,6 +109,29 @@ fn infer_supports_image(canonical: &str) -> Option<bool> {
     None
 }
 
+/// 供应商系列推断（按 canonical 前缀；未知 → 空串，前端显示 —）
+fn vendor_of(canonical: &str) -> &'static str {
+    for (prefix, vendor) in [
+        ("glm-", "智谱"),
+        ("deepseek", "DeepSeek"),
+        ("kimi", "Moonshot"),
+        ("doubao", "字节·豆包"),
+        ("qwen", "阿里·通义"),
+        ("minimax", "MiniMax"),
+        ("claude", "Anthropic"),
+        ("gemini", "Google"),
+        ("grok", "xAI"),
+        ("gpt", "OpenAI"),
+        ("o1", "OpenAI"),
+        ("o3", "OpenAI"),
+    ] {
+        if canonical.starts_with(prefix) {
+            return vendor;
+        }
+    }
+    ""
+}
+
 // ==================== L1 人工维护覆盖层（trae_model_meta.json，§6.1） ====================
 
 /// L1 覆盖层条目（编辑弹框落盘；None = 该字段未人工指定，交由下层兜底）
@@ -175,6 +198,8 @@ pub struct UnifiedModel {
     pub id: String,
     /// 展示名：L1 人工 label 绝对优先；否则双源按调度策略命中侧（trae 侧含 L2 label）
     pub display: String,
+    /// 供应商：自定义模型用户填写值优先；否则按模型名系列推断（未知为空串，前端显示 —）
+    pub vendor: String,
     /// 实际生效倍率 = 当前调度策略命中的来源侧（§3.1），非"最优值"
     pub rate: Option<f64>,
     /// 思考档位（双语义合并展示，§3.1 注：仅 Buddy 池作为请求参数下发）
@@ -286,6 +311,8 @@ pub fn unified_models(
     // 而是由末段按调度策略命中侧选定（与 rate 同源，§3.1/§3.3 #2）
     let mut buddy_disp: HashMap<String, String> = HashMap::new();
     let mut buddy_img: HashMap<String, bool> = HashMap::new();
+    // 自定义模型供应商（canonical → 用户填写值；聚合末段优先于系列推断）
+    let mut custom_vendor: HashMap<String, String> = HashMap::new();
 
     // 源1：Trae（先入者；同 canonical 的 wb 条目随后合并）
     for m in &trae_list {
@@ -300,6 +327,7 @@ pub fn unified_models(
             UnifiedModel {
                 id: t.id.clone(),
                 display: t.display.clone(),
+                vendor: String::new(),
                 rate: t.rate,
                 efforts: t.efforts.clone(),
                 context_length: t.context_length,
@@ -361,6 +389,7 @@ pub fn unified_models(
                         } else {
                             m.display.clone()
                         },
+                        vendor: String::new(),
                         rate: wrate,
                         efforts: m.supported_efforts.clone(),
                         context_length: wctx,
@@ -384,6 +413,9 @@ pub fn unified_models(
         let canonical = canonical_id(&m.name);
         if canonical.is_empty() {
             continue;
+        }
+        if !m.vendor.is_empty() {
+            custom_vendor.insert(canonical.clone(), m.vendor.clone());
         }
         let crate_rate = if m.rate > 0.0 { Some(m.rate) } else { None };
         let cctx = if m.context_length > 0 { Some(m.context_length) } else { None };
@@ -413,6 +445,7 @@ pub fn unified_models(
                     UnifiedModel {
                         id: m.name.clone(),
                         display: m.name.clone(),
+                        vendor: m.vendor.clone(),
                         rate: crate_rate,
                         efforts: Vec::new(),
                         context_length: cctx,
@@ -494,6 +527,11 @@ pub fn unified_models(
         }
         // L1 人工维护标记统一按覆盖层判定
         u.manual = l1.contains_key(&canonical);
+        // 供应商：自定义模型用户填写值优先，否则按模型名系列推断（未知空串 → 前端显示 —）
+        u.vendor = custom_vendor
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_else(|| vendor_of(&canonical).to_string());
     }
 
     // 目录序：双源在前、单源在后，组内字母序（§3.3 #4）
