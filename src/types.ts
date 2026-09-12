@@ -377,7 +377,7 @@ export interface CustomModel {
   context_length: number;
   max_tokens: number;
   supports_image: boolean;
-  /** 展示倍率（0 = 未声明） */
+  /** 展示倍率（0 = 免费；支持两位小数，如 0.01） */
   rate: number;
   note: string;
   updated_at: number;
@@ -731,6 +731,17 @@ export interface WorkBuddyEnvCheck {
   snapshot_edition: string | null;
 }
 
+/** CodeBuddy 桌面环境检测（Buddy 双应用）：exe/进程走 app_locate codebuddy 档案，
+ *  uid/昵称解析自与 WorkBuddy 共享的 auth 文件，解析失败/未登录为 null */
+export interface CodeBuddyEnvCheck {
+  installed: boolean;
+  running: boolean;
+  exe: string | null;
+  version: string | null;
+  uid: string | null;
+  nickname: string | null;
+}
+
 export interface WorkBuddyScanResult {
   id: string;
   uid: string;
@@ -740,6 +751,8 @@ export interface WorkBuddyScanResult {
   has_refresh_token: boolean;
   access_token_expires_at: number | null;
   exists: boolean;
+  /** 已在账号池中（再次导入 = 更新凭证而非新增；accounts.rs 导入按此 upsert） */
+  already_in_pool?: boolean;
 }
 
 export interface WorkBuddySettings {
@@ -766,11 +779,15 @@ export interface WorkBuddySettings {
   ui_click_y: number;
 }
 
-/** 账号库导入结果（F-46 扩展） */
+/** 账号库导入结果（F-46 扩展；与后端 accounts.rs 导入返回对齐） */
 export interface WbPoolImportResult {
   added: number;
   skipped: number;
   with_credentials: number;
+  /** 已在池中且凭证被更新的条数 */
+  updated?: number;
+  /** 被拒绝的条目（id + 原因），非空时前端需提示 */
+  rejected?: { id: string; reason: string }[];
 }
 
 // ---- CodeBuddy CLI 切号桥（F-06/F-59，批次3；Rust workbuddy_cli.rs + commands）----

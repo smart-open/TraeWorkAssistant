@@ -12,7 +12,7 @@ use super::cli::{cli_rotate_state_path, load_cli_rotate_state};
 use super::common::{
     account_id_of, as_str, as_ts_seconds, auth_file_path_of, is_running, load_pool, save_pool,
     snapshot_json_path, token_store_path, upsert_token_store, wb_data_dir, wb_renew_locks,
-    WorkBuddyAccount,
+    WorkBuddyAccount, WbPool,
 };
 
 // ── 数据结构 ────────────────────────────────────────────────────────────────
@@ -67,8 +67,11 @@ pub struct WorkBuddyScanResult {
     pub has_access_token: bool,
     pub has_refresh_token: bool,
     pub access_token_expires_at: Option<i64>,
-    /// 已在池中
+    /// 已在池中（同 token → 同 id）
     pub exists: bool,
+    /// 同一账号（同 uid）已在池中：客户端换发 token 后 id 会变，但按账号身份（uid）判定已在池；
+    /// 前端可后续据此展示，导入确认后走原位更新，不会重复入池
+    pub already_in_pool: bool,
 }
 
 // ── M1 环境检测（workbuddy_env_check）──────────────────────────────────────
@@ -223,20 +226,81 @@ pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBud
         return Err("auth 文件 accessToken 为空（可能未登录）".into());
     }
     let id = account_id_of(&access);
-    let exists = load_pool(&state).accounts.iter().any(|a| a.id == id);
+    let uid = as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default();
+    let pool = load_pool(&state);
+    let exists = pool.accounts.iter().any(|a| a.id == id);
+    let already_in_pool = !uid.is_empty() && pool.accounts.iter().any(|a| a.uid == uid);
     Ok(Some(WorkBuddyScanResult {
         id,
-        uid: as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default(),
+        uid,
         nickname: as_str(fs_utils::dig(&raw, &["nickname", "displayName", "name"])).unwrap_or_default(),
         edition_type: as_str(fs_utils::dig(&raw, &["editionType", "edition"])).unwrap_or_default(),
         has_access_token: true,
         has_refresh_token: as_str(fs_utils::dig(&raw, &["refreshToken", "refresh_token"])).is_some(),
         access_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["expiresAtMs", "expiresAt", "expires_in_ms"])),
         exists,
+        already_in_pool,
     }))
 }
 
-/// auth 文件导入入池（F-04）：写账号池 + 工具侧凭证副本（掩码入池、凭证不外泄）
+/// 池内账号幂等匹配（账号身份以 uid 为准）：uid 非空时按 uid 匹配，或按 id（token 派生）兜底匹配，
+/// 保证「同 uid 换 token」与「同 token（auth 文件缺 uid / uid 漂移）」都不会产生重复条目。
+/// pub(super)：OAuth 自动入池（oauth.rs）复用同一匹配语义，避免同 uid 重复入池。
+pub(super) fn find_uid_or_id<'a>(pool: &'a mut WbPool, uid: &str, id: &str) -> Option<&'a mut WorkBuddyAccount> {
+    pool.accounts
+        .iter_mut()
+        .find(|a| (!uid.is_empty() && a.uid == uid) || (!id.is_empty() && a.id == id))
+}
+
+/// auth 文件导入的池合并输入（从 auth 文件解析出的可覆盖字段集合）
+struct AuthMerge {
+    /// 本次 token 派生 id（wb-<sha256 前 12 位>）；命中已有条目时不采用，保留旧 id
+    id: String,
+    uid: String,
+    nickname: String,
+    edition_type: String,
+    access_token_expires_at: Option<i64>,
+    refresh_token_expires_at: Option<i64>,
+}
+
+/// auth 文件入池合并（纯逻辑，便于单测）：按 uid（优先）/ id（兜底）匹配已有条目 →
+/// 原位更新（uid/昵称/版本/过期时间/auth_saved_at 以新值覆盖）并**保留原 id**，返回该 id；
+/// 未命中 → 新增（沿用现有 id 生成规则），返回新 id。
+/// 保留原 id 的取舍：id 派生自 token，客户端换发 token 后重导入会派生新 id，若改用新 id
+/// 会使已有快照（profiles_workbuddy/<id>/）、分组与外部引用悬空，故沿用旧 id 作为账号身份。
+fn merge_auth_entry(pool: &mut WbPool, m: AuthMerge) -> String {
+    if let Some(a) = find_uid_or_id(pool, &m.uid, &m.id) {
+        // 重复导入（同 token，或同账号换发 token）= 原位更新，不产生重复条目
+        if !m.uid.is_empty() {
+            a.uid = m.uid;
+        }
+        a.nickname = m.nickname;
+        if !m.edition_type.is_empty() {
+            a.edition_type = m.edition_type;
+        }
+        a.access_token_expires_at = m.access_token_expires_at;
+        a.refresh_token_expires_at = m.refresh_token_expires_at;
+        a.auth_saved_at = Some(chrono::Utc::now().timestamp());
+        a.needs_relogin = false;
+        a.id.clone()
+    } else {
+        let id = m.id.clone();
+        pool.accounts.push(WorkBuddyAccount {
+            id: id.clone(),
+            uid: m.uid,
+            nickname: m.nickname,
+            edition_type: m.edition_type,
+            access_token_expires_at: m.access_token_expires_at,
+            refresh_token_expires_at: m.refresh_token_expires_at,
+            auth_saved_at: Some(chrono::Utc::now().timestamp()),
+            ..Default::default()
+        });
+        id
+    }
+}
+
+/// auth 文件导入入池（F-04）：写账号池 + 工具侧凭证副本（掩码入池、凭证不外泄）。
+/// 按 uid 幂等：重复导入（同 token 或同账号换 token）原位更新并保留原 id，不产生重复条目。
 #[tauri::command(async)]
 pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String>) -> Result<WorkBuddyAccountView, String> {
     let path = auth_file_path_of(&state);
@@ -255,29 +319,21 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
         .unwrap_or_else(|| uid.chars().take(8).collect());
 
     let mut pool = load_pool(&state);
-    if let Some(existing) = pool.accounts.iter_mut().find(|a| a.id == id) {
-        // 重复导入 = 更新凭证时间戳与元数据
-        existing.nickname = nickname;
-        existing.uid = uid.clone();
-        existing.auth_saved_at = Some(chrono::Utc::now().timestamp());
-        existing.access_token_expires_at = as_ts_seconds(fs_utils::dig(&raw, &["expiresAtMs", "expiresAt", "expires_in_ms"]));
-        existing.needs_relogin = false;
-        save_pool(&state, &pool)?;
-    } else {
-        pool.accounts.push(WorkBuddyAccount {
-            id: id.clone(),
+    let target_id = merge_auth_entry(
+        &mut pool,
+        AuthMerge {
+            id,
             uid: uid.clone(),
             nickname,
             edition_type: as_str(fs_utils::dig(&raw, &["editionType", "edition"])).unwrap_or_default(),
             access_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["expiresAtMs", "expiresAt", "expires_in_ms"])),
             refresh_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["refreshExpiresAt", "refresh_expires_at"])),
-            auth_saved_at: Some(chrono::Utc::now().timestamp()),
-            ..Default::default()
-        });
-        save_pool(&state, &pool)?;
-    }
+        },
+    );
+    save_pool(&state, &pool)?;
 
-    // 工具侧凭证副本（F-10 双源化）
+    // 工具侧凭证副本（F-10 双源化）：写回保留的原 id 名下（换 token 重导入时与池条目对齐，
+    // 避免 pool 用旧 id / token store 用新 id 导致凭证与账号脱钩）
     let creds = serde_json::json!({
         "access_token": access,
         "refresh_token": refresh,
@@ -286,13 +342,13 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
         "uid": uid,
         "domain": as_str(fs_utils::dig(&raw, &["domain"])),
     });
-    upsert_token_store(&state, &id, &creds)?;
+    upsert_token_store(&state, &target_id, &creds)?;
 
     // 返回合并视图（简化：直接重查）
     let views = accounts_list_inner(&state)?;
     views
         .into_iter()
-        .find(|v| v.id == id)
+        .find(|v| v.id == target_id)
         .ok_or_else(|| "导入后回读失败".into())
 }
 
@@ -500,7 +556,8 @@ pub fn workbuddy_accounts_export(state: State<AppState>, include_credentials: Op
     }))
 }
 
-/// 账号库导入（F-46 扩展）：解析导出文件 → 逐账号入池（已存在跳过）+ 凭证回写 token store。
+/// 账号库导入（F-46 扩展）：解析导出文件 → 逐账号按 uid 幂等入池
+///（已存在（同 uid，可能换 token/异机 id）原位更新并保留原 id，不重复入池）+ 凭证回写 token store。
 #[tauri::command(async)]
 pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Value) -> Result<serde_json::Value, String> {
     if payload.get("kind").and_then(|v| v.as_str()) != Some("aiwork-workbuddy-pool") {
@@ -511,7 +568,7 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
         .and_then(|v| v.as_array())
         .ok_or("导出文件缺少 accounts 数组")?;
     let mut added = 0usize;
-    let mut skipped = 0usize;
+    let mut updated = 0usize;
     let mut with_cred = 0usize;
     // 审查 P1：被拒绝条目逐条标注原因（id 非法/缺失的不入池，避免注入任意目录名）
     let mut rejected: Vec<serde_json::Value> = Vec::new();
@@ -534,13 +591,41 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
             rejected.push(serde_json::json!({ "id": id, "reason": "id 不符合 wb-<12位十六进制小写> 规则" }));
             continue;
         }
-        if pool.accounts.iter().any(|x| x.id == id) {
-            skipped += 1;
+        // 按 uid 幂等（uid 优先，id 兜底，同 find_uid_or_id）：命中 → 原位更新并保留原 id
+        // （换 token / 异机 id 的同账号不再产生重复条目，快照与分组引用不悬空）。
+        // group_id/note/phone_masked 属本地/用户可编辑数据，更新时不覆盖，仅新增时采用。
+        let entry_uid = a.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if let Some(x) = find_uid_or_id(&mut pool, &entry_uid, &id) {
+            if !entry_uid.is_empty() {
+                x.uid = entry_uid;
+            }
+            let nickname = a.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            if !nickname.is_empty() {
+                x.nickname = nickname;
+            }
+            let edition = a.get("edition_type").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            if !edition.is_empty() {
+                x.edition_type = edition;
+            }
+            if let Some(v) = a.get("access_token_expires_at").and_then(|v| v.as_i64()) {
+                x.access_token_expires_at = Some(v);
+            }
+            if let Some(v) = a.get("refresh_token_expires_at").and_then(|v| v.as_i64()) {
+                x.refresh_token_expires_at = Some(v);
+            }
+            x.auth_saved_at = Some(chrono::Utc::now().timestamp());
+            updated += 1;
+            // 凭证副本回写（导出时含凭证才有效）：写回保留的原 id 名下，与池条目对齐
+            if let Some(cred) = a.get("credential").filter(|c| c.is_object()) {
+                let rec = cred.clone();
+                upsert_token_store(&state, &x.id, &rec)?;
+                with_cred += 1;
+            }
             continue;
         }
         pool.accounts.push(WorkBuddyAccount {
             id: id.clone(),
-            uid: a.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            uid: entry_uid,
             nickname: a.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             phone_masked: a.get("phone_masked").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             edition_type: a.get("edition_type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
@@ -562,7 +647,92 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
     save_pool(&state, &pool)?;
     fs_utils::app_log(
         &state.data_dir,
-        &format!("workbuddy: 账号库导入 新增 {added} / 跳过 {skipped} / 带凭证 {with_cred} / 拒绝 {}", rejected.len()),
+        &format!("workbuddy: 账号库导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {}", rejected.len()),
     );
-    Ok(serde_json::json!({ "added": added, "skipped": skipped, "with_credentials": with_cred, "rejected": rejected }))
+    // skipped 保留为旧版前端兼容字段：旧语义「同 id 跳过」已改为按 uid 原位合并（updated）
+    Ok(serde_json::json!({ "added": added, "updated": updated, "skipped": 0, "with_credentials": with_cred, "rejected": rejected }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_auth_entry, AuthMerge, WorkBuddyAccount, WbPool};
+
+    fn entry(id: &str, uid: &str, nickname: &str) -> WorkBuddyAccount {
+        WorkBuddyAccount {
+            id: id.into(),
+            uid: uid.into(),
+            nickname: nickname.into(),
+            ..Default::default()
+        }
+    }
+
+    fn auth_merge(id: &str, uid: &str, exp: Option<i64>) -> AuthMerge {
+        AuthMerge {
+            id: id.into(),
+            uid: uid.into(),
+            nickname: "new-nick".into(),
+            edition_type: "pro".into(),
+            access_token_expires_at: exp,
+            refresh_token_expires_at: None,
+        }
+    }
+
+    /// 重复导入同 token：池大小不变、id 不变、字段以新值覆盖
+    #[test]
+    fn merge_same_token_keeps_pool_size_and_id() {
+        let mut pool = WbPool { accounts: vec![entry("wb-aaaaaaaaaaaa", "u1", "old")] };
+        let target_id = merge_auth_entry(&mut pool, auth_merge("wb-aaaaaaaaaaaa", "u1", Some(123)));
+        assert_eq!(pool.accounts.len(), 1);
+        assert_eq!(target_id, "wb-aaaaaaaaaaaa");
+        assert_eq!(pool.accounts[0].id, "wb-aaaaaaaaaaaa");
+        assert_eq!(pool.accounts[0].nickname, "new-nick");
+        assert_eq!(pool.accounts[0].edition_type, "pro");
+        assert_eq!(pool.accounts[0].access_token_expires_at, Some(123));
+        assert!(!pool.accounts[0].needs_relogin);
+    }
+
+    /// 同 uid 不同 token（客户端换发 token）：池大小不变、凭证（过期时间）更新、id 保持旧值
+    #[test]
+    fn merge_same_uid_new_token_updates_and_keeps_old_id() {
+        let mut pool = WbPool { accounts: vec![entry("wb-oldoldoldold", "u1", "old")] };
+        let target_id = merge_auth_entry(&mut pool, auth_merge("wb-newnewnewnew", "u1", Some(456)));
+        assert_eq!(pool.accounts.len(), 1);
+        assert_eq!(pool.accounts[0].id, "wb-oldoldoldold"); // 保留旧 id：快照/分组引用不悬空
+        assert_eq!(target_id, "wb-oldoldoldold"); // 凭证副本须写回旧 id 名下
+        assert_eq!(pool.accounts[0].uid, "u1");
+        assert_eq!(pool.accounts[0].access_token_expires_at, Some(456));
+    }
+
+    /// 新 uid（新账号）：新增条目，沿用传入 id
+    #[test]
+    fn merge_new_uid_appends_entry() {
+        let mut pool = WbPool { accounts: vec![entry("wb-aaaaaaaaaaaa", "u1", "a")] };
+        let target_id = merge_auth_entry(&mut pool, auth_merge("wb-bbbbbbbbbbbb", "u2", None));
+        assert_eq!(pool.accounts.len(), 2);
+        assert_eq!(target_id, "wb-bbbbbbbbbbbb");
+        assert_eq!(pool.accounts[1].id, "wb-bbbbbbbbbbbb");
+        assert_eq!(pool.accounts[1].uid, "u2");
+        assert_eq!(pool.accounts[1].nickname, "new-nick");
+    }
+
+    /// 同 id 但 uid 漂移（池内旧 uid 与 auth 文件不一致）：按 id 兜底匹配，不产生第二条，
+    /// 且 uid 以 auth 文件新值修正
+    #[test]
+    fn merge_same_id_drifted_uid_does_not_duplicate() {
+        let mut pool = WbPool { accounts: vec![entry("wb-cccccccccccc", "u-old", "old")] };
+        let target_id = merge_auth_entry(&mut pool, auth_merge("wb-cccccccccccc", "u-new", Some(789)));
+        assert_eq!(pool.accounts.len(), 1);
+        assert_eq!(target_id, "wb-cccccccccccc");
+        assert_eq!(pool.accounts[0].uid, "u-new");
+    }
+
+    /// auth 文件缺 uid（uid 为空）：按 id 匹配原位更新，且不以空 uid 回填覆盖旧 uid
+    #[test]
+    fn merge_empty_uid_falls_back_to_id_and_keeps_old_uid() {
+        let mut pool = WbPool { accounts: vec![entry("wb-dddddddddddd", "u1", "old")] };
+        let target_id = merge_auth_entry(&mut pool, auth_merge("wb-dddddddddddd", "", None));
+        assert_eq!(pool.accounts.len(), 1);
+        assert_eq!(target_id, "wb-dddddddddddd");
+        assert_eq!(pool.accounts[0].uid, "u1");
+    }
 }

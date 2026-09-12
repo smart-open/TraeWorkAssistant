@@ -52,6 +52,49 @@ fn make_custom_request(cm: &CustomModel, body: &[u8]) -> Result<Box<dyn std::io:
     }
 }
 
+/// 连通性探活（custom_model_test 命令底层）：向自定义上游发一条最小 chat 请求
+/// （max_tokens=16 + stream:true，与网关同款 SSE 处理），返回成功摘要 / 失败原因。
+/// 阻塞调用——调用方需放入 spawn_blocking 并外加超时（命令层 30s）。
+pub fn probe(cm: &CustomModel) -> Result<String, String> {
+    let body = json!({
+        "model": cm.name,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 16,
+        "stream": true,
+    })
+    .to_string()
+    .into_bytes();
+    let reader = make_custom_request(cm, &body).map_err(|(status, resp_body)| {
+        let preview: String = resp_body.chars().take(200).collect();
+        if preview.is_empty() {
+            format!("上游返回 status {status}（无响应体；请检查 API 地址与 Key）")
+        } else {
+            format!("上游返回 status {status}：{preview}")
+        }
+    })?;
+    let lines = wb_upstream::lines_with_first_byte_timeout(reader)
+        .map_err(|_| "10 秒内未收到上游响应（首字超时）".to_string())?;
+    let (resp, error_info) = wb_sse::aggregate(lines, &format!("probe-{}", now_ts()));
+    match (resp, error_info) {
+        (Some(r), None) => {
+            let content = r
+                .pointer("/choices/0/message/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let preview: String = content.chars().take(40).collect();
+            if preview.is_empty() {
+                Ok("连通成功（上游返回空内容）".to_string())
+            } else {
+                Ok(format!("连通成功：{preview}"))
+            }
+        }
+        (None, Some((code, msg))) => Err(format!("上游流内错误 code={code}：{msg}")),
+        _ => Err("上游返回为空（未产出任何 completion）".to_string()),
+    }
+}
+
 fn now_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

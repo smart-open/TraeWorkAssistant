@@ -7,7 +7,9 @@
 
 输出（stdout 末行 JSON，Rust 捕获）：
   {"ok":true,"fetched_at":"...","accounts":[{...}],...}
-  单账号：{"user_id","name","balance","packages":[{name,remaining,total,used,end_time,expire_soon}],"source"}
+  单账号：{"user_id","name","balance","packages":[{name,remaining,total,used,
+    end_time("YYYY-MM-DD HH:MM:SS" 统一形态，由 expire_ts 归一生成),
+    expire_ts(Unix 秒),expire_soon}],"source"}
   全池：{"accounts":[...],"total_balance":N}
 缓存：data/workbuddy_credits_cache.json（≥5 分钟；--fresh 强制刷新）。
 
@@ -73,6 +75,15 @@ def _to_ts(v):
         return None
 
 
+def _fmt_ts(ts):
+    """Unix 秒 → 统一展示形态 "YYYY-MM-DD HH:MM:SS"（UTC+8，与 _to_ts
+    无时区输入的假定一致；前端明细按 end_time[:10] 截日期）"""
+    if ts is None:
+        return None
+    dt = datetime.datetime.fromtimestamp(int(ts), datetime.timezone(datetime.timedelta(hours=8)))
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 # 兼容旧名（外部可能引用）
 _iso_to_ts = _to_ts
 
@@ -133,19 +144,30 @@ def _packages_from(body):
             continue
         name = wb.dig(item, "PackageName", "packageName", "Name", "name",
                       "ProductCode", "description")
-        # 到期字段宽容链：ISO/时间戳均可（_to_ts 归一），毫秒时间戳自动识别
+        # 到期字段宽容链（§3.6）：DeductionEndTime → PackageEndTime → EndTime
+        # → expireTime/expireAt/expire_time/expiredAt/ExpiredTime 等别名，
+        # 经 _to_ts 归一为 Unix 秒（秒/毫秒时间戳、ISO/纯日期字符串均可）。
         end_raw = wb.dig(item, "DeductionEndTime", "deductionEndTime",
                          "PackageEndTime", "packageEndTime",
                          "EndTime", "endTime", "expireTime", "expireAt",
                          "ExpireTime", "expire_time", "expiredAt", "ExpiredTime")
         end_ts = _to_ts(end_raw)
         used = _num(wb.dig(item, "UsedCapacity", "used", "Used"))
+        # 到期双字段（与到期日历同口径）：
+        #   expire_ts —— Unix 秒（BuddyCredits 到期日历直接使用）
+        #   end_time  —— 统一形态 "YYYY-MM-DD HH:MM:SS"，由 expire_ts 生成，
+        #                保证 expire_ts 有值 ⟺ end_time 有值（BuddyAccounts
+        #                积分包明细读此字段）。此前 end_time 仅在原始值为字符串时
+        #                回填，上游返回数字（毫秒/秒）时间戳时明细恒显示
+        #                「到期时间未知」而日历正常——本行修复该不一致；
+        #                时间戳解析失败时两者同时为 None（明细显示「未知」，
+        #                日历过滤），与日历侧口径严格对齐。
         out.append({
             "name": str(name) if name else "积分包",
             "remaining": remaining or 0.0,
             "total": total or 0.0,
             "used": used or 0.0,
-            "end_time": end_raw if isinstance(end_raw, str) else None,
+            "end_time": _fmt_ts(end_ts),
             "expire_ts": end_ts,
         })
     return out

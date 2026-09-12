@@ -126,10 +126,10 @@ interface AppState {
   removeGroup: (id: string) => Promise<void>;
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
-  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy') => Promise<void>;
+  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') => Promise<void>;
   /** C1：一键以账号 X 打开豆包（恢复快照后拉起客户端；代理运行中时注入代理） */
   openDoubaoAs: (userId: string, proxyPort?: number) => Promise<void>;
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy') => Promise<void>;
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
   startCheckin: (opts: {
@@ -244,17 +244,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       onSwitchDone: (e) => {
         // 提取脚本 [fatal] 行的原文（如「目标账号 xxx 无快照，请先登录该账号并点击保存当前登录态」）
         // raw 兜底空串：后端偶发缺 payload 时避免 TypeError 把 switchingTo 永久锁死
-        const reason = e.success ? null : ((e.raw ?? '').match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
+        const raw = e.raw ?? '';
+        const reason = e.success ? null : (raw.match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
+        // verify 超时（authfile 布局）：切换动作完成但登录身份未确认 → warn 而非 success，
+        // 避免「切换成功」toast 掩盖客户端未登录的事实（switcher.log 实测 4/4 超时）
+        const warnUnconfirmed = e.success && /未确认登录身份/.test(raw);
+        const doneLine = warnUnconfirmed
+          ? '[警告] 已切换，但 30 秒内未确认登录身份，请打开客户端核实'
+          : e.success
+            ? '[完成] 登录态切换成功'
+            : `[失败] ${reason ?? '登录态切换未完成，请查看日志'}`;
         set((s) => ({
           switchingTo: null,
-          switchProgress: [
-            ...s.switchProgress.slice(-49),
-            e.success ? '[完成] 登录态切换成功' : `[失败] ${reason ?? '登录态切换未完成，请查看日志'}`,
-          ],
+          switchProgress: [...s.switchProgress.slice(-49), doneLine],
         }));
         get().pushToast(
-          e.success ? 'success' : 'error',
-          e.success ? '登录态切换完成' : `切换失败：${reason ?? '请查看系统日志'}`,
+          warnUnconfirmed ? 'warn' : e.success ? 'success' : 'error',
+          warnUnconfirmed
+            ? '已执行切换，但 30 秒内未确认登录身份——请打开客户端核实；若未登录，请重新登录后「保存当前登录态」'
+            : e.success
+              ? '登录态切换完成'
+              : `切换失败：${reason ?? '请查看系统日志'}`,
         );
         void get().refreshAccounts();
         void get().refreshProxy();
@@ -694,7 +704,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ switchingTo: userId, switchProgress: [] });
       // withMinDelay：切换是高风险操作，保证 busy 态至少可见 1s（避免瞬间完成导致闪烁/误触连点）
       await withMinDelay(api.switchAccount(userId, targetApp));
-      get().pushToast('info', `正在切换登录态${targetApp === 'Trae' ? '（Trae）' : ''}，请稍候…`);
+      // 应用名后缀：TraeWork 静默；其余应用标注目标（Trae→Trae、WorkBuddy→WorkBuddy、Doubao→Doubao、CodeBuddy→CodeBuddy）
+      get().pushToast('info', `正在切换登录态${targetApp && targetApp !== 'TraeWork' ? `（${targetApp === 'CodeBuddy' ? 'CodeBuddy' : targetApp}）` : ''}，请稍候…`);
     } catch (err) {
       set({ switchingTo: null });
       get().pushToast('error', `切换失败：${String(err)}`);

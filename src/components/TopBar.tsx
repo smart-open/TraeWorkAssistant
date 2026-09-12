@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ExternalLink, Power, PowerOff, ShieldCheck, ShieldAlert, MonitorCheck, MonitorX, Server, Wifi, Play } from 'lucide-react';
-import { open } from '@tauri-apps/plugin-shell';
+import { ExternalLink, Loader2, Power, PowerOff, ShieldCheck, ShieldAlert, MonitorCheck, MonitorX, Server, Wifi, Play } from 'lucide-react';
 import { useAppStore } from '../store';
 import { Badge } from './ui';
 import { api } from '../lib/tauri';
@@ -214,6 +213,8 @@ function BuddyTopBar() {
   const [cbLocate, setCbLocate] = useState<AppLocate | null>(null);
   // CLI 桥状态：CodeBuddy CLI-only 用户（只装 CLI 无桌面版）用 settings_present 兜底判定
   const [cbCli, setCbCli] = useState<WbCliStatus | null>(null);
+  // 打开客户端 pending（wb/cb 互斥防连点；执行期间两按钮均禁用）
+  const [launching, setLaunching] = useState<'wb' | 'cb' | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -234,15 +235,22 @@ function BuddyTopBar() {
     };
   }, []);
 
-  const openExe = async (exe: string | null | undefined, label: string) => {
-    if (!exe) {
-      pushToast('warn', `未检测到 ${label} 客户端，请先安装`);
-      return;
-    }
+  // 打开客户端：走后端 spawn exe（Tauri v2 opener 对可执行文件静默失败，不能用 file:/// 打开）。
+  // 按钮不再因未检测到 exe 而哑死禁用：后端 reject 文案含「未检测到」时降级为 warn 提示，其余为 error
+  const launchApp = async (which: 'wb' | 'cb') => {
+    if (launching) return;
+    const label = which === 'wb' ? 'WorkBuddy' : 'CodeBuddy';
+    setLaunching(which);
     try {
-      await open(`file:///${exe}`);
-    } catch (e) {
-      pushToast('error', `打开 ${label} 失败：${String(e)}`);
+      if (which === 'wb') await api.env.openWorkbuddyApp();
+      else await api.env.openCodebuddyApp();
+      pushToast('success', `已启动 ${label}`);
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('未检测到')) pushToast('warn', msg);
+      else pushToast('error', `打开 ${label} 失败：${msg}`);
+    } finally {
+      setLaunching(null);
     }
   };
 
@@ -288,11 +296,11 @@ function BuddyTopBar() {
         </Badge>
       </div>
       <div className="flex items-center gap-2">
-        <button onClick={() => void openExe(wbEnv?.exe, 'WorkBuddy')} className="btn-outline" disabled={!wbEnv?.exe}>
-          <ExternalLink size={15} /> 打开WorkBuddy
+        <button onClick={() => void launchApp('wb')} className="btn-outline" disabled={launching != null}>
+          {launching === 'wb' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开WorkBuddy
         </button>
-        <button onClick={() => void openExe(cbLocate?.exe, 'CodeBuddy')} className="btn-outline" disabled={!cbLocate?.exe}>
-          <ExternalLink size={15} /> 打开CodeBuddy
+        <button onClick={() => void launchApp('cb')} className="btn-outline" disabled={launching != null}>
+          {launching === 'cb' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开CodeBuddy
         </button>
         {proxy.running ? (
           <button onClick={stopProxy} className="btn-outline">

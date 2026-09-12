@@ -44,7 +44,7 @@ pub struct CustomModel {
     pub max_tokens: u64,
     #[serde(default)]
     pub supports_image: bool,
-    /// 展示倍率（0 = 未声明）
+    /// 展示倍率（0 = 免费；支持两位小数，如 0.01）
     #[serde(default)]
     pub rate: f64,
     #[serde(default)]

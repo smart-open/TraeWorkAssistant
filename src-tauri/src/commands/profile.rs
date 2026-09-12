@@ -17,21 +17,28 @@ pub struct ProfileInfo {
 }
 
 /// profiles 根目录：%APPDATA%\AIWorkAssistant\data\profiles\（Trae Work）
-/// 或 data\profiles_trae\（Trae CN IDE）、data\profiles_doubao\（豆包，P2），
-/// 与切换桥 -TargetApp 参数化一致
+/// 或 data\profiles_trae\（Trae CN IDE）、data\profiles_doubao\（豆包）、
+/// data\profiles_codebuddy\（CodeBuddy 桌面）、data\profiles_workbuddy\（WorkBuddy 桌面，
+/// authfile 布局）——profiles_workbuddy 由切换桥按 -TargetApp WorkBuddy 写入，
+/// 此处映射保证通用快照命令（list/backup/restore/delete）与桥同源，防误操作 TraeWork 快照
 fn profiles_dir(state: &State<AppState>, target_app: Option<&str>) -> PathBuf {
     match target_app {
         Some("Trae") => state.data_dir.join("data").join("profiles_trae"),
         Some("Doubao") => state.data_dir.join("data").join("profiles_doubao"),
+        Some("CodeBuddy") => state.data_dir.join("data").join("profiles_codebuddy"),
+        Some("WorkBuddy") => state.data_dir.join("data").join("profiles_workbuddy"),
         _ => state.data_dir.join("data").join("profiles"),
     }
 }
 
-/// 归一化 target_app：仅接受 "Trae"（Trae CN IDE）/ "Doubao"（豆包），其余一律视为 TraeWork
+/// 归一化 target_app：仅接受 "Trae"（Trae CN IDE）/ "Doubao"（豆包）/ "CodeBuddy"（CodeBuddy 桌面）/
+/// "WorkBuddy"（WorkBuddy 桌面，authfile 布局），其余一律视为 TraeWork
 fn normalize_target_app(target_app: Option<&str>) -> &'static str {
     match target_app {
         Some("Trae") => "Trae",
         Some("Doubao") => "Doubao",
+        Some("CodeBuddy") => "CodeBuddy",
+        Some("WorkBuddy") => "WorkBuddy",
         _ => "TraeWork",
     }
 }

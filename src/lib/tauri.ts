@@ -11,6 +11,7 @@ import type {
   CheckinDone,
   CheckinOpts,
   CheckinTrendPoint,
+  CodeBuddyEnvCheck,
   CreditRecord,
   CreditDetail,
   CreditsDailySnapshot,
@@ -79,6 +80,12 @@ export const api = {
     openSite: () => invoke('open_trae_website'),
     openApp: (proxyPort?: number) => invoke('open_trae_app', { proxyPort }),
     openCnApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
+    /** Buddy 双应用：打开 WorkBuddy 桌面客户端（分离启动，不注入代理） */
+    openWorkbuddyApp: () => invoke('open_workbuddy_app'),
+    /** Buddy 双应用：打开 CodeBuddy 桌面客户端（分离启动，不注入代理） */
+    openCodebuddyApp: () => invoke('open_codebuddy_app'),
+    /** CodeBuddy 桌面环境检测（exe/进程/auth uid；与 WorkBuddy 共享 auth 文件） */
+    codebuddyEnvCheck: () => invoke<CodeBuddyEnvCheck>('codebuddy_env_check'),
   },
   cert: {
     status: () => invoke<{ installed: boolean }>('cert_status'),
@@ -193,7 +200,7 @@ export const api = {
   },
   switchAccount: (
     userId: string,
-    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy',
+    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy',
     skipJwtProbe?: boolean,
   ) =>
     invoke('switch_account', {
@@ -202,18 +209,19 @@ export const api = {
       // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
       skipJwtProbe: skipJwtProbe ?? false,
     }),
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy') =>
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   profiles: {
-    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
+    // Buddy 双应用：profile_list / profile_restore / profile_delete 支持 WorkBuddy / CodeBuddy 档案映射
+    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
       invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null }),
     backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
       invoke('profile_backup', { userId, targetApp: targetApp ?? null }),
-    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
+    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
       invoke('profile_restore', { userId, targetApp: targetApp ?? null }),
-    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
+    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
       invoke('profile_delete', { userId, targetApp: targetApp ?? null }),
     formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
   },
@@ -339,8 +347,9 @@ export const api = {
     envReset: (items: string[], keycloakLogout: boolean) =>
       invoke<WbResetResult[]>('workbuddy_env_reset', { items, keycloakLogout }),
     // 官方用量 + 本地 Token 统计（F-25/26/57/58，批次3）
+    // 注意：Rust 端参数名为 refresh（Option<bool>），key 必须写 refresh；此前误写 fresh 被静默忽略导致「刷新」永远走缓存
     usageOfficial: (userId?: string, fresh?: boolean) =>
-      invoke<WbUsageOfficial>('workbuddy_usage_official', { userId: userId ?? null, fresh: fresh ?? null }),
+      invoke<WbUsageOfficial>('workbuddy_usage_official', { userId: userId ?? null, refresh: fresh ?? null }),
     usageFallback: () => invoke<WbUsageFallback>('workbuddy_usage_fallback'),
     tokenStats: () => invoke<WbTokenStats>('workbuddy_token_stats'),
     activityInfo: (userId?: string, fresh?: boolean) =>
@@ -438,6 +447,8 @@ export const api = {
       invoke<CustomModel[]>('custom_models_save', { model }),
     // 按 id 删除自定义模型；返回是否确有删除
     customModelsRemove: (id: string) => invoke<boolean>('custom_models_remove', { id }),
+    // 自定义模型连通性测试：发一条最小 chat 请求（max_tokens=16），成功返回摘要 / 失败返回原因
+    customModelTest: (model: CustomModel) => invoke<string>('custom_model_test', { model }),
     // ---- 统一网关命令（Phase 1 §8.1）：统一模型目录 / 网关设置 ----
     // 顶层参数用 camelCase（availableOnly），嵌套结构体字段保持 snake_case
     unifiedModels: (availableOnly?: boolean) =>

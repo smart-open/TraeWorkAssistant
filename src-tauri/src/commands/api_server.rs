@@ -716,6 +716,31 @@ pub fn custom_models_remove(state: State<'_, AppState>, id: String) -> Result<bo
     crate::api_server::custom_models::remove(&state.data_dir, &id)
 }
 
+/// 自定义模型连通性测试：向上游发一条最小 chat 请求（max_tokens=16），
+/// 成功返回摘要、失败返回原因（保存/编辑前的前置校验入口）。
+/// 阻塞 IO 放 spawn_blocking，外加 30s 总超时（覆盖连接 10s + 首字 10s + 出字余量）。
+#[tauri::command]
+pub async fn custom_model_test(
+    model: crate::api_server::custom_models::CustomModel,
+) -> Result<String, String> {
+    // 与保存同口径的参数预检：给出明确错误而非透传上游 4xx
+    let mut cm = model;
+    cm.name = cm.name.trim().to_string();
+    cm.base_url = cm.base_url.trim().trim_end_matches('/').to_string();
+    if cm.name.is_empty() {
+        return Err("请先填写模型名称".into());
+    }
+    if !cm.base_url.starts_with("http://") && !cm.base_url.starts_with("https://") {
+        return Err("API 地址必须以 http:// 或 https:// 开头".into());
+    }
+    let handle = tokio::task::spawn_blocking(move || crate::api_server::custom_route::probe(&cm));
+    match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(format!("测试任务失败: {e}")),
+        Err(_) => Err("测试超时（30 秒）".into()),
+    }
+}
+
 /// Trae 模型元数据人工覆盖（L1 覆盖层，键 canonical_id；编辑后聚合视图即时生效）
 #[tauri::command]
 pub fn trae_model_meta_set(

@@ -381,13 +381,18 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             user_data_dir: format!("{home}\\.workbuddy"),
             settings_key: Some("workbuddy_path"),
         },
-        // CodeBuddy IDE 独立探测（顶栏安装徽标/打开客户端）：默认路径同 WorkBuddy 的 Electron 惯例
+        // CodeBuddy IDE 独立探测（顶栏安装徽标/打开客户端）：默认路径同 WorkBuddy 的 Electron 惯例。
+        // 本机实测（2026-09-12）：安装形态为 CodeBuddy CN（带空格），exe/进程名均为 "CodeBuddy CN"，
+        // 注册表 DisplayName=CodeBuddy CN (User)，故 exe/进程/注册表候选同时覆盖不带 CN 的通用形态
         "codebuddy" => AppProfile {
             display: "CodeBuddy",
             reg_patterns: &["CodeBuddy"],
-            reg_exe_names: &["CodeBuddy.exe"],
-            exe_candidates: &["%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe"],
-            proc_names: &["CodeBuddy"],
+            reg_exe_names: &["CodeBuddy.exe", "CodeBuddy CN.exe"],
+            exe_candidates: &[
+                "%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe",
+                "%LOCALAPPDATA%\\Programs\\CodeBuddy CN\\CodeBuddy CN.exe",
+            ],
+            proc_names: &["CodeBuddy", "CodeBuddy CN"],
             user_data_dir: format!("{home}\\.codebuddy"),
             settings_key: Some("codebuddy_path"),
         },
@@ -432,6 +437,87 @@ pub fn open_doubao_app(state: State<AppState>, proxy_port: Option<u16>) -> Resul
     }
     cmd.spawn().map_err(|e| format!("启动豆包失败: {e}"))?;
     Ok(())
+}
+
+// ── Buddy 双应用（WorkBuddy / CodeBuddy）打开与环境检测 ────────────────────
+
+/// 打开 WorkBuddy 桌面版：复用 app_locate workbuddy 档案四级探测取 exe。
+/// 分离启动（spawn 不等待），不注入代理、不做三级关闭。
+#[tauri::command(async)]
+pub fn open_workbuddy_app(state: State<AppState>) -> Result<(), String> {
+    open_buddy_app(&state, "workbuddy", "WorkBuddy")
+}
+
+/// 打开 CodeBuddy 桌面版：复用 app_locate codebuddy 档案四级探测取 exe。
+/// 分离启动（spawn 不等待），不注入代理、不做三级关闭。
+#[tauri::command(async)]
+pub fn open_codebuddy_app(state: State<AppState>) -> Result<(), String> {
+    open_buddy_app(&state, "codebuddy", "CodeBuddy")
+}
+
+/// Buddy 双应用打开共用实现（open_doubao_app 的极简版：无代理注入、无进程关闭）
+fn open_buddy_app(state: &State<AppState>, app: &str, display: &str) -> Result<(), String> {
+    let loc = app_locate_inner(state, app);
+    let exe = loc
+        .exe
+        .ok_or_else(|| format!("未检测到 {display} 客户端，请先安装或手动指定路径"))?;
+    Command::new(&exe)
+        .spawn()
+        .map_err(|e| format!("启动 {display} 失败: {e}"))?;
+    Ok(())
+}
+
+/// CodeBuddy 桌面环境检测结果（Buddy 双应用域；字段 snake_case 直出前端）
+#[derive(Serialize)]
+pub struct CodeBuddyEnvCheck {
+    pub installed: bool,
+    pub running: bool,
+    pub exe: Option<String>,
+    pub version: Option<String>,
+    /// auth 文件当前登录 uid（解析失败/未登录为 None）
+    pub uid: Option<String>,
+    /// auth 文件当前登录昵称（解析失败/未登录为 None）
+    pub nickname: Option<String>,
+}
+
+/// CodeBuddy 桌面环境检测：exe/版本走 app_locate codebuddy 档案；uid/昵称复用
+/// workbuddy_scan_auth_file 的 auth 文件解析（CodeBuddy 与 WorkBuddy 共享同一 auth 文件
+/// %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info，本机实测）。
+/// 环境检查不抛错：auth 文件不存在/解析失败时 uid/nickname 置 None。
+#[tauri::command(async)]
+pub fn codebuddy_env_check(state: State<AppState>) -> CodeBuddyEnvCheck {
+    let loc = app_locate_inner(&state, "codebuddy");
+    let running = is_running_codebuddy();
+    let (uid, nickname) = match crate::commands::workbuddy::workbuddy_scan_auth_file(state.clone())
+    {
+        Ok(Some(scan)) => (
+            (!scan.uid.is_empty()).then_some(scan.uid),
+            (!scan.nickname.is_empty()).then_some(scan.nickname),
+        ),
+        _ => (None, None),
+    };
+    CodeBuddyEnvCheck {
+        installed: loc.exe.is_some(),
+        running,
+        exe: loc.exe,
+        version: loc.version,
+        uid,
+        nickname,
+    }
+}
+
+/// CodeBuddy 进程检测：同时覆盖通用形态 CodeBuddy.exe 与本机实测的 "CodeBuddy CN.exe"
+fn is_running_codebuddy() -> bool {
+    for exe in ["CodeBuddy CN.exe", "CodeBuddy.exe"] {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {exe}"), "/NH"])
+            .creation_flags(0x08000000)
+            .output();
+        if matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains(exe)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// app_locate 的内部版本（供 open_* 命令与 workbuddy 模块复用；无需 Option 包装）

@@ -37,8 +37,8 @@ pub fn switch_account(
 
     // C4：豆包快照可选纳入 IndexedDB（设置开关控制，其他应用不受影响）
     let is_doubao = target_app.as_deref() == Some("Doubao");
-    // JWT 预检仅 TRAE 双应用（TraeWork/Trae，含默认）：WorkBuddy 会话模型不同，
-    // 且其 uid 与 TRAE 账号池撞库时会被误探活错误拦截
+    // JWT 预检仅 TRAE 双应用（TraeWork/Trae，含默认）：WorkBuddy/CodeBuddy 会话模型不同，
+    // 且其 uid 与 TRAE 账号池撞库时会被误探活错误拦截——非 trae 一律放行（CodeBuddy 同 WorkBuddy）
     let is_trae = matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae"));
     let include_idb = is_doubao && state.settings().doubao_snapshot_include_idb;
     // C1：一键以账号打开时注入代理（>0 才传给桥）

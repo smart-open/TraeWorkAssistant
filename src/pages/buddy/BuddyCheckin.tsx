@@ -222,11 +222,13 @@ export default function BuddyCheckin() {
 
   const saveSettings = async (patch: Partial<NonNullable<typeof settings>>) => {
     if (!settings) return;
+    const prev = settings; // 乐观更新前留存旧值，保存失败时回滚
     const next = { ...settings, ...patch };
     setSettings(next);
     try {
       await api.workbuddy.settingsSet(next);
     } catch (err) {
+      setSettings(prev);
       pushToast('error', `保存设置失败：${String(err)}`);
     }
   };

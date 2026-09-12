@@ -63,6 +63,13 @@ export default function CustomModelsPanel({
   // 编辑弹框（新增与编辑共用；form.id 为空 = 新增）
   const [form, setForm] = useState<CustomModel | null>(null);
   const [deleteFor, setDeleteFor] = useState<CustomModel | null>(null);
+  // 必填项内联校验错误（输入即清除）
+  const [errors, setErrors] = useState<{ name?: string; base_url?: string }>({});
+  // 连通性测试（「测试连接」按钮与「保存前强制测试」共用同一入口）
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  // 倍率输入框文本态（避免受控数字输入打断小数点输入）
+  const [rateText, setRateText] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -84,17 +91,67 @@ export default function CustomModelsPanel({
     onSubModalChange?.(form != null || deleteFor != null);
   }, [form, deleteFor, onSubModalChange]);
 
-  /** 保存（新增/编辑共用）：前后端双校验，名称 canonical 唯一由后端兜底 */
+  /** 打开/关闭编辑弹框（同时清内联错误与测试结果） */
+  const openForm = (f: CustomModel) => {
+    setForm(f);
+    setErrors({});
+    setTestResult(null);
+    setRateText(f.rate > 0 ? String(f.rate) : f.id ? '0' : '');
+  };
+  const closeForm = () => {
+    setForm(null);
+    setErrors({});
+    setTestResult(null);
+  };
+
+  /** 必填项内联校验（空对象 = 通过） */
+  const validate = (f: CustomModel) => ({
+    name: f.name.trim() ? undefined : '请填写模型名称（请求模型名）',
+    base_url: /^https?:\/\//.test(f.base_url.trim())
+      ? undefined
+      : 'API 地址必须以 http:// 或 https:// 开头',
+  });
+
+  /** 连通性测试：向上游发一条最小 chat 请求；保存前强制调用同一入口 */
+  const runTest = async (): Promise<boolean> => {
+    if (!form) return false;
+    const errs = validate(form);
+    if (errs.name || errs.base_url) {
+      setErrors(errs);
+      toast('error', '请先完善必填项再测试');
+      return false;
+    }
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const msg = await api.apiServer.customModelTest({
+        ...form,
+        name: form.name.trim(),
+        base_url: form.base_url.trim(),
+      });
+      setTestResult({ ok: true, msg });
+      return true;
+    } catch (e) {
+      const msg = String(e).slice(0, 160);
+      setTestResult({ ok: false, msg });
+      toast('error', `测试不通过：${msg}`);
+      return false;
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  /** 保存（新增/编辑共用）：必填校验 → 强制连通性测试（不通过无法保存）→ upsert */
   const save = async () => {
     if (!form) return;
-    if (!form.name.trim()) {
-      toast('error', '请填写模型名称（请求模型名）');
+    const errs = validate(form);
+    if (errs.name || errs.base_url) {
+      setErrors(errs);
+      toast('error', '请完善必填项');
       return;
     }
-    if (!/^https?:\/\//.test(form.base_url.trim())) {
-      toast('error', 'API 地址必须以 http:// 或 https:// 开头');
-      return;
-    }
+    const ok = await runTest();
+    if (!ok) return;
     setSaving(true);
     try {
       const next = await api.apiServer.customModelsSave({
@@ -104,7 +161,7 @@ export default function CustomModelsPanel({
         vendor: form.vendor.trim(),
       });
       setModels(next);
-      setForm(null);
+      closeForm();
       toast('success', form.id ? `模型「${form.name}」已更新` : `模型「${form.name}」已添加`);
     } catch (e) {
       toast('error', `保存失败：${String(e).slice(0, 120)}`);
@@ -155,7 +212,7 @@ export default function CustomModelsPanel({
             <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
             刷新
           </button>
-          <button className="btn-outline flex items-center gap-1 !px-3 text-xs" onClick={() => setForm({ ...EMPTY_FORM })}>
+          <button className="btn-outline flex items-center gap-1 !px-3 text-xs" onClick={() => openForm({ ...EMPTY_FORM })}>
             <Plus size={14} />
             新建模型
           </button>
@@ -207,8 +264,8 @@ export default function CustomModelsPanel({
                       <Badge tone="blue" className="ml-1.5 !px-1.5 !text-[10px]">图片</Badge>
                     )}
                   </td>
-                  <td className="py-2 pr-4 tabular-nums text-xs text-slate-500 dark:text-zinc-400">
-                    {m.rate > 0 ? `×${m.rate}` : '—'}
+                  <td className="py-2 pr-4 text-xs text-slate-500 dark:text-zinc-400">
+                    {m.rate === 0 ? <Badge tone="green">免费</Badge> : `×${m.rate.toFixed(2)}`}
                   </td>
                   <td className="py-2 pr-4">
                     {m.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
@@ -222,7 +279,7 @@ export default function CustomModelsPanel({
                       >
                         <Power size={14} className={m.enabled ? 'text-emerald-500' : 'text-slate-400'} />
                       </button>
-                      <button className="btn-ghost !p-1.5" title="编辑" onClick={() => setForm({ ...m })}>
+                      <button className="btn-ghost !p-1.5" title="编辑" onClick={() => openForm({ ...m })}>
                         <Pencil size={14} />
                       </button>
                       <button className="btn-ghost !p-1.5" title="删除" onClick={() => setDeleteFor(m)}>
@@ -240,13 +297,16 @@ export default function CustomModelsPanel({
       {/* 新建/编辑弹框（共用；form.id 为空 = 新增） */}
       <Modal
         open={form != null}
-        onClose={() => setForm(null)}
+        onClose={closeForm}
         title={form?.id ? `编辑自定义模型 · ${form.name}` : '新建自定义模型'}
         footer={
           <>
-            <button className="btn-outline" onClick={() => setForm(null)}>取消</button>
-            <button className="btn-primary" onClick={() => void save()} disabled={saving}>
-              保存
+            <button className="btn-outline" onClick={closeForm}>取消</button>
+            <button className="btn-outline" onClick={() => void runTest()} disabled={testing || saving}>
+              {testing ? '测试中…' : '测试连接'}
+            </button>
+            <button className="btn-primary" onClick={() => void save()} disabled={saving || testing}>
+              {saving ? '保存中…' : '保存'}
             </button>
           </>
         }
@@ -258,24 +318,38 @@ export default function CustomModelsPanel({
                 模型名称 <span className="text-rose-500">*</span>
               </span>
               <input
-                className="input font-mono text-xs"
+                className={`input font-mono text-xs ${errors.name ? '!border-rose-400' : ''}`}
                 placeholder="如 gpt-4o / deepseek-v3（客户端请求模型名）"
                 value={form.name}
-                onChange={(e) => set('name', e.target.value)}
+                onChange={(e) => {
+                  set('name', e.target.value);
+                  if (errors.name) setErrors((p) => ({ ...p, name: undefined }));
+                }}
               />
-              <span className="mt-1 block text-[11px] text-slate-400">路由键：匹配时忽略大小写与首尾空格</span>
+              {errors.name ? (
+                <span className="mt-1 block text-[11px] text-rose-500">{errors.name}</span>
+              ) : (
+                <span className="mt-1 block text-[11px] text-slate-400">路由键：匹配时忽略大小写与首尾空格</span>
+              )}
             </label>
             <label className="block sm:col-span-1">
               <span className="mb-1 block text-xs font-medium text-slate-500">
                 API 地址 <span className="text-rose-500">*</span>
               </span>
               <input
-                className="input font-mono text-xs"
+                className={`input font-mono text-xs ${errors.base_url ? '!border-rose-400' : ''}`}
                 placeholder="https://api.openai.com（含 /v1 亦可）"
                 value={form.base_url}
-                onChange={(e) => set('base_url', e.target.value)}
+                onChange={(e) => {
+                  set('base_url', e.target.value);
+                  if (errors.base_url) setErrors((p) => ({ ...p, base_url: undefined }));
+                }}
               />
-              <span className="mt-1 block text-[11px] text-slate-400">自动拼接 /v1/chat/completions</span>
+              {errors.base_url ? (
+                <span className="mt-1 block text-[11px] text-rose-500">{errors.base_url}</span>
+              ) : (
+                <span className="mt-1 block text-[11px] text-slate-400">自动拼接 /v1/chat/completions</span>
+              )}
             </label>
             <label className="block sm:col-span-2">
               <span className="mb-1 block text-xs font-medium text-slate-500">API Key（Bearer）</span>
@@ -309,16 +383,20 @@ export default function CustomModelsPanel({
               />
             </label>
             <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-500">展示倍率（0 = 未声明）</span>
+              <span className="mb-1 block text-xs font-medium text-slate-500">展示倍率（0 = 免费）</span>
               <input
                 type="number"
                 min={0}
-                step="0.1"
+                step="0.01"
                 className="input"
-                value={form.rate || ''}
-                placeholder="如 1.0"
-                onChange={(e) => set('rate', Math.max(0, parseFloat(e.target.value) || 0))}
+                value={rateText}
+                placeholder="如 0.78；0 标识免费"
+                onChange={(e) => {
+                  setRateText(e.target.value);
+                  set('rate', Math.max(0, parseFloat(e.target.value) || 0));
+                }}
               />
+              <span className="mt-1 block text-[11px] text-slate-400">支持两位小数（如 0.01）；留空或 0 标识免费</span>
             </label>
             <label className="block">
               <span className="mb-1 block text-xs font-medium text-slate-500">供应商</span>
@@ -363,6 +441,18 @@ export default function CustomModelsPanel({
                 支持图片输入
               </label>
             </div>
+            {testResult && (
+              <div
+                className={`rounded-md px-3 py-2 text-xs sm:col-span-2 ${
+                  testResult.ok
+                    ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'
+                    : 'bg-rose-50 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300'
+                }`}
+              >
+                {testResult.ok ? '✓ ' : '✗ '}
+                {testResult.msg}
+              </div>
+            )}
           </div>
         )}
       </Modal>

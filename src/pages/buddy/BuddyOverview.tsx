@@ -14,7 +14,7 @@ import {
 } from 'recharts';
 import { open } from '@tauri-apps/plugin-shell';
 import PageHeader from '../../components/PageHeader';
-import { StatCard, Badge } from '../../components/ui';
+import { Spinner, StatCard, Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
@@ -82,6 +82,7 @@ export default function BuddyOverview() {
   const [records, setRecords] = useState<WbCheckinRecord[]>([]);
   const [cliBridged, setCliBridged] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [openingClient, setOpeningClient] = useState(false);
 
   const refresh = async () => {
     setRefreshing(true);
@@ -199,13 +200,15 @@ export default function BuddyOverview() {
   const completed = required.filter((s) => s.done).length;
   const allDone = completed === required.length;
 
+  // 打开客户端：走后端 spawn 启动（Tauri v2 opener 对可执行文件静默失败，不能用 file:/// 打开）；
+  // 未安装时后端 reject「未检测到…」，透传错误 toast，不再前端预判 exe
   const openClient = () => {
-    const exe = env?.exe;
-    if (exe) {
-      void open(`file:///${exe}`).catch((e) => pushToast('error', `打开客户端失败：${String(e)}`));
-    } else {
-      pushToast('warn', '未检测到 WorkBuddy 客户端，请先安装');
-    }
+    setOpeningClient(true);
+    api.env
+      .openWorkbuddyApp()
+      .then(() => pushToast('success', '已启动 WorkBuddy'))
+      .catch((e) => pushToast('error', `打开客户端失败：${String(e)}`))
+      .finally(() => setOpeningClient(false));
   };
 
   return (
@@ -444,7 +447,9 @@ export default function BuddyOverview() {
                 <button
                   onClick={() => (step.key === 'client' ? openClient() : setView(step.view))}
                   className="btn-outline shrink-0"
+                  disabled={step.key === 'client' && openingClient}
                 >
+                  {step.key === 'client' && openingClient ? <Spinner /> : null}
                   {step.actionLabel}
                   <ChevronRight size={14} />
                 </button>

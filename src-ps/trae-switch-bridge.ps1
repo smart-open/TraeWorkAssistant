@@ -28,8 +28,8 @@ param(
     [string]$UserId,
 
     [Parameter(Mandatory = $false)]
-    # F-48：档案表驱动四应用（Work/Ide 已完整接入；Doubao/WorkBuddy 定位/启停已就绪，快照管线随各自批次接入）
-    [ValidateSet('TraeWork', 'Trae', 'Doubao', 'WorkBuddy')]
+    # F-48：档案表驱动五应用（Work/Ide 已完整接入；Doubao/WorkBuddy/CodeBuddy 定位/启停已就绪，快照管线随各自批次接入）
+    [ValidateSet('TraeWork', 'Trae', 'Doubao', 'WorkBuddy', 'CodeBuddy')]
     [string]$TargetApp = 'TraeWork',
 
     [Parameter(Mandatory = $false)]
@@ -130,6 +130,28 @@ switch ($TargetApp) {
         $Script:ProcPatterns    = @('WorkBuddy*')
         $Script:ExeCandidates   = @(
             "$env:LOCALAPPDATA\Programs\WorkBuddy\WorkBuddy.exe"
+        )
+    }
+    'CodeBuddy' {
+        # CodeBuddy 桌面版（本机实测 2026-09-12：安装形态 CodeBuddy CN，exe/进程名带 CN 后缀）。
+        # 与 WorkBuddy 共享 authfile 布局：auth 文件同为
+        # %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
+        # （CodeBuddyExtension 宿主目录 + workbuddy 产品线文件名，实测确认），复用全部 authfile 快照管线；
+        # 差异仅 exe/进程名、数据目录（~\.codebuddy，无 storage\skeleton 登录快照，
+        # Confirm-AuthFileSwitch 自动跳过确认）与快照存储位置（profiles_codebuddy）。
+        $Script:AppName         = 'CodeBuddy'
+        $Script:SnapshotLayout  = 'authfile'
+        $Script:TraeDataDir     = "$env:USERPROFILE\.codebuddy"
+        $Script:ProfilesDir     = "$Script:AppDataDir\data\profiles_codebuddy"
+        $Script:SettingsPathKey = 'codebuddy_path'
+        $Script:ProcNames       = @('CodeBuddy', 'CodeBuddy CN')
+        $Script:ExeNames        = @('CodeBuddy.exe', 'CodeBuddy CN.exe')
+        $Script:LnkPatterns     = @('*CodeBuddy*')
+        $Script:RegPatterns     = @('*CodeBuddy*')
+        $Script:ProcPatterns    = @('CodeBuddy*')
+        $Script:ExeCandidates   = @(
+            "$env:LOCALAPPDATA\Programs\CodeBuddy\CodeBuddy.exe",
+            "$env:LOCALAPPDATA\Programs\CodeBuddy CN\CodeBuddy CN.exe"
         )
     }
     default {
@@ -950,12 +972,12 @@ function Backup-AuthFileProfile {
     } else {
         Write-Step -Stage 'backup' -Message 'auth 文件中未能解析 uid（JSON 结构变化？），L2 跳过' -Status 'warn'
     }
-    # 元数据
+    # 元数据（app 记录实际目标应用：WorkBuddy 与 CodeBuddy 共用 authfile 管线，以档案名区分）
     try {
         $meta = [ordered]@{
             schemaVersion = 1
             layout        = 'authfile'
-            app           = 'WorkBuddy'
+            app           = $Script:AppName
             uid           = $uid
             savedAt       = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         }
@@ -1013,9 +1035,16 @@ function Restore-AuthFileProfile {
 
 # 批次1：authfile 切换后轮询 account-snapshot.json.uid 确认（F-02 验收项，超时 30s）。
 # 客户端启动后首次联网刷新快照；uid 与目标槽 meta.json 一致 = 切换真正生效（fail-open：超时仅警告）。
+# 返回值：'ok' 已确认 / 'skip' 数据目录无快照跳过确认（如 CodeBuddy）/ 'timeout' 30 秒未确认
 function Confirm-AuthFileSwitch {
     param([string]$Slot)
     $snapFile = Join-Path $Script:TraeDataDir 'storage\skeleton\account-snapshot.json'
+    # CodeBuddy 数据目录（~\.codebuddy）无 storage\skeleton 登录快照（实测）：直接跳过轮询，
+    # 不空耗 30 秒；WorkBuddy（~\.workbuddy）快照存在，行为不变
+    if (-not (Test-Path (Split-Path $snapFile -Parent))) {
+        Write-Step -Stage 'verify' -Message "$($Script:AppName) 数据目录无登录快照（storage\skeleton 不存在），跳过切换确认" -Status 'warn'
+        return 'skip'
+    }
     $metaFile = Join-Path (Join-Path $Script:ProfilesDir $Slot) 'meta.json'
     $expectUid = $null
     try { $expectUid = [string]((Get-Content $metaFile -Raw -Encoding UTF8 | ConvertFrom-Json).uid) } catch {}
@@ -1031,12 +1060,13 @@ function Confirm-AuthFileSwitch {
                 foreach ($v in @($j.uid, $j.account.uid, $j.accountId)) { if ($v) { $uid = [string]$v; break } }
                 if ($uid -eq $expectUid) {
                     Write-Step -Stage 'verify' -Message '登录身份已确认为目标账号' -Status 'ok'
-                    return
+                    return 'ok'
                 }
             } catch {}
         }
     }
     Write-Step -Stage 'verify' -Message '30 秒内未确认到目标 uid（客户端可能未启动/未联网），请打开客户端核实' -Status 'warn'
+    return 'timeout'
 }
 
 function Backup-CurrentProfile {
@@ -1247,8 +1277,18 @@ try {
             # 记录当前账号 ID
             Set-CurrentAccount -AccountId $UserId
             Start-Trae
-            if ($Script:SnapshotLayout -eq 'authfile') { Confirm-AuthFileSwitch -Slot $UserId }
-            Write-Step -Stage 'done' -Message "已切换至账号 $UserId" -Status 'ok'
+            # authfile 布局：verify 超时 ≠ 切换失败（快照已恢复、客户端已启动），但必须在 done
+            # 里如实告知「登录身份未确认」，否则前端报「切换成功」掩盖未登录事实（switcher.log 实测 4/4 超时）
+            if ($Script:SnapshotLayout -eq 'authfile') {
+                $verifyResult = Confirm-AuthFileSwitch -Slot $UserId
+                if ($verifyResult -eq 'timeout') {
+                    Write-Step -Stage 'done' -Message "已切换至账号 $UserId（警告：30 秒内未确认登录身份，请打开客户端核实；若客户端未登录，请重新登录后「保存当前登录态」）" -Status 'ok'
+                } else {
+                    Write-Step -Stage 'done' -Message "已切换至账号 $UserId" -Status 'ok'
+                }
+            } else {
+                Write-Step -Stage 'done' -Message "已切换至账号 $UserId" -Status 'ok'
+            }
         }
         'SaveCurrentLogin' {
             # 保存当前登录态：关闭 Trae → 备份 → 启动

@@ -177,6 +177,10 @@ function CheckinConfigCard({
   const [tasks, setTasks] = useState<string[]>([]);
   const [renewOn, setRenewOn] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
+  // 定时任务（签到/续期）注册与卸载 pending（防连点重复注册）
+  const [taskBusy, setTaskBusy] = useState(false);
+  // UI 点击兜底执行态（防连点重复驱动鼠标）
+  const [uiClickBusy, setUiClickBusy] = useState<'capture' | 'run' | null>(null);
 
   const refreshTasks = useCallback(() => {
     api.workbuddy.checkinTaskStatus().then(setTasks).catch(() => setTasks([]));
@@ -189,7 +193,10 @@ function CheckinConfigCard({
 
   // settings 单项保存（走 settingsSet 全量 patch，与父页「保存配置」同通道）
   const savePatch = async (p: Partial<WorkBuddySettings>) => {
-    if (!settings) return;
+    if (!settings) {
+      pushToast('warn', '设置尚未加载，请稍后重试');
+      return;
+    }
     setSavingSettings(true);
     try {
       patch(p);
@@ -202,16 +209,33 @@ function CheckinConfigCard({
   };
 
   const registerTasks = async () => {
+    setTaskBusy(true);
     try {
       await api.workbuddy.checkinTaskRegister(['09:00', '21:00']);
       setTasks(await api.workbuddy.checkinTaskStatus());
       pushToast('success', '已注册每日 09:00 / 21:00 双时段签到任务');
     } catch (err) {
       pushToast('error', `注册任务失败：${String(err)}`);
+    } finally {
+      setTaskBusy(false);
+    }
+  };
+
+  const unregisterTasks = async () => {
+    setTaskBusy(true);
+    try {
+      await api.workbuddy.checkinTaskUnregister();
+      setTasks([]);
+      pushToast('info', '已卸载定时签到任务');
+    } catch (err) {
+      pushToast('error', `卸载任务失败：${String(err)}`);
+    } finally {
+      setTaskBusy(false);
     }
   };
 
   const toggleRenew = async () => {
+    setTaskBusy(true);
     try {
       if (renewOn) {
         await api.workbuddy.renewTaskUnregister();
@@ -224,6 +248,8 @@ function CheckinConfigCard({
       }
     } catch (err) {
       pushToast('error', `续期任务操作失败：${String(err)}`);
+    } finally {
+      setTaskBusy(false);
     }
   };
 
@@ -284,21 +310,12 @@ function CheckinConfigCard({
               </div>
               <div className="flex gap-2">
                 {tasks.length === 0 ? (
-                  <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void registerTasks()}>注册</button>
+                  <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void registerTasks()}>
+                    {taskBusy ? <Spinner /> : null} 注册
+                  </button>
                 ) : (
-                  <button
-                    className="btn-outline !px-2 !py-1 text-xs"
-                    onClick={() =>
-                      void api.workbuddy
-                        .checkinTaskUnregister()
-                        .then(() => {
-                          setTasks([]);
-                          pushToast('info', '已卸载定时签到任务');
-                        })
-                        .catch((e) => pushToast('error', String(e)))
-                    }
-                  >
-                    卸载
+                  <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void unregisterTasks()}>
+                    {taskBusy ? <Spinner /> : null} 卸载
                   </button>
                 )}
               </div>
@@ -310,8 +327,8 @@ function CheckinConfigCard({
                 <div className="text-sm font-medium">token 每周兜底续期（周日 10:30）</div>
                 <div className="text-xs text-slate-400">{renewOn ? '已注册：惰性刷新临期账号凭证' : '未注册：凭证临期后需手动续期'}</div>
               </div>
-              <button className="btn-outline !px-2 !py-1 text-xs" onClick={() => void toggleRenew()}>
-                {renewOn ? '卸载' : '注册'}
+              <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void toggleRenew()}>
+                {taskBusy ? <Spinner /> : null} {renewOn ? '卸载' : '注册'}
               </button>
             </div>
           </div>
@@ -347,8 +364,9 @@ function CheckinConfigCard({
             </span>
             <button
               className="btn-outline !px-2 !py-1"
-              disabled={savingSettings}
-              onClick={() =>
+              disabled={savingSettings || uiClickBusy != null}
+              onClick={() => {
+                setUiClickBusy('capture');
                 void api.workbuddy
                   .uiClickCapture()
                   .then((r) => {
@@ -360,22 +378,25 @@ function CheckinConfigCard({
                     }
                   })
                   .catch((e) => pushToast('error', String(e)))
-              }
+                  .finally(() => setUiClickBusy(null));
+              }}
             >
-              取点（3 秒倒计时）
+              {uiClickBusy === 'capture' ? '取点中…' : '取点（3 秒倒计时）'}
             </button>
             <button
               className="btn-outline !px-2 !py-1"
-              disabled={!settings?.ui_click_enabled || savingSettings}
+              disabled={!settings?.ui_click_enabled || savingSettings || uiClickBusy != null}
               title={settings?.ui_click_enabled ? '' : '先启用后才可执行（F-18 默认关闭）'}
-              onClick={() =>
+              onClick={() => {
+                setUiClickBusy('run');
                 void api.workbuddy
                   .uiClickCheckin()
                   .then((r) => pushToast(r.ok ? 'success' : 'warn', r.message))
                   .catch((e) => pushToast('error', String(e)))
-              }
+                  .finally(() => setUiClickBusy(null));
+              }}
             >
-              执行点击
+              {uiClickBusy === 'run' ? '执行中…' : '执行点击'}
             </button>
           </div>
         </div>
@@ -398,9 +419,11 @@ export default function BuddySettings() {
   const [locWbDone, setLocWbDone] = useState(false);
   const [locCbDone, setLocCbDone] = useState(false);
   const [detecting, setDetecting] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const prefilled = useRef(false);
 
   const refresh = useCallback(async () => {
+    setRefreshing(true);
     try {
       const [e, st] = await Promise.all([
         api.workbuddy.envCheck(),
@@ -411,6 +434,7 @@ export default function BuddySettings() {
     } catch (err) {
       pushToast('error', `环境检测失败：${String(err)}`);
     }
+    setRefreshing(false);
     // 路径配置与四级探测来源（失败静默，不阻断主检测）
     api.misc
       .settingsGet()
@@ -507,8 +531,8 @@ export default function BuddySettings() {
         desc="客户端环境 · 签到配置 · 通知与轮换"
         actions={
           <>
-            <button className="btn-outline" onClick={() => void refresh()}>
-              <RefreshCw size={15} /> 重新检测
+            <button className="btn-outline" onClick={() => void refresh()} disabled={refreshing}>
+              <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 重新检测
             </button>
             <button className="btn-outline" onClick={() => void save()} disabled={saving || !settings}>
               {saving ? <Spinner /> : <Save size={15} />} 保存配置

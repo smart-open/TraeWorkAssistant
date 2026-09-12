@@ -206,8 +206,11 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                         {m.vendor || '—'}
                       </td>
                       <td className="px-2.5 py-2">
-                        <span className="block max-w-[14rem] truncate" title={m.id}>
-                          {m.display || m.id}
+                        <span
+                          className="block max-w-[14rem] truncate font-mono"
+                          title={m.display && m.display !== m.id ? `模型名称：${m.display}` : m.id}
+                        >
+                          {m.id}
                         </span>
                       </td>
                       <td className="px-2.5 py-2 text-right tabular-nums">
@@ -216,7 +219,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                         ) : m.rate === 0 ? (
                           <Badge tone="green">免费</Badge>
                         ) : (
-                          `${m.rate}x`
+                          `${m.rate.toFixed(2)}x`
                         )}
                       </td>
                       <td className="px-2.5 py-2 text-center">

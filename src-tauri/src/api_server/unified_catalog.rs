@@ -419,7 +419,9 @@ pub fn unified_models(
         if !m.vendor.is_empty() {
             custom_vendor.insert(canonical.clone(), m.vendor.clone());
         }
-        let crate_rate = if m.rate > 0.0 { Some(m.rate) } else { None };
+        // 展示倍率：0 = 免费（有效语义，透传聚合层）——命中 custom 即按免费展示；
+        // 聚合尾部 rate=命中侧倍率，disabled 的 custom 源不会被命中，不影响 Trae/Buddy 侧
+        let crate_rate: Option<f64> = Some(m.rate);
         let cctx = if m.context_length > 0 { Some(m.context_length) } else { None };
         let cmt = if m.max_tokens > 0 { Some(m.max_tokens) } else { None };
         match acc.get_mut(&canonical) {
@@ -931,5 +933,23 @@ mod tests {
         .unwrap();
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "my-vision-model").supports_image, Some(true));
+    }
+
+    /// 自定义模型 rate=0 = 免费（有效展示语义）：source/顶层均透传 Some(0.0)，
+    /// 帮助列表按「免费」徽标展示（不得再当「未声明」丢弃为 None）
+    #[test]
+    fn t14_custom_zero_rate_is_free() {
+        let f = fixture(&[], &[], None);
+        std::fs::write(
+            f.dir.join("data").join("custom_models.json"),
+            json!({"models": [{"id": "cm1", "name": "my-free-model", "base_url": "https://x",
+                               "enabled": true, "rate": 0.0}]})
+                .to_string(),
+        )
+        .unwrap();
+        let list = unified_models(&f.dir, true, true, true);
+        let m = find(&list, "my-free-model");
+        assert_eq!(m.rate, Some(0.0), "rate=0 必须透传为免费（Some(0.0)）");
+        assert_eq!(m.sources[0].rate, Some(0.0));
     }
 }

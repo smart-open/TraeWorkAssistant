@@ -106,10 +106,10 @@ ai-work-assistant/
 | 签到 | `checkin_trends(days?)` → `CheckinTrendPoint[]` | 近 N 天签到结果按日汇总（T8，data/checkin_results.json，保留 90 天） |
 | 环境 | `app_locate(targetApp)` → `AppLocate` | 四应用安装位置四级探测（手动指定→注册表→默认路径→进程反查，F-01）；`targetApp: trae_work\|trae\|doubao\|workbuddy` |
 | 环境 | `open_doubao_app()` | 启动豆包桌面版（复用 app_locate 豆包档案探测） |
-| 切换 | `switch_account(userId)` | 调 `trae-switch-bridge.ps1 -Action Switch`（进程三级关闭策略）；`target_app` 支持 TraeWork/Trae/Doubao |
+| 切换 | `switch_account(userId)` | 调 `trae-switch-bridge.ps1 -Action Switch`（进程三级关闭策略）；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
 | 切换 | `reset_device_ids(userId)` | switch 模块：重置设备指纹（区别于 misc 的 `device_reset` 只删映射）；仅 icube 布局 |
-| 保存 | `save_current_login(userId)` | 调 `trae-switch-bridge.ps1 -Action SaveCurrentLogin`；`target_app` 支持 TraeWork/Trae/Doubao |
-| 快照 | `profile_list` → `ProfileInfo[]` | 列出快照槽；`target_app` 决定根目录 profiles / profiles_trae / profiles_doubao |
+| 保存 | `save_current_login(userId)` | 调 `trae-switch-bridge.ps1 -Action SaveCurrentLogin`；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
+| 快照 | `profile_list` → `ProfileInfo[]` | 列出快照槽；`target_app` 决定根目录 profiles / profiles_trae / profiles_doubao / profiles_codebuddy |
 | 快照 | `profile_backup(userId)` / `profile_restore(userId)` / `profile_delete(slot)` | 手动备份/恢复/删除；`target_app` 同上 |
 | 快照 | `profile_format_size(...)` | 快照体积格式化 |
 | 豆包 | `doubao_accounts_list` → `DoubaoAccountView[]` | 账号池 ∪ profiles_doubao 快照槽合并视图 + 当前账号标记 + 会话状态（last 槽与 `*.bak` 单代回滚槽不展示） |
@@ -171,6 +171,7 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_activity_info(userId?, refresh?)` | 活动信息三端点聚合（F-51，批次4）：公开 GET `/v2/activity/banner` + billing POST `get-payment-type`/`get-dosage-notify`；宽容解析逐项容错（errors[] 明示），缓存 10min（data/workbuddy_activity_cache.json） |
 | WorkBuddy | `workbuddy_ui_click_capture()` / `workbuddy_ui_click_checkin()` | UI 坐标点击签到兜底（F-18，批次4）：ctypes user32 驱动鼠标（零新依赖）；仅手动触发、默认关闭（settings.ui_click_enabled）；取点 3 秒倒计时记录坐标，执行单次单击不循环 |
 | WB 配置 | `wb_route_config_get()` / `wb_route_config_set(config)` / `wb_template_map_get()` / `wb_template_map_set(map)` | 四段模型路由与审核模板映射两个手工配置文件的程序化读写：读 data/ 新路径回退旧根；set 结构校验与读取方反序列化严格对齐（aliases/rules/suffixes 为 object，模板表为 {templates:[{from,to}]} 形态），写 data/ 新路径并逐出读缓存（网关热路径即时生效） |
+| Buddy 双应用 | `open_workbuddy_app()` / `open_codebuddy_app()` / `codebuddy_env_check()` | 启动 WorkBuddy / CodeBuddy 桌面客户端（app_locate 探测，未装返回明确错误，不注入代理）；CodeBuddy 环境探测 `{installed,running,exe,version,uid,nickname}`（CodeBuddy CN 桌面与 WorkBuddy 共享 auth 文件 `%LOCALAPPDATA%\CodeBuddyExtension\...\workbuddy-desktop.info`，uid 同源 → 账号页「CodeBuddy在线」徽标）；`-TargetApp CodeBuddy`（authfile 布局）切换/保存快照落 profiles_codebuddy |
 
 ### 5.1 双应用与双 uid 体系（F-08，trae_apps.rs）
 
@@ -251,7 +252,7 @@ ai-work-assistant/
 - `-Json` 时输出 NDJSON 单行 `{"stage":"...","status":"...","message":"...","time":"..."}`。
 - 入口目录：`$env:APPDATA\TRAE SOLO CN` + `$env:APPDATA\AIWorkAssistant\data\profiles`。
 - **Action 参数**：`Switch` / `SaveCurrentLogin` / `ResetMachineId` / `ResetDeviceIds` / `BackupCurrent` / `RestoreOnly` / `KeepAlive`。
-- **通用参数**：`-TargetApp TraeWork|Trae|Doubao|WorkBuddy`、`-Json`、`-ProxyPort <int>`（C1：>0 时启动应用注入 `--proxy-server`）、`-IncludeIndexedDB`（C4：备份纳入 `Default/IndexedDB`）。
+- **通用参数**：`-TargetApp TraeWork|Trae|Doubao|WorkBuddy|CodeBuddy`、`-Json`、`-ProxyPort <int>`（C1：>0 时启动应用注入 `--proxy-server`）、`-IncludeIndexedDB`（C4：备份纳入 `Default/IndexedDB`）。CodeBuddy 为 authfile 布局：ProcNames 双形态 `CodeBuddy/CodeBuddy CN`、ProfilesDir=profiles_codebuddy、`~/.codebuddy` 无 account-snapshot 时确认步 skip+warn。
 - **精准备份**：仅复制 9 类核心登录文件（storage.json / state.vscdb / machineid / aha / Network 等），非全量镜像。
 - **Switch 流程**：预检查目标快照 → 关闭 Trae Work → 保存当前到 last + 当前账号槽位 → 恢复目标 → 启动。
 - **SaveCurrentLogin 流程**：关闭 Trae Work → 精准备份到 userId 槽位 → 启动。
