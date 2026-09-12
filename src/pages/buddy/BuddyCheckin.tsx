@@ -5,7 +5,7 @@ import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { WorkBuddyAccountView, WorkBuddySettings } from '../../types';
+import type { WbCheckinRecord, WorkBuddyAccountView, WorkBuddySettings } from '../../types';
 
 /**
  * buddy-checkin 签到与成长（§3.7.3，F-15/F-16/F-55）：
@@ -90,8 +90,10 @@ export default function BuddyCheckin() {
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<WbAccountLine[]>([]);
-  const [summary, setSummary] = useState<string | null>(null);
+  const [doneInfo, setDoneInfo] = useState<{ ok: number; already: number; failed: number } | null>(null);
   const [settings, setSettings] = useState<WorkBuddySettings | null>(null);
+  // 今日签到记录（user_id → 记录数组，供列表签到状态/获取积分列展示）
+  const [checkinMap, setCheckinMap] = useState<Map<string, WbCheckinRecord[]>>(new Map());
   const [growthRunning, setGrowthRunning] = useState(false);
   const [growthLines, setGrowthLines] = useState<WbGrowthLine[]>([]);
   const [growthSummary, setGrowthSummary] = useState<string | null>(null);
@@ -99,12 +101,26 @@ export default function BuddyCheckin() {
 
   const refresh = useCallback(async () => {
     try {
-      const [accs, st] = await Promise.all([
+      const [accs, st, recs] = await Promise.all([
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
         api.workbuddy.settingsGet().catch(() => null),
+        api.workbuddy
+          .checkinResults(1)
+          .catch(() => [] as WbCheckinRecord[]),
       ]);
       setAccounts(accs);
       setSettings(st);
+      // 仅保留今天的记录（days=1 会含昨日）
+      const today = new Date();
+      const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+      const m = new Map<string, WbCheckinRecord[]>();
+      for (const r of recs) {
+        if (r.date !== todayStr) continue;
+        const arr = m.get(r.user_id) ?? [];
+        arr.push(r);
+        m.set(r.user_id, arr);
+      }
+      setCheckinMap(m);
     } catch (err) {
       pushToast('error', `读取签到数据失败：${String(err)}`);
     }
@@ -125,7 +141,7 @@ export default function BuddyCheckin() {
           setGrowthRunning(true);
         } else {
           setLines([]);
-          setSummary(null);
+          setDoneInfo(null);
         }
       } else if ('type' in parsed && parsed.type === 'done') {
         if (parsed.mode === 'growth') {
@@ -134,7 +150,7 @@ export default function BuddyCheckin() {
           void refresh();
           pushToast('success', '成长中心执行完成（旅行/盲盒/任务结果见下方明细）');
         } else {
-          setSummary(`成功 ${parsed.ok} · 已签 ${parsed.already} · 失败 ${parsed.failed}`);
+          setDoneInfo({ ok: parsed.ok, already: parsed.already, failed: parsed.failed });
           setRunning(false);
           void refresh();
           pushToast(parsed.failed > 0 ? 'warn' : 'success', `WorkBuddy 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}`);
@@ -179,7 +195,7 @@ export default function BuddyCheckin() {
     }
     setRunning(true);
     setLines([]);
-    setSummary(null);
+    setDoneInfo(null);
     try {
       await api.workbuddy.checkinStart({ skip_checked_in: true, skip_expired: false });
     } catch (err) {
@@ -217,6 +233,26 @@ export default function BuddyCheckin() {
 
   // 本轮累计获得积分（汇总徽标展示；防浮点求和误差）
   const earned = Math.round(lines.reduce((s, l) => s + (l.reward ?? 0), 0) * 100) / 100;
+
+  // 实时结果按 user_id 索引（运行中覆盖列表列展示）
+  const liveById = new Map(lines.map((l) => [l.user_id, l] as const));
+  // 今日累计获取积分：成功记录求和（重试多轮累加；无成功记录时取最近一条含奖励记录）
+  const todayEarnedOf = (uid: string): number | null => {
+    const recs = checkinMap.get(uid) ?? [];
+    const sum = recs.reduce((s, r) => s + (r.status === 'success' && r.reward != null ? r.reward : 0), 0);
+    if (sum > 0) return Math.round(sum * 100) / 100;
+    return recs.find((r) => r.reward != null)?.reward ?? null; // recs 新→旧序，find 即最新
+  };
+  // 今日签到状态（无实时行时按记录推导：任一成功/已签 → 已签；否则最近一条失败）
+  const checkinStatusOf = (uid: string): 'success' | 'already' | 'fail' | null => {
+    const live = liveById.get(uid);
+    if (live) return live.status;
+    const recs = checkinMap.get(uid) ?? [];
+    if (recs.some((r) => r.status === 'success' || r.status === 'already')) {
+      return recs.some((r) => r.status === 'success') ? 'success' : 'already';
+    }
+    return recs.find((r) => r.status === 'fail') ? 'fail' : null; // 新→旧序，find 即最近一次失败
+  };
 
   return (
     <div className="animate-fade-in">
@@ -304,75 +340,117 @@ export default function BuddyCheckin() {
         )}
       </div>
 
-      {/* 一键签到卡（对齐 Trae 一键签到形态：账号列表表格 + 实时结果行 + 按钮右下角） */}
+      {/* 一键签到卡（对齐 Trae 一键签到形态：账号列表表格 + 按钮右下角；实时进度移到底部独立卡） */}
       <div className="mt-4 card p-4">
         <div className="mb-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span className="text-sm font-medium">一键签到</span>
             {running && <Badge tone="blue">执行中</Badge>}
-            {!running && summary && (
-              <Badge tone={summary.includes('失败 0') ? 'green' : 'amber'}>
-                {earned > 0 ? `${summary} · 获得 ${earned} 积分` : summary}
-              </Badge>
-            )}
           </div>
           {accounts.length > 0 && !running && (
             <span className="text-xs text-slate-400">已签账号自动跳过</span>
           )}
         </div>
 
-        {/* 参与签到的账号列表（列形态对齐 Trae：账号 / 登录态 / 版本 / 积分） */}
+        {/* 参与签到的账号列表（账号 / 登录态 / 会员等级 / 签到状态 / 获取积分 / 可用总积分） */}
         <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
           <table className="w-full text-sm">
             <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-zinc-900">
               <tr>
                 <th className="px-3 py-1.5 text-left">账号</th>
                 <th className="px-3 py-1.5 text-left">登录态</th>
-                <th className="px-3 py-1.5 text-left">版本</th>
-                <th className="px-3 py-1.5 text-right">积分</th>
+                <th className="px-3 py-1.5 text-left">会员等级</th>
+                <th className="px-3 py-1.5 text-left">签到状态</th>
+                <th className="px-3 py-1.5 text-right">获取积分</th>
+                <th className="px-3 py-1.5 text-right">可用总积分</th>
               </tr>
             </thead>
             <tbody>
               {accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={4} className="px-3 py-4 text-center text-xs text-slate-400">
+                  <td colSpan={6} className="px-3 py-4 text-center text-xs text-slate-400">
                     暂无账号：请先在「账号管理」导入本机账号
                   </td>
                 </tr>
               ) : (
-                accounts.map((a) => (
-                  <tr key={a.id} className="border-t border-slate-100 dark:border-zinc-800">
-                    <td className="px-3 py-1.5">
-                      <div className="font-medium">{a.nickname || a.uid}</div>
-                      <div className="text-xs text-slate-400">{a.phone_masked || a.id}</div>
-                    </td>
-                    <td className="px-3 py-1.5"><MiniTokenBadge a={a} /></td>
-                    <td className="px-3 py-1.5 text-xs text-slate-500">
-                      {a.edition_type ? (
-                        a.edition_type.toLowerCase() === 'pro' ? (
-                          <span className="font-medium text-sky-600 dark:text-sky-400">{a.edition_type}</span>
+                accounts.map((a) => {
+                  const st = checkinStatusOf(a.id);
+                  const earn = liveById.get(a.id)?.reward ?? todayEarnedOf(a.id);
+                  return (
+                    <tr key={a.id} className="border-t border-slate-100 dark:border-zinc-800">
+                      <td className="px-3 py-1.5">
+                        <div className="font-medium">{a.nickname || a.uid}</div>
+                        <div className="text-xs text-slate-400">{a.phone_masked || a.id}</div>
+                      </td>
+                      <td className="px-3 py-1.5"><MiniTokenBadge a={a} /></td>
+                      <td className="px-3 py-1.5 text-xs text-slate-500">
+                        {a.edition_type ? (
+                          a.edition_type.toLowerCase() === 'pro' ? (
+                            <span className="font-medium text-sky-600 dark:text-sky-400">{a.edition_type}</span>
+                          ) : (
+                            a.edition_type
+                          )
                         ) : (
-                          a.edition_type
-                        )
-                      ) : !a.has_credential ? (
-                        <span className="text-amber-500">无凭证</span>
-                      ) : (
-                        '未知版本'
-                      )}
-                    </td>
-                    <td className="px-3 py-1.5 text-right tabular-nums text-xs">
-                      {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
-                    </td>
-                  </tr>
-                ))
+                          <span className="text-slate-300 dark:text-zinc-600">—</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-1.5">
+                        {st == null ? (
+                          <Badge tone="slate">未签</Badge>
+                        ) : st === 'success' ? (
+                          <Badge tone="green">已签</Badge>
+                        ) : st === 'already' ? (
+                          <Badge tone="blue">已签（此前已签）</Badge>
+                        ) : (
+                          <Badge tone="red">失败</Badge>
+                        )}
+                      </td>
+                      <td className="px-3 py-1.5 text-right tabular-nums text-xs">
+                        {earn != null ? (
+                          <span className="text-emerald-600 dark:text-emerald-400">+{earn}</span>
+                        ) : (
+                          <span className="text-slate-300 dark:text-zinc-600">—</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-1.5 text-right tabular-nums text-xs">
+                        {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
         </div>
 
-        {/* 实时结果行（对齐 Trae 实时进度行形态：图标 + 序号 + 账号 + 结果文案） */}
-        {lines.length > 0 && (
-          <div className="mt-3 space-y-1">
+        {/* 操作区：按钮右下角（对齐 Trae） */}
+        <div className="mt-3 flex items-center justify-between">
+          <span className="text-xs text-slate-400">
+            {running ? '签到进行中，逐账号结果见下方实时进度…' : '签到结果与获取积分将展示在下方实时进度卡'}
+          </span>
+          <button className="btn-outline" onClick={() => void startCheckin()} disabled={running}>
+            <PlayCircle size={15} /> {running ? '签到中…' : '开始签到'}
+          </button>
+        </div>
+      </div>
+
+      {/* 实时进度卡（对齐 Trae：标题 + 汇总徽标 + 逐账号结果行；结束后保留避免提示一闪而过） */}
+      {(running || lines.length > 0) && (
+        <div className="mt-4 card p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="font-medium">实时进度</h3>
+            <div className="flex items-center gap-3">
+              {running ? (
+                <Badge tone="blue">运行中</Badge>
+              ) : doneInfo ? (
+                <Badge tone={doneInfo.failed > 0 ? 'amber' : 'green'}>
+                  完成：成功 {doneInfo.ok} · 已签 {doneInfo.already} · 失败 {doneInfo.failed}
+                  {earned > 0 && ` · 获得 ${earned} 积分`}
+                </Badge>
+              ) : null}
+            </div>
+          </div>
+          <div className="space-y-1">
             {lines.map((l, i) => {
               const tone =
                 l.status === 'success'
@@ -386,30 +464,20 @@ export default function BuddyCheckin() {
                   <Icon size={14} className={tone} />
                   <span className="w-8 text-right text-xs text-slate-400">{l.index}</span>
                   <span className="flex-1 truncate">{l.name || l.user_id}</span>
+                  <span className={`max-w-[50%] truncate text-xs ${tone}`} title={l.message}>
+                    {l.status === 'success' ? (l.message || '签到成功') : (l.message || statusText[l.status])}
+                  </span>
                   {l.reward != null && (
-                    <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-300">
-                      +{l.reward} 积分
+                    <span className="shrink-0 rounded bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-300">
+                      获取积分 +{l.reward}
                     </span>
                   )}
-                  <span className={`max-w-[50%] truncate text-xs ${tone}`} title={l.message}>
-                    {statusText[l.status] === '成功' ? (l.message || '签到成功') : (l.message || statusText[l.status])}
-                  </span>
                 </div>
               );
             })}
           </div>
-        )}
-
-        {/* 操作区：按钮右下角（对齐 Trae） */}
-        <div className="mt-3 flex justify-end">
-          <button className="btn-outline" onClick={() => void startCheckin()} disabled={running}>
-            <PlayCircle size={15} /> {running ? '签到中…' : '开始签到'}
-          </button>
         </div>
-        {running && (
-          <div className="mt-1 text-right text-xs text-slate-500">签到进行中，逐账号结果将在上方实时刷新…</div>
-        )}
-      </div>
+      )}
     </div>
   );
 }

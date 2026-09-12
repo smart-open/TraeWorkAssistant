@@ -110,7 +110,7 @@ export default function BuddyCredits() {
           {/* KPI 卡（对齐 Trae 积分看板：5 卡） */}
           <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
             <StatCard
-              label="总剩余积分"
+              label="可用积分总数"
               value={total.toFixed(2)}
               hint={result?.cached ? '缓存数据（≥5 分钟）' : '实时数据'}
               tone="violet"

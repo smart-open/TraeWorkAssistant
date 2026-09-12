@@ -325,6 +325,9 @@ pub struct ApiPoolFile {
     /// 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c
     #[serde(default)]
     pub strategy: String,
+    /// Buddy 池调度策略（取值同上）；空 = 沿用 strategy（兼容旧数据两池同策略）
+    #[serde(default)]
+    pub wb_strategy: String,
     /// 参与调度的分组 id 列表；空 = 不限分组
     #[serde(default)]
     pub group_ids: Vec<String>,

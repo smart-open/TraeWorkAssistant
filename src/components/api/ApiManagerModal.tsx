@@ -1,7 +1,8 @@
 /**
  * 全局 API 管理弹窗（unified-api-gateway-design §5.2，Phase 2）
- * Modal（max-w-[76.8rem]，较原 max-w-5xl 整体放大 1/5）+ Tab 分区【概览｜接口配置｜API Keys 管理｜用量统计】，默认概览；
- * 头部常驻 GatewayHeader（启停 + 指标行），Tab 切换不消失；任意 activeApp 视图均可打开。
+ * Modal（max-w-[76.8rem]，较原 max-w-5xl 整体放大 1/5）+ Tab 分区【概览｜接口配置｜API Keys 管理｜用量统计｜自定义模型｜生态接入】，
+ * 默认概览；头部常驻 GatewayHeader（启停 + 指标行），Tab 切换不消失；任意 activeApp 视图均可打开。
+ * 概览 Tab 为资源总览 + 调度策略中心；生态接入（CC Switch 注册）独立成 Tab。
  * 豆包视图：概览 Tab 顶部提示「豆包不提供网关资源，以下为 Trae / Buddy 资源池」。
  * 子弹框（子 Key 配置/删除确认）沿用 Modal 组件叠加，z 序高于主弹窗。
  */
@@ -17,7 +18,7 @@ import EcoAccess from './EcoAccess';
 import ResourceSummary from './ResourceSummary';
 import UsageStatsPanel from './UsageStatsPanel';
 
-type TabKey = 'overview' | 'config' | 'keys' | 'usage' | 'custom';
+type TabKey = 'overview' | 'config' | 'keys' | 'usage' | 'custom' | 'eco';
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
@@ -25,6 +26,7 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: 'keys', label: 'API Keys 管理' },
   { key: 'usage', label: '用量统计' },
   { key: 'custom', label: '自定义模型' },
+  { key: 'eco', label: '生态接入' },
 ];
 
 export default function ApiManagerModal() {
@@ -80,12 +82,7 @@ export default function ApiManagerModal() {
       {/* Tab 内容（固定高度内部滚动，头部与 Tab 栏常驻；切换 Tab 高度不变，接口配置等长内容走内部滚动。
           高度推导：(100vh-330px)*1.2 - 500px = 120vh - 896px） */}
       <div className="mt-3 h-[calc(120vh_-_896px)] min-h-[288px] overflow-y-auto pr-0.5">
-        {tab === 'overview' && (
-          <div className="space-y-4">
-            <ResourceSummary />
-            <EcoAccess />
-          </div>
-        )}
+        {tab === 'overview' && <ResourceSummary />}
         {tab === 'config' && <InterfaceConfig />}
         {tab === 'keys' && (
           <ApiKeysManager onSubModalChange={(v) => { subOpenRef.current = v; }} />
@@ -94,6 +91,7 @@ export default function ApiManagerModal() {
         {tab === 'custom' && (
           <CustomModelsPanel onSubModalChange={(v) => { subOpenRef.current = v; }} />
         )}
+        {tab === 'eco' && <EcoAccess />}
       </div>
     </Modal>
   );

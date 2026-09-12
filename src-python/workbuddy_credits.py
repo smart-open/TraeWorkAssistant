@@ -44,11 +44,26 @@ def _num(v):
     return None
 
 
-def _iso_to_ts(v):
-    """DeductionEndTime ISO 字符串 → Unix 秒（解析失败 None）"""
-    if not isinstance(v, str) or not v:
+def _to_ts(v):
+    """到期字段宽容归一 → Unix 秒（解析失败 None）。
+    兼容：ISO 字符串（含 Z / 空格分隔 / 日期分隔符变体）、纯日期、
+    数字或数字字符串时间戳（毫秒 ≥1e12 自动除 1000）。"""
+    if v is None or isinstance(v, bool):
         return None
-    s = v.replace("Z", "+00:00")
+    # 数字时间戳（毫秒/秒自适应）
+    n = _num(v)
+    if n is not None:
+        if n >= 1e12:  # 毫秒
+            return int(n / 1000)
+        if n >= 1e9:   # 秒
+            return int(n)
+        return None    # 过小（如剩余量）不是时间戳
+    if not isinstance(v, str) or not v.strip():
+        return None
+    s = v.strip().replace("Z", "+00:00").replace("/", "-")
+    # 纯日期 YYYY-MM-DD → 当天 23:59:59（本地时区），避免凌晨 0 点误报"已过期"
+    if len(s) == 10 and s.count("-") == 2:
+        s += " 23:59:59"
     try:
         dt = datetime.datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -56,6 +71,10 @@ def _iso_to_ts(v):
         return int(dt.timestamp())
     except ValueError:
         return None
+
+
+# 兼容旧名（外部可能引用）
+_iso_to_ts = _to_ts
 
 
 def _total_of(pkg):
@@ -114,9 +133,12 @@ def _packages_from(body):
             continue
         name = wb.dig(item, "PackageName", "packageName", "Name", "name",
                       "ProductCode", "description")
+        # 到期字段宽容链：ISO/时间戳均可（_to_ts 归一），毫秒时间戳自动识别
         end_raw = wb.dig(item, "DeductionEndTime", "deductionEndTime",
-                         "PackageEndTime", "EndTime", "expireTime")
-        end_ts = _iso_to_ts(end_raw if isinstance(end_raw, str) else None)
+                         "PackageEndTime", "packageEndTime",
+                         "EndTime", "endTime", "expireTime", "expireAt",
+                         "ExpireTime", "expire_time", "expiredAt", "ExpiredTime")
+        end_ts = _to_ts(end_raw)
         used = _num(wb.dig(item, "UsedCapacity", "used", "Used"))
         out.append({
             "name": str(name) if name else "积分包",

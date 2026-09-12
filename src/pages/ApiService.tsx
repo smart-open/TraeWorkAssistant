@@ -43,7 +43,6 @@ export default function ApiService() {
   const [status, setStatus] = useState<ApiServiceStatus | null>(null);
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
-  const [poolStrategy, setPoolStrategy] = useState('expire_first');
   const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [savingPool, setSavingPool] = useState(false);
@@ -147,7 +146,6 @@ export default function ApiService() {
     try {
       const pool = await withMinDelay(api.apiServer.poolList());
       setEnabledUids(new Set(pool.enabled_uids));
-      setPoolStrategy(pool.strategy || 'expire_first');
       setPoolGroups(new Set(pool.group_ids ?? []));
     } catch {
       // 初始化加载失败静默保留空列表；手动点击刷新失败需给出提示
@@ -215,7 +213,8 @@ export default function ApiService() {
   const savePool = async () => {
     setSavingPool(true);
     try {
-      await withMinDelay(api.apiServer.poolSet([...enabledUids], poolStrategy, [...poolGroups]));
+      // 调度策略已收口至全局 API 管理「调度策略中心」，本页只保存成员/分组（未传字段后端保留原值）
+      await withMinDelay(api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups]));
       toast('success', '账号池已更新');
       if (status?.running) {
         toast('info', '需重启 API 服务以应用变更');
@@ -413,20 +412,8 @@ export default function ApiService() {
             </p>
           ) : (
             <>
-              {/* 调度策略 + 分组筛选（T10，保存后需重启 API 服务生效） */}
+              {/* 分组筛选（T10，保存后需重启 API 服务生效）；调度策略已收口至全局 API 管理调度策略中心 */}
               <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
-                <div className="flex items-center gap-2">
-                  <label className="shrink-0 text-xs text-slate-500 dark:text-zinc-400">调度策略</label>
-                  <select
-                    className="h-7 flex-1 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-                    value={poolStrategy}
-                    onChange={(e) => setPoolStrategy(e.target.value)}
-                  >
-                    <option value="expire_first">积分先过期优先（默认）</option>
-                    <option value="credit_first">剩余积分多优先</option>
-                    <option value="random">随机</option>
-                  </select>
-                </div>
                 {groups.length > 0 && (
                   <div className="flex items-start gap-2">
                     <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">
@@ -468,7 +455,8 @@ export default function ApiService() {
                   </div>
                 )}
                 <p className="text-xs text-slate-400 dark:text-zinc-500">
-                  分组筛选与调度策略作用于网关取号范围，保存后需重启 API 服务生效；不选分组 = 全部参与
+                  分组筛选作用于网关取号范围，保存后需重启 API 服务生效；不选分组 = 全部参与。
+                  调度策略（池间 / 池内）请在全局 API 管理「资源总览 → 调度策略中心」配置。
                 </p>
               </div>
 

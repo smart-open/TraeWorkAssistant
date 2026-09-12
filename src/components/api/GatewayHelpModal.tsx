@@ -1,7 +1,9 @@
 /**
  * 全局 API 管理 · 网关使用帮助弹窗（GatewayHeader 帮助图标入口）
- * 左侧使用说明（端点 / 鉴权 / cURL 示例，与 InterfaceConfig 文案一致）+
+ * 左侧使用说明（端点 / 鉴权 / cURL 示例 / 资源调度说明，与 InterfaceConfig 文案一致）+
  * 右侧当前支持模型列表（供应商 / 模型名称 / 倍率 / 支持图片 / 来源池，带搜索过滤）。
+ * 资源调度说明覆盖三层语义：自定义直达 → 池间选池（smart/priority+回退）→ 池内取号，
+ * 并指向「资源总览 → 调度策略中心」调整入口（任务7）。
  * 数据源：unified_models（实时聚合 Trae / Buddy / 自定义 三池）+ gateway_settings_get（端口）。
  */
 import { useEffect, useMemo, useState } from 'react';
@@ -142,9 +144,27 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
             </code>
           </div>
 
-          <p className="text-[11px] leading-relaxed text-slate-400 dark:text-zinc-500">
-            调度说明：双源模型按「池间调度策略」选池（默认智能调度：积分先到期 → 免费/低倍率 → 积分多）；自定义模型命中即直达，不参与跨池回退。
-          </p>
+          <div className="rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-800/50">
+            <p className="mb-2 font-medium text-slate-700 dark:text-zinc-200">资源调度说明</p>
+            <div className="space-y-1.5 leading-relaxed text-slate-500 dark:text-zinc-400">
+              <p>
+                <span className="font-medium text-slate-600 dark:text-zinc-300">自定义模型：</span>
+                模型名命中启用条目即直达该上游（上游自有计费），不参与跨池回退。
+              </p>
+              <p>
+                <span className="font-medium text-slate-600 dark:text-zinc-300">双源模型（Trae/Buddy 同名）：</span>
+                按「池间调度策略」选池——智能调度（默认）按 积分先到期 → 免费/低倍率 → 积分多 排序，全并列时按池优先级序；
+                固定优先级按序取首选可用池；可选「首选池不可用时跨池回退」。仅单源可用时直接路由该池。
+              </p>
+              <p>
+                <span className="font-medium text-slate-600 dark:text-zinc-300">池内取号：</span>
+                Trae 池 / Buddy 池各自独立配置策略（默认积分先过期优先，可选 余额多优先 / 随机 / 三因子加权 / P2C）。
+              </p>
+              <p className="text-slate-400 dark:text-zinc-500">
+                调整入口：「资源总览」Tab → 调度策略中心（内置最佳组合预设一键应用，运行中网关即时生效，无需重启）。
+              </p>
+            </div>
+          </div>
         </div>
 
         {/* 右：支持模型列表 */}

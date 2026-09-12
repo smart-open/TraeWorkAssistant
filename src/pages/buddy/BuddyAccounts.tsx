@@ -26,6 +26,7 @@ import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import type {
+  WbCheckinRecord,
   WorkBuddyAccountView,
   WbCreditPackage,
   WbCreditsResult,
@@ -67,6 +68,8 @@ export default function BuddyAccounts() {
   const savingLogin = useAppStore((s) => s.savingLogin);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [credits, setCredits] = useState<Map<string, WbCreditPackage[]>>(new Map());
+  // 今日签到状态（user_id → 最新一条记录；success/already=已签，fail=失败，无=未签）
+  const [checkinMap, setCheckinMap] = useState<Map<string, WbCheckinRecord>>(new Map());
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [scanPreview, setScanPreview] = useState<{ nickname: string; uid: string; exists: boolean } | null>(null);
@@ -115,6 +118,20 @@ export default function BuddyAccounts() {
           setCredits(m);
         })
         .catch(() => pushToast('warn', '积分缓存查询失败，积分包列为空'));
+      // 今日签到状态（失败静默，不阻断列表）
+      api.workbuddy
+        .checkinResults(1)
+        .then((recs: WbCheckinRecord[]) => {
+          const today = new Date();
+          const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+          const m = new Map<string, WbCheckinRecord>();
+          for (const r of recs) {
+            if (r.date !== todayStr) continue; // days=1 含昨日，仅保留今天
+            if (!m.has(r.user_id)) m.set(r.user_id, r); // 接口返回新→旧序，首见 = 最新一条
+          }
+          setCheckinMap(m);
+        })
+        .catch(() => setCheckinMap(new Map()));
     } catch (err) {
       pushToast('error', `读取账号失败：${String(err)}`);
     } finally {
@@ -444,10 +461,11 @@ export default function BuddyAccounts() {
             <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
               <tr>
                 <th className="px-4 py-2 text-left">账号</th>
-                <th className="px-4 py-2 text-left">版本</th>
+                <th className="px-4 py-2 text-left">会员等级</th>
                 <th className="px-4 py-2 text-right">可用积分</th>
                 <th className="px-4 py-2 text-left">token 到期</th>
                 <th className="px-4 py-2 text-left">积分包</th>
+                <th className="px-4 py-2 text-left">签到状态</th>
                 <th className="px-4 py-2 text-left">状态</th>
                 <th className="px-4 py-2 text-right">操作</th>
               </tr>
@@ -473,12 +491,8 @@ export default function BuddyAccounts() {
                     <td className="px-4 py-3">
                       {a.edition_type ? (
                         <Badge tone={a.edition_type.toLowerCase() === 'pro' ? 'blue' : 'slate'}>{a.edition_type}</Badge>
-                      ) : !a.has_credential ? (
-                        <Badge tone="amber">无凭证</Badge>
-                      ) : a.phone_masked ? (
-                        <span className="font-mono text-xs text-slate-400">{a.phone_masked}</span>
                       ) : (
-                        <span className="text-xs text-slate-300">未知版本</span>
+                        <span className="text-xs text-slate-300 dark:text-zinc-600">—</span>
                       )}
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums">
@@ -501,6 +515,15 @@ export default function BuddyAccounts() {
                       ) : (
                         <span className="text-xs text-slate-300">-</span>
                       )}
+                    </td>
+                    <td className="px-4 py-3">
+                      {(() => {
+                        const rec = checkinMap.get(a.id);
+                        if (!rec) return <Badge tone="slate">未签</Badge>;
+                        if (rec.status === 'fail') return <Badge tone="red">签到失败</Badge>;
+                        if (rec.status === 'already') return <Badge tone="blue">已签（本轮已签）</Badge>;
+                        return <Badge tone="green">已签{rec.reward != null ? ` +${rec.reward}` : ''}</Badge>;
+                      })()}
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1">

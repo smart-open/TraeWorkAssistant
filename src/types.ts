@@ -416,6 +416,8 @@ export interface ApiPoolFile {
   enabled_uids: string[];
   /** 调度策略：expire_first（默认）/ credit_first / random（T10） */
   strategy?: string;
+  /** Buddy 池调度策略（取值同 strategy）；空 = 跟随 Trae 池（两池同策略） */
+  wb_strategy?: string;
   /** 参与调度的分组 id 列表；空 = 不限分组（T10） */
   group_ids?: string[];
   /** WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池 */
