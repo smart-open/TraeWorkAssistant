@@ -1,7 +1,7 @@
 //! 文件读写工具：原子替换 + 容错加载 + 时间辅助。
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 读取 JSON，文件不存在或解析失败返回默认值。
 pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
@@ -9,6 +9,60 @@ pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
         Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).unwrap_or_default(),
         _ => T::default(),
     }
+}
+
+// ── mtime 校验的 JSON 解析缓存（调度热路径磁盘读优化）────────────────────────
+// resolve_target 每请求读约 4 份小 JSON（dispatch_policy / wb_model_route /
+// wb_model_catalog / api_models），重复读盘 + 解析开销大。
+// 策略：mtime + size 均未变化 → 直接克隆缓存中的已解析值（免 IO 免解析）；
+// write_json 写成功后逐出对应条目（应用内写入立即生效），外部编辑靠 mtime/size 变化兜底。
+
+type JsonCacheVal = Box<dyn std::any::Any + Send + Sync>;
+type JsonCache = std::collections::HashMap<PathBuf, (std::time::SystemTime, u64, JsonCacheVal)>;
+
+fn json_cache() -> &'static std::sync::Mutex<JsonCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<JsonCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 带解析缓存的 JSON 读取：文件缺失 / 为空 / 解析失败返回 None，兜底语义由调用方决定。
+/// 供只读热路径使用（调度分流、目录聚合等）；命中时克隆已解析值——
+/// 小结构克隆成本远低于磁盘 IO + 解析。同一路径请保持请求类型一致（缓存按类型下溯）。
+pub fn read_json_cached<T>(path: &Path) -> Option<T>
+where
+    T: serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let len = meta.len();
+    {
+        let map = json_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((m, l, val)) = map.get(path) {
+            if *m == mtime && *l == len {
+                if let Some(v) = val.downcast_ref::<T>() {
+                    return Some(v.clone());
+                }
+            }
+        }
+    }
+    let text = fs::read_to_string(path).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let value: T = serde_json::from_str(&text).ok()?;
+    json_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), (mtime, len, Box::new(value.clone())));
+    Some(value)
+}
+
+/// 逐出路径对应的缓存条目（write_json 成功后调用）
+fn evict_json_cache(path: &Path) {
+    json_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
 }
 
 /// 原子写：先写临时文件再 rename，避免断电损坏。
@@ -26,6 +80,7 @@ pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), Str
         f.flush().map_err(|e| format!("刷新失败: {e}"))?;
     }
     fs::rename(&tmp, path).map_err(|e| format!("替换文件失败: {e}"))?;
+    evict_json_cache(path);
     Ok(())
 }
 
@@ -136,5 +191,34 @@ fn dig_key<'a>(v: &'a serde_json::Value, key: &str, depth: usize) -> Option<&'a 
             .iter()
             .find_map(|item| dig_key(item, key, depth + 1)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 解析缓存契约：读取缓存生效；write_json 逐出后立即可见新值；损坏/缺失返回 None
+    #[test]
+    fn cached_read_reflects_writes_and_missing_files() {
+        let dir = std::env::temp_dir().join(format!("twa_fscache_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("cache_probe.json");
+        #[derive(serde::Deserialize, Clone, PartialEq, Debug)]
+        struct V {
+            v: i32,
+        }
+        std::fs::write(&p, r#"{"v":1}"#).unwrap();
+        assert_eq!(read_json_cached::<V>(&p), Some(V { v: 1 }));
+        // 应用内写入（write_json）逐出缓存 → 立即读到新值
+        write_json(&p, &serde_json::json!({"v": 2})).unwrap();
+        assert_eq!(read_json_cached::<V>(&p), Some(V { v: 2 }));
+        // 文件损坏 → None（不缓存毒值，调用方走自愈/兜底）
+        std::fs::write(&p, "not-json").unwrap();
+        assert_eq!(read_json_cached::<V>(&p), None);
+        // 文件缺失 → None
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(read_json_cached::<V>(&p), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

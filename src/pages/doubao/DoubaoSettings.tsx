@@ -239,7 +239,7 @@ export default function DoubaoSettings() {
           <button onClick={() => void detect()} disabled={detecting} className="btn-outline shrink-0">
             <FolderSearch size={15} /> {detecting ? '检测中…' : '自动检测'}
           </button>
-          <button onClick={() => void save()} disabled={saving} className="btn-primary shrink-0">
+          <button onClick={() => void save()} disabled={saving} className="btn-outline shrink-0">
             <Save size={15} /> {saving ? '保存中…' : '保存'}
           </button>
         </div>
@@ -303,7 +303,7 @@ export default function DoubaoSettings() {
           {/* 手动巡检 */}
           <div className="flex flex-wrap items-center gap-2">
             <span className="shrink-0 text-slate-500">手动巡检</span>
-            <button onClick={() => void runRenew(false)} disabled={running} className="btn-primary shrink-0">
+            <button onClick={() => void runRenew(false)} disabled={running} className="btn-outline shrink-0">
               <ShieldCheck size={14} /> {running ? '巡检中…' : '探活巡检'}
             </button>
             <button onClick={() => void runRenew(true)} disabled={running} className="btn-outline shrink-0">

@@ -117,13 +117,15 @@ pub fn builtin() -> Vec<WbModel> {
     ]
 }
 
-/// 目录文件路径（data/wb_model_catalog.json，§3.8）
+/// 目录文件路径（data/wb_model_catalog.json，§3.8）。
+/// 数据文件统一 data/ 子目录（与 api_models/api_keys/api_usage 同层）；
+/// Buddy 侧不保历史（§9.4 #7）：旧根目录位置不迁移，缺失即内置兜底重建
 pub fn catalog_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("wb_model_catalog.json")
+    data_dir.join("data").join("wb_model_catalog.json")
 }
 
 /// 目录文件结构（支持上游动态替换后的全量覆盖）
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WbCatalogFile {
     #[serde(default)]
     pub models: Vec<WbModel>,
@@ -135,9 +137,12 @@ pub struct WbCatalogFile {
 /// 缺失或为空时落盘内置表并返回内置表
 pub fn load(data_dir: &Path) -> Vec<WbModel> {
     let path = catalog_path(data_dir);
-    let file: WbCatalogFile = crate::fs_utils::read_json(&path);
-    if !file.models.is_empty() {
-        return file.models;
+    // 带解析缓存（每请求热路径）：write_json 逐出 + mtime 兜底保证新鲜；
+    // 缓存未命中/缺失/为空才走内置表落盘自愈
+    if let Some(file) = crate::fs_utils::read_json_cached::<WbCatalogFile>(&path) {
+        if !file.models.is_empty() {
+            return file.models;
+        }
     }
     let builtin = builtin();
     let _ = crate::fs_utils::write_json(

@@ -86,6 +86,8 @@ interface AppState {
   profileApp: 'TraeWork' | 'Trae';
   /** 本机两个 Trae 应用当前登录账号的套餐信息（storage.json 明文，零 API） */
   localEntitlement: LocalEntitlement | null;
+  /** 全局 API 管理弹窗（unified-api-gateway-design §5.2；任意 activeApp 视图均可打开） */
+  showApiManager: boolean;
 
   init: () => Promise<void>;
   setView: (v: ViewKey) => void;
@@ -106,6 +108,7 @@ interface AppState {
   refreshProfiles: () => Promise<void>;
   setProfileApp: (app: 'TraeWork' | 'Trae') => Promise<void>;
   refreshLocalEntitlement: () => Promise<void>;
+  setShowApiManager: (v: boolean) => void;
 
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
@@ -171,6 +174,8 @@ function defaultSettings(): Settings {
     doubao_quota_url: 'https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/',
     doubao_snapshot_include_idb: false,
     workbuddy_path: null,
+    codebuddy_path: null,
+    wb_auth_file_path: null,
     data_dir: null,
     log_retention_days: 30,
     proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com',
@@ -216,6 +221,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   profileActive: false,
   profileApp: 'TraeWork',
   localEntitlement: null,
+  showApiManager: false,
 
   init: async () => {
     // StrictMode 下 effect 会执行两次：先注销旧监听，避免重复注册导致事件触发两次（如 captured 重复 +1、toast 双发）
@@ -326,6 +332,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setView: (v) => set({ view: v }),
   setActiveApp: (app) => set({ activeApp: app, view: APP_HOME_VIEW[app] }),
+  setShowApiManager: (v) => set({ showApiManager: v }),
 
   applyCheckinEvent: (e) => {
     set((s) => {

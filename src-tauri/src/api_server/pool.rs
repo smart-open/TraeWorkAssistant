@@ -503,6 +503,16 @@ impl ApiPool {
         safe_lock(&self.entries).len()
     }
 
+    /// 池内是否存在可选账号（healthy + 非零积分 + 未过期）。
+    /// 统一调度选池健康预检用（§4.1 ④）；不含 Key 级白名单/专一约束——
+    /// 那由各执行路径取号时自理，预检仅覆盖"池整体耗尽"场景
+    pub fn has_selectable(&self) -> bool {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let tried = HashSet::new();
+        entries.values().any(|e| selectable(e, &tried, now))
+    }
+
     /// 诊断：返回所有账号被过滤的原因（用于 "no healthy account" 排查）
     pub fn diagnose(&self) -> Vec<PoolDiagnosis> {
         let entries = safe_lock(&self.entries);

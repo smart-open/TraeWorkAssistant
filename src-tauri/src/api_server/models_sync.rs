@@ -8,16 +8,29 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::fs_utils;
 use crate::models::{AccountsFile, DeviceMap};
 
-/// 单个模型选项：id = 上游 config_name（原样透传），label = 官方展示名
+/// 单个模型选项：id = 上游 config_name（原样透传），label = 官方展示名。
+/// 扩展字段（统一网关 §3.4，serde default 兼容旧文件——存量 api_models.json
+/// 仅 {id,label} 原样读取，不重写不丢失 §9.6）：
+/// - `rate`：官网同步解析的积分倍率（L2，§3.2；字段名以实际响应为准，
+///   宽容解析失败置 None → 聚合层自动落 L3/L4，不阻塞）
+/// - `context_length / efforts / supports_image`：同上 L2 语义
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelOption {
     pub id: String,
     pub label: String,
+    #[serde(default)]
+    pub rate: Option<f64>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    #[serde(default)]
+    pub supports_image: Option<bool>,
 }
 
 /// 配置接口不返回、但客户端内置可用的模型（id, label），同步时保位插入
@@ -57,6 +70,11 @@ pub fn default_models() -> Vec<ModelOption> {
         .map(|(id, label)| ModelOption {
             id: id.to_string(),
             label: label.to_string(),
+            // 默认列表不预置元数据：交由统一目录聚合层的 L3/L4 兜底（§3.2）
+            rate: None,
+            context_length: None,
+            efforts: Vec::new(),
+            supports_image: None,
         })
         .collect()
 }
@@ -85,6 +103,13 @@ fn data_file(data_dir: &Path, name: &str) -> std::path::PathBuf {
 /// 文件损坏（JSON 解析失败）：记录日志、备份为 .bak 后写入默认列表自愈，不静默。
 pub fn load_models(data_dir: &Path) -> Vec<ModelOption> {
     let path = models_file(data_dir);
+    // 热路径解析缓存（调度每请求读取）：mtime 未变 → 直接复用已解析列表，
+    // 免 IO 免解析；未命中/缺失/为空/损坏再走下方读取自愈流程
+    if let Some(list) = fs_utils::read_json_cached::<Vec<ModelOption>>(&path) {
+        if !list.is_empty() {
+            return list;
+        }
+    }
     // Ok(Some(list)) 读取成功；Ok(None) 文件缺失或空列表；Err(原因) 文件存在但损坏
     let read_list = |p: &Path| -> Result<Option<Vec<ModelOption>>, String> {
         let text = match std::fs::read_to_string(p) {
@@ -177,7 +202,17 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
                     .map_or(false, |i| i > pos)
             })
             .unwrap_or(fetched.len());
-        fetched.insert(insert_at, ModelOption { id: extra.to_string(), label });
+        fetched.insert(
+            insert_at,
+            ModelOption {
+                id: extra.to_string(),
+                label,
+                rate: None,
+                context_length: None,
+                efforts: Vec::new(),
+                supports_image: None,
+            },
+        );
     }
     let rank = |id: &str| {
         defaults
@@ -302,6 +337,95 @@ fn into_string(r: ureq::Response) -> Result<String, String> {
         .map_err(|e| format!("读取响应失败: {e}"))
 }
 
+/// 宽容取值：候选键逐个探测（数值），任一命中即返回（L2 字段名待抓包确认 §3.2）
+fn dig_f64(v: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|k| {
+        v.get(*k)
+            .and_then(|x| x.as_f64())
+            .or_else(|| v.get(*k).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()))
+    })
+}
+
+fn dig_u64(v: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| {
+        v.get(*k)
+            .and_then(|x| x.as_u64())
+            .or_else(|| v.get(*k).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()))
+    })
+}
+
+fn dig_bool(v: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|k| v.get(*k).and_then(|x| x.as_bool()))
+}
+
+fn dig_strs(v: &Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|k| {
+            v.get(*k)
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|a| !a.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+/// 档位语义序（与 wb_catalog::resolve_effort 的 rank 一致）；未知档位排最后。
+/// 字母序会把 {low,medium,high} 排成 high/low/medium，破坏展示与降级语义
+fn effort_rank(e: &str) -> usize {
+    ["minimal", "low", "medium", "high", "xhigh", "max"]
+        .iter()
+        .position(|o| *o == e)
+        .unwrap_or(usize::MAX)
+}
+
+/// L2 运营字段提取（batch_get_detail_param 条目）：倍率/上下文/档位/图片。
+/// 字段名以实际响应为准——候选键宽容解析，全部未命中置 None/空 → 聚合层落 L3/L4 兜底，
+/// 不阻塞同步主流程（§3.2 ADR）
+fn extract_meta(ci: &Value) -> (Option<f64>, Option<u64>, Vec<String>, Option<bool>) {
+    let rate = dig_f64(
+        ci,
+        &["rate", "credit_rate", "creditRate", "ratio", "price", "price_rate"],
+    )
+    .or_else(|| {
+        ci.get("display_config")
+            .and_then(|d| dig_f64(d, &["rate", "ratio", "price"]))
+    });
+    let context_length = dig_u64(
+        ci,
+        &[
+            "context_length",
+            "contextLength",
+            "context_window",
+            "contextWindow",
+            "max_context_tokens",
+        ],
+    );
+    let mut efforts = dig_strs(
+        ci,
+        &["efforts", "supported_efforts", "supportedEfforts", "thinking_modes"],
+    )
+    .into_iter()
+    .map(|e| e.to_lowercase())
+    .collect::<Vec<_>>();
+    efforts.sort_by_key(|e| effort_rank(e));
+    efforts.dedup();
+    let supports_image = dig_bool(ci, &["supports_image", "supportsImage", "image_input", "imageInput"])
+        .or_else(|| {
+            dig_strs(
+                ci,
+                &["modalities", "input_modalities", "inputModalities"],
+            )
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case("image") || m.eq_ignore_ascii_case("image_url"))
+            .then_some(true)
+        });
+    (rate, context_length, efforts, supports_image)
+}
+
 /// 解析 batch_get_detail_param 响应：跨 function 合并可见、非内部的模型，去重
 fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
     let root: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("解析失败: {e}"))?;
@@ -371,9 +495,14 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
                 }
                 None => {
                     seen.insert(id.to_string(), has_dev);
+                    let (rate, context_length, efforts, supports_image) = extract_meta(ci);
                     result.push(ModelOption {
                         id: id.to_string(),
                         label: label.to_string(),
+                        rate,
+                        context_length,
+                        efforts,
+                        supports_image,
                     });
                 }
             }
@@ -430,9 +559,9 @@ mod tests {
     #[test]
     fn normalize_order_inserts_builtins_and_sorts() {
         let fetched = vec![
-            ModelOption { id: "brand-new-model".into(), label: "Brand New".into() },
-            ModelOption { id: "glm-5.3".into(), label: "GLM-5.3".into() },
-            ModelOption { id: "qwen3.8-max".into(), label: "Qwen3.8-Max".into() },
+            ModelOption { id: "brand-new-model".into(), label: "Brand New".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None },
+            ModelOption { id: "glm-5.3".into(), label: "GLM-5.3".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None },
+            ModelOption { id: "qwen3.8-max".into(), label: "Qwen3.8-Max".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None },
         ];
         let list = normalize_order(fetched);
         let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
@@ -443,5 +572,62 @@ mod tests {
         assert!(idx("qwen3.8-flash") < idx("qwen3.8-max"));
         assert_eq!(ids.last(), Some(&"brand-new-model"));
         assert_eq!(ids.len(), 6);
+    }
+
+    // ==================== 统一网关 §3.4 ModelOption 扩展 ====================
+
+    /// 存量旧格式（仅 id/label）serde default 兼容读取，不丢不重写（§9.6）
+    #[test]
+    fn old_file_shape_reads_with_defaults() {
+        let text = r#"[{"id":"glm-5.3","label":"GLM-5.3"}]"#;
+        let list: Vec<ModelOption> = serde_json::from_str(text).unwrap();
+        assert_eq!(list.len(), 1);
+        let m = &list[0];
+        assert!(m.rate.is_none());
+        assert!(m.context_length.is_none());
+        assert!(m.efforts.is_empty());
+        assert!(m.supports_image.is_none());
+    }
+
+    /// parse_official 提取 L2 运营字段（倍率/上下文/档位/图片，候选键宽容解析）
+    #[test]
+    fn parse_official_extracts_meta_fields() {
+        let text = serde_json::json!({
+            "function_configs": [
+                { "function": "solo_work_lite", "config_info_list": [
+                    { "config_name": "glm-5.3", "is_invisible_to_user": false,
+                      "display_config": { "display_name": "GLM-5.3", "rate": 0.78 },
+                      "contextLength": 1000000,
+                      "supportedEfforts": ["high", "medium"],
+                      "inputModalities": ["text", "image"],
+                      "model_detail_list": [{ "model_name": "glm-5.3__dev" }] },
+                    { "config_name": "kimi-k3", "is_invisible_to_user": false,
+                      "display_config": { "display_name": "Kimi-K3" } }
+                ]}
+            ]
+        })
+        .to_string();
+        let list = parse_official(&text).unwrap();
+        let g = list.iter().find(|m| m.id == "glm-5.3").unwrap();
+        assert_eq!(g.rate, Some(0.78), "display_config 内倍率候选键");
+        assert_eq!(g.context_length, Some(1_000_000));
+        assert_eq!(g.efforts, vec!["medium".to_string(), "high".to_string()], "排序去重");
+        assert_eq!(g.supports_image, Some(true), "modalities 含 image");
+        // 无运营字段条目 → 全部缺省（交由 L3/L4 兜底）
+        let k = list.iter().find(|m| m.id == "kimi-k3").unwrap();
+        assert!(k.rate.is_none());
+        assert!(k.context_length.is_none());
+        assert!(k.efforts.is_empty());
+        assert!(k.supports_image.is_none());
+    }
+
+    /// 字符串数值宽容解析（上游偶发字符串形态）
+    #[test]
+    fn extract_meta_tolerates_string_numbers() {
+        let ci = serde_json::json!({"rate": "0.16", "context_length": "131072", "supports_image": true});
+        let (rate, ctx, _, img) = extract_meta(&ci);
+        assert_eq!(rate, Some(0.16));
+        assert_eq!(ctx, Some(131_072));
+        assert_eq!(img, Some(true));
     }
 }

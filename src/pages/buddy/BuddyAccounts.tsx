@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   RefreshCw,
   Download,
@@ -93,12 +93,19 @@ export default function BuddyAccounts() {
   const [resetConfirming, setResetConfirming] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
   const [resetResults, setResetResults] = useState<WbResetResult[] | null>(null);
+  // CodeBuddy CLI 当前号（settings.json token → 池 id），列表内徽标展示
+  const [cliActiveId, setCliActiveId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
       const accs = await api.workbuddy.accountsList();
       setAccounts(accs);
+      // CLI 当前号查询（失败不阻断列表展示；切号/删号后 refresh 会自动重取）
+      api.workbuddy
+        .cliStatus()
+        .then((s) => setCliActiveId(s.active_account_id))
+        .catch(() => setCliActiveId(null));
       // 积分缓存查询（≥5min 缓存，失败不阻断列表展示）
       api.workbuddy
         .creditsFetch()
@@ -265,6 +272,7 @@ export default function BuddyAccounts() {
     try {
       await withMinDelay(api.workbuddy.cliBridgeSet(a.id), 800);
       pushToast('success', `「${a.nickname || a.id}」已设为 CodeBuddy CLI 账号（重启 CLI 后生效）`);
+      void refresh(); // 更新列表内「CodeBuddy 当前号」徽标
     } catch (err) {
       pushToast('error', `CLI 桥接失败：${String(err)}`);
     }
@@ -491,13 +499,20 @@ export default function BuddyAccounts() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      {a.is_current ? (
-                        <Badge tone="green">在线</Badge>
-                      ) : a.needs_relogin ? (
-                        <Badge tone="red">需重登</Badge>
-                      ) : (
-                        <Badge tone="slate">备用</Badge>
-                      )}
+                      <div className="flex items-center gap-1">
+                        {a.is_current ? (
+                          <Badge tone="green">在线</Badge>
+                        ) : a.needs_relogin ? (
+                          <Badge tone="red">需重登</Badge>
+                        ) : (
+                          <Badge tone="slate">备用</Badge>
+                        )}
+                        {cliActiveId === a.id && (
+                          <Badge tone="blue" title="CodeBuddy CLI 当前账号（~/.codebuddy/settings.json）">
+                            <TerminalSquare size={12} /> CodeBuddy
+                          </Badge>
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1">

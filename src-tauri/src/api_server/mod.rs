@@ -1,6 +1,10 @@
 pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
+pub mod custom_models;
+pub mod custom_route;
+pub mod dispatch;
+pub mod gateway_settings;
 pub mod models_sync;
 pub mod pool;
 pub mod payload;
@@ -8,6 +12,7 @@ pub mod retry;
 pub mod routes;
 pub mod server;
 pub mod sse;
+pub mod unified_catalog;
 pub mod usage;
 pub mod wb_catalog;
 pub mod wb_images;
@@ -21,7 +26,7 @@ pub mod wb_toolexec;
 pub mod wb_upstream;
 
 use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub use api_logger::ApiLogger;
 pub use pool::ApiPool;
@@ -56,6 +61,9 @@ pub struct ApiSharedState {
     pub wb_bg_downgrade: std::sync::atomic::AtomicBool,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
+    /// 会话池粘性（统一网关 §4.4，内存态不落盘、重启即清）：
+    /// session_key → (上次成功服务的资源池, 过期时间 Unix 秒)，TTL 60s 软粘
+    pub pool_sticky: Mutex<std::collections::HashMap<String, (dispatch::TargetPool, i64)>>,
     /// 模型级冷却（F-34）：model → (until 秒, 连续失败次数)；10→20→40s 渐进退避，
     /// 优先级高于 Key 级冷却
     pub model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
@@ -65,6 +73,9 @@ pub struct ApiSharedState {
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
     pub total_requests: AtomicU64,
+    /// 当前并发数（统一网关 §4.5）：由 InflightGuard RAII 维护，覆盖全部业务端点。
+    /// Arc 包装使 guard 可跨 spawn_blocking/流任务持有（'static + Send）
+    pub inflight: Arc<AtomicU64>,
     pub active_uid: Mutex<Option<String>>,
     pub last_error: Mutex<Option<String>>,
     pub logger: ApiLogger,
@@ -79,6 +90,12 @@ pub struct ApiSharedState {
 }
 
 impl ApiSharedState {
+    /// 进入业务端点时获取并发 guard（§4.5）：inflight +1，Drop 时 -1。
+    /// panic 展开 / 客户端断连（axum 丢弃 handler future）/ 流异常终止均兜底释放
+    pub fn inflight_guard(&self) -> InflightGuard {
+        InflightGuard::acquire(&self.inflight)
+    }
+
     /// 记录一次请求用量并原子落盘；写盘失败静默忽略，不影响主流程。
     /// `is_wb`：WB 上游路由的请求记入独立 wb_days 桶（与 Trae 侧分账，页面互不串数）
     #[allow(clippy::too_many_arguments)]
@@ -102,6 +119,52 @@ impl ApiSharedState {
             is_wb, model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
         );
         usage::save(&self.data_dir, &guard);
+    }
+
+    /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
+    /// uid 固定 "custom"，落盘策略与 record_usage 相同
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_custom(
+        &self,
+        model: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record_in(
+            usage::UsageBucket::Custom,
+            model, "custom", key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+        );
+        usage::save(&self.data_dir, &guard);
+    }
+}
+
+/// 当前并发计数 RAII guard（统一网关 §4.5）：构造时 +1，Drop 时 -1。
+/// 持有 Arc 克隆（'static + Send）——端点获取后作为参数移入执行路径，
+/// 流式场景随 spawn 任务存续至流结束；不做下溢防护依赖"构造必 +1"配对语义
+pub struct InflightGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl InflightGuard {
+    pub fn acquire(counter: &Arc<AtomicU64>) -> InflightGuard {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        InflightGuard {
+            counter: counter.clone(),
+        }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -254,4 +317,74 @@ pub fn streaming_agent() -> ureq::Agent {
         .max_idle_connections(20)
         .max_idle_connections_per_host(20)
         .build()
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::*;
+
+    /// 正常路径：acquire/drop 配对，计数归零
+    #[test]
+    fn t01_guard_drop_decrements() {
+        let c = Arc::new(AtomicU64::new(0));
+        {
+            let _g1 = InflightGuard::acquire(&c);
+            let _g2 = InflightGuard::acquire(&c);
+            assert_eq!(c.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+        assert_eq!(c.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// panic 路径（§10 关键断言）：栈展开执行 guard Drop，计数不泄漏
+    #[test]
+    fn t02_guard_released_on_panic_unwind() {
+        let c = Arc::new(AtomicU64::new(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = InflightGuard::acquire(&c);
+            assert_eq!(c.load(std::sync::atomic::Ordering::Relaxed), 1);
+            panic!("boom");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            c.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "panic 展开时 guard Drop 必须释放计数"
+        );
+    }
+
+    /// ApiSharedState::inflight_guard 便捷方法配对生效
+    #[test]
+    fn t03_state_helper_pairs() {
+        let dir = std::env::temp_dir().join(format!("twa_inflight_{}", std::process::id()));
+        let state = ApiSharedState {
+            pool: pool::ApiPool::new(),
+            wb_pool: pool::ApiPool::new(),
+            wb_enabled: std::sync::atomic::AtomicBool::new(true),
+            wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+            wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+            wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_sticky: wb_sticky::StickyStore::default(),
+            pool_sticky: Mutex::new(std::collections::HashMap::new()),
+            model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+            wb_template_cache: Mutex::new(None),
+            default_model: String::new(),
+            data_dir: dir.clone(),
+            total_requests: AtomicU64::new(0),
+            inflight: Arc::new(AtomicU64::new(0)),
+            active_uid: Mutex::new(None),
+            last_error: Mutex::new(None),
+            logger: ApiLogger::new(dir.join("logs")),
+            debug_enabled: std::sync::atomic::AtomicBool::new(false),
+            usage: Mutex::new(usage::UsageFile::default()),
+            wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        };
+        {
+            let _g = state.inflight_guard();
+            assert_eq!(state.inflight.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+        assert_eq!(state.inflight.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

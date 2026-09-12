@@ -143,7 +143,7 @@ export default function SetupGuide() {
               <button
                 onClick={() => void handleRun(step)}
                 disabled={busy === step.key}
-                className="btn-primary shrink-0"
+                className="btn-outline shrink-0"
               >
                 {busy === step.key ? '处理中…' : step.actionLabel}
                 <ChevronRight size={14} />

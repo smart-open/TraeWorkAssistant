@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Calendar, Trash2, Save, Search, RotateCcw, Fingerprint, Clock, AlertTriangle } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Modal } from '../components/ui';
@@ -263,7 +263,7 @@ export default function Settings() {
             <button
               onClick={() => setConfirmResetDevice(true)}
               disabled={deviceResetActive}
-              className="btn-primary"
+              className="btn-outline"
             >
               <Fingerprint size={15} /> {deviceResetActive ? '重置中…' : '执行 6 层重置'}
             </button>
@@ -328,7 +328,7 @@ export default function Settings() {
                 className="input h-9 !w-32 pl-8 text-sm"
               />
             </div>
-            <button onClick={register} disabled={busyTask} className="btn-primary">
+            <button onClick={register} disabled={busyTask} className="btn-outline">
               <Calendar size={15} /> {busyTask ? '注册中…' : '注册任务'}
             </button>
             <button onClick={query} disabled={querying} className="btn-outline">

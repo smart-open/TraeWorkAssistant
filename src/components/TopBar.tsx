@@ -1,12 +1,56 @@
 import { useEffect, useState } from 'react';
-import { ExternalLink, Power, PowerOff, ShieldCheck, ShieldAlert, MonitorCheck, MonitorX, Server, Wifi, KeyRound, FileCheck } from 'lucide-react';
+import { ExternalLink, Power, PowerOff, ShieldCheck, ShieldAlert, MonitorCheck, MonitorX, Server, Wifi, Play } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
 import { Badge } from './ui';
 import { api } from '../lib/tauri';
-import type { AppLocate, WorkBuddyEnvCheck, WorkBuddyAccountView } from '../types';
+import type { AppLocate, WorkBuddyEnvCheck, WbCliStatus } from '../types';
 
-/** Trae 专区顶栏：双应用安装状态 + 证书/代理/API 服务 + 打开应用 */
+/** API 网关启停（Trae/Buddy 顶栏共用）：直接调 api_server_start/stop 并同步 store */
+function useApiGatewayToggle() {
+  const pushToast = useAppStore((s) => s.pushToast);
+  const apiStatus = useAppStore((s) => s.apiStatus);
+  const [busy, setBusy] = useState(false);
+  const running = apiStatus?.running ?? false;
+
+  const toggle = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (running) {
+        await api.apiServer.stop();
+        useAppStore.setState({ apiStatus: null });
+        pushToast('info', 'API 网关已停止');
+      } else {
+        const s = await api.apiServer.start();
+        useAppStore.setState({ apiStatus: s });
+        pushToast('success', `API 网关已启动（端口 ${s.port}）`);
+      }
+    } catch (e) {
+      pushToast('error', `API 网关${running ? '停止' : '启动'}失败：${String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return { running, busy, toggle };
+}
+
+/** 网关启停按钮（与启停代理并排） */
+function GatewayButton() {
+  const { running, busy, toggle } = useApiGatewayToggle();
+  return running ? (
+    <button onClick={() => void toggle()} className="btn-outline" disabled={busy}>
+      <PowerOff size={15} /> 停止网关
+    </button>
+  ) : (
+    <button onClick={() => void toggle()} className="btn-outline" disabled={busy}>
+      <Play size={15} /> 启动API网关
+    </button>
+  );
+}
+
+/** Trae 专区顶栏：双应用安装状态 + 证书/代理/API 网关 + 打开应用 */
 function TraeTopBar() {
   const env = useAppStore((s) => s.env);
   const envCn = useAppStore((s) => s.envCn);
@@ -57,7 +101,7 @@ function TraeTopBar() {
           <Wifi size={13} /> {proxy.running ? `代理运行中 :${proxy.port}` : '代理未启动'}
         </Badge>
         <Badge tone={apiStatus?.running ? 'green' : 'slate'}>
-          <Server size={13} /> {apiStatus?.running ? `API 服务 :${apiStatus.port}` : 'API 服务未启动'}
+          <Server size={13} /> {apiStatus?.running ? `API网关运行中 :${apiStatus.port}` : 'API网关未启动'}
         </Badge>
       </div>
       <div className="flex items-center gap-2">
@@ -72,10 +116,11 @@ function TraeTopBar() {
             <PowerOff size={15} /> 停止代理
           </button>
         ) : (
-          <button onClick={startProxy} className="btn-primary">
+          <button onClick={startProxy} className="btn-outline">
             <Power size={15} /> 启动代理
           </button>
         )}
+        <GatewayButton />
       </div>
     </>
   );
@@ -136,7 +181,7 @@ function DoubaoTopBar() {
         </Badge>
       </div>
       <div className="flex items-center gap-2">
-        <button onClick={() => void launch()} className="btn-primary" disabled={!locate?.exe}>
+        <button onClick={() => void launch()} className="btn-outline" disabled={!locate?.exe}>
           <ExternalLink size={15} /> 打开豆包
         </button>
         {proxy.running ? (
@@ -153,66 +198,112 @@ function DoubaoTopBar() {
   );
 }
 
-/** Buddy 专区顶栏：客户端状态 + auth 登录态 + 账号池概览 + 打开客户端（Buddy 工作区与 Trae/豆包顶栏同构，上下文不串） */
+/**
+ * Buddy 专区顶栏：左列双客户端安装徽标（hover 显版本）+ 证书/代理/API 网关状态，
+ * 右列 打开WorkBuddy / 打开CodeBuddy / 启动代理 / 启动API网关。
+ * 与 Trae/豆包顶栏同构（上下文不串）；原登录态/账号池徽标已移除（账号信息看账号管理页）。
+ */
 function BuddyTopBar() {
   const pushToast = useAppStore((s) => s.pushToast);
-  const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
-  const [accountCount, setAccountCount] = useState<number | null>(null);
+  const certInstalled = useAppStore((s) => s.certInstalled);
+  const proxy = useAppStore((s) => s.proxy);
+  const apiStatus = useAppStore((s) => s.apiStatus);
+  const startProxy = useAppStore((s) => s.startProxy);
+  const stopProxy = useAppStore((s) => s.stopProxy);
+  const [wbEnv, setWbEnv] = useState<WorkBuddyEnvCheck | null>(null);
+  const [cbLocate, setCbLocate] = useState<AppLocate | null>(null);
+  // CLI 桥状态：CodeBuddy CLI-only 用户（只装 CLI 无桌面版）用 settings_present 兜底判定
+  const [cbCli, setCbCli] = useState<WbCliStatus | null>(null);
 
   useEffect(() => {
     let alive = true;
     api.workbuddy
       .envCheck()
-      .then((e) => alive && setEnv(e))
+      .then((e) => alive && setWbEnv(e))
+      .catch(() => {});
+    api.env
+      .locate('codebuddy')
+      .then((r) => alive && setCbLocate(r))
       .catch(() => {});
     api.workbuddy
-      .accountsList()
-      .then((a) => alive && setAccountCount(a.length))
-      .catch(() => alive && setAccountCount(0));
+      .cliStatus()
+      .then((s) => alive && setCbCli(s))
+      .catch(() => {});
     return () => {
       alive = false;
     };
   }, []);
 
-  const openClient = async () => {
-    const exe = env?.exe;
+  const openExe = async (exe: string | null | undefined, label: string) => {
     if (!exe) {
-      pushToast('warn', '未检测到 WorkBuddy 客户端，请先安装');
+      pushToast('warn', `未检测到 ${label} 客户端，请先安装`);
       return;
     }
     try {
-      if (exe) await open(`file:///${exe}`);
+      await open(`file:///${exe}`);
     } catch (e) {
-      pushToast('error', `打开客户端失败：${String(e)}`);
+      pushToast('error', `打开 ${label} 失败：${String(e)}`);
     }
   };
 
   return (
     <>
       <div className="flex items-center gap-2">
-        {env?.installed ? (
-          <Badge tone="green" title={env.version ? `WorkBuddy 当前版本：v${env.version}` : 'WorkBuddy 客户端'}>
-            <MonitorCheck size={13} /> 客户端已安装
+        {wbEnv?.installed ? (
+          <Badge tone="green" title={wbEnv.version ? `WorkBuddy 当前版本：v${wbEnv.version}` : 'WorkBuddy 客户端'}>
+            <MonitorCheck size={13} /> WorkBuddy已安装
           </Badge>
         ) : (
           <Badge tone="red">
-            <MonitorX size={13} /> 客户端未检测到
+            <MonitorX size={13} /> WorkBuddy未检测到
           </Badge>
         )}
-        <Badge tone={env?.running ? 'green' : 'slate'} title="WorkBuddy 桌面客户端运行状态">
-          <Server size={13} /> {env?.running ? '运行中' : '未运行'}
+        {cbLocate?.exe ? (
+          <Badge tone="green" title={cbLocate.version ? `CodeBuddy 当前版本：v${cbLocate.version}` : 'CodeBuddy 客户端'}>
+            <MonitorCheck size={13} /> CodeBuddy已安装
+          </Badge>
+        ) : cbCli?.settings_present ? (
+          <Badge tone="green" title="未检测到 CodeBuddy 桌面版；CLI 桥已就绪（~/.codebuddy/settings.json），切号/轮换可用">
+            <MonitorCheck size={13} /> CodeBuddy CLI已就绪
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> CodeBuddy未检测到
+          </Badge>
+        )}
+        {certInstalled ? (
+          <Badge tone="green">
+            <ShieldCheck size={13} /> 证书已信任
+          </Badge>
+        ) : (
+          <Badge tone="amber">
+            <ShieldAlert size={13} /> 证书未信任
+          </Badge>
+        )}
+        <Badge tone={proxy.running ? 'blue' : 'slate'}>
+          <Wifi size={13} /> {proxy.running ? `代理运行中 :${proxy.port}` : '代理未启动'}
         </Badge>
-        <Badge tone={env?.auth_file_exists ? 'green' : 'amber'} title="登录态文件（workbuddy-desktop.info）">
-          <FileCheck size={13} /> {env?.auth_file_exists ? '登录态正常' : '登录态缺失'}
-        </Badge>
-        <Badge tone={accountCount && accountCount > 0 ? 'blue' : 'slate'} title="账号池账号数量（账号管理页维护）">
-          <KeyRound size={13} /> 账号池 {accountCount ?? '—'} 个
+        <Badge tone={apiStatus?.running ? 'green' : 'slate'}>
+          <Server size={13} /> {apiStatus?.running ? `API网关运行中 :${apiStatus.port}` : 'API网关未启动'}
         </Badge>
       </div>
       <div className="flex items-center gap-2">
-        <button onClick={() => void openClient()} className="btn-primary" disabled={!env?.exe}>
-          <ExternalLink size={15} /> 打开客户端
+        <button onClick={() => void openExe(wbEnv?.exe, 'WorkBuddy')} className="btn-outline" disabled={!wbEnv?.exe}>
+          <ExternalLink size={15} /> 打开WorkBuddy
         </button>
+        <button onClick={() => void openExe(cbLocate?.exe, 'CodeBuddy')} className="btn-outline" disabled={!cbLocate?.exe}>
+          <ExternalLink size={15} /> 打开CodeBuddy
+        </button>
+        {proxy.running ? (
+          <button onClick={stopProxy} className="btn-outline">
+            <PowerOff size={15} /> 停止代理
+          </button>
+        ) : (
+          <button onClick={startProxy} className="btn-outline">
+            <Power size={15} /> 启动代理
+          </button>
+        )}
+        <GatewayButton />
       </div>
     </>
   );

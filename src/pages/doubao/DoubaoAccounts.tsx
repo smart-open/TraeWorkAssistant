@@ -556,7 +556,7 @@ export default function DoubaoAccounts() {
             <button onClick={() => void doKeepalive()} className="btn-outline" disabled={anyBusy}>
               <Timer size={15} /> {keepaliveRunning ? '保活中…' : '立即保活'}
             </button>
-            <button onClick={() => void openSaveLoginDialog()} className="btn-primary" disabled={anyBusy}>
+            <button onClick={() => void openSaveLoginDialog()} className="btn-outline" disabled={anyBusy}>
               <Save size={15} /> 保存当前登录态
             </button>
           </>

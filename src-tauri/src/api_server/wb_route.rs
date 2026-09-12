@@ -1,4 +1,4 @@
-﻿//! WorkBuddy 上游请求路径（T2.1/T2.4/T2.7 集成点）
+//! WorkBuddy 上游请求路径（T2.1/T2.4/T2.7 集成点）
 //!
 //! 请求流程：
 //! 1. 模型级冷却检查（F-34：优先级高于 Key 级，命中直接快速失败）；
@@ -31,7 +31,7 @@ use super::wb_payload;
 use super::wb_sse;
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{self, WbCreds};
-use super::{classify_error, ApiSharedState, ErrKind};
+use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
 use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
@@ -162,10 +162,13 @@ pub fn wb_stream_chat(
     start_ts: Instant,
     proto: Protocol,
     key_id: String,
+    guard: InflightGuard,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::task::spawn_blocking(move || {
+        // inflight guard 随后台任务存续至流结束（§4.5，客户端断连由 Drop 兜底）
+        let _inflight = guard;
         let chat_id = match proto {
             Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
             Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
@@ -456,9 +459,12 @@ pub async fn wb_aggregate_chat(
     start_ts: Instant,
     proto: Protocol,
     key_id: String,
+    guard: InflightGuard,
 ) -> Response {
     let model_out = model.clone();
     let result = tokio::task::spawn_blocking(move || {
+        // inflight guard 随后台任务存续至聚合完成（§4.5）
+        let _inflight = guard;
         let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
         let sticky_key = SessionKey::from_body(&peek);
         let templates = load_templates(&state);
@@ -718,9 +724,12 @@ pub async fn wb_tool_exec_chat(
     stream: bool,
     start_ts: Instant,
     key_id: String,
+    guard: InflightGuard,
 ) -> Response {
     let model_inner = model.clone();
     let result = tokio::task::spawn_blocking(move || {
+        // inflight guard 随后台任务存续至编排完成（§4.5）
+        let _inflight = guard;
         let model = model_inner;
         let templates = load_templates(&state);
         let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);

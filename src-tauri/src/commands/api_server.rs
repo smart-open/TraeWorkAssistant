@@ -43,22 +43,18 @@ pub async fn do_start(
         }
     }
 
-    let settings = state.settings();
-    let port = settings.api_port;
+    // 网关设置（§8.1/§9.2）：port / default_model 改读 data/api_gateway_settings.json；
+    // 新文件缺失时从 app_settings.json 旧字段一次性迁移（旧字段保留不删，防回滚）。
+    // load 已将空 default_model 兜底为内置默认，无需再 trim 判空
+    let gw = crate::api_server::gateway_settings::load(&state.data_dir);
+    let port = gw.port;
 
     // 代理循环说明：ureq 2.12 未启用 proxy-from-env feature，构建 Agent 时
     // 既不读 HTTP(S)_PROXY/NO_PROXY 环境变量、也不读系统代理，Agent 未显式
     // 配置 proxy 即直连，不会形成 127.0.0.1:8899 回环。
     // 旧实现曾进程级 set_var("NO_PROXY","*")：多线程下 setenv 有竞态
     // （Rust 2024 已标 unsafe），且污染 python 签到等子进程的代理行为，已移除
-    let default_model = {
-        let m = settings.api_default_model.trim();
-        if m.is_empty() {
-            crate::api_server::DEFAULT_MODEL.to_string()
-        } else {
-            m.to_string()
-        }
-    };
+    let default_model = gw.default_model;
 
     // 读取账号数据、冷却状态、剩余积分（账号经 vault 解密还原明文 jwt）
     let accounts = crate::vault::load_accounts(state);
@@ -223,11 +219,13 @@ pub async fn do_start(
         wb_tool_exec: std::sync::atomic::AtomicBool::new(pool_file.wb_tool_exec),
         wb_bg_downgrade: std::sync::atomic::AtomicBool::new(pool_file.wb_bg_downgrade),
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
+        pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         wb_template_cache: Mutex::new(None),
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
+        inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_uid: Mutex::new(None),
         last_error: Mutex::new(None),
         logger: ApiLogger::new(state.logs_dir()),
@@ -325,6 +323,8 @@ pub fn api_server_status(
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
 ) -> ApiServiceStatus {
     let guard = safe_lock(&runtime);
+    // 端口显示与 do_start 同源（gateway_settings，§8.2），避免双源显示漂移
+    let port = crate::api_server::gateway_settings::load(&state.data_dir).port;
     match guard.as_ref() {
         Some(rt) => {
             let total = rt
@@ -335,24 +335,21 @@ pub fn api_server_status(
             let last_err = safe_lock(&rt.shared.last_error).clone();
             ApiServiceStatus {
                 running: true,
-                port: state.settings().api_port,
+                port,
                 total_requests: total,
                 active_uid: active,
                 last_error: last_err,
                 started_at: Some(rt.started_at),
             }
         }
-        None => {
-            let settings = state.settings();
-            ApiServiceStatus {
-                running: false,
-                port: settings.api_port,
-                total_requests: 0,
-                active_uid: None,
-                last_error: None,
-                started_at: None,
-            }
-        }
+        None => ApiServiceStatus {
+            running: false,
+            port,
+            total_requests: 0,
+            active_uid: None,
+            last_error: None,
+            started_at: None,
+        },
     }
 }
 
@@ -537,6 +534,17 @@ pub fn api_wb_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<
     crate::api_server::usage::query_recent(&state.data_dir, days, true)
 }
 
+/// 查询最近 N 天的自定义模型用量统计（custom_days 桶，API 管理·用量统计「自定义」筛选专用）
+#[tauri::command]
+pub fn api_custom_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    crate::api_server::usage::query_recent_in(
+        &state.data_dir,
+        days,
+        crate::api_server::usage::UsageBucket::Custom,
+    )
+}
+
 // ==================== 多 API Key 命令 ====================
 
 /// 读取 API Key 列表与鉴权开关
@@ -562,4 +570,132 @@ pub fn api_keys_save(
     };
     crate::api_server::api_keys::save(&state.data_dir, &file);
     Ok(())
+}
+
+// ==================== 统一网关命令（Phase 1 §8.1） ====================
+
+/// 统一模型目录聚合视图（实时派生，不落盘）。
+/// `available_only=true`：过滤全部来源不可用的模型。
+/// 服务运行中用实时池健康派生 enabled 标记；未运行时放宽（池健康视为可选，
+/// wb_enabled 读落盘值）——目录展示不因服务停启而失真（§3.3 #5）
+#[tauri::command]
+pub fn api_unified_models(
+    state: State<'_, AppState>,
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    available_only: Option<bool>,
+) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
+    let (wb_enabled, trae_ok, buddy_ok) = match safe_lock(&runtime).as_ref() {
+        Some(rt) => {
+            let s = &rt.shared;
+            (
+                s.wb_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                s.pool.has_selectable(),
+                s.wb_pool.has_selectable(),
+            )
+        }
+        None => {
+            let pf: ApiPoolFile = fs_utils::read_json(&state.path("api_pool.json"));
+            (pf.wb_enabled, true, true)
+        }
+    };
+    let data_dir = state.data_dir.clone();
+    let mut list = crate::api_server::unified_catalog::unified_models(
+        &data_dir,
+        wb_enabled,
+        trae_ok,
+        buddy_ok,
+    );
+    if available_only.unwrap_or(false) {
+        list.retain(|m| m.sources.iter().any(|s| s.enabled));
+    }
+    list
+}
+
+/// 读取调度策略（规范化后视图：非法池名/空优先级已回退默认）
+#[tauri::command]
+pub fn dispatch_policy_get(
+    state: State<'_, AppState>,
+) -> crate::api_server::dispatch::DispatchPolicy {
+    crate::api_server::dispatch::load_policy(&state.data_dir)
+}
+
+/// 保存调度策略；返回规范化后的生效值（前端展示以返回值为准）
+#[tauri::command]
+pub fn dispatch_policy_set(
+    state: State<'_, AppState>,
+    policy: crate::api_server::dispatch::DispatchPolicy,
+) -> Result<crate::api_server::dispatch::DispatchPolicy, String> {
+    crate::api_server::dispatch::save_policy(&state.data_dir, &policy)?;
+    Ok(crate::api_server::dispatch::load_policy(&state.data_dir))
+}
+
+/// 读取网关设置（port / default_model；缺失时从 app_settings 旧字段一次性迁移）
+#[tauri::command]
+pub fn gateway_settings_get(
+    state: State<'_, AppState>,
+) -> crate::api_server::gateway_settings::GatewaySettings {
+    crate::api_server::gateway_settings::load(&state.data_dir)
+}
+
+/// 保存网关设置（端口改动在下次启动 API 服务后生效；返回规范化后的生效值）
+#[tauri::command]
+pub fn gateway_settings_set(
+    state: State<'_, AppState>,
+    settings: crate::api_server::gateway_settings::GatewaySettings,
+) -> Result<crate::api_server::gateway_settings::GatewaySettings, String> {
+    crate::api_server::gateway_settings::save(&state.data_dir, settings)?;
+    Ok(crate::api_server::gateway_settings::load(&state.data_dir))
+}
+
+// ==================== 自定义模型资源池（custom_models.json） ====================
+
+/// 自定义模型列表（OpenAI 兼容上游直通；命中即直达，§custom_models）
+#[tauri::command]
+pub fn custom_models_list(
+    state: State<'_, AppState>,
+) -> Vec<crate::api_server::custom_models::CustomModel> {
+    crate::api_server::custom_models::load(&state.data_dir)
+}
+
+/// 保存自定义模型（upsert：id 为空新增并生成 cm- id，存在则整条覆盖；
+/// 校验 name/base_url 必填 + 名称 canonical 唯一；返回保存后的完整列表）
+#[tauri::command]
+pub fn custom_models_save(
+    state: State<'_, AppState>,
+    model: crate::api_server::custom_models::CustomModel,
+) -> Result<Vec<crate::api_server::custom_models::CustomModel>, String> {
+    crate::api_server::custom_models::upsert(&state.data_dir, model)
+}
+
+/// 删除自定义模型（按 id）；返回是否确有删除
+#[tauri::command]
+pub fn custom_models_remove(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    crate::api_server::custom_models::remove(&state.data_dir, &id)
+}
+
+/// Trae 模型元数据人工覆盖（L1 覆盖层，键 canonical_id；编辑后聚合视图即时生效）
+#[tauri::command]
+pub fn trae_model_meta_set(
+    state: State<'_, AppState>,
+    model: String,
+    meta: crate::api_server::unified_catalog::TraeModelMeta,
+) -> Result<(), String> {
+    crate::api_server::unified_catalog::meta_set(&state.data_dir, &model, meta)
+}
+
+/// 读取 Trae 模型元数据人工覆盖（编辑弹框回显用；None = 无人工值，交由自动来源链）
+#[tauri::command]
+pub fn trae_model_meta_get(
+    state: State<'_, AppState>,
+    model: String,
+) -> Option<crate::api_server::unified_catalog::TraeModelMeta> {
+    crate::api_server::unified_catalog::load_meta(&state.data_dir)
+        .remove(&crate::api_server::unified_catalog::canonical_id(&model))
+}
+
+/// 清除 Trae 模型元数据人工覆盖；返回是否存在过
+#[tauri::command]
+pub fn trae_model_meta_clear(state: State<'_, AppState>, model: String) -> Result<bool, String> {
+    crate::api_server::unified_catalog::meta_clear(&state.data_dir, &model)
 }

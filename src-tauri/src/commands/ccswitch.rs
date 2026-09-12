@@ -108,7 +108,10 @@ pub fn ccswitch_register(
     if !db.is_file() {
         return Err("未检测到 CC Switch（~/.cc-switch/cc-switch.db 不存在），请先安装 CC Switch".into());
     }
-    let port = port.unwrap_or_else(|| state.settings().api_port as u16);
+    // 端口缺省与网关启动同源（gateway_settings，§8.2）：避免注册条目指向旧端口
+    let port = port.unwrap_or_else(|| {
+        crate::api_server::gateway_settings::load(&state.data_dir).port
+    });
     let model = model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())

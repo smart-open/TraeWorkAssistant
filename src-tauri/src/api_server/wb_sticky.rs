@@ -55,7 +55,8 @@ impl SessionKey {
         SessionKey::Fingerprint(fingerprint_messages(body))
     }
 
-    fn cache_key(&self) -> String {
+    /// 缓存键（"cid:{id}" / "fp:{指纹}"）——池粘性键复用同一前缀约定（§4.4）
+    pub fn cache_key(&self) -> String {
         match self {
             SessionKey::Explicit(s) => format!("cid:{}", s),
             SessionKey::Fingerprint(s) => format!("fp:{}", s),

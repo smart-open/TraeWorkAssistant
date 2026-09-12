@@ -129,7 +129,7 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
                 已完成
               </span>
             ) : (
-              <button onClick={() => void handleRun(step)} disabled={busy === step.key} className="btn-primary shrink-0">
+              <button onClick={() => void handleRun(step)} disabled={busy === step.key} className="btn-outline shrink-0">
                 {busy === step.key ? '处理中…' : step.actionLabel}
                 <ChevronRight size={14} />
               </button>

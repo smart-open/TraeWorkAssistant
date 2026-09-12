@@ -23,6 +23,15 @@ def data_dir() -> str:
         os.environ.get("APPDATA", ""), "AIWorkAssistant")
 
 
+def data_subdir() -> str:
+    """统一数据子目录（<data_dir>/data/）：与 Rust fs_utils 对齐（§9.4 网关迁移）。
+    池/凭证/签到结果/积分缓存等 WorkBuddy 数据文件均落盘于此，路径不一致会导致
+    Python 侧读到空池（签到空跑、积分为空）。"""
+    p = os.path.join(data_dir(), "data")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
 def auth_file_path() -> str:
     """桌面端 auth 文件（只读；写入仅限客户端关闭窗口期，由 PS 桥/Rust 控制）"""
     local = os.environ.get("LOCALAPPDATA", "")
@@ -35,19 +44,19 @@ def wb_data_dir() -> str:
 
 
 def pool_path() -> str:
-    return os.path.join(data_dir(), "workbuddy_accounts.json")
+    return os.path.join(data_subdir(), "workbuddy_accounts.json")
 
 
 def token_store_path() -> str:
-    return os.path.join(data_dir(), "workbuddy_token_store.json")
+    return os.path.join(data_subdir(), "workbuddy_token_store.json")
 
 
 def checkin_results_path() -> str:
-    return os.path.join(data_dir(), "workbuddy_checkin_results.json")
+    return os.path.join(data_subdir(), "workbuddy_checkin_results.json")
 
 
 def credits_cache_path() -> str:
-    return os.path.join(data_dir(), "workbuddy_credits_cache.json")
+    return os.path.join(data_subdir(), "workbuddy_credits_cache.json")
 
 
 def load_json(path, default):

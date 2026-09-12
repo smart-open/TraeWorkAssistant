@@ -72,7 +72,8 @@ impl RouteResult {
 
 /// 读取路由配置；缺失/损坏 → 空配置（四级中 ①②④ 用户部分退化为内置层）
 pub fn load_config(data_dir: &Path) -> WbRouteFile {
-    crate::fs_utils::read_json(&data_dir.join(ROUTE_FILE))
+    // 带解析缓存（每请求热路径）：write_json 逐出 + mtime 兜底保证新鲜
+    crate::fs_utils::read_json_cached(&data_dir.join(ROUTE_FILE)).unwrap_or_default()
 }
 
 /// 内置系列通配（③）：知名闭源模型族 → 目录代表模型。

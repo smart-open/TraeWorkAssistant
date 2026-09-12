@@ -108,64 +108,68 @@ export default function GeneralSettingsPanel() {
         </div>
       </section>
 
-      {/* 通用与通知 */}
+      {/* 通用与通知（两列布局：左选项/右开关组） */}
       <section className="card p-4">
         <h3 className="mb-3 font-medium">通用与通知</h3>
-        <div className="space-y-3 text-sm">
-          <div>
-            <label className="label">通知方式</label>
-            <select value={form.notify} onChange={(e) => update('notify', e.target.value)} className="input">
-              <option value="toast">应用内 Toast</option>
-              <option value="system">系统通知</option>
-              <option value="both">Toast + 系统通知</option>
-              <option value="none">不通知</option>
-            </select>
+        <div className="grid gap-x-8 gap-y-3 text-sm sm:grid-cols-2">
+          <div className="space-y-3">
+            <div>
+              <label className="label">通知方式</label>
+              <select value={form.notify} onChange={(e) => update('notify', e.target.value)} className="input">
+                <option value="toast">应用内 Toast</option>
+                <option value="system">系统通知</option>
+                <option value="both">Toast + 系统通知</option>
+                <option value="none">不通知</option>
+              </select>
+            </div>
+            <div>
+              <label className="label">日志保留天数</label>
+              <input
+                type="number"
+                value={form.log_retention_days}
+                onChange={(e) => update('log_retention_days', Math.min(365, Math.max(1, Number(e.target.value) || 30)))}
+                className="input w-24"
+                min={1}
+                max={365}
+              />
+              <p className="mt-1 text-xs text-slate-400">
+                应用启动时自动清理超过保留天数的运行日志（代理 / 签到 / 切换日志）。
+              </p>
+            </div>
           </div>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={form.launch_minimized}
-              onChange={(e) => update('launch_minimized', e.target.checked)}
-            />
-            启动时最小化到托盘
-          </label>
-          <label className="flex items-center gap-2">
-            <input type="checkbox" checked={form.tray} onChange={(e) => update('tray', e.target.checked)} />
-            启用系统托盘图标
-          </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={autostart}
-              onChange={() => void toggleAutostart()}
-              disabled={autostartBusy}
-            />
-            开机自启
-            <span className="text-xs text-slate-400">（开关即时生效，无需保存）</span>
-          </label>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={form.silent_checkin}
-              onChange={(e) => update('silent_checkin', e.target.checked)}
-            />
-            启动静默签到
-            <span className="text-xs text-slate-400">（启动 60 秒后自动为未签到账号签到）</span>
-          </label>
-          <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
-          <div>
-            <label className="label">日志保留天数</label>
-            <input
-              type="number"
-              value={form.log_retention_days}
-              onChange={(e) => update('log_retention_days', Math.min(365, Math.max(1, Number(e.target.value) || 30)))}
-              className="input w-24"
-              min={1}
-              max={365}
-            />
-            <p className="mt-1 text-xs text-slate-400">
-              应用启动时自动清理超过保留天数的运行日志（代理 / 签到 / 切换日志）。
-            </p>
+          <div className="space-y-3">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.launch_minimized}
+                onChange={(e) => update('launch_minimized', e.target.checked)}
+              />
+              启动时最小化到托盘
+            </label>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={form.tray} onChange={(e) => update('tray', e.target.checked)} />
+              启用系统托盘图标
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={autostart}
+                onChange={() => void toggleAutostart()}
+                disabled={autostartBusy}
+              />
+              开机自启
+              <span className="text-xs text-slate-400">（开关即时生效，无需保存）</span>
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.silent_checkin}
+                onChange={(e) => update('silent_checkin', e.target.checked)}
+              />
+              启动静默签到
+              <span className="text-xs text-slate-400">（启动 60 秒后自动为未签到账号签到）</span>
+            </label>
+            <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
           </div>
         </div>
       </section>
@@ -231,7 +235,7 @@ export default function GeneralSettingsPanel() {
         <button onClick={reset} disabled={!dirty} className="btn-outline disabled:opacity-40">
           <RotateCcw size={15} /> 撤销
         </button>
-        <button onClick={save} disabled={saving || !dirty} className="btn-primary disabled:opacity-40">
+        <button onClick={save} disabled={saving || !dirty} className="btn-outline disabled:opacity-40">
           <Save size={15} /> {saving ? '保存中…' : '保存设置'}
         </button>
       </div>

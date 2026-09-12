@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   LineChart,
   Line,
@@ -97,7 +97,7 @@ export default function BuddyCredits() {
               </button>
             </div>
             <button className="btn-outline" onClick={() => void refresh(true)} disabled={loading}>
-              <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 强制刷新
+              <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
           </>
         }

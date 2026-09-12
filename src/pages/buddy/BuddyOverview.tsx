@@ -1,5 +1,5 @@
-﻿import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw, ExternalLink, CheckCircle2, Circle, ChevronRight, Coins } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { RefreshCw, ExternalLink, CheckCircle2, Circle, ChevronRight } from 'lucide-react';
 import {
   BarChart,
   Bar,
@@ -14,7 +14,7 @@ import {
 } from 'recharts';
 import { open } from '@tauri-apps/plugin-shell';
 import PageHeader from '../../components/PageHeader';
-import { StatCard, Badge, EmptyState } from '../../components/ui';
+import { StatCard, Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
@@ -35,7 +35,7 @@ interface TrendPoint {
   failed: number;
 }
 
-/** 配置导航步骤（对齐 Trae 概述 SetupGuide 的形态） */
+/** 配置导航步骤（对齐 Trae 概述 SetupGuide 的形态；optional 步骤不计入完成度） */
 interface Step {
   key: string;
   title: string;
@@ -43,6 +43,8 @@ interface Step {
   done: boolean;
   actionLabel: string;
   view: ViewKey;
+  /** 可选步骤：不计入 x/y 完成度（如 CodeBuddy CLI 桥接） */
+  optional?: boolean;
 }
 
 const statusText: Record<string, string> = {
@@ -78,6 +80,7 @@ export default function BuddyOverview() {
   const [credits, setCredits] = useState<WbCreditsResult | null>(null);
   const [activity, setActivity] = useState<WbActivityInfo | null>(null);
   const [records, setRecords] = useState<WbCheckinRecord[]>([]);
+  const [cliBridged, setCliBridged] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
   const refresh = async () => {
@@ -93,11 +96,15 @@ export default function BuddyOverview() {
       setAccounts(accs);
       setCredits(cr);
       setRecords(recs);
-      // 活动信息（低频附加展示，失败静默）
+      // 活动信息与 CLI 桥状态（低频附加展示，失败静默）
       api.workbuddy
         .activityInfo()
         .then(setActivity)
         .catch(() => setActivity(null));
+      api.workbuddy
+        .cliStatus()
+        .then((s) => setCliBridged(s.env_token_present))
+        .catch(() => setCliBridged(false));
     } catch (err) {
       pushToast('error', `WorkBuddy 概述刷新失败：${String(err)}`);
     } finally {
@@ -134,12 +141,21 @@ export default function BuddyOverview() {
     [credits],
   );
 
-  // 配置导航（步骤完成态实时判定）
+  // 用量提醒人类可读文案（dosageNotifyCode=0 且无文案 = 无提醒，不展示原始键值）
+  const dosageMsg = (() => {
+    const dn = activity?.dosage_notify;
+    if (!dn) return '';
+    const zh = typeof dn.dosageNotifyZh === 'string' ? dn.dosageNotifyZh.trim() : '';
+    const en = typeof dn.dosageNotifyEn === 'string' ? dn.dosageNotifyEn.trim() : '';
+    return zh || en;
+  })();
+
+  // 配置导航（步骤完成态实时判定；结合双客户端审计——主功能在 WorkBuddy，CodeBuddy 仅 CLI 桥接可选）
   const steps: Step[] = [
     {
       key: 'client',
       title: '安装 WorkBuddy 客户端',
-      desc: '签到/积分目标客户端，需先安装并登录至少一个账号。',
+      desc: '主客户端：签到/积分/切换全功能。路径未自动识别时可在「环境配置」人工指定。',
       done: !!env?.installed,
       actionLabel: env?.installed ? '打开客户端' : '前往下载',
       view: 'buddy-settings',
@@ -168,9 +184,20 @@ export default function BuddyOverview() {
       actionLabel: '查看积分',
       view: 'buddy-credits',
     },
+    {
+      key: 'cli',
+      title: '桥接 CodeBuddy CLI（可选）',
+      desc: '把 WorkBuddy 账号桥接到 CodeBuddy CLI 切号，按需启用五重防护自动轮换。',
+      done: cliBridged,
+      actionLabel: '去配置',
+      view: 'buddy-settings',
+      optional: true,
+    },
   ];
-  const completed = steps.filter((s) => s.done).length;
-  const allDone = completed === steps.length;
+  // 可选步骤不计入完成度（未桥接 CLI 不阻塞「全部完成」）
+  const required = steps.filter((s) => !s.optional);
+  const completed = required.filter((s) => s.done).length;
+  const allDone = completed === required.length;
 
   const openClient = () => {
     const exe = env?.exe;
@@ -187,14 +214,9 @@ export default function BuddyOverview() {
         title="Buddy · 概述"
         desc="WorkBuddy / CodeBuddy 多账号管理 · 切换 / 续期 / 签到 / 积分"
         actions={
-          <>
-            <button className="btn-outline" onClick={openClient}>
-              <ExternalLink size={15} /> 打开客户端
-            </button>
-            <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
-              <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
-            </button>
-          </>
+          <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
+            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
+          </button>
         }
       />
 
@@ -232,8 +254,8 @@ export default function BuddyOverview() {
         />
       </div>
 
-      {/* 活动信息卡（低频附加展示） */}
-      {activity && (activity.banners.length > 0 || activity.payment_type || activity.dosage_notify) && (
+      {/* 活动信息卡（低频附加展示；用量提醒仅在有文案时展示） */}
+      {activity && (activity.banners.length > 0 || activity.payment_type || dosageMsg) && (
         <div className="mt-4 card p-4">
           <div className="mb-2 flex items-center justify-between">
             <span className="text-sm font-medium">活动信息</span>
@@ -265,13 +287,9 @@ export default function BuddyOverview() {
               ))}
             </div>
           )}
-          {activity.dosage_notify != null && Object.keys(activity.dosage_notify).length > 0 && (
+          {dosageMsg && (
             <div className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
-              用量提醒：{Object.entries(activity.dosage_notify)
-                .filter(([, v]) => v != null && v !== '')
-                .slice(0, 4)
-                .map(([k, v]) => `${k}=${String(v)}`)
-                .join(' · ')}
+              用量提醒：{dosageMsg}
             </div>
           )}
         </div>
@@ -322,18 +340,24 @@ export default function BuddyOverview() {
         )}
       </div>
 
-      {/* 积分榜 Top 榜（对齐 Trae 概述） */}
-      {top.length > 0 && (
-        <div className="mt-5 card p-5">
-          <div className="mb-4 flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <h3 className="font-medium">积分榜 Top 榜</h3>
+      {/* 积分榜 Top 榜（对齐 Trae 概述；无数据显示空态引导，不再整卡隐藏） */}
+      <div className="mt-5 card p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <h3 className="font-medium">积分榜 Top 榜</h3>
+            {top.length > 0 && (
               <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
                 Top {top.length}
               </span>
-            </div>
-            <span className="text-xs text-slate-400">按可用积分排序</span>
+            )}
           </div>
+          <span className="text-xs text-slate-400">按可用积分排序</span>
+        </div>
+        {top.length === 0 ? (
+          <div className="flex h-40 items-center justify-center text-sm text-slate-400">
+            暂无积分数据，导入账号并查询积分后展示 Top 榜。
+          </div>
+        ) : (
           <div className="h-72">
             <ResponsiveContainer>
               <BarChart data={top} margin={{ top: 24, right: 16, left: 0, bottom: 4 }} barCategoryGap="36%">
@@ -382,8 +406,8 @@ export default function BuddyOverview() {
               </BarChart>
             </ResponsiveContainer>
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* 组件配置导航（对齐 Trae 概述 SetupGuide 形态） */}
       <div className="mt-5 card overflow-hidden">
@@ -393,7 +417,7 @@ export default function BuddyOverview() {
             <p className="text-xs text-slate-500">按步骤完成初始化，已完成的步骤无需重复处理。</p>
           </div>
           <Badge tone={allDone ? 'green' : 'amber'}>
-            {completed}/{steps.length} 已完成
+            {completed}/{required.length} 已完成
           </Badge>
         </div>
         <ol className="divide-y divide-slate-100 dark:divide-slate-800">
@@ -412,10 +436,14 @@ export default function BuddyOverview() {
                 <span className="shrink-0 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400">
                   已完成
                 </span>
+              ) : step.optional ? (
+                <span className="shrink-0 rounded-full bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                  可选
+                </span>
               ) : (
                 <button
                   onClick={() => (step.key === 'client' ? openClient() : setView(step.view))}
-                  className="btn-primary shrink-0"
+                  className="btn-outline shrink-0"
                 >
                   {step.actionLabel}
                   <ChevronRight size={14} />
@@ -424,22 +452,19 @@ export default function BuddyOverview() {
             </li>
           ))}
         </ol>
+        {/* CodeBuddy 说明（双客户端审计结论：主功能在 WorkBuddy，CodeBuddy 仅轻量侧） */}
+        <div className="mt-3 border-t border-slate-100 px-4 pt-3 text-xs leading-relaxed text-slate-400 dark:border-zinc-800">
+          <b className="font-medium text-slate-500 dark:text-zinc-400">CodeBuddy 说明：</b>
+          CodeBuddy 为轻量侧客户端，仅支持账号切换（CLI 桥写入 ~/.codebuddy/settings.json）与五重防护自动轮换；
+          签到、积分、API 上游等主功能均在 WorkBuddy 侧完成。客户端路径可在「环境配置」自动检测或人工指定，
+          桥接入口在「账号管理 → 设为 CLI 账号」。
+        </div>
         {allDone && (
           <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-zinc-800 dark:bg-emerald-500/10 dark:text-emerald-300">
             🎉 全部配置已完成，定时签到/积分轮换交给自动化即可！
           </div>
         )}
       </div>
-
-      {accounts.length === 0 && (
-        <div className="mt-5">
-          <EmptyState
-            icon={<Coins size={26} />}
-            title="暂无 WorkBuddy 账号"
-            hint="先在 WorkBuddy 客户端登录，然后到「账号管理」导入本机账号或 OAuth 扫码入池。"
-          />
-        </div>
-      )}
     </div>
   );
 }

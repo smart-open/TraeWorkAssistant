@@ -1,4 +1,4 @@
-﻿use std::collections::HashSet;
+use std::collections::HashSet;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
@@ -10,12 +10,16 @@ use axum::{Extension, Json};
 use serde_json::{json, Value};
 use tokio_stream::wrappers::ReceiverStream;
 
+use super::custom_route;
+use super::dispatch::{self, DispatchError, TargetPool};
 use super::sse;
+use super::unified_catalog;
 use super::usage::{extract_tokens, KeyId};
 use super::wb_catalog;
 use super::wb_model_route;
 use super::wb_route;
 use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState, ErrKind,
+            InflightGuard,
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
 const MAX_ROTATE: usize = 3;
@@ -33,7 +37,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    fn log_path(self) -> &'static str {
+    pub(super) fn log_path(self) -> &'static str {
         match self {
             Protocol::OpenAi => "/v1/chat/completions",
             Protocol::OpenAiText => "/v1/completions",
@@ -119,6 +123,39 @@ fn model_cooling_response(state: &ApiSharedState, model: &str, proto: Protocol) 
     match proto {
         Protocol::Anthropic => anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg),
         _ => openai_error(StatusCode::TOO_MANY_REQUESTS, "model_cooldown", &msg),
+    }
+}
+
+/// 调度错误矩阵 → 按客户端协议格式化响应（§4.3/§4.5；统一调度分流点专用）
+fn dispatch_error_response(err: DispatchError, proto: Protocol, model: &str) -> Response {
+    match err {
+        DispatchError::WbDisabled => {
+            let msg = "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）";
+            match proto {
+                Protocol::Anthropic => {
+                    anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
+                }
+                _ => openai_error(StatusCode::BAD_REQUEST, "wb_upstream_disabled", msg),
+            }
+        }
+        DispatchError::ModelCooling(rem) => {
+            let msg = format!("model {} cooling down, retry after {}s", model, rem);
+            match proto {
+                Protocol::Anthropic => {
+                    anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg)
+                }
+                _ => openai_error(StatusCode::TOO_MANY_REQUESTS, "model_cooldown", &msg),
+            }
+        }
+        DispatchError::NoHealthy(_) => {
+            let msg = "no healthy account available";
+            match proto {
+                Protocol::Anthropic => {
+                    anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", msg)
+                }
+                _ => openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", msg),
+            }
+        }
     }
 }
 
@@ -245,6 +282,8 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     Json(json!({
         "running": true,
         "total_requests": total,
+        // 当前并发数（统一网关 §4.5）：InflightGuard RAII 维护，覆盖 6 业务端点
+        "inflight": state.inflight.load(std::sync::atomic::Ordering::Relaxed),
         "active_uid": active,
         "last_error": last_err,
         "summary": {
@@ -269,42 +308,42 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
 }
 
 pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
-    // 与应用配置同源：读取 api_models.json（缺失时写入默认列表），
-    // 官网同步后无需重启 API 服务即可通过 /v1/models 看到最新列表
+    // 统一模型目录（§3.4）：实时聚合 data/api_models.json（Trae，元数据四层链）
+    // 与 data/wb_model_catalog.json（Buddy），纯派生不落盘。官网/目录同步后
+    // 无需重启 API 服务即可通过 /v1/models 看到最新列表
+    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    // 可用性标记运行时派生（§3.3 #5）：HTTP 端点用实时池健康
+    let trae_ok = state.pool.has_selectable();
+    let buddy_ok = state.wb_pool.has_selectable();
     let data_dir = state.data_dir.clone();
-    let list = tokio::task::spawn_blocking(move || super::models_sync::load_models(&data_dir))
-        .await
-        .unwrap_or_default();
-    let mut data: Vec<Value> = list
+    let list = tokio::task::spawn_blocking(move || {
+        unified_catalog::unified_models(&data_dir, wb_enabled, trae_ok, buddy_ok)
+    })
+    .await
+    .unwrap_or_default();
+    // wb_enabled=false：仅 Buddy 源的模型过滤，双源模型保留（仍可由 Trae 源服务 §3.4）
+    let data: Vec<Value> = list
         .iter()
+        .filter(|m| wb_enabled || !m.sources.iter().all(|s| s.pool == "buddy"))
         .map(|m| {
             json!({
                 "id": m.id,
                 "object": "model",
                 "created": 1753600000,
-                "owned_by": "trae-solo",
-                "context_length": 131072,
+                "owned_by": "unified",
+                "display": m.display,
+                "rate": m.rate,
+                "context_length": m.context_length,
+                "max_tokens": m.max_tokens,
+                "supports_image": m.supports_image,
+                "supported_efforts": m.efforts,
+                // 来源池集合：[{pool: "trae"|"buddy", rate, enabled}]（徽章/降级判定
+                // 由客户端按元数据自决，勿硬编码 §3.4）
+                "sources": m.sources,
+                "manual": m.manual,
             })
         })
         .collect();
-    // WB 上游模型目录合并（T2.1/T2.3）：启用时并入，owned_by=workbuddy；
-    // 能力字段读目录（T5.1/F-37：inputModalities→supports_image、supportedEfforts、
-    // 倍率透传——徽章/降级判定由客户端按元数据自决，勿硬编码）
-    if state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-        for m in wb_catalog::load(&state.data_dir) {
-            data.push(json!({
-                "id": m.id,
-                "object": "model",
-                "created": 1753600000,
-                "owned_by": "workbuddy",
-                "context_length": m.context_length,
-                "max_tokens": m.max_tokens,
-                "rate": m.rate,
-                "supports_image": m.supports_image,
-                "supported_efforts": m.supported_efforts,
-            }));
-        }
-    }
     Json(json!({ "object": "list", "data": data }))
 }
 
@@ -358,32 +397,45 @@ pub async fn chat_completions(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
-    // 模型路由（T5.2/F-61 四段管线）：解析成功 → WB 上游；未命中 → SOLO
-    if let Some((resolved_model, route_hint)) = resolve_wb_target(&state, &model, &peek) {
-        if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            return openai_error(
-                StatusCode::BAD_REQUEST,
-                "wb_upstream_disabled",
-                "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）",
-            );
-        }
-        if wb_route::model_cooling_remaining(&state, &resolved_model).is_some() {
-            return model_cooling_response(&state, &resolved_model, Protocol::OpenAi);
-        }
-        // T5.3 默认深度思考：客户端未带 reasoning_effort 时注入 high
-        let explicit = peek.get("reasoning_effort").and_then(|v| v.as_str()).is_some();
-        let hint = effective_effort_hint(&state, route_hint, explicit);
-        let body_vec = apply_effort_hint(body_vec, hint);
-        if stream {
-            return wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::OpenAi, key_str);
-        }
-        return wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::OpenAi, key_str).await;
-    }
-
-    if stream {
-        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi, key_str)
-    } else {
-        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAi, key_str).await
+    // 统一调度分流点（§4.1 ③~⑥）：resolve_target 决定资源池/会话池粘性/跨池回退/
+    // 错误矩阵，替代原 resolve_wb_target 单向判定；默认策略下行为与改造前一致（§9.1）。
+    // inflight guard 随执行路径持有至请求结束（流式含整个后台任务）
+    let guard = state.inflight_guard();
+    match dispatch::resolve_target(&state, &model, &peek) {
+        Err(e) => dispatch_error_response(e, Protocol::OpenAi, &model),
+        Ok(r) => match r.pool {
+            TargetPool::Buddy => {
+                // T5.3 默认深度思考：客户端未带 reasoning_effort 时注入 high
+                let explicit = peek.get("reasoning_effort").and_then(|v| v.as_str()).is_some();
+                let hint = effective_effort_hint(&state, r.effort_hint, explicit);
+                let body_vec = apply_effort_hint(body_vec, hint);
+                if stream {
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                }
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+            }
+            TargetPool::Trae => {
+                if stream {
+                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard)
+                } else {
+                    aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await
+                }
+            }
+            TargetPool::Custom => {
+                // 自定义模型直达（custom_models 命中即 Custom，§dispatch ⓪）；
+                // 条目可能热更新，执行时重读，缺失（已被删）按 404 语义报错
+                match super::custom_models::find_enabled(&state.data_dir, &model) {
+                    Some(cm) => {
+                        if stream {
+                            custom_route::custom_stream_chat(state_clone, body_vec, r.model, cm, start_ts, Protocol::OpenAi, key_str, guard)
+                        } else {
+                            custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, cm, stream, start_ts, Protocol::OpenAi, key_str, guard).await
+                        }
+                    }
+                    None => openai_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model)),
+                }
+            }
+        },
     }
 }
 
@@ -438,6 +490,8 @@ pub async fn responses_api(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+    // inflight guard：随执行路径持有至请求结束（§4.5）
+    let guard = state.inflight_guard();
 
     // T5.2/F-61 四段路由解析（Responses 仅支持 WB 上游模型）
     let (resolved_model, route_hint) = match resolve_wb_target(&state, &model, &chat_body) {
@@ -476,6 +530,7 @@ pub async fn responses_api(
             stream,
             start_ts,
             key_str,
+            guard,
         )
         .await;
     }
@@ -486,9 +541,9 @@ pub async fn responses_api(
     let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
     if stream {
-        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str)
+        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard)
     } else {
-        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str).await
+        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard).await
     }
 }
 
@@ -542,32 +597,42 @@ pub async fn messages(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
-    // 模型路由（T5.2/F-61 四段管线；body 已转为 OpenAI 内部格式）
-    if let Some((resolved_model, route_hint)) = resolve_wb_target(&state, &model, &peek) {
-        if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            return anthropic_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）",
-            );
-        }
-        if wb_route::model_cooling_remaining(&state, &resolved_model).is_some() {
-            return model_cooling_response(&state, &resolved_model, Protocol::Anthropic);
-        }
-        // T5.3 默认深度思考：Anthropic 侧 thinking 参数视为显式请求
-        let explicit = peek.get("thinking").map_or(false, |t| !t.is_null());
-        let hint = effective_effort_hint(&state, route_hint, explicit);
-        let body_vec = apply_effort_hint(body_vec, hint);
-        if stream {
-            return wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Anthropic, key_str);
-        }
-        return wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Anthropic, key_str).await;
-    }
-
-    if stream {
-        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic, key_str)
-    } else {
-        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::Anthropic, key_str).await
+    // 统一调度分流点（§4.1）：resolve_target 决定资源池/回退/错误矩阵；
+    // guard 随执行路径持有至请求结束（流式含整个后台任务）
+    let guard = state.inflight_guard();
+    match dispatch::resolve_target(&state, &model, &peek) {
+        Err(e) => dispatch_error_response(e, Protocol::Anthropic, &model),
+        Ok(r) => match r.pool {
+            TargetPool::Buddy => {
+                // T5.3 默认深度思考：Anthropic 侧 thinking 参数视为显式请求
+                let explicit = peek.get("thinking").map_or(false, |t| !t.is_null());
+                let hint = effective_effort_hint(&state, r.effort_hint, explicit);
+                let body_vec = apply_effort_hint(body_vec, hint);
+                if stream {
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                }
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+            }
+            TargetPool::Trae => {
+                if stream {
+                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard)
+                } else {
+                    aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await
+                }
+            }
+            TargetPool::Custom => {
+                match super::custom_models::find_enabled(&state.data_dir, &model) {
+                    Some(cm) => {
+                        if stream {
+                            custom_route::custom_stream_chat(state_clone, body_vec, r.model, cm, start_ts, Protocol::Anthropic, key_str, guard)
+                        } else {
+                            custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, cm, stream, start_ts, Protocol::Anthropic, key_str, guard).await
+                        }
+                    }
+                    None => anthropic_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model)),
+                }
+            }
+        },
     }
 }
 
@@ -653,31 +718,40 @@ pub async fn completions(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
-    // 模型路由（T5.2/F-61 四段管线）
-    if let Some((resolved_model, route_hint)) = resolve_wb_target(&state, &model, &internal) {
-        if !state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            return openai_error(
-                StatusCode::BAD_REQUEST,
-                "wb_upstream_disabled",
-                "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）",
-            );
-        }
-        if wb_route::model_cooling_remaining(&state, &resolved_model).is_some() {
-            return model_cooling_response(&state, &resolved_model, Protocol::OpenAiText);
-        }
-        // T5.3 默认深度思考（text completions 无 effort 字段 → 默认思考直接生效）
-        let hint = effective_effort_hint(&state, route_hint, false);
-        let body_vec = apply_effort_hint(body_vec, hint);
-        if stream {
-            return wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::OpenAiText, key_str);
-        }
-        return wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::OpenAiText, key_str).await;
-    }
-
-    if stream {
-        stream_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAiText, key_str)
-    } else {
-        aggregate_chat(state_clone, body_vec, model, stream, start_ts, Protocol::OpenAiText, key_str).await
+    // 统一调度分流点（§4.1）；guard 随执行路径持有至请求结束
+    let guard = state.inflight_guard();
+    match dispatch::resolve_target(&state, &model, &internal) {
+        Err(e) => dispatch_error_response(e, Protocol::OpenAiText, &model),
+        Ok(r) => match r.pool {
+            TargetPool::Buddy => {
+                // T5.3 默认深度思考（text completions 无 effort 字段 → 默认思考直接生效）
+                let hint = effective_effort_hint(&state, r.effort_hint, false);
+                let body_vec = apply_effort_hint(body_vec, hint);
+                if stream {
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                }
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+            }
+            TargetPool::Trae => {
+                if stream {
+                    stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard)
+                } else {
+                    aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await
+                }
+            }
+            TargetPool::Custom => {
+                match super::custom_models::find_enabled(&state.data_dir, &model) {
+                    Some(cm) => {
+                        if stream {
+                            custom_route::custom_stream_chat(state_clone, body_vec, r.model, cm, start_ts, Protocol::OpenAiText, key_str, guard)
+                        } else {
+                            custom_route::custom_aggregate_chat(state_clone, body_vec, r.model, cm, stream, start_ts, Protocol::OpenAiText, key_str, guard).await
+                        }
+                    }
+                    None => openai_error(StatusCode::NOT_FOUND, "model_not_found", &format!("自定义模型 {} 已被删除", model)),
+                }
+            }
+        },
     }
 }
 
@@ -719,6 +793,8 @@ async fn images_entry(
     state
         .total_requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // inflight guard（§4.5）：async fn 全程 inline await，作用域即请求生命周期
+    let _guard = state.inflight_guard();
     if body.len() > MAX_BODY_BYTES {
         return openai_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", "request body exceeds 8MB limit");
     }
@@ -807,7 +883,7 @@ async fn images_entry(
 // ==================== Streaming ====================
 
 #[allow(clippy::too_many_arguments)]
-fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String) -> Response {
+fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     // SSE keep-alive 15s（T2.7/F-34 §5.5 #7）：防中间层回收长流；
@@ -831,6 +907,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
     }
 
     tokio::task::spawn_blocking(move || {
+        // inflight guard 随后台任务存续至流结束（§4.5：客户端断连/流终止由
+        // 任务结束 Drop 兜底释放）
+        let _inflight = guard;
         let chat_id = match proto {
             Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
             Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
@@ -1026,8 +1105,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
 // ==================== Non-streaming ====================
 
-async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String) -> Response {
+async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
     let result = tokio::task::spawn_blocking(move || {
+        // inflight guard 随后台任务存续至聚合完成（§4.5）
+        let _inflight = guard;
         let mut tried = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
@@ -1309,7 +1390,7 @@ pub(crate) fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> 
 
 /// 流式错误统一下发：sse 层在流未开始时不透传错误（留待重试决策），
 /// 由此处按客户端协议格式化错误事件并收尾
-fn send_stream_error(
+pub(crate) fn send_stream_error(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
     code: i64,

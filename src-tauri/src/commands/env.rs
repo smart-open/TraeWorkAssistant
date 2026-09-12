@@ -374,14 +374,24 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
             user_data_dir: format!("{local}\\Doubao\\User Data"),
             settings_key: Some("doubao_path"),
         },
-        "workbuddy" | "codebuddy" => AppProfile {
+        "workbuddy" => AppProfile {
             display: "WorkBuddy",
             reg_patterns: &["WorkBuddy", "CodeBuddy"],
             reg_exe_names: &["WorkBuddy.exe"],
             exe_candidates: &["%LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddy.exe"],
             proc_names: &["WorkBuddy"],
             user_data_dir: format!("{home}\\.workbuddy"),
-            settings_key: None,
+            settings_key: Some("workbuddy_path"),
+        },
+        // CodeBuddy IDE 独立探测（顶栏安装徽标/打开客户端）：默认路径同 WorkBuddy 的 Electron 惯例
+        "codebuddy" => AppProfile {
+            display: "CodeBuddy",
+            reg_patterns: &["CodeBuddy"],
+            reg_exe_names: &["CodeBuddy.exe"],
+            exe_candidates: &["%LOCALAPPDATA%\\Programs\\CodeBuddy\\CodeBuddy.exe"],
+            proc_names: &["CodeBuddy"],
+            user_data_dir: format!("{home}\\.codebuddy"),
+            settings_key: Some("codebuddy_path"),
         },
         // trae_work / traework / work / solo 及其它值 → 默认 Trae Work
         _ => AppProfile {
@@ -438,6 +448,7 @@ pub(crate) fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate 
             "trae_cn_path" => settings.trae_cn_path,
             "doubao_path" => settings.doubao_path,
             "workbuddy_path" => settings.workbuddy_path,
+            "codebuddy_path" => settings.codebuddy_path,
             _ => None,
         };
         if let Some(p) = custom {

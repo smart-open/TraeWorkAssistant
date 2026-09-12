@@ -1,4 +1,4 @@
-﻿import { useMemo, useEffect, useState } from 'react';
+import { useMemo, useEffect, useState } from 'react';
 import {
   BarChart,
   Bar,
@@ -24,21 +24,10 @@ import { api } from '../lib/tauri';
 import { useIsDark } from '../lib/useIsDark';
 import type { CheckinTrendPoint } from '../types';
 
-function formatUptime(startedAt: number | null): string | null {
-  if (startedAt == null) return null;
-  const secs = Math.floor(Date.now() / 1000 - startedAt);
-  if (secs < 60) return `${secs}秒`;
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins}分${secs % 60}秒`;
-  const hrs = Math.floor(mins / 60);
-  return `${hrs}时${mins % 60}分`;
-}
-
 export default function Dashboard() {
   const accounts = useAppStore((s) => s.accounts);
   const env = useAppStore((s) => s.env);
   const envCn = useAppStore((s) => s.envCn);
-  const apiStatus = useAppStore((s) => s.apiStatus);
   const certInstalled = useAppStore((s) => s.certInstalled);
   const localEntitlement = useAppStore((s) => s.localEntitlement);
   const refreshLocalEntitlement = useAppStore((s) => s.refreshLocalEntitlement);
@@ -147,10 +136,21 @@ export default function Dashboard() {
         <StatCard label="账号总数" value={total} hint={`今日已签 ${checkedToday}`} tone="brand" />
         <StatCard label="可用总积分" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={creditsHint} tone="amber" />
         <StatCard
-          label="API 服务"
-          value={apiStatus?.running ? `运行 :${apiStatus.port}` : '未启动'}
-          hint={apiStatus?.running ? `请求 ${apiStatus.total_requests} 次 · 运行 ${formatUptime(apiStatus.started_at)}` : undefined}
-          tone={apiStatus?.running ? 'green' : 'slate'}
+          label="登录账号"
+          value={localEntitlement?.work?.identity_str ?? (env?.installed ? '未登录' : '未安装')}
+          hint={
+            [
+              env?.running ? 'Trae Work 运行中' : env?.installed ? 'Trae Work 未运行' : null,
+              localEntitlement?.cn?.identity_str
+                ? `Trae：${localEntitlement.cn.identity_str}`
+                : envCn?.installed
+                  ? 'Trae 未登录'
+                  : null,
+            ]
+              .filter(Boolean)
+              .join(' · ') || undefined
+          }
+          tone="violet"
         />
         <StatCard
           label="JWT 告警"

@@ -127,9 +127,16 @@ pub struct Settings {
     /// 豆包快照可选纳入 Default/IndexedDB（C4：对话历史等完整状态随账号迁移；体积代价大，默认排除）
     #[serde(default)]
     pub doubao_snapshot_include_idb: bool,
-    /// WorkBuddy 桌面版 exe 手动路径（切换桥 workbuddy 档案 settings_key；页面随后续批次接入）
+    /// WorkBuddy 桌面版 exe 手动路径（切换桥 workbuddy 档案 settings_key；环境配置页持久化）
     #[serde(default)]
     pub workbuddy_path: Option<String>,
+    /// CodeBuddy 桌面版 exe 手动路径（app_locate codebuddy 档案 settings_key）
+    #[serde(default)]
+    pub codebuddy_path: Option<String>,
+    /// WorkBuddy auth 文件人工路径（默认 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info；
+    /// 非默认安装布局时在环境配置页指定）
+    #[serde(default)]
+    pub wb_auth_file_path: Option<String>,
     #[serde(default)]
     pub data_dir: Option<String>,
     #[serde(default = "default_retention")]

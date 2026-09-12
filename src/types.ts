@@ -216,8 +216,12 @@ export interface Settings {
   doubao_quota_url: string | null;
   /** 豆包快照可选纳入 Default/IndexedDB（对话历史等完整状态随账号迁移；体积代价大） */
   doubao_snapshot_include_idb: boolean;
-  /** WorkBuddy 桌面版 exe 手动路径（随后续批次接入） */
+  /** WorkBuddy 桌面版 exe 手动路径（环境配置页） */
   workbuddy_path: string | null;
+  /** CodeBuddy 桌面版 exe 手动路径（环境配置页） */
+  codebuddy_path: string | null;
+  /** WorkBuddy auth 文件人工路径（默认 %LOCALAPPDATA%\CodeBuddyExtension\...\workbuddy-desktop.info） */
+  wb_auth_file_path: string | null;
   data_dir: string | null;
   log_retention_days: number;
   proxy_domains: string;
@@ -306,6 +310,71 @@ export interface ApiServiceStatus {
   active_uid: string | null;
   last_error: string | null;
   started_at: number | null;
+  /** 当前并发数（统一网关 §4.5；可选：后端 Tauri 状态命令补齐前缺省 0） */
+  inflight?: number;
+}
+
+// ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
+/** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
+export interface UnifiedModelSource {
+  pool: 'trae' | 'buddy' | 'custom';
+  rate: number | null;
+  enabled: boolean;
+}
+
+/** 统一模型目录条目（api_unified_models 返回，实时聚合派生视图） */
+export interface UnifiedModel {
+  id: string;
+  display: string;
+  /** 实际生效倍率 = 当前调度策略命中的来源侧 */
+  rate: number | null;
+  /** 思考档位（双语义合并展示，仅 Buddy 池作为请求参数下发） */
+  efforts: string[];
+  context_length: number | null;
+  max_tokens: number | null;
+  supports_image: boolean | null;
+  /** L1 人工维护标记 */
+  manual: boolean;
+  sources: UnifiedModelSource[];
+}
+
+/** 网关设置（data/api_gateway_settings.json；gateway_settings_get/set） */
+export interface GatewaySettings {
+  port: number;
+  default_model: string;
+  updated_at: number;
+}
+
+/** 自定义模型条目（data/custom_models.json；custom_models_list/save/remove）。
+ *  OpenAI 兼容上游直通：请求模型名 canonical 命中 enabled 条目即直达该上游 */
+export interface CustomModel {
+  /** 稳定 id（cm-<12hex>，保存时为空则新增） */
+  id: string;
+  /** 请求模型名（路由键） */
+  name: string;
+  /** OpenAI 兼容 API 地址（如 https://api.openai.com 或含 /v1 前缀） */
+  base_url: string;
+  /** API Key（Bearer） */
+  api_key: string;
+  enabled: boolean;
+  context_length: number;
+  max_tokens: number;
+  supports_image: boolean;
+  /** 展示倍率（0 = 未声明） */
+  rate: number;
+  note: string;
+  updated_at: number;
+}
+
+/** Trae 模型元数据 L1 覆盖层（data/trae_model_meta.json；trae_model_meta_set/clear，§6.1）
+ *  嵌套字段保持 snake_case；null = 未设置，交由下层自动来源兜底（官网同步 > 内置参考 > 名称推断） */
+export interface TraeModelMeta {
+  label?: string | null;
+  rate?: number | null;
+  efforts?: string[] | null;
+  context_length?: number | null;
+  max_tokens?: number | null;
+  supports_image?: boolean | null;
 }
 
 /** 模型选项：id = 上游 config_name，label = 官方展示名 */
@@ -634,6 +703,8 @@ export interface WorkBuddyEnvCheck {
   running: boolean;
   version: string | null;
   exe: string | null;
+  /** 实际读取的 auth 文件路径（人工覆盖优先） */
+  auth_file_path: string;
   auth_file_exists: boolean;
   data_dir_exists: boolean;
   snapshot_uid: string | null;

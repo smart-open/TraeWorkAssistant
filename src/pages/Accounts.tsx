@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Plus,
@@ -474,7 +474,7 @@ export default function Accounts() {
         actions={
           <>
             <button onClick={() => void refreshAccountsAndPay()} className="btn-outline" title="刷新账号列表、套餐与积分数据">
-              <RefreshCw size={15} /> 刷新数据
+              <RefreshCw size={15} /> 刷新
             </button>
             <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae Work / Trae 已登录账号，一键加入账号池">
               <ScanSearch size={15} /> 扫描本机

@@ -1,13 +1,11 @@
-﻿import { useCallback, useEffect, useState } from 'react';
-import { Save, FolderOpen, RefreshCw, TerminalSquare, Play, CalendarClock, MousePointerClick } from 'lucide-react';
-import { open } from '@tauri-apps/plugin-shell';
-import { localDataDir } from '@tauri-apps/api/path';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Save, FolderOpen, RefreshCw, TerminalSquare, Play, CalendarClock, MousePointerClick, Search } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import type { WorkBuddySettings, WorkBuddyEnvCheck, WbCliStatus, WbCliRotateLog } from '../../types';
+import type { WorkBuddySettings, WorkBuddyEnvCheck, WbCliStatus, WbCliRotateLog, Settings, AppLocate } from '../../types';
 
 /**
  * buddy-settings 环境配置（§3.7.5，F-55/F-59/F-13）：
@@ -391,6 +389,16 @@ export default function BuddySettings() {
   const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
   const [settings, setSettings] = useState<WorkBuddySettings | null>(null);
   const [saving, setSaving] = useState(false);
+  // 应用级路径配置（workbuddy_path / codebuddy_path / wb_auth_file_path 存 app Settings）
+  const [appSettings, setAppSettings] = useState<Settings | null>(null);
+  const [locWb, setLocWb] = useState<AppLocate | null>(null);
+  const [locCb, setLocCb] = useState<AppLocate | null>(null);
+  // 路径表单：输入框内直接展示（自动检测预填，可人工修改替换），随右上角「保存配置」统一提交
+  const [pathForm, setPathForm] = useState({ workbuddy_path: '', codebuddy_path: '', wb_auth_file_path: '' });
+  const [locWbDone, setLocWbDone] = useState(false);
+  const [locCbDone, setLocCbDone] = useState(false);
+  const [detecting, setDetecting] = useState<string | null>(null);
+  const prefilled = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -403,6 +411,21 @@ export default function BuddySettings() {
     } catch (err) {
       pushToast('error', `环境检测失败：${String(err)}`);
     }
+    // 路径配置与四级探测来源（失败静默，不阻断主检测）
+    api.misc
+      .settingsGet()
+      .then(setAppSettings)
+      .catch(() => setAppSettings(null));
+    api.env
+      .locate('workbuddy')
+      .then(setLocWb)
+      .catch(() => setLocWb(null))
+      .finally(() => setLocWbDone(true));
+    api.env
+      .locate('codebuddy')
+      .then(setLocCb)
+      .catch(() => setLocCb(null))
+      .finally(() => setLocCbDone(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -410,12 +433,34 @@ export default function BuddySettings() {
     void refresh();
   }, [refresh]);
 
+  // 首次数据就绪后预填路径输入框：人工配置优先，否则自动检测值（auth 为实际读取路径）
+  useEffect(() => {
+    if (prefilled.current || !appSettings || !locWbDone || !locCbDone) return;
+    prefilled.current = true;
+    setPathForm({
+      workbuddy_path: appSettings.workbuddy_path ?? locWb?.exe ?? '',
+      codebuddy_path: appSettings.codebuddy_path ?? locCb?.exe ?? '',
+      wb_auth_file_path: appSettings.wb_auth_file_path ?? env?.auth_file_path ?? '',
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appSettings, locWbDone, locCbDone, locWb, locCb, env]);
+
   const save = async () => {
     if (!settings) return;
     setSaving(true);
     try {
       await withMinDelay(api.workbuddy.settingsSet(settings), 800);
+      // 路径配置随「保存配置」一并提交（settings_set 真 patch 语义，仅写出现的字段）
+      if (appSettings) {
+        await api.misc.settingsSet({
+          ...appSettings,
+          workbuddy_path: pathForm.workbuddy_path.trim() || null,
+          codebuddy_path: pathForm.codebuddy_path.trim() || null,
+          wb_auth_file_path: pathForm.wb_auth_file_path.trim() || null,
+        });
+      }
       pushToast('success', '配置已保存');
+      await refresh();
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
@@ -425,6 +470,34 @@ export default function BuddySettings() {
 
   const patch = (p: Partial<WorkBuddySettings>) => {
     setSettings((prev) => (prev ? { ...prev, ...p } : prev));
+  };
+
+  /** 探测来源中文标签（settings = 人工指定） */
+  const LOCATE_SOURCE_LABEL: Record<string, string> = {
+    settings: '人工指定',
+    registry: '注册表',
+    default: '默认路径',
+    process: '运行进程',
+    not_found: '未检测到',
+  };
+
+  /** 自动检测：四级探测 → 命中即替换输入框内容，随「保存配置」统一生效 */
+  const detectPath = async (target: 'workbuddy' | 'codebuddy') => {
+    setDetecting(target);
+    try {
+      const r = await withMinDelay(api.env.locate(target), 600);
+      const key = target === 'workbuddy' ? 'workbuddy_path' : 'codebuddy_path';
+      if (r.exe) {
+        setPathForm((f) => ({ ...f, [key]: r.exe as string }));
+        pushToast('info', `已定位（${LOCATE_SOURCE_LABEL[r.source] ?? r.source}${r.version ? `，v${r.version}` : ''}）`);
+      } else {
+        pushToast('warn', '未检测到客户端，请人工填写 exe 路径');
+      }
+    } catch (err) {
+      pushToast('error', `检测失败：${String(err)}`);
+    } finally {
+      setDetecting(null);
+    }
   };
 
   return (
@@ -437,83 +510,118 @@ export default function BuddySettings() {
             <button className="btn-outline" onClick={() => void refresh()}>
               <RefreshCw size={15} /> 重新检测
             </button>
-            <button className="btn-primary" onClick={() => void save()} disabled={saving || !settings}>
-              {saving ? <Spinner className="text-white" /> : <Save size={15} />} 保存配置
+            <button className="btn-outline" onClick={() => void save()} disabled={saving || !settings}>
+              {saving ? <Spinner /> : <Save size={15} />} 保存配置
             </button>
           </>
         }
       />
 
-      {/* 环境卡 */}
-      <div className="card p-4">
-        <div className="mb-3 flex items-center justify-between">
-          <span className="text-sm font-medium">环境</span>
-          <div className="flex gap-2">
-            <Badge tone={env?.installed ? 'green' : 'red'}>{env?.installed ? '已安装' : '未安装'}</Badge>
-            <Badge tone={env?.running ? 'green' : 'slate'}>{env?.running ? '运行中' : '已停止'}</Badge>
-            {env?.version && <Badge tone="slate">v{env.version}</Badge>}
+      {/* 环境卡 + 失败通知渠道：一行两列（各占 1/2） */}
+      <div className="grid items-start gap-4 lg:grid-cols-2">
+        {/* 环境卡：WorkBuddy / CodeBuddy 客户端路径 + auth 文件路径（自动检测 + 人工配置） */}
+        <div className="card p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <span className="text-sm font-medium">环境</span>
+            <div className="flex items-center gap-2">
+              <Badge tone={env?.installed ? 'green' : 'red'}>
+                WorkBuddy{env?.installed ? `已安装${env?.version ? ` v${env.version}` : ''}` : '未安装'}
+              </Badge>
+              <Badge tone={env?.running ? 'green' : 'slate'}>{env?.running ? '运行中' : '已停止'}</Badge>
+            </div>
+          </div>
+          <div className="space-y-3 text-xs">
+            {/* WorkBuddy 客户端路径（输入框直显：自动检测预填，可人工替换，随「保存配置」生效） */}
+            <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+              <div className="mb-2 flex items-center justify-between font-medium text-slate-500">
+                WorkBuddy 客户端路径
+                <Badge tone={locWb?.exe ? 'green' : 'amber'}>{LOCATE_SOURCE_LABEL[locWb?.source ?? 'not_found']}</Badge>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  className="input flex-1 font-mono text-xs"
+                  value={pathForm.workbuddy_path}
+                  onChange={(e) => setPathForm((f) => ({ ...f, workbuddy_path: e.target.value }))}
+                  placeholder={locWb?.exe ?? '未检测到，留空 = 自动检测'}
+                />
+                <button className="btn-outline shrink-0 !px-2 !py-1" onClick={() => void detectPath('workbuddy')} disabled={detecting !== null}>
+                  {detecting === 'workbuddy' ? <Spinner /> : <Search size={13} />} 自动检测
+                </button>
+              </div>
+            </div>
+            {/* CodeBuddy 客户端路径 */}
+            <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+              <div className="mb-2 flex items-center justify-between font-medium text-slate-500">
+                CodeBuddy 客户端路径
+                <Badge tone={locCb?.exe ? 'green' : 'amber'}>{LOCATE_SOURCE_LABEL[locCb?.source ?? 'not_found']}</Badge>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  className="input flex-1 font-mono text-xs"
+                  value={pathForm.codebuddy_path}
+                  onChange={(e) => setPathForm((f) => ({ ...f, codebuddy_path: e.target.value }))}
+                  placeholder={locCb?.exe ?? '未检测到，留空 = 自动检测'}
+                />
+                <button className="btn-outline shrink-0 !px-2 !py-1" onClick={() => void detectPath('codebuddy')} disabled={detecting !== null}>
+                  {detecting === 'codebuddy' ? <Spinner /> : <Search size={13} />} 自动检测
+                </button>
+              </div>
+            </div>
+            {/* auth 文件路径（实际读取路径直显；人工覆盖 + 打开目录） */}
+            <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+              <div className="mb-2 flex items-center justify-between font-medium text-slate-500">
+                auth 文件路径
+                <Badge tone={env?.auth_file_exists ? 'green' : 'amber'}>{env?.auth_file_exists ? '存在 ✓' : '不存在'}</Badge>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  className="input flex-1 font-mono text-xs"
+                  value={pathForm.wb_auth_file_path}
+                  onChange={(e) => setPathForm((f) => ({ ...f, wb_auth_file_path: e.target.value }))}
+                  placeholder={env?.auth_file_path || '检测中…'}
+                />
+                <button className="btn-outline shrink-0 !px-2 !py-1" onClick={() => void api.workbuddy.openAuthDir().catch((e) => pushToast('error', String(e)))}>
+                  <FolderOpen size={13} /> 打开所在目录
+                </button>
+              </div>
+              <p className="mt-1.5 text-slate-400">路径改动随右上角「保存配置」一并生效；留空恢复默认位置</p>
+            </div>
           </div>
         </div>
-        <div className="grid gap-3 lg:grid-cols-2">
-          <div className="rounded-lg border border-slate-100 p-3 text-xs dark:border-zinc-800">
-            <div className="mb-1 font-medium text-slate-500">客户端路径（自动检测）</div>
-            <div className="break-all font-mono text-slate-600 dark:text-zinc-300">{env?.exe ?? '未检测到'}</div>
-            <div className="mt-1 text-slate-400">手动路径覆盖可在 Trae 页「环境配置」的 workbuddy_path 设置（随后续批次开放）</div>
-          </div>
-          <div className="rounded-lg border border-slate-100 p-3 text-xs dark:border-zinc-800">
-            <div className="mb-1 flex items-center justify-between font-medium text-slate-500">
-              auth 文件路径
-              <Badge tone={env?.auth_file_exists ? 'green' : 'amber'}>{env?.auth_file_exists ? '存在 ✓' : '不存在'}</Badge>
-            </div>
-            <div className="break-all font-mono text-slate-600 dark:text-zinc-300">
-              %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
-            </div>
-            <button
-              className="mt-2 flex items-center gap-1 text-xs text-brand-600 hover:underline dark:text-brand-400"
-              onClick={() =>
-                void localDataDir()
-                  .then((d) => open(`file:///${d.replace(/\\/g, '/')}CodeBuddyExtension/Data/Public/auth`))
-                  .catch((e) => pushToast('error', `打开目录失败：${String(e)}`))
-              }
-            >
-              <FolderOpen size={13} /> 打开所在目录
-            </button>
+
+        {/* 通知渠道（F-19） */}
+        <div className="card p-4">
+          <div className="mb-3 text-sm font-medium">失败通知渠道</div>
+          <div className="space-y-3">
+            <p className="text-xs text-slate-400">
+              桌面通知之外的可选渠道：签到/补签失败等关键事件会同时推送到已配置的渠道（留空 = 关闭）。
+            </p>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-500">企业微信群机器人 Webhook</span>
+              <input
+                className="input w-full font-mono text-xs"
+                value={settings?.notify_wechat_webhook ?? ''}
+                onChange={(e) => patch({ notify_wechat_webhook: e.target.value || null })}
+                placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+              />
+              <span className="mt-1 block text-xs text-slate-400">群机器人消息：标题 + 失败摘要</span>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-500">Server酱 SendKey</span>
+              <input
+                className="input w-full font-mono text-xs"
+                value={settings?.notify_serverchan_sendkey ?? ''}
+                onChange={(e) => patch({ notify_serverchan_sendkey: e.target.value || null })}
+                placeholder="SCTxxxxxxxx（sctapi.ftqq.com）"
+              />
+              <span className="mt-1 block text-xs text-slate-400">推送到微信服务号；Key 仅本地保存，不进日志</span>
+            </label>
           </div>
         </div>
       </div>
 
       {/* 签到配置（F-55/F-16/F-18）：自动签到 + 定时任务 + 坐标点击兜底 */}
       <CheckinConfigCard settings={settings} patch={patch} />
-
-      {/* 通知渠道（F-19） */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 text-sm font-medium">失败通知渠道</div>
-        <div className="space-y-3">
-          <p className="text-xs text-slate-400">
-            桌面通知之外的可选渠道：签到/补签失败等关键事件会同时推送到已配置的渠道（留空 = 关闭）。
-          </p>
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-slate-500">企业微信群机器人 Webhook</span>
-            <input
-              className="input w-full font-mono text-xs"
-              value={settings?.notify_wechat_webhook ?? ''}
-              onChange={(e) => patch({ notify_wechat_webhook: e.target.value || null })}
-              placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
-            />
-            <span className="mt-1 block text-xs text-slate-400">群机器人消息：标题 + 失败摘要</span>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-slate-500">Server酱 SendKey</span>
-            <input
-              className="input w-full font-mono text-xs"
-              value={settings?.notify_serverchan_sendkey ?? ''}
-              onChange={(e) => patch({ notify_serverchan_sendkey: e.target.value || null })}
-              placeholder="SCTxxxxxxxx（sctapi.ftqq.com）"
-            />
-            <span className="mt-1 block text-xs text-slate-400">推送到微信服务号；Key 仅本地保存，不进日志</span>
-          </label>
-        </div>
-      </div>
 
       {/* CLI 五重防护自动轮换（F-06/F-59，批次3） */}
       <CliRotateCard settings={settings} patch={patch} />

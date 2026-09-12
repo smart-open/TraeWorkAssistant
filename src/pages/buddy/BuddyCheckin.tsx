@@ -1,6 +1,6 @@
-﻿import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { PlayCircle, Sparkles } from 'lucide-react';
+import { CheckCircle2, PlayCircle, Sparkles, XCircle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -50,16 +50,23 @@ function parseLine(raw: string): ParsedEvent | null {
   }
 }
 
-const statusTone: Record<string, 'green' | 'blue' | 'red'> = {
-  success: 'green',
-  already: 'blue',
-  fail: 'red',
-};
 const statusText: Record<string, string> = {
   success: '成功',
   already: '已签',
   fail: '失败',
 };
+
+/** 登录态徽标：needs_relogin 优先，其次按 access_token 剩余时长分色（对齐 Trae MiniJwtBadge 形态） */
+function MiniTokenBadge({ a }: { a: WorkBuddyAccountView }) {
+  if (a.needs_relogin)
+    return <span className="text-xs text-rose-500"><XCircle size={11} className="inline" /> 需重新登录</span>;
+  const exp = a.access_token_expires_at;
+  if (!exp) return <span className="text-xs text-slate-400">未知</span>;
+  const hours = (exp - Math.floor(Date.now() / 1000)) / 3600;
+  if (hours <= 0) return <span className="text-xs text-rose-500"><XCircle size={11} className="inline" /> 已过期</span>;
+  if (hours <= 24) return <span className="text-xs text-amber-500">{hours.toFixed(1)}h</span>;
+  return <span className="text-xs text-emerald-500">{hours.toFixed(0)}h</span>;
+}
 
 export default function BuddyCheckin() {
   const pushToast = useAppStore((s) => s.pushToast);
@@ -189,42 +196,10 @@ export default function BuddyCheckin() {
 
   return (
     <div className="animate-fade-in">
-      <PageHeader
-        title="Buddy · 签到与成长"
-        desc="一键签到 · 成长中心 · 定时任务见环境配置"
-        actions={
-          <button className="btn-primary" onClick={() => void startCheckin()} disabled={running}>
-            <PlayCircle size={15} /> {running ? '签到中…' : '立即签到'}
-          </button>
-        }
-      />
+      <PageHeader title="Buddy · 签到与成长" desc="一键签到 · 成长中心 · 定时任务见环境配置" />
 
-      {/* 签到控制卡 */}
+      {/* 成长中心卡（F-17：三开关 + 立即执行，T2.5 执行器）——与签到进度卡上下互换后置顶 */}
       <div className="card p-4">
-        <div className="mb-3 flex items-center justify-between">
-          <span className="text-sm font-medium">签到进度</span>
-          {running && <Badge tone="blue">执行中</Badge>}
-          {summary && !running && <span className="text-xs text-slate-400">{summary}</span>}
-        </div>
-        {lines.length === 0 && !running ? (
-          <p className="py-4 text-center text-xs text-slate-400">
-            {accounts.length > 0 ? `共 ${accounts.length} 个账号待签：点击「立即签到」开始（已签账号自动跳过）` : '账号池为空：请先在「账号管理」导入账号'}
-          </p>
-        ) : (
-          <div className="space-y-1.5">
-            {lines.map((l, i) => (
-              <div key={i} className="flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800">
-                <Badge tone={statusTone[l.status] ?? 'slate'}>{statusText[l.status] ?? l.status}</Badge>
-                <span className="min-w-0 flex-1 truncate font-medium">{l.name || l.user_id}</span>
-                <span className="max-w-[50%] truncate text-xs text-slate-400">{l.message}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* 成长中心卡（F-17：三开关 + 立即执行，T2.5 执行器） */}
-      <div className="mt-4 card p-4">
         <div className="mb-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Sparkles size={16} className="text-violet-500" />
@@ -302,6 +277,94 @@ export default function BuddyCheckin() {
               </div>
             ))}
           </div>
+        )}
+      </div>
+
+      {/* 一键签到卡（对齐 Trae 一键签到形态：账号列表表格 + 实时结果行 + 按钮右下角） */}
+      <div className="mt-4 card p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">一键签到</span>
+            {running && <Badge tone="blue">执行中</Badge>}
+            {!running && summary && (
+              <Badge tone={summary.includes('失败 0') ? 'green' : 'amber'}>{summary}</Badge>
+            )}
+          </div>
+          {accounts.length > 0 && !running && (
+            <span className="text-xs text-slate-400">已签账号自动跳过</span>
+          )}
+        </div>
+
+        {/* 参与签到的账号列表（列形态对齐 Trae：账号 / 登录态 / 版本 / 积分） */}
+        <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-zinc-900">
+              <tr>
+                <th className="px-3 py-1.5 text-left">账号</th>
+                <th className="px-3 py-1.5 text-left">登录态</th>
+                <th className="px-3 py-1.5 text-left">版本</th>
+                <th className="px-3 py-1.5 text-right">积分</th>
+              </tr>
+            </thead>
+            <tbody>
+              {accounts.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="px-3 py-4 text-center text-xs text-slate-400">
+                    暂无账号：请先在「账号管理」导入本机账号
+                  </td>
+                </tr>
+              ) : (
+                accounts.map((a) => (
+                  <tr key={a.id} className="border-t border-slate-100 dark:border-zinc-800">
+                    <td className="px-3 py-1.5">
+                      <div className="font-medium">{a.nickname || a.uid}</div>
+                      <div className="text-xs text-slate-400">{a.phone_masked || a.id}</div>
+                    </td>
+                    <td className="px-3 py-1.5"><MiniTokenBadge a={a} /></td>
+                    <td className="px-3 py-1.5 text-xs text-slate-500">{a.edition_type || '-'}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-xs">
+                      {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* 实时结果行（对齐 Trae 实时进度行形态：图标 + 序号 + 账号 + 结果文案） */}
+        {lines.length > 0 && (
+          <div className="mt-3 space-y-1">
+            {lines.map((l, i) => {
+              const tone =
+                l.status === 'success'
+                  ? 'text-emerald-600 dark:text-emerald-300'
+                  : l.status === 'already'
+                  ? 'text-sky-600 dark:text-sky-300'
+                  : 'text-rose-600 dark:text-rose-300';
+              const Icon = l.status === 'fail' ? XCircle : CheckCircle2;
+              return (
+                <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
+                  <Icon size={14} className={tone} />
+                  <span className="w-8 text-right text-xs text-slate-400">{l.index}</span>
+                  <span className="flex-1 truncate">{l.name || l.user_id}</span>
+                  <span className={`max-w-[50%] truncate text-xs ${tone}`} title={l.message}>
+                    {statusText[l.status] === '成功' ? (l.message || '签到成功') : (l.message || statusText[l.status])}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* 操作区：按钮右下角（对齐 Trae） */}
+        <div className="mt-3 flex justify-end">
+          <button className="btn-outline" onClick={() => void startCheckin()} disabled={running}>
+            <PlayCircle size={15} /> {running ? '签到中…' : '开始签到'}
+          </button>
+        </div>
+        {running && (
+          <div className="mt-1 text-right text-xs text-slate-500">签到进行中，逐账号结果将在上方实时刷新…</div>
         )}
       </div>
     </div>

@@ -21,6 +21,7 @@ import BuddyCheckin from './pages/buddy/BuddyCheckin';
 import BuddyCredits from './pages/buddy/BuddyCredits';
 import BuddyApiService from './pages/buddy/BuddyApiService';
 import BuddySettings from './pages/buddy/BuddySettings';
+import ApiManagerModal from './components/api/ApiManagerModal';
 
 function renderView(view: string) {
   switch (view) {
@@ -109,6 +110,8 @@ export default function App() {
         </main>
       </div>
       <Toaster />
+      {/* 全局 API 管理弹窗（任意 activeApp 视图均可打开，unified-api-gateway-design §5.2） */}
+      <ApiManagerModal />
     </div>
   );
 }

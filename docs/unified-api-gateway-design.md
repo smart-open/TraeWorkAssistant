@@ -123,7 +123,7 @@ Trae 官网 `batch_get_detail_param` 接口实际返回倍率等运营字段（�
 ### 3.3 去重合并规则
 
 1. **归并键**：`canonical_id()` = trim + 小写后的模型 ID，与 `wb_catalog::find` 语义一致；**三处键统一走同一函数**：目录归并键、`dispatch_policy.per_model` 键、`trae_model_meta.json` 覆盖层键，防止规则漂移；
-2. **双源命中**：`sources` 记录两侧，`rate/efforts/context/image` 取**有值优先**（WB 目录结构化元数据为主源，Trae 侧按 §3.2 四层解析）；
+2. **双源命中**：`sources` 记录两侧；顶层 `rate` = 策略命中侧倍率（§4.2），`display / supports_image` 亦按**策略命中侧**选定（v1.2 修订：不再无条件取 WB 值；命中侧未声明时有值兜底），`display` 在 L1 人工 label 存在时绝对优先（§3.2）；`efforts / context / max_tokens` 取**有值优先**（WB 目录结构化元数据为主源——efforts 仅 Buddy 池作为请求参数下发，见 §3.1 注）；
 3. **单源命中**：仅记录该池，另一池不出现；
 4. **目录序**：默认按"双源在前、单源在后，同组内字母序"，资源页展示时按所属池单独过滤；
 5. **可用性标记**：`sources[].enabled` 为运行时派生（wb_enabled / 账号池健康状态），不落盘。
@@ -349,6 +349,7 @@ v1 单屏堆叠 8 个区块过长，且 API Keys 管理自带子弹框会形成 
 | 会话池粘性（内存态） | `session_key → (pool, expire_ts)`，TTL 60s（§4.4），不落盘 |
 | 跨池回退 warn 日志 | `dispatch fallback: model=… preferred=… actual=… reason=…`（§4.5） |
 | `store.showApiManager` + `ApiManagerModal` 组件 | 全局弹窗（Tab 分区） |
+| `fs_utils::read_json_cached` 解析缓存 | 调度热路径 4 份数据文件（dispatch_policy / wb_model_route / wb_model_catalog / api_models）按 mtime+size 校验缓存已解析值，`write_json` 写后逐出——消除 `resolve_target` 每请求约 4 次磁盘读（v1.2 修订） |
 
 ### 8.2 修改
 

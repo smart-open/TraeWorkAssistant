@@ -1,4 +1,4 @@
-﻿import { useMemo, useState, useEffect } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { PlayCircle, CheckCircle2, XCircle, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw, Users } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
@@ -291,7 +291,7 @@ export default function Checkin() {
           <button
             onClick={start}
             disabled={checkin.active}
-            className="btn-primary"
+            className="btn-outline"
           >
             <PlayCircle size={16} /> {checkin.active ? '签到进行中…' : '开始签到'}
           </button>
@@ -345,7 +345,8 @@ export default function Checkin() {
               <span>本轮没有发起签到：所有账号均已签到 / JWT 过期 / 冷却中，被「跳过规则」过滤，无候选账号</span>
             </div>
           )}
-          <div className="max-h-80 space-y-1 overflow-auto">
+          {/* 高度自适应：不限制容器高度，避免内部竖向滚动条（页面级滚动） */}
+          <div className="space-y-1">
             {checkin.results.map((r) => {
               if (!r) return null;
               const tone =

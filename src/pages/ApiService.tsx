@@ -1,254 +1,120 @@
-﻿import { useEffect, useState, useCallback, useMemo } from 'react';
-import {
-  Play,
-  Square,
-  Save,
-  RefreshCw,
-  CheckCircle2,
-  XCircle,
-  Activity,
-  Globe,
-  Eraser,
-  Copy,
-  Info,
-  BarChart3,
-  KeyRound,
-  Plus,
-  Trash2,
-  Power,
-  Plug,
-} from 'lucide-react';
-import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Legend,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
-import { Badge, StatCard, Modal } from '../components/ui';
+import { Badge, Modal, Spinner, StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
-import { maskApiKey, fmtTokens } from '../lib/format';
 import type {
-  Settings,
   ApiServiceStatus,
   PoolStatus,
-  ModelOption,
+  TraeModelMeta,
+  UnifiedModel,
   UsageDayView,
-  ApiKeyEntry,
   GroupView,
 } from '../types';
 
+/**
+ * Trae · 资源调度（unified-api-gateway-design §6.1，Phase 3）
+ * 页内仅保留本应用资源级内容（自上而下）：积分体系说明 / 池指标行 / 账号池选择 / 模型目录（Trae）。
+ * 模型目录数据源为统一目录聚合（api.apiServer.unifiedModels 过滤 Trae 源，§3.2 四层兜底），
+ * 行内「编辑」弹框维护 L1 人工覆盖层（trae_model_meta_set/clear），保存后聚合视图即时生效。
+ * 网关级功能（启停 / 接口配置 / API Keys / 生态接入 / 用量统计）已全部迁至
+ * 全局 API 管理弹窗（左侧栏 KeyRound 图标），页内不再出现网关级内容。
+ */
+
+/** 思考档位选项（编辑弹框多选，顺序固定） */
+const EFFORT_OPTIONS = ['low', 'medium', 'high'] as const;
+
+/** 表单数值解析：空串 → null（未设置）；非法数字返回 NaN 由调用方拦截 */
+const numOrNull = (s: string) => {
+  const t = s.trim();
+  if (t === '') return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : NaN;
+};
+
 export default function ApiService() {
-  const settings = useAppStore((s) => s.settings);
-  const saveSettings = useAppStore((s) => s.saveSettings);
-  const refreshSettings = useAppStore((s) => s.refreshSettings);
   const accounts = useAppStore((s) => s.accounts);
   const refreshAccounts = useAppStore((s) => s.refreshAccounts);
   const toast = useAppStore((s) => s.pushToast);
 
-  const [form, setForm] = useState<Settings | null>(null);
-  const [saving, setSaving] = useState(false);
+  // ---- 池指标 / 账号池 ----
   const [status, setStatus] = useState<ApiServiceStatus | null>(null);
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
   const [poolStrategy, setPoolStrategy] = useState('expire_first');
   const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
   const [groups, setGroups] = useState<GroupView[]>([]);
-  const [starting, setStarting] = useState(false);
-  const [stopping, setStopping] = useState(false);
   const [savingPool, setSavingPool] = useState(false);
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
   const [refreshingPool, setRefreshingPool] = useState(false);
-  const [copying, setCopying] = useState(false);
-  const [models, setModels] = useState<ModelOption[]>([]);
-  const [syncingModels, setSyncingModels] = useState(false);
+  // 当日活跃账号数据源（今日用量桶的账号维度计数）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
-  const [usageDays, setUsageDays] = useState(14);
-  const [usageLoading, setUsageLoading] = useState(false);
-  const [apiKeys, setApiKeys] = useState<ApiKeyEntry[]>([]);
-  const [authDisabled, setAuthDisabled] = useState(false);
-  const [keysSaving, setKeysSaving] = useState(false);
-  const [newKeyName, setNewKeyName] = useState('');
-  const [newKeyLimit, setNewKeyLimit] = useState(0);
-  const [newKeyValue, setNewKeyValue] = useState('');
-  // F-35 子 Key 配置弹框 + 删除确认（禁 window.confirm，红线）
-  const [editKey, setEditKey] = useState<ApiKeyEntry | null>(null);
-  const [editAllowed, setEditAllowed] = useState<Set<string>>(new Set());
-  const [editMode, setEditMode] = useState('expire_first');
-  const [editDedicated, setEditDedicated] = useState('');
-  const [deleteForKey, setDeleteForKey] = useState<ApiKeyEntry | null>(null);
+
+  // ---- 模型目录（Trae 源） ----
+  const [models, setModels] = useState<UnifiedModel[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [syncingModels, setSyncingModels] = useState(false);
+  // 编辑弹框（null = 关闭；表单留空 = 未设置，交由下层自动来源兜底）
+  const [editing, setEditing] = useState<UnifiedModel | null>(null);
+  const [fLabel, setFLabel] = useState('');
+  const [fRate, setFRate] = useState('');
+  const [fEfforts, setFEfforts] = useState<Set<string>>(new Set());
+  const [fContext, setFContext] = useState('');
+  const [fMaxTokens, setFMaxTokens] = useState('');
+  const [fImage, setFImage] = useState<'' | 'true' | 'false'>('');
+  const [savingMeta, setSavingMeta] = useState(false);
+  const [clearingMeta, setClearingMeta] = useState(false);
 
   useEffect(() => {
-    void refreshSettings();
     void refreshAccounts();
     void loadPool();
     void refreshStatus();
-    void loadModels();
     void loadGroups();
-  }, [refreshSettings, refreshAccounts]);
+    void loadTodayUsage();
+    void loadModels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshAccounts]);
 
-  useEffect(() => {
-    if (settings && !form) {
-      setForm(settings);
-    }
-  }, [settings, form]);
-
-  // 用量统计：直接读落盘数据，服务未运行也可查看
-  const loadUsage = useCallback(async (days: number) => {
-    setUsageLoading(true);
+  // 当日用量（query_recent 含今日；仅用于「活跃账号」指标）
+  const loadTodayUsage = useCallback(async () => {
     try {
-      setUsage(await api.apiServer.usageStats(days));
+      setUsage(await api.apiServer.usageStats(1));
     } catch {
-      /* 加载失败保留上次数据 */
+      /* 加载失败按无数据处理 */
+    }
+  }, []);
+
+  // 统一模型目录：过滤 sources 含 Trae 池的条目（§6.1，聚合视图实时派生）
+  const loadModels = useCallback(
+    async (manual = false) => {
+      setLoadingModels(true);
+      try {
+        const list = await withMinDelay(api.apiServer.unifiedModels(), 250);
+        setModels(list.filter((m) => m.sources.some((s) => s.pool === 'trae')));
+      } catch {
+        // 初始化失败静默保留空列表；手动点击刷新失败需给出提示
+        if (manual) toast('error', '加载模型目录失败，请重试');
+      } finally {
+        setLoadingModels(false);
+      }
+    },
+    [toast],
+  );
+
+  // 同步官网模型（models_sync 沿用现有调用）；L1 人工覆盖层不受同步影响
+  const syncModels = async () => {
+    if (syncingModels) return;
+    setSyncingModels(true);
+    try {
+      await withMinDelay(api.apiServer.modelsSync(), 500);
+      toast('success', '官网模型已同步（人工维护值不受影响）');
+      await loadModels();
+    } catch (err) {
+      toast('error', `同步官网模型失败：${String(err).slice(0, 120)}`);
     } finally {
-      setUsageLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadUsage(usageDays);
-  }, [usageDays, loadUsage]);
-
-  // ---- 多 API Key 管理 ----
-  const loadKeys = useCallback(async () => {
-    try {
-      const view = await api.apiServer.keysList();
-      setApiKeys(view.keys);
-      setAuthDisabled(view.auth_disabled);
-    } catch {
-      /* 保留空列表 */
-    }
-  }, []);
-
-  /** 生成 sk- 前缀随机 Key（前端 crypto 随机源） */
-  const generateKeyValue = useCallback(() => {
-    const buf = new Uint8Array(24);
-    crypto.getRandomValues(buf);
-    // F-35：子 Key 统一 ck_ 前缀（旧 sk- Key 仍兼容鉴权）
-    setNewKeyValue('ck_' + [...buf].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 32));
-  }, []);
-
-  useEffect(() => {
-    void loadKeys();
-    generateKeyValue();
-  }, [loadKeys, generateKeyValue]);
-
-  const saveKeys = async (next: ApiKeyEntry[], msg: string, nextAuthDisabled?: boolean) => {
-    setKeysSaving(true);
-    try {
-      await api.apiServer.keysSave(next, nextAuthDisabled);
-      setApiKeys(next);
-      if (nextAuthDisabled !== undefined) setAuthDisabled(nextAuthDisabled);
-      toast('success', msg);
-    } catch (e) {
-      toast('error', `保存 Key 失败：${String(e).slice(0, 120)}`);
-    } finally {
-      setKeysSaving(false);
-    }
-  };
-
-  const toggleAuthDisabled = () => {
-    const next = !authDisabled;
-    void saveKeys(
-      apiKeys,
-      next ? '已关闭鉴权：无启用 Key 时任何本机程序均可调用（不推荐）' : '已开启鉴权：未配置启用 Key 时请求将被拒绝',
-      next,
-    );
-  };
-
-  const addKey = () => {
-    const name = newKeyName.trim();
-    if (!name) {
-      toast('error', '请填写 Key 名称');
-      return;
-    }
-    if (!newKeyValue.startsWith('ck_') && !newKeyValue.startsWith('sk-')) {
-      toast('error', 'Key 值无效（需 ck_ 或 sk- 前缀），请重新生成');
-      return;
-    }
-    if (apiKeys.some((k) => k.key === newKeyValue)) {
-      toast('error', 'Key 值与现有条目重复');
-      return;
-    }
-    const entry: ApiKeyEntry = {
-      id: crypto.randomUUID(),
-      name,
-      key: newKeyValue,
-      enabled: true,
-      daily_limit: Math.max(0, Math.floor(newKeyLimit) || 0),
-      created_at: Math.floor(Date.now() / 1000),
-      used_date: '',
-      used_today: 0,
-      allowed_accounts: [],
-      schedule_mode: 'expire_first',
-      dedicated_account: '',
-      daily_stats: [],
-    };
-    void saveKeys([...apiKeys, entry], `Key「${name}」已添加`);
-    setNewKeyName('');
-    setNewKeyLimit(0);
-    generateKeyValue();
-  };
-
-  const toggleKey = (id: string) => {
-    const next = apiKeys.map((k) => (k.id === id ? { ...k, enabled: !k.enabled } : k));
-    void saveKeys(next, 'Key 状态已更新');
-  };
-
-  const deleteKey = (k: ApiKeyEntry) => {
-    setDeleteForKey(k);
-  };
-
-  const confirmDeleteKey = async () => {
-    if (!deleteForKey) return;
-    const k = deleteForKey;
-    setDeleteForKey(null);
-    await saveKeys(apiKeys.filter((x) => x.id !== k.id), `Key「${k.name}」已删除`);
-  };
-
-  // 子 Key 配置弹框（F-35）：限定上游 + 专一/临期优先 + 按日统计展示
-  const openKeyEdit = (k: ApiKeyEntry) => {
-    setEditKey(k);
-    setEditAllowed(new Set(k.allowed_accounts));
-    setEditMode(k.schedule_mode || 'expire_first');
-    setEditDedicated(k.dedicated_account || '');
-  };
-
-  const confirmKeyEdit = () => {
-    if (!editKey) return;
-    const next = apiKeys.map((k) =>
-      k.id === editKey.id
-        ? {
-            ...k,
-            allowed_accounts: [...editAllowed],
-            schedule_mode: editMode,
-            dedicated_account: editMode === 'dedicated' ? editDedicated : '',
-          }
-        : k,
-    );
-    void saveKeys(next, `Key「${editKey.name}」调度配置已更新`);
-    setEditKey(null);
-  };
-
-  const updateKeyLimit = (id: string, limit: number) => {
-    const v = Math.max(0, Math.floor(limit) || 0);
-    const cur = apiKeys.find((k) => k.id === id);
-    if (!cur || cur.daily_limit === v) return;
-    void saveKeys(apiKeys.map((k) => (k.id === id ? { ...k, daily_limit: v } : k)), '限额已更新');
-  };
-
-  const copyKeyValue = async (k: ApiKeyEntry) => {
-    try {
-      await navigator.clipboard.writeText(k.key);
-      toast('success', 'Key 已复制到剪贴板');
-    } catch {
-      toast('error', '复制失败');
+      setSyncingModels(false);
     }
   };
 
@@ -258,8 +124,7 @@ export default function ApiService() {
       setStatus(s);
       if (s.running) {
         try {
-          const ps = await api.apiServer.poolStatus();
-          setPoolStatus(ps);
+          setPoolStatus(await api.apiServer.poolStatus());
         } catch {
           /* ignore */
         }
@@ -321,105 +186,20 @@ export default function ApiService() {
   const inPoolFilter = (uid: string) =>
     poolGroups.size === 0 || groupUidSets.some((g) => poolGroups.has(g.id) && g.uids.has(uid));
 
-  // 今日按 Key 的 token 用量（Keys 表「今日已用」并列展示；日期口径与后端一致 = 本地时区 YYYY-MM-DD）
-  const todayKey = new Date().toLocaleDateString('sv-SE');
-  const todayKeyTokens = useMemo(() => {
-    const m = new Map<string, { prompt: number; completion: number }>();
-    usage.find((d) => d.date === todayKey)?.key_tokens.forEach((t) =>
-      m.set(t.name, { prompt: t.prompt_tokens, completion: t.completion_tokens }),
-    );
-    return m;
-  }, [usage, todayKey]);
-
-  // 加载模型列表（api_models.json，缺失时后端写入默认列表）
-  const loadModels = async () => {
+  const clearAllCooldowns = async () => {
+    setClearingCooldowns(true);
     try {
-      setModels(await api.apiServer.modelsList());
-    } catch {
-      /* 加载失败保留空列表，用户可点同步按钮重试 */
-    }
-  };
-
-  // 从官网同步最新模型列表（batch_get_detail_param 配置接口，不消耗积分）
-  const syncModels = async () => {
-    if (syncingModels) return;
-    setSyncingModels(true);
-    try {
-      const list = await withMinDelay(api.apiServer.modelsSync());
-      setModels(list);
-      toast('success', `官网模型同步成功（共 ${list.length} 个）`);
-    } catch (e) {
-      toast('error', `官网模型同步失败: ${String(e).slice(0, 120)}`);
-    } finally {
-      setSyncingModels(false);
-    }
-  };
-
-  // T5.7/F-43：CC Switch 注册状态（注册 Trae 侧条目；WB 侧条目在 Buddy「API 服务」页）
-  const [ccBusy, setCcBusy] = useState<'claude' | 'codex' | null>(null);
-  const [ecoNote, setEcoNote] = useState('');
-
-  const registerCcSwitch = async (appType: 'claude' | 'codex') => {
-    if (ccBusy) return;
-    setCcBusy(appType);
-    setEcoNote('');
-    try {
-      const msg = await withMinDelay(api.apiServer.ccSwitchRegister(appType, 'trae'));
-      setEcoNote(`✓ ${msg}`);
-    } catch (e) {
-      setEcoNote(`✗ CC Switch 注册失败：${String(e).slice(0, 160)}`);
-    } finally {
-      setCcBusy(null);
-    }
-  };
-
-  const update = <K extends keyof Settings>(key: K, val: Settings[K]) => {
-    setForm((prev) => (prev ? { ...prev, [key]: val } : prev));
-  };
-
-  const save = async () => {
-    if (!form) return;
-    setSaving(true);
-    try {
-      await withMinDelay(saveSettings(form));
-      toast('success', '配置已保存');
-    } catch {
-      /* toast 已发出 */
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const start = async () => {
-    setStarting(true);
-    try {
-      // 启动前自动保存当前勾选的账号池，避免用户忘记点"保存"
-      // WB 开关字段不传，Rust 端保留 api_pool.json 原值（由 Buddy「API 服务」页维护）
-      await api.apiServer.poolSet([...enabledUids], poolStrategy, [...poolGroups]);
-      const s = await withMinDelay(api.apiServer.start());
-      setStatus(s);
-      useAppStore.setState({ apiStatus: s });
-      toast('success', `API 服务已启动（端口 ${s.port}，池内 ${enabledUids.size} 个账号）`);
-      void refreshStatus();
+      const cleared = await withMinDelay(api.accounts.cooldownClearAll());
+      if (cleared > 0) {
+        toast('success', `已清除 ${cleared} 个账号的冷却状态`);
+        void refreshStatus();
+      } else {
+        toast('info', '当前无冷却中的账号');
+      }
     } catch (err) {
-      toast('error', `启动失败：${String(err)}`);
+      toast('error', `清除冷却失败：${String(err)}`);
     } finally {
-      setStarting(false);
-    }
-  };
-
-  const stop = async () => {
-    setStopping(true);
-    try {
-      await withMinDelay(api.apiServer.stop());
-      toast('info', 'API 服务已停止');
-      setStatus(null);
-      setPoolStatus([]);
-      useAppStore.setState({ apiStatus: null });
-    } catch (err) {
-      toast('error', `停止失败：${String(err)}`);
-    } finally {
-      setStopping(false);
+      setClearingCooldowns(false);
     }
   };
 
@@ -447,107 +227,84 @@ export default function ApiService() {
     }
   };
 
-  const clearAllCooldowns = async () => {
-    setClearingCooldowns(true);
+  // ---- 模型元数据编辑（L1 覆盖层） ----
+
+  // 打开弹框：回显 L1 人工值（metaGet 读取 data/trae_model_meta.json，跨会话可回显）；
+  // 读取失败时全表单留空 = 交由下层兜底（绝不把聚合值当人工值回填，区分 L1 与 L2-L4，§6.1）。
+  // editReqRef 令牌守卫：快速连点两个模型时仅让最后一次请求回填，防止慢响应覆盖新弹框。
+  const editReqRef = useRef('');
+  const openEdit = async (m: UnifiedModel) => {
+    editReqRef.current = m.id;
+    setEditing(m);
+    const known = await api.apiServer.metaGet(m.id).catch(() => null);
+    if (editReqRef.current !== m.id) return;
+    setFLabel(known?.label ?? '');
+    setFRate(known?.rate != null ? String(known.rate) : '');
+    setFEfforts(new Set(known?.efforts ?? []));
+    setFContext(known?.context_length != null ? String(known.context_length) : '');
+    setFMaxTokens(known?.max_tokens != null ? String(known.max_tokens) : '');
+    setFImage(
+      known?.supports_image === true ? 'true' : known?.supports_image === false ? 'false' : '',
+    );
+  };
+
+  const saveMeta = async () => {
+    if (!editing) return;
+    const rate = numOrNull(fRate);
+    const context = numOrNull(fContext);
+    const maxTokens = numOrNull(fMaxTokens);
+    if (Number.isNaN(rate) || Number.isNaN(context) || Number.isNaN(maxTokens)) {
+      toast('error', '数值字段格式不正确，请检查倍率 / 上下文 / max_tokens');
+      return;
+    }
+    const meta: TraeModelMeta = {
+      label: fLabel.trim() || null,
+      rate,
+      // 未勾选任何档位 = 未设置（交由下层推断），不落空数组
+      efforts: fEfforts.size > 0 ? EFFORT_OPTIONS.filter((e) => fEfforts.has(e)) : null,
+      context_length: context,
+      max_tokens: maxTokens,
+      supports_image: fImage === '' ? null : fImage === 'true',
+    };
+    setSavingMeta(true);
     try {
-      const cleared = await withMinDelay(api.accounts.cooldownClearAll());
-      if (cleared > 0) {
-        toast('success', `已清除 ${cleared} 个账号的冷却状态`);
-        void refreshStatus();
-      } else {
-        toast('info', '当前无冷却中的账号');
-      }
+      await withMinDelay(api.apiServer.metaSet(editing.id, meta), 300);
+      toast('success', `已保存 ${editing.id} 人工元数据（L1 覆盖，聚合即时生效）`);
+      setEditing(null);
+      await loadModels();
     } catch (err) {
-      toast('error', `清除冷却失败：${String(err)}`);
+      toast('error', `保存失败：${String(err)}`);
     } finally {
-      setClearingCooldowns(false);
+      setSavingMeta(false);
     }
   };
 
-  const copyConfigExample = async () => {
-    setCopying(true);
-    const port = form?.api_port ?? 7864;
-    const model = form?.api_default_model ?? 'glm-5.2';
-    const example = `# 客户端配置示例（OpenAI 兼容格式）
-接口地址: http://127.0.0.1:${port}/v1
-API Key:  <在下方「API Keys 管理」中创建并复制>
-模型 ID:  ${model}
-
-# Anthropic 兼容端点（Claude Code 等工具直连）
-POST http://127.0.0.1:${port}/v1/messages
-鉴权头: x-api-key: your-api-key 或 Authorization: Bearer
-
-# cURL 测试（请将 API Key 替换为列表中的完整值）
-curl -X POST http://127.0.0.1:${port}/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer your-api-key" \\
-  -d '{
-    "model": "${model}",
-    "messages": [{"role": "user", "content": "你好"}],
-    "stream": true
-  }'
-
-# Anthropic /v1/messages 测试
-curl -X POST http://127.0.0.1:${port}/v1/messages \\
-  -H "Content-Type: application/json" \\
-  -H "x-api-key: your-api-key" \\
-  -H "anthropic-version: 2023-06-01" \\
-  -d '{
-    "model": "${model}",
-    "max_tokens": 1024,
-    "messages": [{"role": "user", "content": "你好"}]
-  }'`;
+  // 清除人工值 → 恢复自动来源链（L2 官网同步 > L3 文档参考 > L4 名称推断）
+  const clearMeta = async () => {
+    if (!editing) return;
+    setClearingMeta(true);
     try {
-      await withMinDelay(navigator.clipboard.writeText(example));
-      toast('success', '配置示例已复制到剪贴板');
-    } catch {
-      toast('error', '复制失败');
+      await withMinDelay(api.apiServer.metaClear(editing.id), 300);
+      toast('success', `已清除 ${editing.id} 人工元数据，恢复自动来源`);
+      setEditing(null);
+      await loadModels();
+    } catch (err) {
+      toast('error', `清除失败：${String(err)}`);
     } finally {
-      setCopying(false);
+      setClearingMeta(false);
     }
   };
 
   const running = status?.running ?? false;
   const poolCount = enabledUids.size;
 
-  // 用量汇总（跨天聚合）+ 图表数据
-  const usageSummary = useMemo(() => {
-    const models = new Map<string, { requests: number; ok: number; errors: number }>();
-    const t = usage.reduce(
-      (acc, d) => {
-        acc.requests += d.total_requests;
-        acc.ok += d.ok;
-        acc.errors += d.errors;
-        acc.prompt += d.prompt_tokens;
-        acc.completion += d.completion_tokens;
-        acc.weightedDuration += d.avg_duration_ms * d.total_requests;
-        for (const m of d.models) {
-          const e = models.get(m.name) ?? { requests: 0, ok: 0, errors: 0 };
-          e.requests += m.requests;
-          e.ok += m.ok;
-          e.errors += m.errors;
-          models.set(m.name, e);
-        }
-        return acc;
-      },
-      { requests: 0, ok: 0, errors: 0, prompt: 0, completion: 0, weightedDuration: 0 },
-    );
-    const topModels = [...models.entries()]
-      .sort((a, b) => b[1].requests - a[1].requests)
-      .slice(0, 5)
-      .map(([name, v]) => ({ name, ...v }));
-    return {
-      ...t,
-      topModels,
-      successRate: t.requests > 0 ? ((t.ok / t.requests) * 100).toFixed(1) : '—',
-      avgDuration: t.requests > 0 ? Math.round(t.weightedDuration / t.requests) : 0,
-    };
-  }, [usage]);
-
-  const usageChartData = useMemo(
-    () => usage.map((d) => ({ date: d.date.slice(5), 成功: d.ok, 失败: d.errors })),
-    [usage],
-  );
+  // 池指标（§6.1）：可用 = 健康且未冷却（仅运行中可得实时值）；活跃 = 当日被调度使用；池内 = enabled_uids
+  const todayKey = new Date().toLocaleDateString('sv-SE');
+  const availableCount = running
+    ? poolStatus.filter((p) => !p.cooling && !p.disabled).length
+    : null;
+  const activeToday =
+    usage.find((d) => d.date === todayKey)?.accounts.filter((a) => a.requests > 0).length ?? 0;
 
   // 账号池仅展示/可选有通用积分的账号（本服务消耗通用积分，零积分账号无法服务请求）
   const poolAccounts = useMemo(
@@ -559,79 +316,31 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
     [accounts],
   );
 
+  // 输入框通用样式（沿用页面表单惯例）
+  const inputCls =
+    'h-7 w-full rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200';
+
   return (
     <div>
       <PageHeader
-        title="Trae · API 服务"
-        desc="OpenAI / Anthropic 兼容接口，通过账号池轮转实现多账号负载均衡（消耗通用积分）"
+        title="Trae · 资源调度"
+        desc="服务资源池管理 · 账号调度与模型目录 · 资源提供给API网关使用"
         actions={
-          running ? (
-            <button
-              className="btn-danger flex items-center gap-2"
-              onClick={stop}
-              disabled={stopping}
-            >
-              <Square size={16} />
-              {stopping ? '停止中…' : '停止服务'}
-            </button>
-          ) : (
-            <button
-              className="btn-primary flex items-center gap-2"
-              onClick={start}
-              disabled={starting || poolCount === 0}
-            >
-              <Play size={16} />
-              {starting ? '启动中…' : poolCount === 0 ? '请先选择账号' : '启动服务'}
-            </button>
-          )
+          <button className="btn-outline" onClick={() => void refreshStatus()}>
+            <RefreshCw size={15} /> 刷新
+          </button>
         }
       />
 
-      {/* 状态卡片 */}
-      <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard
-          label="运行状态"
-          value={running ? '运行中' : '已停止'}
-          tone={running ? 'green' : 'slate'}
-          hint={running ? `127.0.0.1:${status?.port ?? 0}` : '未启动'}
-        />
-        <StatCard
-          label="总请求数"
-          value={status?.total_requests ?? 0}
-          tone="brand"
-          hint="累计处理的 API 调用"
-        />
-        <StatCard
-          label="活跃账号"
-          value={status?.active_uid ? status.active_uid.slice(0, 8) + '…' : '—'}
-          tone="blue"
-          hint={status?.active_uid ? '当前正在处理请求' : '空闲'}
-        />
-        <StatCard
-          label="池内账号"
-          value={poolCount}
-          tone="violet"
-          hint="已选入轮转池的账号数"
-        />
-      </div>
-
-      {status?.last_error && (
-        <div className="mb-5 flex items-center gap-2 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-800 dark:bg-rose-900/20 dark:text-rose-300">
-          <XCircle size={16} className="shrink-0" />
-          <span className="truncate">{status.last_error}</span>
-        </div>
-      )}
-
-      {/* 积分体系说明 — 紧凑面板 */}
-      <div className="mb-5 rounded-xl border border-amber-300/70 bg-amber-50/80 px-3.5 py-2.5 dark:border-amber-700/40 dark:bg-amber-900/10">
+      {/* 积分体系说明（资源级） */}
+      <div className="rounded-xl border border-amber-300/70 bg-amber-50/80 px-3.5 py-2.5 dark:border-amber-700/40 dark:bg-amber-900/10">
         <div className="flex flex-wrap items-center gap-2">
-          <Info size={14} className="shrink-0 text-amber-500 dark:text-amber-400" />
           <span className="text-xs font-semibold text-amber-800 dark:text-amber-200">积分体系说明</span>
           <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-700/50 dark:text-amber-100">本服务消耗通用积分</span>
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500 dark:text-zinc-400">
           <span>
-            Trae 通用积分（product_id 208）为账号统一积分：签到奖励、每月登录赠送与购买套餐均计入，IDE 聊天与本 API 服务共用扣减；上游接口{' '}
+            Trae 通用积分（product_id 208）：签到 / 活动获取，各模型按倍率消耗；账号池轮换消耗各账号积分，冷却与禁用规则同现有实现。上游接口{' '}
             <code className="font-mono text-amber-700 dark:text-amber-300">llm_utils_chat</code>，明文 JSON。
           </span>
           <span className="ml-auto">
@@ -643,161 +352,30 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
         </div>
       </div>
 
-      <div className="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
-        {/* 配置卡片 */}
-        <div className="card flex flex-col p-5">
-          <div className="mb-4 flex items-center gap-2">
-            <Globe size={18} className="text-brand-500" />
-            <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h2>
-          </div>
+      {/* 池指标行 */}
+      <div className="mt-5 grid grid-cols-3 gap-3">
+        <StatCard
+          label="可用账号数"
+          value={availableCount ?? '—'}
+          tone="green"
+          hint={running ? '健康且未冷却，可被调度选中' : 'API 服务未运行，无实时池状态'}
+        />
+        <StatCard
+          label="活跃账号"
+          value={activeToday}
+          tone="blue"
+          hint="当日被调度使用过的账号"
+        />
+        <StatCard
+          label="池内账号"
+          value={poolCount}
+          tone="violet"
+          hint="已选入轮转池的账号数（enabled_uids）"
+        />
+      </div>
 
-          <div className="flex-1 space-y-4">
-            <div>
-              <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
-                监听端口
-              </label>
-              <input
-                type="number"
-                className="input"
-                value={form?.api_port ?? 7864}
-                onChange={(e) => update('api_port', parseInt(e.target.value) || 7864)}
-                disabled={running}
-              />
-              <p className="mt-1 text-xs text-slate-400">服务运行时无法修改</p>
-            </div>
-
-            <div>
-              <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
-                默认模型
-              </label>
-              <div className="flex items-center gap-2">
-                <select
-                  className="input flex-1"
-                  value={form?.api_default_model ?? 'glm-5.2'}
-                  onChange={(e) => update('api_default_model', e.target.value)}
-                  disabled={running}
-                >
-                  {(models.some((m) => m.id === (form?.api_default_model ?? 'glm-5.2'))
-                    ? models
-                    : [
-                        {
-                          id: form?.api_default_model ?? 'glm-5.2',
-                          label: form?.api_default_model ?? 'glm-5.2',
-                        },
-                        ...models,
-                      ]
-                  ).map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  className="btn-ghost flex shrink-0 items-center gap-1 !p-2 text-xs"
-                  onClick={syncModels}
-                  disabled={syncingModels}
-                  title="从官网拉取最新模型列表（不消耗积分）"
-                >
-                  <RefreshCw size={13} className={syncingModels ? 'animate-spin' : ''} />
-                  {syncingModels ? '同步中…' : '同步官网模型'}
-                </button>
-              </div>
-              <p className="mt-1 text-xs text-slate-400">
-                上游接口：llm_utils_chat（通用积分，product_id 208）
-              </p>
-            </div>
-
-            <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
-              <div className="mb-2 flex items-center justify-between">
-                <p className="font-medium">使用方式 & 配置示例</p>
-                <button
-                  className="btn-ghost flex items-center gap-1 !p-1 text-xs"
-                  onClick={copyConfigExample}
-                  disabled={copying}
-                  title="复制完整配置示例"
-                >
-                  <Copy size={12} className={copying ? 'animate-pulse' : ''} />
-                  {copying ? '复制中…' : '复制示例'}
-                </button>
-              </div>
-              <div className="space-y-1.5">
-                <div>
-                  <span className="text-slate-400">接口地址：</span>
-                  <code className="break-all text-[11px]">
-                    http://127.0.0.1:{form?.api_port ?? 7864}/v1
-                  </code>
-                </div>
-                <div>
-                  <span className="text-slate-400">API Key：</span>
-                  <code className="text-[11px]">在下方「API Keys 管理」中创建并复制</code>
-                </div>
-                <div>
-                  <span className="text-slate-400">模型 ID：</span>
-                  <code className="text-[11px]">{form?.api_default_model ?? 'glm-5.2'}</code>
-                </div>
-                <div className="pt-1">
-                  <span className="text-slate-400">其他端点：</span>
-                </div>
-                <code className="block break-all text-[11px]">
-                  POST http://127.0.0.1:{form?.api_port ?? 7864}/v1/messages（Anthropic 兼容，x-api-key 鉴权）
-                </code>
-                <code className="block break-all text-[11px]">
-                  GET http://127.0.0.1:{form?.api_port ?? 7864}/v1/models
-                </code>
-                <code className="block break-all text-[11px]">
-                  GET http://127.0.0.1:{form?.api_port ?? 7864}/health
-                </code>
-              </div>
-            </div>
-
-            <button
-              className="btn-secondary flex items-center gap-2"
-              onClick={save}
-              disabled={saving || running}
-            >
-              <Save size={15} />
-              {saving ? '保存中…' : '保存配置'}
-            </button>
-          </div>
-        </div>
-
-        {/* T5.7 生态接入：CC Switch 协同（独立面板，结构对齐 Buddy「API 服务」页） */}
-        <div className="mt-5 card p-5">
-          <div className="mb-2 flex items-center gap-2">
-            <Plug size={16} className="text-emerald-500" />
-            <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">生态接入</span>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              className="btn-outline !py-1.5 text-xs"
-              onClick={() => void registerCcSwitch('claude')}
-              disabled={ccBusy !== null}
-              title="把网关 Anthropic 端点（/v1/messages）注册进 CC Switch（Trae 侧条目「AI Work 助手网关」），由 CC Switch 负责切换"
-            >
-              注册到 CC Switch（Claude Code）
-            </button>
-            <button
-              className="btn-outline !py-1.5 text-xs"
-              onClick={() => void registerCcSwitch('codex')}
-              disabled={ccBusy !== null}
-              title="把网关 Responses 端点（/v1/responses）注册进 CC Switch（Trae 侧条目「AI Work 助手网关」），由 CC Switch 负责切换"
-            >
-              注册到 CC Switch（Codex）
-            </button>
-          </div>
-          {ecoNote && (
-            <p className="mt-2 break-all text-[11px] leading-4 text-slate-500 dark:text-zinc-400">
-              {ecoNote}
-            </p>
-          )}
-          <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
-            CC Switch 注册会先整库备份至 ~/.cc-switch/backups/，仅写入本网关条目、不改其它
-            provider；写入后需重启 CC Switch 生效。此处注册的是 Trae 模型网关条目（默认模型 glm-5.3），
-            WB 上游的 CC Switch 条目在 Buddy「API 服务」页注册，互不覆盖。
-          </p>
-        </div>
-
-        {/* 账号池卡片 */}
+      <div className="mt-5 grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
+        {/* 账号池选择（资源级，现有功能原样迁移） */}
         <div className="card flex flex-col p-5">
           <div className="mb-4 flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -806,14 +384,27 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
                 账号池选择
               </h2>
             </div>
-            <button
-              className="btn-ghost flex items-center gap-1 text-xs"
-              onClick={() => void loadPool(true)}
-              disabled={refreshingPool}
-            >
-              <RefreshCw size={13} className={refreshingPool ? 'animate-spin' : ''} />
-              {refreshingPool ? '刷新中…' : '刷新'}
-            </button>
+            <div className="flex items-center gap-2">
+              {running && (
+                <button
+                  className="btn-ghost flex items-center gap-1 text-xs"
+                  onClick={() => void clearAllCooldowns()}
+                  disabled={clearingCooldowns}
+                  title="清除所有账号的冷却状态"
+                >
+                  <Eraser size={13} className={clearingCooldowns ? 'animate-pulse' : ''} />
+                  {clearingCooldowns ? '清除中…' : '清除冷却'}
+                </button>
+              )}
+              <button
+                className="btn-ghost flex items-center gap-1 text-xs"
+                onClick={() => void loadPool(true)}
+                disabled={refreshingPool}
+              >
+                <RefreshCw size={13} className={refreshingPool ? 'animate-spin' : ''} />
+                {refreshingPool ? '刷新中…' : '刷新'}
+              </button>
+            </div>
           </div>
 
           {poolAccounts.length === 0 ? (
@@ -951,8 +542,8 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
               </div>
 
               <button
-                className="btn-secondary mt-3 flex w-full items-center justify-center gap-2"
-                onClick={savePool}
+                className="btn-outline mt-3 flex w-full items-center justify-center gap-2"
+                onClick={() => void savePool()}
                 disabled={savingPool}
               >
                 <Save size={15} />
@@ -961,539 +552,236 @@ curl -X POST http://127.0.0.1:${port}/v1/messages \\
             </>
           )}
         </div>
-      </div>
 
-      {/* API Keys 管理（多 Key + 每日配额，改动立即生效） */}
-      <div className="mt-5 card p-5">
-        <div className="mb-4 flex items-center gap-2">
-          <KeyRound size={18} className="text-brand-500" />
-          <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">API Keys 管理</h2>
-          <span className="hidden text-xs text-slate-400 sm:inline">
-            多个 Key 独立签发并设置每日配额；增删/启停立即生效
-          </span>
-        </div>
-
-        {/* 新增表单 */}
-        <div className="mb-4 flex flex-wrap items-end gap-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
-          <div className="w-36">
-            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">名称</label>
-            <input
-              className="input"
-              placeholder="如：cli / 小工具"
-              value={newKeyName}
-              onChange={(e) => setNewKeyName(e.target.value)}
-            />
-          </div>
-          <div className="min-w-64 flex-1">
-            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">Key 值</label>
-            <input
-              className="input font-mono text-xs"
-              value={newKeyValue}
-              onChange={(e) => setNewKeyValue(e.target.value)}
-            />
-          </div>
-          <button
-            className="btn-ghost flex items-center gap-1 !p-2 text-xs"
-            onClick={generateKeyValue}
-            title="重新生成 Key 值"
-          >
-            <RefreshCw size={13} />
-            重新生成
-          </button>
-          <div className="w-36">
-            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
-              日限额/次（0=不限）
-            </label>
-            <input
-              type="number"
-              min={0}
-              className="input"
-              value={newKeyLimit}
-              onChange={(e) => setNewKeyLimit(parseInt(e.target.value) || 0)}
-            />
-          </div>
-          <button
-            className="btn-primary flex items-center gap-1 !px-3 text-xs"
-            onClick={addKey}
-            disabled={keysSaving}
-          >
-            <Plus size={14} />
-            添加 Key
-          </button>
-        </div>
-
-        {/* 鉴权开关：无启用 Key 时的行为（默认拒绝；显式关闭后才放行） */}
-        <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs dark:border-zinc-700 dark:bg-zinc-800/50">
-          <div>
-            <p className="font-medium text-slate-700 dark:text-zinc-200">鉴权开关</p>
-            <p className="text-slate-400 dark:text-zinc-500">
-              {authDisabled
-                ? '已关闭：未配置启用 Key 时任何本机程序均可调用（不推荐）'
-                : '已开启：未配置启用 Key 时请求将被拒绝并提示创建 Key'}
-            </p>
-          </div>
-          <button
-            className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
-              authDisabled
-                ? 'bg-emerald-500/90 text-white hover:bg-emerald-500'
-                : 'bg-amber-500/90 text-white hover:bg-amber-500'
-            }`}
-            onClick={toggleAuthDisabled}
-            disabled={keysSaving}
-          >
-            {authDisabled ? '开启鉴权' : '关闭鉴权'}
-          </button>
-        </div>
-
-        {apiKeys.length === 0 ? (
-          <p className="py-4 text-center text-sm text-slate-400">
-            {authDisabled
-              ? '暂无 Key — 鉴权已关闭，任何本机程序无需 Key 即可调用'
-              : '暂无 Key — 请求将被拒绝；请添加并启用 Key，或关闭鉴权'}
-          </p>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
-                  <th className="pb-2 pr-4 font-medium">名称</th>
-                  <th className="pb-2 pr-4 font-medium">Key</th>
-                  <th className="pb-2 pr-4 font-medium">日限额(次)</th>
-                  <th className="pb-2 pr-4 font-medium">今日已用(次/tok)</th>
-                  <th className="pb-2 pr-4 font-medium">调度</th>
-                  <th className="pb-2 pr-4 font-medium">状态</th>
-                  <th className="pb-2 font-medium">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {apiKeys.map((k) => {
-                  const exhausted = k.daily_limit > 0 && k.used_today >= k.daily_limit;
-                  const kt = todayKeyTokens.get(k.id);
-                  const ktTotal = kt ? kt.prompt + kt.completion : 0;
-                  return (
-                    <tr
-                      key={k.id}
-                      className="row-hover border-b border-slate-100 last:border-0 dark:border-zinc-800"
-                    >
-                      <td className="py-2 pr-4 font-medium text-slate-700 dark:text-zinc-200">
-                        {k.name}
-                      </td>
-                      <td className="py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400">
-                        {maskApiKey(k.key)}
-                      </td>
-                      <td className="py-2 pr-4">
-                        <input
-                          type="number"
-                          min={0}
-                          className="input !w-24 !px-2 !py-1 text-xs"
-                          defaultValue={k.daily_limit}
-                          onBlur={(e) => {
-                            const raw = e.target.value.trim();
-                            if (!/^\d+$/.test(raw)) {
-                              // 空/非法输入不落 0（不限），还原显示并提示
-                              e.target.value = String(k.daily_limit);
-                              toast('error', '日限额需为非负整数，已还原原值');
-                              return;
-                            }
-                            updateKeyLimit(k.id, parseInt(raw, 10));
-                          }}
-                          title="0 表示不限；失焦自动保存"
-                        />
-                      </td>
-                      <td
-                        className={
-                          'py-2 pr-4 tabular-nums ' +
-                          (exhausted
-                            ? 'font-semibold text-amber-600 dark:text-amber-400'
-                            : 'text-slate-500 dark:text-zinc-400')
-                        }
-                      >
-                        {k.used_today}
-                        {k.daily_limit > 0 ? ` / ${k.daily_limit}` : ''} 次
-                        {ktTotal > 0 && ` · ${fmtTokens(ktTotal)} tok`}
-                      </td>
-                      <td className="py-2 pr-4">
-                        {(k.schedule_mode || 'expire_first') === 'dedicated' ? (
-                          <Badge tone="violet">专一</Badge>
-                        ) : (
-                          <Badge tone="slate">临期优先</Badge>
-                        )}
-                        {k.allowed_accounts.length > 0 && (
-                          <span className="ml-1 text-xs text-slate-400" title={k.allowed_accounts.join(', ')}>
-                            限{k.allowed_accounts.length}账号
-                          </span>
-                        )}
-                      </td>
-                      <td className="py-2 pr-4">
-                        {k.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
-                      </td>
-                      <td className="py-2">
-                        <div className="flex items-center gap-1">
-                          <button
-                            className="btn-ghost !p-1.5"
-                            title={k.enabled ? '禁用' : '启用'}
-                            onClick={() => toggleKey(k.id)}
-                            disabled={keysSaving}
-                          >
-                            <Power
-                              size={14}
-                              className={k.enabled ? 'text-emerald-500' : 'text-slate-400'}
-                            />
-                          </button>
-                          <button
-                            className="btn-ghost !p-1.5"
-                            title="复制完整 Key"
-                            onClick={() => void copyKeyValue(k)}
-                          >
-                            <Copy size={14} />
-                          </button>
-                          <button
-                            className="btn-ghost !p-1.5"
-                            title="调度配置（限定上游 / 专一 / 临期优先）"
-                            onClick={() => openKeyEdit(k)}
-                          >
-                            <BarChart3 size={14} />
-                          </button>
-                          <button
-                            className="btn-ghost !p-1.5"
-                            title="删除"
-                            onClick={() => deleteKey(k)}
-                            disabled={keysSaving}
-                          >
-                            <Trash2 size={14} className="text-rose-500" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-
-      {/* 子 Key 调度配置弹框（F-35：限定上游 + 专一/临期优先 + 按日统计） */}
-      <Modal
-        open={editKey != null}
-        onClose={() => setEditKey(null)}
-        title={`调度配置 · ${editKey?.name ?? ''}`}
-        footer={
-          <>
-            <button className="btn-outline" onClick={() => setEditKey(null)}>取消</button>
-            <button className="btn-primary" onClick={confirmKeyEdit} disabled={keysSaving}>保存</button>
-          </>
-        }
-      >
-        <div className="space-y-4 text-sm">
-          <div>
-            <div className="mb-1.5 text-xs font-medium text-slate-500">调度模式</div>
-            <div className="flex gap-2">
-              {[
-                { key: 'expire_first', label: '临期优先', desc: '按积分最早到期取上游' },
-                { key: 'dedicated', label: '专一', desc: '固定绑定单一上游账号' },
-              ].map((m) => (
-                <button
-                  key={m.key}
-                  className={`flex-1 rounded-lg border p-2.5 text-left text-xs ${editMode === m.key ? 'border-indigo-400 bg-indigo-50 dark:bg-indigo-500/10' : 'border-slate-200 dark:border-zinc-700'}`}
-                  onClick={() => setEditMode(m.key)}
-                >
-                  <div className="font-medium">{m.label}</div>
-                  <div className="mt-0.5 text-slate-400">{m.desc}</div>
-                </button>
-              ))}
-            </div>
-          </div>
-          {editMode === 'dedicated' && (
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-500">专一账号</span>
-              <select className="input w-full" value={editDedicated} onChange={(e) => setEditDedicated(e.target.value)}>
-                <option value="">— 默认取限定上游首个 —</option>
-                {poolStatus.map((p) => (
-                  <option key={p.uid} value={p.uid}>
-                    {p.name || p.uid}
-                    {p.credits != null ? `（${p.credits.toFixed(1)} 积分）` : ''}
-                  </option>
-                ))}
-              </select>
-              {poolStatus.length === 0 && (
-                <span className="mt-1 block text-xs text-amber-500">服务未运行，暂无上游账号候选；可保存后稍后调整。</span>
-              )}
-            </label>
-          )}
-          <div>
-            <div className="mb-1.5 text-xs font-medium text-slate-500">
-              限定上游<span className="ml-1 font-normal text-slate-400">（不勾选 = 使用全部上游账号）</span>
-            </div>
-            <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2 dark:border-zinc-700">
-              {poolStatus.length === 0 ? (
-                <div className="py-2 text-center text-xs text-slate-400">服务未运行，暂无上游账号候选</div>
-              ) : (
-                poolStatus.map((p) => (
-                  <label key={p.uid} className="flex items-center gap-2 text-xs">
-                    <input
-                      type="checkbox"
-                      checked={editAllowed.has(p.uid)}
-                      onChange={() => {
-                        const next = new Set(editAllowed);
-                        if (next.has(p.uid)) next.delete(p.uid);
-                        else next.add(p.uid);
-                        setEditAllowed(next);
-                      }}
-                    />
-                    <span className="truncate">{p.name || p.uid}</span>
-                    {p.credits != null && <span className="ml-auto tabular-nums text-slate-400">{p.credits.toFixed(1)}</span>}
-                  </label>
-                ))
-              )}
-            </div>
-          </div>
-          {editKey && (editKey.daily_stats?.length ?? 0) > 0 && (
-            <div>
-              <div className="mb-1.5 text-xs font-medium text-slate-500">近 7 日请求统计</div>
-              <div className="flex items-end gap-1.5">
-                {editKey.daily_stats.slice(-7).map((d) => {
-                  const max = Math.max(...editKey.daily_stats.slice(-7).map((x) => x.requests), 1);
-                  return (
-                    <div key={d.date} className="flex flex-1 flex-col items-center gap-1" title={`${d.date}：${d.requests} 次`}>
-                      <span className="text-[10px] tabular-nums text-slate-400">{d.requests}</span>
-                      <div
-                        className="w-full rounded-t bg-indigo-400"
-                        style={{ height: `${Math.max(4, (d.requests / max) * 40)}px` }}
-                      />
-                      <span className="text-[10px] text-slate-400">{d.date.slice(5)}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      </Modal>
-
-      {/* Key 删除确认弹框（禁 window.confirm，红线） */}
-      <Modal
-        open={deleteForKey != null}
-        onClose={() => setDeleteForKey(null)}
-        title="删除 API Key"
-        footer={
-          <>
-            <button className="btn-outline" onClick={() => setDeleteForKey(null)}>取消</button>
-            <button className="btn-primary !bg-rose-600 hover:!bg-rose-500" onClick={() => void confirmDeleteKey()}>确认删除</button>
-          </>
-        }
-      >
-        <div className="text-sm">
-          确认删除 Key「{deleteForKey?.name}」？
-          <div className="mt-1 text-xs text-slate-400">使用该 Key 的客户端将立即无法访问（401）。</div>
-        </div>
-      </Modal>
-
-      {/* 运行中池状态详情 */}
-      {running && poolStatus.length > 0 && (
-        <div className="mt-5 card p-5">
-          <div className="mb-3 flex items-center justify-between">
+        {/* 模型目录（Trae）：统一目录聚合 Trae 源 + L1 人工元数据编辑 */}
+        <div className="card flex flex-col p-5">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <CheckCircle2 size={18} className="text-emerald-500" />
+              <Layers size={18} className="text-brand-500" />
               <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">
-                池实时状态
+                模型目录（Trae）
               </h2>
+              <span className="text-xs text-slate-400">{models.length} 个模型</span>
             </div>
-            <button
-              className="btn-ghost flex items-center gap-1 text-xs"
-              onClick={clearAllCooldowns}
-              disabled={clearingCooldowns}
-              title="清除所有账号的冷却状态"
-            >
-              <Eraser size={13} className={clearingCooldowns ? 'animate-pulse' : ''} />
-              {clearingCooldowns ? '清除中…' : '清除冷却'}
-            </button>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
-                  <th className="pb-2 pr-4 font-medium">账号</th>
-                  <th className="pb-2 pr-4 font-medium">UID</th>
-                  <th className="pb-2 pr-4 font-medium">通用积分</th>
-                  <th className="pb-2 pr-4 font-medium">状态</th>
-                  <th className="pb-2 pr-4 font-medium">错误次数</th>
-                  <th className="pb-2 font-medium">冷却原因</th>
-                </tr>
-              </thead>
-              <tbody>
-                {poolStatus.map((p) => (
-                  <tr
-                    key={p.uid}
-                    className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
-                  >
-                    <td className="py-2 pr-4 font-medium text-slate-700 dark:text-zinc-200">
-                      {p.name}
-                    </td>
-                    <td className="py-2 pr-4 text-xs text-slate-400">{p.uid.slice(0, 12)}…</td>
-                    <td className="py-2 pr-4 tabular-nums text-slate-600 dark:text-zinc-300">
-                      {p.credits != null ? p.credits.toFixed(0) : '—'}
-                    </td>
-                    <td className="py-2 pr-4">
-                      {p.disabled ? (
-                        <Badge tone="red">已禁用</Badge>
-                      ) : p.cooling ? (
-                        <Badge tone="amber">冷却中</Badge>
-                      ) : (
-                        <Badge tone="green">就绪</Badge>
-                      )}
-                    </td>
-                    <td className="py-2 pr-4 tabular-nums text-slate-500">{p.err_count}</td>
-                    <td className="py-2 text-xs text-slate-400">
-                      {p.cooldown_reason ?? '—'}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* 用量统计（落盘数据，服务未运行也可查看） */}
-      <div className="mt-5 card p-5">
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <BarChart3 size={18} className="text-brand-500" />
-            <h2 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">用量统计</h2>
-            <span className="hidden text-xs text-slate-400 sm:inline">按日落盘 · 独立于服务运行状态</span>
-          </div>
-          <div className="flex items-center gap-1">
-            {[7, 14, 30].map((d) => (
+            <div className="flex items-center gap-2">
               <button
-                key={d}
-                className={
-                  'rounded-md px-2 py-1 text-xs transition ' +
-                  (usageDays === d
-                    ? 'bg-brand-500/10 font-medium text-brand-600 dark:text-brand-400'
-                    : 'text-slate-500 hover:bg-slate-100 dark:text-zinc-400 dark:hover:bg-zinc-800')
-                }
-                onClick={() => setUsageDays(d)}
+                className="btn-outline flex items-center gap-1 text-xs"
+                onClick={() => void syncModels()}
+                disabled={syncingModels}
               >
-                {d}天
+                <Download size={13} className={syncingModels ? 'animate-spin' : ''} />
+                {syncingModels ? '同步中…' : '同步官网模型'}
               </button>
-            ))}
-            <button
-              className="btn-ghost ml-1 flex items-center gap-1 text-xs"
-              onClick={() => void loadUsage(usageDays)}
-              disabled={usageLoading}
-            >
-              <RefreshCw size={13} className={usageLoading ? 'animate-spin' : ''} />
-              刷新
-            </button>
+              <button
+                className="btn-ghost flex items-center gap-1 text-xs"
+                onClick={() => void loadModels(true)}
+                disabled={loadingModels}
+              >
+                <RefreshCw size={13} className={loadingModels ? 'animate-spin' : ''} />
+                {loadingModels ? '刷新中…' : '刷新'}
+              </button>
+            </div>
           </div>
-        </div>
 
-        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <StatCard
-            label="总请求数"
-            value={usageSummary.requests}
-            tone="brand"
-            hint={`近 ${usageDays} 天`}
-          />
-          <StatCard
-            label="成功率"
-            value={usageSummary.successRate === '—' ? '—' : `${usageSummary.successRate}%`}
-            tone="green"
-            hint={`失败 ${usageSummary.errors} 次`}
-          />
-          <StatCard
-            label="Token 消耗"
-            value={fmtTokens(usageSummary.prompt + usageSummary.completion)}
-            tone="amber"
-            hint={`输入 ${fmtTokens(usageSummary.prompt)} / 输出 ${fmtTokens(usageSummary.completion)}`}
-          />
-          <StatCard
-            label="平均耗时"
-            value={usageSummary.requests > 0 ? `${usageSummary.avgDuration}ms` : '—'}
-            tone="blue"
-            hint="按请求加权"
-          />
-        </div>
-
-        {usageSummary.requests > 0 ? (
-          <div className="h-56 text-slate-500 dark:text-zinc-400">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={usageChartData} margin={{ top: 4, right: 8, bottom: 0, left: -16 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.15} vertical={false} />
-                <XAxis dataKey="date" tick={{ fill: 'currentColor', fontSize: 11 }} tickLine={false} />
-                <YAxis allowDecimals={false} tick={{ fill: 'currentColor', fontSize: 11 }} tickLine={false} />
-                <Tooltip
-                  contentStyle={{
-                    borderRadius: 8,
-                    border: '1px solid rgba(120,120,120,0.25)',
-                    fontSize: 12,
-                  }}
-                />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar dataKey="成功" stackId="s" fill="#10b981" radius={[0, 0, 0, 0]} />
-                <Bar dataKey="失败" stackId="s" fill="#f43f5e" radius={[3, 3, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        ) : (
-          <p className="py-6 text-center text-sm text-slate-400">
-            暂无请求数据 — 发起一次 API 调用后这里会展示按日趋势
+          <p className="mb-3 text-xs text-slate-400 dark:text-zinc-500">
+            四层来源聚合：人工维护 &gt; 官网同步 &gt; 内置参考 &gt; 名称推断；未确定字段显示 —，名称带{' '}
+            <span className="font-bold text-amber-500">*</span> 表示已人工维护（官网同步不覆盖）。
           </p>
-        )}
 
-        {usageSummary.topModels.length > 0 && (
-          <div className="mt-4">
-            <p className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-400">
-              模型分布（近 {usageDays} 天 Top 5）
+          {models.length === 0 ? (
+            <p className="flex-1 py-8 text-center text-sm text-slate-400">
+              暂无模型数据 — 点击「同步官网模型」或「刷新」拉取统一目录
             </p>
-            <div className="overflow-x-auto">
+          ) : (
+            <div className="flex-1 overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
-                    <th className="pb-2 pr-4 font-medium">模型</th>
-                    <th className="pb-2 pr-4 font-medium">请求数</th>
-                    <th className="pb-2 pr-4 font-medium">成功</th>
-                    <th className="pb-2 pr-4 font-medium">失败</th>
-                    <th className="pb-2 font-medium">占比</th>
+                    <th className="pb-2 pr-3 font-medium">模型 ID</th>
+                    <th className="pb-2 pr-3 font-medium">展示名</th>
+                    <th className="pb-2 pr-3 text-right font-medium">积分倍率</th>
+                    <th className="pb-2 pr-3 font-medium">思考档位</th>
+                    <th className="pb-2 pr-3 text-right font-medium">上下文</th>
+                    <th className="pb-2 pr-3 text-center font-medium">图片</th>
+                    <th className="pb-2 text-right font-medium">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {usageSummary.topModels.map((m) => {
-                    const pct = usageSummary.requests > 0 ? (m.requests / usageSummary.requests) * 100 : 0;
-                    return (
-                      <tr
-                        key={m.name}
-                        className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
-                      >
-                        <td className="py-2 pr-4 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
-                          {m.name}
-                        </td>
-                        <td className="py-2 pr-4 tabular-nums text-slate-600 dark:text-zinc-300">{m.requests}</td>
-                        <td className="py-2 pr-4 tabular-nums text-emerald-600 dark:text-emerald-400">{m.ok}</td>
-                        <td className="py-2 pr-4 tabular-nums text-rose-600 dark:text-rose-400">{m.errors}</td>
-                        <td className="w-40 py-2">
-                          <div className="flex items-center gap-2">
-                            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100 dark:bg-zinc-800">
-                              <div
-                                className="h-full rounded-full bg-brand-500"
-                                style={{ width: `${Math.min(100, pct)}%` }}
-                              />
-                            </div>
-                            <span className="w-12 shrink-0 text-right text-xs tabular-nums text-slate-400">
-                              {pct.toFixed(1)}%
-                            </span>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {models.map((m) => (
+                    <tr
+                      key={m.id}
+                      className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
+                    >
+                      <td className="py-2 pr-3 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
+                        {m.id}
+                      </td>
+                      <td className="py-2 pr-3 text-slate-600 dark:text-zinc-300">
+                        {m.display || '—'}
+                        {m.manual && (
+                          <span
+                            className="ml-0.5 font-bold text-amber-500"
+                            title="已人工维护（L1 覆盖层）"
+                          >
+                            *
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2 pr-3 text-right tabular-nums text-amber-600 dark:text-amber-400">
+                        {m.rate != null ? m.rate.toFixed(2) : '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-xs text-slate-500 dark:text-zinc-400">
+                        {m.efforts.length > 0 ? m.efforts.join(' / ') : '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-right tabular-nums text-xs text-slate-500 dark:text-zinc-400">
+                        {m.context_length != null ? `${Math.round(m.context_length / 1000)}k` : '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-center text-xs">
+                        {m.supports_image === true ? (
+                          <span className="font-semibold text-emerald-600 dark:text-emerald-400">✓</span>
+                        ) : m.supports_image === false ? (
+                          <span className="text-slate-400 dark:text-zinc-500">✗</span>
+                        ) : (
+                          <span className="text-slate-300 dark:text-zinc-600">—</span>
+                        )}
+                      </td>
+                      <td className="py-2 text-right">
+                        <button
+                          className="btn-ghost inline-flex items-center gap-1 text-xs"
+                          onClick={() => void openEdit(m)}
+                        >
+                          <Pencil size={12} />
+                          编辑
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
+
+      {/* 模型元数据编辑弹框（L1 覆盖层，§6.1）：字段全部可留空 = 交由下层自动来源兜底 */}
+      <Modal
+        open={editing !== null}
+        onClose={() => setEditing(null)}
+        title={`编辑模型元数据 · ${editing?.id ?? ''}`}
+        footer={
+          <>
+            {editing?.manual && (
+              <button
+                className="btn-outline mr-auto flex items-center gap-1"
+                onClick={() => void clearMeta()}
+                disabled={clearingMeta || savingMeta}
+                title="清除 L1 人工覆盖，恢复自动来源链（官网同步 > 内置参考 > 名称推断）"
+              >
+                <Eraser size={14} />
+                {clearingMeta ? '清除中…' : '清除人工值'}
+              </button>
+            )}
+            <button className="btn-ghost" onClick={() => setEditing(null)} disabled={savingMeta}>
+              取消
+            </button>
+            <button
+              className="btn-primary flex items-center gap-1"
+              onClick={() => void saveMeta()}
+              disabled={savingMeta}
+            >
+              {savingMeta ? <Spinner className="text-white" /> : <Save size={15} />}
+              {savingMeta ? '保存中…' : '保存'}
+            </button>
+          </>
+        }
+      >
+        <p className="mb-3 text-xs text-slate-400 dark:text-zinc-500">
+          人工维护为最高优先级（L1），官网同步不覆盖；<b>留空 = 未设置</b>，交由下层自动来源兜底。
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">展示名</label>
+            <input
+              className={inputCls}
+              value={fLabel}
+              onChange={(e) => setFLabel(e.target.value)}
+              placeholder="留空 = 自动来源"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">积分倍率</label>
+            <input
+              className={inputCls}
+              type="number"
+              step="0.01"
+              min="0"
+              value={fRate}
+              onChange={(e) => setFRate(e.target.value)}
+              placeholder="留空 = 自动来源"
+            />
+          </div>
+          <div className="col-span-2">
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
+              思考档位（可多选；全不选 = 未设置）
+            </label>
+            <div className="flex items-center gap-4">
+              {EFFORT_OPTIONS.map((e) => (
+                <label key={e} className="flex cursor-pointer items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-300">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                    checked={fEfforts.has(e)}
+                    onChange={() =>
+                      setFEfforts((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(e)) next.delete(e);
+                        else next.add(e);
+                        return next;
+                      })
+                    }
+                  />
+                  {e}
+                </label>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">上下文长度</label>
+            <input
+              className={inputCls}
+              type="number"
+              step="1"
+              min="0"
+              value={fContext}
+              onChange={(e) => setFContext(e.target.value)}
+              placeholder="如 1000000"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">max_tokens</label>
+            <input
+              className={inputCls}
+              type="number"
+              step="1"
+              min="0"
+              value={fMaxTokens}
+              onChange={(e) => setFMaxTokens(e.target.value)}
+              placeholder="如 96000"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">图片支持</label>
+            <select
+              className={inputCls}
+              value={fImage}
+              onChange={(e) => setFImage(e.target.value as '' | 'true' | 'false')}
+            >
+              <option value="">未设置（自动来源）</option>
+              <option value="true">支持</option>
+              <option value="false">不支持</option>
+            </select>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

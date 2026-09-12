@@ -6,8 +6,7 @@ import {
   Coins,
   Settings,
   Server,
-  Github,
-  Globe,
+  KeyRound,
   SlidersHorizontal,
   Palette,
   Info,
@@ -15,10 +14,8 @@ import {
   Bot,
   LayoutGrid,
 } from 'lucide-react';
-import { open } from '@tauri-apps/plugin-shell';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
-import { LINK_REPO, LINK_BLOG } from '../lib/about';
 import { nextTheme } from '../lib/themes';
 import type { ViewKey, AppKey } from '../types';
 import AboutDialog from './AboutDialog';
@@ -31,7 +28,7 @@ const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'accounts', label: '账号管理', icon: Users },
   { key: 'checkin', label: '一键签到', icon: PlayCircle },
   { key: 'credits', label: '积分看板', icon: Coins },
-  { key: 'api-service', label: 'API 服务', icon: Server },
+  { key: 'api-service', label: '资源调度', icon: Server },
   { key: 'settings', label: '环境配置', icon: Settings },
 ];
 
@@ -48,7 +45,7 @@ const BUDDY_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'buddy-accounts', label: '账号管理', icon: Users },
   { key: 'buddy-checkin', label: '签到与成长', icon: PlayCircle },
   { key: 'buddy-credits', label: '积分看板', icon: Coins },
-  { key: 'buddy-api-service', label: 'API 服务', icon: Server },
+  { key: 'buddy-api-service', label: '资源调度', icon: Server },
   { key: 'buddy-settings', label: '环境配置', icon: Settings },
 ];
 
@@ -69,19 +66,12 @@ export default function Sidebar({
   const pushToast = useAppStore((s) => s.pushToast);
   const activeApp = useAppStore((s) => s.activeApp);
   const setActiveApp = useAppStore((s) => s.setActiveApp);
+  const setShowApiManager = useAppStore((s) => s.setShowApiManager);
   const [showAbout, setShowAbout] = useState(false);
   const [showSystem, setShowSystem] = useState(false);
 
   // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 5 页（批次1）
   const nav = activeApp === 'doubao' ? DOUBAO_NAV : activeApp === 'buddy' ? BUDDY_NAV : NAV;
-
-  const openExternal = async (url: string, label: string) => {
-    try {
-      await open(url);
-    } catch (e) {
-      pushToast('error', `打开${label}失败：${String(e)}`);
-    }
-  };
 
   // 主题轮询：每次点击切换到下一个主题并持久化
   const cycleTheme = async () => {
@@ -147,21 +137,14 @@ export default function Sidebar({
         </div>
       </div>
       <div className="flex items-center justify-center gap-1 border-t border-slate-200 p-3 dark:border-zinc-800">
+        {/* API 管理入口（统一网关 §5.1，原 Github 图标位置） */}
         <button
-          onClick={() => void openExternal(LINK_REPO, '软件 Github 地址')}
+          onClick={() => setShowApiManager(true)}
           className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
-          aria-label="软件 Github 地址"
-          title="软件 Github 地址"
+          aria-label="API 管理"
+          title="API 管理（统一网关：启停 / 接口配置 / API Keys / 生态接入 / 用量统计）"
         >
-          <Github size={17} />
-        </button>
-        <button
-          onClick={() => void openExternal(LINK_BLOG, '作者博客主页')}
-          className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
-          aria-label="作者博客主页"
-          title="作者博客主页"
-        >
-          <Globe size={17} />
+          <KeyRound size={17} />
         </button>
         <button
           onClick={() => setShowSystem(true)}

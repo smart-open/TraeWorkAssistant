@@ -42,7 +42,11 @@ import type {
   UpdateCheckResult,
   UpdateDownloaded,
   UpdateDownloadProgress,
+  GatewaySettings,
+  TraeModelMeta,
+  UnifiedModel,
   UsageDayView,
+  CustomModel,
   WorkBuddyAccountView,
   WorkBuddyEnvCheck,
   WorkBuddyScanResult,
@@ -289,6 +293,8 @@ export const api = {
       invoke<WbCreditsResult>('workbuddy_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
     settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
     settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),
+    // 打开 auth 文件所在目录（资源管理器；人工覆盖路径优先）
+    openAuthDir: () => invoke('workbuddy_open_auth_dir'),
     // UI 坐标点击签到兜底（F-18，批次4）：仅手动触发、默认关闭
     uiClickCapture: () => invoke<{ ok: boolean; x: number; y: number; message: string }>('workbuddy_ui_click_capture'),
     uiClickCheckin: () => invoke<{ ok: boolean; x: number; y: number; message: string }>('workbuddy_ui_click_checkin'),
@@ -386,7 +392,7 @@ export const api = {
     modelsSync: () => invoke<ModelOption[]>('api_models_sync'),
     // T5.1/F-37：WB 上游模型目录动态替换（手动触发；网关启动时已自动做一次）
     wbCatalogSync: () => invoke<number>('api_wb_catalog_sync'),
-    // WB 目录模型列表（Buddy API 服务页展示）
+    // WB 目录模型列表（Buddy「资源调度」页展示）
     wbCatalogList: () => invoke<WbModelInfo[]>('api_wb_catalog_list'),
     // T5.7/F-43：CC Switch 协同（注册网关 provider 条目，不自建切换器）
     // side：trae（Trae 模型网关）/ wb（WB 上游网关），两套条目互不覆盖
@@ -407,9 +413,35 @@ export const api = {
     // T1：近 N 天 API 用量统计（Trae 模型请求桶；按日聚合，服务未运行也可查）
     usageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_usage_stats', { days: days ?? null }),
-    // WB 上游用量统计（wb_days 桶，Buddy「API 服务」页专用，与 Trae 侧分账）
+    // WB 上游用量统计（wb_days 桶，Buddy「资源调度」页专用，与 Trae 侧分账）
     wbUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_wb_usage_stats', { days: days ?? null }),
+    // 自定义模型用量统计（custom_days 桶，API 管理·用量统计「自定义」筛选）
+    customUsageStats: (days?: number) =>
+      invoke<UsageDayView[]>('api_custom_usage_stats', { days: days ?? null }),
+    // 自定义模型列表（custom_models.json，OpenAI 兼容上游直通）
+    customModelsList: () => invoke<CustomModel[]>('custom_models_list'),
+    // 保存自定义模型（upsert：id 空 = 新增；返回保存后的完整列表）
+    customModelsSave: (model: CustomModel) =>
+      invoke<CustomModel[]>('custom_models_save', { model }),
+    // 按 id 删除自定义模型；返回是否确有删除
+    customModelsRemove: (id: string) => invoke<boolean>('custom_models_remove', { id }),
+    // ---- 统一网关命令（Phase 1 §8.1）：统一模型目录 / 网关设置 ----
+    // 顶层参数用 camelCase（availableOnly），嵌套结构体字段保持 snake_case
+    unifiedModels: (availableOnly?: boolean) =>
+      invoke<UnifiedModel[]>('api_unified_models', { availableOnly: availableOnly ?? null }),
+    gatewaySettingsGet: () => invoke<GatewaySettings>('gateway_settings_get'),
+    // 返回规范化后的生效值（前端展示以返回值为准）；端口改动下次启动 API 服务后生效
+    gatewaySettingsSet: (settings: GatewaySettings) =>
+      invoke<GatewaySettings>('gateway_settings_set', { settings }),
+    // Trae 模型元数据 L1 覆盖层（§6.1 编辑弹框读写 data/trae_model_meta.json）：
+    // 顶层参数 camelCase；meta 嵌套字段保持 snake_case；null 字段 = 未设置，交由下层兜底
+    // metaGet 用于编辑弹框回显跨会话人工值（null = 无人工值，全字段交由下层兜底）
+    metaGet: (model: string) => invoke<TraeModelMeta | null>('trae_model_meta_get', { model }),
+    metaSet: (model: string, meta: TraeModelMeta) =>
+      invoke<void>('trae_model_meta_set', { model, meta }),
+    // 清除人工覆盖（恢复自动来源链）；返回是否确有删除
+    metaClear: (model: string) => invoke<boolean>('trae_model_meta_clear', { model }),
     // T2：多 API Key 管理（统一列表，无主/子之分）
     keysList: () => invoke<ApiKeysFileView>('api_keys_list'),
     // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）

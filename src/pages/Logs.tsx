@@ -1,4 +1,4 @@
-﻿import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { RefreshCw, Search, Trash2, Copy, ChevronLeft, ChevronRight, Eye, Eraser, Bug, FileText, X } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, Modal } from '../components/ui';
@@ -585,7 +585,7 @@ function ApiLogsTab() {
               } ${!running || togglingDebug ? 'cursor-not-allowed opacity-50' : ''}`}
               onClick={() => void toggleDebug()}
               disabled={!running || togglingDebug}
-              title={running ? '开启后记录完整请求/响应信息' : '需先启动 API 服务'}
+              title={running ? '开启后记录完整请求/响应信息' : '需先启动 API 网关'}
             >
               <Bug size={13} className={togglingDebug ? 'animate-pulse' : ''} />
               {togglingDebug ? '切换中…' : `Debug ${debugEnabled ? 'ON' : 'OFF'}`}

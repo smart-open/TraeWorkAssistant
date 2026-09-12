@@ -28,6 +28,18 @@ fn auth_file_path() -> PathBuf {
         .join("workbuddy-desktop.info")
 }
 
+/// auth 文件读取路径：settings.wb_auth_file_path 人工指定优先（环境配置页），否则默认布局。
+/// 仅作用于读取类路径（检测/列表/导入/续期/用量）；环境重置等清理动作仍针对客户端真实落盘位置。
+fn auth_file_path_of(state: &AppState) -> PathBuf {
+    if let Some(p) = state.settings().wb_auth_file_path.as_deref() {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    auth_file_path()
+}
+
 fn wb_data_dir() -> PathBuf {
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     PathBuf::from(home).join(".workbuddy")
@@ -135,6 +147,8 @@ pub struct WorkBuddyEnvCheck {
     pub running: bool,
     pub version: Option<String>,
     pub exe: Option<String>,
+    /// 实际读取的 auth 文件路径（人工覆盖优先，见 auth_file_path_of）
+    pub auth_file_path: String,
     pub auth_file_exists: bool,
     pub data_dir_exists: bool,
     /// account-snapshot.json 当前登录 uid（可读时）
@@ -353,7 +367,7 @@ fn as_ts_seconds(v: &Option<serde_json::Value>) -> Option<i64> {
 pub fn workbuddy_env_check(state: State<AppState>) -> WorkBuddyEnvCheck {
     // 复用 F-01 app_locate 四级探测（env.rs 内部实现走注册表/默认路径/进程反查）
     let locate = crate::commands::env::app_locate_inner(&state, "workbuddy");
-    let auth_exists = auth_file_path().exists();
+    let auth_path = auth_file_path_of(&state);
     let snap = fs_utils::read_json::<serde_json::Value>(&snapshot_json_path());
     let has_snap = snap.is_object();
     WorkBuddyEnvCheck {
@@ -361,12 +375,31 @@ pub fn workbuddy_env_check(state: State<AppState>) -> WorkBuddyEnvCheck {
         running: is_running(),
         version: locate.version,
         exe: locate.exe,
-        auth_file_exists: auth_exists,
+        auth_file_path: auth_path.display().to_string(),
+        auth_file_exists: auth_path.exists(),
         data_dir_exists: wb_data_dir().exists(),
         snapshot_uid: if has_snap { as_str(&dig(&snap, &["uid", "accountId"])) } else { None },
         snapshot_nickname: if has_snap { as_str(&dig(&snap, &["nickname", "displayName", "name"])) } else { None },
         snapshot_edition: if has_snap { as_str(&dig(&snap, &["editionType", "edition"])) } else { None },
     }
+}
+
+/// 打开 auth 文件所在目录（资源管理器；人工覆盖路径优先）。目录不存在时报错提示。
+#[tauri::command(async)]
+pub fn workbuddy_open_auth_dir(state: State<AppState>) -> Result<(), String> {
+    let path = auth_file_path_of(&state);
+    let dir = path
+        .parent()
+        .map(|d| d.to_path_buf())
+        .ok_or_else(|| format!("无法解析 auth 目录：{}", path.display()))?;
+    if !dir.is_dir() {
+        return Err(format!("目录不存在：{}", dir.display()));
+    }
+    std::process::Command::new("explorer")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("打开目录失败: {e}"))?;
+    Ok(())
 }
 
 // ── 账号池（F-04）──────────────────────────────────────────────────────────
@@ -380,7 +413,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
     let pool = load_pool(state);
     // 在线判定：auth 文件 uid 与账号一致（客户端当前生效登录）
     let auth_uid = {
-        let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path());
+        let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(state));
         if raw.is_object() { as_str(&dig(&raw, &["uid"])) } else { None }
     };
     let snap_path = state.data_dir.join("data").join("profiles_workbuddy");
@@ -450,13 +483,20 @@ pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_
             let _ = std::fs::remove_dir_all(&slot);
         }
     }
+    // 被删账号是 CodeBuddy CLI 当前号 → 清理轮换状态残留（active_account_id），
+    // 避免轮换日志参考失真（下次轮换 current 判定按 settings.json 自愈）
+    let mut st = load_cli_rotate_state(&state);
+    if st.active_account_id.as_deref() == Some(user_id.as_str()) {
+        st.active_account_id = None;
+        let _ = fs_utils::write_json(&cli_rotate_state_path(&state), &st);
+    }
     Ok(())
 }
 
 /// 扫描本机 auth 文件（F-04 导入预览；不写盘）
 #[tauri::command(async)]
 pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBuddyScanResult>, String> {
-    let path = auth_file_path();
+    let path = auth_file_path_of(&state);
     if !path.exists() {
         return Ok(None);
     }
@@ -486,7 +526,7 @@ pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBud
 /// auth 文件导入入池（F-04）：写账号池 + 工具侧凭证副本（掩码入池、凭证不外泄）
 #[tauri::command(async)]
 pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String>) -> Result<WorkBuddyAccountView, String> {
-    let path = auth_file_path();
+    let path = auth_file_path_of(&state);
     if !path.exists() {
         return Err("未找到 auth 文件，请先在 WorkBuddy 客户端登录".into());
     }
@@ -587,7 +627,7 @@ pub fn workbuddy_refresh_token(state: State<AppState>, user_id: String) -> Resul
     let refresh = as_str(&dig(&rec, &["refresh_token"]))
         .or_else(|| {
             // 兜底：auth 文件 uid 匹配时取其 refreshToken（客户端当前生效账号）
-            let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path());
+            let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(&state));
             let fuid = as_str(&dig(&raw, &["uid"]));
             if fuid.as_deref() == Some(acct.uid.as_str()) && !acct.uid.is_empty() {
                 as_str(&dig(&raw, &["refreshToken", "refresh_token"]))
@@ -2709,7 +2749,7 @@ fn state_vscdb_backup_exists() -> bool {
 
 /// 当前生效 accessToken：auth 文件优先，回退 token store 中有效期最新的账号凭证（仅用于解析 Keycloak iss）
 fn current_access_token(state: &AppState) -> Option<String> {
-    let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path());
+    let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(state));
     if let Some(t) = as_str(&dig(&raw, &["accessToken"])) {
         if !t.is_empty() {
             return Some(t);
@@ -2885,7 +2925,7 @@ pub fn workbuddy_usage_official(
         .as_deref()
         .and_then(|uid| pick(uid))
         .or_else(|| {
-            let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path());
+            let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(&state));
             let fuid = as_str(&dig(&raw, &["uid"]))?;
             pool.accounts.iter().find(|a| a.uid == fuid).map(|a| a.id.clone()).and_then(|id| pick(&id))
         })
@@ -3111,7 +3151,7 @@ pub fn workbuddy_activity_info(
         .as_deref()
         .and_then(|uid| pick(uid))
         .or_else(|| {
-            let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path());
+            let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(&state));
             let fuid = as_str(&dig(&raw, &["uid"]))?;
             pool.accounts.iter().find(|a| a.uid == fuid).map(|a| a.id.clone()).and_then(|id| pick(&id))
         })
