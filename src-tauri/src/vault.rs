@@ -8,7 +8,7 @@
 //! - 所有账号文件读写统一走 `load_accounts` / `save_accounts`：
 //!   读：JSON 明文优先（更新鲜，如 MITM 新捕获）→ 否则从 vault 回填；
 //!   写：非空凭据先写入 vault 并落盘快照 → JSON 占位化；
-//!   vault 写失败时降级为明文落盘（保功能可用，仅记录告警）；
+//!   vault 写失败时仅保存占位化 JSON 并返回 Err（禁止明文 jwt/refresh_token 落盘）；
 //! - Python 签到脚本通过 `write_temp_accounts` 获取解密临时文件（用后即删；
 //!   文件落在应用数据目录而非全局 %TEMP%，启动时统一清理残留）。
 
@@ -117,8 +117,28 @@ mod dpapi {
 }
 
 /// 生成 32 字节随机主密码：
-/// 熵源 = 多轮 RandomState（OS 随机种子）+ 高精度时间 + 进程 ID，经 SHA-256 压缩成 256bit
+/// 熵源 = OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG）。
+/// 旧实现（多轮 RandomState + 高精度时间 + 进程 ID 经 SHA-256 压缩）熵不足且部分可预测，
+/// 审查 P1 要求改用 OS CSPRNG；BCrypt 调用失败时保留旧实现兜底（主密码生成不允许 panic）。
 fn generate_password() -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        let mut buf = [0u8; 32];
+        // 算法句柄传零值（等效 NULL）配合 BCRYPT_USE_SYSTEM_PREFERRED_RNG 使用进程首选 RNG
+        let halg: windows_sys::Win32::Security::Cryptography::BCRYPT_ALG_HANDLE =
+            unsafe { std::mem::zeroed() };
+        // STATUS_SUCCESS == 0
+        let status = unsafe {
+            BCryptGenRandom(halg, buf.as_mut_ptr(), buf.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+        };
+        if status == 0 {
+            return buf.to_vec();
+        }
+        // BCrypt 失败 → 落到下方旧实现兜底
+    }
     use sha2::{Digest, Sha256};
     use std::hash::{BuildHasher, Hasher};
     let mut entropy: Vec<u8> = Vec::new();
@@ -154,7 +174,9 @@ fn vault_password(state: &AppState) -> Result<Vec<u8>, String> {
 
 /// 打开（并缓存）vault：首次调用时加载快照或创建新 client
 fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<Stronghold>>, String> {
-    let mut guard = VAULT.lock().map_err(|_| "vault 锁已被毒化".to_string())?;
+    // 锁中毒恢复：另一线程在持锁期间 panic 毒化锁时，直接恢复内部数据继续使用，
+    // 而不是让「vault 锁已被毒化」错误在所有后续调用上永久传播
+    let mut guard = VAULT.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         let path = state.conf_path("vault.stronghold");
         let password = vault_password(state)?;
@@ -209,21 +231,26 @@ pub fn load_accounts(state: &AppState) -> AccountsFile {
 }
 
 /// 保存账号文件：非空凭据写入 vault（字段级合并）并落盘快照，JSON 占位化。
-/// vault 写失败时降级为明文落盘（保证功能不中断，记录告警日志）。
-/// 注意：成功路径会就地清空调用方结构体中的 jwt / refresh_token 字段。
+/// vault 写失败时**禁止明文落盘**（审查 P1）：仅保存占位化 JSON（凭据字段清空），
+/// 返回 Err 明确告知「加密存储失败，签到功能不可用直至修复」——宁可丢本次凭据更新，
+/// 也不把 jwt/refresh_token 明文写到磁盘。
+/// 注意：成功与降级路径都会就地清空调用方结构体中的 jwt / refresh_token 字段。
 pub fn save_accounts(state: &AppState, accounts: &mut AccountsFile) -> Result<(), String> {
     let vault_result = write_vault_secrets(state, accounts);
-    if vault_result.is_ok() {
-        wipe_placeholders(accounts);
-    } else {
-        let reason = vault_result.as_ref().err().cloned().unwrap_or_default();
+    // 无论 vault 写入成败，落盘前一律占位化：vault 失败时严禁明文凭据进入 JSON
+    wipe_placeholders(accounts);
+    if let Err(reason) = &vault_result {
         fs_utils::app_log(
             &state.data_dir,
-            &format!("vault 写入失败，凭据保留明文落盘（下次启动重试迁移）: {reason}"),
+            &format!("vault 写入失败，已仅保存账号占位信息（禁止明文落盘）: {reason}"),
         );
     }
     fs_utils::write_json(&state.path("checkin_accounts.json"), accounts)?;
-    vault_result
+    vault_result.map_err(|reason| {
+        format!(
+            "加密存储失败，已仅保存账号占位信息，签到功能不可用直至修复（vault 错误: {reason}）"
+        )
+    })
 }
 
 /// 将账号结构体中的明文凭据占位化（清空 jwt / refresh_token）
@@ -320,7 +347,7 @@ pub fn remove_secret(state: &AppState, uid: &str) {
 }
 
 /// 启动时幂等迁移：JSON 中的明文 jwt / refresh_token → vault，随后 JSON 占位化。
-/// 失败不阻断启动（下次启动重试；vault 异常时 save_accounts 会降级保留明文）。
+/// 失败不阻断启动（下次启动重试；vault 异常时 save_accounts 仅落盘占位信息，禁止明文）。
 pub fn migrate_on_startup(state: &AppState) {
     let raw: AccountsFile = fs_utils::read_json(&state.path("checkin_accounts.json"));
     let plaintext = raw
@@ -341,7 +368,7 @@ pub fn migrate_on_startup(state: &AppState) {
         ),
         Err(e) => fs_utils::app_log(
             &state.data_dir,
-            &format!("启动迁移: 写入 vault 失败（保留明文，下次启动重试）: {e}"),
+            &format!("启动迁移: 写入 vault 失败（已仅保留占位信息，禁止明文落盘）: {e}"),
         ),
     }
 }
