@@ -1,47 +1,85 @@
 //! F-47 进程管理增强：三级关闭策略
 //!
 //! 参考社区实现（oss-ecosystem-research §5.3 rotate.rs）的三级关闭思路：
-//! 1. **优雅关闭**：taskkill（不带 /F）向主窗口发送 WM_CLOSE，等待最长 3s，
-//!    让 Electron 尽量正常落盘（避免强杀导致 leveldb/vscdb 文件锁与数据损坏）；
+//! 1. **优雅关闭**：Windows taskkill（不带 /F）向主窗口发送 WM_CLOSE / macOS SIGTERM
+//!    （sysinfo kill_with，Electron 收到后走正常 quit 流程，落盘语义等价 WM_CLOSE），
+//!    等待最长 3s，让 Electron 尽量正常落盘（避免强杀导致 leveldb/vscdb 文件锁与数据损坏）；
 //!    实测 Electron 收到 WM_CLOSE 后通常 1s 内退出，3s 足够且不拖慢切换体验；
-//! 2. **强杀进程树**：taskkill /T /F，等待最长 2s；
+//! 2. **强杀进程树**：Windows taskkill /T /F / macOS SIGKILL（sysinfo kill()），
+//!    等待最长 2s；
 //! 3. **人工介入**：仍存活则返回 Err，由前端 toast 提示用户手动关闭。
 //!
-//! 匹配策略：仅按主程序映像名精确匹配（tasklist/taskkill 的 IMAGENAME），
-//! crashpad-helper 等子进程不会独立命中；树杀阶段随主进程一并清理。
-//! 所有子进程均以 CREATE_NO_WINDOW（0x08000000）拉起，不闪烁控制台窗口。
+//! 匹配策略：仅按主程序映像名精确匹配（Windows tasklist 的 IMAGENAME /
+//! macOS sysinfo 进程名），crashpad-helper 等子进程不会独立命中；
+//! 树杀阶段随主进程一并清理。
+//! Windows 子进程以 CREATE_NO_WINDOW 拉起（platform::cmd::sys_command 收敛点）；
+//! macOS 进程探测/关闭走 sysinfo（F-75 M1-1.1，与 switcher/proc.rs 同源实现，
+//! Windows 路径零变化——tasklist/taskkill 语义保留）。
 
-use std::os::windows::process::CommandExt;
-use std::process::Command;
+#[cfg(windows)]
+use crate::platform::cmd::sys_command;
 use std::time::{Duration, Instant};
 
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-/// 检查任一映像名是否仍在运行（tasklist 精确匹配 IMAGENAME）
+/// 检查任一映像名是否仍在运行（Windows：tasklist 精确匹配 IMAGENAME；
+/// macOS：sysinfo 进程名精确匹配，剥离 .exe 后缀比对）
 pub fn images_running(images: &[&str]) -> Vec<String> {
-    let mut alive = Vec::new();
-    for img in images {
-        let running = Command::new("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {img}"), "/NH"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map(|o| {
-                let s = String::from_utf8_lossy(&o.stdout);
-                s.to_lowercase().contains(&img.to_lowercase())
-            })
-            .unwrap_or(false);
-        if running {
-            alive.push(img.to_string());
+    #[cfg(windows)]
+    {
+        let mut alive = Vec::new();
+        for img in images {
+            let running = sys_command("tasklist")
+                .args(["/FI", &format!("IMAGENAME eq {img}"), "/NH"])
+                .output()
+                .map(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    s.to_lowercase().contains(&img.to_lowercase())
+                })
+                .unwrap_or(false);
+            if running {
+                alive.push(img.to_string());
+            }
         }
+        alive
     }
-    alive
+    #[cfg(target_os = "macos")]
+    {
+        let sys = mac_snapshot();
+        let mut alive = Vec::new();
+        for img in images {
+            // mac 进程名无 .exe 后缀（待 M-1 侦察 6 核对各应用 mac 主进程名）；
+            // images_for_app 的 Windows 形态名单经剥离后精确比对
+            let want = img.strip_suffix(".exe").unwrap_or(img);
+            if sys
+                .processes()
+                .values()
+                .any(|p| p.name().to_string_lossy().eq_ignore_ascii_case(want))
+            {
+                alive.push(img.to_string());
+            }
+        }
+        alive
+    }
 }
 
+#[cfg(windows)]
 fn run_taskkill(args: &[&str]) {
-    let _ = Command::new("taskkill")
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let _ = sys_command("taskkill").args(args).output();
+}
+
+/// macOS sysinfo 快照（与 switcher/proc.rs 同款封装）
+#[cfg(target_os = "macos")]
+fn mac_snapshot() -> sysinfo::System {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys
+}
+
+/// macOS 白名单进程匹配（剥离 .exe 后缀精确比对）
+#[cfg(target_os = "macos")]
+fn mac_name_matches(images: &[&str], name: &str) -> bool {
+    images
+        .iter()
+        .any(|img| img.strip_suffix(".exe").unwrap_or(img).eq_ignore_ascii_case(name))
 }
 
 /// 三级关闭指定映像名的进程。
@@ -52,29 +90,69 @@ pub fn graceful_kill_images(images: &[&str]) -> Result<(), String> {
         return Ok(());
     }
 
-    // ---- 第一级：优雅关闭（WM_CLOSE），最长等待 3s ----
-    for img in &alive {
-        // taskkill 不带 /F：向有窗口的进程发送关闭消息
-        run_taskkill(&["/IM", img]);
-    }
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if images_running(images).is_empty() {
-            return Ok(());
+    #[cfg(windows)]
+    {
+        // ---- 第一级：优雅关闭（WM_CLOSE），最长等待 3s ----
+        for img in &alive {
+            // taskkill 不带 /F：向有窗口的进程发送关闭消息
+            run_taskkill(&["/IM", img]);
         }
-        std::thread::sleep(Duration::from_millis(250));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if images_running(images).is_empty() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        // ---- 第二级：强杀进程树（/T /F），最长等待 2s ----
+        for img in &alive {
+            run_taskkill(&["/T", "/F", "/IM", img]);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if images_running(images).is_empty() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
-    // ---- 第二级：强杀进程树（/T /F），最长等待 2s ----
-    for img in &alive {
-        run_taskkill(&["/T", "/F", "/IM", img]);
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if images_running(images).is_empty() {
-            return Ok(());
+    #[cfg(target_os = "macos")]
+    {
+        // ---- 第一级：优雅关闭（SIGTERM，Electron 正常落盘），最长等待 3s ----
+        {
+            let sys = mac_snapshot();
+            for p in sys.processes().values() {
+                if mac_name_matches(images, &p.name().to_string_lossy()) {
+                    let _ = p.kill_with(sysinfo::Signal::Term); // SIGTERM
+                }
+            }
         }
-        std::thread::sleep(Duration::from_millis(250));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if images_running(images).is_empty() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        // ---- 第二级：强杀（SIGKILL，sysinfo kill()），最长等待 2s ----
+        {
+            let sys = mac_snapshot();
+            for p in sys.processes().values() {
+                if mac_name_matches(images, &p.name().to_string_lossy()) {
+                    let _ = p.kill(); // unix = SIGKILL
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if images_running(images).is_empty() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
     // ---- 第三级：人工介入 ----

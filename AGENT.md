@@ -5,7 +5,9 @@
 
 ## 1. 一句话
 
-Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae Work 与 Trae（Trae CN IDE）双应用**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；桥档案表已预留豆包 / WorkBuddy）。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
+Windows / macOS 双平台桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包 五应用**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；桥档案表可扩展更多应用）。**所有数据仅存在本地数据目录（Windows `%APPDATA%\AIWorkAssistant\`，macOS `~/Library/Application Support/AIWorkAssistant/`），零外部网络**。
+
+> **macOS 支持（F-75）**：平台服务层 `platform/` 分层归位（子进程构建 / 数据目录 / vault Keychain / 系统代理 networksetup / CA security / 进程 SIGTERM / bundle 定位），打包 dmg（aarch64 + x64 双架构，`tauri.macos.conf.json`）。应用域灰度放开中（`mac_supported`，待各应用 mac 版数据布局侦察），设计与进度见 `docs/tmp/f75-macos-support-design.md`。schtasks 系统级定时、MachineGuid 系统级重置、UI 点击兜底为 Windows 专属（mac 由内置调度器 + 开机自启覆盖，入口按 platform 标志隐藏）。
 
 ## 2. Quick Start
 
@@ -53,6 +55,7 @@ ai-work-assistant/
 │   ├── tauri.conf.json           # 无装饰窗 / 无外部资源（Python 与 PS 桥均已移除，全 Rust）
 │   └── src/
 │       ├── main.rs               # 注册全部命令 + --task-run CLI 任务模式
+│       ├── platform/             # F-75 平台服务层（M0 底座）：mod.rs 数据根/OS 标志 + cmd.rs sys_command 子进程构建（全仓 creation_flags 收敛点，禁止再散写 CommandExt）+ secret.rs vault 主密码原语（win DPAPI / mac Keychain via keyring）
 │       ├── state.rs              # AppState（%APPDATA%\AIWorkAssistant + 旧目录迁移）
 │       ├── models.rs             # DTO（含 CheckinSummary.time 字段）
 │       ├── store/                # SQLite 存储层（v3.4.5 起全量承载 data 目录状态，替代 JSON 文件读写）
@@ -327,7 +330,15 @@ ai-work-assistant/
 
 语义化版本 `MAJOR.MINOR.PATCH`（如 3.1.0），按本次提交内容判断：
 
-> **升版时机（红线）**：**不要随意升版**——只有用户明确说「升级版本」时才升版并走全流程：**调整版本（set-version + CHANGELOG）→ 编译（tauri build 产出 setup / msi / portable 三件套）→ 提交 → 推送 → 打 tag 并推送 → 发布 GitHub Release（上传三资产）**。日常提交 / bug 修复一律不动版本号；下表的升位判断标准仅在用户主动发版时用于确定升哪一位。
+> **升版时机（红线）**：**不要随意升版**——只有用户明确说「升级版本」时才升版并走全流程：**调整版本（set-version + CHANGELOG）→ 编译（双平台：Windows 机 `npm run tauri build` 产出 setup/msi/portable 三件套，mac 机或 CI `npm run tauri build -- --bundles dmg` 产出 dmg）→ `node scripts/rename_release.mjs`（双平台产物统一进 release/，latest.json 收录四资产；按执行平台判定完备性）→ 提交 → 推送 → 打 tag 并推送 → 发布 GitHub Release（上传四资产：setup.exe / msi / dmg / latest.json）**。日常提交 / bug 修复一律不动版本号；下表的升位判断标准仅在用户主动发版时用于确定升哪一位。
+
+> **macOS 构建与分发（F-75）**：`tauri.conf.json` 为公共配置，Windows 配置在 `tauri.windows.conf.json`、macOS 在 `tauri.macos.conf.json`（Tauri v2 按目标平台深度合并）。mac 产物为 `dmg` + `app`（aarch64），ad-hoc 签名（`signingIdentity: "-"`，暂不申请 Developer ID）。**Gatekeeper 首装放行引导（Release 正文模板固定附加）**：
+>
+> > macOS 因应用未经公证会提示「无法验证开发者」，两种放行方式任选：
+> > ① 在「应用程序」文件夹中**右键点击**「AI Work 助手」→「打开」→ 再点「打开」（此后不再提示）；
+> > ② 或在「终端」执行：`xattr -d com.apple.quarantine "/Applications/AI Work 助手.app"`
+>
+> 应用内同款引导内置于 AboutDialog 的 mac 更新安装视图（update-installing 事件后渲染）。
 
 | 提交内容 | 升级位 | 示例 |
 |---|---|---|
@@ -374,7 +385,7 @@ ai-work-assistant/
 
 ## 14. 已知约束
 
-- 仅 Windows（代理证书安装 + MachineGuid 重置只在 Windows 验证）。
+- **平台支持（F-75）**：Windows 10/11（完整功能）+ macOS 12+（Apple Silicon / Intel，dmg 分发；功能域灰度放开中——schtasks 注册 / MachineGuid 重置 / UI 点击兜底为 Windows 专属，mac 由内置调度器 + 开机自启覆盖；平台差异实现收敛于 `platform/` 模块）。
 - **PowerShell 运行时依赖已移除**：切换/保存/备份/恢复/保活全链路由 `switcher` 模块进程内直调（仅 Windows，sysinfo 0.33 锁定版——0.38+ 需 rustc 1.88 超出项目 MSRV 1.85）。
 - `profiles_dir` 路径为 `data_dir.join("data").join("profiles")`，注意 `data/` 子目录。
 - LLM API 上游必须设置 `NO_PROXY=*` 避免系统代理循环。

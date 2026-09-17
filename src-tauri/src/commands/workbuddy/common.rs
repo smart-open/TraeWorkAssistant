@@ -3,9 +3,7 @@
 //! 函数逻辑零改动，仅将跨子模块引用项提升为 `pub(super)`。
 
 use sha2::{Digest, Sha256};
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
 use tauri::{AppHandle, State};
 
 use crate::fs_utils;
@@ -235,11 +233,18 @@ pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &
 }
 
 pub(super) fn is_running() -> bool {
-    let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq WorkBuddy.exe", "/NH"])
-        .creation_flags(0x08000000)
-        .output();
-    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains("WorkBuddy.exe"))
+    #[cfg(target_os = "macos")]
+    {
+        // F-75 审查修复 #6：mac 走 sysinfo 进程探测（与 commands::process 同源）
+        return !crate::commands::process::images_running(&["WorkBuddy.exe"]).is_empty();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let out = crate::platform::cmd::sys_command("tasklist")
+            .args(["/FI", "IMAGENAME eq WorkBuddy.exe", "/NH"])
+            .output();
+        matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains("WorkBuddy.exe"))
+    }
 }
 
 // 宽容字段提取统一走 fs_utils::dig（含 data/result/resp/response/info/auth/account

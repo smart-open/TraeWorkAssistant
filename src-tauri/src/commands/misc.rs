@@ -1,6 +1,4 @@
-use std::os::windows::process::CommandExt;
-use std::process::Command;
-
+use crate::platform::cmd::sys_command;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -626,6 +624,27 @@ pub(crate) fn validate_hhmm(time: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// F-75 M2-2.4：schtasks 注册面 mac 明示错误文案（命令级门控统一出口）。
+/// mac 定时主路径 = 内置调度器 tasks/scheduler.rs + 开机自启 + 静默签到（设计 §5.4.1，
+/// 功能零缺口），schtasks 6 任务名 + .cmd 启动器 + 2 个迁移函数整体 Windows 专属。
+#[cfg(not(windows))]
+const SCHTASKS_UNSUPPORTED_MSG: &str =
+    "系统级计划任务注册仅支持 Windows；macOS 请开启「开机自启 + 静默签到」，应用运行期间由内置调度器按时执行";
+
+/// 命令级 schtasks 门控：mac 恒 Err（明示文案），Windows 恒 Ok。
+/// 审查修复（P1）：替代 `#[cfg] { return ...; }` 直排模式——直排块在 mac 构建中
+/// 展开为无条件 return，其后命令体被编译器判定不可达 → unreachable_code 警告
+/// （零警告红线）。gate 形态下命令体在编译器视角仍可达（Result 非幂类型），
+/// 运行时 mac 恒早退，命令体零改动。
+#[cfg(not(windows))]
+pub(crate) fn schtasks_gate() -> Result<(), String> {
+    Err(SCHTASKS_UNSUPPORTED_MSG.to_string())
+}
+#[cfg(windows)]
+pub(crate) fn schtasks_gate() -> Result<(), String> {
+    Ok(())
+}
+
 pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     let mut full: Vec<String> = vec![
         "/c".to_string(),
@@ -638,9 +657,8 @@ pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), Stri
     for a in args {
         full.push((*a).to_string());
     }
-    let out = Command::new("cmd")
+    let out = sys_command("cmd")
         .args(&full)
-        .creation_flags(0x08000000)
         .output()
         .map_err(|e| format!("执行 schtasks 失败: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -723,6 +741,7 @@ fn register_daily_task(state: &AppState, time: &str) -> Result<(), String> {
 // 计划任务命令含 schtasks 子进程调用（可达数秒），标记 async 派发到线程池执行，避免阻塞 UI
 #[tauri::command(async)]
 pub fn task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    schtasks_gate()?;
     validate_hhmm(&time)?;
     register_daily_task(&state, &time)?;
     // 注册成功后清理旧版计划任务（品牌迁移），失败不影响本次注册
@@ -742,7 +761,7 @@ fn task_exists(name: &str) -> bool {
 /// 导出计划任务 XML 并解析每日触发时间（HH:MM）。
 /// schtasks /XML 输出为 UTF-16LE（带 BOM），需按 UTF-16 解码；解析失败返回 None。
 fn legacy_task_start_time(name: &str) -> Option<String> {
-    let out = Command::new("cmd")
+    let out = sys_command("cmd")
         .args([
             "/c",
             "chcp",
@@ -755,7 +774,6 @@ fn legacy_task_start_time(name: &str) -> Option<String> {
             name,
             "/XML",
         ])
-        .creation_flags(0x08000000)
         .output()
         .ok()?;
     if !out.status.success() {
@@ -820,6 +838,7 @@ pub fn try_migrate_legacy_task(state: &AppState) -> Option<String> {
 
 #[tauri::command(async)]
 pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, String> {
+    schtasks_gate()?;
     let (ok, stdout, stderr) = run_schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])?;
     if !ok {
         let detail = if !stderr.trim().is_empty() {
@@ -851,6 +870,7 @@ pub fn task_status(state: State<AppState>, _app: AppHandle) -> Result<String, St
 
 #[tauri::command(async)]
 pub fn task_unregister(_app: AppHandle, _state: State<AppState>) -> Result<(), String> {
+    schtasks_gate()?;
     // 只删除本应用的新任务名；旧任务 TraeWorkAssistant_DailyCheckin 属老应用，
     // 两版并存时不得越权删除（老应用的签到计划需继续工作）
     let mut last_detail = String::new();

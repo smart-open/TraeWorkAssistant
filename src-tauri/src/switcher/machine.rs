@@ -18,23 +18,34 @@ fn random_digits(n: usize) -> String {
 }
 
 /// 重置 6 层机器码中的 MachineGuid（需管理员）。非管理员时跳过并提示，不阻断切换。
+/// F-75 M1-1.3：mac 无系统级 MachineGuid 等价可写物（IOPlatformUUID 只读），
+/// mac 分支如实 Skip 并说明（不影响切换主流程）。
 pub fn reset_machine_id(sink: &dyn ProgressSink) -> Result<(), String> {
-    let new_guid = uuid::Uuid::new_v4().to_string();
-    match windows_registry::LOCAL_MACHINE
-        .open("SOFTWARE\\Microsoft\\Cryptography")
-        .and_then(|k| k.set_string("MachineGuid", &new_guid))
+    #[cfg(windows)]
     {
-        Ok(()) => sink.step(
-            "machine",
-            StepStatus::Ok,
-            &format!("机器码已重置为 {new_guid}"),
-        ),
-        Err(e) => sink.step(
-            "machine",
-            StepStatus::Skip,
-            &format!("重置机器码需要管理员权限，已跳过（不影响账号切换）: {e}"),
-        ),
+        let new_guid = uuid::Uuid::new_v4().to_string();
+        match windows_registry::LOCAL_MACHINE
+            .open("SOFTWARE\\Microsoft\\Cryptography")
+            .and_then(|k| k.set_string("MachineGuid", &new_guid))
+        {
+            Ok(()) => sink.step(
+                "machine",
+                StepStatus::Ok,
+                &format!("机器码已重置为 {new_guid}"),
+            ),
+            Err(e) => sink.step(
+                "machine",
+                StepStatus::Skip,
+                &format!("重置机器码需要管理员权限，已跳过（不影响账号切换）: {e}"),
+            ),
+        }
     }
+    #[cfg(target_os = "macos")]
+    sink.step(
+        "machine",
+        StepStatus::Skip,
+        "macOS 无系统级 MachineGuid 等价可写物（IOPlatformUUID 只读），已跳过（不影响账号切换）",
+    );
     Ok(())
 }
 
@@ -154,7 +165,10 @@ pub fn reset_device_ids_only(sess: &Session, sink: &dyn ProgressSink) -> Result<
         sink.step("device", StepStatus::Skip, "[4/6] aha/TinyStorage 目录不存在，跳过");
     }
 
-    // 5. 注册表 MachineGuid（需管理员；写 newSqmId GUID，PS 同款）
+    // 5. 注册表 MachineGuid（需管理员；写 newSqmId GUID，PS 同款）。
+    //    F-75 M1-1.3：mac 无可写系统级等价物（IOPlatformUUID 只读），降级为
+    //    应用层标识重置（1/2/3/4/6 层，纯文件层两平台共用）+ 如实说明
+    #[cfg(windows)]
     match windows_registry::LOCAL_MACHINE
         .open("SOFTWARE\\Microsoft\\Cryptography")
         .and_then(|k| k.set_string("MachineGuid", &new_sqm_id))
@@ -169,6 +183,13 @@ pub fn reset_device_ids_only(sess: &Session, sink: &dyn ProgressSink) -> Result<
             "[5/6] 注册表 MachineGuid 重置需要管理员权限，已跳过",
         ),
     }
+    #[cfg(target_os = "macos")]
+    sink.step(
+        "device",
+        StepStatus::Skip,
+        "[5/6] macOS 无系统级 MachineGuid 等价可写物（IOPlatformUUID 只读），已跳过；\
+         如目标应用风控仍关联硬件指纹，设备隔离覆盖面低于 Windows",
+    );
 
     // 6. trae-webview 追踪数据（Cookies/Local Storage/Session Storage）
     let webview_dir = dir.join("Partitions").join("trae-webview");

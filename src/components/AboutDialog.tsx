@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { Modal } from './ui';
 import { api } from '../lib/tauri';
+import { useAppStore } from '../store';
 import type { UpdateCheckResult, UpdateDownloadProgress, UpdateDownloaded } from '../types';
 import {
   APP_NAME,
@@ -47,6 +48,9 @@ function fmtSize(bytes: number): string {
 }
 
 export default function AboutDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  // F-75 M3-3.3：更新安装引导按平台分派（win NSIS 自动重启 / mac dmg 人工拖拽 + Gatekeeper 放行）
+  const platform = useAppStore((s) => s.platform);
+  const isMac = platform === 'macos';
   const [upd, setUpd] = useState<UpdateState>({ k: 'idle' });
   // 版本号运行时读取（Tauri getVersion() ← Cargo.toml 单一来源），不再前端硬编码
   const [appVersion, setAppVersion] = useState('');
@@ -108,11 +112,19 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
       .catch((e) => setUpd({ k: 'error', msg: String(e) }));
   };
 
-  // 第二步：启动安装器（确认二后触发；/P /UPDATE /R，安装完成后自动重启应用）
+  // 第二步：启动安装器（确认二后触发；win /P /UPDATE /R 自动重启 / mac open dmg 人工安装）
   const runInstaller = (file: UpdateDownloaded) => {
     setUpd({ k: 'installing' });
     void api.updater
       .runInstaller({ filePath: file.file_path, assetName: file.asset_name })
+      .catch((e) => setUpd({ k: 'error', msg: String(e) }));
+  };
+
+  // mac 专用：人工拖拽安装完成后一键重启（LaunchServices 拉起 /Applications 新版）
+  const restartAfterInstall = () => {
+    setUpd({ k: 'installing' });
+    void api.updater
+      .restartApp()
       .catch((e) => setUpd({ k: 'error', msg: String(e) }));
   };
 
@@ -236,7 +248,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
                   onClick={() => runInstaller(upd.file)}
                   className="rounded-md bg-sky-600 px-2 py-0.5 text-[11px] font-semibold text-white transition hover:bg-sky-700 dark:bg-sky-500 dark:hover:bg-sky-400"
                 >
-                  立即安装并重启
+                  {isMac ? '打开安装包' : '立即安装并重启'}
                 </button>
                 <button
                   onClick={() => setUpd({ k: 'idle' })}
@@ -246,11 +258,33 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
                 </button>
               </div>
             )}
-            {upd.k === 'installing' && (
+            {upd.k === 'installing' && (isMac ? (
+              // mac dmg 人工安装引导（F-75 M3-3.3/3.6）：拖拽安装 + Gatekeeper 放行 + 一键重启
+              <div className="mt-1.5 max-w-sm space-y-1.5 rounded-lg border border-sky-200 bg-sky-50 p-2.5 text-[11px] leading-relaxed text-slate-600 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-zinc-300">
+                <div className="font-semibold text-sky-600 dark:text-sky-400">安装包已打开，请完成以下步骤：</div>
+                <div>① 将窗口中的「{APP_NAME}」拖入右侧的 Applications 文件夹，选择「替换」完成覆盖安装</div>
+                <div>
+                  ② 若 macOS 提示「无法验证开发者」：在「应用程序」文件夹中<b>右键点击</b>应用 → 「打开」→
+                  再点「打开」（首次一次即可）；或在终端执行
+                  <code className="mx-1 rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-zinc-800">
+                    xattr -d com.apple.quarantine "/Applications/{APP_NAME}.app"
+                  </code>
+                </div>
+                <div className="flex items-center gap-1.5 pt-0.5">
+                  <button
+                    onClick={restartAfterInstall}
+                    className="rounded-md bg-sky-600 px-2 py-0.5 text-[11px] font-semibold text-white transition hover:bg-sky-700 dark:bg-sky-500 dark:hover:bg-sky-400"
+                  >
+                    安装完成，重启应用
+                  </button>
+                  <span className="text-slate-400 dark:text-zinc-500">拖拽完成后点击</span>
+                </div>
+              </div>
+            ) : (
               <div className="mt-1.5 flex items-center gap-1 text-xs font-medium text-sky-600 dark:text-sky-400">
                 <Loader2 size={13} className="animate-spin" /> 正在安装更新（进度条安装中），完成后应用将自动重启…
               </div>
-            )}
+            ))}
             {upd.k === 'error' && (
               <div className="mt-1.5 flex max-w-sm items-start gap-1 text-xs text-rose-600 dark:text-rose-400">
                 <AlertCircle size={13} className="mt-0.5 shrink-0" />

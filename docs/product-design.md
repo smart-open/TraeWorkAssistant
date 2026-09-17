@@ -6,6 +6,7 @@
 > 范围声明：v1.0 聚焦桌面端管理工具；v2.0 已实现本地 API 网关（OpenAI 兼容协议）、账号池智能调度、SSE 协议转换，全部为本项目自主设计与实现。
 > 文档定位：本文是**需求产品设计**主文档（v1.0/v2.0 设计基线）；3.x 增量功能见 `CHANGELOG.md` 与根目录 `AGENT.md`，未排期优化项见 [backlog.md](backlog.md)（WorkBuddy 接入蓝本的协议事实已归并至 [tech-framework.md](tech-framework.md) 附录 B）。
 > **架构演进说明（2026-09-15）**：文中 §1.2/§1.3/§九等处的 Python/PowerShell 表述为**设计当时的历史现状**——现核心逻辑已全量 Rust 化（`src-tauri/src/tasks/`、`switcher/`、`device_proxy/`），Python/PS 运行时与脚本均已移除；状态数据已由 JSON 文件迁入 SQLite（`data/aiwork.sqlite`）。历史表述保留以存档设计决策脉络。
+> **平台与应用域演进说明（2026-09-17，F-75）**：产品已从「Windows 桌面端 + Trae Work 单应用」演进为 **Windows / macOS 双平台**（macOS 12+，Apple Silicon / Intel dmg 双架构分发）× **五应用域**（Trae Work / Trae / WorkBuddy / CodeBuddy / 豆包）+ **本地 API 网关**（OpenAI / Anthropic / Codex 三协议）。本文「Windows 桌面端」「TW 单应用」等 v1.0/v2.0 表述均为设计基线史存；现状以 `AGENT.md` / `README.md` 为准，macOS 平台设计详见 `docs/tmp/f75-macos-support-design.md`。
 
 ---
 
@@ -930,7 +931,7 @@ Anthropic Request─┘                    └─→ Anthropic SSE
 | 响应性 | 任何按钮点击 100ms 内有视觉反馈；耗时操作显示进度 |
 | 稳定性 | 子进程崩溃自动检测并提示；单账号失败不影响批量任务其余账号 |
 | 数据安全 | 所有 JSON 写入采用 tmp + rename 原子替换，防止断电损坏 |
-| 兼容性 | Windows 10 1809+ / Windows 11；支持 100%~200% DPI 缩放 |
+| 兼容性 | Windows 10 1809+ / Windows 11；macOS 12+（Apple Silicon / Intel，F-75）；支持 100%~200% DPI 缩放 |
 | 可访问性 | 全键盘可操作；焦点可见；对比度符合 WCAG AA |
 
 ---

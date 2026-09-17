@@ -174,6 +174,8 @@ function CheckinConfigCard({
   patch: (p: Partial<WorkBuddySettings>) => void;
 }) {
   const pushToast = useAppStore((s) => s.pushToast);
+  // F-75 M2-2.4：schtasks 注册与 UI 点击兜底入口按平台标志隐藏
+  const platform = useAppStore((s) => s.platform);
   const [tasks, setTasks] = useState<string[]>([]);
   const [renewOn, setRenewOn] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
@@ -183,9 +185,12 @@ function CheckinConfigCard({
   const [uiClickBusy, setUiClickBusy] = useState<'capture' | 'run' | null>(null);
 
   const refreshTasks = useCallback(() => {
+    // 审查修复（P2）：schtasks 状态查询仅 Windows 发起——mac 上后端恒 Err，
+    // catch 静默吞掉徒增无谓 IPC；注册卡片本就按平台隐藏
+    if (platform !== 'windows') return;
     api.workbuddy.checkinTaskStatus().then(setTasks).catch(() => setTasks([]));
     api.workbuddy.renewTaskStatus().then(setRenewOn).catch(() => setRenewOn(false));
-  }, []);
+  }, [platform]);
 
   useEffect(() => {
     refreshTasks();
@@ -298,8 +303,8 @@ function CheckinConfigCard({
           </label>
         </div>
 
-        {/* 定时任务（F-16） */}
-        <div className="grid gap-3 lg:grid-cols-2">
+        {/* 定时任务（F-16；schtasks 仅 Windows，mac 隐藏——自动签到 + 启动补签已覆盖） */}
+        <div className={`grid gap-3 lg:grid-cols-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
           <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
             <div className="flex items-center justify-between">
               <div>
@@ -334,8 +339,8 @@ function CheckinConfigCard({
           </div>
         </div>
 
-        {/* UI 坐标点击签到兜底（F-18）：仅手动触发、默认关闭 */}
-        <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+        {/* UI 坐标点击签到兜底（F-18）：仅手动触发、默认关闭（user32 仅 Windows，mac 隐藏） */}
+        <div className={`rounded-lg border border-slate-100 p-3 dark:border-zinc-800 ${platform !== 'windows' ? 'hidden' : ''}`}>
           <div className="mb-2 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <MousePointerClick size={15} className="text-amber-500" />
@@ -407,6 +412,8 @@ function CheckinConfigCard({
 
 export default function BuddySettings() {
   const pushToast = useAppStore((s) => s.pushToast);
+  // F-75 M2-2.4：schtasks 注册与 UI 点击兜底入口按平台标志隐藏
+  const platform = useAppStore((s) => s.platform);
   const saveSettings = useAppStore((s) => s.saveSettings);
   const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
   const [settings, setSettings] = useState<WorkBuddySettings | null>(null);

@@ -76,6 +76,10 @@ import type {
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
 export const api = {
+  /** F-75 M0-0.5：平台标志（os/arch），init 时拉取一次存 store.platform */
+  platform: {
+    info: () => invoke<{ os: 'windows' | 'macos'; arch: string }>('platform_info'),
+  },
   env: {
     check: () => invoke<EnvStatus>('env_check'),
     checkCn: () => invoke<EnvStatus>('env_check_trae_cn'),
@@ -533,9 +537,11 @@ export const api = {
       expectedVersion: string;
       expectedSha256?: string | null;
     }) => invoke<UpdateDownloaded>('update_download', p),
-    // 第二步：启动安装器（/P /UPDATE /R，完成后自动重启应用）
+    // 第二步：启动安装器（win：/P /UPDATE /R 自动重启；mac：open dmg 人工拖拽安装）
     runInstaller: (p: { filePath: string; assetName: string }) =>
       invoke<void>('update_run_installer', p),
+    // mac 更新专用：人工拖拽完成后一键重启（LaunchServices 拉起新版后旧进程退出）
+    restartApp: () => invoke<void>('update_restart_app'),
     onDownloadProgress: async (
       cb: (e: UpdateDownloadProgress) => void,
     ): Promise<UnlistenFn> =>

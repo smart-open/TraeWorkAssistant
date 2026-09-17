@@ -10,8 +10,6 @@
 //!   ④ GET /v2/plugin/login/account?state= 带 Bearer 取 uid/nickname → 自动入池 + 凭证回写 token store
 //! 每流程独立 cookie jar（手工捕获 Set-Cookie 回传，不引新依赖）；凭证零明文输出（不进日志/事件/UI）。
 
-use std::os::windows::process::CommandExt;
-use std::process::Command;
 use tauri::{AppHandle, Emitter};
 
 use crate::fs_utils;
@@ -52,19 +50,32 @@ pub(super) fn jwt_claims(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// 系统浏览器打开 URL（Windows：cmd /c start，隐藏控制台；仅放行 http/https 且无引号空格）。
+/// 系统浏览器打开 URL（仅放行 http/https 且无引号空格）。
 /// URL 必须包一层引号再交给 cmd：裸 URL 里的 `&` 会被 cmd 解析成命令分隔符把链接截断
 /// （实测 `.../login?platform=CLI&state=xxx` 打开后浏览器停在裸登录页，state 丢失）。
 /// 注意必须用 raw_arg 直拼命令行：普通 .arg() 会把参数内嵌引号按 MSVC 规则转义成 `\"`，
 /// cmd 不识别 `\"`，整串会被 start 当成带反斜杠的文件路径（实测报「Windows 找不到文件」）。
+#[cfg(windows)]
 pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
     }
-    Command::new("cmd")
-        .arg("/c")
-        .raw_arg(format!("start \"\" \"{url}\""))
-        .creation_flags(0x08000000)
+    // 审查修复（P0）：重构时丢失了 `/c`——`cmd start "" "<url>"` 无 /c 时 cmd 不执行
+    // start 而是进交互态立即退出，浏览器打不开（Windows OAuth 链路回归）
+    crate::platform::cmd::sys_command_raw("cmd", &["/c"], &format!("start \"\" \"{url}\""))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开浏览器失败: {e}"))
+}
+
+/// macOS：`open <url>` 走 LaunchServices，无引号转义问题（URL 校验同 Windows 分支）。
+#[cfg(target_os = "macos")]
+pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
+        return Err(format!("拒绝打开非法 URL：{url}"));
+    }
+    crate::platform::cmd::sys_command("open")
+        .arg(url)
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("打开浏览器失败: {e}"))

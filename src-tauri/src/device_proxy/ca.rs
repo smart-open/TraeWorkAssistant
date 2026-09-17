@@ -108,11 +108,9 @@ impl CaAuthority {
 /// 查询失败一律视为未安装。供代理启动日志输出真实安装状态（此前为无条件提示，误导）。
 #[cfg(target_os = "windows")]
 pub fn installed_in_windows_root() -> bool {
-    use std::os::windows::process::CommandExt;
     let run = |args: &[&str]| -> bool {
-        std::process::Command::new("certutil")
+        crate::platform::cmd::sys_command("certutil")
             .args(args)
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("TraeDeviceProxyCA"))
             .unwrap_or(false)
@@ -253,19 +251,19 @@ fn sweep_legacy_leaf_files(certs_dir: &std::path::Path) {
 /// 收紧 CA 目录 ACL（仅 Windows，尽力而为）：移除继承、仅当前用户完全控制，
 /// 防止同机低权限账户读取 CA 私钥。自验证失败自动 /reset 回滚（fail-open：
 /// ACL 仅纵深防御，绝不能因此破坏代理自身的 CA 读写）。
+/// F-75：Windows 专属（icacls ACL 模型）；mac Keychain 自管理不适用，空实现。
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
 fn harden_ca_dir(certs_dir: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         let user = std::env::var("USERNAME").unwrap_or_default();
         if user.is_empty() {
             return;
         }
         let run = |args: &[&str]| {
-            std::process::Command::new("icacls")
+            crate::platform::cmd::sys_command("icacls")
                 .arg(certs_dir)
                 .args(args)
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW
                 .output()
         };
         // 记录收紧前已有文件：NTFS 动态继承下 /inheritance:r 移除目录可继承 ACE

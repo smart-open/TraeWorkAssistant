@@ -106,18 +106,8 @@ pub(crate) mod dpapi {
     }
 }
 
-#[cfg(not(windows))]
-mod dpapi {
-    pub fn protect(_plain: &[u8]) -> Result<Vec<u8>, String> {
-        Err("vault 仅支持 Windows".into())
-    }
-    pub fn unprotect(_blob: &[u8]) -> Result<Vec<u8>, String> {
-        Err("vault 仅支持 Windows".into())
-    }
-}
-
 /// 生成 32 字节随机主密码：
-/// 熵源 = OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG）。
+/// 熵源 = OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG；macOS uuid v4 → getrandom）。
 /// 旧实现（多轮 RandomState + 高精度时间 + 进程 ID 经 SHA-256 压缩）熵不足且部分可预测，
 /// 审查 P1 要求改用 OS CSPRNG；BCrypt 调用失败时保留旧实现兜底（主密码生成不允许 panic）。
 fn generate_password() -> Vec<u8> {
@@ -139,37 +129,49 @@ fn generate_password() -> Vec<u8> {
         }
         // BCrypt 失败 → 落到下方旧实现兜底
     }
-    use sha2::{Digest, Sha256};
-    use std::hash::{BuildHasher, Hasher};
-    let mut entropy: Vec<u8> = Vec::new();
-    for _ in 0..8 {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u128(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        );
-        entropy.extend(h.finish().to_le_bytes());
+    #[cfg(not(windows))]
+    {
+        // F-75 M0-0.4：macOS 走 uuid v4（getrandom 熵源）两条拼接 = 32 字节 CSPRNG，
+        // 消除弱随机兜底在该平台成为主路径的问题（兜底段仅 Windows 编译——
+        // 审查修复：否则 mac 构建在 return 后触发 unreachable_code 警告）
+        let mut buf = [0u8; 32];
+        buf[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        buf[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        return buf.to_vec();
     }
-    entropy.extend(std::process::id().to_le_bytes());
-    let mut hasher = Sha256::new();
-    hasher.update(&entropy);
-    hasher.finalize().to_vec()
+    #[cfg(windows)]
+    {
+        use sha2::{Digest, Sha256};
+        use std::hash::{BuildHasher, Hasher};
+        let mut entropy: Vec<u8> = Vec::new();
+        for _ in 0..8 {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u128(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            );
+            entropy.extend(h.finish().to_le_bytes());
+        }
+        entropy.extend(std::process::id().to_le_bytes());
+        let mut hasher = Sha256::new();
+        hasher.update(&entropy);
+        hasher.finalize().to_vec()
+    }
 }
 
-/// 读取（或首次生成）DPAPI 保护的主密码
+/// 读取（或首次生成）受保护的主密码。
+/// F-75 M0-0.4：DPAPI/Keychain 读写收口至 `platform::secret`——
+/// Windows 走 DPAPI + `conf/vault_key.bin`（行为零变化，错误文案逐字保留）；
+/// macOS 走 Keychain（首启无条目 → 生成随机主密码写入，用户无感）。
 fn vault_password(state: &AppState) -> Result<Vec<u8>, String> {
-    let key_path = state.conf_path("vault_key.bin");
-    if key_path.exists() {
-        let blob = std::fs::read(&key_path).map_err(|e| format!("读取 vault 密钥失败: {e}"))?;
-        dpapi::unprotect(&blob)
-    } else {
-        let pwd = generate_password();
-        let blob = dpapi::protect(&pwd)?;
-        std::fs::write(&key_path, &blob).map_err(|e| format!("写入 vault 密钥失败: {e}"))?;
-        Ok(pwd)
+    if let Some(pwd) = crate::platform::secret::load_vault_password(state)? {
+        return Ok(pwd);
     }
+    let pwd = generate_password();
+    crate::platform::secret::store_vault_password(state, &pwd)?;
+    Ok(pwd)
 }
 
 /// 打开（并缓存）vault：首次调用时加载快照或创建新 client

@@ -218,24 +218,48 @@ pub(crate) fn random_hex(len: usize) -> String {
             return out;
         }
     }
-    // 兜底：旧 LCG（仅非 Windows 或 BCrypt 调用失败时）
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(42);
-    let mut out = String::with_capacity(len);
-    for _ in 0..len {
-        // 简单 LCG
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let nibble = ((seed >> 32) & 0xF) as u8;
-        out.push(if nibble < 10 {
-            (b'0' + nibble) as char
-        } else {
-            (b'a' + nibble - 10) as char
-        });
+    #[cfg(not(windows))]
+    {
+        // F-75 M2-2.5：mac/其他平台走 uuid v4（getrandom CSPRNG）——
+        // 消除弱随机 LCG 在非 Windows 成为主路径的问题
+        let mut bytes = Vec::with_capacity(len.div_ceil(2) + 16);
+        while bytes.len() < len.div_ceil(2) {
+            bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        }
+        let mut out = String::with_capacity(len);
+        for b in bytes {
+            if out.len() >= len {
+                break;
+            }
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+            if out.len() < len {
+                out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
+            }
+        }
+        return out;
     }
-    out
+    // 兜底：旧 LCG（仅 Windows BCrypt 调用失败时；cfg(windows) 门控——
+    // 审查修复：否则 mac 构建在上方 return 后触发 unreachable_code 警告）
+    #[cfg(windows)]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let mut seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(42);
+        let mut out = String::with_capacity(len);
+        for _ in 0..len {
+            // 简单 LCG
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let nibble = ((seed >> 32) & 0xF) as u8;
+            out.push(if nibble < 10 {
+                (b'0' + nibble) as char
+            } else {
+                (b'a' + nibble - 10) as char
+            });
+        }
+        out
+    }
 }
 
 /// OAuth 登录设备标识（F-78 批次 3）：持久化于 data/oauth_device.json。
@@ -317,7 +341,31 @@ pub fn oauth_get_login_url(state: State<AppState>) -> OAuthLoginUrl {
     let trace_id = random_hex(32);
     let (pkce_verifier, code_challenge) = pkce_pair();
 
-    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into());
+    // 主机名兜底（F-75 M2-2.5）：Windows 读 COMPUTERNAME；mac 无此环境变量，
+    // 恒落 "Windows-PC"——改 scutil --get ComputerName 取值（失败回落 macOS-Device）
+    let hostname = host_fallback();
+    fn host_fallback() -> String {
+        #[cfg(windows)]
+        {
+            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::cmd::sys_command("scutil")
+                .arg("--get")
+                .arg("ComputerName")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "macOS-Device".into())
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            "Unknown-Device".into()
+        }
+    }
     let url = format!(
         "https://www.trae.cn/authorization?\
         login_version=1\

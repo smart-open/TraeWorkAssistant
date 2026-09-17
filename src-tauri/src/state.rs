@@ -7,7 +7,8 @@ use crate::models::Settings;
 pub const DATA_DIR_NAME: &str = "AIWorkAssistant";
 /// 旧版数据目录名（品牌迁移前为 Trae Work Assistant），启动时自动迁移到新版目录
 pub const LEGACY_DATA_DIR_NAME: &str = "TraeWorkAssistant";
-/// 旧版 bundle identifier（品牌迁移前），其 WebView2 数据目录同样需要迁移
+/// 旧版 bundle identifier（品牌迁移前），其 WebView2 数据目录同样需要迁移（仅 Windows）
+#[cfg(windows)]
 pub const LEGACY_IDENTIFIER: &str = "com.traework.assistant";
 /// 新版 bundle identifier
 pub const IDENTIFIER: &str = "com.aiwork.assistant";
@@ -26,10 +27,10 @@ pub const IDENTIFIER: &str = "com.aiwork.assistant";
 pub fn migrate_legacy_dirs() -> Option<String> {
     let mut notes: Vec<String> = Vec::new();
 
-    // 1) 数据目录迁移（复制语义）
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let legacy = PathBuf::from(&appdata).join(LEGACY_DATA_DIR_NAME);
-        let new_dir = PathBuf::from(&appdata).join(DATA_DIR_NAME);
+    // 1) 数据目录迁移（复制语义；mac 无旧版数据，legacy.is_dir() 恒 false 天然跳过）
+    if let Ok(appdata) = crate::platform::app_support_root() {
+        let legacy = appdata.join(LEGACY_DATA_DIR_NAME);
+        let new_dir = appdata.join(DATA_DIR_NAME);
         if legacy.is_dir() {
             if new_dir.is_dir() && dir_is_empty(&new_dir) == Some(false) {
                 // 已迁移过：跳过（老应用数据原地保留，两版并存）
@@ -57,6 +58,9 @@ pub fn migrate_legacy_dirs() -> Option<String> {
     // 2) WebView2 用户数据目录迁移（identifier 变更所致；复制语义，失败不影响启动）
     //    排除缓存类子目录（Cache/GPUCache 等）：体积可达 GB 级且常被运行中的老应用锁定，
     //    跳过后由新版本首次运行时自动重建，界面偏好等关键文件仍完整迁移
+    //    F-75 M0-0.3：mac 无 WebView2 用户数据目录概念（WKWebView 数据由系统按
+    //    bundle identifier 管理随 app 删除清除），整段 cfg(windows) 门控
+    #[cfg(windows)]
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         let legacy = PathBuf::from(&local).join(LEGACY_IDENTIFIER);
         let new_dir = PathBuf::from(&local).join(IDENTIFIER);
@@ -108,6 +112,7 @@ pub(crate) fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf, exclude_dirs: &[&
 }
 
 /// WebView2 用户数据目录中可跳过的缓存类子目录（迁移时排除，运行时自动重建）
+#[cfg(windows)]
 const WEBVIEW_CACHE_DIRS: [&str; 8] = [
     "Cache",
     "Code Cache",
@@ -141,11 +146,9 @@ const CONF_FILES: &[&str] = &["app_settings.json"];
 
 impl AppState {
     pub fn new() -> Result<Self, String> {
-        // 数据目录：%APPDATA%\AIWorkAssistant，不存在则创建
-        let appdata = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .map_err(|_| "无法读取 APPDATA 环境变量".to_string())?;
-        let data_dir = appdata.join(DATA_DIR_NAME);
+        // 数据目录：%APPDATA%\AIWorkAssistant（macOS: ~/Library/Application Support/AIWorkAssistant，
+        // F-75 M0-0.3），不存在则创建
+        let data_dir = crate::platform::app_support_root()?.join(DATA_DIR_NAME);
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
 
@@ -235,3 +238,22 @@ impl AppState {
 
 // （PS 桥 Rust 化后 resolve_ps_dir 与 tauri.conf.json resources 的 ps/ 资源一并移除——
 // 切换/保存/备份/恢复/保活全链路由 switcher 模块进程内直调，无外部运行时依赖）
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 数据目录落app_support_root() {
+        // F-75 M0-0.3：数据根目录不再直读 APPDATA 环境变量，锁定与 platform 基根一致
+        let s = AppState::new().expect("AppState::new");
+        let expected = crate::platform::app_support_root()
+            .expect("app_support_root")
+            .join(DATA_DIR_NAME);
+        assert_eq!(s.data_dir, expected);
+        // 子目录结构（conf/data/logs）在 new() 内已创建
+        assert!(s.data_dir.join("conf").is_dir());
+        assert!(s.data_dir.join("data").is_dir());
+        assert!(s.data_dir.join("logs").is_dir());
+    }
+}

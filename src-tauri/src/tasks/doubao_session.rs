@@ -41,7 +41,7 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
 }
 #[cfg(not(windows))]
 fn dpapi_unprotect(_data: &[u8]) -> Result<Vec<u8>, String> {
-    Err("仅支持 Windows".into())
+    Err("macOS 暂不支持 cookie 直读（客户端走 Keychain Safe Storage，属重写范畴）；请使用 MITM 捕获".into())
 }
 
 /// Local State → os_crypt.encrypted_key（base64，DPAPI 包裹）→ AES-256 密钥
@@ -423,7 +423,7 @@ fn sync_cookie_state(state: &AppState, logs: &mut Vec<String>) -> Value {
         });
         #[cfg(not(windows))]
         let res: Result<(usize, Option<usize>, Vec<String>), String> =
-            Err("仅支持 Windows".into());
+            Err("macOS 暂不支持 cookie 直读，请使用 MITM 捕获".into());
         match res {
             Err(e) => {
                 logs.push(format!("{label} 解密失败：{e}"));

@@ -1,0 +1,64 @@
+# F-75 M3-3.4：macOS DMG 构建流水线（双架构矩阵：Apple Silicon + Intel）。
+# M3 阶段启用（feature/macos 分支触发）；合入主干后按需对齐 build-windows 触发策略。
+# 无 Developer ID：Tauri 未配置 signingIdentity 时默认 ad-hoc（tauri.macos.conf.json 显式 "-"），
+# 产物带 quarantine 属性，Gatekeeper 拦截的放行引导见 README / AboutDialog / Release 正文模板。
+#
+# 双架构策略（审查后裁定）：矩阵分别产出 aarch64 / x64 原生 dmg；
+# updater 按运行时 ARCH 精确匹配资产（_aarch64.dmg / _x64.dmg，_universal.dmg 兜底）。
+# 如需单产物覆盖双架构，可改用 universal 构建：
+#   rustup target add aarch64-apple-darwin x86_64-apple-darwin
+#   npm run tauri build -- --target universal-apple-darwin --bundles dmg
+# （体积约翻倍；rename_release.mjs 已收录 _universal.dmg 命名，updater 侧兼容）
+
+name: Build macOS DMG
+
+on:
+  push:
+    branches:
+      - feature/macos
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, target: aarch64-apple-darwin, arch: aarch64 } # Apple Silicon
+          - { runner: macos-13, target: x86_64-apple-darwin, arch: x64 } # Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: ${{ matrix.target }} }
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - run: npm ci
+
+      - name: Run Rust tests（零警告红线 + 全量测试）
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Tauri app (dmg only)
+        run: npm run tauri build -- --bundles dmg
+
+      - name: Rename & manifest（本机架构 dmg 缺失即失败，其余产物仅 WARN）
+        run: node scripts/rename_release.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-work-assistant-macos-${{ matrix.arch }}
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            release/latest.json
+          if-no-files-found: error

@@ -1,8 +1,8 @@
 use serde::Serialize;
-use std::os::windows::process::CommandExt;
 use std::process::Command;
 use tauri::{AppHandle, State};
 
+use crate::platform::cmd::sys_command;
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -28,13 +28,33 @@ pub fn env_check(_app: AppHandle, state: State<AppState>) -> EnvStatus {
     }
 }
 
+/// F-75 M0-0.5：平台标志下发（os + arch），前端存 store.platform 控制入口显隐与文案。
+/// 零参数零副作用，启动时调用一次。
+#[tauri::command]
+pub fn platform_info() -> serde_json::Value {
+    serde_json::json!({
+        "os": crate::platform::OS,           // "windows" | "macos"
+        "arch": std::env::consts::ARCH,      // "x86_64" | "aarch64"
+    })
+}
+
 #[tauri::command]
 pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
-    Command::new("cmd")
-        .args(["/c", "start", "https://www.trae.cn"])
-        .creation_flags(0x08000000)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    // F-75 M2-2.5：打开网站按平台分派（Windows cmd /c start / macOS open）
+    #[cfg(windows)]
+    {
+        sys_command("cmd")
+            .args(["/c", "start", "https://www.trae.cn"])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        sys_command("open")
+            .arg("https://www.trae.cn")
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -196,9 +216,8 @@ fn version_of(path: &str) -> Option<String> {
         "$v=(Get-Item '{}').VersionInfo; if ($v.ProductVersion) {{ $v.ProductVersion }} else {{ $v.FileVersion }}",
         path.replace('\'', "''")
     );
-    let out = Command::new("powershell")
+    let out = sys_command("powershell")
         .args(["-NoProfile", "-Command", &ps])
-        .creation_flags(0x08000000)
         .output()
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -217,7 +236,7 @@ fn version_of(path: &str) -> Option<String> {
 
 fn registry_trae_path() -> Option<String> {
     for root in ["HKCU", "HKLM"] {
-        let out = match Command::new("reg")
+        let out = match sys_command("reg")
             .args([
                 "query",
                 &format!("{root}\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
@@ -225,7 +244,6 @@ fn registry_trae_path() -> Option<String> {
                 "/f",
                 "TRAE",
             ])
-            .creation_flags(0x08000000)
             .output()
         {
             Ok(o) => o,
@@ -298,30 +316,51 @@ fn resolve_reg_candidate(icon: &Option<String>, loc: &Option<String>) -> Option<
 }
 
 fn is_running_cn() -> bool {
-    let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq Trae CN.exe", "/NH"])
-        .creation_flags(0x08000000)
-        .output();
-    match out {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.contains("Trae CN.exe")
+    #[cfg(windows)]
+    {
+        let out = sys_command("tasklist")
+            .args(["/FI", "IMAGENAME eq Trae CN.exe", "/NH"])
+            .output();
+        match out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.contains("Trae CN.exe")
+            }
+            Err(_) => false,
         }
-        Err(_) => false,
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // F-75 审查修复 #6：mac 走 sysinfo 进程探测（设计 §5.5；主进程名待 M-1 侦察 6 核对）
+        !crate::commands::process::images_running(&["Trae CN.exe"]).is_empty()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        false
     }
 }
 
 fn is_running() -> bool {
-    let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq TRAE SOLO CN.exe", "/NH"])
-        .creation_flags(0x08000000)
-        .output();
-    match out {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.contains("TRAE SOLO CN.exe")
+    #[cfg(windows)]
+    {
+        let out = sys_command("tasklist")
+            .args(["/FI", "IMAGENAME eq TRAE SOLO CN.exe", "/NH"])
+            .output();
+        match out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.contains("TRAE SOLO CN.exe")
+            }
+            Err(_) => false,
         }
-        Err(_) => false,
+    }
+    #[cfg(target_os = "macos")]
+    {
+        !crate::commands::process::images_running(&["TRAE SOLO CN.exe"]).is_empty()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        false
     }
 }
 
@@ -520,16 +559,24 @@ pub fn codebuddy_env_check(state: State<AppState>) -> CodeBuddyEnvCheck {
 
 /// CodeBuddy 进程检测：同时覆盖通用形态 CodeBuddy.exe 与本机实测的 "CodeBuddy CN.exe"
 fn is_running_codebuddy() -> bool {
-    for exe in ["CodeBuddy CN.exe", "CodeBuddy.exe"] {
-        let out = Command::new("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {exe}"), "/NH"])
-            .creation_flags(0x08000000)
-            .output();
-        if matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains(exe)) {
-            return true;
-        }
+    #[cfg(target_os = "macos")]
+    {
+        // F-75 审查修复 #6：mac 走 sysinfo 进程探测
+        return !crate::commands::process::images_running(&["CodeBuddy CN.exe", "CodeBuddy.exe"])
+            .is_empty();
     }
-    false
+    #[cfg(not(target_os = "macos"))]
+    {
+        for exe in ["CodeBuddy CN.exe", "CodeBuddy.exe"] {
+            let out = sys_command("tasklist")
+                .args(["/FI", &format!("IMAGENAME eq {exe}"), "/NH"])
+                .output();
+            if matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains(exe)) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// app_locate 的内部版本（供 open_* 命令与 workbuddy 模块复用；无需 Option 包装）
@@ -607,7 +654,7 @@ fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Optio
 fn registry_app_path(profile: &AppProfile) -> Option<String> {
     for pattern in profile.reg_patterns {
         for root in ["HKCU", "HKLM"] {
-            let out = match Command::new("reg")
+            let out = match sys_command("reg")
                 .args([
                     "query",
                     &format!("{root}\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
@@ -615,7 +662,6 @@ fn registry_app_path(profile: &AppProfile) -> Option<String> {
                     "/f",
                     pattern,
                 ])
-                .creation_flags(0x08000000)
                 .output()
             {
                 Ok(o) => o,
@@ -699,9 +745,8 @@ fn process_exe_path(proc_names: &[&str]) -> Option<String> {
     let ps = format!(
         "(Get-Process -Name @({names}) -ErrorAction SilentlyContinue | Where-Object {{ $_.Path }} | Select-Object -First 1).Path"
     );
-    let out = Command::new("powershell")
+    let out = sys_command("powershell")
         .args(["-NoProfile", "-Command", &ps])
-        .creation_flags(0x08000000)
         .output()
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();

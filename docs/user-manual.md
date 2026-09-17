@@ -1,6 +1,6 @@
 # AI Work 助手 用户手册
 
-> **版本**: v3.4.5 | **平台**: Windows 10 / 11 | **更新日期**: 2026-09-15
+> **版本**: v3.4.5 | **平台**: Windows 10 / 11 · macOS 12+（Apple Silicon / Intel）| **更新日期**: 2026-09-17
 
 ## 目录
 
@@ -20,7 +20,7 @@
 
 ## 1. 软件简介
 
-AI Work 助手 是一款 Windows 桌面端多账号管理一站式工作台，**深度支持 Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包 五应用**：账号管理、自动签到、登录态按应用独立切换、积分看板、本地 API 网关等功能。所有数据存储在本地（v3.4.5 起状态数据统一存于单个 SQLite 数据库），不上传任何服务器。
+AI Work 助手 是一款桌面端（Windows / macOS）多账号管理一站式工作台，**深度支持 Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包 五应用**：账号管理、自动签到、登录态按应用独立切换、积分看板、本地 API 网关等功能。所有数据存储在本地（v3.4.5 起状态数据统一存于单个 SQLite 数据库），不上传任何服务器。
 
 **核心功能**：
 
@@ -38,13 +38,15 @@ AI Work 助手 是一款 Windows 桌面端多账号管理一站式工作台，**
 
 ### 系统要求
 
-- Windows 10 / 11（64 位）
-- WebView2 Runtime（Windows 11 已内置）
-- 管理员权限（仅安装 CA 证书时需要）
+- Windows 10 / 11（64 位），或 macOS 12+（Apple Silicon / Intel）
+- Windows 需 WebView2 Runtime（Windows 11 已内置）
+- 管理员 / 授权权限（仅安装 CA 证书时需要：Windows UAC / macOS 钥匙串授权弹窗）
 
 ### 安装
 
-下载最新版本的 MSI 或 NSIS 安装包，双击运行即可完成安装。
+- **Windows**：下载 MSI 或 NSIS 安装包（`AI Work 助手_<版本>_x64-setup.exe` / `_x64_zh-CN.msi`），双击运行即可完成安装。
+- **macOS**：下载对应架构的 dmg（Apple Silicon 选 `_aarch64.dmg`，Intel 选 `_x64.dmg`），打开后把「AI Work 助手」拖入「应用程序」文件夹。
+  - 因应用未做公证，首次打开若提示「无法验证开发者」：在「应用程序」中**右键点击**应用 →「打开」→ 再点「打开」（首次一次即可）；或在终端执行 `xattr -d com.apple.quarantine "/Applications/AI Work 助手.app"`。
 
 ### 首次启动
 
@@ -74,11 +76,11 @@ AI Work 助手 是一款 Windows 桌面端多账号管理一站式工作台，**
 **侧边栏导航**：
 
 - **概览** — 账号签到状态概览与环境引导
-- **账号管理** — 账号 CRUD、分组、**双应用**登录态切换
+- **账号管理** — 账号 CRUD、分组、按应用独立登录态切换（Trae Work / Trae / WorkBuddy / CodeBuddy / 豆包）
 - **一键签到** — 批量签到操作
 - **积分看板** — 积分排行与趋势图
 - **资源调度** — 服务资源池管理（账号池 / 资源开关 / 模型目录）
-- **环境配置** — 两应用路径检测、代理、定时任务等配置
+- **环境配置** — 各应用路径检测（Trae Work / Trae / WorkBuddy / CodeBuddy / 豆包）、代理、定时任务等配置
 
 **侧边栏左下角工具按钮**：
 
@@ -360,10 +362,12 @@ response = client.chat.completions.create(
 
 ### 8.4 系统代理设置
 
-启动代理后，系统会自动配置 Windows 代理设置：
+启动代理后，系统会自动配置系统代理：
 
 - 代理地址：`127.0.0.1:8899`
 - 代理例外：`127.0.0.1;localhost;<local>`
+- **Windows**：写注册表 WinINet 设置并在停止时原样还原（含 VPN 串联）
+- **macOS**：经 `networksetup` 对全部网络服务设置（HTTP/HTTPS），OAuth 登录域名自动加入直连豁免；停止时还原
 
 关闭代理时自动恢复原设置。
 
@@ -414,9 +418,8 @@ response = client.chat.completions.create(
 ### 10.2 定时签到
 
 - 设置每日签到时间（HH:MM 格式）
-- 注册/查看/删除 Windows 计划任务
-- 计划任务以**当前登录用户身份**运行，无需管理员权限（v2.4.3 起不再使用 `/RL HIGHEST`，避免普通用户注册失败）
-- 未注册时点击「查询」会明确提示「未注册每日签到任务」，注册/取消失败会展示可读的中文原因
+- **Windows**：注册/查看/删除系统计划任务（schtasks）——计划任务以**当前登录用户身份**运行，无需管理员权限（v2.4.3 起不再使用 `/RL HIGHEST`，避免普通用户注册失败）；未注册时点击「查询」会明确提示「未注册每日签到任务」，注册/取消失败会展示可读的中文原因
+- **macOS**：系统级计划任务注册不可用（入口自动隐藏）——应用内置 Rust 调度器在运行期间按时刻自动执行签到/续期/巡检（错过时刻启动会自动补跑），配合「开机自启 + 静默签到」即可覆盖每日定时场景
 
 ### 10.3 设备标识重置
 

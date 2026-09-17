@@ -741,7 +741,25 @@ fn bind_exclusive(port: u16) -> Result<std::net::TcpListener, String> {
         // fd 所有权转交 std（后续转 tokio 异步轮询）
         Ok(std::net::TcpListener::from_raw_socket(sock as u64))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // F-75 M2-2.3 mac 分支：显式 SO_REUSEADDR（防 TIME_WAIT 残留导致代理重启
+        // 绑定失败——与 Windows 独占语义方向相反但同为「重启必成功」服务目标）。
+        // tokio TcpSocket 实现零新增依赖（socket2/libc 均不必引入）。
+        use std::net::Ipv4Addr;
+        let socket = tokio::net::TcpSocket::new_v4()
+            .map_err(|e| format!("创建监听套接字失败: {e}"))?;
+        socket
+            .set_reuseaddr(true)
+            .map_err(|e| format!("设置 SO_REUSEADDR 失败: {e}"))?;
+        let addr = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        socket
+            .bind(addr)
+            .map_err(|e| format!("绑定 127.0.0.1:{port} 失败: {e}"))?
+            .into_std()
+            .map_err(|e| format!("监听器转入阻塞模式失败: {e}"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         std::net::TcpListener::bind(("127.0.0.1", port))
             .map_err(|e| format!("绑定 127.0.0.1:{port} 失败: {e}"))

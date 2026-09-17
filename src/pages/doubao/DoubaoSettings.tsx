@@ -11,6 +11,8 @@ export default function DoubaoSettings() {
   const settings = useAppStore((s) => s.settings);
   const saveSettings = useAppStore((s) => s.saveSettings);
   const pushToast = useAppStore((s) => s.pushToast);
+  // F-75 M2-2.4：schtasks 注册入口按平台标志隐藏（mac 由内置调度器覆盖）
+  const platform = useAppStore((s) => s.platform);
 
   const [locate, setLocate] = useState<AppLocate | null>(null);
   const [path, setPath] = useState('');
@@ -84,8 +86,12 @@ export default function DoubaoSettings() {
     if (settings?.doubao_renew_url) setRenewUrl(settings.doubao_renew_url);
     if (settings?.doubao_quota_url) setQuotaUrl(settings.doubao_quota_url);
     if (settings) setIncludeIdb(!!settings.doubao_snapshot_include_idb);
-    void refreshTaskStatus();
-    void refreshQuotaTaskStatus();
+    // 审查修复（P2）：schtasks 状态查询仅 Windows 发起——mac 上后端恒 Err，
+    // catch 静默吞掉徒增无谓 IPC；注册卡片本就按平台隐藏
+    if (platform === 'windows') {
+      void refreshTaskStatus();
+      void refreshQuotaTaskStatus();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb]);
 
@@ -277,8 +283,8 @@ export default function DoubaoSettings() {
             </button>
           </div>
 
-          {/* 定时任务 */}
-          <div className="flex flex-wrap items-center gap-2">
+          {/* 定时任务（schtasks 仅 Windows；mac 隐藏，保活由内置调度器 + 手动巡检覆盖） */}
+          <div className={`flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
             <span className="shrink-0 text-slate-500">每日任务</span>
             <input
               value={taskTime}
@@ -405,8 +411,8 @@ export default function DoubaoSettings() {
             </button>
           </div>
 
-          {/* 每日额度巡检任务 */}
-          <div className="flex flex-wrap items-center gap-2">
+          {/* 每日额度巡检任务（schtasks 仅 Windows；mac 隐藏） */}
+          <div className={`flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
             <span className="shrink-0 text-slate-500">每日巡检</span>
             <input
               value={quotaTaskTime}

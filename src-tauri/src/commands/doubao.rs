@@ -1168,6 +1168,7 @@ fn schtasks_create_failure(state: &State<AppState>, task: &str, stderr: &str) ->
 /// 启动豆包 8s 联网滑动续期后关闭，switcher Rust 化后不再依赖 PS 桥）
 #[tauri::command(async)]
 pub fn doubao_renew_task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     // 审查修复（命令注入）：原 contains(':')/len 弱校验可被 "12:3&calc" 绕过，改严格白名单
     crate::commands::misc::validate_hhmm(&time)?;
     let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
@@ -1225,6 +1226,7 @@ pub fn try_migrate_keepalive_launcher(state: &AppState) -> Option<String> {
 /// 查询豆包续期计划任务状态（存在与否 + 触发时间）
 #[tauri::command(async)]
 pub fn doubao_renew_task_status(_state: State<AppState>) -> Result<String, String> {
+    crate::commands::misc::schtasks_gate()?;
     let name = crate::commands::misc::DOUBAO_TASK_NAME;
     let (ok, stdout, _stderr) =
         crate::commands::misc::run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"])?;
@@ -1239,6 +1241,7 @@ pub fn doubao_renew_task_status(_state: State<AppState>) -> Result<String, Strin
 /// 注销豆包续期计划任务
 #[tauri::command(async)]
 pub fn doubao_renew_task_unregister(state: State<AppState>) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     let name = crate::commands::misc::DOUBAO_TASK_NAME;
     let (ok, _stdout, stderr) =
         crate::commands::misc::run_schtasks(&["/Delete", "/TN", name, "/F"])?;
@@ -1256,6 +1259,7 @@ pub fn doubao_renew_task_unregister(state: State<AppState>) -> Result<(), String
 /// 注册豆包额度巡检每日计划任务（schtasks 直调主 exe CLI 任务模式，原 python doubao_quota.py --all 已 Rust 化）
 #[tauri::command(async)]
 pub fn doubao_quota_task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     // 审查修复（命令注入）：同上，弱校验改严格白名单
     crate::commands::misc::validate_hhmm(&time)?;
     let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
@@ -1293,6 +1297,7 @@ pub fn doubao_quota_task_register(state: State<AppState>, time: String) -> Resul
 /// 查询豆包额度巡检计划任务状态
 #[tauri::command(async)]
 pub fn doubao_quota_task_status(_state: State<AppState>) -> Result<String, String> {
+    crate::commands::misc::schtasks_gate()?;
     let name = crate::commands::misc::DOUBAO_QUOTA_TASK_NAME;
     let (ok, stdout, _stderr) =
         crate::commands::misc::run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"])?;
@@ -1306,6 +1311,7 @@ pub fn doubao_quota_task_status(_state: State<AppState>) -> Result<String, Strin
 /// 注销豆包额度巡检计划任务
 #[tauri::command(async)]
 pub fn doubao_quota_task_unregister(state: State<AppState>) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     let name = crate::commands::misc::DOUBAO_QUOTA_TASK_NAME;
     let (ok, _stdout, stderr) =
         crate::commands::misc::run_schtasks(&["/Delete", "/TN", name, "/F"])?;

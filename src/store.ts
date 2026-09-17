@@ -57,6 +57,8 @@ export interface LogQuery {
 
 interface AppState {
   ready: boolean;
+  /** 运行平台（F-75 M0-0.5）：init 时经 platform_info 拉取，控制 Windows 专属入口显隐与文案 */
+  platform: 'windows' | 'macos';
   view: ViewKey;
   /** 侧边栏应用切换（trae = 现有菜单；buddy = 后期扩展置灰；doubao = 豆包页） */
   activeApp: AppKey;
@@ -199,6 +201,7 @@ let lastLogsErrToastAt = 0;
 
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
+  platform: 'windows',
   view: 'dashboard',
   activeApp: 'trae',
   env: null,
@@ -235,6 +238,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     // 幂等锁：仅首次执行注册，后续调用直接复用（审查修复 P1-16）
     if (initStarted) return;
     initStarted = true;
+    // F-75 M0-0.5：平台标志先行拉取（失败保持默认 windows，不阻塞启动）
+    try {
+      const p = await api.platform.info();
+      set({ platform: p.os });
+    } catch {
+      /* ignore：保持默认 */
+    }
     unsubs = await setupListeners({
       onProxyLog: (line) =>
         set((s) => ({ proxyLog: [line, ...s.proxyLog.slice(0, 199)] })),

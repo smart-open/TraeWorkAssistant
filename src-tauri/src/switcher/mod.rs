@@ -433,6 +433,19 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
     }
 
     let mut sess = Session::new(&args);
+
+    // F-75 M0-0.6 mac 灰度门控：档案表 mac_supported=false 的应用域，mac 版数据布局
+    // 未经 M-1 侦察确认，切换/备份/恢复全链路直接拒绝（Windows 恒放行，行为零变化）。
+    // 不用 #[cfg] 门控是为让字段在 Windows 构建也有消费方（无 dead_code 警告）。
+    if !sess.prof.mac_supported && crate::platform::is_macos() {
+        let msg = format!(
+            "{} 的 macOS 版数据布局尚未侦察确认，切换/备份/恢复暂不可用（macOS 支持域按应用逐步放开）",
+            sess.prof.app_name
+        );
+        sink.step("fatal", StepStatus::Error, &msg);
+        return Err(fatal_line(&msg));
+    }
+
     sink.step(
         "init",
         StepStatus::Info,

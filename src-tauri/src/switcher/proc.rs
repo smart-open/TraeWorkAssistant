@@ -107,10 +107,22 @@ pub fn stop_app(sess: &mut Session, sink: &dyn ProgressSink) -> Result<(), Strin
         }
     }
 
-    // 一级：优雅关闭（EnumWindows→PostMessageW(WM_CLOSE)，等价 PS CloseMainWindow
-    // 的全窗口版——覆盖多窗口 Electron 应用），等待 graceful_wait_secs
+    // 一级：优雅关闭 —— Windows：EnumWindows→PostMessageW(WM_CLOSE)，等价 PS
+    // CloseMainWindow 的全窗口版（覆盖多窗口 Electron 应用）；macOS：SIGTERM
+    // （Electron 收到后走正常 quit 流程，落盘语义等价 WM_CLOSE，待 M-1 侦察 4 实测验证）。
+    // 等待 graceful_wait_secs
+    #[cfg(windows)]
     for (pid, _) in &procs {
         post_wm_close(*pid);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let sys = snapshot();
+        for (pid, _) in &procs {
+            if let Some(p) = sys.process(sysinfo::Pid::from_u32(*pid)) {
+                let _ = p.kill_with(sysinfo::Signal::Term); // SIGTERM
+            }
+        }
     }
     sink.step(
         "stop",
@@ -151,32 +163,66 @@ pub fn start_app(sess: &mut Session, sink: &dyn ProgressSink) -> Result<(), Stri
             &format!("未找到 {} 可执行文件", sess.prof.app_name),
         ));
     };
-    let mut cmd = std::process::Command::new(&exe);
-    if let Some(port) = sess.launch_proxy_port.filter(|p| *p > 0) {
-        sink.step(
-            "start",
-            super::StepStatus::Running,
-            &format!(
-                "正在启动 {}（注入代理 127.0.0.1:{port}）: {}",
-                sess.prof.app_name,
-                exe.display()
-            ),
-        );
-        // 规则 R1：参数数组传值（标准库按 MSVCRT 规则自动加引号，空格路径安全），
-        // 禁止手拼命令行字符串
-        cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
-    } else {
-        sink.step(
-            "start",
-            super::StepStatus::Running,
-            &format!("正在启动 {}: {}", sess.prof.app_name, exe.display()),
-        );
+
+    // F-75 M1-1.2 macOS：不需要 exe 路径——`open <bundle>` 让 LaunchServices 处理
+    // （单实例、激活前台，天然正确）；代理注入经 `--args` 透传给 Electron 主进程。
+    // exe 在 mac 定位链上即 .app bundle 路径（locate.rs find_bundle）。
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = crate::platform::cmd::sys_command("open");
+        cmd.arg(&exe);
+        if let Some(port) = sess.launch_proxy_port.filter(|p| *p > 0) {
+            sink.step(
+                "start",
+                super::StepStatus::Running,
+                &format!(
+                    "正在启动 {}（注入代理 127.0.0.1:{port}）: {}",
+                    sess.prof.app_name,
+                    exe.display()
+                ),
+            );
+            cmd.args(["--args", &format!("--proxy-server=http://127.0.0.1:{port}")]);
+        } else {
+            sink.step(
+                "start",
+                super::StepStatus::Running,
+                &format!("正在启动 {}: {}", sess.prof.app_name, exe.display()),
+            );
+        }
+        return cmd.spawn().map(|_| ()).map_err(|e| {
+            super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
+        });
     }
-    // 分离启动（对齐 PS Start-Process，不等待）；启动失败 throw → 顶层 catch fatal
-    cmd.spawn().map_err(|e| {
-        super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
-    })?;
-    Ok(())
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut cmd = std::process::Command::new(&exe);
+        if let Some(port) = sess.launch_proxy_port.filter(|p| *p > 0) {
+            sink.step(
+                "start",
+                super::StepStatus::Running,
+                &format!(
+                    "正在启动 {}（注入代理 127.0.0.1:{port}）: {}",
+                    sess.prof.app_name,
+                    exe.display()
+                ),
+            );
+            // 规则 R1：参数数组传值（标准库按 MSVCRT 规则自动加引号，空格路径安全），
+            // 禁止手拼命令行字符串
+            cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
+        } else {
+            sink.step(
+                "start",
+                super::StepStatus::Running,
+                &format!("正在启动 {}: {}", sess.prof.app_name, exe.display()),
+            );
+        }
+        // 分离启动（对齐 PS Start-Process，不等待）；启动失败 throw → 顶层 catch fatal
+        cmd.spawn().map_err(|e| {
+            super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
+        })?;
+        Ok(())
+    }
 }
 
 /// 在 deadline 内等待目标进程全部退出（1s 轮询，对齐 PS Start-Sleep 1s 循环）
@@ -194,7 +240,9 @@ fn wait_gone(prof: &AppProfile, timeout: Duration) -> bool {
 }
 
 /// 向 pid 的所有顶层窗口投递 WM_CLOSE（PS $proc.CloseMainWindow() 的全窗口版，
-/// 覆盖多窗口 Electron 应用；投递不阻塞）
+/// 覆盖多窗口 Electron 应用；投递不阻塞）。
+/// F-75 M1-1.1：Windows 专属实现（windows-sys），mac 走上方 SIGTERM 分支。
+#[cfg(windows)]
 pub fn post_wm_close(pid: u32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
@@ -273,6 +321,7 @@ mod tests {
             .map_or(true, |p| profile::exe_matches(&p, &prof(TargetApp::Doubao))));
     }
 
+    #[cfg(windows)]
     #[test]
     fn post_wm_close_对不存在pid无副作用() {
         post_wm_close(u32::MAX - 1);

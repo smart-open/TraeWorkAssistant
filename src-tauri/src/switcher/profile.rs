@@ -53,6 +53,15 @@ pub struct AppProfile {
     pub exe_candidates: Vec<PathBuf>,
     /// 仅 CodeBuddy：L3 vscdb 登录真源目录（%APPDATA%\CodeBuddy CN\User\globalStorage）
     pub cb_global_storage_dir: Option<PathBuf>,
+    /// F-75 M0-0.6：macOS 支持灰度标志——mac 版数据布局经 M-1 侦察确认前置 true，
+    /// 未确认前 run_action 对该应用域直接拒绝（切换/备份/恢复全链路）。
+    /// Windows 侧恒放行（`is_macos()` 门控），字段不影响既有行为。
+    pub mac_supported: bool,
+    /// F-75 M1-1.4 预填（按设计 §3.4 假设表，**均待 M-1 实测确认**）：
+    /// mac 数据目录假设值（`~` = $HOME，M-1 确认后随 mac_supported 一起放开）。
+    /// - VS Code fork 惯例：~/Library/Application Support/<Name>
+    /// - dotfile 惯例：~/.workbuddy、~/.codebuddy
+    pub mac_data_dir_guess: Option<&'static str>,
 }
 
 impl AppProfile {
@@ -100,6 +109,9 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 PathBuf::from("D:\\Programs\\Trae CN\\Trae CN.exe"),
             ],
             cb_global_storage_dir: None,
+            // mac 预填假设 ~/Library/Application Support/Trae CN（VS Code fork 惯例），待 M-1 侦察 1 确认
+            mac_supported: false,
+            mac_data_dir_guess: Some("~/Library/Application Support/Trae CN"),
         },
         TargetApp::Doubao => AppProfile {
             app_name: "豆包",
@@ -120,6 +132,9 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 PathBuf::from(format!("{program_files}\\Doubao\\Application\\Doubao.exe")),
             ],
             cb_global_storage_dir: None,
+            // mac 预填假设 ~/Library/Application Support/Doubao（Chromium 惯例），待 M-1 侦察 3 确认
+            mac_supported: false,
+            mac_data_dir_guess: Some("~/Library/Application Support/Doubao"),
         },
         TargetApp::WorkBuddy => AppProfile {
             app_name: "WorkBuddy",
@@ -140,6 +155,9 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 "{local}\\Programs\\WorkBuddy\\WorkBuddy.exe"
             ))],
             cb_global_storage_dir: None,
+            // mac dotfile 惯例 ~\.workbuddy 理论零改动（把握最高的 mac 先行域），待 M-1 侦察 2 确认
+            mac_supported: false,
+            mac_data_dir_guess: Some("~/.workbuddy"),
         },
         TargetApp::CodeBuddy => AppProfile {
             app_name: "CodeBuddy",
@@ -164,6 +182,10 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: Some(PathBuf::from(format!(
                 "{appdata}\\CodeBuddy CN\\User\\globalStorage"
             ))),
+            // mac 双目录混合布局（dotfile + VS Code fork globalStorage 真源），
+            // 含 Keychain secret 绑定风险，待 M-1 侦察 9 确认
+            mac_supported: false,
+            mac_data_dir_guess: Some("~/.codebuddy"),
         },
         TargetApp::TraeWork => AppProfile {
             app_name: "Trae Work",
@@ -188,6 +210,9 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 PathBuf::from("D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe"),
             ],
             cb_global_storage_dir: None,
+            // mac 预填假设 ~/Library/Application Support/TRAE SOLO CN，待 M-1 侦察 1 确认
+            mac_supported: false,
+            mac_data_dir_guess: Some("~/Library/Application Support/TRAE SOLO CN"),
         },
     }
 }
@@ -232,6 +257,37 @@ mod tests {
         assert_eq!(trae.settings_path_key, "trae_cn_path");
         assert_eq!(trae.profiles_dir, data.join("data").join("profiles_trae"));
         assert_eq!(trae.exe_candidates.len(), 3);
+    }
+
+    #[test]
+    fn 五应用档案_mac灰度_未侦察前全部禁用() {
+        // F-75 M0-0.6：M-1 侦察确认前置 mac_supported=true；锁定默认全 false，
+        // 防止「顺手放开」未侦察应用域——放开时必须显式改动此测试
+        for (app, name) in [
+            (TargetApp::TraeWork, "Trae Work"),
+            (TargetApp::Trae, "Trae"),
+            (TargetApp::Doubao, "豆包"),
+            (TargetApp::WorkBuddy, "WorkBuddy"),
+            (TargetApp::CodeBuddy, "CodeBuddy"),
+        ] {
+            let prof = profile_for(app, &temp_data());
+            assert!(!prof.mac_supported, "{name} 未侦察确认前 mac_supported 必须为 false");
+        }
+    }
+
+    #[test]
+    fn 五应用档案_mac数据目录预填_完整() {
+        // M1-1.4 预填假设表（设计 §3.4）：确认前仅供侦察对照，不参与任何路径展开
+        let cases = [
+            (TargetApp::TraeWork, Some("~/Library/Application Support/TRAE SOLO CN")),
+            (TargetApp::Trae, Some("~/Library/Application Support/Trae CN")),
+            (TargetApp::Doubao, Some("~/Library/Application Support/Doubao")),
+            (TargetApp::WorkBuddy, Some("~/.workbuddy")),
+            (TargetApp::CodeBuddy, Some("~/.codebuddy")),
+        ];
+        for (app, guess) in cases {
+            assert_eq!(profile_for(app, &temp_data()).mac_data_dir_guess, guess);
+        }
     }
 
     #[test]

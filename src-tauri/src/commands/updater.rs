@@ -3,6 +3,9 @@
 // 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.mjs）：
 //   AI Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
 //   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
+//   AI Work 助手_<ver>_aarch64.dmg     ← macOS 安装镜像（Apple Silicon；人工拖拽安装）
+//   AI Work 助手_<ver>_x64.dmg         ← macOS 安装镜像（Intel；updater 按运行时 ARCH 挑选，
+//                                         _universal.dmg 命名亦兼容）
 //
 // 流程（下载与安装拆分，UI 两处确认）：
 //   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
@@ -42,6 +45,8 @@ pub struct UpdateCheckResult {
     /// 发布方提供的安装包 SHA256（优先取发布校验清单 latest.json，回退 release 正文约定行；
     /// 存量旧 release 两者皆无时为 None，跳过校验）
     pub sha256: Option<String>,
+    /// 运行平台（F-75 M3-3.3："windows" | "macos"），前端更新引导文案分派用
+    pub platform: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -78,10 +83,12 @@ fn cmp_version(a: (u64, u64, u64), b: (u64, u64, u64)) -> std::cmp::Ordering {
     a.cmp(&b)
 }
 
-/// 读当前 Windows 系统代理（即用户 VPN）为 ureq 可用的代理 URL；未启用或格式异常返回 None。
-/// 注册表 ProxyServer 有两种形态："host:port" 或 "http=..;https=..;ftp=.."（按协议区分）。
+/// 读当前系统代理（即用户 VPN）为 ureq 可用的代理 URL；未启用或格式异常返回 None。
+/// Windows：注册表 ProxyServer 有两种形态："host:port" 或 "http=..;https=..;ftp=.."（按协议区分）。
+/// macOS：scutil --proxies（F-75 M2-2.1 接线 platform::proxy_ctl——原直调
+/// cfg(windows) 的 get_existing_win_proxy 是 mac 编译阻断点，本行即修复）。
 fn system_proxy_url() -> Option<String> {
-    let (_, server, _) = crate::commands::proxy::get_existing_win_proxy()?;
+    let (_, server, _) = crate::platform::proxy_ctl::get_system_proxy()?;
     let server = server.trim();
     if server.is_empty() {
         return None;
@@ -158,25 +165,43 @@ fn fetch_releases() -> Result<Vec<serde_json::Value>, String> {
     ))
 }
 
-/// 在 release 资产中挑选安装包：优先 NSIS（x64-setup.exe），退而求其次 MSI。
+/// 平台安装包资产后缀（优先级序，F-75 M3-3.2 随 cfg 分派）：
+/// Windows：NSIS（_x64-setup.exe）> MSI（_x64_zh-CN.msi）；
+/// macOS（双架构支持）：本机架构精确匹配 > universal > 另一架构（Rosetta 兜底）。
+/// 附带收益：Windows 版不会误选 dmg、mac 版不会误选 exe——双产品线同 Release 共存。
+#[cfg(windows)]
+fn asset_suffixes() -> &'static [&'static str] {
+    &["_x64-setup.exe", "_x64_zh-CN.msi"]
+}
+#[cfg(target_os = "macos")]
+fn asset_suffixes() -> &'static [&'static str] {
+    if std::env::consts::ARCH == "x86_64" {
+        &["_x64.dmg", "_universal.dmg", "_aarch64.dmg"]
+    } else {
+        &["_aarch64.dmg", "_universal.dmg", "_x64.dmg"]
+    }
+}
+
+/// 在 release 资产中挑选安装包（按 asset_suffixes 优先级 + 版本号最大）。
 fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
-    // [(name, url, size)] 两轮：先 NSIS 后 MSI
-    let mut parsed: Vec<(String, String, u64, bool)> = Vec::new(); // bool=is_nsis
+    // [(name, url, size, suffix 优先级序号)]
+    let suffixes = asset_suffixes();
+    let mut parsed: Vec<(String, String, u64, usize)> = Vec::new();
     for a in assets {
         let name = a.get("name")?.as_str()?.to_string();
         let url = a.get("browser_download_url")?.as_str()?.to_string();
         let size = a.get("size")?.as_u64().unwrap_or(0);
-        let is_nsis = name.ends_with("_x64-setup.exe");
-        let is_msi = name.ends_with("_x64_zh-CN.msi");
-        if is_nsis || is_msi {
-            parsed.push((name, url, size, is_nsis));
+        if let Some(prio) = suffixes.iter().position(|s| name.ends_with(s)) {
+            parsed.push((name, url, size, prio));
         }
     }
-    // NSIS 优先；同类型取文件名版本号最大者（release 内一般只有一个，防御性处理）
+    // 后缀优先级升序（NSIS 0 先于 MSI 1）；同类型取文件名版本号最大者
+    // （release 内一般只有一个，防御性处理）。Windows 行为与原 (is_nsis, version)
+    // 降序排序等价：NSIS=true 恒先于 MSI=false，版本大者先。
     parsed.sort_by(|a, b| {
-        let ka = (a.3, version_from_asset(&a.0).unwrap_or((0, 0, 0)));
-        let kb = (b.3, version_from_asset(&b.0).unwrap_or((0, 0, 0)));
-        kb.cmp(&ka)
+        let va = version_from_asset(&a.0).unwrap_or((0, 0, 0));
+        let vb = version_from_asset(&b.0).unwrap_or((0, 0, 0));
+        a.3.cmp(&b.3).then(vb.cmp(&va))
     });
     parsed
         .into_iter()
@@ -388,6 +413,7 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         size,
         release_page,
         sha256,
+        platform: crate::platform::OS.to_string(),
     })
 }
 
@@ -515,7 +541,7 @@ pub fn update_download(
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
             if name.as_deref() != Some(asset_name.as_str())
                 && p.is_file()
-                && p.extension().map(|e| e == "exe" || e == "msi").unwrap_or(false)
+                && p.extension().map(|e| e == "exe" || e == "msi" || e == "dmg").unwrap_or(false)
             {
                 let _ = std::fs::remove_file(&p);
             }
@@ -644,7 +670,21 @@ pub fn update_run_installer(
         _ => return Err("安装包版本不大于当前版本，已中止".to_string()),
     }
 
-    // /P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用
+    // F-75 M3-3.3 macOS 分支：无安装器概念——`open` 挂载 dmg 并弹 Finder 窗口，
+    // 引导用户把 .app 拖入 /Applications 完成覆盖安装；**不退出应用**（用户拖拽
+    // 完成后由前端「重启应用」按钮调 update_restart_app）。Gatekeeper 未签名
+    // 拦截的放行引导见 AboutDialog mac 安装视图。
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::cmd::sys_command("open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("打开安装包失败: {e}（可手动打开：{file_path}）"))?;
+        let _ = app.emit("update-installing", asset_name);
+        return Ok(());
+    }
+
+    // Windows：/P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用
     std::process::Command::new(path)
         .args(["/P", "/UPDATE", "/R"])
         .spawn()
@@ -656,9 +696,82 @@ pub fn update_run_installer(
     std::process::exit(0);
 }
 
+/// macOS 更新安装完成后的一键重启（AboutDialog「重启应用」按钮触发）：
+/// 当前进程退出前 spawn `open -a` 拉起新版（/Applications 中的 .app 已被用户
+/// 覆盖为新版）；顺序关键——`open` 是 LaunchServices 异步拉起，旧进程退出不影响
+/// 新进程启动。若用户尚未完成拖拽，`open -a` 拉起的仍是旧版（无害，前端文案覆盖）。
+#[tauri::command]
+pub fn update_restart_app(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::cmd::sys_command("open")
+            .args(["-a", "AI Work 助手"])
+            .spawn()
+            .map_err(|e| format!("重启应用失败: {e}"))?;
+        let _ = app.emit("update-restarting", ());
+        std::thread::sleep(Duration::from_millis(800));
+        std::process::exit(0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err("仅 macOS 需要手动重启更新（Windows 安装器 /R 参数自动重启）".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn pick_asset_跨平台互斥_忽略dmg并优先nsis() {
+        // M3-3.2 验收：双产品线同 Release 共存——Windows 更新器绝不误选 mac dmg，
+        // 且 NSIS 优先于 MSI（mac 侧对应分支由 cfg(target_os = "macos") 编译，真机验证）
+        let assets = serde_json::json!([
+            { "name": "AI Work 助手_3.5.4_aarch64.dmg", "browser_download_url": "u-dmg", "size": 9 },
+            { "name": "AI Work 助手_3.5.4_x64-setup.exe", "browser_download_url": "u-nsis", "size": 1 },
+            { "name": "AI Work 助手_3.4.0_x64_zh-CN.msi", "browser_download_url": "u-msi", "size": 2 }
+        ]);
+        let list = assets.as_array().unwrap();
+        let (name, url, _) = pick_asset(list).expect("应命中 NSIS");
+        assert!(name.ends_with("_x64-setup.exe"), "不应选中 dmg/msi: {name}");
+        assert_eq!(url, "u-nsis");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pick_asset_mac_本机架构优先_跨平台互斥() {
+        // M3-3.2 mac 侧对测（与 Windows 版互斥测试同源）：exe/dmg 互斥，
+        // 本机架构 dmg > universal > 另一架构（Rosetta 兜底）
+        let assets = serde_json::json!([
+            {"name": "AI.Work._3.3.3_x64-setup.exe", "browser_download_url": "u-nsis", "size": 1},
+            {"name": "AI.Work._3.3.3_x64.dmg", "browser_download_url": "u-x64", "size": 1},
+            {"name": "AI.Work._3.3.3_universal.dmg", "browser_download_url": "u-univ", "size": 1},
+            {"name": "AI.Work._3.3.3_aarch64.dmg", "browser_download_url": "u-arm", "size": 1}
+        ]);
+        let (name, url, _) = pick_asset(assets.as_array().unwrap()).unwrap();
+        assert!(!name.ends_with(".exe"), "mac 更新器绝不误选 exe: {name}");
+        let native = format!("_{}.dmg", std::env::consts::ARCH);
+        assert!(name.ends_with(&native), "应选本机架构 dmg: {name}");
+        if std::env::consts::ARCH == "x86_64" {
+            assert_eq!(url, "u-x64");
+        } else {
+            assert_eq!(url, "u-arm");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pick_asset_mac_仅universal时兜底选中() {
+        let assets = serde_json::json!([
+            {"name": "AI.Work._3.3.3_x64-setup.exe", "browser_download_url": "u-nsis", "size": 1},
+            {"name": "AI.Work._3.3.3_universal.dmg", "browser_download_url": "u-univ", "size": 1}
+        ]);
+        let (name, url, _) = pick_asset(assets.as_array().unwrap()).unwrap();
+        assert!(name.ends_with("_universal.dmg"));
+        assert_eq!(url, "u-univ");
+    }
 
     #[test]
     fn sha256_hex_format() {

@@ -19,6 +19,8 @@ export default function Settings() {
   const deviceResetActive = useAppStore((s) => s.deviceResetActive);
   const deviceResetProgress = useAppStore((s) => s.deviceResetProgress);
   const toast = useAppStore((s) => s.pushToast);
+  // F-75 M0-0.5/M2-2.4：Windows 专属入口（schtasks 注册等）按平台标志隐藏
+  const platform = useAppStore((s) => s.platform);
 
   const [time, setTime] = useState('09:00');
   const [taskInfo, setTaskInfo] = useState<string>('');
@@ -38,7 +40,8 @@ export default function Settings() {
 
   useEffect(() => {
     void refreshSettings();
-    void query();
+    // F-75 审查修复 #4：schtasks 状态查询仅 Windows 发起（mac 调用会报错误弹 toast）
+    if (platform === 'windows') void query();
   }, [refreshSettings]);
 
   // settings 从后端加载完毕后同步到本地 form
@@ -317,9 +320,11 @@ export default function Settings() {
           <h3 className="mb-1 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-400">
             应用内置 Rust 定时调度器：应用运行期间每日 09:00 自动签到（晚于该时刻启动会自动补跑，无需管理员权限）。
-            下方可注册 Windows 计划任务作为兜底，在应用未启动时于指定时间直接运行签到（注册/删除需要管理员权限）。
+            {platform === 'windows'
+              ? '下方可注册 Windows 计划任务作为兜底，在应用未启动时于指定时间直接运行签到（注册/删除需要管理员权限）。'
+              : '配合「开机自启 + 静默签到」，macOS 上应用运行期间即可覆盖每日定时签到（系统级计划任务注册仅支持 Windows）。'}
           </p>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className={`flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
             <div className="relative flex items-center">
               <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
               <input
@@ -339,7 +344,7 @@ export default function Settings() {
               <Trash2 size={15} /> {busyTask ? '删除中…' : '取消'}
             </button>
           </div>
-          {taskInfo && (
+          {platform === 'windows' && taskInfo && (
             <pre
               className={`mt-3 overflow-auto whitespace-pre-wrap rounded-lg p-3 text-xs ${
                 taskInfo.startsWith('❌')

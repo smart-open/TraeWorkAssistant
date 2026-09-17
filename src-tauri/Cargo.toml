@@ -65,11 +65,16 @@ sysinfo = "=0.33.1"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 # .lnk 快捷方式解析（switcher exe 发现第 3 级，替代 WScript.Shell COM）
 lnk = "0.6"
 # 注册表读写（HKLM MachineGuid 重置 + Uninstall 键枚举定位 exe，Microsoft 官方 crate）
 windows-registry = "0.6"
+
+# F-75 M0-0.4：vault 主密码 macOS 存储走 Keychain（platform/secret.rs 消费）；
+# 仅编译进 mac 分支，Windows 构建零新依赖、零行为变化（vault 保持 DPAPI）
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = "3"
 
 # dev/test 构建对依赖开优化：Stronghold 快照加密派生等在未优化下极慢（写一次 ~100s）
 [profile.dev.package."*"]

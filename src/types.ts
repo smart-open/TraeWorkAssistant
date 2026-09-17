@@ -768,6 +768,8 @@ export interface UpdateCheckResult {
   release_page: string;
   // 发布方提供的安装包 SHA256（release 正文约定行；旧版本无此行时缺省，跳过校验）
   sha256?: string | null;
+  // 运行平台（F-75 M3-3.3）：更新引导文案按平台分派（mac dmg 人工安装 vs win NSIS 自动重启）
+  platform?: 'windows' | 'macos';
 }
 
 // API Key 数据文件视图（api_keys_list 返回：列表 + 鉴权开关）

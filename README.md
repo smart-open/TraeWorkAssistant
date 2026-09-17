@@ -4,7 +4,7 @@
 
 # AI Work 助手（AI Work Assistant）
 
-Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 18 + Rust
+Windows / macOS 双平台多账号签到与管理一站式工作台 · Tauri 2 + React 18 + Rust
 
 **GitHub**：[github.com/smart-open](https://github.com/smart-open) · **个人博客**：[blog.sopenai.cn](https://blog.sopenai.cn/)
 
@@ -12,7 +12,7 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 ![AI Work 助手](./docs/images/main.png)
 
-> 深度支持 **Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包** 五应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + 自定义模型三池调度）、6 层设备标识重置等；Trae 双应用同一账号体系可分别切换，WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份。后续规划扩展更多 AI 应用。
+> 深度支持 **Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包** 五应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + 自定义模型三池调度）、6 层设备标识重置等；Trae 双应用同一账号体系可分别切换，WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份。**macOS 版已可用**（Apple Silicon + Intel dmg；部分 Windows 专属域按平台灰度，详见下方 macOS 说明）。后续规划扩展更多 AI 应用。
 >
 > ⚠️ 本工具与 Trae Work / WorkBuddy / 豆包等官方均无任何关联，仅供学习研究。使用本工具可能违反相关服务条款，风险自担。请仅管理本人合法持有的账号。
 
@@ -54,12 +54,29 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 ```powershell
 npm install
 npm run tauri dev      # 开发模式
-npm run tauri build    # 打包（msi + nsis）
+npm run tauri build    # 打包（msi + nsis，Windows 平台自动合并 tauri.windows.conf.json）
 node scripts/rename_release.mjs     # 安装包统一输出到 release/，命名 AI Work 助手_<版本>_x64*
 node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x64_portable.zip）
 ```
 
 前置：Node.js 18+、Rust 1.75+、WebView2 Runtime、VS Build Tools (C++)
+
+macOS（F-75，Apple Silicon + Intel）：
+
+```bash
+npm install
+npm run tauri build -- --bundles dmg   # 打包 dmg（自动合并 tauri.macos.conf.json，产出对应架构镜像）
+node scripts/rename_release.mjs        # 输出 release/，命名 AI Work 助手_<版本>_aarch64|x64.dmg
+```
+
+## macOS 安装与「无法验证开发者」放行（未公证应用）
+
+macOS 版为 **ad-hoc 签名**（暂未购买 Developer ID 公证），首次打开会被 Gatekeeper 拦截，两种放行方式任选其一：
+
+1. **右键打开**：在「应用程序」文件夹中**右键点击**「AI Work 助手」→「打开」→ 再点「打开」（此后不再提示）；
+2. **终端命令**：`xattr -d com.apple.quarantine "/Applications/AI Work 助手.app"`
+
+系统级定时注册（schtasks）与设备系统级 MachineGuid 重置仅 Windows 可用；macOS 签到由内置调度器 + 开机自启覆盖。各目标应用的 macOS 版数据布局支持范围以应用内提示为准（灰度逐步放开）。
 
 ## 从老版本升级
 

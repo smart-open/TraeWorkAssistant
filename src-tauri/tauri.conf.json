@@ -30,22 +30,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["msi", "nsis"],
-    "icon": ["icons/icon.ico"],
     "shortDescription": "AI Work 多账号签到与管理助手",
-    "longDescription": "整合多账号签到、登录态切换、设备隔离与账号分组的 Windows 桌面端工具，支持 Trae / WorkBuddy / 豆包等多应用扩展。",
-    "publisher": "AI Work 助手",
-    "windows": {
-      "wix": {
-        "language": "zh-CN"
-      },
-      "nsis": {
-        "displayLanguageSelector": false,
-        "languages": ["SimpChinese"],
-        "installerHooks": "../build-assets/installer-hooks.nsh",
-        "template": "../build-assets/installer.nsi"
-      }
-    }
+    "longDescription": "整合多账号签到、登录态切换、设备隔离与账号分组的多平台桌面端工具，支持 Trae / WorkBuddy / 豆包等多应用扩展。",
+    "publisher": "AI Work 助手"
   },
   "plugins": {}
 }

@@ -9,6 +9,7 @@ mod icube_auth;
 mod jwt;
 mod models;
 mod notify;
+mod platform;
 mod state;
 mod store;
 mod switcher;
@@ -103,6 +104,7 @@ fn main() {
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
+            commands::env::platform_info,
             commands::env::env_check,
             commands::env::app_locate,
             commands::env::open_doubao_app,
@@ -242,6 +244,7 @@ fn main() {
             commands::updater::update_check,
             commands::updater::update_download,
             commands::updater::update_run_installer,
+            commands::updater::update_restart_app,
             commands::workbuddy::workbuddy_env_check,
             commands::workbuddy::workbuddy_open_auth_dir,
             commands::workbuddy::workbuddy_accounts_list,

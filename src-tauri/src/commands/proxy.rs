@@ -3,9 +3,7 @@
 //! MITM/JWT 捕获/日志等细节全部在 device_proxy 模块内完成（日志经 ProxyLog 直接
 //! emit `proxy-log` / `account-captured` 事件，与原 stdout 消费通路对齐）。
 
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 
 use crate::fs_utils;
+use crate::platform::cmd::sys_command;
 use crate::state::AppState;
 
 /// 看门狗标记：用户主动停止代理时置 true，用于区分「主动停止」与「代理异常崩溃」。
@@ -56,28 +55,47 @@ fn now_secs() -> i64 {
 /// 查询监听指定端口的进程 PID 列表（对齐 Python port_pids 诊断；netstat -ano 解析，
 /// 探测失败返回空表，仅供错误信息展示）。列格式：TCP 本地地址 远程地址 状态 PID。
 fn port_pids(port: u16) -> Vec<String> {
-    let Ok(out) = Command::new("netstat")
-        .args(["-ano", "-p", "TCP"])
-        .creation_flags(0x08000000)
-        .output()
-    else {
-        return vec![];
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let suffix = format!(":{port}");
-    let mut pids: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() >= 5
-            && cols[0].eq_ignore_ascii_case("TCP")
-            && cols[1].ends_with(&suffix)
-            && cols[3].eq_ignore_ascii_case("LISTENING")
-            && !pids.iter().any(|p| p == cols[4])
-        {
-            pids.push(cols[4].to_string());
-        }
+    // F-75 审查补齐：mac netstat 旗标为 `-an -p tcp`（小写协议名），输出列为
+    // `tcp4 0 0 127.0.0.1.<port> *.* LISTEN`（PID 列不存在，仅端口占用提示用）——
+    // mac 分支返回「占用」判定本身即可，PID 信息缺失无碍（仅错误文案展示）。
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(out) = sys_command("netstat").args(["-an", "-p", "tcp"]).output() else {
+            return vec![];
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let suffix = format!("127.0.0.1.{port}");
+        // F-75 审查补齐：首列 tcp4/tcp6 前缀过滤——表头行等非连接行不得误判「占用」
+        return if text.lines().any(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            cols.len() > 3 && cols[0].starts_with("tcp") && cols[3] == suffix
+        }) {
+            vec!["?".to_string()] // mac netstat 无 PID 列，占位表示「有监听」
+        } else {
+            vec![]
+        };
     }
-    pids
+    #[cfg(not(target_os = "macos"))]
+    {
+        let Ok(out) = sys_command("netstat").args(["-ano", "-p", "TCP"]).output() else {
+            return vec![];
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let suffix = format!(":{port}");
+        let mut pids: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() >= 5
+                && cols[0].eq_ignore_ascii_case("TCP")
+                && cols[1].ends_with(&suffix)
+                && cols[3].eq_ignore_ascii_case("LISTENING")
+                && !pids.iter().any(|p| p == cols[4])
+            {
+                pids.push(cols[4].to_string());
+            }
+        }
+        pids
+    }
 }
 
 /// 安全获取 Mutex 锁，即使中毒也能恢复（避免 panic 级联）。
@@ -164,7 +182,25 @@ pub async fn do_start(
         }
         #[cfg(not(target_os = "windows"))]
         {
-            None
+            // F-75 M2-2.1：mac 补齐 Windows 同等能力——读取用户 VPN（scutil）作为
+            // 上游透传，并在停止时经 PREV_SYSTEM_PROXY 还原（语义与 Windows 分支一致）
+            match crate::platform::proxy_ctl::get_system_proxy() {
+                Some((en, sv, ov))
+                    if sv != proxy_addr && !sv.contains(&format!("127.0.0.1:{port}")) =>
+                {
+                    *PREV_SYSTEM_PROXY
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) =
+                        Some((en, sv.clone(), ov));
+                    Some(sv)
+                }
+                _ => {
+                    *PREV_SYSTEM_PROXY
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                    None
+                }
+            }
         }
     };
 
@@ -356,7 +392,7 @@ pub fn proxy_status(
 // Windows 系统代理(WinINet)。故启动本地代理时同步把系统代理指向本机端口，TRAE 的全部
 // 流量(含鉴权)即汇入我们的 MITM 代理；停止时还原，避免全局断网。
 #[cfg(target_os = "windows")]
-fn apply_proxy(enable: bool, server: &str, override_: &str) -> Result<(), String> {
+pub(crate) fn apply_proxy(enable: bool, server: &str, override_: &str) -> Result<(), String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
     run_reg(key, "ProxyEnable", "REG_DWORD", if enable { "1" } else { "0" })?;
     if enable {
@@ -381,6 +417,35 @@ pub(crate) fn clear_win_proxy() -> Result<(), String> {
     apply_proxy(false, "", "")
 }
 
+/// F-75 M2-2.1 mac 分支：networksetup 逐服务接管/还原（实现收口 platform::proxy_ctl）。
+/// server 形态与 Windows 分支一致（"127.0.0.1:8899"）。
+#[cfg(target_os = "macos")]
+pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
+    crate::platform::proxy_ctl::apply_system_proxy(true, addr, "127.0.0.1;localhost;<local>")
+}
+
+/// mac 还原清空：off 态逐服务关闭（bypass 列表不动——代理已关，列表不再生效，
+/// 且保留用户 bypass 配置避免误清）
+#[cfg(target_os = "macos")]
+pub(crate) fn clear_win_proxy() -> Result<(), String> {
+    crate::platform::proxy_ctl::apply_system_proxy(false, "", "")
+}
+
+/// 还原路径的平台分派（审查修复 P0：restore_system_proxy/_on_exit 此前直调
+/// cfg(windows) 的 apply_proxy，mac 构建必然 E0425）：Windows 走注册表三键，
+/// mac 走 networksetup 逐服务（PREV_SYSTEM_PROXY 快照即 get_system_proxy 返回形态，
+/// 两平台 (enabled, server, bypass) 语义一致）。
+fn apply_prev_proxy(enable: bool, server: &str, bypass: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        apply_proxy(enable, server, bypass)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::proxy_ctl::apply_system_proxy(enable, server, bypass)
+    }
+}
+
 /// 还原系统代理（#14 提取共用）：启动前存在启用的外部代理（用户 VPN 梯子）→ 原样
 /// 还原，否则清空系统代理。`consume=true` 取走快照（proxy_stop / 应用退出，一次性）；
 /// `consume=false` 仅窥视（看门狗崩溃路径不消费，保留给后续 proxy_stop 继续还原）。
@@ -396,7 +461,7 @@ pub(crate) fn restore_system_proxy(consume: bool) -> Result<(), String> {
         }
     };
     match prev {
-        Some((en, sv, ov)) if en => apply_proxy(true, &sv, &ov),
+        Some((en, sv, ov)) if en => apply_prev_proxy(true, &sv, &ov),
         _ => clear_win_proxy(),
     }
 }
@@ -412,7 +477,7 @@ pub(crate) fn restore_system_proxy_on_exit(proxy_was_running: bool) -> Result<()
         .unwrap_or_else(|e| e.into_inner())
         .take();
     match prev {
-        Some((true, sv, ov)) => apply_proxy(true, &sv, &ov),
+        Some((true, sv, ov)) => apply_prev_proxy(true, &sv, &ov),
         // 防御分支：快照存在但未启用（正常路径不会出现，get_existing 仅存启用项）
         Some(_) => clear_win_proxy(),
         None if proxy_was_running => clear_win_proxy(),
@@ -487,9 +552,8 @@ fn notify_wininet_changed() {
 
 #[cfg(target_os = "windows")]
 fn reg_query_value(key: &str, name: &str) -> Option<String> {
-    let out = Command::new("reg")
+    let out = sys_command("reg")
         .args(["query", key, "/v", name])
-        .creation_flags(0x08000000)
         .output()
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
@@ -527,9 +591,8 @@ pub(crate) fn get_existing_win_proxy() -> Option<(bool, String, String)> {
 
 #[cfg(target_os = "windows")]
 fn run_reg(key: &str, name: &str, kind: &str, value: &str) -> Result<(), String> {
-    let status = Command::new("reg")
+    let status = sys_command("reg")
         .args(["add", key, "/v", name, "/t", kind, "/d", value, "/f"])
-        .creation_flags(0x08000000)
         .status()
         .map_err(|e| format!("设置系统代理失败: {e}"))?;
     if !status.success() {
@@ -538,15 +601,8 @@ fn run_reg(key: &str, name: &str, kind: &str, value: &str) -> Result<(), String>
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-fn set_win_proxy(_addr: &str) -> Result<(), String> {
-    Err("仅 Windows 支持系统代理设置".into())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn clear_win_proxy() -> Result<(), String> {
-    Err("仅 Windows 支持系统代理设置".into())
-}
+// F-75 M2-2.1：原「仅 Windows 支持系统代理设置」stub 已由上方 mac 实现替代
+// （set_win_proxy/clear_win_proxy 现为两平台真实实现，Windows 路径零变化）
 
 /// 应用退出路径使用：标记「主动停止」，让看门狗静默（退出清理由 RunEvent::Exit 统一完成）
 pub(crate) fn mark_intentional_stop() {

@@ -6,8 +6,8 @@ import { promo_banner_base64 as promoBanner } from '../assets/promo-banner.base6
 export const APP_NAME = 'AI Work 助手';
 export const APP_TAGLINE = '多账号签到与管理 · 一站式工作台';
 export const APP_OVERVIEW =
-  'Windows 桌面端多账号签到与管理一站式工作台（Tauri 2 + React 18 + Rust）。' +
-  '深度支持 Trae Work 与 Trae（Trae CN IDE）双应用：多账号签到、登录态双应用独立切换、设备隔离、积分看板与 OpenAI / Anthropic 兼容 API 网关，数据全部本地存储。';
+  'Windows / macOS 双平台多账号签到与管理一站式工作台（Tauri 2 + React 18 + Rust）。' +
+  '深度支持 Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包 五应用：多账号签到、登录态按应用独立切换、设备隔离、积分看板与 OpenAI / Anthropic / Codex 三协议兼容 API 网关，数据全部本地存储。';
 export const APP_AUTHOR = '朱天伟';
 export const APP_COPYRIGHT = `Copyright © 2026 ${APP_AUTHOR} · MIT License`;
 export const APP_DISCLAIMER =

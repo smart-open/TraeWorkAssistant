@@ -9,16 +9,18 @@
 | 层 | 选型 | 理由 |
 |---|---|---|
 | UI | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 + lucide-react | Web 技术栈还原设计稿；Zustand 单一状态源；Recharts 图表 |
-| 外壳 | Tauri 2.x（Rust 1.75+ MSVC） | 包体 8~15MB（远小于 Electron），可调用系统 API（注册表/证书/计划任务/DPAPI） |
+| 外壳 | Tauri 2.x（Rust 1.75+，MSVC / macOS 双平台） | 包体 8~15MB（远小于 Electron），可调用系统 API（注册表/证书/计划任务/DPAPI/Keychain） |
 | 核心逻辑 | Rust（`src-tauri/src/tasks/` 直调模块） | 原 Python 脚本已全部重写为 Rust 后台任务（trae_checkin / wb_* / doubao_* / device_proxy），无子进程、无解释器依赖 |
-| 登录态切换 | Rust `switcher/` 模块（5 应用 × 3 快照布局档案表驱动，进程内直调） | 原 `trae-switch-bridge.ps1` 已全量 Rust 化：sysinfo 进程管理 + windows-registry + lnk 解析，无外部运行时 |
+| 登录态切换 | Rust `switcher/` 模块（5 应用 × 3 快照布局档案表驱动，进程内直调） | 原 `trae-switch-bridge.ps1` 已全量 Rust 化：sysinfo 进程管理 + windows-registry + lnk 解析（Windows）/ bundle 探测 + SIGTERM（macOS，F-75），无外部运行时 |
+| 平台服务层 | Rust `platform/` 模块（F-75） | 数据根目录 / 子进程构建（sys_command）/ vault 原语（DPAPI \| Keychain）/ 系统代理（注册表 \| networksetup）/ CA（certutil \| security）双实现收口，`#[cfg]` 分派 |
 | API 网关 | Rust axum（内嵌，复用 Tauri tokio runtime） | OpenAI / Anthropic 双协议端点 + SSE 转换 + 账号池调度，无独立进程 |
 | HTTP 客户端 | ureq（同步）+ `spawn_blocking` 包装 | 双 Client 设计：短请求 120s 超时 / 流式仅 ResponseHeaderTimeout 120s，共享连接池 |
-| 加密 | tauri-plugin-stronghold + windows-sys(DPAPI) | jwt/refresh_token 入 vault，主密码经 DPAPI 仅本机当前用户可解 |
-| 测试 | cargo test + vitest | Rust 310 用例（tasks/device_proxy 纯函数） / 前端 `src/lib/format.test.ts` |
-| 打包 | Tauri Bundler → MSI / NSIS（自定义模板） | 全 Rust 零外部运行时（Python 与 PowerShell 均已移除）；产物经 `scripts/rename_release.mjs` 输出中文命名到 release/ |
+| 加密 | tauri-plugin-stronghold + windows-sys(DPAPI) / macOS keyring(Keychain) | jwt/refresh_token 入 vault，主密码 Windows 经 DPAPI、macOS 经 Keychain 仅本机当前用户可解 |
+| 测试 | cargo test + vitest | Rust 420+ 用例（tasks/device_proxy/switcher/platform 纯函数） / 前端 `src/lib/format.test.ts` |
+| 打包 | Tauri Bundler → MSI / NSIS（win 自定义模板）+ dmg（mac aarch64 / x64 双架构） | 全 Rust 零外部运行时（Python 与 PowerShell 均已移除）；平台配置拆分 `tauri.{windows,macos}.conf.json` 深度合并；产物经 `scripts/rename_release.mjs` 输出中文命名到 release/ |
 
 **不采用**：Electron（体积过大）、WPF/WinUI（样式成本高）、PyQt（视觉不达要求）、React Router/Redux（依赖最小原则）。
+**平台支持（F-75，2026-09-17）**：Windows 10/11（完整功能）+ macOS 12+（Apple Silicon / Intel）——mac 差异收敛于 `platform/` 与 `switcher/{proc,locate,machine}.rs` 的 `#[cfg]` 分支，应用域灰度放开（`mac_supported`）；schtasks / MachineGuid / UI 点击兜底为 Windows 专属，mac 由内置调度器 + 开机自启覆盖。设计与进度见 `docs/tmp/f75-macos-support-design.md`。
 
 ## 2. 架构分层
 
@@ -205,7 +207,9 @@ event:error         流内错误（code:1005 → PlanLimit 等）
 
 ## 7. 开发与运维
 
-### 7.1 环境准备（一次性，仅 Windows）
+### 7.1 环境准备（一次性）
+
+**Windows**（完整功能验证环境）：
 
 | 依赖 | 要求 | 校验 |
 |---|---|---|
@@ -214,6 +218,17 @@ event:error         流内错误（code:1005 → PlanLimit 等）
 | Rust | ≥ 1.77 stable（MSVC，edition 2021） | `rustc --version` |
 | VS Build Tools | 「使用 C++ 的桌面开发」+ Windows SDK | 链接错误多因缺失此项 |
 | WebView2 | Win11 自带 / Win10 装 Evergreen Bootstrapper | — |
+
+**macOS**（F-75，构建 / CI / 真机验证）：
+
+| 依赖 | 要求 | 校验 |
+|---|---|---|
+| macOS | 12+（Apple Silicon 或 Intel；CI 矩阵 macos-14 / macos-13） | `sw_vers` |
+| Node.js | ≥ 18（建议 20） | `node -v` |
+| Rust | stable + 对应架构 target（`aarch64-apple-darwin` / `x86_64-apple-darwin`；universal 需双 target） | `rustc --version` |
+| Xcode CLT | `xcode-select --install`（链接器 / Security.framework） | `clang -v` |
+
+打包：Windows `npm run tauri build`（MSI + NSIS）；macOS `npm run tauri build -- --bundles dmg`（对应架构 dmg，`tauri.macos.conf.json` 自动合并）。
 
 ```powershell
 npm install
