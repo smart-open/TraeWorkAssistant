@@ -58,9 +58,13 @@ fn main() {
     }
 
     // 旧版计划任务迁移（并存语义）：按旧任务触发时间重建 AIWorkAssistant_DailyCheckin，
-    // 旧任务保留供老应用继续使用；任何一步失败都静默跳过
-    if let Some(note) = commands::misc::try_migrate_legacy_task(&state) {
-        fs_utils::app_log(&state.data_dir, &note);
+    // 旧任务保留供老应用继续使用；任何一步失败都静默跳过。
+    // 仅 Windows 有 schtasks 体系（cfg! 运行时判断保持函数可达，mac 无 dead_code 警告，
+    // 也不会空跑注定失败的 cmd 子进程）
+    if cfg!(windows) {
+        if let Some(note) = commands::misc::try_migrate_legacy_task(&state) {
+            fs_utils::app_log(&state.data_dir, &note);
+        }
     }
     // PS 桥 KeepAlive 启动器一次性迁移：旧 task_doubao_renew.cmd 引用
     // trae-switch-bridge.ps1 → 原地改写为 --task-run doubao-keepalive（幂等，失败静默）

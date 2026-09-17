@@ -212,23 +212,30 @@ fn locate_bundle_dir(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
 /// Spotlight 兜底：mdfind 查 .app，逐个经白名单防串台
 #[cfg(target_os = "macos")]
 fn mdfind_bundle(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
-    let mut cmd = crate::platform::cmd::sys_command("mdfind");
-    let out = cmd
-        .args([
-            &format!("kMDItemKind == 'Application' && kMDItemDisplayName == '*{name}*'cd"),
-            "-onlyin",
-            "/Applications",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    // 逐应用目录查询（用户级 ~/Applications 与系统级 /Applications 同等常见）
+    let mut roots = vec!["/Applications".to_string()];
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() {
+        roots.push(format!("{home}/Applications"));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let p = PathBuf::from(line.trim());
-        if is_bundle_dir(&p) && bundle_exe_matches(&p, exe_names) {
-            return Some(p);
+    for root in roots {
+        let out = crate::platform::cmd::sys_command("mdfind")
+            .args([
+                &format!("kMDItemKind == 'Application' && kMDItemDisplayName == '*{name}*'cd"),
+                "-onlyin",
+                &root,
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let p = PathBuf::from(line.trim());
+            if is_bundle_dir(&p) && bundle_exe_matches(&p, exe_names) {
+                return Some(p);
+            }
         }
     }
     None

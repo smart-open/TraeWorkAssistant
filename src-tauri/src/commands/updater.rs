@@ -685,15 +685,20 @@ pub fn update_run_installer(
     }
 
     // Windows：/P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用
-    std::process::Command::new(path)
-        .args(["/P", "/UPDATE", "/R"])
-        .spawn()
-        .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+    // 审查修复（P1，整体黑盒复审）：整体 cfg 门控——mac 构建中上方 return 之后
+    // 本段不可达，未门控会触发 unreachable_code 警告（零警告红线）
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::process::Command::new(path)
+            .args(["/P", "/UPDATE", "/R"])
+            .spawn()
+            .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
 
-    // 提示前端后退出，让安装器接管（安装钩子会兜底结束本进程解锁文件占用）
-    let _ = app.emit("update-installing", asset_name);
-    std::thread::sleep(Duration::from_millis(800));
-    std::process::exit(0);
+        // 提示前端后退出，让安装器接管（安装钩子会兜底结束本进程解锁文件占用）
+        let _ = app.emit("update-installing", asset_name);
+        std::thread::sleep(Duration::from_millis(800));
+        std::process::exit(0);
+    }
 }
 
 /// macOS 更新安装完成后的一键重启（AboutDialog「重启应用」按钮触发）：

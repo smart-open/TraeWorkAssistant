@@ -753,9 +753,15 @@ fn bind_exclusive(port: u16) -> Result<std::net::TcpListener, String> {
             .set_reuseaddr(true)
             .map_err(|e| format!("设置 SO_REUSEADDR 失败: {e}"))?;
         let addr = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        // 审查修复（P0-1，整体黑盒复审）：tokio 1.53 TcpSocket::bind 仅绑定端口返回
+        // io::Result<()>（socket.rs:805），监听器由 listen(backlog) 产出（:906）——
+        // 原写法 `bind(...)?.into_std()` 对 () 调用不存在的方法，mac 构建 E0599
         socket
             .bind(addr)
-            .map_err(|e| format!("绑定 127.0.0.1:{port} 失败: {e}"))?
+            .map_err(|e| format!("绑定 127.0.0.1:{port} 失败: {e}"))?;
+        socket
+            .listen(128)
+            .map_err(|e| format!("监听 127.0.0.1:{port} 失败: {e}"))?
             .into_std()
             .map_err(|e| format!("监听器转入阻塞模式失败: {e}"))
     }

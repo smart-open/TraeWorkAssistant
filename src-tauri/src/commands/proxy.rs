@@ -140,7 +140,9 @@ pub async fn do_start(
     let proxy_addr = format!("127.0.0.1:{port}");
 
     // 端口预检（友好报错；真正的独占绑定在 ProxyServer::start 内以
-    // SO_EXCLUSIVEADDRUSE 完成，issue #7 防重复绑定「假启动」）
+    // SO_EXCLUSIVEADDRUSE 完成，issue #7 防重复绑定「假启动」）。
+    // mac 无需显式 SO_REUSEADDR：std 在非 Windows 平台的 TcpListener::bind
+    // 内置该选项（TIME_WAIT 残留不会误报占用），Windows 则显式不设（防劫持）。
     match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => drop(l),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {

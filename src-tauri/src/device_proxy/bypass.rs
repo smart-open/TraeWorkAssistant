@@ -287,17 +287,16 @@ pub fn disable_oauth_bypass(data_dir: &Path) -> Result<(), String> {
     if added.is_empty() {
         return Ok(());
     }
-    // 还原：只移除本次追加的条目（对齐 Windows 全局清单语义；MITM 代理停止时
-    // bypass 列表会随 apply_system_proxy(false) 之后的整体还原再校准）
-    if let Ok(services) = mac_services() {
-        for svc in &services {
-            let current = mac_bypass_list(svc);
-            let remaining: Vec<String> = current
-                .into_iter()
-                .filter(|s| !added.iter().any(|a| a.eq_ignore_ascii_case(s)))
-                .collect();
-            let _ = mac_set_bypass(svc, &remaining);
-        }
+    // 还原：只移除本次追加的条目（对齐 Windows 全局清单语义）。任一服务读写失败
+    // 即整体报错且不清账（保留 ADDED + marker 供重试）——半还原状态下「失忆」
+    // 会让用户 bypass 永久残留（对齐 Windows 注册表路径的 ? 传播语义）
+    for svc in mac_services()? {
+        let current = mac_bypass_list(&svc);
+        let remaining: Vec<String> = current
+            .into_iter()
+            .filter(|s| !added.iter().any(|a| a.eq_ignore_ascii_case(s)))
+            .collect();
+        mac_set_bypass(&svc, &remaining)?;
     }
     added.clear();
     let _ = std::fs::remove_file(marker_path(data_dir));
