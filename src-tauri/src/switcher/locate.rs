@@ -151,7 +151,7 @@ fn find_bundle(sess: &mut Session) -> Option<PathBuf> {
 
 /// 是否为 .app bundle 目录
 #[cfg(target_os = "macos")]
-fn is_bundle_dir(p: &Path) -> bool {
+pub(crate) fn is_bundle_dir(p: &Path) -> bool {
     p.is_dir() && p.extension().map(|e| e == "app").unwrap_or(false)
 }
 
@@ -169,23 +169,25 @@ fn bundle_root_of(exe: &Path) -> Option<PathBuf> {
 
 /// bundle 防串台：Contents/Info.plist 的 CFBundleExecutable 必须 ∈ exe_names 白名单
 #[cfg(target_os = "macos")]
-fn bundle_exe_matches(app: &Path, exe_names: &[&str]) -> bool {
-    let Some(exec) = read_info_plist_exec(app) else { return false };
+pub(crate) fn bundle_exe_matches(app: &Path, exe_names: &[&str]) -> bool {
+    let Some(exec) = read_info_plist_value(app, "CFBundleExecutable") else { return false };
     exe_names
         .iter()
         .any(|e| e.strip_suffix(".exe").unwrap_or(e).eq_ignore_ascii_case(&exec))
 }
 
-/// 解析 Contents/Info.plist 的 CFBundleExecutable（纯文本 XML plist 宽容解析：
-/// `<key>CFBundleExecutable</key>` 后的第一个 `<string>…</string>`）。
+/// 解析 Contents/Info.plist 指定 key 的首个 `<string>…</string>` 值（纯文本 XML
+/// plist 宽容解析）。F-75 P2-2 起开放给 env.rs（app_locate mac 分派读
+/// CFBundleShortVersionString 版本号）。
 /// M-1 已知局限（bplist 二进制风险）：部分应用 Info.plist 为 binary1 格式，
-/// read_to_string 得到乱码 → 解析 None → 该 bundle 被白名单拒绝而跳过；
+/// read_to_string 得到乱码 → 解析 None → 调用方按缺失处理（白名单拒绝/版本为空）；
 /// M-1 真机侦察确认后如需支持，改用 plutil -convert xml1 或 plist crate。
 #[cfg(target_os = "macos")]
-fn read_info_plist_exec(app: &Path) -> Option<String> {
+pub(crate) fn read_info_plist_value(app: &Path, key: &str) -> Option<String> {
     let plist = std::fs::read_to_string(app.join("Contents").join("Info.plist")).ok()?;
-    let key_pos = plist.find("<key>CFBundleExecutable</key>")?;
-    let rest = &plist[key_pos + "<key>CFBundleExecutable</key>".len()..];
+    let key_tag = format!("<key>{key}</key>");
+    let key_pos = plist.find(&key_tag)?;
+    let rest = &plist[key_pos + key_tag.len()..];
     let start = rest.find("<string>")? + "<string>".len();
     let end = rest[start..].find("</string>")? + start;
     let v = rest[start..end].trim();
@@ -194,7 +196,7 @@ fn read_info_plist_exec(app: &Path) -> Option<String> {
 
 /// bundle 探测：/Applications/<Name>.app、~/Applications/<Name>.app
 #[cfg(target_os = "macos")]
-fn locate_bundle_dir(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
+pub(crate) fn locate_bundle_dir(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let bases = [
         PathBuf::from("/Applications"),
@@ -211,7 +213,7 @@ fn locate_bundle_dir(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
 
 /// Spotlight 兜底：mdfind 查 .app，逐个经白名单防串台
 #[cfg(target_os = "macos")]
-fn mdfind_bundle(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
+pub(crate) fn mdfind_bundle(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
     // 逐应用目录查询（用户级 ~/Applications 与系统级 /Applications 同等常见）
     let mut roots = vec!["/Applications".to_string()];
     let home = std::env::var("HOME").unwrap_or_default();

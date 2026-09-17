@@ -367,18 +367,22 @@ fn is_running() -> bool {
 // ── F-01：安装位置自动识别 app_locate（跨应用通用，三级探测）────────────────
 // 探测顺序：用户手动指定（app_settings.json 持久化值）→ 注册表卸载键 → 默认路径候选
 // → 运行进程反查。方案依据 doubao-trae-switch-plan.md §1.3 / workbuddy-switch-plan.md §2.1。
+// F-75 P2-2：Windows 档案与四级链整体 cfg 门控；mac 走 bundle 定位链（app_locate_macos，
+// 设计 §4.2「app_locate 内 cfg 分派」——档案数据按应用×平台分离，非复用同一结构）。
 
 #[derive(Serialize)]
 pub struct AppLocate {
     /// 应用标识：trae_work | trae | doubao | workbuddy
     pub app: String,
+    /// 可执行文件路径（macOS 形态为 .app bundle 目录路径，供 LaunchServices `open` 启动）
     pub exe: Option<String>,
     pub user_data_dir: String,
     pub version: Option<String>,
-    /// settings | registry | default | process | not_found
+    /// settings | registry | default | process | not_found（mac 的 mdfind 命中归入 default）
     pub source: String,
 }
 
+#[cfg(not(target_os = "macos"))]
 struct AppProfile {
     display: &'static str,
     /// 注册表 DisplayName 匹配片段（按顺序尝试，大小写不敏感）
@@ -393,6 +397,7 @@ struct AppProfile {
     settings_key: Option<&'static str>,
 }
 
+#[cfg(not(target_os = "macos"))]
 fn app_profile(target_app: Option<&str>) -> AppProfile {
     let key = target_app.unwrap_or("trae_work").to_lowercase();
     let appdata = std::env::var("APPDATA").unwrap_or_default();
@@ -474,15 +479,36 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
 pub fn open_doubao_app(state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
     let loc = app_locate_inner(&state, "doubao");
     let exe = loc.exe.ok_or("未检测到豆包安装，请在豆包「环境配置」中指定 Doubao.exe 路径")?;
+    launch_doubao(&state, &exe, proxy_port)
+}
+
+/// 豆包启动平台分派（F-75 P2-2：mac 走 LaunchServices `open` 直启 .app）
+#[cfg(target_os = "macos")]
+fn launch_doubao(state: &State<AppState>, exe: &str, proxy_port: Option<u16>) -> Result<(), String> {
+    // mac 首版：`open` 直启不传启动参数，--proxy-server 注入暂不支持——豆包
+    // Chromium 内核遵循系统代理，MITM 经系统代理路径仍可捕获（豆包 mac 域
+    // 布局与启动形态待 M-1 侦察确认后再评估注入支持）。系统代理残留清理与
+    // 三级关闭同属 Windows 注入链，此处一并跳过。
+    let _ = (state, proxy_port);
+    crate::platform::cmd::sys_command("open")
+        .arg(exe)
+        .spawn()
+        .map_err(|e| format!("启动豆包失败: {e}"))?;
+    Ok(())
+}
+
+/// 豆包启动平台分派（Windows：原注入链行为零变化）
+#[cfg(not(target_os = "macos"))]
+fn launch_doubao(state: &State<AppState>, exe: &str, proxy_port: Option<u16>) -> Result<(), String> {
     // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理
     if proxy_port.is_none() {
-        crate::commands::proxy::cleanup_stale_local_proxy(&state);
+        crate::commands::proxy::cleanup_stale_local_proxy(state);
     }
     // Chromium 单实例：已运行的窗口会忽略新启动参数，注入代理前先关闭现有进程确保生效
     if proxy_port.is_some() {
         crate::commands::process::graceful_kill_app("Doubao")?;
     }
-    let mut cmd = Command::new(&exe);
+    let mut cmd = Command::new(exe);
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
@@ -512,7 +538,23 @@ fn open_buddy_app(state: &State<AppState>, app: &str, display: &str) -> Result<(
     let exe = loc
         .exe
         .ok_or_else(|| format!("未检测到 {display} 客户端，请先安装或手动指定路径"))?;
-    Command::new(&exe)
+    launch_buddy(exe, display)
+}
+
+/// Buddy 启动平台分派（F-75 P2-2：mac 走 LaunchServices `open` 直启 .app）
+#[cfg(target_os = "macos")]
+fn launch_buddy(exe: String, display: &str) -> Result<(), String> {
+    crate::platform::cmd::sys_command("open")
+        .arg(exe)
+        .spawn()
+        .map_err(|e| format!("启动 {display} 失败: {e}"))?;
+    Ok(())
+}
+
+/// Buddy 启动平台分派（Windows：分离启动，行为零变化）
+#[cfg(not(target_os = "macos"))]
+fn launch_buddy(exe: String, display: &str) -> Result<(), String> {
+    Command::new(exe)
         .spawn()
         .map_err(|e| format!("启动 {display} 失败: {e}"))?;
     Ok(())
@@ -579,8 +621,164 @@ fn is_running_codebuddy() -> bool {
     }
 }
 
-/// app_locate 的内部版本（供 open_* 命令与 workbuddy 模块复用；无需 Option 包装）
+/// app_locate 的内部版本（供 open_* 命令与 workbuddy 模块复用；无需 Option 包装）。
+/// F-75 P2-2 平台分派：mac 走 bundle 定位链，Windows 走四级探测链（两链互斥编译）。
 pub(crate) fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate {
+    #[cfg(target_os = "macos")]
+    {
+        return app_locate_macos(state, app);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        return app_locate_windows(state, app);
+    }
+}
+
+/// macOS bundle 定位链（F-75 P2-2，设计 §4.2「app_locate 内 cfg 分派」）：
+/// settings（.app 目录形态）→ bundle 探测（/Applications、~/Applications）→
+/// Spotlight mdfind 兜底 → 运行中进程回退（sysinfo exe → bundle 根归一）。
+/// bundle 候选名（显示名 + 主进程名）与 CFBundleExecutable 白名单沿用 Windows
+/// 档案的 proc_names（设计 §M2：主进程名 mac 同构）；各应用 mac bundle 名与
+/// CFBundleExecutable 实测确认属 M-1 侦察，不符时最坏结果为 not_found（白名单
+/// 防串台），不会误启动。user_data_dir 采用设计 §4.3 mac 预填假设（M-1 待确认）。
+#[cfg(target_os = "macos")]
+fn app_locate_macos(state: &State<AppState>, app: &str) -> AppLocate {
+    use crate::switcher::locate::{
+        bundle_exe_matches, is_bundle_dir, locate_bundle_dir, mdfind_bundle,
+        read_info_plist_value,
+    };
+
+    let key = app.to_lowercase();
+    let home = std::env::var("HOME").unwrap_or_default();
+    // (显示名, 主进程名/CFBundleExecutable 白名单, mac 数据目录预填假设, settings 键)
+    let (display, proc_names, user_data_dir, settings_key): (
+        &str,
+        &[&str],
+        String,
+        Option<&str>,
+    ) = match key.as_str() {
+        "trae" | "trae_cn" | "traecn" | "ide" => (
+            "Trae",
+            &["Trae CN"],
+            format!("{home}/Library/Application Support/Trae CN"),
+            Some("trae_cn_path"),
+        ),
+        "doubao" => (
+            "豆包",
+            &["Doubao"],
+            format!("{home}/Library/Application Support/Doubao"),
+            Some("doubao_path"),
+        ),
+        "workbuddy" => (
+            "WorkBuddy",
+            &["WorkBuddy"],
+            format!("{home}/.workbuddy"),
+            Some("workbuddy_path"),
+        ),
+        "codebuddy" => (
+            "CodeBuddy",
+            &["CodeBuddy", "CodeBuddy CN"],
+            format!("{home}/.codebuddy"),
+            Some("codebuddy_path"),
+        ),
+        // trae_work / traework / work / solo 及其它值 → 默认 Trae Work
+        _ => (
+            "Trae Work",
+            &["TRAE SOLO CN", "TRAE SOLO", "Trae"],
+            format!("{home}/Library/Application Support/TRAE SOLO CN"),
+            Some("trae_path"),
+        ),
+    };
+
+    // 1) 用户手动指定（settings）：mac 形态为 .app 目录（非文件），is_file 校验不适用
+    if let Some(sk) = settings_key {
+        let settings = state.settings();
+        let custom = match sk {
+            "trae_path" => settings.trae_path,
+            "trae_cn_path" => settings.trae_cn_path,
+            "doubao_path" => settings.doubao_path,
+            "workbuddy_path" => settings.workbuddy_path,
+            "codebuddy_path" => settings.codebuddy_path,
+            _ => None,
+        };
+        if let Some(p) = custom {
+            let p = p.trim().to_string();
+            if !p.is_empty() {
+                let pb = std::path::PathBuf::from(&p);
+                if is_bundle_dir(&pb) {
+                    return finish_locate_macos(display, &user_data_dir, pb, "settings");
+                }
+            }
+        }
+    }
+
+    // 2) bundle 探测（显示名 + 主进程名作目录名候选，白名单防串台）
+    let mut names: Vec<&str> = vec![display];
+    for n in proc_names {
+        if !names.contains(n) {
+            names.push(n);
+        }
+    }
+    for name in &names {
+        if let Some(found) = locate_bundle_dir(name, proc_names) {
+            return finish_locate_macos(display, &user_data_dir, found, "default");
+        }
+    }
+    // 3) Spotlight 兜底（mdfind 秒回；仅上面未命中时）
+    for name in &names {
+        if let Some(found) = mdfind_bundle(name, proc_names) {
+            return finish_locate_macos(display, &user_data_dir, found, "default");
+        }
+    }
+
+    // 4) 运行中进程回退：sysinfo exe 路径归一回 .app 根（exe → MacOS → Contents
+    //    → <App>.app，ancestors().nth(3)）后经白名单防串台
+    for p in crate::commands::process::mac_exe_paths() {
+        if let Some(app_dir) = p.ancestors().nth(3) {
+            if is_bundle_dir(app_dir) && bundle_exe_matches(app_dir, proc_names) {
+                return finish_locate_macos(
+                    display,
+                    &user_data_dir,
+                    app_dir.to_path_buf(),
+                    "process",
+                );
+            }
+        }
+    }
+
+    AppLocate {
+        // not_found 时沿用原始参数（与 Windows 链 not_found 分支同语义，前端按此分派）
+        app: app.to_string(),
+        exe: None,
+        user_data_dir,
+        version: None,
+        source: "not_found".into(),
+    }
+}
+
+/// mac 命中后统一补版本号（Info.plist CFBundleShortVersionString）并组装结果。
+/// 不做 Windows 版的豆包 `_win` 后缀加工（mac 版本形态待 M-1 侦察）。
+#[cfg(target_os = "macos")]
+fn finish_locate_macos(
+    display: &str,
+    user_data_dir: &str,
+    app: std::path::PathBuf,
+    source: &str,
+) -> AppLocate {
+    use crate::switcher::locate::read_info_plist_value;
+    let version = read_info_plist_value(&app, "CFBundleShortVersionString");
+    AppLocate {
+        app: display.to_lowercase().replace(' ', "_"),
+        exe: Some(app.to_string_lossy().to_string()),
+        user_data_dir: user_data_dir.to_string(),
+        version,
+        source: source.into(),
+    }
+}
+
+/// Windows 四级探测链（原 app_locate_inner 主体，F-75 P2-2 起平台分派；行为零变化）
+#[cfg(not(target_os = "macos"))]
+fn app_locate_windows(state: &State<AppState>, app: &str) -> AppLocate {
     let profile = app_profile(Some(app));
 
     if let Some(sk) = profile.settings_key {
@@ -631,6 +829,7 @@ pub fn app_locate(state: State<AppState>, target_app: Option<String>) -> AppLoca
 }
 
 /// 命中后统一补齐版本号并组装结果
+#[cfg(not(target_os = "macos"))]
 fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Option<String>) -> AppLocate {
     let mut version = version.or_else(|| version_of(&exe));
     // 豆包客户端版本号官方形态带平台后缀（与安装包命名一致，如 2.28.13_win）
@@ -651,6 +850,7 @@ fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Optio
 }
 
 /// 注册表卸载键搜索（按应用档案的 DisplayName 片段与 exe 名参数化）
+#[cfg(not(target_os = "macos"))]
 fn registry_app_path(profile: &AppProfile) -> Option<String> {
     for pattern in profile.reg_patterns {
         for root in ["HKCU", "HKLM"] {
@@ -736,6 +936,7 @@ fn resolve_reg_profile_candidate(
 }
 
 /// 运行进程反查 exe 路径（Get-Process 取 Path，应用运行中时最准）
+#[cfg(not(target_os = "macos"))]
 fn process_exe_path(proc_names: &[&str]) -> Option<String> {
     let names = proc_names
         .iter()

@@ -74,6 +74,17 @@ fn mac_snapshot() -> sysinfo::System {
     sys
 }
 
+/// macOS：全部进程的可执行文件路径（F-75 P2-2 app_locate mac 分派的进程回退级；
+/// 调用方自行做 bundle 根归一与白名单防串台，见 commands/env.rs）
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_exe_paths() -> Vec<std::path::PathBuf> {
+    mac_snapshot()
+        .processes()
+        .values()
+        .filter_map(|p| p.exe().map(|e| e.to_path_buf()))
+        .collect()
+}
+
 /// macOS 白名单进程匹配（剥离 .exe 后缀精确比对）
 #[cfg(target_os = "macos")]
 fn mac_name_matches(images: &[&str], name: &str) -> bool {
