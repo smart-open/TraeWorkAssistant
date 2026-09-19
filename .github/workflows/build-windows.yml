@@ -3,7 +3,7 @@ name: Build Windows EXE
 on:
   push:
     branches:
-      - feat/export-accounts-json
+      - main
   workflow_dispatch:
 
 jobs:

@@ -1,14 +1,35 @@
-# F-75 M3-3.4：macOS DMG 构建流水线（双架构矩阵：Apple Silicon + Intel）。
+# F-75 M3-3.4：macOS DMG 构建流水线（三产物矩阵：aarch64 / x64 / universal）。
 # M3 阶段启用（feature/macos 分支触发）；合入主干后按需对齐 build-windows 触发策略。
 # 无 Developer ID：Tauri 未配置 signingIdentity 时默认 ad-hoc（tauri.macos.conf.json 显式 "-"），
 # 产物带 quarantine 属性，Gatekeeper 拦截的放行引导见 README / AboutDialog / Release 正文模板。
 #
-# 双架构策略（审查后裁定）：矩阵分别产出 aarch64 / x64 原生 dmg；
+# 自签证书签名（可选，仅签名无公证——公证强制要求付费 Developer ID 证书，自签不可行）：
+#   1) 本机（Windows Git Bash 自带 openssl）生成自签代码签名证书并导出 p12：
+#        openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
+#          -subj "/CN=AI Work Assistant Self-Signed" \
+#          -addext "basicConstraints=critical,CA:FALSE" \
+#          -addext "keyUsage=digitalSignature" \
+#          -addext "extendedKeyUsage=codeSigning" \
+#          -keyout key.pem -out cert.pem
+#        openssl pkcs12 -export -inkey key.pem -in cert.pem \
+#          -out aiwork-selfsigned.p12 -password pass:<p12密码> \
+#          -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1
+#        （3DES+SHA1 为 macOS security import 兼容组合；openssl 3 默认 AES-256/PBKDF2 会报
+#         「MAC verification failed」，自签场景安全性无实际差异）
+#   2) 仓库 Settings → Secrets and variables → Actions 配置两项：
+#        MACOS_SELF_SIGNED_P12          = p12 文件的 base64（base64 -w0 aiwork-selfsigned.p12）
+#        MACOS_SELF_SIGNED_P12_PASSWORD = 上一步的 <p12密码>
+#   3) secrets 未配置时自动回退 ad-hoc（signingIdentity "-"），流水线行为同前。
+#   效果边界：跨版本稳定的签名身份；Gatekeeper 行为与 ad-hoc 相同（用户首开仍需放行引导）。
+#
+# 产物策略（策略 A + universal 兜底）：
+#   aarch64   → macos-15（Apple Silicon 原生）打 aarch64 dmg
+#   x64       → macos-15-intel（Intel 原生）打 x64 dmg（macos-13 已弃用，Intel 包必须用它）
+#   universal → macos-15 上双 target 交叉 + lipo 合并，单 dmg 覆盖双架构（体积约翻倍）
+#   显式 --target <triple> 锁定产物架构；rename 脚本按 TAURI_TARGET 判定本任务必需产物。
+# 兜底动机：GitHub 托管 macOS runner 2027-08 起不再提供 x86_64（macos-15-intel 退役），
+# 届时下线 x64 任务、保留 aarch64 + universal 即可（后期再调整）。
 # updater 按运行时 ARCH 精确匹配资产（_aarch64.dmg / _x64.dmg，_universal.dmg 兜底）。
-# 如需单产物覆盖双架构，可改用 universal 构建：
-#   rustup target add aarch64-apple-darwin x86_64-apple-darwin
-#   npm run tauri build -- --target universal-apple-darwin --bundles dmg
-# （体积约翻倍；rename_release.mjs 已收录 _universal.dmg 命名，updater 侧兼容）
 
 name: Build macOS DMG
 
@@ -24,9 +45,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-14, target: aarch64-apple-darwin, arch: aarch64 } # Apple Silicon
-          - { runner: macos-13, target: x86_64-apple-darwin, arch: x64 } # Intel
+          - { runner: macos-15, target: aarch64-apple-darwin, rust_targets: aarch64-apple-darwin, arch: aarch64 } # Apple Silicon
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, rust_targets: x86_64-apple-darwin, arch: x64 } # Intel（macos-13 已弃用）
+          - { runner: macos-15, target: universal-apple-darwin, rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin', arch: universal } # universal 兜底（双 target + lipo）
     runs-on: ${{ matrix.runner }}
+    # 自签证书 secrets（可选，job 级注入以供步骤 if 判定；未配置时回退 ad-hoc）
+    env:
+      MACOS_SELF_SIGNED_P12: ${{ secrets.MACOS_SELF_SIGNED_P12 }}
+      MACOS_SELF_SIGNED_P12_PASSWORD: ${{ secrets.MACOS_SELF_SIGNED_P12_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -34,7 +60,7 @@ jobs:
         with: { node-version: 20, cache: npm }
 
       - uses: dtolnay/rust-toolchain@stable
-        with: { targets: ${{ matrix.target }} }
+        with: { targets: ${{ matrix.rust_targets }} }
 
       - uses: actions/cache@v4
         with:
@@ -49,16 +75,46 @@ jobs:
       - name: Run Rust tests（零警告红线 + 全量测试）
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: Build Tauri app (dmg only)
-        run: npm run tauri build -- --bundles dmg
+      # ---------- 自签证书签名（可选）----------
+      - name: Import self-signed signing certificate（secrets 未配置时跳过）
+        if: env.MACOS_SELF_SIGNED_P12 != ''
+        run: |
+          echo "$MACOS_SELF_SIGNED_P12" | base64 --decode > cert.p12
+          security create-keychain -p ci-keychain-pwd build.keychain
+          security default-keychain -s build.keychain
+          security list-keychain -d user -s build.keychain
+          security unlock-keychain -p ci-keychain-pwd build.keychain
+          security import cert.p12 -k build.keychain -P "$MACOS_SELF_SIGNED_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci-keychain-pwd build.keychain
+          IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep '"' | head -n 1 | awk '{print $2}')
+          if [ -z "$IDENTITY" ]; then
+            echo "WARN: keychain 中未找到有效 codesigning 身份，回退 ad-hoc"
+            echo "SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+          else
+            echo "SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          fi
+          rm cert.p12
 
-      - name: Rename & manifest（本机架构 dmg 缺失即失败，其余产物仅 WARN）
+      - name: Fallback to ad-hoc signing identity（未配置 secrets）
+        if: env.MACOS_SELF_SIGNED_P12 == ''
+        run: echo "SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+
+      - name: Write signing override config（--config 深度合并覆盖 signingIdentity）
+        run: |
+          node -e "const fs=require('fs');fs.writeFileSync('tauri.signing.conf.json',JSON.stringify({bundle:{macOS:{signingIdentity:process.env.SIGNING_IDENTITY}}},null,2))"
+
+      - name: Build Tauri app (dmg only)
+        run: npm run tauri build -- --target ${{ matrix.target }} --bundles dmg --config tauri.signing.conf.json
+
+      - name: Rename & manifest（本任务架构 dmg 缺失即失败，其余产物仅 WARN）
         run: node scripts/rename_release.mjs
+        env:
+          TAURI_TARGET: ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: ai-work-assistant-macos-${{ matrix.arch }}
           path: |
-            src-tauri/target/release/bundle/dmg/*.dmg
+            release/*.dmg
             release/latest.json
           if-no-files-found: error

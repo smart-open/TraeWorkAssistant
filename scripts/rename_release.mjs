@@ -10,10 +10,13 @@
  *       → release/AI Work 助手_<ver>_x64_zh-CN.msi
  *   src-tauri/target/release/bundle/dmg/AI Work 助手_<ver>_aarch64.dmg
  *       → release/AI Work 助手_<ver>_aarch64.dmg（F-75 M3-3.4）
+ *   CI 显式 --target <triple> 构建落 target/<triple>/release/，dmg 扫描同样兼容（策略 A）。
  *   portable zip 由 package_portable.mjs 直接生成同名（无需重命名）。
  *
- * 产物完备性按执行平台判定（F-75 §6.7）：Windows 上 dmg 缺失仅 WARN，
- * macOS 上 dmg 缺失即 die（反之 exe/msi 在 mac 上缺失仅 WARN）。
+ * 产物完备性判定：Windows 上 exe/msi 缺失即 die（dmg 仅 WARN）；
+ * macOS 上按 TAURI_TARGET 判定必需 dmg（universal-apple-darwin → _universal.dmg /
+ * x86_64-apple-darwin → _x64.dmg / aarch64 或未设 → 按本机架构），缺失即 die
+ * （反之 exe/msi 在 mac 上缺失仅 WARN）。
  */
 import { createHash } from 'node:crypto';
 import {
@@ -54,40 +57,55 @@ const product = conf.productName;
 const outDir = resolve(ROOT, 'release');
 mkdirSync(outDir, { recursive: true });
 
+// dmg 产物源目录候选：本地原生构建落 target/release/；CI 显式 --target <triple> 落
+// target/<triple>/release/（build-macos.yml 策略 A：arm64 runner 打 aarch64 / Intel runner 打 x64）
+const dmgSrcDirs = [
+  resolve(SRC_TAURI, 'target/release/bundle/dmg'),
+  resolve(SRC_TAURI, 'target/aarch64-apple-darwin/release/bundle/dmg'),
+  resolve(SRC_TAURI, 'target/x86_64-apple-darwin/release/bundle/dmg'),
+];
+
+// 每个 job 的源为候选路径数组：取第一个存在者（单一固定路径时数组长度为 1）
 const jobs = [
   [
-    resolve(SRC_TAURI, 'target/release/bundle/nsis', `${product}_${version}_x64-setup.exe`),
+    [resolve(SRC_TAURI, 'target/release/bundle/nsis', `${product}_${version}_x64-setup.exe`)],
     resolve(outDir, `${product}_${version}_x64-setup.exe`),
   ],
   [
-    resolve(SRC_TAURI, 'target/release/bundle/msi', `${product}_${version}_x64_zh-CN.msi`),
+    [resolve(SRC_TAURI, 'target/release/bundle/msi', `${product}_${version}_x64_zh-CN.msi`)],
     resolve(outDir, `${product}_${version}_x64_zh-CN.msi`),
   ],
   // F-75 审查：mac 双架构 dmg（aarch64 = Apple Silicon / x64 = Intel；universal 为可选形态，
   // rustup target add x86_64-apple-darwin + tauri build --target universal-apple-darwin 产出）
   [
-    resolve(SRC_TAURI, 'target/release/bundle/dmg', `${product}_${version}_aarch64.dmg`),
+    dmgSrcDirs.map((d) => join(d, `${product}_${version}_aarch64.dmg`)),
     resolve(outDir, `${product}_${version}_aarch64.dmg`),
   ],
   [
-    resolve(SRC_TAURI, 'target/release/bundle/dmg', `${product}_${version}_x64.dmg`),
+    dmgSrcDirs.map((d) => join(d, `${product}_${version}_x64.dmg`)),
     resolve(outDir, `${product}_${version}_x64.dmg`),
   ],
   // F-75 审查：universal 可选形态——--target universal-apple-darwin 的 bundle 落
   // target/universal-apple-darwin/（非 target/release/）；updater 以 _universal.dmg 兜底
   [
-    resolve(SRC_TAURI, 'target/universal-apple-darwin/release/bundle/dmg', `${product}_${version}_universal.dmg`),
+    [resolve(SRC_TAURI, 'target/universal-apple-darwin/release/bundle/dmg', `${product}_${version}_universal.dmg`)],
     resolve(outDir, `${product}_${version}_universal.dmg`),
   ],
 ];
 
-// 本机平台对应的必需产物（缺失即 die）：mac 按架构 → 对应 dmg；Windows → exe/msi。
+// 本机平台对应的必需产物（缺失即 die）：mac 按 TAURI_TARGET（CI 矩阵显式传入）→ 对应 dmg，
+// 未设 env 的本地构建回退本机架构推断；Windows → exe/msi。
 // 其余平台产物缺失仅 WARN（双平台构建机分别跑本脚本后人工汇总到 release/）
 const isMac = process.platform === 'darwin';
+const requiredMacDmg = () => {
+  const t = process.env.TAURI_TARGET || '';
+  if (t === 'universal-apple-darwin') return 'universal';
+  if (t === 'x86_64-apple-darwin') return 'x64';
+  if (t === 'aarch64-apple-darwin') return 'aarch64';
+  return process.arch === 'x64' ? 'x64' : 'aarch64';
+};
 const REQUIRED_ON_THIS_HOST = isMac
-  ? [process.arch === 'arm64'
-      ? `${product}_${version}_aarch64.dmg`
-      : `${product}_${version}_x64.dmg`]
+  ? [`${product}_${version}_${requiredMacDmg()}.dmg`]
   : [
       `${product}_${version}_x64-setup.exe`,
       `${product}_${version}_x64_zh-CN.msi`,
@@ -95,22 +113,23 @@ const REQUIRED_ON_THIS_HOST = isMac
 
 let moved = 0;
 const missing = [];
-for (const [src, dst] of jobs) {
-  if (existsSync(src)) {
+for (const [srcCandidates, dst] of jobs) {
+  const src = srcCandidates.find((p) => existsSync(p));
+  if (src) {
     copyFileSync(src, dst);
     console.log('OK:', dst);
     moved++;
   } else {
-    console.error('SKIP（不存在）:', src);
-    missing.push(src);
+    console.error('SKIP（不存在）:', srcCandidates[0]);
+    missing.push(srcCandidates[0]);
   }
 }
 if (moved === 0) die('未找到任何安装包产物，请先执行 npm run tauri build');
 
 // 生成发布校验清单 latest.json：版本号 + 各资产 SHA-256。
 // 更新器（updater.rs）下载安装包后与清单比对，不匹配即拒绝安装（更新包完整性校验）。
-// F-75：清单收录双架构 dmg 哈希（mac updater fail-closed 消费）；老版本 Windows updater
-// 只找 exe/msi 键，多出的 dmg 键无害。
+// F-75：清单收录双架构 + universal dmg 哈希（mac updater fail-closed 消费，universal 为
+// Intel runner 退役后的兜底资产）；老版本 Windows updater 只找 exe/msi 键，多出的 dmg 键无害。
 // 审查修复 #5（跨平台清单合并）：若 release/ 已存在 previous latest.json（另一平台的
 // 构建先产出），以其 assets 为基底合并——保证最终上传的清单同时含 exe/msi/dmg 键，
 // 否则单平台清单随 Release 上传会让另一平台更新器 fail-closed 阻断。
@@ -134,6 +153,7 @@ for (const name of [
   `${product}_${version}_x64_zh-CN.msi`,
   `${product}_${version}_aarch64.dmg`,
   `${product}_${version}_x64.dmg`,
+  `${product}_${version}_universal.dmg`,
   `${product}_${version}_x64_portable.zip`,
 ]) {
   const p = join(outDir, name);
