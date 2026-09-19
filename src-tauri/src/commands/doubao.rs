@@ -440,9 +440,12 @@ fn analyze_login_sessions(user_data: &std::path::Path) -> LoginSessionAnalysis {
 }
 
 /// 豆包客户端 User Data 目录（Live 态，登录 Cookie/uid 检测用）。
+/// 基根：Windows=%LOCALAPPDATA%，mac=Application Support（豆包桌面端 Chromium 布局）
 fn doubao_live_user_data_dir() -> Option<PathBuf> {
-    let localappdata = std::env::var("LOCALAPPDATA").ok()?;
-    let dir = PathBuf::from(localappdata).join("Doubao").join("User Data");
+    let dir = crate::platform::local_data_root()
+        .ok()?
+        .join("Doubao")
+        .join("User Data");
     dir.exists().then_some(dir)
 }
 
@@ -588,9 +591,9 @@ fn read_captured_uid(state: &State<AppState>) -> Option<String> {
 /// 来源①：从 User Data/Local State 的 profile.info_cache 取最近活跃 Profile 的 saman.user_id。
 /// 文件缺失/无 saman 块/解析失败返回 Ok(None)。
 fn detect_uid_from_local_state() -> Result<Option<String>, String> {
-    let localappdata =
-        std::env::var("LOCALAPPDATA").map_err(|e| format!("读取 LOCALAPPDATA 环境变量失败: {e}"))?;
-    let path = PathBuf::from(localappdata)
+    let base = crate::platform::local_data_root()
+        .map_err(|e| format!("读取应用数据根目录失败: {e}"))?;
+    let path = base
         .join("Doubao")
         .join("User Data")
         .join("Local State");
@@ -665,8 +668,9 @@ fn pick_uid_from_info_cache(v: &serde_json::Value) -> Option<String> {
 
 /// 从 public_config.json 全树递归收集 uid 候选并择优。文件缺失/解析失败返回 Ok(None)。
 fn detect_uid_from_public_config() -> Result<Option<String>, String> {
-    let appdata = std::env::var("APPDATA").map_err(|e| format!("读取 APPDATA 环境变量失败: {e}"))?;
-    let path = PathBuf::from(appdata).join("Doubao").join("public_config.json");
+    let base = crate::platform::app_support_root()
+        .map_err(|e| format!("读取应用数据根目录失败: {e}"))?;
+    let path = base.join("Doubao").join("public_config.json");
     if !path.exists() {
         return Ok(None);
     }
@@ -1544,10 +1548,12 @@ pub fn doubao_snapshot_meta(state: State<AppState>, user_id: String) -> Result<O
 // 独立备份 = 把这些本地状态复制到 data/doubao_chats/<uid>/，与快照解耦：
 // 重装/换机后先恢复对话数据再登录，客户端体验立即可用；配合云端同步，对话不丢。
 
-/// 豆包 User Data 目录（与 env.rs 安装探测一致的默认位置）
+/// 豆包 User Data 目录（与 env.rs 安装探测一致的默认位置；
+/// 基根 Windows=%LOCALAPPDATA%，mac=Application Support）
 fn doubao_user_data_dir() -> PathBuf {
-    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    PathBuf::from(local).join("Doubao").join("User Data")
+    crate::platform::local_data_root_lossy()
+        .join("Doubao")
+        .join("User Data")
 }
 
 /// 对话数据备份根目录：data/doubao_chats/<uid>/

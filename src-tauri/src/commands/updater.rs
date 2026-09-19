@@ -701,18 +701,45 @@ pub fn update_run_installer(
     }
 }
 
-/// macOS 更新安装完成后的一键重启（AboutDialog「重启应用」按钮触发）：
-/// 当前进程退出前 spawn `open -a` 拉起新版（/Applications 中的 .app 已被用户
-/// 覆盖为新版）；顺序关键——`open` 是 LaunchServices 异步拉起，旧进程退出不影响
-/// 新进程启动。若用户尚未完成拖拽，`open -a` 拉起的仍是旧版（无害，前端文案覆盖）。
+/// macOS 更新安装完成后的一键重启（AboutDialog「重启应用」按钮触发）。
+/// bundle 根从 current_exe 反推（<App>.app/Contents/MacOS/<exe> → nth(3)），
+/// 不经应用名字符串查找——与 tauri.conf.json productName / 前端 APP_NAME 零耦合，改名不失效。
+/// 两道防御：① 磁盘 bundle 版本与运行版本一致 → 用户尚未完成 dmg 拖拽覆盖，
+/// 此时 `open` 只会激活现有实例、随后本进程 exit 造成「重启=应用退出」，故拒绝执行；
+/// ② `open` 退出码非零时不退出并回报错误（不再静默失效）。
+/// （LS 对已替换 bundle 的激活时序竞争待 M-1 真机验证一并确认）
 #[tauri::command]
 pub fn update_restart_app(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        crate::platform::cmd::sys_command("open")
-            .args(["-a", "AI Work 助手"])
-            .spawn()
-            .map_err(|e| format!("重启应用失败: {e}"))?;
+        use crate::switcher::locate::read_info_plist_value;
+        // 当前进程即从该 bundle 运行，Info.plist 必在；异常形态（非 .app 布局）直接报错
+        let bundle = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.ancestors().nth(3).map(|a| a.to_path_buf()))
+            .filter(|b| b.extension().map(|x| x == "app").unwrap_or(false))
+            .ok_or_else(|| "无法定位当前应用 bundle，请手动从启动台重新打开".to_string())?;
+        // 防御 ①：update_run_installer 已校验新包版本 > 当前版本，磁盘版本仍等于
+        // 运行版本即说明 /Applications 中的 .app 尚未被新版覆盖
+        if let Some(v) = read_info_plist_value(&bundle, "CFBundleShortVersionString") {
+            if v == env!("CARGO_PKG_VERSION") {
+                return Err(
+                    "尚未检测到新版本完成安装：请先在 dmg 窗口将应用拖入「Applications」替换旧版，再点击重启"
+                        .to_string(),
+                );
+            }
+        }
+        // `open <bundle>` 经 LaunchServices 拉起（异步提交激活请求）；status() 取退出码
+        let status = crate::platform::cmd::sys_command("open")
+            .arg(&bundle)
+            .status()
+            .map_err(|e| format!("拉起新版应用失败: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "拉起新版应用失败（open 退出码 {:?}），请手动从启动台打开新版",
+                status.code()
+            ));
+        }
         let _ = app.emit("update-restarting", ());
         std::thread::sleep(Duration::from_millis(800));
         std::process::exit(0);

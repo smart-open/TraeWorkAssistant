@@ -50,7 +50,10 @@ function fmtSize(bytes: number): string {
 export default function AboutDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   // F-75 M3-3.3：更新安装引导按平台分派（win NSIS 自动重启 / mac dmg 人工拖拽 + Gatekeeper 放行）
   const platform = useAppStore((s) => s.platform);
-  const isMac = platform === 'macos';
+  // 审查修复（P3-2）：store.platform 默认 'windows'，platform_info 拉取失败时 mac 用户
+  // 会误见 Windows 文案——用 update_check 下发的 platform 字段兜底（后端为准）
+  const [checkPlatform, setCheckPlatform] = useState<'windows' | 'macos' | null>(null);
+  const isMac = (checkPlatform ?? platform) === 'macos';
   const [upd, setUpd] = useState<UpdateState>({ k: 'idle' });
   // 版本号运行时读取（Tauri getVersion() ← Cargo.toml 单一来源），不再前端硬编码
   const [appVersion, setAppVersion] = useState('');
@@ -133,6 +136,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
     setUpd({ k: 'checking' });
     try {
       const r = await api.updater.check();
+      setCheckPlatform(r.platform ?? null);
       if (r.has_update) {
         // 有新版本：停在「确认一」，由用户决定是否下载
         setUpd({ k: 'available', info: r });

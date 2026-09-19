@@ -10,7 +10,7 @@
 //!（绕过 apiKeyHelper 的 Git Bash/Node 路径兼容坑）；凭证红线：token 不进日志/错误消息。
 
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// CLI settings.json 中的认证环境变量键
 pub const AUTH_ENV_KEY: &str = "CODEBUDDY_AUTH_TOKEN";
@@ -176,11 +176,11 @@ pub fn with_env_token(value: &mut Value, token: &str) -> Result<(), String> {
 /// CLI 最近会话活动时间：递归扫 `~/.codebuddy/projects/**/*.jsonl`（含子目录），
 /// 取最新 mtime（Unix 毫秒）；无会话文件返回 None。
 pub fn cli_recent_activity() -> Option<i64> {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    if home.is_empty() {
+    let home = crate::platform::home_dir();
+    if home.as_os_str().is_empty() {
         return None;
     }
-    cli_recent_activity_at(&PathBuf::from(home).join(".codebuddy").join("projects"))
+    cli_recent_activity_at(&home.join(".codebuddy").join("projects"))
 }
 
 /// 指定目录版本（测试与扫描复用）。

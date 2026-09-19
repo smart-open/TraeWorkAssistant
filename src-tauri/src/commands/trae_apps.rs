@@ -27,18 +27,23 @@ use tauri::State;
 use crate::fs_utils;
 use crate::state::AppState;
 
-const STORAGE_SUFFIX: &str = r"User\globalStorage\storage.json";
-const VSCDB_SUFFIX: &str = r"User\globalStorage\state.vscdb";
+/// User/globalStorage 相对路径（组件化 join 跨平台；勿用 `\` 硬编码——mac 上会
+/// 拼成单文件名组件导致永远找不到文件）
+fn storage_json_rel() -> std::path::PathBuf {
+    ["User", "globalStorage"].iter().collect::<std::path::PathBuf>().join("storage.json")
+}
 
-/// 单个应用的数据目录候选（按优先级）
+fn state_vscdb_rel() -> std::path::PathBuf {
+    ["User", "globalStorage"].iter().collect::<std::path::PathBuf>().join("state.vscdb")
+}
+
+/// 单个应用的数据目录候选（按优先级）。
+/// 基根：Windows=%APPDATA%，mac=~/Library/Application Support
 fn app_data_dirs(app_kind: &str) -> Vec<std::path::PathBuf> {
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let base = crate::platform::app_support_root_lossy();
     match app_kind {
-        "TraeWork" => vec![
-            std::path::PathBuf::from(&appdata).join("TRAE SOLO CN"),
-            std::path::PathBuf::from(&appdata).join("TRAE SOLO"),
-        ],
-        "Trae" => vec![std::path::PathBuf::from(&appdata).join("Trae CN")],
+        "TraeWork" => vec![base.join("TRAE SOLO CN"), base.join("TRAE SOLO")],
+        "Trae" => vec![base.join("Trae CN")],
         _ => vec![],
     }
 }
@@ -54,7 +59,7 @@ fn app_label(app_kind: &str) -> &str {
 /// 读取应用的 storage.json（多个候选目录取第一个存在的）
 fn read_storage_json(app_kind: &str) -> Option<serde_json::Value> {
     for dir in app_data_dirs(app_kind) {
-        let p = dir.join(STORAGE_SUFFIX);
+        let p = dir.join(storage_json_rel());
         if p.is_file() {
             if let Ok(s) = std::fs::read_to_string(&p) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
@@ -129,7 +134,7 @@ fn vscdb_uid_evidence(app_kind: &str) -> HashMap<String, UidEvidence> {
     let mut out: HashMap<String, UidEvidence> = HashMap::new();
     let Some(db_path) = app_data_dirs(app_kind)
         .into_iter()
-        .map(|d| d.join(VSCDB_SUFFIX))
+        .map(|d| d.join(state_vscdb_rel()))
         .find(|p| p.is_file())
     else {
         return out;
@@ -353,7 +358,7 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
         // 记录实际命中的 storage 路径用于展示
         let mut path_display = String::new();
         for dir in app_data_dirs(kind) {
-            let p = dir.join(STORAGE_SUFFIX);
+            let p = dir.join(storage_json_rel());
             if p.is_file() {
                 path_display = p.to_string_lossy().to_string();
                 break;
@@ -426,7 +431,7 @@ pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<S
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     for kind in ["TraeWork", "Trae"] {
         for dir in app_data_dirs(kind) {
-            candidates.push(dir.join(STORAGE_SUFFIX));
+            candidates.push(dir.join(storage_json_rel()));
         }
     }
     for prof in ["profiles", "profiles_trae"] {
@@ -435,7 +440,7 @@ pub fn backfill_dc_id_for(data_dir: &std::path::Path, user_id: &str) -> Option<S
                 .join("data")
                 .join(prof)
                 .join(uid)
-                .join(STORAGE_SUFFIX),
+                .join(storage_json_rel()),
         );
     }
     let mut found = None;

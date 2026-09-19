@@ -71,6 +71,40 @@ pub fn programs_root() -> Result<std::path::PathBuf, String> {
     }
 }
 
+// ---------------- lossy 变体 ----------------
+// 业务侧大量既有 `env::var(...).unwrap_or_default()` 风格调用点（F-75 审查收口），
+// 统一经此处取根：env 缺失返回空 PathBuf（Windows 行为与裸读 env 完全一致，
+// 含 env 缺失时空串语义），不再各自散落平台分支。
+
+/// 主目录（`~/.workbuddy`、`~/.codebuddy` 等跨平台 HOME 基根）：
+/// - Windows: `%USERPROFILE%`（缺失回退 `%HOME%`，再缺失为空 PathBuf）
+/// - macOS:   `$HOME`
+pub fn home_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+    }
+}
+
+/// [`app_support_root`] 的 lossy 变体：env 缺失返回空 PathBuf
+pub fn app_support_root_lossy() -> std::path::PathBuf {
+    app_support_root().unwrap_or_default()
+}
+
+/// [`local_data_root`] 的 lossy 变体：env 缺失返回空 PathBuf
+pub fn local_data_root_lossy() -> std::path::PathBuf {
+    local_data_root().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +136,28 @@ mod tests {
             .unwrap()
             .ends_with("Library/Application Support"));
         assert_eq!(programs_root().unwrap(), std::path::PathBuf::from("/Applications"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_lossy_helpers_match_env_on_windows() {
+        // Windows 形态锁定：lossy 输出与裸读 env 完全一致（红线）
+        assert_eq!(
+            home_dir(),
+            std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+        );
+        assert_eq!(
+            app_support_root_lossy(),
+            std::env::var("APPDATA").map(std::path::PathBuf::from).unwrap_or_default()
+        );
+        assert_eq!(
+            local_data_root_lossy(),
+            std::env::var("LOCALAPPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+        );
     }
 }

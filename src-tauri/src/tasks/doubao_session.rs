@@ -444,8 +444,10 @@ fn sync_cookie_state(state: &AppState, logs: &mut Vec<String>) -> Value {
         }
     };
 
-    let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    let ud = PathBuf::from(localappdata).join("Doubao").join("User Data");
+    // 基根：Windows=%LOCALAPPDATA%，mac=Application Support（豆包桌面端 Chromium 布局）
+    let ud = crate::platform::local_data_root_lossy()
+        .join("Doubao")
+        .join("User Data");
     if ud.exists() {
         diagnose("live", &ud, &mut sources, logs);
     }

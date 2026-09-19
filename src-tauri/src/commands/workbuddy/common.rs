@@ -12,8 +12,8 @@ use crate::state::AppState;
 // ── 路径常量（与 wb_common.py / trae-switch-bridge.ps1 保持一致）────────────
 
 pub(super) fn auth_file_path() -> PathBuf {
-    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    PathBuf::from(local)
+    // F-75 跨平台收口：Windows=%LOCALAPPDATA%，mac=~/Library/Application Support
+    crate::platform::local_data_root_lossy()
         .join("CodeBuddyExtension")
         .join("Data")
         .join("Public")
@@ -34,8 +34,8 @@ pub(super) fn auth_file_path_of(state: &AppState) -> PathBuf {
 }
 
 pub(super) fn wb_data_dir() -> PathBuf {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    PathBuf::from(home).join(".workbuddy")
+    // ~/.workbuddy 跨平台 HOME 基根（Windows=%USERPROFILE%，mac=$HOME）
+    crate::platform::home_dir().join(".workbuddy")
 }
 
 pub(super) fn snapshot_json_path() -> PathBuf {
@@ -349,8 +349,7 @@ pub(super) fn restore_cli_settings(previous: &str) {
 
 /// CodeBuddy CLI settings.json 路径（.codebuddy/settings.json）。
 pub(super) fn cli_settings_path() -> PathBuf {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    PathBuf::from(home).join(".codebuddy").join("settings.json")
+    crate::platform::home_dir().join(".codebuddy").join("settings.json")
 }
 
 // ── M8 会话三件套命令的 uid 防护（审查 P0-1）───────────────────────────────

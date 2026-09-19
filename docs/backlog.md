@@ -278,6 +278,19 @@
 - **参考开源项目**：`tauri-apps/tauri`（v2 多平台打包与 updater 官方范式）；`hwchen/keyring-rs`（三平台 secret store 统一抽象）；本项目既有 Rust 资产（`switcher/` 平台分派设计、`tasks/scheduler.rs` 跨平台调度、sysinfo 进程管理）。
 - **边界与风险**：①各目标应用 macOS 版布局是最大不确定性，M-1 侦察不通过的应用域先不支持（档案表按应用×平台灰度）；②Apple 签名公证需要 Developer ID 账号；③MITM 抓包在 macOS 需 Keychain 信任授权交互；④豆包 cookie 解密 mac 形态（Keychain Safe Storage）与 Windows DPAPI+AES-GCM 完全不同，属重写而非移植；⑤`machine.rs` 注册表层 mac 无等价物（MachineGuid），设备重置覆盖面在 mac 上降级（如实提示）。
 - **验收**：macOS 上完成 Trae Work 双账号切换 + WorkBuddy 切换 + 自动签到（内置调度器）+ 网关代理全链路；Windows 行为零变化（回归：现有 Rust 测试全绿 + 前端 tsc）。
+- **v2.7 进展（2026-09-19，全仓 Windows/macOS 兼容性审查收口）**：①代理启动 CA 探测三平台收口 `cert_ctl::cert_query`（删除 `installed_in_windows_root` 的 `cfg(not)` 恒 false 兜底，修复 mac 启动日志误报「CA 证书未安装」）；②全仓 **16 处业务路径基根直读**（APPDATA/LOCALAPPDATA/USERPROFILE 裸读）收口至 `platform` 层 lossy helper（`home_dir`/`app_support_root_lossy`/`local_data_root_lossy`，Windows 输出与裸读 env 一致并由单测锁定）：oauth 外置配置与调试 CA、workbuddy 全家桶（auth 文件 / `~/.workbuddy` / `~/.codebuddy` / token 统计 / 环境重置 / CodeBuddy live uid）、豆包 6 处（User Data / Local State / public_config）、`icube_auth` 设备凭证、`trae_apps` 自动发现；③`trae_apps.rs` 反斜杠 SUFFIX 常量组件化 join（mac 上原样会拼成单文件名组件永远 miss）；④`misc.rs` `write_text_file` 系统目录防护补 mac 分支（/System、/Library、/private、/etc）+ 前缀归一化平台化；⑤warning 清零（`trae_app_dirs` 补 cfg(windows) 门控、`sys_output`/`mac_data_dir_guess` 补 allow 注记）。验证：`cargo check` 零警告 + `cargo test` 437 全绿。
+- **剩余任务**（2026-09-19 盘点，对照设计 §8.2 任务表：M0 全部 / M1.1-1.3 / M2 全部 / M3 全部代码已落地 ✅，其余如下）：
+
+| # | 任务 | 前置 | 解决方案 |
+|---|---|---|---|
+| R1 | **mac 真机编译验证**（双架构） | 无（可立即做） | mac 机 `rustup target add aarch64-apple-darwin x86_64-apple-darwin` 后分别 `cargo check --target <t>` + `cargo test` 零警告；重点复核 v2.7 新增 cfg(macos) 分支（platform lossy helpers、misc blocked_system_dirs、trae_apps 组件化路径、local_capture 门控）——Windows 侧无法交叉验证 mac 编译 |
+| R2 | **M-1 真机侦察**（设计 §7 共 9 项，先决） | mac 机 + 各应用 mac 版账号 | 按侦察表执行：①Trae CN/Work mac 版数据布局 ②WorkBuddy/CodeBuddy dotfile 布局 ③豆包 mac 版存在性 ④SIGTERM 优雅落盘验证 ⑤VS Code 系 Keychain secret 形态 ⑥主进程名核对 ⑦sysinfo kill 行为 ⑧networksetup 权限模型 ⑨CodeBuddy 双目录 secret；侦察不通过的域维持 `mac_supported=false` 灰度并记录结论 |
+| R3 | **M1-1.4 档案表 mac 路径回填** | R2 | 按侦察 1/2/6/9 结论回填 `switcher/profile.rs`（`mac_data_dir_guess` 猜测值 → 实测值）并优先置位 WorkBuddy/CodeBuddy dotfile 域 `mac_supported=true`；顺手移除 M1 接线标注的 `#[allow(dead_code)]`（profile.rs:64、platform/mod.rs local_data_root） |
+| R4 | **M1-1.5 切换全链路 mac 实测** | R2、R3 | WorkBuddy 双账号互切（快照备份 → 恢复 → 守卫回滚）按设计 §十 验收矩阵 2/3 执行；Trae 域按侦察结论决定覆盖范围；`switcher/mod.rs` 主体预期零改动纯验证 |
+| R5 | **M2 mac 真机复核** | R1（可与 R2 并行） | 逐项冒烟：`scutil --proxies` 读 / `networksetup` 逐服务写+还原 / `security add-trusted-cert` GUI 授权 / SO_REUSEADDR 重复启停无端口残留 / CA 信任后 MITM 抓包闭环（验收矩阵 6：装证书 → 接管代理 → 捕获 → 还原） |
+| R6 | **M3 dmg 构建 + 更新闭环验证** | R1（推荐尽早，不依赖 R2） | 本地 `npm run tauri build -- --bundles dmg`（aarch64 / x86_64 / universal 三形态）+ CI `build-macos.yml` 首跑产出四资产；updater mac 闭环实测（发现 dmg → 下载 → SHA256 fail-closed → open dmg → 重启，验收矩阵 8）；Gatekeeper 无签名首启引导实测（右键打开 + `xattr -d`，验收矩阵 1） |
+| R7 | **M4 集成验收 + 首个 mac 发布演练** | R1~R6 | 验收矩阵 1-9 全项通过（含 Windows 回归 §9.3：cargo test 全绿 + tsc + NSIS/MSI/portable 产物不变 + 手工冒烟）；tag 发布 Release 四资产 + 新 mac 机从 dmg 安装到登录使用成功；更新 CHANGELOG 与 AGENT.md SOP 实测补充 |
+| R8 | **延后项**（M-1 后评估，非阻塞） | R2 | ①豆包 cookie mac 直读（Keychain Safe Storage + AES-128-CBC，重写非移植，首版走 MITM 捕获）②launchd 系统级定时注册（内置调度器已覆盖）③Developer ID 签名公证（$99/年，决策后落地可根除 Gatekeeper 引导）④「更新重启前旧进程对新 .app 执行 `xattr -d`」自动化增强（设计 §9.4 留档） |
 
 ### F-52 WorkBuddyProxy 模式（P3，远期）
 

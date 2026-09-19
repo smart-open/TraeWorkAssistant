@@ -38,8 +38,8 @@ impl BuddyApp {
 
     /// 客户端数据目录（会话三件套所在地）
     pub fn data_dir(self) -> PathBuf {
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        PathBuf::from(home).join(match self {
+        // ~/.workbuddy / ~/.codebuddy 跨平台 HOME 基根（Windows=%USERPROFILE%，mac=$HOME）
+        crate::platform::home_dir().join(match self {
             BuddyApp::WorkBuddy => ".workbuddy",
             BuddyApp::CodeBuddy => ".codebuddy",
         })

@@ -28,8 +28,8 @@ fn auth_file_path(state: &AppState) -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    PathBuf::from(local)
+    // F-75 跨平台收口：Windows=%LOCALAPPDATA%，mac=~/Library/Application Support
+    crate::platform::local_data_root_lossy()
         .join("CodeBuddyExtension")
         .join("Data")
         .join("Public")
@@ -374,22 +374,20 @@ pub fn discover_local_quota_services(
     let mut seen: std::collections::HashSet<u16> = Default::default();
     let mut ports: Vec<u16> = vec![];
     // ① ~/.workbuddy/*.port（服务启动时落盘的端口声明，最多扫 16 个）
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let wb_dir = PathBuf::from(home).join(".workbuddy");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&wb_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "port").unwrap_or(false))
-            .collect();
-        files.sort();
-        for f in files.into_iter().take(16) {
-            if let Ok(txt) = std::fs::read_to_string(&f) {
-                if let Some(first) = txt.split_whitespace().next() {
-                    if let Ok(p) = first.parse::<u16>() {
-                        ports.push(p);
-                    }
+    let wb_dir = crate::platform::home_dir().join(".workbuddy");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&wb_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "port").unwrap_or(false))
+        .collect();
+    files.sort();
+    for f in files.into_iter().take(16) {
+        if let Ok(txt) = std::fs::read_to_string(&f) {
+            if let Some(first) = txt.split_whitespace().next() {
+                if let Ok(p) = first.parse::<u16>() {
+                    ports.push(p);
                 }
             }
         }

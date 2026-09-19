@@ -61,6 +61,7 @@ pub struct AppProfile {
     /// mac 数据目录假设值（`~` = $HOME，M-1 确认后随 mac_supported 一起放开）。
     /// - VS Code fork 惯例：~/Library/Application Support/<Name>
     /// - dotfile 惯例：~/.workbuddy、~/.codebuddy
+    #[allow(dead_code)] // M1 mac 侧接线前 Windows 构建仅测试读取
     pub mac_data_dir_guess: Option<&'static str>,
 }
 

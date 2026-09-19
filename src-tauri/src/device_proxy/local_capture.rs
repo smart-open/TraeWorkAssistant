@@ -16,7 +16,10 @@ use crate::state::AppState;
 use super::handler::{extract_user_id, update_account_jwt, valid_cloud_ide_jwt, ProxyCtx};
 
 /// 候选应用数据目录（对齐 Python `_trae_app_dirs`）：TRAE SOLO CN + Trae CN；
-/// 设置 TRAE_APP_DIR 时只扫指定目录（兼容旧环境变量）
+/// 设置 TRAE_APP_DIR 时只扫指定目录（兼容旧环境变量）。
+/// 仅 Windows 构建编译——唯一调用方是 cfg(windows) 的 capture_from_local，
+/// 无门控会让 mac 构建报 dead_code（本功能依赖 DPAPI，mac 不提供）
+#[cfg(windows)]
 fn trae_app_dirs() -> Vec<PathBuf> {
     if let Ok(env) = std::env::var("TRAE_APP_DIR") {
         if !env.is_empty() {

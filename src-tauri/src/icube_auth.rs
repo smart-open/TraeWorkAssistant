@@ -112,15 +112,16 @@ pub struct DeviceCredential {
 /// 扫描本机各 Trae 客户端 storage.json 提取设备凭证（多个客户端各有一套）。
 /// 找不到/解密失败返回空表——DeviceProof 不可用时调用方回落无 proof 变体。
 pub fn extract_device_credentials() -> Vec<DeviceCredential> {
-    let Some(appdata) = std::env::var("APPDATA").ok() else {
+    // F-75 跨平台收口：storage.json 基根 Windows=%APPDATA% / mac=Application Support
+    // （Trae 桌面客户端两平台同为 Electron 布局 User/globalStorage）；
+    // Programs 安装目录探测仅 Windows 存在，mac 读取失败走 unwrap_or_default 降级
+    let Ok(appdata) = crate::platform::app_support_root() else {
         return Vec::new();
     };
-    let Some(localappdata) = std::env::var("LOCALAPPDATA").ok() else {
-        return Vec::new();
-    };
+    let localappdata = crate::platform::local_data_root_lossy();
     let mut out = Vec::new();
     for app in ["Trae CN", "TRAE SOLO CN", "Trae", "Trae Work"] {
-        let path = std::path::PathBuf::from(&appdata)
+        let path = appdata
             .join(app)
             .join("User")
             .join("globalStorage")
@@ -135,7 +136,7 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
         // DeviceInfo.ClientVersion 用：安装目录 package.json 的 version（真实客户端
         // 上报的是 appVersion，与服务端对设备注册记录的校验相关）
         let app_version = std::fs::read_to_string(
-            std::path::PathBuf::from(&localappdata)
+            localappdata
                 .join("Programs")
                 .join(app)
                 .join("resources")

@@ -34,6 +34,9 @@ pub fn sys_command_raw(program: &str, args: &[&str], raw: &str) -> std::process:
 
 /// 运行命令并收集 stdout（utf-8 宽容解码 + 隐藏窗口）。
 /// 失败（非零退出码 / 启动失败）返回 Err，错误尾带 stderr 内容。
+/// Windows 构建下生产调用方均为 cfg(macos) 分支（cert_ctl/proxy_ctl/bypass），
+/// 仅测试消费；mac 构建下有生产调用——allow 避免 Windows 构建误报
+#[allow(dead_code)]
 pub fn sys_output(cmd: &mut std::process::Command) -> Result<String, String> {
     let out = cmd.output().map_err(|e| format!("执行失败: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);

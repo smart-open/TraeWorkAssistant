@@ -495,6 +495,7 @@ const BLOCKED_EXEC_EXTS: &[&str] = &[
 
 /// Windows 路径归一化（仅用于前缀比较）：分隔符统一为 `\`、剥离 verbatim
 /// `\\?\` / `\\?\UNC\` 前缀、去尾部分隔符、转小写（Windows 不区分大小写）
+#[cfg(windows)]
 fn normalize_win_path(p: &std::path::Path) -> String {
     let s = p.to_string_lossy().replace('/', "\\");
     let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
@@ -507,8 +508,23 @@ fn normalize_win_path(p: &std::path::Path) -> String {
     s.trim_end_matches('\\').to_lowercase()
 }
 
+/// 前缀比较用归一化（check_export_path 唯一入口）：
+/// Windows 走 normalize_win_path；mac 只统一分隔符与尾部斜杠（保留大小写，
+/// APFS 大小写敏感卷上小写折叠会误判）
+#[cfg(windows)]
+fn normalize_for_prefix(p: &std::path::Path) -> String {
+    normalize_win_path(p)
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_for_prefix(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    s.trim_end_matches('/').to_string()
+}
+
 /// 目录前缀匹配：相等，或 path 位于 prefix 的子目录内
 /// （避免 `C:\Windows` 误伤 `C:\Windows-Empire` 这类兄弟目录）
+#[cfg(windows)]
 fn starts_with_dir(path_norm: &str, prefix_norm: &str) -> bool {
     if prefix_norm.is_empty() {
         return false;
@@ -516,8 +532,17 @@ fn starts_with_dir(path_norm: &str, prefix_norm: &str) -> bool {
     path_norm == prefix_norm || path_norm.starts_with(&format!("{prefix_norm}\\"))
 }
 
-/// 收集需禁止写入的系统目录前缀：Windows 系统目录、Program Files、
+#[cfg(target_os = "macos")]
+fn starts_with_dir(path_norm: &str, prefix_norm: &str) -> bool {
+    if prefix_norm.is_empty() {
+        return false;
+    }
+    path_norm == prefix_norm || path_norm.starts_with(&format!("{prefix_norm}/"))
+}
+
+/// 收集需禁止写入的系统目录前缀（Windows）：系统目录、Program Files、
 /// 开始菜单（含用户/公共启动文件夹）。环境变量缺失时用常见默认值兜底
+#[cfg(windows)]
 fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
     let env_or = |k: &str, fb: &str| std::env::var(k).unwrap_or_else(|_| fb.to_string());
     let mut v = Vec::new();
@@ -535,6 +560,18 @@ fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
     v
 }
 
+/// 收集需禁止写入的系统目录前缀（macOS）：SIP 保护域与全机 Library、私有根、
+/// /etc（/private/etc 符链）——防持久化滥用语义对齐 Windows 分支
+#[cfg(target_os = "macos")]
+fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
+    vec![
+        std::path::PathBuf::from("/System"),
+        std::path::PathBuf::from("/Library"),
+        std::path::PathBuf::from("/private"),
+        std::path::PathBuf::from("/etc"),
+    ]
+}
+
 /// 导出路径校验（canonicalize 失败时对原路径做前缀判断）：
 /// ① 命中系统目录/启动文件夹前缀 → 拒绝；
 /// ② 可执行/脚本扩展名且不在应用数据目录下 → 拒绝
@@ -544,9 +581,9 @@ fn check_export_path(
     blocked: &[std::path::PathBuf],
 ) -> Result<(), String> {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let norm = normalize_win_path(&canon);
+    let norm = normalize_for_prefix(&canon);
     for b in blocked {
-        if starts_with_dir(&norm, &normalize_win_path(b)) {
+        if starts_with_dir(&norm, &normalize_for_prefix(b)) {
             return Err(
                 "拒绝写入：目标位于系统目录或启动文件夹，为防止持久化滥用不允许导出到该位置".into(),
             );
@@ -554,7 +591,7 @@ fn check_export_path(
     }
     let exec_ok = || -> bool {
         let data_canon = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
-        starts_with_dir(&norm, &normalize_win_path(&data_canon))
+        starts_with_dir(&norm, &normalize_for_prefix(&data_canon))
     };
     let is_exec = path
         .extension()

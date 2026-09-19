@@ -333,14 +333,15 @@ pub fn pool_account_id_by_uid(state: &AppState, uid: &str) -> Option<String> {
         .map(|a| a.id)
 }
 
-/// CodeBuddy 客户端 live 登录 uid：`%APPDATA%\CodeBuddy CN\User\globalStorage\storage.json`
+/// CodeBuddy 客户端 live 登录 uid：客户端应用支持目录
+/// `CodeBuddy CN/User/globalStorage/storage.json`（Windows=%APPDATA%，mac=Application Support）
 /// 的 `genie.userId`。F2-5：这是 CodeBuddy 当前登录的**真源信号**——共享 auth 文件属
 /// WorkBuddy（会被其覆盖），不能作为 CodeBuddy 的登录证据；genie.userId 由客户端随
 /// 登录/切换改写（实测：恢复某账号快照启动后该值变为该账号 uid）。
 /// None = 文件不存在/未登录/解析失败（调用方 fail-open）。
 pub fn codebuddy_live_uid() -> Option<String> {
-    let appdata = std::env::var("APPDATA").ok()?;
-    let p = std::path::PathBuf::from(appdata)
+    let p = crate::platform::app_support_root()
+        .ok()?
         .join("CodeBuddy CN")
         .join("User")
         .join("globalStorage")

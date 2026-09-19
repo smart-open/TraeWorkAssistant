@@ -157,11 +157,12 @@ impl ProxyServer {
         if let Some(up) = &cfg.upstream {
             log.log(&format!("上游代理(用户VPN)透传: {}", up.addr()));
         }
-        // CA 安装状态如实探测输出（原为无条件提示，已安装也提示安装，误导用户）
-        if ca::installed_in_windows_root() {
-            log.log("CA 证书已安装到 Windows 受信任根（TraeDeviceProxyCA）✅");
+        // CA 安装状态如实探测输出（原为无条件提示，已安装也提示安装，误导用户）。
+        // 三平台收口走 cert_query（Windows=certutil 根存储 / mac=security find-certificate）
+        if crate::platform::cert_ctl::cert_query("TraeDeviceProxyCA") {
+            log.log("CA 证书已安装到系统信任域（TraeDeviceProxyCA）✅");
         } else {
-            log.log("⚠ CA 证书未安装：请在顶部「证书未信任」徽标或引导页一键安装（certs/ca.cer → Windows 受信任根），否则被代理的客户端会因证书不受信而无法加载页面");
+            log.log("⚠ CA 证书未安装：请在顶部「证书未信任」徽标或引导页一键安装（certs/ca.cer → 系统信任域），否则被代理的客户端会因证书不受信而无法加载页面");
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

@@ -106,6 +106,8 @@ impl CaAuthority {
 /// 查询 Windows 受信任根存储是否含本代理 CA（TraeDeviceProxyCA）。
 /// HKLM 与 HKCU Root 任一命中即视为已安装（与 commands::cert::cert_status 同语义）；
 /// 查询失败一律视为未安装。供代理启动日志输出真实安装状态（此前为无条件提示，误导）。
+/// 跨平台统一入口是 platform::cert_ctl::cert_query（mac 走 security find-certificate），
+/// 本函数仅保留 Windows 实现。
 #[cfg(target_os = "windows")]
 pub fn installed_in_windows_root() -> bool {
     let run = |args: &[&str]| -> bool {
@@ -116,11 +118,6 @@ pub fn installed_in_windows_root() -> bool {
             .unwrap_or(false)
     };
     run(&["-store", "Root"]) || run(&["-user", "-store", "Root"])
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn installed_in_windows_root() -> bool {
-    false
 }
 
 /// 确保数据目录下存在可用 CA：已有则加载（兼容 Python 版 RSA CA），缺失则生成并落盘。

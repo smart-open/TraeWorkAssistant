@@ -575,7 +575,7 @@ pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Val
         }
     }
 
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let home = crate::platform::home_dir();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let cutoff = cutoff_date_str();
 
@@ -584,14 +584,14 @@ pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Val
     let mut seen: HashSet<String> = HashSet::new();
 
     let mut merged = scan_root(
-        &Path::new(&home).join(".workbuddy").join("projects"),
+        &home.join(".workbuddy").join("projects"),
         "workbuddy",
         &cutoff,
         &mut cache,
         &mut seen,
     );
     let second = scan_root(
-        &Path::new(&home).join(".codebuddy").join("projects"),
+        &home.join(".codebuddy").join("projects"),
         "codebuddy-cli",
         &cutoff,
         &mut cache,

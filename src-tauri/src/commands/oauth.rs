@@ -70,11 +70,11 @@ fn default_exchange_url() -> String {
 pub fn oauth_client() -> &'static OAuthClientConfig {
     static CFG: std::sync::OnceLock<OAuthClientConfig> = std::sync::OnceLock::new();
     CFG.get_or_init(|| {
-        std::env::var("APPDATA")
+        // F-75 跨平台收口：Windows=%APPDATA%，mac=~/Library/Application Support
+        crate::platform::app_support_root()
             .ok()
             .map(|d| {
-                std::path::PathBuf::from(d)
-                    .join(crate::state::DATA_DIR_NAME)
+                d.join(crate::state::DATA_DIR_NAME)
                     .join("conf")
                     .join("oauth_client.json")
             })
@@ -137,9 +137,9 @@ fn exchange_agent() -> Result<ureq::Agent, String> {
     };
     // 调试代理容错（2026-09-16 实测）：设置了调试代理但尚未启动过代理（CA 未生成）
     // 时降级直连并记日志，不阻断登录闭环；只有 CA 存在但损坏才视为错误
-    let dir = std::env::var("APPDATA")
+    let dir = crate::platform::app_support_root()
         .ok()
-        .map(|d| std::path::PathBuf::from(d).join(crate::state::DATA_DIR_NAME));
+        .map(|d| d.join(crate::state::DATA_DIR_NAME));
     let ca_path = dir.as_ref().map(|d| d.join("certs").join("ca.crt"));
     let ca_pem = match ca_path.as_deref().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(p) => p,
