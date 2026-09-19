@@ -136,6 +136,11 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
     std::fs::create_dir_all(certs_dir).map_err(|e| format!("创建证书目录失败: {e}"))?;
 
     let issuer = if cert_pem_path.exists() && key_pem_path.exists() {
+        // 读取前 ACL 自愈（issue #14）：历史版本 harden_ca_dir 的 grant 无 (OI)(CI)
+        // 继承标志，目录收紧时已有子文件的继承 ACE 被动态清空成空 DACL——任何进程
+        // （含提权 certutil、Windows 证书 UI）都读不了文件。此前的自愈挂在 certutil
+        // 失败之后，读取阶段就报「读取 CA 证书失败: 拒绝访问 (os error 5)」走不到那里
+        self_heal_acl_if_needed(certs_dir, &[&cert_pem_path, &key_pem_path])?;
         let cert_pem = std::fs::read_to_string(&cert_pem_path)
             .map_err(|e| format!("读取 CA 证书失败: {e}"))?;
         let key_pem = std::fs::read_to_string(&key_pem_path)
@@ -245,6 +250,43 @@ fn sweep_legacy_leaf_files(certs_dir: &std::path::Path) {
         if name.starts_with("leaf_") && (name.ends_with(".crt") || name.ends_with(".key")) {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+/// 读取前 ACL 自愈（仅 Windows，尽力而为 + 明确报错）：探测任一目标文件当前用户
+/// 不可读（空 DACL 等损坏）→ icacls /reset /T 恢复继承后重探；仍不可读则报人话
+/// 错误指引删除 certs 目录重新生成。cert_install 阶段借此保证不再带着坏文件走到
+/// certutil 才失败；/reset 恢复父目录继承属 fail-open 取舍（证书本就要公开分发，
+/// 目录收紧仅纵深防御，绝不能因此阻断 CA 自身读写）。
+fn self_heal_acl_if_needed(
+    certs_dir: &std::path::Path,
+    targets: &[&std::path::Path],
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let readable = |p: &std::path::Path| std::fs::File::open(p).is_ok();
+        if targets.iter().all(|p| readable(p)) {
+            return Ok(());
+        }
+        let _ = std::process::Command::new("icacls")
+            .arg(certs_dir)
+            .args(["/reset", "/T"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output();
+        if targets.iter().all(|p| readable(p)) {
+            return Ok(());
+        }
+        Err(format!(
+            "证书文件 ACL 权限损坏且自动修复失败（拒绝访问）。请完全退出助手后删除 \
+             {} 整个文件夹，重新打开助手并再次点击「安装证书」",
+            certs_dir.display()
+        ))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (certs_dir, targets);
+        Ok(())
     }
 }
 
@@ -374,6 +416,24 @@ mod tests {
             std::fs::read_to_string(tmp.join("ca.crt")).unwrap(),
             LEGACY_CA_CERT
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// issue #14 回归：目标文件可读时 ACL 自愈必须为纯探测（不触发 icacls、
+    /// 无副作用）直接 Ok——正常环境每次 ensure_ca 都会走到此路径
+    #[test]
+    fn acl_self_heal_is_noop_when_readable() {
+        let tmp = std::env::temp_dir().join(format!("aiwork_ca_acl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cert = tmp.join("ca.crt");
+        let key = tmp.join("ca.key");
+        std::fs::write(&cert, b"cert").unwrap();
+        std::fs::write(&key, b"key").unwrap();
+
+        self_heal_acl_if_needed(&tmp, &[&cert, &key]).expect("readable files must pass");
+        assert_eq!(std::fs::read(&cert).unwrap(), b"cert");
+        assert_eq!(std::fs::read(&key).unwrap(), b"key");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -344,20 +344,99 @@ pub fn doubao_detect_uid(state: State<AppState>) -> Result<Option<String>, Strin
     Ok(read_current_uid(&state))
 }
 
-/// 检测某 profile 目录是否持有登录会话 Cookie（Rust 实现，原 doubao_chats.py --check-login-cookie）。
-/// cookie 名为明文（值加密不影响），可直接判定 sessionid/sid_guard 是否存在。
-/// 返回：Some((是否有会话, sessionid 最小剩余秒数))；None=检测不可用（读取失败，不阻断流程）。
-pub(crate) fn check_profile_login_cookie(
-    profile_dir: &std::path::Path,
-) -> Option<(bool, Option<i64>)> {
-    let v = crate::tasks::doubao_chats::check_login_cookie(profile_dir);
-    if !v.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false) {
-        return None;
+/// 检测某 User Data 目录（Live 或快照槽）的登录会话综合判定（Issue #15 修复）。
+/// 原实现只看 Local State `profile.last_used` 指向的活跃 Profile，存在两条误报路径：
+/// ① 豆包多 Profile 下登录会话可能不在活跃 Profile（localStorage 的 uid 检测链扫全部
+///    Profile，而 Cookie 检查只看活跃 → 弹窗预填了账号但预检误报「未检测到登录会话」）；
+/// ② 客户端运行中 Cookies 被独占锁导致活跃 Profile 复制失败，「读不到」被当成「未登录」。
+/// 统一口径：任一 Profile 持有非游客登录会话即算已登录（快照含全部 Profile，会话随快照
+/// 走，恢复后不会丢）；存在读取失败 → 全貌不可知 → Unavailable 由调用方 fail-open。
+#[derive(Debug, PartialEq)]
+enum LoginSessionAnalysis {
+    /// 存在非游客登录会话（remaining=None 视为最优，否则取剩余最长者所在的 Profile）
+    LoggedIn,
+    /// 所有 Profile 均读取成功，但仅存在游客/临时会话
+    GuestOnly { remaining: i64 },
+    /// 所有 Profile 均读取成功且均无 sessionid/sid_guard → 确认未登录（带诊断摘要）
+    NoSession { summary: String },
+    /// 检测不可用（无 Profile/存在读取失败等，无法确认全貌）→ 调用方 fail-open
+    Unavailable,
+}
+
+fn analyze_login_sessions(user_data: &std::path::Path) -> LoginSessionAnalysis {
+    let v = crate::tasks::doubao_chats::check_login_cookie(user_data);
+    let Some(profiles) = v.get("profiles").and_then(serde_json::Value::as_array) else {
+        return LoginSessionAnalysis::Unavailable;
+    };
+    if profiles.is_empty() {
+        return LoginSessionAnalysis::Unavailable;
     }
-    Some((
-        v.get("has_session")?.as_bool()?,
-        v.get("sessionid_remaining_sec").and_then(serde_json::Value::as_i64),
-    ))
+    let active = v
+        .get("active_profile")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut logged: Option<(Option<i64>, &str)> = None; // 非游客会话：None 剩余优先，其次取最大
+    let mut guest: Option<i64> = None;
+    let mut any_err = false;
+    let mut total_cookies = 0i64;
+    for p in profiles {
+        let name = p.get("name").and_then(serde_json::Value::as_str).unwrap_or("?");
+        let err = p
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        total_cookies += p
+            .get("doubao_cookies")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if !err.is_empty() {
+            any_err = true; // 锁占用/无 Cookies 库等：该 Profile 会话状态未知
+            continue;
+        }
+        if !p
+            .get("has_session")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let remaining = p
+            .get("sessionid_remaining_sec")
+            .and_then(serde_json::Value::as_i64);
+        match remaining {
+            Some(sec) if is_guest_session(Some(sec)) => {
+                guest = Some(guest.map_or(sec, |g| g.max(sec)));
+            }
+            other => {
+                let better = match logged {
+                    None => true,
+                    Some((Some(_), _)) => other.is_none(),
+                    Some((None, _)) => false,
+                };
+                if better {
+                    logged = Some((other, name));
+                }
+            }
+        }
+    }
+    if logged.is_some() {
+        return LoginSessionAnalysis::LoggedIn;
+    }
+    // 无非游客会话且有读取失败 → 可能真登录被锁挡住，不可断言「未登录」
+    if any_err {
+        return LoginSessionAnalysis::Unavailable;
+    }
+    if let Some(sec) = guest {
+        return LoginSessionAnalysis::GuestOnly { remaining: sec };
+    }
+    LoginSessionAnalysis::NoSession {
+        summary: format!(
+            "活跃 Profile {}，共扫描 {} 个 Profile / {} 个 doubao.com Cookie，全部读取成功但均无 sessionid/sid_guard",
+            if active.is_empty() { "未知" } else { active },
+            profiles.len(),
+            total_cookies,
+        ),
+    }
 }
 
 /// 豆包客户端 User Data 目录（Live 态，登录 Cookie/uid 检测用）。
@@ -367,8 +446,8 @@ fn doubao_live_user_data_dir() -> Option<PathBuf> {
     dir.exists().then_some(dir)
 }
 
-/// 切换守卫的严格版：检测当前登录 uid，且**必须**在 Live profile 的 Cookies 里验证到
-/// 登录会话（sessionid/sid_guard）才返回该 uid；无登录会话返回空串。
+/// 切换守卫的严格版：检测当前登录 uid，且**必须**在 Live User Data 的 Cookies 里验证到
+/// 登录会话（sessionid/sid_guard，任一 Profile）才返回该 uid；无登录会话返回空串。
 /// 背景（实测 2026-09-09 16:5x）：客户端恢复某账号快照后未登录，uid 检测链被快照自带的
 /// localStorage 残留（client_device_info.userId=旧账号）骗过 → 下次切换时守卫误通过，
 /// 把"未登录态"又备份进该账号槽，反复污染。Cookie 存在性无法被残留数据伪造。
@@ -376,10 +455,13 @@ pub(crate) fn detect_guard_uid_strict(state: &State<AppState>) -> String {
     let Some(uid) = detect_uid_from_local_storage(state) else {
         return String::new();
     };
-    match doubao_live_user_data_dir().and_then(|dir| check_profile_login_cookie(&dir)) {
-        // 有真实登录会话（非游客态）才放行回写
-        Some((true, remaining)) if !is_guest_session(remaining) => uid,
-        // 确认无登录会话/游客态（或检测不可用）→ 一律不回写账号槽（宁可不备份，不可覆盖错）
+    let Some(dir) = doubao_live_user_data_dir() else {
+        return String::new();
+    };
+    match analyze_login_sessions(&dir) {
+        // 有真实登录会话（非游客态）才放行回写；游客/确认无会话/检测不可用一律不回写
+        //（宁可不备份，不可覆盖错；Unavailable 保守拦截维持原 fail-closed 语义）
+        LoginSessionAnalysis::LoggedIn => uid,
         _ => String::new(),
     }
 }
@@ -463,27 +545,26 @@ pub(crate) fn probe_live_session_alive(user_id: &str) -> Result<(), String> {
     }
 }
 
-/// 保存前预检：Live profile 必须持有登录会话 Cookie，否则禁止「保存当前登录态」。
-/// 返回 Err(原因) = 无登录会话/检测失败按可用性判断；Ok(()) = 放行。
+/// 保存前预检：Live User Data 必须持有登录会话 Cookie，否则禁止「保存当前登录态」。
+/// 返回 Err(原因) = 确认无登录会话/游客态；Ok(()) = 放行（含检测不可用 fail-open）。
 pub(crate) fn ensure_live_has_login_session() -> Result<(), String> {
     let Some(dir) = doubao_live_user_data_dir() else {
         return Err("未找到豆包客户端数据目录（%LOCALAPPDATA%\\Doubao\\User Data），请先安装并登录豆包".to_string());
     };
-    match check_profile_login_cookie(&dir) {
-        Some((true, remaining)) if !is_guest_session(remaining) => Ok(()),
-        Some((false, _)) => Err(
-            "当前豆包客户端未检测到登录会话（Cookies 中无 sessionid/sid_guard）——请先在豆包中登录账号再保存，\
-             否则会把未登录状态存进账号槽（这正是此前账号快照反复被污染的原因）"
-                .to_string(),
-        ),
+    match analyze_login_sessions(&dir) {
+        LoginSessionAnalysis::LoggedIn => Ok(()),
         // 有 sessionid 但剩余有效期 <12h = 退出登录后残留的 6h 游客会话，不是真登录
-        Some((true, remaining)) => Err(format!(
+        LoginSessionAnalysis::GuestOnly { remaining } => Err(format!(
             "当前豆包客户端是游客/未登录状态（sessionid 剩余有效期仅约 {} 小时，\
              为退出登录后残留的临时会话），不能保存为账号登录态。请先在豆包中真正登录账号",
-            remaining.unwrap_or(0).max(0) / 3600
+            remaining.max(0) / 3600
         )),
-        // 检测不可用（脚本缺失等）不阻断，保持旧行为
-        None => Ok(()),
+        LoginSessionAnalysis::NoSession { summary } => Err(format!(
+            "当前豆包客户端未检测到登录会话（{summary}）——请先在豆包中登录账号再保存，\
+             否则会把未登录状态存进账号槽（这正是此前账号快照反复被污染的原因）"
+        )),
+        // 检测不可用（Cookies 被客户端运行占用等）不阻断，保持旧行为
+        LoginSessionAnalysis::Unavailable => Ok(()),
     }
 }
 
@@ -1349,19 +1430,20 @@ pub fn doubao_open_as_account(
     // 目标快照登录 Cookie 预检：快照里没有 sessionid/sid_guard = 恢复后必然未登录
     // （此前 908 槽就是被未登录态污染后反复"切换成功但没登录"），直接拦截并告知补救方式；
     // 剩余有效期 <12h = 快照存的是游客会话，同样拦截
-    match check_profile_login_cookie(&slot) {
-        Some((false, _)) => {
+    match analyze_login_sessions(&slot) {
+        LoginSessionAnalysis::NoSession { .. } => {
             return Err(format!(
                 "账号 {uid} 的快照中未检测到登录会话（无 sessionid Cookie），恢复后必然未登录。\n\
                  请在豆包中登录该账号后重新「保存当前登录态」修复快照"
             ));
         }
-        Some((true, remaining)) if is_guest_session(remaining) => {
+        LoginSessionAnalysis::GuestOnly { .. } => {
             return Err(format!(
                 "账号 {uid} 的快照保存的是游客/临时会话（sessionid 剩余有效期不足 12 小时），\
                  恢复后无法登录。\n请在豆包中登录该账号后重新「保存当前登录态」修复快照"
             ));
         }
+        // LoggedIn（含会话在非活跃 Profile 的聚合判定）放行；Unavailable fail-open 不阻断
         _ => {}
     }
     // 服务端会话预检：本地 Cookie 存在≠会话在服务端仍有效。曾在客户端内退出登录该账号时
@@ -1731,5 +1813,124 @@ mod tests {
         assert_eq!(pick_uid_from_info_cache(&v).as_deref(), Some("333"));
         assert_eq!(pick_uid_from_info_cache(&serde_json::json!({"profile":{"info_cache":{}}})), None);
         assert_eq!(pick_uid_from_info_cache(&serde_json::json!({})), None);
+    }
+
+    // ── analyze_login_sessions（Issue #15 误报修复回归）────────────────────────
+
+    /// 构造测试 Profile：Cookies 库 + 可选的 sessionid（expires_utc 为 Webkit 微秒时间戳）
+    fn make_profile(ud: &std::path::Path, name: &str, session_expires: Option<i64>) {
+        let dir = ud.join(name).join("Network");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("Cookies")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cookies (host_key TEXT, name TEXT, expires_utc INTEGER);
+             INSERT INTO cookies VALUES ('.doubao.com', 'ttwid', 99999999999000000);",
+        )
+        .unwrap();
+        if let Some(exp) = session_expires {
+            conn.execute(
+                "INSERT INTO cookies VALUES ('.doubao.com', 'sessionid', ?1)",
+                rusqlite::params![exp],
+            )
+            .unwrap();
+        }
+    }
+
+    fn make_local_state(ud: &std::path::Path, last_used: &str) {
+        std::fs::write(
+            ud.join("Local State"),
+            format!(r#"{{"profile":{{"last_used":"{last_used}"}}}}"#),
+        )
+        .unwrap();
+    }
+
+    fn webkit_expires_in(secs_from_now: i64) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        (now + secs_from_now + 11_644_473_600) * 1_000_000
+    }
+
+    /// 误报场景①回归：登录会话在非活跃 Profile → 聚合判定为已登录（此前误报「未检测到登录会话」）
+    #[test]
+    fn analyze_aggregates_session_from_non_active_profile() {
+        let td = std::env::temp_dir().join(format!("aw_analyze_t1_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        make_local_state(&td, "Default");
+        make_profile(&td, "Default", None); // 活跃 Profile 无会话
+        make_profile(&td, "Profile 1", Some(webkit_expires_in(30 * 86400))); // 真登录在别处
+        assert_eq!(analyze_login_sessions(&td), LoginSessionAnalysis::LoggedIn);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 误报场景②回归：活跃 Profile 无 Cookies 库（读取失败）且其他 Profile 也无会话
+    /// → Unavailable fail-open（此前误报「未检测到登录会话」）
+    #[test]
+    fn analyze_fails_open_when_active_profile_unreadable() {
+        let td = std::env::temp_dir().join(format!("aw_analyze_t2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        make_local_state(&td, "Default");
+        std::fs::create_dir_all(td.join("Default").join("Network")).unwrap(); // 无 Cookies 库
+        make_profile(&td, "Profile 1", None); // 可读但无会话
+        assert_eq!(analyze_login_sessions(&td), LoginSessionAnalysis::Unavailable);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 全部 Profile 读取成功且均无会话 → 确认未登录（唯一允许拦「未检测到」的路径）
+    #[test]
+    fn analyze_no_session_when_all_profiles_clean() {
+        let td = std::env::temp_dir().join(format!("aw_analyze_t3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        make_local_state(&td, "Default");
+        make_profile(&td, "Default", None);
+        assert!(matches!(
+            analyze_login_sessions(&td),
+            LoginSessionAnalysis::NoSession { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 仅剩游客会话（sessionid 剩余 <12h）→ GuestOnly（游客拦截不受聚合影响）
+    #[test]
+    fn analyze_guest_only_when_remaining_under_12h() {
+        let td = std::env::temp_dir().join(format!("aw_analyze_t4_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        make_local_state(&td, "Default");
+        make_profile(&td, "Default", Some(webkit_expires_in(6 * 3600)));
+        // remaining 按分析时刻重算，会略小于构造时的 6h → 范围断言而非精确断言
+        match analyze_login_sessions(&td) {
+            LoginSessionAnalysis::GuestOnly { remaining } => {
+                assert!(remaining > 0 && remaining <= 6 * 3600, "remaining={remaining}");
+            }
+            other => panic!("期望 GuestOnly，实际 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 活跃 Profile 真登录 → LoggedIn（原主路径行为保持）
+    #[test]
+    fn analyze_logged_in_from_active_profile() {
+        let td = std::env::temp_dir().join(format!("aw_analyze_t5_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        make_local_state(&td, "Default");
+        make_profile(&td, "Default", Some(webkit_expires_in(30 * 86400)));
+        assert_eq!(analyze_login_sessions(&td), LoginSessionAnalysis::LoggedIn);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 无任何 Profile 目录 → Unavailable（不阻断）
+    #[test]
+    fn analyze_unavailable_without_profiles() {
+        let td = std::env::temp_dir().join(format!("aw_analyze_t6_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        assert_eq!(analyze_login_sessions(&td), LoginSessionAnalysis::Unavailable);
+        let _ = std::fs::remove_dir_all(&td);
     }
 }

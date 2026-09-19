@@ -4,6 +4,43 @@
 
 ---
 
+## [3.5.6] · 2026-09-19 · API 池凭据/成员热重载 + Trae/Buddy 模型目录客户端对齐过滤
+
+> 范围：自 [3.5.5]（commit 27c5e71）以来的全部变更。
+
+### 修复
+
+- **[P1] Trae「同步官网模型」401（存储 JWT 带前缀）**：自动捕获/本地抓取/刷新链路均以 `Cloud-IDE-JWT ` 前缀规范化写入，`fetch_official` 漏剥前缀 → mchost.guru 网关在 token 校验前统一拒绝（401 code 1001）。发送前剥前缀，对齐 pool.rs 入池行为（消融探针实证）。
+- **[P1] Trae 同步目录混入客户端隐藏模型**：过滤逻辑对齐客户端模型选择器（抓包逆向四层判定）——内部配置 / 自定义回显（`custom_` 前缀等）/ `is_invisible_to_user` / 当代代际（`context_window_tokens.max ≥ 250_000`）逐层剔除，glm-5.1、kimi-k2.6、custom_claude-* 等不再出现；同步结果 16 条与客户端截图逐条零误差（含倍率）。请求形态换用客户端 Agent 聊天选择器真实形态（7 函数 + access_type=0 + solo_agent）；展示名/倍率/上下文取 solo_agent/chat_v3 主语境位；新增 DeepSeek-V4.1-Flash、Kimi-K2.8-Preview 路由映射。
+- **[P1] Buddy 模型目录污染（agent/别名/内部条目）**：`wb_catalog` 三重过滤——`looks_like_model` 能力特征剔除无 models 子数组的 agent 条目（general-purpose/compact/plan 等）；噪音 id 黑名单（`auto` AutoMode 元模型 / `default` 路由别名 / `hunyuan-chat` 无定价内部条目）；`cli_agent_whitelist` 客户端菜单白名单逆向（tags 含 cli+default 的 agent models ∩ data.models），同名双档价位（hy3/hy3-x）保留双档。倍率解析对齐 `credits` 字符串链（"x0.05" / "x0.00 credits"）。
+
+### 功能优化（API 服务热重载）
+
+- **[P1] 凭据/成员变更联动热重载**：新增 `reload_pools_if_running` 全量重建运行中双池（Trae + WB），取代原 `note_refresh_success` 单点回填 JWT——覆盖其管不到的陈旧快照（SessionDead 禁用 / 冷却 / 积分 / 新账号缺失），修复「刚登录的 JWT 网关还是不行」。联动入口：OAuth 重登、refresh_token 刷新、手动更新 JWT、导入账号、保存账号池。
+- **[P2] Buddy 资源开关热应用**：pool_set 保存时同步热应用 `wb_enabled` / `wb_default_thinking` / `wb_tool_exec` / `wb_bg_downgrade` 四开关（此前仅启动时读取，改动需重启服务）；前端「需重启 API 服务」提示文案全部移除。
+
+### 测试
+
+- cargo 单测 425 → **426** 全绿零 warning（新增：旧代模型/自定义回显过滤、主语境展示名优先等回归）。
+
+---
+
+## [3.5.5] · 2026-09-19 · 豆包登录误报修复 + Buddy 模型目录兼容 agents 新容器形态
+
+> 范围：自 [3.5.4]（commit 0215498）以来的全部变更。
+
+### 修复
+
+- **[P1] 豆包「保存登录态失败」误报（Issue #15）**：`check_profile_login_cookie` 活跃 Profile 单一口径改为 `analyze_login_sessions` 多 Profile 聚合判定——任一 Profile 持有非游客登录会话即放行；存在读取失败（Cookies 锁/活跃 Profile 错位）时 fail-open，不再误报「未检测到登录会话」；确认未登录时的报错附带 Profile 扫描诊断；保存预检 / 切换守卫（保持 fail-closed）/ 快照槽恢复预检三个消费方口径统一；新增 6 个回归测试（多 Profile 聚合、锁读失败、游客态边界等）。
+- **[P1] Buddy 模型目录拉取 0 模型（官网 2026-09 新容器形态）**：`wb_catalog` parse_upstream_catalog 重构三层策略——定向容器探测（兼容 `{code:0,data:{agents:[…]}}` 新形态，data 由数组变为对象）→ agent 内嵌 models 展开（无内嵌则 agent 条目本身作为候选）→ 全树深扫兜底（要求非空字符串显式 id），按 id 大小写不敏感去重。
+- **[P2] models_sync 鉴权失败指引增强**：401/code 1001 自动附带凭据修复指引（续期 JWT / 重新 OAuth / 保存当前登录态），避免误判为同步功能故障；Buddy API 服务页卡片文案对齐「同步官网模型」。
+
+### 测试
+
+- cargo 单测 412 → **425** 全绿（本周期新增：豆包登录会话聚合判定 6 项回归、wb_catalog agents 新容器形态解析）；vitest 26/26、`tsc --noEmit` 全绿。
+
+---
+
 ## [3.5.4] · 2026-09-16 · API 网关性能优化 + refresh_token 刷新链路修复
 
 > 范围：自 [3.5.3]（commit 663b8a4）以来的全部变更。

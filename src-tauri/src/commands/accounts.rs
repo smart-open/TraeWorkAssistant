@@ -290,6 +290,7 @@ fn pick_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
 #[tauri::command]
 pub fn accounts_import(
     state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     content: String,
     only: Option<Vec<usize>>,
 ) -> Result<ImportReport, String> {
@@ -407,6 +408,10 @@ pub fn accounts_import(
                 report.added, report.skipped, report.groups_added
             ),
         );
+        // 凭据变更联动：运行中 API 池热重载（导入账号已在池白名单内时立即生效）
+        if report.added > 0 {
+            crate::commands::api_server::reload_pools_if_running(&state, &runtime);
+        }
     }
     Ok(report)
 }
@@ -630,6 +635,7 @@ pub fn account_get_jwt(state: State<AppState>, user_id: String) -> Result<String
 #[tauri::command]
 pub fn account_update(
     state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     user_id: String,
     name: Option<String>,
     jwt: Option<String>,
@@ -647,6 +653,7 @@ pub fn account_update(
             a.name = n;
         }
     }
+    let mut jwt_updated = false;
     if let Some(j) = jwt {
         let j = j.trim().to_string();
         if !j.is_empty() {
@@ -656,10 +663,15 @@ pub fn account_update(
                 a.user_id = Some(uid);
             }
             a.jwt = j;
+            jwt_updated = true;
         }
     }
     a.updated_at = Some(fs_utils::now_iso());
     crate::vault::save_accounts(&state, &mut accounts)?;
+    // 凭据变更联动：运行中 API 池热重载（手动粘贴 JWT 后立即参与调度，无需重启）
+    if jwt_updated {
+        crate::commands::api_server::reload_pools_if_running(&state, &runtime);
+    }
     Ok(())
 }
 
@@ -1436,22 +1448,20 @@ pub fn refresh_jwt(
     user_id: String,
 ) -> Result<String, String> {
     let result = refresh_jwt_impl(&state, &user_id);
-    // F-78 批次 3：运行中 API 池联动——成功解除失效禁用；失败且已判定失效则禁用
-    // （entry 按 uid 命中，Trae 账号在 pool、WB 账号在 wb_pool，双查无害）
-    let guard = runtime.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(rt) = guard.as_ref() {
-        match &result {
-            Ok(new_jwt) => {
-                rt.shared.pool.note_refresh_success(&user_id, new_jwt);
-                rt.shared.wb_pool.note_refresh_success(&user_id, new_jwt);
-            }
-            Err(_) => {
-                let accounts = crate::vault::load_accounts(&state);
-                if accounts
-                    .accounts
-                    .iter()
-                    .any(|a| a.user_id.as_deref() == Some(user_id.as_str()) && a.refresh_token_invalid)
-                {
+    // 运行中 API 池联动：成功 → 全量热重载（新 JWT 落池 + 解除失效/SessionDead 禁用快照，
+    // 单点 note_refresh_success 覆盖不了禁用/冷却/积分陈旧快照）；
+    // 失败且已判定 refresh_token 失效 → 池内同步禁用（entry 按 uid 命中，双池双查无害）
+    match &result {
+        Ok(_) => crate::commands::api_server::reload_pools_if_running(&state, &runtime),
+        Err(_) => {
+            let accounts = crate::vault::load_accounts(&state);
+            if accounts
+                .accounts
+                .iter()
+                .any(|a| a.user_id.as_deref() == Some(user_id.as_str()) && a.refresh_token_invalid)
+            {
+                let guard = runtime.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(rt) = guard.as_ref() {
                     rt.shared.pool.note_refresh_invalid(&user_id);
                     rt.shared.wb_pool.note_refresh_invalid(&user_id);
                 }

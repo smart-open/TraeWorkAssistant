@@ -67,8 +67,6 @@ pub async fn do_start(
         crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let credits_file: RemainingCreditsFile =
         crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
-    let device_map: DeviceMap =
-        crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
 
     // 调度策略（T10）：api_pool.json.strategy，空/未知值回退 expire_first
     let strategy = crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy);
@@ -151,28 +149,12 @@ pub async fn do_start(
         }
     }
 
-    // 创建池并同步（含调度策略与分组筛选）
+    // 创建池并同步（装配逻辑抽公共函数：do_start 与凭据变更热重载共用，见 apply_pool_snapshot）
     let pool = ApiPool::new();
     pool.set_strategy(strategy);
-    // 池积分语义 = 通用积分（product_id 208，llm_utils_chat 实际扣减的类别）：
-    // 优先取 general 表，账号未重新刷新过缓存时回退旧的总积分表
-    let pool_credits: std::collections::HashMap<String, f64> = credits_file
-        .credits
-        .iter()
-        .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
-        .collect();
-    pool.sync_from_accounts(
-        &accounts.accounts,
-        &pool_file.enabled_uids,
-        &pool_file.group_ids,
-        &groups_file.membership,
-        &cooldowns_file.cooldowns,
-        &pool_credits,
-        &credits_file.expire_times,
-        &device_map,
-    );
+    let wb_pool = ApiPool::new();
+    let (pool_count, wb_uids_len, wb_accounts_total) = apply_pool_snapshot(state, &pool, &wb_pool);
 
-    let pool_count = pool.count();
     let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
         &state.data_dir,
@@ -182,27 +164,19 @@ pub async fn do_start(
         ),
     );
 
-    // ===== WorkBuddy 上游池装配（T2.1）=====
-    // 入池白名单：显式 wb_enabled_uids 优先；空时兼容旧共享 enabled_uids 混存的
-    // wb- 条目；两者皆空 = 全部含凭证账号自动入池（Buddy 页设计语义）
-    let wb_accounts = crate::commands::workbuddy::wb_upstream_accounts(state);
-    let wb_uids = effective_wb_uids(&pool_file, &wb_accounts);
-    let wb_pool = ApiPool::new();
-    wb_pool.sync_from_wb(&wb_accounts, &wb_uids);
-    let wb_count = wb_pool.count();
-    let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     // Buddy 池策略：wb_strategy 独立配置优先；空 = 跟随 Trae 池（与 pool_set 热应用逻辑一致）
     let wb_strategy = crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy);
+    let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "API服务启动-WB上游池: enabled={} accounts={} healthy={} strategy={} whitelist={} (total_cred={})",
+            "API服务启动-WB上游池: enabled={} accounts={} healthy={} strategy={} whitelist={} (total_accounts={})",
             pool_file.wb_enabled,
-            wb_count,
+            wb_pool.count(),
             wb_healthy,
             wb_strategy.as_str(),
-            wb_uids.len(),
-            wb_accounts.len(),
+            wb_uids_len,
+            wb_accounts_total,
         ),
     );
     wb_pool.set_strategy(wb_strategy);
@@ -413,6 +387,62 @@ fn effective_wb_uids(
     wb_accounts.iter().map(|a| a.uid.clone()).collect()
 }
 
+/// 池装配公共逻辑（do_start 构建 / 凭据变更热重载共用）：
+/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建两池内条目。
+/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数) 供调用方记日志。
+fn apply_pool_snapshot(state: &AppState, pool: &ApiPool, wb_pool: &ApiPool) -> (usize, usize, usize) {
+    let accounts = crate::vault::load_accounts(state);
+    let pool_file: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
+    let groups_file: crate::models::GroupsFile =
+        crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
+    let cooldowns_file: AccountCooldownsFile =
+        crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
+    let credits_file: RemainingCreditsFile =
+        crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
+    let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
+    // 池积分语义 = 通用积分（product_id 208，llm_utils_chat 实际扣减的类别）：
+    // 优先取 general 表，账号未重新刷新过缓存时回退旧的总积分表（与 do_start 原装配一致）
+    let pool_credits: std::collections::HashMap<String, f64> = credits_file
+        .credits
+        .iter()
+        .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
+        .collect();
+    pool.sync_from_accounts(
+        &accounts.accounts,
+        &pool_file.enabled_uids,
+        &pool_file.group_ids,
+        &groups_file.membership,
+        &cooldowns_file.cooldowns,
+        &pool_credits,
+        &credits_file.expire_times,
+        &device_map,
+    );
+    let wb_accounts = crate::commands::workbuddy::wb_upstream_accounts(state);
+    let wb_uids = effective_wb_uids(&pool_file, &wb_accounts);
+    wb_pool.sync_from_wb(&wb_accounts, &wb_uids);
+    (pool.count(), wb_uids.len(), wb_accounts.len())
+}
+
+/// 网关运行中热重载两池（凭据/成员变更联动）：OAuth 重登、refresh_token 刷新、
+/// 手动更新 JWT、导入账号、保存账号池后调用；服务未运行时为 no-op。
+/// 全量重建修复运行中池的陈旧快照——旧 JWT / SessionDead 禁用 / 冷却 / 积分 /
+/// 新勾选成员缺失（此前仅 note_refresh_success 单点回填 JWT，覆盖不了这些场景，
+/// 用户实测「刚登录的 JWT 网关还是不行」即此根因）。
+pub fn reload_pools_if_running(
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+) {
+    let guard = safe_lock(runtime);
+    let Some(rt) = guard.as_ref() else { return };
+    let (trae, wb_uids, wb_total) = apply_pool_snapshot(state, &rt.shared.pool, &rt.shared.wb_pool);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务池热重载(凭据/成员变更联动): trae_pool={trae} wb_whitelist={wb_uids} wb_accounts={wb_total}"
+        ),
+    );
+}
+
 /// pool_set 字段合并（纯函数，便于单测）：未传（None）保留 existing 原值，传值覆盖。
 /// 注意 strategy/wb_strategy 的显式空串是合法值（"跟随默认"语义），与 None（未传）区分；
 /// group_ids 显式空数组 = 清空分组，None = 保留（语义与其他字段统一）。
@@ -551,7 +581,24 @@ pub fn pool_set(
             pool_file.pool_sticky_ttl_secs,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // Buddy 资源开关热应用（此前仅启动时读取，改动需重启服务生效）
+        rt.shared
+            .wb_enabled
+            .store(pool_file.wb_enabled, std::sync::atomic::Ordering::Relaxed);
+        rt.shared.wb_default_thinking.store(
+            pool_file.wb_default_thinking,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared
+            .wb_tool_exec
+            .store(pool_file.wb_tool_exec, std::sync::atomic::Ordering::Relaxed);
+        rt.shared
+            .wb_bg_downgrade
+            .store(pool_file.wb_bg_downgrade, std::sync::atomic::Ordering::Relaxed);
     }
+    // 成员/分组热应用：此前仅策略/参数热生效，成员变更要求重启服务；
+    // 现统一走凭据/成员变更联动热重载，保存账号池后立即生效
+    reload_pools_if_running(&state, &runtime);
     Ok(())
 }
 

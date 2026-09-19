@@ -23,6 +23,7 @@ Thumbs.db
 
 # WorkBuddy 自动产物（严禁提交）
 .workbuddy/
+.codebuddy/
 
 # 运行时数据（证书、账号状态等）
 data/
@@ -48,3 +49,4 @@ overview.md
 tauri.dev.conf.json
 # 本地素材导出产物（promo banner 等）
 out/
+

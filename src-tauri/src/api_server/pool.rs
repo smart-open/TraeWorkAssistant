@@ -650,20 +650,6 @@ impl ApiPool {
         }
     }
 
-    /// F-78 批次 3：refresh_token 刷新成功 → 回填新凭证并解除失效禁用
-    /// （仅当 disabled 因 refresh_invalid 置位时恢复；SessionDead 等其他禁用原因不动）
-    pub fn note_refresh_success(&self, uid: &str, jwt: &str) {
-        let mut entries = safe_lock(&self.entries);
-        if let Some(e) = entries.get_mut(uid) {
-            e.jwt = jwt.to_string();
-            if e.refresh_invalid {
-                e.refresh_invalid = false;
-                e.disabled = false;
-                e.reason.clear();
-            }
-        }
-    }
-
     /// 记录错误并冷却（T2.2 错误三态 + 分级冷却）
     pub fn note_error(&self, uid: &str, kind: ErrKind) {
         let mut entries = safe_lock(&self.entries);
@@ -1262,23 +1248,14 @@ mod tests {
 
     #[test]
     fn refresh_invalid_runtime_note_and_recover() {
-        // 运行时联动：note_refresh_invalid 禁用 → note_refresh_success 解除并回填新 JWT
+        // 运行时联动：note_refresh_invalid 禁用 → 恢复路径 = 凭据变更联动热重载
+        // reload_pools_if_running → sync_from_accounts 全量重建（commands/api_server.rs），
+        // 原单点回填 note_refresh_success 已被其取代并移除
         let pool = build_pool(&[("uid_a", 100.0, 0)]);
         pool.note_refresh_invalid("uid_a");
         let st = &pool.status_list()[0];
         assert!(st.disabled && st.refresh_invalid);
         assert!(pool.pick_excluding(&HashSet::new()).is_none());
-
-        pool.note_refresh_success("uid_a", "Cloud-IDE-JWT new");
-        let st = &pool.status_list()[0];
-        assert!(!st.disabled && !st.refresh_invalid);
-        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
-        assert_eq!(picked.jwt, "Cloud-IDE-JWT new");
-
-        // 非 refresh_invalid 原因的禁用（SessionDead）不被 note_refresh_success 恢复
-        pool.note_error("uid_a", ErrKind::SessionDead);
-        pool.note_refresh_success("uid_a", "Cloud-IDE-JWT again");
-        assert!(pool.status_list()[0].disabled);
     }
 
     // ==================== T2.2 新增 ====================

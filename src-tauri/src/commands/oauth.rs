@@ -1276,14 +1276,9 @@ pub fn oauth_login(
         );
     }
 
-    // F-78 批次 3：重新登录拿到新凭证 → 运行中 API 池回填 JWT 并解除 refresh_token 失效禁用
-    {
-        let guard = runtime.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(rt) = guard.as_ref() {
-            rt.shared.pool.note_refresh_success(&user_id, &jwt);
-            rt.shared.wb_pool.note_refresh_success(&user_id, &jwt);
-        }
-    }
+    // 重新登录拿到新凭证 → 运行中 API 池热重载（全量重建，覆盖单点回填管不到的
+    // 陈旧快照：SessionDead 禁用 / 冷却 / 积分 / 新账号缺失；服务未运行时 no-op）
+    crate::commands::api_server::reload_pools_if_running(&state, &runtime);
 
     Ok(OAuthLoginResult {
         user_id: user_id.clone(),

@@ -178,20 +178,90 @@ pub fn find<'a>(catalog: &'a [WbModel], model: &str) -> Option<&'a WbModel> {
 
 // ==================== T5.1/F-37 动态目录替换 ====================
 
-/// 上游目录响应 → 模型列表（宽容解析：字段链逐级探测，能力字段读上游勿硬编码）。
-/// 兼容三种容器形态：根数组 / {data: []} / {models: []}（值可为 list 或含 list 字段）。
-/// 解析产出 0 条视为失败（不产脏目录），由调用方决定回退行为。
-pub fn parse_upstream_catalog(body: &Value) -> Vec<WbModel> {
-    let items: Vec<Value> = match body {
-        Value::Array(arr) => arr.clone(),
-        v => v
-            .get("data")
-            .or_else(|| v.get("models"))
-            .or_else(|| v.get("list"))
-            .and_then(|d| d.as_array())
-            .cloned()
-            .unwrap_or_default(),
-    };
+/// 条目是否具备「模型能力特征」——至少含一个能力/定价字段。
+/// 2026-09 实测：agents 容器里无 models 子数组的 agent 条目（仅 name/description/
+/// instructions/tools/commands，如 general-purpose/compact/plan）会被定向收集兜进来，
+/// 此处按特征剔除，防 agent/命令名污染目录（agent 不是模型人格，models 挂字符串数组）。
+fn looks_like_model(item: &Value) -> bool {
+    const KEYS: &[&str] = &[
+        "maxOutputTokens",
+        "maxInputTokens",
+        "maxTokens",
+        "max_tokens",
+        "credits",
+        "rate",
+        "ratio",
+        "price",
+        "creditRate",
+        "contextLength",
+        "context_length",
+        "inputTokenLimit",
+        "inputModalities",
+        "input_modalities",
+        "modalities",
+        "supportsImages",
+        "reasoning",
+        "supportedEfforts",
+        "supported_efforts",
+    ];
+    KEYS.iter().any(|k| item.get(*k).is_some())
+}
+
+/// 噪音模型 id 黑名单：路由别名 / 内部条目，不是可调度的真实模型。
+/// 2026-09-19 用户确认 + 抓包实证（30 条目录 vs 客户端 14 条可用模型）：
+/// - "default"：通用路由别名（vendor v，兜底倍率 x2.20）；
+/// - "auto"：AutoMode 元模型（客户端由 productFeatures.AutoMode 开关单独渲染，非菜单项）；
+/// - "hunyuan-chat"：无定价内部条目（仅 supportsToolCall + 尺寸字段）。
+/// "hunyuan-image-v3.0"（画图条目，零能力字段）已由 looks_like_model 剔除，无需入名单。
+fn is_noise_model_id(id: &str) -> bool {
+    matches!(id, "auto" | "default" | "hunyuan-chat")
+}
+
+/// 官方客户端过滤逻辑逆向（2026-09-19 抓包实证）：客户端模型菜单 =
+/// `cli` agent（tags 含 cli+default）的 models 白名单 ∩ data.models 元数据，
+/// 菜单顺序也与该白名单一致；auto 由 AutoMode 开关单独渲染不入菜单。
+/// 同名双档（hy3/hy3-x 同名 Hy3、hy4-preview/hy4-preview-x 同名 Hy4 preview）
+/// 客户端按展示名去重只显示首个，但二者是真实不同价档位，网关侧保留双档。
+/// 返回 None = 响应无 cli 主 agent（旧形态/端点变更），不做白名单过滤。
+fn cli_agent_whitelist(body: &Value) -> Option<Vec<String>> {
+    let agents = body
+        .get("data")
+        .and_then(|d| d.get("agents"))
+        .or_else(|| body.get("agents"))?
+        .as_array()?;
+    for a in agents {
+        let tags: Vec<&str> = a
+            .get("tags")
+            .and_then(|t| t.as_array())
+            .map(|arr| arr.iter().filter_map(|t| t.as_str()).collect())
+            .unwrap_or_default();
+        if !tags.contains(&"cli") || !tags.contains(&"default") {
+            continue;
+        }
+        let ids: Vec<String> = a
+            .get("models")?
+            .as_array()?
+            .iter()
+            .filter_map(|m| m.as_str().map(str::to_string))
+            .collect();
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+    }
+    None
+}
+
+/// 从单条候选对象解析模型（字段链宽容探测，能力字段读上游勿硬编码）。
+/// 2026-09 实测字段链（copilot.tencent.com console/personal/models data.models[]）：
+/// - 倍率 `credits`："x0.05" / "x0.00 credits" 字符串；
+/// - 档位嵌套 `reasoning.supportedEfforts`（数组）或 `reasoning.effort`（固定单档）；
+/// - 上下文 `maxInputTokens`（兜底 `maxAllowedSize` / `contextWindow.defaultLength`）；
+/// - 图片 `supportsImages` 布尔（`disabledMultimodal: true` 时禁用多模态）；
+/// - 最大输出 `maxOutputTokens`（此前唯一命中的键）。
+fn model_from_item(item: &Value) -> Option<WbModel> {
+    if !item.is_object() {
+        return None;
+    }
     let dig_str = |v: &Value, keys: &[&str]| -> Option<String> {
         keys.iter().find_map(|k| {
             v.get(*k).and_then(|x| x.as_str()).map(str::to_string).or_else(|| {
@@ -227,36 +297,186 @@ pub fn parse_upstream_catalog(body: &Value) -> Vec<WbModel> {
             })
             .unwrap_or_default()
     };
+    let Some(id) = dig_str(item, &["id", "model", "modelId", "name"])
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+    else {
+        return None;
+    };
+    // 倍率：credits 字符串形如 "x0.05" / "x0.00 credits"（前缀倍数标记 + 可能的单位尾巴）；
+    // 数字形态或旧键（rate/ratio/price/creditRate）兜底
+    let rate = dig_f64(item, &["rate", "ratio", "price", "creditRate"]).unwrap_or_else(|| {
+        item.get("credits")
+            .and_then(|x| match x {
+                Value::Number(n) => n.as_f64(),
+                Value::String(s) => s
+                    .trim()
+                    .trim_start_matches(['x', 'X'])
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok()),
+                _ => None,
+            })
+            .unwrap_or(0.0)
+    });
+    // 档位：顶层旧键 → reasoning.supportedEfforts 数组 → reasoning.effort 固定单档（统一小写）
+    let reasoning = item.get("reasoning");
+    let mut supported_efforts = dig_strs(item, &["supportedEfforts", "supported_efforts", "efforts"]);
+    if supported_efforts.is_empty() {
+        if let Some(r) = reasoning {
+            supported_efforts = dig_strs(r, &["supportedEfforts", "supported_efforts", "efforts"]);
+            if supported_efforts.is_empty() {
+                if let Some(e) = r.get("effort").and_then(|x| x.as_str()) {
+                    if !e.trim().is_empty() {
+                        supported_efforts.push(e.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    let supported_efforts: Vec<String> =
+        supported_efforts.into_iter().map(|e| e.to_lowercase()).collect();
+    // 图片：supportsImages 布尔（disabledMultimodal 显式禁用多模态时置否）；
+    // 旧模态数组形态（inputModalities/modalities）兜底
+    let disabled_multimodal = item.get("disabledMultimodal").and_then(Value::as_bool).unwrap_or(false);
+    let modalities = dig_strs(item, &["inputModalities", "input_modalities", "modalities"]);
+    let supports_image = match item.get("supportsImages").and_then(Value::as_bool) {
+        Some(b) => b && !disabled_multimodal,
+        None => modalities
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case("image") || m.eq_ignore_ascii_case("image_url")),
+    };
+    Some(WbModel {
+        display: dig_str(item, &["displayName", "display", "name"]).unwrap_or_else(|| id.clone()),
+        context_length: dig_u64(
+            item,
+            &["contextLength", "context_length", "inputTokenLimit", "maxInputTokens", "maxAllowedSize"],
+        )
+        .unwrap_or_else(|| {
+            item.get("contextWindow")
+                .and_then(|c| c.get("defaultLength"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        }),
+        max_tokens: dig_u64(item, &["maxTokens", "max_tokens", "maxOutputTokens"]).unwrap_or(0),
+        supports_image,
+        supported_efforts,
+        effort_override: None, // 修正层仅人工/实测维护，不从上游读
+        rate,
+        id,
+    })
+}
 
-    let mut out = Vec::new();
-    for item in &items {
-        if !item.is_object() {
+/// 定向容器收集：从响应中找出「模型条目」候选对象列表。
+/// 兼容形态（按上游演进逐版累积）：
+/// 1. 根数组 / `{data: []}` / `{models: []}` / `{list: []}`（条目直接是模型）；
+/// 2. **`{code:0, data:{agents:[…]}}`**（2026-09 实测新形态）——`data` 为对象，
+///    模型/agent 列表挂在对象的数组字段下（agents/models/list/items/entries）；
+/// 3. agent 条目内嵌 `models`/`list`/`items` 子数组（每 agent 挂自己的模型表）→ 展开子条目，
+///    无内嵌子数组的 agent 条目本身作为候选（agent 即模型人格的形态）。
+fn collect_candidates(v: &Value, out: &mut Vec<Value>, depth: usize) {
+    if depth > 6 {
+        return;
+    }
+    match v {
+        Value::Array(arr) => {
+            for el in arr {
+                let mut nested = false;
+                for key in ["models", "list", "items"] {
+                    if let Some(sub) = el.get(key).and_then(Value::as_array) {
+                        collect_candidates(&Value::Array(sub.clone()), out, depth + 1);
+                        nested = true;
+                    }
+                }
+                if !nested {
+                    out.push(el.clone());
+                }
+            }
+        }
+        Value::Object(obj) => {
+            for key in ["data", "models", "list", "items", "agents", "entries", "result"] {
+                if let Some(sub) = obj.get(key) {
+                    if sub.is_array() || sub.is_object() {
+                        collect_candidates(sub, out, depth + 1);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 深度扫描兜底（定向解析产出 0 条时）：全树递归收集「像模型条目」的对象
+/// ——必须有**非空字符串**的显式 id 键（id/model/modelId/model_id）才算候选，
+/// 防止把分页数字等噪音当模型。上游结构再漂移时的最后防线。
+fn deep_scan_models(v: &Value, out: &mut Vec<Value>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    match v {
+        Value::Array(arr) => {
+            for x in arr {
+                deep_scan_models(x, out, depth + 1);
+            }
+        }
+        Value::Object(_) => {
+            let id_like = ["id", "model", "modelId", "model_id"].iter().any(|k| {
+                matches!(v.get(*k), Some(Value::String(s)) if !s.trim().is_empty())
+            });
+            if id_like {
+                out.push(v.clone());
+            }
+            if let Some(obj) = v.as_object() {
+                for (_k, val) in obj {
+                    deep_scan_models(val, out, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 上游目录响应 → 模型列表（宽容解析：定向容器探测 → 深扫兜底 → 按 id 去重）。
+/// 候选须通过 `looks_like_model` 能力特征过滤（剔 agent/命令噪音条目）；
+/// 解析产出 0 条视为失败（不产脏目录），由调用方决定回退行为。
+pub fn parse_upstream_catalog(body: &Value) -> Vec<WbModel> {
+    let mut candidates: Vec<Value> = Vec::new();
+    collect_candidates(body, &mut candidates, 0);
+    // 官方客户端口径（抓包逆向）：cli agent 白名单 ∩ data.models，再剔路由别名黑名单；
+    // 白名单缺失（旧形态）时仅黑名单过滤
+    let whitelist = cli_agent_whitelist(body);
+    let admitted = |m: &WbModel| -> bool {
+        !is_noise_model_id(&m.id)
+            && whitelist
+                .as_ref()
+                .map_or(true, |w| w.iter().any(|x| x.eq_ignore_ascii_case(&m.id)))
+    };
+    let mut out: Vec<WbModel> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for item in &candidates {
+        if !looks_like_model(item) {
             continue;
         }
-        let Some(id) = dig_str(item, &["id", "model", "modelId", "name"])
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-        let modalities = dig_strs(item, &["inputModalities", "input_modalities", "modalities"]);
-        let supports_image = modalities
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case("image") || m.eq_ignore_ascii_case("image_url"));
-        let model = WbModel {
-            display: dig_str(item, &["displayName", "display", "name"]).unwrap_or_else(|| id.clone()),
-            context_length: dig_u64(item, &["contextLength", "context_length", "inputTokenLimit"]).unwrap_or(0),
-            max_tokens: dig_u64(item, &["maxTokens", "max_tokens", "maxOutputTokens"]).unwrap_or(0),
-            supports_image,
-            supported_efforts: dig_strs(item, &["supportedEfforts", "supported_efforts", "efforts"])
-                .into_iter()
-                .map(|e| e.to_lowercase())
-                .collect(),
-            effort_override: None, // 修正层仅人工/实测维护，不从上游读
-            rate: dig_f64(item, &["rate", "ratio", "price", "creditRate"]).unwrap_or(0.0),
-            id,
-        };
-        out.push(model);
+        if let Some(m) = model_from_item(item) {
+            if admitted(&m) && seen.insert(m.id.clone()) {
+                out.push(m);
+            }
+        }
+    }
+    if out.is_empty() {
+        let mut scanned: Vec<Value> = Vec::new();
+        deep_scan_models(body, &mut scanned, 0);
+        for item in &scanned {
+            if !looks_like_model(item) {
+                continue;
+            }
+            if let Some(m) = model_from_item(item) {
+                if admitted(&m) && seen.insert(m.id.clone()) {
+                    out.push(m);
+                }
+            }
+        }
     }
     out
 }
@@ -306,6 +526,18 @@ pub fn fetch_and_replace(
         let excerpt: String = text.chars().take(200).collect();
         return Err(format!(
             "上游目录解析产出 0 个模型（响应结构与预期不符，body 摘要: {excerpt}），本地目录保持不变"
+        ));
+    }
+    // 质量守门：全部条目的能力字段全零（倍率/档位/上下文皆空）= 字段链漂移信号
+    // （2026-09 实测教训：agents 新形态下仅 maxOutputTokens 命中，产出 39 条全零目录）。
+    // 有 id 无能力 = 噪音目录，拒绝落盘保持旧目录。
+    if models
+        .iter()
+        .all(|m| m.rate == 0.0 && m.supported_efforts.is_empty() && m.context_length == 0)
+    {
+        return Err(format!(
+            "上游目录 {} 个条目能力字段全空（倍率/档位/上下文均未解析到，字段链疑似漂移），本地目录保持不变",
+            models.len()
         ));
     }
     let count = models.len();
@@ -407,14 +639,18 @@ mod tests {
 
     #[test]
     fn parse_upstream_catalog_tolerates_missing_fields_and_garbage() {
-        // 缺能力字段 → 零值默认，不报错
-        let out = parse_upstream_catalog(&serde_json::json!({"data": [{"id": "M1"}, {"model": "M2"}]}));
+        // 有能力字段但缺其他字段 → 零值默认，不报错
+        let out = parse_upstream_catalog(&serde_json::json!({"data": [
+            {"id": "M1", "credits": "x0.10"}, {"model": "M2", "maxOutputTokens": 4096},
+        ]}));
         assert_eq!(out.len(), 2);
         assert!(out[0].id == "m1" && out[1].id == "m2");
         assert!(!out[0].supports_image);
         assert!(out[0].supported_efforts.is_empty());
-        // 非 dict 条目 / 缺 id → 跳过
-        let out = parse_upstream_catalog(&serde_json::json!({"data": ["junk", {"displayName": "无id"}, 42]}));
+        assert!((out[0].rate - 0.10).abs() < 1e-9);
+        assert_eq!(out[1].max_tokens, 4096);
+        // 裸 id 条目（无任何能力字段）→ 当噪音过滤
+        let out = parse_upstream_catalog(&serde_json::json!({"data": ["junk", {"displayName": "无id"}, 42, {"id": "bare"}]}));
         assert!(out.is_empty());
         // 完全无关结构 → 空列表（调用方保持本地目录不变）
         assert!(parse_upstream_catalog(&serde_json::json!({"foo": 1})).is_empty());
@@ -431,5 +667,147 @@ mod tests {
         assert_eq!(out[0].context_length, 1_000_000, "字符串数值宽容解析");
         assert!((out[0].rate - 0.35).abs() < 1e-9);
         assert!(out[0].supports_image, "modalities 别名键");
+    }
+
+    #[test]
+    fn parse_upstream_catalog_data_object_with_agents() {
+        // 防御形态：data 为对象，agents[] 挂在对象字段下（每 agent 内嵌完整模型对象——
+        // 带能力字段才认；2026-09 抓包实测上游真实形态为字符串 id 数组，见
+        // parse_upstream_catalog_2026_09_copilot_real_shape）
+        let entry = serde_json::json!({
+            "id": "glm-5.3",
+            "displayName": "GLM 5.3",
+            "contextLength": 200000,
+            "inputModalities": ["text", "image"],
+        });
+        let body = serde_json::json!({
+            "code": 0,
+            "data": {
+                "agents": [
+                    {"commands": ["init", "compact", "statusline", "insights"], "models": [entry.clone()]},
+                    {"commands": ["init"], "models": [{"id": "hy4-preview", "displayName": "Hy4 Preview", "maxOutputTokens": 8192}]},
+                ]
+            }
+        });
+        let out = parse_upstream_catalog(&body);
+        assert_eq!(out.len(), 2, "agents 内嵌 models 展开");
+        assert_eq!(out[0].id, "glm-5.3");
+        assert!(out[0].supports_image);
+        assert_eq!(out[1].id, "hy4-preview");
+    }
+
+    #[test]
+    fn parse_upstream_catalog_agents_without_capability_are_noise() {
+        // 2026-09 实测修正：agent 条目（无 models 子数组）不是模型人格——
+        // 仅 id/name/commands 的 agent（general-purpose/compact 等）一律剔除
+        let body = serde_json::json!({
+            "code": 0,
+            "data": {
+                "agents": [
+                    {"id": "kimi-k3", "name": "Kimi K3", "commands": ["init", "compact"]},
+                    {"name": "general-purpose", "description": "general-purpose agent", "instructions": "x", "tools": []},
+                ]
+            }
+        });
+        assert!(parse_upstream_catalog(&body).is_empty(), "agent 条目不再进目录");
+    }
+
+    #[test]
+    fn parse_upstream_catalog_2026_09_copilot_real_shape() {
+        // 2026-09-19 copilot.tencent.com/console/enterprises/personal/models 抓包固化：
+        // data.agents[].models 是字符串 id 数组（cli 主 agent = 客户端模型菜单白名单）；
+        // 真实模型元数据在 data.models[]，倍率 credits="x0.05 credits"、档位嵌套
+        // reasoning.supportedEfforts / reasoning.effort 单档、上下文 maxInputTokens、
+        // 图片 supportsImages±disabledMultimodal；
+        // 过滤：cli 白名单之外剔除（default/glm-4.6 等），黑名单剔除 auto/hunyuan-chat
+        let body = serde_json::json!({
+            "code": 0, "msg": "OK",
+            "data": {
+                "endpoint": "https://copilot.tencent.com",
+                "mergeStrategy": "merge",
+                "agents": [
+                    {"commands": ["init", "compact"], "description": "cli agent",
+                     "models": ["auto", "hy3", "hy3-x", "glm-5.3", "glm-5.0"], "name": "cli", "tags": ["cli", "default"]},
+                    {"description": "general-purpose agent", "instructions": "x",
+                     "name": "general-purpose", "tags": ["cli", "general-purpose"], "tools": []},
+                    {"description": "compact agent", "instructions": "x", "name": "compact", "tools": []},
+                ],
+                "models": [
+                    {"credits": "x2.20 credits", "id": "auto", "name": "Auto",
+                     "maxInputTokens": 256000, "maxOutputTokens": 32000,
+                     "onlyReasoning": true, "reasoning": {"effort": "high"}, "supportsImages": true},
+                    {"credits": "x0.00 credits", "id": "hy3", "name": "Hy3",
+                     "maxInputTokens": 192000, "maxOutputTokens": 64000,
+                     "onlyReasoning": true, "reasoning": {"effort": "high", "summary": "auto"},
+                     "supportsImages": true, "supportsReasoning": true,
+                     "tags": ["craft", "badge:限时免费:#FF0000"], "vendor": "j"},
+                    {"credits": "x0.05", "id": "hy3-x", "name": "Hy3",
+                     "maxInputTokens": 192000, "maxOutputTokens": 64000,
+                     "reasoning": {"canDisableThinking": false, "defaultEffort": "high",
+                                   "summary": "auto", "supportedEfforts": ["low", "high"]},
+                     "supportsImages": true, "vendor": "j"},
+                    {"credits": "x0.79", "disabledMultimodal": true, "id": "glm-5.0",
+                     "maxInputTokens": 200000, "maxOutputTokens": 48000, "name": "GLM-5.0",
+                     "reasoning": {"effort": "medium"}, "supportsImages": true, "vendor": "e"},
+                    {"credits": "x0.23 credits", "id": "default", "name": "Default",
+                     "maxInputTokens": 200000, "maxOutputTokens": 24000, "supportsToolCall": true},
+                    {"id": "hunyuan-chat", "maxInputTokens": 200000, "maxOutputTokens": 8192,
+                     "name": "Hunyuan-Turbos", "supportsImages": false},
+                ],
+            }
+        });
+        let out = parse_upstream_catalog(&body);
+        assert_eq!(out.len(), 3, "cli 白名单内真模型：hy3/hy3-x/glm-5.0；auto/default/hunyuan-chat 剔除");
+        assert!(out.iter().all(|m| m.id != "auto"), "auto 属黑名单（白名单命中也剔除）");
+        assert!(out.iter().all(|m| m.id != "default"), "default 不在 cli 白名单");
+        assert!(out.iter().all(|m| m.id != "hunyuan-chat"), "hunyuan-chat 黑名单 + 不在白名单");
+        let hy3 = out.iter().find(|m| m.id == "hy3").unwrap();
+        assert!((hy3.rate - 0.0).abs() < 1e-9, "credits 带单位尾巴解析为数值");
+        assert_eq!(hy3.supported_efforts, vec!["high"], "reasoning.effort 固定单档");
+        assert_eq!(hy3.context_length, 192_000);
+        assert!(hy3.supports_image);
+        let hy3x = out.iter().find(|m| m.id == "hy3-x").unwrap();
+        assert!((hy3x.rate - 0.05).abs() < 1e-9);
+        assert_eq!(hy3x.supported_efforts, vec!["low", "high"], "reasoning.supportedEfforts 嵌套数组");
+        let glm50 = out.iter().find(|m| m.id == "glm-5.0").unwrap();
+        assert!((glm50.rate - 0.79).abs() < 1e-9);
+        assert!(!glm50.supports_image, "disabledMultimodal=true 压制 supportsImages");
+        assert_eq!(glm50.supported_efforts, vec!["medium"]);
+    }
+
+    #[test]
+    fn parse_upstream_catalog_without_cli_agent_keeps_denylist_only() {
+        // 无 cli 主 agent（旧形态/端点变更）→ 不做白名单过滤，仅黑名单兜底
+        let body = serde_json::json!({
+            "code": 0,
+            "data": {
+                "models": [
+                    {"credits": "x0.10", "id": "m-1", "name": "M1", "maxInputTokens": 100000},
+                    {"credits": "x2.20", "id": "default", "name": "Default", "maxInputTokens": 200000},
+                    {"id": "hunyuan-chat", "maxInputTokens": 200000, "maxOutputTokens": 8192},
+                ],
+            }
+        });
+        let out = parse_upstream_catalog(&body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "m-1");
+    }
+
+    #[test]
+    fn parse_upstream_catalog_deep_scan_fallback_and_dedupe() {
+        // 定向容器全不命中 → 全树深扫兜底（要求非空字符串显式 id + 能力特征）
+        let body = serde_json::json!({"x": {"y": [{"meta": 1}, {"model": "unknown-model", "credits": "x1.0"}]}});
+        let out = parse_upstream_catalog(&body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "unknown-model");
+        // 同 id 去重（保留首个）
+        let body = serde_json::json!({"data": [{"id": "M1", "credits": "x0.1"}, {"id": "M1", "credits": "x0.2"}, {"id": "m1", "credits": "x0.3"}]});
+        let out = parse_upstream_catalog(&body);
+        assert_eq!(out.len(), 1, "大小写不敏感去重");
+        // 数字 id / 空 id / 纯噪音不进深扫结果
+        let body = serde_json::json!({"a": {"id": 3}, "b": {"id": ""}, "c": {"id": "ok-model", "maxOutputTokens": 1024}});
+        let out = parse_upstream_catalog(&body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "ok-model");
     }
 }

@@ -166,7 +166,7 @@ export default function ApiService() {
   };
 
   // 分组筛选实时预览（T10）：按当前勾选 + 所选分组即时计算将纳入池中的账号，
-  // 让「点选分组」有立即可见的过滤反馈（实际入池在保存并重启 API 服务后生效）
+  // 让「点选分组」有立即可见的过滤反馈（保存后热重载即时生效，无需重启 API 服务）
   const groupUidSets = useMemo(
     () => groups.map((g) => ({ id: g.id, uids: new Set(g.uids ?? []) })),
     [groups],
@@ -216,10 +216,7 @@ export default function ApiService() {
     try {
       // 调度策略已收口至全局 API 管理「调度策略中心」，本页只保存成员/分组（未传字段后端保留原值）
       await withMinDelay(api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups]));
-      toast('success', '账号池已更新');
-      if (status?.running) {
-        toast('info', '需重启 API 服务以应用变更');
-      }
+      toast('success', '账号池已更新（服务运行中即时生效）');
     } catch (err) {
       toast('error', `保存账号池失败：${String(err)}`);
     } finally {
@@ -424,7 +421,7 @@ export default function ApiService() {
             </p>
           ) : (
             <>
-              {/* 分组筛选（T10，保存后需重启 API 服务生效）；调度策略已收口至全局 API 管理调度策略中心 */}
+              {/* 分组筛选（T10，保存后热重载即时生效）；调度策略已收口至全局 API 管理调度策略中心 */}
               <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
                 {groups.length > 0 && (
                   <div className="flex items-start gap-2">
@@ -467,7 +464,7 @@ export default function ApiService() {
                   </div>
                 )}
                 <p className="text-xs text-slate-400 dark:text-zinc-500">
-                  分组筛选作用于网关取号范围，保存后需重启 API 服务生效；不选分组 = 全部参与。
+                  分组筛选作用于网关取号范围，保存后即时生效；不选分组 = 全部参与。
                   调度策略（池间 / 池内）请在全局 API 管理「资源总览 → 调度策略中心」配置。
                 </p>
               </div>
