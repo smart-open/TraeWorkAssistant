@@ -17,8 +17,8 @@ import type {
 /**
  * Buddy · 资源调度（unified-api-gateway-design §6.2，Phase 3）
  * 页内仅保留 Buddy 资源级内容：积分体系说明 / 池指标行 /
- * 左列（资源开关 + 调度参数合并面板，共用「保存」）/ 右列（账号池选择 + 模型目录（Buddy）上下排布），
- * 同行左右两列各占 1/2。
+ * 左列（账号池选择 + 资源开关与调度参数合并面板，共用右上角「保存」一次保存全部）/
+ * 右列（模型目录（Buddy）），同行左右两列各占 1/2。
  * 网关级功能（服务启停 / 使用方式 / 生态接入 / WB 用量统计）已全部迁至
  * 全局 API 管理弹窗（左侧栏 KeyRound 图标），页内不再出现网关级内容。
  */
@@ -190,7 +190,7 @@ export default function BuddyApiService() {
     void loadTodayUsage();
   }, [loadTodayUsage]);
 
-  // 保存资源开关：uids/strategy/groups 原样回传（本页不改 Trae 池配置）；
+  // 保存资源开关/调度参数/账号池白名单：uids/strategy/groups 原样回传（本页不改 Trae 池配置）；
   // WB 白名单随本次保存提交：未自定义传 null（后端保留原值，fail-open 语义不变，
   // 新增账号可持续自动入池；显式全量名单会冻结 fail-open）；清空传 []（后端同样 fail-open）；
   // F-76②/③/F-77 数值参数随开关一起保存（后端热应用，运行中即时生效）
@@ -208,7 +208,7 @@ export default function BuddyApiService() {
         }),
         600,
       );
-      pushToast('success', '资源开关与调度参数已保存（服务运行中即时生效）');
+      pushToast('success', '账号池选择、资源开关与调度参数已保存（服务运行中即时生效）');
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
@@ -299,105 +299,19 @@ export default function BuddyApiService() {
         />
         <StatCard
           label="池内账号"
-          value={credAccounts.length}
+          value={wbSelected.length}
           tone="violet"
-          hint="含凭证账号总数（wb_pool）"
+          hint="勾选参与 WB 调度的账号数（清空 = 全部含凭证账号自动入池）"
         />
       </div>
 
-      {/* 资源开关 + 调度参数（左列，合并面板）｜账号池选择 + 模型目录（右列），同行两列各占 1/2 */}
+      {/* 左列：账号池选择 + 资源开关与调度参数（合并面板）｜右列：模型目录（Buddy），同行两列各占 1/2 */}
       <div className="mt-4 grid grid-cols-12 items-start gap-4">
-        {/* 左列：资源开关 + 调度参数（合并为一个面板，共用「保存」，两者本就随 poolSet 一并落盘） */}
+        {/* 左列：账号池选择（上）+ 资源开关与调度参数（下）合并面板，共用右上角「保存」（随 poolSet 一并落盘） */}
         <div className="col-span-6">
           <div className="card p-4">
-            <div className="mb-3 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <ToggleLeft size={16} className="text-brand-500" />
-                <span className="text-sm font-medium">资源开关与调度参数</span>
-              </div>
-              <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving}>
-                {saving ? <Spinner /> : <Save size={15} />} 保存
-              </button>
-            </div>
-            <div className="mb-2">
-              {wbFlags.wbEnabled ? (
-                <Badge tone="green">上游已启用</Badge>
-              ) : (
-                <Badge tone="amber">上游未启用 — Buddy 源模型将显式报错</Badge>
-              )}
-            </div>
-            <div className="space-y-1.5">
-              {WB_FLAG_FIELDS.map((item) => (
-                <label
-                  key={item.key}
-                  className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50"
-                >
-                  <input
-                    type="checkbox"
-                    className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
-                    checked={wbFlags[item.key]}
-                    onChange={() => setWbFlags((prev) => ({ ...prev, [item.key]: !prev[item.key] }))}
-                  />
-                  <span className="min-w-0">
-                    <span className="block text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
-                    <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">{item.desc}</span>
-                  </span>
-                </label>
-              ))}
-            </div>
-
-            {/* 调度参数（F-76②/③/F-77：数值热参数，与资源开关同面板，保存即热生效） */}
-            <div className="mt-4 border-t border-slate-100 pt-3 dark:border-zinc-800">
-              <div className="mb-2 flex items-center gap-2">
-                <Gauge size={15} className="text-brand-500" />
-                <span className="text-sm font-medium">调度参数</span>
-                <span className="text-xs text-slate-400">保存即热生效 · 0 表示关闭/不限</span>
-              </div>
-              <div className="space-y-3">
-                {WB_PARAM_FIELDS.map((item) => (
-                  <div key={item.key} className="rounded-md px-1.5 py-1.5">
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="number"
-                          className="w-24 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
-                          min={item.min}
-                          max={item.max}
-                          step={item.step}
-                          value={wbParams[item.key]}
-                          onChange={(e) => {
-                            const v = Number(e.target.value);
-                            setWbParams((prev) => ({
-                              ...prev,
-                              [item.key]: Number.isFinite(v)
-                                ? Math.min(item.max, Math.max(item.min, v))
-                                : prev[item.key],
-                            }));
-                          }}
-                        />
-                        <span className="w-8 shrink-0 text-[11px] text-slate-400">{item.unit}</span>
-                      </div>
-                    </div>
-                    <p className="mt-1 text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
-                      {item.desc}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
-              保存后即时生效；Trae 池的调度策略与分组筛选在 Trae「资源调度」页配置，本页不改动。
-            </p>
-          </div>
-        </div>
-
-        {/* 右列：账号池选择（上）+ 模型目录（Buddy）（下），上下排布 */}
-        <div className="col-span-6 space-y-4">
-          {/* 账号池选择卡（现有 WB 池状态卡功能保留迁移；勾选即自定义入池白名单） */}
-          <div className="card p-4">
-            <div className="mb-3 flex items-center justify-between">
+            {/* 面板头＝账号池选择；「保存」位于面板整体右上角，一次保存账号池选择/资源开关/调度参数 */}
+            <div className="mb-3 flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <Activity size={16} className="text-brand-500" />
                 <span className="text-sm font-medium">账号池选择</span>
@@ -405,19 +319,24 @@ export default function BuddyApiService() {
                   {credAccounts.length > 0 && `已选 ${wbSelected.length}/${credAccounts.length}`}
                 </span>
               </div>
-              {credAccounts.length > 0 && (
-                <div className="flex items-center gap-1">
-                  <button
-                    className="btn-ghost px-2 py-0.5 text-xs"
-                    onClick={() => setWbUids(credAccounts.map((a) => a.id))}
-                  >
-                    全选
-                  </button>
-                  <button className="btn-ghost px-2 py-0.5 text-xs" onClick={() => setWbUids([])}>
-                    清空
-                  </button>
-                </div>
-              )}
+              <div className="flex items-center gap-1">
+                {credAccounts.length > 0 && (
+                  <>
+                    <button
+                      className="btn-ghost px-2 py-0.5 text-xs"
+                      onClick={() => setWbUids(credAccounts.map((a) => a.id))}
+                    >
+                      全选
+                    </button>
+                    <button className="btn-ghost px-2 py-0.5 text-xs" onClick={() => setWbUids([])}>
+                      清空
+                    </button>
+                  </>
+                )}
+                <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving}>
+                  {saving ? <Spinner /> : <Save size={15} />} 保存
+                </button>
+              </div>
             </div>
             <p className="mb-2 text-xs text-slate-400">
               {credAccounts.length === 0
@@ -456,8 +375,90 @@ export default function BuddyApiService() {
                 })}
               </div>
             )}
-          </div>
 
+            {/* 资源开关与调度参数（与账号池选择同面板，共用右上角「保存」） */}
+            <div className="mt-4 border-t border-slate-100 pt-3 dark:border-zinc-800">
+              <div className="mb-2 flex items-center gap-2">
+                <ToggleLeft size={16} className="text-brand-500" />
+                <span className="text-sm font-medium">资源开关与调度参数</span>
+              </div>
+              <div className="mb-2">
+                {wbFlags.wbEnabled ? (
+                  <Badge tone="green">上游已启用</Badge>
+                ) : (
+                  <Badge tone="amber">上游未启用 — Buddy 源模型将显式报错</Badge>
+                )}
+              </div>
+              <div className="space-y-1.5">
+                {WB_FLAG_FIELDS.map((item) => (
+                  <label
+                    key={item.key}
+                    className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50"
+                  >
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                      checked={wbFlags[item.key]}
+                      onChange={() => setWbFlags((prev) => ({ ...prev, [item.key]: !prev[item.key] }))}
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
+                      <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">{item.desc}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+
+              {/* 调度参数（F-76②/③/F-77：数值热参数，保存即热生效） */}
+              <div className="mt-4">
+                <div className="mb-2 flex items-center gap-2">
+                  <Gauge size={15} className="text-brand-500" />
+                  <span className="text-sm font-medium">调度参数</span>
+                  <span className="text-xs text-slate-400">保存即热生效 · 0 表示关闭/不限</span>
+                </div>
+                <div className="space-y-3">
+                  {WB_PARAM_FIELDS.map((item) => (
+                    <div key={item.key} className="rounded-md px-1.5 py-1.5">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs text-slate-700 dark:text-zinc-200">{item.label}</span>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            className="w-24 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+                            min={item.min}
+                            max={item.max}
+                            step={item.step}
+                            value={wbParams[item.key]}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              setWbParams((prev) => ({
+                                ...prev,
+                                [item.key]: Number.isFinite(v)
+                                  ? Math.min(item.max, Math.max(item.min, v))
+                                  : prev[item.key],
+                              }));
+                            }}
+                          />
+                          <span className="w-8 shrink-0 text-[11px] text-slate-400">{item.unit}</span>
+                        </div>
+                      </div>
+                      <p className="mt-1 text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                        {item.desc}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
+              保存后即时生效；Trae 池的调度策略与分组筛选在 Trae「资源调度」页配置，本页不改动。
+            </p>
+          </div>
+        </div>
+
+        {/* 右列：模型目录（Buddy） */}
+        <div className="col-span-6">
           {/* 同步官网模型（Buddy）卡（现有目录同步能力保留） */}
           <div className="card p-4">
             <div className="mb-3 flex items-center justify-between">

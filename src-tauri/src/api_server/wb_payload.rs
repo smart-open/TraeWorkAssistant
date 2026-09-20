@@ -14,7 +14,8 @@
 use serde_json::{json, Map, Value};
 
 /// 默认审核模板映射（映射表文件缺失时的内置兜底，§5.5 #9：
-/// CLI→CLI tool、Main branch→Default branch——任何一字改动即绕过逐字匹配）
+/// CLI→CLI tool、based on→built on——任何一字改动即绕过逐字匹配）。
+/// Codex 两条身份句前缀不带句号，兼容 GPT-5/GPT-5-Codex 等模型后缀变体。
 pub fn default_template_map() -> Vec<(String, String)> {
     vec![
         (
@@ -28,6 +29,32 @@ pub fn default_template_map() -> Vec<(String, String)> {
         (
             "Main branch (you will usually use this for PRs)".to_string(),
             "Default branch (you will usually use this for PRs)".to_string(),
+        ),
+        // Codex CLI v1 harness：instructions 首句身份声明
+        (
+            "You are Codex, based on GPT-5".to_string(),
+            "You are Codex, built on GPT-5".to_string(),
+        ),
+        // Codex CLI v2 harness：instructions 首句身份声明
+        (
+            "You are Codex, an agent based on GPT-5".to_string(),
+            "You are Codex, an agent built on GPT-5".to_string(),
+        ),
+        // Codex CLI v3 harness（9/19 新版 codex.exe 实证）：instructions 首句身份声明
+        (
+            "You are Codex, a coding agent based on GPT-5".to_string(),
+            "You are Codex, a coding agent built on GPT-5".to_string(),
+        ),
+        // Codex CLI v4 harness（同上新版 codex.exe 实证，CLI 官方 harness）
+        (
+            "You are a coding agent running in the Codex CLI".to_string(),
+            "You are a coding agent working in the Codex CLI".to_string(),
+        ),
+        // TraeCode harness：system 首句身份声明（日志实证 pool=trae 请求原文，
+        // 虽当前未被拦截，预防性兜底——同一指纹句一旦进入风控名单即全量 11128）
+        (
+            "You are an interactive agent in TraeCode that helps the USER with software engineering tasks.".to_string(),
+            "You are an interactive agent running in TraeCode that helps the USER with software engineering tasks.".to_string(),
         ),
     ]
 }
@@ -224,6 +251,21 @@ pub fn prepare_wb_chat_body(
             }
         }
         m.insert("messages".into(), Value::Array(merged));
+    }
+
+    // 指纹清洗覆盖 tools[].function.description（审核模板最小改写）：
+    // CLI harness 可能将身份句/生态术语嵌入工具描述，是消息体清洗的绕过通道
+    if sanitize {
+        if let Some(tools) = m.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            for tool in tools.iter_mut() {
+                if let Some(Value::String(d)) = tool
+                    .get_mut("function")
+                    .and_then(|f| f.get_mut("description"))
+                {
+                    *d = apply_template_map(d, templates);
+                }
+            }
+        }
     }
 
     normalize_tool_choice(m);
@@ -530,5 +572,142 @@ mod tests {
         // 无 name 的未知形态 → auto
         let out = rewrite(json!({"messages":[],"tool_choice":{"type":"weird"}}), None);
         assert_eq!(out["tool_choice"], json!("auto"));
+    }
+
+    /// Codex CLI 身份句指纹清洗（v1/v2 harness 首句，最小改写绕过逐字匹配）
+    #[test]
+    fn codex_identity_sentences_minimal_rewrite() {
+        let tpl = default_template_map();
+        // v1 harness 首句（gpt-5/5.1/5.3-codex 通用）
+        let v1 = "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer.";
+        let out = apply_template_map(v1, &tpl);
+        assert_ne!(out, v1);
+        assert!(out.starts_with("You are Codex, built on GPT-5."));
+        assert!(!out.contains("based on GPT-5"));
+        // v2 harness 首句（新版 harness）
+        let v2 = "You are Codex, an agent based on GPT-5. You and the user share one workspace.";
+        let out = apply_template_map(v2, &tpl);
+        assert_ne!(out, v2);
+        assert!(out.starts_with("You are Codex, an agent built on GPT-5."));
+        assert!(!out.contains("based on GPT-5"));
+        // v3 harness 首句（9/19 新版 codex.exe 实证）
+        let v3 = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
+        let out = apply_template_map(v3, &tpl);
+        assert_ne!(out, v3);
+        assert!(out.starts_with("You are Codex, a coding agent built on GPT-5."));
+        assert!(!out.contains("based on GPT-5"));
+        // v4 harness 首句（同上新版 codex.exe 实证，CLI 官方 harness）
+        let v4 = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant.";
+        let out = apply_template_map(v4, &tpl);
+        assert_ne!(out, v4);
+        assert!(out.starts_with("You are a coding agent working in the Codex CLI"));
+        assert!(!out.contains("running in the Codex CLI"));
+        // 两条规则互不误伤（v1 改写结果不含 v2 触发词，反之亦然）
+        assert_eq!(
+            apply_template_map("You are Codex, built on GPT-5.", &tpl),
+            "You are Codex, built on GPT-5."
+        );
+    }
+
+    /// Codex instructions → system 消息端到端清洗（responses_to_chat 产物形态）
+    #[test]
+    fn sanitize_covers_codex_instructions_system_message() {
+        let src = json!({"messages":[
+            {"role":"system","content":"You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer."},
+            {"role":"user","content":"帮我写个函数"},
+        ]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let tpl = default_template_map();
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, true, &tpl);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let s = v["messages"][0]["content"].as_str().unwrap();
+        assert!(s.contains("built on GPT-5"));
+        assert!(!s.contains("based on GPT-5"));
+        // user 消息不受影响
+        assert_eq!(v["messages"][1]["content"], json!("帮我写个函数"));
+        // sanitize=false 原样透传（清洗开关联动）
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, false, &tpl);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(v["messages"][0]["content"].as_str().unwrap().contains("based on GPT-5"));
+    }
+
+    /// TraeCode 身份句最小改写（日志实证 pool=trae system 首句原文，预防性兜底）
+    #[test]
+    fn trae_identity_sentence_minimal_rewrite() {
+        let tpl = default_template_map();
+        let src = "You are an interactive agent in TraeCode that helps the USER with software engineering tasks. Use the instructions below and the tools available to you to assist the USER.";
+        let out = apply_template_map(src, &tpl);
+        assert_ne!(out, src);
+        assert!(out.contains("interactive agent running in TraeCode"));
+        assert!(!out.contains("agent in TraeCode"));
+        // 改写结果不再命中触发词（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out);
+    }
+
+    /// TraeCode system 消息端到端清洗（pool=trae 请求形态）
+    #[test]
+    fn sanitize_covers_trae_system_message() {
+        let src = json!({"messages":[
+            {"role":"system","content":"You are an interactive agent in TraeCode that helps the USER with software engineering tasks. Use the instructions below and the tools available to you to assist the USER."},
+            {"role":"user","content":"fix the bug"},
+        ]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let tpl = default_template_map();
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, true, &tpl);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let s = v["messages"][0]["content"].as_str().unwrap();
+        assert!(s.contains("agent running in TraeCode"));
+        assert!(!s.contains("agent in TraeCode"));
+        // user 消息不受影响
+        assert_eq!(v["messages"][1]["content"], json!("fix the bug"));
+    }
+
+    /// tools[].function.description 指纹清洗（CLI harness 将身份句嵌入工具
+    /// 描述的绕过通道——消息体清洗覆盖不到，必须单独处理）
+    #[test]
+    fn sanitize_covers_tool_function_description() {
+        let src = json!({
+            "messages": [{"role":"user","content":"hi"}],
+            "tools": [
+                {"type":"function","function":{
+                    "name":"web_search",
+                    "description":"Web search tool. You are Codex, based on GPT-5. You are Claude Code, Anthropic's official CLI for Claude. You are an interactive agent in TraeCode that helps the USER with software engineering tasks.",
+                    "parameters":{"type":"object","properties":{"query":{"type":"string"}}}
+                }},
+                {"type":"function","function":{
+                    "name":"read_file",
+                    "description":"Reads a file from disk.",
+                    "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+                }},
+                // 非 function 形态工具（Responses 原生 web_search）不误伤
+                {"type":"web_search"}
+            ]
+        });
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let tpl = default_template_map();
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, true, &tpl);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+
+        // 工具 1：三条指纹全部改写（规则逐字匹配完整身份句）
+        let d0 = tools[0]["function"]["description"].as_str().unwrap();
+        assert!(d0.contains("You are Codex, built on GPT-5"));
+        assert!(d0.contains("official CLI tool for Claude"));
+        assert!(d0.contains("interactive agent running in TraeCode"));
+        assert!(!d0.contains("based on GPT-5"));
+        assert!(!d0.contains("CLI for Claude"));
+        assert!(!d0.contains("agent in TraeCode"));
+
+        // 工具 2：无指纹原样保留
+        assert_eq!(tools[1]["function"]["description"], json!("Reads a file from disk."));
+        // 工具 3：无 description 字段的工具不误伤
+        assert_eq!(tools[2]["type"], json!("web_search"));
+        assert!(tools[2].get("function").is_none());
+
+        // sanitize=false 原样透传（清洗开关联动）
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, false, &tpl);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let d0 = v["tools"][0]["function"]["description"].as_str().unwrap();
+        assert!(d0.contains("based on GPT-5"));
     }
 }

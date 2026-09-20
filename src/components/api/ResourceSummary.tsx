@@ -17,6 +17,7 @@ import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { fmtCredits } from '../../lib/format';
 import { DISPATCH_PRESETS, matchPreset } from './dispatchPresets';
+import { computePoolMetrics } from './poolMetrics';
 import type { AccountView, ApiPoolFile, CustomModel, DispatchPolicy, WorkBuddyAccountView } from '../../types';
 
 function Row({ label, value }: { label: string; value: ReactNode }) {
@@ -306,15 +307,8 @@ export default function ResourceSummary() {
       });
   }, []);
 
-  // Trae 池：池内账号与通用积分（本服务消耗通用积分，零积分账号无法服务请求）
-  const traePoolCount = pool?.enabled_uids.length ?? 0;
-  const traeWithCredits = accounts.filter((a) => (a.general_credits ?? 0) > 0).length;
-  const traeTotalCredits = accounts.reduce((s, a) => s + (a.general_credits ?? 0), 0);
-
-  // Buddy 池：上游开关 + 含凭证账号与积分余额
-  const buddyEnabled = pool?.wb_enabled ?? false;
-  const credAccounts = wbAccounts.filter((a) => a.has_credential);
-  const buddyTotalCredits = credAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0);
+  // 三池摘要指标（池内成员与积分口径的纯计算见 poolMetrics.ts，含单测）
+  const metrics = computePoolMetrics(pool, accounts, wbAccounts, customModels);
   // Buddy 池内策略文案：空 = 跟随 Trae 池（展示 Trae 当前生效策略）
   const buddyStrategyText = pool?.wb_strategy
     ? (STRATEGY_LABELS[pool.wb_strategy] ?? pool.wb_strategy)
@@ -335,19 +329,34 @@ export default function ResourceSummary() {
         <div className="mb-3 flex items-center gap-2">
           <Server size={16} className="text-brand-500" />
           <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">Trae 资源池</span>
-          <span className="ml-auto text-[11px] text-slate-400">消耗通用积分（product_id 208）</span>
+          <Badge tone={metrics.traePoolCount > 0 ? 'green' : 'slate'}>
+            {metrics.traePoolCount > 0 ? '可用' : '空池'}
+          </Badge>
         </div>
         <div className="space-y-1.5">
-          <Row label="池内账号" value={traePoolCount} />
-          <Row label="含通用积分账号" value={traeWithCredits} />
+          <Row label="池内账号数" value={metrics.traePoolCount} />
           <Row
-            label="通用积分总余额"
-            value={<span className="font-semibold text-amber-600 dark:text-amber-400">{fmtCredits(traeTotalCredits)}</span>}
+            label="可用积分"
+            value={
+              <span className="font-semibold text-amber-600 dark:text-amber-400">
+                {fmtCredits(metrics.traePoolCredits)}
+              </span>
+            }
+          />
+          <Row label="账号总数" value={metrics.traeAccountTotal} />
+          <Row
+            label="积分总余额"
+            value={
+              <span className="font-semibold text-amber-600 dark:text-amber-400">
+                {fmtCredits(metrics.traeTotalCredits)}
+              </span>
+            }
           />
           <Row
             label="池内调度策略"
             value={pool?.strategy ? (STRATEGY_LABELS[pool.strategy] ?? pool.strategy) : '—'}
           />
+          <Row label="消耗口径" value="通用积分（product_id 208）" />
         </div>
         <p className="mt-3 border-t border-slate-100 pt-2 text-[11px] text-slate-400 dark:border-zinc-800 dark:text-zinc-500">
           详情（账号池选择 / 分组筛选 / 模型目录）见 Trae「资源调度」页
@@ -359,16 +368,26 @@ export default function ResourceSummary() {
         <div className="mb-3 flex items-center gap-2">
           <Bot size={16} className="text-violet-500" />
           <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">Buddy 资源池</span>
-          <Badge tone={buddyEnabled ? 'green' : 'slate'}>{buddyEnabled ? '上游已启用' : '上游未启用'}</Badge>
+          <Badge tone={metrics.buddyEnabled ? 'green' : 'slate'}>
+            {metrics.buddyEnabled ? '上游已启用' : '上游未启用'}
+          </Badge>
         </div>
         <div className="space-y-1.5">
-          <Row label="含凭证账号" value={credAccounts.length} />
-          <Row label="账号总数" value={wbAccounts.length} />
+          <Row label="池内账号数" value={metrics.buddyPoolCount} />
           <Row
-            label="Buddy 积分总余额"
+            label="可用积分"
             value={
               <span className="font-semibold text-amber-600 dark:text-amber-400">
-                {credAccounts.some((a) => a.credits_balance != null) ? fmtCredits(buddyTotalCredits) : '未知'}
+                {metrics.buddyPoolCredits != null ? fmtCredits(metrics.buddyPoolCredits) : '未知'}
+              </span>
+            }
+          />
+          <Row label="账号总数" value={metrics.buddyAccountTotal} />
+          <Row
+            label="积分总余额"
+            value={
+              <span className="font-semibold text-amber-600 dark:text-amber-400">
+                {metrics.buddyTotalCredits != null ? fmtCredits(metrics.buddyTotalCredits) : '未知'}
               </span>
             }
           />
@@ -386,13 +405,13 @@ export default function ResourceSummary() {
         <div className="mb-3 flex items-center gap-2">
           <Blocks size={16} className="text-sky-500" />
           <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">自定义资源池</span>
-          <Badge tone={customEnabled > 0 ? 'green' : 'slate'}>
-            {customEnabled > 0 ? '调度中' : '无启用条目'}
+          <Badge tone={metrics.customEnabledCount > 0 ? 'green' : 'slate'}>
+            {metrics.customEnabledCount > 0 ? '调度中' : '无启用条目'}
           </Badge>
         </div>
         <div className="space-y-1.5">
-          <Row label="启用模型" value={customEnabled} />
-          <Row label="模型总数" value={customModels.length} />
+          <Row label="启用模型数" value={metrics.customEnabledCount} />
+          <Row label="模型总数" value={metrics.customModelTotal} />
           <Row label="消耗口径" value="上游自有计费" />
           <Row label="调度语义" value="模型名命中即直达" />
         </div>

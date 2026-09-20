@@ -136,7 +136,15 @@ pub fn prepare_llm_chat_body(
     // 部分客户端内置模型仅在 solo_agent 下可用（实测），按模型分发 function
     let function = super::models_sync::function_for_model(&model.to_lowercase());
     obj_mut.insert("function".into(), json!(function));
-    obj_mut.insert("max_tokens".into(), json!(4096));
+    // max_tokens：尊重客户端显式值（含 Anthropic max_tokens 透传，P2 修复），
+    // 缺省兜底 4096（上游必需字段）
+    let max_tokens = obj_mut
+        .get("max_tokens")
+        .or_else(|| obj_mut.get("max_completion_tokens"))
+        .cloned()
+        .filter(|v| v.as_u64().map_or(false, |n| n > 0))
+        .unwrap_or_else(|| json!(4096));
+    obj_mut.insert("max_tokens".into(), max_tokens);
     obj_mut.insert("conversation_id".into(), json!(gen_uuid_like()));
     obj_mut.insert("user_id".into(), json!(uid));
     obj_mut.insert("session_id".into(), json!(gen_uuid_like()));
@@ -262,6 +270,22 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
     if let Some(s) = obj.get("stream") {
         out.insert("stream".into(), s.clone());
     }
+    // 采样参数透传（P2 修复）：max_tokens（Anthropic 必填）/temperature/top_p
+    // 同名直传；stop_sequences → OpenAI stop
+    if let Some(m) = obj.get("max_tokens") {
+        out.insert("max_tokens".into(), m.clone());
+    }
+    if let Some(x) = obj.get("temperature") {
+        out.insert("temperature".into(), x.clone());
+    }
+    if let Some(x) = obj.get("top_p") {
+        out.insert("top_p".into(), x.clone());
+    }
+    if let Some(ss) = obj.get("stop_sequences").and_then(|s| s.as_array()) {
+        if !ss.is_empty() {
+            out.insert("stop".into(), json!(ss));
+        }
+    }
 
     let mut messages: Vec<Value> = Vec::new();
 
@@ -333,10 +357,25 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
                                     .join(""),
                                 _ => String::new(),
                             };
+                            // is_error 透传（P2 修复）：OpenAI tool 消息无 is_error
+                            // 字段，以「Error:」前缀标注，保证模型可感知工具执行失败
+                            let is_error = b
+                                .get("is_error")
+                                .and_then(|e| e.as_bool())
+                                .unwrap_or(false);
+                            let content_final = if is_error {
+                                if content_str.is_empty() {
+                                    "Error: tool execution failed".to_string()
+                                } else {
+                                    format!("Error: {}", content_str)
+                                }
+                            } else {
+                                content_str
+                            };
                             tool_results.push(json!({
                                 "role": "tool",
                                 "tool_call_id": b.get("tool_use_id").cloned().unwrap_or(json!("")),
-                                "content": content_str,
+                                "content": content_final,
                             }));
                         }
                         _ => {} // image 等不支持类型跳过

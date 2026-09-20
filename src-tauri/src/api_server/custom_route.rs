@@ -142,25 +142,30 @@ pub fn custom_stream_chat(
         let _inflight = guard; // 随后台任务存续至流结束（§4.5）
         let chat_id = chat_id_for(proto);
 
-        // SSE keep-alive 15s：防中间层回收长流（与 WB/solo 路径同策略）
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // SSE keep-alive 15s：防中间层回收长流（与 WB/solo 路径同策略）。
+        // P1 修复：与 routes.rs 同款 watch + DoneSignal 方案，替换旧 AtomicBool
+        // 15s 轮询（流终结最多被拖延 15s）；主任务结束（Drop，含 panic 展开）
+        // → ticker select! 退出 → sender 全部关闭 → 流正常终结
+        let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+        let _done = super::routes::DoneSignal(done_tx);
         {
             let tx2 = tx.clone();
-            let done2 = done.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
                 tick.tick().await;
                 loop {
-                    tick.tick().await;
-                    if done2.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    if tx2
-                        .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            if tx2
+                                .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        // 主任务已结束：ticker 退出，放行流终结
+                        _ = done_rx.changed() => break,
                     }
                 }
             });
@@ -220,7 +225,6 @@ pub fn custom_stream_chat(
                 send_stream_error(&tx, proto, status as i64, &msg);
             }
         }
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -253,7 +257,9 @@ pub async fn custom_aggregate_chat(
 ) -> Response {
     // 闭包 move 后外层协议转换仍需模型名，提前克隆
     let model_outer = model.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    // P2 修复：非流式聚合为长阻塞上游读取（首字超时 10s + 全量读入），
+    // 与 WB/solo 聚合同口径迁入 stream_runtime 专用阻塞池，不占主池短任务槽
+    let result = super::stream_runtime().spawn_blocking(move || {
         let _inflight = guard; // 随聚合完成释放（§4.5）
         let prepared = prep_body(&body_vec, &cm);
         let reader = match make_custom_request(&cm, &prepared) {

@@ -8,12 +8,20 @@ import { useEffect, useState } from 'react';
 import { Plug } from 'lucide-react';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
-import type { GatewaySettings } from '../../types';
+import type { CcSwitchStatus, GatewaySettings } from '../../types';
 
 export default function EcoAccess() {
   const [ccBusy, setCcBusy] = useState<'claude' | 'codex' | null>(null);
   const [ecoNote, setEcoNote] = useState('');
   const [gwModel, setGwModel] = useState<string | undefined>(undefined);
+  const [ccStatus, setCcStatus] = useState<CcSwitchStatus | null>(null);
+
+  const refreshStatus = () => {
+    api.apiServer
+      .ccSwitchStatus()
+      .then((s) => setCcStatus(s))
+      .catch(() => setCcStatus(null));
+  };
 
   // 默认模型取网关设置（§7：与统一网关条目语义一致）；读取失败时不传，后端回退内置默认
   useEffect(() => {
@@ -23,6 +31,7 @@ export default function EcoAccess() {
       .catch(() => {
         /* 后端回退默认模型 */
       });
+    refreshStatus(); // CC Switch 安装/注册状态（ccswitch_status）
   }, []);
 
   const registerCcSwitch = async (appType: 'claude' | 'codex') => {
@@ -34,6 +43,7 @@ export default function EcoAccess() {
         api.apiServer.ccSwitchRegister(appType, 'trae', undefined, gwModel),
       );
       setEcoNote(`✓ ${msg}`);
+      refreshStatus(); // 注册成功后刷新条目状态
     } catch (e) {
       setEcoNote(`✗ CC Switch 注册失败：${String(e).slice(0, 160)}`);
     } finally {
@@ -65,6 +75,13 @@ export default function EcoAccess() {
           {ccBusy === 'codex' ? '注册中…' : '注册到 CC Switch（Codex）'}
         </button>
       </div>
+      {ccStatus && (
+        <p className="mt-2 text-[11px] text-slate-400 dark:text-zinc-500">
+          CC Switch：{ccStatus.installed ? '已安装' : '未检测到（~/.cc-switch/cc-switch.db 不存在）'}
+          ；Claude 条目 {ccStatus.claudeRegistered ? '已注册' : '未注册'}，Codex 条目{' '}
+          {ccStatus.codexRegistered ? '已注册' : '未注册'}
+        </p>
+      )}
       {ecoNote && (
         <p className="mt-2 break-all text-[11px] leading-4 text-slate-500 dark:text-zinc-400">
           {ecoNote}

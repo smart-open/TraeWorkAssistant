@@ -4,6 +4,38 @@
 
 ---
 
+## [3.5.7] · 2026-09-20 · CC Switch 注册链路修复 + 网关协议对齐 + 多账号互踢优化
+
+> 范围：自 [3.5.6]（commit a15e822）以来的全部变更。
+
+### 修复
+
+- **[P1] CC Switch Claude 条目注册后完全失效**：settings_config 由扁平结构改为官方 `{"env": {...}}` 嵌套结构（官网文档 + cc-switch main provider.rs + 本机真实条目三重实证）——此前切换后 Claude Code settings.json 顶层无 env 键，端点/凭据全部丢失。
+- **[P1] CC Switch Codex 条目启动即报 "Model provider `custom` not found"（Issue #20）**：config.toml 内 provider id 固定为 CC Switch 常量 `custom`（其切换逻辑按常量改写 model_provider，自定义 id 会「键在表不在」）；TOML 插值补 basic string 转义（引号/反斜杠/控制字符）。
+- **[P1] API 网关请求体超限行为（Issue #21）**：axum `Bytes` 提取器默认 2MiB 限制，超限请求在进 handler 前即被纯文本 413 拒绝（handler 内 8MB 检查不可达）——显式放开 DefaultBodyLimit 至 32MiB（适配长上下文客户端每轮重发完整历史 + 图片 base64），鉴权中间件前置 Content-Length 预检，超限返回结构化 JSON 413，阈值/文案由常量统一推导。
+- **[P1] Anthropic 协议 stop_reason 硬编码 end_turn**：流式 message_delta 与非流式 /v1/messages 均按上游 finish_reason 映射（length→max_tokens / tool_calls→tool_use / content_filter→refusal），存在 tool_use 块时强制 tool_use——修复工具调用客户端把「等工具结果」误判为「正常结束」。
+- **[P1] SSE keep-alive 拖延流终结（WB/Custom 路径）**：AtomicBool 15s 轮询改 watch + DoneSignal（主任务结束 Drop 即触发，含 panic 展开），流终结不再被拖延最多一个 15s 周期，与 Trae solo 路径同方案。
+- **[P1] CA 证书读取拒绝访问 os error 5（Issue #14）**：历史 harden_ca_dir 授权无 (OI)(CI) 继承标志，目录收紧时子文件 DACL 被动态清空；加载分支探测不可读即 `icacls /reset /T` 自愈重试，仍失败报「删 certs 目录重新生成」指引（cert_install 与代理启动同链路受益）。
+- **[P2] CC Switch 注册复用业务 Key 被每日配额 429**：未显式传 Key 时自动使用「CC Switch 专用」Key（复用或新建，不限每日配额，被禁用自动恢复启用），与业务 Key 隔离；注册成功文案附 Key 来源说明。
+- **[P2] CC Switch 数据库写入健壮性**：连接设 busy_timeout 3s（运行中持写锁不再立即报 database is locked）；providers 列级兼容（SCHEMA_VERSION 19 基线无 cost_multiplier 列时按实际列动态拼装 INSERT）；备份只保留最近 10 份本工具创建的备份（.bak_aiwork_ 标记，不触碰 CC Switch 自身备份）；主目录定位失败不再兜底 "." 误报 cwd 下数据库。
+- **[P2] 非流式聚合/工具代执行占用主阻塞池**：两者含分级重试（退避最长 60s×N），迁入 stream_runtime 专用阻塞池，不再饿死鉴权等短任务（与流式线程隔离同策略）。
+- **[P2] Trae 池空警告误导排查方向**：Trae 池空 ≠ 全部资源不可用——启动日志与系统通知分池展示（Trae 池 accounts/healthy、Buddy 池 enabled/accounts/healthy），分别指明哪个池不可用、去哪里处理。
+- **[P2] 上游采样参数丢失**：Trae solo 请求 max_tokens 尊重客户端显式值（含 max_completion_tokens，缺省兜底 4096）；Anthropic→OpenAI 转换透传 temperature / top_p / stop_sequences→stop；tool_result is_error 以「Error:」前缀标注，保证模型可感知工具执行失败。
+- **[P2] 豆包保活 TOCTOU 与 PID 复用误杀**：记录 spawn PID，stop 前重检存活 + 映像名匹配后按 PID 精确关闭，消除 8s 窗口竞态。
+
+### 功能优化
+
+- **[P1] 多账号互踢冲突面优化**：Trae refresh_jwt 惰性刷新门（JWT/refresh_token 剩余 >48h 跳过 ExchangeToken）+ invalid 时从 IDE 本地登录态自动恢复；Buddy workbuddy_refresh_token 惰性续期门（access_token 剩余 >24h 跳过上游取号，expires_at 缺失保守放行）；前端刷新支持 force 强制，惰性跳过走中性提示。
+- **WB 指纹清洗扩展**：新增 Codex CLI v1–v4 harness 身份句与 TraeCode 身份句的最小改写（9/19 新版 codex.exe 实证 + pool=trae 日志实证预防性兜底）；清洗覆盖 tools[].function.description（CLI harness 将身份句嵌入工具描述的绕过通道）。
+- **Buddy 资源调度页布局重组**：账号池选择与资源开关/调度参数合并为左列同一面板，右上角「保存」一次保存全部；右列模型目录；「池内账号」指标改为「勾选参与 WB 调度的账号数」。
+- **资源总览三池指标口径升级**：新增池内成员数（Trae enabled_uids / Buddy 白名单或 fail-open 全量）与「可用积分」（池内账号积分和），与「积分总余额」（全部账号）区分；指标纯计算抽出 poolMetrics.ts 并配单测；生态接入卡展示 CC Switch 安装/条目注册状态，注册成功后即时刷新。
+
+### 测试
+
+- cargo 单测 446 → **453** 全绿（新增：Codex/Trae 身份句与工具描述指纹清洗 5 项、CC Switch 专用 Key/TOML 转义 2 项）；vitest 26 → **32**（poolMetrics 6 项）；`tsc --noEmit` 全绿。
+
+---
+
 ## [3.5.6] · 2026-09-19 · API 池凭据/成员热重载 + Trae/Buddy 模型目录客户端对齐过滤
 
 > 范围：自 [3.5.5]（commit 27c5e71）以来的全部变更。

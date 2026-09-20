@@ -37,15 +37,20 @@ pub struct CcSwitchStatus {
 /// 查询 CC Switch 安装状态与两侧条目注册情况（只读；库不存在 → installed=false）
 #[tauri::command]
 pub fn ccswitch_status() -> CcSwitchStatus {
-    let db = home_db_path();
     let mut st = CcSwitchStatus {
-        installed: db.is_file(),
-        db_path: db.display().to_string(),
+        installed: false,
+        db_path: String::new(),
         claude_registered: false,
         codex_registered: false,
         wb_claude_registered: false,
         wb_codex_registered: false,
     };
+    // 加固：无法定位主目录 → 视为未安装（不再兜底 "."，避免误报 cwd 下的库）
+    let Some(db) = home_db_path() else {
+        return st;
+    };
+    st.installed = db.is_file();
+    st.db_path = db.display().to_string();
     if st.installed {
         if let Ok(conn) = Connection::open_with_flags(
             &db,
@@ -81,7 +86,8 @@ pub fn ccswitch_status() -> CcSwitchStatus {
 /// 注册/更新网关 provider 条目到 CC Switch。
 /// `app_type`：claude（Anthropic 协议 /v1/messages）或 codex（Responses /v1/responses）。
 /// `side`：trae（Trae 模型网关，缺省）或 wb（WB 上游网关）——两侧条目 id 不同，互不覆盖。
-/// `api_key`：网关 API Key（网关未配 Key 时可空）；`model`：默认模型 id；
+/// `api_key`：网关 API Key（未传时自动使用「CC Switch 专用」Key，复用或新建）；
+/// `model`：默认模型 id；
 /// `port`：网关端口（缺省用应用设置 api_port）。
 /// 返回说明文案（含备份路径；提醒重启 CC Switch 生效）。
 #[tauri::command]
@@ -104,7 +110,9 @@ pub fn ccswitch_register(
             return Err(format!("不支持的 side: {other}（仅 trae / wb）"));
         }
     };
-    let db = home_db_path();
+    let Some(db) = home_db_path() else {
+        return Err("无法定位用户主目录（USERPROFILE / HOME 均未设置），中止注册".into());
+    };
     if !db.is_file() {
         return Err("未检测到 CC Switch（~/.cc-switch/cc-switch.db 不存在），请先安装 CC Switch".into());
     }
@@ -122,7 +130,16 @@ pub fn ccswitch_register(
                 DEFAULT_MODEL.to_string()
             }
         });
-    let key = api_key.unwrap_or_default();
+    // 前端未显式传 Key 时使用「CC Switch 专用」Key（复用或自动创建，不限配额）：
+    // 不再复用业务 Key——业务 Key 可能设了每日限额（如 100/100 已耗尽），注册后
+    // 请求全被 429 拒绝，用户需手动换 Key 才能用（2026-09-20 实测反馈）
+    let (key, key_note) = match api_key {
+        Some(k) => (k, String::new()),
+        None => (
+            ensure_ccswitch_key(&state.data_dir)?,
+            "网关鉴权使用「CC Switch 专用」Key（不限每日配额，可在 API 管理·子 Key 查看）。".to_string(),
+        ),
+    };
 
     // 红线：写前整库备份（沿用 CC Switch 自身 backups 目录）
     let backup_dir = db
@@ -147,6 +164,34 @@ pub fn ccswitch_register(
                     &state.data_dir,
                     &format!("备份 CC Switch {suffix} 文件失败（忽略）: {e}"),
                 );
+            }
+        }
+    }
+    // 审查：备份无限累积 → 只保留最近 10 份本工具创建的备份（文件名带 .bak_aiwork_ 标记，
+    // 不触碰 CC Switch 自身备份）
+    const KEEP_BACKUPS: usize = 10;
+    if let Ok(entries) = std::fs::read_dir(&backup_dir) {
+        let mut baks: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.contains(".bak_aiwork_"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if baks.len() > KEEP_BACKUPS {
+            // 文件名含固定宽度秒级时间戳，按名排序即按时间排序；刚创建的最新备份不会被删
+            baks.sort();
+            let overflow = baks.len() - KEEP_BACKUPS;
+            for old in baks.iter().take(overflow) {
+                if let Err(e) = std::fs::remove_file(old) {
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("清理 CC Switch 旧备份失败（忽略）: {} - {e}", old.display()),
+                    );
+                }
             }
         }
     }
@@ -177,6 +222,9 @@ pub fn ccswitch_register(
     let meta_str = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
 
     let conn = Connection::open(&db).map_err(|e| format!("打开 CC Switch 数据库失败: {e}"))?;
+    // 审查：CC Switch 运行中可能持有写锁，等待 3s 而非立即报 database is locked
+    conn.busy_timeout(std::time::Duration::from_millis(3000))
+        .map_err(|e| format!("设置数据库等待超时失败: {e}"))?;
     // 表结构自检：providers 表不存在视为 CC Switch 版本不兼容
     let has_table: bool = conn
         .query_row(
@@ -202,85 +250,182 @@ pub fn ccswitch_register(
                 r.get(0)
             })
             .unwrap_or(-1);
-        conn.execute(
+        // 列级兼容：cc-switch main（SCHEMA_VERSION=19）基线 providers 已无
+        // cost_multiplier 列，固定列名 INSERT 在新库上报 no such column；旧库可能
+        // 仍保留该列（可能 NOT NULL 无默认），按实际存在的列动态拼装
+        let has_cost_multiplier: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('providers') WHERE name='cost_multiplier'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false);
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            entry_id.into(),
+            app.to_string().into(),
+            name.clone().into(),
+            cfg_str.into(),
+            "https://github.com/smart-open".to_string().into(),
+            rusqlite::types::Value::Integer((ts * 1000) as i64), // CC Switch created_at 为毫秒时间戳
+            (max_sort + 1).to_string().into(),
+            notes.into(),
+            (if app == "claude" { "anthropic" } else { "openai" }).to_string().into(),
+            (if app == "claude" { "#D4915D" } else { "#10A37F" }).to_string().into(),
+            meta_str.into(),
+        ];
+        let sql = if has_cost_multiplier {
+            values.push("1.0".to_string().into());
             "INSERT INTO providers (id, app_type, name, settings_config, website_url, category, \
              created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue, \
-             cost_multiplier) VALUES (?1, ?2, ?3, ?4, ?5, 'custom', ?6, ?7, ?8, ?9, ?10, ?11, '0', '0', '1.0')",
-            rusqlite::params![
-                entry_id,
-                app,
-                name,
-                cfg_str,
-                "https://github.com/smart-open",
-                ts * 1000, // CC Switch created_at 为毫秒时间戳
-                (max_sort + 1).to_string(),
-                notes,
-                if app == "claude" { "anthropic" } else { "openai" },
-                if app == "claude" { "#D4915D" } else { "#10A37F" },
-                meta_str,
-            ],
-        )
-        .map_err(|e| format!("插入条目失败: {e}"))?;
+             cost_multiplier) VALUES (?1, ?2, ?3, ?4, ?5, 'custom', ?6, ?7, ?8, ?9, ?10, ?11, '0', '0', ?12)"
+        } else {
+            "INSERT INTO providers (id, app_type, name, settings_config, website_url, category, \
+             created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'custom', ?6, ?7, ?8, ?9, ?10, ?11, '0', '0')"
+        };
+        conn.execute(sql, rusqlite::params_from_iter(values.iter()))
+            .map_err(|e| format!("插入条目失败: {e}"))?;
     }
 
     Ok(format!(
         "已在 CC Switch 注册「{}」provider（{} 协议 → http://127.0.0.1:{}）。\
 数据库已备份至 {}。\
-重启 CC Switch 后在对应应用下即可看到并切换该条目。",
+重启 CC Switch 后在对应应用下即可看到并切换该条目。{}",
         name,
         if app == "claude" { "/v1/messages" } else { "/v1/responses" },
         port,
-        backup_path.display()
+        backup_path.display(),
+        key_note
     ))
 }
 
-/// home 下 CC Switch 数据库路径
-fn home_db_path() -> std::path::PathBuf {
-    dirs_home().join(DB_REL)
+/// CC Switch 注册专用 Key 名（自动创建/复用；与业务 Key 隔离，不受业务每日配额影响）
+const CC_SWITCH_KEY_NAME: &str = "CC Switch 专用";
+
+/// 取「CC Switch 专用」Key：已有同名 Key → 复用（若被禁用则恢复启用）；
+/// 无 → 新建（ck_ + 128-bit 随机 hex，不限每日配额）。
+/// 持久化随 api_keys::save 落盘（内存权威副本同步刷新）；失败返回 Err 由
+/// 注册流程中止——宁可报错也不写占位 Key 导致请求全 401/429。
+fn ensure_ccswitch_key(data_dir: &std::path::Path) -> Result<String, String> {
+    let mut file = crate::api_server::api_keys::load(data_dir);
+    let existing = file
+        .keys
+        .iter()
+        .find(|k| k.name == CC_SWITCH_KEY_NAME)
+        .map(|e| (e.enabled, e.key.clone()));
+    if let Some((enabled, key)) = existing {
+        if !enabled {
+            // 被手动禁用过：注册是显式使用意图，恢复启用
+            if let Some(e) = file
+                .keys
+                .iter_mut()
+                .find(|k| k.name == CC_SWITCH_KEY_NAME)
+            {
+                e.enabled = true;
+            }
+            crate::api_server::api_keys::save(data_dir, &file);
+        }
+        return Ok(key);
+    }
+    let entry = crate::api_server::api_keys::ApiKeyEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: CC_SWITCH_KEY_NAME.to_string(),
+        // uuid simple() = 32 位小写 hex，与前端生成的 ck_ 子 Key 格式一致（总长 35）
+        key: format!("ck_{}", uuid::Uuid::new_v4().simple()),
+        enabled: true,
+        daily_limit: 0,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        used_date: String::new(),
+        used_today: 0,
+        allowed_accounts: Vec::new(),
+        schedule_mode: String::new(),
+        dedicated_account: String::new(),
+        daily_stats: Vec::new(),
+    };
+    let key = entry.key.clone();
+    file.keys.push(entry);
+    crate::api_server::api_keys::save(data_dir, &file);
+    Ok(key)
 }
 
-fn dirs_home() -> std::path::PathBuf {
+/// home 下 CC Switch 数据库路径；无法定位主目录 → None（调用方报错或视为未安装）
+fn home_db_path() -> Option<std::path::PathBuf> {
+    dirs_home().map(|h| h.join(DB_REL))
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .filter(|h| !h.trim().is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-/// claude 条目：扁平 env 结构（与 CC Switch 自定义 provider 同款）
+/// claude 条目：`{"env": {...}}` 嵌套结构（官方文档「添加供应商 → Claude 配置格式」
+/// 及 cc-switch main provider.rs 均以 settings["env"] 读取；本机真实条目实证一致）。
+/// 此前误用扁平结构会导致 cc-switch 读不到端点/凭据，切换后 Claude Code 的
+/// settings.json 顶层无 env 键，条目完全失效（对照官网文档复审确认）。
 /// Claude Code 请求 `{ANTHROPIC_BASE_URL}/v1/messages`，base 不带 /v1
 fn claude_settings_config(port: u16, model: &str, key: &str) -> serde_json::Value {
     let base = format!("http://127.0.0.1:{}", port);
     serde_json::json!({
-        "ANTHROPIC_BASE_URL": base,
-        "ANTHROPIC_AUTH_TOKEN": key,
-        "ANTHROPIC_API_KEY": key,
-        "ANTHROPIC_MODEL": model,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": model,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": model,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": model,
-        "CLAUDE_CODE_SUBAGENT_MODEL": model,
+        "env": {
+            "ANTHROPIC_BASE_URL": base,
+            "ANTHROPIC_AUTH_TOKEN": key,
+            "ANTHROPIC_API_KEY": key,
+            "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": model,
+            "CLAUDE_CODE_SUBAGENT_MODEL": model,
+        }
     })
 }
 
-/// codex 条目：auth + config.toml（wire_api=responses，直连 /v1/responses）
+/// TOML basic string 转义（审查：插值未转义，值含引号/反斜杠/控制字符会生成非法 TOML）
+fn toml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// codex 条目：auth + config.toml（wire_api=responses，直连 /v1/responses）。
+/// TOML 内 provider id 固定为 `custom`：CC Switch 的模型目录/切换逻辑按其常量
+/// `CC_SWITCH_CODEX_MODEL_PROVIDER_ID = "custom"` 改写 `model_provider`，若此处用
+/// 其它 id（如 aiwork）会与其产生「键在表不在」，Codex 启动即报
+/// "Model provider `custom` not found"（issue #20）。两侧 DB 条目 id 仍不同，
+/// 切换为整体替换 config.toml，互不覆盖。
 fn codex_settings_config(port: u16, model: &str, key: &str, is_wb: bool) -> serde_json::Value {
+    let provider_name = if is_wb { "WorkBuddy 网关" } else { "AI Work 助手网关" };
     let toml = format!(
-        "model_provider = \"{provider_id}\"\n\
-         model = \"{model}\"\n\
+        "model_provider = \"custom\"\n\
+         model = \"{model_esc}\"\n\
          model_reasoning_effort = \"high\"\n\
-         disable_response_storage = true\n\
          \n\
-         [model_providers.{provider_id}]\n\
-         name = \"{provider_name}\"\n\
+         [model_providers.custom]\n\
+         name = \"{name_esc}\"\n\
          base_url = \"http://127.0.0.1:{port}/v1\"\n\
          wire_api = \"responses\"\n\
          requires_openai_auth = true\n",
-        provider_id = if is_wb { "aiwork-wb" } else { "aiwork" },
-        provider_name = if is_wb { "WorkBuddy 网关" } else { "AI Work 助手网关" },
-        model = model,
+        model_esc = toml_escape(model),
+        name_esc = toml_escape(provider_name),
         port = port,
     );
     serde_json::json!({
@@ -294,13 +439,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ccswitch_dedicated_key_create_and_reuse() {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_ccswitch_key_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 首次：自动创建（ck_ 前缀、32 位 hex、不限配额、启用）
+        let k1 = ensure_ccswitch_key(&dir).unwrap();
+        assert!(k1.starts_with("ck_"));
+        assert_eq!(k1.len(), 35);
+        // 再次：复用同一 Key，不新建条目
+        let k2 = ensure_ccswitch_key(&dir).unwrap();
+        assert_eq!(k1, k2, "同名专用 Key 必须复用");
+        let f = crate::api_server::api_keys::load(&dir);
+        let dedicated: Vec<_> = f.keys.iter().filter(|k| k.name == CC_SWITCH_KEY_NAME).collect();
+        assert_eq!(dedicated.len(), 1);
+        assert!(dedicated[0].enabled);
+        assert_eq!(dedicated[0].daily_limit, 0);
+        // 与既有业务 Key 格式一致（ck_ + 32 hex）
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn claude_config_has_base_and_model_mapping() {
         let cfg = claude_settings_config(8899, "glm-5.3", "sk-test");
-        assert_eq!(cfg["ANTHROPIC_BASE_URL"], serde_json::json!("http://127.0.0.1:8899"));
-        assert_eq!(cfg["ANTHROPIC_DEFAULT_OPUS_MODEL"], serde_json::json!("glm-5.3"));
-        assert_eq!(cfg["ANTHROPIC_AUTH_TOKEN"], serde_json::json!("sk-test"));
+        // 官方文档/cc-switch main：settings_config 顶层必须是 env 包裹层
+        assert_eq!(
+            cfg["env"]["ANTHROPIC_BASE_URL"],
+            serde_json::json!("http://127.0.0.1:8899")
+        );
+        assert_eq!(cfg["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], serde_json::json!("glm-5.3"));
+        assert_eq!(cfg["env"]["ANTHROPIC_AUTH_TOKEN"], serde_json::json!("sk-test"));
         let s = cfg.to_string();
         assert!(!s.contains("/v1\""), "base 不带 /v1（Claude Code 自行拼接 /v1/messages）");
+    }
+
+    #[test]
+    fn toml_escape_quotes_and_control_chars() {
+        assert_eq!(toml_escape("hy\"4"), "hy\\\"4");
+        assert_eq!(toml_escape("a\\b"), "a\\\\b");
+        assert_eq!(toml_escape("x\ny"), "x\\ny");
+        assert_eq!(toml_escape("tab\tc"), "tab\\tc");
+        assert_eq!(toml_escape("\u{1}"), "\\u0001");
+        assert_eq!(toml_escape("普通文本"), "普通文本", "常规字符不转义");
     }
 
     #[test]
@@ -311,21 +497,26 @@ mod tests {
         assert!(toml.contains("base_url = \"http://127.0.0.1:8899/v1\""));
         assert!(toml.contains("wire_api = \"responses\""));
         assert!(toml.contains("model = \"hy4\""));
-        assert!(toml.contains("model_provider = \"aiwork\""));
+        assert!(toml.contains("model_provider = \"custom\""));
+        // issue #20：model_provider 指向的表必须同串成对，否则 Codex 报
+        // "Model provider `custom` not found"
+        assert!(toml.contains("[model_providers.custom]"));
     }
 
     #[test]
-    fn wb_codex_config_uses_wb_provider_id() {
+    fn wb_codex_config_uses_fixed_custom_id_with_distinct_name() {
         let cfg = codex_settings_config(8899, "hy4", "", true);
         let toml = cfg["config"].as_str().unwrap();
-        assert!(toml.contains("model_provider = \"aiwork-wb\""), "WB 侧 provider id 独立");
-        assert!(toml.contains("WorkBuddy 网关"));
-        assert!(!toml.contains("model_provider = \"aiwork\"\n"), "不得回落到 Trae 侧 provider id");
+        // 两侧 DB 条目 id 不同，但 TOML 内 provider id 统一固定为 CC Switch 常量 custom
+        assert!(toml.contains("model_provider = \"custom\""), "WB 侧同样使用固定 id custom");
+        assert!(toml.contains("[model_providers.custom]"));
+        assert!(toml.contains("WorkBuddy 网关"), "WB 侧以 name 区分");
+        assert!(!toml.contains("aiwork"), "TOML 内不得残留 aiwork provider id");
     }
 
     #[test]
     fn empty_key_allowed_for_claude() {
         let cfg = claude_settings_config(8899, "m", "");
-        assert_eq!(cfg["ANTHROPIC_AUTH_TOKEN"], serde_json::json!(""));
+        assert_eq!(cfg["env"]["ANTHROPIC_AUTH_TOKEN"], serde_json::json!(""));
     }
 }
