@@ -11,7 +11,7 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
             <li>
-              <b>添加账号</b>：点右上角「OAuth 登录」完成授权自动入池；也可「扫描本机」发现已登录账号，或启动代理自动抓取 / 「添加账号」手动粘贴 JWT。
+              <b>添加账号</b>：点右上角「OAuth 登录」完成授权自动入池；也可「扫描本机账号」发现已登录账号，或启动代理自动抓取 / 「添加账号」手动粘贴 JWT。
             </li>
             <li>
               <b>登录客户端</b>：打开 Trae Work 或 Trae 客户端，登录刚添加的账号。

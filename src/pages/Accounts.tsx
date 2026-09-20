@@ -304,7 +304,7 @@ export default function Accounts() {
     <div className="animate-fade-in">
       <PageHeader
         title="Trae · 账号管理"
-        desc="账号入池与分组管理 · 登录态切换 / JWT 续期 · 标记客户端当前登录账号"
+        desc="多账号入池 · 切换登录 · JWT 续期"
         leftExtra={
           <button
             onClick={() => setHelpOpen(true)}
@@ -319,17 +319,17 @@ export default function Accounts() {
             <button onClick={() => void refreshAccountsAndPay()} className="btn-outline" title="刷新账号列表、套餐与积分数据">
               <RefreshCw size={15} /> 刷新
             </button>
-            <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae Work / Trae 已登录账号，一键加入账号池">
-              <ScanSearch size={15} /> 扫描本机
-            </button>
             <button onClick={() => setOAuthOpen(true)} className="btn-outline" title="通过 OAuth 授权登录添加账号">
               <Globe size={15} /> OAuth 登录
+            </button>
+            <button onClick={() => void runDiscover()} className="btn-outline" title="扫描本机 Trae Work / Trae 已登录账号，一键加入账号池">
+              <ScanSearch size={15} /> 扫描本机账号
             </button>
             <button onClick={() => setAddOpen(true)} className="btn-outline" title="手动粘贴 JWT 添加账号">
               <Plus size={15} /> 添加账号
             </button>
             <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
-              <Download size={15} /> 导出账户
+              <Download size={15} /> 导出账号
             </button>
             <button
               onClick={() => void importAccounts()}

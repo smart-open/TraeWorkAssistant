@@ -295,6 +295,21 @@ export const api = {
     accountsList: () => invoke<WorkBuddyAccountView[]>('workbuddy_accounts_list'),
     accountSave: (userId: string, name?: string, note?: string) =>
       invoke('workbuddy_account_save', { userId, name: name ?? null, note: note ?? null }),
+    accountMove: (userId: string, groupId: string | null) =>
+      invoke('workbuddy_account_move', { userId, groupId: groupId ?? null }),
+    groups: {
+      list: () => invoke<GroupView[]>('workbuddy_groups_list'),
+      create: (name: string, color: string) =>
+        invoke<string>('workbuddy_groups_create', { name, color }),
+      update: (id: string, patch: { name?: string; color?: string; order?: number }) =>
+        invoke('workbuddy_groups_update', {
+          id,
+          name: patch.name ?? null,
+          color: patch.color ?? null,
+          order: patch.order ?? null,
+        }),
+      remove: (id: string) => invoke('workbuddy_groups_remove', { id }),
+    },
     accountRemove: (userId: string, deleteSnapshot?: boolean) =>
       invoke('workbuddy_account_remove', { userId, deleteSnapshot: deleteSnapshot ?? null }),
     scanAuthFile: () => invoke<WorkBuddyScanResult | null>('workbuddy_scan_auth_file'),
@@ -418,6 +433,8 @@ export const api = {
         wbStickyTtlSecs?: number;
         /** Buddy 池入池白名单（wb- 前缀账号 id）；null/未传 = 保留原值（含旧数据迁移） */
         wbUids?: string[] | null;
+        /** Buddy 池分组筛选；null/未传 = 保留原值，空数组 = 清空（不限分组） */
+        wbGroupIds?: string[] | null;
       },
       wbStrategy?: string,
     ) =>
@@ -425,6 +442,7 @@ export const api = {
         uids,
         strategy: strategy ?? null,
         groupIds: groupIds ?? null,
+        wbGroupIds: wbFlags?.wbGroupIds ?? null,
         wbEnabled: wbFlags?.wbEnabled ?? null,
         wbDefaultThinking: wbFlags?.wbDefaultThinking ?? null,
         wbToolExec: wbFlags?.wbToolExec ?? null,

@@ -417,6 +417,10 @@ pub struct ApiPoolFile {
     /// 非空 = 仅列表内账号参与调度
     #[serde(default)]
     pub wb_enabled_uids: Vec<String>,
+    /// Buddy 池分组筛选（wb_group_ids）：非空时仅纳入所选分组的 WB 账号
+    /// （未分组账号不参与，对齐 Trae 池 group_ids 的 T10 语义）；空 = 不限分组
+    #[serde(default)]
+    pub wb_group_ids: Vec<String>,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -457,6 +461,7 @@ impl Default for ApiPoolFile {
             pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             wb_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
             wb_enabled_uids: Vec::new(),
+            wb_group_ids: Vec::new(),
         }
     }
 }

@@ -201,7 +201,7 @@ export default function BuddyCheckin() {
 
   const startCheckin = async () => {
     if (accounts.length === 0) {
-      pushToast('warn', '账号池为空：请先在「账号管理」导入本机账号');
+      pushToast('warn', '账号池为空：请先在「账号管理」扫描本机账号');
       return;
     }
     setRunning(true);
@@ -217,7 +217,7 @@ export default function BuddyCheckin() {
 
   const runGrowth = async () => {
     if (accounts.length === 0) {
-      pushToast('warn', '账号池为空：请先在「账号管理」导入本机账号');
+      pushToast('warn', '账号池为空：请先在「账号管理」扫描本机账号');
       return;
     }
     setGrowthRunning(true);
@@ -388,7 +388,7 @@ export default function BuddyCheckin() {
               {accounts.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="px-3 py-4 text-center text-xs text-slate-400">
-                    暂无账号：请先在「账号管理」导入本机账号
+                    暂无账号：请先在「账号管理」扫描本机账号
                   </td>
                 </tr>
               ) : (

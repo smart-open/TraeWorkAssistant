@@ -21,6 +21,7 @@ mod cli;
 mod common;
 mod credits;
 mod env_reset;
+mod groups;
 mod oauth;
 
 // 对外 API 与拆分前单文件模块完全一致（main.rs 的 commands::workbuddy::xxx 全部不变）。
@@ -31,4 +32,5 @@ pub use cli::*;
 pub use common::*;
 pub use credits::*;
 pub use env_reset::*;
+pub use groups::*;
 pub use oauth::*;

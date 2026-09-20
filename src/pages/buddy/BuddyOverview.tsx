@@ -174,8 +174,8 @@ export default function BuddyOverview() {
     },
     {
       key: 'account',
-      title: '导入本机账号',
-      desc: '在客户端登录后到「账号管理」导入本机账号，或用 OAuth 扫码入池。',
+      title: '扫描本机账号',
+      desc: '在客户端登录后到「账号管理」扫描本机账号，或用 OAuth 登录入池。',
       done: accounts.length > 0,
       actionLabel: '去导入',
       view: 'buddy-accounts',

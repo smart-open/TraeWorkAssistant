@@ -1,5 +1,6 @@
 import {
   DatabaseBackup,
+  FolderCog,
   Globe,
   History,
   KeyRound,
@@ -21,7 +22,7 @@ export function BuddyHelpModal({ open, onClose }: { open: boolean; onClose: () =
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
             <li>
-              <b>添加账号</b>：点右上角「OAuth 扫码」完成登录并自动入池；也可「导入本机账号」扫描本机已登录客户端。
+              <b>添加账号</b>：点右上角「OAuth登录」完成登录并自动入池；也可「扫描本机账号」扫描本机已登录客户端。
             </li>
             <li>
               <b>登录客户端</b>：打开 WorkBuddy（或 CodeBuddy）客户端，登录刚添加的账号。
@@ -34,10 +35,10 @@ export function BuddyHelpModal({ open, onClose }: { open: boolean; onClose: () =
 
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
           <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <Globe size={15} className="text-amber-500" /> OAuth 扫码
+            <Globe size={15} className="text-amber-500" /> OAuth登录
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            点击「OAuth 扫码」，应用会自动打开浏览器完成登录，成功后自动解析凭证并入账号池（凭证仅写入本地 token
+            点击「OAuth登录」，应用会自动打开浏览器完成登录，成功后自动解析凭证并入账号池（凭证仅写入本地 token
             store，全程掩码不上传）。浏览器未自动打开时，弹框内可「复制完整链接」手动打开；扫码超过 5
             分钟未收到结果会自动解除等待，最终结果以账号列表为准。
           </p>
@@ -45,13 +46,23 @@ export function BuddyHelpModal({ open, onClose }: { open: boolean; onClose: () =
 
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
           <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <ScanSearch size={15} className="text-amber-500" /> 导入本机账号
+            <ScanSearch size={15} className="text-amber-500" /> 扫描本机账号
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             扫描本机 WorkBuddy 客户端已登录的账号，一键加入账号池。
           </p>
           <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
             ⚠ 客户端退出登录后登录凭证已被清空，将无法导入——需先重新登录客户端。
+          </p>
+        </section>
+
+        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
+            <FolderCog size={15} className="text-amber-500" /> 账号分组
+          </h3>
+          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            「分组管理」可新建 / 重命名 / 换色 / 删除分组（删除后组内账号回落「未分组」）；列表上方过滤 chips
+            与账号行「分组」下拉可按分组筛选与归类。分组同时供 Buddy「资源调度」页账号池的分组筛选使用。
           </p>
         </section>
 
@@ -88,7 +99,7 @@ export function BuddyHelpModal({ open, onClose }: { open: boolean; onClose: () =
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             点击账号行「续期」图标，用 refreshToken 换新 accessToken，恢复积分查询 / 签到 /
-            API 池服务等凭证能力。带「需重新登录」红色标记的账号凭证已失效，续期无法恢复——需重新 OAuth 扫码或在客户端登录后保存登录态。
+            API 池服务等凭证能力。带「需重新登录」红色标记的账号凭证已失效，续期无法恢复——需重新 OAuth 登录或在客户端登录后保存登录态。
           </p>
         </section>
 
@@ -108,7 +119,7 @@ export function BuddyHelpModal({ open, onClose }: { open: boolean; onClose: () =
             <DatabaseBackup size={15} className="text-amber-500" /> 会话备份 / 恢复 / 复制
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            页面顶部「WB 会话 / CB 会话」选择会话域，决定备份、恢复、复制作用于
+            会话备份 / 恢复 / 复制弹窗内均可选择「会话域」（WorkBuddy / CodeBuddy），决定操作作用于
             <code className="mx-0.5 rounded bg-slate-100 px-1 dark:bg-zinc-800">~/.workbuddy</code>还是
             <code className="mx-0.5 rounded bg-slate-100 px-1 dark:bg-zinc-800">~/.codebuddy</code>
             目录。「备份会话」打包 projects 与双 db 快照；之后可「恢复会话」回滚，或「复制会话」到其他账号（复制以全新会话 id

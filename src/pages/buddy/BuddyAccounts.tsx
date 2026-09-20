@@ -21,11 +21,15 @@ import {
   AppWindow,
   History,
   HelpCircle,
+  FolderCog,
 } from 'lucide-react';
+import { useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState, Modal, Spinner } from '../../components/ui';
 import { BuddyHelpModal } from './HelpModal';
+import { GroupSelect } from '../accounts/GroupSelect';
+import { GroupsModal } from '../accounts/GroupsModal';
 import { listen } from '@tauri-apps/api/event';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
@@ -33,6 +37,7 @@ import { withMinDelay } from '../../lib/delay';
 import { copyText } from '../../lib/clipboard';
 import type {
   BuddyChatApp,
+  GroupView,
   ProfileInfo,
   WbCheckinRecord,
   WorkBuddyAccountView,
@@ -103,6 +108,8 @@ export default function BuddyAccounts() {
   const [restoreFor, setRestoreFor] = useState<WorkBuddyAccountView | null>(null);
   const [copyFor, setCopyFor] = useState<WorkBuddyAccountView | null>(null);
   const [copyTarget, setCopyTarget] = useState('');
+  // 会话备份弹框（域选择内联）：目标账号 + 执行 pending
+  const [backupFor, setBackupFor] = useState<WorkBuddyAccountView | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportWithCreds, setExportWithCreds] = useState(false);
   const importFileRef = useRef<HTMLInputElement>(null);
@@ -157,7 +164,12 @@ export default function BuddyAccounts() {
   // 二次确认弹框内容（恢复并启动 / 删除）
   const [snapConfirm, setSnapConfirm] = useState<{ slot: string; kind: 'restore' | 'delete' } | null>(null);
   // F-74：会话域（会话三件套作用目标：WorkBuddy = ~/.workbuddy / CodeBuddy = ~/.codebuddy）
+  // ——域选择内联在备份/恢复/复制弹窗中，切换即重拉徽标
   const [chatApp, setChatApp] = useState<BuddyChatApp>('WorkBuddy');
+  // ---- 账号分组（对齐 Trae 账号管理）----
+  const [wbGroups, setWbGroups] = useState<GroupView[]>([]);
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [filter, setFilter] = useState<string>('all');
   // refresh 为 useCallback([]) 固定身份（域切换不触发整表刷新），经 ref 读取最新会话域
   // ——直接闭包引用 chatApp 会恒为首次渲染的 'WorkBuddy'，切换域后徽标按过期域重拉
   const chatAppRef = useRef(chatApp);
@@ -183,6 +195,21 @@ export default function BuddyAccounts() {
     if (accounts.length) void loadChatMeta(accounts, next);
   };
 
+  /** 分组列表重取（count/uids 由后端按账号 group_id 实时推导） */
+  const reloadGroups = useCallback(() => {
+    api.workbuddy.groups
+      .list()
+      .then(setWbGroups)
+      .catch(() => {});
+  }, []);
+
+  // 分组过滤（对齐 Trae 账号管理）：all / ungrouped / 指定分组 id
+  const filtered = useMemo(() => {
+    if (filter === 'all') return accounts;
+    if (filter === 'ungrouped') return accounts.filter((a) => !a.group_id);
+    return accounts.filter((a) => a.group_id === filter);
+  }, [accounts, filter]);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
@@ -191,6 +218,8 @@ export default function BuddyAccounts() {
       // 会话备份状态徽标：逐账号轻量查询 chatdata_info（按当前会话域，经 ref 取最新值）；
       // 任一失败仅该账号不显示徽标（纯状态降级，不阻断列表）
       void loadChatMeta(accs, chatAppRef.current);
+      // 分组列表（失败静默：过滤 chips 缺失不阻断列表）
+      reloadGroups();
       // CLI 当前号查询（失败仅置空徽标：纯状态复位，不阻断列表展示；切号/删号后 refresh 会自动重取）
       api.workbuddy
         .cliStatus()
@@ -285,7 +314,7 @@ export default function BuddyAccounts() {
     const timer = oauthBusy
       ? setTimeout(() => {
           setOauthBusy(false);
-          pushToast('warn', 'OAuth 扫码超过 5 分钟未收到结果事件，已解除等待；结果请以账号列表为准');
+          pushToast('warn', 'OAuth 登录超过 5 分钟未收到结果事件，已解除等待；结果请以账号列表为准');
         }, 310_000)
       : undefined;
     return () => {
@@ -462,12 +491,16 @@ export default function BuddyAccounts() {
     }
   };
 
-  // 会话三件套备份（F-44/F-74）：projects + 双 db 快照；执行前自动关闭对应客户端
-  const handleBackupChats = async (a: WorkBuddyAccountView) => {
-    setRowOp({ id: a.id, kind: 'backup' });
+  // 会话三件套备份（F-44/F-74）：projects + 双 db 快照；执行前自动关闭对应客户端。
+  // 弹框内选择会话域后确认执行（域经 chatApp 状态统一管理，切换即重拉徽标）
+  const confirmBackupChats = async () => {
+    if (!backupFor) return;
+    setRowOp({ id: backupFor.id, kind: 'backup' });
     try {
-      const r = await withMinDelay(api.workbuddy.chatdataBackup(a.id, chatApp), 1200);
-      pushToast('success', `「${a.nickname || a.id}」${chatApp} 会话已备份（${r.files} 个文件）`);
+      const r = await withMinDelay(api.workbuddy.chatdataBackup(backupFor.id, chatApp), 1200);
+      pushToast('success', `「${backupFor.nickname || backupFor.id}」${chatApp} 会话已备份（${r.files} 个文件）`);
+      setBackupFor(null);
+      void loadChatMeta(accounts, chatApp);
     } catch (err) {
       pushToast('error', `会话备份失败：${String(err)}`);
     } finally {
@@ -475,7 +508,27 @@ export default function BuddyAccounts() {
     }
   };
 
-  // 恢复会话（二次确认后执行；覆盖现有 ~/.workbuddy 会话数据）
+  // F-74：会话域切换控件（内联于备份/恢复/复制弹窗；选择即重拉徽标）
+  const chatAppToggle = () => (
+    <div className="flex overflow-hidden rounded-lg border border-slate-200 dark:border-zinc-700">
+      {(['WorkBuddy', 'CodeBuddy'] as BuddyChatApp[]).map((ap) => (
+        <button
+          key={ap}
+          type="button"
+          onClick={() => changeChatApp(ap)}
+          className={`px-3 py-1.5 text-xs transition ${
+            chatApp === ap
+              ? 'bg-brand-600 text-white'
+              : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-zinc-800'
+          }`}
+        >
+          {ap === 'WorkBuddy' ? 'WorkBuddy 会话' : 'CodeBuddy 会话'}
+        </button>
+      ))}
+    </div>
+  );
+
+  // 恢复会话（二次确认后执行；覆盖现有所选会话域的本地会话数据）
   const confirmRestoreChats = async () => {
     if (!restoreFor) return;
     setRestoreBusy(true);
@@ -676,22 +729,19 @@ export default function BuddyAccounts() {
             <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
-            <button className="btn-outline" onClick={openSnapshots}>
-              <History size={15} /> 快照管理
-            </button>
-            <button className="btn-outline" onClick={() => void importFromAuth()} disabled={importing}>
-              {importing ? <Spinner /> : <ScanSearch size={15} />} 导入本机账号
-            </button>
             <button
               className="btn-outline"
               onClick={() => void startOauth()}
               disabled={oauthBusy}
               title={oauthBusy ? '扫码流程进行中…' : undefined}
             >
-              <Globe size={15} /> OAuth 扫码
+              <Globe size={15} /> OAuth登录
+            </button>
+            <button className="btn-outline" onClick={() => void importFromAuth()} disabled={importing}>
+              {importing ? <Spinner /> : <ScanSearch size={15} />} 扫描本机账号
             </button>
             <button className="btn-outline" onClick={exportPool} disabled={accounts.length === 0}>
-              <Download size={15} /> 导出
+              <Download size={15} /> 导出账号
             </button>
             <button
               className="btn-outline"
@@ -699,7 +749,7 @@ export default function BuddyAccounts() {
               disabled={importingBackup}
               title={importingBackup ? '正在导入备份…' : undefined}
             >
-              {importingBackup ? <Spinner /> : <Upload size={15} />} 导入备份
+              {importingBackup ? <Spinner /> : <Upload size={15} />} 导入账号
             </button>
             <input
               ref={importFileRef}
@@ -720,28 +770,44 @@ export default function BuddyAccounts() {
             >
               {resetLoading ? <Spinner /> : <ShieldAlert size={15} />} 环境重置
             </button>
-            {/* F-74：会话域选择——决定会话三件套的备份/恢复/复制作用于哪个客户端数据目录 */}
-            <div
-              className="flex overflow-hidden rounded-lg border border-slate-200 dark:border-zinc-700"
-              title="会话域：会话备份/恢复/复制作用于哪个客户端（~/.workbuddy 或 ~/.codebuddy）"
-            >
-              {(['WorkBuddy', 'CodeBuddy'] as BuddyChatApp[]).map((ap) => (
-                <button
-                  key={ap}
-                  onClick={() => changeChatApp(ap)}
-                  className={`px-3 py-1.5 text-xs transition ${
-                    chatApp === ap
-                      ? 'bg-brand-600 text-white'
-                      : 'text-slate-500 hover:bg-slate-50 dark:hover:bg-zinc-800'
-                  }`}
-                >
-                  {ap === 'WorkBuddy' ? 'WB 会话' : 'CB 会话'}
-                </button>
-              ))}
-            </div>
+            <button onClick={() => setGroupOpen(true)} className="btn-outline" title="管理账号分组">
+              <FolderCog size={15} /> 分组管理
+            </button>
+            <button className="btn-outline" onClick={openSnapshots}>
+              <History size={15} /> 快照管理
+            </button>
           </>
         }
       />
+
+      {/* 分组过滤 chips（对齐 Trae 账号管理） */}
+      {accounts.length > 0 && (
+        <div className="mb-3 mt-5 flex flex-wrap items-center gap-2 text-sm">
+          <button
+            onClick={() => setFilter('all')}
+            className={`chip border ${filter === 'all' ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+          >
+            全部 ({accounts.length})
+          </button>
+          <button
+            onClick={() => setFilter('ungrouped')}
+            className={`chip border ${filter === 'ungrouped' ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+          >
+            未分组 ({accounts.filter((a) => !a.group_id).length})
+          </button>
+          {wbGroups.map((g) => (
+            <button
+              key={g.id}
+              onClick={() => setFilter(g.id)}
+              className={`chip border ${filter === g.id ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+              style={{ borderColor: filter === g.id ? g.color : undefined }}
+            >
+              <span className="inline-block h-2 w-2 rounded-full" style={{ background: g.color }} />
+              {g.name} ({g.count})
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* 账号列表（对齐 Trae 账号管理表格） */}
       {accounts.length === 0 ? (
@@ -749,15 +815,16 @@ export default function BuddyAccounts() {
           <EmptyState
             icon={<Users size={26} />}
             title="暂无 WorkBuddy 账号"
-            hint="先在 WorkBuddy 客户端登录，然后点击上方「导入本机账号」自动扫描入池；切换/保存登录态会在账号管理中生成快照。注意：客户端退出登录后登录凭证已被清空，将无法导入，需先重新登录客户端。"
+            hint="先在 WorkBuddy 客户端登录，然后点击上方「扫描本机账号」自动扫描入池；切换/保存登录态会在账号管理中生成快照。注意：客户端退出登录后登录凭证已被清空，将无法导入，需先重新登录客户端。"
           />
         </div>
       ) : (
         <div className="mt-5 card overflow-x-auto">
-          <table className="w-full min-w-[860px] text-sm">
+          <table className="w-full min-w-[980px] text-sm">
             <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
               <tr>
                 <th className="px-4 py-2 text-left">账号</th>
+                <th className="px-4 py-2 text-left">分组</th>
                 <th className="px-4 py-2 text-left">会员套餐</th>
                 <th className="px-4 py-2 text-left">积分包</th>
                 <th className="px-4 py-2 text-right">可用积分</th>
@@ -768,7 +835,7 @@ export default function BuddyAccounts() {
               </tr>
             </thead>
             <tbody>
-              {accounts.map((a) => {
+              {filtered.map((a) => {
                 const pkgs = credits.get(a.id) ?? [];
                 // 7 日内将过期（仍有剩余）的积分包 → 列表标记提示
                 const nowSec = Math.floor(Date.now() / 1000);
@@ -793,6 +860,21 @@ export default function BuddyAccounts() {
                         )}
                       </div>
                       <div className="font-mono text-xs text-slate-400">{maskUid(a.uid)}</div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <GroupSelect
+                        value={a.group_id || null}
+                        groups={wbGroups}
+                        onChange={(gid) => {
+                          void api.workbuddy.accountMove(a.id, gid).then(() => {
+                            // 本地同步账号分组 + 重取分组计数（不整表刷新）
+                            setAccounts((prev) =>
+                              prev.map((x) => (x.id === a.id ? { ...x, group_id: gid ?? '' } : x)),
+                            );
+                            reloadGroups();
+                          }).catch((err) => pushToast('error', `分组调整失败：${String(err)}`));
+                        }}
+                      />
                     </td>
                     <td className="px-4 py-3">
                       {a.edition_type ? (
@@ -933,8 +1015,8 @@ export default function BuddyAccounts() {
                           return <Badge tone="green" title={extra ? `已备份：${extra}` : '会话已备份'}>已备份</Badge>;
                         })()}
                         <button
-                          title={rowOpKind === 'backup' ? '会话备份中…' : '备份会话（projects + 双 db 快照）'}
-                          onClick={() => void handleBackupChats(a)}
+                          title="备份会话（选择客户端后执行，projects + 双 db 快照）"
+                          onClick={() => setBackupFor(a)}
                           disabled={rowOpKind != null}
                           className={`btn-ghost !p-2 ${rowOpKind != null ? 'opacity-40 cursor-not-allowed' : ''}`}
                         >
@@ -1034,7 +1116,7 @@ export default function BuddyAccounts() {
         onClose={() => {
           if (!confirmImportBusy) setScanPreview(null);
         }}
-        title="导入本机账号"
+        title="扫描本机账号"
         footer={
           <>
             <button className="btn-outline" onClick={() => setScanPreview(null)} disabled={confirmImportBusy}>取消</button>
@@ -1085,6 +1167,34 @@ export default function BuddyAccounts() {
         </div>
       </Modal>
 
+      {/* 会话备份弹框（域选择内联，F-44/F-74） */}
+      <Modal
+        open={backupFor != null}
+        onClose={() => {
+          if (rowOp?.kind !== 'backup') setBackupFor(null);
+        }}
+        title={`备份会话 · ${backupFor?.nickname || backupFor?.id || ''}`}
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setBackupFor(null)} disabled={rowOp?.kind === 'backup'}>取消</button>
+            <button className="btn-primary" onClick={() => void confirmBackupChats()} disabled={rowOp != null}>
+              {rowOp?.kind === 'backup' ? <Spinner /> : null} 开始备份
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-2 text-sm">
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-slate-500 dark:text-zinc-400">会话域</span>
+            {chatAppToggle()}
+          </div>
+          <div>备份「{backupFor?.nickname || backupFor?.id}」在所选客户端目录的会话数据（projects + 双 db 快照）。</div>
+          <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+            执行时会先自动关闭对应客户端；备份后账号行出现「已备份」徽标。
+          </div>
+        </div>
+      </Modal>
+
       {/* 会话恢复确认弹框（F-44，覆盖性操作二次确认） */}
       <Modal
         open={restoreFor != null}
@@ -1105,10 +1215,14 @@ export default function BuddyAccounts() {
           </>
         }
       >
-        <div className="space-y-1 text-sm">
-          <div>把「{restoreFor?.nickname || restoreFor?.id}」的会话备份恢复到 ~/.workbuddy？</div>
+        <div className="space-y-2 text-sm">
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-slate-500 dark:text-zinc-400">会话域</span>
+            {chatAppToggle()}
+          </div>
+          <div>把「{restoreFor?.nickname || restoreFor?.id}」的会话备份恢复到 {chatApp === 'CodeBuddy' ? '~/.codebuddy' : '~/.workbuddy'}？</div>
           <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
-            将覆盖现有会话数据（原数据自动保留为 .bak）；执行时会先自动关闭 WorkBuddy 客户端。
+            将覆盖现有会话数据（原数据自动保留为 .bak）；执行时会先自动关闭对应客户端。
           </div>
         </div>
       </Modal>
@@ -1130,6 +1244,10 @@ export default function BuddyAccounts() {
         }
       >
         <div className="space-y-2 text-sm">
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-slate-500 dark:text-zinc-400">会话域</span>
+            {chatAppToggle()}
+          </div>
           <div>选择目标账号：源会话将以全新会话 id 复制过去，并注册到目标账号的云端映射（复制前自动快照数据库）。</div>
           <select className="input w-full" value={copyTarget} onChange={(e) => setCopyTarget(e.target.value)}>
             <option value="">— 选择目标账号 —</option>
@@ -1142,7 +1260,7 @@ export default function BuddyAccounts() {
               ))}
           </select>
           <div className="text-xs text-slate-400">
-            数据来源：该账号的会话备份（如有）或当前 ~/.workbuddy/projects；执行时会先自动关闭 WorkBuddy 客户端。
+            数据来源：该账号在所选会话域的会话备份（如有）或当前本地 projects；执行时会先自动关闭对应客户端。
           </div>
         </div>
       </Modal>
@@ -1213,7 +1331,7 @@ export default function BuddyAccounts() {
       <Modal
         open={oauthOpen}
         onClose={() => setOauthOpen(false)}
-        title="OAuth 扫码登录"
+        title="OAuth 登录"
       >
         <div className="space-y-3 text-sm">
           <div className="flex items-center gap-2">
@@ -1492,6 +1610,30 @@ export default function BuddyAccounts() {
           </div>
         )}
       </Modal>
+
+      {/* 分组管理弹框（复用 Trae GroupsModal，WB 分组走 workbuddy_groups_* 命令） */}
+      <GroupsModal
+        open={groupOpen}
+        onClose={() => setGroupOpen(false)}
+        groups={wbGroups}
+        onCreate={async (name, color) => {
+          await api.workbuddy.groups.create(name, color);
+          reloadGroups();
+        }}
+        onRename={async (id, name) => {
+          await api.workbuddy.groups.update(id, { name });
+          reloadGroups();
+        }}
+        onRecolor={async (id, color) => {
+          await api.workbuddy.groups.update(id, { color });
+          reloadGroups();
+        }}
+        onDelete={async (id) => {
+          await api.workbuddy.groups.remove(id);
+          reloadGroups();
+          await refresh(); // 组内账号回落「未分组」，列表同步
+        }}
+      />
 
       {/* 使用帮助弹框（与 Trae 账号管理同款入口样式，内容为 Buddy 特性口径） */}
       <BuddyHelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
