@@ -230,7 +230,7 @@ export default function DoubaoSettings() {
 
         <div className="space-y-2 text-xs text-slate-500">
           <p>
-            数据目录：<code className="rounded bg-slate-100 px-1 font-mono dark:bg-zinc-800">{locate?.user_data_dir ?? '%LOCALAPPDATA%\\Doubao\\User Data'}</code>
+            数据目录：<code className="rounded bg-slate-100 px-1 font-mono dark:bg-zinc-800">{locate?.user_data_dir ?? (platform === 'macos' ? '~/Library/Application Support/Doubao/User Data' : '%LOCALAPPDATA%\\Doubao\\User Data')}</code>
             {locate?.version ? ` · 版本 ${locate.version}` : ''}
           </p>
         </div>
@@ -239,7 +239,9 @@ export default function DoubaoSettings() {
           <input
             value={path}
             onChange={(e) => setPath(e.target.value)}
-            placeholder="Doubao.exe 完整路径（如 C:\\Users\\<user>\\AppData\\Local\\Doubao\\Application\\Doubao.exe）"
+            placeholder={platform === 'macos'
+              ? 'Doubao.app 完整路径（如 /Applications/Doubao.app）'
+              : 'Doubao.exe 完整路径（如 C:\\Users\\<user>\\AppData\\Local\\Doubao\\Application\\Doubao.exe）'}
             className="input flex-1 font-mono text-xs"
           />
           <button onClick={() => void detect()} disabled={detecting} className="btn-outline shrink-0">
@@ -251,7 +253,7 @@ export default function DoubaoSettings() {
         </div>
 
         <p className="mt-2 text-xs text-slate-400">
-          自动检测顺序：手动指定 → 注册表卸载键 → 默认路径 → 运行进程反查。
+          自动检测顺序：手动指定 → {platform === 'macos' ? '应用 bundle 定位' : '注册表卸载键'} → 默认路径 → 运行进程反查。
         </p>
       </div>
 
