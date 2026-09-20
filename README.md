@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="build-assets/app-icon.png" alt="AI Work 助手" width="128" />
+<img src="build-assets/app-icon-rounded.png" alt="AI Work 助手" width="128" />
 
 # AI Work 助手（AI Work Assistant）
 
