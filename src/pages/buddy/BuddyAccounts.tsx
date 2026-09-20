@@ -20,10 +20,12 @@ import {
   Users,
   AppWindow,
   History,
+  HelpCircle,
 } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState, Modal, Spinner } from '../../components/ui';
+import { BuddyHelpModal } from './HelpModal';
 import { listen } from '@tauri-apps/api/event';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
@@ -89,6 +91,7 @@ export default function BuddyAccounts() {
   const saveCurrentLogin = useAppStore((s) => s.saveCurrentLogin);
   const savingLogin = useAppStore((s) => s.savingLogin);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
+  const [helpOpen, setHelpOpen] = useState(false);
   const [credits, setCredits] = useState<Map<string, WbCreditPackage[]>>(new Map());
   // 今日签到状态（user_id → 最新一条记录；success/already=已签，fail=失败，无=未签）
   const [checkinMap, setCheckinMap] = useState<Map<string, WbCheckinRecord>>(new Map());
@@ -659,6 +662,15 @@ export default function BuddyAccounts() {
       <PageHeader
         title="Buddy · 账号管理"
         desc="多账号入池 · 切换登录 · 凭证续期"
+        leftExtra={
+          <button
+            onClick={() => setHelpOpen(true)}
+            title="使用帮助"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sky-100 text-sky-600 shadow-sm transition hover:bg-sky-200 hover:shadow dark:bg-sky-500/15 dark:text-sky-300 dark:hover:bg-sky-500/25"
+          >
+            <HelpCircle size={17} />
+          </button>
+        }
         actions={
           <>
             <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
@@ -1480,6 +1492,9 @@ export default function BuddyAccounts() {
           </div>
         )}
       </Modal>
+
+      {/* 使用帮助弹框（与 Trae 账号管理同款入口样式，内容为 Buddy 特性口径） */}
+      <BuddyHelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
   );
 }

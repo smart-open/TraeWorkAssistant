@@ -6,10 +6,27 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
     <Modal open={open} onClose={onClose} title="账号管理使用帮助" size="xl">
       <div className="space-y-4 text-sm">
         <section className="rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/20">
-          <h3 className="mb-1 flex items-center gap-1.5 font-semibold text-amber-700 dark:text-amber-300">
-            <Globe size={15} /> OAuth 登录（自动保存账号）
+          <h3 className="mb-1.5 flex items-center gap-1.5 font-semibold text-amber-700 dark:text-amber-300">
+            <Globe size={15} /> 添加账号流程（三步）
           </h3>
-          <p className="text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+          <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+            <li>
+              <b>添加账号</b>：点右上角「OAuth 登录」完成授权自动入池；也可「扫描本机」发现已登录账号，或启动代理自动抓取 / 「添加账号」手动粘贴 JWT。
+            </li>
+            <li>
+              <b>登录客户端</b>：打开 Trae Work 或 Trae 客户端，登录刚添加的账号。
+            </li>
+            <li>
+              <b>保存登录会话</b>：回到本页，点该账号行「保存」图标并选择目标应用（Trae Work / Trae），备份当前登录会话——此后即可随时「切换」回来。
+            </li>
+          </ol>
+        </section>
+
+        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
+            <Globe size={15} className="text-amber-500" /> OAuth 登录（自动保存账号）
+          </h3>
+          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             点击「OAuth 登录」按钮，在浏览器中完成 Trae 账号登录（Trae Work 与 Trae 同一账号体系，登录任一应用均可）。
             登录完成后将回调 URL 粘贴回应用，系统会自动解析 JWT 并保存账号信息，无需手动粘贴 token。
             适合首次添加账号或 JWT 过期后重新登录。
