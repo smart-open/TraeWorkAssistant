@@ -168,6 +168,7 @@ fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     crate::commands::misc::run_schtasks(args)
 }
 
+#[cfg(windows)] // 仅 workbuddy_renew_task_status 的 Windows 分支消费（mac 恒 false）
 fn task_exists(name: &str) -> bool {
     run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"]).map(|(ok, _, _)| ok).unwrap_or(false)
 }

@@ -10,7 +10,8 @@ pub const LEGACY_DATA_DIR_NAME: &str = "TraeWorkAssistant";
 /// 旧版 bundle identifier（品牌迁移前），其 WebView2 数据目录同样需要迁移（仅 Windows）
 #[cfg(windows)]
 pub const LEGACY_IDENTIFIER: &str = "com.traework.assistant";
-/// 新版 bundle identifier
+/// 新版 bundle identifier（与 LEGACY 同为 WebView2 目录迁移专用，仅 Windows 消费）
+#[cfg(windows)]
 pub const IDENTIFIER: &str = "com.aiwork.assistant";
 
 /// 品牌迁移：老版本遗留目录**复制**到新目录（旧目录原地保留，老应用可继续使用，两版可并存）。

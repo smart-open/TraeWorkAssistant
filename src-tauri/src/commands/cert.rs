@@ -146,6 +146,7 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)] // 全部用例 Windows 专属（certutil 语义）
     use super::*;
 
     #[cfg(windows)]

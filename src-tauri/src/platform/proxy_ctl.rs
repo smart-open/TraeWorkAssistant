@@ -19,7 +19,7 @@ pub fn get_system_proxy() -> Option<(bool, String, String)> {
     }
     #[cfg(target_os = "macos")]
     {
-        scutil_parse()
+        networksetup_read()
     }
 }
 
@@ -62,7 +62,7 @@ fn networksetup_apply(enable: bool, server: &str, bypass: &str) -> Result<(), St
 
     let mut errs: Vec<String> = Vec::new();
     for svc in &services {
-        let mut run = |args: &[&str]| -> Option<String> {
+        let run = |args: &[&str]| -> Option<String> {
             crate::platform::cmd::sys_output(
                 crate::platform::cmd::sys_command("networksetup").args(args),
             )
@@ -112,59 +112,64 @@ fn networksetup_apply(enable: bool, server: &str, bypass: &str) -> Result<(), St
     }
 }
 
-/// scutil --proxies 输出解析：
-///   <dictionary> {
-///     HTTPEnable : 1
-///     HTTPProxy : 127.0.0.1
-///     HTTPPort : 8899
-///     ExceptionsList : <array> {
-///       0 : 127.0.0.1
-///       1 : localhost
-///     }
-///   }
-/// 注意 substring 匹配边界：HTTPEnable 不命中 HTTPSEnable（HTTP 后跟 S），
-/// HTTPProxy 不命中 HTTPSProxy，语义安全。
+/// 读系统代理（mac 分派，M-1 侦察 ⑧ 2026-09-20 实测）：macOS 12 的 `scutil`
+/// **不支持 `--proxies` 子命令**（unrecognized option），原 scutil_parse 恒 None
+/// （启动前捕获用户 VPN 能力失效）——改逐网络服务 `networksetup -getwebproxy`
+/// 读（与 networksetup_apply 逐服务写对称），任一服务 HTTP 代理启用即返回。
 #[cfg(target_os = "macos")]
-fn scutil_parse() -> Option<(bool, String, String)> {
-    let out = crate::platform::cmd::sys_output(
-        crate::platform::cmd::sys_command("scutil").arg("--proxies"),
-    )
-    .ok()?;
-    let get = |k: &str| {
-        out.lines()
-            .find(|l| l.contains(k))
-            .and_then(|l| l.split(':').nth(1).map(|v| v.trim().to_string()))
-    };
-    if get("HTTPEnable").as_deref() != Some("1") {
-        return None;
-    }
-    let host = get("HTTPProxy")?;
-    let port = get("HTTPPort")?;
-    if host.is_empty() || port.is_empty() {
-        return None;
-    }
-    // ExceptionsList 数组段抽取（聚合视图的 bypass 域，还原时回写保真）
-    let mut bypass: Vec<String> = Vec::new();
-    let mut in_list = false;
-    for line in out.lines() {
-        if line.contains("ExceptionsList") {
-            in_list = true;
+fn networksetup_read() -> Option<(bool, String, String)> {
+    let services = network_services().ok()?;
+    for svc in &services {
+        let out = |args: &[&str]| -> Option<String> {
+            crate::platform::cmd::sys_output(
+                crate::platform::cmd::sys_command("networksetup").args(args),
+            )
+            .ok()
+        };
+        // 输出形如：Enabled: Yes / Server: 127.0.0.1 / Port: 7890 /
+        // Authenticated Proxy Enabled: 0（前缀匹配安全：Server 不命中认证段）
+        let web = out(&["-getwebproxy", svc])?;
+        if parse_enabled(&web) != Some(true) {
             continue;
         }
-        if in_list {
-            let t = line.trim();
-            if t.starts_with('}') {
-                break;
-            }
-            if let Some((_, v)) = t.split_once(':') {
-                let v = v.trim();
-                if !v.is_empty() {
-                    bypass.push(v.to_string());
-                }
-            }
+        let (Some(host), Some(port)) = (parse_field(&web, "Server"), parse_field(&web, "Port"))
+        else {
+            continue;
+        };
+        if host.is_empty() || port.is_empty() {
+            continue;
         }
+        // bypass 取同服务 -getproxybypassdomains（逐行域列表；未设置时输出说明行）
+        let bypass = out(&["-getproxybypassdomains", svc])
+            .map(|t| {
+                t.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.contains("aren't any"))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .unwrap_or_default();
+        return Some((true, format!("{host}:{port}"), bypass));
     }
-    Some((true, format!("{host}:{port}"), bypass.join(";")))
+    None
+}
+
+/// networksetup 读输出 Enabled 行解析（Yes/No；缺行返回 None）
+#[cfg(target_os = "macos")]
+fn parse_enabled(text: &str) -> Option<bool> {
+    text.lines()
+        .find(|l| l.trim_start().starts_with("Enabled"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// networksetup 读输出字段解析（"Key: value" 形态，前缀匹配）
+#[cfg(target_os = "macos")]
+fn parse_field(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find(|l| l.trim_start().starts_with(key))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
 }
 
 #[cfg(test)]
@@ -173,17 +178,22 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn scutil_解析样例() {
-        // 以样例文本锁定解析逻辑（真机 M-1 侦察 8 复核权限模型）
-        let sample = "<dictionary> {\n  HTTPEnable : 1\n  HTTPProxy : 127.0.0.1\n  HTTPPort : 7890\n  ExceptionsList : <array> {\n    0 : 127.0.0.1\n    1 : localhost\n  }\n}";
-        // 解析逻辑抽自 scutil_parse 内联实现——此处直接验证关键子串判定边界
-        assert!(sample.lines().any(|l| l.contains("HTTPEnable")));
-        assert!(!sample.lines().any(|l| l.contains("HTTPEnable") && l.contains("HTTPS")));
+    fn networksetup_读输出解析() {
+        // M-1 侦察 ⑧：以 networksetup -getwebproxy 标准输出样例锁定解析
+        let sample = "Enabled: Yes\nServer: 127.0.0.1\nPort: 7890\nAuthenticated Proxy Enabled: 0\n";
+        assert_eq!(parse_enabled(&sample), Some(true));
+        assert_eq!(parse_field(&sample, "Server").as_deref(), Some("127.0.0.1"));
+        assert_eq!(parse_field(&sample, "Port").as_deref(), Some("7890"));
+        // 前缀边界：Port 不命中 Authenticated 段（starts_with 从行首判定）
+        let off = "Enabled: No\nServer: 0.0.0.0\nPort: 0\nAuthenticated Proxy Enabled: 0\n";
+        assert_eq!(parse_enabled(&off), Some(false));
+        let auth = "Enabled: Yes\nServer: 1.2.3.4\nPort: 8888\nAuthenticated Proxy Enabled: Yes\n";
+        assert_eq!(parse_field(&auth, "Server").as_deref(), Some("1.2.3.4"));
     }
 
     #[test]
     fn get_system_proxy_返回形态稳定() {
-        // 仅验证不 panic（Windows 注册表读取 / scutil 依赖真机环境，None 均合法）
+        // 仅验证不 panic（Windows 注册表读取 / networksetup 依赖真机环境，None 均合法）
         let _ = get_system_proxy();
     }
 }

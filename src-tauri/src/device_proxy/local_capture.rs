@@ -9,11 +9,16 @@
 //! --capture-local` 手动兜底用法）。扫描两个应用目录：TRAE SOLO CN（Trae Work）与
 //! Trae CN（Trae IDE），设置 TRAE_APP_DIR 时只扫指定目录。
 
+#[cfg(windows)] // 文件层 API 仅 Windows 管线消费（mac 构建零使用）
 use std::path::{Path, PathBuf};
 
 use crate::state::AppState;
 
-use super::handler::{extract_user_id, update_account_jwt, valid_cloud_ide_jwt, ProxyCtx};
+#[cfg(windows)] // 同上：JWT 回写仅 Windows 捕获管线消费
+use super::handler::{extract_user_id, update_account_jwt};
+use super::handler::valid_cloud_ide_jwt; // JWT 校验被跨平台测试复用
+#[cfg(windows)] // ProxyCtx 仅 Windows 版 offline_ctx/capture_from_app_dir 消费
+use super::handler::ProxyCtx;
 
 /// 候选应用数据目录（对齐 Python `_trae_app_dirs`）：TRAE SOLO CN + Trae CN；
 /// 设置 TRAE_APP_DIR 时只扫指定目录（兼容旧环境变量）。
@@ -37,6 +42,7 @@ fn trae_app_dirs() -> Vec<PathBuf> {
 }
 
 /// 离线场景构造 ProxyCtx（复用 handler 的账号写回通路；不启动代理、不 emit 前端事件）
+#[cfg(windows)] // 仅 Windows 版 capture_from_local 消费（mac 走 Err 桩）
 fn offline_ctx(state: &AppState) -> ProxyCtx {
     let captured = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     ProxyCtx {
@@ -116,6 +122,7 @@ fn decrypt_cookie(enc: &[u8], key: Option<&[u8]>) -> Option<String> {
 /// 从一段文本里找 Cloud-IDE-JWT（对齐 Python `_find_cloud_ide_jwt`）：
 /// 先匹配显式前缀，命中即返回（无效也直接 None，不落入通用扫描）；
 /// 否则通用三段 JWT 逐个校验，返回首个通过者（格式化为 `Cloud-IDE-JWT <jwt>`）。
+#[cfg_attr(not(windows), allow(dead_code))] // 生产调用链 Windows 专属；测试跨平台复用
 fn find_cloud_ide_jwt(blob: &str) -> Option<String> {
     use std::sync::OnceLock;
     static PREFIX_RE: OnceLock<regex::Regex> = OnceLock::new();

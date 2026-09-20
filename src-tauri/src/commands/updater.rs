@@ -784,8 +784,9 @@ mod tests {
         ]);
         let (name, url, _) = pick_asset(assets.as_array().unwrap()).unwrap();
         assert!(!name.ends_with(".exe"), "mac 更新器绝不误选 exe: {name}");
-        let native = format!("_{}.dmg", std::env::consts::ARCH);
-        assert!(name.ends_with(&native), "应选本机架构 dmg: {name}");
+        // dmg 令牌映射：运行时 ARCH=x86_64 对应资产命名 _x64.dmg（aarch64 同名）
+        let native = if std::env::consts::ARCH == "x86_64" { "_x64.dmg" } else { "_aarch64.dmg" };
+        assert!(name.ends_with(native), "应选本机架构 dmg: {name}");
         if std::env::consts::ARCH == "x86_64" {
             assert_eq!(url, "u-x64");
         } else {

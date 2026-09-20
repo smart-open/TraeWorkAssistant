@@ -15,7 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{profile, glob_match_ci, Session};
+#[cfg(windows)] // Windows 六级发现专用（mac bundle 定位链不消费）
+use super::{glob_match_ci, profile};
+use super::Session;
 
 pub fn find_exe(sess: &mut Session) -> Option<PathBuf> {
     // F-75 M1-1.2：mac 走 bundle 定位链（与 Windows 六级发现完全分派）
@@ -115,7 +117,7 @@ fn find_bundle(sess: &mut Session) -> Option<PathBuf> {
 
     // 2) bundle 探测：候选名 = 显示名 + exe 名主干（豆包等中文名应用 mac bundle 名待侦察）
     for name in bundle_name_candidates(sess) {
-        if let Some(app) = locate_bundle_dir(name, sess.prof.exe_names) {
+        if let Some(app) = locate_bundle_dir(name, sess.prof.exe_names, sess.prof.mac_bundle_ids) {
             sess.exe_cache = Some(app.clone());
             return Some(app);
         }
@@ -125,20 +127,21 @@ fn find_bundle(sess: &mut Session) -> Option<PathBuf> {
     //    候选名与 bundle 探测同源（审查 P2：原只查显示名，漏掉安装目录名与
     //    显示名不一致的应用，如英文名目录 + 中文名显示）
     for name in bundle_name_candidates(sess) {
-        if let Some(app) = mdfind_bundle(name, sess.prof.exe_names) {
+        if let Some(app) = mdfind_bundle(name, sess.prof.exe_names, sess.prof.mac_bundle_ids) {
             sess.exe_cache = Some(app.clone());
             return Some(app);
         }
     }
 
     // 4) 运行中进程回退：sysinfo exe() 返回 <App>.app/Contents/MacOS/<exe>，
-    //    归一回 .app 根后经 exe_names 白名单防串台。
+    //    归一回 .app 根后经白名单防串台。
     //    M-1 已知局限（helper 进程局限）：仅辅助进程在跑（主进程已退）时，
     //    running_exe_of 可能命中 <App> Helper.app 内层 bundle——bundle_root_of
     //    归一到 Helper 包、白名单不匹配被拒 → 进程回退失准；主进程在跑时无此问题
+    //    （M-1 ⑥ 后 running_exe_of mac 分支仅枚举主进程，本局限已消除）
     if let Some(exe) = super::proc::running_exe_of(&sess.prof) {
         if let Some(app) = bundle_root_of(&exe) {
-            if bundle_exe_matches(&app, sess.prof.exe_names) {
+            if bundle_exe_matches(&app, sess.prof.exe_names, sess.prof.mac_bundle_ids) {
                 sess.exe_cache = Some(app);
                 return sess.exe_cache.clone();
             }
@@ -167,13 +170,25 @@ fn bundle_root_of(exe: &Path) -> Option<PathBuf> {
     }
 }
 
-/// bundle 防串台：Contents/Info.plist 的 CFBundleExecutable 必须 ∈ exe_names 白名单
+/// bundle 防串台：Info.plist 身份 ∈ 白名单。双信号（M-1 侦察 ⑥：四应用
+/// CFBundleExecutable 均为 "Electron" 不可区分，CFBundleIdentifier 为主身份信号）：
+///   ① CFBundleExecutable ∈ exe_names（剥 .exe 后缀，原语义保留）；
+///   ② CFBundleIdentifier ∈ bundle_ids（mac_bundle_ids 档案字段；Helper 内层
+///     bundle id 带 ".helper" 后缀，如 cn.trae.app.helper，不会被 ② 误放行）
 #[cfg(target_os = "macos")]
-pub(crate) fn bundle_exe_matches(app: &Path, exe_names: &[&str]) -> bool {
-    let Some(exec) = read_info_plist_value(app, "CFBundleExecutable") else { return false };
-    exe_names
-        .iter()
-        .any(|e| e.strip_suffix(".exe").unwrap_or(e).eq_ignore_ascii_case(&exec))
+pub(crate) fn bundle_exe_matches(app: &Path, exe_names: &[&str], bundle_ids: &[&str]) -> bool {
+    if let Some(exec) = read_info_plist_value(app, "CFBundleExecutable") {
+        if exe_names
+            .iter()
+            .any(|e| e.strip_suffix(".exe").unwrap_or(e).eq_ignore_ascii_case(&exec))
+        {
+            return true;
+        }
+    }
+    !bundle_ids.is_empty()
+        && read_info_plist_value(app, "CFBundleIdentifier")
+            .map(|id| bundle_ids.iter().any(|b| b.eq_ignore_ascii_case(&id)))
+            .unwrap_or(false)
 }
 
 /// 解析 Contents/Info.plist 指定 key 的首个 `<string>…</string>` 值（纯文本 XML
@@ -196,7 +211,7 @@ pub(crate) fn read_info_plist_value(app: &Path, key: &str) -> Option<String> {
 
 /// bundle 探测：/Applications/<Name>.app、~/Applications/<Name>.app
 #[cfg(target_os = "macos")]
-pub(crate) fn locate_bundle_dir(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
+pub(crate) fn locate_bundle_dir(name: &str, exe_names: &[&str], bundle_ids: &[&str]) -> Option<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let bases = [
         PathBuf::from("/Applications"),
@@ -204,7 +219,7 @@ pub(crate) fn locate_bundle_dir(name: &str, exe_names: &[&str]) -> Option<PathBu
     ];
     for base in bases {
         let app = base.join(format!("{name}.app"));
-        if is_bundle_dir(&app) && bundle_exe_matches(&app, exe_names) {
+        if is_bundle_dir(&app) && bundle_exe_matches(&app, exe_names, bundle_ids) {
             return Some(app);
         }
     }
@@ -213,7 +228,7 @@ pub(crate) fn locate_bundle_dir(name: &str, exe_names: &[&str]) -> Option<PathBu
 
 /// Spotlight 兜底：mdfind 查 .app，逐个经白名单防串台
 #[cfg(target_os = "macos")]
-pub(crate) fn mdfind_bundle(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
+pub(crate) fn mdfind_bundle(name: &str, exe_names: &[&str], bundle_ids: &[&str]) -> Option<PathBuf> {
     // 逐应用目录查询（用户级 ~/Applications 与系统级 /Applications 同等常见）
     let mut roots = vec!["/Applications".to_string()];
     let home = std::env::var("HOME").unwrap_or_default();
@@ -235,7 +250,7 @@ pub(crate) fn mdfind_bundle(name: &str, exe_names: &[&str]) -> Option<PathBuf> {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
             let p = PathBuf::from(line.trim());
-            if is_bundle_dir(&p) && bundle_exe_matches(&p, exe_names) {
+            if is_bundle_dir(&p) && bundle_exe_matches(&p, exe_names, bundle_ids) {
                 return Some(p);
             }
         }
@@ -341,6 +356,7 @@ fn registry_locate(sess: &Session) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)] // 仅 lnk_dirs 用例消费（displayicon 用例为纯 std 语义）
     use super::*;
 
     #[test]

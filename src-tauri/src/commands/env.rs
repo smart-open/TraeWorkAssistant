@@ -645,7 +645,6 @@ pub(crate) fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate 
 fn app_locate_macos(state: &State<AppState>, app: &str) -> AppLocate {
     use crate::switcher::locate::{
         bundle_exe_matches, is_bundle_dir, locate_bundle_dir, mdfind_bundle,
-        read_info_plist_value,
     };
 
     let key = app.to_lowercase();
@@ -720,22 +719,23 @@ fn app_locate_macos(state: &State<AppState>, app: &str) -> AppLocate {
         }
     }
     for name in &names {
-        if let Some(found) = locate_bundle_dir(name, proc_names) {
+        if let Some(found) = locate_bundle_dir(name, proc_names, &[]) {
             return finish_locate_macos(display, &user_data_dir, found, "default");
         }
     }
     // 3) Spotlight 兜底（mdfind 秒回；仅上面未命中时）
     for name in &names {
-        if let Some(found) = mdfind_bundle(name, proc_names) {
+        if let Some(found) = mdfind_bundle(name, proc_names, &[]) {
             return finish_locate_macos(display, &user_data_dir, found, "default");
         }
     }
 
     // 4) 运行中进程回退：sysinfo exe 路径归一回 .app 根（exe → MacOS → Contents
-    //    → <App>.app，ancestors().nth(3)）后经白名单防串台
+    //    → <App>.app，ancestors().nth(3)）后经白名单防串台（bundle_ids 空表 =
+    //    维持 CFBundleExecutable 单信号语义，本函数档案的 exe 主干名信号不变）
     for p in crate::commands::process::mac_exe_paths() {
         if let Some(app_dir) = p.ancestors().nth(3) {
-            if is_bundle_dir(app_dir) && bundle_exe_matches(app_dir, proc_names) {
+            if is_bundle_dir(app_dir) && bundle_exe_matches(app_dir, proc_names, &[]) {
                 return finish_locate_macos(
                     display,
                     &user_data_dir,
@@ -912,6 +912,7 @@ fn registry_app_path(profile: &AppProfile) -> Option<String> {
 }
 
 /// 从注册表 DisplayIcon / InstallLocation 推导 exe 路径（按档案 exe 名匹配）
+#[cfg(not(target_os = "macos"))] // 唯一调用方 registry_app_path 为 Windows 分支；AppProfile 亦非 mac 编译
 fn resolve_reg_profile_candidate(
     icon: &Option<String>,
     loc: &Option<String>,

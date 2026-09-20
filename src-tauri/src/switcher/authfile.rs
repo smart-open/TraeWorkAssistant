@@ -25,13 +25,28 @@ use super::{ProgressSink, Session, StepStatus};
 
 // 路径常量（与 commands/workbuddy/common.rs::auth_file_path 同值，注释互指；
 // CodeBuddyExtension 宿主目录 + workbuddy 产品线文件名，实测确认）
+#[cfg(windows)] // mac 分支走 Application Support 基根（不含反斜杠相对段）
 const WB_AUTH_DIR_REL: &str = "CodeBuddyExtension\\Data\\Public\\auth";
 const WB_AUTH_FILE_NAME: &str = "workbuddy-desktop.info";
 
 pub(crate) fn wb_auth_dir() -> PathBuf {
-    std::env::var("LOCALAPPDATA")
-        .map(|l| PathBuf::from(l).join(WB_AUTH_DIR_REL))
-        .unwrap_or_else(|_| PathBuf::from(WB_AUTH_DIR_REL))
+    #[cfg(windows)]
+    {
+        std::env::var("LOCALAPPDATA")
+            .map(|l| PathBuf::from(l).join(WB_AUTH_DIR_REL))
+            .unwrap_or_else(|_| PathBuf::from(WB_AUTH_DIR_REL))
+    }
+    // M-1 侦察 ②（2026-09-20 实测确认）：mac auth 文件与 Windows 同构，仅宿主基根
+    // 不同——~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/
+    // workbuddy-desktop.info（本机实测存在且客户端活跃回写）
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::app_support_root_lossy()
+            .join("CodeBuddyExtension")
+            .join("Data")
+            .join("Public")
+            .join("auth")
+    }
 }
 
 pub(crate) fn wb_auth_file() -> PathBuf {

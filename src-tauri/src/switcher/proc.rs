@@ -22,6 +22,7 @@ fn snapshot() -> System {
 /// 形态——精确比较恒不命中 → list_procs 恒空 → stop_app 恒报「未运行」从不关闭
 /// 客户端，快照在运行中被覆盖 + 启动变多开（豆包/CodeBuddy/TRAE 全线「切换不生效」
 /// 的根因）。匹配前统一剥离 .exe 后缀（大小写不敏感）。
+#[cfg(windows)]
 fn name_matches(prof: &AppProfile, name: &str) -> bool {
     let base = strip_exe_suffix(name);
     prof.proc_names.iter().any(|n| base.eq_ignore_ascii_case(n))
@@ -29,6 +30,7 @@ fn name_matches(prof: &AppProfile, name: &str) -> bool {
 
 /// 剥离映像名尾部的 ".exe"（大小写不敏感；无后缀原样返回）。
 /// 用 get 防多字节字符下标越界（非字符边界时 get 返回 None → 原样返回）。
+#[cfg(windows)]
 fn strip_exe_suffix(name: &str) -> &str {
     if name.len() > 4 {
         if let Some(base) = name.get(..name.len() - 4) {
@@ -40,13 +42,42 @@ fn strip_exe_suffix(name: &str) -> &str {
     name
 }
 
+/// M-1 侦察 ⑥（2026-09-20 真机实测）：mac 四应用主进程可执行名均为 "Electron"
+///（<App>.app/Contents/MacOS/Electron），映像名精确匹配恒不命中且会跨应用串台。
+/// 主进程判定改按 exe 路径 bundle 段：含 `/<App>.app/Contents/MacOS/`——
+/// Helper 进程位于 `Contents/Frameworks/<X> Helper*.app/` 下不会命中（仅主进程），
+/// SIGTERM 主进程后 Helper 随主退出（与 Windows 仅关停主 exe 的语义一致）。
+#[cfg(target_os = "macos")]
+fn mac_main_matches(prof: &AppProfile, p: &sysinfo::Process) -> bool {
+    p.exe()
+        .map(|e| {
+            let s = e.to_string_lossy().to_lowercase();
+            prof.proc_names
+                .iter()
+                .any(|n| s.contains(&format!("/{}.app/contents/macos/", n.to_lowercase())))
+        })
+        .unwrap_or(false)
+}
+
+/// 进程匹配分派：Windows 按映像名（剥 .exe），macOS 按主 bundle 路径段
+fn proc_matches(prof: &AppProfile, p: &sysinfo::Process) -> bool {
+    #[cfg(windows)]
+    {
+        name_matches(prof, &p.name().to_string_lossy())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mac_main_matches(prof, p)
+    }
+}
+
 /// 枚举目标应用进程（精确映像名匹配）。返回 (pid, exe 全路径)——
 /// Stop 前缓存 exe、Find-TraeExe 第 5 级复用。
 pub fn list_procs(prof: &AppProfile) -> Vec<(u32, Option<std::path::PathBuf>)> {
     let sys = snapshot();
     sys.processes()
         .iter()
-        .filter(|(_, p)| name_matches(prof, &p.name().to_string_lossy()))
+        .filter(|(_, p)| proc_matches(prof, p))
         .map(|(pid, p)| (pid.as_u32(), p.exe().map(|e| e.to_path_buf())))
         .collect()
 }
@@ -58,16 +89,30 @@ pub fn is_running(sess: &Session) -> bool {
 /// exe 发现第 5 级专用（PS 322-333）：proc_patterns 通配组命中（大小写不敏感，
 /// PS Get-Process -Name 'Trae*'/'TRAE*' 语义）的进程 → 取 exe 全路径（首个命中）。
 /// 与 list_procs 的精确 proc_names 组双轨并存（PS 同款：Find 用 ProcPatterns、
-/// Stop 用 ProcNames）。
+/// Stop 用 ProcNames）。mac 分支（M-1 ⑥）：映像名通配会命中 Helper 进程
+///（"Trae CN Helper" ∈ "Trae*"）→ 归一回 Helper 内层 bundle 被白名单拒绝、发现
+/// 失准——改用主 bundle 路径段匹配（与 list_procs 同源，仅主进程）。
 pub fn running_exe_of(prof: &AppProfile) -> Option<std::path::PathBuf> {
-    let sys = snapshot();
-    sys.processes()
-        .iter()
-        .filter(|(_, p)| {
-            let name = p.name().to_string_lossy();
-            prof.proc_patterns.iter().any(|pat| super::glob_match_ci(pat, &name))
-        })
-        .find_map(|(_, p)| p.exe().map(|e| e.to_path_buf()))
+    #[cfg(target_os = "macos")]
+    {
+        let sys = snapshot();
+        return sys
+            .processes()
+            .iter()
+            .filter(|(_, p)| mac_main_matches(prof, p))
+            .find_map(|(_, p)| p.exe().map(|e| e.to_path_buf()));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let sys = snapshot();
+        sys.processes()
+            .iter()
+            .filter(|(_, p)| {
+                let name = p.name().to_string_lossy();
+                prof.proc_patterns.iter().any(|pat| super::glob_match_ci(pat, &name))
+            })
+            .find_map(|(_, p)| p.exe().map(|e| e.to_path_buf()))
+    }
 }
 
 /// Stop-Trae 对译：三级关闭。
@@ -264,7 +309,7 @@ pub fn post_wm_close(pid: u32) {
 fn kill_all(prof: &AppProfile) {
     let sys = snapshot();
     for (_, p) in sys.processes() {
-        if name_matches(prof, &p.name().to_string_lossy()) {
+        if proc_matches(prof, p) {
             let _ = p.kill();
         }
     }
@@ -279,6 +324,7 @@ mod tests {
         profile::profile_for(app, std::env::temp_dir().as_path())
     }
 
+    #[cfg(windows)]
     #[test]
     fn name_matches_兼容sysinfo带exe后缀() {
         // 实测根因回归：sysinfo ImageName 带 .exe 后缀，白名单不带——必须能命中

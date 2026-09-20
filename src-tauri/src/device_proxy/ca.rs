@@ -261,15 +261,15 @@ fn self_heal_acl_if_needed(
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
+        use crate::platform::cmd::sys_command;
         let readable = |p: &std::path::Path| std::fs::File::open(p).is_ok();
         if targets.iter().all(|p| readable(p)) {
             return Ok(());
         }
-        let _ = std::process::Command::new("icacls")
+        // 经 cmd.rs 收敛点构建（CREATE_NO_WINDOW 语义与原直建 CommandExt 一致）
+        let _ = sys_command("icacls")
             .arg(certs_dir)
             .args(["/reset", "/T"])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output();
         if targets.iter().all(|p| readable(p)) {
             return Ok(());

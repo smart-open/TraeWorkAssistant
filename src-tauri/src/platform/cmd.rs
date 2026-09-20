@@ -11,13 +11,17 @@
 /// - Windows：CREATE_NO_WINDOW（0x08000000）隐藏控制台，语义与既有散写完全一致；
 /// - macOS：无控制台弹窗问题，原生即安静，直接返回。
 pub fn sys_command(program: &str) -> std::process::Command {
-    let mut c = std::process::Command::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new(program);
         c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        c
     }
-    c
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(program)
+    }
 }
 
 /// Windows 专用：构建无窗口子进程，先追加若干**常规**参数、再追加一条**原生**命令行
@@ -61,6 +65,8 @@ mod tests {
         let mut c = sys_command(if cfg!(windows) { "cmd" } else { "echo" });
         if cfg!(windows) {
             c.args(["/C", "echo", "ok"]);
+        } else {
+            c.arg("ok"); // POSIX echo：参数直出
         }
         let out = sys_output(&mut c).unwrap();
         assert!(out.contains("ok"));

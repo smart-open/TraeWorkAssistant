@@ -2,6 +2,8 @@
 //! icube 分支 1262-1398 对译）：精准白名单备份/恢复 + .bak 单代回滚 + 恢复计数
 //!（供 Switch 恢复后校验）。
 
+use std::path::PathBuf;
+
 use super::copy;
 use super::{ProgressSink, Session, StepStatus};
 
@@ -44,6 +46,28 @@ const ICUBE_ITEMS: &[Item] = &[
     Item::Dir("Session Storage"),                   // 9.
 ];
 
+/// mac 专属快照项（F-75 M-1 侦察 ①，2026-09-20 真机实测）：mac Trae CN / TRAE SOLO CN
+/// 数据目录无 `Network/` 子目录，登录 Cookies 在数据根级 `Cookies` + `Cookies-journal`
+///（Windows 的 `Dir("Network")` 项在 mac 由存在性检查自然跳过，无需删除）。
+#[cfg(target_os = "macos")]
+const ICUBE_ITEMS_MAC: &[&str] = &["Cookies", "Cookies-journal"];
+
+#[cfg(not(target_os = "macos"))]
+const ICUBE_ITEMS_MAC: &[&str] = &[];
+
+/// 快照相对路径组件化（F-75 M-1 侦察修复）：ICUBE_ITEMS 沿用 Windows 反斜杠常量
+/// 形态，mac 上 `PathBuf::join("User\\globalStorage\\storage.json")` 会把整串当作
+/// 单个文件名组件导致恒 miss——统一按 '\\' 切分组件逐级 join（Windows join 结果
+/// 与原样一致，行为零变化；与 trae_apps.rs v2.7 组件化修复同思路）。
+fn rel_path(rel: &str) -> PathBuf {
+    rel.split('\\').fold(PathBuf::new(), |p, c| p.join(c))
+}
+
+/// 快照项全集（相对路径）：公共项 + 平台专属项
+fn all_items() -> Vec<&'static str> {
+    ICUBE_ITEMS.iter().map(|i| i.rel()).chain(ICUBE_ITEMS_MAC.iter().copied()).collect()
+}
+
 /// 精准备份：仅复制登录态关键文件（参考 traework-switcher）
 pub fn backup_icube(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
     let src = &sess.prof.data_dir;
@@ -58,8 +82,8 @@ pub fn backup_icube(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Resu
     std::fs::create_dir_all(&dest).map_err(|e| format!("创建快照目录失败: {e}"))?;
 
     let mut copied = 0usize;
-    for item in ICUBE_ITEMS {
-        if copy::copy_snapshot_item(&src.join(item.rel()), &dest.join(item.rel())) {
+    for rel in all_items() {
+        if copy::copy_snapshot_item(&src.join(rel_path(rel)), &dest.join(rel_path(rel))) {
             copied += 1;
         }
     }
@@ -93,9 +117,9 @@ pub fn restore_icube(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) ->
     // 对称恢复：槽位有的项覆盖，槽位没有的项删除现场残留——恢复后 Live 恒等于槽位
     // 内容，不携带上一账号的残留（如槽位缺 state.vscdb.backup 而现场有旧账号的）
     let mut restored = 0usize;
-    for item in ICUBE_ITEMS {
-        let src_item = src.join(item.rel());
-        let dst_item = dest.join(item.rel());
+    for rel in all_items() {
+        let src_item = src.join(rel_path(rel));
+        let dst_item = dest.join(rel_path(rel));
         if src_item.exists() {
             if copy::copy_snapshot_item(&src_item, &dst_item) {
                 restored += 1;

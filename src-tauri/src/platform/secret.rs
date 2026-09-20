@@ -31,6 +31,7 @@ pub fn load_vault_password(state: &AppState) -> Result<Option<Vec<u8>>, String> 
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = state; // mac 走 Keychain，无 conf 路径消费（Windows 分支用 state.conf_path）
         let entry = keyring_entry()?;
         match entry.get_password() {
             Ok(hex) => decode_hex(&hex).map(Some),
@@ -52,6 +53,7 @@ pub fn store_vault_password(state: &AppState, pwd: &[u8]) -> Result<(), String> 
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = state; // mac 走 Keychain，无 conf 路径消费（Windows 分支用 state.conf_path）
         let hex: String = pwd.iter().map(|b| format!("{b:02x}")).collect();
         keyring_entry()?
             .set_password(&hex)

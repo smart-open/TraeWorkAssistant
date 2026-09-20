@@ -240,10 +240,12 @@ impl ProgressSink for CliSink {
 // ── 通用小工具 ──────────────────────────────────────────────────────────────
 
 /// glob 通配匹配（PS -like 语义：仅 `*` 通配，大小写不敏感——如 *Doubao* 须命中 doubao.lnk）
+#[cfg_attr(not(windows), allow(dead_code))] // Windows 六级发现消费；测试跨平台复用
 pub fn glob_match_ci(pattern: &str, text: &str) -> bool {
     glob_match_ci_inner(pattern, text)
 }
 
+#[cfg_attr(not(windows), allow(dead_code))] // 同上：Windows 生产链专用
 fn glob_match_ci_inner(pattern: &str, text: &str) -> bool {
     let p = pattern.to_lowercase();
     let t = text.to_lowercase();

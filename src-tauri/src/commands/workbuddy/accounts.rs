@@ -114,10 +114,11 @@ pub fn workbuddy_open_auth_dir(state: State<AppState>) -> Result<(), String> {
     if !dir.is_dir() {
         return Err(format!("目录不存在：{}", dir.display()));
     }
-    std::process::Command::new("explorer")
-        .arg(&dir)
-        .spawn()
-        .map_err(|e| format!("打开目录失败: {e}"))?;
+    // F-75：按平台分派打开目录——Windows explorer / macOS open（Finder 置顶）。
+    // 经 sys_command 收敛（Windows 侧获得 CREATE_NO_WINDOW，GUI 应用无害）
+    let mut cmd = crate::platform::cmd::sys_command(if cfg!(windows) { "explorer" } else { "open" });
+    cmd.arg(&dir);
+    cmd.spawn().map_err(|e| format!("打开目录失败: {e}"))?;
     Ok(())
 }
 
