@@ -293,6 +293,39 @@ fn main() {
             tasks::scheduler::scheduler_status,
         ])
         .setup(|app| {
+            // F-75：macOS 无边框窗口（decorations:false，前端自绘标题栏）下 tauri.conf
+            // 的 "maximized": true 不生效（Tauri v2 已知缺陷：borderless 样式忽略
+            // maximize），窗口退回 1180×760 原始尺寸显得过大。此处按所在屏幕手动
+            // 铺满可视区（下移菜单栏高度，避免自绘标题栏被系统菜单栏遮挡）；
+            // Windows 走 conf 原生最大化，不受本段影响（行为零变化）。
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(win) = app.get_webview_window("main") {
+                    let monitor = win
+                        .current_monitor()
+                        .ok()
+                        .flatten()
+                        .or_else(|| win.primary_monitor().ok().flatten());
+                    if let Some(monitor) = monitor {
+                        let mpos = monitor.position();
+                        let msize = monitor.size();
+                        let scale = monitor.scale_factor();
+                        // 菜单栏高度经验值 ~25 逻辑 px（Retina/普通屏通用近似）
+                        let menu_h = (25.0 * scale) as i32;
+                        let _ = win.hide();
+                        let _ = win.set_position(tauri::PhysicalPosition::new(
+                            mpos.x,
+                            mpos.y + menu_h,
+                        ));
+                        let _ = win.set_size(tauri::PhysicalSize::new(
+                            msize.width,
+                            msize.height - menu_h as u32,
+                        ));
+                        let _ = win.show();
+                    }
+                }
+            }
+
             let state = app.state::<AppState>();
 
             // 数据存储层 SQLite 化（docs/sqllite-storage-plan.md）：旧 JSON 导入 aiwork.sqlite
@@ -612,6 +645,19 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 std::process::exit(0);
             });
+        }
+        // F-75：mac 点击 Dock 图标重新打开（Reopen 变体带 #[cfg(target_os = "macos")]，
+        // Windows 编译不存在该变体，匹配须整体门控）。无边框窗口（decorations:false）
+        // 最小化后，macOS 不会自动恢复窗口——手动 unminimize + show + 置前聚焦。
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+            if !has_visible_windows {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
         }
     });
 }

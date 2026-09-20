@@ -235,8 +235,8 @@ pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &
 pub(super) fn is_running() -> bool {
     #[cfg(target_os = "macos")]
     {
-        // F-75 审查修复 #6：mac 走 sysinfo 进程探测（与 commands::process 同源）
-        return !crate::commands::process::images_running(&["WorkBuddy.exe"]).is_empty();
+        // M-1 ⑥：映像名均为 Electron，按 bundle 主进程路径段匹配
+        crate::commands::process::mac_app_running(&["WorkBuddy"])
     }
     #[cfg(not(target_os = "macos"))]
     {

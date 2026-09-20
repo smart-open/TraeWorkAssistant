@@ -270,11 +270,16 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: Some(
                 roaming_dir("CodeBuddy CN").join("User").join("globalStorage"),
             ),
-            // M-1 侦察 ⑨（2026-09-20 结论）：**侦察不通过，维持灰度**——本机
-            // CodeBuddy CN.app 已安装但从未启动（无 ~/.codebuddy、无
-            // CodeBuddy CN 数据目录、Keychain 无对应条目），双目录布局无法确认；
-            // 待客户端启动并登录后补充侦察再放开
-            mac_supported: false,
+            // M-1 侦察 ⑨（2026-09-20 复测放开）：首次侦察时 CodeBuddy CN.app 未启动
+            //（无 ~/.codebuddy/、无 CodeBuddy CN 数据目录），维持灰度。复测时客户端已
+            // 通过 WorkBuddy OAuth 扫码登录，双目录布局与 Windows 同构：
+            //   L2 数据根  ~/.codebuddy/（settings.json, mcp.json, plugins, skills-marketplace）
+            //   L3 登录真源 ~/Library/Application Support/CodeBuddy CN/User/globalStorage/
+            //              （state.vscdb, storage.json, tencent-cloud.coding-copilot/）
+            //   共享 auth  ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/
+            //              workbuddy-desktop.info
+            // 三路径全部存在且活跃回写 → mac_supported 放开
+            mac_supported: true,
             mac_data_dir_guess: Some("~/.codebuddy"),
             mac_bundle_ids: &["com.tencent.codebuddycn"],
         },
@@ -357,24 +362,23 @@ mod tests {
     }
 
     #[test]
-    fn 五应用档案_mac灰度_m1侦察后四域放开() {
+    fn 五应用档案_mac灰度_m1侦察后五域放开() {
         // F-75 M0-0.6：mac_supported 仅在 M-1 侦察确认后放开。M-1 真机侦察
         //（2026-09-20）：Trae/TraeWork/WorkBuddy/豆包四域布局实测确认 → true；
-        // CodeBuddy 客户端从未启动（无 ~/.codebuddy 与数据目录）→ 维持 false，
-        // 放开时必须显式改动此测试
+        // CodeBuddy 首次侦察时客户端未启动，复测时已通过 WorkBuddy OAuth 扫码
+        // 登录，L2/L3/authfile 三路径全部存在 → 一并放开
         let confirmed = [
             (TargetApp::TraeWork, "Trae Work"),
             (TargetApp::Trae, "Trae"),
             (TargetApp::Doubao, "豆包"),
             (TargetApp::WorkBuddy, "WorkBuddy"),
+            (TargetApp::CodeBuddy, "CodeBuddy"),
         ];
         for (app, name) in confirmed {
             let prof = profile_for(app, &temp_data());
             assert!(prof.mac_supported, "{name} M-1 侦察确认后应为 true");
             assert!(!prof.mac_bundle_ids.is_empty(), "{name} mac_bundle_ids 必填（防串台）");
         }
-        let cb = profile_for(TargetApp::CodeBuddy, &temp_data());
-        assert!(!cb.mac_supported, "CodeBuddy 侦察不通过（客户端未启动）必须维持 false");
     }
 
     #[test]

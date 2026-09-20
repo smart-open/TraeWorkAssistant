@@ -522,7 +522,9 @@ fn switch_flow(
     let target = sess.prof.profiles_dir.join(uid);
     let target_bak = sess.prof.profiles_dir.join(format!("{uid}.bak"));
     if !target.exists() && !target_bak.exists() {
-        let msg = format!("目标账号 {uid} 无快照，请先登录该账号并点击「保存当前登录态」");
+        // 兜底预检（switch_account 命令层已有同步预检，正常到不了这里——如 Restore
+        // 直调入口）：文案与命令层引导一致，uid 保留供日志排查
+        let msg = format!("账号 {uid} 尚未保存登录态：请先用此账号登录客户端，然后点击「保存当前登录态」，成功后即可一键切换");
         sink.step("fatal", StepStatus::Error, &msg);
         return Err(fatal_line(&msg));
     }
@@ -573,7 +575,10 @@ fn switch_flow(
             missing.push("（快照为空或损坏，0 项恢复）".to_string());
         } else {
             for f in ["User\\globalStorage\\storage.json", "User\\globalStorage\\state.vscdb"] {
-                if !sess.prof.data_dir.join(f).exists() {
+                // 清单为 Windows 反斜杠形态：join 前必须组件化——mac 上 join 整串会把
+                // 反斜杠当作字面文件名，校验恒失败 → 恒回滚 last 槽 =「无论怎么切换
+                // 都是最后一个登录的账号」（2026-09-20 mac 实测根因，switcher.log 佐证）
+                if !sess.prof.data_dir.join(icube::rel_path(f)).exists() {
                     missing.push(f.to_string());
                 }
             }

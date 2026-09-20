@@ -1506,7 +1506,7 @@ fn lazy_refresh_needed(jwt: &str, refresh_token_expires_at: Option<i64>, now_ts:
 /// 解密本地 Chromium Cookies + leveldb 提取最新 JWT/refresh_token 写回 accounts 表。
 /// 恢复判定：捕获后该账号 JWT 或 refresh_token 与捕获前不同 → 视为拿到新登录态
 ///（capture 通路不清理 invalid 标记，此处补齐解除），返回 true；
-/// 无变化 / 非 Windows / 捕获失败 → 返回 false（调用方维持「需重新 OAuth 登录」）。
+/// 无变化 / 捕获失败（密钥不可得等）→ 返回 false（调用方维持「需重新 OAuth 登录」）。
 /// 调用方持有 jwt_refresh_lock，无并发写竞争。
 fn try_recover_from_local(state: &AppState, user_id: &str) -> bool {
     let before = crate::vault::load_accounts(state);

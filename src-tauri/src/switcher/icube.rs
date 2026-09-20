@@ -47,10 +47,12 @@ const ICUBE_ITEMS: &[Item] = &[
 ];
 
 /// mac 专属快照项（F-75 M-1 侦察 ①，2026-09-20 真机实测）：mac Trae CN / TRAE SOLO CN
-/// 数据目录无 `Network/` 子目录，登录 Cookies 在数据根级 `Cookies` + `Cookies-journal`
+/// 数据目录无 `Network/` 子目录，Chromium 根级文件放在数据根而非 `Network/` 下：
+/// - `Cookies` + `Cookies-journal`（登录 Cookies，Windows 在 Network/ 下）
+/// - `Network Persistent State`（Chromium 网络持久状态，Windows 在 Network/ 下）
 ///（Windows 的 `Dir("Network")` 项在 mac 由存在性检查自然跳过，无需删除）。
 #[cfg(target_os = "macos")]
-const ICUBE_ITEMS_MAC: &[&str] = &["Cookies", "Cookies-journal"];
+const ICUBE_ITEMS_MAC: &[&str] = &["Cookies", "Cookies-journal", "Network Persistent State"];
 
 #[cfg(not(target_os = "macos"))]
 const ICUBE_ITEMS_MAC: &[&str] = &[];
@@ -59,7 +61,8 @@ const ICUBE_ITEMS_MAC: &[&str] = &[];
 /// 形态，mac 上 `PathBuf::join("User\\globalStorage\\storage.json")` 会把整串当作
 /// 单个文件名组件导致恒 miss——统一按 '\\' 切分组件逐级 join（Windows join 结果
 /// 与原样一致，行为零变化；与 trae_apps.rs v2.7 组件化修复同思路）。
-fn rel_path(rel: &str) -> PathBuf {
+/// mod.rs 的恢复后校验（verify_restore）同样复用本函数。
+pub(super) fn rel_path(rel: &str) -> PathBuf {
     rel.split('\\').fold(PathBuf::new(), |p, c| p.join(c))
 }
 

@@ -5,6 +5,14 @@ description = "AI Work 助手 - 多账号签到与管理桌面端"
 edition = "2021"
 rust-version = "1.85"
 
+# aws-lc-sys 预编译汇编（keccak）的 DWARF unwind 信息含 DW_CFA_same_value，
+# Apple ld 无法为其生成 compact unwind——纯信息性提示（不影响产物正确性），
+# macOS 12 主机链接必现 → 放行该类链接器消息，守住构建零警告红线。
+# 注意：必须走命令行级 allow（cargo [lints] 会展开为 rustc CLI 参数），
+# 源码级 `#![allow(linker_messages)]` 对链接期诊断无效。
+[lints.rust]
+linker_messages = "allow"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -75,6 +83,13 @@ windows-registry = "0.6"
 # 仅编译进 mac 分支，Windows 构建零新依赖、零行为变化（vault 保持 DPAPI）
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = "3"
+# F-75 mac 本地捕获：TRAE Cookies 解密对齐 Chromium os_crypt_mac
+#（Keychain Safe Storage 密码 → PBKDF2-HMAC-SHA1/saltysalt/1003 → AES-128-CBC，IV=16×空格）
+pbkdf2 = "0.12"
+hmac = "0.12"
+sha1 = "0.10"
+aes = "0.8"
+cbc = "0.1"
 
 # dev/test 构建对依赖开优化：Stronghold 快照加密派生等在未优化下极慢（写一次 ~100s）
 [profile.dev.package."*"]

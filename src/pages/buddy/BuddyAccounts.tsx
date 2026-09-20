@@ -997,6 +997,14 @@ export default function BuddyAccounts() {
                     const { id, kind } = appMenu;
                     setAppMenu(null);
                     if (kind === 'switch') {
+                      // 无快照引导：该应用域从未保存过登录态，切换必然失败——
+                      // 直接提示补救路径，不发无效请求（后端 switch_account 同步预检兜底）
+                      const acc = accounts.find((x) => x.id === id);
+                      const snapOk = opt.app === 'WorkBuddy' ? acc?.has_snapshot : acc?.has_snapshot_codebuddy;
+                      if (!snapOk) {
+                        pushToast('warn', `该账号还没有保存过 ${opt.label} 登录态：请先在 ${opt.label} 客户端登录此账号，回到本页点击「保存当前登录态」，成功后即可一键切换`);
+                        return;
+                      }
                       void switchTo(id, opt.app);
                     } else {
                       void saveCurrentLogin(id, opt.app);

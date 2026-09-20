@@ -169,6 +169,18 @@ fn vault_password(state: &AppState) -> Result<Vec<u8>, String> {
     if let Some(pwd) = crate::platform::secret::load_vault_password(state)? {
         return Ok(pwd);
     }
+    // 防御（实测缺陷修复）：主密码源缺失但 vault 快照已存在时，静默重生成新密码
+    // 会与既有密文永久失配（macOS Keychain 条目丢失 → 每次 save_accounts 报
+    // BadFileKey，凭据不可恢复且读路径静默降级为空 JWT）。此时必须显式报错，
+    // 由用户决定重置 vault 或恢复密码源，绝不静默换钥。
+    let snapshot = state.conf_path("vault.stronghold");
+    if snapshot.exists() {
+        return Err(format!(
+            "vault 主密码源缺失但快照已存在（{}），拒绝静默重生成密码；\
+             若快照内凭据已全部失效，可备份后删除该文件重置 vault",
+            snapshot.display()
+        ));
+    }
     let pwd = generate_password();
     crate::platform::secret::store_vault_password(state, &pwd)?;
     Ok(pwd)
@@ -196,41 +208,59 @@ fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<Strong
 
 // ---------------- 公共 API ----------------
 
+/// vault 打开失败的去重日志标记：读路径调用极频繁，仅首条降级写日志，
+/// 恢复成功后复位（避免诊断盲区——本机曾因该静默降级整晚 401 无从定位）
+static VAULT_DEGRADED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 从磁盘加载账号文件，并从 vault 回填占位账号的明文凭据（仅内存，不落明文盘）。
 /// JSON 中已有的明文凭据优先（更新鲜，例如 MITM 新捕获，待下次保存迁移进 vault）。
 pub fn load_accounts(state: &AppState) -> AccountsFile {
     // SQLite 化（P3）：checkin_accounts.json → accounts 表（行保序、user_id 可空）
     let mut file: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
-    let Ok(guard) = open(state) else {
-        return file; // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
-    };
-    let Some(sh) = guard.as_ref() else {
-        return file;
-    };
-    let Ok(client) = sh.get_client(CLIENT_PATH.to_vec()) else {
-        return file;
-    };
-    for a in file.accounts.iter_mut() {
-        let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
-            continue;
-        };
-        if !a.jwt.trim().is_empty() {
-            continue; // JSON 明文优先
+    match open(state) {
+        Err(reason) => {
+            use std::sync::atomic::Ordering;
+            if !VAULT_DEGRADED_LOGGED.swap(true, Ordering::Relaxed) {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("vault 不可用：账号凭据读取降级为空 JWT（后续同类错误不再重复记录）: {reason}"),
+                );
+            }
+            return file; // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
         }
-        if let Ok(Some(v)) = client.store().get(uid.as_bytes()) {
-            if let Ok(entry) = serde_json::from_slice::<SecretEntry>(&v) {
-                if !entry.jwt.is_empty() {
-                    a.jwt = entry.jwt;
+        Ok(guard) => {
+            use std::sync::atomic::Ordering;
+            VAULT_DEGRADED_LOGGED.store(false, Ordering::Relaxed);
+            let Some(sh) = guard.as_ref() else {
+                return file;
+            };
+            let client = sh.get_client(CLIENT_PATH.to_vec());
+            let Ok(client) = client else {
+                return file;
+            };
+            for a in file.accounts.iter_mut() {
+                let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
+                    continue;
+                };
+                if !a.jwt.trim().is_empty() {
+                    continue; // JSON 明文优先
                 }
-                if a.refresh_token.as_deref().map_or(true, |s| s.is_empty())
-                    && !entry.refresh_token.is_empty()
-                {
-                    a.refresh_token = Some(entry.refresh_token);
+                if let Ok(Some(v)) = client.store().get(uid.as_bytes()) {
+                    if let Ok(entry) = serde_json::from_slice::<SecretEntry>(&v) {
+                        if !entry.jwt.is_empty() {
+                            a.jwt = entry.jwt;
+                        }
+                        if a.refresh_token.as_deref().map_or(true, |s| s.is_empty())
+                            && !entry.refresh_token.is_empty()
+                        {
+                            a.refresh_token = Some(entry.refresh_token);
+                        }
+                    }
                 }
             }
+            file
         }
     }
-    file
 }
 
 /// 保存账号文件：非空凭据写入 vault（字段级合并）并落盘快照，JSON 占位化。

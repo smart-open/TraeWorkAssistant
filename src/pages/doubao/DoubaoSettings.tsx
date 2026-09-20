@@ -105,7 +105,7 @@ export default function DoubaoSettings() {
         await saveSettings({ doubao_path: r.exe });
         pushToast('success', `已自动定位豆包（${r.source === 'settings' ? '手动指定' : r.source === 'registry' ? '注册表' : r.source === 'default' ? '默认路径' : '进程反查'}）`);
       } else {
-        pushToast('info', '未检测到豆包安装，请手动指定 Doubao.exe 路径');
+        pushToast('info', '未检测到豆包安装，请手动指定豆包客户端路径');
       }
     } catch (err) {
       pushToast('error', `检测失败：${String(err)}`);

@@ -44,6 +44,13 @@ fn buddy_target_slot_exists(data_dir: &std::path::Path, app: BuddyApp, uid: &str
         BuddyApp::CodeBuddy => TargetApp::CodeBuddy,
         BuddyApp::WorkBuddy => TargetApp::WorkBuddy,
     };
+    target_slot_exists(data_dir, target, uid)
+}
+
+/// 快照槽存在性（与 switcher::run_action 内部预检同条件：主槽或 .bak 回退槽任一存在）。
+/// switch_account 命令层用它在进入后台流程**之前**同步拦截——无快照时立即 Err 引导文案，
+/// 不发 progress 事件、不触发前端 90s 看门狗、不启动会话迁移等前置作业。
+fn target_slot_exists(data_dir: &std::path::Path, target: TargetApp, uid: &str) -> bool {
     let profiles_dir = crate::switcher::profile::profile_for(target, data_dir).profiles_dir;
     profiles_dir.join(uid).exists() || profiles_dir.join(format!("{uid}.bak")).exists()
 }
@@ -116,6 +123,16 @@ pub fn switch_account(
     // 与快照槽路径，与其余 uid 入口（profile.rs/doubao.rs 等）统一过白名单
     fs_utils::ensure_uid_safe(user_id.trim())?;
     fs_utils::app_log(&state.data_dir, &format!("开始切换账号: user_id={user_id}"));
+
+    // 无快照提前拦截（P1-3 用户反馈）：目标应用域从未保存过登录态时，切换必然失败。
+    // 同步 Err 直接给前端 toast 引导（「切换失败：」前缀由前端拼接，文案避免重复），
+    // 不进后台流程、不触发 90s 看门狗、不启动会话迁移等前置作业；run_action 内部预检保留作兜底。
+    let preflight_target = TargetApp::parse(target_app.as_deref().unwrap_or("TraeWork"));
+    if !target_slot_exists(&state.data_dir, preflight_target, user_id.trim()) {
+        return Err(
+            "还没有该账号的登录态快照：请先用此账号登录客户端，然后到「账号管理」点击「保存当前登录态」，成功后即可一键切换".into(),
+        );
+    }
 
     // C4：豆包快照可选纳入 IndexedDB（设置开关控制，其他应用不受影响）
     let is_doubao = target_app.as_deref() == Some("Doubao");

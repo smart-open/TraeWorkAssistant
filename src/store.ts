@@ -763,10 +763,15 @@ export const useAppStore = create<AppState>((set, get) => ({
         get().pushToast('info', '正在启动代理以续期 JWT…');
         await get().startProxy();
       }
+      // 代理在跑才注入端口：切换后 TRAE 以 --proxy-server 重启（Electron 单实例，
+      // 切换流程会先关闭旧进程保证参数生效），客户端流量经 MITM，新 JWT 被自动捕获；
+      // 代理未跑（启动失败等）则退化为普通切换，不带参数
+      const proxy = get().proxy;
+      const proxyPort = proxy?.running && proxy.port ? proxy.port : undefined;
       // 切换到目标账号，TRAE 重启后走代理，新 JWT 会被自动捕获
       // skipJwtProbe=true：续期场景目标账号 JWT 本就可能已被服务端吊销，跳过切换前预检
       get().pushToast('info', '正在切换账号以捕获新 JWT，请稍候…');
-      await api.switchAccount(userId, undefined, true);
+      await api.switchAccount(userId, undefined, true, proxyPort);
     } catch (err) {
       get().pushToast('error', `续期失败：${String(err)}`);
     }

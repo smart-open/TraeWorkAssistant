@@ -471,7 +471,7 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
             "verify",
             StepStatus::Info,
             &format!(
-                "{} 数据目录无登录快照（storage\\skeleton 不存在），改以客户端实际重写信号确认（auth 重写或 vscdb 更新，静默不动不算确认）",
+                "{} 数据目录无登录快照（storage/skeleton 不存在），改以客户端实际重写信号确认（auth 重写或 vscdb 更新，静默不动不算确认）",
                 sess.prof.app_name
             ),
         );

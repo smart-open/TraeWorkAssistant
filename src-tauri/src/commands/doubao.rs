@@ -552,7 +552,7 @@ pub(crate) fn probe_live_session_alive(user_id: &str) -> Result<(), String> {
 /// 返回 Err(原因) = 确认无登录会话/游客态；Ok(()) = 放行（含检测不可用 fail-open）。
 pub(crate) fn ensure_live_has_login_session() -> Result<(), String> {
     let Some(dir) = doubao_live_user_data_dir() else {
-        return Err("未找到豆包客户端数据目录（%LOCALAPPDATA%\\Doubao\\User Data），请先安装并登录豆包".to_string());
+        return Err("未找到豆包客户端数据目录，请先安装并登录豆包".to_string());
     };
     match analyze_login_sessions(&dir) {
         LoginSessionAnalysis::LoggedIn => Ok(()),
@@ -1604,7 +1604,7 @@ pub fn doubao_chatdata_backup(state: State<AppState>, user_id: String) -> Result
     fs_utils::ensure_uid_safe(user_id.trim())?;
     let user_data = doubao_user_data_dir();
     if !user_data.is_dir() {
-        return Err("未找到豆包数据目录（%LOCALAPPDATA%\\Doubao\\User Data），请先安装并登录豆包".into());
+        return Err("未找到豆包数据目录，请先安装并登录豆包".into());
     }
     let sources = chat_source_dirs(&user_data);
     if sources.is_empty() {

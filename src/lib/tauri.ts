@@ -213,12 +213,15 @@ export const api = {
     userId: string,
     targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy',
     skipJwtProbe?: boolean,
+    proxyPort?: number,
   ) =>
     invoke('switch_account', {
       userId,
       targetApp: targetApp ?? null,
       // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
       skipJwtProbe: skipJwtProbe ?? false,
+      // 续期捕获场景传代理端口：切换后 TRAE 以 --proxy-server 重启，客户端流量走 MITM
+      proxyPort: proxyPort ?? null,
     }),
   saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
