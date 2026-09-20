@@ -675,6 +675,7 @@ mod tests {
                     global_region: false,
                     credits: Some(10.0),
                     needs_relogin: false,
+                    group_id: String::new(),
                 }],
                 &[if trae { "t1" } else { "b1" }.to_string()],
             );

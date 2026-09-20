@@ -74,7 +74,7 @@ export default function SetupGuide() {
     {
       key: 'account',
       title: '添加账号',
-      desc: '至少添加一个 Trae Work 或 Trae 账号，才能执行签到（可用「扫描本机」自动发现）。',
+      desc: '至少添加一个 Trae Work 或 Trae 账号，才能执行签到（可用「扫描本机账号」自动发现）。',
       done: accounts.length > 0,
       actionLabel: '去添加',
       run: () => setView('accounts'),

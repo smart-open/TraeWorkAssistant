@@ -12,6 +12,7 @@ import type {
   UsageDayView,
   WbModelInfo,
   WorkBuddyAccountView,
+  GroupView,
 } from '../../types';
 
 /**
@@ -123,6 +124,9 @@ export default function BuddyApiService() {
   // Buddy 池入池白名单（wb-<hash> 账号 id = a.id，与网关池键/PoolStatus.uid 同域；
   // 注意不是 a.uid——那是真实账号 uuid）：null = 未自定义（后端按「全部含凭证账号」自动入池）
   const [wbUids, setWbUids] = useState<string[] | null>(null);
+  // Buddy 池分组筛选（对齐 Trae T10）：所选分组 id 集合，空 = 不限（全部参与）
+  const [wbPoolGroups, setWbPoolGroups] = useState<Set<string>>(new Set());
+  const [wbGroups, setWbGroups] = useState<GroupView[]>([]);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
   const [syncing, setSyncing] = useState(false);
@@ -136,18 +140,20 @@ export default function BuddyApiService() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [st, pf, accs, cat, wbp] = await Promise.all([
+      const [st, pf, accs, cat, wbp, wbg] = await Promise.all([
         api.apiServer.status().catch(() => null),
         api.apiServer.poolList().catch(() => null),
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
         api.apiServer.wbCatalogList().catch(() => [] as WbModelInfo[]),
         api.apiServer.wbPoolStatus().catch(() => [] as PoolStatus[]),
+        api.workbuddy.groups.list().catch(() => [] as GroupView[]),
       ]);
       setStatus(st);
       setPool(pf);
       setAccounts(accs);
       setCatalog(cat);
       setWbPool(wbp);
+      setWbGroups(wbg);
       if (pf) {
         setWbFlags({
           wbEnabled: pf.wb_enabled ?? false,
@@ -164,6 +170,8 @@ export default function BuddyApiService() {
         });
         // 空数组 = fail-open（全部自动入池）→ 视为未自定义，显示为全选
         setWbUids(pf.wb_enabled_uids?.length ? pf.wb_enabled_uids : null);
+        // 分组筛选：空 = 不限（fail-open，全部参与）
+        setWbPoolGroups(new Set(pf.wb_group_ids ?? []));
       }
     } catch (err) {
       pushToast('error', `读取资源状态失败：${String(err)}`);
@@ -201,6 +209,7 @@ export default function BuddyApiService() {
         api.apiServer.poolSet(pool?.enabled_uids ?? [], pool?.strategy, pool?.group_ids, {
           ...wbFlags,
           wbUids,
+          wbGroupIds: [...wbPoolGroups],
           wbHedgeThresholdMs: wbParams.wbHedgeThresholdMs,
           accountConcurrencyLimit: wbParams.accountConcurrencyLimit,
           poolStickyTtlSecs: wbParams.poolStickyTtlSecs,
@@ -238,6 +247,26 @@ export default function BuddyApiService() {
     const base = wbUids ?? credAccounts.map((a) => a.id);
     setWbUids(base.includes(id) ? base.filter((u) => u !== id) : [...base, id]);
   };
+
+  // 分组筛选实时预览（对齐 Trae T10）：GroupView.uids 值域 = a.id（wb-<hash>），与白名单同域；
+  // 后端在池装配层按 wb_group_ids 过滤账号后再应用白名单交集
+  const wbGroupUidSets = useMemo(
+    () => wbGroups.map((g) => ({ id: g.id, uids: new Set(g.uids ?? []) })),
+    [wbGroups],
+  );
+  const inWbPoolFilter = (id: string) =>
+    wbPoolGroups.size === 0 ||
+    wbGroupUidSets.some((g) => wbPoolGroups.has(g.id) && g.uids.has(id));
+  const wbPoolPreview = (() => {
+    if (wbPoolGroups.size === 0) return { inPool: wbSelected.length, excluded: 0 };
+    let inPool = 0;
+    let excluded = 0;
+    for (const a of credAccounts) {
+      if (inWbPoolFilter(a.id)) inPool += 1;
+      else excluded += 1;
+    }
+    return { inPool, excluded };
+  })();
 
   // 池指标（§6.2 Buddy 口径）：健康 = 含凭证且无需重新登录；今日使用 = 当日被调度使用；池内 = 含凭证账号总数
   const todayKey = new Date().toLocaleDateString('sv-SE');
@@ -299,9 +328,9 @@ export default function BuddyApiService() {
         />
         <StatCard
           label="池内账号"
-          value={wbSelected.length}
+          value={wbPoolPreview.inPool}
           tone="violet"
-          hint="勾选参与 WB 调度的账号数（清空 = 全部含凭证账号自动入池）"
+          hint="勾选并符合分组筛选的账号数（清空勾选 = 全部含凭证账号自动入池）"
         />
       </div>
 
@@ -343,9 +372,55 @@ export default function BuddyApiService() {
                 ? '暂无含凭证账号'
                 : `勾选账号参与 WB 上游调度（清空 = 全部含凭证账号自动入池）；保存后即时生效`}
             </p>
+            {/* 分组筛选（对齐 Trae T10，保存后热重载即时生效）；分组在「账号管理 → 分组管理」维护 */}
+            {wbGroups.length > 0 && credAccounts.length > 0 && (
+              <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+                <div className="flex items-start gap-2">
+                  <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">
+                    分组筛选
+                  </label>
+                  <div className="flex flex-1 flex-wrap gap-1">
+                    {wbGroups.map((g) => {
+                      const active = wbPoolGroups.has(g.id);
+                      return (
+                        <button
+                          key={g.id}
+                          type="button"
+                          className={`rounded-full border px-2 py-0.5 text-xs transition ${
+                            active
+                              ? 'border-brand-400 bg-brand-50 text-brand-700 dark:border-brand-500 dark:bg-brand-500/15 dark:text-brand-300'
+                              : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-600'
+                          }`}
+                          onClick={() =>
+                            setWbPoolGroups((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(g.id)) next.delete(g.id);
+                              else next.add(g.id);
+                              return next;
+                            })
+                          }
+                        >
+                          {g.name}
+                        </button>
+                      );
+                    })}
+                    {wbPoolGroups.size > 0 && (
+                      <span className="pt-0.5 text-xs text-slate-400">
+                        将纳入 {wbPoolPreview.inPool} 个账号
+                        {wbPoolPreview.excluded > 0 &&
+                          `，${wbPoolPreview.excluded} 个分组外账号不参与调度`}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <p className="text-xs text-slate-400 dark:text-zinc-500">
+                  分组筛选作用于 WB 池取号范围，保存后即时生效；不选分组 = 全部参与（分组在「账号管理 → 分组管理」维护）。
+                </p>
+              </div>
+            )}
             {credAccounts.length === 0 ? (
               <p className="py-4 text-center text-xs text-slate-400">
-                暂无含凭证账号：请先在「账号管理」导入本机账号或 OAuth 扫码入池（凭证写入本地 token store）。
+                暂无含凭证账号：请先在「账号管理」扫描本机账号或 OAuth 登录入池（凭证写入本地 token store）。
               </p>
             ) : (
               <div className="space-y-1">
@@ -353,10 +428,14 @@ export default function BuddyApiService() {
                   // F-77⑤ 可观测：实时在途并发（服务未运行/未匹配时为 0）；
                   // PoolStatus.uid = 池键 = a.id（wb-<hash>），非 a.uid
                   const inflight = wbPool.find((p) => p.uid === a.id)?.inflight ?? 0;
+                  // 分组筛选激活时，分组外账号不参与调度（整行半透明标记，对齐 Trae）
+                  const filteredOut = !inWbPoolFilter(a.id);
                   return (
                     <div
                       key={a.id}
-                      className="flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800"
+                      className={`flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800 ${
+                        filteredOut ? 'opacity-50' : ''
+                      }`}
                     >
                       <input
                         type="checkbox"
@@ -364,6 +443,7 @@ export default function BuddyApiService() {
                         onChange={() => toggleWbUid(a.id)}
                       />
                       <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
+                      {filteredOut && <Badge tone="slate">分组外</Badge>}
                       {a.is_current && <Badge tone="green">在线</Badge>}
                       {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
                       {inflight > 0 && <Badge tone="amber">在途 {inflight}</Badge>}
@@ -452,7 +532,7 @@ export default function BuddyApiService() {
             </div>
 
             <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
-              保存后即时生效；Trae 池的调度策略与分组筛选在 Trae「资源调度」页配置，本页不改动。
+              保存后即时生效；Trae 池的成员/分组与调度策略在 Trae「资源调度」页或全局 API 管理配置，本页不改动。
             </p>
           </div>
         </div>

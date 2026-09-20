@@ -445,7 +445,22 @@ fn apply_pool_snapshot(state: &AppState, pool: &ApiPool, wb_pool: &ApiPool) -> (
         &credits_file.expire_times,
         &device_map,
     );
-    let wb_accounts = crate::commands::workbuddy::wb_upstream_accounts(state);
+    let wb_accounts_all = crate::commands::workbuddy::wb_upstream_accounts(state);
+    // Buddy 池分组筛选（对齐 Trae 池 T10 语义）：wb_group_ids 非空时仅纳入所选
+    // 分组的 WB 账号，未分组账号不参与；空 = 不限分组。筛选在装配层先行完成，
+    // sync_from_wb 白名单交集语义不变。
+    let wb_group_filter: Option<std::collections::HashSet<&str>> = if pool_file.wb_group_ids.is_empty() {
+        None
+    } else {
+        Some(pool_file.wb_group_ids.iter().map(|s| s.as_str()).collect())
+    };
+    let wb_accounts: Vec<_> = match &wb_group_filter {
+        Some(f) => wb_accounts_all
+            .into_iter()
+            .filter(|a| f.contains(a.group_id.as_str()))
+            .collect(),
+        None => wb_accounts_all,
+    };
     let wb_uids = effective_wb_uids(&pool_file, &wb_accounts);
     wb_pool.sync_from_wb(&wb_accounts, &wb_uids);
     (pool.count(), wb_uids.len(), wb_accounts.len())
@@ -480,6 +495,7 @@ fn merge_pool_set(
     strategy: Option<String>,
     wb_strategy: Option<String>,
     group_ids: Option<Vec<String>>,
+    wb_group_ids: Option<Vec<String>>,
     wb_enabled: Option<bool>,
     wb_default_thinking: Option<bool>,
     wb_tool_exec: Option<bool>,
@@ -517,6 +533,7 @@ fn merge_pool_set(
         strategy: strategy.unwrap_or_else(|| existing.strategy.clone()),
         wb_strategy: wb_strategy.unwrap_or_else(|| existing.wb_strategy.clone()),
         group_ids: group_ids.unwrap_or_else(|| existing.group_ids.clone()),
+        wb_group_ids: wb_group_ids.unwrap_or_else(|| existing.wb_group_ids.clone()),
         wb_enabled: wb_enabled.unwrap_or(existing.wb_enabled),
         wb_default_thinking: wb_default_thinking.unwrap_or(existing.wb_default_thinking),
         wb_tool_exec: wb_tool_exec.unwrap_or(existing.wb_tool_exec),
@@ -545,6 +562,7 @@ pub fn pool_set(
     strategy: Option<String>,
     wb_strategy: Option<String>,
     group_ids: Option<Vec<String>>,
+    wb_group_ids: Option<Vec<String>>,
     wb_enabled: Option<bool>,
     wb_default_thinking: Option<bool>,
     wb_tool_exec: Option<bool>,
@@ -565,6 +583,7 @@ pub fn pool_set(
         strategy,
         wb_strategy,
         group_ids,
+        wb_group_ids,
         wb_enabled,
         wb_default_thinking,
         wb_tool_exec,
@@ -1004,6 +1023,7 @@ mod pool_merge_tests {
             pool_sticky_ttl_secs: 600,
             wb_sticky_ttl_secs: 3600,
             wb_enabled_uids: Vec::new(),
+            wb_group_ids: vec!["wg1".into()],
         }
     }
 
@@ -1026,11 +1046,14 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
         assert_eq!(m.strategy, "weighted");
         assert_eq!(m.wb_strategy, "p2c");
         assert_eq!(m.group_ids, vec!["g1".to_string()]);
+        // wb_group_ids 未传 → 保留原值
+        assert_eq!(m.wb_group_ids, vec!["wg1".to_string()]);
         assert!(m.wb_enabled);
         assert!(m.wb_default_thinking);
         assert!(!m.wb_tool_exec);
@@ -1053,6 +1076,7 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &legacy,
             vec!["1001".into(), "wb-abc".into(), "1002".into(), "wb-def".into()],
+            None,
             None,
             None,
             None,
@@ -1094,6 +1118,7 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
             Some(vec!["wb-new".into()]),
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
@@ -1113,6 +1138,7 @@ mod pool_merge_tests {
             global_region: false,
             credits: None,
             needs_relogin: false,
+            group_id: String::new(),
         };
         let accounts = vec![acc("wb-a"), acc("wb-b")];
         // ① 显式白名单优先
@@ -1140,6 +1166,8 @@ mod pool_merge_tests {
             Some("p2c".into()),
             Some("".into()),
             Some(vec![]),
+            // wb_group_ids 显式覆盖
+            Some(vec!["wg2".into()]),
             Some(false),
             Some(false),
             Some(true),
@@ -1154,6 +1182,7 @@ mod pool_merge_tests {
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
         assert!(m.group_ids.is_empty());
+        assert_eq!(m.wb_group_ids, vec!["wg2".to_string()]);
         assert!(!m.wb_enabled);
         assert!(!m.wb_default_thinking);
         assert!(m.wb_tool_exec);
@@ -1185,6 +1214,7 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -1200,6 +1230,7 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &ApiPoolFile::default(),
             vec!["u1".into()],
+            None,
             None,
             None,
             None,

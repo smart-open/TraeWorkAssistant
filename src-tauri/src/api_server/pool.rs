@@ -835,6 +835,8 @@ pub struct WbSyncAccount {
     pub global_region: bool,
     pub credits: Option<f64>,
     pub needs_relogin: bool,
+    /// 所属 Buddy 分组 id（空 = 未分组）；池分组筛选在装配层按此过滤
+    pub group_id: String,
 }
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
@@ -1479,6 +1481,7 @@ mod tests {
                 global_region: true,
                 credits: Some(50.0),
                 needs_relogin: false,
+                group_id: String::new(),
             }],
             &["wb-abc".to_string()],
         );
@@ -1495,6 +1498,7 @@ mod tests {
                 uid: "wb-x".into(), name: String::new(), token: "tk".into(),
                 domain: String::new(), enterprise_id: String::new(),
                 global_region: false, credits: None, needs_relogin: true,
+                group_id: String::new(),
             }],
             &["wb-x".to_string()],
         );
