@@ -456,8 +456,15 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
 
 /// 刷新单账号凭证：读 token store（双源副本）→ POST plugin refresh → 回写。
 /// 客户端运行中跳过 auth 文件写入（只更新工具侧副本，F-10 保证谁新用谁）。
+/// force=false（默认）时惰性：accessToken 剩余有效期充足则跳过续期（减少无谓
+/// refresh 调用——refresh 端点可能轮换 refreshToken，减少轮换面）；
+/// force=true 强制续期（手动按钮使用）。
 #[tauri::command(async)]
-pub fn workbuddy_refresh_token(state: State<AppState>, user_id: String) -> Result<String, String> {
+pub fn workbuddy_refresh_token(
+    state: State<AppState>,
+    user_id: String,
+    force: Option<bool>,
+) -> Result<String, String> {
     // 每账号续期互斥（审查 P1）：并发触发同一账号续期时后到者直接拒绝，
     // 避免双请求交错回写 token store / 账号池造成凭证覆盖竞态
     let acct_lock = {
@@ -480,6 +487,18 @@ pub fn workbuddy_refresh_token(state: State<AppState>, user_id: String) -> Resul
         .find(|a| a.id == user_id)
         .ok_or_else(|| format!("账号不存在: {user_id}"))?
         .clone();
+
+    // 惰性续期门（force=false 时生效）：判定抽为纯函数 lazy_renew_skippable。
+    // expires_at 缺失时放行（无法判定就续一次，顺带拿到准确的 expiresIn）。
+    if !force.unwrap_or(false)
+        && lazy_renew_skippable(acct.access_token_expires_at, chrono::Utc::now().timestamp())
+    {
+        let remaining = acct.access_token_expires_at.unwrap_or_default() - chrono::Utc::now().timestamp();
+        return Err(format!(
+            "凭证剩余有效期 {:.1} 小时，暂无需续期（如需立即续期请使用手动续期）",
+            remaining as f64 / 3600.0
+        ));
+    }
 
     // 双源取值「谁新用谁」（审查 P1）：token store 副本与桌面 auth 文件都可能被更新
     // （客户端运行时刷新 auth 文件，工具侧续期刷新 token store）。分别解析两源的
@@ -574,6 +593,17 @@ pub fn workbuddy_refresh_token(state: State<AppState>, user_id: String) -> Resul
     save_pool(&state, &pool)?;
     fs_utils::app_log(&state.data_dir, &format!("WorkBuddy 凭证续期成功: {}", acct.id));
     Ok("凭证已续期".into())
+}
+
+/// 惰性续期判定（纯函数化便于单测）：true = 可跳过（剩余有效期充足）。
+/// 跳过 = accessToken 剩余 > 24h——refresh 端点可能轮换 refreshToken，减少无谓轮换。
+/// expires_at 缺失 → false（放行刷新，顺带拿到准确的 expiresIn）。
+fn lazy_renew_skippable(access_token_expires_at: Option<i64>, now_ts: i64) -> bool {
+    const WB_LAZY_RENEW_MIN_SECS: i64 = 24 * 3600;
+    match access_token_expires_at {
+        None => false,
+        Some(exp) => exp - now_ts > WB_LAZY_RENEW_MIN_SECS,
+    }
 }
 
 // ── API 网关 WB 上游取号（T2.1）───────────────────────────────────────────
@@ -755,7 +785,7 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_auth_entry, AuthMerge, WorkBuddyAccount, WbPool};
+    use super::{lazy_renew_skippable, merge_auth_entry, AuthMerge, WorkBuddyAccount, WbPool};
 
     fn entry(id: &str, uid: &str, nickname: &str) -> WorkBuddyAccount {
         WorkBuddyAccount {
@@ -834,5 +864,44 @@ mod tests {
         assert_eq!(pool.accounts.len(), 1);
         assert_eq!(target_id, "wb-dddddddddddd");
         assert_eq!(pool.accounts[0].uid, "u1");
+    }
+
+    // ── 惰性续期门（lazy_renew_skippable）边界测试 ──────────────────────────
+    // 语义：true = 可跳过续期（access_token 剩余 >24h）；false = 需要续期。
+    // 与 Trae 的 lazy_refresh_needed 方向相反，注意断言极性。
+
+    /// 基准时刻（固定 now，不依赖真实时钟）
+    const WB_T0: i64 = 1_700_000_000;
+    /// 阈值 24h（秒），须与 WB_LAZY_RENEW_MIN_SECS 一致
+    const WB_H24: i64 = 24 * 3600;
+
+    /// expires_at 缺失（旧版 auth 文件/字段解析失败）：无法判断时效 → 保守放行续期
+    #[test]
+    fn lazy_renew_none_expires_at_conservatively_renews() {
+        assert!(!lazy_renew_skippable(None, WB_T0));
+    }
+
+    /// 剩余 25h：跳过 /access_token/refresh，减少一次上游取号
+    #[test]
+    fn lazy_renew_over_24h_skips() {
+        assert!(lazy_renew_skippable(Some(WB_T0 + WB_H24 + 3600), WB_T0));
+    }
+
+    /// 剩余恰好 24h：严格大于（> 24h）→ 不算充足 → 续期
+    #[test]
+    fn lazy_renew_exactly_24h_boundary_renews() {
+        assert!(!lazy_renew_skippable(Some(WB_T0 + WB_H24), WB_T0));
+    }
+
+    /// 剩余不足 24h：续期
+    #[test]
+    fn lazy_renew_under_24h_renews() {
+        assert!(!lazy_renew_skippable(Some(WB_T0 + WB_H24 - 1), WB_T0));
+    }
+
+    /// 已过期（负剩余）：必须续期
+    #[test]
+    fn lazy_renew_expired_renews() {
+        assert!(!lazy_renew_skippable(Some(WB_T0 - 3600), WB_T0));
     }
 }

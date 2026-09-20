@@ -1439,15 +1439,19 @@ pub fn cooldown_clear_all(
 }
 
 /// 使用 refresh_token 刷新 JWT（ExchangeToken）
-/// 成功后原子写回新 accessToken + refresh_token，返回新 JWT
+/// 成功后原子写回新 accessToken + refresh_token，返回新 JWT。
+/// force=false（默认）时惰性：JWT 剩余有效期充足则跳过（防无谓 refresh_token 轮换——
+/// 轮换会使 TRAE IDE 侧旧凭证失效，是双端互踢冲突的直接诱因）；
+/// force=true 强制刷新（手动按钮/测试探针使用）。
 // async：内含 ExchangeToken 网络请求（最长 120s），同步命令会冻结 UI（审查修复）
 #[tauri::command(async)]
 pub fn refresh_jwt(
     state: State<AppState>,
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     user_id: String,
+    force: Option<bool>,
 ) -> Result<String, String> {
-    let result = refresh_jwt_impl(&state, &user_id);
+    let result = refresh_jwt_impl(&state, &user_id, force.unwrap_or(false));
     // 运行中 API 池联动：成功 → 全量热重载（新 JWT 落池 + 解除失效/SessionDead 禁用快照，
     // 单点 note_refresh_success 覆盖不了禁用/冷却/积分陈旧快照）；
     // 失败且已判定 refresh_token 失效 → 池内同步禁用（entry 按 uid 命中，双池双查无害）
@@ -1478,8 +1482,83 @@ static REFRESH_COOLDOWN: std::sync::LazyLock<std::sync::Mutex<std::collections::
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 const REFRESH_COOLDOWN_SECS: u64 = 60;
 
+/// 惰性刷新门阈值（优化 2）：JWT 剩余有效期超过 48h（且 refresh_token 未临近过期）
+/// 时不发 ExchangeToken。JWT 全量寿命约 13 天——把刷新压到最后 48h，每次刷新都是
+/// refresh_token 轮换（IDE 侧旧凭证随之失效），减少轮换次数 = 缩小双端互踢冲突面。
+const TRAE_LAZY_REFRESH_MIN_SECS: i64 = 48 * 3600;
+
+/// 惰性刷新判定（优化 2，纯函数化便于单测）：false = 可跳过刷新。
+/// 跳过 = JWT 剩余 > 48h 且 refresh_token 未临近过期（剩余 ≥48h）。
+/// JWT exp 缺失（空串/解析失败）→ 需要刷新（保守放行）；
+/// refresh_token 缺失 → 不因 rt 提前触发刷新。
+fn lazy_refresh_needed(jwt: &str, refresh_token_expires_at: Option<i64>, now_ts: i64) -> bool {
+    let jwt_fresh = jwt::parse(jwt)
+        .exp_timestamp
+        .map(|exp| exp - now_ts > TRAE_LAZY_REFRESH_MIN_SECS)
+        .unwrap_or(false);
+    let rt_expiring = refresh_token_expires_at
+        .map(|exp| exp - now_ts < TRAE_LAZY_REFRESH_MIN_SECS)
+        .unwrap_or(false);
+    !jwt_fresh || rt_expiring
+}
+
+/// refresh_token 已失效时，尝试从 TRAE IDE 本地登录态恢复（优化 1，Windows only）：
+/// 解密本地 Chromium Cookies + leveldb 提取最新 JWT/refresh_token 写回 accounts 表。
+/// 恢复判定：捕获后该账号 JWT 或 refresh_token 与捕获前不同 → 视为拿到新登录态
+///（capture 通路不清理 invalid 标记，此处补齐解除），返回 true；
+/// 无变化 / 非 Windows / 捕获失败 → 返回 false（调用方维持「需重新 OAuth 登录」）。
+/// 调用方持有 jwt_refresh_lock，无并发写竞争。
+fn try_recover_from_local(state: &AppState, user_id: &str) -> bool {
+    let before = crate::vault::load_accounts(state);
+    let Some(acct) = before
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id))
+    else {
+        return false;
+    };
+    let (old_jwt, old_rt) = (acct.jwt.clone(), acct.refresh_token.clone());
+
+    let res = crate::device_proxy::local_capture::capture_from_local(state);
+    if res.is_err() {
+        return false; // 非 Windows 或解密失败：维持原语义
+    }
+    let reloaded = crate::vault::load_accounts(state);
+    let Some(acct) = reloaded
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id))
+    else {
+        return false;
+    };
+    if acct.jwt == old_jwt && acct.refresh_token == old_rt {
+        return false; // 本地登录态无更新：refresh_token 确实失效
+    }
+    let mut fixed = reloaded;
+    if let Some(a) = fixed
+        .accounts
+        .iter_mut()
+        .find(|a| a.user_id.as_deref() == Some(user_id))
+    {
+        a.refresh_token_invalid = false;
+        a.refresh_token_fails = 0;
+        a.updated_at = Some(fs_utils::now_iso());
+    }
+    if crate::vault::save_accounts(state, &mut fixed).is_err() {
+        return false;
+    }
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "refresh_token 已失效，但从 TRAE IDE 本地登录态恢复成功 [uid={}]（用户很可能已在 IDE 重新登录）",
+            &user_id[..user_id.len().min(8)]
+        ),
+    );
+    true
+}
+
 /// refresh_jwt 核心逻辑（&AppState，供命令与测试探针共用）
-pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, String> {
+pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<String, String> {
     // 并发安全：持锁防止多个并发请求同时 ExchangeToken
     let _lock = state
         .jwt_refresh_lock
@@ -1501,17 +1580,58 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str) -> Result<String, Strin
 
     // Double-check：持锁后重新读取文件，防止其他线程已刷新
     let mut accounts = crate::vault::load_accounts(state);
-    let account = accounts
-        .accounts
-        .iter()
-        .find(|a| a.user_id.as_deref() == Some(user_id))
-        .ok_or("账号不存在")?;
 
     // C 入口拦截：已判定 refresh_token 失效的账号不再发网络请求
     // （此前无效标记仅影响调度，手动/自动刷新仍会持续探测——app.log 实证
     // 「已标记失效」后 19s 内仍 4 连败 + 每次触发 vault 全量加密写盘）
-    if account.refresh_token_invalid {
-        return Err("refresh_token 已失效，需重新 OAuth 登录".to_string());
+    // 优化 1：失效 ≠ 死亡——先尝试从 TRAE IDE 本地登录态恢复（用户可能已在 IDE
+    // 重新登录），恢复成功则清 invalid 继续正常刷新；否则维持原错误。
+    let account = {
+        let acct = accounts
+            .accounts
+            .iter()
+            .find(|a| a.user_id.as_deref() == Some(user_id))
+            .ok_or("账号不存在")?;
+        if acct.refresh_token_invalid {
+            if try_recover_from_local(state, user_id) {
+                // 恢复成功：重读账号数据（invalid 已解除），继续下方惰性门 + 刷新流程
+                accounts = crate::vault::load_accounts(state);
+                accounts
+                    .accounts
+                    .iter()
+                    .find(|a| a.user_id.as_deref() == Some(user_id))
+                    .ok_or("账号不存在")?
+            } else {
+                return Err(
+                    "refresh_token 已失效，需重新 OAuth 登录（已尝试从 TRAE 客户端本地登录态恢复，未找到更新的登录态）"
+                        .to_string(),
+                );
+            }
+        } else {
+            acct
+        }
+    };
+
+    // 惰性刷新门（优化 2，force=false 时生效）：判定抽为纯函数 lazy_refresh_needed
+    //（含边界语义：exp 缺失放行、rt 临期续命）。ExchangeToken 会轮换 refresh_token，
+    // 工具侧续期即会使 TRAE IDE 持有的旧凭证失效——减少无谓轮换 = 缩小双端互踢冲突面。
+    // JWT 已被服务端提前吊销（exp 仍远）时此门放不住，需由调用方传 force=true；
+    // 手动刷新按钮保持强制语义。
+    if !force
+        && !lazy_refresh_needed(
+            &account.jwt,
+            account.refresh_token_expires_at,
+            chrono::Utc::now().timestamp(),
+        )
+    {
+        let remain_h = jwt::parse(&account.jwt)
+            .exp_timestamp
+            .map(|exp| (exp - chrono::Utc::now().timestamp()) as f64 / 3600.0)
+            .unwrap_or(0.0);
+        return Err(format!(
+            "JWT 剩余有效期 {:.1} 小时，暂无需刷新（如需立即刷新请使用手动刷新按钮）",
+            remain_h
+        ));
     }
 
     let refresh_token = account
@@ -1892,7 +2012,7 @@ mod tests {
             Err(e) => {
                 println!("STEP1 旧 JWT 查询: FAIL — {}", e);
                 // 尝试 refresh_token 自愈：ExchangeToken 换新 JWT 后重试
-                match refresh_jwt_impl(&state, &uid) {
+                match refresh_jwt_impl(&state, &uid, true) {
                     Ok(new_jwt) => {
                         let ni = crate::jwt::parse(&new_jwt);
                         println!(
@@ -1911,5 +2031,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── 惰性刷新门（lazy_refresh_needed）边界测试 ────────────────────────────
+    // 语义：true = 需要刷新；false = 跳过 ExchangeToken（少一次调用 = 少一次
+    // refresh_token 轮换 = 缩小双端互踢冲突面）
+
+    /// 基准时刻（固定 now，全部边界相对它推算，不依赖真实时钟）
+    const T0: i64 = 1_700_000_000;
+    /// 阈值 48h（秒），须与 TRAE_LAZY_REFRESH_MIN_SECS 一致
+    const H48: i64 = 48 * 3600;
+
+    /// 构造带指定 exp 的最小 JWT（header.payload.sig 形态；parse 不验签，
+    /// payload 为 base64url 无填充编码，含 data.id + exp）
+    fn jwt_with_exp(exp: Option<i64>) -> String {
+        use base64::Engine as _;
+        let payload = match exp {
+            Some(e) => format!(r#"{{"data":{{"id":"u-test"}},"exp":{e}}}"#),
+            None => r#"{"data":{"id":"u-test"}}"#.to_string(),
+        };
+        let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        format!("h.{enc}.s")
+    }
+
+    /// JWT 剩余 >48h 且 refresh_token 剩余 >48h：跳过刷新
+    #[test]
+    fn test_lazy_refresh_needed_fresh_jwt_and_rt_skips() {
+        let jwt = jwt_with_exp(Some(T0 + H48 + 3600)); // 剩余 49h
+        let rt = Some(T0 + 96 * 3600); // 剩余 96h
+        assert!(!lazy_refresh_needed(&jwt, rt, T0));
+    }
+
+    /// JWT 剩余恰好 48h：jwt_fresh 为严格大于（> 48h）→ 不算新鲜 → 触发刷新
+    #[test]
+    fn test_lazy_refresh_needed_jwt_48h_boundary_triggers() {
+        let jwt = jwt_with_exp(Some(T0 + H48));
+        assert!(lazy_refresh_needed(&jwt, Some(T0 + 96 * 3600), T0));
+    }
+
+    /// JWT 剩余不足 48h：触发刷新
+    #[test]
+    fn test_lazy_refresh_needed_jwt_under_48h_triggers() {
+        let jwt = jwt_with_exp(Some(T0 + H48 - 3600)); // 剩余 47h
+        assert!(lazy_refresh_needed(&jwt, Some(T0 + 96 * 3600), T0));
+    }
+
+    /// JWT 仍新鲜但 refresh_token 临期（< 48h）：提前换发防 rt 失效后无法自愈
+    #[test]
+    fn test_lazy_refresh_needed_rt_expiring_forces_refresh() {
+        let jwt = jwt_with_exp(Some(T0 + 200 * 3600)); // 剩余 200h
+        let rt = Some(T0 + H48 - 1); // 剩余 48h - 1s
+        assert!(lazy_refresh_needed(&jwt, rt, T0));
+    }
+
+    /// refresh_token 剩余恰好 48h：rt_expiring 为严格小于（< 48h）→ 不算临期，不触发
+    #[test]
+    fn test_lazy_refresh_needed_rt_48h_boundary_no_trigger() {
+        let jwt = jwt_with_exp(Some(T0 + 200 * 3600));
+        assert!(!lazy_refresh_needed(&jwt, Some(T0 + H48), T0));
+    }
+
+    /// JWT exp 缺失或 token 损坏：解析不出 exp_timestamp → 保守触发刷新
+    #[test]
+    fn test_lazy_refresh_needed_missing_exp_forces_refresh() {
+        assert!(lazy_refresh_needed("not-a-jwt", Some(T0 + 96 * 3600), T0));
+        assert!(lazy_refresh_needed(&jwt_with_exp(None), Some(T0 + 96 * 3600), T0));
+    }
+
+    /// JWT 已过期（exp - now 为负）：触发刷新
+    #[test]
+    fn test_lazy_refresh_needed_expired_jwt_triggers() {
+        let jwt = jwt_with_exp(Some(T0 - 3600)); // 已过期 1h
+        assert!(lazy_refresh_needed(&jwt, Some(T0 + 96 * 3600), T0));
+    }
+
+    /// 无 refresh_token 的账号（rt 缺失）：只要 JWT 新鲜就不触发——
+    /// rt_expiring 对 None 恒 false，不因缺 rt 而提前刷
+    #[test]
+    fn test_lazy_refresh_needed_no_rt_not_triggered_early() {
+        let jwt = jwt_with_exp(Some(T0 + 49 * 3600));
+        assert!(!lazy_refresh_needed(&jwt, None, T0));
     }
 }

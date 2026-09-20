@@ -435,7 +435,7 @@ export default function BuddyAccounts() {
   const handleRefreshToken = async (a: WorkBuddyAccountView) => {
     setRowOp({ id: a.id, kind: 'refresh' });
     try {
-      await withMinDelay(api.workbuddy.refreshToken(a.id), 1000);
+      await withMinDelay(api.workbuddy.refreshToken(a.id, true), 1000);
       pushToast('success', `「${a.nickname || a.id}」凭证已续期`);
       await refresh();
     } catch (err) {

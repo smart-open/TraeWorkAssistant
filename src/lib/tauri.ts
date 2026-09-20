@@ -124,8 +124,8 @@ export const api = {
       invoke('cooldown_clear', { userId }),
     cooldownClearAll: () =>
       invoke<number>('cooldown_clear_all'),
-    refreshJwt: (userId: string) =>
-      invoke<string>('refresh_jwt', { userId }),
+    refreshJwt: (userId: string, force = false) =>
+      invoke<string>('refresh_jwt', { userId, force }),
     exportRaw: () => invoke<Record<string, unknown>>('accounts_export_raw'),
     importAccounts: (content: string, only?: number[]) =>
       invoke<ImportReport>('accounts_import', { content, only }),
@@ -304,7 +304,8 @@ export const api = {
     scanAuthFile: () => invoke<WorkBuddyScanResult | null>('workbuddy_scan_auth_file'),
     accountImportAuth: (name?: string) =>
       invoke<WorkBuddyAccountView>('workbuddy_account_import_auth', { name: name ?? null }),
-    refreshToken: (userId: string) => invoke<string>('workbuddy_refresh_token', { userId }),
+    refreshToken: (userId: string, force = false) =>
+      invoke<string>('workbuddy_refresh_token', { userId, force }),
     checkinStart: (opts: { user_ids?: string[]; skip_checked_in: boolean; skip_expired: boolean }) =>
       invoke('workbuddy_checkin_start', { opts }),
     growthRun: () => invoke('workbuddy_growth_run'),

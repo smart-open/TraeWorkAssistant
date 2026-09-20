@@ -142,7 +142,7 @@ interface AppState {
   }) => Promise<void>;
   refreshRemainingCredits: () => Promise<void>;
   cooldownClear: (userId: string) => Promise<void>;
-  refreshJwt: (userId: string) => Promise<void>;
+  refreshJwt: (userId: string, force?: boolean) => Promise<void>;
   saveSettings: (patch: Partial<Settings>) => Promise<void>;
   profileBackup: (userId: string) => Promise<void>;
   profileRestore: (userId: string) => Promise<void>;
@@ -811,13 +811,19 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `解除冷却失败：${String(err)}`);
     }
   },
-  refreshJwt: async (userId) => {
+  refreshJwt: async (userId, force = true) => {
     try {
-      await api.accounts.refreshJwt(userId);
+      await api.accounts.refreshJwt(userId, force);
       await get().refreshAccounts();
       get().pushToast('success', 'JWT 已自动刷新');
     } catch (err) {
-      get().pushToast('error', `JWT 刷新失败：${String(err)}`);
+      const msg = String(err);
+      // 惰性刷新门（force=false）主动跳过：按中性提示呈现，不标红为失败
+      if (msg.includes('暂无需刷新')) {
+        get().pushToast('info', msg);
+      } else {
+        get().pushToast('error', `JWT 刷新失败：${msg}`);
+      }
     }
   },
   saveSettings: async (patch) => {

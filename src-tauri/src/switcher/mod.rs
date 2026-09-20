@@ -632,6 +632,8 @@ fn switch_flow(
 /// KeepAlive（PS 1514-1528）：运行中跳过；否则启动 → 8s 联网刷新 → 优雅关闭。
 /// sid_guard 30 天滑动续期由豆包客户端自己完成（cookie 值为客户端级加密，外部无法
 /// 离线续写），本动作仅负责"启动→等待联网刷新→关闭"。
+/// 关闭阶段按 spawn 返回的主进程 PID 精确命中本次实例（proc::stop_spawned）：
+/// 8 秒等待窗口内用户手动开启的应用实例不受影响，消除 TOCTOU 误关风险。
 fn keepalive_flow(sess: &mut Session, sink: &dyn ProgressSink) -> Result<String, String> {
     if proc::is_running(sess) {
         sink.step(
@@ -641,15 +643,18 @@ fn keepalive_flow(sess: &mut Session, sink: &dyn ProgressSink) -> Result<String,
         );
         return done(sink, "保活检查完成（应用运行中）");
     }
-    proc::start_app(sess, sink)?;
+    let spawned_pid = proc::start_app_pid(sess, sink)?;
     sink.step(
         "keepalive",
         StepStatus::Running,
         "已启动，等待会话联网刷新（8 秒）",
     );
     std::thread::sleep(std::time::Duration::from_secs(8));
-    proc::stop_app(sess, sink)?;
-    done(sink, "保活完成（启动 8 秒 → 优雅关闭，sid_guard 已滑动续期）")
+    proc::stop_spawned(sess, sink, &[spawned_pid])?;
+    done(
+        sink,
+        "保活完成（启动 8 秒 → 按 PID 精确关闭，sid_guard 已滑动续期）",
+    )
 }
 
 #[cfg(test)]
