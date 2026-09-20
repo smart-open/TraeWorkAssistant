@@ -181,16 +181,40 @@ pub async fn do_start(
     );
     wb_pool.set_strategy(wb_strategy);
 
-    // 池为空时给出明确警告
+    // 池为空时给出明确警告：分别指明是哪个池——Trae 池空 ≠ 全部资源不可用，
+    // Buddy(WB) 池可能正常服务（2026-09-20 实测反馈：警告误导排查方向）
+    let wb_pool_count = wb_pool.count(); // ApiPool 非 Copy：移入 shared 前取值
+    let wb_summary = format!(
+        "Buddy(WB)池 enabled={} accounts={} healthy={}",
+        pool_file.wb_enabled,
+        wb_pool_count,
+        wb_healthy
+    );
     if pool_count == 0 {
-        fs_utils::app_log(
-            &state.data_dir,
-            "警告: 账号池为空！请在API服务页面勾选账号并保存后再启动。当前 api_pool.json 中 enabled_uids 为空。",
-        );
+        if pool_file.wb_enabled && wb_pool.count() > 0 {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "警告: Trae 模型池为空（Trae 池请求不可用），{wb_summary} 可正常服务。\
+如需 Trae 池，请在API服务页面勾选 Trae 账号并保存。",
+                ),
+            );
+        } else {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "警告: 全部账号池为空或未启用！Trae 池: 0 个账号；{wb_summary}。\
+请在API服务页面勾选账号并保存后再启动。",
+                ),
+            );
+        }
     } else if healthy_count == 0 {
         fs_utils::app_log(
             &state.data_dir,
-            "警告: 池中无健康账号！所有账号可能处于冷却/积分过期/SessionDead 状态。请检查账号状态或清除冷却。",
+            &format!(
+                "警告: Trae 模型池中无健康账号（冷却/积分过期/SessionDead），{wb_summary}。\
+请检查 Trae 账号状态或清除冷却。",
+            ),
         );
     }
 
@@ -240,7 +264,10 @@ pub async fn do_start(
 
     fs_utils::app_log(
         &state.data_dir,
-        &format!("API 服务已启动: port={} pool_accounts={}", port, pool_count),
+        &format!(
+            "API 服务已启动: port={} 资源概况: Trae池 accounts={} healthy={} | {}",
+            port, pool_count, healthy_count, wb_summary
+        ),
     );
 
     let now = std::time::SystemTime::now()
@@ -263,13 +290,14 @@ pub async fn do_start(
         started_at: now,
     });
 
-    // 同步托盘菜单文本 + 系统通知
+    // 同步托盘菜单文本 + 系统通知（账号数分池展示：Trae 池空 ≠ 无资源，Buddy 池可能正常服务）
     sync_tray_api_text(app, true);
-    crate::notify::notify(
-        app,
-        "API 网关已启动",
-        &format!("端口 {port}，池内 {pool_count} 个账号"),
-    );
+    let notify_body = if pool_file.wb_enabled {
+        format!("端口 {port}，Trae 池 {pool_count} 个账号，Buddy 池 {wb_pool_count} 个账号")
+    } else {
+        format!("端口 {port}，池内 {pool_count} 个账号")
+    };
+    crate::notify::notify(app, "API 网关已启动", &notify_body);
 
     Ok(status)
 }

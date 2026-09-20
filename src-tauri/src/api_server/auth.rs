@@ -28,6 +28,20 @@ pub async fn bearer_auth(
         return next.run(request).await;
     }
 
+    // 请求体预检（issue #21）：Content-Length 超过网关上限时在 body 提取器之前
+    // 返回结构化 413（axum 提取器超限默认回纯文本，客户端难以解析识别）；
+    // 无 Content-Length（chunked）的超限请求仍由 DefaultBodyLimit 兜底拒绝
+    if let Some(len) = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if len > super::routes::MAX_BODY_BYTES {
+            return body_too_large();
+        }
+    }
+
     // 提取呈现的 Key（Bearer 优先，其次 x-api-key）
     let authz = request
         .headers()
@@ -89,6 +103,24 @@ pub async fn bearer_auth(
     }
 
     (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
+}
+
+/// 413 请求体超限响应（issue #21）：结构化 JSON 错误体（OpenAI/Anthropic 客户端
+/// 均可解析 message），替代 axum 提取器的纯文本 413
+fn body_too_large() -> Response {
+    let body = json!({
+        "error": {
+            "message": super::routes::body_too_large_msg(),
+            "type": "invalid_request_error",
+            "code": "request_too_large",
+        }
+    });
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// 401：要求鉴权但不满足（未配置启用 Key 且未显式关闭鉴权，或未携带 Key）。

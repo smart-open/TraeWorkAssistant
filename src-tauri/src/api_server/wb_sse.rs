@@ -227,6 +227,8 @@ pub fn stream_forward_ex<L: Iterator<Item = String>>(
 
     // Anthropic tool_use 块缓冲（index → (id,name,args)）
     let mut tool_buf: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
+    // 上游最后携带的 finish_reason（P1 修复：Anthropic message_delta 按此映射 stop_reason）
+    let mut last_finish = String::new();
 
     // Responses 输出状态（T4.1/F-40）
     let mut resp_created = false;
@@ -294,11 +296,18 @@ pub fn stream_forward_ex<L: Iterator<Item = String>>(
                             ))));
                         }
                         let (it, ot) = usage.as_ref().map(u64_pair).unwrap_or((0, 0));
+                        // P1 修复：stop_reason 按上游 finish_reason 映射，工具块存在时
+                        // 必为 tool_use（原硬编码 end_turn 与已输出的 tool_use 块矛盾）
+                        let stop_reason = if !tool_buf.is_empty() {
+                            "tool_use"
+                        } else {
+                            finish_to_stop(&last_finish)
+                        };
                         let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
                             "event: message_delta\ndata: {}\n\n",
                             json!({
                                 "type":"message_delta",
-                                "delta":{"stop_reason":"end_turn","stop_sequence":null},
+                                "delta":{"stop_reason":stop_reason,"stop_sequence":null},
                                 "usage":{"input_tokens":it,"output_tokens":ot},
                             })
                         ))));
@@ -408,6 +417,9 @@ pub fn stream_forward_ex<L: Iterator<Item = String>>(
                 break;
             }
             Some(WbEvent::Chunk { delta, finish, usage: u, id }) => {
+                if !finish.is_empty() {
+                    last_finish = finish.clone();
+                }
                 if let Some(x) = u {
                     usage = Some(x);
                 }
@@ -720,6 +732,16 @@ pub fn aggregate<L: Iterator<Item = String>>(
     (Some(resp), None)
 }
 
+/// OpenAI finish_reason → Anthropic stop_reason 映射（P1 修复）
+fn finish_to_stop(finish: &str) -> &'static str {
+    match finish {
+        "length" => "max_tokens",
+        "tool_calls" | "function_call" => "tool_use",
+        "content_filter" => "refusal",
+        _ => "end_turn",
+    }
+}
+
 /// 内部 OpenAI completion → Anthropic Messages 响应（非流式 /v1/messages）
 pub fn completion_to_anthropic(v: &Value, msg_id: &str, model: &str) -> Value {
     let choice = v
@@ -762,13 +784,24 @@ pub fn completion_to_anthropic(v: &Value, msg_id: &str, model: &str) -> Value {
         content.push(json!({"type":"text","text":""}));
     }
     let (it, ot) = v.get("usage").map(u64_pair).unwrap_or((0, 0));
+    // P1 修复：stop_reason 读上游 finish_reason 映射（原硬编码 end_turn 丢失
+    // tool_use/max_tokens 语义）；有 tool_calls 时强制 tool_use 兜底
+    let has_tool_calls = message
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let stop_reason = if has_tool_calls {
+        "tool_use"
+    } else {
+        finish_to_stop(choice.get("finish_reason").and_then(|f| f.as_str()).unwrap_or(""))
+    };
     json!({
         "id": msg_id,
         "type": "message",
         "role": "assistant",
         "model": model,
         "content": content,
-        "stop_reason": "end_turn",
+        "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {"input_tokens": it, "output_tokens": ot},
     })

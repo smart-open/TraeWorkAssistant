@@ -24,7 +24,15 @@ use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
 
 const MAX_ROTATE: usize = 3;
-const MAX_BODY_BYTES: usize = 8 << 20;
+/// 请求体上限（issue #21）：axum `Bytes` 提取器受 DefaultBodyLimit 约束（默认 2MiB），
+/// build_router 已显式放开到本值，两处阈值必须一致。32MiB 适配长上下文客户端
+/// （每轮重发完整历史 + 图片 base64 场景）
+pub(super) const MAX_BODY_BYTES: usize = 32 << 20;
+
+/// 请求体超限文案（issue #21）：由常量推导，避免阈值调整后文案脱节
+pub(super) fn body_too_large_msg() -> String {
+    format!("request body exceeds {}MB limit", MAX_BODY_BYTES >> 20)
+}
 
 /// 客户端协议：决定响应/流事件的输出格式（请求侧均已统一转为 OpenAI 内部格式）
 #[derive(Clone, Copy, PartialEq)]
@@ -55,8 +63,9 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 
 /// keep-alive 退出信号（P1 修复）：主任务（spawn_blocking）结束时 Drop 触发
 /// watch 通知，ticker 收到后退出 → sender 全部关闭 → 流可正常终结。
-/// Drop 兜底覆盖 panic 展开与提前 return 路径
-struct DoneSignal(tokio::sync::watch::Sender<bool>);
+/// Drop 兜底覆盖 panic 展开与提前 return 路径。
+/// pub(super)：WB / Custom 流式路径（wb_route.rs / custom_route.rs）复用同一方案
+pub(super) struct DoneSignal(pub(super) tokio::sync::watch::Sender<bool>);
 
 impl Drop for DoneSignal {
     fn drop(&mut self) {
@@ -393,7 +402,7 @@ pub async fn chat_completions(
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
-            "request body exceeds 8MB limit",
+            &body_too_large_msg(),
         );
     }
 
@@ -490,7 +499,7 @@ pub async fn responses_api(
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
-            "request body exceeds 8MB limit",
+            &body_too_large_msg(),
         );
     }
 
@@ -595,7 +604,7 @@ pub async fn messages(
         return anthropic_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request_error",
-            "request body exceeds 8MB limit",
+            &body_too_large_msg(),
         );
     }
 
@@ -685,7 +694,7 @@ pub async fn completions(
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
-            "request body exceeds 8MB limit",
+            &body_too_large_msg(),
         );
     }
 
@@ -833,7 +842,7 @@ async fn images_entry(
     // inflight guard（§4.5）：async fn 全程 inline await，作用域即请求生命周期
     let _guard = state.inflight_guard();
     if body.len() > MAX_BODY_BYTES {
-        return openai_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", "request body exceeds 8MB limit");
+        return openai_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", &body_too_large_msg());
     }
     let peek: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1034,6 +1043,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 state.pool.note_error(&picked.uid, ErrKind::Server);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} first-byte timeout(10s)", picked.uid));
+                                // P2 修复：失败尝试记账（与非流式/WB 口径一致）
+                                state.record_usage(
+                                    false, &model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                );
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     504, &picked.uid, start_ts.elapsed().as_millis() as u64,
@@ -1139,6 +1153,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 let preview = safe_slice(&resp_body, 200);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} status={} body={}", picked.uid, status, preview));
+                                // P2 修复：失败尝试记账（与非流式/WB 口径一致）
+                                state.record_usage(
+                                    false, &model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0,
+                                );
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,
@@ -1259,7 +1278,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 // ==================== Non-streaming ====================
 
 async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
+    // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池
+    let result = super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
         let mut tried = HashSet::new();

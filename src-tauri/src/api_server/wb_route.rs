@@ -17,7 +17,6 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -325,33 +324,37 @@ pub fn wb_stream_chat(
             Protocol::Responses => format!("resp_{}", now_ts()),
         };
 
-        // SSE keep-alive 15s（T2.7/F-34 §5.5 #7：防中间层回收长流）；
-        // 主任务结束置 done 退出，客户端断连后发送失败自然退出
-        let done = Arc::new(AtomicBool::new(false));
+        // SSE keep-alive 15s（T2.7/F-34 §5.5 #7：防中间层回收长流）。
+        // P1 修复：与 routes.rs 同款 watch + DoneSignal 方案，替换旧 AtomicBool
+        // 15s 轮询（主任务发完后 ticker 仍可空转至多一个 15s 周期，流终结被拖延）；
+        // 主任务结束（DoneSignal Drop，含 panic 展开）置 done=true，ticker select!
+        // 收到退出信号即退出 → sender 全部关闭 → 流正常终结
+        let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+        let _done = super::routes::DoneSignal(done_tx);
         {
             let tx2 = tx.clone();
-            let done2 = done.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
                 tick.tick().await; // 首个 tick 立即返回，跳过
                 loop {
-                    tick.tick().await;
-                    if done2.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    if tx2
-                        .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            if tx2
+                                .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        // 主任务已结束：ticker 退出，放行流终结
+                        _ = done_rx.changed() => break,
                     }
                 }
             });
         }
 
         run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -660,7 +663,9 @@ pub async fn wb_aggregate_chat(
     guard: InflightGuard,
 ) -> Response {
     let model_out = model.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
+    // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池
+    let result = super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
         let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
@@ -974,7 +979,9 @@ pub async fn wb_tool_exec_chat(
     guard: InflightGuard,
 ) -> Response {
     let model_inner = model.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    // P2 修复：工具代执行多轮上游请求 + 重试退避（最长 60s×N），长阻塞占主池
+    // 会饿死鉴权等短任务，与非流式聚合一并迁入 stream_runtime 专用阻塞池
+    let result = super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至编排完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
         let model = model_inner;
