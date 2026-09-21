@@ -1,16 +1,13 @@
 /**
  * 全局 API 管理 · 网关头部（unified-api-gateway-design §5.2/§5.4）
- * 启停按钮 + 常驻指标行（运行状态 / 总请求数 / 当前并发数 / API Key 数量）。
- * 数据源：api_server_status（含 inflight）、api_keys_list；3s 轮询刷新。
+ * Web 版网关常驻运行：无启停按钮，仅展示「网关运行中 :端口」徽标 + 指标行（API Key 数量）。
+ * 数据源：gateway_settings_get（端口）、api_keys_list。
  */
-import { useCallback, useEffect, useState } from 'react';
-import { Play, Square } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { Badge } from '../ui';
 import { api } from '../../lib/tauri';
-import { withMinDelay } from '../../lib/delay';
 import { useAppStore } from '../../store';
 import GatewayHelpModal, { GatewayHelpButton } from './GatewayHelpModal';
-import type { ApiServiceStatus } from '../../types';
 
 /** 紧凑指标单元（弹窗头部不做大号 StatCard） */
 function Metric({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
@@ -26,61 +23,22 @@ function Metric({ label, value, hint }: { label: string; value: string | number;
 
 export default function GatewayHeader() {
   const toast = useAppStore((s) => s.pushToast);
-  const [status, setStatus] = useState<ApiServiceStatus | null>(null);
+  const [port, setPort] = useState(7864);
   const [keyCount, setKeyCount] = useState(0);
-  const [starting, setStarting] = useState(false);
-  const [stopping, setStopping] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
 
-  const refresh = useCallback(async () => {
-    try {
-      setStatus(await api.apiServer.status());
-    } catch {
-      /* 保留上次状态 */
-    }
-    try {
-      const view = await api.apiServer.keysList();
-      setKeyCount(view.keys.length);
-    } catch {
-      /* 保留上次数量 */
-    }
-  }, []);
-
   useEffect(() => {
-    void refresh();
-    const id = setInterval(() => void refresh(), 3000);
-    return () => clearInterval(id);
-  }, [refresh]);
-
-  const start = async () => {
-    setStarting(true);
     try {
-      const s = await withMinDelay(api.apiServer.start());
-      setStatus(s);
-      useAppStore.setState({ apiStatus: s });
-      toast('success', `API 服务已启动（端口 ${s.port}）`);
-    } catch (err) {
-      toast('error', `启动失败：${String(err)}`);
-    } finally {
-      setStarting(false);
+      void api.apiServer.gatewaySettingsGet().then((s) => setPort(s.port));
+    } catch {
+      /* 保留默认端口展示 */
     }
-  };
-
-  const stop = async () => {
-    setStopping(true);
-    try {
-      await withMinDelay(api.apiServer.stop());
-      setStatus(null);
-      useAppStore.setState({ apiStatus: null });
-      toast('info', 'API 服务已停止');
-    } catch (err) {
-      toast('error', `停止失败：${String(err)}`);
-    } finally {
-      setStopping(false);
-    }
-  };
-
-  const running = status?.running ?? false;
+    api.apiServer
+      .keysList()
+      .then((view) => setKeyCount(view.keys.length))
+      .catch((err) => toast('error', `读取 API Key 列表失败：${String(err)}`));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="card p-4">
@@ -90,56 +48,23 @@ export default function GatewayHeader() {
             OpenAI / Anthropic 兼容接口，通过 Trae / Buddy 资源池智能调度实现多账号负载均衡
           </p>
           <p className="mt-0.5 text-xs text-slate-400 dark:text-zinc-500">
-            统一网关 127.0.0.1:{status?.port ?? 7864} · 请求按模型 ID 匹配资源池（未运行时端口为配置值）
+            统一网关 127.0.0.1:{port} · 请求按模型 ID 匹配资源池
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          {running ? (
-            <button
-              className="btn-danger flex items-center gap-1.5 !py-1.5 text-xs"
-              onClick={() => void stop()}
-              disabled={stopping}
-            >
-              <Square size={14} />
-              {stopping ? '停止中…' : '停止网关'}
-            </button>
-          ) : (
-            <button
-              className="btn-outline flex items-center gap-1.5 !py-1.5 text-xs"
-              onClick={() => void start()}
-              disabled={starting}
-            >
-              <Play size={14} />
-              {starting ? '启动中…' : '启动网关'}
-            </button>
-          )}
+          <Badge tone="green">网关运行中 :{port}</Badge>
           <GatewayHelpButton onClick={() => setHelpOpen(true)} />
         </div>
       </div>
 
-      <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <div className="rounded-lg border border-slate-200 px-3 py-2 dark:border-zinc-700">
-          <div className="text-[11px] text-slate-400 dark:text-zinc-500">运行状态</div>
-          <div className="mt-1">
-            <Badge tone={running ? 'green' : 'slate'}>
-              {running ? `运行中 :${status?.port ?? 0}` : '已停止'}
-            </Badge>
-          </div>
-        </div>
-        <Metric label="总请求数" value={status?.total_requests ?? 0} hint="累计处理的 API 调用" />
-        <Metric
-          label="当前并发数"
-          value={running ? (status?.inflight ?? 0) : '—'}
-          hint="正在处理中的请求数（inflight，§4.5）"
-        />
+      <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
         <Metric label="API Key 数量" value={keyCount} hint="data/api_keys.json 全部条目" />
+        <Metric
+          label="运行状态"
+          value="常驻运行"
+          hint="Web 版网关随服务端常驻运行，无需手动启停"
+        />
       </div>
-
-      {status?.last_error && (
-        <p className="mt-2 break-all text-xs text-rose-600 dark:text-rose-400">
-          最近错误：{status.last_error}
-        </p>
-      )}
 
       <GatewayHelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>

@@ -6,7 +6,6 @@ import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import type {
-  ApiServiceStatus,
   ApiPoolFile,
   PoolStatus,
   UsageDayView,
@@ -111,7 +110,6 @@ const WB_PARAM_DEFAULTS = {
 
 export default function BuddyApiService() {
   const pushToast = useAppStore((s) => s.pushToast);
-  const [status, setStatus] = useState<ApiServiceStatus | null>(null);
   const [pool, setPool] = useState<ApiPoolFile | null>(null);
   const [wbFlags, setWbFlags] = useState({
     wbEnabled: false,
@@ -140,15 +138,13 @@ export default function BuddyApiService() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [st, pf, accs, cat, wbp, wbg] = await Promise.all([
-        api.apiServer.status().catch(() => null),
+      const [pf, accs, cat, wbp, wbg] = await Promise.all([
         api.apiServer.poolList().catch(() => null),
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
         api.apiServer.wbCatalogList().catch(() => [] as WbModelInfo[]),
         api.apiServer.wbPoolStatus().catch(() => [] as PoolStatus[]),
         api.workbuddy.groups.list().catch(() => [] as GroupView[]),
       ]);
-      setStatus(st);
       setPool(pf);
       setAccounts(accs);
       setCatalog(cat);

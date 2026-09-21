@@ -1,13 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download } from 'lucide-react';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  ResponsiveContainer,
+  Tooltip,
+  CartesianGrid,
+} from 'recharts';
 import PageHeader from '../components/PageHeader';
 import { Badge, Modal, Spinner, StatCard } from '../components/ui';
 import { useAppStore } from '../store';
+import { useIsDark } from '../lib/useIsDark';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
 import { RefreshTokenBadge } from './accounts/RefreshTokenBadge';
 import type {
-  ApiServiceStatus,
   PoolStatus,
   TraeModelMeta,
   UnifiedModel,
@@ -39,9 +48,9 @@ export default function ApiService() {
   const accounts = useAppStore((s) => s.accounts);
   const refreshAccounts = useAppStore((s) => s.refreshAccounts);
   const toast = useAppStore((s) => s.pushToast);
+  const isDark = useIsDark();
 
   // ---- 池指标 / 账号池 ----
-  const [status, setStatus] = useState<ApiServiceStatus | null>(null);
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
   const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
@@ -51,6 +60,12 @@ export default function ApiService() {
   const [refreshingPool, setRefreshingPool] = useState(false);
   // 当日活跃账号数据源（今日用量桶的账号维度计数）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
+  // 近 30 天三池用量（T12d 堆叠柱状图；null = 加载失败不展示）
+  const [usage30, setUsage30] = useState<{
+    trae: UsageDayView[];
+    wb: UsageDayView[];
+    custom: UsageDayView[];
+  } | null>(null);
 
   // ---- 模型目录（Trae 源） ----
   const [models, setModels] = useState<UnifiedModel[]>([]);
@@ -73,6 +88,7 @@ export default function ApiService() {
     void refreshStatus();
     void loadGroups();
     void loadTodayUsage();
+    void loadUsage30();
     void loadModels();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshAccounts]);
@@ -83,6 +99,20 @@ export default function ApiService() {
       setUsage(await api.apiServer.usageStats(1));
     } catch {
       /* 加载失败按无数据处理 */
+    }
+  }, []);
+
+  // 近 30 天三池用量（T12d：网关请求趋势堆叠柱状图数据源）
+  const loadUsage30 = useCallback(async () => {
+    try {
+      const [trae, wb, custom] = await Promise.all([
+        api.apiServer.usageStats(30),
+        api.apiServer.wbUsageStats(30),
+        api.apiServer.customUsageStats(30),
+      ]);
+      setUsage30({ trae, wb, custom });
+    } catch {
+      setUsage30(null);
     }
   }, []);
 
@@ -118,29 +148,19 @@ export default function ApiService() {
     }
   };
 
+  // Web 版网关常驻运行：无启停概念，仅轮询实时池状态
   const refreshStatus = useCallback(async () => {
     try {
-      const s = await api.apiServer.status();
-      setStatus(s);
-      if (s.running) {
-        try {
-          setPoolStatus(await api.apiServer.poolStatus());
-        } catch {
-          /* ignore */
-        }
-      } else {
-        setPoolStatus([]);
-      }
+      setPoolStatus(await api.apiServer.poolStatus());
     } catch {
       /* ignore */
     }
   }, []);
 
   useEffect(() => {
-    if (!status?.running) return;
     const id = setInterval(() => void refreshStatus(), 3000);
     return () => clearInterval(id);
-  }, [status?.running, refreshStatus]);
+  }, [refreshStatus]);
 
   const loadPool = async (manual = false) => {
     setRefreshingPool(true);
@@ -292,16 +312,38 @@ export default function ApiService() {
     }
   };
 
-  const running = status?.running ?? false;
   const poolCount = enabledUids.size;
 
-  // 池指标（§6.1）：可用 = 健康且未冷却（仅运行中可得实时值）；活跃 = 当日被调度使用；池内 = enabled_uids
+  // 池指标（§6.1）：可用 = 健康且未冷却（网关常驻，实时可得）；活跃 = 当日被调度使用；池内 = enabled_uids
   const todayKey = new Date().toLocaleDateString('sv-SE');
-  const availableCount = running
-    ? poolStatus.filter((p) => !p.cooling && !p.disabled).length
-    : null;
+  const availableCount = poolStatus.filter((p) => !p.cooling && !p.disabled).length;
   const activeToday =
     usage.find((d) => d.date === todayKey)?.accounts.filter((a) => a.requests > 0).length ?? 0;
+
+  // 近 30 天三池堆叠数据（T12d）：三池用量按日合并，自然日序列补 0 保持 X 轴连续
+  const usage30Data = useMemo(() => {
+    if (!usage30) return null;
+    const map = new Map<string, { trae: number; wb: number; custom: number }>();
+    const add = (arr: UsageDayView[], key: 'trae' | 'wb' | 'custom') =>
+      arr.forEach((d) => {
+        const rec = map.get(d.date) ?? { trae: 0, wb: 0, custom: 0 };
+        rec[key] += d.total_requests;
+        map.set(d.date, rec);
+      });
+    add(usage30.trae, 'trae');
+    add(usage30.wb, 'wb');
+    add(usage30.custom, 'custom');
+    const out: { label: string; trae: number; wb: number; custom: number }[] = [];
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86400000);
+      const key = `${d.getFullYear()}-${`${d.getMonth() + 1}`.padStart(2, '0')}-${`${d.getDate()}`.padStart(2, '0')}`;
+      const rec = map.get(key) ?? { trae: 0, wb: 0, custom: 0 };
+      out.push({ label: key.slice(5), trae: rec.trae, wb: rec.wb, custom: rec.custom });
+    }
+    return out;
+  }, [usage30]);
+  const usage30Total = usage30Data?.reduce((s, d) => s + d.trae + d.wb + d.custom, 0) ?? 0;
+  const hasUsage30 = usage30Data?.some((d) => d.trae + d.wb + d.custom > 0) ?? false;
 
   // 账号池仅展示/可选有通用积分的账号（本服务消耗通用积分，零积分账号无法服务请求）
   const poolAccounts = useMemo(
@@ -353,9 +395,9 @@ export default function ApiService() {
       <div className="mt-5 grid grid-cols-3 gap-3">
         <StatCard
           label="可用账号数"
-          value={availableCount ?? '—'}
+          value={availableCount}
           tone="green"
-          hint={running ? '健康且未冷却，可被调度选中' : 'API 服务未运行，无实时池状态'}
+          hint="健康且未冷却，可被调度选中"
         />
         <StatCard
           label="活跃账号"
@@ -371,6 +413,71 @@ export default function ApiService() {
         />
       </div>
 
+      {/* 近 30 天网关请求趋势（T12d：三池堆叠柱状图，无请求日补 0 保持 X 轴连续） */}
+      {usage30Data && hasUsage30 && (
+        <div className="mt-5 card p-5">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+            <h3 className="font-medium">近 30 天网关请求趋势</h3>
+            <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
+              <span className="flex items-center gap-1">
+                <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#6366f1' }} />
+                Trae 池
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#f59e0b' }} />
+                Buddy 池
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#10b981' }} />
+                自定义模型
+              </span>
+              <span className="tabular-nums">合计 {usage30Total.toLocaleString()} 次</span>
+            </div>
+          </div>
+          <div className="h-56">
+            <ResponsiveContainer>
+              <BarChart data={usage30Data} margin={{ top: 8, right: 16, left: 0, bottom: 4 }}>
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  stroke={isDark ? '#3f3f46' : '#e2e8f0'}
+                  opacity={0.25}
+                  vertical={false}
+                />
+                <XAxis
+                  dataKey="label"
+                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                  axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                  tickLine={false}
+                  interval={4}
+                />
+                <YAxis
+                  tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={48}
+                  allowDecimals={false}
+                />
+                <Tooltip
+                  cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.04)' }}
+                  contentStyle={{
+                    fontSize: 12,
+                    borderRadius: 10,
+                    border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                    background: isDark ? '#18181b' : '#fff',
+                    color: isDark ? '#e4e4e7' : '#1e293b',
+                    boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+                    padding: '8px 12px',
+                  }}
+                />
+                <Bar dataKey="trae" name="Trae 池" stackId="pool" fill="#6366f1" />
+                <Bar dataKey="wb" name="Buddy 池" stackId="pool" fill="#f59e0b" />
+                <Bar dataKey="custom" name="自定义模型" stackId="pool" fill="#10b981" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+
       <div className="mt-5 grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
         {/* 账号池选择（资源级，现有功能原样迁移） */}
         <div className="card flex flex-col p-5">
@@ -382,17 +489,15 @@ export default function ApiService() {
               </h2>
             </div>
             <div className="flex items-center gap-2">
-              {running && (
-                <button
-                  className="btn-ghost flex items-center gap-1 text-xs"
-                  onClick={() => void clearAllCooldowns()}
-                  disabled={clearingCooldowns}
-                  title="清除所有账号的冷却状态"
-                >
-                  <Eraser size={13} className={clearingCooldowns ? 'animate-pulse' : ''} />
-                  {clearingCooldowns ? '清除中…' : '清除冷却'}
-                </button>
-              )}
+              <button
+                className="btn-ghost flex items-center gap-1 text-xs"
+                onClick={() => void clearAllCooldowns()}
+                disabled={clearingCooldowns}
+                title="清除所有账号的冷却状态"
+              >
+                <Eraser size={13} className={clearingCooldowns ? 'animate-pulse' : ''} />
+                {clearingCooldowns ? '清除中…' : '清除冷却'}
+              </button>
               <button
                 className="btn-ghost flex items-center gap-1 text-xs"
                 onClick={() => void loadPool(true)}
@@ -536,7 +641,7 @@ export default function ApiService() {
                         {poolItem?.disabled && !a.refresh_token_invalid && (
                           <Badge tone="red">已禁用</Badge>
                         )}
-                        {running && poolItem && !poolItem.cooling && !poolItem.disabled && (
+                        {poolItem && !poolItem.cooling && !poolItem.disabled && (
                           // F-77⑤ 可观测：在途并发 > 0 时显示 busy 状态（替代"就绪"）
                           (poolItem.inflight ?? 0) > 0 ? (
                             <Badge tone="amber">在途 {poolItem.inflight}</Badge>

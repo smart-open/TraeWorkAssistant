@@ -2,12 +2,11 @@ import { useEffect, useState } from 'react';
 import { Save, RotateCcw } from 'lucide-react';
 import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
-import { api } from '../lib/tauri';
 import { THEMES } from '../lib/themes';
 import type { Settings as SettingsType } from '../types';
 
 /**
- * 通用设置面板：外观 / 语言 / 通用与通知 / 代理相关配置。
+ * 通用设置面板：外观 / 语言 / 通用与通知。
  * 供「系统设置」弹框（左下角系统图标）使用；环境配置页不包含这些区块。
  * 表单为本地状态，点击「保存」才持久化。
  */
@@ -19,32 +18,10 @@ export default function GeneralSettingsPanel() {
 
   const [form, setForm] = useState<SettingsType | null>(null);
   const [saving, setSaving] = useState(false);
-  // 开机自启（T11）：注册表 Run 项即时生效，不随「保存设置」提交
-  const [autostart, setAutostart] = useState(false);
-  const [autostartBusy, setAutostartBusy] = useState(false);
 
   useEffect(() => {
     void refreshSettings();
-    api.misc
-      .autostartStatus()
-      .then(setAutostart)
-      .catch(() => setAutostart(false));
   }, [refreshSettings]);
-
-  const toggleAutostart = async () => {
-    if (autostartBusy) return;
-    setAutostartBusy(true);
-    const next = !autostart;
-    try {
-      await api.misc.autostartSet(next);
-      setAutostart(next);
-      toast('success', next ? '已开启开机自启' : '已关闭开机自启');
-    } catch (e) {
-      toast('error', `设置开机自启失败：${String(e)}`);
-    } finally {
-      setAutostartBusy(false);
-    }
-  };
 
   useEffect(() => {
     if (settings && !form) {
@@ -117,8 +94,6 @@ export default function GeneralSettingsPanel() {
               <label className="label">通知方式</label>
               <select value={form.notify} onChange={(e) => update('notify', e.target.value)} className="input">
                 <option value="toast">应用内 Toast</option>
-                <option value="system">系统通知</option>
-                <option value="both">Toast + 系统通知</option>
                 <option value="none">不通知</option>
               </select>
             </div>
@@ -133,100 +108,9 @@ export default function GeneralSettingsPanel() {
                 max={365}
               />
               <p className="mt-1 text-xs text-slate-400">
-                应用启动时自动清理超过保留天数的运行日志（代理 / 签到 / 切换日志）。
+                应用启动时自动清理超过保留天数的运行日志（签到 / 网关日志）。
               </p>
             </div>
-          </div>
-          <div className="space-y-3">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.launch_minimized}
-                onChange={(e) => update('launch_minimized', e.target.checked)}
-              />
-              启动时最小化到托盘
-            </label>
-            <label className="flex items-center gap-2">
-              <input type="checkbox" checked={form.tray} onChange={(e) => update('tray', e.target.checked)} />
-              启用系统托盘图标
-            </label>
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={autostart}
-                onChange={() => void toggleAutostart()}
-                disabled={autostartBusy}
-              />
-              开机自启
-              <span className="text-xs text-slate-400">（开关即时生效，无需保存）</span>
-            </label>
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.silent_checkin}
-                onChange={(e) => update('silent_checkin', e.target.checked)}
-              />
-              启动静默签到
-              <span className="text-xs text-slate-400">（启动 60 秒后自动为未签到账号签到）</span>
-            </label>
-            <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
-          </div>
-        </div>
-      </section>
-
-      {/* 代理相关 */}
-      <section className="card p-4">
-        <h3 className="mb-1 font-medium">代理</h3>
-        <p className="mb-3 text-xs text-slate-400">本地 MITM 代理的端口与抓包行为，修改后需重启代理生效。</p>
-        <div className="space-y-3 text-sm">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div>
-              <label className="label">代理端口</label>
-              <input
-                type="number"
-                value={form.proxy_port}
-                onChange={(e) => update('proxy_port', Math.min(65535, Math.max(1, Number(e.target.value) || 8899)))}
-                className="input w-32"
-                min={1}
-                max={65535}
-              />
-            </div>
-            <label className="flex items-center gap-2 self-end pb-2.5">
-              <input
-                type="checkbox"
-                checked={form.auto_start_proxy}
-                onChange={(e) => update('auto_start_proxy', e.target.checked)}
-              />
-              启动时自动开启代理
-            </label>
-          </div>
-          <div>
-            <label className="label">代理监听域名列表</label>
-            <textarea
-              value={form.proxy_domains}
-              onChange={(e) => update('proxy_domains', e.target.value)}
-              className="input min-h-[60px] text-xs"
-              placeholder="trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com"
-            />
-            <p className="mt-1 text-xs text-slate-400">
-              逗号分隔的域名后缀列表，即 <b>解密白名单</b>（同 Charles SSL Proxying）：列表内域名走
-              MITM 解密并记录日志；未列出的域名透明直通、不记录。注意：做证书锁定（cert pinning）的客户端
-              （如豆包 ttnet 原生栈）对其 API 域解密会被拒，应只列入需要抓取凭证/流量的具体域名
-              （如 www.doubao.com），不要配宽后缀。留空则使用默认值。
-            </p>
-          </div>
-          <div>
-            <label className="label">代理抓取日志路径</label>
-            <input
-              type="text"
-              value={form.proxy_log_path ?? ''}
-              onChange={(e) => update('proxy_log_path', e.target.value.trim() || null)}
-              placeholder="留空则默认 %APPDATA%\AIWorkAssistant\logs"
-              className="input"
-            />
-            <p className="mt-1 text-xs text-slate-400">
-              代理拦截到的完整请求/响应将记录到此目录，按 100MB 滚动存储。
-            </p>
           </div>
         </div>
       </section>

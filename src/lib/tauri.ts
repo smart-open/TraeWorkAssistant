@@ -1,105 +1,296 @@
-import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+// Web 版 API 适配层（T9）：桌面 Tauri invoke/listen 的服务端对位。
+// - invoke(name, args) → `POST /api/cmd/{name}`（Tauri invoke 约定换皮 REST，
+//   响应 `{"ok":true,"data":...}` / `{"ok":false,"error":...}`，契约见 aiwork-server cmd_bridge）
+// - listen(event, cb)  → WebSocket `/api/ws`（T12c 双向推送，30s 心跳）；
+//   WS 不可用时自动回退 SSE `GET /api/events/checkin`（广播通道全事件按名下发）
+// 仅保留命令桥白名单内的命令封装；白名单外命令 404 fail-closed。
+
 import type {
   AccountView,
-  ApiServiceStatus,
+  AdminTokenEntry,
+  AdminTokenView,
   ApiPoolFile,
   ApiKeyEntry,
-  CcSwitchStatus,
   ApiKeysFileView,
-  AppLocate,
-  CheckinDone,
   CheckinOpts,
   CheckinTrendPoint,
-  CodeBuddyEnvCheck,
-  CreditRecord,
   CreditDetail,
   CreditsDailySnapshot,
-  DiscoveredAccount,
-  DoubaoAccountView,
-  DoubaoCapturedCredential,
-  DoubaoChatdataInfo,
-  DoubaoChatdataResult,
-  DoubaoExportResult,
-  DoubaoRenewSummary,
-  DoubaoQuotaResult,
-  DoubaoHistoryEvent,
-  DoubaoSnapshotMeta,
-  EnvStatus,
+  CustomModel,
+  DispatchPolicy,
+  GatewaySettings,
   GroupView,
-  JwtParseResult,
-  LocalEntitlement,
-  ImportReport,
   ImportPreview,
+  ImportReport,
+  IpAllowlistConfig,
+  JwtParseResult,
   LogLine,
   ModelOption,
-  OAuthLoginUrl,
+  NotifyConfig,
+  NotifyResult,
   OAuthLoginResult,
-  OAuthLoginDoneEvent,
+  OAuthLoginUrl,
   PoolStatus,
-  ProfileInfo,
-  ProxyLogListResult,
-  ProxyStatus,
   Settings,
-  UpdateCheckResult,
-  UpdateDownloaded,
-  UpdateDownloadProgress,
-  GatewaySettings,
-  DispatchPolicy,
   TraeModelMeta,
   UnifiedModel,
   UsageDayView,
-  CustomModel,
-  WorkBuddyAccountView,
-  WorkBuddyEnvCheck,
-  WorkBuddyScanResult,
-  WorkBuddySettings,
-  WbCreditsResult,
+  WbActivityInfo,
   WbCheckinRecord,
-  WbCliStatus,
-  WbCliRotateResult,
-  WbCliRotateLog,
-  WbOauthDone,
-  WbOauthProgress,
-  WbResetItem,
-  WbResetResult,
-  WbTokenStats,
-  BuddyChatApp,
+  WbCreditsResult,
+  WbModelInfo,
+  WbPoolImportResult,
+  WbUsageFallback,
   WbUsageOfficial,
   WbUsageOfficialAll,
-  WbUsageFallback,
-  WbActivityInfo,
-  WbPoolImportResult,
-  WbModelInfo,
-  UsageHistoryResult,
+  WorkBuddyAccountView,
+  WorkBuddyScanResult,
+  WorkBuddySettings,
 } from '../types';
 
-// 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
+/** API 错误：携带 HTTP 状态码，401 供全局未登录拦截使用 */
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** camelCase → snake_case（仅顶层参数键；旧 tauri invoke 依赖框架自动转换，此处补齐） */
+function toSnakeKey(key: string): string {
+  return key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+}
+
+/** 未登录事件名：invoke 收到 401 时派发，store 监听后回登录页 */
+export const UNAUTHORIZED_EVENT = 'aiwork:unauthorized';
+
+// 命令桥调用：body 按原命令参数名传键（顶层 camelCase 自动转 snake_case）；
+// 成功解包 data，失败抛 ApiError；401 时同步派发全局未登录事件。
+async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  let body: Record<string, unknown> | undefined;
+  if (args) {
+    body = {};
+    for (const [k, v] of Object.entries(args)) body[toSnakeKey(k)] = v;
+  }
+  const res = await fetch(`/api/cmd/${command}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (res.status === 401) {
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    throw new ApiError(401, '未登录或登录已过期');
+  }
+  let payload: { ok?: boolean; data?: T; error?: string };
+  try {
+    payload = await res.json();
+  } catch {
+    throw new ApiError(res.status, `请求失败（HTTP ${res.status}）`);
+  }
+  if (!res.ok || !payload.ok) {
+    throw new ApiError(res.status, payload.error ?? `请求失败（HTTP ${res.status}）`);
+  }
+  return payload.data as T;
+}
+
+// ---- 登录会话（ADR-4）----
+
+/** token 登录：成功后服务端下发 HttpOnly 会话 cookie（Max-Age 7 天） */
+export async function login(token: string): Promise<void> {
+  const res = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
+  if (res.ok) return;
+  let msg = `登录失败（HTTP ${res.status}）`;
+  try {
+    const j = (await res.json()) as { error?: string };
+    if (j?.error) msg = j.error;
+  } catch {
+    /* 非 JSON 响应，保留 HTTP 状态信息 */
+  }
+  throw new ApiError(res.status, msg);
+}
+
+// ---- 实时事件订阅（桌面 listen 的服务端对位）：WebSocket 优先，SSE 回退（T12c）----
+
+export type UnlistenFn = () => void;
+
+// 集中登记服务端会下发的事件名：WS 帧自带事件名，EventSource 需预先注册命名监听。
+// 桌面单事件 checkin-progress 承载全部签到载荷（start/account/retry/done），
+// 服务端拆为 checkin-progress / checkin-done 两个命名事件，别名归一分发。
+const RT_EVENT_NAMES = [
+  'checkin-progress',
+  'checkin-done',
+  'wb-checkin-progress',
+  'wb-oauth-progress',
+  'wb-oauth-done',
+];
+const RT_ALIASES: Record<string, string[]> = {
+  'checkin-progress': ['checkin-progress', 'checkin-done'],
+};
+type RtHandler = (payload: unknown) => void;
+const rtHandlers = new Map<string, Set<RtHandler>>();
+
+function dispatchEvent(name: string, payload: unknown) {
+  rtHandlers.get(name)?.forEach((h) => h(payload));
+}
+
+function hasSubscribers() {
+  return [...rtHandlers.values()].some((s) => s.size > 0);
+}
+
+// ---------- SSE 回退通道（EventSource，断线由浏览器自动重连） ----------
+let sseSource: EventSource | null = null;
+
+function ensureSseConnection() {
+  if (sseSource || !hasSubscribers()) return;
+  const es = new EventSource('/api/events/checkin');
+  sseSource = es;
+  for (const name of RT_EVENT_NAMES) {
+    es.addEventListener(name, (ev) => {
+      let payload: unknown;
+      try {
+        payload = JSON.parse((ev as MessageEvent).data as string);
+      } catch {
+        return;
+      }
+      dispatchEvent(name, payload);
+    });
+  }
+  // 断线由浏览器自动重连；登录过期期间的重试无害，重登录后恢复
+  es.onerror = () => {};
+}
+
+function closeSse() {
+  sseSource?.close();
+  sseSource = null;
+}
+
+// ---------- WebSocket 通道（T12c）：/api/ws，30s 心跳保活，断开自动回退 SSE ----------
+let wsSock: WebSocket | null = null;
+let wsHeartbeat: number | null = null;
+let wsRetryTimer: number | null = null;
+
+function wsUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/api/ws`;
+}
+
+function closeWs() {
+  if (wsHeartbeat !== null) {
+    clearInterval(wsHeartbeat);
+    wsHeartbeat = null;
+  }
+  const sock = wsSock;
+  wsSock = null;
+  if (sock) {
+    // 先摘掉回调再 close，避免 close/error 触发回退逻辑
+    sock.onopen = sock.onmessage = sock.onclose = sock.onerror = null;
+    try {
+      sock.close();
+    } catch {
+      /* 已关闭 */
+    }
+  }
+}
+
+function tryWs() {
+  if (wsSock || !hasSubscribers()) return;
+  if (typeof WebSocket === 'undefined') {
+    ensureSseConnection();
+    return;
+  }
+  let sock: WebSocket;
+  try {
+    sock = new WebSocket(wsUrl());
+  } catch {
+    ensureSseConnection();
+    scheduleWsRetry();
+    return;
+  }
+  wsSock = sock;
+  sock.onopen = () => {
+    // 显式订阅全部事件（防服务端默认语义漂移）；30s 心跳防反代 idle 断连
+    sock.send(JSON.stringify({ type: 'subscribe', events: RT_EVENT_NAMES }));
+    wsHeartbeat = window.setInterval(() => {
+      if (wsSock?.readyState === WebSocket.OPEN) wsSock.send('{"type":"ping"}');
+    }, 30_000);
+    // WS 就绪后关闭 SSE，避免同一事件重复消费
+    closeSse();
+  };
+  sock.onmessage = (ev) => {
+    let frame: { event?: string; payload?: unknown };
+    try {
+      frame = JSON.parse(ev.data as string);
+    } catch {
+      return; // pong / 非事件帧
+    }
+    if (frame.event) dispatchEvent(frame.event, frame.payload);
+  };
+  // 关闭/异常统一走 onclose：回退 SSE + 30s 后重试 WS（重连成功会自动关掉 SSE）
+  sock.onclose = () => {
+    closeWs();
+    ensureSseConnection();
+    scheduleWsRetry();
+  };
+  sock.onerror = () => {};
+}
+
+function scheduleWsRetry() {
+  if (wsRetryTimer !== null) return;
+  wsRetryTimer = window.setTimeout(() => {
+    wsRetryTimer = null;
+    tryWs();
+  }, 30_000);
+}
+
+function ensureRealtime() {
+  if (wsRetryTimer !== null) {
+    clearTimeout(wsRetryTimer);
+    wsRetryTimer = null;
+  }
+  tryWs();
+}
+
+function closeRealtimeIfIdle() {
+  if (hasSubscribers()) return;
+  closeWs();
+  closeSse();
+  if (wsRetryTimer !== null) {
+    clearTimeout(wsRetryTimer);
+    wsRetryTimer = null;
+  }
+  rtHandlers.clear();
+}
+
+// 事件订阅：载荷经 `{ payload }` 包装对齐桌面版签名（e.payload）
+export async function listen<T>(
+  event: string,
+  cb: (ev: { payload: T }) => void,
+): Promise<UnlistenFn> {
+  const names = RT_ALIASES[event] ?? (RT_EVENT_NAMES.includes(event) ? [event] : []);
+  if (names.length === 0) {
+    // 桌面专属事件（proxy-log/switch-*等）在 Web 版已随模块退役
+    console.warn(`[rt] Web 版不支持的事件订阅: ${event}，已忽略`);
+    return () => {};
+  }
+  const handler: RtHandler = (payload) => cb({ payload: payload as T });
+  for (const n of names) {
+    if (!rtHandlers.has(n)) rtHandlers.set(n, new Set());
+    rtHandlers.get(n)!.add(handler);
+  }
+  ensureRealtime();
+  return () => {
+    for (const n of names) rtHandlers.get(n)?.delete(handler);
+    closeRealtimeIfIdle();
+  };
+}
+
+// 所有命令封装集中于此，字段名严格遵循 Rust 端 snake_case 约定（invoke 内自动转换）。
 export const api = {
-  env: {
-    check: () => invoke<EnvStatus>('env_check'),
-    checkCn: () => invoke<EnvStatus>('env_check_trae_cn'),
-    // F-01：跨应用安装位置自动识别（trae_work | trae | doubao | workbuddy）
-    locate: (targetApp?: string) => invoke<AppLocate>('app_locate', { targetApp }),
-    openSite: () => invoke('open_trae_website'),
-    openApp: (proxyPort?: number) => invoke('open_trae_app', { proxyPort }),
-    openCnApp: (proxyPort?: number) => invoke('open_trae_cn_app', { proxyPort }),
-    /** Buddy 双应用：打开 WorkBuddy 桌面客户端（分离启动，不注入代理） */
-    openWorkbuddyApp: () => invoke('open_workbuddy_app'),
-    /** Buddy 双应用：打开 CodeBuddy 桌面客户端（分离启动，不注入代理） */
-    openCodebuddyApp: () => invoke('open_codebuddy_app'),
-    /** CodeBuddy 桌面环境检测（exe/进程/auth uid；与 WorkBuddy 共享 auth 文件） */
-    codebuddyEnvCheck: () => invoke<CodeBuddyEnvCheck>('codebuddy_env_check'),
-  },
-  cert: {
-    status: () => invoke<{ installed: boolean }>('cert_status'),
-    install: () => invoke<{ installed: boolean }>('cert_install'),
-  },
-  proxy: {
-    start: (port: number) => invoke<ProxyStatus>('proxy_start', { port }),
-    stop: () => invoke<ProxyStatus>('proxy_stop'),
-    status: () => invoke<ProxyStatus>('proxy_status'),
-  },
   accounts: {
     list: () => invoke<AccountView[]>('accounts_list'),
     addManual: (name: string, jwt: string, groupId?: string) =>
@@ -127,20 +318,8 @@ export const api = {
       invoke<ImportReport>('accounts_import', { content, only }),
     // F-46：导入前预览（解析账号/分组、标记已存在，不写盘）
     importPreview: (content: string) => invoke<ImportPreview>('accounts_import_preview', { content }),
-    // F-08 双应用账号自动发现
-    discover: () => invoke<DiscoveredAccount[]>('apps_accounts_discover'),
-    addDiscovered: (userId: string, name: string, app: string, dcUid?: string | null, uidConfident?: boolean) =>
-      invoke('apps_account_add', { userId, name, app, dcId: dcUid ?? null, uidConfident: uidConfident ?? null }),
     // 按需取完整 JWT（列表接口只回掩码值；弹窗/复制场景调用）
     getJwt: (userId: string) => invoke<string>('account_get_jwt', { userId }),
-    // 会员/套餐信息
-    refreshPayStatus: () => invoke<number>('refresh_pay_status'),
-    // 积分消耗历史（Trae Work query_user_usage_group_by_session；fresh=true 增量拉取，false 纯缓存）
-    usageHistory: (fresh?: boolean) =>
-      invoke<UsageHistoryResult>('usage_history_fetch', { fresh: fresh ?? null }),
-  },
-  traeApps: {
-    localEntitlement: () => invoke<LocalEntitlement>('apps_entitlement_read'),
   },
   groups: {
     list: () => invoke<GroupView[]>('groups_list'),
@@ -151,16 +330,13 @@ export const api = {
     move: (userId: string, groupId: string | null) => invoke('group_move', { userId, groupId }),
   },
   checkin: {
-    start: (opts: CheckinOpts) => invoke('checkin_start', { opts }),
+    // 命令桥约定：body 即 CheckinOpts（scope / user_ids / skip_checked_in / skip_expired）
+    start: (opts: CheckinOpts) => invoke('checkin_start', { ...opts }),
     // T8：近 N 天签到结果趋势（Dashboard 堆叠图）
     trends: (days?: number) =>
       invoke<CheckinTrendPoint[]>('checkin_trends', { days: days ?? null }),
   },
   misc: {
-    deviceReset: (userId: string) => invoke('device_reset', { userId }),
-    // T11：开机自启（开关即时生效）
-    autostartStatus: () => invoke<boolean>('autostart_status'),
-    autostartSet: (enabled: boolean) => invoke('autostart_set', { enabled }),
     jwtParse: (jwt: string) => invoke<JwtParseResult>('jwt_parse', { jwt }),
     logsQuery: (opts: {
       logType?: string;
@@ -180,238 +356,36 @@ export const api = {
     logsClear: (logType: string) => invoke<number>('logs_clear', { logType }),
     settingsGet: () => invoke<Settings>('settings_get'),
     settingsSet: (patch: Settings) => invoke('settings_set', { patch }),
-    creditsHistory: () => invoke<CreditRecord[]>('credits_history'),
-    inviteLink: () => invoke<{ url: string }>('invite_link'),
-    taskRegister: (time: string) => invoke('task_register', { time }),
-    taskStatus: () => invoke<string>('task_status'),
-    taskUnregister: () => invoke('task_unregister'),
-    proxyLogsList: (opts: {
-      keyword?: string;
-      startTime?: string;
-      endTime?: string;
-      offset?: number;
-      limit?: number;
-    }) => invoke<ProxyLogListResult>('proxy_logs_list', {
-      opts: {
-        keyword: opts.keyword,
-        start_time: opts.startTime,
-        end_time: opts.endTime,
-        offset: opts.offset,
-        limit: opts.limit,
-      },
-    }),
-    proxyLogDetail: (id: string) => invoke<string>('proxy_log_detail', { id }),
-    writeTextFile: (path: string, content: string) =>
-      invoke('write_text_file', { path, content }),
-    readTextFile: (path: string) => invoke<string>('read_text_file', { path }),
   },
-  switchAccount: (
-    userId: string,
-    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy',
-    skipJwtProbe?: boolean,
-  ) =>
-    invoke('switch_account', {
-      userId,
-      targetApp: targetApp ?? null,
-      // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
-      skipJwtProbe: skipJwtProbe ?? false,
-    }),
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
-    invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
-  resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
-    invoke('reset_device_ids', { targetApp: targetApp ?? null }),
-  profiles: {
-    // Buddy 双应用：profile_list / profile_restore / profile_delete 支持 WorkBuddy / CodeBuddy 档案映射
-    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
-      invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null }),
-    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
-      invoke('profile_backup', { userId, targetApp: targetApp ?? null }),
-    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
-      invoke('profile_restore', { userId, targetApp: targetApp ?? null }),
-    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
-      invoke('profile_delete', { userId, targetApp: targetApp ?? null }),
-    formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
+  scheduler: {
+    // T8：6 项内置定时任务状态（trae-jwt-renew / trae-checkin / wb-checkin / wb-renew / 双积分快照）
+    status: () => invoke<Record<string, unknown>>('scheduler_status'),
   },
-  // ---- 豆包账号池（Rust doubao.rs；字段名严格 snake_case）----
-  doubao: {
-    accountsList: () => invoke<DoubaoAccountView[]>('doubao_accounts_list'),
-    accountSave: (userId: string, name?: string, note?: string) =>
-      invoke('doubao_account_save', { userId, name: name ?? null, note: note ?? null }),
-    accountRemove: (userId: string) => invoke('doubao_account_remove', { userId }),
-    detectUid: () => invoke<string | null>('doubao_detect_uid'),
-    launch: (proxyPort?: number) => invoke('open_doubao_app', { proxyPort: proxyPort ?? null }),
-    /** C1：一键以账号打开（恢复快照后拉起客户端；代理运行中时注入 --proxy-server） */
-    openAs: (userId: string, proxyPort?: number) =>
-      invoke('doubao_open_as_account', { userId, proxyPort: proxyPort ?? null }),
-    /** C3：快照版本元数据（旧版快照返回 schema_version=0 或 null） */
-    snapshotMeta: (userId: string) =>
-      invoke<DoubaoSnapshotMeta | null>('doubao_snapshot_meta', { userId }),
-    /** 运维历史（keepalive/renew/quota 事件，旧→新；健康度卡与额度趋势数据源） */
-    history: () => invoke<DoubaoHistoryEvent[]>('doubao_history'),
-    // ---- 额度定时巡检任务（A1/B4） ----
-    quotaTaskRegister: (time: string) => invoke('doubao_quota_task_register', { time }),
-    quotaTaskStatus: () => invoke<string>('doubao_quota_task_status'),
-    quotaTaskUnregister: () => invoke('doubao_quota_task_unregister'),
-    // ---- 会话凭证（代理自动抓包） ----
-    capturedCredential: () => invoke<DoubaoCapturedCredential | null>('doubao_captured_credential'),
-    /** 抓包凭证自动回写当前账号（幂等）；返回写入说明或 null（无凭证/无目标/内容未变） */
-    credentialAutoApply: () => invoke<string | null>('doubao_credential_auto_apply'),
-    // ---- 会话续期 ----
-    renewRun: (syncOnly?: boolean) =>
-      invoke<DoubaoRenewSummary>('doubao_renew_run', { syncOnly: syncOnly ?? false }),
-    keepaliveRun: () => invoke('doubao_keepalive_run'),
-    accountSetCredential: (userId: string, sessionId?: string, sidGuard?: string, ttwid?: string) =>
-      invoke('doubao_account_set_credential', {
-        userId,
-        sessionId: sessionId ?? null,
-        sidGuard: sidGuard ?? null,
-        ttwid: ttwid ?? null,
-      }),
-    // ---- D1 对话数据（客户端状态）独立备份/恢复 ----
-    /** 备份对话数据：IndexedDB / DoubaoStorage → data/doubao_chats/<uid>/（自动先关豆包） */
-    chatdataBackup: (userId: string) => invoke<DoubaoChatdataResult>('doubao_chatdata_backup', { userId }),
-    /** 恢复对话数据备份到豆包 User Data（自动先关豆包） */
-    chatdataRestore: (userId: string) => invoke<DoubaoChatdataResult>('doubao_chatdata_restore', { userId }),
-    /** 对话数据备份状态（backed / files / size_bytes / backed_at） */
-    chatdataInfo: (userId: string) => invoke<DoubaoChatdataInfo>('doubao_chatdata_info', { userId }),
-    // ---- D2 对话记录导出（官方 API 拉取 → markdown/json） ----
-    /** 导出对话记录：需要账号已录入凭证（sessionid/sid_guard/ttwid），输出到 data/exports/ */
-    exportChats: (userId: string) => invoke<DoubaoExportResult>('doubao_export_chats', { userId }),
-    taskRegister: (time: string) => invoke('doubao_renew_task_register', { time }),
-    taskStatus: () => invoke<string>('doubao_renew_task_status'),
-    taskUnregister: () => invoke('doubao_renew_task_unregister'),
-    // ---- 会员额度 ----
-    fetchQuota: (userId: string) => invoke<DoubaoQuotaResult>('doubao_quota_fetch', { userId }),
-    // 按需取完整会话凭证（列表接口只回掩码值；编辑弹框回填场景调用）
-    getCredential: (userId: string) =>
-      invoke<{ session_id: string | null; sid_guard: string | null; ttwid: string | null }>(
-        'doubao_account_get_credential',
-        { userId },
-      ),
+  // ---- 通知渠道（Phase 3 T11：Bark / Server酱 / Webhook，独立 kv）----
+  notify: {
+    getConfig: () => invoke<NotifyConfig>('notify_config_get'),
+    // 返回保存后的生效值（前端表单以返回值为准）
+    setConfig: (config: NotifyConfig) => invoke<NotifyConfig>('notify_config_set', { config }),
+    // 用表单当前值直接发测试通知（不落盘，不校验总开关）
+    test: (config: NotifyConfig) => invoke<NotifyResult>('notify_test', { config }),
   },
-  // ---- WorkBuddy（批次1；Rust workbuddy.rs；字段名严格 snake_case）----
-  workbuddy: {
-    envCheck: () => invoke<WorkBuddyEnvCheck>('workbuddy_env_check'),
-    accountsList: () => invoke<WorkBuddyAccountView[]>('workbuddy_accounts_list'),
-    accountSave: (userId: string, name?: string, note?: string) =>
-      invoke('workbuddy_account_save', { userId, name: name ?? null, note: note ?? null }),
-    accountMove: (userId: string, groupId: string | null) =>
-      invoke('workbuddy_account_move', { userId, groupId: groupId ?? null }),
-    groups: {
-      list: () => invoke<GroupView[]>('workbuddy_groups_list'),
-      create: (name: string, color: string) =>
-        invoke<string>('workbuddy_groups_create', { name, color }),
-      update: (id: string, patch: { name?: string; color?: string; order?: number }) =>
-        invoke('workbuddy_groups_update', {
-          id,
-          name: patch.name ?? null,
-          color: patch.color ?? null,
-          order: patch.order ?? null,
-        }),
-      remove: (id: string) => invoke('workbuddy_groups_remove', { id }),
-    },
-    accountRemove: (userId: string, deleteSnapshot?: boolean) =>
-      invoke('workbuddy_account_remove', { userId, deleteSnapshot: deleteSnapshot ?? null }),
-    scanAuthFile: () => invoke<WorkBuddyScanResult | null>('workbuddy_scan_auth_file'),
-    accountImportAuth: (name?: string) =>
-      invoke<WorkBuddyAccountView>('workbuddy_account_import_auth', { name: name ?? null }),
-    refreshToken: (userId: string, force = false) =>
-      invoke<string>('workbuddy_refresh_token', { userId, force }),
-    checkinStart: (opts: { user_ids?: string[]; skip_checked_in: boolean; skip_expired: boolean }) =>
-      invoke('workbuddy_checkin_start', { opts }),
-    growthRun: () => invoke('workbuddy_growth_run'),
-    checkinResults: (days?: number) =>
-      invoke<WbCheckinRecord[]>('workbuddy_checkin_results', { days: days ?? null }),
-    checkinTaskRegister: (times: string[]) =>
-      invoke('workbuddy_checkin_task_register', { times }),
-    checkinTaskStatus: () => invoke<string[]>('workbuddy_checkin_task_status'),
-    checkinTaskUnregister: () => invoke('workbuddy_checkin_task_unregister'),
-    renewTaskRegister: (day?: string) => invoke('workbuddy_renew_task_register', { day: day ?? null }),
-    renewTaskStatus: () => invoke<boolean>('workbuddy_renew_task_status'),
-    renewTaskUnregister: () => invoke('workbuddy_renew_task_unregister'),
-    creditsFetch: (userId?: string, fresh?: boolean) =>
-      invoke<WbCreditsResult>('workbuddy_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
-    editionsBackfill: () => invoke<number>('workbuddy_editions_backfill'),
-    settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
-    settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),
-    // 打开 auth 文件所在目录（资源管理器；人工覆盖路径优先）
-    openAuthDir: () => invoke('workbuddy_open_auth_dir'),
-    // UI 坐标点击签到兜底（F-18，批次4）：仅手动触发、默认关闭
-    uiClickCapture: () => invoke<{ ok: boolean; x: number; y: number; message: string }>('workbuddy_ui_click_capture'),
-    uiClickCheckin: () => invoke<{ ok: boolean; x: number; y: number; message: string }>('workbuddy_ui_click_checkin'),
-    // CLI 切号桥 + 五重防护轮换（F-06/F-59，批次3）
-    cliStatus: () => invoke<WbCliStatus>('workbuddy_cli_status'),
-    cliBridgeSet: (userId: string) => invoke<WbCliStatus>('workbuddy_cli_bridge_set', { userId }),
-    cliRotateRun: () => invoke<WbCliRotateResult>('workbuddy_cli_rotate_run'),
-    cliRotateLogs: (limit?: number) =>
-      invoke<WbCliRotateLog[]>('workbuddy_cli_rotate_logs', { limit: limit ?? null }),
-    // 会话三件套备份/恢复 + 复制迁移（F-44/F-45，批次3）
-    // F-74：app 决定会话域（~/.workbuddy / ~/.codebuddy）与备份根；省略 = WorkBuddy（旧行为）
-    chatdataBackup: (userId: string, app?: BuddyChatApp) =>
-      invoke<{ ok: boolean; files: number; path: string }>('workbuddy_chatdata_backup', {
-        userId,
-        app: app ?? 'WorkBuddy',
-      }),
-    chatdataRestore: (userId: string, app?: BuddyChatApp) =>
-      invoke<{ ok: boolean; files: number }>('workbuddy_chatdata_restore', { userId, app: app ?? 'WorkBuddy' }),
-    chatdataInfo: (userId: string, app?: BuddyChatApp) =>
-      invoke<{ backed: boolean; size_bytes?: number; files?: number; backed_at?: string; has_edge_mapping?: boolean }>(
-        'workbuddy_chatdata_info',
-        { userId, app: app ?? 'WorkBuddy' },
-      ),
-    chatdataCopy: (sourceUserId: string, targetUserId: string, app?: BuddyChatApp) =>
-      invoke<{ ok: boolean; copied: number; total_lines: number; sessions_cloned: number; mappings_registered: number }>(
-        'workbuddy_chatdata_copy',
-        { sourceUserId, targetUserId, app: app ?? 'WorkBuddy' },
-      ),
-    // 账号库导入导出扩展（F-46，批次3）
-    accountsExport: (includeCredentials?: boolean) =>
-      invoke<Record<string, unknown>>('workbuddy_accounts_export', { includeCredentials: includeCredentials ?? null }),
-    accountsImport: (payload: Record<string, unknown>) =>
-      invoke<WbPoolImportResult>('workbuddy_accounts_import', { payload }),
-    // OAuth 扫码 + 环境重置（F-50/F-14，批次3）
-    oauthLogin: () => invoke<void>('workbuddy_oauth_login'),
-    envResetItems: () => invoke<WbResetItem[]>('workbuddy_env_reset_items'),
-    envReset: (items: string[], keycloakLogout: boolean) =>
-      invoke<WbResetResult[]>('workbuddy_env_reset', { items, keycloakLogout }),
-    // 官方用量 + 本地 Token 统计（F-25/26/57/58，批次3）
-    // 注意：Rust 端参数名为 refresh（Option<bool>），key 必须写 refresh；此前误写 fresh 被静默忽略导致「刷新」永远走缓存
-    usageOfficial: (userId?: string, fresh?: boolean) =>
-      invoke<WbUsageOfficial>('workbuddy_usage_official', { userId: userId ?? null, refresh: fresh ?? null }),
-    /** 全账号官方用量聚合（近 7 日积分消耗主数据源；31 天零填充） */
-    usageOfficialAll: () => invoke<WbUsageOfficialAll>('workbuddy_usage_official_all'),
-    usageFallback: () => invoke<WbUsageFallback>('workbuddy_usage_fallback'),
-    // fresh=true 强制重扫（跳过 10 分钟结果缓存；按文件增量缓存仍生效）
-    tokenStats: (fresh?: boolean) =>
-      invoke<WbTokenStats>('workbuddy_token_stats', { fresh: fresh ?? null }),
-    activityInfo: (userId?: string, fresh?: boolean) =>
-      invoke<WbActivityInfo>('workbuddy_activity_info', { userId: userId ?? null, refresh: fresh ?? null }),
+  // ---- IP 允许列表（Phase 3 T12a：应用层访问控制，覆盖网关与管理面）----
+  ipAllowlist: {
+    getConfig: () => invoke<IpAllowlistConfig>('ip_allowlist_get'),
+    // 返回保存后的生效值（归一化 trim/去重后）；存在无效 CIDR 条目时整体拒绝
+    setConfig: (config: IpAllowlistConfig) => invoke<IpAllowlistConfig>('ip_allowlist_set', { config }),
   },
-  oauth: {
-    getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),
-    parseCallback: (callbackUrl: string) =>
-      invoke('oauth_parse_callback', { callbackUrl }),
-    login: (callbackUrl: string, accountName?: string, groupId?: string) =>
-      invoke<OAuthLoginResult>('oauth_login', { callbackUrl, accountName, groupId }),
-    // F-78 批次 1：本机回环监听（127.0.0.1:17388），浏览器回调自动落库收尾；
-    // startLoopback 端口被占用时后端返回明确错误，前端降级为手动粘贴兜底
-    startLoopback: (accountName?: string, groupId?: string) =>
-      invoke<void>('oauth_start_loopback', {
-        accountName: accountName ?? null,
-        groupId: groupId ?? null,
-      }),
-    stopLoopback: () => invoke<void>('oauth_stop_loopback'),
-    // 登录完成事件：回环监听器自动落库后发出；ok=false 时提示改用手动粘贴兜底
-    onLoginDone: (cb: (e: OAuthLoginDoneEvent) => void): Promise<UnlistenFn> =>
-      listen<OAuthLoginDoneEvent>('oauth-login-done', (ev) => cb(ev.payload)),
+  // ---- 管理员令牌（Phase 3 T12b：主 token 之外的可吊销附加令牌）----
+  adminTokens: {
+    list: () => invoke<AdminTokenView[]>('admin_tokens_list'),
+    // 创建成功返回含明文 token 的完整条目（仅此一次，前端应引导立即复制）
+    create: (label: string) => invoke<AdminTokenEntry>('admin_token_create', { label }),
+    revoke: (id: string) => invoke<void>('admin_token_revoke', { id }),
   },
+  // ---- API 网关管理（Web 版网关常驻运行，无启停命令）----
   apiServer: {
-    start: () => invoke<ApiServiceStatus>('api_server_start'),
-    stop: () => invoke('api_server_stop'),
-    status: () => invoke<ApiServiceStatus>('api_server_status'),
     poolList: () => invoke<ApiPoolFile>('pool_list'),
-    // T10：池设置扩展调度策略与分组筛选；T5.2/T5.3/T5.5/T5.6③ 扩展 WB 开关组；
-    // 任务7：wbStrategy 为 Buddy 池独立策略（空串 = 跟随 Trae 池策略）
+    // T10：池设置扩展调度策略与分组筛选；wbStrategy 为 Buddy 池独立策略（空串 = 跟随 Trae 池策略）
     poolSet: (
       uids: string[],
       strategy?: string,
@@ -481,23 +455,7 @@ export const api = {
     wbCatalogSync: () => invoke<number>('api_wb_catalog_sync'),
     // WB 目录模型列表（Buddy「资源调度」页展示）
     wbCatalogList: () => invoke<WbModelInfo[]>('api_wb_catalog_list'),
-    // T5.7/F-43：CC Switch 协同（注册网关 provider 条目，不自建切换器）
-    // side：trae（Trae 模型网关）/ wb（WB 上游网关），两套条目互不覆盖
-    ccSwitchStatus: () => invoke<CcSwitchStatus>('ccswitch_status'),
-    ccSwitchRegister: (
-      appType: 'claude' | 'codex',
-      side: 'trae' | 'wb' = 'trae',
-      apiKey?: string,
-      model?: string,
-    ) =>
-      invoke<string>('ccswitch_register', {
-        appType,
-        side,
-        apiKey: apiKey ?? null,
-        model: model ?? null,
-        port: null,
-      }),
-    // T1：近 N 天 API 用量统计（Trae 模型请求桶；按日聚合，服务未运行也可查）
+    // T1：近 N 天 API 用量统计（Trae 模型请求桶；按日聚合）
     usageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_usage_stats', { days: days ?? null }),
     // WB 上游用量统计（wb_days 桶，Buddy「资源调度」页专用，与 Trae 侧分账）
@@ -516,7 +474,6 @@ export const api = {
     // 自定义模型连通性测试：发一条最小 chat 请求（max_tokens=16），成功返回摘要 / 失败返回原因
     customModelTest: (model: CustomModel) => invoke<string>('custom_model_test', { model }),
     // ---- 统一网关命令（Phase 1 §8.1）：统一模型目录 / 网关设置 ----
-    // 顶层参数用 camelCase（availableOnly），嵌套结构体字段保持 snake_case
     unifiedModels: (availableOnly?: boolean) =>
       invoke<UnifiedModel[]>('api_unified_models', { availableOnly: availableOnly ?? null }),
     // 池间调度策略（dispatch_policy.json：strategy/priority/per_model/fallback）
@@ -525,12 +482,10 @@ export const api = {
     dispatchPolicySet: (policy: DispatchPolicy) =>
       invoke<DispatchPolicy>('dispatch_policy_set', { policy }),
     gatewaySettingsGet: () => invoke<GatewaySettings>('gateway_settings_get'),
-    // 返回规范化后的生效值（前端展示以返回值为准）；端口改动下次启动 API 服务后生效
+    // 返回规范化后的生效值（前端展示以返回值为准）；端口改动需重启服务生效
     gatewaySettingsSet: (settings: GatewaySettings) =>
       invoke<GatewaySettings>('gateway_settings_set', { settings }),
-    // Trae 模型元数据 L1 覆盖层（§6.1 编辑弹框读写 data/trae_model_meta.json）：
-    // 顶层参数 camelCase；meta 嵌套字段保持 snake_case；null 字段 = 未设置，交由下层兜底
-    // metaGet 用于编辑弹框回显跨会话人工值（null = 无人工值，全字段交由下层兜底）
+    // Trae 模型元数据 L1 覆盖层（§6.1 编辑弹框读写 data/trae_model_meta.json）
     metaGet: (model: string) => invoke<TraeModelMeta | null>('trae_model_meta_get', { model }),
     metaSet: (model: string, meta: TraeModelMeta) =>
       invoke<void>('trae_model_meta_set', { model, meta }),
@@ -540,34 +495,75 @@ export const api = {
     keysList: () => invoke<ApiKeysFileView>('api_keys_list'),
     // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）
     keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
-      invoke('api_keys_save', { keys, authDisabled: authDisabled ?? null }),
+      invoke('api_keys_save', { keys, authDisabled }),
   },
-  updater: {
-    check: () => invoke<UpdateCheckResult>('update_check'),
-    // 第一步：下载安装包（完成后返回本地路径，等待用户确认安装）
-    // 注意：key 必须是 expectedVersion（Rust 参数 expected_version 的 Tauri 驼峰匹配），传 version 会报 missing required key
-    download: (p: {
-      downloadUrl: string;
-      assetName: string;
-      expectedVersion: string;
-      expectedSha256?: string | null;
-    }) => invoke<UpdateDownloaded>('update_download', p),
-    // 第二步：启动安装器（/P /UPDATE /R，完成后自动重启应用）
-    runInstaller: (p: { filePath: string; assetName: string }) =>
-      invoke<void>('update_run_installer', p),
-    onDownloadProgress: async (
-      cb: (e: UpdateDownloadProgress) => void,
-    ): Promise<UnlistenFn> =>
-      listen<UpdateDownloadProgress>('update-download-progress', (ev) =>
-        cb(ev.payload),
-      ),
-    onInstalling: async (cb: (assetName: string) => void): Promise<UnlistenFn> =>
-      listen<string>('update-installing', (ev) => cb(ev.payload)),
+  // ---- WB 手工路由配置（wb_route_config / wb_template_map）----
+  wbConfig: {
+    routeGet: () => invoke<Record<string, unknown>>('wb_route_config_get'),
+    routeSet: (config: Record<string, unknown>) => invoke('wb_route_config_set', { config }),
+    templateMapGet: () => invoke<Record<string, unknown>>('wb_template_map_get'),
+    templateMapSet: (map: Record<string, unknown>) => invoke('wb_template_map_set', { map }),
+  },
+  oauth: {
+    getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),
+    parseCallback: (callbackUrl: string) =>
+      invoke('oauth_parse_callback', { callbackUrl }),
+    login: (callbackUrl: string, accountName?: string, groupId?: string) =>
+      invoke<OAuthLoginResult>('oauth_login', { callbackUrl, accountName, groupId }),
+  },
+  // ---- WorkBuddy（Web 版保留：账号/分组/签到/积分/设置/导入导出/OAuth/用量）----
+  workbuddy: {
+    accountsList: () => invoke<WorkBuddyAccountView[]>('workbuddy_accounts_list'),
+    accountSave: (userId: string, name?: string, note?: string) =>
+      invoke('workbuddy_account_save', { userId, name, note }),
+    accountMove: (userId: string, groupId: string | null) =>
+      invoke('workbuddy_account_move', { userId, groupId }),
+    groups: {
+      list: () => invoke<GroupView[]>('workbuddy_groups_list'),
+      create: (name: string, color: string) =>
+        invoke<string>('workbuddy_groups_create', { name, color }),
+      update: (id: string, patch: { name?: string; color?: string; order?: number }) =>
+        invoke('workbuddy_groups_update', { id, ...patch }),
+      remove: (id: string) => invoke('workbuddy_groups_remove', { id }),
+    },
+    accountRemove: (userId: string, deleteSnapshot?: boolean) =>
+      invoke('workbuddy_account_remove', { userId, deleteSnapshot }),
+    scanAuthFile: () => invoke<WorkBuddyScanResult | null>('workbuddy_scan_auth_file'),
+    accountImportAuth: (name?: string) =>
+      invoke<WorkBuddyAccountView>('workbuddy_account_import_auth', { name }),
+    refreshToken: (userId: string, force = false) =>
+      invoke<string>('workbuddy_refresh_token', { userId, force }),
+    checkinStart: (opts: { user_ids?: string[]; skip_checked_in: boolean; skip_expired: boolean }) =>
+      invoke('workbuddy_checkin_start', { opts }),
+    growthRun: () => invoke('workbuddy_growth_run'),
+    checkinResults: (days?: number) =>
+      invoke<WbCheckinRecord[]>('workbuddy_checkin_results', { days: days ?? null }),
+    creditsFetch: (userId?: string, fresh?: boolean) =>
+      invoke<WbCreditsResult>('workbuddy_credits_fetch', { userId, fresh }),
+    editionsBackfill: () => invoke<number>('workbuddy_editions_backfill'),
+    settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
+    settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),
+    // 账号库导入导出（F-46）
+    accountsExport: (includeCredentials?: boolean) =>
+      invoke<Record<string, unknown>>('workbuddy_accounts_export', { includeCredentials }),
+    accountsImport: (payload: Record<string, unknown>) =>
+      invoke<WbPoolImportResult>('workbuddy_accounts_import', { payload }),
+    // OAuth 扫码全流程（后台线程执行，进度经 SSE wb-oauth-progress / wb-oauth-done 下发）
+    oauthLogin: () => invoke<void>('workbuddy_oauth_login'),
+    // 官方用量 + 用量聚合（F-25/26/57/58）
+    // 注意：Rust 端参数名为 refresh（Option<bool>），fresh=false 走缓存
+    usageOfficial: (userId?: string, fresh?: boolean) =>
+      invoke<WbUsageOfficial>('workbuddy_usage_official', { userId, refresh: fresh }),
+    /** 全账号官方用量聚合（近 7 日积分消耗主数据源；31 天零填充） */
+    usageOfficialAll: () => invoke<WbUsageOfficialAll>('workbuddy_usage_official_all'),
+    usageFallback: () => invoke<WbUsageFallback>('workbuddy_usage_fallback'),
+    activityInfo: (userId?: string, fresh?: boolean) =>
+      invoke<WbActivityInfo>('workbuddy_activity_info', { userId, refresh: fresh }),
   },
 };
 
 // ---- 事件载荷 ----
-/** start 事件账号清单项（Rust 侧发出，scope 内全集：候选 pending / 跳过带原因 / 重试轮沿用上轮状态） */
+/** start 事件账号清单项（scope 内全集：候选 pending / 跳过带原因 / 重试轮沿用上轮状态） */
 export interface CheckinStartAccount {
   user_id: string;
   name: string;
@@ -577,7 +573,7 @@ export interface CheckinStartAccount {
 export interface CheckinStartEvent {
   type: 'start';
   total: number;
-  /** scope 内全集清单；Python 脚本转发的 start 无此字段，前端仅同步 total 不重建列表 */
+  /** scope 内全集清单；脚本转发的 start 无此字段，前端仅同步 total 不重建列表 */
   accounts?: CheckinStartAccount[];
 }
 export interface CheckinAccountEvent {
@@ -616,117 +612,19 @@ export type CheckinProgressEvent =
   | CheckinRetryEvent
   | CheckinDoneEvent;
 
-export interface SwitchDoneEvent {
-  success: boolean;
-  raw: string;
-}
-
-export interface SaveLoginDoneEvent {
-  success: boolean;
-  raw: string;
-}
-
-export interface DeviceResetDoneEvent {
-  success: boolean;
-  raw: string;
-}
-
-export interface ProfileDoneEvent {
-  success: boolean;
-  raw: string;
-  action: 'backup' | 'restore';
-}
-
 export interface ListenerHandlers {
-  onProxyLog?: (line: string) => void;
-  onAccountCaptured?: (uid: string) => void;
   onCheckinProgress?: (e: CheckinProgressEvent) => void;
-  onSwitchProgress?: (line: string) => void;
-  onSwitchDone?: (e: SwitchDoneEvent) => void;
-  onSaveLoginProgress?: (line: string) => void;
-  onSaveLoginDone?: (e: SaveLoginDoneEvent) => void;
-  onDeviceResetProgress?: (line: string) => void;
-  onDeviceResetDone?: (e: DeviceResetDoneEvent) => void;
-  onProfileProgress?: (line: string) => void;
-  onProfileDone?: (e: ProfileDoneEvent) => void;
 }
 
+// 事件订阅集中注册（对位桌面版 setupListeners；Web 版仅保留签到进度流）
 export async function setupListeners(
   handlers: ListenerHandlers,
 ): Promise<UnlistenFn[]> {
   const unsubs: UnlistenFn[] = [];
-  if (handlers.onProxyLog) {
-    unsubs.push(
-      await listen<string>('proxy-log', (e) => handlers.onProxyLog!(e.payload)),
-    );
-  }
-  if (handlers.onAccountCaptured) {
-    unsubs.push(
-      await listen<string>('account-captured', (e) =>
-        handlers.onAccountCaptured!(e.payload),
-      ),
-    );
-  }
   if (handlers.onCheckinProgress) {
     unsubs.push(
       await listen<CheckinProgressEvent>('checkin-progress', (e) =>
         handlers.onCheckinProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchProgress) {
-    unsubs.push(
-      await listen<string>('switch-progress', (e) =>
-        handlers.onSwitchProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSwitchDone) {
-    unsubs.push(
-      await listen<SwitchDoneEvent>('switch-done', (e) =>
-        handlers.onSwitchDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginProgress) {
-    unsubs.push(
-      await listen<string>('save-login-progress', (e) =>
-        handlers.onSaveLoginProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onSaveLoginDone) {
-    unsubs.push(
-      await listen<SaveLoginDoneEvent>('save-login-done', (e) =>
-        handlers.onSaveLoginDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetProgress) {
-    unsubs.push(
-      await listen<string>('device-reset-progress', (e) =>
-        handlers.onDeviceResetProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onDeviceResetDone) {
-    unsubs.push(
-      await listen<DeviceResetDoneEvent>('device-reset-done', (e) =>
-        handlers.onDeviceResetDone!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileProgress) {
-    unsubs.push(
-      await listen<string>('profile-progress', (e) =>
-        handlers.onProfileProgress!(e.payload),
-      ),
-    );
-  }
-  if (handlers.onProfileDone) {
-    unsubs.push(
-      await listen<ProfileDoneEvent>('profile-done', (e) =>
-        handlers.onProfileDone!(e.payload),
       ),
     );
   }

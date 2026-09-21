@@ -1,10 +1,9 @@
 import { useEffect } from 'react';
-import TitleBar from './components/TitleBar';
 import Sidebar from './components/Sidebar';
-import TopBar from './components/TopBar';
 import Toaster from './components/Toaster';
 import { useAppStore } from './store';
 import { resolveTheme } from './lib/themes';
+import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import Accounts from './pages/Accounts';
 import Checkin from './pages/Checkin';
@@ -12,9 +11,6 @@ import Credits from './pages/Credits';
 import Logs from './pages/Logs';
 import Settings from './pages/Settings';
 import ApiService from './pages/ApiService';
-import DoubaoOverview from './pages/doubao/DoubaoOverview';
-import DoubaoAccounts from './pages/doubao/DoubaoAccounts';
-import DoubaoSettings from './pages/doubao/DoubaoSettings';
 import BuddyOverview from './pages/buddy/BuddyOverview';
 import BuddyAccounts from './pages/buddy/BuddyAccounts';
 import BuddyCheckin from './pages/buddy/BuddyCheckin';
@@ -39,12 +35,6 @@ function renderView(view: string) {
       return <ApiService />;
     case 'settings':
       return <Settings />;
-    case 'doubao-overview':
-      return <DoubaoOverview />;
-    case 'doubao-accounts':
-      return <DoubaoAccounts />;
-    case 'doubao-settings':
-      return <DoubaoSettings />;
     case 'buddy-overview':
       return <BuddyOverview />;
     case 'buddy-accounts':
@@ -67,6 +57,7 @@ export default function App() {
   const setView = useAppStore((s) => s.setView);
   const init = useAppStore((s) => s.init);
   const ready = useAppStore((s) => s.ready);
+  const authed = useAppStore((s) => s.authed);
   const settings = useAppStore((s) => s.settings);
 
   useEffect(() => {
@@ -99,13 +90,21 @@ export default function App() {
     );
   }
 
+  // 未登录（ADR-4）：整页登录页，登录成功后经 afterLogin 进入主界面
+  if (!authed) {
+    return (
+      <>
+        <Login />
+        <Toaster />
+      </>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-zinc-950 dark:text-zinc-100">
-      <TitleBar />
       <div className="flex min-h-0 flex-1">
         <Sidebar view={view} onNav={setView} />
         <main className="relative flex min-w-0 flex-1 flex-col">
-          <TopBar />
           <div className="relative min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
         </main>
       </div>

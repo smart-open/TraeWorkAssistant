@@ -1,0 +1,25 @@
+# AI Work 助手 Web 版一键部署（判据：docker compose up -d 一次成功 + HEALTHCHECK 绿）
+# 详细说明见 docs/server-deploy.md
+services:
+  aiwork-server:
+    build: .
+    image: aiwork-server:latest
+    container_name: aiwork-server
+    restart: unless-stopped
+    ports:
+      # 宿主端口可用 .env 的 AIWORK_PORT 覆盖（默认 8080）
+      - "${AIWORK_PORT:-8080}:8080"
+    environment:
+      TZ: Asia/Shanghai
+      AIWORK_DATA_DIR: /app/data
+      AIWORK_LISTEN_ADDR: 0.0.0.0:8080
+      # 管理令牌：建议显式注入（.env 中设置 AIWORK_ADMIN_TOKEN）；
+      # 留空则首启自动生成 64 位随机 token 落 /app/data/conf/admin_token
+      AIWORK_ADMIN_TOKEN: ${AIWORK_ADMIN_TOKEN:-}
+      # vault 密钥（ADR-2）：留空则首启生成 conf/vault_key.bin；
+      # 容器重建时该文件若丢失，已存账号凭据将无法解密——要么固定本 env，要么备份 volume
+      AIWORK_VAULT_KEY: ${AIWORK_VAULT_KEY:-}
+    volumes:
+      # 数据持久化：SQLite / stronghold 快照 / conf(admin_token、vault_key) / logs
+      - ./data:/app/data
+    # 健康检查内置在镜像 HEALTHCHECK（curl /health，30s 间隔）

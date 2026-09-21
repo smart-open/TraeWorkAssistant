@@ -1,0 +1,24 @@
+[package]
+name = "aiwork-server"
+version = "3.5.8"
+description = "AI Work 助手 Web 版服务端（管理面 + OpenAI 网关 + 调度器，单进程 axum）"
+edition = "2021"
+rust-version = "1.85"
+
+[[bin]]
+name = "aiwork-server"
+path = "src/main.rs"
+
+[dependencies]
+aiwork-core = { path = "../aiwork-core" }
+# ws feature：/api/ws 双向推送（T12c）；split 需 futures-util（仅 sink/stream，无运行时）
+axum = { version = "0.7", features = ["ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+# 静态托管 React 构建产物（ServeDir + SPA fallback）
+tower-http = { version = "0.5", features = ["fs"] }
+# 管理面（T5/T6/T7）：命令桥 JSON 编解码 + 登录请求体解析
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SSE 事件流：broadcast 通道 → Stream 适配（BroadcastStream 需 sync feature）
+tokio-stream = { version = "0.1", features = ["sync"] }

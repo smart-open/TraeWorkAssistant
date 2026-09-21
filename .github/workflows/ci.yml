@@ -1,0 +1,39 @@
+# CI：Rust 测试 + 前端构建 + Docker 镜像构建验证（Phase 2）
+# 桌面构建流水线（build-windows.yml）已随桌面壳退役删除
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust 测试（core + server）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  web:
+    name: 前端构建（tsc + vite）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  docker:
+    name: Docker 镜像构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build（不 push，验证 Dockerfile 一次成功）
+        run: docker build -t aiwork-server:ci .

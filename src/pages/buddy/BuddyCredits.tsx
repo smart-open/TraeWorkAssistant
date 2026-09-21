@@ -12,7 +12,6 @@ import { RefreshCw, Coins } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { StatCard, Badge, EmptyState } from '../../components/ui';
 import ExpiryCalendar from '../../components/ExpiryCalendar';
-import TokenStatsPanel from './TokenStatsPanel';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
@@ -28,7 +27,7 @@ interface UsageTrend {
 
 /**
  * buddy-credits 积分看板（§3.7.4，F-20/F-22/F-56/F-57/F-58/F-25，对齐 Trae 积分看板）：
- * KPI 统计 + 近 7 日用量趋势 + 账号积分明细排名 + 积分包到期日历；Token 统计 Tab。
+ * KPI 统计 + 近 7 日用量趋势 + 账号积分明细排名 + 积分包到期日历。
  */
 export default function BuddyCredits() {
   const pushToast = useAppStore((s) => s.pushToast);
@@ -36,7 +35,8 @@ export default function BuddyCredits() {
   const [result, setResult] = useState<WbCreditsResult | null>(null);
   const [usage, setUsage] = useState<UsageTrend | null>(null);
   const [loading, setLoading] = useState(false);
-  const [tab, setTab] = useState<'credits' | 'stats'>('credits');
+  // 用量趋势区间（T12d：官方聚合含 31 天逐日数据，支持 7/30 日切换）
+  const [trendRange, setTrendRange] = useState<7 | 30>(7);
 
   const refresh = useCallback(
     async (fresh = false) => {
@@ -85,8 +85,8 @@ export default function BuddyCredits() {
   const soonCount = allPackages.filter((x) => x.pkg.expire_soon).length;
   const avg = accounts.length === 0 ? 0 : total / accounts.length;
 
-  // 近 7 日用量趋势（usageFallback 本地推导快照）
-  const trend = (usage?.daily ?? []).slice(-7).map((d) => ({
+  // 用量趋势（官方聚合 31 天逐日 / 本地快照差分回退；按区间截尾）
+  const trend = (usage?.daily ?? []).slice(-trendRange).map((d) => ({
     label: d.date.slice(5),
     usage: d.usage,
   }));
@@ -98,33 +98,13 @@ export default function BuddyCredits() {
         title="Buddy · 积分看板"
         desc="积分余额 · 积分明细 · 到期日历"
         actions={
-          <>
-            <div className="flex rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
-              <button
-                className={`rounded-md px-3 py-1 text-xs font-medium ${tab === 'credits' ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100' : 'text-slate-500 dark:text-zinc-400'}`}
-                onClick={() => setTab('credits')}
-              >
-                积分统计
-              </button>
-              <button
-                className={`rounded-md px-3 py-1 text-xs font-medium ${tab === 'stats' ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100' : 'text-slate-500 dark:text-zinc-400'}`}
-                onClick={() => setTab('stats')}
-              >
-                Token 统计
-              </button>
-            </div>
-            <button className="btn-outline" onClick={() => void refresh(true)} disabled={loading}>
-              <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
-            </button>
-          </>
+          <button className="btn-outline" onClick={() => void refresh(true)} disabled={loading}>
+            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
+          </button>
         }
       />
 
-      {tab === 'stats' ? (
-        <TokenStatsPanel remainingCredits={result ? total : null} />
-      ) : (
-        <>
-          {/* KPI 卡（对齐 Trae 积分看板：5 卡） */}
+      {/* KPI 卡（对齐 Trae 积分看板：5 卡） */}
           <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
             <StatCard
               label="可用积分总数"
@@ -143,22 +123,37 @@ export default function BuddyCredits() {
             />
           </div>
 
-          {/* 近 7 日用量趋势（本地快照推导，对齐 Trae 积分看板趋势卡形态） */}
+          {/* 用量趋势（官方用量明细为主数据源，本地快照差分回退；T12d 支持 7/30 日切换） */}
           {usage && hasTrend && (
             <div className="mt-5 card p-5">
-              <div className="mb-4 flex items-center justify-between">
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
-                  <h3 className="font-medium">近 7 日积分消耗</h3>
+                  <h3 className="font-medium">近 {trendRange} 日积分消耗</h3>
                   <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
-                    7 Days
+                    {trendRange} Days
                   </span>
                 </div>
-                <div className="flex items-center gap-3 text-xs text-slate-400">
+                <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
                   <span className="flex items-center gap-1">
                     <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#f59e0b' }} />
                     消耗积分
                   </span>
                   <span>{usage.source}{usage.stale ? '（历史缓存回退）' : ''}</span>
+                  <div className="flex items-center gap-1">
+                    {([7, 30] as const).map((n) => (
+                      <button
+                        key={n}
+                        onClick={() => setTrendRange(n)}
+                        className={
+                          trendRange === n
+                            ? 'rounded-full bg-brand-500 px-2.5 py-0.5 font-medium text-white'
+                            : 'rounded-full bg-zinc-100 px-2.5 py-0.5 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400'
+                        }
+                      >
+                        {n} 日
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
               <div className="h-56">
@@ -269,8 +264,6 @@ export default function BuddyCredits() {
               emptyHint="暂无剩余积分的积分包：待账号录入凭证并完成积分查询后展示到期时间。"
             />
           </div>
-        </>
-      )}
     </div>
   );
 }

@@ -2,12 +2,13 @@
 // dev server 关闭后弹窗图片仍可显示，不依赖运行中的静态服务器
 import { promo_banner_base64 as promoBanner } from '../assets/promo-banner.base64';
 
-/** 应用品牌与关于信息（集中管理，改名只改这里；版本号不再硬编码——运行时经 getVersion() 读 Cargo.toml 单一来源） */
+/** 应用品牌与关于信息（集中管理，改名只改这里）；Web 版版本号与 package.json 单一来源同步 */
 export const APP_NAME = 'AI Work 助手';
+export const APP_VERSION = '3.5.8';
 export const APP_TAGLINE = '多账号签到与管理 · 一站式工作台';
 export const APP_OVERVIEW =
-  'Windows 桌面端多账号签到与管理一站式工作台（Tauri 2 + React 18 + Rust）。' +
-  '深度支持 Trae Work 与 Trae（Trae CN IDE）双应用：多账号签到、登录态双应用独立切换、设备隔离、积分看板与 OpenAI / Anthropic 兼容 API 网关，数据全部本地存储。';
+  '多账号签到与管理一站式工作台（Web 版：React 18 + Rust axum 单体服务）。' +
+  '支持 Trae 与 WorkBuddy 账号管理、签到、积分看板、定时调度与 OpenAI / Anthropic 兼容 API 网关，浏览器任意设备直访。';
 export const APP_AUTHOR = '朱天伟';
 export const APP_COPYRIGHT = `Copyright © 2026 ${APP_AUTHOR} · MIT License`;
 export const APP_DISCLAIMER =

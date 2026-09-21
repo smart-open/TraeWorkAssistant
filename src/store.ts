@@ -1,21 +1,12 @@
 import { create } from 'zustand';
-import { APP_NAME } from './lib/about';
-import { sendNotification } from '@tauri-apps/plugin-notification';
-import { api, setupListeners, type CheckinProgressEvent, type ProfileDoneEvent, type SaveLoginDoneEvent } from './lib/tauri';
-import { withMinDelay } from './lib/delay';
+import { api, setupListeners, ApiError, UNAUTHORIZED_EVENT, type CheckinProgressEvent } from './lib/tauri';
 import type {
   AccountView,
-  ApiServiceStatus,
   CheckinAccountResult,
   CheckinDone,
-  CreditRecord,
   CreditsDailySnapshot,
-  EnvStatus,
   GroupView,
-  LocalEntitlement,
   LogLine,
-  ProfileInfo,
-  ProxyStatus,
   Settings,
   ViewKey,
   AppKey,
@@ -57,64 +48,38 @@ export interface LogQuery {
 
 interface AppState {
   ready: boolean;
+  /** 管理面登录态（ADR-4）：false 时整页显示登录页 */
+  authed: boolean;
   view: ViewKey;
-  /** 侧边栏应用切换（trae = 现有菜单；buddy = 后期扩展置灰；doubao = 豆包页） */
+  /** 侧边栏应用切换（trae = Trae 菜单；buddy = WorkBuddy 菜单） */
   activeApp: AppKey;
-  env: EnvStatus | null;
-  envCn: EnvStatus | null;
-  certInstalled: boolean;
-  proxy: ProxyStatus;
-  apiStatus: ApiServiceStatus | null;
   accounts: AccountView[];
   groups: GroupView[];
   settings: Settings | null;
   logs: LogLine[];
-  creditsHistory: CreditRecord[];
   creditsDaily: CreditsDailySnapshot[];
-  proxyLog: string[];
-  switchProgress: string[];
-  switchingTo: string | null;
-  saveLoginProgress: string[];
-  savingLogin: string | null;
-  deviceResetProgress: string[];
-  deviceResetActive: boolean;
   checkin: CheckinState;
   toasts: Toast[];
-  profiles: ProfileInfo[];
-  profileProgress: string[];
-  profileActive: boolean;
-  /** 快照管理当前查看的目标应用：TraeWork=TRAE SOLO CN / Trae=Trae CN IDE（F-03 参数化） */
-  profileApp: 'TraeWork' | 'Trae';
-  /** 本机两个 Trae 应用当前登录账号的套餐信息（storage.json 明文，零 API） */
-  localEntitlement: LocalEntitlement | null;
   /** 全局 API 管理弹窗（unified-api-gateway-design §5.2；任意 activeApp 视图均可打开） */
   showApiManager: boolean;
 
   init: () => Promise<void>;
+  /** 登录成功后调用：注册 SSE 监听 + 全量刷新数据 */
+  afterLogin: () => Promise<void>;
+  /** 会话失效/登出：断开监听、清空数据、回登录页 */
+  resetAuth: () => void;
   setView: (v: ViewKey) => void;
   /** 切换侧边栏应用 Tab，并跳到该应用默认首页 */
   setActiveApp: (app: AppKey) => void;
   applyCheckinEvent: (e: CheckinProgressEvent) => void;
 
-  refreshEnv: () => Promise<void>;
-  refreshCert: () => Promise<void>;
-  refreshProxy: () => Promise<void>;
-  refreshApiStatus: () => Promise<void>;
   refreshAccounts: () => Promise<void>;
   refreshGroups: () => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshLogs: (q?: LogQuery, manual?: boolean) => Promise<void>;
-  refreshCreditsHistory: () => Promise<void>;
   refreshCreditsDaily: () => Promise<void>;
-  refreshProfiles: () => Promise<void>;
-  setProfileApp: (app: 'TraeWork' | 'Trae') => Promise<void>;
-  refreshLocalEntitlement: () => Promise<void>;
   setShowApiManager: (v: boolean) => void;
 
-  startProxy: () => Promise<void>;
-  stopProxy: () => Promise<void>;
-  openTraeWithProxy: () => Promise<void>;
-  openTraeCn: () => Promise<void>;
   addAccount: (name: string, jwt: string, groupId?: string) => Promise<void>;
   deleteAccount: (userId: string, deleteProfile: boolean) => Promise<void>;
   updateAccount: (userId: string, name?: string, jwt?: string) => Promise<void>;
@@ -125,13 +90,6 @@ interface AppState {
   ) => Promise<void>;
   removeGroup: (id: string) => Promise<void>;
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
-  resetDevice: (userId: string) => Promise<void>;
-  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') => Promise<void>;
-  /** C1：一键以账号 X 打开豆包（恢复快照后拉起客户端；代理运行中时注入代理） */
-  openDoubaoAs: (userId: string, proxyPort?: number) => Promise<void>;
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') => Promise<void>;
-  renewJwt: (userId: string) => Promise<void>;
-  resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
   startCheckin: (opts: {
     scope: string;
     user_ids?: string[];
@@ -142,9 +100,6 @@ interface AppState {
   cooldownClear: (userId: string) => Promise<void>;
   refreshJwt: (userId: string, force?: boolean) => Promise<void>;
   saveSettings: (patch: Partial<Settings>) => Promise<void>;
-  profileBackup: (userId: string) => Promise<void>;
-  profileRestore: (userId: string) => Promise<void>;
-  profileDelete: (userId: string) => Promise<void>;
   oauthLogin: (callbackUrl: string, accountName?: string, groupId?: string) => Promise<void>;
 
   pushToast: (kind: ToastKind, msg: string) => void;
@@ -152,10 +107,12 @@ interface AppState {
 }
 
 let toastSeq = 0;
-// 已注册的事件监听取消函数；StrictMode 下 init 会执行两次，靠它先注销旧监听避免重复注册
+// 已注册的事件监听取消函数；重复注册前先注销旧监听避免重复
 let unsubs: Array<() => void> = [];
 /** init 幂等锁：StrictMode 双跑（dev）时第二次调用直接返回，防并发双注册监听 */
 let initStarted = false;
+/** 全局 401 拦截是否已绑定（绑定一次即可） */
+let unauthorizedBound = false;
 
 function defaultSettings(): Settings {
   return {
@@ -199,159 +156,73 @@ let lastLogsErrToastAt = 0;
 
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
+  authed: false,
   view: 'dashboard',
   activeApp: 'trae',
-  env: null,
-  envCn: null,
-  certInstalled: false,
-  proxy: { running: false, port: 0, captured: 0, started_at: null },
-  apiStatus: null,
   accounts: [],
   groups: [],
   settings: null,
   logs: [],
-  creditsHistory: [],
   creditsDaily: [],
-  proxyLog: [],
-  switchProgress: [],
-  switchingTo: null,
-  saveLoginProgress: [],
-  savingLogin: null,
-  deviceResetProgress: [],
-  deviceResetActive: false,
   checkin: { active: false, total: 0, index: 0, results: [], done: null, retry: null },
   toasts: [],
-  profiles: [],
-  profileProgress: [],
-  profileActive: false,
-  profileApp: 'TraeWork',
-  localEntitlement: null,
   showApiManager: false,
 
   init: async () => {
-    // StrictMode 下 effect 会执行两次（dev）：两次 init 同步并发启动，旧的「先注销旧监听」
-    // 防护在 setupListeners resolve 前执行时注销不到任何东西，两组监听都会注册成功，
-    // 且后者覆盖 unsubs → 第一组永久泄漏、事件双发（proxy-log 重复、captured +2）。
-    // 幂等锁：仅首次执行注册，后续调用直接复用（审查修复 P1-16）
+    // StrictMode 下 effect 会执行两次（dev）：幂等锁保证监听只注册一次（审查修复 P1-16）
     if (initStarted) return;
     initStarted = true;
+    // 全局 401 拦截：任一命令返回未登录 → 清理本地会话状态回登录页
+    if (!unauthorizedBound) {
+      unauthorizedBound = true;
+      window.addEventListener(UNAUTHORIZED_EVENT, () => get().resetAuth());
+    }
+    // 登录探测：settings_get 需鉴权，401 → 停在登录页等待用户输入 token
+    try {
+      const settings = await api.misc.settingsGet();
+      // notify 归一化：旧版本/数据迁移可能存入非枚举脏值（如空串），统一收敛为合法值
+      const validNotify = ['toast', 'system', 'both', 'none'];
+      if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
+      set({ settings, authed: true });
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        set({ authed: false, ready: true });
+        return;
+      }
+      // 非 401（网络/服务异常）：仍进入主界面，由各页面 toast 呈现具体错误
+      set({ settings: get().settings ?? defaultSettings(), authed: true });
+    }
+    await get().afterLogin();
+  },
+
+  afterLogin: async () => {
+    // 重登录场景：先注销旧监听再注册，避免 SSE 双订阅
+    unsubs.forEach((fn) => fn());
+    unsubs = [];
     unsubs = await setupListeners({
-      onProxyLog: (line) =>
-        set((s) => ({ proxyLog: [line, ...s.proxyLog.slice(0, 199)] })),
-      onAccountCaptured: (uid) => {
-        // 事件驱动累加捕获数（后端 Arc<AtomicI64> 的实时镜像，避免轮询）
-        set((s) => ({ proxy: { ...s.proxy, captured: s.proxy.captured + 1 } }));
-        get().pushToast('success', `已捕获账号 ${uid}`);
-        void get().refreshAccounts();
-      },
       onCheckinProgress: (e) => get().applyCheckinEvent(e),
-      onSwitchProgress: (line) =>
-        set((s) => ({ switchProgress: [...s.switchProgress.slice(-49), line] })),
-      // D2：订阅后端 switch-done，给用户明确的切换完成/失败信号
-      onSwitchDone: (e) => {
-        // 提取脚本 [fatal] 行的原文（如「目标账号 xxx 无快照，请先登录该账号并点击保存当前登录态」）
-        // raw 兜底空串：后端偶发缺 payload 时避免 TypeError 把 switchingTo 永久锁死
-        const raw = e.raw ?? '';
-        const reason = e.success ? null : (raw.match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
-        // verify 超时（authfile 布局）：切换动作完成但登录身份未确认 → warn 而非 success，
-        // 避免「切换成功」toast 掩盖客户端未登录的事实（switcher.log 实测 4/4 超时）
-        const warnUnconfirmed = e.success && /未确认登录身份/.test(raw);
-        const doneLine = warnUnconfirmed
-          ? '[警告] 已切换，但 30 秒内未确认登录身份，请打开客户端核实'
-          : e.success
-            ? '[完成] 登录态切换成功'
-            : `[失败] ${reason ?? '登录态切换未完成，请查看日志'}`;
-        set((s) => ({
-          switchingTo: null,
-          switchProgress: [...s.switchProgress.slice(-49), doneLine],
-        }));
-        get().pushToast(
-          warnUnconfirmed ? 'warn' : e.success ? 'success' : 'error',
-          warnUnconfirmed
-            ? '已执行切换，但 30 秒内未确认登录身份——请打开客户端核实；若未登录，请重新登录后「保存当前登录态」'
-            : e.success
-              ? '登录态切换完成'
-              : `切换失败：${reason ?? '请查看系统日志'}`,
-        );
-        void get().refreshAccounts();
-        void get().refreshProxy();
-        // 登录中徽标（localEntitlement）刷新：切换完成后本机登录 uid 已变，
-        // 立即刷新一次；客户端启动写入本机使用证据需数秒，延迟再刷一次兜底
-        void get().refreshLocalEntitlement();
-        setTimeout(() => void get().refreshLocalEntitlement(), 8000);
-      },
-      onSaveLoginProgress: (line) =>
-        set((s) => ({ saveLoginProgress: [...s.saveLoginProgress.slice(-49), line] })),
-      onSaveLoginDone: (e: SaveLoginDoneEvent) => {
-        // 同上：raw 缺失时兜底空串，避免 savingLogin 被锁死
-        const reason = e.success ? null : ((e.raw ?? '').match(/\[fatal\]\s*(.+)$/)?.[1]?.trim() ?? null);
-        set((s) => ({
-          savingLogin: null,
-          saveLoginProgress: [
-            ...s.saveLoginProgress.slice(-49),
-            e.success ? '[完成] 登录态保存成功' : `[失败] ${reason ?? '登录态保存失败，请查看日志'}`,
-          ],
-        }));
-        get().pushToast(
-          e.success ? 'success' : 'error',
-          e.success ? '登录态已保存，可随时切换回此账号' : `保存失败：${reason ?? '请查看系统日志'}`,
-        );
-        void get().refreshProfiles();
-      },
-      onDeviceResetProgress: (line) =>
-        set((s) => ({ deviceResetProgress: [...s.deviceResetProgress.slice(-99), line] })),
-      onDeviceResetDone: (e) => {
-        set((s) => ({
-          deviceResetActive: false,
-          deviceResetProgress: [
-            ...s.deviceResetProgress.slice(-99),
-            e.success ? '[完成] 6 层设备标识重置成功' : '[失败] 设备标识重置未完成，请查看日志',
-          ],
-        }));
-        get().pushToast(
-          e.success ? 'success' : 'error',
-          e.success ? '6 层设备标识重置完成' : '设备标识重置失败，请查看日志',
-        );
-      },
-      onProfileProgress: (line) =>
-        set((s) => ({ profileProgress: [...s.profileProgress.slice(-49), line] })),
-      onProfileDone: (e: ProfileDoneEvent) => {
-        set((s) => ({
-          profileActive: false,
-          profileProgress: [
-            ...s.profileProgress.slice(-49),
-            e.success ? `[完成] ${e.action === 'backup' ? '备份' : '恢复'}成功` : `[失败] ${e.action === 'backup' ? '备份' : '恢复'}失败`,
-          ],
-        }));
-        get().pushToast(
-          e.success ? 'success' : 'error',
-          e.success
-            ? `登录态${e.action === 'backup' ? '备份' : '恢复'}完成`
-            : `登录态${e.action === 'backup' ? '备份' : '恢复'}失败`,
-        );
-        void get().refreshProfiles();
-      },
     });
     await Promise.all([
-      get().refreshEnv(),
-      get().refreshCert(),
-      get().refreshProxy(),
-      get().refreshApiStatus(),
       get().refreshAccounts(),
       get().refreshGroups(),
       get().refreshSettings(),
-      get().refreshCreditsHistory(),
       get().refreshCreditsDaily(),
-      get().refreshProfiles(),
-      get().refreshLocalEntitlement(),
     ]);
     set({ ready: true });
+  },
 
-    // 启动时根据设置自动开启代理
-    const s = get();
-    if (!s.proxy.running && s.settings?.auto_start_proxy) {
-      void s.startProxy();
-    }
+  resetAuth: () => {
+    unsubs.forEach((fn) => fn());
+    unsubs = [];
+    // 保留 ready 与主题等本地态；数据清空防止串号
+    set({
+      authed: false,
+      accounts: [],
+      groups: [],
+      logs: [],
+      creditsDaily: [],
+      checkin: { active: false, total: 0, index: 0, results: [], done: null, retry: null },
+    });
   },
 
   setView: (v) => set({ view: v }),
@@ -361,8 +232,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   applyCheckinEvent: (e) => {
     set((s) => {
       if (e.type === 'start') {
-        // Rust 侧 start 带 scope 内全集清单（候选 pending / 跳过带原因 / 重试轮沿用上轮状态），
-        // 重建列表使被跳过的账号也可见；Python 转发的 start（无 accounts）仅同步候选总数
+        // start 带 scope 内全集清单（候选 pending / 跳过带原因 / 重试轮沿用上轮状态），
+        // 重建列表使被跳过的账号也可见；无 accounts 时仅同步候选总数
         if (e.accounts) {
           return {
             checkin: {
@@ -381,7 +252,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             },
           };
         }
-        // Python 转发的 start（无 accounts）同样重置进度与旧结果，避免上一轮残留干扰本轮展示
+        // 无 accounts 的 start 同样重置进度与旧结果，避免上一轮残留干扰本轮展示
         return { checkin: { ...s.checkin, active: true, total: e.total, index: 0, results: [], done: null } };
       }
       if (e.type === 'retry') {
@@ -427,8 +298,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
     if (e.type === 'done') {
       void get().refreshAccounts();
-      // JWT 吊销类失败的精确提示（issue #9）：401=服务端已吊销 JWT，重新登录+保存即可恢复，
-      // 不再让用户面对笼统的「失败 N」自己摸索原因
+      // JWT 吊销类失败的精确提示（issue #9）：401=服务端已吊销 JWT，重新 OAuth 录入即可恢复
       const deadCount = get().checkin.results.filter(
         (r) => r?.status === 'fail' && r.error_type === 'SessionDead',
       ).length;
@@ -447,51 +317,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (deadCount > 0) {
         get().pushToast(
           'error',
-          `${deadCount} 个账号 JWT 已被服务端吊销（该账号在别处重新登录/IDE 内退出过登录）：请在 TRAE 中重新登录该账号并「保存当前登录态」，再点「续期 JWT」重新捕获`,
+          `${deadCount} 个账号 JWT 已被服务端吊销（该账号在别处重新登录/IDE 内退出过登录）：请在账号管理页对该账号重新执行 OAuth 登录录入`,
         );
       }
     }
   },
 
-  refreshEnv: async () => {
-    try {
-      const env = await api.env.check();
-      set({ env });
-    } catch (err) {
-      get().pushToast('error', `环境检测失败：${String(err)}`);
-    }
-    // Trae CN IDE 环境检测（独立应用，失败不影响主检测）
-    try {
-      const envCn = await api.env.checkCn();
-      set({ envCn });
-    } catch {
-      set({ envCn: null });
-    }
-  },
-  refreshCert: async () => {
-    try {
-      const r = await api.cert.status();
-      set({ certInstalled: r.installed });
-    } catch {
-      /* ignore */
-    }
-  },
-  refreshProxy: async () => {
-    try {
-      const proxy = await api.proxy.status();
-      set({ proxy });
-    } catch {
-      /* ignore */
-    }
-  },
-  refreshApiStatus: async () => {
-    try {
-      const s = await api.apiServer.status();
-      set({ apiStatus: s });
-    } catch {
-      set({ apiStatus: null });
-    }
-  },
   refreshAccounts: async () => {
     try {
       const accounts = await api.accounts.list();
@@ -511,8 +342,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   refreshSettings: async () => {
     try {
       const settings = await api.misc.settingsGet();
-      // notify 归一化：旧版本/数据迁移可能存入非枚举脏值（如空串），统一收敛为
-      // 合法值，保证设置页下拉正确回显、pushToast 不再走兼容分支
       const validNotify = ['toast', 'system', 'both', 'none'];
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
       set({ settings });
@@ -545,14 +374,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       logsPollInflight = false;
     }
   },
-  refreshCreditsHistory: async () => {
-    try {
-      const creditsHistory = await api.misc.creditsHistory();
-      set({ creditsHistory });
-    } catch (err) {
-      get().pushToast('error', `读取积分历史失败：${String(err)}`);
-    }
-  },
   refreshCreditsDaily: async () => {
     try {
       const creditsDaily = await api.accounts.dailyList();
@@ -562,85 +383,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  startProxy: async () => {
-    const port = get().settings?.proxy_port || 8899;
-    try {
-      const proxy = await api.proxy.start(port);
-      set({ proxy, proxyLog: [] });
-      get().pushToast('success', `代理已启动（端口 ${proxy.port}）`);
-    } catch (err) {
-      get().pushToast('error', `启动代理失败：${String(err)}`);
-    }
-  },
-  stopProxy: async () => {
-    try {
-      const proxy = await api.proxy.stop();
-      set({ proxy });
-      get().pushToast('info', '代理已停止');
-    } catch (err) {
-      get().pushToast('error', `停止代理失败：${String(err)}`);
-    }
-  },
-  openTraeWithProxy: async () => {
-    const env = get().env;
-    if (!env?.installed) {
-      get().pushToast('info', '未检测到 Trae Work 安装，正在打开下载页…');
-      try {
-        await api.env.openSite();
-      } catch (err) {
-        get().pushToast('error', `打开下载页失败：${String(err)}`);
-      }
-      return;
-    }
-    // 确保代理在请求路径上：未运行则先启动，否则打开 Trae Work 也不会走代理、无法捕获账号
-    let port: number | undefined = get().proxy.running ? get().proxy.port : undefined;
-    if (!port) {
-      // 可能残留端口为 0 的无效代理，先停掉再以有效端口重启
-      if (get().proxy.running) {
-        try { await get().stopProxy(); } catch { /* ignore */ }
-      }
-      get().pushToast('info', '正在启动代理以确保 Trae Work 走本地代理…');
-      await get().startProxy();
-      port = get().proxy.running ? get().proxy.port : undefined;
-    }
-    try {
-      if (port) {
-        await api.env.openApp(port);
-        get().pushToast('success', `已打开 Trae Work（代理已注入 127.0.0.1:${port}）`);
-      } else {
-        // 代理启动失败：仍打开客户端，但明确告知不会捕获账号
-        await api.env.openApp(undefined);
-        get().pushToast('warn', '代理启动失败，已直接打开 Trae Work（账号不会被自动捕获）');
-      }
-    } catch (err) {
-      get().pushToast('error', `打开 Trae Work 失败：${String(err)}`);
-    }
-  },
-  openTraeCn: async () => {
-    // 与 openTraeWithProxy 同款逻辑：先确保代理在运行并注入，Trae 的流量才走本地 MITM 代理
-    let port: number | undefined = get().proxy.running ? get().proxy.port : undefined;
-    if (!port) {
-      // 可能残留端口为 0 的无效代理，先停掉再以有效端口重启
-      if (get().proxy.running) {
-        try { await get().stopProxy(); } catch { /* ignore */ }
-      }
-      get().pushToast('info', '正在启动代理以确保 Trae 走本地代理…');
-      await get().startProxy();
-      port = get().proxy.running ? get().proxy.port : undefined;
-    }
-    try {
-      if (port) {
-        await api.env.openCnApp(port);
-        get().pushToast('success', `已打开 Trae（代理已注入 127.0.0.1:${port}）`);
-      } else {
-        // 代理启动失败：仍打开客户端，但明确告知不走代理
-        await api.env.openCnApp(undefined);
-        get().pushToast('warn', '代理启动失败，已直接打开 Trae（流量不会经过本地代理）');
-      }
-    } catch (err) {
-      get().pushToast('error', `打开 Trae 失败：${String(err)}`);
-    }
-  },
   addAccount: async (name, jwt, groupId) => {
     try {
       await api.accounts.addManual(name, jwt, groupId);
@@ -705,72 +447,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `移动分组失败：${String(err)}`);
     }
   },
-  resetDevice: async (userId) => {
-    try {
-      await api.misc.deviceReset(userId);
-      await get().refreshAccounts();
-      get().pushToast('success', '设备 ID 已重置');
-    } catch (err) {
-      get().pushToast('error', `重置失败：${String(err)}`);
-    }
-  },
-  switchTo: async (userId, targetApp) => {
-    try {
-      set({ switchingTo: userId, switchProgress: [] });
-      // withMinDelay：切换是高风险操作，保证 busy 态至少可见 1s（避免瞬间完成导致闪烁/误触连点）
-      await withMinDelay(api.switchAccount(userId, targetApp));
-      // 应用名后缀：TraeWork 静默；其余应用标注目标（Trae→Trae、WorkBuddy→WorkBuddy、Doubao→Doubao、CodeBuddy→CodeBuddy）
-      get().pushToast('info', `正在切换登录态${targetApp && targetApp !== 'TraeWork' ? `（${targetApp === 'CodeBuddy' ? 'CodeBuddy' : targetApp}）` : ''}，请稍候…`);
-    } catch (err) {
-      set({ switchingTo: null });
-      get().pushToast('error', `切换失败：${String(err)}`);
-    }
-  },
-  saveCurrentLogin: async (userId, targetApp) => {
-    try {
-      set({ savingLogin: userId, saveLoginProgress: [] });
-      await api.saveCurrentLogin(userId, targetApp);
-      get().pushToast('info', '正在保存当前登录态，请稍候…');
-    } catch (err) {
-      set({ savingLogin: null });
-      get().pushToast('error', `保存登录态失败：${String(err)}`);
-    }
-  },
-  openDoubaoAs: async (userId, proxyPort) => {
-    try {
-      set({ switchingTo: userId, switchProgress: [] });
-      await withMinDelay(api.doubao.openAs(userId, proxyPort));
-      get().pushToast('info', `正在恢复账号 ${userId} 的快照并启动豆包，请稍候…`);
-    } catch (err) {
-      set({ switchingTo: null });
-      get().pushToast('error', `以账号打开失败：${String(err)}`);
-    }
-  },
-  renewJwt: async (userId) => {
-    try {
-      // 若代理未运行则先启动
-      if (!get().proxy.running) {
-        get().pushToast('info', '正在启动代理以续期 JWT…');
-        await get().startProxy();
-      }
-      // 切换到目标账号，TRAE 重启后走代理，新 JWT 会被自动捕获
-      // skipJwtProbe=true：续期场景目标账号 JWT 本就可能已被服务端吊销，跳过切换前预检
-      get().pushToast('info', '正在切换账号以捕获新 JWT，请稍候…');
-      await api.switchAccount(userId, undefined, true);
-    } catch (err) {
-      get().pushToast('error', `续期失败：${String(err)}`);
-    }
-  },
-  resetDeviceIds: async (targetApp) => {
-    set({ deviceResetActive: true, deviceResetProgress: [] });
-    try {
-      await api.resetDeviceIds(targetApp);
-      get().pushToast('info', `正在执行 6 层设备标识重置（${targetApp === 'Trae' ? 'Trae' : 'Trae Work'}）…`);
-    } catch (err) {
-      set({ deviceResetActive: false });
-      get().pushToast('error', `设备标识重置失败：${String(err)}`);
-    }
-  },
   startCheckin: async (opts) => {
     // 重置签到状态，避免显示上一次的进度
     set({ checkin: { active: true, total: 0, index: 0, results: [], done: null, retry: null } });
@@ -830,56 +506,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       throw err;
     }
   },
-
-  refreshProfiles: async () => {
-    try {
-      const profiles = await api.profiles.list(get().profileApp);
-      set({ profiles });
-    } catch {
-      /* ignore */
-    }
-  },
-  setProfileApp: async (app) => {
-    set({ profileApp: app, profiles: [] });
-    await get().refreshProfiles();
-  },
-  refreshLocalEntitlement: async () => {
-    try {
-      const localEntitlement = await api.traeApps.localEntitlement();
-      set({ localEntitlement });
-    } catch {
-      /* ignore */
-    }
-  },
-  profileBackup: async (userId) => {
-    set({ profileActive: true, profileProgress: [] });
-    try {
-      await api.profiles.backup(userId, get().profileApp);
-      get().pushToast('info', '正在备份登录态快照…');
-    } catch (err) {
-      set({ profileActive: false });
-      get().pushToast('error', `备份失败：${String(err)}`);
-    }
-  },
-  profileRestore: async (userId) => {
-    set({ profileActive: true, profileProgress: [] });
-    try {
-      await api.profiles.restore(userId, get().profileApp);
-      get().pushToast('info', '正在恢复登录态快照…');
-    } catch (err) {
-      set({ profileActive: false });
-      get().pushToast('error', `恢复失败：${String(err)}`);
-    }
-  },
-  profileDelete: async (userId) => {
-    try {
-      await api.profiles.delete(userId, get().profileApp);
-      await get().refreshProfiles();
-      get().pushToast('info', '快照已删除');
-    } catch (err) {
-      get().pushToast('error', `删除失败：${String(err)}`);
-    }
-  },
   oauthLogin: async (callbackUrl, accountName, groupId) => {
     try {
       const result = await api.oauth.login(callbackUrl, accountName, groupId);
@@ -892,27 +518,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   pushToast: (kind, msg) => {
-    // 通知方式兼容：仅 'none'/'system' 有特殊语义，其余值（含历史脏数据如中文标签）
-    // 一律按应用内 toast 处理，避免非枚举值把提示静默吞掉（表现为「点了没任何反应」）
+    // Web 版仅应用内 Toast；notify='none' 保留静默语义
     const mode = get().settings?.notify ?? 'toast';
-    if (mode !== 'none' && mode !== 'system') {
-      if (mode !== 'toast' && mode !== 'both') {
-        console.info('[notify] 未知通知方式，已按 toast 处理:', mode);
-      }
-      const id = ++toastSeq;
-      set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }));
-      setTimeout(() => get().dismissToast(id), 4200);
-    }
-
-    if (mode === 'system' || mode === 'both') {
-      // sendNotification v2 返回 void（fire-and-forget），用 try-catch 防御同步异常
-      try {
-        sendNotification({ title: APP_NAME, body: msg });
-        console.info('[notify] 系统通知已发送:', msg);
-      } catch (e) {
-        console.warn('[notify] sendNotification 异常:', e);
-      }
-    }
+    if (mode === 'none') return;
+    const id = ++toastSeq;
+    set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }));
+    setTimeout(() => get().dismissToast(id), 4200);
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 }));

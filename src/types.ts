@@ -9,10 +9,6 @@ export type ViewKey =
   | 'logs'
   | 'api-service'
   | 'settings'
-  // 豆包应用页面（侧边栏应用切换 Tab → 豆包）
-  | 'doubao-overview'
-  | 'doubao-accounts'
-  | 'doubao-settings'
   // Buddy 应用页面（侧边栏应用切换 Tab → Buddy，批次1）
   | 'buddy-overview'
   | 'buddy-accounts'
@@ -21,30 +17,15 @@ export type ViewKey =
   | 'buddy-api-service'
   | 'buddy-settings';
 
-/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy 批次1接入 / 豆包 接入中 */
-export type AppKey = 'trae' | 'buddy' | 'doubao';
+/** 侧边栏应用切换（左下角 Tab）：Trae 菜单 / Buddy 菜单 */
+export type AppKey = 'trae' | 'buddy';
 
 /** 各应用的默认落地页 */
 export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
   trae: 'dashboard',
   buddy: 'buddy-overview',
-  doubao: 'doubao-overview',
 };
 
-
-export interface EnvStatus {
-  installed: boolean;
-  running: boolean;
-  version: string | null;
-  path: string | null;
-}
-
-export interface ProxyStatus {
-  running: boolean;
-  port: number;
-  captured: number;
-  started_at: number | null;
-}
 
 export interface AccountView {
   user_id: string;
@@ -85,36 +66,6 @@ export interface AccountView {
   auth_saved_at?: string | null;
 }
 
-// ---- 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----
-export interface UsageDayStat {
-  /** 本地自然日 YYYY-MM-DD */
-  date: string;
-  credits: number;
-  sessions: number;
-  /** 模型 → 当日消耗积分 */
-  models: Record<string, number>;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-}
-
-export interface UsageHistoryAccount {
-  user_id: string;
-  name: string;
-  ok: boolean;
-  /** 本次增量拉取失败但已沿用缓存时的说明；ok=false 时为失败/未拉取原因 */
-  error: string | null;
-  /** 按日期升序（缓存中全部历史） */
-  daily: UsageDayStat[];
-}
-
-export interface UsageHistoryResult {
-  fetched_at: number;
-  /** true = 纯缓存读取（未发起网络请求） */
-  cached: boolean;
-  accounts: UsageHistoryAccount[];
-}
-
 // ---- F-08 双应用账号自动发现 ----
 /** 账号导入结果报告 */
 export interface ImportReport {
@@ -149,48 +100,6 @@ export interface ImportPreview {
   accounts: ImportPreviewAccount[];
   /** 将新增的分组 */
   new_groups: { id: string; name: string; color: string; order: number }[];
-}
-
-// ---- F-01 安装位置自动识别（跨应用通用三级探测）----
-export interface AppLocate {
-  app: string;
-  exe: string | null;
-  user_data_dir: string;
-  version: string | null;
-  /** settings | registry | default | process | not_found */
-  source: string;
-}
-
-
-export interface DiscoveredAccount {
-  user_id: string;
-  /** 账户中心（dc）uid —— 与账号池 Cloud-IDE id 体系不同，仅诊断展示 */
-  dc_uid?: string | null;
-  /** Cloud-IDE uid 是否经本机使用证据确认（false 时 user_id 实为 dc uid，不可入池） */
-  uid_confident: boolean;
-  /** TraeWork | Trae */
-  app: string;
-  app_label: string;
-  in_pool: boolean;
-  storage_path: string;
-}
-
-// ---- Trae 会员/套餐信息 ----
-export interface AppEntitlement {
-  app: string;
-  app_label: string;
-  /** 当前登录账号的 Cloud-IDE uid（本机使用证据推导；未登录/推导失败为 null） */
-  uid?: string | null;
-  /** 账号池中匹配的展示名（未入池/未匹配为 null） */
-  account_name?: string | null;
-  identity_str: string | null;
-  identity: number | null;
-  last_sync_time: number | null;
-}
-
-export interface LocalEntitlement {
-  work: AppEntitlement | null;
-  cn: AppEntitlement | null;
 }
 
 /** 积分明细条目（仅剩余 > 0 且未过期的积分包） */
@@ -276,8 +185,58 @@ export interface Settings {
   buddy_switch_migrate_chats: boolean;
 }
 
-/** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */
-export type BuddyChatApp = 'WorkBuddy' | 'CodeBuddy';
+/** 通知渠道配置（Phase 3 T11：Bark / Server酱 / 通用 webhook，独立 kv） */
+export interface NotifyConfig {
+  /** 总开关：关闭时一切通知静默 */
+  enabled: boolean;
+  /** Bark 推送地址（形如 https://api.day.app/<key>），null = 未配置 */
+  bark_url: string | null;
+  /** Server酱 SendKey，null = 未配置 */
+  serverchan_sendkey: string | null;
+  /** 通用 webhook 地址（POST JSON），null = 未配置 */
+  webhook_url: string | null;
+  /** 签到完成时通知 */
+  on_checkin_done: boolean;
+  /** 调度任务失败时通知 */
+  on_task_failed: boolean;
+}
+
+/** IP 允许列表配置（Phase 3 T12a：应用层访问控制，独立 kv） */
+export interface IpAllowlistConfig {
+  /** 总开关：关闭时所有来源放行 */
+  enabled: boolean;
+  /** 反代信任：开启后取 X-Real-IP / X-Forwarded-For 首项作为客户端 IP；直连部署必须关闭 */
+  trust_proxy: boolean;
+  /** 允许的 CIDR/IP 条目（如 192.168.1.0/24、10.0.0.5）；回环地址始终放行 */
+  cidrs: string[];
+}
+
+/** 附加管理员令牌完整条目（T12b；token 明文仅创建响应返回一次） */
+export interface AdminTokenEntry {
+  id: string;
+  token: string;
+  label: string;
+  /** 创建时间（epoch 毫秒） */
+  created_at: number;
+}
+
+/** 附加管理员令牌列表项（token 掩码显示） */
+export interface AdminTokenView {
+  id: string;
+  token_masked: string;
+  label: string;
+  /** 创建时间（epoch 毫秒） */
+  created_at: number;
+}
+
+/** 通知发送结果：sent = 至少一渠道成功；各渠道 null=未配置 / "ok" / 失败原因 */
+export interface NotifyResult {
+  sent: boolean;
+  reason?: string;
+  bark: string | null;
+  serverchan: string | null;
+  webhook: string | null;
+}
 
 export interface CheckinOpts {
   scope: string;
@@ -321,46 +280,11 @@ export interface CheckinTrendPoint {
   failed: number;
 }
 
-export interface CreditRecord {
-  date: string;
-  user_id: string;
-  credits: number;
-  delta: number;
-}
-
 export interface CreditsDailySnapshot {
   date: string;
   total: number;
   earned: number;
   consumed: number;
-}
-
-export interface ProxyLogEntry {
-  id: string;
-  timestamp: string;
-  method: string;
-  host: string;
-  path: string;
-  status: string;
-  size: number;
-  sse_model?: string;
-  sse_tokens?: string;
-}
-
-export interface ProxyLogListResult {
-  entries: ProxyLogEntry[];
-  total: number;
-}
-
-export interface ApiServiceStatus {
-  running: boolean;
-  port: number;
-  total_requests: number;
-  active_uid: string | null;
-  last_error: string | null;
-  started_at: number | null;
-  /** 当前并发数（统一网关 §4.5；可选：后端 Tauri 状态命令补齐前缺省 0） */
-  inflight?: number;
 }
 
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
@@ -497,17 +421,6 @@ export interface ApiPoolFile {
   wb_sticky_ttl_secs?: number;
 }
 
-/** CC Switch 协同状态（T5.7/F-43） */
-export interface CcSwitchStatus {
-  installed: boolean;
-  dbPath: string;
-  claudeRegistered: boolean;
-  codexRegistered: boolean;
-  /** WB 侧条目（aiwork-wb-gateway-*）注册状态，与 Trae 侧互不覆盖 */
-  wbClaudeRegistered: boolean;
-  wbCodexRegistered: boolean;
-}
-
 /** 用量统计计数（按模型/账号/Key 维度，T1） */
 export interface UsageCounterView {
   name: string;
@@ -586,159 +499,11 @@ export interface ApiKeyDailyStat {
   requests: number;
 }
 
-// ---- 登录态快照 ----
-export interface ProfileInfo {
-  slot: string;
-  size_bytes: number;
-  file_count: number;
-  last_modified: string;
-}
-
-// ---- 豆包账号池（P2：快照槽 + 别名元数据合并视图，对应 Rust doubao.rs DoubaoAccountView）----
-export interface DoubaoAccountView {
-  user_id: string;
-  name: string;
-  note: string;
-  has_snapshot: boolean;
-  size_bytes: number;
-  file_count: number;
-  last_modified: string;
-  is_current: boolean;
-  added_at: string | null;
-  /** 会话状态（P3）：ok=有效 / expired=已过期 / unknown=未探活 / none=无 sessionid */
-  session_state: 'ok' | 'expired' | 'unknown' | 'none';
-  /** 明文 sessionid（编辑弹框回填用，仅本地） */
-  session_id: string | null;
-  /** sid_guard 原文（编辑弹框回填用） */
-  sid_guard: string | null;
-  /** ttwid 设备 Cookie（对话导出 API 必需；代理抓包或手动录入） */
-  ttwid: string | null;
-  /** 会员等级（null = 免费或未识别；quota_checked_at 非空表示已查询过） */
-  quota_level: string | null;
-  /** 会员到期时间（免费账号为 null） */
-  quota_expire_at: string | null;
-  /** 额度状态一句话（如 "图片 80/100 · 视频 3/10"） */
-  quota_summary: string | null;
-  /** 最近一次额度查询时间 */
-  quota_checked_at: string | null;
-  session_expire_at: string | null;
-  cookies_synced_at: string | null;
-  last_renew_at: string | null;
-  session_source: string | null;
-  /** 池级：最近一次 KeepAlive 保活时间（所有行同值） */
-  last_keepalive_at: string | null;
-}
-
-/** 续期巡检摘要 JSON（Rust tasks/doubao_session.rs，原 doubao_renew.py） */
-export interface DoubaoRenewSummary {
-  mode: 'full' | 'diagnose';
-  finished_at: string;
-  renew_url?: string;
-  sync: { synced: number; sources: { source: string; decryptable: boolean; cookies?: string[]; ascii_values?: number; note?: string; detail?: string }[] };
-  renew?: { ok: number; expired: number; error: number; skipped: number };
-  accounts?: { user_id: string; status: string; detail?: string; renewed?: boolean }[];
-  logs?: string[];
-}
-
-/** 豆包切换/保存的目标应用参数（与 switch_account / save_current_login 的 target_app 对齐） */
-export type DoubaoTargetApp = 'Doubao';
-
-/** 代理自动抓到的豆包会话凭证（代理 MITM 层写 doubao_captured_credentials.json，Rust doubao.rs 透传） */
-export interface DoubaoCapturedCredential {
-  session_id: string;
-  sid_guard: string;
-  host: string;
-  captured_at: string;
-  /** ttwid 设备 Cookie（对话导出 API 必需） */
-  ttwid: string;
-}
-
-/** D1：对话数据备份/恢复结果（doubao_chatdata_backup / doubao_chatdata_restore） */
-export interface DoubaoChatdataResult {
-  ok: boolean;
-  files: number;
-  /** 备份目录（仅 backup 返回） */
-  path?: string;
-}
-
-/** D1：对话数据备份状态（doubao_chatdata_info） */
-export interface DoubaoChatdataInfo {
-  backed: boolean;
-  files?: number;
-  size_bytes?: number;
-  backed_at?: string | null;
-}
-
-/** D2：对话记录导出结果（Rust tasks/doubao_chats.rs，原 doubao_chats.py stdout 末行 JSON） */
-export interface DoubaoExportResult {
-  ok: boolean;
-  conversations: number;
-  messages: number;
-  md_path: string;
-  json_path: string;
-}
-
-/** 会员额度查询摘要 JSON（字段由宽容解析尽力得到，均可为 null） */
-export interface DoubaoQuotaResult {
-  ok: boolean;
-  http_status: number;
-  url: string;
-  user_id: string;
-  parsed: {
-    level: string | number | null;
-    expire_at: string | null;
-    is_gift?: boolean | null;
-    has_subscription?: boolean | null;
-    /** 订阅记录（对齐客户端「订阅记录」页；免费账号为 null） */
-    subscription: {
-      name: string | null;
-      period_days: number | null;
-      start_at: string | null;
-      expire_at: string | null;
-      is_gift: boolean | null;
-      active: boolean;
-    } | null;
-    items: (
-      | { name: string; total: string | number; left: string | number | null; used: string | number | null }
-      | { name: string; used_percent: number; exhausted: boolean; reset_at: string | null }
-    )[];
-  };
-  finished_at?: string;
-}
-
-/** 豆包运维历史事件（keepalive/renew/quota；doubao_health_history.json） */
-export interface DoubaoHistoryEvent {
-  ts: string;
-  kind: 'keepalive' | 'renew' | 'quota';
-  ok: boolean;
-  uid?: string;
-  level?: string | null;
-  summary?: string | null;
-  windows?: { name: string; used_percent: number; reset_at: string }[];
-  source?: string;
-}
-
-/** 豆包快照版本元数据（C3：snapshot_meta.json + Last Version；schema_version 0 = 旧版快照无元数据） */
-export interface DoubaoSnapshotMeta {
-  schema_version: number;
-  created_at: string;
-  chromium_version: string;
-  include_idb: boolean;
-}
-
 // ---- OAuth 登录 ----
 export interface OAuthLoginUrl {
   url: string;
   state: string;
   redirect_uri: string;
-}
-
-export interface OAuthCallbackInfo {
-  refresh_token: string;
-  access_token: string | null;
-  user_id: string | null;
-  user_name: string | null;
-  avatar: string | null;
 }
 
 export interface OAuthLoginResult {
@@ -749,48 +514,11 @@ export interface OAuthLoginResult {
   has_refresh_token: boolean;
 }
 
-/** 本机回环监听器落库完成事件（oauth-login-done）负载 */
-export interface OAuthLoginDoneEvent {
-  ok: boolean;
-  message: string;
-  /** 登录成功时的账号备注名 */
-  account: string | null;
-  /** 登录成功时的 user_id */
-  user_id: string | null;
-}
-
-// ---- 应用自更新 ----
-export interface UpdateCheckResult {
-  has_update: boolean;
-  current_version: string;
-  latest_version: string;
-  asset_name: string;
-  download_url: string;
-  size: number;
-  release_page: string;
-  // 发布方提供的安装包 SHA256（release 正文约定行；旧版本无此行时缺省，跳过校验）
-  sha256?: string | null;
-}
-
 // API Key 数据文件视图（api_keys_list 返回：列表 + 鉴权开关）
 export interface ApiKeysFileView {
   keys: ApiKeyEntry[];
   // 显式关闭鉴权：仅当无启用 Key 时生效（true=放行，默认 false=拒绝）
   auth_disabled: boolean;
-}
-
-export interface UpdateDownloadProgress {
-  received: number;
-  total: number;
-  percent: number;
-}
-
-// 下载完成后的安装包信息（update_download 返回，供「确认安装」使用）
-export interface UpdateDownloaded {
-  file_path: string;
-  asset_name: string;
-  size: number;
-  version: string;
 }
 
 // ---- WorkBuddy 账号池（批次1；对应 Rust workbuddy.rs WorkBuddyAccountView）----
@@ -819,31 +547,6 @@ export interface WorkBuddyAccountView {
   is_current_workbuddy: boolean;
   /** CodeBuddy 端当前账号（桥按端写入的 current_account.txt 标记） */
   is_current_codebuddy: boolean;
-}
-
-export interface WorkBuddyEnvCheck {
-  installed: boolean;
-  running: boolean;
-  version: string | null;
-  exe: string | null;
-  /** 实际读取的 auth 文件路径（人工覆盖优先） */
-  auth_file_path: string;
-  auth_file_exists: boolean;
-  data_dir_exists: boolean;
-  snapshot_uid: string | null;
-  snapshot_nickname: string | null;
-  snapshot_edition: string | null;
-}
-
-/** CodeBuddy 桌面环境检测（Buddy 双应用）：exe/进程走 app_locate codebuddy 档案，
- *  uid/昵称解析自与 WorkBuddy 共享的 auth 文件，解析失败/未登录为 null */
-export interface CodeBuddyEnvCheck {
-  installed: boolean;
-  running: boolean;
-  exe: string | null;
-  version: string | null;
-  uid: string | null;
-  nickname: string | null;
 }
 
 export interface WorkBuddyScanResult {
@@ -894,45 +597,6 @@ export interface WbPoolImportResult {
   rejected?: { id: string; reason: string }[];
 }
 
-// ---- CodeBuddy CLI 切号桥（F-06/F-59，批次3；Rust workbuddy_cli.rs + commands）----
-export interface WbCliStatus {
-  settings_present: boolean;
-  env_token_present: boolean;
-  /** 进程环境变量 CODEBUDDY_AUTH_TOKEN 存在（会覆盖 settings.json，需删除） */
-  environment_override: boolean;
-  active_account_id: string | null;
-  active_account_name: string | null;
-  /** CLI 最近会话写入时间（Unix 毫秒；活跃保护数据源） */
-  recent_activity_ms: number | null;
-  last_switch_at_ms: number | null;
-  config: Pick<
-    WorkBuddySettings,
-    | 'cli_rotate_enabled'
-    | 'cli_rotate_interval_minutes'
-    | 'cli_cooldown_minutes'
-    | 'cli_min_gap_hours'
-    | 'cli_min_urgency_hours'
-    | 'cli_active_guard_minutes'
-    | 'cli_min_remaining_credits'
-  >;
-}
-
-export interface WbCliRotateResult {
-  status: 'switched' | 'skipped' | 'error';
-  reason?: string;
-  error?: string;
-  to?: { id: string; name: string };
-}
-
-export interface WbCliRotateLog {
-  ts: number;
-  action: 'noop' | 'skipped' | 'switched' | 'error' | 'manual';
-  reason: string | null;
-  from: string | null;
-  to: { id: string; name: string } | null;
-  detail?: { name: string; remaining: number; soonest_expire_at: number | null; valid: boolean; error: string | null }[];
-}
-
 // ---- OAuth 扫码 + 环境重置（F-50/F-14，批次3）----
 /** OAuth 流程进度事件（wb-oauth-progress） */
 export interface WbOauthProgress {
@@ -947,52 +611,6 @@ export interface WbOauthDone {
   id?: string;
   nickname?: string;
   message: string;
-}
-
-/** 环境重置清单项（F-14：16 项认证残留清理） */
-export interface WbResetItem {
-  id: string;
-  label: string;
-  detail: string;
-  exists: boolean;
-}
-
-/** 环境重置单项执行结果 */
-export interface WbResetResult {
-  id: string;
-  ok: boolean;
-  detail: string;
-}
-
-// ---- 本地 Token 统计 + 官方用量（F-25/26/57/58，批次3）----
-/** 聚合数字组（本地统计各组通用，snake_case 对齐 Rust 输出） */
-export interface WbTokenAgg {
-  total: number;
-  input: number;
-  output: number;
-  cache_read: number;
-  cache_write: number;
-  uncached_input: number;
-  calls: number;
-  cache_hit_rate?: number | null;
-  date?: string;
-  key?: string;
-}
-
-/** 本地 Token 统计（F-26：JSONL 解析合并双源，365 天窗口） */
-export interface WbTokenStats {
-  source: string;
-  summary: WbTokenAgg;
-  models: WbTokenAgg[];
-  projects: WbTokenAgg[];
-  daily: WbTokenAgg[];
-  daily_by_model: Record<string, WbTokenAgg[]>;
-  files_scanned: number;
-  parse_errors: number;
-  coverage_start_at: number | null;
-  coverage_end_at: number | null;
-  generated_at: number;
-  window_days: number;
 }
 
 /** 官方按模型用量点（get-user-request-usage） */

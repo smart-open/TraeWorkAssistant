@@ -1,16 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
 import { CheckCircle2, PlayCircle, Sparkles, XCircle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
-import { api } from '../../lib/tauri';
+import { api, listen } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import type { WbCheckinRecord, WorkBuddyAccountView, WorkBuddySettings } from '../../types';
 
 /**
  * buddy-checkin 签到与成长（§3.7.3，F-15/F-16/F-55）：
  * 签到控制卡（NDJSON 进度）+ 成长中心卡。
- * 近 30 天签到日志在概述页；定时任务与坐标点击兜底在环境配置「签到配置」面板。
+ * 近 30 天签到日志在概述页；定时任务由服务端调度器自动执行。
  */
 
 interface WbAccountLine {
@@ -269,7 +268,7 @@ export default function BuddyCheckin() {
 
   return (
     <div className="animate-fade-in">
-      <PageHeader title="Buddy · 签到与成长" desc="一键签到 · 成长中心 · 定时任务见环境配置" />
+      <PageHeader title="Buddy · 签到与成长" desc="一键签到 · 成长中心 · 定时签到由服务端调度器自动执行" />
 
       {/* 成长中心卡（F-17：三开关 + 立即执行，T2.5 执行器）——与签到进度卡上下互换后置顶 */}
       <div className="card p-4">

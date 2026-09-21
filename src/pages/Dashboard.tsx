@@ -11,13 +11,8 @@ import {
   LabelList,
   Legend,
 } from 'recharts';
-import {
-  ShieldAlert,
-  ExternalLink,
-  RefreshCw,
-} from 'lucide-react';
+import { RefreshCw } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
-import SetupGuide from '../components/SetupGuide';
 import { StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
@@ -26,11 +21,6 @@ import type { CheckinTrendPoint } from '../types';
 
 export default function Dashboard() {
   const accounts = useAppStore((s) => s.accounts);
-  const env = useAppStore((s) => s.env);
-  const envCn = useAppStore((s) => s.envCn);
-  const certInstalled = useAppStore((s) => s.certInstalled);
-  const localEntitlement = useAppStore((s) => s.localEntitlement);
-  const refreshLocalEntitlement = useAppStore((s) => s.refreshLocalEntitlement);
   const toast = useAppStore((s) => s.pushToast);
   const isDark = useIsDark();
   // 近 30 天签到结果趋势（堆叠柱状图数据，T8）
@@ -65,9 +55,6 @@ export default function Dashboard() {
   const creditsHint = accounts.some((a) => a.general_credits != null || a.work_credits != null)
     ? `通用 ${fmt(generalCredits)} 积分 · Work ${fmt(workCredits)} 积分`
     : '总剩余可用积分';
-  const warned = accounts.filter(
-    (a) => a.jwt_exp_hours !== null && a.jwt_exp_hours <= 24,
-  ).length;
 
   const top = useMemo(
     () =>
@@ -118,14 +105,9 @@ export default function Dashboard() {
     toast('info', '刷新中…');
     const s = useAppStore.getState();
     await Promise.all([
-      s.refreshEnv(),
-      s.refreshCert(),
-      s.refreshProxy(),
-      s.refreshApiStatus(),
       s.refreshAccounts(),
       s.refreshGroups(),
-      s.refreshCreditsHistory(),
-      s.refreshLocalEntitlement(),
+      s.refreshCreditsDaily(),
       loadTrends(),
     ]);
     // 刷新剩余可用积分（会再次 refreshAccounts 更新 UI）
@@ -133,43 +115,21 @@ export default function Dashboard() {
     toast('success', '已刷新');
   };
 
-  // 本机套餐徽标：两个 Trae 应用当前登录账号的套餐（storage.json 明文缓存）
-  const entHint =
-    localEntitlement?.work || localEntitlement?.cn
-      ? [
-          localEntitlement?.work?.identity_str
-            ? `Work ${localEntitlement.work.identity_str}`
-            : null,
-          localEntitlement?.cn?.identity_str ? `Trae ${localEntitlement.cn.identity_str}` : null,
-        ]
-          .filter(Boolean)
-          .join(' · ')
-      : env?.installed || envCn?.installed
-        ? '本机应用未读取到套餐'
-        : undefined;
-  useEffect(() => {
-    void refreshLocalEntitlement();
-  }, [refreshLocalEntitlement]);
-
-  // 当前登录账号（账号池匹配名）：本机使用证据推导 uid → 反查账号池
-  const workLogin = localEntitlement?.work?.account_name ?? null;
-  const cnLogin = localEntitlement?.cn?.account_name ?? null;
   // 告警提醒：JWT 24h 内将过期 + 积分 7 日内将过期（含已过期）的账号数
+  const warned = accounts.filter(
+    (a) => a.jwt_exp_hours !== null && a.jwt_exp_hours <= 24,
+  ).length;
   const nowSec = Math.floor(Date.now() / 1000);
   const creditWarned = accounts.filter(
     (a) => a.credits_expire_at != null && a.credits_expire_at <= nowSec + 7 * 86400,
   ).length;
   const alertCount = warned + creditWarned;
 
-  const openTrae = async () => {
-    await useAppStore.getState().openTraeWithProxy();
-  };
-
   return (
     <div className="animate-fade-in">
       <PageHeader
         title="Trae · 概览"
-        desc="多账号签到与账号管理总览 · 登录账号 / 套餐 / 告警提醒 · 签到趋势与积分榜"
+        desc="多账号签到与账号管理总览 · 告警提醒 · 签到趋势与积分榜"
         actions={
           <button onClick={refresh} className="btn-outline">
             <RefreshCw size={15} /> 刷新
@@ -177,34 +137,9 @@ export default function Dashboard() {
         }
       />
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
         <StatCard label="账号总数" value={total} hint={`今日已签 ${checkedToday}`} tone="brand" />
         <StatCard label="可用总积分" value={totalCredits.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })} hint={creditsHint} tone="amber" />
-        <StatCard
-          label="登录账号"
-          value={
-            workLogin ?? cnLogin ?? (env?.installed || envCn?.installed ? '未登录' : '未安装')
-          }
-          hint={
-            [
-              env?.installed || localEntitlement?.work
-                ? `Trae Work：${workLogin ?? '未登录'}`
-                : null,
-              envCn?.installed || localEntitlement?.cn ? `Trae：${cnLogin ?? '未登录'}` : null,
-            ]
-              .filter(Boolean)
-              .join(' · ') || undefined
-          }
-          tone="violet"
-        />
-        <StatCard
-          label="本机套餐"
-          value={
-            localEntitlement?.work?.identity_str ?? localEntitlement?.cn?.identity_str ?? (env?.installed || envCn?.installed ? '—' : '未安装')
-          }
-          hint={entHint}
-          tone="violet"
-        />
         <StatCard
           label="告警提醒"
           value={alertCount}
@@ -212,49 +147,6 @@ export default function Dashboard() {
           tone={alertCount > 0 ? 'red' : 'slate'}
         />
       </div>
-
-      {!env?.installed && !envCn?.installed && (
-        <div className="mt-5 card flex items-center justify-between gap-4 p-4">
-          <div className="flex items-center gap-3">
-            <ShieldAlert className="text-amber-500" />
-            <div>
-              <div className="font-medium">未检测到 Trae Work / Trae 安装</div>
-              <div className="text-xs text-slate-500">代理捕获与账号切换同时支持 Trae Work 与 Trae，安装任一应用即可开始。</div>
-            </div>
-          </div>
-          <button
-            onClick={() => void openTrae()}
-            className="btn-outline"
-          >
-            <ExternalLink size={15} /> 前往下载
-          </button>
-        </div>
-      )}
-      {!certInstalled && (env?.installed || envCn?.installed) && (
-        <div className="mt-3 card flex items-center justify-between gap-4 p-4">
-          <div className="flex items-center gap-3">
-            <ShieldAlert className="text-amber-500" />
-            <div>
-              <div className="font-medium">CA 证书尚未安装</div>
-              <div className="text-xs text-slate-500">代理已启动但 Trae 应用不信任代理证书将无法拦截签到接口。</div>
-            </div>
-          </div>
-          <button
-            onClick={async () => {
-              try {
-                await api.cert.install();
-                await useAppStore.getState().refreshCert();
-                toast('success', '证书安装成功（可在 certmgr「受信任的根证书颁发机构」中搜索 TraeDeviceProxyCA 验证）');
-              } catch (e) {
-                toast('error', `证书安装失败：${String(e)}`);
-              }
-            }}
-            className="btn-primary"
-          >
-            一键安装证书
-          </button>
-        </div>
-      )}
 
       {/* 近 30 天签到结果趋势（无数据显示空态，T8） */}
       <div className="mt-5 card p-5">
@@ -354,10 +246,6 @@ export default function Dashboard() {
           </div>
         </div>
       )}
-
-      <div className="mt-5">
-        <SetupGuide />
-      </div>
     </div>
   );
 }

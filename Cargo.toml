@@ -1,0 +1,10 @@
+# AI Work 助手 workspace（Web 化改造，2026-09）
+# 桌面壳已退役（src-tauri 于 Phase 2 删除，git 历史归档）
+[workspace]
+resolver = "2"
+members = ["crates/aiwork-core", "crates/aiwork-server"]
+
+# 与桌面版同款：dev/test 构建对依赖开优化
+# （Stronghold 快照加密派生等在未优化下极慢，写一次 ~100s）
+[profile.dev.package."*"]
+opt-level = 2

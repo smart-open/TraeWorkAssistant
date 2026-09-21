@@ -1,0 +1,36 @@
+[package]
+name = "aiwork-core"
+version = "3.5.8"
+description = "AI Work 助手业务核心（Web 化改造抽取，零 tauri/桌面依赖）"
+edition = "2021"
+rust-version = "1.85"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+ureq = { version = "2", features = ["json"] }
+urlencoding = "2"
+axum = "0.7"
+tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-thread", "time", "macros"] }
+tokio-stream = "0.1"
+bytes = "1"
+sha2 = "0.10"
+# icube_auth：Trae 客户端 tc 信封解密（AES-128-CBC）+ ExchangeToken DeviceProof 签名（ECDSA P-256）
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+# 随机源（core 侧 random_hex：OAuth nonce / state，跨平台安全随机）
+rand = "0.8"
+# SQLite（bundled：免系统依赖，容器内可用）
+rusqlite = { version = "0.32", features = ["bundled"] }
+# 敏感数据加密：Stronghold 快照（直依赖，替代已退役的 tauri-plugin-stronghold 重导出）
+iota_stronghold = "2"
+# KeyProvider::try_from(Zeroizing<Vec<u8>>) 要求（对齐 tauri-plugin-stronghold 用法）
+zeroize = "1"
+# api_logger 日志 gzip/deflate 解压
+flate2 = "1"
+futures-util = "0.3"
+regex = "1"
+time = "0.3"

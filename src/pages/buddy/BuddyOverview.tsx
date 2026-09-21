@@ -13,14 +13,12 @@ import {
   Legend,
 } from 'recharts';
 import PageHeader from '../../components/PageHeader';
-import { Spinner, StatCard, Badge } from '../../components/ui';
+import { StatCard, Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
 import type {
   ViewKey,
-  CodeBuddyEnvCheck,
-  WorkBuddyEnvCheck,
   WorkBuddyAccountView,
   WbCreditsResult,
   WbCheckinRecord,
@@ -34,7 +32,7 @@ interface TrendPoint {
   failed: number;
 }
 
-/** 配置导航步骤（对齐 Trae 概述 SetupGuide 的形态；optional 步骤不计入完成度） */
+/** 配置导航步骤（optional 步骤不计入完成度） */
 interface Step {
   key: string;
   title: string;
@@ -42,7 +40,7 @@ interface Step {
   done: boolean;
   actionLabel: string;
   view: ViewKey;
-  /** 可选步骤：不计入 x/y 完成度（如 CodeBuddy CLI 桥接） */
+  /** 可选步骤：不计入 x/y 完成度 */
   optional?: boolean;
 }
 
@@ -74,37 +72,22 @@ export default function BuddyOverview() {
   const pushToast = useAppStore((s) => s.pushToast);
   const setView = useAppStore((s) => s.setView);
   const isDark = useIsDark();
-  const [env, setEnv] = useState<WorkBuddyEnvCheck | null>(null);
-  const [codebuddyEnv, setCodebuddyEnv] = useState<CodeBuddyEnvCheck | null>(null);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [credits, setCredits] = useState<WbCreditsResult | null>(null);
   const [records, setRecords] = useState<WbCheckinRecord[]>([]);
-  const [cliBridged, setCliBridged] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [openingClient, setOpeningClient] = useState(false);
 
   const refresh = async () => {
     setRefreshing(true);
     try {
-      const [e, accs, cr, recs] = await Promise.all([
-        api.workbuddy.envCheck().catch(() => null),
+      const [accs, cr, recs] = await Promise.all([
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
         api.workbuddy.creditsFetch().catch(() => null),
         api.workbuddy.checkinResults(30).catch(() => [] as WbCheckinRecord[]),
       ]);
-      setEnv(e);
       setAccounts(accs);
       setCredits(cr);
       setRecords(recs);
-      // CLI 桥状态（低频附加展示，失败静默）
-      api.env
-        .codebuddyEnvCheck()
-        .then(setCodebuddyEnv)
-        .catch(() => setCodebuddyEnv(null));
-      api.workbuddy
-        .cliStatus()
-        .then((s) => setCliBridged(s.env_token_present))
-        .catch(() => setCliBridged(false));
     } catch (err) {
       pushToast('error', `WorkBuddy 概述刷新失败：${String(err)}`);
     } finally {
@@ -129,13 +112,13 @@ export default function BuddyOverview() {
 
   const trends = useMemo(() => aggregateTrends(records), [records]);
 
-  // 登录账号 / 本机套餐：客户端当前生效登录（auth 文件在线判定优先，快照/环境检测兜底）
+  // 登录账号 / 本机套餐：账号列表中 is_current 标记的当前生效登录（服务端 auth 文件在线判定）
   const wbAccount = accounts.find((a) => a.is_current) ?? null;
-  const wbLoginName = wbAccount?.nickname || env?.snapshot_nickname || null;
-  const wbPlan = wbAccount?.edition_type || env?.snapshot_edition || null;
+  const wbLoginName = wbAccount?.nickname ?? null;
+  const wbPlan = wbAccount?.edition_type ?? null;
   const cbAccount = accounts.find((a) => a.is_current_codebuddy) ?? null;
-  const cbLoginName = cbAccount?.nickname || codebuddyEnv?.nickname || null;
-  const cbPlan = cbAccount?.edition_type || null;
+  const cbLoginName = cbAccount?.nickname ?? null;
+  const cbPlan = cbAccount?.edition_type ?? null;
   // 告警提醒：Token 24h 内将过期（含已过期）账号数 + 积分包 7 日内将过期包数（仍有剩余）
   const nowSec = Math.floor(Date.now() / 1000);
   const tokenSoon = accounts.filter(
@@ -162,22 +145,14 @@ export default function BuddyOverview() {
     [credits],
   );
 
-  // 配置导航（步骤完成态实时判定；结合双客户端审计——主功能在 WorkBuddy，CodeBuddy 仅 CLI 桥接可选）
+  // 配置导航（步骤完成态实时判定）
   const steps: Step[] = [
     {
-      key: 'client',
-      title: '安装 WorkBuddy 客户端',
-      desc: '主客户端：签到/积分/切换全功能。路径未自动识别时可在「环境配置」人工指定。',
-      done: !!env?.installed,
-      actionLabel: env?.installed ? '打开客户端' : '前往下载',
-      view: 'buddy-settings',
-    },
-    {
       key: 'account',
-      title: '扫描本机账号',
-      desc: '在客户端登录后到「账号管理」扫描本机账号，或用 OAuth 登录入池。',
+      title: '录入账号',
+      desc: '通过 OAuth 登录或导入账号库的方式将账号入池。',
       done: accounts.length > 0,
-      actionLabel: '去导入',
+      actionLabel: '去录入',
       view: 'buddy-accounts',
     },
     {
@@ -196,31 +171,11 @@ export default function BuddyOverview() {
       actionLabel: '查看积分',
       view: 'buddy-credits',
     },
-    {
-      key: 'cli',
-      title: '桥接 CodeBuddy CLI（可选）',
-      desc: '把 WorkBuddy 账号桥接到 CodeBuddy CLI 切号，按需启用五重防护自动轮换。',
-      done: cliBridged,
-      actionLabel: '去配置',
-      view: 'buddy-settings',
-      optional: true,
-    },
   ];
-  // 可选步骤不计入完成度（未桥接 CLI 不阻塞「全部完成」）
+  // 可选步骤不计入完成度
   const required = steps.filter((s) => !s.optional);
   const completed = required.filter((s) => s.done).length;
   const allDone = completed === required.length;
-
-  // 打开客户端：走后端 spawn 启动（Tauri v2 opener 对可执行文件静默失败，不能用 file:/// 打开）；
-  // 未安装时后端 reject「未检测到…」，透传错误 toast，不再前端预判 exe
-  const openClient = () => {
-    setOpeningClient(true);
-    api.env
-      .openWorkbuddyApp()
-      .then(() => pushToast('success', '已启动 WorkBuddy'))
-      .catch((e) => pushToast('error', `打开客户端失败：${String(e)}`))
-      .finally(() => setOpeningClient(false));
-  };
 
   return (
     <div className="animate-fade-in">
@@ -250,7 +205,7 @@ export default function BuddyOverview() {
         />
         <StatCard
           label="登录账号"
-          value={wbLoginName ?? cbLoginName ?? (env?.installed ? '未登录' : '未检测到')}
+          value={wbLoginName ?? cbLoginName ?? '未登录'}
           hint={
             [`WorkBuddy：${wbLoginName ?? '未登录'}`, `CodeBuddy：${cbLoginName ?? '未登录'}`].join(' · ')
           }
@@ -416,12 +371,7 @@ export default function BuddyOverview() {
                   可选
                 </span>
               ) : (
-                <button
-                  onClick={() => (step.key === 'client' ? openClient() : setView(step.view))}
-                  className="btn-outline shrink-0"
-                  disabled={step.key === 'client' && openingClient}
-                >
-                  {step.key === 'client' && openingClient ? <Spinner /> : null}
+                <button onClick={() => setView(step.view)} className="btn-outline shrink-0">
                   {step.actionLabel}
                   <ChevronRight size={14} />
                 </button>
@@ -429,13 +379,6 @@ export default function BuddyOverview() {
             </li>
           ))}
         </ol>
-        {/* CodeBuddy 说明（双客户端审计结论：主功能在 WorkBuddy，CodeBuddy 仅轻量侧） */}
-        <div className="mt-3 border-t border-slate-100 px-4 pt-3 text-xs leading-relaxed text-slate-400 dark:border-zinc-800">
-          <b className="font-medium text-slate-500 dark:text-zinc-400">CodeBuddy 说明：</b>
-          CodeBuddy 为轻量侧客户端，仅支持账号切换（CLI 桥写入 ~/.codebuddy/settings.json）与五重防护自动轮换；
-          签到、积分、API 上游等主功能均在 WorkBuddy 侧完成。客户端路径可在「环境配置」自动检测或人工指定，
-          桥接入口在「账号管理 → 设为 CLI 账号」。
-        </div>
         {allDone && (
           <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-zinc-800 dark:bg-emerald-500/10 dark:text-emerald-300">
             🎉 全部配置已完成，定时签到/积分轮换交给自动化即可！

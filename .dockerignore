@@ -1,0 +1,24 @@
+# Docker 构建上下文瘦身：只保留前端构建 + Rust 源码所需文件
+.git
+.github
+.vscode
+.idea
+
+# 桌面壳（workspace exclude，平移期只读参照，严禁进构建上下文）
+src-tauri
+
+# 本机构建产物与运行时数据（避免打进镜像/污染层缓存）
+target
+node_modules
+dist
+web
+data
+conf
+logs
+
+# 文档与杂项
+docs
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore
