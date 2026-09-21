@@ -1808,20 +1808,29 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
         .as_ref()
         .map(|t| t.starts_with(&fs_utils::today_prefix()))
         .unwrap_or(false);
-    let checked_names: std::collections::HashSet<String> = if summary_today {
-        summary
-            .results
-            .iter()
-            .filter(|r| {
-                let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                ok || (action != "fail" && !action.is_empty())
-            })
-            .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .collect()
-    } else {
-        Default::default()
-    };
+    // 「今日已签」判定（issue #24）：仅 ok==true（claim_ok / skip_already）算已签。
+    // 旧条件 ok || (action != "fail" && !action.is_empty()) 会把失败的 claim 记录
+    // （ok=false, action="claim"）误判为已签 → 状态误报 + 手动签到被跳过规则过滤。
+    // 匹配键用 user_id（与账号视图同源于 JWT），旧记录缺 user_id 时回退按 name。
+    let mut checked_uids: std::collections::HashSet<String> = Default::default();
+    let mut checked_names: std::collections::HashSet<String> = Default::default();
+    if summary_today {
+        for r in &summary.results {
+            if !r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            if let Some(u) = r
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                checked_uids.insert(u.to_string());
+            }
+            if let Some(n) = r.get("name").and_then(|v| v.as_str()) {
+                checked_names.insert(n.to_string());
+            }
+        }
+    }
 
     let now_ts = chrono::Local::now().timestamp();
     let mut out = Vec::new();
@@ -1856,7 +1865,12 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             .get(&uid)
             .map(|d: &DeviceEntry| fs_utils::mask(&d.device_id));
         let checked = if summary_today {
-            checked_names.contains(&a.name)
+            // 有 uid 严格按 uid 匹配（同名账号不互吞）；uid 为空才回退按 name
+            if uid.is_empty() {
+                checked_names.contains(&a.name)
+            } else {
+                checked_uids.contains(&uid)
+            }
         } else {
             false
         };
