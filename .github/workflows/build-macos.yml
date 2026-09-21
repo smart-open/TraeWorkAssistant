@@ -73,6 +73,11 @@ jobs:
 
       - run: npm ci
 
+      # cargo test 编译 main.rs 时 tauri::generate_context!() 宏在编译期校验 frontendDist
+      # （../dist）存在，全新 checkout 无 dist/ 会直接 panic——先构建前端再跑测试
+      - name: Build frontend (tsc + vite build → dist/)
+        run: npm run build
+
       - name: Run Rust tests（零警告红线 + 全量测试）
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
