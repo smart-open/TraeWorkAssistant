@@ -60,7 +60,8 @@ jobs:
         with: { node-version: 20, cache: npm }
 
       - uses: dtolnay/rust-toolchain@stable
-        with: { targets: ${{ matrix.rust_targets }} }
+        with:
+          targets: ${{ matrix.rust_targets }}
 
       - uses: actions/cache@v4
         with:
@@ -110,11 +111,12 @@ jobs:
         run: node scripts/rename_release.mjs
         env:
           TAURI_TARGET: ${{ matrix.target }}
+          RELEASE_OUT_DIR: release/mac
 
       - uses: actions/upload-artifact@v4
         with:
           name: ai-work-assistant-macos-${{ matrix.arch }}
           path: |
-            release/*.dmg
-            release/latest.json
+            release/mac/*.dmg
+            release/mac/latest.json
           if-no-files-found: error

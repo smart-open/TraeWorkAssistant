@@ -4,6 +4,7 @@
  *
  * 用法：node scripts/rename_release.mjs [--strict]
  *   --strict  任一产物缺失时以非零码退出（默认仅告警）
+ *   环境变量 RELEASE_OUT_DIR：输出目录覆盖（默认 release/；CI 分别落 release/mac、release/windows）
  *   src-tauri/target/release/bundle/nsis/AI Work 助手_<ver>_x64-setup.exe
  *       → release/AI Work 助手_<ver>_x64-setup.exe
  *   src-tauri/target/release/bundle/msi/AI Work 助手_<ver>_x64_zh-CN.msi
@@ -54,7 +55,7 @@ function readVersion(conf) {
 const conf = JSON.parse(readFileSync(resolve(SRC_TAURI, 'tauri.conf.json'), 'utf8'));
 const version = readVersion(conf);
 const product = conf.productName;
-const outDir = resolve(ROOT, 'release');
+const outDir = resolve(ROOT, process.env.RELEASE_OUT_DIR || 'release');
 mkdirSync(outDir, { recursive: true });
 
 // dmg 产物源目录候选：本地原生构建落 target/release/；CI 显式 --target <triple> 落
