@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "aiwork-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes",
  "axum",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "aiwork-server"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aiwork-core",
  "axum",
