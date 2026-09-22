@@ -10,6 +10,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { CircleHelp, Copy, Search } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
+import { gatewayBaseUrl } from '../../lib/gateway';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import type { GatewaySettings, UnifiedModel } from '../../types';
@@ -38,7 +39,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
   const [copied, setCopied] = useState(false);
 
   const port = gw?.port ?? 7864;
-  const base = `http://127.0.0.1:${port}`;
+  const base = gatewayBaseUrl(port);
 
   useEffect(() => {
     if (!open) return;

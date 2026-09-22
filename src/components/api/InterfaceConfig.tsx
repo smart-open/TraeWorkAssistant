@@ -1,11 +1,14 @@
 /**
  * 全局 API 管理 · 接口配置（unified-api-gateway-design §5.2/§5.3）
- * 读写 api_gateway_settings.json（gateway_settings_get/set，Phase 1 §8.1）；
+ * 网关端口与默认模型（gateway_settings_get/set，Phase 1 §8.1）；
  * 端口改动下次启动 API 服务后生效；含使用方式与配置示例。
+ * 接口地址展示走 gatewayBaseUrl()：默认跟随当前访问域名，构建时可注入
+ * VITE_GATEWAY_BASE_URL 覆盖（不再固定 127.0.0.1）。
  */
 import { useEffect, useState } from 'react';
 import { Copy, Globe, Save } from 'lucide-react';
 import { api } from '../../lib/tauri';
+import { gatewayBaseUrl } from '../../lib/gateway';
 import { withMinDelay } from '../../lib/delay';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
@@ -69,17 +72,18 @@ export default function InterfaceConfig() {
   const copyConfigExample = async () => {
     const p = gw?.port ?? 7864;
     const m = gw?.default_model ?? 'glm-5.3';
+    const base = gatewayBaseUrl(p);
     const example = `# 客户端配置示例（OpenAI 兼容格式）
-接口地址: http://127.0.0.1:${p}/v1
+接口地址: ${base}/v1
 API Key:  <在「API Keys 管理」中创建并复制>
 模型 ID:  ${m}（统一目录内任一模型均可，请求按模型 ID 匹配资源池）
 
 # Anthropic 兼容端点（Claude Code 等工具直连）
-POST http://127.0.0.1:${p}/v1/messages
+POST ${base}/v1/messages
 鉴权头: x-api-key: your-api-key 或 Authorization: Bearer
 
 # cURL 测试（请将 API Key 替换为列表中的完整值）
-curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
+curl -X POST ${base}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer your-api-key" \\
   -d '{
@@ -104,12 +108,14 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
       ? models
       : [{ id: model, display: model, rate: null, efforts: [], context_length: null, max_tokens: null, supports_image: null, manual: false, sources: [] }, ...models];
 
+  // 展示用网关地址（跟随当前访问域名；构建时 VITE_GATEWAY_BASE_URL 可覆盖）
+  const displayBase = gatewayBaseUrl(gw?.port ?? 7864);
+
   return (
     <div className="card p-4">
       <div className="mb-3 flex items-center gap-2">
         <Globe size={16} className="text-brand-500" />
         <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h3>
-        <span className="text-xs text-slate-400">读写 api_gateway_settings.json</span>
       </div>
 
       <div className="space-y-4">
@@ -173,7 +179,7 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
           <div className="space-y-1.5">
             <div>
               <span className="text-slate-400">接口地址：</span>
-              <code className="break-all text-[11px]">http://127.0.0.1:{gw?.port ?? 7864}/v1</code>
+              <code className="break-all text-[11px]">{displayBase}/v1</code>
             </div>
             <div>
               <span className="text-slate-400">API Key：</span>
@@ -187,13 +193,13 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
               <span className="text-slate-400">其他端点：</span>
             </div>
             <code className="block break-all text-[11px]">
-              POST http://127.0.0.1:{gw?.port ?? 7864}/v1/messages（Anthropic 兼容，x-api-key 鉴权）
+              POST {displayBase}/v1/messages（Anthropic 兼容，x-api-key 鉴权）
             </code>
             <code className="block break-all text-[11px]">
-              GET http://127.0.0.1:{gw?.port ?? 7864}/v1/models（统一模型目录）
+              GET {displayBase}/v1/models（统一模型目录）
             </code>
             <code className="block break-all text-[11px]">
-              GET http://127.0.0.1:{gw?.port ?? 7864}/health
+              GET {displayBase}/health
             </code>
           </div>
         </div>
