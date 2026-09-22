@@ -1,7 +1,7 @@
 # CI + Docker 镜像发布一体工作流（原 ci.yml 已并入：Rust 测试 + 前端构建作为发布前置门禁）
-# - push main（默认分支）→ :latest + :main + :sha
-# - push docker_main（Web 化开发线）→ :docker_main + :sha
-# - push tag v*      → :x.y.z + :latest + :sha
+# - 任意分支 push → :x.y.z（取 package.json 版本）+ 分支名 + :sha
+# - push main（默认分支）→ 额外 :latest
+# - push tag v*      → :x.y.z + :latest + :sha（semver 与版本步骤产出同值，自动去重）
 # - pull_request     → 仅跑测试与构建验证，不推镜像
 # 仅 linux/amd64（arm64 需 QEMU 交叉编译 Rust，构建极慢，暂不启用）
 name: CI & Docker Image
@@ -54,6 +54,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 版本号取 package.json（sync_version.mjs 单一来源维护），任意 push 均产出 :x.y.z 版本 tag
+      - name: 读取项目版本
+        id: ver
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v3
 
       - name: 登录 GHCR
@@ -69,6 +74,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=semver,pattern={{version}}

@@ -22,17 +22,51 @@
 
 前置：Docker 20.10+ 与 Docker Compose v2。
 
+### 方式一：GHCR 镜像启动（推荐，免编译）
+
 ```bash
-# 1. 构建并启动（首次构建约 10-20 分钟，Rust 编译占大头）
-docker compose up -d --build
+# 1. 拉取镜像（版本号随发布更新，也可用 latest / docker_main / sha-xxxxxxx）
+docker pull ghcr.io/smart-open/traeworkassistant:1.0.0
 
-# 2. 等待 healthy 后获取管理令牌（未注入 AIWORK_ADMIN_TOKEN 时自动生成）
-docker compose exec aiwork-server cat /app/data/conf/admin_token
+# 2. 启动（数据持久化在 ./data；TZ 默认 Asia/Shanghai 已内置镜像）
+#    注意：docker run 的 -v 源路径必须为绝对路径（Linux/macOS 用 $PWD，Windows PowerShell 用 ${PWD}）
+mkdir -p data
+docker run -d --name aiwork-server \
+  -p 8080:8080 \
+  -v "$PWD/data:/app/data" \
+  --restart unless-stopped \
+  ghcr.io/smart-open/traeworkassistant:1.0.0
 
-# 3. 浏览器访问 http://<服务器IP>:8080 ，粘贴令牌登录
+# 3. 等待 healthy 后获取管理令牌（未注入 AIWORK_ADMIN_TOKEN 时自动生成）
+docker exec aiwork-server cat /app/data/conf/admin_token
+
+# 4. 浏览器访问 http://<服务器IP>:8080 ，粘贴令牌登录
 ```
 
-端口自定义、TLS 反向代理、IP 允许列表、备份与恢复等详见 **[docs/server-deploy.md](docs/server-deploy.md)**。
+**镜像 Tag 说明**：`1.0.0` 版本号（随每次发布更新）· `latest`（main 分支最新）· `docker_main`（开发线最新）· `sha-xxxxxxx`（提交快照，用于锁定版本回溯）。仅构建 `linux/amd64` 架构。
+
+**支持的环境变量**（均可通过 `docker run -e` 或 compose `environment` 注入）：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `AIWORK_LISTEN_ADDR` | `0.0.0.0:8080` | 服务监听地址 |
+| `AIWORK_ADMIN_TOKEN` | 空（自动生成） | 管理面登录令牌；留空则首启生成 64 位随机 hex 写 `conf/admin_token`；**生产建议显式注入强随机值** |
+| `AIWORK_VAULT_KEY` | 空（自动生成） | 敏感数据加密密钥（任意字符串 SHA-256 归一 32B）；**容器重建必须可复现**，否则已存凭据不可解密 |
+| `AIWORK_DATA_DIR` | `/app/data` | 数据目录（容器内固定挂载 volume） |
+| `AIWORK_PORT` | `8080` | 仅供容器 HEALTHCHECK 探活取端口 |
+| `TZ` | `Asia/Shanghai` | 调度任务按本地时刻触发（签到/续期/快照） |
+
+### 方式二：源码构建
+
+```bash
+# 首次构建约 10-20 分钟，Rust 编译占大头
+docker compose up -d --build
+
+# 获取管理令牌
+docker compose exec aiwork-server cat /app/data/conf/admin_token
+```
+
+宿主端口自定义：项目根目录建 `.env` 写入 `AIWORK_PORT=9090` 后重建容器。端口自定义、TLS 反向代理、IP 允许列表、备份与恢复等详见 **[docs/server-deploy.md](docs/server-deploy.md)**。
 
 > ⚠️ 数据持久化在 volume `./data:/app/data`，其中 `conf/vault_key.bin` 是账号凭据加密密钥——**丢失即全部凭据不可解密**，务必纳入备份。
 
