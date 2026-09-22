@@ -8,7 +8,7 @@ import {
   Tooltip,
   CartesianGrid,
 } from 'recharts';
-import { RefreshCw, Coins } from 'lucide-react';
+import { RefreshCw, Coins, TrendingUp } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { StatCard, Badge, EmptyState } from '../../components/ui';
 import ExpiryCalendar from '../../components/ExpiryCalendar';
@@ -34,6 +34,8 @@ export default function BuddyCredits() {
   const isDark = useIsDark();
   const [result, setResult] = useState<WbCreditsResult | null>(null);
   const [usage, setUsage] = useState<UsageTrend | null>(null);
+  // 用量空态引导文案（status=empty / 双数据源均不可用时展示；有数据即清空）
+  const [usageHint, setUsageHint] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   // 用量趋势区间（T12d：官方聚合含 31 天逐日数据，支持 7/30 日切换）
   const [trendRange, setTrendRange] = useState<7 | 30>(7);
@@ -55,15 +57,35 @@ export default function BuddyCredits() {
         setLoading(false);
       }
       // 近 7 日消耗数据源：优先全账号官方用量聚合（31 天逐日完整，不再只有昨天）；
-      // 失败回退本地快照差分（依赖每日快照任务积累时序，缺天为已知局限）
+      // 空态（status=empty）直接展示引导提示，不再降级快照；失败回退本地快照差分
+      //（依赖每日快照任务积累时序，缺天为已知局限）；回退仍无数据时提示官方失败原因
       api.workbuddy
         .usageOfficialAll()
-        .then((r) => setUsage({ daily: r.daily, source: '官方用量明细', stale: r.stale }))
-        .catch(() =>
+        .then((r) => {
+          if (r.status === 'empty') {
+            setUsage(null);
+            setUsageHint(r.reason);
+            return;
+          }
+          setUsageHint(null);
+          setUsage({ daily: r.daily, source: '官方用量明细', stale: r.stale });
+        })
+        .catch((first) =>
           api.workbuddy
             .usageFallback()
-            .then((r) => setUsage({ daily: r.daily, source: '本地快照推导', stale: false }))
-            .catch(() => setUsage(null)),
+            .then((r) => {
+              if (r.status === 'snapshot') {
+                setUsageHint(null);
+                setUsage({ daily: r.daily, source: '本地快照推导', stale: false });
+                return;
+              }
+              setUsage(null);
+              setUsageHint(String(first));
+            })
+            .catch(() => {
+              setUsage(null);
+              setUsageHint(String(first));
+            }),
         );
       // eslint-disable-next-line react-hooks/exhaustive-deps
     },
@@ -184,6 +206,17 @@ export default function BuddyCredits() {
                   </LineChart>
                 </ResponsiveContainer>
               </div>
+            </div>
+          )}
+
+          {/* 用量空态引导（status=empty / 双数据源均不可用）：替代静默空白，告知如何建立数据 */}
+          {!usage && usageHint && (
+            <div className="mt-5 card p-5">
+              <EmptyState
+                icon={<TrendingUp size={22} />}
+                title="近 7 日积分消耗暂无数据"
+                hint={usageHint}
+              />
             </div>
           )}
 

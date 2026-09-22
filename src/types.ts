@@ -638,7 +638,7 @@ export interface WbUsageOfficial {
 }
 
 /** 全账号官方用量聚合（Buddy 积分看板近 7 日消耗主数据源；31 天零填充） */
-export interface WbUsageOfficialAll {
+export interface WbUsageOfficialAllComplete {
   status: 'complete';
   source: 'official_all';
   accounts_total: number;
@@ -654,6 +654,14 @@ export interface WbUsageOfficialAll {
   daily: { date: string; usage: number }[];
 }
 
+/** 用量数据空态（非错误）：无账号凭证 / 快照时序不足等冷启动阶段，reason 为引导文案 */
+export interface WbUsageEmpty {
+  status: 'empty';
+  reason: string;
+}
+
+export type WbUsageOfficialAll = WbUsageOfficialAllComplete | WbUsageEmpty;
+
 /** 活动信息三端点聚合（F-51）：banner（公开）+ 付费类型 + 用量提醒 */
 export interface WbActivityInfo {
   account_id: string | null;
@@ -665,7 +673,7 @@ export interface WbActivityInfo {
 }
 
 /** 积分用量快照回退（F-27）：官方用量不可用时的本地推导数据源 */
-export interface WbUsageFallback {
+export interface WbUsageFallbackComplete {
   status: 'snapshot';
   snapshot_days: number;
   summary: { usage_today: number; usage_7days: number; usage_this_month: number };
@@ -673,6 +681,8 @@ export interface WbUsageFallback {
   note: string;
   fetched_at_ms: number;
 }
+
+export type WbUsageFallback = WbUsageFallbackComplete | WbUsageEmpty;
 
 /** 积分包（tasks/wb_credits.rs 宽容解析输出） */
 export interface WbCreditPackage {

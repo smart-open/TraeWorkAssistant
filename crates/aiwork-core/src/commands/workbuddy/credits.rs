@@ -166,13 +166,16 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
 /// 快照回退用量：官方用量不可用时自动切换数据源（F-27）。
 /// 推导：当日消耗 = 前一日总余额 − 当日总余额 + 当日签到奖励（签到日志 message「+N」）；
 /// 负差值（充值包到账/快照波动）记 0。口径明示「快照回退」，非官方逐请求统计。
+/// 快照不足两天时返回 `{"status":"empty","reason":..}`（空态非错误，避免命令桥映射 500）。
 pub fn workbuddy_usage_fallback(state: &AppState) -> Result<serde_json::Value, String> {
     let hist: Value = crate::store::docs::wb_credits_history_load(&crate::store::db(&state.data_dir));
     let snapshots = hist.get("snapshots").and_then(Value::as_array).cloned().unwrap_or_default();
     if snapshots.len() < 2 {
-        return Err(
-            "快照回退不可用：本地余额时序不足（至少两天快照）。请在积分页刷新几次建立时序后重试。".to_string(),
-        );
+        // 冷启动空态（非错误）：时序不足属正常阶段，返回 200 交由前端展示引导提示
+        return Ok(serde_json::json!({
+            "status": "empty",
+            "reason": "本地余额快照不足两天：在积分页刷新几次或等待每日快照任务积累时序后可看趋势。",
+        }));
     }
 
     // 签到日志 → 每日奖励充值（90 天滚动，仅 success 事件；SQLite 化 P3 走 store）
@@ -554,6 +557,7 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
 /// 此前看板用快照差分（usageFallback）作唯一数据源——快照只在打开积分页且非缓存
 /// 命中时写入，未打开应用的日子无快照，7 日趋势只剩「昨天」一格。
 /// 单账号失败跳过（accounts_ok 计数），全部失败才报错并回退过期缓存（stale）。
+/// 无任何账号凭证时返回 `{"status":"empty","reason":..}`（空态非错误，避免命令桥映射 500）。
 /// 聚合结果缓存 10 分钟（跨账号全量拉取代价高，避免看板每次刷新都打满分页请求）。
 pub fn workbuddy_usage_official_all(state: &AppState) -> Result<serde_json::Value, String> {
     let cache_path = "workbuddy_usage_official_all_cache"; // kv 键（SQLite 化 P2）
@@ -607,7 +611,11 @@ pub fn workbuddy_usage_official_all(state: &AppState) -> Result<serde_json::Valu
         }
     }
     if list.is_empty() {
-        return Err("无可用账号凭证（请先在账号管理导入/扫码入池并续期）".into());
+        // 冷启动空态（非错误）：全新部署尚未导入账号属正常阶段，返回 200 交由前端展示引导提示
+        return Ok(serde_json::json!({
+            "status": "empty",
+            "reason": "暂无账号凭证：请先在「账号管理」导入账号或 OAuth 登录入池。",
+        }));
     }
 
     // 逐账号拉取 + 按日聚合（单账号失败跳过，不让一个失效凭证拖垮整板趋势）
