@@ -9,7 +9,7 @@ import type { Settings as SettingsType, NotifyConfig as NotifyConfigType, Notify
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 通知渠道。
  * 供「系统设置」弹框（左下角系统图标）使用；环境配置页不包含这些区块。
- * 表单为本地状态，点击「保存」才持久化；通知渠道为独立 kv，卡片内即时保存。
+ * 表单为本地状态（含通知渠道），统一由底部「保存设置」持久化（通知渠道为独立 kv）。
  */
 export default function GeneralSettingsPanel() {
   const settings = useAppStore((s) => s.settings);
@@ -43,7 +43,19 @@ export default function GeneralSettingsPanel() {
     setSaving(true);
     try {
       await withMinDelay(saveSettings(form));
-      toast('success', '设置已保存');
+      // 通知渠道（独立 kv）随底部保存统一持久化；设置成功而通知失败时单独报错
+      let notifyErr: string | null = null;
+      if (notifyForm && notifyDirty) {
+        try {
+          const saved = await withMinDelay(api.notify.setConfig(notifyForm));
+          setNotifyForm(saved);
+          setNotifyLoaded(saved);
+        } catch (e) {
+          notifyErr = e instanceof Error ? e.message : '保存失败';
+        }
+      }
+      if (notifyErr) toast('error', `设置已保存，但通知渠道保存失败：${notifyErr}`);
+      else toast('success', '设置已保存');
     } catch {
       /* toast 已发出 */
     } finally {
@@ -53,33 +65,28 @@ export default function GeneralSettingsPanel() {
 
   const reset = () => {
     if (settings) setForm({ ...settings });
+    if (notifyLoaded) setNotifyForm(notifyLoaded);
   };
 
-  // ---- 通知渠道（Trae / Buddy 全平台共用；独立 kv，卡片内保存）----
+  // ---- 通知渠道（Trae / Buddy 全平台共用；独立 kv，随底部「保存设置」统一持久化）----
   const [notifyForm, setNotifyForm] = useState<NotifyConfigType | null>(null);
-  const [notifySaving, setNotifySaving] = useState(false);
+  const [notifyLoaded, setNotifyLoaded] = useState<NotifyConfigType | null>(null);
   const [notifyTesting, setNotifyTesting] = useState(false);
+  const notifyDirty =
+    notifyForm != null && notifyLoaded != null && JSON.stringify(notifyForm) !== JSON.stringify(notifyLoaded);
 
   useEffect(() => {
     api.notify
       .getConfig()
-      .then(setNotifyForm)
-      .catch(() => setNotifyForm(null));
+      .then((c) => {
+        setNotifyForm(c);
+        setNotifyLoaded(c);
+      })
+      .catch(() => {
+        setNotifyForm(null);
+        setNotifyLoaded(null);
+      });
   }, []);
-
-  const saveNotify = async () => {
-    if (!notifyForm) return;
-    setNotifySaving(true);
-    try {
-      const saved = await withMinDelay(api.notify.setConfig(notifyForm));
-      setNotifyForm(saved);
-      toast('success', '通知配置已保存');
-    } catch (e) {
-      toast('error', e instanceof Error ? e.message : '通知配置保存失败');
-    } finally {
-      setNotifySaving(false);
-    }
-  };
 
   const testNotify = async () => {
     if (!notifyForm) return;
@@ -163,7 +170,7 @@ export default function GeneralSettingsPanel() {
         </div>
       </section>
 
-      {/* 通知渠道（Trae / Buddy 全平台共用：Bark / Server酱 / Webhook；独立 kv 即时保存） */}
+      {/* 通知渠道（Trae / Buddy 全平台共用：Bark / Server酱 / Webhook；随底部「保存设置」统一保存） */}
       {notifyForm && (
         <section className="card p-4">
           <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
@@ -171,17 +178,12 @@ export default function GeneralSettingsPanel() {
               <BellRing size={16} className="text-brand-500" />
               <h3 className="font-medium">通知渠道</h3>
             </div>
-            <div className="flex items-center gap-2">
-              <button onClick={testNotify} disabled={notifyTesting} className="btn-outline">
-                <Send size={15} /> {notifyTesting ? '发送中…' : '发送测试'}
-              </button>
-              <button onClick={saveNotify} disabled={notifySaving} className="btn-primary">
-                <Save size={15} /> {notifySaving ? '保存中…' : '保存'}
-              </button>
-            </div>
+            <button onClick={testNotify} disabled={notifyTesting} className="btn-outline">
+              <Send size={15} /> {notifyTesting ? '发送中…' : '发送测试'}
+            </button>
           </div>
           <p className="mb-3 text-xs text-slate-400">
-            签到完成 / 调度任务失败时推送到手机（Bark / Server酱）或自建 Webhook，Trae 与 Buddy 全平台共用，未配置的渠道自动跳过。
+            签到完成 / 调度任务失败时推送到手机（Bark / Server酱）或自建 Webhook，Trae 与 Buddy 全平台共用，未配置的渠道自动跳过；修改后点底部「保存设置」生效。
           </p>
           <div className="grid gap-4 text-sm md:grid-cols-2">
             <div className="space-y-3">
@@ -245,13 +247,13 @@ export default function GeneralSettingsPanel() {
         </section>
       )}
 
-      {/* 保存条 */}
+      {/* 保存条（外观/通用/通知渠道统一保存） */}
       <div className="flex items-center justify-end gap-2 pb-1">
-        {dirty && <span className="mr-auto text-xs text-amber-500">有未保存的更改</span>}
-        <button onClick={reset} disabled={!dirty} className="btn-outline disabled:opacity-40">
+        {(dirty || notifyDirty) && <span className="mr-auto text-xs text-amber-500">有未保存的更改</span>}
+        <button onClick={reset} disabled={!dirty && !notifyDirty} className="btn-outline disabled:opacity-40">
           <RotateCcw size={15} /> 撤销
         </button>
-        <button onClick={save} disabled={saving || !dirty} className="btn-outline disabled:opacity-40">
+        <button onClick={save} disabled={saving || (!dirty && !notifyDirty)} className="btn-outline disabled:opacity-40">
           <Save size={15} /> {saving ? '保存中…' : '保存设置'}
         </button>
       </div>
