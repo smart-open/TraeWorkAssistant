@@ -11,11 +11,10 @@ const COOLDOWN_LABELS: Record<string, string> = {
   BusinessError: '业务错误',
 };
 
-/** SessionDead（JWT 被服务端吊销）的恢复指引：重登 → 保存登录态 → 续期捕获新凭证 */
+/** SessionDead（JWT 被服务端吊销）的恢复指引：重新 OAuth 登录该账号即可恢复 */
 const SESSION_DEAD_GUIDE =
   '该账号的登录已失效（JWT 被服务端吊销，常见于账号在别处重新登录或触发风控）。' +
-  '恢复步骤：在 TRAE 中重新登录该账号 → 点击「保存当前登录态」保留新登录 → ' +
-  '开启代理后点击右侧「续期 JWT」重新捕获凭证（新凭证捕获成功会自动解除失效标记），签到即可恢复。';
+  '恢复方式：回到「账号管理」点「OAuth 登录」重新授权添加该账号（同账号会更新凭证），签到即可恢复。';
 
 export function CooldownBadge({ type, until }: { type: string; until: number | null }) {
   const label = COOLDOWN_LABELS[type] ?? type;

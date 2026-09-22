@@ -221,7 +221,7 @@ export default function BuddyCredits() {
               <EmptyState
                 icon={<Coins size={22} />}
                 title="暂无积分数据"
-                hint="请先在「账号管理」导入账号（需已录入凭证）；查询失败时请检查客户端登录态。"
+                hint="请先在「账号管理」添加账号（需已录入凭证）；查询失败时请在账号行点「刷新」续期凭证后重试。"
               />
             </div>
           ) : (
