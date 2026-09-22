@@ -1,5 +1,5 @@
 # F-75 M3-3.4：macOS DMG 构建流水线（三产物矩阵：aarch64 / x64 / universal）。
-# M3 阶段启用（feature/macos 分支触发）；合入主干后按需对齐 build-windows 触发策略。
+# 触发：push 到 macos_main 或手动 dispatch；合入主干后按需对齐 build-windows 触发策略。
 # 无 Developer ID：Tauri 未配置 signingIdentity 时默认 ad-hoc（tauri.macos.conf.json 显式 "-"），
 # 产物带 quarantine 属性，Gatekeeper 拦截的放行引导见 README / AboutDialog / Release 正文模板。
 #
@@ -36,7 +36,6 @@ name: Build macOS DMG
 on:
   push:
     branches:
-      - feature/macos
       - macos_main
   workflow_dispatch:
 
