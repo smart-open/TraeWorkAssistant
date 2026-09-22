@@ -2,9 +2,10 @@ use serde_json::{json, Value};
 
 /// 模型显示名 → (canonical config_name, 内部 model_name) 映射
 /// 大小写不敏感：客户端可传入 "doubao-seed-2.1-turbo" 或 "Doubao-Seed-2.1-Turbo"
-/// 与上游 batch_get_detail_param（solo_work_lite，2026-09 实测）同步
-fn model_config(model: &str) -> (&'static str, &'static str) {
-    match model.to_lowercase().as_str() {
+/// 与上游 batch_get_detail_param（solo_work_lite，2026-09 实测）同步。
+/// 未收录模型返回 None（官方新上架等，调用侧原样透传）
+fn model_config(model: &str) -> Option<(&'static str, &'static str)> {
+    let pair = match model.to_lowercase().as_str() {
         "doubao-seed-evolving" => ("Doubao-Seed-Evolving", "Doubao-Seed-Evolving__dev"),
         "doubao-seed-2.1-pro" | "seed-code-pro-0430" => ("Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Pro__dev"),
         "doubao-seed-2.1-turbo" => ("Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.1-Turbo__dev"),
@@ -15,6 +16,8 @@ fn model_config(model: &str) -> (&'static str, &'static str) {
         "glm-5.3" => ("glm-5.3", "glm-5.3__dev"),
         "glm-5" => ("glm-5", "glm-5__dev"),
         "glm-5-turbo" => ("glm-5-turbo", "glm-5-turbo__dev"),
+        // deepseek-v4.1-flash 仅在 solo_agent 视图可用（solo_work_lite 下报 4001），
+        // 且 solo_agent 位内部名为点号风格（下划线变体报 4023 model unknown，2026-09-22 实测）
         "deepseek-v4.1-flash" => ("deepseek-v4.1-flash", "deepseek-v4.1-flash__dev"),
         "deepseek-v4-flash" => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
         "deepseek-v4-flash-official" => ("DeepSeek-V4-Flash-Official", "DeepSeek-V4-Flash-Official__dev"),
@@ -27,8 +30,11 @@ fn model_config(model: &str) -> (&'static str, &'static str) {
         "minimax-m3" => ("minimax-m3", "minimax-m3__dev"),
         "qwen3.8-max" => ("qwen3.8-max", "qwen3.8-max__dev"),
         "qwen-3.7-plus" => ("qwen-3.7-plus", "qwen-3.7-plus__dev"),
-        _ => ("DeepSeek-V4-Flash", "deepseek_v4_flash__dev"),
-    }
+        // 未收录模型返回 None → 调用侧按实证规律原样透传（见 prepare_llm_chat_body）；
+        // 旧兜底 DeepSeek-V4-Flash 会把官方新上架模型静默路由到错误模型，比报 4023 更糟
+        _ => return None,
+    };
+    Some(pair)
 }
 
 /// 生成类似 UUID 的十六进制字符串
@@ -54,12 +60,14 @@ fn gen_uuid_like() -> String {
 
 /// OpenAI 请求体 → llm_utils_chat 请求体改写
 /// llm_utils_chat 消耗通用积分(product_id 208)
+/// `models` 为同步落库的模型目录（查表定 function，热路径有缓存）
 pub fn prepare_llm_chat_body(
     src: &[u8],
     default_model: &str,
     uid: &str,
     device_id: &str,
     machine_id: &str,
+    models: &[super::models_sync::ModelOption],
 ) -> Vec<u8> {
     let mut obj: Value = match serde_json::from_slice(src) {
         Ok(v) => v,
@@ -123,7 +131,17 @@ pub fn prepare_llm_chat_body(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default_model.to_string());
-    let (config_name, model_name) = model_config(&model);
+    let (config_name, model_name): (std::borrow::Cow<str>, std::borrow::Cow<str>) =
+        match model_config(&model) {
+            Some((c, m)) => (c.into(), m.into()),
+            None => {
+                // 未收录模型（官方新上架等）原样透传：实证规律
+                // model_name = config_name__dev（solo_agent/solo_work_lite 位均成立，
+                // 仅 deepseek-v4.1-flash 例外且已有显式映射）
+                let c = model.trim();
+                (c.into(), format!("{c}__dev").into())
+            }
+        };
 
     // normalize tool_choice and tools (reuse existing logic)
     normalize_tool_choice(obj_mut);
@@ -133,8 +151,9 @@ pub fn prepare_llm_chat_body(
     obj_mut.insert("config_name".into(), json!(config_name));
     obj_mut.insert("model_name".into(), json!(model_name));
     obj_mut.insert("stream".into(), json!(true));
-    // 部分客户端内置模型仅在 solo_agent 下可用（实测），按模型分发 function
-    let function = super::models_sync::function_for_model(&model.to_lowercase());
+    // 部分客户端内置模型仅在 solo_agent 下可用（实测），按模型分发 function：
+    // 同步落库的来源视图优先（官方新上架免改代码），表内无视图时回退硬编码
+    let function = super::models_sync::function_for_model_in(models, &model.to_lowercase());
     obj_mut.insert("function".into(), json!(function));
     // max_tokens：尊重客户端显式值（含 Anthropic max_tokens 透传，P2 修复），
     // 缺省兜底 4096（上游必需字段）
@@ -518,5 +537,67 @@ mod tests {
         // tools → OpenAI function 格式
         assert_eq!(out["tools"][0]["type"], "function");
         assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+    }
+
+    fn mo(id: &str, function: &str) -> super::super::models_sync::ModelOption {
+        super::super::models_sync::ModelOption {
+            id: id.into(),
+            label: id.into(),
+            rate: None,
+            context_length: None,
+            efforts: Vec::new(),
+            supports_image: None,
+            function: function.into(),
+        }
+    }
+
+    /// function 查表优先（官方新上架免改代码的关键路径）+ 未收录模型
+    /// 原样透传（config_name/model_name 按 __dev 实证规律兜底）
+    #[test]
+    fn llm_chat_body_function_from_table_and_passthrough() {
+        let models = vec![mo("brand-new-x", "solo_agent")];
+        let src = json!({
+            "model": "Brand-New-X",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&src).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &models,
+        ))
+        .unwrap();
+        // 表内视图优先（id 大小写不敏感命中）
+        assert_eq!(out["function"], "solo_agent");
+        // 未收录于 model_config → 原样透传 + __dev 规律
+        assert_eq!(out["config_name"], "Brand-New-X");
+        assert_eq!(out["model_name"], "Brand-New-X__dev");
+    }
+
+    /// 空表（存量数据未重新同步）→ 硬编码回退：
+    /// solo_agent 专属模型与默认 function 各按实证行为分发
+    #[test]
+    fn llm_chat_body_function_falls_back_when_table_empty() {
+        let src = json!({
+            "model": "kimi-k2.8-preview",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&src).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &[],
+        ))
+        .unwrap();
+        assert_eq!(out["function"], "solo_agent");
+        assert_eq!(out["config_name"], "kimi-k2.8-preview");
+        assert_eq!(out["model_name"], "kimi-k2.8-preview__dev");
+
+        let src2 = json!({
+            "model": "glm-5.2",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out2: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&src2).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &[],
+        ))
+        .unwrap();
+        assert_eq!(out2["function"], super::super::FUNCTION);
     }
 }

@@ -307,6 +307,11 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let available_only = opt_arg(&args, "available_only")?;
             api_server_cmd::api_unified_models(state, available_only).and_then(to_json)
         }
+        "model_whitelist_get" => to_json(api_server_cmd::model_whitelist_get(state)),
+        "model_whitelist_set" => {
+            let models = arg(&args, "models")?;
+            api_server_cmd::model_whitelist_set(state, models).and_then(to_json)
+        }
         "dispatch_policy_get" => to_json(api_server_cmd::dispatch_policy_get(state)),
         "dispatch_policy_set" => {
             let policy = arg(&args, "policy")?;

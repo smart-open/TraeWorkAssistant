@@ -361,87 +361,6 @@ impl ApiPool {
         }
     }
 
-    /// 按当前策略挑选 healthy 账号；跳过 tried
-    /// llm_utils_chat 消耗通用积分(product_id 208)
-    /// 零积分账号会被跳过，避免无效请求
-    pub fn pick_excluding(&self, tried: &HashSet<String>) -> Option<PickedAccount> {
-        let mut entries = safe_lock(&self.entries);
-        let strategy = *safe_lock(&self.strategy);
-        let now = now_ts();
-        let all_cands: Vec<&PoolEntry> = entries
-            .values()
-            .filter(|e| selectable(e, tried, now))
-            .collect();
-        // F-77 取号过滤 busy：inflight ≥ 上限的账号不参与候选；
-        // 全部 busy 时降级为选 inflight 最小者（不过载拒绝，请求不失败）
-        let inflight = self.inflight_snapshot();
-        let limit = self.concurrency_limit();
-        let (cands, busy_fallback) = busy_filter(&all_cands, &inflight, limit);
-        // Random 用纳秒级时间做种子（无需密码学随机，仅打散取号顺序）
-        let rand_seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
-            .unwrap_or(0);
-        let picked_entry = if busy_fallback {
-            all_cands
-                .iter()
-                .copied()
-                .min_by_key(|e| inflight_of(e, &inflight))
-        } else {
-            pick_by_strategy(&cands, strategy, rand_seed, now, &inflight)
-        };
-        let mut picked = picked_entry.map(|e| PickedAccount {
-            uid: e.uid.clone(),
-            jwt: e.jwt.clone(),
-            device_id: e.device_id.clone(),
-            machine_id: e.machine_id.clone(),
-            domain: e.domain.clone(),
-            enterprise_id: e.enterprise_id.clone(),
-            global_region: e.global_region,
-        })?;
-
-        // 防惊群：100ms 内重复选中同一 uid 且还有其他候选 → 让位（T2.2）；
-        // 全 busy 降级路径不参与——min(inflight) 本身即负载分散，策略让位反而
-        // 会破坏「取在途最小者」语义（F-77）
-        if !busy_fallback && cands.len() > 1 {
-            let mut recent = safe_lock(&self.recent_pick);
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            if recent.0 == picked.uid && now_ms - recent.1 < 100 {
-                if let Some(alt) = pick_by_strategy(
-                    &cands
-                        .iter()
-                        .copied()
-                        .filter(|e| e.uid != picked.uid)
-                        .collect::<Vec<_>>(),
-                    strategy,
-                    rand_seed.wrapping_add(1),
-                    now,
-                    &inflight,
-                ) {
-                    picked = PickedAccount {
-                        uid: alt.uid.clone(),
-                        jwt: alt.jwt.clone(),
-                        device_id: alt.device_id.clone(),
-                        machine_id: alt.machine_id.clone(),
-                        domain: alt.domain.clone(),
-                        enterprise_id: alt.enterprise_id.clone(),
-                        global_region: alt.global_region,
-                    };
-                }
-            }
-            *recent = (picked.uid.clone(), now_ms);
-        }
-
-        // 记录取号时间（三因子加权闲置补偿因子）
-        if let Some(e) = entries.get_mut(&picked.uid) {
-            e.last_used = now;
-        }
-        Some(picked)
-    }
-
     /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None
     pub fn pick_by_uid(&self, uid: &str) -> Option<PickedAccount> {
         let entries = safe_lock(&self.entries);
@@ -460,7 +379,7 @@ impl ApiPool {
 
     /// 带 Key 约束取号（F-35 子 Key 体系，批次3）：
     /// - `dedicated`：专一模式绑定 uid（healthy 即直接锁定，绕过策略）
-    /// - `allowed`：上游白名单过滤（None/空 = 不限）
+    /// - `allowed`：上游白名单过滤（None = 不限；`Some(空集)` = 过滤全部——调用方须先过滤空集）
     /// - 调度策略沿用池当前策略（子 Key「临期优先」= 池默认 expire_first，
     ///   池策略本身即用户可选的临期/积分/加权等模式；约束仅做过滤与锁定）
     pub fn pick_excluding_constrained(
@@ -473,7 +392,8 @@ impl ApiPool {
             .map(|(p, _)| p)
     }
 
-    /// 同 [pick_excluding_constrained]，附带 F-77 调度事件（[SCHED] 日志用）：
+    /// 同 [pick_excluding_constrained]，附带 F-77 调度事件（[SCHED] 日志用），
+    /// 并内置防惊群让位（T2.2：100ms 内重复选中同一 uid 且有其他候选时让位）：
     /// - `busy_yield`：候选中存在被并发上限过滤的 busy 账号（让位给空闲账号）
     /// - `busy_fallback`：全部候选 busy，降级取 inflight 最小者（不过载拒绝）
     pub fn pick_excluding_constrained_ev(
@@ -502,7 +422,7 @@ impl ApiPool {
             .filter(|e| selectable(e, tried, now))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .collect();
-        // F-77 busy 过滤 + 全 busy 降级（语义同 pick_excluding）
+        // F-77 busy 过滤 + 全 busy 降级
         let inflight = self.inflight_snapshot();
         let limit = self.concurrency_limit();
         let (cands, busy_fallback) = busy_filter(&all_cands, &inflight, limit);
@@ -510,7 +430,7 @@ impl ApiPool {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
             .unwrap_or(0);
-        let picked = if busy_fallback {
+        let mut picked = if busy_fallback {
             all_cands
                 .iter()
                 .copied()
@@ -518,6 +438,33 @@ impl ApiPool {
         } else {
             pick_by_strategy(&cands, strategy, rand_seed, now, &inflight)
         }?;
+
+        // 防惊群：100ms 内重复选中同一 uid 且还有其他候选 → 让位（T2.2）；
+        // 全 busy 降级路径不参与——min(inflight) 本身即负载分散，策略让位反而
+        // 会破坏「取在途最小者」语义（F-77）
+        if !busy_fallback && cands.len() > 1 {
+            let mut recent = safe_lock(&self.recent_pick);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if recent.0 == picked.uid && now_ms - recent.1 < 100 {
+                if let Some(alt) = pick_by_strategy(
+                    &cands
+                        .iter()
+                        .copied()
+                        .filter(|e| e.uid != picked.uid)
+                        .collect::<Vec<_>>(),
+                    strategy,
+                    rand_seed.wrapping_add(1),
+                    now,
+                    &inflight,
+                ) {
+                    picked = alt;
+                }
+            }
+            *recent = (picked.uid.clone(), now_ms);
+        }
         let account = PickedAccount {
             uid: picked.uid.clone(),
             jwt: picked.jwt.clone(),
@@ -753,6 +700,20 @@ impl ApiPool {
         let now = now_ts();
         let tried = HashSet::new();
         entries.values().any(|e| selectable(e, &tried, now))
+    }
+
+    /// 同 [has_selectable]，附加 Key 级 uid 白名单过滤（issue #25 资源池绑定）：
+    /// 绑定池 Key 的健康预检须感知白名单——池内仅剩白名单外账号时视为该池
+    /// 对此 Key 不健康，走全局 fallback 开关回退另一池，而非取号阶段才失败。
+    /// `allowed`：uid 白名单（None = 不限；`Some(空集)` = 过滤全部——调用方须先
+    /// 过滤空集，语义同 pick_excluding_constrained）
+    pub fn has_selectable_in(&self, allowed: Option<&HashSet<String>>) -> bool {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let tried = HashSet::new();
+        entries
+            .values()
+            .any(|e| selectable(e, &tried, now) && allowed.map_or(true, |a| a.contains(&e.uid)))
     }
 
     /// 诊断：返回所有账号被过滤的原因（用于 "no healthy account" 排查）
@@ -1083,6 +1044,31 @@ mod tests {
     }
 
     #[test]
+    fn has_selectable_in_respects_whitelist() {
+        // issue #25 资源池绑定：健康预检的白名单感知行为
+        let pool = build_pool(&[
+            ("uid_a", 100.0, 4_000_001_000),
+            ("uid_b", 100.0, 4_000_001_000),
+        ]);
+        // 无白名单：与 has_selectable 等价
+        assert!(pool.has_selectable());
+        assert!(pool.has_selectable_in(None));
+        // 白名单命中任一健康账号即可
+        let ok: HashSet<String> = ["uid_b".to_string()].into_iter().collect();
+        assert!(pool.has_selectable_in(Some(&ok)));
+        // 白名单全在池外 → 视为不健康（dispatch 层据此触发 fallback）
+        let miss: HashSet<String> = ["uid_x".to_string()].into_iter().collect();
+        assert!(!pool.has_selectable_in(Some(&miss)));
+        // 空白名单 = 过滤所有账号：调用方须先过滤空集（与 pick_excluding_constrained 同语义）
+        let empty: HashSet<String> = HashSet::new();
+        assert!(!pool.has_selectable_in(Some(&empty)));
+        // 过期账号即使命中白名单也不可选
+        let expired = build_pool(&[("uid_a", 100.0, 1_000)]);
+        let ok_a: HashSet<String> = ["uid_a".to_string()].into_iter().collect();
+        assert!(!expired.has_selectable_in(Some(&ok_a)));
+    }
+
+    #[test]
     fn resolve_wb_follows_trae_when_wb_empty() {
         // Buddy 池 wb_strategy 空 = 跟随 Trae 池策略（启动/热应用共用语义）
         assert_eq!(PoolStrategy::resolve_wb("weighted", ""), PoolStrategy::Weighted);
@@ -1109,12 +1095,12 @@ mod tests {
             ("uid_b", 100.0, 3_900_000_000),
         ]);
         pool.set_strategy(PoolStrategy::ExpireFirst);
-        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+        let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
         assert_eq!(picked.uid, "uid_b");
         // 排除后取另一个
         let mut tried = HashSet::new();
         tried.insert("uid_b".to_string());
-        let picked = pool.pick_excluding(&tried).unwrap();
+        let picked = pool.pick_excluding_constrained(&tried, None, None).unwrap();
         assert_eq!(picked.uid, "uid_a");
     }
 
@@ -1123,13 +1109,13 @@ mod tests {
         // 有过期时间者优先于无过期时间
         let pool = build_pool(&[("uid_a", 999.0, 0), ("uid_b", 10.0, 4_000_000_000)]);
         pool.set_strategy(PoolStrategy::ExpireFirst);
-        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+        assert_eq!(pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid, "uid_b");
         // 过期时间相同：积分多者胜
         let pool = build_pool(&[
             ("uid_a", 50.0, 4_000_000_000),
             ("uid_b", 200.0, 4_000_000_000),
         ]);
-        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+        assert_eq!(pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid, "uid_b");
     }
 
     #[test]
@@ -1139,7 +1125,7 @@ mod tests {
             ("uid_b", 300.0, 4_000_000_000),
         ]);
         pool.set_strategy(PoolStrategy::CreditFirst);
-        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+        let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
         assert_eq!(picked.uid, "uid_b");
     }
 
@@ -1153,20 +1139,20 @@ mod tests {
         // 连续取号（排除已选）能遍历完所有候选后枯竭
         let mut tried = HashSet::new();
         for _ in 0..2 {
-            let p = pool.pick_excluding(&tried).unwrap();
+            let p = pool.pick_excluding_constrained(&tried, None, None).unwrap();
             tried.insert(p.uid);
         }
-        assert!(pool.pick_excluding(&tried).is_none());
+        assert!(pool.pick_excluding_constrained(&tried, None, None).is_none());
     }
 
     #[test]
     fn zero_credit_and_expired_are_skipped() {
         // 零积分账号不参与取号
         let pool = build_pool(&[("uid_a", 0.0, 0), ("uid_b", 10.0, 0)]);
-        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+        assert_eq!(pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid, "uid_b");
         // 积分已过期账号不参与取号（now 之后才会过期的不受影响）
         let pool = build_pool(&[("uid_a", 10.0, 1), ("uid_b", 10.0, 0)]);
-        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+        assert_eq!(pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid, "uid_b");
     }
 
     #[test]
@@ -1189,7 +1175,7 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(pool.count(), 1);
-        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+        let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
         assert_eq!(picked.uid, "uid_b");
     }
 
@@ -1242,7 +1228,7 @@ mod tests {
         assert!(sa.disabled && sa.refresh_invalid);
         assert_eq!(sa.state, "Forbidden");
         // 取号只落到 uid_b
-        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_b");
+        assert_eq!(pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid, "uid_b");
         // diagnose 给出 refresh_token_invalid 原因
         let d = pool.diagnose().into_iter().find(|x| x.uid == "uid_a").unwrap();
         assert_eq!(d.reason, "disabled(refresh_token_invalid)");
@@ -1257,7 +1243,7 @@ mod tests {
         pool.note_refresh_invalid("uid_a");
         let st = &pool.status_list()[0];
         assert!(st.disabled && st.refresh_invalid);
-        assert!(pool.pick_excluding(&HashSet::new()).is_none());
+        assert!(pool.pick_excluding_constrained(&HashSet::new(), None, None).is_none());
     }
 
     // ==================== T2.2 新增 ====================
@@ -1274,7 +1260,7 @@ mod tests {
         let mut seen_b = false;
         for i in 0..32u64 {
             let _ = i;
-            if pool.pick_excluding(&HashSet::new()).unwrap().uid == "uid_b" {
+            if pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid == "uid_b" {
                 seen_b = true;
                 break;
             }
@@ -1381,7 +1367,7 @@ mod tests {
         let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
         pool.note_error("uid_b", ErrKind::Forbidden);
         assert_eq!(pool.status_list()[1].state, "Forbidden");
-        assert!(pool.pick_excluding(&HashSet::new()).unwrap().uid != "uid_b");
+        assert!(pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid != "uid_b");
     }
 
     #[test]
@@ -1486,7 +1472,7 @@ mod tests {
             &["wb-abc".to_string()],
         );
         pool.set_strategy(PoolStrategy::CreditFirst);
-        let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+        let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
         assert_eq!(picked.uid, "wb-abc");
         assert!(picked.global_region);
         assert_eq!(picked.domain, "workbuddy.ai");
@@ -1502,7 +1488,7 @@ mod tests {
             }],
             &["wb-x".to_string()],
         );
-        assert!(pool2.pick_excluding(&HashSet::new()).is_none());
+        assert!(pool2.pick_excluding_constrained(&HashSet::new(), None, None).is_none());
     }
 
     // ==================== F-77 账号级并发感知调度 ====================
@@ -1515,14 +1501,14 @@ mod tests {
         let h = pool.inflight_handle("uid_a");
         h.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for _ in 0..8 {
-            let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+            let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
             assert_eq!(picked.uid, "uid_b", "busy 账号应让位空闲账号");
         }
         // 释放后恢复可选
         h.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let mut seen_a = false;
         for _ in 0..16 {
-            if pool.pick_excluding(&HashSet::new()).unwrap().uid == "uid_a" {
+            if pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid == "uid_a" {
                 seen_a = true;
                 break;
             }
@@ -1538,7 +1524,7 @@ mod tests {
         pool.inflight_handle("uid_a").fetch_add(2, std::sync::atomic::Ordering::Relaxed);
         pool.inflight_handle("uid_b").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for _ in 0..8 {
-            let picked = pool.pick_excluding(&HashSet::new()).unwrap();
+            let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
             assert_eq!(picked.uid, "uid_b", "全部 busy 时应取 inflight 最小者");
         }
     }
@@ -1549,7 +1535,7 @@ mod tests {
         let pool = build_pool(&[("uid_a", 10.0, 0)]);
         pool.set_concurrency_limit(0);
         pool.inflight_handle("uid_a").fetch_add(3, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_a");
+        assert_eq!(pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid, "uid_a");
     }
 
     #[test]
@@ -1558,7 +1544,7 @@ mod tests {
         let pool = build_pool(&[("uid_a", 10.0, 0)]);
         pool.set_concurrency_limit(1);
         pool.inflight_handle("uid_a").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(pool.pick_excluding(&HashSet::new()).unwrap().uid, "uid_a");
+        assert_eq!(pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid, "uid_a");
     }
 
     #[test]

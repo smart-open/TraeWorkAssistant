@@ -390,15 +390,18 @@ fn run_wb_stream(
     let templates = load_templates(state);
     let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
-    // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）
+    // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）。
+    // issue #25 资源池绑定：仅当 Key 约束作用域含 buddy 池时应用（绑定 trae 的
+    // Key 白名单指 Trae 账号，不得误过滤 WB 池）
     let key_constraints = super::api_keys::constraints_for(&state.data_dir, key_id);
     let allowed_set: Option<HashSet<String>> = key_constraints
         .as_ref()
+        .filter(|k| k.constrains_pool("buddy"))
         .map(|k| k.allowed_accounts.iter().cloned().collect())
         .filter(|s: &HashSet<String>| !s.is_empty());
     let dedicated: Option<String> = key_constraints
         .as_ref()
-        .filter(|k| k.schedule_mode == super::api_keys::MODE_DEDICATED)
+        .filter(|k| k.constrains_pool("buddy") && k.schedule_mode == super::api_keys::MODE_DEDICATED)
         .map(|k| {
             if k.dedicated_account.is_empty() {
                 k.allowed_accounts.first().cloned().unwrap_or_default()
@@ -679,11 +682,12 @@ pub async fn wb_aggregate_chat(
         let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_id);
         let allowed_set: Option<HashSet<String>> = key_constraints
             .as_ref()
+            .filter(|k| k.constrains_pool("buddy"))
             .map(|k| k.allowed_accounts.iter().cloned().collect())
             .filter(|s: &HashSet<String>| !s.is_empty());
         let dedicated: Option<String> = key_constraints
             .as_ref()
-            .filter(|k| k.schedule_mode == super::api_keys::MODE_DEDICATED)
+            .filter(|k| k.constrains_pool("buddy") && k.schedule_mode == super::api_keys::MODE_DEDICATED)
             .map(|k| {
                 if k.dedicated_account.is_empty() {
                     k.allowed_accounts.first().cloned().unwrap_or_default()
@@ -995,11 +999,12 @@ pub async fn wb_tool_exec_chat(
         let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_id);
         let allowed_set: Option<HashSet<String>> = key_constraints
             .as_ref()
+            .filter(|k| k.constrains_pool("buddy"))
             .map(|k| k.allowed_accounts.iter().cloned().collect())
             .filter(|s: &HashSet<String>| !s.is_empty());
         let dedicated: Option<String> = key_constraints
             .as_ref()
-            .filter(|k| k.schedule_mode == super::api_keys::MODE_DEDICATED)
+            .filter(|k| k.constrains_pool("buddy") && k.schedule_mode == super::api_keys::MODE_DEDICATED)
             .map(|k| {
                 if k.dedicated_account.is_empty() {
                     k.allowed_accounts.first().cloned().unwrap_or_default()

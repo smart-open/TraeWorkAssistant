@@ -6,7 +6,7 @@
  * 在子弹框打开期间屏蔽 ESC 双关（主弹窗 onClose 先于子弹框触发）。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { BarChart3, Check, Copy, KeyRound, Plus, Power, RefreshCw, Trash2 } from 'lucide-react';
+import { Check, Copy, KeyRound, Plus, Power, RefreshCw, Route, Trash2 } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
 import { copyText } from '../../lib/clipboard';
@@ -44,9 +44,15 @@ export default function ApiKeysManager({
   const [editAllowed, setEditAllowed] = useState<Set<string>>(new Set());
   const [editMode, setEditMode] = useState('expire_first');
   const [editDedicated, setEditDedicated] = useState('');
+  // issue #25 资源池绑定："" = 跟随全局调度 | "trae" | "buddy"
+  const [editBindPool, setEditBindPool] = useState('');
+  // 新增 Key 时的资源池选择（issue #25）
+  const [newBindPool, setNewBindPool] = useState('');
   const [deleteForKey, setDeleteForKey] = useState<ApiKeyEntry | null>(null);
-  // 子 Key 配置候选（服务运行中的上游账号；打开弹框时刷新）
+  // 子 Key 配置候选（两池上游账号；打开弹框时刷新）：
+  // poolStatus = Trae 池（invoke pool_status），buddyPoolStatus = Buddy/WB 池
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
+  const [buddyPoolStatus, setBuddyPoolStatus] = useState<PoolStatus[]>([]);
   // 今日按 Key 的 token 用量（「今日已用」列展示）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
 
@@ -118,11 +124,13 @@ export default function ApiKeysManager({
       allowed_accounts: [],
       schedule_mode: 'expire_first',
       dedicated_account: '',
+      bind_pool: newBindPool,
       daily_stats: [],
     };
     void saveKeys([...apiKeys, entry], `Key「${name}」已添加`);
     setNewKeyName('');
     setNewKeyLimit(0);
+    setNewBindPool('');
     generateKeyValue();
   };
 
@@ -142,16 +150,23 @@ export default function ApiKeysManager({
     await saveKeys(apiKeys.filter((x) => x.id !== k.id), `Key「${k.name}」已删除`);
   };
 
-  // 子 Key 配置弹框（F-35）：限定上游 + 专一/临期优先 + 按日统计展示
+  // 子 Key 配置弹框（F-35 + issue #25 资源池绑定）：限定上游 + 专一/临期优先 + 按日统计展示
   const openKeyEdit = (k: ApiKeyEntry) => {
     setEditKey(k);
     setEditAllowed(new Set(k.allowed_accounts));
     setEditMode(k.schedule_mode || 'expire_first');
     setEditDedicated(k.dedicated_account || '');
-    // 服务可能刚启动，候选列表即时刷新
+    setEditBindPool(k.bind_pool || '');
+    // 服务可能刚启动，两池候选列表即时刷新
     api.apiServer
       .poolStatus()
       .then(setPoolStatus)
+      .catch(() => {
+        /* 保留上次候选 */
+      });
+    api.apiServer
+      .wbPoolStatus()
+      .then(setBuddyPoolStatus)
       .catch(() => {
         /* 保留上次候选 */
       });
@@ -166,6 +181,7 @@ export default function ApiKeysManager({
             allowed_accounts: [...editAllowed],
             schedule_mode: editMode,
             dedicated_account: editMode === 'dedicated' ? editDedicated : '',
+            bind_pool: editBindPool,
           }
         : k,
     );
@@ -197,10 +213,16 @@ export default function ApiKeysManager({
   useEffect(() => {
     void loadKeys();
     generateKeyValue();
-    // 上游账号候选（服务未运行时为空列表）
+    // 上游账号候选（服务未运行时为空列表）：Trae 池 + Buddy 池
     api.apiServer
       .poolStatus()
       .then(setPoolStatus)
+      .catch(() => {
+        /* 保留空列表 */
+      });
+    api.apiServer
+      .wbPoolStatus()
+      .then(setBuddyPoolStatus)
       .catch(() => {
         /* 保留空列表 */
       });
@@ -227,6 +249,18 @@ export default function ApiKeysManager({
     );
     return m;
   }, [usage, todayKey]);
+
+  // issue #25 资源池绑定：限定上游/专一账号候选按绑定池切换数据源
+  // （trae → Trae 池账号；buddy/默认 → Buddy 池账号；两池 uid 体系不同不混用）。
+  // 修复历史问题：原候选列表拉的是 Trae 池，而后端白名单只作用于 WB 池
+  const editCandidates = editBindPool === 'trae' ? poolStatus : buddyPoolStatus;
+  const switchBindPool = (p: string) => {
+    if (p === editBindPool) return;
+    setEditBindPool(p);
+    // 切换池清空已勾选账号与专一账号（uid 体系不同）
+    setEditAllowed(new Set());
+    setEditDedicated('');
+  };
 
   return (
     <div className="card p-4">
@@ -276,6 +310,31 @@ export default function ApiKeysManager({
             value={newKeyLimit}
             onChange={(e) => setNewKeyLimit(parseInt(e.target.value) || 0)}
           />
+        </div>
+        <div className="w-56">
+          <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
+            资源池<span className="ml-1 font-normal text-slate-400">（优先走所选池）</span>
+          </label>
+          <div className="flex gap-1">
+            {[
+              { key: '', label: '跟随全局', title: '不绑定，按系统策略选池' },
+              { key: 'trae', label: 'Trae 池', title: '优先走 Trae，异常可回退' },
+              { key: 'buddy', label: 'Buddy 池', title: '优先走 Buddy，异常可回退' },
+            ].map((p) => (
+              <button
+                key={p.key}
+                className={`flex-1 rounded-lg border px-2 py-1.5 text-xs font-medium transition-colors ${
+                  newBindPool === p.key
+                    ? 'border-indigo-400 bg-indigo-50 text-indigo-600 dark:border-indigo-500 dark:bg-indigo-500/10 dark:text-indigo-300'
+                    : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400'
+                }`}
+                onClick={() => setNewBindPool(p.key)}
+                title={p.title}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
         </div>
         <button
           className="btn-outline flex items-center gap-1 !px-3 text-xs"
@@ -383,6 +442,9 @@ export default function ApiKeysManager({
                       ) : (
                         <Badge tone="slate">临期优先</Badge>
                       )}
+                      {/* issue #25 资源池绑定徽标 */}
+                      {k.bind_pool === 'trae' && <Badge tone="blue" className="ml-1">Trae 池</Badge>}
+                      {k.bind_pool === 'buddy' && <Badge tone="green" className="ml-1">Buddy 池</Badge>}
                       {k.allowed_accounts.length > 0 && (
                         <span className="ml-1 text-xs text-slate-400" title={k.allowed_accounts.join(', ')}>
                           限{k.allowed_accounts.length}账号
@@ -421,7 +483,7 @@ export default function ApiKeysManager({
                           title="调度配置（限定上游 / 专一 / 临期优先）"
                           onClick={() => openKeyEdit(k)}
                         >
-                          <BarChart3 size={14} />
+                          <Route size={14} />
                         </button>
                         <button
                           className="btn-ghost !p-1.5"
@@ -455,6 +517,27 @@ export default function ApiKeysManager({
       >
         <div className="space-y-4 text-sm">
           <div>
+            <div className="mb-1.5 text-xs font-medium text-slate-500">
+              资源池<span className="ml-1 font-normal text-slate-400">（issue #25：绑定后该 Key 的请求优先走所选池）</span>
+            </div>
+            <div className="flex gap-2">
+              {[
+                { key: '', label: '跟随全局调度', desc: '不绑定，按系统策略选池' },
+                { key: 'trae', label: 'Trae 池', desc: '优先走 Trae，异常可回退' },
+                { key: 'buddy', label: 'Buddy 池', desc: '优先走 Buddy，异常可回退' },
+              ].map((p) => (
+                <button
+                  key={p.key}
+                  className={`flex-1 rounded-lg border p-2.5 text-left text-xs ${editBindPool === p.key ? 'border-indigo-400 bg-indigo-50 dark:bg-indigo-500/10' : 'border-slate-200 dark:border-zinc-700'}`}
+                  onClick={() => switchBindPool(p.key)}
+                >
+                  <div className="font-medium">{p.label}</div>
+                  <div className="mt-0.5 text-slate-400">{p.desc}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
             <div className="mb-1.5 text-xs font-medium text-slate-500">调度模式</div>
             <div className="flex gap-2">
               {[
@@ -474,30 +557,35 @@ export default function ApiKeysManager({
           </div>
           {editMode === 'dedicated' && (
             <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-500">专一账号</span>
+              <span className="mb-1 block text-xs font-medium text-slate-500">
+                专一账号<span className="ml-1 font-normal text-slate-400">（{editBindPool === 'trae' ? 'Trae 池' : 'Buddy 池'}账号）</span>
+              </span>
               <select className="input w-full" value={editDedicated} onChange={(e) => setEditDedicated(e.target.value)}>
                 <option value="">— 默认取限定上游首个 —</option>
-                {poolStatus.map((p) => (
+                {editCandidates.map((p) => (
                   <option key={p.uid} value={p.uid}>
                     {p.name || p.uid}
                     {p.credits != null ? `（${p.credits.toFixed(1)} 积分）` : ''}
                   </option>
                 ))}
               </select>
-              {poolStatus.length === 0 && (
+              {editCandidates.length === 0 && (
                 <span className="mt-1 block text-xs text-amber-500">服务未运行，暂无上游账号候选；可保存后稍后调整。</span>
               )}
             </label>
           )}
           <div>
             <div className="mb-1.5 text-xs font-medium text-slate-500">
-              限定上游<span className="ml-1 font-normal text-slate-400">（不勾选 = 使用全部上游账号）</span>
+              限定上游
+              <span className="ml-1 font-normal text-slate-400">
+                （{editBindPool === 'trae' ? 'Trae 池账号' : 'Buddy 池账号'}；不勾选 = 使用全部上游账号）
+              </span>
             </div>
             <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2 dark:border-zinc-700">
-              {poolStatus.length === 0 ? (
+              {editCandidates.length === 0 ? (
                 <div className="py-2 text-center text-xs text-slate-400">服务未运行，暂无上游账号候选</div>
               ) : (
-                poolStatus.map((p) => (
+                editCandidates.map((p) => (
                   <label key={p.uid} className="flex items-center gap-2 text-xs">
                     <input
                       type="checkbox"

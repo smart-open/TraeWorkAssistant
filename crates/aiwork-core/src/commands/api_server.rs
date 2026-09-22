@@ -377,6 +377,17 @@ pub fn api_unified_models(
     Ok(list)
 }
 
+/// 读取全局模型白名单（canonical 归一列表；空 = 不限，issue #26）
+pub fn model_whitelist_get(state: &AppState) -> Vec<String> {
+    crate::api_server::unified_catalog::load_whitelist(&state.data_dir)
+}
+
+/// 保存全局模型白名单（canonical 归一 + 去空 + 去重；空列表 = 不限）；
+/// 返回归一后的生效值（前端展示以返回值为准）
+pub fn model_whitelist_set(state: &AppState, models: Vec<String>) -> Result<Vec<String>, String> {
+    crate::api_server::unified_catalog::save_whitelist(&state.data_dir, &models)
+}
+
 /// 读取调度策略（规范化后视图：非法池名/空优先级已回退默认）
 pub fn dispatch_policy_get(
     state: &AppState,

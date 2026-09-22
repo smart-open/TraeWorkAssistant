@@ -13,7 +13,7 @@
 //! 命名约定（v1.2 §2）：对外池标识统一 `trae` / `buddy`；内部实现 wb_* 前缀
 //! 保留不改名，本模块做标识映射（TargetPool::Buddy ↔ wb_* 数据）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -239,14 +239,18 @@ fn log_fallback(state: &ApiSharedState, model: &str, preferred: TargetPool, actu
 
 /// 统一调度分流点（§4.1 ②~⑥）：替代原 `resolve_wb_target` 单向判定。
 ///
+/// - `key_id`：命中 Key 条目 id（None = 匿名/未启用鉴权）；用于 Key 级资源池
+///   绑定（issue #25）。选池优先级：**Key 绑定池 > 会话池粘性 > 全局策略**
+///   （per_model > priority，smart 重排）。
 /// - 返回 `Ok(Resolved)`：按 pool 分发到对应执行路径（Buddy → wb_route，Trae → solo）；
 /// - 返回 `Err(DispatchError)`：错误矩阵处置，由端点按协议格式化响应。
 ///
-/// 默认策略下路由行为与改造前一致（§9.1 零行为差异）。
+/// 默认策略（无绑定 Key）下路由行为与改造前一致（§9.1 零行为差异）。
 pub fn resolve_target(
     state: &Arc<ApiSharedState>,
     model: &str,
     body: &Value,
+    key_id: Option<&str>,
 ) -> Result<Resolved, DispatchError> {
     // ⓪ 自定义模型直达（custom_models.json 命中 enabled 条目）：用户显式配置
     // 优先于内置目录；单源无跨池回退，模型名原样透传（custom_route 按条目
@@ -266,25 +270,30 @@ pub fn resolve_target(
     let catalog = super::wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
     let buddy_hit = super::wb_catalog::find(&catalog, &r.model)
-        .map(|_| {
-            // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
-            let final_model = if state
-                .wb_bg_downgrade
-                .load(std::sync::atomic::Ordering::Relaxed)
-                && wb_model_route::is_background_task(body)
-            {
-                wb_model_route::cheapest_catalog_model(&catalog).unwrap_or_else(|| r.model.clone())
-            } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
-                // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
-                && wb_model_route::estimate_input_tokens(body)
-                    >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
-            {
-                wb_model_route::flash_catalog_model(&catalog).unwrap_or_else(|| r.model.clone())
-            } else {
-                r.model.clone()
-            };
-            (final_model, r.effort_hint.clone())
-        });
+            .map(|_| {
+                // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
+                // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
+                let whitelist = super::unified_catalog::load_whitelist(&state.data_dir);
+                let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
+                let final_model = if state
+                    .wb_bg_downgrade
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && wb_model_route::is_background_task(body)
+                {
+                    wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl)
+                        .unwrap_or_else(|| r.model.clone())
+                } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+                    // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
+                    && wb_model_route::estimate_input_tokens(body)
+                        >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
+                {
+                    wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl)
+                        .unwrap_or_else(|| r.model.clone())
+                } else {
+                    r.model.clone()
+                };
+                (final_model, r.effort_hint.clone())
+            });
 
     // ③ Trae 源判定：canonical_id 命中 Trae 模型列表；未命中任何目录时保持
     // 透传语义（单源 Trae，与现状一致）
@@ -306,11 +315,31 @@ pub fn resolve_target(
         return Err(DispatchError::WbDisabled);
     }
 
-    // 会话池粘性（§4.4 软粘，TTL 60s，内存态不落盘）：命中且池仍可用 → 直接沿用
+    // ③⁻ Key 级资源池绑定（issue #25）：解析命中 Key 的约束快照。
+    // 绑定是「池偏好」而非模型过滤——绑定池无该模型源时仍路由到唯一可用池（D2）；
+    // 未绑定（""/非法值/无 Key）跟随全局调度，行为与改造前一致
+    let key_rk = key_id.and_then(|id| super::api_keys::constraints_for(&state.data_dir, id));
+    let bind = key_rk.as_ref().and_then(|rk| rk.bind_pool());
+    // 绑定 Key 的白名单健康预检（仅绑定池生效）：绑定池内若仅剩白名单外账号，
+    // 选池阶段即判不健康走全局 fallback，而非取号阶段才失败。
+    // 未绑定 Key 维持现状——预检不感知白名单，F-35 约束由执行路径取号时自理
+    let key_allowed_for = |pool: TargetPool| -> Option<HashSet<String>> {
+        let rk = key_rk.as_ref()?;
+        if bind.is_none() || !rk.constrains_pool(pool.as_str()) || rk.allowed_accounts.is_empty() {
+            return None;
+        }
+        Some(rk.allowed_accounts.iter().cloned().collect())
+    };
+
+    // 会话池粘性（§4.4 软粘，TTL 60s，内存态不落盘）：命中且池仍可用 → 直接沿用。
+    // Key 绑定池优先于粘性：粘性池 ≠ 绑定池时不沿用（重新按候选序选池）
     let sticky_key = pool_session_key(body);
     if let Some(sk) = &sticky_key {
         if let Some(pool) = take_sticky(state, sk) {
-            if sources.available(pool, wb_enabled) && pool_healthy(state, pool, &sources, wb_enabled) {
+            if bind.map_or(true, |b| pool.as_str() == b)
+                && sources.available(pool, wb_enabled)
+                && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref())
+            {
                 record_sticky(state, sk, pool);
                 return Ok(Resolved {
                     pool,
@@ -322,25 +351,38 @@ pub fn resolve_target(
         }
     }
 
-    // ④ 按策略优先级序选池（per_model 覆盖优先）
+    // ④ 按策略优先级序选池：有绑定时强制 [绑定池, 另一池] 候选序，跳过
+    // per_model 与 smart 重排（用户 Key 级显式配置优先于全局策略）
     let policy = load_policy(&state.data_dir);
-    let mut order: Vec<TargetPool> = policy
-        .per_model
-        .get(&canonical)
-        .cloned()
-        .unwrap_or_else(|| policy.priority.clone())
-        .iter()
-        .filter_map(|s| TargetPool::parse(s))
-        .collect();
-    // per_model 可能只写了一个池：另一可用源追加尾部，保证双源回退有序
-    for p in [TargetPool::Buddy, TargetPool::Trae] {
-        if !order.contains(&p) {
-            order.push(p);
+    let mut order: Vec<TargetPool> = if let Some(b) = bind {
+        // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"，无需再 parse
+        if b == "trae" {
+            vec![TargetPool::Trae, TargetPool::Buddy]
+        } else {
+            vec![TargetPool::Buddy, TargetPool::Trae]
         }
-    }
+    } else {
+        let mut o: Vec<TargetPool> = policy
+            .per_model
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_else(|| policy.priority.clone())
+            .iter()
+            .filter_map(|s| TargetPool::parse(s))
+            .collect();
+        // per_model 可能只写了一个池：另一可用源追加尾部，保证双源回退有序
+        for p in [TargetPool::Buddy, TargetPool::Trae] {
+            if !o.contains(&p) {
+                o.push(p);
+            }
+        }
+        o
+    };
     // ④+ 智能调度（strategy=smart）：双源可用且无 per_model 显式覆盖时，
-    // 按请求模型对候选池重排（到期 → 倍率/免费 → 积分多；并列保持优先级序）
-    if policy.strategy == DispatchStrategy::Smart
+    // 按请求模型对候选池重排（到期 → 倍率/免费 → 积分多；并列保持优先级序）。
+    // 有绑定时跳过（绑定序即最终候选序）
+    if bind.is_none()
+        && policy.strategy == DispatchStrategy::Smart
         && policy.per_model.get(&canonical).is_none()
         && sources.is_dual()
         && wb_enabled
@@ -358,7 +400,7 @@ pub fn resolve_target(
         if !sources.available(pool, wb_enabled) {
             continue;
         }
-        match pool_health(state, pool, &sources, wb_enabled) {
+        match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref()) {
             Ok(()) => {
                 // 首个可用池胜出；此前有可用池失败 → 跨池回退 warn 日志（§4.5）。
                 // 源剔除（如 wb_enabled=false）不算回退，不记日志
@@ -460,11 +502,13 @@ fn smart_pool_order(
 }
 
 /// 首选池健康检查：Buddy 池额外检查模型级冷却（优先级高于账号级）
+/// `allowed`：Key 绑定的白名单（仅绑定池生效），None = 不感知白名单
 fn pool_health(
     state: &Arc<ApiSharedState>,
     pool: TargetPool,
     sources: &ModelSources,
     _wb_enabled: bool,
+    allowed: Option<&HashSet<String>>,
 ) -> Result<(), FallbackReason> {
     match pool {
         TargetPool::Buddy => {
@@ -472,13 +516,13 @@ fn pool_health(
             if super::wb_route::model_cooling_remaining(state, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
             }
-            if !state.wb_pool.has_selectable() {
+            if !state.wb_pool.has_selectable_in(allowed) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
         }
         TargetPool::Trae => {
-            if !state.pool.has_selectable() {
+            if !state.pool.has_selectable_in(allowed) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
@@ -493,8 +537,9 @@ fn pool_healthy(
     pool: TargetPool,
     sources: &ModelSources,
     wb_enabled: bool,
+    allowed: Option<&HashSet<String>>,
 ) -> bool {
-    pool_health(state, pool, sources, wb_enabled).is_ok()
+    pool_health(state, pool, sources, wb_enabled, allowed).is_ok()
 }
 
 fn final_buddy_model(sources: &ModelSources) -> String {
@@ -648,12 +693,51 @@ mod tests {
                 &self.state,
                 model,
                 &json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}),
+                None,
             )
         }
 
         /// 无会话键的解析（无 messages → 不粘性）
         fn resolve_no_session(&self, model: &str) -> Result<Resolved, DispatchError> {
-            resolve_target(&self.state, model, &json!({"model": model}))
+            resolve_target(&self.state, model, &json!({"model": model}), None)
+        }
+
+        /// 带会话指纹 + Key 的解析（issue #25 资源池绑定用例）
+        fn resolve_key(&self, model: &str, key_id: &str) -> Result<Resolved, DispatchError> {
+            resolve_target(
+                &self.state,
+                model,
+                &json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}),
+                Some(key_id),
+            )
+        }
+
+        /// 种子一个启用的 Key 条目（store 直写，追加/替换式合并；
+        /// 须在首次 resolve_key 前调用——constraints_for 首读后缓存不可见后续直写）
+        fn seed_key(&self, id: &str, bind_pool: &str, allowed: &[&str]) {
+            self.seed_key_cfg(id, bind_pool, allowed, "", "")
+        }
+
+        /// 同上，可指定调度模式与专一账号（trae_pool_constraints 等用例用）
+        fn seed_key_cfg(&self, id: &str, bind_pool: &str, allowed: &[&str], mode: &str, dedicated: &str) {
+            let mut file = crate::store::docs::api_keys_load(&crate::store::db(&self.dir));
+            file.keys.retain(|k| k.id != id);
+            file.keys.push(super::super::api_keys::ApiKeyEntry {
+                id: id.into(),
+                name: id.into(),
+                key: format!("ck-{id}"),
+                enabled: true,
+                daily_limit: 0,
+                created_at: 0,
+                used_date: String::new(),
+                used_today: 0,
+                allowed_accounts: allowed.iter().map(|s| s.to_string()).collect(),
+                schedule_mode: mode.into(),
+                dedicated_account: dedicated.into(),
+                bind_pool: bind_pool.into(),
+                daily_stats: vec![],
+            });
+            crate::store::docs::api_keys_save(&crate::store::db(&self.dir), &file).unwrap();
         }
 
         fn set_wb_enabled(&self, on: bool) {
@@ -933,6 +1017,7 @@ mod tests {
             &f.state,
             "glm-5.3",
             &json!({"model": "glm-5.3", "conversation_id": "sessA", "messages": []}),
+            None,
         )
         .unwrap();
         assert_eq!(a.pool, TargetPool::Buddy);
@@ -949,6 +1034,7 @@ mod tests {
             &f.state,
             "glm-5.3",
             &json!({"model": "glm-5.3", "conversation_id": "sessB", "messages": []}),
+            None,
         )
         .unwrap();
         assert_eq!(b.pool, TargetPool::Trae);
@@ -957,6 +1043,7 @@ mod tests {
             &f.state,
             "glm-5.3",
             &json!({"model": "glm-5.3", "conversation_id": "sessA", "messages": []}),
+            None,
         )
         .unwrap();
         assert_eq!(a2.pool, TargetPool::Buddy);
@@ -968,7 +1055,7 @@ mod tests {
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
         f.seed_healthy(true);
         f.seed_healthy(false);
-        let r1 = resolve_target(&f.state, "glm-5.3", &json!({"model": "glm-5.3"})).unwrap();
+        let r1 = resolve_target(&f.state, "glm-5.3", &json!({"model": "glm-5.3"}), None).unwrap();
         assert_eq!(r1.pool, TargetPool::Buddy);
         // 粘性表为空
         assert!(f.state.pool_sticky.lock().unwrap().is_empty());
@@ -1068,6 +1155,7 @@ mod tests {
             &f.state,
             "glm-5.3",
             &json!({"model": "glm-5.3", "conversation_id": "sess-new", "messages": []}),
+            None,
         )
         .unwrap();
         assert_eq!(fresh.pool, TargetPool::Buddy);
@@ -1126,5 +1214,177 @@ mod tests {
         f.seed_healthy(true);
         f.seed_healthy(false);
         assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Trae);
+    }
+
+    // ---------- Key 资源池绑定（issue #25） ----------
+
+    /// 绑定池 > 全局策略：默认策略 Buddy 优先 + smart 重排，Key 绑定 trae → Trae
+    #[test]
+    fn t31_bind_pool_overrides_policy_and_smart() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        // 先无 Key 请求：按全局策略走 Buddy 并写粘性（避免污染后续断言）
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+        // 绑定 trae 的 Key 同会话请求：粘性池 ≠ 绑定池不沿用，绑定序覆盖全局策略
+        f.seed_key("k1", "trae", &[]);
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Trae);
+    }
+
+    /// 绑定池 > 会话池粘性（双向）：粘性池 ≠ 当前 Key 绑定池时不沿用，
+    /// 每次都按当前 Key 的绑定序重新选池
+    #[test]
+    fn t32_bind_pool_beats_sticky() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        f.seed_key("k1", "trae", &[]);
+        f.seed_key("k2", "buddy", &[]);
+        // k1 → Trae，写粘性 Trae
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Trae);
+        // 同会话 k2：粘性 Trae ≠ 绑定 Buddy → 不沿用 → Buddy
+        assert_eq!(f.resolve_key("glm-5.3", "k2").unwrap().pool, TargetPool::Buddy);
+        // 同会话 k1：粘性 Buddy ≠ 绑定 Trae → 不沿用 → Trae
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Trae);
+    }
+
+    /// 绑定池不健康：fallback 开（默认）→ 回退另一池 + warn 日志（D1 优先非硬限制）
+    #[test]
+    fn t33_bind_pool_unhealthy_falls_back() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false); // 仅 Buddy 健康，Trae 池耗尽
+        f.seed_key("k1", "trae", &[]);
+        let r = f.resolve_key("glm-5.3", "k1").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.fallback_from, Some(TargetPool::Trae));
+        assert!(f.app_log_contains("dispatch fallback: model=glm-5.3 preferred=trae actual=buddy reason=no_healthy_account"));
+
+        // fallback 关：绑定池不健康 → 显式报错（不回退）
+        let mut p = policy_default();
+        p.fallback = false;
+        let f2 = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f2.seed_healthy(false);
+        f2.seed_key("k1", "trae", &[]);
+        assert_eq!(
+            f2.resolve_key("glm-5.3", "k1").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Trae)
+        );
+    }
+
+    /// 绑定池白名单感知健康预检：绑定 buddy + 白名单 [b2]（池内仅 b1）→
+    /// Buddy 对该 Key 不健康 → 回退 Trae；fallback 关 → NoHealthy(Buddy)
+    #[test]
+    fn t34_bind_pool_whitelist_aware_health() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false); // 池内仅 b1，不在白名单
+        f.seed_key("k1", "buddy", &["b2"]);
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Trae);
+
+        let mut p = policy_default();
+        p.fallback = false;
+        let f2 = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f2.seed_healthy(true);
+        f2.seed_healthy(false);
+        f2.seed_key("k1", "buddy", &["b2"]);
+        assert_eq!(
+            f2.resolve_key("glm-5.3", "k1").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Buddy)
+        );
+    }
+
+    /// D2 绑定是池偏好非模型过滤：绑定 trae + 模型仅 Buddy 源（hy4）→ 仍走 Buddy
+    #[test]
+    fn t35_bind_pool_is_preference_not_filter() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        f.seed_key("k1", "trae", &[]);
+        let r = f.resolve_key("hy4", "k1").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert!(r.fallback_from.is_none(), "唯一可用池不算回退");
+    }
+
+    /// 非法 bind_pool 值视为未绑定：跟随全局策略（默认 Buddy 优先）
+    #[test]
+    fn t36_bind_pool_invalid_value_follows_global() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        f.seed_key("k1", "openai", &[]);
+        assert_eq!(f.resolve_key("glm-5.3", "k1").unwrap().pool, TargetPool::Buddy);
+    }
+
+    /// routes::trae_pool_constraints 四种作用域（复用本模块 Fixture 构造状态）：
+    /// 未绑定/绑定 buddy → (None, None)；绑定 trae → 提取白名单 + 专一；未知 Key → 匿名
+    #[test]
+    fn t37_trae_pool_constraints_scopes() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), None);
+        // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
+        f.seed_key("k0", "", &["b1"]);
+        f.seed_key_cfg("k1", "trae", &["t1", "t2"], super::super::api_keys::MODE_DEDICATED, "t2");
+        f.seed_key("k2", "buddy", &["b1"]);
+        f.seed_key_cfg("k3", "trae", &["t1"], super::super::api_keys::MODE_EXPIRE_FIRST, "");
+
+        // 未绑定 Key：白名单历来只作用 WB 池，绝不波及 Trae 池（F-35 兼容红线）
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "k0");
+        assert!(a.is_none() && d.is_none(), "未绑定 Key 的白名单不得作用于 Trae 池");
+
+        // 绑定 trae + 专一：白名单与 dedicated 均提取（dedicated 非空优先于 allowed 首个）
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "k1");
+        let set = a.expect("绑定 trae 应提取白名单");
+        assert!(set.contains("t1") && set.contains("t2"));
+        assert_eq!(d.as_deref(), Some("t2"));
+
+        // 绑定 buddy：白名单指 Buddy 账号体系，Trae 侧不应用
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "k2");
+        assert!(a.is_none() && d.is_none());
+
+        // 绑定 trae + 临期优先：只提取白名单，无 dedicated
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "k3");
+        assert!(a.is_some() && d.is_none());
+
+        // 未知 Key（已注销/匿名）：不限制
+        let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "nope");
+        assert!(a.is_none() && d.is_none());
+    }
+
+    // ---------- issue #26 全局模型白名单 ----------
+
+    /// 白名单感知后台任务降级（dispatch 白名单联动）：候选 ∩ 白名单非空 →
+    /// 取白名单内最低倍率；交集为空 → 跳过降级保持原模型（原模型已过端点准入）
+    #[test]
+    fn t38_whitelist_aware_bg_downgrade() {
+        // 内置目录（fixture 写入的 kv 因 builtin_rev=0 触发内置表重建）：
+        // 全局最低为 hy4-preview(0.00 免费档)，原模型 glm-5.3(0.78)
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        f.state
+            .wb_bg_downgrade
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 后台任务体：max_tokens ≤ 128 + 短文本（is_background_task = true）
+        let bg_body = || {
+            json!({"model": "glm-5.3", "max_tokens": 16,
+                   "messages": [{"role": "user", "content": "生成标题"}]})
+        };
+
+        // 白名单含 glm-5.3-flash(0.06) + glm-5.3 → 降级取白名单内最低倍率（跳过被禁的 0.00 免费档）
+        super::super::unified_catalog::save_whitelist(
+            &f.dir,
+            &["GLM-5.3-Flash".to_string(), "GLM-5.3".to_string()],
+        )
+        .unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.model, "glm-5.3-flash", "降级候选 ∩ 白名单 → 白名单内最低倍率");
+
+        // 白名单仅含原模型 → 候选集只剩 glm-5.3，不落入被禁模型
+        super::super::unified_catalog::save_whitelist(&f.dir, &["GLM-5.3".to_string()]).unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
+        assert_eq!(r.model, "glm-5.3", "降级候选不在白名单 → 跳过降级保持原模型");
+
+        // 白名单清空（不限）→ 正常降级到目录最低倍率 hy4-preview
+        super::super::unified_catalog::save_whitelist(&f.dir, &[]).unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
+        assert_eq!(r.model, "hy4-preview", "空白名单不限 → 后台任务降级取目录最低倍率");
     }
 }

@@ -40,7 +40,7 @@ pub enum KeyCheck {
     QuotaExceeded { limit: u64 },
 }
 
-/// 鉴权通过后的 Key 约束快照（F-35）
+/// 鉴权通过后的 Key 约束快照（F-35 + 资源池绑定）
 #[derive(Clone, Debug)]
 pub struct ResolvedKey {
     pub id: String,
@@ -50,6 +50,37 @@ pub struct ResolvedKey {
     pub schedule_mode: String,
     /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）
     pub dedicated_account: String,
+    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy"
+    pub bind_pool: String,
+}
+
+impl ResolvedKey {
+    /// 返回绑定的池标识（归一化后 Some("trae")/Some("buddy")；空或非法 = None）
+    pub fn bind_pool(&self) -> Option<&'static str> {
+        parse_bind_pool(&self.bind_pool)
+    }
+
+    /// 该 Key 的 F-35 约束（allowed_accounts 白名单 + dedicated）是否作用于指定池。
+    /// 作用域规则（bind_pool 决定白名单所指的账号体系）：
+    /// - bind=""（未绑定）→ 仅约束 buddy 池（F-35 旧语义兼容：白名单历来只作用于
+    ///   WB 上游；绝不能波及 trae，否则旧 Key 的 Trae 侧调度会被误过滤）
+    /// - bind="trae" → 仅约束 trae 池（白名单/专一指 Trae 账号 uid）
+    /// - bind="buddy" → 仅约束 buddy 池
+    pub fn constrains_pool(&self, pool: &str) -> bool {
+        match self.bind_pool() {
+            None => pool == "buddy",
+            Some(p) => p == pool,
+        }
+    }
+}
+
+/// 解析 bind_pool 字段为静态池标识（空/非法→None）
+pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
+    match s.trim().to_lowercase().as_str() {
+        "trae" => Some("trae"),
+        "buddy" => Some("buddy"),
+        _ => None,
+    }
 }
 
 /// 子 Key 按日统计项
@@ -92,6 +123,11 @@ pub struct ApiKeyEntry {
     /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）
     #[serde(default)]
     pub dedicated_account: String,
+    /// 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy"。
+    /// 绑定后选池优先级最高（覆盖会话粘性与全局策略），池内约束（白名单/专一）
+    /// 随绑定池切换账号体系
+    #[serde(default)]
+    pub bind_pool: String,
     /// 按日请求统计（升序，保留最近 90 天）
     #[serde(default)]
     pub daily_stats: Vec<KeyDailyStat>,
@@ -189,6 +225,7 @@ impl ApiKeysFile {
             allowed_accounts: e.allowed_accounts.clone(),
             schedule_mode: e.schedule_mode().to_string(),
             dedicated_account: e.dedicated_account.clone(),
+            bind_pool: e.bind_pool.clone(),
         })
     }
 
@@ -212,6 +249,7 @@ pub fn constraints_for(data_dir: &Path, key_id: &str) -> Option<ResolvedKey> {
             allowed_accounts: e.allowed_accounts.clone(),
             schedule_mode: e.schedule_mode().to_string(),
             dedicated_account: e.dedicated_account.clone(),
+            bind_pool: e.bind_pool.clone(),
         })
 }
 
@@ -331,6 +369,7 @@ mod tests {
             allowed_accounts: vec![],
             schedule_mode: String::new(),
             dedicated_account: String::new(),
+            bind_pool: String::new(),
             daily_stats: vec![],
         }
     }
@@ -399,6 +438,103 @@ mod tests {
         e.schedule_mode = MODE_DEDICATED.into();
         e.allowed_accounts = vec!["wb-1".into()];
         assert_eq!(e.schedule_mode(), MODE_DEDICATED);
+    }
+
+    #[test]
+    fn bind_pool_parse_and_pool_scope() {
+        // 未绑定：跟随全局调度，F-35 约束仅作用于 buddy 池（旧语义兼容）
+        let mut e = entry("k1", "ck-a", true, 0);
+        assert_eq!(parse_bind_pool(&e.bind_pool), None);
+        let mut rk = constraints_of(&e);
+        assert_eq!(rk.bind_pool(), None);
+        assert!(rk.constrains_pool("buddy"), "旧 Key 白名单仍仅作用 buddy");
+        assert!(!rk.constrains_pool("trae"), "旧 Key 白名单绝不能波及 trae");
+
+        // 绑定 trae：约束切换到 trae 池
+        e.bind_pool = "Trae".into(); // 大小写归一
+        rk = constraints_of(&e);
+        assert_eq!(rk.bind_pool(), Some("trae"));
+        assert!(rk.constrains_pool("trae"));
+        assert!(!rk.constrains_pool("buddy"));
+
+        // 绑定 buddy
+        e.bind_pool = "buddy".into();
+        rk = constraints_of(&e);
+        assert_eq!(rk.bind_pool(), Some("buddy"));
+        assert!(rk.constrains_pool("buddy"));
+        assert!(!rk.constrains_pool("trae"));
+
+        // 非法值视为未绑定
+        e.bind_pool = "openai".into();
+        assert_eq!(parse_bind_pool(&e.bind_pool), None);
+    }
+
+    /// 从条目构造约束快照（模拟 verify_and_consume / constraints_for 的字段拷贝）
+    fn constraints_of(e: &ApiKeyEntry) -> ResolvedKey {
+        ResolvedKey {
+            id: e.id.clone(),
+            allowed_accounts: e.allowed_accounts.clone(),
+            schedule_mode: e.schedule_mode().to_string(),
+            dedicated_account: e.dedicated_account.clone(),
+            bind_pool: e.bind_pool.clone(),
+        }
+    }
+
+    #[test]
+    fn roundtrip_preserves_bind_pool() {
+        let dir = std::env::temp_dir().join(format!("twa_keys_bind_{}", std::process::id()));
+        let mut f = ApiKeysFile::default();
+        let mut e = entry("k1", "ck-x", true, 0);
+        e.bind_pool = "trae".into();
+        f.keys.push(e);
+        save(&dir, &f);
+        let loaded = load(&dir);
+        assert_eq!(loaded.keys[0].bind_pool, "trae");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serde_compat_old_entry_without_bind_pool() {
+        // 旧版本落盘 JSON 无 bind_pool 字段：serde default 反序列化为空串（跟随全局调度）
+        let old = r#"{"id":"k1","name":"旧 Key","key":"ck-x","enabled":true,
+                      "daily_limit":5,"created_at":1,"used_date":"2026-01-01","used_today":2}"#;
+        let e: ApiKeyEntry = serde_json::from_str(old).unwrap();
+        assert_eq!(e.bind_pool, "");
+        assert_eq!(parse_bind_pool(&e.bind_pool), None);
+        assert_eq!(e.schedule_mode(), MODE_EXPIRE_FIRST);
+        // 未来版本新增未知字段：serde 默认忽略，不报错
+        let fut = r#"{"id":"k2","name":"n","key":"ck-y","enabled":true,"future_field":1}"#;
+        let e2: ApiKeyEntry = serde_json::from_str(fut).unwrap();
+        assert_eq!(e2.bind_pool, "");
+    }
+
+    #[test]
+    fn verify_and_consume_returns_bind_pool() {
+        // 鉴权记账返回的约束快照必须携带 bind_pool（供 dispatch/wb_route 读取）
+        let mut f = ApiKeysFile::default();
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.bind_pool = "buddy".into();
+        e.allowed_accounts = vec!["b1".into()];
+        f.keys.push(e);
+        match f.verify_and_consume("ck-a", "2026-09-22") {
+            KeyCheck::Ok(rk) => {
+                assert_eq!(rk.bind_pool(), Some("buddy"));
+                assert!(rk.constrains_pool("buddy"));
+                assert!(!rk.constrains_pool("trae"));
+            }
+            _ => panic!("命中 Key 应返回 Ok"),
+        }
+        // 未绑定 Key：快照 bind_pool 为空串，constrains_pool 维持旧语义（仅 WB 池）
+        let mut f2 = ApiKeysFile::default();
+        f2.keys.push(entry("k2", "ck-b", true, 0));
+        match f2.verify_and_consume("ck-b", "2026-09-22") {
+            KeyCheck::Ok(rk) => {
+                assert_eq!(rk.bind_pool(), None);
+                assert!(rk.constrains_pool("buddy"));
+                assert!(!rk.constrains_pool("trae"));
+            }
+            _ => panic!("命中 Key 应返回 Ok"),
+        }
     }
 
     #[test]
