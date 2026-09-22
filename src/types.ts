@@ -703,6 +703,17 @@ export interface WbUsageFallbackComplete {
 
 export type WbUsageFallback = WbUsageFallbackComplete | WbUsageEmpty;
 
+/** 积分趋势单日快照（wb_credits_history 差分推导；首日 earned/consumed 为 null） */
+export interface WbCreditsTrendSnap {
+  date: string;
+  total: number | null;
+  earned: number | null;
+  consumed: number | null;
+}
+
+/** 积分趋势序列（积分看板三线图数据源） */
+export type WbCreditsTrend = { status: 'ok'; snapshots: WbCreditsTrendSnap[] } | WbUsageEmpty;
+
 /** 积分包（tasks/wb_credits.rs 宽容解析输出） */
 export interface WbCreditPackage {
   name: string;

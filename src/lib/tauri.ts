@@ -43,6 +43,7 @@ import type {
   WbModelInfo,
   WbPoolImportResult,
   WbUsageFallback,
+  WbCreditsTrend,
   WbUsageOfficial,
   WbUsageOfficialAll,
   WorkBuddyAccountView,
@@ -564,6 +565,8 @@ export const api = {
     /** 全账号官方用量聚合（近 7 日积分消耗主数据源；31 天零填充） */
     usageOfficialAll: () => invoke<WbUsageOfficialAll>('workbuddy_usage_official_all'),
     usageFallback: () => invoke<WbUsageFallback>('workbuddy_usage_fallback'),
+    /** 积分趋势序列（wb_credits_history 快照差分 + 签到奖励推导；积分看板三线图） */
+    creditsTrend: () => invoke<WbCreditsTrend>('workbuddy_credits_trend'),
     activityInfo: (userId?: string, fresh?: boolean) =>
       invoke<WbActivityInfo>('workbuddy_activity_info', { userId, refresh: fresh }),
   },

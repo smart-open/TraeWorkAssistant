@@ -15,55 +15,7 @@ import ExpiryCalendar, { type ExpiryItem } from '../components/ExpiryCalendar';
 import { useAppStore } from '../store';
 import { useIsDark } from '../lib/useIsDark';
 import { fmtCredits, normZero } from '../lib/format';
-
-function localDate(d: Date): string {
-  const y = d.getFullYear();
-  const m = `${d.getMonth() + 1}`.padStart(2, '0');
-  const day = `${d.getDate()}`.padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-// ---- 趋势时间区间 ----
-type RangeKey = 'today' | '7d' | '30d' | 'month' | 'year';
-const RANGES: { key: RangeKey; label: string }[] = [
-  { key: 'today', label: '今日' },
-  { key: '7d', label: '近7天' },
-  { key: '30d', label: '近30天' },
-  { key: 'month', label: '本月' },
-  { key: 'year', label: '近一年' },
-];
-
-/** 区间 → 本地自然日序列（升序） */
-function rangeDates(range: RangeKey): string[] {
-  const today = new Date();
-  const dates: string[] = [];
-  const push = (d: Date) => dates.push(localDate(d));
-  switch (range) {
-    case 'today':
-      push(today);
-      break;
-    case '7d':
-      for (let i = 6; i >= 0; i--) push(new Date(Date.now() - i * 86400000));
-      break;
-    case '30d':
-      for (let i = 29; i >= 0; i--) push(new Date(Date.now() - i * 86400000));
-      break;
-    case 'month': {
-      for (
-        let d = new Date(today.getFullYear(), today.getMonth(), 1);
-        d <= today;
-        d = new Date(d.getTime() + 86400000)
-      ) {
-        push(new Date(d));
-      }
-      break;
-    }
-    case 'year':
-      for (let i = 364; i >= 0; i--) push(new Date(Date.now() - i * 86400000));
-      break;
-  }
-  return dates;
-}
+import { localDate, type RangeKey, RANGES, rangeDates } from '../lib/trendRange';
 
 export default function Credits() {
   const accounts = useAppStore((s) => s.accounts);

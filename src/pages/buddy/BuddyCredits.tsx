@@ -16,29 +16,25 @@ import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
 import { withMinDelay } from '../../lib/delay';
-import type { WbCreditsResult, WbCreditAccount, WbCreditPackage } from '../../types';
-
-/** 近 7 日消耗趋势数据（归一化：官方全账号聚合 → 快照差分回退） */
-interface UsageTrend {
-  daily: { date: string; usage: number }[];
-  source: string;
-  stale?: boolean;
-}
+import { normZero } from '../../lib/format';
+import { type RangeKey, RANGES, rangeDates } from '../../lib/trendRange';
+import type { WbCreditsResult, WbCreditAccount, WbCreditPackage, WbCreditsTrendSnap } from '../../types';
 
 /**
  * buddy-credits 积分看板（§3.7.4，F-20/F-22/F-56/F-57/F-58/F-25，对齐 Trae 积分看板）：
- * KPI 统计 + 近 7 日用量趋势 + 账号积分明细排名 + 积分包到期日历。
+ * KPI 统计 + 积分趋势图（总/获得/消耗三线，快照差分落库）+ 账号积分明细排名 + 积分包到期日历。
  */
 export default function BuddyCredits() {
   const pushToast = useAppStore((s) => s.pushToast);
   const isDark = useIsDark();
   const [result, setResult] = useState<WbCreditsResult | null>(null);
-  const [usage, setUsage] = useState<UsageTrend | null>(null);
-  // 用量空态引导文案（status=empty / 双数据源均不可用时展示；有数据即清空）
-  const [usageHint, setUsageHint] = useState<string | null>(null);
+  // 积分趋势数据源（三线图）：wb_credits_history 每日快照（23:30 自动落盘）差分推导
+  const [snapshots, setSnapshots] = useState<WbCreditsTrendSnap[]>([]);
+  // 趋势空态原因（快照未建立 / 查询失败时展示引导；有数据即清空）
+  const [trendEmptyReason, setTrendEmptyReason] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  // 用量趋势区间（T12d：官方聚合含 31 天逐日数据，支持 7/30 日切换）
-  const [trendRange, setTrendRange] = useState<7 | 30>(7);
+  // 趋势区间（对齐 Trae 积分看板：今日/近7天/近30天/本月/近一年）
+  const [range, setRange] = useState<RangeKey>('7d');
 
   const refresh = useCallback(
     async (fresh = false) => {
@@ -56,37 +52,23 @@ export default function BuddyCredits() {
       } finally {
         setLoading(false);
       }
-      // 近 7 日消耗数据源：优先全账号官方用量聚合（31 天逐日完整，不再只有昨天）；
-      // 空态（status=empty）直接展示引导提示，不再降级快照；失败回退本地快照差分
-      //（依赖每日快照任务积累时序，缺天为已知局限）；回退仍无数据时提示官方失败原因
+      // 积分趋势数据源：wb_credits_history 每日快照（23:30 落库）差分推导，
+      // 持久化于 SQLite；空态（status=empty）展示引导提示，失败展示原因
       api.workbuddy
-        .usageOfficialAll()
+        .creditsTrend()
         .then((r) => {
           if (r.status === 'empty') {
-            setUsage(null);
-            setUsageHint(r.reason);
+            setSnapshots([]);
+            setTrendEmptyReason(r.reason);
             return;
           }
-          setUsageHint(null);
-          setUsage({ daily: r.daily, source: '官方用量明细', stale: r.stale });
+          setSnapshots(r.snapshots);
+          setTrendEmptyReason(null);
         })
-        .catch((first) =>
-          api.workbuddy
-            .usageFallback()
-            .then((r) => {
-              if (r.status === 'snapshot') {
-                setUsageHint(null);
-                setUsage({ daily: r.daily, source: '本地快照推导', stale: false });
-                return;
-              }
-              setUsage(null);
-              setUsageHint(String(first));
-            })
-            .catch(() => {
-              setUsage(null);
-              setUsageHint(String(first));
-            }),
-        );
+        .catch((e) => {
+          setSnapshots([]);
+          setTrendEmptyReason(String(e));
+        });
       // eslint-disable-next-line react-hooks/exhaustive-deps
     },
     [],
@@ -107,12 +89,22 @@ export default function BuddyCredits() {
   const soonCount = allPackages.filter((x) => x.pkg.expire_soon).length;
   const avg = accounts.length === 0 ? 0 : total / accounts.length;
 
-  // 用量趋势（官方聚合 31 天逐日 / 本地快照差分回退；按区间截尾）
-  const trend = (usage?.daily ?? []).slice(-trendRange).map((d) => ({
-    label: d.date.slice(5),
-    usage: d.usage,
-  }));
-  const hasTrend = trend.some((d) => d.usage > 0);
+  // 积分趋势（三线图，对齐 Trae 积分看板）：快照缺失的日期为 null，recharts 跳点不画，避免误导性 0 值
+  const snapMap = new Map(snapshots.map((s) => [s.date, s]));
+  const trend = rangeDates(range).map((date) => {
+    const snap = snapMap.get(date);
+    return {
+      label:
+        range === 'year'
+          ? `${date.slice(0, 4)}/${+date.slice(5, 7)}/${+date.slice(8, 10)}`
+          : `${+date.slice(5, 7)}/${+date.slice(8, 10)}`,
+      total: snap?.total ?? null,
+      earned: snap?.earned ?? null,
+      consumed: snap?.consumed ?? null,
+    };
+  });
+  const hasTrend = trend.some((d) => d.total != null || d.earned != null || d.consumed != null);
+  const showDots = range === 'today' || range === '7d';
 
   return (
     <div className="animate-fade-in">
@@ -145,39 +137,42 @@ export default function BuddyCredits() {
             />
           </div>
 
-          {/* 用量趋势（官方用量明细为主数据源，本地快照差分回退；T12d 支持 7/30 日切换） */}
-          {usage && hasTrend && (
-            <div className="mt-5 card p-5">
-              <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <h3 className="font-medium">近 {trendRange} 日积分消耗</h3>
-                  <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
-                    {trendRange} Days
-                  </span>
-                </div>
-                <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#f59e0b' }} />
-                    消耗积分
-                  </span>
-                  <span>{usage.source}{usage.stale ? '（历史缓存回退）' : ''}</span>
-                  <div className="flex items-center gap-1">
-                    {([7, 30] as const).map((n) => (
-                      <button
-                        key={n}
-                        onClick={() => setTrendRange(n)}
-                        className={
-                          trendRange === n
-                            ? 'rounded-full bg-brand-500 px-2.5 py-0.5 font-medium text-white'
-                            : 'rounded-full bg-zinc-100 px-2.5 py-0.5 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400'
-                        }
-                      >
-                        {n} 日
-                      </button>
-                    ))}
-                  </div>
-                </div>
+          {/* 积分趋势图（对齐 Trae 积分看板：总/获得/消耗三线；wb_credits_history 每日快照差分） */}
+          <div className="mt-5 card p-5">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
+                <h3 className="text-sm font-medium text-slate-900 dark:text-zinc-100">积分趋势图</h3>
+                <span className="flex items-center gap-1">
+                  <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#6366f1' }} />
+                  积分总数
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#22c55e' }} />
+                  获得积分
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#f59e0b' }} />
+                  消耗积分
+                </span>
+                <span className="hidden sm:inline">每日积分快照（23:30 自动落盘）</span>
               </div>
+              <div className="flex items-center gap-1">
+                {RANGES.map((r) => (
+                  <button
+                    key={r.key}
+                    onClick={() => setRange(r.key)}
+                    className={`chip border ${
+                      range === r.key
+                        ? 'border-brand-500 text-brand-600 dark:text-brand-400'
+                        : 'border-slate-200 text-slate-500 dark:border-zinc-700 dark:text-zinc-400'
+                    }`}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {hasTrend ? (
               <div className="h-56">
                 <ResponsiveContainer>
                   <LineChart data={trend} margin={{ top: 24, right: 16, left: 0, bottom: 4 }}>
@@ -188,7 +183,7 @@ export default function BuddyCredits() {
                       axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
                       tickLine={false}
                     />
-                    <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={48} />
+                    <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={56} />
                     <Tooltip
                       cursor={{ stroke: isDark ? '#52525b' : '#cbd5e1', strokeWidth: 1, strokeDasharray: '3 3' }}
                       contentStyle={{
@@ -200,25 +195,25 @@ export default function BuddyCredits() {
                         boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
                         padding: '8px 12px',
                       }}
-                      formatter={(v: number) => [Number(v).toFixed(2), '消耗积分']}
+                      formatter={(v: number, name: string) => {
+                        const labels: Record<string, string> = { total: '积分总数', earned: '获得积分', consumed: '消耗积分' };
+                        return [normZero(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 }), labels[name] ?? name];
+                      }}
                     />
-                    <Line type="monotone" dataKey="usage" stroke="#f59e0b" strokeWidth={2.5} dot={{ r: 3, fill: '#f59e0b', strokeWidth: 0 }} activeDot={{ r: 5 }} />
+                    <Line type="monotone" dataKey="total" stroke="#6366f1" strokeWidth={2.5} dot={showDots ? { r: 3, fill: '#6366f1', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
+                    <Line type="monotone" dataKey="earned" stroke="#22c55e" strokeWidth={2} dot={showDots ? { r: 3, fill: '#22c55e', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
+                    <Line type="monotone" dataKey="consumed" stroke="#f59e0b" strokeWidth={3} dot={showDots ? { r: 3, fill: '#f59e0b', strokeWidth: 0 } : false} activeDot={{ r: 5 }} connectNulls />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
-            </div>
-          )}
-
-          {/* 用量空态引导（status=empty / 双数据源均不可用）：替代静默空白，告知如何建立数据 */}
-          {!usage && usageHint && (
-            <div className="mt-5 card p-5">
+            ) : (
               <EmptyState
-                icon={<TrendingUp size={22} />}
-                title="近 7 日积分消耗暂无数据"
-                hint={usageHint}
+                icon={<TrendingUp size={28} />}
+                title="暂无趋势数据"
+                hint={trendEmptyReason ?? '每日积分快照生成后（23:30 自动落盘）这里会展示积分趋势。'}
               />
-            </div>
-          )}
+            )}
+          </div>
 
           {/* 账号积分明细（对齐 Trae：排名表格） */}
           {accounts.length === 0 ? (

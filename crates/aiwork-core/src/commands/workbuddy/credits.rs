@@ -179,18 +179,7 @@ pub fn workbuddy_usage_fallback(state: &AppState) -> Result<serde_json::Value, S
     }
 
     // 签到日志 → 每日奖励充值（90 天滚动，仅 success 事件；SQLite 化 P3 走 store）
-    let results: Value = crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
-    let mut recharge: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    for r in results.get("results").and_then(Value::as_array).into_iter().flatten() {
-        if r.get("status").and_then(Value::as_str) != Some("success") {
-            continue;
-        }
-        let Some(date) = r.get("date").and_then(Value::as_str) else { continue };
-        let msg = r.get("message").and_then(Value::as_str).unwrap_or("");
-        if let Some(v) = parse_reward_plus(msg) {
-            *recharge.entry(date.to_string()).or_insert(0.0) += v;
-        }
-    }
+    let recharge = wb_daily_recharge_from_checkin(state);
 
     // 快照差分（快照按 date 升序，credits 追加时保序）
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -244,6 +233,67 @@ pub fn workbuddy_usage_fallback(state: &AppState) -> Result<serde_json::Value, S
         "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
         "_today": today,
     }))
+}
+
+/// 积分趋势序列（积分看板三线图数据源）：wb_credits_history 快照 + 签到奖励推导
+/// 每日 获得/消耗。口径与 workbuddy_usage_fallback 一致：
+/// consumed = max(0, 前日余额 − 当日余额 + 当日签到奖励)，earned = max(0, 当日 − 前日 + consumed)
+///（恒等式 当日 = 前日 + earned − consumed；余额跳增——充值包到账——计入获得）。
+/// 首个快照无前值，earned/consumed 为 null（前端 connectNulls 跳点不画）。
+pub fn workbuddy_credits_trend(state: &AppState) -> Result<Value, String> {
+    let hist: Value = crate::store::docs::wb_credits_history_load(&crate::store::db(&state.data_dir));
+    let snapshots = hist.get("snapshots").and_then(Value::as_array).cloned().unwrap_or_default();
+    if snapshots.is_empty() {
+        // 冷启动空态（非错误）：等待 23:30 快照任务或积分页刷新建立时序
+        return Ok(serde_json::json!({
+            "status": "empty",
+            "reason": "本地积分快照尚未建立：每日 23:30 快照任务或在积分页刷新后开始积累。",
+        }));
+    }
+    let recharge = wb_daily_recharge_from_checkin(state);
+    let mut rows: Vec<Value> = vec![];
+    for (i, snap) in snapshots.iter().enumerate() {
+        let Some(date) = snap.get("date").and_then(Value::as_str) else { continue };
+        let Some(cur) = snap.get("total_balance").and_then(Value::as_f64) else { continue };
+        let (earned, consumed) = if i == 0 {
+            (None, None)
+        } else {
+            match snapshots[i - 1].get("total_balance").and_then(Value::as_f64) {
+                Some(prev) => {
+                    let reward = recharge.get(date).copied().unwrap_or(0.0);
+                    let consumed = (prev - cur + reward).max(0.0);
+                    let earned = (cur - prev + consumed).max(0.0);
+                    (Some(earned), Some(consumed))
+                }
+                None => (None, None),
+            }
+        };
+        rows.push(serde_json::json!({
+            "date": date,
+            "total": cur,
+            "earned": earned,
+            "consumed": consumed,
+        }));
+    }
+    Ok(serde_json::json!({ "status": "ok", "snapshots": rows }))
+}
+
+/// 签到日志 → 每日奖励充值映射（90 天滚动，仅 success 事件「+N」）：
+/// 用量快照回退与积分趋势共用（口径一致）
+fn wb_daily_recharge_from_checkin(state: &AppState) -> std::collections::HashMap<String, f64> {
+    let results: Value = crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
+    let mut recharge: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for r in results.get("results").and_then(Value::as_array).into_iter().flatten() {
+        if r.get("status").and_then(Value::as_str) != Some("success") {
+            continue;
+        }
+        let Some(date) = r.get("date").and_then(Value::as_str) else { continue };
+        let msg = r.get("message").and_then(Value::as_str).unwrap_or("");
+        if let Some(v) = parse_reward_plus(msg) {
+            *recharge.entry(date.to_string()).or_insert(0.0) += v;
+        }
+    }
+    recharge
 }
 
 /// 从签到 message 提取「+N」奖励数额（不硬编码数额，仅解析接口回显）

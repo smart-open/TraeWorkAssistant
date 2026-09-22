@@ -475,6 +475,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             workbuddy::workbuddy_usage_official(state, user_id, refresh).and_then(to_json)
         }
         "workbuddy_usage_fallback" => workbuddy::workbuddy_usage_fallback(state).and_then(to_json),
+        "workbuddy_credits_trend" => workbuddy::workbuddy_credits_trend(state).and_then(to_json),
         "workbuddy_usage_official_all" => {
             workbuddy::workbuddy_usage_official_all(state).and_then(to_json)
         }
