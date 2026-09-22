@@ -37,6 +37,7 @@ on:
   push:
     branches:
       - feature/macos
+      - macos_main
   workflow_dispatch:
 
 jobs:
