@@ -1,6 +1,6 @@
 # AI Work 助手 Web 版（aiwork-server）多阶段构建
 # 阶段 1 node:20  → npm run build 产出 dist/
-# 阶段 2 rust:1.85-slim → cargo build --release 产出 aiwork-server
+# 阶段 2 rust:1.88-slim → cargo build --release 产出 aiwork-server
 #      （假工程先编译依赖：源码改动不触发全量依赖重编译）
 # 阶段 3 debian:bookworm-slim → 运行级（ca-certificates/tzdata/curl + HEALTHCHECK）
 # 用法：docker compose up -d --build（见 docs/server-deploy.md）
@@ -16,7 +16,8 @@ COPY . .
 RUN npm run build
 
 # ===== 阶段 2：Rust 服务端构建 =====
-FROM rust:1.85-slim AS server
+# 1.88：Cargo.lock 内 icu_*/time/zip 等依赖 MSRV ≥1.86~1.88，1.85 会编译失败（exit 101）
+FROM rust:1.88-slim AS server
 WORKDIR /build
 # rusqlite(bundled) 需要 cc；slim 镜像默认无 gcc
 RUN apt-get update \

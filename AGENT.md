@@ -26,9 +26,9 @@ docker compose up -d --build     # 详见 docs/server-deploy.md
 
 | 层 | 技术 |
 |---|---|
-| 后端 | Rust 1.85（workspace：aiwork-core + aiwork-server，axum 0.7 / tokio / ureq / rusqlite bundled / iota_stronghold） |
+| 后端 | Rust 1.88（workspace：aiwork-core + aiwork-server，axum 0.7 / tokio / ureq / rusqlite bundled / iota_stronghold） |
 | 前端 | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 + lucide-react |
-| 部署 | Docker 多阶段构建（node:20 → rust:1.85-slim → debian:bookworm-slim）+ docker-compose |
+| 部署 | Docker 多阶段构建（node:20 → rust:1.88-slim → debian:bookworm-slim）+ docker-compose |
 | 辅助 | Node.js 18+（scripts/*.mjs，零 npm 依赖） |
 
 ## 4. 目录地图

@@ -45,7 +45,7 @@ cargo test --workspace       # Rust 单测
 npm run test                 # 前端单测
 ```
 
-前置：Node.js 18+、Rust 1.85+。
+前置：Node.js 18+、Rust 1.88+。
 
 ## 从桌面版迁移 / 老版本说明
 

@@ -7,13 +7,13 @@
 
 | 层 | 技术 | 说明 |
 |---|---|---|
-| 后端核心 | Rust 1.85 + `aiwork-core` crate | 业务核心零桌面依赖：state/models/store/tasks/api_server/oauth/notify |
+| 后端核心 | Rust 1.88 + `aiwork-core` crate | 业务核心零桌面依赖：state/models/store/tasks/api_server/oauth/notify |
 | 后端服务 | Rust + `aiwork-server` crate（axum 0.7 / tokio） | 单进程：管理面 REST + OpenAI 兼容网关 + 静态托管 + 调度线程 |
 | HTTP 客户端 | ureq（同步，阻塞线程池） | **直连语义**：不读系统/环境代理，容器内行为确定；合成设备指纹 |
 | 存储 | rusqlite（bundled SQLite，WAL 模式） | 单文件库 `data/aiwork.sqlite`，跨平台无 OS 依赖 |
 | 加密存储 | iota_stronghold | jwt/refresh_token 权威加密；主密钥来自 `AIWORK_VAULT_KEY` 或 `conf/vault_key.bin`（ADR-2，去 DPAPI） |
 | 前端 | React 18 + TypeScript 5 + Vite 5 + Tailwind 3 + Zustand 4 + Recharts 2 | 复用桌面版页面骨架，`lib/tauri.ts` 单点适配 REST+SSE |
-| 部署 | Docker 多阶段构建（node:20 → rust:1.85-slim → debian:bookworm-slim） | compose 编排，HEALTHCHECK `/health` |
+| 部署 | Docker 多阶段构建（node:20 → rust:1.88-slim → debian:bookworm-slim） | compose 编排，HEALTHCHECK `/health` |
 
 ## 2. 架构分层
 
