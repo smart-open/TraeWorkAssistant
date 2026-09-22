@@ -109,15 +109,64 @@ pub fn tc_decrypt(b64: &str, private_mode: bool) -> Result<String, String> {
 /// 设备凭证：deviceId（数字串，与 storage.json 键内嵌一致）+ EC P-256 私钥 PEM
 /// + machineId（同 storage.json telemetry.machineId，DeviceInfo 构造用）
 /// + appVersion（安装目录 package.json version，DeviceInfo.ClientVersion 用）
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeviceCredential {
     pub device_id: String,
     pub private_key_pem: String,
     pub machine_id: String,
     pub app_version: String,
-    /// 来源客户端（Trae CN / TRAE SOLO CN 等），诊断日志用
+    /// 来源客户端（Trae CN / TRAE SOLO CN / synthetic 等），诊断日志用
     #[allow(dead_code)]
     pub source_app: String,
+}
+
+/// 宽容解析持久化的凭证 JSON（kv oauth_synthetic_device；字段缺失/类型不符返回 None）
+pub fn device_credential_from_json(v: &serde_json::Value) -> Option<DeviceCredential> {
+    let obj = v.as_object()?;
+    let s = |k: &str| -> Option<&str> { obj.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()) };
+    Some(DeviceCredential {
+        device_id: s("device_id")?.to_string(),
+        private_key_pem: s("private_key_pem")?.to_string(),
+        machine_id: s("machine_id")?.to_string(),
+        app_version: obj
+            .get("app_version")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        source_app: obj
+            .get("source_app")
+            .and_then(|x| x.as_str())
+            .unwrap_or("synthetic")
+            .to_string(),
+    })
+}
+
+/// 生成合成设备凭证（容器/无 Trae 客户端环境的兜底身份）：随机 EC P-256 密钥对
+/// + 15 位数字 deviceId + 32 hex machineId——与全新安装 IDE 的自生成身份等价
+///（IDE 首启同样本地生成密钥对并经 DeviceInfo.DevicePublicKey 自声明，无预注册 API）。
+/// 私钥由调用方持久化（服务端自有身份，与 store 内 token 同信任域；不进日志）。
+pub fn generate_synthetic_device_credential(app_version: &str) -> Result<DeviceCredential, String> {
+    use p256::pkcs8::EncodePrivateKey;
+    use rand::RngCore;
+
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let signing = p256::ecdsa::SigningKey::from_bytes(&secret.into())
+        .map_err(|e| format!("合成设备密钥生成失败: {e}"))?;
+    let pem = signing
+        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+        .map_err(|e| format!("合成设备私钥 PEM 编码失败: {e}"))?;
+    // deviceId 形态对齐真实客户端：15 位数字串（load_or_create_oauth_device 原随机逻辑）
+    let device_id: String = (0..15)
+        .map(|_| char::from(b'0' + u8::from(rand::Rng::gen_range(&mut rand::rngs::OsRng, 0..10))))
+        .collect();
+    Ok(DeviceCredential {
+        device_id,
+        private_key_pem: pem.to_string(),
+        machine_id: random_hex(32),
+        app_version: app_version.to_string(),
+        source_app: "synthetic".to_string(),
+    })
 }
 
 /// 扫描本机各 Trae 客户端 storage.json 提取设备凭证（多个客户端各有一套）。
@@ -283,5 +332,35 @@ mod tests {
     fn tc_decrypt_rejects_bad_magic() {
         let bad = base64::engine::general_purpose::STANDARD.encode([1u8; 64]);
         assert!(tc_decrypt(&bad, false).is_err());
+    }
+
+    /// 合成设备凭证：生成 → JSON roundtrip → DeviceProof 签名可用（私钥有效）+
+    /// 公钥可推导（DeviceInfo.DevicePublicKey 用）
+    #[test]
+    fn synthetic_credential_roundtrip_and_sign() {
+        let cred = generate_synthetic_device_credential("9.9.9-test").unwrap();
+        assert_eq!(cred.device_id.len(), 15);
+        assert!(cred.device_id.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(cred.app_version, "9.9.9-test");
+
+        let json = serde_json::to_value(&cred).unwrap();
+        let parsed = device_credential_from_json(&json).unwrap();
+        assert_eq!(parsed.device_id, cred.device_id);
+        assert_eq!(parsed.private_key_pem, cred.private_key_pem);
+
+        // 签名链路可用（P1363 首选格式）
+        let proof = device_proof(
+            &parsed,
+            "/trae/api/v3/oauth/ExchangeToken",
+            "test-client",
+            "auth-code-x",
+            ProofSigFormat::P1363,
+        )
+        .unwrap();
+        assert!(proof.get("Signature").and_then(|v| v.as_str()).is_some());
+        assert!(proof.get("Timestamp").and_then(|v| v.as_i64()).unwrap_or(0) > 0);
+
+        // 空对象 / 缺字段 → None（宽容解析不 panic）
+        assert!(device_credential_from_json(&serde_json::json!({})).is_none());
     }
 }

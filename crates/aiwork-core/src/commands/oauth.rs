@@ -248,7 +248,7 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
     // device_id 首选 icube 设备凭证（F-78 DeviceProof）：签名私钥与 icube-dc
     // deviceId 绑定，登录 URL 的 device_id 必须与之同源，否则服务端 20403/20405；
     // 恒覆盖旧值（旧值是随机/device_map 对齐的，与私钥不匹配）
-    if let Some(cred) = icube_device_creds().first() {
+    if let Some(cred) = icube_device_creds(&state.data_dir).first() {
         if dev.device_id != cred.device_id {
             dev.device_id = cred.device_id.clone();
             let _ = store.kv_set("oauth_device", &dev);
@@ -530,7 +530,7 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
     let mut variants: Vec<(String, String, serde_json::Value, bool)> = Vec::new();
 
     // 主变体（真实客户端形态）：DeviceInfo 对象 + IDEVersion，无 DeviceProof
-    if let Some(cred) = icube_device_creds().first() {
+    if let Some(cred) = icube_device_creds(data_dir).first() {
         let pub_pem = crate::icube_auth::device_public_key_pem(cred)
             .unwrap_or_default();
         let url = format!("{}/trae/api/v3/oauth/ExchangeToken", host.trim_end_matches('/'));
@@ -564,7 +564,7 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
 
     // 兜底：旧形态探测变体（DeviceProof 是 refreshToken 刷新场景的结构，AuthCode
     // 场景按逆向结论不应携带；保留以验证逆向结论，全部失败时错误码进 app.log）
-    if let Some(cred) = icube_device_creds().first() {
+    if let Some(cred) = icube_device_creds(data_dir).first() {
         let proof_path_com = "/cloudide/api/v3/trae/oauth/ExchangeToken";
         for (fmt, tag_base, url) in [
             (
@@ -627,10 +627,44 @@ fn exchange_code(code: &str, verifier: Option<&str>, device_id: &str, host: &str
     Err(format!("全部交换变体失败 → {}", errs.join(" | ")))
 }
 
-/// 本机 Trae 客户端 icube 设备凭证（进程内缓存；首次调用扫描 storage.json）
-fn icube_device_creds() -> &'static [crate::icube_auth::DeviceCredential] {
+/// 本机 Trae 客户端 icube 设备凭证（进程内缓存；首次调用解析）。
+/// 解析链：扫描本机 storage.json（桌面机真实凭证）→ 空则加载/生成合成设备
+///（kv `oauth_synthetic_device` 持久化，跨重启稳定）——Web-only 容器部署无 Trae
+/// 客户端，此前仅剩裸 DeviceID 兜底变体，上游 20405 Device proof required 直接拒绝。
+/// data_dir 仅首次调用生效（OnceLock 进程级缓存；进程内 data_dir 恒定）。
+fn icube_device_creds(data_dir: &std::path::Path) -> &'static [crate::icube_auth::DeviceCredential] {
     static CREDS: std::sync::OnceLock<Vec<crate::icube_auth::DeviceCredential>> = std::sync::OnceLock::new();
-    CREDS.get_or_init(crate::icube_auth::extract_device_credentials)
+    CREDS.get_or_init(|| {
+        let extracted = crate::icube_auth::extract_device_credentials();
+        if !extracted.is_empty() {
+            return extracted;
+        }
+        // 合成设备兜底（等同全新安装 IDE 的自生成密钥对 + DeviceInfo 自声明）：
+        // 服务端自有身份落 store（与 token 同信任域），私钥不进日志
+        let store = crate::store::db(data_dir);
+        let saved: serde_json::Value = store.kv_get("oauth_synthetic_device");
+        if let Some(cred) = crate::icube_auth::device_credential_from_json(&saved) {
+            return vec![cred];
+        }
+        match crate::icube_auth::generate_synthetic_device_credential(OAUTH_PAGE_APP_VERSION) {
+            Ok(cred) => {
+                let json = serde_json::to_value(&cred).unwrap_or_default();
+                let _ = store.kv_set("oauth_synthetic_device", &json);
+                fs_utils::app_log(
+                    data_dir,
+                    &format!(
+                        "OAuth: 本机无 Trae 客户端凭证，已生成合成设备身份并持久化（device_id={}，来源 synthetic）",
+                        cred.device_id
+                    ),
+                );
+                vec![cred]
+            }
+            Err(e) => {
+                fs_utils::app_log(data_dir, &format!("OAuth: 合成设备凭证生成失败: {e}"));
+                Vec::new()
+            }
+        }
+    })
 }
 
 /// 单个交换变体尝试：脱敏日志（请求+响应全量）→ 设备头请求 → 火山信封错误解析 →
@@ -866,7 +900,7 @@ pub(crate) fn exchange_token_refresh(
     // 变体链（主→兜底）：固化协议 P1363/DER → 旧端点 P1363 → 旧协议（无凭证时唯一路径）
     let new_url = "https://api.trae.com.cn/trae/api/v3/oauth/ExchangeToken";
     let mut variants: Vec<(String, String, serde_json::Value, bool)> = Vec::new();
-    if let Some(cred) = icube_device_creds().first() {
+    if let Some(cred) = icube_device_creds(&state.data_dir).first() {
         for (fmt, url, sign_path) in [
             (
                 crate::icube_auth::ProofSigFormat::P1363,
