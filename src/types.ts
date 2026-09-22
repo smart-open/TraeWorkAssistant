@@ -238,6 +238,26 @@ export interface NotifyResult {
   webhook: string | null;
 }
 
+/** 调度任务状态项（scheduler_status）：任务定义 + 最近一次执行情况 */
+export interface SchedulerTaskView {
+  key: string;
+  name: string;
+  /** 每日触发时刻 HH:MM */
+  time: string;
+  /** 当前是否启用（用户开关 + 既有设置语义合成） */
+  enabled: boolean;
+  last_run_date: string | null;
+  last_run_ts: number | null;
+  last_fail_ts: number | null;
+  last_ok: boolean | null;
+  last_summary: string | null;
+}
+
+/** 调度任务开关配置（scheduler_config_get/set）：停用名单，缺省 = 全部启用 */
+export interface SchedulerConfig {
+  disabled_tasks: string[];
+}
+
 export interface CheckinOpts {
   scope: string;
   user_ids?: string[];

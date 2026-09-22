@@ -234,6 +234,10 @@ pub fn random_hex(len: usize) -> String {
 pub struct OAuthDevice {
     pub machine_id: String,
     pub device_id: String,
+    /// 上游归一化设备绑定 ID（交换成功后响应 Result.BoundDeviceID）。
+    /// 刷新时必须用此值做请求 DeviceID，否则新端点 20403 Token device not match。
+    #[serde(default)]
+    pub bound_device_id: Option<String>,
 }
 
 /// 读取（缺失则生成并写回）本机稳定的 OAuth 设备标识。
@@ -667,6 +671,30 @@ fn icube_device_creds(data_dir: &std::path::Path) -> &'static [crate::icube_auth
     })
 }
 
+/// 交换/刷新成功后回写上游归一化 BoundDeviceID（kv `oauth_device.bound_device_id`）：
+/// 上游把本地声明 device_id 归一化为独立 BoundDeviceID 并与 Token 绑定，后续新端点
+/// 刷新必须用它作 DeviceID（否则 20403 Token device not match）；值不变时跳过写盘。
+fn persist_bound_device_id(data_dir: &std::path::Path, body: &serde_json::Value) {
+    let Some(bound) = crate::fs_utils::dig(body, &["Result", "BoundDeviceID"])
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+    else {
+        return;
+    };
+    let store = crate::store::db(data_dir);
+    let mut dev: OAuthDevice = store.kv_get("oauth_device");
+    if dev.bound_device_id.as_deref() == Some(bound.as_str()) {
+        return;
+    }
+    dev.bound_device_id = Some(bound.clone());
+    let _ = store.kv_set("oauth_device", &dev);
+    fs_utils::app_log(
+        data_dir,
+        &format!("[OAuth] 已持久化上游 BoundDeviceID={bound}（后续刷新优先用作 DeviceID）"),
+    );
+}
+
 /// 单个交换变体尝试：脱敏日志（请求+响应全量）→ 设备头请求 → 火山信封错误解析 →
 /// token 三级提取（容器精确键 → 全树深挖 → 键路径诊断）
 fn try_exchange_variant(
@@ -754,6 +782,7 @@ fn try_exchange_variant(
         let r = find_token_value(d, REFRESH_KEYS);
         if let (Some(a), Some(r)) = (a, r) {
             if !a.is_empty() && !r.is_empty() {
+                persist_bound_device_id(data_dir, &body);
                 return Ok((a, r));
             }
         }
@@ -762,7 +791,10 @@ fn try_exchange_variant(
         find_token_value(&body, ACCESS_KEYS),
         find_token_value(&body, REFRESH_KEYS),
     ) {
-        (Some(a), Some(r)) if !a.is_empty() && !r.is_empty() => Ok((a, r)),
+        (Some(a), Some(r)) if !a.is_empty() && !r.is_empty() => {
+            persist_bound_device_id(data_dir, &body);
+            Ok((a, r))
+        }
         _ => {
             let mut paths = Vec::new();
             collect_key_paths_public(&body, &mut paths);
@@ -895,11 +927,18 @@ pub(crate) fn exchange_token_refresh(
     refresh_token: &str,
 ) -> Result<(String, Option<String>, serde_json::Value), RefreshExchangeError> {
     let client_id = oauth_client().client_id.clone();
-    let device_id = load_or_create_oauth_device(state).device_id;
+    let dev = load_or_create_oauth_device(state);
+    let local_device_id = dev.device_id;
+    // 刷新 DeviceID 选择：新端点校验 Token 绑定设备（20403 Token device not match），
+    // 须用交换成功后持久化的上游归一化 BoundDeviceID；旧端点不校验，保持本地声明 id
+    let bound_device_id = dev
+        .bound_device_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| local_device_id.clone());
 
     // 变体链（主→兜底）：固化协议 P1363/DER → 旧端点 P1363 → 旧协议（无凭证时唯一路径）
     let new_url = "https://api.trae.com.cn/trae/api/v3/oauth/ExchangeToken";
-    let mut variants: Vec<(String, String, serde_json::Value, bool)> = Vec::new();
+    let mut variants: Vec<(String, String, serde_json::Value, String, bool)> = Vec::new();
     if let Some(cred) = icube_device_creds(&state.data_dir).first() {
         for (fmt, url, sign_path) in [
             (
@@ -923,16 +962,19 @@ pub(crate) fn exchange_token_refresh(
             else {
                 continue;
             };
+            // proof 签名原文不含 device_id，请求 DeviceID 按端点选择不受签名影响
+            let req_device_id = if url == new_url { &bound_device_id } else { &local_device_id };
             variants.push((
                 format!("Refresh/Proof{}", fmt.suffix()),
                 url.to_string(),
                 ureq::json!({
                     "ClientID": client_id,
                     "RefreshToken": refresh_token,
-                    "DeviceID": cred.device_id,
+                    "DeviceID": req_device_id,
                     "PlatformCode": OAUTH_PAGE_PLATFORM_CODE,
                     "DeviceProof": proof,
                 }),
+                req_device_id.clone(),
                 true,
             ));
         }
@@ -947,12 +989,13 @@ pub(crate) fn exchange_token_refresh(
             "ClientSecret": oauth_client().client_secret,
             "UserID": "",
         }),
+        local_device_id.clone(),
         false,
     ));
 
     let mut last_err: Option<RefreshExchangeError> = None;
-    for (tag, url, payload, with_proof_header) in &variants {
-        match try_refresh_variant(tag, url, payload.clone(), &device_id, *with_proof_header, &state.data_dir) {
+    for (tag, url, payload, device_id, with_proof_header) in &variants {
+        match try_refresh_variant(tag, url, payload.clone(), device_id, *with_proof_header, &state.data_dir) {
             Ok(t) => return Ok(t),
             Err(e) => {
                 // 旧形态数字 code != 0：服务端明确拒绝，立即采纳不再探测
@@ -1072,7 +1115,10 @@ fn try_refresh_variant(
     let access = find_token_value(&body, ACCESS_KEYS).filter(|s| !s.is_empty());
     let refresh = find_token_value(&body, REFRESH_KEYS).filter(|s| !s.is_empty());
     match access {
-        Some(a) => Ok((a, refresh, body)),
+        Some(a) => {
+            persist_bound_device_id(data_dir, &body);
+            Ok((a, refresh, body))
+        }
         None => {
             let mut paths = Vec::new();
             collect_key_paths_public(&body, &mut paths);

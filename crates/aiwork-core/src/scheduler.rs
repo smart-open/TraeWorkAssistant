@@ -40,6 +40,9 @@ struct SchedTask {
 const TASKS: &[SchedTask] = &[
     // T8 新增：临期 JWT 自动续期（排在签到前，避免签到时大面积 401）
     SchedTask { key: "trae-jwt-renew", name: "Trae JWT 自动续期", hhmm: "05:30" },
+    // 官网模型列表每日同步（batch_get_detail_param，不消耗积分），供网关模型映射与
+    // 前端模型选择器使用；此前仅 API 服务页手动触发，自动化后「自动同步服务器数据」闭环
+    SchedTask { key: "models-sync", name: "Trae 模型列表同步", hhmm: "05:40" },
     SchedTask { key: "trae-checkin", name: "Trae 每日签到", hhmm: "09:00" },
     SchedTask { key: "wb-checkin", name: "WorkBuddy 每日签到", hhmm: "09:10" },
     // F-09 兜底续期：lazy 24h（到期前 24h 内才真正刷新），每天跑一次是安全超集
@@ -125,8 +128,12 @@ fn tick(st: &AppState) {
     }
 }
 
-/// 任务启用判定：快照/巡检/续期类恒开（补齐数据时序），签到类跟随各自设置开关
+/// 任务启用判定：先看用户开关（kv `scheduler_cfg.disabled_tasks`，默认全开 = 推荐配置），
+/// 再叠加各任务既有设置语义
 fn enabled(st: &AppState, key: &str) -> bool {
+    if disabled_tasks(st).iter().any(|k| k == key) {
+        return false;
+    }
     match key {
         // WorkBuddy 签到跟随「启动自动补签」开关（F-55 同源设置）
         "wb-checkin" => crate::commands::workbuddy::wb_auto_checkin_enabled(st),
@@ -135,11 +142,63 @@ fn enabled(st: &AppState, key: &str) -> bool {
     }
 }
 
+// ── 任务开关配置（kv `scheduler_cfg`）────────────────────────────────────────
+// 形态：{ "disabled_tasks": ["trae-checkin", ...] }；缺省 = 全部启用（推荐配置）。
+// 前端在 Trae / Buddy 环境配置页按平台展示对应任务的开关。
+
+fn disabled_tasks(st: &AppState) -> Vec<String> {
+    load_cfg(st)
+        .get("disabled_tasks")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn load_cfg(st: &AppState) -> Value {
+    let v: Value = crate::store::db(&st.data_dir).kv_get("scheduler_cfg");
+    if v.is_object() { v } else { json!({}) }
+}
+
+/// 任务开关配置查询（命令桥 scheduler_config_get 分发）
+pub fn scheduler_config_get(st: &AppState) -> Value {
+    json!({ "disabled_tasks": disabled_tasks(st) })
+}
+
+/// 任务开关配置写入（命令桥 scheduler_config_set 分发）：未知任务键整体拒绝，
+/// 返回保存后的生效值
+pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> {
+    let list = cfg
+        .get("disabled_tasks")
+        .and_then(Value::as_array)
+        .ok_or("缺少 disabled_tasks 数组")?;
+    let mut disabled: Vec<String> = Vec::new();
+    for v in list {
+        let k = v.as_str().ok_or("disabled_tasks 含非字符串项")?;
+        if !TASKS.iter().any(|t| t.key == k) {
+            return Err(format!("未知调度任务: {k}"));
+        }
+        disabled.push(k.to_string());
+    }
+    let _ = crate::store::db(&st.data_dir).kv_set("scheduler_cfg", &json!({ "disabled_tasks": disabled }));
+    fs_utils::app_log(
+        &st.data_dir,
+        &format!("[调度器] 任务开关已更新：{} 项停用", disabled.len()),
+    );
+    Ok(scheduler_config_get(st))
+}
+
 /// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）
 fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
     match key {
         // T8 新增：Trae JWT 自动续期（48h lazy gate 内置于 refresh_jwt_impl）
         "trae-jwt-renew" => run_trae_jwt_renew(st),
+        // 官网模型列表每日同步：与 API 服务页「同步模型列表」同款实现
+        "models-sync" => run_models_sync(st),
         // Trae 每日签到：与 `--task-run checkin` 同款（vault 全账号单轮，状态核验幂等）
         "trae-checkin" => {
             let accts = crate::vault::load_accounts(st);
@@ -177,6 +236,23 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         "trae-credits-snapshot" => accounts::refresh_remaining_credits_impl(st)
             .map(|n| json!({ "ok": true, "refreshed": n })),
         other => Err(format!("未知调度任务: {other}")),
+    }
+}
+
+/// 官网模型列表每日同步：vault 全账号复用 models_sync::fetch_official（首个含 JWT
+/// 账号，最多尝试 3 个）。无可用账号视为跳过（非失败），避免冷启动每日失败告警。
+fn run_models_sync(st: &AppState) -> Result<Value, String> {
+    let accounts = crate::vault::load_accounts(st);
+    let has_creds = accounts.accounts.iter().any(|a| !a.jwt.trim().is_empty());
+    if !has_creds {
+        return Ok(json!({ "summary": "跳过：无可用账号（未添加或缺少 JWT）" }));
+    }
+    match crate::api_server::models_sync::fetch_official(&st.data_dir, accounts) {
+        Ok(list) => Ok(json!({
+            "summary": format!("官网模型列表同步成功: {} 个模型", list.len()),
+            "models": list.len(),
+        })),
+        Err(e) => Err(e),
     }
 }
 
@@ -298,6 +374,7 @@ pub fn scheduler_status(st: &AppState) -> Value {
                 "key": t.key,
                 "name": t.name,
                 "time": t.hhmm,
+                "enabled": enabled(st, t.key),
                 "last_run_date": e.get("last_run_date").cloned().unwrap_or(Value::Null),
                 "last_run_ts": e.get("last_run_ts").cloned().unwrap_or(Value::Null),
                 "last_fail_ts": e.get("last_fail_ts").cloned().unwrap_or(Value::Null),

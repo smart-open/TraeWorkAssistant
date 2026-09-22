@@ -31,6 +31,8 @@ import type {
   OAuthLoginResult,
   OAuthLoginUrl,
   PoolStatus,
+  SchedulerConfig,
+  SchedulerTaskView,
   Settings,
   TraeModelMeta,
   UnifiedModel,
@@ -358,8 +360,13 @@ export const api = {
     settingsSet: (patch: Settings) => invoke('settings_set', { patch }),
   },
   scheduler: {
-    // T8：6 项内置定时任务状态（trae-jwt-renew / trae-checkin / wb-checkin / wb-renew / 双积分快照）
-    status: () => invoke<Record<string, unknown>>('scheduler_status'),
+    // 内置定时任务状态（key/name/time/enabled + 最近一次执行情况）
+    status: () =>
+      invoke<{ tasks: SchedulerTaskView[] }>('scheduler_status'),
+    // 任务开关配置：disabled_tasks 停用名单，缺省 = 全部启用（推荐配置）
+    configGet: () => invoke<SchedulerConfig>('scheduler_config_get'),
+    // 返回保存后的生效值；未知任务键整体拒绝
+    configSet: (config: SchedulerConfig) => invoke<SchedulerConfig>('scheduler_config_set', { config }),
   },
   // ---- 通知渠道（Phase 3 T11：Bark / Server酱 / Webhook，独立 kv）----
   notify: {

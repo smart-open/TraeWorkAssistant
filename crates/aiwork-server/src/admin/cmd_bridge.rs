@@ -486,6 +486,11 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
 
         // ==================== scheduler（调度器） ====================
         "scheduler_status" => Ok(aiwork_core::scheduler::scheduler_status(state)),
+        "scheduler_config_get" => Ok(aiwork_core::scheduler::scheduler_config_get(state)),
+        "scheduler_config_set" => {
+            let cfg = arg(&args, "config")?;
+            aiwork_core::scheduler::scheduler_config_set(state, cfg).and_then(to_json)
+        }
 
         // ==================== notify（通知渠道，Phase 3 T11） ====================
         "notify_config_get" => to_json(aiwork_core::notify::notify_config_get(state)),

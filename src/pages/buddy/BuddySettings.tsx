@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Save, RefreshCw, CalendarClock } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
+import SchedulerTasksCard, { type TaskToggleOverride } from '../../components/SchedulerTasksCard';
 import { Spinner } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
@@ -8,78 +9,18 @@ import { withMinDelay } from '../../lib/delay';
 import type { WorkBuddySettings } from '../../types';
 
 /**
- * buddy-settings 环境配置（§3.7.5，F-55/F-59/F-13）：
- * 签到配置卡（自动签到参数 + 服务端调度说明）+ 失败通知渠道。
- * 定时签到/续期由服务端内置调度器自动执行；到期日历统一收敛在「积分看板」页。
+ * Buddy · 环境配置（§3.7.5，F-55/F-59/F-13）：
+ * 定时任务（自动签到和成长 / 自动续期 / 自动同步服务器数据，开关即时保存）+
+ * 签到参数（保活阈值 / 惰性刷新）+ 失败通知渠道。
+ * wb-checkin 开关绑定 WorkBuddySettings.auto_checkin（单源：同时门控定时签到与启动补签）。
  */
-
-/** 签到配置卡（F-55/F-16）：自动签到参数 + 服务端调度说明 */
-function CheckinConfigCard({
-  settings,
-  patch,
-}: {
-  settings: WorkBuddySettings | null;
-  patch: (p: Partial<WorkBuddySettings>) => void;
-}) {
-  return (
-    <div className="mt-4 card p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <CalendarClock size={16} className="text-brand-500" />
-        <span className="text-sm font-medium">签到配置</span>
-      </div>
-      <div className="space-y-3">
-        {/* 自动签到（F-55） */}
-        <label className="flex items-start gap-2">
-          <input
-            type="checkbox"
-            className="mt-0.5"
-            checked={settings?.auto_checkin ?? false}
-            onChange={(e) => patch({ auto_checkin: e.target.checked })}
-          />
-          <span className="text-sm">
-            启用自动签到（启动补签）
-            <span className="block text-xs text-slate-400">服务启动时立即核验签到状态，未签到账号会自动补签</span>
-          </span>
-        </label>
-        <div className="grid gap-3 lg:grid-cols-2">
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-slate-500">保活阈值（天）</span>
-            <input
-              type="number"
-              min={0}
-              className="input w-full"
-              value={settings?.keepalive_days ?? 0}
-              onChange={(e) => patch({ keepalive_days: Number(e.target.value) || 0 })}
-            />
-            <span className="mt-1 block text-xs text-slate-400">0 = 每天无条件刷新全部带 refreshToken 账号</span>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-slate-500">惰性刷新（小时）</span>
-            <input
-              type="number"
-              min={1}
-              className="input w-full"
-              value={settings?.lazy_refresh_hours ?? 24}
-              onChange={(e) => patch({ lazy_refresh_hours: Number(e.target.value) || 24 })}
-            />
-            <span className="mt-1 block text-xs text-slate-400">剩余有效期低于该值才触发刷新（默认 24）</span>
-          </label>
-        </div>
-
-        {/* 定时任务：服务端内置调度器自动执行，无需手动注册 */}
-        <div className="rounded-lg border border-slate-100 p-3 text-xs text-slate-500 dark:border-zinc-800 dark:text-zinc-400">
-          定时任务由服务端内置调度器自动执行：每日 09:10 自动签到，Token 续期 10:30 自动执行，无需手动配置。
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function BuddySettings() {
   const pushToast = useAppStore((s) => s.pushToast);
   const [settings, setSettings] = useState<WorkBuddySettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // wb-checkin 开关（auto_checkin）即时保存 pending
+  const [checkinToggleBusy, setCheckinToggleBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -114,11 +55,35 @@ export default function BuddySettings() {
     setSettings((prev) => (prev ? { ...prev, ...p } : prev));
   };
 
+  // wb-checkin 开关：绑定 auto_checkin 并即时保存（与定时任务卡其他开关交互一致）
+  const toggleCheckin = async (v: boolean) => {
+    if (!settings) return;
+    const prev = settings;
+    const next = { ...prev, auto_checkin: v };
+    setSettings(next);
+    setCheckinToggleBusy(true);
+    try {
+      await withMinDelay(api.workbuddy.settingsSet(next));
+      pushToast('success', v ? '自动签到和成长已启用' : '自动签到和成长已停用');
+    } catch (err) {
+      setSettings(prev);
+      pushToast('error', `保存失败：${String(err)}`);
+    } finally {
+      setCheckinToggleBusy(false);
+    }
+  };
+
+  const overrides: Record<string, TaskToggleOverride> | undefined = settings
+    ? {
+        'wb-checkin': { checked: settings.auto_checkin, onToggle: toggleCheckin, busy: checkinToggleBusy },
+      }
+    : undefined;
+
   return (
     <div className="animate-fade-in">
       <PageHeader
         title="Buddy · 环境配置"
-        desc="签到配置 · 失败通知"
+        desc="定时任务 · 签到参数 · 失败通知"
         actions={
           <>
             <button className="btn-outline" onClick={() => void refresh()} disabled={refreshing}>
@@ -131,38 +96,79 @@ export default function BuddySettings() {
         }
       />
 
-      {/* 失败通知渠道（F-19） */}
-      <div className="card p-4">
+      <div className="grid items-start gap-4 md:grid-cols-2">
+        {/* 左列：签到参数（F-55/F-16；wb-checkin 开关在右侧定时任务卡） */}
+        <section className="card p-4">
+          <div className="mb-1 flex items-center gap-2">
+            <CalendarClock size={16} className="text-brand-500" />
+            <span className="font-medium">签到参数</span>
+          </div>
+          <p className="mb-3 text-xs text-slate-400">自动签到与续期的执行参数，改动后点击「保存配置」生效。</p>
+          <div className="grid gap-3 lg:grid-cols-2">
+            <label className="block rounded-lg bg-slate-50 px-3 py-2.5 dark:bg-zinc-900">
+              <span className="mb-1 block text-xs font-medium text-slate-500">保活阈值（天）</span>
+              <input
+                type="number"
+                min={0}
+                className="input w-full"
+                value={settings?.keepalive_days ?? 0}
+                onChange={(e) => patch({ keepalive_days: Number(e.target.value) || 0 })}
+              />
+              <span className="mt-1 block text-xs text-slate-400">0 = 每天无条件刷新全部带 refreshToken 账号（推荐）</span>
+            </label>
+            <label className="block rounded-lg bg-slate-50 px-3 py-2.5 dark:bg-zinc-900">
+              <span className="mb-1 block text-xs font-medium text-slate-500">惰性刷新（小时）</span>
+              <input
+                type="number"
+                min={1}
+                className="input w-full"
+                value={settings?.lazy_refresh_hours ?? 24}
+                onChange={(e) => patch({ lazy_refresh_hours: Number(e.target.value) || 24 })}
+              />
+              <span className="mt-1 block text-xs text-slate-400">剩余有效期低于该值才触发刷新（推荐 24）</span>
+            </label>
+          </div>
+        </section>
+
+        {/* 右列：定时任务（开关即时保存，含最近执行状态；推荐配置 = 全部启用） */}
+        <SchedulerTasksCard
+          taskKeys={['wb-checkin', 'wb-renew', 'wb-credits-snapshot']}
+          overrides={overrides}
+          desc="服务端内置调度器每日自动执行，覆盖自动签到和成长 / 自动续期 / 自动同步积分看板数据。推荐保持全部启用。"
+        />
+      </div>
+
+      {/* 失败通知渠道（F-19，Buddy 业务配置）：随「保存配置」保存 */}
+      <div className="card mt-4 p-4">
         <div className="mb-3 text-sm font-medium">失败通知渠道</div>
         <div className="space-y-3">
           <p className="text-xs text-slate-400">
             签到/补签失败等关键事件会同时推送到已配置的渠道（留空 = 关闭）。
           </p>
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-slate-500">企业微信群机器人 Webhook</span>
-            <input
-              className="input w-full font-mono text-xs"
-              value={settings?.notify_wechat_webhook ?? ''}
-              onChange={(e) => patch({ notify_wechat_webhook: e.target.value || null })}
-              placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
-            />
-            <span className="mt-1 block text-xs text-slate-400">群机器人消息：标题 + 失败摘要</span>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-slate-500">Server酱 SendKey</span>
-            <input
-              className="input w-full font-mono text-xs"
-              value={settings?.notify_serverchan_sendkey ?? ''}
-              onChange={(e) => patch({ notify_serverchan_sendkey: e.target.value || null })}
-              placeholder="SCTxxxxxxxx（sctapi.ftqq.com）"
-            />
-            <span className="mt-1 block text-xs text-slate-400">推送到微信服务号；Key 仅本地保存，不进日志</span>
-          </label>
+          <div className="grid gap-3 lg:grid-cols-2">
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-500">企业微信群机器人 Webhook</span>
+              <input
+                className="input w-full font-mono text-xs"
+                value={settings?.notify_wechat_webhook ?? ''}
+                onChange={(e) => patch({ notify_wechat_webhook: e.target.value || null })}
+                placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+              />
+              <span className="mt-1 block text-xs text-slate-400">群机器人消息：标题 + 失败摘要</span>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-500">Server酱 SendKey</span>
+              <input
+                className="input w-full font-mono text-xs"
+                value={settings?.notify_serverchan_sendkey ?? ''}
+                onChange={(e) => patch({ notify_serverchan_sendkey: e.target.value || null })}
+                placeholder="SCTxxxxxxxx（sctapi.ftqq.com）"
+              />
+              <span className="mt-1 block text-xs text-slate-400">推送到微信服务号；Key 仅本地保存，不进日志</span>
+            </label>
+          </div>
         </div>
       </div>
-
-      {/* 签到配置（F-55/F-16）：自动签到参数 + 服务端调度说明 */}
-      <CheckinConfigCard settings={settings} patch={patch} />
     </div>
   );
 }

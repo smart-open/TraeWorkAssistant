@@ -1,17 +1,19 @@
 import { useEffect, useState } from 'react';
-import { Settings2, ScrollText } from 'lucide-react';
+import { Settings2, ShieldCheck, ScrollText } from 'lucide-react';
 import { Modal } from './ui';
 import GeneralSettingsPanel from './GeneralSettingsPanel';
+import SecurityAdminPanel from './SecurityAdminPanel';
 import Logs from '../pages/Logs';
 import { cn } from '../lib/cn';
 
 /**
  * 系统设置与系统日志弹框（侧边栏左下角系统图标入口）。
  * Tab 1 系统设置：外观 / 语言 / 通用与通知 / 代理配置。
- * Tab 2 系统日志：复用系统日志页面（运行日志 / 代理日志 / API 请求日志）。
+ * Tab 2 安全与管理：通知渠道 / IP 允许列表 / 管理员令牌（自环境配置页迁入的全局配置）。
+ * Tab 3 系统日志：复用系统日志页面（运行日志 / 代理日志 / API 请求日志）。
  */
 export default function SystemDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [tab, setTab] = useState<'settings' | 'logs'>('settings');
+  const [tab, setTab] = useState<'settings' | 'security' | 'logs'>('settings');
 
   // 每次打开重置到第一个 tab
   useEffect(() => {
@@ -20,6 +22,7 @@ export default function SystemDialog({ open, onClose }: { open: boolean; onClose
 
   const TABS = [
     { key: 'settings' as const, label: '系统设置', icon: Settings2 },
+    { key: 'security' as const, label: '安全与管理', icon: ShieldCheck },
     { key: 'logs' as const, label: '系统日志', icon: ScrollText },
   ];
 
@@ -49,6 +52,10 @@ export default function SystemDialog({ open, onClose }: { open: boolean; onClose
           {tab === 'settings' ? (
             <div className="min-h-0 flex-1 overflow-auto pr-1">
               <GeneralSettingsPanel />
+            </div>
+          ) : tab === 'security' ? (
+            <div className="min-h-0 flex-1 overflow-auto pr-1">
+              <SecurityAdminPanel />
             </div>
           ) : (
             <Logs embedded />
