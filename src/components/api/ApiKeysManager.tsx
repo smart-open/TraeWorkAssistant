@@ -14,6 +14,18 @@ import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
 import type { ApiKeyEntry, PoolStatus, UsageDayView } from '../../types';
 
+/** RFC4122 v4 UUID（crypto.randomUUID 仅安全上下文可用，HTTP 直访报错 → getRandomValues 兜底） */
+function randomUuid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10x
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export default function ApiKeysManager({
   onSubModalChange,
 }: {
@@ -95,7 +107,7 @@ export default function ApiKeysManager({
       return;
     }
     const entry: ApiKeyEntry = {
-      id: crypto.randomUUID(),
+      id: randomUuid(),
       name,
       key: newKeyValue,
       enabled: true,
