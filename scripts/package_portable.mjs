@@ -144,8 +144,14 @@ for (const [srcRel, destRaw] of Object.entries(resources)) {
 }
 
 // 3) 打包（保留内部目录结构，顶层为产品名文件夹）：tar -a 按扩展名 .zip 生成 zip
+// Windows 显式用 System32 的 bsdtar（宽字符参数安全）：CI 的 PATH 里 Git 自带 GNU tar
+// 优先且对非 ASCII 文件名乱码（「AI Work 助手」→「AI Work ??」导致打开失败）
+const TAR =
+  process.platform === 'win32' && existsSync('C:/Windows/System32/tar.exe')
+    ? 'C:/Windows/System32/tar.exe'
+    : 'tar';
 console.log('正在打包:', zipPath);
-const r = spawnSync('tar', ['-a', '-cf', zipPath, product], {
+const r = spawnSync(TAR, ['-a', '-cf', zipPath, product], {
   cwd: tmpRoot,
   stdio: 'inherit',
 });
