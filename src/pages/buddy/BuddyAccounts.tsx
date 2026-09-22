@@ -72,8 +72,6 @@ export default function BuddyAccounts() {
   const [scanPreview, setScanPreview] = useState<{ nickname: string; uid: string; exists: boolean; already_in_pool?: boolean } | null>(null);
   const [detailFor, setDetailFor] = useState<WorkBuddyAccountView | null>(null);
   const [deleteFor, setDeleteFor] = useState<WorkBuddyAccountView | null>(null);
-  const [exportOpen, setExportOpen] = useState(false);
-  const [exportWithCreds, setExportWithCreds] = useState(false);
   const importFileRef = useRef<HTMLInputElement>(null);
   const [editFor, setEditFor] = useState<WorkBuddyAccountView | null>(null);
   const [editName, setEditName] = useState('');
@@ -319,15 +317,16 @@ export default function BuddyAccounts() {
     }
   };
 
+  // 导出（Web 简版一步导出）：固定含凭证副本（迁移必需），文件等同密码
   const exportPool = () => {
-    setExportOpen(true);
+    void confirmExport();
   };
 
-  // 导出确认（F-46 扩展）：可选是否附带凭证副本（迁移场景用）
+  // 导出确认（F-46 扩展）：默认含凭证副本（迁移场景必需）
   const confirmExport = async () => {
     setExportBusy(true);
     try {
-      const data = await withMinDelay(api.workbuddy.accountsExport(exportWithCreds), 1000);
+      const data = await withMinDelay(api.workbuddy.accountsExport(true), 1000);
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -335,11 +334,7 @@ export default function BuddyAccounts() {
       a.download = `workbuddy_accounts_${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
       URL.revokeObjectURL(url);
-      pushToast(
-        'success',
-        exportWithCreds ? '账号池已导出（含凭证，文件等同密码请妥善保管）' : '账号元数据已导出（凭证不导出）',
-      );
-      setExportOpen(false);
+      pushToast('success', '账号池已导出（含凭证，文件等同密码请妥善保管）');
     } catch (err) {
       pushToast('error', `导出失败：${String(err)}`);
     } finally {
@@ -718,41 +713,6 @@ export default function BuddyAccounts() {
         </label>
       </Modal>
 
-      {/* 导出选项弹框（F-46 扩展：凭证是否随导出） */}
-      <Modal
-        open={exportOpen}
-        onClose={() => {
-          if (!exportBusy) setExportOpen(false);
-        }}
-        title="导出账号池"
-        footer={
-          <>
-            <button className="btn-outline" onClick={() => setExportOpen(false)} disabled={exportBusy}>取消</button>
-            <button className="btn-primary" onClick={() => void confirmExport()} disabled={exportBusy}>
-              {exportBusy ? <Spinner /> : null} 确认导出
-            </button>
-          </>
-        }
-      >
-        <div className="space-y-3 text-sm">
-          <div>导出账号池为 JSON 文件，可用于备份或迁移到其他设备。</div>
-          <label className="flex items-start gap-2">
-            <input
-              type="checkbox"
-              className="mt-0.5"
-              checked={exportWithCreds}
-              onChange={(e) => setExportWithCreds(e.target.checked)}
-            />
-            <span>
-              包含凭证副本（refreshToken / accessToken）
-              <span className="mt-0.5 block text-xs text-amber-600 dark:text-amber-400">
-                含凭证的导出文件等同密码：仅用于本机迁移，请勿分享；不含凭证的导出仅恢复元数据（需重新续期登录）。
-              </span>
-            </span>
-          </label>
-        </div>
-      </Modal>
-
       {/* OAuth 扫码弹框（F-50：后端全流程，事件驱动进度展示） */}
       <Modal
         open={oauthOpen}
@@ -776,9 +736,17 @@ export default function BuddyAccounts() {
           {oauthStage !== 'success' &&
             (oauthAuthUrl ? (
               <div className="space-y-1.5 text-xs text-slate-400">
-                <div>未自动打开浏览器？可复制完整链接手动打开：</div>
+                <div>点击链接在新标签页完成登录；也可复制链接到其他设备浏览器打开：</div>
                 <div className="flex items-start gap-2">
-                  <span className="min-w-0 flex-1 font-mono break-all">{oauthAuthUrl}</span>
+                  <a
+                    href={oauthAuthUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="min-w-0 flex-1 font-mono break-all text-indigo-500 underline dark:text-indigo-400"
+                    title="打开登录页"
+                  >
+                    {oauthAuthUrl}
+                  </a>
                   <button
                     className="btn-outline shrink-0 !px-2 !py-1 !text-xs"
                     onClick={() => void copyOauthUrl()}
@@ -787,7 +755,7 @@ export default function BuddyAccounts() {
                     <Copy size={12} /> 复制完整链接
                   </button>
                 </div>
-                <div>若浏览器仍提示登录链接不完整，请复制完整链接手动打开。</div>
+                <div>若页面提示登录链接不完整，请复制完整链接到新标签页打开。</div>
               </div>
             ) : (
               <div className="text-xs text-slate-400">未获取到登录链接，请查看应用日志</div>

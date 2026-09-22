@@ -542,11 +542,11 @@ fn lazy_renew_skippable(access_token_expires_at: Option<i64>, now_ts: i64) -> bo
 
 // ── 账号库导入导出扩展（F-46 扩展，批次3 T3.6）────────────────────────────
 
-/// 导出账号池（F-46 扩展）：元数据必含；include_credentials=true 时附工具侧凭证副本
-///（迁移场景用；导出文件等同密码，由调用方提示）。与 Trae accounts_export_raw 同语义。
+/// 导出账号池（F-46 扩展）：元数据必含；凭证副本默认附带（迁移场景必需，
+/// Web 一步简版导出；导出文件等同密码，由调用方提示）。与 Trae accounts_export_raw 同语义。
 pub fn workbuddy_accounts_export(state: &AppState, include_credentials: Option<bool>) -> Result<serde_json::Value, String> {
     let pool = load_pool(state);
-    let include_cred = include_credentials.unwrap_or(false);
+    let include_cred = include_credentials.unwrap_or(true);
     let store: serde_json::Value = if include_cred {
         crate::tasks::wb_common::load_token_store(state)
     } else {

@@ -153,11 +153,12 @@ pub fn accounts_list(state: &AppState) -> Vec<AccountView> {
     build_account_views(state)
 }
 
-/// 导出所有账号原始数据，字段名对齐参考 JSON（camelCase），供前端一键导出使用。
+/// 导出账号（Web 简版 JSON）：仅迁移必需字段（凭证 + 身份 + 分组），键名与
+/// accounts_import 兼容口径一致（userId/cloudIdeJwt/refreshToken/dcId/groupId）；
+/// 运行时状态（冷却/签到/余额等）不入简版。桌面端大而全导出仍可被导入兼容。
 pub fn accounts_export_raw(state: &AppState) -> Result<serde_json::Value, String> {
     let accounts = crate::vault::load_accounts(state);
     let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
     let views = build_account_views(state);
 
     let merged: Vec<serde_json::Value> = views
@@ -170,39 +171,16 @@ pub fn accounts_export_raw(state: &AppState) -> Result<serde_json::Value, String
             let refresh_token = raw
                 .and_then(|a| a.refresh_token.clone())
                 .unwrap_or_default();
-            let has_rt = !refresh_token.is_empty();
             // 导出必须给完整 JWT：视图 jwt 字段已改为掩码（防下发），此处从原始账号取
             let jwt_full = raw.map(|a| a.jwt.clone()).unwrap_or_default();
 
-            let device_id = device_map
-                .get(&v.user_id)
-                .map(|d| d.device_id.clone())
-                .unwrap_or_default();
-
-            let jwt_source = if has_rt { "session" } else { "manual" };
-
             serde_json::json!({
+                "userId": v.user_id,
                 "name": v.name,
                 "cloudIdeJwt": jwt_full,
-                "deviceId": device_id,
-                "jwtExp": v.jwt_exp_timestamp,
-                "balance": v.credits,
                 "refreshToken": refresh_token,
-                "jwtSource": jwt_source,
-                "userId": v.user_id,
                 "dcId": raw.and_then(|a| a.dc_id.clone()),
                 "groupId": v.group_id,
-                "addedAt": raw.and_then(|a| a.added_at.clone()),
-                "jwtExpHours": v.jwt_exp_hours,
-                "checkedToday": v.checked_today,
-                "remainingCredits": v.remaining_credits,
-                "deviceIdMasked": v.device_id_masked,
-                "cooldownType": v.cooldown_type,
-                "cooldownUntil": v.cooldown_until,
-                "cooldownReason": v.cooldown_reason,
-                "hasRefreshToken": v.has_refresh_token,
-                "jwtAutoRefresh": v.jwt_auto_refresh,
-                "creditsExpireAt": v.credits_expire_at,
             })
         })
         .collect();
@@ -219,12 +197,11 @@ pub fn accounts_export_raw(state: &AppState) -> Result<serde_json::Value, String
         })
         .map(|a| {
             serde_json::json!({
+                "userId": a.user_id,
                 "name": a.name,
                 "cloudIdeJwt": a.jwt,
                 "refreshToken": a.refresh_token.clone().unwrap_or_default(),
-                "userId": a.user_id,
                 "dcId": a.dc_id,
-                "addedAt": a.added_at,
             })
         })
         .collect();
@@ -246,6 +223,8 @@ pub fn accounts_export_raw(state: &AppState) -> Result<serde_json::Value, String
     all_accounts.extend(extras);
 
     Ok(serde_json::json!({
+        "kind": "aiwork-trae-pool",
+        "version": 1,
         "exportedAt": fs_utils::now_iso(),
         "appVersion": env!("CARGO_PKG_VERSION"),
         "accountCount": all_accounts.len(),

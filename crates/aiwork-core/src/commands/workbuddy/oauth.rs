@@ -315,7 +315,8 @@ fn oauth_flow(state: &AppState, emit: &WbOauthEmitter) -> Result<(String, String
 pub fn workbuddy_oauth_login(state: &AppState, emit: WbOauthEmitter) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     if OAUTH_RUNNING.swap(true, Ordering::SeqCst) {
-        return Err("已有 OAuth 扫码流程进行中".into());
+        // 幂等：已有流程进行中不报错（前端会收到既有流程的 progress/done 事件）
+        return Ok(());
     }
     let st = state.clone();
     std::thread::spawn(move || {
