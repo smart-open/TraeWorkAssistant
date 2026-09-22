@@ -38,6 +38,7 @@ pub async fn bearer_auth(
         .and_then(|s| s.parse::<usize>().ok())
     {
         if len > super::routes::MAX_BODY_BYTES {
+            log_reject(&state, &request, 413, "body too large");
             return body_too_large();
         }
     }
@@ -84,6 +85,7 @@ pub async fn bearer_auth(
             return next.run(request).await;
         }
         Some(KeyCheck::QuotaExceeded { limit }) => {
+            log_reject(&state, &request, 429, &format!("quota exceeded (limit {limit}/day)"));
             return quota_exceeded(limit);
         }
         Some(KeyCheck::Invalid) => {}
@@ -93,6 +95,7 @@ pub async fn bearer_auth(
                 request.extensions_mut().insert(KeyId("anonymous".into()));
                 return next.run(request).await;
             }
+            log_reject(&state, &request, 401, "no api key presented");
             return auth_required_rejected().into_response();
         }
     }
@@ -101,8 +104,27 @@ pub async fn bearer_auth(
         request.extensions_mut().insert(KeyId("anonymous".into()));
         return next.run(request).await;
     }
-
+    // 无效 Key 拒绝（fail-closed）：补记请求日志（此前黑盒，客户端侧报错但
+    // 请求日志零记录，难以区分 Key 填错 / 地址路径错误 / 服务未达）
+    log_reject(&state, &request, 401, "invalid api key");
     (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
+}
+
+/// 鉴权层拒绝日志：请求未进入业务 handler，此前不留任何记录，导致客户端
+/// 报错（如 Trae「empty content 502」）时无法区分 Key 无效 / 未携带 / 超限。
+/// model 未知（body 未解析）记 "-"，uid 记 "-"；reason 写入 error 字段。
+fn log_reject(state: &ApiSharedState, request: &Request, status: u16, reason: &str) {
+    state.logger.log_request(
+        "-",
+        request.method().as_str(),
+        request.uri().path(),
+        "-",
+        false,
+        status,
+        "-",
+        0,
+        Some(reason),
+    );
 }
 
 /// 413 请求体超限响应（issue #21）：结构化 JSON 错误体（OpenAI/Anthropic 客户端
