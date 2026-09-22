@@ -535,6 +535,11 @@ export const api = {
     // 返回规范化后的生效值（前端展示以返回值为准）；端口改动下次启动 API 服务后生效
     gatewaySettingsSet: (settings: GatewaySettings) =>
       invoke<GatewaySettings>('gateway_settings_set', { settings }),
+    // 全局模型白名单（issue #26，canonical 归一列表；空 = 不限）
+    modelWhitelistGet: () => invoke<string[]>('model_whitelist_get'),
+    // 返回归一后的生效值（canonical + 去空 + 去重）；落盘即时生效无需重启网关
+    modelWhitelistSet: (models: string[]) =>
+      invoke<string[]>('model_whitelist_set', { models }),
     // Trae 模型元数据 L1 覆盖层（§6.1 编辑弹框读写 data/trae_model_meta.json）：
     // 顶层参数 camelCase；meta 嵌套字段保持 snake_case；null 字段 = 未设置，交由下层兜底
     // metaGet 用于编辑弹框回显跨会话人工值（null = 无人工值，全字段交由下层兜底）

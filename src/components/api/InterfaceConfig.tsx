@@ -1,15 +1,38 @@
 /**
  * 全局 API 管理 · 接口配置（unified-api-gateway-design §5.2/§5.3）
- * 读写 api_gateway_settings.json（gateway_settings_get/set，Phase 1 §8.1）；
+ * 网关设置经 gateway_settings_get/set 读写（Phase 1 §8.1，SQLite 化后落 kv api_gateway_settings）；
  * 端口改动下次启动 API 服务后生效；含使用方式与配置示例。
+ * issue #26 全局模型白名单：白名单非空 = 仅放行名单内模型（/v1/models 过滤 + 推理端点准入），
+ * 空 = 不限；编辑弹框为三源全量多选，管理端目录（unifiedModels）不过滤白名单。
  */
 import { useEffect, useState } from 'react';
-import { Copy, Globe, Save } from 'lucide-react';
+import { Copy, Globe, ListFilter, Pencil, Save, Search, X } from 'lucide-react';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
+import { Badge, Modal } from '../ui';
 import type { GatewaySettings, UnifiedModel } from '../../types';
+
+/** 与后端 canonical_id 一致：trim + 小写（§3.3 #1） */
+const canonical = (id: string) => id.trim().toLowerCase();
+
+/** 来源池徽章配色（与 API Keys 管理的池徽标一致） */
+function PoolBadges({ pools }: { pools: string[] }) {
+  return (
+    <>
+      {pools.map((p) =>
+        p === 'trae' ? (
+          <Badge key={p} tone="blue">Trae</Badge>
+        ) : p === 'buddy' ? (
+          <Badge key={p} tone="violet">Buddy</Badge>
+        ) : (
+          <Badge key={p} tone="amber">自定义</Badge>
+        ),
+      )}
+    </>
+  );
+}
 
 export default function InterfaceConfig() {
   const toast = useAppStore((s) => s.pushToast);
@@ -17,8 +40,17 @@ export default function InterfaceConfig() {
   const [port, setPort] = useState(7864);
   const [model, setModel] = useState('glm-5.3');
   const [models, setModels] = useState<UnifiedModel[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [copying, setCopying] = useState(false);
+
+  // ---- issue #26 模型白名单 ----
+  const [whitelist, setWhitelist] = useState<string[]>([]);
+  const [savingWl, setSavingWl] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<Set<string>>(new Set());
+  const [draftEnabled, setDraftEnabled] = useState(false);
+  const [wlSearch, setWlSearch] = useState('');
 
   useEffect(() => {
     api.apiServer
@@ -36,6 +68,13 @@ export default function InterfaceConfig() {
       .then(setModels)
       .catch(() => {
         /* 保留空列表 */
+      })
+      .finally(() => setModelsLoaded(true));
+    api.apiServer
+      .modelWhitelistGet()
+      .then(setWhitelist)
+      .catch(() => {
+        /* 保留空名单（= 不限） */
       });
   }, []);
 
@@ -64,6 +103,47 @@ export default function InterfaceConfig() {
     } finally {
       setSaving(false);
     }
+  };
+
+  /** 白名单保存（后端归一/去重，返回值为准）；空列表 = 关闭（不限） */
+  const saveWhitelist = async (list: string[]) => {
+    setSavingWl(true);
+    try {
+      const next = await withMinDelay(api.apiServer.modelWhitelistSet(list));
+      setWhitelist(next);
+      toast('success', next.length ? `白名单已保存（${next.length} 个模型）` : '白名单已关闭（不限模型）');
+      return true;
+    } catch (e) {
+      toast('error', `白名单保存失败：${String(e).slice(0, 120)}`);
+      return false;
+    } finally {
+      setSavingWl(false);
+    }
+  };
+
+  const openEditing = () => {
+    setDraft(new Set(whitelist));
+    setDraftEnabled(whitelist.length > 0);
+    setWlSearch('');
+    setEditing(true);
+  };
+
+  const saveEditing = async () => {
+    if (draftEnabled && draft.size === 0) {
+      toast('error', '启用白名单时至少选择 1 个模型');
+      return;
+    }
+    const ok = await saveWhitelist(draftEnabled ? [...draft] : []);
+    if (ok) setEditing(false);
+  };
+
+  const toggleDraft = (c: string) => {
+    setDraft((prev) => {
+      const next = new Set(prev);
+      if (next.has(c)) next.delete(c);
+      else next.add(c);
+      return next;
+    });
   };
 
   const copyConfigExample = async () => {
@@ -104,12 +184,26 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
       ? models
       : [{ id: model, display: model, rate: null, efforts: [], context_length: null, max_tokens: null, supports_image: null, manual: false, sources: [] }, ...models];
 
+  // ---- 白名单派生数据 ----
+  const catalogByCanonical = new Map(models.map((m) => [canonical(m.id), m]));
+  const wlEnabled = whitelist.length > 0;
+  // 已失效判定须以目录加载完成为前提：加载中/失败时 catalogByCanonical 为空，
+  // 会把全部条目误标失效（「清除失效」将误清所有勾选）
+  const draftStale = modelsLoaded ? [...draft].filter((c) => !catalogByCanonical.has(c)) : [];
+  const searchLc = wlSearch.trim().toLowerCase();
+  const catalogList = models.filter(
+    (m) =>
+      !searchLc ||
+      m.id.toLowerCase().includes(searchLc) ||
+      m.display.toLowerCase().includes(searchLc) ||
+      m.vendor.toLowerCase().includes(searchLc),
+  );
+
   return (
     <div className="card p-4">
       <div className="mb-3 flex items-center gap-2">
         <Globe size={16} className="text-brand-500" />
         <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h3>
-        <span className="text-xs text-slate-400">读写 api_gateway_settings.json</span>
       </div>
 
       <div className="space-y-4">
@@ -146,6 +240,54 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
               统一目录（Trae / Buddy 聚合）；用于 CC Switch 注册与未指定 model 的请求
             </p>
           </div>
+        </div>
+
+        {/* issue #26 模型白名单 */}
+        <div className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700/60">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <ListFilter size={14} className={wlEnabled ? 'text-amber-500' : 'text-slate-400'} />
+              <span className="text-xs font-medium text-slate-600 dark:text-zinc-300">模型白名单</span>
+              {wlEnabled ? (
+                <Badge tone="amber">已启用 · {whitelist.length} 个</Badge>
+              ) : (
+                <Badge tone="slate">未启用 · 不限</Badge>
+              )}
+            </div>
+            <button
+              className="btn-ghost flex items-center gap-1 !p-1 text-xs"
+              onClick={openEditing}
+              disabled={savingWl}
+              title="编辑白名单"
+            >
+              <Pencil size={12} />
+              编辑
+            </button>
+          </div>
+          {wlEnabled ? (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              {whitelist.map((c) => (
+                <span
+                  key={c}
+                  className="flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+                >
+                  {c}
+                  <button
+                    className="opacity-60 hover:opacity-100"
+                    disabled={savingWl}
+                    onClick={() => void saveWhitelist(whitelist.filter((w) => w !== c))}
+                    aria-label={`移除 ${c}`}
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-1.5 text-xs text-slate-400">
+              未启用：目录内全部模型均可访问。启用后 /v1/models 与推理端点仅放行名单内模型（自定义模型同受管辖）。
+            </p>
+          )}
         </div>
 
         <button
@@ -198,6 +340,123 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
           </div>
         </div>
       </div>
+
+      {/* 白名单编辑弹框：三源全量多选 + 来源徽章 + 搜索 + 已失效清除 */}
+      <Modal
+        open={editing}
+        onClose={() => setEditing(false)}
+        title="编辑模型白名单"
+        size="lg"
+        bodyClass="max-h-[calc(100vh-560px)] min-h-[240px] overflow-y-auto"
+      >
+        <div className="space-y-3">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              className="accent-amber-500"
+              checked={draftEnabled}
+              onChange={(e) => setDraftEnabled(e.target.checked)}
+            />
+            <span className="text-xs font-medium text-slate-700 dark:text-zinc-200">启用白名单</span>
+            <span className="text-xs text-slate-400">关闭 = 目录内全部模型均可访问</span>
+          </label>
+
+          <div className="relative">
+            <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              className="input !py-1.5 pl-7 text-xs"
+              placeholder="搜索模型 ID / 名称 / 供应商"
+              value={wlSearch}
+              onChange={(e) => setWlSearch(e.target.value)}
+              disabled={!draftEnabled}
+            />
+          </div>
+
+          <div className="max-h-72 overflow-y-auto rounded-lg border border-slate-200 dark:border-zinc-700/60">
+            {catalogList.length === 0 && (
+              <p className="p-3 text-xs text-slate-400">目录为空或无匹配项；可先在目录页同步官网模型。</p>
+            )}
+            {catalogList.map((m) => {
+              const c = canonical(m.id);
+              const checked = draft.has(c);
+              return (
+                <label
+                  key={m.id}
+                  className={`flex cursor-pointer items-center gap-2 border-b border-slate-100 px-3 py-2 text-xs last:border-b-0 dark:border-zinc-800 ${
+                    checked ? 'bg-amber-50/60 dark:bg-amber-500/5' : ''
+                  } ${!draftEnabled ? 'cursor-not-allowed opacity-50' : ''}`}
+                >
+                  <input
+                    type="checkbox"
+                    className="accent-amber-500"
+                    checked={checked}
+                    disabled={!draftEnabled}
+                    onChange={() => toggleDraft(c)}
+                  />
+                  <span className="min-w-0 flex-1 truncate font-medium text-slate-700 dark:text-zinc-200">
+                    {m.display || m.id}
+                    {m.display !== m.id && (
+                      <span className="ml-1.5 font-normal text-slate-400">{m.id}</span>
+                    )}
+                  </span>
+                  <PoolBadges pools={m.sources.map((s) => s.pool)} />
+                  {m.rate != null && (
+                    <span className="tabular-nums text-slate-400">{m.rate.toFixed(2)}x</span>
+                  )}
+                </label>
+              );
+            })}
+          </div>
+
+          {draftEnabled && draftStale.length > 0 && (
+            <div className="rounded-lg border border-rose-200 bg-rose-50/60 p-2 text-xs dark:border-rose-500/30 dark:bg-rose-500/5">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="font-medium text-rose-600 dark:text-rose-300">
+                  已失效（目录中不存在，仍会按名单拒绝）
+                </span>
+                <button
+                  className="btn-ghost !p-1 text-xs text-rose-500"
+                  onClick={() => setDraft((prev) => new Set([...prev].filter((c) => catalogByCanonical.has(c))))}
+                >
+                  清除失效
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {draftStale.map((c) => (
+                  <span
+                    key={c}
+                    className="flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-[11px] text-rose-700 dark:bg-rose-500/15 dark:text-rose-300"
+                  >
+                    {c}
+                    <button className="opacity-60 hover:opacity-100" onClick={() => toggleDraft(c)} aria-label={`移除 ${c}`}>
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-slate-400">
+              {draftEnabled ? `已选 ${draft.size} 个模型` : '白名单未启用'}
+            </span>
+            <div className="flex gap-2">
+              <button className="btn-ghost text-xs" onClick={() => setEditing(false)} disabled={savingWl}>
+                取消
+              </button>
+              <button
+                className="btn-secondary flex items-center gap-1.5 text-xs"
+                onClick={() => void saveEditing()}
+                disabled={savingWl}
+              >
+                <Save size={13} />
+                {savingWl ? '保存中…' : '保存'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

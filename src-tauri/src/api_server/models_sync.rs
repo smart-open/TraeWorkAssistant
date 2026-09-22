@@ -19,6 +19,8 @@ use crate::models::{AccountsFile, DeviceMap};
 /// - `rate`：官网同步解析的积分倍率（L2，§3.2；字段名以实际响应为准，
 ///   宽容解析失败置 None → 聚合层自动落 L3/L4，不阻塞）
 /// - `context_length / efforts / supports_image`：同上 L2 语义
+/// - `function`：同步时记录的来源视图（上游 llm_utils_chat 接受的 function 值）。
+///   官方新上架模型免改代码：路由按表内视图请求，空 = 旧数据未同步 → 回退硬编码
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelOption {
     pub id: String,
@@ -31,6 +33,8 @@ pub struct ModelOption {
     pub efforts: Vec<String>,
     #[serde(default)]
     pub supports_image: Option<bool>,
+    #[serde(default)]
+    pub function: String,
 }
 
 /// 保位兜底：客户端内置模型，个别账号的配置接口响应可能缺失时补齐
@@ -72,22 +76,54 @@ pub fn default_models() -> Vec<ModelOption> {
         .map(|(id, label)| ModelOption {
             id: id.to_string(),
             label: label.to_string(),
-            // 默认列表不预置元数据：交由统一目录聚合层的 L3/L4 兜底（§3.2）
+            // L2 运营元数据不预置：交由统一目录聚合层的 L3/L4 兜底（§3.2）；
+            // function 预填硬编码实测映射：新装/历史数据免同步即路由正确
             rate: None,
             context_length: None,
             efforts: Vec::new(),
             supports_image: None,
+            function: function_for_model(&id.to_lowercase()).to_string(),
         })
         .collect()
 }
 
-/// 模型 → 上游 function 覆盖：部分模型仅在 solo_agent 下可用，
-/// 其余走 Trae Work 模式的默认 function
+/// 硬编码回退：模型 → 上游 function 覆盖。仅在表内 `function` 为空
+/// （存量数据未重新同步 / 默认列表兜底项）时使用；已知模型实证：
+/// 部分模型仅在 solo_agent 下可用，其余走 Trae Work 模式的默认 function
 pub fn function_for_model(model_lower: &str) -> &'static str {
     match model_lower {
-        "doubao-seed-code" | "glm-5.3-flash" | "qwen3.8-flash" => "solo_agent",
+        "doubao-seed-code" | "glm-5.3-flash" | "qwen3.8-flash" | "deepseek-v4.1-flash"
+        | "kimi-k2.8-preview" => "solo_agent",
         _ => super::FUNCTION,
     }
+}
+
+/// 查表优先的 function 解析（官方新上架模型免改代码的关键路径）：
+/// 同步落库的来源视图非空则直接采用；表内未收录或视图为空 → 硬编码回退。
+/// `model_lower` 须为小写化后的请求模型名（调用方 to_lowercase）；
+/// 表内 id 为官方 config_name 原样，比较时统一小写，大小写不敏感
+pub fn function_for_model_in(list: &[ModelOption], model_lower: &str) -> String {
+    for m in list {
+        if m.id.to_lowercase() == model_lower && !m.function.is_empty() {
+            return m.function.clone();
+        }
+    }
+    function_for_model(model_lower).to_string()
+}
+
+/// 历史数据兼容回填：存量条目（旧版同步/默认列表写入）无 function 字段，
+/// 按硬编码实测映射补齐——回填值与旧版路由行为完全一致（零行为变化），
+/// 仅完成数据格式升级；后续「同步官网模型」由真实来源视图接管。
+/// 返回 (升级后列表, 是否发生回填)；已有值不覆盖，幂等
+fn backfill_functions(mut list: Vec<ModelOption>) -> (Vec<ModelOption>, bool) {
+    let mut changed = false;
+    for m in &mut list {
+        if m.function.is_empty() {
+            m.function = function_for_model(&m.id.to_lowercase()).to_string();
+            changed = true;
+        }
+    }
+    (list, changed)
 }
 
 /// 读取模型列表；kv 缺失或为空时写入默认列表。
@@ -103,7 +139,17 @@ pub fn load_models(data_dir: &Path) -> Vec<ModelOption> {
 fn load_models_uncached(data_dir: &Path) -> Vec<ModelOption> {
     let list: Vec<ModelOption> = crate::store::db(data_dir).kv_get("api_models");
     if !list.is_empty() {
-        return list;
+        // 历史数据兼容：存量条目 function 为空 → 一次性回填写回（见 backfill_functions）；
+        // 写库失败不阻塞读取（下次启动重试）。无需 invalidate：loader 返回值即本轮缓存内容
+        let (upgraded, changed) = backfill_functions(list);
+        if changed {
+            if let Err(e) = crate::store::db(data_dir).kv_set("api_models", &upgraded) {
+                fs_utils::app_log(data_dir, &format!("模型目录 function 回填写入失败: {e}"));
+            } else {
+                fs_utils::app_log(data_dir, "模型目录历史数据兼容：已回填 function 视图字段");
+            }
+        }
+        return upgraded;
     }
     let defaults = default_models();
     if let Err(e) = crate::store::db(data_dir).kv_set("api_models", &defaults) {
@@ -165,6 +211,8 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
                 context_length: None,
                 efforts: Vec::new(),
                 supports_image: None,
+                // 与默认列表同源：预填硬编码实测映射，保位项路由行为不变
+                function: function_for_model(&extra.to_lowercase()).to_string(),
             },
         );
     }
@@ -408,7 +456,10 @@ const PRIMARY_FUNCTIONS: [&str; 4] = ["solo_agent", "chat_v3", "builder", "build
 /// 实测覆盖 98 模型 × 4 视图与客户端两张选择器截图零误差。
 const CONTEXT_MAX_MIN: u64 = 250_000;
 
-/// 解析 batch_get_detail_param 响应：跨 function 合并、按客户端可见性过滤、去重
+/// 解析 batch_get_detail_param 响应：跨 function 合并、按客户端可见性过滤、去重。
+/// 合并时按 PRIMARY_FUNCTIONS 优先级记录来源视图到 `function` 字段（该 function 名
+/// 即上游 llm_utils_chat 接受的请求值）——官方新上架模型路由免改代码的数据来源；
+/// 带 __dev 内部名的条目视为「可调用实证」，替换分支以提供最终胜出条目的视图为准
 fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
     let root: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("解析失败: {e}"))?;
     let fcs = root
@@ -432,6 +483,7 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
         let Some(items) = fc.get("config_info_list").and_then(|v| v.as_array()) else {
             continue;
         };
+        let fname = fc.get("function").and_then(|f| f.as_str()).unwrap_or("");
         for ci in items {
             let id = ci.get("config_name").and_then(|v| v.as_str()).unwrap_or("").trim();
             if id.is_empty() || is_internal(id) {
@@ -488,7 +540,8 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
                 Some(true) => {} // 已收录且带 __dev，跳过
                 Some(false) => {
                     if has_dev {
-                        // 用带 __dev 的条目整体替换先前收录的同名条目（展示名+运营字段）
+                        // 用带 __dev 的条目整体替换先前收录的同名条目（展示名+运营字段+
+                        // 来源视图——带 __dev 的视图是可调用实证）
                         if let Some(pos) = result.iter().position(|m| m.id == id) {
                             let (rate, context_length, efforts, supports_image) = extract_meta(ci);
                             result[pos] = ModelOption {
@@ -498,6 +551,7 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
                                 context_length,
                                 efforts,
                                 supports_image,
+                                function: fname.to_string(),
                             };
                         }
                         seen.insert(id.to_string(), true);
@@ -513,6 +567,7 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
                         context_length,
                         efforts,
                         supports_image,
+                        function: fname.to_string(),
                     });
                 }
             }
@@ -526,12 +581,108 @@ mod tests {
     use super::*;
 
     #[test]
-    fn function_override_only_for_builtin_three() {
+    fn function_override_solo_agent_models() {
         assert_eq!(function_for_model("glm-5.3-flash"), "solo_agent");
         assert_eq!(function_for_model("qwen3.8-flash"), "solo_agent");
         assert_eq!(function_for_model("doubao-seed-code"), "solo_agent");
+        assert_eq!(function_for_model("deepseek-v4.1-flash"), "solo_agent");
+        assert_eq!(function_for_model("kimi-k2.8-preview"), "solo_agent");
         assert_eq!(function_for_model("glm-5.2"), super::super::FUNCTION);
         assert_eq!(function_for_model("deepseek-v4-flash"), super::super::FUNCTION);
+    }
+
+    /// 查表优先：表内 function 非空则直接采用（官方新上架免改代码），
+    /// 未收录 / 视图为空（旧数据）→ 硬编码回退
+    #[test]
+    fn function_for_model_in_prefers_table_then_falls_back() {
+        let list = vec![
+            ModelOption {
+                id: "brand-new-model".into(),
+                label: "Brand New".into(),
+                rate: None,
+                context_length: None,
+                efforts: Vec::new(),
+                supports_image: None,
+                function: "solo_agent".into(),
+            },
+            // 已知模型但视图为空（存量数据未重新同步）→ 回退硬编码
+            ModelOption {
+                id: "deepseek-v4.1-flash".into(),
+                label: "DeepSeek-V4.1-Flash".into(),
+                rate: None,
+                context_length: None,
+                efforts: Vec::new(),
+                supports_image: None,
+                function: String::new(),
+            },
+        ];
+        assert_eq!(function_for_model_in(&list, "brand-new-model"), "solo_agent");
+        // id 大小写不敏感：表内 id 官方原样（如 Doubao-Seed-Code）也按小写命中
+        assert_eq!(
+            function_for_model_in(&list, &"BRAND-NEW-MODEL".to_lowercase()),
+            "solo_agent"
+        );
+        // 视图为空 → 硬编码
+        assert_eq!(function_for_model_in(&list, "deepseek-v4.1-flash"), "solo_agent");
+        // 表外已知模型 → 硬编码；表外未知模型 → 默认 function
+        assert_eq!(function_for_model_in(&list, "glm-5.3-flash"), "solo_agent");
+        assert_eq!(function_for_model_in(&list, "glm-5.2"), super::super::FUNCTION);
+        assert_eq!(function_for_model_in(&list, "totally-unknown"), super::super::FUNCTION);
+        // 空表 → 全部硬编码回退
+        assert_eq!(function_for_model_in(&[], "brand-new-model"), super::super::FUNCTION);
+    }
+
+    /// 历史数据兼容：无 function 的存量条目按硬编码实测映射回填（与旧路由
+    /// 行为零差异），官方原样大小写 id 命中，已有值不覆盖
+    #[test]
+    fn backfill_functions_upgrades_legacy_entries() {
+        let mo = |id: &str, function: &str| ModelOption {
+            id: id.into(),
+            label: id.into(),
+            rate: None,
+            context_length: None,
+            efforts: Vec::new(),
+            supports_image: None,
+            function: function.into(),
+        };
+        let legacy = vec![
+            mo("glm-5.2", ""),
+            mo("Doubao-Seed-Code", ""),
+            mo("brand-new-x", "solo_agent"),
+        ];
+        let (upgraded, changed) = backfill_functions(legacy);
+        assert!(changed);
+        assert_eq!(upgraded[0].function, super::super::FUNCTION);
+        // 官方原样大小写 id（Doubao-Seed-Code）按小写命中硬编码映射
+        assert_eq!(upgraded[1].function, "solo_agent");
+        assert_eq!(upgraded[2].function, "solo_agent");
+    }
+
+    /// 回填幂等：升级后列表再次执行无变更（不会反复写库）
+    #[test]
+    fn backfill_functions_idempotent_after_upgrade() {
+        let (once, _) = backfill_functions(default_models());
+        let (_, changed) = backfill_functions(once);
+        assert!(!changed);
+    }
+
+    /// 默认列表自带 function：新装环境（首次写入）无需同步即路由正确
+    #[test]
+    fn default_models_carry_functions() {
+        for m in default_models() {
+            assert!(!m.function.is_empty(), "{} 缺 function", m.id);
+        }
+        let f = |id: &str| {
+            default_models()
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .function
+                .clone()
+        };
+        assert_eq!(f("deepseek-v4.1-flash"), "solo_agent");
+        assert_eq!(f("kimi-k2.8-preview"), "solo_agent");
+        assert_eq!(f("glm-5.2"), super::super::FUNCTION);
     }
 
     #[test]
@@ -568,6 +719,9 @@ mod tests {
             list.iter().map(|m| (m.id.as_str(), m.label.as_str())).collect::<Vec<_>>(),
             vec![("glm-5.3", "GLM-5.3"), ("qwen-3.7-plus", "Qwen3.7-Plus")]
         );
+        // 来源视图落库：solo_agent 优先级最高（code_reviewer 视图同模型被跳过）
+        assert_eq!(list[0].function, "solo_agent");
+        assert_eq!(list[1].function, "solo_agent");
     }
 
     /// 客户端可见性四层过滤（2026-09-19 截图逆向实证）：
@@ -646,14 +800,43 @@ mod tests {
         let list = parse_official(&text).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].label, "DeepSeek-V4.1-Flash");
+        // 主语境优先落库：solo_agent 位权威名 + 来源视图
+        assert_eq!(list[0].function, "solo_agent");
+    }
+
+    /// 替换分支落库：先收录视图缺 __dev（无可调用实证），带 __dev 的视图
+    /// 整体替换时来源视图一并更新（function 名即上游接受的请求值）
+    #[test]
+    fn parse_official_replace_branch_updates_function() {
+        let text = serde_json::json!({
+            "function_configs": [
+                { "function": "chat_v3", "config_info_list": [
+                    { "config_name": "edge-model", "is_invisible_to_user": false,
+                      "display_config": { "display_name": "Edge V1" },
+                      "context_window_tokens": { "dev": 200000, "max": 1000000 } }
+                ]},
+                { "function": "builder", "config_info_list": [
+                    { "config_name": "edge-model", "is_invisible_to_user": false,
+                      "display_config": { "display_name": "Edge V2" },
+                      "context_window_tokens": { "dev": 200000, "max": 1000000 },
+                      "model_detail_list": [{ "model_name": "edge-model__dev" }] }
+                ]}
+            ]
+        })
+        .to_string();
+        let list = parse_official(&text).unwrap();
+        assert_eq!(list.len(), 1);
+        // 元数据与来源视图均取自带 __dev 的胜出条目
+        assert_eq!(list[0].label, "Edge V2");
+        assert_eq!(list[0].function, "builder");
     }
 
     #[test]
     fn normalize_order_inserts_builtins_and_sorts() {
         let fetched = vec![
-            ModelOption { id: "brand-new-model".into(), label: "Brand New".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None },
-            ModelOption { id: "glm-5.3".into(), label: "GLM-5.3".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None },
-            ModelOption { id: "qwen3.8-max".into(), label: "Qwen3.8-Max".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None },
+            ModelOption { id: "brand-new-model".into(), label: "Brand New".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None, function: String::new() },
+            ModelOption { id: "glm-5.3".into(), label: "GLM-5.3".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None, function: String::new() },
+            ModelOption { id: "qwen3.8-max".into(), label: "Qwen3.8-Max".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None, function: String::new() },
         ];
         let list = normalize_order(fetched);
         let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
@@ -679,6 +862,8 @@ mod tests {
         assert!(m.context_length.is_none());
         assert!(m.efforts.is_empty());
         assert!(m.supports_image.is_none());
+        // function 同样 serde default：空 = 回退硬编码 function_for_model
+        assert!(m.function.is_empty());
     }
 
     /// parse_official 提取 L2 运营字段（真实字段位置：display_contact_config 倍率 /

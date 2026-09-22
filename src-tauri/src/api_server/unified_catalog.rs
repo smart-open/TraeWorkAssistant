@@ -194,6 +194,50 @@ pub fn meta_clear(data_dir: &Path, model: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
+// ==================== 全局模型白名单（issue #26） ====================
+
+/// 读取全局模型白名单（kv `model_whitelist`，Vec<canonical_id>；缺失/空 = 不限）。
+/// 准入校验在每请求热路径上，经 config_cache 缓存；写路径显式失效
+pub fn load_whitelist(data_dir: &Path) -> Vec<String> {
+    super::config_cache::get_or_load(data_dir, "model_whitelist", || {
+        crate::store::db(data_dir).kv_get("model_whitelist")
+    })
+}
+
+/// 白名单准入判定：空名单 = 不限；请求模型名 canonical 化后精确匹配
+pub fn whitelist_allows(list: &[String], model: &str) -> bool {
+    list.is_empty() || list.iter().any(|w| *w == canonical_id(model))
+}
+
+/// 保存白名单（canonical 归一 + 去空 + 去重保序）；返回归一后的生效列表。
+/// 目录未收录的条目允许保存（模型下架/目录同步前的历史勾选仍可表达）
+pub fn save_whitelist(data_dir: &Path, models: &[String]) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let out: Vec<String> = models
+        .iter()
+        .map(|m| canonical_id(m))
+        .filter(|c| !c.is_empty() && seen.insert(c.clone()))
+        .collect();
+    crate::store::db(data_dir).kv_set("model_whitelist", &out)?;
+    super::config_cache::invalidate(data_dir, "model_whitelist");
+    Ok(out)
+}
+
+/// 聚合目录 ∩ 白名单（GET /v1/models 对外目录用）；
+/// 管理端 api_unified_models 不过滤（需全量 + 白名单状态展示）
+pub fn unified_models_whitelisted(
+    data_dir: &Path,
+    wb_enabled: bool,
+    trae_ok: bool,
+    buddy_ok: bool,
+) -> Vec<UnifiedModel> {
+    let wl = load_whitelist(data_dir);
+    unified_models(data_dir, wb_enabled, trae_ok, buddy_ok)
+        .into_iter()
+        .filter(|m| whitelist_allows(&wl, &m.id))
+        .collect()
+}
+
 // ==================== 统一目录聚合（§3.1/§3.3） ====================
 
 /// 单池来源（`enabled` 为运行时派生标记：wb_enabled / 账号池健康，不落盘 §3.3 #5）
@@ -987,5 +1031,67 @@ mod tests {
         let m = find(&list, "my-free-model");
         assert_eq!(m.rate, Some(0.0), "rate=0 必须透传为免费（Some(0.0)）");
         assert_eq!(m.sources[0].rate, Some(0.0));
+    }
+
+    // ==================== issue #26 全局模型白名单 ====================
+
+    /// save 归一（canonical + 去空 + 去重保序）/ 回读 / 判定语义（空 = 不限）
+    #[test]
+    fn t15_whitelist_save_normalize_and_allows() {
+        let f = fixture(&[("glm-5.3", None)], &[], None);
+        let saved = save_whitelist(
+            &f.dir,
+            &["  GLM-5.3 ".into(), "".into(), "glm-5.3".into(), "DeepSeek-V4-Flash".into()],
+        )
+        .unwrap();
+        // 归一 + 去空 + 去重保序
+        assert_eq!(saved, vec!["glm-5.3".to_string(), "deepseek-v4-flash".to_string()]);
+        assert_eq!(load_whitelist(&f.dir), saved, "回读与保存值一致");
+        // 命中：canonical 化匹配（大小写/空白不敏感）
+        assert!(whitelist_allows(&saved, "glm-5.3"));
+        assert!(whitelist_allows(&saved, "  DeepSeek-V4-Flash "));
+        assert!(!whitelist_allows(&saved, "kimi-k3"));
+        // 空名单 = 不限（未保存时缺失也是空）
+        assert!(whitelist_allows(&[], "anything"));
+        // 空保存 → 归一为空列表（= 不限）
+        let cleared = save_whitelist(&f.dir, &[]).unwrap();
+        assert!(cleared.is_empty());
+        assert!(whitelist_allows(&load_whitelist(&f.dir), "kimi-k3"));
+    }
+
+    /// unified_models_whitelisted：白名单过滤对外目录；空名单全量透传
+    #[test]
+    fn t16_unified_models_whitelisted_filter() {
+        let f = fixture(&[("glm-5.3", None)], &["hy4"], None);
+        // 空名单 → 全量
+        let all = unified_models_whitelisted(&f.dir, true, true, true);
+        assert_eq!(all.len(), 2);
+        // 仅 glm-5.3 → hy4 被过滤
+        save_whitelist(&f.dir, &["GLM-5.3".to_string()]).unwrap();
+        let filtered = unified_models_whitelisted(&f.dir, true, true, true);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(canonical_id(&filtered[0].id), "glm-5.3");
+    }
+
+    /// 未知条目允许保存（先建名单后同步目录的工作流，save 不校验目录）；
+    /// 仅含未知条目时对外目录收紧为空（/v1/models 无可返回模型，不静默放行）
+    #[test]
+    fn t17_whitelist_unknown_entries_and_empty_catalog() {
+        let f = fixture(&[("glm-5.3", None)], &[], None);
+        // 目录不存在的条目可直接保存
+        let saved = save_whitelist(
+            &f.dir,
+            &["future-model-x".to_string(), "GLM-5.3".to_string()],
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 2, "未知 + 已知条目均入库");
+        assert_eq!(load_whitelist(&f.dir), saved);
+        // 已知模型保留，未知条目不产生目录条目
+        let filtered = unified_models_whitelisted(&f.dir, true, true, true);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(canonical_id(&filtered[0].id), "glm-5.3");
+        // 仅未知条目 → 对外目录为空
+        save_whitelist(&f.dir, &["future-model-x".to_string()]).unwrap();
+        assert!(unified_models_whitelisted(&f.dir, true, true, true).is_empty());
     }
 }

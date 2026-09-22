@@ -51,4 +51,5 @@ tauri.dev.conf.json
 tauri.signing.conf.json
 # 本地素材导出产物（promo banner 等）
 out/
+target/
 

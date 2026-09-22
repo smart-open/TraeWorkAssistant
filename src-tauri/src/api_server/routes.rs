@@ -109,16 +109,19 @@ fn resolve_wb_target(
         return None;
     }
     // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型；
-    // F-76④ 长上下文降档：输入粗估超阈值 → flash 档模型
+    // F-76④ 长上下文降档：输入粗估超阈值 → flash 档模型。
+    // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
+    let whitelist = unified_catalog::load_whitelist(&state.data_dir);
+    let in_wl = |m: &str| unified_catalog::whitelist_allows(&whitelist, m);
     let final_model = if state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::is_background_task(body)
     {
-        wb_model_route::cheapest_catalog_model(&catalog).unwrap_or(r.model)
+        wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
     } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::estimate_input_tokens(body)
             >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
     {
-        wb_model_route::flash_catalog_model(&catalog).unwrap_or(r.model)
+        wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
     } else {
         r.model
     };
@@ -190,6 +193,29 @@ fn dispatch_error_response(err: DispatchError, proto: Protocol, model: &str) -> 
                 _ => openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", msg),
             }
         }
+    }
+}
+
+/// issue #26 全局模型白名单准入：请求模型不在白名单时返回按协议格式化的 404。
+/// 拒绝码与官方语义一致：OpenAI 侧 `model_not_found`、Anthropic 侧 `not_found_error`。
+/// 白名单为空 = 不限（默认行为零变化）
+fn whitelist_check(state: &ApiSharedState, model: &str, proto: Protocol) -> Option<Response> {
+    let list = unified_catalog::load_whitelist(&state.data_dir);
+    if unified_catalog::whitelist_allows(&list, model) {
+        return None;
+    }
+    Some(whitelist_error_response(model, proto))
+}
+
+/// 白名单拒绝响应壳（独立纯函数便于单测错误格式）
+fn whitelist_error_response(model: &str, proto: Protocol) -> Response {
+    let msg = format!(
+        "model {} is not in the model whitelist; see GET /v1/models for allowed models",
+        model
+    );
+    match proto {
+        Protocol::Anthropic => anthropic_error(StatusCode::NOT_FOUND, "not_found_error", &msg),
+        _ => openai_error(StatusCode::NOT_FOUND, "model_not_found", &msg),
     }
 }
 
@@ -362,7 +388,8 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     let buddy_ok = state.wb_pool.has_selectable();
     let data_dir = state.data_dir.clone();
     let list = tokio::task::spawn_blocking(move || {
-        unified_catalog::unified_models(&data_dir, wb_enabled, trae_ok, buddy_ok)
+        // issue #26：对外目录经全局白名单过滤（管理端 api_unified_models 不过滤）
+        unified_catalog::unified_models_whitelisted(&data_dir, wb_enabled, trae_ok, buddy_ok)
     })
     .await
     .unwrap_or_default();
@@ -439,6 +466,10 @@ pub async fn chat_completions(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::OpenAi) {
+        return resp;
+    }
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
@@ -447,7 +478,7 @@ pub async fn chat_completions(
     // 错误矩阵，替代原 resolve_wb_target 单向判定；默认策略下行为与改造前一致（§9.1）。
     // inflight guard 随执行路径持有至请求结束（流式含整个后台任务）
     let guard = state.inflight_guard();
-    match dispatch::resolve_target(&state, &model, &peek) {
+    match dispatch::resolve_target(&state, &model, &peek, Some(&key_str)) {
         Err(e) => dispatch_error_response(e, Protocol::OpenAi, &model),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
@@ -524,6 +555,10 @@ pub async fn responses_api(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::Responses) {
+        return resp;
+    }
 
     // Responses → OpenAI chat 内部格式（纯投影，失败即 400）
     let chat_body: Value = match super::wb_responses::responses_to_chat(&peek) {
@@ -637,6 +672,10 @@ pub async fn messages(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::Anthropic) {
+        return resp;
+    }
 
     let body_vec = super::payload::anthropic_to_openai(&body);
     let state_clone = state.clone();
@@ -646,7 +685,7 @@ pub async fn messages(
     // 统一调度分流点（§4.1）：resolve_target 决定资源池/回退/错误矩阵；
     // guard 随执行路径持有至请求结束（流式含整个后台任务）
     let guard = state.inflight_guard();
-    match dispatch::resolve_target(&state, &model, &peek) {
+    match dispatch::resolve_target(&state, &model, &peek, Some(&key_str)) {
         Err(e) => dispatch_error_response(e, Protocol::Anthropic, &model),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
@@ -751,6 +790,10 @@ pub async fn completions(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::OpenAiText) {
+        return resp;
+    }
 
     // prompt → user message，复用 /v1/chat/completions 内部链路
     let internal = json!({
@@ -766,7 +809,7 @@ pub async fn completions(
 
     // 统一调度分流点（§4.1）；guard 随执行路径持有至请求结束
     let guard = state.inflight_guard();
-    match dispatch::resolve_target(&state, &model, &internal) {
+    match dispatch::resolve_target(&state, &model, &internal, Some(&key_str)) {
         Err(e) => dispatch_error_response(e, Protocol::OpenAiText, &model),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
@@ -854,6 +897,10 @@ async fn images_entry(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("hy4")
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::OpenAi) {
+        return resp;
+    }
     let prompt = peek.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let image_b64 = peek.get("image").and_then(|v| v.as_str()).map(str::to_string);
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
@@ -876,16 +923,19 @@ async fn images_entry(
 
     // 取健康 WB 账号（生图无粘性语义，任一健康账号）；携带当前请求 Key 的
     // 约束（P1 修复4c）：白名单 allowed_accounts 过滤 + dedicated 专一锁定，
-    // 与 wb_route 同款解析；Key 无约束/匿名（constraints_for 为 None）时不限制
+    // 与 wb_route 同款解析；Key 无约束/匿名（constraints_for 为 None）时不限制。
+    // issue #25 资源池绑定：Key 绑定 trae 时约束作用域不在 WB 池（白名单空），
+    // 生图仍用 WB 池但不应用 Trae 账号白名单（避免误过滤）
     let (allowed_set, dedicated) = {
         let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_str);
         let allowed: Option<HashSet<String>> = key_constraints
             .as_ref()
+            .filter(|k| k.constrains_pool("buddy"))
             .map(|k| k.allowed_accounts.iter().cloned().collect())
             .filter(|s: &HashSet<String>| !s.is_empty());
         let dedicated: Option<String> = key_constraints
             .as_ref()
-            .filter(|k| k.schedule_mode == super::api_keys::MODE_DEDICATED)
+            .filter(|k| k.constrains_pool("buddy") && k.schedule_mode == super::api_keys::MODE_DEDICATED)
             .map(|k| {
                 if k.dedicated_account.is_empty() {
                     k.allowed_accounts.first().cloned().unwrap_or_default()
@@ -960,6 +1010,34 @@ async fn images_entry(
 
 // ==================== Streaming ====================
 
+/// issue #25 资源池绑定：Key 绑定 trae 时 F-35 约束（白名单/专一）作用于 Trae 池；
+/// 其余情况（未绑定/绑定 buddy/匿名）返回 (None, None) = 不限制。
+/// F-35 旧语义兼容：未绑定 Key 的白名单历来只作用 WB 池，绝不能波及 Trae。
+/// pub(crate) 供 dispatch 测试模块复用 Fixture 覆盖四种作用域
+pub(crate) fn trae_pool_constraints(
+    state: &ApiSharedState,
+    key_id: &str,
+) -> (Option<HashSet<String>>, Option<String>) {
+    let Some(kc) = super::api_keys::constraints_for(&state.data_dir, key_id) else {
+        return (None, None);
+    };
+    if !kc.constrains_pool("trae") {
+        return (None, None);
+    }
+    let allowed: Option<HashSet<String>> = (!kc.allowed_accounts.is_empty())
+        .then(|| kc.allowed_accounts.iter().cloned().collect());
+    let dedicated: Option<String> = (kc.schedule_mode == super::api_keys::MODE_DEDICATED)
+        .then(|| {
+            if kc.dedicated_account.is_empty() {
+                kc.allowed_accounts.first().cloned().unwrap_or_default()
+            } else {
+                kc.dedicated_account.clone()
+            }
+        })
+        .filter(|s| !s.is_empty());
+    (allowed, dedicated)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -994,7 +1072,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
     }
 
     // 批次 D-1 线程隔离：流任务迁入专用阻塞池，长流不再占用主 runtime 的
-    // spawn_blocking 池（鉴权/短 IO 依赖它），防并发流耗尽池导致网关级联卡死
+    // spawn_blocking 池（鉴权/短 IO 依赖它），防并发流耗尽池导致网关级联卡死。
+    // Key 绑定 trae 的约束在闭包外解析（clone 进闭包，锁外取号）
+    let (trae_allowed, trae_dedicated) = trae_pool_constraints(&state, &key_id);
     super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至流结束（§4.5：客户端断连/流终止由
         // 任务结束 Drop 兜底释放）；F-77 取号后绑定账号级计数
@@ -1011,7 +1091,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut tried = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
-            let picked = match state.pool.pick_excluding(&tried) {
+            let picked = match state
+                .pool
+                .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
+            {
                 Some(p) => p,
                 None => break,
             };
@@ -1022,6 +1105,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
             let converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                // 模型目录（config_cache 缓存，热路径）：function 查表优先
+                &super::models_sync::load_models(&state.data_dir),
             );
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
@@ -1279,14 +1364,19 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
 async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
     // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
-    // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池
+    // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池。
+    // Key 绑定 trae 的约束在闭包外解析（clone 进闭包，锁外取号）
+    let (trae_allowed, trae_dedicated) = trae_pool_constraints(&state, &key_id);
     let result = super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
         let mut tried = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
-            let picked = match state.pool.pick_excluding(&tried) {
+            let picked = match state
+                .pool
+                .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
+            {
                 Some(p) => p,
                 None => break,
             };
@@ -1297,6 +1387,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
 
             let converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                // 模型目录（config_cache 缓存，热路径）：function 查表优先
+                &super::models_sync::load_models(&state.data_dir),
             );
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
@@ -1730,5 +1822,105 @@ mod tests {
             assert!(out.len() <= n);
             assert!(body.starts_with(out));
         }
+    }
+
+    // ==================== issue #26 全局模型白名单 ====================
+
+    /// 白名单准入用的最小 state fixture：仅 data_dir 参与白名单读取（kv SQLite），
+    /// 其余字段与 dispatch 测试 fixture 同构（空池/默认开关）；Drop 兜底清理临时目录
+    struct WlFixture {
+        dir: std::path::PathBuf,
+        state: Arc<ApiSharedState>,
+    }
+
+    impl Drop for WlFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn wl_fixture(tag: &str) -> WlFixture {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_routes_wl_test_{}_{}_{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(ApiSharedState {
+            pool: super::super::pool::ApiPool::new(),
+            wb_pool: super::super::pool::ApiPool::new(),
+            wb_enabled: std::sync::atomic::AtomicBool::new(true),
+            wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+            wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+            wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            account_concurrency_limit: std::sync::atomic::AtomicU32::new(0),
+            pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            wb_sticky: super::super::wb_sticky::StickyStore::default(),
+            model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            default_model: "deepseek-v4-flash".into(),
+            data_dir: dir.clone(),
+            total_requests: std::sync::atomic::AtomicU64::new(0),
+            inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            active_uid: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            pool_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
+            logger: super::super::ApiLogger::new(dir.join("logs")),
+            debug_enabled: std::sync::atomic::AtomicBool::new(false),
+            usage: std::sync::Mutex::new(super::super::usage::UsageFile::default()),
+            usage_dirty: std::sync::Mutex::new(Vec::new()),
+            wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        });
+        WlFixture { dir, state }
+    }
+
+    /// 拒绝壳格式（纯函数）：OpenAI 三协议共用 model_not_found 404 壳，
+    /// Anthropic 用 not_found_error；消息携带模型名与 /v1/models 指引
+    #[tokio::test]
+    async fn whitelist_error_response_format_by_protocol() {
+        for proto in [Protocol::OpenAi, Protocol::OpenAiText, Protocol::Responses] {
+            let resp = whitelist_error_response("kimi-k3", proto);
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{}", proto.log_path());
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["error"]["code"], "model_not_found");
+            assert_eq!(v["error"]["type"], "api_error");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("kimi-k3") && msg.contains("/v1/models"), "{}", msg);
+        }
+        // Anthropic：type=error 外壳 + not_found_error
+        let resp = whitelist_error_response("kimi-k3", Protocol::Anthropic);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "not_found_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("kimi-k3"));
+    }
+
+    /// whitelist_check 端到端（真实 kv 读写）：空名单放行；canonical 归一命中；
+    /// 非名单模型返回按协议格式化的 404
+    #[tokio::test]
+    async fn whitelist_check_state_end_to_end() {
+        let f = wl_fixture("e2e");
+        // 空名单 = 不限（默认行为零变化）
+        assert!(whitelist_check(&f.state, "glm-5.3", Protocol::OpenAi).is_none());
+        // 保存「GLM-5.3」→ 大小写/空白变体均命中（canonical 归一）
+        unified_catalog::save_whitelist(&f.dir, &["GLM-5.3".to_string()]).unwrap();
+        assert!(whitelist_check(&f.state, "GLM-5.3", Protocol::OpenAi).is_none());
+        assert!(whitelist_check(&f.state, "  glm-5.3 ", Protocol::Anthropic).is_none());
+        // 非名单模型 → 404 model_not_found（OpenAI 壳）
+        let denied = whitelist_check(&f.state, "kimi-k3", Protocol::OpenAi).unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], "model_not_found");
     }
 }
