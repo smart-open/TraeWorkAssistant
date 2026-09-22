@@ -402,7 +402,7 @@ export interface DispatchPolicy {
   updated_at: number;
 }
 
-/** 网关设置（data/api_gateway_settings.json；gateway_settings_get/set） */
+/** 网关设置（kv api_gateway_settings；gateway_settings_get/set） */
 export interface GatewaySettings {
   port: number;
   default_model: string;
@@ -576,6 +576,8 @@ export interface ApiKeyEntry {
   schedule_mode: string;
   /** 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个） */
   dedicated_account: string;
+  /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" */
+  bind_pool: string;
   /** 按日请求统计（升序，保留最近 90 天） */
   daily_stats: ApiKeyDailyStat[];
 }

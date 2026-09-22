@@ -49,4 +49,5 @@ overview.md
 tauri.dev.conf.json
 # 本地素材导出产物（promo banner 等）
 out/
+target/
 

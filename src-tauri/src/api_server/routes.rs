@@ -447,7 +447,7 @@ pub async fn chat_completions(
     // 错误矩阵，替代原 resolve_wb_target 单向判定；默认策略下行为与改造前一致（§9.1）。
     // inflight guard 随执行路径持有至请求结束（流式含整个后台任务）
     let guard = state.inflight_guard();
-    match dispatch::resolve_target(&state, &model, &peek) {
+    match dispatch::resolve_target(&state, &model, &peek, Some(&key_str)) {
         Err(e) => dispatch_error_response(e, Protocol::OpenAi, &model),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
@@ -646,7 +646,7 @@ pub async fn messages(
     // 统一调度分流点（§4.1）：resolve_target 决定资源池/回退/错误矩阵；
     // guard 随执行路径持有至请求结束（流式含整个后台任务）
     let guard = state.inflight_guard();
-    match dispatch::resolve_target(&state, &model, &peek) {
+    match dispatch::resolve_target(&state, &model, &peek, Some(&key_str)) {
         Err(e) => dispatch_error_response(e, Protocol::Anthropic, &model),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
@@ -766,7 +766,7 @@ pub async fn completions(
 
     // 统一调度分流点（§4.1）；guard 随执行路径持有至请求结束
     let guard = state.inflight_guard();
-    match dispatch::resolve_target(&state, &model, &internal) {
+    match dispatch::resolve_target(&state, &model, &internal, Some(&key_str)) {
         Err(e) => dispatch_error_response(e, Protocol::OpenAiText, &model),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
@@ -876,16 +876,19 @@ async fn images_entry(
 
     // 取健康 WB 账号（生图无粘性语义，任一健康账号）；携带当前请求 Key 的
     // 约束（P1 修复4c）：白名单 allowed_accounts 过滤 + dedicated 专一锁定，
-    // 与 wb_route 同款解析；Key 无约束/匿名（constraints_for 为 None）时不限制
+    // 与 wb_route 同款解析；Key 无约束/匿名（constraints_for 为 None）时不限制。
+    // issue #25 资源池绑定：Key 绑定 trae 时约束作用域不在 WB 池（白名单空），
+    // 生图仍用 WB 池但不应用 Trae 账号白名单（避免误过滤）
     let (allowed_set, dedicated) = {
         let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_str);
         let allowed: Option<HashSet<String>> = key_constraints
             .as_ref()
+            .filter(|k| k.constrains_pool("buddy"))
             .map(|k| k.allowed_accounts.iter().cloned().collect())
             .filter(|s: &HashSet<String>| !s.is_empty());
         let dedicated: Option<String> = key_constraints
             .as_ref()
-            .filter(|k| k.schedule_mode == super::api_keys::MODE_DEDICATED)
+            .filter(|k| k.constrains_pool("buddy") && k.schedule_mode == super::api_keys::MODE_DEDICATED)
             .map(|k| {
                 if k.dedicated_account.is_empty() {
                     k.allowed_accounts.first().cloned().unwrap_or_default()
@@ -960,6 +963,34 @@ async fn images_entry(
 
 // ==================== Streaming ====================
 
+/// issue #25 资源池绑定：Key 绑定 trae 时 F-35 约束（白名单/专一）作用于 Trae 池；
+/// 其余情况（未绑定/绑定 buddy/匿名）返回 (None, None) = 不限制。
+/// F-35 旧语义兼容：未绑定 Key 的白名单历来只作用 WB 池，绝不能波及 Trae。
+/// pub(crate) 供 dispatch 测试模块复用 Fixture 覆盖四种作用域
+pub(crate) fn trae_pool_constraints(
+    state: &ApiSharedState,
+    key_id: &str,
+) -> (Option<HashSet<String>>, Option<String>) {
+    let Some(kc) = super::api_keys::constraints_for(&state.data_dir, key_id) else {
+        return (None, None);
+    };
+    if !kc.constrains_pool("trae") {
+        return (None, None);
+    }
+    let allowed: Option<HashSet<String>> = (!kc.allowed_accounts.is_empty())
+        .then(|| kc.allowed_accounts.iter().cloned().collect());
+    let dedicated: Option<String> = (kc.schedule_mode == super::api_keys::MODE_DEDICATED)
+        .then(|| {
+            if kc.dedicated_account.is_empty() {
+                kc.allowed_accounts.first().cloned().unwrap_or_default()
+            } else {
+                kc.dedicated_account.clone()
+            }
+        })
+        .filter(|s| !s.is_empty());
+    (allowed, dedicated)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -994,7 +1025,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
     }
 
     // 批次 D-1 线程隔离：流任务迁入专用阻塞池，长流不再占用主 runtime 的
-    // spawn_blocking 池（鉴权/短 IO 依赖它），防并发流耗尽池导致网关级联卡死
+    // spawn_blocking 池（鉴权/短 IO 依赖它），防并发流耗尽池导致网关级联卡死。
+    // Key 绑定 trae 的约束在闭包外解析（clone 进闭包，锁外取号）
+    let (trae_allowed, trae_dedicated) = trae_pool_constraints(&state, &key_id);
     super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至流结束（§4.5：客户端断连/流终止由
         // 任务结束 Drop 兜底释放）；F-77 取号后绑定账号级计数
@@ -1011,7 +1044,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut tried = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
-            let picked = match state.pool.pick_excluding(&tried) {
+            let picked = match state
+                .pool
+                .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
+            {
                 Some(p) => p,
                 None => break,
             };
@@ -1022,6 +1058,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
             let converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                // 模型目录（config_cache 缓存，热路径）：function 查表优先
+                &super::models_sync::load_models(&state.data_dir),
             );
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
@@ -1279,14 +1317,19 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
 async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, stream: bool, start_ts: std::time::Instant, proto: Protocol, key_id: String, guard: InflightGuard) -> Response {
     // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
-    // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池
+    // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池。
+    // Key 绑定 trae 的约束在闭包外解析（clone 进闭包，锁外取号）
+    let (trae_allowed, trae_dedicated) = trae_pool_constraints(&state, &key_id);
     let result = super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
         let mut tried = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
-            let picked = match state.pool.pick_excluding(&tried) {
+            let picked = match state
+                .pool
+                .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
+            {
                 Some(p) => p,
                 None => break,
             };
@@ -1297,6 +1340,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
 
             let converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                // 模型目录（config_cache 缓存，热路径）：function 查表优先
+                &super::models_sync::load_models(&state.data_dir),
             );
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号

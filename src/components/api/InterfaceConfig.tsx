@@ -1,6 +1,6 @@
 /**
  * 全局 API 管理 · 接口配置（unified-api-gateway-design §5.2/§5.3）
- * 读写 api_gateway_settings.json（gateway_settings_get/set，Phase 1 §8.1）；
+ * 网关设置经 gateway_settings_get/set 读写（Phase 1 §8.1，SQLite 化后落 kv api_gateway_settings）；
  * 端口改动下次启动 API 服务后生效；含使用方式与配置示例。
  */
 import { useEffect, useState } from 'react';
@@ -109,7 +109,6 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
       <div className="mb-3 flex items-center gap-2">
         <Globe size={16} className="text-brand-500" />
         <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h3>
-        <span className="text-xs text-slate-400">读写 api_gateway_settings.json</span>
       </div>
 
       <div className="space-y-4">
