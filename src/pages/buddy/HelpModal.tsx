@@ -1,46 +1,43 @@
-import {
-  DatabaseBackup,
-  FolderCog,
-  Globe,
-  History,
-  KeyRound,
-  LogIn,
-  Save,
-  ScanSearch,
-  ShieldAlert,
-  TerminalSquare,
-} from 'lucide-react';
+import { CalendarClock, Globe, KeyRound, RefreshCw, ScanSearch, Server, Upload } from 'lucide-react';
 import { Modal } from '../../components/ui';
 
+/**
+ * Buddy 账号管理使用帮助（Web 版）：
+ * 按推荐使用流程组织——OAuth 登录添加账号 → 签到与成长 → 定时任务 → API 服务配置；
+ * 桌面版特有功能（保存登录态/切换账号/快照管理/会话备份/CLI 桥接/环境重置）已随桌面壳退役，不再赘述。
+ */
 export function BuddyHelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   return (
     <Modal open={open} onClose={onClose} title="Buddy 账号管理使用帮助" size="xl">
       <div className="space-y-4 text-sm">
         <section className="rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/20">
           <h3 className="mb-1.5 flex items-center gap-1.5 font-semibold text-amber-700 dark:text-amber-300">
-            <Globe size={15} /> 添加账号流程（三步）
+            <Globe size={15} /> 推荐使用流程（三步）
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
             <li>
-              <b>添加账号</b>：点右上角「OAuth登录」完成登录并自动入池；也可「扫描本机账号」扫描本机已登录客户端。
+              <b>添加账号</b>：点「OAuth 登录」完成授权自动入池（推荐）；也可「扫描本机账号」导入本机客户端已登录账号，或「导入账号」从 JSON 文件批量导入。
             </li>
             <li>
-              <b>登录客户端</b>：打开 WorkBuddy（或 CodeBuddy）客户端，登录刚添加的账号。
+              <b>开启自动化</b>：到「Buddy · 环境配置」开启定时任务——签到和成长、token 兜底续期、积分快照自动采集，无需每天手动操作。
             </li>
             <li>
-              <b>保存登录会话</b>：回到本页，点该账号行「保存当前登录态」图标并选择目标应用，备份当前登录会话——此后即可随时「切换」回来。
+              <b>接入 API 服务（可选）</b>：到「API 服务」页启用 WB 上游池并勾选账号，创建 API Key 后即可通过 OpenAI 兼容接口调用。
             </li>
           </ol>
         </section>
 
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
           <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <Globe size={15} className="text-amber-500" /> OAuth登录
+            <Globe size={15} className="text-amber-500" /> OAuth 登录（推荐，自动入池）
           </h3>
-          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            点击「OAuth登录」，应用会自动打开浏览器完成登录，成功后自动解析凭证并入账号池（凭证仅写入本地 token
-            store，全程掩码不上传）。浏览器未自动打开时，弹框内可「复制完整链接」手动打开；扫码超过 5
-            分钟未收到结果会自动解除等待，最终结果以账号列表为准。
+          <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            <li>点「OAuth 登录」，弹窗显示登录链接并自动打开新标签页（浏览器拦截弹窗时点击链接或复制到新窗口）</li>
+            <li>在腾讯 Copilot 授权页完成登录，系统后台自动轮询登录结果</li>
+            <li>成功后凭证自动解析入池（仅存本地，全程掩码展示），弹窗提示完成</li>
+          </ol>
+          <p className="mt-1 text-xs leading-relaxed text-slate-500 dark:text-zinc-400">
+            流程超过 5 分钟未收到结果会自动解除等待，最终以账号列表为准；重复点击进行中的登录会安全返回，不会产生冲突。
           </p>
         </section>
 
@@ -49,104 +46,61 @@ export function BuddyHelpModal({ open, onClose }: { open: boolean; onClose: () =
             <ScanSearch size={15} className="text-amber-500" /> 扫描本机账号
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            扫描本机 WorkBuddy 客户端已登录的账号，一键加入账号池。
+            扫描<b>服务器本机</b> WorkBuddy / CodeBuddy 客户端已登录的账号，一键加入账号池。
           </p>
           <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
-            ⚠ 客户端退出登录后登录凭证已被清空，将无法导入——需先重新登录客户端。
+            ⚠ 仅当服务端与客户端装在同一台机器时可用（Docker 容器部署无客户端，请使用 OAuth 登录）；
+            客户端退出登录后凭证已被清空，将无法导入，需先重新登录客户端。
           </p>
         </section>
 
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
           <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <FolderCog size={15} className="text-amber-500" /> 账号分组
+            <Upload size={15} className="text-amber-500" /> 导入导出与分组
           </h3>
-          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            「分组管理」可新建 / 重命名 / 换色 / 删除分组（删除后组内账号回落「未分组」）；列表上方过滤 chips
-            与账号行「分组」下拉可按分组筛选与归类。分组同时供 Buddy「资源调度」页账号池的分组筛选使用。
+          <ul className="ml-4 list-disc space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            <li><b>导出账号</b>：JSON 文件备份（默认含凭证），可用于迁移或导入其他实例</li>
+            <li><b>导入账号</b>：兼容 Web 简版与桌面版导出格式，导入前预览确认、自动去重</li>
+            <li><b>分组管理</b>：新建 / 重命名 / 换色 / 删除分组，签到、积分、API 服务页均可按组筛选</li>
+            <li><b>行内「刷新」</b>：用 Refresh Token 续期该账号 accessToken，恢复积分查询 / 签到 / API 池能力</li>
+          </ul>
+        </section>
+
+        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
+            <CalendarClock size={15} className="text-amber-500" /> 签到与定时任务
+          </h3>
+          <ul className="ml-4 list-disc space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            <li><b>手动签到</b>：「一键签到」页批量签到 + 成长中心自动化（旅行 / 盲盒 / 任务领奖），支持按分组筛选</li>
+            <li><b>自动签到</b>：「Buddy · 环境配置」开启自动签到后，每日 <b>09:10</b> 定时执行签到和成长，服务启动时还会自动补签当天漏签账号</li>
+            <li><b>定时任务一览</b>：签到和成长 09:10 · token 兜底续期 10:30 · 积分快照 23:30</li>
+            <li>任务支持<b>开关</b>与<b>自定义执行时刻</b>（点时刻徽章修改，当天过点自动补跑）；「恢复推荐配置」一键还原默认</li>
+            <li>任务失败自动冷却重试，可通过「通知渠道」（系统设置，Trae / Buddy 共用）推送失败提醒</li>
+          </ul>
+        </section>
+
+        <section className="rounded-lg border border-sky-200 bg-sky-50 p-3 dark:border-sky-700 dark:bg-sky-900/20">
+          <h3 className="mb-1 flex items-center gap-1.5 font-semibold text-sky-700 dark:text-sky-300">
+            <KeyRound size={15} /> 凭证续期说明
+          </h3>
+          <p className="text-xs leading-relaxed text-sky-800 dark:text-sky-200">
+            调度任务每日 10:30 对池内账号做 token 兜底续期。带「需重新登录」红色标记的账号凭证已失效，
+            行内续期无法恢复——需重新 OAuth 登录。
           </p>
         </section>
 
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
           <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <Save size={15} className="text-amber-500" /> 保存当前登录态
+            <Server size={15} className="text-amber-500" /> API 服务配置
           </h3>
-          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            点击账号行「保存」图标并选择目标应用（WorkBuddy / CodeBuddy）：系统自动关闭客户端 →
-            备份该应用的登录态文件 → 重新启动。WorkBuddy 与 CodeBuddy
-            双端快照相互独立（profiles_workbuddy / profiles_codebuddy），同一账号可分别为两个应用保存。
-          </p>
-          <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
-            ⚠ 首次使用前，请先在对应客户端中登录目标账号，然后点「保存」图标创建快照。
-          </p>
-        </section>
-
-        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
-          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <LogIn size={15} className="text-amber-500" /> 切换账号
-          </h3>
-          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            点击账号行「切换」图标并选择目标应用：系统自动保存当前登录态到当前账号槽位 →
-            恢复目标账号在该应用的登录态 → 重启客户端自动登录。
-          </p>
-          <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
-            ⚠ 目标账号在所选应用下从未保存过登录态时，切换会被中止——请先用「保存」图标创建快照；带「需重新登录」标记的账号需先重新登录客户端并保存登录态。
-          </p>
-        </section>
-
-        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
-          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <KeyRound size={15} className="text-amber-500" /> 凭证续期
-          </h3>
-          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            点击账号行「续期」图标，用 refreshToken 换新 accessToken，恢复积分查询 / 签到 /
-            API 池服务等凭证能力。带「需重新登录」红色标记的账号凭证已失效，续期无法恢复——需重新 OAuth 登录或在客户端登录后保存登录态。
-          </p>
-        </section>
-
-        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
-          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <TerminalSquare size={15} className="text-amber-500" /> CodeBuddy CLI 桥接
-          </h3>
-          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            点击账号行「CLI」图标，将该账号设为 CodeBuddy CLI 的当前账号（写入
-            <code className="mx-0.5 rounded bg-slate-100 px-1 dark:bg-zinc-800">~/.codebuddy/settings.json</code>
-            ）。需账号已录入凭证副本（有 refreshToken）。
-          </p>
-        </section>
-
-        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
-          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <DatabaseBackup size={15} className="text-amber-500" /> 会话备份 / 恢复 / 复制
-          </h3>
-          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            会话备份 / 恢复 / 复制弹窗内均可选择「会话域」（WorkBuddy / CodeBuddy），决定操作作用于
-            <code className="mx-0.5 rounded bg-slate-100 px-1 dark:bg-zinc-800">~/.workbuddy</code>还是
-            <code className="mx-0.5 rounded bg-slate-100 px-1 dark:bg-zinc-800">~/.codebuddy</code>
-            目录。「备份会话」打包 projects 与双 db 快照；之后可「恢复会话」回滚，或「复制会话」到其他账号（复制以全新会话 id
-            进行并注册云端映射，执行前自动快照数据库）。执行时会自动关闭对应客户端。
-          </p>
-        </section>
-
-        <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
-          <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <History size={15} className="text-amber-500" /> 登录态快照管理
-          </h3>
-          <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            点「快照管理」查看 WorkBuddy / CodeBuddy 双端快照槽位（按账号命名，含更新时间、大小、文件数），
-            支持「恢复并启动」与删除，均需二次确认。
-          </p>
-        </section>
-
-        <section className="rounded-lg border border-rose-200 bg-rose-50 p-3 dark:border-rose-700 dark:bg-rose-900/20">
-          <h3 className="mb-1 flex items-center gap-1.5 font-semibold text-rose-700 dark:text-rose-300">
-            <ShieldAlert size={15} /> 环境重置
-          </h3>
-          <p className="text-xs leading-relaxed text-rose-800 dark:text-rose-200">
-            彻底清除本机 WorkBuddy 的全部认证残留（客户端回到未登录态），可同时注销 Keycloak SSO
-            会话。账号池与已备份的登录态、会话数据不受影响。
-          </p>
-          <p className="mt-1 text-xs font-medium text-rose-600 dark:text-rose-400">
-            ⚠ 所选残留将被永久清除，不可逆，请谨慎使用。
+          <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
+            <li>「API 服务」页开启 WB 上游池，勾选账号加入白名单并保存</li>
+            <li>「API 管理 → API Keys 管理」创建子 Key（ck_ 前缀），可设每日配额</li>
+            <li>客户端接口地址填 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">http://&lt;服务器IP&gt;:8080/v1</code>（与管理面同端口，跟随实际访问地址）</li>
+            <li>Buddy 池模型以统一模型目录为准（Buddy 专属模型如 GLM-5.1、Kimi-K2.6 等仅 Buddy 池提供）</li>
+          </ol>
+          <p className="mt-1 flex items-center gap-1 text-xs leading-relaxed text-slate-500 dark:text-zinc-400">
+            <RefreshCw size={12} className="shrink-0" /> 调度策略（smart / 优先级）与指纹清洗开关在「Buddy · 环境配置」调整。
           </p>
         </section>
       </div>
