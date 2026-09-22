@@ -20,8 +20,10 @@ pub fn workbuddy_credits_fetch(state: &AppState, user_id: Option<String>, fresh:
     write_back_pool_balances(state, &parsed);
     // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
     backfill_edition_from_payment_type(state);
-    // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
-    if parsed.get("cached") != Some(&serde_json::json!(true)) {
+    // 每日余额快照（F-27 数据源）：非缓存命中且为全池查询时追加，按日去重，cap 365 天。
+    // 单账号查询（user_id 过滤）不落快照——否则会以单账号余额同日覆盖全池快照，
+    // 次日恢复后差分出现虚假「消耗+获得」对
+    if user_id.is_none() && parsed.get("cached") != Some(&serde_json::json!(true)) {
         append_credits_snapshot(state, &parsed);
     }
     Ok(parsed)
@@ -129,24 +131,65 @@ pub fn workbuddy_editions_backfill(state: &AppState) -> Result<usize, String> {
     Ok(backfill_edition_from_payment_type(state))
 }
 
-/// 追加每日积分余额快照（F-27）：SQLite 化 P6 → wb_credits_history 表，同日覆盖最新 + 365 天裁剪
+/// 追加每日积分余额快照（F-27）：SQLite 化 P6 → wb_credits_history 表，同日覆盖最新 + 365 天裁剪。
+/// 数据质量防护（趋势差分依赖连续可靠的 total 序列）：
+/// 1) 全部账号失败 → 跳过当日快照（不落零值，避免次日恢复时差分出虚假消耗/获得对）；
+/// 2) 部分账号失败 → 该账号沿用最近一次快照余额（标 carried），total 保持连续；
+/// 3) 池组成变化（账号增删）导致的 total 跳变属真实变动，差分口径固有，不处理。
 fn append_credits_snapshot(state: &AppState, parsed: &Value) {
     let store = crate::store::db(&state.data_dir);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let accounts: Vec<Value> = parsed
+    let accounts_in = parsed
         .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if accounts_in.is_empty() {
+        return;
+    }
+    let any_ok = accounts_in
+        .iter()
+        .any(|a| a.get("ok").and_then(Value::as_bool) == Some(true));
+    if !any_ok {
+        fs_utils::app_log(
+            &state.data_dir,
+            "workbuddy: 积分快照跳过（全部账号查询失败，不落零值快照）",
+        );
+        return;
+    }
+    // 最近一次快照的 uid→balance（升序末条），供失败账号补值
+    let prev_map: std::collections::HashMap<String, f64> = crate::store::docs::wb_credits_history_load(&store)
+        .get("snapshots")
+        .and_then(Value::as_array)
+        .and_then(|s| s.last())
+        .and_then(|last| last.get("accounts"))
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
-                .map(|a| {
-                    serde_json::json!({
-                        "user_id": a.get("user_id").cloned().unwrap_or_default(),
-                        "balance": a.get("balance").cloned().unwrap_or(Value::Null),
-                    })
+                .filter_map(|a| {
+                    let uid = a.get("user_id").and_then(Value::as_str)?.to_string();
+                    let bal = a.get("balance").and_then(Value::as_f64)?;
+                    Some((uid, bal))
                 })
                 .collect()
         })
         .unwrap_or_default();
+    let accounts: Vec<Value> = accounts_in
+        .iter()
+        .map(|a| {
+            let uid = a.get("user_id").and_then(Value::as_str).unwrap_or_default().to_string();
+            let ok = a.get("ok").and_then(Value::as_bool) == Some(true);
+            let bal = a.get("balance").and_then(Value::as_f64);
+            match (ok, bal) {
+                (true, Some(b)) => serde_json::json!({ "user_id": uid, "balance": b }),
+                _ => match prev_map.get(&uid) {
+                    // 失败账号沿用昨日余额（carried 标记可追溯）
+                    Some(prev) => serde_json::json!({ "user_id": uid, "balance": prev, "carried": true }),
+                    None => serde_json::json!({ "user_id": uid, "balance": Value::Null }),
+                },
+            }
+        })
+        .collect();
     let total: f64 = accounts.iter().filter_map(|a| a.get("balance").and_then(Value::as_f64)).sum();
     let snap = serde_json::json!({
         "date": today,
