@@ -1,8 +1,8 @@
 /**
  * 全局 API 管理 · 接口配置（unified-api-gateway-design §5.2/§5.3）
- * 网关端口与默认模型（gateway_settings_get/set，Phase 1 §8.1）；
- * 端口改动下次启动 API 服务后生效；含使用方式与配置示例。
- * 接口地址展示走 gatewayBaseUrl()：默认跟随当前访问域名，构建时可注入
+ * 默认模型配置（gateway_settings_get/set，Phase 1 §8.1）；
+ * Web 版单端口架构：/v1/* 网关与管理面同源，无独立端口配置。
+ * 接口地址展示走 gatewayBaseUrl()：默认跟随当前访问地址 origin，构建时可注入
  * VITE_GATEWAY_BASE_URL 覆盖（不再固定 127.0.0.1）。
  */
 import { useEffect, useState } from 'react';
@@ -17,7 +17,6 @@ import type { GatewaySettings, UnifiedModel } from '../../types';
 export default function InterfaceConfig() {
   const toast = useAppStore((s) => s.pushToast);
   const [gw, setGw] = useState<GatewaySettings | null>(null);
-  const [port, setPort] = useState(7864);
   const [model, setModel] = useState('glm-5.3');
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [saving, setSaving] = useState(false);
@@ -28,7 +27,6 @@ export default function InterfaceConfig() {
       .gatewaySettingsGet()
       .then((s) => {
         setGw(s);
-        setPort(s.port);
         setModel(s.default_model);
       })
       .catch(() => {
@@ -43,25 +41,19 @@ export default function InterfaceConfig() {
   }, []);
 
   const save = async () => {
-    const p = Math.floor(port);
-    if (!Number.isFinite(p) || p < 1 || p > 65535) {
-      toast('error', '端口需为 1-65535 的整数');
-      return;
-    }
     setSaving(true);
     try {
-      // 后端会规范化（空模型名回退默认值），前端展示以返回值为准（§5.3）
+      // 后端契约保留 port 字段（原值透传，Web 版无 UI 入口）；模型名由后端规范化（空回退默认）
       const next = await withMinDelay(
         api.apiServer.gatewaySettingsSet({
-          port: p,
+          port: gw?.port ?? 7864,
           default_model: model.trim(),
           updated_at: gw?.updated_at ?? 0,
         }),
       );
       setGw(next);
-      setPort(next.port);
       setModel(next.default_model);
-      toast('success', '网关设置已保存；端口改动将在下次启动 API 服务后生效');
+      toast('success', '网关设置已保存');
     } catch (e) {
       toast('error', `保存失败：${String(e).slice(0, 120)}`);
     } finally {
@@ -70,9 +62,8 @@ export default function InterfaceConfig() {
   };
 
   const copyConfigExample = async () => {
-    const p = gw?.port ?? 7864;
     const m = gw?.default_model ?? 'glm-5.3';
-    const base = gatewayBaseUrl(p);
+    const base = gatewayBaseUrl();
     const example = `# 客户端配置示例（OpenAI 兼容格式）
 接口地址: ${base}/v1
 API Key:  <在「API Keys 管理」中创建并复制>
@@ -108,8 +99,8 @@ curl -X POST ${base}/v1/chat/completions \\
       ? models
       : [{ id: model, display: model, rate: null, efforts: [], context_length: null, max_tokens: null, supports_image: null, manual: false, sources: [] }, ...models];
 
-  // 展示用网关地址（跟随当前访问域名；构建时 VITE_GATEWAY_BASE_URL 可覆盖）
-  const displayBase = gatewayBaseUrl(gw?.port ?? 7864);
+  // 展示用网关地址（跟随当前访问地址 origin；构建时 VITE_GATEWAY_BASE_URL 可覆盖）
+  const displayBase = gatewayBaseUrl();
 
   return (
     <div className="card p-4">
@@ -119,39 +110,25 @@ curl -X POST ${base}/v1/chat/completions \\
       </div>
 
       <div className="space-y-4">
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div>
-            <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
-              监听端口
-            </label>
-            <input
-              type="number"
-              className="input"
-              value={port}
-              onChange={(e) => setPort(parseInt(e.target.value) || 0)}
-            />
-            <p className="mt-1 text-xs text-slate-400">改动将在下次启动 API 服务后生效</p>
-          </div>
-          <div>
-            <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
-              默认模型
-            </label>
-            <select
-              className="input"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-            >
-              {modelOptions.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.display || m.id}
-                  {m.rate != null ? `（${m.rate.toFixed(2)}x）` : ''}
-                </option>
-              ))}
-            </select>
-            <p className="mt-1 text-xs text-slate-400">
-              统一目录（Trae / Buddy 聚合）；用于 CC Switch 注册与未指定 model 的请求
-            </p>
-          </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
+            默认模型
+          </label>
+          <select
+            className="input"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+          >
+            {modelOptions.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.display || m.id}
+                {m.rate != null ? `（${m.rate.toFixed(2)}x）` : ''}
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-xs text-slate-400">
+            统一目录（Trae / Buddy 聚合）；用于 CC Switch 注册与未指定 model 的请求
+          </p>
         </div>
 
         <button

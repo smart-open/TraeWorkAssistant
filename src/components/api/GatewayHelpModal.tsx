@@ -4,7 +4,7 @@
  * 右侧当前支持模型列表（供应商 / 模型名称 / 倍率 / 支持图片 / 来源池，带搜索过滤）。
  * 资源调度说明覆盖三层语义：自定义直达 → 池间选池（smart/priority+回退）→ 池内取号，
  * 并指向「资源总览 → 调度策略中心」调整入口（任务7）。
- * 数据源：unified_models（实时聚合 Trae / Buddy / 自定义 三池）+ gateway_settings_get（端口）。
+ * 数据源：unified_models（实时聚合 Trae / Buddy / 自定义 三池）+ gateway_settings_get（默认模型）。
  */
 import { useEffect, useMemo, useState } from 'react';
 import { CircleHelp, Copy, Search } from 'lucide-react';
@@ -38,8 +38,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
   const [query, setQuery] = useState('');
   const [copied, setCopied] = useState(false);
 
-  const port = gw?.port ?? 7864;
-  const base = gatewayBaseUrl(port);
+  const base = gatewayBaseUrl();
 
   useEffect(() => {
     if (!open) return;

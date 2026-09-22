@@ -1,7 +1,8 @@
 /**
  * 全局 API 管理 · 网关头部（unified-api-gateway-design §5.2/§5.4）
- * Web 版网关常驻运行：无启停按钮，仅展示「网关运行中 :端口」徽标 + 指标行（API Key 数量）。
- * 数据源：gateway_settings_get（端口）、api_keys_list。
+ * Web 版网关常驻运行且与管理面同端口（单端口架构）：无启停按钮，
+ * 仅展示「网关运行中」徽标 + 指标行（API Key 数量）。
+ * 数据源：api_keys_list。
  */
 import { useEffect, useState } from 'react';
 import { Badge } from '../ui';
@@ -24,16 +25,10 @@ function Metric({ label, value, hint }: { label: string; value: string | number;
 
 export default function GatewayHeader() {
   const toast = useAppStore((s) => s.pushToast);
-  const [port, setPort] = useState(7864);
   const [keyCount, setKeyCount] = useState(0);
   const [helpOpen, setHelpOpen] = useState(false);
 
   useEffect(() => {
-    try {
-      void api.apiServer.gatewaySettingsGet().then((s) => setPort(s.port));
-    } catch {
-      /* 保留默认端口展示 */
-    }
     api.apiServer
       .keysList()
       .then((view) => setKeyCount(view.keys.length))
@@ -49,11 +44,11 @@ export default function GatewayHeader() {
             OpenAI / Anthropic 兼容接口，通过 Trae / Buddy 资源池智能调度实现多账号负载均衡
           </p>
           <p className="mt-0.5 text-xs text-slate-400 dark:text-zinc-500">
-            统一网关 {gatewayBaseUrl(port).replace(/^https?:\/\//, '')} · 请求按模型 ID 匹配资源池
+            统一网关 {gatewayBaseUrl().replace(/^https?:\/\//, '')} · 请求按模型 ID 匹配资源池
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          <Badge tone="green">网关运行中 :{port}</Badge>
+          <Badge tone="green">网关运行中</Badge>
           <GatewayHelpButton onClick={() => setHelpOpen(true)} />
         </div>
       </div>
