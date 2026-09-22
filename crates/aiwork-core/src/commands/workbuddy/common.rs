@@ -125,13 +125,8 @@ pub struct WorkBuddySettings {
     /// ⑤ 最小剩余积分：目标低于该值不切（0 = 关闭）
     #[serde(default)]
     pub cli_min_remaining_credits: f64,
-    // 失败通知渠道（F-19，批次3 T3.6）：桌面通知之外的可选渠道
-    /// 企业微信群机器人 webhook（空 = 关闭）
-    #[serde(default)]
-    pub notify_wechat_webhook: Option<String>,
-    /// Server酱 SendKey（空 = 关闭）
-    #[serde(default)]
-    pub notify_serverchan_sendkey: Option<String>,
+    // 失败通知渠道已并入全局通知配置（kv notify_config，系统设置 → 通知渠道）；
+    // 旧设置 JSON 中的 notify_* 字段由 serde 忽略，无需迁移
     // UI 坐标点击签到兜底（F-18，批次4 T4.2）：仅手动触发，默认关闭
     #[serde(default)]
     pub ui_click_enabled: bool,
@@ -180,8 +175,6 @@ impl WorkBuddySettings {
             cli_min_urgency_hours: 72,
             cli_active_guard_minutes: 30,
             cli_min_remaining_credits: 0.0,
-            notify_wechat_webhook: None,
-            notify_serverchan_sendkey: None,
             ui_click_enabled: false,
             ui_click_x: 0,
             ui_click_y: 0,

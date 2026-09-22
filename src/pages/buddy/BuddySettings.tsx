@@ -10,9 +10,10 @@ import type { WorkBuddySettings } from '../../types';
 
 /**
  * Buddy · 环境配置（§3.7.5，F-55/F-59/F-13）：
- * 定时任务（自动签到和成长 / 自动续期 / 自动同步服务器数据，开关即时保存）+
- * 签到参数（保活阈值 / 惰性刷新）+ 失败通知渠道。
- * wb-checkin 开关绑定 WorkBuddySettings.auto_checkin（单源：同时门控定时签到与启动补签）。
+ * 定时任务（自动签到和成长 / 自动续期 / 自动同步服务器数据，开关与执行时刻即时保存）+
+ * 签到参数（保活阈值 / 惰性刷新）。
+ * wb-checkin 开关绑定 WorkBuddySettings.auto_checkin（单源：同时门控定时签到与启动补签）；
+ * 失败通知渠道已并入全局「通知渠道」（系统设置弹框，Trae / Buddy 共用）。
  */
 export default function BuddySettings() {
   const pushToast = useAppStore((s) => s.pushToast);
@@ -83,7 +84,7 @@ export default function BuddySettings() {
     <div className="animate-fade-in">
       <PageHeader
         title="Buddy · 环境配置"
-        desc="定时任务 · 签到参数 · 失败通知"
+        desc="定时任务 · 签到参数（失败通知在系统设置 → 通知渠道配置）"
         actions={
           <>
             <button className="btn-outline" onClick={() => void refresh()} disabled={refreshing}>
@@ -130,44 +131,12 @@ export default function BuddySettings() {
           </div>
         </section>
 
-        {/* 右列：定时任务（开关即时保存，含最近执行状态；推荐配置 = 全部启用） */}
+        {/* 右列：定时任务（开关与执行时刻即时保存，含最近执行状态；推荐配置 = 全部启用 + 默认时刻） */}
         <SchedulerTasksCard
           taskKeys={['wb-checkin', 'wb-renew', 'wb-credits-snapshot']}
           overrides={overrides}
           desc="服务端内置调度器每日自动执行，覆盖自动签到和成长 / 自动续期 / 自动同步积分看板数据。推荐保持全部启用。"
         />
-      </div>
-
-      {/* 失败通知渠道（F-19，Buddy 业务配置）：随「保存配置」保存 */}
-      <div className="card mt-4 p-4">
-        <div className="mb-3 text-sm font-medium">失败通知渠道</div>
-        <div className="space-y-3">
-          <p className="text-xs text-slate-400">
-            签到/补签失败等关键事件会同时推送到已配置的渠道（留空 = 关闭）。
-          </p>
-          <div className="grid gap-3 lg:grid-cols-2">
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-500">企业微信群机器人 Webhook</span>
-              <input
-                className="input w-full font-mono text-xs"
-                value={settings?.notify_wechat_webhook ?? ''}
-                onChange={(e) => patch({ notify_wechat_webhook: e.target.value || null })}
-                placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
-              />
-              <span className="mt-1 block text-xs text-slate-400">群机器人消息：标题 + 失败摘要</span>
-            </label>
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-500">Server酱 SendKey</span>
-              <input
-                className="input w-full font-mono text-xs"
-                value={settings?.notify_serverchan_sendkey ?? ''}
-                onChange={(e) => patch({ notify_serverchan_sendkey: e.target.value || null })}
-                placeholder="SCTxxxxxxxx（sctapi.ftqq.com）"
-              />
-              <span className="mt-1 block text-xs text-slate-400">推送到微信服务号；Key 仅本地保存，不进日志</span>
-            </label>
-          </div>
-        </div>
       </div>
     </div>
   );

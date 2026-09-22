@@ -73,6 +73,8 @@ fn tick(st: &AppState) {
     let now_hm = now.format("%H:%M").to_string();
     // T11：通知配置整轮读一次（签到成功/任务失败推送，内部再按总开关静默）
     let notify_cfg = crate::notify::load_config(st);
+    // 自定义时刻整轮读一次（kv 单读，各任务共用）
+    let times = task_times(st);
     for t in TASKS {
         // 各任务启用判定（与既有设置语义保持一致）
         if !enabled(st, t.key) {
@@ -81,8 +83,9 @@ fn tick(st: &AppState) {
         if last_run_date(st, t.key).as_deref() == Some(today.as_str()) {
             continue;
         }
-        // HH:MM 零填充，字符串比较即时间序
-        if now_hm.as_str() < t.hhmm {
+        // 生效时刻：自定义覆盖 > 默认；HH:MM 零填充，字符串比较即时间序
+        let hhmm = times.get(t.key).map(String::as_str).unwrap_or(t.hhmm);
+        if now_hm.as_str() < hhmm {
             continue;
         }
         // 失败冷却：30 分钟内静默等待重试，不重复执行也不刷日志
@@ -103,7 +106,7 @@ fn tick(st: &AppState) {
                 mark_run(st, t.key, &today, &summary);
                 fs_utils::app_log(
                     &st.data_dir,
-                    &format!("[调度器] {}（每日 {}）：{}", t.name, t.hhmm, summary),
+                    &format!("[调度器] {}（每日 {hhmm}）：{}", t.name, summary),
                 );
                 // T11：仅签到类任务完成时推送（快照/续期类静默，避免每日刷屏）
                 if notify_cfg.on_checkin_done && matches!(t.key, "trae-checkin" | "wb-checkin") {
@@ -115,8 +118,8 @@ fn tick(st: &AppState) {
                 fs_utils::app_log(
                     &st.data_dir,
                     &format!(
-                        "[调度器] {}（每日 {}）失败，30 分钟后重试：{}",
-                        t.name, t.hhmm, summary
+                        "[调度器] {}（每日 {hhmm}）失败，30 分钟后重试：{}",
+                        t.name, summary
                     ),
                 );
                 // T11：任务失败推送（全部任务；通知内部再按总开关静默）
@@ -142,9 +145,9 @@ fn enabled(st: &AppState, key: &str) -> bool {
     }
 }
 
-// ── 任务开关配置（kv `scheduler_cfg`）────────────────────────────────────────
-// 形态：{ "disabled_tasks": ["trae-checkin", ...] }；缺省 = 全部启用（推荐配置）。
-// 前端在 Trae / Buddy 环境配置页按平台展示对应任务的开关。
+// ── 任务配置（kv `scheduler_cfg`）────────────────────────────────────────────
+// 形态：{ "disabled_tasks": ["trae-checkin", ...], "task_times": { "trae-checkin": "08:30", ... } }
+// 缺省 = 全部启用 + 各任务默认时刻（推荐配置）。前端在 Trae / Buddy 环境配置页展示。
 
 fn disabled_tasks(st: &AppState) -> Vec<String> {
     load_cfg(st)
@@ -159,18 +162,44 @@ fn disabled_tasks(st: &AppState) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 自定义触发时刻表（key → HH:MM；缺省键 = 用任务默认时刻）
+fn task_times(st: &AppState) -> std::collections::HashMap<String, String> {
+    load_cfg(st)
+        .get("task_times")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn load_cfg(st: &AppState) -> Value {
     let v: Value = crate::store::db(&st.data_dir).kv_get("scheduler_cfg");
     if v.is_object() { v } else { json!({}) }
 }
 
-/// 任务开关配置查询（命令桥 scheduler_config_get 分发）
+/// 任务配置查询（命令桥 scheduler_config_get 分发）
 pub fn scheduler_config_get(st: &AppState) -> Value {
-    json!({ "disabled_tasks": disabled_tasks(st) })
+    json!({
+        "disabled_tasks": disabled_tasks(st),
+        "task_times": task_times(st),
+    })
 }
 
-/// 任务开关配置写入（命令桥 scheduler_config_set 分发）：未知任务键整体拒绝，
-/// 返回保存后的生效值
+/// HH:MM 合法性（00:00–23:59）
+fn valid_hhmm(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 5 || b[2] != b':' {
+        return false;
+    }
+    let (h, m) = (s[..2].parse::<u8>().ok(), s[3..].parse::<u8>().ok());
+    matches!((h, m), (Some(h), Some(m)) if h < 24 && m < 60)
+}
+
+/// 任务配置写入（命令桥 scheduler_config_set 分发）：未知任务键整体拒绝，
+/// 自定义时刻需合法 HH:MM，返回保存后的生效值
 pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> {
     let list = cfg
         .get("disabled_tasks")
@@ -184,10 +213,33 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
         }
         disabled.push(k.to_string());
     }
-    let _ = crate::store::db(&st.data_dir).kv_set("scheduler_cfg", &json!({ "disabled_tasks": disabled }));
+    // 自定义时刻：整表替换；空对象 = 全部回默认。只存与默认不同的键也无妨——
+    // 全量存便于前端整表回显，语义等价
+    let mut times: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(m) = cfg.get("task_times") {
+        let obj = m.as_object().ok_or("task_times 应为对象")?;
+        for (k, v) in obj {
+            if !TASKS.iter().any(|t| t.key == k) {
+                return Err(format!("未知调度任务: {k}"));
+            }
+            let s = v.as_str().ok_or_else(|| format!("任务 {k} 的时刻应为 HH:MM 字符串"))?;
+            if !valid_hhmm(s) {
+                return Err(format!("任务 {k} 的时刻 {s} 非法（应为 00:00–23:59）"));
+            }
+            times.insert(k.clone(), s.to_string());
+        }
+    }
+    let _ = crate::store::db(&st.data_dir).kv_set(
+        "scheduler_cfg",
+        &json!({ "disabled_tasks": disabled, "task_times": times }),
+    );
     fs_utils::app_log(
         &st.data_dir,
-        &format!("[调度器] 任务开关已更新：{} 项停用", disabled.len()),
+        &format!(
+            "[调度器] 任务配置已更新：{} 项停用，{} 项自定义时刻",
+            disabled.len(),
+            times.len()
+        ),
     );
     Ok(scheduler_config_get(st))
 }
@@ -363,6 +415,7 @@ fn summarize(v: &Value) -> String {
 /// 调度器状态查询（命令桥 scheduler_status 分发到此）：任务定义 + 最近一次执行情况
 pub fn scheduler_status(st: &AppState) -> Value {
     let raw = load_state(st);
+    let times = task_times(st);
     let tasks: Vec<Value> = TASKS
         .iter()
         .map(|t| {
@@ -373,7 +426,7 @@ pub fn scheduler_status(st: &AppState) -> Value {
             json!({
                 "key": t.key,
                 "name": t.name,
-                "time": t.hhmm,
+                "time": times.get(t.key).cloned().unwrap_or_else(|| t.hhmm.to_string()),
                 "enabled": enabled(st, t.key),
                 "last_run_date": e.get("last_run_date").cloned().unwrap_or(Value::Null),
                 "last_run_ts": e.get("last_run_ts").cloned().unwrap_or(Value::Null),

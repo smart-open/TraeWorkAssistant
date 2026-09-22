@@ -102,7 +102,7 @@ SQLite 单库（WAL），三类表（详见 `crates/aiwork-core/src/store/schema
 | `trae-credits-snapshot` | 23:40 | `refresh_remaining_credits_impl` |
 
 - 状态落 kv `scheduler_state`（每任务 last_run_date/last_ok/last_fail_ts/last_summary），前端 `scheduler_status` 查看。
-- 任务开关：kv `scheduler_cfg.disabled_tasks`（前端 `scheduler_config_get/set`，缺省全开 = 推荐配置）；`enabled` 与既有设置语义合成（`wb-checkin` 仍跟随「自动补签」开关）。
+- 任务配置：kv `scheduler_cfg`（前端 `scheduler_config_get/set`）——`disabled_tasks` 停用名单（缺省全开 = 推荐配置）、`task_times` 自定义每日触发时刻（缺省用内置默认）；`enabled` 与既有设置语义合成（`wb-checkin` 仍跟随「自动补签」开关）。
 - CLI 兜底：`aiwork-server --task-run <name>` 单任务执行后退出。
 - 任务执行 panic 由 `catch_unwind` 捕获，不影响后续调度。
 - 通知接入：签到完成（仅签到类任务）/ 任务失败 → `notify::send`（Bark / Server酱 / webhook 三渠道，总开关默认关，单渠道失败仅记日志的旁路语义）。

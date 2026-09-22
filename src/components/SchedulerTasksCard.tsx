@@ -8,7 +8,8 @@ import type { SchedulerTaskView } from '../types';
 /**
  * 定时任务配置卡（Trae / Buddy 环境配置共用）：
  * 按平台展示内置调度任务开关（kv scheduler_cfg.disabled_tasks，缺省全开 = 推荐配置）、
- * 每日触发时刻与最近一次执行摘要；wb-checkin 由外部 override 绑定 WorkBuddySettings.auto_checkin。
+ * 可编辑的每日触发时刻（kv scheduler_cfg.task_times，空 = 默认时刻）与最近一次执行摘要；
+ * wb-checkin 由外部 override 绑定 WorkBuddySettings.auto_checkin。
  */
 
 /** 各任务一句话说明（key → 描述） */
@@ -47,7 +48,10 @@ export default function SchedulerTasksCard({
   const pushToast = useAppStore((s) => s.pushToast);
   const [tasks, setTasks] = useState<SchedulerTaskView[] | null>(null);
   const [disabled, setDisabled] = useState<string[]>([]);
+  /** 自定义触发时刻表（key → HH:MM；空 = 默认时刻，状态接口回显生效值） */
+  const [times, setTimes] = useState<Record<string, string>>({});
   const [toggling, setToggling] = useState<string | null>(null);
+  const [timeSaving, setTimeSaving] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
 
   const reload = useCallback(() => {
@@ -57,7 +61,10 @@ export default function SchedulerTasksCard({
       .catch(() => setTasks(null));
     api.scheduler
       .configGet()
-      .then((c) => setDisabled(c.disabled_tasks))
+      .then((c) => {
+        setDisabled(c.disabled_tasks);
+        setTimes(c.task_times ?? {});
+      })
       .catch(() => setDisabled([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -77,8 +84,10 @@ export default function SchedulerTasksCard({
     setDisabled(nextList);
     setToggling(key);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: nextList });
+      // config_set 为整表替换：必须同时携带自定义时刻，否则会被清空
+      const saved = await api.scheduler.configSet({ disabled_tasks: nextList, task_times: times });
       setDisabled(saved.disabled_tasks);
+      setTimes(saved.task_times ?? {});
       pushToast('success', next ? '任务已启用，明日按计划执行' : '任务已停用');
       // enabled 合成了其他设置语义，重取状态保持展示准确
       api.scheduler
@@ -93,13 +102,38 @@ export default function SchedulerTasksCard({
     }
   };
 
-  /** 恢复推荐配置：清空停用名单（全部启用） */
+  /** 修改执行时刻：清空 = 恢复默认；保存后重取状态回显生效时刻 */
+  const saveTime = async (key: string, value: string) => {
+    const prev = times;
+    const next = { ...prev };
+    if (value) next[key] = value;
+    else delete next[key];
+    setTimes(next);
+    setTimeSaving(key);
+    try {
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: next });
+      setTimes(saved.task_times ?? {});
+      pushToast('success', value ? `执行时间已改为 ${value}（当天已过新时刻会自动补跑）` : '已恢复默认执行时间');
+      api.scheduler
+        .status()
+        .then((r) => setTasks(r.tasks.filter((t) => taskKeys.includes(t.key))))
+        .catch(() => {});
+    } catch (e) {
+      setTimes(prev);
+      pushToast('error', e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setTimeSaving(null);
+    }
+  };
+
+  /** 恢复推荐配置：清空停用名单与自定义时刻（全部启用 + 默认时刻） */
   const resetRecommended = async () => {
     setResetting(true);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: [] });
+      const saved = await api.scheduler.configSet({ disabled_tasks: [], task_times: {} });
       setDisabled(saved.disabled_tasks);
-      pushToast('success', '已恢复推荐配置（全部任务启用）');
+      setTimes(saved.task_times ?? {});
+      pushToast('success', '已恢复推荐配置（全部任务启用 + 默认时刻）');
       api.scheduler
         .status()
         .then((r) => setTasks(r.tasks.filter((t) => taskKeys.includes(t.key))))
@@ -111,8 +145,8 @@ export default function SchedulerTasksCard({
     }
   };
 
-  // 恢复推荐按钮只覆盖本卡内的 kv 开关任务；外部 override 绑定的开关由自身行内开关恢复
-  const hasCustom = disabled.some((k) => taskKeys.includes(k));
+  // 恢复推荐按钮只覆盖本卡内的 kv 配置任务；外部 override 绑定的开关由自身行内开关恢复
+  const hasCustom = disabled.some((k) => taskKeys.includes(k)) || taskKeys.some((k) => times[k]);
 
   return (
     <section className={`card p-4 ${className ?? ''}`}>
@@ -157,7 +191,26 @@ export default function SchedulerTasksCard({
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-medium">{t?.name ?? key}</span>
-                    <Badge tone={on ? 'brand' : 'slate'}>{t?.time ?? '—'}</Badge>
+                    {t && (
+                      <input
+                        type="time"
+                        value={t.time}
+                        disabled={timeSaving === key}
+                        onChange={(e) => void saveTime(key, e.target.value)}
+                        className="w-[92px] rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-xs tabular-nums text-slate-600 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                        title="每日触发时刻（修改即时保存；留空恢复默认）"
+                      />
+                    )}
+                    {times[key] && t?.time !== undefined && (
+                      <button
+                        onClick={() => void saveTime(key, '')}
+                        disabled={timeSaving === key}
+                        className="text-xs text-slate-400 underline-offset-2 hover:text-brand-500 hover:underline"
+                        title="恢复该任务的默认时刻"
+                      >
+                        默认
+                      </button>
+                    )}
                     {!on && <Badge tone="amber">已停用</Badge>}
                   </div>
                   <p className="mt-0.5 text-xs text-slate-400">{TASK_DESC[key] ?? ''}</p>

@@ -253,9 +253,11 @@ export interface SchedulerTaskView {
   last_summary: string | null;
 }
 
-/** 调度任务开关配置（scheduler_config_get/set）：停用名单，缺省 = 全部启用 */
+/** 调度任务配置（scheduler_config_get/set）：停用名单 + 自定义时刻，缺省 = 全部启用 + 默认时刻 */
 export interface SchedulerConfig {
   disabled_tasks: string[];
+  /** 自定义触发时刻（key → HH:MM）；空对象 = 全部用默认时刻 */
+  task_times?: Record<string, string>;
 }
 
 export interface CheckinOpts {
@@ -597,9 +599,6 @@ export interface WorkBuddySettings {
   cli_min_urgency_hours: number;
   cli_active_guard_minutes: number;
   cli_min_remaining_credits: number;
-  /** 失败通知渠道（F-19）：空 = 关闭 */
-  notify_wechat_webhook: string | null;
-  notify_serverchan_sendkey: string | null;
   /** UI 坐标点击签到兜底（F-18）：仅手动触发，默认关闭 */
   ui_click_enabled: boolean;
   ui_click_x: number;

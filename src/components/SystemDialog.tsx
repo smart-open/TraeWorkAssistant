@@ -7,10 +7,10 @@ import Logs from '../pages/Logs';
 import { cn } from '../lib/cn';
 
 /**
- * 系统设置与系统日志弹框（侧边栏左下角系统图标入口）。
- * Tab 1 系统设置：外观 / 语言 / 通用与通知 / 代理配置。
- * Tab 2 安全与管理：通知渠道 / IP 允许列表 / 管理员令牌（自环境配置页迁入的全局配置）。
- * Tab 3 系统日志：复用系统日志页面（运行日志 / 代理日志 / API 请求日志）。
+ * 系统设置与日志弹框（侧边栏左下角系统图标入口）。
+ * Tab 1 系统设置：外观 / 语言 / 通用与通知 / 通知渠道（Trae / Buddy 全平台共用）。
+ * Tab 2 安全与管理：管理员令牌 / IP 允许列表（自环境配置页迁入的全局配置）。
+ * Tab 3 日志：复用系统日志页面（运行日志 / 代理日志 / API 请求日志）。
  */
 export default function SystemDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [tab, setTab] = useState<'settings' | 'security' | 'logs'>('settings');
@@ -23,11 +23,11 @@ export default function SystemDialog({ open, onClose }: { open: boolean; onClose
   const TABS = [
     { key: 'settings' as const, label: '系统设置', icon: Settings2 },
     { key: 'security' as const, label: '安全与管理', icon: ShieldCheck },
-    { key: 'logs' as const, label: '系统日志', icon: ScrollText },
+    { key: 'logs' as const, label: '日志', icon: ScrollText },
   ];
 
   return (
-    <Modal open={open} onClose={onClose} title="系统设置与系统日志" size="2xl">
+    <Modal open={open} onClose={onClose} title="系统设置与日志" size="2xl">
       <div className="flex h-[72vh] flex-col">
         {/* Tab 切换 — 分段控件风格 */}
         <div className="mb-3 inline-flex shrink-0 items-center gap-1 self-start rounded-xl border border-slate-200/80 bg-slate-50/80 p-1 dark:border-zinc-700/60 dark:bg-zinc-800/40">

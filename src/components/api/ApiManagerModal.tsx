@@ -69,8 +69,9 @@ export default function ApiManagerModal() {
       </div>
 
       {/* Tab 内容（固定高度内部滚动，头部与 Tab 栏常驻；切换 Tab 高度不变，接口配置等长内容走内部滚动。
-          高度推导：(100vh-330px)*1.2 - 500px = 120vh - 896px） */}
-      <div className="mt-3 h-[calc(120vh_-_896px)] min-h-[288px] overflow-y-auto pr-0.5">
+          高度推导：内容区占 100vh-360px（概览 Tab 常见内容一屏放下不出纵向滚动条），
+          加上头部/Tab 栏/标题后整窗 ≈ 100vh-250px，常见视口内不溢出；矮屏由内部滚动兜底） */}
+      <div className="mt-3 h-[calc(100vh_-_360px)] min-h-[320px] overflow-y-auto pr-0.5">
         {tab === 'overview' && <ResourceSummary />}
         {tab === 'config' && <InterfaceConfig />}
         {tab === 'keys' && (

@@ -91,6 +91,8 @@ export default function BuddyAccounts() {
   const [importingBackup, setImportingBackup] = useState(false);
   // OAuth 流程 pending（发起 → done 事件/超时；期间顶部按钮禁用，弹框提前关闭仍监听结果）
   const [oauthBusy, setOauthBusy] = useState(false);
+  // 已自动打开过的登录链接（防止重复 window.open）
+  const autoOpenedRef = useRef<string | null>(null);
   // ---- 账号分组（对齐 Trae 账号管理）----
   const [wbGroups, setWbGroups] = useState<GroupView[]>([]);
   const [groupOpen, setGroupOpen] = useState(false);
@@ -171,6 +173,13 @@ export default function BuddyAccounts() {
       setOauthStage(e.payload.stage);
       setOauthMessage(e.payload.message);
       if (e.payload.auth_url) setOauthAuthUrl(e.payload.auth_url);
+      // 自动打开登录页：服务端（容器）无 GUI 无法开浏览器，由前端代开新标签页；
+      // 被弹窗拦截时回退到弹框内的可点击链接 + 提示
+      if (e.payload.auth_url && autoOpenedRef.current !== e.payload.auth_url) {
+        autoOpenedRef.current = e.payload.auth_url;
+        const w = window.open(e.payload.auth_url, '_blank', 'noopener');
+        if (!w) pushToast('warn', '浏览器拦截了自动打开：请点击弹框中的登录链接完成登录');
+      }
     });
     const un2 = listen<WbOauthDone>('wb-oauth-done', (e) => {
       setOauthBusy(false);
@@ -200,12 +209,13 @@ export default function BuddyAccounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [oauthOpen, oauthBusy]);
 
-  // 发起 OAuth 扫码（后端打开浏览器 + 轮询 + 自动入池）
+  // 发起 OAuth 扫码（服务端轮询 + 前端自动打开登录页 + 自动入池）
   const startOauth = async () => {
     setOauthBusy(true);
     setOauthStage('init');
     setOauthMessage('正在发起扫码登录…');
     setOauthAuthUrl(null);
+    autoOpenedRef.current = null; // 新一轮流程允许重新自动打开
     setOauthOpen(true);
     try {
       await api.workbuddy.oauthLogin();
