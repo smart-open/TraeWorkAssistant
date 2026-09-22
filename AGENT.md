@@ -71,7 +71,7 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_accounts_*` / `workbuddy_checkin_start` / `workbuddy_growth_run` / `workbuddy_checkin_results` / `workbuddy_credits_fetch` / `workbuddy_settings_*` / `workbuddy_oauth_login` / `workbuddy_usage_official` / `workbuddy_usage_fallback` / `workbuddy_activity_info` / `workbuddy_token_stats` | WB 账号/签到/成长中心/积分/官方用量（31 天分页）/快照回退/活动信息/本地 Token 统计；OAuth 为 authUrl+state 轮询（≤300s，纯 HTTP 无需粘贴） |
 | API 网关 | `pool_list/set/status` / `api_keys_list/save` / `api_models_list/sync` / `api_unified_models` / `api_custom_models_*` / `dispatch_policy_*` / `gateway_settings_*` / `trae_model_meta_*` | 三池调度策略（smart/priority + per_model 覆盖）、ck_ 子 Key、模型目录三源合并（四层兜底）、自定义上游、网关设置；网关常驻随服务启停（无启停命令） |
 | 用量/日志 | `api_usage_stats` / `api_wb_usage_stats` / `api_custom_usage_stats` / `api_logs_list/detail/search` / `logs_query` / `logs_clear` | 按日统计（分池）、请求日志、运行日志 |
-| 调度 | `scheduler_status` | 各任务最近执行状态（kv `scheduler_state`） |
+| 调度 | `scheduler_status` / `scheduler_config_get` / `scheduler_config_set(config)` | 任务状态（kv `scheduler_state`）+ 任务开关（kv `scheduler_cfg.disabled_tasks`，未知键整体拒绝；缺省全开 = 推荐配置） |
 | 通知 | `notify_config_get` / `notify_config_set` / `notify_test` | Bark / Server酱 / 通用 webhook 三渠道配置与测试（T11） |
 | 安全 | `ip_allowlist_get` / `ip_allowlist_set` | IP 允许列表（T12a）：enabled/trust_proxy/cidrs；保存即热生效，无效 CIDR 整体拒绝 |
 | 管理员令牌 | `admin_tokens_list` / `admin_token_create(label)` / `admin_token_revoke(id)` | 附加可吊销令牌（T12b）：list 掩码、create 返回明文仅一次、上限 20 个 |
@@ -103,13 +103,14 @@ ai-work-assistant/
 | 任务 | 每日触发 | 说明 |
 |---|---|---|
 | `trae-jwt-renew` | 05:30 | 遍历 vault 账号 `refresh_jwt_impl(force=false)`，48h lazy gate 内置（未临期零网络请求）；invalid 计入「需重新 OAuth」摘要 |
+| `models-sync` | 05:40 | 官网模型列表每日同步（batch_get_detail_param，不消耗积分）；无可用账号时跳过不计失败 |
 | `trae-checkin` | 09:00 | Trae 全账号签到（状态核验幂等） |
 | `wb-checkin` | 09:10 | WB 签到+成长中心；跟随「启动自动补签」开关；与手动路径抢轮次锁互斥 |
 | `wb-renew` | 10:30 | WB token 兜底续期（lazy 24h） |
 | `wb-credits-snapshot` | 23:30 | WB 积分快照（近 7 日消耗差分数据源） |
 | `trae-credits-snapshot` | 23:40 | Trae 积分快照 |
 
-状态落 SQLite kv `scheduler_state`，前端 `scheduler_status` 查看。`--task-run <name>` CLI 兜底（单任务执行后退出）。
+状态落 SQLite kv `scheduler_state`，前端 `scheduler_status` 查看。任务开关：kv `scheduler_cfg.disabled_tasks`（前端 `scheduler_config_get/set`），`enabled` 与既有设置语义合成（`wb-checkin` 仍跟随「启动自动补签」）。`--task-run <name>` CLI 兜底（单任务执行后退出）。
 
 **通知渠道**（`notify.rs`，kv `notify_config`）：Bark / Server酱 / 通用 webhook 三渠道顺序推送；触发点=签到完成（仅签到类任务+手动签到）与任务失败；总开关默认关；单渠道失败仅记 `app_log` 不阻塞主流程（旁路语义）。
 

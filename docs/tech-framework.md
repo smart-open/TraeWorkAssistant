@@ -38,7 +38,7 @@
 │ state/store/models/fs_utils/jwt/icube_auth/checkin_results   │
 │ vault（KeyProvider: env 或文件，ADR-2）                        │
 │ tasks/{trae_checkin, wb_checkin, wb_common, wb_credits}      │
-│ tasks/scheduler（60s tick，6 任务，§5）                       │
+│ tasks/scheduler（60s tick，7 任务，§5）                       │
 │ commands/*（accounts/oauth/workbuddy/checkin impl 层）        │
 │ notify.rs（Bark / Server酱 / webhook 三渠道推送）              │
 └──────────┬──────────────────────────────────────────────────┘
@@ -94,6 +94,7 @@ SQLite 单库（WAL），三类表（详见 `crates/aiwork-core/src/store/schema
 | 任务 | 触发 | 实现 |
 |---|---|---|
 | `trae-jwt-renew` | 05:30 | 遍历 vault 账号 `refresh_jwt_impl(force=false)`；48h lazy gate 内置；invalid 计入「需重新 OAuth」摘要 |
+| `models-sync` | 05:40 | `models_sync::fetch_official`（vault 首个含 JWT 账号，最多试 3 个；无账号跳过不计失败） |
 | `trae-checkin` | 09:00 | `trae_checkin::run_round`（vault 全账号单轮，状态核验幂等） |
 | `wb-checkin` | 09:10 | `wb_checkin::run_checkin_round`（抢轮次锁与手动路径互斥；跟随「自动补签」开关） |
 | `wb-renew` | 10:30 | `run_renew_only`（lazy 24h） |
@@ -101,6 +102,7 @@ SQLite 单库（WAL），三类表（详见 `crates/aiwork-core/src/store/schema
 | `trae-credits-snapshot` | 23:40 | `refresh_remaining_credits_impl` |
 
 - 状态落 kv `scheduler_state`（每任务 last_run_date/last_ok/last_fail_ts/last_summary），前端 `scheduler_status` 查看。
+- 任务开关：kv `scheduler_cfg.disabled_tasks`（前端 `scheduler_config_get/set`，缺省全开 = 推荐配置）；`enabled` 与既有设置语义合成（`wb-checkin` 仍跟随「自动补签」开关）。
 - CLI 兜底：`aiwork-server --task-run <name>` 单任务执行后退出。
 - 任务执行 panic 由 `catch_unwind` 捕获，不影响后续调度。
 - 通知接入：签到完成（仅签到类任务）/ 任务失败 → `notify::send`（Bark / Server酱 / webhook 三渠道，总开关默认关，单渠道失败仅记日志的旁路语义）。

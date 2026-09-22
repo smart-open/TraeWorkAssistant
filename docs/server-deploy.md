@@ -1,6 +1,6 @@
 # 🚀 Web 版服务端部署指南
 
-> 单进程 axum 服务（`aiwork-server`）：管理面 REST + OpenAI/Anthropic 兼容网关 + 6 项定时任务调度 + 三渠道通知推送（Bark/Server酱/Webhook，应用内配置）+ React 静态托管，浏览器任意设备直访。
+> 单进程 axum 服务（`aiwork-server`）：管理面 REST + OpenAI/Anthropic 兼容网关 + 7 项定时任务调度 + 三渠道通知推送（Bark/Server酱/Webhook，应用内配置）+ React 静态托管，浏览器任意设备直访。
 
 ## 📋 快速开始
 
@@ -147,4 +147,4 @@ tar czf aiwork-backup-$(date +%F).tgz data/
 | 登录提示 token 无效 | 令牌取自 `conf/admin_token` 文件或 env 注入值；env 变更后需 `docker compose up -d` 重建；附加管理员令牌（设置页签发）同样可登录，吊销后立即失效 |
 | 签到时间不对 | 确认 `TZ=Asia/Shanghai` 未被覆盖 |
 | 手动签到无进度 | 实时通道走 WebSocket `/api/ws`（连接失败前端自动回退 SSE `/api/events/checkin`）；Nginx 需带 Upgrade 升级头并对 SSE `proxy_buffering off`（见上节示例） |
-| 定时任务没跑 | 任务由服务端内置调度器托管（05:30 Trae JWT 续期 / 09:00 Trae 签到 / 09:10 WB 签到 / 10:30 WB 续期 / 23:30、23:40 积分快照），重启后自动补跑当天错过的任务 |
+| 定时任务没跑 | 任务由服务端内置调度器托管（05:30 Trae JWT 续期 / 05:40 模型列表同步 / 09:00 Trae 签到 / 09:10 WB 签到 / 10:30 WB 续期 / 23:30、23:40 积分快照），重启后自动补跑当天错过的任务；确认环境配置页对应任务开关未停用 |

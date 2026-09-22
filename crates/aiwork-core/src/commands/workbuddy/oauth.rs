@@ -320,14 +320,21 @@ pub fn workbuddy_oauth_login(state: &AppState, emit: WbOauthEmitter) -> Result<(
     }
     let st = state.clone();
     std::thread::spawn(move || {
-        let payload = match oauth_flow(&st, &emit) {
-            Ok((id, nickname)) => serde_json::json!({
+        // panic 保护（与调度器任务 catch_unwind 同款防御）：oauth_flow 若 panic，
+        // 标志位必须复位，否则幂等分支会让后续登录静默无事件直至重启
+        let flow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| oauth_flow(&st, &emit)));
+        let payload = match flow {
+            Ok(Ok((id, nickname))) => serde_json::json!({
                 "ok": true,
                 "id": id,
                 "nickname": nickname,
                 "message": format!("账号「{nickname}」已扫码登录并自动入池"),
             }),
-            Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            Ok(Err(e)) => serde_json::json!({ "ok": false, "message": e }),
+            Err(_) => serde_json::json!({
+                "ok": false,
+                "message": "OAuth 流程内部异常（panic），请重试；若持续失败请结合 app.log 反馈",
+            }),
         };
         let _ = emit("wb-oauth-done", payload);
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
