@@ -208,10 +208,15 @@ fn strip_suffix_ci(name: &str, suffix: &str) -> Option<String> {
 }
 
 /// 目录内倍率最低的模型（后台任务降级目标，T5.6③/F-65）；
-/// 全目录倍率相同/为空时取首个
-pub fn cheapest_catalog_model(catalog: &[super::wb_catalog::WbModel]) -> Option<String> {
+/// 全目录倍率相同/为空时取首个。
+/// issue #26：生产路由一律走白名单感知的 `cheapest_catalog_model_filtered`
+pub fn cheapest_catalog_model_filtered(
+    catalog: &[super::wb_catalog::WbModel],
+    allowed: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     catalog
         .iter()
+        .filter(|m| allowed(&m.id))
         .min_by(|a, b| a.rate.partial_cmp(&b.rate).unwrap_or(std::cmp::Ordering::Equal))
         .map(|m| m.id.clone())
 }
@@ -277,22 +282,24 @@ pub fn estimate_input_tokens(body: &serde_json::Value) -> u64 {
     total_chars / 4
 }
 
-/// flash 档模型（F-76④长上下文降档目标）：id 含 "flash" 中最低倍率者；
-/// 目录无 flash 档时回退全局最低倍率（与 wb_bg_downgrade 同族降档语义）
-pub fn flash_catalog_model(catalog: &[super::wb_catalog::WbModel]) -> Option<String> {
-    let pick_min = |c: &[&super::wb_catalog::WbModel]| {
-        c.iter()
-            .min_by(|a, b| a.rate.partial_cmp(&b.rate).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|m| m.id.clone())
-    };
+// ==================== issue #26 白名单感知降级 ====================
+
+/// 白名单感知的 flash 档降档：flash 子集先过 `allowed`，空则回退白名单内全局最低倍率
+pub fn flash_catalog_model_filtered(
+    catalog: &[super::wb_catalog::WbModel],
+    allowed: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     let flash: Vec<&super::wb_catalog::WbModel> = catalog
         .iter()
-        .filter(|m| m.id.to_lowercase().contains("flash"))
+        .filter(|m| m.id.to_lowercase().contains("flash") && allowed(&m.id))
         .collect();
     if flash.is_empty() {
-        cheapest_catalog_model(catalog)
+        cheapest_catalog_model_filtered(catalog, allowed)
     } else {
-        pick_min(&flash)
+        flash
+            .iter()
+            .min_by(|a, b| a.rate.partial_cmp(&b.rate).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|m| m.id.clone())
     }
 }
 
@@ -426,7 +433,7 @@ mod tests {
 
     #[test]
     fn cheapest_model_is_lowest_rate() {
-        let c = cheapest_catalog_model(&catalog()).unwrap();
+        let c = cheapest_catalog_model_filtered(&catalog(), &|_| true).unwrap();
         // hy4-preview 与 hy3 均限时免费（0.00），min_by 取目录首个命中 hy4-preview
         assert_eq!(c, "hy4-preview");
     }
@@ -524,11 +531,44 @@ mod tests {
         }
         // flash 档中最低倍率者胜
         let cat = vec![m("glm-5.3", 1.0), m("glm-5.3-flash", 0.5), m("glm-4-flash", 0.2)];
-        assert_eq!(flash_catalog_model(&cat).as_deref(), Some("glm-4-flash"));
+        assert_eq!(flash_catalog_model_filtered(&cat, &|_| true).as_deref(), Some("glm-4-flash"));
         // 无 flash 档 → 回退全局最低倍率
         let cat2 = vec![m("glm-5.3", 1.0), m("glm-5.2", 0.8)];
-        assert_eq!(flash_catalog_model(&cat2).as_deref(), Some("glm-5.2"));
+        assert_eq!(flash_catalog_model_filtered(&cat2, &|_| true).as_deref(), Some("glm-5.2"));
         // 空目录 → None
-        assert_eq!(flash_catalog_model(&[]), None);
+        assert_eq!(flash_catalog_model_filtered(&[], &|_| true), None);
+    }
+
+    // ==================== issue #26 白名单感知降级 ====================
+
+    /// 白名单过滤的降级候选：过滤生效、交集为空返回 None（调用方跳过降级）
+    #[test]
+    fn whitelist_filtered_downgrade_targets() {
+        fn m(id: &str, rate: f64) -> super::super::wb_catalog::WbModel {
+            serde_json::from_value(json!({"id": id, "rate": rate})).unwrap()
+        }
+        let cat = vec![m("glm-5.3", 1.0), m("glm-5.3-flash", 0.5), m("glm-4-flash", 0.2)];
+        // 过滤掉全局最低（glm-4-flash）→ cheapest 取剩余最低
+        let allow = |id: &str| id != "glm-4-flash";
+        assert_eq!(
+            cheapest_catalog_model_filtered(&cat, &allow).as_deref(),
+            Some("glm-5.3-flash")
+        );
+        // flash 子集过滤后仍命中
+        assert_eq!(
+            flash_catalog_model_filtered(&cat, &allow).as_deref(),
+            Some("glm-5.3-flash")
+        );
+        // 全部被过滤 → None（跳过降级）
+        let none: &dyn Fn(&str) -> bool = &|_| false;
+        assert_eq!(cheapest_catalog_model_filtered(&cat, none), None);
+        assert_eq!(flash_catalog_model_filtered(&cat, none), None);
+        // flash 全被过滤 → 回退白名单内全局最低
+        let no_flash = |id: &str| id != "glm-4-flash" && id != "glm-5.3-flash";
+        assert_eq!(
+            flash_catalog_model_filtered(&cat, &no_flash).as_deref(),
+            Some("glm-5.3")
+        );
+        // 谓词 canonical 匹配（大小写不敏感场景由 whitelist_allows 承担，此处直传）
     }
 }

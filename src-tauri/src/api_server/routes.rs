@@ -109,16 +109,19 @@ fn resolve_wb_target(
         return None;
     }
     // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型；
-    // F-76④ 长上下文降档：输入粗估超阈值 → flash 档模型
+    // F-76④ 长上下文降档：输入粗估超阈值 → flash 档模型。
+    // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
+    let whitelist = unified_catalog::load_whitelist(&state.data_dir);
+    let in_wl = |m: &str| unified_catalog::whitelist_allows(&whitelist, m);
     let final_model = if state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::is_background_task(body)
     {
-        wb_model_route::cheapest_catalog_model(&catalog).unwrap_or(r.model)
+        wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
     } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::estimate_input_tokens(body)
             >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
     {
-        wb_model_route::flash_catalog_model(&catalog).unwrap_or(r.model)
+        wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
     } else {
         r.model
     };
@@ -190,6 +193,29 @@ fn dispatch_error_response(err: DispatchError, proto: Protocol, model: &str) -> 
                 _ => openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", msg),
             }
         }
+    }
+}
+
+/// issue #26 全局模型白名单准入：请求模型不在白名单时返回按协议格式化的 404。
+/// 拒绝码与官方语义一致：OpenAI 侧 `model_not_found`、Anthropic 侧 `not_found_error`。
+/// 白名单为空 = 不限（默认行为零变化）
+fn whitelist_check(state: &ApiSharedState, model: &str, proto: Protocol) -> Option<Response> {
+    let list = unified_catalog::load_whitelist(&state.data_dir);
+    if unified_catalog::whitelist_allows(&list, model) {
+        return None;
+    }
+    Some(whitelist_error_response(model, proto))
+}
+
+/// 白名单拒绝响应壳（独立纯函数便于单测错误格式）
+fn whitelist_error_response(model: &str, proto: Protocol) -> Response {
+    let msg = format!(
+        "model {} is not in the model whitelist; see GET /v1/models for allowed models",
+        model
+    );
+    match proto {
+        Protocol::Anthropic => anthropic_error(StatusCode::NOT_FOUND, "not_found_error", &msg),
+        _ => openai_error(StatusCode::NOT_FOUND, "model_not_found", &msg),
     }
 }
 
@@ -362,7 +388,8 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     let buddy_ok = state.wb_pool.has_selectable();
     let data_dir = state.data_dir.clone();
     let list = tokio::task::spawn_blocking(move || {
-        unified_catalog::unified_models(&data_dir, wb_enabled, trae_ok, buddy_ok)
+        // issue #26：对外目录经全局白名单过滤（管理端 api_unified_models 不过滤）
+        unified_catalog::unified_models_whitelisted(&data_dir, wb_enabled, trae_ok, buddy_ok)
     })
     .await
     .unwrap_or_default();
@@ -439,6 +466,10 @@ pub async fn chat_completions(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::OpenAi) {
+        return resp;
+    }
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
@@ -524,6 +555,10 @@ pub async fn responses_api(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::Responses) {
+        return resp;
+    }
 
     // Responses → OpenAI chat 内部格式（纯投影，失败即 400）
     let chat_body: Value = match super::wb_responses::responses_to_chat(&peek) {
@@ -637,6 +672,10 @@ pub async fn messages(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::Anthropic) {
+        return resp;
+    }
 
     let body_vec = super::payload::anthropic_to_openai(&body);
     let state_clone = state.clone();
@@ -751,6 +790,10 @@ pub async fn completions(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::OpenAiText) {
+        return resp;
+    }
 
     // prompt → user message，复用 /v1/chat/completions 内部链路
     let internal = json!({
@@ -854,6 +897,10 @@ async fn images_entry(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("hy4")
         .to_string();
+    // issue #26 白名单准入（空名单不限）
+    if let Some(resp) = whitelist_check(&state, &model, Protocol::OpenAi) {
+        return resp;
+    }
     let prompt = peek.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let image_b64 = peek.get("image").and_then(|v| v.as_str()).map(str::to_string);
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
@@ -1775,5 +1822,105 @@ mod tests {
             assert!(out.len() <= n);
             assert!(body.starts_with(out));
         }
+    }
+
+    // ==================== issue #26 全局模型白名单 ====================
+
+    /// 白名单准入用的最小 state fixture：仅 data_dir 参与白名单读取（kv SQLite），
+    /// 其余字段与 dispatch 测试 fixture 同构（空池/默认开关）；Drop 兜底清理临时目录
+    struct WlFixture {
+        dir: std::path::PathBuf,
+        state: Arc<ApiSharedState>,
+    }
+
+    impl Drop for WlFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn wl_fixture(tag: &str) -> WlFixture {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_routes_wl_test_{}_{}_{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(ApiSharedState {
+            pool: super::super::pool::ApiPool::new(),
+            wb_pool: super::super::pool::ApiPool::new(),
+            wb_enabled: std::sync::atomic::AtomicBool::new(true),
+            wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+            wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+            wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+            wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
+            wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            account_concurrency_limit: std::sync::atomic::AtomicU32::new(0),
+            pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            wb_sticky: super::super::wb_sticky::StickyStore::default(),
+            model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            default_model: "deepseek-v4-flash".into(),
+            data_dir: dir.clone(),
+            total_requests: std::sync::atomic::AtomicU64::new(0),
+            inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            active_uid: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            pool_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
+            logger: super::super::ApiLogger::new(dir.join("logs")),
+            debug_enabled: std::sync::atomic::AtomicBool::new(false),
+            usage: std::sync::Mutex::new(super::super::usage::UsageFile::default()),
+            usage_dirty: std::sync::Mutex::new(Vec::new()),
+            wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+            wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        });
+        WlFixture { dir, state }
+    }
+
+    /// 拒绝壳格式（纯函数）：OpenAI 三协议共用 model_not_found 404 壳，
+    /// Anthropic 用 not_found_error；消息携带模型名与 /v1/models 指引
+    #[tokio::test]
+    async fn whitelist_error_response_format_by_protocol() {
+        for proto in [Protocol::OpenAi, Protocol::OpenAiText, Protocol::Responses] {
+            let resp = whitelist_error_response("kimi-k3", proto);
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{}", proto.log_path());
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["error"]["code"], "model_not_found");
+            assert_eq!(v["error"]["type"], "api_error");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("kimi-k3") && msg.contains("/v1/models"), "{}", msg);
+        }
+        // Anthropic：type=error 外壳 + not_found_error
+        let resp = whitelist_error_response("kimi-k3", Protocol::Anthropic);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "not_found_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("kimi-k3"));
+    }
+
+    /// whitelist_check 端到端（真实 kv 读写）：空名单放行；canonical 归一命中；
+    /// 非名单模型返回按协议格式化的 404
+    #[tokio::test]
+    async fn whitelist_check_state_end_to_end() {
+        let f = wl_fixture("e2e");
+        // 空名单 = 不限（默认行为零变化）
+        assert!(whitelist_check(&f.state, "glm-5.3", Protocol::OpenAi).is_none());
+        // 保存「GLM-5.3」→ 大小写/空白变体均命中（canonical 归一）
+        unified_catalog::save_whitelist(&f.dir, &["GLM-5.3".to_string()]).unwrap();
+        assert!(whitelist_check(&f.state, "GLM-5.3", Protocol::OpenAi).is_none());
+        assert!(whitelist_check(&f.state, "  glm-5.3 ", Protocol::Anthropic).is_none());
+        // 非名单模型 → 404 model_not_found（OpenAI 壳）
+        let denied = whitelist_check(&f.state, "kimi-k3", Protocol::OpenAi).unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], "model_not_found");
     }
 }

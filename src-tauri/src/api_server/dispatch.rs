@@ -270,25 +270,30 @@ pub fn resolve_target(
     let catalog = super::wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
     let buddy_hit = super::wb_catalog::find(&catalog, &r.model)
-        .map(|_| {
-            // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
-            let final_model = if state
-                .wb_bg_downgrade
-                .load(std::sync::atomic::Ordering::Relaxed)
-                && wb_model_route::is_background_task(body)
-            {
-                wb_model_route::cheapest_catalog_model(&catalog).unwrap_or_else(|| r.model.clone())
-            } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
-                // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
-                && wb_model_route::estimate_input_tokens(body)
-                    >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
-            {
-                wb_model_route::flash_catalog_model(&catalog).unwrap_or_else(|| r.model.clone())
-            } else {
-                r.model.clone()
-            };
-            (final_model, r.effort_hint.clone())
-        });
+            .map(|_| {
+                // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
+                // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
+                let whitelist = super::unified_catalog::load_whitelist(&state.data_dir);
+                let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
+                let final_model = if state
+                    .wb_bg_downgrade
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && wb_model_route::is_background_task(body)
+                {
+                    wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl)
+                        .unwrap_or_else(|| r.model.clone())
+                } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
+                    // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
+                    && wb_model_route::estimate_input_tokens(body)
+                        >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
+                {
+                    wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl)
+                        .unwrap_or_else(|| r.model.clone())
+                } else {
+                    r.model.clone()
+                };
+                (final_model, r.effort_hint.clone())
+            });
 
     // ③ Trae 源判定：canonical_id 命中 Trae 模型列表；未命中任何目录时保持
     // 透传语义（单源 Trae，与现状一致）
@@ -1341,5 +1346,45 @@ mod tests {
         // 未知 Key（已注销/匿名）：不限制
         let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "nope");
         assert!(a.is_none() && d.is_none());
+    }
+
+    // ---------- issue #26 全局模型白名单 ----------
+
+    /// 白名单感知后台任务降级（dispatch 白名单联动）：候选 ∩ 白名单非空 →
+    /// 取白名单内最低倍率；交集为空 → 跳过降级保持原模型（原模型已过端点准入）
+    #[test]
+    fn t38_whitelist_aware_bg_downgrade() {
+        // 内置目录（fixture 写入的 kv 因 builtin_rev=0 触发内置表重建）：
+        // 全局最低为 hy4-preview(0.00 免费档)，原模型 glm-5.3(0.78)
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        f.state
+            .wb_bg_downgrade
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 后台任务体：max_tokens ≤ 128 + 短文本（is_background_task = true）
+        let bg_body = || {
+            json!({"model": "glm-5.3", "max_tokens": 16,
+                   "messages": [{"role": "user", "content": "生成标题"}]})
+        };
+
+        // 白名单含 glm-5.3-flash(0.06) + glm-5.3 → 降级取白名单内最低倍率（跳过被禁的 0.00 免费档）
+        super::super::unified_catalog::save_whitelist(
+            &f.dir,
+            &["GLM-5.3-Flash".to_string(), "GLM-5.3".to_string()],
+        )
+        .unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.model, "glm-5.3-flash", "降级候选 ∩ 白名单 → 白名单内最低倍率");
+
+        // 白名单仅含原模型 → 候选集只剩 glm-5.3，不落入被禁模型
+        super::super::unified_catalog::save_whitelist(&f.dir, &["GLM-5.3".to_string()]).unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
+        assert_eq!(r.model, "glm-5.3", "降级候选不在白名单 → 跳过降级保持原模型");
+
+        // 白名单清空（不限）→ 正常降级到目录最低倍率 hy4-preview
+        super::super::unified_catalog::save_whitelist(&f.dir, &[]).unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
+        assert_eq!(r.model, "hy4-preview", "空白名单不限 → 后台任务降级取目录最低倍率");
     }
 }
