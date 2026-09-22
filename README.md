@@ -4,7 +4,7 @@
 
 **GitHub**：[github.com/smart-open](https://github.com/smart-open) · **个人博客**：[blog.sopenai.cn](https://blog.sopenai.cn/)
 
-> 深度支持 **Trae / WorkBuddy（CodeBuddy）** 双账号体系：多账号 OAuth/凭证管理、每日自动签到、积分看板、JWT 自动续期，内嵌 **OpenAI / Anthropic / Codex Responses 三协议兼容 API 网关**（Trae 池 + WorkBuddy 池 + 自定义模型三池调度、会话粘性、ck_ 子 Key）。单进程 axum 服务承载管理面 + 网关 + 调度器，浏览器任意设备直访，Docker 部署。
+> 深度支持 **Trae / WorkBuddy（CodeBuddy）** 双账号体系：多账号 OAuth/凭证管理、每日自动签到、积分看板、JWT 自动续期，内嵌 **OpenAI / Anthropic / Codex Responses 三协议兼容 API 网关**（Trae 池 + WorkBuddy 池 + 自定义模型三池调度、会话粘性、ck\_ 子 Key）。单进程 axum 服务承载管理面 + 网关 + 调度器，浏览器任意设备直访，Docker 部署。
 >
 > ⚠️ 本工具与 Trae / WorkBuddy 等官方均无任何关联，仅供学习研究。使用本工具可能违反相关服务条款，风险自担。请仅管理本人合法持有的账号。
 
@@ -13,7 +13,7 @@
 - **账号管理**：OAuth 登录（Trae 粘贴回调 / WorkBuddy 扫码轮询）与手动凭证录入、分组管理、JWT 解析与自动续期（临期 48h 懒刷新）、账号导入导出（导入前预览）
 - **一键签到**：批量签到、按分组/手动勾选、跳过已签/过期、失败自动重试（30s/90s 两轮）、近 N 天趋势图；WorkBuddy 成长中心自动化（旅行/盲盒/任务领奖）
 - **积分看板**：Trae 积分排行与三线趋势、每日快照自动采集；WorkBuddy 积分三件套 + 官方请求用量 + 本地 Token 统计（缓存命中率/热力图）
-- **API 网关**：内嵌 OpenAI / Anthropic / Codex Responses 三协议兼容 API 服务——Trae 账号池 + WorkBuddy 池 + 自定义 OpenAI 兼容模型三池调度（smart 智能策略/优先级/模型级覆盖）、会话粘性、ck_ 子 Key 配额、四段模型路由、审核指纹清洗、生图双端点、web_search 工具代执行
+- **API 网关**：内嵌 OpenAI / Anthropic / Codex Responses 三协议兼容 API 服务——Trae 账号池 + WorkBuddy 池 + 自定义 OpenAI 兼容模型三池调度（smart 智能策略/优先级/模型级覆盖）、会话粘性、ck\_ 子 Key 配额、四段模型路由、审核指纹清洗、生图双端点、web\_search 工具代执行
 - **内置调度器**：单后台线程每日 7 任务自动执行——JWT 续期（05:30）、模型列表同步（05:40）、双端签到（09:00/09:10）、WB token 兜底续期（10:30）、双端积分快照（23:30/23:40）；任务可在环境配置页开关，失败 30 分钟冷却自动重试
 - **通知渠道**：Bark / Server酱 / 通用 Webhook 三渠道推送（签到完成、任务失败），设置页可发测试通知
 - **数据全部本地存储**（SQLite，WAL 模式），出网仅 Trae / 腾讯上游，不上传任何服务器
@@ -47,14 +47,14 @@ docker exec aiwork-server cat /app/data/conf/admin_token
 
 **支持的环境变量**（均可通过 `docker run -e` 或 compose `environment` 注入）：
 
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `AIWORK_LISTEN_ADDR` | `0.0.0.0:8080` | 服务监听地址 |
-| `AIWORK_ADMIN_TOKEN` | 空（自动生成） | 管理面登录令牌；留空则首启生成 64 位随机 hex 写 `conf/admin_token`；**生产建议显式注入强随机值** |
-| `AIWORK_VAULT_KEY` | 空（自动生成） | 敏感数据加密密钥（任意字符串 SHA-256 归一 32B）；**容器重建必须可复现**，否则已存凭据不可解密 |
-| `AIWORK_DATA_DIR` | `/app/data` | 数据目录（容器内固定挂载 volume） |
-| `AIWORK_PORT` | `8080` | 仅供容器 HEALTHCHECK 探活取端口 |
-| `TZ` | `Asia/Shanghai` | 调度任务按本地时刻触发（签到/续期/快照） |
+| 环境变量                 | 默认值             | 说明                                                               |
+| -------------------- | --------------- | ---------------------------------------------------------------- |
+| `AIWORK_LISTEN_ADDR` | `0.0.0.0:8080`  | 服务监听地址                                                           |
+| `AIWORK_ADMIN_TOKEN` | 空（自动生成）         | 管理面登录令牌；留空则首启生成 64 位随机 hex 写 `conf/admin_token`；**生产建议显式注入强随机值** |
+| `AIWORK_VAULT_KEY`   | 空（自动生成）         | 敏感数据加密密钥（任意字符串 SHA-256 归一 32B）；**容器重建必须可复现**，否则已存凭据不可解密          |
+| `AIWORK_DATA_DIR`    | `/app/data`     | 数据目录（容器内固定挂载 volume）                                             |
+| `AIWORK_PORT`        | `8080`          | 仅供容器 HEALTHCHECK 探活取端口                                           |
+| `TZ`                 | `Asia/Shanghai` | 调度任务按本地时刻触发（签到/续期/快照）                                            |
 
 ### 方式二：源码构建
 
