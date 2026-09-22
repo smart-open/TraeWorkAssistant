@@ -1,10 +1,11 @@
 // 软件宣传图 base64 内嵌（由 scripts/gen_asset_base64.mjs 从 promo_banner.jpg 生成）：
 // dev server 关闭后弹窗图片仍可显示，不依赖运行中的静态服务器
 import { promo_banner_base64 as promoBanner } from '../assets/promo-banner.base64';
+import { version } from '../../package.json';
 
-/** 应用品牌与关于信息（集中管理，改名只改这里）；Web 版版本号与 package.json 单一来源同步 */
+/** 应用品牌与关于信息（集中管理，改名只改这里）；版本号单一来源 package.json，随 sync_version.mjs 自动对齐 */
 export const APP_NAME = 'AI Work 助手';
-export const APP_VERSION = '3.5.8';
+export const APP_VERSION = version;
 export const APP_TAGLINE = '多账号签到与管理 · 一站式工作台';
 export const APP_OVERVIEW =
   '多账号签到与管理一站式工作台（Web 版：React 18 + Rust axum 单体服务）。' +

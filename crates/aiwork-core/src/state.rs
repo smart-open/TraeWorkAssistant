@@ -5,6 +5,10 @@ use crate::models::Settings;
 
 /// 应用数据目录名（品牌 ai-work-assistant）
 pub const DATA_DIR_NAME: &str = "AIWorkAssistant";
+/// 默认数据根目录（v1.0.0 起默认目录切换，AIWORK_DATA_DIR 可覆盖）：
+/// Windows 下 `/data` 按进程**当前盘符**解析（如从 D:\code\AIWorkAssistant 启动则为 D:\data）；
+/// Linux/macOS 为根级 /data；Docker 部署不受影响（compose 已显式注入 AIWORK_DATA_DIR=/app/data）
+pub const DEFAULT_DATA_ROOT: &str = "/data";
 /// 旧版数据目录名（品牌迁移前为 Trae Work Assistant），启动时自动迁移到新版目录
 pub const LEGACY_DATA_DIR_NAME: &str = "TraeWorkAssistant";
 /// 旧版 bundle identifier（品牌迁移前），其 WebView2 数据目录同样需要迁移
@@ -126,9 +130,8 @@ fn dir_is_empty(dir: &PathBuf) -> Option<bool> {
         .map(|mut entries| entries.next().is_none())
 }
 
-/// 按平台解析数据根目录（AIWORK_DATA_DIR 未设置时的回退）：
-/// Windows %APPDATA% / macOS ~/Library/Application Support /
-/// Linux $XDG_DATA_HOME 或 ~/.local/share（XDG 规范）
+/// 旧默认数据根（品牌期：Windows %APPDATA% / macOS ~/Library/Application Support /
+/// Linux $XDG_DATA_HOME 或 ~/.local/share）。v1.0.0 默认目录切换后仅作为一次性迁移源。
 fn platform_data_root() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -155,8 +158,41 @@ fn platform_data_root() -> PathBuf {
     }
 }
 
-/// 应用全局状态。base_dir 指向 %APPDATA%\AIWorkAssistant；
-/// 子目录: conf/ (配置), data/ (数据), logs/ (日志)
+/// 桌面时代退役的遗留数据子目录（切换器 profiles 快照等，Web 版不再使用且体积可达 GB 级）——
+/// 默认目录迁移时整目录排除，不搬进新目录（旧目录中原样保留）
+const RETIRED_DESKTOP_DIRS: [&str; 4] = ["profiles", "profiles_trae", "profiles_codebuddy", "profiles_workbuddy"];
+
+/// 默认数据目录切换（旧平台目录 → /data/AIWorkAssistant）的一次性迁移：
+/// 旧目录有数据且目标为空/不存在时递归**复制**（旧目录原地保留，与品牌迁移同语义），
+/// 排除桌面退役遗留子目录（RETIRED_DESKTOP_DIRS）；失败回滚半成品下次启动重试；
+/// 显式设置 AIWORK_DATA_DIR 时完全不触发。
+fn migrate_platform_data_to_default(target: &PathBuf) -> Option<String> {
+    let legacy = platform_data_root().join(DATA_DIR_NAME);
+    if !legacy.is_dir() || dir_is_empty(&legacy) != Some(false) {
+        return None; // 无旧数据可迁
+    }
+    if target.is_dir() && dir_is_empty(target) == Some(false) {
+        return None; // 已迁移过（或目标已有数据）
+    }
+    match copy_dir_recursive(&legacy, target, &RETIRED_DESKTOP_DIRS) {
+        Ok(n) => Some(format!(
+            "数据目录已切换至默认 {}：旧目录 {} 数据已复制迁移（{n} 个文件，旧目录原地保留）",
+            target.display(),
+            legacy.display()
+        )),
+        Err(e) => {
+            // 清理复制一半的半成品：避免下次启动误判「已迁移」而丢文件
+            let _ = std::fs::remove_dir_all(target);
+            Some(format!(
+                "数据目录切换迁移失败（{e}），已回滚半成品，下次启动重试；旧数据保留于 {}",
+                legacy.display()
+            ))
+        }
+    }
+}
+
+/// 应用全局状态。base_dir 指向 /data/AIWorkAssistant（AIWORK_DATA_DIR 可覆盖；
+/// Windows 下 /data 按进程当前盘符解析）；子目录: conf/ (配置), data/ (数据), logs/ (日志)
 /// Clone 支持把状态克隆进后台工作线程（签到/任务等直调场景）。
 #[derive(Clone)]
 pub struct AppState {
@@ -171,13 +207,23 @@ const CONF_FILES: &[&str] = &["app_settings.json"];
 impl AppState {
     pub fn new() -> Result<Self, String> {
         // 数据目录（T3 可配置）：AIWORK_DATA_DIR 环境变量优先（server/Docker 部署）；
-        // 未设置时按平台回退（Windows %APPDATA%，语义与原实现一致）
+        // 未设置时默认 /data/AIWorkAssistant（v1.0.0 起），首启自动从旧平台目录一次性复制迁移
         let data_dir = match std::env::var("AIWORK_DATA_DIR") {
             Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
-            _ => platform_data_root().join(DATA_DIR_NAME),
+            _ => {
+                let dir = PathBuf::from(DEFAULT_DATA_ROOT).join(DATA_DIR_NAME);
+                if let Some(note) = migrate_platform_data_to_default(&dir) {
+                    eprintln!("aiwork-server: {note}");
+                }
+                dir
+            }
         };
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|e| format!("创建数据目录失败: {e}"))?;
+        std::fs::create_dir_all(&data_dir).map_err(|e| {
+            format!(
+                "创建数据目录失败: {e}（目录 {} 不可写时可设置 AIWORK_DATA_DIR 指定其他位置）",
+                data_dir.display()
+            )
+        })?;
 
         // 创建子目录结构
         let conf_dir = data_dir.join("conf");

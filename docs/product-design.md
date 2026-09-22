@@ -1,6 +1,6 @@
 # AI Work 助手 · 产品设计文档（Web 版）
 
-> **版本**: v3.5.8+ | **形态**: Web-only 单体（浏览器直访 + Docker 部署）| **更新日期**: 2026-09-21
+> **版本**: v1.0.0 | **形态**: Web-only 单体（浏览器直访 + Docker 部署）| **更新日期**: 2026-09-22
 > 桌面版设计基线（v1.0/v2.0，含登录态切换、MITM 代理、豆包等）已随 Web 化转型归档于 git 历史；转型决策见 `docs/tmp/docker-headless-server-plan.md`（ADR-1~4），协议事实见 `docs/tech-framework.md` 附录 A/B，未排期优化项见 `docs/backlog.md`。
 
 ## 一、产品概述

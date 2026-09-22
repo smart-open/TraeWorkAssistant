@@ -4,7 +4,7 @@
 //! → 单端口 axum（/v1/* 网关 + /api/* 管理面 + /health + 静态托管）→ SIGTERM 优雅退出
 //!
 //! 环境变量：
-//! - AIWORK_DATA_DIR     数据目录（默认 Windows %APPDATA%，Linux $XDG_DATA_HOME|~/.local/share）
+//! - AIWORK_DATA_DIR     数据目录（默认 /data/AIWorkAssistant，Windows 按启动盘符解析；旧 %APPDATA%/XDG 数据首启自动复制迁移）
 //! - AIWORK_LISTEN_ADDR  监听地址（默认 127.0.0.1:{网关设置端口}；容器部署设 0.0.0.0:<port>）
 //! - AIWORK_WEB_DIST     前端构建产物目录（默认 web/dist）
 //! - AIWORK_ADMIN_TOKEN  管理面 token（未设置时首启生成 conf/admin_token）
