@@ -133,9 +133,9 @@ export default function BuddySettings() {
 
         {/* 右列：定时任务（开关与执行时刻即时保存，含最近执行状态；推荐配置 = 全部启用 + 默认时刻） */}
         <SchedulerTasksCard
-          taskKeys={['wb-checkin', 'wb-renew', 'wb-credits-snapshot']}
+          taskKeys={['wb-checkin', 'wb-growth', 'wb-renew', 'wb-credits-snapshot']}
           overrides={overrides}
-          desc="服务端内置调度器每日自动执行，覆盖自动签到和成长 / 自动续期 / 自动同步积分看板数据。推荐保持全部启用。"
+          desc="服务端内置调度器每日自动执行，覆盖自动签到 / 自动成长 / 自动续期 / 自动同步积分看板数据。推荐保持全部启用。"
         />
       </div>
     </div>
