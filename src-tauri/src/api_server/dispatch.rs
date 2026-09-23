@@ -759,6 +759,7 @@ mod tests {
                     enterprise_id: String::new(),
                     global_region: false,
                     credits: Some(10.0),
+                    credits_expire_at: None,
                     needs_relogin: false,
                     group_id: String::new(),
                 }],

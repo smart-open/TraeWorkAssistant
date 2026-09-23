@@ -93,6 +93,8 @@ pub async fn do_start(
     } else {
         Some(pool_file.group_ids.iter().map(|s| s.as_str()).collect())
     };
+    // 诊断口径与池装配一致：通用积分余额/到期（老缓存账号回退混合口径）
+    let merged_expires = merge_pool_expire_times(&credits_file);
     for a in &accounts.accounts {
         let uid = a.user_id.as_deref().unwrap_or("(none)");
         let name = &a.name;
@@ -111,8 +113,12 @@ pub async fn do_start(
         } else {
             // 检查冷却和积分状态
             let cd = cooldowns_file.cooldowns.get(uid);
-            let credits = credits_file.credits.get(uid).copied();
-            let expire = credits_file.expire_times.get(uid).copied();
+            let credits = credits_file
+                .general
+                .get(uid)
+                .copied()
+                .or_else(|| credits_file.credits.get(uid).copied());
+            let expire = merged_expires.get(uid).copied();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -424,6 +430,24 @@ fn effective_wb_uids(
     wb_accounts.iter().map(|a| a.uid.clone()).collect()
 }
 
+/// 池到期表装配（issue #28）：通用积分（product_id != 209）最早到期优先，
+/// 与 pool_credits 的通用口径对齐。回退规则：
+/// - 通用剩余表未覆盖的老缓存账号（升级前未刷新过）→ 回退混合口径 expire_times
+/// - 已刷新但通用包均长期有效/耗尽的账号（general 有键而 general_expire_times 无键）
+///   → 不回退，无到期约束（混合口径里的 Work 包到期不得泄漏进调度）
+fn merge_pool_expire_times(rc: &RemainingCreditsFile) -> std::collections::HashMap<String, i64> {
+    let mut out: std::collections::HashMap<String, i64> = rc
+        .expire_times
+        .iter()
+        .filter(|(uid, _)| !rc.general.contains_key(*uid))
+        .map(|(uid, e)| (uid.clone(), *e))
+        .collect();
+    for (uid, exp) in &rc.general_expire_times {
+        out.insert(uid.clone(), *exp);
+    }
+    out
+}
+
 /// 池装配公共逻辑（do_start 构建 / 凭据变更热重载共用）：
 /// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建两池内条目。
 /// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数) 供调用方记日志。
@@ -451,7 +475,7 @@ fn apply_pool_snapshot(state: &AppState, pool: &ApiPool, wb_pool: &ApiPool) -> (
         &groups_file.membership,
         &cooldowns_file.cooldowns,
         &pool_credits,
-        &credits_file.expire_times,
+        &merge_pool_expire_times(&credits_file),
         &device_map,
     );
     let wb_accounts_all = crate::commands::workbuddy::wb_upstream_accounts(state);
@@ -1123,6 +1147,42 @@ mod pool_merge_tests {
         assert_eq!(m.wb_enabled_uids, vec!["wb-abc".to_string()]);
     }
 
+    // ── merge_pool_expire_times（issue #28：调度到期 = 通用口径）────────────
+
+    use super::merge_pool_expire_times;
+    use crate::models::RemainingCreditsFile;
+
+    #[test]
+    fn merge_expires_prefers_general_table() {
+        // 新旧两表同账号并存 → 通用口径胜出（Work 包污染的混合值不参与）
+        let mut rc = RemainingCreditsFile::default();
+        rc.expire_times.insert("u1".into(), 1000);
+        rc.general.insert("u1".into(), 90.0);
+        rc.general_expire_times.insert("u1".into(), 2000);
+        let got = merge_pool_expire_times(&rc);
+        assert_eq!(got.get("u1"), Some(&2000));
+    }
+
+    #[test]
+    fn merge_expires_legacy_fallback_without_general_cache() {
+        // 老缓存账号（通用剩余表未覆盖，升级前未刷新过）→ 回退混合口径保底
+        let mut rc = RemainingCreditsFile::default();
+        rc.expire_times.insert("legacy".into(), 1000);
+        let got = merge_pool_expire_times(&rc);
+        assert_eq!(got.get("legacy"), Some(&1000));
+    }
+
+    #[test]
+    fn merge_expires_no_fallback_when_refreshed_without_general_expiry() {
+        // 已刷新（general 有键）但通用包均长期有效/耗尽（general_expire_times 无键）
+        // → 不回退，混合口径里的 Work 包到期不得泄漏进调度
+        let mut rc = RemainingCreditsFile::default();
+        rc.expire_times.insert("u1".into(), 1000);
+        rc.general.insert("u1".into(), 0.0);
+        let got = merge_pool_expire_times(&rc);
+        assert!(got.get("u1").is_none());
+    }
+
     #[test]
     fn explicit_wb_uids_override() {
         // Buddy 页勾选保存：显式传 wb_uids → 覆盖（不再走旧数据迁移）
@@ -1162,6 +1222,7 @@ mod pool_merge_tests {
             enterprise_id: String::new(),
             global_region: false,
             credits: None,
+            credits_expire_at: None,
             needs_relogin: false,
             group_id: String::new(),
         };

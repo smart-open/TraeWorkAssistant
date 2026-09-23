@@ -634,6 +634,7 @@ pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::p
             enterprise_id: eid,
             global_region: domain.contains(".workbuddy.ai"),
             credits: a.credits_balance,
+            credits_expire_at: a.credits_expire_at,
             needs_relogin: a.needs_relogin,
             group_id: a.group_id.clone(),
         });

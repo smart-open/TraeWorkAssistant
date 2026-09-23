@@ -347,6 +347,11 @@ pub struct RemainingCreditsFile {
     /// 通用积分（product_id != 209）剩余缓存
     #[serde(default)]
     pub general: HashMap<String, f64>,
+    /// 通用积分（product_id != 209）最早到期时间缓存（Unix 秒）：
+    /// API 网关调度口径（网关只扣通用积分，Work 包到期不参与，issue #28）；
+    /// None 语义 = 账号通用包长期有效/已耗尽，键缺失即无到期约束
+    #[serde(default)]
+    pub general_expire_times: HashMap<String, i64>,
     /// Work 积分（product_id == 209）剩余缓存
     #[serde(default)]
     pub work: HashMap<String, f64>,

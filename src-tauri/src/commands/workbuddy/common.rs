@@ -88,6 +88,11 @@ pub struct WorkBuddyAccount {
     pub credits_balance: Option<f64>,
     #[serde(default)]
     pub credits_fetched_at: Option<String>,
+    /// 最早积分包到期时间缓存（Unix 秒；积分查询/每日快照回写）：
+    /// 剩余>0 且未过期包取 min，Buddy 不分包类型（issue #28 调度口径）；
+    /// None = 无到期信息或全部包长期有效，键值随每次回写覆盖（不留 stale）
+    #[serde(default)]
+    pub credits_expire_at: Option<i64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]

@@ -335,7 +335,7 @@ impl ApiPool {
                     name: a.name.clone(),
                     jwt: a.token.clone(),
                     credits: a.credits,
-                    credits_expire_at: None,
+                    credits_expire_at: a.credits_expire_at,
                     disabled: a.needs_relogin,
                     err_count: 0,
                     until: 0,
@@ -795,6 +795,8 @@ pub struct WbSyncAccount {
     pub enterprise_id: String,
     pub global_region: bool,
     pub credits: Option<f64>,
+    /// 最早积分包到期（Unix 秒，Buddy 不分包类型，issue #28）；None = 无到期约束
+    pub credits_expire_at: Option<i64>,
     pub needs_relogin: bool,
     /// 所属 Buddy 分组 id（空 = 未分组）；池分组筛选在装配层按此过滤
     pub group_id: String,
@@ -1466,6 +1468,7 @@ mod tests {
                 enterprise_id: "e1".into(),
                 global_region: true,
                 credits: Some(50.0),
+                credits_expire_at: None,
                 needs_relogin: false,
                 group_id: String::new(),
             }],
@@ -1483,12 +1486,35 @@ mod tests {
             &[crate::api_server::pool::WbSyncAccount {
                 uid: "wb-x".into(), name: String::new(), token: "tk".into(),
                 domain: String::new(), enterprise_id: String::new(),
-                global_region: false, credits: None, needs_relogin: true,
+                global_region: false, credits: None, credits_expire_at: None, needs_relogin: true,
                 group_id: String::new(),
             }],
             &["wb-x".to_string()],
         );
         assert!(pool2.pick_excluding_constrained(&HashSet::new(), None, None).is_none());
+    }
+
+    #[test]
+    fn wb_sync_carries_credits_expire_at() {
+        // issue #28：Buddy 积分包到期透传入池，供 ExpireFirst/smart 排序消费
+        let pool = ApiPool::new();
+        pool.sync_from_wb(
+            &[crate::api_server::pool::WbSyncAccount {
+                uid: "wb-e".into(),
+                name: "n".into(),
+                token: "tk".into(),
+                domain: "d".into(),
+                enterprise_id: String::new(),
+                global_region: false,
+                credits: Some(10.0),
+                credits_expire_at: Some(1_234_567_890),
+                needs_relogin: false,
+                group_id: String::new(),
+            }],
+            &["wb-e".to_string()],
+        );
+        let entries = safe_lock(&pool.entries);
+        assert_eq!(entries.get("wb-e").unwrap().credits_expire_at, Some(1_234_567_890));
     }
 
     // ==================== F-77 账号级并发感知调度 ====================

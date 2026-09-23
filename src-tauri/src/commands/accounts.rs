@@ -805,8 +805,11 @@ struct CreditStats {
     work: f64,
     /// 本周期积分包总额度（有效积分包 credits_limit 合计；到期日历「剩余 X / 总 Y」）
     total_limit: f64,
-    /// 最近一个仍未用完且未过期的积分包过期时间（Unix 秒）
+    /// 最近一个仍未用完且未过期的积分包过期时间（Unix 秒，含 Work 包；UI 展示/签到排序口径）
     earliest_expire: Option<i64>,
+    /// 通用积分（product_id != 209）最早到期时间（Unix 秒，不含 Work 包）；
+    /// API 网关调度口径（网关只扣通用积分），issue #28
+    general_earliest_expire: Option<i64>,
     /// 各日期新开积分包额度聚合（键=北京时间日期）：
     /// entitlement_base_info.start_time 即积分包 CycleStartTime（如
     /// "2026-09-14 15:52:38"），某日获得积分 = 该日新开全部积分包 credits_limit
@@ -940,21 +943,26 @@ fn classify_source(pack: &serde_json::Value) -> String {
 /// 剩余 = credits_limit - usage.credits_amount（usage 为空则已用=0），按 product_id 分类求和。
 fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, String> {
     let packs = query_ent_packs(jwt, dev)?;
+    let now_ts = chrono::Utc::now().timestamp();
+    Ok(parse_credit_stats(&packs, now_ts))
+}
 
+/// 解析积分包列表 → 统计（纯函数，便于单测；分类口径见 CreditStats 注释）
+fn parse_credit_stats(packs: &[serde_json::Value], now_ts: i64) -> CreditStats {
     let mut total: f64 = 0.0;
     let mut general: f64 = 0.0;
     let mut work: f64 = 0.0;
     let mut total_limit: f64 = 0.0;
     let mut earliest_expire: Option<i64> = None;
+    let mut general_earliest_expire: Option<i64> = None;
     let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
     let mut membership_expire: Option<i64> = None;
     let mut membership_next_billing: Option<i64> = None;
 
     // 使用固定 UTC+8 偏移，不依赖 chrono::Local（某些 Windows 环境下可能误判时区）
     let cst = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-    let now_ts = chrono::Utc::now().timestamp();
 
-    for pack in &packs {
+    for pack in packs {
         // ---- 会员套餐到期时间（不限积分包，扫描全部权益包）----
         // 实测（2026-09）：连续包月会员包 display_desc="会员 Lite 连续包月"、
         // group_name="会员积分"，end_time/expire_time=到期日，next_billing_time=下次扣款日。
@@ -1016,6 +1024,11 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
             if let Some(exp) = expire {
                 if exp > now_ts && remaining > 0.0 {
                     earliest_expire = Some(earliest_expire.map_or(exp, |e| e.min(exp)));
+                    // 调度口径（issue #28）：网关只扣通用积分，Work 包到期不参与
+                    if product_id != 209 {
+                        general_earliest_expire =
+                            Some(general_earliest_expire.map_or(exp, |e| e.min(exp)));
+                    }
                 }
             }
 
@@ -1046,16 +1059,17 @@ fn calc_remaining_credits(jwt: &str, dev: &DeviceEntry) -> Result<CreditStats, S
         let r = (v * 100.0).round() / 100.0;
         if r == 0.0 { 0.0 } else { r }
     };
-    Ok(CreditStats {
+    CreditStats {
         total: r2(total),
         general: r2(general),
         work: r2(work),
         total_limit: r2(total_limit),
         earliest_expire,
+        general_earliest_expire,
         pack_earned_daily,
         membership_expire,
         membership_next_billing,
-    })
+    }
 }
 
 /// 获取单账号积分明细（悬浮展示用）：
@@ -1164,6 +1178,16 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
     if let Some(exp) = stats.earliest_expire {
         rc.expire_times.insert(user_id.clone(), exp);
     }
+    // 通用积分到期（API 网关调度口径，issue #28）：None → 清除，
+    // 避免 Work 包污染回退或包耗尽/长期有效后残留 stale 老值误伤调度
+    match stats.general_earliest_expire {
+        Some(exp) => {
+            rc.general_expire_times.insert(user_id.clone(), exp);
+        }
+        None => {
+            rc.general_expire_times.remove(&user_id);
+        }
+    }
     match stats.membership_expire {
         Some(v) => {
             rc.membership_expire.insert(user_id.clone(), v);
@@ -1221,6 +1245,15 @@ pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String>
                 rc.total_limit.insert(uid.clone(), stats.total_limit);
                 if let Some(exp) = stats.earliest_expire {
                     rc.expire_times.insert(uid.clone(), exp);
+                }
+                // 通用积分到期（调度口径）：None → 清除，与单账号刷新同语义
+                match stats.general_earliest_expire {
+                    Some(exp) => {
+                        rc.general_expire_times.insert(uid.clone(), exp);
+                    }
+                    None => {
+                        rc.general_expire_times.remove(&uid);
+                    }
                 }
                 match stats.membership_expire {
                     Some(v) => {
@@ -2093,6 +2126,67 @@ mod tests {
         assert_eq!(mu.len(), 36);
         assert_eq!(&mu[14..15], "4");
         assert!(matches!(&mu[19..20], "8" | "9" | "a" | "b"));
+    }
+
+    // ── parse_credit_stats 通用/Work 到期口径（issue #28）───────────────────
+
+    /// 构造积分包 JSON（credits_limit/usage/product_id/expire_time，字段层级与 API 实测一致）
+    fn pack(product_id: i64, limit: f64, used: f64, expire: Option<i64>) -> serde_json::Value {
+        serde_json::json!({
+            "expire_time": expire,
+            "usage": {"credits_amount": used},
+            "entitlement_base_info": {
+                "product_id": product_id,
+                "quota": {"credits_limit": limit}
+            }
+        })
+    }
+
+    const NOW_TS: i64 = 1_800_000_000;
+
+    #[test]
+    fn parse_credit_stats_general_expire_ignores_work_pack() {
+        // issue #28 核心：Work 包（209）先到期不得污染通用积分调度口径
+        let stats = parse_credit_stats(
+            &[
+                pack(208, 100.0, 10.0, Some(NOW_TS + 86_400)),
+                pack(209, 50.0, 0.0, Some(NOW_TS + 3_600)),
+            ],
+            NOW_TS,
+        );
+        assert_eq!(stats.earliest_expire, Some(NOW_TS + 3_600));
+        assert_eq!(stats.general_earliest_expire, Some(NOW_TS + 86_400));
+        assert_eq!(stats.general, 90.0);
+        assert_eq!(stats.work, 50.0);
+    }
+
+    #[test]
+    fn parse_credit_stats_only_work_expiring_leaves_general_none() {
+        // 通用包长期有效 + Work 包临期：通用调度口径应为 None（无到期约束）
+        let stats = parse_credit_stats(
+            &[
+                pack(208, 100.0, 10.0, None),
+                pack(209, 50.0, 0.0, Some(NOW_TS + 60)),
+            ],
+            NOW_TS,
+        );
+        assert_eq!(stats.earliest_expire, Some(NOW_TS + 60));
+        assert_eq!(stats.general_earliest_expire, None);
+    }
+
+    #[test]
+    fn parse_credit_stats_excludes_expired_and_drained_packs() {
+        // 已用完/已过期的包不参与两个口径的最早到期统计
+        let stats = parse_credit_stats(
+            &[
+                pack(208, 100.0, 100.0, Some(NOW_TS + 60)),
+                pack(208, 100.0, 0.0, Some(NOW_TS - 60)),
+                pack(208, 80.0, 20.0, Some(NOW_TS + 120)),
+            ],
+            NOW_TS,
+        );
+        assert_eq!(stats.earliest_expire, Some(NOW_TS + 120));
+        assert_eq!(stats.general_earliest_expire, Some(NOW_TS + 120));
     }
 
     /// 实测探针（默认忽略）：用真实数据目录 + vault 凭据验证积分接口设备指纹修复。
