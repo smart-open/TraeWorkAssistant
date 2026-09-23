@@ -229,9 +229,143 @@ impl AppState {
         if s.doubao_quota_url.clone().unwrap_or_default().trim().is_empty() {
             s.doubao_quota_url = Some(crate::models::default_doubao_quota_url());
         }
+        // Trae JWT 续期调度（issue #27）：kv 完全缺失走 Settings::default()（bool=false/
+        // String=""）会漏开——时刻为空视为从未配置，统一回填默认开 + 09:00；
+        // 用户显式关闭后 hhmm 保持非空，不会被此处重新打开
+        if s.jwt_renew_hhmm.trim().is_empty() {
+            s.jwt_renew_enabled = true;
+            s.jwt_renew_hhmm = "09:00".into();
+        }
+        // WorkBuddy 每日成长任务（任务配置页）：同款零值回填（默认开 + 09:00）
+        if s.wb_growth_hhmm.trim().is_empty() {
+            s.wb_growth_enabled = true;
+            s.wb_growth_hhmm = "09:00".into();
+        }
+        // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，Trae/Buddy 共用）：
+        // app_settings 渠道字段双 None 时从旧 workbuddy_settings 一次性搬运。
+        // 命中即 kv_set 回写持久化——push_notify 裸读 kv 不经过本函数，仅内存视图会让
+        // 推送链路读不到迁移值（老用户通知静默失效）；同时移除旧 kv 的通知键，
+        // 区分「从未配置」与「用户显式清空」，防止清空后被迁移逻辑复活。
+        if s.notify_webhook_url.is_none() && s.notify_serverchan_sendkey.is_none() {
+            let db = crate::store::db(&self.data_dir);
+            let raw = db.kv_get_raw("workbuddy_settings");
+            let wb: serde_json::Value = raw
+                .as_deref()
+                .and_then(|r| serde_json::from_str(r).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let legacy = |key: &str| {
+                wb.get(key)
+                    .and_then(|x| x.as_str())
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+            };
+            let migrated_webhook = legacy("notify_wechat_webhook");
+            let migrated_sendkey = legacy("notify_serverchan_sendkey");
+            if migrated_webhook.is_some() || migrated_sendkey.is_some() {
+                s.notify_webhook_url = migrated_webhook;
+                s.notify_serverchan_sendkey = migrated_sendkey;
+                // 写失败下次重试（与 load_models 回填同策略）；写成功后清掉旧键，迁移不可逆
+                if db.kv_set("app_settings", &s).is_ok() {
+                    if let Some(obj) = wb.as_object() {
+                        let mut cleaned = obj.clone();
+                        cleaned.remove("notify_wechat_webhook");
+                        cleaned.remove("notify_serverchan_sendkey");
+                        let _ = db.kv_set_raw("workbuddy_settings", &serde_json::to_string(&cleaned).unwrap_or_default());
+                    }
+                }
+            }
+        }
         s
     }
 }
 
 // （PS 桥 Rust 化后 resolve_ps_dir 与 tauri.conf.json resources 的 ps/ 资源一并移除——
 // 切换/保存/备份/恢复/保活全链路由 switcher 模块进程内直调，无外部运行时依赖）
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_state(tag: &str) -> AppState {
+        let d = std::env::temp_dir().join(format!("twa_state_notify_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        AppState { data_dir: d, jwt_refresh_lock: Arc::new(Mutex::new(())) }
+    }
+
+    /// 旧 workbuddy_settings 通知字段 → app Settings 一次性搬运：回写 app_settings 持久化 +
+    /// 移除旧 kv 通知键（push_notify 裸读 kv，必须落盘才能读到迁移值）
+    #[test]
+    fn settings_migrates_notify_from_workbuddy_kv() {
+        let st = tmp_state("migrate");
+        crate::store::db(&st.data_dir)
+            .kv_set_raw(
+                "workbuddy_settings",
+                r#"{"notify_wechat_webhook":"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc","notify_serverchan_sendkey":"SCT123","other_field":1}"#,
+            )
+            .unwrap();
+        let s = st.settings();
+        assert_eq!(
+            s.notify_webhook_url.as_deref(),
+            Some("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc")
+        );
+        assert_eq!(s.notify_serverchan_sendkey.as_deref(), Some("SCT123"));
+        // 落盘验证：kv app_settings 已含迁移值；旧 kv 通知键已移除（其余字段保留）
+        let persisted: crate::models::Settings = crate::store::db(&st.data_dir).kv_get("app_settings");
+        assert_eq!(persisted.notify_serverchan_sendkey.as_deref(), Some("SCT123"));
+        let wb_raw = crate::store::db(&st.data_dir).kv_get_raw("workbuddy_settings").unwrap();
+        assert!(!wb_raw.contains("notify_wechat_webhook"), "旧通知键应被移除: {wb_raw}");
+        assert!(wb_raw.contains("other_field"), "其余字段保留: {wb_raw}");
+        // 幂等：再次读取结果一致（迁移已持久化，不再重复触发）
+        let s2 = st.settings();
+        assert_eq!(s2.notify_webhook_url, s.notify_webhook_url);
+        assert_eq!(s2.notify_serverchan_sendkey, s.notify_serverchan_sendkey);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    /// 用户显式清空渠道（存 null → None）后不再被迁移复活（旧键已在迁移时移除）
+    #[test]
+    fn settings_notify_not_revived_after_explicit_clear() {
+        let st = tmp_state("no_revive");
+        let db = crate::store::db(&st.data_dir);
+        db.kv_set_raw("workbuddy_settings", r#"{"notify_wechat_webhook":"https://old.example.com/hook"}"#).unwrap();
+        let s = st.settings();
+        assert_eq!(s.notify_webhook_url.as_deref(), Some("https://old.example.com/hook"), "首启迁移生效");
+        // 模拟用户在面板清空渠道：app_settings 存 null（前端 `|| null` 语义）
+        db.kv_set_raw(
+            "app_settings",
+            r#"{"notify_enabled":true,"notify_webhook_url":null,"notify_serverchan_sendkey":null}"#,
+        )
+        .unwrap();
+        let s2 = st.settings();
+        assert_eq!(s2.notify_webhook_url, None, "显式清空后不得复活");
+        assert_eq!(s2.notify_serverchan_sendkey, None);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    /// 面板已显式配置（非 None）时不被旧值覆盖
+    #[test]
+    fn settings_migration_skipped_when_panel_already_set() {
+        let st = tmp_state("no_overwrite");
+        let db = crate::store::db(&st.data_dir);
+        db.kv_set_raw("app_settings", r#"{"notify_webhook_url":"https://new.example.com/hook"}"#).unwrap();
+        db.kv_set_raw("workbuddy_settings", r#"{"notify_wechat_webhook":"https://old.example.com/hook"}"#).unwrap();
+        let s = st.settings();
+        assert_eq!(s.notify_webhook_url.as_deref(), Some("https://new.example.com/hook"));
+        assert_eq!(s.notify_serverchan_sendkey, None, "webhook 已配置时整体跳过搬运");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    /// 旧值为空白串视为未配置：不搬运，保持 None
+    #[test]
+    fn settings_migration_ignores_blank_legacy_values() {
+        let st = tmp_state("blank");
+        crate::store::db(&st.data_dir)
+            .kv_set_raw("workbuddy_settings", r#"{"notify_wechat_webhook":"  ","notify_serverchan_sendkey":""}"#)
+            .unwrap();
+        let s = st.settings();
+        assert_eq!(s.notify_webhook_url, None);
+        assert_eq!(s.notify_serverchan_sendkey, None);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+}

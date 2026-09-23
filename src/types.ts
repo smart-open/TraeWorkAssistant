@@ -274,6 +274,27 @@ export interface Settings {
   api_default_model: string;
   /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
   buddy_switch_migrate_chats: boolean;
+  /** Trae JWT 定时调度续期开关（issue #27，默认开：每日兜底续期临期账号） */
+  jwt_renew_enabled: boolean;
+  /** Trae JWT 续期调度触发时刻 HH:MM（默认 09:00，环境配置页可改） */
+  jwt_renew_hhmm: string;
+  /** WorkBuddy 每日成长任务开关（任务配置页，默认开：应用内调度器每日执行成长轮） */
+  wb_growth_enabled: boolean;
+  /** WorkBuddy 成长任务调度触发时刻 HH:MM（默认 09:00，任务配置页可改） */
+  wb_growth_hhmm: string;
+  // ── 通知渠道（F-19；Trae/Buddy 全平台共用，系统设置页通知渠道面板维护） ──
+  /** 通知总开关（默认开；关闭后所有事件渠道静默） */
+  notify_enabled: boolean;
+  /** 签到完成时推送（默认开） */
+  notify_on_checkin: boolean;
+  /** 调度任务失败时推送（默认开） */
+  notify_on_task_fail: boolean;
+  /** Bark 推送地址（https://api.day.app/<key>；空 = 关闭该渠道） */
+  notify_bark_url: string | null;
+  /** 通用 Webhook 地址（POST JSON，兼容企业微信群机器人等自建端；空 = 关闭） */
+  notify_webhook_url: string | null;
+  /** Server酱 SendKey（空 = 关闭） */
+  notify_serverchan_sendkey: string | null;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */
@@ -876,9 +897,7 @@ export interface WorkBuddySettings {
   cli_min_urgency_hours: number;
   cli_active_guard_minutes: number;
   cli_min_remaining_credits: number;
-  /** 失败通知渠道（F-19）：空 = 关闭 */
-  notify_wechat_webhook: string | null;
-  notify_serverchan_sendkey: string | null;
+  // 失败通知渠道（F-19）已迁移至 Settings（通知渠道面板，Trae/Buddy 全平台共用）
   /** UI 坐标点击签到兜底（F-18）：仅手动触发，默认关闭 */
   ui_click_enabled: boolean;
   ui_click_x: number;

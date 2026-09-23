@@ -1089,9 +1089,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             Protocol::Responses => format!("resp_{}", now_ts()),
         };
         let mut tried = HashSet::new();
+        // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
+        let mut refreshed_401 = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
-            let picked = match state
+            let mut picked = match state
                 .pool
                 .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
             {
@@ -1233,6 +1235,36 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 continue;
                             }
                             RetryAction::SwitchKey => {
+                                // Trae 401 自愈（issue #27 方案 B，对齐 wb_route T2.6）：
+                                // 强制刷新一次凭证后同号重试（每请求每账号一次）；成功则
+                                // 不冷却不换号。失败/无回调维持原「note_error + 换号」语义。
+                                if status == 401
+                                    && !refreshed_401.contains(&picked.uid)
+                                    && state.trae_jwt_refresh.is_some()
+                                {
+                                    refreshed_401.insert(picked.uid.clone());
+                                    let refresh = state.trae_jwt_refresh.as_ref().unwrap();
+                                    match refresh(&picked.uid) {
+                                        Ok(new_jwt) => {
+                                            let clean = new_jwt
+                                                .strip_prefix("Cloud-IDE-JWT ")
+                                                .unwrap_or(&new_jwt)
+                                                .trim()
+                                                .to_string();
+                                            state.pool.update_jwt(&picked.uid, &clean);
+                                            picked.jwt = clean;
+                                            same_attempt += 1;
+                                            continue; // 同号重试（新 JWT）
+                                        }
+                                        Err(e) => {
+                                            state.logger.log_request(
+                                                "trae", "POST", proto.log_path(), &model, stream,
+                                                status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                                Some(&format!("401 自愈刷新失败: {}", e)),
+                                            );
+                                        }
+                                    }
+                                }
                                 let kind = classify_error(status, &resp_body);
                                 state.pool.note_error(&picked.uid, kind);
                                 let preview = safe_slice(&resp_body, 200);
@@ -1371,9 +1403,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
         let mut tried = HashSet::new();
+        // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
+        let mut refreshed_401 = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
-            let picked = match state
+            let mut picked = match state
                 .pool
                 .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
             {
@@ -1474,6 +1508,36 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 continue;
                             }
                             RetryAction::SwitchKey => {
+                                // Trae 401 自愈（issue #27 方案 B，对齐 wb_route T2.6）：
+                                // 强制刷新一次凭证后同号重试（每请求每账号一次）；成功则
+                                // 不冷却不换号。失败/无回调维持原「note_error + 换号」语义。
+                                if status == 401
+                                    && !refreshed_401.contains(&picked.uid)
+                                    && state.trae_jwt_refresh.is_some()
+                                {
+                                    refreshed_401.insert(picked.uid.clone());
+                                    let refresh = state.trae_jwt_refresh.as_ref().unwrap();
+                                    match refresh(&picked.uid) {
+                                        Ok(new_jwt) => {
+                                            let clean = new_jwt
+                                                .strip_prefix("Cloud-IDE-JWT ")
+                                                .unwrap_or(&new_jwt)
+                                                .trim()
+                                                .to_string();
+                                            state.pool.update_jwt(&picked.uid, &clean);
+                                            picked.jwt = clean;
+                                            same_attempt += 1;
+                                            continue; // 同号重试（新 JWT）
+                                        }
+                                        Err(e) => {
+                                            state.logger.log_request(
+                                                "trae", "POST", proto.log_path(), &model, stream,
+                                                status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                                Some(&format!("401 自愈刷新失败: {}", e)),
+                                            );
+                                        }
+                                    }
+                                }
                                 let kind = classify_error(status, &resp_body);
                                 state.pool.note_error(&picked.uid, kind);
                                 *safe_lock(&state.last_error) =
@@ -1877,6 +1941,7 @@ mod tests {
             usage_dirty: std::sync::Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            trae_jwt_refresh: None,
         });
         WlFixture { dir, state }
     }

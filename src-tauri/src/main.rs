@@ -151,6 +151,7 @@ fn main() {
             commands::misc::logs_clear,
             commands::misc::settings_get,
             commands::misc::settings_set,
+            commands::misc::notify_test,
             commands::misc::invite_link,
             commands::misc::credits_history,
             commands::misc::task_register,

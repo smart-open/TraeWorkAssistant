@@ -249,6 +249,15 @@ pub async fn do_start(
         usage_dirty: Mutex::new(Vec::new()),
         wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
         wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        // Trae 401 自愈回调（issue #27 方案 B）：网关层无 AppState，闭包借 AppHandle
+        // 每次取 State 调 refresh_jwt_impl(force=true)（全防护：锁/冷却/轮换/失效标记）
+        trae_jwt_refresh: Some({
+            let app = app.clone();
+            std::sync::Arc::new(move |uid: &str| {
+                let st = app.state::<AppState>();
+                crate::commands::accounts::refresh_jwt_impl(&st, uid, true)
+            })
+        }),
     });
 
     // F-76②/F-77 热参数：池并发上限（两池同构生效）+ wb_sticky 显式 TTL

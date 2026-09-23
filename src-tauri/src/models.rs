@@ -156,6 +156,39 @@ pub struct Settings {
     /// 豆包快照可选纳入 Default/IndexedDB（C4：对话历史等完整状态随账号迁移；体积代价大，默认排除）
     #[serde(default)]
     pub doubao_snapshot_include_idb: bool,
+    /// Trae JWT 定时调度续期（issue #27）：调度器 trae-renew 开关（默认开，每日兜底
+    /// 续期临期账号；state::settings 对零值统一回填默认，防止 Settings::default 路径漏开）
+    #[serde(default = "default_true")]
+    pub jwt_renew_enabled: bool,
+    /// Trae JWT 续期调度触发时刻 HH:MM（默认 09:00，环境配置页可改）
+    #[serde(default = "default_jwt_renew_hhmm")]
+    pub jwt_renew_hhmm: String,
+    /// WorkBuddy 每日成长任务（任务配置页）：调度器 wb-growth 开关（默认开；
+    /// 成长三开关全关时轮次空转无副作用，防 Settings::default 路径漏开同款回填）
+    #[serde(default = "default_true")]
+    pub wb_growth_enabled: bool,
+    /// WorkBuddy 成长任务调度触发时刻 HH:MM（默认 09:00，任务配置页可改）
+    #[serde(default = "default_wb_growth_hhmm")]
+    pub wb_growth_hhmm: String,
+    // ── 通知渠道（F-19；Trae/Buddy 全平台共用，系统设置页通知渠道面板维护） ──
+    /// 通知总开关（默认开；关闭后所有事件渠道静默）
+    #[serde(default = "default_true")]
+    pub notify_enabled: bool,
+    /// 签到完成时推送（默认开）
+    #[serde(default = "default_true")]
+    pub notify_on_checkin: bool,
+    /// 调度任务失败时推送（默认开）
+    #[serde(default = "default_true")]
+    pub notify_on_task_fail: bool,
+    /// Bark 推送地址（https://api.day.app/<key>；空 = 关闭该渠道）
+    #[serde(default)]
+    pub notify_bark_url: Option<String>,
+    /// 通用 Webhook 地址（POST JSON，兼容企业微信群机器人等自建端；空 = 关闭）
+    #[serde(default)]
+    pub notify_webhook_url: Option<String>,
+    /// Server酱 SendKey（空 = 关闭）
+    #[serde(default)]
+    pub notify_serverchan_sendkey: Option<String>,
     /// WorkBuddy 桌面版 exe 手动路径（切换桥 workbuddy 档案 settings_key；环境配置页持久化）
     #[serde(default)]
     pub workbuddy_path: Option<String>,
@@ -205,6 +238,13 @@ fn default_lang() -> String {
 }
 fn default_retry() -> i32 {
     1
+}
+/// Trae JWT 续期调度默认每日 09:00（issue #27：剩余 <48h 惰性续期，每日一次为安全超集）
+fn default_jwt_renew_hhmm() -> String {
+    "09:00".into()
+}
+fn default_wb_growth_hhmm() -> String {
+    "09:00".into()
 }
 fn default_notify() -> String {
     "toast".into()

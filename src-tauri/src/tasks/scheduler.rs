@@ -48,7 +48,13 @@ struct SchedTask {
 
 const TASKS: &[SchedTask] = &[
     SchedTask { key: "trae-checkin", name: "Trae 每日签到", hhmm: "09:00" },
+    // Trae JWT 定时续期（issue #27）：默认 09:00，环境配置页可改（settings.jwt_renew_hhmm）；
+    // 惰性判定（剩余 ≤48h 才真正刷新），每日一次为安全超集
+    SchedTask { key: "trae-renew", name: "Trae JWT 定时续期", hhmm: "09:00" },
     SchedTask { key: "wb-checkin", name: "WorkBuddy 每日签到", hhmm: "09:10" },
+    // WorkBuddy 每日成长（任务配置页）：默认 09:00 可改（settings.wb_growth_hhmm）；
+    // 成长三开关驱动（旅行/盲盒/任务），全关时空轮无副作用
+    SchedTask { key: "wb-growth", name: "WorkBuddy 每日成长", hhmm: "09:00" },
     // F-09 兜底续期：lazy 24h（到期前 24h 内才真正刷新），每天跑一次是安全超集
     SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30" },
     SchedTask { key: "doubao-keepalive", name: "豆包会话每日续期", hhmm: "09:20" },
@@ -83,11 +89,12 @@ fn tick(st: &AppState) {
         if !enabled(st, t.key) {
             continue;
         }
+        let hhmm = effective_hhmm(st, t);
         if last_run_date(st, t.key).as_deref() == Some(today.as_str()) {
             continue;
         }
         // HH:MM 零填充，字符串比较即时间序
-        if now_hm.as_str() < t.hhmm {
+        if now_hm.as_str() < hhmm.as_str() {
             continue;
         }
         // 失败冷却：30 分钟内静默等待重试，不重复执行也不刷日志
@@ -104,13 +111,66 @@ fn tick(st: &AppState) {
         match outcome {
             Ok(summary) => {
                 mark_run(st, t.key, &today, &summary);
-                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（每日 {}）：{}", t.name, t.hhmm, summary));
+                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（每日 {}）：{}", t.name, hhmm, summary));
             }
             Err(summary) => {
+                // 当日首败判定（在 mark_fail 覆盖前读旧值）：上次失败不在今天 → 今天首次失败。
+                // 只有当日首败才推送渠道通知，30 分钟冷却后的重试失败只落日志，
+                // 避免全天故障时单任务刷 ~30 条通知（Server酱免费档每日仅 5 条）
+                let first_fail_today = match last_fail_ts(st, t.key) {
+                    None => true,
+                    Some(ts) => {
+                        let prev_date = chrono::DateTime::from_timestamp_millis(ts)
+                            .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string());
+                        prev_date.as_deref() != Some(today.as_str())
+                    }
+                };
                 mark_fail(st, t.key, &summary);
-                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（每日 {}）失败，30 分钟后重试：{}", t.name, t.hhmm, summary));
+                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（每日 {}）失败，30 分钟后重试：{}", t.name, hhmm, summary));
+                // 调度任务失败通知（通知渠道面板）：推 Bark/Webhook/Server酱（无 AppHandle，仅渠道；
+                // 渠道失败静默，绝不影响调度循环）
+                if first_fail_today {
+                    crate::commands::workbuddy::push_notify(
+                        None,
+                        &st.data_dir,
+                        &format!("{} 失败", t.name),
+                        &format!("{summary}（30 分钟后自动重试）"),
+                        crate::notify::NotifyEvent::TaskFail,
+                    );
+                }
             }
         }
+    }
+}
+
+/// 任务生效触发时刻：trae-renew / wb-growth 跟随设置页时刻（环境配置页可改），
+/// 其余任务用内置默认；配置非法（非 HH:MM 格式）时回退默认值
+fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
+    let configured = match t.key {
+        "trae-renew" => Some(st.settings().jwt_renew_hhmm),
+        "wb-growth" => Some(st.settings().wb_growth_hhmm),
+        _ => None,
+    };
+    let Some(v) = configured else {
+        return t.hhmm.to_string();
+    };
+    // 合法性：严格 HH:MM（小时 00–23，分钟 00–59），非法回退内置默认
+    let ok = |s: &str| match s.split_once(':') {
+        Some((h, m)) => {
+            h.len() == 2
+                && m.len() == 2
+                && h.bytes().all(|c| c.is_ascii_digit())
+                && m.bytes().all(|c| c.is_ascii_digit())
+                && h.parse::<u32>().map(|x| x < 24).unwrap_or(false)
+                && m.parse::<u32>().map(|x| x < 60).unwrap_or(false)
+        }
+        None => false,
+    };
+    let v = v.trim();
+    if ok(v) {
+        v.to_string()
+    } else {
+        t.hhmm.to_string()
     }
 }
 
@@ -119,6 +179,10 @@ fn enabled(st: &AppState, key: &str) -> bool {
     match key {
         // WorkBuddy 签到跟随「启动自动补签」开关（F-55 同源设置）
         "wb-checkin" => crate::commands::workbuddy::wb_auto_checkin_enabled(st),
+        // Trae JWT 定时续期（issue #27）：跟随环境配置页开关（默认开）
+        "trae-renew" => st.settings().jwt_renew_enabled,
+        // WorkBuddy 每日成长（任务配置页）：跟随成长调度开关（默认开）
+        "wb-growth" => st.settings().wb_growth_enabled,
         // 其余任务幂等且低风险，恒开（Trae 签到 run_round 自带状态核验）
         _ => true,
     }
@@ -140,6 +204,23 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             };
             Ok(super::wb_checkin::run_checkin_round(st, &super::wb_checkin::CheckinOpts::daily(), &mut |_| {}))
         }
+        // WorkBuddy 每日成长（任务配置页）：成长三开关驱动，抢轮次锁与 UI 路径互斥
+        "wb-growth" => {
+            let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
+                return Err("跳过：已有签到/成长任务在执行中".into());
+            };
+            let s = crate::commands::workbuddy::load_settings(st);
+            let flags = super::wb_checkin::GrowthOpts {
+                travel: s.growth_travel,
+                lottery: s.growth_lottery,
+                tasks: s.growth_tasks,
+            };
+            // run_growth_round 为 NDJSON 推进式输出（无汇总返回值），调度日志记 ok 概要即可
+            super::wb_checkin::run_growth_round(st, &flags, &[], &mut |_| {});
+            Ok(json!({ "ok": true }))
+        }
+        // Trae JWT 定时续期（issue #27）：与 `--task-run trae-renew` 同款（lazy 48h 惰性门）
+        "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(st),
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
         "wb-renew" => Ok(super::wb_checkin::run_renew_only(st, 24)),
         // 豆包会话每日续期：与 `--task-run doubao-keepalive` 同款
@@ -251,7 +332,7 @@ pub fn scheduler_status(st: tauri::State<AppState>) -> Value {
             json!({
                 "key": t.key,
                 "name": t.name,
-                "time": t.hhmm,
+                "time": effective_hhmm(&st, t),
                 "last_run_date": e.get("last_run_date").cloned().unwrap_or(Value::Null),
                 "last_run_ts": e.get("last_run_ts").cloned().unwrap_or(Value::Null),
                 "last_fail_ts": e.get("last_fail_ts").cloned().unwrap_or(Value::Null),
@@ -261,4 +342,107 @@ pub fn scheduler_status(st: tauri::State<AppState>) -> Value {
         })
         .collect();
     json!({ "tasks": tasks })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_state(tag: &str) -> AppState {
+        let dir = std::env::temp_dir()
+            .join(format!("aiwork_sched_renew_test_{tag}_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("data"));
+        AppState {
+            data_dir: dir,
+            jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        }
+    }
+
+    fn renew_task() -> &'static SchedTask {
+        TASKS.iter().find(|t| t.key == "trae-renew").unwrap()
+    }
+
+    fn seed_settings(st: &AppState, enabled: bool, hhmm: &str) {
+        crate::store::db(&st.data_dir)
+            .kv_set("app_settings", &json!({ "jwt_renew_enabled": enabled, "jwt_renew_hhmm": hhmm }))
+            .unwrap();
+    }
+
+    /// 成长调度配置种子（wb_growth_enabled/wb_growth_hhmm → app_settings kv）
+    fn seed_growth_settings(st: &AppState, enabled: bool, hhmm: &str) {
+        crate::store::db(&st.data_dir)
+            .kv_set("app_settings", &json!({ "wb_growth_enabled": enabled, "wb_growth_hhmm": hhmm }))
+            .unwrap();
+    }
+
+    /// 默认（无 kv）：零值回填链路保证「默认开 + 09:00」（issue #27 语义）
+    #[test]
+    fn effective_hhmm_default_0900_and_enabled() {
+        let st = temp_state("dflt");
+        assert_eq!(effective_hhmm(&st, renew_task()), "09:00");
+        assert!(enabled(&st, "trae-renew"), "默认应启用续期任务");
+    }
+
+    /// 环境配置页可改：合法 HH:MM 覆盖内置默认
+    #[test]
+    fn effective_hhmm_follows_settings() {
+        let st = temp_state("cfg");
+        seed_settings(&st, true, "07:30");
+        assert_eq!(effective_hhmm(&st, renew_task()), "07:30");
+    }
+
+    /// 非法配置回退内置默认：小时越界 / 非 HH:MM 格式 / 分钟越界 / 非法串 / 缺冒号
+    #[test]
+    fn effective_hhmm_invalid_falls_back() {
+        for bad in ["24:00", "9:00", "07:60", "abc", "0730"] {
+            let st = temp_state("bad");
+            seed_settings(&st, true, bad);
+            assert_eq!(effective_hhmm(&st, renew_task()), "09:00", "非法值 {bad:?} 应回退默认");
+        }
+    }
+
+    /// 前后空白容忍：trim 后生效
+    #[test]
+    fn effective_hhmm_trims_whitespace() {
+        let st = temp_state("trim");
+        seed_settings(&st, true, " 08:15 ");
+        assert_eq!(effective_hhmm(&st, renew_task()), "08:15");
+    }
+
+    /// 续期时刻配置不外溢：其他任务（wb-checkin）仍用内置 09:10
+    #[test]
+    fn other_tasks_ignore_renew_settings() {
+        let st = temp_state("other");
+        seed_settings(&st, true, "07:30");
+        let wb = TASKS.iter().find(|t| t.key == "wb-checkin").unwrap();
+        assert_eq!(effective_hhmm(&st, wb), "09:10");
+    }
+
+    /// WorkBuddy 每日成长：默认 09:00 + 默认开；合法覆盖生效；非法回退；显式关闭
+    #[test]
+    fn wb_growth_default_and_settings() {
+        let st = temp_state("wbg");
+        let growth = || TASKS.iter().find(|t| t.key == "wb-growth").unwrap();
+        assert_eq!(effective_hhmm(&st, growth()), "09:00");
+        assert!(enabled(&st, "wb-growth"), "成长调度默认启用");
+        seed_growth_settings(&st, true, "08:20");
+        assert_eq!(effective_hhmm(&st, growth()), "08:20");
+        seed_growth_settings(&st, true, "25:00");
+        assert_eq!(effective_hhmm(&st, growth()), "09:00", "非法时刻回退默认");
+    }
+
+    #[test]
+    fn wb_growth_disabled_skipped() {
+        let st = temp_state("wgoff");
+        seed_growth_settings(&st, false, "09:00");
+        assert!(!enabled(&st, "wb-growth"));
+    }
+
+    /// 显式关闭：enabled() 返回 false（环境配置页开关关闭后调度器跳过）
+    #[test]
+    fn enabled_false_when_disabled() {
+        let st = temp_state("off");
+        seed_settings(&st, false, "09:00");
+        assert!(!enabled(&st, "trae-renew"));
+    }
 }

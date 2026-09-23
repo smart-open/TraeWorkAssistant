@@ -100,6 +100,10 @@ pub struct ApiSharedState {
     pub wb_probe_ts_ms: std::sync::atomic::AtomicI64,
     /// WB 上游健康探针结果：-1 未探测 / 0 不可达 / 1 在线
     pub wb_probe_ok: std::sync::atomic::AtomicI64,
+    /// Trae 上游 401 自愈回调（issue #27 方案 B；网关层无 AppState 引用，由启动方注入）：
+    /// 入参 user_id，内部走 refresh_jwt_impl 全防护链路强制刷新并持久化。
+    /// None（单测/降级构造）时 401 维持原「note_error + 换号」语义
+    pub trae_jwt_refresh: Option<std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>>,
 }
 
 impl ApiSharedState {
@@ -522,6 +526,7 @@ mod inflight_tests {
             usage_dirty: Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            trae_jwt_refresh: None,
         };
         {
             let _g = state.inflight_guard();

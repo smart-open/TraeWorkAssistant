@@ -1481,6 +1481,10 @@ pub fn refresh_jwt(
 static REFRESH_COOLDOWN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 const REFRESH_COOLDOWN_SECS: u64 = 60;
+/// 401 自愈并发去重窗：force 刷新成功后记录时刻，窗内同账号 force 直接复用 vault 现有 JWT
+const FORCE_REFRESH_DEDUP_SECS: u64 = 5;
+static LAST_SUCCESS_REFRESH: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// 惰性刷新门阈值（优化 2）：JWT 剩余有效期超过 48h（且 refresh_token 未临近过期）
 /// 时不发 ExchangeToken。JWT 全量寿命约 13 天——把刷新压到最后 48h，每次刷新都是
@@ -1580,6 +1584,25 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
 
     // Double-check：持锁后重新读取文件，防止其他线程已刷新
     let mut accounts = crate::vault::load_accounts(state);
+
+    // 401 自愈并发去重（force 路径）：去重窗内该账号刚成功刷新过 → vault 中即最新 JWT，
+    // 直接复用不再重复轮换——并发 401 会串行进锁，每次真实轮换都作废上一轮凭证
+    if force {
+        let recent = LAST_SUCCESS_REFRESH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(user_id)
+            .map(|t: &std::time::Instant| t.elapsed());
+        if matches!(recent, Some(e) if e < std::time::Duration::from_secs(FORCE_REFRESH_DEDUP_SECS)) {
+            if let Some(acct) = accounts
+                .accounts
+                .iter()
+                .find(|a| a.user_id.as_deref() == Some(user_id))
+            {
+                return Ok(acct.jwt.clone());
+            }
+        }
+    }
 
     // C 入口拦截：已判定 refresh_token 失效的账号不再发网络请求
     // （此前无效标记仅影响调度，手动/自动刷新仍会持续探测——app.log 实证
@@ -1721,6 +1744,11 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
         account.name.clone()
     };
     crate::vault::save_accounts(&state, &mut accounts)?;
+    // 记录成功刷新时刻：供 401 自愈 force 路径并发去重（FORCE_REFRESH_DEDUP_SECS 窗内复用）
+    LAST_SUCCESS_REFRESH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(user_id.to_string(), std::time::Instant::now());
 
     // 自动解冻（含 SessionDead）：新 JWT 刚从 ExchangeToken 换发、必然有效，
     // 此前签到 401 打上的 SessionDead 永久冷却若不清除，调度会永远跳过该账号
@@ -1750,9 +1778,66 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
     Ok(new_jwt_full)
 }
 
+/// Trae JWT 定时批量续期（issue #27，调度器 `trae-renew` / `--task-run trae-renew` 共用）：
+/// 遍历 vault 全账号，对「有 refresh_token 且未判失效且 lazy_refresh_needed（JWT 剩余
+/// ≤48h 或 refresh_token 临期）」的账号逐个惰性刷新。复用 refresh_jwt_impl 全部防护
+/// （并发锁/冷却/轮换写回/user_id 校验/失效标记），本函数只做批量编排，串行执行。
+///
+/// 返回计数 JSON；仅当发起过刷新且全部失败时返回 Err（调度器 30 分钟后重试），
+/// invalid-only 等永久性失败计 skipped——避免无网络请求的本地错误整日重试刷日志。
+pub fn renew_due_accounts_impl(state: &AppState) -> Result<serde_json::Value, String> {
+    let accounts = crate::vault::load_accounts(state);
+    let now_ts = chrono::Utc::now().timestamp();
+    let (mut refreshed, mut skipped, mut no_rt, mut failed) = (0u32, 0u32, 0u32, 0u32);
+    let mut details: Vec<String> = Vec::new();
+    for a in &accounts.accounts {
+        let Some(uid) = a.user_id.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let has_rt = a.refresh_token.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+        if !has_rt {
+            no_rt += 1; // 本机捕获/导入账号：无刷新前提（UI 已有「无 RT」徽标提示）
+            continue;
+        }
+        // invalid 账号不在此跳过：交给 refresh_jwt_impl 入口拦截处理——其内部先尝试
+        // 从 TRAE IDE 本地登录态恢复（用户可能已重新登录），恢复失败才报「已失效」
+        //（不发网络请求，仅读本地文件）；renew 按错误文案归入 skipped，无重试风暴
+        if !lazy_refresh_needed(&a.jwt, a.refresh_token_expires_at, now_ts) {
+            skipped += 1; // JWT 剩余 >48h 且 rt 未临期：不轮换 = 缩小 IDE 互踢冲突面
+            continue;
+        }
+        // force=false：与惰性门双保险（候选与判定之间状态可能变化）
+        match refresh_jwt_impl(state, uid, false) {
+            Ok(_) => refreshed += 1,
+            Err(e) if e.contains("已失效") => {
+                skipped += 1;
+                details.push(format!("[{}] {}", a.name, e));
+            }
+            Err(e) => {
+                failed += 1;
+                details.push(format!("[{}] {}", a.name, e));
+            }
+        }
+    }
+    let v = serde_json::json!({
+        "ok": failed == 0,
+        "refreshed": refreshed,
+        "skipped": skipped,
+        "no_refresh_token": no_rt,
+        "failed": failed,
+        "details": details,
+    });
+    if failed > 0 && refreshed == 0 {
+        Err(serde_json::to_string(&v).unwrap_or_default())
+    } else {
+        Ok(v)
+    }
+}
+
 /// 记录一次 refresh_token 刷新失败（F-78 批次 3 生命周期管理）：
-/// 递增连续失败计数；服务端明确拒绝（code != 0 / user_id 不匹配）或连续 3 次失败时
-/// 置 refresh_token_invalid=true，供调度与 UI 提前规避（原实现只能等签到 401 才暴露）。
+/// 服务端明确拒绝（code != 0 / user_id 不匹配）→ 递增计数并立即置 refresh_token_invalid=true，
+/// 供调度与 UI 提前规避（原实现只能等签到 401 才暴露）；网络/解析类失败仅计数不置失效
+///（调度 30 分钟重试会快速累计 3 次，若计入会把一过性网络故障误判为 refresh_token 不可用）。
 /// 刷新成功在 refresh_jwt_impl 写回时清零；重新 OAuth 登录亦会重置（commands/oauth.rs）。
 /// 调用方持有 jwt_refresh_lock，无并发写竞争。
 fn record_refresh_failure(state: &AppState, user_id: &str, rejected: bool, err_msg: &str) {
@@ -1764,10 +1849,25 @@ fn record_refresh_failure(state: &AppState, user_id: &str, rejected: bool, err_m
     else {
         return;
     };
-    acct.refresh_token_fails = acct.refresh_token_fails.saturating_add(1);
-    if rejected || acct.refresh_token_fails >= 3 {
-        acct.refresh_token_invalid = true;
+    // 网络/解析类失败（rejected=false）：计数但不触发失效（区分服务端明确拒绝）
+    if !rejected {
+        acct.refresh_token_fails = acct.refresh_token_fails.saturating_add(1);
+        acct.updated_at = Some(fs_utils::now_iso());
+        let (name, fails) = (acct.name.clone(), acct.refresh_token_fails);
+        if let Err(e) = crate::vault::save_accounts(state, &mut accounts) {
+            fs_utils::app_log(&state.data_dir, &format!("refresh_token 失败计数写入失败: {e}"));
+        }
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "[{}] refresh_token 刷新失败（网络类，不计失效）第 {} 次: {}",
+                name, fails, err_msg
+            ),
+        );
+        return;
     }
+    acct.refresh_token_fails = acct.refresh_token_fails.saturating_add(1);
+    acct.refresh_token_invalid = true;
     acct.updated_at = Some(fs_utils::now_iso());
     let (name, fails, invalid) =
         (acct.name.clone(), acct.refresh_token_fails, acct.refresh_token_invalid);
@@ -2125,5 +2225,61 @@ mod tests {
     fn test_lazy_refresh_needed_no_rt_not_triggered_early() {
         let jwt = jwt_with_exp(Some(T0 + 49 * 3600));
         assert!(!lazy_refresh_needed(&jwt, None, T0));
+    }
+
+    // ── renew_due_accounts_impl 批量续期编排测试（issue #27）───────────────
+    // 约束：VAULT 为进程级单例（首个 open() 绑定目录），且「临期触发刷新」分支
+    // 会发起真实网络请求——故全部断言共用一个临时目录，且只种可离线判定的账号
+    // （无 rt / 已失效 / JWT 新鲜）；网络刷新成功路径不入单测（联调覆盖）。
+    #[test]
+    fn test_renew_due_accounts_skip_branches_and_counts() {
+        let dir = std::env::temp_dir()
+            .join(format!("aiwork_renew_orch_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("data"));
+        let state = crate::state::AppState {
+            data_dir: dir,
+            jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let acc = |name: &str, uid: Option<&str>, exp: i64, rt: Option<&str>, invalid: bool| {
+            RawAccount {
+                name: name.into(),
+                user_id: uid.map(|s| s.to_string()),
+                jwt: jwt_with_exp(Some(exp)),
+                refresh_token: rt.map(|s| s.to_string()),
+                // rt 过期时间给足 30 天：确保新鲜账号不因 rt 临期误触发
+                refresh_token_expires_at: rt.map(|_| now + 30 * 24 * 3600),
+                refresh_token_invalid: invalid,
+                ..Default::default()
+            }
+        };
+        let mut f = AccountsFile {
+            accounts: vec![
+                // JWT 剩余 7 天（>48h）且 rt 未临期 → 惰性门跳过
+                acc("fresh", Some("uid-fresh"), now + 7 * 24 * 3600, Some("rt-fresh"), false),
+                // JWT 已过期但无 refresh_token → 无法刷新，计 no_refresh_token
+                acc("nort", Some("uid-nort"), now - 3600, None, false),
+                // 已判失效 → 刷新前拦截，计 skipped 并出明细（不发网络请求）
+                acc("invalid", Some("uid-invalid"), now - 3600, Some("rt-invalid"), true),
+                // 无 user_id → 无法定位设备/刷新，编排层直接忽略
+                acc("nouid", None, now - 3600, Some("rt-nouid"), false),
+            ],
+        };
+        crate::vault::save_accounts(&state, &mut f).unwrap();
+
+        let v =
+            serde_json::to_value(renew_due_accounts_impl(&state).unwrap()).unwrap();
+        assert_eq!(v["refreshed"], 0, "三种可离线分支均不应调用 ExchangeToken");
+        assert_eq!(v["skipped"], 2, "新鲜账号 + 已失效账号计入 skipped");
+        assert_eq!(v["no_refresh_token"], 1, "无 rt 账号单列计数");
+        assert_eq!(v["failed"], 0);
+        assert_eq!(v["ok"], true, "零刷新零失败 = 无事可做的成功");
+        let details = v["details"].as_array().unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.as_str().unwrap_or("").contains("invalid")),
+            "失效账号应出现在明细中（提示重新 OAuth 登录）"
+        );
     }
 }

@@ -179,7 +179,8 @@ export const api = {
     // T6：按类型清理日志文件（all 为全清），返回删除的文件数
     logsClear: (logType: string) => invoke<number>('logs_clear', { logType }),
     settingsGet: () => invoke<Settings>('settings_get'),
-    settingsSet: (patch: Settings) => invoke('settings_set', { patch }),
+    settingsSet: (patch: Partial<Settings>) => invoke('settings_set', { patch }),
+    notifyTest: () => invoke<string>('notify_test'),
     creditsHistory: () => invoke<CreditRecord[]>('credits_history'),
     inviteLink: () => invoke<{ url: string }>('invite_link'),
     taskRegister: (time: string) => invoke('task_register', { time }),
@@ -326,7 +327,8 @@ export const api = {
       invoke('workbuddy_checkin_task_register', { times }),
     checkinTaskStatus: () => invoke<string[]>('workbuddy_checkin_task_status'),
     checkinTaskUnregister: () => invoke('workbuddy_checkin_task_unregister'),
-    renewTaskRegister: (day?: string) => invoke('workbuddy_renew_task_register', { day: day ?? null }),
+    renewTaskRegister: (day?: string, time?: string) =>
+      invoke('workbuddy_renew_task_register', { day: day ?? null, time: time ?? null }),
     renewTaskStatus: () => invoke<boolean>('workbuddy_renew_task_status'),
     renewTaskUnregister: () => invoke('workbuddy_renew_task_unregister'),
     creditsFetch: (userId?: string, fresh?: boolean) =>

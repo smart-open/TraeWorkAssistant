@@ -72,6 +72,19 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         )),
         // WorkBuddy 每周兜底续期（对齐 python --renew-only，lazy 24h）
         "wb-renew" => Ok(wb_checkin::run_renew_only(state, 24)),
+        // WorkBuddy 每日成长（任务配置页；调度器/CLI 共用，成长三开关驱动）
+        "wb-growth" => {
+            let s = crate::commands::workbuddy::load_settings(state);
+            let flags = wb_checkin::GrowthOpts {
+                travel: s.growth_travel,
+                lottery: s.growth_lottery,
+                tasks: s.growth_tasks,
+            };
+            wb_checkin::run_growth_round(state, &flags, &[], &mut print_progress);
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        // Trae JWT 定时续期（issue #27；调度器/CLI 共用批量惰性刷新）
+        "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(state),
         // Trae 每日签到：vault 解密全量账号跑单轮
         //（修复 python 直读 checkin_accounts.json 占位文件导致全部「未配置 jwt」的隐性失效）
         "checkin" => {
