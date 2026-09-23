@@ -86,6 +86,11 @@ pub struct WorkBuddyAccount {
     pub credits_balance: Option<f64>,
     #[serde(default)]
     pub credits_fetched_at: Option<String>,
+    /// 最早积分包到期时间缓存（Unix 秒；积分查询/每日快照回写）：
+    /// 剩余>0 且未过期包取 min，Buddy 不分包类型（issue #28 调度口径）；
+    /// None = 无到期信息或全部包长期有效，键值随每次回写覆盖（不留 stale）
+    #[serde(default)]
+    pub credits_expire_at: Option<i64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -133,13 +138,7 @@ pub struct WorkBuddySettings {
     /// ⑤ 最小剩余积分：目标低于该值不切（0 = 关闭）
     #[serde(default)]
     pub cli_min_remaining_credits: f64,
-    // 失败通知渠道（F-19，批次3 T3.6）：桌面通知之外的可选渠道
-    /// 企业微信群机器人 webhook（空 = 关闭）
-    #[serde(default)]
-    pub notify_wechat_webhook: Option<String>,
-    /// Server酱 SendKey（空 = 关闭）
-    #[serde(default)]
-    pub notify_serverchan_sendkey: Option<String>,
+    // 失败通知渠道（F-19）：已迁移至 app Settings（通知渠道面板，Trae/Buddy 全平台共用）
     // UI 坐标点击签到兜底（F-18，批次4 T4.2）：仅手动触发，默认关闭
     #[serde(default)]
     pub ui_click_enabled: bool,
@@ -188,8 +187,6 @@ impl WorkBuddySettings {
             cli_min_urgency_hours: 72,
             cli_active_guard_minutes: 30,
             cli_min_remaining_credits: 0.0,
-            notify_wechat_webhook: None,
-            notify_serverchan_sendkey: None,
             ui_click_enabled: false,
             ui_click_x: 0,
             ui_click_y: 0,
@@ -210,7 +207,7 @@ pub(super) fn save_pool(state: &AppState, pool: &WbPool) -> Result<(), String> {
     crate::store::docs::wb_pool_save(&crate::store::db(&state.data_dir), &v)
 }
 
-pub(super) fn load_settings(state: &AppState) -> WorkBuddySettings {
+pub(crate) fn load_settings(state: &AppState) -> WorkBuddySettings {
     // SQLite 化（P2）：workbuddy_settings.json → kv `workbuddy_settings`
     let mut s: WorkBuddySettings = crate::store::db(&state.data_dir).kv_get("workbuddy_settings");
     // 审查 P2：单字段非法只钳制该字段为默认值，不再整体 with_defaults() 重置
@@ -221,12 +218,26 @@ pub(super) fn load_settings(state: &AppState) -> WorkBuddySettings {
     s
 }
 
-/// 失败通知统一入口（F-19）：桌面通知（有 AppHandle 时）+ 企业微信/Server酱可选渠道。
-/// 渠道配置来自 kv `workbuddy_settings`；渠道失败静默记日志，不影响主流程。
-pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &str, body: &str) {
-    let s: WorkBuddySettings = crate::store::db(data_dir).kv_get("workbuddy_settings");
+/// 失败通知统一入口（F-19；通知渠道面板，Trae/Buddy 全平台共用）：
+/// 桌面通知（有 AppHandle 时）+ Bark/通用 Webhook/Server酱 可选渠道。
+/// 配置来自 app Settings（kv `app_settings`，通知渠道面板维护）；
+/// 总开关 + 事件开关过滤；渠道失败静默记日志，不影响主流程。
+pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &str, body: &str, event: crate::notify::NotifyEvent) {
+    let s: crate::models::Settings = crate::store::db(data_dir).kv_get("app_settings");
+    if !s.notify_enabled {
+        return;
+    }
+    let on = match event {
+        crate::notify::NotifyEvent::CheckinDone => s.notify_on_checkin,
+        crate::notify::NotifyEvent::TaskFail => s.notify_on_task_fail,
+        crate::notify::NotifyEvent::Other => true,
+    };
+    if !on {
+        return;
+    }
     let channels = crate::notify::NotifyChannels {
-        wechat_webhook: s.notify_wechat_webhook.clone().filter(|x| !x.trim().is_empty()),
+        bark_url: s.notify_bark_url.clone().filter(|x| !x.trim().is_empty()),
+        wechat_webhook: s.notify_webhook_url.clone().filter(|x| !x.trim().is_empty()),
         serverchan_sendkey: s.notify_serverchan_sendkey.clone().filter(|x| !x.trim().is_empty()),
     };
     crate::notify::notify_all(app, data_dir, title, body, &channels);
@@ -372,4 +383,102 @@ pub(super) fn wb_chat_uid_guard(state: &AppState, user_id: &str) -> Result<(), S
         return Err(format!("账号不在池中: {user_id}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notify::NotifyEvent;
+
+    // ── 集成测试：kv app_settings → push_notify 门控 → 渠道分发 → app_log ──
+    // 渠道统一配无效值（格式校验必失败 → 落日志），用日志作为「已尝试发送」的可观测信号，全程不触网。
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("twa_push_notify_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn seed_app_settings(dir: &std::path::Path, json: &str) {
+        crate::store::db(dir).kv_set_raw("app_settings", json).unwrap();
+    }
+
+    fn read_log(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("logs").join("app.log")).unwrap_or_default()
+    }
+
+    fn assert_sent(dir: &std::path::Path) {
+        let log = read_log(dir);
+        assert!(log.contains("通知渠道(Bark)失败"), "log: {log}");
+        assert!(log.contains("通知渠道(企业微信)失败"), "log: {log}");
+        assert!(log.contains("通知渠道(Server酱)失败"), "log: {log}");
+    }
+
+    fn assert_not_sent(dir: &std::path::Path) {
+        assert!(!read_log(dir).contains("通知渠道"), "不应有任何渠道发送记录");
+    }
+
+    /// 总开关关闭：事件开关/渠道配置再齐也全静默
+    #[test]
+    fn push_notify_total_switch_off_blocks_all() {
+        let dir = tmp_dir("total_off");
+        seed_app_settings(
+            &dir,
+            r#"{"notify_enabled":false,"notify_bark_url":"http://b","notify_webhook_url":"ftp://w","notify_serverchan_sendkey":"bad key"}"#,
+        );
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::TaskFail);
+        assert_not_sent(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 事件门控按类别路由：TaskFail 关 → 静默；CheckinDone 开 → 发出
+    #[test]
+    fn push_notify_event_gate_routes_by_event_kind() {
+        let dir = tmp_dir("event_gate");
+        seed_app_settings(
+            &dir,
+            r#"{"notify_enabled":true,"notify_on_checkin":true,"notify_on_task_fail":false,"notify_bark_url":"http://b","notify_webhook_url":"ftp://w","notify_serverchan_sendkey":"bad key"}"#,
+        );
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::TaskFail);
+        assert_not_sent(&dir);
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::CheckinDone);
+        assert_sent(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Other 事件不受事件开关限制（手动操作结果始终尝试推送）
+    #[test]
+    fn push_notify_other_event_bypasses_event_switches() {
+        let dir = tmp_dir("other");
+        seed_app_settings(
+            &dir,
+            r#"{"notify_enabled":true,"notify_on_checkin":false,"notify_on_task_fail":false,"notify_bark_url":"http://b","notify_webhook_url":"ftp://w","notify_serverchan_sendkey":"bad key"}"#,
+        );
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::Other);
+        assert_sent(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 渠道值全空白：push_notify 过滤后 is_empty 短路（无日志、不 panic）
+    #[test]
+    fn push_notify_blank_channel_values_skipped() {
+        let dir = tmp_dir("blank");
+        seed_app_settings(
+            &dir,
+            r#"{"notify_enabled":true,"notify_on_checkin":true,"notify_bark_url":"   ","notify_webhook_url":"","notify_serverchan_sendkey":"  "}"#,
+        );
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::CheckinDone);
+        assert_not_sent(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// kv 完全缺失：Settings 走 serde 默认（notify_enabled 默认开）→ 渠道 None → 静默短路，不 panic
+    #[test]
+    fn push_notify_kv_missing_defaults_silent() {
+        let dir = tmp_dir("no_kv");
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::TaskFail);
+        assert_not_sent(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

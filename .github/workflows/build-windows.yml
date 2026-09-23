@@ -35,22 +35,25 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build Tauri app (NSIS only)
-        run: npm run tauri build -- --bundles nsis
+      - name: Build Tauri app (NSIS + MSI)
+        run: npm run tauri build -- --bundles nsis,msi
 
-      # CI 仅构建 NSIS（无 msi），不走 rename_release.mjs（其要求 exe+msi 齐全），
-      # 暂存到 release/windows/ 与 macOS CI（release/mac）产物目录约定对齐
+      # portable zip：零依赖（Windows 自带 tar.exe），从 release 产物打包
+      - name: Package portable zip
+        run: node scripts/package_portable.mjs
+
       - name: Stage artifacts (release/windows)
         shell: bash
         run: |
           mkdir -p release/windows
           cp src-tauri/target/release/bundle/nsis/*.exe release/windows/
-          cp src-tauri/target/release/*.exe release/windows/
+          cp src-tauri/target/release/bundle/msi/*.msi release/windows/
+          cp release/*_x64_portable.zip release/windows/
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: trae-work-assistant-windows
           path: |
-            release/windows/*.exe
+            release/windows/*
           if-no-files-found: error

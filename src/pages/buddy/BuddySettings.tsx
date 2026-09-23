@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Save, FolderOpen, RefreshCw, TerminalSquare, Play, CalendarClock, MousePointerClick, Search } from 'lucide-react';
+import { Save, FolderOpen, RefreshCw, TerminalSquare, Play, MousePointerClick, Search, SlidersHorizontal, ListChecks } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -9,7 +9,7 @@ import type { WorkBuddySettings, WorkBuddyEnvCheck, WbCliStatus, WbCliRotateLog,
 
 /**
  * buddy-settings 环境配置（§3.7.5，F-55/F-59/F-13）：
- * 环境卡 + 签到配置卡（自动签到 + 定时任务 + 坐标点击兜底）+ CLI 五重防护轮换卡。
+ * 通用配置（应用环境 + 切换迁移会话）+ 任务配置（JWT 续期 / 自动签到 / 自动成长）+ 通知与 CLI 轮换。
  * 到期日历统一收敛在「积分看板」页。
  */
 
@@ -165,13 +165,28 @@ function CliRotateCard({
   );
 }
 
-/** 签到配置卡（F-55/F-16/F-18）：自动签到参数 + 定时任务注册 + UI 坐标点击兜底 */
-function CheckinConfigCard({
+/** 星期中文标签（每周兜底续期任务用） */
+const DAY_LABEL: Record<string, string> = {
+  MON: '周一',
+  TUE: '周二',
+  WED: '周三',
+  THU: '周四',
+  FRI: '周五',
+  SAT: '周六',
+  SUN: '周日',
+};
+
+/** 任务配置卡：JWT 定时续期（refreshToken 配置 + 每周兜底任务）+ 自动签到 + 自动成长 */
+function TaskConfigCard({
   settings,
   patch,
+  growthForm,
+  setGrowthForm,
 }: {
   settings: WorkBuddySettings | null;
   patch: (p: Partial<WorkBuddySettings>) => void;
+  growthForm: { enabled: boolean; hhmm: string };
+  setGrowthForm: (f: { enabled: boolean; hhmm: string }) => void;
 }) {
   const pushToast = useAppStore((s) => s.pushToast);
   // F-75 M2-2.4：schtasks 注册与 UI 点击兜底入口按平台标志隐藏
@@ -183,6 +198,12 @@ function CheckinConfigCard({
   const [taskBusy, setTaskBusy] = useState(false);
   // UI 点击兜底执行态（防连点重复驱动鼠标）
   const [uiClickBusy, setUiClickBusy] = useState<'capture' | 'run' | null>(null);
+  // 每日签到注册时刻（默认 09:00 可改；第二时段可清空 = 单时段）
+  const [t1, setT1] = useState('09:00');
+  const [t2, setT2] = useState('21:00');
+  // 每周兜底续期任务触发日/时刻（默认周日 10:30，可改）
+  const [renewDay, setRenewDay] = useState('SUN');
+  const [renewTime, setRenewTime] = useState('10:30');
 
   const refreshTasks = useCallback(() => {
     // 审查修复（P2）：schtasks 状态查询仅 Windows 发起——mac 上后端恒 Err，
@@ -214,11 +235,16 @@ function CheckinConfigCard({
   };
 
   const registerTasks = async () => {
+    const times = [t1.trim(), t2.trim()].filter(Boolean);
+    if (times.length === 0) {
+      pushToast('warn', '请至少填写一个签到时刻');
+      return;
+    }
     setTaskBusy(true);
     try {
-      await api.workbuddy.checkinTaskRegister(['09:00', '21:00']);
+      await api.workbuddy.checkinTaskRegister(times);
       setTasks(await api.workbuddy.checkinTaskStatus());
-      pushToast('success', '已注册每日 09:00 / 21:00 双时段签到任务');
+      pushToast('success', `已注册每日签到任务：${times.join(' / ')}`);
     } catch (err) {
       pushToast('error', `注册任务失败：${String(err)}`);
     } finally {
@@ -247,9 +273,9 @@ function CheckinConfigCard({
         setRenewOn(false);
         pushToast('info', '已卸载每周续期任务');
       } else {
-        await api.workbuddy.renewTaskRegister('SUN');
+        await api.workbuddy.renewTaskRegister(renewDay, renewTime);
         setRenewOn(true);
-        pushToast('success', '已注册每周日 10:30 凭证续期任务');
+        pushToast('success', `已注册每周${DAY_LABEL[renewDay] ?? renewDay} ${renewTime} 凭证续期任务`);
       }
     } catch (err) {
       pushToast('error', `续期任务操作失败：${String(err)}`);
@@ -259,13 +285,76 @@ function CheckinConfigCard({
   };
 
   return (
-    <div className="mt-4 card p-4">
+    <div className="card p-4">
       <div className="mb-3 flex items-center gap-2">
-        <CalendarClock size={16} className="text-brand-500" />
-        <span className="text-sm font-medium">签到配置</span>
+        <ListChecks size={16} className="text-emerald-500" />
+        <h2 className="font-medium">任务配置</h2>
       </div>
+
+      {/* JWT Token 定时续期：refreshToken 配置 + 每周兜底任务（注册即生效） */}
+      <h3 className="mb-1 font-medium">JWT Token 定时续期</h3>
+      <div className="grid gap-3 lg:grid-cols-2">
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-slate-500">保活阈值（天）</span>
+          <input
+            type="number"
+            min={0}
+            className="input w-full"
+            value={settings?.keepalive_days ?? 0}
+            onChange={(e) => patch({ keepalive_days: Number(e.target.value) || 0 })}
+          />
+          <span className="mt-1 block text-xs text-slate-400">0 = 每天无条件刷新全部带 refreshToken 账号</span>
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-slate-500">惰性刷新（小时）</span>
+          <input
+            type="number"
+            min={1}
+            className="input w-full"
+            value={settings?.lazy_refresh_hours ?? 24}
+            onChange={(e) => patch({ lazy_refresh_hours: Number(e.target.value) || 24 })}
+          />
+          <span className="mt-1 block text-xs text-slate-400">剩余有效期低于该值才触发刷新（默认 24）</span>
+        </label>
+      </div>
+      <div className="mt-3 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <div className="text-sm font-medium">每周兜底续期任务</div>
+            <div className="text-xs text-slate-400">
+              {renewOn ? `已注册：每周${DAY_LABEL[renewDay] ?? renewDay} ${renewTime} 惰性刷新临期账号凭证` : '未注册：凭证临期后需手动续期'}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <select
+              className="input h-9 !w-24 text-sm"
+              value={renewDay}
+              onChange={(e) => setRenewDay(e.target.value)}
+            >
+              {Object.entries(DAY_LABEL).map(([k, v]) => (
+                <option key={k} value={k}>
+                  {v}
+                </option>
+              ))}
+            </select>
+            <input
+              type="time"
+              value={renewTime}
+              onChange={(e) => setRenewTime(e.target.value || '10:30')}
+              className="input h-9 !w-28 text-sm"
+            />
+            <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void toggleRenew()}>
+              {taskBusy ? <Spinner /> : null} {renewOn ? '卸载' : '注册'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+      {/* 自动签到：启动补签 + 每日签到任务（时刻可改） + UI 坐标点击兜底 */}
+      <h3 className="mb-1 font-medium">自动签到</h3>
       <div className="space-y-3">
-        {/* 自动签到（F-55） */}
         <label className="flex items-start gap-2">
           <input
             type="checkbox"
@@ -278,63 +367,27 @@ function CheckinConfigCard({
             <span className="block text-xs text-slate-400">应用启动时立即核验服务端状态，未签到账号会自动补签</span>
           </span>
         </label>
-        <div className="grid gap-3 lg:grid-cols-2">
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-slate-500">保活阈值（天）</span>
-            <input
-              type="number"
-              min={0}
-              className="input w-full"
-              value={settings?.keepalive_days ?? 0}
-              onChange={(e) => patch({ keepalive_days: Number(e.target.value) || 0 })}
-            />
-            <span className="mt-1 block text-xs text-slate-400">0 = 每天无条件刷新全部带 refreshToken 账号</span>
-          </label>
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-slate-500">惰性刷新（小时）</span>
-            <input
-              type="number"
-              min={1}
-              className="input w-full"
-              value={settings?.lazy_refresh_hours ?? 24}
-              onChange={(e) => patch({ lazy_refresh_hours: Number(e.target.value) || 24 })}
-            />
-            <span className="mt-1 block text-xs text-slate-400">剩余有效期低于该值才触发刷新（默认 24）</span>
-          </label>
-        </div>
-
         {/* 定时任务（F-16；schtasks 仅 Windows，mac 隐藏——自动签到 + 启动补签已覆盖） */}
-        <div className={`grid gap-3 lg:grid-cols-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
-          <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm font-medium">每日签到 · 09:00 / 21:00 双时段</div>
-                <div className="text-xs text-slate-400">
-                  {tasks.length > 0 ? `已注册：${tasks.join('、')}` : '未注册'}
-                </div>
-              </div>
-              <div className="flex gap-2">
-                {tasks.length === 0 ? (
-                  <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void registerTasks()}>
-                    {taskBusy ? <Spinner /> : null} 注册
-                  </button>
-                ) : (
-                  <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void unregisterTasks()}>
-                    {taskBusy ? <Spinner /> : null} 卸载
-                  </button>
-                )}
+        <div className={`rounded-lg border border-slate-100 p-3 dark:border-zinc-800 ${platform !== 'windows' ? 'hidden' : ''}`}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-sm font-medium">每日签到</div>
+              <div className="text-xs text-slate-400">
+                {tasks.length > 0 ? `已注册：${tasks.join('、')}` : '未注册（第二时刻可清空 = 单时段）'}
               </div>
             </div>
-          </div>
-          <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-sm font-medium">token 每周兜底续期（周日 10:30）</div>
-                <div className="text-xs text-slate-400">{renewOn ? '已注册：惰性刷新临期账号凭证' : '未注册：凭证临期后需手动续期'}</div>
-              </div>
-              <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void toggleRenew()}>
-                {taskBusy ? <Spinner /> : null} {renewOn ? '卸载' : '注册'}
-              </button>
+            <div className="flex items-center gap-2">
+              <input type="time" value={t1} onChange={(e) => setT1(e.target.value || '09:00')} className="input h-9 !w-28 text-sm" />
+              <input type="time" value={t2} onChange={(e) => setT2(e.target.value)} className="input h-9 !w-28 text-sm" />
+              {tasks.length === 0 ? (
+                <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void registerTasks()}>
+                  {taskBusy ? <Spinner /> : null} 注册
+                </button>
+              ) : (
+                <button className="btn-outline !px-2 !py-1 text-xs" disabled={taskBusy} onClick={() => void unregisterTasks()}>
+                  {taskBusy ? <Spinner /> : null} 卸载
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -406,6 +459,66 @@ function CheckinConfigCard({
           </div>
         </div>
       </div>
+
+      <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+      {/* 自动成长：应用内调度器每日成长轮（开关/时刻随「保存配置」生效） */}
+      <h3 className="mb-1 font-medium">自动成长</h3>
+      <p className="mb-3 text-xs text-slate-400">
+        应用运行期间每日到点自动执行成长轮（旅行 / 盲盒 / 任务，按下方开关项）；手动执行入口在「签到与成长」页。
+        开关与时刻随右上角「保存配置」生效。
+      </p>
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center gap-4">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={growthForm.enabled}
+              onChange={(e) => setGrowthForm({ ...growthForm, enabled: e.target.checked })}
+            />
+            每日执行成长任务
+          </label>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-slate-500">每日执行时刻</span>
+            <input
+              type="time"
+              value={growthForm.hhmm}
+              onChange={(e) => setGrowthForm({ ...growthForm, hhmm: e.target.value || '09:00' })}
+              disabled={!growthForm.enabled}
+              className="input h-9 !w-28 text-sm"
+            />
+            {growthForm.enabled && (
+              <span className="text-xs text-slate-400">每天 {growthForm.hhmm || '09:00'} 执行（应用关闭期间不执行）</span>
+            )}
+          </div>
+        </div>
+        <div className="grid gap-3 text-sm lg:grid-cols-3">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={settings?.growth_travel ?? true}
+              onChange={(e) => patch({ growth_travel: e.target.checked })}
+            />
+            成长旅行
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={settings?.growth_lottery ?? true}
+              onChange={(e) => patch({ growth_lottery: e.target.checked })}
+            />
+            盲盒抽奖
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={settings?.growth_tasks ?? true}
+              onChange={(e) => patch({ growth_tasks: e.target.checked })}
+            />
+            每日任务
+          </label>
+        </div>
+      </div>
     </div>
   );
 }
@@ -426,6 +539,8 @@ export default function BuddySettings() {
   const [pathForm, setPathForm] = useState({ workbuddy_path: '', codebuddy_path: '', wb_auth_file_path: '' });
   const [locWbDone, setLocWbDone] = useState(false);
   const [locCbDone, setLocCbDone] = useState(false);
+  // 成长调度表单（wb_growth_enabled/hhmm 存 app Settings，随「保存配置」统一提交）
+  const [growthForm, setGrowthForm] = useState({ enabled: true, hhmm: '09:00' });
   const [detecting, setDetecting] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const prefilled = useRef(false);
@@ -474,6 +589,10 @@ export default function BuddySettings() {
       codebuddy_path: appSettings.codebuddy_path ?? locCb?.exe ?? '',
       wb_auth_file_path: appSettings.wb_auth_file_path ?? env?.auth_file_path ?? '',
     });
+    setGrowthForm({
+      enabled: appSettings.wb_growth_enabled ?? true,
+      hhmm: appSettings.wb_growth_hhmm || '09:00',
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appSettings, locWbDone, locCbDone, locWb, locCb, env]);
 
@@ -482,15 +601,15 @@ export default function BuddySettings() {
     setSaving(true);
     try {
       await withMinDelay(api.workbuddy.settingsSet(settings), 800);
-      // 路径配置随「保存配置」一并提交（settings_set 真 patch 语义，仅写出现的字段）
-      if (appSettings) {
-        await api.misc.settingsSet({
-          ...appSettings,
-          workbuddy_path: pathForm.workbuddy_path.trim() || null,
-          codebuddy_path: pathForm.codebuddy_path.trim() || null,
-          wb_auth_file_path: pathForm.wb_auth_file_path.trim() || null,
-        });
-      }
+      // 路径配置随「保存配置」一并提交：settings_set 真 patch 语义，只写本页维护的字段——
+      // 不 spread appSettings 快照（挂载时旧快照会把系统设置弹框等外部通道刚保存的值回滚）
+      await api.misc.settingsSet({
+        workbuddy_path: pathForm.workbuddy_path.trim() || null,
+        codebuddy_path: pathForm.codebuddy_path.trim() || null,
+        wb_auth_file_path: pathForm.wb_auth_file_path.trim() || null,
+        wb_growth_enabled: growthForm.enabled,
+        wb_growth_hhmm: growthForm.hhmm.trim() || '09:00',
+      });
       pushToast('success', '配置已保存');
       await refresh();
     } catch (err) {
@@ -554,7 +673,7 @@ export default function BuddySettings() {
     <div className="animate-fade-in">
       <PageHeader
         title="Buddy · 环境配置"
-        desc="客户端环境 · 签到配置 · 通知与轮换"
+        desc="通用配置 · 任务配置 · 通知与轮换"
         actions={
           <>
             <button className="btn-outline" onClick={() => void refresh()} disabled={refreshing}>
@@ -567,12 +686,17 @@ export default function BuddySettings() {
         }
       />
 
-      {/* 环境卡 + 失败通知渠道：一行两列（各占 1/2） */}
+      {/* 通用配置 + 任务配置：一行两列 */}
       <div className="grid items-start gap-4 lg:grid-cols-2">
-        {/* 环境卡：WorkBuddy / CodeBuddy 客户端路径 + auth 文件路径（自动检测 + 人工配置） */}
+        {/* 左：通用配置（应用环境 + 切换账号自动迁移会话） */}
         <div className="card p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <span className="text-sm font-medium">环境</span>
+          <div className="mb-3 flex items-center gap-2">
+            <SlidersHorizontal size={16} className="text-emerald-500" />
+            <h2 className="font-medium">通用配置</h2>
+          </div>
+
+          <div className="mb-1 flex items-center justify-between">
+            <h3 className="font-medium">应用环境</h3>
             <div className="flex items-center gap-2">
               <Badge tone={env?.installed ? 'green' : 'red'}>
                 WorkBuddy{env?.installed ? `已安装${env?.version ? ` v${env.version}` : ''}` : '未安装'}
@@ -637,66 +761,36 @@ export default function BuddySettings() {
               <p className="mt-1.5 text-slate-400">路径改动随右上角「保存配置」一并生效；留空恢复默认位置</p>
             </div>
           </div>
-        </div>
 
-        {/* 通知渠道（F-19） */}
-        <div className="card p-4">
-          <div className="mb-3 text-sm font-medium">失败通知渠道</div>
-          <div className="space-y-3">
-            <p className="text-xs text-slate-400">
-              桌面通知之外的可选渠道：签到/补签失败等关键事件会同时推送到已配置的渠道（留空 = 关闭）。
-            </p>
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-500">企业微信群机器人 Webhook</span>
-              <input
-                className="input w-full font-mono text-xs"
-                value={settings?.notify_wechat_webhook ?? ''}
-                onChange={(e) => patch({ notify_wechat_webhook: e.target.value || null })}
-                placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
-              />
-              <span className="mt-1 block text-xs text-slate-400">群机器人消息：标题 + 失败摘要</span>
-            </label>
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-500">Server酱 SendKey</span>
-              <input
-                className="input w-full font-mono text-xs"
-                value={settings?.notify_serverchan_sendkey ?? ''}
-                onChange={(e) => patch({ notify_serverchan_sendkey: e.target.value || null })}
-                placeholder="SCTxxxxxxxx（sctapi.ftqq.com）"
-              />
-              <span className="mt-1 block text-xs text-slate-400">推送到微信服务号；Key 仅本地保存，不进日志</span>
-            </label>
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          {/* 切换时自动迁移会话（F-74）：默认关；勾选即存，进度走切换进度流 */}
+          <div className="mb-2 flex items-center gap-2 font-medium">
+            切换账号时自动迁移会话
+            <Badge tone={appSettings?.buddy_switch_migrate_chats ? 'green' : 'slate'}>
+              {appSettings?.buddy_switch_migrate_chats ? '已开启' : '已关闭'}
+            </Badge>
           </div>
+          <label className="flex cursor-pointer items-start gap-2 text-xs text-slate-600 dark:text-zinc-300">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+              checked={!!appSettings?.buddy_switch_migrate_chats}
+              onChange={(e) => void toggleSwitchMigrateChats(e.target.checked)}
+            />
+            <span>
+              切换 WorkBuddy/CodeBuddy 账号前，自动备份当前账号的会话三件套（projects + workbuddy.db +
+              edge-sync-mapping-v2.db），再以新 id 复制到目标账号名下并注册云端映射，之后才执行桥的
+              Stop→Restore→Start。任何一步失败只告警不阻断登录态切换（可稍后在账号管理页手动「复制会话」）。
+            </span>
+          </label>
         </div>
+
+        {/* 右：任务配置（JWT 续期 / 自动签到 / 自动成长） */}
+        <TaskConfigCard settings={settings} patch={patch} growthForm={growthForm} setGrowthForm={setGrowthForm} />
       </div>
 
-      {/* 切换时自动迁移会话（F-74）：默认关；勾选即存，进度走切换进度流 */}
-      <div className="card mt-4 p-4">
-        <div className="mb-2 flex items-center gap-2 text-sm font-medium">
-          切换账号时自动迁移会话
-          <Badge tone={appSettings?.buddy_switch_migrate_chats ? 'green' : 'slate'}>
-            {appSettings?.buddy_switch_migrate_chats ? '已开启' : '已关闭'}
-          </Badge>
-        </div>
-        <label className="flex cursor-pointer items-start gap-2 text-xs text-slate-600 dark:text-zinc-300">
-          <input
-            type="checkbox"
-            className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
-            checked={!!appSettings?.buddy_switch_migrate_chats}
-            onChange={(e) => void toggleSwitchMigrateChats(e.target.checked)}
-          />
-          <span>
-            切换 WorkBuddy/CodeBuddy 账号前，自动备份当前账号的会话三件套（projects + workbuddy.db +
-            edge-sync-mapping-v2.db），再以新 id 复制到目标账号名下并注册云端映射，之后才执行桥的
-            Stop→Restore→Start。任何一步失败只告警不阻断登录态切换（可稍后在账号管理页手动「复制会话」）。
-          </span>
-        </label>
-      </div>
-
-      {/* 签到配置（F-55/F-16/F-18）：自动签到 + 定时任务 + 坐标点击兜底 */}
-      <CheckinConfigCard settings={settings} patch={patch} />
-
-      {/* CLI 五重防护自动轮换（F-06/F-59，批次3） */}
+      {/* CLI 五重防护自动轮换（F-06/F-59，批次3）：通用配置与任务配置之后 */}
       <CliRotateCard settings={settings} patch={patch} />
     </div>
   );

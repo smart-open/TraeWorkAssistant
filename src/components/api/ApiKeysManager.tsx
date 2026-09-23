@@ -5,7 +5,7 @@
  * 子弹框（子 Key 配置/删除确认）沿用 Modal 组件叠加；onSubModalChange 供主弹窗
  * 在子弹框打开期间屏蔽 ESC 双关（主弹窗 onClose 先于子弹框触发）。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Copy, KeyRound, Plus, Power, RefreshCw, Route, Trash2 } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
@@ -13,6 +13,13 @@ import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
 import type { ApiKeyEntry, PoolStatus, UsageDayView } from '../../types';
+
+/** issue #30 混合白名单：候选账号平台标记 */
+type CandidatePool = 'trae' | 'buddy';
+/** 调度配置候选：上游账号 + 所属池标记 */
+interface PoolCandidate extends PoolStatus {
+  pool: CandidatePool;
+}
 
 export default function ApiKeysManager({
   onSubModalChange,
@@ -34,6 +41,10 @@ export default function ApiKeysManager({
   const [editDedicated, setEditDedicated] = useState('');
   // issue #25 资源池绑定："" = 跟随全局调度 | "trae" | "buddy"
   const [editBindPool, setEditBindPool] = useState('');
+  // issue #30：打开弹框时的原始白名单/专一值（未归一）。保存时若用户未改动勾选
+  // （归一化后等价），写回原值——旧裸 uid 数据保持旧语义，避免「仅打开保存一次」
+  // 就把 trae 侧从「不限」静默升级为「排除」（混合白名单零条目池 = 排除）
+  const editOrigRef = useRef<{ allowed: string[]; dedicated: string }>({ allowed: [], dedicated: '' });
   // 新增 Key 时的资源池选择（issue #25）
   const [newBindPool, setNewBindPool] = useState('');
   const [deleteForKey, setDeleteForKey] = useState<ApiKeyEntry | null>(null);
@@ -141,9 +152,13 @@ export default function ApiKeysManager({
   // 子 Key 配置弹框（F-35 + issue #25 资源池绑定）：限定上游 + 专一/临期优先 + 按日统计展示
   const openKeyEdit = (k: ApiKeyEntry) => {
     setEditKey(k);
-    setEditAllowed(new Set(k.allowed_accounts));
+    // issue #30：bind="" 旧数据裸 uid 显示时归一为 buddy: 前缀（与候选编码对齐，
+    // UI 勾选状态与实际限定一致）；原值存入 editOrigRef，保存时未改动则写回原值
+    const norm = (v: string) => (!k.bind_pool && v && !/^(trae|buddy):/i.test(v) ? `buddy:${v}` : v);
+    editOrigRef.current = { allowed: k.allowed_accounts, dedicated: k.dedicated_account || '' };
+    setEditAllowed(new Set(k.allowed_accounts.map(norm)));
     setEditMode(k.schedule_mode || 'expire_first');
-    setEditDedicated(k.dedicated_account || '');
+    setEditDedicated(norm(k.dedicated_account || ''));
     setEditBindPool(k.bind_pool || '');
     // 服务可能刚启动，两池候选列表即时刷新
     api.apiServer
@@ -162,13 +177,24 @@ export default function ApiKeysManager({
 
   const confirmKeyEdit = () => {
     if (!editKey) return;
+    // issue #30：归一化比较——用户未改动白名单/专一（仅打开弹框触发的前缀归一）
+    // 时写回原值，旧裸 uid 保持旧语义（trae 不限）；改动过才落前缀编码（升级语义）
+    const stripTag = (v: string) => v.replace(/^(trae|buddy):/i, '');
+    const normSig = (arr: string[]) =>
+      arr
+        .map(stripTag)
+        .sort()
+        .join('\n');
+    const allowedChanged = normSig([...editAllowed]) !== normSig(editOrigRef.current.allowed);
+    const dedicatedChanged = stripTag(editDedicated) !== stripTag(editOrigRef.current.dedicated);
     const next = apiKeys.map((k) =>
       k.id === editKey.id
         ? {
             ...k,
-            allowed_accounts: [...editAllowed],
+            allowed_accounts: allowedChanged ? [...editAllowed] : editOrigRef.current.allowed,
             schedule_mode: editMode,
-            dedicated_account: editMode === 'dedicated' ? editDedicated : '',
+            dedicated_account:
+              editMode === 'dedicated' ? (dedicatedChanged ? editDedicated : editOrigRef.current.dedicated) : '',
             bind_pool: editBindPool,
           }
         : k,
@@ -238,10 +264,24 @@ export default function ApiKeysManager({
     return m;
   }, [usage, todayKey]);
 
-  // issue #25 资源池绑定：限定上游/专一账号候选按绑定池切换数据源
-  // （trae → Trae 池账号；buddy/默认 → Buddy 池账号；两池 uid 体系不同不混用）。
+  // issue #25 资源池绑定 + issue #30 混合白名单：限定上游/专一候选按绑定池切换数据源。
+  // 跟随全局调度（bind=""）合并展示 Trae + Buddy 两池账号并标记平台，可跨池勾选；
+  // 绑定池时仅展示对应池（trae → Trae 池；buddy/默认 → Buddy 池）。
   // 修复历史问题：原候选列表拉的是 Trae 池，而后端白名单只作用于 WB 池
-  const editCandidates = editBindPool === 'trae' ? poolStatus : buddyPoolStatus;
+  const editCandidates: PoolCandidate[] = useMemo(() => {
+    const tag = (pool: CandidatePool, list: PoolStatus[]) => list.map((p) => ({ ...p, pool }));
+    if (editBindPool === 'trae') return tag('trae', poolStatus);
+    if (editBindPool === 'buddy') return tag('buddy', buddyPoolStatus);
+    return [...tag('trae', poolStatus), ...tag('buddy', buddyPoolStatus)];
+  }, [editBindPool, poolStatus, buddyPoolStatus]);
+
+  // issue #30 编码：跟随全局调度时白名单/专一值携带池前缀（trae:/buddy:），
+  // 后端按前缀分池作用域；绑定池时存裸 uid（与旧格式一致）
+  const encodeUid = useCallback(
+    (pool: CandidatePool, uid: string) => (editBindPool === '' ? `${pool}:${uid}` : uid),
+    [editBindPool],
+  );
+
   const switchBindPool = (p: string) => {
     if (p === editBindPool) return;
     setEditBindPool(p);
@@ -546,14 +586,17 @@ export default function ApiKeysManager({
           {editMode === 'dedicated' && (
             <label className="block">
               <span className="mb-1 block text-xs font-medium text-slate-500">
-                专一账号<span className="ml-1 font-normal text-slate-400">（{editBindPool === 'trae' ? 'Trae 池' : 'Buddy 池'}账号）</span>
+                专一账号
+                <span className="ml-1 font-normal text-slate-400">
+                  （{editBindPool === 'trae' ? 'Trae 池' : editBindPool === 'buddy' ? 'Buddy 池' : 'Trae/Buddy 池'}账号）
+                </span>
               </span>
               <select className="input w-full" value={editDedicated} onChange={(e) => setEditDedicated(e.target.value)}>
                 <option value="">— 默认取限定上游首个 —</option>
-                {editCandidates.map((p) => (
-                  <option key={p.uid} value={p.uid}>
-                    {p.name || p.uid}
-                    {p.credits != null ? `（${p.credits.toFixed(1)} 积分）` : ''}
+                {editCandidates.map((c) => (
+                  <option key={encodeUid(c.pool, c.uid)} value={encodeUid(c.pool, c.uid)}>
+                    [{c.pool === 'trae' ? 'Trae' : 'Buddy'}] {c.name || c.uid}
+                    {c.credits != null ? `（${c.credits.toFixed(1)} 积分）` : ''}
                   </option>
                 ))}
               </select>
@@ -566,29 +609,36 @@ export default function ApiKeysManager({
             <div className="mb-1.5 text-xs font-medium text-slate-500">
               限定上游
               <span className="ml-1 font-normal text-slate-400">
-                （{editBindPool === 'trae' ? 'Trae 池账号' : 'Buddy 池账号'}；不勾选 = 使用全部上游账号）
+                （{editBindPool === 'trae' ? 'Trae 池账号' : editBindPool === 'buddy' ? 'Buddy 池账号' : 'Trae + Buddy 池账号'}
+                ；不勾选 = 使用全部上游账号）
               </span>
             </div>
             <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2 dark:border-zinc-700">
               {editCandidates.length === 0 ? (
                 <div className="py-2 text-center text-xs text-slate-400">服务未运行，暂无上游账号候选</div>
               ) : (
-                editCandidates.map((p) => (
-                  <label key={p.uid} className="flex items-center gap-2 text-xs">
-                    <input
-                      type="checkbox"
-                      checked={editAllowed.has(p.uid)}
-                      onChange={() => {
-                        const next = new Set(editAllowed);
-                        if (next.has(p.uid)) next.delete(p.uid);
-                        else next.add(p.uid);
-                        setEditAllowed(next);
-                      }}
-                    />
-                    <span className="truncate">{p.name || p.uid}</span>
-                    {p.credits != null && <span className="ml-auto tabular-nums text-slate-400">{p.credits.toFixed(1)}</span>}
-                  </label>
-                ))
+                editCandidates.map((c) => {
+                  const val = encodeUid(c.pool, c.uid);
+                  return (
+                    <label key={val} className="flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={editAllowed.has(val)}
+                        onChange={() => {
+                          const next = new Set(editAllowed);
+                          if (next.has(val)) next.delete(val);
+                          else next.add(val);
+                          setEditAllowed(next);
+                        }}
+                      />
+                      <Badge tone={c.pool === 'trae' ? 'blue' : 'green'} className="!px-1.5 !text-[10px]">
+                        {c.pool === 'trae' ? 'Trae' : 'Buddy'}
+                      </Badge>
+                      <span className="truncate">{c.name || c.uid}</span>
+                      {c.credits != null && <span className="ml-auto tabular-nums text-slate-400">{c.credits.toFixed(1)}</span>}
+                    </label>
+                  );
+                })
               )}
             </div>
           </div>

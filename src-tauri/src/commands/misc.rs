@@ -444,6 +444,47 @@ pub fn settings_get(state: State<AppState>) -> Settings {
     state.settings()
 }
 
+/// 通知渠道「发送测试」（F-19）：按当前已保存配置经全部已配置渠道推送一条测试消息。
+/// 渠道失败汇总返回（如全部渠道未配置则提示先配置），不影响主流程。
+#[tauri::command(async)]
+pub fn notify_test(state: State<AppState>) -> Result<String, String> {
+    let s = state.settings();
+    let channels = crate::notify::NotifyChannels {
+        bark_url: s.notify_bark_url.clone().filter(|x| !x.trim().is_empty()),
+        wechat_webhook: s.notify_webhook_url.clone().filter(|x| !x.trim().is_empty()),
+        serverchan_sendkey: s.notify_serverchan_sendkey.clone().filter(|x| !x.trim().is_empty()),
+    };
+    if channels.is_empty() {
+        return Err("尚未配置任何通知渠道（Bark / 通用 Webhook / Server酱）".into());
+    }
+    if !s.notify_enabled {
+        return Err("通知推送总开关未启用".into());
+    }
+    let title = "AI Work Assistant 测试通知";
+    let body = "这是一条测试消息：如果你收到它，说明对应通知渠道配置生效。";
+    let mut errs: Vec<String> = Vec::new();
+    if let Some(bark) = channels.bark_url.as_deref().filter(|x| !x.trim().is_empty()) {
+        if let Err(e) = crate::notify::notify_bark(bark, title, body) {
+            errs.push(format!("Bark: {e}"));
+        }
+    }
+    if let Some(wh) = channels.wechat_webhook.as_deref().filter(|x| !x.trim().is_empty()) {
+        if let Err(e) = crate::notify::notify_wechat_webhook(wh, title, body) {
+            errs.push(format!("Webhook: {e}"));
+        }
+    }
+    if let Some(sk) = channels.serverchan_sendkey.as_deref().filter(|x| !x.trim().is_empty()) {
+        if let Err(e) = crate::notify::notify_serverchan(sk, title, body) {
+            errs.push(format!("Server酱: {e}"));
+        }
+    }
+    if errs.is_empty() {
+        Ok("测试消息已发送至全部已配置渠道".into())
+    } else {
+        Err(errs.join("；"))
+    }
+}
+
 #[tauri::command]
 pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<(), String> {
     // SQLite 化（P2）：app_settings 入 kv 文档（patch 合并语义不变）

@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { Calendar, Trash2, Save, Search, RotateCcw, Fingerprint, Clock, AlertTriangle } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Calendar, Trash2, Save, Search, RotateCcw, Fingerprint, Clock, AlertTriangle, SlidersHorizontal, ListChecks } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Modal } from '../components/ui';
 import { useAppStore } from '../store';
@@ -9,7 +9,7 @@ import type { Settings as SettingsType } from '../types';
 
 /**
  * 环境配置页：应用安装路径、签到行为、定时任务与设备标识重置。
- * 外观 / 语言 / 通用与通知 / 代理配置已移至左下角系统图标的「系统设置」弹框。
+ * 外观 / 语言 / 通用与通知 / 通知渠道（F-19，Trae 与 Buddy 共用）/ 代理配置位于左下角系统图标的「系统设置」弹框。
  */
 export default function Settings() {
   const settings = useAppStore((s) => s.settings);
@@ -36,6 +36,9 @@ export default function Settings() {
 
   // 本地表单状态：用户编辑后点击「保存」才持久化，避免每次按键都写文件
   const [form, setForm] = useState<SettingsType | null>(null);
+  // form 与 store settings 的同步基线：form 等于基线（用户未编辑）时跟随外部变化回填，
+  // 防止挂载时旧快照把系统设置弹框等外部通道刚保存的值覆盖回滚
+  const baselineRef = useRef<SettingsType | null>(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -44,10 +47,19 @@ export default function Settings() {
     if (platform === 'windows') void query();
   }, [refreshSettings]);
 
-  // settings 从后端加载完毕后同步到本地 form
+  // settings 加载/变化时同步 form：仅初始化与「用户未编辑且与最新值有差异」两种情形
   useEffect(() => {
-    if (settings && !form) {
+    if (!settings) return;
+    if (!form) {
       setForm(settings);
+      baselineRef.current = settings;
+      return;
+    }
+    const unchanged = JSON.stringify(form) === JSON.stringify(baselineRef.current);
+    const drifted = JSON.stringify(form) !== JSON.stringify(settings);
+    if (unchanged && drifted) {
+      setForm(settings);
+      baselineRef.current = settings;
     }
   }, [settings, form]);
 
@@ -62,6 +74,7 @@ export default function Settings() {
     setSaving(true);
     try {
       await withMinDelay(saveSettings(form));
+      baselineRef.current = form; // 保存成功后以提交内容为新基线，恢复对外部变化的跟随
       toast('success', '配置已保存');
     } catch {
       /* toast 已发出 */
@@ -71,7 +84,10 @@ export default function Settings() {
   };
 
   const reset = () => {
-    if (settings) setForm({ ...settings });
+    if (settings) {
+      setForm({ ...settings });
+      baselineRef.current = settings;
+    }
   };
 
   const register = async () => {
@@ -203,8 +219,13 @@ export default function Settings() {
       />
 
       <div className="grid items-start gap-4 md:grid-cols-2">
-        {/* 左列：应用环境 + 设备标识重置 */}
+        {/* 左列：通用配置（应用环境 + 签到行为 + 设备标识重置） */}
         <section className="card p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <SlidersHorizontal size={16} className="text-emerald-500" />
+            <h2 className="font-medium">通用配置</h2>
+          </div>
+
           <h3 className="mb-1 font-medium">应用环境</h3>
           <p className="mb-3 text-xs text-slate-400">
             两个 Trae 应用的安装路径，用于「打开应用」与「切换账号」时定位 exe；留空将自动探测。
@@ -248,6 +269,40 @@ export default function Settings() {
 
           <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
 
+          <h3 className="mb-1 font-medium">签到行为</h3>
+          <p className="mb-3 text-xs text-slate-400">批量签到时的默认跳过策略与重试参数，对所有签到入口生效。</p>
+          <div className="space-y-3 text-sm">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.checkin_skip_checked}
+                onChange={(e) => update('checkin_skip_checked', e.target.checked)}
+              />
+              默认跳过今日已签账号
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.checkin_skip_expired}
+                onChange={(e) => update('checkin_skip_expired', e.target.checked)}
+              />
+              默认跳过 JWT 过期账号
+            </label>
+            <div>
+              <label className="label">失败重试次数（签到失败后的重试次数）</label>
+              <input
+                type="number"
+                value={form.retry}
+                onChange={(e) => update('retry', Math.min(5, Math.max(0, Number(e.target.value) || 0)))}
+                className="input w-24"
+                min={0}
+                max={5}
+              />
+            </div>
+          </div>
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
           <h3 className="mb-1 font-medium">6 层设备标识重置</h3>
           <p className="mb-3 text-xs text-slate-500">
             一次性重置所选应用的全部设备标识层：① machineid ② storage.json telemetry ③ storage.json aha.device ④
@@ -281,38 +336,44 @@ export default function Settings() {
           )}
         </section>
 
-        {/* 右列：签到行为 + 每日定时签到（同一面板） */}
+        {/* 右列：任务配置（JWT 定时续期 + 每日定时签到） */}
         <section className="card p-4">
-          <h3 className="mb-1 font-medium">签到行为</h3>
-          <p className="mb-3 text-xs text-slate-400">批量签到时的默认跳过策略与重试参数，对所有签到入口生效。</p>
-          <div className="space-y-3 text-sm">
-            <label className="flex items-center gap-2">
+          <div className="mb-3 flex items-center gap-2">
+            <ListChecks size={16} className="text-emerald-500" />
+            <h2 className="font-medium">任务配置</h2>
+          </div>
+
+          {/* JWT Token 定时调度续期（issue #27）：应用内调度器，无需管理员权限 */}
+          <h3 className="mb-1 flex items-center gap-1.5 font-medium">
+            JWT Token 定时续期
+            <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-xs font-normal text-slate-500">
               <input
                 type="checkbox"
-                checked={form.checkin_skip_checked}
-                onChange={(e) => update('checkin_skip_checked', e.target.checked)}
+                checked={form.jwt_renew_enabled}
+                onChange={(e) => update('jwt_renew_enabled', e.target.checked)}
               />
-              默认跳过今日已签账号
+              启用
             </label>
-            <label className="flex items-center gap-2">
+          </h3>
+          <p className="mb-3 text-xs text-slate-400">
+            应用运行期间每日到点自动续期临期账号（惰性判定：JWT 剩余 &le;48h 或 refresh_token 临期才真正刷新，
+            减少与 TRAE IDE 的双端互踢）。无 refresh_token 的账号自动跳过；刷新失败 30 分钟后自动重试。
+          </p>
+          <div className="flex items-center gap-2">
+            <label className="label !mb-0">每日触发时刻</label>
+            <div className="relative flex items-center">
+              <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
               <input
-                type="checkbox"
-                checked={form.checkin_skip_expired}
-                onChange={(e) => update('checkin_skip_expired', e.target.checked)}
-              />
-              默认跳过 JWT 过期账号
-            </label>
-            <div>
-              <label className="label">失败重试次数（签到失败后的重试次数）</label>
-              <input
-                type="number"
-                value={form.retry}
-                onChange={(e) => update('retry', Math.min(5, Math.max(0, Number(e.target.value) || 0)))}
-                className="input w-24"
-                min={0}
-                max={5}
+                type="time"
+                value={form.jwt_renew_hhmm}
+                onChange={(e) => update('jwt_renew_hhmm', e.target.value || '09:00')}
+                disabled={!form.jwt_renew_enabled}
+                className="input h-9 !w-32 pl-8 text-sm"
               />
             </div>
+            {form.jwt_renew_enabled && (
+              <span className="text-xs text-slate-400">每天 {form.jwt_renew_hhmm || '09:00'} 执行（应用关闭期间不执行）</span>
+            )}
           </div>
 
           <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />

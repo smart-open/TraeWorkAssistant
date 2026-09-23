@@ -434,6 +434,7 @@ pub fn workbuddy_env_reset(
             &state.data_dir,
             "WorkBuddy 环境重置",
             &format!("清理完成，{fail_n} 项失败，请查看详情"),
+            crate::notify::NotifyEvent::Other,
         );
     }
     Ok(results)

@@ -189,6 +189,19 @@ function defaultSettings(): Settings {
     api_default_model: 'deepseek-v4-flash',
     // F-74：切换时自动迁移会话——默认关（旧行为保持"只切登录态，不写会话"）
     buddy_switch_migrate_chats: false,
+    // Trae JWT 定时续期（issue #27）：默认开，每日 09:00 惰性续期临期账号
+    jwt_renew_enabled: true,
+    jwt_renew_hhmm: '09:00',
+    // WorkBuddy 每日成长（任务配置页）：默认开，每日 09:00 执行成长轮
+    wb_growth_enabled: true,
+    wb_growth_hhmm: '09:00',
+    // 通知渠道（F-19，Trae/Buddy 全平台共用）：总开关与事件通知默认开，渠道留空 = 关闭
+    notify_enabled: true,
+    notify_on_checkin: true,
+    notify_on_task_fail: true,
+    notify_bark_url: null,
+    notify_webhook_url: null,
+    notify_serverchan_sendkey: null,
   };
 }
 
@@ -836,7 +849,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     const next = { ...current, ...patch } as Settings;
     set({ settings: next });
     try {
-      await api.misc.settingsSet(next);
+      // 后端 settings_set 为真 patch 语义（仅写出现的字段）——只发 patch，
+      // 不发合并后的全量对象：store.settings 可能落后于其他通道（如系统设置弹框）刚保存的值，
+      // 全量发送会把那些字段回滚成旧值
+      await api.misc.settingsSet(patch);
     } catch (err) {
       // 回滚到修改前的值，避免 UI 显示与后端不一致
       set({ settings: current });

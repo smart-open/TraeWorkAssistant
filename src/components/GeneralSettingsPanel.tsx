@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Save, RotateCcw } from 'lucide-react';
+import { Save, RotateCcw, Bell, Send } from 'lucide-react';
 import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
 import { api } from '../lib/tauri';
@@ -22,6 +22,20 @@ export default function GeneralSettingsPanel() {
   // 开机自启（T11）：注册表 Run 项即时生效，不随「保存设置」提交
   const [autostart, setAutostart] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
+  // 通知渠道「发送测试」执行态
+  const [testing, setTesting] = useState(false);
+
+  const sendTest = async () => {
+    setTesting(true);
+    try {
+      const msg = await api.misc.notifyTest();
+      toast('success', msg);
+    } catch (e) {
+      toast('error', String(e));
+    } finally {
+      setTesting(false);
+    }
+  };
 
   useEffect(() => {
     void refreshSettings();
@@ -170,6 +184,88 @@ export default function GeneralSettingsPanel() {
               <span className="text-xs text-slate-400">（启动 60 秒后自动为未签到账号签到）</span>
             </label>
             <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
+          </div>
+        </div>
+      </section>
+
+      {/* 通知渠道（F-19，Trae/Buddy 全平台共用） */}
+      <section className="card p-4">
+        <div className="mb-1 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Bell size={16} className="text-amber-500" />
+            <h3 className="font-medium">通知渠道</h3>
+          </div>
+          <button
+            className="btn-outline !px-2.5 !py-1 text-xs"
+            disabled={testing || dirty}
+            title={dirty ? '表单有未保存的修改，请先点底部「保存设置」再测试' : '按已保存的配置向全部渠道发送测试消息'}
+            onClick={() => void sendTest()}
+          >
+            <Send size={13} /> {testing ? '发送中…' : '发送测试'}
+          </button>
+        </div>
+        <p className="mb-3 text-xs text-slate-400">
+          签到完成 / 调度任务失败时推送到手机（Bark / Server酱）或自建 Webhook，Trae 与 Buddy 全平台共用，
+          未配置的渠道自动跳过；修改后点底部「保存设置」生效。
+        </p>
+        <div className="grid gap-x-8 gap-y-3 text-sm sm:grid-cols-2">
+          <div className="space-y-3">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.notify_enabled}
+                onChange={(e) => update('notify_enabled', e.target.checked)}
+              />
+              启用通知推送（总开关）
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.notify_on_checkin}
+                onChange={(e) => update('notify_on_checkin', e.target.checked)}
+              />
+              签到完成时通知
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.notify_on_task_fail}
+                onChange={(e) => update('notify_on_task_fail', e.target.checked)}
+              />
+              调度任务失败时通知
+            </label>
+          </div>
+          <div className="space-y-3">
+            <div>
+              <label className="label">Bark 推送地址</label>
+              <input
+                type="text"
+                value={form.notify_bark_url ?? ''}
+                onChange={(e) => update('notify_bark_url', e.target.value.trim() || null)}
+                placeholder="https://api.day.app/你的Key"
+                className="input"
+              />
+            </div>
+            <div>
+              <label className="label">Server酱 SendKey</label>
+              <input
+                type="text"
+                value={form.notify_serverchan_sendkey ?? ''}
+                onChange={(e) => update('notify_serverchan_sendkey', e.target.value.trim() || null)}
+                placeholder="SCT...（sct.ftqq.com 获取）"
+                className="input"
+              />
+            </div>
+            <div>
+              <label className="label">通用 Webhook 地址</label>
+              <input
+                type="text"
+                value={form.notify_webhook_url ?? ''}
+                onChange={(e) => update('notify_webhook_url', e.target.value.trim() || null)}
+                placeholder="https://...（POST JSON，兼容企业微信机器人等自建端）"
+                className="input"
+              />
+            </div>
           </div>
         </div>
       </section>

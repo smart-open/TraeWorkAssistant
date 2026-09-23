@@ -246,7 +246,7 @@ pub fn workbuddy_checkin_task_unregister() -> Result<(), String> {
 
 /// token 每周兜底续期任务（F-09；python --renew-only 惰性刷新）
 #[tauri::command(async)]
-pub fn workbuddy_renew_task_register(state: State<AppState>, day: String) -> Result<(), String> {
+pub fn workbuddy_renew_task_register(state: State<AppState>, day: String, time: String) -> Result<(), String> {
     crate::commands::misc::schtasks_gate()?;
     // day: MON..SUN（schtasks /SC WEEKLY /D）；默认 SUN。
     // 审查修复（命令注入）：白名单校验（此前仅大写化，"mon&calc" → "MON&CALC" 仍可注入）
@@ -254,9 +254,13 @@ pub fn workbuddy_renew_task_register(state: State<AppState>, day: String) -> Res
     if !["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"].contains(&d.as_str()) {
         return Err(format!("星期无效: {day}（应为 MON..SUN）"));
     }
+    // 触发时刻 HH:MM（默认 10:30，任务配置页可改）
+    let t = time.trim();
+    let t = if t.is_empty() { "10:30" } else { t };
+    crate::commands::misc::validate_hhmm(t)?;
     let tr = build_wb_task_tr(&state, "wb-renew")?;
     let (ok, _, stderr) = run_schtasks(&[
-        "/Create", "/TN", WB_RENEW_TASK_NAME, "/TR", &tr, "/SC", "WEEKLY", "/D", &d, "/ST", "10:30", "/F",
+        "/Create", "/TN", WB_RENEW_TASK_NAME, "/TR", &tr, "/SC", "WEEKLY", "/D", &d, "/ST", t, "/F",
     ])?;
     if !ok {
         return Err(format!("注册续期任务失败: {}", stderr.trim()));
@@ -356,6 +360,7 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
                 &state2.data_dir,
                 "WorkBuddy 签到提醒",
                 &format!("启动补签有 {failed} 个账号失败，请在签到与成长页查看"),
+                crate::notify::NotifyEvent::TaskFail,
             );
         }
     });
@@ -372,7 +377,7 @@ pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
     let Ok(_round) = try_acquire_wb_round() else {
         let msg = "已有签到/成长任务在执行中，一键签到已跳过";
         fs_utils::app_log(&state.data_dir, msg);
-        push_notify(Some(app), &state.data_dir, "一键签到", msg);
+        push_notify(Some(app), &state.data_dir, "一键签到", msg, crate::notify::NotifyEvent::Other);
         return;
     };
     let s = load_settings(state);
@@ -388,7 +393,7 @@ pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
     };
     let msg = format!("WorkBuddy 签到: {summary}");
     fs_utils::app_log(&state.data_dir, &msg);
-    push_notify(Some(app), &state.data_dir, "一键签到", &msg);
+    push_notify(Some(app), &state.data_dir, "一键签到", &msg, crate::notify::NotifyEvent::CheckinDone);
     // 阶段 2：成长计划（旅行/盲盒/任务开关随设置）
     let flags = GrowthOpts {
         travel: s.growth_travel,
@@ -398,5 +403,5 @@ pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
     wb_checkin::run_growth_round(state, &flags, &[], &mut |_| {});
     let msg = "WorkBuddy 成长计划: 完成";
     fs_utils::app_log(&state.data_dir, msg);
-    push_notify(Some(app), &state.data_dir, "一键签到", msg);
+    push_notify(Some(app), &state.data_dir, "一键签到", msg, crate::notify::NotifyEvent::CheckinDone);
 }

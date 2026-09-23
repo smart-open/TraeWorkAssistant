@@ -335,7 +335,7 @@ impl ApiPool {
                     name: a.name.clone(),
                     jwt: a.token.clone(),
                     credits: a.credits,
-                    credits_expire_at: None,
+                    credits_expire_at: a.credits_expire_at,
                     disabled: a.needs_relogin,
                     err_count: 0,
                     until: 0,
@@ -379,7 +379,8 @@ impl ApiPool {
 
     /// 带 Key 约束取号（F-35 子 Key 体系，批次3）：
     /// - `dedicated`：专一模式绑定 uid（healthy 即直接锁定，绕过策略）
-    /// - `allowed`：上游白名单过滤（None = 不限；`Some(空集)` = 过滤全部——调用方须先过滤空集）
+    /// - `allowed`：上游白名单过滤（None = 不限；`Some(空集)` = 过滤全部——
+    ///   issue #30 混合白名单借空集表达「该池被此 Key 排除」，调用方可有意传入）
     /// - 调度策略沿用池当前策略（子 Key「临期优先」= 池默认 expire_first，
     ///   池策略本身即用户可选的临期/积分/加权等模式；约束仅做过滤与锁定）
     pub fn pick_excluding_constrained(
@@ -586,6 +587,14 @@ impl ApiPool {
         }
     }
 
+    /// 按 uid 取账号展示名（请求日志用）；不在池中返回空串（日志侧显示 "-"）
+    pub fn name_of(&self, uid: &str) -> String {
+        safe_lock(&self.entries)
+            .get(uid)
+            .map(|e| e.name.clone())
+            .unwrap_or_default()
+    }
+
     /// F-78 批次 3：refresh_token 判定失效 → 运行时禁用（前端 refresh_jwt 失败联动；
     /// 持久化标记由 record_refresh_failure 写 accounts 文件，重启后经 sync_from_accounts 同步）
     pub fn note_refresh_invalid(&self, uid: &str) {
@@ -705,15 +714,30 @@ impl ApiPool {
     /// 同 [has_selectable]，附加 Key 级 uid 白名单过滤（issue #25 资源池绑定）：
     /// 绑定池 Key 的健康预检须感知白名单——池内仅剩白名单外账号时视为该池
     /// 对此 Key 不健康，走全局 fallback 开关回退另一池，而非取号阶段才失败。
-    /// `allowed`：uid 白名单（None = 不限；`Some(空集)` = 过滤全部——调用方须先
-    /// 过滤空集，语义同 pick_excluding_constrained）
+    /// `allowed`：uid 白名单（None = 不限；`Some(空集)` = 过滤全部，即该池对此
+    /// Key 不健康——issue #30 混合白名单的有意传参，语义同 pick_excluding_constrained）
     pub fn has_selectable_in(&self, allowed: Option<&HashSet<String>>) -> bool {
+        self.selectable_stats_in(allowed).1 > 0
+    }
+
+    /// 可选账号统计（诊断用，issue #29）：返回 (池内可选总数, 白名单内可选数)。
+    /// `allowed` 语义同 has_selectable_in（None = 不限）；供 NoHealthy 错误
+    /// 消息携带「池健康数 / 白名单命中数」，帮助用户自查 Key 约束配置
+    pub fn selectable_stats_in(&self, allowed: Option<&HashSet<String>>) -> (usize, usize) {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
-        entries
-            .values()
-            .any(|e| selectable(e, &tried, now) && allowed.map_or(true, |a| a.contains(&e.uid)))
+        let mut total = 0usize;
+        let mut in_allowed = 0usize;
+        for e in entries.values() {
+            if selectable(e, &tried, now) {
+                total += 1;
+                if allowed.map_or(true, |a| a.contains(&e.uid)) {
+                    in_allowed += 1;
+                }
+            }
+        }
+        (total, in_allowed)
     }
 
     /// 诊断：返回所有账号被过滤的原因（用于 "no healthy account" 排查）
@@ -795,6 +819,8 @@ pub struct WbSyncAccount {
     pub enterprise_id: String,
     pub global_region: bool,
     pub credits: Option<f64>,
+    /// 最早积分包到期（Unix 秒，Buddy 不分包类型，issue #28）；None = 无到期约束
+    pub credits_expire_at: Option<i64>,
     pub needs_relogin: bool,
     /// 所属 Buddy 分组 id（空 = 未分组）；池分组筛选在装配层按此过滤
     pub group_id: String,
@@ -1066,6 +1092,24 @@ mod tests {
         let expired = build_pool(&[("uid_a", 100.0, 1_000)]);
         let ok_a: HashSet<String> = ["uid_a".to_string()].into_iter().collect();
         assert!(!expired.has_selectable_in(Some(&ok_a)));
+    }
+
+    #[test]
+    fn selectable_stats_in_counts_total_and_whitelisted() {
+        // issue #29 修复2：NoHealthy 详情需要池健康计数（总数 + 白名单命中数）
+        let pool = build_pool(&[
+            ("uid_a", 100.0, 4_000_001_000),
+            ("uid_b", 100.0, 4_000_001_000),
+            ("uid_c", 0.0, 4_000_001_000), // 零积分 → 不可选
+        ]);
+        // 无白名单：(可选总数, 同值)
+        assert_eq!(pool.selectable_stats_in(None), (2, 2));
+        // 白名单命中 uid_b：总数不变，命中=1
+        let ok: HashSet<String> = ["uid_b".to_string()].into_iter().collect();
+        assert_eq!(pool.selectable_stats_in(Some(&ok)), (2, 1));
+        // 白名单全在池外：命中=0
+        let miss: HashSet<String> = ["uid_x".to_string()].into_iter().collect();
+        assert_eq!(pool.selectable_stats_in(Some(&miss)), (2, 0));
     }
 
     #[test]
@@ -1466,6 +1510,7 @@ mod tests {
                 enterprise_id: "e1".into(),
                 global_region: true,
                 credits: Some(50.0),
+                credits_expire_at: None,
                 needs_relogin: false,
                 group_id: String::new(),
             }],
@@ -1483,12 +1528,35 @@ mod tests {
             &[crate::api_server::pool::WbSyncAccount {
                 uid: "wb-x".into(), name: String::new(), token: "tk".into(),
                 domain: String::new(), enterprise_id: String::new(),
-                global_region: false, credits: None, needs_relogin: true,
+                global_region: false, credits: None, credits_expire_at: None, needs_relogin: true,
                 group_id: String::new(),
             }],
             &["wb-x".to_string()],
         );
         assert!(pool2.pick_excluding_constrained(&HashSet::new(), None, None).is_none());
+    }
+
+    #[test]
+    fn wb_sync_carries_credits_expire_at() {
+        // issue #28：Buddy 积分包到期透传入池，供 ExpireFirst/smart 排序消费
+        let pool = ApiPool::new();
+        pool.sync_from_wb(
+            &[crate::api_server::pool::WbSyncAccount {
+                uid: "wb-e".into(),
+                name: "n".into(),
+                token: "tk".into(),
+                domain: "d".into(),
+                enterprise_id: String::new(),
+                global_region: false,
+                credits: Some(10.0),
+                credits_expire_at: Some(1_234_567_890),
+                needs_relogin: false,
+                group_id: String::new(),
+            }],
+            &["wb-e".to_string()],
+        );
+        let entries = safe_lock(&pool.entries);
+        assert_eq!(entries.get("wb-e").unwrap().credits_expire_at, Some(1_234_567_890));
     }
 
     // ==================== F-77 账号级并发感知调度 ====================
