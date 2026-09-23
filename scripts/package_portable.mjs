@@ -15,6 +15,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
 } from 'node:fs';
@@ -144,18 +145,27 @@ for (const [srcRel, destRaw] of Object.entries(resources)) {
 }
 
 // 3) 打包（保留内部目录结构，顶层为产品名文件夹）：tar -a 按扩展名 .zip 生成 zip
-// Windows 显式用 System32 的 bsdtar（宽字符参数安全）：CI 的 PATH 里 Git 自带 GNU tar
-// 优先且对非 ASCII 文件名乱码（「AI Work 助手」→「AI Work ??」导致打开失败）
+// Windows 显式用 System32 的 bsdtar（CI PATH 里 Git 的 GNU tar 优先且行为不一）。
+// tar 的 argv 在 Windows 走 ANSI API：CI runner（en-US，ACP 1252）编不了中文产品名
+// （「AI Work 助手」→「??」导致打开失败；本机 ACP 936 无此问题，具有迷惑性）。
+// 规避：tar 的输出路径与目录参数全部 ASCII（临时 zip 名 + "."，目录内容由
+// libarchive 宽字符遍历保证 zip 内 UTF-8 名正确），打包完用 node rename 回中文名。
 const TAR =
   process.platform === 'win32' && existsSync('C:/Windows/System32/tar.exe')
     ? 'C:/Windows/System32/tar.exe'
     : 'tar';
+const tmpZip = join(OUT_DIR, '_portable_tmp.zip');
+rmSync(tmpZip, { force: true });
 console.log('正在打包:', zipPath);
-const r = spawnSync(TAR, ['-a', '-cf', zipPath, product], {
+const r = spawnSync(TAR, ['-a', '-cf', tmpZip, '.'], {
   cwd: tmpRoot,
   stdio: 'inherit',
 });
 rmSync(tmpRoot, { recursive: true, force: true });
-if (r.status !== 0) die('ERROR: tar 打包 zip 失败');
+if (r.status !== 0) {
+  rmSync(tmpZip, { force: true });
+  die('ERROR: tar 打包 zip 失败');
+}
+renameSync(tmpZip, zipPath);
 const size = statSync(zipPath).size;
 console.log(`OK: ${zipPath}  (${(size / 1024 / 1024).toFixed(2)} MB)`);
