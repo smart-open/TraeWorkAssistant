@@ -11,7 +11,10 @@
 //!
 //! F-35 子 Key 体系（对外子 Key 与上游真实凭证分离）：
 //! - `ck_` 前缀子 Key（前端 crypto 随机源生成；旧 `sk-` Key 继续兼容）
-//! - `allowed_accounts`：限定上游（WB 上游账号 uid 白名单，空 = 不限）
+//! - `allowed_accounts`：限定上游账号白名单，空 = 不限。
+//!   issue #30 混合白名单：bind=""（跟随全局调度）时条目可带 `trae:`/`buddy:`
+//!   池前缀（按前缀作用域分池，某池零条目 = 该池排除）；旧数据全裸 uid 保持
+//!   旧语义（仅约束 WB 池）；绑定池时为对应池裸 uid
 //! - `schedule_mode`：`expire_first`（默认，临期优先）| `dedicated`（专一，固定
 //!   `dedicated_account` 或 allowed_accounts 首个）
 //! - `daily_stats`：按日请求统计（保留最近 90 天）
@@ -40,18 +43,43 @@ pub enum KeyCheck {
     QuotaExceeded { limit: u64 },
 }
 
-/// 鉴权通过后的 Key 约束快照（F-35 + 资源池绑定）
+/// 鉴权通过后的 Key 约束快照（F-35 + 资源池绑定 + issue #30 混合白名单）
 #[derive(Clone, Debug)]
 pub struct ResolvedKey {
     pub id: String,
-    /// 限定上游账号 uid 白名单；空 = 不限
+    /// 限定上游账号 uid 白名单；空 = 不限。
+    /// bind=""（跟随全局调度）时条目可带池前缀 `trae:`/`buddy:`（issue #30 混合
+    /// 白名单）；绑定池时为对应池裸 uid；旧数据全裸 uid = 仅约束 buddy 池
     pub allowed_accounts: Vec<String>,
     /// expire_first | dedicated
     pub schedule_mode: String,
-    /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）
+    /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）；混合白名单时
+    /// 同样可带池前缀（专一锁定其归属池，排除另一池）
     pub dedicated_account: String,
     /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy"
     pub bind_pool: String,
+}
+
+/// 解析池前缀标记（issue #30）：`"trae:x"` → (Some("trae"), "x")；裸 uid → (None, 原串)。
+/// 大小写不敏感；非法前缀（如 "openai:x"）不识别，整体视为裸 uid。
+/// 池标识为 &'static（归一化字面量），第二个引用绑定输入串生命周期
+pub fn split_pool_tagged(uid: &str) -> (Option<&'static str>, &str) {
+    if let Some((tag, rest)) = uid.split_once(':') {
+        match parse_bind_pool(tag) {
+            Some(p) => return (Some(p), rest),
+            None => return (None, uid),
+        }
+    }
+    (None, uid)
+}
+
+/// 单池生效约束（pool_constraints 返回值）
+#[derive(Clone, Debug)]
+pub struct PoolConstraint {
+    /// 白名单集合：None = 不限；Some(空集) = 该池被该 Key 排除
+    pub allowed: Option<std::collections::HashSet<String>>,
+    /// 该池专一账号 uid（已去前缀；取号侧优先锁定不让位）
+    pub dedicated: Option<String>,
 }
 
 impl ResolvedKey {
@@ -60,16 +88,92 @@ impl ResolvedKey {
         parse_bind_pool(&self.bind_pool)
     }
 
+    /// 混合白名单判定（issue #30）：allowed_accounts 中任一条目带池前缀。
+    /// 新前端在 bind="" 下保存的列表必带前缀；旧数据全裸 uid = 旧语义
+    pub fn is_mixed_whitelist(&self) -> bool {
+        self.allowed_accounts.iter().any(|u| split_pool_tagged(u).0.is_some())
+    }
+
     /// 该 Key 的 F-35 约束（allowed_accounts 白名单 + dedicated）是否作用于指定池。
     /// 作用域规则（bind_pool 决定白名单所指的账号体系）：
     /// - bind=""（未绑定）→ 仅约束 buddy 池（F-35 旧语义兼容：白名单历来只作用于
     ///   WB 上游；绝不能波及 trae，否则旧 Key 的 Trae 侧调度会被误过滤）
     /// - bind="trae" → 仅约束 trae 池（白名单/专一指 Trae 账号 uid）
     /// - bind="buddy" → 仅约束 buddy 池
+    /// - 混合白名单（issue #30）→ 各池按前缀条目分别约束（见 pool_constraints）
     pub fn constrains_pool(&self, pool: &str) -> bool {
         match self.bind_pool() {
             None => pool == "buddy",
             Some(p) => p == pool,
+        }
+    }
+
+    /// 指定池的生效约束（issue #30 统一入口）。
+    /// 返回 None = 该 Key 不约束此池；Some(PoolConstraint)：
+    /// - `allowed` None = 本池不限；Some(空集) = 该池被该 Key 排除（预检判不健康
+    ///   走 fallback，取号必失败兜底）；Some(非空) = 白名单过滤
+    /// - `dedicated` = 该池专一账号 uid（已去前缀，取号侧优先锁定不让位）
+    ///
+    /// 作用域规则：
+    /// - 白名单与专一账号全空 → None（不限）
+    /// - 混合白名单（任一条目带 `trae:`/`buddy:` 前缀）→ 按前缀作用域分池：
+    ///   本池条目（裸 uid 兜底视为 buddy，防御旧数据混入）构成白名单；
+    ///   专一模式锁定归属池（归属池白名单并入专一账号，保证预检健康集与取号
+    ///   dedicated 优先语义一致；另一池整体排除）
+    /// - 否则旧语义 → `constrains_pool` 为 false 返回 None；true 返回约束，
+    ///   其中白名单可空（空白名单 + 专一 = 不限账号但锁定专一，F-35 原语义）
+    pub fn pool_constraints(&self, pool: &str) -> Option<PoolConstraint> {
+        use std::collections::HashSet;
+        if self.allowed_accounts.is_empty() && self.dedicated_account.is_empty() {
+            return None;
+        }
+        // 专一模式生效的专一账号（空 → allowed 首个），解析归属池与裸 uid
+        let dedicated = if self.schedule_mode == MODE_DEDICATED {
+            let raw = if self.dedicated_account.is_empty() {
+                self.allowed_accounts.first().cloned().unwrap_or_default()
+            } else {
+                self.dedicated_account.clone()
+            };
+            let (p, u) = split_pool_tagged(&raw);
+            let u = u.to_string();
+            (!u.is_empty()).then(|| (p.unwrap_or("buddy"), u))
+        } else {
+            None
+        };
+        if self.is_mixed_whitelist() {
+            // 混合白名单：按前缀作用域到指定池（裸 uid 防御性归属 buddy）
+            let scoped: HashSet<String> = self
+                .allowed_accounts
+                .iter()
+                .filter(|u| match split_pool_tagged(u) {
+                    (Some(p), _) => p == pool,
+                    (None, _) => pool == "buddy",
+                })
+                .map(|u| split_pool_tagged(u).1.to_string())
+                .collect();
+            match dedicated {
+                // 归属池：白名单并入专一账号——预检健康集与取号「dedicated 优先
+                // 锁定」一致，避免「专一账号不在勾选集 + 其余全不健康」时被误杀
+                Some((dpool, duid)) if dpool == pool => {
+                    let mut allowed = scoped;
+                    allowed.insert(duid.clone());
+                    Some(PoolConstraint { allowed: Some(allowed), dedicated: Some(duid) })
+                }
+                // 专一锁池：非归属池整体排除（预检判不健康 → 走归属池）
+                Some(_) => {
+                    Some(PoolConstraint { allowed: Some(HashSet::new()), dedicated: None })
+                }
+                None => Some(PoolConstraint { allowed: Some(scoped), dedicated: None }),
+            }
+        } else if self.constrains_pool(pool) {
+            // 旧语义：constrains_pool 已判定本池受约束；白名单可空（issue #30
+            // 回归修复：空白名单 + 专一时 allowed=None 不限、dedicated 仍锁定，
+            // 与重构前 wb_route/trae_pool_constraints 的独立提取行为一致）
+            let allowed = (!self.allowed_accounts.is_empty())
+                .then(|| self.allowed_accounts.iter().cloned().collect());
+            Some(PoolConstraint { allowed, dedicated: dedicated.map(|(_, u)| u) })
+        } else {
+            None
         }
     }
 }
@@ -251,6 +355,19 @@ pub fn constraints_for(data_dir: &Path, key_id: &str) -> Option<ResolvedKey> {
             dedicated_account: e.dedicated_account.clone(),
             bind_pool: e.bind_pool.clone(),
         })
+}
+
+/// 按 Key 条目 id 取展示名（请求日志用）：走同一内存权威副本，零磁盘 IO；
+/// Key 不存在或匿名返回空串（日志侧显示 "-"）
+pub fn key_name_for(data_dir: &Path, key_id: &str) -> String {
+    let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    entry_or_load(&mut reg, data_dir)
+        .file
+        .keys
+        .iter()
+        .find(|k| k.id == key_id)
+        .map(|e| e.name.clone())
+        .unwrap_or_default()
 }
 
 /// 进程级状态锁 + 内存权威副本（批次 E）：api_keys 的「读-改-写」（verify 记账 +
@@ -618,5 +735,180 @@ mod tests {
         assert_eq!(stored.keys[0].used_today, 1, "落盘含合并后的计数");
         assert!(!flush_dirty(&dir), "收敛后脏标记清除");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==================== issue #30 混合白名单 ====================
+
+    #[test]
+    fn split_pool_tagged_parses_prefix() {
+        assert_eq!(split_pool_tagged("trae:t1"), (Some("trae"), "t1"));
+        assert_eq!(split_pool_tagged("Trae:t1"), (Some("trae"), "t1"));
+        assert_eq!(split_pool_tagged("buddy:b1"), (Some("buddy"), "b1"));
+        // 裸 uid / 非法前缀（"openai:x" 中 openai 非法 → 整串视为裸 uid）
+        assert_eq!(split_pool_tagged("t1"), (None, "t1"));
+        assert_eq!(split_pool_tagged("openai:x"), (None, "openai:x"));
+    }
+
+    #[test]
+    fn pool_constraints_empty_whitelist_is_none() {
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.allowed_accounts = vec![];
+        e.dedicated_account = String::new();
+        let rk = constraints_of(&e);
+        assert!(rk.pool_constraints("trae").is_none());
+        assert!(rk.pool_constraints("buddy").is_none());
+    }
+
+    #[test]
+    fn pool_constraints_empty_whitelist_keeps_dedicated() {
+        // 回归修复（审查 #1）：空白名单 + 专一 → allowed=None 不限、dedicated 仍锁定
+        // （旧 wb_route/trae_pool_constraints 独立提取语义），不得被「白名单空 → None」吞掉
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.schedule_mode = MODE_DEDICATED.into();
+        e.allowed_accounts = vec![];
+        e.dedicated_account = "b9".into();
+        let rk = constraints_of(&e);
+        // bind=""：白名单仅作用 buddy 池（F-35），buddy=(不限, b9)、trae 不受限
+        let c = rk.pool_constraints("buddy").expect("buddy 专一约束应保留");
+        assert!(c.allowed.is_none(), "空白名单 = 不限，不得变成空集排除");
+        assert_eq!(c.dedicated.as_deref(), Some("b9"));
+        assert!(rk.pool_constraints("trae").is_none());
+
+        // bind="trae"：约束转到 trae 池
+        e.bind_pool = "trae".into();
+        e.dedicated_account = "t9".into();
+        let rk = constraints_of(&e);
+        let c = rk.pool_constraints("trae").expect("trae 专一约束应保留");
+        assert!(c.allowed.is_none());
+        assert_eq!(c.dedicated.as_deref(), Some("t9"));
+        assert!(rk.pool_constraints("buddy").is_none());
+    }
+
+    #[test]
+    fn pool_constraints_legacy_unbound_only_buddy() {
+        // 旧数据全裸 uid + bind=""：仅约束 buddy 池，trae 不受限（F-35 红线）
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.allowed_accounts = vec!["b1".into()];
+        let rk = constraints_of(&e);
+        let c = rk.pool_constraints("buddy").expect("buddy 应被约束");
+        assert!(c.allowed.is_some_and(|a| a.contains("b1") && a.len() == 1));
+        assert!(c.dedicated.is_none());
+        assert!(rk.pool_constraints("trae").is_none(), "旧 Key 白名单不得波及 trae");
+    }
+
+    #[test]
+    fn pool_constraints_bound_pools_unchanged() {
+        // 绑定 trae：裸 uid 约束 trae；buddy 不受限
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.bind_pool = "trae".into();
+        e.allowed_accounts = vec!["t1".into(), "t2".into()];
+        e.schedule_mode = MODE_DEDICATED.into();
+        e.dedicated_account = "t2".into();
+        let rk = constraints_of(&e);
+        let c = rk.pool_constraints("trae").expect("trae 应被约束");
+        let a = c.allowed.expect("白名单应为 Some");
+        assert!(a.contains("t1") && a.contains("t2"));
+        assert_eq!(c.dedicated.as_deref(), Some("t2"));
+        assert!(rk.pool_constraints("buddy").is_none());
+
+        // 绑定 buddy：对称
+        e.bind_pool = "buddy".into();
+        e.allowed_accounts = vec!["b1".into()];
+        e.dedicated_account = String::new();
+        let rk = constraints_of(&e);
+        let c = rk.pool_constraints("buddy").expect("buddy 应被约束");
+        assert!(c.allowed.is_some_and(|a| a.contains("b1")));
+        assert_eq!(c.dedicated.as_deref(), Some("b1"), "专一空 dedicated 回退 allowed 首个");
+        assert!(rk.pool_constraints("trae").is_none());
+    }
+
+    #[test]
+    fn pool_constraints_mixed_scopes_per_pool() {
+        // 混合白名单：trae/buddy 前缀条目各自作用域
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.allowed_accounts = vec!["trae:t1".into(), "buddy:b1".into(), "buddy:b2".into()];
+        let rk = constraints_of(&e);
+        assert!(rk.is_mixed_whitelist());
+
+        let ct = rk.pool_constraints("trae").expect("trae 应被约束");
+        assert!(ct.allowed.is_some_and(|a| a.contains("t1") && a.len() == 1));
+        assert!(ct.dedicated.is_none());
+
+        let cb = rk.pool_constraints("buddy").expect("buddy 应被约束");
+        assert!(cb.allowed.is_some_and(|a| a.contains("b1") && a.contains("b2") && a.len() == 2));
+        assert!(cb.dedicated.is_none());
+    }
+
+    #[test]
+    fn pool_constraints_mixed_missing_pool_excluded() {
+        // 混合白名单只勾 trae：buddy 零条目 = 排除（Some(空集)，非 None 不限）
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.allowed_accounts = vec!["trae:t1".into()];
+        let rk = constraints_of(&e);
+        let ct = rk.pool_constraints("trae").expect("trae 应被约束");
+        assert!(ct.allowed.is_some_and(|a| a.contains("t1")));
+        let cb = rk.pool_constraints("buddy").expect("buddy 应返回空集排除");
+        assert!(cb.allowed.is_some_and(|a| a.is_empty()), "零条目池应为空集（排除），而非不限");
+
+        // 对称：只勾 buddy
+        e.allowed_accounts = vec!["buddy:b1".into()];
+        let rk = constraints_of(&e);
+        let cb = rk.pool_constraints("buddy").expect("buddy 应被约束");
+        assert!(cb.allowed.is_some_and(|a| a.contains("b1")));
+        let ct = rk.pool_constraints("trae").expect("trae 应返回空集排除");
+        assert!(ct.allowed.is_some_and(|a| a.is_empty()));
+    }
+
+    #[test]
+    fn pool_constraints_mixed_legacy_uid_falls_back_to_buddy() {
+        // 防御：混合列表中混入裸 uid → 归属 buddy（F-35 旧语义兜底）
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.allowed_accounts = vec!["trae:t1".into(), "b9".into()];
+        let rk = constraints_of(&e);
+        let cb = rk.pool_constraints("buddy").expect("buddy 应被约束");
+        assert!(cb.allowed.is_some_and(|a| a.contains("b9")));
+        let ct = rk.pool_constraints("trae").expect("trae 应被约束");
+        assert!(ct.allowed.is_some_and(|a| a.contains("t1") && a.len() == 1));
+    }
+
+    #[test]
+    fn pool_constraints_mixed_dedicated_pins_pool() {
+        // 混合 + 专一（trae:t1）：归属池 trae 提取 dedicated 并入白名单；buddy 排除（锁池）
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.schedule_mode = MODE_DEDICATED.into();
+        e.allowed_accounts = vec!["trae:t1".into(), "buddy:b1".into()];
+        e.dedicated_account = "trae:t1".into();
+        let rk = constraints_of(&e);
+        let ct = rk.pool_constraints("trae").expect("归属池应被约束");
+        assert!(ct.allowed.is_some_and(|a| a.contains("t1")));
+        assert_eq!(ct.dedicated.as_deref(), Some("t1"), "dedicated 应去前缀");
+        let cb = rk.pool_constraints("buddy").expect("非归属池应返回空集排除");
+        assert!(cb.allowed.is_some_and(|a| a.is_empty()));
+        assert!(cb.dedicated.is_none());
+
+        // 专一空 dedicated 回退 allowed 首个（trae:t1）→ 仍锁 trae 排除 buddy
+        e.dedicated_account = String::new();
+        let rk = constraints_of(&e);
+        let ct = rk.pool_constraints("trae").expect("归属池应被约束");
+        assert!(ct.allowed.is_some_and(|a| a.contains("t1")));
+        assert_eq!(ct.dedicated.as_deref(), Some("t1"));
+        let cb = rk.pool_constraints("buddy").expect("非归属池应返回空集排除");
+        assert!(cb.allowed.is_some_and(|a| a.is_empty()));
+    }
+
+    #[test]
+    fn pool_constraints_mixed_dedicated_outside_whitelist() {
+        // 审查 #2 修复：专一账号不在勾选集 → 归属池白名单并入专一账号（预检不误杀）；
+        // 另一池锁池排除。场景：只勾 buddy:b1，专一手选 trae:t9
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.schedule_mode = MODE_DEDICATED.into();
+        e.allowed_accounts = vec!["buddy:b1".into()];
+        e.dedicated_account = "trae:t9".into();
+        let rk = constraints_of(&e);
+        let ct = rk.pool_constraints("trae").expect("归属池应被约束");
+        assert!(ct.allowed.is_some_and(|a| a.contains("t9") && !a.contains("b1")));
+        assert_eq!(ct.dedicated.as_deref(), Some("t9"));
+        let cb = rk.pool_constraints("buddy").expect("非归属池应返回空集排除");
+        assert!(cb.allowed.is_some_and(|a| a.is_empty()), "专一锁池：勾选集 b1 也不得放行");
     }
 }

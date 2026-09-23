@@ -322,13 +322,15 @@ pub fn resolve_target(
     let bind = key_rk.as_ref().and_then(|rk| rk.bind_pool());
     // 绑定 Key 的白名单健康预检（仅绑定池生效）：绑定池内若仅剩白名单外账号，
     // 选池阶段即判不健康走全局 fallback，而非取号阶段才失败。
-    // 未绑定 Key 维持现状——预检不感知白名单，F-35 约束由执行路径取号时自理
+    // issue #30 混合白名单：未绑定但带池前缀的 Key 同样预检感知（按前缀作用域
+    // 分池，零条目池 = 排除 → 预检不健康走 fallback）；旧未绑定 Key 维持现状——
+    // 预检不感知白名单，F-35 约束由执行路径取号时自理
     let key_allowed_for = |pool: TargetPool| -> Option<HashSet<String>> {
         let rk = key_rk.as_ref()?;
-        if bind.is_none() || !rk.constrains_pool(pool.as_str()) || rk.allowed_accounts.is_empty() {
+        if bind.is_none() && !rk.is_mixed_whitelist() {
             return None;
         }
-        Some(rk.allowed_accounts.iter().cloned().collect())
+        rk.pool_constraints(pool.as_str()).and_then(|c| c.allowed)
     };
 
     // 会话池粘性（§4.4 软粘，TTL 60s，内存态不落盘）：命中且池仍可用 → 直接沿用。
@@ -440,7 +442,23 @@ pub fn resolve_target(
             }
         }
     }
-    // 可用源全部耗尽（双源回退目标也不可用 / 源剔除后无源）
+    // 可用源全部耗尽（双源回退目标也不可用 / 源剔除后无源 / Key 白名单排除）：
+    // 落盘调度日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名）
+    {
+        let key_label = key_id
+            .map(|id| super::api_keys::key_name_for(&state.data_dir, id))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "anonymous".to_string());
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "dispatch exhausted: model={} key={} preferred={}",
+                model,
+                key_label,
+                preferred.map(|p| p.as_str()).unwrap_or("none"),
+            ),
+        );
+    }
     Err(DispatchError::NoHealthy(
         preferred.unwrap_or(TargetPool::Trae),
     ))

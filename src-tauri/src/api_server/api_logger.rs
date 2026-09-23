@@ -96,6 +96,9 @@ impl ApiLogger {
 
     /// 记录一条 API 请求日志
     /// `pool`：资源标识（"trae" / "buddy"），区分该请求由哪个上游资源池服务
+    /// `key_name`：请求所用 API Key 展示名（空 → "-"）
+    /// `acct_name`：实际服务的资源池账号名称（空 → "-"）
+    #[allow(clippy::too_many_arguments)]
     pub fn log_request(
         &self,
         pool: &str,
@@ -106,13 +109,16 @@ impl ApiLogger {
         status: u16,
         uid: &str,
         duration_ms: u64,
+        key_name: &str,
+        acct_name: &str,
         error: Option<&str>,
     ) {
-        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, None, error)
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, None, key_name, acct_name, error)
     }
 
     /// 记录一条 API 请求日志（流式请求带 TTFB 首字耗时字段）
     /// `ttfb_ms`：请求发起 → 上游首行到达的耗时；None 不输出该字段（旧格式兼容）
+    #[allow(clippy::too_many_arguments)]
     pub fn log_request_ttfb(
         &self,
         pool: &str,
@@ -124,11 +130,14 @@ impl ApiLogger {
         uid: &str,
         duration_ms: u64,
         ttfb_ms: Option<u64>,
+        key_name: &str,
+        acct_name: &str,
         error: Option<&str>,
     ) {
-        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, ttfb_ms, error)
+        self.log_request_inner(pool, method, path, model, stream, status, uid, duration_ms, ttfb_ms, key_name, acct_name, error)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log_request_inner(
         &self,
         pool: &str,
@@ -140,6 +149,8 @@ impl ApiLogger {
         uid: &str,
         duration_ms: u64,
         ttfb_ms: Option<u64>,
+        key_name: &str,
+        acct_name: &str,
         error: Option<&str>,
     ) {
         let now = SystemTime::now()
@@ -160,11 +171,14 @@ impl ApiLogger {
             Some(e) => format!(" error={}", e),
             None => String::new(),
         };
+        // 空名称（匿名 Key / 无可用账号）统一显示 "-"，保持字段可检索
+        let key_disp = if key_name.is_empty() { "-" } else { key_name };
+        let acct_disp = if acct_name.is_empty() { "-" } else { acct_name };
 
         let line = format!(
-            "[{:02}:{:02}:{:02}] {} {} pool={} model={} stream={} status={} uid={} {}ms{}{}\n",
+            "[{:02}:{:02}:{:02}] {} {} key={} pool={} model={} acct={} uid={} stream={} status={} {}ms{}{}\n",
             h, m, s,
-            method, path, pool, model, stream, status, uid_short, duration_ms, ttfb_part, err_part,
+            method, path, key_disp, pool, model, acct_disp, uid_short, stream, status, duration_ms, ttfb_part, err_part,
         );
 
         self.enqueue(line);
@@ -573,15 +587,19 @@ mod tests {
         let logger = ApiLogger::new(dir.clone());
         logger.log_request(
             "buddy", "POST", "/v1/chat/completions", "glm-5.3", true, 200,
-            "user-1234567890abcdef", 42, None,
+            "user-1234567890abcdef", 42, "测试Key", "账号A", None,
         );
         logger.log_request(
             "trae", "POST", "/v1/chat/completions", "glm-5.2", false, 503,
-            "none", 8, Some("no healthy account"),
+            "none", 8, "", "", Some("no healthy account"),
         );
         let content = logger.read_log(&today()).expect("log written");
         assert!(content.contains("pool=buddy model=glm-5.3"), "buddy 行需含资源标识与模型: {content}");
         assert!(content.contains("pool=trae model=glm-5.2"), "trae 行需含资源标识与模型: {content}");
+        assert!(content.contains("key=测试Key"), "需含 API Key 名: {content}");
+        assert!(content.contains("acct=账号A"), "需含账号名: {content}");
+        assert!(content.contains("key=- "), "空名称 Key 需显示占位符: {content}");
+        assert!(content.contains(" acct=- "), "空名称账号需显示占位符: {content}");
         assert!(content.contains("error=no healthy account"));
         let _ = fs::remove_dir_all(&dir);
     }

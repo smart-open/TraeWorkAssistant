@@ -383,6 +383,8 @@ fn run_wb_stream(
     start_ts: Instant,
     mut guard: InflightGuard,
 ) {
+    // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+    let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
     let sticky_key = SessionKey::from_body(&peek);
     // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
@@ -392,24 +394,11 @@ fn run_wb_stream(
 
     // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）。
     // issue #25 资源池绑定：仅当 Key 约束作用域含 buddy 池时应用（绑定 trae 的
-    // Key 白名单指 Trae 账号，不得误过滤 WB 池）
-    let key_constraints = super::api_keys::constraints_for(&state.data_dir, key_id);
-    let allowed_set: Option<HashSet<String>> = key_constraints
-        .as_ref()
-        .filter(|k| k.constrains_pool("buddy"))
-        .map(|k| k.allowed_accounts.iter().cloned().collect())
-        .filter(|s: &HashSet<String>| !s.is_empty());
-    let dedicated: Option<String> = key_constraints
-        .as_ref()
-        .filter(|k| k.constrains_pool("buddy") && k.schedule_mode == super::api_keys::MODE_DEDICATED)
-        .map(|k| {
-            if k.dedicated_account.is_empty() {
-                k.allowed_accounts.first().cloned().unwrap_or_default()
-            } else {
-                k.dedicated_account.clone()
-            }
-        })
-        .filter(|s: &String| !s.is_empty());
+    // Key 白名单指 Trae 账号，不得误过滤 WB 池）。
+    // issue #30 混合白名单：按前缀作用域提取 Buddy 条目（空集 = 排除，不得过滤）
+    let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
+        .and_then(|k| k.pool_constraints("buddy"))
+        .map_or((None, None), |c| (c.allowed, c.dedicated));
 
     // 粘性首轮：命中绑定且账号 healthy → 锁定账号与上游会话（双段分配）；
     // 子 Key 限定上游不含粘性账号时忽略粘性
@@ -466,7 +455,8 @@ fn run_wb_stream(
                     state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
                     state.logger.log_request(
                         "buddy", "POST", "/v2/chat/completions", model, true, 503, "none",
-                        duration_ms, Some("no healthy account"),
+                        duration_ms, &key_name, "",
+                        Some("no healthy account"),
                     );
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from(
                         "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
@@ -567,7 +557,8 @@ fn run_wb_stream(
                             }
                             state.logger.log_request_ttfb(
                                 "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
-                                duration_ms, Some(ttfb_ms), Some(&msg),
+                                duration_ms, Some(ttfb_ms), &key_name,
+                                &state.wb_pool.name_of(win_uid), Some(&msg),
                             );
                             return; // 已有数据流出：就地收尾
                         }
@@ -579,7 +570,8 @@ fn run_wb_stream(
                                 // 失败计入冷却会造成账号过度冷却
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
-                                    duration_ms, Some(ttfb_ms), Some("流内失败已透传客户端"),
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.wb_pool.name_of(win_uid), Some("流内失败已透传客户端"),
                                 );
                                 return;
                             }
@@ -590,7 +582,8 @@ fn run_wb_stream(
                             state.wb_sticky.save(&state.data_dir);
                             state.logger.log_request_ttfb(
                                 "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
-                                duration_ms, Some(ttfb_ms), None,
+                                duration_ms, Some(ttfb_ms), &key_name,
+                                &state.wb_pool.name_of(win_uid), None,
                             );
                             return;
                         }
@@ -632,6 +625,7 @@ fn run_wb_stream(
                             state.logger.log_request(
                                 "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
                                 start_ts.elapsed().as_millis() as u64,
+                                &key_name, &state.wb_pool.name_of(&picked.uid),
                                 Some(&format!("upstream status={}", status)),
                             );
                             break; // 换号
@@ -641,6 +635,7 @@ fn run_wb_stream(
                             state.logger.log_request(
                                 "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
                                 start_ts.elapsed().as_millis() as u64,
+                                &key_name, &state.wb_pool.name_of(&picked.uid),
                                 Some(&msg),
                             );
                             send_stream_error_wb(tx, proto, status as i64, &msg);
@@ -671,6 +666,8 @@ pub async fn wb_aggregate_chat(
     let result = super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
+        // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
         let sticky_key = SessionKey::from_body(&peek);
         // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
@@ -678,24 +675,10 @@ pub async fn wb_aggregate_chat(
         let templates = load_templates(&state);
         let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
-        // F-35 子 Key 约束（与非流式同款）
-        let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_id);
-        let allowed_set: Option<HashSet<String>> = key_constraints
-            .as_ref()
-            .filter(|k| k.constrains_pool("buddy"))
-            .map(|k| k.allowed_accounts.iter().cloned().collect())
-            .filter(|s: &HashSet<String>| !s.is_empty());
-        let dedicated: Option<String> = key_constraints
-            .as_ref()
-            .filter(|k| k.constrains_pool("buddy") && k.schedule_mode == super::api_keys::MODE_DEDICATED)
-            .map(|k| {
-                if k.dedicated_account.is_empty() {
-                    k.allowed_accounts.first().cloned().unwrap_or_default()
-                } else {
-                    k.dedicated_account.clone()
-                }
-            })
-            .filter(|s: &String| !s.is_empty());
+        // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
+        let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
+            .and_then(|k| k.pool_constraints("buddy"))
+            .map_or((None, None), |c| (c.allowed, c.dedicated));
 
         let sticky0: Option<(String, String)> = state
             .wb_sticky
@@ -822,7 +805,8 @@ pub async fn wb_aggregate_chat(
                                 state.wb_sticky.save(&state.data_dir);
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
-                                    duration_ms, Some(ttfb_ms), None,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.wb_pool.name_of(win_uid), None,
                                 );
                                 return Ok(r);
                             }
@@ -837,7 +821,8 @@ pub async fn wb_aggregate_chat(
                                 state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
-                                    duration_ms, Some(ttfb_ms), Some(&msg),
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.wb_pool.name_of(win_uid), Some(&msg),
                                 );
                                 // 流内错误且未产出内容 → 换号重试
                                 break;
@@ -848,7 +833,8 @@ pub async fn wb_aggregate_chat(
                                 state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
-                                    duration_ms, Some(ttfb_ms), Some("empty response"),
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.wb_pool.name_of(win_uid), Some("empty response"),
                                 );
                                 break;
                             }
@@ -886,6 +872,7 @@ pub async fn wb_aggregate_chat(
                                 state.logger.log_request(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
+                                    &key_name, &state.wb_pool.name_of(&picked.uid),
                                     Some(&format!("upstream status={}", status)),
                                 );
                                 break;
@@ -894,6 +881,7 @@ pub async fn wb_aggregate_chat(
                                 state.logger.log_request(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
+                                    &key_name, &state.wb_pool.name_of(&picked.uid),
                                     Some(&safe_slice(&resp_body, 300)),
                                 );
                                 return Err(format!(
@@ -989,30 +977,18 @@ pub async fn wb_tool_exec_chat(
         // inflight guard 随后台任务存续至编排完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
         let model = model_inner;
+        // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let templates = load_templates(&state);
         let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         super::wb_toolexec::inject_proxy_tools(&mut chat_body);
         // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
         log_longctx_hint(&state, &chat_body, &model);
 
-        // F-35 子 Key 约束（与非流式同款）
-        let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_id);
-        let allowed_set: Option<HashSet<String>> = key_constraints
-            .as_ref()
-            .filter(|k| k.constrains_pool("buddy"))
-            .map(|k| k.allowed_accounts.iter().cloned().collect())
-            .filter(|s: &HashSet<String>| !s.is_empty());
-        let dedicated: Option<String> = key_constraints
-            .as_ref()
-            .filter(|k| k.constrains_pool("buddy") && k.schedule_mode == super::api_keys::MODE_DEDICATED)
-            .map(|k| {
-                if k.dedicated_account.is_empty() {
-                    k.allowed_accounts.first().cloned().unwrap_or_default()
-                } else {
-                    k.dedicated_account.clone()
-                }
-            })
-            .filter(|s: &String| !s.is_empty());
+        // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
+        let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
+            .and_then(|k| k.pool_constraints("buddy"))
+            .map_or((None, None), |c| (c.allowed, c.dedicated));
 
         let catalog = super::wb_catalog::load(&state.data_dir);
         let effort = super::wb_catalog::find(&catalog, &model)
@@ -1235,7 +1211,7 @@ pub async fn wb_tool_exec_chat(
                 state.record_usage_ttfb(true, &model, usage_uid, &key_id, true, stream, duration_ms, pt, ct, last_ttfb_ms);
                 state.logger.log_request_ttfb(
                     "buddy", "POST", "/v1/responses", &model, stream, 200, usage_uid,
-                    duration_ms, last_ttfb_ms,
+                    duration_ms, last_ttfb_ms, &key_name, &state.wb_pool.name_of(usage_uid),
                     Some(&format!("rounds={} searches={}", records.len(), records.iter().filter(|r| r.tool == super::wb_toolexec::TOOL_SEARCH).count())),
                 );
                 // Responses 投影：web_search_call 历史项前置
@@ -1247,7 +1223,7 @@ pub async fn wb_tool_exec_chat(
                 state.record_usage(true, &model, "wb-toolexec", &key_id, false, stream, duration_ms, 0, 0);
                 state.logger.log_request(
                     "buddy", "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
-                    duration_ms, last_err.as_deref(),
+                    duration_ms, &key_name, "", last_err.as_deref(),
                 );
                 Err(last_err.unwrap_or_else(|| "no healthy account available".to_string()))
             }

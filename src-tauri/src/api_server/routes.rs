@@ -905,6 +905,8 @@ async fn images_entry(
     let image_b64 = peek.get("image").and_then(|v| v.as_str()).map(str::to_string);
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
     let start_ts = std::time::Instant::now();
+    // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+    let key_name = super::api_keys::key_name_for(&state.data_dir, &key_str);
 
     // 校验（目录命中 + 图片模态 + prompt/image 非空）
     let catalog = wb_catalog::load(&state.data_dir);
@@ -925,27 +927,11 @@ async fn images_entry(
     // 约束（P1 修复4c）：白名单 allowed_accounts 过滤 + dedicated 专一锁定，
     // 与 wb_route 同款解析；Key 无约束/匿名（constraints_for 为 None）时不限制。
     // issue #25 资源池绑定：Key 绑定 trae 时约束作用域不在 WB 池（白名单空），
-    // 生图仍用 WB 池但不应用 Trae 账号白名单（避免误过滤）
-    let (allowed_set, dedicated) = {
-        let key_constraints = super::api_keys::constraints_for(&state.data_dir, &key_str);
-        let allowed: Option<HashSet<String>> = key_constraints
-            .as_ref()
-            .filter(|k| k.constrains_pool("buddy"))
-            .map(|k| k.allowed_accounts.iter().cloned().collect())
-            .filter(|s: &HashSet<String>| !s.is_empty());
-        let dedicated: Option<String> = key_constraints
-            .as_ref()
-            .filter(|k| k.constrains_pool("buddy") && k.schedule_mode == super::api_keys::MODE_DEDICATED)
-            .map(|k| {
-                if k.dedicated_account.is_empty() {
-                    k.allowed_accounts.first().cloned().unwrap_or_default()
-                } else {
-                    k.dedicated_account.clone()
-                }
-            })
-            .filter(|s: &String| !s.is_empty());
-        (allowed, dedicated)
-    };
+    // 生图仍用 WB 池但不应用 Trae 账号白名单（避免误过滤）。
+    // issue #30 混合白名单：按前缀作用域提取 Buddy 条目（空集 = 排除，不得过滤）
+    let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_str)
+        .and_then(|k| k.pool_constraints("buddy"))
+        .map_or((None, None), |c| (c.allowed, c.dedicated));
     let picked = {
         let tried = HashSet::new();
         state
@@ -985,7 +971,8 @@ async fn images_entry(
             state.logger.log_request(
                 "buddy", "POST",
                 if is_edit { "/v1/images/edits" } else { "/v1/images/generations" },
-                &model, false, 200, &picked.uid, duration_ms, None,
+                &model, false, 200, &picked.uid, duration_ms, &key_name,
+                &state.wb_pool.name_of(&picked.uid), None,
             );
             Response::builder()
                 .header("content-type", "application/json")
@@ -997,7 +984,8 @@ async fn images_entry(
             state.logger.log_request(
                 "buddy", "POST",
                 if is_edit { "/v1/images/edits" } else { "/v1/images/generations" },
-                &model, false, code, &picked.uid, duration_ms, Some(&msg),
+                &model, false, code, &picked.uid, duration_ms, &key_name,
+                &state.wb_pool.name_of(&picked.uid), Some(&msg),
             );
             openai_error(
                 StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -1011,31 +999,17 @@ async fn images_entry(
 // ==================== Streaming ====================
 
 /// issue #25 资源池绑定：Key 绑定 trae 时 F-35 约束（白名单/专一）作用于 Trae 池；
-/// 其余情况（未绑定/绑定 buddy/匿名）返回 (None, None) = 不限制。
+/// 其余情况（未绑定旧语义/绑定 buddy/匿名）返回 (None, None) = 不限制。
 /// F-35 旧语义兼容：未绑定 Key 的白名单历来只作用 WB 池，绝不能波及 Trae。
-/// pub(crate) 供 dispatch 测试模块复用 Fixture 覆盖四种作用域
+/// issue #30 混合白名单：带池前缀的未绑定 Key 按前缀作用域提取 Trae 条目
+/// （零条目 = 空集排除）。pub(crate) 供 dispatch 测试模块复用 Fixture 覆盖四种作用域
 pub(crate) fn trae_pool_constraints(
     state: &ApiSharedState,
     key_id: &str,
 ) -> (Option<HashSet<String>>, Option<String>) {
-    let Some(kc) = super::api_keys::constraints_for(&state.data_dir, key_id) else {
-        return (None, None);
-    };
-    if !kc.constrains_pool("trae") {
-        return (None, None);
-    }
-    let allowed: Option<HashSet<String>> = (!kc.allowed_accounts.is_empty())
-        .then(|| kc.allowed_accounts.iter().cloned().collect());
-    let dedicated: Option<String> = (kc.schedule_mode == super::api_keys::MODE_DEDICATED)
-        .then(|| {
-            if kc.dedicated_account.is_empty() {
-                kc.allowed_accounts.first().cloned().unwrap_or_default()
-            } else {
-                kc.dedicated_account.clone()
-            }
-        })
-        .filter(|s| !s.is_empty());
-    (allowed, dedicated)
+    super::api_keys::constraints_for(&state.data_dir, key_id)
+        .and_then(|kc| kc.pool_constraints("trae"))
+        .map_or((None, None), |c| (c.allowed, c.dedicated))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1081,6 +1055,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut guard = guard;
         // 主任务结束（含 panic 展开）→ 通知 keep-alive ticker 退出（P1 修复3）
         let _done = DoneSignal(done_tx);
+        // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let chat_id = match proto {
             Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
             Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
@@ -1138,6 +1114,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     504, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    &key_name, &state.pool.name_of(&picked.uid),
                                     Some("first byte timeout"),
                                 );
                                 break; // 换号
@@ -1208,7 +1185,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             }
                             state.logger.log_request_ttfb(
                                 "trae", "POST", proto.log_path(), &model, stream,
-                                200, &picked.uid, duration_ms, ttfb_ms, Some(&msg),
+                                200, &picked.uid, duration_ms, ttfb_ms, &key_name,
+                                &state.pool.name_of(&picked.uid), Some(&msg),
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                 state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
@@ -1217,7 +1195,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             state.pool.note_success(&picked.uid);
                             state.logger.log_request_ttfb(
                                 "trae", "POST", proto.log_path(), &model, stream,
-                                200, &picked.uid, duration_ms, ttfb_ms, None,
+                                200, &picked.uid, duration_ms, ttfb_ms, &key_name,
+                                &state.pool.name_of(&picked.uid), None,
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                 state.logger.log_debug(&picked.uid, &converted, None, 200, None);
@@ -1260,6 +1239,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                             state.logger.log_request(
                                                 "trae", "POST", proto.log_path(), &model, stream,
                                                 status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                                &key_name, &state.pool.name_of(&picked.uid),
                                                 Some(&format!("401 自愈刷新失败: {}", e)),
                                             );
                                         }
@@ -1278,6 +1258,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    &key_name, &state.pool.name_of(&picked.uid),
                                     Some(&format!("upstream status={}", status)),
                                 );
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1291,6 +1272,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    &key_name, &state.pool.name_of(&picked.uid),
                                     Some(&msg),
                                 );
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1321,7 +1303,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             .collect();
         state.logger.log_request(
             "trae", "POST", proto.log_path(), &model, stream,
-            503, "none", duration_ms, Some("no healthy account"),
+            503, "none", duration_ms, &key_name, "",
+            Some("no healthy account"),
         );
         // 写入 app.log 供排查
         {
@@ -1402,6 +1385,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
     let result = super::stream_runtime().spawn_blocking(move || {
         // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
         let mut guard = guard;
+        // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
@@ -1456,7 +1441,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 state.pool.note_success(&picked.uid);
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
-                                    200, &picked.uid, duration_ms, None,
+                                    200, &picked.uid, duration_ms, &key_name,
+                                    &state.pool.name_of(&picked.uid), None,
                                 );
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                     state.logger.log_debug(&picked.uid, &converted, Some(r.to_string().as_bytes()), 200, None);
@@ -1474,7 +1460,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 );
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
-                                    200, &picked.uid, duration_ms, Some(&msg),
+                                    200, &picked.uid, duration_ms, &key_name,
+                                    &state.pool.name_of(&picked.uid), Some(&msg),
                                 );
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                     state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
@@ -1489,7 +1476,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 );
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
-                                    502, &picked.uid, duration_ms, Some("empty response"),
+                                    502, &picked.uid, duration_ms, &key_name,
+                                    &state.pool.name_of(&picked.uid), Some("empty response"),
                                 );
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                     state.logger.log_debug(&picked.uid, &converted, None, 502, Some("empty response"));
@@ -1533,6 +1521,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                             state.logger.log_request(
                                                 "trae", "POST", proto.log_path(), &model, stream,
                                                 status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                                &key_name, &state.pool.name_of(&picked.uid),
                                                 Some(&format!("401 自愈刷新失败: {}", e)),
                                             );
                                         }
@@ -1549,6 +1538,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    &key_name, &state.pool.name_of(&picked.uid),
                                     Some(&format!("upstream status={}", status)),
                                 );
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1562,6 +1552,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                    &key_name, &state.pool.name_of(&picked.uid),
                                     Some(&msg),
                                 );
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1591,7 +1582,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             .collect();
         state.logger.log_request(
             "trae", "POST", proto.log_path(), &model, stream,
-            503, "none", duration_ms, Some("no healthy account"),
+            503, "none", duration_ms, &key_name, "",
+            Some("no healthy account"),
         );
         // 写入诊断日志
         {

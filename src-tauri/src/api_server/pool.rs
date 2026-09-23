@@ -379,7 +379,8 @@ impl ApiPool {
 
     /// 带 Key 约束取号（F-35 子 Key 体系，批次3）：
     /// - `dedicated`：专一模式绑定 uid（healthy 即直接锁定，绕过策略）
-    /// - `allowed`：上游白名单过滤（None = 不限；`Some(空集)` = 过滤全部——调用方须先过滤空集）
+    /// - `allowed`：上游白名单过滤（None = 不限；`Some(空集)` = 过滤全部——
+    ///   issue #30 混合白名单借空集表达「该池被此 Key 排除」，调用方可有意传入）
     /// - 调度策略沿用池当前策略（子 Key「临期优先」= 池默认 expire_first，
     ///   池策略本身即用户可选的临期/积分/加权等模式；约束仅做过滤与锁定）
     pub fn pick_excluding_constrained(
@@ -586,6 +587,14 @@ impl ApiPool {
         }
     }
 
+    /// 按 uid 取账号展示名（请求日志用）；不在池中返回空串（日志侧显示 "-"）
+    pub fn name_of(&self, uid: &str) -> String {
+        safe_lock(&self.entries)
+            .get(uid)
+            .map(|e| e.name.clone())
+            .unwrap_or_default()
+    }
+
     /// F-78 批次 3：refresh_token 判定失效 → 运行时禁用（前端 refresh_jwt 失败联动；
     /// 持久化标记由 record_refresh_failure 写 accounts 文件，重启后经 sync_from_accounts 同步）
     pub fn note_refresh_invalid(&self, uid: &str) {
@@ -705,8 +714,8 @@ impl ApiPool {
     /// 同 [has_selectable]，附加 Key 级 uid 白名单过滤（issue #25 资源池绑定）：
     /// 绑定池 Key 的健康预检须感知白名单——池内仅剩白名单外账号时视为该池
     /// 对此 Key 不健康，走全局 fallback 开关回退另一池，而非取号阶段才失败。
-    /// `allowed`：uid 白名单（None = 不限；`Some(空集)` = 过滤全部——调用方须先
-    /// 过滤空集，语义同 pick_excluding_constrained）
+    /// `allowed`：uid 白名单（None = 不限；`Some(空集)` = 过滤全部，即该池对此
+    /// Key 不健康——issue #30 混合白名单的有意传参，语义同 pick_excluding_constrained）
     pub fn has_selectable_in(&self, allowed: Option<&HashSet<String>>) -> bool {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
