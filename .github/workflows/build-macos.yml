@@ -109,8 +109,33 @@ jobs:
         run: |
           node -e "const fs=require('fs');fs.writeFileSync('tauri.signing.conf.json',JSON.stringify({bundle:{macOS:{signingIdentity:process.env.SIGNING_IDENTITY}}},null,2))"
 
-      - name: Build Tauri app (dmg only)
-        run: npm run tauri build -- --target ${{ matrix.target }} --bundles dmg --config tauri.signing.conf.json
+      # bundle_dmg.sh（hdiutil 挂载 + Finder AppleScript）在 GitHub 托管 runner 上偶发失败
+      # （同 run 内其余 matrix job 成功、仅单 job dmg 步骤失败，tauri-action#801 同签名）。
+      # cargo target 有缓存，重试只重打包不重编译；两次尝试间清理残留挂载卷与临时 dmg。
+      - name: Build Tauri app (dmg only, retry against flaky bundle_dmg.sh)
+        run: |
+          set -e
+          BUNDLE_DMG_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+          for attempt in 1 2 3; do
+            echo "::group::tauri build (attempt $attempt)"
+            set +e
+            npm run tauri build -- --target ${{ matrix.target }} --bundles dmg --config tauri.signing.conf.json
+            status=$?
+            set -e
+            echo "::endgroup::"
+            if [ "$status" -eq 0 ]; then
+              echo "tauri build succeeded on attempt $attempt"
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "tauri build failed after 3 attempts (last exit $status)"
+              exit "$status"
+            fi
+            echo "attempt $attempt failed (exit $status), cleaning stale dmg state and retrying..."
+            hdiutil detach "/Volumes/AI Work 助手" -force || true
+            rm -f "$BUNDLE_DMG_DIR"/rw.*.dmg || true
+            sleep 10
+          done
 
       - name: Rename & manifest（本任务架构 dmg 缺失即失败，其余产物仅 WARN）
         run: node scripts/rename_release.mjs
