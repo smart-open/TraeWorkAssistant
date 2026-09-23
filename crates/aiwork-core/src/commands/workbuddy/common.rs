@@ -78,6 +78,11 @@ pub struct WorkBuddyAccount {
     pub credits_balance: Option<f64>,
     #[serde(default)]
     pub credits_fetched_at: Option<String>,
+    /// 最早积分包到期时间缓存（Unix 秒；积分查询/每日快照回写）：
+    /// 剩余>0 且未过期包取 min，Buddy 不分包类型（issue #28 调度口径）；
+    /// None = 无到期信息或全部包长期有效，键值随每次回写覆盖（不留 stale）
+    #[serde(default)]
+    pub credits_expire_at: Option<i64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -195,7 +200,7 @@ pub(super) fn save_pool(state: &AppState, pool: &WbPool) -> Result<(), String> {
     crate::store::docs::wb_pool_save(&crate::store::db(&state.data_dir), &v)
 }
 
-pub(super) fn load_settings(state: &AppState) -> WorkBuddySettings {
+pub(crate) fn load_settings(state: &AppState) -> WorkBuddySettings {
     // SQLite 化（P2）：workbuddy_settings.json → kv `workbuddy_settings`
     let mut s: WorkBuddySettings = crate::store::db(&state.data_dir).kv_get("workbuddy_settings");
     // 审查 P2：单字段非法只钳制该字段为默认值，不再整体 with_defaults() 重置

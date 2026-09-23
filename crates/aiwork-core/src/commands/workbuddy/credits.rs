@@ -33,16 +33,40 @@ pub fn workbuddy_credits_fetch(state: &AppState, user_id: Option<String>, fresh:
 fn write_back_pool_balances(state: &AppState, parsed: &Value) {
     if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
         let mut pool = load_pool(state);
+        let now_ts = chrono::Utc::now().timestamp();
         for acc in accounts {
             let uid = acc.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
             let bal = acc.get("balance").and_then(|v| v.as_f64());
             if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == uid) {
                 a.credits_balance = bal;
                 a.credits_fetched_at = acc.get("fetched_at").and_then(|v| v.as_str()).map(|s| s.to_string());
+                // 最早积分包到期（issue #28 API 网关调度口径，Buddy 不分包类型）：
+                // 仅成功取数的账号回写，失败（ok=false）保留旧值防误清
+                let ok = acc.get("ok").and_then(Value::as_bool).unwrap_or(true);
+                if ok {
+                    a.credits_expire_at = earliest_pack_expire(acc, now_ts);
+                }
             }
         }
         let _ = save_pool(state, &pool);
     }
+}
+
+/// 派生账号积分包最早到期（纯函数，便于单测）：
+/// packages[]{remaining, expire_ts} 中剩余>0 且未过期的包取 min；
+/// 无到期时间的包视为长期有效不参与；全部长期有效/无包信息 → None
+fn earliest_pack_expire(acc: &Value, now_ts: i64) -> Option<i64> {
+    acc.get("packages")
+        .and_then(|v| v.as_array())
+        .and_then(|pkgs| {
+            pkgs.iter()
+                .filter_map(|p| {
+                    let rem = p.get("remaining").and_then(Value::as_f64)?;
+                    let exp = p.get("expire_ts").and_then(Value::as_i64)?;
+                    (rem > 0.0 && exp > now_ts).then_some(exp)
+                })
+                .min()
+        })
 }
 
 /// 每日积分余额快照任务（调度器 `wb-credits-snapshot`；补齐近 7 日用量时序的关键）：
@@ -952,5 +976,37 @@ mod credits_tests {
         assert_eq!(parse_reward_plus("签到成功"), None);
         assert_eq!(parse_reward_plus("已签到"), None);
         assert_eq!(parse_reward_plus("签到成功 +0"), None);
+    }
+
+    // ── earliest_pack_expire（issue #28：Buddy 调度到期派生）────────────────
+
+    #[test]
+    fn earliest_pack_expire_takes_min_of_valid_packs() {
+        let acc = serde_json::json!({"packages": [
+            {"remaining": 10.0, "expire_ts": 2000},
+            {"remaining": 5.0, "expire_ts": 1000}
+        ]});
+        assert_eq!(earliest_pack_expire(&acc, 500), Some(1000));
+    }
+
+    #[test]
+    fn earliest_pack_expire_skips_drained_expired_and_no_expiry() {
+        // 已用完 / 已过期 / 无到期时间（长期有效）的包均不参与，Buddy 不分包类型
+        let acc = serde_json::json!({"packages": [
+            {"remaining": 0.0, "expire_ts": 900},
+            {"remaining": 8.0, "expire_ts": 400},
+            {"remaining": 8.0},
+            {"remaining": 3.0, "expire_ts": 1500}
+        ]});
+        assert_eq!(earliest_pack_expire(&acc, 500), Some(1500));
+    }
+
+    #[test]
+    fn earliest_pack_expire_none_without_valid_packages() {
+        assert_eq!(
+            earliest_pack_expire(&serde_json::json!({"packages": []}), 500),
+            None
+        );
+        assert_eq!(earliest_pack_expire(&serde_json::json!({}), 500), None);
     }
 }

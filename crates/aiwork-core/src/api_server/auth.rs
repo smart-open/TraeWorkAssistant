@@ -123,6 +123,8 @@ fn log_reject(state: &ApiSharedState, request: &Request, status: u16, reason: &s
         status,
         "-",
         0,
+        "",
+        "",
         Some(reason),
     );
 }

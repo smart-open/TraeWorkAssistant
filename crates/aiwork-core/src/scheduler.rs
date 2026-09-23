@@ -45,6 +45,9 @@ const TASKS: &[SchedTask] = &[
     SchedTask { key: "models-sync", name: "Trae 模型列表同步", hhmm: "05:40" },
     SchedTask { key: "trae-checkin", name: "Trae 每日签到", hhmm: "09:00" },
     SchedTask { key: "wb-checkin", name: "WorkBuddy 每日签到", hhmm: "09:10" },
+    // WorkBuddy 每日成长（issue #27 随 ad63bdc 移植）：成长三开关驱动（旅行/盲盒/任务），
+    // 全关时空轮无副作用；启用/时刻经 scheduler_cfg 配置（默认开 + 09:00）
+    SchedTask { key: "wb-growth", name: "WorkBuddy 每日成长", hhmm: "09:00" },
     // F-09 兜底续期：lazy 24h（到期前 24h 内才真正刷新），每天跑一次是安全超集
     SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30" },
     // 快照类排到晚间（接近日末，差分口径最准）
@@ -273,6 +276,21 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 &mut |_| {},
             ))
         }
+        // WorkBuddy 每日成长：成长三开关驱动，抢轮次锁与 UI 路径互斥
+        "wb-growth" => {
+            let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
+                return Err("跳过：已有签到/成长任务在执行中".into());
+            };
+            let s = crate::commands::workbuddy::load_settings(st);
+            let flags = crate::tasks::wb_checkin::GrowthOpts {
+                travel: s.growth_travel,
+                lottery: s.growth_lottery,
+                tasks: s.growth_tasks,
+            };
+            // run_growth_round 为 NDJSON 推进式输出（无汇总返回值），调度日志记 ok 概要即可
+            crate::tasks::wb_checkin::run_growth_round(st, &flags, &[], &mut |_| {});
+            Ok(json!({ "ok": true }))
+        }
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
         "wb-renew" => Ok(crate::tasks::wb_checkin::run_renew_only(st, 24)),
         // WorkBuddy 积分余额每日快照：补齐近 7 日消耗差分时序
@@ -308,35 +326,25 @@ fn run_models_sync(st: &AppState) -> Result<Value, String> {
     }
 }
 
-/// Trae JWT 自动续期（T8 新增）：遍历 vault 账号逐个调 refresh_jwt_impl(force=false)。
-/// 48h lazy gate 在 impl 内生效（JWT 剩余有效期 > 48h 时直接返回「暂无需刷新」，零网络请求）；
-/// invalid（refresh_token 被服务端吊销/明确拒绝）计入「需重新 OAuth」摘要，由人工重新录入。
+/// Trae JWT 自动续期（issue #27 方案 A 编排）：委托 `renew_due_accounts_impl`
+///（lazy 48h 惰性门前置预筛 + 全失败返回 Err 触发调度器 30 分钟重试；
+/// invalid 账号由 impl 入口拦截计 skipped，无重试风暴）。此处仅映射计数 JSON
+/// 为调度摘要（summarize 优先取 summary 字段）。
 fn run_trae_jwt_renew(st: &AppState) -> Result<Value, String> {
-    let accts = crate::vault::load_accounts(st);
-    let mut renewed = 0usize;
-    let mut lazy_skipped = 0usize;
-    let mut need_reauth = 0usize;
-    let mut no_refresh_token = 0usize;
-    let mut failed = 0usize;
-    for a in &accts.accounts {
-        let Some(uid) = a.user_id.as_deref() else { continue };
-        match accounts::refresh_jwt_impl(st, uid, false) {
-            Ok(_) => renewed += 1,
-            Err(e) if e.contains("暂无需刷新") => lazy_skipped += 1,
-            Err(e) if e.contains("需重新 OAuth") => need_reauth += 1,
-            Err(e) if e.contains("无 refresh_token") => no_refresh_token += 1,
-            Err(_) => failed += 1,
-        }
-    }
+    let v = accounts::renew_due_accounts_impl(st)?;
+    let get = |k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
     Ok(json!({
         "summary": format!(
-            "续期 {renewed}，门跳过 {lazy_skipped}，需重新 OAuth {need_reauth}，无凭据 {no_refresh_token}，失败 {failed}"
+            "续期 {}，跳过 {}，无凭据 {}，失败 {}",
+            get("refreshed"),
+            get("skipped"),
+            get("no_refresh_token"),
+            get("failed"),
         ),
-        "renewed": renewed,
-        "lazy_skipped": lazy_skipped,
-        "need_reauth": need_reauth,
-        "no_refresh_token": no_refresh_token,
-        "failed": failed,
+        "renewed": get("refreshed"),
+        "skipped": get("skipped"),
+        "no_refresh_token": get("no_refresh_token"),
+        "failed": get("failed"),
     }))
 }
 

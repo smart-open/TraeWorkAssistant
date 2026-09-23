@@ -141,6 +141,9 @@ pub fn custom_stream_chat(
     super::stream_runtime().spawn_blocking(move || {
         let _inflight = guard; // 随后台任务存续至流结束（§4.5）
         let chat_id = chat_id_for(proto);
+        // 请求日志附带：API Key 展示名 + 自定义模型名（即"账号"，匿名 → "-"）
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        let acct_name = cm.name.clone();
 
         // SSE keep-alive 15s：防中间层回收长流（与 WB/solo 路径同策略）。
         // P1 修复：与 routes.rs 同款 watch + DoneSignal 方案，替换旧 AtomicBool
@@ -192,12 +195,12 @@ pub fn custom_stream_chat(
                         set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
                         state.logger.log_request(
                             "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                            duration_ms, Some(&msg),
+                            duration_ms, &key_name, &acct_name, Some(&msg),
                         );
                     } else {
                         state.logger.log_request(
                             "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                            duration_ms, None,
+                            duration_ms, &key_name, &acct_name, None,
                         );
                     }
                 }
@@ -207,7 +210,7 @@ pub fn custom_stream_chat(
                     state.record_usage_custom(&model, &key_id, false, true, duration_ms, 0, 0);
                     state.logger.log_request(
                         "custom", "POST", proto.log_path(), &model, true, 504, "custom",
-                        duration_ms, Some("first byte timeout"),
+                        duration_ms, &key_name, &acct_name, Some("first byte timeout"),
                     );
                     send_stream_error(&tx, proto, 504, "自定义上游 10 秒内未响应（首字超时）");
                 }
@@ -219,7 +222,7 @@ pub fn custom_stream_chat(
                 set_last_error(&state, format!("custom model={} status={} body={}", model, status, preview));
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, true, status, "custom",
-                    duration_ms, Some(&format!("upstream status={}", status)),
+                    duration_ms, &key_name, &acct_name, Some(&format!("upstream status={}", status)),
                 );
                 let msg = format!("自定义上游错误（status {}）：{}", status, preview);
                 send_stream_error(&tx, proto, status as i64, &msg);
@@ -261,6 +264,9 @@ pub async fn custom_aggregate_chat(
     // 与 WB/solo 聚合同口径迁入 stream_runtime 专用阻塞池，不占主池短任务槽
     let result = super::stream_runtime().spawn_blocking(move || {
         let _inflight = guard; // 随聚合完成释放（§4.5）
+        // 请求日志附带：API Key 展示名 + 自定义模型名（即"账号"，匿名 → "-"）
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        let acct_name = cm.name.clone();
         let prepared = prep_body(&body_vec, &cm);
         let reader = match make_custom_request(&cm, &prepared) {
             Ok(r) => r,
@@ -271,7 +277,7 @@ pub async fn custom_aggregate_chat(
                 set_last_error(&state, format!("custom model={} status={} body={}", model, status, preview));
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, status, "custom",
-                    duration_ms, Some(&format!("upstream status={}", status)),
+                    duration_ms, &key_name, &acct_name, Some(&format!("upstream status={}", status)),
                 );
                 return Err(format!("自定义上游错误（status {}）：{}", status, preview));
             }
@@ -283,7 +289,7 @@ pub async fn custom_aggregate_chat(
                 state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 504, "custom",
-                    duration_ms, Some("first byte timeout"),
+                    duration_ms, &key_name, &acct_name, Some("first byte timeout"),
                 );
                 return Err("自定义上游 10 秒内未响应（首字超时）".into());
             }
@@ -296,7 +302,8 @@ pub async fn custom_aggregate_chat(
                 let (pt, ct) = r.get("usage").map(usage_pair).unwrap_or((0, 0));
                 state.record_usage_custom(&model, &key_id, true, stream, duration_ms, pt, ct);
                 state.logger.log_request(
-                    "custom", "POST", proto.log_path(), &model, stream, 200, "custom", duration_ms, None,
+                    "custom", "POST", proto.log_path(), &model, stream, 200, "custom", duration_ms,
+                    &key_name, &acct_name, None,
                 );
                 Ok(r)
             }
@@ -305,7 +312,7 @@ pub async fn custom_aggregate_chat(
                 set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 200, "custom",
-                    duration_ms, Some(&msg),
+                    duration_ms, &key_name, &acct_name, Some(&msg),
                 );
                 Err(msg)
             }
@@ -313,7 +320,7 @@ pub async fn custom_aggregate_chat(
                 state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0);
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 502, "custom",
-                    duration_ms, Some("empty response"),
+                    duration_ms, &key_name, &acct_name, Some("empty response"),
                 );
                 Err("自定义上游返回为空".into())
             }

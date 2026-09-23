@@ -322,13 +322,15 @@ pub fn resolve_target(
     let bind = key_rk.as_ref().and_then(|rk| rk.bind_pool());
     // 绑定 Key 的白名单健康预检（仅绑定池生效）：绑定池内若仅剩白名单外账号，
     // 选池阶段即判不健康走全局 fallback，而非取号阶段才失败。
-    // 未绑定 Key 维持现状——预检不感知白名单，F-35 约束由执行路径取号时自理
+    // issue #30 混合白名单：未绑定但带池前缀的 Key 同样预检感知（按前缀作用域
+    // 分池，零条目池 = 排除 → 预检不健康走 fallback）；旧未绑定 Key 维持现状——
+    // 预检不感知白名单，F-35 约束由执行路径取号时自理
     let key_allowed_for = |pool: TargetPool| -> Option<HashSet<String>> {
         let rk = key_rk.as_ref()?;
-        if bind.is_none() || !rk.constrains_pool(pool.as_str()) || rk.allowed_accounts.is_empty() {
+        if bind.is_none() && !rk.is_mixed_whitelist() {
             return None;
         }
-        Some(rk.allowed_accounts.iter().cloned().collect())
+        rk.pool_constraints(pool.as_str()).and_then(|c| c.allowed)
     };
 
     // 会话池粘性（§4.4 软粘，TTL 60s，内存态不落盘）：命中且池仍可用 → 直接沿用。
@@ -440,7 +442,23 @@ pub fn resolve_target(
             }
         }
     }
-    // 可用源全部耗尽（双源回退目标也不可用 / 源剔除后无源）
+    // 可用源全部耗尽（双源回退目标也不可用 / 源剔除后无源 / Key 白名单排除）：
+    // 落盘调度日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名）
+    {
+        let key_label = key_id
+            .map(|id| super::api_keys::key_name_for(&state.data_dir, id))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "anonymous".to_string());
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "dispatch exhausted: model={} key={} preferred={}",
+                model,
+                key_label,
+                preferred.map(|p| p.as_str()).unwrap_or("none"),
+            ),
+        );
+    }
     Err(DispatchError::NoHealthy(
         preferred.unwrap_or(TargetPool::Trae),
     ))
@@ -682,6 +700,7 @@ mod tests {
             usage_dirty: std::sync::Mutex::new(Vec::new()),
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+            trae_jwt_refresh: None,
         });
         Fixture { dir, state }
     }
@@ -758,6 +777,7 @@ mod tests {
                     enterprise_id: String::new(),
                     global_region: false,
                     credits: Some(10.0),
+                    credits_expire_at: None,
                     needs_relogin: false,
                     group_id: String::new(),
                 }],
@@ -1346,6 +1366,77 @@ mod tests {
         // 未知 Key（已注销/匿名）：不限制
         let (a, d) = super::super::routes::trae_pool_constraints(&f.state, "nope");
         assert!(a.is_none() && d.is_none());
+    }
+
+    // ---------- issue #29 调度失败可观测性 ----------
+
+    /// NoHealthy 详情（修复2）：匿名/未知 Key 仅报池健康数，不编造约束细节
+    #[test]
+    fn t39_no_healthy_detail_anonymous_pool_only() {
+        let f = fixture(&[], None, None);
+        let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "anonymous");
+        assert!(msg.starts_with("no healthy account available"), "{msg}");
+        assert!(msg.contains("pool=trae healthy=0"), "{msg}");
+        assert!(!msg.contains("key="), "匿名 Key 不应携带约束细节: {msg}");
+    }
+
+    /// NoHealthy 详情（修复2）：Key 约束细节（绑定池/白名单条数/作用域健康数）——
+    /// 白名单指向池外账号时 healthy_in_scope=0 直接暴露「约束排除致败」根因
+    #[test]
+    fn t40_no_healthy_detail_key_constraints() {
+        let f = fixture(&[], None, None);
+        f.seed_healthy(true); // trae 池健康账号 t1
+        // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
+        f.seed_key("k1", "trae", &["t9"]); // 白名单指向池外账号
+        f.seed_key("k2", "trae", &["t1"]); // 白名单命中池内健康账号
+
+        let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k1");
+        assert!(msg.contains("pool=trae healthy=1"), "{msg}");
+        assert!(msg.contains("key=k1"), "{msg}");
+        assert!(msg.contains("bind=trae"), "{msg}");
+        assert!(msg.contains("whitelist=1"), "{msg}");
+        assert!(msg.contains("healthy_in_scope=0"), "{msg}");
+
+        let msg2 = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k2");
+        assert!(msg2.contains("healthy_in_scope=1"), "{msg2}");
+    }
+
+    /// 修复1 直测：调度阶段失败落 API 请求日志——NoHealthy → status=503、
+    /// uid="-"（未取号）、acct="-"、error 携带 no healthy 详情与约束根因
+    #[test]
+    fn t41_dispatch_error_logs_request() {
+        let f = fixture(&[], None, None);
+        f.seed_healthy(true); // trae 池健康账号 t1
+        // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
+        f.seed_key("k1", "trae", &["t9"]); // 白名单指向池外 → healthy_in_scope=0
+
+        let resp = super::super::routes::dispatch_error_response(
+            &f.state,
+            DispatchError::NoHealthy(TargetPool::Trae),
+            super::super::routes::Protocol::OpenAi,
+            "glm-5.3",
+            false,
+            "k1",
+            12,
+        );
+        assert_eq!(resp.status().as_u16(), 503);
+
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let content = f
+            .state
+            .logger
+            .read_log(&date)
+            .expect("调度失败应落 API 请求日志");
+        let line = content
+            .lines()
+            .find(|l| l.contains("pool=trae") && l.contains("model=glm-5.3"))
+            .expect("应存在 pool=trae model=glm-5.3 日志行");
+        assert!(line.contains("status=503"), "{line}");
+        assert!(line.contains("key=k1"), "{line}");
+        assert!(line.contains("uid=- "), "调度阶段未取号，uid 应为占位符: {line}");
+        assert!(line.contains(" acct=- "), "调度阶段无账号，acct 应为占位符: {line}");
+        assert!(line.contains("error=no healthy account available"), "{line}");
+        assert!(line.contains("healthy_in_scope=0"), "{line}");
     }
 
     // ---------- issue #26 全局模型白名单 ----------

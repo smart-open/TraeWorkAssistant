@@ -32,6 +32,8 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         store::docs::account_cooldowns_load(&store::db(&state.data_dir));
     let credits_file: RemainingCreditsFile =
         store::docs::remaining_credits_load(&store::db(&state.data_dir));
+    // 诊断口径与池装配一致：通用积分余额/到期（老缓存账号回退混合口径）
+    let merged_expires = merge_pool_expire_times(&credits_file);
 
     // 调度策略（T10）：api_pool.json.strategy，空/未知值回退 expire_first
     let strategy = PoolStrategy::parse(&pool_file.strategy);
@@ -76,8 +78,12 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         } else {
             // 检查冷却和积分状态
             let cd = cooldowns_file.cooldowns.get(uid);
-            let credits = credits_file.credits.get(uid).copied();
-            let expire = credits_file.expire_times.get(uid).copied();
+            let credits = credits_file
+                .general
+                .get(uid)
+                .copied()
+                .or_else(|| credits_file.credits.get(uid).copied());
+            let expire = merged_expires.get(uid).copied();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -214,6 +220,15 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         usage_dirty: Mutex::new(Vec::new()),
         wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
         wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        // Trae 401 自愈回调（issue #27 方案 B）：AppState 克隆进闭包，走 refresh_jwt_impl
+        // 全防护链路（并发锁/冷却/轮换写回/5s 成功去重窗）强制刷新并持久化
+        trae_jwt_refresh: {
+            let st = state.clone();
+            Some(std::sync::Arc::new(move |uid: &str| {
+                crate::commands::accounts::refresh_jwt_impl(&st, uid, true)
+            })
+                as std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>)
+        },
     });
 
     // F-76②/F-77 热参数：池并发上限（两池同构生效）+ wb_sticky 显式 TTL
@@ -226,6 +241,24 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         .set_explicit_ttl(pool_file.wb_sticky_ttl_secs as i64);
 
     shared
+}
+
+/// 池到期表装配（issue #28）：通用积分（product_id != 209）最早到期优先，
+/// 与 pool_credits 的通用口径对齐。回退规则：
+/// - 通用剩余表未覆盖的老缓存账号（升级前未刷新过）→ 回退混合口径 expire_times
+/// - 已刷新但通用包均长期有效/耗尽的账号（general 有键而 general_expire_times 无键）
+///   → 不回退，无到期约束（混合口径里的 Work 包到期不得泄漏进调度）
+fn merge_pool_expire_times(rc: &crate::models::RemainingCreditsFile) -> std::collections::HashMap<String, i64> {
+    let mut out: std::collections::HashMap<String, i64> = rc
+        .expire_times
+        .iter()
+        .filter(|(uid, _)| !rc.general.contains_key(*uid))
+        .map(|(uid, e)| (uid.clone(), *e))
+        .collect();
+    for (uid, exp) in &rc.general_expire_times {
+        out.insert(uid.clone(), *exp);
+    }
+    out
 }
 
 /// 池装配公共逻辑（build_shared 构建 / 凭据变更热重载共用）：
@@ -254,7 +287,7 @@ pub fn apply_pool_snapshot(state: &AppState, pool: &ApiPool, wb_pool: &ApiPool) 
         &groups_file.membership,
         &cooldowns_file.cooldowns,
         &pool_credits,
-        &credits_file.expire_times,
+        &merge_pool_expire_times(&credits_file),
         &device_map,
     );
     let wb_accounts_all = wb_upstream_accounts(state);
@@ -321,6 +354,9 @@ struct WbAcctLite {
     group_id: String,
     #[serde(default)]
     credits_balance: Option<f64>,
+    /// 最早积分包到期（issue #28 调度口径透传）；老数据缺省 None
+    #[serde(default)]
+    credits_expire_at: Option<i64>,
 }
 
 /// 宽容字符串字段提取（对齐 fs_utils::dig 语义的本地 helper）
@@ -357,6 +393,7 @@ pub fn wb_upstream_accounts(state: &AppState) -> Vec<WbSyncAccount> {
             enterprise_id: eid,
             global_region: domain.contains(".workbuddy.ai"),
             credits: a.credits_balance,
+            credits_expire_at: a.credits_expire_at,
             needs_relogin: a.needs_relogin,
             group_id: a.group_id.clone(),
         });
@@ -409,6 +446,7 @@ mod tests {
             enterprise_id: String::new(),
             global_region: false,
             credits: None,
+            credits_expire_at: None,
             needs_relogin: false,
             group_id: String::new(),
         }];
@@ -420,5 +458,38 @@ mod tests {
         // 两者皆空 → 全部含凭证账号
         pf.enabled_uids.clear();
         assert_eq!(effective_wb_uids(&pf, &accs), vec!["wb-b".to_string()]);
+    }
+
+    // ── merge_pool_expire_times（issue #28：调度到期 = 通用口径）────────────
+
+    #[test]
+    fn merge_expires_prefers_general_table() {
+        // 新旧两表同账号并存 → 通用口径胜出（Work 包污染的混合值不参与）
+        let mut rc = crate::models::RemainingCreditsFile::default();
+        rc.expire_times.insert("u1".into(), 1000);
+        rc.general.insert("u1".into(), 90.0);
+        rc.general_expire_times.insert("u1".into(), 2000);
+        let got = merge_pool_expire_times(&rc);
+        assert_eq!(got.get("u1"), Some(&2000));
+    }
+
+    #[test]
+    fn merge_expires_legacy_fallback_without_general_cache() {
+        // 老缓存账号（通用剩余表未覆盖，升级前未刷新过）→ 回退混合口径保底
+        let mut rc = crate::models::RemainingCreditsFile::default();
+        rc.expire_times.insert("legacy".into(), 1000);
+        let got = merge_pool_expire_times(&rc);
+        assert_eq!(got.get("legacy"), Some(&1000));
+    }
+
+    #[test]
+    fn merge_expires_no_fallback_when_refreshed_without_general_expiry() {
+        // 已刷新（general 有键）但通用包均长期有效/耗尽（general_expire_times 无键）
+        // → 不回退，混合口径里的 Work 包到期不得泄漏进调度
+        let mut rc = crate::models::RemainingCreditsFile::default();
+        rc.expire_times.insert("u1".into(), 1000);
+        rc.general.insert("u1".into(), 0.0);
+        let got = merge_pool_expire_times(&rc);
+        assert!(got.get("u1").is_none());
     }
 }

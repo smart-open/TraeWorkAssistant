@@ -505,11 +505,18 @@ export interface ApiKeyEntry {
   created_at: number;
   used_date: string;
   used_today: number;
-  /** 限定上游（WB 上游账号 uid 白名单；空 = 不限） */
+  /**
+   * 限定上游账号白名单（空 = 不限）。bind_pool=""（跟随全局调度）时条目可带
+   * 池前缀 `trae:`/`buddy:`（issue #30 混合白名单，按前缀分池限定）；绑定池时
+   * 为对应池裸 uid；旧数据全裸 uid = 仅限定 Buddy 池
+   */
   allowed_accounts: string[];
   /** 调度模式：expire_first（默认，临期优先）| dedicated（专一） */
   schedule_mode: string;
-  /** 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个） */
+  /**
+   * 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）；跟随全局调度时
+   * 可带 `trae:`/`buddy:` 池前缀（专一锁定其归属池）
+   */
   dedicated_account: string;
   /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" */
   bind_pool: string;

@@ -629,6 +629,7 @@ mod pool_merge_tests {
             enterprise_id: String::new(),
             global_region: false,
             credits: None,
+            credits_expire_at: None,
             needs_relogin: false,
             group_id: String::new(),
         };

@@ -312,7 +312,8 @@ export default function UsageStatsPanel() {
         </div>
       </div>
 
-      <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      {/* 5 个统计块单行铺开：sm 起 5 列，收紧间距防换行 */}
+      <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
         <StatCard
           label="总请求数"
           value={summary.requests}

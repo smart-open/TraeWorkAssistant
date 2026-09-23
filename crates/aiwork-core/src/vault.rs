@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn key_provider_V2文件往返与旧blob拒绝() {
+    fn key_provider_v2文件往返与旧blob拒绝() {
         // "V2:" + hex 文件 → 正确解码 32 字节
         let key = [7u8; 32];
         let content = format!("V2:{}", bytes_to_hex(&key));
