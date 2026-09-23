@@ -1368,6 +1368,77 @@ mod tests {
         assert!(a.is_none() && d.is_none());
     }
 
+    // ---------- issue #29 调度失败可观测性 ----------
+
+    /// NoHealthy 详情（修复2）：匿名/未知 Key 仅报池健康数，不编造约束细节
+    #[test]
+    fn t39_no_healthy_detail_anonymous_pool_only() {
+        let f = fixture(&[], None, None);
+        let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "anonymous");
+        assert!(msg.starts_with("no healthy account available"), "{msg}");
+        assert!(msg.contains("pool=trae healthy=0"), "{msg}");
+        assert!(!msg.contains("key="), "匿名 Key 不应携带约束细节: {msg}");
+    }
+
+    /// NoHealthy 详情（修复2）：Key 约束细节（绑定池/白名单条数/作用域健康数）——
+    /// 白名单指向池外账号时 healthy_in_scope=0 直接暴露「约束排除致败」根因
+    #[test]
+    fn t40_no_healthy_detail_key_constraints() {
+        let f = fixture(&[], None, None);
+        f.seed_healthy(true); // trae 池健康账号 t1
+        // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
+        f.seed_key("k1", "trae", &["t9"]); // 白名单指向池外账号
+        f.seed_key("k2", "trae", &["t1"]); // 白名单命中池内健康账号
+
+        let msg = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k1");
+        assert!(msg.contains("pool=trae healthy=1"), "{msg}");
+        assert!(msg.contains("key=k1"), "{msg}");
+        assert!(msg.contains("bind=trae"), "{msg}");
+        assert!(msg.contains("whitelist=1"), "{msg}");
+        assert!(msg.contains("healthy_in_scope=0"), "{msg}");
+
+        let msg2 = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k2");
+        assert!(msg2.contains("healthy_in_scope=1"), "{msg2}");
+    }
+
+    /// 修复1 直测：调度阶段失败落 API 请求日志——NoHealthy → status=503、
+    /// uid="-"（未取号）、acct="-"、error 携带 no healthy 详情与约束根因
+    #[test]
+    fn t41_dispatch_error_logs_request() {
+        let f = fixture(&[], None, None);
+        f.seed_healthy(true); // trae 池健康账号 t1
+        // 先种满全部 Key 再断言：constraints_for 首读后走内存缓存，后续直写不可见
+        f.seed_key("k1", "trae", &["t9"]); // 白名单指向池外 → healthy_in_scope=0
+
+        let resp = super::super::routes::dispatch_error_response(
+            &f.state,
+            DispatchError::NoHealthy(TargetPool::Trae),
+            super::super::routes::Protocol::OpenAi,
+            "glm-5.3",
+            false,
+            "k1",
+            12,
+        );
+        assert_eq!(resp.status().as_u16(), 503);
+
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let content = f
+            .state
+            .logger
+            .read_log(&date)
+            .expect("调度失败应落 API 请求日志");
+        let line = content
+            .lines()
+            .find(|l| l.contains("pool=trae") && l.contains("model=glm-5.3"))
+            .expect("应存在 pool=trae model=glm-5.3 日志行");
+        assert!(line.contains("status=503"), "{line}");
+        assert!(line.contains("key=k1"), "{line}");
+        assert!(line.contains("uid=- "), "调度阶段未取号，uid 应为占位符: {line}");
+        assert!(line.contains(" acct=- "), "调度阶段无账号，acct 应为占位符: {line}");
+        assert!(line.contains("error=no healthy account available"), "{line}");
+        assert!(line.contains("healthy_in_scope=0"), "{line}");
+    }
+
     // ---------- issue #26 全局模型白名单 ----------
 
     /// 白名单感知后台任务降级（dispatch 白名单联动）：候选 ∩ 白名单非空 →

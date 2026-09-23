@@ -717,12 +717,27 @@ impl ApiPool {
     /// `allowed`：uid 白名单（None = 不限；`Some(空集)` = 过滤全部，即该池对此
     /// Key 不健康——issue #30 混合白名单的有意传参，语义同 pick_excluding_constrained）
     pub fn has_selectable_in(&self, allowed: Option<&HashSet<String>>) -> bool {
+        self.selectable_stats_in(allowed).1 > 0
+    }
+
+    /// 可选账号统计（诊断用，issue #29）：返回 (池内可选总数, 白名单内可选数)。
+    /// `allowed` 语义同 has_selectable_in（None = 不限）；供 NoHealthy 错误
+    /// 消息携带「池健康数 / 白名单命中数」，帮助用户自查 Key 约束配置
+    pub fn selectable_stats_in(&self, allowed: Option<&HashSet<String>>) -> (usize, usize) {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
-        entries
-            .values()
-            .any(|e| selectable(e, &tried, now) && allowed.map_or(true, |a| a.contains(&e.uid)))
+        let mut total = 0usize;
+        let mut in_allowed = 0usize;
+        for e in entries.values() {
+            if selectable(e, &tried, now) {
+                total += 1;
+                if allowed.map_or(true, |a| a.contains(&e.uid)) {
+                    in_allowed += 1;
+                }
+            }
+        }
+        (total, in_allowed)
     }
 
     /// 诊断：返回所有账号被过滤的原因（用于 "no healthy account" 排查）
@@ -1077,6 +1092,24 @@ mod tests {
         let expired = build_pool(&[("uid_a", 100.0, 1_000)]);
         let ok_a: HashSet<String> = ["uid_a".to_string()].into_iter().collect();
         assert!(!expired.has_selectable_in(Some(&ok_a)));
+    }
+
+    #[test]
+    fn selectable_stats_in_counts_total_and_whitelisted() {
+        // issue #29 修复2：NoHealthy 详情需要池健康计数（总数 + 白名单命中数）
+        let pool = build_pool(&[
+            ("uid_a", 100.0, 4_000_001_000),
+            ("uid_b", 100.0, 4_000_001_000),
+            ("uid_c", 0.0, 4_000_001_000), // 零积分 → 不可选
+        ]);
+        // 无白名单：(可选总数, 同值)
+        assert_eq!(pool.selectable_stats_in(None), (2, 2));
+        // 白名单命中 uid_b：总数不变，命中=1
+        let ok: HashSet<String> = ["uid_b".to_string()].into_iter().collect();
+        assert_eq!(pool.selectable_stats_in(Some(&ok)), (2, 1));
+        // 白名单全在池外：命中=0
+        let miss: HashSet<String> = ["uid_x".to_string()].into_iter().collect();
+        assert_eq!(pool.selectable_stats_in(Some(&miss)), (2, 0));
     }
 
     #[test]

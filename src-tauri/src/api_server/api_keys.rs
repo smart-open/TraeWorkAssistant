@@ -370,6 +370,30 @@ pub fn key_name_for(data_dir: &Path, key_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 按 Key 条目 id 一次性取（展示名, 约束快照）：单锁单遍历合并查询，
+/// 供诊断路径（no_healthy_detail）替代 constraints_for + key_name_for 的两次加锁；
+/// Key 不存在返回 None（匿名/未知 Key 由调用方兜底仅报池健康数）
+pub fn key_snapshot_for(data_dir: &Path, key_id: &str) -> Option<(String, ResolvedKey)> {
+    let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    entry_or_load(&mut reg, data_dir)
+        .file
+        .keys
+        .iter()
+        .find(|k| k.id == key_id)
+        .map(|e| {
+            (
+                e.name.clone(),
+                ResolvedKey {
+                    id: e.id.clone(),
+                    allowed_accounts: e.allowed_accounts.clone(),
+                    schedule_mode: e.schedule_mode().to_string(),
+                    dedicated_account: e.dedicated_account.clone(),
+                    bind_pool: e.bind_pool.clone(),
+                },
+            )
+        })
+}
+
 /// 进程级状态锁 + 内存权威副本（批次 E）：api_keys 的「读-改-写」（verify 记账 +
 /// save + flush）全部在同一把锁内完成，保证并发请求计数原子，且替代原
 /// 「每请求 load 全表 + 整表替换事务落盘」的写放大（P1-2 / 批次 E）。

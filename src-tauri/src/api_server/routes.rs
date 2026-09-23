@@ -163,35 +163,90 @@ fn model_cooling_response(state: &ApiSharedState, model: &str, proto: Protocol) 
     }
 }
 
-/// 调度错误矩阵 → 按客户端协议格式化响应（§4.3/§4.5；统一调度分流点专用）
-fn dispatch_error_response(err: DispatchError, proto: Protocol, model: &str) -> Response {
-    match err {
-        DispatchError::WbDisabled => {
-            let msg = "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）";
-            match proto {
-                Protocol::Anthropic => {
-                    anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
-                }
-                _ => openai_error(StatusCode::BAD_REQUEST, "wb_upstream_disabled", msg),
-            }
-        }
-        DispatchError::ModelCooling(rem) => {
-            let msg = format!("model {} cooling down, retry after {}s", model, rem);
-            match proto {
-                Protocol::Anthropic => {
-                    anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg)
-                }
-                _ => openai_error(StatusCode::TOO_MANY_REQUESTS, "model_cooldown", &msg),
-            }
-        }
-        DispatchError::NoHealthy(_) => {
-            let msg = "no healthy account available";
-            match proto {
-                Protocol::Anthropic => {
-                    anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", msg)
-                }
-                _ => openai_error(StatusCode::SERVICE_UNAVAILABLE, "no_healthy_account", msg),
-            }
+/// 调度错误矩阵 → 按客户端协议格式化响应（§4.3/§4.5；统一调度分流点专用）。
+/// issue #29 修复1：调度阶段失败同样落 API 请求日志——此前失败仅 app.log 有
+/// dispatch exhausted，前端「API 请求日志」页无记录，用户无法自查失败原因。
+/// pub(crate)：dispatch 测试模块经 Fixture 直测日志落盘（与 no_healthy_detail 同模式）
+pub(crate) fn dispatch_error_response(
+    state: &ApiSharedState,
+    err: DispatchError,
+    proto: Protocol,
+    model: &str,
+    stream: bool,
+    key_str: &str,
+    duration_ms: u64,
+) -> Response {
+    // 单次 match：错误 → (状态码, 池标识, 消息, OpenAI 侧错误码, Anthropic 侧错误码)
+    let (status, pool_str, msg, oa_code, anthro_code): (StatusCode, &str, String, &'static str, &'static str) =
+        match err {
+            DispatchError::WbDisabled => (
+                StatusCode::BAD_REQUEST,
+                "buddy",
+                "该模型属 WorkBuddy 上游，但 WB 上游未启用（api_pool.json wb_enabled）".to_string(),
+                "wb_upstream_disabled",
+                "invalid_request_error",
+            ),
+            DispatchError::ModelCooling(rem) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "buddy",
+                format!("model {model} cooling down, retry after {rem}s"),
+                "model_cooldown",
+                "rate_limit_error",
+            ),
+            DispatchError::NoHealthy(pool) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                pool.as_str(),
+                no_healthy_detail(state, pool, key_str),
+                "no_healthy_account",
+                "api_error",
+            ),
+        };
+    // issue #29 修复1：uid/acct 置空（调度阶段未取号），error 携带失败原因
+    let key_name = super::api_keys::key_name_for(&state.data_dir, key_str);
+    state.logger.log_request(
+        pool_str, "POST", proto.log_path(), model, stream, status.as_u16(), "-",
+        duration_ms, &key_name, "", Some(&msg),
+    );
+    match proto {
+        Protocol::Anthropic => anthropic_error(status, anthro_code, &msg),
+        _ => openai_error(status, oa_code, &msg),
+    }
+}
+
+/// NoHealthy 详情（issue #29 修复2）：错误消息携带 Key 约束细节（绑定池/白名单
+/// 条数/专一账号）与池内健康计数，帮助用户自查 Key 配置（匿名/未知 Key 仅报
+/// 池健康数）；healthy_in_scope 为约束作用域内健康账号数，0 即「约束排除致败」。
+/// pub(crate)：dispatch 测试模块经 Fixture 直测（与 trae_pool_constraints 同模式）
+pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_str: &str) -> String {
+    let pool_ref = match pool {
+        TargetPool::Trae => &state.pool,
+        TargetPool::Buddy => &state.wb_pool,
+        // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
+        TargetPool::Custom => return "no healthy account available".to_string(),
+    };
+    let (healthy_total, _) = pool_ref.selectable_stats_in(None);
+    let base = format!(
+        "no healthy account available (pool={} healthy={healthy_total})",
+        pool.as_str(),
+    );
+    // 单锁快照：一次取（展示名, 约束），替代 constraints_for + key_name_for 双加锁
+    let Some((name, rk)) = super::api_keys::key_snapshot_for(&state.data_dir, key_str) else {
+        return base;
+    };
+    let name = if name.is_empty() { key_str } else { name.as_str() };
+    let bind = rk.bind_pool().unwrap_or("-");
+    match rk.pool_constraints(pool.as_str()) {
+        None => format!("{base} key={name} bind={bind} constraint=none"),
+        Some(c) => {
+            let (_, healthy_scope) = pool_ref.selectable_stats_in(c.allowed.as_ref());
+            let wl = match &c.allowed {
+                None => "none".to_string(),
+                Some(s) => s.len().to_string(),
+            };
+            let ded = c.dedicated.as_deref().unwrap_or("-");
+            format!(
+                "{base} key={name} bind={bind} whitelist={wl} dedicated={ded} healthy_in_scope={healthy_scope}"
+            )
         }
     }
 }
@@ -479,7 +534,10 @@ pub async fn chat_completions(
     // inflight guard 随执行路径持有至请求结束（流式含整个后台任务）
     let guard = state.inflight_guard();
     match dispatch::resolve_target(&state, &model, &peek, Some(&key_str)) {
-        Err(e) => dispatch_error_response(e, Protocol::OpenAi, &model),
+        Err(e) => dispatch_error_response(
+            &state, e, Protocol::OpenAi, &model, stream, &key_str,
+            start_ts.elapsed().as_millis() as u64,
+        ),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
                 // T5.3 默认深度思考：客户端未带 reasoning_effort 时注入 high
@@ -686,7 +744,10 @@ pub async fn messages(
     // guard 随执行路径持有至请求结束（流式含整个后台任务）
     let guard = state.inflight_guard();
     match dispatch::resolve_target(&state, &model, &peek, Some(&key_str)) {
-        Err(e) => dispatch_error_response(e, Protocol::Anthropic, &model),
+        Err(e) => dispatch_error_response(
+            &state, e, Protocol::Anthropic, &model, stream, &key_str,
+            start_ts.elapsed().as_millis() as u64,
+        ),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
                 // T5.3 默认深度思考：Anthropic 侧 thinking 参数视为显式请求
@@ -810,7 +871,10 @@ pub async fn completions(
     // 统一调度分流点（§4.1）；guard 随执行路径持有至请求结束
     let guard = state.inflight_guard();
     match dispatch::resolve_target(&state, &model, &internal, Some(&key_str)) {
-        Err(e) => dispatch_error_response(e, Protocol::OpenAiText, &model),
+        Err(e) => dispatch_error_response(
+            &state, e, Protocol::OpenAiText, &model, stream, &key_str,
+            start_ts.elapsed().as_millis() as u64,
+        ),
         Ok(r) => match r.pool {
             TargetPool::Buddy => {
                 // T5.3 默认深度思考（text completions 无 effort 字段 → 默认思考直接生效）
