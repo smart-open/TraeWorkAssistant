@@ -172,19 +172,33 @@ fn task_exists(name: &str) -> bool {
     run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"]).map(|(ok, _, _)| ok).unwrap_or(false)
 }
 
-/// 枚举当前用户可见的计划任务名（审查 P2）：`schtasks /Query /FO CSV /NH`，
-/// CSV 列序固定为 HostName, TaskName, ...（取第 2 列），结构不受系统语言影响；
-/// 带引号字段与根目录前缀 `\` 需剥离（本仓任务名不含逗号，按逗号切分安全）。
+/// 枚举当前用户可见的计划任务名（审查 P2）：`schtasks /Query /FO CSV /NH`。
+/// 注意：CSV 列序**不跨机固定**——部分系统为 HostName,TaskName,…（TaskName 第 2 列），
+/// 部分系统仅 TaskName,NextRunTime,Status（TaskName 第 1 列，实测 2026-09-24 Win11）。
+/// 不按固定下标取列，改为扫描各行字段：TaskName 字段带引号且以 `\` 开头
+/// （根目录任务形如 `\AIWorkAssistant_WorkBuddyCheckin_0900`），取末段 `\` 之后为任务名；
+/// 本仓任务名不含逗号，按逗号切分安全。
 fn list_task_names() -> Vec<String> {
     let Ok((_, stdout, _)) = run_schtasks(&["/Query", "/FO", "CSV", "/NH"]) else {
         return vec![];
     };
-    stdout
-        .lines()
-        .filter_map(|line| line.split(',').nth(1))
-        .map(|f| f.trim().trim_matches('"').trim_start_matches('\\').to_string())
-        .filter(|n| !n.is_empty())
-        .collect()
+    parse_task_names_from_csv(&stdout)
+}
+
+/// 从 schtasks CSV 输出提取任务名（纯函数，便于单测覆盖两种列序）。
+fn parse_task_names_from_csv(stdout: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        for field in line.split(',') {
+            let f = field.trim().trim_matches('"');
+            let Some(name) = f.strip_prefix('\\') else { continue };
+            let name = name.rsplit('\\').next().unwrap_or(name);
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// 按任务名前缀枚举本功能全部签到任务（兼容任意 _HHMM 后缀，不再硬编码 _0900/_2100/_1200）
@@ -220,6 +234,10 @@ pub fn workbuddy_checkin_task_register(state: State<AppState>, times: Vec<String
             return Err(format!("注册任务 {t} 失败: {}", stderr.trim()));
         }
     }
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!("WorkBuddy 每日签到定时任务已注册: {}", times.join(" / ")),
+    );
     Ok(())
 }
 
@@ -233,10 +251,11 @@ pub fn workbuddy_checkin_task_status() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command(async)]
-pub fn workbuddy_checkin_task_unregister() -> Result<(), String> {
+pub fn workbuddy_checkin_task_unregister(state: State<AppState>) -> Result<(), String> {
     for name in wb_checkin_task_names() {
         let _ = run_schtasks(&["/Delete", "/TN", &name, "/F"]);
     }
+    fs_utils::app_log(&state.data_dir, "WorkBuddy 每日签到定时任务已注销");
     Ok(())
 }
 
@@ -260,6 +279,10 @@ pub fn workbuddy_renew_task_register(state: State<AppState>, day: String, time: 
     if !ok {
         return Err(format!("注册续期任务失败: {}", stderr.trim()));
     }
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!("WorkBuddy 每周续期定时任务已注册: 每周{d} {t}"),
+    );
     Ok(())
 }
 
@@ -269,8 +292,9 @@ pub fn workbuddy_renew_task_status() -> bool {
 }
 
 #[tauri::command(async)]
-pub fn workbuddy_renew_task_unregister() -> Result<(), String> {
+pub fn workbuddy_renew_task_unregister(state: State<AppState>) -> Result<(), String> {
     let _ = run_schtasks(&["/Delete", "/TN", WB_RENEW_TASK_NAME, "/F"]);
+    fs_utils::app_log(&state.data_dir, "WorkBuddy 每周续期定时任务已注销");
     Ok(())
 }
 
@@ -393,4 +417,38 @@ pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
     let msg = "WorkBuddy 成长计划: 完成";
     fs_utils::app_log(&state.data_dir, msg);
     push_notify(Some(app), &state.data_dir, "一键签到", msg, crate::notify::NotifyEvent::CheckinDone);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_task_names_from_csv;
+
+    #[test]
+    fn csv_解析_三列无主机名_本机实测列序() {
+        // 2026-09-24 Win11 实测：无 HostName 列，TaskName 在第 1 列
+        let out = parse_task_names_from_csv(
+            "\"\\360ZipUpdater\",\"N/A\",\"Ready\"\n\"\\AIWorkAssistant_WorkBuddyCheckin_0900\",\"2026/9/24 9:00:00\",\"Ready\"\n",
+        );
+        assert_eq!(
+            out,
+            vec!["360ZipUpdater", "AIWorkAssistant_WorkBuddyCheckin_0900"]
+        );
+    }
+
+    #[test]
+    fn csv_解析_四列含主机名_旧列序() {
+        // 部分系统为 HostName,TaskName,...（TaskName 第 2 列）
+        let out = parse_task_names_from_csv(
+            "\"DESKTOP-ABC\",\"\\AIWorkAssistant_WorkBuddyCheckin_0900\",\"2026/9/24 9:00:00\",\"就绪\"\n",
+        );
+        assert_eq!(out, vec!["AIWorkAssistant_WorkBuddyCheckin_0900"]);
+    }
+
+    #[test]
+    fn csv_解析_文件夹任务取末段与空行安全() {
+        let out = parse_task_names_from_csv(
+            "\"\\Microsoft\\Windows\\TaskScheduler\\Maintenance Configurator\",\"N/A\",\"Ready\"\n\n",
+        );
+        assert_eq!(out, vec!["Maintenance Configurator"]);
+    }
 }

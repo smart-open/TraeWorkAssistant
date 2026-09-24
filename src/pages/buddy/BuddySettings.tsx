@@ -359,13 +359,20 @@ function TaskConfigCard({
           />
           <span className="text-sm">
             启用自动签到（启动补签）
-            <span className="block text-xs text-slate-400">应用启动时立即核验服务端状态，未签到账号会自动补签</span>
+            <span className="block text-xs text-slate-400">
+              应用启动时立即核验服务端状态，未签到账号会自动补签；同时作为应用内每日 09:10 Rust
+              调度签到的总开关（关闭后仅 Windows 计划任务生效）
+            </span>
           </span>
         </label>
         <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+          <div className="mb-2 text-xs text-slate-400">
+            应用内置 Rust 定时调度器：应用运行期间每日 09:10 自动签到（晚于该时刻启动会自动补跑，无需管理员权限，失败
+            30 分钟后自动重试）。下方注册的 Windows 计划任务作为兜底，在应用未启动时于指定时刻直接运行签到（注册/卸载需要管理员权限）。
+          </div>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <div className="text-sm font-medium">每日签到</div>
+              <div className="text-sm font-medium">Windows 计划任务（兜底）</div>
               <div className="text-xs text-slate-400">
                 {tasks.length > 0 ? `已注册：${tasks.join('、')}` : '未注册（第二时刻可清空 = 单时段）'}
               </div>
