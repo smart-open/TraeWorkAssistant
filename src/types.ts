@@ -274,6 +274,8 @@ export interface Settings {
   api_default_model: string;
   /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
   buddy_switch_migrate_chats: boolean;
+  /** Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；Windows 计划任务注册时间复用该值） */
+  trae_checkin_hhmm: string;
   /** Trae JWT 定时调度续期开关（issue #27，默认开：每日兜底续期临期账号） */
   jwt_renew_enabled: boolean;
   /** Trae JWT 续期调度触发时刻 HH:MM（默认 09:00，环境配置页可改） */

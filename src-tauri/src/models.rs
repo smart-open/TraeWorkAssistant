@@ -156,6 +156,10 @@ pub struct Settings {
     /// 豆包快照可选纳入 Default/IndexedDB（C4：对话历史等完整状态随账号迁移；体积代价大，默认排除）
     #[serde(default)]
     pub doubao_snapshot_include_idb: bool,
+    /// Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；
+    /// Windows 计划任务注册时间复用该值）
+    #[serde(default = "default_trae_checkin_hhmm")]
+    pub trae_checkin_hhmm: String,
     /// Trae JWT 定时调度续期（issue #27）：调度器 trae-renew 开关（默认开，每日兜底
     /// 续期临期账号；state::settings 对零值统一回填默认，防止 Settings::default 路径漏开）
     #[serde(default = "default_true")]
@@ -266,6 +270,10 @@ fn default_lang() -> String {
 }
 fn default_retry() -> i32 {
     1
+}
+/// Trae 每日签到调度默认每日 09:00（环境配置页可改，schtasks 注册时间复用）
+fn default_trae_checkin_hhmm() -> String {
+    "09:00".into()
 }
 /// Trae JWT 续期调度默认每日 09:00（issue #27：剩余 <48h 惰性续期，每日一次为安全超集）
 fn default_jwt_renew_hhmm() -> String {

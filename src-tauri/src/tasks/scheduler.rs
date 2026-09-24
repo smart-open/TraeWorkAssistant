@@ -51,6 +51,8 @@ struct SchedTask {
 }
 
 const TASKS: &[SchedTask] = &[
+    // Trae 每日签到：默认 09:00，环境配置页可改（settings.trae_checkin_hhmm）；
+    // Windows 计划任务（AIWorkAssistant_DailyCheckin）注册时间复用同一设置值
     SchedTask { key: "trae-checkin", name: "Trae 每日签到", hhmm: "09:00", kind: "fix" },
     // Trae JWT 定时续期（issue #27）：默认 09:00，环境配置页可改（settings.jwt_renew_hhmm）；
     // 惰性判定（剩余 ≤48h 才真正刷新），每日一次为安全超集
@@ -197,11 +199,12 @@ fn tick(st: &AppState) {
     }
 }
 
-/// 任务生效触发时刻：trae-renew / wb-growth 跟随设置页时刻（环境配置页可改），
-/// 看板同步与模型同步跟随各自 settings 时刻；其余任务用内置默认；
-/// 配置非法（非 HH:MM 格式）时回退默认值
+/// 任务生效触发时刻：trae-checkin / trae-renew / wb-growth / wb-checkin 跟随设置页时刻
+/// （环境配置页 / 任务配置页可改），看板同步与模型同步跟随各自 settings 时刻；
+/// 其余任务用内置默认；配置非法（非 HH:MM 格式）时回退默认值
 fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
     let configured = match t.key {
+        "trae-checkin" => Some(st.settings().trae_checkin_hhmm),
         "trae-renew" => Some(st.settings().jwt_renew_hhmm),
         "wb-growth" => Some(st.settings().wb_growth_hhmm),
         "wb-checkin" => Some(st.settings().wb_checkin_hhmm),

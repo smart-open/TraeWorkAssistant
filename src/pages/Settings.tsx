@@ -20,7 +20,6 @@ export default function Settings() {
   const deviceResetProgress = useAppStore((s) => s.deviceResetProgress);
   const toast = useAppStore((s) => s.pushToast);
 
-  const [time, setTime] = useState('09:00');
   const [taskInfo, setTaskInfo] = useState<string>('');
   const [busyTask, setBusyTask] = useState(false);
   const [querying, setQuerying] = useState(false);
@@ -87,11 +86,13 @@ export default function Settings() {
     }
   };
 
+  // 注册时间复用应用内调度时刻（trae_checkin_hhmm）：schtasks 与调度器共用同一配置值
   const register = async () => {
+    const hhmm = form?.trae_checkin_hhmm || '09:00';
     setBusyTask(true);
     try {
-      await withMinDelay(api.misc.taskRegister(time));
-      toast('success', `已注册每日 ${time} 自动签到`);
+      await withMinDelay(api.misc.taskRegister(hhmm));
+      toast('success', `已注册每日 ${hhmm} 自动签到`);
       await query();
     } catch (e) {
       const msg = String(e);
@@ -377,19 +378,26 @@ export default function Settings() {
 
           <h3 className="mb-1 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-400">
-            应用内置 Rust 定时调度器：应用运行期间每日 09:00 自动签到（晚于该时刻启动会自动补跑，无需管理员权限）。
-            下方可注册 Windows 计划任务作为兜底，在应用未启动时于指定时间直接运行签到（注册/删除需要管理员权限）。
+            应用内置 Rust 定时调度器：应用运行期间每日到点自动签到（晚于该时刻启动会自动补跑，无需管理员权限），
+            触发时刻随底部「保存设置」生效。下方可注册 Windows 计划任务作为兜底，注册时间复用同一时刻，
+            在应用未启动时直接运行签到（注册/删除需要管理员权限）。
           </p>
           <div className="flex flex-wrap items-center gap-2">
+            <label className="label !mb-0">每日触发时刻</label>
             <div className="relative flex items-center">
               <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
               <input
                 type="time"
-                value={time}
-                onChange={(e) => setTime(e.target.value)}
+                value={form.trae_checkin_hhmm}
+                onChange={(e) => update('trae_checkin_hhmm', e.target.value || '09:00')}
                 className="input h-9 !w-32 pl-8 text-sm"
               />
             </div>
+            <span className="text-xs text-slate-400">
+              每天 {form.trae_checkin_hhmm || '09:00'} 执行（应用关闭期间不执行）
+            </span>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
             <button onClick={register} disabled={busyTask} className="btn-outline">
               <Calendar size={15} /> {busyTask ? '注册中…' : '注册任务'}
             </button>
