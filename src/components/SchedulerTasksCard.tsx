@@ -173,7 +173,9 @@ export default function SchedulerTasksCard({
   };
 
   // 恢复推荐按钮只覆盖本卡内的 kv 配置任务；外部 override 绑定的开关由自身行内开关恢复
-  const hasCustom = disabled.some((k) => taskKeys.includes(k)) || taskKeys.some((k) => times[k]);
+  const hasCustom =
+    disabled.some((k) => taskKeys.includes(k)) ||
+    taskKeys.some((k) => times[k] || modes[k] === 'hourly');
 
   return (
     <section className={`card p-4 ${className ?? ''}`}>

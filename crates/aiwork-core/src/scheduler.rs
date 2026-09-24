@@ -87,17 +87,27 @@ enum SchedPlan {
     Hourly,
 }
 
-/// 单任务调度计划：合并启用判定与模式/时刻解析（tick 与 scheduler_status 共用）
-fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
-    if !enabled(st, t.key) {
+/// 单任务调度计划：合并启用判定与模式/时刻解析（tick 与 scheduler_status 共用；
+/// cfg 为整轮一次性读出的 scheduler_cfg，避免每任务重复读 db；
+/// extra_enabled 为外部设置语义门（wb-checkin → 启动自动补签开关，F-55），其余任务恒 true）
+fn sched_plan(cfg: &Value, t: &SchedTask, extra_enabled: bool) -> SchedPlan {
+    if !enabled_from(cfg, t.key) || !extra_enabled {
         return SchedPlan::Skip;
     }
     if HOURLY_CAPABLE.contains(&t.key)
-        && task_modes(st).get(t.key).map(String::as_str) == Some("hourly")
+        && task_modes_from(cfg).get(t.key).map(String::as_str) == Some("hourly")
     {
         SchedPlan::Hourly
     } else {
-        SchedPlan::Daily(effective_hhmm(st, t))
+        SchedPlan::Daily(effective_hhmm_from(cfg, t))
+    }
+}
+
+/// 任务外部设置语义门（整轮读一次）：仅 wb-checkin 联动「启动自动补签」开关（F-55）
+fn extra_enabled(st: &AppState, key: &str) -> bool {
+    match key {
+        "wb-checkin" => crate::commands::workbuddy::wb_auto_checkin_enabled(st),
+        _ => true,
     }
 }
 
@@ -108,12 +118,15 @@ fn tick(st: &AppState) {
     let now_hm = now.format("%H:%M").to_string();
     // T11：通知配置整轮读一次（签到成功/任务失败推送，内部再按总开关静默）
     let notify_cfg = crate::notify::load_config(st);
+    // 调度配置与执行状态整轮各读一次（每 60s tick，避免每任务重复读 db）
+    let cfg = load_cfg(st);
+    let state = load_state(st);
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：每日 HH:MM 或「每小时」）
-        let trigger = match sched_plan(st, t) {
+        let trigger = match sched_plan(&cfg, t, extra_enabled(st, t.key)) {
             SchedPlan::Skip => continue,
             SchedPlan::Daily(hhmm) => {
-                if last_run_date(st, t.key).as_deref() == Some(today.as_str()) {
+                if last_run_date(&state, t.key).as_deref() == Some(today.as_str()) {
                     continue;
                 }
                 // HH:MM 零填充，字符串比较即时间序
@@ -124,7 +137,7 @@ fn tick(st: &AppState) {
             }
             SchedPlan::Hourly => {
                 // hourly 按小时节流：仅成功执行记 last_run_ts（mark_run）
-                if let Some(ts) = last_run_ts(st, t.key) {
+                if let Some(ts) = last_run_ts(&state, t.key) {
                     if chrono::Utc::now().timestamp_millis() - ts < HOURLY_INTERVAL_MS {
                         continue;
                     }
@@ -133,7 +146,7 @@ fn tick(st: &AppState) {
             }
         };
         // 失败冷却：30 分钟内静默等待重试，不重复执行也不刷日志
-        if let Some(ts) = last_fail_ts(st, t.key) {
+        if let Some(ts) = last_fail_ts(&state, t.key) {
             if chrono::Utc::now().timestamp_millis() - ts < RETRY_COOLDOWN_MS {
                 continue;
             }
@@ -175,27 +188,23 @@ fn tick(st: &AppState) {
     }
 }
 
-/// 任务启用判定：先看用户开关（kv `scheduler_cfg.disabled_tasks`，默认全开 = 推荐配置），
-/// 再叠加各任务既有设置语义
-fn enabled(st: &AppState, key: &str) -> bool {
-    if disabled_tasks(st).iter().any(|k| k == key) {
-        return false;
-    }
-    match key {
-        // WorkBuddy 签到跟随「启动自动补签」开关（F-55 同源设置）
-        "wb-checkin" => crate::commands::workbuddy::wb_auto_checkin_enabled(st),
-        // 其余任务幂等且低风险，恒开（Trae 签到 run_round 自带状态核验；JWT 续期自带 48h 门）
-        _ => true,
-    }
+/// 任务启用判定（用户开关部分）：kv `scheduler_cfg.disabled_tasks`，默认全开 = 推荐配置；
+/// 外部设置语义门（wb-checkin → 启动自动补签）由 extra_enabled 单独叠加
+fn enabled_from(cfg: &Value, key: &str) -> bool {
+    !disabled_tasks_from(cfg).iter().any(|k| k == key)
 }
 
 // ── 任务配置（kv `scheduler_cfg`）────────────────────────────────────────────
-// 形态：{ "disabled_tasks": ["trae-checkin", ...], "task_times": { "trae-checkin": "08:30", ... } }
-// 缺省 = 全部启用 + 各任务默认时刻（推荐配置）。前端在 Trae / Buddy 环境配置页展示。
+// 形态：{ "disabled_tasks": ["trae-checkin", ...], "task_times": { "trae-checkin": "08:30", ... },
+//        "task_modes": { "wb-credits-snapshot": "hourly", ... } }
+// 缺省 = 全部启用 + 各任务默认时刻 + 全部每日模式（推荐配置）。前端在 Trae / Buddy 环境配置页展示。
 
 fn disabled_tasks(st: &AppState) -> Vec<String> {
-    load_cfg(st)
-        .get("disabled_tasks")
+    disabled_tasks_from(&load_cfg(st))
+}
+
+fn disabled_tasks_from(cfg: &Value) -> Vec<String> {
+    cfg.get("disabled_tasks")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
@@ -208,8 +217,11 @@ fn disabled_tasks(st: &AppState) -> Vec<String> {
 
 /// 自定义触发时刻表（key → HH:MM；缺省键 = 用任务默认时刻）
 fn task_times(st: &AppState) -> std::collections::HashMap<String, String> {
-    load_cfg(st)
-        .get("task_times")
+    task_times_from(&load_cfg(st))
+}
+
+fn task_times_from(cfg: &Value) -> std::collections::HashMap<String, String> {
+    cfg.get("task_times")
         .and_then(Value::as_object)
         .map(|m| {
             m.iter()
@@ -222,8 +234,11 @@ fn task_times(st: &AppState) -> std::collections::HashMap<String, String> {
 /// 任务执行模式表（key → "hourly"；缺省 = 每日）：scheduler_cfg.task_modes，
 /// 仅 HOURLY_CAPABLE 内的任务生效（移植 main@c8e855b 看板数据同步 hourly 语义）
 fn task_modes(st: &AppState) -> std::collections::HashMap<String, String> {
-    load_cfg(st)
-        .get("task_modes")
+    task_modes_from(&load_cfg(st))
+}
+
+fn task_modes_from(cfg: &Value) -> std::collections::HashMap<String, String> {
+    cfg.get("task_modes")
         .and_then(Value::as_object)
         .map(|m| {
             m.iter()
@@ -234,8 +249,8 @@ fn task_modes(st: &AppState) -> std::collections::HashMap<String, String> {
 }
 
 /// 任务生效触发时刻：task_times 自定义覆盖 > 内置默认（HH:MM 零填充，字符串比较即时间序）
-fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
-    task_times(st)
+fn effective_hhmm_from(cfg: &Value, t: &SchedTask) -> String {
+    task_times_from(cfg)
         .get(t.key)
         .cloned()
         .unwrap_or_else(|| t.hhmm.to_string())
@@ -452,22 +467,22 @@ fn load_state(st: &AppState) -> Value {
     if v.is_object() { v } else { json!({}) }
 }
 
-fn last_run_date(st: &AppState, key: &str) -> Option<String> {
-    load_state(st)
+fn last_run_date(state: &Value, key: &str) -> Option<String> {
+    state
         .pointer(&format!("/tasks/{key}/last_run_date"))
         .and_then(Value::as_str)
         .map(String::from)
 }
 
-fn last_fail_ts(st: &AppState, key: &str) -> Option<i64> {
-    load_state(st)
+fn last_fail_ts(state: &Value, key: &str) -> Option<i64> {
+    state
         .pointer(&format!("/tasks/{key}/last_fail_ts"))
         .and_then(Value::as_i64)
 }
 
 /// 最近一次成功执行时间戳（hourly 模式节流用；mark_run 写入）
-fn last_run_ts(st: &AppState, key: &str) -> Option<i64> {
-    load_state(st)
+fn last_run_ts(state: &Value, key: &str) -> Option<i64> {
+    state
         .pointer(&format!("/tasks/{key}/last_run_ts"))
         .and_then(Value::as_i64)
 }
@@ -526,7 +541,8 @@ fn summarize(v: &Value) -> String {
 /// 调度器状态查询（命令桥 scheduler_status 分发到此）：任务定义 + 最近一次执行情况
 pub fn scheduler_status(st: &AppState) -> Value {
     let raw = load_state(st);
-    let times = task_times(st);
+    let cfg = load_cfg(st);
+    let times = task_times_from(&cfg);
     let tasks: Vec<Value> = TASKS
         .iter()
         .map(|t| {
@@ -539,12 +555,12 @@ pub fn scheduler_status(st: &AppState) -> Value {
                 "name": t.name,
                 "time": times.get(t.key).cloned().unwrap_or_else(|| t.hhmm.to_string()),
                 // 执行模式（daily/hourly/off）：前端据此切换时刻输入与每小时徽标
-                "mode": match sched_plan(st, t) {
+                "mode": match sched_plan(&cfg, t, extra_enabled(st, t.key)) {
                     SchedPlan::Hourly => "hourly",
                     SchedPlan::Daily(_) => "daily",
                     SchedPlan::Skip => "off",
                 },
-                "enabled": enabled(st, t.key),
+                "enabled": enabled_from(&cfg, t.key) && extra_enabled(st, t.key),
                 "last_run_date": e.get("last_run_date").cloned().unwrap_or(Value::Null),
                 "last_run_ts": e.get("last_run_ts").cloned().unwrap_or(Value::Null),
                 "last_fail_ts": e.get("last_fail_ts").cloned().unwrap_or(Value::Null),
@@ -554,4 +570,55 @@ pub fn scheduler_status(st: &AppState) -> Value {
         })
         .collect();
     json!({ "tasks": tasks })
+}
+
+// ==================== 单元测试：调度计划纯逻辑（移植 main@c8e855b 时补充） ====================
+
+#[cfg(test)]
+mod sched_plan_tests {
+    use super::*;
+
+    fn task(key: &str) -> &'static SchedTask {
+        TASKS.iter().find(|t| t.key == key).unwrap()
+    }
+
+    /// hourly 模式仅对 HOURLY_CAPABLE 任务生效：误配到其他任务按每日处理
+    #[test]
+    fn hourly_mode_only_for_capable_tasks() {
+        let cfg = json!({ "task_modes": { "wb-credits-snapshot": "hourly", "wb-checkin": "hourly" } });
+        assert!(matches!(
+            sched_plan(&cfg, task("wb-credits-snapshot"), true),
+            SchedPlan::Hourly
+        ));
+        assert!(matches!(sched_plan(&cfg, task("wb-checkin"), true), SchedPlan::Daily(_)));
+    }
+
+    /// 停用名单与外部设置门（wb-checkin → 启动自动补签）任一不满足即 Skip
+    #[test]
+    fn disabled_or_external_gate_skips() {
+        let cfg = json!({ "disabled_tasks": ["trae-credits-snapshot"] });
+        assert!(matches!(
+            sched_plan(&cfg, task("trae-credits-snapshot"), true),
+            SchedPlan::Skip
+        ));
+        assert!(matches!(
+            sched_plan(&json!({}), task("wb-checkin"), false),
+            SchedPlan::Skip
+        ));
+    }
+
+    /// 自定义时刻覆盖默认；缺省回落内置默认时刻
+    #[test]
+    fn custom_time_overrides_default() {
+        let cfg = json!({ "task_times": { "models-sync": "08:15" } });
+        let t = task("models-sync");
+        match sched_plan(&cfg, t, true) {
+            SchedPlan::Daily(hhmm) => assert_eq!(hhmm, "08:15"),
+            _ => panic!("models-sync 应为每日计划"),
+        }
+        match sched_plan(&json!({}), t, true) {
+            SchedPlan::Daily(hhmm) => assert_eq!(hhmm, t.hhmm),
+            _ => panic!("models-sync 应为每日计划"),
+        }
+    }
 }
