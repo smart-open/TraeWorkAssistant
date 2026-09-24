@@ -9,7 +9,9 @@
 //! - 声明（/v1/models、聚合目录）：各池支持的档位映射回统一空间后取**并集**；
 //!   无实证数据的模型声明为空数组（诚实缺省，不按名称猜测）
 //! - 请求（出口转换）：调度命中池后把统一档位转为该池 wire 值；不受支持时按
-//!   「≤ 请求值的最大支持档位，否则最低档」降级；无实证数据不下发（保持现状）
+//!   「≤ 请求值的最大支持档位，否则最低档」降级；无实证数据（表外模型）合成
+//!   默认不下发，显式客户端请求按统一→Trae 映射填充默认下发（trae_request_wire_fill，
+//!   仅显式源走此路径，门控在 routes 层）
 
 /// 统一档位序（与 wb_catalog::resolve_effort 既有降级链一致，含宽容入参）
 pub const UNIFIED_ORDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
@@ -159,6 +161,16 @@ pub fn trae_request_wire(requested: Option<&str>, supported_wire: &[String]) -> 
     Some(downgrade_by(wire, supported_wire, trae_rank))
 }
 
+/// 无实证模型（表外）显式请求的填充默认（buddy 独有档位场景）：不查实证表、
+/// 不做降级（无表可降），统一→Trae 映射后直接下发（未知值按 unified_to_trae
+/// 保守落最低档 light）。仅显式客户端请求调用；合成默认（路由提示/默认深度
+/// 思考）不得走此路径——保持上游默认，避免全量表外模型请求行为变化。
+/// 显式关闭空串（Anthropic thinking disabled 编码）→ None 不下发
+pub fn trae_request_wire_fill(requested: Option<&str>) -> Option<String> {
+    let req = requested.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(unified_to_trae(req).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,8 +242,22 @@ mod tests {
         assert_eq!(trae_request_wire(Some("xhigh"), &sup), Some("extra_high".into()));
         assert_eq!(trae_request_wire(Some("medium"), &sup), Some("light".into()));
         assert_eq!(trae_request_wire(Some("low"), &sup), Some("light".into()));
-        // 无实证模型不下发
+        // 无实证模型不走降级链（合成默认不下发；显式源走 t08 填充默认）
         assert_eq!(trae_request_wire(Some("high"), &[]), None);
+    }
+
+    /// 表外填充默认（buddy 独有档位场景）：显式请求按统一→Trae 映射直接下发
+    /// （无表可降）；未请求/空白/显式关闭空串 → None
+    #[test]
+    fn t08_trae_fill_default() {
+        assert_eq!(trae_request_wire_fill(None), None);
+        assert_eq!(trae_request_wire_fill(Some("  ")), None);
+        assert_eq!(trae_request_wire_fill(Some("high")), Some("high".into()));
+        assert_eq!(trae_request_wire_fill(Some("xhigh")), Some("extra_high".into()));
+        assert_eq!(trae_request_wire_fill(Some("medium")), Some("light".into()));
+        assert_eq!(trae_request_wire_fill(Some(" MAX ")), Some("extra_high".into()));
+        // 显式关闭空串 → None
+        assert_eq!(trae_request_wire_fill(Some("")), None);
     }
 
     /// 并集：去空去重 + 统一序升序；空输入 → 空

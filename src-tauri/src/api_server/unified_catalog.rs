@@ -265,6 +265,9 @@ pub struct UnifiedModel {
     pub rate: Option<f64>,
     /// 思考档位（双语义合并展示，§3.1 注：仅 Buddy 池作为请求参数下发）
     pub efforts: Vec<String>,
+    /// Max Mode 支持（Trae 池 1M 上下文，efforts::TRAE_MAX_MODE_REF 查表）：
+    /// 含 Trae 源的条目按表标记；Buddy/自定义单源条目恒 false（Max Mode 仅 Trae 管线注入）
+    pub max_mode: bool,
     pub context_length: Option<u64>,
     pub max_tokens: Option<u64>,
     pub supports_image: Option<bool>,
@@ -336,13 +339,10 @@ fn trae_entry_of(m: &ModelOption, l1: Option<&TraeModelMeta>) -> TraeEntry {
     }
 }
 
-/// wb 目录倍率：0 视为未声明（交由另一源兜底）
+/// wb 目录倍率：原始值透传，0 = 免费声明（与调度层「wb 原始值 0 = 免费」同语义；
+/// 此前 0 丢为 None 会导致 Buddy 免费模型被当未声明后置/退源）
 fn wb_rate(m: &WbModel) -> Option<f64> {
-    if m.rate > 0.0 {
-        Some(m.rate)
-    } else {
-        None
-    }
+    Some(m.rate)
 }
 
 /// 聚合统一目录（纯派生，实时计算）。
@@ -391,6 +391,7 @@ pub fn unified_models(
                 vendor: String::new(),
                 rate: t.rate,
                 efforts: t.efforts.clone(),
+                max_mode: super::efforts::trae_max_mode_supported(&canonical),
                 context_length: t.context_length,
                 max_tokens: t.max_tokens,
                 supports_image: t.supports_image,
@@ -463,6 +464,7 @@ pub fn unified_models(
                         vendor: String::new(),
                         rate: wrate,
                         efforts: m.supported_efforts.clone(),
+                        max_mode: false,
                         context_length: wctx,
                         max_tokens: wmt,
                         supports_image: Some(m.supports_image),
@@ -525,6 +527,7 @@ pub fn unified_models(
                         vendor: m.vendor.clone(),
                         rate: crate_rate,
                         efforts: Vec::new(),
+                        max_mode: false,
                         context_length: cctx,
                         max_tokens: cmt,
                         supports_image: Some(m.supports_image),
@@ -857,18 +860,25 @@ mod tests {
         super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "glm-5.3").rate, Some(0.78));
-        // 命中侧未声明倍率（WB rate=0 视为未声明）→ 退另一可用源
+        // 命中侧 WB rate=0 = 免费声明（与调度层同语义）→ 顶层透传免费，不再退 Trae 源
+        //（恢复默认 buddy 优先：第二段 per_model 仍生效会使命中侧停留在 trae）
+        crate::store::db(&f.dir)
+            .kv_set("dispatch_policy",
+                    &json!({"priority": ["buddy", "trae"], "per_model": {}, "fallback": true}))
+            .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
         crate::store::db(&f.dir)
             .kv_set(
                 "wb_model_catalog",
                 &json!({"models": [{"id": "glm-5.3", "display": "GLM-5.3", "context_length": 0,
                                "max_tokens": 0, "supports_image": true,
-                               "supported_efforts": [], "rate": 0.0}]}),
+                               "supported_efforts": [], "rate": 0.0}],
+                        "builtin_rev": crate::api_server::wb_catalog::BUILTIN_REV}),
             )
             .unwrap();
         super::super::config_cache::invalidate(&f.dir, "wb_model_catalog");
         let list = unified_models(&f.dir, true, true, true);
-        assert_eq!(find(&list, "glm-5.3").rate, Some(0.78), "WB 未声明倍率退 Trae 源");
+        assert_eq!(find(&list, "glm-5.3").rate, Some(0.0), "WB rate=0 = 免费声明（命中 buddy 侧透传）");
     }
 
     /// 同 canonical 重复 Trae 条目去重（首条胜出）

@@ -1,7 +1,8 @@
 /**
  * 全局 API 管理 · 网关使用帮助弹窗（GatewayHeader 帮助图标入口）
- * 左侧使用说明（端点 / 鉴权 / cURL 示例 / 资源调度说明，与 InterfaceConfig 文案一致）+
- * 右侧当前支持模型列表（供应商 / 模型名称 / 倍率 / 支持图片 / 来源池，带搜索过滤）。
+ * 左侧使用说明（端点 / 鉴权 / cURL 示例 / 资源调度 / 模型档位与 Max Mode，与 InterfaceConfig 文案一致）+
+ * 右侧当前支持模型列表（供应商 / 模型名称 / 倍率 / 档位 / Max Mode / 图片 / 来源池，
+ * table-fixed 定宽防横向滚动，带搜索过滤）。
  * 资源调度说明覆盖三层语义：自定义直达 → 池间选池（smart/priority+回退）→ 池内取号，
  * 并指向「资源总览 → 调度策略中心」调整入口（任务7）。
  * 数据源：unified_models（实时聚合 Trae / Buddy / 自定义 三池）+ gateway_settings_get（端口）。
@@ -166,6 +167,27 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
               </p>
             </div>
           </div>
+
+          <div className="rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-800/50">
+            <p className="mb-2 font-medium text-slate-700 dark:text-zinc-200">模型档位与 Max Mode</p>
+            <div className="space-y-1.5 leading-relaxed text-slate-500 dark:text-zinc-400">
+              <p>
+                <span className="font-medium text-slate-600 dark:text-zinc-300">思考档位：</span>
+                统一六档 minimal / low / medium / high / xhigh / max。请求体{' '}
+                <code>reasoning_effort</code>（OpenAI 兼容）或 <code>thinking</code>（Anthropic 兼容）
+                传入后按池自动映射——Trae 三档 light / high / extra_high，Buddy 按上游声明下发；
+                档位列取双池声明并集（统一档位值）。Trae 侧未实证的模型显式请求档位时按
+                统一映射填充默认下发，未显式请求时走上游默认（默认深度思考 high 仅对已实证模型生效）。
+              </p>
+              <p>
+                <span className="font-medium text-slate-600 dark:text-zinc-300">Max Mode（1M 上下文，仅 Trae 池）：</span>
+                右表「Max」列为 ✓ 的模型在 ID 后加 <code>-max</code> 后缀即可启用（如 <code>glm-5.3-max</code>），
+                网关自动剥离后缀并向 Trae 注入；也可在 OpenAI 兼容请求体直传{' '}
+                <code>&quot;is_max_mode&quot;: true</code>。表外模型加后缀不生效；
+                特例 <code>qwen3.8-max</code> 本身以 -max 结尾，启用需写 <code>qwen3.8-max-max</code>。
+              </p>
+            </div>
+          </div>
         </div>
 
         {/* 右：支持模型列表 */}
@@ -185,14 +207,16 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
             </div>
           </div>
           <div className="overflow-hidden rounded-lg border border-slate-200 dark:border-zinc-700">
-            <table className="w-full text-left text-xs">
+            <table className="w-full table-fixed text-left text-xs">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-[11px] text-slate-400 dark:border-zinc-700 dark:bg-zinc-800/50 dark:text-zinc-500">
-                  <th className="px-2.5 py-2 font-medium">供应商</th>
-                  <th className="px-2.5 py-2 font-medium">模型名称</th>
-                  <th className="px-2.5 py-2 text-right font-medium">倍率</th>
-                  <th className="px-2.5 py-2 text-center font-medium">图片</th>
-                  <th className="px-2.5 py-2 font-medium">来源</th>
+                  <th className="w-[9%] px-2 py-2 font-medium">供应商</th>
+                  <th className="w-[36%] px-2 py-2 font-medium">模型名称</th>
+                  <th className="w-[11%] px-2 py-2 text-right font-medium">倍率</th>
+                  <th className="w-[16%] px-2 py-2 font-medium" title="思考档位（统一六档）">档位</th>
+                  <th className="w-[6%] px-2 py-2 text-center font-medium" title="Max Mode（1M 上下文，仅 Trae 池）">Max</th>
+                  <th className="w-[6%] px-2 py-2 text-center font-medium">图片</th>
+                  <th className="w-[16%] px-2 py-2 font-medium">来源</th>
                 </tr>
               </thead>
               <tbody>
@@ -203,18 +227,13 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                       key={m.id}
                       className="border-b border-slate-100 text-slate-700 last:border-0 dark:border-zinc-800 dark:text-zinc-200"
                     >
-                      <td className="max-w-[8rem] truncate px-2.5 py-2" title={m.vendor || undefined}>
+                      <td className="truncate px-2 py-2" title={m.vendor || undefined}>
                         {m.vendor || '—'}
                       </td>
-                      <td className="px-2.5 py-2">
-                        <span
-                          className="block max-w-[14rem] truncate font-mono"
-                          title={m.display && m.display !== m.id ? `模型名称：${m.display}` : m.id}
-                        >
-                          {m.id}
-                        </span>
+                      <td className="px-2 py-2">
+                        <span className="block break-all font-mono leading-snug">{m.id}</span>
                       </td>
-                      <td className="px-2.5 py-2 text-right tabular-nums">
+                      <td className="px-2 py-2 text-right tabular-nums">
                         {m.rate == null ? (
                           <span className="text-slate-400 dark:text-zinc-500">—</span>
                         ) : m.rate === 0 ? (
@@ -223,7 +242,21 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                           `${m.rate.toFixed(2)}x`
                         )}
                       </td>
-                      <td className="px-2.5 py-2 text-center">
+                      <td className="truncate px-2 py-2 text-[11px]" title={m.efforts.length ? m.efforts.join(' / ') : undefined}>
+                        {m.efforts.length ? (
+                          <span className="font-mono text-slate-500 dark:text-zinc-400">{m.efforts.join('/')}</span>
+                        ) : (
+                          <span className="text-slate-400 dark:text-zinc-500">—</span>
+                        )}
+                      </td>
+                      <td className="px-2 py-2 text-center" title={m.max_mode ? '支持 Max Mode（模型 ID 加 -max 后缀启用）' : undefined}>
+                        {m.max_mode ? (
+                          <span className="text-emerald-600 dark:text-emerald-400">✓</span>
+                        ) : (
+                          <span className="text-slate-400 dark:text-zinc-500">—</span>
+                        )}
+                      </td>
+                      <td className="px-2 py-2 text-center">
                         {m.supports_image == null ? (
                           <span className="text-slate-400 dark:text-zinc-500">—</span>
                         ) : m.supports_image ? (
@@ -232,7 +265,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                           <span className="text-slate-400 dark:text-zinc-500">✗</span>
                         )}
                       </td>
-                      <td className="px-2.5 py-2">
+                      <td className="px-2 py-2">
                         <div className="flex flex-wrap gap-1">
                           {m.sources.map((s) => (
                             <Badge key={s.pool} tone={s.enabled ? 'slate' : 'amber'}>
@@ -247,7 +280,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 })}
                 {filtered.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="px-2.5 py-6 text-center text-slate-400 dark:text-zinc-500">
+                    <td colSpan={7} className="px-2 py-6 text-center text-slate-400 dark:text-zinc-500">
                       {models.length === 0 ? '模型目录加载中或为空' : '无匹配模型'}
                     </td>
                   </tr>

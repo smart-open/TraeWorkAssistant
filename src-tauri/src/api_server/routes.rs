@@ -162,7 +162,10 @@ const TRAE_EFFORT_FIELD: &str = "reasoning_effort_level";
 
 /// Trae 池 effort 解析（issue #31 T3.2/T3.3）：显式请求 > 路由级提示（后缀剥离
 /// 所得）> 默认深度思考，三源合成为统一档位后转 Trae wire（efforts::trae_request_wire：
-/// 实证表内精确命中或按降级链取兼容值；表外模型 supported 为空 → None 不下发）。
+/// 实证表内精确命中或按降级链取兼容值）。
+/// 实证表外模型（如档位仅 Buddy 侧声明、Trae 无实证）：显式客户端请求按统一→
+/// Trae 映射填充默认下发（efforts::trae_request_wire_fill）；合成默认（路由提示/
+/// 默认深度思考）不下发，保守走上游默认。
 /// 显式关闭以空串编码（Anthropic thinking disabled）：短路默认思考与路由提示
 fn trae_effort_wire(
     state: &ApiSharedState,
@@ -170,13 +173,17 @@ fn trae_effort_wire(
     explicit: Option<String>,
     model: &str,
 ) -> Option<String> {
+    let supported = efforts::trae_supported_wire(&unified_catalog::canonical_id(model));
+    if supported.is_empty() {
+        // 表外无实证：仅显式请求填充默认（统一→Trae 映射），合成默认不下发
+        return efforts::trae_request_wire_fill(explicit.as_deref());
+    }
     let requested = explicit.or(route_hint).or_else(|| {
         state
             .wb_default_thinking
             .load(std::sync::atomic::Ordering::Relaxed)
             .then(|| "high".to_string())
     });
-    let supported = efforts::trae_supported_wire(&unified_catalog::canonical_id(model));
     requested.and_then(|req| efforts::trae_request_wire(Some(&req), &supported))
 }
 
@@ -2142,7 +2149,8 @@ mod tests {
 
     /// 三源合成：显式请求 > 路由提示 > 默认思考；空串显式 = Anthropic thinking
     /// disabled 编码，短路为 None（同时压制默认思考与路由提示）；实证表外模型
-    /// 不下发（不按名称猜测）；canonical 归一命中实证表
+    /// 显式请求按统一→Trae 映射填充默认下发（合成默认不下发）；canonical 归一
+    /// 命中实证表
     #[test]
     fn trae_effort_wire_three_sources_and_short_circuit() {
         let f = wl_fixture("effort");
@@ -2184,10 +2192,18 @@ mod tests {
                 .is_none()
         );
 
-        // 实证表外模型：即便显式请求也不下发（supported 为空 → None）
-        assert!(
-            trae_effort_wire(&f.state, None, Some("high".into()), "deepseek-v4-flash").is_none()
+        // 实证表外模型（Trae 无实证，如档位仅 Buddy 侧声明）：显式请求填充默认
+        //（统一→Trae 映射直接下发）；合成默认（路由提示）不下发
+        assert_eq!(
+            trae_effort_wire(&f.state, None, Some("high".into()), "deepseek-v4-flash").as_deref(),
+            Some("high")
         );
+        assert_eq!(
+            trae_effort_wire(&f.state, None, Some("medium".into()), "deepseek-v4-flash")
+                .as_deref(),
+            Some("light")
+        );
+        assert!(trae_effort_wire(&f.state, Some("high".into()), None, "deepseek-v4-flash").is_none());
 
         // canonical 归一：大小写变体同样命中实证表
         assert_eq!(
