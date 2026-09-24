@@ -180,13 +180,34 @@ fn trae_effort_wire(
     requested.and_then(|req| efforts::trae_request_wire(Some(&req), &supported))
 }
 
-/// 注入 Trae effort wire 到请求体字节流（issue #31 T3.3）。wire=None → 原样返回。
-/// payload 层（prepare_llm_chat_body）为透传+增补模式，注入字段直达上游
-fn inject_trae_effort(body_vec: Vec<u8>, wire: Option<String>) -> Vec<u8> {
-    let Some(w) = wire else { return body_vec };
+/// Trae 出站 Max Mode 字段名（issue #31 T4.2，T0.3 客户端实证）：请求级布尔门控，
+/// 注入数值 1（客户端表达式 `is_max_mode:(…)&&t.isMaxMode?1:0`）；依赖上游
+/// 「未知字段忽略」惯例，仅入口标志置位且模型在支持表内才注入（表外不冒进）
+const TRAE_MAX_MODE_FIELD: &str = "is_max_mode";
+
+/// Trae 出站注入（issue #31 T3.3/T4.2）：effort wire 与 Max Mode 两路合并为单次
+/// parse/serialize（Max Mode 场景恰为大 body，避免重复往返）。两路均未激活时零
+/// parse 原样返回；非对象/非 JSON body 原样返回。payload 层（prepare_llm_chat_body）
+/// 为透传+增补模式，注入字段直达上游
+fn inject_trae_outbound(
+    body_vec: Vec<u8>,
+    wire: Option<String>,
+    max_mode_hint: bool,
+    model: &str,
+) -> Vec<u8> {
+    let inject_max =
+        max_mode_hint && efforts::trae_max_mode_supported(&unified_catalog::canonical_id(model));
+    if wire.is_none() && !inject_max {
+        return body_vec;
+    }
     match serde_json::from_slice::<Value>(&body_vec) {
         Ok(Value::Object(mut obj)) => {
-            obj.insert(TRAE_EFFORT_FIELD.to_string(), json!(w));
+            if let Some(w) = wire {
+                obj.insert(TRAE_EFFORT_FIELD.to_string(), json!(w));
+            }
+            if inject_max {
+                obj.insert(TRAE_MAX_MODE_FIELD.to_string(), json!(1));
+            }
             serde_json::to_vec(&obj).unwrap_or(body_vec)
         }
         _ => body_vec,
@@ -597,7 +618,7 @@ pub async fn chat_completions(
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
-                let body_vec = inject_trae_effort(body_vec, wire);
+                let body_vec = inject_trae_outbound(body_vec, wire, r.max_mode_hint, &r.model);
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard)
                 } else {
@@ -825,7 +846,7 @@ pub async fn messages(
                     _ => None,
                 };
                 let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
-                let body_vec = inject_trae_effort(body_vec, wire);
+                let body_vec = inject_trae_outbound(body_vec, wire, r.max_mode_hint, &r.model);
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard)
                 } else {
@@ -954,7 +975,7 @@ pub async fn completions(
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
                 let wire = trae_effort_wire(&state, r.effort_hint, None, &r.model);
-                let body_vec = inject_trae_effort(body_vec, wire);
+                let body_vec = inject_trae_outbound(body_vec, wire, r.max_mode_hint, &r.model);
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard)
                 } else {
@@ -2175,27 +2196,64 @@ mod tests {
         );
     }
 
-    /// wire 注入：None 原样返回；Some 时写入 reasoning_effort_level（T0.2 抓包后
-    /// 仅改 TRAE_EFFORT_FIELD 常量）且原字段保留；非对象/非 JSON body 原样返回
+    /// Trae 出站注入（issue #31 T3.3/T4.2，合并后单次 parse）：effort wire=Some 写
+    /// reasoning_effort_level（T0.2 抓包后仅改 TRAE_EFFORT_FIELD 常量）；Max Mode
+    /// 入口标志 + 支持表双门控、未请求不注入 0（保持请求最小化）、注入值 1（客户端
+    /// 实证 is_max_mode:…?1:0）；原字段保留；两路均未激活原样返回；非对象/非 JSON
+    /// body 原样返回
     #[test]
-    fn inject_trae_effort_wire_variants() {
+    fn inject_trae_outbound_variants() {
         let body = br#"{"model":"glm-5.3","messages":[]}"#.to_vec();
 
-        // None → 原样
-        assert_eq!(inject_trae_effort(body.clone(), None), body);
+        // 两路均未激活 → 原样（零 parse）
+        assert_eq!(
+            inject_trae_outbound(body.clone(), None, false, "glm-5.3"),
+            body
+        );
 
-        // Some → 注入字段，原字段保留
-        let out = inject_trae_effort(body, Some("extra_high".into()));
+        // effort 单路：注入字段，原字段保留
+        let out = inject_trae_outbound(body.clone(), Some("extra_high".into()), false, "glm-5.3");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["reasoning_effort_level"], "extra_high");
+        assert_eq!(v["model"], "glm-5.3");
+        assert!(v.get("is_max_mode").is_none());
+
+        // Max Mode 单路：注入 is_max_mode:1
+        let out = inject_trae_outbound(body.clone(), None, true, "glm-5.3");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["is_max_mode"], 1);
+        assert!(v.get("reasoning_effort_level").is_none());
+
+        // 支持表外模型不注入（不按名称冒进）
+        assert_eq!(
+            inject_trae_outbound(body.clone(), None, true, "doubao-seed-code"),
+            body
+        );
+
+        // canonical 归一：大小写变体同样命中支持表
+        let out = inject_trae_outbound(body.clone(), None, true, "GLM-5.3");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["is_max_mode"], 1);
+
+        // 双路并发：单次 parse 同时注入两字段
+        let out = inject_trae_outbound(body.clone(), Some("high".into()), true, "glm-5.3");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["reasoning_effort_level"], "high");
+        assert_eq!(v["is_max_mode"], 1);
         assert_eq!(v["model"], "glm-5.3");
 
         // 非对象 body（数组）→ 原样
         let arr = br#"[1,2,3]"#.to_vec();
-        assert_eq!(inject_trae_effort(arr.clone(), Some("high".into())), arr);
+        assert_eq!(
+            inject_trae_outbound(arr.clone(), Some("high".into()), true, "glm-5.3"),
+            arr
+        );
 
         // 非 JSON body → 原样
         let raw = b"not-json".to_vec();
-        assert_eq!(inject_trae_effort(raw.clone(), Some("high".into())), raw);
+        assert_eq!(
+            inject_trae_outbound(raw.clone(), Some("high".into()), true, "glm-5.3"),
+            raw
+        );
     }
 }

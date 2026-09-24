@@ -27,9 +27,11 @@ pub fn trae_rank(e: &str) -> Option<usize> {
     TRAE_ORDER.iter().position(|o| *o == e)
 }
 
-/// 统一 → Trae wire（越界钳制两端；未知值按最低档，保守）
+/// 统一 → Trae wire（越界钳制两端；未知值按最低档，保守）。
+/// 入口先 trim + 小写归一：外部 explicit 可能传 "High"/"HIGH" 等大小写变体，
+/// 归一后命中 high 而非静默落最低档 light（内部 route_hint 本为小写，幂等）
 pub fn unified_to_trae(unified: &str) -> &'static str {
-    match unified {
+    match unified.trim().to_lowercase().as_str() {
         "xhigh" | "max" => "extra_high",
         "high" => "high",
         _ => "light",
@@ -76,6 +78,32 @@ pub fn trae_declared_unified(canonical: &str) -> Vec<String> {
     out.sort_by_key(|e| unified_rank(e).unwrap_or(usize::MAX));
     out.dedup();
     out
+}
+
+// ==================== L3 文档参考表（Trae Max Mode，issue #31 T4.1） ====================
+
+/// Trae Max Mode 支持表（2026-09 T0.3 客户端实证 + docs.trae.cn/ide_max-mode）：
+/// Max Mode 为请求级布尔字段 `is_max_mode:1` 注入（客户端门控表达式
+/// `is_max_mode:(…)&&t.isMaxMode?1:0`），非模型名变体；支持集取官方文档
+/// Max Mode 1M 上下文档（原 unified_catalog::MAX_MODE_1M 占位迁入，单一事实源）。
+/// 表外模型不注入（未知字段不冒进，与 effort 实证表同规）
+pub const TRAE_MAX_MODE_REF: [&str; 11] = [
+    "doubao-seed-evolving",
+    "glm-5.3",
+    "glm-5.2",
+    "deepseek-v4-pro",
+    "deepseek-v4-pro-official",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-official",
+    "kimi-k3",
+    "minimax-m3",
+    "qwen3.8-max",
+    "qwen-3.7-plus",
+];
+
+/// Trae 模型是否支持 Max Mode（canonical 查表；表外 → false 不注入）
+pub fn trae_max_mode_supported(canonical: &str) -> bool {
+    TRAE_MAX_MODE_REF.contains(&canonical)
 }
 
 // ==================== 降级与并集 ====================
@@ -153,6 +181,10 @@ mod tests {
         assert_eq!(unified_to_trae("xhigh"), "extra_high");
         assert_eq!(unified_to_trae("minimal"), "light");
         assert_eq!(unified_to_trae("max"), "extra_high");
+        // 大小写/空白归一（外部 explicit 变体不静默落 light）
+        assert_eq!(unified_to_trae("HIGH"), "high");
+        assert_eq!(unified_to_trae(" MAX "), "extra_high");
+        assert_eq!(unified_to_trae("Bogus"), "light");
         assert_eq!(trae_to_unified("light"), Some("low"));
         assert_eq!(trae_to_unified("high"), Some("high"));
         assert_eq!(trae_to_unified("extra_high"), Some("xhigh"));
@@ -212,5 +244,16 @@ mod tests {
             vec!["low".to_string(), "medium".to_string(), "high".to_string()]
         );
         assert!(declared_union(&[vec![], vec![]]).is_empty());
+    }
+
+    /// Max Mode 支持表：表内命中；表外/空串不命中
+    #[test]
+    fn t07_max_mode_supported() {
+        assert!(trae_max_mode_supported("glm-5.3"));
+        assert!(trae_max_mode_supported("qwen3.8-max"));
+        assert!(trae_max_mode_supported("doubao-seed-evolving"));
+        assert!(!trae_max_mode_supported("doubao-seed-code"));
+        assert!(!trae_max_mode_supported("glm-5.3-flash"));
+        assert!(!trae_max_mode_supported(""));
     }
 }
