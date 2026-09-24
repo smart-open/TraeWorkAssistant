@@ -318,8 +318,6 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             api_server_cmd::dispatch_policy_set(state, policy).and_then(to_json)
         }
         "gateway_settings_get" => to_json(api_server_cmd::gateway_settings_get(state)),
-        // 局域网网卡 IPv4（issue #34：网关接入地址展示；无参数，不依赖状态）
-        "lan_iface_ips" => to_json(api_server_cmd::lan_iface_ips()),
         "gateway_settings_set" => {
             let settings = arg(&args, "settings")?;
             api_server_cmd::gateway_settings_set(state, settings).and_then(to_json)
