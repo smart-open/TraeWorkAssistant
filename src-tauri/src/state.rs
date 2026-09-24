@@ -241,6 +241,24 @@ impl AppState {
             s.wb_growth_enabled = true;
             s.wb_growth_hhmm = "09:00".into();
         }
+        // 模型目录每日同步（Buddy/Trae）：同款零值回填（默认开）；同步幂等且不消耗积分，
+        // 无账号时调度器静默跳过，默认开安全
+        if s.wb_catalog_sync_hhmm.trim().is_empty() {
+            s.wb_catalog_sync_enabled = true;
+            s.wb_catalog_sync_hhmm = "05:45".into();
+        }
+        if s.trae_models_sync_hhmm.trim().is_empty() {
+            s.trae_models_sync_enabled = true;
+            s.trae_models_sync_hhmm = "05:40".into();
+        }
+        // 看板数据同步模式零值归一：空/未知值视为默认 daily（时刻由调度器回退内置默认），
+        // 显式 "off"/"hourly"/"daily" 原样生效
+        if s.wb_credits_sync_mode.trim().is_empty() {
+            s.wb_credits_sync_mode = "daily".into();
+        }
+        if s.trae_credits_sync_mode.trim().is_empty() {
+            s.trae_credits_sync_mode = "daily".into();
+        }
         // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，Trae/Buddy 共用）：
         // app_settings 渠道字段双 None 时从旧 workbuddy_settings 一次性搬运。
         // 命中即 kv_set 回写持久化——push_notify 裸读 kv 不经过本函数，仅内存视图会让

@@ -282,6 +282,22 @@ export interface Settings {
   wb_growth_enabled: boolean;
   /** WorkBuddy 成长任务调度触发时刻 HH:MM（默认 09:00，任务配置页可改） */
   wb_growth_hhmm: string;
+  /** Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM，默认） */
+  wb_credits_sync_mode: string;
+  /** Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻） */
+  wb_credits_sync_hhmm: string;
+  /** Trae 积分数据同步模式：off | hourly | daily（默认） */
+  trae_credits_sync_mode: string;
+  /** Trae 积分同步触发时刻 HH:MM（daily 模式生效，默认 23:40 对齐原快照时刻） */
+  trae_credits_sync_hhmm: string;
+  /** Buddy 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过） */
+  wb_catalog_sync_enabled: boolean;
+  /** Buddy 模型目录同步触发时刻 HH:MM（默认 05:45） */
+  wb_catalog_sync_hhmm: string;
+  /** Trae 官网模型列表每日同步开关（API 服务页，默认开；无账号时调度静默跳过） */
+  trae_models_sync_enabled: boolean;
+  /** Trae 模型列表同步触发时刻 HH:MM（默认 05:40） */
+  trae_models_sync_hhmm: string;
   // ── 通知渠道（F-19；Trae/Buddy 全平台共用，系统设置页通知渠道面板维护） ──
   /** 通知总开关（默认开；关闭后所有事件渠道静默） */
   notify_enabled: boolean;

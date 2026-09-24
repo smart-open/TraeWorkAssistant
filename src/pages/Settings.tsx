@@ -411,6 +411,46 @@ export default function Settings() {
               {taskInfo}
             </pre>
           )}
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          {/* 积分数据同步：应用内置调度器（模式/时刻随底部「保存设置」生效） */}
+          <h3 className="mb-1 font-medium">积分数据同步</h3>
+          <p className="mb-3 text-xs text-slate-400">
+            应用运行期间按所选模式自动拉取账号积分并刷新看板（含积分快照与到期数据）；无账号时静默跳过，
+            失败 30 分钟后自动重试。模式与时刻随底部「保存设置」生效。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="label !mb-0">同步模式</label>
+            <select
+              className="input h-9 !w-32 text-sm"
+              value={form.trae_credits_sync_mode}
+              onChange={(e) => update('trae_credits_sync_mode', e.target.value)}
+            >
+              <option value="daily">每日定时</option>
+              <option value="hourly">每小时</option>
+              <option value="off">关闭</option>
+            </select>
+            {form.trae_credits_sync_mode === 'daily' && (
+              <>
+                <div className="relative flex items-center">
+                  <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
+                  <input
+                    type="time"
+                    value={form.trae_credits_sync_hhmm}
+                    onChange={(e) => update('trae_credits_sync_hhmm', e.target.value || '23:40')}
+                    className="input h-9 !w-32 pl-8 text-sm"
+                  />
+                </div>
+                <span className="text-xs text-slate-400">
+                  每天 {form.trae_credits_sync_hhmm || '23:40'} 执行（应用关闭期间不执行）
+                </span>
+              </>
+            )}
+            {form.trae_credits_sync_mode === 'hourly' && (
+              <span className="text-xs text-slate-400">应用运行期间每小时同步一次</span>
+            )}
+          </div>
         </section>
       </div>
 

@@ -565,7 +565,13 @@ fn scan_root(
 /// fresh=true（前端「重扫」按钮）跳过结果缓存强制重扫（仍享受增量缓存）。
 #[tauri::command(async)]
 pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Value {
-    if !fresh.unwrap_or(false) {
+    workbuddy_token_stats_impl(&state, fresh.unwrap_or(false))
+}
+
+/// 实现（本命令与调度器 wb-credits-snapshot Token 同步共用）：
+/// fresh=true（前端「重扫」/调度同步）跳过结果缓存强制重扫（仍享受增量缓存）
+pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value {
+    if !fresh {
         if let Ok(guard) = RESULT_CACHE.lock() {
             if let Some((at, v)) = guard.as_ref() {
                 if at.elapsed().as_secs() < RESULT_TTL_SECS {
@@ -620,7 +626,7 @@ pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Val
     merged["generated_at"] = json!(now_ms);
     merged["window_days"] = json!(WINDOW_DAYS);
     merged["cache_hit_files"] = json!(seen.len().saturating_sub(0));
-    merged["fresh"] = json!(fresh.unwrap_or(false));
+    merged["fresh"] = json!(fresh);
 
     if let Ok(mut guard) = RESULT_CACHE.lock() {
         *guard = Some((Instant::now(), merged.clone()));
