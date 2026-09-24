@@ -16,13 +16,17 @@ import type { SchedulerTaskView } from '../types';
 const TASK_DESC: Record<string, string> = {
   'trae-jwt-renew': '临期 JWT 自动续期，剩余有效期 > 48h 时自动跳过',
   'models-sync': '同步官网模型列表（不消耗积分），供网关与模型选择器使用',
+  'wb-catalog-sync': '同步 Buddy 上游模型目录（不消耗积分），供网关模型映射使用',
   'trae-checkin': '全账号每日自动签到，已签账号自动跳过（幂等）',
   'wb-checkin': '每日自动签到；服务启动后也会自动补签当日签到',
   'wb-growth': '每日成长任务（旅行/盲盒/任务三开关驱动，全关时空轮）',
   'wb-renew': 'Token 到期前 24h 内自动续期（兜底，每日检查一次）',
-  'wb-credits-snapshot': '积分余额每日快照，补齐积分看板近 7 日消耗趋势',
+  'wb-credits-snapshot': '积分余额快照 + 官方用量刷新，补齐积分看板近 7 日消耗趋势',
   'trae-credits-snapshot': '积分余额每日快照，补齐积分看板消耗趋势',
 };
+
+/** 可配置「每小时」模式的任务（看板数据同步类，与服务端 HOURLY_CAPABLE 对齐） */
+const HOURLY_TASKS = ['wb-credits-snapshot', 'trae-credits-snapshot'];
 
 /** 外部接管开关（wb-checkin → settings.auto_checkin）：checked + 切换回调 */
 export interface TaskToggleOverride {
@@ -51,6 +55,8 @@ export default function SchedulerTasksCard({
   const [disabled, setDisabled] = useState<string[]>([]);
   /** 自定义触发时刻表（key → HH:MM；空 = 默认时刻，状态接口回显生效值） */
   const [times, setTimes] = useState<Record<string, string>>({});
+  /** 执行模式表（key → "daily" | "hourly"；缺省 = 每日，仅看板同步类任务可 hourly） */
+  const [modes, setModes] = useState<Record<string, string>>({});
   const [toggling, setToggling] = useState<string | null>(null);
   const [timeSaving, setTimeSaving] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
@@ -65,6 +71,7 @@ export default function SchedulerTasksCard({
       .then((c) => {
         setDisabled(c.disabled_tasks);
         setTimes(c.task_times ?? {});
+        setModes(c.task_modes ?? {});
       })
       .catch(() => setDisabled([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -85,8 +92,8 @@ export default function SchedulerTasksCard({
     setDisabled(nextList);
     setToggling(key);
     try {
-      // config_set 为整表替换：必须同时携带自定义时刻，否则会被清空
-      const saved = await api.scheduler.configSet({ disabled_tasks: nextList, task_times: times });
+      // config_set 为整表替换：必须同时携带自定义时刻与执行模式，否则会被清空
+      const saved = await api.scheduler.configSet({ disabled_tasks: nextList, task_times: times, task_modes: modes });
       setDisabled(saved.disabled_tasks);
       setTimes(saved.task_times ?? {});
       pushToast('success', next ? '任务已启用，明日按计划执行' : '任务已停用');
@@ -112,7 +119,7 @@ export default function SchedulerTasksCard({
     setTimes(next);
     setTimeSaving(key);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: next });
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: next, task_modes: modes });
       setTimes(saved.task_times ?? {});
       pushToast('success', value ? `执行时间已改为 ${value}（当天已过新时刻会自动补跑）` : '已恢复默认执行时间');
       api.scheduler
@@ -127,13 +134,32 @@ export default function SchedulerTasksCard({
     }
   };
 
+  /** 切换执行模式（每日/每小时，仅看板同步类任务）：距上次成功 ≥1h 才再跑（hourly） */
+  const saveMode = async (key: string, mode: string) => {
+    const prev = modes;
+    const next = { ...prev, [key]: mode };
+    setModes(next);
+    setToggling(key);
+    try {
+      const saved = await api.scheduler.configSet({ disabled_tasks: disabled, task_times: times, task_modes: next });
+      setModes(saved.task_modes ?? {});
+      pushToast('success', mode === 'hourly' ? '已改为每小时执行（距上次成功 ≥1 小时才再跑）' : '已改为每日定时执行');
+    } catch (e) {
+      setModes(prev);
+      pushToast('error', e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setToggling(null);
+    }
+  };
+
   /** 恢复推荐配置：清空停用名单与自定义时刻（全部启用 + 默认时刻） */
   const resetRecommended = async () => {
     setResetting(true);
     try {
-      const saved = await api.scheduler.configSet({ disabled_tasks: [], task_times: {} });
+      const saved = await api.scheduler.configSet({ disabled_tasks: [], task_times: {}, task_modes: {} });
       setDisabled(saved.disabled_tasks);
       setTimes(saved.task_times ?? {});
+      setModes(saved.task_modes ?? {});
       pushToast('success', '已恢复推荐配置（全部任务启用 + 默认时刻）');
       api.scheduler
         .status()
@@ -192,7 +218,19 @@ export default function SchedulerTasksCard({
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-medium">{t?.name ?? key}</span>
-                    {t && (
+                    {t && HOURLY_TASKS.includes(key) && (
+                      <select
+                        value={modes[key] === 'hourly' ? 'hourly' : 'daily'}
+                        disabled={toggling === key}
+                        onChange={(e) => void saveMode(key, e.target.value)}
+                        className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-xs text-slate-600 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                        title="执行模式：每日定时或每小时（距上次成功 ≥1 小时才再跑）"
+                      >
+                        <option value="daily">每日</option>
+                        <option value="hourly">每小时</option>
+                      </select>
+                    )}
+                    {t && !(HOURLY_TASKS.includes(key) && modes[key] === 'hourly') && (
                       <input
                         type="time"
                         value={t.time}

@@ -423,6 +423,16 @@ pub fn workbuddy_usage_official(
     user_id: Option<String>,
     refresh: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    workbuddy_usage_official_impl(state, user_id, refresh.unwrap_or(false))
+}
+
+/// 实现（本命令与调度器 wb-credits-snapshot 用量刷新共用）：
+/// refresh=true 跳过 10min 缓存强制上游拉取；无可用凭证账号时 Err（调用方自行降级）
+pub(crate) fn workbuddy_usage_official_impl(
+    state: &AppState,
+    user_id: Option<String>,
+    refresh: bool,
+) -> Result<serde_json::Value, String> {
     let cache_path = "workbuddy_usage_official_cache"; // kv 键（SQLite 化 P2）
 
     // 选号：user_id → auth 文件当前账号 → 首个有 token store 凭证的账号
@@ -459,7 +469,7 @@ pub fn workbuddy_usage_official(
         let c: serde_json::Value = crate::store::db(&state.data_dir).kv_get(cache_path);
         (c.get("status").is_some()).then_some(c)
     };
-    if !refresh.unwrap_or(false) {
+    if !refresh {
         if let Some(cached) = &cached_val {
             let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
             let cached_acct = cached.get("account_id").and_then(Value::as_str);

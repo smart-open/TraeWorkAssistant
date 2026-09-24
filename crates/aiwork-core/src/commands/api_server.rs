@@ -272,9 +272,27 @@ pub async fn api_models_sync(state: &AppState) -> Result<Vec<models_sync::ModelO
         .map_err(|e| format!("同步任务执行失败: {e}"))?
 }
 
+/// WB 上游模型目录同步实现（手动同步命令与调度器 wb-catalog-sync 共用）：
+/// 取首个含凭证的 WB 账号拉取并替换目录；无凭证账号时 Err（调度侧转为静默跳过）
+pub(crate) fn wb_catalog_sync_impl(state: &AppState) -> Result<usize, String> {
+    let accounts = crate::api_server::runtime::wb_upstream_accounts(state);
+    let acct = accounts
+        .first()
+        .ok_or("无可用 WB 账号凭证，无法拉取上游目录")?;
+    crate::api_server::wb_catalog::fetch_and_replace(
+        &state.data_dir,
+        &acct.uid,
+        &acct.token,
+        &acct.domain,
+        &acct.enterprise_id,
+        acct.global_region,
+    )
+}
+
 /// 从 WB 上游模型目录接口同步 wb_model_catalog.json（T5.1/F-37，动态替换；
 /// 网关启动时已自动做一次，此命令供手动刷新）。取任一含凭证的 WB 账号。
 pub async fn api_wb_catalog_sync(state: &AppState) -> Result<usize, String> {
+    // 阻塞网络请求放入阻塞线程池，避免卡住异步运行时
     let data_dir = state.data_dir.clone();
     let accounts = crate::api_server::runtime::wb_upstream_accounts(state);
     tokio::task::spawn_blocking(move || {

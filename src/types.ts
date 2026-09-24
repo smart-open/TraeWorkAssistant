@@ -244,6 +244,8 @@ export interface SchedulerTaskView {
   name: string;
   /** 每日触发时刻 HH:MM */
   time: string;
+  /** 执行模式：daily（每日 HH:MM，默认）| hourly（每小时，仅看板同步类）| off（已关闭） */
+  mode?: string;
   /** 当前是否启用（用户开关 + 既有设置语义合成） */
   enabled: boolean;
   last_run_date: string | null;
@@ -258,6 +260,8 @@ export interface SchedulerConfig {
   disabled_tasks: string[];
   /** 自定义触发时刻（key → HH:MM）；空对象 = 全部用默认时刻 */
   task_times?: Record<string, string>;
+  /** 执行模式（key → "daily" | "hourly"）；仅看板同步类任务可 hourly，缺省 = 每日 */
+  task_modes?: Record<string, string>;
 }
 
 export interface CheckinOpts {

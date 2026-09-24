@@ -43,6 +43,9 @@ const TASKS: &[SchedTask] = &[
     // 官网模型列表每日同步（batch_get_detail_param，不消耗积分），供网关模型映射与
     // 前端模型选择器使用；此前仅 API 服务页手动触发，自动化后「自动同步服务器数据」闭环
     SchedTask { key: "models-sync", name: "Trae 模型列表同步", hhmm: "05:40" },
+    // WorkBuddy 上游模型目录同步（移植 main@c8e855b）：与 models-sync 对称（wb_catalog
+    // fetch_and_replace 同款实现），默认开 05:45；无凭证账号时任务内部静默跳过不计失败
+    SchedTask { key: "wb-catalog-sync", name: "WorkBuddy 模型目录同步", hhmm: "05:45" },
     SchedTask { key: "trae-checkin", name: "Trae 每日签到", hhmm: "09:00" },
     SchedTask { key: "wb-checkin", name: "WorkBuddy 每日签到", hhmm: "09:10" },
     // WorkBuddy 每日成长（issue #27 随 ad63bdc 移植）：成长三开关驱动（旅行/盲盒/任务），
@@ -69,6 +72,35 @@ pub fn start(state: AppState) {
 /// 失败重试冷却：失败后 30 分钟内不重复尝试（避免每 60s tick 连打）
 const RETRY_COOLDOWN_MS: i64 = 30 * 60_000;
 
+/// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走 30 分钟冷却，不受此门限制）
+const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
+
+/// 可配置「每小时」模式的任务（看板数据同步类，移植 main@c8e855b 的 credits 语义）：
+/// 仅这些任务接受 scheduler_cfg.task_modes 的 hourly 值，其余任务恒为每日模式
+const HOURLY_CAPABLE: &[&str] = &["wb-credits-snapshot", "trae-credits-snapshot"];
+
+/// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
+/// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）
+enum SchedPlan {
+    Skip,
+    Daily(String),
+    Hourly,
+}
+
+/// 单任务调度计划：合并启用判定与模式/时刻解析（tick 与 scheduler_status 共用）
+fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
+    if !enabled(st, t.key) {
+        return SchedPlan::Skip;
+    }
+    if HOURLY_CAPABLE.contains(&t.key)
+        && task_modes(st).get(t.key).map(String::as_str) == Some("hourly")
+    {
+        SchedPlan::Hourly
+    } else {
+        SchedPlan::Daily(effective_hhmm(st, t))
+    }
+}
+
 /// 单轮 tick：检查每个任务「今天已过触发时刻 && 今天未跑」→ 执行
 fn tick(st: &AppState) {
     let now = chrono::Local::now();
@@ -76,21 +108,30 @@ fn tick(st: &AppState) {
     let now_hm = now.format("%H:%M").to_string();
     // T11：通知配置整轮读一次（签到成功/任务失败推送，内部再按总开关静默）
     let notify_cfg = crate::notify::load_config(st);
-    // 自定义时刻整轮读一次（kv 单读，各任务共用）
-    let times = task_times(st);
     for t in TASKS {
-        // 各任务启用判定（与既有设置语义保持一致）
-        if !enabled(st, t.key) {
-            continue;
-        }
-        if last_run_date(st, t.key).as_deref() == Some(today.as_str()) {
-            continue;
-        }
-        // 生效时刻：自定义覆盖 > 默认；HH:MM 零填充，字符串比较即时间序
-        let hhmm = times.get(t.key).map(String::as_str).unwrap_or(t.hhmm);
-        if now_hm.as_str() < hhmm {
-            continue;
-        }
+        // 触发判定（trigger 用于日志展示：每日 HH:MM 或「每小时」）
+        let trigger = match sched_plan(st, t) {
+            SchedPlan::Skip => continue,
+            SchedPlan::Daily(hhmm) => {
+                if last_run_date(st, t.key).as_deref() == Some(today.as_str()) {
+                    continue;
+                }
+                // HH:MM 零填充，字符串比较即时间序
+                if now_hm.as_str() < hhmm.as_str() {
+                    continue;
+                }
+                format!("每日 {hhmm}")
+            }
+            SchedPlan::Hourly => {
+                // hourly 按小时节流：仅成功执行记 last_run_ts（mark_run）
+                if let Some(ts) = last_run_ts(st, t.key) {
+                    if chrono::Utc::now().timestamp_millis() - ts < HOURLY_INTERVAL_MS {
+                        continue;
+                    }
+                }
+                "每小时".to_string()
+            }
+        };
         // 失败冷却：30 分钟内静默等待重试，不重复执行也不刷日志
         if let Some(ts) = last_fail_ts(st, t.key) {
             if chrono::Utc::now().timestamp_millis() - ts < RETRY_COOLDOWN_MS {
@@ -109,7 +150,7 @@ fn tick(st: &AppState) {
                 mark_run(st, t.key, &today, &summary);
                 fs_utils::app_log(
                     &st.data_dir,
-                    &format!("[调度器] {}（每日 {hhmm}）：{}", t.name, summary),
+                    &format!("[调度器] {}（{trigger}）：{}", t.name, summary),
                 );
                 // T11：仅签到类任务完成时推送（快照/续期类静默，避免每日刷屏）
                 if notify_cfg.on_checkin_done && matches!(t.key, "trae-checkin" | "wb-checkin") {
@@ -121,7 +162,7 @@ fn tick(st: &AppState) {
                 fs_utils::app_log(
                     &st.data_dir,
                     &format!(
-                        "[调度器] {}（每日 {hhmm}）失败，30 分钟后重试：{}",
+                        "[调度器] {}（{trigger}）失败，30 分钟后重试：{}",
                         t.name, summary
                     ),
                 );
@@ -178,6 +219,28 @@ fn task_times(st: &AppState) -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// 任务执行模式表（key → "hourly"；缺省 = 每日）：scheduler_cfg.task_modes，
+/// 仅 HOURLY_CAPABLE 内的任务生效（移植 main@c8e855b 看板数据同步 hourly 语义）
+fn task_modes(st: &AppState) -> std::collections::HashMap<String, String> {
+    load_cfg(st)
+        .get("task_modes")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 任务生效触发时刻：task_times 自定义覆盖 > 内置默认（HH:MM 零填充，字符串比较即时间序）
+fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
+    task_times(st)
+        .get(t.key)
+        .cloned()
+        .unwrap_or_else(|| t.hhmm.to_string())
+}
+
 fn load_cfg(st: &AppState) -> Value {
     let v: Value = crate::store::db(&st.data_dir).kv_get("scheduler_cfg");
     if v.is_object() { v } else { json!({}) }
@@ -188,6 +251,7 @@ pub fn scheduler_config_get(st: &AppState) -> Value {
     json!({
         "disabled_tasks": disabled_tasks(st),
         "task_times": task_times(st),
+        "task_modes": task_modes(st),
     })
 }
 
@@ -232,16 +296,33 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
             times.insert(k.clone(), s.to_string());
         }
     }
+    // 执行模式（移植 main@c8e855b）：仅 hourly/daily 两值，且仅看板同步类任务可 hourly；
+    // 整表替换（空对象 = 全部回每日）。非 hourly-capable 键一律拒绝，防前端误传。
+    let mut modes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(m) = cfg.get("task_modes") {
+        let obj = m.as_object().ok_or("task_modes 应为对象")?;
+        for (k, v) in obj {
+            if !HOURLY_CAPABLE.contains(&k.as_str()) {
+                return Err(format!("任务 {k} 不支持配置执行模式"));
+            }
+            let s = v.as_str().ok_or_else(|| format!("任务 {k} 的模式应为 \"daily\" 或 \"hourly\""))?;
+            if s != "daily" && s != "hourly" {
+                return Err(format!("任务 {k} 的模式 {s} 非法（应为 daily/hourly）"));
+            }
+            modes.insert(k.clone(), s.to_string());
+        }
+    }
     let _ = crate::store::db(&st.data_dir).kv_set(
         "scheduler_cfg",
-        &json!({ "disabled_tasks": disabled, "task_times": times }),
+        &json!({ "disabled_tasks": disabled, "task_times": times, "task_modes": modes }),
     );
     fs_utils::app_log(
         &st.data_dir,
         &format!(
-            "[调度器] 任务配置已更新：{} 项停用，{} 项自定义时刻",
+            "[调度器] 任务配置已更新：{} 项停用，{} 项自定义时刻，{} 项每小时模式",
             disabled.len(),
-            times.len()
+            times.len(),
+            modes.iter().filter(|(_, v)| v.as_str() == "hourly").count()
         ),
     );
     Ok(scheduler_config_get(st))
@@ -293,15 +374,30 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         }
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
         "wb-renew" => Ok(crate::tasks::wb_checkin::run_renew_only(st, 24)),
-        // WorkBuddy 积分余额每日快照：补齐近 7 日消耗差分时序
-        "wb-credits-snapshot" => crate::commands::workbuddy::wb_credits_snapshot_task(st).map(
-            |p| {
-                json!({
-                    "ok": true,
-                    "accounts": p.get("accounts").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)
-                })
-            },
-        ),
+        // WorkBuddy 积分余额每日快照：补齐近 7 日消耗差分时序；顺带刷新官方请求用量
+        //（尽力而为不上抛——页面打开时本就有各自缓存/降级链路）
+        "wb-credits-snapshot" => {
+            let parsed = crate::commands::workbuddy::wb_credits_snapshot_task(st)?;
+            let usage = match crate::commands::workbuddy::workbuddy_usage_official_impl(st, None, true)
+            {
+                Ok(_) => "已刷新",
+                Err(_) => "跳过（无可用凭证或拉取失败）",
+            };
+            Ok(json!({
+                "ok": true,
+                "accounts": parsed.get("accounts").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
+                "usage": usage,
+            }))
+        }
+        // WorkBuddy 上游模型目录同步：取首个含凭证 WB 账号；无凭证账号静默跳过不计失败
+        "wb-catalog-sync" => {
+            if crate::api_server::runtime::wb_upstream_accounts(st).is_empty() {
+                Ok(json!({ "ok": true, "skipped": "无可用 WB 账号凭证" }))
+            } else {
+                crate::commands::api_server::wb_catalog_sync_impl(st)
+                    .map(|n| json!({ "ok": true, "models": n }))
+            }
+        }
         // Trae 积分余额每日快照：与 `--task-run refresh-credits` 同款
         "trae-credits-snapshot" => accounts::refresh_remaining_credits_impl(st)
             .map(|n| json!({ "ok": true, "refreshed": n })),
@@ -366,6 +462,13 @@ fn last_run_date(st: &AppState, key: &str) -> Option<String> {
 fn last_fail_ts(st: &AppState, key: &str) -> Option<i64> {
     load_state(st)
         .pointer(&format!("/tasks/{key}/last_fail_ts"))
+        .and_then(Value::as_i64)
+}
+
+/// 最近一次成功执行时间戳（hourly 模式节流用；mark_run 写入）
+fn last_run_ts(st: &AppState, key: &str) -> Option<i64> {
+    load_state(st)
+        .pointer(&format!("/tasks/{key}/last_run_ts"))
         .and_then(Value::as_i64)
 }
 
@@ -435,6 +538,12 @@ pub fn scheduler_status(st: &AppState) -> Value {
                 "key": t.key,
                 "name": t.name,
                 "time": times.get(t.key).cloned().unwrap_or_else(|| t.hhmm.to_string()),
+                // 执行模式（daily/hourly/off）：前端据此切换时刻输入与每小时徽标
+                "mode": match sched_plan(st, t) {
+                    SchedPlan::Hourly => "hourly",
+                    SchedPlan::Daily(_) => "daily",
+                    SchedPlan::Skip => "off",
+                },
                 "enabled": enabled(st, t.key),
                 "last_run_date": e.get("last_run_date").cloned().unwrap_or(Value::Null),
                 "last_run_ts": e.get("last_run_ts").cloned().unwrap_or(Value::Null),
