@@ -340,12 +340,14 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                     .map(|list| json!({ "ok": true, "models": list.len() }))
             }
         }
-        // WorkBuddy 上游模型目录同步：取首个含凭证 WB 账号；无凭证账号静默跳过不计失败
+        // WorkBuddy 上游模型目录同步：wb_upstream_accounts 取一次共用（判空跳过 + impl 首账号）；
+        // 无凭证账号静默跳过不计失败
         "wb-catalog-sync" => {
-            if crate::commands::workbuddy::wb_upstream_accounts(st).is_empty() {
+            let accounts = crate::commands::workbuddy::wb_upstream_accounts(st);
+            if accounts.is_empty() {
                 Ok(json!({ "ok": true, "skipped": "无可用 WB 账号凭证" }))
             } else {
-                crate::commands::api_server::wb_catalog_sync_impl(st)
+                crate::commands::api_server::wb_catalog_sync_impl(&st.data_dir, &accounts)
                     .map(|n| json!({ "ok": true, "models": n }))
             }
         }

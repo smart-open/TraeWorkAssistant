@@ -133,10 +133,13 @@ export default function ApiService() {
   const saveModelsSyncCfg = async () => {
     setSavingModelsSyncCfg(true);
     try {
-      await api.misc.settingsSet({
-        trae_models_sync_enabled: modelsSyncCfg.enabled,
-        trae_models_sync_hhmm: modelsSyncCfg.hhmm.trim() || '05:40',
-      });
+      await withMinDelay(
+        api.misc.settingsSet({
+          trae_models_sync_enabled: modelsSyncCfg.enabled,
+          trae_models_sync_hhmm: modelsSyncCfg.hhmm.trim() || '05:40',
+        }),
+        400,
+      );
       toast(
         'success',
         modelsSyncCfg.enabled ? `已保存：每天 ${modelsSyncCfg.hhmm || '05:40'} 自动同步官网模型` : '已关闭定时同步（仅手动同步）',

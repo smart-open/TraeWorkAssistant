@@ -213,10 +213,13 @@ export default function BuddyApiService() {
   const saveCatSync = async () => {
     setSavingCatSync(true);
     try {
-      await api.misc.settingsSet({
-        wb_catalog_sync_enabled: catSync.enabled,
-        wb_catalog_sync_hhmm: catSync.hhmm.trim() || '05:45',
-      });
+      await withMinDelay(
+        api.misc.settingsSet({
+          wb_catalog_sync_enabled: catSync.enabled,
+          wb_catalog_sync_hhmm: catSync.hhmm.trim() || '05:45',
+        }),
+        400,
+      );
       pushToast(
         'success',
         catSync.enabled ? `已保存：每天 ${catSync.hhmm || '05:45'} 自动同步官网模型` : '已关闭定时同步（仅手动同步）',

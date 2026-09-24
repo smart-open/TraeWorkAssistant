@@ -807,30 +807,23 @@ pub async fn api_wb_catalog_sync(state: State<'_, AppState>) -> Result<usize, St
     // 阻塞网络请求放入阻塞线程池，避免卡住异步运行时
     let data_dir = state.data_dir.clone();
     let accounts = crate::commands::workbuddy::wb_upstream_accounts(&state);
-    tauri::async_runtime::spawn_blocking(move || {
-        let acct = accounts.first().ok_or("无可用 WB 账号凭证，无法拉取上游目录")?;
-        crate::api_server::wb_catalog::fetch_and_replace(
-            &data_dir,
-            &acct.uid,
-            &acct.token,
-            &acct.domain,
-            &acct.enterprise_id,
-            acct.global_region,
-        )
-    })
-    .await
-    .map_err(|e| format!("同步任务执行失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || wb_catalog_sync_impl(&data_dir, &accounts))
+        .await
+        .map_err(|e| format!("同步任务执行失败: {e}"))?
 }
 
-/// WB 上游模型目录同步实现（调度器 wb-catalog-sync 与上面手动同步命令共用）：
-/// 取首个含凭证的 WB 账号拉取并替换目录；无凭证账号时 Err（调度侧转为静默跳过）
-pub(crate) fn wb_catalog_sync_impl(state: &AppState) -> Result<usize, String> {
-    let accounts = crate::commands::workbuddy::wb_upstream_accounts(state);
+/// WB 上游模型目录同步实现（手动命令与调度器 wb-catalog-sync 共用）：
+/// accounts 由调用方取好（wb_upstream_accounts，避免双读 pool/token store），
+/// 取首个含凭证账号拉取并替换目录；空列表时 Err（调度侧据此转静默跳过不计失败）
+pub(crate) fn wb_catalog_sync_impl(
+    data_dir: &std::path::Path,
+    accounts: &[crate::api_server::pool::WbSyncAccount],
+) -> Result<usize, String> {
     let acct = accounts
         .first()
         .ok_or("无可用 WB 账号凭证，无法拉取上游目录")?;
     crate::api_server::wb_catalog::fetch_and_replace(
-        &state.data_dir,
+        data_dir,
         &acct.uid,
         &acct.token,
         &acct.domain,
