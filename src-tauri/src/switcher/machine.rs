@@ -18,10 +18,12 @@ fn random_digits(n: usize) -> String {
 }
 
 /// 重置 6 层机器码中的 MachineGuid（需管理员）。非管理员时跳过并提示，不阻断切换。
+/// 注意：必须用 create()（KEY_READ|KEY_WRITE）——open() 仅 KEY_READ 只读句柄，
+/// set_string 必然拒绝访问（os error 5），管理员权限下也一样（issue #33）。
 pub fn reset_machine_id(sink: &dyn ProgressSink) -> Result<(), String> {
     let new_guid = uuid::Uuid::new_v4().to_string();
     match windows_registry::LOCAL_MACHINE
-        .open("SOFTWARE\\Microsoft\\Cryptography")
+        .create("SOFTWARE\\Microsoft\\Cryptography")
         .and_then(|k| k.set_string("MachineGuid", &new_guid))
     {
         Ok(()) => sink.step(
@@ -121,18 +123,18 @@ pub fn reset_device_ids_only(sess: &Session, sink: &dyn ProgressSink) -> Result<
         match edit_storage_device_ids(&storage_file, &new_machine_id, &new_sqm_id, &new_device_id)
         {
             Ok(true) => {
-                sink.step("device", StepStatus::Ok, "[2/3] storage.json 设备标识已重置");
+                sink.step("device", StepStatus::Ok, "[2-3/6] storage.json 设备标识已重置");
                 reset_count += 1;
             }
-            Ok(false) => sink.step("device", StepStatus::Skip, "[2/3] storage.json 无需修改"),
+            Ok(false) => sink.step("device", StepStatus::Skip, "[2-3/6] storage.json 无需修改"),
             Err(e) => sink.step(
                 "device",
                 StepStatus::Skip,
-                &format!("[2/3] storage.json 重置失败: {e}"),
+                &format!("[2-3/6] storage.json 重置失败: {e}"),
             ),
         }
     } else {
-        sink.step("device", StepStatus::Skip, "[2/3] storage.json 不存在，跳过");
+        sink.step("device", StepStatus::Skip, "[2-3/6] storage.json 不存在，跳过");
     }
 
     // 4. aha/TinyStorage device_id — 清除。递归遍历目录下全部文件，
@@ -140,8 +142,12 @@ pub fn reset_device_ids_only(sess: &Session, sink: &dyn ProgressSink) -> Result<
     let tiny_storage_dir = dir.join("aha").join("TinyStorage");
     if tiny_storage_dir.exists() {
         match clear_tiny_storage(&tiny_storage_dir) {
-            Ok(()) => {
-                sink.step("device", StepStatus::Ok, "[4/6] aha/TinyStorage device_id 已清除");
+            Ok(removed) => {
+                sink.step(
+                    "device",
+                    StepStatus::Ok,
+                    &format!("[4/6] aha/TinyStorage device_id 已清除（删除 {removed} 个文件）"),
+                );
                 reset_count += 1;
             }
             Err(e) => sink.step(
@@ -155,18 +161,20 @@ pub fn reset_device_ids_only(sess: &Session, sink: &dyn ProgressSink) -> Result<
     }
 
     // 5. 注册表 MachineGuid（需管理员；写 newSqmId GUID，PS 同款）
+    //    create() = KEY_READ|KEY_WRITE（open() 只读，见 reset_machine_id 注释）；
+    //    错误透出真实原因，不再一律归因为「需要管理员权限」（issue #33）
     match windows_registry::LOCAL_MACHINE
-        .open("SOFTWARE\\Microsoft\\Cryptography")
+        .create("SOFTWARE\\Microsoft\\Cryptography")
         .and_then(|k| k.set_string("MachineGuid", &new_sqm_id))
     {
         Ok(()) => {
             sink.step("device", StepStatus::Ok, "[5/6] 注册表 MachineGuid 已重置");
             reset_count += 1;
         }
-        Err(_) => sink.step(
+        Err(e) => sink.step(
             "device",
             StepStatus::Skip,
-            "[5/6] 注册表 MachineGuid 重置需要管理员权限，已跳过",
+            &format!("[5/6] 注册表 MachineGuid 重置失败，已跳过（如为拒绝访问请以管理员身份运行）: {e}"),
         ),
     }
 
@@ -202,27 +210,39 @@ pub fn reset_device_ids_only(sess: &Session, sink: &dyn ProgressSink) -> Result<
 }
 
 /// TinyStorage 清除：递归删除内容含 "device_id" 的文件（字节级匹配；PS 为
-/// Get-Content -Raw -match，二进制内容按 lossy 字符串含子串判定）
-fn clear_tiny_storage(dir: &Path) -> Result<(), String> {
-    fn walk(d: &Path, removed: &mut usize) -> Result<(), String> {
-        for entry in std::fs::read_dir(d).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
+/// Get-Content -Raw -match，二进制内容按 lossy 字符串含子串判定）。
+/// TinyStorage 可能是目录也可能是单文件——对文件 read_dir 会报
+/// 「目录名称无效 (os error 267)」（issue #33 实测），故先判文件形态。
+/// 子目录 read_dir 失败按最佳努力跳过（对齐 PS Get-ChildItem 语义，不中断整体清理）。
+/// 返回删除的文件数。
+fn clear_tiny_storage(dir: &Path) -> Result<usize, String> {
+    fn contains_device_id(p: &Path) -> bool {
+        std::fs::read(p)
+            .map(|b| b.windows(9).any(|w| w == b"device_id"))
+            .unwrap_or(false)
+    }
+    fn walk(d: &Path, removed: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for entry in rd.flatten() {
             let p = entry.path();
             if p.is_dir() {
-                walk(&p, removed)?;
-            } else if let Ok(bytes) = std::fs::read(&p) {
-                if bytes.windows(9).any(|w| w == b"device_id") {
-                    if std::fs::remove_file(&p).is_ok() {
-                        *removed += 1;
-                    }
-                }
+                walk(&p, removed);
+            } else if contains_device_id(&p) && std::fs::remove_file(&p).is_ok() {
+                *removed += 1;
             }
         }
-        Ok(())
+    }
+    // 单文件形态：仅当内容含 device_id 标记时删除
+    if dir.is_file() {
+        if contains_device_id(dir) {
+            std::fs::remove_file(dir).map_err(|e| e.to_string())?;
+            return Ok(1);
+        }
+        return Ok(0);
     }
     let mut removed = 0usize;
-    walk(dir, &mut removed)?;
-    Ok(())
+    walk(dir, &mut removed);
+    Ok(removed)
 }
 
 /// storage.json 设备标识编辑：点号键名整体替换 + 删标记位。
@@ -313,11 +333,27 @@ mod tests {
         std::fs::write(tiny.join("sub_has.bin"), b"prefix device_id suffix").unwrap();
         std::fs::create_dir_all(tiny.join("nested")).unwrap();
         std::fs::write(tiny.join("nested").join("deep.txt"), "has device_id inside").unwrap();
-        clear_tiny_storage(&tiny).unwrap();
+        assert_eq!(clear_tiny_storage(&tiny).unwrap(), 3);
         assert!(!tiny.join("has_id.bin").exists());
         assert!(tiny.join("clean.txt").exists());
         assert!(!tiny.join("sub_has.bin").exists());
         assert!(!tiny.join("nested").join("deep.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tinystorage_单文件形态按内容删() {
+        // issue #33：TinyStorage 为单文件时对文件 read_dir 报 os error 267
+        let base = std::env::temp_dir().join(format!("sw-tiny-file-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let f = base.join("TinyStorage");
+        std::fs::write(&f, b"\x01device_id\x02").unwrap();
+        assert_eq!(clear_tiny_storage(&f).unwrap(), 1);
+        assert!(!f.exists());
+        // 无标记的单文件保留不删
+        std::fs::write(&f, b"clean content").unwrap();
+        assert_eq!(clear_tiny_storage(&f).unwrap(), 0);
+        assert!(f.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 }
