@@ -208,6 +208,8 @@ response = client.chat.completions.create(
 
 **支持端点**：`POST /v1/chat/completions`、`POST /v1/completions`、`POST /v1/messages`（Anthropic，Claude Code 直连）、`POST /v1/responses`（Codex，仅 WB 上游）、`POST /v1/images/generations|edits`、`GET /v1/models`、`GET /status`、`GET /health`。
 
+**局域网访问**：容器/服务器部署时网关监听 `0.0.0.0`（所有网卡，`AIWORK_LISTEN_ADDR` 可改），局域网内其他设备可通过服务器内网 IP 访问，如 `http://192.168.1.5:8080/v1`。「接口配置」与「API 使用帮助」自动列出本机局域网地址（已排除回环 / 链路本地 / Docker / 虚拟化 / 代理虚拟网卡，多个物理网卡展示多个 IP）。安全提示：未启用任何 API Key 时网关匿名放行，开放局域网访问前建议在「API Keys 管理」中创建并启用 Key。
+
 ### 7.5 用量统计
 
 按日请求统计（7/14/30 天窗口），Trae / Buddy / 自定义三池分库查询，另附**近 30 天三池请求堆叠柱状图**；模型分布 Top 5，请求日志（含 TTFB）可查详情。

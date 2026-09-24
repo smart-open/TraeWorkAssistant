@@ -10,6 +10,7 @@ import { api } from '../../lib/tauri';
 import { gatewayBaseUrl } from '../../lib/gateway';
 import { useAppStore } from '../../store';
 import GatewayHelpModal, { GatewayHelpButton } from './GatewayHelpModal';
+import type { LanIfaceIp } from '../../types';
 
 /** 紧凑指标单元（弹窗头部不做大号 StatCard） */
 function Metric({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
@@ -27,12 +28,17 @@ export default function GatewayHeader() {
   const toast = useAppStore((s) => s.pushToast);
   const [keyCount, setKeyCount] = useState(0);
   const [helpOpen, setHelpOpen] = useState(false);
+  // 局域网网卡 IPv4（issue #34：网关 0.0.0.0 监听后的局域网接入地址概览，一次性加载）
+  const [lanIps, setLanIps] = useState<LanIfaceIp[]>([]);
 
   useEffect(() => {
     api.apiServer
       .keysList()
       .then((view) => setKeyCount(view.keys.length))
       .catch((err) => toast('error', `读取 API Key 列表失败：${String(err)}`));
+    api.apiServer.lanIfaceIps().then(setLanIps).catch(() => {
+      /* 保留空列表（概览行仅显示当前访问地址） */
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -43,8 +49,14 @@ export default function GatewayHeader() {
           <p className="text-sm font-medium text-slate-800 dark:text-zinc-100">
             OpenAI / Anthropic 兼容接口，通过 Trae / Buddy 资源池智能调度实现多账号负载均衡
           </p>
-          <p className="mt-0.5 text-xs text-slate-400 dark:text-zinc-500">
-            统一网关 {gatewayBaseUrl().replace(/^https?:\/\//, '')} · 请求按模型 ID 匹配资源池
+          <p className="mt-0.5 break-all text-xs text-slate-400 dark:text-zinc-500">
+            统一网关 {gatewayBaseUrl().replace(/^https?:\/\//, '')}
+            {lanIps.length > 0 && (
+              <span title={lanIps.map((e) => `${e.ip}（${e.name}）`).join('、')}>
+                {' '}· 局域网 {lanIps.map((e) => e.ip).join(' / ')}
+              </span>
+            )}
+            {' · 请求按模型 ID 匹配资源池'}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1">

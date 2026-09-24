@@ -361,6 +361,15 @@ export interface GatewaySettings {
   updated_at: number;
 }
 
+/** 局域网网卡地址（issue #34：lan_iface_ips 命令；已过滤回环/链路本地/
+ *  Docker/虚拟化/代理虚拟网卡，多物理网卡多 IP，按 IP 去重保序） */
+export interface LanIfaceIp {
+  /** 接口名（如「以太网」「WLAN」） */
+  name: string;
+  /** IPv4 地址 */
+  ip: string;
+}
+
 /** 自定义模型条目（data/custom_models.json；custom_models_list/save/remove）。
  *  OpenAI 兼容上游直通：请求模型名 canonical 命中 enabled 条目即直达该上游 */
 export interface CustomModel {

@@ -438,6 +438,66 @@ pub fn gateway_settings_set(
     Ok(crate::api_server::gateway_settings::load(&state.data_dir))
 }
 
+// ==================== 局域网接入地址（issue #34：网关 0.0.0.0 监听展示用） ====================
+
+/// 局域网网卡地址条目（前端展示网关接入地址：`http://{ip}:{port}/v1`）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LanIfaceIp {
+    /// 接口名（如「以太网」「WLAN」）
+    pub name: String,
+    /// IPv4 地址
+    pub ip: String,
+}
+
+/// 虚拟/回环接口名黑名单（小写子串匹配）：Docker 网桥与 veth 对端、虚拟化平台
+/// Host-Only/NAT 网卡（Hyper-V / WSL / VMware / VirtualBox）、TUN/TAP 代理与
+/// VPN 虚拟网卡（Tailscale / ZeroTier / Clash 等）、蓝牙 PAN / 拨号虚拟适配器。
+/// 中文接口名（「以太网」「WLAN」「本地连接」）与常规英文网卡名均不含关键词
+fn is_virtual_iface(name: &str) -> bool {
+    const BLACKLIST: &[&str] = &[
+        "loopback", "docker", "br-", "veth", "virbr", "vmnet", "vethernet", "vmware",
+        "virtualbox", "virtual", "hyper-v", "wsl", "bluetooth", "tailscale", "zerotier",
+        "hamachi", "tap", "tun", "wintun", "clash", "sing-box", "singbox", "mihomo",
+        "wireguard", "openvpn", "wan miniport", "ras async", "wi-fi direct",
+    ];
+    let n = name.to_lowercase();
+    if BLACKLIST.iter().any(|k| n.contains(k)) {
+        return true;
+    }
+    // Linux/macOS 回环接口名 lo / lo0 / lo1…：精确匹配（"lo" 子串会误伤
+    // 「Local Area Connection」等物理网卡命名，故单独处理）
+    n == "lo" || (n.starts_with("lo") && n.as_bytes()[2..].iter().all(|b| b.is_ascii_digit()))
+}
+
+/// 局域网网卡 IPv4 地址列表（多物理网卡多 IP）：
+/// 仅 IPv4 单播；排除回环（127/8）、链路本地（169.254/16）、Docker/虚拟化/
+/// 代理虚拟网卡（名称黑名单）；按 IP 去重、保持系统枚举顺序
+pub fn lan_iface_ips() -> Vec<LanIfaceIp> {
+    lan_iface_ips_impl()
+}
+
+fn lan_iface_ips_impl() -> Vec<LanIfaceIp> {
+    let mut out: Vec<LanIfaceIp> = Vec::new();
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return out;
+    };
+    for ifa in ifaces {
+        let std::net::IpAddr::V4(v4) = ifa.ip() else { continue };
+        if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+            continue;
+        }
+        if is_virtual_iface(&ifa.name) {
+            continue;
+        }
+        let ip_str = v4.to_string();
+        if out.iter().any(|e| e.ip == ip_str) {
+            continue; // 同 IP 多接口（如桥接别名）只保留首条
+        }
+        out.push(LanIfaceIp { name: ifa.name, ip: ip_str });
+    }
+    out
+}
+
 // ==================== 自定义模型资源池（custom_models.json） ====================
 
 /// 自定义模型列表（OpenAI 兼容上游直通；命中即直达，§custom_models）
@@ -765,5 +825,63 @@ mod pool_merge_tests {
         assert_eq!(m.account_concurrency_limit, 1);
         assert_eq!(m.pool_sticky_ttl_secs, 300);
         assert_eq!(m.wb_sticky_ttl_secs, 1800);
+    }
+}
+
+// ==================== 单元测试：局域网网卡地址过滤（issue #34） ====================
+
+#[cfg(test)]
+mod lan_iface_tests {
+    use super::{is_virtual_iface, lan_iface_ips_impl};
+
+    /// 黑名单命中：Docker / 虚拟化平台 / 代理 TUN / 回环 / 蓝牙 PAN / 拨号
+    #[test]
+    fn virtual_iface_blacklist() {
+        assert!(is_virtual_iface("Loopback Pseudo-Interface 1"));
+        assert!(is_virtual_iface("lo0"));
+        assert!(is_virtual_iface("docker0"));
+        assert!(is_virtual_iface("br-3f9a2b1c"));
+        assert!(is_virtual_iface("veth9a2b1c0"));
+        assert!(is_virtual_iface("virbr0"));
+        assert!(is_virtual_iface("vEthernet (Default Switch)"));
+        assert!(is_virtual_iface("vEthernet (WSL)"));
+        assert!(is_virtual_iface("VMware Network Adapter VMnet1"));
+        assert!(is_virtual_iface("VirtualBox Host-Only Network"));
+        assert!(is_virtual_iface("TAP-Windows Adapter V9"));
+        assert!(is_virtual_iface("Wintun Userspace Tunnel"));
+        assert!(is_virtual_iface("Tailscale"));
+        assert!(is_virtual_iface("ZeroTier One [Ethernet]"));
+        assert!(is_virtual_iface("Clash"));
+        assert!(is_virtual_iface("Mihomo"));
+        assert!(is_virtual_iface("WireGuard Tunnel"));
+        assert!(is_virtual_iface("Bluetooth Device (Personal Area Network)"));
+        assert!(is_virtual_iface("WAN Miniport (IP)"));
+        assert!(is_virtual_iface("Microsoft Wi-Fi Direct Virtual Adapter"));
+    }
+
+    /// 物理网卡（中英文常见命名）不误伤
+    #[test]
+    fn physical_iface_not_blocked() {
+        assert!(!is_virtual_iface("以太网"));
+        assert!(!is_virtual_iface("本地连接"));
+        assert!(!is_virtual_iface("Ethernet"));
+        assert!(!is_virtual_iface("Ethernet 2"));
+        assert!(!is_virtual_iface("WLAN"));
+        assert!(!is_virtual_iface("Wi-Fi"));
+        assert!(!is_virtual_iface("Intel(R) Wi-Fi 6 AX201 160MHz"));
+        assert!(!is_virtual_iface("Realtek Gaming 2.5GbE Family Controller"));
+    }
+
+    /// 真机冒烟：不 panic；结果无回环/链路本地/IPv6，无虚拟网卡名，按 IP 去重
+    #[test]
+    fn lan_iface_ips_smoke() {
+        let ips = lan_iface_ips_impl();
+        for (i, e) in ips.iter().enumerate() {
+            assert!(!e.ip.starts_with("127."), "回环泄漏: {}", e.ip);
+            assert!(!e.ip.starts_with("169.254."), "链路本地泄漏: {}", e.ip);
+            assert!(!e.ip.contains(':'), "混入 IPv6: {}", e.ip);
+            assert!(!is_virtual_iface(&e.name), "虚拟网卡泄漏: {}", e.name);
+            assert!(!ips[..i].iter().any(|p| p.ip == e.ip), "重复 IP: {}", e.ip);
+        }
     }
 }

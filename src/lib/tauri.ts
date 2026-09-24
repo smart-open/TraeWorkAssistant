@@ -24,6 +24,7 @@ import type {
   ImportReport,
   IpAllowlistConfig,
   JwtParseResult,
+  LanIfaceIp,
   LogLine,
   ModelOption,
   NotifyConfig,
@@ -493,6 +494,8 @@ export const api = {
     // 返回规范化后的生效值（前端展示以返回值为准）；端口改动需重启服务生效
     gatewaySettingsSet: (settings: GatewaySettings) =>
       invoke<GatewaySettings>('gateway_settings_set', { settings }),
+    // 局域网网卡 IPv4（issue #34：已过滤回环/链路本地/虚拟网卡，多物理网卡多 IP）
+    lanIfaceIps: () => invoke<LanIfaceIp[]>('lan_iface_ips'),
     // 全局模型白名单（issue #26，canonical 归一列表；空 = 不限）
     modelWhitelistGet: () => invoke<string[]>('model_whitelist_get'),
     // 返回归一后的生效值（canonical + 去空 + 去重）；落盘即时生效无需重启网关

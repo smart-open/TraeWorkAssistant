@@ -34,3 +34,5 @@ flate2 = "1"
 futures-util = "0.3"
 regex = "1"
 time = "0.3"
+# 局域网网卡枚举（issue #34：网关接入地址展示，Web 版同款）
+if-addrs = "0.15"
