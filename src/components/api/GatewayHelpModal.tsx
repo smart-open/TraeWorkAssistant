@@ -210,10 +210,10 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
             <table className="w-full table-fixed text-left text-xs">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-[11px] text-slate-400 dark:border-zinc-700 dark:bg-zinc-800/50 dark:text-zinc-500">
-                  <th className="w-[9%] px-2 py-2 font-medium">供应商</th>
-                  <th className="w-[36%] px-2 py-2 font-medium">模型名称</th>
+                  <th className="w-[12%] px-2 py-2 font-medium">供应商</th>
+                  <th className="w-[28%] px-2 py-2 font-medium">模型名称</th>
                   <th className="w-[11%] px-2 py-2 text-right font-medium">倍率</th>
-                  <th className="w-[16%] px-2 py-2 font-medium" title="思考档位（统一六档）">档位</th>
+                  <th className="w-[21%] px-2 py-2 font-medium" title="思考档位（统一六档）">档位</th>
                   <th className="w-[6%] px-2 py-2 text-center font-medium" title="Max Mode（1M 上下文，仅 Trae 池）">Max</th>
                   <th className="w-[6%] px-2 py-2 text-center font-medium">图片</th>
                   <th className="w-[16%] px-2 py-2 font-medium">来源</th>
