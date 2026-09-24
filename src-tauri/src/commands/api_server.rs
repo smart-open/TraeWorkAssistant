@@ -995,14 +995,18 @@ pub struct LanIfaceIp {
 
 /// 虚拟/回环接口名黑名单（小写子串匹配）：Docker 网桥与 veth 对端、虚拟化平台
 /// Host-Only/NAT 网卡（Hyper-V / WSL / VMware / VirtualBox）、TUN/TAP 代理与
-/// VPN 虚拟网卡（Tailscale / ZeroTier / Clash 等）、蓝牙 PAN / 拨号虚拟适配器。
+/// VPN 虚拟网卡（Tailscale / ZeroTier / Clash 等）、蓝牙 PAN / 拨号虚拟适配器、
+/// macOS 专属虚拟接口（Docker Desktop 网桥 bridge100* / Apple Wireless Direct
+/// Link awdl0 / 低时延 WLAN llw0——`br-` 不命中 `bridge100`，单独收录）。
 /// 中文接口名（「以太网」「WLAN」「本地连接」）与常规英文网卡名均不含关键词
 fn is_virtual_iface(name: &str) -> bool {
     const BLACKLIST: &[&str] = &[
-        "loopback", "docker", "br-", "veth", "virbr", "vmnet", "vethernet", "vmware",
+        "loopback", "docker", "br-", "bridge", "veth", "virbr", "vmnet", "vethernet", "vmware",
         "virtualbox", "virtual", "hyper-v", "wsl", "bluetooth", "tailscale", "zerotier",
         "hamachi", "tap", "tun", "wintun", "clash", "sing-box", "singbox", "mihomo",
         "wireguard", "openvpn", "wan miniport", "ras async", "wi-fi direct",
+        // macOS 专属：Docker Desktop 网桥（bridge100…N）/ Apple Awdl / Llw 虚拟接口
+        "awdl", "llw",
     ];
     let n = name.to_lowercase();
     if BLACKLIST.iter().any(|k| n.contains(k)) {
@@ -1421,7 +1425,8 @@ mod pool_merge_tests {
 mod lan_iface_tests {
     use super::{is_virtual_iface, lan_iface_ips_impl};
 
-    /// 黑名单命中：Docker / 虚拟化平台 / 代理 TUN / 回环 / 蓝牙 PAN / 拨号
+    /// 黑名单命中：Docker / 虚拟化平台 / 代理 TUN / 回环 / 蓝牙 PAN / 拨号 /
+    /// macOS 专属虚拟接口（bridge100 / awdl0 / llw0）
     #[test]
     fn virtual_iface_blacklist() {
         assert!(is_virtual_iface("Loopback Pseudo-Interface 1"));
@@ -1444,6 +1449,11 @@ mod lan_iface_tests {
         assert!(is_virtual_iface("Bluetooth Device (Personal Area Network)"));
         assert!(is_virtual_iface("WAN Miniport (IP)"));
         assert!(is_virtual_iface("Microsoft Wi-Fi Direct Virtual Adapter"));
+        // macOS 专属（合并审查跟进：bridge100 不含 "br-"，此前会泄漏为局域网地址）
+        assert!(is_virtual_iface("bridge100"), "Docker Desktop mac 网桥");
+        assert!(is_virtual_iface("bridge101"));
+        assert!(is_virtual_iface("awdl0"), "Apple Wireless Direct Link");
+        assert!(is_virtual_iface("llw0"), "Apple 低时延 WLAN");
     }
 
     /// 物理网卡（中英文常见命名）不误伤
