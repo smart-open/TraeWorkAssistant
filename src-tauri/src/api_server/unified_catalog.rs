@@ -9,7 +9,9 @@
 //! - L2 官网同步：api_models.json 条目扩展字段（ModelOption serde default，宽容解析；
 //!   context 双口径独立记录——context_length=dev 实际请求槽、context_length_max=max 声明槽）
 //! - L3 文档参考值：内置表（主条目诚实兜底 128K、倍率初始参考、
-//!   思考档位实证表 efforts::TRAE_EFFORTS_REF；1M 声明仅 Max Mode 通道可达）
+//!   思考档位实证表 efforts::TRAE_EFFORTS_REF、Max Mode 支持表
+//!   efforts::TRAE_MAX_MODE_REF——1M 仅 is_max_mode 请求级字段可达，
+//!   T0.3 实证后无静态 -max 条目形态，不做 1M 静态声明）
 //! - L4 名称推断：仅图片支持（Code/Flash 不支持、Seed/数字+V 支持）；思考档位
 //!   已停用名称推断（issue #31：推断值与真实档位不符），无实证 → 空数组
 //!
@@ -36,28 +38,11 @@ pub fn canonical_id(id: &str) -> String {
 
 // ==================== L3 文档参考值（随版本更新维护，§3.2） ====================
 
-/// Max 模式 1M 上下文档（docs.trae.cn/ide_max-mode）。
-/// issue #31：主条目不再按本表声明 1M——实际请求走 __dev 通道，1M 仅 Max Mode
-/// 可达。本表保留给 T4.1-T4.3 显式 `-max` 条目接线（待 T0.3 抓包实证后启用）
-#[allow(dead_code)]
-const MAX_MODE_1M: [&str; 11] = [
-    "doubao-seed-evolving",
-    "glm-5.3",
-    "glm-5.2",
-    "deepseek-v4-pro",
-    "deepseek-v4-pro-official",
-    "deepseek-v4-flash",
-    "deepseek-v4-flash-official",
-    "kimi-k3",
-    "minimax-m3",
-    "qwen3.8-max",
-    "qwen-3.7-plus",
-];
-/// 1M 声明值：仅 Max Mode 通道（显式 -max 条目）使用，主条目禁用（issue #31）
-#[allow(dead_code)]
-const CTX_1M: u64 = 1_000_000;
-/// L3：主条目诚实兜底 128K（与旧 /v1/models 默认一致；1M 声明仅 Max Mode 可达，
-/// 见 MAX_MODE_1M）。L2 dev 口径缺失时的保守声明，不冒充实际窗口
+/// L3：主条目诚实兜底 128K（与旧 /v1/models 默认一致）——L2 dev 口径缺失时的
+/// 保守声明，不冒充实际窗口。1M 上下文档仅 Max Mode 通道（efforts::TRAE_MAX_MODE_REF
+/// 门控 is_max_mode:1 请求级注入，T0.3 实证无静态 -max 模型条目形态）可达，故主条目
+/// 不做 1M 静态声明；原 MAX_MODE_1M/CTX_1M 占位随 T4.1 迁入 efforts::TRAE_MAX_MODE_REF
+/// （单一事实源）
 const CTX_128K: u64 = 131_072;
 
 /// 倍率初始参考（客户端下拉实测，随官网同步覆盖，§3.2）。
@@ -307,24 +292,24 @@ fn trae_entry_of(m: &ModelOption, l1: Option<&TraeModelMeta>) -> TraeEntry {
         .and_then(|l| l.rate)
         .or(m.rate)
         .or_else(|| doc_rate(&canonical));
-    // efforts: L1 → L2（非空才算有值）→ L3 实证表（TRAE_EFFORTS_REF）。
+    // efforts: L1 → L2 → L3 实证表（TRAE_EFFORTS_REF）。
     // L4 名称推断已停用（issue #31：light/high/extra_high 与名称推断的
-    // low/medium/high 不符），无实证 → 空数组；全链归一到统一档位空间
+    // low/medium/high 不符），无实证 → 空数组；全链归一到统一档位空间。
+    // 回退判断基于「归一后非空」而非原始值：L2 官网同步返回非空但全为未知
+    // 档位字面量（脏数据）时不得遮蔽 L3 实证表（归一为空 = 视为未声明）
     let efforts = l1
         .and_then(|l| l.efforts.clone())
         .filter(|e| !e.is_empty())
-        .or_else(|| {
-            if m.efforts.is_empty() {
-                None
-            } else {
-                Some(m.efforts.clone())
-            }
-        })
         .map(normalize_unified_efforts)
+        .filter(|e| !e.is_empty())
+        .or_else(|| {
+            let normalized = normalize_unified_efforts(m.efforts.clone());
+            (!normalized.is_empty()).then_some(normalized)
+        })
         .unwrap_or_else(|| super::efforts::trae_declared_unified(&canonical));
     // context: L1 → L2（models_sync 双口径的 dev 实际请求槽）→ L3 诚实兜底 128K。
-    // issue #31：主条目不再按 MAX_MODE_1M 声明 1M——实际请求走 __dev 通道，
-    // 1M 仅 Max Mode 可达，待 T0.3 抓包确认后由显式 -max 条目承载（T4.1-T4.3）
+    // issue #31：主条目不做 1M 静态声明——实际请求走 __dev 通道，1M 仅 Max Mode
+    // 请求级字段（is_max_mode:1，efforts::TRAE_MAX_MODE_REF 门控）可达
     let context_length = Some(
         l1.and_then(|l| l.context_length)
             .or(m.context_length)
@@ -1207,6 +1192,35 @@ mod tests {
             find(&list, "ctx-max-only").context_length,
             Some(CTX_128K),
             "仅声明槽不冒充实际口径，L3 保守兜底"
+        );
+    }
+
+    /// L2 全未知档位（脏数据）不遮蔽 L3 实证表：归一后为空视为未声明，
+    /// 回退 L3（审查修复：原判断用原始 efforts 非空，脏档位会静默清空档位列）
+    #[test]
+    fn t21_l2_all_unknown_efforts_fall_back_to_l3() {
+        let f = fixture(&[], &[], None);
+        crate::store::db(&f.dir)
+            .kv_set(
+                "api_models",
+                &json!([
+                    {"id": "glm-5.3", "label": "G", "efforts": ["bogus-a", "bogus-b"]}
+                ]),
+            )
+            .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "api_models");
+        let list = unified_models(&f.dir, true, true, true);
+        // 双源并集：WB 内置 [low,medium,high] ∪ Trae L3 实证 [low,high,xhigh]；
+        // 修复前 L2 脏档位遮蔽 L3 → 实证侧为空 → 并集缺 xhigh
+        assert_eq!(
+            find(&list, "glm-5.3").efforts,
+            vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string()
+            ],
+            "L2 脏档位归一为空 → 回退 L3 实证表（xhigh 仅来自 L3）"
         );
     }
 }

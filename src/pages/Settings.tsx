@@ -86,13 +86,22 @@ export default function Settings() {
     }
   };
 
-  // 注册时间复用应用内调度时刻（trae_checkin_hhmm）：schtasks 与调度器共用同一配置值
+  // 注册时间复用应用内调度时刻（trae_checkin_hhmm）：schtasks 与调度器共用同一配置值。
+  // form 是编辑态：若时刻已改但未「保存设置」，schtasks 注册新值而内置调度器仍按
+  // 存储值运行（两执行器分叉），toast 需明示这一边界
   const register = async () => {
     const hhmm = form?.trae_checkin_hhmm || '09:00';
     setBusyTask(true);
     try {
       await withMinDelay(api.misc.taskRegister(hhmm));
-      toast('success', `已注册每日 ${hhmm} 自动签到`);
+      const unsaved =
+        form != null && settings != null && form.trae_checkin_hhmm !== settings.trae_checkin_hhmm;
+      toast(
+        'success',
+        unsaved
+          ? `已注册每日 ${hhmm} 签到（内置调度器在底部「保存设置」后才使用该时刻）`
+          : `已注册每日 ${hhmm} 自动签到`,
+      );
       await query();
     } catch (e) {
       const msg = String(e);

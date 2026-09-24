@@ -179,6 +179,10 @@ pub struct Resolved {
     /// 路由级 effort 提示（统一档位）：Buddy 池直接注入 reasoning_effort；
     /// Trae 池由 routes 层转 wire 档位下发（efforts::trae_request_wire）
     pub effort_hint: Option<String>,
+    /// Max Mode 入口标志（issue #31 T4.2）：请求模型带 `-max` 入口后缀且基名可由
+    /// Trae 服务时置位（整名命中列表的真模型不置位，见 trae_final 计算段守卫）；
+    /// 实际注入由 routes 层结合 efforts::TRAE_MAX_MODE_REF 门控，仅 Trae 池为 true
+    pub max_mode_hint: bool,
     /// 跨池回退来源：Some(首选池) 表示发生了回退（warn 日志已在 resolve_target
     /// 内部落 app_log；本字段供调度测试断言与 Phase 2 资源页展示预留）
     #[allow(dead_code)]
@@ -207,9 +211,11 @@ struct ModelSources {
     buddy: Option<(String, Option<String>)>,
     /// Trae 源：api_models 命中；或模型不属于任何目录（透传语义，单源 Trae）
     trae: bool,
-    /// Trae 侧最终模型 + effort 提示（issue #31 T3.1：Trae-only 模型带路由后缀时
-    /// 剥离为基名，effort 提示随池携带、由 routes 层转 wire 下发；透传语义为原名）
-    trae_final: (String, Option<String>),
+    /// Trae 侧最终模型 + effort 提示 + Max Mode 入口标志（issue #31 T3.1/T4.2：
+    /// Trae-only 模型带路由后缀时剥离为基名，effort 提示随池携带、由 routes 层转
+    /// wire 下发；带 `-max` 入口后缀时剥离为基名并置 max 标志、由 routes 层结合
+    /// efforts::TRAE_MAX_MODE_REF 门控注入 is_max_mode:1；透传语义为原名）
+    trae_final: (String, Option<String>, bool),
 }
 
 impl ModelSources {
@@ -269,6 +275,7 @@ pub fn resolve_target(
             pool: TargetPool::Custom,
             model: model.to_string(),
             effort_hint: None,
+            max_mode_hint: false,
             fallback_from: None,
         });
     }
@@ -309,19 +316,46 @@ pub fn resolve_target(
     // 基名仅在 Trae 源）时，Buddy 管线 ④ 段因基名不在 Buddy 目录直落 direct，
     // 全名带后缀透传 Trae 上游会报模型不存在 → 剥离后缀以基名作为 Trae 侧模型，
     // effort 提示随池携带。基名未命中 Trae 模型列表时保持原名透传（未知模型零行为差异）
+    // issue #31 T4.2 Max Mode 入口：`-max` 后缀同链路剥离（内置后缀最低优先），
+    // 剥离成功置 max 入口标志随池携带；整名以 -max/-thinking 结尾的真模型
+    // （如 qwen3.8-max）整名在列表时优先透传、不误剥（t47 固化；未请求 = 不注入，
+    // 保持零行为差异）。整名真模型开 Max 的逃生口：① 双后缀 "qwen3.8-max-max"
+    // （整名不在列表 → 剥外层 -max → 基名命中列表，正常注入）；② OpenAI 协议
+    // 请求直传 is_max_mode 字段（payload 层透传+增补不删未知字段，可存活到上游）；
+    // Anthropic 协议经 anthropic_to_openai 重建请求对象会丢弃直传字段，不可用
     // Trae 模型列表一次加载（config_cache 缓存），③ 段剥离守卫与 trae_hit 判定共用
     let trae_list = models_sync::load_models(&state.data_dir);
+    let in_trae = |n: &str| trae_list.iter().any(|m| canonical_id(&m.id) == canonical_id(n));
     let trae_final = if buddy_hit.is_none() {
-        match wb_model_route::strip_route_suffix(model, &cfg) {
-            Some((base, hint))
-                if trae_list.iter().any(|m| canonical_id(&m.id) == canonical_id(&base)) =>
-            {
-                (base, hint)
+        if in_trae(model) {
+            // 整名命中：真模型名透传，不做任何后缀剥离
+            (model.to_string(), None, false)
+        } else if let Some((base, hint)) = wb_model_route::strip_route_suffix(model, &cfg)
+            .filter(|(base, _)| in_trae(base))
+        {
+            (base, hint, false)
+        } else if let Some(base) =
+            wb_model_route::strip_max_suffix(model).filter(|base| in_trae(base))
+        {
+            // 可观测性：基名在 Trae 列表但不在 Max Mode 支持表（efforts::
+            // TRAE_MAX_MODE_REF）→ 注入层将静默跳过 is_max_mode，落日志避免
+            // 「请求带 -max 却无 1M 行为」无从排查（零行为变更）
+            if !super::efforts::trae_max_mode_supported(&canonical_id(&base)) {
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "dispatch max-mode unsupported: model={} base={} (-max suffix stripped, is_max_mode not injected)",
+                        model,
+                        base,
+                    ),
+                );
             }
-            _ => (model.to_string(), None),
+            (base, None, true)
+        } else {
+            (model.to_string(), None, false)
         }
     } else {
-        (model.to_string(), None)
+        (model.to_string(), None, false)
     };
     let canonical = canonical_id(&trae_final.0);
     let trae_hit = buddy_hit.is_none()
@@ -372,6 +406,7 @@ pub fn resolve_target(
                     pool,
                     model: final_model_for(pool, &sources, model),
                     effort_hint: effort_for(pool, &sources),
+                    max_mode_hint: max_mode_for(pool, &sources),
                     fallback_from: None,
                 });
             }
@@ -441,6 +476,7 @@ pub fn resolve_target(
                     pool,
                     model: final_model_for(pool, &sources, model),
                     effort_hint: effort_for(pool, &sources),
+                    max_mode_hint: max_mode_for(pool, &sources),
                     fallback_from: fallback_from.map(|(p, _)| p),
                 });
             }
@@ -608,6 +644,15 @@ fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
         // Trae：路由级 effort 提示同样随池携带（routes 层统一档位 → wire 转换下发）
         TargetPool::Trae => sources.trae_final.1.clone(),
         TargetPool::Custom => None,
+    }
+}
+
+/// Max Mode 入口标志随池取值（issue #31 T4.2）：仅 Trae 池携带入口标志；实际注入
+/// 由 routes 层结合 efforts::TRAE_MAX_MODE_REF 门控，Buddy/Custom 恒 false
+fn max_mode_for(pool: TargetPool, sources: &ModelSources) -> bool {
+    match pool {
+        TargetPool::Trae => sources.trae_final.2,
+        TargetPool::Buddy | TargetPool::Custom => false,
     }
 }
 
@@ -1301,6 +1346,45 @@ mod tests {
         assert_eq!(r.pool, TargetPool::Trae);
         assert_eq!(r.model, "kimi-k3");
         assert_eq!(r.effort_hint.as_deref(), Some("xhigh"));
+    }
+
+    // ---------- Max Mode 入口后缀（issue #31 T4.2） ----------
+
+    /// Trae-only 模型带 -max 入口后缀 → 剥离为基名 + max 入口标志置位（无 effort 提示）
+    #[test]
+    fn t46_trae_only_max_suffix_stripped() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        // 目录排除 glm-5.3 → "glm-5.3-max" 的基名仅在 Trae 源
+        catalog_only(&f.dir, "hy4");
+        f.seed_healthy(true);
+        let r = f.resolve("glm-5.3-max").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "glm-5.3");
+        assert!(r.max_mode_hint);
+        assert!(r.effort_hint.is_none());
+    }
+
+    /// 整名以 -max 结尾的真模型（qwen3.8-max）整名在列表 → 原名透传不误剥、
+    /// 不置 max 入口标志（整名优先守卫）
+    #[test]
+    fn t47_real_name_max_suffix_not_stripped() {
+        let f = fixture(&["qwen3.8-max"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("qwen3.8-max").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "qwen3.8-max");
+        assert!(!r.max_mode_hint);
+    }
+
+    /// -max 基名不在 Trae 模型列表 → 原名透传（透传语义不变、不置标志）
+    #[test]
+    fn t48_unknown_model_max_suffix_passthrough() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("ghost-model-max").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "ghost-model-max");
+        assert!(!r.max_mode_hint);
     }
 
     // ---------- 智能调度（DispatchStrategy::Smart） ----------
