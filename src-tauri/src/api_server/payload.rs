@@ -545,6 +545,7 @@ mod tests {
             label: id.into(),
             rate: None,
             context_length: None,
+            context_length_max: None,
             efforts: Vec::new(),
             supports_image: None,
             function: function.into(),

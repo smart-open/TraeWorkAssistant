@@ -18,7 +18,10 @@ use crate::models::{AccountsFile, DeviceMap};
 /// 仅 {id,label} 原样读取，不重写不丢失 §9.6）：
 /// - `rate`：官网同步解析的积分倍率（L2，§3.2；字段名以实际响应为准，
 ///   宽容解析失败置 None → 聚合层自动落 L3/L4，不阻塞）
-/// - `context_length / efforts / supports_image`：同上 L2 语义
+/// - `context_length / context_length_max / efforts / supports_image`：同上 L2 语义。
+///   上下文双口径（issue #31）：`context_length` 记录 `context_window_tokens.dev`
+///   （__dev 实际请求口径，对外诚实声明）；`context_length_max` 记录 `.max`
+///   （客户端声明口径），两槽独立记录不互相兜底
 /// - `function`：同步时记录的来源视图（上游 llm_utils_chat 接受的 function 值）。
 ///   官方新上架模型免改代码：路由按表内视图请求，空 = 旧数据未同步 → 回退硬编码
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +32,9 @@ pub struct ModelOption {
     pub rate: Option<f64>,
     #[serde(default)]
     pub context_length: Option<u64>,
+    /// 客户端声明口径（context_window_tokens.max），与 context_length 独立记录
+    #[serde(default)]
+    pub context_length_max: Option<u64>,
     #[serde(default)]
     pub efforts: Vec<String>,
     #[serde(default)]
@@ -80,6 +86,7 @@ pub fn default_models() -> Vec<ModelOption> {
             // function 预填硬编码实测映射：新装/历史数据免同步即路由正确
             rate: None,
             context_length: None,
+            context_length_max: None,
             efforts: Vec::new(),
             supports_image: None,
             function: function_for_model(&id.to_lowercase()).to_string(),
@@ -209,6 +216,7 @@ fn normalize_order(mut fetched: Vec<ModelOption>) -> Vec<ModelOption> {
                 label,
                 rate: None,
                 context_length: None,
+                context_length_max: None,
                 efforts: Vec::new(),
                 supports_image: None,
                 // 与默认列表同源：预填硬编码实测映射，保位项路由行为不变
@@ -410,10 +418,15 @@ fn effort_rank(e: &str) -> usize {
 /// 字段位置以 2026-09-19 客户端抓包固化为准：
 /// - 倍率：`display_contact_config`（JSON 字符串）→ consumption_rate.data.rate
 ///   （基准倍率，会员/闲时折扣在 discount 块，客户端选择器亦展示基准值）
-/// - 上下文：`context_window_tokens.max`（缺省回落 dev）
+/// - 上下文双口径（issue #31）：`.dev` = __dev 实际请求口径（对外诚实声明）、
+///   `.max` = 客户端声明口径，双槽独立记录不互相兜底
 /// - 图片：`display_config.multimodal`
 /// - efforts：响应未提供 → 空，交由聚合层 L3/L4 兜底
-fn extract_meta(ci: &Value) -> (Option<f64>, Option<u64>, Vec<String>, Option<bool>) {
+///
+/// 返回 (rate, context_length=dev, context_length_max=max, efforts, supports_image)
+fn extract_meta(
+    ci: &Value,
+) -> (Option<f64>, Option<u64>, Option<u64>, Vec<String>, Option<bool>) {
     let contact: Value = ci
         .get("display_contact_config")
         .and_then(|v| v.as_str())
@@ -424,9 +437,8 @@ fn extract_meta(ci: &Value) -> (Option<f64>, Option<u64>, Vec<String>, Option<bo
         .and_then(|c| c.get("data"))
         .and_then(|d| dig_f64(d, &["rate"]));
     let ctx = ci.get("context_window_tokens");
-    let context_length = ctx
-        .and_then(|c| dig_u64(c, &["max"]))
-        .or_else(|| ctx.and_then(|c| dig_u64(c, &["dev"])));
+    let context_length = ctx.and_then(|c| dig_u64(c, &["dev"]));
+    let context_length_max = ctx.and_then(|c| dig_u64(c, &["max"]));
     let mut efforts = dig_strs(
         ci,
         &["efforts", "supported_efforts", "supportedEfforts", "thinking_modes"],
@@ -439,7 +451,13 @@ fn extract_meta(ci: &Value) -> (Option<f64>, Option<u64>, Vec<String>, Option<bo
     let supports_image = ci
         .get("display_config")
         .and_then(|d| dig_bool(d, &["multimodal"]));
-    (rate, context_length, efforts, supports_image)
+    (
+        rate,
+        context_length,
+        context_length_max,
+        efforts,
+        supports_image,
+    )
 }
 
 /// 主对话语境优先：同模型跨 function 重复出现时，solo_agent/chat_v3 携带权威的
@@ -543,12 +561,14 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
                         // 用带 __dev 的条目整体替换先前收录的同名条目（展示名+运营字段+
                         // 来源视图——带 __dev 的视图是可调用实证）
                         if let Some(pos) = result.iter().position(|m| m.id == id) {
-                            let (rate, context_length, efforts, supports_image) = extract_meta(ci);
+                            let (rate, context_length, context_length_max, efforts, supports_image) =
+                                extract_meta(ci);
                             result[pos] = ModelOption {
                                 id: id.to_string(),
                                 label: label.to_string(),
                                 rate,
                                 context_length,
+                                context_length_max,
                                 efforts,
                                 supports_image,
                                 function: fname.to_string(),
@@ -559,12 +579,14 @@ fn parse_official(text: &str) -> Result<Vec<ModelOption>, String> {
                 }
                 None => {
                     seen.insert(id.to_string(), has_dev);
-                    let (rate, context_length, efforts, supports_image) = extract_meta(ci);
+                    let (rate, context_length, context_length_max, efforts, supports_image) =
+                        extract_meta(ci);
                     result.push(ModelOption {
                         id: id.to_string(),
                         label: label.to_string(),
                         rate,
                         context_length,
+                        context_length_max,
                         efforts,
                         supports_image,
                         function: fname.to_string(),
@@ -601,6 +623,7 @@ mod tests {
                 label: "Brand New".into(),
                 rate: None,
                 context_length: None,
+                context_length_max: None,
                 efforts: Vec::new(),
                 supports_image: None,
                 function: "solo_agent".into(),
@@ -611,6 +634,7 @@ mod tests {
                 label: "DeepSeek-V4.1-Flash".into(),
                 rate: None,
                 context_length: None,
+                context_length_max: None,
                 efforts: Vec::new(),
                 supports_image: None,
                 function: String::new(),
@@ -641,6 +665,7 @@ mod tests {
             label: id.into(),
             rate: None,
             context_length: None,
+            context_length_max: None,
             efforts: Vec::new(),
             supports_image: None,
             function: function.into(),
@@ -834,9 +859,9 @@ mod tests {
     #[test]
     fn normalize_order_inserts_builtins_and_sorts() {
         let fetched = vec![
-            ModelOption { id: "brand-new-model".into(), label: "Brand New".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None, function: String::new() },
-            ModelOption { id: "glm-5.3".into(), label: "GLM-5.3".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None, function: String::new() },
-            ModelOption { id: "qwen3.8-max".into(), label: "Qwen3.8-Max".into(), rate: None, context_length: None, efforts: Vec::new(), supports_image: None, function: String::new() },
+            ModelOption { id: "brand-new-model".into(), label: "Brand New".into(), rate: None, context_length: None, context_length_max: None, efforts: Vec::new(), supports_image: None, function: String::new() },
+            ModelOption { id: "glm-5.3".into(), label: "GLM-5.3".into(), rate: None, context_length: None, context_length_max: None, efforts: Vec::new(), supports_image: None, function: String::new() },
+            ModelOption { id: "qwen3.8-max".into(), label: "Qwen3.8-Max".into(), rate: None, context_length: None, context_length_max: None, efforts: Vec::new(), supports_image: None, function: String::new() },
         ];
         let list = normalize_order(fetched);
         let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
@@ -860,6 +885,7 @@ mod tests {
         let m = &list[0];
         assert!(m.rate.is_none());
         assert!(m.context_length.is_none());
+        assert!(m.context_length_max.is_none());
         assert!(m.efforts.is_empty());
         assert!(m.supports_image.is_none());
         // function 同样 serde default：空 = 回退硬编码 function_for_model
@@ -890,7 +916,9 @@ mod tests {
         let list = parse_official(&text).unwrap();
         let g = list.iter().find(|m| m.id == "glm-5.3").unwrap();
         assert_eq!(g.rate, Some(0.78), "display_contact_config 内基准倍率");
-        assert_eq!(g.context_length, Some(1_000_000), "取 max 上下文");
+        // 双口径独立记录（issue #31）：dev = 实际请求口径，max = 客户端声明口径
+        assert_eq!(g.context_length, Some(116_000), "dev 实际请求口径");
+        assert_eq!(g.context_length_max, Some(1_000_000), "max 客户端声明口径");
         assert_eq!(g.supports_image, Some(false), "multimodal=false 显式为否");
         let k = list.iter().find(|m| m.id == "kimi-k3").unwrap();
         assert_eq!(k.rate, Some(1.83));
@@ -906,8 +934,28 @@ mod tests {
             "context_window_tokens": { "dev": "131072" },
             "display_contact_config": "{\"consumption_rate\":{\"enable\":true,\"data\":{\"rate\":\"0.16\"}}}"
         });
-        let (rate, ctx, _, _) = extract_meta(&ci);
+        let (rate, ctx, ctx_max, _, _) = extract_meta(&ci);
         assert_eq!(rate, Some(0.16));
-        assert_eq!(ctx, Some(131_072), "max 缺失回落 dev");
+        assert_eq!(ctx, Some(131_072), "字符串 dev 宽容解析");
+        assert_eq!(ctx_max, None, "max 缺失独立为 None，不回落 dev");
+    }
+
+    /// 上下文双口径独立记录（issue #31）：dev/max 同存时各落各槽、
+    /// 不互相兜底；仅 max 时 dev 槽为 None（聚合层回落 L3，不冒充实际口径）
+    #[test]
+    fn extract_meta_records_dual_context_slots_independently() {
+        let ci = serde_json::json!({
+            "context_window_tokens": { "dev": 168000, "max": 1000000 }
+        });
+        let (_, ctx, ctx_max, _, _) = extract_meta(&ci);
+        assert_eq!(ctx, Some(168_000), "dev 实际请求口径");
+        assert_eq!(ctx_max, Some(1_000_000), "max 客户端声明口径");
+
+        let ci_max_only = serde_json::json!({
+            "context_window_tokens": { "max": 1000000 }
+        });
+        let (_, ctx2, ctx_max2, _, _) = extract_meta(&ci_max_only);
+        assert_eq!(ctx2, None, "仅 max 时 dev 槽为 None，不回落声明值");
+        assert_eq!(ctx_max2, Some(1_000_000));
     }
 }

@@ -207,6 +207,25 @@ fn strip_suffix_ci(name: &str, suffix: &str) -> Option<String> {
     Some(base.trim_end_matches(['-', '_']).to_string())
 }
 
+/// 跨池后缀剥离（issue #31 T3.1）：内置 `-thinking` 与自定义 `suffixes[]` 的
+/// 纯字符串剥离（**不查 Buddy 目录**），返回 (基名, effort 提示)，按 resolve ④
+/// 段同序匹配（内置优先）。供 dispatch 对 Trae-only 模型剥离后缀（基名是否可
+/// 服务由 dispatch 查 Trae 模型列表判定）；Buddy 目录校验仍由 resolve ④ 段自理。
+pub fn strip_route_suffix(name: &str, cfg: &WbRouteFile) -> Option<(String, Option<String>)> {
+    if let Some(base) = strip_suffix_ci(name, BUILTIN_THINKING_SUFFIX) {
+        return Some((base, Some(BUILTIN_THINKING_EFFORT.to_string())));
+    }
+    for s in &cfg.suffixes {
+        if s.suffix.is_empty() {
+            continue;
+        }
+        if let Some(base) = strip_suffix_ci(name, &s.suffix) {
+            return Some((base, s.effort.clone()));
+        }
+    }
+    None
+}
+
 /// 目录内倍率最低的模型（后台任务降级目标，T5.6③/F-65）；
 /// 全目录倍率相同/为空时取首个。
 /// issue #26：生产路由一律走白名单感知的 `cheapest_catalog_model_filtered`

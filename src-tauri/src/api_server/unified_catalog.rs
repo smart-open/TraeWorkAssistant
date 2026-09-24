@@ -6,13 +6,19 @@
 //!
 //! Trae 侧元数据四层来源（§3.2，逐级兜底）：
 //! - L1 人工维护：`data/trae_model_meta.json` 覆盖层（键 canonical_id），官网同步永不覆盖
-//! - L2 官网同步：api_models.json 条目扩展字段（ModelOption serde default，宽容解析）
-//! - L3 文档参考值：内置表（Max 模式 1M 上下文 + 其余 128K、倍率初始参考）
-//! - L4 名称推断：系列规则（思考档位 / 图片支持）；上下文 L3 已全量覆盖
-//!   （1M 表命中 → 1M，其余 → 128K），故无 L4 上下文规则
+//! - L2 官网同步：api_models.json 条目扩展字段（ModelOption serde default，宽容解析；
+//!   context 双口径独立记录——context_length=dev 实际请求槽、context_length_max=max 声明槽）
+//! - L3 文档参考值：内置表（主条目诚实兜底 128K、倍率初始参考、
+//!   思考档位实证表 efforts::TRAE_EFFORTS_REF；1M 声明仅 Max Mode 通道可达）
+//! - L4 名称推断：仅图片支持（Code/Flash 不支持、Seed/数字+V 支持）；思考档位
+//!   已停用名称推断（issue #31：推断值与真实档位不符），无实证 → 空数组
 //!
 //! 归并键 `canonical_id()` 三处统一：目录归并 / dispatch_policy.per_model /
 //! trae_model_meta 覆盖层（§3.3 #1），防止规则漂移。
+//!
+//! 档位口径（issue #31，统一空间见 efforts 模块）：Trae 侧 L1/L2/L3 值一律
+//! 归一到统一档位（wire light/high/extra_high → low/high/xhigh）；双源条目
+//! 顶层 efforts = 各池映射后取并集，context_length 取两池较小值（诚实声明）。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,7 +36,10 @@ pub fn canonical_id(id: &str) -> String {
 
 // ==================== L3 文档参考值（随版本更新维护，§3.2） ====================
 
-/// Max 模式 1M 上下文档（docs.trae.cn/ide_max-mode）
+/// Max 模式 1M 上下文档（docs.trae.cn/ide_max-mode）。
+/// issue #31：主条目不再按本表声明 1M——实际请求走 __dev 通道，1M 仅 Max Mode
+/// 可达。本表保留给 T4.1-T4.3 显式 `-max` 条目接线（待 T0.3 抓包实证后启用）
+#[allow(dead_code)]
 const MAX_MODE_1M: [&str; 11] = [
     "doubao-seed-evolving",
     "glm-5.3",
@@ -44,8 +53,11 @@ const MAX_MODE_1M: [&str; 11] = [
     "qwen3.8-max",
     "qwen-3.7-plus",
 ];
+/// 1M 声明值：仅 Max Mode 通道（显式 -max 条目）使用，主条目禁用（issue #31）
+#[allow(dead_code)]
 const CTX_1M: u64 = 1_000_000;
-/// L3：其余模型默认 128K（与旧 /v1/models 的 131072 一致）
+/// L3：主条目诚实兜底 128K（与旧 /v1/models 默认一致；1M 声明仅 Max Mode 可达，
+/// 见 MAX_MODE_1M）。L2 dev 口径缺失时的保守声明，不冒充实际窗口
 const CTX_128K: u64 = 131_072;
 
 /// 倍率初始参考（客户端下拉实测，随官网同步覆盖，§3.2）。
@@ -87,20 +99,28 @@ fn doc_rate(canonical: &str) -> Option<f64> {
 
 // ==================== L4 名称推断（可被 L1–L3 覆盖，§3.2） ====================
 
-/// 思考档位推断：Flash/Turbo 轻量系列 `["low","medium"]`；
-/// DeepSeek-4 / Kimi-K2·K3 / GLM-5 系列 `["medium","high"]`；未知 → 空（显示 —）
-fn infer_efforts(canonical: &str) -> Vec<String> {
-    if canonical.contains("flash") || canonical.contains("turbo") {
-        return vec!["low".into(), "medium".into()];
+/// 档位值归一到统一空间（issue #31）：Trae wire 值（light/high/extra_high）映射
+/// 统一档位；已是统一档位的原样保留；未知值丢弃（声明口径不含猜测值）。
+/// 去空 + 去重 + 按统一档位序升序。
+fn normalize_unified_efforts(list: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for e in list {
+        let e = e.trim().to_lowercase();
+        if e.is_empty() {
+            continue;
+        }
+        let unified = super::efforts::trae_to_unified(&e)
+            .map(str::to_string)
+            .or_else(|| super::efforts::unified_rank(&e).map(|_| e.clone()));
+        if let Some(u) = unified {
+            if seen.insert(u.clone()) {
+                out.push(u);
+            }
+        }
     }
-    let in_series = canonical.starts_with("deepseek-v4")
-        || canonical.starts_with("kimi-k2")
-        || canonical.starts_with("kimi-k3")
-        || canonical.starts_with("glm-5");
-    if in_series {
-        return vec!["medium".into(), "high".into()];
-    }
-    Vec::new()
+    out.sort_by_key(|e| super::efforts::unified_rank(e).unwrap_or(usize::MAX));
+    out
 }
 
 /// 图片支持推断：Code / Flash 系列明确不支持（优先判定，如 Seed-Code）；
@@ -279,7 +299,7 @@ struct TraeEntry {
     supports_image: Option<bool>,
 }
 
-/// 四层链解析 Trae 条目：L1 覆盖层 → L2 条目扩展字段 → L3 文档表 → L4 名称推断
+/// 四层链解析 Trae 条目：L1 覆盖层 → L2 条目扩展字段 → L3 文档表（无 L4 档位猜测）
 fn trae_entry_of(m: &ModelOption, l1: Option<&TraeModelMeta>) -> TraeEntry {
     let canonical = canonical_id(&m.id);
     // rate: L1 → L2 → L3
@@ -287,7 +307,9 @@ fn trae_entry_of(m: &ModelOption, l1: Option<&TraeModelMeta>) -> TraeEntry {
         .and_then(|l| l.rate)
         .or(m.rate)
         .or_else(|| doc_rate(&canonical));
-    // efforts: L1 → L2（非空才算有值）→ L4
+    // efforts: L1 → L2（非空才算有值）→ L3 实证表（TRAE_EFFORTS_REF）。
+    // L4 名称推断已停用（issue #31：light/high/extra_high 与名称推断的
+    // low/medium/high 不符），无实证 → 空数组；全链归一到统一档位空间
     let efforts = l1
         .and_then(|l| l.efforts.clone())
         .filter(|e| !e.is_empty())
@@ -298,18 +320,16 @@ fn trae_entry_of(m: &ModelOption, l1: Option<&TraeModelMeta>) -> TraeEntry {
                 Some(m.efforts.clone())
             }
         })
-        .unwrap_or_else(|| infer_efforts(&canonical));
-    // context: L1 → L2 → L3（1M 表命中 1M，其余 128K——L3 全量覆盖）
-    let context_length = l1
-        .and_then(|l| l.context_length)
-        .or(m.context_length)
-        .or_else(|| {
-            Some(if MAX_MODE_1M.contains(&canonical.as_str()) {
-                CTX_1M
-            } else {
-                CTX_128K
-            })
-        });
+        .map(normalize_unified_efforts)
+        .unwrap_or_else(|| super::efforts::trae_declared_unified(&canonical));
+    // context: L1 → L2（models_sync 双口径的 dev 实际请求槽）→ L3 诚实兜底 128K。
+    // issue #31：主条目不再按 MAX_MODE_1M 声明 1M——实际请求走 __dev 通道，
+    // 1M 仅 Max Mode 可达，待 T0.3 抓包确认后由显式 -max 条目承载（T4.1-T4.3）
+    let context_length = Some(
+        l1.and_then(|l| l.context_length)
+            .or(m.context_length)
+            .unwrap_or(CTX_128K),
+    );
     // max_tokens: L1 → L2（ModelOption 无此字段）→ 无兜底（显示 —）
     let max_tokens = l1.and_then(|l| l.max_tokens);
     // image: L1 → L2 → L4
@@ -424,11 +444,21 @@ pub fn unified_models(
                 if let Some(r) = wrate {
                     u.rate = Some(r);
                 }
+                // issue #31：双源档位声明 = 各池映射统一空间后取并集
+                //（原实现 WB 无条件覆盖 Trae 侧，丢掉 Trae 档位声明）
                 if !m.supported_efforts.is_empty() {
-                    u.efforts = m.supported_efforts.clone();
+                    u.efforts = super::efforts::declared_union(&[
+                        std::mem::take(&mut u.efforts),
+                        m.supported_efforts.clone(),
+                    ]);
                 }
+                // issue #31：双源上下文取较小值——声明不得大于任一池实际可用
+                //（1M 表模型实际请求走 dev 通道受 prompt 上限约束，见 models_sync 双口径）
                 if let Some(c) = wctx {
-                    u.context_length = Some(c);
+                    u.context_length = Some(match u.context_length {
+                        Some(prev) => prev.min(c),
+                        None => c,
+                    });
                 }
                 if let Some(t) = wmt {
                     u.max_tokens = Some(t);
@@ -704,11 +734,13 @@ mod tests {
         assert_eq!(m.rate, Some(0.79));
         assert_eq!(m.sources.len(), 2);
         assert!(m.sources.iter().all(|s| s.enabled));
-        assert_eq!(m.context_length, Some(200000));
+        // context 诚实取 min：Trae L3 兜底 128K（主条目不声明 1M，issue #31）
+        // vs WB 200000 → 128K
+        assert_eq!(m.context_length, Some(CTX_128K));
         assert_eq!(m.supports_image, Some(true));
     }
 
-    /// 单源各自保留：Trae-only 走 L3/L4 兜底；Buddy-only 直接透传目录
+    /// 单源各自保留：Trae-only 走 L3 兜底；Buddy-only 直接透传目录
     #[test]
     fn t03_single_source_fallbacks() {
         let f = fixture(
@@ -717,15 +749,17 @@ mod tests {
             None,
         );
         let list = unified_models(&f.dir, true, true, true);
-        // kimi-k2.7-code：L3 倍率 0.83 / L4 档位 medium,high / L4 图片不支持（Code）/ L3 上下文 128K
+        // kimi-k2.7-code：L3 倍率 0.83 / 档位无实证 → 空（issue #31 停用名称推断）/
+        // L4 图片不支持（Code）/ L3 上下文 128K
         let k = find(&list, "Kimi-K2.7-Code");
         assert_eq!(k.rate, Some(0.83));
-        assert_eq!(k.efforts, vec!["medium".to_string(), "high".to_string()]);
+        assert!(k.efforts.is_empty(), "无实证模型档位为空，不按名称猜测");
         assert_eq!(k.supports_image, Some(false));
         assert_eq!(k.context_length, Some(CTX_128K));
-        // Doubao-Seed-Evolving：L3 1M 上下文 / L3 倍率 0.08 / L4 Seed 系列支持图片
+        // Doubao-Seed-Evolving：L3 诚实兜底 128K（1M 声明仅 Max Mode 可达，issue #31）/
+        // L3 倍率 0.08 / L4 Seed 系列支持图片
         let s = find(&list, "Doubao-Seed-Evolving");
-        assert_eq!(s.context_length, Some(CTX_1M));
+        assert_eq!(s.context_length, Some(CTX_128K));
         assert_eq!(s.rate, Some(0.08));
         assert_eq!(s.supports_image, Some(true));
         // hy4：Buddy-only，直取目录值
@@ -873,10 +907,9 @@ mod tests {
         let f = fixture(&[("GLM-5V-Turbo", None)], &[], None);
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "GLM-5V-Turbo").supports_image, Some(true));
-        assert_eq!(
-            find(&list, "GLM-5V-Turbo").efforts,
-            vec!["low".to_string(), "medium".to_string()],
-            "turbo 轻量系列档位"
+        assert!(
+            find(&list, "GLM-5V-Turbo").efforts.is_empty(),
+            "turbo 不再按名称推断档位（issue #31）"
         );
     }
 
@@ -1093,5 +1126,87 @@ mod tests {
         // 仅未知条目 → 对外目录为空
         save_whitelist(&f.dir, &["future-model-x".to_string()]).unwrap();
         assert!(unified_models_whitelisted(&f.dir, true, true, true).is_empty());
+    }
+
+    // ==================== issue #31 档位统一（并集 + 归一） ====================
+
+    /// 双源档位声明取并集（WB 不再覆盖 Trae 侧），context 取两池较小值
+    #[test]
+    fn t18_dual_source_efforts_union_and_context_min() {
+        // glm-5.3：Trae 侧 L3 实证 [low,high,xhigh]；WB 侧目录 [low,medium,high]
+        let f = fixture(&[("glm-5.3", None)], &["glm-5.3"], None);
+        let list = unified_models(&f.dir, true, true, true);
+        let m = find(&list, "glm-5.3");
+        assert_eq!(
+            m.efforts,
+            vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string()
+            ],
+            "双源并集：Trae 实证 ∪ WB 目录"
+        );
+        // context：Trae L3 诚实兜底 128K（主条目不再声明 1M，issue #31）
+        // vs WB 200000 → 诚实取 min = 128K
+        assert_eq!(m.context_length, Some(CTX_128K));
+    }
+
+    /// L2 同步档位归一：wire 值（light/extra_high）映射统一档位，
+    /// 已是统一值的保留、大小写归一、未知值丢弃；L2 非空时不回退 L3 实证表
+    #[test]
+    fn t19_l2_efforts_normalized_to_unified() {
+        let f = fixture(&[], &[], None);
+        crate::store::db(&f.dir)
+            .kv_set(
+                "api_models",
+                &json!([
+                    {"id": "wire-model", "label": "W", "efforts": ["light", "extra_high"]},
+                    {"id": "mixed-model", "label": "M", "efforts": ["light", "low", "bogus", "HIGH"]}
+                ]),
+            )
+            .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "api_models");
+        let list = unified_models(&f.dir, true, true, true);
+        assert_eq!(
+            find(&list, "wire-model").efforts,
+            vec!["low".to_string(), "xhigh".to_string()],
+            "wire 值归一为统一档位"
+        );
+        assert_eq!(
+            find(&list, "mixed-model").efforts,
+            vec!["low".to_string(), "high".to_string()],
+            "统一值保留 / 大小写归一 / 未知值丢弃 / 去重"
+        );
+    }
+
+    /// /v1/models 上下文诚实口径（issue #31）：L2 dev 槽（实际请求口径）传导为
+    /// 统一 context_length；max 声明槽不冒充——即使 L2 带出 1M 声明也取 dev 值
+    #[test]
+    fn t20_l2_dev_slot_flows_through_max_not_claimed() {
+        let f = fixture(&[], &[], None);
+        crate::store::db(&f.dir)
+            .kv_set(
+                "api_models",
+                &json!([
+                    {"id": "ctx-model", "label": "C",
+                     "context_length": 168000, "context_length_max": 1000000},
+                    {"id": "ctx-max-only", "label": "M", "context_length_max": 1000000}
+                ]),
+            )
+            .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "api_models");
+        let list = unified_models(&f.dir, true, true, true);
+        assert_eq!(
+            find(&list, "ctx-model").context_length,
+            Some(168_000),
+            "dev 实际口径胜出，1M 声明不冒充（issue #31）"
+        );
+        // 仅 max（dev 缺失）→ 不冒充声明值，回落 L3 保守 128K
+        assert_eq!(
+            find(&list, "ctx-max-only").context_length,
+            Some(CTX_128K),
+            "仅声明槽不冒充实际口径，L3 保守兜底"
+        );
     }
 }
