@@ -173,9 +173,11 @@ pub enum DispatchError {
 pub struct Resolved {
     /// 实际服务的资源池
     pub pool: TargetPool,
-    /// Buddy 池：四段管线归一化后的最终模型；Trae 池：原模型名透传
+    /// Buddy 池：四段管线归一化后的最终模型；Trae 池：后缀剥离后的基名
+    /// （issue #31 T3.1，无后缀/透传语义 = 原名）；Custom：原名
     pub model: String,
-    /// 路由级 effort 注入提示（仅 Buddy 池有效）
+    /// 路由级 effort 提示（统一档位）：Buddy 池直接注入 reasoning_effort；
+    /// Trae 池由 routes 层转 wire 档位下发（efforts::trae_request_wire）
     pub effort_hint: Option<String>,
     /// 跨池回退来源：Some(首选池) 表示发生了回退（warn 日志已在 resolve_target
     /// 内部落 app_log；本字段供调度测试断言与 Phase 2 资源页展示预留）
@@ -205,6 +207,9 @@ struct ModelSources {
     buddy: Option<(String, Option<String>)>,
     /// Trae 源：api_models 命中；或模型不属于任何目录（透传语义，单源 Trae）
     trae: bool,
+    /// Trae 侧最终模型 + effort 提示（issue #31 T3.1：Trae-only 模型带路由后缀时
+    /// 剥离为基名，effort 提示随池携带、由 routes 层转 wire 下发；透传语义为原名）
+    trae_final: (String, Option<String>),
 }
 
 impl ModelSources {
@@ -252,6 +257,9 @@ pub fn resolve_target(
     body: &Value,
     key_id: Option<&str>,
 ) -> Result<Resolved, DispatchError> {
+    // 端点层 model 仅过滤非空未 trim：入口统一去空白（strip_route_suffix 后缀
+    // 匹配 / canonical 比对 / Custom 条目查找均依赖干净形态，错误信息同步受益）
+    let model = model.trim();
     // ⓪ 自定义模型直达（custom_models.json 命中 enabled 条目）：用户显式配置
     // 优先于内置目录；单源无跨池回退，模型名原样透传（custom_route 按条目
     // base_url/key 直连）。mtime 缓存读取，未配置时零开销跳过
@@ -296,15 +304,32 @@ pub fn resolve_target(
             });
 
     // ③ Trae 源判定：canonical_id 命中 Trae 模型列表；未命中任何目录时保持
-    // 透传语义（单源 Trae，与现状一致）
-    let canonical = canonical_id(model);
+    // 透传语义（单源 Trae，与现状一致）。
+    // issue #31 T3.1 后缀剥离跨池：Trae-only 模型带路由后缀（如 "glm-5.3-thinking"，
+    // 基名仅在 Trae 源）时，Buddy 管线 ④ 段因基名不在 Buddy 目录直落 direct，
+    // 全名带后缀透传 Trae 上游会报模型不存在 → 剥离后缀以基名作为 Trae 侧模型，
+    // effort 提示随池携带。基名未命中 Trae 模型列表时保持原名透传（未知模型零行为差异）
+    // Trae 模型列表一次加载（config_cache 缓存），③ 段剥离守卫与 trae_hit 判定共用
+    let trae_list = models_sync::load_models(&state.data_dir);
+    let trae_final = if buddy_hit.is_none() {
+        match wb_model_route::strip_route_suffix(model, &cfg) {
+            Some((base, hint))
+                if trae_list.iter().any(|m| canonical_id(&m.id) == canonical_id(&base)) =>
+            {
+                (base, hint)
+            }
+            _ => (model.to_string(), None),
+        }
+    } else {
+        (model.to_string(), None)
+    };
+    let canonical = canonical_id(&trae_final.0);
     let trae_hit = buddy_hit.is_none()
-        || models_sync::load_models(&state.data_dir)
-            .iter()
-            .any(|m| canonical_id(&m.id) == canonical);
+        || trae_list.iter().any(|m| canonical_id(&m.id) == canonical);
     let sources = ModelSources {
         buddy: buddy_hit,
         trae: trae_hit,
+        trae_final,
     };
 
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
@@ -571,14 +596,18 @@ fn final_buddy_model(sources: &ModelSources) -> String {
 fn final_model_for(pool: TargetPool, sources: &ModelSources, request_model: &str) -> String {
     match pool {
         TargetPool::Buddy => final_buddy_model(sources),
-        TargetPool::Trae | TargetPool::Custom => request_model.to_string(),
+        // Trae：后缀剥离后的基名（issue #31 T3.1；无后缀/透传语义 = 原名）
+        TargetPool::Trae => sources.trae_final.0.clone(),
+        TargetPool::Custom => request_model.to_string(),
     }
 }
 
 fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
     match pool {
         TargetPool::Buddy => sources.buddy.as_ref().and_then(|(_, h)| h.clone()),
-        TargetPool::Trae | TargetPool::Custom => None,
+        // Trae：路由级 effort 提示同样随池携带（routes 层统一档位 → wire 转换下发）
+        TargetPool::Trae => sources.trae_final.1.clone(),
+        TargetPool::Custom => None,
     }
 }
 
@@ -803,6 +832,24 @@ mod tests {
 
     fn policy_default() -> DispatchPolicy {
         DispatchPolicy::default()
+    }
+
+    /// 覆写 Buddy 目录为仅含 `keep` 的显式条目（builtin_rev 拉平退出内置重建）：
+    /// fixture 的 wb_model_catalog 写入缺 builtin_rev 会被 wb_catalog::load 重建为
+    /// 内置 15 模型（含 glm-5.3/kimi-k3），无法构造「基名不在 Buddy 目录」的
+    /// Trae-only 前提（issue #31 T3.1 测试专用）
+    fn catalog_only(dir: &Path, keep: &str) {
+        crate::store::db(dir)
+            .kv_set(
+                "wb_model_catalog",
+                &json!({
+                    "models": [{"id": keep, "display": keep, "context_length": 128000,
+                                "max_tokens": 64000, "supports_image": false,
+                                "supported_efforts": ["low","medium","high"], "rate": 0.5}],
+                    "builtin_rev": super::super::wb_catalog::BUILTIN_REV
+                }),
+            )
+            .unwrap();
     }
 
     // ---------- 维度一：优先级 ----------
@@ -1197,6 +1244,63 @@ mod tests {
         assert_eq!(t.pool, TargetPool::Trae);
         assert_eq!(t.model, "Kimi-K3");
         assert!(t.effort_hint.is_none());
+    }
+
+    // ---------- 后缀剥离跨池（issue #31 T3.1） ----------
+
+    /// Trae-only 模型带 -thinking 后缀 → 剥离后以基名路由，effort 提示随池携带
+    /// （Buddy 管线 ④ 段因基名不在 Buddy 目录未命中，全名透传会报模型不存在）
+    #[test]
+    fn t42_trae_only_suffix_stripped_with_effort_hint() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        // 目录排除 glm-5.3 → "glm-5.3-thinking" 的基名仅在 Trae 源（T3.1 触发前提）
+        catalog_only(&f.dir, "hy4");
+        f.seed_healthy(true);
+        let r = f.resolve("glm-5.3-thinking").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "glm-5.3");
+        assert_eq!(r.effort_hint.as_deref(), Some("high"));
+    }
+
+    /// 无后缀 Trae-only 模型保持原名透传 + 无 effort 提示（零行为差异）
+    #[test]
+    fn t43_trae_only_no_suffix_unchanged() {
+        let f = fixture(&["Kimi-K3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("Kimi-K3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "Kimi-K3");
+        assert!(r.effort_hint.is_none());
+    }
+
+    /// 未知模型带后缀但基名不在 Trae 模型列表 → 原名透传（不剥离，透传语义不变）
+    #[test]
+    fn t44_unknown_model_suffix_passthrough() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let r = f.resolve("ghost-model-thinking").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "ghost-model-thinking");
+        assert!(r.effort_hint.is_none());
+    }
+
+    /// 自定义后缀跨池剥离（effort 值取条目配置；基名命中 Trae 源即生效）
+    #[test]
+    fn t45_custom_suffix_stripped_cross_pool() {
+        let f = fixture(&["kimi-k3"], Some(&["hy4"]), Some(&policy_default()));
+        // 目录排除 kimi-k3 → "kimi-k3-deep" 的基名仅在 Trae 源（T3.1 触发前提）
+        catalog_only(&f.dir, "hy4");
+        crate::store::db(&f.dir)
+            .kv_set(
+                "wb_model_route",
+                &json!({"suffixes": [{"suffix": "-deep", "effort": "xhigh"}]}),
+            )
+            .unwrap();
+        f.seed_healthy(true);
+        let r = f.resolve("kimi-k3-deep").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.model, "kimi-k3");
+        assert_eq!(r.effort_hint.as_deref(), Some("xhigh"));
     }
 
     // ---------- 智能调度（DispatchStrategy::Smart） ----------

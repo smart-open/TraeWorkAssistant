@@ -12,6 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::custom_route;
 use super::dispatch::{self, DispatchError, TargetPool};
+use super::efforts;
 use super::retry::{retry_plan, RetryAction};
 use super::sse;
 use super::unified_catalog;
@@ -151,6 +152,45 @@ fn effective_effort_hint(
 /// 注入 effort 提示到请求体字节流（T5.2④/T5.3）
 fn apply_effort_hint(body_vec: Vec<u8>, hint: Option<String>) -> Vec<u8> {
     wb_model_route::inject_effort_hint(&body_vec, &hint)
+}
+
+/// Trae 出站 effort wire 字段名（issue #31 T0.2 待确认）：
+/// 2026-09 客户端抓包仅实证档位值（light/high/extra_high，efforts::TRAE_EFFORTS_REF），
+/// 字段名以 T0.2 抓包为准，确认后仅需修改本常量。注入依赖上游「未知字段忽略」
+/// 惯例，且仅实证表内模型才产生 wire 值（表外不下发，不按名称猜测）
+const TRAE_EFFORT_FIELD: &str = "reasoning_effort_level";
+
+/// Trae 池 effort 解析（issue #31 T3.2/T3.3）：显式请求 > 路由级提示（后缀剥离
+/// 所得）> 默认深度思考，三源合成为统一档位后转 Trae wire（efforts::trae_request_wire：
+/// 实证表内精确命中或按降级链取兼容值；表外模型 supported 为空 → None 不下发）。
+/// 显式关闭以空串编码（Anthropic thinking disabled）：短路默认思考与路由提示
+fn trae_effort_wire(
+    state: &ApiSharedState,
+    route_hint: Option<String>,
+    explicit: Option<String>,
+    model: &str,
+) -> Option<String> {
+    let requested = explicit.or(route_hint).or_else(|| {
+        state
+            .wb_default_thinking
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| "high".to_string())
+    });
+    let supported = efforts::trae_supported_wire(&unified_catalog::canonical_id(model));
+    requested.and_then(|req| efforts::trae_request_wire(Some(&req), &supported))
+}
+
+/// 注入 Trae effort wire 到请求体字节流（issue #31 T3.3）。wire=None → 原样返回。
+/// payload 层（prepare_llm_chat_body）为透传+增补模式，注入字段直达上游
+fn inject_trae_effort(body_vec: Vec<u8>, wire: Option<String>) -> Vec<u8> {
+    let Some(w) = wire else { return body_vec };
+    match serde_json::from_slice::<Value>(&body_vec) {
+        Ok(Value::Object(mut obj)) => {
+            obj.insert(TRAE_EFFORT_FIELD.to_string(), json!(w));
+            serde_json::to_vec(&obj).unwrap_or(body_vec)
+        }
+        _ => body_vec,
+    }
 }
 
 /// 模型级冷却快速失败（T2.7/F-34：优先级高于 Key 级）
@@ -550,6 +590,14 @@ pub async fn chat_completions(
                 return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
             TargetPool::Trae => {
+                // issue #31 T3.2/T3.3：Trae 池 effort 通道（默认思考两池对齐）——
+                // 显式 reasoning_effort / 路由级提示 / 默认思考 → wire 档位注入
+                let explicit = peek
+                    .get("reasoning_effort")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
+                let body_vec = inject_trae_effort(body_vec, wire);
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard)
                 } else {
@@ -760,6 +808,24 @@ pub async fn messages(
                 return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
             }
             TargetPool::Trae => {
+                // issue #31 T3.2/T3.3：Anthropic thinking 参数视为显式请求
+                //（enabled → high 档；disabled → 空串短路默认思考与路由提示）
+                let explicit = match peek.get("thinking") {
+                    Some(t) if !t.is_null() => {
+                        match t.get("type").and_then(|v| v.as_str()) {
+                            Some("enabled") => Some("high".to_string()),
+                            // 显式关闭（type=disabled 等已知关闭形态）：空串经
+                            // trae_request_wire 短路 → 不下发
+                            Some(_) => Some(String::new()),
+                            // 缺 type（非合规形态，如仅 {"budget_tokens":N}）：对齐
+                            // Buddy 侧「thinking 存在即显式开启」语义，判为开启
+                            None => Some("high".to_string()),
+                        }
+                    }
+                    _ => None,
+                };
+                let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
+                let body_vec = inject_trae_effort(body_vec, wire);
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard)
                 } else {
@@ -886,6 +952,9 @@ pub async fn completions(
                 return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
             }
             TargetPool::Trae => {
+                // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
+                let wire = trae_effort_wire(&state, r.effort_hint, None, &r.model);
+                let body_vec = inject_trae_effort(body_vec, wire);
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard)
                 } else {
@@ -1181,6 +1250,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                     &key_name, &state.pool.name_of(&picked.uid),
                                     Some("first byte timeout"),
                                 );
+                                if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    state.logger.log_debug(&picked.uid, &converted, None, 504, Some("first byte timeout"));
+                                }
                                 break; // 换号
                             }
                         };
@@ -2043,5 +2115,87 @@ mod tests {
         let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["code"], "model_not_found");
+    }
+
+    // ==================== issue #31 T3.2/T3.3：Trae effort wire ====================
+
+    /// 三源合成：显式请求 > 路由提示 > 默认思考；空串显式 = Anthropic thinking
+    /// disabled 编码，短路为 None（同时压制默认思考与路由提示）；实证表外模型
+    /// 不下发（不按名称猜测）；canonical 归一命中实证表
+    #[test]
+    fn trae_effort_wire_three_sources_and_short_circuit() {
+        let f = wl_fixture("effort");
+
+        // 无显式、无提示、默认思考关 → None
+        assert!(trae_effort_wire(&f.state, None, None, "glm-5.3").is_none());
+
+        // 路由提示兜底（实证表内模型 → wire 命中）
+        assert_eq!(
+            trae_effort_wire(&f.state, Some("high".into()), None, "glm-5.3").as_deref(),
+            Some("high")
+        );
+
+        // 显式优先于路由提示；统一档位映射：low → light
+        assert_eq!(
+            trae_effort_wire(&f.state, Some("high".into()), Some("low".into()), "glm-5.3")
+                .as_deref(),
+            Some("light")
+        );
+
+        // 统一档位映射：xhigh → extra_high
+        assert_eq!(
+            trae_effort_wire(&f.state, None, Some("xhigh".into()), "glm-5.3").as_deref(),
+            Some("extra_high")
+        );
+
+        // 默认思考开 → high（仍经实证表转换）
+        f.state
+            .wb_default_thinking
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            trae_effort_wire(&f.state, None, None, "glm-5.3").as_deref(),
+            Some("high")
+        );
+
+        // 显式关闭（空串编码）短路一切：默认思考开着、路由提示在也返回 None
+        assert!(
+            trae_effort_wire(&f.state, Some("high".into()), Some(String::new()), "glm-5.3")
+                .is_none()
+        );
+
+        // 实证表外模型：即便显式请求也不下发（supported 为空 → None）
+        assert!(
+            trae_effort_wire(&f.state, None, Some("high".into()), "deepseek-v4-flash").is_none()
+        );
+
+        // canonical 归一：大小写变体同样命中实证表
+        assert_eq!(
+            trae_effort_wire(&f.state, None, Some("high".into()), "GLM-5.3").as_deref(),
+            Some("high")
+        );
+    }
+
+    /// wire 注入：None 原样返回；Some 时写入 reasoning_effort_level（T0.2 抓包后
+    /// 仅改 TRAE_EFFORT_FIELD 常量）且原字段保留；非对象/非 JSON body 原样返回
+    #[test]
+    fn inject_trae_effort_wire_variants() {
+        let body = br#"{"model":"glm-5.3","messages":[]}"#.to_vec();
+
+        // None → 原样
+        assert_eq!(inject_trae_effort(body.clone(), None), body);
+
+        // Some → 注入字段，原字段保留
+        let out = inject_trae_effort(body, Some("extra_high".into()));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["reasoning_effort_level"], "extra_high");
+        assert_eq!(v["model"], "glm-5.3");
+
+        // 非对象 body（数组）→ 原样
+        let arr = br#"[1,2,3]"#.to_vec();
+        assert_eq!(inject_trae_effort(arr.clone(), Some("high".into())), arr);
+
+        // 非 JSON body → 原样
+        let raw = b"not-json".to_vec();
+        assert_eq!(inject_trae_effort(raw.clone(), Some("high".into())), raw);
     }
 }

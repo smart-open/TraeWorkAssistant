@@ -5,6 +5,7 @@ pub mod config_cache;
 pub mod custom_models;
 pub mod custom_route;
 pub mod dispatch;
+pub mod efforts;
 pub mod gateway_settings;
 pub mod models_sync;
 pub mod pool;
