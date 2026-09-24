@@ -331,6 +331,8 @@ export interface UnifiedModel {
   rate: number | null;
   /** 思考档位（双语义合并展示，仅 Buddy 池作为请求参数下发） */
   efforts: string[];
+  /** Max Mode 支持（Trae 池 1M 上下文；Buddy/自定义单源恒 false） */
+  max_mode: boolean;
   context_length: number | null;
   max_tokens: number | null;
   supports_image: boolean | null;

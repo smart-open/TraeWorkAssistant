@@ -177,7 +177,7 @@ curl -X POST ${base}/v1/chat/completions \\
   const modelOptions =
     models.some((m) => m.id === model) || !model
       ? models
-      : [{ id: model, display: model, rate: null, efforts: [], context_length: null, max_tokens: null, supports_image: null, manual: false, sources: [] }, ...models];
+      : [{ id: model, display: model, rate: null, efforts: [], max_mode: false, context_length: null, max_tokens: null, supports_image: null, manual: false, sources: [] }, ...models];
 
   // ---- 白名单派生数据 ----
   const catalogByCanonical = new Map(models.map((m) => [canonical(m.id), m]));
@@ -321,6 +321,18 @@ curl -X POST ${base}/v1/chat/completions \\
             <code className="block break-all text-[11px]">
               GET {displayBase}/health
             </code>
+            <div className="border-t border-slate-200 pt-1.5 dark:border-zinc-700/60">
+              <span className="text-slate-400">模型档位：</span>
+              <code className="text-[11px]">
+                reasoning_effort（OpenAI）/ thinking（Anthropic），统一六档 minimal/low/medium/high/xhigh/max，按池自动映射；Trae 未实证模型显式请求时填充默认映射
+              </code>
+            </div>
+            <div>
+              <span className="text-slate-400">Max Mode：</span>
+              <code className="text-[11px]">
+                支持模型（Max 列 ✓）ID 加 -max 后缀启用 1M 上下文，如 glm-5.3-max；qwen3.8-max 需写 qwen3.8-max-max
+              </code>
+            </div>
           </div>
         </div>
       </div>
