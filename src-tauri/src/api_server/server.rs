@@ -58,11 +58,13 @@ impl Drop for ApiServerHandle {
 /// 启动 axum HTTP 服务器
 ///
 /// 使用 Tauri 内置 tokio runtime，不新建 runtime。
+/// 监听 0.0.0.0（issue #34）：局域网内其他机器可访问；鉴权见 auth::bearer_auth
+/// （有启用 Key 强制鉴权，无 Key 匿名放行——UI 侧提示启用 Key）。
 pub async fn start_api_server(
     port: u16,
     state: Arc<ApiSharedState>,
 ) -> Result<ApiServerHandle, String> {
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("端口 {} 绑定失败: {}", port, e))?;

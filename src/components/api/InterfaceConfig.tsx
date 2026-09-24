@@ -12,7 +12,7 @@ import { withMinDelay } from '../../lib/delay';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import { Badge, Modal } from '../ui';
-import type { GatewaySettings, UnifiedModel } from '../../types';
+import type { GatewaySettings, LanIfaceIp, UnifiedModel } from '../../types';
 
 /** 与后端 canonical_id 一致：trim + 小写（§3.3 #1） */
 const canonical = (id: string) => id.trim().toLowerCase();
@@ -43,6 +43,8 @@ export default function InterfaceConfig() {
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [copying, setCopying] = useState(false);
+  // 局域网网卡 IPv4（issue #34：网关 0.0.0.0 监听后的接入地址展示）
+  const [lanIps, setLanIps] = useState<LanIfaceIp[]>([]);
 
   // ---- issue #26 模型白名单 ----
   const [whitelist, setWhitelist] = useState<string[]>([]);
@@ -62,6 +64,12 @@ export default function InterfaceConfig() {
       })
       .catch(() => {
         /* 保留默认值 */
+      });
+    api.apiServer
+      .lanIfaceIps()
+      .then(setLanIps)
+      .catch(() => {
+        /* 保留空列表（展示回退「仅本机可访问」） */
       });
     api.apiServer
       .unifiedModels()
@@ -149,9 +157,13 @@ export default function InterfaceConfig() {
   const copyConfigExample = async () => {
     const p = gw?.port ?? 7864;
     const m = gw?.default_model ?? 'glm-5.3';
+    // 局域网接入地址（issue #34：网关 0.0.0.0 监听，内网设备按局域网 IP 访问）
+    const lanLines = lanIps
+      .map((e) => `接口地址(局域网): http://${e.ip}:${p}/v1  # ${e.name}`)
+      .join('\n');
     const example = `# 客户端配置示例（OpenAI 兼容格式）
 接口地址: http://127.0.0.1:${p}/v1
-API Key:  <在「API Keys 管理」中创建并复制>
+${lanLines ? lanLines + '\n' : ''}API Key:  <在「API Keys 管理」中创建并复制>
 模型 ID:  ${m}（统一目录内任一模型均可，请求按模型 ID 匹配资源池）
 
 # Anthropic 兼容端点（Claude Code 等工具直连）
@@ -316,6 +328,28 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
             <div>
               <span className="text-slate-400">接口地址：</span>
               <code className="break-all text-[11px]">http://127.0.0.1:{gw?.port ?? 7864}/v1</code>
+            </div>
+            <div>
+              <span className="text-slate-400">局域网接入：</span>
+              {lanIps.length ? (
+                lanIps.map((e) => (
+                  <code
+                    key={e.ip}
+                    className="block break-all text-[11px]"
+                    title={`网卡：${e.name}`}
+                  >
+                    http://{e.ip}:{gw?.port ?? 7864}/v1（{e.name}）
+                  </code>
+                ))
+              ) : (
+                <code className="text-[11px]">未检测到局域网地址（已排除回环/虚拟网卡）</code>
+              )}
+            </div>
+            <div>
+              <span className="text-slate-400">安全提示：</span>
+              <code className="text-[11px]">
+                网关监听 0.0.0.0，局域网内设备可访问；未启用任何 API Key 时匿名放行，建议创建并启用 Key
+              </code>
             </div>
             <div>
               <span className="text-slate-400">API Key：</span>

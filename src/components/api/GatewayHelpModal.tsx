@@ -13,7 +13,7 @@ import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
-import type { GatewaySettings, UnifiedModel } from '../../types';
+import type { GatewaySettings, LanIfaceIp, UnifiedModel } from '../../types';
 
 const POOL_LABELS: Record<string, string> = {
   trae: 'Trae',
@@ -37,6 +37,8 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [query, setQuery] = useState('');
   const [copied, setCopied] = useState(false);
+  // 局域网网卡 IPv4（issue #34：网关 0.0.0.0 监听后的接入地址展示）
+  const [lanIps, setLanIps] = useState<LanIfaceIp[]>([]);
 
   const port = gw?.port ?? 7864;
   const base = `http://127.0.0.1:${port}`;
@@ -45,6 +47,9 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
     if (!open) return;
     api.apiServer.gatewaySettingsGet().then(setGw).catch(() => {
       /* 保留默认端口 */
+    });
+    api.apiServer.lanIfaceIps().then(setLanIps).catch(() => {
+      /* 保留空列表 */
     });
     api.apiServer
       .unifiedModels()
@@ -103,6 +108,22 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
               <div>
                 <span className="text-slate-400 dark:text-zinc-500">接口地址：</span>
                 <code className="text-[11px]">{base}/v1</code>
+              </div>
+              <div>
+                <span className="text-slate-400 dark:text-zinc-500">局域网接入：</span>
+                {lanIps.length ? (
+                  lanIps.map((e) => (
+                    <code
+                      key={e.ip}
+                      className="block break-all text-[11px]"
+                      title={`网卡：${e.name}`}
+                    >
+                      http://{e.ip}:{port}/v1（{e.name}）
+                    </code>
+                  ))
+                ) : (
+                  <span className="text-[11px]">未检测到局域网地址（已排除回环/虚拟网卡）</span>
+                )}
               </div>
               <div>
                 <span className="text-slate-400 dark:text-zinc-500">API Key：</span>
