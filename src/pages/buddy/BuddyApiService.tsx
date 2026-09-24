@@ -136,6 +136,9 @@ export default function BuddyApiService() {
   const [usage, setUsage] = useState<UsageDayView[]>([]);
   // WB 池实时状态（F-77⑤ 可观测：per-account inflight 在途计数）
   const [wbPool, setWbPool] = useState<PoolStatus[]>([]);
+  // 模型目录定时同步配置（wb_catalog_sync_enabled/hhmm 存 app Settings，独立部分保存）
+  const [catSync, setCatSync] = useState({ enabled: true, hhmm: '05:45' });
+  const [savingCatSync, setSavingCatSync] = useState(false);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -197,6 +200,36 @@ export default function BuddyApiService() {
   useEffect(() => {
     void loadTodayUsage();
   }, [loadTodayUsage]);
+
+  // 定时同步配置加载（app Settings；失败静默保留默认值）
+  useEffect(() => {
+    api.misc
+      .settingsGet()
+      .then((s) => setCatSync({ enabled: s.wb_catalog_sync_enabled ?? true, hhmm: s.wb_catalog_sync_hhmm || '05:45' }))
+      .catch(() => {});
+  }, []);
+
+  // 定时同步配置保存：settings_set 真 patch 语义，只写本卡两个字段
+  const saveCatSync = async () => {
+    setSavingCatSync(true);
+    try {
+      await withMinDelay(
+        api.misc.settingsSet({
+          wb_catalog_sync_enabled: catSync.enabled,
+          wb_catalog_sync_hhmm: catSync.hhmm.trim() || '05:45',
+        }),
+        400,
+      );
+      pushToast(
+        'success',
+        catSync.enabled ? `已保存：每天 ${catSync.hhmm || '05:45'} 自动同步官网模型` : '已关闭定时同步（仅手动同步）',
+      );
+    } catch (err) {
+      pushToast('error', `保存失败：${String(err)}`);
+    } finally {
+      setSavingCatSync(false);
+    }
+  };
 
   // 保存资源开关/调度参数/账号池白名单：uids/strategy/groups 原样回传（本页不改 Trae 池配置）；
   // WB 白名单随本次保存提交：未自定义传 null（后端保留原值，fail-open 语义不变，
@@ -556,6 +589,32 @@ export default function BuddyApiService() {
               从 Buddy 上游模型目录接口拉取并替换 wb_model_catalog.json（倍率/思考档位/图片模态以服务端为准）；
               网关启动时也会自动同步一次。
             </p>
+            {/* 定时同步（app Settings）：应用内置调度器每日到点自动执行，无账号时静默跳过 */}
+            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-slate-100 p-2.5 text-xs dark:border-zinc-800">
+              <label className="flex cursor-pointer items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={catSync.enabled}
+                  onChange={(e) => setCatSync((f) => ({ ...f, enabled: e.target.checked }))}
+                />
+                每日定时同步
+              </label>
+              <input
+                type="time"
+                value={catSync.hhmm}
+                onChange={(e) => setCatSync((f) => ({ ...f, hhmm: e.target.value || '05:45' }))}
+                disabled={!catSync.enabled}
+                className="input h-8 !w-28 text-xs"
+              />
+              <button className="btn-outline !px-2 !py-1" disabled={savingCatSync} onClick={() => void saveCatSync()}>
+                {savingCatSync ? <Spinner /> : <Save size={13} />} 保存
+              </button>
+              <span className="text-slate-400 dark:text-zinc-500">
+                {catSync.enabled
+                  ? `应用运行期间每天 ${catSync.hhmm || '05:45'} 自动同步（无账号时静默跳过）`
+                  : '已关闭定时同步，仅手动同步'}
+              </span>
+            </div>
             {catalog.length === 0 ? (
               <p className="py-4 text-center text-xs text-slate-400">暂无目录数据：点击「同步目录」拉取（需至少一个含凭证的 WB 账号）。</p>
             ) : (

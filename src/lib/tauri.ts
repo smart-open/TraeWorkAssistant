@@ -45,6 +45,7 @@ import type {
   UpdateDownloaded,
   UpdateDownloadProgress,
   GatewaySettings,
+  LanIfaceIp,
   DispatchPolicy,
   TraeModelMeta,
   UnifiedModel,
@@ -537,6 +538,9 @@ export const api = {
     // 返回规范化后的生效值（前端展示以返回值为准）；端口改动下次启动 API 服务后生效
     gatewaySettingsSet: (settings: GatewaySettings) =>
       invoke<GatewaySettings>('gateway_settings_set', { settings }),
+    // 局域网网卡 IPv4 列表（issue #34：过滤回环/链路本地/Docker/虚拟化/代理虚拟网卡，
+    // 多物理网卡多 IP；网关 0.0.0.0 监听后作为局域网接入地址展示）
+    lanIfaceIps: () => invoke<LanIfaceIp[]>('lan_iface_ips'),
     // 全局模型白名单（issue #26，canonical 归一列表；空 = 不限）
     modelWhitelistGet: () => invoke<string[]>('model_whitelist_get'),
     // 返回归一后的生效值（canonical + 去空 + 去重）；落盘即时生效无需重启网关

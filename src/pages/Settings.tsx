@@ -22,7 +22,6 @@ export default function Settings() {
   // F-75 M0-0.5/M2-2.4：Windows 专属入口（schtasks 注册等）按平台标志隐藏
   const platform = useAppStore((s) => s.platform);
 
-  const [time, setTime] = useState('09:00');
   const [taskInfo, setTaskInfo] = useState<string>('');
   const [busyTask, setBusyTask] = useState(false);
   const [querying, setQuerying] = useState(false);
@@ -90,11 +89,22 @@ export default function Settings() {
     }
   };
 
+  // 注册时间复用应用内调度时刻（trae_checkin_hhmm）：schtasks 与调度器共用同一配置值。
+  // form 是编辑态：若时刻已改但未「保存设置」，schtasks 注册新值而内置调度器仍按
+  // 存储值运行（两执行器分叉），toast 需明示这一边界
   const register = async () => {
+    const hhmm = form?.trae_checkin_hhmm || '09:00';
     setBusyTask(true);
     try {
-      await withMinDelay(api.misc.taskRegister(time));
-      toast('success', `已注册每日 ${time} 自动签到`);
+      await withMinDelay(api.misc.taskRegister(hhmm));
+      const unsaved =
+        form != null && settings != null && form.trae_checkin_hhmm !== settings.trae_checkin_hhmm;
+      toast(
+        'success',
+        unsaved
+          ? `已注册每日 ${hhmm} 签到（内置调度器在底部「保存设置」后才使用该时刻）`
+          : `已注册每日 ${hhmm} 自动签到`,
+      );
       await query();
     } catch (e) {
       const msg = String(e);
@@ -380,21 +390,28 @@ export default function Settings() {
 
           <h3 className="mb-1 font-medium">每日定时签到</h3>
           <p className="mb-3 text-xs text-slate-400">
-            应用内置 Rust 定时调度器：应用运行期间每日 09:00 自动签到（晚于该时刻启动会自动补跑，无需管理员权限）。
+            应用内置 Rust 定时调度器：应用运行期间每日到点自动签到（晚于该时刻启动会自动补跑，无需管理员权限），
+            触发时刻随底部「保存设置」生效。
             {platform === 'windows'
-              ? '下方可注册 Windows 计划任务作为兜底，在应用未启动时于指定时间直接运行签到（注册/删除需要管理员权限）。'
-              : '配合「开机自启 + 静默签到」，macOS 上应用运行期间即可覆盖每日定时签到（系统级计划任务注册仅支持 Windows）。'}
+              ? '下方可注册 Windows 计划任务作为兜底，注册时间复用同一时刻，在应用未启动时直接运行签到（注册/删除需要管理员权限）。'
+              : 'macOS 无系统级计划任务注册，配合「开机自启 + 静默签到」即可覆盖每日定时签到。'}
           </p>
-          <div className={`flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="label !mb-0">每日触发时刻</label>
             <div className="relative flex items-center">
               <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
               <input
                 type="time"
-                value={time}
-                onChange={(e) => setTime(e.target.value)}
+                value={form.trae_checkin_hhmm}
+                onChange={(e) => update('trae_checkin_hhmm', e.target.value || '09:00')}
                 className="input h-9 !w-32 pl-8 text-sm"
               />
             </div>
+            <span className="text-xs text-slate-400">
+              每天 {form.trae_checkin_hhmm || '09:00'} 执行（应用关闭期间不执行）
+            </span>
+          </div>
+          <div className={`mt-3 flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
             <button onClick={register} disabled={busyTask} className="btn-outline">
               <Calendar size={15} /> {busyTask ? '注册中…' : '注册任务'}
             </button>
@@ -416,6 +433,46 @@ export default function Settings() {
               {taskInfo}
             </pre>
           )}
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          {/* 积分数据同步：应用内置调度器（模式/时刻随底部「保存设置」生效） */}
+          <h3 className="mb-1 font-medium">积分数据同步</h3>
+          <p className="mb-3 text-xs text-slate-400">
+            应用运行期间按所选模式自动拉取账号积分并刷新看板（含积分快照与到期数据）；无账号时静默跳过，
+            失败 30 分钟后自动重试。模式与时刻随底部「保存设置」生效。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="label !mb-0">同步模式</label>
+            <select
+              className="input h-9 !w-32 text-sm"
+              value={form.trae_credits_sync_mode}
+              onChange={(e) => update('trae_credits_sync_mode', e.target.value)}
+            >
+              <option value="daily">每日定时</option>
+              <option value="hourly">每小时</option>
+              <option value="off">关闭</option>
+            </select>
+            {form.trae_credits_sync_mode === 'daily' && (
+              <>
+                <div className="relative flex items-center">
+                  <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
+                  <input
+                    type="time"
+                    value={form.trae_credits_sync_hhmm}
+                    onChange={(e) => update('trae_credits_sync_hhmm', e.target.value || '23:40')}
+                    className="input h-9 !w-32 pl-8 text-sm"
+                  />
+                </div>
+                <span className="text-xs text-slate-400">
+                  每天 {form.trae_credits_sync_hhmm || '23:40'} 执行（应用关闭期间不执行）
+                </span>
+              </>
+            )}
+            {form.trae_credits_sync_mode === 'hourly' && (
+              <span className="text-xs text-slate-400">应用运行期间每小时同步一次</span>
+            )}
+          </div>
         </section>
       </div>
 

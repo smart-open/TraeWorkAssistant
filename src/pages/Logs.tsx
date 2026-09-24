@@ -106,7 +106,7 @@ function SystemLogsTab() {
   };
 
   return (
-    <div className="grid min-h-0 flex-1 gap-3 md:grid-cols-[1fr_2fr]">
+    <div className="grid min-h-0 flex-1 gap-3 grid-cols-[1fr_2fr]">
       {/* 实时代理输出 */}
       <div className="card flex min-h-0 flex-col p-3">
         <div className="mb-2 flex items-center justify-between">

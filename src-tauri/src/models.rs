@@ -156,6 +156,10 @@ pub struct Settings {
     /// 豆包快照可选纳入 Default/IndexedDB（C4：对话历史等完整状态随账号迁移；体积代价大，默认排除）
     #[serde(default)]
     pub doubao_snapshot_include_idb: bool,
+    /// Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；
+    /// Windows 计划任务注册时间复用该值）
+    #[serde(default = "default_trae_checkin_hhmm")]
+    pub trae_checkin_hhmm: String,
     /// Trae JWT 定时调度续期（issue #27）：调度器 trae-renew 开关（默认开，每日兜底
     /// 续期临期账号；state::settings 对零值统一回填默认，防止 Settings::default 路径漏开）
     #[serde(default = "default_true")]
@@ -170,6 +174,34 @@ pub struct Settings {
     /// WorkBuddy 成长任务调度触发时刻 HH:MM（默认 09:00，任务配置页可改）
     #[serde(default = "default_wb_growth_hhmm")]
     pub wb_growth_hhmm: String,
+    /// WorkBuddy 每日签到调度触发时刻 HH:MM（默认 09:10，任务配置页可改）
+    #[serde(default = "default_wb_checkin_hhmm")]
+    pub wb_checkin_hhmm: String,
+    // ── 看板数据定时同步（积分/Token/模型；调度器 credits/models 两类任务） ──
+    /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM，默认）
+    #[serde(default = "default_credits_sync_mode")]
+    pub wb_credits_sync_mode: String,
+    /// Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻）
+    #[serde(default = "default_wb_credits_sync_hhmm")]
+    pub wb_credits_sync_hhmm: String,
+    /// Trae 积分数据同步模式：off | hourly | daily（默认）
+    #[serde(default = "default_credits_sync_mode")]
+    pub trae_credits_sync_mode: String,
+    /// Trae 积分同步触发时刻 HH:MM（daily 模式生效，默认 23:40 对齐原快照时刻）
+    #[serde(default = "default_trae_credits_sync_hhmm")]
+    pub trae_credits_sync_hhmm: String,
+    /// Buddy 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过）
+    #[serde(default = "default_true")]
+    pub wb_catalog_sync_enabled: bool,
+    /// Buddy 模型目录同步触发时刻 HH:MM（默认 05:45）
+    #[serde(default = "default_wb_catalog_sync_hhmm")]
+    pub wb_catalog_sync_hhmm: String,
+    /// Trae 官网模型列表每日同步开关（API 服务页，默认开；无账号时调度静默跳过）
+    #[serde(default = "default_true")]
+    pub trae_models_sync_enabled: bool,
+    /// Trae 模型列表同步触发时刻 HH:MM（默认 05:40）
+    #[serde(default = "default_trae_models_sync_hhmm")]
+    pub trae_models_sync_hhmm: String,
     // ── 通知渠道（F-19；Trae/Buddy 全平台共用，系统设置页通知渠道面板维护） ──
     /// 通知总开关（默认开；关闭后所有事件渠道静默）
     #[serde(default = "default_true")]
@@ -239,12 +271,34 @@ fn default_lang() -> String {
 fn default_retry() -> i32 {
     1
 }
+/// Trae 每日签到调度默认每日 09:00（环境配置页可改，schtasks 注册时间复用）
+fn default_trae_checkin_hhmm() -> String {
+    "09:00".into()
+}
 /// Trae JWT 续期调度默认每日 09:00（issue #27：剩余 <48h 惰性续期，每日一次为安全超集）
 fn default_jwt_renew_hhmm() -> String {
     "09:00".into()
 }
 fn default_wb_growth_hhmm() -> String {
     "09:00".into()
+}
+fn default_wb_checkin_hhmm() -> String {
+    "09:10".into()
+}
+fn default_credits_sync_mode() -> String {
+    "daily".into()
+}
+fn default_wb_credits_sync_hhmm() -> String {
+    "23:30".into()
+}
+fn default_trae_credits_sync_hhmm() -> String {
+    "23:40".into()
+}
+fn default_wb_catalog_sync_hhmm() -> String {
+    "05:45".into()
+}
+fn default_trae_models_sync_hhmm() -> String {
+    "05:40".into()
 }
 fn default_notify() -> String {
     "toast".into()

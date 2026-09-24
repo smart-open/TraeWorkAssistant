@@ -274,6 +274,8 @@ export interface Settings {
   api_default_model: string;
   /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
   buddy_switch_migrate_chats: boolean;
+  /** Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；Windows 计划任务注册时间复用该值） */
+  trae_checkin_hhmm: string;
   /** Trae JWT 定时调度续期开关（issue #27，默认开：每日兜底续期临期账号） */
   jwt_renew_enabled: boolean;
   /** Trae JWT 续期调度触发时刻 HH:MM（默认 09:00，环境配置页可改） */
@@ -282,6 +284,24 @@ export interface Settings {
   wb_growth_enabled: boolean;
   /** WorkBuddy 成长任务调度触发时刻 HH:MM（默认 09:00，任务配置页可改） */
   wb_growth_hhmm: string;
+  /** WorkBuddy 每日签到调度触发时刻 HH:MM（默认 09:10，任务配置页可改） */
+  wb_checkin_hhmm: string;
+  /** Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM，默认） */
+  wb_credits_sync_mode: string;
+  /** Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻） */
+  wb_credits_sync_hhmm: string;
+  /** Trae 积分数据同步模式：off | hourly | daily（默认） */
+  trae_credits_sync_mode: string;
+  /** Trae 积分同步触发时刻 HH:MM（daily 模式生效，默认 23:40 对齐原快照时刻） */
+  trae_credits_sync_hhmm: string;
+  /** Buddy 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过） */
+  wb_catalog_sync_enabled: boolean;
+  /** Buddy 模型目录同步触发时刻 HH:MM（默认 05:45） */
+  wb_catalog_sync_hhmm: string;
+  /** Trae 官网模型列表每日同步开关（API 服务页，默认开；无账号时调度静默跳过） */
+  trae_models_sync_enabled: boolean;
+  /** Trae 模型列表同步触发时刻 HH:MM（默认 05:40） */
+  trae_models_sync_hhmm: string;
   // ── 通知渠道（F-19；Trae/Buddy 全平台共用，系统设置页通知渠道面板维护） ──
   /** 通知总开关（默认开；关闭后所有事件渠道静默） */
   notify_enabled: boolean;
@@ -402,6 +422,8 @@ export interface UnifiedModel {
   rate: number | null;
   /** 思考档位（双语义合并展示，仅 Buddy 池作为请求参数下发） */
   efforts: string[];
+  /** Max Mode 支持（Trae 池 1M 上下文；Buddy/自定义单源恒 false） */
+  max_mode: boolean;
   context_length: number | null;
   max_tokens: number | null;
   supports_image: boolean | null;
@@ -428,6 +450,15 @@ export interface GatewaySettings {
   port: number;
   default_model: string;
   updated_at: number;
+}
+
+/** 局域网网卡地址（issue #34：lan_iface_ips 命令；已过滤回环/链路本地/
+ *  Docker/虚拟化/代理虚拟网卡，多物理网卡多 IP，按 IP 去重保序） */
+export interface LanIfaceIp {
+  /** 接口名（如「以太网」「WLAN」） */
+  name: string;
+  /** IPv4 地址 */
+  ip: string;
 }
 
 /** 自定义模型条目（data/custom_models.json；custom_models_list/save/remove）。

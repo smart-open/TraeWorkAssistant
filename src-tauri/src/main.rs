@@ -199,6 +199,7 @@ fn main() {
             commands::api_server::model_whitelist_set,
             commands::api_server::gateway_settings_get,
             commands::api_server::gateway_settings_set,
+            commands::api_server::lan_iface_ips,
             commands::api_server::custom_models_list,
             commands::api_server::custom_models_save,
             commands::api_server::custom_models_remove,

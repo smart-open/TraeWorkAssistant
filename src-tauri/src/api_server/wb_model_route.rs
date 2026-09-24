@@ -23,6 +23,13 @@ use std::path::Path;
 pub const BUILTIN_THINKING_SUFFIX: &str = "-thinking";
 pub const BUILTIN_THINKING_EFFORT: &str = "high";
 
+/// Max Mode 入口后缀（issue #31 T4.2）：私有约定入口，dispatch 对 Trae-only 模型
+/// 剥离后置 max 入口标志、由 routes 层结合 efforts::TRAE_MAX_MODE_REF 门控注入
+/// `is_max_mode:1`（不改写模型名）。不作 Buddy 管线路由后缀（max_mode 为 Trae
+/// wire 专属语义）；整名以 -max 结尾的真模型（如 qwen3.8-max）由 dispatch
+/// 「整名在模型列表优先透传」守卫避免误剥
+pub const BUILTIN_MAX_SUFFIX: &str = "-max";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteRule {
     pub pattern: String,
@@ -205,6 +212,33 @@ fn strip_suffix_ci(name: &str, suffix: &str) -> Option<String> {
         return None;
     }
     Some(base.trim_end_matches(['-', '_']).to_string())
+}
+
+/// 跨池后缀剥离（issue #31 T3.1）：内置 `-thinking` 与自定义 `suffixes[]` 的
+/// 纯字符串剥离（**不查 Buddy 目录**），返回 (基名, effort 提示)，按 resolve ④
+/// 段同序匹配（内置优先）。供 dispatch 对 Trae-only 模型剥离后缀（基名是否可
+/// 服务由 dispatch 查 Trae 模型列表判定）；Buddy 目录校验仍由 resolve ④ 段自理。
+pub fn strip_route_suffix(name: &str, cfg: &WbRouteFile) -> Option<(String, Option<String>)> {
+    if let Some(base) = strip_suffix_ci(name, BUILTIN_THINKING_SUFFIX) {
+        return Some((base, Some(BUILTIN_THINKING_EFFORT.to_string())));
+    }
+    for s in &cfg.suffixes {
+        if s.suffix.is_empty() {
+            continue;
+        }
+        if let Some(base) = strip_suffix_ci(name, &s.suffix) {
+            return Some((base, s.effort.clone()));
+        }
+    }
+    None
+}
+
+/// 跨池 Max Mode 后缀剥离（issue #31 T4.2）：纯字符串剥离内置 `-max`（不查目录），
+/// 返回基名（无 effort 提示——max_mode 与档位正交）。仅 dispatch Trae 分支调用，
+/// 剥离成功不代表可服务：基名是否可由 Trae 提供由 dispatch 查 Trae 模型列表判定，
+/// 整名命中列表的真模型（qwen3.8-max 等）由调用方守卫优先透传、不走本剥离
+pub fn strip_max_suffix(name: &str) -> Option<String> {
+    strip_suffix_ci(name, BUILTIN_MAX_SUFFIX)
 }
 
 /// 目录内倍率最低的模型（后台任务降级目标，T5.6③/F-65）；

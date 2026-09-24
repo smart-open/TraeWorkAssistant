@@ -189,12 +189,25 @@ function defaultSettings(): Settings {
     api_default_model: 'deepseek-v4-flash',
     // F-74：切换时自动迁移会话——默认关（旧行为保持"只切登录态，不写会话"）
     buddy_switch_migrate_chats: false,
+    // Trae 每日签到调度时刻（环境配置页可改，默认 09:00；schtasks 注册时间复用该值）
+    trae_checkin_hhmm: '09:00',
     // Trae JWT 定时续期（issue #27）：默认开，每日 09:00 惰性续期临期账号
     jwt_renew_enabled: true,
     jwt_renew_hhmm: '09:00',
     // WorkBuddy 每日成长（任务配置页）：默认开，每日 09:00 执行成长轮
     wb_growth_enabled: true,
     wb_growth_hhmm: '09:00',
+    // WorkBuddy 每日签到调度时刻（任务配置页可改，默认 09:10）
+    wb_checkin_hhmm: '09:10',
+    // 积分/Token 同步与官网模型定时同步：默认每日定时（Buddy 23:30 / Trae 23:40）与默认开（05:45 / 05:40）
+    wb_credits_sync_mode: 'daily',
+    wb_credits_sync_hhmm: '23:30',
+    trae_credits_sync_mode: 'daily',
+    trae_credits_sync_hhmm: '23:40',
+    wb_catalog_sync_enabled: true,
+    wb_catalog_sync_hhmm: '05:45',
+    trae_models_sync_enabled: true,
+    trae_models_sync_hhmm: '05:40',
     // 通知渠道（F-19，Trae/Buddy 全平台共用）：总开关与事件通知默认开，渠道留空 = 关闭
     notify_enabled: true,
     notify_on_checkin: true,

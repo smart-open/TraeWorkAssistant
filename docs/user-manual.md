@@ -275,7 +275,7 @@ AI Work 助手 是一款桌面端（Windows / macOS）多账号管理一站式�
 | Tab | 内容 |
 |-----|------|
 | 概览 | 服务启停与指标行（运行状态 / 总请求数 / 当前并发 / Key 数量）、目前资源（Trae / Buddy 双池摘要）、生态接入（CC Switch / Codex 统一条目注册） |
-| 接口配置 | 监听端口、默认模型、使用示例（端口改动下次启动服务后生效） |
+| 接口配置 | 监听端口、默认模型、局域网接入地址、使用示例、模型档位与 Max Mode 说明（端口改动下次启动服务后生效） |
 | API Keys 管理 | Key 新建 / 编辑 / 删除、日限额、调度配置（临期优先 / 专一） |
 | 用量统计 | 7 / 14 / 30 天窗口、资源池筛选（全部 / Trae / Buddy）、模型分布 Top 5 |
 
@@ -326,10 +326,38 @@ response = client.chat.completions.create(
 - `GET /health` — 健康检查
 - `POST /v1/embeddings` — 上游无向量能力，固定返回 501
 
+**局域网访问**：网关监听 `0.0.0.0`（所有网卡），局域网内其他设备可通过本机内网 IP 访问，如 `http://192.168.1.5:7864/v1`。「接口配置」与「API 使用帮助」自动列出本机局域网地址（已排除回环 / 链路本地 / Docker / 虚拟化 / 代理虚拟网卡，多个物理网卡展示多个 IP）。安全提示：未启用任何 API Key 时网关匿名放行，开放局域网访问前建议在「API Keys 管理」中创建并启用 Key。
+
 ### 7.5 积分口径
 
 - Trae 池消耗 **通用积分**（product_id 208，签到获取），不是 Work 积分（product_id 209）；请在签到后确认账号有可用积分
 - Buddy 池消耗 **Buddy 积分**；两套积分体系相互独立，倍率不可直接比较
+
+### 7.6 模型档位与 Max Mode
+
+#### 思考档位（Effort）
+
+网关将两池档位统一为六档：`minimal / low / medium / high / xhigh / max`。
+
+- **传参方式**：OpenAI 兼容端点在请求体传 `reasoning_effort`；Anthropic 兼容端点（`/v1/messages`）传 `thinking` 参数
+- **按池映射**：Trae 池自动映射为三档 wire 值 `light / high / extra_high`（xhigh / max → extra_high，high → high，其余 → light）；Buddy 池按上游声明档位原样下发
+- **声明合并**：模型档位声明取 Trae / Buddy 双池并集（统一档位值）。Trae 侧暂无实证数据的模型（实证表外）若 Buddy 侧有声明，表中展示 Buddy 声明的统一档位
+- **填充默认**：Trae 实证表外模型显式请求档位时，按统一→Trae 映射填充默认下发（如请求 `xhigh` 下发 `extra_high`）；未显式请求时不下发，走上游默认
+- **默认行为**：未显式传档位时默认注入 `high`（默认深度思考，可在 Buddy · 资源调度「资源开关」中关闭；仅对 Trae 已实证模型生效）
+- **查看**：`GET /v1/models` 返回的 `efforts` / `supported_efforts` 字段（统一档位空间）；「API 使用帮助」与两池模型目录页亦可查看
+
+#### Max Mode（Trae 池 1M 上下文）
+
+Max Mode 为请求级能力（网关向 Trae 上游注入 `is_max_mode:1`），仅 Trae 池生效。对支持模型，启用方式二选一：
+
+1. **`-max` 后缀（推荐）**：在支持模型的 ID 后加 `-max`，如 `glm-5.3-max`。网关自动剥离后缀、按基名匹配资源池并注入
+2. **请求体直传**：OpenAI 兼容请求体加 `"is_max_mode": true`（Anthropic 兼容端点不支持直传，请用后缀方式）
+
+注意事项：
+
+- 仅支持表内模型可用（即 `/v1/models` 中 `max_mode: true` 的条目：doubao-seed-evolving / glm-5.3 / glm-5.2 / deepseek-v4-pro(-official) / deepseek-v4-flash(-official) / kimi-k3 / minimax-m3 / qwen3.8-max / qwen-3.7-plus）；表外模型加后缀不生效，按原名请求
+- 特例 `qwen3.8-max` 本身以 `-max` 结尾（整名命中透传、不剥离后缀）：启用 Max Mode 需写 `qwen3.8-max-max`，或直传 `"is_max_mode": true`
+- Buddy / 自定义模型不支持 Max Mode；`-max` 后缀仅在请求路由到 Trae 池时生效
 
 ---
 

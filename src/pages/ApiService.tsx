@@ -56,6 +56,9 @@ export default function ApiService() {
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [syncingModels, setSyncingModels] = useState(false);
+  // 官网模型定时同步配置（trae_models_sync_enabled/hhmm 存 app Settings，独立部分保存）
+  const [modelsSyncCfg, setModelsSyncCfg] = useState({ enabled: true, hhmm: '05:40' });
+  const [savingModelsSyncCfg, setSavingModelsSyncCfg] = useState(false);
   // 编辑弹框（null = 关闭；表单留空 = 未设置，交由下层自动来源兜底）
   const [editing, setEditing] = useState<UnifiedModel | null>(null);
   const [fLabel, setFLabel] = useState('');
@@ -115,6 +118,36 @@ export default function ApiService() {
       toast('error', `同步官网模型失败：${String(err).slice(0, 120)}`);
     } finally {
       setSyncingModels(false);
+    }
+  };
+
+  // 定时同步配置加载（app Settings；失败静默保留默认值）
+  useEffect(() => {
+    api.misc
+      .settingsGet()
+      .then((s) => setModelsSyncCfg({ enabled: s.trae_models_sync_enabled ?? true, hhmm: s.trae_models_sync_hhmm || '05:40' }))
+      .catch(() => {});
+  }, []);
+
+  // 定时同步配置保存：settings_set 真 patch 语义，只写本卡两个字段
+  const saveModelsSyncCfg = async () => {
+    setSavingModelsSyncCfg(true);
+    try {
+      await withMinDelay(
+        api.misc.settingsSet({
+          trae_models_sync_enabled: modelsSyncCfg.enabled,
+          trae_models_sync_hhmm: modelsSyncCfg.hhmm.trim() || '05:40',
+        }),
+        400,
+      );
+      toast(
+        'success',
+        modelsSyncCfg.enabled ? `已保存：每天 ${modelsSyncCfg.hhmm || '05:40'} 自动同步官网模型` : '已关闭定时同步（仅手动同步）',
+      );
+    } catch (err) {
+      toast('error', `保存失败：${String(err)}`);
+    } finally {
+      setSavingModelsSyncCfg(false);
     }
   };
 
@@ -587,6 +620,37 @@ export default function ApiService() {
             四层来源聚合：人工维护 &gt; 官网同步 &gt; 内置参考 &gt; 名称推断；未确定字段显示 —，名称带{' '}
             <span className="font-bold text-amber-500">*</span> 表示已人工维护（官网同步不覆盖）。
           </p>
+
+          {/* 定时同步（app Settings）：应用内置调度器每日到点自动执行，无账号时静默跳过 */}
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 p-2.5 text-xs dark:border-zinc-800">
+            <label className="flex cursor-pointer items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={modelsSyncCfg.enabled}
+                onChange={(e) => setModelsSyncCfg((f) => ({ ...f, enabled: e.target.checked }))}
+              />
+              每日定时同步
+            </label>
+            <input
+              type="time"
+              value={modelsSyncCfg.hhmm}
+              onChange={(e) => setModelsSyncCfg((f) => ({ ...f, hhmm: e.target.value || '05:40' }))}
+              disabled={!modelsSyncCfg.enabled}
+              className="input h-8 !w-28 text-xs"
+            />
+            <button
+              className="btn-outline !px-2 !py-1"
+              disabled={savingModelsSyncCfg}
+              onClick={() => void saveModelsSyncCfg()}
+            >
+              {savingModelsSyncCfg ? <Spinner /> : <Save size={13} />} 保存
+            </button>
+            <span className="text-slate-400 dark:text-zinc-500">
+              {modelsSyncCfg.enabled
+                ? `应用运行期间每天 ${modelsSyncCfg.hhmm || '05:40'} 自动同步（无账号时静默跳过）`
+                : '已关闭定时同步，仅手动同步'}
+            </span>
+          </div>
 
           {models.length === 0 ? (
             <p className="flex-1 py-8 text-center text-sm text-slate-400">

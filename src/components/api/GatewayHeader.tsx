@@ -10,7 +10,7 @@ import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
 import { useAppStore } from '../../store';
 import GatewayHelpModal, { GatewayHelpButton } from './GatewayHelpModal';
-import type { ApiServiceStatus } from '../../types';
+import type { ApiServiceStatus, LanIfaceIp } from '../../types';
 
 /** 紧凑指标单元（弹窗头部不做大号 StatCard） */
 function Metric({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
@@ -31,6 +31,8 @@ export default function GatewayHeader() {
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  // 局域网网卡 IPv4（issue #34：0.0.0.0 监听后的局域网接入地址概览，一次性加载）
+  const [lanIps, setLanIps] = useState<LanIfaceIp[]>([]);
 
   const refresh = useCallback(async () => {
     try {
@@ -44,6 +46,12 @@ export default function GatewayHeader() {
     } catch {
       /* 保留上次数量 */
     }
+  }, []);
+
+  useEffect(() => {
+    api.apiServer.lanIfaceIps().then(setLanIps).catch(() => {
+      /* 保留空列表（概览行仅显示 127.0.0.1） */
+    });
   }, []);
 
   useEffect(() => {
@@ -89,8 +97,14 @@ export default function GatewayHeader() {
           <p className="text-sm font-medium text-slate-800 dark:text-zinc-100">
             OpenAI / Anthropic 兼容接口，通过 Trae / Buddy 资源池智能调度实现多账号负载均衡
           </p>
-          <p className="mt-0.5 text-xs text-slate-400 dark:text-zinc-500">
-            统一网关 127.0.0.1:{status?.port ?? 7864} · 请求按模型 ID 匹配资源池（未运行时端口为配置值）
+          <p className="mt-0.5 break-all text-xs text-slate-400 dark:text-zinc-500">
+            统一网关 127.0.0.1:{status?.port ?? 7864}
+            {lanIps.length > 0 && (
+              <span title={lanIps.map((e) => `${e.ip}（${e.name}）`).join('、')}>
+                {' '}· 局域网 {lanIps.map((e) => e.ip).join(' / ')}
+              </span>
+            )}
+            {' · 请求按模型 ID 匹配资源池（未运行时端口为配置值）'}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1">

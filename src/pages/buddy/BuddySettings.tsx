@@ -81,7 +81,7 @@ function CliRotateCard({
   };
 
   return (
-    <div className="mt-4 card p-4">
+    <div className="card p-4">
       <div className="mb-3 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <TerminalSquare size={16} className="text-sky-500" />
@@ -176,17 +176,25 @@ const DAY_LABEL: Record<string, string> = {
   SUN: '周日',
 };
 
-/** 任务配置卡：JWT 定时续期（refreshToken 配置 + 每周兜底任务）+ 自动签到 + 自动成长 */
+/** 任务配置卡：JWT 定时续期（refreshToken 配置 + 每周兜底任务）+ 自动签到（含每日时刻）+ 积分与 Token 同步 + 自动成长 */
 function TaskConfigCard({
   settings,
   patch,
   growthForm,
   setGrowthForm,
+  creditsForm,
+  setCreditsForm,
+  checkinHhmm,
+  setCheckinHhmm,
 }: {
   settings: WorkBuddySettings | null;
   patch: (p: Partial<WorkBuddySettings>) => void;
   growthForm: { enabled: boolean; hhmm: string };
   setGrowthForm: (f: { enabled: boolean; hhmm: string }) => void;
+  creditsForm: { mode: string; hhmm: string };
+  setCreditsForm: (f: { mode: string; hhmm: string }) => void;
+  checkinHhmm: string;
+  setCheckinHhmm: (v: string) => void;
 }) {
   const pushToast = useAppStore((s) => s.pushToast);
   // F-75 M2-2.4：schtasks 注册与 UI 点击兜底入口按平台标志隐藏
@@ -364,14 +372,34 @@ function TaskConfigCard({
           />
           <span className="text-sm">
             启用自动签到（启动补签）
-            <span className="block text-xs text-slate-400">应用启动时立即核验服务端状态，未签到账号会自动补签</span>
+            <span className="block text-xs text-slate-400">
+              应用启动时立即核验服务端状态，未签到账号会自动补签；同时作为应用内每日{' '}
+              {checkinHhmm || '09:10'} Rust 调度签到的总开关（关闭后仅 Windows 计划任务生效）
+            </span>
           </span>
         </label>
+        {/* 每日签到调度时刻（wb_checkin_hhmm 存 app Settings，随「保存配置」统一提交；应用内调度器全平台生效） */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-slate-500">每日签到时刻</span>
+          <input
+            type="time"
+            value={checkinHhmm}
+            onChange={(e) => setCheckinHhmm(e.target.value || '09:10')}
+            className="input h-9 !w-28 text-sm"
+          />
+          <span className="text-xs text-slate-400">
+            每天 {checkinHhmm || '09:10'} 自动签到；当天已过该时刻，下次启动应用会自动补跑
+          </span>
+        </div>
         {/* 定时任务（F-16；schtasks 仅 Windows，mac 隐藏——自动签到 + 启动补签已覆盖） */}
         <div className={`rounded-lg border border-slate-100 p-3 dark:border-zinc-800 ${platform !== 'windows' ? 'hidden' : ''}`}>
+          <div className="mb-2 text-xs text-slate-400">
+            应用内置 Rust 定时调度器：应用运行期间每日 {checkinHhmm || '09:10'} 自动签到（晚于该时刻启动会自动补跑，无需管理员权限，失败
+            30 分钟后自动重试）。下方注册的 Windows 计划任务作为兜底，在应用未启动时于指定时刻直接运行签到（注册/卸载需要管理员权限）。
+          </div>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <div className="text-sm font-medium">每日签到</div>
+              <div className="text-sm font-medium">Windows 计划任务（兜底）</div>
               <div className="text-xs text-slate-400">
                 {tasks.length > 0 ? `已注册：${tasks.join('、')}` : '未注册（第二时刻可清空 = 单时段）'}
               </div>
@@ -462,6 +490,44 @@ function TaskConfigCard({
 
       <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
 
+      {/* 积分与 Token 数据同步：看板数据定时刷新（模式/时刻随「保存配置」生效） */}
+      <h3 className="mb-1 font-medium">积分与 Token 数据同步</h3>
+      <p className="mb-3 text-xs text-slate-400">
+        应用运行期间按所选模式自动同步积分与 Token 看板数据（积分快照 + Token 统计重扫 + 官网用量刷新，一次配置管两个看板）；
+        无可用凭证时静默跳过，失败 30 分钟后自动重试。模式与时刻随右上角「保存配置」生效。
+      </p>
+      <div className="flex flex-wrap items-center gap-4">
+        <label className="flex items-center gap-2 text-sm">
+          <span className="text-xs font-medium text-slate-500">同步模式</span>
+          <select
+            className="input h-9 !w-32 text-sm"
+            value={creditsForm.mode}
+            onChange={(e) => setCreditsForm({ ...creditsForm, mode: e.target.value })}
+          >
+            <option value="daily">每日定时</option>
+            <option value="hourly">每小时</option>
+            <option value="off">关闭</option>
+          </select>
+        </label>
+        {creditsForm.mode === 'daily' && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-slate-500">每日执行时刻</span>
+            <input
+              type="time"
+              value={creditsForm.hhmm}
+              onChange={(e) => setCreditsForm({ ...creditsForm, hhmm: e.target.value || '23:30' })}
+              className="input h-9 !w-28 text-sm"
+            />
+            <span className="text-xs text-slate-400">每天 {creditsForm.hhmm || '23:30'} 执行（应用关闭期间不执行）</span>
+          </div>
+        )}
+        {creditsForm.mode === 'hourly' && (
+          <span className="text-xs text-slate-400">应用运行期间每小时同步一次</span>
+        )}
+      </div>
+
+      <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
       {/* 自动成长：应用内调度器每日成长轮（开关/时刻随「保存配置」生效） */}
       <h3 className="mb-1 font-medium">自动成长</h3>
       <p className="mb-3 text-xs text-slate-400">
@@ -541,6 +607,10 @@ export default function BuddySettings() {
   const [locCbDone, setLocCbDone] = useState(false);
   // 成长调度表单（wb_growth_enabled/hhmm 存 app Settings，随「保存配置」统一提交）
   const [growthForm, setGrowthForm] = useState({ enabled: true, hhmm: '09:00' });
+  // 积分与 Token 同步表单（wb_credits_sync_mode/hhmm 存 app Settings，随「保存配置」统一提交）
+  const [creditsForm, setCreditsForm] = useState({ mode: 'daily', hhmm: '23:30' });
+  // 每日签到调度时刻（wb_checkin_hhmm 存 app Settings，随「保存配置」统一提交）
+  const [checkinHhmm, setCheckinHhmm] = useState('09:10');
   const [detecting, setDetecting] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const prefilled = useRef(false);
@@ -593,6 +663,11 @@ export default function BuddySettings() {
       enabled: appSettings.wb_growth_enabled ?? true,
       hhmm: appSettings.wb_growth_hhmm || '09:00',
     });
+    setCreditsForm({
+      mode: appSettings.wb_credits_sync_mode || 'daily',
+      hhmm: appSettings.wb_credits_sync_hhmm || '23:30',
+    });
+    setCheckinHhmm(appSettings.wb_checkin_hhmm || '09:10');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appSettings, locWbDone, locCbDone, locWb, locCb, env]);
 
@@ -609,6 +684,9 @@ export default function BuddySettings() {
         wb_auth_file_path: pathForm.wb_auth_file_path.trim() || null,
         wb_growth_enabled: growthForm.enabled,
         wb_growth_hhmm: growthForm.hhmm.trim() || '09:00',
+        wb_credits_sync_mode: creditsForm.mode,
+        wb_credits_sync_hhmm: creditsForm.hhmm.trim() || '23:30',
+        wb_checkin_hhmm: checkinHhmm.trim() || '09:10',
       });
       pushToast('success', '配置已保存');
       await refresh();
@@ -688,7 +766,8 @@ export default function BuddySettings() {
 
       {/* 通用配置 + 任务配置：一行两列 */}
       <div className="grid items-start gap-4 lg:grid-cols-2">
-        {/* 左：通用配置（应用环境 + 切换账号自动迁移会话） */}
+        {/* 左：通用配置（应用环境 + 切换账号自动迁移会话）+ CLI 自动轮换（同列其下） */}
+        <div className="space-y-4">
         <div className="card p-4">
           <div className="mb-3 flex items-center gap-2">
             <SlidersHorizontal size={16} className="text-emerald-500" />
@@ -786,12 +865,22 @@ export default function BuddySettings() {
           </label>
         </div>
 
-        {/* 右：任务配置（JWT 续期 / 自动签到 / 自动成长） */}
-        <TaskConfigCard settings={settings} patch={patch} growthForm={growthForm} setGrowthForm={setGrowthForm} />
-      </div>
+        {/* CLI 五重防护自动轮换（CodeBuddy）：与通用配置同列，置于其下 */}
+        <CliRotateCard settings={settings} patch={patch} />
+        </div>
 
-      {/* CLI 五重防护自动轮换（F-06/F-59，批次3）：通用配置与任务配置之后 */}
-      <CliRotateCard settings={settings} patch={patch} />
+        {/* 右：任务配置（JWT 续期 / 自动签到 / 积分与 Token 同步 / 自动成长） */}
+        <TaskConfigCard
+          settings={settings}
+          patch={patch}
+          growthForm={growthForm}
+          setGrowthForm={setGrowthForm}
+          creditsForm={creditsForm}
+          setCreditsForm={setCreditsForm}
+          checkinHhmm={checkinHhmm}
+          setCheckinHhmm={setCheckinHhmm}
+        />
+      </div>
     </div>
   );
 }
