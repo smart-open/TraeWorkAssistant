@@ -327,18 +327,40 @@ ai-work-assistant/
 
 语义化版本 `MAJOR.MINOR.PATCH`（如 3.1.0），按本次提交内容判断：
 
-> **升版时机（红线）**：**不要随意升版**——只有用户明确说「升级版本」时才升版并走全流程：**调整版本（set-version + CHANGELOG）→ 编译（tauri build 产出 setup / msi / portable 三件套）→ 提交 → 推送 → 打 tag 并推送 → 发布 GitHub Release（上传三资产）**。日常提交 / bug 修复一律不动版本号；下表的升位判断标准仅在用户主动发版时用于确定升哪一位。
+> **升版时机（红线）**：**不要随意升版**——只有用户明确说「升级版本」时才升版并走全流程（见下文「发版全流程」）。日常提交 / bug 修复一律不动版本号；下表的升位判断标准仅在用户主动发版时用于确定升哪一位。
 
 | 提交内容 | 升级位 | 示例 |
 |---|---|---|
 | 新增一个完整的有意义的功能 | **中位（MINOR）** | 3.0.0 → 3.1.0 |
 | 修复 bug / 功能优化 / 微小功能新增或调整 | **低位（PATCH）** | 3.1.0 → 3.1.1 |
 
+**升位细则**：
+
 - 大位（MAJOR）仅在重大架构/破坏性变更时升级
+- 一个提交包含多类变更时，按最高级别升位；纯文档/注释改动不升级；版本同步提交本身不再升位
 - 升版提交执行 `npm run set-version <x.y.z>` 一键同步（底层 `scripts/sync_version.mjs`：package.json / Cargo.toml / Cargo.lock / AGENT.md 标题）；CHANGELOG.md 手动新增条目
 - 版本号单一来源为 `src-tauri/Cargo.toml`：tauri.conf.json 不写 version（自动回退），Rust 端 `env!("CARGO_PKG_VERSION")` 自动取，前端关于页运行时经 `getVersion()` 读取（about.ts 不写版本号），NSIS / MSI 安装包版本号自动跟随
-- 一个提交包含多类变更时，按最高级别升位；纯文档/注释改动不升级；版本同步提交本身不再升位
-- **GitHub Release 标题固定格式**：`v{MAJOR}.{MINOR}.{PATCH} 版本发布`（如 `v3.1.1 版本发布`），不额外加描述后缀
+
+**发版全流程**（仅用户明确发版时）：
+
+1. **调整版本**：`npm run set-version <x.y.z>` + CHANGELOG.md 新增条目
+2. **编译**：Windows 本机 `npm run tauri build` 产出 setup / msi / portable 三件套；macOS 由 GitHub Actions `build-macos.yml`（push macos_main 触发）产出 aarch64 / x64 / universal 三个 dmg
+3. **提交 → 推送 → 打 tag 并推送**
+4. **发布 GitHub Release**：上传资产 + `latest.json`，标题见下方格式约定
+
+**Release 资产清单（红线，缺一即更新器 fail-closed）**：
+
+| 平台 | 资产 |
+|---|---|
+| Windows | `AI Work 助手_<版本>_x64-setup.exe` / `_x64_zh-CN.msi` / `_x64_portable.zip` |
+| macOS | `AI Work 助手_<版本>_aarch64.dmg` / `_x64.dmg` / `_universal.dmg` |
+| 校验清单 | `latest.json`（**必须收录上述全部 6 个资产**的 SHA-256） |
+
+- **latest.json 单一清单原则**：updater（Windows 与 macOS 同源）下载安装包后与清单比对哈希，清单存在即 fail-closed——缺失 / 损坏 / 版本不符 / **目标资产未收录**任一情况直接阻止自动更新。**只上传单一平台的清单 = 另一平台全部用户自动更新被阻断**（v3.6.1 事故：清单只含 exe/msi，mac dmg 未收录，mac 更新全挂）
+- CI 双平台分别生成清单（Windows 落 `release/windows/`、mac 落 `release/mac/`，`rename_release.mjs` 仅同目录自动合并），**发布时必须人工合并为一份全资产清单再上传**；发布前逐项核对 6 资产均在 `assets` 键内
+- 清单格式契约（`updater.rs` 消费）：`{ "version": "x.y.z", "assets": { "<本地原始文件名>": "<sha256hex>" } }`，2 空格缩进、中文原样、无末尾换行；键为本地原始文件名（含空格/中文），GitHub 重写后的资产名（空格→`.`、中文→`_`）由 updater 宽松键归一匹配
+
+**GitHub Release 标题固定格式**：`v{MAJOR}.{MINOR}.{PATCH} 版本发布`（如 `v3.1.1 版本发布`），不额外加描述后缀
 
 ## 12. 安全与合规
 
