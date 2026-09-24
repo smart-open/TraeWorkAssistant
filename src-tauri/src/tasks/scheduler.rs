@@ -204,6 +204,7 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
     let configured = match t.key {
         "trae-renew" => Some(st.settings().jwt_renew_hhmm),
         "wb-growth" => Some(st.settings().wb_growth_hhmm),
+        "wb-checkin" => Some(st.settings().wb_checkin_hhmm),
         "wb-credits-snapshot" => Some(st.settings().wb_credits_sync_hhmm),
         "trae-credits-snapshot" => Some(st.settings().trae_credits_sync_hhmm),
         "wb-catalog-sync" => Some(st.settings().wb_catalog_sync_hhmm),

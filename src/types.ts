@@ -282,6 +282,8 @@ export interface Settings {
   wb_growth_enabled: boolean;
   /** WorkBuddy 成长任务调度触发时刻 HH:MM（默认 09:00，任务配置页可改） */
   wb_growth_hhmm: string;
+  /** WorkBuddy 每日签到调度触发时刻 HH:MM（默认 09:10，任务配置页可改） */
+  wb_checkin_hhmm: string;
   /** Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM，默认） */
   wb_credits_sync_mode: string;
   /** Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻） */

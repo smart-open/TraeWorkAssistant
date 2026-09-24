@@ -170,6 +170,9 @@ pub struct Settings {
     /// WorkBuddy 成长任务调度触发时刻 HH:MM（默认 09:00，任务配置页可改）
     #[serde(default = "default_wb_growth_hhmm")]
     pub wb_growth_hhmm: String,
+    /// WorkBuddy 每日签到调度触发时刻 HH:MM（默认 09:10，任务配置页可改）
+    #[serde(default = "default_wb_checkin_hhmm")]
+    pub wb_checkin_hhmm: String,
     // ── 看板数据定时同步（积分/Token/模型；调度器 credits/models 两类任务） ──
     /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM，默认）
     #[serde(default = "default_credits_sync_mode")]
@@ -270,6 +273,9 @@ fn default_jwt_renew_hhmm() -> String {
 }
 fn default_wb_growth_hhmm() -> String {
     "09:00".into()
+}
+fn default_wb_checkin_hhmm() -> String {
+    "09:10".into()
 }
 fn default_credits_sync_mode() -> String {
     "daily".into()

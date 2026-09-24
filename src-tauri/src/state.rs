@@ -241,6 +241,10 @@ impl AppState {
             s.wb_growth_enabled = true;
             s.wb_growth_hhmm = "09:00".into();
         }
+        // WorkBuddy 每日签到时刻零值回填（默认 09:10；开关 auto_checkin 在 workbuddy_settings 不动）
+        if s.wb_checkin_hhmm.trim().is_empty() {
+            s.wb_checkin_hhmm = "09:10".into();
+        }
         // 模型目录每日同步（Buddy/Trae）：同款零值回填（默认开）；同步幂等且不消耗积分，
         // 无账号时调度器静默跳过，默认开安全
         if s.wb_catalog_sync_hhmm.trim().is_empty() {
