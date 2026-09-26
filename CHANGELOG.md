@@ -4,7 +4,13 @@
 
 ---
 
-## [未发布]
+## [3.6.3] · 2026-09-26 · 积分看板重建（Trae/Buddy 平台拆分）+ Issue #38 `-max` 修复批
+
+> 范围：自 [3.6.2]（tag v3.6.2，commit 89b0b6b）以来的全部变更。
+
+### 新功能
+
+- **[P1] 积分看板重建——Trae/Buddy 平台拆分 + 三源数据矩阵（credits-dashboard-plan.md）**：同一看板组件按 platform 参数渲染两个独立页面（Trae `credits` 视图 / Buddy `buddy-credits` 视图，互不混装），旧 Credits / BuddyCredits / TokenStatsPanel 三页退役删除；统计面板 KPI 7 卡（账号数/可用积分/平均/积分包/今日新增/今日消耗/7 天内到期，单平台口径）+ 积分统计 Tab（官网/本地/API 网关三源切换——网关源 `api_usage` 仅记 tokens，**决策落地：以请求数为主要口径、积分数不估算**）+ Token 统计 Tab 三源完整（本地 JSONL 365 天 / 网关 Trae/Buddy 池 90 天 / 官网 Trae token 字段，issue #35 Bug2 用户可见修复）+ 积分到期 Tab（双平台账号明细 + 到期日历）；布局两层分类（Tab / 数据源面板外切换）与面板同宽弹性热力图；抽公共组件 useDateRange / ChartFilterBar / ActivityHeatmap / ModelRanking 与 BoardPoint 纯函数适配层。Rust 侧方案 B：`wb_credits_history` 每日快照新增 `earned`（当日余额差分与签到 reward 归并，schema 幂等补列免版本迁移），新增 `workbuddy_credits_history_list` 命令；Buddy「获得积分」快照 earned 优先、缺失日回退签到口径；覆盖窗口与口径差异（§8）页面内诚实标注，不做静默合并。
 
 ### 修复
 
