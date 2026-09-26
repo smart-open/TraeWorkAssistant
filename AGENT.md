@@ -47,7 +47,9 @@ ai-work-assistant/
 │   ├── types.ts                  # 与 Rust DTO 对齐（snake_case）
 │   ├── lib/                      # tauri.ts(invoke 封装+事件订阅) / themes.ts(主题) / delay.ts(withMinDelay) / cn.ts / about.ts / useIsDark.ts
 │   ├── components/               # TitleBar/Sidebar/TopBar/Toaster/PageHeader/SetupGuide/ui + SystemDialog(系统设置+系统日志弹框)/GeneralSettingsPanel/AboutDialog
-│   └── pages/                    # Dashboard / Accounts(661行编排 + accounts/ 16 个拆分子组件) / Checkin / Credits / Logs / ApiService / Settings
+│   └── pages/                    # Dashboard / Accounts(661行编排 + accounts/ 16 个拆分子组件) / Checkin / Logs / ApiService / Settings
+│   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters）
+│   │                             #   buddy/（BuddyOverview/BuddyAccounts/BuddyCheckin/BuddyApiService/BuddySettings）
 ├── scripts/                      # dev-tauri.mjs(tauri 脚本入口) / sync_version.mjs / rename_release.mjs / package_portable.mjs / gen_asset_base64.mjs
 ├── src-tauri/
 │   ├── tauri.conf.json           # 无装饰窗 / 无外部资源（Python 与 PS 桥均已移除，全 Rust）
@@ -173,7 +175,8 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（data/workbuddy_checkin_results.json 90 天滚动，默认展示 30 天） |
 | WorkBuddy | `workbuddy_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日双时段签到任务 AIWorkAssistant_WorkBuddyCheckin_<HHMM>（09:00/21:00） |
 | WorkBuddy | `workbuddy_renew_task_register(day) / _status / _unregister` | schtasks 每周凭证续期兜底任务 AIWorkAssistant_WorkBuddyRenew（周日 10:30，主 exe `--task-run wb-renew` → `run_renew_only` 惰性刷新） |
-| WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/wb_credits.rs`：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥10min 缓存；成功回写账号池余额缓存 |
+| WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/wb_credits.rs`：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥10min 缓存；成功回写账号池余额缓存；非缓存命中时追加每日快照（含 earned = 当日余额差分与签到 reward 归并，credits-dashboard-plan.md §2.2 方案 B） |
+| WorkBuddy | `workbuddy_credits_history_list()` | WB 每日积分快照时序读取（wb_credits_history 表，365 天，含 earned；看板「Buddy 获得积分」方案 B 数据源） |
 | WorkBuddy | `workbuddy_settings_get / workbuddy_settings_set(patch)` | data/workbuddy_settings.json：auto_checkin（启动补签）/ keepalive_days / lazy_refresh_hours / growth_* 开关 |
 | WorkBuddy | `workbuddy_cli_status / _bridge_set(userId) / _rotate_run / _rotate_logs(limit?)` | CLI 切号桥（F-06/F-59，批次3）：桥接状态（含 environment_override 警告）/ 写 `~/.codebuddy/settings.json` env 直桥 / 手动触发五重防护轮换 / 轮换日志（cap 50）；后台轮换线程 `start_cli_rotate_thread()` 按 settings.cli_* 配置独立运行（`workbuddy_cli.rs` 决策纯函数 `decide_target` 13 单测） |
 | WorkBuddy | `workbuddy_chatdata_backup/restore/info(userId, app?)` / `_copy(source,target,app?)` | 会话三件套（F-44/F-45，批次3）：正文 projects/ + workbuddy.db + edge-sync-mapping-v2.db → `data/<app>_chats/<uid>/`（restore 前 .bak 单代保护 + 完整性校验回滚）；copy = jsonl 逐行 sessionId 换新 UUID（pseudo_uuid_v4 纯函数）+ sessions 整行克隆 + edge 映射 convmsg 替换（`.pre-copy.bak` 预备份）。**F-74**：`app` = `"WorkBuddy"`（默认）/ `"CodeBuddy"`——数据目录 `~/.workbuddy` / `~/.codebuddy` 与备份根 `data/workbuddy_chats` / `data/codebuddy_chats` 双域隔离；空/未知回落 WorkBuddy（旧行为） |

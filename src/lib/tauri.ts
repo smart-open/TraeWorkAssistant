@@ -56,6 +56,7 @@ import type {
   WorkBuddyScanResult,
   WorkBuddySettings,
   WbCreditsResult,
+  WbCreditsSnapshot,
   WbCheckinRecord,
   WbCliStatus,
   WbCliRotateResult,
@@ -66,7 +67,6 @@ import type {
   WbResetResult,
   WbTokenStats,
   BuddyChatApp,
-  WbUsageOfficial,
   WbUsageOfficialAll,
   WbUsageFallback,
   WbActivityInfo,
@@ -334,6 +334,9 @@ export const api = {
     renewTaskUnregister: () => invoke('workbuddy_renew_task_unregister'),
     creditsFetch: (userId?: string, fresh?: boolean) =>
       invoke<WbCreditsResult>('workbuddy_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
+    // 快照时序读取（credits-dashboard-plan.md §2.2 方案 B：earned 已随快照落库）
+    creditsHistoryList: () =>
+      invoke<{ snapshots: WbCreditsSnapshot[] }>('workbuddy_credits_history_list'),
     editionsBackfill: () => invoke<number>('workbuddy_editions_backfill'),
     settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
     settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),
@@ -379,9 +382,7 @@ export const api = {
       invoke<WbResetResult[]>('workbuddy_env_reset', { items, keycloakLogout }),
     // 官方用量 + 本地 Token 统计（F-25/26/57/58，批次3）
     // 注意：Rust 端参数名为 refresh（Option<bool>），key 必须写 refresh；此前误写 fresh 被静默忽略导致「刷新」永远走缓存
-    usageOfficial: (userId?: string, fresh?: boolean) =>
-      invoke<WbUsageOfficial>('workbuddy_usage_official', { userId: userId ?? null, refresh: fresh ?? null }),
-    /** 全账号官方用量聚合（近 7 日积分消耗主数据源；31 天零填充） */
+    /** 全账号官方用量聚合（近 7 日积分消耗主数据源；31 天零填充，含按模型汇总） */
     usageOfficialAll: () => invoke<WbUsageOfficialAll>('workbuddy_usage_official_all'),
     usageFallback: () => invoke<WbUsageFallback>('workbuddy_usage_fallback'),
     // fresh=true 强制重扫（跳过 10 分钟结果缓存；按文件增量缓存仍生效）

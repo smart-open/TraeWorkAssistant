@@ -269,6 +269,7 @@ fn main() {
             commands::workbuddy::workbuddy_renew_task_status,
             commands::workbuddy::workbuddy_renew_task_unregister,
             commands::workbuddy::workbuddy_credits_fetch,
+            commands::workbuddy::workbuddy_credits_history_list,
             commands::workbuddy::workbuddy_editions_backfill,
             commands::workbuddy::workbuddy_settings_get,
             commands::workbuddy::workbuddy_ui_click_capture,

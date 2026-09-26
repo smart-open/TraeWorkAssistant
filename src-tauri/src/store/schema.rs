@@ -140,11 +140,14 @@ const DDL: &[&str] = &[
         payload TEXT NOT NULL
     )",
     // P6 流水迁出：WB 每日积分快照（原 kv workbuddy_credits_history，同日覆盖 + 365 天）
+    // earned = 当日新增积分（credits-dashboard-plan.md §2.2 方案 B：余额差分 + 签到 reward 归并）；
+    // NULL = 未统计（v2 老库行 / 首日无历史差分时可能仅签到口径）
     "CREATE TABLE IF NOT EXISTS wb_credits_history (
         date         TEXT PRIMARY KEY,
         ts           INTEGER NOT NULL DEFAULT 0,
         total_balance REAL NOT NULL DEFAULT 0,
-        accounts     TEXT NOT NULL DEFAULT '[]'
+        accounts     TEXT NOT NULL DEFAULT '[]',
+        earned       REAL
     )",
     // P6 流水迁出：消耗明细增量拉取缓存（原 kv usage_history，per-account/per-day 行）
     "CREATE TABLE IF NOT EXISTS usage_history_accounts (
@@ -179,6 +182,34 @@ const DDL: &[&str] = &[
 pub fn init(conn: &Connection) -> Result<(), String> {
     for sql in DDL {
         conn.execute_batch(sql).map_err(|e| format!("建表失败: {e}"))?;
+    }
+    // 轻量列补齐（credits-dashboard-plan.md §2.2 方案 B）：v2 老库的
+    // wb_credits_history 无 earned 列——CREATE TABLE IF NOT EXISTS 对已存在表不生效，
+    // 在每次开库的 init 里按 table_info 幂等补列，无需 bump SCHEMA_VERSION 走全量迁移。
+    ensure_column(conn, "wb_credits_history", "earned", "REAL")?;
+    Ok(())
+}
+
+/// 幂等补列：表缺该列时 ALTER TABLE ADD COLUMN（列存在则跳过）
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<(), String> {
+    let exists: bool = {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| format!("table_info({table}) 失败: {e}"))?;
+        let mut rows = stmt.query([]).map_err(|e| format!("table_info({table}) 查询失败: {e}"))?;
+        let mut found = false;
+        while let Some(r) = rows.next().map_err(|e| format!("table_info({table}) 迭代失败: {e}"))? {
+            let name: String = r.get(1).map_err(|e| format!("table_info({table}) 读取失败: {e}"))?;
+            if name == column {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+            .map_err(|e| format!("补列 {table}.{column} 失败: {e}"))?;
     }
     Ok(())
 }
