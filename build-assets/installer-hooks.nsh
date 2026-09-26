@@ -1,4 +1,4 @@
-; AI Work 助手 — NSIS 安装钩子（installerHooks）
+﻿; AI Work 助手 — NSIS 安装钩子（installerHooks）
 ; 品牌并存策略：老品牌（Trae Work 助手）与新版本 AI Work 助手 **并存运行、互不干扰**。
 ; 安装/升级本产品时绝不卸载老品牌应用，也绝不清理其安装目录、卸载键与快捷方式；
 ; 用户数据目录（%APPDATA%\TraeWorkAssistant → %APPDATA%\AIWorkAssistant）
