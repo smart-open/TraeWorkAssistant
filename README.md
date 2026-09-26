@@ -26,6 +26,8 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 - **v3.x 新版本线（默认分支）**：产品为「AI Work 助手」，支持 Trae Work / Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包多应用；新版本自 **3.0.0** 起开始维护。
 - **原「Trae Work 助手」产品**：通过 **`trae_work_main`** 分支维护，仅支持 Trae Work 单应用，版本停留在 **2.x.x**，仅做必要修复、不再新增功能。
+- **macOS 产品分支（`macos_main`）**：macOS 平台支持的产品化分支——Windows 主线（`main`）功能持续合并对齐，mac 安装包（aarch64 / x64 / universal 三个 dmg）由 GitHub Actions `build-macos.yml` 在 push `macos_main` 时构建发布，与 Windows 随 3.6.x 同步发版。
+- **Docker 简化分支（`docker_main`）**：Web-only Docker 版（独立版本线 1.x）——单进程 `aiwork-server`（管理 REST + OpenAI 兼容网关 + 定时调度 + 浏览器 UI，`docker compose up` 一键部署），裁剪桌面壳 / MITM 抓包 / 账号切换 / 豆包等桌面专属功能，账号经 OAuth 录入或桌面导出导入。
 - **升级与数据迁移**：新版本从 3.0.0 开始，**之前所有版本（2.x 全系）升级到 3.x 都需要迁移数据**——数据目录、界面偏好、签到计划任务会在安装 / 首次启动时**自动完成迁移**，无需手动操作（详见下方「从老版本升级」）。
 
 ## 免责声明
