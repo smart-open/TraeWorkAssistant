@@ -57,6 +57,8 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
   const [upd, setUpd] = useState<UpdateState>({ k: 'idle' });
   // 版本号运行时读取（Tauri getVersion() ← Cargo.toml 单一来源），不再前端硬编码
   const [appVersion, setAppVersion] = useState('');
+  // mac 手动安装引导：点击「退出应用」后的退出中状态（防重复点击；退出后窗口即关闭）
+  const [quitting, setQuitting] = useState(false);
 
   useEffect(() => {
     getVersion()
@@ -129,6 +131,16 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
     void api.updater
       .restartApp()
       .catch((e) => setUpd({ k: 'error', msg: String(e) }));
+  };
+
+  // mac 专用：拖拽替换前主动退出应用，释放 .app bundle 占用（Finder 无法替换运行中的应用）
+  // 退出前引导步骤已展示在弹窗内（退出后弹窗消失，故不依赖二次确认）
+  const quitForInstall = () => {
+    setQuitting(true);
+    void api.updater.quitApp().catch((e) => {
+      setQuitting(false);
+      setUpd({ k: 'error', msg: String(e) });
+    });
   };
 
   const checkUpdate = async () => {
@@ -263,12 +275,23 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
               </div>
             )}
             {upd.k === 'installing' && (isMac ? (
-              // mac dmg 人工安装引导（F-75 M3-3.3/3.6）：拖拽安装 + Gatekeeper 放行 + 一键重启
+              // mac dmg 人工安装引导（F-75 M3-3.3/3.6）：修复「无法复制」——
+              // Finder 无法替换运行中的 .app，改为「先退出 → 拖拽替换 → 重开」流程
               <div className="mt-1.5 max-w-sm space-y-1.5 rounded-lg border border-sky-200 bg-sky-50 p-2.5 text-[11px] leading-relaxed text-slate-600 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-zinc-300">
-                <div className="font-semibold text-sky-600 dark:text-sky-400">安装包已打开，请完成以下步骤：</div>
-                <div>① 将窗口中的「{APP_NAME}」拖入右侧的 Applications 文件夹，选择「替换」完成覆盖安装</div>
+                <div className="font-semibold text-sky-600 dark:text-sky-400">安装包已打开，请按顺序完成：</div>
                 <div>
-                  ② 若 macOS 提示「无法验证开发者」：在「应用程序」文件夹中<b>右键点击</b>应用 → 「打开」→
+                  ① <b>先退出本应用</b>（否则拖拽时会提示「无法复制」）：
+                  <button
+                    onClick={quitForInstall}
+                    disabled={quitting}
+                    className="mx-1 rounded-md bg-sky-600 px-2 py-0.5 text-[11px] font-semibold text-white transition hover:bg-sky-700 disabled:opacity-50 dark:bg-sky-500 dark:hover:bg-sky-400"
+                  >
+                    {quitting ? '正在退出…' : '退出应用'}
+                  </button>
+                </div>
+                <div>② 退出后，把 dmg 窗口中的「{APP_NAME}」拖入右侧的 Applications 文件夹，选择「替换」完成覆盖安装</div>
+                <div>
+                  ③ 从「启动台 / 应用程序」重新打开。若提示「无法验证开发者」：<b>右键点击</b>应用 → 「打开」→
                   再点「打开」（首次一次即可）；或在终端执行
                   <code className="mx-1 rounded bg-slate-100 px-1 py-0.5 font-mono text-[10px] dark:bg-zinc-800">
                     xattr -d com.apple.quarantine "/Applications/{APP_NAME}.app"
@@ -277,11 +300,11 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
                 <div className="flex items-center gap-1.5 pt-0.5">
                   <button
                     onClick={restartAfterInstall}
-                    className="rounded-md bg-sky-600 px-2 py-0.5 text-[11px] font-semibold text-white transition hover:bg-sky-700 dark:bg-sky-500 dark:hover:bg-sky-400"
+                    className="rounded-md border border-sky-300 px-2 py-0.5 text-[11px] font-medium text-sky-600 transition hover:bg-sky-100 dark:border-sky-500/40 dark:text-sky-400 dark:hover:bg-sky-500/10"
                   >
                     安装完成，重启应用
                   </button>
-                  <span className="text-slate-400 dark:text-zinc-500">拖拽完成后点击</span>
+                  <span className="text-slate-400 dark:text-zinc-500">未退出直接替换时使用（兜底）</span>
                 </div>
               </div>
             ) : (

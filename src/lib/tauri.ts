@@ -575,6 +575,8 @@ export const api = {
       invoke<void>('update_run_installer', p),
     // mac 更新专用：人工拖拽完成后一键重启（LaunchServices 拉起新版后旧进程退出）
     restartApp: () => invoke<void>('update_restart_app'),
+    // mac 手动安装引导：主动退出应用释放 .app 占用（Finder 无法替换运行中的应用）
+    quitApp: () => invoke<void>('update_quit_app'),
     onDownloadProgress: async (
       cb: (e: UpdateDownloadProgress) => void,
     ): Promise<UnlistenFn> =>

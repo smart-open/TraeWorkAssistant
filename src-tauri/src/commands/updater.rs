@@ -689,12 +689,35 @@ pub fn update_run_installer(
     // 本段不可达，未门控会触发 unreachable_code 警告（零警告红线）
     #[cfg(not(target_os = "macos"))]
     {
-        std::process::Command::new(path)
-            .args(["/P", "/UPDATE", "/R"])
-            .spawn()
-            .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            // Issue #37 加固：CREATE_BREAKAWAY_FROM_JOB 让安装器脱离本应用的 Job 对象，
+            // 防止应用退出时 Job 的 kill-on-close 连带终止安装器；它不改变父子关系，
+            // 进程树竞态由安装钩子（UpdateMode 等待退出 + 无 /T 兜底）主修复。
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+            let mut cmd = std::process::Command::new(path);
+            cmd.args(["/P", "/UPDATE", "/R"]);
+            let spawned = cmd
+                .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
+                .spawn()
+                .or_else(|_| {
+                    // 当前 Job 不允许脱离等场景启动失败 → 回退普通方式启动
+                    cmd.creation_flags(0).spawn().map_err(|e| {
+                        format!("启动安装程序失败: {e}（可手动运行：{file_path}）")
+                    })
+                });
+            spawned?;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::process::Command::new(path)
+                .args(["/P", "/UPDATE", "/R"])
+                .spawn()
+                .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+        }
 
-        // 提示前端后退出，让安装器接管（安装钩子会兜底结束本进程解锁文件占用）
+        // 提示前端后退出，让安装器接管（安装钩子已先等本进程自行退出再兜底解锁）
         let _ = app.emit("update-installing", asset_name);
         std::thread::sleep(Duration::from_millis(800));
         std::process::exit(0);
@@ -748,6 +771,24 @@ pub fn update_restart_app(app: AppHandle) -> Result<(), String> {
     {
         let _ = app;
         Err("仅 macOS 需要手动重启更新（Windows 安装器 /R 参数自动重启）".to_string())
+    }
+}
+
+/// macOS 手动安装引导：主动退出应用，释放 .app bundle 占用——Finder 无法替换
+/// 正在运行的 .app（提示「无法复制」），故拖拽替换前必须先退出本应用。
+/// 用 app.exit(0) 走 RunEvent::Exit 清理链（停进程内代理、停 API 服务、还原系统代理），
+/// 不用 std::process::exit 跳过清理。Windows 无此需求（NSIS /R 自动重启）。
+#[tauri::command]
+pub fn update_quit_app(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err("仅 macOS 手动安装流程需要退出应用".to_string())
     }
 }
 

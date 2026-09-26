@@ -253,6 +253,7 @@ fn main() {
             commands::updater::update_download,
             commands::updater::update_run_installer,
             commands::updater::update_restart_app,
+            commands::updater::update_quit_app,
             commands::workbuddy::workbuddy_env_check,
             commands::workbuddy::workbuddy_open_auth_dir,
             commands::workbuddy::workbuddy_accounts_list,
