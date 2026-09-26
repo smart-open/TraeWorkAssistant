@@ -122,11 +122,22 @@ pub fn trim_logs(data_dir: &Path, retention_days: u64) {
     }
 }
 
+/// app.log 大小轮转阈值（10MB）：超过即重命名为 app.log.old（覆盖旧档）。
+/// trim_logs 仅启动期按保留天数清理，长驻进程需靠此防止热路径日志无限增长
+const APP_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+
 /// 追加一行到 data_dir/logs/app.log，用于托盘/通知等关键路径排查。
+/// 超过 APP_LOG_ROTATE_BYTES 时先轮转为 app.log.old 再追加。
 pub fn app_log(data_dir: &Path, msg: &str) {
     let log_path = data_dir.join("logs").join("app.log");
     if let Some(parent) = log_path.parent() {
         let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(meta) = fs::metadata(&log_path) {
+        if meta.len() > APP_LOG_ROTATE_BYTES {
+            let old = data_dir.join("logs").join("app.log.old");
+            let _ = fs::rename(&log_path, &old);
+        }
     }
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)

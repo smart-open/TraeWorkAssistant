@@ -363,7 +363,7 @@ Max Mode 为请求级能力（网关向 Trae 上游注入 `is_max_mode: true`）
 
 `/v1/models` 各字段口径：
 
-- `context_length`：**本网关实际请求可用的上下文**（Trae 侧取 `__dev` 通道实际请求口径；双源模型按当前调度策略命中侧取值）——客户端应以此作为可用上限
+- `context_length`：**本网关实际请求可用的上下文**（Trae 侧取 `__dev` 通道实际请求口径；双源模型按当前调度策略命中侧取值；Buddy 模型运行中冷却回退 Trae 兜底时，实际窗口以 Trae 侧口径为准，可能短暂低于声明值）——客户端应以此作为可用上限
 - `max_mode`：该模型经 `-max` 后缀 / `is_max_mode` 是否可启用 Max Mode 1M 上下文档（Trae 池专属）
 - 官网同步的「模型原始能力上限」（如 `context_length_max = 1M`）为上游声明值，**不代表网关当前请求即可兑现**；1M 仅在 Max Mode 通路内由上游决策生效，未启用 Max Mode 的请求请以 `context_length` 为准
 

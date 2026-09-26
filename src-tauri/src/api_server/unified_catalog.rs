@@ -41,7 +41,7 @@ pub fn canonical_id(id: &str) -> String {
 
 /// L3：主条目诚实兜底 128K（与旧 /v1/models 默认一致）——L2 dev 口径缺失时的
 /// 保守声明，不冒充实际窗口。1M 上下文档仅 Max Mode 通道（efforts::TRAE_MAX_MODE_REF
-/// 门控 is_max_mode:1 请求级注入，T0.3 实证无静态 -max 模型条目形态）可达，故主条目
+/// 门控 is_max_mode:true 请求级注入，T0.3 实证无静态 -max 模型条目形态）可达，故主条目
 /// 不做 1M 静态声明；原 MAX_MODE_1M/CTX_1M 占位随 T4.1 迁入 efforts::TRAE_MAX_MODE_REF
 /// （单一事实源）
 const CTX_128K: u64 = 131_072;
@@ -313,7 +313,7 @@ fn trae_entry_of(m: &ModelOption, l1: Option<&TraeModelMeta>) -> TraeEntry {
         .unwrap_or_else(|| super::efforts::trae_declared_unified(&canonical));
     // context: L1 → L2（models_sync 双口径的 dev 实际请求槽）→ L3 诚实兜底 128K。
     // issue #31：主条目不做 1M 静态声明——实际请求走 __dev 通道，1M 仅 Max Mode
-    // 请求级字段（is_max_mode:1，efforts::TRAE_MAX_MODE_REF 门控）可达
+    // 请求级字段（is_max_mode:true，efforts::TRAE_MAX_MODE_REF 门控）可达
     let context_length = Some(
         l1.and_then(|l| l.context_length)
             .or(m.context_length)

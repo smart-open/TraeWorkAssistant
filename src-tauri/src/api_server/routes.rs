@@ -174,17 +174,26 @@ fn trae_effort_wire(
     model: &str,
 ) -> Option<String> {
     let supported = efforts::trae_supported_wire(&unified_catalog::canonical_id(model));
-    let wire = if supported.is_empty() {
-        // 表外无实证：仅显式请求填充默认（统一→Trae 映射），合成默认不下发
-        efforts::trae_request_wire_fill(explicit.as_deref())
+    // 合成请求侧档位：显式 > 路由提示 > 全局默认思考（表外模型仅显式参与填充）。
+    // 日志需记合成后的 requested 而非仅 explicit，否则 route_hint/默认思考生效时
+    // 日志与实际出站不符
+    let requested = if supported.is_empty() {
+        explicit.clone()
     } else {
-        let requested = explicit.clone().or(route_hint).or_else(|| {
+        explicit.clone().or(route_hint).or_else(|| {
             state
                 .wb_default_thinking
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .then(|| "high".to_string())
-        });
-        requested.and_then(|req| efforts::trae_request_wire(Some(&req), &supported))
+        })
+    };
+    let wire = if supported.is_empty() {
+        // 表外无实证：仅显式请求填充默认（统一→Trae 映射），合成默认不下发
+        efforts::trae_request_wire_fill(explicit.as_deref())
+    } else {
+        requested
+            .as_deref()
+            .and_then(|req| efforts::trae_request_wire(Some(req), &supported))
     };
     // 可观测性（issue #38-5）：请求侧档位 → wire 档位映射落盘（脱敏，仅模型与档位），
     // 用于验证「档位到底有没有下发/映射成哪一档」
@@ -192,7 +201,7 @@ fn trae_effort_wire(
         &state.data_dir,
         &format!(
             "trae effort: model={} requested={:?} wire={:?}",
-            model, explicit, wire
+            model, requested, wire
         ),
     );
     wire
@@ -1671,9 +1680,17 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             }
                             (None, Some((code, msg))) => {
                                 let kind = classify_solo_error(code, &msg);
-                                state.pool.note_error(&picked.uid, kind);
-                                *safe_lock(&state.last_error) =
-                                    Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
+                                // 请求级错误（ErrKind::None）不计账号错误——与流式路径
+                                // 守卫一致；误计会在连续 3 次后熔断健康账号
+                                if kind != ErrKind::None {
+                                    state.pool.note_error(&picked.uid, kind);
+                                }
+                                *safe_lock(&state.last_error) = Some(format!(
+                                    "uid={} code={} msg={}",
+                                    picked.uid,
+                                    code,
+                                    safe_slice(&msg, 300)
+                                ));
                                 state.record_usage(
                                     false, &model, &picked.uid, &key_id, false, stream,
                                     duration_ms, 0, 0,
@@ -1691,7 +1708,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     // model config mismatch）与账号无关——换任何账号都会
                                     // 复现同类错误，轮换只会打满整池后报 503（issue 实测
                                     // 双账号被连打）。终止轮换，按 400 透传上游错误
-                                    //（note_error(None) 不冷却，账号健康度不受影响）
+                                    //（不记 note_error，账号健康度不受影响）
                                     return Err(AggregateFail::Upstream(
                                         400,
                                         format!("upstream code={} msg={}", code, safe_slice(&msg, 300)),
