@@ -8,7 +8,6 @@ import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
 import Accounts from './pages/Accounts';
 import Checkin from './pages/Checkin';
-import Credits from './pages/Credits';
 import Logs from './pages/Logs';
 import Settings from './pages/Settings';
 import ApiService from './pages/ApiService';
@@ -18,7 +17,9 @@ import DoubaoSettings from './pages/doubao/DoubaoSettings';
 import BuddyOverview from './pages/buddy/BuddyOverview';
 import BuddyAccounts from './pages/buddy/BuddyAccounts';
 import BuddyCheckin from './pages/buddy/BuddyCheckin';
-import BuddyCredits from './pages/buddy/BuddyCredits';
+// 积分看板（credits-dashboard-plan.md；平台拆分）：同一组件按 platform 渲染
+// Trae 页（credits 视图，替换原 pages/Credits.tsx）与 Buddy 页（buddy-credits 视图）
+import CreditsDashboard from './pages/dashboard/Dashboard';
 import BuddyApiService from './pages/buddy/BuddyApiService';
 import BuddySettings from './pages/buddy/BuddySettings';
 import ApiManagerModal from './components/api/ApiManagerModal';
@@ -32,7 +33,9 @@ function renderView(view: string) {
     case 'checkin':
       return <Checkin />;
     case 'credits':
-      return <Credits />;
+      // key 强制按平台重挂载：两视图共用同一组件类型，缺 key 时 React 复用实例仅更新 props，
+      // 挂载数据加载 useEffect 不重跑，切换平台后另一平台数据全空
+      return <CreditsDashboard key="trae" platform="trae" />;
     case 'logs':
       return <Logs />;
     case 'api-service':
@@ -52,7 +55,7 @@ function renderView(view: string) {
     case 'buddy-checkin':
       return <BuddyCheckin />;
     case 'buddy-credits':
-      return <BuddyCredits />;
+      return <CreditsDashboard key="buddy" platform="buddy" />;
     case 'buddy-api-service':
       return <BuddyApiService />;
     case 'buddy-settings':

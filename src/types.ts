@@ -1063,23 +1063,6 @@ export interface WbUsageModelPoint {
   credit: number;
 }
 
-/** 官方请求用量（F-25：近 31 天窗口） */
-export interface WbUsageOfficial {
-  status: 'complete' | 'unavailable';
-  account_id: string;
-  domain: string;
-  range_start: string;
-  range_end: string;
-  fetched_at_ms: number;
-  request_count_total: number;
-  /** F-59 stale-on-error：拉取失败回退的过期缓存标记 */
-  stale?: boolean;
-  stale_reason?: string;
-  summary: { usage_today: number; usage_7days: number; usage_this_month: number };
-  daily: { date: string; usage: number; models: WbUsageModelPoint[] }[];
-  models: WbUsageModelPoint[];
-}
-
 /** 全账号官方用量聚合（Buddy 积分看板近 7 日消耗主数据源；31 天零填充） */
 export interface WbUsageOfficialAll {
   status: 'complete';
@@ -1095,6 +1078,8 @@ export interface WbUsageOfficialAll {
   stale_reason?: string;
   summary: { usage_today: number; usage_7days: number; usage_this_month: number };
   daily: { date: string; usage: number }[];
+  /** 按模型汇总（31 天全窗口、跨账号合并；stale 旧缓存可能缺省） */
+  models?: WbUsageModelPoint[];
 }
 
 /** 活动信息三端点聚合（F-51）：banner（公开）+ 付费类型 + 用量提醒 */
@@ -1146,6 +1131,16 @@ export interface WbCreditsResult {
   stale?: boolean;
   accounts: WbCreditAccount[];
   total_balance?: number;
+}
+
+/** WB 每日积分快照行（wb_credits_history；credits-dashboard-plan.md §2.2 方案 B 含 earned） */
+export interface WbCreditsSnapshot {
+  date: string;
+  ts: number;
+  total_balance: number;
+  /** 当日新增积分（余额差分 + 签到 reward 归并）；null/缺省 = 未统计（v2 老快照行/首日） */
+  earned?: number | null;
+  accounts: { user_id: string; balance: number | null }[];
 }
 
 /** WorkBuddy 签到日志（90 天存储） */

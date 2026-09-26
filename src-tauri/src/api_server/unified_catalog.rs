@@ -20,7 +20,8 @@
 //!
 //! 档位口径（issue #31，统一空间见 efforts 模块）：Trae 侧 L1/L2/L3 值一律
 //! 归一到统一档位（wire light/high/extra_high → low/high/xhigh）；双源条目
-//! 顶层 efforts = 各池映射后取并集，context_length 取两池较小值（诚实声明）。
+//! 顶层 efforts = 各池映射后取并集，context_length 按调度命中侧选定
+//! （issue #38-4：WB 池未启用时残留快照不得拖低声明）。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -40,7 +41,7 @@ pub fn canonical_id(id: &str) -> String {
 
 /// L3：主条目诚实兜底 128K（与旧 /v1/models 默认一致）——L2 dev 口径缺失时的
 /// 保守声明，不冒充实际窗口。1M 上下文档仅 Max Mode 通道（efforts::TRAE_MAX_MODE_REF
-/// 门控 is_max_mode:1 请求级注入，T0.3 实证无静态 -max 模型条目形态）可达，故主条目
+/// 门控 is_max_mode:true 请求级注入，T0.3 实证无静态 -max 模型条目形态）可达，故主条目
 /// 不做 1M 静态声明；原 MAX_MODE_1M/CTX_1M 占位随 T4.1 迁入 efforts::TRAE_MAX_MODE_REF
 /// （单一事实源）
 const CTX_128K: u64 = 131_072;
@@ -312,7 +313,7 @@ fn trae_entry_of(m: &ModelOption, l1: Option<&TraeModelMeta>) -> TraeEntry {
         .unwrap_or_else(|| super::efforts::trae_declared_unified(&canonical));
     // context: L1 → L2（models_sync 双口径的 dev 实际请求槽）→ L3 诚实兜底 128K。
     // issue #31：主条目不做 1M 静态声明——实际请求走 __dev 通道，1M 仅 Max Mode
-    // 请求级字段（is_max_mode:1，efforts::TRAE_MAX_MODE_REF 门控）可达
+    // 请求级字段（is_max_mode:true，efforts::TRAE_MAX_MODE_REF 门控）可达
     let context_length = Some(
         l1.and_then(|l| l.context_length)
             .or(m.context_length)
@@ -356,6 +357,10 @@ pub fn unified_models(
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
     let l1 = load_meta(data_dir);
+    // 注（issue #38-4 排查决策）：Trae 侧快照（kv api_models）无条件参与聚合，
+    // trae_ok=false 仅置 enabled 徽章、不过滤条目——Trae 池健康是瞬时状态，
+    // 过滤会导致 /v1/models 随账号冷却抖动；池不可用的信号由 sources[].enabled
+    // 传递（与 buddy-only 过滤依赖稳定的 wb_enabled 设置开关不同构）
     let trae_list = models_sync::load_models(data_dir);
     let wb_list = wb_catalog::load(data_dir);
 
@@ -372,6 +377,9 @@ pub fn unified_models(
     // 而是由末段按调度策略命中侧选定（与 rate 同源，§3.1/§3.3 #2）
     let mut buddy_disp: HashMap<String, String> = HashMap::new();
     let mut buddy_img: HashMap<String, bool> = HashMap::new();
+    // Buddy 侧上下文候选值：由末段按调度策略命中侧选定（issue #38-4，
+    // WB 池未启用时残留快照数值不得拖低双源条目的上下文声明）
+    let mut buddy_ctx: HashMap<String, u64> = HashMap::new();
     // 自定义模型供应商（canonical → 用户填写值；聚合末段优先于系列推断）
     let mut custom_vendor: HashMap<String, String> = HashMap::new();
 
@@ -438,13 +446,11 @@ pub fn unified_models(
                         m.supported_efforts.clone(),
                     ]);
                 }
-                // issue #31：双源上下文取较小值——声明不得大于任一池实际可用
-                //（1M 表模型实际请求走 dev 通道受 prompt 上限约束，见 models_sync 双口径）
+                // issue #38-4：上下文候选记入 buddy_ctx，由末段按命中侧选定。
+                // 原实现无条件取 min——WB 池未启用时磁盘/ kv 残留快照仍拖低声明
+                //（glm-5.2 等被压到 128K）；禁用池不会被调度命中，其数值不应约束声明
                 if let Some(c) = wctx {
-                    u.context_length = Some(match u.context_length {
-                        Some(prev) => prev.min(c),
-                        None => c,
-                    });
+                    buddy_ctx.insert(canonical.clone(), c);
                 }
                 if let Some(t) = wmt {
                     u.max_tokens = Some(t);
@@ -585,6 +591,14 @@ pub fn unified_models(
             .or_else(|| u.sources.iter().find(|s| s.enabled).and_then(|s| s.rate))
             .or_else(|| u.sources.first().and_then(|s| s.rate))
             .or(u.rate);
+        // context_length 跟随命中侧（issue #38-4）：命中 buddy → WB 目录值；
+        // 命中 trae/custom 或未命中 → Trae 四层链值（L1/L2/L3 诚实口径）。
+        // WB 池未启用时命中侧不可能是 buddy，残留快照数值不再拖低双源条目
+        if hit == Some("buddy") {
+            if let Some(c) = buddy_ctx.get(&canonical) {
+                u.context_length = Some(*c);
+            }
+        }
         // display：L1 人工 label 绝对最高优先（§3.2，覆盖双源展示名）；
         // 未人工维护时命中 buddy → 取 WB 展示名，命中 trae → 保持 Trae 侧（已含 L2 label）
         if let Some(label) = l1.get(&canonical).and_then(|m| m.label.clone()) {
@@ -722,9 +736,8 @@ mod tests {
         assert_eq!(m.rate, Some(0.79));
         assert_eq!(m.sources.len(), 2);
         assert!(m.sources.iter().all(|s| s.enabled));
-        // context 诚实取 min：Trae L3 兜底 128K（主条目不声明 1M，issue #31）
-        // vs WB 200000 → 128K
-        assert_eq!(m.context_length, Some(CTX_128K));
+        // context 按命中侧选定（issue #38-4）：默认策略 buddy 优先 → WB 目录值
+        assert_eq!(m.context_length, Some(200_000));
         assert_eq!(m.supports_image, Some(true));
     }
 
@@ -830,6 +843,40 @@ mod tests {
         let list = unified_models(&f.dir, true, false, true);
         let g = find(&list, "glm-5.3");
         assert!(!g.sources.iter().find(|s| s.pool == "trae").unwrap().enabled);
+    }
+
+    /// 双源 context_length 跟随命中侧/启用池（issue #38-4）：WB 池未启用时
+    /// 残留 buddy 快照数值不得拖低双源条目的上下文声明（原实现无条件取 min，
+    /// glm-5.2 等被压到 128K）
+    #[test]
+    fn t06b_dual_context_follows_enabled_pool() {
+        let f = fixture(&[("DeepSeek-V4-Flash", None)], &["deepseek-v4-flash"], None);
+        // WB 池启用 + 默认 buddy 优先 → 命中 buddy → WB 目录值
+        let list = unified_models(&f.dir, true, true, true);
+        assert_eq!(
+            find(&list, "DeepSeek-V4-Flash").context_length,
+            Some(200_000)
+        );
+        // WB 池未启用 → 命中 trae → Trae 四层链值（L3 兜底 128K），快照不拖低
+        let list = unified_models(&f.dir, false, true, true);
+        assert_eq!(
+            find(&list, "DeepSeek-V4-Flash").context_length,
+            Some(CTX_128K)
+        );
+        // WB 启用但 per_model 覆盖为 trae 优先 → 命中 trae → Trae 值
+        crate::store::db(&f.dir)
+            .kv_set(
+                "dispatch_policy",
+                &json!({"priority": ["buddy", "trae"],
+                    "per_model": {"deepseek-v4-flash": ["trae", "buddy"]}, "fallback": true}),
+            )
+            .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
+        let list = unified_models(&f.dir, true, true, true);
+        assert_eq!(
+            find(&list, "DeepSeek-V4-Flash").context_length,
+            Some(CTX_128K)
+        );
     }
 
     /// 目录序：双源在前、单源在后、组内字母序
@@ -1125,9 +1172,9 @@ mod tests {
 
     // ==================== issue #31 档位统一（并集 + 归一） ====================
 
-    /// 双源档位声明取并集（WB 不再覆盖 Trae 侧），context 取两池较小值
+    /// 双源档位声明取并集（WB 不再覆盖 Trae 侧），context 按命中侧选定
     #[test]
-    fn t18_dual_source_efforts_union_and_context_min() {
+    fn t18_dual_source_efforts_union_and_context_hit_side() {
         // glm-5.3：Trae 侧 L3 实证 [low,high,xhigh]；WB 侧目录 [low,medium,high]
         let f = fixture(&[("glm-5.3", None)], &["glm-5.3"], None);
         let list = unified_models(&f.dir, true, true, true);
@@ -1142,9 +1189,20 @@ mod tests {
             ],
             "双源并集：Trae 实证 ∪ WB 目录"
         );
-        // context：Trae L3 诚实兜底 128K（主条目不再声明 1M，issue #31）
-        // vs WB 200000 → 诚实取 min = 128K
-        assert_eq!(m.context_length, Some(CTX_128K));
+        // context 按命中侧选定（issue #38-4）：默认策略 buddy 优先 → WB 目录值
+        assert_eq!(m.context_length, Some(200_000));
+        // per_model 覆盖为 trae 优先 → 命中 trae → Trae L3 诚实兜底 128K
+        //（主条目不声明 1M，issue #31）
+        crate::store::db(&f.dir)
+            .kv_set(
+                "dispatch_policy",
+                &json!({"priority": ["buddy", "trae"],
+                    "per_model": {"glm-5.3": ["trae", "buddy"]}, "fallback": true}),
+            )
+            .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
+        let list = unified_models(&f.dir, true, true, true);
+        assert_eq!(find(&list, "glm-5.3").context_length, Some(CTX_128K));
     }
 
     /// L2 同步档位归一：wire 值（light/extra_high）映射统一档位，

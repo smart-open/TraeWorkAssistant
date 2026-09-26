@@ -171,7 +171,15 @@ pub fn prepare_llm_chat_body(
     obj_mut.insert("machine_id".into(), json!(machine_id));
     obj_mut.insert("project_id".into(), json!(gen_uuid_like()));
     obj_mut.insert("workspace_id".into(), json!("e04cdd"));
-    obj_mut.insert("prompt_max_tokens".into(), json!(168000));
+    // prompt_max_tokens：固定 168000（dev 通道实测值，issue #31）。
+    // 2026-09-26 真机实证矩阵（issue #38 复测链路）：
+    //   is_max_mode:true + prompt_max_tokens:168000 → 200 ✅
+    //   is_max_mode:true + 省略该字段              → 4001（上游必填）
+    //   is_max_mode:true + prompt_max_tokens:1M    → 4001（上游拒绝 1M 值）
+    // 1M 兑现已验证：`-max` 通路（注入 is_max_mode:true + 本字段 168000）实测
+    // 180051 prompt_tokens（>168000）HTTP 200——Max Mode 下该字段不钳制实际上下文，
+    // 1M 窗口由上游内部决策，网关侧固定 168000 即可
+    obj_mut.insert("prompt_max_tokens".into(), json!(168_000));
     obj_mut.insert("mode".into(), json!("FunctionCall"));
     obj_mut.insert("ide_version".into(), json!(super::IDE_VERSION));
     obj_mut.insert("ide_version_code".into(), json!(super::IDE_VERSION_CODE));
@@ -600,5 +608,36 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(out2["function"], super::super::FUNCTION);
+    }
+
+    /// prompt_max_tokens 恒为 168000（真机实证矩阵：省略 → 4001 必填；
+    /// 1M → 4001 拒绝；is_max_mode:true + 168000 → 200 唯一可行组合）
+    #[test]
+    fn llm_chat_body_prompt_max_tokens_max_mode() {
+        let mk = |extra: Value| {
+            let mut src = json!({
+                "model": "glm-5.3",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if !extra.is_null() {
+                src["is_max_mode"] = extra;
+            }
+            let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+                serde_json::to_vec(&src).unwrap().as_slice(),
+                "DeepSeek-V4-Flash", "u", "d", "m", &[],
+            ))
+            .unwrap();
+            out
+        };
+        // dev 请求：168000
+        let dev = mk(Value::Null);
+        assert_eq!(dev["prompt_max_tokens"], 168_000);
+        // Max Mode（布尔 true / 数值 1）：字段保留到上游，prompt_max_tokens 不变
+        let max = mk(json!(true));
+        assert_eq!(max["prompt_max_tokens"], 168_000);
+        assert_eq!(max["is_max_mode"], true);
+        let legacy = mk(json!(1));
+        assert_eq!(legacy["prompt_max_tokens"], 168_000);
+        assert_eq!(legacy["is_max_mode"], 1);
     }
 }

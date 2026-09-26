@@ -1,7 +1,8 @@
 # 产品优化需求清单（全应用统一待办）
 
-> **文档版本**: v2.9 · 2026-09-16
+> **文档版本**: v3.0 · 2026-09-26
 > **定位**: 全项目**唯一待办依据**——所有未实施的优化与需求项均在此登记，每条含需求概述 / 实现路径 / 参考开源项目。
+> **v3.0 变更**（2026-09-26，待办全量复核 + F-75 收官）：① **F-75 macOS 平台支持标记 ✅ 已完成**——macos_main 分支产品化（2026-09-17~26，22 提交）：platform 服务层 + 平台门控 + dmg 构建流水线（db4efd4）、app_locate mac bundle 分派 + LaunchServices 启动（5c1f79a）、平台抽象层收敛（113350a）、R1-R3 真机收口 + 双平台二轮审查修复（4adf498）、三/四轮真机修复——vault 双源密钥 + mac JWT 本地捕获 + 切换链收口（97e4dd5）、CI 三产物矩阵 aarch64/x64/universal + 可选自签（3c89310）、package_macos.mjs dmg + 便携 zip（81a9870）、dmg 打包重试（16a9b3d）、局域网网卡黑名单补 mac 虚拟接口（3a31d17）、内置更新竞态修复（#37）+ macOS 手动安装引导（e96a218）；随 3.6.1/3.6.2 发 mac dmg，AGENT.md §11.1 双平台发版红线在案；② 其余待办经代码检索复核状态无变化（F-70 余项 tc 直读仍未接入 `apps_accounts_discover`；F-38/E-01/E-02/F-69/F-79 等确认未实施，状态属实）。
 > **v2.9 变更**（2026-09-16，网关请求链路堵塞分析批次落地）：① 新增 **F-79 网关流式上游异步化**（reqwest + async SSE，原「D-2 二期」）——同批已落地的过渡方案：调度配置内存缓存（A）+ API 日志异步写入（B）+ 用量/Key 记账削峰落盘（C/E）+ 流式专用阻塞池线程隔离（D-1），P0 级堵塞（spawn_blocking 池耗尽、async worker 同步 SQLite）已消除，F-79 为彻底形态；② 其余待办项状态复核无变化。
 > **v2.8 变更**（2026-09-16，对照 CHANGELOG 3.5.3 + 全仓代码检索完成度核查）：① **F-78 全链路完成**——批次 3 真实协议闭环（PKCE + authCodeInfo 回调 + DeviceInfo 主变体 + 端点修正 + 变体探测链，v3.5.3 九提交），原「待抓包验证项」经协议实测全部裁定；② **F-70 部分落地**——`icube_auth.rs`（tc 信封解密 + ECDSA P-256 DeviceProof）随 F-78 批次 3 交付，条目改「部分完成」，剩余账号发现直读下调至 1~2 天；③ §五排序刷新（已完成项退出）；④ 其余待办项（F-38/F-69/F-67/F-07/F-41/F-42/F-66/E-01~E-03 及远期项）经代码检索确认均未实现，状态属实。
 > **v2.7 变更**: ① **W-01（Work 积分接入网关）标记 ❌ 已排除**——Trae 积分签到调整，前提与收益均不成立；条目与 §三 专题保留作技术留档，§四新增排除行、§五排序移除；② **F-68 已完成**（`switcher/vscdb.rs` 全局键合并，恢复前抽键 → 恢复后按条目合并回写）；③ **F-74 已完成**（chatdata 三命令 `app` 参数化 + CodeBuddy 会话域 + `buddy_switch_migrate_chats` 切换编排）。
@@ -39,7 +40,7 @@
 | F-41 | trae2codex 转换器 | Trae 生态 | P3 | 3 天 | 待开发（机会项） |
 | F-42 | workbuddy-mcp 模式 | Buddy 生态 | P3 | 2~3 天 | 机会项（按需评估） |
 | F-66 | CLI 多账号环境隔离 | Buddy 生态 | P3 | 评估先行 | 机会项（按需评估） |
-| F-75 | macOS 平台支持（依赖盘点 v2.6 复审 + 分层归位） | 全应用 | P3 | 3~4 周（侦察先行，原 6~8 周下调） | 待侦察（目标应用 mac 布局未证实；PS 桥/Python/存储三大项已消除） |
+| F-75 ✅ | macOS 平台支持（分层归位） | 全应用 | P3 | 3~4 周（实际 ~1.5 周，2026-09-17~26） | 已完成（2026-09-26，macos_main 分支产品化，随 3.6.1/3.6.2 发 mac dmg） |
 | F-52 | WorkBuddyProxy 模式（驾驶舱 + Codex 执行器） | Buddy 生态 | P3 | — | 远期（与 F-40 方向相反） |
 | F-71 | Trae SG 版（国际版）支持 | Trae 生态 | P3 | — | 远期（前置情报已有） |
 | F-72 | 网关上游多级回退 + 分档竞速调度 | 网关 | P3 | — | 远期（调度增强方向） |
@@ -243,7 +244,7 @@
 - **实现路径**：先做评估（目标 CLI 的配置目录读取优先级、与现有 `workbuddy_cli_bridge_set` 写 token 模式的冲突调和），通过后作为 CLI 桥的第二种隔离模式并存。
 - **参考开源项目**：`xiaolizi0v0/CliProxy`（多 CLI 账号环境隔离 + 严格账号模式 + 接口脱敏完整范式）。
 
-### F-75 macOS 平台支持（P3，侦察先行，分层归位——v2.6 全面复审）
+### F-75 macOS 平台支持（P3，分层归位）✅ 已完成（2026-09-26，macos_main 分支产品化）
 
 - **需求概述**：让助手与四应用（Trae Work / Trae CN / WorkBuddy+CodeBuddy / 豆包）的账号管理、切换、签到、网关能力在 macOS 可用。**迁移策略为「分层归位」而非整体重写**。
 - **v2.6 复审背景**（2026-09-15，Python/PS 移除 + SQLite 迁移 + 定时任务 Rust 化完成后的全仓代码实测）：原 Windows 依赖全景中三大项已整体消失——① 切换桥（原表最大工作量项，PS 1534 行）已 Rust 化为 `switcher/` 且平台耦合收敛到 locate/proc/machine 三模块（其余 ~70% 纯文件层天然跨平台）；② Python 网络层与豆包脚本已全量 Rust 化，**原 M2「路径中立化」阶段整体取消**；③ 存储层已迁 SQLite（rusqlite bundled 跨平台）、Job Object 随 `python.rs` 删除消失、进度事件已进程内回调（无 stdout 桥）。**预估由 6~8 周下调至 3~4 周**。
@@ -301,6 +302,13 @@
 | R6 | **M3 dmg 构建 + 更新闭环验证**（x86_64 本地形态 ✅ 2026-09-20） | R1（推荐尽早，不依赖 R2） | 已完成：本地 `npm run tauri build -- --target x86_64-apple-darwin --bundles dmg` 产出 `AI Work 助手_3.5.6_x64.dmg`（含二轮审查修复）。剩余：aarch64/universal 形态走 CI `build-macos.yml` 首跑；updater mac 闭环实测（发现 dmg → 下载 → SHA256 fail-closed → open dmg → 重启，验收矩阵 8）；Gatekeeper 无签名首启引导实测（右键打开 + `xattr -d`，验收矩阵 1） |
 | R7 | **M4 集成验收 + 首个 mac 发布演练** | R1~R6 | 验收矩阵 1-9 全项通过（含 Windows 回归 §9.3：cargo test 全绿 + tsc + NSIS/MSI/portable 产物不变 + 手工冒烟）；tag 发布 Release 四资产 + 新 mac 机从 dmg 安装到登录使用成功；更新 CHANGELOG 与 AGENT.md SOP 实测补充 |
 | R8 | **延后项**（M-1 后评估，非阻塞） | R2 | ①豆包 cookie mac 直读（Keychain Safe Storage + AES-128-CBC，重写非移植，首版走 MITM 捕获）②launchd 系统级定时注册（内置调度器已覆盖）③Developer ID 签名公证（$99/年，决策后落地可根除 Gatekeeper 引导）④「更新重启前旧进程对新 .app 执行 `xattr -d`」自动化增强（设计 §9.4 留档） |
+- **落地落点（2026-09-17~26，macos_main 分支 22 提交，产品化闭环 ✅）**：
+  - **主体（db4efd4，09-17）**：platform 服务层 + 平台门控 + dmg 构建流水线；cert（`security add-trusted-cert`）/ proxy（networksetup/scutil）/ process（sysinfo）/ oauth / env / updater / checkin / device_proxy（bypass + ca + 绑定）等原 13 个 Windows 依赖点全量 mac 分支落地；
+  - **定位与启动（5c1f79a）**：`app_locate` mac bundle 分派——`/Applications/<App>.app` 探测链 + LaunchServices 启动；**平台抽象层收敛（113350a）** + 整体黑盒复审修复（9504e3a）；
+  - **真机收口（4adf498 + 97e4dd5，09-20，R1~R4 四轮）**：vault 双源密钥（Keychain 优先回落）、mac JWT 本地捕获、切换链收口 + 双平台二轮审查修复；
+  - **构建与分发（3c89310 + 81a9870 + 9ab1cad + 16a9b3d）**：CI 三产物矩阵 aarch64/x64/universal + 可选自签证书签名；`package_macos.mjs` dmg 安装包 + ditto 便携 zip；产物按平台分目录（release/mac）；dmg 打包 bundle_dmg.sh 偶发失败自动清理重试；
+  - **发版与更新（随 3.6.1/3.6.2）**：mac dmg 随双版本发布；内置更新竞态修复（#37）+ macOS 手动安装「先退出再拖拽」引导（e96a218，09-26）；AGENT.md §11.1 补双平台发版产物清单与 latest.json 全资产收录红线（v3.6.1 mac 更新阻断事故复盘）；
+  - **合并审查跟进**：局域网网卡黑名单补 macOS 专属虚拟接口 bridge100/awdl0/llw0（3a31d17）；豆包环境配置页路径文案按平台分派（d76f900）；应用图标圆角化全套重生成并回流 main（a5fcdd6）。
 
 ### F-52 WorkBuddyProxy 模式（P3，远期）
 
@@ -394,7 +402,7 @@
 2. **E-01/E-02 豆包网关**（批次 0 探测实验 Gate 先行）—— 8~12 天，豆包积分资产化主路径
 3. **F-70 tc 凭证直读（剩余收尾）** —— 解密算法与 DeviceProof 已落地（`icube_auth.rs`），仅剩账号发现直读接入，1~2 天
 4. F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
-5. F-52 / F-71 / F-72 / F-73 / F-75 —— 远期留档，随生态演进评估（F-75 侦察可随时低成本启动）
+5. F-52 / F-71 / F-72 / F-73 —— 远期留档，随生态演进评估
 6. ~~W-01 Work 积分接入~~ —— 已排除（2026-09-15）：Trae 积分签到调整，见 §四
 
-> 已完成项退出排序：F-76/F-77（2026-09-14）、F-78 全批次（批次 1+2 2026-09-14 / 批次 3 2026-09-16）、F-68/F-74（2026-09-15）、F-24-余（2026-09-16 真机复验闭环）。
+> 已完成项退出排序：F-76/F-77（2026-09-14）、F-78 全批次（批次 1+2 2026-09-14 / 批次 3 2026-09-16）、F-68/F-74（2026-09-15）、F-24-余（2026-09-16 真机复验闭环）、F-75（2026-09-26，macos_main 分支产品化）。
