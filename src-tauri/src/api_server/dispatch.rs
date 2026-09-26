@@ -214,7 +214,7 @@ struct ModelSources {
     /// Trae 侧最终模型 + effort 提示 + Max Mode 入口标志（issue #31 T3.1/T4.2：
     /// Trae-only 模型带路由后缀时剥离为基名，effort 提示随池携带、由 routes 层转
     /// wire 下发；带 `-max` 入口后缀时剥离为基名并置 max 标志、由 routes 层结合
-    /// efforts::TRAE_MAX_MODE_REF 门控注入 is_max_mode:1；透传语义为原名）
+    /// efforts::TRAE_MAX_MODE_REF 门控注入 is_max_mode:true；透传语义为原名）
     trae_final: (String, Option<String>, bool),
 }
 

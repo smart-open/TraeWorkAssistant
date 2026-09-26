@@ -346,7 +346,7 @@ response = client.chat.completions.create(
 
 #### Max Mode（Trae 池 1M 上下文）
 
-Max Mode 为请求级能力（网关向 Trae 上游注入 `is_max_mode:1`），仅 Trae 池生效。对支持模型，启用方式二选一：
+Max Mode 为请求级能力（网关向 Trae 上游注入 `is_max_mode: true`），仅 Trae 池生效。对支持模型，启用方式二选一：
 
 1. **`-max` 后缀（推荐）**：在支持模型的 ID 后加 `-max`，如 `glm-5.3-max`。网关自动剥离后缀、按基名匹配资源池并注入
 2. **请求体直传**：OpenAI 兼容请求体加 `"is_max_mode": true`（Anthropic 兼容端点不支持直传，请用后缀方式）
@@ -356,6 +356,16 @@ Max Mode 为请求级能力（网关向 Trae 上游注入 `is_max_mode:1`），�
 - 仅支持表内模型可用（即 `/v1/models` 中 `max_mode: true` 的条目：doubao-seed-evolving / glm-5.3 / glm-5.2 / deepseek-v4-pro(-official) / deepseek-v4-flash(-official) / kimi-k3 / minimax-m3 / qwen3.8-max / qwen-3.7-plus）；表外模型加后缀不生效，按原名请求
 - 特例 `qwen3.8-max` 本身以 `-max` 结尾（整名命中透传、不剥离后缀）：启用 Max Mode 需写 `qwen3.8-max-max`，或直传 `"is_max_mode": true`
 - Buddy / 自定义模型不支持 Max Mode；`-max` 后缀仅在请求路由到 Trae 池时生效
+- 启用白名单的部署下，`-max` 后缀按剥离后的基名过白名单准入（基名在名单即放行），无需把带后缀名加进白名单
+- 请求级错误（如上游 `4001 param is invalid`）与账号无关：网关立即以 400 透传上游错误、不轮换账号、不触发冷却
+
+#### 上下文口径（`context_length` 语义）
+
+`/v1/models` 各字段口径：
+
+- `context_length`：**本网关实际请求可用的上下文**（Trae 侧取 `__dev` 通道实际请求口径；双源模型按当前调度策略命中侧取值）——客户端应以此作为可用上限
+- `max_mode`：该模型经 `-max` 后缀 / `is_max_mode` 是否可启用 Max Mode 1M 上下文档（Trae 池专属）
+- 官网同步的「模型原始能力上限」（如 `context_length_max = 1M`）为上游声明值，**不代表网关当前请求即可兑现**；1M 仅在 Max Mode 通路内由上游决策生效，未启用 Max Mode 的请求请以 `context_length` 为准
 
 ---
 

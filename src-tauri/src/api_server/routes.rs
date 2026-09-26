@@ -174,47 +174,80 @@ fn trae_effort_wire(
     model: &str,
 ) -> Option<String> {
     let supported = efforts::trae_supported_wire(&unified_catalog::canonical_id(model));
-    if supported.is_empty() {
+    let wire = if supported.is_empty() {
         // 表外无实证：仅显式请求填充默认（统一→Trae 映射），合成默认不下发
-        return efforts::trae_request_wire_fill(explicit.as_deref());
-    }
-    let requested = explicit.or(route_hint).or_else(|| {
-        state
-            .wb_default_thinking
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .then(|| "high".to_string())
-    });
-    requested.and_then(|req| efforts::trae_request_wire(Some(&req), &supported))
+        efforts::trae_request_wire_fill(explicit.as_deref())
+    } else {
+        let requested = explicit.clone().or(route_hint).or_else(|| {
+            state
+                .wb_default_thinking
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then(|| "high".to_string())
+        });
+        requested.and_then(|req| efforts::trae_request_wire(Some(&req), &supported))
+    };
+    // 可观测性（issue #38-5）：请求侧档位 → wire 档位映射落盘（脱敏，仅模型与档位），
+    // 用于验证「档位到底有没有下发/映射成哪一档」
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "trae effort: model={} requested={:?} wire={:?}",
+            model, explicit, wire
+        ),
+    );
+    wire
 }
 
-/// Trae 出站 Max Mode 字段名（issue #31 T4.2，T0.3 客户端实证）：请求级布尔门控，
-/// 注入数值 1（客户端表达式 `is_max_mode:(…)&&t.isMaxMode?1:0`）；依赖上游
-/// 「未知字段忽略」惯例，仅入口标志置位且模型在支持表内才注入（表外不冒进）
+/// Trae 出站 Max Mode 字段名（issue #31 T4.2，T0.3 客户端实证）：请求级布尔门控。
+/// 注入值用布尔 true（2026-09-26 真机实证 is_max_mode:true + pmt:168000 → 200）。
+/// 注意：issue #38 报告的 4001 真机根因是 body model 字段未随 `-max` 剥离回写
+/// （见 inject_trae_outbound），字段值类型并非根因。仅入口标志置位且模型在
+/// 支持表内才注入（表外不冒进）
 const TRAE_MAX_MODE_FIELD: &str = "is_max_mode";
 
 /// Trae 出站注入（issue #31 T3.3/T4.2）：effort wire 与 Max Mode 两路合并为单次
-/// parse/serialize（Max Mode 场景恰为大 body，避免重复往返）。两路均未激活时零
-/// parse 原样返回；非对象/非 JSON body 原样返回。payload 层（prepare_llm_chat_body）
-/// 为透传+增补模式，注入字段直达上游
+/// parse/serialize（Max Mode 场景恰为大 body，避免重复往返）。同时回写 body 的
+/// model 字段为剥离后基名（issue #38 真机根因：dispatch 剥离 `-max`/`-thinking`
+/// 仅用于路由与日志，body 原样透传致 payload 生成 `xxx-max__dev` → 上游 4001
+/// param invalid）。三者均未激活时零 parse 原样返回；非对象/非 JSON body 原样返回。
+/// payload 层（prepare_llm_chat_body）为透传+增补模式，注入字段直达上游。
+/// 注入结果落 app.log（issue #38-5：is_max_mode 是否注入此前无任何痕迹，
+/// 无法区分「注入被拒」与「后缀未剥离」）
 fn inject_trae_outbound(
+    data_dir: &std::path::Path,
     body_vec: Vec<u8>,
     wire: Option<String>,
     max_mode_hint: bool,
+    requested_model: &str,
     model: &str,
 ) -> Vec<u8> {
     let inject_max =
         max_mode_hint && efforts::trae_max_mode_supported(&unified_catalog::canonical_id(model));
-    if wire.is_none() && !inject_max {
+    let rewrite_model = requested_model != model;
+    if wire.is_none() && !inject_max && !rewrite_model {
         return body_vec;
     }
     match serde_json::from_slice::<Value>(&body_vec) {
         Ok(Value::Object(mut obj)) => {
-            if let Some(w) = wire {
+            if rewrite_model {
+                obj.insert("model".into(), json!(model));
+            }
+            if let Some(w) = &wire {
                 obj.insert(TRAE_EFFORT_FIELD.to_string(), json!(w));
             }
             if inject_max {
-                obj.insert(TRAE_MAX_MODE_FIELD.to_string(), json!(1));
+                obj.insert(TRAE_MAX_MODE_FIELD.to_string(), json!(true));
             }
+            crate::fs_utils::app_log(
+                data_dir,
+                &format!(
+                    "trae outbound: model={} requested_model={} effort_injected={} max_mode_injected={}",
+                    model,
+                    requested_model,
+                    wire.is_some(),
+                    inject_max,
+                ),
+            );
             serde_json::to_vec(&obj).unwrap_or(body_vec)
         }
         _ => body_vec,
@@ -326,6 +359,20 @@ fn whitelist_check(state: &ApiSharedState, model: &str, proto: Protocol) -> Opti
     let list = unified_catalog::load_whitelist(&state.data_dir);
     if unified_catalog::whitelist_allows(&list, model) {
         return None;
+    }
+    // issue #38 实测修复：`-max` / `-thinking` 等入口后缀在 dispatch ② 段才剥离，
+    // 白名单须按同一剥离规则对基名放行——否则启用白名单的部署下，Max Mode /
+    // 路由后缀入口在准入层就被 404 拦截，整个能力不可用（剥离规则与 dispatch 同源，
+    // 基名最终可服务性仍由 dispatch 查模型列表判定，此处仅准入放行）
+    let cfg = wb_model_route::load_config(&state.data_dir);
+    let bases = [
+        wb_model_route::strip_max_suffix(model),
+        wb_model_route::strip_route_suffix(model, &cfg).map(|(b, _)| b),
+    ];
+    for base in bases.into_iter().flatten() {
+        if unified_catalog::whitelist_allows(&list, &base) {
+            return None;
+        }
     }
     Some(whitelist_error_response(model, proto))
 }
@@ -532,6 +579,9 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
                 "max_tokens": m.max_tokens,
                 "supports_image": m.supports_image,
                 "supported_efforts": m.efforts,
+                // Max Mode 支持（issue #38-1：UnifiedModel 已按支持表计算，
+                // 此前手工序列化遗漏导致 release notes/手册声明的字段从未出现在响应中）
+                "max_mode": m.max_mode,
                 // 来源池集合：[{pool: "trae"|"buddy", rate, enabled}]（徽章/降级判定
                 // 由客户端按元数据自决，勿硬编码 §3.4）
                 "sources": m.sources,
@@ -625,7 +675,9 @@ pub async fn chat_completions(
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
-                let body_vec = inject_trae_outbound(body_vec, wire, r.max_mode_hint, &r.model);
+                let body_vec = inject_trae_outbound(
+                    &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
+                );
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard)
                 } else {
@@ -853,7 +905,9 @@ pub async fn messages(
                     _ => None,
                 };
                 let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
-                let body_vec = inject_trae_outbound(body_vec, wire, r.max_mode_hint, &r.model);
+                let body_vec = inject_trae_outbound(
+                    &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
+                );
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard)
                 } else {
@@ -982,7 +1036,9 @@ pub async fn completions(
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
                 let wire = trae_effort_wire(&state, r.effort_hint, None, &r.model);
-                let body_vec = inject_trae_outbound(body_vec, wire, r.max_mode_hint, &r.model);
+                let body_vec = inject_trae_outbound(
+                    &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
+                );
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard)
                 } else {
@@ -1630,7 +1686,18 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                     state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
                                 }
-                                break; // 流内错误：冷却换号
+                                if kind == ErrKind::None {
+                                    // issue #38-2/T5：请求级错误（4001 param invalid /
+                                    // model config mismatch）与账号无关——换任何账号都会
+                                    // 复现同类错误，轮换只会打满整池后报 503（issue 实测
+                                    // 双账号被连打）。终止轮换，按 400 透传上游错误
+                                    //（note_error(None) 不冷却，账号健康度不受影响）
+                                    return Err(AggregateFail::Upstream(
+                                        400,
+                                        format!("upstream code={} msg={}", code, safe_slice(&msg, 300)),
+                                    ));
+                                }
+                                break; // 账号级错误：冷却换号
                             }
                             _ => {
                                 state.pool.note_error(&picked.uid, ErrKind::Server);
@@ -2214,62 +2281,66 @@ mod tests {
 
     /// Trae 出站注入（issue #31 T3.3/T4.2，合并后单次 parse）：effort wire=Some 写
     /// reasoning_effort_level（T0.2 抓包后仅改 TRAE_EFFORT_FIELD 常量）；Max Mode
-    /// 入口标志 + 支持表双门控、未请求不注入 0（保持请求最小化）、注入值 1（客户端
-    /// 实证 is_max_mode:…?1:0）；原字段保留；两路均未激活原样返回；非对象/非 JSON
-    /// body 原样返回
+    /// 入口标志 + 支持表双门控、未请求不注入（保持请求最小化）、注入值布尔 true；
+    /// body model 字段回写剥离后基名（issue #38 真机根因）；原字段保留；三路均未
+    /// 激活原样返回；非对象/非 JSON body 原样返回
     #[test]
     fn inject_trae_outbound_variants() {
+        // 测试桩：注入函数现需 data_dir 落可观测性日志（issue #38-5），指向临时目录
+        let dir = std::env::temp_dir();
+        let inject = |body: Vec<u8>, wire: Option<String>, mm: bool, requested: &str, model: &str| {
+            inject_trae_outbound(&dir, body, wire, mm, requested, model)
+        };
         let body = br#"{"model":"glm-5.3","messages":[]}"#.to_vec();
 
-        // 两路均未激活 → 原样（零 parse）
-        assert_eq!(
-            inject_trae_outbound(body.clone(), None, false, "glm-5.3"),
-            body
-        );
+        // 三路均未激活 → 原样（零 parse）
+        assert_eq!(inject(body.clone(), None, false, "glm-5.3", "glm-5.3"), body);
 
         // effort 单路：注入字段，原字段保留
-        let out = inject_trae_outbound(body.clone(), Some("extra_high".into()), false, "glm-5.3");
+        let out = inject(body.clone(), Some("extra_high".into()), false, "glm-5.3", "glm-5.3");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["reasoning_effort_level"], "extra_high");
         assert_eq!(v["model"], "glm-5.3");
         assert!(v.get("is_max_mode").is_none());
 
-        // Max Mode 单路：注入 is_max_mode:1
-        let out = inject_trae_outbound(body.clone(), None, true, "glm-5.3");
+        // Max Mode 单路：注入 is_max_mode:true
+        let out = inject(body.clone(), None, true, "glm-5.3", "glm-5.3");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["is_max_mode"], 1);
+        assert_eq!(v["is_max_mode"], true);
         assert!(v.get("reasoning_effort_level").is_none());
 
         // 支持表外模型不注入（不按名称冒进）
-        assert_eq!(
-            inject_trae_outbound(body.clone(), None, true, "doubao-seed-code"),
-            body
-        );
+        assert_eq!(inject(body.clone(), None, true, "doubao-seed-code", "doubao-seed-code"), body);
 
         // canonical 归一：大小写变体同样命中支持表
-        let out = inject_trae_outbound(body.clone(), None, true, "GLM-5.3");
+        let out = inject(body.clone(), None, true, "GLM-5.3", "GLM-5.3");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["is_max_mode"], 1);
+        assert_eq!(v["is_max_mode"], true);
 
         // 双路并发：单次 parse 同时注入两字段
-        let out = inject_trae_outbound(body.clone(), Some("high".into()), true, "glm-5.3");
+        let out = inject(body.clone(), Some("high".into()), true, "glm-5.3", "glm-5.3");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["reasoning_effort_level"], "high");
-        assert_eq!(v["is_max_mode"], 1);
+        assert_eq!(v["is_max_mode"], true);
         assert_eq!(v["model"], "glm-5.3");
+
+        // body model 回写（issue #38 真机根因）：`-max` 剥离后 body model 仍为
+        // 带后缀原名 → 上游收到 xxx-max__dev 报 4001；回写为基名
+        let sfx = br#"{"model":"DeepSeek-V4-Flash-Official-max","messages":[]}"#.to_vec();
+        let out = inject(sfx.clone(), None, false, "DeepSeek-V4-Flash-Official-max", "DeepSeek-V4-Flash-Official");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "DeepSeek-V4-Flash-Official", "仅回写场景（无注入）也生效");
+        let out = inject(sfx, None, true, "DeepSeek-V4-Flash-Official-max", "DeepSeek-V4-Flash-Official");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "DeepSeek-V4-Flash-Official");
+        assert_eq!(v["is_max_mode"], true);
 
         // 非对象 body（数组）→ 原样
         let arr = br#"[1,2,3]"#.to_vec();
-        assert_eq!(
-            inject_trae_outbound(arr.clone(), Some("high".into()), true, "glm-5.3"),
-            arr
-        );
+        assert_eq!(inject(arr.clone(), Some("high".into()), true, "glm-5.3", "glm-5.3"), arr);
 
         // 非 JSON body → 原样
         let raw = b"not-json".to_vec();
-        assert_eq!(
-            inject_trae_outbound(raw.clone(), Some("high".into()), true, "glm-5.3"),
-            raw
-        );
+        assert_eq!(inject(raw.clone(), Some("high".into()), true, "glm-5.3", "glm-5.3"), raw);
     }
 }

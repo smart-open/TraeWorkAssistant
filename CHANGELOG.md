@@ -4,6 +4,25 @@
 
 ---
 
+## [未发布]
+
+### 修复
+
+- **[P1] `-max` 后缀请求上游 4001 并轮换打满账号池（Issue #38②）**：真机根因为 dispatch 剥离 `-max`/`-thinking` 后仅路由与日志使用基名，请求体 `model` 字段原样透传 → payload 按未收录名生成 `xxx-max__dev` → 上游 `4001 param is invalid`；Trae 出站注入层现回写 body `model` 为剥离后基名（Buddy 管线同语义）。配套：Max Mode 注入值改布尔 `true`（真机实证 `is_max_mode:true` 可用）；全局模型白名单准入对齐后缀剥离规则（基名在名单即放行，白名单部署下 `-max` 入口不再 404）；流内请求级错误（4001 等 `ErrKind::None`）终止账号轮换、按 400 透传上游错误且不冷却（不再无意义打满整池）。
+- **[P1] `/v1/models` 漏序列化 `max_mode` 字段（Issue #38①）**：内部 `UnifiedModel.max_mode` 已按支持表计算，手工 JSON 序列化遗漏致 release notes 声明的字段从未出现在响应中，Max Mode 对客户端不可发现；现补齐输出。
+- **[P2] WB 池未启用时双源模型 `context_length` 被残留快照拖低（Issue #38④）**：双源合并原对 Buddy 侧上下文无条件取 min（`glm-5.2` 等被压到 128K）；现 `context_length` 纳入聚合末段按调度策略命中侧选定（与 rate/display 同模式），禁用池数值不再约束声明。
+- **[P2] `prompt_max_tokens` 口径固化**：真机实证矩阵（省略 → 4001 上游必填；放大 1M → 4001 拒绝；`is_max_mode:true` + 168000 → 200），固定 168000；长上下文用例实测 `-max` 通路 180051 prompt_tokens（>168000）HTTP 200，确认 1M 窗口实际兑现、该字段不钳制 Max Mode 上下文。
+
+### 可观测性
+
+- **[P3] Trae 出站链路落盘（Issue #38⑤）**：app.log 新增 `trae effort: requested → wire`（档位映射）与 `trae outbound: requested_model/model/effort_injected/max_mode_injected`（后缀剥离回写与 Max Mode 注入），三类失败分支（未剥离/剥离未注入/注入被拒）可区分。
+
+### 测试
+
+- cargo 单测 **559** 全绿（新增/更新：context 命中侧选定、`-max` 白名单放行与 body model 回写、Max Mode 注入布尔值、`prompt_max_tokens` 恒定等）；真机端到端验证 `-max` 全链路 200、账号池零冷却。
+
+---
+
 ## [3.6.2] · 2026-09-25 · 模型档位统一空间 + Max Mode 出站 + 局域网网关接入 + 定时同步扩展
 
 > 范围：自 [3.6.1]（commit df8010e）以来的全部变更。
