@@ -37,9 +37,11 @@ import type {
   TraeModelMeta,
   UnifiedModel,
   UsageDayView,
+  UsageHistoryResult,
   WbActivityInfo,
   WbCheckinRecord,
   WbCreditsResult,
+  WbCreditsSnapshot,
   WbModelInfo,
   WbPoolImportResult,
   WbUsageFallback,
@@ -310,6 +312,9 @@ export const api = {
       invoke<number>('refresh_remaining_credits'),
     dailyList: () =>
       invoke<CreditsDailySnapshot[]>('credits_daily_list'),
+    // Trae 官网消耗明细（usage_history；fresh=true 增量拉取，false 纯缓存读取）
+    usageHistory: (fresh?: boolean) =>
+      invoke<UsageHistoryResult>('usage_history', { fresh: fresh ?? null }),
     cooldownClear: (userId: string) =>
       invoke('cooldown_clear', { userId }),
     cooldownClearAll: () =>
@@ -553,6 +558,9 @@ export const api = {
       invoke<WbCheckinRecord[]>('workbuddy_checkin_results', { days: days ?? null }),
     creditsFetch: (userId?: string, fresh?: boolean) =>
       invoke<WbCreditsResult>('workbuddy_credits_fetch', { userId, fresh }),
+    // 快照时序读取（credits-dashboard-plan.md §2.2 方案 B：earned 已随快照落库）
+    creditsHistoryList: () =>
+      invoke<{ snapshots: WbCreditsSnapshot[] }>('workbuddy_credits_history_list'),
     editionsBackfill: () => invoke<number>('workbuddy_editions_backfill'),
     settingsGet: () => invoke<WorkBuddySettings>('workbuddy_settings_get'),
     settingsSet: (patch: WorkBuddySettings) => invoke('workbuddy_settings_set', { patch }),

@@ -25,9 +25,9 @@ pub const BUILTIN_THINKING_EFFORT: &str = "high";
 
 /// Max Mode 入口后缀（issue #31 T4.2）：私有约定入口，dispatch 对 Trae-only 模型
 /// 剥离后置 max 入口标志、由 routes 层结合 efforts::TRAE_MAX_MODE_REF 门控注入
-/// `is_max_mode:1`（不改写模型名）。不作 Buddy 管线路由后缀（max_mode 为 Trae
-/// wire 专属语义）；整名以 -max 结尾的真模型（如 qwen3.8-max）由 dispatch
-/// 「整名在模型列表优先透传」守卫避免误剥
+/// `is_max_mode:true`（不改写模型名；issue #38 实测布尔可用、数值 1 被上游拒绝）。
+/// 不作 Buddy 管线路由后缀（max_mode 为 Trae wire 专属语义）；整名以 -max 结尾的
+/// 真模型（如 qwen3.8-max）由 dispatch「整名在模型列表优先透传」守卫避免误剥
 pub const BUILTIN_MAX_SUFFIX: &str = "-max";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

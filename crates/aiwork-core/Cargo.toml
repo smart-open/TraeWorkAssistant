@@ -1,6 +1,6 @@
 ﻿[package]
 name = "aiwork-core"
-version = "1.3.0"
+version = "1.3.1"
 description = "AI Work 助手业务核心（Web 化改造抽取，零 tauri/桌面依赖）"
 edition = "2021"
 rust-version = "1.88"

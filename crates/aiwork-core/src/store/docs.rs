@@ -6,12 +6,12 @@
 
 // ── P6 流水迁出：WB 每日积分快照（原 kv workbuddy_credits_history）───────────
 
-/// 读回 {snapshots:[{date,ts,total_balance,accounts}]}（按日期升序；原文件形状兼容）
+/// 读回 {snapshots:[{date,ts,total_balance,earned,accounts}]}（按日期升序；原文件形状兼容）
 pub fn wb_credits_history_load(s: &Store) -> Value {
     let rows = s
         .with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT date, ts, total_balance, accounts FROM wb_credits_history ORDER BY date",
+                "SELECT date, ts, total_balance, accounts, earned FROM wb_credits_history ORDER BY date",
             )?;
             let rows = stmt
                 .query_map([], |r| {
@@ -22,6 +22,7 @@ pub fn wb_credits_history_load(s: &Store) -> Value {
                         "total_balance": r.get::<_, f64>(2)?,
                         "accounts": serde_json::from_str::<Value>(&accounts)
                             .unwrap_or(Value::Array(vec![])),
+                        "earned": r.get::<_, Option<f64>>(4)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -43,11 +44,12 @@ pub fn wb_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), String> 
         snap.get("accounts").unwrap_or(&Value::Array(vec![])),
     )
     .map_err(|e| format!("序列化失败: {e}"))?;
+    let earned = snap.get("earned").and_then(Value::as_f64);
     s.with_conn(move |c| {
         c.execute(
-            "INSERT INTO wb_credits_history(date, ts, total_balance, accounts) VALUES(?1, ?2, ?3, ?4)
-             ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, total_balance = excluded.total_balance, accounts = excluded.accounts",
-            rusqlite::params![date, ts, total, accounts],
+            "INSERT INTO wb_credits_history(date, ts, total_balance, accounts, earned) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, total_balance = excluded.total_balance, accounts = excluded.accounts, earned = excluded.earned",
+            rusqlite::params![date, ts, total, accounts, earned],
         )?;
         Ok(())
     })

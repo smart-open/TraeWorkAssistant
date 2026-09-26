@@ -215,17 +215,61 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
         })
         .collect();
     let total: f64 = accounts.iter().filter_map(|a| a.get("balance").and_then(Value::as_f64)).sum();
+    // 当日签到 reward 合计（90 天滚动签到日志；reward 列缺省时回退 message「+N」解析）
+    let checkin_reward = checkin_reward_today(&store, &today);
+    // 当日余额差分（最近一条「早于今天」的快照 → 当日总余额）；无历史快照 = 首日，无差分
+    let hist: Value = crate::store::docs::wb_credits_history_load(&store);
+    let prev_total = hist
+        .get("snapshots")
+        .and_then(Value::as_array)
+        .and_then(|snaps| {
+            snaps
+                .iter()
+                .filter(|s| s.get("date").and_then(Value::as_str).map(|d| d < today.as_str()).unwrap_or(false))
+                .filter_map(|s| s.get("total_balance").and_then(Value::as_f64))
+                .last()
+        });
+    let earned = match prev_total {
+        Some(prev) => (total - prev).max(0.0).max(checkin_reward),
+        None => checkin_reward,
+    };
     let snap = serde_json::json!({
         "date": today,
         "ts": chrono::Utc::now().timestamp_millis(),
         "total_balance": total,
         "accounts": accounts,
+        "earned": earned,
     });
     if let Err(e) = crate::store::docs::wb_credits_history_upsert(&store, &snap) {
         fs_utils::app_log(&state.data_dir, &format!("workbuddy 积分快照写入失败: {e}"));
         return;
     }
     let _ = crate::store::docs::wb_credits_history_prune(&store);
+}
+
+/// 当日签到 reward 合计（纯聚合，便于单测口径）：优先 reward 列，缺省回退 message「+N」解析
+fn checkin_reward_today(store: &std::sync::Arc<crate::store::Store>, today: &str) -> f64 {
+    let results: Value = crate::store::docs::wb_checkin_results_load(store);
+    results
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("date").and_then(Value::as_str) == Some(today))
+        .filter(|r| r.get("status").and_then(Value::as_str) == Some("success"))
+        .filter_map(|r| {
+            r.get("reward")
+                .and_then(Value::as_f64)
+                .or_else(|| parse_reward_plus(r.get("message").and_then(Value::as_str).unwrap_or("")))
+        })
+        .sum()
+}
+
+/// 快照时序读取（credits-dashboard-plan.md §4.3 最小新增命令，方案 B 前端消费）：
+/// wb_credits_history 全量（365 天，含 earned），{snapshots:[...]} 形状与 usage_fallback 读取侧一致。
+pub fn workbuddy_credits_history_list(state: &AppState) -> Result<serde_json::Value, String> {
+    let hist: Value = crate::store::docs::wb_credits_history_load(&crate::store::db(&state.data_dir));
+    Ok(hist)
 }
 
 // ── 积分用量快照回退（T4.3/F-27）────────────────────────────────────────────
@@ -680,7 +724,7 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
 }
 
 /// 全账号官方用量聚合（Buddy 积分看板「近 7 日积分消耗」主数据源）：
-/// 遍历账号池全部有凭证账号，逐个拉取官方用量明细后按日求和（31 天零填充）。
+/// 遍历账号池全部有凭证账号，逐个拉取官方用量明细后按日/按模型求和（31 天零填充）。
 /// 此前看板用快照差分（usageFallback）作唯一数据源——快照只在打开积分页且非缓存
 /// 命中时写入，未打开应用的日子无快照，7 日趋势只剩「昨天」一格。
 /// 单账号失败跳过（accounts_ok 计数），全部失败才报错并回退过期缓存（stale）。
@@ -745,8 +789,9 @@ pub fn workbuddy_usage_official_all(state: &AppState) -> Result<serde_json::Valu
         }));
     }
 
-    // 逐账号拉取 + 按日聚合（单账号失败跳过，不让一个失效凭证拖垮整板趋势）
+    // 逐账号拉取 + 按日/按模型聚合（单账号失败跳过，不让一个失效凭证拖垮整板趋势）
     let mut daily_credits: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut model_totals: std::collections::HashMap<String, (u64, f64)> = std::collections::HashMap::new();
     let mut ok = 0usize;
     let mut req_total = 0u64;
     for (id, token, domain) in &list {
@@ -758,11 +803,30 @@ pub fn workbuddy_usage_official_all(state: &AppState) -> Result<serde_json::Valu
                 let Some(u) = row.get("usage").and_then(Value::as_f64) else { continue };
                 *daily_credits.entry(date.to_string()).or_insert(0.0) += u;
             }
+            // 按模型汇总（单账号接口 31 天全窗口口径，跨账号合并；此前丢弃导致看板模型排行无数据）
+            for m in p.get("models").and_then(Value::as_array).into_iter().flatten() {
+                let Some(model) = m.get("model").and_then(Value::as_str) else { continue };
+                let e = model_totals.entry(model.to_string()).or_insert((0, 0.0));
+                e.0 += m.get("request_count").and_then(Value::as_u64).unwrap_or(0);
+                e.1 += m.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+            }
         }
     }
     if ok == 0 {
         return fail("全部账号官方用量拉取失败（凭证可能已失效，请续期后重试）");
     }
+
+    let mut models_out: Vec<serde_json::Value> = model_totals
+        .into_iter()
+        .map(|(model, (count, credit))| {
+            serde_json::json!({ "model": model, "request_count": count, "credit": credit })
+        })
+        .collect();
+    models_out.sort_by(|a, b| {
+        let ca = a.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+        let cb = b.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+        cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // 31 天零填充输出（汇总口径与单账号命令一致）
     use chrono::Datelike;
@@ -803,6 +867,7 @@ pub fn workbuddy_usage_official_all(state: &AppState) -> Result<serde_json::Valu
             "usage_this_month": usage_month,
         },
         "daily": daily_out,
+        "models": models_out,
     });
     let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
     fs_utils::app_log(

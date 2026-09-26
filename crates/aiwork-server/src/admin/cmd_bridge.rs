@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use aiwork_core::commands::{
-    accounts, api_server as api_server_cmd, checkin as checkin_cmd, misc, oauth, wb_config,
-    workbuddy,
+    accounts, api_server as api_server_cmd, checkin as checkin_cmd, misc, oauth, usage_history,
+    wb_config, workbuddy,
 };
 use aiwork_core::state::AppState;
 use axum::extract::{Path, State};
@@ -173,6 +173,10 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         }
         "refresh_remaining_credits" => accounts::refresh_remaining_credits(state).and_then(to_json),
         "credits_daily_list" => to_json(accounts::credits_daily_list(state)),
+        "usage_history" => {
+            let fresh = opt_arg(&args, "fresh")?;
+            usage_history::usage_history_fetch(state, fresh).and_then(to_json)
+        }
         "cooldown_clear" => {
             let user_id = arg(&args, "user_id")?;
             accounts::cooldown_clear(state, user_id).and_then(to_json)
@@ -448,6 +452,9 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let user_id = opt_arg(&args, "user_id")?;
             let fresh = opt_arg(&args, "fresh")?;
             workbuddy::workbuddy_credits_fetch(state, user_id, fresh).and_then(to_json)
+        }
+        "workbuddy_credits_history_list" => {
+            workbuddy::workbuddy_credits_history_list(state).and_then(to_json)
         }
         "workbuddy_editions_backfill" => {
             workbuddy::workbuddy_editions_backfill(state).and_then(to_json)

@@ -227,9 +227,15 @@ response = client.chat.completions.create(
 - **默认行为**：未显式传档位时默认注入 `high`（默认深度思考，可在 Buddy · 资源调度「资源开关」中关闭；仅对 Trae 已实证模型生效）
 - **查看**：`GET /v1/models` 返回的 `efforts` / `supported_efforts` 字段（统一档位空间）；「API 使用帮助」与两池模型目录页亦可查看
 
+`/v1/models` 各字段口径：
+
+- `context_length`：**本网关实际请求可用的上下文**（Trae 侧取 `__dev` 通道实际请求口径；双源模型按当前调度策略命中侧取值；Buddy 模型运行中冷却回退 Trae 兜底时，实际窗口以 Trae 侧口径为准，可能短暂低于声明值）——客户端应以此作为可用上限
+- `max_mode`：该模型经 `-max` 后缀 / `is_max_mode` 是否可启用 Max Mode 1M 上下文档（Trae 池专属）
+- 官网同步的「模型原始能力上限」（如 `context_length_max = 1M`）为上游声明值，**不代表网关当前请求即可兑现**；1M 仅在 Max Mode 通路内由上游决策生效，未启用 Max Mode 的请求请以 `context_length` 为准
+
 #### Max Mode（Trae 池 1M 上下文）
 
-Max Mode 为请求级能力（网关向 Trae 上游注入 `is_max_mode:1`），仅 Trae 池生效。对支持模型，启用方式二选一：
+Max Mode 为请求级能力（网关向 Trae 上游注入 `is_max_mode: true`；真机实证布尔可用，数值 `1` 被上游 4001 拒绝），仅 Trae 池生效。对支持模型，启用方式二选一：
 
 1. **`-max` 后缀（推荐）**：在支持模型的 ID 后加 `-max`，如 `glm-5.3-max`。网关自动剥离后缀、按基名匹配资源池并注入
 2. **请求体直传**：OpenAI 兼容请求体加 `"is_max_mode": true`（Anthropic 兼容端点不支持直传，请用后缀方式）

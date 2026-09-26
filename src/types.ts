@@ -686,6 +686,8 @@ export interface WbUsageOfficialAllComplete {
   stale_reason?: string;
   summary: { usage_today: number; usage_7days: number; usage_this_month: number };
   daily: { date: string; usage: number }[];
+  /** 按模型汇总（31 天全窗口、跨账号合并；stale 旧缓存可能缺省） */
+  models?: WbUsageModelPoint[];
 }
 
 /** 用量数据空态（非错误）：无账号凭证 / 快照时序不足等冷启动阶段，reason 为引导文案 */
@@ -694,7 +696,83 @@ export interface WbUsageEmpty {
   reason: string;
 }
 
-export type WbUsageOfficialAll = WbUsageOfficialAllComplete | WbUsageEmpty;
+/** 看板组件按 main 口径直接消费 complete 形状（empty 空态经状态判断处理） */
+export type WbUsageOfficialAll = WbUsageOfficialAllComplete;
+
+// ---- Trae 官网消耗明细（usage_history；积分看板官网源 + 今日消耗 KPI）----
+
+/** 单日聚合（date → 消耗合计 / 会话数 / 模型分布 / token 明细） */
+export interface UsageDayStat {
+  /** 本地自然日 YYYY-MM-DD */
+  date: string;
+  credits: number;
+  sessions: number;
+  /** 模型 → 当日消耗积分 */
+  models: Record<string, number>;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+}
+
+export interface UsageHistoryAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  /** 本次增量拉取失败但已沿用缓存时的说明；ok=false 时为失败/未拉取原因 */
+  error: string | null;
+  /** 按日期升序（缓存中全部历史） */
+  daily: UsageDayStat[];
+}
+
+export interface UsageHistoryResult {
+  fetched_at: number;
+  /** true = 纯缓存读取（未发起网络请求） */
+  cached: boolean;
+  /** true = 拉取中有账号部分时段会话数超单块分页上限（该时段数据可能不完整） */
+  truncated?: boolean;
+  accounts: UsageHistoryAccount[];
+}
+
+// ---- 本地 Token 统计（桌面版专属：扫描本机 WB/CodeBuddy 客户端会话；Web 版恒为 null）----
+
+export interface WbTokenAgg {
+  total: number;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  uncached_input: number;
+  calls: number;
+  cache_hit_rate?: number | null;
+  date?: string;
+  key?: string;
+}
+
+/** 本地 Token 统计（F-26：JSONL 解析合并双源，365 天窗口） */
+export interface WbTokenStats {
+  source: string;
+  summary: WbTokenAgg;
+  models: WbTokenAgg[];
+  projects: WbTokenAgg[];
+  daily: WbTokenAgg[];
+  daily_by_model: Record<string, WbTokenAgg[]>;
+  files_scanned: number;
+  parse_errors: number;
+  coverage_start_at: number | null;
+  coverage_end_at: number | null;
+  generated_at: number;
+  window_days: number;
+}
+
+/** WB 每日积分快照行（wb_credits_history；credits-dashboard-plan.md §2.2 方案 B 含 earned） */
+export interface WbCreditsSnapshot {
+  date: string;
+  ts: number;
+  total_balance: number;
+  /** 当日新增积分（余额差分 + 签到 reward 归并）；null/缺省 = 未统计（v2 老快照行/首日） */
+  earned?: number | null;
+  accounts: { user_id: string; balance: number | null }[];
+}
 
 /** 活动信息三端点聚合（F-51）：banner（公开）+ 付费类型 + 用量提醒 */
 export interface WbActivityInfo {
@@ -716,7 +794,7 @@ export interface WbUsageFallbackComplete {
   fetched_at_ms: number;
 }
 
-export type WbUsageFallback = WbUsageFallbackComplete | WbUsageEmpty;
+export type WbUsageFallback = WbUsageFallbackComplete;
 
 /** 积分趋势单日快照（wb_credits_history 差分推导；首日 earned/consumed 为 null） */
 export interface WbCreditsTrendSnap {

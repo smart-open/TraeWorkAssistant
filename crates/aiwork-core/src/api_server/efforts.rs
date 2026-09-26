@@ -85,9 +85,10 @@ pub fn trae_declared_unified(canonical: &str) -> Vec<String> {
 // ==================== L3 文档参考表（Trae Max Mode，issue #31 T4.1） ====================
 
 /// Trae Max Mode 支持表（2026-09 T0.3 客户端实证 + docs.trae.cn/ide_max-mode）：
-/// Max Mode 为请求级布尔字段 `is_max_mode:1` 注入（客户端门控表达式
-/// `is_max_mode:(…)&&t.isMaxMode?1:0`），非模型名变体；支持集取官方文档
-/// Max Mode 1M 上下文档（原 unified_catalog::MAX_MODE_1M 占位迁入，单一事实源）。
+/// Max Mode 为请求级布尔字段 `is_max_mode:true` 注入（issue #38 实测：布尔 true
+/// 可用，数值 1 被上游 4001 拒绝；客户端 `isMaxMode?1:0` 疑为 UI 门控表达式），
+/// 非模型名变体；支持集取官方文档 Max Mode 1M 上下文档（原
+/// unified_catalog::MAX_MODE_1M 占位迁入，单一事实源）。
 /// 表外模型不注入（未知字段不冒进，与 effort 实证表同规）
 pub const TRAE_MAX_MODE_REF: [&str; 11] = [
     "doubao-seed-evolving",

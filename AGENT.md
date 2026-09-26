@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v1.3.0
+# AGENT.md — AI Work 助手 (ai-work-assistant) v1.3.1
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > **产品形态（2026-09 Web 化转型已落地）**：Web-only 单体——`crates/aiwork-core`（业务核心，零桌面依赖）+ `crates/aiwork-server`（axum：管理面 `/api/*` + 网关 `/v1/*` + 静态托管 + 调度器），浏览器直访，Docker 部署。桌面壳（Tauri/托盘/代理/切换器/豆包/CC Switch/更新器）已整体退役并删除 `src-tauri/`（git 历史归档）。转型决策与裁剪清单见 `docs/tmp/docker-headless-server-plan.md`（ADR-1~4）。
@@ -46,7 +46,9 @@ ai-work-assistant/
 │   ├── types.ts                  # 与 Rust DTO 对齐（snake_case）
 │   ├── lib/tauri.ts              # invoke→POST /api/cmd/{name} + 实时 listen（WS 优先/SSE 回退）+ login（唯一适配层）
 │   ├── components/               # Sidebar/Toaster/PageHeader/ui + SystemDialog/GeneralSettingsPanel/AboutDialog/BrandMark
-│   └── pages/                    # Login / Dashboard / Accounts(accounts/ 子组件) / Checkin / Credits / Logs / ApiService / Settings / buddy/*
+│   └── pages/                    # Login / Dashboard / Accounts(accounts/ 子组件) / Checkin / Logs / ApiService / Settings
+│   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters；本地 token 源为桌面版专属，Web 版禁用）
+│   │                             #   buddy/*（BuddyOverview/BuddyAccounts/BuddyCheckin/BuddyApiService/BuddySettings）
 ├── crates/
 │   ├── aiwork-core/              # 业务核心：state/models/store/tasks/{trae_checkin,wb_checkin,wb_common,wb_credits,scheduler}/api_server/* + notify.rs（Bark/Server酱/webhook）
 │   └── aiwork-server/            # axum 单体：main.rs(启动序+--task-run) / admin(cmd_bridge 白名单命令桥 + sse + ws 双向推送 + ip_allow + admin_tokens + 鉴权) / static_files.rs
@@ -64,11 +66,11 @@ ai-work-assistant/
 | 账号 | `accounts_list` / `account_add_manual` / `account_delete` / `account_update` / `account_get_jwt` / `accounts_export_raw` / `accounts_import` / `accounts_import_preview` | CRUD + 掩码下发（完整 JWT 按需取）+ 导入导出（导入前预览） |
 | OAuth | `oauth_get_login_url` / `oauth_parse_callback` / `oauth_login` | Trae 粘贴回调模式：取登录链接 → 任意设备登录 → 复制回调 URL → 解析入池 |
 | 分组 | `groups_list` / `group_create` / `group_update` / `group_delete` / `group_move` | 删除分组时账号回落「未分组」 |
-| 积分 | `fetch_remaining_credits` / `fetch_credit_detail` / `refresh_remaining_credits` / `credits_daily_list` | 查询 / 明细 / 批量刷新（快照任务共用）/ 每日快照列表 |
+| 积分 | `fetch_remaining_credits` / `fetch_credit_detail` / `refresh_remaining_credits` / `credits_daily_list` / `usage_history` | 查询 / 明细 / 批量刷新（快照任务共用）/ 每日快照列表 / Trae 官网消耗明细（按本地日聚合落盘，fresh=true 增量拉取） |
 | 冷却 | `cooldown_clear` / `cooldown_clear_all` | 清除签到错误冷却 |
 | JWT | `jwt_parse` / `refresh_jwt` | 解析 / 自动续期（48h lazy gate，需 refresh_token） |
 | 签到 | `checkin_start(opts)` / `checkin_trends(days)` | `opts: {scope, user_ids?, skip_checked_in, skip_expired}`；失败自动重试 2 轮（30s/90s）；进度走 SSE |
-| WorkBuddy | `workbuddy_accounts_*` / `workbuddy_checkin_start` / `workbuddy_growth_run` / `workbuddy_checkin_results` / `workbuddy_credits_fetch` / `workbuddy_settings_*` / `workbuddy_oauth_login` / `workbuddy_usage_official` / `workbuddy_usage_fallback` / `workbuddy_activity_info` / `workbuddy_token_stats` | WB 账号/签到/成长中心/积分/官方用量（31 天分页）/快照回退/活动信息/本地 Token 统计；OAuth 为 authUrl+state 轮询（≤300s，纯 HTTP 无需粘贴） |
+| WorkBuddy | `workbuddy_accounts_*` / `workbuddy_checkin_start` / `workbuddy_growth_run` / `workbuddy_checkin_results` / `workbuddy_credits_fetch` / `workbuddy_credits_history_list` / `workbuddy_settings_*` / `workbuddy_oauth_login` / `workbuddy_usage_official` / `workbuddy_usage_official_all` / `workbuddy_usage_fallback` / `workbuddy_activity_info` | WB 账号/签到/成长中心/积分/官方用量（31 天分页，聚合含按模型汇总）/快照回退/活动信息；`workbuddy_credits_history_list` = WB 每日积分快照时序（wb_credits_history 表 365 天，含 earned = 当日余额差分与签到 reward 归并）；OAuth 为 authUrl+state 轮询（≤300s，纯 HTTP 无需粘贴）。注：本地 Token 统计（`workbuddy_token_stats`）为桌面版专属（扫描本机客户端会话文件），Web 版不提供 |
 | API 网关 | `pool_list/set/status` / `api_keys_list/save` / `api_models_list/sync` / `api_unified_models` / `api_custom_models_*` / `dispatch_policy_*` / `gateway_settings_*` / `trae_model_meta_*` | 三池调度策略（smart/priority + per_model 覆盖）、ck_ 子 Key、模型目录三源合并（四层兜底）、自定义上游、网关设置；网关常驻随服务启停（无启停命令） |
 | 用量/日志 | `api_usage_stats` / `api_wb_usage_stats` / `api_custom_usage_stats` / `api_logs_list/detail/search` / `logs_query` / `logs_clear` | 按日统计（分池）、请求日志、运行日志 |
 | 调度 | `scheduler_status` / `scheduler_config_get` / `scheduler_config_set(config)` | 任务状态（kv `scheduler_state`）+ 任务配置（kv `scheduler_cfg`：`disabled_tasks` 停用名单 + `task_times` 自定义时刻 HH:MM，未知键/非法时刻整体拒绝；缺省全开 + 默认时刻 = 推荐配置；set 为整表替换，前端须同时携带两字段） |
