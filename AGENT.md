@@ -361,7 +361,7 @@ ai-work-assistant/
 
 - **latest.json 单一清单原则**：updater（Windows 与 macOS 同源）下载安装包后与清单比对哈希，清单存在即 fail-closed——缺失 / 损坏 / 版本不符 / **目标资产未收录**任一情况直接阻止自动更新。**只上传单一平台的清单 = 另一平台全部用户自动更新被阻断**（v3.6.1 事故：清单只含 exe/msi，mac dmg 未收录，mac 更新全挂）
 - CI 双平台分别生成清单（Windows 落 `release/windows/`、mac 落 `release/mac/`，`rename_release.mjs` 仅同目录自动合并），**发布时必须人工合并为一份全资产清单再上传**；发布前逐项核对 6 资产均在 `assets` 键内
-- 清单格式契约（`updater.rs` 消费）：`{ "version": "x.y.z", "assets": { "<本地原始文件名>": "<sha256hex>" } }`，2 空格缩进、中文原样、无末尾换行；键为本地原始文件名（含空格/中文），GitHub 重写后的资产名（空格→`.`、中文→`_`）由 updater 宽松键归一匹配
+- 清单格式契约（`updater.rs` 消费）：`{ "version": "x.y.z", "assets": { "<本地原始文件名>": "<sha256hex>" } }`，2 空格缩进、中文原样、无末尾换行；键为**纯文件名**（含空格/中文），**严禁带任何本地路径前缀**（v3.6.3 事故：临时脚本把 `d:\code\...` 绝对路径写进键里，路径归一后无法匹配资产名）；GitHub 重写后的资产名（空格→`.`、中文→`_`）由 updater 宽松键归一匹配
 
 **GitHub Release 标题固定格式**：`v{MAJOR}.{MINOR}.{PATCH} 版本发布`（如 `v3.1.1 版本发布`），不额外加描述后缀
 
