@@ -182,6 +182,10 @@ pub struct Settings {
     ///（默认关；开启后切换前自动备份当前账号三件套并复制到目标账号名下）
     #[serde(default)]
     pub buddy_switch_migrate_chats: bool,
+    /// WebUI 免令牌访问（安全与管理页开关，默认关）：开启后管理面 API 跳过
+    /// Cookie 鉴权，浏览器打开即进主界面；受信任内网专用，公网部署应保持关闭
+    #[serde(default)]
+    pub web_auth_disabled: bool,
 }
 
 fn default_api_port() -> u16 {

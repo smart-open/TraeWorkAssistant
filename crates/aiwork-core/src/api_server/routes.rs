@@ -398,6 +398,15 @@ fn whitelist_error_response(model: &str, proto: Protocol) -> Response {
     }
 }
 
+/// 根路径 Web 状态页：单文件内嵌 HTML，浏览器直访即可查看网关状态
+/// （数据由页面自行拉取 /health 与鉴权端点，此处仅回静态资源）
+pub async fn status_page() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        super::status_page::STATUS_PAGE_HTML,
+    )
+}
+
 pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
     let pool = state.pool.status_list();
     let wb_pool = state.wb_pool.status_list();

@@ -127,6 +127,7 @@ pub(super) fn json_response(status: StatusCode, value: serde_json::Value) -> Res
 
 /// T7 鉴权中间件：覆盖管理面路由整体；`/api/login` 放行，
 /// 其余请求校验 Cookie `aiwork_admin=<token>` 精确匹配，失败 → 401。
+/// WebUI 免令牌开关（settings.web_auth_disabled）开启时整体跳过鉴权，即时生效。
 pub(super) async fn auth_middleware(
     State(admin): State<Arc<AdminState>>,
     req: Request,
@@ -134,6 +135,10 @@ pub(super) async fn auth_middleware(
 ) -> Response {
     // 登录端点放行（其余路径一律鉴权）
     if req.uri().path() == "/api/login" {
+        return next.run(req).await;
+    }
+    // 免令牌开关：每请求读 kv（无缓存），设置页切换后无需重启
+    if admin.state.settings().web_auth_disabled {
         return next.run(req).await;
     }
     let authorized = req

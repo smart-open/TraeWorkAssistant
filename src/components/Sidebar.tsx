@@ -78,7 +78,7 @@ export default function Sidebar({
   };
 
   return (
-    <aside className="flex w-52 shrink-0 flex-col border-r border-slate-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
+    <aside className="flex h-full w-52 shrink-0 flex-col border-r border-slate-200 bg-white dark:border-zinc-800 dark:bg-zinc-950">
       <nav className="flex-1 space-y-1 p-3">
         {nav.map((item) => {
           const Icon = item.icon;

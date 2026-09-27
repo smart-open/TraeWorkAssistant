@@ -183,6 +183,8 @@ export interface Settings {
   api_default_model: string;
   /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
   buddy_switch_migrate_chats: boolean;
+  /** WebUI 免令牌访问（安全与管理页开关，默认关）：开启后打开页面即进主界面 */
+  web_auth_disabled: boolean;
 }
 
 /** 通知渠道配置（Phase 3 T11：Bark / Server酱 / 通用 webhook，独立 kv） */

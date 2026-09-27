@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Save, ShieldCheck, KeyRound } from 'lucide-react';
+import { Save, ShieldCheck, KeyRound, Globe } from 'lucide-react';
 import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
 import { copyText } from '../lib/clipboard';
 import { api } from '../lib/tauri';
-import type { IpAllowlistConfig, AdminTokenView } from '../types';
+import type { IpAllowlistConfig, AdminTokenView, Settings } from '../types';
 
 /**
  * 安全与管理面板（系统设置弹框 · 安全与管理 Tab）：
@@ -104,6 +104,32 @@ export default function SecurityAdminPanel() {
     }
   };
 
+  // ---- WebUI 免令牌访问（settings.web_auth_disabled）----
+  const [webAuthOff, setWebAuthOff] = useState(false);
+  const [webAuthSaving, setWebAuthSaving] = useState(false);
+
+  useEffect(() => {
+    api.misc
+      .settingsGet()
+      .then((s: Settings) => setWebAuthOff(s.web_auth_disabled))
+      .catch(() => setWebAuthOff(false));
+  }, []);
+
+  const toggleWebAuth = async () => {
+    setWebAuthSaving(true);
+    try {
+      const cur = await api.misc.settingsGet();
+      const next = !webAuthOff;
+      await withMinDelay(api.misc.settingsSet({ ...cur, web_auth_disabled: next }));
+      setWebAuthOff(next);
+      toast('success', next ? '已开启免令牌访问，刷新页面即可免登录' : '已恢复令牌登录，未登录设备需重新认证');
+    } catch (e) {
+      toast('error', e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setWebAuthSaving(false);
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4 text-sm">
       {/* 管理员令牌：操作即时生效 */}
@@ -169,6 +195,32 @@ export default function SecurityAdminPanel() {
           )}
         </section>
       )}
+
+      {/* WebUI 免令牌访问：设置项即时保存生效 */}
+      <section className="card p-4">
+        <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Globe size={16} className="text-brand-500" />
+            <h3 className="font-medium">WebUI 免令牌访问</h3>
+          </div>
+          <button onClick={toggleWebAuth} disabled={webAuthSaving} className="btn-primary">
+            <Save size={15} /> {webAuthSaving ? '保存中…' : webAuthOff ? '恢复令牌登录' : '开启免令牌'}
+          </button>
+        </div>
+        <p className="text-xs text-slate-400">
+          开启后浏览器打开 WebUI 无需输入令牌，直接进入主界面（保存后即时生效，无需重启）。
+          仅建议在受信任的内网使用；公网部署请保持关闭，否则任何访问者都可操作账号与签到。
+        </p>
+        <label className="mt-3 flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={webAuthOff}
+            onChange={toggleWebAuth}
+            disabled={webAuthSaving}
+          />
+          免令牌访问{webAuthOff ? '（已开启）' : '（已关闭）'}
+        </label>
+      </section>
 
       {/* IP 允许列表：独立配置即时保存 */}
       {ipForm && (

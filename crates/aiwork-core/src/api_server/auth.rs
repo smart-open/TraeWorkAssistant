@@ -24,7 +24,9 @@ pub async fn bearer_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path() == "/health" {
+    // 根路径状态页免鉴权：页面为静态 HTML，无账号/用量数据；
+    // 页面内账号明细与模型目录由浏览器另行请求鉴权端点获得
+    if request.uri().path() == "/" || request.uri().path() == "/health" {
         return next.run(request).await;
     }
 

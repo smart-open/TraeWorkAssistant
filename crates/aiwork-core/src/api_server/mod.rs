@@ -15,6 +15,7 @@ pub mod routes;
 pub mod runtime;
 pub mod server;
 pub mod sse;
+pub mod status_page;
 pub mod unified_catalog;
 pub mod usage;
 pub mod wb_catalog;
