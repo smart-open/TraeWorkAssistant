@@ -245,6 +245,8 @@ export interface Settings {
   /** 启动静默签到：启动 60s 后对未签到账号自动执行一轮签到（T11） */
   silent_checkin: boolean;
   auto_start_proxy: boolean;
+  /** 启动时自动开启 API 网关（7864） */
+  auto_start_api: boolean;
   tray: boolean;
   language: string;
   checkin_skip_checked: boolean;
