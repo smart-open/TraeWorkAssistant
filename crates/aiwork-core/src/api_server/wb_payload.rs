@@ -12,6 +12,8 @@
 //! 另：连续同角色消息自动合并（生态实测，§5.8 #9）。
 
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
 
 /// 默认审核模板映射（映射表文件缺失时的内置兜底，§5.5 #9：
 /// CLI→CLI tool、based on→built on——任何一字改动即绕过逐字匹配）。
@@ -56,6 +58,54 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You are an interactive agent in TraeCode that helps the USER with software engineering tasks.".to_string(),
             "You are an interactive agent running in TraeCode that helps the USER with software engineering tasks.".to_string(),
         ),
+        // issue #57 预防性布防：REASONIX/DSH 等第三方客户端指纹句（无真实请求
+        // 日志可查证，按常见开源 CLI harness 身份句先布防——未命中即无操作）。
+        // 上线后从请求日志（debug）核实触发句，通过 KV wb_template_map.json
+        // 热更新迭代精确规则，无须发版
+        (
+            "You are Cline, a highly skilled software engineer with extensive knowledge".to_string(),
+            "You are Cline, a highly capable software engineering assistant with extensive knowledge"
+                .to_string(),
+        ),
+        (
+            "You are Roo, a highly skilled software engineer with extensive knowledge".to_string(),
+            "You are Roo, a highly capable software engineering assistant with extensive knowledge"
+                .to_string(),
+        ),
+        (
+            "You are an interactive CLI agent specializing in software engineering tasks."
+                .to_string(),
+            "You are an interactive CLI assistant specializing in software engineering tasks."
+                .to_string(),
+        ),
+        // OpenCode harness（公开 prompt 可查证，issue #57 布防）：按 provider
+        // 分多套 flavor，首句身份声明各不相同，逐条最小改写（含大小写变体）
+        (
+            "You are opencode, an interactive CLI tool that helps users with software engineering tasks."
+                .to_string(),
+            "You are opencode, an interactive CLI assistant that helps users with software engineering tasks."
+                .to_string(),
+        ),
+        (
+            "You are OpenCode, You and the user share the same workspace.".to_string(),
+            "You are OpenCode, You and the user work in the same workspace.".to_string(),
+        ),
+        (
+            "You are OpenCode, the best coding agent on the planet.".to_string(),
+            "You are OpenCode, a top coding agent for software engineering.".to_string(),
+        ),
+        (
+            "You are opencode, an interactive CLI agent specializing in software engineering tasks."
+                .to_string(),
+            "You are opencode, an interactive CLI assistant specializing in software engineering tasks."
+                .to_string(),
+        ),
+        (
+            "You are operating as and within the OpenCode CLI, a terminal-based agentic coding assistant built by OpenAI."
+                .to_string(),
+            "You are operating as and within the OpenCode CLI, a terminal-based agentic coding tool built by OpenAI."
+                .to_string(),
+        ),
     ]
 }
 
@@ -91,6 +141,43 @@ impl TemplateMapFile {
     }
 }
 
+/// 模板映射命中计数（issue #57 指纹反查）：
+/// 热路径仅内存计数（命中才加锁）；11128 强制清洗重试 / 空完成换号重试等
+/// 风控命中路径用 template_hit_note() 导出随日志落盘——ZCode/DSH/REASONIX
+/// 等无公开资料客户端的迭代通道：从日志反查精确触发句 → 热更新规则表
+fn hit_counter() -> &'static Mutex<BTreeMap<String, u64>> {
+    static HITS: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+    HITS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn record_hit(from: &str, to: &str) {
+    if let Ok(mut m) = hit_counter().lock() {
+        *m.entry(format!("{from} → {to}")).or_insert(0) += 1;
+    }
+}
+
+/// 命中统计全文（"from → to ×N; ..."；无命中返回 None）
+pub fn template_hit_summary() -> Option<String> {
+    let m = hit_counter().lock().ok()?;
+    if m.is_empty() {
+        return None;
+    }
+    Some(
+        m.iter()
+            .map(|(k, v)| format!("{k} ×{v}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// 错误日志附注（无命中返回空串）：拼在「空完成 → 换号重试」等 note 之后
+pub fn template_hit_note() -> String {
+    match template_hit_summary() {
+        Some(s) => format!("；模板命中: {s}"),
+        None => String::new(),
+    }
+}
+
 /// 审核模板黑名单最小改写：映射表为空才跳过（不做硬编码关键词预检——
 /// 外置映射表新增规则的命中词可能不含内置三短语，预检会永久漏改）；
 /// 条目少（个位数），逐条 contains 代价可接受
@@ -102,6 +189,7 @@ pub fn apply_template_map(text: &str, templates: &[(String, String)]) -> String 
     for (from, to) in templates {
         if out.contains(from.as_str()) {
             out = out.replace(from.as_str(), to.as_str());
+            record_hit(from, to);
         }
     }
     out
@@ -384,6 +472,24 @@ mod tests {
     use serde_json::json;
 
     const NO_TPL: &[(String, String)] = &[];
+
+    #[test]
+    fn template_hit_counter_records_and_exports() {
+        // 命中即计数（issue #57 指纹反查）：summary/note 导出 from→to 与次数
+        let tpls = vec![("FP_PROBE_FROM".to_string(), "FP_PROBE_TO".to_string())];
+        let out = apply_template_map("before FP_PROBE_FROM after", &tpls);
+        assert_eq!(out, "before FP_PROBE_TO after");
+        let summary = template_hit_summary().expect("命中后 summary 不应为空");
+        assert!(summary.contains("FP_PROBE_FROM → FP_PROBE_TO"), "{summary}");
+        assert!(summary.contains("×1"), "{summary}");
+        let note = template_hit_note();
+        assert!(note.contains("模板命中: "), "{note}");
+        assert!(note.contains("FP_PROBE_FROM → FP_PROBE_TO"), "{note}");
+        // 未命中不计数：只含上面那一条
+        let _ = apply_template_map("no match here", &tpls);
+        let again = template_hit_summary().unwrap();
+        assert_eq!(again.matches("FP_PROBE_FROM → FP_PROBE_TO").count(), 1);
+    }
 
     fn rewrite(v: Value, effort: Option<&str>) -> Value {
         let src = serde_json::to_vec(&v).unwrap();

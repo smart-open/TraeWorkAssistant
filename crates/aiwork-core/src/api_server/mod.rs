@@ -428,6 +428,42 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     }
 }
 
+// ==================== 空完成识别（issue #57：影子风控） ====================
+
+/// 空完成哨兵码：上游 HTTP 200 正常收流但零内容（影子风控静默拦截 / 上游异常）。
+/// 取负数避免与上游业务码（正整数）冲突；SSE 转换层不发收尾帧、以该哨兵上抛，
+/// 调用方按可重试失败换号处理（is_empty_completion 识别）
+pub const EMPTY_COMPLETION_CODE: i64 = -9901;
+pub const EMPTY_COMPLETION_MSG: &str =
+    "empty completion: upstream returned a completed response with no content";
+
+/// 判定是否空完成哨兵（流式转换层上抛 / 聚合响应零内容共用）
+pub fn is_empty_completion(code: i64, msg: &str) -> bool {
+    code == EMPTY_COMPLETION_CODE || msg.starts_with("empty completion:")
+}
+
+/// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
+/// 无正文 + 无思考链 + 无工具调用即视为空完成（换号重试）
+pub fn aggregated_response_is_empty(r: &serde_json::Value) -> bool {
+    // Anthropic message：顶层 content 块数组
+    if let Some(blocks) = r.get("content").and_then(|c| c.as_array()) {
+        return blocks.is_empty();
+    }
+    // OpenAI chat（message.content/reasoning_content/tool_calls）与
+    // legacy text（choices[0].text）统一判定（缺字段视为空）
+    let empty_at = |p: &str| -> bool {
+        r.pointer(p)
+            .and_then(|v| v.as_str())
+            .map_or(true, str::is_empty)
+    };
+    empty_at("/choices/0/message/content")
+        && empty_at("/choices/0/message/reasoning_content")
+        && r.pointer("/choices/0/message/tool_calls")
+            .and_then(|t| t.as_array())
+            .map_or(true, |a| a.is_empty())
+        && empty_at("/choices/0/text")
+}
+
 /// 流式上游 Agent：无总超时；连接 10s / 写 30s / 空闲读 300s，用于 SSE 流式对话
 /// 注意：ureq 2.12 默认不读环境变量/系统代理（需显式 proxy-from-env feature），
 /// 本 crate 未启用该 feature，天然直连，不会走本应用 127.0.0.1:8899 形成循环

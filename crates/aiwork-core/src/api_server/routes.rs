@@ -856,6 +856,87 @@ pub async fn responses_api(
     }
 }
 
+// ==================== issue #54 Claude Code 分类器模型兜底 ====================
+
+/// 剥离模型名尾部的 `[1m]` 窗口标记（Claude 1M 上下文变体后缀），ASCII 大小写不敏感。
+/// 纯字节尾比较：`[1m]` 全 ASCII（<0x80），不可能与多字节 UTF-8 尾字节混淆，
+/// 切分点必为字符边界（'[' 起点）——任何输入不 panic。不引入 to_lowercase
+/// 字节漂移（对照 wb_model_route::strip_suffix_ci 审查修复的同类切片问题）；
+/// 仅识别尾部完整标记且剥离后非空
+fn strip_bracket_1m(name: &str) -> Option<&str> {
+    const SUFFIX: &[u8] = b"[1m]";
+    let bytes = name.as_bytes();
+    // 短路顺序保证：len > 4 先于切片，不会下溢
+    if bytes.len() > SUFFIX.len()
+        && bytes[bytes.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+    {
+        Some(&name[..bytes.len() - SUFFIX.len()])
+    } else {
+        None
+    }
+}
+
+/// 三池可路由判定（Anthropic 入口兜底专用）：Custom 直达命中 /
+/// WB 路由解析命中目录且上游启用 / Trae 模型列表 canonical 命中
+fn anthropic_model_servable(state: &ApiSharedState, model: &str) -> bool {
+    if super::custom_models::find_enabled(&state.data_dir, model).is_some() {
+        return true;
+    }
+    let cfg = wb_model_route::load_config(&state.data_dir);
+    let catalog = wb_catalog::load(&state.data_dir);
+    let r = wb_model_route::resolve(&cfg, &catalog, model);
+    if state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed)
+        && wb_catalog::find(&catalog, &r.model).is_some()
+    {
+        return true;
+    }
+    super::models_sync::load_models(&state.data_dir)
+        .iter()
+        .any(|m| unified_catalog::canonical_id(&m.id) == unified_catalog::canonical_id(model))
+}
+
+/// Claude Code auto 模式（v2.1.83+）把权限审批交给独立「安全分类器」模型：
+/// 分类器以 side_query 请求本网关 `/v1/messages`，模型名为 Claude Code 服务端
+/// feature flag 下发的官方名（如 `claude-sonnet-5[1m]`）——无环境变量可覆盖，
+/// 三池不可路由时上游必 4001/失败，Claude Code 随即 fail-closed 报
+/// "temporarily unavailable (timed out)" 并阻断 Bash/Write（issue #54）。
+///
+/// 入口兜底：原名可路由 → 原样（WB 用户经内置系列 claude-* 映射的行为不变）；
+/// 剥离 `[1m]` 标记后基名可路由 → 用基名；仍不可路由的 `claude-*` 系名
+/// （Anthropic 内部名，上游不可能服务）回落网关默认模型。
+/// 返回 Some(改写后模型名)；None = 原样保留（非 claude 未知名维持透传语义）
+fn anthropic_model_fallback(state: &ApiSharedState, model: &str) -> Option<String> {
+    let m = model.trim();
+    if m.is_empty() {
+        return None;
+    }
+    // 热路径短路（零分配）：仅 claude-* 系名与带 [1m] 窗口标记的请求参与判定
+    let bytes = m.as_bytes();
+    let is_claude = bytes.len() >= 6 && bytes[..6].eq_ignore_ascii_case(b"claude");
+    let has_1m = strip_bracket_1m(m).is_some();
+    if !is_claude && !has_1m {
+        return None;
+    }
+    // ① 原名可路由（含 Custom 命中、WB 系列映射命中且启用）→ 原样保留
+    if anthropic_model_servable(state, m) {
+        return None;
+    }
+    // ② 剥 [1m] 后基名可路由（如用户以基名配置了 Custom claude 条目）→ 用基名
+    if let Some(base) = strip_bracket_1m(m) {
+        if anthropic_model_servable(state, base) {
+            return Some(base.to_string());
+        }
+    }
+    // ③ claude-* 系不可路由 → 回落网关默认模型；非 claude 未知名维持透传
+    //（与 dispatch t07 透传语义零行为差异）。边界：默认模型自身不可服务时
+    // 不再二次改写，与「未指定 model 的请求」走同一失败路径，行为一致
+    let default = state.default_model.trim();
+    if is_claude && !default.is_empty() && !default.eq_ignore_ascii_case(m) {
+        return Some(default.to_string());
+    }
+    None
+}
+
 /// Anthropic Messages 端点（F-39：+Anthropic 适配）
 /// 请求：POST /v1/messages，鉴权支持 x-api-key 或 Authorization: Bearer
 pub async fn messages(
@@ -894,12 +975,37 @@ pub async fn messages(
         );
     }
     let stream = peek.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let model = peek
+    let mut model = peek
         .get("model")
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // issue #54 分类器模型兜底：改写原子生效——peek 插入与 body 重序列化任一步
+    // 失败则整体跳过（model 变量与请求体模型名永不不一致），保证调度、outbound
+    // 转换与白名单准入使用同一（可路由）模型名
+    let mut peek = peek;
+    let mut body = body;
+    if let Some(rewritten) = anthropic_model_fallback(&state, &model) {
+        let new_body = peek
+            .as_object_mut()
+            .map(|obj| {
+                obj.insert("model".into(), serde_json::Value::String(rewritten.clone()));
+            })
+            .and_then(|_| serde_json::to_vec(&peek).ok())
+            .map(axum::body::Bytes::from);
+        if let Some(bytes) = new_body {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "anthropic model fallback (issue #54): model={} -> {}",
+                    model, rewritten
+                ),
+            );
+            body = bytes;
+            model = rewritten;
+        }
+    }
     // issue #26 白名单准入（空名单不限）
     if let Some(resp) = whitelist_check(&state, &model, Protocol::Anthropic) {
         return resp;
@@ -1326,6 +1432,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
+        // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
+        // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
+        let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        let templates = super::wb_route::load_templates(&state);
 
         for _ in 0..MAX_ROTATE {
             // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽
@@ -1344,10 +1454,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
-            let converted = super::payload::prepare_llm_chat_body(
+            let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
+                sanitize, &templates,
             );
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
@@ -1448,6 +1559,16 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             );
                         }
                         if let Some((code, msg)) = error_info {
+                            if super::is_empty_completion(code, &msg) {
+                                // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传，
+                                // 换号重试（收尾帧未发，重试流可在同一连接续传）
+                                state.logger.log_request_ttfb(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    200, &picked.uid, duration_ms, ttfb_ms, &key_name,
+                                    &state.pool.name_of(&picked.uid), Some(&format!("空完成 → 换号重试{}", super::wb_payload::template_hit_note())),
+                                );
+                                break; // 退出重试循环 → 换号
+                            }
                             let kind = classify_solo_error(code, &msg);
                             if kind != ErrKind::None {
                                 state.pool.note_error(&picked.uid, kind);
@@ -1480,6 +1601,29 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         return; // 流式结束后直接返回
                     }
                     Err((status, resp_body, retry_after)) => {
+                        // 11128 渠道风控（issue #57）：按请求指纹拦截、与账号/模型无关，
+                        // 换号无意义。清洗未启用时强制清洗后同号重试一次；已清洗仍命中
+                        // → 走下方 retry_plan 原样 Fatal（需更新 wb_template_map.json）
+                        if status == 400
+                            && super::retry::is_illegal_channel_error(&resp_body)
+                            && !sanitize
+                        {
+                            sanitize = true;
+                            state.logger.log_sched_event(&format!(
+                                "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
+                            ));
+                            converted = super::payload::prepare_llm_chat_body(
+                                &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                                &super::models_sync::load_models(&state.data_dir),
+                                true, &templates,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            // 断连检测：重试等待期间客户端离开则终止
+                            if tx.is_closed() {
+                                return;
+                            }
+                            continue;
+                        }
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
@@ -1669,6 +1813,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
+        // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
+        // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
+        let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        let templates = super::wb_route::load_templates(&state);
 
         for _ in 0..MAX_ROTATE {
             let mut picked = match state
@@ -1683,10 +1831,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             // F-77 账号级在途计数：取号即绑定（换号时自动解绑旧账号）
             guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
 
-            let converted = super::payload::prepare_llm_chat_body(
+            let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
+                sanitize, &templates,
             );
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
@@ -1711,6 +1860,21 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {
                             (Some(r), None) => {
+                                if super::aggregated_response_is_empty(&r) {
+                                    // 空完成（影子风控/上游异常，issue #57）：换号重试，
+                                    // 口径同下方「empty response」（Server 级短冷却）
+                                    state.pool.note_error(&picked.uid, ErrKind::Server);
+                                    state.record_usage(
+                                        false, &model, &picked.uid, &key_id, false, stream,
+                                        duration_ms, 0, 0,
+                                    );
+                                    state.logger.log_request(
+                                        "trae", "POST", proto.log_path(), &model, stream,
+                                        502, &picked.uid, duration_ms, &key_name,
+                                        &state.pool.name_of(&picked.uid), Some(&format!("空完成 → 换号重试{}", super::wb_payload::template_hit_note())),
+                                    );
+                                    break; // 换号
+                                }
                                 // 用量记账（成功：token 数从聚合响应 usage 提取）
                                 let (pt, ct) = r.get("usage").map(extract_tokens).unwrap_or((0, 0));
                                 state.record_usage(
@@ -1785,6 +1949,24 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         }
                     }
                     Err((status, resp_body, retry_after)) => {
+                        // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后同号重试一次；
+                        // 已清洗仍命中 → 走下方 retry_plan 原样 Fatal
+                        if status == 400
+                            && super::retry::is_illegal_channel_error(&resp_body)
+                            && !sanitize
+                        {
+                            sanitize = true;
+                            state.logger.log_sched_event(&format!(
+                                "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
+                            ));
+                            converted = super::payload::prepare_llm_chat_body(
+                                &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                                &super::models_sync::load_models(&state.data_dir),
+                                true, &templates,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        }
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
@@ -2277,6 +2459,83 @@ mod tests {
         let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["code"], "model_not_found");
+    }
+
+    // ==================== issue #54：Claude Code 分类器模型兜底 ====================
+
+    /// `[1m]` 窗口标记剥离：仅尾部完整标记生效，剥离后非空
+    #[test]
+    fn strip_bracket_1m_tail_only() {
+        assert_eq!(strip_bracket_1m("claude-sonnet-5[1m]"), Some("claude-sonnet-5"));
+        assert_eq!(strip_bracket_1m("glm-5.3[1M]"), Some("glm-5.3"));
+        assert_eq!(strip_bracket_1m("claude-sonnet-5[1m]x"), None, "非尾部标记不剥");
+        assert_eq!(strip_bracket_1m("[1m]"), None, "剥离后为空不剥");
+        assert_eq!(strip_bracket_1m("claude-sonnet-5"), None);
+    }
+
+    /// 多字节字符 + 大小写字节长度变化：字节尾比较不 panic、不切错位置。
+    /// `ẞ`(U+1E9E,3B)→`ß`(2B)、`İ`(2B)→`i̇`(3B) 均会漂移 to_lowercase 偏移，
+    /// 旧实现（lower 偏移切原串）在 `claude-ẞ[1m]` 上越过字符边界直接 panic
+    #[test]
+    fn strip_bracket_1m_multibyte_case_folding_safe() {
+        assert_eq!(strip_bracket_1m("claude-ẞ[1m]"), Some("claude-ẞ"));
+        assert_eq!(strip_bracket_1m("glm-5.3İ[1M]"), Some("glm-5.3İ"));
+        // 多字节结尾/中部标记不误判
+        assert_eq!(strip_bracket_1m("中文模型"), None);
+        assert_eq!(strip_bracket_1m("模型[1m]中"), None);
+        // 4 字节以内短输入不 panic
+        assert_eq!(strip_bracket_1m("[1"), None);
+        assert_eq!(strip_bracket_1m(""), None);
+    }
+
+    /// 纯 Trae 用户（WB 关闭）：分类器官方模型名三池不可路由 → 回落网关默认模型
+    #[tokio::test]
+    async fn fallback_claude_classifier_to_default_when_unroutable() {
+        let f = wl_fixture("claude_fb");
+        f.state
+            .wb_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // 分类器 side_query 的官方模型名（issue #54 报错模型）
+        assert_eq!(
+            anthropic_model_fallback(&f.state, "claude-sonnet-5[1m]").as_deref(),
+            Some("deepseek-v4-flash")
+        );
+        // 无窗口标记的 claude 系未知名同样兜底
+        assert_eq!(
+            anthropic_model_fallback(&f.state, "Claude-Opus-5").as_deref(),
+            Some("deepseek-v4-flash")
+        );
+    }
+
+    /// WB 启用用户：claude-* 经内置系列映射命中 WB 目录 → 原样保留（行为不变）
+    #[tokio::test]
+    async fn fallback_keeps_claude_when_wb_routes_it() {
+        let f = wl_fixture("claude_wb"); // fixture 默认 wb_enabled=true，builtin 目录含 glm-5.3
+        assert!(anthropic_model_fallback(&f.state, "claude-sonnet-5[1m]").is_none());
+    }
+
+    /// 基名在目录（原名带 [1m] 不在）→ 剥标记用基名
+    #[tokio::test]
+    async fn fallback_strips_1m_when_base_routable() {
+        let f = wl_fixture("claude_1m");
+        assert_eq!(
+            anthropic_model_fallback(&f.state, "glm-5.3[1M]").as_deref(),
+            Some("glm-5.3")
+        );
+    }
+
+    /// 非 claude 未知名维持透传语义（与 dispatch t07 零行为差异）；默认模型同名不循环改写
+    #[tokio::test]
+    async fn fallback_leaves_unknown_names_passthrough() {
+        let f = wl_fixture("claude_pass");
+        f.state
+            .wb_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(anthropic_model_fallback(&f.state, "brand-new-model").is_none());
+        // 未知名带 [1m] 但基名不可路由且非 claude 系 → 原样
+        assert!(anthropic_model_fallback(&f.state, "brand-new-model[1m]").is_none());
+        // 模型名恰为默认模型 → None（不产生无意义改写）
+        assert!(anthropic_model_fallback(&f.state, "deepseek-v4-flash").is_none());
     }
 
     // ==================== issue #31 T3.2/T3.3：Trae effort wire ====================
