@@ -4,6 +4,22 @@
 
 ---
 
+## [3.6.6] · 2026-10-04 · Trae 池指纹清洗接入 + 11128/空完成感知重试（Issue #57/#54 修复批）
+
+> 范围：自 [3.6.5]（tag v3.6.5，commit 29d106a）以来的全部变更。
+
+### 修复
+
+- **[P1] Trae 池接入指纹清洗管线 + 11128 渠道拦截/空完成感知重试（issue #57「Trae 会中断」，dc3b32d/fc13a1b）**：CLI harness（REASONIX/DSH 等）的客户端身份句原样透传上游，触发渠道级风控——该拦截按**请求指纹**而非账号/模型，换模型换账号均无效，表现为 400 `code:11128`（Illegal API invocation from an unapproved channel）或 200 状态零内容完成（影子风控，客户端表现为空响应中断）。现 Trae 池复用 WB 池清洗管线：`prepare_llm_chat_body` 新增 sanitize 开关与热更新规则表参数（消息文本块 strip_cc+模板映射；tool_calls arguments 与工具描述仅模板映射，删段语义不破坏 JSON 结构），`wb_template_map.json` 默认规则新增 Cline/Roo/OpenCode 等 CLI 身份句改写（含「function → function_call 改名后仍命中」兼容）；五处链路（stream_chat/aggregate_chat/run_wb_stream/wb_aggregate_chat/wb_tool_exec_chat）11128 感知重试——未清洗时强制开启清洗**同号**重试一次（不消耗换号额度），已清洗仍命中按 Fatal 透传（提示更新规则表），`wb_tool_exec_chat` 回退轮次不消耗；空完成以哨兵码 -9901 上抛触发换号（占位帧不计入 has_content；流式不冷却不透传、聚合 Server 短冷却），三协议转换器（OpenAI/OpenAiText/Anthropic）与 wb_sse 转发器全覆盖，Anthropic 空流不再伪造空合法 message；sanitize/templates 为**请求级快照**，11128 强制清洗跨账号保持（对齐 wb_route 三处）；模板命中计数随日志导出，便于规则表逆向热更新闭环。
+- **[P2] /v1/messages 分类器模型三级兜底（issue #54，0441851）**：客户端请求携带网关不可路由的模型名（未来 claude 系名、`[1m]` 变体、上游已下线名）时原样透传致客户端 400/404；现按「Custom 直配 → WB 可路由 → 网关默认模型」三级兜底改写（claude 前缀判定字节级短路、`[1m]` 后缀剥离多字节安全），改写原子生效（peek/body/model 三处同步，任一步失败整体跳过），非 claude 且不可路由仍透传；默认模型自身不可服务时不二次改写，与「未指定 model」走同一失败路径。
+- **[P3] e2e 隧道测试偶发失败（8d540e4）**：`read_head` 会把同段到达的 body 一并读入缓冲，body 后续分段到达时测试只断言 head 即漏检；新增 `read_head_and_body` helper（先查已读缓冲，未命中再 2s 超时补读到 marker），修复 CI Intel runner 偶发失败（run 36835288825）。
+
+### 测试
+
+- cargo 单测 **584** 全绿（本周期新增：模板命中计数导出、Trae 池 body 清洗三路覆盖、/v1/messages 兜底五场景、e2e 隧道 body 补读等回归用例）。
+
+---
+
 ## [3.6.5] · 2026-10-01 · 账号槽位交叉污染防护 + WorkBuddy 指纹与凭据提取修复批
 
 > 范围：自 [3.6.4]（tag v3.6.4，commit 31fa051）以来的全部变更。

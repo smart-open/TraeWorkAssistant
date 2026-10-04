@@ -393,7 +393,7 @@ fn run_wb_stream(
     // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
     log_longctx_hint(state, &peek, model);
     let templates = load_templates(state);
-    let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+    let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
     // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）。
     // issue #25 资源池绑定：仅当 Key 约束作用域含 buddy 池时应用（绑定 trae 的
@@ -489,7 +489,7 @@ fn run_wb_stream(
         let catalog = super::wb_catalog::load(&state.data_dir);
         let effort = super::wb_catalog::find(&catalog, model)
             .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
-        let converted = wb_payload::prepare_wb_chat_body(
+        let mut converted = wb_payload::prepare_wb_chat_body(
             body_vec, model, &conv_id, effort.as_deref(), sanitize, &templates,
         );
         let mut creds = WbCreds {
@@ -560,6 +560,16 @@ fn run_wb_stream(
                     }
                     match error_info {
                         Some((code, msg)) => {
+                            if super::is_empty_completion(code, &msg) {
+                                // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传、
+                                // 不绑定粘性，换号重试（收尾帧未发，重试流可续传）
+                                state.logger.log_request_ttfb(
+                                    "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.wb_pool.name_of(win_uid), Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                                );
+                                break;
+                            }
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
                                 state.wb_pool.note_error(win_uid, kind);
@@ -606,6 +616,27 @@ fn run_wb_stream(
                     }
                 }
                 Err((status, resp_body, retry_after)) => {
+                    // 11128 渠道风控（issue #57）：按请求指纹拦截、与账号/模型无关，
+                    // 换号无意义。清洗未启用时强制清洗后同号重试一次；已清洗仍命中
+                    // → 走下方 retry_plan 原样 Fatal（需更新 wb_template_map.json）
+                    if status == 400
+                        && super::retry::is_illegal_channel_error(&resp_body)
+                        && !sanitize
+                    {
+                        sanitize = true;
+                        state.logger.log_sched_event(&format!(
+                            "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                        ));
+                        converted = wb_payload::prepare_wb_chat_body(
+                            body_vec, model, &conv_id, effort.as_deref(), true, &templates,
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        // 断连检测：重试等待期间客户端离开则终止
+                        if tx.is_closed() {
+                            return;
+                        }
+                        continue;
+                    }
                     // 分级重试策略表（T2.2/F-33 v1.2）
                     match retry_plan(status, &resp_body, same_attempt, retry_after) {
                         RetryAction::RetrySame { delay_ms } => {
@@ -692,7 +723,7 @@ pub async fn wb_aggregate_chat(
         // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
         log_longctx_hint(&state, &peek, &model);
         let templates = load_templates(&state);
-        let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
         // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
         let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
@@ -767,7 +798,7 @@ pub async fn wb_aggregate_chat(
             let catalog = super::wb_catalog::load(&state.data_dir);
             let effort = super::wb_catalog::find(&catalog, &model)
                 .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
-            let converted = wb_payload::prepare_wb_chat_body(
+            let mut converted = wb_payload::prepare_wb_chat_body(
                 &body_vec, &model, &conv_id, effort.as_deref(), sanitize, &templates,
             );
             let mut creds = WbCreds {
@@ -811,6 +842,19 @@ pub async fn wb_aggregate_chat(
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {
                             (Some(mut r), None) => {
+                                if super::aggregated_response_is_empty(&r) {
+                                    // 空完成（影子风控/上游异常，issue #57）：换号重试，
+                                    // 口径同下方「empty response」（Server 级短冷却）
+                                    state.wb_pool.note_error(win_uid, ErrKind::Server);
+                                    note_model_failure(&state, &model);
+                                    state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
+                                    state.logger.log_request_ttfb(
+                                        "buddy", "POST", "/v2/chat/completions", &model, stream, 502, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.wb_pool.name_of(win_uid), Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                                    );
+                                    break;
+                                }
                                 r["model"] = json!(model);
                                 let (pt, ct) = r.get("usage").map(|u| (
                                     u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -860,6 +904,21 @@ pub async fn wb_aggregate_chat(
                         }
                     }
                     Err((status, resp_body, retry_after)) => {
+                        // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后同号重试一次
+                        if status == 400
+                            && super::retry::is_illegal_channel_error(&resp_body)
+                            && !sanitize
+                        {
+                            sanitize = true;
+                            state.logger.log_sched_event(&format!(
+                                "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                            ));
+                            converted = wb_payload::prepare_wb_chat_body(
+                                &body_vec, &model, &conv_id, effort.as_deref(), true, &templates,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        }
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
@@ -999,7 +1058,7 @@ pub async fn wb_tool_exec_chat(
         // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let templates = load_templates(&state);
-        let sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         super::wb_toolexec::inject_proxy_tools(&mut chat_body);
         // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
         log_longctx_hint(&state, &chat_body, &model);
@@ -1100,6 +1159,10 @@ pub async fn wb_tool_exec_chat(
                         let Some(completion) = completion else {
                             break Err("上游返回空响应".to_string());
                         };
+                        if super::aggregated_response_is_empty(&completion) {
+                            // 空完成（影子风控/上游异常，issue #57）：换号重试
+                            break Err("空完成（影子风控/上游异常）".to_string());
+                        }
                         if let Some(u) = completion.get("usage") {
                             acc_usage = (
                                 acc_usage.0 + u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -1165,6 +1228,20 @@ pub async fn wb_tool_exec_chat(
                         continue;
                     }
                     Err((status, resp_body, retry_after)) => {
+                        // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后重试
+                        // （round 回退，不消耗轮次；下一轮循环顶部按新 sanitize 重建请求体）
+                        if status == 400
+                            && super::retry::is_illegal_channel_error(&resp_body)
+                            && !sanitize
+                        {
+                            sanitize = true;
+                            state.logger.log_sched_event(&format!(
+                                "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                            ));
+                            round = round.saturating_sub(1);
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        }
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;

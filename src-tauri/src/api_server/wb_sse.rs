@@ -240,6 +240,9 @@ pub fn stream_forward_ex(
     let mut parser = WbSseParser::new(lines);
     let mut sent_any = false;
     let mut failed_inline = false;
+    // 真实内容标记（正文/思考链/工具调用任一非空）：空完成（影子风控）检测依据
+    // （issue #57）；占位帧（Responses created / 空 delta chunk）不计入
+    let mut has_content = false;
     let mut usage: Option<Value> = None;
     let mut error_info: Option<(i64, String)> = None;
 
@@ -312,6 +315,17 @@ pub fn stream_forward_ex(
         match parser.next_event_polling(LINE_POLL, &|| tx.is_closed()) {
             None => break,
             Some(WbEvent::Done) => {
+                if !has_content {
+                    // 空完成（影子风控/上游异常）：不发任何收尾帧，以哨兵错误上抛
+                    // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）。
+                    // 注：Responses 协议若已发 created（空 delta chunk 触发），换号
+                    // 重试会重复 created——影子风控场景上游通常零 chunk，属可接受边界
+                    error_info = Some((
+                        super::EMPTY_COMPLETION_CODE,
+                        super::EMPTY_COMPLETION_MSG.to_string(),
+                    ));
+                    break;
+                }
                 match proto {
                     crate::api_server::routes::Protocol::Anthropic => {
                         anthropic_start(tx, &mut message_started, chat_id, model);
@@ -477,6 +491,19 @@ pub fn stream_forward_ex(
                 }
                 if let Some(x) = u {
                     usage = Some(x);
+                }
+                // 真实内容标记（issue #57 空完成检测）：空 delta chunk 不计入
+                if delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                    || delta
+                        .get("reasoning_content")
+                        .and_then(|c| c.as_str())
+                        .map_or(false, |s| !s.is_empty())
+                    || delta
+                        .get("tool_calls")
+                        .and_then(|t| t.as_array())
+                        .map_or(false, |a| !a.is_empty())
+                {
+                    has_content = true;
                 }
                 if proto == crate::api_server::routes::Protocol::Anthropic {
                     anthropic_start(tx, &mut message_started, chat_id, model);
@@ -672,6 +699,15 @@ pub fn stream_forward_ex(
 
     // 上游断流：error_info / sent_any / failed_inline 状态交由上层判定
     // （故障转移，或流内失败已收尾）
+
+    // 空完成兜底（issue #57）：EOF 且零内容零错误、客户端仍在线 → 哨兵上抛
+    // （原样收尾会让客户端收到 "empty provider response"）
+    if error_info.is_none() && !has_content && !failed_inline && !tx.is_closed() {
+        error_info = Some((
+            super::EMPTY_COMPLETION_CODE,
+            super::EMPTY_COMPLETION_MSG.to_string(),
+        ));
+    }
 
     (error_info, sent_any, failed_inline, usage)
 }

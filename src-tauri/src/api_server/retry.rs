@@ -23,6 +23,16 @@ pub fn is_thinking_signature_error(body: &str) -> bool {
     body.contains("thinking.signature")
 }
 
+/// 11128 渠道风控识别（issue #57）：上游判定「非授权渠道调用」全量拦截。
+/// 以报文关键词匹配（不裸匹配数字 11128，避免与 token 里的数字误撞）。
+/// 该拦截按请求指纹判定、与账号/模型无关，正确处置是「强制指纹清洗后
+/// 同号重试一次」（retry_plan 不感知清洗状态，升级逻辑在调用方）
+pub fn is_illegal_channel_error(body: &str) -> bool {
+    body.contains("Illegal API invocation")
+        || body.contains("unapproved channel")
+        || body.contains("\"code\":11128")
+}
+
 /// 分级重试决策（按 §3.9 ③ 表格逐行实现）
 ///
 /// - `attempt`：同一账号已尝试次数（0 = 第一次失败后决策）

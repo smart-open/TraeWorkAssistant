@@ -58,9 +58,35 @@ fn gen_uuid_like() -> String {
     )
 }
 
+/// 文本指纹清洗（issue #57）：strip_cc + 模板映射（与 WB 管线同一套规则表）
+fn sanitize_text(s: &str, templates: &[(String, String)]) -> String {
+    let washed = super::wb_payload::strip_cc_fingerprints(s);
+    super::wb_payload::apply_template_map(&washed, templates)
+}
+
+/// content 块数组/裸字符串的文本清洗
+fn sanitize_content(content: &mut Value, templates: &[(String, String)]) {
+    match content {
+        Value::Array(blocks) => {
+            for b in blocks.iter_mut() {
+                if let Some(Value::String(t)) = b.get_mut("text") {
+                    *t = sanitize_text(t, templates);
+                }
+            }
+        }
+        Value::String(s) => {
+            *s = sanitize_text(s, templates);
+        }
+        _ => {}
+    }
+}
+
 /// OpenAI 请求体 → llm_utils_chat 请求体改写
 /// llm_utils_chat 消耗通用积分(product_id 208)
 /// `models` 为同步落库的模型目录（查表定 function，热路径有缓存）
+/// `sanitize`：指纹清洗开关（沿用全局 wb_sanitize，issue #57——Trae 池此前
+/// 从不清洗，客户端 harness 身份句原样透传上游，进入风控名单即全量 11128）
+/// `templates`：热更新的指纹改写规则表（load_templates）
 pub fn prepare_llm_chat_body(
     src: &[u8],
     default_model: &str,
@@ -68,6 +94,8 @@ pub fn prepare_llm_chat_body(
     device_id: &str,
     machine_id: &str,
     models: &[super::models_sync::ModelOption],
+    sanitize: bool,
+    templates: &[(String, String)],
 ) -> Vec<u8> {
     let mut obj: Value = match serde_json::from_slice(src) {
         Ok(v) => v,
@@ -87,6 +115,18 @@ pub fn prepare_llm_chat_body(
                 // assistant tool_calls: function → function_call
                 if role == "assistant" {
                     if let Some(tcs) = m.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+                        // 指纹清洗：function arguments 为 JSON 字符串，仅模板映射
+                        //（此时尚未改名 function → function_call，先清洗再改名）
+                        if sanitize {
+                            for tc in tcs.iter_mut() {
+                                if let Some(Value::String(args)) =
+                                    tc.pointer_mut("/function/arguments")
+                                {
+                                    *args =
+                                        super::wb_payload::apply_template_map(args, templates);
+                                }
+                            }
+                        }
                         let kept: Vec<Value> = tcs
                             .iter_mut()
                             .filter_map(|tc| {
@@ -120,6 +160,12 @@ pub fn prepare_llm_chat_body(
                         );
                     }
                 }
+                // 指纹清洗：文本块 strip_cc + 模板映射
+                if sanitize {
+                    if let Some(content) = m.get_mut("content") {
+                        sanitize_content(content, templates);
+                    }
+                }
             }
         }
     }
@@ -146,6 +192,19 @@ pub fn prepare_llm_chat_body(
     // normalize tool_choice and tools (reuse existing logic)
     normalize_tool_choice(obj_mut);
     normalize_tools(obj_mut);
+
+    // 指纹清洗：工具描述仅模板映射（客户端 harness 常在工具描述注入身份痕迹）
+    if sanitize {
+        if let Some(tools) = obj_mut.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            for tool in tools.iter_mut() {
+                if let Some(Value::String(desc)) =
+                    tool.pointer_mut("/function/description")
+                {
+                    *desc = super::wb_payload::apply_template_map(desc, templates);
+                }
+            }
+        }
+    }
 
     // 添加 llm_utils_chat 必需字段
     obj_mut.insert("config_name".into(), json!(config_name));
@@ -571,7 +630,7 @@ mod tests {
         });
         let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
             serde_json::to_vec(&src).unwrap().as_slice(),
-            "DeepSeek-V4-Flash", "u", "d", "m", &models,
+            "DeepSeek-V4-Flash", "u", "d", "m", &models, true, &[],
         ))
         .unwrap();
         // 表内视图优先（id 大小写不敏感命中）
@@ -591,7 +650,7 @@ mod tests {
         });
         let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
             serde_json::to_vec(&src).unwrap().as_slice(),
-            "DeepSeek-V4-Flash", "u", "d", "m", &[],
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[],
         ))
         .unwrap();
         assert_eq!(out["function"], "solo_agent");
@@ -604,7 +663,7 @@ mod tests {
         });
         let out2: Value = serde_json::from_slice(&prepare_llm_chat_body(
             serde_json::to_vec(&src2).unwrap().as_slice(),
-            "DeepSeek-V4-Flash", "u", "d", "m", &[],
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[],
         ))
         .unwrap();
         assert_eq!(out2["function"], super::super::FUNCTION);
@@ -624,7 +683,7 @@ mod tests {
             }
             let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
                 serde_json::to_vec(&src).unwrap().as_slice(),
-                "DeepSeek-V4-Flash", "u", "d", "m", &[],
+                "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[],
             ))
             .unwrap();
             out
@@ -639,5 +698,68 @@ mod tests {
         let legacy = mk(json!(1));
         assert_eq!(legacy["prompt_max_tokens"], 168_000);
         assert_eq!(legacy["is_max_mode"], 1);
+    }
+
+    /// 指纹清洗（issue #57）：文本块 strip_cc + 模板映射、tool_calls arguments
+    /// 与工具描述仅模板映射；sanitize=false 时原样透传
+    #[test]
+    fn llm_chat_body_sanitize_washes_fingerprints() {
+        let templates = vec![
+            (
+                "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+                "You are a coding assistant, a generic CLI tool.".to_string(),
+            ),
+            (
+                "Main branch (you will usually use this with PRs)".to_string(),
+                "Default branch (you will usually use this with PRs)".to_string(),
+            ),
+        ];
+        let mk_src = || {
+            json!({
+                "model": "glm-5.3",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude."},
+                    {"role": "user", "content": "see Main branch (you will usually use this with PRs)"},
+                    {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "f", "arguments": "{\"q\":\"Main branch (you will usually use this with PRs)\"}"}}]},
+                ],
+                "tools": [{"type": "function", "function": {"name": "f", "description": "Main branch (you will usually use this with PRs)", "parameters": {}}}],
+            })
+        };
+        let wash: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&mk_src()).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &templates,
+        ))
+        .unwrap();
+        // 模板映射：身份句改写
+        assert_eq!(
+            wash["messages"][0]["content"][0]["text"],
+            "You are a coding assistant, a generic CLI tool."
+        );
+        // 模板映射：文本块
+        assert_eq!(
+            wash["messages"][1]["content"][0]["text"],
+            "see Default branch (you will usually use this with PRs)"
+        );
+        // 模板映射：function_call arguments（function → function_call 改名后仍命中）
+        assert!(wash["messages"][2]["tool_calls"][0]["function_call"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("Default branch"));
+        // 模板映射：工具描述
+        assert_eq!(
+            wash["tools"][0]["function"]["description"],
+            "Default branch (you will usually use this with PRs)"
+        );
+
+        let raw: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            serde_json::to_vec(&mk_src()).unwrap().as_slice(),
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], false, &templates,
+        ))
+        .unwrap();
+        assert_eq!(
+            raw["messages"][1]["content"][0]["text"],
+            "see Main branch (you will usually use this with PRs)"
+        );
     }
 }

@@ -173,6 +173,9 @@ fn stream_convert_src(
     let mut pending_usage: Option<Value> = None;
     let mut saw_done = false;
     let mut sent_any = false;
+    // 真实内容标记（正文/思考链/工具调用任一非空）；占位 role chunk 不计入。
+    // 空完成（影子风控）检测依据（issue #57）
+    let mut has_content = false;
     let mut error_info: Option<(i64, String)> = None;
 
     let write_chunk = |delta: Value, finish: &str, pending_usage: &Option<Value>| -> String {
@@ -252,6 +255,7 @@ fn stream_convert_src(
                         }
                     }
                     if !delta.is_empty() {
+                        has_content = true;
                         let data = write_chunk(Value::Object(delta), "", &pending_usage);
                         // 客户端断连检测：发送失败即退出读循环，释放上游与账号并发槽
                         if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
@@ -272,6 +276,15 @@ fn stream_convert_src(
                     pending_usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    if !has_content {
+                        // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
+                        // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）
+                        error_info = Some((
+                            crate::api_server::EMPTY_COMPLETION_CODE,
+                            super::EMPTY_COMPLETION_MSG.to_string(),
+                        ));
+                        break;
+                    }
                     let data = write_chunk(json!({}), &ev.finish_reason, &pending_usage);
                     if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
                         break;
@@ -307,7 +320,15 @@ fn stream_convert_src(
     }
 
     if !saw_done && error_info.is_none() {
-        let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        if !has_content && !sender.is_closed() {
+            // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）
+            error_info = Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                super::EMPTY_COMPLETION_MSG.to_string(),
+            ));
+        } else {
+            let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        }
     }
 
     (
@@ -338,6 +359,7 @@ fn stream_convert_text_src(
     let mut pending_usage: Option<Value> = None;
     let mut saw_done = false;
     let mut sent_any = false;
+    let mut has_content = false; // 空完成检测（issue #57）
     let mut error_info: Option<(i64, String)> = None;
 
     let write_chunk = |text: &str, finish: &str, usage: &Option<Value>| -> String {
@@ -374,6 +396,7 @@ fn stream_convert_text_src(
             match ev.event.as_str() {
                 "output" | "thought" => {
                     if !ev.response.is_empty() {
+                        has_content = true;
                         let data = write_chunk(&ev.response, "", &pending_usage);
                         if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
                             break;
@@ -385,6 +408,15 @@ fn stream_convert_text_src(
                     pending_usage = Some(json!(ev.usage.clone().unwrap_or(json!({}))));
                 }
                 "done" | "turn_completion" => {
+                    if !has_content {
+                        // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
+                        // 调用方换号重试（issue #57）
+                        error_info = Some((
+                            crate::api_server::EMPTY_COMPLETION_CODE,
+                            super::EMPTY_COMPLETION_MSG.to_string(),
+                        ));
+                        break;
+                    }
                     let data = write_chunk("", &ev.finish_reason, &pending_usage);
                     if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
                         break;
@@ -420,7 +452,15 @@ fn stream_convert_text_src(
     }
 
     if !saw_done && error_info.is_none() {
-        let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        if !has_content && !sender.is_closed() {
+            // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）
+            error_info = Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                super::EMPTY_COMPLETION_MSG.to_string(),
+            ));
+        } else {
+            let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        }
     }
 
     (error_info, sent_any, pending_usage)
@@ -830,6 +870,15 @@ fn stream_convert_anthropic_src(
                     if !ev.finish_reason.is_empty() {
                         finish_reason = ev.finish_reason;
                     }
+                    if !(message_started || !tools.is_empty()) {
+                        // 空完成（影子风控/上游异常）：不发 message_delta/message_stop，
+                        // 以哨兵错误上抛调用方换号重试（issue #57）
+                        error_info = Some((
+                            crate::api_server::EMPTY_COMPLETION_CODE,
+                            super::EMPTY_COMPLETION_MSG.to_string(),
+                        ));
+                        break;
+                    }
                     start_message!();
                     finish_stream!();
                     saw_done = true;
@@ -865,9 +914,12 @@ fn stream_convert_anthropic_src(
             // 上游未发 done 即断流：把已收到的内容按正常收尾发出，避免客户端挂起
             finish_stream!();
         } else if error_info.is_none() {
-            // 空流：发一个空的合法 message
-            start_message!();
-            finish_stream!();
+            // 空流：以空完成哨兵上抛（原发一个空的合法 message，issue #57 改为
+            // 换号重试，避免客户端收到 "empty provider response"）
+            error_info = Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                super::EMPTY_COMPLETION_MSG.to_string(),
+            ));
         }
     }
 
@@ -1129,5 +1181,87 @@ mod tests {
         assert_eq!(without_created(&a), without_created(&b));
         assert!(a.contains("\"finish_reason\":\"stop\""));
         assert!(a.ends_with("data: [DONE]"));
+    }
+
+    // ==================== 空完成哨兵（issue #57 影子风控）====================
+
+    #[test]
+    fn empty_completion_done_without_output_returns_sentinel() {
+        // 只有 done 帧零内容：不发收尾帧，以哨兵错误上抛调用方换号重试
+        let input = "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+        );
+        let (code, msg) = error_info.expect("空完成必须返回哨兵错误");
+        assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
+        assert!(crate::api_server::is_empty_completion(code, &msg));
+        assert!(!sent_any, "零内容不得置 sent_any");
+        let joined = collect_events(rx).join("\n");
+        assert!(
+            !joined.contains("data: [DONE]"),
+            "空完成不发收尾帧，客户端不得误认为正常结束"
+        );
+    }
+
+    #[test]
+    fn empty_completion_eof_without_output_returns_sentinel() {
+        // 上游直接 EOF（无 done 帧零输出）：EOF 兜底同样命中哨兵
+        let input = ": keep-alive\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+        );
+        let (code, msg) = error_info.expect("EOF 零内容必须返回哨兵错误");
+        assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
+        assert!(!sent_any);
+        assert!(!collect_events(rx).join("\n").contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn normal_done_with_output_not_flagged_empty() {
+        // 对照组：有内容时 done 正常收尾，无哨兵且发 [DONE]
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+        );
+        assert!(error_info.is_none(), "有内容不得触发哨兵");
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("hi"), "output 文本应已转发");
+        assert!(joined.ends_with("data: [DONE]"));
+    }
+
+    #[test]
+    fn aggregated_response_empty_detection() {
+        // OpenAI chat：content/reasoning/tool_calls/text 全空 → 空
+        let empty = serde_json::json!({
+            "choices": [{"message": {"content": "", "reasoning_content": ""}, "finish_reason": "stop"}]
+        });
+        assert!(crate::api_server::aggregated_response_is_empty(&empty));
+        // 缺字段同样视为空
+        assert!(crate::api_server::aggregated_response_is_empty(&serde_json::json!({"choices": [{}]})));
+        // 有内容 → 非空
+        let with = serde_json::json!({
+            "choices": [{"message": {"content": "hi"}}]
+        });
+        assert!(!crate::api_server::aggregated_response_is_empty(&with));
+        // 仅有 tool_calls → 非空
+        let tools = serde_json::json!({
+            "choices": [{"message": {"content": "", "tool_calls": [{"id": "t1"}]}}]
+        });
+        assert!(!crate::api_server::aggregated_response_is_empty(&tools));
+        // Anthropic message：顶层 content 块数组为空 → 空
+        assert!(crate::api_server::aggregated_response_is_empty(&serde_json::json!({"content": []})));
+        // Anthropic 有文本块 → 非空
+        let blocks = serde_json::json!({"content": [{"type": "text", "text": "hi"}]});
+        assert!(!crate::api_server::aggregated_response_is_empty(&blocks));
     }
 }
