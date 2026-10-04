@@ -28,22 +28,37 @@ use crate::state::AppState;
 use super::common::ide_data_dir;
 
 fn cli_dir() -> Option<PathBuf> {
-    // macOS 适配预留：与 cli_status.rs::cli_status_path 同款主目录分支——
-    // Windows USERPROFILE / macOS HOME，建议两处统一收敛为一个 home_dir() 助手
-    std::env::var("USERPROFILE")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".qoder-cn"))
+    // 主目录收口（跨平台审查 2026-10-05）：统一走 platform::home_dir()
+    // （Windows=USERPROFILE / macOS=HOME），env 缺失时返回空 PathBuf → None
+    let home = crate::platform::home_dir();
+    if home.as_os_str().is_empty() {
+        None
+    } else {
+        Some(home.join(".qoder-cn"))
+    }
 }
 
 /// QoderWork 客户端数据目录（疑点④）：Electron userData 根，0.4.3 起与 IDE
-/// 拆分独立布局（对照 switcher/profile.rs QoderWork data_dir 实测修正值）；
-/// 登录会话 = Local State（Cookies 解密密钥）+ Network\Cookies（qoderuid）。
-/// macOS 适配预留：APPDATA 为 Windows 专属，macOS 同构路径为
-/// ~/Library/Application Support/com.qodercn.app.stable（profile.rs L250）
+/// 拆分独立布局；登录会话 = Local State（Cookies 解密密钥）+ Cookies（会话）。
+/// 三平台收口（跨平台审查 2026-10-05）：Windows=%APPDATA%\com.qodercn.app.stable /
+/// macOS=~/Library/Application Support/com.qodercn.app.stable（对齐
+/// switcher/profile.rs QoderWork data_dir）/ 其他平台回退 APPDATA。
 fn work_data_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA")
-        .ok()
-        .map(|d| PathBuf::from(d).join("com.qodercn.app.stable"))
+    #[cfg(target_os = "macos")]
+    {
+        let root = crate::platform::app_support_root_lossy();
+        if root.as_os_str().is_empty() {
+            None
+        } else {
+            Some(root.join("com.qodercn.app.stable"))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var("APPDATA")
+            .ok()
+            .map(|d| PathBuf::from(d).join("com.qodercn.app.stable"))
+    }
 }
 
 /// 9 项清单（id, label, detail）——存在性检查在命令层动态计算。

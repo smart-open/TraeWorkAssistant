@@ -100,6 +100,8 @@ hmac = "0.12"
 sha1 = "0.10"
 aes = "0.8"
 cbc = "0.1"
+# qoder_common CrossProcLock mac 实装：flock(2) 跨进程互斥（对齐 Windows 命名 Mutex）
+libc = "0.2"
 
 # dev/test 构建对依赖开优化：Stronghold 快照加密派生等在未优化下极慢（写一次 ~100s）
 [profile.dev.package."*"]

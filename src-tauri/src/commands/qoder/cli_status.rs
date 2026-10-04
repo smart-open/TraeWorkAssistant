@@ -9,16 +9,15 @@
 use serde_json::{json, Value};
 
 /// CLI status 文件：`~/.qoder-cn/.qoder-app-status.json`
-/// macOS 适配预留：`.qoder-cn` 目录名本身跨平台同构（CLI 官方约定），仅主目录
-/// 变量需分支——Windows 用 USERPROFILE，macOS 用 HOME（或统一 dirs::home_dir()）；
-/// macOS 下本函数当前返回 None → available=false（fail-safe），不阻塞其他功能
+/// 主目录收口（跨平台审查 2026-10-05）：统一走 platform::home_dir()
+/// （Windows=USERPROFILE / macOS=HOME），`.qoder-cn` 目录名跨平台同构；
+/// env 缺失返回 None → available=false（fail-safe），不阻塞其他功能
 fn cli_status_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("USERPROFILE").ok()?;
-    let home = home.trim();
-    if home.is_empty() {
+    let home = crate::platform::home_dir();
+    if home.as_os_str().is_empty() {
         return None;
     }
-    Some(std::path::PathBuf::from(home).join(".qoder-cn").join(".qoder-app-status.json"))
+    Some(home.join(".qoder-cn").join(".qoder-app-status.json"))
 }
 
 /// status 原文 → 脱敏视图（白名单字段透传；schema_version 等非展示字段丢弃）
@@ -39,7 +38,7 @@ fn parse_status(raw: &str) -> Value {
 #[tauri::command]
 pub fn qoder_cli_status() -> Value {
     let Some(path) = cli_status_path() else {
-        return json!({ "available": false, "reason": "无法定位用户主目录（USERPROFILE 未设置）" });
+        return json!({ "available": false, "reason": "无法定位用户主目录" });
     };
     if !path.exists() {
         return json!({

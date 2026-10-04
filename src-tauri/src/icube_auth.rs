@@ -98,7 +98,7 @@ pub fn tc_decrypt(b64: &str, private_mode: bool) -> Result<String, String> {
 /// 设备凭证：deviceId（数字串，与 storage.json 键内嵌一致）+ EC P-256 私钥 PEM
 /// + machineId（同 storage.json telemetry.machineId，DeviceInfo 构造用）
 /// + appVersion（安装目录 package.json version，DeviceInfo.ClientVersion 用）
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DeviceCredential {
     pub device_id: String,
     pub private_key_pem: String,
@@ -107,6 +107,21 @@ pub struct DeviceCredential {
     /// 来源客户端（Trae CN / TRAE SOLO CN 等），诊断日志用
     #[allow(dead_code)]
     pub source_app: String,
+}
+
+// Debug 脱敏（审查 2026-10-05）：private_key_pem 为 OAuth 设备签名私钥，
+// derive(Debug) 会随 {:?} 整串进诊断日志；手写实现将其替换为占位符，
+// 其余非敏感字段（device_id/machine_id/app_version/source_app）原样展示。
+impl std::fmt::Debug for DeviceCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCredential")
+            .field("device_id", &self.device_id)
+            .field("private_key_pem", &"[REDACTED]")
+            .field("machine_id", &self.machine_id)
+            .field("app_version", &self.app_version)
+            .field("source_app", &self.source_app)
+            .finish()
+    }
 }
 
 /// mac 客户端版本号（DeviceInfo.ClientVersion 用）：安装 bundle Info.plist 的

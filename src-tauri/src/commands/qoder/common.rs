@@ -355,15 +355,28 @@ pub(crate) fn ide_exe_candidates(state: &AppState) -> Vec<PathBuf> {
     out
 }
 
-/// IDE 数据目录（M0 实测修正：`%APPDATA%\QoderCN`，与 switcher Qoder 档案 data_dir 同源）
-/// macOS 适配预留：Qoder IDE（VS Code fork）预期数据目录为
-/// `~/Library/Application Support/QoderCN`（Electron app.getPath('userData') 惯例），
-/// 需真机实测确认；实现层建议改用 `dirs::home_dir()` + 固定拼接替代 APPDATA 环境变量，
-/// 返回值语义（Option<PathBuf>）与调用方均不变
+/// IDE 数据目录（M0 实测修正：Windows=`%APPDATA%\QoderCN`，与 switcher Qoder 档案
+/// data_dir 同源）。macOS 实装（2026-10-05 合并审查）：Electron userData 惯例
+/// `~/Library/Application Support/QoderCN`，经 platform 基根收口（与 profile.rs
+/// roaming_dir("QoderCN") 同源）——目录名待真机实测确认前仅影响环境检测/重置展示，
+/// 不影响切换灰度（Qoder mac_supported=false）
 pub(crate) fn ide_data_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA")
-        .ok()
-        .map(|d| PathBuf::from(d).join("QoderCN"))
+    #[cfg(windows)]
+    {
+        std::env::var("APPDATA")
+            .ok()
+            .map(|d| PathBuf::from(d).join("QoderCN"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(crate::platform::app_support_root_lossy().join("QoderCN"))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::env::var("APPDATA")
+            .ok()
+            .map(|d| PathBuf::from(d).join("QoderCN"))
+    }
 }
 
 /// QoderWork exe 候选：settings.qoderwork_path 人工指定优先，否则默认安装布局。
@@ -486,10 +499,11 @@ pub fn qoder_env_check(state: State<AppState>) -> serde_json::Value {
         .find(|p| p.exists());
     let data_dir = ide_data_dir();
     let data_dir_str = data_dir.as_ref().map(|p| p.to_string_lossy().to_string());
-    // macOS 适配预留：USERPROFILE 为 Windows 专属主目录变量，macOS 下为空字符串
-    // → cli_dir_exists 恒 false（fail-safe 不报错）。macOS 实装：改用
-    // `std::env::var("HOME")` 或 dirs crate home_dir()，.qoder-cn 路径本身同构
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    // CLI 目录（~/.qoder-cn，路径名跨平台同构）：主目录经 platform::home_dir 收口
+    // （Windows=USERPROFILE / mac=HOME）——原直读 USERPROFILE 在 mac 恒缺失，
+    // cli_dir_exists 恒 false（2026-10-05 合并审查实装）
+    let home = crate::platform::home_dir();
+    let cli_dir = home.join(".qoder-cn");
     // 版本号（对齐 Trae/Buddy 顶栏 hover：exe ProductVersion，PowerShell 子进程读取）
     let ide_version = exe
         .as_ref()
@@ -507,8 +521,8 @@ pub fn qoder_env_check(state: State<AppState>) -> serde_json::Value {
         "ide_version": ide_version,
         "ide_data_dir": data_dir_str,
         "ide_data_dir_exists": data_dir.map(|p| p.exists()).unwrap_or(false),
-        "cli_dir": home,
-        "cli_dir_exists": !home.is_empty() && PathBuf::from(&home).join(".qoder-cn").exists(),
+        "cli_dir": cli_dir.to_string_lossy().to_string(),
+        "cli_dir_exists": !home.as_os_str().is_empty() && cli_dir.exists(),
         // QoderWork：Qoder CN 本体（Electron，0.4.3 起与 IDE 拆分，userData=
         // %APPDATA%\com.qodercn.app.stable），exe 装机检测走 Launcher 形态；
         // ide_data_dir（%APPDATA%\QoderCN）专属拆分后的 IDE

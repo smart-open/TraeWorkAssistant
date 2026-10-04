@@ -92,6 +92,7 @@ dependencies = [
  "hyper-util",
  "if-addrs",
  "keyring",
+ "libc",
  "lnk",
  "md-5",
  "num-bigint",

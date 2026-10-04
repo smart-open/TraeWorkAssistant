@@ -994,7 +994,12 @@ pub fn sync_pool_expiry(state: &AppState, aid: &str, creds: &QoderCreds) {
         }
     }
     if changed {
-        let _ = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool);
+        if let Err(e) = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool)
+        {
+            // 回写失败不可静默（审查 2026-10-05）：过期时间/登录态丢失会导致调度
+            // 口径滞后，落日志便于事后排查（调用方为调度通道，无法再上抛）
+            fs_utils::app_log(&state.data_dir, &format!("[qoder] 池回写失败: {e}"));
+        }
     }
 }
 
@@ -1020,7 +1025,11 @@ pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
         }
     }
     if changed {
-        let _ = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool);
+        // 回写失败落日志（审查 2026-10-05，sync_pool_expiry 同款）；成功日志保留其后
+        if let Err(e) = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool)
+        {
+            fs_utils::app_log(&state.data_dir, &format!("[qoder] 池回写失败: {e}"));
+        }
         fs_utils::app_log(
             &state.data_dir,
             &format!("[qoder] 账号 {acct_id} 已标记需重新登录（{reason}）"),
@@ -1056,27 +1065,28 @@ pub struct CrossProcLock {
 
 /// 跨进程锁获取失败原因（可观测：创建失败 ≠ 真被占用——2026-10-04 排查教训：
 /// 锁名误用多段路径时 CreateMutexW 恒报 ERROR_PATH_NOT_FOUND(3)，旧实现一律
-/// 误报「另一进程正在执行」，调度器每分钟空转 skip 且刷新永不执行）
-/// 构造点全在 cfg(windows) 的 try_acquire——mac 构建未消费（mac 跨进程互斥
-/// 待实装：flock/文件锁，见平台注释）
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+/// 误报「另一进程正在执行」，调度器每分钟空转 skip 且刷新永不执行）。
+/// 跨平台（审查 2026-10-05）：Windows=CreateMutexW/WaitForSingleObject 错误码，
+/// macOS=flock(2) errno（CreateFailed/WaitFailed 携带 raw_os_error）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrossProcLockFail {
-    /// CreateMutexW 失败（内核错误码）——锁机制本身不可用，非他方占用
+    /// 锁创建失败（Win32 err / errno）——锁机制本身不可用，非他方占用
     CreateFailed(u32),
     /// 对方持有中，等待 wait_ms 超时——真占用，幂等跳过无损失
     Busy,
-    /// WaitForSingleObject 系统级失败（内核错误码）
+    /// 锁等待系统级失败（Win32 err / errno）
     WaitFailed(u32),
 }
 
 impl CrossProcLockFail {
     /// 人类可读描述（调用方拼进 skip 日志，便于一眼区分误报与真占用）
     pub fn describe(&self) -> String {
+        // 错误码语义标签随平台（Win32 GetLastError / POSIX errno）
+        let label = if cfg!(windows) { "Win32" } else { "errno" };
         match self {
-            Self::CreateFailed(e) => format!("锁创建失败（Win32 err={e}，非他方占用）"),
+            Self::CreateFailed(e) => format!("锁创建失败（{label} err={e}，非他方占用）"),
             Self::Busy => "他方进程持有中（等待超时）".to_string(),
-            Self::WaitFailed(e) => format!("锁等待系统失败（Win32 err={e}）"),
+            Self::WaitFailed(e) => format!("锁等待系统失败（{label} err={e}）"),
         }
     }
 }
@@ -1146,11 +1156,89 @@ impl Drop for CrossProcLock {
     }
 }
 
-/// 非 Windows 平台占位（本项目仅 Windows 发布，保 CI 单测可编译）
-#[cfg(not(windows))]
+/// macOS 实装（审查 2026-10-05）：flock(2) 锁文件，对齐 Windows 命名 Mutex 的
+/// 「进程崩溃由 OS 回收」语义——fd 关闭（Drop/进程退出）即自动释放。锁文件
+/// `data_dir/conf/crossproc_{safe_scope}.{hash16}`，hash16 沿用 data_dir 短哈希
+/// 隔离（便携版多数据目录互不误伤）；scope 白名单外字符替换为 `_`（Windows 锁名
+/// 单段名教训的文件系统对应物——路径分隔符会把锁文件写进子目录）。等待策略：
+/// LOCK_EX|LOCK_NB 每 25ms 轮询至 wait_ms 超时（WaitForSingleObject 的最小等价物）。
+#[cfg(target_os = "macos")]
+pub struct CrossProcLock {
+    /// 持有锁文件句柄：Drop 关闭 fd 即释放 flock
+    _file: std::fs::File,
+}
+
+#[cfg(target_os = "macos")]
+impl CrossProcLock {
+    /// 尝试在 wait_ms 内获取 flock；成功返回 Some(guard)，失败返回 None + 具体原因
+    /// （Busy=他方持有超时，CreateFailed=锁文件创建失败，WaitFailed=flock 系统错误）
+    pub fn try_acquire(
+        data_dir: &std::path::Path,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        use std::os::unix::io::AsRawFd;
+        let safe_scope: String = scope
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        let mut h = Sha256::new();
+        h.update(data_dir.to_string_lossy().as_bytes());
+        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let lock_dir = data_dir.join("conf");
+        if let Err(e) = std::fs::create_dir_all(&lock_dir) {
+            return (
+                None,
+                Some(CrossProcLockFail::CreateFailed(e.raw_os_error().unwrap_or(0) as u32)),
+            );
+        }
+        let path = lock_dir.join(format!("crossproc_{safe_scope}.{}", &hex[..16]));
+        // truncate(false)：多进程并发打开同一锁文件，截断会互相破坏 fd 偏移语义
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    None,
+                    Some(CrossProcLockFail::CreateFailed(e.raw_os_error().unwrap_or(0) as u32)),
+                );
+            }
+        };
+        // 轮询至 deadline（wait_ms=0 仅试一次，与 Windows WAIT_TIMEOUT 语义对齐）
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(wait_ms as u64);
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return (Some(Self { _file: file }), None);
+            }
+            let err = std::io::Error::last_os_error();
+            // WouldBlock（EWOULDBLOCK/EAGAIN）= 他方持有中 → 可等待重试；
+            // 其余 errno = 系统级失败
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return (
+                    None,
+                    Some(CrossProcLockFail::WaitFailed(err.raw_os_error().unwrap_or(0) as u32)),
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                return (None, Some(CrossProcLockFail::Busy));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
+/// 其他平台占位（本项目仅 Windows/macOS 发布，保 CI 单测可编译）
+#[cfg(not(any(windows, target_os = "macos")))]
 pub struct CrossProcLock;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl CrossProcLock {
     pub fn try_acquire(
         _data_dir: &std::path::Path,

@@ -199,6 +199,7 @@ fn delete_task_checked(name: &str) -> Result<(), String> {
 
 #[tauri::command(async)]
 pub fn qoder_checkin_task_register(state: State<AppState>, times: Vec<String>) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     if times.is_empty() {
         return Err("至少需要一个触发时间（如 10:15）".into());
     }
@@ -242,6 +243,7 @@ pub fn qoder_checkin_task_register(state: State<AppState>, times: Vec<String>) -
 
 #[tauri::command(async)]
 pub fn qoder_checkin_task_status() -> Result<Vec<String>, String> {
+    crate::commands::misc::schtasks_gate()?;
     let prefix = format!("{QODER_CHECKIN_TASK_PREFIX}_");
     // I15：register 侧存的是 replace(':',"") 后的 4 位数字任务名（如 1015），
     // 需还原为 HH:MM；通用 '_'→':' 替换对其恒 no-op，前端会显示成 1015
@@ -258,6 +260,7 @@ pub fn qoder_checkin_task_status() -> Result<Vec<String>, String> {
 
 #[tauri::command(async)]
 pub fn qoder_checkin_task_unregister(state: State<AppState>) -> Result<(), String> {
+    crate::commands::misc::schtasks_gate()?;
     // 删除失败如实反馈（残留任务会继续触发签到），全部成功才记「已注销」；
     // 原实现 `let _ =` 静默吞错，用户以为已注销实际任务仍在跑
     let mut failed: Vec<String> = Vec::new();

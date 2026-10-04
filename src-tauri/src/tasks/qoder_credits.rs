@@ -705,7 +705,11 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         }
     }
     if changed {
-        let _ = crate::store::docs::qoder_pool_save(&db, &pool);
+        // 回写失败落日志（审查 2026-10-05，sync_pool_expiry 同款）：余额/套餐回写
+        // 丢失仅缓存滞后，但静默丢错无法排查
+        if let Err(e) = crate::store::docs::qoder_pool_save(&db, &pool) {
+            fs_utils::app_log(&state.data_dir, &format!("[qoder-credits] 池回写失败: {e}"));
+        }
     }
     // 审查 P3：入口 now_ms 在逐账号网络拉取前取得（多账号可耗数分钟），快照 ts
     // 与缓存 fetched_at_ms 沿用入口值会让拉取耗时「吃掉」缓存 TTL（10 分钟 TTL

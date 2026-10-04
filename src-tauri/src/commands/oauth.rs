@@ -360,8 +360,10 @@ pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, Stri
     let dev = load_or_create_oauth_device(state);
     let machine_id = dev.machine_id;
     let device_id = dev.device_id;
-    // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）
-    let trace_id = random_hex(32);
+    // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）；
+    // 安全场景 CSPRNG fail-closed（审查 P3：random_hex 为 fail-open，熵源故障时
+    // 会退化为非安全值，CSRF 绑定值不可降级）
+    let trace_id = random_hex_result(32)?;
     let (pkce_verifier, code_challenge) = pkce_pair()?;
 
     // 主机名兜底（F-75 M2-2.5）：Windows 读 COMPUTERNAME；mac 无此环境变量，

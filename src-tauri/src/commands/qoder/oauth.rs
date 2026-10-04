@@ -5,9 +5,6 @@
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-// 消费点在 cfg(windows) 的 open_url 分支——mac 构建未消费（macOS 适配预留：
-// mac 实装将用 Command::new("open")，见 open_url 非 Windows 占位注释）
-#[cfg_attr(target_os = "macos", allow(unused_imports))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -33,12 +30,18 @@ impl Drop for OAuthGuard {
     }
 }
 
-/// 系统浏览器打开 URL（复用 wb oauth 同款实现：cmd /c start + raw_arg 防 & 截断）
-#[cfg(windows)]
-fn open_in_browser(url: &str) -> Result<(), String> {
+/// URL 白名单校验（https/http 前缀 + 拒绝引号/空格——防参数注入，跨平台共用）
+fn validate_open_url(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
     }
+    Ok(())
+}
+
+/// Windows：cmd /c start + raw_arg 防 & 截断（wb oauth 同款实现）
+#[cfg(windows)]
+fn open_in_browser(url: &str) -> Result<(), String> {
+    validate_open_url(url)?;
     Command::new("cmd")
         .arg("/c")
         .raw_arg(format!("start \"\" \"{url}\""))
@@ -48,14 +51,22 @@ fn open_in_browser(url: &str) -> Result<(), String> {
         .map_err(|e| format!("打开浏览器失败: {e}"))
 }
 
-/// 非 Windows 占位（cmd/raw_arg/creation_flags 为 Windows 专属，逐函数门控
-/// 对齐 common.rs is_running 惯例）
-/// macOS 适配预留：用 `open <url>` 子进程（Command::new("open").arg(url)）等价替换，
-/// URL 校验逻辑（https/http 前缀 + 引号/空格拒绝）跨平台保留；Linux 分支可顺手
-/// 用 `xdg-open`，三平台收敛为 cfg 分支同签名函数，调用方 qoder_oauth_login 零改动
-#[cfg(not(windows))]
+/// macOS 实装（2026-10-05 合并审查）：`open <url>` 走 LaunchServices 默认浏览器，
+/// 与 Windows cmd start 同语义；URL 校验逻辑跨平台共用，调用方 qoder_oauth_login 零改动
+#[cfg(target_os = "macos")]
+fn open_in_browser(url: &str) -> Result<(), String> {
+    validate_open_url(url)?;
+    Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开浏览器失败: {e}"))
+}
+
+/// 其余平台占位（无统一系统浏览器打开入口，维持拒绝）
+#[cfg(not(any(windows, target_os = "macos")))]
 fn open_in_browser(_url: &str) -> Result<(), String> {
-    Err("打开浏览器仅支持 Windows".into())
+    Err("打开浏览器暂不支持该平台".into())
 }
 
 fn emit_progress(app: &AppHandle, stage: &str, message: &str, auth_url: Option<&str>) {
