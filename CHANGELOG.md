@@ -6,6 +6,40 @@
 
 ---
 
+## [1.3.6] · 2026-10-04 · 移植 main 渠道风控对抗 + Claude Code 分类器兜底
+
+> **合并点记录**：本次移植范围 `main@29d106af1da7bc6e1df477c8f0b7c4ebb9811ab3`（**不含**）至 `main@1c295643c0d5996be32d0a2f9f19e6ab22c1a9be`；**下次合并请从 `1c29564` 之后接着移植**。手工语义移植、未经 merge。
+
+### 修复（移植 main `0441851`，issue #54）
+
+- **/v1/messages 分类器模型兜底**：Claude Code auto 模式的安全分类器以 side_query 请求本网关，模型名为服务端下发的官方名（如 `claude-sonnet-5[1m]`），无环境变量可覆盖；纯 Trae 用户三池不可路由 → 上游 4001 → 分类器 fail-closed 报 "temporarily unavailable" 并阻断 Bash/Write：
+  - 入口三级兜底：原名可路由原样保留（WB 用户内置系列映射行为不变）→ 剥 `[1m]` 窗口标记后基名可路由用基名 → claude-* 系不可路由回落网关默认模型；非 claude 未知名维持透传语义。
+  - 改写原子生效（peek/body/model 三处同步）；热路径零分配短路。
+  - `[1m]` 剥离用 ASCII 字节尾比较，规避 to_lowercase 字节漂移导致的多字节字符切片 panic（对照 `wb_model_route::strip_suffix_ci` 同类修复）。
+
+### 修复（移植 main `dc3b32d` + `fc13a1b`，issue #57）
+
+- **Trae 池接入指纹清洗 + 11128/空完成感知重试**：渠道风控（11128 Illegal API invocation）按请求指纹判定、与账号/模型无关，换模型换账号无效：
+  - 模板映射预防布防：Cline/Roo/通用 CLI/OpenCode 全 flavor 身份句（`wb_payload.rs` default_template_map + 命中计数/统计导出）。
+  - Trae 池接入清洗管线（content/tool arguments/工具描述），与 WB 池同一套规则表（`payload.rs::prepare_llm_chat_body` 新增 sanitize/templates 参数）。
+  - 11128 渠道风控感知：未清洗请求被拦（HTTP 400）时强制清洗重算请求体同号重试一次（Trae 流式/聚合 + WB 流式/聚合/工具代执行共 5 处调用点）；已清洗仍命中 → retry_plan 原样 Fatal。
+  - 空完成哨兵（`EMPTY_COMPLETION_CODE = -9901`）：上游 HTTP 200 正常收流但零内容（影子风控静默拦截）不再伪装成正常完成——流式转换层不发收尾帧以哨兵上抛，调用方换号重试（不冷却、不透传）；聚合响应零内容（OpenAI chat/legacy text/Anthropic message 三形态）同样换号。
+  - sanitize/templates 提升为**请求级快照**（`fc13a1b`）：11128 强制开启后跨账号保持，换号不再以未清洗状态重烧一次拦截（每账号 +200ms），且每请求只做一次 load_templates SQLite 读；热更新开关下一请求生效。
+  - 模板命中计数与风控日志挂钩（「空完成 → 换号重试；模板命中: …」），ZCode/DSH 等无公开资料客户端可经日志反查精确触发句 → 热更新规则表。
+  - 新增 `scripts/sim_zcode_dsh.mjs` 客户端模拟测试（Node 18+ 零依赖，probe 打满全部已知指纹句，`--system-file` 注入真实抓包 system prompt 作迭代通道）。
+
+### 明确跳过（桌面客户端专属，docker 分支不适用）
+
+- main `8d540e4`（device_proxy e2e 隧道测试补读 body 修 CI 偶发失败）：docker 分支无 `src-tauri/src/device_proxy/` 模块（桌面设备代理隧道）。
+- main `1c29564` 的 3.6.6 版本号升级：docker 分支走独立 1.3.x 版本线（本次升级 1.3.5 → 1.3.6，合并点即记录于本条目）。
+
+### 验证
+
+- `cargo test --workspace`：419 通过（含新增 issue #54 兜底 6 例 / issue #57 空完成哨兵、模板命中计数、指纹清洗等）。
+- `npm run test`：32 通过（前端无本次相关变更）。
+
+---
+
 ## [1.3.5] · 2026-10-01 · 移植 main 客户端指纹伪装 + auth 键诊断
 
 > **合并点记录**：本次移植范围 `main@31fa051c52beb9b0e227f87dd87b5f94f6d28477`（**含**）至 `main@29d106af1da7bc6e1df477c8f0b7c4ebb9811ab3`；**下次合并请从 `29d106a` 之后接着移植**。手工语义移植、未经 merge。
