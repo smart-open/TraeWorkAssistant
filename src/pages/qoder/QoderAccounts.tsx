@@ -461,7 +461,7 @@ export default function QoderAccounts() {
     if (!editing || editBusy) return;
     setEditBusy(true);
     try {
-      await api.qoder.accountSave(editing.id, editName.trim() || undefined, editNote);
+      await api.qoder.accountSave(editing.id, editName.trim(), editNote);
       pushToast('success', '已保存');
       setEditing(null);
       void refresh();
@@ -904,9 +904,9 @@ export default function QoderAccounts() {
                     <td className="px-4 py-3 text-right">
                       <div className="flex justify-end gap-1">
                         <button
-                          className={`btn-ghost !p-2 ${switchingTo === a.id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${busy && switchingTo !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
+                          className={`btn-ghost !p-2 ${switchingTo === a.id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${(busy || snapBusy != null) && switchingTo !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
                           title="切换此账号到…（Qoder Work / Qoder IDE 双目标）"
-                          disabled={busy}
+                          disabled={busy || snapBusy != null}
                           onClick={(e) => openAppMenu(a, 'switch', e)}
                         >
                           {switchingTo === a.id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}

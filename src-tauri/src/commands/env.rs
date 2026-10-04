@@ -216,7 +216,17 @@ pub(crate) fn version_of(path: &str) -> Option<String> {
 /// finish_locate_macos 同源，qoder_env_check（main 合并引入）跨平台复用入口。
 #[cfg(target_os = "macos")]
 pub(crate) fn version_of(path: &str) -> Option<String> {
-    let mut cur = std::path::Path::new(path).parent();
+    let start = std::path::Path::new(path);
+    // 起点自身即 .app（2026-10-05 审查修复）：qoder_env_check 的 mac 候选直接是
+    // bundle 目录（/Applications/Qoder CN IDE.app），原实现从 parent() 起步上溯，
+    // 永远遇不到 .app 扩展名 → 版本号恒 null；先查自身再上溯，exe 裸路径行为不变
+    if start.extension().map(|e| e == "app").unwrap_or(false) {
+        return crate::switcher::locate::read_info_plist_value(
+            start,
+            "CFBundleShortVersionString",
+        );
+    }
+    let mut cur = start.parent();
     while let Some(dir) = cur {
         if dir.extension().map(|e| e == "app").unwrap_or(false) {
             return crate::switcher::locate::read_info_plist_value(

@@ -70,6 +70,14 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
                     &format!("[qoder] 账号 {id} 凭证需人工处理（{note}），请重新登录或更新 PAT"),
                 );
             }
+            // 临期但仍有效（无刷新令牌，2026-10-05 审查修复）：凭证未失效暂不需
+            // 人工处理，不再计入「需重登」；落日志提示用户在过期前重登/换 PAT
+            "near_expiry_no_refresh" => {
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("[qoder] 账号 {id} 凭证临期且无刷新令牌，过期后需重新登录或更新 PAT"),
+                );
+            }
             // no_credential / fresh：无需刷新
             _ => {}
         }

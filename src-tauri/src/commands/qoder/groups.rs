@@ -8,7 +8,7 @@ use tauri::State;
 
 use crate::state::AppState;
 
-use super::common::{load_pool, with_pool_mut};
+use super::common::{load_pool, load_pool_checked, save_pool, with_pool_mut};
 
 fn load_defs(state: &AppState) -> Vec<crate::models::Group> {
     crate::store::db(&state.data_dir).kv_get("qoder_groups")
@@ -121,22 +121,24 @@ pub fn qoder_groups_remove(
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     id: String,
 ) -> Result<(), String> {
+    // 单临界区（2026-10-05 审查修复）：组内账号回落与删分组定义合并到同一次持锁。
+    // 原两段持锁（with_pool_mut 回落 → 解锁 → 再锁删定义）的窗口内可被并发
+    // qoder_account_move 插入重新挂上本组（其锁内校验时定义尚在），删定义后
+    // 留下幽灵 group_id（网关分组筛选下该账号沉默退出调度）。std Mutex 不可重入，
+    // 故此处手动持锁内联回落（load_pool_checked + save_pool，与 with_pool_mut
+    // 同语义：损坏池备份后拒绝，防整池覆盖丢账号）。
+    //
     // 先回落组内账号、成功后再删分组定义（审查修复）：反序在中途回落失败时会产生
     // 「分组定义已删、账号 group_id 悬空」且重试路径断裂（retain 幂等空操作，
-    // with_pool_mut 仍因同一原因失败）。本序最坏情况是回落成功但定义残留
-    // （空分组，重试即可删除），无悬空引用
-    with_pool_mut(&state, |accounts| {
-        for a in accounts.iter_mut() {
-            if a.group_id == id {
-                a.group_id = String::new();
-            }
-        }
-        Ok(())
-    })?;
-    // defs 读改写互斥（审查 P3）：with_pool_mut 内部已获取并释放同一把锁，std Mutex
-    // 不可重入，故回落与 defs RMW 分两段持锁；窗口内仅存在「回落成功但定义残留」
-    // 可重试态（与函数头注释的最坏情形一致），无悬空引用
+    // 仍因同一原因失败）。本序失败只发生在回落（定义残留，空分组重试即可删除）。
     let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut accounts = load_pool_checked(&state)?;
+    for a in accounts.iter_mut() {
+        if a.group_id == id {
+            a.group_id = String::new();
+        }
+    }
+    save_pool(&state, &accounts)?;
     let mut defs = load_defs(&state);
     defs.retain(|g| g.id != id);
     save_defs(&state, &defs)?;
@@ -164,17 +166,19 @@ pub fn qoder_account_move(
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
-    // 目标分组校验：group_id 传了非空值但分组已删除/不存在时直接拒绝，防幽灵分组
-    if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
-        if !load_defs(&state).iter().any(|g| g.id == gid) {
-            return Err(format!("目标分组不存在: {gid}"));
-        }
-    }
     with_pool_mut(&state, |accounts| {
         let acct = accounts
             .iter_mut()
             .find(|a| a.id == user_id)
             .ok_or_else(|| format!("账号不在池中: {user_id}"))?;
+        // 目标分组校验移入锁内（2026-10-05 审查修复）：与 qoder_groups_remove 并发时
+        // 锁外校验存在 TOCTOU，可把账号挂上已删除分组的幽灵 group_id（网关分组
+        // 筛选下沉默退出调度）；校验与 remove 的删定义同持池锁，完全串行化
+        if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
+            if !load_defs(&state).iter().any(|g| g.id == gid) {
+                return Err(format!("目标分组不存在: {gid}"));
+            }
+        }
         acct.group_id = group_id.unwrap_or_default();
         Ok(())
     })?;

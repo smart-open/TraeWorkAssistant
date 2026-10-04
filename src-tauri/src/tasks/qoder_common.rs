@@ -837,8 +837,8 @@ fn is_pat_channel(creds: &QoderCreds) -> bool {
 }
 
 /// 惰性刷新：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
-/// 返回 (creds, refreshed, note)，note ∈ no_credential/fresh/expired_needs_relogin/
-/// refreshed/refreshed_unsaved/refresh_failed/auth_dead/pat_rejected。
+/// 返回 (creds, refreshed, note)，note ∈ no_credential/fresh/near_expiry_no_refresh/
+/// expired_needs_relogin/refreshed/refreshed_unsaved/refresh_failed/auth_dead/pat_rejected。
 ///
 /// PAT 通道（R-6）：pt- 不被 sash 业务端点接受（实测 401），先经 jobToken 换取
 /// 24h 作业令牌；作业令牌临期（< lazy_hours，与客户端通道同语义）或已过期时用
@@ -911,6 +911,14 @@ pub fn ensure_fresh(
             let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
             if remain_h > lazy_hours as f64 {
                 return (creds, false, "fresh");
+            }
+            if remain_h > 0.0 {
+                // 临期但仍有效（2026-10-05 审查修复）：无刷新令牌无法续期，但当前
+                // token 未过期、本轮请求（签到/余额/网关）可正常工作——放行并如实
+                // 标注，不再误判「已过期」整轮跳过丢一次可成功的签到；调用方传
+                // i64::MAX（恒刷路径）时 remain_h > lazy_hours 恒假，全新凭证同样
+                // 落此分支如实上报（续期命令据此提示「仍有效但无法自动续期」）
+                return (creds, false, "near_expiry_no_refresh");
             }
         } else {
             // 无 expires_at 也无 refresh_token：无法判定新鲜度也无法刷新，按需重登

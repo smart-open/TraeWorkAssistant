@@ -391,6 +391,11 @@ pub async fn qoder_account_refresh_token(
                 Err("续期已执行但落库失败（重启后需重新续期），请检查磁盘空间后重试".into())
             }
             "pat_rejected" => Err("续期失败：PAT 已被拒绝，请更新 PAT 后重试".into()),
+            // 临期但仍有效且无刷新令牌（2026-10-05 审查修复）：凭证未失效，不再
+            // 误报「已失效」；如实告知无法自动续期、需在过期前重登
+            "near_expiry_no_refresh" => {
+                Err("凭证当前仍在有效期内，但无刷新令牌无法自动续期；请在过期前重新登录客户端或更新 PAT".into())
+            }
             // 永久失败：ensure_fresh 内已回写池 needs_relogin，视图随之展示
             "expired_needs_relogin" | "auth_dead" => {
                 Err("凭证已失效且无法自动续期，请重新登录客户端或更新 PAT".into())

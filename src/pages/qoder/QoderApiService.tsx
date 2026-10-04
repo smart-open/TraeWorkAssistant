@@ -204,8 +204,14 @@ export default function QoderApiService() {
     try {
       const n = await withMinDelay(api.apiServer.qoderCatalogSync(), 800);
       pushToast('success', `Qoder 模型目录已更新（${n} 个模型），/v1/models 与路由即时生效`);
-      const list = await api.apiServer.unifiedModels();
-      setModels(list.filter((m) => m.sources.some((s) => s.pool === 'qoder')));
+      // 列表刷新独立容错（审查修复）：失败不落入同步的 catch 误报「目录同步失败」
+      //（同步本身已成功），保留旧列表并如实提示
+      try {
+        const list = await api.apiServer.unifiedModels();
+        setModels(list.filter((m) => m.sources.some((s) => s.pool === 'qoder')));
+      } catch (err) {
+        pushToast('error', `目录已更新，但模型列表刷新失败：${String(err).slice(0, 120)}`);
+      }
     } catch (err) {
       pushToast('error', `Qoder 模型目录同步失败：${String(err).slice(0, 120)}`);
     } finally {

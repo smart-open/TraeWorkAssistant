@@ -752,7 +752,15 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
                 .map(|r| json!({"user_id": r["user_id"], "total": r["total"]}))
                 .collect::<Vec<_>>(),
         });
-        let _ = crate::store::docs::qoder_credits_history_upsert(&db, &snap);
+        // 落库失败不能静默（审查修复，对齐 710-712 qoder_pool_save 先例）：写失败
+        // （磁盘满/IO 错误）时 fetch 照常 ok，调度器记当日已跑，快照点永久丢失
+        //（consumed 差分链断一环）——至少落日志可感知排查
+        if let Err(e) = crate::store::docs::qoder_credits_history_upsert(&db, &snap) {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("[qoder] 积分快照落库失败({today}): {e}"),
+            );
+        }
     }
     let out = json!({
         "ok": true, "cached": false, "stale": false,
