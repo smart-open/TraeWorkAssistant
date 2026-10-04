@@ -17,6 +17,15 @@
 pub mod doubao_chats;
 pub mod doubao_quota;
 pub mod doubao_session;
+pub mod qoder_catalog;
+pub mod qoder_checkin;
+pub mod qoder_common;
+pub mod qoder_credits;
+pub mod qoder_device;
+pub mod qoder_oauth;
+pub mod qoder_refresh;
+pub mod qoder_sign;
+pub mod qoder_upstream;
 pub mod scheduler;
 pub mod trae_checkin;
 pub mod ui_click;
@@ -83,6 +92,41 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
             wb_checkin::run_growth_round(state, &flags, &[], &mut print_progress);
             Ok(serde_json::json!({ "ok": true }))
         }
+        // Qoder 每日签到（F-80；schtasks 直调 + 应用内调度器共用；10:15 单次覆盖双活动）
+        "qoder-checkin" => {
+            let opts = qoder_checkin::QoderCheckinOpts::daily();
+            let done = qoder_checkin::run_checkin_round(state, &opts, &mut print_progress);
+            // 审查 M-1：存在失败账号时返 Err（schtasks 退出码可见 + 通知渠道）。
+            // 口径对齐调度器（scheduler.rs 同款）：empty_campaigns（活动未上线/不可用）
+            // 属非用户可操作失败，不计失败——CLI 进程本身无 30min 冷却重试链，
+            // 重试由次日调度覆盖；done 事件恒携带该字段，旧结构缺字段时按 0 兜底
+            let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let failed_empty = done
+                .get("failed_empty_campaigns")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            // 永久性认证失败与调度器口径对齐（scheduler.rs 同款）：重试注定失败，
+            // 不计入 Err（否则失效账号让 schtasks 每日执行结果恒为失败）
+            let failed_permanent = done
+                .get("failed_permanent")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty - failed_permanent > 0 {
+                let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                Err(format!(
+                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（30 分钟后自动重试）"
+                ))
+            } else {
+                Ok(done)
+            }
+        }
+        // Qoder 积分快照（调度器/CLI 共用；空池自然空转）
+        "qoder-credits-snapshot" => qoder_credits::run_snapshot_task(state),
+        // Qoder 凭证 6h 兜底刷新（调度器/CLI 共用；空池空转）
+        "qoder-refresh" => qoder_refresh::run_task(state),
+        // Qoder 模型目录每日同步（调度器/CLI 共用；空池/无凭证空转，p3-3 收尾）
+        "qoder-catalog-sync" => qoder_catalog::run_task(state),
         // Trae JWT 定时续期（issue #27；调度器/CLI 共用批量惰性刷新）
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(state),
         // Trae 每日签到：vault 解密全量账号跑单轮
@@ -109,6 +153,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                     proxy_port: None,
                     include_indexeddb: false,
                     expected_current_uid: String::new(),
+                    machine_id_override: None,
                     data_dir: state.data_dir.clone(),
                 },
                 &sink,

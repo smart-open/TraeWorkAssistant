@@ -16,6 +16,7 @@ import {
   RotateCcw,
   Save,
   ScanSearch,
+  ShieldAlert,
   Snowflake,
   SquareTerminal,
   Tags,
@@ -25,7 +26,7 @@ import {
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import SwitchProgressPanel from '../components/SwitchProgressPanel';
-import { Badge, EmptyState } from '../components/ui';
+import { Badge, EmptyState, Modal } from '../components/ui';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
@@ -110,6 +111,8 @@ export default function Accounts() {
   // 删除确认（禁 window.confirm，红线）：删除账号 / 删除快照
   const [deleteTarget, setDeleteTarget] = useState<AccountView | null>(null);
   const [deleteSlot, setDeleteSlot] = useState<string | null>(null);
+  // 导出凭证确认（审查 P0-2；禁 window.confirm，红线）：Trae 导出恒含明文 JWT / refreshToken
+  const [exportConfirming, setExportConfirming] = useState(false);
   // 切换/保存 90s 看门狗（对齐 BuddyAccounts）：switch-done / save-login-done 事件异常缺失
   // （桥挂死/事件丢失/后台线程 panic）时 switchingTo/savingLogin 会永久非空——全部切换/保存/
   // 续期/重置按钮被禁用、appMenu 不再弹出，用户感知为「点击切换账号无反应」。90s 后解除
@@ -217,11 +220,17 @@ export default function Accounts() {
     }
   };
 
-  const exportAccounts = async () => {
+  const exportAccounts = () => {
     if (accounts.length === 0) {
       toast('warn', '没有账号可导出');
       return;
     }
+    // 凭证导出强确认（审查 P0-2；禁 window.confirm，红线）：导出文件恒含明文 JWT / refreshToken
+    setExportConfirming(true);
+  };
+
+  const doExportAccounts = async () => {
+    setExportConfirming(false);
     try {
       const payload = await api.accounts.exportRaw();
       const content = JSON.stringify(payload, null, 2);
@@ -332,7 +341,7 @@ export default function Accounts() {
             <button onClick={() => setAddOpen(true)} className="btn-outline" title="手动粘贴 JWT 添加账号">
               <Plus size={15} /> 添加账号
             </button>
-            <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
+            <button onClick={() => exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
               <Download size={15} /> 导出账号
             </button>
             <button
@@ -443,6 +452,14 @@ export default function Accounts() {
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1">
                         <JwtStatusBadge hours={a.jwt_exp_hours} />
+                        {a.jwt_uid_mismatch && (
+                          <Badge
+                            tone="amber"
+                            title={`该账号的 JWT 实际属于账号 ${a.jwt_uid ?? '?'}，与记录的账号 id ${a.user_id} 不一致（可能粘贴错 JWT 或被污染）。快照槽位按账号 id 命名，请编辑账号重新粘贴正确的 JWT，或删除该账号重新收录`}
+                          >
+                            JWT/id 不符
+                          </Badge>
+                        )}
                         {a.has_refresh_token && (
                           <span title="支持自动刷新" className="text-sky-500">
                             <Zap size={12} />
@@ -490,18 +507,30 @@ export default function Accounts() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1">
-                        <button title="编辑账号" onClick={() => setEditTarget(a)} className="btn-ghost !p-2">
-                          <Pencil size={14} />
-                        </button>
-                        {a.cooldown_type && (
+                        <div className="relative flex items-center">
                           <button
-                            title="解除冷却"
-                            onClick={() => void cooldownClear(a.user_id)}
-                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                            title={switchingTo ? (switchingTo === a.user_id ? '切换中…' : '正在切换其他账号') : '切换此账号（选择目标应用）'}
+                            onClick={(e) => {
+                              const r = e.currentTarget.getBoundingClientRect();
+                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'switch' ? null : { userId: a.user_id, kind: 'switch', x: r.right, y: r.bottom });
+                            }}
+                            disabled={busy}
+                            className={`btn-ghost !p-2 ${switchingTo === a.user_id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${(switchingTo && switchingTo !== a.user_id) || savingLogin ? 'opacity-40 cursor-not-allowed' : ''}`}
                           >
-                            <Snowflake size={14} />
+                            {switchingTo === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                           </button>
-                        )}
+                          <button
+                            title={savingLogin ? (savingLogin === a.user_id ? '保存中…' : '正在保存其他账号') : '保存当前登录态（选择目标应用）'}
+                            onClick={(e) => {
+                              const r = e.currentTarget.getBoundingClientRect();
+                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'save' ? null : { userId: a.user_id, kind: 'save', x: r.right, y: r.bottom });
+                            }}
+                            disabled={busy}
+                            className={`btn-ghost !p-2 ${savingLogin === a.user_id ? 'text-amber-500' : ''} ${(savingLogin && savingLogin !== a.user_id) || switchingTo ? 'opacity-40 cursor-not-allowed' : ''}`}
+                          >
+                            {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                          </button>
+                        </div>
                         {/* SessionDead（JWT 被服务端吊销）时 exp 往往未到，必须常显续期入口，
                             否则与签到/切换失败的「点续期 JWT」指引断链（issue #9 审查项） */}
                         {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead') && (
@@ -523,30 +552,15 @@ export default function Accounts() {
                             <Zap size={14} />
                           </button>
                         )}
-                        <div className="relative flex items-center">
+                        {a.cooldown_type && (
                           <button
-                            title={switchingTo ? (switchingTo === a.user_id ? '切换中…' : '正在切换其他账号') : '切换此账号（选择目标应用）'}
-                            onClick={(e) => {
-                              const r = e.currentTarget.getBoundingClientRect();
-                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'switch' ? null : { userId: a.user_id, kind: 'switch', x: r.right, y: r.bottom });
-                            }}
-                            disabled={busy}
-                            className={`btn-ghost !p-2 ${switchingTo === a.user_id ? 'text-amber-500' : ''} ${(switchingTo && switchingTo !== a.user_id) || savingLogin ? 'opacity-40 cursor-not-allowed' : ''}`}
+                            title="解除冷却"
+                            onClick={() => void cooldownClear(a.user_id)}
+                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
                           >
-                            {switchingTo === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
+                            <Snowflake size={14} />
                           </button>
-                          <button
-                            title={savingLogin ? (savingLogin === a.user_id ? '保存中…' : '正在保存其他账号') : '保存当前登录态（选择目标应用）'}
-                            onClick={(e) => {
-                              const r = e.currentTarget.getBoundingClientRect();
-                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'save' ? null : { userId: a.user_id, kind: 'save', x: r.right, y: r.bottom });
-                            }}
-                            disabled={busy}
-                            className={`btn-ghost !p-2 ${savingLogin === a.user_id ? 'text-amber-500' : ''} ${(savingLogin && savingLogin !== a.user_id) || switchingTo ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          >
-                            {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
-                          </button>
-                        </div>
+                        )}
                         <button
                           title={switchingTo || savingLogin ? '切换/保存进行中，暂不能重置' : '重置设备 ID'}
                           onClick={() => void resetDevice(a.user_id)}
@@ -554,6 +568,9 @@ export default function Accounts() {
                           className="btn-ghost !p-2 disabled:cursor-not-allowed disabled:opacity-40"
                         >
                           <RotateCcw size={14} />
+                        </button>
+                        <button title="编辑账号" onClick={() => setEditTarget(a)} className="btn-ghost !p-2">
+                          <Pencil size={14} />
                         </button>
                         <button title="删除" onClick={() => void onDelete(a)} className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-500/10">
                           <Trash2 size={14} />
@@ -691,6 +708,31 @@ export default function Accounts() {
         onClose={() => setDeleteSlot(null)}
         onConfirm={() => void confirmDeleteSlot()}
       />
+      {/* 导出凭证确认弹框（审查 P0-2；禁 window.confirm，红线） */}
+      <Modal
+        open={exportConfirming}
+        onClose={() => setExportConfirming(false)}
+        title="确认导出明文凭证"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setExportConfirming(false)}>取消</button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              onClick={() => void doExportAccounts()}
+            >
+              我已知晓风险，继续导出
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-sm">
+          <div>即将导出 {accounts.length} 个账号，文件包含明文 JWT / refreshToken 凭证（等同密码）。</div>
+          <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
+            <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+            <span>仅应在可信环境用于账号迁移，导出后请妥善保管，切勿通过不可信渠道传输。</span>
+          </div>
+        </div>
+      </Modal>
       <OAuthLoginModal
         open={oauthOpen}
         onClose={() => setOAuthOpen(false)}

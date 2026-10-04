@@ -282,22 +282,66 @@ pub(super) fn as_ts_seconds(v: Option<&serde_json::Value>) -> Option<i64> {
     })
 }
 
-/// 诊断用键名提取（issue #51）：仅列键名、绝不含值，顶层 + auth/account 一层子对象。
+/// 值类型名（诊断用，绝不含值本身）
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// 诊断用键名提取（issue #51）：仅列键名 + 值类型（绝不含值），顶层 + auth/account 一层子对象。
 /// 供「未找到 accessToken」类错误自带结构线索，用户截图即可定位，省去跑 PowerShell 往返。
+/// 类型标注（issue #58）：键存在但值为 null 时「未找到」报错与键名清单自相矛盾，
+/// 附类型后用户截图可直接看出 accessToken（null）→ 未登录，而非结构变更。
 pub(super) fn auth_key_names(raw: &serde_json::Value) -> String {
     if !raw.is_object() {
         return "（非 JSON 对象）".into();
     }
     let mut names: Vec<String> = Vec::new();
     if let Some(map) = raw.as_object() {
-        names.extend(map.keys().cloned());
+        names.extend(map.iter().map(|(k, v)| format!("{k}（{}）", json_type_name(v))));
         for wk in ["auth", "account"] {
             if let Some(child) = map.get(wk).and_then(|v| v.as_object()) {
-                names.extend(child.keys().map(|k| format!("{wk}.{k}")));
+                names.extend(
+                    child
+                        .iter()
+                        .map(|(k, v)| format!("{wk}.{k}（{}）", json_type_name(v))),
+                );
             }
         }
     }
     if names.is_empty() { "（对象无键）".into() } else { names.join(", ") }
+}
+
+/// auth 文件 access token 提取 + 失败原因分类（issue #58）：
+/// 对候选键逐个 dig，命中即决（语义与 dig 一致，null 不回退尝试后续候选键，避免误采其他 token 字段串号）：
+/// 命中且为非空字符串 → Ok；命中但为 null/非字符串/空串 → 「未登录/凭证为空」类错误（不再误报结构变更）；
+/// 全部候选键未命中 → 「结构可能已变更」+ 键名诊断（含值类型）。
+pub(super) fn extract_access_token(raw: &serde_json::Value) -> Result<String, String> {
+    for k in ["accessToken", "access_token", "token"] {
+        let Some(v) = fs_utils::dig(raw, &[k]) else { continue };
+        if let Some(s) = v.as_str() {
+            if !s.is_empty() {
+                return Ok(s.to_string());
+            }
+            return Err(format!(
+                "auth 文件 accessToken 为空字符串（可能未登录）：键 {k} 存在但无值，请先在 WorkBuddy 客户端登录后重试"
+            ));
+        }
+        return Err(format!(
+            "auth 文件凭证不可用：键 {k} 存在但值为 {}（预期字符串；null 多为未登录或客户端已清空登录态），请先在 WorkBuddy 客户端登录后重试",
+            json_type_name(v)
+        ));
+    }
+    Err(format!(
+        "auth 文件中未找到 accessToken（结构可能已变更）；实际键名: {}",
+        auth_key_names(raw)
+    ))
 }
 
 // ── 设置（F-55 配置化）──────────────────────────────────────────────────────
@@ -315,9 +359,8 @@ pub fn workbuddy_settings_set(state: State<AppState>, patch: WorkBuddySettings) 
 // ── 工具侧凭证副本写入（F-10 双源化）───────────────────────────────────────
 
 pub(super) fn upsert_token_store(state: &AppState, id: &str, creds: &serde_json::Value) -> Result<(), String> {
-    // SQLite 化（P3）：wb_tokens 表单行 UPSERT（merge 语义保留）
-    let store = crate::store::db(&state.data_dir);
-    let existing = crate::store::docs::wb_token_store_load(&store);
+    // 凭证收敛（P0-1）：读走 secure 回填，写走 secure 占位（敏感字段进 vault，DB 不落明文）
+    let existing = crate::tasks::wb_common::token_store_load_secure(&state.data_dir);
     let mut rec = existing
         .get("tokens")
         .and_then(|t| t.get(id))
@@ -331,7 +374,7 @@ pub(super) fn upsert_token_store(state: &AppState, id: &str, creds: &serde_json:
         }
         rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
     }
-    crate::store::docs::wb_token_store_upsert(&store, id, &rec)
+    crate::tasks::wb_common::token_store_upsert_secure(&state.data_dir, id, &rec)
 }
 
 // ── M3 凭证续期互斥（F-09，Rust 侧手动触发；schtasks 每周兜底走 python --renew-only）──

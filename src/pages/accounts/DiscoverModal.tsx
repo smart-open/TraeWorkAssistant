@@ -74,10 +74,26 @@ export function DiscoverModal({
                               无法确认账号池 uid（仅识别到账户中心 id），暂不能入池
                             </div>
                           )}
+                          {d.matched_via_jwt && d.matched_account_name && (
+                            <div className="text-[10px] text-amber-600 dark:text-amber-400">
+                              该 uid 来自账号「{d.matched_account_name}」的 JWT（与其记录的账号 id 不一致），请检查该账号
+                            </div>
+                          )}
                         </div>
                         {d.in_pool ? (
-                          <Badge tone="green">
-                            <CheckCircle2 size={12} /> 已入池
+                          <Badge
+                            tone={d.matched_via_jwt ? 'amber' : 'green'}
+                            className="max-w-[55%] overflow-hidden"
+                            title={
+                              d.matched_account_name
+                                ? `已入池：匹配账号「${d.matched_account_name}」${d.matched_via_jwt ? '（经其 JWT 命中，账号 id 不一致）' : ''}`
+                                : '已入池'
+                            }
+                          >
+                            <CheckCircle2 size={12} className="shrink-0" />
+                            <span className="truncate">
+                              已入池{d.matched_account_name ? ` · ${d.matched_account_name}` : ''}
+                            </span>
                           </Badge>
                         ) : d.uid_confident ? (
                           <button

@@ -50,7 +50,7 @@ ai-work-assistant/
 │   ├── lib/                      # tauri.ts(invoke 封装+事件订阅) / themes.ts(主题) / delay.ts(withMinDelay) / cn.ts / about.ts / useIsDark.ts
 │   ├── components/               # TitleBar/Sidebar/TopBar/Toaster/PageHeader/SetupGuide/ui + SystemDialog(系统设置+系统日志弹框)/GeneralSettingsPanel/AboutDialog
 │   └── pages/                    # Dashboard / Accounts(661行编排 + accounts/ 16 个拆分子组件) / Checkin / Logs / ApiService / Settings
-│   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters）
+│   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页、qoder-credits 视图=Qoder 页替换旧 QoderCredits；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters）
 │   │                             #   buddy/（BuddyOverview/BuddyAccounts/BuddyCheckin/BuddyApiService/BuddySettings）
 ├── scripts/                      # dev-tauri.mjs(tauri 脚本入口) / sync_version.mjs / rename_release.mjs / package_portable.mjs / gen_asset_base64.mjs
 ├── src-tauri/
@@ -119,7 +119,7 @@ ai-work-assistant/
 | OAuth | `oauth_parse_callback(callback_url)` → `{ user_id, ... }` | 解析回调 URL 中的 token |
 | 分组 | `groups_list` / `group_create` / `group_update` / `group_delete` / `group_move` | 删除分组时账号回落「未分组」 |
 | 签到 | `checkin_start(opts)` → NDJSON 事件 | `opts: { scope, user_ids?, skip_checked_in, skip_expired }`；失败自动重试最多 2 轮（30s/90s，T5） |
-| 签到 | `checkin_trends(days?)` → `CheckinTrendPoint[]` | 近 N 天签到结果按日汇总（T8，data/checkin_results.json，保留 90 天） |
+| 签到 | `checkin_trends(days?)` → `CheckinTrendPoint[]` | 近 N 天签到结果按日汇总（T8，checkin_results 表，保留 90 天）；写入方 = `trae_checkin::run_round` 末尾统一落库（UI 手动/托盘/静默/应用内调度器/CLI `--task-run checkin` 全路径覆盖；UI 路径重试轮合并后由 `run_checkin_worker` 再落一次，同 uid 同日以最后一次为准，双写幂等） |
 | 环境 | `app_locate(targetApp)` → `AppLocate` | 四应用安装位置四级探测（手动指定→注册表→默认路径→进程反查，F-01）；`targetApp: trae_work\|trae\|doubao\|workbuddy` |
 | 环境 | `open_doubao_app()` | 启动豆包桌面版（复用 app_locate 豆包档案探测） |
 | 切换 | `switch_account(userId)` | 调 `switcher::run_action(Switch)`（进程内直调，三级关闭策略）；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
@@ -153,16 +153,16 @@ ai-work-assistant/
 | 设备 | `device_reset(userId)` | 删 `device_map.json[ uid ]` |
 | JWT | `jwt_parse(jwt)` / `refresh_jwt(userId)` | 解析 / 自动刷新（需 refresh_token） |
 | API | `api_server_start()` / `api_server_stop()` / `api_server_status()` | API 网关启停（端口/默认模型由设置页提供；鉴权统一走 API Keys 列表） |
-| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy`（expire_first/credit_first/random/**weighted/p2c**）/ `group_ids` / `wb_enabled`（T2.1 WB 上游开关）/ `wb_default_thinking`（T5.3）/ `wb_tool_exec`（T5.5，默认开）/ `wb_bg_downgrade`（T5.6③）——未传字段保留原值 |
+| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy`（expire_first/credit_first/random/**weighted/p2c**）/ `group_ids` / `wb_enabled`（T2.1 WB 上游开关）/ `wb_default_thinking`（T5.3）/ `wb_tool_exec`（T5.5，默认开）/ `wb_bg_downgrade`（T5.6③）/ `qoder_enabled`（p3-3 Qoder 上游开关，默认关，Qoder 环境配置页·网关上游）/ `qoder_hedge_threshold_ms`（F-80-余 v2 Qoder 对冲阈值，默认 8000，0=关）/ `qoder_sticky_enabled`（F-80-余 v2 Qoder 会话粘性，默认关）/ `trae_enabled`（Trae 池开关，默认开，Trae 资源调度页）；**per-pool 调度参数八参（三池不共享，None=保留原值；旧共用参数 `account_concurrency_limit` / `pool_sticky_ttl_secs` 已退役——存量迁移仅 Buddy 池沿用旧共享值：读取侧检测 Buddy 新字段缺失且旧字段存在时回填（`load_pool_file_with_legacy_migration` 纯函数幂等，pool_set 保存后落盘固化），Trae/Qoder 池直接落默认值 1/300/1800，serde 忽略旧 JSON 键）**：`trae_account_concurrency_limit` + `trae_pool_sticky_ttl_secs` + `trae_sticky_ttl_secs` + `trae_hedge_threshold_ms`（Trae 池参数含竞速对冲阈值默认 8000/0=关，Trae 资源调度页）/ `wb_account_concurrency_limit` + `wb_pool_sticky_ttl_secs`（+ 既有 `wb_sticky_ttl_secs`，Buddy 资源调度页）/ `qoder_account_concurrency_limit` + `qoder_pool_sticky_ttl_secs` + `qoder_sticky_ttl_secs`（Qoder 资源调度页）——保存即热应用（三池 set_concurrency_limit / 三份池粘性 TTL 原子量 / 三 sticky store 各自 set_explicit_ttl）；未传字段保留原值；三池三页各自管理自己的开关与参数 |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
 | API | `api_models_list()` / `api_models_sync()` | 模型列表读取（data/api_models.json）/ 官网同步（不消耗积分，最多试 3 账号） |
 | API | `api_logs_list(...)` / `api_logs_detail(...)` / `api_logs_search(...)` | API 请求日志查询 / 详情 / 搜索 |
 | API | `api_usage_stats(days?)` → `UsageDayView[]` | 网关用量按日统计（T1，data/api_usage.json，保留 90 天，直读落盘） |
 | API | `api_keys_list()` / `api_keys_save(keys)` | 多 API Key 列表管理（T2，data/api_keys.json，每日配额；主 Key 双轨已移除） |
 | API | `api_unified_models(available_only?)` | 统一模型目录（v3.3.x）：Trae 官网同步 + WB 目录 + 自定义模型三源合并（canonical_id trim+lowercase 归并），元数据四层兜底（L1 人工覆盖 trae_model_meta.json → L2 官网 → L3 默认 → L4 系列推断）；与 `GET /v1/models` 共用视图 |
-| API | `dispatch_policy_get()` / `dispatch_policy_set(policy)` | 池间调度策略（data/dispatch_policy.json）：`strategy`（smart=到期优先→倍率→健康积分和 / priority=严格按序）、`priority`（trae/buddy 数组，缺省 ["buddy","trae"]）、`per_model` 模型级覆盖（显式覆盖不做智能重排）、`fallback` 跨池回退开关；带 mtime 兜底解析缓存 |
+| API | `dispatch_policy_get()` / `dispatch_policy_set(policy)` | 池间调度策略（data/dispatch_policy.json）：`strategy`（smart=到期优先→倍率→健康积分和 / priority=严格按序）、`priority`（trae/buddy/qoder 数组，缺省 ["buddy","trae","qoder"]）、`per_model` 模型级覆盖（显式覆盖不做智能重排）、`fallback` 跨池回退开关；带 mtime 兜底解析缓存 |
 | API | `custom_models_list()` / `custom_models_save(model)` / `custom_model_test(model)` | 自定义 OpenAI 兼容上游（data/custom_models.json，v3.3.x）：列表 / upsert（name/base_url 必填、canonical 不重复、id `cm-<12hex>` 自动生成）/ 连通性测试（与保存同口径预检）；模型命中即直达 custom 池，不参与 dispatch 池间策略 |
-| API | `api_wb_usage_stats(days?)` / `api_custom_usage_stats(days?)` | WB 池 / 自定义池用量按日统计（分库查询，days 默认 14 clamp 1~90） |
+| API | `api_wb_usage_stats(days?)` / `api_custom_usage_stats(days?)` / `api_qoder_usage_stats(days?)` | WB 池 / 自定义池 / Qoder 池用量按日统计（四桶分库查询，days 默认 14 clamp 1~90；Qoder 桶上游接入后产生数据） |
 | 日志 | `logs_query({ opts: { log_type, date, keyword, limit } })` → `LogLine[]` | `split_time` 会 strip BOM 前缀 |
 | 日志 | `logs_clear(log_type)` → `u32` | 按类型删除日志文件（all/proxy/checkin/switch，T6，幂等） |
 | 设置 | `settings_get()` / `settings_set(patch: Settings)` | Settings 全部 snake_case |
@@ -175,7 +175,7 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_refresh_token(userId)` | plugin refresh 端点（X-Refresh-Token 仅限此端点）+ 回写 token store 与账号池过期时间；失败提示需重登 |
 | WorkBuddy | `workbuddy_checkin_start(opts)` → NDJSON `wb-checkin-progress` | Rust 直调 `tasks/wb_checkin.rs::run_checkin_round`（状态查询回退旧路径 / code:10001 已签容错 / 401 刷新一次重试 / 零 token 输出）；opts: `{ user_ids?, skip_checked_in, skip_expired, lazy_hours? }` |
 | WorkBuddy | `workbuddy_growth_run()` | 成长中心执行入口（旅行/盲盒/任务开关从 workbuddy_settings.json 读取；`wb_checkin::run_growth_round` 链式执行：travel status→claim→config→depart / lottery chances→draw 循环（上限 20）/ tasks→accept，各步独立容错、401 刷新一次重试、奖励数额以接口返回为准） |
-| WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（data/workbuddy_checkin_results.json 90 天滚动，默认展示 30 天） |
+| WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（wb_checkin_results 表 90 天滚动，默认展示 30 天；**纯追加**：同日同账号多轮并存，返回新→旧序；活动档期日历聚合 `daysFromWbRecords` 按账号取当日最终态——任一 success/already 即当日已领、仅全失败计 fail） |
 | WorkBuddy | `workbuddy_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日双时段签到任务 AIWorkAssistant_WorkBuddyCheckin_<HHMM>（09:00/21:00） |
 | WorkBuddy | `workbuddy_renew_task_register(day) / _status / _unregister` | schtasks 每周凭证续期兜底任务 AIWorkAssistant_WorkBuddyRenew（周日 10:30，主 exe `--task-run wb-renew` → `run_renew_only` 惰性刷新） |
 | WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/wb_credits.rs`：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥10min 缓存；成功回写账号池余额缓存；非缓存命中时追加每日快照（含 earned = 当日余额差分与签到 reward 归并，credits-dashboard-plan.md §2.2 方案 B） |
@@ -193,6 +193,22 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_ui_click_capture()` / `workbuddy_ui_click_checkin()` | UI 坐标点击签到兜底（F-18，批次4）：ctypes user32 驱动鼠标（零新依赖）；仅手动触发、默认关闭（settings.ui_click_enabled）；取点 3 秒倒计时记录坐标，执行单次单击不循环 |
 | WB 配置 | `wb_route_config_get()` / `wb_route_config_set(config)` / `wb_template_map_get()` / `wb_template_map_set(map)` | 四段模型路由与审核模板映射两个手工配置文件的程序化读写：读 data/ 新路径回退旧根；set 结构校验与读取方反序列化严格对齐（aliases/rules/suffixes 为 object，模板表为 {templates:[{from,to}]} 形态），写 data/ 新路径并逐出读缓存（网关热路径即时生效） |
 | Buddy 双应用 | `open_workbuddy_app()` / `open_codebuddy_app()` / `codebuddy_env_check()` | 启动 WorkBuddy / CodeBuddy 桌面客户端（app_locate 探测，未装返回明确错误，不注入代理）；CodeBuddy 环境探测 `{installed,running,exe,version,uid,nickname}`（CodeBuddy CN 桌面与 WorkBuddy 共享 auth 文件 `%LOCALAPPDATA%\CodeBuddyExtension\...\workbuddy-desktop.info`，uid 同源 → 账号页「CodeBuddy在线」徽标）；`-TargetApp CodeBuddy`（authfile 布局）切换/保存快照落 profiles_codebuddy |
+| Qoder | `qoder_env_check()` / `qoder_open_ide()` / `qoder_open_work()` | Qoder IDE 环境探测 / 启动 IDE / 启动 Qoder Work（app_locate 四级探测，`target_app=Qoder`） |
+| Qoder | `qoder_oauth_login()` / `qoder_oauth_cancel()` | PKCE 设备流登录（R-10 抓包固化）：nonce+verifier 生成 → 系统浏览器开 `qoder.cn/device/selectAccounts?challenge=...` → 轮询 `GET /api/v1/deviceToken/poll`（pending=404，≤180s/1s）→ **响应 nonce 回验**（防会话混淆）→ 自动入池落库；事件 qoder-oauth-progress / qoder-oauth-done |
+| Qoder | `qoder_settings_get()` / `qoder_settings_set(patch)` | kv("qoder_settings")：auto_checkin（启动补签）/ checkin_hhmm / credits_sync_hhmm / credits_sync_enabled / lazy_refresh_hours |
+| Qoder | `qoder_accounts_list` → `QoderAccountView[]` | 账号池 ∪ token store 合并视图（脱敏：只回凭证 kind 徽标不回 token）；列表前惰性回填每账号设备指纹（§5.4）；async |
+| Qoder | `qoder_account_save/remove/move` | 改名备注（脏检查：名称/备注均未变直接跳过，不触发网关池 reload）/ 移除（同步清 token store + vault，DB 落库成功才清 vault；池外孤儿凭证（token store 有记录而池条目缺失）仍可清理，清理失败返 Err 透出）/ 分组移动（跨组移动联动网关池热重载——api_pool 按 group_id 过滤调度）；save（有变更）/remove/move/import_pat/OAuth 入池/IDE 扫描/账号导入均联动网关池热重载 |
+| Qoder | `qoder_account_import_pat(name?, pat)` | PAT/作业令牌手工导入（幂等：同 token 稳定同 id `qd-<sha256前12>`）；`pt-`/`jt-` 前缀均写入 access_token+pat 双字段（确保 ensure_fresh PAT 重换通道覆盖）；**导入成功后清理旧设备流凭证残留**（refresh_token/refresh_expires_at_ms；machine_id/machine_token 保留——PAT 通道仍消费有效指纹）；userinfo/plan 回填失败容错 |
+| Qoder | `qoder_account_refresh_token(account_id)` → `QoderAccountView` | 单账号凭证续期（账号管理操作列手动按钮，对照 workbuddy_refresh_token 同语义）：force 恒刷（lazy_hours=i64::MAX 走 ensure_fresh 无条件重换路径——PAT 通道重换作业令牌、客户端通道 deviceToken/refresh 续期）；每账号互斥由 refresh_lock_for 兜底；成功回读最新视图（到期时间/登录态即时刷新），失败按 note 分类中文归因（no_credential/refresh_failed 暂态/pat_rejected/auth_dead 永久）；async（spawn_blocking） |
+| Qoder | `qoder_ide_scan()` / `qoder_cli_status()` / `qoder_live_logins()` | 本机 Qoder 客户端账号发现 / CLI 切号桥状态 / 双客户端实时登录标记——`{ide, work}` 均为池反查后的账号 id（ide=state.vscdb `secret://auth.userInfo` 解密；work=Work 数据目录根级 `auth.v1.dat` v10 解密 `user.id`，2026-10-04 实测修正：Cookies 库无 qoderuid）；未登录/解密失败 → null（fail-open，前端不展示徽标）；async（spawn_blocking 派发，join 失败拒绝 → 前端 catch 静默置空） |
+| Qoder | `qoder_checkin_start(opts)` → NDJSON `qoder-checkin-progress` | Rust 直调 `tasks/qoder_checkin.rs::run_checkin_round`（sash 双活动 claim，幂等回放归类已签；claim 间隔 1~3s 随机抖动；401 刷新一次重试；campaign_id 路径段白名单；done 事件含 `failed_empty_campaigns` 单列计数） |
+| Qoder | `qoder_checkin_results(days?)` | 签到日志（qoder_checkin_results 表 90 天滚动，逐条 UPSERT 按 pk=date\|user_id\|time_ms 去重） |
+| Qoder | `qoder_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日签到任务（主 exe `--task-run qoder-checkin`；应用内调度器同款默认 10:15 单次覆盖双活动） |
+| Qoder | `qoder_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/qoder_credits.rs`：usage 三通道取数（R-7 主结构 userQuota/addOnQuota + 宽容兜底全 None 显式失败）+ R-11 逐包明细端点 `GET {WEB_BASE}/api/v2/me/usages/big_model_credits`（官网域 qoder.cn 优先、openapi 兜底；total_quota.quota_detail → packages[]，source: plan 订阅配额 / bonus 个人资源包）；sash usage 原生 `dedicated_resource_packages[]` 同步解析为逐包（source: dedicated 专属/组织资源包，Work 客户端解析器同款字段、status 枚举前缀 QUOTA_DETAIL_STATUS_* 归一，已用完/非激活过滤、expires_at 缺失回退订阅周期）；字段级覆盖、全失败回退聚合口径并记 app.log warn + 30 分钟负缓存防噪音（双端点实测恒 401/503：qoder.cn 需 Web 会话鉴权、openapi 主机无路由；TTL 内静默跳过、TTL 过自动复探自愈）；缓存 10min（仅全部成功落缓存）；401 自愈刷新一次；成功回写池余额；全量且全部成功才落每日快照（含当日消耗差分） |
+| Qoder | `qoder_credits_history_list()` | 积分每日快照时序读取（qoder_credits_history 表 365 天，同日覆盖） |
+| Qoder | `qoder_groups_list / create / update / remove` | 分组管理（kv("qoder_groups")，结构与 Trae/Buddy 一致；create 重名校验；删除时组内账号回落未分组） |
+| Qoder | `qoder_accounts_export(includeCredentials?) / _import(payload)` | 账号库导入导出（kind 标记 `aiwork-qoder-pool`；凭证是否随行由用户勾选，含凭证导出前端强确认；分组定义随载荷导出，导入按 id 幂等合并 + 幽灵 group_id 回落未分组） |
+| Qoder | `qoder_env_reset_items()` / `qoder_env_reset(items)` | Qoder 环境残留清理清单 + 程序化清理（执行前关闭 Qoder IDE 与 Work 客户端——本体进程同名 "Qoder CN.exe" 一并覆盖；9 项含 QoderWork 客户端 `%APPDATA%\com.qodercn.app.stable` 的 Local State + Network\Cookies；单项失败不中断） |
 
 ### 5.1 双应用与双 uid 体系（F-08，trae_apps.rs）
 
@@ -206,8 +222,8 @@ ai-work-assistant/
 - **WB headers 三铁律（wb_upstream.rs，红线）**：① Origin/Referer 必带按区域；② 缺省字段显式 `X-No-User-Id/X-No-Enterprise-Id/X-No-Department-Info: 1` 占位；③ **chat 请求绝不携带 `X-Refresh-Token`**（仅 refresh 端点，配 `X-Auth-Refresh-Source: workbuddy`）。UA 伪装 `CLI/2.63.2 CodeBuddy/2.63.2`。
 - **请求体改写（wb_payload.rs）**：强制 `stream:true`（上游只回 SSE，非流式本地聚合 wb_sse::aggregate，tool_calls delta 按 index 合并）；tool_choice 对象→string；reasoning_effort 按目录 `supported_efforts` 降级（`effort_override` 修正层最优先，如 hy3-*→high）；指纹清洗（默认开）：cc_xxx 键值/x-anthropic-* 引用剥离 + 审核模板黑名单最小改写（映射表 `wb_template_map.json` mtime 热更新，缺失用内置兜底：CLI→CLI tool、Main branch→Default branch）；连续同角色消息自动合并。
 - **调度扩展（pool.rs）**：策略新增 `weighted`（三因子=积分占比×10+闲置补偿 0.5/h 封顶 5.0+成功率×3，Top5 加权随机）与 `p2c`（随机选二取优），保留 expire_first/credit_first/random；100ms 防惊群窗口。五态机：Available/QuotaProtection（hard_credit 冷却至**次日 04:00** 自动恢复）/RateLimited/Forbidden（403/SessionDead 禁用）/ProxyDisabled，随 PoolStatus.state 下发。熔断：连续 3 错 30m 起指数递增（×2）封顶 6h，成功重置。
-- **分级重试（retry.rs 纯函数）**：429=Retry-After 优先/线性 1/2/3s→耗尽换号；503/529=10/20/40s 指数；400+thinking.signature=200ms 重试一次；502 同号重试 1 次；401/403=换号（**WB 401 先刷新一次凭证同号重试，T2.6**）；400=context_too_long 类 Fatal 透传。**SOLO 主路径（routes.rs）现已接入同一 `retry_plan`**（同号重试/退避/换号/Fatal 透传，Retry-After 头解析）并复用 `lines_with_first_byte_timeout` 10s 首字超时；SOLO 流式 keep-alive ticker 经 watch 信号在流结束时退出（普通 HTTP 客户端可正常收到流终结）。
-- **会话粘性（wb_sticky.rs，仅 WB）**：显式 `conversation_id` 绑定（TTL 30m 滚动续期）+ 无 id 时指纹模式（前 3 消息 SHA256 前 6 位 + 60s 窗）；绑定含上游 conversation_id（双段分配），Mutex 内 re-check 防 TOCTOU；持久化 wb_sticky_sessions.json。
+- **分级重试（retry.rs 纯函数）**：429=Retry-After 优先/线性 1/2/3s→耗尽换号；503/529=10/20/40s 指数；400+thinking.signature=200ms 重试一次；502 同号重试 1 次；401/403=换号（**WB 401 先刷新一次凭证同号重试，T2.6**）；400=context_too_long 类 Fatal 透传。**SOLO 主路径（routes.rs）现已接入同一 `retry_plan`**（同号重试/退避/换号/Fatal 透传，Retry-After 头解析）并复用 `lines_with_first_byte_timeout` 10s 首字超时；**Trae 池流式首字接入竞速对冲 `race_trae_first_byte`**（wb_route/qoder_route 同构，`trae_hedge_threshold_ms` 默认 8000/0=关，运行时 clamp 1s–8s，pool_set 保存即热应用）：首字节超阈值且存在其他健康账号时经 `lines_with_first_byte_hedged` 向第二账号发对冲请求（请求体按对冲账号指纹经 `prepare_llm_chat_body` 重建，注入对冲账号 device_id/machine_id），先出首字者胜；对冲接管后记账/日志/粘性绑定均记生效账号 win_uid（HedgeLease RAII 竞速窗口恰好释放一次）；SOLO 流式 keep-alive ticker 经 watch 信号在流结束时退出（普通 HTTP 客户端可正常收到流终结）。
+- **会话粘性（wb_sticky.rs，三池同构分命名空间）**：显式 `conversation_id` 绑定（TTL 滚动续期，`wb_sticky_ttl_secs` 可配默认 1800s）+ 无 id 时指纹模式（前 3 消息 SHA256 前 6 位 + 60s 窗）；绑定含上游 conversation_id（双段分配），Mutex 内 re-check 防 TOCTOU；持久化 sticky_bindings 表，键命名空间隔离：WB=空串 / Qoder=`"q:"` / Trae=`"t:"`（`owns_key` 判定 + `save_ns` 范围替换防互删），三池互不串绑；TTL 均可配（Trae 经 `trae_sticky_ttl_secs`、Qoder 经 `qoder_sticky_ttl_secs`，evict_expired 按 store 生效值清理）。
 - **工程化（T2.7/F-34）**：模型级冷却 10→20→40s 渐进退避（优先级高于 Key 级，成功清除）；SSE keep-alive 15s 注释行（SOLO 与 WB 流式均已接入）；首字超时 10s 故障转移（转发线程 + recv_timeout，Agent 300s 读超时兜底 detach）；客户端断连后继续消费上游保 usage 完整（wb_sse 忽略 send 失败直至 EOF）。
 - **运维接口（T2.3/F-32）**：`/healthz`（无健康账号 503）；`/v1/models` 合并 WB 目录（owned_by=workbuddy）；`/status`、`/health` 增加 `wb` 段（池画像/模型冷却/粘性会话数/上游健康探针 `probe_ok`+`probe_ts_ms`：-1 未探测/0 不可达/1 在线，§2.2 频控 5min+0-60s 抖动）；请求日志含 TTFB（WB 与 SOLO 流式均覆盖，SOLO 经 `log_request_ttfb` 结构化字段）。
 - **ck_ 子 Key 体系（F-35，批次3）**：对外子 Key（`ck_` 前缀，前端 crypto 随机源生成；旧 `sk-` 兼容）与上游真实凭证分离。`api_keys.json` 条目扩展：`allowed_accounts`（上游 uid 白名单，空=不限）、`schedule_mode`（`expire_first` 临期优先默认 / `dedicated` 专一固定 `dedicated_account`）、`daily_stats`（按日请求统计 cap 90 天）。鉴权中间件把 `ResolvedKey` 快照注入 extensions；wb_route 流式/非流式取号统一走 `pick_excluding_constrained`（专一锁定 > 白名单过滤 > 池策略），粘性绑定不白名单内时忽略粘性。
@@ -218,6 +234,20 @@ ai-work-assistant/
 - **池间策略（`dispatch.rs`）**：`smart` 默认——按请求模型对可用源池排序：① 池内最早积分到期优先（无到期数据后置）→ ② 该模型倍率小者优先（0=免费最优）→ ③ 健康账号剩余积分总和多优先；全并列回退固定序（Buddy 优先现状）。`priority` 为改造前严格按序行为。`per_model` 显式覆盖不做智能重排（用户显式配置优先）；`fallback=false` 时仅用首选池。
 - **统一目录（`unified_catalog.rs`）**：`api_unified_models` 与 `GET /v1/models` 共用；Trae 模型元数据四层兜底——L1 人工覆盖（`trae_model_meta.json`，编辑弹框 upsert/clear）→ L2 官网同步 → L3 默认 128K / 倍率参考（含 2026-09-13 审查补充的 5 个官网同步缺失倍率）→ L4 系列/思考档位/图片支持推断。倍率口径冲突时只补缺失条目、不改既有值。
 - **custom 路由（`custom_route.rs` / `custom_models.rs`）**：请求模型名 canonical（trim+lowercase）命中 enabled 自定义模型即直转其 `chat/completions`（`chat_url` 归一 base 含 `/v1` 与否两种形态），Bearer 用条目 API Key；响应侧复用既有协议输出层。
+
+### 5.4 Qoder 约定（F-80）
+
+- **凭证三前缀**：`pt-`（PAT，官方认可）→ 经 `POST /api/v1/me/jobToken`（R-6 抓包真实路径，探测顺序首位）换 24h 作业令牌再调业务端点；`jt-`（作业令牌）；`dt-`（设备流 token，≈30d，配 refresh_token ≈360d）。`ensure_fresh` 惰性刷新：PAT 通道（`is_pat_channel`：access_token `pt-` 前缀 ∥ pat 备份非空——jt- 导入双写 pat 后同走此通道）临期用原始 PAT 重换；客户端通道走 `deviceToken/refresh`；401 自愈传 `lazy_hours=i64::MAX` 恒刷一次（禁二次刷新）。
+- **凭证存储（红线）**：敏感字段（access_token/refresh_token/pat/machine_token）只进 vault（ns="qoder"，Stronghold+DPAPI），DB `qoder_tokens` 表一律占位空串；QoderCreds Debug 手写脱敏。全程零 token 输出到日志/事件/UI。
+- **并发防护（三层）**：① `TOKEN_STORE_LOCK` 表级读改写互斥；② **每账号刷新锁**（`refresh_lock_for`）串行化同账号 ensure_fresh 全程，持锁重读即二次检查（防并发刷新互相覆盖丢 token）；③ save_token_store 落库前重新 load DB 最新表做**仅目标行替换**的行级合并（收窄跨进程 last-writer-wins 窗口）。锁序：refresh 锁 → TOKEN_STORE_LOCK。
+- **设备指纹（设计文档 §5.10 多账号并发）**：每账号入池即生成稳定 `QoderDeviceProfile`（一次生成永不轮换）；MITM/抓包真实捕获值优先透传，缺失时 `effective_creds` 注入账号绑定 machine_id + 现场随机 machine_token（随机值不落库）。注入唯一出口 = `effective_creds` / ensure_fresh 合并层。
+- **expires_at 域钳制**：store 读入的过期时间超 (0, now+10y) 一律视为无过期信息（防脏数据溢出/千年展示）；`refresh_expires_at_ms` 随设备流/refresh 响应解析落库留档。
+- **调度四任务**：每日签到（默认 10:15，覆盖 0 点签到 + 10:00 登录奖励；失败返 Err → 调度器 30min 冷却重试；启动补签 60s 延迟 + 轮次锁互斥，empty_campaigns 不推送打扰；失败口径=failed − failed_empty_campaigns，调度器/UI/CLI 三路一致）/ 积分快照（qoder_credits_sync_hhmm；全账号拉取失败 stale 回退历史缓存（cached:true）按暂态返 Err 交 30min 冷却重试——当日快照点位不可后补，失败性质分流对齐凭证刷新）/ 凭证 6h 兜底刷新（qoder_token_renew_enabled 可关默认开；lazy 7h 窗口，暂态失败返 Err 重试，永久失败落日志提示人工）/ 模型目录同步（qoder-catalog-sync，每日 05:50，qoder_catalog_sync_enabled / qoder_catalog_sync_hhmm 可控均默认开，真 COSY 签名拉 model/list → adopt_remote 替换 CN 区缓存；空池/无凭证静默跳过）。轮次锁 `QODER_ROUND_LOCK`（进程内：调度器/启动补签/UI 三路互斥，调度器抢不到锁返回 `skipped_busy` 幂等跳过）+ 跨进程锁 `CrossProcLock`（Windows 命名互斥体**单段名** `Global\AIWorkAssistant.qoder.<scope>.<data_dir哈希16>`（首版多段名 `Global\AIWorkAssistant\qoder\<scope>\<hash16>` 恒 CreateMutexW ERROR_PATH_NOT_FOUND(3)——内核对象命名空间无中间对象目录，创建失败被误判 Busy 致锁自合入起从未成功获取、双进程防护空转 54+ 分钟，2026-10-04 日志分析修复），scope=checkin/refresh、3s 抢锁——schtasks CLI `--task-run` 与应用内调度器同刻双进程对同账号并发 ensure_fresh 会以同一 refresh_token 刷新、服务端一次性轮换下后到者误标 needs_relogin；锁名含 data_dir 短哈希，多数据目录实例互不误伤；`WAIT_ABANDONED` 前持有进程崩溃视为获取成功，RAII Drop 补 ReleaseMutex 再关句柄（仅 CloseHandle 不 Release 时所有权悬于本线程、他方等待者全超时假 busy），非 Windows 占位桩直通；抢锁失败 done/返回值带 `skipped_busy:true`，日志区分原因（`CrossProcLockFail`：创建失败/真占用/等待失败——「另一进程正在执行」仅真占用时出现））；锁序：轮次锁 → 跨进程锁（三路一致）；调度器见 `skipped_busy` 不 mark_run（跳过≠完成，保留当日重试链）；**Qoder 账号生命周期事件（save（有变更）/remove/move 分组移动/import_pat/OAuth 入池/IDE 扫描/导入）均联动网关池热重载**。
+- **网关上游（p3-3 + F-80-余 v2，仅 CN 区）**：`qoder_enabled` 开关（Qoder 环境配置页·网关上游，运行中热应用）→ Qoder 目录模型路由专用 `qoder_pool`（fail-open 全量入池，needs_relogin 即禁用；池内 access_token 仅入池门槛，请求期真凭证由 `qoder_identity` 回调按次 `ensure_fresh` 解析；并发上限 `qoder_account_concurrency_limit` per-pool 热生效（Qoder 资源调度页编辑）。执行链 = `prepare_qoder_body` agent 固定信封 → `encode_body` → COSY 19 头签名（qoder_sign.rs，RSA 内置公钥）→ `gateway.qoder.com.cn` agent_chat_generation SSE → 双层信封翻译（qoder_upstream.rs）。错误四分类：10605 排队（不冷却不换号，同号退避≤3 次）/ 105 鉴权 / 110~122 额度 / 裸 403 Forbidden；**identity 解析失败按暂态/永久二分**：refresh_failed（网络/5xx，含 PAT 换取首通道 0/5xx）带 `TRANSIENT_ERR_TAG` 走 Server 熔断可自愈，仅永久失效 SessionDead 禁用；用量独立 `qoder_days` 桶（`api_qoder_usage_stats`，TTFT 与 WB 同构入账）。**F-80-余 v2**：① 慢请求竞速对冲同构 WB（`race_qoder_first_byte` 原始行源层竞速 + `QoderHedgeLease` RAII，`qoder_hedge_threshold_ms` 默认 8s 热参数；对冲接管后排队同号退避不适用——重试凭证/请求体属主账号）；② 会话粘性（`qoder_sticky` 复用 StickyStore，键命名空间 `"q:"` 与 WB/Trae 同表隔离；显式 conversationId/指纹双模式，显式 TTL 经 `qoder_sticky_ttl_secs` 可配默认 1800s、指纹 60s 短窗；粘住账号 + 同种子派生同一上游 session_id；busy 且有空闲候选让位同 F-77④；`qoder_sticky_enabled` 默认关）；③ Global 区（api3.qoder.sh）**产品决策仅 CN 区**：Global 专属模型仅目录可见、显式 404，Qoder 资源调度页带地区标注说明；接线前置未决项（账号-区域关系 / Global 域 COSY 签名）已留档 backlog。
+- **网关上游审查批（v3.7.0 阶段 5）**：SSE 信封 `statusCodeValue` 钳制 100..=599（i64→u16 截断会把越界值误映射进合法码区间如 65937→401 误入换号链；越界按 502）；目录 resolve 兜底序 `[region, other]` 对齐远程目录序（同名条目不再解析到对区兜底）；pricing_url 提取过 http(s) 协议白名单；请求体 `max_tokens` 兼容 `max_completion_tokens`（OpenAI 新客户端）；session_seed / sticky_seed / conversationId 确定性限长 128 字符（`chars().take`，防字节切片 panic；SessionKey 由 WB/Qoder 路由共用，两侧一致截断保证匹配）；池空错误消息中文化（`code: no_healthy_account` 保留机器可读）；`js_truthy`/`truthy` 合一（目录解析与错误分类共用）；CatalogState 死状态 `*_fetched_at` 字段删除。
+- **签到/积分/导入导出审查批（v3.7.0 阶段 4-5）**：① 签到 `done` 事件补 `skipped_busy:true`（跨进程锁占用），前端专项 warn 分支（不误报「成功 0 已签 0」）、启动补签日志同步识别；② data_io 导出前剥离 `machine_id`/`machine_token`（对齐导入侧）；**KDF 升级 Argon2id**（19MiB/t=2/p=1，抗 GPU/ASIC 暴破）：导出信封 `kdf: "argon2id"`，导入经 `kdf_scheme_of` 分派派生（"sha256-iter-N" 旧格式兼容可解、kdf 字段缺失回退 sha256 旧默认、前缀不识别/越界 >10⁷ 明确报错请升级）——双格式 roundtrip 单测锁定；③ 命令异步化：accounts list/save/remove、export、import_pat 探测均 spawn_blocking；groups create/update/remove defs 读改写全程持 `qoder_pool_lock`（与导入分组合并互斥）；④ 积分 `deep_balance_dig` 负余额钳 0（与 quota_pair 同款守卫）；快照 ts 与缓存 `fetched_at_ms` 按拉取**完成**时刻取时（入口时刻会让多账号拉取耗时吃掉缓存 TTL）；⑤ OAuth 导入凭证前发 `importing` progress 事件（防 30s+ 静默）。
+- **人工确认疑点批（v3.7.0 阶段 6）**：① jt- 换号链路补纯函数单测锁定（`is_pat_channel` 判定 + `job_token_attempts` 探测端点 `/api/v1/me/jobToken` 首位——真实 token 无法离线复现，以单测固化行为契约，含「jt- 无 pat 备份不走 PAT 通道」反例锁定）；② PAT 导入成功后清旧设备流凭证残留（`clear_device_flow_creds`：refresh_token/refresh_expires_at_ms；machine_id/machine_token 保留——有效指纹 PAT 通道仍消费）；③ `qoder_account_save` 脏检查（name/note 均未变跳过网关池 reload）；④ env_reset 第 9 项 `work_client`（QoderWork 客户端 Local State + Network\Cookies；Work 本体进程与 IDE 同名 "Qoder CN.exe"，关闭动作天然覆盖）；⑤ KDF 迁移 Argon2id（见上条②）；⑥ **明文兼容导入通道保留为有意决策**（向后兼容旧版导出文件；仅导入解包瞬间经手，运行期存储/导出/日志凭证红线不变）；⑦ Qoder 签到进行态 store 化（监听与归约移入前端 store 层，见 §6）；⑧ Global 区维持仅 CN 不接线（产品决策：Global 专属模型仅目录可见、显式 404；账号-区域关系 / Global 域 COSY 签名等前置未决项留档 backlog，见 F-80-余 v2）。
+- **切换器**：`target_app="Qoder"`（authfile 布局），快照落 `data/profiles_qoder`；`target_app="QoderWork"`（electron_root 布局，Work 数据目录 `%APPDATA%\com.qodercn.app.stable`）快照落 `data/profiles_qoder_work`。electron_root 根级白名单 9 项含**登录凭据三件套** `auth.v1.dat` / `auth.machine-id` / `auth-profile-overlays.v1.dat`（2026-10-04 切换无效根因修复：Work 登录真源 = 数据目录根级 `auth.v1.dat`（v10 密文 JSON，token/refreshToken/user.id），原白名单仅 6 项 → 恢复 Cookies/LocalStorage 成功但客户端启动仍读旧 `auth.v1.dat`，切了等于没切）；恢复侧**对称清理**——快照不含而数据目录存活的凭据文件删除（旧版快照恢复后不串号：Work 回退未登录态，重登 + 重存快照自愈）；完整性校验对 `auth.v1.dat` 缺失 Warn（旧版快照合法存在，不 fatal）。
 
 ## 6. Tauri 事件（Rust → 前端）
 
@@ -235,6 +265,9 @@ ai-work-assistant/
 | `wb-checkin-progress` | `{"type":"start",total,mode?}` / `{"type":"account",index,user_id,name,status,message}` / `{"type":"growth",index,user_id,name,status,travel?,lottery?,tasks?,energy?,streak?}` / `{"type":"done",ok,already,failed,mode?}` / `{"type":"exit",ok}`（WorkBuddy 签到/成长中心独立管线：`mode:"growth"` 标记成长事件，与 Trae checkin-progress 互不串扰） |
 | `wb-oauth-progress` | `{stage:'init'|'browser'|'polling'|'success'|'error', message, auth_url?}`（OAuth 扫码流程进度；auth_url 仅 browser 阶段携带） |
 | `wb-oauth-done` | `{ok, id?, nickname?, message}`（扫码结果；成功已入池，凭证不出 Rust） |
+| `qoder-checkin-progress` | `{"type":"start",total}` / `{"type":"account",index,user_id,name,status,message,reward?,campaigns?}` / `{"type":"done",ok,already,failed,failed_empty_campaigns,skipped_busy?}`（Qoder 签到管线，与 wb-checkin-progress 前端组件同构；`failed_empty_campaigns` 为活动未开始/不可用类失败计数，启动补签推送按 `failed - failed_empty_campaigns` 判定；`campaigns` 为 F-80-余 v2 逐活动明细 `[{id,name,kind,reward?}]`，档期日历数据源；`skipped_busy=true` 表示跨进程锁占用本轮跳过——调度稍后自动重试，前端专项提示**不计入**成功/失败统计；**疑点⑦ store 化**：监听与归约在前端 store 层 setupListeners/`applyQoderCheckinLine`（qoderCheckin.running/lines/done/doneRev），页面切走/卸载不丢事件，QoderCheckin 页按 doneRev 联动刷新） |
+| `qoder-oauth-progress` | `{stage:'init'\|'browser'\|'polling'\|'success'\|'error', message, auth_url?}`（Qoder 设备流登录进度；auth_url 仅 browser 阶段携带） |
+| `qoder-oauth-done` | `{ok, id?, nickname?, message}`（设备流结果；成功已入池，凭证不出 Rust） |
 
 ## 7. 数据文件
 
@@ -253,9 +286,12 @@ ai-work-assistant/
 │   │   │                         #   workbuddy_settings / credits 三缓存 / wb_cli_rotate_state / doubao_* 等 29 键
 │   │   ├── 行文档实体表           # accounts / device_map / groups(+group_members) / remaining_credits /
 │   │   │                         #   account_cooldowns / pay_status / api_keys / custom_models /
-│   │   │                         #   doubao_accounts / wb_accounts / wb_tokens / api_usage —— (pk, data JSON)
+│   │   │                         #   doubao_accounts / wb_accounts / wb_tokens / api_usage /
+│   │   │                         #   qoder_accounts(池) / qoder_tokens(凭证 store，敏感字段占位) —— (pk, data JSON)
 │   │   └── 列化流水表             # credits_history / credits_daily / checkin_results(90天) / wb_checkin_results /
-│   │                             #   doubao_health_events / wb_credits_history(365天) / usage_history_*(365天) / sticky_bindings
+│   │                             #   doubao_health_events / wb_credits_history(365天) / usage_history_*(365天) / sticky_bindings /
+│   │                             #   qoder_checkin_results(90天) / qoder_credits_history(365天)
+│   │   kv 增量（Qoder）          # qoder_settings / qoder_groups / qoder_credits_cache(10min TTL)
 │   ├── backup/                   # 首启迁移时移入的旧 JSON（含 migration_manifest.json / corrupt/）
 │   ├── workbuddy_chats/          # WorkBuddy 会话三件套备份（<uid>/projects/ + 双 db + chat_backup_meta.json）
 │   ├── codebuddy_chats/          # CodeBuddy 会话三件套备份（F-74，同上结构，源 ~/.codebuddy）
@@ -268,7 +304,9 @@ ai-work-assistant/
 │   ├── profiles_trae/            # Trae CN 快照槽
 │   ├── profiles_doubao/          # 豆包快照槽（chromium 布局 + snapshot_meta.json + .bak 单代回滚）
 │   ├── profiles_workbuddy/       # WorkBuddy 快照槽（auth/ + storage/ + meta.json）
-│   └── profiles_codebuddy/       # CodeBuddy 快照槽（authfile 布局 + L3 vscdb 登录真源）
+│   ├── profiles_codebuddy/       # CodeBuddy 快照槽（authfile 布局 + L3 vscdb 登录真源）
+│   ├── profiles_qoder/           # Qoder 快照槽（authfile 布局，target_app="Qoder"）
+│   ├── profiles_qoder_work/      # Qoder Work 快照槽（electron_root 布局，target_app="QoderWork"）
 └── logs/                         # proxy / checkin / switcher / api / proxy-requests / app.log 日志
 ```
 

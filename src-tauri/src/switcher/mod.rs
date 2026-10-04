@@ -17,6 +17,7 @@
 pub mod authfile;
 pub mod chromium;
 pub mod copy;
+pub mod electron_root;
 pub mod icube;
 pub mod locate;
 pub mod machine;
@@ -69,6 +70,12 @@ pub enum TargetApp {
     Doubao,
     WorkBuddy,
     CodeBuddy,
+    /// F-80 M3：Qoder CN IDE（VS Code fork，icube 布局，数据目录 %APPDATA%\QoderCN）
+    Qoder,
+    /// 2026-10-02：Qoder Work 独立客户端（Electron，0.4.3+；数据目录
+    /// %APPDATA%\com.qodercn.app.stable，根级 Chromium 会话，与豆包多 Profile
+    /// 布局不同构 → electron_root 管线）。与 Qoder IDE 为两套独立登录态。
+    QoderWork,
 }
 
 impl TargetApp {
@@ -80,6 +87,8 @@ impl TargetApp {
             "Doubao" => TargetApp::Doubao,
             "WorkBuddy" => TargetApp::WorkBuddy,
             "CodeBuddy" => TargetApp::CodeBuddy,
+            "Qoder" => TargetApp::Qoder,
+            "QoderWork" => TargetApp::QoderWork,
             _ => TargetApp::TraeWork,
         }
     }
@@ -97,43 +106,58 @@ pub struct RunArgs {
     pub include_indexeddb: bool,
     /// -ExpectedCurrentUid（防误覆盖守卫：桌面端关闭前检测到的当前登录 uid）
     pub expected_current_uid: String,
+    /// F-80 §5.10.2 Qoder 专用：账号绑定 machine_id（切换/恢复成功后对本地存储
+    /// 三层覆写）；None = 不覆写（其余应用恒 None）
+    pub machine_id_override: Option<String>,
     /// AIWORKDATA_DIR 等价物（进程内直传；CLI 模式来自 AppState）
     pub data_dir: PathBuf,
 }
 
 /// 执行会话：一次 run_action 内共享的可变状态（PS $Script: 作用域 → 显式结构体）
 pub struct Session {
+    /// 所属目标应用（守卫按 target 收窄数据源：日志探测仅 Trae 系有意义）
+    pub target: TargetApp,
     pub prof: AppProfile,
     pub data_dir: PathBuf,
     /// PS $Script:_TraeExeCache（exe 发现第 6 级兜底 + Stop 前缓存）
     pub exe_cache: Option<PathBuf>,
-    /// PS $Script:_LastRestoredCount（icube 恢复后校验；每次恢复先置 -1，
-    /// 仅 icube 结尾写实际值）
+    /// PS $Script:_LastRestoredCount（icube/electron_root 恢复后校验；每次恢复先置 -1，
+    /// 对应布局结尾写实际值）
     pub last_restored_count: i64,
     /// PS $Script:LaunchProxyPort（>0 启动注入 --proxy-server）
     pub launch_proxy_port: Option<u16>,
     pub include_indexeddb: bool,
+    /// F-80 §5.10.2：账号绑定 machine_id（Qoder 切换/恢复后本地指纹覆写取值）
+    pub machine_id_override: Option<String>,
     /// authfile 布局：共享 auth 文件目录与文件（$Script:WbAuthDir/WbAuthFile；
     /// 独立字段便于测试注入临时路径）
     pub auth_dir: PathBuf,
     pub auth_file: PathBuf,
-    /// L2 守卫探测到的客户端当前登录 uid（icube 布局，stop 后从日志提取）；
-    /// 由 icube_save_identity_guard 写入，backup_icube 据此写槽位 sidecar
+    /// L2 守卫探测到的客户端当前登录 uid（icube/electron_root 布局，stop 后守卫写入）；
+    /// 由 save_identity_guard 写入，backup_icube 据此写槽位 sidecar
     pub detected_live_uid: Option<String>,
+    /// 命令层预探测的当前登录账号（2026-10-02 审查新增）：Qoder 保存链由
+    /// profile_backup 经 vscdb secret://userInfo 解密传入，QoderWork 由客户端
+    /// Cookies qoderuid 解密传入（Work/其他为空）。L2 守卫优先采用；为空时按布局
+    /// 回退（icube 仅 Trae 系走日志探测，见 save_identity_guard）
+    pub expected_current_uid: String,
 }
 
 impl Session {
     pub fn new(args: &RunArgs) -> Session {
         Session {
+            target: args.target_app,
             prof: profile::profile_for(args.target_app, &args.data_dir),
             data_dir: args.data_dir.clone(),
             exe_cache: None,
             last_restored_count: -1,
             launch_proxy_port: args.proxy_port,
             include_indexeddb: args.include_indexeddb,
+            machine_id_override: args.machine_id_override.clone(),
             auth_dir: authfile::wb_auth_dir(),
             auth_file: authfile::wb_auth_file(),
             detected_live_uid: None,
+            expected_current_uid: args.expected_current_uid.clone(),
         }
     }
 }
@@ -361,22 +385,43 @@ fn fatal_line(msg: &str) -> String {
 /// stop 前以 [`proc::is_running`] 记录 `was_running`。探测与目标不符 →
 /// 仅当 `was_running` 为真才重启客户端还原现场（原本没开的不拉起），拒绝，
 /// 绝不 rotate。
-fn icube_save_identity_guard(
+/// L2 保存身份守卫（SaveCurrentLogin/BackupCurrent 流内，stop 后执行）：探测客户端
+/// 当前登录账号，与目标槽位不一致 → 拒绝保存并重启客户端还原现场，防 A 的登录态
+/// 覆盖污染 B 的槽位（icube 布局 1335/4487 同型事故）。
+/// live 探测按布局分派（2026-10-02 审查重构）：
+/// - icube：命令层预探测优先（Qoder 保存链 vscdb secret://userInfo 解密传入，唯一
+///   可靠源）；空则日志探测回退——仅 TraeWork/Trae（Qoder 池 id 为 qd-<hex> 形态，
+///   与日志数字 uid 永不相等，回退会把「格式不同」误判为「登录了别的账号」恒拒保存）
+/// - electron_root（QoderWork）：预探测（命令层 live_work_account_id 解密 auth.v1.dat
+///   user.id；2026-10-04 实测修正——Cookies 库无 qoderuid cookie，原探测恒空守卫失效）
+///   非空才校验；空（未登录/文件缺失/解密失败）= fail-open 放行
+/// - 其余布局（chromium/authfile）无 icube 型身份防线，直接放行
+fn save_identity_guard(
     sess: &mut Session,
     uid: &str,
     was_running: bool,
     sink: &dyn ProgressSink,
 ) -> Result<(), String> {
-    if sess.prof.layout != Layout::Icube {
-        return Ok(());
-    }
-    match icube::detect_live_uid(&sess.prof.data_dir) {
+    let live = match sess.prof.layout {
+        Layout::Icube => {
+            if !sess.expected_current_uid.is_empty() {
+                Some(sess.expected_current_uid.clone())
+            } else if matches!(sess.target, TargetApp::TraeWork | TargetApp::Trae) {
+                icube::detect_live_uid(&sess.prof.data_dir)
+            } else {
+                None
+            }
+        }
+        Layout::ElectronRoot => {
+            (!sess.expected_current_uid.is_empty()).then(|| sess.expected_current_uid.clone())
+        }
+        _ => return Ok(()),
+    };
+    match live {
         Some(live) if live != uid => {
-            let msg = format!(
-                "客户端当前登录的是账号 {live}，与要保存的账号 {uid} 不一致，已拒绝保存\
-                 （防止账号 {uid} 的槽位被账号 {live} 的登录态覆盖污染）。\
-                 请先「切换」到账号 {uid} 并在客户端确认登录，再点「保存当前登录态」。"
-            );
+            // issue #55 审查修复：文案按槽位状态分流（首存指引/污染自愈指引/通用），
+            // 不再一律指回「切换」（对无快照账号不可执行、对污染槽位是死循环）
+            let msg = save_reject_message(&sess.prof.profiles_dir, uid, &live);
             // 还原现场：仅当客户端原本在运行（调用方 stop 前经 is_running 确认）
             // 才拉回，避免把原本没开的客户端意外拉起；失败仅 Warn，不影响拒绝结果
             if was_running {
@@ -405,7 +450,7 @@ fn icube_save_identity_guard(
             Ok(())
         }
         None => {
-            // 探测失败（无日志/最新会话无 uid 记录）：fail-open 放行，
+            // 探测失败（无日志/最新会话无 uid 记录/命令层未预探测）：fail-open 放行，
             // 与 F2-5 authfile 守卫的 None 放行策略一致
             sink.step(
                 "guard",
@@ -417,17 +462,58 @@ fn icube_save_identity_guard(
     }
 }
 
+/// 保存守卫拒绝文案分派（issue #55 审查修复 2026-10-03）：L1 命令层与 L2 switcher
+/// 共用，按槽位状态给出**可执行**的补救指引。通用文案的「先切换到该账号」对两类
+/// 场景不可执行/死循环（issue #55 实测）：
+/// ① 槽位不存在（OAuth/扫描新入池账号首次保存）：切换无快照可恢复 → 指引客户端手动登录；
+/// ② 槽位 sidecar 记录的保存身份与槽位不符（历史污染）：「切换」只会恢复出被污染的
+///    会话（A 槽存了 B 的会话后，切到 A 恒登录为 B）→ 指引客户端退出重登；
+/// ③ 其余：通用文案（保留原语义 + 手动登录兜底提示）
+pub(crate) fn save_reject_message(profiles_dir: &Path, uid: &str, live: &str) -> String {
+    let slot = profiles_dir.join(uid);
+    let slot_bak = profiles_dir.join(format!("{uid}.bak"));
+    if !slot.exists() && !slot_bak.exists() {
+        return format!(
+            "客户端当前登录的是账号 {live}，与要保存的账号 {uid} 不一致，已拒绝保存。\
+账号 {uid} 还没有本地快照（如刚通过 OAuth/扫描入池），「切换」无法恢复出该账号。\
+请在客户端手动登录账号 {uid}（勿用「切换」），登录成功后再点「保存当前登录态」。"
+        );
+    }
+    let sidecar = profiles_dir.join(format!("{uid}.meta.json"));
+    if let Ok(text) = std::fs::read_to_string(&sidecar) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(saved) = v.get("detectedUid").and_then(|x| x.as_str()) {
+                if !saved.is_empty() && saved != uid {
+                    return format!(
+                        "客户端当前登录的是账号 {live}，与要保存的账号 {uid} 不一致，已拒绝保存。\
+账号 {uid} 的快照疑似已被账号 {saved} 的登录态污染（该快照保存时检测到的客户端身份是 {saved}），\
+此时「切换」到账号 {uid} 也只会恢复出账号 {saved} 的会话，反复操作无法自愈。\
+请在客户端退出登录并手动重新登录账号 {uid}，再点「保存当前登录态」覆盖修复。"
+                    );
+                }
+            }
+        }
+    }
+    format!(
+        "客户端当前登录的是账号 {live}，与要保存的账号 {uid} 不一致，已拒绝保存\
+（防止账号 {uid} 的槽位被账号 {live} 的登录态覆盖污染）。\
+请先「切换」到账号 {uid} 并在客户端确认登录身份是 {uid}（若不是，请退出登录后手动登录），\
+再点「保存当前登录态」。"
+    )
+}
+
 fn backup_current(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
     match sess.prof.layout {
         Layout::Authfile => authfile::backup_authfile(sess, slot, sink),
         Layout::Chromium => chromium::backup_chromium(sess, slot, sink),
+        Layout::ElectronRoot => electron_root::backup_electron_root(sess, slot, sink),
         Layout::Icube => icube::backup_icube(sess, slot, sink),
     }
 }
 
 fn restore_profile(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
-    // 恢复项计数（Switch 恢复后校验用）：每次恢复先重置为 -1；仅 icube 结尾写实际值。
-    // 校验处用 -le 0 拦截：icube 下等价于 0 项拷贝=快照空/损坏；-1 作为防御一并拦下。
+    // 恢复项计数（Switch 恢复后校验用）：每次恢复先重置为 -1；icube/electron_root
+    // 结尾写实际值。校验处用 -le 0 拦截：等价于 0 项拷贝=快照空/损坏；-1 作为防御一并拦下。
     sess.last_restored_count = -1;
     // F-68：icube 布局（TraeWork/Trae）恢复前抽出 state.vscdb 的两个全局键
     //（项目列表 / 最近打开），恢复后按条目合并回写——账号分区键零改动。
@@ -446,6 +532,7 @@ fn restore_profile(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) -> R
     let r = match sess.prof.layout {
         Layout::Authfile => authfile::restore_authfile(sess, slot, sink),
         Layout::Chromium => chromium::restore_chromium(sess, slot, sink),
+        Layout::ElectronRoot => electron_root::restore_electron_root(sess, slot, sink),
         Layout::Icube => icube::restore_icube(sess, slot, sink),
     };
     if r.is_ok() {
@@ -552,7 +639,7 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
         Action::SaveCurrentLogin => {
             let was_running = proc::is_running(&sess);
             proc::stop_app(&mut sess, sink)?;
-            icube_save_identity_guard(&mut sess, uid.trim(), was_running, sink)?;
+            save_identity_guard(&mut sess, uid.trim(), was_running, sink)?;
             backup_current(&sess, uid.trim(), sink)?;
             set_current_account(&sess, uid.trim());
             proc::start_app(&mut sess, sink)?;
@@ -563,7 +650,7 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
             // 防止文件锁下拷贝静默缺文件生成"看似成功"的坏快照；备份完成后拉回
             let was_running = proc::is_running(&sess);
             proc::stop_app(&mut sess, sink)?;
-            icube_save_identity_guard(&mut sess, uid.trim(), was_running, sink)?;
+            save_identity_guard(&mut sess, uid.trim(), was_running, sink)?;
             backup_current(&sess, uid.trim(), sink)?;
             set_current_account(&sess, uid.trim());
             proc::start_app(&mut sess, sink)?;
@@ -575,6 +662,7 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
             proc::stop_app(&mut sess, sink)?;
             backup_current(&sess, "last", sink)?;
             restore_profile(&mut sess, uid.trim(), sink)?;
+            apply_fingerprint_override(&sess, sink);
             set_current_account(&sess, uid.trim());
             proc::start_app(&mut sess, sink)?;
             done(
@@ -599,6 +687,69 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
     // 备份失败/设备重置未接入等）已在错误点经 thrown() 补发 fatal「失败: {msg}」；
     // PS 直接 exit 1 路径（预检失败/恢复后校验回滚完成）自带 fatal 行。此处透传。
     r
+}
+
+/// F-80 §5.10.2：Qoder 本地存储设备指纹覆写挂点（切号/恢复成功后、启动前）。
+/// 仅 icube 布局且 Session 携带 machine_id_override 时执行：machineid 文件 +
+/// storage.json 遥测三键 + state.vscdb storage.serviceMachineId 三层统一覆写为
+/// 账号绑定值。失败仅 Warn 不阻断切换（API 请求侧指纹由 tasks::qoder_common 独立
+/// 生效）；快照无效回滚路径在挂点之前 return，不会污染切换前现场。
+fn apply_fingerprint_override(sess: &Session, sink: &dyn ProgressSink) {
+    if sess.prof.layout != Layout::Icube {
+        return;
+    }
+    let Some(mid) = sess.machine_id_override.as_deref() else {
+        return;
+    };
+    match machine::apply_qoder_fingerprint(&sess.prof.data_dir, mid) {
+        Ok(n) => sink.step(
+            "fingerprint",
+            StepStatus::Ok,
+            &format!("本地设备指纹已按账号绑定覆写（{n} 处）"),
+        ),
+        Err(e) => sink.step(
+            "fingerprint",
+            StepStatus::Warn,
+            &format!("本地设备指纹覆写失败（不阻断切换）: {e}"),
+        ),
+    }
+}
+
+/// 恢复后校验的 missing 判定（switch_flow 主快照与 .bak 回退重试共用；issue #9）：
+/// ①0 项恢复 = 快照空/损坏；②缺关键登录态文件 = 快照不含登录态或布局漂移。
+/// 仅 icube/electron_root 有可靠判定数据源，其余布局恒空。
+fn post_restore_missing(sess: &Session) -> Vec<String> {
+    match sess.prof.layout {
+        Layout::Icube => {
+            let mut m: Vec<String> = Vec::new();
+            if sess.last_restored_count <= 0 {
+                m.push("（快照为空或损坏，0 项恢复）".to_string());
+            } else {
+                for f in ["User\\globalStorage\\storage.json", "User\\globalStorage\\state.vscdb"] {
+                    // 清单为 Windows 反斜杠形态：join 前必须组件化——mac 上 join 整串会把
+                    // 反斜杠当作字面文件名，校验恒失败 → 恒回滚 last 槽 =「无论怎么切换
+                    // 都是最后一个登录的账号」（2026-09-20 mac 实测根因，switcher.log 佐证）
+                    if !sess.prof.data_dir.join(icube::rel_path(f)).exists() {
+                        m.push(f.to_string());
+                    }
+                }
+            }
+            m
+        }
+        // 2026-10-02 审查：QoderWork（electron_root）同型校验——Local State 是
+        // cookie 解密密钥元数据，缺失则 Work 恢复后必然未登录，按 fatal 回滚；
+        // Cookies 缺失仅 Warn（快照可能是「启动过但未登录」的合法状态）
+        Layout::ElectronRoot => {
+            let mut m: Vec<String> = Vec::new();
+            if sess.last_restored_count <= 0 {
+                m.push("（快照为空或损坏，0 项恢复）".to_string());
+            } else if !sess.prof.data_dir.join("Local State").exists() {
+                m.push("Local State".to_string());
+            }
+            m
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Switch 主流程（PS 1415-1477 逐段对译，含防误覆盖守卫与恢复后校验回滚）
@@ -656,43 +807,82 @@ fn switch_flow(
     // 恢复目标账号的登录态
     restore_profile(sess, uid, sink)?;
 
-    // 恢复后校验（issue #9，仅 icube）：①0 项恢复=快照空/损坏；②恢复后数据目录缺
-    // storage.json / state.vscdb = 快照不含关键登录态或 TRAE 布局漂移。两种情况
+    // 恢复后校验（issue #9，仅 icube/electron_root）：①0 项恢复=快照空/损坏；
+    // ②恢复后数据目录缺关键登录态文件 = 快照不含登录态或布局漂移。两种情况
     // 启动都只会「切了个寂寞」——从 last 槽回滚到切换前状态并重启，报 fatal 明示原因。
-    if sess.prof.layout == Layout::Icube {
-        let mut missing: Vec<String> = Vec::new();
-        if sess.last_restored_count <= 0 {
-            missing.push("（快照为空或损坏，0 项恢复）".to_string());
-        } else {
-            for f in ["User\\globalStorage\\storage.json", "User\\globalStorage\\state.vscdb"] {
-                // 清单为 Windows 反斜杠形态：join 前必须组件化——mac 上 join 整串会把
-                // 反斜杠当作字面文件名，校验恒失败 → 恒回滚 last 槽 =「无论怎么切换
-                // 都是最后一个登录的账号」（2026-09-20 mac 实测根因，switcher.log 佐证）
-                if !sess.prof.data_dir.join(icube::rel_path(f)).exists() {
-                    missing.push(f.to_string());
-                }
-            }
-        }
-        if !missing.is_empty() {
+    let mut missing = post_restore_missing(sess);
+    // 缺陷4（issue #55 实测「traecode 切换失败」根因=主快照无效）：主快照损坏时
+    // 先尝试 <uid>.bak 回退槽（rotate_bak 保留的上一次覆盖前旧快照），有效则改用，
+    // 仍无效才回滚——旧逻辑直接回滚 fatal，用户必须手动重登重建快照；.bak 里往往
+    // 还留着一份完好的历史快照，白白浪费。
+    // 前置条件：主槽目录存在（若主槽本就缺失，resolve_slot 已自动回退 .bak，无需重试）
+    if !missing.is_empty() {
+        let bak_slot = format!("{uid}.bak");
+        if sess.prof.profiles_dir.join(uid).exists()
+            && sess.prof.profiles_dir.join(&bak_slot).exists()
+        {
             sink.step(
                 "restore",
                 StepStatus::Warn,
                 &format!(
-                    "目标快照无效（{}），正在从 last 槽回滚到切换前状态…",
+                    "主快照无效（{}），尝试回退槽 {bak_slot}…",
                     missing.join("；")
                 ),
             );
-            restore_profile(sess, "last", sink)?;
-            proc::start_app(sess, sink)?;
-            let msg = format!(
-                "账号 {uid} 的快照无效（{}），已回滚到切换前状态。请登录该账号后重新「保存当前登录态」；若重新保存后仍报此错，可能是 TRAE 新版登录态布局变化，请携带日志反馈",
-                missing.join("；")
-            );
-            sink.step("fatal", StepStatus::Error, &msg);
-            return Err(fatal_line(&msg));
+            // 恢复失败不中止（审查修复）：此时 live 已是坏的主快照内容，必须落回
+            // 下方 last 槽回滚 + 重启客户端，不能把停在关机状态的现场丢给用户
+            match restore_profile(sess, &bak_slot, sink) {
+                Ok(()) => {
+                    missing = post_restore_missing(sess);
+                    if missing.is_empty() {
+                        sink.step(
+                            "restore",
+                            StepStatus::Ok,
+                            &format!("回退槽 {bak_slot} 有效，已改用其恢复登录态"),
+                        );
+                    }
+                }
+                Err(e) => sink.step(
+                    "restore",
+                    StepStatus::Warn,
+                    &format!("回退槽 {bak_slot} 恢复失败（将回滚到切换前状态）: {e}"),
+                ),
+            }
         }
     }
+    if !missing.is_empty() {
+        sink.step(
+            "restore",
+            StepStatus::Warn,
+            &format!(
+                "目标快照无效（{}），正在从 last 槽回滚到切换前状态…",
+                missing.join("；")
+            ),
+        );
+        restore_profile(sess, "last", sink)?;
+        proc::start_app(sess, sink)?;
+        let msg = format!(
+            "账号 {uid} 的快照无效（{}），已回滚到切换前状态。请在客户端手动登录账号 {uid}\
+             （登录成功后点「保存当前登录态」重建快照；勿再「切换」到该账号，会重复此错误）；\
+             若重新保存后仍报此错，可能是 {} 新版登录态布局变化，请携带日志反馈",
+            missing.join("；"),
+            sess.prof.app_name
+        );
+        sink.step("fatal", StepStatus::Error, &msg);
+        return Err(fatal_line(&msg));
+    }
+    // QoderWork 软校验：Cookies 缺失（快照为「启动过但未登录」态）不回滚，如实告知
+    if sess.prof.layout == Layout::ElectronRoot
+        && !sess.prof.data_dir.join("Network").join("Cookies").exists()
+    {
+        sink.step(
+            "restore",
+            StepStatus::Warn,
+            "目标快照不含 Cookies——恢复后 Qoder Work 可能为未登录状态，请登录后重新保存快照",
+        );
+    }
 
+    apply_fingerprint_override(sess, sink);
     set_current_account(sess, uid);
     proc::start_app(sess, sink)?;
 
@@ -774,6 +964,97 @@ mod tests {
         }
     }
 
+    /// save_identity_guard 分派（2026-10-02 审查补齐 QoderWork 守卫的集成验证）：
+    /// electron_root 布局下预探测非空且与槽位一致 → Ok 并记录 detected_live_uid；
+    /// 预探测为空（未登录/Cookie 缺失/解密失败）→ Ok fail-open 且不记录。
+    /// 注：不一致分支含 proc::start_app（本机若装有 Work 会真实拉起客户端），
+    /// 出于副作用安全不在测试范围，其拒绝语义由消息拼接单测覆盖。
+    #[test]
+    fn save_identity_guard_electron_root_预探测分派() {
+        let base = std::env::temp_dir().join(format!("sw-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let args = RunArgs {
+            action: Action::BackupCurrent,
+            target_app: TargetApp::QoderWork,
+            user_id: Some("qd-x".into()),
+            proxy_port: None,
+            include_indexeddb: false,
+            expected_current_uid: "qd-x".into(),
+            machine_id_override: None,
+            data_dir: base.clone(),
+        };
+        // 一致：Ok + detected_live_uid 记录（backup 流随后据此回写来源标记）
+        // was_running=false：测试环境不拉起客户端（mismatch 分支 proc::start_app 有副作用）
+        let mut sess = Session::new(&args);
+        save_identity_guard(&mut sess, "qd-x", false, &MemSink::new()).unwrap();
+        assert_eq!(sess.detected_live_uid.as_deref(), Some("qd-x"));
+        // fail-open：expected_current_uid 为空（RunArgs 未预探测到登录账号）
+        let args2 = RunArgs { expected_current_uid: String::new(), ..args };
+        let mut sess2 = Session::new(&args2);
+        let sink = MemSink::new();
+        save_identity_guard(&mut sess2, "qd-x", false, &sink).unwrap();
+        assert!(sess2.detected_live_uid.is_none());
+        assert!(
+            sink.steps
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(s, st, _)| s == "guard" && st == "warn"),
+            "fail-open 应留 Warn 步骤"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// save_reject_message 三类场景分流（issue #55）：无槽位 → 首存指引（勿用切换）；
+    /// sidecar detectedUid ≠ 槽位 → 污染自愈指引（切换是死循环）；其余 → 通用文案
+    #[test]
+    fn save_reject_message_三类场景分流() {
+        let base = std::env::temp_dir().join(format!(
+            "sw-reject-msg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let profiles = base.join("data").join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+
+        // ① 无槽位（OAuth/扫描新入池账号首次保存）
+        let m1 = save_reject_message(&profiles, "3401253136383392", "2011463847263801");
+        assert!(m1.contains("还没有本地快照"), "m1={m1}");
+        assert!(m1.contains("手动登录"), "m1={m1}");
+
+        // ② 槽位存在 + sidecar 记录的保存身份是别的账号（历史污染）
+        std::fs::create_dir_all(profiles.join("1335050000000000")).unwrap();
+        std::fs::write(
+            profiles.join("1335050000000000.meta.json"),
+            r#"{"slot":"1335050000000000","savedAtMs":1,"detectedUid":"4487568582777872"}"#,
+        )
+        .unwrap();
+        let m2 = save_reject_message(&profiles, "1335050000000000", "4487568582777872");
+        assert!(m2.contains("污染"), "m2={m2}");
+        assert!(m2.contains("退出登录并手动重新登录"), "m2={m2}");
+
+        // ③ 槽位存在、无 sidecar / sidecar 身份一致 → 通用文案
+        std::fs::create_dir_all(profiles.join("2117003799429594")).unwrap();
+        let m3 = save_reject_message(&profiles, "2117003799429594", "4487568582777872");
+        assert!(m3.contains("已拒绝保存"), "m3={m3}");
+        assert!(m3.contains("确认登录身份"), "m3={m3}");
+        // sidecar 身份与槽位一致 → 不走污染文案
+        std::fs::write(
+            profiles.join("2117003799429594.meta.json"),
+            r#"{"slot":"2117003799429594","savedAtMs":1,"detectedUid":"2117003799429594"}"#,
+        )
+        .unwrap();
+        let m4 = save_reject_message(&profiles, "2117003799429594", "4487568582777872");
+        // 通用文案含「覆盖污染」字样，污染专案文案的特征是「疑似已被…污染」+「退出登录并手动重新登录」
+        assert!(!m4.contains("疑似已被"), "m4={m4}");
+        assert!(!m4.contains("反复操作无法自愈"), "m4={m4}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn glob_大小写不敏感与ps_like语义一致() {
         assert!(glob_match_ci("*Doubao*", "doubao.lnk"));
@@ -810,6 +1091,7 @@ mod tests {
             proxy_port: None,
             include_indexeddb: false,
             expected_current_uid: String::new(),
+            machine_id_override: None,
             data_dir: dir.clone(),
         };
         args.target_app = TargetApp::TraeWork;
@@ -838,6 +1120,7 @@ mod tests {
                 proxy_port: None,
                 include_indexeddb: false,
                 expected_current_uid: String::new(),
+                machine_id_override: None,
                 data_dir: std::env::temp_dir(),
             },
             &sink,
@@ -861,6 +1144,7 @@ mod tests {
                 proxy_port: None,
                 include_indexeddb: false,
                 expected_current_uid: String::new(),
+                machine_id_override: None,
                 data_dir: std::env::temp_dir(),
             },
             &sink,

@@ -94,6 +94,9 @@ pub struct ProxyCtx {
     /// 上游代理（用户 VPN）：配置后所有转发流量（MITM/WS/隧道）一律先经上游，
     /// 失败回退直连 —— 镜像客户端无本代理时的正常出口路径（见 upstream.rs 模块注释）
     pub upstream: Option<crate::device_proxy::upstream::UpstreamProxy>,
+    /// 直连白名单域（p3-2e，后缀匹配）：命中域跳过上游 VPN 直接连目标
+    ///（qoder 国内域经 VPN 实测全挂、直连恢复），供 WS 路径与隧道判定
+    pub direct_domains: Arc<Vec<String>>,
     /// 自适应证书锁定降级：host → (握手成功数, 握手被中止数, 已判定锁定)。
     /// 失败率判定（非连续计数）：投机性预连接风暴（客户端并发开连接再裁撤，
     /// 握手 RST）会造成「连续 3 次失败」的假阳性，把正常域误降级为直通（实测
@@ -1202,6 +1205,7 @@ mod tests {
             auto_capture_jwt: true,
             data_dir: dir.clone(),
             upstream: None,
+            direct_domains: Arc::new(Vec::new()),
             pin_state: Mutex::new(HashMap::new()),
         }
     }

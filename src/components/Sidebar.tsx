@@ -12,6 +12,7 @@ import {
   Info,
   Sparkles,
   Bot,
+  Boxes,
   LayoutGrid,
 } from 'lucide-react';
 import { useAppStore } from '../store';
@@ -49,10 +50,21 @@ const BUDDY_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'buddy-settings', label: '环境配置', icon: Settings },
 ];
 
-/** 应用切换 Tab：trae = 当前菜单；buddy = 批次1接入；doubao = 接入中 */
+/** Qoder 应用菜单（F-80：IDE / Work / CLI 三端共用六页子导航，P1 对齐 Buddy） */
+const QODER_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
+  { key: 'qoder-overview', label: '概述', icon: LayoutDashboard },
+  { key: 'qoder-accounts', label: '账号管理', icon: Users },
+  { key: 'qoder-checkin', label: '每日签到', icon: PlayCircle },
+  { key: 'qoder-credits', label: '积分看板', icon: Coins },
+  { key: 'qoder-api-service', label: '资源调度', icon: Server },
+  { key: 'qoder-settings', label: '环境配置', icon: Settings },
+];
+
+/** 应用切换 Tab：trae = 当前菜单；buddy = 批次1接入；qoder = F-80 接入；doubao = 接入中 */
 const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disabled?: boolean; title?: string }[] = [
   { key: 'trae', label: 'Trae', icon: Sparkles },
   { key: 'buddy', label: 'Buddy', icon: Bot, title: 'WorkBuddy / CodeBuddy' },
+  { key: 'qoder', label: 'Qoder', icon: Boxes, title: 'Qoder CN（IDE / Work / CLI）' },
   { key: 'doubao', label: '豆包', icon: LayoutGrid },
 ];
 
@@ -70,8 +82,15 @@ export default function Sidebar({
   const [showAbout, setShowAbout] = useState(false);
   const [showSystem, setShowSystem] = useState(false);
 
-  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 5 页（批次1）
-  const nav = activeApp === 'doubao' ? DOUBAO_NAV : activeApp === 'buddy' ? BUDDY_NAV : NAV;
+  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）
+  const nav =
+    activeApp === 'doubao'
+      ? DOUBAO_NAV
+      : activeApp === 'buddy'
+      ? BUDDY_NAV
+      : activeApp === 'qoder'
+      ? QODER_NAV
+      : NAV;
 
   // 主题轮询：每次点击切换到下一个主题并持久化
   const cycleTheme = async () => {
@@ -111,7 +130,7 @@ export default function Sidebar({
       </nav>
       {/* 应用切换 Tab（位于左下角工具图标行上方） */}
       <div className="border-t border-slate-200 p-3 dark:border-zinc-800">
-        <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
+        <div className="grid grid-cols-4 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
           {APP_TABS.map((tab) => {
             const TabIcon = tab.icon;
             const active = activeApp === tab.key;

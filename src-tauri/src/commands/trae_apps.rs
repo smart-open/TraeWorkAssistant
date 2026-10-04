@@ -306,6 +306,36 @@ pub(crate) fn current_cloud_uid_hybrid(
     }
 }
 
+/// 存活登录身份探测（issue #55 审查修复 2026-10-03）：当前登录账号的 Cloud-IDE uid。
+/// 数据源优先级：
+/// 1. 客户端日志探测（icube::detect_live_uid）——最新会话 dynamicConfig.log 的明文
+///    uid，与账号池同体系，是「客户端现在登录的是谁」的直接证据。issue #55 实测：
+///    手动重登新账号后 hybrid 会因桥标记/快照冻结旧证据失真而指向历史账号，导致
+///    扫描把旧账号误报为「当前登录（已入池）」、保存守卫误拒合法保存；
+/// 2. hybrid（桥标记 + 本机使用证据）回退——日志不可用（客户端从未运行/最新会话
+///    无 uid 记录）时维持既有行为。
+pub(crate) fn live_cloud_uid(kind: &str, data_dir: &std::path::Path) -> Option<String> {
+    let app_dir = app_data_dirs(kind)
+        .into_iter()
+        // 组件化相对路径（mac 兼容：反斜杠常量整串 join 在 mac 恒 miss，见 storage_json_rel）
+        .find(|d| d.join(storage_json_rel()).is_file());
+    live_cloud_uid_with(app_dir, kind, data_dir)
+}
+
+/// 测试注入版：`app_dir` 为命中的应用数据目录候选（None = 未找到 storage.json）。
+fn live_cloud_uid_with(
+    app_dir: Option<std::path::PathBuf>,
+    kind: &str,
+    data_dir: &std::path::Path,
+) -> Option<String> {
+    if let Some(dir) = app_dir {
+        if let Some(uid) = crate::switcher::icube::detect_live_uid(&dir) {
+            return Some(uid);
+        }
+    }
+    current_cloud_uid_hybrid(kind, data_dir)
+}
+
 #[derive(Serialize, Clone)]
 pub struct DiscoveredAccount {
     /// 账号池体系（Cloud-IDE）uid。uid_confident=false 时为账户中心 uid（仅展示，不可入池）
@@ -320,6 +350,12 @@ pub struct DiscoveredAccount {
     pub app_label: String,
     /// 是否已在账号池
     pub in_pool: bool,
+    /// 已入池时匹配到的账号名（user_id 直配优先；issue #55：「已入池」但列表无从
+    /// 对账的透明化）
+    pub matched_account_name: Option<String>,
+    /// true = 仅经某账号 JWT 的 data.id 命中（该账号 user_id 与本 uid 不一致，
+    /// 列表中找不到与本 uid 同号的行，提示用户检查该账号）
+    pub matched_via_jwt: bool,
     /// 命中的 storage.json 路径
     pub storage_path: String,
 }
@@ -344,6 +380,19 @@ fn pool_uid_set(accounts: &crate::models::AccountsFile) -> std::collections::Has
             ids
         })
         .collect()
+}
+
+/// 已入池 uid 的来源反查（issue #55 透明化）：返回 (账号名, 是否仅经 JWT 命中)。
+/// user_id 直配优先；仅 JWT data.id 命中 = 账号 user_id 与 JWT 归属不一致
+///（「扫描显示已入池但列表找不到同号账号」的土壤之一）。
+fn pool_match_for(accounts: &crate::models::AccountsFile, uid: &str) -> Option<(String, bool)> {
+    if let Some(a) = accounts.accounts.iter().find(|a| a.user_id.as_deref() == Some(uid)) {
+        return Some((a.name.clone(), false));
+    }
+    accounts.accounts.iter().find_map(|a| {
+        (!a.jwt.trim().is_empty() && crate::jwt::parse(&a.jwt).user_id.as_deref() == Some(uid))
+            .then(|| (a.name.clone(), true))
+    })
 }
 
 /// F-08：扫描本机两个 Trae 应用的登录账号（推导 Cloud-IDE uid，标记是否已入池）。
@@ -372,11 +421,22 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
             // 未登录任何账号
             continue;
         }
-        // 推导当前登录账号的 Cloud-IDE uid；失败则回退 dc uid（标记不置信，禁止入池）
-        match current_cloud_uid_hybrid(kind, &state.data_dir) {
+        // 推导当前登录账号的 Cloud-IDE uid（issue #55 审查修复：日志探测优先，
+        // hybrid 回退）；失败则回退 dc uid（标记不置信，禁止入池）
+        match live_cloud_uid(kind, &state.data_dir) {
             Some(cloud_uid) => {
+                let in_pool = known.contains(&cloud_uid);
+                let (matched_account_name, matched_via_jwt) = if in_pool {
+                    pool_match_for(&accounts, &cloud_uid)
+                        .map(|(n, j)| (Some(n), j))
+                        .unwrap_or((None, false))
+                } else {
+                    (None, false)
+                };
                 out.push(DiscoveredAccount {
-                    in_pool: known.contains(&cloud_uid),
+                    in_pool,
+                    matched_account_name,
+                    matched_via_jwt,
                     dc_uid: dc_uids.first().cloned(),
                     uid_confident: true,
                     user_id: cloud_uid,
@@ -389,6 +449,8 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
                 for dc in &dc_uids {
                     out.push(DiscoveredAccount {
                         in_pool: false,
+                        matched_account_name: None,
+                        matched_via_jwt: false,
                         dc_uid: Some(dc.clone()),
                         uid_confident: false,
                         user_id: dc.clone(),
@@ -610,15 +672,17 @@ fn pool_name_for(accounts: &crate::models::AccountsFile, uid: &str) -> Option<St
     })
 }
 
-/// 单应用的当前登录信息 + 套餐：登录信息（uid/账号名）来自混合推导（证据 + 桥标记，
-/// F2-6），套餐来自 storage.json 明文缓存；套餐解析失败不影响登录信息展示。
+/// 单应用的当前登录信息 + 套餐：登录信息（uid/账号名）来自 live_cloud_uid（日志
+/// 探测优先，hybrid 回退——issue #55 审查修复，与扫描/守卫同源，列表「登录中」
+/// 角标不再被桥标记/冻结证据带偏），套餐来自 storage.json 明文缓存；套餐解析失败
+/// 不影响登录信息展示。
 fn app_login(
     kind: &str,
     accounts: &crate::models::AccountsFile,
     data_dir: &std::path::Path,
 ) -> Option<AppEntitlement> {
     let storage = read_storage_json(kind)?;
-    let uid = current_cloud_uid_hybrid(kind, data_dir);
+    let uid = live_cloud_uid(kind, data_dir);
     let account_name = uid.as_deref().and_then(|u| pool_name_for(accounts, u));
     let ent = parse_entitlement(kind, &storage);
     Some(AppEntitlement {
@@ -740,7 +804,100 @@ pub fn refresh_pay_status(state: State<AppState>) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::marker_with_ts;
+    use super::{live_cloud_uid_with, marker_with_ts, pool_match_for};
+
+    /// live_cloud_uid_with：客户端日志探测优先（当前会话 dynamicConfig.log uid），
+    /// 日志不可用时回退 hybrid（桥标记）。标记 sidecar 设为远未来时间戳，
+    /// 保证 hybrid 分支确定选标记（不受测试机真实 %APPDATA% 证据干扰）。
+    #[test]
+    fn live_cloud_uid_with_日志优先与hybrid回退() {
+        let base = std::env::temp_dir().join(format!(
+            "trae-apps-live-uid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        // 应用数据目录：最新会话日志记录 uid=3401…（客户端真实登录）
+        let app_dir = base.join("appdata");
+        let sess_dir = app_dir.join("logs").join("20261003T101010");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        std::fs::write(
+            sess_dir.join("dynamicConfig.log"),
+            "url https://x/dynamicConfig?uid=3401253136383392&ok=1",
+        )
+        .unwrap();
+        // 桥标记指向另一账号（hybrid 会选它）：sidecar 远未来 → 证据恒输
+        let prof_dir = crate::switcher::profile::profile_for(
+            crate::switcher::TargetApp::TraeWork,
+            &base,
+        )
+        .profiles_dir;
+        std::fs::create_dir_all(&prof_dir).unwrap();
+        std::fs::write(prof_dir.join("current_account.txt"), "2011463847263801").unwrap();
+        std::fs::write(
+            prof_dir.join("current_account.meta.json"),
+            "{\"switchedAtMs\":4102444800000}",
+        )
+        .unwrap();
+        // 有日志 → 日志 uid 优先（issue #55：手动重登新账号后不再被标记带偏）
+        assert_eq!(
+            live_cloud_uid_with(Some(app_dir.clone()), "TraeWork", &base).as_deref(),
+            Some("3401253136383392")
+        );
+        // 日志不可用 → 回退 hybrid（标记）
+        assert_eq!(
+            live_cloud_uid_with(None, "TraeWork", &base).as_deref(),
+            Some("2011463847263801")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// pool_match_for：user_id 直配优先；仅 JWT data.id 命中时 matched_via_jwt=true
+    #[test]
+    fn pool_match_for_直配优先与jwt命中标记() {
+        let mk_jwt = |uid: &str| {
+            let b64 = |v: &serde_json::Value| {
+                use base64::Engine as _;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(v).unwrap())
+            };
+            format!(
+                "{}.{}.sig",
+                b64(&serde_json::json!({"alg": "RS256"})),
+                b64(&serde_json::json!({"data": {"id": uid}}))
+            )
+        };
+        let accounts = crate::models::AccountsFile {
+            accounts: vec![
+                crate::models::RawAccount {
+                    name: "直配账号".into(),
+                    user_id: Some("3401253136383392".into()),
+                    ..Default::default()
+                },
+                crate::models::RawAccount {
+                    name: "错绑JWT账号".into(),
+                    user_id: Some("2011463847263801".into()),
+                    jwt: mk_jwt("2117003799429594"),
+                    ..Default::default()
+                },
+            ],
+        };
+        // 直配
+        assert_eq!(
+            pool_match_for(&accounts, "3401253136383392"),
+            Some(("直配账号".into(), false))
+        );
+        // 仅 JWT data.id 命中（该账号 user_id 是另一个 uid）
+        assert_eq!(
+            pool_match_for(&accounts, "2117003799429594"),
+            Some(("错绑JWT账号".into(), true))
+        );
+        // 未入池
+        assert_eq!(pool_match_for(&accounts, "9999999999999999"), None);
+    }
 
     /// marker_with_ts：标记 uid + sidecar 切换时刻（缺失 sidecar → ts=0；
     /// BOM 剥离与 profiles 目录路由按档案表）

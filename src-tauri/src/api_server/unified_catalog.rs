@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::dispatch::TargetPool;
 use super::models_sync::{self, ModelOption};
@@ -145,6 +146,12 @@ fn vendor_of(canonical: &str) -> &'static str {
         ("gpt", "OpenAI"),
         ("o1", "OpenAI"),
         ("o3", "OpenAI"),
+        // 2026-10-02：Qoder 目录新增模型（step-5-preview / step5model 形态、
+        // space-bunny）；Space-Bunny 供应商产品确认为未知，标注「未知」
+        ("step-5", "阶跃星辰"),
+        ("step5", "阶跃星辰"),
+        ("space-bunny", "未知"),
+        ("spacebunny", "未知"),
     ] {
         if canonical.starts_with(prefix) {
             return vendor;
@@ -230,15 +237,29 @@ pub fn save_whitelist(data_dir: &Path, models: &[String]) -> Result<Vec<String>,
 }
 
 /// 聚合目录 ∩ 白名单（GET /v1/models 对外目录用）；
-/// 管理端 api_unified_models 不过滤（需全量 + 白名单状态展示）
+/// 管理端 api_unified_models 不过滤（需全量 + 白名单状态展示）。
+/// 旧签名：不合并 Qoder 源（既有调用方/测试零变化）
+#[allow(dead_code)] // 旧签名包装：生产调用方已迁 _ex，测试仍消费
 pub fn unified_models_whitelisted(
     data_dir: &Path,
     wb_enabled: bool,
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
+    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+}
+
+/// 同 [`unified_models_whitelisted`]，`qoder = Some((开关, 池健康))` 时合并
+/// Qoder 目录（p3-3：HTTP /v1/models 端点传入，管理端/测试传 None）
+pub fn unified_models_whitelisted_ex(
+    data_dir: &Path,
+    wb_enabled: bool,
+    trae_ok: bool,
+    buddy_ok: bool,
+    qoder: Option<(bool, bool)>,
+) -> Vec<UnifiedModel> {
     let wl = load_whitelist(data_dir);
-    unified_models(data_dir, wb_enabled, trae_ok, buddy_ok)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, qoder)
         .into_iter()
         .filter(|m| whitelist_allows(&wl, &m.id))
         .collect()
@@ -262,6 +283,9 @@ pub struct UnifiedModel {
     pub display: String,
     /// 供应商：自定义模型用户填写值优先；否则按模型名系列推断（未知为空串，前端显示 —）
     pub vendor: String,
+    /// 地区归属（Qoder 双区特有 cn|global，qoder_upstream::list 注入；非 Qoder 源恒 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     /// 实际生效倍率 = 当前调度策略命中的来源侧（§3.1），非"最优值"
     pub rate: Option<f64>,
     /// 思考档位（双语义合并展示，§3.1 注：仅 Buddy 池作为请求参数下发）
@@ -350,11 +374,25 @@ fn wb_rate(m: &WbModel) -> Option<f64> {
 ///
 /// `wb_enabled`：Buddy 源总开关；`trae_ok` / `buddy_ok`：两池是否存在可选账号
 /// （§3.3 #5 运行时派生，调用方按需取值——HTTP 端点用实时池，命令在服务未运行时放宽）。
+/// 旧签名包装：不合并 Qoder 源（既有调用方/测试零变化）
+#[allow(dead_code)] // 旧签名包装：生产调用方已迁 _ex，测试仍消费
 pub fn unified_models(
     data_dir: &Path,
     wb_enabled: bool,
     trae_ok: bool,
     buddy_ok: bool,
+) -> Vec<UnifiedModel> {
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+}
+
+/// 同 [`unified_models`]，`qoder = Some((开关, 池健康))` 时合并 Qoder 目录：
+/// 条目始终入表（镜像 WB 内置目录语义），`enabled` 徽章 = 开关 && 池健康
+pub fn unified_models_ex(
+    data_dir: &Path,
+    wb_enabled: bool,
+    trae_ok: bool,
+    buddy_ok: bool,
+    qoder: Option<(bool, bool)>,
 ) -> Vec<UnifiedModel> {
     let l1 = load_meta(data_dir);
     // 注（issue #38-4 排查决策）：Trae 侧快照（kv api_models）无条件参与聚合，
@@ -369,6 +407,8 @@ pub fn unified_models(
         TargetPool::Buddy => wb_enabled && buddy_ok,
         // 自定义模型可用性 = 条目 enabled（find_enabled 只回 enabled 条目）
         TargetPool::Custom => true,
+        // Qoder：开关 && 池健康（调用方未提供旗标时该源不参与聚合）
+        TargetPool::Qoder => qoder.map_or(false, |(e, ok)| e && ok),
     };
 
     let mut order: Vec<String> = Vec::new();
@@ -380,6 +420,13 @@ pub fn unified_models(
     // Buddy 侧上下文候选值：由末段按调度策略命中侧选定（issue #38-4，
     // WB 池未启用时残留快照数值不得拖低双源条目的上下文声明）
     let mut buddy_ctx: HashMap<String, u64> = HashMap::new();
+    // Qoder 侧候选值（审查修复，镜像 buddy_ctx 模式）：context/max_tokens/
+    // supports_images 由末段按命中侧（hit == qoder）选定——原实现合并时无条件
+    // 覆盖 context/max_tokens、丢弃 supportsImages，Qoder 池禁用时残留声明
+    // 仍拖低多源条目
+    let mut qoder_ctx: HashMap<String, u64> = HashMap::new();
+    let mut qoder_mt: HashMap<String, u64> = HashMap::new();
+    let mut qoder_img: HashMap<String, bool> = HashMap::new();
     // 自定义模型供应商（canonical → 用户填写值；聚合末段优先于系列推断）
     let mut custom_vendor: HashMap<String, String> = HashMap::new();
 
@@ -397,6 +444,7 @@ pub fn unified_models(
                 id: t.id.clone(),
                 display: t.display.clone(),
                 vendor: String::new(),
+                region: None,
                 rate: t.rate,
                 efforts: t.efforts.clone(),
                 max_mode: super::efforts::trae_max_mode_supported(&canonical),
@@ -468,6 +516,7 @@ pub fn unified_models(
                             m.display.clone()
                         },
                         vendor: String::new(),
+                        region: None,
                         rate: wrate,
                         efforts: m.supported_efforts.clone(),
                         max_mode: false,
@@ -531,6 +580,7 @@ pub fn unified_models(
                         id: m.name.clone(),
                         display: m.name.clone(),
                         vendor: m.vendor.clone(),
+                        region: None,
                         rate: crate_rate,
                         efforts: Vec::new(),
                         max_mode: false,
@@ -545,6 +595,116 @@ pub fn unified_models(
                         manual: false,
                     },
                 );
+            }
+        }
+    }
+
+    // 源4：Qoder（p3-3，qoder_upstream 进程目录；对外标识 qoder）——
+    // 远程清单 + 静态兜底并集。开关关闭或调用方未提供旗标时不合并
+    //（旧签名包装传 None：测试面与既有调用方零变化）。双源/三源同 canonical
+    // 条目仅追加来源标记（倍率取 credits 文本解析值）
+    if let Some((_qoder_enabled, _qoder_ok)) = qoder {
+        for m in crate::tasks::qoder_upstream::list() {
+            let Some(id) = m.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let canonical = canonical_id(id);
+            if canonical.is_empty() {
+                continue;
+            }
+            let qrate = m
+                .get("credits")
+                .and_then(Value::as_str)
+                .and_then(crate::tasks::qoder_upstream::credits_rate_of);
+            let qctx = m
+                .get("maxInputTokens")
+                .and_then(Value::as_u64)
+                .filter(|v| *v > 0);
+            let qmt = m
+                .get("maxOutputTokens")
+                .and_then(Value::as_u64)
+                .filter(|v| *v > 0);
+            let qimg = m.get("supportsImages").and_then(Value::as_bool);
+            let display = m
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id)
+                .to_string();
+            let qefforts: Vec<String> = m
+                .get("efforts")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // 地区归属（cn|global）：qoder_upstream::list 为每条目注入 region 键；
+            // 双区同名去重（global 优先）后单条目单 region，多源条目同样带 Qoder 侧 region
+            let qregion = m.get("region").and_then(Value::as_str).map(str::to_string);
+            match acc.get_mut(&canonical) {
+                Some(u) => {
+                    u.region = qregion;
+                    u.sources.push(UnifiedSource {
+                        pool: "qoder",
+                        rate: qrate,
+                        enabled: enabled_of(TargetPool::Qoder),
+                    });
+                    if let Some(r) = qrate {
+                        u.rate = Some(r);
+                    }
+                    // 审查修复（镜像 buddy_ctx 模式）：候选记入 map，由末段按
+                    // 命中侧选定——禁用/未命中的 Qoder 声明不得覆盖多源条目；
+                    // supportsImages 同款（原实现合并时直接丢弃）
+                    if let Some(c) = qctx {
+                        qoder_ctx.insert(canonical.clone(), c);
+                    }
+                    if let Some(t) = qmt {
+                        qoder_mt.insert(canonical.clone(), t);
+                    }
+                    if let Some(img) = qimg {
+                        qoder_img.insert(canonical.clone(), img);
+                    }
+                    if !qefforts.is_empty() {
+                        u.efforts = super::efforts::declared_union(&[
+                            std::mem::take(&mut u.efforts),
+                            qefforts,
+                        ]);
+                    }
+                }
+                None => {
+                    order.push(canonical.clone());
+                    // vendor：条目厂商标注优先（qoder_upstream::MODEL_VENDORS，
+                    // 如 Step 5 Preview → 阶跃星辰），未命中回落 Qoder
+                    let qvendor = m
+                        .get("vendor")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Qoder");
+                    acc.insert(
+                        canonical.clone(),
+                        UnifiedModel {
+                            id: id.to_string(),
+                            display,
+                            vendor: qvendor.to_string(),
+                            region: qregion,
+                            rate: qrate,
+                            efforts: qefforts,
+                            max_mode: false,
+                            context_length: qctx,
+                            max_tokens: qmt,
+                            supports_image: qimg,
+                            sources: vec![UnifiedSource {
+                                pool: "qoder",
+                                rate: qrate,
+                                enabled: enabled_of(TargetPool::Qoder),
+                            }],
+                            manual: false,
+                        },
+                    );
+                }
             }
         }
     }
@@ -597,6 +757,20 @@ pub fn unified_models(
         if hit == Some("buddy") {
             if let Some(c) = buddy_ctx.get(&canonical) {
                 u.context_length = Some(*c);
+            }
+        }
+        // context_length/max_tokens/supports_image 命中 qoder → Qoder 目录声明
+        // （审查修复：Qoder 池禁用或未命中时残留声明不再拖低多源条目；
+        // supportsImages 此前合并即丢，此处随命中侧补齐）
+        if hit == Some("qoder") {
+            if let Some(c) = qoder_ctx.get(&canonical) {
+                u.context_length = Some(*c);
+            }
+            if let Some(t) = qoder_mt.get(&canonical) {
+                u.max_tokens = Some(*t);
+            }
+            if let Some(img) = qoder_img.get(&canonical) {
+                u.supports_image = Some(*img);
             }
         }
         // display：L1 人工 label 绝对最高优先（§3.2，覆盖双源展示名）；

@@ -104,12 +104,120 @@ fn read_auth_file(state: &AppState) -> Creds {
     creds_of(&fs_utils::read_json::<Value>(&auth_file_path(state)))
 }
 
+// ── token store 凭证 vault 收敛（审查 P0-1）────────────────────────────────
+//
+// wb_tokens 表中敏感字段（access_token / refresh_token）一律占位（空串）存储，
+// 明文经 vault::ns_set 走 Stronghold + DPAPI 加密（与 Trae 家族同一 vault）。
+// 读取统一回填（仅内存）；写入统一占位。vault 写失败时禁止明文落库（对齐 Trae 红线）。
+
+/// 敏感字段键名集合：snake_case 为主（save_token_store / oauth 写入形态），
+/// 兼容 auth 文件导入的 camelCase 形态（accessToken / refreshToken）。
+const TOKEN_SENSITIVE_KEYS: [&str; 4] = [
+    "access_token",
+    "accessToken",
+    "refresh_token",
+    "refreshToken",
+];
+
+/// DB 读取 + vault 回填（仅内存，不落明文）：敏感字段为占位空串时从 vault 回填。
+/// vault 不可用 / 无记录 → 保持空串（上层按 no_credential 处理，fail-secure）。
+pub fn token_store_load_secure(data_dir: &std::path::Path) -> Value {
+    let mut store = crate::store::docs::wb_token_store_load(&crate::store::db(data_dir));
+    let Some(tokens) = store.get_mut("tokens").and_then(Value::as_object_mut) else {
+        return store;
+    };
+    for (id, rec) in tokens.iter_mut() {
+        let Some(rm) = rec.as_object_mut() else { continue };
+        let Some(sec) = crate::vault::ns_get(data_dir, "wb", id) else { continue };
+        let acc = sec.get("access_token").and_then(Value::as_str).unwrap_or("");
+        let rt = sec.get("refresh_token").and_then(Value::as_str).unwrap_or("");
+        let mut has_access_key = false;
+        let mut has_refresh_key = false;
+        for k in TOKEN_SENSITIVE_KEYS {
+            let is_access = k.ends_with("ccess_token");
+            let val = if is_access { acc } else { rt };
+            if !rm.contains_key(k) {
+                continue;
+            }
+            if is_access {
+                has_access_key = true;
+            } else {
+                has_refresh_key = true;
+            }
+            // 仅填空值：DB 明文优先（更新鲜，如迁移残留，待下次写入收敛）
+            if !val.is_empty()
+                && rm.get(k).and_then(Value::as_str).map_or(true, |s| s.is_empty())
+            {
+                rm.insert(k.to_string(), serde_json::json!(val));
+            }
+        }
+        // rec 无任何敏感键但 vault 有值 → 补 snake_case 两键（与 save_token_store 写入形态一致）
+        if !acc.is_empty() && !has_access_key {
+            rm.insert("access_token".into(), serde_json::json!(acc));
+        }
+        if !rt.is_empty() && !has_refresh_key {
+            rm.insert("refresh_token".into(), serde_json::json!(rt));
+        }
+    }
+    store
+}
+
+/// 单账号 UPSERT + 敏感字段 vault 收敛：非空敏感值字段级合并写入 vault（不丢旧值），
+/// DB 记录一律占位（空串）。vault 写失败时仍落占位行并返回 Err（禁止明文落库）。
+pub fn token_store_upsert_secure(
+    data_dir: &std::path::Path,
+    id: &str,
+    rec: &Value,
+) -> Result<(), String> {
+    let mut rec = rec.clone();
+    let Some(rm) = rec.as_object_mut() else {
+        return crate::store::docs::wb_token_store_upsert(&crate::store::db(data_dir), id, &rec);
+    };
+    // 提取非空敏感值（两组键名各取其一）
+    let mut acc = String::new();
+    let mut rt = String::new();
+    for k in TOKEN_SENSITIVE_KEYS {
+        let v = rm.get(k).and_then(Value::as_str).unwrap_or("");
+        if v.is_empty() {
+            continue;
+        }
+        if k.ends_with("ccess_token") {
+            acc = v.to_string();
+        } else {
+            rt = v.to_string();
+        }
+    }
+    let vault_result = if acc.is_empty() && rt.is_empty() {
+        Ok(())
+    } else {
+        let mut entry = crate::vault::ns_get(data_dir, "wb", id)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !acc.is_empty() {
+            entry["access_token"] = serde_json::json!(acc);
+        }
+        if !rt.is_empty() {
+            entry["refresh_token"] = serde_json::json!(rt);
+        }
+        crate::vault::ns_set(data_dir, "wb", id, &entry)
+    };
+    // 无论 vault 成败，DB 一律占位
+    for k in TOKEN_SENSITIVE_KEYS {
+        if rm.contains_key(k) {
+            rm.insert(k.to_string(), serde_json::json!(""));
+        }
+    }
+    crate::store::docs::wb_token_store_upsert(&crate::store::db(data_dir), id, &rec)?;
+    vault_result.map_err(|e| {
+        format!("WB 凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}")
+    })
+}
+
 /// 生效凭证 = token store 与 auth 文件中 expiresAtMs 更晚者（F-10 谁新用谁）。
 /// auth 文件仅当其 uid 与账号匹配时参与双源比较（桌面当前登录态）。
 /// 读 token store（SQLite 化 P3：wb_tokens 表；结构 {version, tokens:{id:rec}}）。
 /// 全部 token store 读点统一入口。
 pub fn load_token_store(state: &AppState) -> Value {
-    crate::store::docs::wb_token_store_load(&crate::store::db(&state.data_dir))
+    token_store_load_secure(&state.data_dir)
 }
 
 pub fn effective_creds(state: &AppState, acct_id: &str, acct_uid: &str) -> Creds {
@@ -135,6 +243,8 @@ pub fn effective_creds(state: &AppState, acct_id: &str, acct_uid: &str) -> Creds
 
 /// 写工具侧凭证副本（F-10 谁新用谁）。version≠1 拒绝写入（版本闸门）；
 /// 非空字段合并 + updated_at（与 commands/workbuddy/common.rs upsert_token_store 同语义）。
+/// 凭证收敛（P0-1）：落库走 token_store_upsert_secure——敏感字段进 vault、DB 占位；
+/// vault 写失败时仅落占位并返回 Err（禁止明文落库）。
 pub fn save_token_store(state: &AppState, id: &str, creds: &Creds) -> Result<(), String> {
     let mut store: Value = load_token_store(state);
     if !store.is_object() {
@@ -149,20 +259,24 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &Creds) -> Result<(),
     }
     obj.insert("version".into(), serde_json::json!(1));
     let tokens = obj.entry("tokens").or_insert_with(|| serde_json::json!({}));
-    if let Some(t) = tokens.as_object_mut() {
-        let mut rec = t.get(id).cloned().unwrap_or(serde_json::json!({}));
-        if let Some(rm) = rec.as_object_mut() {
-            let val = serde_json::to_value(creds).map_err(|e| e.to_string())?;
-            for (k, v) in val.as_object().into_iter().flatten() {
-                if !v.is_null() {
-                    rm.insert(k.clone(), v.clone());
-                }
-            }
-            rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
+    let mut rec = serde_json::json!({});
+    if let Some(t) = tokens.as_object() {
+        if let Some(r) = t.get(id) {
+            rec = r.clone();
         }
-        t.insert(id.to_string(), rec);
     }
-    crate::store::docs::wb_token_store_save(&crate::store::db(&state.data_dir), &store)
+    if let Some(rm) = rec.as_object_mut() {
+        let val = serde_json::to_value(creds).map_err(|e| e.to_string())?;
+        for (k, v) in val.as_object().into_iter().flatten() {
+            if !v.is_null() {
+                rm.insert(k.clone(), v.clone());
+            }
+        }
+        rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
+    }
+    token_store_upsert_secure(&state.data_dir, id, &rec)?;
+    // version 闸门语义不变（整库字段，单行 upsert 不携带 version——写入 kv 元数据）
+    crate::store::docs::wb_token_store_save_version(&crate::store::db(&state.data_dir), 1)
 }
 
 // ── 客户端指纹伪装（issue #48）─────────────────────────────────────────────
@@ -234,12 +348,13 @@ pub fn post_json_raw(
     }
     match req.send_string(&body.to_string()) {
         Ok(resp) => {
-            let raw = resp.into_string().unwrap_or_default();
+            // 审查 P2：读取失败不再吞成空串（调用方诊断日志需区分「空响应」与「读取失败」）
+            let raw = resp.into_string().unwrap_or_else(|e| format!("<响应体读取失败: {e}>"));
             let parsed = serde_json::from_str(&raw).ok();
             (200, parsed, raw)
         }
         Err(ureq::Error::Status(code, resp)) => {
-            let raw = resp.into_string().unwrap_or_default();
+            let raw = resp.into_string().unwrap_or_else(|e| format!("<响应体读取失败: {e}>"));
             let parsed = serde_json::from_str(&raw).ok();
             (code, parsed, raw)
         }
@@ -272,12 +387,13 @@ pub fn get_json(
     }
     match req.call() {
         Ok(resp) => {
-            let raw = resp.into_string().unwrap_or_default();
+            // 审查 P2：读取失败不再吞成空串（调用方诊断日志需区分「空响应」与「读取失败」）
+            let raw = resp.into_string().unwrap_or_else(|e| format!("<响应体读取失败: {e}>"));
             let parsed = serde_json::from_str(&raw).ok();
             (200, parsed, raw)
         }
         Err(ureq::Error::Status(code, resp)) => {
-            let raw = resp.into_string().unwrap_or_default();
+            let raw = resp.into_string().unwrap_or_else(|e| format!("<响应体读取失败: {e}>"));
             let parsed = serde_json::from_str(&raw).ok();
             (code, parsed, raw)
         }
@@ -318,11 +434,30 @@ pub fn billing_bases(domain: &str) -> [&'static str; 2] {
 
 // ── token 刷新（F-09）──────────────────────────────────────────────────────
 
+/// refresh 失败原因（审查 P1-4：区分「凭证失效」与「网络故障」，
+/// 供调用方决定是否标记 needs_relogin——网络失败不应误标）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFail {
+    /// 无 refreshToken（不可刷新）
+    NoRefreshToken,
+    /// 网络不可达 / 传输层失败（不标记重登录，下次重试）
+    Network,
+    /// HTTP 4xx：refresh token 已失效（应标记 needs_relogin）
+    Auth,
+    /// 200 但响应无 accessToken（响应结构异常，不标记重登录）
+    BadResponse,
+}
+
 /// 调 plugin refresh 端点（X-Refresh-Token 仅允许出现在此端点）。
 /// 成功返回新 Creds（expires 字段按 expiresIn/refreshExpiresIn 秒数回填）。
 pub fn refresh_token_once(agent: &ureq::Agent, creds: &Creds) -> Option<Creds> {
+    refresh_token_once_ex(agent, creds).0
+}
+
+/// refresh_token_once 的带失败原因版本（审查 P1-4）。
+pub fn refresh_token_once_ex(agent: &ureq::Agent, creds: &Creds) -> (Option<Creds>, RefreshFail) {
     if creds.refresh_token.is_empty() {
-        return None;
+        return (None, RefreshFail::NoRefreshToken);
     }
     let mut h = build_auth_headers(creds, false);
     h.push(("X-Refresh-Token".to_string(), creds.refresh_token.clone()));
@@ -331,13 +466,21 @@ pub fn refresh_token_once(agent: &ureq::Agent, creds: &Creds) -> Option<Creds> {
         "workbuddy".to_string(),
     ));
     let (status, body) = post_json(agent, REFRESH_URL, &h, &serde_json::json!({}));
-    if status != 200 {
-        return None;
+    if status == 0 {
+        return (None, RefreshFail::Network);
     }
-    let body = body?;
+    if (400..500).contains(&status) {
+        return (None, RefreshFail::Auth);
+    }
+    if status != 200 {
+        return (None, RefreshFail::Network); // 5xx 等服务端故障：不标记重登录
+    }
+    let Some(body) = body else {
+        return (None, RefreshFail::BadResponse);
+    };
     let acc = s_of(fs_utils::dig(&body, &["accessToken"]));
     if acc.is_empty() {
-        return None;
+        return (None, RefreshFail::BadResponse);
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut out = creds.clone();
@@ -349,7 +492,31 @@ pub fn refresh_token_once(agent: &ureq::Agent, creds: &Creds) -> Option<Creds> {
     out.expires_at_ms = i_of(fs_utils::dig(&body, &["expiresIn"])).map(|e| now_ms + e * 1000);
     out.refresh_expires_at_ms = i_of(fs_utils::dig(&body, &["refreshExpiresIn"]))
         .map(|e| now_ms + e * 1000);
-    Some(out)
+    (Some(out), RefreshFail::NoRefreshToken)
+}
+
+/// 标记账号需重新登录（审查 P1-4：刷新凭证失效时回写账号池，
+/// 网关池同步（sync_from_wb disabled=needs_relogin）与调度跳过随之生效）
+pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
+    let store = crate::store::db(&state.data_dir);
+    let mut pool = crate::store::docs::wb_pool_load(&store);
+    let mut changed = false;
+    if let Some(arr) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
+        for a in arr {
+            if a.get("id").and_then(Value::as_str) == Some(acct_id) {
+                a["needs_relogin"] = serde_json::json!(true);
+                a["relogin_reason"] = serde_json::json!(reason);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _ = crate::store::docs::wb_pool_save(&store, &pool);
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("wb: 账号 {acct_id} 已标记需重新登录（{reason}）"),
+        );
+    }
 }
 
 // ── 本地 quota 端口发现兜底（T5.8/F-21）────────────────────────────────────

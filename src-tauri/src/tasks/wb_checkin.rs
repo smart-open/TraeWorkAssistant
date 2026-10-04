@@ -506,7 +506,8 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     let (mut kind, mut message, mut reward, mut dbg_keys) = checkin_do(agent, &headers, &urls);
     if kind == "auth" {
         // 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）
-        match wb_common::refresh_token_once(agent, &creds) {
+        let (new, fail_reason) = wb_common::refresh_token_once_ex(agent, &creds);
+        match new {
             Some(new) => {
                 let _ = wb_common::save_token_store(state, &aid, &new);
                 sync_pool_expiry(state, &aid, &new);
@@ -516,8 +517,19 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                 message = r.1;
                 reward = r.2;
                 dbg_keys = r.3;
+                // 二次失败（审查 P1-4）：新凭证仍 401 → 标记重登录，归一为 fail
+                if kind == "auth" {
+                    wb_common::mark_needs_relogin(state, &aid, "签到重试后仍 401");
+                    kind = "fail".into();
+                    message = "登录态失效（刷新后仍 401），需重新登录".into();
+                    reward = None;
+                }
             }
             None => {
+                // 凭证失效才标记重登录；网络故障/响应异常不误标（审查 P1-4）
+                if fail_reason == wb_common::RefreshFail::Auth {
+                    wb_common::mark_needs_relogin(state, &aid, &format!("签到 refresh 失败: {message}"));
+                }
                 kind = "fail".into();
                 message = "登录态失效且刷新失败，需重新登录".into();
                 reward = None;
@@ -527,11 +539,14 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     // 获得积分兜底（F-17）：接口未返回奖励数额时用签到前后余额差值；
     // 仅差值>0 才采信（防并发扣减/查询时点差造成负值误报）。
     // 两级数据源都尝试：①billing meter（通用积分）②WB credits（WorkBuddy 积分）
+    let mut balance_shrunk = false; // 差值兜底期间检测到余额下降（并发扣减），用于诊断区分「无奖励」与「未能核实」
     if kind == "success" && reward.is_none() {
         if let Some(pre) = pre_balance {
             if let Some(post) = fetch_balance(agent, &headers, base) {
                 if post > pre {
                     reward = Some(((post - pre) * 100.0).round() / 100.0);
+                } else if post < pre {
+                    balance_shrunk = true;
                 }
             }
         }
@@ -540,6 +555,8 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                 if let Some(post) = fetch_wb_credits_balance(state, &aid) {
                     if post > pre {
                         reward = Some(((post - pre) * 100.0).round() / 100.0);
+                    } else if post < pre {
+                        balance_shrunk = true;
                     }
                 }
             }
@@ -552,6 +569,8 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     };
     // 「已签」回填：签到奖励当日只发一次，今日早前成功记录若已捕获奖励则同步展示
     //（用户语义：无论成功还是已签，获取积分列都应显示当日所得）
+    //（审查 P1-3：结果表为纯 append，同日同账号可能多条——取当日 success 记录中的
+    // 最大 reward，防早前无奖励记录遮蔽后来的有效记录）
     if status_txt == "already" && reward.is_none() {
         let results: Value = crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -560,14 +579,16 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
             .and_then(Value::as_array)
             .and_then(|arr| {
                 arr.iter()
-                    .find(|r| {
+                    .filter(|r| {
                         r.get("date").and_then(Value::as_str) == Some(today.as_str())
                             && r.get("user_id").and_then(Value::as_str) == Some(aid.as_str())
                             && r.get("status").and_then(Value::as_str) == Some("success")
-                            && r.get("reward").and_then(Value::as_f64).is_some()
                     })
-                    .and_then(|r| r.get("reward"))
-                    .and_then(Value::as_f64)
+                    .filter_map(|r| r.get("reward").and_then(Value::as_f64))
+                    .fold(None::<f64>, |acc, v| Some(match acc {
+                        Some(a) if a >= v => a,
+                        _ => v,
+                    }))
             });
     }
     // 诊断（脱敏红线：只输出键路径不含值）：成功但三层提取（精确键/深挖/双差值）
@@ -576,8 +597,9 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
         fs_utils::app_log(
             &state.data_dir,
             &format!(
-                "wb 签到成功但奖励数额未识别（接口回显/递归深挖/双余额差值均未命中）: {aid}，响应键路径: {}",
-                dbg_keys.as_deref().unwrap_or("（响应非 JSON）")
+                "wb 签到成功但奖励数额未识别（接口回显/递归深挖/双余额差值均未命中）: {aid}，响应键路径: {}{}",
+                dbg_keys.as_deref().unwrap_or("（响应非 JSON）"),
+                if balance_shrunk { "；差值兜底期间余额下降（并发扣减可能抵消奖励差值）" } else { "" },
             ),
         );
     }
@@ -635,11 +657,23 @@ where
     let headers = wb_common::build_auth_headers(creds, false);
     let (kind, msg) = f(&headers);
     if kind == "auth" {
-        if let Some(new) = wb_common::refresh_token_once(agent, creds) {
+        let (new, fail_reason) = wb_common::refresh_token_once_ex(agent, creds);
+        if let Some(new) = new {
             let _ = wb_common::save_token_store(state, acct_id, &new);
             sync_pool_expiry(state, acct_id, &new);
             let h2 = wb_common::build_auth_headers(&new, false);
-            return f(&h2);
+            let (kind2, msg2) = f(&h2);
+            // 二次失败处理（审查 P1-4）：刷新成功但新凭证仍 401 → 凭证实际已失效，
+            // 归一为 fail 并回写 needs_relogin（避免 auth 泄漏到上层结果）
+            if kind2 == "auth" {
+                wb_common::mark_needs_relogin(state, acct_id, "刷新后仍 401");
+                return ("fail".into(), "登录态失效（刷新后仍 401），需重新登录".into());
+            }
+            return (kind2, msg2);
+        }
+        // 凭证失效才标记重登录；网络故障/响应异常不误标（下次调度自然重试）
+        if fail_reason == wb_common::RefreshFail::Auth {
+            wb_common::mark_needs_relogin(state, acct_id, &format!("refresh 失败: {msg}"));
         }
         return ("fail".into(), "登录态失效且刷新失败".into());
     }
@@ -731,9 +765,10 @@ fn growth_lottery(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls
         return ("fail".into(), msg);
     }
     let b = body.as_ref().unwrap();
-    // 对齐 python int(balance)：数字（float 截断）或整数字符串；小数字符串视为无效
+    // 对齐 python int(balance)：数字（float 四舍五入）或整数字符串；小数字符串视为无效。
+    // 审查 P1-4：不用 as i64 截断——JSON 浮点表示误差（3.0 实存 2.9999…）会少抽一次
     let balance = fs_utils::dig(b, &["balance", "chances", "count", "remain"]).and_then(|v| match v {
-        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f.round() as i64)),
         Value::String(s) => s.trim().parse::<i64>().ok(),
         _ => None,
     });

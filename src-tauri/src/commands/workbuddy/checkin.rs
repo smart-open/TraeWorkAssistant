@@ -257,9 +257,16 @@ pub fn workbuddy_checkin_task_register(state: State<AppState>, times: Vec<String
 pub fn workbuddy_checkin_task_status() -> Result<Vec<String>, String> {
     crate::commands::misc::schtasks_gate()?;
     let prefix = format!("{WB_CHECKIN_TASK_PREFIX}_");
+    // I15 同步修（蓝本同款缺陷）：register 侧存 4 位数字任务名（如 1015），
+    // 需还原为 HH:MM；通用 '_'→':' 替换对其恒 no-op
     Ok(wb_checkin_task_names()
         .iter()
-        .map(|name| name.trim_start_matches(&prefix).replace('_', ":"))
+        .map(|name| match name.strip_prefix(&prefix) {
+            Some(d) if d.len() == 4 && d.chars().all(|c| c.is_ascii_digit()) => {
+                format!("{}:{}", &d[..2], &d[2..])
+            }
+            _ => name.trim_start_matches(&prefix).to_string(),
+        })
         .collect())
 }
 

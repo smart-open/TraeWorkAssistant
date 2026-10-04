@@ -140,6 +140,9 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// JWT 刷新锁：防止多个并发请求同时 ExchangeToken（Arc 共享跨线程）
     pub jwt_refresh_lock: Arc<Mutex<()>>,
+    /// Qoder 账号池读-改-写互斥（F-80 I09）：OAuth/PAT/IDE 导入、改名/移除、
+    /// 签到回写过期时间、指纹回填等路径并发时整池覆盖会丢更新，统一持锁执行
+    pub qoder_pool_lock: Arc<Mutex<()>>,
 }
 
 /// 配置文件名列表（路由到 conf/ 目录）
@@ -148,7 +151,8 @@ const CONF_FILES: &[&str] = &["app_settings.json"];
 impl AppState {
     pub fn new() -> Result<Self, String> {
         // 数据目录：%APPDATA%\AIWorkAssistant（macOS: ~/Library/Application Support/AIWorkAssistant，
-        // F-75 M0-0.3），不存在则创建
+        // F-75 M0-0.3；Qoder 账号池 qoder_pool/token store/快照 profiles_qoder* 全部落在此目录下），
+        // 不存在则创建。平台根收口 platform::app_support_root（Windows=APPDATA / mac=dirs::data_dir()）
         let data_dir = crate::platform::app_support_root()?.join(DATA_DIR_NAME);
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
@@ -164,6 +168,7 @@ impl AppState {
         Ok(Self {
             data_dir,
             jwt_refresh_lock: Arc::new(Mutex::new(())),
+            qoder_pool_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -221,6 +226,15 @@ impl AppState {
             || s.proxy_domains == crate::models::legacy_proxy_domains()
             || s.proxy_domains == crate::models::legacy_proxy_domains_with_doubao()
             || s.proxy_domains == crate::models::legacy_proxy_domains_narrow()
+            // F-80：Qoder 域追加前的历届默认（含上一版 9 域默认），未自定义过则补上 qoder.com.cn
+            || s.proxy_domains == crate::models::legacy_proxy_domains_without_qoder()
+            // p3-2：Qoder chat 抓包需要 qoder.sh/qoder.cn/qoder.ai（worker 模型端点
+            // api2-v2.qoder.sh），未自定义过则从旧 10 域默认迁移到新默认
+            || s.proxy_domains == crate::models::legacy_proxy_domains_with_qoder_cn()
+            // p3-2e 遗漏版：三 Qoder 域默认（qoder.com.cn + qoder.cn + qoder.com，
+            // F-80 扩展版），p3-2b 迁移列表漏了它，被误判为自定义导致 qoder.sh/
+            // qoder.ai 始终未进解密白名单（运行时横幅实测确认），补上
+            || s.proxy_domains == crate::models::legacy_proxy_domains_qoder_com()
         {
             s.proxy_domains = crate::models::default_proxy_domains();
         }
@@ -252,6 +266,14 @@ impl AppState {
         // Trae 每日签到时刻零值回填（默认 09:00；签到恒开无独立开关）
         if s.trae_checkin_hhmm.trim().is_empty() {
             s.trae_checkin_hhmm = "09:00".into();
+        }
+        // Qoder 调度零值回填（F-80 §5.7）：时刻为空视为从未配置，回填默认开（教训对照 wb_growth_hhmm）
+        if s.qoder_checkin_hhmm.trim().is_empty() {
+            s.qoder_checkin_hhmm = "10:15".into();
+        }
+        if s.qoder_credits_sync_hhmm.trim().is_empty() {
+            s.qoder_credits_sync_enabled = true;
+            s.qoder_credits_sync_hhmm = "23:40".into();
         }
         // 模型目录每日同步（Buddy/Trae）：同款零值回填（默认开）；同步幂等且不消耗积分，
         // 无账号时调度器静默跳过，默认开安全
@@ -334,7 +356,11 @@ mod tests {
         let d = std::env::temp_dir().join(format!("twa_state_notify_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        AppState { data_dir: d, jwt_refresh_lock: Arc::new(Mutex::new(())) }
+        AppState {
+            data_dir: d,
+            jwt_refresh_lock: Arc::new(Mutex::new(())),
+            qoder_pool_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     /// 旧 workbuddy_settings 通知字段 → app Settings 一次性搬运：回写 app_settings 持久化 +

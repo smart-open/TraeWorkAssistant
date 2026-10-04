@@ -295,15 +295,22 @@ pub async fn forward_websocket<S: AsyncRead + AsyncWrite + Unpin>(
     req: &RawRequest,
 ) {
     let ws_tag = format!("[WebSocket] {host}:{port}{}", req.path);
-    // 路由对齐 MITM 转发（见 upstream.rs 模块注释）：上游优先、失败回退直连
+    // 路由对齐 MITM 转发（见 upstream.rs 模块注释）：上游优先、失败回退直连；
+    // 白名单域（p3-2e，默认 qoder 各域）跳过上游直连目标
     let via_up = ctx.upstream.is_some();
     ctx.log.log(&format!(
         "  {ws_tag} 正在连接上游 {host}:{port}（{}）...",
         if via_up { "经上游代理" } else { "直连" }
     ));
     let mut upstream: ClientTlsStream<TcpStream> =
-        match crate::device_proxy::upstream::connect_tls_upstream_first(host, port, ctx.upstream.as_ref())
-            .await
+        match crate::device_proxy::upstream::connect_tls_upstream_first(
+            host,
+            port,
+            ctx.upstream.as_ref(),
+            &ctx.direct_domains,
+            &ctx.log,
+        )
+        .await
         {
             Ok(s) => s,
             Err(e) => {

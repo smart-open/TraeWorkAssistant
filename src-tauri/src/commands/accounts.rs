@@ -815,6 +815,9 @@ struct CreditStats {
     /// "2026-09-14 15:52:38"），某日获得积分 = 该日新开全部积分包 credits_limit
     /// 合计（签到包与购买包均计）；覆盖范围受 API 返回的包历史限制
     pack_earned_daily: std::collections::BTreeMap<String, f64>,
+    /// 可用积分包明细（剩余 > 0 且未过期，按到期时间升序）：到期日历与
+    /// 7 天内到期 KPI 按包口径计算的数据源（对齐 Buddy packages[]）
+    packs: Vec<CreditPackDetail>,
     /// 会员套餐到期时间（Unix 秒，如「会员 Lite 连续包月」包的 end_time）
     membership_expire: Option<i64>,
     /// 会员套餐下次自动续费扣款时间（Unix 秒，next_billing_time）
@@ -937,6 +940,34 @@ fn classify_source(pack: &serde_json::Value) -> String {
     "积分包".to_string()
 }
 
+/// 单个积分包 → 明细条目（parse_credit_stats 与 fetch_credit_detail 共用口径）：
+/// 仅剩余 > 0 且未过期的包产生明细；无 expire_time 视为长期有效，
+/// 以 2100-01-01 哨兵时间戳 4102444800 参与排序/落盘，前端识别显示「长期有效」
+fn pack_to_detail(pack: &serde_json::Value, limit: f64, remaining: f64, now_ts: i64) -> Option<CreditPackDetail> {
+    if remaining <= 0.0 {
+        return None;
+    }
+    let expire_time = pack
+        .get("expire_time")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(4102444800);
+    if expire_time <= now_ts {
+        return None;
+    }
+    let product_id = pack
+        .get("entitlement_base_info")
+        .and_then(|e| e.get("product_id"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Some(CreditPackDetail {
+        kind: if product_id == 209 { "Work" } else { "通用" }.to_string(),
+        source: classify_source(pack),
+        remaining: (remaining * 100.0).round() / 100.0,
+        total: (limit * 100.0).round() / 100.0,
+        expire_time,
+    })
+}
+
 /// 计算剩余积分（区分通用 / Work）
 ///
 /// 计算逻辑：遍历 user_entitlement_pack_list，仅对 quota.credits_limit 存在的包，
@@ -956,6 +987,7 @@ fn parse_credit_stats(packs: &[serde_json::Value], now_ts: i64) -> CreditStats {
     let mut earliest_expire: Option<i64> = None;
     let mut general_earliest_expire: Option<i64> = None;
     let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
+    let mut detail_packs: Vec<CreditPackDetail> = Vec::new();
     let mut membership_expire: Option<i64> = None;
     let mut membership_next_billing: Option<i64> = None;
 
@@ -1004,6 +1036,11 @@ fn parse_credit_stats(packs: &[serde_json::Value], now_ts: i64) -> CreditStats {
             total += remaining;
             // 本周期总额度：与剩余同口径（有 credits_limit 的包）求和
             total_limit += limit;
+
+            // 包明细（到期日历 / 7 天内到期按包口径；过滤口径与 fetch_credit_detail 一致）
+            if let Some(d) = pack_to_detail(pack, limit, remaining, now_ts) {
+                detail_packs.push(d);
+            }
 
             // product_id == 209 → Work 积分，其余归入通用积分
             let product_id = pack
@@ -1059,6 +1096,8 @@ fn parse_credit_stats(packs: &[serde_json::Value], now_ts: i64) -> CreditStats {
         let r = (v * 100.0).round() / 100.0;
         if r == 0.0 { 0.0 } else { r }
     };
+    // 明细按到期时间升序（长期有效哨兵排最后）
+    detail_packs.sort_by_key(|p| p.expire_time);
     CreditStats {
         total: r2(total),
         general: r2(general),
@@ -1067,6 +1106,7 @@ fn parse_credit_stats(packs: &[serde_json::Value], now_ts: i64) -> CreditStats {
         earliest_expire,
         general_earliest_expire,
         pack_earned_daily,
+        packs: detail_packs,
         membership_expire,
         membership_next_billing,
     }
@@ -1089,8 +1129,8 @@ pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<Cr
     let now_ts = chrono::Utc::now().timestamp();
     let mut detail_packs: Vec<CreditPackDetail> = Vec::new();
     for pack in &packs {
-        let base = pack.get("entitlement_base_info");
-        let limit = base
+        let limit = pack
+            .get("entitlement_base_info")
             .and_then(|e| e.get("quota"))
             .and_then(|q| q.get("credits_limit"))
             .and_then(|v| v.as_f64());
@@ -1100,34 +1140,10 @@ pub fn fetch_credit_detail(state: State<AppState>, user_id: String) -> Result<Cr
             .and_then(|u| u.get("credits_amount"))
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
-        let remaining = (limit - used).max(0.0);
-        // 已用完的积分包不展示
-        if remaining <= 0.0 {
-            continue;
+        // 剩余 > 0 且未过期才展示（口径统一收敛到 pack_to_detail，与积分看板包明细一致）
+        if let Some(d) = pack_to_detail(pack, limit, (limit - used).max(0.0), now_ts) {
+            detail_packs.push(d);
         }
-        // 已过期的积分包不展示；无 expire_time 视为长期有效（与 calc_remaining_credits 统计口径一致），
-        // 以 2100-01-01 哨兵时间戳参与排序，前端识别该值显示「长期有效」
-        if let Some(expire) = pack.get("expire_time").and_then(|v| v.as_i64()) {
-            if expire <= now_ts {
-                continue;
-            }
-        }
-        let product_id = base
-            .and_then(|e| e.get("product_id"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let kind = if product_id == 209 { "Work" } else { "通用" }.to_string();
-        let source = classify_source(pack);
-        detail_packs.push(CreditPackDetail {
-            kind,
-            source,
-            remaining: (remaining * 100.0).round() / 100.0,
-            // 无 expire_time → 长期有效哨兵（2100-01-01），排序靠后且前端特殊展示
-            expire_time: pack
-                .get("expire_time")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(4102444800),
-        });
     }
     detail_packs.sort_by_key(|p| p.expire_time);
 
@@ -1175,6 +1191,8 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
     rc.general.insert(user_id.clone(), stats.general);
     rc.work.insert(user_id.clone(), stats.work);
     rc.total_limit.insert(user_id.clone(), stats.total_limit);
+    // 包明细：成功即以最新为准整体覆盖（空数组 = 无可用包），避免 stale 残留
+    rc.packs.insert(user_id.clone(), stats.packs.clone());
     if let Some(exp) = stats.earliest_expire {
         rc.expire_times.insert(user_id.clone(), exp);
     }
@@ -1243,6 +1261,8 @@ pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String>
                 rc.general.insert(uid.clone(), stats.general);
                 rc.work.insert(uid.clone(), stats.work);
                 rc.total_limit.insert(uid.clone(), stats.total_limit);
+                // 包明细：成功即以最新为准整体覆盖（空数组 = 无可用包），避免 stale 残留
+                rc.packs.insert(uid.clone(), stats.packs.clone());
                 if let Some(exp) = stats.earliest_expire {
                     rc.expire_times.insert(uid.clone(), exp);
                 }
@@ -2032,6 +2052,15 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
                 .exp_hours
                 .map(|h| h <= 24.0)
                 .unwrap_or(true);
+        // JWT 归属一致性（issue #55）：user_id 与 JWT data.id 均非空且不同 → 警示。
+        // user_id 为空时视图 uid 本就回退 JWT id（既有语义），不算 mismatch
+        let raw_user_id = a.user_id.clone().unwrap_or_default();
+        let jwt_uid = info.user_id.clone();
+        let jwt_uid_mismatch = !raw_user_id.is_empty()
+            && jwt_uid
+                .as_deref()
+                .map(|j| !j.is_empty() && j != raw_user_id)
+                .unwrap_or(false);
         out.push(AccountView {
             user_id: uid.clone(),
             name: a.name.clone(),
@@ -2060,11 +2089,15 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
                 .map(|p| p.identity_str.clone()),
             membership_expire: rc.membership_expire.get(&uid).copied(),
             membership_next_billing: rc.membership_next_billing.get(&uid).copied(),
+            // 积分包明细（无缓存为空数组 → 前端回退账号级汇总口径）
+            credit_packs: rc.packs.get(&uid).cloned().unwrap_or_default(),
             // refresh_token 生命周期（F-78 批次 3）：过期时间/连续失败次数/失效标记
             refresh_token_expires_at: a.refresh_token_expires_at,
             refresh_token_fails: a.refresh_token_fails,
             refresh_token_invalid: a.refresh_token_invalid,
             auth_saved_at: a.auth_saved_at.clone(),
+            jwt_uid_mismatch,
+            jwt_uid,
         });
     }
     out
@@ -2187,6 +2220,37 @@ mod tests {
         );
         assert_eq!(stats.earliest_expire, Some(NOW_TS + 120));
         assert_eq!(stats.general_earliest_expire, Some(NOW_TS + 120));
+    }
+
+    #[test]
+    fn parse_credit_stats_pack_details_for_expiry_calendar() {
+        // 到期日历包级口径：可用包逐包出明细（kind 分类 / 排序 / 长期有效哨兵），
+        // 已用完、已过期的包不进明细；7 天内到期 KPI 按包 remaining 累计不再吃账号全量
+        let stats = parse_credit_stats(
+            &[
+                // 长期有效通用包（无 expire_time → 哨兵 4102444800）
+                pack(208, 500.0, 100.0, None),
+                // 3 天后到期的 Work 包（remaining 30）
+                pack(209, 30.0, 0.0, Some(NOW_TS + 3 * 86_400)),
+                // 已用完（不进明细）
+                pack(208, 100.0, 100.0, Some(NOW_TS + 60)),
+                // 已过期（不进明细）
+                pack(208, 100.0, 0.0, Some(NOW_TS - 60)),
+            ],
+            NOW_TS,
+        );
+        assert_eq!(stats.packs.len(), 2);
+        // 按到期时间升序：Work 包在前，长期有效哨兵在后
+        assert_eq!(stats.packs[0].kind, "Work");
+        assert_eq!(stats.packs[0].remaining, 30.0);
+        assert_eq!(stats.packs[0].total, 30.0);
+        assert_eq!(stats.packs[0].expire_time, NOW_TS + 3 * 86_400);
+        assert_eq!(stats.packs[1].kind, "通用");
+        assert_eq!(stats.packs[1].remaining, 400.0);
+        assert_eq!(stats.packs[1].total, 500.0);
+        assert_eq!(stats.packs[1].expire_time, 4102444800);
+        // 来源归类（无 group_name/display_desc → 兜底「积分包」）
+        assert_eq!(stats.packs[0].source, "积分包");
     }
 
     /// 实测探针（默认忽略）：用真实数据目录 + vault 凭据验证积分接口设备指纹修复。
@@ -2333,6 +2397,7 @@ mod tests {
         let state = crate::state::AppState {
             data_dir: dir,
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         let now = chrono::Utc::now().timestamp();
         let acc = |name: &str, uid: Option<&str>, exp: i64, rt: Option<&str>, invalid: bool| {

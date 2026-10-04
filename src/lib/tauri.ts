@@ -73,6 +73,21 @@ import type {
   WbPoolImportResult,
   WbModelInfo,
   UsageHistoryResult,
+  QoderAccountView,
+  QoderCheckinRecord,
+  QoderCliStatus,
+  QoderLiveLogins,
+  QoderCreditsResult,
+  QoderCreditsSnapshot,
+  QoderEnvCheck,
+  QoderIdeScanResult,
+  QoderOauthDone,
+  QoderOauthProgress,
+  QoderPoolExport,
+  QoderPoolImportResult,
+  QoderResetItem,
+  QoderResetResult,
+  QoderSettings,
 } from '../types';
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
@@ -213,7 +228,7 @@ export const api = {
   },
   switchAccount: (
     userId: string,
-    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy',
+    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork',
     skipJwtProbe?: boolean,
     proxyPort?: number,
   ) =>
@@ -225,19 +240,21 @@ export const api = {
       // 续期捕获场景传代理端口：切换后 TRAE 以 --proxy-server 重启，客户端流量走 MITM
       proxyPort: proxyPort ?? null,
     }),
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   profiles: {
     // Buddy 双应用：profile_list / profile_restore / profile_delete 支持 WorkBuddy / CodeBuddy 档案映射
-    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
+    // Qoder：M3 Icube 档案（data/profiles_qoder；切号快照保存/恢复）
+    // QoderWork：2026-10-02 Qoder Work 独立客户端档案（data/profiles_qoder_work；electron-root 布局）
+    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
       invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null }),
-    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
+    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'Qoder' | 'QoderWork') =>
       invoke('profile_backup', { userId, targetApp: targetApp ?? null }),
-    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
+    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
       invoke('profile_restore', { userId, targetApp: targetApp ?? null }),
-    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
+    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
       invoke('profile_delete', { userId, targetApp: targetApp ?? null }),
     formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
   },
@@ -398,6 +415,89 @@ export const api = {
     activityInfo: (userId?: string, fresh?: boolean) =>
       invoke<WbActivityInfo>('workbuddy_activity_info', { userId: userId ?? null, refresh: fresh ?? null }),
   },
+  // ---- Qoder（F-80；Rust commands/qoder；字段名严格 snake_case）----
+  qoder: {
+    envCheck: () => invoke<QoderEnvCheck>('qoder_env_check'),
+    /** 打开客户端（后端 spawn；未检测到 exe 时 reject 文案含「未检测到」） */
+    openIde: () => invoke('qoder_open_ide'),
+    openWork: () => invoke('qoder_open_work'),
+    accountsList: () => invoke<QoderAccountView[]>('qoder_accounts_list'),
+    accountSave: (userId: string, name?: string, note?: string) =>
+      invoke('qoder_account_save', { userId, name: name ?? null, note: note ?? null }),
+    accountRemove: (userId: string) => invoke('qoder_account_remove', { userId }),
+    /** 移动账号到分组（groupId=null 回落「未分组」；对齐 Buddy 账号分组） */
+    accountMove: (userId: string, groupId: string | null) =>
+      invoke('qoder_account_move', { userId, groupId: groupId ?? null }),
+    groups: {
+      list: () => invoke<GroupView[]>('qoder_groups_list'),
+      create: (name: string, color: string) =>
+        invoke<string>('qoder_groups_create', { name, color }),
+      update: (id: string, patch: { name?: string; color?: string; order?: number }) =>
+        invoke('qoder_groups_update', {
+          id,
+          name: patch.name ?? null,
+          color: patch.color ?? null,
+          order: patch.order ?? null,
+        }),
+      remove: (id: string) => invoke('qoder_groups_remove', { id }),
+    },
+    /** PAT 手工导入（M1 最可靠凭证通道；qoder.com.cn/account/integrations 自建，pt- 前缀）。pat 后端必填 */
+    accountImportPat: (name: string | undefined, pat: string) =>
+      invoke<QoderAccountView>('qoder_account_import_pat', { name: name ?? null, pat }),
+    /** 单账号凭证续期（手动按钮，force 恒刷；成功返回续期后的最新账号视图） */
+    accountRefreshToken: (accountId: string) =>
+      invoke<QoderAccountView>('qoder_account_refresh_token', { accountId }),
+    /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done）。
+     *  compat=true = 兼容模式（授权 URL 不带 client_id）：官方 client_id 常量被
+     *  Qoder 轮换导致授权页「参数无效」时的降级链路；前端在授权超时后自动切换重试 */
+    oauthLogin: (compat?: boolean) => invoke<void>('qoder_oauth_login', { compat: compat ?? null }),
+    /** 取消进行中的 OAuth 轮询（弹框「取消授权」）：后端置标志后轮询线程自行发失败终态 */
+    oauthCancel: () => invoke<void>('qoder_oauth_cancel'),
+    /** IDE 存储账号发现/导入（M3；secret://aicoding.auth.userInfo DPAPI+AES-GCM 解密） */
+    ideScan: () => invoke<QoderIdeScanResult>('qoder_ide_scan'),
+    /** CLI 登录状态只读桥（M4；~/.qoder-cn/.qoder-app-status.json 白名单透传，无凭证） */
+    cliStatus: () => invoke<QoderCliStatus>('qoder_cli_status'),
+    /** 两个客户端当前实际登录的账号 id（徽标用；IDE=state.vscdb / Work=auth.v1.dat 解密） */
+    liveLogins: () => invoke<QoderLiveLogins>('qoder_live_logins'),
+    settingsGet: () => invoke<QoderSettings>('qoder_settings_get'),
+    settingsSet: (patch: QoderSettings) => invoke('qoder_settings_set', { patch }),
+    checkinStart: (opts?: { user_ids?: string[]; skip_checked_in?: boolean; lazy_hours?: number }) =>
+      invoke('qoder_checkin_start', {
+        opts: {
+          user_ids: opts?.user_ids ?? null,
+          skip_checked_in: opts?.skip_checked_in ?? true,
+          lazy_hours: opts?.lazy_hours ?? null,
+        },
+      }),
+    checkinResults: (days?: number) =>
+      invoke<QoderCheckinRecord[]>('qoder_checkin_results', { days: days ?? null }),
+    checkinTaskRegister: (times: string[]) => invoke('qoder_checkin_task_register', { times }),
+    checkinTaskStatus: () => invoke<string[]>('qoder_checkin_task_status'),
+    checkinTaskUnregister: () => invoke('qoder_checkin_task_unregister'),
+    creditsFetch: (userId?: string, fresh?: boolean) =>
+      invoke<QoderCreditsResult>('qoder_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
+    creditsHistoryList: () =>
+      invoke<{ snapshots: QoderCreditsSnapshot[] }>('qoder_credits_history_list'),
+    /**
+     * 账号池导出（M4；includeCredentials=true 必须提供 password——凭证经 AES-256-GCM
+     * 加密为 AIWQENC1 信封后才写入导出文件，后端对无密码含凭证导出直接拒绝）
+     */
+    accountsExport: (includeCredentials?: boolean, password?: string) =>
+      invoke<QoderPoolExport>('qoder_accounts_export', {
+        includeCredentials: includeCredentials ?? null,
+        password: password ?? null,
+      }),
+    /**
+     * 账号池导入（M4；kind 强校验 + uid 幂等原位更新 + device_profile 仅本地为空才补入）。
+     * payload 为加密信封（AIWQENC1）时必须提供 password 解密；旧明文导出文件免密向后兼容
+     */
+    accountsImport: (payload: Record<string, unknown>, password?: string) =>
+      invoke<QoderPoolImportResult>('qoder_accounts_import', { payload, password: password ?? null }),
+    /** 环境重置清单（M4；8 项语义块 + 动态存在性标注） */
+    envResetItems: () => invoke<QoderResetItem[]>('qoder_env_reset_items'),
+    /** 环境重置执行（M4；自动关闭 Qoder CN，单项失败不中断） */
+    envReset: (items: string[]) => invoke<QoderResetResult[]>('qoder_env_reset', { items }),
+  },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),
     parseCallback: (callbackUrl: string) =>
@@ -436,16 +536,44 @@ export const api = {
         wbLongctxDowngrade?: boolean;
         /** F-76③ 竞速对冲阈值毫秒（0 = 关闭） */
         wbHedgeThresholdMs?: number;
-        /** F-77 账号并发上限（0 = 不限） */
-        accountConcurrencyLimit?: number;
-        /** F-76② 池粘性 TTL 秒 */
-        poolStickyTtlSecs?: number;
-        /** F-76② WB 会话粘性 TTL 秒 */
+        /** Trae 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        traeAccountConcurrencyLimit?: number;
+        /** Trae 池粘性 TTL 秒；null/未传 = 保留原值 */
+        traePoolStickyTtlSecs?: number;
+        /** Trae 池会话粘性 TTL 秒（显式 conversationId 绑定有效期）；null/未传 = 保留原值 */
+        traeStickyTtlSecs?: number;
+        /** Trae 池竞速对冲阈值毫秒（0 = 关闭）；null/未传 = 保留原值 */
+        traeHedgeThresholdMs?: number;
+        /** Buddy 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        wbAccountConcurrencyLimit?: number;
+        /** Buddy 池粘性 TTL 秒；null/未传 = 保留原值 */
+        wbPoolStickyTtlSecs?: number;
+        /** Buddy 会话粘性 TTL 秒；null/未传 = 保留原值 */
         wbStickyTtlSecs?: number;
+        /** Qoder 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        qoderAccountConcurrencyLimit?: number;
+        /** Qoder 池粘性 TTL 秒；null/未传 = 保留原值 */
+        qoderPoolStickyTtlSecs?: number;
+        /** Qoder 会话粘性 TTL 秒（显式 conversationId 绑定有效期）；null/未传 = 保留原值 */
+        qoderStickyTtlSecs?: number;
         /** Buddy 池入池白名单（wb- 前缀账号 id）；null/未传 = 保留原值（含旧数据迁移） */
         wbUids?: string[] | null;
         /** Buddy 池分组筛选；null/未传 = 保留原值，空数组 = 清空（不限分组） */
         wbGroupIds?: string[] | null;
+        /** Qoder 上游开关（p3-3）；null/未传 = 保留原值 */
+        qoderEnabled?: boolean;
+        /** Qoder 竞速对冲阈值毫秒（F-80-余 v2，0 = 关闭）；null/未传 = 保留原值 */
+        qoderHedgeThresholdMs?: number;
+        /** Qoder 会话粘性开关（F-80-余 v2）；null/未传 = 保留原值 */
+        qoderStickyEnabled?: boolean;
+        /** Qoder 池入池白名单（qd- 账号 id）；null/未传 = 保留原值 */
+        qoderUids?: string[];
+        /** Qoder 池分组筛选；null/未传 = 保留原值 */
+        qoderGroupIds?: string[];
+        /** Qoder 池内调度策略（空串 = 跟随 Trae 池）；null/未传 = 保留原值 */
+        qoderStrategy?: string;
+        /** Trae 池参与调度开关（默认开）；null/未传 = 保留原值 */
+        traeEnabled?: boolean;
       },
       wbStrategy?: string,
     ) =>
@@ -460,15 +588,33 @@ export const api = {
         wbBgDowngrade: wbFlags?.wbBgDowngrade ?? null,
         wbLongctxDowngrade: wbFlags?.wbLongctxDowngrade ?? null,
         wbHedgeThresholdMs: wbFlags?.wbHedgeThresholdMs ?? null,
-        accountConcurrencyLimit: wbFlags?.accountConcurrencyLimit ?? null,
-        poolStickyTtlSecs: wbFlags?.poolStickyTtlSecs ?? null,
+        traeAccountConcurrencyLimit: wbFlags?.traeAccountConcurrencyLimit ?? null,
+        traePoolStickyTtlSecs: wbFlags?.traePoolStickyTtlSecs ?? null,
+        traeStickyTtlSecs: wbFlags?.traeStickyTtlSecs ?? null,
+        traeHedgeThresholdMs: wbFlags?.traeHedgeThresholdMs ?? null,
+        wbAccountConcurrencyLimit: wbFlags?.wbAccountConcurrencyLimit ?? null,
+        wbPoolStickyTtlSecs: wbFlags?.wbPoolStickyTtlSecs ?? null,
         wbStickyTtlSecs: wbFlags?.wbStickyTtlSecs ?? null,
+        qoderAccountConcurrencyLimit: wbFlags?.qoderAccountConcurrencyLimit ?? null,
+        qoderPoolStickyTtlSecs: wbFlags?.qoderPoolStickyTtlSecs ?? null,
+        qoderStickyTtlSecs: wbFlags?.qoderStickyTtlSecs ?? null,
         wbUids: wbFlags?.wbUids ?? null,
+        qoderEnabled: wbFlags?.qoderEnabled ?? null,
+        qoderHedgeThresholdMs: wbFlags?.qoderHedgeThresholdMs ?? null,
+        qoderStickyEnabled: wbFlags?.qoderStickyEnabled ?? null,
+        qoderUids: wbFlags?.qoderUids ?? null,
+        qoderGroupIds: wbFlags?.qoderGroupIds ?? null,
+        qoderStrategy: wbFlags?.qoderStrategy ?? null,
+        traeEnabled: wbFlags?.traeEnabled ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
     /** WB 池实时状态（F-77⑤：含 per-account inflight 在途计数） */
     wbPoolStatus: () => invoke<PoolStatus[]>('wb_pool_status'),
+    /** Qoder 池实时状态（Qoder「资源调度」页：含 per-account inflight 在途计数） */
+    qoderPoolStatus: () => invoke<PoolStatus[]>('qoder_pool_status'),
+    /** 手动同步 Qoder 模型目录（复用每日调度任务入口；返回采纳模型数） */
+    qoderCatalogSync: () => invoke<number>('qoder_catalog_sync'),
     logsList: () => invoke<string[]>('api_logs_list'),
     logsDetail: (date: string) => invoke<string | null>('api_logs_detail', { date }),
     logsSearch: (opts: {
@@ -517,6 +663,9 @@ export const api = {
     // 自定义模型用量统计（custom_days 桶，API 管理·用量统计「自定义」筛选）
     customUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_custom_usage_stats', { days: days ?? null }),
+    // Qoder 上游用量统计（qoder_days 桶，与 Trae/WB/Custom 侧分账；上游接入前恒空）
+    qoderUsageStats: (days?: number) =>
+      invoke<UsageDayView[]>('api_qoder_usage_stats', { days: days ?? null }),
     // 自定义模型列表（custom_models.json，OpenAI 兼容上游直通）
     customModelsList: () => invoke<CustomModel[]>('custom_models_list'),
     // 保存自定义模型（upsert：id 空 = 新增；返回保存后的完整列表）
@@ -537,7 +686,7 @@ export const api = {
       invoke<DispatchPolicy>('dispatch_policy_set', { policy }),
     gatewaySettingsGet: () => invoke<GatewaySettings>('gateway_settings_get'),
     // 返回规范化后的生效值（前端展示以返回值为准）；端口改动下次启动 API 服务后生效
-    gatewaySettingsSet: (settings: GatewaySettings) =>
+    gatewaySettingsSet: (settings: Partial<GatewaySettings>) =>
       invoke<GatewaySettings>('gateway_settings_set', { settings }),
     // 局域网网卡 IPv4 列表（issue #34：过滤回环/链路本地/Docker/虚拟化/代理虚拟网卡，
     // 多物理网卡多 IP；网关 0.0.0.0 监听后作为局域网接入地址展示）
@@ -672,6 +821,8 @@ export interface ListenerHandlers {
   onDeviceResetDone?: (e: DeviceResetDoneEvent) => void;
   onProfileProgress?: (line: string) => void;
   onProfileDone?: (e: ProfileDoneEvent) => void;
+  /** Qoder 签到 NDJSON 进度（payload 为 JSON 字符串，归约前需 parse） */
+  onQoderCheckinProgress?: (line: string) => void;
 }
 
 export async function setupListeners(
@@ -750,6 +901,13 @@ export async function setupListeners(
     unsubs.push(
       await listen<ProfileDoneEvent>('profile-done', (e) =>
         handlers.onProfileDone!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onQoderCheckinProgress) {
+    unsubs.push(
+      await listen<string>('qoder-checkin-progress', (e) =>
+        handlers.onQoderCheckinProgress!(e.payload),
       ),
     );
   }

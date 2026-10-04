@@ -8,7 +8,7 @@ import { fmtCredits } from '../../lib/format';
  */
 
 /** 数据源平台维度（Tab 内部过滤用；页面级已固定为单平台，无「全部」混合口径） */
-export type PlatformScope = 'trae' | 'buddy';
+export type PlatformScope = 'trae' | 'buddy' | 'qoder';
 
 /** 单平台 KPI 口径（credits-dashboard-plan.md §2.1） */
 export interface PlatformKpi {
@@ -16,13 +16,13 @@ export interface PlatformKpi {
   accounts: number;
   /** 可用积分总数 */
   totalCredits: number;
-  /** 积分包总数（Trae = 积分包 + 会员包计数；Buddy = remaining > 0 的包计数） */
+  /** 积分包总数（Trae = 积分包 + 会员包计数；Buddy/Qoder = 剩余 > 0 的包计数） */
   packages: number;
   /** 今日新增积分 */
   todayEarned: number;
-  /** 今日消耗积分 */
-  todayConsumed: number;
-  /** 7 天内到期（按剩余积分额度合计，非包数；已过期不计） */
+  /** 今日消耗积分；null = 差分不可比（快照首日/账号数变动日），卡片显示「—」 */
+  todayConsumed: number | null;
+  /** 7 天内到期（按剩余积分额度合计，非包数；已过期不计；Qoder 含 Plan 订阅重置额度） */
   expiring7d: number;
 }
 
@@ -37,7 +37,7 @@ export default function KpiRow({
 }: {
   kpi: PlatformKpi;
   /** 页面所属平台（决定 hint 文案） */
-  platform: 'trae' | 'buddy';
+  platform: 'trae' | 'buddy' | 'qoder';
   /** 本地日期 YYYY-MM-DD（今日新增/消耗卡 hint） */
   today: string;
   /** 可用积分总数卡 hint（Buddy 缓存/stale 状态说明；无数据时缺省） */
@@ -49,7 +49,7 @@ export default function KpiRow({
   /** 今日消耗卡时效标注（Buddy stale 缓存/快照差分推导均非当日数据）；缺省显示今日日期 */
   consumedHint?: string;
 }) {
-  const label = platform === 'trae' ? 'Trae' : 'Buddy';
+  const label = platform === 'trae' ? 'Trae' : platform === 'buddy' ? 'Buddy' : 'Qoder';
   const avg = kpi.accounts > 0 ? kpi.totalCredits / kpi.accounts : 0;
   return (
     <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-7">
@@ -69,7 +69,13 @@ export default function KpiRow({
       <StatCard
         label="积分包总数"
         value={String(kpi.packages)}
-        hint={platform === 'trae' ? '积分包 + 会员包计数' : '剩余积分包（已用完不计）'}
+        hint={
+          platform === 'trae'
+            ? '积分包 + 会员包计数'
+            : platform === 'qoder'
+              ? '剩余积分包 + Plan 订阅重置 · 已用完不计（与到期日历一致）'
+              : '剩余积分包（已用完不计）'
+        }
         tone="amber"
       />
       <StatCard
@@ -78,11 +84,21 @@ export default function KpiRow({
         hint={[today, earnedHint].filter(Boolean).join(' · ')}
         tone="green"
       />
-      <StatCard label="今日消耗积分" value={fmtCredits(kpi.todayConsumed)} hint={consumedHint ?? today} tone="red" />
+      {/* 今日消耗：null（差分不可比）显示「—」，避免与真实零消耗混淆（审查修复） */}
+      <StatCard
+        label="今日消耗积分"
+        value={kpi.todayConsumed == null ? '—' : fmtCredits(kpi.todayConsumed)}
+        hint={consumedHint ?? today}
+        tone={(kpi.todayConsumed ?? 0) > 0 ? 'red' : 'green'}
+      />
       <StatCard
         label="7 天内到期"
         value={fmtCredits(kpi.expiring7d)}
-        hint="按剩余积分额度合计 · 见到期日历"
+        hint={
+          platform === 'qoder'
+            ? '积分包 + Plan 订阅重置额度 · 见到期日历'
+            : '按剩余积分额度合计 · 见到期日历'
+        }
         tone={kpi.expiring7d > 0 ? 'red' : 'green'}
       />
     </div>

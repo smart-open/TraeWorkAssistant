@@ -1,11 +1,15 @@
 //! 多 API Key 管理与每日配额（T2）+ ck_xxx 子 Key 体系（F-35，批次3）。
 //!
-//! 数据落盘 `data/api_keys.json`；`daily_limit = 0` 表示不限。
+//! 存储（审查 P3-6）：Key 注册表整体存入 vault（Stronghold + DPAPI，命名空间
+//! `ns:api_keys:registry`，参照 qoder 凭证 ns 模式）；`daily_limit = 0` 表示不限。
+//! 加载时 vault 优先，vault 无记录则从遗留明文存储（SQLite api_keys 表，更早版本
+//! 为 data/api_keys.json，均已废弃写入）做一次性迁移——迁移失败保留旧库兜底不丢
+//! 数据、下次重试；迁移成功后遗留库**保留但不再写入**。
 //! 所有 Key 统一在列表中维护（无主/子之分）；未配置任何启用的 Key 时：
 //! `auth_disabled = true`（显式关闭鉴权）放行并记为 anonymous，否则拒绝请求（默认）。
 //!
 //! 记账削峰（网关性能批次 E）：鉴权命中只更新**内存权威副本**并标脏，
-//! SQLite 写事务由 flusher（2s）与 stop 时统一落盘——消除「每请求一次整表替换
+//! vault 快照落盘由 flusher（2s）与 stop 时统一执行——消除「每请求一次整表替换
 //! 事务」的写放大与 store 层连接锁争抢。UI 编辑走 `save`（持久化 + 缓存同步刷新），
 //! 改动即时生效；进程崩溃最多丢最近 2s 的 used_today 计数（个人场景可接受）。
 //!
@@ -24,7 +28,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 
-/// 数据文件名（位于 data/ 目录）
+/// vault 命名空间与记录键（审查 P3-6）：整表存单条加密记录
+const VAULT_NS: &str = "api_keys";
+const VAULT_KEY: &str = "registry";
+
 /// 按日统计保留天数
 const DAILY_STATS_CAP: usize = 90;
 
@@ -56,7 +63,7 @@ pub struct ResolvedKey {
     /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）；混合白名单时
     /// 同样可带池前缀（专一锁定其归属池，排除另一池）
     pub dedicated_account: String,
-    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy"
+    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
     pub bind_pool: String,
 }
 
@@ -183,6 +190,7 @@ pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
     match s.trim().to_lowercase().as_str() {
         "trae" => Some("trae"),
         "buddy" => Some("buddy"),
+        "qoder" => Some("qoder"),
         _ => None,
     }
 }
@@ -406,13 +414,48 @@ struct KeysEntry {
     dirty: bool,
 }
 
-/// 锁内取条目：缓存未命中时从 SQLite 加载并插入（首读即缓存）
+/// 从 vault 加载 Key 注册表：vault 有记录 → 反序列化返回（加密权威存储）。
+/// vault 无记录/不可用 → 读遗留明文存储（SQLite api_keys 表）并尝试一次性迁移
+/// 入 vault；迁移失败以遗留库为当前数据源（下次加载重试）。注意（审查 G7）：
+/// 迁移成功后遗留库仅为**迁移时点的快照**且不再写入——vault 异常时只能恢复
+/// 迁移时点的 Key，迁移后在 vault 中新增/编辑的内容不可从遗留库恢复。
+/// 日志只记条数，不落 Key 值。
+fn registry_load(data_dir: &Path) -> ApiKeysFile {
+    if let Some(v) = crate::vault::ns_get(data_dir, VAULT_NS, VAULT_KEY) {
+        if let Ok(f) = serde_json::from_value::<ApiKeysFile>(v) {
+            return f;
+        }
+    }
+    let legacy = crate::store::docs::api_keys_load(&crate::store::db(data_dir));
+    match registry_save(data_dir, &legacy) {
+        Ok(()) => {
+            if !legacy.keys.is_empty() || legacy.auth_disabled {
+                eprintln!(
+                    "[api_keys] 已将 {} 个 Key 的注册表从明文存储一次性迁移至 vault（遗留库仅为迁移时快照且不再写入；vault 异常时只能恢复迁移时点的 Key，迁移后在 vault 中新增/编辑的内容不可从遗留库恢复）",
+                    legacy.keys.len()
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "[api_keys] 迁移至 vault 失败（迁移未完成，遗留明文存储仍为当前数据源，下次加载重试）: {e}"
+        ),
+    }
+    legacy
+}
+
+/// 持久化 Key 注册表到 vault（加密整表单条记录）；SQLite/JSON 明文遗留存储不再写入
+fn registry_save(data_dir: &Path, f: &ApiKeysFile) -> Result<(), String> {
+    let v = serde_json::to_value(f).map_err(|e| format!("Key 注册表序列化失败: {e}"))?;
+    crate::vault::ns_set(data_dir, VAULT_NS, VAULT_KEY, &v)
+}
+
+/// 锁内取条目：缓存未命中时加载（vault 优先 + 遗留迁移）并插入（首读即缓存）
 fn entry_or_load<'a>(
     reg: &'a mut std::collections::HashMap<std::path::PathBuf, KeysEntry>,
     data_dir: &'a Path,
 ) -> &'a mut KeysEntry {
     reg.entry(data_dir.to_path_buf()).or_insert_with(|| KeysEntry {
-        file: crate::store::docs::api_keys_load(&crate::store::db(data_dir)),
+        file: registry_load(data_dir),
         dirty: false,
     })
 }
@@ -427,7 +470,7 @@ pub fn load(data_dir: &Path) -> ApiKeysFile {
 /// 计数字段（used_today/used_date/daily_stats）以内存权威副本为准合并——前端快照
 /// 常携带打开设置页时的旧计数，直接覆盖会系统性回退当日记账（R2；同时消除
 /// save 与 flusher 锁外写库交错的窄竞态）。合并后标脏，flusher 兜底再落一次盘
-/// 收敛交错窗口；落盘失败保留脏标记由 flusher 重试（不静默丢编辑）。
+/// 收敛交错窗口；入 vault 失败保留脏标记由 flusher 重试（不静默丢编辑）。
 pub fn save(data_dir: &Path, f: &ApiKeysFile) {
     let merged = {
         let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -444,8 +487,8 @@ pub fn save(data_dir: &Path, f: &ApiKeysFile) {
         entry.dirty = true;
         nf
     };
-    if crate::store::docs::api_keys_save(&crate::store::db(data_dir), &merged).is_err() {
-        eprintln!("[api_keys] save 落盘失败（内存已生效，flusher 将重试）: {}", data_dir.display());
+    if let Err(e) = registry_save(data_dir, &merged) {
+        eprintln!("[api_keys] save 入 vault 失败（内存已生效，flusher 将重试）: {e}");
     }
 }
 
@@ -463,8 +506,8 @@ pub fn verify_and_consume_locked(data_dir: &Path, presented: &str, today: &str) 
     r
 }
 
-/// 落盘脏副本（flusher 线程 2s 一次 + stop / 退出时调用）；成功落盘返回 true，
-/// 无脏副本或落盘失败返回 false。锁内只取快照，SQLite 写事务在锁外执行；
+/// 落盘脏副本（flusher 线程 2s 一次 + stop / 退出时调用）；成功入 vault 返回 true，
+/// 无脏副本或写入失败返回 false。锁内只取快照，vault 写入在锁外执行；
 /// 写失败恢复脏标记由 flusher 下轮重试（R3，不静默丢当批计数）
 pub fn flush_dirty(data_dir: &Path) -> bool {
     let snapshot = {
@@ -479,13 +522,13 @@ pub fn flush_dirty(data_dir: &Path) -> bool {
     };
     match snapshot {
         Some(f) => {
-            let ok = crate::store::docs::api_keys_save(&crate::store::db(data_dir), &f).is_ok();
+            let ok = registry_save(data_dir, &f).is_ok();
             if !ok {
                 let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(e) = reg.get_mut(&data_dir.to_path_buf()) {
                     e.dirty = true;
                 }
-                eprintln!("[api_keys] flush 落盘失败（已恢复脏标记待重试）: {}", data_dir.display());
+                eprintln!("[api_keys] flush 入 vault 失败（已恢复脏标记待重试）: {}", data_dir.display());
             }
             ok
         }
@@ -496,6 +539,43 @@ pub fn flush_dirty(data_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 从 vault 直接读注册表（验证加密持久层可见性；KEYS_STATE 缓存绕开）
+    fn vault_file(dir: &Path) -> ApiKeysFile {
+        let v = crate::vault::ns_get(dir, VAULT_NS, VAULT_KEY).expect("vault 应有注册表记录");
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn legacy_sqlite_one_time_migration_to_vault() {
+        // 遗留明文存储（SQLite api_keys 表）有数据、vault 为空 → 首次 load 迁移入 vault
+        let dir = std::env::temp_dir().join(format!("twa_keys_migrate_{}", std::process::id()));
+        let mut f = ApiKeysFile::default();
+        f.keys.push(entry("k1", "ck-legacy", true, 3));
+        crate::store::docs::api_keys_save(&crate::store::db(&dir), &f).unwrap();
+        let loaded = load(&dir); // 触发迁移（KEYS_STATE 缓存未预热）
+        assert_eq!(loaded.keys[0].key, "ck-legacy");
+        // vault 已有迁移记录；遗留库保留兜底（不再写入但不删除）
+        let vaulted = vault_file(&dir);
+        assert_eq!(vaulted.keys[0].key, "ck-legacy");
+        assert_eq!(
+            crate::store::docs::api_keys_load(&crate::store::db(&dir)).keys.len(),
+            1,
+            "遗留库保留兜底，防 vault 异常丢 Key"
+        );
+        // 迁移后的编辑走 vault，遗留库不再写入（旧值保持不变）
+        let mut f2 = load(&dir);
+        f2.keys[0].name = "renamed-in-vault".into();
+        save(&dir, &f2);
+        let _ = flush_dirty(&dir);
+        assert_eq!(vault_file(&dir).keys[0].name, "renamed-in-vault");
+        assert_eq!(
+            crate::store::docs::api_keys_load(&crate::store::db(&dir)).keys[0].name,
+            "k1",
+            "遗留库为迁移时快照，不再被后续编辑覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn entry(id: &str, key: &str, enabled: bool, limit: u64) -> ApiKeyEntry {
         ApiKeyEntry {
@@ -604,6 +684,14 @@ mod tests {
         assert_eq!(rk.bind_pool(), Some("buddy"));
         assert!(rk.constrains_pool("buddy"));
         assert!(!rk.constrains_pool("trae"));
+
+        // 绑定 qoder：约束仅作用 qoder 池（qoder_route 以 pool_constraints("qoder") 取约束）
+        e.bind_pool = "Qoder".into();
+        rk = constraints_of(&e);
+        assert_eq!(rk.bind_pool(), Some("qoder"));
+        assert!(rk.constrains_pool("qoder"));
+        assert!(!rk.constrains_pool("trae"));
+        assert!(!rk.constrains_pool("buddy"));
 
         // 非法值视为未绑定
         e.bind_pool = "openai".into();
@@ -720,15 +808,14 @@ mod tests {
             verify_and_consume_locked(&dir, "ck-a", "d1"),
             KeyCheck::Ok(_)
         ));
-        // 落盘前存储仍是旧值、内存副本已是新值（缓存权威语义）
-        // 注意 store 用 rows_replace 写 SQLite，不能用 kv_get_raw 验证；
-        // 直接调 api_keys_load（从 rows 读）验证存储层是否可见
-        let mid_store = crate::store::docs::api_keys_load(&crate::store::db(&dir));
+        // 落盘前 vault 仍是旧值、内存副本已是新值（缓存权威语义）；
+        // 直接调 vault_file（从 vault 记录读）验证持久层是否可见
+        let mid_store = vault_file(&dir);
         assert_eq!(mid_store.keys[0].used_today, 0, "flush 前不应写库");
         assert_eq!(load(&dir).keys[0].used_today, 1, "内存副本已记账");
-        // flush 后存储与内存一致
+        // flush 后持久层与内存一致
         assert!(flush_dirty(&dir), "记账后应标脏并落盘");
-        let updated = crate::store::docs::api_keys_load(&crate::store::db(&dir));
+        let updated = vault_file(&dir);
         assert_eq!(updated.keys[0].used_today, 1, "flush 后应写库");
         assert!(!flush_dirty(&dir), "flush 后脏标记清除");
         let _ = std::fs::remove_dir_all(&dir);
@@ -754,7 +841,7 @@ mod tests {
         assert_eq!(loaded.keys[0].used_date, "d1");
         // save 合并后标脏 → flusher 兜底落一次盘收敛（再 flush 应无脏）
         assert!(flush_dirty(&dir), "save 后应标脏由 flusher 收敛");
-        let stored = crate::store::docs::api_keys_load(&crate::store::db(&dir));
+        let stored = vault_file(&dir);
         assert_eq!(stored.keys[0].name, "renamed");
         assert_eq!(stored.keys[0].used_today, 1, "落盘含合并后的计数");
         assert!(!flush_dirty(&dir), "收敛后脏标记清除");
@@ -768,6 +855,7 @@ mod tests {
         assert_eq!(split_pool_tagged("trae:t1"), (Some("trae"), "t1"));
         assert_eq!(split_pool_tagged("Trae:t1"), (Some("trae"), "t1"));
         assert_eq!(split_pool_tagged("buddy:b1"), (Some("buddy"), "b1"));
+        assert_eq!(split_pool_tagged("qoder:q1"), (Some("qoder"), "q1"));
         // 裸 uid / 非法前缀（"openai:x" 中 openai 非法 → 整串视为裸 uid）
         assert_eq!(split_pool_tagged("t1"), (None, "t1"));
         assert_eq!(split_pool_tagged("openai:x"), (None, "openai:x"));

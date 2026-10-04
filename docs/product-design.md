@@ -88,6 +88,8 @@ AI Work 助手是一款面向多账号 Trae Work 用户的桌面端管理工具�
 
 > **说明**：G01~G07 在 v2.0.0 全部实现并验证通过（原 `requirements-v2.md` 需求规格已于文档精简中归档删除）。
 
+> **Qoder 功能域（F-80，v3.7.0）**：多品牌扩展域——账号管理（PAT 导入 / OAuth 设备流 / IDE 登录态扫描三通道入池、分组、改名、移除）、每日签到（NDJSON 进度、定时调度、启动补签、活动多档领取）、积分查询与每日快照（看板三平台统一）、API 网关 Qoder 上游（模型目录同步、smart 调度、子 Key 池、`qoder_enabled` 开关、并发上限、模型级冷却）、登录态快照切换到 Qoder IDE、设备指纹管理、环境重置 / 彻底登出、账号池导入导出；能力与 Trae/Buddy 域同构，详见 [user-manual.md](user-manual.md)「Qoder 应用」章节与根目录 `AGENT.md` §5.4，本文不展开。
+
 ---
 
 ## 三、界面设计
@@ -699,10 +701,10 @@ notify crate 监听 checkin_accounts.json / device_map.json / groups.json
 
 | 项 | 措施 |
 |---|---|
-| JWT 存储 | 明文存于用户数据目录（与现有脚本保持兼容）；目录权限继承用户账户；**不**随应用打包分发 |
+| JWT 存储 | v1 设计：明文存于用户数据目录（与当时脚本保持兼容）；**现状（vault 已实现）**：凭证已收敛至 DPAPI + Stronghold vault（`conf/vault.stronghold` + DPAPI 加密的 `vault_key.bin`，`vault.rs`），SQLite 状态库中敏感字段一律占位空串，vault 写失败宁可不落盘；目录权限继承用户账户，**不**随应用打包分发 |
 | JWT 展示 | 界面永不完整展示 JWT，仅显示 UserID 前 4 后 4 位 |
 | 日志脱敏 | 所有日志中的 JWT / device_id 一律截断为 `8391…2210` 形式 |
-| 配置导出 | 导出时强制要求设置密码，使用 AES-256-GCM 加密压缩包 |
+| 配置导出 | v1 设计：导出时强制要求设置密码，使用 AES-256-GCM 加密压缩包；**现状（实现中）**：WorkBuddy/Qoder 含凭证导出已强制密码 + AES-256-GCM（魔数头信封） |
 | 提权最小化 | 仅 CA 安装、机器码重置、计划任务注册三个操作提权，其余全程普通权限 |
 | 更新校验 | 应用自动更新走 Tauri Updater，强制签名校验 |
 

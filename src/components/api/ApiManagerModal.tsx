@@ -3,7 +3,7 @@
  * Modal（max-w-[76.8rem]，较原 max-w-5xl 整体放大 1/5）+ Tab 分区【概览｜接口配置｜API Keys 管理｜用量统计｜自定义模型｜生态接入】，
  * 默认概览；头部常驻 GatewayHeader（启停 + 指标行），Tab 切换不消失；任意 activeApp 视图均可打开。
  * 概览 Tab 为资源总览 + 调度策略中心；生态接入（CC Switch 注册）独立成 Tab。
- * 豆包视图：概览 Tab 顶部提示「豆包不提供网关资源，以下为 Trae / Buddy 资源池」。
+ * 豆包视图：概览 Tab 顶部提示「豆包不提供网关资源，以下为 Trae / Buddy / Qoder 资源池」。
  * 子弹框（子 Key 配置/删除确认）沿用 Modal 组件叠加，z 序高于主弹窗。
  */
 import { useEffect, useRef, useState } from 'react';
@@ -75,7 +75,7 @@ export default function ApiManagerModal() {
       {/* 豆包视图说明（§5.2：仅概览 Tab 顶部展示） */}
       {activeApp === 'doubao' && tab === 'overview' && (
         <div className="mt-3 flex items-center gap-2 rounded-lg border border-amber-300/70 bg-amber-50/80 px-3 py-2 text-xs text-amber-800 dark:border-amber-700/40 dark:bg-amber-900/10 dark:text-amber-200">
-          豆包不提供网关资源，以下为 Trae / Buddy 资源池
+          豆包不提供网关资源，以下为 Trae / Buddy / Qoder 资源池
         </div>
       )}
 

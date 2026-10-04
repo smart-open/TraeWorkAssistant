@@ -26,3 +26,15 @@ export function normZero(n: number): number {
 export function fmtCredits(n: number): string {
   return normZero(n).toLocaleString('zh-CN', { maximumFractionDigits: 2 });
 }
+
+/**
+ * 'YYYY-MM-DD' → 当日 23:59:59 本地时间戳（秒）。
+ * Qoder 积分包/订阅到期均为日期字符串（无时分秒），按当日末尾计算到期窗口；
+ * 空串/非法格式返回 null（调用方按「无到期时间」处理）。
+ */
+export function dateStrToEndTs(s: string | null | undefined): number | null {
+  if (!s) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (!m) return null;
+  return new Date(+m[1], +m[2] - 1, +m[3], 23, 59, 59).getTime() / 1000;
+}

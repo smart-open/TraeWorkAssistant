@@ -47,6 +47,13 @@ impl UpstreamProxy {
     }
 }
 
+/// 域名后缀匹配（对齐 handler::ProxyCtx::host_in_targets 语义）：
+/// `d` 命中根域自身与任意层级子域，大小写不敏感
+pub fn host_matches_domain(host: &str, domain: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == domain || h.ends_with(&format!(".{domain}"))
+}
+
 /// 解析上游代理规格，对齐 Python `_parse_upstream`：
 /// 兼容 Windows 系统代理 ProxyServer 的多种写法：
 /// - `127.0.0.1:7890`               -> http
@@ -257,12 +264,34 @@ pub async fn connect_tls_direct(
 }
 
 /// 上游优先建立 TLS 连接（WS 升级路径，路由对齐 MITM 转发：见模块注释）。
-/// 有上游 → CONNECT/SOCKS5 隧道后包 TLS，失败回退直连；无上游 → 直连。
+/// 白名单域（direct_domains 命中）直连优先、失败回退上游；其余有上游 →
+/// CONNECT/SOCKS5 隧道后包 TLS，失败回退直连；无上游 → 直连。
 pub async fn connect_tls_upstream_first(
     host: &str,
     port: u16,
     upstream: Option<&UpstreamProxy>,
+    direct_domains: &[String],
+    log: &crate::device_proxy::logger::ProxyLog,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    // 直连白名单域（p3-2e）：qoder 等国内域经用户 VPN 实测全挂、直连恢复
+    //（2026-09-30 IDE chat 链路），命中域先直连
+    if direct_domains.iter().any(|d| host_matches_domain(host, d)) {
+        return match connect_tls_direct(host, port).await {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                log.log(&format!(
+                    "  [upstream] 直连白名单域 {host}:{port} 失败({e})，回退上游"
+                ));
+                match upstream {
+                    Some(up) => match connect_via_upstream(host, port, up).await {
+                        Ok(tcp) => tls_wrap(host, port, tcp).await,
+                        Err(e2) => Err(format!("直连({e})与上游({e2})均失败")),
+                    },
+                    None => Err(e),
+                }
+            }
+        };
+    }
     match upstream {
         None => connect_tls_direct(host, port).await,
         Some(up) => match connect_via_upstream(host, port, up).await {
@@ -377,11 +406,19 @@ pub struct UpstreamConnector {
     upstream: Option<UpstreamProxy>,
     tls: Arc<tokio_rustls::rustls::ClientConfig>,
     log: crate::device_proxy::logger::ProxyLog,
+    /// 直连白名单域（后缀匹配，p3-2e）：https 目标命中时跳过上游 VPN 直接连目标。
+    /// qoder 国内域经用户 VPN 实测全挂（IDE chat 链路 2026-09-30）、直连恢复——
+    /// MITM 解密层不得改变此类域的出口路径。
+    direct_domains: Arc<Vec<String>>,
 }
 
 impl UpstreamConnector {
-    pub fn new(upstream: Option<UpstreamProxy>, log: crate::device_proxy::logger::ProxyLog) -> Self {
-        Self { upstream, tls: Arc::new(build_client_tls_config()), log }
+    pub fn new(
+        upstream: Option<UpstreamProxy>,
+        log: crate::device_proxy::logger::ProxyLog,
+        direct_domains: Arc<Vec<String>>,
+    ) -> Self {
+        Self { upstream, tls: Arc::new(build_client_tls_config()), log, direct_domains }
     }
 }
 
@@ -435,8 +472,27 @@ impl UpstreamConnector {
             }
         }
 
-        // 建连：直连，或经上游隧道（失败回退直连，对齐 Python 各处回退语义）
-        let tcp = if proxy_fell_back {
+        // 建连：直连白名单域优先直连（失败回退上游兜底）；否则直连，或经上游隧道
+        //（失败回退直连，对齐 Python 各处回退语义）
+        let tcp = if use_tls
+            && self.direct_domains.iter().any(|d| host_matches_domain(&host, d))
+        {
+            match connect_direct(&host, port).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.log.log(&format!(
+                        "  [upstream] 直连白名单域 {host}:{port} 失败({e})，回退上游"
+                    ));
+                    match &self.upstream {
+                        Some(up) => match connect_via_upstream(&host, port, up).await {
+                            Ok(s) => s,
+                            Err(e2) => return Err(format!("直连({e})与上游({e2})均失败")),
+                        },
+                        None => return Err(e),
+                    }
+                }
+            }
+        } else if proxy_fell_back {
             connect_direct(&host, port).await?
         } else {
             match &self.upstream {

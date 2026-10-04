@@ -58,16 +58,24 @@ impl Drop for ApiServerHandle {
 /// 启动 axum HTTP 服务器
 ///
 /// 使用 Tauri 内置 tokio runtime，不新建 runtime。
-/// 监听 0.0.0.0（issue #34）：局域网内其他机器可访问；鉴权见 auth::bearer_auth
-/// （有启用 Key 强制鉴权，无 Key 匿名放行——UI 侧提示启用 Key）。
+/// 监听地址（审查 P1-2）：取 gateway_settings.host，默认 127.0.0.1 环回——个人助手
+/// 场景默认不对外暴露；用户显式配置非环回地址（0.0.0.0 / 局域网 IP）时强制校验
+/// 鉴权（存在启用 Key 且未显式关闭鉴权），否则拒绝启动并返回明确中文错误
+/// （经启动命令链 api_server.rs do_start 的 `?` 透传前端展示）。
 pub async fn start_api_server(
     port: u16,
     state: Arc<ApiSharedState>,
 ) -> Result<ApiServerHandle, String> {
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = TcpListener::bind(&addr)
-        .await
-        .map_err(|e| format!("端口 {} 绑定失败: {}", port, e))?;
+    let host = super::gateway_settings::load(&state.data_dir).host;
+    ensure_bind_auth_policy(&host, &super::api_keys::load(&state.data_dir))?;
+    let addr = format!("{host}:{port}");
+    let listener = TcpListener::bind(&addr).await.map_err(|e| {
+        // 审查 G1：绑定失败错误带监听地址与局域网访问指引（前端展示）
+        format!(
+            "当前监听地址 {host}:{port} 绑定失败: {e}；\
+             如需局域网访问，请在 API 服务设置中修改监听地址并启用 API Key"
+        )
+    })?;
 
     let app = build_router(state.clone());
     spawn_wb_health_probe(state.clone());
@@ -108,6 +116,48 @@ fn spawn_persistence_flusher(state: Arc<ApiSharedState>) {
         });
 }
 
+/// 环回监听地址判定（审查 G3 复用：启动门禁 + api_keys_save 保存守卫同一份判定）。
+/// fail-closed 白名单语义：仅精确匹配以下字面量，未识别的地址一律按非环回处理——
+/// 宁可误拒（多走一次鉴权校验），不可误放（局域网裸奔）。含 IPv6 环回等价写法
+/// "0:0:0:0:0:0:0:1" 与 IPv4 映射环回 "::ffff:127.0.0.1"（审查 G8）。
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host.trim(),
+        "127.0.0.1" | "::1" | "localhost" | "0:0:0:0:0:0:0:1" | "::ffff:127.0.0.1"
+    )
+}
+
+/// 非环回绑定的鉴权门禁（审查 P1-2；纯函数，可单测）：
+/// - 环回地址（127.0.0.1 / ::1 / localhost 等价写法）→ 放行（本机监听无暴露面）
+/// - 非环回地址（0.0.0.0 / 局域网 IP，局域网内任何设备可达）→ 必须**存在启用 Key
+///   且未显式关闭鉴权**，否则拒绝启动并给出明确中文提示（前端展示）
+fn ensure_bind_auth_policy(
+    host: &str,
+    keys: &super::api_keys::ApiKeysFile,
+) -> Result<(), String> {
+    let loopback = is_loopback_host(host);
+    if loopback {
+        return Ok(());
+    }
+    if keys.auth_disabled {
+        return Err(format!(
+            "当前监听地址 {host} 为非环回地址（局域网内任何设备均可访问），\
+             不允许在「显式关闭鉴权」状态下对外监听；\
+             如需局域网访问，请在 API 服务设置中修改监听地址并启用 API Key，\
+             或将监听地址改回 127.0.0.1"
+        ));
+    }
+    if !keys.has_enabled() {
+        return Err(format!(
+            "当前监听地址 {host} 为非环回地址（局域网内任何设备均可访问），\
+             必须先创建并启用至少一个 API Key 才能对外监听；\
+             如需局域网访问，请在 API 服务设置中修改监听地址并启用 API Key，\
+             或将监听地址改回 127.0.0.1"
+        ));
+    }
+    Ok(())
+}
+
 fn build_router(state: Arc<ApiSharedState>) -> Router {
     Router::new()
         .route("/health", get(routes::health))
@@ -133,6 +183,46 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== P1-2：非环回绑定鉴权门禁 ====================
+
+    fn keys_with(entries: Vec<super::super::api_keys::ApiKeyEntry>, auth_disabled: bool) -> super::super::api_keys::ApiKeysFile {
+        super::super::api_keys::ApiKeysFile { keys: entries, auth_disabled }
+    }
+
+    fn key_entry(enabled: bool) -> super::super::api_keys::ApiKeyEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": "k1", "name": "k1", "key": "ck-test", "enabled": enabled,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn bind_policy_loopback_always_allowed() {
+        // 环回地址：无 Key / 显式关闭鉴权均放行（本机监听无暴露面）
+        for host in ["127.0.0.1", "::1", "localhost", " 127.0.0.1 "] {
+            assert!(ensure_bind_auth_policy(host, &keys_with(vec![], true)).is_ok());
+            assert!(ensure_bind_auth_policy(host, &keys_with(vec![], false)).is_ok());
+            assert!(ensure_bind_auth_policy(host, &keys_with(vec![key_entry(true)], false)).is_ok());
+        }
+    }
+
+    #[test]
+    fn bind_policy_non_loopback_requires_auth() {
+        // 0.0.0.0 / 局域网 IP：显式关闭鉴权 → 拒绝
+        let e = ensure_bind_auth_policy("0.0.0.0", &keys_with(vec![key_entry(true)], true))
+            .expect_err("auth_disabled 应拒绝");
+        assert!(e.contains("显式关闭鉴权"));
+        // 无任何启用 Key → 拒绝
+        let e = ensure_bind_auth_policy("192.168.1.10", &keys_with(vec![], false))
+            .expect_err("无启用 Key 应拒绝");
+        assert!(e.contains("API Key"));
+        let e = ensure_bind_auth_policy("0.0.0.0", &keys_with(vec![key_entry(false)], false))
+            .expect_err("仅禁用 Key 应拒绝");
+        assert!(e.contains("API Key"));
+        // 启用 Key 存在且未关闭鉴权 → 放行
+        assert!(ensure_bind_auth_policy("0.0.0.0", &keys_with(vec![key_entry(true)], false)).is_ok());
+    }
 
     // ==================== P2 修复9：优雅停机轮询 ====================
 

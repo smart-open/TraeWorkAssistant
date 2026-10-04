@@ -90,6 +90,7 @@ fn target_slot_exists(data_dir: &std::path::Path, target: TargetApp, uid: &str) 
 }
 
 /// 构造切/存/恢复类命令的通用入参
+#[allow(clippy::too_many_arguments)]
 fn build_args(
     action: Action,
     target_app: Option<&str>,
@@ -97,6 +98,7 @@ fn build_args(
     proxy_port: Option<u16>,
     include_indexeddb: bool,
     expected_current_uid: String,
+    machine_id_override: Option<String>,
     data_dir: std::path::PathBuf,
 ) -> RunArgs {
     RunArgs {
@@ -106,6 +108,7 @@ fn build_args(
         proxy_port: proxy_port.filter(|p| *p > 0),
         include_indexeddb,
         expected_current_uid,
+        machine_id_override,
         data_dir,
     }
 }
@@ -177,6 +180,9 @@ pub fn switch_account(
     // JWT 预检仅 TRAE 双应用（TraeWork/Trae，含默认）：WorkBuddy/CodeBuddy 会话模型不同，
     // 且其 uid 与 TRAE 账号池撞库时会被误探活错误拦截——非 trae 一律放行（CodeBuddy 同 WorkBuddy）
     let is_trae = matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae"));
+    // F-80 §5.10.2：Qoder 切号需携带账号绑定 machine_id 做本地存储指纹覆写
+    let is_qoder = target_app.as_deref() == Some("Qoder");
+    let is_qoder_work = target_app.as_deref() == Some("QoderWork");
     let include_idb = is_doubao && state.settings().doubao_snapshot_include_idb;
     // 切换前服务端会话预检（仅豆包）：目标槽位快照里的会话若已被服务端吊销——常见于
     // 在豆包客户端内退出登录/重登该账号（passport logout 吊销旧会话，快照文件却完好）——
@@ -216,14 +222,12 @@ pub fn switch_account(
     let expected_uid = if is_doubao {
         crate::commands::doubao::detect_guard_uid_strict(&state)
     } else if is_trae {
-        // icube 布局（TraeWork/Trae）切换守卫：混合推导（本机使用证据 + 桥标记切换
-        // 时刻，F2-6）——纯证据推导会被快照冻结的旧时间戳误导（实测指向一个月前的
-        // 历史账号，守卫恒误判不一致而跳过回写）。推导失败（None）→ 维持空串
-        // fail-open 不阻断切换。switch_account 为 async 命令，vscdb/storage 同步读取
-        // 在工作线程执行，不冻结 UI
+        // icube 布局（TraeWork/Trae）切换守卫（issue #55 审查修复）：live_cloud_uid
+        // 日志探测优先（当前会话 dynamicConfig.log uid 是「现在登录的是谁」的直接
+        // 证据），hybrid 仅在日志不可用时回退——回写来源槽的判定不再被桥标记/冻结
+        // 证据带偏。推导失败（None）→ 维持空串 fail-open 不阻断切换
         let kind = target_app.as_deref().unwrap_or("TraeWork");
-        crate::commands::trae_apps::current_cloud_uid_hybrid(kind, &state.data_dir)
-            .unwrap_or_default()
+        crate::commands::trae_apps::live_cloud_uid(kind, &state.data_dir).unwrap_or_default()
     } else if is_buddy {
         // F1-3/F2-5 authfile 布局切换守卫：按端取「当前登录账号 id」——
         // WorkBuddy 由共享 auth 文件驱动 → auth 文件 uid 在池反查优先，桥标记兜底；
@@ -242,6 +246,22 @@ pub fn switch_account(
                 buddy_current_account_id(&state, buddy_app).unwrap_or_default()
             }
         }
+    } else if is_qoder {
+        // F-80 §5.10 切换守卫：Qoder（icube 布局）当前登录真源 = IDE state.vscdb
+        // secret://userInfo（DPAPI 解密，与 ide_store 扫描同链路，仅 Windows）→
+        // uid 在池反查账号 id。uid 在池外时原样返回（守卫消息如实提示「与标记
+        // 账号不一致」，且 uid 与 qd- 池 id 无碰撞）；未登录/解密失败 → 空串
+        // fail-open（仅跳过回写，不阻断切换）。此前 Qoder 落入空串兜底：守卫
+        // 每次误报「未识别登录会话」且来源账号槽永不回写（合并审查修复）。
+        // 2026-10-02 审查：逻辑收编为 commands::qoder::live_account_id，与
+        // profile_backup 保存守卫预探测共用同一实现
+        crate::commands::qoder::live_account_id(&state).unwrap_or_default()
+    } else if is_qoder_work {
+        // 2026-10-02 审查补齐：Qoder Work 切换守卫数据源 = 客户端 Cookies qoderuid
+        // cookie 解密（uuid 与池 uid 同源）→ 池反查账号 id；Cookie 缺失/解密失败 →
+        // 空串 fail-open（仅跳过回写，不阻断切换）。非空时 switch_flow 守卫可正常
+        // 把当前登录态回写到来源账号槽（此前 Work 恒空串，来源槽永不回写）
+        crate::commands::qoder::live_work_account_id(&state).unwrap_or_default()
     } else {
         String::new()
     };
@@ -314,6 +334,12 @@ pub fn switch_account(
         None
     };
 
+    // F-80 §5.10.2：Qoder 切号取账号绑定 machine_id（池内 device_profile；无档案 → None 跳过覆写）
+    let machine_id = if is_qoder {
+        crate::commands::qoder::machine_id_of(&state, user_id.trim())
+    } else {
+        None
+    };
     let args = build_args(
         Action::Switch,
         target_app.as_deref(),
@@ -321,6 +347,7 @@ pub fn switch_account(
         proxy_port,
         include_idb,
         expected_uid,
+        machine_id,
         state.data_dir.clone(),
     );
     // 后台线程执行（流程含最长 ~45s 等待：优雅关闭 8s + auth 静默 10s + verify 30s，
@@ -328,10 +355,13 @@ pub fn switch_account(
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
     let is_doubao2 = is_doubao;
+    let is_qoder2 = is_qoder;
+    let is_qoder_work2 = is_qoder_work;
     run_in_background(app2, "switch-progress", "switch-done", args, migrate_job, Some(Box::new(move |_app, dc_dir| {
         // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
-        // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
-        if !is_doubao2 {
+        // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过；
+        // Qoder/QoderWork 无 icube-dc 通道（qoder_uid 另行回填），同样跳过
+        if !is_doubao2 && !is_qoder2 && !is_qoder_work2 {
             let _ = crate::commands::trae_apps::backfill_dc_id_for(dc_dir, &uid_for_dc);
         }
     })));
@@ -387,21 +417,24 @@ pub fn save_current_login(
         }
     }
 
-    // L1 保存守卫（icube 布局，TraeWork/Trae）：与 F2-5 同型，数据源为
-    // current_cloud_uid_hybrid（本机使用证据 + 桥标记混合推导）。与 L2 日志硬校验
-    // （switcher::icube_save_identity_guard，stop 后读客户端日志）构成双层防护：
-    // L1 在命令层 fail-fast（客户端尚未被关停，体验最好），L2 兜底防 L1 数据源失真
-    // 后误放行。检测不可用（None，如未登录/无证据无标记）→ fail-open 放行。
+    // L1 保存守卫（icube 布局，TraeWork/Trae）：与 F2-5 同型。数据源改为
+    // live_cloud_uid（issue #55 审查修复：客户端日志探测优先，hybrid 回退）——
+    // hybrid 在手动重登后会被桥标记/快照冻结旧证据带偏，误拦合法保存，且拦截发生在
+    // 数据源更可靠的 L2 日志校验之前，曾造成「OAuth 新账号无法建立首个快照」死锁
+    // （切换要快照 → 快照要保存 → 保存被误拒）。与 L2 构成双层防护：L1 命令层
+    // fail-fast（客户端尚未被关停，体验最好），L2 兜底防 L1 数据源失真后误放行。
+    // 检测不可用（None，如未登录/无日志无证据无标记）→ fail-open 放行。
     if matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae")) {
         let kind = target_app.as_deref().unwrap_or("TraeWork");
-        if let Some(live) =
-            crate::commands::trae_apps::current_cloud_uid_hybrid(kind, &state.data_dir)
-        {
+        if let Some(live) = crate::commands::trae_apps::live_cloud_uid(kind, &state.data_dir) {
             if !live.is_empty() && live != user_id.trim() {
-                let msg = format!(
-                    "客户端当前登录的是账号 {live}，与要保存的账号 {user_id} 不一致，已拒绝保存（防止账号 {user_id} 的槽位被账号 {live} 的登录态覆盖污染）。\
-                     请先「切换」到账号 {user_id} 并在客户端确认登录，再点「保存当前登录态」。"
-                );
+                // issue #55 审查修复：拒绝文案按槽位状态分流（首存/污染/通用）
+                let profiles_dir = crate::switcher::profile::profile_for(
+                    TargetApp::parse(kind),
+                    &state.data_dir,
+                )
+                .profiles_dir;
+                let msg = crate::switcher::save_reject_message(&profiles_dir, user_id.trim(), &live);
                 fs_utils::app_log(&state.data_dir, &format!("保存登录态被守卫拦截: {msg}"));
                 return Err(msg);
             }
@@ -421,15 +454,19 @@ pub fn save_current_login(
         None,
         include_idb,
         String::new(),
+        None,
         state.data_dir.clone(),
     );
     let is_doubao = target_app.as_deref() == Some("Doubao");
+    let is_qoder = target_app.as_deref() == Some("Qoder");
+    let is_qoder_work = target_app.as_deref() == Some("QoderWork");
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
     run_in_background(app2, "save-login-progress", "save-login-done", args, None, Some(Box::new(move |_app, dc_dir| {
         // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
-        // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
-        if !is_doubao {
+        // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过；
+        // Qoder/QoderWork 无 icube-dc 通道，同样跳过
+        if !is_doubao && !is_qoder && !is_qoder_work {
             let _ = crate::commands::trae_apps::backfill_dc_id_for(dc_dir, &uid_for_dc);
         }
     })));
@@ -458,6 +495,7 @@ pub fn reset_device_ids(
         None,
         false,
         String::new(),
+        None,
         state.data_dir.clone(),
     );
     run_in_background(app, "device-reset-progress", "device-reset-done", args, None, None);

@@ -360,8 +360,8 @@ function TaskConfigCard({
 
       <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
 
-      {/* 自动签到：启动补签 + 每日签到任务（时刻可改） + UI 坐标点击兜底 */}
-      <h3 className="mb-1 font-medium">自动签到</h3>
+      {/* 每日自动签到：启动补签 + 每日签到任务（时刻可改） + UI 坐标点击兜底 */}
+      <h3 className="mb-1 font-medium">每日自动签到</h3>
       <div className="space-y-3">
         <label className="flex items-start gap-2">
           <input
@@ -490,8 +490,8 @@ function TaskConfigCard({
 
       <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
 
-      {/* 积分与 Token 数据同步：看板数据定时刷新（模式/时刻随「保存配置」生效） */}
-      <h3 className="mb-1 font-medium">积分与 Token 数据同步</h3>
+      {/* 积分数据同步（原「积分与 Token 数据同步」改名）：看板数据定时刷新（模式/时刻随「保存配置」生效） */}
+      <h3 className="mb-1 font-medium">积分数据同步</h3>
       <p className="mb-3 text-xs text-slate-400">
         应用运行期间按所选模式自动同步积分与 Token 看板数据（积分快照 + Token 统计重扫 + 官网用量刷新，一次配置管两个看板）；
         无可用凭证时静默跳过，失败 30 分钟后自动重试。模式与时刻随右上角「保存配置」生效。

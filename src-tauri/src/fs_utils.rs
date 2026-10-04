@@ -32,6 +32,24 @@ pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), Str
     Ok(())
 }
 
+/// 文本原子写（同 write_json 的 temp+rename 模型；供 machineid / storage.json 等
+/// 非 JSON 序列化路径复用，防断电产生半截指纹文件）。
+pub fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), nanos));
+    {
+        let mut f = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
+        f.write_all(content.as_bytes())
+            .map_err(|e| format!("写入失败: {e}"))?;
+        f.flush().map_err(|e| format!("刷新失败: {e}"))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| format!("替换文件失败: {e}"))?;
+    Ok(())
+}
+
 /// 掩码：保留前4后4，中间用 … 代替。
 pub fn mask(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -58,16 +76,20 @@ pub fn mask_secret(s: &str) -> String {
     format!("{}****{}", head, tail)
 }
 
-/// user_id / 账号 id 作文件系统路径段时的安全校验（审查 P0-1 全仓统一入口）。
-/// 只做字符集白名单（字母数字 - _），杜绝 `..`、绝对路径、分隔符注入导致的目录逃逸；
+/// user_id / 账号 id / 快照槽位作文件系统路径段时的安全校验（审查 P0-1 全仓统一入口）。
+/// 只做字符集白名单（字母数字 - _ .），杜绝 `..`、绝对路径、分隔符注入导致的目录逃逸；
 /// 池内存在性校验由各调用方按各自账号池补充（wb_chat_uid_guard 模式）。
+/// 注：`.` 用于快照槽位轮转后缀（<slot>.bak / <slot>.bak2，switcher/copy.rs），
+/// `..` 与裸 `.` 仍被显式拒绝——后者 join 后退化为目录本身，而 profile_delete 对
+/// 校验后的槽位整目录删除（remove_dir_all），放行裸 `.` 等于放行整目录清除。
 pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
     if uid.is_empty()
         || uid.len() > 64
         || !uid
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
         || uid.contains("..")
+        || uid == "."
     {
         return Err(format!("非法账号标识: {}", &uid.chars().take(24).collect::<String>()));
     }
@@ -144,7 +166,11 @@ pub fn app_log(data_dir: &Path, msg: &str) {
         .append(true)
         .open(&log_path)
     {
-        let _ = writeln!(f, "[{}] {}", now_ts(), msg);
+        // 先整行格式化再一次 write_all：writeln! 对多片段格式串会拆成多次
+        // write 系统调用，多线程/多进程并发追加时行中交错（2026-10-04 实测
+        // 出现两行前缀互相嵌入的串行错乱行）；单次 write_all 同行不拆分
+        let line = format!("[{}] {}\n", now_ts(), msg);
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -184,6 +210,33 @@ fn dig_key<'a>(v: &'a serde_json::Value, key: &str, depth: usize) -> Option<&'a 
             .iter()
             .find_map(|item| dig_key(item, key, depth + 1)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 账号 id / 快照槽位白名单（`-` `_` `.`）：
+    /// `.bak`/`.bak2` 为快照轮转槽位合法形态（此前误拒导致快照无法删除）
+    #[test]
+    fn uid_safe_allows_snapshot_bak_suffix() {
+        assert!(ensure_uid_safe("qd-443681d83879").is_ok());
+        assert!(ensure_uid_safe("qd-443681d83879.bak").is_ok());
+        assert!(ensure_uid_safe("qd-443681d83879.bak2").is_ok());
+    }
+
+    /// 路径穿越/分隔符/空串/裸点仍一律拒绝（`..` 防目录逃逸；裸 `.` join 后退化
+    /// 为目录本身，防 profile_delete 类整目录删除误清快照根）
+    #[test]
+    fn uid_safe_rejects_traversal_and_separators() {
+        assert!(ensure_uid_safe("").is_err());
+        assert!(ensure_uid_safe("..").is_err());
+        assert!(ensure_uid_safe(".").is_err());
+        assert!(ensure_uid_safe("a..b").is_err());
+        assert!(ensure_uid_safe("a/b").is_err());
+        assert!(ensure_uid_safe(r"a\b").is_err());
+        assert!(ensure_uid_safe("qd-443681d83879.bak/../../etc").is_err());
     }
 }
 

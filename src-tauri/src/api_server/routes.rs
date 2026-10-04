@@ -20,6 +20,7 @@ use super::usage::{extract_tokens, KeyId};
 use super::wb_catalog;
 use super::wb_model_route;
 use super::wb_route;
+use super::wb_sticky::SessionKey;
 use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState, ErrKind,
             InflightGuard,
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
@@ -296,6 +297,20 @@ pub(crate) fn dispatch_error_response(
                 "wb_upstream_disabled",
                 "invalid_request_error",
             ),
+            DispatchError::QoderDisabled => (
+                StatusCode::BAD_REQUEST,
+                "qoder",
+                "该模型属 Qoder 上游，但 Qoder 上游未启用（api_pool.json qoder_enabled）".to_string(),
+                "qoder_upstream_disabled",
+                "invalid_request_error",
+            ),
+            DispatchError::TraeDisabled => (
+                StatusCode::BAD_REQUEST,
+                "trae",
+                "该模型属 Trae 上游，但 Trae 资源池已停用（api_pool.json trae_enabled）".to_string(),
+                "trae_pool_disabled",
+                "invalid_request_error",
+            ),
             DispatchError::ModelCooling(rem) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "buddy",
@@ -331,6 +346,7 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
     let pool_ref = match pool {
         TargetPool::Trae => &state.pool,
         TargetPool::Buddy => &state.wb_pool,
+        TargetPool::Qoder => &state.qoder_pool,
         // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
         TargetPool::Custom => return "no healthy account available".to_string(),
     };
@@ -562,13 +578,24 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // 与 data/wb_model_catalog.json（Buddy），纯派生不落盘。官网/目录同步后
     // 无需重启 API 服务即可通过 /v1/models 看到最新列表
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    // 可用性标记运行时派生（§3.3 #5）：HTTP 端点用实时池健康
-    let trae_ok = state.pool.has_selectable();
+    // 可用性标记运行时派生（§3.3 #5）：HTTP 端点用实时池健康；
+    // Trae 开关（trae_enabled，默认开）参与徽章判定——关闭时 Trae 源徽章置灰
+    let trae_enabled = state.trae_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let trae_ok = trae_enabled && state.pool.has_selectable();
     let buddy_ok = state.wb_pool.has_selectable();
+    // Qoder 源旗标（p3-3）：条目始终入表（开关关闭时徽章置灰）
+    let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let qoder_ok = state.qoder_pool.has_selectable();
     let data_dir = state.data_dir.clone();
     let list = tokio::task::spawn_blocking(move || {
         // issue #26：对外目录经全局白名单过滤（管理端 api_unified_models 不过滤）
-        unified_catalog::unified_models_whitelisted(&data_dir, wb_enabled, trae_ok, buddy_ok)
+        unified_catalog::unified_models_whitelisted_ex(
+            &data_dir,
+            wb_enabled,
+            trae_ok,
+            buddy_ok,
+            Some((qoder_enabled, qoder_ok)),
+        )
     })
     .await
     .unwrap_or_default();
@@ -675,6 +702,14 @@ pub async fn chat_completions(
                     return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
                 }
                 return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+            }
+            TargetPool::Qoder => {
+                // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
+                // 无 effort/后缀预处理（思考档位由 resolve_thinking 按条目解析）
+                if stream {
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                }
+                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Trae 池 effort 通道（默认思考两池对齐）——
@@ -1002,6 +1037,13 @@ pub async fn messages(
                 }
                 return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
             }
+            TargetPool::Qoder => {
+                // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
+                if stream {
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                }
+                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+            }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Anthropic thinking 参数视为显式请求
                 //（enabled → high 档；disabled → 空串短路默认思考与路由提示）
@@ -1147,6 +1189,13 @@ pub async fn completions(
                     return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
                 }
                 return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+            }
+            TargetPool::Qoder => {
+                // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
+                if stream {
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                }
+                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
@@ -1396,6 +1445,41 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             // Responses 仅走 WB 上游；solo 管线不会收到，兜底给 resp_ id
             Protocol::Responses => format!("resp_{}", now_ts()),
         };
+        // 会话→账号粘性（per-pool 三参数批次，对齐 Buddy/Qoder）：显式
+        // conversationId / 消息指纹命中且账号健康 → 首选粘住账号（上游 KV cache
+        // 复用；busy 且有空闲候选时让位，F-77④ 同构）。子 Key 限定上游不含
+        // 粘性账号时忽略粘性
+        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or_else(|_| json!({}));
+        let sticky_key = SessionKey::from_body(&peek);
+        // 空指纹（无 messages / 无 conversation_id）不可粘
+        let sticky_usable = !sticky_key.cache_key().ends_with(':');
+        let sticky0: Option<String> = if sticky_usable {
+            state
+                .trae_sticky
+                .resolve(&sticky_key, now_ts() as i64)
+                .and_then(|b| {
+                    if trae_allowed.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                        return None;
+                    }
+                    state.pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                })
+        } else {
+            None
+        };
+        // 首选：粘性 > 调度策略；绑定回写用会话键占位 conv_id（Trae 上游无
+        // 会话 id 复用语义，仅落库留档满足非空校验）
+        let sticky_conv = sticky_key.cache_key();
+        let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
+            state
+                .pool
+                .pick_sticky_yield(u, trae_allowed.as_ref())
+                .map(|(p, ev)| {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                })
+        });
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
@@ -1409,12 +1493,17 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             if tx.is_closed() {
                 return;
             }
-            let mut picked = match state
-                .pool
-                .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
-            {
+            // 取号：粘性命中优先（每请求仅首轮），否则按 Key 约束 + 调度策略；
+            // 换号重试后仅走策略
+            let mut picked = match first_pick.take() {
                 Some(p) => p,
-                None => break,
+                None => match state
+                    .pool
+                    .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
+                {
+                    Some(p) => p,
+                    None => break,
+                },
             };
             tried.insert(picked.uid.clone());
             // F-77 账号级在途计数：取号即绑定（换号时 bind_account 自动解绑旧账号）
@@ -1438,13 +1527,15 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 let ttfb_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 match make_upstream_request(&picked.jwt, &picked.uid, &picked.device_id, &picked.machine_id, &converted) {
                     Ok(reader) => {
-                        // 首字超时 10s（T2.7/F-34，与 wb_upstream 同款包装）：建连后
-                        // 首字节 10s 未到视为上游故障 → 冷却换号；首字节到达后正常
-                        // 流速不受限（后续行无超时）。可中断行源：转换循环可在
-                        // 上游停滞期间周期性检查客户端断连（sse.rs LINE_POLL）
-                        let lines = match super::wb_upstream::lines_with_first_byte_timeout_interruptible(reader)
-                        {
-                            Ok(l) => l,
+                        // 首字超时 10s（T2.7/F-34）+ F-76③ 慢请求竞速对冲（Trae 池，
+                        // wb_route/qoder_route 同构）：首字节超阈值且有其他健康账号时
+                        // 向第二账号发对冲请求，先出首字者胜；阈值 0 = 纯首字超时（原语义）。
+                        // 双败/首字超时 → 冷却换号；首字节到达后正常流速不受限
+                        let mut win = match race_trae_first_byte(
+                            &state, &picked.uid, reader, &tried, trae_allowed.as_ref(),
+                            trae_dedicated.as_deref(), &body_vec, sanitize, &templates,
+                        ) {
+                            Ok(w) => w,
                             Err(()) => {
                                 state.pool.note_error(&picked.uid, ErrKind::Server);
                                 *safe_lock(&state.last_error) =
@@ -1466,11 +1557,15 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 break; // 换号
                             }
                         };
+                        // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）；
+                        // 后续记账/日志/粘性绑定均以生效账号 win_uid 为准
+                        guard = settle_trae_hedge(&state, &mut win, guard, &picked.uid);
+                        let TraeRaceWin { lines: win_lines, uid: win_uid, .. } = win;
                         // 首行打点包装：首次成功读到上游行即记录 ttfb（0 哨兵防重复
                         // 覆盖；叠加首字超时包装，语义为「请求发起 → 首行到达」）
                         let lines = {
                             let ttfb_flag = ttfb_us.clone();
-                            lines.map(move |l| {
+                            win_lines.map(move |l| {
                                 let _ = ttfb_flag.compare_exchange(
                                     0,
                                     ttfb_start.elapsed().as_micros() as u64,
@@ -1513,11 +1608,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             let us = ttfb_us.load(std::sync::atomic::Ordering::Relaxed);
                             if us == 0 { None } else { Some(us / 1000) }
                         };
-                        // 用量记账（流式结束即落盘；F-76① TTFT 入账）
+                        // 用量记账（流式结束即落盘；F-76① TTFT 入账；对冲接管记生效账号）
                         {
                             let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
                             state.record_usage_ttfb(
-                                false, &model, &picked.uid, &key_id, error_info.is_none(), true,
+                                false, &model, &win_uid, &key_id, error_info.is_none(), true,
                                 duration_ms, pt, ct, ttfb_ms,
                             );
                         }
@@ -1527,16 +1622,16 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 // 换号重试（收尾帧未发，重试流可在同一连接续传）
                                 state.logger.log_request_ttfb(
                                     "trae", "POST", proto.log_path(), &model, stream,
-                                    200, &picked.uid, duration_ms, ttfb_ms, &key_name,
-                                    &state.pool.name_of(&picked.uid), Some(&format!("空完成 → 换号重试{}", super::wb_payload::template_hit_note())),
+                                    200, &win_uid, duration_ms, ttfb_ms, &key_name,
+                                    &state.pool.name_of(&win_uid), Some(&format!("空完成 → 换号重试{}", super::wb_payload::template_hit_note())),
                                 );
                                 break; // 退出重试循环 → 换号
                             }
                             let kind = classify_solo_error(code, &msg);
                             if kind != ErrKind::None {
-                                state.pool.note_error(&picked.uid, kind);
+                                state.pool.note_error(&win_uid, kind);
                                 *safe_lock(&state.last_error) =
-                                    Some(format!("uid={} code={} msg={}", picked.uid, code, msg));
+                                    Some(format!("uid={} code={} msg={}", win_uid, code, msg));
                             }
                             if !sent_any {
                                 // 流未开始：错误延迟下发（sse 层未透传，由这里统一发）
@@ -1544,21 +1639,27 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             }
                             state.logger.log_request_ttfb(
                                 "trae", "POST", proto.log_path(), &model, stream,
-                                200, &picked.uid, duration_ms, ttfb_ms, &key_name,
-                                &state.pool.name_of(&picked.uid), Some(&msg),
+                                200, &win_uid, duration_ms, ttfb_ms, &key_name,
+                                &state.pool.name_of(&win_uid), Some(&msg),
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                                state.logger.log_debug(&picked.uid, &converted, None, 200, Some(&msg));
+                                state.logger.log_debug(&win_uid, &converted, None, 200, Some(&msg));
                             }
                         } else {
-                            state.pool.note_success(&picked.uid);
+                            state.pool.note_success(&win_uid);
+                            // 绑定会话→账号粘性（仅 clean success；save 1s 节流；
+                            // 对冲接管时绑定生效账号，会话后续粘住实际服务者）
+                            if sticky_usable {
+                                state.trae_sticky.bind(&sticky_key, &win_uid, &sticky_conv, now_ts() as i64);
+                                state.trae_sticky.save(&state.data_dir);
+                            }
                             state.logger.log_request_ttfb(
                                 "trae", "POST", proto.log_path(), &model, stream,
-                                200, &picked.uid, duration_ms, ttfb_ms, &key_name,
-                                &state.pool.name_of(&picked.uid), None,
+                                200, &win_uid, duration_ms, ttfb_ms, &key_name,
+                                &state.pool.name_of(&win_uid), None,
                             );
                             if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                                state.logger.log_debug(&picked.uid, &converted, None, 200, None);
+                                state.logger.log_debug(&win_uid, &converted, None, 200, None);
                             }
                         }
                         return; // 流式结束后直接返回
@@ -1772,6 +1873,39 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut guard = guard;
         // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        // 会话→账号粘性（per-pool 三参数批次，与流式路径同构）：显式
+        // conversationId / 消息指纹命中且账号健康 → 首选粘住账号；子 Key 限定
+        // 上游不含粘性账号时忽略粘性
+        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or_else(|_| json!({}));
+        let sticky_key = SessionKey::from_body(&peek);
+        // 空指纹（无 messages / 无 conversation_id）不可粘
+        let sticky_usable = !sticky_key.cache_key().ends_with(':');
+        let sticky0: Option<String> = if sticky_usable {
+            state
+                .trae_sticky
+                .resolve(&sticky_key, now_ts() as i64)
+                .and_then(|b| {
+                    if trae_allowed.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                        return None;
+                    }
+                    state.pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                })
+        } else {
+            None
+        };
+        // 首选：粘性 > 调度策略；绑定回写用会话键占位 conv_id（仅落库留档）
+        let sticky_conv = sticky_key.cache_key();
+        let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
+            state
+                .pool
+                .pick_sticky_yield(u, trae_allowed.as_ref())
+                .map(|(p, ev)| {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                })
+        });
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
@@ -1781,12 +1915,17 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let templates = super::wb_route::load_templates(&state);
 
         for _ in 0..MAX_ROTATE {
-            let mut picked = match state
-                .pool
-                .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
-            {
+            // 取号：粘性命中优先（每请求仅首轮），否则按 Key 约束 + 调度策略；
+            // 换号重试后仅走策略
+            let mut picked = match first_pick.take() {
                 Some(p) => p,
-                None => break,
+                None => match state
+                    .pool
+                    .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
+                {
+                    Some(p) => p,
+                    None => break,
+                },
             };
             tried.insert(picked.uid.clone());
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
@@ -1844,6 +1983,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     duration_ms, pt, ct,
                                 );
                                 state.pool.note_success(&picked.uid);
+                                // 绑定会话→账号粘性（仅 clean success；save 1s 节流）
+                                if sticky_usable {
+                                    state.trae_sticky.bind(&sticky_key, &picked.uid, &sticky_conv, now_ts() as i64);
+                                    state.trae_sticky.save(&state.data_dir);
+                                }
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     200, &picked.uid, duration_ms, &key_name,
@@ -2068,6 +2212,152 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             &format!("task join error: {}", e),
         ),
     }
+}
+
+// ==================== F-76③ 慢请求竞速对冲（Trae 池，wb_route/qoder_route 同构） ====================
+
+/// 对冲账号在途计数租约（镜像 wb_route::HedgeLease，P0 泄漏修复）：
+/// 构造即 +1（竞速窗口占用），Drop 即 -1——建连失败（闭包内 `?` 提前返回）、
+/// 双败（`lines_with_first_byte_hedged` Err 路径内 Drop）、竞速胜出（随
+/// `RaceOutcome.hedge` 移交调用方，`settle_trae_hedge` 落定后 Drop）三类
+/// 退出路径均恰好释放一次，杜绝计数泄漏导致的账号永久 busy
+struct TraeHedgeLease {
+    uid: String,
+    counter: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl TraeHedgeLease {
+    fn acquire(state: &ApiSharedState, uid: &str) -> Self {
+        let counter = state.pool.inflight_handle(uid);
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { uid: uid.to_string(), counter }
+    }
+}
+
+impl Drop for TraeHedgeLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 首字竞速胜者信息（镜像 wb_route::RaceWin）：生效账号 + 对冲计数租约
+struct TraeRaceWin {
+    lines: Box<dyn Iterator<Item = String> + Send>,
+    /// 生效账号 uid（对冲接管时为对冲账号）
+    uid: String,
+    /// 对冲侧计数租约（None = 未触发对冲；Some = 竞速已定，待 settle 释放）
+    hedge: Option<TraeHedgeLease>,
+    /// 对冲接管（对冲请求先出首字）
+    takeover: bool,
+}
+
+/// 首字竞速（Trae 池，镜像 wb_route::race_first_byte）：对冲关闭（阈值 0）
+/// 时与纯首字超时语义完全一致；开启时主请求首字节超阈值 → 从池内取第二账号
+/// （走同一 busy 过滤/负载因子——主账号已 inflight 天然让位）发对冲请求，
+/// 先出首字者胜。对冲请求体按对冲账号指纹重建（device/machine id 逐账号
+/// 注入，不能复用主请求体）
+#[allow(clippy::too_many_arguments)]
+fn race_trae_first_byte(
+    state: &Arc<ApiSharedState>,
+    primary_uid: &str,
+    reader: Box<dyn Read + Send>,
+    tried: &HashSet<String>,
+    allowed: Option<&HashSet<String>>,
+    dedicated: Option<&str>,
+    body_vec: &[u8],
+    sanitize: bool,
+    templates: &[(String, String)],
+) -> Result<TraeRaceWin, ()> {
+    let hedge_ms = state
+        .trae_hedge_threshold_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if hedge_ms == 0 {
+        let lines = super::wb_upstream::lines_with_first_byte_timeout(reader)?;
+        return Ok(TraeRaceWin {
+            lines,
+            uid: primary_uid.to_string(),
+            hedge: None,
+            takeover: false,
+        });
+    }
+    let state2 = state.clone();
+    let tried2 = tried.clone();
+    let allowed2 = allowed.cloned();
+    let dedicated2 = dedicated.map(str::to_string);
+    let body = body_vec.to_vec();
+    let templates2 = templates.to_vec();
+    let spawn_backup = move || -> Option<(Box<dyn Read + Send>, TraeHedgeLease)> {
+        let (picked2, ev) = state2
+            .pool
+            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+        // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
+        if let Some(ev) = ev {
+            state2.logger.log_sched_event(&ev);
+        }
+        // 租约先于建连获取：建连失败（下行 `?`）时随闭包局部变量 Drop 自动 -1
+        let lease = TraeHedgeLease::acquire(&state2, &picked2.uid);
+        // 对冲请求体按对冲账号指纹重建
+        let converted2 = super::payload::prepare_llm_chat_body(
+            &body,
+            &state2.default_model,
+            &picked2.uid,
+            &picked2.device_id,
+            &picked2.machine_id,
+            &super::models_sync::load_models(&state2.data_dir),
+            sanitize,
+            &templates2,
+        );
+        let reader2 = make_upstream_request(
+            &picked2.jwt,
+            &picked2.uid,
+            &picked2.device_id,
+            &picked2.machine_id,
+            &converted2,
+        )
+        .ok()?;
+        Some((reader2, lease))
+    };
+    match super::wb_upstream::lines_with_first_byte_hedged(reader, hedge_ms, spawn_backup) {
+        Ok(out) => {
+            let uid = if out.takeover {
+                out.hedge
+                    .as_ref()
+                    .map(|l| l.uid.clone())
+                    .unwrap_or_else(|| primary_uid.to_string())
+            } else {
+                primary_uid.to_string()
+            };
+            Ok(TraeRaceWin { lines: out.lines, uid, hedge: out.hedge, takeover: out.takeover })
+        }
+        Err(()) => Err(()),
+    }
+}
+
+/// 竞速结束后处理对冲计数与日志（镜像 wb_route::settle_hedge）：
+/// 释放对冲账号竞速窗口占用；接管时 guard 重绑到对冲账号；[SCHED] 日志记录
+/// hedge_takeover / hedge_lost
+fn settle_trae_hedge(
+    state: &ApiSharedState,
+    win: &mut TraeRaceWin,
+    mut guard: InflightGuard,
+    primary_uid: &str,
+) -> InflightGuard {
+    let Some(lease) = win.hedge.take() else {
+        return guard;
+    };
+    let hedge_uid = lease.uid.as_str();
+    if win.takeover {
+        state
+            .logger
+            .log_sched_event(&format!("hedge_takeover primary={} hedge={}", primary_uid, hedge_uid));
+        guard = guard.bind_account(lease.counter.clone());
+    } else {
+        state
+            .logger
+            .log_sched_event(&format!("hedge_lost primary={} hedge={}", primary_uid, hedge_uid));
+    }
+    drop(lease); // 释放竞速窗口占用（接管路径先重绑流计数再释放，语义与原实现一致）
+    guard
 }
 
 // ==================== Upstream Request ====================
@@ -2358,8 +2648,10 @@ mod tests {
             wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
-            account_concurrency_limit: std::sync::atomic::AtomicU32::new(0),
-            pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            trae_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
@@ -2376,6 +2668,14 @@ mod tests {
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             trae_jwt_refresh: None,
+            trae_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_pool: super::super::pool::ApiPool::new(),
+            qoder_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_identity: None,
+            qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_sticky: super::super::wb_sticky::StickyStore::default(),
+            trae_sticky: super::super::wb_sticky::StickyStore::default(),
         });
         WlFixture { dir, state }
     }

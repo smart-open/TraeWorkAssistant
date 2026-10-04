@@ -14,7 +14,7 @@ use super::{ProgressSink, Session, StepStatus};
 /// 「清空后拷贝」；因备份前 .bak 轮转保证目标恒为新目录，合并 ≡ 替换，恢复侧
 /// 「清空内容后拷」与「删目录重建后拷」终态恒等——Rust 统一为 copy_snapshot_item
 /// 替换语义，结果集与 PS 完全一致。
-enum Item {
+pub(crate) enum Item {
     File(&'static str),
     Dir(&'static str),
 }
@@ -27,7 +27,9 @@ impl Item {
     }
 }
 
-const ICUBE_ITEMS: &[Item] = &[
+/// TRAE 双应用（TraeWork/Trae）白名单（原 ICUBE_ITEMS；F-80 M3 档案化后由
+/// AppProfile.icube_items 参数指向，backup/restore 不再依赖单一常量）
+pub(crate) const TRAE_ICUBE_ITEMS: &[Item] = &[
     Item::File("User\\globalStorage\\storage.json"), // 1. 设备标识/遥测/认证信息
     Item::File("User\\globalStorage\\state.vscdb"), // 2. 登录令牌数据库
     // 2b. WAL/SHM 边车随主库快照（审查修复 2026-09-15）：优雅关闭超时强杀是常态
@@ -68,10 +70,41 @@ pub(super) fn rel_path(rel: &str) -> PathBuf {
     rel.split('\\').fold(PathBuf::new(), |p, c| p.join(c))
 }
 
-/// 快照项全集（相对路径）：公共项 + 平台专属项
-fn all_items() -> Vec<&'static str> {
-    ICUBE_ITEMS.iter().map(|i| i.rel()).chain(ICUBE_ITEMS_MAC.iter().copied()).collect()
+/// 快照项全集（相对路径）：per-profile 白名单（F-80 M3 档案化：TRAE_ICUBE_ITEMS /
+/// QODER_IDE_ITEMS 由 AppProfile.icube_items 指向）+ 平台专属项（mac 根级 Cookies 等）。
+/// mac 项对所有 icube 布局档案（含 Qoder IDE，同为 VSCode fork）统一追加：
+/// 备份/恢复同源对称（存在性检查自然跳过未命中项），同机快照无跨平台污染。
+fn all_items(prof: &super::AppProfile) -> Vec<&'static str> {
+    prof.icube_items
+        .iter()
+        .map(|i| i.rel())
+        .chain(ICUBE_ITEMS_MAC.iter().copied())
+        .collect()
 }
+
+/// Qoder CN IDE 白名单（F-80 M3 实测 2026-09-27：%APPDATA%\QoderCN）：与 TRAE 同构
+/// 的 VSCode fork——根级 machineid/Local State/Preferences + User\globalStorage 登录
+/// 真源（storage.json/state.vscdb±边车）。差异点：无 aha、无 Partitions、无
+/// Local Storage\config.db；特有 SharedClientCache\cache 身份/凭证四小文件——
+/// 仅纳入身份相关小文件，app-config/db/atlas/repowiki 等可再生缓存不入快照
+pub(crate) const QODER_IDE_ITEMS: &[Item] = &[
+    Item::File("User\\globalStorage\\storage.json"), // 设备标识/遥测/认证信息
+    Item::File("User\\globalStorage\\state.vscdb"),  // 登录令牌数据库
+    // WAL/SHM 边车随主库快照（同 TRAE：强杀后残留会被启动回放，恢复前先删）
+    Item::File("User\\globalStorage\\state.vscdb-wal"),
+    Item::File("User\\globalStorage\\state.vscdb-shm"),
+    Item::File("User\\globalStorage\\state.vscdb.backup"),
+    Item::File("machineid"),
+    Item::File("Preferences"),
+    Item::File("Local State"),
+    Item::Dir("Local Storage\\leveldb"), // web 侧登录/偏好 KV
+    Item::Dir("Network"),                // Cookie
+    Item::Dir("Session Storage"),
+    Item::File("SharedClientCache\\cache\\id"), // 客户端身份 id
+    Item::File("SharedClientCache\\cache\\machine_token.json"), // 设备令牌
+    Item::File("SharedClientCache\\cache\\client.json"),        // 客户端注册信息
+    Item::File("SharedClientCache\\cache\\status.json"),        // 登录/激活状态
+];
 
 /// 精准备份：仅复制登录态关键文件（参考 traework-switcher）
 pub fn backup_icube(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
@@ -87,7 +120,7 @@ pub fn backup_icube(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Resu
     std::fs::create_dir_all(&dest).map_err(|e| format!("创建快照目录失败: {e}"))?;
 
     let mut copied = 0usize;
-    for rel in all_items() {
+    for rel in all_items(&sess.prof) {
         if copy::copy_snapshot_item(&src.join(rel_path(rel)), &dest.join(rel_path(rel))) {
             copied += 1;
         }
@@ -135,7 +168,7 @@ pub fn restore_icube(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) ->
     // 对称恢复：槽位有的项覆盖，槽位没有的项删除现场残留——恢复后 Live 恒等于槽位
     // 内容，不携带上一账号的残留（如槽位缺 state.vscdb.backup 而现场有旧账号的）
     let mut restored = 0usize;
-    for rel in all_items() {
+    for rel in all_items(&sess.prof) {
         let src_item = src.join(rel_path(rel));
         let dst_item = dest.join(rel_path(rel));
         if src_item.exists() {
@@ -280,6 +313,7 @@ mod tests {
             proxy_port: None,
             include_indexeddb: false,
             expected_current_uid: String::new(),
+            machine_id_override: None,
             data_dir: data.clone(),
         };
         args.include_indexeddb = false;

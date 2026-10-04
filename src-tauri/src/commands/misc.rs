@@ -506,6 +506,17 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
         (current.as_object_mut(), patch.as_object())
     {
         for (k, v) in patch_obj {
+            // 调度时刻防御性校验：空 hhmm 的既有语义是「从未配置」（state.rs 据此回填
+            // 默认开+默认时刻），显式存空串会破坏该前提（回填覆盖显式关闭）；
+            // 非空值必须为合法 HH:MM（schtasks 还原/调度器均依赖该格式）。
+            if k.ends_with("_hhmm") {
+                match v.as_str() {
+                    Some(s) if s.trim().is_empty() => continue,
+                    Some(s) => validate_hhmm(s)?,
+                    // 非字符串（含 null）不写入，避免破坏 Settings 的 String 反序列化
+                    None => continue,
+                }
+            }
             current_obj.insert(k.clone(), v.clone());
         }
     }

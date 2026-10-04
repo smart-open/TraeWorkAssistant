@@ -204,12 +204,18 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
         // CodeBuddy 桌面版（安装形态含 CN 后缀，与 trae-switch-bridge.ps1 ProcNames 对齐；
         // 此前缺失导致 Rust 侧 graceful_kill_app 杀不掉 CodeBuddy，与桥行为不一致存竞态）
         "CodeBuddy" => vec!["CodeBuddy.exe", "CodeBuddy CN.exe"],
+        // Qoder CN IDE（F-80 M4 环境重置前置关闭，防清理后被回写）；
+        // 0.4.3+ 拆分形态真 IDE 独立进程 Qoder CN IDE.exe（见 qoder/common.rs ide_exe_candidates）
+        "Qoder CN" => vec!["Qoder CN.exe", "Qoder CN Launcher.exe", "Qoder CN IDE.exe"],
         _ => vec![],
     }
 }
 
 /// macOS：按应用类别返回 .app bundle 目录名候选（与 bundles 真实安装形态一致；
 /// 双形态候选防串台——目录名命中后仍以路径段为准，本身即身份信号）。
+/// Qoder 类目（main 合并引入）：Work 本体 bundle "Qoder CN" + 拆分形态 IDE
+/// bundle "Qoder CN IDE"（qoder/common.rs ide_exe_candidates 同源；Launcher
+/// 形态为 Windows 专属，mac 无对应 bundle）。
 #[cfg(target_os = "macos")]
 fn bundles_for_app(app_kind: &str) -> Vec<&'static str> {
     match app_kind {
@@ -218,6 +224,7 @@ fn bundles_for_app(app_kind: &str) -> Vec<&'static str> {
         "Doubao" => vec!["Doubao"],
         "WorkBuddy" => vec!["WorkBuddy"],
         "CodeBuddy" => vec!["CodeBuddy", "CodeBuddy CN"],
+        "Qoder CN" => vec!["Qoder CN", "Qoder CN IDE"],
         _ => vec![],
     }
 }

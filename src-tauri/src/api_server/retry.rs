@@ -30,7 +30,30 @@ pub fn is_thinking_signature_error(body: &str) -> bool {
 pub fn is_illegal_channel_error(body: &str) -> bool {
     body.contains("Illegal API invocation")
         || body.contains("unapproved channel")
-        || body.contains("\"code\":11128")
+        || contains_code_11128(body)
+}
+
+/// `"code": 11128` 宽松匹配：容忍键/冒号/值之间的序列化空白差异
+/// （Go encoding/json 紧凑无空格，但报文可能经中间层重序列化）；
+/// 值须带数字边界（`111280`/`111289` 不误撞），键名引号边界天然排除
+/// `some_code` 等字段名
+fn contains_code_11128(body: &str) -> bool {
+    const KEY: &str = "\"code\"";
+    const CODE: &str = "11128";
+    let mut rest = body;
+    while let Some(pos) = rest.find(KEY) {
+        let after_key = rest[pos + KEY.len()..].trim_start();
+        if let Some(after_colon) = after_key.strip_prefix(':') {
+            let after_colon = after_colon.trim_start();
+            if let Some(tail) = after_colon.strip_prefix(CODE) {
+                if !tail.starts_with(|c: char| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+        rest = &rest[pos + KEY.len()..];
+    }
+    false
 }
 
 /// 分级重试决策（按 §3.9 ③ 表格逐行实现）
@@ -163,5 +186,22 @@ mod tests {
         assert_eq!(retry_plan(400, "context_too_long", 0, None), RetryAction::Fatal);
         assert_eq!(retry_plan(404, "", 0, None), RetryAction::Fatal);
         assert_eq!(retry_plan(422, "", 0, None), RetryAction::Fatal);
+    }
+
+    #[test]
+    fn illegal_channel_code_match_tolerates_whitespace() {
+        // 紧凑与空白两种序列化形态均命中（issue #57 审查修复）
+        assert!(is_illegal_channel_error(r#"{"error":{"code":11128,"msg":"x"}}"#));
+        assert!(is_illegal_channel_error(r#"{"error":{"code": 11128 }}"#));
+        assert!(is_illegal_channel_error(r#"{"error" : {"code"
+: 11128}}"#));
+        // 数字边界：更长数字不误撞
+        assert!(!is_illegal_channel_error(r#"{"code":111280}"#));
+        assert!(!is_illegal_channel_error(r#"{"code":111289}"#));
+        // 键名引号边界：some_code 等字段不误撞
+        assert!(!is_illegal_channel_error(r#"{"some_code":11128}"#));
+        // 关键词兜底仍有效
+        assert!(is_illegal_channel_error("Illegal API invocation from channel"));
+        assert!(!is_illegal_channel_error("normal upstream error"));
     }
 }

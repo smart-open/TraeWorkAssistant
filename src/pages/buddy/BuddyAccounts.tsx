@@ -114,6 +114,8 @@ export default function BuddyAccounts() {
   const [backupFor, setBackupFor] = useState<WorkBuddyAccountView | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportWithCreds, setExportWithCreds] = useState(false);
+  // 含凭证导出的二次确认弹框（审查 P0-2；禁 window.confirm，红线）
+  const [credExportConfirm, setCredExportConfirm] = useState(false);
   const importFileRef = useRef<HTMLInputElement>(null);
   const [editFor, setEditFor] = useState<WorkBuddyAccountView | null>(null);
   const [editName, setEditName] = useState('');
@@ -611,8 +613,18 @@ export default function BuddyAccounts() {
     setExportOpen(true);
   };
 
-  // 导出确认（F-46 扩展）：可选是否附带凭证副本（迁移场景用）
-  const confirmExport = async () => {
+  // 导出确认（F-46 扩展）：可选是否附带凭证副本（迁移场景用）。
+  // 含凭证时先弹独立确认弹框（审查 P0-2；禁 window.confirm，红线）
+  const confirmExport = () => {
+    if (exportWithCreds) {
+      setCredExportConfirm(true);
+      return;
+    }
+    void doExport();
+  };
+
+  const doExport = async () => {
+    setCredExportConfirm(false);
     setExportBusy(true);
     try {
       const data = await withMinDelay(api.workbuddy.accountsExport(exportWithCreds), 1000);
@@ -1317,7 +1329,7 @@ export default function BuddyAccounts() {
         footer={
           <>
             <button className="btn-outline" onClick={() => setExportOpen(false)} disabled={exportBusy}>取消</button>
-            <button className="btn-primary" onClick={() => void confirmExport()} disabled={exportBusy}>
+            <button className="btn-primary" onClick={() => confirmExport()} disabled={exportBusy}>
               {exportBusy ? <Spinner /> : null} 确认导出
             </button>
           </>
@@ -1339,6 +1351,39 @@ export default function BuddyAccounts() {
               </span>
             </span>
           </label>
+        </div>
+      </Modal>
+
+      {/* 含凭证导出二次确认弹框（审查 P0-2；禁 window.confirm，红线） */}
+      <Modal
+        open={credExportConfirm}
+        onClose={() => {
+          if (!exportBusy) setCredExportConfirm(false);
+        }}
+        title="确认导出明文凭证"
+        footer={
+          <>
+            <button className="btn-outline" disabled={exportBusy} onClick={() => setCredExportConfirm(false)}>
+              取消
+            </button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              disabled={exportBusy}
+              onClick={() => void doExport()}
+            >
+              {exportBusy ? <Spinner /> : null} 我已知晓风险，继续导出
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-sm">
+          <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
+            <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+            <span>
+              导出文件将包含账号的明文凭证（refreshToken / accessToken），文件等同密码。
+              仅应在可信环境用于账号迁移，导出后请妥善保管，切勿通过不可信渠道传输。
+            </span>
+          </div>
         </div>
       </Modal>
 

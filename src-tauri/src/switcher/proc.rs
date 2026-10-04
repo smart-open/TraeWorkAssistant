@@ -532,6 +532,7 @@ mod tests {
             proxy_port: None,
             include_indexeddb: false,
             expected_current_uid: String::new(),
+            machine_id_override: None,
             data_dir: std::env::temp_dir(),
         })
     }

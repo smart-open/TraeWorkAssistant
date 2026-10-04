@@ -18,8 +18,8 @@ fn random_digits(n: usize) -> String {
 }
 
 /// 重置 6 层机器码中的 MachineGuid（需管理员）。非管理员时跳过并提示，不阻断切换。
-/// F-75 M1-1.3：mac 无系统级 MachineGuid 等价可写物（IOPlatformUUID 只读），
-/// mac 分支如实 Skip 并说明（不影响切换主流程）。
+/// F-75 M1-1.3：mac 无系统级 MachineGuid 等价可写物（IOPlatformUUID 只读，不可也
+/// 无需重置），mac 分支如实 Skip 并说明（不影响切换主流程）。
 /// 注意（Windows 分支）：必须用 create()（KEY_READ|KEY_WRITE）——open() 仅 KEY_READ
 /// 只读句柄，set_string 必然拒绝访问（os error 5），管理员权限下也一样（issue #33）。
 pub fn reset_machine_id(sink: &dyn ProgressSink) -> Result<(), String> {
@@ -297,8 +297,80 @@ fn edit_storage_device_ids(
         changed = true;
     }
     if changed {
-        std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        // 原子写（write_json 同款 temp+rename），防断电损坏 storage.json
+        crate::fs_utils::write_json(path, &v).map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
+}
+
+/// F-80 §5.10.2（M3）：Qoder 每账号稳定指纹 → 本地存储覆写。切换/恢复成功后由
+/// switcher 挂点调用（回滚路径不调用，防 last 回滚后残留目标账号指纹）：
+/// ① machineid 文件 ← machine_id（32-hex 无 BOM；不存在则创建）；
+/// ② storage.json 点号键 telemetry.machineId / sqmId / devDeviceId ← machine_id
+///    （仅替换已存在键，对齐 edit_storage_device_ids 语义；sqmId/devDeviceId 同值
+///    绑定 = 单标识域模型，与 QoderPatcher 伪造口径一致，不引入第二标识源）；
+/// ③ state.vscdb ItemTable storage.serviceMachineId ← machine_id（upsert）。
+/// 返回成功层数；任何一层失败 → Err 汇总（调用侧降级 warn 不阻断切换）
+/// macOS 适配预留（2026-10-03）：三层写入全部为「文件 + SQLite」操作，跨平台
+/// 无需改动（machineid 无 BOM 写、storage.json 点号键、vscdb upsert 均平台无关）；
+/// 仅 6 层重置里的第 5 层注册表（reset_device_ids_only）为 Windows 专属，见其注释
+pub fn apply_qoder_fingerprint(data_dir: &Path, machine_id: &str) -> Result<usize, String> {
+    let mut ok = 0usize;
+    let mut errs: Vec<String> = Vec::new();
+
+    // ① machineid 文件（根级；原子写防断电产生半截指纹文件，无 BOM 语义不变）
+    match crate::fs_utils::write_text_atomic(&data_dir.join("machineid"), machine_id) {
+        Ok(()) => ok += 1,
+        Err(e) => errs.push(format!("machineid 写入失败: {e}")),
+    }
+
+    // ② storage.json（User\globalStorage\ 下；文件不存在 = 首次使用，跳过）
+    let storage_file = data_dir.join("User").join("globalStorage").join("storage.json");
+    if storage_file.exists() {
+        match edit_qoder_storage_ids(&storage_file, machine_id) {
+            Ok(true) => ok += 1,
+            Ok(false) => {} // 三个键均不存在（该版本布局未写遥测键），无需改
+            Err(e) => errs.push(format!("storage.json 覆写失败: {e}")),
+        }
+    }
+
+    // ③ state.vscdb serviceMachineId（upsert；文件不存在 = 首装未启动过，跳过）
+    match super::vscdb::upsert_text_key(
+        &data_dir.join("User").join("globalStorage").join("state.vscdb"),
+        "storage.serviceMachineId",
+        machine_id,
+    ) {
+        Ok(true) => ok += 1,
+        Ok(false) => {}
+        Err(e) => errs.push(format!("state.vscdb 覆写失败: {e}")),
+    }
+
+    if errs.is_empty() {
+        Ok(ok)
+    } else {
+        Err(format!("成功 {ok}/3 层；{}", errs.join("；")))
+    }
+}
+
+/// storage.json Qoder 设备键覆写：点号键名整体替换（仅已存在键）。返回 false = 无键可改。
+fn edit_qoder_storage_ids(path: &Path, machine_id: &str) -> Result<bool, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut v: serde_json::Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
+        .map_err(|e| e.to_string())?;
+    let Some(obj) = v.as_object_mut() else {
+        return Err("storage.json 非对象".to_string());
+    };
+    let mut changed = false;
+    for k in ["telemetry.machineId", "telemetry.sqmId", "telemetry.devDeviceId"] {
+        if obj.contains_key(k) {
+            obj.insert(k.to_string(), serde_json::Value::String(machine_id.to_string()));
+            changed = true;
+        }
+    }
+    if changed {
+        // 原子写（temp+rename，对齐同文件 edit_storage_device_ids 口径）：
+        // storage.json 是登录态载体，直接覆盖写遇断电/崩溃会产生半截文件
+        crate::fs_utils::write_json(path, &v)?;
     }
     Ok(changed)
 }

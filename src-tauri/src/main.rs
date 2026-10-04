@@ -213,6 +213,8 @@ fn main() {
             commands::api_server::pool_set,
             commands::api_server::pool_status,
             commands::api_server::wb_pool_status,
+            commands::api_server::qoder_pool_status,
+            commands::api_server::qoder_catalog_sync,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
             commands::api_server::api_logs_search,
@@ -223,6 +225,7 @@ fn main() {
             commands::api_server::api_usage_stats,
             commands::api_server::api_wb_usage_stats,
             commands::api_server::api_custom_usage_stats,
+            commands::api_server::api_qoder_usage_stats,
             commands::api_server::api_keys_list,
             commands::api_server::api_keys_save,
             commands::api_server::api_wb_catalog_sync,
@@ -340,6 +343,38 @@ fn main() {
             commands::workbuddy::workbuddy_usage_official_all,
             commands::workbuddy::workbuddy_activity_info,
             commands::workbuddy_stats::workbuddy_token_stats,
+            // Qoder（F-80 M1：签到 MVP 闭环 + 最小积分通道）
+            commands::qoder::qoder_env_check,
+            commands::qoder::qoder_open_ide,
+            commands::qoder::qoder_open_work,
+            commands::qoder::qoder_oauth_login,
+            commands::qoder::qoder_oauth_cancel,
+            commands::qoder::qoder_settings_get,
+            commands::qoder::qoder_settings_set,
+            commands::qoder::qoder_accounts_list,
+            commands::qoder::qoder_account_save,
+            commands::qoder::qoder_account_remove,
+            commands::qoder::qoder_account_move,
+            commands::qoder::qoder_groups_list,
+            commands::qoder::qoder_groups_create,
+            commands::qoder::qoder_groups_update,
+            commands::qoder::qoder_groups_remove,
+            commands::qoder::qoder_account_import_pat,
+            commands::qoder::qoder_account_refresh_token,
+            commands::qoder::qoder_ide_scan,
+            commands::qoder::qoder_cli_status,
+            commands::qoder::qoder_live_logins,
+            commands::qoder::qoder_checkin_start,
+            commands::qoder::qoder_checkin_results,
+            commands::qoder::qoder_checkin_task_register,
+            commands::qoder::qoder_checkin_task_status,
+            commands::qoder::qoder_checkin_task_unregister,
+            commands::qoder::qoder_credits_fetch,
+            commands::qoder::qoder_credits_history_list,
+            commands::qoder::qoder_accounts_export,
+            commands::qoder::qoder_accounts_import,
+            commands::qoder::qoder_env_reset_items,
+            commands::qoder::qoder_env_reset,
             tasks::scheduler::scheduler_status,
         ])
         .setup(|app| {
@@ -399,6 +434,10 @@ fn main() {
 
             // 敏感数据迁移：库中明文 jwt/refresh_token → Stronghold vault（幂等，失败不阻断启动）
             vault::migrate_on_startup(&state);
+
+            // 凭证收敛（审查 P0-1）：WB/Qoder token store 与豆包账号池的明文凭证
+            // → Stronghold vault，SQLite 行占位化（幂等，失败不阻断启动）
+            vault::migrate_ns_on_startup(&state);
 
             fs_utils::app_log(
                 &state.data_dir,
@@ -627,6 +666,13 @@ fn main() {
                 let app2 = app.handle().clone();
                 let st = app.state::<AppState>();
                 commands::workbuddy::startup_auto_checkin(&app2, &st);
+            }
+
+            // Qoder 启动自动补签（F-80，F-55 同款模式）：独立开关，与 WB 补签互不影响
+            {
+                let app2 = app.handle().clone();
+                let st = app.state::<AppState>();
+                commands::qoder::startup_auto_checkin(&app2, &st);
             }
 
             // CodeBuddy CLI 五重防护自动轮换（F-59）：独立后台线程按检查间隔执行，

@@ -178,10 +178,12 @@ fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
     }
 }
 
-/// 版本号读取（Windows：PowerShell 读 exe VersionInfo；mac 走 finish_locate_macos 的
-/// Info.plist CFBundleShortVersionString，本函数不参与编译——避免 dead_code 警告）
-#[cfg(not(target_os = "macos"))]
-fn version_of(path: &str) -> Option<String> {
+/// exe 文件版本（ProductVersion 优先，回退 FileVersion）——qoder_env_check 复用。
+/// 分平台实现：Windows=PowerShell 读 exe VersionInfo；mac=exe 路径上溯定位 .app
+/// bundle 后读 Info.plist CFBundleShortVersionString（复用 locate::read_info_plist_value）；
+/// 其余平台恒 None。
+#[cfg(windows)]
+pub(crate) fn version_of(path: &str) -> Option<String> {
     // 优先 ProductVersion（用户认知的产品版本，如 Trae 3.3.100 / Trae Work 0.1.65 /
     // CodeBuddy 4.12.0），缺失时回退 FileVersion（内部构建号）——实测 Electron 系客户端
     // 两者差异巨大（TRAE SOLO CN.exe FileVersion=2.3.83557 而 ProductVersion=0.1.65，
@@ -207,6 +209,30 @@ fn version_of(path: &str) -> Option<String> {
         s
     };
     Some(s)
+}
+
+/// mac 版本号读取：exe 路径（如 /Applications/Qoder CN.app/Contents/MacOS/Qoder CN IDE）
+/// 上溯定位 .app bundle 根，读 Info.plist CFBundleShortVersionString——与
+/// finish_locate_macos 同源，qoder_env_check（main 合并引入）跨平台复用入口。
+#[cfg(target_os = "macos")]
+pub(crate) fn version_of(path: &str) -> Option<String> {
+    let mut cur = std::path::Path::new(path).parent();
+    while let Some(dir) = cur {
+        if dir.extension().map(|e| e == "app").unwrap_or(false) {
+            return crate::switcher::locate::read_info_plist_value(
+                dir,
+                "CFBundleShortVersionString",
+            );
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// 其余平台（非 Windows/macOS）占位：恒 None，保证调用方编译通过
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn version_of(_path: &str) -> Option<String> {
+    None
 }
 
 fn is_running_cn() -> bool {

@@ -26,6 +26,8 @@ function PoolBadges({ pools }: { pools: string[] }) {
           <Badge key={p} tone="blue">Trae</Badge>
         ) : p === 'buddy' ? (
           <Badge key={p} tone="violet">Buddy</Badge>
+        ) : p === 'qoder' ? (
+          <Badge key={p} tone="green">Qoder</Badge>
         ) : (
           <Badge key={p} tone="amber">自定义</Badge>
         ),
@@ -38,6 +40,7 @@ export default function InterfaceConfig() {
   const toast = useAppStore((s) => s.pushToast);
   const [gw, setGw] = useState<GatewaySettings | null>(null);
   const [port, setPort] = useState(7864);
+  const [host, setHost] = useState('127.0.0.1');
   const [model, setModel] = useState('glm-5.3');
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
@@ -60,6 +63,7 @@ export default function InterfaceConfig() {
       .then((s) => {
         setGw(s);
         setPort(s.port);
+        setHost(s.host || '127.0.0.1');
         setModel(s.default_model);
       })
       .catch(() => {
@@ -94,16 +98,18 @@ export default function InterfaceConfig() {
     }
     setSaving(true);
     try {
-      // 后端会规范化（空模型名回退默认值），前端展示以返回值为准（§5.3）
+      // 后端会规范化（空模型名回退默认值），前端展示以返回值为准（§5.3）；
+      // patch 合并语义：仅显式修改的字段（端口/监听地址/默认模型）覆盖现值
       const next = await withMinDelay(
         api.apiServer.gatewaySettingsSet({
           port: p,
+          host: host.trim(),
           default_model: model.trim(),
-          updated_at: gw?.updated_at ?? 0,
         }),
       );
       setGw(next);
       setPort(next.port);
+      setHost(next.host || '127.0.0.1');
       setModel(next.default_model);
       toast('success', '网关设置已保存；端口改动将在下次启动 API 服务后生效');
     } catch (e) {
@@ -196,6 +202,11 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
       ? models
       : [{ id: model, display: model, rate: null, efforts: [], max_mode: false, context_length: null, max_tokens: null, supports_image: null, manual: false, sources: [] }, ...models];
 
+  // 网关 host 环回判定（按已保存设置）：环回（127.0.0.1/localhost/::1）时局域网接入
+  // 仅展示「仅本机可访问」提示；非环回才列出各网卡 IP（审查 G1：原写死 0.0.0.0 与实际不符）
+  const gwHost = gw?.host || '127.0.0.1';
+  const gwLoopback = gwHost === '127.0.0.1' || gwHost === 'localhost' || gwHost === '::1';
+
   // ---- 白名单派生数据 ----
   const catalogByCanonical = new Map(models.map((m) => [canonical(m.id), m]));
   const wlEnabled = whitelist.length > 0;
@@ -213,9 +224,21 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
 
   return (
     <div className="card p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <Globe size={16} className="text-brand-500" />
-        <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h3>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Globe size={16} className="text-brand-500" />
+          <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h3>
+        </div>
+        {/* 保存配置置于右上角（2026-10-02 评审：原在表单底部，长表单需滚动到底才能保存） */}
+        <button
+          className="btn-secondary flex items-center gap-2"
+          onClick={() => void save()}
+          disabled={saving}
+          title="保存端口 / 监听地址 / 默认模型 / 模型白名单"
+        >
+          <Save size={15} />
+          {saving ? '保存中…' : '保存配置'}
+        </button>
       </div>
 
       <div className="space-y-4">
@@ -234,6 +257,21 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
+              监听地址
+            </label>
+            <input
+              type="text"
+              className="input font-mono"
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+              placeholder="127.0.0.1"
+            />
+            <p className="mt-1 text-xs text-slate-400">
+              默认仅本机 127.0.0.1 可访问；如需局域网设备访问可设为 0.0.0.0，此时必须启用 API Key
+            </p>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
               默认模型
             </label>
             <select
@@ -249,7 +287,7 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
               ))}
             </select>
             <p className="mt-1 text-xs text-slate-400">
-              统一目录（Trae / Buddy 聚合）；用于 CC Switch 注册与未指定 model 的请求
+              统一目录（Trae / Buddy / Qoder 聚合）；用于 CC Switch 注册与未指定 model 的请求
             </p>
           </div>
         </div>
@@ -302,15 +340,6 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
           )}
         </div>
 
-        <button
-          className="btn-secondary flex items-center gap-2"
-          onClick={() => void save()}
-          disabled={saving}
-        >
-          <Save size={15} />
-          {saving ? '保存中…' : '保存配置'}
-        </button>
-
         <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
           <div className="mb-2 flex items-center justify-between">
             <p className="font-medium">使用方式 & 配置示例</p>
@@ -331,25 +360,30 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
             </div>
             <div>
               <span className="text-slate-400">局域网接入：</span>
-              {lanIps.length ? (
-                lanIps.map((e) => (
-                  <code
-                    key={e.ip}
-                    className="block break-all text-[11px]"
-                    title={`网卡：${e.name}`}
-                  >
-                    http://{e.ip}:{gw?.port ?? 7864}/v1（{e.name}）
-                  </code>
-                ))
+              {gwLoopback ? (
+                <code className="text-[11px]">
+                  当前仅本机可访问（监听 {gwHost}）；如需局域网访问请修改上方监听地址为 0.0.0.0 并启用 API Key
+                </code>
               ) : (
-                <code className="text-[11px]">未检测到局域网地址（已排除回环/虚拟网卡）</code>
+                <>
+                  <code className="block text-[11px]">
+                    当前监听 {gwHost}，局域网内设备可通过下列地址访问；出于安全要求已强制启用 API Key 鉴权
+                  </code>
+                  {lanIps.length ? (
+                    lanIps.map((e) => (
+                      <code
+                        key={e.ip}
+                        className="block break-all text-[11px]"
+                        title={`网卡：${e.name}`}
+                      >
+                        http://{e.ip}:{gw?.port ?? 7864}/v1（{e.name}）
+                      </code>
+                    ))
+                  ) : (
+                    <code className="text-[11px]">未检测到局域网地址（已排除回环/虚拟网卡）</code>
+                  )}
+                </>
               )}
-            </div>
-            <div>
-              <span className="text-slate-400">安全提示：</span>
-              <code className="text-[11px]">
-                网关监听 0.0.0.0，局域网内设备可访问；未启用任何 API Key 时匿名放行，建议创建并启用 Key
-              </code>
             </div>
             <div>
               <span className="text-slate-400">API Key：</span>

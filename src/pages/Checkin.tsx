@@ -2,7 +2,10 @@ import { useMemo, useState, useEffect } from 'react';
 import { PlayCircle, CheckCircle2, XCircle, AlertCircle, HelpCircle, AlertTriangle, Snowflake, RefreshCw, Users } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Progress } from '../components/ui';
+import CheckinCalendarCard from '../components/CheckinCalendar';
+import { daysFromTrendPoints, type CheckinCalendarDay } from '../components/checkinCalendarModel';
 import { useAppStore } from '../store';
+import { api } from '../lib/tauri';
 import { normZero } from '../lib/format';
 import type { AccountView } from '../types';
 
@@ -77,6 +80,21 @@ export default function Checkin() {
   useEffect(() => {
     if (groups.length > 0 && !groupId) setGroupId(groups[0].id);
   }, [groups, groupId]);
+
+  // 活动档期日历（F-80-余 v2 推广，对齐 Qoder「每日签到」）：近 90 天签到趋势按日可视化；
+  // 挂载时 + 每轮签到结束（checkin.active false→ true→false 翻转）后刷新。
+  // Trae 暂无逐账号历史命令，趋势点转「全账号汇总」行（聚合逻辑在
+  // checkinCalendarModel.daysFromTrendPoints，含单测）
+  const [calDays, setCalDays] = useState<CheckinCalendarDay[]>([]);
+  useEffect(() => {
+    if (checkin.active) return; // 签到进行中不刷新（结束后 active 翻回 false 再拉取）
+    api.checkin
+      .trends(90)
+      .then((pts) => setCalDays(daysFromTrendPoints(pts)))
+      .catch(() => {
+        /* 日历加载失败静默：不影响签到主流程 */
+      });
+  }, [checkin.active]);
 
   // 根据范围过滤出候选账号列表
   const candidateAccounts = useMemo(() => {
@@ -409,6 +427,13 @@ export default function Checkin() {
           </div>
         </div>
       ) : null}
+
+      {/* 活动档期日历（F-80-余 v2 推广，对齐 Qoder「每日签到」）：近 90 天签到趋势按日可视化 */}
+      <CheckinCalendarCard
+        title="活动档期日历"
+        days={calDays}
+        footnote="档期：每日定时任务到点自动签到（时刻见环境配置） · Windows 计划任务兜底 · 汇总趋势（无逐账号明细）"
+      />
 
       <div className="mt-5 text-xs text-slate-400">
         提示：如跳过规则默认开启，可在「设置」中调整。

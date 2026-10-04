@@ -1,7 +1,7 @@
 {
   "name": "ai-work-assistant",
   "private": true,
-  "version": "3.6.6",
+  "version": "3.7.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,10 +12,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.1.1",
-    "@tauri-apps/plugin-dialog": "^2.0.1",
-    "@tauri-apps/plugin-notification": "^2.0.0",
-    "@tauri-apps/plugin-shell": "^2.0.2",
+    "@tauri-apps/api": "~2.11.1",
+    "@tauri-apps/plugin-dialog": "~2.7.3",
+    "@tauri-apps/plugin-notification": "~2.4.0",
+    "@tauri-apps/plugin-shell": "~2.3.6",
+    "@tauri-apps/cli": "~2.11.5",
     "clsx": "^2.1.1",
     "lucide-react": "^0.456.0",
     "react": "^18.3.1",
@@ -24,7 +25,7 @@
     "zustand": "^4.5.5"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.1.0",
+    "@tauri-apps/cli": "^2.11.5",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",

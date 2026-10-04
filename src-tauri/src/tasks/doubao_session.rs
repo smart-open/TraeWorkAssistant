@@ -619,6 +619,7 @@ mod tests {
         AppState {
             data_dir: dir,
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 

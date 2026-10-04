@@ -3,7 +3,7 @@ import { ExternalLink, Loader2, Power, PowerOff, ShieldCheck, ShieldAlert, Monit
 import { useAppStore } from '../store';
 import { Badge } from './ui';
 import { api } from '../lib/tauri';
-import type { AppLocate, WorkBuddyEnvCheck, WbCliStatus } from '../types';
+import type { AppLocate, WorkBuddyEnvCheck, WbCliStatus, QoderCliStatus, QoderEnvCheck } from '../types';
 
 /** API 网关启停（Trae/Buddy 顶栏共用）：直接调 api_server_start/stop 并同步 store */
 function useApiGatewayToggle() {
@@ -317,11 +317,147 @@ function BuddyTopBar() {
   );
 }
 
+/**
+ * Qoder 专区顶栏（F-80）：左列 IDE / QoderWork 安装徽标（hover 显路径）+ 证书/代理/API 网关状态，
+ * 右列 打开IDE / 打开QoderWork / 启动代理 / 启动API网关。
+ * 与 Buddy 顶栏同构（上下文不串）；客户端探测走 commands/qoder::qoder_env_check（Launcher 形态）。
+ */
+function QoderTopBar() {
+  const pushToast = useAppStore((s) => s.pushToast);
+  const certInstalled = useAppStore((s) => s.certInstalled);
+  const proxy = useAppStore((s) => s.proxy);
+  const apiStatus = useAppStore((s) => s.apiStatus);
+  const startProxy = useAppStore((s) => s.startProxy);
+  const stopProxy = useAppStore((s) => s.stopProxy);
+  const [env, setEnv] = useState<QoderEnvCheck | null>(null);
+  // CLI 状态只读桥（拿 CLI 版本号，徽标 hover 展示，对齐 Trae/Buddy）
+  const [cliStatus, setCliStatus] = useState<QoderCliStatus | null>(null);
+  // 打开客户端 pending（ide/work 互斥防连点）
+  const [launching, setLaunching] = useState<'ide' | 'work' | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.qoder
+      .envCheck()
+      .then((e) => alive && setEnv(e))
+      .catch(() => {});
+    api.qoder
+      .cliStatus()
+      .then((s) => alive && setCliStatus(s))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const launchApp = async (which: 'ide' | 'work') => {
+    if (launching) return;
+    const label = which === 'ide' ? 'Qoder CN IDE' : 'QoderWork CN';
+    setLaunching(which);
+    try {
+      if (which === 'ide') await api.qoder.openIde();
+      else await api.qoder.openWork();
+      pushToast('success', `已启动 ${label}`);
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('未检测到')) pushToast('warn', msg);
+      else pushToast('error', `打开 ${label} 失败：${msg}`);
+    } finally {
+      setLaunching(null);
+    }
+  };
+
+  return (
+    <>
+      <div className="flex items-center gap-2">
+        {env?.ide_installed ? (
+          <Badge
+            tone="green"
+            title={env.ide_version ? `Qoder IDE 当前版本：v${env.ide_version}` : (env.ide_exe ?? 'Qoder CN IDE')}
+          >
+            <MonitorCheck size={13} /> Qoder IDE已安装
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> Qoder IDE未检测到
+          </Badge>
+        )}
+        {env?.qoderwork_installed ? (
+          <Badge
+            tone="green"
+            title={
+              env.qoderwork_version
+                ? `QoderWork 当前版本：v${env.qoderwork_version}`
+                : (env.qoderwork_exe ?? 'QoderWork CN（Launcher）')
+            }
+          >
+            <MonitorCheck size={13} /> QoderWork已安装
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> QoderWork未检测到
+          </Badge>
+        )}
+        {env?.cli_dir_exists ? (
+          <Badge tone="green" title={cliStatus?.version ? `Qoder CLI 当前版本：v${cliStatus.version}` : '~/.qoder-cn 已配置（CLI 可用）'}>
+            <MonitorCheck size={13} /> CLI已就绪
+          </Badge>
+        ) : (
+          <Badge tone="slate" title="未检测到 ~/.qoder-cn（CLI 未安装，不影响 PAT 通道）">
+            CLI未安装
+          </Badge>
+        )}
+        {certInstalled ? (
+          <Badge tone="green">
+            <ShieldCheck size={13} /> 证书已信任
+          </Badge>
+        ) : (
+          <Badge tone="amber">
+            <ShieldAlert size={13} /> 证书未信任
+          </Badge>
+        )}
+        <Badge tone={proxy.running ? 'blue' : 'slate'}>
+          <Wifi size={13} /> {proxy.running ? `代理运行中 :${proxy.port}` : '代理未启动'}
+        </Badge>
+        <Badge tone={apiStatus?.running ? 'green' : 'slate'}>
+          <Server size={13} /> {apiStatus?.running ? `API网关运行中 :${apiStatus.port}` : 'API网关未启动'}
+        </Badge>
+      </div>
+      <div className="flex items-center gap-2">
+        <button onClick={() => void launchApp('ide')} className="btn-outline" disabled={launching != null}>
+          {launching === 'ide' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开Qoder IDE
+        </button>
+        <button onClick={() => void launchApp('work')} className="btn-outline" disabled={launching != null}>
+          {launching === 'work' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开QoderWork
+        </button>
+        {proxy.running ? (
+          <button onClick={stopProxy} className="btn-outline">
+            <PowerOff size={15} /> 停止代理
+          </button>
+        ) : (
+          <button onClick={startProxy} className="btn-outline">
+            <Power size={15} /> 启动代理
+          </button>
+        )}
+        <GatewayButton />
+      </div>
+    </>
+  );
+}
+
 export default function TopBar() {
   const activeApp = useAppStore((s) => s.activeApp);
   return (
     <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 dark:border-zinc-800 dark:bg-zinc-950">
-      {activeApp === 'doubao' ? <DoubaoTopBar /> : activeApp === 'buddy' ? <BuddyTopBar /> : <TraeTopBar />}
+      {activeApp === 'doubao' ? (
+        <DoubaoTopBar />
+      ) : activeApp === 'buddy' ? (
+        <BuddyTopBar />
+      ) : activeApp === 'qoder' ? (
+        <QoderTopBar />
+      ) : (
+        <TraeTopBar />
+      )}
     </div>
   );
 }

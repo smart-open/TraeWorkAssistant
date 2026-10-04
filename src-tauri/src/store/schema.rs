@@ -9,7 +9,7 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// 行文档表白名单（rows_* 原语允许操作的表，防表名拼接注入）
 pub const ROW_TABLES: &[&str] = &[
@@ -23,6 +23,10 @@ pub const ROW_TABLES: &[&str] = &[
     "doubao_accounts",
     "wb_accounts",
     "wb_tokens",
+    "qoder_accounts",
+    "qoder_tokens",
+    "qoder_checkin_results",
+    "qoder_credits_history",
 ];
 
 const DDL: &[&str] = &[
@@ -74,6 +78,27 @@ const DDL: &[&str] = &[
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
     "CREATE TABLE IF NOT EXISTS wb_tokens (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    // F-80 Qoder 三端支持（M1）：账号池 / token store（含 PAT）/ 签到结果（90 天滚动）/ 积分快照（365 天裁剪）
+    "CREATE TABLE IF NOT EXISTS qoder_accounts (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS qoder_tokens (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS qoder_checkin_results (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS qoder_credits_history (
         pk         TEXT PRIMARY KEY,
         data       TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))

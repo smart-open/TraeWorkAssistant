@@ -1,5 +1,6 @@
 import type {
   CreditsDailySnapshot,
+  QoderCreditsSnapshot,
   UsageHistoryResult,
   WbCheckinRecord,
   WbCreditsSnapshot,
@@ -49,6 +50,28 @@ export function traeUsageToPoints(usage: UsageHistoryResult | null): BoardPoint[
 export function wbOfficialAllToPoints(r: WbUsageOfficialAll | null): BoardPoint[] {
   if (!r) return [];
   return r.daily.map((d) => ({ date: d.date.slice(0, 10), credits: d.usage, models: {} }));
+}
+
+/**
+ * Qoder 本地快照差分（qoder_credits_history，日合计，365 天）。
+ * Qoder 官网无按日消耗明细接口，本地快照差分是消耗侧唯一可靠来源；
+ * 快照无按模型粒度，models 恒为空（模型排行展示空态）。
+ */
+export function qoderSnapshotsToPoints(snaps: QoderCreditsSnapshot[]): BoardPoint[] {
+  // consumed=null（首日/账号数变动日，差分不可比）不进 points：趋势/热力图留空，
+  // 对齐「不可比日不计入」口径与 earned 侧过滤——画 0 会与真实零消耗混淆（审查修复）
+  return snaps
+    .filter((s) => s.consumed != null)
+    .map((s) => ({ date: s.date.slice(0, 10), credits: s.consumed ?? 0, models: {} }));
+}
+
+/** Qoder 区间「获得积分」：快照 earned（签到合计口径，与积分统计 Tab 同源） */
+export function qoderEarnedByDate(snaps: QoderCreditsSnapshot[]): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const s of snaps) {
+    if (s.earned != null && s.earned > 0) m.set(s.date, (m.get(s.date) ?? 0) + s.earned);
+  }
+  return m;
 }
 
 /** Buddy 快照差分回退（workbuddy_usage_fallback，日合计，365 天快照史） */

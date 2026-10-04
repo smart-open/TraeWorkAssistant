@@ -81,11 +81,17 @@ pub fn save(data_dir: &Path, results: &ResultsFile) {
     let _ = crate::store::docs::checkin_results_save(&crate::store::db(data_dir), results);
 }
 
+/// 当日落库进程内互斥（审查修复）：UI 手动签到、调度器/CLI 落库三路并发时，
+/// record_today 整表 load→record→save 的后保存方会覆盖先保存方的当日记录
+///（表级 last-writer-wins）。持锁串行化保证同进程内不丢行
+static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 记录当日签到最终状态（签到完成后的 done 落库入口），随后写盘
 pub fn record_today(
     data_dir: &Path,
     entries: impl IntoIterator<Item = (String, String, String)>,
 ) {
+    let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut f = load(data_dir);
     f.record_day(&today_key(), entries);
     save(data_dir, &f);

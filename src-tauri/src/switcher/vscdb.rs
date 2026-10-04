@@ -143,7 +143,7 @@ fn bak_path(vscdb: &Path) -> std::path::PathBuf {
     vscdb.with_file_name(format!("{name}.f68.bak"))
 }
 
-fn write_keys(vscdb: &Path, writes: &[(&'static str, String, bool)]) -> Result<(), String> {
+fn write_keys(vscdb: &Path, writes: &[(&str, String, bool)]) -> Result<(), String> {
     let mut conn = rusqlite::Connection::open(vscdb).map_err(|e| format!("打开 state.vscdb 失败: {e}"))?;
     let tx = conn.transaction().map_err(|e| format!("开启事务失败: {e}"))?;
     for (key, val, blob) in writes {
@@ -160,6 +160,26 @@ fn write_keys(vscdb: &Path, writes: &[(&'static str, String, bool)]) -> Result<(
         .map_err(|e| format!("写入 {key} 失败: {e}"))?;
     }
     tx.commit().map_err(|e| format!("提交 state.vscdb 失败: {e}"))
+}
+
+/// F-80 §5.10.2：单键 TEXT upsert（键不存在则插入）。文件缺失 → Ok(false)
+///（调用方按可跳过处理）；单条写入事务原子、失败即整体回滚，无需写前备份
+///（区别于 merge_global_keys 的多键合并回滚场景）。返回 Ok(true) = 已写入。
+pub fn upsert_text_key(vscdb: &Path, key: &str, val: &str) -> Result<bool, String> {
+    if !vscdb.is_file() {
+        return Ok(false);
+    }
+    let mut conn =
+        rusqlite::Connection::open(vscdb).map_err(|e| format!("打开 state.vscdb 失败: {e}"))?;
+    let tx = conn.transaction().map_err(|e| format!("开启事务失败: {e}"))?;
+    tx.execute(
+        "INSERT INTO ItemTable(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, val],
+    )
+    .map_err(|e| format!("写入 {key} 失败: {e}"))?;
+    tx.commit().map_err(|e| format!("提交 state.vscdb 失败: {e}"))?;
+    Ok(true)
 }
 
 /// 合并单键值：快照值（cur）优先，仅补入切换前（pre）多出的条目。

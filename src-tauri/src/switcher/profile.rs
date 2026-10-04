@@ -66,6 +66,9 @@ pub(crate) fn doubao_data_dir() -> PathBuf {
 pub enum Layout {
     Icube,
     Chromium,
+    /// Electron 根级 Chromium 会话（Qoder Work：userData 根直挂 Network/Local
+    /// Storage，无 Default/Profile N 子目录，与 Chromium 布局不同构）
+    ElectronRoot,
     Authfile,
 }
 
@@ -75,6 +78,7 @@ impl Layout {
         match self {
             Layout::Icube => "icube",
             Layout::Chromium => "chromium",
+            Layout::ElectronRoot => "electron-root",
             Layout::Authfile => "authfile",
         }
     }
@@ -111,6 +115,9 @@ pub struct AppProfile {
     pub exe_candidates: Vec<PathBuf>,
     /// 仅 CodeBuddy：L3 vscdb 登录真源目录（%APPDATA%\CodeBuddy CN\User\globalStorage）
     pub cb_global_storage_dir: Option<PathBuf>,
+    /// icube 布局快照白名单（F-80 M3 档案化：TRAE_ICUBE_ITEMS / QODER_IDE_ITEMS；
+    /// 非 icube 布局为空表，backup/restore 不消费）
+    pub icube_items: &'static [super::icube::Item],
     /// F-75 M0-0.6：macOS 支持灰度标志——mac 版数据布局经 M-1 侦察确认前置 true，
     /// 未确认前 run_action 对该应用域直接拒绝（切换/备份/恢复全链路）。
     /// Windows 侧恒放行（`is_macos()` 门控），字段不影响既有行为。
@@ -187,6 +194,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 PathBuf::from("D:\\Programs\\Trae CN\\Trae CN.exe"),
             ],
             cb_global_storage_dir: None,
+            icube_items: super::icube::TRAE_ICUBE_ITEMS,
             // M-1 侦察 ①（2026-09-20 实测确认）：~/Library/Application Support/Trae CN
             // 存在且 User/globalStorage/{state.vscdb,storage.json} 与 Windows 同布局；
             // 差异项：无 Local State / Network/（Cookies 在根级，icube mac 项已补）
@@ -213,6 +221,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 PathBuf::from(format!("{program_files}\\Doubao\\Application\\Doubao.exe")),
             ],
             cb_global_storage_dir: None,
+            icube_items: &[],
             // M-1 侦察 ③（2026-09-20 实测确认）：mac 版存在（Doubao.app，
             // Chromium 布局 Local State + Default，Cookies 在 Default/ 根级——
             // chromium.rs cookie_files 新旧布局归一已覆盖）；同机快照复制不受
@@ -240,6 +249,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 "{local}\\Programs\\WorkBuddy\\WorkBuddy.exe"
             ))],
             cb_global_storage_dir: None,
+            icube_items: &[],
             // M-1 侦察 ②（2026-09-20 实测确认）：~/.workbuddy 存在，storage/{skeleton,
             // user-<uid>*} 与 Windows 同构；auth 文件在 CodeBuddyExtension 布局
             //（mac 根为 ~/Library/Application Support，authfile.rs 已分派）——
@@ -272,6 +282,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: Some(
                 roaming_dir("CodeBuddy CN").join("User").join("globalStorage"),
             ),
+            icube_items: &[],
             // M-1 侦察 ⑨（2026-09-20 复测放开）：首次侦察时 CodeBuddy CN.app 未启动
             //（无 ~/.codebuddy/、无 CodeBuddy CN 数据目录），维持灰度。复测时客户端已
             // 通过 WorkBuddy OAuth 扫码登录，双目录布局与 Windows 同构：
@@ -308,11 +319,79 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 PathBuf::from("D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe"),
             ],
             cb_global_storage_dir: None,
+            icube_items: super::icube::TRAE_ICUBE_ITEMS,
             // M-1 侦察 ①（2026-09-20 实测确认）：~/Library/Application Support/TRAE SOLO CN
             // 存在且 globalStorage 布局与 Windows 同构（差异项同 Trae）
             mac_supported: true,
             mac_data_dir_guess: Some("~/Library/Application Support/TRAE SOLO CN"),
             mac_bundle_ids: &["cn.trae.solo.app"],
+        },
+        TargetApp::Qoder => AppProfile {
+            // 【跨平台审查 2026-10-03】Qoder 档案是 macOS 分支的单点扩展位——
+            // AppProfile 为纯数据表，macOS 无需动切换管线。数据目录收口
+            // roaming_dir()：Windows=%APPDATA%\QoderCN（F-80 M0 实测 2026-09-27）/
+            // mac=~/Library/Application Support/QoderCN（Electron userData 惯例，
+            // 与 Windows 同名不同根——**待真机实测**）。mac 字段：布局未实测前
+            // mac_supported 维持灰度 false（run_action 拒绝），guess 值按预留注释预填，
+            // bundle_ids 待实测补录；exe_candidates/lnk/reg 为 Windows 专属发现级，
+            // mac 走 bundle 定位链（cfg_attr dead_code）
+            app_name: "Qoder",
+            layout: Layout::Icube,
+            data_dir: roaming_dir("QoderCN"),
+            profiles_dir: data.join("data").join("profiles_qoder"),
+            // F-80 R-2：与前端写入键对齐（QoderSettings 写 qoder_ide_path = IDE exe 路径，
+            // commands/qoder/common.rs::ide_exe_candidates 同源消费）；原 "qoder_path" 为死键，
+            // locate 按它读 settings 永得 None，用户显式指定的路径在切换链路中失效
+            settings_path_key: "qoder_ide_path",
+            // 同 Trae 系：VSCode fork 强杀后 vscdb WAL 残留被启动回放，8s 优雅落盘
+            graceful_wait_secs: 8,
+            // 2026-10-02 收窄：IDE 全部进程均名为 "Qoder CN IDE"（安装目录仅此一个
+            // exe，实测）；旧「壳进程 Qoder CN.exe」已被 Qoder Work 独立客户端接管。
+            // mac 无后缀形态同名（"Qoder CN IDE"），proc.rs strip_exe_suffix 天然兼容
+            proc_names: &["Qoder CN IDE"],
+            proc_patterns: &["Qoder CN IDE*"],
+            exe_names: &["Qoder CN IDE.exe"],
+            lnk_patterns: &["*Qoder*"],
+            reg_patterns: &["*Qoder*"],
+            exe_candidates: vec![
+                PathBuf::from(format!("{local}\\Programs\\Qoder CN IDE\\Qoder CN IDE.exe")),
+                PathBuf::from(format!("{program_files}\\Qoder CN IDE\\Qoder CN IDE.exe")),
+            ],
+            cb_global_storage_dir: None,
+            icube_items: super::icube::QODER_IDE_ITEMS,
+            mac_supported: false, // mac 数据目录/白名单待真机实测（M-1 补侦察后放开）
+            mac_data_dir_guess: Some("~/Library/Application Support/QoderCN"),
+            mac_bundle_ids: &[],
+        },
+        TargetApp::QoderWork => AppProfile {
+            // 【跨平台审查 2026-10-03】ElectronRoot 布局快照管线
+            // （switcher/electron_root.rs）纯文件拷贝，跨平台零改动。数据目录收口
+            // roaming_dir()：Windows=%APPDATA%\com.qodercn.app.stable（2026-10-02
+            // 实测）/ mac=~/Library/Application Support/com.qodercn.app.stable
+            // （Electron userData 惯例——**待真机实测**）；mac_supported 灰度 false。
+            app_name: "Qoder Work",
+            layout: Layout::ElectronRoot,
+            data_dir: roaming_dir("com.qodercn.app.stable"),
+            profiles_dir: data.join("data").join("profiles_qoder_work"),
+            settings_path_key: "qoder_work_path",
+            // Electron 退出前要落盘 leveldb/cookie（同豆包 chromium 布局 8s 理由）
+            graceful_wait_secs: 8,
+            // 进程名 "Qoder CN" 与 IDE 壳同名（Work 接管了该进程名）：精确匹配
+            // 只停 Work 本体，不 wildcard（"Qoder CN*" 会误杀 Qoder CN IDE）
+            proc_names: &["Qoder CN"],
+            proc_patterns: &["Qoder CN"],
+            exe_names: &["Qoder CN.exe"],
+            lnk_patterns: &["*Qoder*"],
+            reg_patterns: &["*Qoder*"],
+            exe_candidates: vec![
+                PathBuf::from(format!("{local}\\Programs\\Qoder CN\\Qoder CN.exe")),
+                PathBuf::from(format!("{program_files}\\Qoder CN\\Qoder CN.exe")),
+            ],
+            cb_global_storage_dir: None,
+            icube_items: &[],
+            mac_supported: false, // mac 数据目录待真机实测（M-1 补侦察后放开）
+            mac_data_dir_guess: Some("~/Library/Application Support/com.qodercn.app.stable"),
+            mac_bundle_ids: &[],
         },
     }
 }
@@ -326,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn 五应用档案字段与ps常量表一致() {
+    fn 七应用档案字段与ps常量表一致() {
         let data = temp_data();
         let tw = profile_for(TargetApp::TraeWork, &data);
         assert_eq!(tw.app_name, "Trae Work");
@@ -342,11 +421,13 @@ mod tests {
         assert_eq!(tw.proc_names, &["TRAE SOLO CN", "TRAE SOLO", "Trae"]);
         assert_eq!(tw.exe_candidates.len(), 7);
         assert!(tw.cb_global_storage_dir.is_none());
+        assert_eq!(tw.icube_items.len(), 15);
 
         let db = profile_for(TargetApp::Doubao, &data);
         assert_eq!(db.layout, Layout::Chromium);
         assert_eq!(db.graceful_wait_secs, 8);
         assert_eq!(db.profiles_dir, data.join("data").join("profiles_doubao"));
+        assert!(db.icube_items.is_empty());
 
         let wb = profile_for(TargetApp::WorkBuddy, &data);
         assert_eq!(wb.layout, Layout::Authfile);
@@ -361,6 +442,43 @@ mod tests {
         assert_eq!(trae.settings_path_key, "trae_cn_path");
         assert_eq!(trae.profiles_dir, data.join("data").join("profiles_trae"));
         assert_eq!(trae.exe_candidates.len(), 3);
+        assert_eq!(trae.icube_items.len(), 15);
+
+        // F-80 M3：Qoder IDE 档案（icube 布局，复用 Trae 切号管线；M0 实测数据目录 QoderCN）
+        let qd = profile_for(TargetApp::Qoder, &data);
+        assert_eq!(qd.app_name, "Qoder");
+        assert_eq!(qd.layout, Layout::Icube);
+        #[cfg(windows)]
+        assert_eq!(
+            qd.data_dir,
+            PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("QoderCN")
+        );
+        assert_eq!(qd.profiles_dir, data.join("data").join("profiles_qoder"));
+        assert_eq!(qd.settings_path_key, "qoder_ide_path");
+        assert_eq!(qd.graceful_wait_secs, 8);
+        // 2026-10-02 收窄：Qoder CN.exe 已归 Qoder Work，IDE 白名单只留本名
+        assert_eq!(qd.proc_names, &["Qoder CN IDE"]);
+        assert_eq!(qd.exe_names, &["Qoder CN IDE.exe"]);
+        assert_eq!(qd.exe_candidates.len(), 2);
+        assert!(qd.cb_global_storage_dir.is_none());
+        assert_eq!(qd.icube_items.len(), 15);
+
+        // 2026-10-02：Qoder Work 独立客户端（electron-root 布局，数据目录 com.qodercn.app.stable）
+        let qw = profile_for(TargetApp::QoderWork, &data);
+        assert_eq!(qw.app_name, "Qoder Work");
+        assert_eq!(qw.layout, Layout::ElectronRoot);
+        #[cfg(windows)]
+        assert_eq!(
+            qw.data_dir,
+            PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("com.qodercn.app.stable")
+        );
+        assert_eq!(qw.profiles_dir, data.join("data").join("profiles_qoder_work"));
+        assert_eq!(qw.settings_path_key, "qoder_work_path");
+        assert_eq!(qw.graceful_wait_secs, 8);
+        assert_eq!(qw.proc_names, &["Qoder CN"]);
+        assert_eq!(qw.exe_candidates.len(), 2);
+        assert!(qw.cb_global_storage_dir.is_none());
+        assert!(qw.icube_items.is_empty());
     }
 
     #[test]

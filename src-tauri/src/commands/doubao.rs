@@ -126,14 +126,79 @@ fn profiles_root(state: &State<AppState>) -> PathBuf {
 }
 
 /// 读取账号池；文件不存在/损坏时返回空池（损坏仅记日志，避免一个坏文件锁死整页）
-/// 读取账号池（SQLite 化 P3：doubao_accounts 表；tasks/* 共用统一入口）
+/// 读取账号池（SQLite 化 P3：doubao_accounts 表；tasks/* 共用统一入口）。
+/// 凭证收敛（P0-1）：session_id/sid_guard/ttwid 明文只存 vault（Stronghold+DPAPI），
+/// DB 行一律置 None；读取时统一回填（仅内存）。vault 不可用 → 保持 None（fail-secure，
+/// 保活/对话备份按无 sessionid 跳过），编辑弹框可手动重新录入。
 pub(crate) fn load_pool(state: &AppState) -> DoubaoAccountPool {
-    crate::store::docs::doubao_pool_load(&crate::store::db(&state.data_dir))
+    let mut pool = crate::store::docs::doubao_pool_load(&crate::store::db(&state.data_dir));
+    for a in pool.accounts.iter_mut() {
+        let Some(sec) = crate::vault::ns_get(&state.data_dir, "doubao", &a.user_id) else {
+            continue;
+        };
+        // 仅填空值：DB 明文优先（更新鲜，如迁移残留，待下次保存收敛）
+        if a.session_id.as_deref().map_or(true, |s| s.is_empty()) {
+            if let Some(v) = sec.get("session_id").and_then(|v| v.as_str()) {
+                if !v.is_empty() {
+                    a.session_id = Some(v.to_string());
+                }
+            }
+        }
+        if a.sid_guard.as_deref().map_or(true, |s| s.is_empty()) {
+            if let Some(v) = sec.get("sid_guard").and_then(|v| v.as_str()) {
+                if !v.is_empty() {
+                    a.sid_guard = Some(v.to_string());
+                }
+            }
+        }
+        if a.ttwid.as_deref().map_or(true, |s| s.is_empty()) {
+            if let Some(v) = sec.get("ttwid").and_then(|v| v.as_str()) {
+                if !v.is_empty() {
+                    a.ttwid = Some(v.to_string());
+                }
+            }
+        }
+    }
+    pool
 }
 
-/// 保存账号池（SQLite 化 P3：doubao_accounts 表整表替换）
+/// 保存账号池（SQLite 化 P3：doubao_accounts 表整表替换）。
+/// 凭证收敛（P0-1）：非空凭证字段级合并写入 vault，DB 落占位（None）；
+/// vault 写失败时仅落占位并返回 Err（对齐 Trae 红线：禁止明文落库）。
 pub(crate) fn save_pool(state: &AppState, pool: &DoubaoAccountPool) -> Result<(), String> {
-    crate::store::docs::doubao_pool_save(&crate::store::db(&state.data_dir), pool)
+    let mut secured = pool.clone();
+    let mut vault_err: Option<String> = None;
+    for a in secured.accounts.iter_mut() {
+        let mut entry = crate::vault::ns_get(&state.data_dir, "doubao", &a.user_id)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut dirty = false;
+        for (field, val) in [
+            ("session_id", &a.session_id),
+            ("sid_guard", &a.sid_guard),
+            ("ttwid", &a.ttwid),
+        ] {
+            if let Some(v) = val.as_deref().filter(|s| !s.is_empty()) {
+                entry[field] = serde_json::json!(v);
+                dirty = true;
+            }
+        }
+        if dirty {
+            if let Err(e) = crate::vault::ns_set(&state.data_dir, "doubao", &a.user_id, &entry) {
+                vault_err = vault_err.or(Some(e));
+            }
+        }
+        // 一律占位（无论 vault 成败：明文禁止进 SQLite）
+        a.session_id = None;
+        a.sid_guard = None;
+        a.ttwid = None;
+    }
+    crate::store::docs::doubao_pool_save(&crate::store::db(&state.data_dir), &secured)?;
+    match vault_err {
+        None => Ok(()),
+        Some(e) => Err(format!(
+            "豆包凭证加密存储失败（已仅保存账号占位信息，重新录入会话可恢复）: {e}"
+        )),
+    }
 }
 
 /// 读取当前账号（PS 桥 Set-CurrentAccount 写 profiles_doubao/current_account.txt，UTF8 带 BOM）
@@ -310,6 +375,7 @@ pub fn doubao_account_remove(state: State<AppState>, user_id: String) -> Result<
     if pool.accounts.len() == before {
         return Ok(()); // 不存在视为已移除
     }
+    crate::vault::ns_remove(&state.data_dir, "doubao", user_id.trim());
     save_pool(&state, &pool)
 }
 
@@ -783,6 +849,7 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
         proxy_port: None,
         include_indexeddb: false,
         expected_current_uid: String::new(),
+        machine_id_override: None,
         data_dir: state.data_dir.clone(),
     };
     let app2 = app.clone();
@@ -1464,6 +1531,7 @@ pub fn doubao_open_as_account(
         proxy_port: proxy_port.filter(|p| *p > 0),
         include_indexeddb: include_idb,
         expected_current_uid: expected_uid,
+        machine_id_override: None,
         data_dir: state.data_dir.clone(),
     };
     let app2 = app.clone();
@@ -1637,6 +1705,18 @@ pub fn doubao_chatdata_restore(state: State<AppState>, user_id: String) -> Resul
     let backup = chat_backup_dir(&state, &user_id);
     if !backup.is_dir() {
         return Err(format!("该账号没有对话数据备份：{}", backup.display()));
+    }
+    // 会话备份 schemaVersion 兼容门禁（审查 P1-5，语义对齐 chromium.rs 快照校验）：
+    // 当前仅支持 1；未来版本备份（>1）明确拒绝，防旧版应用按 v1 布局静默错乱恢复。
+    // 旧版备份无 meta / 无版本字段 → 兼容继续
+    let meta_raw = std::fs::read_to_string(backup.join("chat_backup_meta.json")).unwrap_or_default();
+    let meta: serde_json::Value = serde_json::from_str(&meta_raw).unwrap_or(serde_json::Value::Null);
+    if let Some(v) = meta.get("schemaVersion").and_then(serde_json::Value::as_i64) {
+        if v > 1 {
+            return Err(format!(
+                "对话数据备份 schemaVersion={v}，当前版本仅支持 1：备份由更新版本的应用生成，请升级应用后再恢复"
+            ));
+        }
     }
     let user_data = doubao_user_data_dir();
     if !user_data.is_dir() {

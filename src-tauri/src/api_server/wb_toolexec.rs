@@ -193,54 +193,61 @@ pub fn url_allowed(url: &str) -> Result<(), String> {
     }
 }
 
-/// host 白名单判定（纯函数，供单测）：true = 允许抓取
+/// host 白名单判定（纯函数，供单测）：true = 允许抓取。
+/// 审查 P2：改用 url crate（与 ureq 请求层同源的 WHATWG 解析）精确识别
+/// IPv4 变体（十六进制 0x7f000001 / 八进制 0177.0.0.1 / 缺段 127.1 / 整型
+/// 2130706433），杜绝字符串前缀匹配的漏放与域名误伤（如 10.orbit.com）；
+/// 私网段按解析后的 Ipv4Addr / Ipv6Addr 精确比对；解析失败 fail-closed
 fn host_allowed(host: &str) -> bool {
     let h = host.trim().to_lowercase();
-    // IPv6 字面量：剥 [] 括号
-    let h = h.strip_prefix('[').and_then(|s| s.split(']').next()).unwrap_or(&h);
     if h.is_empty() {
         return false;
     }
-    if h == "localhost" || h.ends_with(".localhost") {
+    // 调用方（url_allowed）已剥 [] 与端口；裸 IPv6 字面量（含 ':'）须补回括号才能解析
+    let target = if h.contains(':') && !h.starts_with('[') {
+        format!("http://[{h}]/")
+    } else {
+        format!("http://{h}/")
+    };
+    let Ok(u) = url::Url::parse(&target) else {
         return false;
+    };
+    match u.host() {
+        Some(url::Host::Domain(d)) => !(d == "localhost" || d.ends_with(".localhost")),
+        Some(url::Host::Ipv4(ip)) => ipv4_allowed_ip(ip),
+        Some(url::Host::Ipv6(ip)) => ipv6_allowed_ip(ip),
+        None => false,
     }
-    if h.contains(':') {
-        // IPv6：环回（::1）/ 未指定（::）/ 唯一本地（fc/fd）/ 链路本地（fe80）
-        if h == "::1" || h == "::" || h.starts_with("fc") || h.starts_with("fd") || h.starts_with("fe80") {
-            return false;
-        }
-        // IPv4 映射形（::ffff:127.0.0.1）：尾段点分 IPv4 复检
-        if let Some(p) = h.find("ffff:") {
-            let tail = h[p + 5..].trim_start_matches(':');
-            if tail.contains('.') {
-                return ipv4_allowed(tail);
-            }
-        }
-        return true;
-    }
-    // 纯数字整型 IP 字面量（如 2130706433 = 127.0.0.1）：主机名不可能全数字
-    if !h.is_empty() && h.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    ipv4_allowed(h)
 }
 
-/// 点分 IPv4 私网/环回/链路本地/未指定判定
-fn ipv4_allowed(h: &str) -> bool {
-    if h.starts_with("0.")
-        || h.starts_with("10.")
-        || h.starts_with("127.")
-        || h.starts_with("169.254.")
-        || h.starts_with("192.168.")
-    {
+/// IPv4 私网/环回/链路本地/未指定判定（解析后按八位组精确比对）
+fn ipv4_allowed_ip(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(o[0] == 0
+        || o[0] == 10
+        || o[0] == 127
+        || (o[0] == 169 && o[1] == 254)
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 172 && (16..=31).contains(&o[1])))
+}
+
+/// IPv6 环回/未指定/唯一本地/链路本地/IPv4 映射环回判定
+fn ipv6_allowed_ip(ip: std::net::Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
         return false;
     }
-    if let Some(rest) = h.strip_prefix("172.") {
-        if let Ok(n) = rest.split('.').next().unwrap_or("").parse::<u8>() {
-            if (16..=31).contains(&n) {
-                return false;
-            }
-        }
+    let s = ip.segments();
+    // fc00::/7 唯一本地（fc** / fd**）
+    if (s[0] & 0xfe00) == 0xfc00 {
+        return false;
+    }
+    // fe80::/10 链路本地
+    if (s[0] & 0xffc0) == 0xfe80 {
+        return false;
+    }
+    // ::ffff:0:0/96 IPv4 映射：内嵌 IPv4 复检
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return ipv4_allowed_ip(v4);
     }
     true
 }
@@ -650,6 +657,14 @@ mod tests {
         // 纯数字整型 IP 字面量（2130706433 = 127.0.0.1）与空 host
         assert!(url_allowed("http://2130706433/").is_err());
         assert!(url_allowed("http://").is_err());
+        // 审查 P2：WHATWG IPv4 变体（十六进制/八进制/缺段）——旧前缀匹配可被绕过
+        for host in ["0x7f000001", "0177.0.0.1", "127.1", "0x7f.1", "0x7f.0.0.1"] {
+            assert!(url_allowed(&format!("http://{host}/")).is_err(), "应拒绝 {host}");
+        }
+        // 审查 P2：非 IP 域名不因 IP 样式前缀被误伤
+        for host in ["10.orbit.com", "127.example.com", "192.168.example.org"] {
+            assert!(url_allowed(&format!("http://{host}/")).is_ok(), "应放行 {host}");
+        }
     }
 
     /// open_url 抓取受限地址在发起请求前即被拒绝（不触网）

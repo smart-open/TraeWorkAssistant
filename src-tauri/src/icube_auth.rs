@@ -285,7 +285,8 @@ pub fn device_proof(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let nonce = crate::commands::oauth::random_hex(32);
+    // 签名 nonce 属安全场景：CSPRNG 不可用上抛 Err（审查修复，不再 panic 中止任务）
+    let nonce = crate::commands::oauth::random_hex_result(32)?;
     let msg = format!("POST\n{sign_path}\n{client_id}\n{auth_code}\n{ts}\n{nonce}");
     let sig: Signature = signing.sign(msg.as_bytes());
     let sig_b64 = match format {

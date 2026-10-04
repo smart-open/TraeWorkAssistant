@@ -15,6 +15,14 @@ pub struct GatewaySettings {
     /// 网关监听端口（默认 7864，与既有约定一致）
     #[serde(default = "default_port")]
     pub port: u16,
+    /// 网关监听地址（审查 P1-2）：默认 127.0.0.1 环回——个人助手场景默认不对外暴露。
+    /// 历史版本固定 0.0.0.0 且无 host 配置项，不存在「用户显式配置的 host」可保留；
+    /// 需要局域网访问时须显式写入本字段（非环回地址受启动鉴权门禁约束，见
+    /// server.rs::ensure_bind_auth_policy）。旧配置无此字段 → serde default 自动环回。
+    /// 审查 G2：前端保存设置须携带本字段；反序列化缺失走 serde default、
+    /// 空/纯空白由 normalized 兜底，均按环回 127.0.0.1 处理。
+    #[serde(default = "default_host")]
+    pub host: String,
     /// 默认模型（请求未指定 model 时使用；统一目录内模型）
     #[serde(default = "default_model")]
     pub default_model: String,
@@ -26,6 +34,10 @@ fn default_port() -> u16 {
     7864
 }
 
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+
 fn default_model() -> String {
     crate::api_server::DEFAULT_MODEL.to_string()
 }
@@ -34,16 +46,21 @@ impl Default for GatewaySettings {
     fn default() -> Self {
         GatewaySettings {
             port: default_port(),
+            host: default_host(),
             default_model: default_model(),
             updated_at: 0,
         }
     }
 }
 
-/// 规范化：default_model 空 → 内置默认
+/// 规范化：default_model 空 → 内置默认；host 空/纯空白 → 环回
 fn normalized(mut s: GatewaySettings) -> GatewaySettings {
     if s.default_model.trim().is_empty() {
         s.default_model = default_model();
+    }
+    s.host = s.host.trim().to_string();
+    if s.host.is_empty() {
+        s.host = default_host();
     }
     s
 }
@@ -74,6 +91,7 @@ pub fn load(data_dir: &Path) -> GatewaySettings {
         .to_string();
     let s = normalized(GatewaySettings {
         port,
+        host: default_host(),
         default_model: model,
         updated_at: 0,
     });
@@ -166,6 +184,7 @@ mod tests {
             &f.dir,
             GatewaySettings {
                 port: 8000,
+                host: "127.0.0.1".into(),
                 default_model: "kimi-k3".into(),
                 updated_at: 0,
             },
@@ -175,26 +194,45 @@ mod tests {
         assert_eq!(s.port, 8000);
         assert_eq!(s.default_model, "kimi-k3");
         assert!(s.updated_at > 0);
-        // 空模型名兜底默认
+        // 空模型名兜底默认；空 host 兜底环回
         save(
             &f.dir,
             GatewaySettings {
                 port: 8001,
+                host: "  ".into(),
                 default_model: "  ".into(),
                 updated_at: 0,
             },
         )
         .unwrap();
-        assert_eq!(load(&f.dir).default_model, "deepseek-v4-flash");
+        let s = load(&f.dir);
+        assert_eq!(s.default_model, "deepseek-v4-flash");
+        assert_eq!(s.host, "127.0.0.1");
         // 端口 0 拒绝
         assert!(save(
             &f.dir,
             GatewaySettings {
                 port: 0,
+                host: "127.0.0.1".into(),
                 default_model: "kimi-k3".into(),
                 updated_at: 0
             },
         )
         .is_err());
+    }
+
+    /// 旧配置（无 host 字段）→ serde default 兜底 127.0.0.1（审查 P1-2 默认收紧）
+    #[test]
+    fn t04_legacy_config_without_host_defaults_loopback() {
+        let f = fixture(None);
+        crate::store::db(&f.dir)
+            .kv_set_raw(
+                "api_gateway_settings",
+                r#"{"port":8000,"default_model":"kimi-k3","updated_at":1}"#,
+            )
+            .unwrap();
+        let s = load(&f.dir);
+        assert_eq!(s.port, 8000);
+        assert_eq!(s.host, "127.0.0.1");
     }
 }

@@ -35,6 +35,9 @@ function toneOf(days: number): 'red' | 'amber' | 'slate' {
   return 'slate';
 }
 
+/** 长期有效哨兵时间戳（2100-01-01，与后端 pack_to_detail / CreditCell 口径一致） */
+const PERPETUAL_TS = 4102444800;
+
 export default function ExpiryCalendar({ items, emptyHint }: { items: ExpiryItem[]; emptyHint?: string }) {
   const sorted = useMemo(
     () =>
@@ -56,8 +59,9 @@ export default function ExpiryCalendar({ items, emptyHint }: { items: ExpiryItem
   return (
     <div className="space-y-2">
       {sorted.map((it) => {
+        const perpetual = it.expire_ts! >= PERPETUAL_TS;
         const days = daysUntil(it.expire_ts!);
-        const expired = days <= 0;
+        const expired = !perpetual && days <= 0;
         return (
           <div
             key={it.key}
@@ -65,7 +69,13 @@ export default function ExpiryCalendar({ items, emptyHint }: { items: ExpiryItem
           >
             <CalendarClock
               size={15}
-              className={expired ? 'shrink-0 text-rose-500' : days <= 7 ? 'shrink-0 text-amber-500' : 'shrink-0 text-slate-400'}
+              className={
+                expired
+                  ? 'shrink-0 text-rose-500'
+                  : !perpetual && days <= 7
+                    ? 'shrink-0 text-amber-500'
+                    : 'shrink-0 text-slate-400'
+              }
             />
             <div className="min-w-0 flex-1">
               <div className="truncate font-medium text-slate-700 dark:text-zinc-200">{it.label}</div>
@@ -73,10 +83,10 @@ export default function ExpiryCalendar({ items, emptyHint }: { items: ExpiryItem
             </div>
             <Badge tone="slate">{it.kind}</Badge>
             <span className={expired ? 'text-xs font-medium text-rose-500' : 'text-xs text-slate-500'}>
-              {fmtDate(it.expire_ts!)}
+              {perpetual ? '长期' : fmtDate(it.expire_ts!)}
             </span>
-            <Badge tone={toneOf(days)}>
-              {expired ? '已过期' : days <= 7 ? `即将到期 ${days} 天` : `剩 ${days} 天`}
+            <Badge tone={perpetual ? 'slate' : toneOf(days)}>
+              {perpetual ? '长期有效' : expired ? '已过期' : days <= 7 ? `即将到期 ${days} 天` : `剩 ${days} 天`}
             </Badge>
           </div>
         );

@@ -214,12 +214,70 @@ pub fn sticky_bindings_load(s: &Store) -> Value {
     json!({ "version": 1, "bindings": rows })
 }
 
-/// 整表替换（save 的落库等价物；过期项由调用方 evict 后传入）
+/// 整表替换（save 的落库等价物；过期项由调用方 evict 后传入）。
+/// 多池并存时请用 [sticky_bindings_save_ns]（本函数仅遗留种子/单池场景使用）。
 pub fn sticky_bindings_save(s: &Store, root: &Value) -> Result<(), String> {
     let empty = Vec::new();
     let arr = root.get("bindings").and_then(Value::as_array).unwrap_or(&empty);
     s.with_conn(|c| {
         c.execute_batch("BEGIN; DELETE FROM sticky_bindings;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO sticky_bindings(key, uid, conv_id, last_seen, explicit, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, datetime('now','localtime'))",
+            )?;
+            for b in arr {
+                stmt.execute(rusqlite::params![
+                    b.get("key").and_then(Value::as_str).unwrap_or(""),
+                    b.get("uid").and_then(Value::as_str).unwrap_or(""),
+                    b.get("conv_id").and_then(Value::as_str).unwrap_or(""),
+                    b.get("last_seen").and_then(Value::as_i64).unwrap_or(0),
+                    (b.get("explicit").and_then(Value::as_bool).unwrap_or(false)) as i64,
+                ])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
+/// 命名空间范围替换（F-80-余 v2 多池共用 sticky_bindings 表）：
+/// 仅删除并写入归属 `ns` 的键，其他命名空间（`other_ns`）的行原样保留——
+/// 多池 StickyStore 并存时整表替换会互删对方运行期新增的绑定（审查 P1）。
+/// 归属规则与 wb_sticky::owns_key 一致：ns 非空 = key 以 ns 前缀开头；
+/// ns 空 = key 不以任何 other_ns 前缀开头（other_ns 为空时退化为整表删除，
+/// 与 [sticky_bindings_save] 等价）。LIKE 模式由常量前缀经参数绑定构造，
+/// ns 不得含 LIKE 通配符 %/_（当前登记命名空间均满足）。
+pub fn sticky_bindings_save_ns(
+    s: &Store,
+    root: &Value,
+    ns: &str,
+    other_ns: &[&str],
+) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("bindings").and_then(Value::as_array).unwrap_or(&empty);
+    s.with_conn(|c| {
+        c.execute_batch("BEGIN;")?;
+        if ns.is_empty() && other_ns.is_empty() {
+            c.execute_batch("DELETE FROM sticky_bindings;")?;
+        } else if ns.is_empty() {
+            // 无前缀键（WB/遗留）：删除不属于任何已登记命名空间的行。
+            // 逐前缀 NOT LIKE 后 AND 连接（≡ NOT(任一前缀命中)）。曾误写
+            // LIKE+AND 的恒假条件——单个 key 不可能同时命中两个前缀模式，
+            // DELETE 恒 0 行：过期绑定永不清理，且残留行占主键使后续 INSERT
+            // 整事务回滚，WB 池粘性绑定在首次落库成功后永久失效（审查 major）
+            let conds: Vec<String> = other_ns.iter().map(|_| "key NOT LIKE ?".to_string()).collect();
+            let sql = format!("DELETE FROM sticky_bindings WHERE {}", conds.join(" AND "));
+            let mut stmt = c.prepare(&sql)?;
+            let patterns: Vec<String> = other_ns.iter().map(|p| format!("{}%", p)).collect();
+            stmt.execute(rusqlite::params_from_iter(patterns.iter()))?;
+        } else {
+            let mut stmt = c.prepare("DELETE FROM sticky_bindings WHERE key LIKE ?")?;
+            stmt.execute(rusqlite::params![format!("{}%", ns)])?;
+        }
         {
             let mut stmt = c.prepare(
                 "INSERT INTO sticky_bindings(key, uid, conv_id, last_seen, explicit, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, datetime('now','localtime'))",
@@ -315,6 +373,18 @@ mod tests {
         f.expire_times.insert("u1".into(), 1790000000);
         f.work.insert("u1".into(), 50.0);
         f.total_limit.insert("u2".into(), 2000.0);
+        // 包明细（到期日历包级口径）：含长期有效哨兵；u2 空数组（刷新成功但无可用包）
+        f.packs.insert(
+            "u1".into(),
+            vec![crate::models::CreditPackDetail {
+                kind: "通用".into(),
+                source: "每日签到".into(),
+                remaining: 88.5,
+                total: 100.0,
+                expire_time: 4102444800,
+            }],
+        );
+        f.packs.insert("u2".into(), vec![]);
         f.updated_at = Some("2026-09-15T10:00:00".into());
         remaining_credits_save(&s, &f).unwrap();
         let got = remaining_credits_load(&s);
@@ -323,6 +393,16 @@ mod tests {
         assert_eq!(got.work.get("u1"), Some(&50.0));
         assert_eq!(got.total_limit.get("u2"), Some(&2000.0));
         assert!(got.general.is_empty());
+        let packs = got.packs.get("u1").expect("u1 packs 应有值");
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].kind, "通用");
+        assert_eq!(packs[0].source, "每日签到");
+        assert_eq!(packs[0].remaining, 88.5);
+        assert_eq!(packs[0].total, 100.0);
+        assert_eq!(packs[0].expire_time, 4102444800);
+        // 空数组也是有效状态（区分「无包」与「未刷新」）
+        assert!(got.packs.get("u2").map_or(false, |v| v.is_empty()));
+        assert!(got.packs.get("u3").is_none());
         assert_eq!(got.updated_at.as_deref(), Some("2026-09-15T10:00:00"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -395,6 +475,43 @@ mod tests {
         let b = sticky_bindings_load(&s);
         assert_eq!(b["bindings"][0]["uid"], "u1");
         assert_eq!(b["bindings"][0]["explicit"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sticky_bindings_save_ns_no_prefix_scope_replaces_only_unowned_rows() {
+        use serde_json::json;
+        let (dir, s) = tmp_store("sticky_ns");
+        // 三池共存：q:/t: 命名空间行 + WB 无前缀行（一条存活、一条待清理）
+        let seed = json!({"bindings": [
+            {"key": "q:a", "uid": "q1", "conv_id": "", "last_seen": 1, "explicit": false},
+            {"key": "t:b", "uid": "t1", "conv_id": "", "last_seen": 1, "explicit": false},
+            {"key": "cid:keep", "uid": "w1", "conv_id": "", "last_seen": 1, "explicit": false},
+            {"key": "cid:stale", "uid": "w0", "conv_id": "", "last_seen": 1, "explicit": false}
+        ]});
+        sticky_bindings_save_ns(&s, &seed, "q:", &["t:", ""]).unwrap();
+        // WB 池范围替换（ns=""，other_ns=q:/t:）：只允许动无前缀行——
+        // 回归锚点：曾误写 LIKE+AND 恒假条件，DELETE 恒 0 行后 cid:stale
+        // 残留占主键，本次 INSERT 整事务回滚（落库永久失效）
+        let wb = json!({"bindings": [
+            {"key": "cid:fresh", "uid": "w2", "conv_id": "", "last_seen": 2, "explicit": false}
+        ]});
+        sticky_bindings_save_ns(&s, &wb, "", &["q:", "t:"]).unwrap();
+        let root = sticky_bindings_load(&s);
+        let keys: Vec<&str> = root["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["key"].as_str())
+            .collect();
+        assert!(keys.contains(&"q:a"), "q: 命名空间行必须原样保留");
+        assert!(keys.contains(&"t:b"), "t: 命名空间行必须原样保留");
+        assert!(keys.contains(&"cid:fresh"), "WB 新绑定必须写入");
+        assert!(!keys.contains(&"cid:stale"), "无前缀旧行必须被范围替换删除");
+        assert!(!keys.contains(&"cid:keep"), "ns=\"\" 为整命名空间替换，旧无前缀行不保留");
+        // 二次保存仍成功（旧 bug 下主键冲突会回滚）
+        sticky_bindings_save_ns(&s, &wb, "", &["q:", "t:"]).unwrap();
+        assert_eq!(sticky_bindings_load(&s)["bindings"].as_array().unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -684,6 +801,14 @@ pub fn remaining_credits_load(s: &Store) -> RemainingCreditsFile {
         if let Some(v) = get_i("membership_next_billing") {
             f.membership_next_billing.insert(uid.clone(), v);
         }
+        // 积分包明细（按包口径到期计算用）；解析失败的条目跳过不阻断
+        if let Some(arr) = data.get("packs").and_then(Value::as_array) {
+            let packs: Vec<crate::models::CreditPackDetail> = arr
+                .iter()
+                .filter_map(|p| serde_json::from_value(p.clone()).ok())
+                .collect();
+            f.packs.insert(uid.clone(), packs);
+        }
     }
     f.updated_at = s.kv_get::<Option<String>>("remaining_credits_updated_at");
     f
@@ -710,6 +835,11 @@ pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(),
             }
         }
     }
+    for k in f.packs.keys() {
+        if !uids.iter().any(|u| u == k) {
+            uids.push(k.clone());
+        }
+    }
     let rows: Vec<(String, Value)> = uids
         .into_iter()
         .map(|uid| {
@@ -731,6 +861,10 @@ pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(),
             ins_f(&mut obj, "total_limit", &f.total_limit);
             ins_i(&mut obj, "membership_expire", &f.membership_expire);
             ins_i(&mut obj, "membership_next_billing", &f.membership_next_billing);
+            // 积分包明细：有值才写（含空数组，空 = 刷新成功但无可用包）；老缓存无键 → load 侧无记录回退账号级口径
+            if let Some(v) = f.packs.get(&uid) {
+                obj.insert("packs".into(), json!(v));
+            }
             (uid, Value::Object(obj))
         })
         .collect();
@@ -938,6 +1072,11 @@ pub fn wb_token_store_upsert(s: &Store, id: &str, rec: &Value) -> Result<(), Str
     s.row_upsert("wb_tokens", id, rec)
 }
 
+/// 仅写 version kv 元数据（供凭证收敛后的单行 upsert 路径维持版本闸门）
+pub fn wb_token_store_save_version(s: &Store, version: i64) -> Result<(), String> {
+    s.kv_set_raw("wb_tokens_meta", &version.to_string())
+}
+
 // ── API 用量（api_usage.json → api_usage 表，(bucket, day) 行文档）───────────
 
 fn bucket_name(b: UsageBucket) -> &'static str {
@@ -945,6 +1084,7 @@ fn bucket_name(b: UsageBucket) -> &'static str {
         UsageBucket::Trae => "trae",
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
+        UsageBucket::Qoder => "qoder",
     }
 }
 
@@ -953,6 +1093,7 @@ fn bucket_of(name: &str) -> Option<UsageBucket> {
         "trae" => Some(UsageBucket::Trae),
         "wb" => Some(UsageBucket::Wb),
         "custom" => Some(UsageBucket::Custom),
+        "qoder" => Some(UsageBucket::Qoder),
         _ => None,
     }
 }
@@ -962,6 +1103,7 @@ fn bucket_map_mut<'a>(f: &'a mut UsageFile, b: UsageBucket) -> &'a mut std::coll
         UsageBucket::Trae => &mut f.days,
         UsageBucket::Wb => &mut f.wb_days,
         UsageBucket::Custom => &mut f.custom_days,
+        UsageBucket::Qoder => &mut f.qoder_days,
     }
 }
 
@@ -1291,4 +1433,172 @@ pub fn doubao_health_save(s: &Store, events: &[Value]) -> Result<(), String> {
         let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
         Err(e)
     })
+}
+
+// ── Qoder 账号池（F-80 M1；qoder_accounts 表，Value 语义，与 wb_pool 同款）──
+
+/// 读整池（结构 {accounts: [...]}；账号对象原样保真）
+pub fn qoder_pool_load(s: &Store) -> Value {
+    let accounts: Vec<Value> = s
+        .rows_all("qoder_accounts")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "accounts": accounts })
+}
+
+/// 写整池（pk = 账号 id，缺 id 用序号占位）
+pub fn qoder_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = pool.get("accounts").and_then(Value::as_array).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let id = a.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+            (id.map(String::from).unwrap_or_else(|| format!("__idx{i}")), a.clone())
+        })
+        .collect();
+    s.rows_replace("qoder_accounts", &rows)
+}
+
+// ── Qoder token store（qoder_tokens 表；结构 {version, tokens: {id: rec}}）──
+
+/// 读整库（损坏行过滤丢弃，不混入消费方；version 存 kv qoder_tokens_meta）
+pub fn qoder_token_store_load(s: &Store) -> Value {
+    let tokens: serde_json::Map<String, Value> = s
+        .rows_all("qoder_tokens")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v.is_object())
+        .collect();
+    let version = s.kv_get_raw("qoder_tokens_meta").and_then(|v| v.parse::<i64>().ok());
+    let mut root = serde_json::Map::new();
+    root.insert("tokens".into(), Value::Object(tokens));
+    if let Some(v) = version {
+        root.insert("version".into(), json!(v));
+    }
+    Value::Object(root)
+}
+
+/// 写整库（version 闸门由调用方维持，此处整表替换）
+pub fn qoder_token_store_save(s: &Store, store_val: &Value) -> Result<(), String> {
+    let empty = serde_json::Map::new();
+    let tokens = store_val.get("tokens").and_then(Value::as_object).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> =
+        tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    s.rows_replace("qoder_tokens", &rows)?;
+    if let Some(v) = store_val.get("version").and_then(Value::as_i64) {
+        s.kv_set_raw("qoder_tokens_meta", &v.to_string())?;
+    }
+    Ok(())
+}
+
+// ── Qoder 签到结果（qoder_checkin_results 表；行文档 + 90 天滚动由调用方裁剪）──
+
+/// 读回 {results: [...]}（rows_all 按 rowid 序 = 原追加序）
+pub fn qoder_checkin_results_load(s: &Store) -> Value {
+    let results: Vec<Value> = s
+        .rows_all("qoder_checkin_results")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "results": results })
+}
+
+/// 单条签到结果 UPSERT + 90 天滚动裁剪。
+/// pk = `date|user_id|time_ms`（内容派生）：原 `date|user_id|idx` 的 idx 是「载入时数组
+/// 下标」，计划任务与 UI 触发两进程各自从 0 计数，同日同账号并发写入必然互相覆盖；
+/// 秒级 time 同账号同秒仍会碰撞，故优先毫秒级 time_ms（旧记录/旧调用方回退 time 兼容）。
+/// 裁剪为逐 pk DELETE，仅删过期行不触碰新写入（对齐 qoder_credits_history_upsert 模式）。
+pub fn qoder_checkin_results_upsert(s: &Store, rec: &Value) -> Result<(), String> {
+    let date = rec.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    let uid = rec.get("user_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let tail = match rec.get("time_ms").and_then(Value::as_i64) {
+        Some(ms) => ms.to_string(),
+        None => rec
+            .get("time")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    };
+    if date.is_empty() || uid.is_empty() || tail.is_empty() {
+        return Err("签到结果缺少 date/user_id/time_ms(time)".into());
+    }
+    s.row_upsert("qoder_checkin_results", &format!("{date}|{uid}|{tail}"), rec)?;
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(90))
+        .format("%Y-%m-%d")
+        .to_string();
+    let stale: Vec<String> = s
+        .rows_all("qoder_checkin_results")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pk, _)| pk)
+        .filter(|pk| pk.as_str() < cutoff.as_str())
+        .collect();
+    let mut fail = 0usize;
+    let mut first_err = String::new();
+    for pk in stale {
+        if let Err(e) =
+            s.with_conn(|c| c.execute("DELETE FROM qoder_checkin_results WHERE pk = ?1", [&pk]))
+        {
+            fail += 1;
+            if first_err.is_empty() {
+                first_err = e;
+            }
+        }
+    }
+    if fail > 0 {
+        // store 层无 data_dir 不可 app_log；裁剪失败不影响本次写入，过期行留待下次
+        eprintln!("[qoder] 签到结果滚动裁剪删除失败 {fail} 条（首错: {first_err}），过期行将留待下次裁剪");
+    }
+    Ok(())
+}
+
+// ── Qoder 每日积分快照（qoder_credits_history 表；pk = date，同日覆盖）──────
+
+/// 读全部快照（按 pk 升序 = 日期升序）
+pub fn qoder_credits_history_load(s: &Store) -> Vec<Value> {
+    s.rows_all("qoder_credits_history")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect()
+}
+
+/// 同日覆盖 upsert + 365 天裁剪（pk 即 date，YYYY-MM-DD 字符串比较即时间序）
+pub fn qoder_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), String> {
+    let date = snap.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    if date.is_empty() {
+        return Err("快照缺少 date 字段".into());
+    }
+    s.row_upsert("qoder_credits_history", &date, snap)?;
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
+        .format("%Y-%m-%d")
+        .to_string();
+    let stale: Vec<String> = s
+        .rows_all("qoder_credits_history")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pk, _)| pk)
+        .filter(|pk| pk.as_str() < cutoff.as_str())
+        .collect();
+    let mut fail = 0usize;
+    let mut first_err = String::new();
+    for pk in stale {
+        if let Err(e) =
+            s.with_conn(|c| c.execute("DELETE FROM qoder_credits_history WHERE pk = ?1", [&pk]))
+        {
+            fail += 1;
+            if first_err.is_empty() {
+                first_err = e;
+            }
+        }
+    }
+    if fail > 0 {
+        eprintln!("[qoder] 积分快照滚动裁剪删除失败 {fail} 条（首错: {first_err}），过期行将留待下次裁剪");
+    }
+    Ok(())
 }

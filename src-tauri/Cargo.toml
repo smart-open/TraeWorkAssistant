@@ -1,6 +1,6 @@
 [package]
 name = "ai-work-assistant"
-version = "3.6.6"
+version = "3.7.0"
 description = "AI Work 助手 - 多账号签到与管理桌面端"
 edition = "2021"
 rust-version = "1.85"
@@ -33,17 +33,26 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 ureq = { version = "2", features = ["json"] }
 urlencoding = "2"
+# SSRF host 精确判定（审查 P2）：与 ureq 请求层同源的 WHATWG URL 解析，
+# 识别 0x7f000001 / 0177.0.0.1 / 127.1 等 IPv4 变体（ureq 传递依赖，仅显式声明）
+url = "2"
 axum = "0.7"
 tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-thread", "time", "macros"] }
 tokio-stream = "0.1"
 bytes = "1"
 sha2 = "0.10"
+# 口令派生 KDF：导出信封口令派生用 Argon2id（疑点⑤：抗 GPU/ASIC 暴力破解，
+# 内存困难 19MiB/t=2；sha2 链式 10 万轮仅为旧版导出文件的兼容解密路径保留）
+argon2 = "0.5"
 # 豆包 Chromium cookie v10 解密（AES-256-GCM，doubao_session 诊断/探活兜底）
 aes-gcm = "0.10"
 # F-70/F-78：Trae 客户端 tc 信封解密（AES-128-CBC，提取 OAuth 设备 EC P-256 私钥）
 # + ExchangeToken DeviceProof 签名（ECDSA P-256/SHA-256，服务端 20405 Device proof required）
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
+# p3-3：Qoder 网关 COSY 签名（MD5 签名摘要 + RSA PKCS#1 v1.5 模幂，签名层见 tasks/qoder_sign.rs）
+md-5 = "0.10"
+num-bigint = "0.4"
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 # 读 Trae 应用的 state.vscdb（SQLite）——自动发现当前登录账号的 Cloud-IDE uid
 rusqlite = { version = "0.32", features = ["bundled"] }

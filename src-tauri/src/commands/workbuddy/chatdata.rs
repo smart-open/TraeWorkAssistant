@@ -159,6 +159,18 @@ pub fn restore_chats(data_root: &Path, app: BuddyApp, user_id: &str) -> Result<u
     if !backup.is_dir() {
         return Err(format!("该账号没有会话备份：{}", backup.display()));
     }
+    // 会话备份 schemaVersion 兼容门禁（审查 P1-5，语义对齐 chromium.rs 快照校验）：
+    // 当前仅支持 1；未来版本备份（>1）明确拒绝，防旧版应用按 v1 布局静默错乱恢复。
+    // 旧版备份无 meta / 无版本字段 → 兼容继续
+    let meta_raw = std::fs::read_to_string(backup.join("chat_backup_meta.json")).unwrap_or_default();
+    let meta: serde_json::Value = serde_json::from_str(&meta_raw).unwrap_or(serde_json::Value::Null);
+    if let Some(v) = meta.get("schemaVersion").and_then(serde_json::Value::as_i64) {
+        if v > 1 {
+            return Err(format!(
+                "会话备份 schemaVersion={v}，当前版本仅支持 1：备份由更新版本的应用生成，请升级应用后再恢复"
+            ));
+        }
+    }
     let projects_backup = backup.join("projects");
     if !projects_backup.is_dir() {
         return Err("备份缺少 projects 正文目录（备份不完整）".into());

@@ -48,6 +48,12 @@ impl PoolStrategy {
         })
     }
 
+    /// Qoder 池生效策略：qoder_strategy 独立配置优先；空 = 跟随 Trae 池策略
+    ///（与 Buddy 同语义，复用同一跟随规则）
+    pub fn resolve_qoder(strategy: &str, qoder_strategy: &str) -> Self {
+        Self::resolve_wb(strategy, qoder_strategy)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExpireFirst => "expire_first",
@@ -350,6 +356,51 @@ impl ApiPool {
                     domain: a.domain.clone(),
                     enterprise_id: a.enterprise_id.clone(),
                     global_region: a.global_region,
+                    refresh_invalid: false,
+                },
+            );
+        }
+        // F-77：清理已不在池内的在途计数条目（在途请求经 Arc 独立释放，不受影响）
+        {
+            let mut inflight = safe_lock(&self.inflight);
+            inflight.retain(|uid, _| entries.contains_key(uid));
+        }
+    }
+
+    /// 从 Qoder 账号同步池（p3-3）：Qoder 专用池实例（`ApiSharedState.qoder_pool`），
+    /// 全量重建语义同 sync_from_wb。Qoder 按倍率计费无积分余额概念，
+    /// credits 恒 None（selectable 不做积分过滤）；machine_id 透传账号记录值
+    ///（可能为空——请求时由 identity 回调解析 effective 凭证补齐）
+    pub fn sync_from_qoder(&self, accounts: &[QoderSyncAccount], enabled: &[String]) {
+        let mut entries = safe_lock(&self.entries);
+        entries.clear();
+        let enabled_set: HashSet<&str> = enabled.iter().map(|s| s.as_str()).collect();
+        for a in accounts {
+            if !enabled_set.contains(a.uid.as_str()) || a.access_token.is_empty() {
+                continue;
+            }
+            entries.insert(
+                a.uid.clone(),
+                PoolEntry {
+                    uid: a.uid.clone(),
+                    name: a.name.clone(),
+                    jwt: a.access_token.clone(),
+                    credits: None,
+                    credits_expire_at: None,
+                    disabled: a.needs_relogin,
+                    err_count: 0,
+                    until: 0,
+                    reason: String::new(),
+                    device_id: String::new(),
+                    machine_id: a.machine_id.clone(),
+                    hard_until: 0,
+                    last_used: 0,
+                    successes: 0,
+                    failures: 0,
+                    cb_trips: 0,
+                    domain: String::new(),
+                    enterprise_id: String::new(),
+                    global_region: false,
                     refresh_invalid: false,
                 },
             );
@@ -824,6 +875,19 @@ pub struct WbSyncAccount {
     pub needs_relogin: bool,
     /// 所属 Buddy 分组 id（空 = 未分组）；池分组筛选在装配层按此过滤
     pub group_id: String,
+}
+
+/// Qoder 账号入池同步结构（p3-3）：uid 即 Cosy user_id（也是 token store 键）。
+///
+/// `access_token` 可能是会过期的 24h 作业令牌——池内 jwt 仅作快照展示，
+/// 请求时的真凭证由网关 identity 回调按需解析（`ApiSharedState.qoder_identity`，
+/// PAT 换令牌 / 刷新链路在闭包内走全防护），与 WB「池内即凭证」的模式不同。
+pub struct QoderSyncAccount {
+    pub uid: String,
+    pub name: String,
+    pub access_token: String,
+    pub machine_id: String,
+    pub needs_relogin: bool,
 }
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
@@ -1534,6 +1598,58 @@ mod tests {
             &["wb-x".to_string()],
         );
         assert!(pool2.pick_excluding_constrained(&HashSet::new(), None, None).is_none());
+    }
+
+    #[test]
+    fn qoder_sync_and_pick_carries_machine_id() {
+        let pool = ApiPool::new();
+        pool.sync_from_qoder(
+            &[
+                crate::api_server::pool::QoderSyncAccount {
+                    uid: "qd-1".into(),
+                    name: "Qoder账号".into(),
+                    access_token: "tk".into(),
+                    machine_id: "mid".into(),
+                    needs_relogin: false,
+                },
+                crate::api_server::pool::QoderSyncAccount {
+                    uid: "qd-dead".into(),
+                    name: String::new(),
+                    access_token: "tk".into(),
+                    machine_id: String::new(),
+                    needs_relogin: true,
+                },
+                // 空令牌账号不入池（无法签名）
+                crate::api_server::pool::QoderSyncAccount {
+                    uid: "qd-empty".into(),
+                    name: String::new(),
+                    access_token: String::new(),
+                    machine_id: String::new(),
+                    needs_relogin: false,
+                },
+            ],
+            &["qd-1".to_string(), "qd-dead".to_string(), "qd-empty".to_string()],
+        );
+        assert_eq!(pool.count(), 2, "空令牌账号不入池");
+        let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
+        assert_eq!(picked.uid, "qd-1");
+        assert_eq!(picked.machine_id, "mid");
+        // needs_relogin → disabled，不参与取号（Forbidden 态）
+        assert!(pool.pick_by_uid("qd-dead").is_none());
+        assert_eq!(pool.status_list().iter().find(|s| s.uid == "qd-dead").unwrap().state, "Forbidden");
+        // 全量重建：再次同步仅含 qd-dead（enabled）→ qd-1 消失
+        pool.sync_from_qoder(
+            &[crate::api_server::pool::QoderSyncAccount {
+                uid: "qd-dead".into(),
+                name: String::new(),
+                access_token: "tk".into(),
+                machine_id: String::new(),
+                needs_relogin: true,
+            }],
+            &["qd-dead".to_string()],
+        );
+        assert_eq!(pool.count(), 1);
+        assert!(pool.pick_excluding_constrained(&HashSet::new(), None, None).is_none());
     }
 
     #[test]

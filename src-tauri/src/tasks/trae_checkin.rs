@@ -8,7 +8,8 @@
 //!   done {type,ok,already,failed}
 //! - 侧写文件与 python 完全一致：device_map.json（新条目确定性派生后落盘共享）、
 //!   account_cooldowns.json、credits_history.json（90 天滚动）、checkin_summary.json（同日合并）、
-//!   logs/checkin.log（摘要行追加）
+//!   logs/checkin.log（摘要行追加）；另将 per-uid 最终状态按日落库 checkin_results
+//!   （活动档期日历/趋势图数据源，调度器/CLI/UI 三路径统一覆盖）
 //! 红线：jwt 不进日志/事件（事件仅含 user_id/name/status 等脱敏字段）。
 
 use std::collections::{HashMap, HashSet};
@@ -534,6 +535,8 @@ pub fn run_round(
 ) -> Value {
     let agent = http_agent(30);
     let mut outcome = RoundOutcome::default();
+    // uid → 账号名（结果落库 entries 用；statuses 只存状态，名字在循环内各分支维护）
+    let mut round_names: HashMap<String, String> = HashMap::new();
     let mut results: Vec<Value> = Vec::with_capacity(accounts.len());
     let mut warnings: Vec<String> = Vec::new();
     let mut total_ok = 0usize;
@@ -558,6 +561,7 @@ pub fn run_round(
                 "type": "account", "index": idx, "user_id": uid, "name": name,
                 "status": "fail", "message": "未配置 jwt",
             }));
+            round_names.insert(uid.clone(), name.clone());
             outcome.statuses.insert(uid, "fail");
             continue;
         }
@@ -595,7 +599,8 @@ pub fn run_round(
             if let Some(c) = pre.credits {
                 save_credits_history(state, &uid_str, c, 0);
             }
-            outcome.statuses.insert(uid_str, "already");
+            outcome.statuses.insert(uid_str.clone(), "already");
+            round_names.insert(uid_str, name.clone());
             continue;
         }
 
@@ -635,6 +640,7 @@ pub fn run_round(
             failed += 1;
         }
         outcome.statuses.insert(uid_str.clone(), if ok { "success" } else { "fail" });
+        round_names.insert(uid_str, name.clone());
 
         results.push({
             let mut r = json!({
@@ -676,6 +682,26 @@ pub fn run_round(
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
         use std::io::Write as _;
         let _ = f.write_all(log_line.as_bytes());
+    }
+
+    // 签到结果按日落库（checkin_results 表，活动档期日历/趋势图数据源）：
+    // 调度器（scheduler "trae-checkin"）与 CLI（--task-run checkin）直调本函数，
+    // 此前不落库导致「活动档期日历」无打卡标记；UI 路径（run_checkin_worker）
+    // 在重试轮合并后另行落库，同 uid 同日以最后一次为准，双写幂等无冲突
+    let entries: Vec<(String, String, String)> = outcome
+        .statuses
+        .iter()
+        .filter(|(uid, _)| !uid.is_empty())
+        .map(|(uid, st)| {
+            (
+                uid.clone(),
+                round_names.get(uid).cloned().unwrap_or_else(|| uid.clone()),
+                st.to_string(),
+            )
+        })
+        .collect();
+    if !entries.is_empty() {
+        crate::checkin_results::record_today(&state.data_dir, entries);
     }
 
     save_summary_merged(state, results, &warnings);

@@ -38,7 +38,7 @@ use crate::device_proxy::ca::{ensure_ca, CaAuthority};
 use crate::device_proxy::handler::{serve_mitm, HOP_BY_HOP_REQ, PIN_MIN_FAILS, ProxyCtx};
 use crate::device_proxy::logger::{ProxyLog, RequestLogger};
 use crate::device_proxy::upstream::{
-    connect_direct, connect_via_upstream, UpstreamConnector, UpstreamProxy,
+    connect_direct, connect_via_upstream, host_matches_domain, UpstreamConnector, UpstreamProxy,
 };
 
 /// 建连/首读超时（对齐 Python `_CONN_TIMEOUT`）
@@ -72,7 +72,38 @@ pub const DEFAULT_TARGETS: &[&str] = &[
     "volces.com",
     "treecode.com",
     "doubao.com",
+    // F-80：Qoder CN（宽后缀覆盖 openapi./gateway. 等子域，M0 抓包支持）
+    "qoder.com.cn",
+    // p3-2：Qoder Work agent worker chat 流量（模型端点 api2-v2.qoder.sh 的
+    // /model/v1/chat/completions）+ MCP（mcp.qoder.cn）+ 灰度/测试环境域
+    "qoder.sh",
+    "qoder.cn",
+    "qoder.ai",
 ];
+
+/// 上游直连白名单默认域（p3-2e）：命中域的转发流量跳过用户 VPN 直接连目标。
+/// 实测依据（2026-09-30）：qoder 各域经上游 VPN（7890）全挂（IDE chat「无法连接
+/// 服务器」），关闭系统代理直连即恢复——这些是国内域，VPN 分流反而破坏出口路径。
+/// 可用环境变量 `UPSTREAM_BYPASS_DOMAINS`（逗号分隔）覆盖默认值。
+pub const DEFAULT_UPSTREAM_BYPASS_DOMAINS: &[&str] = &[
+    "qoder.com.cn",
+    "qoder.sh",
+    "qoder.cn",
+    "qoder.ai",
+];
+
+/// 解析直连白名单域：环境变量 `UPSTREAM_BYPASS_DOMAINS`（逗号分隔）优先，
+/// 未设置/为空用 [`DEFAULT_UPSTREAM_BYPASS_DOMAINS`]
+fn resolve_direct_domains() -> Vec<String> {
+    match std::env::var("UPSTREAM_BYPASS_DOMAINS") {
+        Ok(s) if !s.trim().is_empty() => s
+            .split(',')
+            .map(|d| d.trim().to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+            .collect(),
+        _ => DEFAULT_UPSTREAM_BYPASS_DOMAINS.iter().map(|s| s.to_string()).collect(),
+    }
+}
 
 // ---------------- 生命周期 ----------------
 
@@ -121,6 +152,7 @@ impl ProxyServer {
         } else {
             cfg.targets.iter().map(|d| d.to_ascii_lowercase()).collect()
         };
+        let direct_domains = Arc::new(resolve_direct_domains());
         let ctx = Arc::new(ProxyCtx {
             log: log.clone(),
             req_logger,
@@ -128,6 +160,7 @@ impl ProxyServer {
             auto_capture_jwt: cfg.auto_capture_jwt,
             data_dir: cfg.data_dir.clone(),
             upstream: cfg.upstream.clone(),
+            direct_domains: Arc::clone(&direct_domains),
             pin_state: Mutex::new(std::collections::HashMap::new()),
         });
 
@@ -157,6 +190,8 @@ impl ProxyServer {
         if let Some(up) = &cfg.upstream {
             log.log(&format!("上游代理(用户VPN)透传: {}", up.addr()));
         }
+        // p3-2e：直连白名单域（命中域跳过上游 VPN 直连目标，qoder 国内域经 VPN 实测全挂）
+        log.log(&format!("上游直连白名单域: {}", direct_domains.join(", ")));
         // CA 安装状态如实探测输出（原为无条件提示，已安装也提示安装，误导用户）。
         // 三平台收口走 cert_query（Windows=certutil 根存储 / mac=security find-certificate）
         if crate::platform::cert_ctl::cert_query("TraeDeviceProxyCA") {
@@ -208,14 +243,16 @@ async fn accept_loop(
     // 实测教训（proxy.log 22:21）：VPN 接管路由/DNS 的环境下本进程直连目标域
     // 47 请求 0 响应（白屏根因），此前「目标域直连」策略在该环境下全线失效。
     // 语义对齐 mitmproxy `--mode upstream:` / Charles 上游代理。
+    // 例外（p3-2e）：直连白名单域（direct_domains，默认 qoder 各域）跳过上游——
+    // 该组国内域经 VPN 实测全挂、直连恢复（IDE chat 链路 2026-09-30）。
     // 两个 Client 仅连接池隔离（明文/解密流量互不挤占 keep-alive 连接）。
-    let plain_client: Client<UpstreamConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(upstream.clone(), ctx.log.clone()));
+    let plain_client: Client<UpstreamConnector, Full<Bytes>> = Client::builder(TokioExecutor::new())
+        .build(UpstreamConnector::new(upstream.clone(), ctx.log.clone(), Arc::clone(&ctx.direct_domains)));
     // MITM 解密后的上游转发 Client（进程级共享）：跨连接复用 hyper 连接池
     // （TCP/TLS keep-alive）。原实现在 serve_mitm 内每连接新建 Client，连接池
     // 无法跨连接复用——桌面客户端高频请求下每请求都重新建连，显著拖慢转发。
-    let mitm_client: Client<UpstreamConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(UpstreamConnector::new(upstream.clone(), ctx.log.clone()));
+    let mitm_client: Client<UpstreamConnector, Full<Bytes>> = Client::builder(TokioExecutor::new())
+        .build(UpstreamConnector::new(upstream.clone(), ctx.log.clone(), Arc::clone(&ctx.direct_domains)));
     let mut conns: Vec<JoinHandle<()>> = Vec::new();
     // [overload] 日志节流锚点（Unix 秒）
     let mut last_overload_log: u64 = 0;
@@ -322,8 +359,9 @@ async fn handle_conn(
         if !ctx.host_in_targets(&host) || ctx.is_pinned(&host) {
             // 未配置解密的域名 / 已判定证书锁定的域：透明直通隧道（不解密不记请求日志）。
             // Charles「SSL Proxying Locations」/ mitmproxy「--ignore-hosts」同款语义。
-            // 隧道路由与其他路径一致：上游优先、失败回退直连（见 tunnel_raw 注释）。
-            tunnel_raw(client, &host, port, &upstream, &ctx.log).await;
+            // 隧道路由与其他路径一致：上游优先、失败回退直连；白名单域直连例外
+            //（p3-2e，见 tunnel_raw 注释）。
+            tunnel_raw(client, &host, port, &upstream, &ctx.log, &ctx.direct_domains).await;
             return;
         }
         let matched = ctx
@@ -397,6 +435,8 @@ async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> Result<Vec<u8>, String> {
 /// 失败回退直连——Python 版此路径只服务非目标域，本版还承接被降级为直通的
 /// 目标域，路由同样必须镜像客户端正常出口（2026-09-15 实测：直连在此环境
 /// 数据黑洞，上游 7890 是唯一活路）。
+/// 例外（p3-2e）：直连白名单域（默认 qoder 各域）跳过上游直连目标（失败回退
+/// 上游兜底）——这些国内域经 VPN 实测全挂、直连恢复，隧道不得改变其出口路径。
 /// client 为 [`PrefixedStream`]（分发阶段超读字节的回放见 handle_conn 注释）。
 async fn tunnel_raw<S>(
     mut client: S,
@@ -404,11 +444,46 @@ async fn tunnel_raw<S>(
     port: u16,
     upstream: &Option<UpstreamProxy>,
     log: &ProxyLog,
+    direct_domains: &[String],
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut pre: Option<TcpStream> = None;
-    if let Some(up) = upstream {
+    if direct_domains.iter().any(|d| host_matches_domain(host, d)) {
+        // 直连白名单域（p3-2e）：先直连，失败回退上游兜底
+        match connect_direct(host, port).await {
+            Ok(s) => {
+                log.log(&format!("  [raw-tunnel] 直连白名单域建立隧道 {host}:{port}"));
+                pre = Some(s);
+            }
+            Err(e) => {
+                log.log(&format!(
+                    "  [raw-tunnel] 直连白名单域 {host}:{port} 失败({e})，回退上游"
+                ));
+                if let Some(up) = upstream {
+                    match connect_via_upstream(host, port, up).await {
+                        Ok(s) => {
+                            log.log(&format!(
+                                "  [raw-tunnel] 经上游代理 {} 建立隧道 {host}:{port}",
+                                up.addr()
+                            ));
+                            pre = Some(s);
+                        }
+                        Err(e2) => {
+                            log.log(&format!(
+                                "  [raw-tunnel] 隧道建立失败 {host}:{port}: 直连({e})与上游({e2})均失败"
+                            ));
+                            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                            return;
+                        }
+                    }
+                } else {
+                    let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                    return;
+                }
+            }
+        }
+    } else if let Some(up) = upstream {
         match connect_via_upstream(host, port, up).await {
             Ok(s) => {
                 log.log(&format!("  [raw-tunnel] 经上游代理 {} 建立隧道 {host}:{port}", up.addr()));
@@ -809,6 +884,7 @@ mod tests {
             auto_capture_jwt: true,
             data_dir: dir.clone(),
             upstream: None,
+            direct_domains: Arc::new(Vec::new()),
             pin_state: Mutex::new(std::collections::HashMap::new()),
         }
     }

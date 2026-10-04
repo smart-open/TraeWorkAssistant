@@ -4,6 +4,38 @@
 
 ---
 
+## [3.7.0] · 2026-10-04 · Qoder 全面支持（上游网关接入 + 积分看板三平台化 + 模块加固）
+
+> 范围：自 [3.6.6] 以来的全部变更，核心为 Qoder 平台全链路接入；协议逆向/抓包调研/运行实证等过程记录见 git 历史。
+
+### 新功能
+
+- **Qoder 上游网关接入**：COSY 三段式签名 + chat 双层信封 SSE 流式/聚合路由（`qoder_route.rs`），智能调度并入 Qoder 池（buddy→trae→qoder 优先级、错误四分类：排队退避/鉴权刷新/额度换号/Forbidden）；统一模型目录合并 Qoder 源；三池每池自管开关（`trae_enabled`/`wb_enabled`/`qoder_enabled`，`qoder_enabled` UI 化热应用）。
+- **Qoder 网关通路 v2**：慢请求竞速对冲（原始行源层首字竞速、胜者统一信封翻译，`qoder_hedge_threshold_ms` 热参数默认 8s）+ 会话粘性（conversationId/消息指纹双模式绑定账号，`qoder_sticky_enabled` 默认关）；Global 区产品决策仅 CN 区。
+- **模型目录定时同步**：`qoder-catalog-sync` 每日 05:50 调度 + CLI 双入口，model/list 真 COSY 签名直通刷新，断网回落静态兜底表。
+- **积分看板三平台化**：三池共用 CreditsDashboard（KPI/趋势/日热度/到期日历）；Qoder 积分包逐包明细（Plan 订阅配额/个人资源包/专属组织包分型，逐包端点失败回退聚合口径 + 负缓存防噪音）；「凭证续期」按钮 + Token 状态列 + IDE/Work 双端登录徽标；四桶用量基建（Qoder usage 桶 + 三池并行拉取）。
+- **Qoder 签到活动档期月历**：逐日双活动状态点 + 奖励合计 + 选中日逐账号明细 + 静态档期标注（0:00 刷新 / 10:00 开窗 / 10:15 调度）。
+- **三池调度参数 per-pool 拆分**：账号并发上限/池粘性 TTL/会话粘性 TTL 拆为每池独立配置（`api_pool.json` 新增 8 字段，存量迁移仅 Buddy 池沿用旧共享值）；Trae 池新增会话粘性与竞速对冲（`trae_hedge_threshold_ms`），前端三页各自编辑三参数。
+- **Qoder 账号管理全家桶**：OAuth/PAT 双通道导入、AES-256-GCM + Argon2id 加密导出、环境重置、分组管理、Qoder CN 0.4.3 安装目录拆分适配、Work 客户端切换。
+
+### 修复
+
+- **并发刷新丢 token（P1 三层防护）**：每账号刷新互斥锁 + 落库行级合并 + 版本闸门；跨进程互斥 CrossProcLock（签到/刷新/积分三 scope）及锁名单段化 P0 修复（多段路径名致创建恒败，防护自合入起空转）。
+- **Qoder Work 切换无效（P1）**：登录真源 `auth.v1.dat` 不在快照白名单——切换后客户端按原账号重写，「切了等于没切」；现白名单补登录凭据三件套 + 恢复侧对称清理 + 身份守卫改解密 user.id。
+- **签到日历双修复（P1）**：Trae 调度器/CLI 路径统一落库（日历不再全空）；Buddy 同日同账号多轮记录取最终态去重（不再误显「部分失败」）。
+- **分组删除整表写回绕过 Buddy 旧值迁移（P1 审查即修）**：api_pool 全部写回点收口走 `load_pool_file` 迁移入口；`qoder_live_logins` 阻塞解密移入 spawn_blocking 等审查 P3 批。
+- **积分链路口径**：Qoder KPI 与到期日历包计数对齐；快照 stale-on-error 返 Err 交调度器重试（当日快照不再静默丢失）；Trae 到期看板改按包明细口径 + `credit_packs` 空数组缺省修复老缓存回退。
+- **导入导出与并发加固**：导出剥离机器指纹、KDF 前向兼容 + 迁移 Argon2id（旧格式兼容可解）、命令异步化（spawn_blocking）、groups 读写持锁、OAuth 导入进度事件、明文凭证导出迁移提示。
+- **网关上游与抓包小修批**：SSE statusCode 钳制、目录 resolve 兜底序对齐远程目录、session_seed 等限长 128、MITM Qoder 四域直连白名单 + 解密默认值补齐、app_log 单行原子写、三源调度早退守卫与 max 别名降级修复。
+- **Qoder 全面审查修复批（边审边修 + 收尾批 8abfe92）**：签到 skipped_busy 前端闭环、快照目标 latest-ref、凭证导出红警化、PAT 前缀预检、签到进行态 store 化、通道判定/KDF roundtrip 单测锁定；粘性落库恒假条件（WB 粘性持久化失效）、积分 401 自愈跨进程锁、-9901 空完成免熔断、Queued 流拼接双响应、record_today 并发互斥、storage.json 原子写、random_hex 去 panic、vault ns_get 落日志。
+- **界面**：Trae 资源调度模型目录 Max 标记移至模型 ID 右上角黄色角标。
+
+### 测试
+
+- `cargo test` 745 passed / 0 failed / 8 ignored；`tsc --noEmit` 全绿；`vitest` 59 passed；`vite build` 通过。
+
+---
+
 ## [3.6.6] · 2026-10-04 · Trae 池指纹清洗接入 + 11128/空完成感知重试（Issue #57/#54 修复批）
 
 > 范围：自 [3.6.5]（tag v3.6.5，commit 29d106a）以来的全部变更。

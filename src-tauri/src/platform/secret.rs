@@ -21,28 +21,22 @@
 //! 会暴露在进程列表（`ps` 可见），是真实的秘密泄露面；keyring 直调 Security.framework
 //! 无此问题（backlog F-75 表格既定迁移目标 hwchen/keyring-rs）。
 
-use crate::state::AppState;
-
 /// Keychain 条目定位（macOS 专用）：服务名 = 应用域 + 账户名 = 用途
 #[cfg(target_os = "macos")]
 pub const KEYCHAIN_SERVICE: &str = "com.aiwork.assistant.vault";
 #[cfg(target_os = "macos")]
 pub const KEYCHAIN_ACCOUNT: &str = "stronghold-master";
 
-/// mac key file 主源落位（与 Windows 同名同位：conf/vault_key.bin；内容为 hex 文本，
-/// Windows 为 DPAPI blob——平台各自解释互不冲突）
-#[cfg(target_os = "macos")]
-fn key_file_path(state: &AppState) -> std::path::PathBuf {
-    state.conf_path("vault_key.bin")
-}
-
 /// 读取受保护的 vault 主密码；不存在（首次运行）返回 Ok(None)。
 /// Windows：读 `conf/vault_key.bin` + DPAPI 解密（文件存在但解密失败仍为 Err，
-/// 与原 vault.rs 行为逐字一致——绝不静默重生成覆盖既有密文）。
-pub fn load_vault_password(state: &AppState) -> Result<Option<Vec<u8>>, String> {
+/// 与原 vault.rs 行为逐字一致——绝不静默重生成覆盖既有密文）；
+/// macOS：key file 主源 + Keychain 兜底（见模块注释）。
+/// data_dir 参数化（vault 多 data_dir 化后 vault_password_at 直调；
+/// `data_dir/conf/vault_key.bin` 与 state.conf_path 同一物理位置）。
+pub fn load_vault_password_at(data_dir: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
     #[cfg(windows)]
     {
-        let key_path = state.conf_path("vault_key.bin");
+        let key_path = data_dir.join("conf").join("vault_key.bin");
         if !key_path.exists() {
             return Ok(None);
         }
@@ -52,7 +46,7 @@ pub fn load_vault_password(state: &AppState) -> Result<Option<Vec<u8>>, String> 
     #[cfg(target_os = "macos")]
     {
         // 1) 主源：key file（与 vault 同生共死的不变量，见模块注释）
-        let key_path = key_file_path(state);
+        let key_path = data_dir.join("conf").join("vault_key.bin");
         if key_path.exists() {
             let text = match std::fs::read_to_string(&key_path) {
                 Ok(t) => t,
@@ -78,21 +72,21 @@ pub fn load_vault_password(state: &AppState) -> Result<Option<Vec<u8>>, String> 
     }
 }
 
-/// 首次生成后写入受保护的 vault 主密码。
+/// 首次生成后写入受保护的 vault 主密码（与 [load_vault_password_at] 配对）。
 /// Windows：DPAPI 密文落 `conf/vault_key.bin`；macOS：hex 双写——key file（0600，
 /// 成功为准）+ Keychain（尽力而为，失败降级容忍并记日志）。
-pub fn store_vault_password(state: &AppState, pwd: &[u8]) -> Result<(), String> {
+pub fn store_vault_password_at(data_dir: &std::path::Path, pwd: &[u8]) -> Result<(), String> {
     #[cfg(windows)]
     {
         let blob = crate::vault::dpapi::protect(pwd)?;
-        let key_path = state.conf_path("vault_key.bin");
+        let key_path = data_dir.join("conf").join("vault_key.bin");
         std::fs::write(&key_path, &blob).map_err(|e| format!("写入 vault 密钥失败: {e}"))
     }
     #[cfg(target_os = "macos")]
     {
         let hex: String = pwd.iter().map(|b| format!("{b:02x}")).collect();
         // 1) 主源：key file，0600 权限（写失败必须报错——它是 vault 的解密真值）
-        let key_path = key_file_path(state);
+        let key_path = data_dir.join("conf").join("vault_key.bin");
         std::fs::write(&key_path, &hex).map_err(|e| format!("写入 vault 密钥失败: {e}"))?;
         #[cfg(unix)]
         {
@@ -103,7 +97,7 @@ pub fn store_vault_password(state: &AppState, pwd: &[u8]) -> Result<(), String> 
         if let Ok(entry) = keyring_entry() {
             if let Err(e) = entry.set_password(&hex) {
                 crate::fs_utils::app_log(
-                    &state.data_dir,
+                    data_dir,
                     &format!("vault 密钥 Keychain 兜底写入失败（已由 key file 主源保障）: {e}"),
                 );
             }
@@ -139,6 +133,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::AppState;
 
     #[cfg(windows)]
     #[test]
@@ -149,13 +144,14 @@ mod tests {
         let state = AppState {
             data_dir: dir.clone(),
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         // 首次：无文件 → None
-        assert_eq!(load_vault_password(&state).unwrap(), None);
+        assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), None);
         // 写入 → 读回一致
         let pwd: Vec<u8> = (0..32u8).collect();
-        store_vault_password(&state, &pwd).unwrap();
-        assert_eq!(load_vault_password(&state).unwrap(), Some(pwd));
+        store_vault_password_at(&state.data_dir, &pwd).unwrap();
+        assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), Some(pwd));
         // 文件落位与原布局一致：conf/vault_key.bin
         assert!(state.conf_path("vault_key.bin").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -179,6 +175,7 @@ mod tests {
         let state = AppState {
             data_dir: dir.clone(),
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         let pwd: Vec<u8> = (0..32u8).collect();
         let hex: String = pwd.iter().map(|b| format!("{b:02x}")).collect();
@@ -187,11 +184,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         // file 主源读回一致
-        assert_eq!(load_vault_password(&state).unwrap(), Some(pwd));
+        assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), Some(pwd));
         // file 损坏 → fail-open 不报 Err（降级 Keychain 线索，测试环境 keychain
         // 大概率 None → Ok(None)）
         std::fs::write(&key_path, "zz").unwrap();
-        let r = load_vault_password(&state);
+        let r = load_vault_password_at(&state.data_dir);
         assert!(r.is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }

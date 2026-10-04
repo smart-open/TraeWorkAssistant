@@ -365,7 +365,10 @@ impl RequestLogger {
         }
         if !resp_body.is_empty() {
             let decompressed = decompress_body(resp_body, resp_headers);
-            let preview = String::from_utf8_lossy(&decompressed[..decompressed.len().min(8192)]);
+            // 预览上限 256KB：model/list / region endpoints 等配置类 JSON 解压后 ~64-128KB，
+            // 旧 8KB 截断导致完整结构（模型目录/加密 payload）无法离线分析
+            let preview_max: usize = 256 * 1024;
+            let preview = String::from_utf8_lossy(&decompressed[..decompressed.len().min(preview_max)]);
             out.push_str(&format!(
                 "--- Response Body ({} bytes, decompressed {} bytes) ---\n",
                 resp_body.len(),

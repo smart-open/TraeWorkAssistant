@@ -186,80 +186,102 @@ fn pem_cert_der(pem: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("本地 CA base64 解码失败: {e}"))
 }
 
-/// 生成随机 hex 字符串。
-/// 熵源：OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG）。旧 LCG 以时间戳作种子，
-/// 输出可预测，不适合 OAuth state / machine_id 等安全场景（审查 P2）；BCrypt 失败时
-/// 保留 LCG 兜底（仅影响随机性，不中断流程）。
-pub(crate) fn random_hex(len: usize) -> String {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Security::Cryptography::{
-            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        };
-        let mut bytes = vec![0u8; len.div_ceil(2)];
-        let halg: windows_sys::Win32::Security::Cryptography::BCRYPT_ALG_HANDLE =
-            unsafe { std::mem::zeroed() };
-        // STATUS_SUCCESS == 0
-        let status = unsafe {
-            BCryptGenRandom(halg, bytes.as_mut_ptr(), bytes.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
-        };
-        if status == 0 {
-            let mut out = String::with_capacity(len);
-            for b in bytes {
-                if out.len() >= len {
-                    break;
-                }
-                out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
-                if out.len() >= len {
-                    break;
-                }
-                out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
-            }
-            return out;
-        }
+/// 生成随机 hex 字符串（安全场景入口：OAuth state / PKCE verifier / 签名 nonce）。
+/// 熵源：OS CSPRNG（Windows=BCryptGenRandom 系统首选 RNG；mac/其他平台=uuid v4
+/// 底层 getrandom CSPRNG，F-75 M2-2.5——旧 LCG/哈希熵链以时间戳作种子输出可预测，
+/// 不适合安全场景（审查 P1-6）——安全路径已全部移除弱实现）。CSPRNG 失败返回 Err
+/// 上抛为用户可见错误：不 panic（审查修复——panic 在异步命令任务内会中止任务，
+/// 前端 invoke 永不 resolve），也不静默降级为可预测随机。
+#[cfg(windows)]
+pub(crate) fn random_hex_result(len: usize) -> Result<String, String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let mut bytes = vec![0u8; len.div_ceil(2)];
+    let halg: windows_sys::Win32::Security::Cryptography::BCRYPT_ALG_HANDLE =
+        unsafe { std::mem::zeroed() };
+    // STATUS_SUCCESS == 0
+    let status = unsafe {
+        BCryptGenRandom(halg, bytes.as_mut_ptr(), bytes.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+    };
+    if status != 0 {
+        return Err(format!(
+            "系统熵池不可用（BCryptGenRandom status={status:#x}），已拒绝生成随机数"
+        ));
     }
-    #[cfg(not(windows))]
-    {
-        // F-75 M2-2.5：mac/其他平台走 uuid v4（getrandom CSPRNG）——
-        // 消除弱随机 LCG 在非 Windows 成为主路径的问题
-        let mut bytes = Vec::with_capacity(len.div_ceil(2) + 16);
-        while bytes.len() < len.div_ceil(2) {
-            bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    Ok(hex_encode(&bytes, len))
+}
+
+/// 非 Windows：mac/其他平台走 uuid v4（getrandom CSPRNG，永失败）——
+/// macos_main 合并适配：安全场景同样走 CSPRNG 主路径，弱哈希熵链仅保留给
+/// [random_hex] 非安全场景兜底，不用于安全令牌。
+#[cfg(not(windows))]
+pub(crate) fn random_hex_result(len: usize) -> Result<String, String> {
+    let mut bytes = Vec::with_capacity(len.div_ceil(2) + 16);
+    while bytes.len() < len.div_ceil(2) {
+        bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    Ok(hex_encode(&bytes, len))
+}
+
+/// 非安全场景便捷封装（request-id / trace-id / 设备号等仅需唯一性）：
+/// CSPRNG 不可用时退化为哈希熵链（唯一性有保障，时间可预测性可接受），
+/// 不 panic 不上抛。安全场景（state/PKCE/nonce）必须走 [random_hex_result]
+/// 并上抛错误（审查 P1-6：熵链不可预测性弱于 CSPRNG，勿用于安全令牌）。
+pub(crate) fn random_hex(len: usize) -> String {
+    random_hex_result(len).unwrap_or_else(|_| hash_hex_fallback(len))
+}
+
+/// 字节 → 定长 hex 字符串（截断到 len）
+fn hex_encode(bytes: &[u8], len: usize) -> String {
+    let mut out = String::with_capacity(len);
+    for b in bytes {
+        if out.len() >= len {
+            break;
         }
-        let mut out = String::with_capacity(len);
-        for b in bytes {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+        if out.len() >= len {
+            break;
+        }
+        out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// 哈希熵链回退（sha256：时间纳秒 + pid + 计数器迭代扩展）。仅保证唯一性，
+/// 供 [random_hex] 非安全场景兜底（CSPRNG 不可用时；mac 上 uuid v4 恒成功，
+/// 本函数实际只在 Windows BCrypt 失败时触达）。
+fn hash_hex_fallback(len: usize) -> String {
+    use sha2::{Digest, Sha256};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = Sha256::new();
+    h.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_le_bytes())
+            .unwrap_or([0u8; 16]),
+    );
+    h.update(std::process::id().to_le_bytes());
+    h.update(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+    let mut digest = h.finalize();
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
+        for b in digest.iter() {
             if out.len() >= len {
                 break;
             }
             out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
-            if out.len() < len {
-                out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
+            if out.len() >= len {
+                break;
             }
+            out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
         }
-        return out;
+        let mut h2 = Sha256::new();
+        h2.update(digest);
+        h2.update(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        digest = h2.finalize();
     }
-    // 兜底：旧 LCG（仅 Windows BCrypt 调用失败时；cfg(windows) 门控——
-    // 审查修复：否则 mac 构建在上方 return 后触发 unreachable_code 警告）
-    #[cfg(windows)]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let mut seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(42);
-        let mut out = String::with_capacity(len);
-        for _ in 0..len {
-            // 简单 LCG
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let nibble = ((seed >> 32) & 0xF) as u8;
-            out.push(if nibble < 10 {
-                (b'0' + nibble) as char
-            } else {
-                (b'a' + nibble - 10) as char
-            });
-        }
-        out
-    }
+    out
 }
 
 /// OAuth 登录设备标识（F-78 批次 3）：持久化于 data/oauth_device.json。
@@ -316,14 +338,15 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
 }
 
 /// 生成 PKCE code_verifier（RFC 7636：43-128 字符非 reserved 字符；hex 64字符合规）
-/// 与 S256 code_challenge（BASE64URL-NOPAD(SHA256(verifier))）
-fn pkce_pair() -> (String, String) {
+/// 与 S256 code_challenge（BASE64URL-NOPAD(SHA256(verifier))）。
+/// 安全令牌走 [random_hex_result]：CSPRNG 不可用上抛 Err，不静默降级
+fn pkce_pair() -> Result<(String, String), String> {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
-    let verifier = random_hex(64);
+    let verifier = random_hex_result(64)?;
     let digest = Sha256::digest(verifier.as_bytes());
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-    (verifier, challenge)
+    Ok((verifier, challenge))
 }
 
 /// 生成 OAuth 登录 URL（2026-09-16 抓包固化：对齐真实 Trae IDE 登录页参数形态）。
@@ -332,14 +355,14 @@ fn pkce_pair() -> (String, String) {
 /// login_channel=native_ide → 页面前端调 GetPCAuthCode（绑定 PKCE challenge）→
 /// 302 回 auth_callback_url，回调参数为 authCodeInfo（JSON）而非 refreshToken/code。
 #[tauri::command]
-pub fn oauth_get_login_url(state: State<AppState>) -> OAuthLoginUrl {
+pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, String> {
     let state = &*state;
     let dev = load_or_create_oauth_device(state);
     let machine_id = dev.machine_id;
     let device_id = dev.device_id;
     // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）
     let trace_id = random_hex(32);
-    let (pkce_verifier, code_challenge) = pkce_pair();
+    let (pkce_verifier, code_challenge) = pkce_pair()?;
 
     // 主机名兜底（F-75 M2-2.5）：Windows 读 COMPUTERNAME；mac 无此环境变量，
     // 恒落 "Windows-PC"——改 scutil --get ComputerName 取值（失败回落 macOS-Device）
@@ -408,11 +431,11 @@ pub fn oauth_get_login_url(state: State<AppState>) -> OAuthLoginUrl {
         *guard = Some(PendingLogin { state: trace_id.clone(), pkce_verifier });
     }
 
-    OAuthLoginUrl {
+    Ok(OAuthLoginUrl {
         url,
         state: trace_id,
         redirect_uri: OAUTH_REDIRECT_URI.to_string(),
-    }
+    })
 }
 
 /// 解析 OAuth 回调 URL

@@ -53,9 +53,14 @@ const WB_FLAG_FIELDS: { key: 'wbEnabled' | 'wbDefaultThinking' | 'wbToolExec' | 
   },
 ];
 
-/** F-76②/③/F-77 数值参数（保存时写回 api_pool.json，服务运行中热生效） */
+/** F-76②/③/F-77 数值参数（保存时写回 api_pool.json，服务运行中热生效）；
+ * per-pool 拆分后 Buddy 池读写 wb_ 专属字段，与 Trae/Qoder 池互不共享 */
 const WB_PARAM_FIELDS: {
-  key: 'wbHedgeThresholdMs' | 'accountConcurrencyLimit' | 'poolStickyTtlSecs' | 'wbStickyTtlSecs';
+  key:
+    | 'wbHedgeThresholdMs'
+    | 'wbAccountConcurrencyLimit'
+    | 'wbPoolStickyTtlSecs'
+    | 'wbStickyTtlSecs';
   label: string;
   desc: string;
   min: number;
@@ -64,16 +69,7 @@ const WB_PARAM_FIELDS: {
   unit: string;
 }[] = [
   {
-    key: 'wbHedgeThresholdMs',
-    label: '竞速对冲阈值',
-    desc: '流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；0 = 关闭（有效范围 1s–8s，与后端对齐）',
-    min: 0,
-    max: 8_000,
-    step: 500,
-    unit: 'ms',
-  },
-  {
-    key: 'accountConcurrencyLimit',
+    key: 'wbAccountConcurrencyLimit',
     label: '账号并发上限',
     desc: '单账号在途请求数达到上限即让位其他账号（全部 busy 时取负载最小者）；0 = 不限',
     min: 0,
@@ -82,7 +78,7 @@ const WB_PARAM_FIELDS: {
     unit: '并发',
   },
   {
-    key: 'poolStickyTtlSecs',
+    key: 'wbPoolStickyTtlSecs',
     label: '池粘性 TTL',
     desc: 'TTL 内同会话落同一账号（上游 KV cache 复用）',
     min: 0,
@@ -99,13 +95,22 @@ const WB_PARAM_FIELDS: {
     step: 60,
     unit: '秒',
   },
+  {
+    key: 'wbHedgeThresholdMs',
+    label: '竞速对冲阈值',
+    desc: '流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；0 = 关闭（有效范围 1s–8s，与后端对齐）',
+    min: 0,
+    max: 8_000,
+    step: 500,
+    unit: 'ms',
+  },
 ];
 
-/** 数值参数默认值（与后端 serde default 对齐：对冲 8s / 并发 1 / 池粘性 300s / 会话粘性 1800s） */
+/** 数值参数默认值（与后端 serde default 对齐：对冲 8s / Buddy 并发 1 / Buddy 池粘性 300s / 会话粘性 1800s） */
 const WB_PARAM_DEFAULTS = {
   wbHedgeThresholdMs: 8_000,
-  accountConcurrencyLimit: 1,
-  poolStickyTtlSecs: 300,
+  wbAccountConcurrencyLimit: 1,
+  wbPoolStickyTtlSecs: 300,
   wbStickyTtlSecs: 1800,
 };
 
@@ -129,6 +134,10 @@ export default function BuddyApiService() {
   const [wbGroups, setWbGroups] = useState<GroupView[]>([]);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
+  // 厂商列数据源（§6.2）：WbModelInfo 无 vendor 字段，经统一目录聚合按模型 id
+  // 关联（vendor = 自定义模型用户填写值优先，否则按模型名系列推断）；id 缺失/
+  // 失败 → 显示 —，不影响主列表
+  const [vendorMap, setVendorMap] = useState<Map<string, string>>(new Map());
   const [syncing, setSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -143,13 +152,14 @@ export default function BuddyApiService() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [st, pf, accs, cat, wbp, wbg] = await Promise.all([
+      const [st, pf, accs, cat, wbp, wbg, unified] = await Promise.all([
         api.apiServer.status().catch(() => null),
         api.apiServer.poolList().catch(() => null),
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
         api.apiServer.wbCatalogList().catch(() => [] as WbModelInfo[]),
         api.apiServer.wbPoolStatus().catch(() => [] as PoolStatus[]),
         api.workbuddy.groups.list().catch(() => [] as GroupView[]),
+        api.apiServer.unifiedModels().catch(() => []),
       ]);
       setStatus(st);
       setPool(pf);
@@ -157,6 +167,7 @@ export default function BuddyApiService() {
       setCatalog(cat);
       setWbPool(wbp);
       setWbGroups(wbg);
+      setVendorMap(new Map(unified.filter((m) => m.vendor).map((m) => [m.id, m.vendor])));
       if (pf) {
         setWbFlags({
           wbEnabled: pf.wb_enabled ?? false,
@@ -167,8 +178,9 @@ export default function BuddyApiService() {
         });
         setWbParams({
           wbHedgeThresholdMs: pf.wb_hedge_threshold_ms ?? WB_PARAM_DEFAULTS.wbHedgeThresholdMs,
-          accountConcurrencyLimit: pf.account_concurrency_limit ?? WB_PARAM_DEFAULTS.accountConcurrencyLimit,
-          poolStickyTtlSecs: pf.pool_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.poolStickyTtlSecs,
+          wbAccountConcurrencyLimit:
+            pf.wb_account_concurrency_limit ?? WB_PARAM_DEFAULTS.wbAccountConcurrencyLimit,
+          wbPoolStickyTtlSecs: pf.wb_pool_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.wbPoolStickyTtlSecs,
           wbStickyTtlSecs: pf.wb_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.wbStickyTtlSecs,
         });
         // 空数组 = fail-open（全部自动入池）→ 视为未自定义，显示为全选
@@ -236,16 +248,22 @@ export default function BuddyApiService() {
   // 新增账号可持续自动入池；显式全量名单会冻结 fail-open）；清空传 []（后端同样 fail-open）；
   // F-76②/③/F-77 数值参数随开关一起保存（后端热应用，运行中即时生效）
   const saveFlags = async () => {
+    // 池配置未加载时禁止保存：uids/strategy/groups 原样回传依赖 pool 快照，
+    // pool=null 时保存会把 Trae 池 enabled_uids 清空（与 Qoder 页同款防护）
+    if (!pool) {
+      pushToast('error', '池配置未加载，无法保存（请先刷新重试）');
+      return;
+    }
     setSaving(true);
     try {
       await withMinDelay(
-        api.apiServer.poolSet(pool?.enabled_uids ?? [], pool?.strategy, pool?.group_ids, {
+        api.apiServer.poolSet(pool.enabled_uids, pool.strategy, pool.group_ids, {
           ...wbFlags,
           wbUids,
           wbGroupIds: [...wbPoolGroups],
           wbHedgeThresholdMs: wbParams.wbHedgeThresholdMs,
-          accountConcurrencyLimit: wbParams.accountConcurrencyLimit,
-          poolStickyTtlSecs: wbParams.poolStickyTtlSecs,
+          wbAccountConcurrencyLimit: wbParams.wbAccountConcurrencyLimit,
+          wbPoolStickyTtlSecs: wbParams.wbPoolStickyTtlSecs,
           wbStickyTtlSecs: wbParams.wbStickyTtlSecs,
         }),
         600,
@@ -265,6 +283,9 @@ export default function BuddyApiService() {
       const n = await withMinDelay(api.apiServer.wbCatalogSync(), 800);
       pushToast('success', `Buddy 模型目录已更新（${n} 个模型），/v1/models 与路由即时生效`);
       setCatalog(await api.apiServer.wbCatalogList());
+      // 新增模型需重取统一目录关联 vendor（否则新行厂商列恒 —）
+      const unified = await api.apiServer.unifiedModels();
+      setVendorMap(new Map(unified.filter((m) => m.vendor).map((m) => [m.id, m.vendor])));
     } catch (err) {
       pushToast('error', `Buddy 模型目录同步失败：${String(err).slice(0, 120)}`);
     } finally {
@@ -395,7 +416,7 @@ export default function BuddyApiService() {
                     </button>
                   </>
                 )}
-                <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving}>
+                <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving || !pool}>
                   {saving ? <Spinner /> : <Save size={15} />} 保存
                 </button>
               </div>
@@ -624,6 +645,7 @@ export default function BuddyApiService() {
                     <tr>
                       <th className="px-3 py-2 text-left">模型 ID</th>
                       <th className="px-3 py-2 text-left">展示名</th>
+                      <th className="px-3 py-2 text-left">厂商</th>
                       <th className="px-3 py-2 text-right">积分倍率</th>
                       <th className="px-3 py-2 text-left">思考档位</th>
                       <th className="px-3 py-2 text-right">上下文</th>
@@ -635,6 +657,9 @@ export default function BuddyApiService() {
                       <tr key={m.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
                         <td className="px-3 py-2 font-mono text-xs">{m.id}</td>
                         <td className="px-3 py-2">{m.display || '—'}</td>
+                        <td className="px-3 py-2 text-xs text-slate-500">
+                          {vendorMap.get(m.id) || '—'}
+                        </td>
                         <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">{m.rate.toFixed(2)}</td>
                         <td className="px-3 py-2 text-xs text-slate-500">
                           {m.effort_override

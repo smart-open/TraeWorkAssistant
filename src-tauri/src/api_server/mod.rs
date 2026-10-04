@@ -10,6 +10,7 @@ pub mod gateway_settings;
 pub mod models_sync;
 pub mod pool;
 pub mod payload;
+pub mod qoder_route;
 pub mod retry;
 pub mod routes;
 pub mod server;
@@ -66,12 +67,17 @@ pub struct ApiSharedState {
     /// 慢请求竞速对冲阈值毫秒（F-76③，0 = 关闭；默认 8000，运行时 clamp 1s–8s）：
     /// 流式首字节超过该阈值且池内有其他健康账号时向第二账号发对冲请求
     pub wb_hedge_threshold_ms: std::sync::atomic::AtomicU64,
-    /// 账号并发上限（F-77，0 = 不限；默认 1）：inflight ≥ 上限的账号视为 busy
-    /// 不参与候选，全部 busy 时降级取 inflight 最小者（不过载拒绝）
-    pub account_concurrency_limit: std::sync::atomic::AtomicU32,
-    /// 池粘性 TTL 秒（F-76②，默认 300）：TTL 内同会话必落同一池同账号，
-    /// 上游 KV cache 复用直接砍 prefill 时间
-    pub pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// Trae 池慢请求竞速对冲阈值毫秒（0 = 关闭；默认 8000，运行时 clamp 1s–8s），
+    /// 与 Buddy/Qoder 池互不共享
+    pub trae_hedge_threshold_ms: std::sync::atomic::AtomicU64,
+    /// 池粘性 TTL 秒（F-76② per-pool，默认 300）：TTL 内同会话必落同一池同账号，
+    /// 上游 KV cache 复用直接砍 prefill 时间。三池各自配置，record_sticky 按
+    /// 胜出池取对应值（旧版单字段三池共用已拆分）
+    pub trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// Buddy 池粘性 TTL 秒（per-pool，默认 300）
+    pub wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// Qoder 池粘性 TTL 秒（per-pool，默认 300）
+    pub qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
     /// 会话池粘性（统一网关 §4.4，内存态不落盘、重启即清）：
@@ -105,6 +111,36 @@ pub struct ApiSharedState {
     /// 入参 user_id，内部走 refresh_jwt_impl 全防护链路强制刷新并持久化。
     /// None（单测/降级构造）时 401 维持原「note_error + 换号」语义
     pub trae_jwt_refresh: Option<std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>>,
+    /// Trae 池参与调度开关（api_pool.json.trae_enabled，默认开）：关闭后 Trae 目录
+    /// 模型不路由 Trae 池（每个资源池管理自己的开关，与 wb_enabled/qoder_enabled 同族）
+    pub trae_enabled: std::sync::atomic::AtomicBool,
+    // ── Qoder 上游（p3-3，gateway.qoder.com.cn 推理网关）─────────────────
+    /// Qoder 上游账号池：独立池实例与 SOLO/WB 并列；Qoder 无积分余额概念，
+    /// 调度只看冷却/禁用/在途。凭证正文不在池内（access_token 会过期），
+    /// 请求时经 qoder_identity 回调解析
+    pub qoder_pool: ApiPool,
+    /// Qoder 上游开关（api_pool.json.qoder_enabled；关闭时 Qoder 模型不参与路由）
+    pub qoder_enabled: std::sync::atomic::AtomicBool,
+    /// Qoder 凭证解析回调（网关层无 AppState 引用，由启动方注入）：
+    /// 入参账号 uid（token store 键），返回经 secure 回填与 effective 合并的
+    /// 完整凭证（PAT 换 24h 作业令牌 / 刷新链路在闭包内走全防护）。
+    /// None（单测/未启用 Qoder）时 Qoder 池不参与路由
+    pub qoder_identity:
+        Option<std::sync::Arc<dyn Fn(&str) -> Result<crate::tasks::qoder_common::QoderCreds, String> + Send + Sync>>,
+    /// Qoder 慢请求竞速对冲阈值毫秒（F-80-余 v2，0 = 关闭；默认 8000，
+    /// 运行时 clamp 1s–8s 同 WB）：流式/聚合首字节超阈值且池内有其他健康账号时
+    /// 向第二账号发对冲请求，先出首字者胜
+    pub qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64,
+    /// Qoder 会话粘性开关（F-80-余 v2，默认关）：开启后同会话（conversationId /
+    /// 消息指纹）TTL 内绑定同一 Qoder 账号；同账号 + 同种子派生同一上游 session_id
+    pub qoder_sticky_enabled: std::sync::atomic::AtomicBool,
+    /// Qoder 会话粘性存储（F-80-余 v2）：与 wb_sticky 共用 sticky_bindings 表，
+    /// 键命名空间 "q:" 隔离，互不串绑
+    pub qoder_sticky: wb_sticky::StickyStore,
+    /// Trae 池会话粘性存储（per-pool 会话粘性批次新增）：与 wb/qoder sticky 共用
+    /// sticky_bindings 表，键命名空间 "t:" 隔离；会话→账号绑定供 Trae 取号粘住
+    ///（显式 conversationId / 消息指纹双模式，TTL 经 trae_sticky_ttl_secs 配置）
+    pub trae_sticky: wb_sticky::StickyStore,
 }
 
 impl ApiSharedState {
@@ -197,6 +233,41 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((usage::UsageBucket::Custom, day));
+    }
+
+    /// 记录一次 Qoder 上游请求用量（独立 qoder_days 桶，与 Trae/WB/Custom 侧分账）；
+    /// uid 用 Qoder 账号 uid（管道先铺，上游接入后填真实值），落盘策略与 record_usage 相同
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_qoder(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        // F-76① 同构 TTFT 入账（审查补齐）：首字耗时；无首字语义的失败（no-healthy/
+        // identity 未达首字）传 None
+        ttfb_ms: Option<u64>,
+    ) {
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record_in_ttfb(
+            usage::UsageBucket::Qoder,
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+            ttfb_ms,
+        );
+        // 批次 C 削峰：同 record_usage_custom，仅标脏不落盘
+        let day = usage::today_key();
+        drop(guard);
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((usage::UsageBucket::Qoder, day));
     }
 
     /// 排空用量脏队列并落盘（flusher 线程 2s 一次 + stop 时调用）。
@@ -431,6 +502,16 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
 /// 空完成哨兵码：上游 HTTP 200 正常收流但零内容（影子风控静默拦截 / 上游异常）。
 /// 取负数避免与上游业务码（正整数）冲突；SSE 转换层不发收尾帧、以该哨兵上抛，
 /// 调用方按可重试失败换号处理（is_empty_completion 识别）
+///
+/// # 处置口径（有意按路径分轨，均为换号重试且 tried 集合有界无循环风险）
+///
+/// - **流式**（wb_route/routes 的 stream 路径）：不冷却、不透传、不绑定粘性——
+///   流内判定可能受协议占位帧干扰（如 Responses 协议 created 帧），冷却从严
+///   以免误伤健康账号；
+/// - **聚合**（wb_aggregate/aggregate 路径）：note_error(Server) 短冷却——
+///   整响应零内容判定最确凿，与既有「empty response」处置同口径；
+/// - **toolexec**（wb_tool_exec_chat）：不冷却、补观测日志——多轮代执行按
+///   换号自愈，日志接通「模板命中」反查通道（issue #57 迭代依赖）。
 pub const EMPTY_COMPLETION_CODE: i64 = -9901;
 pub const EMPTY_COMPLETION_MSG: &str =
     "empty completion: upstream returned a completed response with no content";
@@ -441,13 +522,15 @@ pub fn is_empty_completion(code: i64, msg: &str) -> bool {
 }
 
 /// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
-/// 无正文 + 无思考链 + 无工具调用即视为空完成（换号重试）
+/// 无正文 + 无思考链 + 无工具调用即视为空完成（换号重试）。
+/// legacy `message.function_call` 一并判定（防御性：聚合器当前会把
+/// function_call 归一为 tool_calls，此处兜底防未来透传形态漏判）
 pub fn aggregated_response_is_empty(r: &serde_json::Value) -> bool {
     // Anthropic message：顶层 content 块数组
     if let Some(blocks) = r.get("content").and_then(|c| c.as_array()) {
         return blocks.is_empty();
     }
-    // OpenAI chat（message.content/reasoning_content/tool_calls）与
+    // OpenAI chat（message.content/reasoning_content/tool_calls/function_call）与
     // legacy text（choices[0].text）统一判定（缺字段视为空）
     let empty_at = |p: &str| -> bool {
         r.pointer(p)
@@ -459,6 +542,8 @@ pub fn aggregated_response_is_empty(r: &serde_json::Value) -> bool {
         && r.pointer("/choices/0/message/tool_calls")
             .and_then(|t| t.as_array())
             .map_or(true, |a| a.is_empty())
+        && r.pointer("/choices/0/message/function_call")
+            .map_or(true, serde_json::Value::is_null)
         && empty_at("/choices/0/text")
 }
 
@@ -546,8 +631,10 @@ mod inflight_tests {
             wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_hedge_threshold_ms: AtomicU64::new(0),
-            account_concurrency_limit: std::sync::atomic::AtomicU32::new(0),
-            pool_sticky_ttl_secs: AtomicU64::new(0),
+            trae_hedge_threshold_ms: AtomicU64::new(0),
+            trae_pool_sticky_ttl_secs: AtomicU64::new(0),
+            wb_pool_sticky_ttl_secs: AtomicU64::new(0),
+            qoder_pool_sticky_ttl_secs: AtomicU64::new(0),
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
@@ -564,6 +651,14 @@ mod inflight_tests {
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             trae_jwt_refresh: None,
+            trae_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_pool: pool::ApiPool::new(),
+            qoder_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_identity: None,
+            qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_sticky: wb_sticky::StickyStore::default(),
+            trae_sticky: wb_sticky::StickyStore::default(),
         };
         {
             let _g = state.inflight_guard();

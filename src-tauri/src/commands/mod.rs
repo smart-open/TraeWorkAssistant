@@ -11,6 +11,7 @@ pub mod oauth_loopback;
 pub mod process;
 pub mod profile;
 pub mod proxy;
+pub mod qoder;
 pub mod switch;
 pub mod trae_apps;
 pub mod updater;

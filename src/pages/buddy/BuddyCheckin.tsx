@@ -3,6 +3,8 @@ import { listen } from '@tauri-apps/api/event';
 import { CheckCircle2, PlayCircle, Sparkles, XCircle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
+import CheckinCalendarCard, { type CheckinCalendarDay } from '../../components/CheckinCalendar';
+import { daysFromWbRecords } from '../../components/checkinCalendarModel';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import type { WbCheckinRecord, WorkBuddyAccountView, WorkBuddySettings } from '../../types';
@@ -98,6 +100,19 @@ export default function BuddyCheckin() {
   const [growthLines, setGrowthLines] = useState<WbGrowthLine[]>([]);
   const [growthSummary, setGrowthSummary] = useState<string | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
+  // 活动档期日历（F-80-余 v2 推广）：近 90 天逐账号签到记录按日聚合
+  const [calDays, setCalDays] = useState<CheckinCalendarDay[]>([]);
+
+  // 档期日历加载：挂载时 + 每轮签到/成长完成后（doneInfo / growthSummary 变化触发）；
+  // 逐账号聚合逻辑在 checkinCalendarModel.daysFromWbRecords（含单测）
+  useEffect(() => {
+    api.workbuddy
+      .checkinResults(90)
+      .then((recs) => setCalDays(daysFromWbRecords(recs)))
+      .catch(() => {
+        /* 日历加载失败静默：不影响签到主流程 */
+      });
+  }, [doneInfo, growthSummary]);
 
   const refresh = useCallback(async () => {
     try {
@@ -507,6 +522,13 @@ export default function BuddyCheckin() {
           </div>
         </div>
       )}
+
+      {/* 活动档期日历（F-80-余 v2 推广，对齐 Qoder「每日签到」）：近 90 天签到结果按日可视化 */}
+      <CheckinCalendarCard
+        title="活动档期日历"
+        days={calDays}
+        footnote="档期：每日定时任务到点自动签到（时刻见环境配置） · 启动补签当日已过时刻"
+      />
     </div>
   );
 }

@@ -50,6 +50,21 @@ pub struct AccountView {
     /// F-78 批次 3 收尾，对齐 Buddy 侧 auth_saved_at 先例）
     #[serde(default)]
     pub auth_saved_at: Option<String>,
+    /// JWT data.id 与 user_id 归属不一致（issue #55：此时扫描「已入池」可能经该账号
+    /// JWT 命中其他 uid，列表却无从对账；显式暴露供列表警示。快照槽位按 user_id
+    /// 命名，自动改写会孤儿化既有快照，故仅警示不强修）
+    #[serde(default)]
+    pub jwt_uid_mismatch: bool,
+    /// JWT 解析出的 data.id（mismatch 时供 tooltip 展示）
+    #[serde(default)]
+    pub jwt_uid: Option<String>,
+    /// 积分包明细（仅剩余 > 0 且未过期，按到期时间升序；来自 remaining_credits.json 缓存）：
+    /// 到期日历与「7 天内到期」KPI 按包口径展示/计算（对齐 Buddy packages[]）；
+    /// 刷新过积分即有值，无包/全用完为空数组，老缓存缺省 → 前端回退账号级汇总口径。
+    /// 序列化时空数组同样缺省（前端 `!= null` 判定回退）：无可用包时 credits_expire_at
+    /// 必为空（earliest_expire 仅统计剩余 > 0 的包），回退分支不会虚增展示，两条路径等价
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credit_packs: Vec<CreditPackDetail>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -199,6 +214,12 @@ pub struct Settings {
     /// Buddy 模型目录同步触发时刻 HH:MM（默认 05:45）
     #[serde(default = "default_wb_catalog_sync_hhmm")]
     pub wb_catalog_sync_hhmm: String,
+    /// Qoder 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过）
+    #[serde(default = "default_true")]
+    pub qoder_catalog_sync_enabled: bool,
+    /// Qoder 模型目录同步触发时刻 HH:MM（默认 05:50，错峰 Buddy 05:45）
+    #[serde(default = "default_qoder_catalog_sync_hhmm")]
+    pub qoder_catalog_sync_hhmm: String,
     /// Trae 官网模型列表每日同步开关（API 服务页，默认开；无账号时调度静默跳过）
     #[serde(default = "default_true")]
     pub trae_models_sync_enabled: bool,
@@ -250,6 +271,27 @@ pub struct Settings {
     ///（默认关；开启后切换前自动备份当前账号三件套并复制到目标账号名下）
     #[serde(default)]
     pub buddy_switch_migrate_chats: bool,
+    // ── Qoder（F-80；M1 签到 MVP 调度键 + 客户端路径）──
+    /// Qoder CN IDE 桌面版 exe 手动路径（M3 切换档案预留；默认 %LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe）
+    #[serde(default)]
+    pub qoder_ide_path: Option<String>,
+    /// QoderWork（= Qoder CN，经 Launcher 启动；v1.4.1 澄清同一产品）exe 手动路径；留空走默认安装布局
+    #[serde(default)]
+    pub qoderwork_path: Option<String>,
+    /// Qoder 每日签到调度触发时刻 HH:MM（默认 10:15：单次覆盖 0 点签到与 10:00 登录奖励双活动，§2.2）
+    #[serde(default = "default_qoder_checkin_hhmm")]
+    pub qoder_checkin_hhmm: String,
+    /// Qoder 积分快照调度触发时刻 HH:MM（默认 23:40）
+    #[serde(default = "default_qoder_credits_sync_hhmm")]
+    pub qoder_credits_sync_hhmm: String,
+    /// Qoder 积分快照调度开关（默认开；无账号时任务内部静默跳过不计失败）
+    #[serde(default = "default_true")]
+    pub qoder_credits_sync_enabled: bool,
+    /// Qoder 凭证定时续期开关（默认开）：qoder-refresh 任务每 6 小时为全部含
+    /// refresh_token 的账号兜底续期 dt- 凭证（客户端 token 惰性窗 7h > 6h 调度
+    /// 间隔，任一 tick 必落窗内）；关闭后凭证仅在使用时惰性刷新
+    #[serde(default = "default_true")]
+    pub qoder_token_renew_enabled: bool,
 }
 
 fn default_api_port() -> u16 {
@@ -288,6 +330,13 @@ fn default_wb_growth_hhmm() -> String {
 fn default_wb_checkin_hhmm() -> String {
     "09:10".into()
 }
+/// Qoder 每日签到调度默认 10:15（F-80 §2.2：10:15 时 0 点签到与 10:00 登录奖励均可领）
+fn default_qoder_checkin_hhmm() -> String {
+    "10:15".into()
+}
+fn default_qoder_credits_sync_hhmm() -> String {
+    "23:40".into()
+}
 fn default_credits_sync_mode() -> String {
     "daily".into()
 }
@@ -298,7 +347,12 @@ fn default_trae_credits_sync_hhmm() -> String {
     "23:40".into()
 }
 fn default_wb_catalog_sync_hhmm() -> String {
-    "05:45".into()
+    "05:45".to_string()
+}
+
+/// Qoder 模型目录同步默认时刻（错峰 Buddy 05:45 / Trae 05:40）
+fn default_qoder_catalog_sync_hhmm() -> String {
+    "05:50".to_string()
 }
 fn default_trae_models_sync_hhmm() -> String {
     "05:40".into()
@@ -309,11 +363,19 @@ fn default_notify() -> String {
 fn default_retention() -> i32 {
     30
 }
+
+/// 池开关「默认开」的 serde 兜底（Trae 主池历史行为恒可用，字段缺省视为开启）
+fn default_pool_enabled() -> bool {
+    true
+}
 /// 解密域名白名单默认值（Charles SSL Proxying Locations 语义：列表内 MITM 解密，
-/// 其余透明直通）。完整覆盖字节系九组域；带证书锁定的客户端域（豆包 ttnet 原生栈）
-/// 由自适应降级兜底：连续 3 次握手被客户端中止自动转透明直通（重启代理复位）。
+/// 其余透明直通）。完整覆盖字节系九组域 + Qoder 全系四域（F-80 M0 抓包支持 +
+/// p3-2 chat 抓包：Qoder Work agent worker 的模型端点为 api2-v2.qoder.sh，
+/// 管理面为 qoder.com.cn；宽后缀语义下各域覆盖全部子域）；带证书锁定的
+/// 客户端域（豆包 ttnet 原生栈）由自适应降级兜底：连续 3 次握手被客户端中止
+/// 自动转透明直通（重启代理复位）。
 pub fn default_proxy_domains() -> String {
-    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com,qoder.com.cn,qoder.sh,qoder.cn,qoder.ai".into()
 }
 
 /// 旧版默认域名列表（未含 doubao.com）：用于把升级前已持久化的旧默认无缝迁移到新默认
@@ -331,6 +393,27 @@ pub fn legacy_proxy_domains_with_doubao() -> String {
 /// MITM 且 Trae 抓包需要，迁移回新默认（用户自定义过则不动）
 pub fn legacy_proxy_domains_narrow() -> String {
     "trae.cn,trae.com.cn,mchost.guru,www.doubao.com,accounts.doubao.com".into()
+}
+
+/// F-80 上一版默认域名列表（未含 qoder.com.cn）：已持久化该旧默认的存量用户
+/// 升级后无缝补上 Qoder 域（用户自定义过则不动）
+pub fn legacy_proxy_domains_without_qoder() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
+}
+
+/// p3-2 上一版默认域名列表（仅含 qoder.com.cn 单 Qoder 域）：Qoder Work agent
+/// worker 的 chat 流量走 api2-v2.qoder.sh（/model/v1/chat/completions），MCP 走
+/// mcp.qoder.cn——已持久化旧 10 域默认的存量用户升级后无缝补齐 qoder.sh/qoder.cn/
+/// qoder.ai 三域（用户自定义过则不动）
+pub fn legacy_proxy_domains_with_qoder_cn() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com,qoder.com.cn".into()
+}
+
+/// F-80 扩展版默认域名列表（qoder.com.cn + qoder.cn + qoder.com 三 Qoder 域）：
+/// p3-2b 之前某版本的持久化默认。p3-2b 迁移列表漏了它，存量用户被误判为
+/// 「自定义过」导致 qoder.sh/qoder.ai 未进解密白名单（2026-09-30 运行时横幅实测）
+pub fn legacy_proxy_domains_qoder_com() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com,qoder.com.cn,qoder.cn,qoder.com".into()
 }
 
 /// 豆包保活端点默认值：GET /info/v2/（通知未读数，轻量、必须登录，200=有效 / 302=过期）。
@@ -421,12 +504,16 @@ pub struct RemainingCreditsFile {
     /// 会员套餐下次自动续费时间缓存（Unix 秒，next_billing_time）
     #[serde(default)]
     pub membership_next_billing: HashMap<String, i64>,
+    /// 积分包明细缓存（仅剩余 > 0 且未过期的包，按到期时间升序）：
+    /// 到期日历/7 天内到期 KPI 按包口径计算（对齐 Buddy packages[]），替代账号级汇总
+    #[serde(default)]
+    pub packs: HashMap<String, Vec<CreditPackDetail>>,
     #[serde(default)]
     pub updated_at: Option<String>,
 }
 
 /// 积分明细条目（仅剩余 > 0 且未过期的积分包）
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreditPackDetail {
     /// "ͨ用" | "Work"
     pub kind: String,
@@ -434,6 +521,8 @@ pub struct CreditPackDetail {
     pub source: String,
     /// 该包剩余积分 = credits_limit - usage.credits_amount
     pub remaining: f64,
+    /// 该包本周期总额度（credits_limit；到期日历「剩余 X / 总 Y」口径，对齐 Buddy packages[].total）
+    pub total: f64,
     /// 过期时间（Unix 秒）
     pub expire_time: i64,
 }
@@ -473,6 +562,10 @@ pub struct AccountCooldownsFile {
 /// API 池配置文件：api_pool.json
 #[derive(Serialize, Deserialize)]
 pub struct ApiPoolFile {
+    /// Trae 池参与调度开关：默认开（主池历史行为恒可用）；关闭后 Trae 目录模型
+    /// 不路由 Trae 池，仅 Trae 源模型显式报错（WbDisabled/QoderDisabled 同族语义）
+    #[serde(default = "default_pool_enabled")]
+    pub trae_enabled: bool,
     #[serde(default)]
     pub enabled_uids: Vec<String>,
     /// 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c
@@ -481,9 +574,18 @@ pub struct ApiPoolFile {
     /// Buddy 池调度策略（取值同上）；空 = 沿用 strategy（兼容旧数据两池同策略）
     #[serde(default)]
     pub wb_strategy: String,
+    /// Qoder 池调度策略（取值同上）；空 = 沿用 strategy（跟随 Trae 池，同 Buddy 语义）
+    #[serde(default)]
+    pub qoder_strategy: String,
     /// 参与调度的分组 id 列表；空 = 不限分组
     #[serde(default)]
     pub group_ids: Vec<String>,
+    /// Qoder 池入池白名单（qd- 前缀账号 id）；空 = fail-open 全部含凭证账号入池
+    #[serde(default)]
+    pub qoder_enabled_uids: Vec<String>,
+    /// Qoder 池分组筛选（Qoder 账号 group_id，qoder_groups 分组体系）；空 = 不限分组
+    #[serde(default)]
+    pub qoder_group_ids: Vec<String>,
     /// WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池
     #[serde(default)]
     pub wb_enabled: bool,
@@ -503,16 +605,37 @@ pub struct ApiPoolFile {
     /// 向第二账号发对冲请求；0 = 关闭
     #[serde(default = "default_hedge_threshold_ms")]
     pub wb_hedge_threshold_ms: u64,
-    /// 账号并发上限（F-77）：inflight ≥ 上限的账号视为 busy 不参与候选，
-    /// 全部 busy 时降级取 inflight 最小者；0 = 不限（保持现状）
+    /// Trae 池账号并发上限（F-77，per-pool 三参数之一）：inflight ≥ 上限的账号
+    /// 视为 busy 不参与候选，全部 busy 时降级取 inflight 最小者；0 = 不限。
+    /// 旧版三池共用字段 account_concurrency_limit 已退役（serde 忽略旧 JSON 键），
+    /// Trae 池按默认值 1 落地、与 Buddy/Qoder 池互不共享
     #[serde(default = "default_account_concurrency_limit")]
-    pub account_concurrency_limit: u32,
-    /// 池粘性 TTL 秒（F-76②）：TTL 内同会话必落同一池同账号（上游 KV cache 复用）
+    pub trae_account_concurrency_limit: u32,
+    /// Trae 池粘性 TTL 秒（F-76②，per-pool 三参数之一）：TTL 内同会话必落
+    /// 同一池同账号（上游 KV cache 复用）；旧共用字段 pool_sticky_ttl_secs 已退役，
+    /// Trae 池按默认值 300 落地
     #[serde(default = "default_pool_sticky_ttl_secs")]
-    pub pool_sticky_ttl_secs: u64,
-    /// WB 显式绑定 TTL 秒（F-76②；wb_sticky 会话粘性）：覆盖原 1800s 常量
+    pub trae_pool_sticky_ttl_secs: u64,
+    /// Trae 池显式会话粘性 TTL 秒（per-pool 三参数之一）：显式 conversationId
+    /// 绑定账号的有效期（滚动续期），绑定落 sticky_bindings 表 "t:" 命名空间。
+    /// 旧版 Trae 池无显式绑定机制，新增对齐 Buddy/Qoder 能力
+    #[serde(default = "default_sticky_ttl_secs")]
+    pub trae_sticky_ttl_secs: u64,
+    /// Trae 池慢请求竞速对冲阈值毫秒（F-76③ 同构）：流式首字节超阈值且有其他
+    /// 健康账号时向第二账号发对冲请求，先出首字者胜；0 = 关闭。
+    /// 默认 8000 与 Buddy/Qoder 对冲阈值同默认（运行时 clamp 1s–8s）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub trae_hedge_threshold_ms: u64,
+    /// WB 显式绑定 TTL 秒（F-76②；wb_sticky 会话粘性，per-pool 三参数之一）：
+    /// 显式 conversationId 绑定 Buddy 账号的有效期，覆盖原 1800s 常量
     #[serde(default = "default_wb_sticky_ttl_secs")]
     pub wb_sticky_ttl_secs: u64,
+    /// Buddy 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub wb_account_concurrency_limit: u32,
+    /// Buddy 池粘性 TTL 秒（per-pool 三参数之一，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub wb_pool_sticky_ttl_secs: u64,
     /// Buddy 池入池白名单（wb- 前缀账号 id）：空 = 全部含凭证账号自动入池
     /// （fail-open，对齐 Buddy 页「含凭证账号参与 WB 上游调度」语义；修复 WB 池
     /// 因误用 Trae 共享白名单而恒空、Buddy 源永远 503 no_healthy_account 的问题）；
@@ -523,6 +646,30 @@ pub struct ApiPoolFile {
     /// （未分组账号不参与，对齐 Trae 池 group_ids 的 T10 语义）；空 = 不限分组
     #[serde(default)]
     pub wb_group_ids: Vec<String>,
+    /// Qoder 上游开关（p3-3）：开启后 Qoder 目录模型路由到 Qoder 账号池。
+    /// 默认 false——未部署 Qoder 的环境不产生空池噪音（健康告警/目录徽章）
+    #[serde(default)]
+    pub qoder_enabled: bool,
+    /// Qoder 慢请求竞速对冲阈值毫秒（F-80-余 v2）：流式首字节超阈值且有其他
+    /// 健康账号时向第二账号发对冲请求，先出首字者胜；0 = 关闭。
+    /// 默认 8000 与 WB 对冲阈值同默认（运行时 clamp 1s–8s）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub qoder_hedge_threshold_ms: u64,
+    /// Qoder 会话粘性开关（F-80-余 v2）：开启后同会话（显式 conversationId /
+    /// 消息指纹）在 TTL 内绑定同一 Qoder 账号——同账号 + 同种子派生同一上游
+    /// session_id，保住上游会话侧复用；默认 false（v1 轮换行为）
+    #[serde(default)]
+    pub qoder_sticky_enabled: bool,
+    /// Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub qoder_account_concurrency_limit: u32,
+    /// Qoder 池粘性 TTL 秒（per-pool 三参数之一，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub qoder_pool_sticky_ttl_secs: u64,
+    /// Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800）：
+    /// 覆盖 qoder_sticky store 的 EXPLICIT_TTL_SECS 常量（旧版硬编码不可配）
+    #[serde(default = "default_sticky_ttl_secs")]
+    pub qoder_sticky_ttl_secs: u64,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -543,12 +690,19 @@ fn default_wb_sticky_ttl_secs() -> u64 {
     1800
 }
 
+/// 显式会话粘性 TTL 默认值（Trae/Qoder 池 per-pool 三参数之一，与
+/// wb_sticky::EXPLICIT_TTL_SECS 30m 常量对齐）
+fn default_sticky_ttl_secs() -> u64 {
+    1800
+}
+
 /// Default 与 serde default 对齐（derive Default 的数值字段会落 0，与旧版
 /// api_pool.json 缺字段的语义不一致：F-76③ 对冲默认 15s、F-77 并发默认 1、
 /// F-76② 池粘性 300s / 会话粘性 1800s）
 impl Default for ApiPoolFile {
     fn default() -> Self {
         Self {
+            trae_enabled: true,
             enabled_uids: Vec::new(),
             strategy: String::new(),
             wb_strategy: String::new(),
@@ -559,11 +713,24 @@ impl Default for ApiPoolFile {
             wb_bg_downgrade: false,
             wb_longctx_downgrade: false,
             wb_hedge_threshold_ms: default_hedge_threshold_ms(),
-            account_concurrency_limit: default_account_concurrency_limit(),
-            pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            trae_account_concurrency_limit: default_account_concurrency_limit(),
+            trae_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            trae_sticky_ttl_secs: default_sticky_ttl_secs(),
+            trae_hedge_threshold_ms: default_hedge_threshold_ms(),
             wb_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
+            wb_account_concurrency_limit: default_account_concurrency_limit(),
+            wb_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             wb_enabled_uids: Vec::new(),
             wb_group_ids: Vec::new(),
+            qoder_enabled: false,
+            qoder_hedge_threshold_ms: default_hedge_threshold_ms(),
+            qoder_sticky_enabled: false,
+            qoder_account_concurrency_limit: default_account_concurrency_limit(),
+            qoder_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            qoder_sticky_ttl_secs: default_sticky_ttl_secs(),
+            qoder_strategy: String::new(),
+            qoder_enabled_uids: Vec::new(),
+            qoder_group_ids: Vec::new(),
         }
     }
 }
