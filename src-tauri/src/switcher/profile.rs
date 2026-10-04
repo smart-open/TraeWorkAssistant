@@ -347,7 +347,10 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             graceful_wait_secs: 8,
             // 2026-10-02 收窄：IDE 全部进程均名为 "Qoder CN IDE"（安装目录仅此一个
             // exe，实测）；旧「壳进程 Qoder CN.exe」已被 Qoder Work 独立客户端接管。
-            // mac 无后缀形态同名（"Qoder CN IDE"），proc.rs strip_exe_suffix 天然兼容
+            // mac 实测（2026-10-05）：CFBundleExecutable="Qoder CN"，与 Work 本体同名
+            // ——映像名无法区分 IDE/Work，身份信号是 bundle 目录名（Qoder CN IDE.app
+            // vs Qoder CN.app）；切换若在 mac 放开需按 bundle 路径段区分进程
+            //（参照 commands/process.rs::mac_app_running）
             proc_names: &["Qoder CN IDE"],
             proc_patterns: &["Qoder CN IDE*"],
             exe_names: &["Qoder CN IDE.exe"],
@@ -359,9 +362,13 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             ],
             cb_global_storage_dir: None,
             icube_items: super::icube::QODER_IDE_ITEMS,
-            mac_supported: false, // mac 数据目录/白名单待真机实测（M-1 补侦察后放开）
+            // mac_supported 维持灰度（切换/快照恢复管线未实测放开）；数据目录与
+            // bundle id 已本机实测补录（2026-10-05）：mac_data_dir_guess 经 IDE 编译
+            // 产物 userData 解析函数（join(Application Support, nameShort="QoderCN")）
+            // 与 Work 数据目录实存双向证实
+            mac_supported: false,
             mac_data_dir_guess: Some("~/Library/Application Support/QoderCN"),
-            mac_bundle_ids: &[],
+            mac_bundle_ids: &["com.aliyun.lingma.ide"],
         },
         TargetApp::QoderWork => AppProfile {
             // 【跨平台审查 2026-10-03】ElectronRoot 布局快照管线
@@ -389,9 +396,12 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             ],
             cb_global_storage_dir: None,
             icube_items: &[],
-            mac_supported: false, // mac 数据目录待真机实测（M-1 补侦察后放开）
+            // mac_supported 维持灰度（切换/快照恢复管线未实测放开）；数据目录已本机
+            // 实测证实（2026-10-05：~/Library/Application Support/com.qodercn.app.stable
+            // 实存，根级 Cookies/Local State 布局），bundle id 实测补录
+            mac_supported: false,
             mac_data_dir_guess: Some("~/Library/Application Support/com.qodercn.app.stable"),
-            mac_bundle_ids: &[],
+            mac_bundle_ids: &["com.qodercn.app"],
         },
     }
 }

@@ -74,7 +74,7 @@ fn qoder_reset_catalog() -> &'static [(&'static str, &'static str, &'static str)
         ("session_storage", "Session Storage", "删除 Session Storage 目录（会话级 KV）"),
         ("shared_client_cache", "客户端身份四小件", "删除 SharedClientCache\\cache 下 id / machine_token.json / client.json / status.json（设备注册与激活状态）"),
         ("cli_auth", "CLI 数据目录", "删除 ~/.qoder-cn（R-3 侦察结论：当前无凭证落盘，清残留配置）"),
-        ("work_client", "Work 客户端会话", "删除 QoderWork（com.qodercn.app.stable）内 Local State 与 Network\\Cookies（客户端登录会话：qoderuid Cookie 及其解密密钥，删除后 Work 需重新登录）"),
+        ("work_client", "Work 客户端会话", "删除 QoderWork（com.qodercn.app.stable）内 Local State 与登录 Cookies（Windows 在 Network\\ 下、macOS 在数据根；解密密钥与会话成对删除，删除后 Work 需重新登录）"),
     ]
 }
 
@@ -113,7 +113,7 @@ fn remove_files(dir: &Path, names: &[&str]) -> Result<usize, String> {
 /// items 供关联项校验：machine_identity 删除 Local State 后残留 vscdb 登录密文
 /// 不可解，未勾选 vscdb_auth 时追加联动提示（不自动连带删除，保持用户勾选语义）
 fn run_reset_item(id: &str, items: &[String]) -> Result<String, String> {
-    let base = ide_data_dir().ok_or("无法解析 %APPDATA%（QoderCN 数据目录不可用）")?;
+    let base = ide_data_dir().ok_or("无法定位 Qoder IDE 数据目录")?;
     let gs = base.join("User").join("globalStorage");
     match id {
         "vscdb_auth" => {
@@ -141,10 +141,30 @@ fn run_reset_item(id: &str, items: &[String]) -> Result<String, String> {
             true => Ok("已删除 Local Storage\\leveldb".into()),
             false => Ok("目录不存在（跳过）".into()),
         },
-        "network_cookies" => match force_rmtree(&base.join("Network"))? {
-            true => Ok("已删除 Network 目录（Cookie）".into()),
-            false => Ok("目录不存在（跳过）".into()),
-        },
+        "network_cookies" => {
+            #[cfg(target_os = "macos")]
+            {
+                // mac（2026-10-05 实测，对齐 icube.rs ICUBE_ITEMS_MAC）：数据目录
+                // 无 Network/ 子目录，Chromium 根级会话文件为 Cookies/Cookies-journal/
+                // Network Persistent State（Windows 的 Dir("Network") 项的 mac 对应物）
+                let n = remove_files(
+                    &base,
+                    &["Cookies", "Cookies-journal", "Network Persistent State"],
+                )?;
+                Ok(if n > 0 {
+                    format!("已删除根级会话文件 {n}/3 个")
+                } else {
+                    "会话文件不存在（跳过）".into()
+                })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                match force_rmtree(&base.join("Network"))? {
+                    true => Ok("已删除 Network 目录（Cookie）".into()),
+                    false => Ok("目录不存在（跳过）".into()),
+                }
+            }
+        }
         "session_storage" => match force_rmtree(&base.join("Session Storage"))? {
             true => Ok("已删除 Session Storage 目录".into()),
             false => Ok("目录不存在（跳过）".into()),
@@ -159,25 +179,38 @@ fn run_reset_item(id: &str, items: &[String]) -> Result<String, String> {
                 true => Ok("已删除 ~/.qoder-cn".into()),
                 false => Ok("目录不存在（跳过）".into()),
             },
-            None => Ok("无法解析 %USERPROFILE%（跳过）".into()),
+            None => Ok("无法定位用户主目录（跳过）".into()),
         },
         // 疑点④：Work 登录会话清理——与 IDE 侧 machine_identity+network_cookies 同
         // 语义（解密密钥 + Cookie 库成对删除，残留密文不可解）；只清登录相关，
-        // 不整目录删除（userData 内含缓存/日志等非会话数据）
+        // 不整目录删除（userData 内含缓存/日志等非会话数据）。
+        // 会话数据平台分支（2026-10-05 实测）：Windows 在 Network/ 子目录；
+        // mac 在数据根（Cookies/Cookies-journal/Network Persistent State）——且 mac
+        // Cookies 解密密钥在 Keychain 而非 Local State，根级 Cookies 不删则登录
+        // 会话仍可解密存活（登出语义落空）
         "work_client" => match work_data_dir() {
             Some(d) => {
                 let n = remove_files(&d, &["Local State"])?;
-                let cookies = force_rmtree(&d.join("Network"))?;
-                if n == 0 && !cookies {
+                #[cfg(target_os = "macos")]
+                let session = {
+                    let m = remove_files(
+                        &d,
+                        &["Cookies", "Cookies-journal", "Network Persistent State"],
+                    )?;
+                    m > 0
+                };
+                #[cfg(not(target_os = "macos"))]
+                let session = force_rmtree(&d.join("Network"))?;
+                if n == 0 && !session {
                     Ok("Work 会话文件不存在（跳过）".into())
                 } else {
                     Ok(format!(
-                        "已删除 Work 客户端会话（Local State {n}/1，Network 目录{}）",
-                        if cookies { "已删" } else { "不存在" }
+                        "已删除 Work 客户端会话（Local State {n}/1，会话数据{}）",
+                        if session { "已删" } else { "不存在" }
                     ))
                 }
             }
-            None => Ok("无法解析 %APPDATA%（跳过）".into()),
+            None => Ok("无法定位 Work 数据目录（跳过）".into()),
         },
         _ => Err(format!("未知清理项: {id}")),
     }
@@ -208,7 +241,13 @@ pub fn qoder_env_reset_items() -> Vec<QoderResetItem> {
                 "storage_json" => in_gs("storage.json"),
                 "machine_identity" => in_base("machineid") || in_base("Local State") || in_base("Preferences"),
                 "local_storage" => base.as_ref().map(|b| b.join("Local Storage").join("leveldb").is_dir()).unwrap_or(false),
-                "network_cookies" => base.as_ref().map(|b| b.join("Network").is_dir()).unwrap_or(false),
+                "network_cookies" => base
+                    .as_ref()
+                    .map(|b| {
+                        // Windows=Network/ 子目录；mac=根级 Cookies（2026-10-05 实测）
+                        b.join("Network").is_dir() || b.join("Cookies").exists()
+                    })
+                    .unwrap_or(false),
                 "session_storage" => base.as_ref().map(|b| b.join("Session Storage").is_dir()).unwrap_or(false),
                 "shared_client_cache" => {
                     in_base("SharedClientCache")
@@ -219,7 +258,10 @@ pub fn qoder_env_reset_items() -> Vec<QoderResetItem> {
                 "cli_auth" => cli_dir().map(|d| d.is_dir()).unwrap_or(false),
                 "work_client" => work_data_dir()
                     .map(|d| {
-                        d.join("Network").join("Cookies").exists() || d.join("Local State").exists()
+                        // Windows=Network/Cookies；mac=根级 Cookies（2026-10-05 实测）
+                        d.join("Local State").exists()
+                            || d.join("Cookies").exists()
+                            || d.join("Network").join("Cookies").exists()
                     })
                     .unwrap_or(false),
                 _ => false,

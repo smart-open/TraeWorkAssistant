@@ -303,16 +303,24 @@ fn work_body_installed() -> bool {
         .unwrap_or(false)
 }
 
-/// IDE exe 候选：settings.qoder_ide_path 人工指定优先，否则默认安装布局。
-/// 实测（2026-09-30，Qoder CN 0.4.3 起 IDE 与 Work 拆分安装目录）：
+/// mac 应用检索根（与 icube_auth::mac_app_version / env 定位链同源双根）
+#[cfg(target_os = "macos")]
+fn mac_app_bases() -> Vec<PathBuf> {
+    let mut bases = vec![PathBuf::from("/Applications")];
+    let home = crate::platform::home_dir();
+    if !home.as_os_str().is_empty() {
+        bases.push(home.join("Applications"));
+    }
+    bases
+}
+
+/// IDE exe 候选：settings.qoder_ide_path 人工指定优先，否则按平台默认安装布局。
+/// Windows 实测（2026-09-30，Qoder CN 0.4.3 起 IDE 与 Work 拆分安装目录）：
 /// 真 IDE = `%LOCALAPPDATA%\Programs\Qoder CN IDE\Qoder CN IDE.exe`（VS Code fork），
 /// `Programs\Qoder CN\Qoder CN.exe` 已是 Work 本体（Electron），仅作旧版一体化形态兼容；
 /// `.qoder-versions\<ver>\` 形态为国际版布局，一并保留兼容。
-/// macOS 适配预留：候选顺序逻辑（手动路径 > 拆分形态 > 旧版 > 版本化目录）跨平台通用，
-/// 仅路径字面量需按平台分支——预期 macOS 候选为
-/// `/Applications/Qoder CN IDE.app/Contents/MacOS/Qoder CN IDE`（Electron 可执行名
-/// 需实测确认），`.qoder-versions` 版本化目录如存在则同构复用；建议本函数内部
-/// `#[cfg]` 分平台返回候选表，签名与消费方（qoder_env_check/open_ide）不变。
+/// macOS 实装（2026-10-05 实测）：候选为 /Applications、~/Applications 双根下的
+/// `Qoder CN IDE.app`（bundle 目录本身，消费方全链路按 bundle 工作，见函数内注释）。
 pub(crate) fn ide_exe_candidates(state: &AppState) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(p) = state.settings().qoder_ide_path.as_deref() {
@@ -327,28 +335,42 @@ pub(crate) fn ide_exe_candidates(state: &AppState) -> Vec<PathBuf> {
             }
         }
     }
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let programs = PathBuf::from(&local).join("Programs");
-        // 0.4.3+ 拆分形态：真 IDE 独立目录
-        out.push(
-            programs
-                .join("Qoder CN IDE")
-                .join("Qoder CN IDE.exe"),
-        );
-        // 旧版一体化形态：Programs\Qoder CN\Qoder CN.exe（现已是 Work 本体，兜底）
-        let base = programs.join("Qoder CN");
-        out.push(base.join("Qoder CN.exe"));
-        // 国际版形态：.qoder-versions\<ver>\Qoder CN.exe（版本化目录枚举，最多 4 个）
-        if let Ok(entries) = std::fs::read_dir(base.join(".qoder-versions")) {
-            let mut vers: Vec<PathBuf> = entries
-                .into_iter()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
-            vers.sort();
-            for v in vers.into_iter().rev().take(4) {
-                out.push(v.join("Qoder CN.exe"));
+    #[cfg(target_os = "macos")]
+    {
+        // mac 实装（2026-10-05 实测）：安装形态为 /Applications（或 ~/Applications）
+        // 下 Qoder CN IDE.app（VS Code fork，bundle id com.aliyun.lingma.ide）。
+        // 候选返回 bundle 目录本身：exists() 判定、open 直启（spawn_first_existing
+        // mac 分支）、version_of（.app 上溯读 CFBundleShortVersionString）全链路按
+        // bundle 工作；旧版一体化/.qoder-versions 版本化目录为 Windows 布局，无对应形态
+        for base in mac_app_bases() {
+            out.push(base.join("Qoder CN IDE.app"));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let programs = PathBuf::from(&local).join("Programs");
+            // 0.4.3+ 拆分形态：真 IDE 独立目录
+            out.push(
+                programs
+                    .join("Qoder CN IDE")
+                    .join("Qoder CN IDE.exe"),
+            );
+            // 旧版一体化形态：Programs\Qoder CN\Qoder CN.exe（现已是 Work 本体，兜底）
+            let base = programs.join("Qoder CN");
+            out.push(base.join("Qoder CN.exe"));
+            // 国际版形态：.qoder-versions\<ver>\Qoder CN.exe（版本化目录枚举，最多 4 个）
+            if let Ok(entries) = std::fs::read_dir(base.join(".qoder-versions")) {
+                let mut vers: Vec<PathBuf> = entries
+                    .into_iter()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                vers.sort();
+                for v in vers.into_iter().rev().take(4) {
+                    out.push(v.join("Qoder CN.exe"));
+                }
             }
         }
     }
@@ -356,10 +378,11 @@ pub(crate) fn ide_exe_candidates(state: &AppState) -> Vec<PathBuf> {
 }
 
 /// IDE 数据目录（M0 实测修正：Windows=`%APPDATA%\QoderCN`，与 switcher Qoder 档案
-/// data_dir 同源）。macOS 实装（2026-10-05 合并审查）：Electron userData 惯例
-/// `~/Library/Application Support/QoderCN`，经 platform 基根收口（与 profile.rs
-/// roaming_dir("QoderCN") 同源）——目录名待真机实测确认前仅影响环境检测/重置展示，
-/// 不影响切换灰度（Qoder mac_supported=false）
+/// data_dir 同源）。macOS 实装（2026-10-05 合并审查 + 本机实测证实）：
+/// `~/Library/Application Support/QoderCN`——IDE 编译产物 main.js 的 userData 解析
+/// 函数 PP() 按 `join(getAppDataPath(), product.nameShort="QoderCN")` 取值（与
+/// Windows 同名不同根），经 platform 基根收口（与 profile.rs roaming_dir("QoderCN")
+/// 同源）；目录尚未出现在本机仅因 IDE 未启动过，不影响切换灰度（mac_supported=false）
 pub(crate) fn ide_data_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -379,13 +402,12 @@ pub(crate) fn ide_data_dir() -> Option<PathBuf> {
     }
 }
 
-/// QoderWork exe 候选：settings.qoderwork_path 人工指定优先，否则默认安装布局。
-/// 实测（2026-09-30，0.4.3）：Work 本体 = `%LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe`
-/// （Electron，带 Launcher 转发能力）；`%LOCALAPPDATA%\Qoder CN\Qoder CN Launcher\` 为
-/// 旧版 Launcher 形态，保留兜底。
-/// macOS 适配预留：预期候选为 `/Applications/Qoder CN.app/Contents/MacOS/<可执行名>`
-/// （Electron 惯例；Launcher/state.ini targetVersion 逻辑为 Windows Launcher 特有，
-/// macOS 若无 Launcher 形态则直接回退 exe 版本探测，launcher_version 天然返回 None）
+/// Work exe 候选：settings.qoderwork_path 人工指定优先，否则按平台默认安装布局。
+/// Windows 实测（2026-09-30，0.4.3）：Work 本体 = `%LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe`
+/// （Electron，带 Launcher 转发能力），`%LOCALAPPDATA%\Qoder CN\Qoder CN Launcher\` 为
+/// 旧版 Launcher 形态兜底。macOS 实装（2026-10-05 实测）：/Applications、~/Applications
+/// 双根下 `Qoder CN.app`（bundle 目录本身）；无 Windows Launcher 形态，
+/// launcher_version 天然返回 None，版本号走 version_of 读 Info.plist。
 pub(crate) fn work_exe_candidates(state: &AppState) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(p) = state.settings().qoderwork_path.as_deref() {
@@ -405,19 +427,28 @@ pub(crate) fn work_exe_candidates(state: &AppState) -> Vec<PathBuf> {
             }
         }
     }
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        out.push(
-            PathBuf::from(&local)
-                .join("Programs")
-                .join("Qoder CN")
-                .join("Qoder CN.exe"),
-        );
-        out.push(
-            PathBuf::from(&local)
-                .join("Qoder CN")
-                .join("Qoder CN Launcher")
-                .join("Qoder CN Launcher.exe"),
-        );
+    #[cfg(target_os = "macos")]
+    {
+        for base in mac_app_bases() {
+            out.push(base.join("Qoder CN.app"));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            out.push(
+                PathBuf::from(&local)
+                    .join("Programs")
+                    .join("Qoder CN")
+                    .join("Qoder CN.exe"),
+            );
+            out.push(
+                PathBuf::from(&local)
+                    .join("Qoder CN")
+                    .join("Qoder CN Launcher")
+                    .join("Qoder CN Launcher.exe"),
+            );
+        }
     }
     out
 }
@@ -447,10 +478,18 @@ fn is_running() -> bool {
 
 #[cfg(not(windows))]
 fn is_running() -> bool {
-    // macOS 适配预留：占位恒 false（环境页「运行中」徽标恒灰、不阻断任何流程）。
-    // macOS 实装建议：改用 sysinfo crate（switcher/proc.rs 已用，跨平台）按映像名
-    // "Qoder CN IDE"（无 .exe 后缀形态）枚举，替换 tasklist 实现；或 pgrep -x 子进程。
-    false
+    // mac 实装（2026-10-05）：按 exe 路径 bundle 段检测（commands/process.rs
+    // mac_app_running，M-1 ⑥ 同款语义）——实测双客户端 CFBundleExecutable 同名
+    // "Qoder CN"，映像名无法区分 IDE/Work，bundle 目录名才是身份信号
+    #[cfg(target_os = "macos")]
+    {
+        crate::commands::process::mac_app_running(&["Qoder CN IDE"])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // 其余平台占位：恒 false（不阻断任何流程）
+        false
+    }
 }
 
 #[cfg(windows)]
@@ -461,9 +500,16 @@ fn work_running() -> bool {
 
 #[cfg(not(windows))]
 fn work_running() -> bool {
-    // macOS 适配预留：占位恒 false（同 is_running 注释；sysinfo/pgrep 实装即可，
-    // 进程名预期为 "Qoder CN"——精确匹配防误伤 IDE 进程，语义与 Windows 一致）
-    false
+    // mac 实装（2026-10-05）：Work 本体 = Qoder CN.app（bundle 段检测，与 IDE 的
+    // Qoder CN IDE.app 区分；两 exe 同名 "Qoder CN"，映像名比对不可行）
+    #[cfg(target_os = "macos")]
+    {
+        crate::commands::process::mac_app_running(&["Qoder CN"])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 /// QoderWork 真实产品版本：Launcher exe 本体未打版本号（ProductVersion 恒 0.0.0），
@@ -540,6 +586,19 @@ fn spawn_first_existing(candidates: Vec<PathBuf>, display: &str) -> Result<(), S
         .into_iter()
         .find(|p| p.exists())
         .ok_or_else(|| format!("未检测到 {display} 客户端，请先安装或在「环境配置」手动指定路径"))?;
+    // mac（2026-10-05 实装）：候选为 .app bundle（目录）时须走 LaunchServices `open`
+    // 直启（对齐 env.rs::launch_buddy）——Command::new 直接 exec 目录会因不可执行
+    // 而失败；手动路径指向 bundle 内裸二进制时仍走直接 spawn
+    #[cfg(target_os = "macos")]
+    let is_bundle = exe.is_dir() && exe.extension().map(|e| e == "app").unwrap_or(false);
+    #[cfg(target_os = "macos")]
+    if is_bundle {
+        crate::platform::cmd::sys_command("open")
+            .arg(&exe)
+            .spawn()
+            .map_err(|e| format!("启动 {display} 失败: {e}"))?;
+        return Ok(());
+    }
     Command::new(&exe)
         .spawn()
         .map_err(|e| format!("启动 {display} 失败: {e}"))?;
