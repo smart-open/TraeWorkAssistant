@@ -392,6 +392,81 @@ fn claim_one(
     )
 }
 
+// ── 已知每日活动兜底直领 ────────────────────────────────────────────────────
+//
+// 根因（探针 probe_sash_campaigns_headers 实证）：campaigns 列表端点对工具
+// 请求形态按投放条件过滤 CLAIMABLE 条目（已领 grant 无条件展示），工具全天
+// 看不到 CLAIMABLE → list_claimable 恒空 → 误报「无可领活动」；而 claim 端点
+// 不受列表过滤约束（幂等，重复领取返回 replayed=true 回放）。故列表零
+// CLAIMABLE 时对下表盲发直领兜底。
+/// 已知每日活动常量表：(campaignId, 展示名)。campaignId 仅允许 [A-Za-z0-9_-]
+///（路径安全白名单，known_daily_fallback 内强制校验）。
+const KNOWN_DAILY_CAMPAIGNS: &[(&str, &str)] = &[
+    ("01a0f1cc-d06c-7d4c-8ea0-4b52b24e94a5", "每日领 100 Credits"),
+];
+
+/// 列表零 CLAIMABLE 时的已知每日活动盲发直领（严格判定，不复用 claim_one
+/// 的 200 宽容成功分支——盲发响应形态已探针锁定，必须显式确认）：
+/// - `200 && status=CLAIMED && replayed=false` → success（真实新领取，兜底目标）
+/// - `200 && status=CLAIMED && replayed=true`  → 忽略（幂等回放，今日已领）
+/// - `200` 其它形态 / 4xx / 5xx（如投放未覆盖 RISK_DEPENDENCY_UNAVAILABLE）
+///   / 网络异常 → 忽略该条（维持 already 语义，不误报不刷错）
+/// - `401` → auth（中断遍历，走 process_account 的 401 重试自愈）
+/// 返回 None 表示无任何新领取（调用方维持 already）。
+fn known_daily_fallback(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+) -> Option<(String, String, Option<f64>)> {
+    let mut kind = String::new();
+    let mut messages: Vec<String> = Vec::new();
+    let mut reward: Option<f64> = None;
+    for (cid, cname) in KNOWN_DAILY_CAMPAIGNS {
+        // 路径安全防线：常量表手滑引入非法字符时拒绝该条（与 claim_one 同白名单）
+        if cid.is_empty()
+            || !cid.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            continue;
+        }
+        let url = format!(
+            "{}/sash/api/v1/me/campaigns/{cid}/claim",
+            qoder_common::OPEN_API_BASE
+        );
+        jitter_sleep();
+        let (status, body, _raw) = post_empty(agent, &url, headers);
+        if status == 401 {
+            // auth 中断：已累计的真实奖励不丢弃（对齐 claim_one auth 语义）
+            return Some((
+                "auth".into(),
+                "登录态失效（401）".into(),
+                reward,
+            ));
+        }
+        let claimed = body
+            .as_ref()
+            .and_then(|b| fs_utils::dig(b, &["status", "data.status"]))
+            .map(|v| s_of(Some(v)).to_ascii_uppercase());
+        let replayed = body
+            .as_ref()
+            .and_then(|b| fs_utils::dig(b, &["replayed", "data.replayed"]))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if status == 200 && claimed.as_deref() == Some("CLAIMED") && !replayed {
+            let amt = body
+                .as_ref()
+                .and_then(|b| b.get("benefit"))
+                .and_then(|x| x.get("amount"))
+                .and_then(|v| num_or_none(Some(v)));
+            kind = merge_claim_kind(&kind, "success");
+            messages.push(format!("{cname}（盲发直领）"));
+            if let Some(a) = amt {
+                reward = Some(reward.unwrap_or(0.0) + a);
+            }
+        }
+        // 其余形态（回放/5xx/4xx/网络异常）静默忽略，继续尝试下一条
+    }
+    (kind == "success").then(|| (kind, messages.join("；"), reward))
+}
+
 /// 处理单账号签到（含 401 刷新一次重试，禁二次刷新）。返回 account 事件（不含 index）。
 fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &QoderCheckinOpts) -> Value {
     let aid = s_of(acct.get("id"));
@@ -448,8 +523,13 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
     let (mut kind, mut message, mut reward) = match list_claimable(agent, &headers, &urls) {
         Ok(claimable) => {
             if claimable.is_empty() {
-                // 全部 CLAIMED：视为已签（幂等语义，非错误）
-                ("already".into(), "无可领活动（均已领取）".into(), None)
+                // 列表零 CLAIMABLE：campaigns 列表对工具请求形态按投放过滤
+                // CLAIMABLE 条目（已领 grant 无条件展示）——先盲发已知每日
+                // 活动兜底直领，无新领取才维持 already（幂等语义，非错误）
+                match known_daily_fallback(agent, &headers) {
+                    Some(t) => t,
+                    None => ("already".into(), "无可领活动（均已领取）".into(), None),
+                }
             } else {
                 let mut kind = String::new();
                 let mut auth_msg = String::new();
@@ -519,7 +599,11 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                 let retry = match list_claimable(agent, &headers, &urls) {
                     Ok(claimable) => {
                         if claimable.is_empty() {
-                            ("already".into(), "无可领活动（均已领取）".into(), None)
+                            // 与首次路径同口径：列表零 CLAIMABLE 先盲发兜底直领
+                            match known_daily_fallback(agent, &headers) {
+                                Some(t) => t,
+                                None => ("already".into(), "无可领活动（均已领取）".into(), None),
+                            }
                         } else {
                             // kind 空串起步（对照首次路径）：全部 claim 失败时应判 fail
                             // 而非误标 already（成功才覆写 success，否则取首个非成功 kind）
@@ -788,5 +872,140 @@ mod tests {
         let u = urls_for();
         assert!(u.campaigns.starts_with(qoder_common::OPEN_API_BASE));
         assert!(u.campaigns.contains("/sash/api/v1/me/campaigns"));
+    }
+
+    /// 兜底常量表 campaignId 路径安全（与 claim_one 同白名单 [A-Za-z0-9_-]）：
+    /// 非法字符会改变 claim URL 路径语义，must 在表内即被拦下
+    #[test]
+    fn known_daily_campaigns_ids_path_safe() {
+        assert!(!KNOWN_DAILY_CAMPAIGNS.is_empty());
+        for (cid, cname) in KNOWN_DAILY_CAMPAIGNS {
+            assert!(
+                !cid.is_empty()
+                    && cid
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "KNOWN_DAILY_CAMPAIGNS 含非法 campaignId：{cid}"
+            );
+            assert!(!cname.is_empty(), "KNOWN_DAILY_CAMPAIGNS 条目缺展示名：{cid}");
+        }
+    }
+
+    // ── sash campaigns 视图分桶探针（#[ignore]：cargo test probe_sash_campaigns -- --ignored --nocapture）──
+    // 背景：2026-10-05 每日 100 积分活动（act-20260930-295）客户端 CLAIMABLE 期间
+    //（proxy 抓包 10:14-10:15 确认，10:15:17 才被客户端首次领取 replayed:false），
+    // 工具三轮报 already——收到的是非空 campaigns 数组但零 CLAIMABLE
+    //（empty_campaigns 诊断日志未触发）。工具 ureq 直连不经进程内代理，其响应无法
+    // 从 proxy 日志观察。本探针用池账号真凭证分别以「工具当前头」与「补齐客户端
+    // 形态头」请求 campaigns，对比响应 uid / 顶层 claimable / 各条 claimStatus，
+    // 锁定服务端按请求头（Cosy-Version/设备头族）或凭证形态分桶隐藏活动的证据。
+    // 注意：应用运行时 vault 快照可能被锁，凭证读取降级为空（探针跳过该账号）。
+
+    /// 补齐客户端形态的设备头族（抓包 2026-10-05 10:14 客户端头逐项对齐；
+    /// MachineCode/MachineType/Hostname 无真值时用占位——服务端若校验配对即拒绝，
+    /// 拒绝本身也是证据）
+    fn probe_full_client_headers(base: &[(String, String)]) -> Vec<(String, String)> {
+        let has = |h: &[(String, String)], k: &str| {
+            h.iter().any(|(a, _)| a.eq_ignore_ascii_case(k))
+        };
+        let mut h = base.to_vec();
+        for (k, v) in [
+            ("Cosy-Version", "0.4.3"),
+            ("Cosy-MachineOS", "x86_64_win32"),
+            ("Cosy-MachineHostname", "probe-host"),
+            ("Cosy-MachineCode", "0000000000000000000"),
+            ("Cosy-MachineType", "000000000000000000"),
+        ] {
+            if !has(&h, k) {
+                h.push((k.to_string(), v.to_string()));
+            }
+        }
+        h
+    }
+
+    fn print_campaigns_view(tag: &str, status: u16, body: Option<&Value>, raw: &str) {
+        println!("[{tag}] HTTP {status}");
+        match body {
+            Some(b) => {
+                println!(
+                    "  uid = {}, top_claimable = {:?}",
+                    b.get("uid").and_then(Value::as_str).unwrap_or("<none>"),
+                    b.get("claimable")
+                );
+                match b.get("campaigns").and_then(Value::as_array) {
+                    Some(arr) if !arr.is_empty() => {
+                        for c in arr {
+                            println!(
+                                "  campaign {} key={} action={} status={} amount={:?}",
+                                c.get("campaignId").and_then(Value::as_str).unwrap_or("?"),
+                                c.get("campaignKey").and_then(Value::as_str).unwrap_or("?"),
+                                c.get("actionType").and_then(Value::as_str).unwrap_or("?"),
+                                c.get("claimStatus").and_then(Value::as_str).unwrap_or("?"),
+                                c.get("benefit").and_then(|x| x.get("amount")),
+                            );
+                        }
+                    }
+                    Some(_) => println!("  <campaigns 空数组>"),
+                    None => println!("  <campaigns 键缺失> head={}", &raw[..raw.len().min(200)]),
+                }
+            }
+            None => println!("  <非 JSON> {}", &raw[..raw.len().min(300)]),
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_sash_campaigns_headers() {
+        let state = crate::state::AppState::new().expect("构造 AppState 失败");
+        let agent = crate::tasks::http_agent(30);
+        let urls = urls_for();
+        let pool = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
+        let accounts = pool
+            .get("accounts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(!accounts.is_empty(), "Qoder 账号池为空");
+        for a in &accounts {
+            let acct_id = a.get("id").and_then(Value::as_str).unwrap_or("?").to_string();
+            let (creds, _r, note) = qoder_common::ensure_fresh(&state, &agent, &acct_id, 24);
+            println!("===== acct {acct_id} ensure_fresh={note}");
+            if creds.access_token.is_empty() {
+                println!("  <无可用凭证（vault 被锁或池空），跳过>");
+                continue;
+            }
+            println!(
+                "  stored_uid = {}, token_prefix = {}, machine_id = {}, has_machine_token = {}",
+                creds.uid,
+                &creds.access_token[..creds.access_token.len().min(6)],
+                creds.machine_id,
+                !creds.machine_token.is_empty(),
+            );
+            // A 组：工具现状头（build_auth_headers 原样）
+            let (st, body, raw) =
+                qoder_common::get_json(&agent, &urls.campaigns, &qoder_common::build_auth_headers(&creds));
+            print_campaigns_view("A 工具现状头", st, body.as_ref(), &raw);
+            // B 组：补齐客户端形态头
+            let full = probe_full_client_headers(&qoder_common::build_auth_headers(&creds));
+            let (st2, body2, raw2) = qoder_common::get_json(&agent, &urls.campaigns, &full);
+            print_campaigns_view("B 补齐客户端头", st2, body2.as_ref(), &raw2);
+            // C 组：盲发幂等 claim 实测（每日活动 campaignId，抓包/探针双源确认）——
+            // 已领账号应回放 replayed:true；列表不可见账号若 200+CLAIMED 证明 claim
+            // 不受列表过滤约束（兜底直领可行），4xx 则锁定错误体形态
+            let cid = "01a0f1cc-d06c-7d4c-8ea0-4b52b24e94a5";
+            let c_url = format!(
+                "{}/sash/api/v1/me/campaigns/{cid}/claim",
+                qoder_common::OPEN_API_BASE
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let (st3, body3, raw3) =
+                post_empty(&agent, &c_url, &qoder_common::build_auth_headers(&creds));
+            println!(
+                "[C 盲发claim {cid}] HTTP {st3} body={}",
+                body3.as_ref().map(|b| b.to_string()).unwrap_or_else(|| {
+                    raw3.chars().take(300).collect()
+                })
+            );
+        }
     }
 }
