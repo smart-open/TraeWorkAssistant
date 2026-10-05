@@ -782,9 +782,9 @@ fn max_mode_for(pool: TargetPool, sources: &ModelSources) -> bool {
 // ==================== 会话池粘性（§4.4，内存态） ====================
 
 // 池粘性 TTL 兜底值（秒）：软粘防抖动，重启即清不落盘；
-// 实际 TTL 读 ApiSharedState.pool_sticky_ttl_secs（F-76② 可配置，默认 300s
-// ——上游对同上下文有 prefill 缓存收益，粘性命中 = 缓存命中；
-// docker 轻量版保持全池单一 TTL 配置，不做 per-pool 三字段拆分）
+// 实际 TTL 按胜出池读 ApiSharedState 三个 per-pool 原子量（trae/wb/qoder
+// _pool_sticky_ttl_secs，F-76② 可配置，默认 300s——上游对同上下文有
+// prefill 缓存收益，粘性命中 = 缓存命中）
 // （默认值由 default_pool_sticky_ttl_secs() 提供，无需独立常量）
 
 /// 取出池粘性绑定（命中后移除过期项；命中项由调用方决定是否续期）
@@ -796,12 +796,26 @@ fn take_sticky(state: &Arc<ApiSharedState>, key: &str) -> Option<TargetPool> {
     map.get(key).map(|(p, _)| *p)
 }
 
-/// 记录/续期池粘性绑定（TTL 取可配置值，F-76②）
+/// 池粘性 TTL 按胜出池取值（per-pool 三参数，F-76② 拆分版）：
+/// Custom 为自定义模型直达变体（parse("custom") 返回 None，实际不会被记录），
+/// 兜底取 Trae 值。
+///
+/// 命名区分（勿混淆）：`*_pool_sticky_ttl_secs` = 池粘性 TTL（本函数唯一
+/// 消费方，内存态 state.pool_sticky，重启即清）；`*_sticky_ttl_secs` = 显式
+/// 会话粘性 TTL（落库 sticky_bindings，经 set_explicit_ttl 热应用）——
+/// 两条链路独立，此处取 pool 变体是正确取值
+fn pool_sticky_ttl_secs(state: &ApiSharedState, pool: TargetPool) -> u64 {
+    let cell = match pool {
+        TargetPool::Trae | TargetPool::Custom => &state.trae_pool_sticky_ttl_secs,
+        TargetPool::Buddy => &state.wb_pool_sticky_ttl_secs,
+        TargetPool::Qoder => &state.qoder_pool_sticky_ttl_secs,
+    };
+    cell.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 记录/续期池粘性绑定（TTL 按胜出池的独立配置取值，F-76② per-pool）
 fn record_sticky(state: &Arc<ApiSharedState>, key: &str, pool: TargetPool) {
-    let ttl = state
-        .pool_sticky_ttl_secs
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .max(1) as i64;
+    let ttl = pool_sticky_ttl_secs(state, pool).max(1) as i64;
     let mut map = state.pool_sticky.lock().unwrap_or_else(|e| e.into_inner());
     map.insert(
         key.to_string(),
@@ -881,8 +895,13 @@ mod tests {
             wb_bg_downgrade: AtomicBool::new(false),
             wb_longctx_downgrade: AtomicBool::new(false),
             wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
-            account_concurrency_limit: std::sync::atomic::AtomicU32::new(0),
-            pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            trae_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            trae_sticky: super::super::wb_sticky::StickyStore::with_ns(
+                super::super::wb_sticky::TRAE_NS,
+            ),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(HashMap::new()),
             default_model: "deepseek-v4-flash".into(),

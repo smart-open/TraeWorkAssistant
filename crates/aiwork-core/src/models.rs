@@ -380,6 +380,10 @@ pub struct AccountCooldownsFile {
 /// API 池配置文件：api_pool.json
 #[derive(Serialize, Deserialize)]
 pub struct ApiPoolFile {
+    /// Trae 池参与调度开关（per-pool，默认开）：关闭后 Trae 目录模型不路由
+    /// Trae 池，仅 Trae 源模型显式报错（WbDisabled/QoderDisabled 同族语义）
+    #[serde(default = "default_pool_enabled")]
+    pub trae_enabled: bool,
     #[serde(default)]
     pub enabled_uids: Vec<String>,
     /// 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c
@@ -388,6 +392,9 @@ pub struct ApiPoolFile {
     /// Buddy 池调度策略（取值同上）；空 = 沿用 strategy（兼容旧数据两池同策略）
     #[serde(default)]
     pub wb_strategy: String,
+    /// Qoder 池调度策略（取值同上）；空 = 沿用 strategy（跟随 Trae 池，同 Buddy 语义）
+    #[serde(default)]
+    pub qoder_strategy: String,
     /// 参与调度的分组 id 列表；空 = 不限分组
     #[serde(default)]
     pub group_ids: Vec<String>,
@@ -410,16 +417,33 @@ pub struct ApiPoolFile {
     /// 向第二账号发对冲请求；0 = 关闭
     #[serde(default = "default_hedge_threshold_ms")]
     pub wb_hedge_threshold_ms: u64,
-    /// 账号并发上限（F-77）：inflight ≥ 上限的账号视为 busy 不参与候选，
-    /// 全部 busy 时降级取 inflight 最小者；0 = 不限（保持现状）
+    /// Trae 池账号并发上限（per-pool 三参数之一）：inflight ≥ 上限的账号视为
+    /// busy 不参与候选，全部 busy 时降级取 inflight 最小者；0 = 不限。
+    /// 旧版三池共用字段 account_concurrency_limit 已退役（serde 忽略旧 JSON 键，
+    /// 存量迁移见 load_pool_file_with_legacy_migration：仅 Buddy 池沿用旧共享值）
     #[serde(default = "default_account_concurrency_limit")]
-    pub account_concurrency_limit: u32,
-    /// 池粘性 TTL 秒（F-76②）：TTL 内同会话必落同一池同账号（上游 KV cache 复用）
+    pub trae_account_concurrency_limit: u32,
+    /// Trae 池粘性 TTL 秒（per-pool 三参数之一）：TTL 内同会话必落同一池同账号
+    ///（上游 KV cache 复用）；旧共用字段 pool_sticky_ttl_secs 已退役
     #[serde(default = "default_pool_sticky_ttl_secs")]
-    pub pool_sticky_ttl_secs: u64,
+    pub trae_pool_sticky_ttl_secs: u64,
+    /// Trae 池显式会话粘性 TTL 秒（per-pool 三参数之一）：显式 conversationId
+    /// 绑定账号的有效期（滚动续期），绑定落 sticky_bindings 表 "t:" 命名空间
+    #[serde(default = "default_sticky_ttl_secs")]
+    pub trae_sticky_ttl_secs: u64,
+    /// Trae 池慢请求竞速对冲阈值毫秒（F-76③ 同构）：流式首字节超阈值且有其他
+    /// 健康账号时向第二账号发对冲请求，先出首字者胜；0 = 关闭（默认 clamp 1s–8s）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub trae_hedge_threshold_ms: u64,
     /// WB 显式绑定 TTL 秒（F-76②；wb_sticky 会话粘性）：覆盖原 1800s 常量
     #[serde(default = "default_wb_sticky_ttl_secs")]
     pub wb_sticky_ttl_secs: u64,
+    /// Buddy 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub wb_account_concurrency_limit: u32,
+    /// Buddy 池粘性 TTL 秒（per-pool 三参数之一，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub wb_pool_sticky_ttl_secs: u64,
     /// Buddy 池入池白名单（wb- 前缀账号 id）：空 = 全部含凭证账号自动入池
     /// （fail-open，对齐 Buddy 页「含凭证账号参与 WB 上游调度」语义；修复 WB 池
     /// 因误用 Trae 共享白名单而恒空、Buddy 源永远 503 no_healthy_account 的问题）；
@@ -443,6 +467,16 @@ pub struct ApiPoolFile {
     /// Qoder 会话粘性开关（F-80-余 v2；qoder_sticky）：默认关（对齐 main）
     #[serde(default)]
     pub qoder_sticky_enabled: bool,
+    /// Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub qoder_account_concurrency_limit: u32,
+    /// Qoder 池粘性 TTL 秒（per-pool 三参数之一，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub qoder_pool_sticky_ttl_secs: u64,
+    /// Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800）：
+    /// 覆盖 qoder_sticky store 的 EXPLICIT_TTL_SECS 常量（旧版硬编码不可配）
+    #[serde(default = "default_sticky_ttl_secs")]
+    pub qoder_sticky_ttl_secs: u64,
     /// Qoder 池分组筛选（qoder_group_ids）：非空时仅纳入所选分组的 Qoder 账号
     /// （未分组账号不参与，对齐 Buddy 池 wb_group_ids 语义）；空 = 不限分组
     #[serde(default)]
@@ -467,15 +501,28 @@ fn default_wb_sticky_ttl_secs() -> u64 {
     1800
 }
 
+/// 显式会话粘性 TTL 默认值（Trae/Qoder 池 per-pool 三参数之一，与
+/// wb_sticky::EXPLICIT_TTL_SECS 30m 常量对齐）
+fn default_sticky_ttl_secs() -> u64 {
+    1800
+}
+
+/// Trae 池参与调度开关默认值：主池历史行为恒可用
+fn default_pool_enabled() -> bool {
+    true
+}
+
 /// Default 与 serde default 对齐（derive Default 的数值字段会落 0，与旧版
-/// api_pool.json 缺字段的语义不一致：F-76③ 对冲默认 15s、F-77 并发默认 1、
+/// api_pool.json 缺字段的语义不一致：F-76③ 对冲默认 8s、F-77 并发默认 1、
 /// F-76② 池粘性 300s / 会话粘性 1800s）
 impl Default for ApiPoolFile {
     fn default() -> Self {
         Self {
+            trae_enabled: default_pool_enabled(),
             enabled_uids: Vec::new(),
             strategy: String::new(),
             wb_strategy: String::new(),
+            qoder_strategy: String::new(),
             group_ids: Vec::new(),
             wb_enabled: false,
             wb_default_thinking: false,
@@ -483,15 +530,22 @@ impl Default for ApiPoolFile {
             wb_bg_downgrade: false,
             wb_longctx_downgrade: false,
             wb_hedge_threshold_ms: default_hedge_threshold_ms(),
-            account_concurrency_limit: default_account_concurrency_limit(),
-            pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            trae_account_concurrency_limit: default_account_concurrency_limit(),
+            trae_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            trae_sticky_ttl_secs: default_sticky_ttl_secs(),
+            trae_hedge_threshold_ms: default_hedge_threshold_ms(),
             wb_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
+            wb_account_concurrency_limit: default_account_concurrency_limit(),
+            wb_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             wb_enabled_uids: Vec::new(),
             wb_group_ids: Vec::new(),
             qoder_enabled: true,
             qoder_enabled_uids: Vec::new(),
             qoder_hedge_threshold_ms: 0,
             qoder_sticky_enabled: false,
+            qoder_account_concurrency_limit: default_account_concurrency_limit(),
+            qoder_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            qoder_sticky_ttl_secs: default_sticky_ttl_secs(),
             qoder_group_ids: Vec::new(),
         }
     }

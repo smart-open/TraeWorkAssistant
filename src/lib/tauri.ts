@@ -424,28 +424,44 @@ export const api = {
         wbLongctxDowngrade?: boolean;
         /** F-76③ 竞速对冲阈值毫秒（0 = 关闭） */
         wbHedgeThresholdMs?: number;
-        /** F-77 账号并发上限（0 = 不限） */
-        accountConcurrencyLimit?: number;
-        /** F-76② 池粘性 TTL 秒 */
-        poolStickyTtlSecs?: number;
-        /** F-76② WB 会话粘性 TTL 秒 */
+        /** Trae 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        traeAccountConcurrencyLimit?: number;
+        /** Trae 池粘性 TTL 秒；null/未传 = 保留原值 */
+        traePoolStickyTtlSecs?: number;
+        /** Trae 池会话粘性 TTL 秒（显式 conversationId 绑定有效期）；null/未传 = 保留原值 */
+        traeStickyTtlSecs?: number;
+        /** Trae 池竞速对冲阈值毫秒（0 = 关闭）；null/未传 = 保留原值 */
+        traeHedgeThresholdMs?: number;
+        /** Buddy 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        wbAccountConcurrencyLimit?: number;
+        /** Buddy 池粘性 TTL 秒；null/未传 = 保留原值 */
+        wbPoolStickyTtlSecs?: number;
+        /** Buddy 会话粘性 TTL 秒；null/未传 = 保留原值 */
         wbStickyTtlSecs?: number;
+        /** Qoder 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        qoderAccountConcurrencyLimit?: number;
+        /** Qoder 池粘性 TTL 秒；null/未传 = 保留原值 */
+        qoderPoolStickyTtlSecs?: number;
+        /** Qoder 会话粘性 TTL 秒（显式 conversationId 绑定有效期）；null/未传 = 保留原值 */
+        qoderStickyTtlSecs?: number;
         /** Buddy 池入池白名单（wb- 前缀账号 id）；null/未传 = 保留原值（含旧数据迁移） */
         wbUids?: string[] | null;
         /** Buddy 池分组筛选；null/未传 = 保留原值，空数组 = 清空（不限分组） */
         wbGroupIds?: string[] | null;
-        // 审查 #17：qoderAccountConcurrencyLimit/qoderPoolStickyTtlSecs/qoderStickyTtlSecs
-        // 三个 per-pool 参数 docker 版 pool_set 后端不接收（不移植 per-pool 拆分），已撤除
         /** Qoder 上游开关（p3-3）；null/未传 = 保留原值 */
         qoderEnabled?: boolean;
         /** Qoder 竞速对冲阈值毫秒（F-80-余 v2，0 = 关闭）；null/未传 = 保留原值 */
         qoderHedgeThresholdMs?: number;
         /** Qoder 会话粘性开关（F-80-余 v2）；null/未传 = 保留原值 */
         qoderStickyEnabled?: boolean;
-        /** Qoder 池入池白名单（qoder- 账号 id）；null/未传 = 保留原值 */
+        /** Qoder 池入池白名单（qd- 账号 id）；null/未传 = 保留原值 */
         qoderUids?: string[];
         /** Qoder 池分组筛选；null/未传 = 保留原值 */
         qoderGroupIds?: string[];
+        /** Qoder 池内调度策略（空串 = 跟随 Trae 池）；null/未传 = 保留原值 */
+        qoderStrategy?: string;
+        /** Trae 池参与调度开关（默认开）；null/未传 = 保留原值 */
+        traeEnabled?: boolean;
       },
       wbStrategy?: string,
     ) =>
@@ -460,17 +476,24 @@ export const api = {
         wbBgDowngrade: wbFlags?.wbBgDowngrade ?? null,
         wbLongctxDowngrade: wbFlags?.wbLongctxDowngrade ?? null,
         wbHedgeThresholdMs: wbFlags?.wbHedgeThresholdMs ?? null,
-        accountConcurrencyLimit: wbFlags?.accountConcurrencyLimit ?? null,
-        poolStickyTtlSecs: wbFlags?.poolStickyTtlSecs ?? null,
+        traeAccountConcurrencyLimit: wbFlags?.traeAccountConcurrencyLimit ?? null,
+        traePoolStickyTtlSecs: wbFlags?.traePoolStickyTtlSecs ?? null,
+        traeStickyTtlSecs: wbFlags?.traeStickyTtlSecs ?? null,
+        traeHedgeThresholdMs: wbFlags?.traeHedgeThresholdMs ?? null,
+        wbAccountConcurrencyLimit: wbFlags?.wbAccountConcurrencyLimit ?? null,
+        wbPoolStickyTtlSecs: wbFlags?.wbPoolStickyTtlSecs ?? null,
         wbStickyTtlSecs: wbFlags?.wbStickyTtlSecs ?? null,
-        // 审查 #17：qoderAccountConcurrencyLimit/qoderPoolStickyTtlSecs/qoderStickyTtlSecs
-        // 不再发送——docker 版 pool_set 后端不接收（不移植 per-pool 拆分）
+        qoderAccountConcurrencyLimit: wbFlags?.qoderAccountConcurrencyLimit ?? null,
+        qoderPoolStickyTtlSecs: wbFlags?.qoderPoolStickyTtlSecs ?? null,
+        qoderStickyTtlSecs: wbFlags?.qoderStickyTtlSecs ?? null,
         wbUids: wbFlags?.wbUids ?? null,
         qoderEnabled: wbFlags?.qoderEnabled ?? null,
         qoderHedgeThresholdMs: wbFlags?.qoderHedgeThresholdMs ?? null,
         qoderStickyEnabled: wbFlags?.qoderStickyEnabled ?? null,
         qoderUids: wbFlags?.qoderUids ?? null,
         qoderGroupIds: wbFlags?.qoderGroupIds ?? null,
+        qoderStrategy: wbFlags?.qoderStrategy ?? null,
+        traeEnabled: wbFlags?.traeEnabled ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
@@ -650,9 +673,10 @@ export const api = {
     accountRefreshToken: (accountId: string) =>
       invoke<QoderAccountView>('qoder_account_refresh_token', { accountId }),
     /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done）。
+     *  同步返回授权页链接：前端在点击手势内 window.open 自动打开（Web 化替代桌面 open_in_browser）。
      *  compat=true = 兼容模式（授权 URL 不带 client_id）：官方 client_id 常量被
      *  Qoder 轮换导致授权页「参数无效」时的降级链路；前端在授权超时后自动切换重试 */
-    oauthLogin: (compat?: boolean) => invoke<void>('qoder_oauth_login', { compat: compat ?? null }),
+    oauthLogin: (compat?: boolean) => invoke<string>('qoder_oauth_login', { compat: compat ?? null }),
     /** 取消进行中的 OAuth 轮询（弹框「取消授权」）：后端置标志后轮询线程自行发失败终态 */
     oauthCancel: () => invoke<void>('qoder_oauth_cancel'),
     settingsGet: () => invoke<QoderSettings>('qoder_settings_get'),

@@ -244,15 +244,26 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let wb_bg_downgrade = opt_arg(&args, "wb_bg_downgrade")?;
             let wb_longctx_downgrade = opt_arg(&args, "wb_longctx_downgrade")?;
             let wb_hedge_threshold_ms = opt_arg(&args, "wb_hedge_threshold_ms")?;
-            let account_concurrency_limit = opt_arg(&args, "account_concurrency_limit")?;
-            let pool_sticky_ttl_secs = opt_arg(&args, "pool_sticky_ttl_secs")?;
+            let trae_account_concurrency_limit =
+                opt_arg(&args, "trae_account_concurrency_limit")?;
+            let trae_pool_sticky_ttl_secs = opt_arg(&args, "trae_pool_sticky_ttl_secs")?;
             let wb_sticky_ttl_secs = opt_arg(&args, "wb_sticky_ttl_secs")?;
+            let trae_sticky_ttl_secs = opt_arg(&args, "trae_sticky_ttl_secs")?;
+            let trae_hedge_threshold_ms = opt_arg(&args, "trae_hedge_threshold_ms")?;
+            let wb_account_concurrency_limit = opt_arg(&args, "wb_account_concurrency_limit")?;
+            let wb_pool_sticky_ttl_secs = opt_arg(&args, "wb_pool_sticky_ttl_secs")?;
+            let qoder_account_concurrency_limit =
+                opt_arg(&args, "qoder_account_concurrency_limit")?;
+            let qoder_pool_sticky_ttl_secs = opt_arg(&args, "qoder_pool_sticky_ttl_secs")?;
+            let qoder_sticky_ttl_secs = opt_arg(&args, "qoder_sticky_ttl_secs")?;
             let wb_uids = opt_arg(&args, "wb_uids")?;
             let qoder_enabled = opt_arg(&args, "qoder_enabled")?;
             let qoder_hedge_threshold_ms = opt_arg(&args, "qoder_hedge_threshold_ms")?;
             let qoder_sticky_enabled = opt_arg(&args, "qoder_sticky_enabled")?;
             let qoder_uids = opt_arg(&args, "qoder_uids")?;
             let qoder_group_ids = opt_arg(&args, "qoder_group_ids")?;
+            let qoder_strategy = opt_arg(&args, "qoder_strategy")?;
+            let trae_enabled = opt_arg(&args, "trae_enabled")?;
             api_server_cmd::pool_set(
                 state,
                 uids,
@@ -266,15 +277,24 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
                 wb_bg_downgrade,
                 wb_longctx_downgrade,
                 wb_hedge_threshold_ms,
-                account_concurrency_limit,
-                pool_sticky_ttl_secs,
+                trae_account_concurrency_limit,
+                trae_pool_sticky_ttl_secs,
                 wb_sticky_ttl_secs,
+                trae_sticky_ttl_secs,
+                trae_hedge_threshold_ms,
+                wb_account_concurrency_limit,
+                wb_pool_sticky_ttl_secs,
+                qoder_account_concurrency_limit,
+                qoder_pool_sticky_ttl_secs,
+                qoder_sticky_ttl_secs,
                 wb_uids,
                 qoder_enabled,
                 qoder_hedge_threshold_ms,
                 qoder_sticky_enabled,
                 qoder_uids,
                 qoder_group_ids,
+                qoder_strategy,
+                trae_enabled,
             )
             .and_then(to_json)
         }

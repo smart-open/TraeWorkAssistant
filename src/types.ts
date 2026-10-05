@@ -252,9 +252,9 @@ export interface NotifyResult {
 export interface SchedulerTaskView {
   key: string;
   name: string;
-  /** 每日触发时刻 HH:MM */
+  /** 每日触发时刻 HH:MM；every6h 模式下为固定周期描述（如「每6小时」） */
   time: string;
-  /** 执行模式：daily（每日 HH:MM，默认）| hourly（每小时，仅看板同步类）| off（已关闭） */
+  /** 执行模式：daily（每日 HH:MM，默认）| hourly（每小时，仅看板同步类）| every6h（固定每 6 小时，时刻不可配）| off（已关闭） */
   mode?: string;
   /** 当前是否启用（用户开关 + 既有设置语义合成） */
   enabled: boolean;
@@ -428,6 +428,8 @@ export interface PoolStatus {
 }
 
 export interface ApiPoolFile {
+  /** Trae 池参与调度开关（默认开）：关闭后 Trae 目录模型不路由 Trae 池 */
+  trae_enabled?: boolean;
   enabled_uids: string[];
   /** 调度策略：expire_first（默认）/ credit_first / random（T10） */
   strategy?: string;
@@ -451,12 +453,20 @@ export interface ApiPoolFile {
   wb_enabled_uids?: string[];
   /** Buddy 池分组筛选（wb_group_ids）：非空 = 仅所选分组的 WB 账号参与调度；空 = 不限分组 */
   wb_group_ids?: string[];
-  /** 账号并发上限（F-77）：单账号在途请求数达到上限视为 busy；0 = 不限 */
-  account_concurrency_limit?: number;
-  /** 池粘性 TTL 秒（F-76②）：TTL 内同会话落同一池同账号（KV cache 复用） */
-  pool_sticky_ttl_secs?: number;
-  /** WB 显式会话粘性 TTL 秒（F-76②） */
+  /** Trae 池账号并发上限（F-77，per-pool 三参数之一）：单账号在途请求数达到上限视为 busy；0 = 不限。旧三池共用字段已退役，Trae 池按默认值 1 落地 */
+  trae_account_concurrency_limit?: number;
+  /** Trae 池粘性 TTL 秒（F-76②，per-pool 三参数之一）：TTL 内同会话落同一池同账号（KV cache 复用；默认 300） */
+  trae_pool_sticky_ttl_secs?: number;
+  /** Trae 池显式会话粘性 TTL 秒（per-pool 三参数之一）：显式 conversationId 绑定账号的有效期（默认 1800） */
+  trae_sticky_ttl_secs?: number;
+  /** Trae 池慢请求竞速对冲阈值毫秒：流式首字节超阈值时向第二账号发对冲请求，先出首字者胜；0 = 关闭（默认 8000） */
+  trae_hedge_threshold_ms?: number;
+  /** Buddy 池显式会话粘性 TTL 秒（F-76②，per-pool 三参数之一） */
   wb_sticky_ttl_secs?: number;
+  /** Buddy 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
+  wb_account_concurrency_limit?: number;
+  /** Buddy 池粘性 TTL 秒（per-pool 三参数之一，默认 300） */
+  wb_pool_sticky_ttl_secs?: number;
   /** Qoder 上游开关（p3-3）：开启后 Qoder 目录模型路由到 Qoder 账号池（默认关） */
   qoder_enabled?: boolean;
   /** Qoder 竞速对冲阈值毫秒（F-80-余 v2）：首字节超阈值向第二账号发对冲请求；0 = 关闭 */
@@ -469,7 +479,9 @@ export interface ApiPoolFile {
   qoder_pool_sticky_ttl_secs?: number;
   /** Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800；仅会话粘性开启时生效） */
   qoder_sticky_ttl_secs?: number;
-  /** Qoder 池入池白名单（qoder- 前缀账号 id）；空/缺省 = 全部含凭证账号自动入池 */
+  /** Qoder 池内调度策略；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  qoder_strategy?: string;
+  /** Qoder 池入池白名单（qd- 账号 id）；空 = fail-open 全部含凭证账号入池 */
   qoder_enabled_uids?: string[];
   /** Qoder 池分组筛选（qoder_group_ids）：非空 = 仅所选分组的 Qoder 账号参与调度；空 = 不限分组 */
   qoder_group_ids?: string[];

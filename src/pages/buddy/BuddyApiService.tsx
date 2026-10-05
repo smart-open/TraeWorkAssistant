@@ -53,9 +53,9 @@ const WB_FLAG_FIELDS: { key: 'wbEnabled' | 'wbDefaultThinking' | 'wbToolExec' | 
   },
 ];
 
-/** F-76②/③/F-77 数值参数（保存时写回 api_pool.json，服务运行中热生效） */
+/** F-76②/③/F-77 数值参数（保存时写回 api_pool.json，服务运行中热生效；per-pool 拆分后均为 Buddy 池专属） */
 const WB_PARAM_FIELDS: {
-  key: 'wbHedgeThresholdMs' | 'accountConcurrencyLimit' | 'poolStickyTtlSecs' | 'wbStickyTtlSecs';
+  key: 'wbAccountConcurrencyLimit' | 'wbPoolStickyTtlSecs' | 'wbStickyTtlSecs' | 'wbHedgeThresholdMs';
   label: string;
   desc: string;
   min: number;
@@ -64,16 +64,7 @@ const WB_PARAM_FIELDS: {
   unit: string;
 }[] = [
   {
-    key: 'wbHedgeThresholdMs',
-    label: '竞速对冲阈值',
-    desc: '流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；0 = 关闭（有效范围 1s–8s，与后端对齐）',
-    min: 0,
-    max: 8_000,
-    step: 500,
-    unit: 'ms',
-  },
-  {
-    key: 'accountConcurrencyLimit',
+    key: 'wbAccountConcurrencyLimit',
     label: '账号并发上限',
     desc: '单账号在途请求数达到上限即让位其他账号（全部 busy 时取负载最小者）；0 = 不限',
     min: 0,
@@ -82,7 +73,7 @@ const WB_PARAM_FIELDS: {
     unit: '并发',
   },
   {
-    key: 'poolStickyTtlSecs',
+    key: 'wbPoolStickyTtlSecs',
     label: '池粘性 TTL',
     desc: 'TTL 内同会话落同一账号（上游 KV cache 复用）',
     min: 0,
@@ -99,14 +90,23 @@ const WB_PARAM_FIELDS: {
     step: 60,
     unit: '秒',
   },
+  {
+    key: 'wbHedgeThresholdMs',
+    label: '竞速对冲阈值',
+    desc: '流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；0 = 关闭（有效范围 1s–8s，与后端对齐）',
+    min: 0,
+    max: 8_000,
+    step: 500,
+    unit: 'ms',
+  },
 ];
 
-/** 数值参数默认值（与后端 serde default 对齐：对冲 8s / 并发 1 / 池粘性 300s / 会话粘性 1800s） */
+/** 数值参数默认值（与后端 serde default 对齐：Buddy 并发 1 / Buddy 池粘性 300s / 会话粘性 1800s / 对冲 8s） */
 const WB_PARAM_DEFAULTS = {
-  wbHedgeThresholdMs: 8_000,
-  accountConcurrencyLimit: 1,
-  poolStickyTtlSecs: 300,
+  wbAccountConcurrencyLimit: 1,
+  wbPoolStickyTtlSecs: 300,
   wbStickyTtlSecs: 1800,
+  wbHedgeThresholdMs: 8_000,
 };
 
 export default function BuddyApiService() {
@@ -167,8 +167,10 @@ export default function BuddyApiService() {
         });
         setWbParams({
           wbHedgeThresholdMs: pf.wb_hedge_threshold_ms ?? WB_PARAM_DEFAULTS.wbHedgeThresholdMs,
-          accountConcurrencyLimit: pf.account_concurrency_limit ?? WB_PARAM_DEFAULTS.accountConcurrencyLimit,
-          poolStickyTtlSecs: pf.pool_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.poolStickyTtlSecs,
+          wbAccountConcurrencyLimit:
+            pf.wb_account_concurrency_limit ?? WB_PARAM_DEFAULTS.wbAccountConcurrencyLimit,
+          wbPoolStickyTtlSecs:
+            pf.wb_pool_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.wbPoolStickyTtlSecs,
           wbStickyTtlSecs: pf.wb_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.wbStickyTtlSecs,
         });
         // 空数组 = fail-open（全部自动入池）→ 视为未自定义，显示为全选
@@ -214,8 +216,8 @@ export default function BuddyApiService() {
           wbUids,
           wbGroupIds: [...wbPoolGroups],
           wbHedgeThresholdMs: wbParams.wbHedgeThresholdMs,
-          accountConcurrencyLimit: wbParams.accountConcurrencyLimit,
-          poolStickyTtlSecs: wbParams.poolStickyTtlSecs,
+          wbAccountConcurrencyLimit: wbParams.wbAccountConcurrencyLimit,
+          wbPoolStickyTtlSecs: wbParams.wbPoolStickyTtlSecs,
           wbStickyTtlSecs: wbParams.wbStickyTtlSecs,
         }),
         600,

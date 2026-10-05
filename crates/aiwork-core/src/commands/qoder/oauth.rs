@@ -71,7 +71,7 @@ pub fn qoder_oauth_login(
     state: &AppState,
     emit: QoderOauthEmitter,
     compat: Option<bool>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if OAUTH_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("已有 OAuth 登录在执行中，请等待完成".into());
     }
@@ -89,6 +89,7 @@ pub fn qoder_oauth_login(
     let state2 = state.clone();
     // flow 整体移交工作线程（nonce/verifier 会话一致性）
     // I17：命名线程；spawn 失败必须复位防重入标志，否则后续登录永久被拒
+    let auth_url_ret = auth_url.clone();
     let spawned = std::thread::Builder::new()
         .name("qoder-oauth".into())
         .spawn(move || {
@@ -186,7 +187,9 @@ pub fn qoder_oauth_login(
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
         return Err("OAuth 后台线程启动失败，请重试".into());
     }
-    Ok(())
+    // 同步返回授权页链接：前端在点击手势的 transient activation 窗口内 window.open
+    // 自行打开授权页（Web 化替代桌面版 open_in_browser；进度事件仍兜底下发同一链接）
+    Ok(auth_url_ret)
 }
 
 /// 取消进行中的 OAuth 轮询（弹框「取消授权」）：置标志后轮询线程自行收尾。

@@ -236,15 +236,22 @@ export default function SchedulerTasksCard({
                         <option value="hourly">每小时</option>
                       </select>
                     )}
-                    {t && !(HOURLY_TASKS.includes(key) && modes[key] === 'hourly') && (
-                      <input
-                        type="time"
-                        value={t.time}
-                        disabled={timeSaving === key}
-                        onChange={(e) => void saveTime(key, e.target.value)}
-                        className="w-[92px] rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-xs tabular-nums text-slate-600 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
-                        title="每日触发时刻（修改即时保存；留空恢复默认）"
-                      />
+                    {t && t.mode === 'every6h' ? (
+                      <Badge tone="violet" title="固定周期任务：每 6 小时自动执行一次，触发时刻不可配置">
+                        {t.time}
+                      </Badge>
+                    ) : (
+                      t &&
+                      !(HOURLY_TASKS.includes(key) && modes[key] === 'hourly') && (
+                        <input
+                          type="time"
+                          value={t.time}
+                          disabled={timeSaving === key}
+                          onChange={(e) => void saveTime(key, e.target.value)}
+                          className="w-[92px] rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-xs tabular-nums text-slate-600 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                          title="每日触发时刻（修改即时保存；留空恢复默认）"
+                        />
+                      )
                     )}
                     {times[key] && t?.time !== undefined && (
                       <button

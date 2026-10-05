@@ -244,9 +244,12 @@ export default function BuddyAccounts() {
     try {
       const scan = await withMinDelay(api.workbuddy.scanAuthFile(), 800);
       // 扫描成功但零条可导入（未登录 / 客户端退出登录后 auth 文件被清空，uid 为空或后端返回 null）：
-      // 明确 warn 反馈并终止，不打开空预览弹框
+      // 明确 warn 反馈并终止，不打开空预览弹框（Web/Docker 版需先在环境配置指定挂载的 auth 文件路径）
       if (!scan || !scan.uid) {
-        pushToast('warn', '未在本机发现有效登录凭证：请先在 WorkBuddy / CodeBuddy 客户端登录，再点击导入');
+        pushToast(
+          'warn',
+          '未发现有效登录凭证：请先在 WorkBuddy / CodeBuddy 客户端登录；Docker / 远端部署请先在「环境配置 → 本机 auth 文件」指定挂载进容器的 auth 文件路径',
+        );
         return;
       }
       // 旧后端仅回 exists=true（已在池中）→ 维持拦截；新后端另回 already_in_pool=true 时放行进入预览（保存将更新凭证）

@@ -6,6 +6,32 @@
 
 ---
 
+## [1.4.1] · 2026-10-05 · 资源调度 per-pool 拆分 + API 管理 Qoder 池绑定 + Web 化体验修复
+
+> 本轮无 main 移植内容（Qoder 池绑定等在 main/feat-qoder 均不存在，为 docker 分支三池结构下的自研对齐）；合并点维持 `main@9cdce69` 不变。
+
+### 新增
+
+- **资源调度参数 per-pool 拆分**（1.4.0 曾以「docker 后端无对应结构」跳过，本轮三池结构下完整落地）：
+  - `api_pool` 共享字段 `account_concurrency_limit` / `pool_sticky_ttl_secs` 退役，拆分为 Trae / Buddy / Qoder 三池独立参数组（账号并发上限、池粘性 TTL、显式会话粘性 TTL、竞速对冲阈值）；读取侧统一走 `load_pool_file_with_legacy_migration`——仅 Buddy 池沿用旧共享值（缺失回填、下次保存固化、幂等），Trae / Qoder 池落默认值（并发 1 / 池粘性 300s / 会话粘性 1800s / 对冲 8s）。
+  - Trae 池补齐：`trae_enabled` 参与调度开关（关闭后仅 Trae 源模型显式报错，Buddy/Qoder 不受影响）+ 慢请求竞速对冲（首字节超阈值向第二账号发对冲，先出首字者胜，`TraeHedgeLease` 管理在途计数防泄漏）+ 显式会话粘性（`t:` 命名空间 sticky_bindings，滚动续期）；Qoder 池显式会话粘性 TTL 由硬编码 1800s 改可配。
+  - 前端三页（Trae / Buddy / Qoder · 资源调度）per-pool 参数编辑面板（回显 / 校验 / 保存即热生效），Buddy 页参数键名同步 per-pool 化。
+- **API 管理 · Qoder 池绑定**（issue #25/#30 三池化）：子 Key 资源池绑定新增「Qoder 池」选项（新增表单 + 调度配置弹框，单选切换清空跨池勾选）；限定上游 / 专一候选跟随全局时合并三池展示（Qoder 徽标 amber 区分）；绑定 Qoder 但上游未启用时弹框内显式告警（提示将回退 Buddy/Trae 池）；混合白名单编码扩展 `qoder:` 前缀（后端 `parse_bind_pool` / `qoder_route` 约束链路 1.4.0 已就绪，本轮补前端）。
+- **Buddy 环境配置 · 本机 auth 文件路径**：`Settings.wb_auth_file_path` 暴露到环境配置页（Docker / 远端部署将宿主机客户端 auth 文件挂载进容器后填写容器内路径，「账号管理 → 扫描本机账号」从该文件读取；服务端 `wb_common` 人工指定优先逻辑既有）；扫描零凭证提示同步引导至该配置。
+
+### 修复
+
+- **Qoder OAuth 登录无法自动打开浏览器**：`qoder_oauth_login` 命令同步返回授权页 URL（桌面版 `open_in_browser` 的 Web 化等价——命令返值 + 前端在点击手势的 transient activation 窗口内 `window.open`，避免浏览器弹窗拦截）；被拦截时 toast 提示，弹框内授权链接改为可点击 `<a>`（进度事件兜底下发同一链接）。
+- **Qoder 凭证定时刷新误渲染时间输入框**：every6h 固定周期任务改渲染 violet 徽标（title 注明「固定每 6 小时执行、触发时刻不可配置」），不再展示无效 time input 引导用户误改。
+- **Buddy 概述残留客户端本机态区块**：移除「登录账号」「本机套餐」StatCard（依赖客户端本机 auth 在线判定，Web 版无数据源恒空），统计行 5 → 3 列。
+- **BuddySettings 全局设置调用路径错误**：`api.settingsGet/Set` 顶层误用 → `api.misc.settingsGet/Set`（tsc 拦截修正）。
+
+### 验证
+
+- `cargo test --workspace` 548 通过（536 + 12）· `npm test` 57 通过 · `npx tsc --noEmit` 0 错误。
+
+---
+
 ## [1.4.0] · 2026-10-05 · 移植 main Qoder 平台全链路 + 系统无关修复
 
 > **合并点记录**：移植范围 `main@1c29564`（**不含**）至 `main@c3f3211`，另含 `main@9cdce69`（Qoder 签到兜底直领）。**下次合并请从 `9cdce69` 之后接着移植**。手工语义移植、未经 merge。

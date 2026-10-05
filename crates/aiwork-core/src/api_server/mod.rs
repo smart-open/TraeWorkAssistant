@@ -69,12 +69,17 @@ pub struct ApiSharedState {
     /// 慢请求竞速对冲阈值毫秒（F-76③，0 = 关闭；默认 8000，运行时 clamp 1s–8s）：
     /// 流式首字节超过该阈值且池内有其他健康账号时向第二账号发对冲请求
     pub wb_hedge_threshold_ms: std::sync::atomic::AtomicU64,
-    /// 账号并发上限（F-77，0 = 不限；默认 1）：inflight ≥ 上限的账号视为 busy
-    /// 不参与候选，全部 busy 时降级取 inflight 最小者（不过载拒绝）
-    pub account_concurrency_limit: std::sync::atomic::AtomicU32,
-    /// 池粘性 TTL 秒（F-76②，默认 300）：TTL 内同会话必落同一池同账号，
-    /// 上游 KV cache 复用直接砍 prefill 时间
-    pub pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// Trae 池慢请求竞速对冲阈值毫秒（0 = 关闭；默认 8000，运行时 clamp 1s–8s），
+    /// 与 Buddy/Qoder 池互不共享
+    pub trae_hedge_threshold_ms: std::sync::atomic::AtomicU64,
+    /// 池粘性 TTL 秒（F-76② per-pool，默认 300）：TTL 内同会话必落同一池同账号，
+    /// 上游 KV cache 复用直接砍 prefill 时间。三池各自配置，record_sticky 按
+    /// 胜出池取对应值（旧版单字段三池共用已拆分）
+    pub trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// Buddy 池粘性 TTL 秒（per-pool，默认 300）
+    pub wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// Qoder 池粘性 TTL 秒（per-pool，默认 300）
+    pub qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
     /// Trae 池参与调度开关（api_pool.json.trae_enabled，默认开）：关闭后 Trae 目录
     /// 模型不路由 Trae 池（每个资源池管理自己的开关，与 wb_enabled/qoder_enabled 同族）
     pub trae_enabled: std::sync::atomic::AtomicBool,
@@ -101,6 +106,10 @@ pub struct ApiSharedState {
     /// Qoder 会话粘性存储（F-80-余 v2 移植）：与 wb_sticky 共用 sticky_bindings 表，
     /// 键命名空间 "q:" 隔离，互不串绑
     pub qoder_sticky: wb_sticky::StickyStore,
+    /// Trae 池会话粘性存储（per-pool 会话粘性批次新增）：与 wb/qoder sticky 共用
+    /// sticky_bindings 表，键命名空间 "t:" 隔离；会话→账号绑定供 Trae 取号粘住
+    ///（显式 conversationId / 消息指纹双模式，TTL 经 trae_sticky_ttl_secs 配置）
+    pub trae_sticky: wb_sticky::StickyStore,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
     /// 会话池粘性（统一网关 §4.4，内存态不落盘、重启即清）：
@@ -628,8 +637,11 @@ mod inflight_tests {
             wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_hedge_threshold_ms: AtomicU64::new(0),
-            account_concurrency_limit: std::sync::atomic::AtomicU32::new(0),
-            pool_sticky_ttl_secs: AtomicU64::new(0),
+            trae_hedge_threshold_ms: AtomicU64::new(0),
+            trae_pool_sticky_ttl_secs: AtomicU64::new(0),
+            wb_pool_sticky_ttl_secs: AtomicU64::new(0),
+            qoder_pool_sticky_ttl_secs: AtomicU64::new(0),
+            trae_sticky: wb_sticky::StickyStore::default(),
             wb_sticky: wb_sticky::StickyStore::default(),
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),

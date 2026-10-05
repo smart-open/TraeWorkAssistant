@@ -26,6 +26,8 @@ pub const FINGERPRINT_WINDOW_SECS: i64 = 60;
 /// Qoder 线命名空间前缀（审查 #2：sticky_bindings 表内 WB/Qoder 按前缀隔离；
 /// 无前缀键 = WB 线，存量数据向后兼容）
 pub const QODER_NS: &str = "q:";
+/// Trae 线命名空间前缀（per-pool 会话粘性批次新增：与 q:/无前缀三线隔离）
+pub const TRAE_NS: &str = "t:";
 /// 落盘节流间隔：距上次成功保存不足该时长则跳过本次写盘
 const SAVE_THROTTLE_MS: u64 = 1000;
 
@@ -133,10 +135,12 @@ impl StickyStore {
         format!("{}{}", self.ns, ck)
     }
 
-    /// 键是否归属本命名空间（load 过滤 / save 合并时区分他线绑定）
+    /// 键是否归属本命名空间（load 过滤 / save 合并时区分他线绑定）。
+    /// **新增池命名空间时必须同步扩展 WB 线的排除列表**（load 过滤与 save
+    /// 范围删除随之生效，防两个 store 整表替换互删对方运行期新增的绑定）
     fn owns_key(&self, k: &str) -> bool {
         if self.ns.is_empty() {
-            !k.starts_with(QODER_NS)
+            !k.starts_with(QODER_NS) && !k.starts_with(TRAE_NS)
         } else {
             k.starts_with(&self.ns)
         }
@@ -201,12 +205,15 @@ impl StickyStore {
         );
     }
 
-    /// 清理全部过期绑定，返回清理条数（save 落库前调用，控制绑定表无界增长）
+    /// 清理全部过期绑定，返回清理条数（save 落库前调用，控制绑定表无界增长）。
+    /// 显式模式 TTL 读运行时配置值（per-pool 可配后固定 1800 会在用户调大 TTL
+    /// 时提前删除仍有效的绑定，F-76② per-pool 版修正）
     pub fn evict_expired(&self, now: i64) -> usize {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before = map.len();
+        let explicit_ttl = self.effective_explicit_ttl();
         map.retain(|_, b| {
-            let ttl = if b.explicit { EXPLICIT_TTL_SECS } else { FINGERPRINT_WINDOW_SECS };
+            let ttl = if b.explicit { explicit_ttl } else { FINGERPRINT_WINDOW_SECS };
             now - b.last_seen <= ttl
         });
         before - map.len()

@@ -238,7 +238,15 @@ export default function QoderAccounts() {
     setOauthUrl(null);
     setShowOauth(true);
     try {
-      await api.qoder.oauthLogin(compat);
+      const url = await api.qoder.oauthLogin(compat);
+      // Web 化：桌面版 open_in_browser 的等价实现——命令同步返回授权页链接，
+      // 在点击手势的 transient activation 窗口内 window.open 才不被浏览器弹窗拦截；
+      // 被拦截或新标签被屏蔽时，弹框内仍展示链接可手动打开（progress 事件兜底）
+      if (url) {
+        setOauthUrl(url);
+        const win = window.open(url, '_blank', 'noopener');
+        if (!win) setOauthMsg('浏览器拦截了自动打开，请点击下方链接手动打开授权页');
+      }
     } catch (err) {
       setOauthRunning(false);
       setOauthCanceling(false);
@@ -677,9 +685,16 @@ export default function QoderAccounts() {
           {oauthUrl && (
             <div className="rounded-lg border border-slate-100 p-3 text-xs dark:border-zinc-800">
               <p className="mb-1 text-slate-400">
-                若浏览器未自动打开，请手动访问授权页（勿泄露该链接）：
+                若浏览器未自动打开，请点击链接手动打开授权页（勿泄露该链接）：
               </p>
-              <p className="break-all font-mono text-[11px] text-slate-500 dark:text-zinc-400">{oauthUrl}</p>
+              <a
+                href={oauthUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="break-all font-mono text-[11px] text-brand-500 underline-offset-2 hover:underline"
+              >
+                {oauthUrl}
+              </a>
             </div>
           )}
           <p className="text-xs text-slate-400">

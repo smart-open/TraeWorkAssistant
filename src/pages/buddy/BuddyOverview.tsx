@@ -112,13 +112,6 @@ export default function BuddyOverview() {
 
   const trends = useMemo(() => aggregateTrends(records), [records]);
 
-  // 登录账号 / 本机套餐：账号列表中 is_current 标记的当前生效登录（服务端 auth 文件在线判定）
-  const wbAccount = accounts.find((a) => a.is_current) ?? null;
-  const wbLoginName = wbAccount?.nickname ?? null;
-  const wbPlan = wbAccount?.edition_type ?? null;
-  const cbAccount = accounts.find((a) => a.is_current_codebuddy) ?? null;
-  const cbLoginName = cbAccount?.nickname ?? null;
-  const cbPlan = cbAccount?.edition_type ?? null;
   // 告警提醒：Token 24h 内将过期（含已过期）账号数 + 积分包 7 日内将过期包数（仍有剩余）
   const nowSec = Math.floor(Date.now() / 1000);
   const tokenSoon = accounts.filter(
@@ -181,7 +174,7 @@ export default function BuddyOverview() {
     <div className="animate-fade-in">
       <PageHeader
         title="Buddy · 概述"
-        desc="WorkBuddy / CodeBuddy 运行总览 · 登录账号 / 套餐 / 告警提醒 · 签到趋势与积分榜"
+        desc="WorkBuddy / CodeBuddy 运行总览 · 账号 / 积分 / 告警提醒 · 签到趋势与积分榜"
         actions={
           <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
@@ -189,8 +182,9 @@ export default function BuddyOverview() {
         }
       />
 
-      {/* 顶部统计卡（对齐 Trae 概述：数值一眼掌握） */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+      {/* 顶部统计卡（对齐 Trae 概述：数值一眼掌握；登录账号/本机套餐为客户端本机态，
+          Web 版无对应数据源已移除） */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
         <StatCard
           label="账号总数"
           value={total}
@@ -202,20 +196,6 @@ export default function BuddyOverview() {
           value={totalBalance != null ? totalBalance.toFixed(2) : '—'}
           hint={credits ? `${okAccounts}/${credits.accounts.length} 个查询成功` : '录入凭证后自动查询'}
           tone="amber"
-        />
-        <StatCard
-          label="登录账号"
-          value={wbLoginName ?? cbLoginName ?? '未登录'}
-          hint={
-            [`WorkBuddy：${wbLoginName ?? '未登录'}`, `CodeBuddy：${cbLoginName ?? '未登录'}`].join(' · ')
-          }
-          tone="violet"
-        />
-        <StatCard
-          label="本机套餐"
-          value={wbPlan ?? cbPlan ?? '—'}
-          hint={[`WorkBuddy：${wbPlan ?? '—'}`, `CodeBuddy：${cbPlan ?? '—'}`].join(' · ')}
-          tone="violet"
         />
         <StatCard
           label="告警提醒"

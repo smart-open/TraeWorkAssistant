@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download } from 'lucide-react';
+import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download, ToggleLeft, Gauge } from 'lucide-react';
 import {
   BarChart,
   Bar,
@@ -54,6 +54,14 @@ export default function ApiService() {
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
   const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
+  // Trae 池参与调度开关（每池自管开关；默认开 = 历史恒可用行为）
+  const [traeEnabled, setTraeEnabled] = useState(true);
+  // per-pool 调度参数（Trae 池专属，与 Buddy/Qoder 互不共享）：并发 0 = 不限、池粘性 0 = 关
+  const [traeAccountConcurrencyLimit, setTraeAccountConcurrencyLimit] = useState(1);
+  const [traePoolStickyTtlSecs, setTraePoolStickyTtlSecs] = useState(300);
+  const [traeStickyTtlSecs, setTraeStickyTtlSecs] = useState(1800);
+  // Trae 池竞速对冲阈值毫秒（0 = 关闭；缺省对齐后端 serde default 8s）
+  const [traeHedgeThresholdMs, setTraeHedgeThresholdMs] = useState(8_000);
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [savingPool, setSavingPool] = useState(false);
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
@@ -168,6 +176,13 @@ export default function ApiService() {
       const pool = await withMinDelay(api.apiServer.poolList());
       setEnabledUids(new Set(pool.enabled_uids));
       setPoolGroups(new Set(pool.group_ids ?? []));
+      setTraeEnabled(pool.trae_enabled ?? true);
+      // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s /
+      // 会话粘性 1800s / 对冲 8s）
+      setTraeAccountConcurrencyLimit(pool.trae_account_concurrency_limit ?? 1);
+      setTraePoolStickyTtlSecs(pool.trae_pool_sticky_ttl_secs ?? 300);
+      setTraeStickyTtlSecs(pool.trae_sticky_ttl_secs ?? 1800);
+      setTraeHedgeThresholdMs(pool.trae_hedge_threshold_ms ?? 8_000);
     } catch {
       // 初始化加载失败静默保留空列表；手动点击刷新失败需给出提示
       if (manual) toast('error', '加载账号池失败，请重试');
@@ -234,9 +249,18 @@ export default function ApiService() {
   const savePool = async () => {
     setSavingPool(true);
     try {
-      // 调度策略已收口至全局 API 管理「调度策略中心」，本页只保存成员/分组（未传字段后端保留原值）
-      await withMinDelay(api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups]));
-      toast('success', '账号池已更新（服务运行中即时生效）');
+      // 调度策略已收口至全局 API 管理「调度策略中心」，本页只保存成员/分组/本池开关
+      // 与 Trae 池专属调度参数（未传字段后端保留原值，保存后运行中热生效）
+      await withMinDelay(
+        api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups], {
+          traeEnabled,
+          traeAccountConcurrencyLimit: traeAccountConcurrencyLimit,
+          traePoolStickyTtlSecs: traePoolStickyTtlSecs,
+          traeStickyTtlSecs,
+          traeHedgeThresholdMs,
+        }),
+      );
+      toast('success', `账号池已更新（Trae 池${traeEnabled ? '启用' : '停用'}，服务运行中即时生效）`);
     } catch (err) {
       toast('error', `保存账号池失败：${String(err)}`);
     } finally {
@@ -526,7 +550,8 @@ export default function ApiService() {
             </p>
           ) : (
             <>
-              {/* 分组筛选（T10，保存后热重载即时生效）；调度策略已收口至全局 API 管理调度策略中心 */}
+              {/* 分组筛选（T10，保存后热重载即时生效）；本池开关移入下方「资源开关与调度参数」面板；
+                  调度策略已收口至全局 API 管理调度策略中心 */}
               <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
                 {groups.length > 0 && (
                   <div className="flex items-start gap-2">
@@ -595,7 +620,10 @@ export default function ApiService() {
                 </span>
               </div>
 
-              <div className="flex-1 space-y-1">
+              {/* 不用 flex-1：两列 items-stretch 下 flex-1 会吃掉剩余高度，
+                  账号少时列表与「资源开关与调度参数」之间被撑出大片空白；
+                  自然高度让参数区块紧贴列表，账号增多时随流式布局自然下移 */}
+              <div className="space-y-1">
                 {poolAccounts.map((a) => {
                   const checked = enabledUids.has(a.user_id);
                   const poolItem = poolStatus.find((p) => p.uid === a.user_id);
@@ -653,6 +681,159 @@ export default function ApiService() {
                     </label>
                   );
                 })}
+              </div>
+
+              {/* 资源开关与调度参数（对齐 Buddy：与账号池选择同面板，共用右上角「保存」） */}
+              <div className="mt-4 border-t border-slate-100 pt-3 dark:border-zinc-800">
+                <div className="mb-2 flex items-center gap-2">
+                  <ToggleLeft size={16} className="text-brand-500" />
+                  <span className="text-sm font-medium">资源开关与调度参数</span>
+                </div>
+                <div className="mb-2">
+                  {traeEnabled ? (
+                    <Badge tone="green">上游已启用</Badge>
+                  ) : (
+                    <Badge tone="amber">上游未启用 — Trae 源模型将显式报错</Badge>
+                  )}
+                </div>
+                <div className="space-y-1.5">
+                  {/* 本池开关（每池自管：Trae 页管 trae_enabled） */}
+                  <label className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                      checked={traeEnabled}
+                      onChange={(e) => setTraeEnabled(e.target.checked)}
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-xs text-slate-700 dark:text-zinc-200">启用 Trae 上游</span>
+                      <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                        Trae 目录模型路由到 Trae 账号池，消耗各账号通用积分；
+                        关闭后仅 Trae 源模型显式报错，Buddy/Qoder 不受影响
+                      </span>
+                    </span>
+                  </label>
+                </div>
+                {/* 调度参数（Trae 池专属，与 Buddy/Qoder 互不共享）：数值热参数，保存即热生效 */}
+                <div className="mt-4">
+                  <div className="mb-2 flex items-center gap-2">
+                    <Gauge size={15} className="text-brand-500" />
+                    <span className="text-sm font-medium">调度参数</span>
+                    <span className="text-xs text-slate-400">Trae 池专属 · 保存即热生效</span>
+                  </div>
+                  <div className="space-y-3 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          账号并发上限
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          单账号在途请求数达到上限即让位其他账号（全部 busy 时取负载最小者）；
+                          0 = 不限
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={32}
+                          step={1}
+                          value={traeAccountConcurrencyLimit}
+                          onChange={(e) =>
+                            setTraeAccountConcurrencyLimit(
+                              Math.max(0, Math.min(32, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">并发</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          池粘性 TTL
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          TTL 内同会话落同一账号（上游 KV cache 复用）；0 = 关闭
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={3600}
+                          step={30}
+                          value={traePoolStickyTtlSecs}
+                          onChange={(e) =>
+                            setTraePoolStickyTtlSecs(
+                              Math.max(0, Math.min(3600, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">秒</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          会话粘性 TTL
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          显式 conversationId / 消息指纹绑定账号的有效期
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={86400}
+                          step={60}
+                          value={traeStickyTtlSecs}
+                          onChange={(e) =>
+                            setTraeStickyTtlSecs(
+                              Math.max(0, Math.min(86400, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">秒</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          竞速对冲阈值
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；
+                          0 = 关闭（有效范围 1s–8s，与后端对齐）
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={8000}
+                          step={500}
+                          value={traeHedgeThresholdMs}
+                          onChange={(e) =>
+                            setTraeHedgeThresholdMs(
+                              Math.max(0, Math.min(8000, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">ms</span>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
+                  上方勾选与分组筛选决定 Trae 池取号范围（保存后即时生效）；
+                  池间 / 池内调度策略在全局 API 管理「调度策略中心」配置。
+                </p>
               </div>
             </>
           )}
