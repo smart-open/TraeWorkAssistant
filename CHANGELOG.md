@@ -6,6 +6,37 @@
 
 ---
 
+## [1.4.0] · 2026-10-05 · 移植 main Qoder 平台全链路 + 系统无关修复
+
+> **合并点记录**：移植范围 `main@1c29564`（**不含**）至 `main@c3f3211`，另含 `main@9cdce69`（Qoder 签到兜底直领）。**下次合并请从 `9cdce69` 之后接着移植**。手工语义移植、未经 merge。
+
+### 新增
+
+- **Qoder 平台全链路**：协议层（积分账户/积分包/签到/用量/模型目录）+ 调度器与网关池接入 + 3 命令（`qoder_pool_status` / `api_qoder_usage_stats` / `api_qoder_catalog_sync`）；前端 `src/pages/qoder/*` 六页；Dashboard 三平台化（Trae/Buddy/Qoder：KPI、快照差分曲线/热力图、Token 用量、到期日历按平台口径适配）。
+
+### 修复（移植）
+
+- **签到档期日历双修**（`ded687d` 系统无关部分）：同日同账号多轮记录按最终态去重；BuddyCheckin 接入活动档期日历。
+- **模型目录**（`6ed778a`/`c3f3211` 系统无关部分）：Max Mode 角标 + 厂商列；积分明细包数口径与 KPI 对齐。
+- **Qoder 每日签到误报「无可领活动」**（`main@9cdce69`）：campaigns 列表对工具请求形态过滤 CLAIMABLE——列表零 CLAIMABLE 时对已知每日活动盲发直领兜底（严格判定 `200+CLAIMED+!replayed`，回放/4xx/5xx 维持 already，401 走自愈重试；首次与 401 重试路径同口径）；campaignId 强制路径安全白名单。
+- **审计补移植**：WB chat `prompt_cache_key` 注入（`8838e85`）；6004 配额三态多锚点（`ab67a60`）；auth 文件提取分类报错（`406c50b`）；凭证 vault 收敛改道/刷新失败四分类/响应体读取失败不吞错/SSRF WHATWG 解析（`4f1174b`）；到期日历「长期有效」哨兵（`34e1757`）；Buddy 模型厂商列（`59a594d` 系统无关部分）。
+
+### 安全与健壮性（发布前审查 19 项全修）
+
+- **Critical**：WB 对冲账号按自身 uid 重建 body（防跨账号前缀缓存泄露对话）；WB/Qoder sticky 绑定命名空间隔离（防互删）；WB 账号入池改走 vault secure 读。
+- **Major**：SSRF 加固（尾点/IPv6 兼容段/NAT64/CGNAT）；wb_tokens 存量明文启动收敛；429/408 不再误标永久态；OAuth 事件桥改 web `listen`；撤除 Qoder 资源调度页假保存参数。
+- **Minor 11 项**：冷却多锚点取最大、热路径零克隆、sticky seed 限长、vault 值优先、ns 键校验、导出防双击、重登录清态等。
+
+### 明确跳过（桌面客户端专属）
+
+- Trae 包级积分口径/tokenStats 懒加载；BuddyAccounts 桌面环境操作（凭证导出除外，已带 Modal 强确认）；DiscoverModal 徽标；per-pool 字段拆分（docker 后端无对应结构）。
+
+### 验证
+
+- `cargo test --workspace` 544 通过 · `npm test` 57 通过 · `npx tsc --noEmit` 0 错误。
+
+---
+
 ## [1.3.6] · 2026-10-04 · 移植 main 渠道风控对抗 + Claude Code 分类器兜底
 
 > **合并点记录**：本次移植范围 `main@29d106af1da7bc6e1df477c8f0b7c4ebb9811ab3`（**不含**）至 `main@1c295643c0d5996be32d0a2f9f19e6ab22c1a9be`；**下次合并请从 `1c29564` 之后接着移植**。手工语义移植、未经 merge。
