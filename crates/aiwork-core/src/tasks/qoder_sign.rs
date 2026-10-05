@@ -470,7 +470,8 @@ mod tests {
         assert_eq!(get("Cosy-Data-Policy"), Some("disagree"));
         assert_eq!(get("Login-Version"), Some("v2"));
         assert_eq!(get("Cosy-Machinetoken"), Some("mid"));
-        assert_eq!(get("Cosy-Machineos"), Some("x86_64_windows"));
+        // 平台自适应：Linux CI 上 machine_os() 产出 x86_64_linux，不可硬编码 Windows 值
+        assert_eq!(get("Cosy-Machineos"), Some(machine_os().as_str()));
         assert!(!get("X-Request-Id").unwrap_or_default().is_empty());
         // Cosy-Key 是 128 字节 RSA 密文的 base64
         let key = base64::engine::general_purpose::STANDARD

@@ -30,6 +30,7 @@
 ### 构建修复
 
 - **CI Linux 构建缺依赖（docker-image.yml Rust 测试门禁失败）**：`aiwork-core/Cargo.toml` 本次移植新增的 `[target.'cfg(windows)'.dependencies]`（windows-sys，Qoder CrossProcLock 用）被插在依赖清单中间，其后 13 个跨平台依赖（aes/cbc/p256/rand/argon2/aes-gcm/rusqlite/iota_stronghold/zeroize/flate2/futures-util/regex/time）全部误入 Windows 专属段——本地 Windows 构建无感，CI Ubuntu 上 87 个编译错误。已将 Windows 专属段移至文件末尾；`cargo tree --target x86_64-unknown-linux-gnu` 验证 Linux 依赖图恢复，Cargo.lock 无变化。
+- **qoder_sign 测试平台硬编码**：`build_cosy_headers_produces_all_19` 断言 `Cosy-Machineos` 硬编码 `x86_64_windows`，Linux CI 实际产出 `x86_64_linux` 失败。改为断言头值等于 `machine_os()` 输出（平台自适应，Windows/Linux/macOS 全通过）；`qoder_common.rs` 探针内的 `x86_64_windows` 为复刻抓包包头的 `#[ignore]` 字面值，保留。
 
 ### 明确跳过（桌面客户端专属）
 
