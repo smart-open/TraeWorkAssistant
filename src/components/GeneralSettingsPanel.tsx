@@ -16,6 +16,7 @@ export default function GeneralSettingsPanel() {
   const saveSettings = useAppStore((s) => s.saveSettings);
   const refreshSettings = useAppStore((s) => s.refreshSettings);
   const toast = useAppStore((s) => s.pushToast);
+  const platform = useAppStore((s) => s.platform);
 
   const [form, setForm] = useState<SettingsType | null>(null);
   const [saving, setSaving] = useState(false);
@@ -326,7 +327,11 @@ export default function GeneralSettingsPanel() {
               type="text"
               value={form.proxy_log_path ?? ''}
               onChange={(e) => update('proxy_log_path', e.target.value.trim() || null)}
-              placeholder="留空则默认 %APPDATA%\AIWorkAssistant\logs"
+              placeholder={
+                platform === 'macos'
+                  ? '留空则默认 ~/Library/Application Support/AIWorkAssistant/logs'
+                  : '留空则默认 %APPDATA%\\AIWorkAssistant\\logs'
+              }
               className="input"
             />
             <p className="mt-1 text-xs text-slate-400">
