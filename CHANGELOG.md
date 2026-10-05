@@ -4,7 +4,7 @@
 
 ---
 
-## [3.7.0] · 2026-10-04 · Qoder 全面支持（上游网关接入 + 积分看板三平台化 + 模块加固）
+## [3.7.0] · 2026-10-05 · Qoder 全面支持（上游网关接入 + 积分看板三平台化 + 模块加固）
 
 > 范围：自 [3.6.6] 以来的全部变更，核心为 Qoder 平台全链路接入；协议逆向/抓包调研/运行实证等过程记录见 git 历史。
 
@@ -29,10 +29,15 @@
 - **网关上游与抓包小修批**：SSE statusCode 钳制、目录 resolve 兜底序对齐远程目录、session_seed 等限长 128、MITM Qoder 四域直连白名单 + 解密默认值补齐、app_log 单行原子写、三源调度早退守卫与 max 别名降级修复。
 - **Qoder 全面审查修复批（边审边修 + 收尾批 8abfe92）**：签到 skipped_busy 前端闭环、快照目标 latest-ref、凭证导出红警化、PAT 前缀预检、签到进行态 store 化、通道判定/KDF roundtrip 单测锁定；粘性落库恒假条件（WB 粘性持久化失效）、积分 401 自愈跨进程锁、-9901 空完成免熔断、Queued 流拼接双响应、record_today 并发互斥、storage.json 原子写、random_hex 去 panic、vault ns_get 落日志。
 - **界面**：Trae 资源调度模型目录 Max 标记移至模型 ID 右上角黄色角标。
+- **macOS 合并全面审查修复批（b968204，9 项）**：Qoder mac 路径预留实装（`ide_data_dir`/`env_check`/`cli_dir`/`work_data_dir`/`cli_status_path` 统一收口 platform 层）；Qoder mac 跨进程互斥实装——flock(2) 锁文件对齐 Windows 命名 Mutex 崩溃回收语义；签到定时任务三命令补 schtasks 门控（mac 拒绝并给指引）；mac 打开浏览器实装（`open` + URL 白名单防参数注入）；`DeviceCredential` 手写 Debug 脱敏 `private_key_pem`（防私钥入日志）；oauth trace_id 改 CSPRNG fail-closed；`qoder_pool_save` 三处静默吞错改落日志。
+- **mac 系统依赖深度审查修复批（17b9235，7 项，真机实况驱动）**：`env_reset` work_client 补删 mac 根级 Cookies/Cookies-journal/Network Persistent State（mac 解密密钥在 Keychain 而非 Local State，不删则登录会话存活、登出语义落空）；IDE/Work exe 候选 mac 实装（/Applications、~/Applications 双根 .app，环境检测/打开客户端全链路打通）；`network_cookies` mac 根级三件套对齐 icube 布局；`is_running`/`work_running` mac 按 exe 路径 bundle 段检测（IDE/Work 双客户端 CFBundleExecutable 同名 "Qoder CN"，映像名不可区分，bundle 目录名才是身份信号）；`spawn_first_existing` mac 走 LaunchServices `open` 直启；Qoder 双档案 `mac_bundle_ids` 实测补录（`mac_supported` 维持灰度）。
+- **第三轮全面审查修复批（c069ed1，7 项）**：客户端通道临期凭证（无刷新令牌）不再误判「已过期」——放行当日本可成功的签到，续期给出「仍有效但无法自动续期」准确文案，刷新任务落提示日志不计入需重登；mac `version_of` 起步先查 .app 自身再上溯（环境检测版本号不再恒 null）；`qoder_groups_move` 目标分组校验移入池锁 + `groups_remove` 回落与删定义合并单临界区（闭合删组并发挂上幽灵 group_id 的 TOCTOU）；积分快照落库失败由静默吞改为落日志；前端三处——模型列表刷新失败不再误报「目录同步失败」、快照备份中禁用切换按钮、编辑弹框清空显示名实际生效。
+- **第四轮全面审查修复批（e6cc3b1，switcher/doubao/api_server 全链路复审，仅 2 处文案）**：mac 平台路径文案按实况显示——豆包账号页 uid 探测来源（`public_config.json`）与通用设置代理日志路径占位符按平台分派（mac 显示 `~/Library/Application Support/…`）。
+- **Qoder 每日签到误报「无可领活动」（9cdce69，自 main 合入）**：campaigns 列表端点对工具请求形态全天不展示 CLAIMABLE 条目（已领 grant 无条件展示）——列表零可领时对已知日常活动盲发直领（claim 端点不受列表过滤约束、幂等回放），严格判定响应形态（200+CLAIMED+非回放才算成功，回放/503/4xx 维持 already），401 走自愈重试。
 
 ### 测试
 
-- `cargo test` 745 passed / 0 failed / 8 ignored；`tsc --noEmit` 全绿；`vitest` 59 passed；`vite build` 通过。
+- `cargo test` 746 passed / 0 failed / 9 ignored（含自 main 合入的新增用例）；`tsc --noEmit` 全绿；`vitest` 59 passed；`vite build` 通过。
 
 ---
 
