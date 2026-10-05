@@ -27,6 +27,10 @@
 - **Major**：SSRF 加固（尾点/IPv6 兼容段/NAT64/CGNAT）；wb_tokens 存量明文启动收敛；429/408 不再误标永久态；OAuth 事件桥改 web `listen`；撤除 Qoder 资源调度页假保存参数。
 - **Minor 11 项**：冷却多锚点取最大、热路径零克隆、sticky seed 限长、vault 值优先、ns 键校验、导出防双击、重登录清态等。
 
+### 构建修复
+
+- **CI Linux 构建缺依赖（docker-image.yml Rust 测试门禁失败）**：`aiwork-core/Cargo.toml` 本次移植新增的 `[target.'cfg(windows)'.dependencies]`（windows-sys，Qoder CrossProcLock 用）被插在依赖清单中间，其后 13 个跨平台依赖（aes/cbc/p256/rand/argon2/aes-gcm/rusqlite/iota_stronghold/zeroize/flate2/futures-util/regex/time）全部误入 Windows 专属段——本地 Windows 构建无感，CI Ubuntu 上 87 个编译错误。已将 Windows 专属段移至文件末尾；`cargo tree --target x86_64-unknown-linux-gnu` 验证 Linux 依赖图恢复，Cargo.lock 无变化。
+
 ### 明确跳过（桌面客户端专属）
 
 - Trae 包级积分口径/tokenStats 懒加载；BuddyAccounts 桌面环境操作（凭证导出除外，已带 Modal 强确认）；DiscoverModal 徽标；per-pool 字段拆分（docker 后端无对应结构）。

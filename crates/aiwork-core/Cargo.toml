@@ -23,9 +23,6 @@ num-bigint = "0.4"
 uuid = { version = "1", features = ["v4"] }
 # qoder_oauth 回调地址解析
 url = "2"
-# qoder_common CrossProcLock：Windows 命名互斥体（非 Windows 走占位结构）
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
 # icube_auth：Trae 客户端 tc 信封解密（AES-128-CBC）+ ExchangeToken DeviceProof 签名（ECDSA P-256）
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
@@ -46,3 +43,7 @@ flate2 = "1"
 futures-util = "0.3"
 regex = "1"
 time = "0.3"
+
+# qoder_common CrossProcLock：Windows 命名互斥体（非 Windows 走占位结构）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
