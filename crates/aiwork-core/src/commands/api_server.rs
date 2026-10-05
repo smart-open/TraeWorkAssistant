@@ -35,6 +35,16 @@ fn merge_pool_set(
     pool_sticky_ttl_secs: Option<u64>,
     wb_sticky_ttl_secs: Option<u64>,
     wb_uids: Option<Vec<String>>,
+    // Qoder 上游开关（p3-3）；None = 保留原值
+    qoder_enabled: Option<bool>,
+    // Qoder 竞速对冲阈值毫秒（F-80-余 v2，0 = 关闭）；None = 保留原值
+    qoder_hedge_threshold_ms: Option<u64>,
+    // Qoder 会话粘性开关（F-80-余 v2）；None = 保留原值
+    qoder_sticky_enabled: Option<bool>,
+    // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值
+    qoder_uids: Option<Vec<String>>,
+    // Qoder 池分组筛选（qoder_groups 分组 id）；None = 保留原值
+    qoder_group_ids: Option<Vec<String>>,
 ) -> ApiPoolFile {
     // Trae 池白名单剥离 wb- 前缀条目：WB 账号归属独立白名单 wb_enabled_uids，
     // 旧版混存于共享 enabled_uids（历史兼容形态），保存时迁移归位防丢失
@@ -75,6 +85,12 @@ fn merge_pool_set(
         pool_sticky_ttl_secs: pool_sticky_ttl_secs.unwrap_or(existing.pool_sticky_ttl_secs),
         wb_sticky_ttl_secs: wb_sticky_ttl_secs.unwrap_or(existing.wb_sticky_ttl_secs),
         wb_enabled_uids,
+        qoder_enabled: qoder_enabled.unwrap_or(existing.qoder_enabled),
+        qoder_enabled_uids: qoder_uids.unwrap_or_else(|| existing.qoder_enabled_uids.clone()),
+        qoder_hedge_threshold_ms: qoder_hedge_threshold_ms
+            .unwrap_or(existing.qoder_hedge_threshold_ms),
+        qoder_sticky_enabled: qoder_sticky_enabled.unwrap_or(existing.qoder_sticky_enabled),
+        qoder_group_ids: qoder_group_ids.unwrap_or_else(|| existing.qoder_group_ids.clone()),
     }
 }
 
@@ -103,6 +119,18 @@ pub fn pool_set(
     // Buddy 池入池白名单（wb- 前缀账号 id）；None = 保留原值（含旧数据迁移），
     // Some(list) = 覆盖（Buddy 页账号池勾选保存）
     wb_uids: Option<Vec<String>>,
+    // Qoder 上游开关（p3-3）；None = 保留原值
+    qoder_enabled: Option<bool>,
+    // Qoder 竞速对冲阈值毫秒（0 = 关闭）；None = 保留原值
+    qoder_hedge_threshold_ms: Option<u64>,
+    // Qoder 会话粘性开关；None = 保留原值
+    qoder_sticky_enabled: Option<bool>,
+    // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
+    // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
+    qoder_uids: Option<Vec<String>>,
+    // Qoder 池分组筛选（qoder_groups 分组 id）；None = 保留原值，
+    // Some(list) = 覆盖（Qoder 页分组筛选保存；空数组 = 不限分组）
+    qoder_group_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let existing: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
     let pool_file = merge_pool_set(
@@ -122,6 +150,11 @@ pub fn pool_set(
         pool_sticky_ttl_secs,
         wb_sticky_ttl_secs,
         wb_uids,
+        qoder_enabled,
+        qoder_hedge_threshold_ms,
+        qoder_sticky_enabled,
+        qoder_uids,
+        qoder_group_ids,
     );
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     // 热应用：网关运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
@@ -170,6 +203,22 @@ pub fn pool_set(
         shared
             .wb_bg_downgrade
             .store(pool_file.wb_bg_downgrade, std::sync::atomic::Ordering::Relaxed);
+        // Qoder 上游开关 + 竞速对冲阈值 + 会话粘性热应用（p3-3 / F-80-余 v2）
+        shared
+            .qoder_enabled
+            .store(pool_file.qoder_enabled, std::sync::atomic::Ordering::Relaxed);
+        shared.qoder_hedge_threshold_ms.store(
+            pool_file.qoder_hedge_threshold_ms,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        shared.qoder_sticky_enabled.store(
+            pool_file.qoder_sticky_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        shared
+            .qoder_pool
+            .set_concurrency_limit(pool_file.account_concurrency_limit);
+        shared.qoder_sticky.set_explicit_ttl(pool_file.pool_sticky_ttl_secs as i64);
     }
     // 成员/分组热应用：此前仅策略/参数热生效，成员变更要求重启服务；
     // 现统一走凭据/成员变更联动热重载，保存账号池后立即生效
@@ -190,6 +239,15 @@ pub fn pool_status() -> Vec<PoolStatus> {
 pub fn wb_pool_status() -> Vec<PoolStatus> {
     match crate::api_server::runtime::gateway_shared() {
         Some(shared) => shared.wb_pool.status_list(),
+        None => vec![],
+    }
+}
+
+/// 返回运行中 Qoder 池的实时状态（Qoder「资源调度」页可观测，含 per-account
+/// inflight 在途计数）；网关未注册时返回空数组
+pub fn qoder_pool_status() -> Vec<PoolStatus> {
+    match crate::api_server::runtime::gateway_shared() {
+        Some(shared) => shared.qoder_pool.status_list(),
         None => vec![],
     }
 }
@@ -337,6 +395,42 @@ pub fn api_custom_usage_stats(state: &AppState, days: Option<u32>) -> Vec<crate:
     )
 }
 
+/// 手动同步 Qoder 模型目录（Qoder「资源调度」页；复用每日调度任务入口
+/// qoder_catalog::run_task，按池序逐可用账号拉取 CN 区 model/list 并原子采纳）。
+/// 返回采纳的模型数；无账号/无凭证返回 Ok(0) 语义的信息（与调度器静默跳过一致）
+pub async fn api_qoder_catalog_sync(state: &AppState) -> Result<usize, String> {
+    // AppState 可 Clone 语义的字段快照（Arc 锁与真实状态共享，token 刷新互斥不失效）
+    let st = AppState {
+        data_dir: state.data_dir.clone(),
+        jwt_refresh_lock: state.jwt_refresh_lock.clone(),
+        qoder_pool_lock: state.qoder_pool_lock.clone(),
+    };
+    // 阻塞网络请求放入阻塞线程池，避免卡住异步运行时
+    tokio::task::spawn_blocking(move || {
+        // run_task 返回 json：{ok:true, models:n} 或 {ok:true, skipped:...}
+        let out = crate::tasks::qoder_catalog::run_task(&st)?;
+        if let Some(n) = out.get("models").and_then(serde_json::Value::as_u64) {
+            Ok(n as usize)
+        } else {
+            // 审查 #14：空池/无可用账号属正常跳过（qoder_catalog 空池返回
+            // {ok:true,skipped:...}），按 0 个模型采纳成功返回，不再映射 500 误报失败
+            Ok(0)
+        }
+    })
+    .await
+    .map_err(|e| format!("同步任务执行失败: {e}"))?
+}
+
+/// 查询最近 N 天的 Qoder 上游用量统计（qoder_days 桶，与 Trae/WB/Custom 侧分账）
+pub fn api_qoder_usage_stats(state: &AppState, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    crate::api_server::usage::query_recent_in(
+        &state.data_dir,
+        days,
+        crate::api_server::usage::UsageBucket::Qoder,
+    )
+}
+
 // ==================== 多 API Key 命令 ====================
 
 /// 读取 API Key 列表与鉴权开关
@@ -375,19 +469,27 @@ pub fn api_unified_models(
     let Some(shared) = crate::api_server::runtime::gateway_shared() else {
         return Err("网关未启动".into());
     };
-    let (wb_enabled, trae_ok, buddy_ok) = (
+    let (wb_enabled, trae_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok) = (
         shared
             .wb_enabled
             .load(std::sync::atomic::Ordering::Relaxed),
+        shared
+            .trae_enabled
+            .load(std::sync::atomic::Ordering::Relaxed),
+        shared
+            .qoder_enabled
+            .load(std::sync::atomic::Ordering::Relaxed),
         shared.pool.has_selectable(),
         shared.wb_pool.has_selectable(),
+        shared.qoder_pool.has_selectable(),
     );
     let data_dir = state.data_dir.clone();
-    let mut list = crate::api_server::unified_catalog::unified_models(
+    let mut list = crate::api_server::unified_catalog::unified_models_ex(
         &data_dir,
         wb_enabled,
-        trae_ok,
+        trae_enabled && trae_ok,
         buddy_ok,
+        Some((qoder_enabled, qoder_ok)),
     );
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));
@@ -535,30 +637,74 @@ mod pool_merge_tests {
             wb_sticky_ttl_secs: 3600,
             wb_enabled_uids: Vec::new(),
             wb_group_ids: vec!["wg1".into()],
+            qoder_enabled: true,
+            qoder_enabled_uids: vec!["qd-1".into()],
+            qoder_hedge_threshold_ms: 6000,
+            qoder_sticky_enabled: true,
+            qoder_group_ids: Vec::new(),
         }
+    }
+
+    /// 测试便捷封装：显式命中的字段生效，其余 None（保留原值）。
+    /// 避免位置参数裸传 None 的脆弱写法（每加一个池字段就要全量改一遍）。
+    #[derive(Default)]
+    struct PoolSet {
+        strategy: Option<String>,
+        wb_strategy: Option<String>,
+        group_ids: Option<Vec<String>>,
+        wb_group_ids: Option<Vec<String>>,
+        wb_enabled: Option<bool>,
+        wb_default_thinking: Option<bool>,
+        wb_tool_exec: Option<bool>,
+        wb_bg_downgrade: Option<bool>,
+        wb_longctx_downgrade: Option<bool>,
+        wb_hedge_threshold_ms: Option<u64>,
+        account_concurrency_limit: Option<u32>,
+        pool_sticky_ttl_secs: Option<u64>,
+        wb_sticky_ttl_secs: Option<u64>,
+        wb_uids: Option<Vec<String>>,
+        qoder_enabled: Option<bool>,
+        qoder_hedge_threshold_ms: Option<u64>,
+        qoder_sticky_enabled: Option<bool>,
+        qoder_uids: Option<Vec<String>>,
+        qoder_group_ids: Option<Vec<String>>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pool_set(
+        existing: &ApiPoolFile,
+        uids: Vec<String>,
+        p: PoolSet,
+    ) -> ApiPoolFile {
+        merge_pool_set(
+            existing,
+            uids,
+            p.strategy,
+            p.wb_strategy,
+            p.group_ids,
+            p.wb_group_ids,
+            p.wb_enabled,
+            p.wb_default_thinking,
+            p.wb_tool_exec,
+            p.wb_bg_downgrade,
+            p.wb_longctx_downgrade,
+            p.wb_hedge_threshold_ms,
+            p.account_concurrency_limit,
+            p.pool_sticky_ttl_secs,
+            p.wb_sticky_ttl_secs,
+            p.wb_uids,
+            p.qoder_enabled,
+            p.qoder_hedge_threshold_ms,
+            p.qoder_sticky_enabled,
+            p.qoder_uids,
+            p.qoder_group_ids,
+        )
     }
 
     #[test]
     fn none_fields_preserve_existing() {
         // 只改成员（uids 必传覆盖），其余未传 → 全部保留原值（含 F-76/F-77 新参数）
-        let m = merge_pool_set(
-            &existing(),
-            vec!["u2".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let m = pool_set(&existing(), vec!["u2".into()], PoolSet::default());
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
         assert_eq!(m.strategy, "weighted");
         assert_eq!(m.wb_strategy, "p2c");
@@ -575,6 +721,11 @@ mod pool_merge_tests {
         assert_eq!(m.account_concurrency_limit, 2);
         assert_eq!(m.pool_sticky_ttl_secs, 600);
         assert_eq!(m.wb_sticky_ttl_secs, 3600);
+        // qoder 参数未传 → 保留原值
+        assert!(m.qoder_enabled);
+        assert_eq!(m.qoder_enabled_uids, vec!["qd-1".to_string()]);
+        assert_eq!(m.qoder_hedge_threshold_ms, 6000);
+        assert!(m.qoder_sticky_enabled);
     }
 
     #[test]
@@ -584,23 +735,10 @@ mod pool_merge_tests {
         let mut legacy = existing();
         legacy.enabled_uids = vec!["1001".into(), "wb-abc".into(), "1002".into()];
         legacy.wb_enabled_uids = Vec::new();
-        let m = merge_pool_set(
+        let m = pool_set(
             &legacy,
             vec!["1001".into(), "wb-abc".into(), "1002".into(), "wb-def".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            PoolSet::default(),
         );
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
@@ -614,23 +752,10 @@ mod pool_merge_tests {
         // Buddy 页勾选保存：显式传 wb_uids → 覆盖（不再走旧数据迁移）
         let mut legacy = existing();
         legacy.enabled_uids = vec!["u1".into(), "wb-old".into()];
-        let m = merge_pool_set(
+        let m = pool_set(
             &legacy,
             vec!["u1".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(vec!["wb-new".into()]),
+            PoolSet { wb_uids: Some(vec!["wb-new".to_string()]), ..Default::default() },
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
@@ -671,24 +796,26 @@ mod pool_merge_tests {
     #[test]
     fn some_fields_override_and_empty_string_is_legal_value() {
         // 显式空串 = "跟随默认"合法值（区别于 None 未传）；显式空数组 = 清空分组
-        let m = merge_pool_set(
+        let m = pool_set(
             &existing(),
             vec![],
-            Some("p2c".into()),
-            Some("".into()),
-            Some(vec![]),
-            // wb_group_ids 显式覆盖
-            Some(vec!["wg2".into()]),
-            Some(false),
-            Some(false),
-            Some(true),
-            Some(true),
-            Some(false),
-            Some(3000),
-            Some(0),
-            Some(60),
-            Some(120),
-            None,
+            PoolSet {
+                strategy: Some("p2c".into()),
+                wb_strategy: Some(String::new()),
+                group_ids: Some(vec![]),
+                // wb_group_ids 显式覆盖
+                wb_group_ids: Some(vec!["wg2".into()]),
+                wb_enabled: Some(false),
+                wb_default_thinking: Some(false),
+                wb_tool_exec: Some(true),
+                wb_bg_downgrade: Some(true),
+                wb_longctx_downgrade: Some(false),
+                wb_hedge_threshold_ms: Some(3000),
+                account_concurrency_limit: Some(0),
+                pool_sticky_ttl_secs: Some(60),
+                wb_sticky_ttl_secs: Some(120),
+                ..Default::default()
+            },
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -709,23 +836,10 @@ mod pool_merge_tests {
     #[test]
     fn strategy_only_caller_does_not_touch_wb_and_flags() {
         // Trae 资源调度页收口后只保存成员/分组：不传 strategy/wb_strategy/开关组 → 均保留
-        let m = merge_pool_set(
+        let m = pool_set(
             &existing(),
             vec!["u1".into(), "u3".into()],
-            None,
-            None,
-            Some(vec!["g2".into()]),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            PoolSet { group_ids: Some(vec!["g2".into()]), ..Default::default() },
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -738,24 +852,7 @@ mod pool_merge_tests {
     fn empty_existing_preserves_nothing_but_fills_defaults() {
         // 旧版 api_pool.json（无策略字段）+ 只传成员：策略落为空串（运行时 parse 回退 expire_first）；
         // F-76/F-77 新参数未传 → serde default 生效（对冲 8s、并发=1、池粘性 300s）
-        let m = merge_pool_set(
-            &ApiPoolFile::default(),
-            vec!["u1".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let m = pool_set(&ApiPoolFile::default(), vec!["u1".into()], PoolSet::default());
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");
         assert!(m.group_ids.is_empty());

@@ -338,6 +338,7 @@ mod tests {
         let state = AppState {
             data_dir: dir,
             jwt_refresh_lock: Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: Arc::new(std::sync::Mutex::new(())),
         };
         let saved = config_set(
             &state,

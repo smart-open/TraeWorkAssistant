@@ -80,13 +80,120 @@ pub fn model_cooling_remaining(state: &ApiSharedState, model: &str) -> Option<i6
     }
 }
 
-/// 记录一次模型级失败：渐进退避 10→20→40s（封顶 40s，成功请求后清除）
+/// 记录一次模型级失败：渐进退避 10→20→40s（封顶 40s，成功请求后清除）。
+/// 带错误消息时先尝试解析精确恢复时刻（note_model_failure_ex）。
 pub fn note_model_failure(state: &ApiSharedState, model: &str) {
+    note_model_failure_ex(state, model, None);
+}
+
+/// 记录一次模型级失败（带可选上游错误消息）：
+/// ① 消息含「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」文案（WB 6004 限额，agent2api
+///    errors.rs 情报互证）→ 冷却至精确恢复时刻（钳制 ≤7 天防异常值）；
+/// ② 解析失败/无消息 → 既有渐进退避。后续不可解析的失败取「渐进退避 vs 既有
+///    冷却截止」的较大者——账号实际仍被限额到恢复时刻，不能被 10s 渐进值缩短。
+pub fn note_model_failure_ex(state: &ApiSharedState, model: &str, msg: Option<&str>) {
     let mut map = safe_lock(&state.model_cooldowns);
-    let (_, fails) = map.get(model).copied().unwrap_or((0, 0));
+    let (prev_until, fails) = map.get(model).copied().unwrap_or((0, 0));
     let fails = fails + 1;
-    let delay = 10i64 << (fails - 1).min(2); // 10/20/40
-    map.insert(model.to_string(), (now_ts() + delay, fails));
+    let now = now_ts();
+    let until = match msg.and_then(parse_quota_reset_at) {
+        // 审查 #4：与 None 分支同口径取 max——连续两次 6004 时第二次文案的
+        // 恢复时刻可能早于首次已记录的冷却截止，不得缩短既有冷却
+        Some(ts) => ts.max(prev_until),
+        None => {
+            let delay = 10i64 << (fails - 1).min(2); // 10/20/40
+            (now + delay).max(prev_until)
+        }
+    };
+    map.insert(model.to_string(), (until, fails));
+}
+
+/// 从限额文案解析精确恢复时刻（agent2api parse_quota_reset_at 同源语义）：
+/// 命中 `UTC+8` 字面量后向前扫描 `YYYY-MM-DD HH:MM:SS`（按 UTC+8 解释为 Unix 秒）。
+/// 零正则依赖（项目约定）；有效性钳制：必须在未来且 ≤7 天——上游改措辞/时区
+/// 即解析失败，调用方落回渐进退避（本函数只作快路径，不承担唯一职责）。
+/// 复审修复：遍历**所有**锚点——文案可能含两个时刻（「您于 X UTC+8 触发限额，
+/// 将在 Y UTC+8 重置」），首个锚点前是过去时刻（触发时间），跳过它继续找下一个，
+/// 直到解析出可信的未来恢复时刻。
+pub(crate) fn parse_quota_reset_at(msg: &str) -> Option<i64> {
+    const DT_LEN: usize = 19; // yyyy-mm-dd hh:mm:ss
+    let bytes = msg.as_bytes();
+    let mut from = 0usize;
+    loop {
+        let anchor = msg[from..].find("UTC+8")? + from;
+        from = anchor + "UTC+8".len();
+        if anchor >= DT_LEN {
+            // 从锚点紧前方回扫，最多 48 字节（文案前缀长度）
+            let start_limit = anchor.saturating_sub(48);
+            let mut i = anchor - DT_LEN;
+            loop {
+                if let Some(ts) = try_parse_dt(bytes, i) {
+                    let now = now_ts();
+                    // 未来且 ≤7 天才可信（解析到过去时刻/异常远期 = 该时刻不是恢复时刻）
+                    if ts > now && ts - now <= 7 * 24 * 3600 {
+                        return Some(ts);
+                    }
+                    break; // 此锚点解析出的时刻不可信 → 换下一个锚点
+                }
+                if i == start_limit {
+                    break;
+                }
+                i -= 1;
+            }
+        }
+    }
+}
+
+/// 在 bytes[i..] 处匹配 `dddd-dd-dd dd:dd:dd` 并按 UTC+8 解析为 Unix 秒
+fn try_parse_dt(b: &[u8], i: usize) -> Option<i64> {
+    if i + 19 > b.len() {
+        return None;
+    }
+    let p = &b[i..i + 19];
+    let digit = |x: u8| x.is_ascii_digit();
+    let sep = |x: u8, c: u8| x == c;
+    let num = |s: &[u8]| -> Option<i64> {
+        s.iter().try_fold(0i64, |acc, c| {
+            if digit(*c) { Some(acc * 10 + (*c - b'0') as i64) } else { None }
+        })
+    };
+    let shape = sep(p[4], b'-')
+        && sep(p[7], b'-')
+        && sep(p[10], b' ')
+        && sep(p[13], b':')
+        && sep(p[16], b':')
+        && p[0..4].iter().all(|c| digit(*c))
+        && digit(p[5])
+        && digit(p[6])
+        && digit(p[8])
+        && digit(p[9])
+        && digit(p[11])
+        && digit(p[12])
+        && digit(p[14])
+        && digit(p[15])
+        && digit(p[17])
+        && digit(p[18]);
+    if !shape {
+        return None;
+    }
+    let (y, mo, d) = (num(&p[0..4])?, num(&p[5..7])?, num(&p[8..10])?);
+    let (h, mi, s) = (num(&p[11..13])?, num(&p[14..16])?, num(&p[17..19])?);
+    // 按 UTC+8 解释：Unix 时刻 = naive(UTC 解释) - 8h
+    chrono::NaiveDate::from_ymd_opt(y as i32, mo as u32, d as u32)
+        .and_then(|date| date.and_hms_opt(h as u32, mi as u32, s as u32))
+        .map(|dt| dt.and_utc().timestamp() - 8 * 3600)
+}
+
+/// 从上游 HTTP 错误响应体提取 message（6004 限额文案随 JSON body 下发）；
+/// 兼容 message / error.message / msg（腾讯系接口两种字段名都有）；
+/// 解析失败返回 None → 调用方落回渐进退避
+fn upstream_msg(resp_body: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(resp_body).ok()?;
+    v.get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| v.pointer("/error/message").and_then(|m| m.as_str()))
+        .or_else(|| v.get("msg").and_then(|m| m.as_str()))
+        .map(str::to_string)
 }
 
 /// 请求成功后清除该模型的冷却与失败计数
@@ -184,15 +291,23 @@ struct RaceWin {
 /// inflight 天然让位，受 F-77 并发上限约束）发对冲请求，先出首字者胜。
 /// 对冲账号取号时在途计数 +1 由 `HedgeLease` RAII 管理全生命周期；
 /// 接管时 guard 重绑到对冲账号（流计数随流存续）。
+/// 审查 #1：对冲请求必须按对冲账号 uid 重建 body（`raw_body` + 模型/会话等
+/// 重建材料），prompt_cache_key 按账号硬隔离——跨账号命中前缀缓存 = 对话泄露，
+/// 严禁复用按主账号注入后的产物。
 #[allow(clippy::too_many_arguments)]
 fn race_first_byte(
     state: &Arc<ApiSharedState>,
     primary_uid: &str,
-    converted: &[u8],
     reader: Box<dyn Read + Send>,
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
+    raw_body: &[u8],
+    model: &str,
+    conv_id: &str,
+    effort: Option<&str>,
+    sanitize: bool,
+    templates: &[(String, String)],
 ) -> Result<RaceWin, ()> {
     let hedge_ms = state.wb_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed);
     if hedge_ms == 0 {
@@ -207,7 +322,6 @@ fn race_first_byte(
     let tried2 = tried.clone();
     let allowed2 = allowed.cloned();
     let dedicated2 = dedicated.map(str::to_string);
-    let body = converted.to_vec();
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
         let (picked2, ev) = state2
             .wb_pool
@@ -218,6 +332,11 @@ fn race_first_byte(
         }
         // 租约先于建连获取：建连失败（下行 `?`）时随闭包局部变量 Drop 自动 -1
         let lease = HedgeLease::acquire(&state2, &picked2.uid);
+        // 审查 #1：按对冲账号 uid 重建请求体（prompt_cache_key 首段=账号 uid 硬隔离；
+        // conv_id 保持同一对话），不再复用主账号的 converted
+        let body = wb_payload::prepare_wb_chat_body(
+            raw_body, model, &picked2.uid, conv_id, effort, sanitize, templates,
+        );
         let creds2 = WbCreds {
             id: picked2.uid.clone(),
             uid: picked2.uid.clone(),
@@ -490,7 +609,7 @@ fn run_wb_stream(
         let effort = super::wb_catalog::find(&catalog, model)
             .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
         let mut converted = wb_payload::prepare_wb_chat_body(
-            body_vec, model, &conv_id, effort.as_deref(), sanitize, &templates,
+            body_vec, model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
         );
         let mut creds = WbCreds {
             id: picked.uid.clone(),
@@ -517,11 +636,16 @@ fn run_wb_stream(
                     let mut win = match race_first_byte(
                         state,
                         &picked.uid,
-                        &converted,
                         reader,
                         &tried,
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
+                        body_vec,
+                        model,
+                        &conv_id,
+                        effort.as_deref(),
+                        sanitize,
+                        &templates,
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -573,7 +697,7 @@ fn run_wb_stream(
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
                                 state.wb_pool.note_error(win_uid, kind);
-                                note_model_failure(state, model);
+                                note_model_failure_ex(state, model, Some(&msg));
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
                             }
@@ -628,7 +752,7 @@ fn run_wb_stream(
                             "11128 强制清洗重试{}", wb_payload::template_hit_note()
                         ));
                         converted = wb_payload::prepare_wb_chat_body(
-                            body_vec, model, &conv_id, effort.as_deref(), true, &templates,
+                            body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
                         );
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         // 断连检测：重试等待期间客户端离开则终止
@@ -666,7 +790,7 @@ fn run_wb_stream(
                             }
                             let kind = classify_error(status, &resp_body);
                             state.wb_pool.note_error(&picked.uid, kind);
-                            note_model_failure(state, model);
+                            note_model_failure_ex(state, model, upstream_msg(&resp_body).as_deref());
                             *safe_lock(&state.last_error) = Some(format!(
                                 "wb uid={} status={} body={}",
                                 picked.uid,
@@ -800,7 +924,7 @@ pub async fn wb_aggregate_chat(
             let effort = super::wb_catalog::find(&catalog, &model)
                 .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
             let mut converted = wb_payload::prepare_wb_chat_body(
-                &body_vec, &model, &conv_id, effort.as_deref(), sanitize, &templates,
+                &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
             );
             let mut creds = WbCreds {
                 id: picked.uid.clone(),
@@ -822,11 +946,16 @@ pub async fn wb_aggregate_chat(
                         let mut win = match race_first_byte(
                             &state,
                             &picked.uid,
-                            &converted,
                             reader,
                             &tried,
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
+                            &body_vec,
+                            &model,
+                            &conv_id,
+                            effort.as_deref(),
+                            sanitize,
+                            &templates,
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -878,7 +1007,7 @@ pub async fn wb_aggregate_chat(
                                 let kind = classify_wb_error(code, &msg);
                                 if kind != ErrKind::None {
                                     state.wb_pool.note_error(win_uid, kind);
-                                    note_model_failure(&state, &model);
+                                    note_model_failure_ex(&state, &model, Some(&msg));
                                 }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
@@ -915,7 +1044,7 @@ pub async fn wb_aggregate_chat(
                                 "11128 强制清洗重试{}", wb_payload::template_hit_note()
                             ));
                             converted = wb_payload::prepare_wb_chat_body(
-                                &body_vec, &model, &conv_id, effort.as_deref(), true, &templates,
+                                &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
                             );
                             std::thread::sleep(std::time::Duration::from_millis(200));
                             continue;
@@ -943,7 +1072,7 @@ pub async fn wb_aggregate_chat(
                                 }
                                 let kind = classify_error(status, &resp_body);
                                 state.wb_pool.note_error(&picked.uid, kind);
-                                note_model_failure(&state, &model);
+                                note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
                                 state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
@@ -1129,7 +1258,7 @@ pub async fn wb_tool_exec_chat(
 
                 let body_bytes = serde_json::to_vec(&chat_body).unwrap_or_default();
                 let converted = wb_payload::prepare_wb_chat_body(
-                    &body_bytes, &model, &conv_id, effort.as_deref(), sanitize, &templates,
+                    &body_bytes, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
                 );
 
                 // F-76① 各轮记首字耗时（最终轮即最终回复的 TTFT）
@@ -1151,7 +1280,7 @@ pub async fn wb_tool_exec_chat(
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
                                 state.wb_pool.note_error(&picked.uid, kind);
-                                note_model_failure(&state, &model);
+                                note_model_failure_ex(&state, &model, Some(&msg));
                             }
                             *safe_lock(&state.last_error) =
                                 Some(format!("wb-toolexec uid={} code={} msg={}", picked.uid, code, msg));
@@ -1161,7 +1290,16 @@ pub async fn wb_tool_exec_chat(
                             break Err("上游返回空响应".to_string());
                         };
                         if super::aggregated_response_is_empty(&completion) {
-                            // 空完成（影子风控/上游异常，issue #57）：换号重试
+                            // 空完成（影子风控/上游异常，issue #57）：换号重试。
+                            // 口径：同流式路径不冷却（哨兵注释见 mod.rs）；此处补即时
+                            // 观测日志，接通「空完成 → 模板命中」反查通道（与其余路径一致）
+                            let duration_ms = start_ts.elapsed().as_millis() as u64;
+                            state.logger.log_request_ttfb(
+                                "buddy", "POST", "/v1/responses", &model, stream, 502, &picked.uid,
+                                duration_ms, last_ttfb_ms, &key_name,
+                                &state.wb_pool.name_of(&picked.uid),
+                                Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                            );
                             break Err("空完成（影子风控/上游异常）".to_string());
                         }
                         if let Some(u) = completion.get("usage") {
@@ -1270,7 +1408,7 @@ pub async fn wb_tool_exec_chat(
                                 }
                                 let kind = classify_error(status, &resp_body);
                                 state.wb_pool.note_error(&picked.uid, kind);
-                                note_model_failure(&state, &model);
+                                note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
                                 break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 200)));
                             }
                             RetryAction::Fatal => {
@@ -1501,5 +1639,57 @@ mod tests {
         assert!(matches!(classify_wb_error(0, "weird"), ErrKind::Server));
         // message 关键词优先级不受 code 分段影响
         assert!(matches!(classify_wb_error(200, "积分不足"), ErrKind::HardCredit));
+    }
+
+    /// 6004 限额文案 → 精确恢复时刻（agent2api errors.rs 同源语义；
+    /// UTC+8 字面量必须命中，按 UTC+8 解释为 Unix 秒）
+    #[test]
+    fn parse_quota_reset_at_from_limit_message() {
+        use chrono::TimeZone;
+        // 未来时刻动态构造（UTC+8 时区格式化），格式与上游文案一致
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(3))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let msg = format!(
+            "当前模型使用额度已达上限，将在 {} UTC+8 重置",
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        let ts = parse_quota_reset_at(&msg).expect("应解析出恢复时刻");
+        assert_eq!(ts, reset.timestamp());
+        // 缺 UTC+8 字面量 / 缺时刻 → None
+        assert_eq!(parse_quota_reset_at("将在 2099-01-01 00:00:00 重置"), None);
+        assert_eq!(parse_quota_reset_at("quota exceeded"), None);
+        // 过去时刻 → None（落回渐进退避）
+        assert_eq!(parse_quota_reset_at("已在 2020-01-01 00:00:00 UTC+8 重置"), None);
+        // 超远未来（>7 天钳制）→ None
+        let far = (chrono::Utc::now() + chrono::Duration::days(30))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let far_msg = format!("将在 {} UTC+8 重置", far.format("%Y-%m-%d %H:%M:%S"));
+        assert_eq!(parse_quota_reset_at(&far_msg), None);
+        // 复审修复回归：双时刻文案（触发时刻为过去 + 恢复时刻为未来）→
+        // 首锚点解析出过去时刻须跳过，继续用第二锚点解析出恢复时刻
+        let past = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let dual = format!(
+            "您于 {} UTC+8 触发限额，将在 {} UTC+8 重置",
+            past.format("%Y-%m-%d %H:%M:%S"),
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        assert_eq!(parse_quota_reset_at(&dual), Some(reset.timestamp()));
+    }
+
+    /// upstream_msg 三种字段形态（message / error.message / msg）提取
+    #[test]
+    fn upstream_msg_field_variants() {
+        assert_eq!(
+            upstream_msg(r#"{"code":6004,"message":"将在 2099-01-01 00:00:00 UTC+8 重置"}"#).as_deref(),
+            Some("将在 2099-01-01 00:00:00 UTC+8 重置")
+        );
+        assert_eq!(
+            upstream_msg(r#"{"error":{"code":6004,"message":"限额"}}"#).as_deref(),
+            Some("限额")
+        );
+        assert_eq!(upstream_msg(r#"{"code":6004,"msg":"腾讯系 msg 字段"}"#).as_deref(), Some("腾讯系 msg 字段"));
+        assert_eq!(upstream_msg("not json"), None);
+        assert_eq!(upstream_msg("{}"), None);
     }
 }

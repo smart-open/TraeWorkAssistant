@@ -430,6 +430,23 @@ pub struct ApiPoolFile {
     /// （未分组账号不参与，对齐 Trae 池 group_ids 的 T10 语义）；空 = 不限分组
     #[serde(default)]
     pub wb_group_ids: Vec<String>,
+    /// Qoder 上游开关（3.7.0 移植）：开启后 Qoder 目录模型路由到 Qoder 账号池
+    #[serde(default = "default_true")]
+    pub qoder_enabled: bool,
+    /// Qoder 池入池白名单（qoder 账号 id）：空 = 全部含凭证账号自动入池（fail-open，
+    /// 对齐 Buddy 池 wb_enabled_uids 语义）；非空 = 仅列表内账号参与调度
+    #[serde(default)]
+    pub qoder_enabled_uids: Vec<String>,
+    /// Qoder 慢请求竞速对冲阈值毫秒（F-80-余 v2，同 wb_hedge_threshold_ms）：0 = 关闭
+    #[serde(default)]
+    pub qoder_hedge_threshold_ms: u64,
+    /// Qoder 会话粘性开关（F-80-余 v2；qoder_sticky）：默认关（对齐 main）
+    #[serde(default)]
+    pub qoder_sticky_enabled: bool,
+    /// Qoder 池分组筛选（qoder_group_ids）：非空时仅纳入所选分组的 Qoder 账号
+    /// （未分组账号不参与，对齐 Buddy 池 wb_group_ids 语义）；空 = 不限分组
+    #[serde(default)]
+    pub qoder_group_ids: Vec<String>,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -471,6 +488,11 @@ impl Default for ApiPoolFile {
             wb_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
             wb_enabled_uids: Vec::new(),
             wb_group_ids: Vec::new(),
+            qoder_enabled: true,
+            qoder_enabled_uids: Vec::new(),
+            qoder_hedge_threshold_ms: 0,
+            qoder_sticky_enabled: false,
+            qoder_group_ids: Vec::new(),
         }
     }
 }

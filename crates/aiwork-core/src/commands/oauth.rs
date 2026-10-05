@@ -188,41 +188,25 @@ fn pem_cert_der(pem: &str) -> Result<Vec<u8>, String> {
 /// 生成随机 hex 字符串。
 /// 熵源：OS CSPRNG（Web 化改造后统一走 rand::rngs::OsRng，跨平台安全随机；桌面版
 /// 为 Windows BCryptGenRandom 系统首选 RNG）。旧 LCG 以时间戳作种子，输出可预测，
-/// 不适合 OAuth state / machine_id 等安全场景（审查 P2）；OS RNG 失败时
-/// 保留 LCG 兜底（仅影响随机性，不中断流程）。
+/// 不适合 OAuth state / PKCE verifier / nonce 等安全场景（审查 P1-6）——
+/// 已移除：CSPRNG 失败直接 panic（系统熵池不可用时继续只会产生可预测输出，
+/// 等同把授权码暴露给可猜 state 的劫持者），不再静默降级。
 pub fn random_hex(len: usize) -> String {
     use rand::RngCore;
     let mut bytes = vec![0u8; len.div_ceil(2)];
-    if rand::rngs::OsRng.try_fill_bytes(&mut bytes).is_ok() {
-        let mut out = String::with_capacity(len);
-        for b in bytes {
-            if out.len() >= len {
-                break;
-            }
-            out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
-            if out.len() >= len {
-                break;
-            }
-            out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
-        }
-        return out;
+    if let Err(e) = rand::rngs::OsRng.try_fill_bytes(&mut bytes) {
+        panic!("OsRng 失败（{e}）：系统熵池不可用，拒绝降级为可预测随机");
     }
-    // 兜底：旧 LCG（仅 OS CSPRNG 不可用时）
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(42);
     let mut out = String::with_capacity(len);
-    for _ in 0..len {
-        // 简单 LCG
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let nibble = ((seed >> 32) & 0xF) as u8;
-        out.push(if nibble < 10 {
-            (b'0' + nibble) as char
-        } else {
-            (b'a' + nibble - 10) as char
-        });
+    for b in bytes {
+        if out.len() >= len {
+            break;
+        }
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+        if out.len() >= len {
+            break;
+        }
+        out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
     }
     out
 }

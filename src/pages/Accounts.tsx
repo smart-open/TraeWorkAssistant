@@ -8,6 +8,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  ShieldAlert,
   Snowflake,
   Tags,
   Trash2,
@@ -15,7 +16,7 @@ import {
   Zap,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
-import { Badge, EmptyState } from '../components/ui';
+import { Badge, EmptyState, Modal } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
@@ -70,6 +71,10 @@ export default function Accounts() {
   const [importSelected, setImportSelected] = useState<Set<number>>(new Set());
   // 删除确认（禁 window.confirm，红线）：删除账号
   const [deleteTarget, setDeleteTarget] = useState<AccountView | null>(null);
+  // 导出凭证确认（审查 P0-2；禁 window.confirm，红线）：Trae 导出恒含明文 JWT / refreshToken
+  const [exportConfirming, setExportConfirming] = useState(false);
+  // 导出进行中（审查 #18 防双击）：Modal 不响应关闭，确认按钮禁用 + 旋转图标
+  const [exportBusy, setExportBusy] = useState(false);
   // Web 版文件选择：隐藏 input 触发系统文件选择框
   const importInputRef = useRef<HTMLInputElement>(null);
 
@@ -105,11 +110,18 @@ export default function Accounts() {
     }
   };
 
-  const exportAccounts = async () => {
+  const exportAccounts = () => {
     if (accounts.length === 0) {
       toast('warn', '没有账号可导出');
       return;
     }
+    // 凭证导出强确认（审查 P0-2；禁 window.confirm，红线）：导出文件恒含明文 JWT / refreshToken
+    setExportConfirming(true);
+  };
+
+  const doExportAccounts = async () => {
+    if (exportBusy) return; // 审查 #18：防双击重复导出
+    setExportBusy(true);
     try {
       const payload = await api.accounts.exportRaw();
       const content = JSON.stringify(payload, null, 2);
@@ -125,6 +137,9 @@ export default function Accounts() {
       toast('success', `已导出 ${accounts.length} 个账号`);
     } catch (err) {
       toast('error', `导出失败：${String(err)}`);
+    } finally {
+      setExportBusy(false);
+      setExportConfirming(false);
     }
   };
 
@@ -215,7 +230,7 @@ export default function Accounts() {
             <button onClick={() => setAddOpen(true)} className="btn-outline" title="手动粘贴 JWT 添加账号">
               <Plus size={15} /> 添加账号
             </button>
-            <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
+            <button onClick={() => exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
               <Download size={15} /> 导出账号
             </button>
             <button
@@ -456,6 +471,36 @@ export default function Accounts() {
         onClose={() => setDeleteTarget(null)}
         onConfirm={() => void confirmDelete()}
       />
+      {/* 导出凭证确认弹框（审查 P0-2；禁 window.confirm，红线） */}
+      <Modal
+        open={exportConfirming}
+        onClose={() => {
+          if (!exportBusy) setExportConfirming(false); // 审查 #18：导出中禁止关闭
+        }}
+        title="确认导出明文凭证"
+        footer={
+          <>
+            <button className="btn-outline" disabled={exportBusy} onClick={() => setExportConfirming(false)}>
+              取消
+            </button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              disabled={exportBusy}
+              onClick={() => void doExportAccounts()}
+            >
+              {exportBusy ? <Loader2 size={14} className="animate-spin" /> : null} 我已知晓风险，继续导出
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-sm">
+          <div>即将导出 {accounts.length} 个账号，文件包含明文 JWT / refreshToken 凭证（等同密码）。</div>
+          <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
+            <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+            <span>仅应在可信环境用于账号迁移，导出后请妥善保管，切勿通过不可信渠道传输。</span>
+          </div>
+        </div>
+      </Modal>
       <OAuthLoginModal
         open={oauthOpen}
         onClose={() => setOAuthOpen(false)}

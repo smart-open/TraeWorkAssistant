@@ -187,16 +187,19 @@ impl DayStats {
 }
 
 /// 用量分桶（资源池维度分账）：Trae = Trae 模型请求；Wb = WB 上游请求；
-/// Custom = 自定义模型（custom_models.json 命中直达）请求
+/// Custom = 自定义模型（custom_models.json 命中直达）请求；
+/// Qoder = Qoder 上游请求（p3-3 移植，独立 qoder_days 桶）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageBucket {
     Trae,
     Wb,
     Custom,
+    Qoder,
 }
 
 /// 用量数据根结构：日期 → 单日统计。
-/// 按资源池分桶：days = Trae 模型请求；wb_days = WB 上游请求；custom_days = 自定义模型请求
+/// 按资源池分桶：days = Trae 模型请求；wb_days = WB 上游请求；custom_days = 自定义模型请求；
+/// qoder_days = Qoder 上游请求（p3-3 移植）
 /// （serde default，旧文件无对应桶时视为空——历史混入数据无法追溯分离，从启用时点起分账）。
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct UsageFile {
@@ -206,6 +209,8 @@ pub struct UsageFile {
     pub wb_days: HashMap<String, DayStats>,
     #[serde(default)]
     pub custom_days: HashMap<String, DayStats>,
+    #[serde(default)]
+    pub qoder_days: HashMap<String, DayStats>,
 }
 
 impl UsageFile {
@@ -214,6 +219,7 @@ impl UsageFile {
             UsageBucket::Trae => &mut self.days,
             UsageBucket::Wb => &mut self.wb_days,
             UsageBucket::Custom => &mut self.custom_days,
+            UsageBucket::Qoder => &mut self.qoder_days,
         }
     }
 
@@ -223,6 +229,7 @@ impl UsageFile {
             UsageBucket::Trae => &self.days,
             UsageBucket::Wb => &self.wb_days,
             UsageBucket::Custom => &self.custom_days,
+            UsageBucket::Qoder => &self.qoder_days,
         };
         b.get(day)
     }
@@ -316,7 +323,12 @@ impl UsageFile {
     pub fn trim(&mut self, keep_days: i64) {
         let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(keep_days);
         let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
-        for bucket in [&mut self.days, &mut self.wb_days, &mut self.custom_days] {
+        for bucket in [
+            &mut self.days,
+            &mut self.wb_days,
+            &mut self.custom_days,
+            &mut self.qoder_days,
+        ] {
             bucket.retain(|d, _| d.as_str() >= cutoff_str.as_str());
         }
     }
@@ -327,6 +339,7 @@ impl UsageFile {
             UsageBucket::Trae => &self.days,
             UsageBucket::Wb => &self.wb_days,
             UsageBucket::Custom => &self.custom_days,
+            UsageBucket::Qoder => &self.qoder_days,
         };
         let mut sorted: Vec<(&String, &DayStats)> = b.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(b.0));
@@ -362,6 +375,7 @@ pub fn save_day(data_dir: &Path, bucket: UsageBucket, day: &str, stats: &DayStat
         UsageBucket::Trae => "trae",
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
+        UsageBucket::Qoder => "qoder",
     };
     crate::store::docs::api_usage_upsert_day(&crate::store::db(data_dir), b, day, &text).is_ok()
 }

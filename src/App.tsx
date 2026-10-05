@@ -19,6 +19,11 @@ import BuddyCheckin from './pages/buddy/BuddyCheckin';
 import CreditsDashboard from './pages/dashboard/Dashboard';
 import BuddyApiService from './pages/buddy/BuddyApiService';
 import BuddySettings from './pages/buddy/BuddySettings';
+import QoderOverview from './pages/qoder/QoderOverview';
+import QoderAccounts from './pages/qoder/QoderAccounts';
+import QoderCheckin from './pages/qoder/QoderCheckin';
+import QoderApiService from './pages/qoder/QoderApiService';
+import QoderSettings from './pages/qoder/QoderSettings';
 import ApiManagerModal from './components/api/ApiManagerModal';
 
 function renderView(view: string) {
@@ -51,6 +56,18 @@ function renderView(view: string) {
       return <BuddyApiService />;
     case 'buddy-settings':
       return <BuddySettings />;
+    case 'qoder-overview':
+      return <QoderOverview />;
+    case 'qoder-accounts':
+      return <QoderAccounts />;
+    case 'qoder-checkin':
+      return <QoderCheckin />;
+    case 'qoder-credits':
+      return <CreditsDashboard key="qoder" platform="qoder" />;
+    case 'qoder-api-service':
+      return <QoderApiService key="qoder-api-service" />;
+    case 'qoder-settings':
+      return <QoderSettings />;
     default:
       return <Dashboard />;
   }

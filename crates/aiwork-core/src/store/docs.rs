@@ -243,6 +243,174 @@ pub fn sticky_bindings_save(s: &Store, root: &Value) -> Result<(), String> {
     })
 }
 
+// ── Qoder 账号池（qoder_accounts 表；行保序，结构 {accounts: [...]}）──────────
+
+/// 读整池（rows_all 按 rowid 序 = 原数组序）
+pub fn qoder_pool_load(s: &Store) -> Value {
+    let accounts: Vec<Value> = s
+        .rows_all("qoder_accounts")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "accounts": accounts })
+}
+
+/// 写整池（pk = 账号 id，缺 id 用序号占位）
+pub fn qoder_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = pool.get("accounts").and_then(Value::as_array).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let id = a.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+            (id.map(String::from).unwrap_or_else(|| format!("__idx{i}")), a.clone())
+        })
+        .collect();
+    s.rows_replace("qoder_accounts", &rows)
+}
+
+// ── Qoder token store（qoder_tokens 表；结构 {version, tokens: {id: rec}}）──
+
+/// 读整库（损坏行过滤丢弃，不混入消费方；version 存 kv qoder_tokens_meta）
+pub fn qoder_token_store_load(s: &Store) -> Value {
+    let tokens: serde_json::Map<String, Value> = s
+        .rows_all("qoder_tokens")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v.is_object())
+        .collect();
+    let version = s.kv_get_raw("qoder_tokens_meta").and_then(|v| v.parse::<i64>().ok());
+    let mut root = serde_json::Map::new();
+    root.insert("tokens".into(), Value::Object(tokens));
+    if let Some(v) = version {
+        root.insert("version".into(), json!(v));
+    }
+    Value::Object(root)
+}
+
+/// 写整库（version 闸门由调用方维持，此处整表替换）
+pub fn qoder_token_store_save(s: &Store, store_val: &Value) -> Result<(), String> {
+    let empty = serde_json::Map::new();
+    let tokens = store_val.get("tokens").and_then(Value::as_object).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> =
+        tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    s.rows_replace("qoder_tokens", &rows)?;
+    if let Some(v) = store_val.get("version").and_then(Value::as_i64) {
+        s.kv_set_raw("qoder_tokens_meta", &v.to_string())?;
+    }
+    Ok(())
+}
+
+// ── Qoder 签到结果（qoder_checkin_results 表；行文档 + 90 天滚动由调用方裁剪）──
+
+/// 读回 {results: [...]}（rows_all 按 rowid 序 = 原追加序）
+pub fn qoder_checkin_results_load(s: &Store) -> Value {
+    let results: Vec<Value> = s
+        .rows_all("qoder_checkin_results")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "results": results })
+}
+
+/// 单条签到结果 UPSERT + 90 天滚动裁剪。
+/// pk = `date|user_id|time_ms`（内容派生）：原 `date|user_id|idx` 的 idx 是「载入时数组
+/// 下标」，计划任务与 UI 触发两进程各自从 0 计数，同日同账号并发写入必然互相覆盖；
+/// 秒级 time 同账号同秒仍会碰撞，故优先毫秒级 time_ms（旧记录/旧调用方回退 time 兼容）。
+/// 裁剪为逐 pk DELETE，仅删过期行不触碰新写入（对齐 qoder_credits_history_upsert 模式）。
+pub fn qoder_checkin_results_upsert(s: &Store, rec: &Value) -> Result<(), String> {
+    let date = rec.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    let uid = rec.get("user_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let tail = match rec.get("time_ms").and_then(Value::as_i64) {
+        Some(ms) => ms.to_string(),
+        None => rec
+            .get("time")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    };
+    if date.is_empty() || uid.is_empty() || tail.is_empty() {
+        return Err("签到结果缺少 date/user_id/time_ms(time)".into());
+    }
+    s.row_upsert("qoder_checkin_results", &format!("{date}|{uid}|{tail}"), rec)?;
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(90))
+        .format("%Y-%m-%d")
+        .to_string();
+    let stale: Vec<String> = s
+        .rows_all("qoder_checkin_results")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pk, _)| pk)
+        .filter(|pk| pk.as_str() < cutoff.as_str())
+        .collect();
+    let mut fail = 0usize;
+    let mut first_err = String::new();
+    for pk in stale {
+        if let Err(e) =
+            s.with_conn(|c| c.execute("DELETE FROM qoder_checkin_results WHERE pk = ?1", [&pk]))
+        {
+            fail += 1;
+            if first_err.is_empty() {
+                first_err = e;
+            }
+        }
+    }
+    if fail > 0 {
+        // store 层无 data_dir 不可 app_log；裁剪失败不影响本次写入，过期行留待下次
+        eprintln!("[qoder] 签到结果滚动裁剪删除失败 {fail} 条（首错: {first_err}），过期行将留待下次裁剪");
+    }
+    Ok(())
+}
+
+// ── Qoder 每日积分快照（qoder_credits_history 表；pk = date，同日覆盖）──────
+
+/// 读全部快照（按 pk 升序 = 日期升序）
+pub fn qoder_credits_history_load(s: &Store) -> Vec<Value> {
+    s.rows_all("qoder_credits_history")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect()
+}
+
+/// 同日覆盖 upsert + 365 天裁剪（pk 即 date，YYYY-MM-DD 字符串比较即时间序）
+pub fn qoder_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), String> {
+    let date = snap.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    if date.is_empty() {
+        return Err("快照缺少 date 字段".into());
+    }
+    s.row_upsert("qoder_credits_history", &date, snap)?;
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
+        .format("%Y-%m-%d")
+        .to_string();
+    let stale: Vec<String> = s
+        .rows_all("qoder_credits_history")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pk, _)| pk)
+        .filter(|pk| pk.as_str() < cutoff.as_str())
+        .collect();
+    let mut fail = 0usize;
+    let mut first_err = String::new();
+    for pk in stale {
+        if let Err(e) =
+            s.with_conn(|c| c.execute("DELETE FROM qoder_credits_history WHERE pk = ?1", [&pk]))
+        {
+            fail += 1;
+            if first_err.is_empty() {
+                first_err = e;
+            }
+        }
+    }
+    if fail > 0 {
+        eprintln!("[qoder] 积分快照滚动裁剪删除失败 {fail} 条（首错: {first_err}），过期行将留待下次裁剪");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,6 +1106,11 @@ pub fn wb_token_store_upsert(s: &Store, id: &str, rec: &Value) -> Result<(), Str
     s.row_upsert("wb_tokens", id, rec)
 }
 
+/// 仅写 version kv 元数据（供凭证收敛后的单行 upsert 路径维持版本闸门）
+pub fn wb_token_store_save_version(s: &Store, version: i64) -> Result<(), String> {
+    s.kv_set_raw("wb_tokens_meta", &version.to_string())
+}
+
 // ── API 用量（api_usage.json → api_usage 表，(bucket, day) 行文档）───────────
 
 fn bucket_name(b: UsageBucket) -> &'static str {
@@ -945,6 +1118,7 @@ fn bucket_name(b: UsageBucket) -> &'static str {
         UsageBucket::Trae => "trae",
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
+        UsageBucket::Qoder => "qoder",
     }
 }
 
@@ -953,6 +1127,7 @@ fn bucket_of(name: &str) -> Option<UsageBucket> {
         "trae" => Some(UsageBucket::Trae),
         "wb" => Some(UsageBucket::Wb),
         "custom" => Some(UsageBucket::Custom),
+        "qoder" => Some(UsageBucket::Qoder),
         _ => None,
     }
 }
@@ -962,6 +1137,7 @@ fn bucket_map_mut<'a>(f: &'a mut UsageFile, b: UsageBucket) -> &'a mut std::coll
         UsageBucket::Trae => &mut f.days,
         UsageBucket::Wb => &mut f.wb_days,
         UsageBucket::Custom => &mut f.custom_days,
+        UsageBucket::Qoder => &mut f.qoder_days,
     }
 }
 

@@ -5,12 +5,15 @@ import { SOURCE_LABELS, SOURCES, type BoardSource } from '../../components/Chart
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
-import { fmtCredits } from '../../lib/format';
+import { fmtCredits, dateStrToEndTs } from '../../lib/format';
 import KpiRow, { type PlatformKpi, type PlatformScope } from './KpiRow';
 import ExpiryTab from './ExpiryTab';
 import CreditsTab from './CreditsTab';
 import TokensTab, { type GatewayDays } from './TokensTab';
 import type {
+  QoderCheckinRecord,
+  QoderCreditsResult,
+  QoderCreditsSnapshot,
   UsageDayView,
   UsageHistoryResult,
   WbCheckinRecord,
@@ -23,8 +26,9 @@ import type {
 
 /**
  * 积分看板（credits-dashboard-plan.md；平台拆分调整）：
- * 同一套看板组件按 platform 参数分别渲染 Trae / Buddy 两个独立页面——
- * Trae 页挂在 `credits` 视图，Buddy 页挂在 `buddy-credits` 视图，互不混装。
+ * 同一套看板组件按 platform 参数分别渲染 Trae / Buddy / Qoder 三个独立页面——
+ * Trae 页挂在 `credits` 视图，Buddy 页挂在 `buddy-credits` 视图，
+ * Qoder 页挂在 `qoder-credits` 视图，互不混装。
  * 布局：PageHeader（标题+概述）→ KPI 7 卡 → Tab 工具行（Tab 切换 + 刷新）→ Tab 内容。
  */
 
@@ -36,27 +40,28 @@ const TABS: { key: BoardTab; label: string }[] = [
   { key: 'expiry', label: '积分到期' },
 ];
 
-/** 页面标题/概述（两页同一结构：积分余额 · 积分明细 · Token 统计 · 到期日历） */
-const PAGE_META: Record<'trae' | 'buddy', { title: string; desc: string }> = {
+/** 页面标题/概述（三页同一结构：积分余额 · 积分明细 · Token 统计 · 到期日历） */
+const PAGE_META: Record<'trae' | 'buddy' | 'qoder', { title: string; desc: string }> = {
   trae: { title: 'Trae · 积分看板', desc: '积分余额 · 积分明细 · Token 统计 · 到期日历' },
   buddy: { title: 'Buddy · 积分看板', desc: '积分余额 · 积分明细 · Token 统计 · 到期日历' },
+  qoder: { title: 'Qoder · 积分看板', desc: '积分余额 · 积分明细 · Token 统计 · 到期日历' },
 };
 
 function localDate(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-export default function CreditsDashboard({ platform }: { platform: 'trae' | 'buddy' }) {
+export default function CreditsDashboard({ platform }: { platform: 'trae' | 'buddy' | 'qoder' }) {
   const pushToast = useAppStore((s) => s.pushToast);
   const accounts = useAppStore((s) => s.accounts);
   const creditsDaily = useAppStore((s) => s.creditsDaily);
   const refreshRemainingCredits = useAppStore((s) => s.refreshRemainingCredits);
   const refreshCreditsDaily = useAppStore((s) => s.refreshCreditsDaily);
-  // 注（docker/web 版适配）：桌面版的 Trae 逐条积分流水（creditsHistory）与本地 Token
-  // 统计（扫描本机 ~/.workbuddy 会话文件）在 Web 版不可用——前者回退快照 earned 口径，
-  // 后者本地数据源整体下线（数据源切换器不渲染，tokenStats 恒 null）
+  // 注（docker/web 版适配）：桌面版的本地 Token 统计（扫描本机 ~/.workbuddy 会话文件）
+  // 在 Web 版不可用——本地数据源整体下线（tokenStats 恒 null）
 
   const isTrae = platform === 'trae';
+  const isQoder = platform === 'qoder';
 
   const [tab, setTab] = useState<BoardTab>('credits');
   const [loading, setLoading] = useState(false);
@@ -71,9 +76,13 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   const [wbFallback, setWbFallback] = useState<WbUsageFallback | null>(null);
   // 快照时序（§2.2 方案 B：earned 已落库；null 日期回退方案 A 签到聚合）
   const [wbSnapshots, setWbSnapshots] = useState<WbCreditsSnapshot[]>([]);
-  // 各统计 Tab 独立数据源状态（§3.4）；Token 统计默认源按平台选择
-  // （本地源 Web 版不可用 → Trae 官网优先，Buddy 走网关源），积分统计两平台均默认官网源
-  const [creditsSource, setCreditsSource] = useState<BoardSource>('official');
+  // Qoder 侧数据（官网积分查询 + 本地快照时序 + 签到日志今日新增回退口径；其他页不加载）
+  const [qoderCredits, setQoderCredits] = useState<QoderCreditsResult | null>(null);
+  const [qoderSnapshots, setQoderSnapshots] = useState<QoderCreditsSnapshot[]>([]);
+  const [qoderCheckin, setQoderCheckin] = useState<QoderCheckinRecord[]>([]);
+  // 各统计 Tab 独立数据源状态（§3.4）；默认源按平台选择
+  // （Trae/Buddy 官网优先；Qoder 官网无消耗明细 → 本地快照），积分统计两平台均默认官网源
+  const [creditsSource, setCreditsSource] = useState<BoardSource>(platform === 'qoder' ? 'local' : 'official');
   const [tokensSource, setTokensSource] = useState<BoardSource>(platform === 'trae' ? 'official' : 'gateway');
 
   // Token 统计 Tab 数据（Web 版无本地 token 源，tokenStats 恒 null；网关源 SQLite 直查）
@@ -131,13 +140,43 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     [pushToast],
   );
 
+  // ---- Qoder 页数据装载 ----
+  // 先查积分（后端全量查询且全部成功时落当日快照，同日覆盖），完成后再读快照时序，
+  // 保证「今日快照」在首次装载即可见；签到日志 2 天窗口仅作今日新增的回退口径
+  const loadQoder = useCallback(
+    async (fresh: boolean) => {
+      await api.qoder
+        .creditsFetch(undefined, fresh)
+        .then((r) => {
+          setQoderCredits(r);
+          if (fresh && r.stale) {
+            pushToast('warn', 'Qoder 积分刷新失败，已回退展示历史缓存数据');
+          }
+        })
+        .catch((err) => pushToast('error', `Qoder 积分查询失败：${String(err)}`));
+      await Promise.allSettled([
+        api.qoder
+          .creditsHistoryList()
+          .then((r) => setQoderSnapshots(r.snapshots ?? []))
+          .catch(() => setQoderSnapshots([])),
+        api.qoder
+          .checkinResults(2)
+          .then(setQoderCheckin)
+          .catch(() => setQoderCheckin([])),
+      ]);
+    },
+    [pushToast],
+  );
+
   // ---- Token 统计 Tab 数据源（Web 版仅网关源；本地 token 扫描为桌面版专属）----
   const loadGateway = useCallback(async () => {
     setGatewayLoading(true);
     try {
-      // 看板按单平台展示，仅拉取 Trae/Buddy 两池（custom 池仅 API 服务页 UsageStatsPanel 使用）
+      // 看板按单平台展示，拉取 Trae/Buddy/Qoder 三池（custom 池仅 API 服务页 UsageStatsPanel 使用）
+      // Qoder 网关用量管道已铺（阶段 3 四桶基建），上游未接入前 qoder 池为空；
+      // 三平台一并装载，上游接入后无需再改门控
       const failed: string[] = [];
-      const [trae, buddy] = await Promise.all([
+      const [trae, buddy, qoder] = await Promise.all([
         api.apiServer.usageStats(90).catch(() => {
           failed.push('Trae');
           return [] as UsageDayView[];
@@ -146,8 +185,12 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
           failed.push('Buddy');
           return [] as UsageDayView[];
         }),
+        api.apiServer.qoderUsageStats(90).catch(() => {
+          failed.push('Qoder');
+          return [] as UsageDayView[];
+        }),
       ]);
-      setGateway({ trae, buddy });
+      setGateway({ trae, buddy, qoder });
       if (failed.length > 0) {
         pushToast('warn', `网关用量加载失败（${failed.join('、')}池）：已按空态展示，可点击「刷新」重试`);
       }
@@ -179,7 +222,8 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
               // 按平台只加载本侧数据源
               isTrae ? refreshCreditsDaily() : Promise.resolve(),
               isTrae ? loadUsage(fresh) : Promise.resolve(),
-              isTrae ? Promise.resolve() : loadBuddy(fresh),
+              isTrae || isQoder ? Promise.resolve() : loadBuddy(fresh),
+              isQoder ? loadQoder(fresh) : Promise.resolve(),
               // 已加载过的源随全局刷新联动（fresh=true 网关直查）
               gatewayLoadedRef.current && fresh ? loadGateway() : Promise.resolve(),
             ]);
@@ -193,7 +237,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
         setLoading(false);
       }
     },
-    [isTrae, refreshRemainingCredits, refreshCreditsDaily, loadUsage, loadBuddy, loadGateway, pushToast],
+    [isTrae, isQoder, refreshRemainingCredits, refreshCreditsDaily, loadUsage, loadBuddy, loadQoder, loadGateway, pushToast],
   );
 
   useEffect(() => {
@@ -290,47 +334,125 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     };
   }, [wbCredits, wbCheckin, wbSnapshots, wbOfficial, wbFallback, today]);
 
-  const kpi = isTrae ? traeKpi : buddyKpi;
+  // ---- Qoder KPI（官网积分查询 + 本地快照差分）----
+  const qoderKpi = useMemo<PlatformKpi>(() => {
+    const nowSec = Date.now() / 1000;
+    const horizon = nowSec + 7 * 86400;
+    const accs = qoderCredits?.accounts ?? [];
+    let totalCredits = 0;
+    let packages = 0;
+    let expiring = 0;
+    for (const a of accs) {
+      totalCredits += a.total ?? 0;
+      // 包明细已含 plan 订阅配额包（R-11 逐包口径）→ 独立 Plan 条目不重复计入；
+      // 判定与到期日历同款（some 不过滤 amount）：plan 包已用完也视为「明细已含」
+      const hasPlanPkg = (a.packages ?? []).some((p) => p.source === 'plan');
+      for (const p of a.packages ?? []) {
+        // 包计数与到期日历对齐：剩余未知或 > 0 计入，已用完不计
+        if (p.amount != null && p.amount <= 0) continue;
+        packages += 1;
+        const endTs = dateStrToEndTs(p.expire_at);
+        if (endTs != null && endTs > nowSec && endTs <= horizon) expiring += p.amount ?? 0;
+      }
+      // 7 天内到期含 Plan 订阅重置额度：订阅周期在窗口内到期，plan 剩余全额计入
+      if (!hasPlanPkg) {
+        const planEnd = dateStrToEndTs(a.plan_expires_at);
+        if (planEnd != null && (a.plan_credits ?? 0) > 0) {
+          // 包计数与到期日历口径对齐：包明细缺 plan 包（明细接口失败/老缓存回退
+          // 聚合口径）时，日历会补一条「Plan 订阅重置」独立条目 → 此处同步 +1
+          packages += 1;
+          if (planEnd > nowSec && planEnd <= horizon) expiring += a.plan_credits ?? 0;
+        }
+      }
+    }
+    // 今日新增：快照 earned（签到合计）优先，回退签到日志 reward 聚合（fetch 未落快照时）
+    const todaySnap = qoderSnapshots.find((s) => s.date === today);
+    const checkinEarned = qoderCheckin
+      .filter((r) => r.date === today)
+      .reduce((s, r) => s + (r.reward ?? 0), 0);
+    const todayEarned = todaySnap?.earned != null ? Math.max(0, todaySnap.earned) : checkinEarned;
+    return {
+      accounts: accs.length,
+      totalCredits,
+      packages,
+      todayEarned,
+      // null = 差分不可比（首日/账号数变动日）→ KPI 卡显示「—」，不与零消耗混淆
+      todayConsumed: todaySnap?.consumed ?? null,
+      expiring7d: expiring,
+    };
+  }, [qoderCredits, qoderSnapshots, qoderCheckin, today]);
 
-  // 可用积分总数卡 hint：Buddy 缓存/stale 状态说明；无数据时不给失真提示
-  const creditsHint = isTrae
+  const kpi = isTrae ? traeKpi : isQoder ? qoderKpi : buddyKpi;
+
+  // 可用积分总数卡 hint：Buddy/Qoder 缓存/stale 状态说明；无数据时不给失真提示
+  const creditsResult = platform === 'trae' ? null : platform === 'buddy' ? wbCredits : qoderCredits;
+  const creditsHint = !creditsResult
     ? undefined
-    : !wbCredits
-      ? undefined
-      : wbCredits.stale
-        ? '历史缓存回退（本次查询失败）'
-        : wbCredits.cached
-          ? '缓存数据（≥10 分钟）'
-          : '实时数据';
-  // 今日新增口径诚实标注（§8.4）：快照 earned（方案 B）已统计 vs 回退签到口径（方案 A）
+    : creditsResult.stale
+      ? '历史缓存回退（本次查询失败）'
+      : creditsResult.cached
+        ? '缓存数据（≥10 分钟）'
+        : '实时数据';
+  // 今日新增口径诚实标注（§8.4）：快照 earned 已统计 vs 回退签到口径
   const todaySnapEarned = wbSnapshots.find((s) => s.date === today)?.earned;
+  const qoderTodaySnap = qoderSnapshots.find((s) => s.date === today);
+  const qoderLastSnapDate = qoderSnapshots.reduce<string | null>((acc, s) => (!acc || s.date > acc ? s.date : acc), null);
   const earnedHint = isTrae
     ? undefined
-    : todaySnapEarned != null
-      ? '口径：余额差分+签到归并'
-      : wbCheckin.length > 0
-        ? '仅含签到新增'
-        : undefined;
+    : isQoder
+      ? qoderTodaySnap?.earned != null
+        ? '口径：当日签到奖励合计'
+        : qoderCheckin.length > 0
+          ? '仅含签到新增'
+          : undefined
+      : todaySnapEarned != null
+        ? '口径：余额差分+签到归并'
+        : wbCheckin.length > 0
+          ? '仅含签到新增'
+          : undefined;
   // 今日消耗时效标注（对齐 CreditsTab stale Badge）：stale 缓存/快照差分推导均非当日数据，避免缓存值误读为今日
   const consumedHint = isTrae
     ? undefined
-    : wbOfficial
-      ? wbOfficial.stale
-        ? '缓存回退 · 非当日数据'
-        : undefined
-      : wbFallback
-        ? '快照差分推导（截至最后快照日）'
-        : undefined;
+    : isQoder
+      ? qoderTodaySnap?.consumed != null
+        ? undefined
+        : qoderTodaySnap
+          ? '账号数变动 · 当日差分不可比'
+          : qoderLastSnapDate
+            ? `快照差分推导（截至 ${qoderLastSnapDate}）`
+            : '暂无快照 · 待首次积分查询落库'
+      : wbOfficial
+        ? wbOfficial.stale
+          ? '缓存回退 · 非当日数据'
+          : undefined
+        : wbFallback
+          ? '快照差分推导（截至最后快照日）'
+          : undefined;
 
   const scope: PlatformScope = platform;
 
   // ---- 第二层分类：数据源切换（业务面板外，页面工具行承载）----
   const activeSource = tab === 'credits' ? creditsSource : tokensSource;
-  // 数据源禁用原因；本地源已整体下线（Web 版无本机客户端会话数据），切换器不渲染
+  // 数据源禁用原因；本地源按平台可用性渲染（Qoder 本地快照为积分统计唯一消耗来源）
   const sourceDisabled: Partial<Record<BoardSource, string>> =
-    tab === 'tokens' && platform === 'buddy'
-      ? { official: 'Buddy 官网未提供按日 token 明细接口' }
-      : {};
+    tab === 'tokens'
+      ? isQoder
+        ? {
+            local: 'Qoder 本地日志 token 字段恒为 0（官方模型计费在服务端，实测无可用值）',
+            gateway: 'Qoder 上游未接入（网关用量管道已铺，接入后点亮）',
+            official: 'Qoder 官网未提供 token 用量接口',
+          }
+        : platform === 'trae'
+          ? { local: '本地 Token 统计 = WB/CodeBuddy 客户端会话，Trae 无本地源' }
+          : { official: 'Buddy 官网未提供按日 token 明细接口' }
+      : isQoder
+        ? {
+            official: 'Qoder 官网未提供按日消耗明细接口',
+            gateway: 'Qoder 上游未接入（网关用量管道已铺，接入后点亮）',
+          }
+        : platform === 'trae'
+          ? { local: '本地源 = WB 客户端会话快照差分，Trae 无本地源' }
+          : {};
   const handleSourceChange = (s: BoardSource) => {
     if (tab === 'credits') setCreditsSource(s);
     else setTokensSource(s);
@@ -380,8 +502,8 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
         <div className="mb-4 flex flex-wrap items-center gap-2">
           <span className="text-xs font-medium text-slate-500 dark:text-zinc-400">数据源</span>
           <div className="flex rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
-            {/* 本地源已下线（Web 版无本机客户端会话数据），仅保留官网/网关两源 */}
-            {SOURCES.filter((s) => s !== 'local').map((s) => {
+            {/* 三源全渲染，按平台经 sourceDisabled 禁用（Qoder 页 local 为唯一消耗来源） */}
+            {SOURCES.map((s) => {
               const reason = sourceDisabled[s];
               return (
                 <button
@@ -407,7 +529,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       )}
 
       {tab === 'expiry' ? (
-        <ExpiryTab scope={scope} accounts={accounts} wbCredits={wbCredits} />
+        <ExpiryTab scope={scope} accounts={accounts} wbCredits={wbCredits} qoderCredits={qoderCredits} />
       ) : tab === 'credits' ? (
         <CreditsTab
           scope={scope}
@@ -418,6 +540,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
           wbFallback={wbFallback}
           wbSnapshots={wbSnapshots}
           wbCheckin={wbCheckin}
+          qoderSnapshots={qoderSnapshots}
           gateway={gateway}
         />
       ) : (

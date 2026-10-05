@@ -439,10 +439,11 @@ static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Result<String, String> {
     // SQLite 化（P4）：死引用修复——原读写 data_dir **根**路径的 workbuddy_token_store.json
     // （正牌在 data/ 子目录，此分叉使网关 401 刷新永远读写错位文件），现统一走 store wb_tokens 表
-    let store_db = crate::store::db(data_dir);
     let refresh = {
         let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let store: serde_json::Value = crate::store::docs::wb_token_store_load(&store_db);
+        // 凭证收敛（P0-1）：secure 回填（DB 占位 + vault 明文内存态）
+        let store: serde_json::Value =
+            crate::tasks::wb_common::token_store_load_secure(data_dir);
         let rec = store
             .get("tokens")
             .and_then(|t| t.get(account_id))
@@ -507,7 +508,9 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
     {
         let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut r = {
-            let store: serde_json::Value = crate::store::docs::wb_token_store_load(&store_db);
+            // 凭证收敛（P0-1）：secure 回填（vault 明文内存态参与 merge）
+            let store: serde_json::Value =
+                crate::tasks::wb_common::token_store_load_secure(data_dir);
             store
                 .get("tokens")
                 .and_then(|t| t.get(account_id))
@@ -529,8 +532,12 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
             }
             rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
         }
-        crate::store::docs::wb_token_store_upsert(&store_db, account_id, &r)
-            .map_err(|e| format!("回写 token store 失败: {e}"))?;
+        // 凭证收敛（P0-1）：secure upsert（敏感字段进 vault、DB 占位；失败仅日志——
+        // 401 刷新是网关后台路径，报错无 UI 可达，且下一次刷新会重试收敛）
+        if let Err(e) = crate::tasks::wb_common::token_store_upsert_secure(data_dir, account_id, &r)
+        {
+            fs_utils::app_log(data_dir, &format!("wb 网关刷新回写失败（已落占位）: {e}"));
+        }
     }
     Ok(new_access)
 }

@@ -2155,6 +2155,7 @@ mod tests {
         let state = crate::state::AppState {
             data_dir: dir,
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         let now = chrono::Utc::now().timestamp();
         let acc = |name: &str, uid: Option<&str>, exp: i64, rt: Option<&str>, invalid: bool| {

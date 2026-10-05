@@ -10,9 +10,9 @@ use crate::fs_utils;
 use crate::state::AppState;
 
 use super::common::{
-    account_id_of, as_str, as_ts_seconds, auth_file_path_of, auth_key_names, load_cli_rotate_state,
-    load_pool, save_cli_rotate_state, save_pool, upsert_token_store, wb_renew_locks,
-    WorkBuddyAccount, WbPool,
+    account_id_of, as_str, as_ts_seconds, auth_file_path_of, extract_access_token,
+    load_cli_rotate_state, load_pool, save_cli_rotate_state, save_pool, upsert_token_store,
+    wb_renew_locks, WorkBuddyAccount, WbPool,
 };
 
 // ── 数据结构 ────────────────────────────────────────────────────────────────
@@ -188,16 +188,9 @@ pub fn workbuddy_scan_auth_file(state: &AppState) -> Result<Option<WorkBuddyScan
     if !raw.is_object() {
         return Err("auth 文件格式无法识别（JSON 解析失败）".into());
     }
-    // token 键对齐 tasks 侧 creds_of 超集（wb_common.rs）：含通用 `token`
-    let access = as_str(fs_utils::dig(&raw, &["accessToken", "access_token", "token"])).ok_or_else(|| {
-        format!(
-            "auth 文件中未找到 accessToken（结构可能已变更）；实际键名: {}",
-            auth_key_names(&raw)
-        )
-    })?;
-    if access.is_empty() {
-        return Err("auth 文件 accessToken 为空（可能未登录）".into());
-    }
+    // token 键对齐 tasks 侧 creds_of 超集（wb_common.rs）：含通用 `token`；
+    // 失败分类报错（issue #58）：null/空串 → 未登录提示，键不存在 → 结构变更 + 键名诊断
+    let access = extract_access_token(&raw)?;
     let id = account_id_of(&access);
     let uid = as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default();
     let pool = load_pool(state);
@@ -355,13 +348,8 @@ pub fn workbuddy_account_import_auth(state: &AppState, name: Option<String>) -> 
         return Err("未找到 auth 文件，请先在 WorkBuddy 客户端登录".into());
     }
     let raw = fs_utils::read_json::<serde_json::Value>(&path);
-    // token 键对齐 creds_of 超集 + 失败时自带键名诊断（与 scan 同口径）
-    let access = as_str(fs_utils::dig(&raw, &["accessToken", "access_token", "token"])).ok_or_else(|| {
-        format!(
-            "auth 文件中未找到 accessToken（结构可能已变更）；实际键名: {}",
-            auth_key_names(&raw)
-        )
-    })?;
+    // token 键对齐 creds_of 超集 + 失败分类报错（issue #58，与 scan 同口径）
+    let access = extract_access_token(&raw)?;
     let refresh = as_str(fs_utils::dig(&raw, &["refreshToken", "refresh_token"]));
     let id = account_id_of(&access);
     let uid = as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default();
@@ -715,9 +703,11 @@ pub fn workbuddy_accounts_import(state: &AppState, payload: serde_json::Value) -
 #[cfg(test)]
 mod tests {
     use super::{
-        as_str, as_ts_seconds, auth_key_names, lazy_renew_skippable, merge_auth_entry, AuthMerge,
-        WorkBuddyAccount, WbPool,
+        as_str, as_ts_seconds, extract_access_token, lazy_renew_skippable, merge_auth_entry,
+        AuthMerge, WorkBuddyAccount, WbPool,
     };
+    // auth_key_names 仅测试直用（非测试代码已改经 extract_access_token 间接引用）
+    use super::super::common::auth_key_names;
     use crate::fs_utils;
 
     fn entry(id: &str, uid: &str, nickname: &str) -> WorkBuddyAccount {
@@ -862,6 +852,59 @@ mod tests {
         assert_eq!(auth_key_names(&serde_json::json!("str")), "（非 JSON 对象）");
         assert_eq!(auth_key_names(&serde_json::json!([1])), "（非 JSON 对象）");
         assert_eq!(auth_key_names(&serde_json::json!({})), "（对象无键）");
+    }
+
+    /// 诊断键名附值类型（issue #58）：null 一眼可辨 → 未登录而非结构变更；仍绝不包含值
+    #[test]
+    fn auth_key_names_includes_value_type() {
+        let raw = serde_json::json!({
+            "auth": { "accessToken": null },
+            "account": { "uid": "u1" }
+        });
+        let s = auth_key_names(&raw);
+        assert!(s.contains("auth.accessToken（null）"));
+        assert!(s.contains("account.uid（string）"));
+        assert!(!s.contains("u1"), "诊断信息绝不能包含值");
+    }
+
+    // ── access token 提取分类报错（issue #58）──────────────────────────────
+
+    /// 键存在但值为 null：报「未登录」而非「结构可能已变更」（原实现误报，issue #58 根因）
+    #[test]
+    fn extract_access_token_null_value_reports_login_hint() {
+        let raw = serde_json::json!({
+            "auth": { "accessToken": null, "refreshToken": null },
+            "account": { "uid": "u1" }
+        });
+        let err = extract_access_token(&raw).unwrap_err();
+        assert!(err.contains("null"), "错误应标注值类型: {err}");
+        assert!(err.contains("登录"), "null 应提示登录而非结构变更: {err}");
+        assert!(!err.contains("结构可能已变更"), "null 不应误报结构变更: {err}");
+    }
+
+    /// 键存在但值为空字符串：报「为空（可能未登录）」
+    #[test]
+    fn extract_access_token_empty_string_reports_empty() {
+        let raw = serde_json::json!({ "auth": { "accessToken": "" } });
+        let err = extract_access_token(&raw).unwrap_err();
+        assert!(err.contains("为空字符串"), "{err}");
+        assert!(!err.contains("结构可能已变更"), "{err}");
+    }
+
+    /// 信封下钻命中非空字符串：正常提取
+    #[test]
+    fn extract_access_token_envelope_hit() {
+        let raw = serde_json::json!({ "auth": { "accessToken": "tok-1" } });
+        assert_eq!(extract_access_token(&raw).unwrap(), "tok-1");
+    }
+
+    /// 候选键全未命中：保留「结构可能已变更」+ 键名诊断（含类型）
+    #[test]
+    fn extract_access_token_missing_reports_structure_change() {
+        let raw = serde_json::json!({ "foo": 1 });
+        let err = extract_access_token(&raw).unwrap_err();
+        assert!(err.contains("结构可能已变更"), "{err}");
+        assert!(err.contains("foo（number）"), "{err}");
     }
 
     /// P2 键对齐：通用 `token` 键与 accessTokenExpiresAtMs 经 dig 可命中（原键列表会漏），

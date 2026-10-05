@@ -279,10 +279,16 @@ fn sanitize_content(content: &mut Value, templates: &[(String, String)], sanitiz
     }
 }
 
-/// OpenAI 请求体 → WB /v2/chat/completions 请求体改写
+/// OpenAI 请求体 → WB /v2/chat/completions 请求体改写。
+///
+/// `account_uid`：发起请求的账号 uid（账号池体系）。非空时注入顶层
+/// `prompt_cache_key`（agent2api normalize.rs 情报互证）：命中上游
+/// 前缀缓存可带来数量级的费用差；**键必须按账号硬隔离**——跨账号命中前缀缓存
+/// 等于把 A 账号对话内容泄露给 B 账号（作者实测教训），故键首段为账号 uid。
 pub fn prepare_wb_chat_body(
     src: &[u8],
     model: &str,
+    account_uid: &str,
     conv_id: &str,
     effort: Option<&str>,
     sanitize: bool,
@@ -358,12 +364,26 @@ pub fn prepare_wb_chat_body(
 
     normalize_tool_choice(m);
 
+    // 首条消息必须为 system（上游 Go struct 硬校验，否则 400；agent2api 实测
+    // 情报）。在合并/清洗之后执行：合并不改变首条相对位置，但调用方
+    // 可能产出 user-first 请求体，此处统一兜底
+    ensure_leading_system_message(m);
+
     // 强制流式（上游拒绝非流式，code 11101）
     m.insert("stream".into(), json!(true));
 
     // 会话 id（粘性绑定 / 上游会话归属）
     if !conv_id.is_empty() {
         m.insert("conversation_id".into(), json!(conv_id));
+    }
+
+    // prompt_cache_key：按账号硬隔离的上游前缀缓存键（见函数头注释）；
+    // uid 缺失（测试/异常路径）不注入，宁缺勿造
+    if !account_uid.is_empty() {
+        m.insert(
+            "prompt_cache_key".into(),
+            json!(prompt_cache_key(account_uid, conv_id)),
+        );
     }
 
     // reasoning_effort：调用方已按目录降级，这里只注入非空值
@@ -374,6 +394,39 @@ pub fn prepare_wb_chat_body(
     }
 
     serde_json::to_vec(&obj).unwrap_or_else(|_| src.to_vec())
+}
+
+/// 上游前缀缓存键：`wb-<uid 前 8 位>-<sha256(uid|conv)[0..16]>`。
+/// 同账号 + 同会话稳定命中缓存；不同账号键必不同（硬隔离，防对话内容跨账号泄露）。
+fn prompt_cache_key(account_uid: &str, conv_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let uid8: String = account_uid.chars().take(8).collect();
+    let mut h = Sha256::new();
+    h.update(account_uid.as_bytes());
+    h.update(b"|");
+    h.update(conv_id.as_bytes());
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("wb-{uid8}-{}", &hex[..16.min(hex.len())])
+}
+
+/// 首条消息 system 兜底（agent2api workbuddy.rs ensure_leading_system_message
+/// 同款情报）：上游要求首条必为 system 否则 400；首条为 user/
+/// assistant 时前置一条中性兜底。messages 为空/缺失时不动（让上游自身的
+/// 参数校验报错，避免掩盖调用方 bug）。
+fn ensure_leading_system_message(m: &mut Map<String, Value>) {
+    const FALLBACK_SYSTEM: &str = "你是一个得力助手";
+    let Some(msgs) = m.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let first_is_system = msgs
+        .first()
+        .and_then(|msg| msg.get("role"))
+        .and_then(|r| r.as_str())
+        .map(|r| r.eq_ignore_ascii_case("system"))
+        .unwrap_or(false);
+    if !msgs.is_empty() && !first_is_system {
+        msgs.insert(0, json!({"role": "system", "content": FALLBACK_SYSTEM}));
+    }
 }
 
 /// 同角色合并：string/text 拼接；tool_calls 追加；其余字段保留首个
@@ -493,8 +546,63 @@ mod tests {
 
     fn rewrite(v: Value, effort: Option<&str>) -> Value {
         let src = serde_json::to_vec(&v).unwrap();
-        let out = prepare_wb_chat_body(&src, "glm-5.3", "conv-1", effort, true, NO_TPL);
+        let out = prepare_wb_chat_body(&src, "glm-5.3", "4487568582777872", "conv-1", effort, true, NO_TPL);
         serde_json::from_slice(&out).unwrap()
+    }
+
+    /// prompt_cache_key 按账号硬隔离：同账号+同会话稳定；跨账号键必不同
+    #[test]
+    fn prompt_cache_key_hard_isolated_per_account() {
+        let src = json!({"messages":[{"role":"system","content":"s"}]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let out = prepare_wb_chat_body(&src_bytes, "m", "4487568582777872", "conv-1", None, false, NO_TPL);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let key = v["prompt_cache_key"].as_str().unwrap();
+        assert!(key.starts_with("wb-44875685-"), "键首段为账号 uid 前 8 位: {key}");
+        // 同账号同会话：稳定（可重复调用命中同一缓存键）
+        let out2 = prepare_wb_chat_body(&src_bytes, "m", "4487568582777872", "conv-1", None, false, NO_TPL);
+        let v2: Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(v2["prompt_cache_key"], v["prompt_cache_key"]);
+        // 跨账号：键必不同（硬隔离——跨账号命中前缀缓存 = 对话内容泄露）
+        let out3 = prepare_wb_chat_body(&src_bytes, "m", "1335050000000000", "conv-1", None, false, NO_TPL);
+        let v3: Value = serde_json::from_slice(&out3).unwrap();
+        assert_ne!(v3["prompt_cache_key"], v["prompt_cache_key"]);
+        assert!(v3["prompt_cache_key"].as_str().unwrap().starts_with("wb-13350500-"));
+        // uid 缺失不注入（宁缺勿造）
+        let out4 = prepare_wb_chat_body(&src_bytes, "m", "", "conv-1", None, false, NO_TPL);
+        let v4: Value = serde_json::from_slice(&out4).unwrap();
+        assert!(v4.get("prompt_cache_key").is_none());
+    }
+
+    /// 首条消息 system 兜底：user-first 前置中性 system；system-first 不动；
+    /// 空 messages 不动（让上游参数校验报错）
+    #[test]
+    fn leading_system_message_ensured() {
+        let src = json!({"messages":[{"role":"user","content":"hi"}]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "c", None, false, NO_TPL);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], json!("system"));
+        assert!(!msgs[0]["content"].as_str().unwrap().is_empty());
+        assert_eq!(msgs[1], json!({"role":"user","content":"hi"}));
+
+        // system-first 不重复注入
+        let src = json!({"messages":[{"role":"system","content":"真实系统提示"},{"role":"user","content":"hi"}]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "c", None, false, NO_TPL);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], json!("真实系统提示"));
+
+        // 空 messages 不注入
+        let src = json!({"messages":[]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "c", None, false, NO_TPL);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["messages"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -531,8 +639,10 @@ mod tests {
 
     #[test]
     fn merges_consecutive_same_role() {
+        // 输入自带首条 system：不触发兜底注入，合并语义保持原断言
         let out = rewrite(
             json!({"messages":[
+                {"role":"system","content":"sys"},
                 {"role":"user","content":"第一段"},
                 {"role":"user","content":"第二段"},
                 {"role":"assistant","content":"回复"},
@@ -540,8 +650,8 @@ mod tests {
             None,
         );
         let msgs = out["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0]["content"], json!("第一段\n\n第二段"));
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["content"], json!("第一段\n\n第二段"));
     }
 
     #[test]
@@ -579,13 +689,13 @@ mod tests {
         let src = json!({"messages":[{"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude."}]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let s = v["messages"][0]["content"].as_str().unwrap();
         assert!(s.contains("CLI tool"));
         assert!(!s.contains("official CLI for Claude."));
         // sanitize 关闭时跳过该预处理（与指纹清洗开关联动 §5.5 #9）
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, false, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["messages"][0]["content"], json!("You are Claude Code, Anthropic's official CLI for Claude."));
     }
@@ -594,30 +704,34 @@ mod tests {
     /// 连续 role:"user" 仍合并（既有语义）；tool 之后跟 user 也不得并入 tool
     #[test]
     fn tool_messages_never_merge_and_keep_call_ids() {
+        // 输入自带首条 system：不触发兜底注入
         let out = rewrite(json!({"messages":[
+            {"role":"system","content":"sys"},
             {"role":"assistant","content":null,
              "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
             {"role":"tool","tool_call_id":"c1","content":"r1"},
             {"role":"tool","tool_call_id":"c2","content":"r2"},
         ]}), None);
         let msgs = out["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3, "连续两条 role:tool 不合并");
-        assert_eq!(msgs[1]["tool_call_id"], json!("c1"));
-        assert_eq!(msgs[2]["tool_call_id"], json!("c2"));
-        // 连续 user 仍合并
+        assert_eq!(msgs.len(), 4, "连续两条 role:tool 不合并");
+        assert_eq!(msgs[2]["tool_call_id"], json!("c1"));
+        assert_eq!(msgs[3]["tool_call_id"], json!("c2"));
+        // 连续 user 仍合并（system 兜底注入后共 2 条）
         let out = rewrite(json!({"messages":[
+            {"role":"system","content":"sys"},
             {"role":"user","content":"a"},
             {"role":"user","content":"b"},
         ]}), None);
         let msgs = out["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0]["content"], json!("a\n\nb"));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["content"], json!("a\n\nb"));
         // tool 之后的 user 消息不得并入 tool 消息
         let out = rewrite(json!({"messages":[
+            {"role":"system","content":"sys"},
             {"role":"tool","tool_call_id":"c1","content":"r"},
             {"role":"user","content":"继续"},
         ]}), None);
-        assert_eq!(out["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(out["messages"].as_array().unwrap().len(), 3);
     }
 
     /// 外置映射表新增规则不再被硬编码预检短路：规则命中词不含内置三短语也生效
@@ -636,6 +750,7 @@ mod tests {
     #[test]
     fn sanitize_covers_tool_call_arguments() {
         let src = json!({"messages":[
+            {"role":"system","content":"sys"},
             {"role":"assistant","content":null,"tool_calls":[
                 {"id":"c1","type":"function","function":{"name":"note",
                  "arguments":"{\"prompt\":\"You are Claude Code, Anthropic's official CLI for Claude.\"}"}}
@@ -643,9 +758,9 @@ mod tests {
         ]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
-        let args = v["messages"][0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let args = v["messages"][1]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
         assert!(args.contains("CLI tool"));
         assert!(!args.contains("official CLI for Claude."));
         // arguments 仍是合法 JSON（结构未被清洗破坏）
@@ -655,9 +770,9 @@ mod tests {
             json!("You are Claude Code, Anthropic's official CLI tool for Claude.")
         );
         // sanitize=false 不清洗
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, false, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
-        assert!(v["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        assert!(v["messages"][1]["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap()
             .contains("official CLI for Claude."));
@@ -724,7 +839,7 @@ mod tests {
         ]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let s = v["messages"][0]["content"].as_str().unwrap();
         assert!(s.contains("built on GPT-5"));
@@ -732,7 +847,7 @@ mod tests {
         // user 消息不受影响
         assert_eq!(v["messages"][1]["content"], json!("帮我写个函数"));
         // sanitize=false 原样透传（清洗开关联动）
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, false, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert!(v["messages"][0]["content"].as_str().unwrap().contains("based on GPT-5"));
     }
@@ -759,7 +874,7 @@ mod tests {
         ]});
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let s = v["messages"][0]["content"].as_str().unwrap();
         assert!(s.contains("agent running in TraeCode"));
@@ -791,7 +906,7 @@ mod tests {
         });
         let src_bytes = serde_json::to_vec(&src).unwrap();
         let tpl = default_template_map();
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, true, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let tools = v["tools"].as_array().unwrap();
 
@@ -811,7 +926,7 @@ mod tests {
         assert!(tools[2].get("function").is_none());
 
         // sanitize=false 原样透传（清洗开关联动）
-        let out = prepare_wb_chat_body(&src_bytes, "m", "", None, false, &tpl);
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl);
         let v: Value = serde_json::from_slice(&out).unwrap();
         let d0 = v["tools"][0]["function"]["description"].as_str().unwrap();
         assert!(d0.contains("based on GPT-5"));

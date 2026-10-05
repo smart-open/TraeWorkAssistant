@@ -15,15 +15,23 @@ export type ViewKey =
   | 'buddy-checkin'
   | 'buddy-credits'
   | 'buddy-api-service'
-  | 'buddy-settings';
+  | 'buddy-settings'
+  // Qoder 应用页面（F-80，Web 版：应用内调度，无桌面客户端逻辑）
+  | 'qoder-overview'
+  | 'qoder-accounts'
+  | 'qoder-checkin'
+  | 'qoder-credits'
+  | 'qoder-api-service'
+  | 'qoder-settings';
 
-/** 侧边栏应用切换（左下角 Tab）：Trae 菜单 / Buddy 菜单 */
-export type AppKey = 'trae' | 'buddy';
+/** 侧边栏应用切换（左下角 Tab）：Trae 菜单 / Buddy 菜单 / Qoder 菜单 */
+export type AppKey = 'trae' | 'buddy' | 'qoder';
 
 /** 各应用的默认落地页 */
 export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
   trae: 'dashboard',
   buddy: 'buddy-overview',
+  qoder: 'qoder-overview',
 };
 
 
@@ -318,7 +326,7 @@ export interface CreditsDailySnapshot {
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
 /** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
 export interface UnifiedModelSource {
-  pool: 'trae' | 'buddy' | 'custom';
+  pool: 'trae' | 'buddy' | 'custom' | 'qoder';
   rate: number | null;
   enabled: boolean;
 }
@@ -449,6 +457,22 @@ export interface ApiPoolFile {
   pool_sticky_ttl_secs?: number;
   /** WB 显式会话粘性 TTL 秒（F-76②） */
   wb_sticky_ttl_secs?: number;
+  /** Qoder 上游开关（p3-3）：开启后 Qoder 目录模型路由到 Qoder 账号池（默认关） */
+  qoder_enabled?: boolean;
+  /** Qoder 竞速对冲阈值毫秒（F-80-余 v2）：首字节超阈值向第二账号发对冲请求；0 = 关闭 */
+  qoder_hedge_threshold_ms?: number;
+  /** Qoder 会话粘性开关（F-80-余 v2）：同会话 TTL 内绑定同一 Qoder 账号（默认关） */
+  qoder_sticky_enabled?: boolean;
+  /** Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
+  qoder_account_concurrency_limit?: number;
+  /** Qoder 池粘性 TTL 秒（per-pool 三参数之一，默认 300） */
+  qoder_pool_sticky_ttl_secs?: number;
+  /** Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800；仅会话粘性开启时生效） */
+  qoder_sticky_ttl_secs?: number;
+  /** Qoder 池入池白名单（qoder- 前缀账号 id）；空/缺省 = 全部含凭证账号自动入池 */
+  qoder_enabled_uids?: string[];
+  /** Qoder 池分组筛选（qoder_group_ids）：非空 = 仅所选分组的 Qoder 账号参与调度；空 = 不限分组 */
+  qoder_group_ids?: string[];
 }
 
 /** 用量统计计数（按模型/账号/Key 维度，T1） */
@@ -862,4 +886,165 @@ export interface WbModelInfo {
   supported_efforts: string[];
   effort_override: string | null;
   rate: number;
+}
+
+// ==================== Qoder（Web 版裁剪：剔除桌面端 env/cli/scan/live-logins 类型） ====================
+
+/** 每账号稳定设备指纹（§5.10 多账号并发；machine_id 32 位 hex，入池生成永不轮换） */
+export interface QoderDeviceProfile {
+  machine_id: string;
+  device_id: string;
+  umid: string;
+}
+
+export interface QoderAccountView {
+  id: string;
+  uid: string;
+  nickname: string;
+  phone_masked: string;
+  /** free | pro | pro+ | teams（userinfo 未提供时为空） */
+  plan: string;
+  /** 凭证来源：pat | ide_store | qoderwork_store | mitm | cli */
+  credential_source: string;
+  token_expires_at: number | null;
+  needs_relogin: boolean;
+  relogin_reason: string;
+  group_id: string;
+  note: string;
+  credits_balance: number | null;
+  credits_fetched_at: string | null;
+  has_credential: boolean;
+  /** token 种类徽标：pat | client | unknown（脱敏） */
+  token_kind: string;
+  /** 设备指纹徽标（machine_id 前 8 位；null = 尚未回填） */
+  fingerprint: string | null;
+  /** 完整设备指纹（指纹查看弹框数据源） */
+  device_profile: QoderDeviceProfile | null;
+}
+
+export interface QoderSettings {
+  /** 启动自动补签 + 应用内调度器启用判定（默认开） */
+  auto_checkin: boolean;
+}
+
+/** 账号池导出文件（M4：aiwork-qoder-pool；include_credentials=true 时 accounts[].credential 附带凭证副本，导出文件等同密码） */
+export interface QoderPoolExport {
+  kind: 'aiwork-qoder-pool';
+  version: number;
+  exported_at: string;
+  include_credentials: boolean;
+  accounts: Record<string, unknown>[];
+}
+
+/** 账号池导入结果（M4，与 WbPoolImportResult 同构） */
+export interface QoderPoolImportResult {
+  added: number;
+  updated: number;
+  skipped: number;
+  with_credentials: number;
+  /** 被拒绝的条目（id + 原因），非空时前端需提示 */
+  rejected?: { id: string; reason: string }[];
+  /** F-80-余 v2 迁移提示：true = 历史明文含凭证文件，建议重新以加密格式导出归档 */
+  plaintext_credentials?: boolean;
+}
+
+/** OAuth 设备流进度事件（qoder-oauth-progress，对齐 WbOauthProgress）：
+ *  后端仅发 init/browser/polling 三个 stage，终态（成功/失败）走 qoder-oauth-done 事件 */
+export interface QoderOauthProgress {
+  stage: 'init' | 'browser' | 'polling';
+  message: string;
+  auth_url?: string | null;
+}
+
+/** OAuth 设备流结果事件（qoder-oauth-done，对齐 WbOauthDone） */
+export interface QoderOauthDone {
+  ok: boolean;
+  id?: string;
+  nickname?: string;
+  message: string;
+}
+
+export interface QoderCheckinRecord {
+  date: string;
+  time: string;
+  user_id: string;
+  name: string;
+  status: string;
+  message: string;
+  reward?: number;
+  /** 逐活动明细（F-80-余 v2 档期日历；历史记录无此字段） */
+  campaigns?: { id?: string; name?: string; kind?: string; reward?: number | null }[];
+}
+
+/** qoder-checkin-progress NDJSON 单行：逐账号结果（index 为本轮序号，1 起） */
+export interface QoderCheckinLine {
+  index: number;
+  user_id: string;
+  name: string;
+  status: 'success' | 'already' | 'fail' | 'skip';
+  message?: string;
+  reward?: number;
+}
+
+/** 签到完成汇总（done 事件归约产物） */
+export interface QoderCheckinDone {
+  ok: number;
+  already: number;
+  failed: number;
+  /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
+  empty: number;
+}
+
+export interface QoderCreditPackage {
+  amount: number | null;
+  /** 包总量（R-11 逐包明细 limit_value；旧聚合口径无此值） */
+  total?: number | null;
+  expire_at: string;
+  /** 包来源：plan = 订阅配额（随订阅周期重置）；bonus = 个人资源包（R-11 逐包明细）；
+   *  dedicated = 专属/组织资源包（sash usage 逐包，自有到期时间）；
+   *  addon = 旧聚合口径（addOnQuota 总额，随订阅周期展示） */
+  source: string;
+  /** 包名（dedicated 专属/组织包原生携带；其余来源无此值） */
+  name?: string | null;
+}
+
+export interface QoderCreditAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  message?: string;
+  plan_credits: number | null;
+  addon_credits: number | null;
+  /** 订阅周期内已消耗（userQuota.used，看板「订阅版本的资源」进度数据源） */
+  plan_used?: number | null;
+  addon_used?: number | null;
+  /** 订阅周期到期日（qoderUsage.expiresAt → YYYY-MM-DD） */
+  plan_expires_at?: string;
+  total: number | null;
+  packages: QoderCreditPackage[];
+  /** 数据源徽标：pat | client_token | fetch_failed | none */
+  source: string;
+  fetched_at: string;
+}
+
+export interface QoderCreditsResult {
+  ok: boolean;
+  cached?: boolean;
+  /** F-59 stale-on-error：全部账号刷新失败时回退的历史缓存 */
+  stale?: boolean;
+  stale_reason?: string;
+  accounts: QoderCreditAccount[];
+  total_balance?: number;
+  message?: string;
+}
+
+export interface QoderCreditsSnapshot {
+  date: string;
+  ts: number;
+  total_balance: number;
+  /** 当日消耗（快照差分：前日余额 − 当日余额 + 当日签到奖励，负值记 0；首日 null） */
+  consumed?: number | null;
+  /** 当日获得（签到奖励合计；无签到数据 null） */
+  earned?: number | null;
+  accounts: { user_id: string; total: number | null }[];
 }

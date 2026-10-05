@@ -704,7 +704,8 @@ export default function ApiService() {
                   <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
                     <th className="pb-2 pr-3 font-medium">模型 ID</th>
                     <th className="pb-2 pr-3 font-medium">展示名</th>
-                    <th className="pb-2 pr-3 text-right font-medium">积分倍率</th>
+                    <th className="pb-2 pr-3 font-medium">厂商</th>
+                    <th className="pb-2 pr-3 text-right font-medium">倍率</th>
                     <th className="pb-2 pr-3 font-medium">思考档位</th>
                     <th className="pb-2 pr-3 text-right font-medium">上下文</th>
                     <th className="pb-2 pr-3 text-center font-medium">图片</th>
@@ -719,6 +720,14 @@ export default function ApiService() {
                     >
                       <td className="py-2 pr-3 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
                         {m.id}
+                        {m.max_mode && (
+                          <sup
+                            className="ml-0.5 font-sans text-[9px] font-bold leading-none text-amber-500 dark:text-amber-400"
+                            title="支持 Max Mode（1M 上下文）"
+                          >
+                            Max
+                          </sup>
+                        )}
                       </td>
                       <td className="py-2 pr-3 text-slate-600 dark:text-zinc-300">
                         {m.display || '—'}
@@ -730,6 +739,10 @@ export default function ApiService() {
                             *
                           </span>
                         )}
+                      </td>
+                      {/* §6.2 厂商列：条目标注优先（如 Step 5 Preview → 阶跃星辰），未命中显示 — */}
+                      <td className="py-2 pr-3 text-xs text-slate-500 dark:text-zinc-400">
+                        {m.vendor || '—'}
                       </td>
                       <td className="py-2 pr-3 text-right tabular-nums text-amber-600 dark:text-amber-400">
                         {m.rate != null ? m.rate.toFixed(2) : '—'}

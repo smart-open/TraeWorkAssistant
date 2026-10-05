@@ -8,6 +8,7 @@ pub mod api_server;
 pub mod checkin;
 pub mod misc;
 pub mod oauth;
+pub mod qoder;
 pub mod usage_history;
 pub mod wb_config;
 pub mod workbuddy;

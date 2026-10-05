@@ -7,8 +7,10 @@
 //!   实证设计；Buddy 上游代理流量缓存恒不命中 §5.5 #10，价值在会话一致性）。
 //!
 //! 线程安全：单 Mutex 内完成 resolve+bind（写锁 re-check，防 TOCTOU）。
-//! 持久化：`data/wb_sticky_sessions.json`（TTL 内的绑定，原子写 + 1s 节流；
-//! 旧根路径文件仅作启动加载兼容）。
+//! 持久化：`sticky_bindings` 表（TTL 内的绑定，原子写 + 1s 节流）。
+//! 审查 #2：WB 与 Qoder 两个 StickyStore 实例共用同一张表，按键命名空间隔离——
+//! WB 线键无前缀（存量兼容），Qoder 线键带 `q:` 前缀（QODER_NS）；load 只取
+//! 本线键、save 先读表保留他线绑定再覆写本线，互不串载/互删。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -21,6 +23,9 @@ use sha2::{Digest, Sha256};
 pub const EXPLICIT_TTL_SECS: i64 = 30 * 60;
 /// 指纹模式时间窗
 pub const FINGERPRINT_WINDOW_SECS: i64 = 60;
+/// Qoder 线命名空间前缀（审查 #2：sticky_bindings 表内 WB/Qoder 按前缀隔离；
+/// 无前缀键 = WB 线，存量数据向后兼容）
+pub const QODER_NS: &str = "q:";
 /// 落盘节流间隔：距上次成功保存不足该时长则跳过本次写盘
 const SAVE_THROTTLE_MS: u64 = 1000;
 
@@ -41,6 +46,9 @@ pub struct StickyStore {
     last_save: Mutex<Option<std::time::Instant>>,
     /// 显式模式 TTL 秒（F-76② 可配置，0 视为未设置 → 回退 EXPLICIT_TTL_SECS）
     explicit_ttl_secs: AtomicI64,
+    /// 审查 #2：表内键命名空间前缀（"" = WB 线存量兼容；"q:" = Qoder 线）。
+    /// 内存键与落库键格式一致（均含前缀），避免进出存取时二次变换
+    ns: String,
 }
 
 /// 会话键：显式 conversationId 或消息指纹
@@ -115,6 +123,25 @@ impl StickyStore {
         Self::default()
     }
 
+    /// 按命名空间前缀构造（审查 #2：Qoder 线传 QODER_NS；"" = WB 线）
+    pub fn with_ns(ns: &str) -> Self {
+        Self { ns: ns.to_string(), ..Self::default() }
+    }
+
+    /// 存储键 = 命名空间前缀 + 会话键（resolve/bind 统一入口；内存键与落库同格式）
+    fn store_key(&self, ck: &str) -> String {
+        format!("{}{}", self.ns, ck)
+    }
+
+    /// 键是否归属本命名空间（load 过滤 / save 合并时区分他线绑定）
+    fn owns_key(&self, k: &str) -> bool {
+        if self.ns.is_empty() {
+            !k.starts_with(QODER_NS)
+        } else {
+            k.starts_with(&self.ns)
+        }
+    }
+
     /// 设置显式模式 TTL 秒（F-76②，pool_set 热应用；≤0 回退默认值）
     pub fn set_explicit_ttl(&self, secs: i64) {
         self.explicit_ttl_secs.store(secs, Ordering::Relaxed);
@@ -138,17 +165,18 @@ impl StickyStore {
         } else {
             FINGERPRINT_WINDOW_SECS
         };
-        let b = map.get(&key.cache_key())?;
+        let ck = self.store_key(&key.cache_key());
+        let b = map.get(&ck)?;
         if !b.explicit == key.is_explicit() {
             return None; // 键类型变化（少见）：按无绑定处理
         }
         if now - b.last_seen > ttl {
-            map.remove(&key.cache_key());
+            map.remove(&ck);
             return None;
         }
         let mut b = b.clone();
         b.last_seen = now; // 滚动续期
-        map.insert(key.cache_key(), b.clone());
+        map.insert(ck, b.clone());
         Some(b)
     }
 
@@ -156,7 +184,7 @@ impl StickyStore {
     /// 以更晚者为准——并发首请求只留一个胜者）
     pub fn bind(&self, key: &SessionKey, uid: &str, conv_id: &str, now: i64) {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let ck = key.cache_key();
+        let ck = self.store_key(&key.cache_key());
         if let Some(existing) = map.get(&ck) {
             if existing.uid != uid && existing.last_seen > now - 5 {
                 return; // 5s 内他账号刚绑定：让胜者保持
@@ -216,13 +244,30 @@ impl StickyStore {
         self.evict_expired(now_secs);
         let file = {
             let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // 审查 #2：WB/Qoder 共用 sticky_bindings 表——先读现有表保留他线
+            // 绑定，再覆写本线条目，避免整表覆写互删。节流（1s）+ 绑定为软状态
+            // （丢失仅个别会话重新取号），两实例并发 save 的窄窗口竞态可接受。
+            let mut bindings: Vec<serde_json::Value> = Vec::new();
+            let existing = crate::store::docs::sticky_bindings_load(&crate::store::db(data_dir));
+            if let Some(list) = existing.get("bindings").and_then(|b| b.as_array()) {
+                bindings.extend(
+                    list.iter()
+                        .filter(|item| {
+                            item.get("key")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|k| !self.owns_key(k))
+                        })
+                        .cloned(),
+                );
+            }
+            bindings.extend(map.iter().map(|(k, b)| serde_json::json!({
+                "key": k, "uid": b.uid, "conv_id": b.conv_id,
+                "last_seen": b.last_seen, "explicit": b.explicit,
+            })));
             serde_json::json!({
                 "version": 1,
                 "saved_at": now_ts(),
-                "bindings": map.iter().map(|(k, b)| serde_json::json!({
-                    "key": k, "uid": b.uid, "conv_id": b.conv_id,
-                    "last_seen": b.last_seen, "explicit": b.explicit,
-                })).collect::<Vec<_>>(),
+                "bindings": bindings,
             })
         };
         if crate::store::docs::sticky_bindings_save(&crate::store::db(data_dir), &file).is_ok() {
@@ -231,16 +276,30 @@ impl StickyStore {
         }
     }
 
-    /// 启动时加载（过期的条目在 resolve 时自然失效）。
+    /// 启动时加载（过期的条目在 resolve 时自然失效）。WB 线（无前缀键）。
     /// SQLite 化（P6）：wb_sticky_sessions → sticky_bindings 表；
     /// 旧根路径兼容由启动迁移器完成。
     pub fn load(data_dir: &std::path::Path) -> Self {
-        let file: serde_json::Value = crate::store::docs::sticky_bindings_load(&crate::store::db(data_dir));
-        let mut map = HashMap::new();
+        Self::load_ns(data_dir, "")
+    }
+
+    /// 按命名空间加载（审查 #2）：只取本线前缀的绑定——WB 线（ns=""）跳过
+    /// `q:` 键，Qoder 线只取 `q:` 键；他线绑定留表，互不串载。
+    /// 内存键保留命名空间前缀（与落库/resolve·bind 生成的存储键同格式）。
+    pub fn load_ns(data_dir: &std::path::Path, ns: &str) -> Self {
+        let file: serde_json::Value =
+            crate::store::docs::sticky_bindings_load(&crate::store::db(data_dir));
+        let store = Self {
+            inner: Mutex::new(HashMap::new()),
+            last_save: Mutex::new(None),
+            explicit_ttl_secs: std::sync::atomic::AtomicI64::new(0),
+            ns: ns.to_string(),
+        };
         if let Some(list) = file.get("bindings").and_then(|b| b.as_array()) {
+            let mut map = store.inner.lock().unwrap_or_else(|e| e.into_inner());
             for item in list {
                 let key = match item.get("key").and_then(|v| v.as_str()) {
-                    Some(k) if !k.is_empty() => k.to_string(),
+                    Some(k) if !k.is_empty() && store.owns_key(k) => k.to_string(),
                     _ => continue,
                 };
                 let uid = item.get("uid").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -253,11 +312,7 @@ impl StickyStore {
                 map.insert(key, Binding { uid, conv_id, last_seen, explicit });
             }
         }
-        Self {
-            inner: Mutex::new(map),
-            last_save: Mutex::new(None),
-            explicit_ttl_secs: std::sync::atomic::AtomicI64::new(0),
-        }
+        store
     }
 }
 
@@ -383,6 +438,38 @@ mod tests {
         assert_eq!(snapshot1, snapshot2, "距上次成功保存 <1000ms 应跳过落库");
         // 内存态已更新（resolve 读到新绑定）
         assert_eq!(store.resolve(&key, now + 7).unwrap().uid, "u2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 审查 #2：WB/Qoder 共表命名空间隔离——load 互不串载、save 合并保留他线绑定
+    #[test]
+    fn namespace_isolation_between_wb_and_qoder() {
+        let dir = std::env::temp_dir().join(format!(
+            "twa_sticky_ns_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let wb = StickyStore::new(); // ns = ""
+        let q = StickyStore::with_ns(QODER_NS);
+        let key = SessionKey::Explicit("shared-conv".into()); // 同一会话键，两线各自绑定
+        wb.bind(&key, "wb_uid", "wb_conv", now);
+        wb.save(&dir);
+        // qoder 线 save 不得删除 wb 线绑定（合并保留）
+        q.bind(&key, "q_uid", "q_conv", now);
+        q.save(&dir);
+        let wb2 = StickyStore::load(&dir);
+        let q2 = StickyStore::load_ns(&dir, QODER_NS);
+        assert_eq!(wb2.resolve(&key, now + 1).unwrap().uid, "wb_uid");
+        assert_eq!(q2.resolve(&key, now + 1).unwrap().uid, "q_uid");
+        // 反向：wb 线再 save，qoder 绑定同样保留
+        wb.save(&dir);
+        let q3 = StickyStore::load_ns(&dir, QODER_NS);
+        assert_eq!(q3.resolve(&key, now + 1).unwrap().uid, "q_uid");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

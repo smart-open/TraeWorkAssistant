@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use aiwork_core::commands::{
-    accounts, api_server as api_server_cmd, checkin as checkin_cmd, misc, oauth, usage_history,
-    wb_config, workbuddy,
+    accounts, api_server as api_server_cmd, checkin as checkin_cmd, misc, oauth, qoder,
+    usage_history, wb_config, workbuddy,
 };
 use aiwork_core::state::AppState;
 use axum::extract::{Path, State};
@@ -248,6 +248,11 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let pool_sticky_ttl_secs = opt_arg(&args, "pool_sticky_ttl_secs")?;
             let wb_sticky_ttl_secs = opt_arg(&args, "wb_sticky_ttl_secs")?;
             let wb_uids = opt_arg(&args, "wb_uids")?;
+            let qoder_enabled = opt_arg(&args, "qoder_enabled")?;
+            let qoder_hedge_threshold_ms = opt_arg(&args, "qoder_hedge_threshold_ms")?;
+            let qoder_sticky_enabled = opt_arg(&args, "qoder_sticky_enabled")?;
+            let qoder_uids = opt_arg(&args, "qoder_uids")?;
+            let qoder_group_ids = opt_arg(&args, "qoder_group_ids")?;
             api_server_cmd::pool_set(
                 state,
                 uids,
@@ -265,11 +270,17 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
                 pool_sticky_ttl_secs,
                 wb_sticky_ttl_secs,
                 wb_uids,
+                qoder_enabled,
+                qoder_hedge_threshold_ms,
+                qoder_sticky_enabled,
+                qoder_uids,
+                qoder_group_ids,
             )
             .and_then(to_json)
         }
         "pool_status" => to_json(api_server_cmd::pool_status()),
         "wb_pool_status" => to_json(api_server_cmd::wb_pool_status()),
+        "qoder_pool_status" => to_json(api_server_cmd::qoder_pool_status()),
         "api_logs_list" => to_json(api_server_cmd::api_logs_list(state)),
         "api_logs_detail" => {
             let date = arg(&args, "date")?;
@@ -288,6 +299,9 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         "api_wb_catalog_sync" => {
             block_on_async(api_server_cmd::api_wb_catalog_sync(state)).and_then(to_json)
         }
+        "api_qoder_catalog_sync" => {
+            block_on_async(api_server_cmd::api_qoder_catalog_sync(state)).and_then(to_json)
+        }
         "api_wb_catalog_list" => to_json(api_server_cmd::api_wb_catalog_list(state)),
         "api_usage_stats" => {
             let days = opt_arg(&args, "days")?;
@@ -300,6 +314,10 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
         "api_custom_usage_stats" => {
             let days = opt_arg(&args, "days")?;
             to_json(api_server_cmd::api_custom_usage_stats(state, days))
+        }
+        "api_qoder_usage_stats" => {
+            let days = opt_arg(&args, "days")?;
+            to_json(api_server_cmd::api_qoder_usage_stats(state, days))
         }
         "api_keys_list" => to_json(api_server_cmd::api_keys_list(state)),
         "api_keys_save" => {
@@ -497,6 +515,109 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             workbuddy::workbuddy_activity_info(state, user_id, refresh).and_then(to_json)
         }
 
+        // ==================== qoder（Qoder 全域） ====================
+        "qoder_settings_get" => to_json(qoder::qoder_settings_get(state)),
+        "qoder_settings_set" => {
+            // QoderSettings：body.patch 存在时取 patch，否则整个 body 即设置
+            let patch = args
+                .get("patch")
+                .cloned()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| args.clone());
+            let settings: qoder::QoderSettings =
+                serde_json::from_value(patch).map_err(|e| format!("参数错误: {e}"))?;
+            qoder::qoder_settings_set(state, settings).and_then(to_json)
+        }
+        "qoder_accounts_list" => qoder::qoder_accounts_list(state).and_then(to_json),
+        "qoder_account_save" => {
+            let user_id = arg(&args, "user_id")?;
+            let name_ = opt_arg(&args, "name")?;
+            let note = opt_arg(&args, "note")?;
+            qoder::qoder_account_save(state, user_id, name_, note).and_then(to_json)
+        }
+        "qoder_account_remove" => {
+            let user_id = arg(&args, "user_id")?;
+            qoder::qoder_account_remove(state, user_id).and_then(to_json)
+        }
+        "qoder_account_import_pat" => {
+            let name_ = opt_arg(&args, "name")?;
+            let pat = arg(&args, "pat")?;
+            qoder::qoder_account_import_pat(state, name_, pat).and_then(to_json)
+        }
+        "qoder_account_refresh_token" => {
+            let account_id = arg(&args, "account_id")?;
+            qoder::qoder_account_refresh_token(state, account_id).and_then(to_json)
+        }
+        "qoder_account_move" => {
+            let user_id = arg(&args, "user_id")?;
+            let group_id = opt_arg(&args, "group_id")?;
+            qoder::qoder_account_move(state, user_id, group_id).and_then(to_json)
+        }
+        "qoder_groups_list" => to_json(qoder::qoder_groups_list(state)),
+        "qoder_groups_create" => {
+            let name_ = arg(&args, "name")?;
+            let color = arg(&args, "color")?;
+            qoder::qoder_groups_create(state, name_, color).and_then(to_json)
+        }
+        "qoder_groups_update" => {
+            let id = arg(&args, "id")?;
+            let name_ = opt_arg(&args, "name")?;
+            let color = opt_arg(&args, "color")?;
+            let order = opt_arg(&args, "order")?;
+            qoder::qoder_groups_update(state, id, name_, color, order).and_then(to_json)
+        }
+        "qoder_groups_remove" => {
+            let id = arg(&args, "id")?;
+            qoder::qoder_groups_remove(state, id).and_then(to_json)
+        }
+        "qoder_checkin_start" => {
+            // 真实签名 (state, opts, emit)：轮次锁 + 工作线程模式，立即返回；
+            // 兼容 {"opts":{...}} 包装与 body 即 opts 两种传参
+            let raw = args.get("opts").cloned().unwrap_or_else(|| args.clone());
+            let opts: qoder::QoderCheckinOptsDto =
+                serde_json::from_value(raw).map_err(|e| format!("参数错误: {e}"))?;
+            let events = admin.events.clone();
+            let emit: qoder::QoderCheckinEmitter =
+                Arc::new(move |name: &str, payload: serde_json::Value| {
+                    let _ = events.send((name.to_string(), payload));
+                });
+            qoder::qoder_checkin_start(state, opts, emit).and_then(to_json)
+        }
+        "qoder_checkin_results" => {
+            let days = opt_arg(&args, "days")?;
+            qoder::qoder_checkin_results(state, days).and_then(to_json)
+        }
+        "qoder_credits_fetch" => {
+            let user_id = opt_arg(&args, "user_id")?;
+            let fresh = opt_arg(&args, "fresh")?;
+            qoder::qoder_credits_fetch(state, user_id, fresh).and_then(to_json)
+        }
+        "qoder_credits_history_list" => {
+            qoder::qoder_credits_history_list(state).and_then(to_json)
+        }
+        "qoder_oauth_login" => {
+            // 扫码全流程在后台线程执行，事件经 "qoder-oauth-progress"/"qoder-oauth-done" 广播；
+            // compat：授权超时后前端改用的兼容模式（授权 URL 不带 client_id）
+            let compat = opt_arg(&args, "compat")?;
+            let events = admin.events.clone();
+            let emit: qoder::QoderOauthEmitter =
+                Arc::new(move |name: &str, payload: serde_json::Value| {
+                    let _ = events.send((name.to_string(), payload));
+                });
+            qoder::qoder_oauth_login(state, emit, compat).and_then(to_json)
+        }
+        "qoder_oauth_cancel" => qoder::qoder_oauth_cancel().and_then(to_json),
+        "qoder_accounts_export" => {
+            let include_credentials = opt_arg(&args, "include_credentials")?;
+            let password = opt_arg(&args, "password")?;
+            qoder::qoder_accounts_export(state, include_credentials, password).and_then(to_json)
+        }
+        "qoder_accounts_import" => {
+            let payload = arg(&args, "payload")?;
+            let password = opt_arg(&args, "password")?;
+            qoder::qoder_accounts_import(state, payload, password).and_then(to_json)
+        }
+
         // ==================== scheduler（调度器） ====================
         "scheduler_status" => Ok(aiwork_core::scheduler::scheduler_status(state)),
         "scheduler_config_get" => Ok(aiwork_core::scheduler::scheduler_config_get(state)),
@@ -550,6 +671,7 @@ mod tests {
         let state = Arc::new(AppState {
             data_dir: dir,
             jwt_refresh_lock: Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: Arc::new(std::sync::Mutex::new(())),
         });
         AdminState {
             state,

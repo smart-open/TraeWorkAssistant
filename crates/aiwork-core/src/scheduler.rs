@@ -51,11 +51,23 @@ const TASKS: &[SchedTask] = &[
     // WorkBuddy 每日成长（issue #27 随 ad63bdc 移植）：成长三开关驱动（旅行/盲盒/任务），
     // 全关时空轮无副作用；启用/时刻经 scheduler_cfg 配置（默认开 + 09:00）
     SchedTask { key: "wb-growth", name: "WorkBuddy 每日成长", hhmm: "09:00" },
+    // F-80 Qoder 每日签到（移植 main）：默认 10:15 单次覆盖「0 点签到」与
+    // 「10:00 登录奖励」双活动；开关跟随 qoder_settings.auto_checkin（默认开），
+    // 时刻经 scheduler_cfg.task_times 可改
+    SchedTask { key: "qoder-checkin", name: "Qoder 每日签到", hhmm: "10:15" },
     // F-09 兜底续期：lazy 24h（到期前 24h 内才真正刷新），每天跑一次是安全超集
     SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30" },
     // 快照类排到晚间（接近日末，差分口径最准）
     SchedTask { key: "wb-credits-snapshot", name: "WorkBuddy 积分余额每日快照", hhmm: "23:30" },
     SchedTask { key: "trae-credits-snapshot", name: "Trae 积分余额每日快照", hhmm: "23:40" },
+    // F-80 Qoder 积分快照（移植 main）：每日 HH:MM；空池静默空转不计失败
+    SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分快照", hhmm: "23:40" },
+    // F-80 Qoder 模型目录同步（移植 main p3-3）：真签名拉 model/list → adopt_remote
+    // 替换缓存；空池/无凭证静默跳过不计失败，时刻经 scheduler_cfg.task_times 可改
+    SchedTask { key: "qoder-catalog-sync", name: "Qoder 模型目录同步", hhmm: "05:50" },
+    // F-80 Qoder 凭证 6h 兜底刷新（移植 main）：固定每 6 小时（hhmm 不参与判定）；
+    // 空池空转；与 UI 路径经跨进程锁互斥（任务内部处理）
+    SchedTask { key: "qoder-refresh", name: "Qoder 凭证定时刷新", hhmm: "06:00" },
 ];
 
 /// 启动调度线程（server main 调用；启动 90s 后首跑，避开启动高峰）
@@ -75,24 +87,36 @@ const RETRY_COOLDOWN_MS: i64 = 30 * 60_000;
 /// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走 30 分钟冷却，不受此门限制）
 const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 
+/// qoder-refresh 档位（移植 main）：每 6 小时兜底刷新一次凭证（设计 v1.3 §M4；
+/// 客户端 token 惰性窗 7h > 6h 调度间隔，任一 tick 必落窗内，确保过期令牌被续）
+const REFRESH_INTERVAL_HOURS: i64 = 6;
+
 /// 可配置「每小时」模式的任务（看板数据同步类，移植 main@c8e855b 的 credits 语义）：
 /// 仅这些任务接受 scheduler_cfg.task_modes 的 hourly 值，其余任务恒为每日模式
 const HOURLY_CAPABLE: &[&str] = &["wb-credits-snapshot", "trae-credits-snapshot"];
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
-/// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）
+/// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
+/// EveryHours(h)=每 h 小时（距上次成功执行 ≥h·1h，无记录=首次立即跑）
+#[derive(Debug)]
 enum SchedPlan {
     Skip,
     Daily(String),
     Hourly,
+    EveryHours(i64),
 }
 
 /// 单任务调度计划：合并启用判定与模式/时刻解析（tick 与 scheduler_status 共用；
 /// cfg 为整轮一次性读出的 scheduler_cfg，避免每任务重复读 db；
-/// extra_enabled 为外部设置语义门（wb-checkin → 启动自动补签开关，F-55），其余任务恒 true）
+/// extra_enabled 为外部设置语义门（wb-checkin → 启动自动补签开关 F-55、
+/// qoder-checkin → qoder_settings.auto_checkin，其余任务恒 true）
 fn sched_plan(cfg: &Value, t: &SchedTask, extra_enabled: bool) -> SchedPlan {
     if !enabled_from(cfg, t.key) || !extra_enabled {
         return SchedPlan::Skip;
+    }
+    // Qoder 凭证兜底刷新（移植 main）：固定每 6 小时，hhmm 不参与判定
+    if t.key == "qoder-refresh" {
+        return SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS);
     }
     if HOURLY_CAPABLE.contains(&t.key)
         && task_modes_from(cfg).get(t.key).map(String::as_str) == Some("hourly")
@@ -103,10 +127,12 @@ fn sched_plan(cfg: &Value, t: &SchedTask, extra_enabled: bool) -> SchedPlan {
     }
 }
 
-/// 任务外部设置语义门（整轮读一次）：仅 wb-checkin 联动「启动自动补签」开关（F-55）
+/// 任务外部设置语义门（整轮读一次）：wb-checkin 联动「启动自动补签」开关（F-55），
+/// qoder-checkin 联动 Qoder 自动签到开关（移植 main），其余任务恒 true
 fn extra_enabled(st: &AppState, key: &str) -> bool {
     match key {
         "wb-checkin" => crate::commands::workbuddy::wb_auto_checkin_enabled(st),
+        "qoder-checkin" => crate::commands::qoder::qoder_auto_checkin_enabled(st),
         _ => true,
     }
 }
@@ -144,6 +170,15 @@ fn tick(st: &AppState) {
                 }
                 "每小时".to_string()
             }
+            SchedPlan::EveryHours(hours) => {
+                // EveryHours 按档位节流：距上次成功执行 ≥h·1h 才再跑（无记录=首次立即跑）
+                if let Some(ts) = last_run_ts(&state, t.key) {
+                    if chrono::Utc::now().timestamp_millis() - ts < hours * HOURLY_INTERVAL_MS {
+                        continue;
+                    }
+                }
+                format!("每{hours}小时")
+            }
         };
         // 失败冷却：30 分钟内静默等待重试，不重复执行也不刷日志
         if let Some(ts) = last_fail_ts(&state, t.key) {
@@ -154,20 +189,37 @@ fn tick(st: &AppState) {
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_task(t.key, st)
         })) {
-            Ok(Ok(v)) => Ok(summarize(&v)),
+            Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("任务线程 panic（已捕获，不影响后续调度）".to_string()),
         };
         match outcome {
-            Ok(summary) => {
-                mark_run(st, t.key, &today, &summary);
-                fs_utils::app_log(
-                    &st.data_dir,
-                    &format!("[调度器] {}（{trigger}）：{}", t.name, summary),
-                );
-                // T11：仅签到类任务完成时推送（快照/续期类静默，避免每日刷屏）
-                if notify_cfg.on_checkin_done && matches!(t.key, "trae-checkin" | "wb-checkin") {
-                    crate::notify::send(st, &format!("{}完成", t.name), &summary, "checkin");
+            Ok(v) => {
+                let summary = summarize(&v);
+                // skipped_busy（移植 main 审查修复：qoder-checkin 轮次锁被 UI 路径持有的
+                // 幂等跳过）不 mark_run——跳过≠完成，mark_run 会固化「当日已跑」关闭当日
+                // 重试链，UI 轮次的失败账号将失去当日调度兜底。其余 skipped（空池静默
+                // 空转）仍照常记账，防 Hourly/EveryHours 任务每 tick 空转刷日志
+                if v.get("skipped_busy").is_some() {
+                    fs_utils::app_log(
+                        &st.data_dir,
+                        &format!(
+                            "[调度器] {}（{trigger}）：{}（不记当日已跑，稍后重试）",
+                            t.name, summary
+                        ),
+                    );
+                } else {
+                    mark_run(st, t.key, &today, &summary);
+                    fs_utils::app_log(
+                        &st.data_dir,
+                        &format!("[调度器] {}（{trigger}）：{}", t.name, summary),
+                    );
+                    // T11：仅签到类任务完成时推送（快照/续期类静默，避免每日刷屏）
+                    if notify_cfg.on_checkin_done
+                        && matches!(t.key, "trae-checkin" | "wb-checkin" | "qoder-checkin")
+                    {
+                        crate::notify::send(st, &format!("{}完成", t.name), &summary, "checkin");
+                    }
                 }
             }
             Err(summary) => {
@@ -416,6 +468,53 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // Trae 积分余额每日快照：与 `--task-run refresh-credits` 同款
         "trae-credits-snapshot" => accounts::refresh_remaining_credits_impl(st)
             .map(|n| json!({ "ok": true, "refreshed": n })),
+        // F-80 Qoder 每日签到：与 `--task-run qoder-checkin` 同款；抢轮次锁与 UI 路径互斥
+        "qoder-checkin" => {
+            // 抢不到轮次锁（UI 路径正在签到）= 幂等跳过而非失败：返 Err 会被调度器记
+            // 当日首败并推送「签到失败」误报通知（签到本身未失败，UI 路径会照常完成）
+            let Ok(_round) = crate::tasks::qoder_checkin::try_acquire_qoder_round() else {
+                // skipped_busy：tick 据此跳过 mark_run（保留当日后续 tick 重试机会）
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": "已有 Qoder 签到任务在执行中，本轮跳过",
+                    "skipped_busy": true,
+                }));
+            };
+            let opts = crate::tasks::qoder_checkin::QoderCheckinOpts::daily();
+            let done = crate::tasks::qoder_checkin::run_checkin_round(st, &opts, &mut |_| {});
+            // 审查 M-1：存在失败账号时返 Err，交调度器 30 分钟冷却重试（暂态失败自愈）。
+            // P2 重试口径：empty_campaigns（活动未上线/不可用）属非用户可操作失败，
+            // 计入重试只会全天无效重试 + 当日首败误报通知——按 failed - failed_empty_campaigns
+            // > 0 判定。done 事件恒携带该字段；缺字段时 as_i64 为 None → 0，安全兼容
+            let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            let failed_empty = done
+                .get("failed_empty_campaigns")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            // 审查 minor：永久性认证失败（pat_rejected/expired_needs_relogin/auth_dead）
+            // 重试注定失败，与 empty_campaigns 一并从重试判定剔除——否则失效账号
+            // 会拖动整轮全天约 28 次冷却重试（含每轮必败的刷新请求）
+            let failed_permanent = done
+                .get("failed_permanent")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty - failed_permanent > 0 {
+                let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
+                let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
+                return Err(format!(
+                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（30 分钟后自动重试）"
+                ));
+            }
+            Ok(done)
+        }
+        // F-80 Qoder 积分快照：与 `--task-run qoder-credits-snapshot` 同款（空池空转）
+        "qoder-credits-snapshot" => crate::tasks::qoder_credits::run_snapshot_task(st),
+        // Qoder Token 定时刷新：与 `--task-run qoder-refresh` 同款（6h 周期，lazy 7h 惰性门；
+        // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试；抢不到跨进程锁返回 skipped_busy）
+        "qoder-refresh" => crate::tasks::qoder_refresh::run_task(st),
+        // Qoder 模型目录同步：与 `--task-run qoder-catalog-sync` 同款（真签名拉
+        // model/list → adopt_remote；空池/无凭证空转，网络失败返 Err 冷却重试）
+        "qoder-catalog-sync" => crate::tasks::qoder_catalog::run_task(st),
         other => Err(format!("未知调度任务: {other}")),
     }
 }
@@ -542,7 +641,6 @@ fn summarize(v: &Value) -> String {
 pub fn scheduler_status(st: &AppState) -> Value {
     let raw = load_state(st);
     let cfg = load_cfg(st);
-    let times = task_times_from(&cfg);
     let tasks: Vec<Value> = TASKS
         .iter()
         .map(|t| {
@@ -553,10 +651,17 @@ pub fn scheduler_status(st: &AppState) -> Value {
             json!({
                 "key": t.key,
                 "name": t.name,
-                "time": times.get(t.key).cloned().unwrap_or_else(|| t.hhmm.to_string()),
-                // 执行模式（daily/hourly/off）：前端据此切换时刻输入与每小时徽标
+                // 展示时刻：hourly → 「每小时」；EveryHours(h) → 「每h小时」；其余 HH:MM
+                "time": match sched_plan(&cfg, t, extra_enabled(st, t.key)) {
+                    SchedPlan::Hourly => "每小时".to_string(),
+                    SchedPlan::EveryHours(h) => format!("每{h}小时"),
+                    SchedPlan::Daily(hhmm) => hhmm,
+                    SchedPlan::Skip => "已关闭".to_string(),
+                },
+                // 执行模式（daily/hourly/every6h/off）：前端据此切换时刻输入与徽标
                 "mode": match sched_plan(&cfg, t, extra_enabled(st, t.key)) {
                     SchedPlan::Hourly => "hourly",
+                    SchedPlan::EveryHours(_) => "every6h",
                     SchedPlan::Daily(_) => "daily",
                     SchedPlan::Skip => "off",
                 },
@@ -620,5 +725,23 @@ mod sched_plan_tests {
             SchedPlan::Daily(hhmm) => assert_eq!(hhmm, t.hhmm),
             _ => panic!("models-sync 应为每日计划"),
         }
+    }
+
+    /// qoder-refresh 固定每 6 小时（移植 main）：不受 task_times/task_modes 影响，
+    /// 时刻配置不参与判定；停用时仍按 Skip 处理
+    #[test]
+    fn qoder_refresh_is_every6h() {
+        let cfg = json!({
+            "task_times": { "qoder-refresh": "12:00" },
+            "task_modes": { "qoder-refresh": "hourly" },
+        });
+        match sched_plan(&cfg, task("qoder-refresh"), true) {
+            SchedPlan::EveryHours(h) => assert_eq!(h, REFRESH_INTERVAL_HOURS),
+            other => panic!("qoder-refresh 应为 EveryHours 计划，实际 {other:?}"),
+        }
+        assert!(matches!(
+            sched_plan(&json!({ "disabled_tasks": ["qoder-refresh"] }), task("qoder-refresh"), true),
+            SchedPlan::Skip
+        ));
     }
 }

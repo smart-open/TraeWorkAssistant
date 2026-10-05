@@ -296,6 +296,20 @@ pub(crate) fn dispatch_error_response(
                 "wb_upstream_disabled",
                 "invalid_request_error",
             ),
+            DispatchError::QoderDisabled => (
+                StatusCode::BAD_REQUEST,
+                "qoder",
+                "该模型属 Qoder 上游，但 Qoder 上游未启用（api_pool.json qoder_enabled）".to_string(),
+                "qoder_upstream_disabled",
+                "invalid_request_error",
+            ),
+            DispatchError::TraeDisabled => (
+                StatusCode::BAD_REQUEST,
+                "trae",
+                "该模型属 Trae 上游，但 Trae 资源池已停用（api_pool.json trae_enabled）".to_string(),
+                "trae_pool_disabled",
+                "invalid_request_error",
+            ),
             DispatchError::ModelCooling(rem) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "buddy",
@@ -331,6 +345,7 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
     let pool_ref = match pool {
         TargetPool::Trae => &state.pool,
         TargetPool::Buddy => &state.wb_pool,
+        TargetPool::Qoder => &state.qoder_pool,
         // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
         TargetPool::Custom => return "no healthy account available".to_string(),
     };
@@ -595,13 +610,24 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // 与 data/wb_model_catalog.json（Buddy），纯派生不落盘。官网/目录同步后
     // 无需重启 API 服务即可通过 /v1/models 看到最新列表
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    // 可用性标记运行时派生（§3.3 #5）：HTTP 端点用实时池健康
-    let trae_ok = state.pool.has_selectable();
+    // 可用性标记运行时派生（§3.3 #5）：HTTP 端点用实时池健康；
+    // Trae 开关（trae_enabled，默认开）参与徽章判定——关闭时 Trae 源徽章置灰
+    let trae_enabled = state.trae_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let trae_ok = trae_enabled && state.pool.has_selectable();
     let buddy_ok = state.wb_pool.has_selectable();
+    // Qoder 源旗标（p3-3）：条目始终入表（开关关闭时徽章置灰）
+    let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let qoder_ok = state.qoder_pool.has_selectable();
     let data_dir = state.data_dir.clone();
     let list = tokio::task::spawn_blocking(move || {
         // issue #26：对外目录经全局白名单过滤（管理端 api_unified_models 不过滤）
-        unified_catalog::unified_models_whitelisted(&data_dir, wb_enabled, trae_ok, buddy_ok)
+        unified_catalog::unified_models_whitelisted_ex(
+            &data_dir,
+            wb_enabled,
+            trae_ok,
+            buddy_ok,
+            Some((qoder_enabled, qoder_ok)),
+        )
     })
     .await
     .unwrap_or_default();
@@ -708,6 +734,14 @@ pub async fn chat_completions(
                     return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
                 }
                 return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+            }
+            TargetPool::Qoder => {
+                // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
+                // 无 effort/后缀预处理（思考档位由 resolve_thinking 按条目解析）
+                if stream {
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                }
+                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Trae 池 effort 通道（默认思考两池对齐）——
@@ -1035,6 +1069,13 @@ pub async fn messages(
                 }
                 return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
             }
+            TargetPool::Qoder => {
+                // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
+                if stream {
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                }
+                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+            }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Anthropic thinking 参数视为显式请求
                 //（enabled → high 档；disabled → 空串短路默认思考与路由提示）
@@ -1180,6 +1221,13 @@ pub async fn completions(
                     return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
                 }
                 return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+            }
+            TargetPool::Qoder => {
+                // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
+                if stream {
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                }
+                return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
@@ -2414,6 +2462,15 @@ mod tests {
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             trae_jwt_refresh: None,
+            trae_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_pool: super::super::pool::ApiPool::new(),
+            qoder_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_identity: None,
+            qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_sticky: super::super::wb_sticky::StickyStore::with_ns(
+                super::super::wb_sticky::QODER_NS,
+            ),
         });
         WlFixture { dir, state }
     }

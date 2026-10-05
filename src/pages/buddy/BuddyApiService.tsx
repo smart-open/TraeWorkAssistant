@@ -8,6 +8,7 @@ import { withMinDelay } from '../../lib/delay';
 import type {
   ApiPoolFile,
   PoolStatus,
+  UnifiedModel,
   UsageDayView,
   WbModelInfo,
   WorkBuddyAccountView,
@@ -127,6 +128,10 @@ export default function BuddyApiService() {
   const [wbGroups, setWbGroups] = useState<GroupView[]>([]);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
+  // 厂商列数据源（§6.2）：WbModelInfo 无 vendor 字段，经统一目录聚合按模型 id
+  // 关联（vendor = 自定义模型用户填写值优先，否则按模型名系列推断）；id 缺失/
+  // 失败 → 显示 —，不影响主列表
+  const [vendorMap, setVendorMap] = useState<Map<string, string>>(new Map());
   const [syncing, setSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -138,18 +143,20 @@ export default function BuddyApiService() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [pf, accs, cat, wbp, wbg] = await Promise.all([
+      const [pf, accs, cat, wbp, wbg, unified] = await Promise.all([
         api.apiServer.poolList().catch(() => null),
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
         api.apiServer.wbCatalogList().catch(() => [] as WbModelInfo[]),
         api.apiServer.wbPoolStatus().catch(() => [] as PoolStatus[]),
         api.workbuddy.groups.list().catch(() => [] as GroupView[]),
+        api.apiServer.unifiedModels().catch(() => [] as UnifiedModel[]),
       ]);
       setPool(pf);
       setAccounts(accs);
       setCatalog(cat);
       setWbPool(wbp);
       setWbGroups(wbg);
+      setVendorMap(new Map(unified.filter((m) => m.vendor).map((m) => [m.id, m.vendor])));
       if (pf) {
         setWbFlags({
           wbEnabled: pf.wb_enabled ?? false,
@@ -228,6 +235,9 @@ export default function BuddyApiService() {
       const n = await withMinDelay(api.apiServer.wbCatalogSync(), 800);
       pushToast('success', `Buddy 模型目录已更新（${n} 个模型），/v1/models 与路由即时生效`);
       setCatalog(await api.apiServer.wbCatalogList());
+      // 新增模型需重取统一目录关联 vendor（否则新行厂商列恒 —）
+      const unified = await api.apiServer.unifiedModels();
+      setVendorMap(new Map(unified.filter((m) => m.vendor).map((m) => [m.id, m.vendor])));
     } catch (err) {
       pushToast('error', `Buddy 模型目录同步失败：${String(err).slice(0, 120)}`);
     } finally {
@@ -561,6 +571,7 @@ export default function BuddyApiService() {
                     <tr>
                       <th className="px-3 py-2 text-left">模型 ID</th>
                       <th className="px-3 py-2 text-left">展示名</th>
+                      <th className="px-3 py-2 text-left">厂商</th>
                       <th className="px-3 py-2 text-right">积分倍率</th>
                       <th className="px-3 py-2 text-left">思考档位</th>
                       <th className="px-3 py-2 text-right">上下文</th>
@@ -572,6 +583,9 @@ export default function BuddyApiService() {
                       <tr key={m.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
                         <td className="px-3 py-2 font-mono text-xs">{m.id}</td>
                         <td className="px-3 py-2">{m.display || '—'}</td>
+                        <td className="px-3 py-2 text-xs text-slate-500">
+                          {vendorMap.get(m.id) || '—'}
+                        </td>
                         <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">{m.rate.toFixed(2)}</td>
                         <td className="px-3 py-2 text-xs text-slate-500">
                           {m.effort_override

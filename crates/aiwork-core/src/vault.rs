@@ -333,11 +333,191 @@ pub fn remove_secret(state: &AppState, uid: &str) {
     }
 }
 
+// ---------------- 命名空间凭证（qoder 等多平台复用同一快照）----------------
+
+/// vault 键前缀：`ns:<namespace>:<key>`（冒号分隔，namespace/key 均不允许含冒号）
+fn ns_vault_key(ns: &str, key: &str) -> Vec<u8> {
+    format!("ns:{ns}:{key}").into_bytes()
+}
+
+/// 审查 #15：ns/key 合法性校验（ns_vault_key 以冒号分隔——含冒号的 ns/key
+/// 会与其他组合拼出同一歧义键，造成跨命名空间读写串）。Some(原因) = 非法。
+fn ns_key_invalid(ns: &str, key: &str) -> Option<&'static str> {
+    if ns.is_empty() || key.is_empty() {
+        Some("命名空间或键为空")
+    } else if ns.contains(':') || key.contains(':') {
+        Some("命名空间/键不允许包含冒号")
+    } else {
+        None
+    }
+}
+
+/// 读取命名空间凭证（不存在返回 None；失败仅日志并返回 None）
+pub fn ns_get(data_dir: &Path, ns: &str, key: &str) -> Option<serde_json::Value> {
+    if ns_key_invalid(ns, key).is_some() {
+        return None;
+    }
+    let state = AppState::with_data_dir(data_dir.to_path_buf());
+    let result = (|| -> Result<Option<serde_json::Value>, String> {
+        let guard = open(&state)?;
+        let Some(handle) = guard.as_ref() else {
+            return Err("vault 未初始化".into());
+        };
+        let client = handle
+            .sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        match client
+            .store()
+            .get(&ns_vault_key(ns, key))
+            .map_err(|e| format!("vault 读取失败: {e}"))?
+        {
+            Some(v) => serde_json::from_slice(&v)
+                .map(Some)
+                .map_err(|e| format!("凭证解析失败: {e}")),
+            None => Ok(None),
+        }
+    })();
+    result
+    .inspect_err(|e| {
+        fs_utils::app_log(data_dir, &format!("[vault] ns_get {ns}:{key} 失败: {e}"));
+    })
+    .ok()
+    .flatten()
+}
+
+/// 写入命名空间凭证 + 快照落盘。失败返回 Err（调用方对齐 Trae 红线：
+/// 禁止在 vault 写失败时把明文落库，应只落占位并报错）。
+pub fn ns_set(data_dir: &Path, ns: &str, key: &str, v: &serde_json::Value) -> Result<(), String> {
+    if let Some(reason) = ns_key_invalid(ns, key) {
+        return Err(format!("命名空间凭证非法: {reason}"));
+    }
+    let state = AppState::with_data_dir(data_dir.to_path_buf());
+    let guard = open(&state)?;
+    let Some(handle) = guard.as_ref() else {
+        return Err("vault 未初始化".into());
+    };
+    let client = handle
+        .sh
+        .get_client(CLIENT_PATH.to_vec())
+        .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+    let value = serde_json::to_vec(v).map_err(|e| format!("凭证序列化失败: {e}"))?;
+    client
+        .store()
+        .insert(ns_vault_key(ns, key), value, None)
+        .map_err(|e| format!("vault 写入失败: {e}"))?;
+    handle
+        .sh
+        .commit_with_keyprovider(&handle.snapshot, &handle.keyprovider)
+        .map_err(|e| format!("vault 快照落盘失败: {e}"))
+}
+
+/// 删除命名空间凭证（失败仅日志，不阻断上层删除流程——残留加密记录无碍安全）
+pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
+    if let Some(reason) = ns_key_invalid(ns, key) {
+        fs_utils::app_log(data_dir, &format!("vault: 删除 {ns}:{key} 凭证跳过: {reason}"));
+        return;
+    }
+    let state = AppState::with_data_dir(data_dir.to_path_buf());
+    let result = (|| -> Result<(), String> {
+        let guard = open(&state)?;
+        let Some(handle) = guard.as_ref() else {
+            return Err("vault 未初始化".into());
+        };
+        let client = handle
+            .sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        client
+            .store()
+            .delete(&ns_vault_key(ns, key))
+            .map_err(|e| format!("vault 删除失败: {e}"))?;
+        handle
+            .sh
+            .commit_with_keyprovider(&handle.snapshot, &handle.keyprovider)
+            .map_err(|e| format!("vault 快照落盘失败: {e}"))
+    })();
+    if let Err(e) = result {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("vault: 删除 {ns}:{key} 凭证失败（残留加密记录无碍安全）: {e}"),
+        );
+    }
+}
+
 /// 启动时幂等迁移：库中明文 jwt / refresh_token → vault，随后占位化。
 /// （SQLite 化 P4：原读 checkin_accounts.json，现读 accounts 表——main.rs 已调整为
 /// store 迁移先于本函数，JSON 导入的明文凭据在此收敛进 vault 并从库中抹除。）
 /// 失败不阻断启动（下次启动重试；vault 异常时 save_accounts 仅落盘占位信息，禁止明文）。
 pub fn migrate_on_startup(state: &AppState) {
+    // WB 工具侧凭证收敛（P0-1 补遗，审查 #9）：wb_tokens 表中 1.3.6 及更早版本
+    // 遗留的明文敏感字段 → vault，随后占位化。幂等：已占位行无明文，自然跳过。
+    // 两段式写序（先 vault 成功、后 DB 占位）确保 vault 失败时明文保留、下次启动重试。
+    // （qoder_tokens 无存量部署——Qoder 平台自 1.3.7 新增，写入路径天然收敛，无需迁移。）
+    let wb_raw = crate::store::docs::wb_token_store_load(&crate::store::db(&state.data_dir));
+    if let Some(tokens) = wb_raw.get("tokens").and_then(serde_json::Value::as_object) {
+        let mut migrated = 0usize;
+        for (id, rec) in tokens {
+            let mut acc = "";
+            let mut rt = "";
+            for k in crate::tasks::wb_common::TOKEN_SENSITIVE_KEYS {
+                if let Some(s) = rec.get(k).and_then(serde_json::Value::as_str) {
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if k.ends_with("ccess_token") {
+                        acc = s;
+                    } else {
+                        rt = s;
+                    }
+                }
+            }
+            if acc.is_empty() && rt.is_empty() {
+                continue;
+            }
+            let mut entry =
+                ns_get(&state.data_dir, "wb", id).unwrap_or_else(|| serde_json::json!({}));
+            if !entry.is_object() {
+                entry = serde_json::json!({});
+            }
+            if let Some(em) = entry.as_object_mut() {
+                if !acc.is_empty() {
+                    em.insert("access_token".into(), serde_json::json!(acc));
+                }
+                if !rt.is_empty() {
+                    em.insert("refresh_token".into(), serde_json::json!(rt));
+                }
+            }
+            if ns_set(&state.data_dir, "wb", id, &entry).is_err() {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("启动迁移: WB 凭证 {id} 写入 vault 失败（明文保留，下次启动重试）"),
+                );
+                continue;
+            }
+            // vault 已写入 → DB 占位化（仅敏感键置空串，其余字段原样保留）
+            let mut ph = rec.clone();
+            if let Some(rm) = ph.as_object_mut() {
+                for k in crate::tasks::wb_common::TOKEN_SENSITIVE_KEYS {
+                    if rm.contains_key(k) {
+                        rm.insert(k.to_string(), serde_json::json!(""));
+                    }
+                }
+            }
+            let _ = crate::store::docs::wb_token_store_upsert(
+                &crate::store::db(&state.data_dir),
+                id,
+                &ph,
+            );
+            migrated += 1;
+        }
+        if migrated > 0 {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("启动迁移: 已将 {migrated} 个 WB 账号的明文凭据加密写入 vault"),
+            );
+        }
+    }
     let raw: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
     let plaintext = raw
         .accounts

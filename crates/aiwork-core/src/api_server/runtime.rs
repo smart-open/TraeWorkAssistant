@@ -124,8 +124,9 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     let pool = ApiPool::new();
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
+    let qoder_pool = ApiPool::new();
     let (pool_count, wb_uids_len, wb_accounts_total) =
-        apply_pool_snapshot(state, &pool, &wb_pool);
+        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
 
     let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -192,6 +193,36 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     let shared = Arc::new(ApiSharedState {
         pool,
         wb_pool,
+        trae_enabled: std::sync::atomic::AtomicBool::new(true),
+        qoder_pool,
+        qoder_enabled: std::sync::atomic::AtomicBool::new(pool_file.qoder_enabled),
+        // Qoder 凭证按次解析回调：PAT 换 24h 作业令牌 / 客户端通道惰性刷新
+        //（ensure_fresh 全防护：并发锁 + 落库 + 指纹注入），池内 jwt 仅快照展示
+        qoder_identity: {
+            let st = state.clone();
+            Some(std::sync::Arc::new(move |uid: &str| {
+                let (creds, _, note) = crate::tasks::qoder_common::ensure_fresh(
+                    &st,
+                    &crate::tasks::qoder_upstream::qoder_agent(),
+                    uid,
+                    2,
+                );
+                match note {
+                    "no_credential" | "expired_needs_relogin" | "auth_dead" | "pat_rejected"
+                    | "refresh_failed" => Err(note.to_string()),
+                    _ => Ok(creds),
+                }
+            })
+                as std::sync::Arc<dyn Fn(&str) -> Result<crate::tasks::qoder_common::QoderCreds, String> + Send + Sync>)
+        },
+        qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(
+            pool_file.qoder_hedge_threshold_ms,
+        ),
+        qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(
+            pool_file.qoder_sticky_enabled,
+        ),
+        // 审查 #2：Qoder 线绑定带 "q:" 命名空间，与 WB 线共用 sticky_bindings 表互不串载
+        qoder_sticky: StickyStore::load_ns(&state.data_dir, super::wb_sticky::QODER_NS),
         wb_enabled: std::sync::atomic::AtomicBool::new(pool_file.wb_enabled),
         wb_sanitize: std::sync::atomic::AtomicBool::new(true),
         // T5.3/T5.5/T5.6③ 开关（api_pool.json，serde default 兼容旧文件）
@@ -231,10 +262,13 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         },
     });
 
-    // F-76②/F-77 热参数：池并发上限（两池同构生效）+ wb_sticky 显式 TTL
+    // F-76②/F-77 热参数：池并发上限（三池同构生效）+ wb_sticky 显式 TTL
     shared.pool.set_concurrency_limit(pool_file.account_concurrency_limit);
     shared
         .wb_pool
+        .set_concurrency_limit(pool_file.account_concurrency_limit);
+    shared
+        .qoder_pool
         .set_concurrency_limit(pool_file.account_concurrency_limit);
     shared
         .wb_sticky
@@ -262,9 +296,14 @@ fn merge_pool_expire_times(rc: &crate::models::RemainingCreditsFile) -> std::col
 }
 
 /// 池装配公共逻辑（build_shared 构建 / 凭据变更热重载共用）：
-/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建两池内条目。
-/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数) 供调用方记日志。
-pub fn apply_pool_snapshot(state: &AppState, pool: &ApiPool, wb_pool: &ApiPool) -> (usize, usize, usize) {
+/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建三池内条目
+///（Trae/WB/Qoder）。返回 (trae 池条目数, wb 白名单长度, wb 账号总数) 供调用方记日志。
+pub fn apply_pool_snapshot(
+    state: &AppState,
+    pool: &ApiPool,
+    wb_pool: &ApiPool,
+    qoder_pool: &ApiPool,
+) -> (usize, usize, usize) {
     let accounts = crate::vault::load_accounts(state);
     let pool_file: ApiPoolFile = store::db(&state.data_dir).kv_get("api_pool");
     let groups_file: GroupsFile = store::docs::groups_load(&store::db(&state.data_dir));
@@ -307,6 +346,24 @@ pub fn apply_pool_snapshot(state: &AppState, pool: &ApiPool, wb_pool: &ApiPool) 
     };
     let wb_uids = effective_wb_uids(&pool_file, &wb_accounts);
     wb_pool.sync_from_wb(&wb_accounts, &wb_uids);
+    // Qoder 池同步（api_pool.json.qoder_enabled_uids 白名单 + qoder_group_ids 分组筛选，
+    // 对齐 Buddy 池 wb_group_filter 语义：非空时仅纳入所选分组的账号，未分组不参与；
+    // token 空不入池，credits 恒 None——qoder 侧积分为订阅制口径，池内快照不承载）
+    let qoder_accounts_all = qoder_upstream_accounts(state);
+    let qoder_group_filter: Option<std::collections::HashSet<&str>> =
+        if pool_file.qoder_group_ids.is_empty() {
+            None
+        } else {
+            Some(pool_file.qoder_group_ids.iter().map(|s| s.as_str()).collect())
+        };
+    let qoder_accounts: Vec<_> = match &qoder_group_filter {
+        Some(f) => qoder_accounts_all
+            .into_iter()
+            .filter(|a| f.contains(a.group_id.as_str()))
+            .collect(),
+        None => qoder_accounts_all,
+    };
+    qoder_pool.sync_from_qoder(&qoder_accounts, &pool_file.qoder_enabled_uids);
     (pool.count(), wb_uids.len(), wb_accounts.len())
 }
 
@@ -371,7 +428,9 @@ pub fn wb_upstream_accounts(state: &AppState) -> Vec<WbSyncAccount> {
     let pool: WbPoolLite =
         serde_json::from_value(store::docs::wb_pool_load(&store::db(&state.data_dir)))
             .unwrap_or_default();
-    let tokens = store::docs::wb_token_store_load(&store::db(&state.data_dir))
+    // 凭证收敛（P0-1）：读走 secure 回填（vault 取明文），DB 只留占位空串——
+    // 直读 DB 会导致收敛后 token 恒空、账号不入池（审查 #8）
+    let tokens = crate::tasks::wb_common::token_store_load_secure(&state.data_dir)
         .get("tokens")
         .and_then(|t| t.as_object())
         .cloned()
@@ -401,6 +460,53 @@ pub fn wb_upstream_accounts(state: &AppState) -> Vec<WbSyncAccount> {
     out
 }
 
+// ── Qoder 上游取号（与 wb_upstream_accounts 同构）────────────────────────────
+
+/// 汇总 Qoder 上游账号：qoder_accounts 表账号 + token store 凭证 → QoderSyncAccount。
+/// 池内 access_token 仅快照展示（请求时经 qoder_identity 回调按次解析凭证）；
+/// machine_id 为账号绑定指纹透传（COSY 头签名依赖）。仅纳入有凭证的账号。
+pub fn qoder_upstream_accounts(state: &AppState) -> Vec<crate::api_server::pool::QoderSyncAccount> {
+    use serde_json::Value;
+    let pool = crate::store::docs::qoder_pool_load(&store::db(&state.data_dir));
+    let tokens = crate::tasks::qoder_common::load_token_store(state)
+        .get("tokens")
+        .and_then(|t| t.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for a in pool
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+    {
+        let uid = a.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        if uid.is_empty() {
+            continue;
+        }
+        let rec = tokens.get(&uid).cloned().unwrap_or_default();
+        let access_token = as_str(fs_utils::dig(&rec, &["access_token"])).unwrap_or_default();
+        if access_token.is_empty() {
+            continue;
+        }
+        out.push(crate::api_server::pool::QoderSyncAccount {
+            name: as_str(fs_utils::dig(a, &["name", "nickname"]))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| uid.clone()),
+            machine_id: as_str(fs_utils::dig(a, &["device_profile", "machine_id"]))
+                .unwrap_or_default(),
+            needs_relogin: a
+                .get("needs_relogin")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            uid,
+            access_token,
+            group_id: as_str(fs_utils::dig(a, &["group_id"])).unwrap_or_default(),
+        });
+    }
+    out
+}
+
 // ── 网关共享句柄注册（server 单体常驻运行）──────────────────────────────────
 
 /// 网关共享状态全局注册点：server main 启动时 build_shared 后 set 一次，
@@ -418,10 +524,11 @@ pub fn gateway_shared() -> Option<Arc<ApiSharedState>> {
 }
 
 /// 凭据/池配置变更后热重载（原 commands/api_server.rs `reload_pools_if_running` 语义）：
-/// 网关在运行时全量重建两池条目；未注册（CLI 模式）时静默跳过。
+/// 网关在运行时全量重建三池条目（Trae/WB/Qoder）；未注册（CLI 模式）时静默跳过。
 pub fn reload_pools_after_change(state: &AppState) {
     let Some(shared) = gateway_shared() else { return };
-    let (n, wb_uids, wb_total) = apply_pool_snapshot(state, &shared.pool, &shared.wb_pool);
+    let (n, wb_uids, wb_total) =
+        apply_pool_snapshot(state, &shared.pool, &shared.wb_pool, &shared.qoder_pool);
     fs_utils::app_log(
         &state.data_dir,
         &format!("凭据变更热重载: trae_pool={n} wb_uids={wb_uids} wb_accounts={wb_total}"),

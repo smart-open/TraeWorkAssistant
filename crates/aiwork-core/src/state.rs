@@ -199,6 +199,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// JWT 刷新锁：防止多个并发请求同时 ExchangeToken（Arc 共享跨线程）
     pub jwt_refresh_lock: Arc<Mutex<()>>,
+    /// Qoder 账号池整池读写锁：防并发整池覆盖丢写（直操原始 JSON 路径共用）
+    pub qoder_pool_lock: Arc<Mutex<()>>,
 }
 
 /// 配置文件名列表（路由到 conf/ 目录）
@@ -236,7 +238,18 @@ impl AppState {
         Ok(Self {
             data_dir,
             jwt_refresh_lock: Arc::new(Mutex::new(())),
+            qoder_pool_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// 以既有数据目录构造（vault ns_* 等只有 data_dir 的调用方使用）；
+    /// 仅持有目录与锁，不做目录创建等副作用（目录已由主实例创建）。
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            jwt_refresh_lock: Arc::new(Mutex::new(())),
+            qoder_pool_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     /// 配置文件路径：base_dir/conf/name

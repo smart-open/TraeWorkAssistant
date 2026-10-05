@@ -1261,6 +1261,16 @@ mod tests {
             "choices": [{"message": {"content": "", "tool_calls": [{"id": "t1"}]}}]
         });
         assert!(!crate::api_server::aggregated_response_is_empty(&tools));
+        // 仅有 legacy function_call → 非空（防御性：聚合器当前归一为 tool_calls，
+        // 此处兜底未来透传形态；issue #57 审查修复）
+        let legacy_fn = serde_json::json!({
+            "choices": [{"message": {"content": "", "function_call": {"name": "f", "arguments": "{}"}}}]
+        });
+        assert!(!crate::api_server::aggregated_response_is_empty(&legacy_fn));
+        // function_call 显式 null → 视为空
+        assert!(crate::api_server::aggregated_response_is_empty(
+            &serde_json::json!({"choices": [{"message": {"content": "", "function_call": null}}]})
+        ));
         // Anthropic message：顶层 content 块数组为空 → 空
         assert!(crate::api_server::aggregated_response_is_empty(&serde_json::json!({"content": []})));
         // Anthropic 有文本块 → 非空

@@ -23,6 +23,10 @@ const TASK_DESC: Record<string, string> = {
   'wb-renew': 'Token 到期前 24h 内自动续期（兜底，每日检查一次）',
   'wb-credits-snapshot': '积分余额快照 + 官方用量刷新，补齐积分看板近 7 日消耗趋势',
   'trae-credits-snapshot': '积分余额每日快照，补齐积分看板消耗趋势',
+  'qoder-checkin': '全账号每日自动签到（0 点签到 + 10 点登录奖励双活动），已领账号自动跳过',
+  'qoder-refresh': '每 6 小时为全部账号续期登录凭证（固定周期，不受时刻配置影响）',
+  'qoder-credits-snapshot': '积分余额每日快照，补齐积分看板消耗趋势',
+  'qoder-catalog-sync': '同步 Qoder 上游模型目录（不消耗积分），供网关模型映射使用',
 };
 
 /** 可配置「每小时」模式的任务（看板数据同步类，与服务端 HOURLY_CAPABLE 对齐） */

@@ -55,15 +55,16 @@ function fmtTokens(n: number): string {
   return n.toLocaleString('zh-CN');
 }
 
-/** 网关源按平台维度选取（Trae 池 / Buddy 池；custom 池仅 API 服务页 UsageStatsPanel 展示） */
+/** 网关源按平台维度选取（Trae 池 / Buddy 池 / Qoder 池；custom 池仅 API 服务页 UsageStatsPanel 展示） */
 function gwPoolsFor(gw: GatewayDays | null, scope: PlatformScope): UsageDayView[] {
   if (!gw) return [];
-  return scope === 'trae' ? gw.trae : gw.buddy;
+  return scope === 'trae' ? gw.trae : scope === 'buddy' ? gw.buddy : gw.qoder;
 }
 
 export interface GatewayDays {
   trae: UsageDayView[];
   buddy: UsageDayView[];
+  qoder: UsageDayView[];
 }
 
 type DayAgg = { input: number; output: number; cache_read: number; cache_write: number; calls: number };
@@ -83,7 +84,7 @@ export default function TokensTab({
   usage: UsageHistoryResult | null;
   /** 本地 Token 统计（workbuddy_token_stats，365 天） */
   tokenStats: WbTokenStats | null;
-  /** API 网关 Trae/Buddy 池用量（90 天） */
+  /** API 网关 Trae/Buddy/Qoder 池用量（90 天） */
   gateway: GatewayDays | null;
 }) {
   const isDark = useIsDark();
@@ -92,8 +93,9 @@ export default function TokensTab({
   // 切源时清空模型筛选：旧源的模型在新源列表中不存在，残留会让趋势静默归零（审查修复）
   useEffect(() => setModelFilter(''), [source]);
 
-  const traeActive = scope !== 'buddy';
-  const buddyActive = scope !== 'trae';
+  // 精确等值（三平台扩展）：二元取反会让 qoder 页同时命中 trae/buddy 分支
+  const traeActive = scope === 'trae';
+  const buddyActive = scope === 'buddy';
   const inRange = (date: string) => date >= startStr && date <= todayStr;
 
   // ---- 源可用性（§8 诚实空态兜底；源禁用说明在页面第二层分类的切换控件上）----
@@ -262,13 +264,15 @@ export default function TokensTab({
     return m;
   }, [source, buddyActive, traeActive, tokenStats, gateway, scope, usage, modelFilter]);
 
-  // ---- 覆盖窗口标注（§8.1）----
+  // ---- 覆盖窗口标注（§8.1；Qoder 页无 token 数据源，整页空态不显示窗口文案）----
   const coverage =
-    source === 'local'
-      ? `本地 ${tokenStats?.window_days ?? 365} 天（~/.workbuddy + ~/.codebuddy 会话）`
-      : source === 'gateway'
-        ? '网关 90 天'
-        : 'Trae 365 天 · Buddy 无接口';
+    scope === 'qoder'
+      ? ''
+      : source === 'local'
+        ? `本地 ${tokenStats?.window_days ?? 365} 天（~/.workbuddy + ~/.codebuddy 会话）`
+        : source === 'gateway'
+          ? '网关 90 天'
+          : 'Trae 365 天 · Buddy 无接口';
 
   const tooltipStyle = {
     fontSize: 12,
@@ -285,12 +289,16 @@ export default function TokensTab({
     tickLine: false,
   } as const;
 
+  // Qoder 无任何 token 数据源（本地会话统计/网关池/官网接口均未接入），整页空态优先于单源空态
+  const qoderUnavailable = scope === 'qoder';
   const unavailableHint =
-    localUnavailable
-      ? { title: '本地源无 Trae 数据', hint: '本地源 = WB/CodeBuddy 客户端会话统计；Trae 无本地源，切「官网」查看 Trae token 明细。' }
-      : officialUnavailable
-        ? { title: 'Buddy 官网未提供按日明细接口', hint: 'Token 的 input/output 日明细官网仅 Trae 提供；Buddy 请切「本地」或「API网关」源。' }
-        : null;
+    qoderUnavailable
+      ? { title: 'Qoder 暂无 Token 统计数据源', hint: 'Qoder 官网未提供 token 用量接口；本地日志的 token 字段恒为占位 0（官方模型计费在服务端）。待网关 Qoder 上游接入后由网关侧落库统计。' }
+      : localUnavailable
+        ? { title: '本地源无 Trae 数据', hint: '本地源 = WB/CodeBuddy 客户端会话统计；Trae 无本地源，切「官网」查看 Trae token 明细。' }
+        : officialUnavailable
+          ? { title: 'Buddy 官网未提供按日明细接口', hint: 'Token 的 input/output 日明细官网仅 Trae 提供；Buddy 请切「本地」或「API网关」源。' }
+          : null;
 
   return (
     <div className="card p-5">
@@ -308,7 +316,7 @@ export default function TokensTab({
             )}
             {source === 'gateway' && (
               <Badge tone="slate">
-                {scope === 'trae' ? 'Trae 池' : 'Buddy 池'} · {gwPoolsFor(gateway, scope).length} 个日桶
+                {scope === 'trae' ? 'Trae 池' : scope === 'buddy' ? 'Buddy 池' : 'Qoder 池'} · {gwPoolsFor(gateway, scope).length} 个日桶
               </Badge>
             )}
             {source === 'official' && usage?.cached && <Badge tone="slate">纯缓存读取</Badge>}

@@ -7,6 +7,8 @@ import type {
   CreditsDailySnapshot,
   GroupView,
   LogLine,
+  QoderCheckinDone,
+  QoderCheckinLine,
   Settings,
   ViewKey,
   AppKey,
@@ -39,6 +41,16 @@ export interface CheckinState {
   retry: CheckinRetryInfo | null;
 }
 
+/** Qoder 签到进行态（store 化：事件监听在 store 层注册，不随页面卸载——
+ * 签到进行中切走页面再切回，running/进度/汇总完好；调度器后台触发亦不丢事件） */
+export interface QoderCheckinState {
+  running: boolean;
+  lines: QoderCheckinLine[];
+  done: QoderCheckinDone | null;
+  /** done 事件递增计数：页面据此联动刷新账号列表/签到记录 */
+  doneRev: number;
+}
+
 export interface LogQuery {
   logType?: string;
   date?: string;
@@ -59,6 +71,8 @@ interface AppState {
   logs: LogLine[];
   creditsDaily: CreditsDailySnapshot[];
   checkin: CheckinState;
+  /** Qoder 签到进行态（store 单例持有，页面切走不丢事件） */
+  qoderCheckin: QoderCheckinState;
   toasts: Toast[];
   /** 全局 API 管理弹窗（unified-api-gateway-design §5.2；任意 activeApp 视图均可打开） */
   showApiManager: boolean;
@@ -72,6 +86,11 @@ interface AppState {
   /** 切换侧边栏应用 Tab，并跳到该应用默认首页 */
   setActiveApp: (app: AppKey) => void;
   applyCheckinEvent: (e: CheckinProgressEvent) => void;
+  /** Qoder 签到 NDJSON 进度归约（start/done/逐账号行/exit；skipped_busy 与
+   * empty 计数口径对齐 Rust 侧） */
+  applyQoderCheckinLine: (line: string) => void;
+  /** 发起 Qoder 签到（连点自守；失败置回 running 并 toast） */
+  startQoderCheckin: () => Promise<void>;
 
   refreshAccounts: () => Promise<void>;
   refreshGroups: () => Promise<void>;
@@ -167,6 +186,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   logs: [],
   creditsDaily: [],
   checkin: { active: false, total: 0, index: 0, results: [], done: null, retry: null },
+  qoderCheckin: { running: false, lines: [], done: null, doneRev: 0 },
   toasts: [],
   showApiManager: false,
 
@@ -203,6 +223,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     unsubs = [];
     unsubs = await setupListeners({
       onCheckinProgress: (e) => get().applyCheckinEvent(e),
+      onQoderCheckinProgress: (line) => get().applyQoderCheckinLine(line),
     });
     await Promise.all([
       get().refreshAccounts(),
@@ -224,6 +245,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       logs: [],
       creditsDaily: [],
       checkin: { active: false, total: 0, index: 0, results: [], done: null, retry: null },
+      // 审查 #19：qoderCheckin 与 checkin 同款清空，防止重登录后残留上一会话进度串号
+      qoderCheckin: { running: false, lines: [], done: null, doneRev: 0 },
     });
   },
 
@@ -322,6 +345,88 @@ export const useAppStore = create<AppState>((set, get) => ({
           `${deadCount} 个账号 JWT 已被服务端吊销（该账号在别处重新登录/IDE 内退出过登录）：请在账号管理页对该账号重新执行 OAuth 登录录入`,
         );
       }
+    }
+  },
+
+  applyQoderCheckinLine: (line) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (!parsed || typeof parsed !== 'object') return;
+    const ev = parsed as Record<string, unknown>;
+    if (ev.type === 'start') {
+      // 调度器后台触发时页面不在场也能正确进入 running 态（store 层归约的收益）
+      set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: true, lines: [], done: null } }));
+      return;
+    }
+    if (ev.type === 'done') {
+      // 跨进程锁被占用：整轮幂等跳过，不误报「成功完成」、不落全 0 的 done 徽标
+      if (ev.skipped_busy === true) {
+        set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: false, done: null } }));
+        get().pushToast('warn', '另一进程正在执行 Qoder 签到，本轮已跳过（调度稍后会自动重试）');
+        return;
+      }
+      const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
+      // failed_empty_campaigns（活动未开始/不可用）为非用户可操作失败：与真实
+      // 失败分开计数，避免用户对无解失败反复重试（口径对齐 Rust 侧补签通知）
+      const empty = Math.max(0, num(ev.failed_empty_campaigns));
+      const failed = num(ev.failed);
+      const done: QoderCheckinDone = {
+        ok: num(ev.ok),
+        already: num(ev.already),
+        failed,
+        empty,
+      };
+      set((s) => ({
+        qoderCheckin: { ...s.qoderCheckin, running: false, done, doneRev: s.qoderCheckin.doneRev + 1 },
+      }));
+      get().pushToast(
+        failed - empty > 0 ? 'warn' : 'success',
+        `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
+          (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : ''),
+      );
+      return;
+    }
+    if (ev.type === 'exit') {
+      set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: false } }));
+      return;
+    }
+    if (typeof ev.index === 'number' && ev.index > 0) {
+      const i = ev.index;
+      // reward 数值归一（后端偶发字符串形态；NaN/缺失归 undefined）
+      const raw = ev.reward;
+      const reward =
+        typeof raw === 'number' && isFinite(raw)
+          ? raw
+          : typeof raw === 'string' && raw.trim() !== '' && !isNaN(Number(raw))
+            ? Number(raw)
+            : undefined;
+      set((s) => {
+        const lines = s.qoderCheckin.lines.slice();
+        lines[i - 1] = {
+          index: i,
+          user_id: String(ev.user_id ?? ''),
+          name: String(ev.name ?? ''),
+          status: (ev.status as QoderCheckinLine['status']) ?? 'fail',
+          message: ev.message != null ? String(ev.message) : undefined,
+          reward,
+        };
+        return { qoderCheckin: { ...s.qoderCheckin, lines } };
+      });
+    }
+  },
+
+  startQoderCheckin: async () => {
+    if (get().qoderCheckin.running) return; // 连点自守（后端轮次锁仍兜底）
+    set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: true, lines: [], done: null } }));
+    try {
+      await api.qoder.checkinStart({ skip_checked_in: true });
+    } catch (err) {
+      set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: false } }));
+      get().pushToast('error', `发起签到失败：${String(err)}`);
     }
   },
 
