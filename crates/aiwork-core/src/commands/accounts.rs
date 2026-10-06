@@ -2151,6 +2151,9 @@ mod tests {
     // （无 rt / 已失效 / JWT 新鲜）；网络刷新成功路径不入单测（联调覆盖）。
     #[test]
     fn test_renew_due_accounts_skip_branches_and_counts() {
+        // 触碰 vault 全局单例：串行互斥 + 持锁重置（此前缺 reset，与其他 vault 测试
+        // 并行时单例绑定到他人目录，Linux CI 已暴露 skipped 计数 flake）
+        let _vault_guard = crate::vault::vault_test_guard();
         let dir = std::env::temp_dir()
             .join(format!("aiwork_renew_orch_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(dir.join("data"));

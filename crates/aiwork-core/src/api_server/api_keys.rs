@@ -824,8 +824,8 @@ mod tests {
     #[test]
     fn key_persisted_placeholder_and_restored_from_vault() {
         // 写侧：save 落库后存储层 key 占位化、vault 持真值；读侧：load 回填明文，verify 命中
-        // 触碰 vault 全局单例（VAULT 首开固化 conf_path），先重置避免与其他 vault 测试串写
-        crate::vault::reset_for_tests();
+        // 触碰 vault 全局单例：串行互斥 + 持锁重置（防并行测试跨目录串写）
+        let _vault_guard = crate::vault::vault_test_guard();
         let dir = std::env::temp_dir().join(format!("twa_keys_vault_{}", std::process::id()));
         let f = ApiKeysFile {
             keys: vec![entry("kv1", "ck-secret", true, 0)],
@@ -855,8 +855,8 @@ mod tests {
     #[test]
     fn startup_migration_collects_plaintext_keys() {
         // 存量明文（旧版本遗留）→ vault + 占位，幂等；回填后网关验证可用
-        // 触碰 vault 全局单例，先重置（同 key_persisted_... 测试）
-        crate::vault::reset_for_tests();
+        // 触碰 vault 全局单例：串行互斥 + 持锁重置（同 key_persisted_... 测试）
+        let _vault_guard = crate::vault::vault_test_guard();
         let dir = std::env::temp_dir().join(format!("twa_keys_mig_{}", std::process::id()));
         let f = ApiKeysFile {
             keys: vec![entry("km1", "ck-legacy", true, 0)],

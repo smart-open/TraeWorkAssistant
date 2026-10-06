@@ -179,6 +179,19 @@ pub(crate) fn reset_for_tests() {
     *VAULT.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// 测试专用：触碰 vault 单例的测试统一入口——进程级串行互斥 + 持锁后重置。
+/// cargo test 默认多线程并行，仅 reset 无法防止「A 重置后 B 抢先 open 绑定
+/// 自己的 conf_path，A 随后 open 复用 B 的句柄」的跨目录串写/串读（Linux CI
+/// 已两次暴露）；串行互斥是唯一可靠解。Guard 须绑定具名变量持有至测试结束
+/// （`let _guard = vault_test_guard();`），勿用 `let _ =` 立即释放。
+#[cfg(test)]
+pub(crate) fn vault_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    reset_for_tests();
+    guard
+}
+
 // ---------------- 公共 API ----------------
 
 /// 从磁盘加载账号文件，并从 vault 回填占位账号的明文凭据（仅内存，不落明文盘）。
