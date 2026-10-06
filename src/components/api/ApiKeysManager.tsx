@@ -12,21 +12,24 @@ import { api } from '../../lib/tauri';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
-import type { ApiKeyEntry, ApiPoolFile, PoolStatus, UsageDayView } from '../../types';
+import type { ApiKeyEntry, PoolStatus, UsageDayView } from '../../types';
 
-/** issue #30 混合白名单：候选账号平台标记（三池：Trae/Buddy/Qoder） */
+/** issue #30 混合白名单：候选账号平台标记 */
 type CandidatePool = 'trae' | 'buddy' | 'qoder';
 /** 调度配置候选：上游账号 + 所属池标记 */
 interface PoolCandidate extends PoolStatus {
   pool: CandidatePool;
 }
-/** 三池徽标样式（限定上游/专一候选列表与调度列） */
-const POOL_TONE: Record<CandidatePool, 'blue' | 'green' | 'amber'> = {
-  trae: 'blue',
-  buddy: 'green',
-  qoder: 'amber',
+
+/** 池标记 → 徽标/文案映射（候选列表与专一/限定上游文案共用） */
+const POOL_TAG: Record<CandidatePool, { label: string; tone: 'blue' | 'green' | 'violet' }> = {
+  trae: { label: 'Trae', tone: 'blue' },
+  buddy: { label: 'Buddy', tone: 'green' },
+  qoder: { label: 'Qoder', tone: 'violet' },
 };
-const POOL_LABEL: Record<CandidatePool, string> = { trae: 'Trae', buddy: 'Buddy', qoder: 'Qoder' };
+/** 绑定池 → 展示文案（空串由调用方处理为跨池文案） */
+const bindPoolLabel = (p: string) =>
+  p === 'trae' ? 'Trae 池' : p === 'buddy' ? 'Buddy 池' : p === 'qoder' ? 'Qoder 池' : 'Trae/Buddy/Qoder 池';
 
 /** RFC4122 v4 UUID（crypto.randomUUID 仅安全上下文可用，HTTP 直访报错 → getRandomValues 兜底） */
 function randomUuid(): string {
@@ -69,14 +72,15 @@ export default function ApiKeysManager({
   const [deleteForKey, setDeleteForKey] = useState<ApiKeyEntry | null>(null);
   // 子 Key 配置候选（三池上游账号；打开弹框时刷新）：
   // poolStatus = Trae 池（invoke pool_status），buddyPoolStatus = Buddy/WB 池，
-  // qoderPoolStatus = Qoder 池（invoke qoder_pool_status）
+  // qoderPoolStatus = Qoder 池（fail-open 全量含凭证账号）
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [buddyPoolStatus, setBuddyPoolStatus] = useState<PoolStatus[]>([]);
   const [qoderPoolStatus, setQoderPoolStatus] = useState<PoolStatus[]>([]);
-  // 池配置（读取 qoder_enabled：绑定 Qoder 池但上游未启用时弹框内告警提示）
-  const [poolCfg, setPoolCfg] = useState<ApiPoolFile | null>(null);
   // 今日按 Key 的 token 用量（「今日已用」列展示）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
+  // Qoder 上游开关（对齐方案 §5.3 警告徽标数据源，已交付归档）：
+  // Key 绑定 Qoder 池但未启用时显式告警；null = 未知（不告警）
+  const [qoderEnabled, setQoderEnabled] = useState<boolean | null>(null);
 
   // ---- 多 API Key 管理（原 ApiService.tsx 逻辑原样搬移） ----
   const loadKeys = useCallback(async () => {
@@ -177,14 +181,13 @@ export default function ApiKeysManager({
     setEditKey(k);
     // issue #30：bind="" 旧数据裸 uid 显示时归一为 buddy: 前缀（与候选编码对齐，
     // UI 勾选状态与实际限定一致）；原值存入 editOrigRef，保存时未改动则写回原值
-    const norm = (v: string) =>
-      (!k.bind_pool && v && !/^(trae|buddy|qoder):/i.test(v) ? `buddy:${v}` : v);
+    const norm = (v: string) => (!k.bind_pool && v && !/^(trae|buddy|qoder):/i.test(v) ? `buddy:${v}` : v);
     editOrigRef.current = { allowed: k.allowed_accounts, dedicated: k.dedicated_account || '' };
     setEditAllowed(new Set(k.allowed_accounts.map(norm)));
     setEditMode(k.schedule_mode || 'expire_first');
     setEditDedicated(norm(k.dedicated_account || ''));
     setEditBindPool(k.bind_pool || '');
-    // 服务可能刚启动，三池候选列表与池配置即时刷新
+    // 服务可能刚启动，三池候选列表即时刷新
     api.apiServer
       .poolStatus()
       .then(setPoolStatus)
@@ -202,12 +205,6 @@ export default function ApiKeysManager({
       .then(setQoderPoolStatus)
       .catch(() => {
         /* 保留上次候选 */
-      });
-    api.apiServer
-      .poolList()
-      .then(setPoolCfg)
-      .catch(() => {
-        /* 保留上次配置 */
       });
   };
 
@@ -243,7 +240,7 @@ export default function ApiKeysManager({
     const v = Math.max(0, Math.floor(limit) || 0);
     const cur = apiKeys.find((k) => k.id === id);
     if (!cur || cur.daily_limit === v) return;
-    void saveKeys(apiKeys.map((k) => (k.id === id ? { ...k, daily_limit: v } : k)), '限额已更新');
+    void saveKeys(apiKeys.map((k) => k.id === id ? { ...k, daily_limit: v } : k), '限额已更新');
   };
 
   // 复制成功按钮级反馈（不依赖 toast，通知方式设为 none/system 时也可见）
@@ -263,7 +260,7 @@ export default function ApiKeysManager({
   useEffect(() => {
     void loadKeys();
     generateKeyValue();
-    // 上游账号候选（服务未运行时为空列表）：Trae + Buddy + Qoder 三池
+    // 上游账号候选（服务未运行时为空列表）：Trae 池 + Buddy 池 + Qoder 池
     api.apiServer
       .poolStatus()
       .then(setPoolStatus)
@@ -282,18 +279,19 @@ export default function ApiKeysManager({
       .catch(() => {
         /* 保留空列表 */
       });
-    api.apiServer
-      .poolList()
-      .then(setPoolCfg)
-      .catch(() => {
-        /* 保留空配置 */
-      });
     // 今日 token 用量（读落盘数据，仅取当日条目）
     api.apiServer
       .usageStats(14)
       .then(setUsage)
       .catch(() => {
         /* 保留空列表 */
+      });
+    // Qoder 上游开关（Key 绑定 Qoder 池的警告徽标数据源）
+    api.apiServer
+      .poolList()
+      .then((p) => setQoderEnabled(p.qoder_enabled ?? false))
+      .catch(() => {
+        /* 未知状态不告警 */
       });
   }, [loadKeys, generateKeyValue]);
 
@@ -314,13 +312,13 @@ export default function ApiKeysManager({
 
   // issue #25 资源池绑定 + issue #30 混合白名单：限定上游/专一候选按绑定池切换数据源。
   // 跟随全局调度（bind=""）合并展示 Trae + Buddy + Qoder 三池账号并标记平台，可跨池勾选；
-  // 绑定池时仅展示对应池（trae → Trae 池；buddy/默认 → Buddy 池；qoder → Qoder 池）。
+  // 绑定池时仅展示对应池（trae → Trae 池；buddy → Buddy 池；qoder → Qoder 池）。
   // 修复历史问题：原候选列表拉的是 Trae 池，而后端白名单只作用于 WB 池
   const editCandidates: PoolCandidate[] = useMemo(() => {
     const tag = (pool: CandidatePool, list: PoolStatus[]) => list.map((p) => ({ ...p, pool }));
     if (editBindPool === 'trae') return tag('trae', poolStatus);
-    if (editBindPool === 'qoder') return tag('qoder', qoderPoolStatus);
     if (editBindPool === 'buddy') return tag('buddy', buddyPoolStatus);
+    if (editBindPool === 'qoder') return tag('qoder', qoderPoolStatus);
     return [...tag('trae', poolStatus), ...tag('buddy', buddyPoolStatus), ...tag('qoder', qoderPoolStatus)];
   }, [editBindPool, poolStatus, buddyPoolStatus, qoderPoolStatus]);
 
@@ -388,16 +386,16 @@ export default function ApiKeysManager({
             onChange={(e) => setNewKeyLimit(parseInt(e.target.value) || 0)}
           />
         </div>
-        <div className="w-72">
+        <div className="w-56">
           <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">
             资源池<span className="ml-1 font-normal text-slate-400">（优先走所选池）</span>
           </label>
           <div className="flex gap-1">
             {[
-              { key: '', label: '跟随全局', title: '不绑定，按系统策略选池' },
-              { key: 'trae', label: 'Trae 池', title: '优先走 Trae，异常可回退' },
-              { key: 'buddy', label: 'Buddy 池', title: '优先走 Buddy，异常可回退' },
-              { key: 'qoder', label: 'Qoder 池', title: '优先走 Qoder，异常可回退' },
+              { key: '', label: '全局', title: '不绑定，按系统策略选池' },
+              { key: 'trae', label: 'Trae', title: '优先走 Trae，异常可回退' },
+              { key: 'buddy', label: 'Buddy', title: '优先走 Buddy，异常可回退' },
+              { key: 'qoder', label: 'Qoder', title: '优先走 Qoder，异常可回退' },
             ].map((p) => (
               <button
                 key={p.key}
@@ -523,7 +521,16 @@ export default function ApiKeysManager({
                       {/* issue #25 资源池绑定徽标 */}
                       {k.bind_pool === 'trae' && <Badge tone="blue" className="ml-1">Trae 池</Badge>}
                       {k.bind_pool === 'buddy' && <Badge tone="green" className="ml-1">Buddy 池</Badge>}
-                      {k.bind_pool === 'qoder' && <Badge tone="amber" className="ml-1">Qoder 池</Badge>}
+                      {k.bind_pool === 'qoder' && <Badge tone="violet" className="ml-1">Qoder 池</Badge>}
+                      {/* §5.3 保存后校验提示：绑定 Qoder 池但上游未启用 → 警告徽标 */}
+                      {k.bind_pool === 'qoder' && qoderEnabled === false && (
+                        <span
+                          className="ml-1 inline-flex align-middle"
+                          title="Qoder 上游未启用：该 Key 的请求将显式报错；开启入口在 Qoder「资源调度」页或全局 API 管理·调度策略中心"
+                        >
+                          <Badge tone="amber">上游未启用</Badge>
+                        </span>
+                      )}
                       {k.allowed_accounts.length > 0 && (
                         <span className="ml-1 text-xs text-slate-400" title={k.allowed_accounts.join(', ')}>
                           限{k.allowed_accounts.length}账号
@@ -604,11 +611,7 @@ export default function ApiKeysManager({
                 { key: '', label: '跟随全局调度', desc: '不绑定，按系统策略选池' },
                 { key: 'trae', label: 'Trae 池', desc: '优先走 Trae，异常可回退' },
                 { key: 'buddy', label: 'Buddy 池', desc: '优先走 Buddy，异常可回退' },
-                {
-                  key: 'qoder',
-                  label: 'Qoder 池',
-                  desc: poolCfg?.qoder_enabled ? '优先走 Qoder，异常可回退' : 'Qoder 上游未启用',
-                },
+                { key: 'qoder', label: 'Qoder 池', desc: '优先走 Qoder，异常可回退' },
               ].map((p) => (
                 <button
                   key={p.key}
@@ -620,11 +623,12 @@ export default function ApiKeysManager({
                 </button>
               ))}
             </div>
-            {/* Qoder 绑定告警：上游未启用时绑定是空偏好（回退其他池），显式提示避免误解 */}
-            {editBindPool === 'qoder' && !(poolCfg?.qoder_enabled ?? false) && (
-              <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400">
-                Qoder 上游当前未启用（Qoder · 资源调度页「启用 Qoder 上游」开关），该 Key 的请求将回退至 Buddy/Trae 池。
-              </div>
+            {/* §5.3：绑定 Qoder 池但上游未启用 → 弹框内即时提示 */}
+            {editBindPool === 'qoder' && qoderEnabled === false && (
+              <p className="mt-1.5 text-xs text-amber-500">
+                Qoder 上游当前未启用：保存后该 Key 的请求将显式报错；请先到 Qoder「资源调度」页
+                或上方「调度策略中心」开启「启用 Qoder 上游」。
+              </p>
             )}
           </div>
           <div>
@@ -650,14 +654,14 @@ export default function ApiKeysManager({
               <span className="mb-1 block text-xs font-medium text-slate-500">
                 专一账号
                 <span className="ml-1 font-normal text-slate-400">
-                  （{editBindPool === 'trae' ? 'Trae 池' : editBindPool === 'buddy' ? 'Buddy 池' : editBindPool === 'qoder' ? 'Qoder 池' : 'Trae/Buddy/Qoder 池'}账号）
+                  （{editBindPool ? bindPoolLabel(editBindPool) : 'Trae/Buddy/Qoder 池'}账号）
                 </span>
               </span>
               <select className="input w-full" value={editDedicated} onChange={(e) => setEditDedicated(e.target.value)}>
                 <option value="">— 默认取限定上游首个 —</option>
                 {editCandidates.map((c) => (
                   <option key={encodeUid(c.pool, c.uid)} value={encodeUid(c.pool, c.uid)}>
-                    [{POOL_LABEL[c.pool]}] {c.name || c.uid}
+                    [{POOL_TAG[c.pool].label}] {c.name || c.uid}
                     {c.credits != null ? `（${c.credits.toFixed(1)} 积分）` : ''}
                   </option>
                 ))}
@@ -671,7 +675,7 @@ export default function ApiKeysManager({
             <div className="mb-1.5 text-xs font-medium text-slate-500">
               限定上游
               <span className="ml-1 font-normal text-slate-400">
-                （{editBindPool === 'trae' ? 'Trae 池账号' : editBindPool === 'buddy' ? 'Buddy 池账号' : editBindPool === 'qoder' ? 'Qoder 池账号' : 'Trae + Buddy + Qoder 池账号'}
+                （{editBindPool ? `${bindPoolLabel(editBindPool)}账号` : 'Trae + Buddy + Qoder 池账号'}
                 ；不勾选 = 使用全部上游账号）
               </span>
             </div>
@@ -693,8 +697,8 @@ export default function ApiKeysManager({
                           setEditAllowed(next);
                         }}
                       />
-                      <Badge tone={POOL_TONE[c.pool]} className="!px-1.5 !text-[10px]">
-                        {POOL_LABEL[c.pool]}
+                      <Badge tone={POOL_TAG[c.pool].tone} className="!px-1.5 !text-[10px]">
+                        {POOL_TAG[c.pool].label}
                       </Badge>
                       <span className="truncate">{c.name || c.uid}</span>
                       {c.credits != null && <span className="ml-auto tabular-nums text-slate-400">{c.credits.toFixed(1)}</span>}

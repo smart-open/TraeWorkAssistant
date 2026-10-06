@@ -3,7 +3,7 @@
  * 列表方式维护 OpenAI 兼容自定义模型：名称（请求模型名，路由键）/ API 地址 / Key /
  * 其他字段（上下文长度 / 最大输出 / 图片支持 / 倍率 / 备注 / 启用开关）。
  * 调度语义：请求模型名 canonical 命中 enabled 条目即直达该上游（用户显式配置优先），
- * 未命中回落 Trae/Buddy 统一管线；数据源：custom_models_list / save / remove。
+ * 未命中回落 Trae/Buddy/Qoder 统一管线；数据源：custom_models_list / save / remove。
  * 子弹框（编辑/删除确认）沿用 Modal 叠加，onSubModalChange 上报供主弹窗屏蔽 ESC 双关。
  */
 import { useCallback, useEffect, useState } from 'react';
@@ -204,7 +204,7 @@ export default function CustomModelsPanel({
           <Blocks size={16} className="text-brand-500" />
           <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">自定义模型</h3>
           <span className="hidden text-xs text-slate-400 sm:inline">
-            OpenAI 兼容上游直通 · 模型名命中即直达，未命中回落 Trae/Buddy 调度
+            OpenAI 兼容上游直通 · 模型名命中即直达，未命中回落 Trae/Buddy/Qoder 调度
           </span>
         </div>
         <div className="flex items-center gap-1">
@@ -221,7 +221,8 @@ export default function CustomModelsPanel({
 
       {models.length === 0 ? (
         <p className="py-6 text-center text-sm text-slate-400">
-          暂无自定义模型 — 点击「新建模型」接入任意 OpenAI 兼容 API（中转站 / 自建服务）
+          暂无自定义模型 — 点击「新建模型」接入任意 OpenAI 兼容 API（中转站 / 自建服务）；
+          模型名命中即直达，未命中回落 Trae/Buddy/Qoder 统一调度
         </p>
       ) : (
         <div className="overflow-x-auto">
@@ -274,7 +275,7 @@ export default function CustomModelsPanel({
                     <div className="flex items-center gap-1">
                       <button
                         className="btn-ghost !p-1.5"
-                        title={m.enabled ? '禁用（禁用后该模型名回落 Trae/Buddy 调度）' : '启用'}
+                        title={m.enabled ? '禁用（禁用后该模型名回落 Trae/Buddy/Qoder 调度）' : '启用'}
                         onClick={() => void toggleEnabled(m)}
                       >
                         <Power size={14} className={m.enabled ? 'text-emerald-500' : 'text-slate-400'} />
@@ -430,7 +431,7 @@ export default function CustomModelsPanel({
                   checked={form.enabled}
                   onChange={(e) => set('enabled', e.target.checked)}
                 />
-                启用（禁用后该模型名回落 Trae/Buddy 调度）
+                启用（禁用后该模型名回落 Trae/Buddy/Qoder 调度）
               </label>
               <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-zinc-300">
                 <input
@@ -473,7 +474,7 @@ export default function CustomModelsPanel({
       >
         <div className="text-sm">
           确认删除模型「{deleteFor?.name}」？
-          <div className="mt-1 text-xs text-slate-400">删除后该模型名将回落 Trae/Buddy 统一调度管线（如内置目录存在同名模型）。</div>
+          <div className="mt-1 text-xs text-slate-400">删除后该模型名将回落 Trae/Buddy/Qoder 统一调度管线（如内置目录存在同名模型）。</div>
         </div>
       </Modal>
     </div>

@@ -440,7 +440,11 @@ pub fn apply_pool_snapshot(
             .collect(),
         None => qoder_accounts_all,
     };
-    qoder_pool.sync_from_qoder(&qoder_accounts, &pool_file.qoder_enabled_uids);
+    // 生效白名单 fail-open 解析（对齐 Buddy 池 effective_wb_uids）：显式白名单优先，
+    // 空 = 全部含凭证账号自动入池——直传空白名单会导致 Qoder 池恒为空
+    //（支持模型 qoder 源恒「未启用」、调度配置无 Qoder 候选）
+    let qoder_uids: Vec<String> = qoder_accounts.iter().map(|a| a.uid.clone()).collect();
+    qoder_pool.sync_from_qoder(&qoder_accounts, &effective_qoder_uids(&pool_file, &qoder_uids));
     (pool.count(), wb_uids.len(), wb_accounts.len())
 }
 
@@ -464,6 +468,16 @@ pub fn effective_wb_uids(
         return legacy;
     }
     wb_accounts.iter().map(|a| a.uid.clone()).collect()
+}
+
+/// Qoder 池生效入池白名单（纯函数，便于单测）：显式 qoder_enabled_uids 优先；
+/// 空 = 全部含凭证账号自动入池（fail-open，对齐 Qoder 资源调度页「清空 = 全部入池」
+/// 的设计语义，与 effective_wb_uids 同构）
+pub(crate) fn effective_qoder_uids(pf: &ApiPoolFile, qoder_ids: &[String]) -> Vec<String> {
+    if !pf.qoder_enabled_uids.is_empty() {
+        return pf.qoder_enabled_uids.clone();
+    }
+    qoder_ids.to_vec()
 }
 
 // ── WB 上游取号（自 commands/workbuddy/accounts.rs wb_upstream_accounts 下沉）──
@@ -642,6 +656,19 @@ mod tests {
         // 两者皆空 → 全部含凭证账号
         pf.enabled_uids.clear();
         assert_eq!(effective_wb_uids(&pf, &accs), vec!["wb-b".to_string()]);
+    }
+
+    /// Qoder 池白名单 fail-open：显式优先；空 = 全部含凭证账号自动入池
+    #[test]
+    fn effective_qoder_uids_failopen_and_explicit() {
+        let mut pf = ApiPoolFile::default();
+        pf.qoder_enabled_uids = vec!["qd-1".into()];
+        let ids = vec!["qd-1".to_string(), "qd-2".to_string()];
+        // 显式白名单优先（交集过滤由 sync_from_qoder 完成）
+        assert_eq!(effective_qoder_uids(&pf, &ids), vec!["qd-1".to_string()]);
+        // 空白名单 = fail-open 全量候选
+        pf.qoder_enabled_uids.clear();
+        assert_eq!(effective_qoder_uids(&pf, &ids), ids);
     }
 
     // ── merge_pool_expire_times（issue #28：调度到期 = 通用口径）────────────

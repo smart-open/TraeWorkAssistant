@@ -6,6 +6,23 @@
 
 ---
 
+## [1.4.2] · 2026-10-06 · API 管理 Qoder 集成回溯补齐
+
+> 回溯补齐 1.4.0 遗漏：Qoder 的 API 管理集成（调度策略中心 / 资源池摘要卡 / 混合白名单 UI）源自 main Qoder 早期 commit（`e5da2d1` / `0b615ce` / `23e7117` / `a2cf743`），早于 1.3.6 合并点 `1c29564`，移植 Qoder 全链路时未回溯到。合并点维持 `main@9cdce69` 不变。
+
+### 修复
+
+- **Qoder 池恒空根因（后端）**：`apply_pool_snapshot` 直传可能为空的 `qoder_enabled_uids`，白名单为空时 Qoder 池恒为空——支持模型 qoder 源恒「未启用」、调度配置「暂无上游账号候选」两症状同源。补 `effective_qoder_uids` fail-open 解析（显式白名单优先，空 = 全部含凭证账号自动入池，对齐 Buddy 池 `effective_wb_uids` 语义），含纯函数单测。
+- **调度策略中心 Qoder 化**（移植 `23e7117` / `a2cf743` 语义）：组合预设新增 Qoder 池内策略维度（`matchPreset` 纳入 `qoder_strategy` 匹配，偏离即「自定义组合」）；池内调度补 Qoder 池下拉（空 = 跟随 Trae 池，同 Buddy 语义）；优先级序含 Qoder 池标签与「默认序尾部、可上移」说明；新增 **Qoder 资源池摘要卡**（上游开关徽标 / 池内与总积分「未知」口径 / 池内策略文案），布局改四池等宽。
+- **API Keys 管理**（移植 `e5da2d1` 文案）：资源池选项改「全局 / Trae / Buddy / Qoder」（去池字）；绑定 Qoder 池且上游未启用时表格 amber「上游未启用」警告徽标 + 编辑弹框提示（上游原文）；Qoder 池徽标 tone 改 violet（原 amber 与警告徽标撞色）；候选白名单混合编码注释补 `qoder:` 前缀。
+- **文案与聚合补齐**：使用帮助「双源模型」改「多源同名模型（Trae/Buddy/Qoder）」+ Qoder 档位透传说明 + 池标签加 Qoder；用量统计改四桶聚合（新增 Qoder 独立筛选，`api_qoder_usage_stats`，全部 = 四桶相加）；自定义模型回落文案统一改 Trae/Buddy/Qoder（头注释 / 副标题 / 空态 / 禁用 title / 启用 label / 删除确认 6 处）；接口配置 PoolBadges 加 Qoder 徽标 + 统一目录说明含 Qoder。
+
+### 验证
+
+- `cargo test --workspace` 553 通过（含新增 fail-open 单测）· `npm test` 61 通过（dispatchPresets / poolMetrics 单测扩至 Qoder 维度）· `npx tsc --noEmit` 0 错误。
+
+---
+
 ## [1.4.1] · 2026-10-05 · 资源调度 per-pool 拆分 + API 管理 Qoder 池绑定 + Web 化体验修复
 
 > 本轮无 main 移植内容（Qoder 池绑定等在 main/feat-qoder 均不存在，为 docker 分支三池结构下的自研对齐）；合并点维持 `main@9cdce69` 不变。
