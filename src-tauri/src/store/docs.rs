@@ -1134,6 +1134,9 @@ pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
         (UsageBucket::Trae, &f.days),
         (UsageBucket::Wb, &f.wb_days),
         (UsageBucket::Custom, &f.custom_days),
+        // 审查 P2：补齐 Qoder bucket——原漏写导致 api_usage_save 全量重写时
+        // qoder_days 数据被 DELETE 丢掉（现仅迁移器调用，补齐防未来丢数据）
+        (UsageBucket::Qoder, &f.qoder_days),
     ]
     .into_iter()
     .flat_map(|(b, map)| {
@@ -1493,6 +1496,25 @@ pub fn qoder_token_store_save(s: &Store, store_val: &Value) -> Result<(), String
         s.kv_set_raw("qoder_tokens_meta", &v.to_string())?;
     }
     Ok(())
+}
+
+/// 单行 UPSERT（qoder_tokens 表；审查 P2 跨进程 last-writer-wins 修复）：整表
+/// rows_replace 为「DELETE 全表 + 重插」，他进程在窗口内并发写入的其他账号行会被
+/// 整体吞掉；逐行 upsert（INSERT ... ON CONFLICT(pk) DO UPDATE）仅覆盖目标 pk 行，
+/// 跨进程并发保存互不丢行。version 闸门与 qoder_tokens_meta 维护仍由调用方负责
+pub fn qoder_token_store_row_upsert(s: &Store, id: &str, row: &Value) -> Result<(), String> {
+    s.row_upsert("qoder_tokens", id, row)
+}
+
+/// 单行读取（qoder_tokens 表；行级读改写原语配套，防整表 load→replace 覆盖窗口）
+pub fn qoder_token_store_row_get(s: &Store, id: &str) -> Result<Option<Value>, String> {
+    s.row_get("qoder_tokens", id)
+}
+
+/// 单行删除（qoder_tokens 表；remove_token 消费——仅移除目标 pk 行，不经整表
+/// rows_replace，防吞掉他进程并发写入的其他账号行）
+pub fn qoder_token_store_row_delete(s: &Store, id: &str) -> Result<(), String> {
+    s.row_delete("qoder_tokens", id)
 }
 
 // ── Qoder 签到结果（qoder_checkin_results 表；行文档 + 90 天滚动由调用方裁剪）──

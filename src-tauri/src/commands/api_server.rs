@@ -413,13 +413,20 @@ pub async fn do_stop(
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
 ) -> Result<(), String> {
-    let mut guard = safe_lock(runtime);
-    if let Some(mut rt) = guard.take() {
-        rt.handle.stop();
+    // 审查 P2-10：先取走 runtime 并立即释放 std 锁，再做异步等待——
+    // 锁卫不得跨 await 持有（future 会变 !Send，过不了 tauri command 的
+    // Send 检查），且持锁等待会阻塞并发的启动/停止调用
+    let mut taken = {
+        let mut guard = safe_lock(runtime);
+        guard.take()
+    };
+    if let Some(rt) = taken.as_mut() {
+        // 审查 P2-10：异步等待优雅停机（tokio timeout + await），
+        // 不再以 thread::sleep 轮询阻塞 tokio worker 线程
+        rt.handle.stop_async().await;
         // 批次 C/E：停止前排空用量脏队列、api_keys 计数与日志队列（flusher 已停）
         rt.shared.flush_pending_writes();
         fs_utils::app_log(&state.data_dir, "API 服务已停止");
-        drop(guard);
         sync_tray_api_text(app, false);
         crate::notify::notify(app, "API 网关已停止", "本地网关已关闭");
     }

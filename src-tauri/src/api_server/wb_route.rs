@@ -570,10 +570,14 @@ fn run_wb_stream(
                         duration_ms, &key_name, "",
                         Some("no healthy account"),
                     );
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(
-                        "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
-                    )));
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    // 审查 P1-1：无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
+                    // 各自形态，helper 内已含收尾帧），不再硬编码 OpenAI 格式
+                    send_stream_error_wb(
+                        tx,
+                        proto,
+                        "no_healthy_account",
+                        "WB 上游暂无可用账号（无健康账号可调度），请稍后重试",
+                    );
                     return;
                 }
             },
@@ -667,7 +671,12 @@ fn run_wb_stream(
                         Some((code, msg)) => {
                             if super::is_empty_completion(code, &msg) {
                                 // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传、
-                                // 不绑定粘性，换号重试（收尾帧未发，重试流可续传）
+                                // 不绑定粘性，换号重试（收尾帧未发，重试流可续传）。
+                                // 终审明确边界：Responses 协议下 wb_sse 已先行补发
+                                // response.failed(empty_completion)（防 created 悬空），
+                                // 换号成功 → 新流 created 跟在 failed 后（客户端按
+                                // sequence_number 续读，属协议内形态）；换号耗尽 →
+                                // no_healthy_account 终态帧成第二帧——双终态优于悬空
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
@@ -793,7 +802,7 @@ fn run_wb_stream(
                                 &key_name, &state.wb_pool.name_of(&picked.uid),
                                 Some(&msg),
                             );
-                            send_stream_error_wb(tx, proto, status as i64, &msg);
+                            send_stream_error_wb(tx, proto, &status.to_string(), &msg);
                             return;
                         }
                     }
@@ -881,6 +890,8 @@ pub async fn wb_aggregate_chat(
                         p
                     }
                     None => {
+                        // 三池统一：每请求一行终态记账（中间态不记，防虚高）——聚合路径
+                        // 换号中间步不再各记一条失败（审查 P2-4），终态统一在此落一行
                         state.record_usage(true, &model, "none", &key_id, false, stream,
                             start_ts.elapsed().as_millis() as u64, 0, 0);
                         return Err("no healthy account available".to_string());
@@ -965,7 +976,8 @@ pub async fn wb_aggregate_chat(
                                     u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                                     u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                                 )).unwrap_or((0, 0));
-                                // F-76① TTFT 入账
+                                // F-76① TTFT 入账；三池统一：每请求一行终态记账
+                                //（中间态不记，防虚高，审查 P2-4）
                                 state.record_usage_ttfb(true, &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
                                 state.wb_pool.note_success(win_uid);
                                 clear_model_failure(&state, &model);
@@ -1050,8 +1062,9 @@ pub async fn wb_aggregate_chat(
                                 note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
-                                state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0);
+                                // 三池统一：每请求一行终态记账（中间态不记，防虚高）——
+                                // 换号为中间步，usage 由终态路径（成功/池耗尽）统一落一行
+                                //（审查 P2-4，对齐 qoder_route 聚合口径）
                                 state.logger.log_request(
                                     "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64,
@@ -1543,7 +1556,7 @@ pub async fn wb_tool_exec_chat(
 fn send_stream_error_wb(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
-    code: i64,
+    code: &str,
     msg: &str,
 ) {
     match proto {
@@ -1561,7 +1574,7 @@ fn send_stream_error_wb(
                 "object": "response",
                 "status": "failed",
                 "output": [],
-                "error": {"code": code.to_string(), "message": msg},
+                "error": {"code": code, "message": msg},
             });
             let body = json!({"type": "response.failed", "response": resp});
             let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(

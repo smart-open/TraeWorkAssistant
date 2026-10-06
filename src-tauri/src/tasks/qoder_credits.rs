@@ -559,12 +559,16 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         }
     }
     let agent = http_agent(30);
-    let pool: Value = crate::store::docs::qoder_pool_load(&db);
-    let mut accounts: Vec<Value> = pool
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    // 账号池读取（审查 P2 同族修复，对齐 run_snapshot_task 口径）：qoder_pool_load
+    // 将 rows_all 失败吞为空池，「库损坏/IO 故障」会被误判「账号池为空」→ 快照任务
+    // 记当日已跑且快照点缺失。store API 可区分：Ok(空 rows)=真实空池；no such table
+    //（表未建，db() 打开时 schema::init 已兜底建表，理论罕见）对齐空池语义；
+    // 其余 Err=读取失败 → Err 暂态交调度器冷却重试
+    let mut accounts: Vec<Value> = match db.rows_all("qoder_accounts") {
+        Ok(rows) => rows.into_iter().map(|(_, data)| data).collect(),
+        Err(e) if e.contains("no such table") => Vec::new(),
+        Err(e) => return Err(format!("Qoder 账号池读取失败: {e}")),
+    };
     if let Some(uid) = user_id {
         accounts.retain(|a| a.get("id").and_then(Value::as_str) == Some(uid));
     }
@@ -598,6 +602,10 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         }
         return Ok(json!({
             "ok": false, "cached": false, "stale": false,
+            // 锁忙标记（审查 P2）：run_snapshot_task 据此区分「锁忙空手而归」与真实
+            // 失败/空池——该场景必须返 Err 暂态让调度器冷却重试，否则快照点永久缺失；
+            // UI 消费方忽略本字段（多字段对前端无影响）
+            "lock_busy": true,
             "accounts": [], "total_balance": 0.0,
             "message": "另一进程正在同步积分，请稍后重试",
         }));
@@ -788,12 +796,27 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
 /// - 仅永久失败（无凭证/4xx，401 自愈已试过）→ Ok 停止重试（重试无解，
 ///   全天 48 次 tick 徒劳 + 误报通知），落日志提示人工处理。
 pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
-    let pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
-    let n = pool.get("accounts").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+    // 账号池读取（审查 P2 同族修复）：qoder_pool_load 将 rows_all 失败吞为空池，
+    // 「库损坏/IO 故障」会误走 n==0 空转 Ok 被调度器记当日已跑，快照点永久缺失。
+    // 区分：Ok(空 rows)=真实空池；no such table（表未建，db() 打开时已建表，理论
+    // 罕见）对齐空池语义；其余 Err=读取失败返 Err 暂态
+    let n = match crate::store::db(&state.data_dir).rows_all("qoder_accounts") {
+        Ok(rows) => rows.len(),
+        Err(e) if e.contains("no such table") => 0,
+        Err(e) => return Err(format!("Qoder 账号池读取失败: {e}")),
+    };
     if n == 0 {
         return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号" }));
     }
     let parsed = fetch_credits(state, None, true)?;
+    // 锁忙且无历史缓存（审查 P2）：fetch_credits 此路返回 ok:false + 空 accounts 的
+    // Ok——failed 为空 → transient=0 → 原实现落到尾部 Ok(ok:false)，调度器 mark_run
+    // 固化当日已跑，快照点永久缺失。lock_busy 标记区分「锁忙」与真实失败/空池：
+    // 返 Err 暂态交调度器 30 分钟冷却重试（同日 UPSERT 覆盖，重试成功即补落当日
+    // 快照）。真实空池已在上方 n==0 分支 Ok 跳过，不受影响
+    if parsed.get("lock_busy").and_then(Value::as_bool) == Some(true) {
+        return Err("积分快照跨进程锁忙（另一进程正在同步积分），本轮未执行，30 分钟后重试".into());
+    }
     // stale-on-error 缺口（审查修复）：fresh=true 下 cached=true 仅此一路——全部账号
     // 本轮拉取失败、返回的是历史缓存行（行内全 ok=true，failed 为空），快照未落且
     // 失败性质不可见。按暂态处理交调度器 30 分钟冷却重试，不能按「完成」记账

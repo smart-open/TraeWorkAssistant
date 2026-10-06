@@ -308,8 +308,10 @@ export interface Settings {
   qoder_credits_sync_hhmm: string;
   /** Qoder 积分快照调度开关（默认开） */
   qoder_credits_sync_enabled: boolean;
-  /** Qoder Token 定时续期开关（默认开：qoder-refresh 每 6 小时兜底刷新全部账号凭证） */
+  /** Qoder Token 定时续期开关（默认开：qoder-refresh 每 N 小时兜底刷新全部账号凭证） */
   qoder_token_renew_enabled: boolean;
+  /** Qoder Token 续期间隔小时数（1~24，默认 6；客户端 token 惰性窗 7h，间隔 ≤7h 保证过期前续上） */
+  qoder_token_renew_interval_hours: number;
   /** Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；Windows 计划任务注册时间复用该值） */
   trae_checkin_hhmm: string;
   /** Trae JWT 定时调度续期开关（issue #27，默认开：每日兜底续期临期账号） */

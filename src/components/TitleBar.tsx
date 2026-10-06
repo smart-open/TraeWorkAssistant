@@ -8,6 +8,73 @@ import { APP_NAME } from '../lib/about';
 
 const win = getCurrentWindow();
 
+/** macOS 红绿灯按钮：红=关闭 黄=最小化到托盘 绿=最大化/还原，hover 时浮现符号 */
+function TrafficLights(props: {
+  maximized: boolean;
+  onClose: () => void;
+  onMinimize: () => void;
+  onToggleMaximize: () => void;
+}) {
+  // onMouseDown 阻止冒泡：Windows 侧三按钮嵌在 data-tauri-drag-region 容器内
+  //（红绿灯虽为容器兄弟节点，仍统一 stopPropagation 防拖拽吞 click 并保持两套按钮同约定）
+  // tooltip 用 left-0 而非居中：红灯贴近窗口左缘，居中会被裁掉
+  const base =
+    'group relative flex h-3 w-3 items-center justify-center rounded-full border transition active:brightness-90 [&>svg]:opacity-0 hover:[&>svg]:opacity-100';
+  const tip =
+    'pointer-events-none absolute left-0 top-full z-50 mt-1.5 whitespace-nowrap rounded-md bg-zinc-900 px-2 py-1 text-xs leading-4 text-zinc-100 opacity-0 shadow-md transition-opacity delay-300 duration-150 group-hover:opacity-100 dark:bg-zinc-800';
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={props.onClose}
+        className={`${base} border-[#d9483f] bg-[#ff5f57]`}
+        aria-label="关闭"
+      >
+        <svg
+          viewBox="0 0 12 12"
+          className="h-2 w-2 text-black/60"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+        >
+          <path d="M3.8 3.8l4.4 4.4M8.2 3.8l-4.4 4.4" />
+        </svg>
+        <span className={tip}>关闭</span>
+      </button>
+      <button
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={props.onMinimize}
+        className={`${base} border-[#d9a021] bg-[#febc2e]`}
+        aria-label="最小化"
+      >
+        <svg
+          viewBox="0 0 12 12"
+          className="h-2 w-2 text-black/60"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+        >
+          <path d="M3.2 6h5.6" />
+        </svg>
+        <span className={tip}>最小化到托盘</span>
+      </button>
+      <button
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={props.onToggleMaximize}
+        className={`${base} border-[#1ba32f] bg-[#28c840]`}
+        aria-label={props.maximized ? '还原' : '最大化'}
+      >
+        <svg viewBox="0 0 12 12" className="h-2 w-2 text-black/60" fill="currentColor">
+          <path d="M3 3h3.6L3 6.6zM9 9H5.4L9 5.4z" />
+        </svg>
+        <span className={tip}>{props.maximized ? '向下还原' : '最大化'}</span>
+      </button>
+    </div>
+  );
+}
+
 /** 品牌图标：渐变圆角方块内的机器人（AI）图形 */
 export function BrandMark({ size = 24, iconSize = 14 }: { size?: number; iconSize?: number }) {
   return (
@@ -39,6 +106,7 @@ export default function TitleBar() {
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [maximized, setMaximized] = useState(false);
   const proxyRunning = useAppStore((s) => s.proxy.running);
+  const isMac = useAppStore((s) => s.platform) === 'macos';
 
   // issue #46：跟踪窗口真实最大化状态——toggleMaximize 在无边框窗口 hide/show 后
   // 可能与内部状态失同步（视觉已还原但 isMaximized() 仍为 true，点最大化无反应），
@@ -67,13 +135,25 @@ export default function TitleBar() {
       <div
         className="flex h-9 shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 pl-3 pr-1 dark:border-zinc-800 dark:bg-zinc-950"
       >
-        <div data-tauri-drag-region className="flex flex-1 items-center gap-2">
+        {isMac && (
+          <TrafficLights
+            maximized={maximized}
+            onClose={() => setShowCloseConfirm(true)}
+            onMinimize={() => void invoke('minimize_to_tray')}
+            onToggleMaximize={() => void toggleMaximize()}
+          />
+        )}
+        <div
+          data-tauri-drag-region
+          className={`flex flex-1 items-center gap-2 ${isMac ? 'pl-3' : ''}`}
+        >
           <BrandMark />
           <span className="text-sm font-semibold text-slate-700 dark:text-zinc-200">
             {APP_NAME}
           </span>
         </div>
-        <div className="flex items-center">
+        {!isMac && (
+          <div className="flex items-center">
           {/* onMouseDown 阻止冒泡：否则事件冒泡到外层 data-tauri-drag-region，Tauri 会启动窗口拖拽而吞掉 click，导致最小/最大化/关闭无响应 */}
           <button
             onMouseDown={(e) => e.stopPropagation()}
@@ -101,7 +181,8 @@ export default function TitleBar() {
           >
             <X size={15} />
           </button>
-        </div>
+          </div>
+        )}
       </div>
 
       <Modal

@@ -171,11 +171,12 @@ pub(crate) fn machine_id_of(state: &AppState, account_id: &str) -> Option<String
 }
 
 /// F-80 §5.10 守卫数据源（切换/保存共用，2026-10-02 审查从 switch.rs 内联收编）：
-/// Qoder（icube 布局）当前登录真源 = IDE state.vscdb secret://userInfo（DPAPI 解密，
-/// 与 ide_store 扫描同链路，仅 Windows）→ uid 在池反查账号 id。uid 在池外时原样
-/// 返回（守卫消息如实提示「与标记账号不一致」，uid 与 qd- 池 id 无碰撞）；
-/// 未登录/解密失败 → None（调用方 fail-open：仅跳过回写/守卫放行，不阻断流程）。
-#[cfg(windows)]
+/// Qoder（icube 布局）当前登录真源 = IDE state.vscdb secret://userInfo（os_crypt 解密，
+/// 与 ide_store 扫描同链路；Windows=DPAPI+AES-GCM / mac=Keychain+AES-CBC，2026-10-05
+/// mac 实装）→ uid 在池反查账号 id。uid 在池外时原样返回（守卫消息如实提示
+/// 「与标记账号不一致」，uid 与 qd- 池 id 无碰撞）；未登录/解密失败 → None
+///（调用方 fail-open：仅跳过回写/守卫放行，不阻断流程）。
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn live_account_id(state: &AppState) -> Option<String> {
     let uid = ide_data_dir()
         .and_then(|dir| super::ide_store::scan_ide_login(&dir).ok())
@@ -190,15 +191,9 @@ pub(crate) fn live_account_id(state: &AppState) -> Option<String> {
     )
 }
 
-/// 非 Windows：Qoder 守卫无数据源（IDE 登录态解析依赖 Windows DPAPI）
-#[cfg(not(windows))]
+/// 非 Windows/macOS 平台：Qoder 守卫无数据源（占位桩，发布域外）
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn live_account_id(_state: &AppState) -> Option<String> {
-    // macOS 适配预留：数据源同构存在——Qoder IDE（VS Code fork）state.vscdb
-    // secret://aicoding.auth.userInfo 密文形态应为 Chromium os_crypt v10/v11，
-    // 差异仅在密钥包装：Windows = Local State os_crypt.encrypted_key + DPAPI，
-    // macOS = Keychain「Chromium Safe Storage」条目（service 名需真机实测）。
-    // 实装后：ide_store::scan_ide_login 去 cfg 门控 + 按平台分支密钥获取，
-    // 本占位替换为与 Windows 版同构实现（调用方 fail-open 语义不变）。
     None
 }
 
@@ -207,7 +202,7 @@ pub(crate) fn live_account_id(_state: &AppState) -> Option<String> {
 /// 原 Cookies qoderuid 探测已证伪（Work Cookies 库不存在该 cookie，恒 None → 守卫
 /// 恒 fail-open、来源槽永不回写）。uid 在池外原样返回；文件缺失/解密失败 → None
 /// （fail-open：保存守卫放行、切换来源槽不回写）。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn live_work_account_id(state: &AppState) -> Option<String> {
     let data_dir =
         crate::switcher::profile::profile_for(crate::switcher::TargetApp::QoderWork, &state.data_dir)
@@ -222,13 +217,9 @@ pub(crate) fn live_work_account_id(state: &AppState) -> Option<String> {
     )
 }
 
-/// 非 Windows：Qoder Work 守卫无数据源（auth.v1.dat 解密依赖 Windows DPAPI）
-#[cfg(not(windows))]
+/// 非 Windows/macOS 平台：Qoder Work 守卫无数据源（占位桩，发布域外）
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn live_work_account_id(_state: &AppState) -> Option<String> {
-    // macOS 适配预留：与 live_account_id 同链路——Work 数据目录
-    // ~/Library/Application Support/com.qodercn.app.stable 的 auth.v1.dat +
-    // 根级 Local State（macOS 密钥同样在 Keychain Safe Storage），v10 解密逻辑
-    // （ide_store::decrypt_v10）本身跨平台可复用，仅需按平台分支密钥获取。
     None
 }
 

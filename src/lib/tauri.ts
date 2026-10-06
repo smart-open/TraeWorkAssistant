@@ -471,9 +471,6 @@ export const api = {
       }),
     checkinResults: (days?: number) =>
       invoke<QoderCheckinRecord[]>('qoder_checkin_results', { days: days ?? null }),
-    checkinTaskRegister: (times: string[]) => invoke('qoder_checkin_task_register', { times }),
-    checkinTaskStatus: () => invoke<string[]>('qoder_checkin_task_status'),
-    checkinTaskUnregister: () => invoke('qoder_checkin_task_unregister'),
     creditsFetch: (userId?: string, fresh?: boolean) =>
       invoke<QoderCreditsResult>('qoder_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
     creditsHistoryList: () =>

@@ -247,6 +247,7 @@ function defaultSettings(): Settings {
     qoder_credits_sync_hhmm: '23:40',
     qoder_credits_sync_enabled: true,
     qoder_token_renew_enabled: true,
+    qoder_token_renew_interval_hours: 6,
   };
 }
 

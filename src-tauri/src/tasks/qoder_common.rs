@@ -354,42 +354,46 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
             .cloned()
             .ok_or_else(|| "token_store 内部错误：目标行缺失".to_string())?
     };
-    // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；故落库不使用上面的
-    // 读时快照整表替换，而是重新 load DB 最新表做「仅目标行替换」的行级合并，
-    // 把进程间 last-writer-wins 的覆盖窗口从「vault 全程」收窄到「load→replace 数毫秒」
-    //（审查 H-1 第②步；进程内并发由 TOKEN_STORE_LOCK + 每账号刷新锁防护）。
+    // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；vault 写入后落库
+    // 走逐行 UPSERT（仅覆盖目标行，见下方说明），进程间并发保存互不丢行
+    //（审查 H-1 第②步 + P2 修复；进程内并发由 TOKEN_STORE_LOCK + 每账号刷新锁防护）。
     let vault_result = secure_store_for_save(&state.data_dir, &mut store).map(|_| ());
-    let mut fresh = crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
-    if !fresh.is_object() {
-        fresh = serde_json::json!({});
-    }
-    {
-        let obj = fresh.as_object_mut().unwrap();
-        match obj.get("version") {
-            Some(v) if v.as_i64() != Some(1) => {
-                return Err("token_store 版本不识别，拒绝写入".to_string());
-            }
-            _ => {}
-        }
-        obj.insert("version".into(), serde_json::json!(1));
-        if let Some(t) = obj.entry("tokens").or_insert_with(|| serde_json::json!({})).as_object_mut() {
-            // 凭证红线（审查 P0 修复）：target 是 secure_store_for_save 占位化**之前**
-            // 克隆的明文行，直接落库会把明文凭证写进 SQLite（直到下次启动迁移才收敛，
-            // 且 token_store_load_secure「DB 明文优先」会持续旁路 vault 回填）。
-            // 落库前必须与 secure_store_for_save 同口径占位——DB qoder_tokens 一律空串，
-            // 明文唯一驻留地是 vault；vault 失败时同样落占位行（重新登录可恢复）
-            let mut row = target;
-            if let Some(rm) = row.as_object_mut() {
-                for k in TOKEN_SENSITIVE_KEYS {
-                    if rm.contains_key(k) {
-                        rm.insert(k.to_string(), serde_json::json!(""));
-                    }
-                }
-            }
-            t.insert(id.to_string(), row);
+    // 落库改逐行 UPSERT（审查 P2 跨进程 last-writer-wins 修复，方案 A）：原
+    // 「重读整表 → 仅目标行替换 → qoder_token_store_save 整表 rows_replace」已把
+    // 覆盖窗口从「vault 全程」收窄到数毫秒，但窗口内他进程对**其他账号行**的写入
+    // 仍被 DELETE 全表 + 重插吞掉；逐行 upsert 仅覆盖目标 pk 行。配合本轮修复
+    // remove_token（row_delete）/ clear_device_flow_creds（row_get+row_upsert）
+    // 同步行级化，运行时三条写路径（save/remove/clear）均不再存在整表覆盖窗口
+    // ——唯一保留整表替换的是启动迁移 migrate_token_store（一次性幂等收敛、
+    // 需整表占位化，非并发写路径）。
+    // 保持不变：vault 写入口径（secure_store_for_save 整库收敛）、行占位化、
+    // 锁序（refresh_lock → TOKEN_STORE_LOCK，未引入新锁）、进程内并发防护。
+    // version 闸门：qoder_token_store_load 的 version 字段源即 kv qoder_tokens_meta，
+    // 直接读 kv 判定（非 1 拒写；缺失视为初始库放行，口径一致），写入后回填 1
+    //（kv_set_raw 为原子 UPSERT，version 恒 1 无 last-writer-wins 面）
+    let cur_version = crate::store::db(&state.data_dir)
+        .kv_get_raw("qoder_tokens_meta")
+        .and_then(|v| v.parse::<i64>().ok());
+    if let Some(v) = cur_version {
+        if v != 1 {
+            return Err("token_store 版本不识别，拒绝写入".to_string());
         }
     }
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &fresh)?;
+    // 凭证红线（审查 P0 修复）：target 是 secure_store_for_save 占位化**之前**克隆的
+    // 明文行，直接落库会把明文凭证写进 SQLite（直到下次启动迁移才收敛，且
+    // token_store_load_secure「DB 明文优先」会持续旁路 vault 回填）。落库前必须与
+    // secure_store_for_save 同口径占位——DB qoder_tokens 一律空串，明文唯一驻留地
+    // 是 vault；vault 失败时同样落占位行（重新登录可恢复）
+    let mut row = target;
+    if let Some(rm) = row.as_object_mut() {
+        for k in TOKEN_SENSITIVE_KEYS {
+            if rm.contains_key(k) {
+                rm.insert(k.to_string(), serde_json::json!(""));
+            }
+        }
+    }
+    crate::store::docs::qoder_token_store_row_upsert(&crate::store::db(&state.data_dir), id, &row)?;
+    crate::store::db(&state.data_dir).kv_set_raw("qoder_tokens_meta", "1")?;
     vault_result.map_err(|e| {
         format!("Qoder 凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}")
     })
@@ -400,15 +404,11 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
 /// 避免「库里还在、密钥已删」的悬挂态（重导同账号可复用既有凭证恢复）。
 pub fn remove_token(state: &AppState, id: &str) -> Result<(), String> {
     let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // 凭证红线（审查 P0 修复）：此处只需摘行，必须读 DB 原始表（占位形态）——
-    // 不可走 load_token_store（vault 回填后的明文整表写回，会把其余账号的
-    // 明文凭证重新落库）
-    let mut store =
-        crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
-    if let Some(t) = store.get_mut("tokens").and_then(Value::as_object_mut) {
-        t.remove(id);
-    }
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)?;
+    // 行级删除（本轮审查修复）：原「load 整表 → 摘行 → rows_replace 整表」在他进程
+    // 并发 save 其他账号行时，会把刚 upsert 的行随 DELETE 全表一起吞掉
+    //（last-writer-wins 窗口）；row_delete 仅移除目标 pk 行，与 save_token_store
+    // 的行级 upsert 同口径。vault 清理仍滞后于 DB 删除成功（审查 L 顺序不变）
+    crate::store::docs::qoder_token_store_row_delete(&crate::store::db(&state.data_dir), id)?;
     crate::vault::ns_remove(&state.data_dir, "qoder", id);
     Ok(())
 }
@@ -432,20 +432,20 @@ pub fn clear_device_flow_creds(state: &AppState, id: &str) -> Result<(), String>
             }
         }
     }
-    // DB 行：与 remove_token 同口径读原始占位表（防明文整表写回），目标行移除字段
-    let mut store =
-        crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
-    if let Some(rec) = store
-        .get_mut("tokens")
-        .and_then(Value::as_object_mut)
-        .and_then(|t| t.get_mut(id))
-        .and_then(Value::as_object_mut)
-    {
+    // DB 行：行级读改写（本轮审查修复，与 remove_token/save_token_store 同口径）：
+    // row_get 单行读（占位形态，vault 不参与）→ 移除设备流字段 → row_upsert 仅
+    // 覆盖目标 pk 行，不再经整表 rows_replace 吞掉他进程并发写入的其他账号行
+    let Some(mut row) =
+        crate::store::docs::qoder_token_store_row_get(&crate::store::db(&state.data_dir), id)?
+    else {
+        // 行不存在（未入池/已移除）：DB 侧无可清字段（vault 侧已处理）
+        return Ok(());
+    };
+    if let Some(rec) = row.as_object_mut() {
         rec.remove("refresh_token");
         rec.remove("refresh_expires_at_ms");
     }
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)?;
-    Ok(())
+    crate::store::docs::qoder_token_store_row_upsert(&crate::store::db(&state.data_dir), id, &row)
 }
 
 // ── 统一请求头（§5.2：Cosy 头必带）─────────────────────────────────────────
@@ -584,7 +584,10 @@ pub fn refresh_token_once_ex(
         out.refresh_token = ref_tok;
     }
     if let Some(e) = i_of(fs_utils::dig(&body, &["expiresIn", "expires_in"])) {
-        out.expires_at_ms = Some(now_ms + normalize_expires_in(e));
+        // 溢出硬化（审查 P2）：normalize_expires_in(i64::MAX) 封顶 i64::MAX 后朴素
+        // 相加仍会溢出——saturating_add 封顶，下游 clamp_expires_at 将超界值钳为
+        // 「无过期信息」（保守走刷新路径）
+        out.expires_at_ms = Some(now_ms.saturating_add(normalize_expires_in(e)));
     } else {
         // P2：响应缺 expiresIn 时落保守本地过期基准（now+12h）——否则 expires_at 恒为
         // None，ensure_fresh 的临期判定永无基准，每次调用都重发刷新请求。12h 低于客户端
@@ -597,7 +600,7 @@ pub fn refresh_token_once_ex(
         &body,
         &["refresh_token_expires_in", "refreshTokenExpiresIn"],
     )) {
-        out.refresh_expires_at_ms = Some(now_ms + normalize_expires_in(e));
+        out.refresh_expires_at_ms = Some(now_ms.saturating_add(normalize_expires_in(e)));
     }
     (Some(out), RefreshFail::Transient)
 }
@@ -714,7 +717,10 @@ pub(crate) fn normalize_expires_in(e: i64) -> i64 {
     if e > 2_592_000 {
         e
     } else {
-        e * 1000
+        // 溢出硬化（审查 P2）：畸形负极端值（如 i64::MIN）×1000 会溢出——debug 构建
+        // panic、release 回绕为正。saturating_mul 封顶后调用方 clamp_expires_at 对
+        // 非正值一律视为「无过期信息」（保守走刷新路径），语义不变
+        e.saturating_mul(1000)
     }
 }
 
@@ -788,7 +794,8 @@ pub fn exchange_job_token(
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let expires_at_ms = i_of(fs_utils::dig(&b, &["expires_in", "expiresIn"]))
                         .map(normalize_expires_in)
-                        .map(|e| now_ms + e);
+                        // 溢出硬化（审查 P2，与 refresh_token_once_ex 同款口径）
+                        .map(|e| now_ms.saturating_add(e));
                     let refresh_token = s_of(fs_utils::dig(&b, &["refresh_token", "refreshToken"]));
                     fs_utils::app_log(
                         data_dir,
@@ -1377,6 +1384,20 @@ mod tests {
         let exp = now + normalize_expires_in(86_400_000);
         let hours = (exp - now) as f64 / 3_600_000.0;
         assert!((hours - 24.0).abs() < 0.01, "24h 窗口");
+    }
+
+    /// P2 溢出硬化：畸形大/小 expires_in 不得 panic / 回绕——服务端脏数据经
+    /// saturating_mul/saturating_add 封顶后，由 clamp_expires_at 钳为「无过期信息」
+    ///（保守走刷新路径），不再有 debug 构建算术溢出 panic 面
+    #[test]
+    fn normalize_expires_in_saturates_on_overflow() {
+        // i64::MAX：走「>30d 阈值判毫秒原样」分支，恒等返回不回绕为负
+        assert_eq!(normalize_expires_in(i64::MAX), i64::MAX);
+        // i64::MIN：秒级分支 saturating_mul 封顶为 i64::MIN（原 e*1000 debug 下 panic）
+        assert_eq!(normalize_expires_in(i64::MIN), i64::MIN);
+        // 正常边界回归：阈值内秒级 ×1000、超阈值毫秒原样（对齐既有测试口径）
+        assert_eq!(normalize_expires_in(86_400), 86_400_000);
+        assert_eq!(normalize_expires_in(2_592_001), 2_592_001);
     }
 
     /// Q1：刷新失败状态分类——429（限流）/408（超时）为可恢复暂态归 Transient，

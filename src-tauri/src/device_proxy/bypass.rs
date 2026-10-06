@@ -91,7 +91,10 @@ fn mac_bypass_list(svc: &str) -> Vec<String> {
         out.lines()
             .map(str::trim)
             .filter(|s| {
-                !s.is_empty() && !s.contains("aren't any bypass domains")
+                // 三重保险：空行 / 英文本地化说明 / 含空格的说明句——
+                // 中文 macOS 本地化说明行（如「此服务没有任何 bypass 域名」）
+                // 必含空格，bypass 域名不含空格（审查 P2，与 proxy_ctl 读路径同改）
+                !s.is_empty() && !s.contains("aren't any bypass domains") && !s.contains(' ')
             })
             .map(String::from)
             .collect()

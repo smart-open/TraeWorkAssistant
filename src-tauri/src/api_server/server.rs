@@ -33,6 +33,26 @@ impl ApiServerHandle {
             }
         }
     }
+
+    /// 异步优雅停止（审查 P2-10）：语义与 stop 一致（发信号 → 等优雅退出 →
+    /// 超时 abort），但等待改 tokio::time::timeout + await——供 Tauri 命令链
+    /// （commands/api_server.rs do_stop）在 tokio worker 内调用，不再以
+    /// thread::sleep 轮询阻塞 worker 线程。Drop / 应用退出路径仍用同步版 stop
+    /// （无异步上下文可用）。
+    pub async fn stop_async(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(mut h) = self.join_handle.take() {
+            // JoinHandle: Unpin，可借用等待（&mut h）；超时后句柄仍可 abort
+            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut h)
+                .await
+                .is_err()
+            {
+                h.abort();
+            }
+        }
+    }
 }
 
 /// 轮询任务是否已结束（每 50ms 一次，最多 max）；P2 修复9 优雅停机用
@@ -252,12 +272,17 @@ mod tests {
 /// 发一次轻量 GET（模型目录路径）。无凭证探测——任何 HTTP 响应（含 401）都证明
 /// 服务在线，仅连接失败/超时判不可达；结果写 state.wb_probe_* 供 /status 透出。
 /// 频控红线：单次单请求、不重试、不批量，探活流量可忽略。
+/// 持 Weak 引用（审查 P1-2）：服务停止、共享状态被释放后线程自动退出
+/// （重启服务重建新线程），避免重启循环泄漏线程。
 fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
     use std::sync::atomic::Ordering;
+    let weak = Arc::downgrade(&state);
+    drop(state);
     std::thread::spawn(move || {
         // T5.1/F-37：启动即做一次上游目录动态替换（best effort，失败不影响启动——
-        // 本地静态兜底目录保持不动）；取任一健康 WB 账号的凭证拉取
-        {
+        // 本地静态兜底目录保持不动）；取任一健康 WB 账号的凭证拉取。
+        // 强引用仅在本次替换内短暂持有
+        if let Some(state) = weak.upgrade() {
             let picked = state.wb_pool.pick_excluding_constrained(
                 &std::collections::HashSet::new(),
                 None,
@@ -297,6 +322,11 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
                 .map(|d| d.subsec_nanos() as u64 % 60)
                 .unwrap_or(0);
             std::thread::sleep(std::time::Duration::from_secs(300 + jitter));
+            // 审查 P1-2：每轮 upgrade（睡眠期间不持强引用）；ApiSharedState 已释放
+            // （服务停止且状态回收）即退出线程
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
             let agent = ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(10))
                 .build();
@@ -319,6 +349,7 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
                 // 失败明示（§2.2 接口稳定性）：记日志不静默
                 eprintln!("[wb-probe] 上游健康检测失败: {PROBE_URL}");
             }
+            // 轮末释放本轮强引用（下一轮睡眠期间不持有）
         }
     });
 }

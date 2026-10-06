@@ -42,6 +42,54 @@ const die = (msg) => {
   process.exit(1);
 };
 
+// ---- CI 三 job 清单合并模式（--merge-manifests <latest.json> [...]）----
+// build-macos.yml 的 merge-manifests job 专用：aarch64 / x64 / universal 三个并行
+// 构建 job 各自产出的 latest.json 只含本架构 dmg 的 assets 键，人工汇总易漏合并 →
+// 另一架构的 updater fail-closed（清单缺对应资产键即拒绝更新）。本模式读取多个
+// 清单做 version 一致性校验后取 assets 键并集，输出单一合并清单到 RELEASE_OUT_DIR。
+// 复用主流程的清单契约（键名原样、2 空格缩进、中文原样、无末尾换行——updater.rs 消费）。
+const mergeIdx = process.argv.indexOf('--merge-manifests');
+if (mergeIdx !== -1) {
+  const paths = process.argv.slice(mergeIdx + 1).filter((a) => !a.startsWith('--'));
+  if (paths.length === 0) {
+    die('用法: node scripts/rename_release.mjs --merge-manifests <latest.json> [<latest.json> ...]');
+  }
+  const outDir = resolve(ROOT, process.env.RELEASE_OUT_DIR || 'release');
+  mkdirSync(outDir, { recursive: true });
+  let version = null;
+  const assets = {};
+  for (const p of paths) {
+    if (!existsSync(p)) die(`清单合并失败：文件不存在 ${p}`);
+    let m;
+    try {
+      m = JSON.parse(readFileSync(p, 'utf8'));
+    } catch {
+      die(`清单合并失败：JSON 解析失败 ${p}`);
+    }
+    if (!m.version || !m.assets || typeof m.assets !== 'object') {
+      die(`清单合并失败：格式非法（缺 version/assets）${p}`);
+    }
+    if (version === null) version = m.version;
+    if (version !== m.version) {
+      die(`清单合并失败：版本不一致（${version} vs ${m.version}）${p}`);
+    }
+    for (const [k, v] of Object.entries(m.assets)) {
+      if (assets[k] && assets[k] !== v) {
+        // 终审修复：同名键异哈希 = 同一资产名对应两个不同文件（artifact 污染信号），
+        // 按 updater fail-closed 契约直接拒绝，而非 WARN 后静默取后者
+        die(`清单合并失败：资产 ${k} 哈希冲突（${assets[k]} vs ${v}）${p}`);
+      }
+      assets[k] = v;
+    }
+    console.log('已合并:', p, `(${Object.keys(m.assets).length} 资产)`);
+  }
+  const merged = join(outDir, MANIFEST_NAME);
+  // 与 updater.rs 消费契约字节对齐：2 空格缩进、中文原样、无末尾换行
+  writeFileSync(merged, JSON.stringify({ version, assets }, null, 2));
+  console.log('OK:', merged, `共 ${Object.keys(assets).length} 个资产键 / version=${version}`);
+  process.exit(0);
+}
+
 function readVersion(conf) {
   // 版本单源 = Cargo.toml；tauri.conf.json 里的 version 字段已移除（自动回读 Cargo.toml）
   if (conf.version) return conf.version;

@@ -11,7 +11,11 @@ use super::usage::KeyId;
 use super::ApiSharedState;
 
 /// API Key 鉴权中间件：
-/// - /health 跳过鉴权
+/// - /healthz 跳过鉴权（审查 P2-8：响应仅 status/solo_available/wb_available 布尔，
+///   无账号数/模型/密钥等敏感信息，供定位探活/看门狗直接探测）
+/// - /health 免鉴权为历史行为（**响应含 total_credits/active_uid/last_error/池账号数**，
+///   暴露面大于 /healthz；listen 127.0.0.1 下仅本机可达，非环回监听由强制鉴权
+///   防线兜底）——后续如收敛暴露面需同步更新探活方
 /// - Key 统一在 data/api_keys.json 列表中维护（带每日配额），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
 /// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权）放行记 anonymous，
@@ -24,7 +28,8 @@ pub async fn bearer_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path() == "/health" {
+    // 健康探针路径免鉴权（/healthz 仅布尔；/health 历史行为见上）
+    if matches!(request.uri().path(), "/health" | "/healthz") {
         return next.run(request).await;
     }
 

@@ -11,7 +11,7 @@ import type { QoderEnvCheck, QoderSettings } from '../../types';
  * qoder-settings 环境配置（F-80 §5.8，布局对齐 BuddySettings）：
  * 左列 通用配置（应用环境路径 + 签到行为）；右列 任务配置（每日自动签到 + Token 定时续期 + 积分数据同步）。
  * 顶部「重新检测」+ 右上角「保存配置」统一提交（路径 / 时刻 / 开关一处生效）；
- * Windows 计划任务注册、路径自动检测为独立即时动作。
+ * 路径自动检测为独立即时动作；每日定时统一走应用内 Rust 调度器（无系统计划任务）。
  * 合规提示（条款风险固定展示，不可跳过）。
  */
 
@@ -19,22 +19,22 @@ const isValidHHMM = (s: string) => /^([01]\d|2[0-3]):[0-5]\d$/.test(s.trim());
 
 export default function QoderSettings() {
   const pushToast = useAppStore((s) => s.pushToast);
+  const platform = useAppStore((s) => s.platform);
   const settings = useAppStore((s) => s.settings);
   const saveSettings = useAppStore((s) => s.saveSettings);
   const [qoderSettings, setQoderSettings] = useState<QoderSettings | null>(null);
   const [settingsErr, setSettingsErr] = useState(false);
   const [env, setEnv] = useState<QoderEnvCheck | null>(null);
-  const [taskTimes, setTaskTimes] = useState<string[]>([]);
   const [idePath, setIdePath] = useState('');
   const [workPath, setWorkPath] = useState('');
   const [checkinHhmm, setCheckinHhmm] = useState('10:15');
   const [creditsHhmm, setCreditsHhmm] = useState('23:40');
   const [creditsSyncEnabled, setCreditsSyncEnabled] = useState(true);
   const [tokenRenewEnabled, setTokenRenewEnabled] = useState(true);
+  // number | ''：'' 为「清空重输中」暂存态，保存侧 1~24 校验兜底
+  const [renewHours, setRenewHours] = useState<number | ''>(6);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
-  // 计划任务注册/卸载互斥（防连点重复提交）
-  const [taskBusy, setTaskBusy] = useState(false);
 
   /** qoder-settings 加载（签到开关数据源）：失败置错误态——null 时 checkbox 恒显默认 true
    *  且点击 no-op、保存会静默跳过 settingsSet 仍报「已保存」，必须显式拦截 */
@@ -51,11 +51,7 @@ export default function QoderSettings() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [ts, e] = await Promise.all([
-        api.qoder.checkinTaskStatus().catch(() => [] as string[]),
-        api.qoder.envCheck().catch(() => null),
-      ]);
-      setTaskTimes(ts);
+      const e = await api.qoder.envCheck().catch(() => null);
       setEnv(e);
       await loadQoderSettings();
     } catch (err) {
@@ -80,6 +76,7 @@ export default function QoderSettings() {
     creditsHhmm: '23:40',
     creditsSyncEnabled: true,
     tokenRenewEnabled: true,
+    renewHours: 6,
   });
 
   useEffect(() => {
@@ -91,7 +88,8 @@ export default function QoderSettings() {
       checkinHhmm === s.checkinHhmm &&
       creditsHhmm === s.creditsHhmm &&
       creditsSyncEnabled === s.creditsSyncEnabled &&
-      tokenRenewEnabled === s.tokenRenewEnabled;
+      tokenRenewEnabled === s.tokenRenewEnabled &&
+      renewHours === s.renewHours;
     if (!untouched) return;
     const next = {
       idePath: settings.qoder_ide_path ?? '',
@@ -100,6 +98,7 @@ export default function QoderSettings() {
       creditsHhmm: settings.qoder_credits_sync_hhmm || '23:40',
       creditsSyncEnabled: settings.qoder_credits_sync_enabled ?? true,
       tokenRenewEnabled: settings.qoder_token_renew_enabled ?? true,
+      renewHours: settings.qoder_token_renew_interval_hours || 6,
     };
     setIdePath(next.idePath);
     setWorkPath(next.workPath);
@@ -107,6 +106,7 @@ export default function QoderSettings() {
     setCreditsHhmm(next.creditsHhmm);
     setCreditsSyncEnabled(next.creditsSyncEnabled);
     setTokenRenewEnabled(next.tokenRenewEnabled);
+    setRenewHours(next.renewHours);
     lastSynced.current = next;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings]);
@@ -127,6 +127,12 @@ export default function QoderSettings() {
       pushToast('error', `快照时刻格式无效：${creditsHhmm}（应为 HH:MM）`);
       return;
     }
+    // Token 续期间隔：整数 1~24（越界钳制 + 提示，不静默拦截保存）
+    const hours = Math.round(Number(renewHours));
+    if (!Number.isFinite(hours) || hours < 1 || hours > 24) {
+      pushToast('error', `续期间隔无效：${renewHours}（应为 1~24 的整数小时）`);
+      return;
+    }
     setSaving(true);
     try {
       await withMinDelay(
@@ -138,6 +144,7 @@ export default function QoderSettings() {
             qoder_credits_sync_hhmm: creditsHhmm.trim(),
             qoder_credits_sync_enabled: creditsSyncEnabled,
             qoder_token_renew_enabled: tokenRenewEnabled,
+            qoder_token_renew_interval_hours: hours,
           }),
           api.qoder.settingsSet(qoderSettings),
         ]),
@@ -153,45 +160,14 @@ export default function QoderSettings() {
         creditsHhmm: creditsHhmm.trim(),
         creditsSyncEnabled,
         tokenRenewEnabled,
+        renewHours: hours,
       };
+      setRenewHours(hours);
       await refresh();
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
       setSaving(false);
-    }
-  };
-
-  const registerTask = async () => {
-    if (taskBusy) return;
-    if (!isValidHHMM(checkinHhmm)) {
-      pushToast('error', `签到时刻格式无效：${checkinHhmm}（应为 HH:MM）`);
-      return;
-    }
-    setTaskBusy(true);
-    try {
-      await api.qoder.checkinTaskRegister([checkinHhmm.trim()]);
-      setTaskTimes(await api.qoder.checkinTaskStatus());
-      // 双轨提示：计划任务按输入框当前值注册即生效；应用内调度器仍以「保存配置」提交的值为准
-      pushToast('info', `计划任务已按 ${checkinHhmm.trim()} 注册；应用内定时需点击「保存配置」后生效`);
-    } catch (err) {
-      pushToast('error', `注册失败：${String(err)}`);
-    } finally {
-      setTaskBusy(false);
-    }
-  };
-
-  const unregisterTask = async () => {
-    if (taskBusy) return;
-    setTaskBusy(true);
-    try {
-      await api.qoder.checkinTaskUnregister();
-      setTaskTimes(await api.qoder.checkinTaskStatus());
-      pushToast('success', 'Windows 计划任务已卸载');
-    } catch (err) {
-      pushToast('error', `卸载失败：${String(err)}`);
-    } finally {
-      setTaskBusy(false);
     }
   };
 
@@ -203,7 +179,7 @@ export default function QoderSettings() {
       else setWorkPath(exe);
       pushToast('info', `已定位：${exe}`);
     } else {
-      pushToast('warn', '未检测到客户端，请人工填写 exe 路径');
+      pushToast('warn', `未检测到客户端，请人工填写${platform === 'windows' ? ' exe' : ' .app'}路径`);
     }
   };
 
@@ -251,7 +227,7 @@ export default function QoderSettings() {
             <div className="space-y-3">
               <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
                 <div className="mb-2 flex items-center justify-between font-medium text-slate-500">
-                  Qoder CN IDE exe 路径
+                  {platform === 'windows' ? 'Qoder CN IDE exe 路径' : 'Qoder CN IDE 路径（.app）'}
                   <Badge tone={env?.ide_exe ? 'green' : 'amber'}>{env?.ide_exe ? '已检测到' : '未检测到'}</Badge>
                 </div>
                 <div className="flex items-center gap-2">
@@ -259,7 +235,12 @@ export default function QoderSettings() {
                     className="input flex-1 font-mono text-xs"
                     value={idePath}
                     onChange={(e) => setIdePath(e.target.value)}
-                    placeholder={env?.ide_exe ?? 'C:\\Users\\...\\AppData\\Local\\Programs\\Qoder CN IDE\\Qoder CN IDE.exe'}
+                    placeholder={
+                      env?.ide_exe ??
+                      (platform === 'windows'
+                        ? 'C:\\Users\\...\\AppData\\Local\\Programs\\Qoder CN IDE\\Qoder CN IDE.exe'
+                        : '/Applications/Qoder CN IDE.app')
+                    }
                   />
                   <button className="btn-outline shrink-0 !px-2 !py-1" onClick={() => detectPath('ide')}>
                     <Search size={13} /> 自动检测
@@ -269,7 +250,7 @@ export default function QoderSettings() {
               </div>
               <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
                 <div className="mb-2 flex items-center justify-between font-medium text-slate-500">
-                  QoderWork CN exe 路径
+                  {platform === 'windows' ? 'QoderWork CN exe 路径' : 'QoderWork CN 路径（.app）'}
                   <Badge tone={env?.qoderwork_exe ? 'green' : 'amber'}>{env?.qoderwork_exe ? '已检测到' : '未检测到'}</Badge>
                 </div>
                 <div className="flex items-center gap-2">
@@ -277,7 +258,12 @@ export default function QoderSettings() {
                     className="input flex-1 font-mono text-xs"
                     value={workPath}
                     onChange={(e) => setWorkPath(e.target.value)}
-                    placeholder={env?.qoderwork_exe ?? 'C:\\Users\\...\\AppData\\Local\\Programs\\Qoder CN\\Qoder CN.exe'}
+                    placeholder={
+                      env?.qoderwork_exe ??
+                      (platform === 'windows'
+                        ? 'C:\\Users\\...\\AppData\\Local\\Programs\\Qoder CN\\Qoder CN.exe'
+                        : '/Applications/Qoder CN.app')
+                    }
                   />
                   <button className="btn-outline shrink-0 !px-2 !py-1" onClick={() => detectPath('work')}>
                     <Search size={13} /> 自动检测
@@ -329,17 +315,17 @@ export default function QoderSettings() {
           <div className="mb-3 flex items-center gap-2">
             <ListChecks size={16} className="text-violet-500" />
             <h2 className="font-medium">任务配置</h2>
-            <span className="text-xs text-slate-400">应用内调度器 + Windows 计划任务双轨</span>
+            <span className="text-xs text-slate-400">应用内调度器（全平台一致）</span>
           </div>
 
-          {/* Token 定时续期（qoder-refresh 内置调度任务，2026-10-02 从「无 UI 恒开」升级为可配置） */}
+          {/* Token 定时续期（qoder-refresh 内置调度任务；2026-10-05 间隔可配） */}
           <div className="flex items-center justify-between">
             <h3 className="font-medium">Token 定时续期</h3>
-            <span className="text-xs text-slate-400">开关随右上角「保存配置」生效</span>
+            <span className="text-xs text-slate-400">开关与间隔随右上角「保存配置」生效</span>
           </div>
           <p className="mb-3 mt-1 text-xs text-slate-400">
-            应用内调度器每 6 小时为全部含刷新凭证的账号自动续期登录凭证（如 JWT Token）；
-            客户端令牌惰性窗 7 小时大于 6 小时调度间隔，过期前必被续上。关闭后凭证仅在
+            应用内调度器每 N 小时为全部含刷新凭证的账号自动续期登录凭证（如 JWT Token）；
+            客户端令牌惰性窗 7 小时，间隔不超过 7 小时即可保证过期令牌被续上。关闭后凭证仅在
             实际使用（余额刷新 / 签到 / 网关调用）时惰性刷新。无账号时空转不计失败。
           </p>
           <div className="flex flex-wrap items-center gap-4 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
@@ -351,50 +337,45 @@ export default function QoderSettings() {
               />
               启用
             </label>
-            <span className="text-xs text-slate-400">内置任务 · 每 6 小时 · 无需注册计划任务</span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-slate-500">执行间隔</span>
+              <input
+                type="number"
+                min={1}
+                max={24}
+                step={1}
+                className="input h-9 !w-20 text-sm"
+                value={renewHours}
+                onChange={(e) =>
+                  // 空串原样暂存（允许清空重输，终审修复「清空即跳 6 造成 6→61 粘连」）；
+                  // 保存时由 1~24 fail-closed 校验兜底
+                  setRenewHours(e.target.value === '' ? '' : Number(e.target.value))
+                }
+              />
+              <span className="text-xs text-slate-400">小时（1~24，默认 6）</span>
+            </div>
           </div>
 
           <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
 
-          {/* 每日自动签到（对齐 Buddy「Windows 计划任务」盒子样式） */}
+          {/* 每日自动签到（应用内 Rust 调度器单轨：执行时刻随输入框 + 右上角「保存配置」生效） */}
           <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
             <h3 className="mb-2 font-medium">每日自动签到</h3>
             <div className="mb-2 text-xs text-slate-400">
               应用内调度器到点自动执行（默认 10:15，同时覆盖「0 点签到」与「10:00 登录奖励」双活动），
-              应用启动时自动补跑当日已过时刻；下方 Windows 计划任务作为兜底，应用未启动时直接运行。
+              应用启动时自动补跑当日已过时刻；执行时刻随下方输入框保存后生效。
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
-                <div className="text-sm font-medium">Windows 计划任务（兜底）</div>
-                <div className="text-xs text-slate-400">
-                  {taskTimes.length > 0 ? `已注册：${taskTimes.join('、')}` : '未注册'}
-                </div>
+                <div className="text-sm font-medium">每日执行时刻</div>
+                <div className="text-xs text-slate-400">应用关闭期间不执行，启动后自动补跑</div>
               </div>
-              <div className="flex items-center gap-2">
-                <input
-                  type="time"
-                  className="input h-9 !w-28 text-sm"
-                  value={checkinHhmm}
-                  onChange={(e) => setCheckinHhmm(e.target.value || '10:15')}
-                />
-                {taskTimes.length > 0 ? (
-                  <button
-                    className="btn-ghost !px-3 !py-1 text-xs text-rose-500"
-                    disabled={taskBusy}
-                    onClick={() => void unregisterTask()}
-                  >
-                    {taskBusy ? <Spinner /> : null} 卸载
-                  </button>
-                ) : (
-                  <button
-                    className="btn-outline !px-3 !py-1 text-xs"
-                    disabled={taskBusy}
-                    onClick={() => void registerTask()}
-                  >
-                    {taskBusy ? <Spinner /> : null} 注册
-                  </button>
-                )}
-              </div>
+              <input
+                type="time"
+                className="input h-9 !w-28 text-sm"
+                value={checkinHhmm}
+                onChange={(e) => setCheckinHhmm(e.target.value || '10:15')}
+              />
             </div>
           </div>
 

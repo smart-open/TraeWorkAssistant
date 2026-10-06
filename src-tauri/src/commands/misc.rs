@@ -621,15 +621,25 @@ fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
 }
 
 /// 收集需禁止写入的系统目录前缀（macOS）：SIP 保护域与全机 Library、私有根、
-/// /etc（/private/etc 符链）——防持久化滥用语义对齐 Windows 分支
+/// /etc（/private/etc 符链），另加用户级持久化目录 ~/Library/LaunchAgents 与
+/// ~/Library/LaunchDaemons（审查 P2：LaunchAgent 当前用户可写，是用户级
+/// 开机自启持久化滥用面——语义对齐 Windows 分支的启动文件夹封禁；
+/// LaunchDaemons 需 root 但一并封禁防提权写入）——HOME 缺失时跳过用户级两项
 #[cfg(target_os = "macos")]
 fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
-    vec![
+    let mut v = vec![
         std::path::PathBuf::from("/System"),
         std::path::PathBuf::from("/Library"),
         std::path::PathBuf::from("/private"),
         std::path::PathBuf::from("/etc"),
-    ]
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            v.push(std::path::PathBuf::from(&home).join("Library/LaunchAgents"));
+            v.push(std::path::PathBuf::from(&home).join("Library/LaunchDaemons"));
+        }
+    }
+    v
 }
 
 /// 导出路径校验（canonicalize 失败时对原路径做前缀判断）：

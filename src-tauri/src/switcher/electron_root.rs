@@ -24,7 +24,12 @@ use super::{ProgressSink, Session, StepStatus};
 
 /// 根级白名单条目（文件或目录，Copy-SnapshotItem 语义自适应）。
 /// AUTH_FILES 三件套为登录凭据域（2026-10-04 修复新增）：备份纳入 + 恢复对称清理
-/// （restore_electron_root），保证恢复后登录凭据与快照账号一致
+/// （restore_electron_root），保证恢复后登录凭据与快照账号一致。
+/// mac 平台化（2026-10-05 终审修复）：mac Electron 应用 Cookies 直挂数据根
+/// （QoderWork 实测 + icube 系同布局先例），Windows 版 Network/ 目录在 mac 恒缺失
+/// ——白名单按平台分派，mac 追加根级 Cookies/Cookies-journal，否则登录会话不入
+/// 快照、恢复后残留上一账号 Cookies（切了等于没切的同型问题）。
+#[cfg(windows)]
 const ROOT_ITEMS: [&str; 9] = [
     "Local State",
     "Network",
@@ -36,6 +41,36 @@ const ROOT_ITEMS: [&str; 9] = [
     "auth.machine-id",
     "auth-profile-overlays.v1.dat",
 ];
+#[cfg(target_os = "macos")]
+const ROOT_ITEMS: [&str; 11] = [
+    "Local State",
+    "Network",
+    "Local Storage",
+    "Session Storage",
+    "Preferences",
+    "Shared Dictionary",
+    "auth.v1.dat",
+    "auth.machine-id",
+    "auth-profile-overlays.v1.dat",
+    "Cookies",
+    "Cookies-journal",
+];
+
+/// 登录会话 Cookies 路径（平台分派：Windows 在 Network/ 内，mac 直挂数据根）
+#[cfg(windows)]
+fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("Network").join("Cookies")
+}
+#[cfg(target_os = "macos")]
+fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("Cookies")
+}
+
+/// mac 恢复对称清理域：根级 Cookies 与 auth 三件套同语义（快照缺失而数据目录
+/// 现存 → 删除，防旧版快照/未登录快照恢复后残留上一账号会话）。Windows 侧
+/// Cookies 随 Network/ 目录整体覆盖，无此残留面，维持原状。
+#[cfg(target_os = "macos")]
+const ROOT_COOKIES_FILES: [&str; 2] = ["Cookies", "Cookies-journal"];
 
 /// 登录凭据域三件套（restore 侧对称清理用：快照缺失而数据目录现存 → 删除，
 /// 防旧版快照恢复后残留上一账号凭据——Work 启动读 auth.v1.dat 优先于 Cookies）
@@ -71,7 +106,7 @@ pub fn backup_electron_root(sess: &Session, slot: &str, sink: &dyn ProgressSink)
             src.display()
         ));
     }
-    if !src.join("Local State").exists() && !src.join("Network").join("Cookies").exists() {
+    if !src.join("Local State").exists() && !cookies_path(&src).exists() {
         return Err(format!(
             "{} 数据目录中未发现 Local State / Cookies（可能未登录），已取消备份",
             sess.prof.app_name
@@ -86,7 +121,7 @@ pub fn backup_electron_root(sess: &Session, slot: &str, sink: &dyn ProgressSink)
             copied += 1;
         }
     }
-    if !dest.join("Local State").exists() && !dest.join("Network").join("Cookies").exists() {
+    if !dest.join("Local State").exists() && !cookies_path(&dest).exists() {
         // 清理半成品快照，避免空槽位污染快照列表
         let _ = std::fs::remove_dir_all(&dest);
         return Err(format!(
@@ -120,7 +155,7 @@ fn test_snapshot_integrity(src: &std::path::Path, app: &str, sink: &dyn Progress
             ));
         }
     }
-    if !src.join("Network").join("Cookies").exists() {
+    if !cookies_path(src).exists() {
         sink.step(
             "restore",
             StepStatus::Warn,
@@ -164,6 +199,18 @@ pub fn restore_electron_root(
     // 仍留在数据目录——Work 启动读它作登录真源，切了等于没切（switcher.log 实测：
     // 恢复 6 项成功、客户端仍登录原账号）。删除后 Work 回退 Cookies/登录页，可恢复
     for item in AUTH_FILES {
+        if !src.join(item).exists() {
+            let live = dest.join(item);
+            if live.exists() {
+                let _ = std::fs::remove_file(&live);
+            }
+        }
+    }
+    // mac：根级 Cookies 与 auth 同语义的对称清理（快照缺失而现存 → 删除）——
+    // 防旧版快照/未登录快照恢复后残留上一账号会话；Windows 随 Network/ 整体
+    // 覆盖无此面（见 ROOT_COOKIES_FILES 注释）
+    #[cfg(target_os = "macos")]
+    for item in ROOT_COOKIES_FILES {
         if !src.join(item).exists() {
             let live = dest.join(item);
             if live.exists() {

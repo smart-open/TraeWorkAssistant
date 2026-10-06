@@ -409,7 +409,7 @@ fn run_qoder_stream(
             "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
             start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
         );
-        send_stream_error(tx, proto, 404, &msg);
+        send_stream_error(tx, proto, "404", &msg);
         return;
     };
     // 区域边界执行入口检查（审查修复）：resolve 双区兜底可能命中 Global 专属
@@ -423,7 +423,7 @@ fn run_qoder_stream(
             "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
             start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
         );
-        send_stream_error(tx, proto, 404, &msg);
+        send_stream_error(tx, proto, "404", &msg);
         return;
     }
     let model_key = entry
@@ -515,11 +515,14 @@ fn run_qoder_stream(
                         "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "", Some("no healthy account"),
                     );
-                    // 审查 P3：错误消息面向客户端用户展示，中文化（code 保留机器可读）
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(
-                        "data: {\"error\":{\"message\":\"Qoder 上游暂无可用账号（无健康账号可调度），请检查账号池或稍后重试\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
-                    )));
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    // 审查 P1-1：无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
+                    // 各自形态，helper 内已含收尾帧），不再硬编码 OpenAI 格式
+                    send_stream_error(
+                        tx,
+                        proto,
+                        "no_healthy_account",
+                        "Qoder 上游暂无可用账号（无健康账号可调度），请稍后重试",
+                    );
                     return;
                 }
             },
@@ -574,7 +577,7 @@ fn run_qoder_stream(
                     start_ts.elapsed().as_millis() as u64, &key_name,
                     &state.qoder_pool.name_of(&picked.uid), Some(&e),
                 );
-                send_stream_error(tx, proto, 500, &e);
+                send_stream_error(tx, proto, "500", &e);
                 return;
             }
         };
@@ -820,7 +823,7 @@ fn run_qoder_stream(
                                 &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
                                 &state.qoder_pool.name_of(&picked.uid), Some(&msg),
                             );
-                            send_stream_error(tx, proto, status as i64, &msg);
+                            send_stream_error(tx, proto, &status.to_string(), &msg);
                             return;
                         }
                     }
@@ -904,7 +907,11 @@ pub async fn qoder_aggregate_chat(
             .and_then(Value::as_str)
             .or_else(|| peek.get("user").and_then(Value::as_str))
             .unwrap_or("-")
-            .to_string();
+            // 审查 P2-3：seed 进 sticky 存储做会话匹配，超长值放大留档体积——
+            // 限长 128 字符（与流式路径及上游请求体 session_seed 同款确定性截断）
+            .chars()
+            .take(128)
+            .collect();
         // 首选：粘性 > 调度策略（F-77④：粘性账号 busy 且有空闲候选时让位）
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
@@ -936,6 +943,7 @@ pub async fn qoder_aggregate_chat(
                         p
                     }
                     None => {
+                        // 三池统一：每请求一行终态记账（中间态不记，防虚高）
                         state.record_usage_qoder(
                             &model,
                             "none",
@@ -1045,6 +1053,7 @@ pub async fn qoder_aggregate_chat(
                                         )
                                     })
                                     .unwrap_or((0, 0));
+                                // 三池统一：每请求一行终态记账（中间态不记，防虚高）
                                 state.record_usage_qoder(
                                     &model, &win_uid, &key_id, true, stream, duration_ms, pt, ct,
                                     Some(ttfb_ms),
@@ -1166,9 +1175,10 @@ pub async fn qoder_aggregate_chat(
                                     "qoder uid={} status={}",
                                     picked.uid, status
                                 ));
-                                // 记账口径对齐流式路径（每请求一行）：换号中间态不记
-                                // usage（原聚合路径每次换号多记一条失败，qoder 桶
-                                // requests/errors 虚高）；最终 no-healthy 由取号分支记录
+                                // 三池统一：每请求一行终态记账（中间态不记，防虚高）——
+                                // 换号中间态不记 usage（原聚合路径每次换号多记一条失败，
+                                // qoder 桶 requests/errors 虚高）；终态由成功/取号
+                                // no-healthy 分支统一落一行（审查 P2-4，与 wb/trae 对齐）
                                 state.logger.log_request(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream,
                                     status, &picked.uid,
@@ -1261,7 +1271,7 @@ fn now_ts() -> i64 {
 fn send_stream_error(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
-    code: i64,
+    code: &str,
     msg: &str,
 ) {
     match proto {
@@ -1278,7 +1288,7 @@ fn send_stream_error(
                 "object": "response",
                 "status": "failed",
                 "output": [],
-                "error": {"code": code.to_string(), "message": msg},
+                "error": {"code": code, "message": msg},
             });
             let body = json!({"type": "response.failed", "response": resp});
             let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(

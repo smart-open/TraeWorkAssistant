@@ -128,7 +128,12 @@ fn networksetup_read() -> Option<(bool, String, String)> {
         };
         // 输出形如：Enabled: Yes / Server: 127.0.0.1 / Port: 7890 /
         // Authenticated Proxy Enabled: 0（前缀匹配安全：Server 不命中认证段）
-        let web = out(&["-getwebproxy", svc])?;
+        // 审查 P1：单个服务的 -getwebproxy 查询失败（VPN 虚拟网卡/失效服务等）
+        // 只跳过该服务继续下一个，不得让整个函数返回 None——否则用户 VPN 代理
+        // 快照丢失、停止时被误清（对齐写路径「逐服务独立收集错误」语义）
+        let Some(web) = out(&["-getwebproxy", svc]) else {
+            continue;
+        };
         if parse_enabled(&web) != Some(true) {
             continue;
         }
@@ -139,12 +144,15 @@ fn networksetup_read() -> Option<(bool, String, String)> {
         if host.is_empty() || port.is_empty() {
             continue;
         }
-        // bypass 取同服务 -getproxybypassdomains（逐行域列表；未设置时输出说明行）
+        // bypass 取同服务 -getproxybypassdomains（逐行域列表；未设置时输出说明行，
+        // 读取失败降级为空串继续——bypass 丢失不应让整个快照作废）。
+        // 过滤三重保险：空行 / 英文本地化说明（"aren't any"）/ 含空格的说明句
+        // （中文 macOS 本地化说明行必含空格，bypass 域名不含空格——审查 P2）
         let bypass = out(&["-getproxybypassdomains", svc])
             .map(|t| {
                 t.lines()
                     .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.contains("aren't any"))
+                    .filter(|l| !l.is_empty() && !l.contains("aren't any") && !l.contains(' '))
                     .collect::<Vec<_>>()
                     .join(";")
             })
@@ -170,6 +178,65 @@ fn parse_field(text: &str, key: &str) -> Option<String> {
         .find(|l| l.trim_start().starts_with(key))
         .and_then(|l| l.split_once(':'))
         .map(|(_, v)| v.trim().to_string())
+}
+
+/// 逐服务精确清除指向 127.0.0.1:port 的残留系统代理（commands/proxy.rs
+/// cleanup_stale_local_proxy 消费）。与 apply_system_proxy(false) 的全服务 off
+/// 不同：仅对「web 代理 = 127.0.0.1:port」的服务下发 off，不触碰其他网络服务——
+/// 防止把用户 VPN 代理（如 Clash 配置在另一网络服务上）一并清掉。
+/// 返回清除的服务数；单服务写失败逐个收集（对齐写路径语义），其余服务继续。
+#[cfg(target_os = "macos")]
+pub fn clear_stale_local_proxy_port(port: u16) -> Result<usize, String> {
+    let services = network_services()?;
+    let port_str = port.to_string();
+    let mut cleared = 0usize;
+    let mut errs: Vec<String> = Vec::new();
+    for svc in &services {
+        let read = |args: &[&str]| -> Option<String> {
+            crate::platform::cmd::sys_output(
+                crate::platform::cmd::sys_command("networksetup").args(args),
+            )
+            .ok()
+        };
+        // 服务不可读（VPN 虚拟网卡/失效服务等）→ 跳过该服务（networksetup_read 同款）
+        let Some(web) = read(&["-getwebproxy", svc]) else {
+            continue;
+        };
+        if parse_enabled(&web) != Some(true) {
+            continue;
+        }
+        let (Some(host), Some(p)) = (parse_field(&web, "Server"), parse_field(&web, "Port"))
+        else {
+            continue;
+        };
+        // 仅命中「我们写的形态」（127.0.0.1 + 写盘端口 last_proxy_port.txt）才动
+        // 该服务；host/port 任一不符 = 用户自己的代理，绝不触碰
+        if host != "127.0.0.1" || p != port_str {
+            continue;
+        }
+        let run = |args: &[&str]| -> Option<String> {
+            crate::platform::cmd::sys_output(
+                crate::platform::cmd::sys_command("networksetup").args(args),
+            )
+            .err()
+        };
+        // off 态仍需带 domain/port 形参（networksetup 语法要求，off 时被忽略）；
+        // web/secure 成对关闭——set_win_proxy 接管时两键成对写（残留在两键一致）
+        for args in [
+            vec!["-setwebproxy", svc, "0.0.0.0", "0", "off"],
+            vec!["-setsecurewebproxy", svc, "0.0.0.0", "0", "off"],
+        ] {
+            if let Some(e) = run(&args) {
+                errs.push(format!("{svc}: {e}"));
+            }
+        }
+        cleared += 1;
+    }
+    if errs.is_empty() {
+        Ok(cleared)
+    } else {
+        Err(format!("部分网络服务清理失败: {}", errs.join("；")))
+    }
 }
 
 #[cfg(test)]

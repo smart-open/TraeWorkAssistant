@@ -287,11 +287,18 @@ pub struct Settings {
     /// Qoder 积分快照调度开关（默认开；无账号时任务内部静默跳过不计失败）
     #[serde(default = "default_true")]
     pub qoder_credits_sync_enabled: bool,
-    /// Qoder 凭证定时续期开关（默认开）：qoder-refresh 任务每 6 小时为全部含
-    /// refresh_token 的账号兜底续期 dt- 凭证（客户端 token 惰性窗 7h > 6h 调度
-    /// 间隔，任一 tick 必落窗内）；关闭后凭证仅在使用时惰性刷新
+    /// Qoder 凭证定时续期开关（默认开）：qoder-refresh 任务每 N 小时为全部含
+    /// refresh_token 的账号兜底续期 dt- 凭证（客户端 token 惰性窗 7h——间隔配置
+    /// ≤7h 才能保证过期令牌必被续上；8~24h 时兜底 tick 可能落在过期区，期间业务
+    /// 请求靠各任务 401 自愈兜底，前端配置页已明示该后果）；关闭后凭证仅在
+    /// 使用时惰性刷新
     #[serde(default = "default_true")]
     pub qoder_token_renew_enabled: bool,
+    /// Qoder 凭证续期间隔小时数（1~24，默认 6；环境配置页可改，state 加载时
+    /// 零值回填 + 上限钳制，调度器再兜底 clamp 防越界值直达 EveryHours）。
+    /// 注意 >7h 的后果见上（设计承诺只在 ≤7h 区间成立）
+    #[serde(default = "default_qoder_token_renew_hours")]
+    pub qoder_token_renew_interval_hours: u32,
 }
 
 fn default_api_port() -> u16 {
@@ -333,6 +340,10 @@ fn default_wb_checkin_hhmm() -> String {
 /// Qoder 每日签到调度默认 10:15（F-80 §2.2：10:15 时 0 点签到与 10:00 登录奖励均可领）
 fn default_qoder_checkin_hhmm() -> String {
     "10:15".into()
+}
+/// Qoder 凭证续期默认间隔 6 小时（客户端 token 惰性窗 7h > 6h，过期前必被续上）
+fn default_qoder_token_renew_hours() -> u32 {
+    6
 }
 fn default_qoder_credits_sync_hhmm() -> String {
     "23:40".into()

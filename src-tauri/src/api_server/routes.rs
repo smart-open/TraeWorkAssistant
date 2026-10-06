@@ -1540,11 +1540,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 state.pool.note_error(&picked.uid, ErrKind::Server);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} first-byte timeout(10s)", picked.uid));
-                                // P2 修复：失败尝试记账（与非流式/WB 口径一致）
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0,
-                                );
+                                // 三池统一：每请求一行终态记账（中间态不记，防虚高）——
+                                // 首字超时为换号中间步，usage 由终态路径（成功/池耗尽）
+                                // 统一落一行（审查 P2-4，对齐 qoder_route 聚合口径）
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     504, &picked.uid, start_ts.elapsed().as_millis() as u64,
@@ -1633,9 +1631,18 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} code={} msg={}", win_uid, code, msg));
                             }
-                            if !sent_any {
-                                // 流未开始：错误延迟下发（sse 层未透传，由这里统一发）
-                                send_stream_error(&tx, proto, code, &msg);
+                            // 审查 P2-5：流内错误按「是否已有输出」决策（inline_error_action
+                            // 纯函数，单测锁定口径）
+                            if inline_error_action(sent_any) == InlineErrorAction::RotateAccount {
+                                // 流未开始（首字节前）：错误帧不下发客户端，允许换号重试
+                                //（对齐 wb_route/qoder_route 流式口径）；全部账号失败后
+                                // 由池耗尽终态按协议统一下发错误帧
+                                state.logger.log_request_ttfb(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    200, &win_uid, duration_ms, ttfb_ms, &key_name,
+                                    &state.pool.name_of(&win_uid), Some(&format!("{msg}（首字节前 → 换号重试）")),
+                                );
+                                break; // 退出重试循环 → 换号
                             }
                             state.logger.log_request_ttfb(
                                 "trae", "POST", proto.log_path(), &model, stream,
@@ -1736,11 +1743,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 let preview = safe_slice(&resp_body, 200);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} status={} body={}", picked.uid, status, preview));
-                                // P2 修复：失败尝试记账（与非流式/WB 口径一致）
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0,
-                                );
+                                // 三池统一：每请求一行终态记账（中间态不记，防虚高）——
+                                // 换号为中间步，usage 由终态路径（成功/池耗尽）统一落一行
+                                //（审查 P2-4，对齐 qoder_route 聚合口径）
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,
@@ -1775,6 +1780,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
         // 所有账号不可用
         let duration_ms = start_ts.elapsed().as_millis() as u64;
+        // 记账口径（三池一致）：Err 分支的换号中间态不记（防虚高，审查 P2-4）；
+        // Ok 分支的空完成/流内错误换号会各记一行尝试行 + 池耗尽终态一行——
+        // 即「每请求 N 行尝试/终态记账」，非严格单行；wb/qoder 同构口径
         state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
@@ -2540,6 +2548,26 @@ pub(crate) fn send_stream_error(
     }
 }
 
+/// 流内错误处置决策（审查 P2-5：纯函数，单测锁定口径）：
+/// - 首字节前（!sent_any，收尾帧未发、错误未透传客户端）→ 换号重试，
+///   避免上游瞬断/首字异常直接把失败甩给客户端（对齐 wb/qoder 流式口径）；
+/// - 已有输出（sent_any，错误已随流透传）→ 就地收尾（换号会造成重复流）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineErrorAction {
+    /// 流未开始：丢弃本次尝试，换号重试（不向客户端下发错误帧）
+    RotateAccount,
+    /// 已有数据流出：记日志后就地结束请求
+    FinalizeInline,
+}
+
+fn inline_error_action(sent_any: bool) -> InlineErrorAction {
+    if sent_any {
+        InlineErrorAction::FinalizeInline
+    } else {
+        InlineErrorAction::RotateAccount
+    }
+}
+
 fn now_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2577,6 +2605,16 @@ fn safe_slice(s: &str, n: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== 审查 P2-5：首字节前流内错误 → 换号 ====================
+
+    #[test]
+    fn inline_error_before_first_byte_rotates_account() {
+        // 首字节前（未向客户端发过任何数据）流内错误 → 换号重试，而非直接失败
+        assert_eq!(inline_error_action(false), InlineErrorAction::RotateAccount);
+        // 已有输出（错误已随流透传客户端）→ 就地收尾，不换号（避免重复流）
+        assert_eq!(inline_error_action(true), InlineErrorAction::FinalizeInline);
+    }
 
     // ==================== P2 修复6：safe_slice 字符边界截断 ====================
 

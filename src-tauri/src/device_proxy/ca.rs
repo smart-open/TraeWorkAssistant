@@ -133,6 +133,8 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
     std::fs::create_dir_all(certs_dir).map_err(|e| format!("创建证书目录失败: {e}"))?;
 
     let issuer = if cert_pem_path.exists() && key_pem_path.exists() {
+        // 历史版本可能以默认 0644 落盘 ca.key（审查 P1）：读取前统一收紧到 0600
+        harden_key_permissions(&key_pem_path, certs_dir);
         // 读取前 ACL 自愈（issue #14）：历史版本 harden_ca_dir 的 grant 无 (OI)(CI)
         // 继承标志，目录收紧时已有子文件的继承 ACE 被动态清空成空 DACL——任何进程
         // （含提权 certutil、Windows 证书 UI）都读不了文件。此前的自愈挂在 certutil
@@ -157,6 +159,8 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
             .map_err(|e| format!("写入 ca.crt 失败: {e}"))?;
         std::fs::write(&key_pem_path, generated.key_pem.as_bytes())
             .map_err(|e| format!("写入 ca.key 失败: {e}"))?;
+        // 审查 P1：CA 私钥 0600 落盘（写入后立即收紧，防同机其他用户/低权限进程读取）
+        harden_key_permissions(&key_pem_path, certs_dir);
         std::fs::write(&cer_der_path, generated.cert_der)
             .map_err(|e| format!("写入 ca.cer 失败: {e}"))?;
         harden_ca_dir(certs_dir);
@@ -286,6 +290,28 @@ fn self_heal_acl_if_needed(
         Ok(())
     }
 }
+
+/// ca.key 落盘权限收紧（审查 P1）：unix 以 0600 保护 CA 私钥，防同机其他用户/
+/// 低权限进程读取。仅纵深防御，失败记 app_log warning 不阻断不 panic——CA 读写
+/// 自身绝不能因权限收紧失败而卡死（与 harden_ca_dir 的 fail-open 取舍一致）。
+/// ca.crt/ca.cer 为公开物，权限不动。
+#[cfg(unix)]
+fn harden_key_permissions(key_pem_path: &std::path::Path, certs_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) =
+        std::fs::set_permissions(key_pem_path, std::fs::Permissions::from_mode(0o600))
+    {
+        // certs_dir = data_dir/certs，app_log 需要 data_dir
+        crate::fs_utils::app_log(
+            certs_dir.parent().unwrap_or(certs_dir),
+            &format!("CA 私钥权限收紧为 0600 失败（忽略，仅纵深防御）: {e}"),
+        );
+    }
+}
+
+/// 非 unix（Windows）无 POSIX 权限模型：目录 ACL 由 harden_ca_dir 收口，空实现
+#[cfg(not(unix))]
+fn harden_key_permissions(_key_pem_path: &std::path::Path, _certs_dir: &std::path::Path) {}
 
 /// 收紧 CA 目录 ACL（仅 Windows，尽力而为）：移除继承、仅当前用户完全控制，
 /// 防止同机低权限账户读取 CA 私钥。自验证失败自动 /reset 回滚（fail-open：

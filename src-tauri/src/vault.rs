@@ -304,6 +304,24 @@ pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
     }
 }
 
+/// 豆包代理抓包凭证快照读取（审查 P2 收敛配套）：优先 vault ns `doubao_captured`
+/// （handler.rs 写入点已收敛至此），未命中回退旧 kv `doubao_captured_credentials`
+/// 一次——兼容「应用升级后尚未重启、迁移未执行」场景下读取方仍能拿到快照；
+/// 两处皆无返回 None。历史明文 kv 由 [migrate_ns_on_startup] ④ 迁入 vault 后清空。
+/// 消费方：commands/doubao.rs（read_captured_uid / doubao_captured_credential /
+/// doubao_credential_auto_apply）与 tasks/doubao_chats.rs（detect_uid）共 4 处。
+pub fn doubao_captured_get(data_dir: &Path) -> Option<serde_json::Value> {
+    if let Some(v) = ns_get(data_dir, "doubao_captured", "credentials") {
+        return Some(v);
+    }
+    let v: serde_json::Value = crate::store::db(data_dir).kv_get("doubao_captured_credentials");
+    if v.is_null() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
 // ---------------- 公共 API ----------------
 
 /// vault 打开失败的去重日志标记：读路径调用极频繁，仅首条降级写日志，
@@ -585,6 +603,40 @@ pub fn migrate_ns_on_startup(state: &AppState) {
                     &format!("启动迁移: 豆包凭证入 vault 失败（已落占位，禁止明文）: {e}"),
                 ),
             }
+        }
+    }
+    // ④ 豆包代理抓包凭证（审查 P2：kv `doubao_captured_credentials` 为明文 JSON
+    //    快照，含 session_id/sid_guard/ttwid 会话凭证，违反「凭证只进 vault」红线
+    //    → 迁入 vault ns `doubao_captured` 后清空该 kv）。幂等：kv 缺失/空直接跳过；
+    //    vault 写成功后才删 kv（失败保留，下次启动重试）；读取侧统一走
+    //    [doubao_captured_get]（vault 优先 → 旧 kv 回退一次，兼容未重启场景）。
+    {
+        const KV_KEY: &str = "doubao_captured_credentials";
+        let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get(KV_KEY);
+        if v.is_null() {
+            // 无该行（首次升级/已迁移）：幂等退出
+        } else if v.get("session_id").and_then(|s| s.as_str()).map_or(false, |s| !s.is_empty()) {
+            match ns_set(&state.data_dir, "doubao_captured", "credentials", &v) {
+                Ok(()) => match crate::store::db(&state.data_dir).kv_delete(KV_KEY) {
+                    Ok(()) => fs_utils::app_log(
+                        &state.data_dir,
+                        "启动迁移: 豆包抓包凭证快照已收敛进 vault 并清空明文 kv",
+                    ),
+                    Err(e) => fs_utils::app_log(
+                        &state.data_dir,
+                        &format!(
+                            "启动迁移: 清空豆包抓包凭证明文 kv 失败（vault 已有加密副本，下次启动重试）: {e}"
+                        ),
+                    ),
+                },
+                Err(e) => fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("启动迁移: 豆包抓包凭证入 vault 失败（保留明文 kv 下次重试，禁止丢凭证）: {e}"),
+                ),
+            }
+        } else {
+            // 残留行但无凭证内容（空对象/损坏数据）：直接清理，避免永远空转
+            let _ = crate::store::db(&state.data_dir).kv_delete(KV_KEY);
         }
     }
 }

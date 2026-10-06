@@ -412,14 +412,17 @@ const KNOWN_DAILY_CAMPAIGNS: &[(&str, &str)] = &[
 /// - `200` 其它形态 / 4xx / 5xx（如投放未覆盖 RISK_DEPENDENCY_UNAVAILABLE）
 ///   / 网络异常 → 忽略该条（维持 already 语义，不误报不刷错）
 /// - `401` → auth（中断遍历，走 process_account 的 401 重试自愈）
-/// 返回 None 表示无任何新领取（调用方维持 already）。
+/// 返回 None 表示无任何新领取（调用方维持 already）；Some 第 4 元素为真实新领取
+/// 的逐活动明细（F-80-余 档期日历数据源，与 process_account 的 campaigns_log
+/// 条目同构），401 中断时携带中断前已成功条目（真实入账不丢）。
 fn known_daily_fallback(
     agent: &ureq::Agent,
     headers: &[(String, String)],
-) -> Option<(String, String, Option<f64>)> {
+) -> Option<(String, String, Option<f64>, Vec<Value>)> {
     let mut kind = String::new();
     let mut messages: Vec<String> = Vec::new();
     let mut reward: Option<f64> = None;
+    let mut detail: Vec<Value> = Vec::new();
     for (cid, cname) in KNOWN_DAILY_CAMPAIGNS {
         // 路径安全防线：常量表手滑引入非法字符时拒绝该条（与 claim_one 同白名单）
         if cid.is_empty()
@@ -434,12 +437,8 @@ fn known_daily_fallback(
         jitter_sleep();
         let (status, body, _raw) = post_empty(agent, &url, headers);
         if status == 401 {
-            // auth 中断：已累计的真实奖励不丢弃（对齐 claim_one auth 语义）
-            return Some((
-                "auth".into(),
-                "登录态失效（401）".into(),
-                reward,
-            ));
+            // auth 中断：已累计的真实奖励/明细不丢弃（对齐 claim_one auth 语义）
+            return Some(("auth".into(), "登录态失效（401）".into(), reward, detail));
         }
         let claimed = body
             .as_ref()
@@ -458,13 +457,21 @@ fn known_daily_fallback(
                 .and_then(|v| num_or_none(Some(v)));
             kind = merge_claim_kind(&kind, "success");
             messages.push(format!("{cname}（盲发直领）"));
+            // 逐活动明细（F-80-余 档期日历数据源）：条目结构与 campaigns_log 同构，
+            // 缺失会导致日历该场景无 chips/dots（审查 major 修复）
+            detail.push(json!({
+                "id": cid,
+                "name": cname,
+                "kind": "success",
+                "reward": amt,
+            }));
             if let Some(a) = amt {
                 reward = Some(reward.unwrap_or(0.0) + a);
             }
         }
         // 其余形态（回放/5xx/4xx/网络异常）静默忽略，继续尝试下一条
     }
-    (kind == "success").then(|| (kind, messages.join("；"), reward))
+    (kind == "success").then(|| (kind, messages.join("；"), reward, detail))
 }
 
 /// 处理单账号签到（含 401 刷新一次重试，禁二次刷新）。返回 account 事件（不含 index）。
@@ -527,7 +534,14 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                 // CLAIMABLE 条目（已领 grant 无条件展示）——先盲发已知每日
                 // 活动兜底直领，无新领取才维持 already（幂等语义，非错误）
                 match known_daily_fallback(agent, &headers) {
-                    Some(t) => t,
+                    Some((k, m, r, detail)) => {
+                        // 兜底直领同样计入逐活动明细（F-80-余 档期日历数据源，
+                        // 审查 major 修复：缺失会导致日历主场景无 chips/dots）
+                        if !detail.is_empty() {
+                            campaigns_detail = Some(detail);
+                        }
+                        (k, m, r)
+                    }
                     None => ("already".into(), "无可领活动（均已领取）".into(), None),
                 }
             } else {
@@ -601,13 +615,25 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                         if claimable.is_empty() {
                             // 与首次路径同口径：列表零 CLAIMABLE 先盲发兜底直领
                             match known_daily_fallback(agent, &headers) {
-                                Some(t) => t,
+                                Some((k, m, r, detail)) => {
+                                    // 兜底明细并入 campaigns_detail（保留 401 前已收
+                                    // 部分，与非空分支的 retry_log 合并同口径）
+                                    campaigns_detail = match campaigns_detail.take() {
+                                        Some(mut prev) => {
+                                            prev.extend(detail);
+                                            Some(prev)
+                                        }
+                                        None => (!detail.is_empty()).then_some(detail),
+                                    };
+                                    (k, m, r)
+                                }
                                 None => ("already".into(), "无可领活动（均已领取）".into(), None),
                             }
                         } else {
                             // kind 空串起步（对照首次路径）：全部 claim 失败时应判 fail
                             // 而非误标 already（成功才覆写 success，否则取首个非成功 kind）
                             let mut kind = String::new();
+                            let mut auth_msg = String::new();
                             let mut messages: Vec<String> = Vec::new();
                             let mut reward = None;
                             // 重试路径同样累计逐活动明细（合并进首次已收部分）
@@ -619,6 +645,16 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                                     &["name", "title", "campaignName", "campaign_name"],
                                 ));
                                 let (k, m, r) = claim_one(agent, &headers, &urls, c);
+                                // 401 重发后仍收到 auth：令牌再次失效，盲打剩余活动注定
+                                // 失败——中断遍历（审查 P2，与首次路径 L561-567 同构）。
+                                // kind 直接赋值不经 merge_claim_kind（同首次路径：already
+                                // 等中间值不得吞掉 auth 终态）；auth 条目不入 retry_log
+                                //（契约「auth 中断条目不入明细」），中断前已收条目保留
+                                if k == "auth" {
+                                    kind = "auth".into();
+                                    auth_msg = m;
+                                    break;
+                                }
                                 retry_log.push(json!({
                                     "id": cid,
                                     "name": if cname.is_empty() { cid.clone() } else { cname },
@@ -645,7 +681,13 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                                 }
                                 None => if retry_log.is_empty() { None } else { Some(retry_log) },
                             };
-                            (kind, messages.join("；"), reward)
+                            // auth 中断 message 口径与首次路径同构：仅保留 auth 提示
+                            //（中断前明细/reward 已保留，不再拼接中间活动消息）
+                            if kind == "auth" {
+                                (kind, auth_msg, reward)
+                            } else {
+                                (kind, messages.join("；"), reward)
+                            }
                         }
                     }
                     Err((k, m)) => (k, m, None),
@@ -739,12 +781,33 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
         fs_utils::app_log(&state.data_dir, &format!("Qoder 设备指纹回填失败（继续签到）: {e}"));
     }
     let agent = http_agent(30);
-    let pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
-    let mut accounts: Vec<Value> = pool
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    // 账号池读取（审查 P2 同族修复，对齐 qoder_refresh 口径）：qoder_pool_load 将
+    // rows_all 失败吞为空池，「库损坏/IO 故障」会被误判「无账号」→ done 全 0 被
+    // 调度器 mark_run 当日已跑，签到静默漏打。store API 可区分：Ok(空 rows)=真实
+    // 空池；no such table（表未建，db() 打开时 schema::init 已兜底建表，理论罕见）
+    // 对齐空池语义；其余 Err=读取失败 → 构造 failed=1 的 done 事件：本函数签名返回
+    // Value 无法直接 Err，调度器/CLI 按 failed-empty-permanent>0 判暂态失败冷却重试
+    //（对齐既有失败口径），message 携带真实原因供事件流排障
+    let mut accounts: Vec<Value> = match crate::store::db(&state.data_dir).rows_all("qoder_accounts") {
+        Ok(rows) => rows.into_iter().map(|(_, data)| data).collect(),
+        Err(e) if e.contains("no such table") => Vec::new(),
+        Err(e) => {
+            // 终审补齐：调度器/前端消费方只取 ok/already/failed 计数、丢弃 message——
+            // 不落 app_log 则调度日志只见「1 失败」不见真实原因（对齐 refresh/credits
+            // 同族修复的 Err 语义；本函数签名返回 Value 无法直接 Err）
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("[qoder] 签到轮次中止：账号池读取失败: {e}"),
+            );
+            let done = json!({
+                "type": "done", "ok": 0, "already": 0, "failed": 1,
+                "failed_empty_campaigns": 0, "failed_permanent": 0,
+                "message": format!("账号池读取失败: {e}"),
+            });
+            emit(&done);
+            return done;
+        }
+    };
     if !opts.uids.is_empty() {
         accounts.retain(|a| opts.uids.iter().any(|u| s_of(a.get("id")) == *u));
     }
@@ -946,10 +1009,18 @@ mod tests {
                         }
                     }
                     Some(_) => println!("  <campaigns 空数组>"),
-                    None => println!("  <campaigns 键缺失> head={}", &raw[..raw.len().min(200)]),
+                    // 按字符截断（审查修复）：原字节切片 &raw[..200] 落点多字节
+                    // UTF-8 字符内会 panic；上游错误页常含中文
+                    None => println!(
+                        "  <campaigns 键缺失> head={}",
+                        raw.chars().take(200).collect::<String>()
+                    ),
                 }
             }
-            None => println!("  <非 JSON> {}", &raw[..raw.len().min(300)]),
+            None => println!(
+                "  <非 JSON> {}",
+                raw.chars().take(300).collect::<String>()
+            ),
         }
     }
 
@@ -975,9 +1046,9 @@ mod tests {
                 continue;
             }
             println!(
-                "  stored_uid = {}, token_prefix = {}, machine_id = {}, has_machine_token = {}",
+                "  stored_uid = {}, token_len = {}, machine_id = {}, has_machine_token = {}",
                 creds.uid,
-                &creds.access_token[..creds.access_token.len().min(6)],
+                creds.access_token.len(),
                 creds.machine_id,
                 !creds.machine_token.is_empty(),
             );

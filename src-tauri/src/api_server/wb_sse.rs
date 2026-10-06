@@ -318,8 +318,22 @@ pub fn stream_forward_ex(
                 if !has_content {
                     // 空完成（影子风控/上游异常）：不发任何收尾帧，以哨兵错误上抛
                     // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）。
-                    // 注：Responses 协议若已发 created（空 delta chunk 触发），换号
-                    // 重试会重复 created——影子风控场景上游通常零 chunk，属可接受边界
+                    // 审查 P2-9：Responses 协议若已发 created（空 delta chunk 触发
+                    // resp_created 置位），哨兵上抛前补发 response.failed 收尾——
+                    // Codex 等客户端在 created 后等待终态事件，悬空流会一直等待；
+                    // error.code=empty_completion 保留哨兵语义（调用方仍按空完成
+                    // 换号重试，返回元组的 sent_any/failed_inline 语义不变）
+                    if resp_created {
+                        let mut resp = responses_object(chat_id, model, "failed", vec![], None);
+                        resp["error"] = json!({
+                            "code": "empty_completion",
+                            "message": super::EMPTY_COMPLETION_MSG,
+                        });
+                        resp_send(tx, "response.failed", json!({
+                            "type": "response.failed",
+                            "response": resp,
+                        }));
+                    }
                     error_info = Some((
                         super::EMPTY_COMPLETION_CODE,
                         super::EMPTY_COMPLETION_MSG.to_string(),
@@ -701,8 +715,23 @@ pub fn stream_forward_ex(
     // （故障转移，或流内失败已收尾）
 
     // 空完成兜底（issue #57）：EOF 且零内容零错误、客户端仍在线 → 哨兵上抛
-    // （原样收尾会让客户端收到 "empty provider response"）
+    // （原样收尾会让客户端收到 "empty provider response"）。
+    // 终审补齐（P2-9 同构）：resp_created 已置位（空 delta/usage chunk 触发）时
+    // 与 Done 分支对称地补发 response.failed——EOF 断流同属「created 后悬空」
+    // 场景（qoder_route 证实 EOF 零完成真实存在，非理论不可达），补发后仍上抛
+    // 哨兵交调用方换号重试，sent_any/failed_inline 语义不变
     if error_info.is_none() && !has_content && !failed_inline && !tx.is_closed() {
+        if resp_created {
+            let mut resp = responses_object(chat_id, model, "failed", vec![], None);
+            resp["error"] = json!({
+                "code": "empty_completion",
+                "message": super::EMPTY_COMPLETION_MSG,
+            });
+            resp_send(tx, "response.failed", json!({
+                "type": "response.failed",
+                "response": resp,
+            }));
+        }
         error_info = Some((
             super::EMPTY_COMPLETION_CODE,
             super::EMPTY_COMPLETION_MSG.to_string(),
@@ -997,6 +1026,48 @@ mod tests {
             "活跃流断连应立即终止，实测 {:?}",
             start.elapsed()
         );
+    }
+
+    /// 审查 P2-9：Responses 协议空完成——created 已发（空 delta chunk 触发）时，
+    /// 哨兵上抛前补发 response.failed 收尾帧（客户端不再悬空等待终态事件）；
+    /// 哨兵语义不变：error_info 仍上抛空完成错误驱动调用方换号，failed_inline
+    /// 不置位（未按「失败已透传终态」处理）
+    #[test]
+    fn stream_forward_responses_empty_completion_after_created_sends_failed_frame() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = lines(&[
+            // 空 delta chunk：触发 created 占位帧（不计入 has_content）
+            "data: {\"choices\":[{\"delta\":{}}]}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (error_info, sent_any, failed_inline, _usage) = stream_forward_ex(
+            src,
+            &tx,
+            crate::api_server::routes::Protocol::Responses,
+            "chat-1",
+            "m",
+        );
+        assert_eq!(
+            error_info,
+            Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                crate::api_server::EMPTY_COMPLETION_MSG.to_string()
+            ))
+        );
+        assert!(sent_any, "created 已下发");
+        assert!(!failed_inline);
+        drop(tx); // 关闭通道后收集全部下发帧
+        let mut body = String::new();
+        while let Some(Ok(b)) = rx.try_recv().ok() {
+            body.push_str(&String::from_utf8_lossy(&b));
+        }
+        assert!(body.contains("event: response.created"));
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("empty_completion"));
+        // 空完成不得伪装成正常完成
+        assert!(!body.contains("response.completed"));
     }
 
     #[test]

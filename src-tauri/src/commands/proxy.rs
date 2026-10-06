@@ -546,7 +546,33 @@ pub(crate) fn cleanup_stale_local_proxy(state: &AppState) {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+/// mac 版直开前防御（P1 审查修复，与上方 Windows 版同语义）：应用异常退出可能
+/// 未还原系统代理——若系统代理仍指向本机「我们上次使用的端口」，提前清除，
+/// 避免 Trae 直开时全部请求 ERR_CONNECTION_RESET。只匹配写盘记录的端口
+/// （127.0.0.1 + last_proxy_port.txt，读取方式与 Windows 版完全一致）。
+/// 本轮审查修复：清除原语改 clear_stale_local_proxy_port（逐服务精确命中
+/// 「web 代理 = 127.0.0.1:port」才 off）——原直调 clear_win_proxy 会对全部
+/// 网络服务逐个 off，把用户 VPN 代理（配置在其他网络服务上的 Clash 等）一并
+/// 清掉，违反本函数「不误伤用户自己的 VPN 本地代理」承诺。
+#[cfg(target_os = "macos")]
+pub(crate) fn cleanup_stale_local_proxy(state: &AppState) {
+    let last_port = std::fs::read_to_string(state.data_dir.join("last_proxy_port.txt"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok());
+    let Some(port) = last_port else { return };
+    match crate::platform::proxy_ctl::clear_stale_local_proxy_port(port) {
+        Ok(0) => {
+            // 无命中（代理已还原 / 指向他物 = 用户自己的代理）——静默
+        }
+        Ok(n) => fs_utils::app_log(
+            &state.data_dir,
+            &format!("已清理指向已停止本地代理的残留系统代理(127.0.0.1:{port}，{n} 个网络服务)"),
+        ),
+        Err(e) => fs_utils::app_log(&state.data_dir, &format!("清理残留系统代理失败: {e}")),
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub(crate) fn cleanup_stale_local_proxy(_state: &AppState) {}
 
 /// 通知 WinINet 代理设置已变更，让运行中的进程立即生效

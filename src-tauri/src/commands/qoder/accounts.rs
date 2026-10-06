@@ -365,7 +365,37 @@ pub async fn qoder_account_refresh_token(
             return Err(format!("账号不在池中: {account_id}"));
         }
         let agent = crate::tasks::http_agent(30);
-        let (creds, _did, note) = qoder_common::ensure_fresh(&st, &agent, &account_id, i64::MAX);
+        // 跨进程互斥（审查 P2，对齐 qoder_checkin/refresh 的 CrossProcLock 模式）：
+        // 手动续期 ensure_fresh(i64::MAX) 恒走刷新通道，若 schtasks CLI/调度器进程
+        // 正在刷新同账号，双进程并发以同一 refresh_token 发起刷新——服务端一次性
+        // 轮换下后到者误标 needs_relogin。**scope 必须与 qoder-refresh 任务一致
+        // （"refresh"）**——终审修复：原 "refresh-account" 与任务锁不同名互不互斥，
+        // 注释声称的防护场景实际未防住。短暂等待（2s）后仍取不到锁则友好报错，
+        // 不触碰账号状态；guard RAII 且作用域收窄到 ensure_fresh——返回即释放，
+        // 不覆盖其后的池回写/回读路径
+        let (creds, _did, note) = {
+            let (_cross, lock_fail) =
+                qoder_common::CrossProcLock::try_acquire(&st.data_dir, "refresh", 2_000);
+            let Some(_cross) = _cross else {
+                let reason = lock_fail.as_ref().map(|f| f.describe()).unwrap_or_default();
+                fs_utils::app_log(
+                    &st.data_dir,
+                    &format!("[qoder] 手动续期未执行（{reason}）: {account_id}"),
+                );
+                // 文案按失败类型区分：Busy=他方占用；CreateFailed/WaitFailed=机制故障
+                //（对齐 qoder_refresh.rs 的 P3 文案分类修复）
+                let busy = matches!(
+                    lock_fail.as_ref(),
+                    Some(qoder_common::CrossProcLockFail::Busy)
+                );
+                return Err(if busy {
+                    "另一进程正在续期该账号，请稍后重试".to_string()
+                } else {
+                    format!("续期保护锁不可用（{reason}），请稍后重试")
+                });
+            };
+            qoder_common::ensure_fresh(&st, &agent, &account_id, i64::MAX)
+        };
         match note {
             // 成功路径（本次刷新 / 本已新鲜被复用）→ 回读最新视图
             "refreshed" | "fresh" => {

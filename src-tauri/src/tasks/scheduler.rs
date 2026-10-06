@@ -75,8 +75,9 @@ const TASKS: &[SchedTask] = &[
     SchedTask { key: "trae-credits-snapshot", name: "Trae 积分数据同步", hhmm: "23:40", kind: "credits" },
     // F-80 Qoder 积分快照：每日 HH:MM（settings.qoder_credits_sync_hhmm 可改，开关独立）
     SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分快照", hhmm: "23:40", kind: "fix" },
-    // F-80 Qoder 凭证 6h 兜底刷新（kind "refresh" → EveryHours(6)；hhmm 不参与判定）。
-    // 空池空转；开关独立（settings.qoder_token_renew_enabled，默认开，环境配置页可关）
+    // F-80 Qoder 凭证兜底刷新（kind "refresh" → EveryHours(间隔可配)；hhmm 不参与判定）。
+    // 空池空转；开关/间隔独立（settings.qoder_token_renew_enabled /
+    // qoder_token_renew_interval_hours，默认开/6h，环境配置页可改）
     SchedTask { key: "qoder-refresh", name: "Qoder 凭证定时刷新", hhmm: "06:00", kind: "refresh" },
     // 模型同步（每日 HH:MM，默认开；无账号时静默跳过不计失败，对齐 models-sync 惯例）
     SchedTask { key: "trae-models-sync", name: "Trae 模型列表同步", hhmm: "05:40", kind: "models" },
@@ -103,9 +104,9 @@ pub fn start(app: AppHandle) {
 const RETRY_COOLDOWN_MS: i64 = 30 * 60_000;
 /// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走 30 分钟冷却，不受此门限制）
 const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
-/// qoder-refresh 档位：每 6 小时兜底刷新一次凭证（设计 v1.3 §M4；
-/// 客户端 token 惰性窗 7h > 6h 调度间隔，任一 tick 必落窗内，确保过期令牌被续）
-const REFRESH_INTERVAL_HOURS: i64 = 6;
+/// qoder-refresh 档位（默认 6 小时）说明：客户端 token 惰性窗 7h，间隔 ≤7h 即可
+/// 确保过期令牌在窗口内被续上；真实缺省值在 models.rs serde default
+/// （settings.qoder_token_renew_interval_hours，环境配置页可改 1~24h）
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
@@ -138,8 +139,12 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
     match t.kind {
         // 看板数据同步：hourly 按小时节流，daily（含非法值回退）按每日时刻
         "credits" if credits_sync_mode(st, t.key) == "hourly" => SchedPlan::Hourly,
-        // Qoder 凭证兜底刷新：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_token_renew_enabled）
-        "refresh" => SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS),
+        // Qoder 凭证兜底刷新：每 N 小时（间隔 settings.qoder_token_renew_interval_hours
+        // 可配，环境配置页；state 加载已 clamp 1~24，此处 max(1) 兜底防越界值直达）
+        "refresh" => {
+            let hours = (st.settings().qoder_token_renew_interval_hours.max(1)) as i64;
+            SchedPlan::EveryHours(hours)
+        }
         _ => SchedPlan::Daily(effective_hhmm(st, t)),
     }
 }

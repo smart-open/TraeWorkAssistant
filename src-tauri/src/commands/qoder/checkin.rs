@@ -1,5 +1,10 @@
 //! Qoder 签到域（F-80 M1，对照 commands/workbuddy/checkin.rs 模式）：
-//! 签到（NDJSON 管线）/ 签到结果 / 每日定时任务（schtasks 双轨）/ 启动自动补签。
+//! 签到（NDJSON 管线）/ 签到结果 / 启动自动补签。
+//!
+//! 每日定时统一由应用内 Rust 调度器（tasks/scheduler.rs，60s tick + 当日幂等 +
+//! 启动补跑）驱动，全平台一致；2026-10-05 起移除 Windows schtasks 双轨命令
+//! （qoder_checkin_task_register/status/unregister）——原双轨与调度器重复维护
+//! 时刻口径，且 mac 无对应物；时刻修改统一走 settings.qoder_checkin_hhmm。
 
 use serde::Serialize;
 use serde_json::Value;
@@ -125,156 +130,6 @@ pub fn qoder_checkin_results(
     }
     out.reverse(); // 新→旧
     Ok(out)
-}
-
-// ── 每日签到定时任务（schtasks 双轨；对照 wb_checkin_task_register）─────────
-// 【跨平台审查 2026-10-03】macOS 适配预留：本节为 Windows 专属调度兜底
-// （schtasks /Create /Query /Delete + cmd 启动器）。macOS 等价物 = launchd
-// LaunchAgent（~/Library/LaunchAgents/<label>.plist + launchctl load/unload），
-// 建议按「注册/查询/卸载」三命令同签名收敛：commands 层按 cfg 分平台调度到
-// schtasks 或 launchd 实现，任务名前缀常量跨平台共用（LaunchAgent label 用同值）；
-// build_qoder_task_tr 的 cmd /c 启动器为 Windows 特有，macOS plist 里直接
-// ProgramArguments 数组调用主 exe + --task-run 参数即可（环境变量用
-// EnvironmentVariables 键替代 AIWORKDATA_DIR set）。应用内 in-app 调度器
-// （tasks/scheduler.rs）本身跨平台，关掉 schtasks 双轨不丢签到能力。
-// 检索标记：`macOS 适配预留`
-
-const QODER_CHECKIN_TASK_PREFIX: &str = "AIWorkAssistant_QoderCheckin";
-
-fn build_qoder_task_tr(state: &AppState, task: &str) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
-    let data_dir = state.data_dir.to_string_lossy().to_string();
-    Ok(format!(
-        "cmd /c set \"AIWORKDATA_DIR={}\" && \"{}\" --task-run {}",
-        data_dir,
-        exe.to_string_lossy(),
-        task
-    ))
-}
-
-fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
-    crate::commands::misc::run_schtasks(args)
-}
-
-/// 枚举当前用户可见的计划任务名（列序不跨机固定，扫描各行 TaskName 字段；
-/// 与 commands/workbuddy/checkin.rs::parse_task_names_from_csv 同款解析，独立副本避免跨域耦合）
-fn parse_task_names_from_csv(stdout: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in stdout.lines() {
-        for field in line.split(',') {
-            let f = field.trim().trim_matches('"');
-            let Some(name) = f.strip_prefix('\\') else { continue };
-            let name = name.rsplit('\\').next().unwrap_or(name);
-            if !name.is_empty() {
-                out.push(name.to_string());
-            }
-        }
-    }
-    out
-}
-
-fn qoder_checkin_task_names() -> Vec<String> {
-    let prefix = format!("{QODER_CHECKIN_TASK_PREFIX}_");
-    match run_schtasks(&["/Query", "/FO", "CSV", "/NH"]) {
-        Ok((_, stdout, _)) => parse_task_names_from_csv(&stdout)
-            .into_iter()
-            .filter(|n| n.starts_with(&prefix))
-            .collect(),
-        Err(_) => vec![],
-    }
-}
-
-/// 删除单个计划任务：run_schtasks 三态归一为 Result（Ok(true)=成功；
-/// Ok(false) 取 stderr，Err 透传）——替代原 `let _ = run_schtasks(...)` 静默吞错
-fn delete_task_checked(name: &str) -> Result<(), String> {
-    match run_schtasks(&["/Delete", "/TN", name, "/F"]) {
-        Ok((true, _, _)) => Ok(()),
-        Ok((false, _, stderr)) => {
-            let msg = stderr.trim().to_string();
-            Err(if msg.is_empty() { "schtasks 返回失败".into() } else { msg })
-        }
-        Err(e) => Err(e),
-    }
-}
-
-#[tauri::command(async)]
-pub fn qoder_checkin_task_register(state: State<AppState>, times: Vec<String>) -> Result<(), String> {
-    crate::commands::misc::schtasks_gate()?;
-    if times.is_empty() {
-        return Err("至少需要一个触发时间（如 10:15）".into());
-    }
-    for t in &times {
-        crate::commands::misc::validate_hhmm(t)?;
-    }
-    let tr = build_qoder_task_tr(&state, "qoder-checkin")?;
-    // 先建后删：/Create /F 直接覆盖同名旧任务，全部创建成功后再清理不在新集合内的
-    // 旧任务——原实现先删后建，创建中途失败会导致旧调度已被删除（定时签到整体丢失）
-    let mut new_names: Vec<String> = Vec::with_capacity(times.len());
-    for t in &times {
-        let hhmm = t.replace(':', "");
-        let name = format!("{QODER_CHECKIN_TASK_PREFIX}_{hhmm}");
-        let (ok, _, stderr) =
-            run_schtasks(&["/Create", "/TN", &name, "/TR", &tr, "/SC", "DAILY", "/ST", t, "/F"])?;
-        if !ok {
-            // 先建后删流：此处失败时旧任务尚未清理，仍按原时间正常触发
-            return Err(format!(
-                "注册任务 {t} 失败: {}（原任务未被改动，仍按原时间正常触发；可重试本操作）",
-                stderr.trim()
-            ));
-        }
-        new_names.push(name);
-    }
-    for name in qoder_checkin_task_names() {
-        if !new_names.contains(&name) {
-            if let Err(e) = delete_task_checked(&name) {
-                fs_utils::app_log(&state.data_dir, &format!("清理旧签到任务 {name} 失败: {e}"));
-                return Err(format!(
-                    "新任务已注册成功，但清理旧任务 {name} 失败（残留任务会重复触发签到）: {e}"
-                ));
-            }
-        }
-    }
-    fs_utils::app_log(
-        &state.data_dir,
-        &format!("Qoder 每日签到定时任务已注册: {}", times.join(" / ")),
-    );
-    Ok(())
-}
-
-#[tauri::command(async)]
-pub fn qoder_checkin_task_status() -> Result<Vec<String>, String> {
-    crate::commands::misc::schtasks_gate()?;
-    let prefix = format!("{QODER_CHECKIN_TASK_PREFIX}_");
-    // I15：register 侧存的是 replace(':',"") 后的 4 位数字任务名（如 1015），
-    // 需还原为 HH:MM；通用 '_'→':' 替换对其恒 no-op，前端会显示成 1015
-    Ok(qoder_checkin_task_names()
-        .iter()
-        .map(|name| match name.strip_prefix(&prefix) {
-            Some(d) if d.len() == 4 && d.chars().all(|c| c.is_ascii_digit()) => {
-                format!("{}:{}", &d[..2], &d[2..])
-            }
-            _ => name.trim_start_matches(&prefix).to_string(),
-        })
-        .collect())
-}
-
-#[tauri::command(async)]
-pub fn qoder_checkin_task_unregister(state: State<AppState>) -> Result<(), String> {
-    crate::commands::misc::schtasks_gate()?;
-    // 删除失败如实反馈（残留任务会继续触发签到），全部成功才记「已注销」；
-    // 原实现 `let _ =` 静默吞错，用户以为已注销实际任务仍在跑
-    let mut failed: Vec<String> = Vec::new();
-    for name in qoder_checkin_task_names() {
-        if let Err(e) = delete_task_checked(&name) {
-            fs_utils::app_log(&state.data_dir, &format!("注销签到任务 {name} 失败: {e}"));
-            failed.push(format!("{name}: {e}"));
-        }
-    }
-    if !failed.is_empty() {
-        return Err(format!("部分签到任务注销失败: {}", failed.join("；")));
-    }
-    fs_utils::app_log(&state.data_dir, "Qoder 每日签到定时任务已注销");
-    Ok(())
 }
 
 // ── 启动自动补签（F-55 模式；main.rs setup 调用）───────────────────────────

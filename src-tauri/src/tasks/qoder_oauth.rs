@@ -140,13 +140,13 @@ pub fn parse_poll_success(body: &Value, expected_nonce: &str) -> Option<(QoderCr
         .and_then(|v| {
             v.as_i64().or_else(|| v.as_str()?.trim().parse::<i64>().ok())
         })
-        .map(|e| now_ms + qoder_common::normalize_expires_in(e));
+        .map(|e| now_ms.saturating_add(qoder_common::normalize_expires_in(e)));
     let refresh_expires_at_ms = fs_utils::dig(
         body,
         &["refresh_token_expires_in", "refreshTokenExpiresIn"],
     )
     .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse::<i64>().ok()))
-    .map(|e| now_ms + qoder_common::normalize_expires_in(e));
+    .map(|e| now_ms.saturating_add(qoder_common::normalize_expires_in(e)));
     let refresh_token = fs_utils::dig(body, &["refresh_token", "refreshToken"])
         .and_then(Value::as_str)
         .unwrap_or("")

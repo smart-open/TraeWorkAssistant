@@ -404,7 +404,8 @@ pub fn detect_uid(state: &AppState) -> Value {
     let mut cap_uid: Option<String> = None;
     let mut cap_ts: f64 = 0.0;
     {
-        let c: Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+        // 凭证只进 vault（审查 P2 收敛）：优先 vault ns，兼容回退旧 kv 一次
+        let c = crate::vault::doubao_captured_get(&state.data_dir).unwrap_or(Value::Null);
         if !c.is_null() {
         let u = c.get("uid").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let ts = c.get("captured_at").and_then(Value::as_str).unwrap_or("").trim().to_string();

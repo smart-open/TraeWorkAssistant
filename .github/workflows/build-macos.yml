@@ -150,3 +150,34 @@ jobs:
             release/mac/*.dmg
             release/mac/latest.json
           if-no-files-found: error
+
+  # 审查 P2：三个并行构建 job 各自上传仅含本架构 dmg 键的 latest.json，人工汇总易漏
+  # 合并 → 另一架构 updater fail-closed（清单缺对应资产键即拒绝更新）。本 job 自动
+  # 下载三个 artifact、取 assets 键并集生成合并清单。⚠️ 该清单仅含 mac 三架构 dmg 键，
+  # 是 mac 侧基础清单——发布前必须再与 Windows exe/msi/zip 键合并后整体上传，
+  # 否则 Windows 用户自动更新会被 updater fail-closed 拒绝（build-windows.yml 不产清单）。
+  merge-manifests:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      # merge-multiple 保持默认 false：各 artifact 落独立子目录，防同名 latest.json 相互覆盖
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ai-work-assistant-macos-*
+          path: artifacts
+
+      - name: Merge latest.json（三架构 assets 键并集，复用 rename_release.mjs 键归一契约）
+        run: node scripts/rename_release.mjs --merge-manifests artifacts/*/latest.json
+        env:
+          RELEASE_OUT_DIR: release/mac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-work-assistant-macos-manifest
+          path: release/mac/latest.json
+          if-no-files-found: error

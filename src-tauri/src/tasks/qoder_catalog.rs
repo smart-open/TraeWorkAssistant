@@ -26,6 +26,26 @@ fn model_list_url() -> String {
 
 /// 调度器/CLI 共用入口：CN 区模型目录同步
 pub fn run_task(state: &AppState) -> Result<Value, String> {
+    // 跨进程互斥（审查 P2，对齐 qoder_checkin/refresh 同款 CrossProcLock 模式）：
+    // 调度器与 schtasks CLI 双进程同刻跑目录同步时，逐账号 ensure_fresh 会以同一
+    // refresh_token 并发刷新（服务端一次性轮换下后到者误标 needs_relogin）。
+    // guard RAII 持有至本轮结束（函数返回即释放）；抢锁失败本轮整体幂等跳过——
+    // 目录同步可日后再跑，正常返回不报错、不触碰目录缓存；失败原因落日志区分
+    // 「他方占用」与「锁机制不可用」（2026-10-04 锁名 err=3 误报教训）
+    let (_cross, lock_fail) =
+        qoder_common::CrossProcLock::try_acquire(&state.data_dir, "catalog", 3_000);
+    let Some(_cross) = _cross else {
+        let reason = lock_fail.as_ref().map(|f| f.describe()).unwrap_or_default();
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] Qoder 目录同步未执行（{reason}），本轮幂等跳过"),
+        );
+        return Ok(json!({
+            "ok": true,
+            "skipped": format!("{reason}，本轮幂等跳过"),
+            "skipped_busy": true,
+        }));
+    };
     let accounts = crate::commands::qoder::load_pool(state);
     if accounts.is_empty() {
         return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号" }));

@@ -219,7 +219,7 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
 #[cfg(target_os = "macos")]
 fn bundles_for_app(app_kind: &str) -> Vec<&'static str> {
     match app_kind {
-        "TraeWork" => vec!["TRAE SOLO CN", "TRAE SOLO"],
+        "TraeWork" => vec!["TRAE SOLO CN", "TRAE SOLO", "Trae"], // "Trae"：旧形态 Trae.app（与 switcher/profile.rs TraeWork proc_names 对齐，审查 P2）
         "Trae" => vec!["Trae CN"],
         "Doubao" => vec!["Doubao"],
         "WorkBuddy" => vec!["WorkBuddy"],

@@ -162,7 +162,8 @@ impl ApiLogger {
         let m = (local_ts % 3600) / 60;
         let s = local_ts % 60;
 
-        let uid_short = &uid[..uid.len().min(12)];
+        // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
+        let uid_short: String = uid.chars().take(12).collect();
         let ttfb_part = match ttfb_ms {
             Some(t) => format!(" ttfb={t}ms"),
             None => String::new(),
@@ -217,7 +218,8 @@ impl ApiLogger {
         let m = (local_ts % 3600) / 60;
         let s = local_ts % 60;
 
-        let uid_short = &uid[..uid.len().min(12)];
+        // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
+        let uid_short: String = uid.chars().take(12).collect();
         let mut lines = Vec::new();
         lines.push(format!(
             "[{:02}:{:02}:{:02}] [DEBUG] uid={} status={}",
@@ -256,10 +258,27 @@ impl ApiLogger {
         self.enqueue(data);
     }
 
+    /// 日期白名单校验（审查 P2-7）：恰 10 字节、第 5/8 字节为 b'-'、其余 ASCII
+    /// 数字（YYYY-MM-DD 形态）。防路径注入（date 拼进文件名）——不合法一律拒绝，
+    /// 上层按「无日志」处理
+    fn is_valid_log_date(date: &str) -> bool {
+        let b = date.as_bytes();
+        b.len() == 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    }
+
     /// 读取指定日期的日志文件内容（按时间倒序排列）
     pub fn read_log(&self, date: &str) -> Option<String> {
         self.flush_pending();
-        // date 格式: "2026-08-14"
+        // 审查 P2-7：date 白名单校验后才拼进文件路径，防路径注入；
+        // 不合法按「无日志」处理
+        if !Self::is_valid_log_date(date) {
+            return None;
+        }
         let path = self.dir.join(format!("api_{}.log", date));
         match fs::read(&path) {
             Ok(bytes) => {
@@ -568,6 +587,22 @@ fn reverse_log_blocks(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== 审查 P2-7：read_log 日期白名单 ====================
+
+    #[test]
+    fn log_date_whitelist() {
+        // 合法：YYYY-MM-DD 形态
+        assert!(ApiLogger::is_valid_log_date("2026-08-14"));
+        // 非法：分隔符错位 / 非 10 字节 / 非数字分隔符混入 / 路径注入
+        assert!(!ApiLogger::is_valid_log_date("2026-8-14"));
+        assert!(!ApiLogger::is_valid_log_date("20260814"));
+        assert!(!ApiLogger::is_valid_log_date("2026/08/14"));
+        assert!(!ApiLogger::is_valid_log_date("2026-08-1a"));
+        assert!(!ApiLogger::is_valid_log_date("../etc/passwd"));
+        assert!(!ApiLogger::is_valid_log_date(""));
+        assert!(!ApiLogger::is_valid_log_date("2026-08-141"));
+    }
 
     fn today() -> String {
         let now = Local::now();

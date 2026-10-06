@@ -362,11 +362,15 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             ],
             cb_global_storage_dir: None,
             icube_items: super::icube::QODER_IDE_ITEMS,
-            // mac_supported 维持灰度（切换/快照恢复管线未实测放开）；数据目录与
-            // bundle id 已本机实测补录（2026-10-05）：mac_data_dir_guess 经 IDE 编译
-            // 产物 userData 解析函数（join(Application Support, nameShort="QoderCN")）
-            // 与 Work 数据目录实存双向证实
-            mac_supported: false,
+            // macOS 放开（2026-10-05 本机实测 + 真机实装）：数据目录
+            // ~/Library/Application Support/QoderCN 实存（machineid/Preferences/
+            // Local State/Local Storage/leveldb/Cookies/SharedClientCache/cache/id
+            // 与 QODER_IDE_ITEMS+ICUBE_ITEMS_MAC 白名单对齐；User/globalStorage
+            // 登录态在未登录机器不存在，快照按存在性自然跳过）。IDE/Work 映像名
+            // 同为 "Qoder CFBundleExecutable"，proc.rs mac 主进程匹配按
+            // /<proc_name>.app/Contents/MacOS/ 路径段区分（Qoder CN IDE.app vs
+            // Qoder CN.app），互不串台；启动走 bundle 定位链（mac_bundle_ids 已实测）
+            mac_supported: true,
             mac_data_dir_guess: Some("~/Library/Application Support/QoderCN"),
             mac_bundle_ids: &["com.aliyun.lingma.ide"],
         },
@@ -396,10 +400,13 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             ],
             cb_global_storage_dir: None,
             icube_items: &[],
-            // mac_supported 维持灰度（切换/快照恢复管线未实测放开）；数据目录已本机
-            // 实测证实（2026-10-05：~/Library/Application Support/com.qodercn.app.stable
-            // 实存，根级 Cookies/Local State 布局），bundle id 实测补录
-            mac_supported: false,
+            // macOS 放开（2026-10-05 本机实测）：数据目录
+            // ~/Library/Application Support/com.qodercn.app.stable 实存（根级
+            // Cookies/Local State/auth.v1.dat——auth.v1.dat 为登录真源，electron_root
+            // 白名单含 ROOT_ITEMS 9 项 + AUTH_FILES 三件套，mac 未命中项存在性跳过）。
+            // electron_root 快照管线纯文件拷贝跨平台同构；Work L2 守卫 =
+            // ide_store::scan_work_login_uid（mac Keychain 链路 2026-10-05 实装）
+            mac_supported: true,
             mac_data_dir_guess: Some("~/Library/Application Support/com.qodercn.app.stable"),
             mac_bundle_ids: &["com.qodercn.app"],
         },

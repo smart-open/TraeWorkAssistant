@@ -720,8 +720,18 @@ fn try_capture_doubao_credentials(ctx: &ProxyCtx, host: &str, req_headers: &[(St
         return;
     }
     *cache = Some(captured.clone());
-    // SQLite 化（P3）：凭证快照 → kv `doubao_captured_credentials`
-    let _ = crate::store::db(&ctx.data_dir).kv_set("doubao_captured_credentials", &captured);
+    // 凭证只进 vault（审查 P2 红线：session_id/sid_guard/ttwid 属会话凭证，
+    // 不得明文落 kv）——快照写入 vault ns `doubao_captured`，读取方统一走
+    // vault::doubao_captured_get（vault 优先 → 旧 kv 回退一次）；历史 kv 明文行
+    // 由 vault::migrate_ns_on_startup 启动时收敛进 vault 并清空。
+    // vault 写失败仅记日志放弃本次持久化（内存 cache 仍在），绝不回退明文落盘。
+    if let Err(e) = crate::vault::ns_set(&ctx.data_dir, "doubao_captured", "credentials", &captured) {
+        ctx.log.log(&format!("  [doubao] 凭证快照写入 vault 失败（本次不落盘）: {e}"));
+        // 终审修复：vault 系统性故障时若保留内存 cache，identical 短路会让后续
+        // 相同凭证的抓包永不重试落盘，重启后凭证彻底丢失——回滚 cache 为 None，
+        // 下次抓包自然重写（内存 cache 只是加速层，持久化失败即视为「未捕获」）
+        *cache = None;
+    }
     ctx.log.log(&format!(
         "  [doubao] 抓到会话凭证: sessionid={} 字符{}{}{}",
         session_id.len(),

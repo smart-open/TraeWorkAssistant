@@ -645,9 +645,10 @@ fn detect_uid_from_local_storage(state: &State<AppState>) -> Option<String> {
 }
 
 /// 从代理抓包凭证读 uid（代理 MITM 层解析 multi_sids 得到；None = 未抓到/旧格式无此字段）。
-/// SQLite 化（P3）：kv `doubao_captured_credentials`。
+/// 凭证只进 vault（审查 P2 收敛）：经 vault::doubao_captured_get 优先读 vault ns，
+/// 兼容回退旧 kv 一次。
 fn read_captured_uid(state: &State<AppState>) -> Option<String> {
-    let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+    let v = crate::vault::doubao_captured_get(&state.data_dir).unwrap_or(serde_json::Value::Null);
     let uid = v.get("uid")?.as_str()?.trim().to_string();
     (!uid.is_empty()).then_some(uid)
 }
@@ -1027,8 +1028,8 @@ pub struct DoubaoCapturedCredential {
 
 #[tauri::command]
 pub fn doubao_captured_credential(state: State<AppState>) -> Result<Option<DoubaoCapturedCredential>, String> {
-    // SQLite 化（P3）：kv `doubao_captured_credentials`
-    let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+    // 凭证只进 vault（审查 P2 收敛）：优先 vault ns，兼容回退旧 kv 一次
+    let v = crate::vault::doubao_captured_get(&state.data_dir).unwrap_or(serde_json::Value::Null);
     if v.is_null() {
         return Ok(None);
     }
@@ -1170,8 +1171,8 @@ pub fn doubao_account_get_credential(
 /// 返回 Some(说明) = 本次发生了写入（前端据此提示并刷新）；None = 无凭证/无 uid/未入池/内容未变。
 #[tauri::command]
 pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<String>, String> {
-    // 读最新抓包凭证（SQLite 化 P3：kv `doubao_captured_credentials`）
-    let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+    // 读最新抓包凭证（凭证只进 vault，审查 P2 收敛：优先 vault ns，兼容回退旧 kv 一次）
+    let v = crate::vault::doubao_captured_get(&state.data_dir).unwrap_or(serde_json::Value::Null);
     if v.is_null() {
         return Ok(None);
     }

@@ -36,12 +36,16 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
         // 锁创建失败时误导 CLI/--task-run 输出与日志矛盾
         return Ok(json!({ "ok": true, "skipped": format!("{reason}，本轮幂等跳过"), "skipped_busy": true }));
     };
-    let pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
-    let accounts: Vec<Value> = pool
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    // 账号池读取（审查 P2 同族修复）：qoder_pool_load 将 rows_all 失败吞为空池，
+    // 「库损坏/IO 故障」会被误判「无账号」→ Ok 空转被调度器 mark_run，6h 兜底刷新
+    // 静默缺席。store API 可区分：Ok(空 rows)=真实空池；no such table（表未建，
+    // db() 打开时 schema::init 已兜底建表，理论罕见）对齐空池语义；其余 Err=读取
+    // 失败返 Err 暂态交调度器 30 分钟冷却重试
+    let accounts: Vec<Value> = match crate::store::db(&state.data_dir).rows_all("qoder_accounts") {
+        Ok(rows) => rows.into_iter().map(|(_, data)| data).collect(),
+        Err(e) if e.contains("no such table") => Vec::new(),
+        Err(e) => return Err(format!("Qoder 账号池读取失败: {e}")),
+    };
     if accounts.is_empty() {
         return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号" }));
     }

@@ -325,7 +325,11 @@ function TaskConfigCard({
           <span className="mt-1 block text-xs text-slate-400">剩余有效期低于该值才触发刷新（默认 24）</span>
         </label>
       </div>
-      <div className="mt-3 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+      <div
+        className={`mt-3 rounded-lg border border-slate-100 p-3 dark:border-zinc-800 ${
+          platform !== 'windows' ? 'hidden' : ''
+        }`}
+      >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <div className="text-sm font-medium">每周兜底续期任务</div>
@@ -374,7 +378,7 @@ function TaskConfigCard({
             启用自动签到（启动补签）
             <span className="block text-xs text-slate-400">
               应用启动时立即核验服务端状态，未签到账号会自动补签；同时作为应用内每日{' '}
-              {checkinHhmm || '09:10'} Rust 调度签到的总开关（关闭后仅 Windows 计划任务生效）
+            {checkinHhmm || '09:10'} Rust 调度签到的总开关
             </span>
           </span>
         </label>

@@ -740,7 +740,7 @@ export default function QoderAccounts() {
               className="btn-outline"
               disabled={scanningIde || oauthRunning}
               onClick={() => void scanIde()}
-              title="解密 IDE 本地存储（Local State → state.vscdb secret://）发现并导入当前登录账号"
+              title="解密 IDE 本地存储登录态（Windows: Local State+DPAPI / macOS: 钥匙串 Safe Storage）发现并导入当前登录账号"
             >
               {scanningIde ? <Loader2 size={15} className="animate-spin" /> : <ScanSearch size={15} />} 扫描本地账号
             </button>

@@ -275,6 +275,12 @@ impl AppState {
             s.qoder_credits_sync_enabled = true;
             s.qoder_credits_sync_hhmm = "23:40".into();
         }
+        // Qoder Token 续期间隔：零值回填默认 6 + 域钳制 1~24（serde default 已给 6，
+        // 此处兜底旧数据/手改配置越界值；调度器侧另有 max(1) 防线）
+        if s.qoder_token_renew_interval_hours == 0 {
+            s.qoder_token_renew_interval_hours = 6;
+        }
+        s.qoder_token_renew_interval_hours = s.qoder_token_renew_interval_hours.min(24);
         // 模型目录每日同步（Buddy/Trae）：同款零值回填（默认开）；同步幂等且不消耗积分，
         // 无账号时调度器静默跳过，默认开安全
         if s.wb_catalog_sync_hhmm.trim().is_empty() {

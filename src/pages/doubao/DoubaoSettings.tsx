@@ -317,7 +317,8 @@ export default function DoubaoSettings() {
             <button onClick={() => void runRenew(true)} disabled={running} className="btn-outline shrink-0">
               <RefreshCw size={14} /> Cookie 诊断
             </button>
-            <span className="text-slate-400">每日保活任务见上方「每日任务」</span>
+            {/* 指向 schtasks 卡的提示仅 Windows 显示（mac 该卡隐藏，巡检本身即兜底） */}
+            {platform === 'windows' && <span className="text-slate-400">每日保活任务见上方「每日任务」</span>}
           </div>
 
           {/* 巡检结果 */}

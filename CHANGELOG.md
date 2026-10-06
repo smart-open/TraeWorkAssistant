@@ -6,38 +6,30 @@
 
 ## [3.7.0] · 2026-10-05 · Qoder 全面支持（上游网关接入 + 积分看板三平台化 + 模块加固）
 
-> 范围：自 [3.6.6] 以来的全部变更，核心为 Qoder 平台全链路接入；协议逆向/抓包调研/运行实证等过程记录见 git 历史。
+> 范围：自 [3.6.6] 以来的全部变更；调研过程与逐项实现细节见 git 历史。
 
 ### 新功能
 
-- **Qoder 上游网关接入**：COSY 三段式签名 + chat 双层信封 SSE 流式/聚合路由（`qoder_route.rs`），智能调度并入 Qoder 池（buddy→trae→qoder 优先级、错误四分类：排队退避/鉴权刷新/额度换号/Forbidden）；统一模型目录合并 Qoder 源；三池每池自管开关（`trae_enabled`/`wb_enabled`/`qoder_enabled`，`qoder_enabled` UI 化热应用）。
-- **Qoder 网关通路 v2**：慢请求竞速对冲（原始行源层首字竞速、胜者统一信封翻译，`qoder_hedge_threshold_ms` 热参数默认 8s）+ 会话粘性（conversationId/消息指纹双模式绑定账号，`qoder_sticky_enabled` 默认关）；Global 区产品决策仅 CN 区。
-- **模型目录定时同步**：`qoder-catalog-sync` 每日 05:50 调度 + CLI 双入口，model/list 真 COSY 签名直通刷新，断网回落静态兜底表。
-- **积分看板三平台化**：三池共用 CreditsDashboard（KPI/趋势/日热度/到期日历）；Qoder 积分包逐包明细（Plan 订阅配额/个人资源包/专属组织包分型，逐包端点失败回退聚合口径 + 负缓存防噪音）；「凭证续期」按钮 + Token 状态列 + IDE/Work 双端登录徽标；四桶用量基建（Qoder usage 桶 + 三池并行拉取）。
-- **Qoder 签到活动档期月历**：逐日双活动状态点 + 奖励合计 + 选中日逐账号明细 + 静态档期标注（0:00 刷新 / 10:00 开窗 / 10:15 调度）。
-- **三池调度参数 per-pool 拆分**：账号并发上限/池粘性 TTL/会话粘性 TTL 拆为每池独立配置（`api_pool.json` 新增 8 字段，存量迁移仅 Buddy 池沿用旧共享值）；Trae 池新增会话粘性与竞速对冲（`trae_hedge_threshold_ms`），前端三页各自编辑三参数。
-- **Qoder 账号管理全家桶**：OAuth/PAT 双通道导入、AES-256-GCM + Argon2id 加密导出、环境重置、分组管理、Qoder CN 0.4.3 安装目录拆分适配、Work 客户端切换。
+- **Qoder 上游网关接入**：COSY 签名 + 双层信封 SSE 流式/聚合路由；Qoder 池并入三池智能调度（错误四分类、慢请求竞速对冲、会话粘性），三池每池独立开关与调度参数 per-pool 拆分；统一模型目录合并 Qoder 源并每日定时同步。
+- **Qoder 账号管理**：OAuth/PAT 双通道导入、分组管理、Argon2id 加密导出、环境重置、Work 客户端切换、mac 全链路适配。
+- **积分看板三平台化**：Trae/Buddy/Qoder 共用看板；Qoder 积分包逐包明细、「凭证续期」按钮、Token 状态列与双端登录徽标。
+- **Qoder 签到档期月历**：逐日活动状态点 + 奖励合计 + 选中日逐账号明细。
 
 ### 修复
 
-- **并发刷新丢 token（P1 三层防护）**：每账号刷新互斥锁 + 落库行级合并 + 版本闸门；跨进程互斥 CrossProcLock（签到/刷新/积分三 scope）及锁名单段化 P0 修复（多段路径名致创建恒败，防护自合入起空转）。
-- **Qoder Work 切换无效（P1）**：登录真源 `auth.v1.dat` 不在快照白名单——切换后客户端按原账号重写，「切了等于没切」；现白名单补登录凭据三件套 + 恢复侧对称清理 + 身份守卫改解密 user.id。
-- **签到日历双修复（P1）**：Trae 调度器/CLI 路径统一落库（日历不再全空）；Buddy 同日同账号多轮记录取最终态去重（不再误显「部分失败」）。
-- **分组删除整表写回绕过 Buddy 旧值迁移（P1 审查即修）**：api_pool 全部写回点收口走 `load_pool_file` 迁移入口；`qoder_live_logins` 阻塞解密移入 spawn_blocking 等审查 P3 批。
-- **积分链路口径**：Qoder KPI 与到期日历包计数对齐；快照 stale-on-error 返 Err 交调度器重试（当日快照不再静默丢失）；Trae 到期看板改按包明细口径 + `credit_packs` 空数组缺省修复老缓存回退。
-- **导入导出与并发加固**：导出剥离机器指纹、KDF 前向兼容 + 迁移 Argon2id（旧格式兼容可解）、命令异步化（spawn_blocking）、groups 读写持锁、OAuth 导入进度事件、明文凭证导出迁移提示。
-- **网关上游与抓包小修批**：SSE statusCode 钳制、目录 resolve 兜底序对齐远程目录、session_seed 等限长 128、MITM Qoder 四域直连白名单 + 解密默认值补齐、app_log 单行原子写、三源调度早退守卫与 max 别名降级修复。
-- **Qoder 全面审查修复批（边审边修 + 收尾批 8abfe92）**：签到 skipped_busy 前端闭环、快照目标 latest-ref、凭证导出红警化、PAT 前缀预检、签到进行态 store 化、通道判定/KDF roundtrip 单测锁定；粘性落库恒假条件（WB 粘性持久化失效）、积分 401 自愈跨进程锁、-9901 空完成免熔断、Queued 流拼接双响应、record_today 并发互斥、storage.json 原子写、random_hex 去 panic、vault ns_get 落日志。
-- **界面**：Trae 资源调度模型目录 Max 标记移至模型 ID 右上角黄色角标。
-- **macOS 合并全面审查修复批（b968204，9 项）**：Qoder mac 路径预留实装（`ide_data_dir`/`env_check`/`cli_dir`/`work_data_dir`/`cli_status_path` 统一收口 platform 层）；Qoder mac 跨进程互斥实装——flock(2) 锁文件对齐 Windows 命名 Mutex 崩溃回收语义；签到定时任务三命令补 schtasks 门控（mac 拒绝并给指引）；mac 打开浏览器实装（`open` + URL 白名单防参数注入）；`DeviceCredential` 手写 Debug 脱敏 `private_key_pem`（防私钥入日志）；oauth trace_id 改 CSPRNG fail-closed；`qoder_pool_save` 三处静默吞错改落日志。
-- **mac 系统依赖深度审查修复批（17b9235，7 项，真机实况驱动）**：`env_reset` work_client 补删 mac 根级 Cookies/Cookies-journal/Network Persistent State（mac 解密密钥在 Keychain 而非 Local State，不删则登录会话存活、登出语义落空）；IDE/Work exe 候选 mac 实装（/Applications、~/Applications 双根 .app，环境检测/打开客户端全链路打通）；`network_cookies` mac 根级三件套对齐 icube 布局；`is_running`/`work_running` mac 按 exe 路径 bundle 段检测（IDE/Work 双客户端 CFBundleExecutable 同名 "Qoder CN"，映像名不可区分，bundle 目录名才是身份信号）；`spawn_first_existing` mac 走 LaunchServices `open` 直启；Qoder 双档案 `mac_bundle_ids` 实测补录（`mac_supported` 维持灰度）。
-- **第三轮全面审查修复批（c069ed1，7 项）**：客户端通道临期凭证（无刷新令牌）不再误判「已过期」——放行当日本可成功的签到，续期给出「仍有效但无法自动续期」准确文案，刷新任务落提示日志不计入需重登；mac `version_of` 起步先查 .app 自身再上溯（环境检测版本号不再恒 null）；`qoder_groups_move` 目标分组校验移入池锁 + `groups_remove` 回落与删定义合并单临界区（闭合删组并发挂上幽灵 group_id 的 TOCTOU）；积分快照落库失败由静默吞改为落日志；前端三处——模型列表刷新失败不再误报「目录同步失败」、快照备份中禁用切换按钮、编辑弹框清空显示名实际生效。
-- **第四轮全面审查修复批（e6cc3b1，switcher/doubao/api_server 全链路复审，仅 2 处文案）**：mac 平台路径文案按实况显示——豆包账号页 uid 探测来源（`public_config.json`）与通用设置代理日志路径占位符按平台分派（mac 显示 `~/Library/Application Support/…`）。
-- **Qoder 每日签到误报「无可领活动」（9cdce69，自 main 合入）**：campaigns 列表端点对工具请求形态全天不展示 CLAIMABLE 条目（已领 grant 无条件展示）——列表零可领时对已知日常活动盲发直领（claim 端点不受列表过滤约束、幂等回放），严格判定响应形态（200+CLAIMED+非回放才算成功，回放/503/4xx 维持 already），401 走自愈重试。
+- **并发刷新丢 token（P1）**：每账号刷新锁 + 行级合并 + 版本闸门 + 跨进程互斥 CrossProcLock（含锁名单段化 P0 修复）。
+- **Qoder Work 切换无效（P1）**：快照白名单补登录凭据三件套 + 恢复侧对称清理。
+- **签到日历（P1）**：Trae 调度器/CLI 路径统一落库；Buddy 同日多轮取最终态去重；每日签到对已知活动盲发直领兜底（修复「无可领活动」误报）。
+- **分组删除绕过旧值迁移（P1）**：api_pool 全部写回点收口走迁移入口。
+- **积分链路口径**：Qoder KPI 与到期日历对齐；快照失败返 Err 交调度器重试；Trae 到期看板按包明细口径。
+- **macOS 适配与安全**：Qoder 路径收口、flock 跨进程锁、浏览器打开、schtasks 门控、双客户端检测、env_reset 根级 Cookies 等实装；系统代理残留自愈、CA 私钥权限收紧、networksetup 逐服务容错、抓包凭证收敛进 vault。
+- **网关与凭证加固**：SSE statusCode 钳制、seed 限长 128、三池记账口径统一、粘性持久化失效修复；导出剥离机器指纹、KDF 迁移 Argon2id（旧格式兼容）、命令异步化。
+- **多轮全面审查批**：并发锁序/TOCTOU、Debug 脱敏与日志零明文、调度与快照容错、前端状态与文案修正等系统性加固。
+- **界面**：Trae 资源调度模型目录 Max 标记移至模型 ID 右上角角标。
 
 ### 测试
 
-- `cargo test` 746 passed / 0 failed / 9 ignored（含自 main 合入的新增用例）；`tsc --noEmit` 全绿；`vitest` 59 passed；`vite build` 通过。
+- `cargo test` 750 passed / 0 failed / 9 ignored；`tsc --noEmit` 全绿；`vitest` 59 passed；`vite build` 通过。
 
 ---
 

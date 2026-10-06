@@ -85,13 +85,28 @@ pub fn store_vault_password_at(data_dir: &std::path::Path, pwd: &[u8]) -> Result
     #[cfg(target_os = "macos")]
     {
         let hex: String = pwd.iter().map(|b| format!("{b:02x}")).collect();
-        // 1) 主源：key file，0600 权限（写失败必须报错——它是 vault 的解密真值）
+        // 1) 主源：key file，0600 权限（写失败必须报错——它是 vault 的解密真值）。
+        //    审查 P2：OpenOptions unix 扩展 mode(0o600) 在 create 时即以最小权限
+        //    建立文件，消除原「fs::write 先 0644 创建再 set_permissions」的权限窗口；
+        //    set_permissions 保留为既有文件（历史 0644 / umask 放宽）的兜底，
+        //    失败按本函数 Result 语义传播（key file 是 vault 解密真值，权限放宽
+        //    等同明文暴露，不得静默吞掉）
         let key_path = data_dir.join("conf").join("vault_key.bin");
-        std::fs::write(&key_path, &hex).map_err(|e| format!("写入 vault 密钥失败: {e}"))?;
-        #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&key_path)
+                .map_err(|e| format!("写入 vault 密钥失败: {e}"))?;
+            f.write_all(hex.as_bytes())
+                .map_err(|e| format!("写入 vault 密钥失败: {e}"))?;
+            // 兜底：文件已存在时 mode() 不改变既有权限，统一收紧到 0600
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("vault 密钥权限收紧为 0600 失败: {e}"))?;
         }
         // 2) 兜底：Keychain 尽力而为（dev 重签场景实测写后读不回/可能失败，不影响主源）
         if let Ok(entry) = keyring_entry() {

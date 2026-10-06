@@ -536,7 +536,7 @@ export default function Settings() {
       <Modal
         open={confirmResetDevice}
         onClose={() => setConfirmResetDevice(false)}
-        title="确认执行 6 层设备标识重置"
+        title={platform === 'windows' ? '确认执行 6 层设备标识重置' : '确认执行设备标识重置（mac 5 层）'}
         footer={
           <>
             <button className="btn-outline" onClick={() => setConfirmResetDevice(false)}>取消</button>
@@ -555,7 +555,8 @@ export default function Settings() {
               <li>② storage.json telemetry</li>
               <li>③ storage.json aha.device</li>
               <li>④ TinyStorage</li>
-              <li>⑤ 注册表 MachineGuid</li>
+              {/* ⑤ MachineGuid 为 Windows 注册表层（mac 自动跳过该层，不误导） */}
+              {platform === 'windows' && <li>⑤ 注册表 MachineGuid</li>}
               <li>⑥ webview 追踪数据</li>
             </ul>
             <p className="mt-2 text-xs text-amber-500">建议先关闭 TRAE 再执行。</p>

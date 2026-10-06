@@ -54,6 +54,13 @@ pub(crate) fn finish_action_thread(
             obj.insert(k.clone(), v.clone());
         }
     }
+    // 日志复盘补齐（2026-10-05）：app.log 只有「开始备份/切换」行、结果只在前端
+    // toast 与 switcher.log——后台失败（如 mac 灰度拒绝）在 app.log 断链难排查。
+    // 统一落终态结果行（事件发射失败也有据可查）
+    fs_utils::app_log(
+        data_dir,
+        &format!("后台动作终态: {event_done} success={success} raw={raw}"),
+    );
     emit_or_log(app, event_done, payload, data_dir);
 }
 

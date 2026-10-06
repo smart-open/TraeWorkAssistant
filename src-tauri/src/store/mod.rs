@@ -196,6 +196,44 @@ impl Store {
             Ok(())
         })
     }
+
+    /// 单行读取（与 row_upsert 配对的读改写原语；返回行文档 Value，行缺失 → None）
+    pub fn row_get(&self, table: &str, pk: &str) -> Result<Option<serde_json::Value>, String> {
+        if !schema::ROW_TABLES.contains(&table) {
+            return Err(format!("非法表名: {table}"));
+        }
+        // with_conn 闭包错误类型 = rusqlite::Error：闭包内只做裸 rusqlite 查询，
+        // JSON 反序列化移到闭包外转 String
+        let raw: Option<String> = self.with_conn(|c| {
+            let mut stmt =
+                c.prepare(&format!("SELECT data FROM [{table}] WHERE pk = ?1"))?;
+            let mut rows = stmt.query(rusqlite::params![pk])?;
+            match rows.next()? {
+                Some(r) => Ok(Some(r.get::<_, String>(0)?)),
+                None => Ok(None),
+            }
+        })?;
+        match raw {
+            Some(text) => serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|e| format!("行文档反序列化失败: {e}")),
+            None => Ok(None),
+        }
+    }
+
+    /// 单行删除（与 row_upsert 配对；仅移除目标 pk 行，不动其余行）
+    pub fn row_delete(&self, table: &str, pk: &str) -> Result<(), String> {
+        if !schema::ROW_TABLES.contains(&table) {
+            return Err(format!("非法表名: {table}"));
+        }
+        self.with_conn(|c| {
+            c.execute(
+                &format!("DELETE FROM [{table}] WHERE pk = ?1"),
+                rusqlite::params![pk],
+            )?;
+            Ok(())
+        })
+    }
 }
 
 /// 损坏库隔离：主库/-wal/-shm 改名 `<原名>.corrupt-<时间戳>`（保留现场，不删除），
