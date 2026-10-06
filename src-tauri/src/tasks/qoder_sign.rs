@@ -470,15 +470,20 @@ mod tests {
         assert_eq!(get("Cosy-Data-Policy"), Some("disagree"));
         assert_eq!(get("Login-Version"), Some("v2"));
         assert_eq!(get("Cosy-Machinetoken"), Some("mid"));
-        // machine_os 随编译平台变化（{arch}_{platform}），断言与生产逻辑同源
-        let expect_os = if cfg!(target_os = "windows") {
-            "x86_64_windows"
+        // machine_os 随编译平台变化（{arch}_{platform}），断言与生产逻辑同源——
+        // arch 段同样必须随 target_arch 分支：CI arm64 runner 上测试二进制按
+        // aarch64 编译，machine_os() 返回 aarch64_darwin（原断言硬编码 x86_64_darwin，
+        // 致 aarch64/universal job 的 cargo test 恒挂、x64 job 恒过的架构偏差，run #21）
+        let expect_arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+        let expect_platform = if cfg!(target_os = "windows") {
+            "windows"
         } else if cfg!(target_os = "macos") {
-            "x86_64_darwin"
+            "darwin"
         } else {
-            "x86_64_linux"
+            "linux"
         };
-        assert_eq!(get("Cosy-Machineos"), Some(expect_os));
+        let expect_os = format!("{expect_arch}_{expect_platform}");
+        assert_eq!(get("Cosy-Machineos"), Some(expect_os.as_str()));
         assert!(!get("X-Request-Id").unwrap_or_default().is_empty());
         // Cosy-Key 是 128 字节 RSA 密文的 base64
         let key = base64::engine::general_purpose::STANDARD
