@@ -1071,7 +1071,7 @@ impl CrossProcLockFail {
     /// 人类可读描述（调用方拼进 skip 日志，便于一眼区分误报与真占用）
     pub fn describe(&self) -> String {
         match self {
-            Self::CreateFailed(e) => format!("锁创建失败（Win32 err={e}，非他方占用）"),
+            Self::CreateFailed(e) => format!("锁创建失败（内核错误码 {e}，非他方占用）"),
             Self::Busy => "他方进程持有中（等待超时）".to_string(),
             Self::WaitFailed(e) => format!("锁等待系统失败（Win32 err={e}）"),
         }
@@ -1143,18 +1143,71 @@ impl Drop for CrossProcLock {
     }
 }
 
-/// 非 Windows 平台占位（本项目仅 Windows 发布，保 CI 单测可编译）
+/// 非 Windows 跨进程互斥：data_dir 下文件锁（`std::fs::File::try_lock` 排他锁，
+/// Rust 1.89 稳定）实现与 Windows 命名互斥体同签名。web/docker 版存在
+/// `--task-run` CLI 双进程路径（aiwork-server main），恒成功占位会使上游
+/// 9689fc4 的跨进程互斥静默失效（调度器与 docker exec 并发刷新同一账号 →
+/// refresh_token 一次性轮换竞争 → AuthDead 误标 needs_relogin），故必须落地。
+/// 释放语义：flock 随文件句柄关闭自动释放（含进程崩溃），Drop 无需显式 unlock
 #[cfg(not(windows))]
-pub struct CrossProcLock;
+pub struct CrossProcLock {
+    // 持有句柄即持有锁；字段名前缀 _ 表示仅生命周期用途
+    _file: std::fs::File,
+}
 
 #[cfg(not(windows))]
 impl CrossProcLock {
     pub fn try_acquire(
-        _data_dir: &std::path::Path,
-        _scope: &str,
-        _wait_ms: u32,
+        data_dir: &std::path::Path,
+        scope: &str,
+        wait_ms: u32,
     ) -> (Option<Self>, Option<CrossProcLockFail>) {
-        (Some(Self), None)
+        use std::time::{Duration, Instant};
+        let dir = data_dir.join("locks");
+        let path = dir.join(format!("{scope}.lock"));
+        // scope 为调用点常量（"checkin"/"refresh"/"credits"），无路径注入面；
+        // 目录创建失败按 CreateFailed 上报（对齐 Windows 语义：锁机制不可用 ≠ 被占用）
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("CrossProcLock({scope}) 锁目录创建失败: {e}");
+            return (
+                None,
+                Some(CrossProcLockFail::CreateFailed(e.raw_os_error().unwrap_or(0) as u32)),
+            );
+        }
+        let deadline = Instant::now() + Duration::from_millis(wait_ms as u64);
+        loop {
+            let open = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path);
+            let mut f = match open {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("CrossProcLock({scope}) 锁文件打开失败: {e}");
+                    return (
+                        None,
+                        Some(CrossProcLockFail::CreateFailed(e.raw_os_error().unwrap_or(0) as u32)),
+                    );
+                }
+            };
+            match f.try_lock() {
+                Ok(()) => return (Some(Self { _file: f }), None),
+                // 文件被其他进程/线程持有，按 wait_ms 预算轮询等待
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(e) => {
+                    eprintln!("CrossProcLock({scope}) 加锁 IO 错误: {e}");
+                    return (
+                        None,
+                        Some(CrossProcLockFail::CreateFailed(e.raw_os_error().unwrap_or(0) as u32)),
+                    );
+                }
+            }
+            if Instant::now() >= deadline {
+                return (None, Some(CrossProcLockFail::Busy));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 

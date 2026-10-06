@@ -68,7 +68,10 @@ pub fn qoder_checkin_start(
             // 契约同 wb：NDJSON **字符串** payload（listen<string> 后 JSON.parse），传对象会
             // 破坏 parseLine 导致 exit 事件被静默丢弃
             let line = serde_json::json!({ "type": "exit", "ok": ok }).to_string();
-            let _ = emit("qoder-checkin-progress", Value::String(line));
+            // emit 为 Web 桥回调（Arc<dyn Fn>，无返回值）：广播失败由 cmd_bridge
+            // 的 WS/SSE 桥内部兜底，此处无法在外层判败落日志（与上游 emit_logged
+            // 的差异属 Web 化架构选择）
+            emit("qoder-checkin-progress", Value::String(line));
         });
     if let Err(e) = spawned {
         return Err(format!("签到后台线程启动失败: {e}"));

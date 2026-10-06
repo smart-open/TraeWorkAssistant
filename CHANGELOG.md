@@ -12,23 +12,19 @@
 
 ### 新增
 
-- **资源调度参数 per-pool 拆分**（1.4.0 曾以「docker 后端无对应结构」跳过，本轮三池结构下完整落地）：
-  - `api_pool` 共享字段 `account_concurrency_limit` / `pool_sticky_ttl_secs` 退役，拆分为 Trae / Buddy / Qoder 三池独立参数组（账号并发上限、池粘性 TTL、显式会话粘性 TTL、竞速对冲阈值）；读取侧统一走 `load_pool_file_with_legacy_migration`——仅 Buddy 池沿用旧共享值（缺失回填、下次保存固化、幂等），Trae / Qoder 池落默认值（并发 1 / 池粘性 300s / 会话粘性 1800s / 对冲 8s）。
-  - Trae 池补齐：`trae_enabled` 参与调度开关（关闭后仅 Trae 源模型显式报错，Buddy/Qoder 不受影响）+ 慢请求竞速对冲（首字节超阈值向第二账号发对冲，先出首字者胜，`TraeHedgeLease` 管理在途计数防泄漏）+ 显式会话粘性（`t:` 命名空间 sticky_bindings，滚动续期）；Qoder 池显式会话粘性 TTL 由硬编码 1800s 改可配。
-  - 前端三页（Trae / Buddy / Qoder · 资源调度）per-pool 参数编辑面板（回显 / 校验 / 保存即热生效），Buddy 页参数键名同步 per-pool 化。
-- **API 管理 · Qoder 池绑定**（issue #25/#30 三池化）：子 Key 资源池绑定新增「Qoder 池」选项（新增表单 + 调度配置弹框，单选切换清空跨池勾选）；限定上游 / 专一候选跟随全局时合并三池展示（Qoder 徽标 amber 区分）；绑定 Qoder 但上游未启用时弹框内显式告警（提示将回退 Buddy/Trae 池）；混合白名单编码扩展 `qoder:` 前缀（后端 `parse_bind_pool` / `qoder_route` 约束链路 1.4.0 已就绪，本轮补前端）。
-- **Buddy 环境配置 · 本机 auth 文件路径**：`Settings.wb_auth_file_path` 暴露到环境配置页（Docker / 远端部署将宿主机客户端 auth 文件挂载进容器后填写容器内路径，「账号管理 → 扫描本机账号」从该文件读取；服务端 `wb_common` 人工指定优先逻辑既有）；扫描零凭证提示同步引导至该配置。
+- **资源调度参数 per-pool 拆分**（1.4.0 跳过项，本轮三池结构下完整落地）：`api_pool` 共享字段退役，拆分为 Trae / Buddy / Qoder 三池独立参数组（账号并发上限、池粘性 TTL、会话粘性 TTL、竞速对冲阈值）；读取侧统一走 `load_pool_file_with_legacy_migration`——仅 Buddy 池沿用旧共享值（缺失回填、下次保存固化、幂等），Trae / Qoder 池落默认值。Trae 池补齐启用开关、竞速对冲（先出首字者胜）、显式会话粘性；Qoder 会话粘性 TTL 改可配；前端三页 per-pool 参数面板（保存即热生效）。
+- **API 管理 · Qoder 池绑定**（issue #25/#30）：子 Key 资源池绑定新增「Qoder 池」选项（单选切换清空跨池勾选；绑定 Qoder 但上游未启用时弹框告警回退）；混合白名单编码扩展 `qoder:` 前缀（后端 1.4.0 已就绪，本轮补前端）。
+- **Buddy 环境配置 · 本机 auth 文件路径**：`Settings.wb_auth_file_path` 暴露到环境配置页——Docker/远端部署将宿主机客户端 auth 文件挂载进容器后填写容器内路径，「扫描本机账号」从该文件读取；扫描零凭证提示同步引导。
 
 ### 修复
 
-- **Qoder OAuth 登录无法自动打开浏览器**：`qoder_oauth_login` 命令同步返回授权页 URL（桌面版 `open_in_browser` 的 Web 化等价——命令返值 + 前端在点击手势的 transient activation 窗口内 `window.open`，避免浏览器弹窗拦截）；被拦截时 toast 提示，弹框内授权链接改为可点击 `<a>`（进度事件兜底下发同一链接）。
-- **Qoder 凭证定时刷新误渲染时间输入框**：every6h 固定周期任务改渲染 violet 徽标（title 注明「固定每 6 小时执行、触发时刻不可配置」），不再展示无效 time input 引导用户误改。
-- **Buddy 概述残留客户端本机态区块**：移除「登录账号」「本机套餐」StatCard（依赖客户端本机 auth 在线判定，Web 版无数据源恒空），统计行 5 → 3 列。
-- **BuddySettings 全局设置调用路径错误**：`api.settingsGet/Set` 顶层误用 → `api.misc.settingsGet/Set`（tsc 拦截修正）。
+- **Qoder OAuth 登录无法自动打开浏览器**：命令同步返回授权页 URL，前端在点击手势的 transient activation 窗口内 `window.open`；被拦截时 toast 提示并回退弹框内可点击链接。
+- **会话粘性 TTL 0 值语义陷阱**：后端 0 按「未设置」回退默认 1800s，而 UI 统称「0 = 关闭」——行为与预期相反。三页会话粘性 TTL 最小值改 60（存量 0 下次保存固化），desc 注明「最小 60 秒，无独立关闭开关」；Buddy 页调度参数统称对齐 Trae/Qoder 页。
+- **杂项**：Qoder 凭证定时刷新误渲染时间输入框（改固定周期徽标）；Buddy 概述移除 Web 版无数据源的「登录账号/本机套餐」区块（5 → 3 列）；BuddySettings 全局设置调用路径修正（`api.misc.settingsGet/Set`）。
 
 ### 验证
 
-- `cargo test --workspace` 548 通过（536 + 12）· `npm test` 57 通过 · `npx tsc --noEmit` 0 错误。
+- `cargo test --workspace` 552 通过（540 + 12）· `npm test` 57 通过 · `npx tsc --noEmit` 0 错误。
 
 ---
 
@@ -38,14 +34,14 @@
 
 ### 新增
 
-- **Qoder 平台全链路**：协议层（积分账户/积分包/签到/用量/模型目录）+ 调度器与网关池接入 + 3 命令（`qoder_pool_status` / `api_qoder_usage_stats` / `api_qoder_catalog_sync`）；前端 `src/pages/qoder/*` 六页；Dashboard 三平台化（Trae/Buddy/Qoder：KPI、快照差分曲线/热力图、Token 用量、到期日历按平台口径适配）。
+- **Qoder 平台全链路**：协议层（积分/签到/用量/模型目录）+ 调度器与网关池接入 + 3 命令（`qoder_pool_status` / `api_qoder_usage_stats` / `api_qoder_catalog_sync`）；前端 `src/pages/qoder/*` 六页；Dashboard 三平台化（KPI、快照差分曲线/热力图、Token 用量、到期日历按平台口径适配）。
 
 ### 修复（移植）
 
-- **签到档期日历双修**（`ded687d` 系统无关部分）：同日同账号多轮记录按最终态去重；BuddyCheckin 接入活动档期日历。
-- **模型目录**（`6ed778a`/`c3f3211` 系统无关部分）：Max Mode 角标 + 厂商列；积分明细包数口径与 KPI 对齐。
-- **Qoder 每日签到误报「无可领活动」**（`main@9cdce69`）：campaigns 列表对工具请求形态过滤 CLAIMABLE——列表零 CLAIMABLE 时对已知每日活动盲发直领兜底（严格判定 `200+CLAIMED+!replayed`，回放/4xx/5xx 维持 already，401 走自愈重试；首次与 401 重试路径同口径）；campaignId 强制路径安全白名单。
-- **审计补移植**：WB chat `prompt_cache_key` 注入（`8838e85`）；6004 配额三态多锚点（`ab67a60`）；auth 文件提取分类报错（`406c50b`）；凭证 vault 收敛改道/刷新失败四分类/响应体读取失败不吞错/SSRF WHATWG 解析（`4f1174b`）；到期日历「长期有效」哨兵（`34e1757`）；Buddy 模型厂商列（`59a594d` 系统无关部分）。
+- **Qoder 每日签到误报「无可领活动」**（`main@9cdce69`）：列表零 CLAIMABLE 时对已知每日活动盲发直领兜底（严格判定 `200+CLAIMED+!replayed`，401 走自愈重试）；campaignId 强制路径安全白名单。
+- **签到档期日历双修**：同日同账号多轮记录按最终态去重；BuddyCheckin 接入活动档期日历。
+- **模型目录**：Max Mode 角标 + 厂商列；积分明细包数口径与 KPI 对齐。
+- **审计补移植**：WB chat `prompt_cache_key` 注入（`8838e85`）；6004 配额三态多锚点（`ab67a60`）；auth 文件提取分类报错（`406c50b`）；凭证 vault 收敛改道/刷新失败四分类/SSRF WHATWG 解析（`4f1174b`）；到期日历「长期有效」哨兵（`34e1757`）；Buddy 模型厂商列（`59a594d`）。
 
 ### 安全与健壮性（发布前审查 19 项全修）
 
@@ -55,13 +51,13 @@
 
 ### 构建修复
 
-- **CI Linux 构建缺依赖（docker-image.yml Rust 测试门禁失败）**：`aiwork-core/Cargo.toml` 本次移植新增的 `[target.'cfg(windows)'.dependencies]`（windows-sys，Qoder CrossProcLock 用）被插在依赖清单中间，其后 13 个跨平台依赖（aes/cbc/p256/rand/argon2/aes-gcm/rusqlite/iota_stronghold/zeroize/flate2/futures-util/regex/time）全部误入 Windows 专属段——本地 Windows 构建无感，CI Ubuntu 上 87 个编译错误。已将 Windows 专属段移至文件末尾；`cargo tree --target x86_64-unknown-linux-gnu` 验证 Linux 依赖图恢复，Cargo.lock 无变化。
-- **qoder_sign 测试平台硬编码**：`build_cosy_headers_produces_all_19` 断言 `Cosy-Machineos` 硬编码 `x86_64_windows`，Linux CI 实际产出 `x86_64_linux` 失败。改为断言头值等于 `machine_os()` 输出（平台自适应，Windows/Linux/macOS 全通过）；`qoder_common.rs` 探针内的 `x86_64_windows` 为复刻抓包包头的 `#[ignore]` 字面值，保留。
-- **Docker 镜像构建 rust 1.88 被 uuid MSRV 卡住（GHCR 推送 job 失败）**：本次移植新增的 `uuid` 依赖锁到 1.27.0（要求 rustc ≥1.89），`rust:1.88-slim` 构建阶段 exit 101（此前两轮门禁失败时该 job 一直被跳过、首次真正执行即暴露）。基础镜像升级 `rust:1.88-slim → rust:1.97-slim`（与 CI stable 工具链/本地验证同代，避免逐版追赶）；workspace `rust-version` 声明 1.88 → 1.89（真实 MSRV），AGENT.md / docs/tech-framework.md 同步。
+- **CI Linux 构建缺依赖**：`[target.'cfg(windows)'.dependencies]`（windows-sys）误插依赖清单中间，其后 13 个跨平台依赖全部误入 Windows 专属段——CI Ubuntu 上 87 个编译错误。Windows 专属段移至文件末尾。
+- **qoder_sign 测试平台硬编码**：`Cosy-Machineos` 断言改平台自适应（等于 `machine_os()` 输出），Linux CI 通过。
+- **Docker 基础镜像 MSRV**：新增 `uuid` 依赖要求 rustc ≥1.89，`rust:1.88-slim` 构建 exit 101——基础镜像升级 `rust:1.97-slim`，成员 crate `rust-version` 声明 1.89（真实 MSRV），AGENT.md / docs/tech-framework.md 同步。
 
 ### 明确跳过（桌面客户端专属）
 
-- Trae 包级积分口径/tokenStats 懒加载；BuddyAccounts 桌面环境操作（凭证导出除外，已带 Modal 强确认）；DiscoverModal 徽标；per-pool 字段拆分（docker 后端无对应结构）。
+- Trae 包级积分口径/tokenStats 懒加载；BuddyAccounts 桌面环境操作（凭证导出除外，已带 Modal 强确认）；DiscoverModal 徽标；per-pool 字段拆分（1.4.1 已落地）。
 
 ### 验证
 

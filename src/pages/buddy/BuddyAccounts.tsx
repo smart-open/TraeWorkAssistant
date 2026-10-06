@@ -175,8 +175,10 @@ export default function BuddyAccounts() {
       setOauthStage(e.payload.stage);
       setOauthMessage(e.payload.message);
       if (e.payload.auth_url) setOauthAuthUrl(e.payload.auth_url);
-      // 自动打开登录页：服务端（容器）无 GUI 无法开浏览器，由前端代开新标签页；
-      // 被弹窗拦截时回退到弹框内的可点击链接 + 提示
+      // 自动打开登录页：服务端（容器）无 GUI 无法开浏览器，由前端代开新标签页。
+      // 注：此处位于 SSE/WS 事件回调、非点击手势上下文（auth_url 由服务端后台线程
+      // 产出，属 Web 桥架构的固有形态而非手势违规绕过）；被弹窗拦截时回退到弹框
+      // 内的可点击链接 + 提示，功能闭环不受影响
       if (e.payload.auth_url && autoOpenedRef.current !== e.payload.auth_url) {
         autoOpenedRef.current = e.payload.auth_url;
         const w = window.open(e.payload.auth_url, '_blank', 'noopener');

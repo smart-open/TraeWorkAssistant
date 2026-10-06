@@ -117,7 +117,9 @@ export interface CreditPackDetail {
   /** 来源名称（如「每日签到」「每月登录积分」） */
   source: string;
   remaining: number;
-  /** 过期时间（Unix 秒） */
+  /** 包总额度 credits_limit（到期日历 note「剩余 X / 总 Y」） */
+  total?: number;
+  /** 过期时间（Unix 秒；4102444800 = 2100-01-01 长期有效哨兵） */
   expire_time: number;
 }
 

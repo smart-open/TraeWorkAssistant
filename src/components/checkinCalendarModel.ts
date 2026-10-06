@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 签到档期日历纯模型（CheckinCalendarCard 的可测内核，F-80-余 v2）。
  *
  * 全部为纯函数（无 React / DOM / invoke 依赖），单测覆盖：

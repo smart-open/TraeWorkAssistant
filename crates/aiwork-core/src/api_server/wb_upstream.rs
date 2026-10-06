@@ -106,8 +106,8 @@ pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
         ("X-IDE-Version", WB_CLI_VERSION.into()),
         // X-Request-ID：每请求随机 32 位 hex。用 ThreadRng（rand::random，CSPRNG、
         // OsRng 种子）替代 main 的 uuid::Uuid::new_v4().simple()，免去新增 uuid
-        // 依赖；不走 commands::oauth::random_hex——其 OsRng 失败时会退化为
-        // 时间种子 LCG（可预测），请求标识要求恒定不可预测（审查 No.2）
+        // 依赖；不走 commands::oauth::random_hex——其为 panic 形态（OsRng 失败即
+        // 失败，无退化路径），此处内联 rand::random 语义相同且更直观（审查 No.2）
         ("X-Request-ID", format!("{:032x}", rand::random::<u128>())),
     ];
     // 设备/会话指纹（issue #48）：账号级稳定派生（同账号恒定、跨账号隔离）；

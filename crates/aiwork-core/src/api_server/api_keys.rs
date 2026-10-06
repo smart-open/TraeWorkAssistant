@@ -313,10 +313,13 @@ impl ApiKeysFile {
             h.finalize()
         };
         let pd = digest(presented);
+        // 存储侧非空守卫（安全兜底）：key 为空串的启用条目（vault 回填失败时的占位，
+        // 或脏数据）绝不可参与匹配——否则呈现侧空 Key（如 `x-api-key:` 空值头）即命中，
+        // 构成鉴权绕过；空 Key 恒 Invalid（与 vault 不可用语义一致）
         let Some(e) = self
             .keys
             .iter_mut()
-            .find(|k| k.enabled && digest(&k.key) == pd)
+            .find(|k| k.enabled && !k.key.is_empty() && digest(&k.key) == pd)
         else {
             return KeyCheck::Invalid;
         };
@@ -412,10 +415,43 @@ fn entry_or_load<'a>(
     reg: &'a mut std::collections::HashMap<std::path::PathBuf, KeysEntry>,
     data_dir: &'a Path,
 ) -> &'a mut KeysEntry {
-    reg.entry(data_dir.to_path_buf()).or_insert_with(|| KeysEntry {
-        file: crate::store::docs::api_keys_load(&crate::store::db(data_dir)),
-        dirty: false,
+    reg.entry(data_dir.to_path_buf()).or_insert_with(|| {
+        let mut file = crate::store::docs::api_keys_load(&crate::store::db(data_dir));
+        // vault 回填（vault 化读侧，对齐上游 9ba5fd0）：库中占位 key 从 vault 恢复
+        // 明文——内存权威副本恒持明文，verify/展示无感；vault 异常时该条 key 保持
+        // 空（verify 恒 Invalid 拒绝，与 wb 凭证 vault 不可用语义一致）
+        for k in &mut file.keys {
+            if k.key.is_empty() {
+                if let Some(v) = crate::vault::ns_get(data_dir, "api_key", &k.id) {
+                    if let Some(s) = v.get("key").and_then(serde_json::Value::as_str) {
+                        k.key = s.to_string();
+                    }
+                }
+            }
+        }
+        KeysEntry { file, dirty: false }
     })
+}
+
+/// 落库收敛（vault 化写侧；两段式：先 vault 成功、后 DB 占位——vault 失败该条明文
+/// 保留落库，真值不丢，下次落盘/启动迁移重试）。内存权威副本恒持明文，本函数仅
+/// 决定进入 SQLite 的形态（key 占位化，与 wb/qoder 凭证表同一收敛标准）。
+/// 注：persist 在 KEYS_STATE 锁外执行，save 与 2s flusher 理论上可并发——vault
+/// ns_set 幂等，DB 整表替换 last-writer-wins 最坏存在 ≤2s 陈旧窗口（flusher 旧
+/// 快照后写），与改造前落盘语义一致，cache 权威 + dirty 标记兜底收敛，非新引入面。
+fn persist(data_dir: &Path, f: &ApiKeysFile) -> bool {
+    let mut out = f.clone();
+    for k in &mut out.keys {
+        if k.key.is_empty() {
+            continue;
+        }
+        let entry = serde_json::json!({ "key": k.key });
+        match crate::vault::ns_set(data_dir, "api_key", &k.id, &entry) {
+            Ok(()) => k.key = String::new(),
+            Err(e) => eprintln!("[api_keys] vault 收敛失败（明文保留，下次落盘重试）: {e}"),
+        }
+    }
+    crate::store::docs::api_keys_save(&crate::store::db(data_dir), &out).is_ok()
 }
 
 /// 读（缓存优先；命令层展示与 constraints_for 均走此处，不再每调用一次 SQLite 读）
@@ -445,7 +481,7 @@ pub fn save(data_dir: &Path, f: &ApiKeysFile) {
         entry.dirty = true;
         nf
     };
-    if crate::store::docs::api_keys_save(&crate::store::db(data_dir), &merged).is_err() {
+    if !persist(data_dir, &merged) {
         eprintln!("[api_keys] save 落盘失败（内存已生效，flusher 将重试）: {}", data_dir.display());
     }
 }
@@ -480,7 +516,7 @@ pub fn flush_dirty(data_dir: &Path) -> bool {
     };
     match snapshot {
         Some(f) => {
-            let ok = crate::store::docs::api_keys_save(&crate::store::db(data_dir), &f).is_ok();
+            let ok = persist(data_dir, &f);
             if !ok {
                 let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(e) = reg.get_mut(&data_dir.to_path_buf()) {
@@ -759,6 +795,85 @@ mod tests {
         assert_eq!(stored.keys[0].name, "renamed");
         assert_eq!(stored.keys[0].used_today, 1, "落盘含合并后的计数");
         assert!(!flush_dirty(&dir), "收敛后脏标记清除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_stored_key_never_matches() {
+        // 空存储 Key 兜底（安全）：vault 回填失败的占位（或脏数据）启用条目不可被
+        // 呈现侧空 Key（如 x-api-key 空值头）命中——恒 Invalid，不构成鉴权绕过
+        let dir = std::env::temp_dir().join(format!("twa_keys_empty_{}", std::process::id()));
+        let f = ApiKeysFile {
+            keys: vec![entry("ke1", "", true, 0)],
+            auth_disabled: false,
+        };
+        save(&dir, &f);
+        assert!(matches!(
+            verify_and_consume_locked(&dir, "", "d1"),
+            KeyCheck::Invalid
+        ));
+        assert!(matches!(
+            verify_and_consume_locked(&dir, "ck-anything", "d1"),
+            KeyCheck::Invalid
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==================== API Key vault 收敛（对齐上游 9ba5fd0） ====================
+
+    #[test]
+    fn key_persisted_placeholder_and_restored_from_vault() {
+        // 写侧：save 落库后存储层 key 占位化、vault 持真值；读侧：load 回填明文，verify 命中
+        // 触碰 vault 全局单例（VAULT 首开固化 conf_path），先重置避免与其他 vault 测试串写
+        crate::vault::reset_for_tests();
+        let dir = std::env::temp_dir().join(format!("twa_keys_vault_{}", std::process::id()));
+        let f = ApiKeysFile {
+            keys: vec![entry("kv1", "ck-secret", true, 0)],
+            auth_disabled: false,
+        };
+        save(&dir, &f);
+        assert!(flush_dirty(&dir), "save 标脏由 flusher 收敛");
+        let stored = crate::store::docs::api_keys_load(&crate::store::db(&dir));
+        assert_eq!(stored.keys.len(), 1);
+        assert!(stored.keys[0].key.is_empty(), "落库应占位化");
+        let v = crate::vault::ns_get(&dir, "api_key", "kv1").expect("vault 应有 api_key 凭证");
+        assert_eq!(v.get("key").and_then(serde_json::Value::as_str), Some("ck-secret"));
+        // 新进程视角（绕过内存缓存直读库）也应回填：临时清缓存不可行，改验 verify 走
+        // entry_or_load 首读路径——本测试进程 KEYS_STATE 已缓存，用新 id 独立验证回填
+        let f2 = ApiKeysFile {
+            keys: vec![entry("kv2", "ck-second", true, 0)],
+            auth_disabled: false,
+        };
+        save(&dir, &f2);
+        assert!(matches!(
+            verify_and_consume_locked(&dir, "ck-second", "d1"),
+            KeyCheck::Ok(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_migration_collects_plaintext_keys() {
+        // 存量明文（旧版本遗留）→ vault + 占位，幂等；回填后网关验证可用
+        // 触碰 vault 全局单例，先重置（同 key_persisted_... 测试）
+        crate::vault::reset_for_tests();
+        let dir = std::env::temp_dir().join(format!("twa_keys_mig_{}", std::process::id()));
+        let f = ApiKeysFile {
+            keys: vec![entry("km1", "ck-legacy", true, 0)],
+            auth_disabled: false,
+        };
+        // 绕过 persist 直写存储层模拟遗留明文行（docs 层无 vault 参与）
+        crate::store::docs::api_keys_save(&crate::store::db(&dir), &f).expect("直写遗留明文");
+        let state = crate::state::AppState::with_data_dir(dir.clone());
+        crate::vault::migrate_on_startup(&state);
+        let stored = crate::store::docs::api_keys_load(&crate::store::db(&dir));
+        assert!(stored.keys[0].key.is_empty(), "迁移后库中应占位化");
+        let v = crate::vault::ns_get(&dir, "api_key", "km1").expect("迁移应写 vault");
+        assert_eq!(v.get("key").and_then(serde_json::Value::as_str), Some("ck-legacy"));
+        // 幂等：再次迁移无副作用
+        crate::vault::migrate_on_startup(&state);
+        let again = crate::store::docs::api_keys_load(&crate::store::db(&dir));
+        assert!(again.keys[0].key.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

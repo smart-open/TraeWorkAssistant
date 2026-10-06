@@ -191,6 +191,11 @@ fn pem_cert_der(pem: &str) -> Result<Vec<u8>, String> {
 /// 不适合 OAuth state / PKCE verifier / nonce 等安全场景（审查 P1-6）——
 /// 已移除：CSPRNG 失败直接 panic（系统熵池不可用时继续只会产生可预测输出，
 /// 等同把授权码暴露给可猜 state 的劫持者），不再静默降级。
+/// panic 形态决策留档（上游 8abfe92 改 Err 上抛的本地等价性论证）：调用点均处于
+/// cmd_bridge spawn_blocking / tokio 任务内，panic 被捕获转为命令错误响应（不悬挂、
+/// 不崩进程），OAuth 轮询另有 310s 看门狗兜底 done 事件——与 Err 上抛行为等价，
+/// 而全链路（oauth_get_login_url/pkce_pair 等返回结构体）无现成 Result 通道，
+/// 强改签名只会催生同义 expect。熵池不可用属系统级故障（TLS 亦不可用）。
 pub fn random_hex(len: usize) -> String {
     use rand::RngCore;
     let mut bytes = vec![0u8; len.div_ceil(2)];

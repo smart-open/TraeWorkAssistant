@@ -121,6 +121,8 @@ pub struct Settings {
     pub proxy_port: u16,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 桌面版专属（启动后最小化到托盘）：Web/Docker 版无窗口系统，全树无读取方；
+    /// 仅 settings 兼容解析保留，勿在新代码引用
     #[serde(default)]
     pub launch_minimized: bool,
     /// 启动静默签到（T11）：启动 60s 后对未签到账号自动执行一轮签到
@@ -128,6 +130,8 @@ pub struct Settings {
     pub silent_checkin: bool,
     #[serde(default = "default_true")]
     pub auto_start_proxy: bool,
+    /// 桌面版专属（系统托盘开关）：Web/Docker 版无托盘概念，全树无读取方；
+    /// 仅 settings 兼容解析保留，勿在新代码引用
     #[serde(default = "default_true")]
     pub tray: bool,
     #[serde(default = "default_lang")]
@@ -335,12 +339,17 @@ pub struct RemainingCreditsFile {
 /// 积分明细条目（仅剩余 > 0 且未过期的积分包）
 #[derive(Serialize, Clone)]
 pub struct CreditPackDetail {
-    /// "ͨ用" | "Work"
+    /// "通用" | "Work"
     pub kind: String,
     /// 来源名称（如「每日签到」「每月登录积分」）
     pub source: String,
     /// 该包剩余积分 = credits_limit - usage.credits_amount
     pub remaining: f64,
+    /// 该包总额度 credits_limit（对齐上游：到期日历 note「剩余 X / 总 Y」）；
+    /// quota.credits_limit 缺失时不产生该包，运行时恒 Some，Option 仅为前向兼容
+    /// （skip 序列化：None 时不输出 null，前端 total?: number 已兼容缺省）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
     /// 过期时间（Unix 秒）
     pub expire_time: i64,
 }
@@ -355,7 +364,7 @@ pub struct CreditDetail {
     pub packs: Vec<CreditPackDetail>,
 }
 
-/// 单个账号的冷却状鎬?
+/// 单个账号的冷却状态
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct CooldownEntry {
     #[serde(rename = "type", default)]
@@ -454,15 +463,19 @@ pub struct ApiPoolFile {
     /// （未分组账号不参与，对齐 Trae 池 group_ids 的 T10 语义）；空 = 不限分组
     #[serde(default)]
     pub wb_group_ids: Vec<String>,
-    /// Qoder 上游开关（3.7.0 移植）：开启后 Qoder 目录模型路由到 Qoder 账号池
+    /// Qoder 上游开关（3.7.0 移植）：开启后 Qoder 目录模型路由到 Qoder 账号池。
+    /// docker 分支有意 default true（与上游 main 的 false 相反）：三池全链路为本
+    /// 产品线 1.4.0 主特性，Qoder 池随部署默认可用（有账号时）
     #[serde(default = "default_true")]
     pub qoder_enabled: bool,
     /// Qoder 池入池白名单（qoder 账号 id）：空 = 全部含凭证账号自动入池（fail-open，
     /// 对齐 Buddy 池 wb_enabled_uids 语义）；非空 = 仅列表内账号参与调度
     #[serde(default)]
     pub qoder_enabled_uids: Vec<String>,
-    /// Qoder 慢请求竞速对冲阈值毫秒（F-80-余 v2，同 wb_hedge_threshold_ms）：0 = 关闭
-    #[serde(default)]
+    /// Qoder 池慢请求竞速对冲阈值毫秒（F-80-余 v2，同 wb_hedge_threshold_ms）：
+    /// 默认 8000（对齐上游与 WB/Trae 池；此前 serde default 0 与 UI 回显 8s 不一致，
+    /// 未保存过配置时实际恒关）；0 = 关闭
+    #[serde(default = "default_hedge_threshold_ms")]
     pub qoder_hedge_threshold_ms: u64,
     /// Qoder 会话粘性开关（F-80-余 v2；qoder_sticky）：默认关（对齐 main）
     #[serde(default)]
@@ -541,7 +554,7 @@ impl Default for ApiPoolFile {
             wb_group_ids: Vec::new(),
             qoder_enabled: true,
             qoder_enabled_uids: Vec::new(),
-            qoder_hedge_threshold_ms: 0,
+            qoder_hedge_threshold_ms: default_hedge_threshold_ms(),
             qoder_sticky_enabled: false,
             qoder_account_concurrency_limit: default_account_concurrency_limit(),
             qoder_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),

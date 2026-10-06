@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "aiwork-server"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "aiwork-core",
  "axum",

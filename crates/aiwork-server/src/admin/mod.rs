@@ -125,6 +125,21 @@ pub(super) fn json_response(status: StatusCode, value: serde_json::Value) -> Res
     (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
+/// 常量时间字节串比较（主管理令牌比对用）：无论长度是否一致，迭代次数仅由
+/// 被比较两侧长度的最大值决定，累积异或最后统一判定——消除理论时序侧信道。
+/// 不引入 subtle/subtlecrypto 依赖（std 无等价物，实现量级 12 行）
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    // 长度差以 usize 全宽参与累积（as u8 截断会丢 >255 的长度差）
+    let mut diff: usize = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    // black_box 阻止 LLVM 将「OR 累积」做语义等价的 early-exit 变换
+    std::hint::black_box(diff) == 0
+}
+
 /// T7 鉴权中间件：覆盖管理面路由整体；`/api/login` 放行，
 /// 其余请求校验 Cookie `aiwork_admin=<token>` 精确匹配，失败 → 401。
 /// WebUI 免令牌开关（settings.web_auth_disabled）开启时整体跳过鉴权，即时生效。
@@ -146,8 +161,9 @@ pub(super) async fn auth_middleware(
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|raw| cookie_value(raw, COOKIE_NAME))
-        // 主 token 精确匹配 或 附加管理员令牌命中（T12b）
-        .map(|c| c == admin.token || admin_tokens::contains(&c))
+        // 主 token 精确匹配 或 附加管理员令牌命中（T12b）；常量时间比较（令牌
+        // 比对不经业务数据分支，消除理论时序侧信道；两 token 均进程内可信长度）
+        .map(|c| ct_eq(c.as_bytes(), admin.token.as_bytes()) || admin_tokens::contains(&c))
         .unwrap_or(false);
     if authorized {
         next.run(req).await
@@ -170,8 +186,9 @@ async fn login(State(admin): State<Arc<AdminState>>, body: Bytes) -> Response {
                 .map(|s| s.to_string())
         })
         .unwrap_or_default();
-    // 主 token 或附加管理员令牌任一命中即可登录（T12b）；会话 Cookie 存登录所用 token
-    if supplied != admin.token && !admin_tokens::contains(&supplied) {
+    // 主 token 或附加管理员令牌任一命中即可登录（T12b，主 token 常量时间比较）；
+    // 会话 Cookie 存登录所用 token
+    if !(ct_eq(supplied.as_bytes(), admin.token.as_bytes()) || admin_tokens::contains(&supplied)) {
         return json_response(
             StatusCode::UNAUTHORIZED,
             json!({"ok": false, "error": "token 无效"}),

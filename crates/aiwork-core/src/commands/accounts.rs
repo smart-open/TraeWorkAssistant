@@ -1028,6 +1028,8 @@ pub fn fetch_credit_detail(state: &AppState, user_id: String) -> Result<CreditDe
             kind,
             source,
             remaining: (remaining * 100.0).round() / 100.0,
+            // 包总额度（到期日历「剩余 X / 总 Y」note 用）；limit 在上方已判非 None
+            total: Some((limit * 100.0).round() / 100.0),
             // 无 expire_time → 长期有效哨兵（2100-01-01），排序靠后且前端特殊展示
             expire_time: pack
                 .get("expire_time")

@@ -88,6 +88,16 @@ if (target) {
   writeCargoVersion(CORE_TOML, target);
   writeCargoVersion(SERVER_TOML, target);
   syncCargoLock();
+} else {
+  // 无参路径也要校验 server toml 与 core 一致：此前无参跳过导致历史升级时
+  // server toml 漂移（如 core 1.4.1 / server 1.4.0），破坏「版本号单一来源」约定
+  const version = readCargoVersion();
+  const serverVersion = readFileSync(SERVER_TOML, 'utf8').match(/^version\s*=\s*"(\d+\.\d+\.\d+)"/m)?.[1];
+  if (serverVersion !== version) {
+    console.error(`[sync_version] aiwork-server 版本漂移（${serverVersion} ≠ ${version}），已回正`);
+    writeCargoVersion(SERVER_TOML, version);
+    syncCargoLock();
+  }
 }
 
 const version = readCargoVersion();

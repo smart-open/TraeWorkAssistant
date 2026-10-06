@@ -75,7 +75,7 @@ const WB_PARAM_FIELDS: {
   {
     key: 'wbPoolStickyTtlSecs',
     label: '池粘性 TTL',
-    desc: 'TTL 内同会话落同一账号（上游 KV cache 复用）',
+    desc: 'TTL 内同会话落同一账号（上游 KV cache 复用）；0 = 关闭',
     min: 0,
     max: 3600,
     step: 30,
@@ -84,8 +84,8 @@ const WB_PARAM_FIELDS: {
   {
     key: 'wbStickyTtlSecs',
     label: '会话粘性 TTL',
-    desc: '显式 conversationId 绑定账号的有效期',
-    min: 0,
+    desc: '显式 conversationId 绑定账号的有效期（最小 60 秒，无独立关闭开关）',
+    min: 60,
     max: 86_400,
     step: 60,
     unit: '秒',
@@ -171,7 +171,10 @@ export default function BuddyApiService() {
             pf.wb_account_concurrency_limit ?? WB_PARAM_DEFAULTS.wbAccountConcurrencyLimit,
           wbPoolStickyTtlSecs:
             pf.wb_pool_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.wbPoolStickyTtlSecs,
-          wbStickyTtlSecs: pf.wb_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.wbStickyTtlSecs,
+          wbStickyTtlSecs: Math.max(
+            60,
+            pf.wb_sticky_ttl_secs ?? WB_PARAM_DEFAULTS.wbStickyTtlSecs,
+          ),
         });
         // 空数组 = fail-open（全部自动入池）→ 视为未自定义，显示为全选
         setWbUids(pf.wb_enabled_uids?.length ? pf.wb_enabled_uids : null);
@@ -208,6 +211,13 @@ export default function BuddyApiService() {
   // 新增账号可持续自动入池；显式全量名单会冻结 fail-open）；清空传 []（后端同样 fail-open）；
   // F-76②/③/F-77 数值参数随开关一起保存（后端热应用，运行中即时生效）
   const saveFlags = async () => {
+    // 池配置未加载时禁止保存（对齐 Qoder 页同款守卫）：uids/strategy/groups 原样
+    // 回传依赖 pool 快照，pool=null 时 `pool?.enabled_uids ?? []` 会把 Trae 池
+    // 白名单清空（[] 在调度层为 fail-open 全量入池）
+    if (!pool) {
+      pushToast('error', '池配置未加载，无法保存（请先刷新重试）');
+      return;
+    }
     setSaving(true);
     try {
       await withMinDelay(
@@ -370,7 +380,12 @@ export default function BuddyApiService() {
                     </button>
                   </>
                 )}
-                <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving}>
+                <button
+                  className="btn-outline"
+                  onClick={() => void saveFlags()}
+                  disabled={saving || !pool}
+                  title={pool ? undefined : '池配置未加载，请先刷新重试'}
+                >
                   {saving ? <Spinner /> : <Save size={15} />} 保存
                 </button>
               </div>
@@ -502,7 +517,7 @@ export default function BuddyApiService() {
                 <div className="mb-2 flex items-center gap-2">
                   <Gauge size={15} className="text-brand-500" />
                   <span className="text-sm font-medium">调度参数</span>
-                  <span className="text-xs text-slate-400">保存即热生效 · 0 表示关闭/不限</span>
+                  <span className="text-xs text-slate-400">保存即热生效 · 并发 0 = 不限 · 对冲/池粘性 0 = 关闭</span>
                 </div>
                 <div className="space-y-3">
                   {WB_PARAM_FIELDS.map((item) => (

@@ -265,7 +265,9 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       }
     }
     // 今日新增：快照 earned 优先（积分包 CycleStartTime 归日口径）；
-    // Web 版无 Trae 逐条积分流水，无 history delta 回退（快照未统计时记 0）
+    // Web 版无 Trae 逐条积分流水，无 history delta 回退（快照未统计时记 0）。
+    // KPI 余额/包数维持快照账号级口径（逐包实时拉取 N 账号成本过高，仅在
+    // 积分到期 Tab 按需逐包展示，见 ExpiryTab）
     const snap = creditsDaily.find((s) => s.date === today);
     const todayEarned = snap && snap.earned > 0 ? snap.earned : 0;
     // 今日消耗：官网接口明细优先（credits_float 实际口径），回退快照 consumed

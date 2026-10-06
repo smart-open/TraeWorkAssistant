@@ -649,6 +649,9 @@ mod tests {
         use crate::state::AppState;
         let dir = tmp_dir("vault_conv");
         std::fs::create_dir_all(dir.join("conf")).unwrap();
+        // 本测试触碰 vault 全局单例（VAULT 首开固化 conf_path），先重置避免与其他
+        // vault 测试（api_keys 收敛等）跨目录串写/指向已删快照
+        crate::vault::reset_for_tests();
         write(
             &dir.join("data/checkin_accounts.json"),
             r#"{"accounts":[{"name":"a1","UserID":"u1","jwt":"secret-jwt","refresh_token":"secret-rt"}]}"#,

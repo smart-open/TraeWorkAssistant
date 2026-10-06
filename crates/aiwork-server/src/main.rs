@@ -75,15 +75,21 @@ async fn main() {
 
     // 路由合并：网关（/v1/* + /health + /healthz + /status，api_keys fail-closed）优先，
     // 其次管理面（/api/*，cookie 鉴权），其余路径落入静态托管（React 构建产物）；
-    // 最外层挂 IP 允许列表中间件（/health、/healthz 探活放行，回环地址始终放行）
+    // 最外层挂 IP 允许列表中间件（/health、/healthz 探活放行，回环地址始终放行）+
+    // CSP（仅 HTML 文档响应下发）
     let app = build_router(shared.clone())
         .merge(admin::router(admin))
         .merge(static_router())
+        .layer(axum::middleware::from_fn(csp_html_middleware))
         .layer(axum::middleware::from_fn(admin::ip_allow::ip_middleware));
 
-    // 监听地址：AIWORK_LISTEN_ADDR 优先；默认 127.0.0.1:{网关设置端口}
+    // 监听地址：AIWORK_LISTEN_ADDR 优先（显式空串/空白视为未设置，防御 bind("") 失败）；
+    // 默认 127.0.0.1:{网关设置端口}
     let port = aiwork_core::api_server::gateway_settings::load(&state.data_dir).port;
-    let addr = std::env::var("AIWORK_LISTEN_ADDR").unwrap_or_else(|_| format!("127.0.0.1:{port}"));
+    let addr = std::env::var("AIWORK_LISTEN_ADDR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("127.0.0.1:{port}"));
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -99,6 +105,16 @@ async fn main() {
     println!("{started}");
     fs_utils::app_log(&state.data_dir, &started);
 
+    // 双门禁启动侧（9ba5fd0 移植）：非环回监听时提示 auth_disabled 不生效（运行期
+    // 强制在 aiwork-core auth.rs::bearer_auth，此处仅可观测提示）
+    if !aiwork_core::api_server::auth::listen_is_loopback() {
+        let warn = format!(
+            "安全提示: 监听地址 {addr} 非环回——「关闭鉴权」开关不生效，/v1/* 网关必须携带 API Key 访问"
+        );
+        println!("{warn}");
+        fs_utils::app_log(&state.data_dir, &warn);
+    }
+
     // into_make_service_with_connect_info：向请求注入 ConnectInfo<SocketAddr>，
     // IP 允许列表中间件据此取 TCP 对端地址（trust_proxy 关闭时的唯一信任来源）
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -109,6 +125,44 @@ async fn main() {
     // 优雅退出：排空用量脏队列与 api_keys 计数（对齐桌面 do_stop 语义）
     shared.flush_pending_writes();
     fs_utils::app_log(&state.data_dir, "aiwork-server 已退出（用量/计数已落库）");
+}
+
+/// CSP 响应头中间件（9ba5fd0 移植，纵深防御）：仅对 HTML 文档响应下发——
+/// SPA 产物无内联脚本；style 'unsafe-inline' 为 React 内联 style 属性所需；
+/// ws:/wss: 为管理面 WS 事件桥（CSP 无法按源匹配 WS，scheme 放行）；img data:
+/// 为 base64 横幅、font data: 为字体兜底（img 无需 blob:——createObjectURL 仅用于
+/// a.download 下载链接，不涉 img-src）。仅经 axum 托管时生效（vite dev 不经过
+/// 此层，开发模式不受限）。
+/// /gw-status 内嵌状态页为服务端自渲染 HTML（内联 <script> + onclick，脚本内容
+/// 静态常量、用户输入经 esc() 转义），统一策略的 script-src 'self' 会拦截其页面
+/// 脚本（第四轮审查 Critical）——该路径单发含 script 'unsafe-inline' 的专属策略
+async fn csp_html_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none'";
+    // /gw-status 专属：内联脚本/onclick 需 'unsafe-inline'（其余指令与常规策略一致）；
+    // 精确匹配（含尾斜杠子路径），避免 /gw-status-xxx 等无关路径误享宽松策略
+    const CSP_GW_STATUS: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none'";
+    let path = req.uri().path();
+    let csp = if path == "/gw-status" || path.starts_with("/gw-status/") {
+        CSP_GW_STATUS
+    } else {
+        CSP
+    };
+    let mut resp = next.run(req).await;
+    let is_html = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/html"));
+    if is_html && !resp.headers().contains_key(axum::http::header::CONTENT_SECURITY_POLICY) {
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static(csp),
+        );
+    }
+    resp
 }
 
 /// 静态资源路由：AIWORK_WEB_DIST 目录存在 → ServeDir（目录自动补 index.html）；

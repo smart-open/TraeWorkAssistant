@@ -6,7 +6,8 @@
 //!
 //! Web 化改造：main 版 `runtime: State<...>` 热重载参数删除，
 //! 改 `reload_pools_after_change`（OnceLock 网关未注册时静默跳过）；
-//! api_pool 读改写走 kv（docker 版无 load_pool_file 文件基线）。
+//! api_pool 读改写统一走 `runtime::load_pool_file`（含 Buddy 旧共享值迁移，
+//! 直读 kv 会落 serde default、整表写回静默覆盖迁移值）。
 
 use crate::state::AppState;
 
@@ -136,12 +137,13 @@ pub fn qoder_groups_remove(state: &AppState, id: String) -> Result<(), String> {
     save_defs(state, &defs)?;
     // 清理 api_pool 对该分组的筛选引用：被删分组的 id 在资源调度页无 chip 可取消
     // （幽灵筛选），残留会使 Qoder 池被静默清空且 UI 无出口。有引用变更时联动热重载。
-    // docker 适配：无 load_pool_file 文件基线，走 kv("api_pool") 读改写
-    let store = crate::store::db(&state.data_dir);
-    let mut pool_file: crate::models::ApiPoolFile = store.kv_get("api_pool");
+    // 读改写基线统一走迁移入口（对齐上游 P1 审查修复）：直读 kv_get 会落 serde
+    // default，整表写回把 Buddy 池旧共享迁移值（并发上限/池粘性 TTL）静默覆盖丢失；
+    // runtime.rs::load_pool_file 即为此统一入口（pool_set / groups 写回共用）
+    let mut pool_file = crate::api_server::runtime::load_pool_file(&state.data_dir);
     if pool_file.qoder_group_ids.iter().any(|g| g == &id) {
         pool_file.qoder_group_ids.retain(|g| g != &id);
-        store.kv_set("api_pool", &pool_file)?;
+        crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
         crate::api_server::runtime::reload_pools_after_change(state);
     }
     Ok(())

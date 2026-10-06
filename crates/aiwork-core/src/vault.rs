@@ -170,6 +170,15 @@ fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<VaultH
     Ok(guard)
 }
 
+/// 测试专用：重置全局 vault 句柄。运行期 vault 为进程级单例（首个 open 固化
+/// conf_path），多 data_dir 测试并行时单例会跨目录串写/指向已删快照——各触碰
+/// vault 的测试开头调用本函数，下一跳 open() 按调用方 conf_path 重新打开
+/// （ns_get/ns_set 每次均经 open() 惰性重建 + 快照 commit，重置安全且自愈）
+#[cfg(test)]
+pub(crate) fn reset_for_tests() {
+    *VAULT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 // ---------------- 公共 API ----------------
 
 /// 从磁盘加载账号文件，并从 vault 回填占位账号的明文凭据（仅内存，不落明文盘）。
@@ -515,6 +524,37 @@ pub fn migrate_on_startup(state: &AppState) {
             fs_utils::app_log(
                 &state.data_dir,
                 &format!("启动迁移: 已将 {migrated} 个 WB 账号的明文凭据加密写入 vault"),
+            );
+        }
+    }
+    // API Key 收敛（对齐上游 9ba5fd0「API Key vault 化」；docker 适配批次 E 内存权威架构）：
+    // api_keys 表中遗留明文 key → vault ns `api_key`（按条目 id），随后 DB 占位化。
+    // 幂等：占位行 key 为空自然跳过；两段式写序（先 vault 后占位）确保 vault 失败时
+    // 明文保留、下次启动重试。运行时 verify/展示走内存权威副本（api_keys::entry_or_load
+    // 读侧回填），增量落库收敛统一在 api_keys::persist，此处仅收存量。
+    {
+        let mut file = crate::store::docs::api_keys_load(&crate::store::db(&state.data_dir));
+        let mut migrated = 0usize;
+        for k in file.keys.iter_mut() {
+            if k.key.trim().is_empty() {
+                continue;
+            }
+            let entry = serde_json::json!({ "key": k.key });
+            if ns_set(&state.data_dir, "api_key", &k.id, &entry).is_ok() {
+                k.key = String::new();
+                migrated += 1;
+            } else {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("启动迁移: API Key {} 写入 vault 失败（明文保留，下次启动重试）", k.id),
+                );
+            }
+        }
+        if migrated > 0 {
+            let _ = crate::store::docs::api_keys_save(&crate::store::db(&state.data_dir), &file);
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("启动迁移: 已将 {migrated} 个 API Key 加密写入 vault（库中占位化）"),
             );
         }
     }

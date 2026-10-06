@@ -67,6 +67,8 @@ Buddy 账号页发起 OAuth 后按提示在浏览器完成授权，服务端自�
 
 - **管理面** `/api/*`：主令牌 + 附加管理员令牌（可签发/吊销，最多 20 个）并集校验 → HttpOnly Cookie 会话（7 天有效期），未登录一律 401；
 - **网关** `/v1/*`：api_keys 鉴权 fail-closed（未配置 key 即全拒）；
+- **网关 API Key vault 加密落盘**（v1.4.1 起）：API Key 不再明文存 SQLite——真值加密写入 vault（`data/conf/vault.stronghold`），库中仅占位；主密码优先取环境变量 `AIWORK_VAULT_KEY`（跨机/容器重建可复现），否则自动生成 `data/conf/vault_key.bin`。**两个文件都在 data 卷内，备份 data 卷时需一并保留**；升级首启自动迁移存量明文 key（幂等，失败时明文保留下次重试）；
+- **「关闭鉴权」开关仅环回监听生效**（v1.4.1 起）：容器/compose 默认监听 `0.0.0.0:8080`（非环回），此时 `auth_disabled` 不生效——曾以「无启用 Key + 关闭鉴权」模式运行的存量部署，升级后 `/v1/*` 将 401，请在 Web 端 API 服务页启用至少一个 API Key；
 - **`/health`**：公开探活端点，仅输出聚合级运营汇总（池计数 / 积分合计 / 今日 token 合计，无账号级明细与凭据）；
 - 出网：服务端以合成指纹直连 `api.trae.cn` / `trae-api-cn.mchost.guru` / `copilot.tencent.com`，**不读系统代理**；
 - 建议加固（公网部署必做）：反向代理加 TLS（见下节）、管理面 IP 允许列表（反代层或应用层内置，见下节）、`AIWORK_ADMIN_TOKEN` 显式注入强随机值、禁用 8080 直接对公网暴露（compose 端口映射改 `127.0.0.1:8080:8080` 仅本机反代可达）。

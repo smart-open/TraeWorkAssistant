@@ -39,7 +39,11 @@ export default function QoderSettings() {
   }, [refresh]);
 
   const save = async () => {
-    if (!settings) return;
+    if (!settings) {
+      // 配置未加载时静默返回会让用户误以为保存成功（对齐 BuddyApiService 守卫模式）
+      pushToast('warn', '配置尚未加载，无法保存（请刷新重试）');
+      return;
+    }
     setSaving(true);
     try {
       await withMinDelay(api.qoder.settingsSet(settings), 800);

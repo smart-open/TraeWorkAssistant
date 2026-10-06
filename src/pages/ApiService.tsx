@@ -181,7 +181,7 @@ export default function ApiService() {
       // 会话粘性 1800s / 对冲 8s）
       setTraeAccountConcurrencyLimit(pool.trae_account_concurrency_limit ?? 1);
       setTraePoolStickyTtlSecs(pool.trae_pool_sticky_ttl_secs ?? 300);
-      setTraeStickyTtlSecs(pool.trae_sticky_ttl_secs ?? 1800);
+      setTraeStickyTtlSecs(Math.max(60, pool.trae_sticky_ttl_secs ?? 1800));
       setTraeHedgeThresholdMs(pool.trae_hedge_threshold_ms ?? 8_000);
     } catch {
       // 初始化加载失败静默保留空列表；手动点击刷新失败需给出提示
@@ -781,19 +781,19 @@ export default function ApiService() {
                           会话粘性 TTL
                         </span>
                         <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
-                          显式 conversationId / 消息指纹绑定账号的有效期
+                          显式 conversationId / 消息指纹绑定账号的有效期（最小 60 秒，无独立关闭开关）
                         </span>
                       </span>
                       <span className="flex shrink-0 items-center gap-1.5">
                         <input
                           type="number"
-                          min={0}
+                          min={60}
                           max={86400}
                           step={60}
                           value={traeStickyTtlSecs}
                           onChange={(e) =>
                             setTraeStickyTtlSecs(
-                              Math.max(0, Math.min(86400, Number(e.target.value) || 0)),
+                              Math.max(60, Math.min(86400, Number(e.target.value) || 0)),
                             )
                           }
                           className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
