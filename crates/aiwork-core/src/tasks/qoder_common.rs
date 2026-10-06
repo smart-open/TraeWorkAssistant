@@ -1195,7 +1195,8 @@ impl CrossProcLock {
                 Ok(()) => return (Some(Self { _file: f }), None),
                 // 文件被其他进程/线程持有，按 wait_ms 预算轮询等待
                 Err(std::fs::TryLockError::WouldBlock) => {}
-                Err(e) => {
+                // 解构 TryLockError 拿出内部 io::Error（TryLockError 本身无 raw_os_error）
+                Err(std::fs::TryLockError::Error(e)) => {
                     eprintln!("CrossProcLock({scope}) 加锁 IO 错误: {e}");
                     return (
                         None,
