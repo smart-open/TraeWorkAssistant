@@ -2334,7 +2334,7 @@ mod tests {
         let t = QoderTranslate::new(lines.into_iter(), slot.clone(), "chat-1", "M");
         let ilines = InterruptibleLines::from_iterator(Box::new(t));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let (err, sent_any, _fi, _u) = wb_sse::stream_forward_ex(ilines, &tx, proto, "chat-1", "M");
+        let (err, sent_any, _fi, _u, _t) = wb_sse::stream_forward_ex(ilines, &tx, proto, "chat-1", "M");
         drop(tx);
         let mut sent = Vec::new();
         while let Ok(frame) = rx.try_recv() {
@@ -2393,7 +2393,7 @@ mod tests {
     /// 防重复流）——保证上面的换号语义只作用于「首内容帧前」窗口
     #[test]
     fn error_after_content_is_inline_not_rotation() {
-        let (err, sent_any, failed_inline, _u) = {
+        let (err, sent_any, failed_inline, _u, _t) = {
             let slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
             let t = QoderTranslate::new(
                 vec![

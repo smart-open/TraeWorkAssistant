@@ -526,12 +526,26 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                 }
             }
             None => {
-                // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）
-                if fail_reason == Some(wb_common::RefreshFail::Auth) {
+                // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）。
+                // NoRefreshToken 亦属凭证永久失效（401 后无 refreshToken 可刷，永不自愈），
+                // 一并标记避免后续轮次反复白打 401。
+                // 审查 #1：message 按 fail_reason 差异化——原实现恒报「需重新登录」，
+                // 而 scheduler 的 failed_permanent 按消息含「需重新登录」关键字统计，
+                // 网络/忙碌/响应异常等瞬时态会被误判当日闭合不再重试。
+                let fail = fail_reason.unwrap_or(wb_common::RefreshFail::Network);
+                if matches!(fail, wb_common::RefreshFail::Auth | wb_common::RefreshFail::NoRefreshToken) {
                     wb_common::mark_needs_relogin(state, &aid, &format!("签到 refresh 失败: {message}"));
                 }
                 kind = "fail".into();
-                message = "登录态失效且刷新失败，需重新登录".into();
+                message = match fail {
+                    // 永久失效（含「需重新登录」关键字 → 调度器闭合当日，符合事实）
+                    wb_common::RefreshFail::Auth => "登录态失效且刷新失败，需重新登录".into(),
+                    wb_common::RefreshFail::NoRefreshToken => "无刷新凭证，需重新登录".into(),
+                    // 瞬时态（消息不含关键字 → 进入 30 分钟重试队列）
+                    wb_common::RefreshFail::Network => "刷新失败（网络异常），稍后自动重试".into(),
+                    wb_common::RefreshFail::Busy => "他方进程刷新中，稍后自动重试".into(),
+                    wb_common::RefreshFail::BadResponse => "刷新响应异常，稍后自动重试".into(),
+                };
                 reward = None;
             }
         }

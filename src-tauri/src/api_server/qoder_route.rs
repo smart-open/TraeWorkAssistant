@@ -490,6 +490,9 @@ fn run_qoder_stream(
 
     let mut tried: HashSet<String> = HashSet::new();
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+    // 真实消耗计数（审查 #5）：CAS 绑定成功后 +1（identity 解析失败也计入——真实
+    // 消耗）；CAS 拒绝候选不计入，tried.len() 含 CAS 拒绝会虚大 rotated 分母
+    let mut attempts: usize = 0;
 
     loop {
         // 客户端断连检测：通道关闭即终止轮换/重试（对齐 run_wb_stream）
@@ -513,19 +516,21 @@ fn run_qoder_stream(
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None);
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
-                    // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
-                    // wb_template_map.json），否则维持无健康账号文案；
+                    // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示打开
+                    // Qoder 客户端重建设备信任），否则维持无健康账号文案；
                     // code 保持 no_healthy_account（客户端兼容）
                     let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
-                    let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                        "qoder", empty_hits, attempts, healthy_total,
+                    );
                     state.logger.log_request(
                         "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "", Some(&exhaust_msg),
                     );
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder",
+                        "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool=qoder",
                         tried.len(),
+                        attempts,
                         empty_hits
                     ));
                     // 审查 P1-1：无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
@@ -560,6 +565,7 @@ fn run_qoder_stream(
         if !bound {
             continue;
         }
+        attempts += 1;
         *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
         // 凭证解析：回调缺失（未注入/单测）→ 换号不冷却（配置问题非账号问题）；
@@ -659,7 +665,7 @@ fn run_qoder_stream(
                     let win_uid = race.uid.clone();
                     // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
                     let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
-                    let (error_info, sent_any, failed_inline, usage) =
+                    let (error_info, sent_any, failed_inline, usage, eof_truncated) =
                         wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     let meta = err_slot
@@ -737,15 +743,21 @@ fn run_qoder_stream(
                                     // translate 写 ErrMeta，必落本分支（非「理论不可达」）：
                                     // 上游间歇性空回放属暂态，按 wb_route 口径免熔断，
                                     // 仅由下方 !sent_any 分支换号重试
-                                    if super::is_empty_completion(code, &msg) {
-                                        empty_hits += 1; // 空完成计数：耗尽收尾区分指纹拦截
-                                    } else {
+                                    if !super::is_empty_completion(code, &msg) {
                                         state.qoder_pool.note_error(&win_uid, ErrKind::Server);
                                     }
+                                    // 空完成计数移至下方 !sent_any 护栏内（审查 2026-10-07：
+                                    // 口径对齐 routes/wb_route——仅真正触发换号的空完成
+                                    // 计入，内容已流出的就地收尾不计，避免 exhaust_message
+                                    // 指纹归因跨池偏差）
                                 }
                             }
                             if !sent_any {
-                                // 流未开始：错误不下发，允许换号重试
+                                // 流未开始：错误不下发，允许换号重试；空完成在此计数
+                                //（仅换号路径计入：耗尽收尾区分指纹拦截）
+                                if super::is_empty_completion(code, &msg) {
+                                    empty_hits += 1;
+                                }
                                 break;
                             }
                             state.logger.log_request_ttfb(
@@ -780,7 +792,17 @@ fn run_qoder_stream(
                             state.logger.log_request_ttfb(
                                 "qoder", "POST", "/v1/chat/completions", model, true, 200,
                                 &win_uid, duration_ms, Some(ttfb_ms), &key_name,
-                                &state.qoder_pool.name_of(&win_uid), None,
+                                &state.qoder_pool.name_of(&win_uid),
+                                // 审查 #6：EOF 截断的成功行标注截断（与上游原貌不符，排障可观测）。
+                                // 审查 2026-10-07：断连场景（tx 已关）wb_sse 跳过补帧，
+                                // 补帧断言仅对客户端仍在线的 EOF 截断成立，按 tx 区分文案
+                                eof_truncated.then(|| {
+                                    if tx.is_closed() {
+                                        "上游 EOF 截断（未收到 Done），客户端已提前断开"
+                                    } else {
+                                        "上游 EOF 截断（未收到 Done），已按协议补齐终止帧"
+                                    }
+                                }),
                             );
                             return;
                         }
@@ -957,6 +979,9 @@ pub async fn qoder_aggregate_chat(
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // 真实消耗计数（审查 #5）：CAS 绑定成功后 +1（identity 解析失败也计入——真实
+        // 消耗）；CAS 拒绝候选不计入，tried.len() 含 CAS 拒绝会虚大 rotated 分母
+        let mut attempts: usize = 0;
 
         loop {
             // ── 取号：粘性命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
@@ -988,8 +1013,9 @@ pub async fn qoder_aggregate_chat(
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
-                        let (exhaust_msg, _) =
-                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        let (exhaust_msg, _) = super::routes::exhaust_message(
+                            "qoder", empty_hits, attempts, healthy_total,
+                        );
                         return Err(exhaust_msg);
                     }
                 },
@@ -1013,6 +1039,7 @@ pub async fn qoder_aggregate_chat(
             if !bound {
                 continue;
             }
+            attempts += 1;
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             let creds: QoderCreds = match state.qoder_identity.as_ref() {

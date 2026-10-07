@@ -546,6 +546,9 @@ fn run_wb_stream(
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+    // 实际绑定成功并发出请求的账号数（CAS 拒绝候选不计入——tried 含 CAS 拒绝会
+    // 虚大 rotated 分母，稀释「空完成主导」判定，审查 2026-10-07）
+    let mut attempts: usize = 0;
 
     loop {
         // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）
@@ -571,7 +574,7 @@ fn run_wb_stream(
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
                     let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
                     let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        super::routes::exhaust_message("buddy", empty_hits, attempts, healthy_total);
                     state.logger.log_request(
                         "buddy", "POST", "/v2/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "",
@@ -583,8 +586,9 @@ fn run_wb_stream(
                         .map(|d| format!("{}({})", d.name, d.reason))
                         .collect();
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy reasons=[{}]",
+                        "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool=buddy reasons=[{}]",
                         tried.len(),
+                        attempts,
                         empty_hits,
                         diag_summary.join(", "),
                     ));
@@ -618,6 +622,7 @@ fn run_wb_stream(
         if !bound {
             continue;
         }
+        attempts += 1; // 绑定成功即真实消耗一个候选（CAS 拒绝不计入分母）
         *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
         // 上游会话 id：粘性命中复用，否则新生成（成功后绑定）
@@ -681,7 +686,7 @@ fn run_wb_stream(
                     let win_lines = super::wb_upstream::InterruptibleLines::from_iterator(
                         Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
                     );
-                    let (error_info, sent_any, failed_inline, usage) =
+                    let (error_info, sent_any, failed_inline, usage, eof_truncated) =
                         wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
@@ -715,11 +720,13 @@ fn run_wb_stream(
                                 }
                                 // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传、
                                 // 不绑定粘性，换号重试（收尾帧未发，重试流可续传）。
-                                // 终审明确边界：Responses 协议下 wb_sse 已先行补发
-                                // response.failed(empty_completion)（防 created 悬空），
-                                // 换号成功 → 新流 created 跟在 failed 后（客户端按
-                                // sequence_number 续读，属协议内形态）；换号耗尽 →
-                                // no_healthy_account 终态帧成第二帧——双终态优于悬空
+                                // 协议边界（审查 2026-10-07 修正注释与控制流矛盾）：能到达
+                                // 本换号分支的 Responses 流必然零 delta——wb_sse 对任意
+                                // delta 均置 sent_any=true（早被上方护栏就地收尾），故
+                                // resp_created=false、wb_sse 不补发 response.failed：
+                                // 换号成功 → 重试流 created 即首帧；耗尽 →
+                                // no_healthy_account 终态同为首帧，不存在原注释所述
+                                //「failed 后跟第二终态」的双终态序列
                                 empty_hits += 1;
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
@@ -767,7 +774,17 @@ fn run_wb_stream(
                             state.logger.log_request_ttfb(
                                 "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                 duration_ms, Some(ttfb_ms), &key_name,
-                                &state.wb_pool.name_of(win_uid), None,
+                                &state.wb_pool.name_of(win_uid),
+                                // 审查 #6：EOF 截断的成功行标注截断（与上游原貌不符，排障可观测）。
+                                // 审查 2026-10-07：断连场景（tx 已关）wb_sse 跳过补帧，
+                                // 补帧断言仅对客户端仍在线的 EOF 截断成立，按 tx 区分文案
+                                eof_truncated.then(|| {
+                                    if tx.is_closed() {
+                                        "上游 EOF 截断（未收到 Done），客户端已提前断开"
+                                    } else {
+                                        "上游 EOF 截断（未收到 Done），已按协议补齐终止帧"
+                                    }
+                                }),
                             );
                             return;
                         }
@@ -923,6 +940,8 @@ pub async fn wb_aggregate_chat(
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // 实际绑定成功并发出请求的账号数（CAS 拒绝候选不计入分母，同流式路径）
+        let mut attempts: usize = 0;
 
         loop {
             let picked = match first_pick.take() {
@@ -942,7 +961,7 @@ pub async fn wb_aggregate_chat(
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
                         let (exhaust_msg, _) =
-                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                            super::routes::exhaust_message("buddy", empty_hits, attempts, healthy_total);
                         return Err(exhaust_msg);
                     }
                 },
@@ -965,6 +984,7 @@ pub async fn wb_aggregate_chat(
             if !bound {
                 continue;
             }
+            attempts += 1; // 绑定成功即真实消耗一个候选（CAS 拒绝不计入分母）
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             let is_sticky_hit =
@@ -1260,6 +1280,8 @@ pub async fn wb_tool_exec_chat(
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // 实际绑定成功并发出请求的账号数（CAS 拒绝候选不计入分母，同流式路径）
+        let mut attempts: usize = 0;
         let mut records: Vec<super::wb_toolexec::SearchRecord> = Vec::new();
         let mut final_completion: Option<Value> = None;
         let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
@@ -1300,6 +1322,7 @@ pub async fn wb_tool_exec_chat(
             if !bound {
                 continue;
             }
+            attempts += 1; // 绑定成功即真实消耗一个候选（CAS 拒绝不计入分母）
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
             let mut creds = WbCreds {
                 id: picked.uid.clone(),
@@ -1541,7 +1564,7 @@ pub async fn wb_tool_exec_chat(
                 // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                 Err(last_err.unwrap_or_else(|| {
                     let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
-                    super::routes::exhaust_message(empty_hits, tried.len(), healthy_total).0
+                    super::routes::exhaust_message("buddy", empty_hits, attempts, healthy_total).0
                 }))
             }
         }

@@ -482,6 +482,8 @@ fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool) -> Bl
 /// - 200/BLOCKED：服务端风控明确拒绝本次领取（非依赖故障、非瞬时错误），
 ///   提示到真实客户端建立设备信任
 /// - 503/RISK_DEPENDENCY_UNAVAILABLE：风控前置依赖暂不可用，调度器会自动重试
+/// - 4xx：KNOWN_DAILY_CAMPAIGNS 为表单日轮换 ID，活动过期是最常见根因
+///（审查 2026-10-07：此前 4xx 静默吞进原始响应前缀，难以定位）
 fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String {
     if claimed == Some("BLOCKED") {
         return "服务端风控拦截（status=BLOCKED，本次领取被拒绝）——请在 Qoder 客户端正常登录/使用一次建立设备信任后重试".into();
@@ -490,7 +492,12 @@ fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String
         return "服务端风控依赖暂不可用（503 RISK_DEPENDENCY_UNAVAILABLE），稍后将自动重试".into();
     }
     let head: String = raw.chars().take(120).collect();
-    format!("（HTTP {code}）{head}")
+    let expired = if (400..500).contains(&code) {
+        "活动 ID 疑似过期（每日轮换），请抓包/探针更新 KNOWN_DAILY_CAMPAIGNS；"
+    } else {
+        ""
+    };
+    format!("（HTTP {code}）{expired}{head}")
 }
 
 /// 盲发兜底聚合结果（替代原 Option<(kind, message, reward)>——None 曾被调用方
@@ -506,13 +513,16 @@ enum FallbackOutcome {
     Auth(Option<f64>, Vec<Value>),
     /// 存在失败条目（4xx/5xx/网络/未知形态）——如实报 fail，触发调度器
     /// 30 分钟重试 + UI 显示真话（即使同时有成功条目：claim 幂等，重试轮次
-    /// 以列表已领判定/回放确认，不产生重复领取副作用）
-    Failed(String),
+    /// 以列表已领判定/回放确认，不产生重复领取副作用）。本轮已成功条目的
+    /// reward 与明细随行（审查 2026-10-07 修复：原先丢弃——重试轮不会重发
+    /// 已成功条目，丢弃导致当日入账展示/日历明细短暂少记）
+    Failed(String, Option<f64>, Vec<Value>),
 }
 
 /// 列表零 CLAIMABLE 时的已知每日活动盲发直领。逐条对 KNOWN_DAILY_CAMPAIGNS
 /// 盲发 claim，单步经 classify_blind_step 归类后聚合：
-/// - 任一 Failed → `Failed`（宁 fail 不假 already；成功/回放条目信息保留在 message）
+/// - 任一 Failed → `Failed`（宁 fail 不假 already；成功/回放条目信息保留在
+///   message，已成功条目 reward/明细随行不丢弃）
 /// - 无失败且任一 FreshClaim → `Success`（携带逐活动明细，F-80-余 日历数据源）
 /// - 全部 Replay → `AlreadyReplayed`
 /// - 表空/全被路径白名单拦下（无任何结果）→ `Failed`
@@ -588,7 +598,8 @@ fn known_daily_fallback(agent: &ureq::Agent, headers: &[(String, String)]) -> Fa
         if any_fresh {
             msg = format!("{}；{}", messages.join("；"), msg);
         }
-        return FallbackOutcome::Failed(msg);
+        // 已成功条目的 reward/明细随行（真实入账不丢，对齐 Auth 分支语义）
+        return FallbackOutcome::Failed(msg, reward, detail);
     }
     if any_fresh {
         return FallbackOutcome::Success(messages.join("；"), reward, detail);
@@ -596,7 +607,7 @@ fn known_daily_fallback(agent: &ureq::Agent, headers: &[(String, String)]) -> Fa
     if any_replay {
         return FallbackOutcome::AlreadyReplayed;
     }
-    FallbackOutcome::Failed("已知每日活动表为空，无兜底可尝试".into())
+    FallbackOutcome::Failed("已知每日活动表为空，无兜底可尝试".into(), None, Vec::new())
 }
 
 /// 处理单账号签到（含 401 刷新一次重试，禁二次刷新）。返回 account 事件（不含 index）。
@@ -681,7 +692,11 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                             campaigns_detail = (!detail.is_empty()).then_some(detail);
                             ("auth".into(), "登录态失效（401）".into(), r)
                         }
-                        FallbackOutcome::Failed(m) => ("fail".into(), m, None),
+                        FallbackOutcome::Failed(m, r, detail) => {
+                            // fail 轮已成功条目的明细保留（真实入账不丢，对齐 Auth 分支）
+                            campaigns_detail = (!detail.is_empty()).then_some(detail);
+                            ("fail".into(), m, r)
+                        }
                     }
                 }
             } else {
@@ -789,7 +804,17 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                                         };
                                         ("auth".into(), "登录态失效（401）".into(), r)
                                     }
-                                    FallbackOutcome::Failed(m) => ("fail".into(), m, None),
+                                    FallbackOutcome::Failed(m, r, detail) => {
+                                        // fail 轮已成功条目的明细并入（真实入账不丢）
+                                        campaigns_detail = match campaigns_detail.take() {
+                                            Some(mut prev) => {
+                                                prev.extend(detail);
+                                                Some(prev)
+                                            }
+                                            None => (!detail.is_empty()).then_some(detail),
+                                        };
+                                        ("fail".into(), m, r)
+                                    }
                                 }
                             }
                         } else {
@@ -1186,7 +1211,8 @@ mod tests {
     }
 
     /// 盲发失败消息构造：BLOCKED/风控依赖不可用给可操作提示（不倾倒原始
-    /// JSON），未知形态保留旧格式（HTTP 码 + 原始响应前缀）
+    /// JSON），未知形态保留旧格式（HTTP 码 + 原始响应前缀）；4xx 追加活动
+    /// 表过期提示（审查 #8）
     #[test]
     fn describe_blind_failure_friendly_for_known_shapes() {
         // 实测 BLOCKED 形态（2026-10-07 nick 账号）：HTTP 200 + status=BLOCKED
@@ -1204,10 +1230,16 @@ mod tests {
         );
         assert!(msg.contains("RISK_DEPENDENCY_UNAVAILABLE"), "{msg}");
         assert!(msg.contains("自动重试"), "{msg}");
-        // 未知形态：保持旧格式（HTTP 码 + 原始响应前缀）
+        // 未知形态（非 4xx）：保持旧格式（HTTP 码 + 原始响应前缀）
+        assert_eq!(
+            describe_blind_failure(500, None, r#"{"message":"oops"}"#),
+            r#"（HTTP 500）{"message":"oops"}"#
+        );
+        // 未知形态（4xx）：旧格式 + 活动 ID 过期提示（审查 #8：campaignId
+        // 每日轮换，4xx 最常见原因是活动表过期，给可操作提示）
         assert_eq!(
             describe_blind_failure(404, None, r#"{"message":"not found"}"#),
-            r#"（HTTP 404）{"message":"not found"}"#
+            r#"（HTTP 404）活动 ID 疑似过期（每日轮换），请抓包/探针更新 KNOWN_DAILY_CAMPAIGNS；{"message":"not found"}"#
         );
     }
 

@@ -343,12 +343,26 @@ pub(crate) fn dispatch_error_response(
 /// "no healthy account available" 会误导用户排查账号——现按 empty_hits 分流：
 /// 空完成主导（过半轮换账号返回空完成）→ 明示指纹拦截语义（账号/模型无关，
 /// 提示更新清洗规则表）；混合失败（空完成仅零星出现、以限流/5xx 为主）时
-/// 维持原文案，避免 "switching won't help" 误导排障方向。返回 (错误消息, 诊断日志标记)
-pub(crate) fn exhaust_message(empty_hits: usize, rotated: usize, healthy_total: usize) -> (String, &'static str) {
+/// 维持原文案，避免 "switching won't help" 误导排障方向。返回 (错误消息, 诊断日志标记)。
+/// pool 取池标识（"trae"/"buddy"/"qoder"）：池名与处置建议按池区分（审查 2026-10-07
+/// ——原实现三池共用 trae 文案；qoder 无 wb_template_map/sanitize 机制，其空完成
+/// 根因是设备指纹分桶，正确处置是在真实客户端建立设备信任）。trae 文案与原实现
+/// 逐字一致（存量测试/日志兼容）
+pub(crate) fn exhaust_message(pool: &str, empty_hits: usize, rotated: usize, healthy_total: usize) -> (String, &'static str) {
     if rotated > 0 && empty_hits * 2 > rotated {
+        let pool_upper = match pool {
+            "buddy" => "WB",
+            "qoder" => "Qoder",
+            _ => "Trae",
+        };
+        let advice = if pool == "qoder" {
+            "try opening the Qoder client once to rebuild device trust"
+        } else {
+            "try updating wb_template_map.json or enabling sanitize"
+        };
         (
             format!(
-                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts (Trae shadow risk control, account/model agnostic — switching won't help); try updating wb_template_map.json or enabling sanitize (pool=trae healthy={healthy_total})",
+                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts ({pool_upper} shadow risk control, account/model agnostic — switching won't help); {advice} (pool={pool} healthy={healthy_total})",
             ),
             "CHANNEL_FINGERPRINT_BLOCK",
         )
@@ -1507,6 +1521,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
         let mut empty_hits: usize = 0;
+        // 真实消耗计数（审查 #5）：CAS 绑定成功后 +1（identity 解析失败也计入——真实
+        // 消耗）；CAS 拒绝候选不计入，tried.len() 含 CAS 拒绝会虚大 rotated 分母
+        let mut attempts: usize = 0;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
@@ -1546,6 +1563,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             if !bound {
                 continue;
             }
+            attempts += 1;
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             let mut converted = super::payload::prepare_llm_chat_body(
@@ -1834,7 +1852,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 即「每请求 N 行尝试/终态记账」，非严格单行；wb/qoder 同构口径
         state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let (healthy_total, _) = state.pool.selectable_stats_in(None);
-        let (exhaust_msg, exhaust_tag) = exhaust_message(empty_hits, tried.len(), healthy_total);
+        let (exhaust_msg, exhaust_tag) = exhaust_message("trae", empty_hits, attempts, healthy_total);
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
             .iter()
@@ -1974,6 +1992,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
         let mut empty_hits: usize = 0;
+        // 真实消耗计数（审查 #5）：CAS 绑定成功后 +1（identity 解析失败也计入——真实
+        // 消耗）；CAS 拒绝候选不计入，tried.len() 含 CAS 拒绝会虚大 rotated 分母
+        let mut attempts: usize = 0;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
@@ -2010,6 +2031,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             if !bound {
                 continue;
             }
+            attempts += 1;
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             let mut converted = super::payload::prepare_llm_chat_body(
@@ -2241,7 +2263,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         // 轮换耗尽收尾：空完成主导 → 明示渠道指纹拦截语义，否则维持原文案
         let (healthy_total, _) = state.pool.selectable_stats_in(None);
-        let (exhaust_msg, exhaust_tag) = exhaust_message(empty_hits, tried.len(), healthy_total);
+        let (exhaust_msg, exhaust_tag) = exhaust_message("trae", empty_hits, attempts, healthy_total);
         let diag = state.pool.diagnose();
         // 用量记账（所有账号不可用）
         state.record_usage(false, &model, "none", &key_id, false, stream, duration_ms, 0, 0);
@@ -2702,7 +2724,7 @@ mod tests {
     #[test]
     fn exhaust_message_empty_hits_indicates_fingerprint_block() {
         // 空完成主导：明示指纹拦截语义（账号/模型无关），带清洗规则表提示与健康计数
-        let (msg, tag) = exhaust_message(3, 3, 4);
+        let (msg, tag) = exhaust_message("trae", 3, 3, 4);
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert!(msg.contains("3 empty completion(s) across 3 rotated accounts"), "{msg}");
         assert!(msg.contains("healthy=4"), "{msg}");
@@ -2713,7 +2735,7 @@ mod tests {
     #[test]
     fn exhaust_message_no_empty_hits_keeps_original() {
         // 无空完成（401/429/5xx 等真实不健康）：维持原文案，避免误导
-        let (msg, tag) = exhaust_message(0, 3, 0);
+        let (msg, tag) = exhaust_message("trae", 0, 3, 0);
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
@@ -2722,7 +2744,7 @@ mod tests {
     fn exhaust_message_minority_empty_hits_keeps_original() {
         // 混合失败：仅 1 次空完成 + 其余限流/5xx，空完成非主导 → 不宣判指纹拦截，
         // 避免 "switching won't help" 误导排障方向（限流等待冷却即可自愈）
-        let (msg, tag) = exhaust_message(1, 10, 2);
+        let (msg, tag) = exhaust_message("trae", 1, 10, 2);
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
@@ -2730,8 +2752,31 @@ mod tests {
     #[test]
     fn exhaust_message_majority_empty_hits_indicates_fingerprint_block() {
         // 过半轮换账号返回空完成（6/10）→ 判定指纹拦截主导
-        let (msg, tag) = exhaust_message(6, 10, 2);
+        let (msg, tag) = exhaust_message("trae", 6, 10, 2);
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
+        assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+    }
+
+    #[test]
+    fn exhaust_message_qoder_pool_gets_device_trust_advice() {
+        // qoder 池无 wb_template_map/sanitize 机制：处置建议指向客户端设备信任，
+        // 池名展示为 Qoder（审查 2026-10-07 按池区分归因文案）
+        let (msg, tag) = exhaust_message("qoder", 6, 10, 2);
+        assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
+        assert!(msg.contains("Qoder shadow risk control"), "{msg}");
+        assert!(msg.contains("rebuild device trust"), "{msg}");
+        assert!(!msg.contains("wb_template_map"), "{msg}");
+        assert!(msg.contains("pool=qoder"), "{msg}");
+        assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+    }
+
+    #[test]
+    fn exhaust_message_buddy_pool_labels_wb() {
+        // buddy 池沿用清洗规则表建议，池名展示为 WB
+        let (msg, tag) = exhaust_message("buddy", 3, 3, 4);
+        assert!(msg.contains("WB shadow risk control"), "{msg}");
+        assert!(msg.contains("wb_template_map.json"), "{msg}");
+        assert!(msg.contains("pool=buddy"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
     }
 

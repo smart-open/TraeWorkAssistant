@@ -45,9 +45,32 @@ pub const CLIENT_USER_AGENT: &str = "Qoder";
 /// 网关域 1.1.38）区分——两个域的 COSY 协议版本互不通用。
 pub const CLIENT_COSY_VERSION: &str = "0.4.3";
 
-/// 客户端 openapi 域机器 OS 标识（同抓包实测 `cosy-machineos: x86_64_win32`；
-/// qoder_sign 网关域为 x86_64_windows，形态不同勿混用）
-pub const CLIENT_MACHINE_OS: &str = "x86_64_win32";
+/// 客户端 openapi 域机器 OS 标识（Windows 抓包实测 `cosy-machineos: x86_64_win32`；
+/// qoder_sign 网关域为 x86_64_windows，形态不同勿混用）。按编译目标平台区分
+///（审查 2026-10-07：原常量硬编码 win32 值，macOS 构建会把 Windows 标识发给
+/// 服务端）；macOS 分支按 Qoder 网关命名惯例推断，待真机抓包验证后对齐客户端
+/// 形态。其他平台占位（本项目仅 Windows/macOS 发布，保 CI 单测可编译）。
+pub fn client_machine_os() -> &'static str {
+    #[cfg(windows)]
+    {
+        "x86_64_win32"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        #[cfg(target_arch = "aarch64")]
+        {
+            "aarch64_darwin"
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            "x86_64_darwin"
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        "unknown_os"
+    }
+}
 
 // ── 凭证结构 ────────────────────────────────────────────────────────────────
 
@@ -467,29 +490,70 @@ pub fn clear_device_flow_creds(state: &AppState, id: &str) -> Result<(), String>
 /// 实测与 proxy 抓包 12:35 逐字节一致）：服务端按此三元组做设备指纹分桶——
 /// campaigns 列表的 CLAIMABLE 过滤与 claim 的风控前置拦截（盲发 503
 /// RISK_DEPENDENCY_UNAVAILABLE）都以真值为准；machine_id 截断派生值不被信任。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NativeRiskIdentity {
     pub machine_token: String,
     pub machine_type: String,
     pub machine_code: String,
 }
 
+// 手写脱敏 Debug（审查 2026-10-07，对齐上方 QoderCreds 惯例：derive(Debug) 会把
+// machine_token 全量打进日志——触犯「凭证不入日志」红线）：token/code 掩码仅显
+// **（空则空串便于排障），machine_type 为种类枚举非凭证、保留明文
+impl std::fmt::Debug for NativeRiskIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mask = |s: &str| if s.is_empty() { "" } else { "**" };
+        f.debug_struct("NativeRiskIdentity")
+            .field("machine_token", &mask(&self.machine_token))
+            .field("machine_type", &self.machine_type)
+            .field("machine_code", &mask(&self.machine_code))
+            .finish()
+    }
+}
+
 /// Qoder 主客户端（"Qoder CN" 0.4.3，Electron，userData=com.qodercn.app.stable）
-/// 随包分发的原生身份工具：`resources\umid\runtime-info.exe`（配 sgsdk.dll）。
+/// 随包分发的原生身份工具：Windows 形态 `resources\umid\runtime-info.exe`
+/// （配 sgsdk.dll）；macOS 形态 bundle 内 `Contents/Resources/umid/runtime-info`
+/// （无 .exe 后缀，双根探测与 commands/qoder/common.rs 的 mac_app_bases 同源）。
 /// 客户端桥以 `spawn(exe, [env, "--account-stdin"])` + stdin `{account}.` 调用；
 /// 实测无参直跑同样输出真值且与账号参数无关（机器恒定，exit 0 瞬时返回）。
 fn runtime_info_exe_path() -> Option<std::path::PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")?;
-    let p = std::path::Path::new(&local)
-        .join("Programs")
-        .join("Qoder CN")
-        .join("resources")
-        .join("umid")
-        .join("runtime-info.exe");
-    if p.is_file() {
-        Some(p)
-    } else {
+    #[cfg(target_os = "macos")]
+    {
+        // mac 适配（2026-10-07）：/Applications、~/Applications 双根下 Qoder CN.app
+        // bundle 内探测；未随包分发/未安装时返回 None，调用方走派生 fallback。
+        let mut bases = vec![std::path::PathBuf::from("/Applications")];
+        let home = crate::platform::home_dir();
+        if !home.as_os_str().is_empty() {
+            bases.push(home.join("Applications"));
+        }
+        for base in bases {
+            let p = base
+                .join("Qoder CN.app")
+                .join("Contents")
+                .join("Resources")
+                .join("umid")
+                .join("runtime-info");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
         None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let local = std::env::var_os("LOCALAPPDATA")?;
+        let p = std::path::Path::new(&local)
+            .join("Programs")
+            .join("Qoder CN")
+            .join("resources")
+            .join("umid")
+            .join("runtime-info.exe");
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
     }
 }
 
@@ -514,31 +578,140 @@ fn parse_runtime_info_stdout(s: &str) -> Option<NativeRiskIdentity> {
     one(s).or_else(|| s.split('.').next().and_then(one))
 }
 
-/// 解析本机原生风控身份真值（OnceLock 缓存：真值机器恒定，进程内至多 spawn 一次）。
-/// 失败（客户端未安装/执行失败/解析失败）返回 None，调用方走派生 fallback。
+/// runtime-info 单次执行超时上限（实测 exit 0 瞬时返回，3s 已极宽裕；防子进程
+/// 卡死拖住 build_auth_headers 热路径）
+const NATIVE_RISK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 瞬时失败冷却窗口：spawn 非零开销且本函数处于请求热路径，失败后 60s 内不再重试
+const NATIVE_RISK_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`wait_output_limited`] 的单次执行结果分类：决定失败是否可缓存
+enum RuntimeInfoOutcome {
+    Identity(NativeRiskIdentity),
+    /// 确定性缺失（工具未随包分发/路径非法）：机器现状，可缓存终态至进程重启
+    DeterministicNone,
+    /// 瞬时失败（执行出错/超时/非 0 退出/解析失败）：不缓存，冷却后重试
+    TransientNone,
+}
+
+/// 带 3s 上限的子进程执行：轮询 try_wait 超时则 kill+收尸返回 None（原生
+/// `cmd.output()` 无超时，工具卡死会无限阻塞热路径）。输出为 KB 级 JSON，
+/// 不撑 pipe 缓冲，先等退出再 read_to_end 无死锁风险。
+fn wait_output_limited(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            // try_wait 自身出错（进程句柄异常等）：按瞬时失败处理，不缓存；
+            // 与超时路径对称 kill+wait 收尸，防止子进程残留（审查 2026-10-07）
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    // 退出后再收尾读取：管道已关闭，read_to_end 立即返回
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_end(&mut stdout);
+    }
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_end(&mut stderr);
+    }
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// 执行一次 runtime-info 并按失败性质分类（见 [`RuntimeInfoOutcome`]）。
+fn run_runtime_info_once(exe: &std::path::Path) -> RuntimeInfoOutcome {
+    let Some(exe_str) = exe.to_str() else {
+        return RuntimeInfoOutcome::DeterministicNone;
+    };
+    // 收敛经 platform::cmd::sys_command（CREATE_NO_WINDOW 圈进该模块，
+    // 禁止散写 CommandExt——AGENT.md 子进程红线）
+    let mut cmd = crate::platform::cmd::sys_command(exe_str);
+    let Some(out) = wait_output_limited(&mut cmd, NATIVE_RISK_WAIT_TIMEOUT) else {
+        return RuntimeInfoOutcome::TransientNone;
+    };
+    if !out.status.success() {
+        return RuntimeInfoOutcome::TransientNone;
+    }
+    match parse_runtime_info_stdout(&String::from_utf8_lossy(&out.stdout)) {
+        Some(n) => RuntimeInfoOutcome::Identity(n),
+        None => RuntimeInfoOutcome::TransientNone,
+    }
+}
+
+/// 解析本机原生风控身份真值（终态 OnceLock 缓存 + 瞬时失败冷却，审查 2026-10-07
+/// 重写）：真值机器恒定，`Some` 与「确定性缺失」（客户端未装/路径非法）永久缓存；
+/// 执行出错/超时/非 0 退出/解析失败属瞬时态，不进缓存——仅记 60s 冷却，避免一次
+/// 调度抖动把本该可用的真值固化成 None 直到进程重启。冷却内或他线程 spawn 中
+/// 返回 None，调用方走派生 fallback。
 pub fn resolve_native_risk_identity() -> Option<&'static NativeRiskIdentity> {
-    static CACHE: std::sync::OnceLock<Option<NativeRiskIdentity>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let Some(exe) = runtime_info_exe_path() else {
-                return None;
-            };
-            let mut cmd = std::process::Command::new(&exe);
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                // CREATE_NO_WINDOW：Tauri GUI 进程内 spawn 不得闪控制台窗（项目惯例）
-                cmd.creation_flags(0x0800_0000);
+    static FINAL: std::sync::OnceLock<Option<NativeRiskIdentity>> = std::sync::OnceLock::new();
+    static LAST_FAIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    // spawn 闸门：并发调用时仅一线程真正执行，其余直接走派生 fallback（比
+    // OnceLock get_or_init 阻塞排队更稳，避免冷却判过后排队线程重复 spawn）
+    static SPAWN_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    if let Some(cached) = FINAL.get() {
+        return cached.as_ref();
+    }
+    let cooling = LAST_FAIL
+        .lock()
+        .map(|g| g.map(|t| t.elapsed() < NATIVE_RISK_RETRY_COOLDOWN).unwrap_or(false))
+        .unwrap_or(false);
+    if cooling {
+        return None;
+    }
+    let Ok(_gate) = SPAWN_GATE.try_lock() else {
+        return None;
+    };
+    // 双检：排队等闸门期间可能已被他线程写入终态
+    if let Some(cached) = FINAL.get() {
+        return cached.as_ref();
+    }
+
+    let outcome = match runtime_info_exe_path() {
+        Some(exe) => run_runtime_info_once(&exe),
+        None => RuntimeInfoOutcome::DeterministicNone,
+    };
+    match outcome {
+        RuntimeInfoOutcome::Identity(n) => {
+            let _ = FINAL.set(Some(n));
+            FINAL.get().and_then(|o| o.as_ref())
+        }
+        RuntimeInfoOutcome::DeterministicNone => {
+            let _ = FINAL.set(None);
+            None
+        }
+        RuntimeInfoOutcome::TransientNone => {
+            if let Ok(mut g) = LAST_FAIL.lock() {
+                *g = Some(std::time::Instant::now());
             }
-            let Ok(out) = cmd.output() else {
-                return None;
-            };
-            if !out.status.success() {
-                return None;
-            }
-            parse_runtime_info_stdout(&String::from_utf8_lossy(&out.stdout))
-        })
-        .as_ref()
+            None
+        }
+    }
 }
 
 /// 将原生真值三键写入请求头：替换同名既有键（build_auth_headers 先行透传的
@@ -554,6 +727,40 @@ fn apply_native_risk_headers(h: &mut Vec<(String, String)>, n: &NativeRiskIdenti
             Some(slot) => slot.1 = v.to_string(),
             None => h.push((k.to_string(), v.to_string())),
         }
+    }
+}
+
+/// 本机主机名（Cosy-MachineHostname 取值）：Windows 走 COMPUTERNAME 环境变量
+/// （与客户端同源）；macOS 走 libc::gethostname(3)——GUI 进程普遍无
+/// HOSTNAME 环境变量，且客户端 Electron os.hostname() 即 gethostname(3) 同源
+/// （区别于 commands/oauth.rs 设备注册域的 scutil ComputerName，彼处取的是
+/// 用户可见名）。取不到时回退 "PC"（与派生 fallback 同款兜底，宁降级不崩溃）。
+/// 三平台门控（审查 2026-10-07 对齐本文件 CrossProcLock 模式）：libc 依赖仅声明
+/// 于 Cargo.toml 的 macOS target 段，显式 macos 门控保「其他平台可编译」约定
+///（同 CrossProcLock stub 的 CI 单测先例）。
+fn local_hostname() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 256];
+        let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if ok == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(s) = std::str::from_utf8(&buf[..end]) {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+        "PC".to_string()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        // 其他平台占位（本项目仅 Windows/macOS 发布，保 CI 单测可编译）
+        "PC".to_string()
     }
 }
 
@@ -574,10 +781,10 @@ fn extend_device_headers_with(
     let has = |h: &[(String, String)], k: &str| {
         h.iter().any(|(a, _)| a.eq_ignore_ascii_case(k))
     };
-    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string());
+    let hostname = local_hostname();
     for (k, v) in [
         ("Cosy-Version", CLIENT_COSY_VERSION.to_string()),
-        ("Cosy-MachineOS", CLIENT_MACHINE_OS.to_string()),
+        ("Cosy-MachineOS", client_machine_os().to_string()),
         ("Cosy-MachineHostname", hostname),
     ] {
         if !has(h, k) {
@@ -602,7 +809,7 @@ fn extend_device_headers_with(
 }
 
 /// 见 [`extend_device_headers_with`]：真值经 [`resolve_native_risk_identity`]
-/// 解析并缓存，调用开销≈0
+/// 解析并缓存终态（瞬时失败有 60s 冷却），稳态调用开销≈0
 pub fn extend_client_device_headers(h: &mut Vec<(String, String)>, creds: &QoderCreds) {
     extend_device_headers_with(h, creds, resolve_native_risk_identity());
 }
@@ -1345,7 +1552,7 @@ impl Drop for CrossProcLock {
 
 /// macOS 实装（审查 2026-10-05）：flock(2) 锁文件，对齐 Windows 命名 Mutex 的
 /// 「进程崩溃由 OS 回收」语义——fd 关闭（Drop/进程退出）即自动释放。锁文件
-/// `data_dir/conf/crossproc_{safe_scope}.{hash16}`，hash16 沿用 data_dir 短哈希
+/// `data_dir/conf/crossproc_{ns}_{safe_scope}.{hash16}`，hash16 沿用 data_dir 短哈希
 /// 隔离（便携版多数据目录互不误伤）；scope 白名单外字符替换为 `_`（Windows 锁名
 /// 单段名教训的文件系统对应物——路径分隔符会把锁文件写进子目录）。等待策略：
 /// LOCK_EX|LOCK_NB 每 25ms 轮询至 wait_ms 超时（WaitForSingleObject 的最小等价物）。
@@ -1364,11 +1571,31 @@ impl CrossProcLock {
         scope: &str,
         wait_ms: u32,
     ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        Self::try_acquire_ns(data_dir, "qoder", scope, wait_ms)
+    }
+
+    /// 带命名空间版本（审查 2026-10-07 补齐，对齐 Windows impl 同名方法签名）：
+    /// main 合并引入的调用点（checkin_results/wb_common）直接使用 4 参
+    /// try_acquire_ns，macOS 缺实现会在 mac 目标下 E0599 编译失败。ns 进锁文件名：
+    /// qoder/wb 域同名 scope 锁互不串扰；ns/scope 白名单外字符替换为 `_`
+    ///（单段名教训的文件系统对应物——路径分隔符会把锁文件写进子目录）
+    ///
+    /// 锁文件名 v2（ns 前缀）；v1（旧版 macOS 实装）为 `crossproc_{scope}.{hash16}`。
+    /// v1↔v2 升级并存窗口内新旧版本进程同名 scope 互斥失效，后果为可自愈的
+    /// AuthDead 误标（refresh 域）/ 幂等重放（checkin 域）；fd-based flock，
+    /// 旧锁文件残留无害
+    pub fn try_acquire_ns(
+        data_dir: &std::path::Path,
+        ns: &str,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
         use std::os::unix::io::AsRawFd;
-        let safe_scope: String = scope
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
-            .collect();
+        let safe = |s: &str| {
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+                .collect::<String>()
+        };
         let mut h = Sha256::new();
         h.update(data_dir.to_string_lossy().as_bytes());
         let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
@@ -1379,7 +1606,8 @@ impl CrossProcLock {
                 Some(CrossProcLockFail::CreateFailed(e.raw_os_error().unwrap_or(0) as u32)),
             );
         }
-        let path = lock_dir.join(format!("crossproc_{safe_scope}.{}", &hex[..16]));
+        let path =
+            lock_dir.join(format!("crossproc_{}_{}.{}", safe(ns), safe(scope), &hex[..16]));
         // truncate(false)：多进程并发打开同一锁文件，截断会互相破坏 fd 偏移语义
         let file = match std::fs::OpenOptions::new()
             .create(true)
