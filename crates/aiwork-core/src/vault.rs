@@ -557,14 +557,23 @@ pub fn migrate_on_startup(state: &AppState) {
                 k.key = String::new();
                 migrated += 1;
             } else {
-                fs_utils::app_log(
-                    &state.data_dir,
-                    &format!("启动迁移: API Key {} 写入 vault 失败（明文保留，下次启动重试）", k.id),
+                // 诊断（CI 复盘）：app_log 只落 data_dir 文件，测试进程不可见——
+                // 迁移失败静默会让「库中应占位化」类断言无从归因，同步打 stderr
+                let msg = format!(
+                    "启动迁移: API Key {} 写入 vault 失败（明文保留，下次启动重试）",
+                    k.id
                 );
+                eprintln!("[vault] {msg}");
+                fs_utils::app_log(&state.data_dir, &msg);
             }
         }
         if migrated > 0 {
-            let _ = crate::store::docs::api_keys_save(&crate::store::db(&state.data_dir), &file);
+            if let Err(e) =
+                crate::store::docs::api_keys_save(&crate::store::db(&state.data_dir), &file)
+            {
+                // 占位化写回失败同样静默吞错会让断言/对账无从归因，同步 stderr
+                eprintln!("[vault] 启动迁移: API Key 占位化写回失败: {e}");
+            }
             fs_utils::app_log(
                 &state.data_dir,
                 &format!("启动迁移: 已将 {migrated} 个 API Key 加密写入 vault（库中占位化）"),
