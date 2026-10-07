@@ -488,7 +488,10 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // 缓存；原单账号缓存分支前端无调用方，属刷错目标，issue #61 同类缺口一并修复）
         "wb-credits-snapshot" => {
             let parsed = crate::commands::workbuddy::wb_credits_snapshot_task(st)?;
-            let token_files = crate::commands::workbuddy_stats::workbuddy_token_stats_impl(st, true)
+            // token 统计同步沿用结果级缓存（fresh=false，2026-10-07 性能优化）：
+            // 原传 true 会绕过 10 分钟结果缓存，每天（hourly 档）强制一次全量
+            // walk+stat；当日数据本就有 10 分钟 TTL 兜底，无需强制重扫。
+            let token_files = crate::commands::workbuddy_stats::workbuddy_token_stats_impl(st, false)
                 .get("files_scanned")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
