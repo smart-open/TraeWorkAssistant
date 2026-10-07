@@ -195,6 +195,19 @@ export interface Settings {
   buddy_switch_migrate_chats: boolean;
   /** WebUI 免令牌访问（安全与管理页开关，默认关）：开启后打开页面即进主界面 */
   web_auth_disabled: boolean;
+  // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
+  /** 固定应用 key：始终显示在侧边栏且不可隐藏（单选，默认 'trae'） */
+  pinned_app: AppKey;
+  /** 侧边栏隐藏的应用 key 列表（空 = 全部显示；固定应用即使列入也强制显示） */
+  hidden_apps: AppKey[];
+  /** 侧边栏应用自定义图标（应用 key → 图标名，lib/appIcons.ts 候选表；缺失/非法回退内置默认图标） */
+  app_icons: Partial<Record<AppKey, string>>;
+  /** Trae 签到多账号间隔秒（默认 3s，0=关闭；防上游频控） */
+  trae_checkin_gap_secs: number | null;
+  /** WorkBuddy 签到/成长多账号间隔秒（默认 3s，0=关闭；两轮共用） */
+  wb_checkin_gap_secs: number | null;
+  /** Qoder 签到多账号间隔秒（默认 3s，0=关闭） */
+  qoder_checkin_gap_secs: number | null;
 }
 
 /** 通知渠道配置（Phase 3 T11：Bark / Server酱 / 通用 webhook，独立 kv） */
@@ -421,6 +434,8 @@ export interface PoolStatus {
   cooling: boolean;
   cooldown_until: number | null;
   cooldown_reason: string | null;
+  /** 积分耗尽硬冷却中（次日 04:00 自动恢复探测；cooling 仅覆盖软冷却，旧后端未返回时为 undefined） */
+  hard_credit?: boolean;
   disabled: boolean;
   err_count: number;
   /** 账号实时在途并发数（F-77⑤ 可观测；旧后端未返回时为 undefined） */
@@ -1061,4 +1076,18 @@ export interface QoderCreditsSnapshot {
   /** 当日获得（签到奖励合计；无签到数据 null） */
   earned?: number | null;
   accounts: { user_id: string; total: number | null }[];
+}
+
+// ---- 指纹清洗规则表（wb_template_map KV；整体替换语义，保存即对下一请求生效）----
+// 规则：from → to 子串改写（contains + replace，无正则；from 必填唯一，to 可为空串=删除）
+export interface SanitizeRule {
+  from: string;
+  to: string;
+}
+
+// wb_template_map_get 返回：builtin=true 表示当前生效内置默认规则、尚无自定义副本
+export interface SanitizeMapView {
+  templates: SanitizeRule[];
+  updated_at: number | null;
+  builtin?: boolean;
 }

@@ -380,7 +380,9 @@ fn fetch_round(
 /// 主域名整体网络不可达时切备用域名重试一轮（§2.2 域名双探测，仅一次、不循环）。
 /// 返回 (packages, balance, source, new_creds)。
 fn fetch_credits_once(
+    state: &AppState,
     agent: &ureq::Agent,
+    aid: &str,
     creds: &wb_common::Creds,
 ) -> (Vec<Value>, Option<f64>, &'static str, Option<wb_common::Creds>) {
     let headers = wb_common::build_auth_headers(creds, true);
@@ -402,7 +404,9 @@ fn fetch_credits_once(
     }
     let mut new_creds = None;
     if saw_auth && pkgs.is_empty() && balance.is_none() {
-        if let Some(nc) = wb_common::refresh_token_once(agent, creds) {
+        // H-1：加锁刷新 + 二次检查（他人已刷新落库直接复用）+ 内部落库
+        //（原 refresh_token_once + 调用方 save，两步分离存在并发覆盖丢 token 面）
+        if let (Some(nc), _) = wb_common::refresh_token_once_locked(state, agent, aid, creds) {
             let headers2 = wb_common::build_auth_headers(&nc, true);
             let (p2, b2, _saw2, _nd2) = fetch_round(agent, &headers2, (&summary_url, &paid_url, &free_url));
             pkgs = p2;
@@ -456,11 +460,8 @@ fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
             "packages": [], "source": "none",
         });
     }
-    let (pkgs, balance, source, new_creds) = fetch_credits_once(agent, &creds);
-    if let Some(nc) = new_creds {
-        // 刷新成功 → 回写工具侧副本（F-10 谁新用谁）
-        let _ = wb_common::save_token_store(state, &aid, &nc);
-    }
+    let (pkgs, balance, source, _new_creds) = fetch_credits_once(state, agent, &aid, &creds);
+    // new_creds 已由 refresh_token_once_locked 内部落库（H-1），此处无须再 save
     if pkgs.is_empty() && balance.is_none() {
         return json!({
             "user_id": aid, "name": name, "ok": false,

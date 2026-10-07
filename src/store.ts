@@ -165,7 +165,34 @@ function defaultSettings(): Settings {
     buddy_switch_migrate_chats: false,
     // WebUI 免令牌访问——默认关（保持令牌登录）
     web_auth_disabled: false,
+    // 侧边栏应用显示：默认固定 Trae，其余应用全部显示
+    pinned_app: 'trae',
+    hidden_apps: [],
+    // 侧边栏应用自定义图标（key → 图标名；空 = 全部用内置默认）
+    app_icons: {},
+    // 签到多账号间隔秒（默认 3s 防上游频控，0=关闭；Trae/Buddy/Qoder 各自配置页可改，Buddy 签到与成长共用）
+    trae_checkin_gap_secs: 3,
+    wb_checkin_gap_secs: 3,
+    qoder_checkin_gap_secs: 3,
   };
+}
+
+// 侧边栏应用显示兜底：旧版本配置缺字段/脏值归一，固定应用非法回退 trae 且强制可见
+// （合法 key 按 docker 分支应用集合裁剪：无 doubao）
+function normalizeAppDisplay(settings: Settings): void {
+  const validApps: AppKey[] = ['trae', 'buddy', 'qoder'];
+  if (!validApps.includes(settings.pinned_app as AppKey)) settings.pinned_app = 'trae';
+  settings.hidden_apps = (settings.hidden_apps ?? []).filter(
+    (a): a is AppKey => validApps.includes(a) && a !== settings.pinned_app,
+  );
+  // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）
+  const cleanIcons: Partial<Record<AppKey, string>> = {};
+  for (const [k, v] of Object.entries(settings.app_icons ?? {})) {
+    if (validApps.includes(k as AppKey) && typeof v === 'string' && v.trim()) {
+      cleanIcons[k as AppKey] = v.trim();
+    }
+  }
+  settings.app_icons = cleanIcons;
 }
 
 // 日志轮询去重：上一轮未返回时跳过本轮（防 2s 轮询堆积与旧响应乱序覆盖）
@@ -205,6 +232,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // notify 归一化：旧版本/数据迁移可能存入非枚举脏值（如空串），统一收敛为合法值
       const validNotify = ['toast', 'system', 'both', 'none'];
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
+      normalizeAppDisplay(settings);
       set({ settings, authed: true });
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
@@ -451,6 +479,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const settings = await api.misc.settingsGet();
       const validNotify = ['toast', 'system', 'both', 'none'];
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
+      normalizeAppDisplay(settings);
       set({ settings });
     } catch {
       set({ settings: defaultSettings() });

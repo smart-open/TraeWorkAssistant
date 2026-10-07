@@ -22,11 +22,15 @@ export default function QoderSettings() {
   const [refreshing, setRefreshing] = useState(false);
   // qoder-checkin 开关（auto_checkin）即时保存 pending
   const [checkinToggleBusy, setCheckinToggleBusy] = useState(false);
+  // 多账号签到间隔（qoder_checkin_gap_secs 存 app Settings，随「保存配置」统一提交）
+  const [checkinGap, setCheckinGap] = useState(3);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
       setSettings(await api.qoder.settingsGet().catch(() => null));
+      const app = await api.misc.settingsGet().catch(() => null);
+      setCheckinGap(app?.qoder_checkin_gap_secs ?? 3);
     } catch (err) {
       pushToast('error', `读取配置失败：${String(err)}`);
     }
@@ -46,7 +50,16 @@ export default function QoderSettings() {
     }
     setSaving(true);
     try {
-      await withMinDelay(api.qoder.settingsSet(settings), 800);
+      await withMinDelay(
+        Promise.all([
+          api.qoder.settingsSet(settings),
+          api.misc.settingsSet({
+            ...(await api.misc.settingsGet()),
+            qoder_checkin_gap_secs: checkinGap,
+          }),
+        ]),
+        800,
+      );
       pushToast('success', '配置已保存');
       await refresh();
     } catch (err) {
@@ -148,6 +161,28 @@ export default function QoderSettings() {
                 )}
               </span>
             </label>
+
+            {/* 多账号签到间隔（qoder_checkin_gap_secs 存 app Settings，随「保存配置」统一提交） */}
+            <div className="rounded-lg bg-slate-50 px-3 py-2.5 dark:bg-zinc-900">
+              <label className="label">账号间隔（秒）</label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="number"
+                  min={0}
+                  max={600}
+                  className="input w-20"
+                  value={checkinGap}
+                  onChange={(e) => {
+                    if (e.target.value === '') return; // 清空输入中间态不落值
+                    const n = Math.min(600, Math.max(0, Math.floor(Number(e.target.value))));
+                    setCheckinGap(Number.isFinite(n) ? n : 3);
+                  }}
+                />
+                <span className="text-xs text-slate-400">
+                  多账号串行签到的间隔，默认 3 秒防频控，0 = 关闭
+                </span>
+              </div>
+            </div>
           </div>
         </section>
 

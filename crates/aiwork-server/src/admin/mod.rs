@@ -52,6 +52,10 @@ impl AdminState {
         // 容量 256：慢消费者（SSE 端 lag）丢帧不阻塞签到工作线程，
         // done 事件已落库 checkin_results，前端可降级轮询
         let (events, _rx) = tokio::sync::broadcast::channel(256);
+        // 事件出口注入（移植 main）：scheduler 等后台模块经 AppState.events emit
+        // 看板刷新等软通知，本通道（WS/SSE）订阅后转发前端；未注入（None）时
+        // emit 静默丢弃——事件不参与业务正确性
+        *state.events.lock().unwrap_or_else(|e| e.into_inner()) = Some(events.clone());
         Arc::new(Self {
             state,
             guard: Arc::new(CheckinGuard(tokio::sync::Mutex::new(()))),

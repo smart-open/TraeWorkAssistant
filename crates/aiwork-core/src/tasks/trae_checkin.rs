@@ -545,7 +545,14 @@ pub fn run_round(
 
     emit(&json!({"type": "start", "total": accounts.len()}));
 
+    // 多账号签到间隔（环境配置页可改，默认 3s，0=关闭）：账号间串行等待，
+    // 防上游频控；循环开头 i>0 判定——相邻两账号处理开始之间至少隔 gap 秒，
+    // 未配置 jwt 的 continue 快速失败分支同样计入间隔，节奏统一
+    let gap_secs = crate::models::effective_checkin_gap(state.settings().trae_checkin_gap_secs);
     for (i, acc) in accounts.iter().enumerate() {
+        if i > 0 && gap_secs > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(gap_secs));
+        }
         let idx = i + 1; // 1-based（前端 next[index-1] 定位行）
         let name = if acc.name.is_empty() { format!("账号{idx}") } else { acc.name.clone() };
 

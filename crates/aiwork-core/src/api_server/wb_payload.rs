@@ -106,6 +106,18 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You are operating as and within the OpenCode CLI, a terminal-based agentic coding tool built by OpenAI."
                 .to_string(),
         ),
+        // DeepSeek Harness（DSH，2026-10-06 测试机日志实证：pool=trae 空完成影子
+        // 风控，4 账号全 healthy 仍全灭；请求日志抓到身份句原文）。首句身份声明 +
+        // 模型句 "powered by" 复现（glm 前缀匹配覆盖 5.3/5.3-flash 变体），
+        // 改写手法对齐 Codex 规则 based on→built on
+        (
+            "You are an AI agent powered by DeepSeek Harness.".to_string(),
+            "You are an AI agent built on DeepSeek Harness.".to_string(),
+        ),
+        (
+            "You are a coding agent powered by the glm-".to_string(),
+            "You are a coding agent built on the glm-".to_string(),
+        ),
     ]
 }
 
@@ -214,9 +226,17 @@ pub fn strip_cc_fingerprints(text: &str) -> String {
             while j < text.len() && is_token_char(bytes[j]) {
                 j += 1;
             }
-            // 可选分隔符 = / :（前后允许空白），值到停止符为止
+            // P1 修复（误伤回归）：键名后必须跟 `=`/`:` 分隔符（前后允许空白）才算
+            // 指纹键值对——裸词（如 "use cc_flags for build" 的 cc_flags）是正常
+            // 业务内容，原实现整词删除 + 吞尾随空白，静默损坏用户内容
             let after = &text[j..];
             let t2 = after.trim_start();
+            if !t2.starts_with('=') && !t2.starts_with(':') {
+                // 非指纹键：按普通文本原样保留整个键名（ASCII token，直接复制）
+                out.push_str(&text[i..j]);
+                i = j;
+                continue;
+            }
             let mut end = j;
             if let Some(r) = t2.strip_prefix(['=', ':']) {
                 let v = r.trim_start(); // v 是 text 的后缀
@@ -673,6 +693,18 @@ mod tests {
     }
 
     #[test]
+    fn template_rewrites_deepseek_harness_identity() {
+        // DSH（DeepSeek Harness）身份句：2026-10-06 测试机空完成影子风控实证，
+        // 首句 + 模型句 "powered by" 均需改写（glm- 前缀匹配覆盖模型变体）
+        let tpl = default_template_map();
+        let dsh = "You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent powered by the glm-5.3-flash model.";
+        let out = apply_template_map(dsh, &tpl);
+        assert!(out.contains("built on DeepSeek Harness."), "{out}");
+        assert!(out.contains("built on the glm-5.3-flash model."), "{out}");
+        assert!(!out.contains("powered by"), "{out}");
+    }
+
+    #[test]
     fn sanitize_strips_cc_and_anthropic_tokens() {
         assert_eq!(strip_cc_fingerprints("ok cc_user=abc; tail"), "ok tail");
         assert_eq!(strip_cc_fingerprints("a cc_env=X:1,b"), "a b");
@@ -682,6 +714,20 @@ mod tests {
         );
         // 普通下划线词不受影响
         assert_eq!(strip_cc_fingerprints("success_count=3"), "success_count=3");
+        // P1 修复回归：裸 cc_ 词（无 =/: 值分隔符）属正常业务内容，不得删除
+        assert_eq!(
+            strip_cc_fingerprints("use cc_flags for build"),
+            "use cc_flags for build"
+        );
+        assert_eq!(
+            strip_cc_fingerprints("add cc_config: check crate cc_deps next"),
+            "add crate cc_deps next"
+        );
+        // 键名在文本结尾（无值可取）同样保留
+        assert_eq!(
+            strip_cc_fingerprints("ends with cc_config"),
+            "ends with cc_config"
+        );
     }
 
     #[test]

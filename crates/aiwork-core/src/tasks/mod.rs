@@ -97,6 +97,16 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // 刷新全部账号剩余积分（credits_daily 快照按日重算）
         "refresh-credits" => crate::commands::accounts::refresh_remaining_credits_impl(state)
             .map(|n| serde_json::json!({ "refreshed": n, "snapshot": "credits_daily.json" })),
+        // Trae 消耗明细同步（issue #61；调度器/CLI 共用；无账号跳过，全部账号拉取失败返 Err）
+        "trae-usage-sync" => {
+            let accounts = crate::vault::load_accounts(state);
+            if accounts.accounts.is_empty() {
+                Ok(serde_json::json!({ "ok": true, "skipped": "无 Trae 账号" }))
+            } else {
+                crate::commands::usage_history::usage_history_fetch_impl(state, true)
+                    .map(|r| serde_json::json!({ "ok": true, "accounts": r.accounts.len() }))
+            }
+        }
         other => Err(format!("未知任务: {other}")),
     };
     match result {

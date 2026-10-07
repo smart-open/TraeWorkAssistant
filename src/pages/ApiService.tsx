@@ -16,6 +16,7 @@ import { useIsDark } from '../lib/useIsDark';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
 import { RefreshTokenBadge } from './accounts/RefreshTokenBadge';
+import { PoolHealthBadges } from '../components/api/PoolHealthBadges';
 import type {
   PoolStatus,
   TraeModelMeta,
@@ -157,9 +158,14 @@ export default function ApiService() {
   };
 
   // Web 版网关常驻运行：无启停概念，仅轮询实时池状态
+  // 轮询序号（审查 P2 竞态防护）：3s 轮询响应慢于间隔时两轮并发，后发先至的
+  // 陈旧响应会覆盖新状态——仅当本轮仍是最新发起时才写 state
+  const refreshSeq = useRef(0);
   const refreshStatus = useCallback(async () => {
+    const seq = ++refreshSeq.current;
     try {
-      setPoolStatus(await api.apiServer.poolStatus());
+      const ps = await api.apiServer.poolStatus();
+      if (seq === refreshSeq.current) setPoolStatus(ps);
     } catch {
       /* ignore */
     }
@@ -656,9 +662,6 @@ export default function ApiService() {
                             {(a.general_credits ?? 0).toFixed(0)} 通用积分
                           </span>
                         )}
-                        {poolItem?.cooling && (
-                          <Badge tone="amber">冷却中</Badge>
-                        )}
                         {/* F-78 批次 3：refresh_token 生命周期徽标（失效账号同时被调度禁用） */}
                         <RefreshTokenBadge
                           invalid={a.refresh_token_invalid}
@@ -666,17 +669,8 @@ export default function ApiService() {
                           expiresAt={a.refresh_token_expires_at}
                           savedAt={a.auth_saved_at}
                         />
-                        {poolItem?.disabled && !a.refresh_token_invalid && (
-                          <Badge tone="red">已禁用</Badge>
-                        )}
-                        {poolItem && !poolItem.cooling && !poolItem.disabled && (
-                          // F-77⑤ 可观测：在途并发 > 0 时显示 busy 状态（替代"就绪"）
-                          (poolItem.inflight ?? 0) > 0 ? (
-                            <Badge tone="amber">在途 {poolItem.inflight}</Badge>
-                          ) : (
-                            <Badge tone="green">就绪</Badge>
-                          )
-                        )}
+                        {/* 运行时健康徽标：禁用/积分耗尽/冷却原因/零积分/在途·就绪（三池共用） */}
+                        <PoolHealthBadges s={poolItem} running tokenInvalid={a.refresh_token_invalid} />
                       </div>
                     </label>
                   );

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   LayoutDashboard,
   Users,
@@ -17,6 +17,7 @@ import {
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
 import { nextTheme } from '../lib/themes';
+import { resolveAppIcon } from '../lib/appIcons';
 import type { ViewKey, AppKey } from '../types';
 import AboutDialog from './AboutDialog';
 import SystemDialog from './SystemDialog';
@@ -53,11 +54,17 @@ const QODER_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
 ];
 
 /** 应用切换 Tab：trae = Trae 菜单；buddy = WorkBuddy 菜单；qoder = Qoder CN 菜单 */
-const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disabled?: boolean; title?: string }[] = [
+export const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disabled?: boolean; title?: string }[] = [
   { key: 'trae', label: 'Trae', icon: Sparkles },
   { key: 'buddy', label: 'Buddy', icon: Bot, title: 'WorkBuddy / CodeBuddy' },
   { key: 'qoder', label: 'Qoder', icon: Boxes, title: 'Qoder CN' },
 ];
+
+/** 全部合法应用 key（settings 脏值兜底用） */
+export const APP_KEYS = APP_TABS.map((t) => t.key);
+
+/** 栅格列数必须使用字面量，Tailwind JIT 才能扫描生成 */
+const GRID_COLS = ['grid-cols-1', 'grid-cols-2', 'grid-cols-3', 'grid-cols-4'] as const;
 
 export default function Sidebar({
   view,
@@ -70,8 +77,23 @@ export default function Sidebar({
   const activeApp = useAppStore((s) => s.activeApp);
   const setActiveApp = useAppStore((s) => s.setActiveApp);
   const setShowApiManager = useAppStore((s) => s.setShowApiManager);
+  const settings = useAppStore((s) => s.settings);
   const [showAbout, setShowAbout] = useState(false);
   const [showSystem, setShowSystem] = useState(false);
+
+  // 侧边栏应用显示（系统设置「应用显示」维护）：固定应用始终可见，其余按隐藏列表过滤。
+  // pinned 非法/缺失回退 trae（后端 state.rs 已归一，此处对前端旧缓存双保险）
+  const pinnedApp = (APP_KEYS.includes(settings?.pinned_app as AppKey) ? settings?.pinned_app : 'trae') as AppKey;
+  const hiddenApps = settings?.hidden_apps ?? [];
+  const visibleTabs = APP_TABS.filter((t) => t.key === pinnedApp || !hiddenApps.includes(t.key));
+
+  // 当前激活应用被隐藏（或固定项变更）时自动回落固定应用主页，避免停留在无 Tab 的应用
+  useEffect(() => {
+    if (!visibleTabs.some((t) => t.key === activeApp)) {
+      setActiveApp(pinnedApp);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeApp, pinnedApp, settings?.hidden_apps]);
 
   // 按当前应用切换菜单：Trae → 6 页；Buddy → 6 页；Qoder → 6 页（F-80）
   const nav = activeApp === 'buddy' ? BUDDY_NAV : activeApp === 'qoder' ? QODER_NAV : NAV;
@@ -112,11 +134,17 @@ export default function Sidebar({
           );
         })}
       </nav>
-      {/* 应用切换 Tab（位于左下角工具图标行上方） */}
+      {/* 应用切换 Tab（位于左下角工具图标行上方；显示项由系统设置「应用显示」控制） */}
       <div className="border-t border-slate-200 p-3 dark:border-zinc-800">
-        <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
-          {APP_TABS.map((tab) => {
-            const TabIcon = tab.icon;
+        <div
+          className={cn(
+            'grid gap-1 rounded-lg bg-slate-100 p-1 dark:bg-zinc-900',
+            GRID_COLS[visibleTabs.length - 1] ?? 'grid-cols-4',
+          )}
+        >
+          {visibleTabs.map((tab) => {
+            // 自定义图标优先（系统设置「应用图标」），非法/缺失回退 APP_TABS 内置图标
+            const TabIcon = resolveAppIcon(settings?.app_icons?.[tab.key]) ?? tab.icon;
             const active = activeApp === tab.key;
             return (
               <button

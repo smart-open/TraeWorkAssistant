@@ -11,17 +11,30 @@ import {
   LabelList,
   Legend,
 } from 'recharts';
-import { RefreshCw } from 'lucide-react';
+import { RefreshCw, CheckCircle2, Circle, ChevronRight } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
-import { StatCard } from '../components/ui';
+import { StatCard, Badge } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { useIsDark } from '../lib/useIsDark';
-import type { CheckinTrendPoint } from '../types';
+import type { CheckinTrendPoint, ViewKey } from '../types';
+
+/** 配置导航步骤（对齐 Buddy/Qoder 概述 SetupGuide 形态；optional 步骤不计入完成度） */
+interface Step {
+  key: string;
+  title: string;
+  desc: string;
+  done: boolean;
+  actionLabel: string;
+  view: ViewKey;
+  /** 可选步骤：不计入 x/y 完成度 */
+  optional?: boolean;
+}
 
 export default function Dashboard() {
   const accounts = useAppStore((s) => s.accounts);
   const toast = useAppStore((s) => s.pushToast);
+  const setView = useAppStore((s) => s.setView);
   const isDark = useIsDark();
   // 近 30 天签到结果趋势（堆叠柱状图数据，T8）
   const [trends, setTrends] = useState<CheckinTrendPoint[]>([]);
@@ -124,6 +137,38 @@ export default function Dashboard() {
     (a) => a.credits_expire_at != null && a.credits_expire_at <= nowSec + 7 * 86400,
   ).length;
   const alertCount = warned + creditWarned;
+
+  // 配置导航（步骤完成态实时判定，对齐 Buddy/Qoder 概述）
+  const steps: Step[] = [
+    {
+      key: 'account',
+      title: '录入账号',
+      desc: '通过 OAuth 登录或导入账号的方式将账号入池。',
+      done: accounts.length > 0,
+      actionLabel: '去录入',
+      view: 'accounts',
+    },
+    {
+      key: 'checkin',
+      title: '完成首次签到',
+      desc: '验证签到链路是否跑通（凭证有效、接口可达）。',
+      done: accounts.some((a) => a.checked_today),
+      actionLabel: '去签到',
+      view: 'checkin',
+    },
+    {
+      key: 'credits',
+      title: '查询积分余额',
+      desc: '录入凭证后查询各账号积分余额与到期情况。',
+      done: accounts.some((a) => a.remaining_credits != null),
+      actionLabel: '查看积分',
+      view: 'credits',
+    },
+  ];
+  // 可选步骤不计入完成度
+  const required = steps.filter((s) => !s.optional);
+  const completed = required.filter((s) => s.done).length;
+  const allDone = completed === required.length;
 
   return (
     <div className="animate-fade-in">
@@ -246,6 +291,53 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+
+      {/* 配置导航（对齐 Buddy/Qoder 概述 SetupGuide 形态） */}
+      <div className="mt-5 card overflow-hidden">
+        <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 dark:border-zinc-800">
+          <div>
+            <h3 className="font-medium">配置导航</h3>
+            <p className="text-xs text-slate-500">按步骤完成初始化，已完成的步骤无需重复处理。</p>
+          </div>
+          <Badge tone={allDone ? 'green' : 'amber'}>
+            {completed}/{required.length} 已完成
+          </Badge>
+        </div>
+        <ol className="divide-y divide-slate-100 dark:divide-slate-800">
+          {steps.map((step, i) => (
+            <li key={step.key} className="flex items-center gap-3 px-4 py-3">
+              <div className={step.done ? 'text-emerald-500' : 'text-slate-300 dark:text-zinc-600'}>
+                {step.done ? <CheckCircle2 size={20} /> : <Circle size={20} />}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-slate-800 dark:text-zinc-100">
+                  {i + 1}. {step.title}
+                </div>
+                <div className="text-xs text-slate-500">{step.desc}</div>
+              </div>
+              {step.done ? (
+                <span className="shrink-0 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400">
+                  已完成
+                </span>
+              ) : step.optional ? (
+                <span className="shrink-0 rounded-full bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                  可选
+                </span>
+              ) : (
+                <button onClick={() => setView(step.view)} className="btn-outline shrink-0">
+                  {step.actionLabel}
+                  <ChevronRight size={14} />
+                </button>
+              )}
+            </li>
+          ))}
+        </ol>
+        {allDone && (
+          <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-zinc-800 dark:bg-emerald-500/10 dark:text-emerald-300">
+            🎉 全部配置已完成，定时签到与积分轮换交给自动化即可！
+          </div>
+        )}
+      </div>
     </div>
   );
 }

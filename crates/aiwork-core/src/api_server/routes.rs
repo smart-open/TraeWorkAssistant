@@ -338,6 +338,28 @@ pub(crate) fn dispatch_error_response(
     }
 }
 
+/// 轮换耗尽收尾文案（issue #57 后续可观测）：区分「渠道指纹拦截」与「账号池耗尽」。
+/// 空完成（影子风控，HTTP 200 零内容）与账号无关，换号轮换打满整池后原文案
+/// "no healthy account available" 会误导用户排查账号——现按 empty_hits 分流：
+/// 空完成主导（过半轮换账号返回空完成）→ 明示指纹拦截语义（账号/模型无关，
+/// 提示更新清洗规则表）；混合失败（空完成仅零星出现、以限流/5xx 为主）时
+/// 维持原文案，避免 "switching won't help" 误导排障方向。返回 (错误消息, 诊断日志标记)
+pub(crate) fn exhaust_message(empty_hits: usize, rotated: usize, healthy_total: usize) -> (String, &'static str) {
+    if rotated > 0 && empty_hits * 2 > rotated {
+        (
+            format!(
+                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts (Trae shadow risk control, account/model agnostic — switching won't help); try updating wb_template_map.json or enabling sanitize (pool=trae healthy={healthy_total})",
+            ),
+            "CHANNEL_FINGERPRINT_BLOCK",
+        )
+    } else {
+        (
+            "no healthy account available".to_string(),
+            "NO_HEALTHY_ACCOUNT",
+        )
+    }
+}
+
 /// NoHealthy 详情（issue #29 修复2）：错误消息携带 Key 约束细节（绑定池/白名单
 /// 条数/专一账号）与池内健康计数，帮助用户自查 Key 配置（匿名/未知 Key 仅报
 /// 池健康数）；healthy_in_scope 为约束作用域内健康账号数，0 即「约束排除致败」。
@@ -1516,6 +1538,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
+        // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
+        let mut empty_hits: usize = 0;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
@@ -1539,8 +1563,22 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 },
             };
             tried.insert(picked.uid.clone());
-            // F-77 账号级在途计数：取号即绑定（换号时 bind_account 自动解绑旧账号）
-            guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
+            // F-77 账号级在途计数：取号即绑定（换号时 bind_account 自动解绑旧账号）。
+            // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+            // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
+            // 锁定、busy_fallback 降级）保留原无条件绑定语义
+            let bound = if picked.over_limit {
+                guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
+                true
+            } else {
+                guard.bind_account_cas(
+                    state.pool.inflight_handle(&picked.uid),
+                    state.pool.concurrency_limit(),
+                )
+            };
+            if !bound {
+                continue;
+            }
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             let mut converted = super::payload::prepare_llm_chat_body(
@@ -1655,8 +1693,19 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         }
                         if let Some((code, msg)) = error_info {
                             if super::is_empty_completion(code, &msg) {
+                                // sent_any 护栏（对齐 qoder_route）：内容已流出时换号重发
+                                // 会向同一 SSE 流拼接第二份完整响应 → 就地收尾不再重试
+                                if sent_any {
+                                    state.logger.log_request_ttfb(
+                                        "trae", "POST", proto.log_path(), &model, stream,
+                                        200, &win_uid, duration_ms, ttfb_ms, &key_name,
+                                        &state.pool.name_of(&win_uid), Some("空完成（内容已流出）→ 就地收尾"),
+                                    );
+                                    return;
+                                }
                                 // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传，
                                 // 换号重试（收尾帧未发，重试流可在同一连接续传）
+                                empty_hits += 1;
                                 state.logger.log_request_ttfb(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     200, &win_uid, duration_ms, ttfb_ms, &key_name,
@@ -1811,9 +1860,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             }
         }
 
-        // 所有账号不可用
+        // 所有账号不可用（空完成主导 → 明示渠道指纹拦截语义，否则维持原文案）
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
+        let (healthy_total, _) = state.pool.selectable_stats_in(None);
+        let (exhaust_msg, exhaust_tag) = exhaust_message(empty_hits, tried.len(), healthy_total);
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
             .iter()
@@ -1828,7 +1879,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         state.logger.log_request(
             "trae", "POST", proto.log_path(), &model, stream,
             503, "none", duration_ms, &key_name, "",
-            Some("no healthy account"),
+            Some(&exhaust_msg),
         );
         // 写入 app.log 供排查
         {
@@ -1841,16 +1892,20 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             let m = (local_ts % 3600) / 60;
             let s = local_ts % 60;
             let diag_line = format!(
-                "NO_HEALTHY_ACCOUNT [{:02}:{:02}:{:02}] tried={} pool={} reasons=[{}]",
-                h, m, s, tried.len(), diag.len(), diag_summary.join(", "),
+                "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} empty_hits={} pool={} reasons=[{}]",
+                h, m, s, tried.len(), empty_hits, diag.len(), diag_summary.join(", "),
             );
             state.logger.log_debug_line(format!("[DEBUG] {diag_line}"));
         }
         match proto {
             Protocol::OpenAi | Protocol::OpenAiText => {
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from(
-                    "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
-                )));
+                let err_body = json!({
+                    "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
+                });
+                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                    "data: {}\n\n",
+                    err_body
+                ))));
                 let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
             }
             Protocol::Anthropic => {
@@ -1858,7 +1913,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": "no healthy account available",
+                        "message": exhaust_msg,
                     },
                 });
                 let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
@@ -1874,7 +1929,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         "object": "response",
                         "status": "failed",
                         "output": [],
-                        "error": {"code": "no_healthy_account", "message": "no healthy account available"},
+                        "error": {"code": "no_healthy_account", "message": exhaust_msg},
                     },
                 });
                 let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
@@ -1947,6 +2002,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
+        // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
+        let mut empty_hits: usize = 0;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
@@ -1966,9 +2023,24 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 },
             };
             tried.insert(picked.uid.clone());
+            // F-77 账号级在途计数：取号即绑定（换号时自动解绑旧账号）。
+            // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+            // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
+            // 锁定、busy_fallback 降级）保留原无条件绑定语义。
+            // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
+            let bound = if picked.over_limit {
+                guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
+                true
+            } else {
+                guard.bind_account_cas(
+                    state.pool.inflight_handle(&picked.uid),
+                    state.pool.concurrency_limit(),
+                )
+            };
+            if !bound {
+                continue;
+            }
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
-            // F-77 账号级在途计数：取号即绑定（换号时自动解绑旧账号）
-            guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
 
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
@@ -2002,6 +2074,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 if super::aggregated_response_is_empty(&r) {
                                     // 空完成（影子风控/上游异常，issue #57）：换号重试，
                                     // 口径同下方「empty response」（Server 级短冷却）
+                                    empty_hits += 1;
                                     state.pool.note_error(&picked.uid, ErrKind::Server);
                                     state.record_usage(
                                         false, &model, &picked.uid, &key_id, false, stream,
@@ -2037,6 +2110,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 return Ok(r);
                             }
                             (None, Some((code, msg))) => {
+                                // 空完成哨兵（-9901，影子风控）计入指纹拦截观测；
+                                // 冷却行为维持现状（classify_solo_error → Server）
+                                if super::is_empty_completion(code, &msg) {
+                                    empty_hits += 1;
+                                }
                                 let kind = classify_solo_error(code, &msg);
                                 // 请求级错误（ErrKind::None）不计账号错误——与流式路径
                                 // 守卫一致；误计会在连续 3 次后熔断健康账号
@@ -2191,6 +2269,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         }
 
         let duration_ms = start_ts.elapsed().as_millis() as u64;
+        // 轮换耗尽收尾：空完成主导 → 明示渠道指纹拦截语义，否则维持原文案
+        let (healthy_total, _) = state.pool.selectable_stats_in(None);
+        let (exhaust_msg, exhaust_tag) = exhaust_message(empty_hits, tried.len(), healthy_total);
         let diag = state.pool.diagnose();
         // 用量记账（所有账号不可用）
         state.record_usage(false, &model, "none", &key_id, false, stream, duration_ms, 0, 0);
@@ -2207,16 +2288,16 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         state.logger.log_request(
             "trae", "POST", proto.log_path(), &model, stream,
             503, "none", duration_ms, &key_name, "",
-            Some("no healthy account"),
+            Some(&exhaust_msg),
         );
         // 写入诊断日志
         {
             state.logger.log_debug_line(format!(
-                "[DEBUG] NO_HEALTHY_ACCOUNT(non-stream) tried={} pool={} reasons=[{}]",
-                tried.len(), diag.len(), diag_summary.join(", "),
+                "[DEBUG] {exhaust_tag}(non-stream) tried={} empty_hits={} pool={} reasons=[{}]",
+                tried.len(), empty_hits, diag.len(), diag_summary.join(", "),
             ));
         }
-        Err(AggregateFail::NoHealthy("no healthy account available".to_string()))
+        Err(AggregateFail::NoHealthy(exhaust_msg))
     })
     .await;
 
@@ -2615,6 +2696,44 @@ fn safe_slice(s: &str, n: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== 轮换耗尽收尾文案：指纹拦截 vs 账号池耗尽 ====================
+
+    #[test]
+    fn exhaust_message_empty_hits_indicates_fingerprint_block() {
+        // 空完成主导：明示指纹拦截语义（账号/模型无关），带清洗规则表提示与健康计数
+        let (msg, tag) = exhaust_message(3, 3, 4);
+        assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
+        assert!(msg.contains("3 empty completion(s) across 3 rotated accounts"), "{msg}");
+        assert!(msg.contains("healthy=4"), "{msg}");
+        assert!(msg.contains("wb_template_map.json"), "{msg}");
+        assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+    }
+
+    #[test]
+    fn exhaust_message_no_empty_hits_keeps_original() {
+        // 无空完成（401/429/5xx 等真实不健康）：维持原文案，避免误导
+        let (msg, tag) = exhaust_message(0, 3, 0);
+        assert_eq!(msg, "no healthy account available");
+        assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
+    }
+
+    #[test]
+    fn exhaust_message_minority_empty_hits_keeps_original() {
+        // 混合失败：仅 1 次空完成 + 其余限流/5xx，空完成非主导 → 不宣判指纹拦截，
+        // 避免 "switching won't help" 误导排障方向（限流等待冷却即可自愈）
+        let (msg, tag) = exhaust_message(1, 10, 2);
+        assert_eq!(msg, "no healthy account available");
+        assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
+    }
+
+    #[test]
+    fn exhaust_message_majority_empty_hits_indicates_fingerprint_block() {
+        // 过半轮换账号返回空完成（6/10）→ 判定指纹拦截主导
+        let (msg, tag) = exhaust_message(6, 10, 2);
+        assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
+        assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+    }
 
     // ==================== P2 修复6：safe_slice 字符边界截断 ====================
 

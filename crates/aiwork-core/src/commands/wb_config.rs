@@ -66,19 +66,56 @@ pub fn wb_template_map_set(state: &AppState, map: Value) -> Result<(), String> {
 }
 
 fn template_map_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
-    // SQLite 化（P2）：kv `wb_template_map`
+    // SQLite 化（P2）：kv `wb_template_map`。
+    // 无自定义（KV 缺失或 templates 空 = load_templates 走内置默认）时回显内置
+    // 默认规则并标记 builtin:true——前端「指纹清洗」tab 以此展示生效中规则；
+    // 保存后才成为独立自定义副本（整体替换语义，与 into_rules 口径一致）
     let file: TemplateMapFile = crate::store::db(data_dir).kv_get("wb_template_map");
-    serde_json::to_value(file).map_err(|e| format!("序列化审核模板映射失败: {e}"))
+    if file.templates.is_empty() {
+        let templates: Vec<serde_json::Value> = crate::api_server::wb_payload::default_template_map()
+            .into_iter()
+            .map(|(from, to)| serde_json::json!({"from": from, "to": to}))
+            .collect();
+        return Ok(serde_json::json!({ "templates": templates, "updated_at": null, "builtin": true }));
+    }
+    let mut v = serde_json::to_value(&file).map_err(|e| format!("序列化审核模板映射失败: {e}"))?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("builtin".into(), serde_json::Value::Bool(false));
+    }
+    Ok(v)
 }
 
 /// 结构校验：对齐 wb_route::load_templates 的读取形状（TemplateMapFile）——
-/// templates 为 [{from,to}] 数组（两字段均为必填字符串），updated_at 可空
+/// templates 为 [{from,to}] 数组（两字段均为必填字符串），updated_at 可空。
+/// 软上限守卫（审查 minor）：规则表每请求做 O(n) 子串替换且整体落 KV，
+/// 不设上限时管理员可存近 2MB 规则表构成网关自伤型性能面——条数 200 /
+/// 单条 4KB 远超实际使用（内置默认约 10 条短句），超限拒绝落盘。
+const TEMPLATE_MAP_MAX_RULES: usize = 200;
+const TEMPLATE_MAP_MAX_FIELD_BYTES: usize = 4 * 1024;
+
 fn template_map_set_at(data_dir: &std::path::Path, map: &Value) -> Result<(), String> {
     if !map.is_object() {
         return Err("审核模板映射必须是 JSON 对象（含 templates 数组）".into());
     }
     serde_json::from_value::<TemplateMapFile>(map.clone())
         .map_err(|e| format!("审核模板映射格式不正确（templates[].from/to 均为必填字符串）: {e}"))?;
+    let templates = map["templates"].as_array().cloned().unwrap_or_default();
+    if templates.len() > TEMPLATE_MAP_MAX_RULES {
+        return Err(format!(
+            "审核模板映射规则数超上限（{TEMPLATE_MAP_MAX_RULES} 条），当前 {} 条",
+            templates.len()
+        ));
+    }
+    for (i, t) in templates.iter().enumerate() {
+        for key in ["from", "to"] {
+            if t[key].as_str().map(|s| s.len()) > Some(TEMPLATE_MAP_MAX_FIELD_BYTES) {
+                return Err(format!(
+                    "审核模板映射第 {} 条的 {key} 超长（上限 {TEMPLATE_MAP_MAX_FIELD_BYTES} 字节）",
+                    i + 1
+                ));
+            }
+        }
+    }
     crate::store::db(data_dir).kv_set("wb_template_map", map)
 }
 
@@ -94,6 +131,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 无自定义（空 KV）时回显内置默认规则 + builtin 标志（指纹清洗 tab 展示口径）
+    #[test]
+    fn template_map_get_falls_back_to_builtin_defaults() {
+        let dir = tmp_dir("tpl_builtin");
+        let got = template_map_get_at(&dir).unwrap();
+        assert_eq!(got["builtin"], json!(true));
+        let arr = got["templates"].as_array().expect("默认规则数组");
+        assert!(!arr.is_empty(), "内置默认规则非空");
+        assert!(arr[0]["from"].is_string() && arr[0]["to"].is_string());
+        // 自定义后 builtin 翻转为 false
+        template_map_set_at(&dir, &json!({"templates": [{"from": "x", "to": "y"}]})).unwrap();
+        let got2 = template_map_get_at(&dir).unwrap();
+        assert_eq!(got2["builtin"], json!(false));
+        assert_eq!(got2["templates"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「恢复内置默认」链路：保存空 templates（UI 恢复默认按钮的落盘形状）
+    /// → load_templates 走 into_rules→None→default，get 回显 builtin:true 全量默认
+    #[test]
+    fn template_map_set_empty_restores_builtin_defaults() {
+        let dir = tmp_dir("tpl_reset");
+        // 先写一份自定义
+        template_map_set_at(&dir, &json!({"templates": [{"from": "x", "to": "y"}]})).unwrap();
+        assert_eq!(template_map_get_at(&dir).unwrap()["builtin"], json!(false));
+        // 保存空数组 = 恢复默认（FingerprintSanitizePanel::resetToBuiltin 的落盘形状）
+        template_map_set_at(&dir, &json!({"templates": [], "updated_at": 1})).unwrap();
+        let got = template_map_get_at(&dir).unwrap();
+        assert_eq!(got["builtin"], json!(true));
+        let n = got["templates"].as_array().unwrap().len();
+        assert_eq!(
+            n,
+            crate::api_server::wb_payload::default_template_map().len(),
+            "回显规则数应与内置默认一致"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 校验拒绝畸形路由结构（aliases 传数组 / rules 元素缺 target）
@@ -116,6 +191,30 @@ mod tests {
         assert!(template_map_set_at(&dir, &json!([1, 2])).is_err());
         // 拒绝后不得落库
         assert!(crate::store::db(&dir).kv_get_raw("wb_template_map").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 软上限守卫：规则数超 200 / 单条超 4KB 拒绝落盘（审查 minor）
+    #[test]
+    fn template_map_validation_rejects_oversized() {
+        let dir = tmp_dir("tpl_oversize");
+        // 条数超限
+        let many: Vec<_> = (0..201)
+            .map(|i| json!({"from": format!("f{i}"), "to": "t"}))
+            .collect();
+        assert!(template_map_set_at(&dir, &json!({ "templates": many })).is_err());
+        // 单条字段超长（from 4097 字节）
+        let long = "x".repeat(TEMPLATE_MAP_MAX_FIELD_BYTES + 1);
+        assert!(template_map_set_at(
+            &dir,
+            &json!({"templates": [{"from": long, "to": "t"}]})
+        )
+        .is_err());
+        // 边界内放行（恰好 200 条 + 4KB 字段）
+        let ok: Vec<_> = (0..TEMPLATE_MAP_MAX_RULES)
+            .map(|i| json!({"from": format!("f{i}"), "to": "t"}))
+            .collect();
+        template_map_set_at(&dir, &json!({ "templates": ok })).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

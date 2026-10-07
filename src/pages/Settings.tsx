@@ -135,6 +135,26 @@ export default function Settings() {
                 <span className="text-xs text-slate-400">推荐 1 次：签到失败后自动重试（0–5）</span>
               </div>
             </div>
+            <div className="rounded-lg bg-slate-50 px-3 py-2.5 dark:bg-zinc-900">
+              <label className="label">账号间隔（秒）</label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="number"
+                  min={0}
+                  max={600}
+                  value={form.trae_checkin_gap_secs ?? 3}
+                  onChange={(e) => {
+                    if (e.target.value === '') return; // 清空输入中间态不落值
+                    const n = Math.min(600, Math.max(0, Math.floor(Number(e.target.value))));
+                    update('trae_checkin_gap_secs', Number.isFinite(n) ? n : 3);
+                  }}
+                  className="input w-24"
+                />
+                <span className="text-xs text-slate-400">
+                  多账号串行签到的间隔，默认 3 秒防频控，0 = 关闭
+                </span>
+              </div>
+            </div>
           </div>
         </section>
 

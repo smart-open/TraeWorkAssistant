@@ -201,6 +201,10 @@ pub struct AppState {
     pub jwt_refresh_lock: Arc<Mutex<()>>,
     /// Qoder 账号池整池读写锁：防并发整池覆盖丢写（直操原始 JSON 路径共用）
     pub qoder_pool_lock: Arc<Mutex<()>>,
+    /// 事件广播通道（Web 版事件出口）：scheduler 等后台模块 emit 看板刷新等
+    /// 软通知，aiwork-server 的 admin events（WS/SSE）订阅转发给前端。
+    /// None（启动早期/未注入）时 emit 静默丢弃——事件不参与业务正确性
+    pub events: Arc<Mutex<Option<tokio::sync::broadcast::Sender<(String, serde_json::Value)>>>>,
 }
 
 /// 配置文件名列表（路由到 conf/ 目录）
@@ -239,6 +243,7 @@ impl AppState {
             data_dir,
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
+            events: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -249,6 +254,7 @@ impl AppState {
             data_dir,
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
+            events: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -318,7 +324,33 @@ impl AppState {
         if s.doubao_quota_url.clone().unwrap_or_default().trim().is_empty() {
             s.doubao_quota_url = Some(crate::models::default_doubao_quota_url());
         }
+        // 侧边栏应用显示：固定应用零值回填（kv 全缺失走 Settings::default() 时 String=""）
+        if s.pinned_app.trim().is_empty() {
+            s.pinned_app = "trae".into();
+        }
+        // 隐藏列表归一：丢弃非法 key、去重排序；固定应用强制可见（双保险，前端同样约束）
+        {
+            let pinned = s.pinned_app.clone();
+            s.hidden_apps.retain(|k| {
+                matches!(k.as_str(), "trae" | "buddy" | "qoder") && k != &pinned
+            });
+            s.hidden_apps.sort_unstable();
+            s.hidden_apps.dedup();
+        }
+        // 自定义图标归一：丢弃非法 key 与空图标名（等于未配置）；非法图标名不在此校验，
+        // 前端 resolveAppIcon 未命中即回退默认图标（候选表只有前端持有，避免后端重复维护）
+        s.app_icons
+            .retain(|k, v| matches!(k.as_str(), "trae" | "buddy" | "qoder") && !v.trim().is_empty());
         s
+    }
+
+    /// 发出后台事件（尽力而为）：name 如 "board-data-synced"，payload 为 JSON 对象。
+    /// 通道未注入/无订阅者时静默丢弃（事件不参与业务正确性）
+    pub fn emit_event(&self, name: &str, payload: serde_json::Value) {
+        let guard = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send((name.to_string(), payload));
+        }
     }
 }
 

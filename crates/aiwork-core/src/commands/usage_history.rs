@@ -274,9 +274,18 @@ pub fn usage_history_fetch(
     state: &AppState,
     fresh: Option<bool>,
 ) -> Result<UsageHistoryResult, String> {
-    let fresh = fresh.unwrap_or(false);
+    usage_history_fetch_impl(state, fresh.unwrap_or(false))
+}
+
+/// 实现（本命令与调度器 `trae-usage-sync` / CLI `--task-run trae-usage-sync` 共用，issue #61）。
+/// 失败分流（对齐 qoder_credits::run_snapshot_task 惯例）：全部有凭证账号拉取失败 → Err
+/// （不覆盖 fetched_at，调度器 30 分钟冷却重试）；部分失败 → Ok（保留旧缓存逐账号注明错误）。
+pub fn usage_history_fetch_impl(
+    state: &AppState,
+    fresh: bool,
+) -> Result<UsageHistoryResult, String> {
     let now_ts = chrono::Local::now().timestamp();
-    let accounts = crate::vault::load_accounts(&state);
+    let accounts = crate::vault::load_accounts(state);
     let mut cache: CacheFile = serde_json::from_value(
         crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir)),
     )
@@ -311,6 +320,7 @@ pub fn usage_history_fetch(
     // 增量拉取：无缓存账号全量近一年；已有账号从上次拉取日 00:00 重拉并替换该日及之后
     let full_start = now_ts - FULL_PULL_DAYS * 86400;
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
+    let mut attempted = 0usize;
     // 单块分页上限截断的账号（数据可能不完整，需在结果中注明并写运行日志）
     let mut truncated_uids: BTreeSet<String> = BTreeSet::new();
     for a in &accounts.accounts {
@@ -322,6 +332,7 @@ pub fn usage_history_fetch(
             // 占位账号（无 JWT）：保留既有缓存，不发起请求
             continue;
         }
+        attempted += 1;
         let (start_ts, refetch_from) =
             match cache.accounts.get(&uid).and_then(|c| c.last_fetch_end_ts) {
                 Some(last_end) => {
@@ -363,6 +374,17 @@ pub fn usage_history_fetch(
                 errors.insert(uid, e);
             }
         }
+    }
+
+    // 全部有凭证账号拉取失败：暂态失败上抛（不覆盖 fetched_at、不落盘），
+    // 交调度器 30 分钟冷却重试；部分失败仍 Ok（展示旧缓存 + 逐账号注明）
+    if attempted > 0 && errors.len() == attempted {
+        return Err(format!(
+            "Trae 消耗明细拉取失败（{}/{} 账号）：{}",
+            errors.len(),
+            attempted,
+            errors.values().next().map(String::as_str).unwrap_or("未知错误")
+        ));
     }
 
     cache.fetched_at = Some(now_ts);

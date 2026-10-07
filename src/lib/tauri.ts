@@ -43,6 +43,8 @@ import type {
   SchedulerConfig,
   SchedulerTaskView,
   Settings,
+  SanitizeMapView,
+  SanitizeRule,
   TraeModelMeta,
   UnifiedModel,
   UsageDayView,
@@ -144,6 +146,8 @@ const RT_EVENT_NAMES = [
   'qoder-checkin-progress',
   'qoder-oauth-progress',
   'qoder-oauth-done',
+  // 调度器看板数据同步成功（issue #61）：Dashboard 按 platform 静默重读缓存
+  'board-data-synced',
 ];
 const RT_ALIASES: Record<string, string[]> = {
   'checkin-progress': ['checkin-progress', 'checkin-done'],
@@ -580,8 +584,12 @@ export const api = {
   wbConfig: {
     routeGet: () => invoke<Record<string, unknown>>('wb_route_config_get'),
     routeSet: (config: Record<string, unknown>) => invoke('wb_route_config_set', { config }),
-    templateMapGet: () => invoke<Record<string, unknown>>('wb_template_map_get'),
-    templateMapSet: (map: Record<string, unknown>) => invoke('wb_template_map_set', { map }),
+    templateMapGet: () => invoke<SanitizeMapView>('wb_template_map_get'),
+    // 整体替换保存；load_templates 每请求读取，保存即对下一请求生效，无需重启网关
+    templateMapSet: (templates: SanitizeRule[]) =>
+      invoke<void>('wb_template_map_set', {
+        map: { templates, updated_at: Math.floor(Date.now() / 1000) },
+      }),
   },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),

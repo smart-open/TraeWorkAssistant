@@ -300,6 +300,138 @@ pub fn stream_forward_ex(
         };
     }
 
+    // 正常收尾序列（审查 P1-5）：上游 Done 与「EOF 断流但有内容」共用，
+    // 按协议补齐终止帧，避免严格客户端因未闭合的 content_block / message 项挂起
+    macro_rules! finish_stream {
+        () => {
+            match proto {
+                crate::api_server::routes::Protocol::Anthropic => {
+                    anthropic_start(tx, &mut message_started, chat_id, model);
+                    if thinking_block_open {
+                        thinking_block_open = false;
+                        let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                            "event: content_block_stop\ndata: {}\n\n",
+                            json!({"type":"content_block_stop","index":block_index})
+                        ))));
+                    }
+                    if text_block_open {
+                        text_block_open = false;
+                        let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                            "event: content_block_stop\ndata: {}\n\n",
+                            json!({"type":"content_block_stop","index":block_index})
+                        ))));
+                    }
+                    // 工具块统一在文本块之后输出
+                    for (i, (_k, (tid, name, args))) in tool_buf.iter().enumerate() {
+                        let idx = block_index + 1 + i as i64;
+                        let id = if tid.is_empty() { format!("toolu_{}_{}", chat_id, i) } else { tid.clone() };
+                        let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                            "event: content_block_start\ndata: {}\n\n",
+                            json!({"type":"content_block_start","index":idx,
+                                   "content_block":{"type":"tool_use","id":id,"name":name,"input":{}}})
+                        ))));
+                        if !args.is_empty() {
+                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                                "event: content_block_delta\ndata: {}\n\n",
+                                json!({"type":"content_block_delta","index":idx,
+                                       "delta":{"type":"input_json_delta","partial_json":args}})
+                            ))));
+                        }
+                        let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                            "event: content_block_stop\ndata: {}\n\n",
+                            json!({"type":"content_block_stop","index":idx})
+                        ))));
+                    }
+                    let (it, ot) = usage.as_ref().map(u64_pair).unwrap_or((0, 0));
+                    // P1 修复：stop_reason 按上游 finish_reason 映射，工具块存在时
+                    // 必为 tool_use（原硬编码 end_turn 与已输出的 tool_use 块矛盾）
+                    let stop_reason = if !tool_buf.is_empty() {
+                        "tool_use"
+                    } else {
+                        finish_to_stop(&last_finish)
+                    };
+                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                        "event: message_delta\ndata: {}\n\n",
+                        json!({
+                            "type":"message_delta",
+                            "delta":{"stop_reason":stop_reason,"stop_sequence":null},
+                            "usage":{"input_tokens":it,"output_tokens":ot},
+                        })
+                    ))));
+                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                        "event: message_stop\ndata: {}\n\n",
+                        json!({"type":"message_stop"})
+                    ))));
+                }
+                crate::api_server::routes::Protocol::Responses => {
+                    // 未产出任何 chunk 也补 created，保证事件序列完整
+                    resp_ensure_created!();
+                    let mut output: Vec<Value> = Vec::new();
+                    if resp_msg_open {
+                        output.push(json!({
+                            "id": format!("{}_msg_0", chat_id),
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": resp_text, "annotations": []}],
+                        }));
+                        resp_send(tx, "response.output_item.done", json!({
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": output[0],
+                        }));
+                    }
+                    // 工具调用缓冲统一在文本项之后完整输出
+                    for (i, (_k, (tid, name, args))) in tool_buf.iter().enumerate() {
+                        let idx = output.len() as i64;
+                        let item_id = if tid.is_empty() {
+                            format!("{}_fc_{}", chat_id, i)
+                        } else {
+                            tid.clone()
+                        };
+                        let item = json!({
+                            "id": item_id,
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": if tid.is_empty() { format!("call_{}_{}", chat_id, i) } else { tid.clone() },
+                            "name": name,
+                            "arguments": args,
+                        });
+                        let mut added = item.clone();
+                        added["status"] = json!("in_progress");
+                        added["arguments"] = json!("");
+                        resp_send(tx, "response.output_item.added", json!({
+                            "type": "response.output_item.added",
+                            "output_index": idx,
+                            "item": added,
+                        }));
+                        if !args.is_empty() {
+                            resp_send(tx, "response.function_call_arguments.delta", json!({
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": item["id"],
+                                "output_index": idx,
+                                "delta": args,
+                            }));
+                        }
+                        resp_send(tx, "response.output_item.done", json!({
+                            "type": "response.output_item.done",
+                            "output_index": idx,
+                            "item": item,
+                        }));
+                        output.push(item);
+                    }
+                    resp_send(tx, "response.completed", json!({
+                        "type": "response.completed",
+                        "response": responses_object(chat_id, model, "completed", output, usage.as_ref()),
+                    }));
+                }
+                _ => {
+                    let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                }
+            }
+        };
+    }
+
     loop {
         // 客户端断连快速检测（对齐 sse.rs「发送失败即断」）：send! 宏忽略发送
         // 失败，活跃流期间的断连依赖此处逐事件检查，最坏延迟一个事件的处理耗时；
@@ -321,131 +453,8 @@ pub fn stream_forward_ex(
                     ));
                     break;
                 }
-                match proto {
-                    crate::api_server::routes::Protocol::Anthropic => {
-                        anthropic_start(tx, &mut message_started, chat_id, model);
-                        if thinking_block_open {
-                            thinking_block_open = false;
-                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                                "event: content_block_stop\ndata: {}\n\n",
-                                json!({"type":"content_block_stop","index":block_index})
-                            ))));
-                        }
-                        if text_block_open {
-                            text_block_open = false;
-                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                                "event: content_block_stop\ndata: {}\n\n",
-                                json!({"type":"content_block_stop","index":block_index})
-                            ))));
-                        }
-                        // 工具块统一在文本块之后输出
-                        for (i, (_k, (tid, name, args))) in tool_buf.iter().enumerate() {
-                            let idx = block_index + 1 + i as i64;
-                            let id = if tid.is_empty() { format!("toolu_{}_{}", chat_id, i) } else { tid.clone() };
-                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                                "event: content_block_start\ndata: {}\n\n",
-                                json!({"type":"content_block_start","index":idx,
-                                       "content_block":{"type":"tool_use","id":id,"name":name,"input":{}}})
-                            ))));
-                            if !args.is_empty() {
-                                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                                    "event: content_block_delta\ndata: {}\n\n",
-                                    json!({"type":"content_block_delta","index":idx,
-                                           "delta":{"type":"input_json_delta","partial_json":args}})
-                                ))));
-                            }
-                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                                "event: content_block_stop\ndata: {}\n\n",
-                                json!({"type":"content_block_stop","index":idx})
-                            ))));
-                        }
-                        let (it, ot) = usage.as_ref().map(u64_pair).unwrap_or((0, 0));
-                        // P1 修复：stop_reason 按上游 finish_reason 映射，工具块存在时
-                        // 必为 tool_use（原硬编码 end_turn 与已输出的 tool_use 块矛盾）
-                        let stop_reason = if !tool_buf.is_empty() {
-                            "tool_use"
-                        } else {
-                            finish_to_stop(&last_finish)
-                        };
-                        let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                            "event: message_delta\ndata: {}\n\n",
-                            json!({
-                                "type":"message_delta",
-                                "delta":{"stop_reason":stop_reason,"stop_sequence":null},
-                                "usage":{"input_tokens":it,"output_tokens":ot},
-                            })
-                        ))));
-                        let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                            "event: message_stop\ndata: {}\n\n",
-                            json!({"type":"message_stop"})
-                        ))));
-                    }
-                    crate::api_server::routes::Protocol::Responses => {
-                        // 未产出任何 chunk 也补 created，保证事件序列完整
-                        resp_ensure_created!();
-                        let mut output: Vec<Value> = Vec::new();
-                        if resp_msg_open {
-                            output.push(json!({
-                                "id": format!("{}_msg_0", chat_id),
-                                "type": "message",
-                                "status": "completed",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": resp_text, "annotations": []}],
-                            }));
-                            resp_send(tx, "response.output_item.done", json!({
-                                "type": "response.output_item.done",
-                                "output_index": 0,
-                                "item": output[0],
-                            }));
-                        }
-                        // 工具调用缓冲统一在文本项之后完整输出
-                        for (i, (_k, (tid, name, args))) in tool_buf.iter().enumerate() {
-                            let idx = output.len() as i64;
-                            let item_id = if tid.is_empty() {
-                                format!("{}_fc_{}", chat_id, i)
-                            } else {
-                                tid.clone()
-                            };
-                            let item = json!({
-                                "id": item_id,
-                                "type": "function_call",
-                                "status": "completed",
-                                "call_id": if tid.is_empty() { format!("call_{}_{}", chat_id, i) } else { tid.clone() },
-                                "name": name,
-                                "arguments": args,
-                            });
-                            let mut added = item.clone();
-                            added["status"] = json!("in_progress");
-                            added["arguments"] = json!("");
-                            resp_send(tx, "response.output_item.added", json!({
-                                "type": "response.output_item.added",
-                                "output_index": idx,
-                                "item": added,
-                            }));
-                            if !args.is_empty() {
-                                resp_send(tx, "response.function_call_arguments.delta", json!({
-                                    "type": "response.function_call_arguments.delta",
-                                    "item_id": item["id"],
-                                    "output_index": idx,
-                                    "delta": args,
-                                }));
-                            }
-                            resp_send(tx, "response.output_item.done", json!({
-                                "type": "response.output_item.done",
-                                "output_index": idx,
-                                "item": item,
-                            }));
-                            output.push(item);
-                        }
-                        resp_send(tx, "response.completed", json!({
-                            "type": "response.completed",
-                            "response": responses_object(chat_id, model, "completed", output, usage.as_ref()),
-                        }));
-                    }
-                    _ => {
-                        let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-                    }
-                }
+                // Done 与 EOF 断流共用收尾序列（P1-5 提取为 finish_stream!）
+                finish_stream!();
                 sent_any = true;
                 break;
             }
@@ -692,8 +701,14 @@ pub fn stream_forward_ex(
         }
     }
 
-    // 上游断流：error_info / sent_any / failed_inline 状态交由上层判定
-    // （故障转移，或流内失败已收尾）
+    // 上游断流（EOF 未收到 Done/Error 事件）优雅收尾（审查 P1-5，对齐
+    // sse.rs SOLO finish_stream 语义）：已有内容 → 按协议补齐终止帧，避免
+    // 严格客户端因未闭合的 content_block / message 项挂起；零内容不伪装
+    // 成功，走下方空完成哨兵换号重试
+    if error_info.is_none() && !failed_inline && has_content && !tx.is_closed() {
+        finish_stream!();
+        sent_any = true;
+    }
 
     // 空完成兜底（issue #57）：EOF 且零内容零错误、客户端仍在线 → 哨兵上抛
     // （原样收尾会让客户端收到 "empty provider response"）

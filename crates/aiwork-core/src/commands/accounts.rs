@@ -1530,8 +1530,10 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
         Ok(t) => t,
         Err(e) => {
             let err = format!("ExchangeToken 失败: {}", e.msg);
-            // B 判定收窄：仅服务端明确拒绝（数字 code != 0）才立即置 invalid；
-            // 网络/解析/协议级失败走 rejected=false（连续 3 次仍会置 invalid 兜底）
+            // B 判定收窄：仅服务端明确拒绝才立即置 invalid（旧形态数字 code != 0，
+            // 或火山信封 20101「refresh token is invalid」，见 oauth::refresh_token_rejected）；
+            // 网络/解析/设备协议级失败走 rejected=false 只计数——**无「连续 N 次升级为
+            // invalid」逻辑**（失效判定一律以服务端明确否定为准，避免网络抖动把可用凭证标死）
             record_refresh_failure(state, user_id, e.server_rejected, &err);
             // D 失败进入冷却
             REFRESH_COOLDOWN
@@ -2161,6 +2163,7 @@ mod tests {
             data_dir: dir,
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         let now = chrono::Utc::now().timestamp();
         let acc = |name: &str, uid: Option<&str>, exp: i64, rt: Option<&str>, invalid: bool| {

@@ -36,6 +36,16 @@ pub const COSY_CLIENT_TYPE: &str = "10";
 /// Electron 完整 UA `...QoderCN/0.4.2 Chrome/150... Electron/43.1.1...`）
 pub const CLIENT_USER_AGENT: &str = "Qoder";
 
+/// 客户端 openapi 域 Cosy 协议版本（移植 main@448092a：proxy 抓包 2026-10-07 12:35
+/// 客户端 0.4.3 实测 `cosy-version: 0.4.3`）。注意与 qoder_sign::GATEWAY_COSY_VERSION
+///（推理网关域 1.1.38）区分——两个域的 COSY 协议版本互不通用。
+pub const CLIENT_COSY_VERSION: &str = "0.4.3";
+
+/// 客户端 openapi 域机器 OS 标识（同抓包实测 `cosy-machineos: x86_64_win32`；
+/// qoder_sign 网关域为 x86_64_windows，形态不同勿混用）。docker 侧维持同形态：
+/// 派生指纹本就独立分桶，形态对齐仅保持「不比缺头更差」的底线
+pub const CLIENT_MACHINE_OS: &str = "x86_64_win32";
+
 // ── 凭证结构 ────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Clone, Default)]
@@ -450,7 +460,47 @@ pub fn clear_device_flow_creds(state: &AppState, id: &str) -> Result<(), String>
 
 // ── 统一请求头（§5.2：Cosy 头必带）─────────────────────────────────────────
 
-/// Bearer + Cosy-ClientType（缺失 → 服务端静默空列表）+ 可选设备头透传 + UA。
+/// 按客户端 openapi 域实测形态补齐设备描述头（移植 main@448092a 的 fallback
+/// 路径；proxy 抓包 2026-10-07 12:35，客户端 0.4.3 对全部 openapi 请求携带：
+/// cosy-version / cosy-machineos / cosy-machinehostname / cosy-machinecode /
+/// cosy-machinetype + 原生 cosy-machinetoken）。
+///
+/// docker 版语义（与 main 兼容性差异见移植记录）：main 优先取桌面客户端
+/// runtime-info.exe 原生真值（依赖 Windows 本机安装，docker 容器不含该依赖，
+/// 未移植），恒走 machine_id 派生 fallback——派生值被服务端归入独立指纹桶，
+/// 仅维持「不比缺头更差」的底线。Cosy-MachineId 不在派生键内，仍走 creds
+/// 透传/注入（§5.10 语义不变）。
+pub fn extend_client_device_headers(h: &mut Vec<(String, String)>, creds: &QoderCreds) {
+    let has = |h: &[(String, String)], k: &str| {
+        h.iter().any(|(a, _)| a.eq_ignore_ascii_case(k))
+    };
+    // Windows 主机名走 COMPUTERNAME；Linux/容器走 HOSTNAME（docker 默认注入）
+    let hostname = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "PC".to_string());
+    for (k, v) in [
+        ("Cosy-Version", CLIENT_COSY_VERSION.to_string()),
+        ("Cosy-MachineOS", CLIENT_MACHINE_OS.to_string()),
+        ("Cosy-MachineHostname", hostname),
+    ] {
+        if !has(h, k) {
+            h.push((k.to_string(), v));
+        }
+    }
+    if !creds.machine_id.is_empty() {
+        let code: String = creds.machine_id.chars().take(18).collect();
+        let mtype: String = creds.machine_id.chars().take(17).collect();
+        if !has(h, "Cosy-MachineCode") {
+            h.push(("Cosy-MachineCode".to_string(), code));
+        }
+        if !has(h, "Cosy-MachineType") {
+            h.push(("Cosy-MachineType".to_string(), mtype));
+        }
+    }
+}
+
+/// Bearer + Cosy-ClientType（缺失 → 服务端静默空列表）+ 可选设备头透传 + UA，
+/// 再按客户端形态补齐设备描述头（见 [`extend_client_device_headers`]）。
 pub fn build_auth_headers(creds: &QoderCreds) -> Vec<(String, String)> {
     let mut h = vec![
         (
@@ -468,6 +518,7 @@ pub fn build_auth_headers(creds: &QoderCreds) -> Vec<(String, String)> {
     if !creds.machine_token.is_empty() {
         h.push(("Cosy-MachineToken".to_string(), creds.machine_token.clone()));
     }
+    extend_client_device_headers(&mut h, creds);
     h
 }
 
@@ -1087,6 +1138,17 @@ impl CrossProcLock {
         scope: &str,
         wait_ms: u32,
     ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        Self::try_acquire_ns(data_dir, "qoder", scope, wait_ms)
+    }
+
+    /// 带命名空间版本：签到落库/WB 域复用同一互斥体机制（ns="checkin"/"wb"），锁名互不串扰。
+    /// ns/scope 均须为单段名（不得含 `\`，见上方多段名教训）。
+    pub fn try_acquire_ns(
+        data_dir: &std::path::Path,
+        ns: &str,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
         use windows_sys::Win32::Foundation::{
             CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         };
@@ -1098,7 +1160,7 @@ impl CrossProcLock {
         let mut h = Sha256::new();
         h.update(data_dir.to_string_lossy().as_bytes());
         let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        let name: Vec<u16> = format!("Global\\AIWorkAssistant.qoder.{scope}.{}", &hex[..16])
+        let name: Vec<u16> = format!("Global\\AIWorkAssistant.{ns}.{scope}.{}", &hex[..16])
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -1162,9 +1224,19 @@ impl CrossProcLock {
         scope: &str,
         wait_ms: u32,
     ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        Self::try_acquire_ns(data_dir, "qoder", scope, wait_ms)
+    }
+
+    /// 带命名空间版本：锁文件名拼入 ns（`{ns}.{scope}.lock`），各域互不串扰
+    pub fn try_acquire_ns(
+        data_dir: &std::path::Path,
+        ns: &str,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
         use std::time::{Duration, Instant};
         let dir = data_dir.join("locks");
-        let path = dir.join(format!("{scope}.lock"));
+        let path = dir.join(format!("{ns}.{scope}.lock"));
         // scope 为调用点常量（"checkin"/"refresh"/"credits"），无路径注入面；
         // 目录创建失败按 CreateFailed 上报（对齐 Windows 语义：锁机制不可用 ≠ 被占用）
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -1297,11 +1369,34 @@ mod tests {
         let h = build_auth_headers(&c);
         assert!(h.iter().any(|(k, v)| k == "Cosy-ClientType" && v == "10"));
         assert!(!h.iter().any(|(k, _)| k == "Cosy-MachineId"), "设备头缺失时不得伪造");
+        // 设备描述头（移植 main@448092a fallback 路径）：Version/MachineOS 恒补齐
+        assert!(h.iter().any(|(k, v)| k == "Cosy-Version" && v == CLIENT_COSY_VERSION));
+        assert!(h.iter().any(|(k, v)| k == "Cosy-MachineOS" && v == CLIENT_MACHINE_OS));
+        assert!(h.iter().any(|(k, _)| k == "Cosy-MachineHostname"));
         c.machine_id = "mid".into();
         c.machine_token = "mtk".into();
         let h = build_auth_headers(&c);
         assert!(h.iter().any(|(k, v)| k == "Cosy-MachineId" && v == "mid"));
         assert!(h.iter().any(|(k, v)| k == "Cosy-MachineToken" && v == "mtk"));
+    }
+
+    /// 设备描述头派生 fallback（移植 main@448092a）：machine_id 截断 18/17 hex，幂等不覆盖
+    #[test]
+    fn extend_device_headers_fallback_derives_from_machine_id() {
+        let c = QoderCreds {
+            access_token: "pt-x".into(),
+            machine_id: "0123456789abcdef0123456789abcdef".into(),
+            ..Default::default()
+        };
+        let mut h = Vec::new();
+        extend_client_device_headers(&mut h, &c);
+        assert!(h.iter().any(|(k, v)| k == "Cosy-MachineCode" && v == "0123456789abcdef01"));
+        assert!(h.iter().any(|(k, v)| k == "Cosy-MachineType" && v == "0123456789abcdef0"));
+        assert!(h.iter().any(|(k, v)| k == "Cosy-Version" && v == CLIENT_COSY_VERSION));
+        // 幂等：既有键不覆盖
+        let mut h2 = vec![("Cosy-MachineCode".to_string(), "keep".to_string())];
+        extend_client_device_headers(&mut h2, &c);
+        assert!(h2.iter().any(|(k, v)| k == "Cosy-MachineCode" && v == "keep"));
     }
 
     /// R-6 抓包固化：clientId 为 PAT 派生的稳定 UUID 格式串

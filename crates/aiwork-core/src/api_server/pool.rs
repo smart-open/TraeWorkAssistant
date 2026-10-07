@@ -425,6 +425,8 @@ impl ApiPool {
             domain: e.domain.clone(),
             enterprise_id: e.enterprise_id.clone(),
             global_region: e.global_region,
+            // 专一/粘性锁定：忽略 busy 过滤（语义即「锁定即用」），无条件绑定
+            over_limit: true,
         })
     }
 
@@ -525,6 +527,9 @@ impl ApiPool {
             domain: picked.domain.clone(),
             enterprise_id: picked.enterprise_id.clone(),
             global_region: picked.global_region,
+            // busy_fallback 降级（全候选 busy 取 in-flight 最小者）保留「不过载拒绝」
+            // 既有语义 → 无条件绑定；正常路径交由路由侧 CAS 复核
+            over_limit: busy_fallback,
         };
         // F-77⑤ 可观测：busy 让位/降级事件（无 busy 过滤发生则 None）
         let event = if limit > 0 && busy_fallback {
@@ -565,6 +570,10 @@ impl ApiPool {
         let inflight = self.inflight_snapshot();
         let sticky_inflight = inflight.get(sticky_uid).copied().unwrap_or(0);
         if limit == 0 || sticky_inflight < limit {
+            // 快照判定空闲：绑定语义交路由侧 CAS 复核（TOCTOU 收紧）；
+            // limit=0 未启用上限，CAS 侧按无条件绑定处理
+            let mut sticky = sticky;
+            sticky.over_limit = false;
             return Some((sticky, None));
         }
         // 粘性账号 busy：判定其他健康候选（同 allowed 约束；首轮无 tried）是否存在空闲
@@ -619,6 +628,8 @@ impl ApiPool {
             domain: picked.domain.clone(),
             enterprise_id: picked.enterprise_id.clone(),
             global_region: picked.global_region,
+            // 让位候选取自快照空闲集：绑定语义交路由侧 CAS 复核（TOCTOU 收紧）
+            over_limit: false,
         };
         let event = Some(format!(
             "sticky_yield from={sticky_uid} to={} inflight={} limit={}",
@@ -737,6 +748,7 @@ impl ApiPool {
                 cooling: e.until > 0 && now < e.until,
                 cooldown_until: if e.until > 0 { Some(e.until) } else { None },
                 cooldown_reason: if e.reason.is_empty() { None } else { Some(e.reason.clone()) },
+                hard_credit: e.hard_until > 0 && now < e.hard_until,
                 disabled: e.disabled,
                 err_count: e.err_count,
                 state: e.state_str(now).to_string(),
@@ -859,6 +871,10 @@ pub struct PickedAccount {
     pub domain: String,
     pub enterprise_id: String,
     pub global_region: bool,
+    /// 绑定语义标记（审查 P1-4 TOCTOU 收紧）：true = 按既有语义无条件绑定
+    /// （专一/粘性锁定、busy_fallback 降级——拒绝会破坏其锁定/兜底语义）；
+    /// false = 路由侧绑定时经 CAS 复核「在途 < 并发上限」，已满则换下一候选
+    pub over_limit: bool,
 }
 
 /// WorkBuddy 账号入池同步结构（T2.1）

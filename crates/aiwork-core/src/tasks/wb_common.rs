@@ -245,11 +245,75 @@ pub fn effective_creds(state: &AppState, acct_id: &str, acct_uid: &str) -> Creds
     store_creds
 }
 
+// ── 并发刷新防护（审查 H-1，对齐 qoder_common 同款双锁）──────────────────────
+
+/// token store 表级读改写互斥：load→merge→upsert 非原子，签到/积分/续期/导入/
+/// OAuth 多通道并发写会互相覆盖丢更新（last-writer-wins 抹掉彼此的新 token）。
+/// tasks 侧 save_token_store 与 commands 侧 upsert_token_store 共用本锁串行化
+/// 表级读改写；仅护本地 IO，不覆盖网络请求路径（无死锁面）。
+/// 锁序约定：账号刷新锁 → 本表锁（单向获取，无环）。
+pub(crate) static WB_TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 每账号刷新互斥（审查 H-1/P0）：签到/积分 401 自愈/续期/调度器与 CLI
+/// 双进程多通道并发触发同一账号刷新时，两个线程可能同时拿旧 refresh_token 换新
+/// token——服务端一次性轮换下后落库者覆盖先落库者，被覆盖方刚拿到的令牌即刻失效
+///（严重时 refresh_token 一并丢，被迫重登）。以账号 id 为键的进程内锁串行化
+/// 「读凭证→网络刷新→落库」全程；持锁后重读 token store 天然构成二次检查。
+static WB_REFRESH_LOCKS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::Mutex::new(None);
+
+pub(crate) fn refresh_lock_for(acct_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let mut g = WB_REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(std::collections::HashMap::new)
+        .entry(acct_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
+/// 账号移除路径主动清理（P3-L，对齐 qoder refresh_lock_remove）：回收刷新锁表项，
+/// 防止账号删除后条目永驻 HashMap（进程生命周期内每次增删账号泄漏一把锁）。
+pub(crate) fn refresh_lock_remove(acct_id: &str) {
+    let mut g = WB_REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = g.as_mut() {
+        map.remove(acct_id);
+    }
+}
+
+/// 跨进程刷新互斥（H-1 ②）：server 与 CLI（--task-run）双进程并存，进程内锁
+/// 无法约束跨进程并发。命名互斥体/flock 按账号隔离（ns="wb"，scope=账号 id，
+/// 锁名含 data_dir 短哈希）；抢锁失败幂等跳过本次刷新（沿用现有凭证，
+/// 仅少一次自愈机会，无损失）。
+fn cross_refresh_lock(
+    state: &AppState,
+    acct_id: &str,
+) -> Option<crate::tasks::qoder_common::CrossProcLock> {
+    let (guard, fail) = crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+        &state.data_dir,
+        "wb",
+        acct_id,
+        5000,
+    );
+    if guard.is_none() {
+        let reason = fail
+            .as_ref()
+            .map(|f| f.describe())
+            .unwrap_or_default();
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[wb-fresh] 跨进程刷新锁未获取(id={acct_id}, {reason})，本轮沿用现有凭证"),
+        );
+    }
+    guard
+}
+
 /// 写工具侧凭证副本（F-10 谁新用谁）。version≠1 拒绝写入（版本闸门）；
 /// 非空字段合并 + updated_at（与 commands/workbuddy/common.rs upsert_token_store 同语义）。
 /// 凭证收敛（P0-1）：落库走 token_store_upsert_secure——敏感字段进 vault、DB 占位；
 /// vault 写失败时仅落占位并返回 Err（禁止明文落库）。
 pub fn save_token_store(state: &AppState, id: &str, creds: &Creds) -> Result<(), String> {
+    // H-1：表级读改写互斥（与 commands 侧 upsert_token_store 共锁）
+    let _table = WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store: Value = load_token_store(state);
     if !store.is_object() {
         store = serde_json::json!({});
@@ -452,6 +516,8 @@ pub enum RefreshFail {
     Auth,
     /// 200 但响应无 accessToken（响应结构异常，不标记重登录）
     BadResponse,
+    /// H-1：跨进程锁未获取（他方进程正在刷新同账号，本侧幂等跳过；不标记重登录）
+    Busy,
 }
 
 /// 调 plugin refresh 端点（X-Refresh-Token 仅允许出现在此端点）。
@@ -657,6 +723,11 @@ pub fn dig_num(v: Option<&Value>) -> Option<f64> {
 
 /// 惰性刷新：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
 /// 返回 (creds, refreshed, note)，note ∈ no_credential/fresh/expired_needs_relogin/refreshed/refresh_failed。
+///
+/// H-1（P0 修复）：「读凭证→网络刷新→落库」全程持每账号刷新锁（进程内）+ 跨进程
+/// 命名互斥体，双进程/多通道并发触发同账号刷新时串行化；持锁后重读凭证构成二次
+/// 检查——他人已刷新落库则直接命中新凭证（fresh），不再重复发网络请求。新鲜快路径
+/// 无锁直返（调度/签到热路径不承担锁开销）。
 pub fn ensure_fresh(
     state: &AppState,
     agent: &ureq::Agent,
@@ -679,11 +750,67 @@ pub fn ensure_fresh(
             return (creds, false, "expired_needs_relogin");
         }
     }
+    // H-1 ①：进程内每账号锁串行化；②跨进程命名互斥体（server/CLI 双进程）
+    let lock = refresh_lock_for(acct_id);
+    let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(_cross) = cross_refresh_lock(state, acct_id) else {
+        // 他方进程刷新中：幂等跳过（沿用现有凭证，不误标 needs_relogin）
+        return (creds, false, "refresh_failed");
+    };
+    // 二次检查：他人已刷新落库 → 直接复用新凭证（不发网络请求）
+    let creds = effective_creds(state, acct_id, acct_uid);
+    if creds.access_token.is_empty() {
+        return (creds, false, "no_credential");
+    }
+    if let Some(exp) = creds.expires_at_ms {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
+        if remain_h > lazy_hours as f64 {
+            return (creds, false, "fresh");
+        }
+        if remain_h < 0.0 && creds.refresh_token.is_empty() {
+            return (creds, false, "expired_needs_relogin");
+        }
+    }
     if let Some(new) = refresh_token_once(agent, &creds) {
         let _ = save_token_store(state, acct_id, &new);
         return (new, true, "refreshed");
     }
     (creds, false, "refresh_failed")
+}
+
+/// 401 自愈专用加锁刷新（H-1）：串行化「网络刷新→落库」并做二次检查——他人已刷新
+/// 落库（token store 中该账号 access_token 与调用方持有凭证不同）则直接复用新凭证，
+/// 不再重复发网络请求；否则以调用方凭证刷新并落库（调用方无须再自行 save）。
+/// 跨进程抢锁失败 → (None, Some(RefreshFail::Busy))：调用方按非 Auth 处理
+///（不误标 needs_relogin，下次自然重试）。
+pub fn refresh_token_once_locked(
+    state: &AppState,
+    agent: &ureq::Agent,
+    acct_id: &str,
+    stale: &Creds,
+) -> (Option<Creds>, Option<RefreshFail>) {
+    let lock = refresh_lock_for(acct_id);
+    let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(_cross) = cross_refresh_lock(state, acct_id) else {
+        return (None, Some(RefreshFail::Busy));
+    };
+    // 二次检查：store 权威源中该账号已换新 token（他人刷新落库）→ 直接复用。
+    // 仅比对 store 记录（刷新产物只落 store，不落 auth 文件），避免 auth 文件
+    // 属于其他账号时误判
+    let store_cur: Creds = load_token_store(state)
+        .get("tokens")
+        .and_then(|t| t.get(acct_id))
+        .map(creds_of)
+        .unwrap_or_default();
+    if !store_cur.access_token.is_empty() && store_cur.access_token != stale.access_token {
+        return (Some(store_cur), None);
+    }
+    let (new, fail) = refresh_token_once_ex(agent, stale);
+    if let Some(n) = &new {
+        let _ = save_token_store(state, acct_id, n);
+    }
+    (new, Some(fail))
 }
 
 #[cfg(test)]

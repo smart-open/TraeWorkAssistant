@@ -717,6 +717,10 @@ fn stream_convert_anthropic_src(
 
     macro_rules! finish_stream {
         () => {{
+            // 审查 P2：纯 tool_calls 流（message_started=false，工具仅缓冲未输出）
+            // EOF 收尾时先补 message_start——content_block 必须有 message 前缀，
+            // 严格客户端（如 Claude Code）才会接受该序列；幂等（done 分支已先行调用）
+            start_message!();
             close_text_block!();
             // 工具块：text 之后统一追加（content_block_start + input_json_delta + stop）
             for (i, t) in tools.iter().enumerate() {

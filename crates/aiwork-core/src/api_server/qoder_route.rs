@@ -489,6 +489,7 @@ fn run_qoder_stream(
     });
 
     let mut tried: HashSet<String> = HashSet::new();
+    let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
 
     loop {
         // 客户端断连检测：通道关闭即终止轮换/重试（对齐 run_wb_stream）
@@ -511,14 +512,28 @@ fn run_qoder_stream(
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None);
+                    // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
+                    // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
+                    // wb_template_map.json），否则维持无健康账号文案；
+                    // code 保持 no_healthy_account（客户端兼容）
+                    let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
+                    let (exhaust_msg, exhaust_tag) =
+                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     state.logger.log_request(
                         "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
-                        duration_ms, &key_name, "", Some("no healthy account"),
+                        duration_ms, &key_name, "", Some(&exhaust_msg),
                     );
-                    // 审查 P3：错误消息面向客户端用户展示，中文化（code 保留机器可读）
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(
-                        "data: {\"error\":{\"message\":\"Qoder 上游暂无可用账号（无健康账号可调度），请检查账号池或稍后重试\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
-                    )));
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder",
+                        tried.len(),
+                        empty_hits
+                    ));
+                    let err_body = json!({
+                        "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
+                    });
+                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                        "data: {err_body}\n\n"
+                    ))));
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     return;
                 }
@@ -527,9 +542,24 @@ fn run_qoder_stream(
         tried.insert(picked.uid.clone());
         // 当前账号排队重试计数（账号局部：换号自然重置）
         let mut queue_same: u32 = 0;
+        // F-77 账号级在途计数：取号即绑定（换号时 bind_account 自动解绑旧账号）。
+        // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+        // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（粘性锁定、
+        // busy_fallback 降级）保留原无条件绑定语义。
+        // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
+        let bound = if picked.over_limit {
+            guard = guard.bind_account(state.qoder_pool.inflight_handle(&picked.uid));
+            true
+        } else {
+            guard.bind_account_cas(
+                state.qoder_pool.inflight_handle(&picked.uid),
+                state.qoder_pool.concurrency_limit(),
+            )
+        };
+        if !bound {
+            continue;
+        }
         *safe_lock(&state.active_uid) = Some(picked.uid.clone());
-        // F-77 账号级在途计数：取号即绑定（换号时 bind_account 自动解绑旧账号）
-        guard = guard.bind_account(state.qoder_pool.inflight_handle(&picked.uid));
 
         // 凭证解析：回调缺失（未注入/单测）→ 换号不冷却（配置问题非账号问题）；
         // 回调报错（PAT 换令牌失败/登录态失效）→ SessionDead 禁用后换号
@@ -706,7 +736,9 @@ fn run_qoder_stream(
                                     // translate 写 ErrMeta，必落本分支（非「理论不可达」）：
                                     // 上游间歇性空回放属暂态，按 wb_route 口径免熔断，
                                     // 仅由下方 !sent_any 分支换号重试
-                                    if !super::is_empty_completion(code, &msg) {
+                                    if super::is_empty_completion(code, &msg) {
+                                        empty_hits += 1; // 空完成计数：耗尽收尾区分指纹拦截
+                                    } else {
                                         state.qoder_pool.note_error(&win_uid, ErrKind::Server);
                                     }
                                 }
@@ -922,6 +954,7 @@ pub async fn qoder_aggregate_chat(
         });
 
         let mut tried: HashSet<String> = HashSet::new();
+        let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
 
         loop {
             // ── 取号：粘性命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
@@ -950,16 +983,34 @@ pub async fn qoder_aggregate_chat(
                             0,
                             None,
                         );
-                        // 审查 P3：错误消息面向客户端用户展示，中文化
-                        return Err("Qoder 上游暂无可用账号（无健康账号可调度），请检查账号池或稍后重试".to_string());
+                        // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
+                        let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
+                        let (exhaust_msg, _) =
+                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        return Err(exhaust_msg);
                     }
                 },
             };
             tried.insert(picked.uid.clone());
             // 当前账号排队重试计数（账号局部：换号自然重置）
             let mut queue_same: u32 = 0;
+            // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+            // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（粘性锁定、
+            // busy_fallback 降级）保留原无条件绑定语义。
+            // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
+            let bound = if picked.over_limit {
+                guard = guard.bind_account(state.qoder_pool.inflight_handle(&picked.uid));
+                true
+            } else {
+                guard.bind_account_cas(
+                    state.qoder_pool.inflight_handle(&picked.uid),
+                    state.qoder_pool.concurrency_limit(),
+                )
+            };
+            if !bound {
+                continue;
+            }
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
-            guard = guard.bind_account(state.qoder_pool.inflight_handle(&picked.uid));
 
             let creds: QoderCreds = match state.qoder_identity.as_ref() {
                 None => continue, // 回调未注入：换号（tried 增长自然耗尽后 503）
@@ -1121,6 +1172,8 @@ pub async fn qoder_aggregate_chat(
                                 break;
                             }
                             _ => {
+                                // (None, None)：EOF 零完成（影子风控/上游异常）——计数后换号
+                                empty_hits += 1;
                                 state.qoder_pool.note_error(&win_uid, ErrKind::Server);
                                 state.logger.log_request_ttfb(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream, 502,

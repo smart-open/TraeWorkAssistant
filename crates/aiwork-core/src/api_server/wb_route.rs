@@ -559,6 +559,7 @@ fn run_wb_stream(
 
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
+    let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
 
     loop {
         // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）
@@ -579,23 +580,58 @@ fn run_wb_stream(
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
+                    // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
+                    // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
+                    // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
+                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                    let (exhaust_msg, exhaust_tag) =
+                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     state.logger.log_request(
                         "buddy", "POST", "/v2/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "",
-                        Some("no healthy account"),
+                        Some(&exhaust_msg),
                     );
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(
-                        "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
-                    )));
+                    let diag = state.wb_pool.diagnose();
+                    let diag_summary: Vec<String> = diag
+                        .iter()
+                        .map(|d| format!("{}({})", d.name, d.reason))
+                        .collect();
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy reasons=[{}]",
+                        tried.len(),
+                        empty_hits,
+                        diag_summary.join(", "),
+                    ));
+                    let err_body = json!({
+                        "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
+                    });
+                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                        "data: {err_body}\n\n"
+                    ))));
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     return;
                 }
             },
         };
         tried.insert(picked.uid.clone());
+        // F-77 账号级在途计数：取号即绑定（重试换号时 bind_account 自动解绑旧账号）。
+        // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+        // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
+        // 锁定、busy_fallback 降级）保留原无条件绑定语义。
+        // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
+        let bound = if picked.over_limit {
+            guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
+            true
+        } else {
+            guard.bind_account_cas(
+                state.wb_pool.inflight_handle(&picked.uid),
+                state.wb_pool.concurrency_limit(),
+            )
+        };
+        if !bound {
+            continue;
+        }
         *safe_lock(&state.active_uid) = Some(picked.uid.clone());
-        // F-77 账号级在途计数：取号即绑定（重试换号时 bind_account 自动解绑旧账号）
-        guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
 
         // 上游会话 id：粘性命中复用，否则新生成（成功后绑定）
         let is_sticky_hit = sticky_uid.as_deref() == Some(picked.uid.as_str()) && !sticky_conv.is_empty();
@@ -685,8 +721,19 @@ fn run_wb_stream(
                     match error_info {
                         Some((code, msg)) => {
                             if super::is_empty_completion(code, &msg) {
+                                // sent_any 护栏（对齐 qoder_route）：内容已流出时换号重发
+                                // 会向同一 SSE 流拼接第二份完整响应 → 就地收尾不再重试
+                                if sent_any {
+                                    state.logger.log_request_ttfb(
+                                        "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.wb_pool.name_of(win_uid), Some("空完成（内容已流出）→ 就地收尾"),
+                                    );
+                                    return;
+                                }
                                 // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传、
                                 // 不绑定粘性，换号重试（收尾帧未发，重试流可续传）
+                                empty_hits += 1;
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
@@ -889,6 +936,7 @@ pub async fn wb_aggregate_chat(
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
+        let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
 
         loop {
             let picked = match first_pick.take() {
@@ -903,14 +951,33 @@ pub async fn wb_aggregate_chat(
                     None => {
                         state.record_usage(true, &model, "none", &key_id, false, stream,
                             start_ts.elapsed().as_millis() as u64, 0, 0);
-                        return Err("no healthy account available".to_string());
+                        // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
+                        let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                        let (exhaust_msg, _) =
+                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        return Err(exhaust_msg);
                     }
                 },
             };
             tried.insert(picked.uid.clone());
+            // F-77 账号级在途计数：取号即绑定。
+            // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+            // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
+            // 锁定、busy_fallback 降级）保留原无条件绑定语义。
+            // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
+            let bound = if picked.over_limit {
+                guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
+                true
+            } else {
+                guard.bind_account_cas(
+                    state.wb_pool.inflight_handle(&picked.uid),
+                    state.wb_pool.concurrency_limit(),
+                )
+            };
+            if !bound {
+                continue;
+            }
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
-            // F-77 账号级在途计数：取号即绑定
-            guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
 
             let is_sticky_hit =
                 sticky_uid.as_deref() == Some(picked.uid.as_str()) && !sticky_conv.is_empty();
@@ -975,6 +1042,7 @@ pub async fn wb_aggregate_chat(
                                 if super::aggregated_response_is_empty(&r) {
                                     // 空完成（影子风控/上游异常，issue #57）：换号重试，
                                     // 口径同下方「empty response」（Server 级短冷却）
+                                    empty_hits += 1;
                                     state.wb_pool.note_error(win_uid, ErrKind::Server);
                                     note_model_failure(&state, &model);
                                     state.record_usage_ttfb(true, &model, win_uid, &key_id, false, stream, duration_ms, 0, 0, Some(ttfb_ms));
@@ -1189,7 +1257,9 @@ pub async fn wb_tool_exec_chat(
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let templates = load_templates(&state);
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
-        super::wb_toolexec::inject_proxy_tools(&mut chat_body);
+        // P1-6 劫持防护：false = 客户端已声明同名 function 工具，未注入代理工具，
+        // 全程跳过代执行（客户端工具调用照常透传，由客户端自行执行）
+        let proxy_exec = super::wb_toolexec::inject_proxy_tools(&mut chat_body);
         // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
         log_longctx_hint(&state, &chat_body, &model);
 
@@ -1204,6 +1274,7 @@ pub async fn wb_tool_exec_chat(
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
+        let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
         let mut records: Vec<super::wb_toolexec::SearchRecord> = Vec::new();
         let mut final_completion: Option<Value> = None;
         let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
@@ -1226,10 +1297,25 @@ pub async fn wb_tool_exec_chat(
                 None => break,
             };
             tried.insert(picked.uid.clone());
-            *safe_lock(&state.active_uid) = Some(picked.uid.clone());
             let conv_id = gen_conv_id();
-            // F-77 账号级在途计数：取号即绑定
-            guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
+            // F-77 账号级在途计数：取号即绑定。
+            // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
+            // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一锁定）
+            // 保留原无条件绑定语义。
+            // active_uid 仅在绑定成功后更新（CAS 拒绝的候选不得污染「当前账号」展示）
+            let bound = if picked.over_limit {
+                guard = guard.bind_account(state.wb_pool.inflight_handle(&picked.uid));
+                true
+            } else {
+                guard.bind_account_cas(
+                    state.wb_pool.inflight_handle(&picked.uid),
+                    state.wb_pool.concurrency_limit(),
+                )
+            };
+            if !bound {
+                continue;
+            }
+            *safe_lock(&state.active_uid) = Some(picked.uid.clone());
             let mut creds = WbCreds {
                 id: picked.uid.clone(),
                 uid: picked.uid.clone(),
@@ -1293,6 +1379,7 @@ pub async fn wb_tool_exec_chat(
                             // 空完成（影子风控/上游异常，issue #57）：换号重试。
                             // 口径：同流式路径不冷却（哨兵注释见 mod.rs）；此处补即时
                             // 观测日志，接通「空完成 → 模板命中」反查通道（与其余路径一致）
+                            empty_hits += 1;
                             let duration_ms = start_ts.elapsed().as_millis() as u64;
                             state.logger.log_request_ttfb(
                                 "buddy", "POST", "/v1/responses", &model, stream, 502, &picked.uid,
@@ -1308,7 +1395,13 @@ pub async fn wb_tool_exec_chat(
                                 acc_usage.1 + u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                             );
                         }
-                        let calls = super::wb_toolexec::extract_proxy_calls(&completion);
+                        // P1-6：仅代理成功注入工具时才按名提取代执行调用；
+                        // 客户端同名工具的调用一律视为普通透传（不提取不执行）
+                        let calls = if proxy_exec {
+                            super::wb_toolexec::extract_proxy_calls(&completion)
+                        } else {
+                            Vec::new()
+                        };
                         if calls.is_empty() {
                             // 最终回复：usage 写回全部轮次累加值（中间轮消耗计入总账）
                             let mut completion = completion;
@@ -1460,7 +1553,11 @@ pub async fn wb_tool_exec_chat(
                     "buddy", "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
                     duration_ms, &key_name, "", last_err.as_deref(),
                 );
-                Err(last_err.unwrap_or_else(|| "no healthy account available".to_string()))
+                // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
+                Err(last_err.unwrap_or_else(|| {
+                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                    super::routes::exhaust_message(empty_hits, tried.len(), healthy_total).0
+                }))
             }
         }
     })
@@ -1645,7 +1742,6 @@ mod tests {
     /// UTC+8 字面量必须命中，按 UTC+8 解释为 Unix 秒）
     #[test]
     fn parse_quota_reset_at_from_limit_message() {
-        use chrono::TimeZone;
         // 未来时刻动态构造（UTC+8 时区格式化），格式与上游文案一致
         let reset = (chrono::Utc::now() + chrono::Duration::hours(3))
             .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());

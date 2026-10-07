@@ -83,18 +83,37 @@ pub fn save(data_dir: &Path, results: &ResultsFile) {
 
 /// 当日落库进程内互斥（审查修复）：UI 手动签到、调度器/CLI 落库三路并发时，
 /// record_today 整表 load→record→save 的后保存方会覆盖先保存方的当日记录
-///（表级 last-writer-wins）。持锁串行化保证同进程内不丢行。
-/// 已知限制（审查 #13）：锁为进程内 Mutex——server 与 CLI 双进程同时落库时
-/// 仍可能整表覆盖（仅当日行丢失，历史数据无碍）；CLI 侧签到与 UI 并发场景
-/// 罕见，且签到结果本身为可重放软状态，暂不做跨进程文件锁。
+///（表级 last-writer-wins）。持锁串行化保证同进程内不丢行
 static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 记录当日签到最终状态（签到完成后的 done 落库入口），随后写盘
+/// 记录当日签到最终状态（签到完成后的 done 落库入口），随后写盘。
+/// 跨进程互斥（审查修复）：server 与 CLI（--task-run）双进程并发落库同此丢行问题，
+/// 命名互斥体/flock 串行化（对齐 wb_common/credits 锁语义）；抢锁失败降级仅进程内锁
+/// 继续写（SQLite 单事务写丢失窗口极小，落日志可查）
 pub fn record_today(
     data_dir: &Path,
     entries: impl IntoIterator<Item = (String, String, String)>,
 ) {
     let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+        data_dir,
+        "checkin",
+        "record_today",
+        3_000,
+    ) {
+        (Some(g), _) => Some(g),
+        (None, Some(fail)) => {
+            crate::fs_utils::app_log(
+                data_dir,
+                &format!(
+                    "[checkin_results] record_today 跨进程锁未获取：{}（降级进程内锁继续）",
+                    fail.describe()
+                ),
+            );
+            None
+        }
+        (None, None) => None,
+    };
     let mut f = load(data_dir);
     f.record_day(&today_key(), entries);
     save(data_dir, &f);

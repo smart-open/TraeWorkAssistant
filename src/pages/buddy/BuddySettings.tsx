@@ -33,6 +33,8 @@ export default function BuddySettings() {
       setSettings(await api.workbuddy.settingsGet().catch(() => null));
       const app = await api.misc.settingsGet().catch(() => null);
       setAuthPath(app?.wb_auth_file_path ?? '');
+      // 多账号签到/成长间隔存 app Settings（与签到共用，随「保存配置」统一提交）
+      setCheckinGap(app?.wb_checkin_gap_secs ?? 3);
     } catch (err) {
       pushToast('error', `读取配置失败：${String(err)}`);
     }
@@ -51,7 +53,11 @@ export default function BuddySettings() {
       await withMinDelay(
         Promise.all([
           api.workbuddy.settingsSet(settings),
-          api.misc.settingsSet({ ...(await api.misc.settingsGet()), wb_auth_file_path: authPath.trim() || null }),
+          api.misc.settingsSet({
+            ...(await api.misc.settingsGet()),
+            wb_auth_file_path: authPath.trim() || null,
+            wb_checkin_gap_secs: checkinGap,
+          }),
         ]),
         800,
       );
@@ -67,6 +73,9 @@ export default function BuddySettings() {
   const patch = (p: Partial<WorkBuddySettings>) => {
     setSettings((prev) => (prev ? { ...prev, ...p } : prev));
   };
+
+  // 多账号签到/成长间隔（app Settings 侧 state，随「保存配置」统一提交）
+  const [checkinGap, setCheckinGap] = useState(3);
 
   // wb-checkin 开关：绑定 auto_checkin 并即时保存（与定时任务卡其他开关交互一致）
   const toggleCheckin = async (v: boolean) => {
@@ -164,6 +173,25 @@ export default function BuddySettings() {
                 onChange={(e) => patch({ lazy_refresh_hours: Number(e.target.value) || 24 })}
               />
               <span className="mt-1 block text-xs text-slate-400">剩余有效期低于该值才触发刷新（推荐 24）</span>
+            </label>
+            {/* 多账号签到/成长间隔（wb_checkin_gap_secs 存 app Settings，随「保存配置」统一提交；两轮共用） */}
+            <label className="block rounded-lg bg-slate-50 px-3 py-2.5 dark:bg-zinc-900">
+              <span className="mb-1 block text-xs font-medium text-slate-500">账号间隔（秒）</span>
+              <input
+                type="number"
+                min={0}
+                max={600}
+                className="input w-full"
+                value={checkinGap}
+                onChange={(e) => {
+                  if (e.target.value === '') return; // 清空输入中间态不落值
+                  const n = Math.min(600, Math.max(0, Math.floor(Number(e.target.value))));
+                  setCheckinGap(Number.isFinite(n) ? n : 3);
+                }}
+              />
+              <span className="mt-1 block text-xs text-slate-400">
+                多账号串行签到/成长的间隔，默认 3 秒防频控，0 = 关闭
+              </span>
             </label>
           </div>
         </section>

@@ -505,11 +505,11 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     let pre_wb_credits = fetch_wb_credits_balance(state, &aid);
     let (mut kind, mut message, mut reward, mut dbg_keys) = checkin_do(agent, &headers, &urls);
     if kind == "auth" {
-        // 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）
-        let (new, fail_reason) = wb_common::refresh_token_once_ex(agent, &creds);
+        // 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）。
+        // H-1：加锁刷新 + 二次检查（他人已刷新落库直接复用）+ 内部落库
+        let (new, fail_reason) = wb_common::refresh_token_once_locked(state, agent, &aid, &creds);
         match new {
             Some(new) => {
-                let _ = wb_common::save_token_store(state, &aid, &new);
                 sync_pool_expiry(state, &aid, &new);
                 headers = wb_common::build_auth_headers(&new, false);
                 let r = checkin_do(agent, &headers, &urls);
@@ -526,11 +526,11 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                 }
             }
             None => {
-                // 凭证失效才标记重登录；网络故障/响应异常不误标（审查 P1-4）。
+                // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）。
                 // NoRefreshToken = 永久不可自愈态（RT 为空且已 401），与 Auth 同样标记（审查 #11）
                 if matches!(
                     fail_reason,
-                    wb_common::RefreshFail::Auth | wb_common::RefreshFail::NoRefreshToken
+                    Some(wb_common::RefreshFail::Auth) | Some(wb_common::RefreshFail::NoRefreshToken)
                 ) {
                     wb_common::mark_needs_relogin(state, &aid, &format!("签到 refresh 失败: {message}"));
                 }
@@ -632,8 +632,13 @@ pub fn run_checkin_round(state: &AppState, opts: &CheckinOpts, emit: &mut dyn Fn
     }
     emit(&json!({"type": "start", "total": accounts.len()}));
 
+    // 多账号签到间隔（任务配置页可改，默认 3s，0=关闭）：防上游频控，账号间串行等待
+    let gap_secs = crate::models::effective_checkin_gap(state.settings().wb_checkin_gap_secs);
     let mut events: Vec<Value> = Vec::new();
     for (i, acct) in accounts.iter().enumerate() {
+        if i > 0 && gap_secs > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(gap_secs));
+        }
         // 单账号失败不中断整轮（python try/except 语义；Rust 直调无异常路径）
         let mut ev = process_account(state, &agent, acct, opts);
         ev["index"] = json!(i + 1);
@@ -661,9 +666,9 @@ where
     let headers = wb_common::build_auth_headers(creds, false);
     let (kind, msg) = f(&headers);
     if kind == "auth" {
-        let (new, fail_reason) = wb_common::refresh_token_once_ex(agent, creds);
+        // H-1：加锁刷新 + 二次检查 + 内部落库（原 refresh_token_once_ex + 手工 save）
+        let (new, fail_reason) = wb_common::refresh_token_once_locked(state, agent, acct_id, creds);
         if let Some(new) = new {
-            let _ = wb_common::save_token_store(state, acct_id, &new);
             sync_pool_expiry(state, acct_id, &new);
             let h2 = wb_common::build_auth_headers(&new, false);
             let (kind2, msg2) = f(&h2);
@@ -675,11 +680,11 @@ where
             }
             return (kind2, msg2);
         }
-        // 凭证失效才标记重登录；网络故障/响应异常不误标（下次调度自然重试）。
+        // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（下次调度自然重试）。
         // NoRefreshToken = 永久不可自愈态，同样标记（审查 #11）
         if matches!(
             fail_reason,
-            wb_common::RefreshFail::Auth | wb_common::RefreshFail::NoRefreshToken
+            Some(wb_common::RefreshFail::Auth) | Some(wb_common::RefreshFail::NoRefreshToken)
         ) {
             wb_common::mark_needs_relogin(state, acct_id, &format!("refresh 失败: {msg}"));
         }
@@ -964,7 +969,12 @@ pub fn run_growth_round(state: &AppState, flags: &GrowthOpts, uids: &[String], e
         accounts.retain(|a| uids.iter().any(|u| s_of(a.get("id")) == *u));
     }
     emit(&json!({"type": "start", "total": accounts.len(), "mode": "growth"}));
+    // 多账号成长间隔（与签到共用 wb_checkin_gap_secs，默认 3s，0=关闭）：防上游频控
+    let gap_secs = crate::models::effective_checkin_gap(state.settings().wb_checkin_gap_secs);
     for (i, acct) in accounts.iter().enumerate() {
+        if i > 0 && gap_secs > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(gap_secs));
+        }
         let mut ev = process_account_growth(state, &agent, acct, flags);
         ev["index"] = json!(i + 1);
         emit(&ev);
