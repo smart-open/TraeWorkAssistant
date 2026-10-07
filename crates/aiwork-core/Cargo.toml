@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "aiwork-core"
 version = "1.4.3"
 description = "AI Work 助手业务核心（Web 化改造抽取，零 tauri/桌面依赖）"

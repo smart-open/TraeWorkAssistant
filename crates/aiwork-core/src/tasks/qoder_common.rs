@@ -1253,7 +1253,7 @@ impl CrossProcLock {
                 .truncate(false)
                 .write(true)
                 .open(&path);
-            let mut f = match open {
+            let f = match open {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("CrossProcLock({scope}) 锁文件打开失败: {e}");

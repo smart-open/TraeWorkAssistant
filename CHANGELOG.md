@@ -8,35 +8,34 @@
 
 ## [1.4.3] · 2026-10-07 · 移植 main 侧边栏应用显示 + 看板联动 + 指纹清洗 UI + Qoder 签到风控对齐
 
-> **合并点记录**：移植范围 `main@9cdce69`（**不含**）至 `main@813db35`（含），共 5 个有效提交（`52b5e38` / `cbd2c7e` / `b1531f5` / `448092a` / `813db35`；`5df6d00` 为合并点无动作）。手工语义移植、未经 merge。**合并点自 `main@9cdce69` 推进至 `main@813db35`**。⚠️ 行为变更：Qoder「每日 100 Credits」已领判定从严（宁 fail 不假 already）；Trae/Buddy/Qoder 积分快照与用量同步默认改为每小时。
+> 合并点自 `main@9cdce69` 推进至 `main@813db35`（5 个提交，手工语义移植）。⚠️ 行为变更：Qoder「每日 100 Credits」已领判定从严；积分快照/用量同步默认改每小时。
 
-### 新增（移植）
+### 移植内容
 
-- **侧边栏应用显示可配置**（`52b5e38`）：「应用显示」radio 单选固定应用 + 其余应用勾选隐藏；应用图标自选（48 个 Lucide 图标弹框，恢复默认回退内置图标），`Settings.app_icons` 持久化 + 非法值前后端双重清洗。
-- **看板数据联动**（`b1531f5`）：调度器积分快照/用量同步完成后经 `board-data-synced` 事件软通知看板页静默刷新（不进 loading、序号防竞态）；docker 侧经 `AppState.events` 注入 admin WS/SSE 广播。
-- **指纹清洗 UI 化**（`b1531f5`）：WB 模板清洗规则从手改配置文件升级为 API 管理弹框「指纹清洗」页签（`wb_template_map_get/set`；内置默认模板只读回显，保存空数组即恢复默认）。
-- **多账号签到间隔可配**（`b1531f5`）：Trae / Buddy / Qoder 签到账号间隔秒数（默认 3s 防频控，0=关闭，上限 600），三平台环境配置页输入卡 + 调度器串行等待生效。
+- **侧边栏应用显示可配置**（`52b5e38`）：固定应用单选 + 其余勾选隐藏；图标自选 48 个 Lucide 图标（恢复默认回退内置），`Settings.app_icons` 持久化 + 非法值双端清洗。
+- **看板数据联动**（`b1531f5`）：积分快照/用量同步完成后经 `board-data-synced` 软通知看板页静默刷新（不进 loading、序号防竞态）。
+- **指纹清洗 UI 化**（`b1531f5`）：WB 模板清洗规则升级为 API 管理弹框「指纹清洗」页签（内置默认只读回显，空数组恢复默认）。
+- **多账号签到间隔可配**（`b1531f5`）：三平台签到账号间隔秒数（默认 3s，0=关闭，上限 600），配置页输入卡 + 调度器生效。
+- **Qoder 签到风控对齐**（`448092a` + `813db35`，OS 依赖裁剪）：补 0.4.3 设备描述头（docker 走 hostname 链 fallback）；「每日 100 Credits」已领判定从严四条件；盲发兜底任一失败如实归 fail 交调度器重试（宁 fail 不假 already），失败提示可读化。
+- **Trae JWT 刷新失效判定修复**（`cbd2c7e`）：火山信封错误判定死代码修复（`volcano_error()` 两段式解析），20101 立即置 invalid 停止变体探测。
+- **WB 积分快照差分守卫**（`cbd2c7e`）：增删账号当日差分不可比时 earned 只取签到 reward、该日不计入消耗趋势。
+- **三池耗尽归因徽标**（`b1531f5`）：健康徽标统一 `PoolHealthBadges`（禁用/硬耗尽/冷却/零积分/凭证过期），口径对齐池调度 selectable；三页接入。
 
-### 修复（移植）
+### 跳过（桌面/OS 专属）
 
-- **Qoder 每日签到误报「已领（此前已领）」**（`448092a` + `813db35`，OS 依赖部分裁剪）：openapi 域补齐 0.4.3 设备描述头（`Cosy-Version`/`MachineOS`/`MachineHostname` + machine_id 派生 Code/Type，docker 走 hostname 链 fallback）；campaigns 全量返回 + CLAIMABLE 过滤下沉纯函数；「每日 100 Credits」已领判定从严四条件（CLAIMED + CLAIM_BENEFIT + kind=CREDITS + 当日窗口）；已知活动兜底盲发逐条聚合——任一失败如实归 fail 交调度器 30 分钟重试，全部回放才判已领；失败提示可读化（BLOCKED/503/未知三态）。
-- **Trae JWT 刷新失效判定失效**（`cbd2c7e`）：火山信封错误整段判定为死代码（`dig` 语义误用），失效凭证永不置 `refresh_token_invalid`——新增 `volcano_error()` 两段式解析 + `fs_utils::path()` 严格路径取值；`refresh_token_rejected()` 分流：20101 立即置 invalid 停止变体探测，设备协议码继续探测。
-- **WB 积分快照差分账号集合守卫**（`cbd2c7e`）：增删账号当日余额差分不可比（新账号余额被记成「当日获得」）——账号集合变化时 earned 只取签到 reward、fallback 该日不计入消耗趋势；旧快照维持既有差分行为。
-- **三池耗尽归因徽标**（`b1531f5`）：账号列表健康徽标统一 `PoolHealthBadges`（禁用/硬积分耗尽/冷却含原因/零积分/凭证过期），口径对齐池调度 selectable 判定；三页接入，Trae 手动刷新加序号防竞态。
+- runtime-info.exe 风控真值桥、CodeBuddy IDE 统计、doubao/device_proxy/workbuddy_stats/schtasks 批次。
 
-### 跳过（桌面/OS 专属，不移植）
+### 发布前审查
 
-- `448092a` runtime-info.exe 原生风控真值桥；`cbd2c7e` CodeBuddy IDE 本地 Token 统计；`b1531f5` 桌面专属批次（doubao / device_proxy / workbuddy_stats / schtasks）。
+- 两轮审查（逐文件 + 安全/适配交叉复核）无阻塞问题；修复 1 项 Minor：`wb_template_map_set` 补软上限（≤200 条/单条 ≤4KB）防网关自伤型性能面。
 
-### 发布前审查（两轮：逐文件通读 + 安全/适配交叉复核）
+### CI 与构建
 
-- **修复 1 项 Minor**：`wb_template_map_set` 补软上限守卫（规则 ≤200 条 / 单条 ≤4KB，超限拒绝落盘）——规则表每请求 O(n) 子串替换，无上限可存近 2MB 构成网关自伤型性能面；含边界单测。
-- **重点核实**：事件链路闭环；CAS 绑定 TOCTOU 收紧且 `over_limit` 降级语义未误伤（7 处调用点）；WB 刷新双锁无绕行路径；qoder_checkin 401 重试两路径口径一致；调度器永久失败剔除判定与产源 message 逐串匹配；Settings 新字段旧 JSON 反序列化兼容 + 前端双路径归一；无 XSS/注入/SSRF 新增面。
-- **明确不修**：`availableCount` 未滤 `hard_credit`（既有口径）；设置页 misc.settings 读-改-写合并（既有模式）；CrossProcLock `scope=acct_id` 校验（vault 内部 id 无注入面）；盲发部分成功 reward 不随 Failed 上抛（宁 fail 不假 already 既定语义）。
+- `startup_migration_collects_plaintext_keys` Linux CI 偶发失败：确认为测试并行时序型 flake（重跑即绿；迁移链路吞错点补 stderr 诊断保留，复发可直接归因）；清除 Cargo.toml BOM（版本升级时误写入，触发 rust-cache 解析 warning）与 `qoder_common.rs` 的 `unused_mut` 构建警告。
 
 ### 验证
 
-- `cargo test --workspace` 578 通过（566 + 12，0 失败）· `npx tsc --noEmit` 0 错误 · `npm test` 61 通过。
+- `cargo test --workspace` 578 通过 · `npx tsc --noEmit` 0 错误 · `npm test` 61 通过。
 
 ---
 

@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "aiwork-server"
 version = "1.4.3"
 description = "AI Work 助手 Web 版服务端（管理面 + OpenAI 网关 + 调度器，单进程 axum）"
