@@ -31,7 +31,8 @@
 
 ### CI 与构建
 
-- `startup_migration_collects_plaintext_keys` Linux CI 偶发失败：确认为测试并行时序型 flake（重跑即绿；迁移链路吞错点补 stderr 诊断保留，复发可直接归因）；清除 Cargo.toml BOM（版本升级时误写入，触发 rust-cache 解析 warning）与 `qoder_common.rs` 的 `unused_mut` 构建警告。
+- **vault 单例串目录竞态根治**（`startup_migration_collects_plaintext_keys` Linux CI 三次偶发失败）：迁移链路吞错点补 stderr 诊断后真因确认为——vault 进程级单例被并行测试绑定到其他测试目录/已删目录，`ns_set` 快照落盘 Err 导致明文未占位化。改造为**按 conf_path 分桶**（`VAULTS: Vec<(PathBuf, Handle)>`，生产单目录行为不变，测试多目录各自持有独立 stronghold 实例，互不串扰）；`vault_test_guard` 保留兜底同目录复测。
+- 清除 Cargo.toml BOM（版本升级时误写入，触发 rust-cache 解析 warning）与 `qoder_common.rs` 的 `unused_mut` 构建警告。
 
 ### 验证
 

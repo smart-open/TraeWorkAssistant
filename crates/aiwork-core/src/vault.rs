@@ -45,8 +45,12 @@ struct VaultHandle {
     keyprovider: KeyProvider,
 }
 
-/// 全局 vault 句柄缓存：懒加载；持有锁期间完成读写 + 快照落盘，串行化访问
-static VAULT: Mutex<Option<VaultHandle>> = Mutex::new(None);
+/// 全局 vault 句柄缓存：**按 conf_path 分桶**（懒加载）；持有锁期间完成读写 +
+/// 快照落盘，串行化访问。生产单 data_dir 恒单桶（行为同旧「进程级单例」）；
+/// 测试进程多 data_dir 并行时各目录持有独立 stronghold 实例——互不串写、
+/// 互不指向已删快照（Linux CI 曾三次因「单例被并行测试绑定到别的目录/已删
+/// 目录」导致 migrate 断言偶发失败，分桶为根治方案，见 1.4.3 CHANGELOG）。
+static VAULTS: Mutex<Vec<(std::path::PathBuf, VaultHandle)>> = Mutex::new(Vec::new());
 
 /// 生成 32 字节随机主密码（OS CSPRNG：rand OsRng，跨平台；
 /// 满足 Stronghold KeyProvider 恰好 32 字节 NC_DATA_SIZE 的要求）
@@ -142,12 +146,16 @@ fn write_key_file(path: &Path, content: &[u8]) -> Result<(), String> {
 /// 打开（并缓存）vault：首次调用时加载快照或创建新 client。
 /// 对齐 tauri-plugin-stronghold 2.3.2 的包装方式（iota_stronghold 2.1 engine API：
 /// Stronghold::default() + load_snapshot / commit_with_keyprovider）。
-fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<VaultHandle>>, String> {
+/// 返回全局缓存的 guard；调用方经 locate() 取本 conf_path 的句柄（借用自 guard，
+/// 全局锁在借用期间天然持有）。调用方 conf_path 的桶若不存在则在此创建。
+fn open(
+    state: &AppState,
+) -> Result<std::sync::MutexGuard<'static, Vec<(std::path::PathBuf, VaultHandle)>>, String> {
     // 锁中毒恢复：另一线程在持锁期间 panic 毒化锁时，直接恢复内部数据继续使用，
     // 而不是让「vault 锁已被毒化」错误在所有后续调用上永久传播
-    let mut guard = VAULT.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        let path = state.conf_path("vault.stronghold");
+    let mut guard = VAULTS.lock().unwrap_or_else(|e| e.into_inner());
+    let path = state.conf_path("vault.stronghold");
+    if !guard.iter().any(|(p, _)| p == &path) {
         let password = vault_password(state)?;
         let snapshot = SnapshotPath::from_path(&path);
         // KeyProvider 要求主密码恰好 32 字节（NC_DATA_SIZE），vault_password 已保证归一
@@ -165,25 +173,37 @@ fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<VaultH
             sh.create_client(CLIENT_PATH.to_vec())
                 .map_err(|e| format!("创建 vault client 失败: {e}"))?;
         }
-        *guard = Some(VaultHandle { sh, snapshot, keyprovider });
+        guard.push((path, VaultHandle { sh, snapshot, keyprovider }));
     }
     Ok(guard)
 }
 
-/// 测试专用：重置全局 vault 句柄。运行期 vault 为进程级单例（首个 open 固化
-/// conf_path），多 data_dir 测试并行时单例会跨目录串写/指向已删快照——各触碰
-/// vault 的测试开头调用本函数，下一跳 open() 按调用方 conf_path 重新打开
-/// （ns_get/ns_set 每次均经 open() 惰性重建 + 快照 commit，重置安全且自愈）
-#[cfg(test)]
-pub(crate) fn reset_for_tests() {
-    *VAULT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+/// 从 open() 返回的 guard 中取指定 conf_path 的句柄（open 已确保桶存在；
+/// 找不到即程序不变量被破坏，调用方按 unreachable 处理并携带诊断信息）
+fn locate<'a>(
+    guard: &'a mut std::sync::MutexGuard<'static, Vec<(std::path::PathBuf, VaultHandle)>>,
+    path: &Path,
+) -> &'a mut VaultHandle {
+    guard
+        .iter_mut()
+        .find(|(p, _)| p == path)
+        .map(|(_, h)| h)
+        .unwrap_or_else(|| panic!("vault 句柄桶缺失（open 未创建该 conf_path）: {}", path.display()))
 }
 
-/// 测试专用：触碰 vault 单例的测试统一入口——进程级串行互斥 + 持锁后重置。
-/// cargo test 默认多线程并行，仅 reset 无法防止「A 重置后 B 抢先 open 绑定
-/// 自己的 conf_path，A 随后 open 复用 B 的句柄」的跨目录串写/串读（Linux CI
-/// 已两次暴露）；串行互斥是唯一可靠解。Guard 须绑定具名变量持有至测试结束
-/// （`let _guard = vault_test_guard();`），勿用 `let _ =` 立即释放。
+/// 测试专用：重置全局 vault 句柄（清空全部分桶）。分桶后跨目录测试天然隔离
+/// （各桶独立 stronghold 实例），本函数仅在「同目录复测需从磁盘快照重建」时
+/// 调用（ns_get/ns_set 每次均经 open() 惰性重建 + 快照 commit，重置安全且自愈）
+#[cfg(test)]
+pub(crate) fn reset_for_tests() {
+    VAULTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// 测试专用：触碰 vault 的测试统一入口——进程级串行互斥 + 持锁后重置。
+/// 分桶改造后跨目录测试天然隔离（各 conf_path 独立 stronghold 实例），本 guard
+/// 主要兜底「同目录被并行测试同时触碰」与既有测试语义依赖（重置后从磁盘重建）。
+/// Guard 须绑定具名变量持有至测试结束（`let _guard = vault_test_guard();`），
+/// 勿用 `let _ =` 立即释放。
 #[cfg(test)]
 pub(crate) fn vault_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -199,12 +219,11 @@ pub(crate) fn vault_test_guard() -> std::sync::MutexGuard<'static, ()> {
 pub fn load_accounts(state: &AppState) -> AccountsFile {
     // SQLite 化（P3）：checkin_accounts.json → accounts 表（行保序、user_id 可空）
     let mut file: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
-    let Ok(guard) = open(state) else {
-        return file; // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
+    let mut guard = match open(state) {
+        Ok(g) => g,
+        Err(_) => return file, // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
     };
-    let Some(handle) = guard.as_ref() else {
-        return file;
-    };
+    let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
     let Ok(client) = handle.sh.get_client(CLIENT_PATH.to_vec()) else {
         return file;
     };
@@ -266,10 +285,8 @@ fn wipe_placeholders(accounts: &mut AccountsFile) {
 
 /// 把非空凭据写入 vault：读旧值做字段级合并（防止空字段覆盖 vault 中的有效值），最后快照落盘
 fn write_vault_secrets(state: &AppState, accounts: &AccountsFile) -> Result<(), String> {
-    let guard = open(state)?;
-    let Some(handle) = guard.as_ref() else {
-        return Err("vault 未初始化".into());
-    };
+    let mut guard = open(state)?;
+    let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
     let client = handle
         .sh
         .get_client(CLIENT_PATH.to_vec())
@@ -329,10 +346,8 @@ fn merge_entry(existing: Option<SecretEntry>, jwt_new: &str, rt_new: &str) -> Se
 /// 删除账号时同步清理 vault 记录（失败仅记录，不阻断账号删除）
 pub fn remove_secret(state: &AppState, uid: &str) {
     let result = (|| -> Result<(), String> {
-        let guard = open(state)?;
-        let Some(handle) = guard.as_ref() else {
-            return Err("vault 未初始化".into());
-        };
+        let mut guard = open(state)?;
+        let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
         let client = handle
             .sh
             .get_client(CLIENT_PATH.to_vec())
@@ -381,10 +396,8 @@ pub fn ns_get(data_dir: &Path, ns: &str, key: &str) -> Option<serde_json::Value>
     }
     let state = AppState::with_data_dir(data_dir.to_path_buf());
     let result = (|| -> Result<Option<serde_json::Value>, String> {
-        let guard = open(&state)?;
-        let Some(handle) = guard.as_ref() else {
-            return Err("vault 未初始化".into());
-        };
+        let mut guard = open(&state)?;
+        let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
         let client = handle
             .sh
             .get_client(CLIENT_PATH.to_vec())
@@ -415,10 +428,8 @@ pub fn ns_set(data_dir: &Path, ns: &str, key: &str, v: &serde_json::Value) -> Re
         return Err(format!("命名空间凭证非法: {reason}"));
     }
     let state = AppState::with_data_dir(data_dir.to_path_buf());
-    let guard = open(&state)?;
-    let Some(handle) = guard.as_ref() else {
-        return Err("vault 未初始化".into());
-    };
+    let mut guard = open(&state)?;
+    let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
     let client = handle
         .sh
         .get_client(CLIENT_PATH.to_vec())
@@ -442,10 +453,8 @@ pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
     }
     let state = AppState::with_data_dir(data_dir.to_path_buf());
     let result = (|| -> Result<(), String> {
-        let guard = open(&state)?;
-        let Some(handle) = guard.as_ref() else {
-            return Err("vault 未初始化".into());
-        };
+        let mut guard = open(&state)?;
+        let handle = locate(&mut guard, &state.conf_path("vault.stronghold"));
         let client = handle
             .sh
             .get_client(CLIENT_PATH.to_vec())
