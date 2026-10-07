@@ -151,6 +151,10 @@ pub fn ensure_ca(certs_dir: &std::path::Path) -> Result<CaAuthority, String> {
             let der = pem_to_der(&cert_pem)?;
             std::fs::write(&cer_der_path, der).map_err(|e| format!("补写 ca.cer 失败: {e}"))?;
         }
+        // 审查 P2：已有 CA 加载路径补收紧 ACL——老版本生成的 CA / 上次收紧被
+        // /reset 回滚后目录保持宽松态，仅生成路径收紧会永远漏掉。harden 幂等且
+        // 自验证失败自动回滚（fail-open），不会破坏代理自身读写
+        harden_ca_dir(certs_dir);
         issuer
     } else {
         let generated = generate_ca()?;

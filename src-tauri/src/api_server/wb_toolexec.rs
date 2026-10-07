@@ -36,43 +36,47 @@ pub fn responses_declares_web_search(body: &Value) -> bool {
         })
 }
 
-/// 向 chat body（responses_to_chat 产物）注入代理 function 工具 + system 提示
-pub fn inject_proxy_tools(chat_body: &mut Value) {
-    let Some(obj) = chat_body.as_object_mut() else { return };
+/// 向 chat body（responses_to_chat 产物）注入代理 function 工具 + system 提示。
+/// 返回是否可代执行：客户端已声明同名 function 工具时返回 false 且不做任何
+/// 注入（红线：仅代理注入的工具可代执行——同名工具属客户端自有语义，代理
+/// 不得按名劫持，调用方须跳过代执行循环，工具调用照常透传客户端自行执行）
+pub fn inject_proxy_tools(chat_body: &mut Value) -> bool {
+    let Some(obj) = chat_body.as_object_mut() else { return false };
     let tools = obj.entry("tools".to_string()).or_insert_with(|| json!([]));
     if let Some(arr) = tools.as_array_mut() {
         let has = |arr: &[Value], name: &str| -> bool {
             arr.iter()
                 .any(|t| t.pointer("/function/name").and_then(|n| n.as_str()) == Some(name))
         };
-        if !has(arr, TOOL_SEARCH) {
-            arr.push(json!({
-                "type": "function",
-                "function": {
-                    "name": TOOL_SEARCH,
-                    "description": "Search the web for up-to-date information. Returns a numbered list of results (title, url, snippet).",
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "query": { "type": "string", "description": "Search query" } },
-                        "required": ["query"],
-                    },
-                },
-            }));
+        // P1-6 劫持防护：任一同名冲突即整体退出（部分注入会造成「半个代理」的
+        // 混合语义，且未注入的那个仍会被 extract_proxy_calls 按名劫持）
+        if has(arr, TOOL_SEARCH) || has(arr, TOOL_OPEN_URL) {
+            return false;
         }
-        if !has(arr, TOOL_OPEN_URL) {
-            arr.push(json!({
-                "type": "function",
-                "function": {
-                    "name": TOOL_OPEN_URL,
-                    "description": "Fetch a web page by URL and return its readable text content.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "url": { "type": "string", "description": "Absolute http(s) URL" } },
-                        "required": ["url"],
-                    },
+        arr.push(json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_SEARCH,
+                "description": "Search the web for up-to-date information. Returns a numbered list of results (title, url, snippet).",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "query": { "type": "string", "description": "Search query" } },
+                    "required": ["query"],
                 },
-            }));
-        }
+            },
+        }));
+        arr.push(json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_OPEN_URL,
+                "description": "Fetch a web page by URL and return its readable text content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "url": { "type": "string", "description": "Absolute http(s) URL" } },
+                    "required": ["url"],
+                },
+            },
+        }));
     }
     // system 提示：插在首个非 system 消息之前（保留既有 instructions 语义）
     if let Some(msgs) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -86,6 +90,7 @@ pub fn inject_proxy_tools(chat_body: &mut Value) {
             .unwrap_or(msgs.len());
         msgs.insert(insert_at, hint);
     }
+    true
 }
 
 /// 代执行记录（供 Responses web_search_call 输出项投影）
@@ -562,9 +567,41 @@ mod tests {
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[1]["role"], json!("system"), "提示插在 instructions 之后、首条用户消息之前");
-        // 重复注入不重复加工具
-        inject_proxy_tools(&mut body);
+        // 重复注入：同名冲突 → 返回 false 且不再改动（工具数不变）
+        assert!(!inject_proxy_tools(&mut body));
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+    }
+
+    /// P1-6 劫持防护：客户端已声明同名 function 工具 → 不注入、返回 false，
+    /// 客户端自有 web_search/open_url 语义不被代理按名劫持
+    #[test]
+    fn inject_rejects_client_owned_same_name_tools() {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"name": "web_search", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "shell", "parameters": {"type": "object", "properties": {}}}}
+            ]
+        });
+        assert!(!inject_proxy_tools(&mut body));
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "不得注入代理工具（保持客户端原声明）");
+        assert_eq!(tools[0]["function"]["name"], json!("web_search"));
+        assert_eq!(tools[1]["function"]["name"], json!("shell"));
+        // open_url 单独冲突同样拒绝（部分注入会留下按名劫持的半代理语义）
+        let mut body2 = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "open_url", "parameters": {"type": "object", "properties": {}}}}]
+        });
+        assert!(!inject_proxy_tools(&mut body2));
+        assert_eq!(body2["tools"].as_array().unwrap().len(), 1);
+        // 无冲突时正常注入且返回 true
+        let mut body3 = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "shell", "parameters": {"type": "object", "properties": {}}}}]
+        });
+        assert!(inject_proxy_tools(&mut body3));
+        assert_eq!(body3["tools"].as_array().unwrap().len(), 3);
     }
 
     #[test]

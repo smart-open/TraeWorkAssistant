@@ -73,6 +73,10 @@ const TASKS: &[SchedTask] = &[
     // 排到晚間接近日末，差分口径最准；此前无定时写入是近 7 日消耗缺天的根因
     SchedTask { key: "wb-credits-snapshot", name: "WorkBuddy 积分与 Token 数据同步", hhmm: "23:30", kind: "credits" },
     SchedTask { key: "trae-credits-snapshot", name: "Trae 积分数据同步", hhmm: "23:40", kind: "credits" },
+    // Trae 消耗明细同步（issue #61）：usage_history 此前只有前端点「更新消耗明细」才拉，
+    // 页面常驻时快照停留在最后打开时刻。跟随 trae_credits_sync_mode 频率；daily 模式用
+    // 内置 23:50（不与积分同步共占配置时刻，天然错峰 10 分钟）
+    SchedTask { key: "trae-usage-sync", name: "Trae 消耗明细同步", hhmm: "23:50", kind: "credits" },
     // F-80 Qoder 积分快照：每日 HH:MM（settings.qoder_credits_sync_hhmm 可改，开关独立）
     SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分快照", hhmm: "23:40", kind: "fix" },
     // F-80 Qoder 凭证兜底刷新（kind "refresh" → EveryHours(间隔可配)；hhmm 不参与判定）。
@@ -94,7 +98,7 @@ pub fn start(app: AppHandle) {
         std::thread::sleep(std::time::Duration::from_secs(90));
         loop {
             let st = app.state::<AppState>();
-            tick(&st);
+            tick(&app, &st);
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
     });
@@ -118,16 +122,17 @@ enum SchedPlan {
     EveryHours(i64),
 }
 
-/// credits 类任务的同步模式（空/未知值按 daily 处理——state::settings 已归一，此处兜底）
+/// credits 类任务的同步模式（空/未知值按各平台默认处理——Buddy daily / Trae hourly（issue #61），
+/// state::settings 已归一空值，此处兜底未知值）
 fn credits_sync_mode(st: &AppState, key: &str) -> String {
     let s = st.settings();
-    let raw = match key {
-        "wb-credits-snapshot" => s.wb_credits_sync_mode.as_str(),
-        _ => s.trae_credits_sync_mode.as_str(),
+    let (raw, fallback) = match key {
+        "wb-credits-snapshot" => (s.wb_credits_sync_mode.as_str(), "daily"),
+        _ => (s.trae_credits_sync_mode.as_str(), "hourly"),
     };
     match raw.trim() {
         "off" | "hourly" | "daily" => raw.trim().to_string(),
-        _ => "daily".to_string(),
+        _ => fallback.to_string(),
     }
 }
 
@@ -149,8 +154,22 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
     }
 }
 
+/// 看板数据任务 → 平台 key 映射（emit `board-data-synced` 载荷，前端 Dashboard
+/// 按 platform 匹配后才静默重读缓存；issue #61 前端联动侧）
+fn board_platform(key: &str) -> Option<&'static str> {
+    match key {
+        "wb-credits-snapshot" => Some("buddy"),
+        "trae-credits-snapshot" | "trae-usage-sync" => Some("trae"),
+        // F-80 Qoder 看板与 trae/buddy 同款联动：快照任务写入 qoder_credits_cache
+        // 与当日历史后，常驻页面需静默重读（审查修复：此前缺映射致 Qoder 看板滞后）
+        "qoder-credits-snapshot" => Some("qoder"),
+        _ => None,
+    }
+}
+
 /// 单轮 tick：按各任务生效调度计划检查触发条件 → 执行
-fn tick(st: &AppState) {
+/// （AppHandle 仅用于看板数据同步成功后的前端事件联动，任务执行本身不依赖）
+fn tick(app: &AppHandle, st: &AppState) {
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     let now_hm = now.format("%H:%M").to_string();
@@ -211,6 +230,16 @@ fn tick(st: &AppState) {
                 } else {
                     mark_run(st, t.key, &today, &summary);
                     fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
+                    // 看板数据同步成功 → 通知前端重读缓存（issue #61 前端联动：
+                    // Dashboard listen 后按 platform 匹配静默 refresh(false)，零额外网络）
+                    if let Some(p) = board_platform(t.key) {
+                        crate::events::emit_logged(
+                            app,
+                            "board-data-synced",
+                            json!({ "platform": p, "task": t.key }),
+                            Some(&st.data_dir),
+                        );
+                    }
                 }
             }
             Err(summary) => {
@@ -299,8 +328,10 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "qoder-credits-snapshot" => st.settings().qoder_credits_sync_enabled,
         // Qoder 凭证定时续期（环境配置页可关；默认开，每 6h 兜底刷新）
         "qoder-refresh" => st.settings().qoder_token_renew_enabled,
-        // 看板数据同步（积分/Token）：mode=off 即关闭（hourly/daily 均视为启用）
-        "wb-credits-snapshot" | "trae-credits-snapshot" => credits_sync_mode(st, key) != "off",
+        // 看板数据同步（积分/Token/消耗明细）：mode=off 即关闭（hourly/daily 均视为启用）
+        "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" => {
+            credits_sync_mode(st, key) != "off"
+        }
         // 模型同步开关（默认开；无账号时任务内部静默跳过不计失败）
         "wb-catalog-sync" => st.settings().wb_catalog_sync_enabled,
         "trae-models-sync" => st.settings().trae_models_sync_enabled,
@@ -313,18 +344,64 @@ fn enabled(st: &AppState, key: &str) -> bool {
 /// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）
 fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
     match key {
-        // Trae 每日签到：与 `--task-run checkin` 同款（vault 全账号单轮，状态核验幂等）
+        // Trae 每日签到：与 `--task-run checkin` 同款（vault 全账号单轮，状态核验幂等）。
+        // 审查 P2：存在可重试失败时返 Err，交调度器 30 分钟冷却重试（对齐 qoder-checkin）；
+        // 永久性失败（未配置 jwt，重试注定成功无望）从重试判定剔除——否则全天 ~28 轮无效重试
         "trae-checkin" => {
             let accounts = crate::vault::load_accounts(st);
             let retry = st.settings().retry.max(0) as u32;
-            Ok(super::trae_checkin::run_round(st, &accounts.accounts, retry, &mut |_| {}))
+            let mut events: Vec<Value> = Vec::new();
+            let done =
+                super::trae_checkin::run_round(st, &accounts.accounts, retry, &mut |ev| events.push(ev.clone()));
+            let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            let failed_permanent = events
+                .iter()
+                .filter(|e| {
+                    e.get("status").and_then(Value::as_str) == Some("fail")
+                        && e.get("message").and_then(Value::as_str) == Some("未配置 jwt")
+                })
+                .count() as i64;
+            let retryable = (failed - failed_permanent).max(0);
+            if retryable > 0 {
+                let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
+                let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
+                return Err(format!(
+                    "Trae 签到：{ok} 成功 / {already} 已签 / {retryable} 失败（30 分钟后自动重试）"
+                ));
+            }
+            Ok(done)
         }
-        // WorkBuddy 每日签到：与 `--task-run wb-checkin` 同款；抢轮次锁与 UI 路径互斥
+        // WorkBuddy 每日签到：与 `--task-run wb-checkin` 同款；抢轮次锁与 UI 路径互斥。
+        // 审查 P2：同 trae-checkin——可重试失败返 Err 交 30 分钟冷却重试；
+        // 永久性凭证失败（需重新登录 / 无可用凭证，30 分钟内不会自愈）剔除出重试判定
         "wb-checkin" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
                 return Err("跳过：已有签到/成长任务在执行中".into());
             };
-            Ok(super::wb_checkin::run_checkin_round(st, &super::wb_checkin::CheckinOpts::daily(), &mut |_| {}))
+            let mut events: Vec<Value> = Vec::new();
+            let done = super::wb_checkin::run_checkin_round(
+                st,
+                &super::wb_checkin::CheckinOpts::daily(),
+                &mut |ev| events.push(ev.clone()),
+            );
+            let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            let failed_permanent = events
+                .iter()
+                .filter(|e| {
+                    let m = e.get("message").and_then(Value::as_str).unwrap_or("");
+                    e.get("status").and_then(Value::as_str) == Some("fail")
+                        && (m.contains("需重新登录") || m.contains("无可用凭证"))
+                })
+                .count() as i64;
+            let retryable = (failed - failed_permanent).max(0);
+            if retryable > 0 {
+                let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
+                let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
+                return Err(format!(
+                    "WB 签到：{ok} 成功 / {already} 已签 / {retryable} 失败（30 分钟后自动重试）"
+                ));
+            }
+            Ok(done)
         }
         // WorkBuddy 每日成长（任务配置页）：成长三开关驱动，抢轮次锁与 UI 路径互斥
         "wb-growth" => {
@@ -411,14 +488,16 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         "doubao-quota" => super::doubao_quota::run_batch(st),
         // WorkBuddy 积分与 Token 数据同步（看板定时同步）：积分 fresh 拉取+池回写+快照为主目标
         // （空池自然空转不报错）；顺带 Token 统计重扫（本地增量缓存）与官方请求用量刷新——
-        // 两者尽力而为不上抛（页面打开时本就有各自缓存/降级链路）
+        // 统计尽力而为不上抛（页面打开时本就有各自缓存/降级链路）；用量刷全账号聚合缓存
+        // （看板 Dashboard 唯一消费源 workbuddy_usage_official_all_cache，force 跳过 10min
+        // 缓存；原单账号缓存分支前端无调用方，属刷错目标，issue #61 同类缺口一并修复）
         "wb-credits-snapshot" => {
             let parsed = crate::commands::workbuddy::wb_credits_snapshot_task(st)?;
             let token_files = crate::commands::workbuddy_stats::workbuddy_token_stats_impl(st, true)
                 .get("files_scanned")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            let usage = match crate::commands::workbuddy::workbuddy_usage_official_impl(st, None, true) {
+            let usage = match crate::commands::workbuddy::workbuddy_usage_official_all_impl(st, true) {
                 Ok(_) => "已刷新",
                 Err(_) => "跳过（无可用凭证或拉取失败）",
             };
@@ -432,6 +511,17 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // Trae 积分数据同步：与 `--task-run refresh-credits` 同款（无账号返回 refreshed=0）
         "trae-credits-snapshot" => crate::commands::accounts::refresh_remaining_credits_impl(st)
             .map(|n| json!({ "ok": true, "refreshed": n })),
+        // Trae 消耗明细同步（issue #61）：与 `--task-run trae-usage-sync` 同款（fresh=true 增量拉取）；
+        // 无账号静默跳过（对齐 trae-models-sync 惯例）；全部账号拉取失败返 Err 交 30 分钟冷却重试
+        "trae-usage-sync" => {
+            let accounts = crate::vault::load_accounts(st);
+            if accounts.accounts.is_empty() {
+                Ok(json!({ "ok": true, "skipped": "无 Trae 账号" }))
+            } else {
+                crate::commands::usage_history::usage_history_fetch_impl(st, true)
+                    .map(|r| json!({ "ok": true, "accounts": r.accounts.len() }))
+            }
+        }
         // Trae 模型列表同步：官网配置接口（batch_get_detail_param，不消耗积分）；
         // 无账号时静默跳过不计失败（对齐 models-sync 惯例）
         "trae-models-sync" => {
@@ -687,10 +777,38 @@ mod tests {
         // 非法模式回退 daily（credits_sync_mode 兜底）
         set(json!({ "wb_credits_sync_mode": "weekly" }));
         assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::Daily(_)));
+        // Trae 看板同步（issue #61）：默认 hourly——积分快照与消耗明细（trae-usage-sync）均每小时
+        let trae_credits = || TASKS.iter().find(|t| t.key == "trae-credits-snapshot").unwrap();
+        let trae_usage = || TASKS.iter().find(|t| t.key == "trae-usage-sync").unwrap();
+        assert!(matches!(sched_plan(&st, trae_credits()), SchedPlan::Hourly), "Trae 默认 hourly");
+        assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::Hourly), "消耗明细跟随 hourly");
+        // daily 模式：积分快照走配置时刻（23:40），消耗明细内置 23:50 错峰
+        set(json!({ "trae_credits_sync_mode": "daily" }));
+        assert!(matches!(sched_plan(&st, trae_credits()), SchedPlan::Daily(h) if h == "23:40"));
+        assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::Daily(h) if h == "23:50"));
+        // off 同时关闭积分快照与消耗明细
+        set(json!({ "trae_credits_sync_mode": "off" }));
+        assert!(matches!(sched_plan(&st, trae_credits()), SchedPlan::Skip));
+        assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::Skip));
+        // 非法模式回退 Trae 默认 hourly
+        set(json!({ "trae_credits_sync_mode": "weekly" }));
+        assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::Hourly));
         // 模型同步时刻覆盖 + 显式关闭
         set(json!({ "trae_models_sync_hhmm": "06:10" }));
         assert!(matches!(sched_plan(&st, trae_models()), SchedPlan::Daily(h) if h == "06:10"));
         set(json!({ "trae_models_sync_enabled": false }));
         assert!(matches!(sched_plan(&st, trae_models()), SchedPlan::Skip));
+    }
+
+    /// 看板联动平台映射（issue #61 + 审查修复）：三个看板数据任务分别 emit
+    /// buddy/trae/qoder；凭证刷新与签到类任务不属于看板数据同步，不得误 emit
+    #[test]
+    fn board_platform_maps_board_tasks_only() {
+        assert_eq!(board_platform("wb-credits-snapshot"), Some("buddy"));
+        assert_eq!(board_platform("trae-credits-snapshot"), Some("trae"));
+        assert_eq!(board_platform("trae-usage-sync"), Some("trae"));
+        assert_eq!(board_platform("qoder-credits-snapshot"), Some("qoder"));
+        assert_eq!(board_platform("qoder-refresh"), None);
+        assert_eq!(board_platform("qoder-checkin"), None);
     }
 }

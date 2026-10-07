@@ -54,8 +54,29 @@ impl Store {
                 // data/backup/ 与各上游重新拉取兜底；隔离件保留待人工诊断，绝不静默删除。
                 eprintln!("[store] SQLite 打开失败 {}: {e}，隔离损坏库并重建", path.display());
                 quarantine_corrupt_db(path, &e);
-                Self::try_open(path, data_dir)
-                    .unwrap_or_else(|e2| panic!("SQLite 重建仍失败 {}: {e2}", path.display()))
+                if let Ok(s) = Self::try_open(path, data_dir) {
+                    return s;
+                }
+                // 审查 P2 兜底：重建仍失败不再 panic 击穿启动/调用线程——降级内存库
+                // 续命，本会话读写不落盘（退出即失），应用可启动、其余子系统可排查；
+                // 内存库也不可用时才 panic（真无路可走）。registry 仍以原路径为键，
+                // 同会话后续 db() 命中同一内存库，视图一致
+                eprintln!("[store] SQLite 重建仍失败 {}，降级内存库运行（本会话数据不落盘）", path.display());
+                crate::fs_utils::app_log(
+                    data_dir,
+                    &format!(
+                        "[store] SQLite 重建仍失败 {}，已降级内存库运行（本会话数据不落盘，请排查 data/ 隔离件）",
+                        path.display()
+                    ),
+                );
+                let conn = rusqlite::Connection::open_in_memory()
+                    .map_err(|e| e.to_string())
+                    .and_then(|c| {
+                        schema::init(&c)?;
+                        Ok(c)
+                    })
+                    .unwrap_or_else(|e2| panic!("SQLite 内存库兜底亦失败 {}: {e2}", path.display()));
+                Arc::new(Store { conn: Mutex::new(conn), data_dir: data_dir.to_path_buf() })
             }
         }
     }

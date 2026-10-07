@@ -1,11 +1,15 @@
-//! 本地 WorkBuddy / CodeBuddy CLI JSONL Token 统计（F-26/F-57，批次3）。
-//! 方案对齐 oss-research/workbuddy-switch token_stats.rs 的解析语义：
-//! usage 取值优先级 message.usage > providerData.usage > 顶层 usage；
-//! cache_read 别名链优先正值（cache_read_input_tokens → prompt_cache_hit_tokens），
-//! 兼容嵌套 prompt_tokens_details / inputTokensDetails；
-//! cache_write 仅认显式别名（prompt_cache_miss_tokens 是新增输入，不是写入）。
+//! 本地 Token 统计（F-26/F-57，批次3）：三路来源合并为「本地源」。
+//! ① `~/.workbuddy/projects` / `~/.codebuddy/projects` 会话 JSONL（WorkBuddy 桌面端、
+//!    CodeBuddy CLI）：usage 取值优先级 message.usage > providerData.usage > 顶层 usage；
+//!    cache_read 别名链优先正值（cache_read_input_tokens → prompt_cache_hit_tokens），
+//!    兼容嵌套 prompt_tokens_details / inputTokensDetails；
+//!    cache_write 仅认显式别名（prompt_cache_miss_tokens 是新增输入，不是写入）。
+//! ② `%LOCALAPPDATA%\CodeBuddyExtension\Data\<uid>\CodeBuddyIDE\<uid>\history\<md5(工作区)>
+//!    \<convId>\index.json` 的 `requests[]`（CodeBuddy **IDE** 侧，2026-10-06 接入）——
+//!    见 `parse_codebuddy_index` 的字段契约与口径说明。
 //!
 //! ⚠ serde 命名约定：输出字段全部 snake_case；响应只含聚合数字，不返回消息正文/凭证。
+//! ⚠ 只读：CodeBuddy IDE 目录仅读取，绝不写入（其历史树由客户端自身维护）。
 
 use chrono::TimeZone;
 use serde::{Deserialize, Serialize};
@@ -402,6 +406,185 @@ fn parse_file(path: &Path, fallback_project: &str) -> FileCacheEntry {
     entry
 }
 
+// ── CodeBuddy IDE 会话索引（requests[] 用量）────────────────────────────────
+//
+// 数据位置（2026-10-06 本机实测；与 WorkDaddy `scripts/codebuddy-files.js` 的
+// tokenOptions() 独立互证——其 readRecords 同样读 index.requests，source 标记
+// 'local-codebuddy-requests'）：
+//   %LOCALAPPDATA%\CodeBuddyExtension\Data\
+//     <uid>\CodeBuddyIDE\<uid>\history\<md5(工作区路径)>\<会话id>\index.json
+// 会话目录下的 messages/*.json 只有正文（无用量字段），**用量只在会话级 index.json**。
+//
+// 字段契约：
+//   requests[]: { id, type: "craft"|"plan", messages[], state: "complete"|"running"|"canceled",
+//                 startedAt: 毫秒, usage: {...} }
+//   usage:      { inputTokens, outputTokens, totalTokens, lastTokens,
+//                 cacheTokens(缓存读), cachedWriteTokens, cachedMissTokens, credit }
+//   inputTokens == cacheTokens + cachedMissTokens —— 单条 input 是「整段 prompt」口径，
+//   与 WorkBuddy 侧同构：total = input + output + cache_write，缓存读单列不重复计。
+//
+// 计入规则：
+//   - `state == "running"` 跳过（进行中，usage 可能只是部分快照）；
+//   - 四类 token 全 0 跳过（对齐 WorkDaddy 的丢弃条件）；
+//   - 日期取 startedAt（<1e12 视为秒 ×1000）；
+//   - 模型取同工作区索引 conversations[].modelMap[type]（回退 modelMap.craft /
+//     selectedModelId）——会话级粒度，会话内换模型不回溯；
+//   - 项目维度记常量 `CodeBuddy IDE`（工作区目录名是 md5(cwd)，反查项目名需另读
+//     `%APPDATA%\CodeBuddy CN\codebuddy-sessions.vscdb`，留作后续增强）；
+//   - `usage.credit`（该请求真实扣积分）暂不并入积分统计，避免与官方积分源重复计数。
+const CODEBUDDY_IDE_PROJECT: &str = "CodeBuddy IDE";
+
+fn codebuddy_usage(usage: &Map<String, Value>) -> Usage {
+    Usage {
+        input: field(usage, &["inputTokens", "input_tokens", "promptTokens"]).unwrap_or(0),
+        output: field(usage, &["outputTokens", "output_tokens", "completionTokens"]).unwrap_or(0),
+        read: field(usage, &["cacheTokens", "cache_read_input_tokens", "cached_tokens"]).unwrap_or(0),
+        write: field(usage, &["cachedWriteTokens", "cache_write_input_tokens"]).unwrap_or(0),
+    }
+}
+
+/// 毫秒时间戳（<1e12 视为秒，×1000）→ 本地日期
+fn ms_date(value: &Value) -> Option<String> {
+    let ts = number(value)? as i64;
+    let ms = if ts < 10_000_000_000 { ts.saturating_mul(1000) } else { ts };
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+}
+
+/// 会话模型：工作区索引 conversations[].modelMap[type] > modelMap.craft > selectedModelId。
+/// `memo` 在同一轮扫描内缓存已解析的工作区索引（同一工作区多个会话共享一次读取）。
+fn conversation_model(
+    memo: &mut HashMap<String, Value>,
+    workspace_dir: &Path,
+    conv_id: &str,
+    req_type: &str,
+) -> String {
+    let key = workspace_dir.to_string_lossy().to_string();
+    let conversations = memo.entry(key).or_insert_with(|| {
+        std::fs::read(workspace_dir.join("index.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .and_then(|v| v.get("conversations").cloned())
+            .unwrap_or(Value::Null)
+    });
+    conversations
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|c| c.get("id").and_then(Value::as_str) == Some(conv_id))
+        })
+        .and_then(|c| {
+            let model_map = c.get("modelMap");
+            model_map
+                .and_then(|m| m.get(req_type))
+                .and_then(Value::as_str)
+                .or_else(|| model_map.and_then(|m| m.get("craft")).and_then(Value::as_str))
+                .or_else(|| c.get("selectedModelId").and_then(Value::as_str))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "未知模型".to_string())
+}
+
+/// `%LOCALAPPDATA%\CodeBuddyExtension\Data`（CodeBuddy IDE 历史根）；
+/// 缺环境变量或非 Windows 时返回 None（该源整体跳过，不影响另两路）。
+fn codebuddy_ide_root() -> Option<PathBuf> {
+    let dir = std::env::var("LOCALAPPDATA").ok()?;
+    if dir.trim().is_empty() {
+        return None;
+    }
+    Some(Path::new(&dir).join("CodeBuddyExtension").join("Data"))
+}
+
+/// 递归收集 CodeBuddy IDE 历史下的 `index.json`（限深防病态目录树）。
+fn collect_codebuddy_indexes(dir: &Path, depth: usize, output: &mut Vec<PathBuf>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codebuddy_indexes(&path, depth + 1, output);
+        } else if path.file_name().and_then(|n| n.to_str()) == Some("index.json")
+            && path
+                .components()
+                .any(|c| c.as_os_str().to_str() == Some("history"))
+        {
+            output.push(path);
+        }
+    }
+}
+
+/// 解析 CodeBuddy IDE 会话索引为按日聚合（与 parse_file 同构的增量缓存单元）。
+/// 工作区级 index.json（只有 conversations/current）自然产出空条目，零误计。
+fn parse_codebuddy_index(path: &Path, memo: &mut HashMap<String, Value>) -> FileCacheEntry {
+    let mut entry = FileCacheEntry { rev: PARSE_REV, ..Default::default() };
+    let Ok(raw) = std::fs::read(path) else {
+        entry.parse_errors = 1;
+        return entry;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
+        entry.parse_errors = 1;
+        return entry;
+    };
+    let Some(requests) = value.get("requests").and_then(Value::as_array) else {
+        return entry;
+    };
+    let session_dir = path.parent();
+    let conv_id = session_dir
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let workspace_dir = session_dir.and_then(|p| p.parent());
+    // 同会话内按 request id 去重（跨会话副本不去重——本工具不复制该目录）
+    let mut seen_ids: HashSet<&str> = HashSet::new();
+    for request in requests {
+        let Some(object) = request.as_object() else { continue };
+        let Some(id) = object.get("id").and_then(Value::as_str) else { continue };
+        if !seen_ids.insert(id) {
+            continue;
+        }
+        if object.get("state").and_then(Value::as_str) == Some("running") {
+            continue;
+        }
+        let Some(usage_object) = object.get("usage").and_then(Value::as_object) else { continue };
+        let u = codebuddy_usage(usage_object);
+        if u == Usage::default() {
+            continue;
+        }
+        let Some(day) = object.get("startedAt").and_then(ms_date) else { continue };
+        let req_type = object.get("type").and_then(Value::as_str).unwrap_or("craft");
+        let model = match workspace_dir {
+            Some(ws) => conversation_model(memo, ws, conv_id, req_type),
+            None => "未知模型".to_string(),
+        };
+        let d = DayTotals {
+            input: u.input,
+            output: u.output,
+            read: u.read,
+            write: u.write,
+            calls: 1,
+        };
+        entry.days.entry(day.clone()).or_default().add(&d);
+        entry
+            .by_model
+            .entry(model)
+            .or_default()
+            .entry(day.clone())
+            .or_default()
+            .add(&d);
+        entry
+            .by_project
+            .entry(CODEBUDDY_IDE_PROJECT.to_string())
+            .or_default()
+            .entry(day)
+            .or_default()
+            .add(&d);
+    }
+    entry
+}
+
 fn file_meta_ms(path: &Path) -> Option<(i64, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime_ms = meta
@@ -435,9 +618,7 @@ fn day_to_ms(date: &str, end_of_day: bool) -> Option<i64> {
     }
 }
 
-/// 扫描单个根目录（~/.workbuddy/projects 或 ~/.codebuddy/projects）。
-/// 命中增量缓存的文件零解析；返回聚合视图，同时把扫到的文件键记入 `seen`
-/// （调用方据此清理已删除文件的缓存条目）。
+/// 扫描单个会话 JSONL 根目录（~/.workbuddy/projects 或 ~/.codebuddy/projects）
 fn scan_root(
     root: &Path,
     name: &str,
@@ -447,7 +628,53 @@ fn scan_root(
 ) -> Value {
     let mut paths = Vec::new();
     collect_jsonl(root, &mut paths);
+    aggregate_files(ScanKind::SessionJsonl, root, name, paths, cutoff, cache, seen)
+}
+
+/// 扫描 CodeBuddy IDE 明细根（`%LOCALAPPDATA%\CodeBuddyExtension\Data`）：
+/// 会话索引 `requests[]` 与 WorkBuddy 侧合并进同一个「本地源」。
+fn scan_codebuddy_ide(
+    root: &Path,
+    cutoff: &str,
+    cache: &mut HashMap<String, FileCacheEntry>,
+    seen: &mut HashSet<String>,
+) -> Value {
+    let mut paths = Vec::new();
+    collect_codebuddy_indexes(root, 0, &mut paths);
+    aggregate_files(
+        ScanKind::CodebuddyIndex,
+        root,
+        "codebuddy-ide",
+        paths,
+        cutoff,
+        cache,
+        seen,
+    )
+}
+
+/// 扫描来源类型：决定「路径 → 增量缓存条目」所用的解析器
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanKind {
+    /// 会话 JSONL（~/.workbuddy/projects、~/.codebuddy/projects）
+    SessionJsonl,
+    /// CodeBuddy IDE 会话索引（requests[] 数组）
+    CodebuddyIndex,
+}
+
+/// 多来源共用的聚合过程：命中增量缓存的文件零解析；返回聚合视图，
+/// 同时把扫到的文件键记入 `seen`（调用方据此清理已删除文件的缓存条目）。
+fn aggregate_files(
+    kind: ScanKind,
+    root: &Path,
+    name: &str,
+    mut paths: Vec<PathBuf>,
+    cutoff: &str,
+    cache: &mut HashMap<String, FileCacheEntry>,
+    seen: &mut HashSet<String>,
+) -> Value {
     paths.sort();
+    // CodeBuddy 侧工作区索引解析缓存（同一工作区多会话共享一次读取）
+    let mut memo: HashMap<String, Value> = HashMap::new();
 
     let mut total = Totals::default();
     let mut models: HashMap<String, Totals> = HashMap::new();
@@ -473,8 +700,10 @@ fn scan_root(
         let entry = if hit {
             cache.get(&key).cloned().unwrap_or_default()
         } else {
-            let fallback_project = dir_project_name(root, path);
-            let mut e = parse_file(path, &fallback_project);
+            let mut e = match kind {
+                ScanKind::SessionJsonl => parse_file(path, &dir_project_name(root, path)),
+                ScanKind::CodebuddyIndex => parse_codebuddy_index(path, &mut memo),
+            };
             if let Some((mtime, size)) = meta {
                 e.mtime_ms = mtime;
                 e.size = size;
@@ -559,8 +788,20 @@ fn scan_root(
     })
 }
 
-/// 本地 Token 统计（F-26/F-57）：合并 ~/.workbuddy/projects 与 ~/.codebuddy/projects，
-/// 固定回看 365 天（热力图数据源）；时间/模型/范围筛选由前端从 daily_by_model 派生。
+/// 本地 Token 统计（F-26/F-57）：合并三路来源，固定回看 365 天（热力图数据源）；
+/// 时间/模型/范围筛选由前端从 daily_by_model 派生。
+///
+/// **有效覆盖范围（2026-10-06 实测校正）**：
+/// ① `~/.workbuddy/projects`——WorkBuddy 桌面端会话 JSONL，本机真实产出（164 项目目录）；
+/// ② `~/.codebuddy/projects`——CodeBuddy CLI 会话 JSONL，本机实测仅有 agent 的
+///    memory/*.md、零 jsonl（扫描保留以兼容其他环境）；
+/// ③ `%LOCALAPPDATA%\CodeBuddyExtension\Data\<uid>\CodeBuddyIDE\<uid>\history\...\`——
+///    **CodeBuddy IDE 侧**，用量在会话级 `index.json` 的 `requests[]`（见
+///    `parse_codebuddy_index`）。此项为本轮新增覆盖：此前误判为「IDE 侧无本地用量」
+///    （当时只查了 messages/*.json，那里确实只有正文）。
+/// 故「本地源」现为「WorkBuddy 桌面端 + CodeBuddy IDE」口径；未走本地记录的部分
+/// （如经 API 网关转发的流量）仍由网关源（api_usage bucket=wb）单列，二者不合并。
+///
 /// 性能（F-59）：按文件增量缓存（mtime+size 不变零解析）+ 结果级 10 分钟缓存；
 /// fresh=true（前端「重扫」按钮）跳过结果缓存强制重扫（仍享受增量缓存）。
 #[tauri::command(async)]
@@ -603,12 +844,16 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
         &mut cache,
         &mut seen,
     );
+    // 第三路：CodeBuddy IDE 会话索引 requests[]（%LOCALAPPDATA%\CodeBuddyExtension\Data）
+    let third = codebuddy_ide_root()
+        .map(|root| scan_codebuddy_ide(&root, &cutoff, &mut cache, &mut seen));
 
-    // 已删除文件的缓存条目清理
+    // 已删除文件的缓存条目清理（须在三路扫描都完成后执行）
     cache.retain(|k, _| seen.contains(k));
     let _ = crate::store::db(&state.data_dir).kv_set("token_stats_files", &cache);
 
-    // 合并双源：summary/daily/models/projects/daily_by_model 累加
+    // 合并三路来源：summary/daily/models/projects/daily_by_model 累加
+    let ide = third.as_ref();
     merge_totals(merged.get_mut("summary"), second.get("summary"));
     merge_group_arrays(merged.get_mut("daily"), second.get("daily"), "date");
     merge_group_arrays(merged.get_mut("models"), second.get("models"), "key");
@@ -617,10 +862,32 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
         merged.get_mut("daily_by_model"),
         second.get("daily_by_model"),
     );
+    merge_totals(merged.get_mut("summary"), ide.and_then(|v| v.get("summary")));
+    merge_group_arrays(
+        merged.get_mut("daily"),
+        ide.and_then(|v| v.get("daily")),
+        "date",
+    );
+    merge_group_arrays(
+        merged.get_mut("models"),
+        ide.and_then(|v| v.get("models")),
+        "key",
+    );
+    merge_group_arrays(
+        merged.get_mut("projects"),
+        ide.and_then(|v| v.get("projects")),
+        "key",
+    );
+    merge_daily_by_model(
+        merged.get_mut("daily_by_model"),
+        ide.and_then(|v| v.get("daily_by_model")),
+    );
     let files = merged.get("files_scanned").and_then(Value::as_u64).unwrap_or(0)
-        + second.get("files_scanned").and_then(Value::as_u64).unwrap_or(0);
+        + second.get("files_scanned").and_then(Value::as_u64).unwrap_or(0)
+        + ide.and_then(|v| v.get("files_scanned")).and_then(Value::as_u64).unwrap_or(0);
     let errs = merged.get("parse_errors").and_then(Value::as_u64).unwrap_or(0)
-        + second.get("parse_errors").and_then(Value::as_u64).unwrap_or(0);
+        + second.get("parse_errors").and_then(Value::as_u64).unwrap_or(0)
+        + ide.and_then(|v| v.get("parse_errors")).and_then(Value::as_u64).unwrap_or(0);
     merged["files_scanned"] = json!(files);
     merged["parse_errors"] = json!(errs);
     merged["generated_at"] = json!(now_ms);
@@ -794,5 +1061,136 @@ mod tests {
         let e = parse_file(&path, "p");
         assert_eq!(e.parse_errors, 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── CodeBuddy IDE 会话索引（requests[]）────────────────────────────────
+
+    #[test]
+    fn codebuddy_usage_maps_ide_fields_and_aliases() {
+        let usage_object = json!({
+            "inputTokens": 1000,
+            "outputTokens": 50,
+            "cacheTokens": 800,
+            "cachedWriteTokens": 12,
+            "cachedMissTokens": 200,
+            "credit": 1.67
+        });
+        let u = codebuddy_usage(usage_object.as_object().unwrap());
+        assert_eq!(u, Usage { input: 1000, output: 50, read: 800, write: 12 });
+        // 别名回退（cache_write 只认显式别名；cachedMissTokens 是新增输入，不是写入）
+        let aliased = json!({
+            "input_tokens": 5,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 3
+        });
+        assert_eq!(
+            codebuddy_usage(aliased.as_object().unwrap()),
+            Usage { input: 5, output: 2, read: 3, write: 0 }
+        );
+    }
+
+    #[test]
+    fn ms_date_normalizes_seconds_and_millis() {
+        let ms = json!(1_757_000_000_000i64);
+        let secs = json!(1_757_000_000i64);
+        assert_eq!(ms_date(&ms), ms_date(&secs));
+        assert!(ms_date(&json!("不是时间")).is_none());
+        assert!(ms_date(&json!({})).is_none());
+    }
+
+    /// 端到端：夹具目录 → 计入 complete/canceled、跳过 running 与全 0、同 id 去重、
+    /// 模型取工作区索引 modelMap[type]、项目维度记常量。
+    #[test]
+    fn parse_codebuddy_index_aggregates_requests_by_model_and_day() {
+        let stamp = 1_757_000_000_000i64;
+        let expected_day = chrono::DateTime::from_timestamp_millis(stamp)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string();
+        let uid = "3e385602-a4bb-4f24-b788-a7fc3c367269";
+        let ws = "01535c200188b8815071c3182ebb5942";
+        let conv = "0fee43607ac04566816c4be1edf4d516";
+        let root = std::env::temp_dir().join(format!("wb_stats_cb_{}", std::process::id()));
+        let history = root
+            .join(uid)
+            .join("CodeBuddyIDE")
+            .join(uid)
+            .join("history")
+            .join(ws);
+        let session = history.join(conv);
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(
+            history.join("index.json"),
+            json!({
+                "conversations": [{
+                    "id": conv,
+                    "type": "craft",
+                    "modelMap": { "craft": "deepseek-v4-flash", "plan": "deepseek-v4-pro" }
+                }],
+                "current": conv
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("index.json"),
+            json!({
+                "messages": [],
+                "requests": [
+                    { "id": "r1", "type": "craft", "state": "complete", "startedAt": stamp,
+                      "usage": { "inputTokens": 1000, "outputTokens": 50,
+                                 "cacheTokens": 800, "cachedWriteTokens": 10 } },
+                    // 同 id 重复（会话内去重）
+                    { "id": "r1", "type": "craft", "state": "complete", "startedAt": stamp,
+                      "usage": { "inputTokens": 1000, "outputTokens": 50 } },
+                    // 进行中 → 跳过
+                    { "id": "r2", "type": "plan", "state": "running", "startedAt": stamp,
+                      "usage": { "inputTokens": 9, "outputTokens": 9 } },
+                    // 四类 token 全 0 → 跳过
+                    { "id": "r3", "type": "craft", "state": "complete", "startedAt": stamp,
+                      "usage": { "inputTokens": 0, "outputTokens": 0 } },
+                    // canceled 仍消费 → 计入（plan 走 modelMap.plan）
+                    { "id": "r4", "type": "plan", "state": "canceled", "startedAt": stamp,
+                      "usage": { "inputTokens": 7, "outputTokens": 0 } }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut memo: HashMap<String, Value> = HashMap::new();
+        let entry = parse_codebuddy_index(&session.join("index.json"), &mut memo);
+        assert_eq!(entry.parse_errors, 0);
+        let day = entry.days.get(&expected_day).expect("应有当日聚合");
+        assert_eq!(day.calls, 2);
+        assert_eq!(day.input, 1007);
+        assert_eq!(day.output, 50);
+        assert_eq!(day.read, 800);
+        assert_eq!(day.write, 10);
+        let craft = entry
+            .by_model
+            .get("deepseek-v4-flash")
+            .and_then(|days| days.get(&expected_day))
+            .expect("craft 请求应归到 modelMap.craft");
+        assert_eq!(craft.calls, 1);
+        let plan = entry
+            .by_model
+            .get("deepseek-v4-pro")
+            .and_then(|days| days.get(&expected_day))
+            .expect("plan 请求应归到 modelMap.plan");
+        assert_eq!(plan.input, 7);
+        let project = entry
+            .by_project
+            .get(CODEBUDDY_IDE_PROJECT)
+            .and_then(|days| days.get(&expected_day))
+            .expect("项目维度记常量");
+        assert_eq!(project.calls, 2);
+
+        // 收集器只认 history 祖先下的 index.json（工作区索引也在其中，由解析层空产出）
+        let mut paths = Vec::new();
+        collect_codebuddy_indexes(&root, 0, &mut paths);
+        assert_eq!(paths.len(), 2, "工作区索引 + 会话索引各一：{paths:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { RefreshCw } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { SOURCE_LABELS, SOURCES, type BoardSource } from '../../components/ChartFilterBar';
@@ -201,7 +202,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   }, []);
 
   // 懒加载（§3.4）：本地 token 仅 Buddy 页拉取（Trae 页本地源禁用，tokenStats 为
-  // WB/CodeBuddy 会话扫描的重操作，Trae 页零消费不触发）；网关数据在 Token Tab
+  // WorkBuddy 会话扫描的重操作，Trae 页零消费不触发）；网关数据在 Token Tab
   // 或 积分统计 Tab 网关源首次激活时拉取（SQLite 直查，轻）
   useEffect(() => {
     if (platform === 'buddy' && tab === 'tokens' && !tokensLoadedRef.current) {
@@ -219,42 +220,67 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   }, [platform, tab, creditsSource, loadTokens, loadGateway]);
 
   const refresh = useCallback(
-    async (fresh = false) => {
-      setLoading(true);
+    async (fresh = false, silent = false) => {
+      // silent：调度器联动（board-data-synced）静默重读缓存——不置全局 loading、
+      // 不强制最短展示时长，避免看板每次同步后闪烁并瞬时禁用刷新按钮
+      if (!silent) setLoading(true);
+      const work = async () => {
+        // Trae fresh 时先串行刷新剩余积分：后端逐账号网络查询并落盘 credits_daily.json 快照
+        // （旧页即串行保证此顺序），完成后再并行读取；否则日快照竞速先返回旧值，今日 KPI 滞后
+        if (isTrae && fresh) await refreshRemainingCredits();
+        await Promise.all([
+          // 按平台只加载本侧数据源
+          isTrae ? refreshCreditsDaily() : Promise.resolve(),
+          isTrae ? refreshCreditsHistory() : Promise.resolve(),
+          isTrae ? loadUsage(fresh) : Promise.resolve(),
+          isTrae || isQoder ? Promise.resolve() : loadBuddy(fresh),
+          isQoder ? loadQoder(fresh) : Promise.resolve(),
+          // 已加载过的源随全局刷新联动（fresh=true 本地重扫 + 网关直查）
+          tokensLoadedRef.current && fresh ? loadTokens(true) : Promise.resolve(),
+          gatewayLoadedRef.current && fresh ? loadGateway() : Promise.resolve(),
+        ]);
+      };
       try {
-        await withMinDelay(
-          (async () => {
-            // Trae fresh 时先串行刷新剩余积分：后端逐账号网络查询并落盘 credits_daily.json 快照
-            // （旧页即串行保证此顺序），完成后再并行读取；否则日快照竞速先返回旧值，今日 KPI 滞后
-            if (isTrae && fresh) await refreshRemainingCredits();
-            await Promise.all([
-              // 按平台只加载本侧数据源
-              isTrae ? refreshCreditsDaily() : Promise.resolve(),
-              isTrae ? refreshCreditsHistory() : Promise.resolve(),
-              isTrae ? loadUsage(fresh) : Promise.resolve(),
-              isTrae || isQoder ? Promise.resolve() : loadBuddy(fresh),
-              isQoder ? loadQoder(fresh) : Promise.resolve(),
-              // 已加载过的源随全局刷新联动（fresh=true 本地重扫 + 网关直查）
-              tokensLoadedRef.current && fresh ? loadTokens(true) : Promise.resolve(),
-              gatewayLoadedRef.current && fresh ? loadGateway() : Promise.resolve(),
-            ]);
-          })(),
-          600,
-        );
+        if (silent) await work();
+        else await withMinDelay(work(), 600);
         if (fresh) {
           pushToast('success', '看板数据已刷新');
         }
       } finally {
-        setLoading(false);
+        if (!silent) setLoading(false);
       }
     },
     [isTrae, isQoder, refreshRemainingCredits, refreshCreditsDaily, refreshCreditsHistory, loadUsage, loadBuddy, loadQoder, loadTokens, loadGateway, pushToast],
   );
 
+  // refresh 引用最新闭包（依赖链深，listen effect 只随 platform 注册一次，
+  // 经 ref 调用避免重注册，也保证读到最新 store 状态）
+  const refreshRef = useRef(refresh);
+  useEffect(() => {
+    refreshRef.current = refresh;
+  }, [refresh]);
+
   useEffect(() => {
     void refresh(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 调度器看板数据同步成功后联动重读缓存（issue #61：页面常驻时数据不再滞后）；
+  // payload.platform 与本视图平台匹配才刷新，静默走 refresh(false, true)（纯读缓存、零网络、无 loading 闪烁）
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen<{ platform: string }>('board-data-synced', (e) => {
+      if (e.payload.platform === platform) void refreshRef.current(false, true);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [platform]);
 
   const today = localDate(new Date());
 
@@ -467,7 +493,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
             official: 'Qoder 官网未提供 token 用量接口',
           }
         : platform === 'trae'
-          ? { local: '本地 Token 统计 = WB/CodeBuddy 客户端会话，Trae 无本地源' }
+          ? { local: '本地 Token 统计 = WorkBuddy 桌面端 + CodeBuddy IDE 会话，Trae 无本地源' }
           : { official: 'Buddy 官网未提供按日 token 明细接口' }
       : isQoder
         ? {

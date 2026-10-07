@@ -644,7 +644,9 @@ fn blocked_system_dirs() -> Vec<std::path::PathBuf> {
 
 /// 导出路径校验（canonicalize 失败时对原路径做前缀判断）：
 /// ① 命中系统目录/启动文件夹前缀 → 拒绝；
-/// ② 可执行/脚本扩展名且不在应用数据目录下 → 拒绝
+/// ② 可执行/脚本扩展名（或无扩展名）且不在应用数据目录下 → 拒绝
+///（审查 P1-2：无扩展名文件此前直接放行，可写 `.git/hooks/pre-commit`、
+/// `.bashrc`、`authorized_keys` 等无扩展名持久化/注入目标，按高风险处理）
 fn check_export_path(
     path: &std::path::Path,
     data_dir: &std::path::Path,
@@ -667,9 +669,9 @@ fn check_export_path(
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| BLOCKED_EXEC_EXTS.contains(&e.to_lowercase().as_str()))
-        .unwrap_or(false);
+        .unwrap_or(true); // 无扩展名（.git/hooks/pre-commit 等）按高风险处理
     if is_exec && !exec_ok() {
-        return Err("拒绝写入：可执行/脚本文件仅允许导出到应用数据目录内".into());
+        return Err("拒绝写入：可执行/脚本/无扩展名文件仅允许导出到应用数据目录内".into());
     }
     Ok(())
 }
@@ -681,9 +683,24 @@ pub fn write_text_file(state: State<AppState>, path: String, content: String) ->
     std::fs::write(&p, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
 }
 
+/// 读取允许的文本扩展名白名单（小写无点）：read_text_file 面向「导入账号/配置」
+/// 场景（前端 open 对话框过滤 JSON）。白名单防止渲染层被攻陷后读取任意敏感文件
+///（SSH 私钥/`.env` 等多为无扩展名或专用扩展名，天然不在白名单内；审查 P1-1）
+const ALLOWED_READ_EXTS: &[&str] = &["json", "txt", "log", "csv", "md"];
+
 /// 读取本地文本文件（配合导入账号：文件选择后由 Rust 侧读取，避免前端路径权限问题）
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
+    let p = std::path::PathBuf::from(&path);
+    // 扩展名白名单（大小写不敏感）：无扩展名/未知扩展名一律拒绝
+    let ext_ok = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| ALLOWED_READ_EXTS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false);
+    if !ext_ok {
+        return Err("仅允许读取文本类文件（json/txt/log/csv/md）".into());
+    }
     let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {e}"))?;
     if !meta.is_file() {
         return Err("路径不是常规文件".into());
@@ -1048,5 +1065,19 @@ mod tests {
         let dir = tmp_dir("plain");
         assert!(check_export_path(&dir.join("export.json"), &dir, &[]).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 审查 P1-2 回归：无扩展名文件（.git/hooks/pre-commit、.bashrc 类）在
+    /// 应用数据目录之外一律拒绝
+    #[test]
+    fn export_rejects_extensionless_outside_data_dir() {
+        let data = tmp_dir("datadir2");
+        let repo = tmp_dir("repo");
+        let git_hooks = repo.join(".git").join("hooks");
+        std::fs::create_dir_all(&git_hooks).unwrap();
+        let err = check_export_path(&git_hooks.join("pre-commit"), &data, &[]).unwrap_err();
+        assert!(err.contains("无扩展名") || err.contains("可执行"), "实际错误: {err}");
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

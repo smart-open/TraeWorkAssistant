@@ -4,7 +4,52 @@
 
 ---
 
-## [3.7.0] · 2026-10-05 · Qoder 全面支持（上游网关接入 + 积分看板三平台化 + 模块加固）
+## [3.7.2] · 2026-10-07 · Qoder 每日签到风控真值修复 + 盲发失败提示可读化
+
+> 范围：自 [3.7.1] 以来的全部变更。
+
+### 修复
+
+- **[P1] Qoder 每日签到误报「已领（此前已领）」——设备风控真值集成 + 盲发失败如实上报**：每日 100 Credits 活动 campaignId 每日轮换，服务端按设备风控身份真值（machineToken/MachineType/MachineCode 三元组）做指纹分桶——工具派生值会被分入独立桶，表现为 campaigns 列表恒无 CLAIMABLE + claim 盲发 503 `RISK_DEPENDENCY_UNAVAILABLE`，旧代码把非成功盲发静默归 already 造成「假已领」。现：① openapi 域 `Cosy-MachineToken/Code/Type` 三键优先取 Qoder 主客户端随包 `runtime-info.exe` 产出的真值（OnceLock 缓存进程内至多 spawn 一次、CREATE_NO_WINDOW、客户端未装/解析失败回退 machine_id 派生并保持幂等），并按客户端 0.4.3 抓包形态补齐 `Cosy-Version`/`Cosy-MachineOS`/`Cosy-MachineHostname`（openapi 域与网关域 COSY 协议版本互不通用）；② 真实已领判定从严（claimStatus==CLAIMED + actionType==CLAIM_BENEFIT + benefit 类型 + 活动时间窗口四条件齐备），已知活动兜底盲发逐条聚合归类（Success/AlreadyReplay/Auth/Failed），任一 Failed 如实归 fail 交调度器 30 分钟自动重试（宁 fail 不假 already），仅全部重放才归 already；campaigns 列表改全量返回不过滤，CLAIMABLE 过滤下沉为独立纯函数。实机验证：账号池签到真实到账（CLAIMED 非重放），风控 BLOCKED 账号如实报 fail。
+- **[P3] 盲发失败提示可读化**：两个已探针锁定形态不再倾倒原始 JSON——200/BLOCKED 提示「服务端风控拦截（status=BLOCKED），请在 Qoder 客户端正常登录/使用一次建立设备信任后重试」，503/RISK_DEPENDENCY_UNAVAILABLE 提示「风控依赖暂不可用，稍后自动重试」；未知形态保留 HTTP 码 + 原始响应前缀（截 120 字符）供排障。
+
+### 测试
+
+- `cargo test` 775 passed / 0 failed / 9 ignored。
+
+---
+
+## [3.7.1] · 2026-10-07 · 看板数据联动 + 三池耗尽归因 + 指纹清洗 UI 化 + 加固批
+
+> 范围：自 [3.7.0] 以来的全部变更。
+
+### 新功能
+
+- **看板数据定时预热联动（issue #61）**：`trae-usage-sync` 每小时同步消耗明细、`wb-credits-snapshot` 预热「近 7 日积分消耗」聚合缓存；三平台快照落库后广播 `board-data-synced`，常驻看板页静默重读（零网络）。
+- **签到多账号间隔**：Trae/Buddy/Qoder 签到（Buddy 签到与成长共用）账号间默认 3 秒间隔防上游频控，各应用环境配置页可改（0 = 关闭，上限 600s；调度器/CLI/启动补签三路共用）。
+- **三池账号健康徽标统一（PoolHealthBadges）**：就绪/冷却/硬冷却/禁用/零积分/积分过期六态口径对齐后端 `pool::selectable`，`PoolStatus` 新增 `hard_credit` 硬冷却单列。
+- **指纹清洗 UI 化**：API 管理新增「指纹清洗」tab，DSH/CLI 身份句改写规则在线编辑 + 恢复内置默认（wb_template_map.json 热更新）。
+- **侧边栏应用自定义图标**：系统设置「应用图标」选择器（含重置），非法值归一，渲染回退内置图标。
+
+### 修复
+
+- **[P1] SSE 转发器 EOF 有内容优雅收尾**：上游断流但已有正文时补发协议终止帧，客户端不再悬挂在未闭合 content_block；零内容仍走 -9901 哨兵换号。
+- **[P1] 账号绑定 TOCTOU 收紧（CAS）**：普通候选绑定前原子复核「在途 < 并发上限」，已满换号不计错误不冷却（专一/粘性锁定保留无条件绑定）；`active_uid` 统一改为绑定成功后更新（7 处取号路径）。
+- **[P1] toolexec 工具劫持防护**：客户端自带同名 function 工具（web_search/open_url）时代理代执行整体退出，工具调用透传客户端自行执行。
+- **[P1] 豆包抓包凭证 vault 化**：MITM 捕获凭证只进 vault（DPAPI 加密），读取统一收敛 + 启动迁移后抹除明文 kv 行。
+- **[P1] WB 凭证刷新双锁**：进程内每账号互斥 + 跨进程命名互斥体，防 CLI/调度器双进程并发刷新丢 refresh_token。
+- **[P2] 三池耗尽收尾归因分流**：空完成占半以上提示渠道指纹封锁嫌疑（app.log 标记 `CHANNEL_FINGERPRINT_BLOCK`），错误 code 保持 `no_healthy_account` 兼容；空响应计数补齐 + Trae 流式空完成 `sent_any` 护栏。
+- **[P2] strip_cc_fingerprints 误伤修复**：裸 `cc_` 词（无赋值语义）不再误删；DSH 清洗规则新增 2 条（DeepSeek Harness 身份句/模型句，powered by → built on）。
+- **安全与可靠性**：`read_text_file` 白名单扩展名 + 导出拒绝无扩展名路径（防路径穿越）；CA 目录收紧覆盖既有加载分支；store SQLite 重建失败降级内存库续命；`vault::ns_get` 错误落日志。
+- **已随分支提交**：Qoder 签到误报「无可领活动」修复、JWT 信封判定失效修复、侧边栏应用显隐配置。
+
+### 测试
+
+- `cargo test` 768 passed / 0 failed；`tsc --noEmit` 全绿；`vitest` 59 passed。
+
+---
+
+## [3.7.0] · 2026-10-04 · Qoder 全面支持（上游网关接入 + 积分看板三平台化 + 模块加固）
 
 > 范围：自 [3.6.6] 以来的全部变更；调研过程与逐项实现细节见 git 历史。
 

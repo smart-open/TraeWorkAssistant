@@ -291,14 +291,31 @@ impl AppState {
             s.trae_models_sync_enabled = true;
             s.trae_models_sync_hhmm = "05:40".into();
         }
-        // 看板数据同步模式零值归一：空/未知值视为默认 daily（时刻由调度器回退内置默认），
-        // 显式 "off"/"hourly"/"daily" 原样生效
+        // 看板数据同步模式零值归一：空值视为各平台默认（Buddy daily / Trae hourly，
+        // issue #61），时刻由调度器回退内置默认；显式 "off"/"hourly"/"daily" 原样生效
         if s.wb_credits_sync_mode.trim().is_empty() {
             s.wb_credits_sync_mode = "daily".into();
         }
         if s.trae_credits_sync_mode.trim().is_empty() {
-            s.trae_credits_sync_mode = "daily".into();
+            s.trae_credits_sync_mode = "hourly".into();
         }
+        // 侧边栏应用显示：固定应用零值回填（kv 全缺失走 Settings::default() 时 String=""）
+        if s.pinned_app.trim().is_empty() {
+            s.pinned_app = "trae".into();
+        }
+        // 隐藏列表归一：丢弃非法 key、去重排序；固定应用强制可见（双保险，前端同样约束）
+        {
+            let pinned = s.pinned_app.clone();
+            s.hidden_apps.retain(|k| {
+                matches!(k.as_str(), "trae" | "buddy" | "qoder" | "doubao") && k != &pinned
+            });
+            s.hidden_apps.sort_unstable();
+            s.hidden_apps.dedup();
+        }
+        // 自定义图标归一：丢弃非法 key 与空图标名（等于未配置）；非法图标名不在此校验，
+        // 前端 resolveAppIcon 未命中即回退默认图标（候选表只有前端持有，避免后端重复维护）
+        s.app_icons
+            .retain(|k, v| matches!(k.as_str(), "trae" | "buddy" | "qoder" | "doubao") && !v.trim().is_empty());
         // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，Trae/Buddy 共用）：
         // app_settings 渠道字段双 None 时从旧 workbuddy_settings 一次性搬运。
         // 命中即 kv_set 回写持久化——push_notify 裸读 kv 不经过本函数，仅内存视图会让

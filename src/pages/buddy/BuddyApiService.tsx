@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { RefreshCw, Save, Coins, ToggleLeft, Activity, Gauge } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner, StatCard } from '../../components/ui';
+import { PoolHealthBadges } from '../../components/api/PoolHealthBadges';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
@@ -481,7 +482,7 @@ export default function BuddyApiService() {
                 {credAccounts.map((a) => {
                   // F-77⑤ 可观测：实时在途并发（服务未运行/未匹配时为 0）；
                   // PoolStatus.uid = 池键 = a.id（wb-<hash>），非 a.uid
-                  const inflight = wbPool.find((p) => p.uid === a.id)?.inflight ?? 0;
+                  const poolItem = wbPool.find((p) => p.uid === a.id);
                   // 分组筛选激活时，分组外账号不参与调度（整行半透明标记，对齐 Trae）
                   const filteredOut = !inWbPoolFilter(a.id);
                   return (
@@ -500,7 +501,12 @@ export default function BuddyApiService() {
                       {filteredOut && <Badge tone="slate">分组外</Badge>}
                       {a.is_current && <Badge tone="green">在线</Badge>}
                       {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
-                      {inflight > 0 && <Badge tone="amber">在途 {inflight}</Badge>}
+                      {/* 运行时健康徽标：禁用/积分耗尽/冷却原因/零积分/在途·就绪（三池共用） */}
+                      <PoolHealthBadges
+                        s={poolItem}
+                        running={status?.running ?? false}
+                        tokenInvalid={a.needs_relogin}
+                      />
                       <span className="shrink-0 text-right tabular-nums text-xs text-slate-500">
                         {a.credits_balance != null ? `${a.credits_balance.toFixed(2)} 积分` : '余额未知'}
                       </span>

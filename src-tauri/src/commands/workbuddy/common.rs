@@ -359,6 +359,10 @@ pub fn workbuddy_settings_set(state: State<AppState>, patch: WorkBuddySettings) 
 // ── 工具侧凭证副本写入（F-10 双源化）───────────────────────────────────────
 
 pub(super) fn upsert_token_store(state: &AppState, id: &str, creds: &serde_json::Value) -> Result<(), String> {
+    // H-1：表级读改写互斥（与 tasks 侧 save_token_store 共用 WB_TOKEN_STORE_LOCK，
+    // 导入/OAuth 与签到/积分刷新并发写不互相覆盖）
+    let _table =
+        crate::tasks::wb_common::WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 凭证收敛（P0-1）：读走 secure 回填，写走 secure 占位（敏感字段进 vault，DB 不落明文）
     let existing = crate::tasks::wb_common::token_store_load_secure(&state.data_dir);
     let mut rec = existing

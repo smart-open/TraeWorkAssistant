@@ -178,6 +178,17 @@ pub struct Settings {
     /// Windows 计划任务注册时间复用该值）
     #[serde(default = "default_trae_checkin_hhmm")]
     pub trae_checkin_hhmm: String,
+    /// Trae 签到多账号间隔秒（默认 3s，防上游频控；环境配置页可改，0 = 关闭间隔）。
+    /// None = 未配置按默认（Settings::default() 路径同款，state 不做零值回填）
+    #[serde(default)]
+    pub trae_checkin_gap_secs: Option<u64>,
+    /// WorkBuddy 签到/成长多账号间隔秒（默认 3s；任务配置页可改，0 = 关闭；
+    /// 签到与成长两轮共用同一配置）
+    #[serde(default)]
+    pub wb_checkin_gap_secs: Option<u64>,
+    /// Qoder 签到多账号间隔秒（默认 3s；任务配置页可改，0 = 关闭）
+    #[serde(default)]
+    pub qoder_checkin_gap_secs: Option<u64>,
     /// Trae JWT 定时调度续期（issue #27）：调度器 trae-renew 开关（默认开，每日兜底
     /// 续期临期账号；state::settings 对零值统一回填默认，防止 Settings::default 路径漏开）
     #[serde(default = "default_true")]
@@ -202,8 +213,8 @@ pub struct Settings {
     /// Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻）
     #[serde(default = "default_wb_credits_sync_hhmm")]
     pub wb_credits_sync_hhmm: String,
-    /// Trae 积分数据同步模式：off | hourly | daily（默认）
-    #[serde(default = "default_credits_sync_mode")]
+    /// Trae 积分数据同步模式：off | hourly（默认，issue #61 看板数据保持新鲜）| daily
+    #[serde(default = "default_trae_credits_sync_mode")]
     pub trae_credits_sync_mode: String,
     /// Trae 积分同步触发时刻 HH:MM（daily 模式生效，默认 23:40 对齐原快照时刻）
     #[serde(default = "default_trae_credits_sync_hhmm")]
@@ -299,6 +310,17 @@ pub struct Settings {
     /// 注意 >7h 的后果见上（设计承诺只在 ≤7h 区间成立）
     #[serde(default = "default_qoder_token_renew_hours")]
     pub qoder_token_renew_interval_hours: u32,
+    // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
+    /// 固定应用：始终显示在侧边栏且不可隐藏（radio 单选，默认 trae）
+    #[serde(default = "default_pinned_app")]
+    pub pinned_app: String,
+    /// 侧边栏隐藏的应用 key 列表（空 = 全部显示；固定应用即使列入也强制显示）
+    #[serde(default)]
+    pub hidden_apps: Vec<String>,
+    /// 侧边栏应用自定义图标（应用 key → 图标名，前端 lib/appIcons.ts 候选表；
+    /// 缺失/非法回退 APP_TABS 内置默认图标）
+    #[serde(default)]
+    pub app_icons: HashMap<String, String>,
 }
 
 fn default_api_port() -> u16 {
@@ -306,6 +328,10 @@ fn default_api_port() -> u16 {
 }
 fn default_api_model() -> String {
     "deepseek-v4-flash".into()
+}
+/// 侧边栏固定应用默认 trae（主应用与回退项）
+fn default_pinned_app() -> String {
+    "trae".into()
 }
 
 fn default_port() -> u16 {
@@ -326,6 +352,14 @@ fn default_retry() -> i32 {
 /// Trae 每日签到调度默认每日 09:00（环境配置页可改，schtasks 注册时间复用）
 fn default_trae_checkin_hhmm() -> String {
     "09:00".into()
+}
+/// 签到多账号间隔默认 3s（Trae/Buddy/Qoder 共用默认；防上游频控）
+fn default_checkin_gap_secs() -> u64 {
+    3
+}
+/// 签到间隔生效值：未配置按默认 3s，上限 clamp 600s（误填超大值防呆，0 合法 = 关闭）
+pub fn effective_checkin_gap(v: Option<u64>) -> u64 {
+    v.unwrap_or_else(default_checkin_gap_secs).min(600)
 }
 /// Trae JWT 续期调度默认每日 09:00（issue #27：剩余 <48h 惰性续期，每日一次为安全超集）
 fn default_jwt_renew_hhmm() -> String {
@@ -350,6 +384,10 @@ fn default_qoder_credits_sync_hhmm() -> String {
 }
 fn default_credits_sync_mode() -> String {
     "daily".into()
+}
+/// Trae 看板数据同步默认每小时（issue #61：积分快照 + 消耗明细随调度保持新鲜）
+fn default_trae_credits_sync_mode() -> String {
+    "hourly".into()
 }
 fn default_wb_credits_sync_hhmm() -> String {
     "23:30".into()
@@ -756,6 +794,11 @@ pub struct PoolStatus {
     pub cooling: bool,
     pub cooldown_until: Option<i64>,
     pub cooldown_reason: Option<String>,
+    /// hard_credit（积分耗尽）冷却中：until 次日 04:00 自动恢复探测（F-29 v1.2）。
+    /// cooling 仅覆盖 until 软冷却，此字段补齐硬冷却——否则积分耗尽账号在
+    /// 前端显示「就绪」却不可选（可观测盲点）
+    #[serde(default)]
+    pub hard_credit: bool,
     pub disabled: bool,
     pub err_count: i32,
     /// 账号五态机（T2.2/F-29 v1.2）：Available/QuotaProtection/RateLimited/Forbidden/ProxyDisabled

@@ -314,6 +314,12 @@ export interface Settings {
   qoder_token_renew_interval_hours: number;
   /** Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；Windows 计划任务注册时间复用该值） */
   trae_checkin_hhmm: string;
+  /** Trae 签到多账号间隔秒（默认 3s，环境配置页可改，0=关闭；防上游频控） */
+  trae_checkin_gap_secs: number | null;
+  /** WorkBuddy 签到/成长多账号间隔秒（默认 3s，任务配置页可改，0=关闭；两轮共用） */
+  wb_checkin_gap_secs: number | null;
+  /** Qoder 签到多账号间隔秒（默认 3s，任务配置页可改，0=关闭） */
+  qoder_checkin_gap_secs: number | null;
   /** Trae JWT 定时调度续期开关（issue #27，默认开：每日兜底续期临期账号） */
   jwt_renew_enabled: boolean;
   /** Trae JWT 续期调度触发时刻 HH:MM（默认 09:00，环境配置页可改） */
@@ -328,7 +334,7 @@ export interface Settings {
   wb_credits_sync_mode: string;
   /** Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻） */
   wb_credits_sync_hhmm: string;
-  /** Trae 积分数据同步模式：off | hourly | daily（默认） */
+  /** Trae 积分数据同步模式：off | hourly（默认）| daily */
   trae_credits_sync_mode: string;
   /** Trae 积分同步触发时刻 HH:MM（daily 模式生效，默认 23:40 对齐原快照时刻） */
   trae_credits_sync_hhmm: string;
@@ -357,6 +363,13 @@ export interface Settings {
   notify_webhook_url: string | null;
   /** Server酱 SendKey（空 = 关闭） */
   notify_serverchan_sendkey: string | null;
+  // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
+  /** 固定应用 key：始终显示在侧边栏且不可隐藏（单选，默认 'trae'） */
+  pinned_app: AppKey;
+  /** 侧边栏隐藏的应用 key 列表（空 = 全部显示；固定应用即使列入也强制显示） */
+  hidden_apps: AppKey[];
+  /** 侧边栏应用自定义图标（应用 key → 图标名，lib/appIcons.ts 候选表；缺失/非法回退内置默认图标） */
+  app_icons: Partial<Record<AppKey, string>>;
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */
@@ -555,6 +568,8 @@ export interface PoolStatus {
   cooling: boolean;
   cooldown_until: number | null;
   cooldown_reason: string | null;
+  /** 积分耗尽硬冷却中（次日 04:00 自动恢复探测；cooling 仅覆盖软冷却，旧后端未返回时为 undefined） */
+  hard_credit?: boolean;
   disabled: boolean;
   err_count: number;
   /** 账号实时在途并发数（F-77⑤ 可观测；旧后端未返回时为 undefined） */
@@ -920,6 +935,20 @@ export interface UpdateDownloadProgress {
   received: number;
   total: number;
   percent: number;
+}
+
+// ---- 指纹清洗规则表（wb_template_map KV；整体替换语义，保存即对下一请求生效）----
+// 规则：from → to 子串改写（contains + replace，无正则；from 必填唯一，to 可为空串=删除）
+export interface SanitizeRule {
+  from: string;
+  to: string;
+}
+
+// wb_template_map_get 返回：builtin=true 表示当前生效内置默认规则、尚无自定义副本
+export interface SanitizeMapView {
+  templates: SanitizeRule[];
+  updated_at: number | null;
+  builtin?: boolean;
 }
 
 // 下载完成后的安装包信息（update_download 返回，供「确认安装」使用）

@@ -217,6 +217,9 @@ pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_
         return Err(format!("账号不存在: {user_id}"));
     }
     save_pool(&state, &pool)?;
+    // P3-L：回收该账号的每账号刷新锁表项（对齐 qoder account_remove；
+    // 并发持有者的 Arc 由引用计数自然释放，语义不变）
+    crate::tasks::wb_common::refresh_lock_remove(&user_id);
     if delete_snapshot.unwrap_or(false) {
         // F2-2：双端快照槽对称清理——只清 WorkBuddy 会留下 CodeBuddy 孤儿槽，
         // 且账号列表徽标虽随池删除消失，孤儿目录持续占用磁盘。

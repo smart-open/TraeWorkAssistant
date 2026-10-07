@@ -4,7 +4,9 @@ import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
 import { api } from '../lib/tauri';
 import { THEMES } from '../lib/themes';
-import type { Settings as SettingsType } from '../types';
+import { APP_TABS } from './Sidebar';
+import { ICON_CHOICES, resolveAppIcon, DEFAULT_APP_ICONS } from '../lib/appIcons';
+import type { AppKey, Settings as SettingsType } from '../types';
 
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 代理相关配置。
@@ -25,6 +27,8 @@ export default function GeneralSettingsPanel() {
   const [autostartBusy, setAutostartBusy] = useState(false);
   // 通知渠道「发送测试」执行态
   const [testing, setTesting] = useState(false);
+  // 应用图标选择器：当前展开替换哪个应用的图标（null = 全部收起）
+  const [iconPickerFor, setIconPickerFor] = useState<AppKey | null>(null);
 
   const sendTest = async () => {
     setTesting(true);
@@ -75,6 +79,38 @@ export default function GeneralSettingsPanel() {
     setForm((prev) => (prev ? { ...prev, [key]: val } : prev));
   };
 
+  // 切换固定应用：新固定项强制从隐藏列表移除（始终可见、不可取消）
+  const setPinned = (key: AppKey) => {
+    setForm((prev) =>
+      prev ? { ...prev, pinned_app: key, hidden_apps: prev.hidden_apps.filter((a) => a !== key) } : prev,
+    );
+  };
+
+  // 勾选 = 显示（移出隐藏列表）；取消勾选 = 隐藏（加入隐藏列表）
+  const toggleAppVisible = (key: AppKey) => {
+    setForm((prev) =>
+      prev
+        ? {
+            ...prev,
+            hidden_apps: prev.hidden_apps.includes(key)
+              ? prev.hidden_apps.filter((a) => a !== key)
+              : [...prev.hidden_apps, key],
+          }
+        : prev,
+    );
+  };
+
+  // 设置应用图标：null 或与内置默认同名 = 删除自定义项（回退 APP_TABS 默认图标）
+  const setAppIcon = (key: AppKey, icon: string | null) => {
+    setForm((prev) => {
+      if (!prev) return prev;
+      const appIcons = { ...prev.app_icons };
+      if (!icon || icon === DEFAULT_APP_ICONS[key]) delete appIcons[key];
+      else appIcons[key] = icon;
+      return { ...prev, app_icons: appIcons };
+    });
+  };
+
   const save = async () => {
     if (!form) return;
     setSaving(true);
@@ -122,6 +158,137 @@ export default function GeneralSettingsPanel() {
           </div>
         </div>
       </section>
+
+      {/* 应用显示（侧边栏应用 Tab：固定应用单选 + 显示勾选 + 行首图标点击换图标） */}
+      <section className="card p-4">
+        <h3 className="mb-1 font-medium">应用显示</h3>
+        <p className="mb-3 text-xs text-slate-400">
+          控制左下角侧边栏显示哪些应用。「固定应用」始终显示且不可隐藏（默认 Trae）；其余应用可自由勾选。
+          隐藏仅收起入口，<b>不删除账号数据、不影响签到 / 保活等定时任务</b>，重新勾选即可恢复；
+          若当前正在浏览的应用被隐藏，会自动跳回固定应用。「侧边栏显示」行首的图标可点击更换应用图标。
+        </p>
+        <div className="grid gap-x-8 gap-y-2 sm:grid-cols-2">
+          <div className="space-y-2">
+            <label className="label">固定应用（始终显示）</label>
+            {APP_TABS.map((tab) => (
+              <label key={tab.key} className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="pinned-app"
+                  checked={form.pinned_app === tab.key}
+                  onChange={() => setPinned(tab.key)}
+                />
+                {tab.label}
+                {tab.title ? <span className="text-xs text-slate-400">（{tab.title}）</span> : null}
+              </label>
+            ))}
+          </div>
+          <div className="space-y-2">
+            <label className="label">侧边栏显示</label>
+            {APP_TABS.map((tab) => {
+              const pinned = form.pinned_app === tab.key;
+              const visible = pinned || !form.hidden_apps.includes(tab.key);
+              const customizedName = form.app_icons[tab.key];
+              const Current = resolveAppIcon(customizedName) ?? tab.icon;
+              return (
+                <div key={tab.key} className={`flex items-center gap-2 ${pinned ? 'opacity-60' : ''}`}>
+                  {/* 行首图标：点击弹出候选表更换该应用在侧边栏的显示图标（仅 UI 偏好） */}
+                  <button
+                    type="button"
+                    title={`更换「${tab.label}」图标${customizedName ? `（当前：${customizedName}）` : '（当前：默认）'}`}
+                    onClick={() => setIconPickerFor(tab.key)}
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-200 text-slate-600 transition hover:border-zinc-400 hover:text-zinc-800 active:scale-95 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-zinc-500 dark:hover:text-zinc-100"
+                  >
+                    <Current size={15} />
+                  </button>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={visible}
+                      disabled={pinned}
+                      onChange={() => toggleAppVisible(tab.key)}
+                    />
+                    {tab.label}
+                    {pinned ? <span className="text-xs text-slate-400">（固定应用，不可隐藏）</span> : null}
+                  </label>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
+      {/* 图标选择弹框：点「侧边栏显示」行首图标弹出，在候选表内选择；选后需点底部「保存设置」生效 */}
+      {iconPickerFor
+        ? (() => {
+            const tab = APP_TABS.find((t) => t.key === iconPickerFor)!;
+            const customizedName = form.app_icons[tab.key];
+            const selectedName = customizedName ?? DEFAULT_APP_ICONS[tab.key];
+            return (
+              <div
+                className="fixed inset-0 z-[60] flex items-center justify-center p-4"
+                onClick={() => setIconPickerFor(null)}
+              >
+                <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
+                <div
+                  className="card animate-fade-in relative z-10 w-full max-w-sm p-4 shadow-xl"
+                  role="dialog"
+                  aria-modal="true"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <h3 className="mb-1 text-sm font-semibold text-slate-800 dark:text-zinc-100">
+                    更换「{tab.label}」图标
+                  </h3>
+                  <p className="mb-3 text-xs text-slate-400">
+                    选择侧边栏显示图标，点底部「保存设置」生效；非法/缺失自动回退内置默认（{DEFAULT_APP_ICONS[tab.key]}）。
+                  </p>
+                  <div className="grid grid-cols-8 gap-1">
+                    {ICON_CHOICES.map((c) => {
+                      const Choice = c.icon;
+                      const selected = selectedName === c.name;
+                      return (
+                        <button
+                          key={c.name}
+                          type="button"
+                          title={c.name}
+                          onClick={() => {
+                            setAppIcon(tab.key, c.name);
+                            setIconPickerFor(null);
+                          }}
+                          className={`flex h-8 items-center justify-center rounded-md transition ${
+                            selected
+                              ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+                              : 'text-slate-600 hover:bg-slate-200 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                          }`}
+                        >
+                          <Choice size={16} />
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="mt-3 flex items-center justify-between">
+                    {customizedName ? (
+                      <button
+                        className="btn-outline !px-2.5 !py-1 text-xs"
+                        onClick={() => {
+                          setAppIcon(tab.key, null);
+                          setIconPickerFor(null);
+                        }}
+                      >
+                        <RotateCcw size={12} /> 恢复默认
+                      </button>
+                    ) : (
+                      <span className="text-xs text-slate-400">当前使用默认图标</span>
+                    )}
+                    <button className="btn-outline !px-2.5 !py-1 text-xs" onClick={() => setIconPickerFor(null)}>
+                      取消
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()
+        : null}
 
       {/* 通用与通知（两列布局：左选项/右开关组） */}
       <section className="card p-4">

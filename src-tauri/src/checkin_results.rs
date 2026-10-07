@@ -86,12 +86,34 @@ pub fn save(data_dir: &Path, results: &ResultsFile) {
 ///（表级 last-writer-wins）。持锁串行化保证同进程内不丢行
 static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 记录当日签到最终状态（签到完成后的 done 落库入口），随后写盘
+/// 记录当日签到最终状态（签到完成后的 done 落库入口），随后写盘。
+/// 跨进程互斥（审查修复）：GUI 与 schtasks CLI 双进程并发落库同此丢行问题，
+/// 命名互斥体串行化（对齐 wb_common/credits 锁语义）；抢锁失败降级仅进程内锁
+/// 继续写（SQLite 单事务写丢失窗口极小，落日志可查）
 pub fn record_today(
     data_dir: &Path,
     entries: impl IntoIterator<Item = (String, String, String)>,
 ) {
     let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+        data_dir,
+        "checkin",
+        "record_today",
+        3_000,
+    ) {
+        (Some(g), _) => Some(g),
+        (None, Some(fail)) => {
+            crate::fs_utils::app_log(
+                data_dir,
+                &format!(
+                    "[checkin_results] record_today 跨进程锁未获取：{}（降级进程内锁继续）",
+                    fail.describe()
+                ),
+            );
+            None
+        }
+        (None, None) => None,
+    };
     let mut f = load(data_dir);
     f.record_day(&today_key(), entries);
     save(data_dir, &f);

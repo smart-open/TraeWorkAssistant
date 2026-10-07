@@ -268,7 +268,7 @@ AI Work 助手 是一款桌面端（Windows / macOS）多账号管理一站式�
 
 ## 7. API 网关与资源调度
 
-应用内置统一的本地 API 网关（OpenAI / Anthropic 兼容，默认端口 7864）：网关级功能集中在**全局 API 管理**弹窗，Trae / Buddy 两份服务资源（账号池与模型目录）分别在各应用的**资源调度**页维护。
+应用内置统一的本地 API 网关（OpenAI / Anthropic 兼容，默认端口 7864）：网关级功能集中在**全局 API 管理**弹窗，Trae / Buddy / Qoder 三份服务资源（账号池与模型目录）分别在各应用的**资源调度**页维护。
 
 ### 7.1 全局 API 管理
 
@@ -276,12 +276,12 @@ AI Work 助手 是一款桌面端（Windows / macOS）多账号管理一站式�
 
 | Tab | 内容 |
 |-----|------|
-| 概览 | 服务启停与指标行（运行状态 / 总请求数 / 当前并发 / Key 数量）、目前资源（Trae / Buddy 双池摘要）、生态接入（CC Switch / Codex 统一条目注册） |
+| 概览 | 服务启停与指标行（运行状态 / 总请求数 / 当前并发 / Key 数量）、目前资源（Trae / Buddy / Qoder / 自定义 多池摘要）、生态接入（CC Switch / Codex 统一条目注册） |
 | 接口配置 | 监听端口、默认模型、局域网接入地址、使用示例、模型档位与 Max Mode 说明（端口改动下次启动服务后生效） |
 | API Keys 管理 | Key 新建 / 编辑 / 删除、日限额、调度配置（临期优先 / 专一） |
-| 用量统计 | 7 / 14 / 30 天窗口、资源池筛选（全部 / Trae / Buddy）、模型分布 Top 5 |
+| 用量统计 | 7 / 14 / 30 天窗口、资源池筛选（全部 / Trae / Buddy / Qoder / 自定义）、模型分布 Top 5 |
 
-> 生态接入只注册一个统一网关条目「AI Work 助手网关」，同时覆盖 Trae 与 Buddy 全部模型；历史双条目可在 CC Switch 中手动清理。
+> 生态接入只注册一个统一网关条目「AI Work 助手网关」，同时覆盖 Trae / Buddy / Qoder 全部模型；历史双条目可在 CC Switch 中手动清理。
 
 ### 7.2 Trae · 资源调度
 
@@ -339,14 +339,14 @@ response = client.chat.completions.create(
 
 #### 思考档位（Effort）
 
-网关将两池档位统一为六档：`minimal / low / medium / high / xhigh / max`。
+网关将多池档位统一为六档：`minimal / low / medium / high / xhigh / max`。
 
 - **传参方式**：OpenAI 兼容端点在请求体传 `reasoning_effort`；Anthropic 兼容端点（`/v1/messages`）传 `thinking` 参数
-- **按池映射**：Trae 池自动映射为三档 wire 值 `light / high / extra_high`（xhigh / max → extra_high，high → high，其余 → light）；Buddy 池按上游声明档位原样下发
-- **声明合并**：模型档位声明取 Trae / Buddy 双池并集（统一档位值）。Trae 侧暂无实证数据的模型（实证表外）若 Buddy 侧有声明，表中展示 Buddy 声明的统一档位
+- **按池映射**：Trae 池自动映射为三档 wire 值 `light / high / extra_high`（xhigh / max → extra_high，high → high，其余 → light）；Buddy 池按上游声明档位原样下发；Qoder 池按模型声明白名单直用，别名归一（minimal → low，high / max → xhigh），请求档位不受支持时回退该模型默认档
+- **声明合并**：模型档位声明取 Trae / Buddy / Qoder 多池并集（统一档位值）。Trae 侧暂无实证数据的模型（实证表外）若 Buddy / Qoder 侧有声明，表中展示其声明的统一档位
 - **填充默认**：Trae 实证表外模型显式请求档位时，按统一→Trae 映射填充默认下发（如请求 `xhigh` 下发 `extra_high`）；未显式请求时不下发，走上游默认
 - **默认行为**：未显式传档位时默认注入 `high`（默认深度思考，可在 Buddy · 资源调度「资源开关」中关闭；仅对 Trae 已实证模型生效）
-- **查看**：`GET /v1/models` 返回的 `efforts` / `supported_efforts` 字段（统一档位空间）；「API 使用帮助」与两池模型目录页亦可查看
+- **查看**：`GET /v1/models` 返回的 `efforts` / `supported_efforts` 字段（统一档位空间）；「API 使用帮助」与 Trae / Buddy 模型目录页亦可查看
 
 #### Max Mode（Trae 池 1M 上下文）
 

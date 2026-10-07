@@ -766,24 +766,14 @@ fn try_exchange_variant(
 
     // 火山引擎标准信封（2026-09-16 实测）：错误 ResponseMetadata.Error.{Code,Message,
     // StandardCode}；成功 ResponseMetadata + Result.{...}（对照 GetPCAuthCode 形态）
-    let err_code = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Code"])
-        .map(|v| {
-            v.as_i64()
-                .map(|n| n.to_string())
-                .or_else(|| v.as_str().map(|s| s.to_string()))
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    if !err_code.is_empty() && err_code != "0" {
-        let err_msg = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Message"])
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let std_code = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "StandardCode"])
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        return Err(format!("code={err_code}/{}: {}", std_code, if err_msg.is_empty() { "未知错误" } else { &err_msg }));
+    if let Some((code, msg, std_code)) = volcano_error(&body) {
+        if code != "0" {
+            return Err(format!(
+                "code={code}/{}: {}",
+                std_code,
+                if msg.is_empty() { "未知错误" } else { &msg }
+            ));
+        }
     }
     // 兼容旧解析（顶层 code/message 形态）
     let code_val = body.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -827,6 +817,56 @@ fn try_exchange_variant(
             Err("响应中未找到 AccessToken/RefreshToken 字段（键路径已记入 app.log）".to_string())
         }
     }
+}
+
+/// 火山引擎信封错误解析（2026-09-16 实测形态）：
+/// `ResponseMetadata.Error.{Code,Message,StandardCode}`。
+///
+/// 定级红线（2026-10-06 缺陷修复）：`fs_utils::dig()` 是「按候选键名全树查找」而
+/// **不是路径遍历**——写成 `dig(&body, &["ResponseMetadata", "Error", "Code"])` 时
+/// 第一个键就命中 `ResponseMetadata` 对象，`as_i64()/as_str()` 双双 None → 字符串化
+/// 得空串 → 判定 `!err_code.is_empty()` 恒假，**整个信封分支是死代码**。实测后果：
+/// 20101（refresh token is invalid）被降级成「响应中未找到 AccessToken 字段」，并按
+/// 「网络类，不计失效」计数，失效凭证永不置 `refresh_token_invalid`（既不提示重新
+/// 登录，也不触发本地登录态恢复）。
+///
+/// 现改为两段式：先用 `dig` 按候选键名定位 `Error` 对象（兼容被 data/result 等任意
+/// 包裹键包一层、或直接挂在顶层），再对 Error 对象逐字段严格取值。
+/// 返回 `(code, message, standard_code)`；无信封或 Code 缺失时返回 None。
+fn volcano_error(body: &serde_json::Value) -> Option<(String, String, String)> {
+    let err = body
+        .get("Error")
+        .or_else(|| crate::fs_utils::path(body, &["ResponseMetadata", "Error"]))
+        .or_else(|| crate::fs_utils::dig(body, &["Error"]))?;
+    let code = err
+        .get("Code")
+        .map(|v| {
+            v.as_i64()
+                .map(|n| n.to_string())
+                .or_else(|| v.as_str().map(|s| s.trim().to_string()))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    if code.is_empty() {
+        return None;
+    }
+    let field = |key: &str| -> String {
+        err.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    Some((code, field("Message"), field("StandardCode")))
+}
+
+/// refresh_token 失效判定：仅 `20101`（StandardCode 040012，Message
+/// 「Token 无效：refresh token is invalid.」）是服务端对 refresh_token 的**明确否定**，
+/// 采纳为 `server_rejected=true`（立即置 invalid + 停止逐变体探测）；其余信封码
+/// （20403/20405 等设备与协议级问题）凭证可能仍有效，不当失效处理。
+/// Message 兜底匹配大小写不敏感，防上游改码不改语义。
+fn refresh_token_rejected(code: &str, message: &str) -> bool {
+    code == "20101" || message.to_ascii_lowercase().contains("refresh token is invalid")
 }
 
 /// 脱敏红线（仅打码值不删结构）：键名含 token/jwt/secret/password/authcode/code/credential
@@ -1084,23 +1124,23 @@ fn try_refresh_variant(
         fs_utils::app_log(data_dir, &format!("[OAuth刷新-响应:{tag}] {masked}"));
     }
 
-    // 火山信封错误：协议级失败（可能是 DeviceProof/设备问题），继续探测下一变体
-    let err_code = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Code"])
-        .map(|v| {
-            v.as_i64()
-                .map(|n| n.to_string())
-                .or_else(|| v.as_str().map(|s| s.to_string()))
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    if !err_code.is_empty() && err_code != "0" {
-        let err_msg = crate::fs_utils::dig(&body, &["ResponseMetadata", "Error", "Message"])
-            .and_then(|v| v.as_str())
-            .unwrap_or("未知错误");
-        return Err(RefreshExchangeError {
-            msg: format!("code={err_code}: {err_msg}"),
-            server_rejected: false,
-        });
+    // 火山信封错误分流（2026-10-06 缺陷修复）：
+    // - 20101（refresh token is invalid）= 服务端对凭证的明确否定 → 采纳为 rejected，
+    //   立即置 invalid 并停止逐变体探测（旧实现在此处恒不成立，见 volcano_error 注释）；
+    // - 其余（20403 Device not match / 20405 Device proof required 等）属设备/协议级失败，
+    //   凭证可能仍有效 → rejected=false，继续探测下一变体。
+    if let Some((code, msg, std_code)) = volcano_error(&body) {
+        if code != "0" {
+            let rejected = refresh_token_rejected(&code, &msg);
+            return Err(RefreshExchangeError {
+                msg: format!(
+                    "code={code}/{}: {}",
+                    std_code,
+                    if msg.is_empty() { "未知错误" } else { &msg }
+                ),
+                server_rejected: rejected,
+            });
+        }
     }
     // 旧形态数字 code：唯一可信的「服务端明确拒绝」信号（B 判定收窄——
     // 无 code 字段的异构响应不再被 unwrap_or(-1) 误判为拒绝）
@@ -1312,4 +1352,74 @@ pub fn oauth_login(
         refresh_token: final_refresh_token,
         has_refresh_token: true,
     })
+}
+
+#[cfg(test)]
+mod oauth_tests {
+    use super::*;
+
+    /// 定级回归（2026-10-06 缺陷）：app.log 实测响应形态必须被识别为 code=20101，
+    /// 且判为「服务端明确拒绝」——旧实现对同一响应恒判「无 Error 信封」，
+    /// 失效凭证被记成「网络类不计失效」，永不置 refresh_token_invalid。
+    #[test]
+    fn volcano_error_reads_response_metadata_envelope() {
+        let body = serde_json::json!({
+            "ResponseMetadata": {
+                "Action": "",
+                "Error": {
+                    "Code": "20101",
+                    "Data": {"__Message.error": "refresh token is invalid"},
+                    "Message": "Token 无效：refresh token is invalid.",
+                    "StandardCode": "040012"
+                },
+                "RequestId": "",
+                "TraceID": "00000000000000000000000000000000"
+            }
+        });
+        let (code, msg, std_code) = volcano_error(&body).expect("信封必须被识别");
+        assert_eq!(code, "20101");
+        assert_eq!(std_code, "040012");
+        assert!(refresh_token_rejected(&code, &msg));
+    }
+
+    /// 数字形态 code（部分端点返回 i64 而非字符串）同样识别；
+    /// 且设备/协议级错误码不得判为凭证失效（凭证可能仍有效，应继续探测下一变体）
+    #[test]
+    fn volcano_error_accepts_numeric_code_without_credential_rejection() {
+        let body = serde_json::json!({
+            "ResponseMetadata": {"Error": {"Code": 20403, "Message": "Token device not match."}}
+        });
+        let (code, msg, _) = volcano_error(&body).expect("信封必须被识别");
+        assert_eq!(code, "20403");
+        assert!(!refresh_token_rejected(&code, &msg));
+    }
+
+    /// 顶层 Error / 信封键包裹的 Error 均可识别（抗包裹层变动）
+    #[test]
+    fn volcano_error_tolerates_wrapping() {
+        let flat = serde_json::json!({"Error": {"Code": "20101", "Message": "refresh token is invalid"}});
+        assert_eq!(volcano_error(&flat).map(|(c, _, _)| c), Some("20101".to_string()));
+        let wrapped = serde_json::json!({"data": {"Error": {"Code": "20101"}}});
+        assert_eq!(volcano_error(&wrapped).map(|(c, _, _)| c), Some("20101".to_string()));
+    }
+
+    /// 成功信封不得误判为失败；code=0 由调用方按「非 0 才算错误」过滤
+    #[test]
+    fn volcano_error_ignores_success_envelope() {
+        let ok = serde_json::json!({
+            "ResponseMetadata": {"Action": ""},
+            "Result": {"Token": "x", "RefreshToken": "y"}
+        });
+        assert!(volcano_error(&ok).is_none());
+        let zero = serde_json::json!({"ResponseMetadata": {"Error": {"Code": "0"}}});
+        assert_eq!(volcano_error(&zero).map(|(c, _, _)| c), Some("0".to_string()));
+    }
+
+    /// Message 兜底匹配（上游改码不改语义）：大小写不敏感命中「refresh token is invalid」
+    #[test]
+    fn refresh_token_rejected_matches_message_case_insensitively() {
+        assert!(refresh_token_rejected("99999", "Token Invalid: Refresh Token Is Invalid."));
+        assert!(!refresh_token_rejected("20405", "Device proof required."));
+        assert!(!refresh_token_rejected("0", ""));
+    }
 }

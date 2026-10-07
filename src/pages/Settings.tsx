@@ -433,6 +433,24 @@ export default function Settings() {
               每天 {form.trae_checkin_hhmm || '09:00'} 执行（应用关闭期间不执行）
             </span>
           </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <label className="label !mb-0">账号间隔</label>
+            <input
+              type="number"
+              min={0}
+              max={600}
+              value={form.trae_checkin_gap_secs ?? 3}
+              onChange={(e) => {
+                if (e.target.value === '') return; // 清空输入中间态不落值
+                const n = Math.min(600, Math.max(0, Math.floor(Number(e.target.value))));
+                update('trae_checkin_gap_secs', Number.isFinite(n) ? n : 3);
+              }}
+              className="input h-9 !w-24 text-sm"
+            />
+            <span className="text-xs text-slate-400">
+              秒（多账号串行签到的间隔，默认 3 秒防频控，0 = 关闭）
+            </span>
+          </div>
           <div className={`mt-3 flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
             <button onClick={register} disabled={busyTask} className="btn-outline">
               <Calendar size={15} /> {busyTask ? '注册中…' : '注册任务'}
@@ -461,7 +479,7 @@ export default function Settings() {
           {/* 积分数据同步：应用内置调度器（模式/时刻随底部「保存设置」生效） */}
           <h3 className="mb-1 font-medium">积分数据同步</h3>
           <p className="mb-3 text-xs text-slate-400">
-            应用运行期间按所选模式自动拉取账号积分并刷新看板（含积分快照与到期数据）；无账号时静默跳过，
+            应用运行期间按所选模式自动拉取账号积分并刷新看板（含积分快照、到期数据与消耗明细）；无账号时静默跳过，
             失败 30 分钟后自动重试。模式与时刻随底部「保存设置」生效。
           </p>
           <div className="flex flex-wrap items-center gap-2">

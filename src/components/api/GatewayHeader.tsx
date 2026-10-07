@@ -95,7 +95,7 @@ export default function GatewayHeader() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
           <p className="text-sm font-medium text-slate-800 dark:text-zinc-100">
-            OpenAI / Anthropic 兼容接口，通过 Trae / Buddy 资源池智能调度实现多账号负载均衡
+            OpenAI / Anthropic 兼容接口，通过 Trae / Buddy / Qoder 资源池智能调度实现多账号负载均衡
           </p>
           <p className="mt-0.5 break-all text-xs text-slate-400 dark:text-zinc-500">
             统一网关 127.0.0.1:{status?.port ?? 7864}

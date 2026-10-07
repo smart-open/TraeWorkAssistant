@@ -12,7 +12,7 @@ Windows / macOS 双平台多账号签到与管理一站式工作台 · Tauri 2 +
 
 ![AI Work 助手](./docs/images/main.png)
 
-> 深度支持 **Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包** 五应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + 自定义模型三池调度）、6 层设备标识重置等；Trae 双应用同一账号体系可分别切换，WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份。**macOS 版已可用**（Apple Silicon + Intel dmg；部分 Windows 专属域按平台灰度，详见下方 macOS 说明）。后续规划扩展更多 AI 应用。
+> 深度支持 **Trae Work / Trae（Trae CN IDE）/ WorkBuddy / CodeBuddy / 豆包 / Qoder** 六应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + Qoder + 自定义模型四池调度）、6 层设备标识重置等；Trae 双应用同一账号体系可分别切换，WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份，Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池、每日双活动签到与网关上游接入（当前仅 CN 区）。**macOS 版已可用**（Apple Silicon + Intel dmg；部分 Windows 专属域按平台灰度，详见下方 macOS 说明）。后续规划扩展更多 AI 应用。
 >
 > ⚠️ 本工具与 Trae Work / WorkBuddy / 豆包等官方均无任何关联，仅供学习研究。使用本工具可能违反相关服务条款，风险自担。请仅管理本人合法持有的账号。
 
@@ -24,7 +24,7 @@ Windows / macOS 双平台多账号签到与管理一站式工作台 · Tauri 2 +
 
 ## 版本与分支
 
-- **v3.x 新版本线（默认分支）**：产品为「AI Work 助手」，支持 Trae Work / Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包多应用；新版本自 **3.0.0** 起开始维护。
+- **v3.x 新版本线（默认分支）**：产品为「AI Work 助手」，支持 Trae Work / Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包 / Qoder 多应用；新版本自 **3.0.0** 起开始维护。
 - **原「Trae Work 助手」产品**：通过 **`trae_work_main`** 分支维护，仅支持 Trae Work 单应用，版本停留在 **2.x.x**，仅做必要修复、不再新增功能。
 - **macOS 产品分支（`macos_main`）**：macOS 平台支持的产品化分支——Windows 主线（`main`）功能持续合并对齐，mac 安装包（aarch64 / x64 / universal 三个 dmg）由 GitHub Actions `build-macos.yml` 在 push `macos_main` 时构建发布，与 Windows 随 3.6.x 同步发版。
 - **Docker 简化分支（`docker_main`）**：Web-only Docker 版（独立版本线 1.x）——单进程 `aiwork-server`（管理 REST + OpenAI 兼容网关 + 定时调度 + 浏览器 UI，`docker compose up` 一键部署），裁剪桌面壳 / MITM 抓包 / 账号切换 / 豆包等桌面专属功能，账号经 OAuth 录入或桌面导出导入。
@@ -45,15 +45,15 @@ Windows / macOS 双平台多账号签到与管理一站式工作台 · Tauri 2 +
 
 ## 功能
 
-- **账号管理**：多账号录入/编辑/OAuth 登录（含 WorkBuddy 扫码）、分组管理、设备 ID 隔离、**本机双应用（Trae Work / Trae）账号自动发现**、WorkBuddy/CodeBuddy auth 文件扫描入池、豆包抓包凭证回写
-- **登录态切换**：按目标应用独立切换——保存当前登录态 → 恢复目标账号 → 启动；Trae 系精准备份 9 类核心文件，豆包 chromium 布局含快照版本校验 + 单代回滚 + 防误覆盖守卫，WorkBuddy/CodeBuddy authfile 布局；支持「一键以账号打开」
-- **一键签到**：批量签到、按分组/手动勾选、跳过已签/过期、实时进度；WorkBuddy 成长中心自动化（旅行/盲盒/任务领奖）；豆包/WorkBuddy 定时保活与续期
-- **积分看板**：排行、三线趋势图、今日新增统计；WorkBuddy 积分三件套 + 官方用量 + 本地 Token 统计（缓存命中率/热力图）+ 到期日历
+- **账号管理**：多账号录入/编辑/OAuth 登录（含 WorkBuddy 扫码、Qoder OAuth 设备流 / PAT 导入）、分组管理、设备 ID 隔离、**本机双应用（Trae Work / Trae）账号自动发现**、WorkBuddy/CodeBuddy auth 文件扫描入池、豆包抓包凭证回写、Qoder IDE 登录态扫描入池
+- **登录态切换**：按目标应用独立切换——保存当前登录态 → 恢复目标账号 → 启动；Trae 系精准备份 9 类核心文件，豆包 chromium 布局含快照版本校验 + 单代回滚 + 防误覆盖守卫，WorkBuddy/CodeBuddy authfile 布局，Qoder 快照恢复自动注入账号绑定设备指纹；支持「一键以账号打开」
+- **一键签到**：批量签到、按分组/手动勾选、跳过已签/过期、实时进度；WorkBuddy 成长中心自动化（旅行/盲盒/任务领奖）；Qoder 每日双活动（签到 + 登录奖励）与档期月历；豆包/WorkBuddy 定时保活与续期
+- **积分看板**：Trae / Buddy / Qoder 三平台统一看板（KPI / 趋势 / 日热度 / 到期日历互不混装）；排行、三线趋势图、今日新增统计；WorkBuddy 积分三件套 + 官方用量 + 本地 Token 统计（缓存命中率/热力图）；Qoder 积分包逐包明细
 - **本地代理**：MITM 代理自动捕获 JWT / 豆包凭证、注入独立设备 ID；**自动串联已有系统代理（VPN）作为上游**，停止时原样还原系统代理
-- **API 网关**：内嵌 OpenAI / Anthropic / Codex Responses 三协议兼容 API 服务——Trae 账号池 + WorkBuddy 池 + 自定义 OpenAI 兼容模型三池调度（smart 智能策略/优先级/模型级覆盖）、会话粘性、ck_ 子 Key、四段模型路由、审核指纹清洗、生图双端点、web_search 工具代执行
-- **定时任务**：Windows 计划任务 + 应用内调度器双轨，后台自动签到 / 保活 / 续期 / 额度巡检
+- **API 网关**：内嵌 OpenAI / Anthropic / Codex Responses 三协议兼容 API 服务——Trae 账号池 + WorkBuddy 池 + Qoder 池 + 自定义 OpenAI 兼容模型四池调度（smart 智能策略/优先级/模型级覆盖、每池独立开关与调度参数）、会话粘性、慢请求竞速对冲、指纹清洗、`ck_` 子 Key、四段模型路由、生图双端点、web_search 工具代执行
+- **定时任务**：Windows 计划任务 + 应用内调度器双轨，后台自动签到 / 保活 / 续期 / 额度巡检 / 模型目录同步
 - **6 层设备标识重置**：machineid / storage.json 遥测 / aha.device / 注册表 MachineGuid / webview 追踪数据 / aha TinyStorage
-- **快照管理**：查看/备份/恢复/删除账号登录态快照（各应用独立管理）；豆包/WorkBuddy 对话数据独立备份恢复与导出
+- **快照管理**：查看/备份/恢复/删除账号登录态快照（各应用独立管理）；豆包/WorkBuddy 对话数据独立备份恢复与导出；Qoder / Trae 账号池加密导入导出
 - **暗色模式**：6 套主题，图表动态适配
 - **数据全部本地存储**，不上传任何服务器
 
@@ -67,7 +67,9 @@ node scripts/rename_release.mjs     # 安装包统一输出到 release/，命名
 node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x64_portable.zip）
 ```
 
-前置：Node.js 18+、Rust 1.75+、WebView2 Runtime、VS Build Tools (C++)
+前置：Node.js 18+、Rust 1.85+（`Cargo.toml` rust-version）、WebView2 Runtime、VS Build Tools (C++)
+
+测试：`cargo test`（Rust 单测）、`npm run test`（vitest 前端）、`npx tsc --noEmit`（类型检查）
 
 macOS（F-75，Apple Silicon + Intel）：
 
@@ -110,7 +112,7 @@ macOS 版为 **ad-hoc 签名**（暂未购买 Developer ID 公证），首次打
 │   └── vault_key.bin
 ├── data/
 │   ├── aiwork.sqlite            # 全量状态库（账号 / 分组 / 积分 / 设备映射 / 签到结果 /
-│   │                            #   API 池与 Key / 模型目录 / 用量统计 / WorkBuddy / 豆包状态）
+│   │                            #   API 池与 Key / 模型目录 / 用量统计 / WorkBuddy / 豆包 / Qoder 状态）
 │   ├── backup/                  # 首次升级时旧版 JSON 数据自动迁入 SQLite 后的备份
 │   ├── certs/                   # 自签 CA 证书
 │   ├── profiles*/               # 各应用登录态快照（按账号 ID 分目录 + .bak 单代回滚）

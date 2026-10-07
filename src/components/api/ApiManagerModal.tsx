@@ -15,10 +15,11 @@ import InterfaceConfig from './InterfaceConfig';
 import ApiKeysManager from './ApiKeysManager';
 import CustomModelsPanel from './CustomModelsPanel';
 import EcoAccess from './EcoAccess';
+import FingerprintSanitizePanel from './FingerprintSanitizePanel';
 import ResourceSummary from './ResourceSummary';
 import UsageStatsPanel from './UsageStatsPanel';
 
-type TabKey = 'overview' | 'config' | 'keys' | 'usage' | 'custom' | 'eco';
+type TabKey = 'overview' | 'config' | 'keys' | 'usage' | 'custom' | 'eco' | 'sanitize';
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
@@ -27,6 +28,7 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: 'usage', label: '用量统计' },
   { key: 'custom', label: '自定义模型' },
   { key: 'eco', label: '生态接入' },
+  { key: 'sanitize', label: '指纹清洗' },
 ];
 
 export default function ApiManagerModal() {
@@ -92,6 +94,7 @@ export default function ApiManagerModal() {
           <CustomModelsPanel onSubModalChange={(v) => { subOpenRef.current = v; }} />
         )}
         {tab === 'eco' && <EcoAccess />}
+        {tab === 'sanitize' && <FingerprintSanitizePanel />}
       </div>
     </Modal>
   );

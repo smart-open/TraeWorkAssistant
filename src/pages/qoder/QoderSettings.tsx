@@ -28,6 +28,7 @@ export default function QoderSettings() {
   const [idePath, setIdePath] = useState('');
   const [workPath, setWorkPath] = useState('');
   const [checkinHhmm, setCheckinHhmm] = useState('10:15');
+  const [checkinGap, setCheckinGap] = useState(3);
   const [creditsHhmm, setCreditsHhmm] = useState('23:40');
   const [creditsSyncEnabled, setCreditsSyncEnabled] = useState(true);
   const [tokenRenewEnabled, setTokenRenewEnabled] = useState(true);
@@ -73,6 +74,7 @@ export default function QoderSettings() {
     idePath: '',
     workPath: '',
     checkinHhmm: '10:15',
+    checkinGap: 3,
     creditsHhmm: '23:40',
     creditsSyncEnabled: true,
     tokenRenewEnabled: true,
@@ -86,6 +88,7 @@ export default function QoderSettings() {
       idePath === s.idePath &&
       workPath === s.workPath &&
       checkinHhmm === s.checkinHhmm &&
+      checkinGap === s.checkinGap &&
       creditsHhmm === s.creditsHhmm &&
       creditsSyncEnabled === s.creditsSyncEnabled &&
       tokenRenewEnabled === s.tokenRenewEnabled &&
@@ -95,6 +98,7 @@ export default function QoderSettings() {
       idePath: settings.qoder_ide_path ?? '',
       workPath: settings.qoderwork_path ?? '',
       checkinHhmm: settings.qoder_checkin_hhmm || '10:15',
+      checkinGap: settings.qoder_checkin_gap_secs ?? 3,
       creditsHhmm: settings.qoder_credits_sync_hhmm || '23:40',
       creditsSyncEnabled: settings.qoder_credits_sync_enabled ?? true,
       tokenRenewEnabled: settings.qoder_token_renew_enabled ?? true,
@@ -103,6 +107,7 @@ export default function QoderSettings() {
     setIdePath(next.idePath);
     setWorkPath(next.workPath);
     setCheckinHhmm(next.checkinHhmm);
+    setCheckinGap(next.checkinGap);
     setCreditsHhmm(next.creditsHhmm);
     setCreditsSyncEnabled(next.creditsSyncEnabled);
     setTokenRenewEnabled(next.tokenRenewEnabled);
@@ -141,6 +146,7 @@ export default function QoderSettings() {
             qoder_ide_path: idePath.trim() || null,
             qoderwork_path: workPath.trim() || null,
             qoder_checkin_hhmm: checkinHhmm.trim(),
+            qoder_checkin_gap_secs: checkinGap,
             qoder_credits_sync_hhmm: creditsHhmm.trim(),
             qoder_credits_sync_enabled: creditsSyncEnabled,
             qoder_token_renew_enabled: tokenRenewEnabled,
@@ -157,6 +163,7 @@ export default function QoderSettings() {
         idePath: idePath.trim(),
         workPath: workPath.trim(),
         checkinHhmm: checkinHhmm.trim(),
+        checkinGap,
         creditsHhmm: creditsHhmm.trim(),
         creditsSyncEnabled,
         tokenRenewEnabled,
@@ -364,6 +371,24 @@ export default function QoderSettings() {
             <div className="mb-2 text-xs text-slate-400">
               应用内调度器到点自动执行（默认 10:15，同时覆盖「0 点签到」与「10:00 登录奖励」双活动），
               应用启动时自动补跑当日已过时刻；执行时刻随下方输入框保存后生效。
+            </div>
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <span className="text-xs font-medium text-slate-500">账号间隔</span>
+              <input
+                type="number"
+                min={0}
+                max={600}
+                value={checkinGap}
+                onChange={(e) => {
+                  if (e.target.value === '') return; // 清空输入中间态不落值
+                  const n = Math.min(600, Math.max(0, Math.floor(Number(e.target.value))));
+                  setCheckinGap(Number.isFinite(n) ? n : 3);
+                }}
+                className="input h-9 !w-20 text-sm"
+              />
+              <span className="text-xs text-slate-400">
+                秒（多账号串行签到的间隔，默认 3 秒防频控，0 = 关闭）
+              </span>
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>

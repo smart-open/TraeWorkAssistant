@@ -186,6 +186,8 @@ function TaskConfigCard({
   setCreditsForm,
   checkinHhmm,
   setCheckinHhmm,
+  checkinGap,
+  setCheckinGap,
 }: {
   settings: WorkBuddySettings | null;
   patch: (p: Partial<WorkBuddySettings>) => void;
@@ -195,6 +197,8 @@ function TaskConfigCard({
   setCreditsForm: (f: { mode: string; hhmm: string }) => void;
   checkinHhmm: string;
   setCheckinHhmm: (v: string) => void;
+  checkinGap: number;
+  setCheckinGap: (v: number) => void;
 }) {
   const pushToast = useAppStore((s) => s.pushToast);
   // F-75 M2-2.4：schtasks 注册与 UI 点击兜底入口按平台标志隐藏
@@ -393,6 +397,25 @@ function TaskConfigCard({
           />
           <span className="text-xs text-slate-400">
             每天 {checkinHhmm || '09:10'} 自动签到；当天已过该时刻，下次启动应用会自动补跑
+          </span>
+        </div>
+        {/* 多账号签到/成长间隔（wb_checkin_gap_secs 存 app Settings，随「保存配置」统一提交；两轮共用） */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-slate-500">账号间隔</span>
+          <input
+            type="number"
+            min={0}
+            max={600}
+            value={checkinGap}
+            onChange={(e) => {
+              if (e.target.value === '') return; // 清空输入中间态不落值
+              const n = Math.min(600, Math.max(0, Math.floor(Number(e.target.value))));
+              setCheckinGap(Number.isFinite(n) ? n : 3);
+            }}
+            className="input h-9 !w-20 text-sm"
+          />
+          <span className="text-xs text-slate-400">
+            秒（多账号串行签到/成长的间隔，默认 3 秒防频控，0 = 关闭）
           </span>
         </div>
         {/* 定时任务（F-16；schtasks 仅 Windows，mac 隐藏——自动签到 + 启动补签已覆盖） */}
@@ -613,8 +636,9 @@ export default function BuddySettings() {
   const [growthForm, setGrowthForm] = useState({ enabled: true, hhmm: '09:00' });
   // 积分与 Token 同步表单（wb_credits_sync_mode/hhmm 存 app Settings，随「保存配置」统一提交）
   const [creditsForm, setCreditsForm] = useState({ mode: 'daily', hhmm: '23:30' });
-  // 每日签到调度时刻（wb_checkin_hhmm 存 app Settings，随「保存配置」统一提交）
+  // 每日签到调度时刻与多账号间隔（wb_checkin_hhmm/gap_secs 存 app Settings，随「保存配置」统一提交）
   const [checkinHhmm, setCheckinHhmm] = useState('09:10');
+  const [checkinGap, setCheckinGap] = useState(3);
   const [detecting, setDetecting] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const prefilled = useRef(false);
@@ -672,6 +696,7 @@ export default function BuddySettings() {
       hhmm: appSettings.wb_credits_sync_hhmm || '23:30',
     });
     setCheckinHhmm(appSettings.wb_checkin_hhmm || '09:10');
+    setCheckinGap(appSettings.wb_checkin_gap_secs ?? 3);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appSettings, locWbDone, locCbDone, locWb, locCb, env]);
 
@@ -691,6 +716,7 @@ export default function BuddySettings() {
         wb_credits_sync_mode: creditsForm.mode,
         wb_credits_sync_hhmm: creditsForm.hhmm.trim() || '23:30',
         wb_checkin_hhmm: checkinHhmm.trim() || '09:10',
+        wb_checkin_gap_secs: checkinGap,
       });
       pushToast('success', '配置已保存');
       await refresh();
@@ -883,6 +909,8 @@ export default function BuddySettings() {
           setCreditsForm={setCreditsForm}
           checkinHhmm={checkinHhmm}
           setCheckinHhmm={setCheckinHhmm}
+          checkinGap={checkinGap}
+          setCheckinGap={setCheckinGap}
         />
       </div>
     </div>

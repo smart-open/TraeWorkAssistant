@@ -187,8 +187,23 @@ const ENVELOPE_KEYS: [&str; 7] = ["data", "result", "resp", "response", "info", 
 const DIG_MAX_DEPTH: usize = 8;
 
 /// 在 `v` 中按顺序查找 keys 中的任一键，返回第一个命中值。
+/// **语义红线**：keys 是「同义键名候选」（任一命中即可），不是路径。
+/// 需要固定嵌套层级取值时用 [`path`]，否则只会返回第一个命中的**容器对象**
+/// （如 `dig(&body, &["ResponseMetadata", "Error", "Code"])` 命中的是
+/// `ResponseMetadata` 对象本身，「信封错误码」判定会恒不成立）。
 pub fn dig<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a serde_json::Value> {
     keys.iter().find_map(|k| dig_key(v, k, 0))
+}
+
+/// 严格路径取值：按 `keys` 逐段下钻（不做全树搜索、不沿包裹键跳层），
+/// 任一段缺失即返回 None。用于「确有固定嵌套层级」的字段
+/// （如火山信封 `ResponseMetadata.Error.Code`）。
+pub fn path<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a serde_json::Value> {
+    let mut cur = v;
+    for k in keys {
+        cur = cur.get(*k)?;
+    }
+    Some(cur)
 }
 
 fn dig_key<'a>(v: &'a serde_json::Value, key: &str, depth: usize) -> Option<&'a serde_json::Value> {
@@ -237,6 +252,31 @@ mod tests {
         assert!(ensure_uid_safe("a/b").is_err());
         assert!(ensure_uid_safe(r"a\b").is_err());
         assert!(ensure_uid_safe("qd-443681d83879.bak/../../etc").is_err());
+    }
+
+    /// 定级回归（2026-10-06）：`path` 逐段严格下钻，`dig` 是「候选键名」全树查找。
+    /// 路径式误用 dig 只会命中第一个键所在的容器对象（字符串化得空串）——
+    /// 火山信封判定曾因此整段失效，此处以单测锁定两者语义差异。
+    #[test]
+    fn path_walks_literally_while_dig_searches_candidate_keys() {
+        let v = serde_json::json!({
+            "ResponseMetadata": {"Error": {"Code": "20101", "Message": "refresh token is invalid"}}
+        });
+        assert_eq!(
+            path(&v, &["ResponseMetadata", "Error", "Code"]).and_then(|x| x.as_str()),
+            Some("20101")
+        );
+        // dig 命中 ResponseMetadata 对象本身 → as_str() 为 None（非字符串）
+        assert!(dig(&v, &["ResponseMetadata", "Error", "Code"]).and_then(|x| x.as_str()).is_none());
+        assert!(dig(&v, &["ResponseMetadata"]).map(|x| x.is_object()).unwrap_or(false));
+        // 路径首段不存在时不沿包裹键跳层（严格语义）
+        assert!(path(&v, &["Error", "Code"]).is_none());
+        // 数字 code 经 path 取值同样可用
+        let n = serde_json::json!({"ResponseMetadata": {"Error": {"Code": 20403}}});
+        assert_eq!(
+            path(&n, &["ResponseMetadata", "Error", "Code"]).and_then(|x| x.as_i64()),
+            Some(20403)
+        );
     }
 }
 

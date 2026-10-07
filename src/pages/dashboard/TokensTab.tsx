@@ -25,7 +25,9 @@ import type { PlatformScope } from './KpiRow';
  * ① 总 Token 统计卡（总/输入/输出/缓存命中率）② Token 与调用趋势（双轴堆叠柱 + 调用虚线）
  * ③ 模型消耗排行 ④ 年度活动热力图。
  * 三源（口径不同，独立展示不合并）：
- * 本地 = workbuddy_token_stats（365 天，WB/CodeBuddy 客户端会话）；
+ * 本地 = workbuddy_token_stats（365 天，WorkBuddy 桌面端会话 `~/.workbuddy/projects` +
+ *        CodeBuddy CLI `~/.codebuddy/projects` + CodeBuddy IDE 会话索引 requests[]
+ *        `%LOCALAPPDATA%\CodeBuddyExtension\Data\`；未走本地记录的流量仍由「API网关」源单列）；
  * API 网关 = api_usage_stats / api_wb_usage_stats（90 天，代理转发口径；custom 池仅 API 服务页展示）；
  * 官网 = Trae usage_history token 字段（365 天）；Buddy 官网无按日 token 明细（§8.2 诚实空态）。
  * 统一口径：总 Token = input + output + cache_write（官网/网关 cache_write 恒 0，即 input + output）；
@@ -295,7 +297,7 @@ export default function TokensTab({
     qoderUnavailable
       ? { title: 'Qoder 暂无 Token 统计数据源', hint: 'Qoder 官网未提供 token 用量接口；本地日志的 token 字段恒为占位 0（官方模型计费在服务端）。待网关 Qoder 上游接入后由网关侧落库统计。' }
       : localUnavailable
-        ? { title: '本地源无 Trae 数据', hint: '本地源 = WB/CodeBuddy 客户端会话统计；Trae 无本地源，切「官网」查看 Trae token 明细。' }
+        ? { title: '本地源无 Trae 数据', hint: '本地源 = WorkBuddy 桌面端 + CodeBuddy IDE 会话统计；Trae 无本地源，切「官网」查看 Trae token 明细。' }
         : officialUnavailable
           ? { title: 'Buddy 官网未提供按日明细接口', hint: 'Token 的 input/output 日明细官网仅 Trae 提供；Buddy 请切「本地」或「API网关」源。' }
           : null;

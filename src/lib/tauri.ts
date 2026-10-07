@@ -7,6 +7,8 @@ import type {
   ApiKeyEntry,
   CcSwitchStatus,
   ApiKeysFileView,
+  SanitizeMapView,
+  SanitizeRule,
   AppLocate,
   CheckinDone,
   CheckinOpts,
@@ -706,6 +708,14 @@ export const api = {
     // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）
     keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
       invoke('api_keys_save', { keys, authDisabled: authDisabled ?? null }),
+    // ---- 指纹清洗规则表（wb_template_map KV）----
+    // builtin=true = 当前生效内置默认规则（尚未自定义）；保存后成为独立自定义副本
+    templateMapGet: () => invoke<SanitizeMapView>('wb_template_map_get'),
+    // 整体替换保存；load_templates 每请求读取，保存即对下一请求生效，无需重启网关
+    templateMapSet: (templates: SanitizeRule[]) =>
+      invoke<void>('wb_template_map_set', {
+        map: { templates, updated_at: Math.floor(Date.now() / 1000) },
+      }),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),

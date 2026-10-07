@@ -352,6 +352,33 @@ impl InflightGuard {
         }
         self
     }
+
+    /// TOCTOU 收紧版绑定（审查 P1-4）：仅当账号在途 < limit 时 CAS +1 并绑定，
+    /// 返回是否绑定成功；limit = 0 视为未启用并发上限（无条件绑定）。
+    /// 失败时 guard 保持原绑定不变，由调用方换下一候选（tried 已含该 uid，
+    /// 轮换自然排除，不会无限循环）。CAS 循环消除「取号快照 → 绑定」窗口内
+    /// 多请求同时通过 busy 过滤导致的同账号超载
+    pub fn bind_account_cas(&mut self, acct: Arc<std::sync::atomic::AtomicU32>, limit: u32) -> bool {
+        let mut cur = acct.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if limit > 0 && cur >= limit {
+                return false; // 在途已满：不绑定、不覆盖原账号绑定
+            }
+            match acct.compare_exchange_weak(
+                cur,
+                cur + 1,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        if let Some(old) = self.account.replace(acct) {
+            old.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    }
 }
 
 impl Drop for InflightGuard {
@@ -666,5 +693,30 @@ mod inflight_tests {
         }
         assert_eq!(state.inflight.load(std::sync::atomic::Ordering::Relaxed), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 审查 P1-4：CAS 绑定——未达上限绑定成功；已达上限拒绝且不覆盖原绑定；
+    /// limit=0 视为未启用上限（无条件绑定）
+    #[test]
+    fn t04_bind_account_cas_respects_limit() {
+        let c = Arc::new(AtomicU64::new(0));
+        let acct = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // 空闲账号：CAS 绑定成功，计数 +1
+        let mut g = InflightGuard::acquire(&c);
+        assert!(g.bind_account_cas(acct.clone(), 1));
+        assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // 已达上限（cur=1 >= limit=1）：拒绝，guard 原绑定保持（Drop 时减 1 归零）
+        let mut g2 = InflightGuard::acquire(&c);
+        assert!(!g2.bind_account_cas(acct.clone(), 1));
+        assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(g2.account.is_none(), "拒绝时不得覆盖/解绑原账号绑定");
+        // limit=0：未启用上限，无条件绑定
+        assert!(g2.bind_account_cas(acct.clone(), 0));
+        assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // 换绑 + Drop 配对：旧账号解绑、新账号随 Drop 释放
+        drop(g);
+        assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(g2);
+        assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }

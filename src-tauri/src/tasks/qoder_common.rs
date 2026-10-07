@@ -8,6 +8,10 @@
 //! - 设备头 `Cosy-MachineId` / `Cosy-MachineToken`：真实捕获优先透传；缺失时由
 //!   `effective_creds` 注入账号绑定指纹（§5.10 多账号并发，v1.2 用户决策——
 //!   伪造是正式需求，以每账号稳定绑定控制风险，见 tasks::qoder_device）
+//! - 原生风控身份真值（2026-10-07 闭合）：openapi 域 `Cosy-MachineToken/Code/Type`
+//!   三键优先取 Qoder 主客户端随包 `runtime-info.exe` 产出——服务端按真值做设备
+//!   指纹分桶，派生值会被分入独立桶（campaigns 列表无 CLAIMABLE + claim 盲发
+//!   503 风控前置拦截），见 [`extend_device_headers_with`]
 //!
 //! 凭证双源说明：wb 的双源为 token store × auth 文件；Qoder 客户端本地存储解密
 //! （auth.v1.dat，DPAPI+AES-GCM）受 R-8 门控——M1 仅 token store 单源（PAT 导入落库），
@@ -35,6 +39,15 @@ pub const COSY_CLIENT_TYPE: &str = "10";
 /// 客户端 UA 对齐（R-4 抓包实测：主进程 API 请求 UA 为 "Qoder"；渲染进程为
 /// Electron 完整 UA `...QoderCN/0.4.2 Chrome/150... Electron/43.1.1...`）
 pub const CLIENT_USER_AGENT: &str = "Qoder";
+
+/// 客户端 openapi 域 Cosy 协议版本（proxy 抓包 2026-10-07 12:35 客户端 0.4.3
+/// 实测 `cosy-version: 0.4.3`）。注意与 qoder_sign::GATEWAY_COSY_VERSION（推理
+/// 网关域 1.1.38）区分——两个域的 COSY 协议版本互不通用。
+pub const CLIENT_COSY_VERSION: &str = "0.4.3";
+
+/// 客户端 openapi 域机器 OS 标识（同抓包实测 `cosy-machineos: x86_64_win32`；
+/// qoder_sign 网关域为 x86_64_windows，形态不同勿混用）
+pub const CLIENT_MACHINE_OS: &str = "x86_64_win32";
 
 // ── 凭证结构 ────────────────────────────────────────────────────────────────
 
@@ -450,7 +463,154 @@ pub fn clear_device_flow_creds(state: &AppState, id: &str) -> Result<(), String>
 
 // ── 统一请求头（§5.2：Cosy 头必带）─────────────────────────────────────────
 
-/// Bearer + Cosy-ClientType（缺失 → 服务端静默空列表）+ 可选设备头透传 + UA。
+/// 原生风控身份真值（Qoder 主客户端 NATIVE_RISK_IDENTITY 桥产出，2026-10-07
+/// 实测与 proxy 抓包 12:35 逐字节一致）：服务端按此三元组做设备指纹分桶——
+/// campaigns 列表的 CLAIMABLE 过滤与 claim 的风控前置拦截（盲发 503
+/// RISK_DEPENDENCY_UNAVAILABLE）都以真值为准；machine_id 截断派生值不被信任。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRiskIdentity {
+    pub machine_token: String,
+    pub machine_type: String,
+    pub machine_code: String,
+}
+
+/// Qoder 主客户端（"Qoder CN" 0.4.3，Electron，userData=com.qodercn.app.stable）
+/// 随包分发的原生身份工具：`resources\umid\runtime-info.exe`（配 sgsdk.dll）。
+/// 客户端桥以 `spawn(exe, [env, "--account-stdin"])` + stdin `{account}.` 调用；
+/// 实测无参直跑同样输出真值且与账号参数无关（机器恒定，exit 0 瞬时返回）。
+fn runtime_info_exe_path() -> Option<std::path::PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    let p = std::path::Path::new(&local)
+        .join("Programs")
+        .join("Qoder CN")
+        .join("resources")
+        .join("umid")
+        .join("runtime-info.exe");
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// 解析 runtime-info.exe stdout：优先整段 JSON，失败再按客户端桥的 '.' 分隔符
+/// 取首段重试（asar 桥实现即按 '.' 分段取首段解析）
+fn parse_runtime_info_stdout(s: &str) -> Option<NativeRiskIdentity> {
+    fn one(seg: &str) -> Option<NativeRiskIdentity> {
+        let v: Value = serde_json::from_str(seg.trim()).ok()?;
+        let get = |k: &str| {
+            v.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (t, ty, c) = (get("machineToken"), get("machineType"), get("machineCode"));
+        (!t.is_empty() && !ty.is_empty() && !c.is_empty()).then_some(NativeRiskIdentity {
+            machine_token: t,
+            machine_type: ty,
+            machine_code: c,
+        })
+    }
+    one(s).or_else(|| s.split('.').next().and_then(one))
+}
+
+/// 解析本机原生风控身份真值（OnceLock 缓存：真值机器恒定，进程内至多 spawn 一次）。
+/// 失败（客户端未安装/执行失败/解析失败）返回 None，调用方走派生 fallback。
+pub fn resolve_native_risk_identity() -> Option<&'static NativeRiskIdentity> {
+    static CACHE: std::sync::OnceLock<Option<NativeRiskIdentity>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let Some(exe) = runtime_info_exe_path() else {
+                return None;
+            };
+            let mut cmd = std::process::Command::new(&exe);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // CREATE_NO_WINDOW：Tauri GUI 进程内 spawn 不得闪控制台窗（项目惯例）
+                cmd.creation_flags(0x0800_0000);
+            }
+            let Ok(out) = cmd.output() else {
+                return None;
+            };
+            if !out.status.success() {
+                return None;
+            }
+            parse_runtime_info_stdout(&String::from_utf8_lossy(&out.stdout))
+        })
+        .as_ref()
+}
+
+/// 将原生真值三键写入请求头：替换同名既有键（build_auth_headers 先行透传的
+/// creds.machine_token 属网关域 dt- 令牌，openapi 域客户端的 Cosy-MachineToken/
+/// Code/Type 三键同源于 nativeRiskIdentity——asar 实证），缺键则补。
+fn apply_native_risk_headers(h: &mut Vec<(String, String)>, n: &NativeRiskIdentity) {
+    for (k, v) in [
+        ("Cosy-MachineToken", n.machine_token.as_str()),
+        ("Cosy-MachineCode", n.machine_code.as_str()),
+        ("Cosy-MachineType", n.machine_type.as_str()),
+    ] {
+        match h.iter_mut().find(|(a, _)| a.eq_ignore_ascii_case(k)) {
+            Some(slot) => slot.1 = v.to_string(),
+            None => h.push((k.to_string(), v.to_string())),
+        }
+    }
+}
+
+/// 按客户端 openapi 域实测形态补齐设备描述头（proxy 抓包 2026-10-07 12:35，客户端
+/// 0.4.3 对全部 openapi 请求携带：cosy-version / cosy-machineos / cosy-machinehostname
+/// / cosy-machinecode / cosy-machinetype + 原生 cosy-machinetoken）。
+///
+/// 真值优先：`native` 成功解析时三键（MachineToken/MachineCode/MachineType）一律
+/// 取原生身份——服务端按真值分桶，派生值会被归入独立桶导致 campaigns 列表无
+/// CLAIMABLE、claim 盲发 503。客户端未装/解析失败时退回 machine_id 派生（长度
+/// 对齐抓包形态 18/17 hex，仅维持「不比缺头更差」的底线）。Cosy-MachineId 不在
+/// 原生三键内，仍走 creds 透传/注入（§5.10 语义不变）。
+fn extend_device_headers_with(
+    h: &mut Vec<(String, String)>,
+    creds: &QoderCreds,
+    native: Option<&NativeRiskIdentity>,
+) {
+    let has = |h: &[(String, String)], k: &str| {
+        h.iter().any(|(a, _)| a.eq_ignore_ascii_case(k))
+    };
+    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".to_string());
+    for (k, v) in [
+        ("Cosy-Version", CLIENT_COSY_VERSION.to_string()),
+        ("Cosy-MachineOS", CLIENT_MACHINE_OS.to_string()),
+        ("Cosy-MachineHostname", hostname),
+    ] {
+        if !has(h, k) {
+            h.push((k.to_string(), v));
+        }
+    }
+    match native {
+        Some(n) => apply_native_risk_headers(h, n),
+        None => {
+            if !creds.machine_id.is_empty() {
+                let code: String = creds.machine_id.chars().take(18).collect();
+                let mtype: String = creds.machine_id.chars().take(17).collect();
+                if !has(h, "Cosy-MachineCode") {
+                    h.push(("Cosy-MachineCode".to_string(), code));
+                }
+                if !has(h, "Cosy-MachineType") {
+                    h.push(("Cosy-MachineType".to_string(), mtype));
+                }
+            }
+        }
+    }
+}
+
+/// 见 [`extend_device_headers_with`]：真值经 [`resolve_native_risk_identity`]
+/// 解析并缓存，调用开销≈0
+pub fn extend_client_device_headers(h: &mut Vec<(String, String)>, creds: &QoderCreds) {
+    extend_device_headers_with(h, creds, resolve_native_risk_identity());
+}
+
+/// Bearer + Cosy-ClientType（缺失 → 服务端静默空列表）+ 可选设备头透传 + UA，
+/// 再按客户端形态补齐设备描述头（见 [`extend_device_headers_with`]）。
+/// 注：本机装有 Qoder 客户端时 Cosy-MachineToken/Code/Type 被原生真值替换
+/// （creds.machine_token 的 dt- 令牌属网关域，openapi 域客户端不使用它）。
 pub fn build_auth_headers(creds: &QoderCreds) -> Vec<(String, String)> {
     let mut h = vec![
         (
@@ -468,6 +628,7 @@ pub fn build_auth_headers(creds: &QoderCreds) -> Vec<(String, String)> {
     if !creds.machine_token.is_empty() {
         h.push(("Cosy-MachineToken".to_string(), creds.machine_token.clone()));
     }
+    extend_client_device_headers(&mut h, creds);
     h
 }
 
@@ -1115,6 +1276,17 @@ impl CrossProcLock {
         scope: &str,
         wait_ms: u32,
     ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        Self::try_acquire_ns(data_dir, "qoder", scope, wait_ms)
+    }
+
+    /// 带命名空间版本：WB 域复用同一互斥体机制（ns="wb"），锁名互不串扰。
+    /// ns/scope 均须为单段名（不得含 `\`，见上方多段名教训）。
+    pub fn try_acquire_ns(
+        data_dir: &std::path::Path,
+        ns: &str,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
         use windows_sys::Win32::Foundation::{
             CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         };
@@ -1126,7 +1298,7 @@ impl CrossProcLock {
         let mut h = Sha256::new();
         h.update(data_dir.to_string_lossy().as_bytes());
         let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        let name: Vec<u16> = format!("Global\\AIWorkAssistant.qoder.{scope}.{}", &hex[..16])
+        let name: Vec<u16> = format!("Global\\AIWorkAssistant.{ns}.{scope}.{}", &hex[..16])
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -1256,7 +1428,16 @@ pub struct CrossProcLock;
 #[cfg(not(any(windows, target_os = "macos")))]
 impl CrossProcLock {
     pub fn try_acquire(
+        data_dir: &std::path::Path,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        Self::try_acquire_ns(data_dir, "qoder", scope, wait_ms)
+    }
+
+    pub fn try_acquire_ns(
         _data_dir: &std::path::Path,
+        _ns: &str,
         _scope: &str,
         _wait_ms: u32,
     ) -> (Option<Self>, Option<CrossProcLockFail>) {
@@ -1348,12 +1529,81 @@ mod tests {
         let mut c = QoderCreds { access_token: "pt-x".into(), ..Default::default() };
         let h = build_auth_headers(&c);
         assert!(h.iter().any(|(k, v)| k == "Cosy-ClientType" && v == "10"));
+        // Cosy-MachineId 只来自 creds 透传/注入，原生真值不伪造它
         assert!(!h.iter().any(|(k, _)| k == "Cosy-MachineId"), "设备头缺失时不得伪造");
         c.machine_id = "mid".into();
         c.machine_token = "mtk".into();
         let h = build_auth_headers(&c);
         assert!(h.iter().any(|(k, v)| k == "Cosy-MachineId" && v == "mid"));
-        assert!(h.iter().any(|(k, v)| k == "Cosy-MachineToken" && v == "mtk"));
+        // Cosy-MachineToken：本机装有 Qoder 客户端时被原生真值替换（openapi 域客户端
+        // 行为），未装时透传 creds 值——两态均合法，存在性必成立、值条件细分
+        assert!(h.iter().any(|(k, _)| k == "Cosy-MachineToken"));
+        if resolve_native_risk_identity().is_none() {
+            assert!(h.iter().any(|(k, v)| k == "Cosy-MachineToken" && v == "mtk"));
+        }
+    }
+
+    /// 原生真值优先（2026-10-07 排障闭合）：extend 阶段三键替换 build_auth_headers
+    /// 的 dt-/派生值，Cosy-MachineId 不受影响
+    #[test]
+    fn extend_device_headers_native_truth_replaces_passthrough() {
+        let n = NativeRiskIdentity {
+            machine_token: "P1gA_true".into(),
+            machine_type: "5b91d742146eefbe61".into(),
+            machine_code: "665e041c763d3adcb9".into(),
+        };
+        let c = QoderCreds {
+            access_token: "pt-x".into(),
+            machine_id: "mid".into(),
+            machine_token: "dt-stale".into(),
+            ..Default::default()
+        };
+        let mut h = build_auth_headers(&c);
+        extend_device_headers_with(&mut h, &c, Some(&n));
+        assert!(
+            h.iter().any(|(k, v)| k == "Cosy-MachineToken" && v == "P1gA_true"),
+            "原生 machineToken 必须替换 dt- 透传值"
+        );
+        assert!(!h.iter().any(|(k, v)| k == "Cosy-MachineToken" && v == "dt-stale"));
+        assert!(h.iter().any(|(k, v)| k == "Cosy-MachineCode" && v == "665e041c763d3adcb9"));
+        assert!(h.iter().any(|(k, v)| k == "Cosy-MachineType" && v == "5b91d742146eefbe61"));
+        assert!(h.iter().any(|(k, v)| k == "Cosy-MachineId" && v == "mid"), "MachineId 语义不变");
+    }
+
+    /// 派生 fallback（客户端未装路径）：machine_id 截断 18/17 hex，幂等不覆盖
+    #[test]
+    fn extend_device_headers_fallback_derives_from_machine_id() {
+        let c = QoderCreds {
+            access_token: "pt-x".into(),
+            machine_id: "0123456789abcdef0123456789abcdef".into(),
+            ..Default::default()
+        };
+        let mut h = Vec::new();
+        extend_device_headers_with(&mut h, &c, None);
+        assert!(h.iter().any(|(k, v)| k == "Cosy-MachineCode" && v == "0123456789abcdef01"));
+        assert!(h.iter().any(|(k, v)| k == "Cosy-MachineType" && v == "0123456789abcdef0"));
+        // 幂等：既有键不覆盖
+        let mut h2 = vec![("Cosy-MachineCode".to_string(), "keep".to_string())];
+        extend_device_headers_with(&mut h2, &c, None);
+        assert!(h2.iter().any(|(k, v)| k == "Cosy-MachineCode" && v == "keep"));
+    }
+
+    /// runtime-info.exe stdout 解析：容忍 '.' 终止符（客户端桥分段语义）、拒绝空值
+    #[test]
+    fn parse_runtime_info_stdout_tolerates_dot_separator_and_rejects_empty() {
+        let n = parse_runtime_info_stdout(
+            r#"{"machineToken":"P1gAxyz","machineType":"5b91d742146eefbe61","machineCode":"665e041c763d3adcb9","vmInfo":{"isVm":true,"brand":"Hyper-V","percentage":77,"vmTypeCode":14}}."#,
+        )
+        .expect("带 '.' 终止符应可解析");
+        assert_eq!(n.machine_token, "P1gAxyz");
+        assert_eq!(n.machine_type, "5b91d742146eefbe61");
+        assert_eq!(n.machine_code, "665e041c763d3adcb9");
+        assert!(parse_runtime_info_stdout("not json").is_none());
+        assert!(
+            parse_runtime_info_stdout(r#"{"machineToken":"","machineType":"x","machineCode":"y"}"#)
+                .is_none(),
+            "空 machineToken 拒绝"
+        );
     }
 
     /// R-6 抓包固化：clientId 为 PAT 派生的稳定 UUID 格式串
