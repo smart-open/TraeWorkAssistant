@@ -18,16 +18,75 @@ pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: 
     let _ = &app; // 预留：wb-credits-updated 事件随批次2趋势图启用
     // Rust 直调 tasks::wb_credits（原 python workbuddy_credits.py 移植）；
     // 失败以 Err 返回，成功恒为 {"ok":true,"cached":bool,"accounts":[...]}（消费契约见 tasks/wb_credits.rs 模块注释）
-    let parsed = crate::tasks::wb_credits::fetch_credits(&state, user_id.as_deref(), fresh.unwrap_or(false))?;
+    let fresh = fresh.unwrap_or(false);
+    let uid = user_id.as_deref();
+    // stale-while-revalidate（2026-10-08）：缓存过期时先回旧值并转后台刷新，切板块不再等网络
+    // （全局代理/跨境出口下单请求可达数秒，而每账号 ≥3 次串行请求）。手动刷新（fresh=true）
+    // 与「无缓存」仍走同步路径，语义与耗时保持原样。
+    if !fresh {
+        if let Some(reply) = crate::tasks::wb_credits::stale_reply(&state, uid) {
+            spawn_background_refresh(&state);
+            return Ok(reply);
+        }
+    }
+    credits_refresh_now(&state, uid, fresh)
+}
+
+/// 同步取数一轮：取数（缓存/网络）→ 池余额回写 → 套餐回填 → 非缓存命中时追加快照。
+/// 命令层与后台刷新线程共用，保证后台刷新与手动刷新行为一致。
+fn credits_refresh_now(
+    state: &AppState,
+    uid: Option<&str>,
+    fresh: bool,
+) -> Result<serde_json::Value, String> {
+    let parsed = crate::tasks::wb_credits::fetch_credits(state, uid, fresh)?;
     // 回写账号池余额缓存（列表/概述展示）
-    write_back_pool_balances(&state, &parsed);
+    write_back_pool_balances(state, &parsed);
     // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
-    backfill_edition_from_payment_type(&state);
+    backfill_edition_from_payment_type(state);
     // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
     if parsed.get("cached") != Some(&serde_json::json!(true)) {
-        append_credits_snapshot(&state, &parsed);
+        append_credits_snapshot(state, &parsed);
     }
     Ok(parsed)
+}
+
+/// 后台刷新（SWR 的「后台」半程）：概览页与顶栏可能连续触发，用进程内在途标记去重，
+/// 同一时刻只跑一轮；失败仅记日志（旧缓存仍在，页面无需感知，下次调用自然重试）。
+fn spawn_background_refresh(state: &State<AppState>) {
+    static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let st = state.inner().clone();
+    std::thread::spawn(move || {
+        // 复位兜底（2026-10-08 评审）：线程 panic 时 Drop 守卫仍复位 IN_FLIGHT，
+        // 否则原子标记永久卡 true、后台刷新静默失效（SWR 恒回旧值）
+        struct ResetInFlight;
+        impl Drop for ResetInFlight {
+            fn drop(&mut self) {
+                IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetInFlight;
+        let started = std::time::Instant::now();
+        match credits_refresh_now(&st, None, true) {
+            Ok(_) => fs_utils::app_log(
+                &st.data_dir,
+                &format!(
+                    "[wb-credits] 后台刷新完成，共 {}ms",
+                    started.elapsed().as_millis()
+                ),
+            ),
+            Err(e) => fs_utils::app_log(
+                &st.data_dir,
+                &format!(
+                    "[wb-credits] 后台刷新失败（{}ms）：{e}",
+                    started.elapsed().as_millis()
+                ),
+            ),
+        }
+    });
 }
 
 /// 将积分查询结果中的余额回写账号池缓存（列表/概述展示；命令与调度器快照任务共用）

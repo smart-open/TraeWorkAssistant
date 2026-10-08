@@ -503,12 +503,18 @@ pub(crate) fn save_reject_message(profiles_dir: &Path, uid: &str, live: &str) ->
 }
 
 fn backup_current(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
-    match sess.prof.layout {
+    let slot_dir = sess.prof.profiles_dir.join(slot);
+    let r = match sess.prof.layout {
         Layout::Authfile => authfile::backup_authfile(sess, slot, sink),
         Layout::Chromium => chromium::backup_chromium(sess, slot, sink),
         Layout::ElectronRoot => electron_root::backup_electron_root(sess, slot, sink),
         Layout::Icube => icube::backup_icube(sess, slot, sink),
-    }
+    };
+    // 无论成败都在出口失效该槽位体积缓存（失败也可能已 rotate/写入部分文件）——
+    // 在此收口可一次覆盖 SaveCurrentLogin / BackupCurrent / Switch / RestoreOnly(last)
+    // 全部写槽路径，不再隐式依赖「备份重建槽目录刷新 mtime」这一实现细节
+    crate::commands::profile::invalidate_profile_stats(&slot_dir);
+    r
 }
 
 fn restore_profile(sess: &mut Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {

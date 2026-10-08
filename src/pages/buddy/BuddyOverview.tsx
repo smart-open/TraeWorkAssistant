@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, CheckCircle2, Circle, ChevronRight } from 'lucide-react';
 import {
   BarChart,
@@ -116,6 +116,26 @@ export default function BuddyOverview() {
     void refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // stale-while-revalidate（2026-10-08）：后端缓存过期时先回旧值并转后台刷新
+  // （返回 refreshing=true），这里稍后重取一次即拿到新值；最多 4 次、间隔 1.5s 递增，
+  // 覆盖慢网络（全局代理）下的刷新耗时。拿到新值（refreshing 消失）后计数归零。
+  const creditsPollRef = useRef(0);
+  useEffect(() => {
+    if (!credits?.refreshing) {
+      creditsPollRef.current = 0;
+      return;
+    }
+    if (creditsPollRef.current >= 4) return;
+    const timer = window.setTimeout(() => {
+      creditsPollRef.current += 1;
+      api.workbuddy
+        .creditsFetch()
+        .then(setCredits)
+        .catch(() => {});
+    }, 1500 * (creditsPollRef.current + 1));
+    return () => window.clearTimeout(timer);
+  }, [credits]);
 
   const total = accounts.length;
   const totalBalance = credits?.accounts.reduce((s, a) => s + (a.balance ?? 0), 0) ?? null;

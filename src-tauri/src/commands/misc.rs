@@ -1,4 +1,8 @@
 use crate::platform::cmd::sys_command;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -183,102 +187,348 @@ fn split_host_path(hp: &str) -> (String, String) {
     }
 }
 
-#[tauri::command]
+// ---------------- 代理抓包日志：条目索引（列表 / 详情的公共底座） ----------------
+//
+// 性能（2026-10-07，本机实测）：日志目录内 11 个 `proxy_req_*.log` 共 212.7MB（约 130 万行，
+// 单文件最大 60MB / 58 万行）。原实现每次列表都把**全部文件**读成 String、逐条 parse 成
+// struct（每条还建一次 `Vec<&str>` 与多个 String），最后才 `skip/take` 取当前页 30 条——
+// 翻页 / 改日期 / 改关键字都会重来一遍；详情同样为取 1 条读完整文件。改为「条目索引 + 按需读」：
+//   ① 每个文件维护条目索引（条目字节区间 + 时间戳），文件追加时只增量扫「最后一条 + 新增尾部」
+//      （最后一条上次可能尚未写完），文件被截断 / 轮转则整份重建；
+//   ② 时间筛选在内存里按时间戳完成（不读正文）；关键字筛选才需要正文（顺序读一次，不再逐条 parse）；
+//   ③ 只为当前页那 30 条读取其字节区间并解析；详情只读该条的区间。
+//
+// id 口径修正：id 用「文件内**原始**非空分块序号」，与 `proxy_log_detail` 取序号的方式一致——
+// 原实现 index 只在通过筛选时才自增，带筛选时列表 id 与详情错位（点开看到的是另一条）。
+
+/// 条目分隔行（80 个 `=`；与写入端 `device_proxy/logger.rs` 一致）
+const PROXY_ENTRY_SEP: &[u8] = &[b'='; 80];
+
+/// 条目索引项：字节区间 + 筛选用时间戳。
+/// `ts` 用定长数组避免堆分配——条目可达十万级，增量刷新要整表克隆，逐条 String 会成为新瓶颈。
+#[derive(Clone, Copy)]
+struct ProxyIndexedEntry {
+    start: u64,
+    end: u64,
+    ts: [u8; 19],
+    ts_len: u8,
+}
+
+impl ProxyIndexedEntry {
+    /// 与原实现筛选分支同口径：块**首行**（trim 后）的 `1..20` 字节；行不足 20 字节 → 空串
+    fn ts_str(&self) -> &str {
+        std::str::from_utf8(&self.ts[..self.ts_len as usize]).unwrap_or("")
+    }
+}
+
+struct ProxyFileIndex {
+    /// 已索引到的字节数（文件继续追加时从这里续扫）
+    len: u64,
+    mtime_ms: i64,
+    entries: Vec<ProxyIndexedEntry>,
+}
+
+static PROXY_INDEX_CACHE: OnceLock<Mutex<HashMap<String, Arc<ProxyFileIndex>>>> = OnceLock::new();
+
+fn proxy_index_cache() -> &'static Mutex<HashMap<String, Arc<ProxyFileIndex>>> {
+    PROXY_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 目录内 `proxy_req_*.log`，文件名升序（= 时间升序）
+fn proxy_log_files(log_dir: &Path) -> Vec<String> {
+    let mut files: Vec<String> = std::fs::read_dir(log_dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with("proxy_req_") && name.ends_with(".log") {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+/// 索引缓存清理：磁盘上已不存在的日志文件（轮转 / 删除）不再占内存
+fn retain_alive_indexes(log_dir: &Path, files: &[String]) {
+    let alive: HashSet<String> = files
+        .iter()
+        .map(|n| log_dir.join(n).to_string_lossy().to_string())
+        .collect();
+    let mut cache = proxy_index_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|k, _| alive.contains(k));
+}
+
+/// 读取 `[from, to)` 字节
+fn read_range(path: &Path, from: u64, to: u64) -> Result<Vec<u8>, String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    if to <= from {
+        return Ok(Vec::new());
+    }
+    let mut f = std::fs::File::open(path).map_err(|e| format!("读取日志文件失败: {e}"))?;
+    f.seek(SeekFrom::Start(from))
+        .map_err(|e| format!("定位日志文件失败: {e}"))?;
+    let mut buf = Vec::with_capacity(((to - from) as usize).min(1 << 26));
+    f.take(to - from)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("读取日志文件失败: {e}"))?;
+    Ok(buf)
+}
+
+/// 在字节流里找分隔行（等价原实现的 `content.split(SEP)`：行内更长的 `=` 串同样命中子串）
+fn find_entry_sep(hay: &[u8]) -> Option<usize> {
+    let n = PROXY_ENTRY_SEP.len();
+    if hay.len() < n {
+        return None;
+    }
+    let mut i = 0usize;
+    while let Some(p) = hay[i..].iter().position(|b| *b == b'=') {
+        let pos = i + p;
+        if pos + n <= hay.len() && &hay[pos..pos + n] == PROXY_ENTRY_SEP {
+            return Some(pos);
+        }
+        i = pos + 1;
+    }
+    None
+}
+
+/// 块首行（trim 后）的 `1..20` 字节（时间戳）
+fn first_line_ts(seg: &[u8]) -> ([u8; 19], u8) {
+    let lead = seg
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(seg.len());
+    let rest = &seg[lead..];
+    let line_end = rest.iter().position(|b| *b == b'\n').unwrap_or(rest.len());
+    let line = &rest[..line_end];
+    if line.len() >= 20 {
+        let mut ts = [0u8; 19];
+        ts.copy_from_slice(&line[1..20]);
+        return (ts, 19);
+    }
+    ([0u8; 19], 0)
+}
+
+/// 扫描 `[base, base + bytes.len())` 区间，产出**非空块**的索引项
+/// （空块跳过，对齐原实现 `chunk.trim()` 判空；序号也因此与 `proxy_log_detail` 一致）
+fn scan_index_entries(bytes: &[u8], base: u64) -> Vec<ProxyIndexedEntry> {
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    loop {
+        let rel = find_entry_sep(&bytes[idx..]);
+        let seg_end = rel.map(|p| idx + p).unwrap_or(bytes.len());
+        let seg = &bytes[idx..seg_end];
+        if !seg.iter().all(|b| b.is_ascii_whitespace()) {
+            let (ts, ts_len) = first_line_ts(seg);
+            out.push(ProxyIndexedEntry {
+                start: base + idx as u64,
+                end: base + seg_end as u64,
+                ts,
+                ts_len,
+            });
+        }
+        match rel {
+            Some(p) if idx + p + PROXY_ENTRY_SEP.len() < bytes.len() => {
+                idx += p + PROXY_ENTRY_SEP.len();
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// 取（必要时增量刷新）某文件的条目索引。
+/// 增量条件：文件变大且 mtime 前进（追加场景）——重扫起点取「最后一条的起点」，
+/// 因为该条上次索引时可能尚未写完；其余情况（截断 / 被替换 / 时间戳未更新）整份重建。
+fn proxy_file_index(path: &Path) -> Result<Arc<ProxyFileIndex>, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("读取日志文件属性失败: {e}"))?;
+    let len = meta.len();
+    let mtime_ms = file_mtime_ms(&meta);
+    let key = path.to_string_lossy().to_string();
+
+    let cached = {
+        let cache = proxy_index_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(&key).cloned()
+    };
+    if let Some(idx) = &cached {
+        if idx.len == len && idx.mtime_ms == mtime_ms {
+            return Ok(idx.clone());
+        }
+    }
+
+    let (mut entries, from) = match &cached {
+        Some(idx) if idx.len < len && idx.mtime_ms < mtime_ms => {
+            let mut kept = idx.entries.clone();
+            let from = kept.pop().map(|e| e.start).unwrap_or(0);
+            (kept, from)
+        }
+        _ => (Vec::new(), 0),
+    };
+    if from < len {
+        let bytes = read_range(path, from, len)?;
+        entries.extend(scan_index_entries(&bytes, from));
+    }
+    let idx = Arc::new(ProxyFileIndex { len, mtime_ms, entries });
+    proxy_index_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, idx.clone());
+    Ok(idx)
+}
+
+/// 读取条目正文（trim 后，语义同原实现的 `chunk.trim()`）
+fn read_entry_text(path: &Path, entry: &ProxyIndexedEntry) -> Result<String, String> {
+    let bytes = read_range(path, entry.start, entry.end)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+fn ts_in_range(ts: &str, start: &str, end: &str) -> bool {
+    if !start.is_empty() && ts < start {
+        return false;
+    }
+    if !end.is_empty() && ts > end {
+        return false;
+    }
+    true
+}
+
+/// 列表命令（`async` 属性 → 独立线程执行：冷启动首次建索引要顺序读日志，不占 UI 线程）
+#[tauri::command(async)]
 pub fn proxy_logs_list(
     state: State<AppState>,
     opts: ProxyLogQueryOpts,
 ) -> Result<ProxyLogListResult, String> {
     let log_dir = proxy_log_dir(&state);
+    proxy_logs_list_impl(&log_dir, &opts)
+}
+
+/// 收集一批文件里的候选条目（保持文件升序 + 文件内升序 = 时间升序）。
+/// 无关键字：走内存索引，不读正文；有关键字：整文件顺序读一次（不再逐条 parse 成 struct）。
+fn collect_proxy_candidates(
+    log_dir: &Path,
+    files: &[String],
+    keyword: &str,
+    start: &str,
+    end: &str,
+) -> Result<Vec<(String, usize, ProxyIndexedEntry)>, String> {
+    let mut out = Vec::new();
+    for name in files {
+        let path = log_dir.join(name);
+        if keyword.is_empty() {
+            // 健壮性（对齐基线 `Err(_) => continue`）：单文件读失败（被独占锁定、权限变化等）
+            // 跳过该文件继续其余文件，不让整个列表失败
+            let idx = match proxy_file_index(&path) {
+                Ok(idx) => idx,
+                Err(_) => continue,
+            };
+            for (ei, e) in idx.entries.iter().enumerate() {
+                if ts_in_range(e.ts_str(), start, end) {
+                    out.push((name.clone(), ei, *e));
+                }
+            }
+        } else {
+            // 同上：单文件读失败跳过（基线关键字路径同样是整读，读失败 continue）
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            for (ei, e) in scan_index_entries(&bytes, 0).iter().enumerate() {
+                if !ts_in_range(e.ts_str(), start, end) {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&bytes[e.start as usize..e.end as usize]);
+                if text.to_lowercase().contains(keyword) {
+                    out.push((name.clone(), ei, *e));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 列表核心实现（拆出来便于单测直接喂临时目录）
+fn proxy_logs_list_impl(
+    log_dir: &Path,
+    opts: &ProxyLogQueryOpts,
+) -> Result<ProxyLogListResult, String> {
     if !log_dir.exists() {
         return Ok(ProxyLogListResult {
             entries: vec![],
             total: 0,
         });
     }
-
-    // 列出所有 proxy_req_*.log 文件，按文件名升序（旧文件在前）
-    // 这样 all_entries 中条目按时间正序排列（旧→新），reverse() 后得到正确的时间倒序（新→旧）
-    let mut files: Vec<String> = std::fs::read_dir(&log_dir)
-        .map_err(|e| format!("读取代理日志目录失败: {e}"))?
-        .filter_map(|e| {
-            let e = e.ok()?;
-            let name = e.file_name().to_string_lossy().to_string();
-            // 只匹配 proxy_req_ 前缀，排除 proxy.log（操作日志）和其他日志
-            if name.starts_with("proxy_req_") && name.ends_with(".log") {
-                Some(name)
-            } else {
-                None
-            }
-        })
-        .collect();
-    files.sort_by(|a, b| a.cmp(b));
-
-    let keyword = opts.keyword.as_deref().unwrap_or("");
+    let keyword = opts.keyword.as_deref().unwrap_or("").trim().to_lowercase();
     let start = opts.start_time.as_deref().unwrap_or("");
     let end = opts.end_time.as_deref().unwrap_or("");
     let offset = opts.offset.unwrap_or(0);
     let limit = opts.limit.unwrap_or(50);
 
-    let mut all_entries: Vec<ProxyLogEntry> = Vec::new();
+    let files = proxy_log_files(log_dir);
+    retain_alive_indexes(log_dir, &files);
 
-    for file_name in &files {
-        let path = log_dir.join(file_name);
-        let content = match std::fs::read(&path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-            Err(_) => continue,
-        };
-
-        // 按 ====== 分隔条目
-        let mut index = 0;
-        for chunk in content.split("================================================================================") {
-            let chunk = chunk.trim();
-            if chunk.is_empty() {
-                continue;
-            }
-
-            // 时间过滤
-            if !start.is_empty() || !end.is_empty() {
-                let ts = chunk
-                    .lines()
-                    .next()
-                    .and_then(|l| l.get(1..20))
-                    .unwrap_or("");
-                if !start.is_empty() && ts < start {
-                    continue;
-                }
-                if !end.is_empty() && ts > end {
-                    continue;
-                }
-            }
-
-            // 关键字过滤
-            if !keyword.is_empty() && !chunk.to_lowercase().contains(&keyword.to_lowercase()) {
-                continue;
-            }
-
-            if let Some(entry) = parse_proxy_entry(chunk, file_name, index) {
-                all_entries.push(entry);
-            }
-            index += 1;
-        }
+    // 候选收集：多线程（文件之间互不依赖；冷建索引与关键字全文扫描都是 IO+CPU 密集）。
+    // 分片按文件名升序切分，拼接后仍是「文件升序 + 文件内升序」= 时间升序
+    let threads = files.len().min(4).max(1);
+    let chunk = files.len().div_ceil(threads).max(1);
+    let keyword_ref: &str = &keyword;
+    let parts: Vec<Result<Vec<(String, usize, ProxyIndexedEntry)>, String>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = files
+                .chunks(chunk)
+                .map(|c| {
+                    scope.spawn(move || {
+                        collect_proxy_candidates(log_dir, c, keyword_ref, start, end)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err("日志扫描线程异常退出".to_string())))
+                .collect()
+        });
+    let mut candidates: Vec<(String, usize, ProxyIndexedEntry)> = Vec::new();
+    for part in parts {
+        candidates.extend(part?);
     }
+    candidates.reverse();
 
-    // 文件按升序处理（旧→新），同文件内条目按写入顺序也是旧→新，
-    // 因此 all_entries 整体为时间正序（旧→新），reverse() 后得到时间倒序（新→旧）
-    all_entries.reverse();
-
-    let total = all_entries.len();
-    let entries = all_entries
+    let total = candidates.len();
+    let entries: Vec<ProxyLogEntry> = candidates
         .into_iter()
         .skip(offset)
         .take(limit)
+        .filter_map(|(name, ei, e)| {
+            // 单条读取失败（候选收集后文件恰被删除/轮转）降级跳过该条，不让整页失败
+            let text = read_entry_text(&log_dir.join(&name), &e).ok()?;
+            parse_proxy_entry(&text, &name, ei)
+        })
         .collect();
-
     Ok(ProxyLogListResult { entries, total })
 }
 
-#[tauri::command]
+/// 详情命令（`async` 属性 → 独立线程执行）
+#[tauri::command(async)]
 pub fn proxy_log_detail(state: State<AppState>, id: String) -> Result<String, String> {
+    proxy_log_detail_impl(&proxy_log_dir(&state), &id)
+}
+
+/// 详情核心实现（拆出来便于单测直接喂临时目录）
+fn proxy_log_detail_impl(log_dir: &Path, id: &str) -> Result<String, String> {
     // id 格式: "filename:index"
     let parts: Vec<&str> = id.splitn(2, ':').collect();
     if parts.len() != 2 {
@@ -286,8 +536,8 @@ pub fn proxy_log_detail(state: State<AppState>, id: String) -> Result<String, St
     }
     let file_name = parts[0];
     let index: usize = parts[1].parse().map_err(|_| "无效的索引")?;
-    // 审查修复（任意文件读取/路径遍历）：文件名与列表接口（proxy_logs_list :200）同一
-    // 白名单，并拒绝路径分隔符——"..\..\x:0" 类输入此前可直接 join 读任意文件
+    // 审查修复（任意文件读取/路径遍历）：文件名与列表接口同一白名单，
+    // 并拒绝路径分隔符——"..\..\x:0" 类输入此前可直接 join 读任意文件
     if !file_name.starts_with("proxy_req_")
         || !file_name.ends_with(".log")
         || file_name.contains('\\')
@@ -297,25 +547,15 @@ pub fn proxy_log_detail(state: State<AppState>, id: String) -> Result<String, St
         return Err("无效的日志文件名".into());
     }
 
-    let log_dir = proxy_log_dir(&state);
     let path = log_dir.join(file_name);
-    let content = std::fs::read(&path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-        .map_err(|e| format!("读取日志文件失败: {e}"))?;
-
-    let mut current = 0;
-    for chunk in content.split("================================================================================") {
-        let chunk = chunk.trim();
-        if chunk.is_empty() {
-            continue;
-        }
-        if current == index {
-            return Ok(chunk.to_string());
-        }
-        current += 1;
-    }
-
-    Err("找不到指定的日志条目".into())
+    // 性能（2026-10-07）：只读该条所在字节区间（原实现为取 1 条读完整文件，单文件最大 60MB）。
+    // 序号口径不变 = 文件内**原始**非空分块序号（与列表 id 一致）。
+    let idx = proxy_file_index(&path)?;
+    let entry = idx
+        .entries
+        .get(index)
+        .ok_or_else(|| "找不到指定的日志条目".to_string())?;
+    read_entry_text(&path, entry)
 }
 
 // ---------------- JWT 解析 ----------------
@@ -1079,5 +1319,222 @@ mod tests {
         assert!(err.contains("无扩展名") || err.contains("可执行"), "实际错误: {err}");
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ---------------- 抓包日志：条目索引 / 分页 / 筛选 / 增量 ----------------
+
+    const PROXY_SEP_LINE: &str =
+        "================================================================================";
+
+    fn proxy_entry_text(ts: &str, method: &str, host_path: &str, status: &str, extra: &str) -> String {
+        format!("[{ts}] {method} {host_path}\n--- Request Headers ---\nx: y\n--- Response: {status} ---\n{extra}\n")
+    }
+
+    fn write_proxy_log(dir: &std::path::Path, name: &str, entries: &[String]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        let mut s = String::new();
+        for e in entries {
+            s.push_str(e);
+            s.push_str(PROXY_SEP_LINE);
+            s.push('\n');
+        }
+        std::fs::write(&p, s).unwrap();
+        p
+    }
+
+    fn proxy_opts(
+        offset: usize,
+        limit: usize,
+        keyword: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> ProxyLogQueryOpts {
+        ProxyLogQueryOpts {
+            keyword: keyword.map(str::to_string),
+            start_time: start.map(str::to_string),
+            end_time: end.map(str::to_string),
+            offset: Some(offset),
+            limit: Some(limit),
+        }
+    }
+
+    /// 列表：新→旧排序、id 用文件内原始序号、分页、时间/关键字筛选、空块不计入、
+    /// 详情与列表 id 对齐（原实现带筛选时 id 会错位）、追加后增量可见。
+    #[test]
+    fn proxy_logs_list_pages_filters_and_keeps_raw_index() {
+        let dir = tmp_dir("proxy_logs");
+        write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-01.log",
+            &[
+                proxy_entry_text("2026-10-01 10:00:00", "GET", "a.example.com/x", "200 OK", "body-one"),
+                proxy_entry_text("2026-10-01 11:00:00", "POST", "b.example.com/y", "500", "needle-here"),
+            ],
+        );
+        let day2 = write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-02.log",
+            &[proxy_entry_text("2026-10-02 09:00:00", "GET", "c.example.com/z", "200 OK", "body-three")],
+        );
+
+        // 全量：新→旧；id 为文件内**原始**序号（不是筛选后的序号）
+        let all = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, None, None, None)).unwrap();
+        assert_eq!(all.total, 3);
+        assert_eq!(all.entries[0].id, "proxy_req_2026-10-02.log:0");
+        assert_eq!(all.entries[0].timestamp, "2026-10-02 09:00:00");
+        assert_eq!(all.entries[1].id, "proxy_req_2026-10-01.log:1");
+        assert_eq!(all.entries[1].host, "b.example.com");
+        assert_eq!(all.entries[1].status, "500");
+        assert_eq!(all.entries[2].id, "proxy_req_2026-10-01.log:0");
+
+        // 详情按 id 取到的就是同一条
+        let detail = proxy_log_detail_impl(&dir, "proxy_req_2026-10-01.log:1").unwrap();
+        assert!(detail.contains("needle-here"), "详情应为该条原文: {detail}");
+
+        // 分页：offset=2 / limit=1 → 最旧那条
+        let page = proxy_logs_list_impl(&dir, &proxy_opts(2, 1, None, None, None)).unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].id, "proxy_req_2026-10-01.log:0");
+
+        // 时间筛选（字符串比较口径同原实现）
+        let only2 = proxy_logs_list_impl(
+            &dir,
+            &proxy_opts(
+                0,
+                50,
+                None,
+                Some("2026-10-02 00:00:00"),
+                Some("2026-10-02 23:59:59"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(only2.total, 1);
+        assert_eq!(only2.entries[0].timestamp, "2026-10-02 09:00:00");
+
+        // 关键字筛选（大小写不敏感）：命中条目的 id 仍是原始序号 1
+        let hit =
+            proxy_logs_list_impl(&dir, &proxy_opts(0, 50, Some("Needle-Here"), None, None)).unwrap();
+        assert_eq!(hit.total, 1);
+        assert_eq!(hit.entries[0].id, "proxy_req_2026-10-01.log:1");
+
+        // 追加新条目 → 索引增量续扫，立即可见
+        let mut s = std::fs::read_to_string(&day2).unwrap();
+        s.push_str(&proxy_entry_text(
+            "2026-10-02 10:00:00",
+            "GET",
+            "d.example.com/w",
+            "201 Created",
+            "body-four",
+        ));
+        s.push_str(PROXY_SEP_LINE);
+        s.push('\n');
+        std::fs::write(&day2, s).unwrap();
+        let after = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, None, None, None)).unwrap();
+        assert_eq!(after.total, 4);
+        assert_eq!(after.entries[0].id, "proxy_req_2026-10-02.log:1");
+        assert_eq!(after.entries[0].path, "/w");
+
+        // 连续分隔行 / 纯空白块不计入条目（对齐原实现 `chunk.trim()` 判空）
+        let empty = dir.join("proxy_req_2026-10-03.log");
+        std::fs::write(&empty, format!("{PROXY_SEP_LINE}\n\n{PROXY_SEP_LINE}\n")).unwrap();
+        let with_empty = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, None, None, None)).unwrap();
+        assert_eq!(with_empty.total, 4, "空块不应计入条目数");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 诊断（手动跑）：在真实日志目录上量「冷建索引 / 热命中 / 深翻页 / 关键字筛选」耗时。
+    /// 用法：`cargo test probe_proxy_logs_real_dir -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_proxy_logs_real_dir_timing() {
+        let dir = std::path::PathBuf::from(std::env::var("APPDATA").unwrap())
+            .join("AIWorkAssistant")
+            .join("logs");
+        assert!(dir.is_dir(), "日志目录不存在: {}", dir.display());
+        let mut total_bytes = 0u64;
+        for name in proxy_log_files(&dir) {
+            total_bytes += std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
+        }
+
+        let t0 = std::time::Instant::now();
+        let cold = proxy_logs_list_impl(&dir, &proxy_opts(0, 30, None, None, None)).unwrap();
+        let cold_ms = t0.elapsed().as_millis();
+
+        let t1 = std::time::Instant::now();
+        let warm = proxy_logs_list_impl(&dir, &proxy_opts(0, 30, None, None, None)).unwrap();
+        let warm_ms = t1.elapsed().as_millis();
+
+        let t2 = std::time::Instant::now();
+        let deep = proxy_logs_list_impl(&dir, &proxy_opts(5000, 30, None, None, None)).unwrap();
+        let deep_ms = t2.elapsed().as_millis();
+
+        let t3 = std::time::Instant::now();
+        let kw = proxy_logs_list_impl(&dir, &proxy_opts(0, 30, Some("openai"), None, None)).unwrap();
+        let kw_ms = t3.elapsed().as_millis();
+
+        println!(
+            "日志目录 {} 个文件 / {}MB，条目 {}（冷建索引 {}ms / 热命中 {}ms / 深翻页 {}ms / 关键字 {}ms，关键字命中 {}）",
+            proxy_log_files(&dir).len(),
+            total_bytes / 1024 / 1024,
+            cold.total,
+            cold_ms,
+            warm_ms,
+            deep_ms,
+            kw_ms,
+            kw.total
+        );
+        assert_eq!(cold.total, warm.total);
+        assert_eq!(deep.entries.len().min(30), deep.entries.len());
+    }
+
+    /// 索引时间戳口径 = 原实现筛选分支：块首行（trim 后）的 1..20 字节
+    #[test]
+    fn proxy_index_ts_matches_first_line_slice() {
+        let dir = tmp_dir("proxy_index_ts");
+        write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-05.log",
+            &[
+                proxy_entry_text("2026-10-05 08:00:00", "GET", "e.example.com/a", "200 OK", "x"),
+                // 首行非时间戳形态（不足 20 字节）→ 时间戳为空串，带时间筛选时应被排除
+                "short\n--- Response: 200 OK ---\n".to_string() + PROXY_SEP_LINE + "\n",
+            ],
+        );
+        let all = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, None, None, None)).unwrap();
+        assert_eq!(all.total, 2);
+        let filtered = proxy_logs_list_impl(
+            &dir,
+            &proxy_opts(0, 50, None, Some("2026-01-01 00:00:00"), None),
+        )
+        .unwrap();
+        assert_eq!(filtered.total, 1, "时间戳为空串的块在带起始时间时应被排除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 健壮性：单文件读失败跳过该文件，列表/关键字路径均不整体报错（对齐基线
+    /// `Err(_) => continue`；此处用同名子目录模拟读失败——Windows 打开目录报
+    /// Access denied，Unix read 目录报 EISDIR，两平台都走不到正文）
+    #[test]
+    fn proxy_logs_list_skips_unreadable_file() {
+        let dir = tmp_dir("proxy_logs_skip");
+        write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-01.log",
+            &[proxy_entry_text("2026-10-01 10:00:00", "GET", "a.example.com/x", "200 OK", "body-one")],
+        );
+        // 目录名匹配 proxy_req_*.log → 会进文件列表，但读内容必然失败
+        std::fs::create_dir(dir.join("proxy_req_2026-10-02.log")).unwrap();
+
+        let all = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, None, None, None)).unwrap();
+        assert_eq!(all.total, 1, "坏文件应被跳过而非整个列表失败");
+        assert_eq!(all.entries[0].id, "proxy_req_2026-10-01.log:0");
+
+        // 关键字路径同样跳过
+        let kw = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, Some("body"), None, None)).unwrap();
+        assert_eq!(kw.total, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

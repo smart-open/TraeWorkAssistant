@@ -69,6 +69,11 @@ pub fn retry_plan(status: u16, body: &str, attempt: u32, retry_after: Option<u64
             RetryAction::Fatal
         };
     }
+    // 400 + 积分耗尽（issue #67）：请求本身合法、账号积分已尽 → 换号。
+    // 默认 400 → Fatal 会把积分耗尽直接透传终止，池内其余账号积压不用
+    if status == 400 && super::is_credit_exhausted_error(body) {
+        return RetryAction::SwitchKey;
+    }
     match status {
         // 429：优先 Retry-After；缺省线性退避 1/2/3s；耗尽后换号
         429 => {
@@ -186,6 +191,26 @@ mod tests {
         assert_eq!(retry_plan(400, "context_too_long", 0, None), RetryAction::Fatal);
         assert_eq!(retry_plan(404, "", 0, None), RetryAction::Fatal);
         assert_eq!(retry_plan(422, "", 0, None), RetryAction::Fatal);
+    }
+
+    #[test]
+    fn credit_exhausted_400_switches_key() {
+        // issue #67：400 + 积分耗尽短语 → 换号（非 Fatal）
+        assert_eq!(
+            retry_plan(400, "insufficient credit balance", 0, None),
+            RetryAction::SwitchKey
+        );
+        assert_eq!(retry_plan(400, "积分不足，请充值", 0, None), RetryAction::SwitchKey);
+        assert_eq!(retry_plan(400, "账户额度不足", 0, None), RetryAction::SwitchKey);
+        // 同号重试（attempt>0）后耗尽仍换号——issue #67 核心场景
+        assert_eq!(
+            retry_plan(400, "insufficient credit", 1, None),
+            RetryAction::SwitchKey
+        );
+        // quota exceeded 有意不命中（4008 频率限流走 SoftRate 口径）
+        assert_eq!(retry_plan(400, "quota exceeded", 0, None), RetryAction::Fatal);
+        // 非 400 状态码不受影响
+        assert_eq!(retry_plan(500, "insufficient credit", 0, None), RetryAction::SwitchKey);
     }
 
     #[test]

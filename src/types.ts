@@ -1232,6 +1232,11 @@ export interface WbCreditsResult {
   cached?: boolean;
   /** F-59 stale-on-error：全部账号刷新失败时回退的历史缓存 */
   stale?: boolean;
+  /**
+   * stale-while-revalidate（2026-10-08）：本次返回的是过期缓存，后端已转入后台刷新；
+   * 前端稍后重取一次即可拿到新值（见 BuddyOverview 的重取逻辑）。
+   */
+  refreshing?: boolean;
   accounts: WbCreditAccount[];
   total_balance?: number;
 }

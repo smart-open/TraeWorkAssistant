@@ -20,8 +20,10 @@
 //! - 单后台线程 60s tick；每个任务有默认触发时刻（HH:MM，对齐 schtasks 典型时段）；
 //! - 触发条件：`今天已过触发时刻 && 状态文件 last_run_date != 今天` → 执行；
 //!   应用在触发时刻之后才启动也会补跑一次（启动补跑，等价每日一次语义）；
-//! - 失败重试：仅成功才记 last_run_date；失败记 last_fail_ts，30 分钟冷却后
-//!   自动重试（避免一次网络抖动丢掉整天的签到/快照，也避免每 tick 连打）；
+//! - 失败重试：仅成功才记 last_run_date；失败记 last_fail_ts + 连续失败计数
+//!   （fail_streak），冷却 30 分钟起步、随连续失败指数退避 30→60→120 分钟封顶
+//!  （issue #66 健壮性④：上游风控依赖故障时恒 30 分钟重试只会全天对上游连打
+//!   ~28 轮，退避后收敛到 ~8 轮；成功一轮 mark_run 整体覆盖条目自然清零计数）；
 //! - 所有任务实现均幂等（签到 skip-checked / 快照同日覆盖），与 schtasks
 //!   重复触发不会产生重复效果；
 //! - 串行执行：一轮 tick 内任务逐个跑完，WB 签到复用轮次锁与 UI 路径互斥。
@@ -104,9 +106,9 @@ pub fn start(app: AppHandle) {
     });
 }
 
-/// 失败重试冷却：失败后 30 分钟内不重复尝试（避免每 60s tick 连打）
+/// 失败重试冷却基数：失败后按连续失败次数指数退避（30 分钟起步 ×2 封顶 120 分钟）
 const RETRY_COOLDOWN_MS: i64 = 30 * 60_000;
-/// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走 30 分钟冷却，不受此门限制）
+/// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走退避冷却，不受此门限制）
 const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 /// qoder-refresh 档位（默认 6 小时）说明：客户端 token 惰性窗 7h，间隔 ≤7h 即可
 /// 确保过期令牌在窗口内被续上；真实缺省值在 models.rs serde default
@@ -173,6 +175,9 @@ fn tick(app: &AppHandle, st: &AppState) {
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     let now_hm = now.format("%H:%M").to_string();
+    // 网关运行态句柄（main.rs manage；积分类任务运行中回写池快照用，issue #67）
+    let api_runtime = app
+        .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：「每日 HH:MM」/「每小时」/「每N小时」）
         let trigger = match sched_plan(st, t) {
@@ -204,13 +209,15 @@ fn tick(app: &AppHandle, st: &AppState) {
                 format!("每{hours}小时")
             }
         };
-        // 失败冷却：30 分钟内静默等待重试，不重复执行也不刷日志
+        // 失败冷却：退避窗口内静默等待重试，不重复执行也不刷日志
         if let Some(ts) = last_fail_ts(st, t.key) {
-            if chrono::Utc::now().timestamp_millis() - ts < RETRY_COOLDOWN_MS {
+            if chrono::Utc::now().timestamp_millis() - ts < retry_cooldown_ms(st, t.key) {
                 continue;
             }
         }
-        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_task(t.key, st))) {
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_task(t.key, st, Some(api_runtime.inner()))
+        })) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("任务线程 panic（已捕获，不影响后续调度）".to_string()),
@@ -255,7 +262,9 @@ fn tick(app: &AppHandle, st: &AppState) {
                     }
                 };
                 mark_fail(st, t.key, &summary);
-                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）失败，30 分钟后重试：{}", t.name, trigger, summary));
+                // 退避窗口按实际分钟数展示（连续失败 30→60→120 分钟封顶）
+                let cooldown_min = (retry_cooldown_ms(st, t.key) / 60_000).max(1);
+                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）失败，{cooldown_min} 分钟后重试：{}", t.name, trigger, summary));
                 // 调度任务失败通知（通知渠道面板）：推 Bark/Webhook/Server酱（无 AppHandle，仅渠道；
                 // 渠道失败静默，绝不影响调度循环）
                 if first_fail_today {
@@ -263,7 +272,7 @@ fn tick(app: &AppHandle, st: &AppState) {
                         None,
                         &st.data_dir,
                         &format!("{} 失败", t.name),
-                        &format!("{summary}（30 分钟后自动重试）"),
+                        &format!("{summary}（{cooldown_min} 分钟后自动重试）"),
                         crate::notify::NotifyEvent::TaskFail,
                     );
                 }
@@ -341,8 +350,14 @@ fn enabled(st: &AppState, key: &str) -> bool {
     }
 }
 
-/// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）
-fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
+/// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）。
+/// `runtime`：GUI 进程内的网关运行态句柄（tick 经 AppHandle 取得），
+/// 供积分类任务运行中回写池快照（issue #67）；CLI 侧传 None
+fn run_task(
+    key: &str,
+    st: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<Value, String> {
     match key {
         // Trae 每日签到：与 `--task-run checkin` 同款（vault 全账号单轮，状态核验幂等）。
         // 审查 P2：存在可重试失败时返 Err，交调度器 30 分钟冷却重试（对齐 qoder-checkin）；
@@ -366,7 +381,7 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
                 return Err(format!(
-                    "Trae 签到：{ok} 成功 / {already} 已签 / {retryable} 失败（30 分钟后自动重试）"
+                    "Trae 签到：{ok} 成功 / {already} 已签 / {retryable} 失败（稍后自动重试）"
                 ));
             }
             Ok(done)
@@ -398,7 +413,7 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
                 return Err(format!(
-                    "WB 签到：{ok} 成功 / {already} 已签 / {retryable} 失败（30 分钟后自动重试）"
+                    "WB 签到：{ok} 成功 / {already} 已签 / {retryable} 失败（稍后自动重试）"
                 ));
             }
             Ok(done)
@@ -453,7 +468,7 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 return Err(format!(
-                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（30 分钟后自动重试）"
+                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（稍后自动重试）"
                 ));
             }
             Ok(done)
@@ -493,7 +508,10 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // 缓存；原单账号缓存分支前端无调用方，属刷错目标，issue #61 同类缺口一并修复）
         "wb-credits-snapshot" => {
             let parsed = crate::commands::workbuddy::wb_credits_snapshot_task(st)?;
-            let token_files = crate::commands::workbuddy_stats::workbuddy_token_stats_impl(st, true)
+            // token 统计同步沿用结果级缓存（fresh=false，2026-10-07 性能优化）：
+            // 原传 true 会绕过 10 分钟结果缓存，每天（hourly 档）强制一次全量
+            // walk+stat；当日数据本就有 10 分钟 TTL 兜底，无需强制重扫。
+            let token_files = crate::commands::workbuddy_stats::workbuddy_token_stats_impl(st, false)
                 .get("files_scanned")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
@@ -508,8 +526,9 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 "usage": usage,
             }))
         }
-        // Trae 积分数据同步：与 `--task-run refresh-credits` 同款（无账号返回 refreshed=0）
-        "trae-credits-snapshot" => crate::commands::accounts::refresh_remaining_credits_impl(st)
+        // Trae 积分数据同步：与 `--task-run refresh-credits` 同款（无账号返回 refreshed=0）；
+        // GUI 进程内把 runtime 句柄传入，网关运行中同步回写池内积分快照（issue #67）
+        "trae-credits-snapshot" => crate::commands::accounts::refresh_remaining_credits_impl(st, runtime)
             .map(|n| json!({ "ok": true, "refreshed": n })),
         // Trae 消耗明细同步（issue #61）：与 `--task-run trae-usage-sync` 同款（fresh=true 增量拉取）；
         // 无账号静默跳过（对齐 trae-models-sync 惯例）；全部账号拉取失败返 Err 交 30 分钟冷却重试
@@ -569,6 +588,21 @@ fn last_fail_ts(st: &AppState, key: &str) -> Option<i64> {
         .and_then(Value::as_i64)
 }
 
+/// 退避冷却时长：cooldown = 30 分钟 << min(streak-1, 2)，连续失败 30→60→120 分钟封顶
+/// （streak=0/缺字段兼容旧条目回 30 分钟；mark_run 成功整体覆盖条目自然清零计数）
+/// shift 用显式分支求值：saturating_sub(1).min(2) 在 streak=0 时得 -1（0-1=-1 是
+/// 合法语义，min 只夹上界不夹下界），-1 as u32 = u32::MAX 触发移位溢出 panic——
+/// 显式比较同时夹上下界，语义等价且边界自明。
+fn retry_cooldown_ms(st: &AppState, key: &str) -> i64 {
+    let streak = load_state(st)
+        .pointer(&format!("/tasks/{key}/fail_streak"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let streak = if streak < 0 { 0 } else { streak };
+    let shift: u32 = if streak <= 1 { 0 } else if streak >= 3 { 2 } else { 1 };
+    RETRY_COOLDOWN_MS << shift
+}
+
 /// 最近一次成功执行时间戳（hourly 模式节流用；mark_run 写入）
 fn last_run_ts(st: &AppState, key: &str) -> Option<i64> {
     load_state(st)
@@ -590,13 +624,32 @@ fn mark_run(st: &AppState, key: &str, date: &str, summary: &str) {
     );
 }
 
-/// 失败：只记失败时间戳，不写 last_run_date（冷却后当天自动重试）
+/// 失败：记失败时间戳 + 连续失败计数（退避用），不写 last_run_date（冷却后当天自动重试）。
+/// 距上次失败 ≥24h 视为跨天新鲜失败，streak 重置为 1（昨日残留不抬高今日首败冷却）
 fn mark_fail(st: &AppState, key: &str, summary: &str) {
+    let state = load_state(st);
+    let prev_ts = state
+        .pointer(&format!("/tasks/{key}/last_fail_ts"))
+        .and_then(Value::as_i64);
+    let prev_streak = state
+        .pointer(&format!("/tasks/{key}/fail_streak"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let streak = if prev_ts
+        .map(|ts| chrono::Utc::now().timestamp_millis() - ts >= 24 * 3_600_000)
+        .unwrap_or(true)
+    {
+        1
+    } else {
+        prev_streak + 1
+    };
     write_entry(
         st,
         key,
         json!({
             "last_fail_ts": chrono::Utc::now().timestamp_millis(),
+            "fail_streak": streak,
             "last_ok": false,
             "last_summary": summary,
         }),
@@ -810,5 +863,70 @@ mod tests {
         assert_eq!(board_platform("qoder-credits-snapshot"), Some("qoder"));
         assert_eq!(board_platform("qoder-refresh"), None);
         assert_eq!(board_platform("qoder-checkin"), None);
+    }
+
+    /// 失败退避（issue #66 健壮性④）：无记录/首败 30 分钟起步，连续失败 ×2
+    /// 30→60→120 封顶；负值 streak 兜底按 0；mark_run 成功整体覆盖条目清零计数
+    #[test]
+    fn retry_cooldown_backoff_and_streak_reset() {
+        let st = temp_state("backoff");
+        let key = "qoder-checkin";
+        // 无记录：30 分钟起步
+        assert_eq!(retry_cooldown_ms(&st, key), 30 * 60_000);
+        // 连续失败 1/2/3/4 次：30/60/120/120（封顶）
+        let mut total = 0;
+        for (n, expect_min) in [(1, 30), (2, 60), (3, 120), (4, 120)] {
+            while total < n {
+                mark_fail(&st, key, "模拟失败");
+                total += 1;
+            }
+            assert_eq!(
+                retry_cooldown_ms(&st, key),
+                expect_min * 60_000,
+                "连续失败 {n} 次后冷却应为 {expect_min} 分钟"
+            );
+        }
+        // streak 确实持久化到状态
+        assert_eq!(
+            load_state(&st).pointer(&format!("/tasks/{key}/fail_streak")).and_then(Value::as_i64),
+            Some(4)
+        );
+        // 成功 mark_run 整体覆盖条目 → fail_streak 消失，冷却回 30 分钟
+        mark_run(&st, key, "2026-10-07", "成功 1，已签 0，失败 0");
+        assert_eq!(retry_cooldown_ms(&st, key), 30 * 60_000);
+        assert_eq!(
+            load_state(&st).pointer(&format!("/tasks/{key}/last_fail_ts")).and_then(Value::as_i64),
+            None,
+            "mark_run 应清掉 last_fail_ts"
+        );
+        // 手写负值 streak（脏数据）：兜底按 0 → 30 分钟
+        let mut root = load_state(&st);
+        root["tasks"][key]["fail_streak"] = json!(-7);
+        crate::store::db(&st.data_dir).kv_set("scheduler_state", &root).unwrap();
+        assert_eq!(retry_cooldown_ms(&st, key), 30 * 60_000);
+    }
+
+    /// 跨天新鲜失败（审查修复）：距上次失败 ≥24h 时 streak 重置为 1，
+    /// 昨日残留不抬高今日首败冷却；24h 内连续失败照旧累计
+    #[test]
+    fn mark_fail_resets_streak_after_24h() {
+        let st = temp_state("backoff24h");
+        let key = "wb-checkin";
+        // 伪造昨日失败残留：streak=3 + 25h 前的失败时间戳
+        let mut root = load_state(&st);
+        root["tasks"][key]["fail_streak"] = json!(3);
+        root["tasks"][key]["last_fail_ts"] =
+            json!(chrono::Utc::now().timestamp_millis() - 25 * 3_600_000);
+        crate::store::db(&st.data_dir).kv_set("scheduler_state", &root).unwrap();
+        // 跨天首败：streak 重置为 1 → 30 分钟起步
+        mark_fail(&st, key, "跨天后首次失败");
+        assert_eq!(retry_cooldown_ms(&st, key), 30 * 60_000);
+        assert_eq!(
+            load_state(&st).pointer(&format!("/tasks/{key}/fail_streak")).and_then(Value::as_i64),
+            Some(1)
+        );
+        // 24h 内连续失败：照旧累计（2 → 60 分钟）
+        mark_fail(&st, key, "同日二连失败");
+        assert_eq!(retry_cooldown_ms(&st, key), 60 * 60_000);
     }
 }

@@ -8,7 +8,6 @@
 //! macOS 分支只需替换占位实现，不动调用方。检索标记：`macOS 适配预留`。
 
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::State;
@@ -449,11 +448,9 @@ pub(crate) fn work_exe_candidates(state: &AppState) -> Vec<PathBuf> {
 // 占位注释——建议统一收敛到 sysinfo 实现后，本 Windows 实现可与 macOS 版共用签名
 #[cfg(windows)]
 fn proc_running(image: &str) -> bool {
-    let out = Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
-        .creation_flags(0x08000000)
-        .output();
-    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains(image))
+    // 原 tasklist 子进程（单次实测 ~260ms）改为 sysinfo 进程表枚举 + 短 TTL 复用
+    // （见 switcher::proc::any_running）；`.exe` 后缀由该函数统一剥离
+    crate::switcher::proc::any_running(&[image])
 }
 
 #[cfg(windows)]

@@ -11,6 +11,7 @@ mod jwt;
 mod models;
 mod notify;
 mod platform;
+mod pe_version;
 mod state;
 mod store;
 mod switcher;

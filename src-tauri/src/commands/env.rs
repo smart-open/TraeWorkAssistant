@@ -1,7 +1,12 @@
 use serde::Serialize;
+use std::collections::HashMap;
 // Windows 直启链专用（mac 走 `open` bundle 启动，不经 Command）
 #[cfg(not(target_os = "macos"))]
 use std::process::Command;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, State};
 
 use crate::platform::cmd::sys_command;
@@ -179,16 +184,24 @@ fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
 }
 
 /// exe 文件版本（ProductVersion 优先，回退 FileVersion）——qoder_env_check 复用。
-/// 分平台实现：Windows=PowerShell 读 exe VersionInfo；mac=exe 路径上溯定位 .app
-/// bundle 后读 Info.plist CFBundleShortVersionString（复用 locate::read_info_plist_value）；
+/// Windows 三级实现（main 合并引入）：进程内 (路径, mtime, 大小) 缓存 → PE 版本资源
+/// 直读（pe_version 模块，微秒级）→ powershell 兜底；mac 读 .app bundle Info.plist；
 /// 其余平台恒 None。
 #[cfg(windows)]
 pub(crate) fn version_of(path: &str) -> Option<String> {
-    // 优先 ProductVersion（用户认知的产品版本，如 Trae 3.3.100 / Trae Work 0.1.65 /
-    // CodeBuddy 4.12.0），缺失时回退 FileVersion（内部构建号）——实测 Electron 系客户端
-    // 两者差异巨大（TRAE SOLO CN.exe FileVersion=2.3.83557 而 ProductVersion=0.1.65，
-    // CodeBuddy CN.exe FileVersion=1.106.1.0 而 ProductVersion=4.12.0），旧版恒读
-    // FileVersion 导致顶栏版本显示为构建号而非产品版本
+    version_cached(path, || {
+        crate::pe_version::product_or_file_version(path)
+            .or_else(|| powershell_version_of(path))
+            .map(normalize_version)
+    })
+}
+
+/// 原实现（保留作 PE 资源读取失败时的兜底）：ProductVersion 优先，缺失回退 FileVersion。
+/// 实测 Electron 系客户端两者差异巨大（TRAE SOLO CN.exe FileVersion=2.3.83557 而
+/// ProductVersion=0.1.65，CodeBuddy CN.exe FileVersion=1.106.1.0 而 ProductVersion=4.12.0），
+/// 旧版恒读 FileVersion 导致顶栏版本显示为构建号而非产品版本
+#[cfg(windows)]
+fn powershell_version_of(path: &str) -> Option<String> {
     let ps = format!(
         "$v=(Get-Item '{}').VersionInfo; if ($v.ProductVersion) {{ $v.ProductVersion }} else {{ $v.FileVersion }}",
         path.replace('\'', "''")
@@ -199,44 +212,52 @@ pub(crate) fn version_of(path: &str) -> Option<String> {
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() {
-        return None;
+        None
+    } else {
+        Some(s)
     }
-    // 归一化：4 段式 ProductVersion 去掉末尾冗余 ".0"（WorkBuddy 5.4.7.0 → 5.4.7）；
-    // 3 段式保持原样（CodeBuddy 4.12.0 不能截成 4.12）
-    let s = if s.matches('.').count() == 3 && s.ends_with(".0") {
+}
+
+/// 版本串归一化：4 段式去掉末尾冗余 ".0"（WorkBuddy 5.4.7.0 → 5.4.7）；
+/// 3 段式保持原样（CodeBuddy 4.12.0 不能截成 4.12）
+#[cfg(windows)]
+fn normalize_version(s: String) -> String {
+    if s.matches('.').count() == 3 && s.ends_with(".0") {
         s[..s.len() - 2].to_string()
     } else {
         s
-    };
-    Some(s)
+    }
 }
 
 /// mac 版本号读取：exe 路径（如 /Applications/Qoder CN.app/Contents/MacOS/Qoder CN IDE）
 /// 上溯定位 .app bundle 根，读 Info.plist CFBundleShortVersionString——与
-/// finish_locate_macos 同源，qoder_env_check（main 合并引入）跨平台复用入口。
+/// finish_locate_macos 同源，qoder_env_check（main 合并引入）跨平台复用入口；
+/// 套用与 Windows 同款的 (路径, mtime, 大小) 记忆化缓存。
 #[cfg(target_os = "macos")]
 pub(crate) fn version_of(path: &str) -> Option<String> {
-    let start = std::path::Path::new(path);
-    // 起点自身即 .app（2026-10-05 审查修复）：qoder_env_check 的 mac 候选直接是
-    // bundle 目录（/Applications/Qoder CN IDE.app），原实现从 parent() 起步上溯，
-    // 永远遇不到 .app 扩展名 → 版本号恒 null；先查自身再上溯，exe 裸路径行为不变
-    if start.extension().map(|e| e == "app").unwrap_or(false) {
-        return crate::switcher::locate::read_info_plist_value(
-            start,
-            "CFBundleShortVersionString",
-        );
-    }
-    let mut cur = start.parent();
-    while let Some(dir) = cur {
-        if dir.extension().map(|e| e == "app").unwrap_or(false) {
+    version_cached(path, || {
+        let start = std::path::Path::new(path);
+        // 起点自身即 .app（2026-10-05 审查修复）：qoder_env_check 的 mac 候选直接是
+        // bundle 目录（/Applications/Qoder CN IDE.app），原实现从 parent() 起步上溯，
+        // 永远遇不到 .app 扩展名 → 版本号恒 null；先查自身再上溯，exe 裸路径行为不变
+        if start.extension().map(|e| e == "app").unwrap_or(false) {
             return crate::switcher::locate::read_info_plist_value(
-                dir,
+                start,
                 "CFBundleShortVersionString",
             );
         }
-        cur = dir.parent();
-    }
-    None
+        let mut cur = start.parent();
+        while let Some(dir) = cur {
+            if dir.extension().map(|e| e == "app").unwrap_or(false) {
+                return crate::switcher::locate::read_info_plist_value(
+                    dir,
+                    "CFBundleShortVersionString",
+                );
+            }
+            cur = dir.parent();
+        }
+        None
+    })
 }
 
 /// 其余平台（非 Windows/macOS）占位：恒 None，保证调用方编译通过
@@ -245,23 +266,61 @@ pub(crate) fn version_of(_path: &str) -> Option<String> {
     None
 }
 
+/// 版本缓存条目：(mtime 毫秒, 文件大小) → 版本串（None 也缓存，避免反复读无版本资源的文件）
+type VersionEntry = (u64, u64, Option<String>);
+
+fn version_cache() -> &'static Mutex<HashMap<String, VersionEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, VersionEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 文件「版本是否变化」指纹（mtime + 大小）；取不到（文件不存在/无权限）时不做缓存
+fn file_stamp(path: &str) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some((mtime, meta.len()))
+}
+
+/// 版本读取的记忆化：指纹（路径 + mtime + 大小）未变则直接返回缓存，否则 `compute` 后写回
+/// （None 同样缓存，避免反复读无版本资源的文件）；文件 stat 不到时不缓存，每次重试。
+fn version_cached(path: &str, compute: impl FnOnce() -> Option<String>) -> Option<String> {
+    let key = path.to_ascii_lowercase();
+    let stamp = file_stamp(path);
+    if let Some(stamp) = stamp {
+        let guard = version_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((mtime, len, v)) = guard.get(&key) {
+            if (*mtime, *len) == stamp {
+                return v.clone();
+            }
+        }
+    }
+    let v = compute();
+    if let Some((mtime, len)) = stamp {
+        let mut guard = version_cache().lock().unwrap_or_else(|e| e.into_inner());
+        // 防御：键集合本应有界（客户端 exe 数量级），异常膨胀时整体清空重来
+        if guard.len() > 256 {
+            guard.clear();
+        }
+        guard.insert(key, (mtime, len, v.clone()));
+    }
+    v
+}
+
+/// Trae CN IDE 进程检测：Windows 用 sysinfo 进程表枚举 + 短 TTL 复用（main 合并，
+/// 原 tasklist 子进程 ~260ms）；mac 按 bundle 主进程路径段匹配（M-1 ⑥：映像名均
+/// 为 Electron，按名字比对恒不命中）
 fn is_running_cn() -> bool {
     #[cfg(windows)]
     {
-        let out = sys_command("tasklist")
-            .args(["/FI", "IMAGENAME eq Trae CN.exe", "/NH"])
-            .output();
-        match out {
-            Ok(o) => {
-                let s = String::from_utf8_lossy(&o.stdout);
-                s.contains("Trae CN.exe")
-            }
-            Err(_) => false,
-        }
+        crate::switcher::proc::any_running(&["Trae CN"])
     }
     #[cfg(target_os = "macos")]
     {
-        // M-1 ⑥：映像名均为 Electron，按 bundle 主进程路径段匹配（不可按映像名比对）
         crate::commands::process::mac_app_running(&["Trae CN"])
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -273,16 +332,7 @@ fn is_running_cn() -> bool {
 fn is_running() -> bool {
     #[cfg(windows)]
     {
-        let out = sys_command("tasklist")
-            .args(["/FI", "IMAGENAME eq TRAE SOLO CN.exe", "/NH"])
-            .output();
-        match out {
-            Ok(o) => {
-                let s = String::from_utf8_lossy(&o.stdout);
-                s.contains("TRAE SOLO CN.exe")
-            }
-            Err(_) => false,
-        }
+        crate::switcher::proc::any_running(&["TRAE SOLO CN"])
     }
     #[cfg(target_os = "macos")]
     {
@@ -549,25 +599,58 @@ pub fn codebuddy_env_check(state: State<AppState>) -> CodeBuddyEnvCheck {
     }
 }
 
-/// CodeBuddy 进程检测：同时覆盖通用形态 CodeBuddy.exe 与本机实测的 "CodeBuddy CN.exe"
+/// CodeBuddy 进程检测：同时覆盖通用形态 CodeBuddy 与本机实测的 "CodeBuddy CN"。
+/// Windows：sysinfo 进程表一次枚举（main 合并，原逐名 tasklist 子进程 ~520ms）；
+/// mac：按 bundle 主进程路径段匹配（M-1 ⑥，CodeBuddy 灰度域，目录名双形态兼容）
 fn is_running_codebuddy() -> bool {
+    #[cfg(windows)]
+    {
+        crate::switcher::proc::any_running(&["CodeBuddy CN", "CodeBuddy"])
+    }
     #[cfg(target_os = "macos")]
     {
         // M-1 ⑥：按 bundle 主进程路径段匹配（CodeBuddy 灰度域，目录名双形态兼容）
         crate::commands::process::mac_app_running(&["CodeBuddy", "CodeBuddy CN"])
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
-        for exe in ["CodeBuddy CN.exe", "CodeBuddy.exe"] {
-            let out = sys_command("tasklist")
-                .args(["/FI", &format!("IMAGENAME eq {exe}"), "/NH"])
-                .output();
-            if matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains(exe)) {
-                return true;
-            }
-        }
         false
     }
+}
+
+/// 兜底两级（注册表搜索 / 进程反查）结果短 TTL 缓存（P1 去重）。
+/// 一轮界面切换里概览页与顶栏会对同一应用各探测一次（CodeBuddy 本机默认路径不存在，
+/// 每轮都会走 `reg query`，实测 ~250ms/次），命中缓存直接复用上一轮结果。
+/// 只缓存兜底两级：手动指定与默认路径仍实时判定，用户刚改设置需立即生效。
+/// 仅 Windows 探测链消费（mac 走 bundle 定位链，无注册表/进程反查兜底）。
+#[cfg(not(target_os = "macos"))]
+const LOCATE_FALLBACK_TTL: Duration = Duration::from_secs(3);
+
+#[cfg(not(target_os = "macos"))]
+fn locate_fallback_cached<F>(app: &str, level: &str, f: F) -> Option<String>
+where
+    F: FnOnce() -> Option<String>,
+{
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Option<String>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{app}:{level}");
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        // 「未找到」同样缓存：避免同轮切换里重复跑一次注定失败的注册表全量搜索
+        if let Some((at, v)) = guard.get(&key) {
+            if at.elapsed() < LOCATE_FALLBACK_TTL {
+                return v.clone();
+            }
+        }
+    }
+    let v = f();
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    // 防御：键集合本应有界（应用数 × 两级），异常膨胀时整体清空重来
+    if guard.len() > 64 {
+        guard.clear();
+    }
+    guard.insert(key, (Instant::now(), v.clone()));
+    v
 }
 
 /// app_locate 的内部版本（供 open_* 命令与 workbuddy 模块复用；无需 Option 包装）。
@@ -765,10 +848,11 @@ fn app_locate_windows(state: &State<AppState>, app: &str) -> AppLocate {
             return finish_locate(&profile, expanded, "default", None);
         }
     }
-    if let Some(exe) = registry_app_path(&profile) {
+    if let Some(exe) = locate_fallback_cached(app, "registry", || registry_app_path(&profile)) {
         return finish_locate(&profile, exe, "registry", None);
     }
-    if let Some(exe) = process_exe_path(profile.proc_names) {
+    if let Some(exe) = locate_fallback_cached(app, "process", || process_exe_path(profile.proc_names))
+    {
         return finish_locate(&profile, exe, "process", None);
     }
     AppLocate {
@@ -907,22 +991,13 @@ fn resolve_reg_profile_candidate(
     None
 }
 
-/// 运行进程反查 exe 路径（Get-Process 取 Path，应用运行中时最准）
+/// 运行进程反查 exe 路径（应用运行中时最准）：精确映像名匹配，取首个带路径的进程。
+/// 原 powershell 实现（单次 1.2s+）改 sysinfo 直读（`switcher::proc::running_exe_exact`，
+/// main 合并）；仅 Windows 探测链消费（mac 走 bundle 定位链的进程回退级）。
 #[cfg(not(target_os = "macos"))]
 fn process_exe_path(proc_names: &[&str]) -> Option<String> {
-    let names = proc_names
-        .iter()
-        .map(|n| format!("'{n}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let ps = format!(
-        "(Get-Process -Name @({names}) -ErrorAction SilentlyContinue | Where-Object {{ $_.Path }} | Select-Object -First 1).Path"
-    );
-    let out = sys_command("powershell")
-        .args(["-NoProfile", "-Command", &ps])
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let exe = crate::switcher::proc::running_exe_exact(proc_names)?;
+    let s = exe.to_string_lossy().to_string();
     if s.is_empty() || !std::path::Path::new(&s).is_file() {
         None
     } else {

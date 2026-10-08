@@ -115,7 +115,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 Err(format!(
-                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（30 分钟后自动重试）"
+                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（稍后自动重试）"
                 ))
             } else {
                 Ok(done)
@@ -161,9 +161,12 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
             .map(|_| serde_json::json!({ "ok": true }))
         }
         // 刷新全部账号剩余积分：按积分包 CycleStartTime 归日口径重算 credits_daily
-        // 快照（今日 earned + API 可见历史修正），无需启动 GUI
-        "refresh-credits" => crate::commands::accounts::refresh_remaining_credits_impl(state)
-            .map(|n| serde_json::json!({ "refreshed": n, "snapshot": "credits_daily.json" })),
+        // 快照（今日 earned + API 可见历史修正），无需启动 GUI。
+        // runtime=None：CLI 独立进程，不存在网关运行态
+        "refresh-credits" => {
+            crate::commands::accounts::refresh_remaining_credits_impl(state, None)
+                .map(|n| serde_json::json!({ "refreshed": n, "snapshot": "credits_daily.json" }))
+        }
         // Trae 消耗明细同步（issue #61；调度器/CLI 共用；无账号跳过，全部账号拉取失败返 Err）
         "trae-usage-sync" => {
             let accounts = crate::vault::load_accounts(state);

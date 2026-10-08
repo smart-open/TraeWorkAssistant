@@ -741,6 +741,10 @@ fn run_wb_stream(
                                 note_model_failure_ex(state, model, Some(&msg));
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
+                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                if kind.unbinds_sticky() {
+                                    state.wb_sticky.unbind_uid(&win_uid);
+                                }
                             }
                             if !sent_any {
                                 // 流未开始：错误不下发，允许换号重试
@@ -840,6 +844,10 @@ fn run_wb_stream(
                             }
                             let kind = classify_error(status, &resp_body);
                             state.wb_pool.note_error(&picked.uid, kind);
+                            // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                            if kind.unbinds_sticky() {
+                                state.wb_sticky.unbind_uid(&picked.uid);
+                            }
                             note_model_failure_ex(state, model, upstream_msg(&resp_body).as_deref());
                             *safe_lock(&state.last_error) = Some(format!(
                                 "wb uid={} status={} body={}",
@@ -1080,6 +1088,10 @@ pub async fn wb_aggregate_chat(
                                 if kind != ErrKind::None {
                                     state.wb_pool.note_error(win_uid, kind);
                                     note_model_failure_ex(&state, &model, Some(&msg));
+                                    // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                    if kind.unbinds_sticky() {
+                                        state.wb_sticky.unbind_uid(&win_uid);
+                                    }
                                 }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
@@ -1144,6 +1156,10 @@ pub async fn wb_aggregate_chat(
                                 }
                                 let kind = classify_error(status, &resp_body);
                                 state.wb_pool.note_error(&picked.uid, kind);
+                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                if kind.unbinds_sticky() {
+                                    state.wb_sticky.unbind_uid(&picked.uid);
+                                }
                                 note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
@@ -1375,6 +1391,10 @@ pub async fn wb_tool_exec_chat(
                             if kind != ErrKind::None {
                                 state.wb_pool.note_error(&picked.uid, kind);
                                 note_model_failure_ex(&state, &model, Some(&msg));
+                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                if kind.unbinds_sticky() {
+                                    state.wb_sticky.unbind_uid(&picked.uid);
+                                }
                             }
                             *safe_lock(&state.last_error) =
                                 Some(format!("wb-toolexec uid={} code={} msg={}", picked.uid, code, msg));
@@ -1509,6 +1529,10 @@ pub async fn wb_tool_exec_chat(
                                 }
                                 let kind = classify_error(status, &resp_body);
                                 state.wb_pool.note_error(&picked.uid, kind);
+                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                if kind.unbinds_sticky() {
+                                    state.wb_sticky.unbind_uid(&picked.uid);
+                                }
                                 note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
                                 break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 200)));
                             }

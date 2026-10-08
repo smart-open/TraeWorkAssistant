@@ -1697,6 +1697,25 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 state.pool.note_error(&win_uid, kind);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} code={} msg={}", win_uid, code, msg));
+                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                if kind.unbinds_sticky() {
+                                    state.trae_sticky.unbind_uid(&win_uid);
+                                }
+                            }
+                            // issue #67：流未开始（零内容流出）的账号级错误 → 换号重试
+                            // （对齐空完成分支：错误帧未下发，重试流可在同一连接续传；
+                            // ErrKind::None 属请求级错误，换号无意义，照旧延迟透传）
+                            if !sent_any && kind != ErrKind::None {
+                                state.logger.log_request_ttfb(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    200, &win_uid, duration_ms, ttfb_ms, &key_name,
+                                    &state.pool.name_of(&win_uid),
+                                    Some(&format!("{} → 换号重试", msg)),
+                                );
+                                if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                    state.logger.log_debug(&win_uid, &converted, None, 200, Some(&msg));
+                                }
+                                break; // 退出重试循环 → 换号
                             }
                             // 审查 P2-5：流内错误按「是否已有输出」决策（inline_error_action
                             // 纯函数，单测锁定口径）
@@ -1807,6 +1826,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 }
                                 let kind = classify_error(status, &resp_body);
                                 state.pool.note_error(&picked.uid, kind);
+                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                if kind.unbinds_sticky() {
+                                    state.trae_sticky.unbind_uid(&picked.uid);
+                                }
                                 let preview = safe_slice(&resp_body, 200);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} status={} body={}", picked.uid, status, preview));
@@ -2112,6 +2135,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 // 守卫一致；误计会在连续 3 次后熔断健康账号
                                 if kind != ErrKind::None {
                                     state.pool.note_error(&picked.uid, kind);
+                                    // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                    if kind.unbinds_sticky() {
+                                        state.trae_sticky.unbind_uid(&picked.uid);
+                                    }
                                 }
                                 *safe_lock(&state.last_error) = Some(format!(
                                     "uid={} code={} msg={}",
@@ -2223,6 +2250,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 }
                                 let kind = classify_error(status, &resp_body);
                                 state.pool.note_error(&picked.uid, kind);
+                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                if kind.unbinds_sticky() {
+                                    state.trae_sticky.unbind_uid(&picked.uid);
+                                }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} status={}", picked.uid, status));
                                 state.record_usage(

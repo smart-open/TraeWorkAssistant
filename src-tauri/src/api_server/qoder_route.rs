@@ -590,6 +590,10 @@ fn run_qoder_stream(
                         ErrKind::SessionDead
                     };
                     state.qoder_pool.note_error(&picked.uid, kind);
+                    // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                    if kind.unbinds_sticky() {
+                        state.qoder_sticky.unbind_uid(&picked.uid);
+                    }
                     *safe_lock(&state.last_error) =
                         Some(format!("qoder identity uid={} err={}", picked.uid, e));
                     state.logger.log_request(
@@ -732,6 +736,10 @@ fn run_qoder_stream(
                                     let ek = kind.to_err_kind();
                                     if ek != ErrKind::None {
                                         state.qoder_pool.note_error(&win_uid, ek);
+                                        // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                        if ek.unbinds_sticky() {
+                                            state.qoder_sticky.unbind_uid(&win_uid);
+                                        }
                                     }
                                     *safe_lock(&state.last_error) = Some(format!(
                                         "qoder uid={} code={} msg={}",
@@ -852,6 +860,10 @@ fn run_qoder_stream(
                             let kind = classified.kind.to_err_kind();
                             if kind != ErrKind::None {
                                 state.qoder_pool.note_error(&picked.uid, kind);
+                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                if kind.unbinds_sticky() {
+                                    state.qoder_sticky.unbind_uid(&picked.uid);
+                                }
                             }
                             *safe_lock(&state.last_error) = Some(format!(
                                 "qoder uid={} status={} body={}",
@@ -1054,6 +1066,10 @@ pub async fn qoder_aggregate_chat(
                             ErrKind::SessionDead
                         };
                         state.qoder_pool.note_error(&picked.uid, kind);
+                        // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                        if kind.unbinds_sticky() {
+                            state.qoder_sticky.unbind_uid(&picked.uid);
+                        }
                         *safe_lock(&state.last_error) =
                             Some(format!("qoder identity uid={} err={}", picked.uid, e));
                         continue;
@@ -1184,6 +1200,10 @@ pub async fn qoder_aggregate_chat(
                                         let ek = kind.to_err_kind();
                                         if ek != ErrKind::None {
                                             state.qoder_pool.note_error(&win_uid, ek);
+                                            // issue #67 审查修复：账号级长冷却解绑粘性（与流式分支口径对齐）
+                                            if ek.unbinds_sticky() {
+                                                state.qoder_sticky.unbind_uid(&win_uid);
+                                            }
                                         }
                                     }
                                     None => {
@@ -1248,6 +1268,10 @@ pub async fn qoder_aggregate_chat(
                                 let kind = classified.kind.to_err_kind();
                                 if kind != ErrKind::None {
                                     state.qoder_pool.note_error(&picked.uid, kind);
+                                    // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                    if kind.unbinds_sticky() {
+                                        state.qoder_sticky.unbind_uid(&picked.uid);
+                                    }
                                 }
                                 *safe_lock(&state.last_error) = Some(format!(
                                     "qoder uid={} status={}",

@@ -1231,14 +1231,22 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
 /// 刷新所有账号剩余积分（管理页/积分页刷新按钮入口）。
 /// 同时执行自动解冻：签到成功且有积分（credits > 0）且冷却类型非 SessionDead → 清除冷却。
 #[tauri::command(async)]
-pub fn refresh_remaining_credits(state: State<AppState>) -> Result<usize, String> {
-    refresh_remaining_credits_impl(&state)
+pub fn refresh_remaining_credits(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<usize, String> {
+    refresh_remaining_credits_impl(&state, Some(runtime.inner()))
 }
 
 /// 刷新实现（供 Tauri 命令与 `--task-run refresh-credits` CLI 任务共用）：
 /// 逐账号查询积分包 → 回写 remaining_credits.json → 按 CycleStartTime 归日口径
 /// 重算 credits_daily.json 快照（今日 earned + API 可见历史修正）。
-pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String> {
+/// `runtime` 非空（GUI 进程内调用）时网关运行中会把新积分回写池内条目
+/// （issue #67：只写库不回写池会导致秃号内存 credits>0 永远 selectable）。
+pub fn refresh_remaining_credits_impl(
+    state: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<usize, String> {
     let accounts = crate::vault::load_accounts(state);
     let mut rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
     let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
@@ -1325,6 +1333,12 @@ pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String>
     }
     rc.updated_at = Some(fs_utils::now_iso());
     crate::store::docs::remaining_credits_save(&crate::store::db(&state.data_dir), &rc)?;
+
+    // issue #67：网关运行中把新积分快照回写池内条目（expire_first 等策略
+    // 读取的是池内快照；只写库不回写池 → 秃号持续被选中）
+    if let Some(rt) = runtime {
+        crate::commands::api_server::push_credits_if_running(state, rt);
+    }
 
     // 记录每日积分快照（total / earned / consumed）
     record_daily_snapshot(state, &rc, &pack_earned_daily);

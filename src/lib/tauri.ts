@@ -250,8 +250,11 @@ export const api = {
     // Buddy 双应用：profile_list / profile_restore / profile_delete 支持 WorkBuddy / CodeBuddy 档案映射
     // Qoder：M3 Icube 档案（data/profiles_qoder；切号快照保存/恢复）
     // QoderWork：2026-10-02 Qoder Work 独立客户端档案（data/profiles_qoder_work；electron-root 布局）
-    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
-      invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null }),
+    // fresh=true 绕过体积缓存强制重算（「刷新列表」按钮用；默认命中缓存，避免每次开弹窗遍历快照目录）
+    list: (
+      targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork',
+      fresh?: boolean,
+    ) => invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null, fresh: fresh ?? null }),
     backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'Qoder' | 'QoderWork') =>
       invoke('profile_backup', { userId, targetApp: targetApp ?? null }),
     restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>

@@ -115,6 +115,70 @@ pub fn running_exe_of(prof: &AppProfile) -> Option<std::path::PathBuf> {
     }
 }
 
+// ── 环境检测用进程查询（零子进程）──────────────────────────────────────────
+
+/// 进程映像名集合快照的复用时长：环境检测在「一轮界面切换」里会被概览页与顶栏各问
+/// 一次（Buddy 一次切换实测 5 次），短 TTL 复用同一份进程表快照即可。
+#[cfg(windows)]
+const PROC_NAME_TTL: Duration = Duration::from_secs(2);
+
+/// 全进程映像名集合（剥离 `.exe` 后缀、统一小写）。
+/// 原实现用 `tasklist` 子进程逐次探测（单次实测 ~260ms），改为 sysinfo 枚举一次 +
+/// 短 TTL 复用。注意：关闭/强杀轮询需实时快照，走 `list_procs`，不要用本缓存。
+/// Windows 专属：mac 映像名均为 Electron（M-1 ⑥），进程检测走 bundle 路径段
+/// 匹配（commands::process::mac_app_running），不走映像名白名单。
+#[cfg(windows)]
+pub fn running_name_set() -> std::sync::Arc<std::collections::HashSet<String>> {
+    type Entry = (Instant, std::sync::Arc<std::collections::HashSet<String>>);
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Entry>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, set)) = guard.as_ref() {
+        if at.elapsed() < PROC_NAME_TTL {
+            return set.clone();
+        }
+    }
+    let set: std::sync::Arc<std::collections::HashSet<String>> = std::sync::Arc::new(
+        snapshot()
+            .processes()
+            .values()
+            .map(|p| {
+                let name = p.name().to_string_lossy();
+                strip_exe_suffix(&name).to_ascii_lowercase()
+            })
+            .collect(),
+    );
+    *guard = Some((Instant::now(), set.clone()));
+    set
+}
+
+/// 是否有任一映像名命中（Get-Process -Name 语义：精确名、大小写不敏感、自动兼容
+/// sysinfo 的 `.exe` 后缀形态）。环境检测专用，零子进程。
+#[cfg(windows)]
+pub fn any_running(names: &[&str]) -> bool {
+    let set = running_name_set();
+    names
+        .iter()
+        .any(|n| set.contains(strip_exe_suffix(n).to_ascii_lowercase().as_str()))
+}
+
+/// 精确映像名命中的进程 exe 全路径（首个命中）：`Get-Process -Name @(...) | Select -First 1`
+/// 的进程内等价实现（原 `env::process_exe_path` 走 powershell，单次 ~1.2s）。
+/// 需要返回路径，故取实时快照，不复用只存名字的 `running_name_set`。
+#[cfg(windows)]
+pub fn running_exe_exact(names: &[&str]) -> Option<std::path::PathBuf> {
+    snapshot()
+        .processes()
+        .values()
+        .filter(|p| {
+            let name = p.name().to_string_lossy();
+            names
+                .iter()
+                .any(|want| strip_exe_suffix(&name).eq_ignore_ascii_case(strip_exe_suffix(want)))
+        })
+        .find_map(|p| p.exe().map(|e| e.to_path_buf()))
+}
+
 /// Stop-Trae 对译：三级关闭。
 /// 自身/父进程排除逻辑不再需要：精确映像名匹配（TRAE SOLO CN.exe 等）永不命中
 /// ai-work-assistant.exe；旧版进程名「Trae Work 助手」的兼容排除为死代码，删除
@@ -494,6 +558,29 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn any_running_命中自身且不误命中() {
+        // 环境检测进程查询（原 tasklist 子进程）零子进程化的语义锁定：
+        // 自身测试进程必命中；sysinfo 带 .exe 后缀形态同样命中；不存在名字不误命中
+        let own = std::env::current_exe().expect("取当前测试进程路径");
+        let stem = own
+            .file_stem()
+            .expect("测试进程应有文件名")
+            .to_string_lossy()
+            .to_string();
+        assert!(any_running(&[&stem]), "自身进程应命中: {stem}");
+        assert!(any_running(&[&format!("{stem}.exe")]), "带 .exe 后缀应命中");
+        assert!(!any_running(&["aiwork-definitely-not-a-process"]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn running_name_set_ttl内复用同一份快照() {
+        let a = running_name_set();
+        let b = running_name_set();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+    }
+
     #[test]
     fn post_wm_close_对不存在pid无副作用() {
         post_wm_close(u32::MAX - 1);

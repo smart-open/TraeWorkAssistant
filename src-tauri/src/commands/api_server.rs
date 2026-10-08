@@ -705,6 +705,31 @@ pub fn reload_pools_if_running(
     );
 }
 
+/// 网关运行中回写 Trae 池积分快照（issue #67）：refresh_remaining_credits 刷新后
+/// 调用，让 expire_first 等策略基于最新积分选号。此前刷新只写库不回写池，秃号
+/// 内存中 credits>0 永远 selectable、粘性/策略持续命中同一账号。服务未运行时
+/// no-op；仅回写 Trae 池（WB 池积分随 sync_from_wb 走另一数据链，不适用）。
+pub fn push_credits_if_running(
+    state: &AppState,
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+) {
+    let guard = safe_lock(runtime);
+    let Some(rt) = guard.as_ref() else { return };
+    let credits_file: RemainingCreditsFile =
+        crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
+    // 池积分语义与 apply_pool_snapshot 一致：优先 general 表，回退旧总积分表
+    let pool_credits: std::collections::HashMap<String, f64> = credits_file
+        .credits
+        .iter()
+        .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
+        .collect();
+    rt.shared.pool.update_credits(&pool_credits);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!("API服务池积分回写(运行期): n={}", pool_credits.len()),
+    );
+}
+
 /// pool_set 字段合并（纯函数，便于单测）：未传（None）保留 existing 原值，传值覆盖。
 /// 注意 strategy/wb_strategy 的显式空串是合法值（"跟随默认"语义），与 None（未传）区分；
 /// group_ids 显式空数组 = 清空分组，None = 保留（语义与其他字段统一）。

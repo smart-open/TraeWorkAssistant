@@ -677,10 +677,11 @@ export default function BuddyAccounts() {
 
   // ---- 登录态快照管理（WorkBuddy / CodeBuddy 双应用 profile 槽）----
   // 读取指定应用的快照列表（profile_list 按 targetApp 映射 profiles_workbuddy / profiles_codebuddy）
-  const loadSnapshots = async (target: 'WorkBuddy' | 'CodeBuddy') => {
+  const loadSnapshots = async (target: 'WorkBuddy' | 'CodeBuddy', fresh = false) => {
     setSnapLoading(true);
     try {
-      setSnapList(await api.profiles.list(target));
+      // fresh=true 仅「刷新列表」按钮用：绕过后端体积缓存强制重算（常态命中缓存，弹窗秒开）
+      setSnapList(await api.profiles.list(target, fresh));
     } catch (err) {
       pushToast('error', `读取快照列表失败：${String(err)}`);
       setSnapList([]);
@@ -1526,7 +1527,7 @@ export default function BuddyAccounts() {
         footer={
           <button
             className="btn-outline"
-            onClick={() => void loadSnapshots(snapTarget)}
+            onClick={() => void loadSnapshots(snapTarget, true)}
             disabled={snapLoading || snapOp != null || snapConfirm != null}
           >
             <RefreshCw size={14} className={snapLoading ? 'animate-spin' : ''} /> 刷新列表

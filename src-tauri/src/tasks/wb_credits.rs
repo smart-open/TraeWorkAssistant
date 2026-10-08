@@ -18,6 +18,32 @@ use super::wb_common;
 
 const CACHE_TTL_SECS: f64 = 10.0 * 60.0; // ≥10min 缓存（频控红线，原 5min）
 
+/// 单轮刷新的账号并发上限：账号之间无依赖，原串行 for 让「N 账号 × ≥3 次请求」在慢网络
+/// （全局代理 / 跨境出口）下线性放大；同账号内部仍保持 summary → 包明细的先后顺序。
+const MAX_FETCH_WORKERS: usize = 4;
+
+/// 缓存过期时的「先回旧值」直出（stale-while-revalidate 的前半程，见
+/// commands/workbuddy/credits.rs）：TTL 内 / 无缓存 / 账号明细为空 → None，
+/// 交调用方走原路径（命中缓存或同步拉取）。
+/// 返回体带 `cached:true, refreshing:true`，供前端稍后重取一次拿最新值；
+/// 刻意不打 `stale`——该字段是 F-59「刷新失败回退」语义，本处刷新只是转后台、并未失败。
+pub fn stale_reply(state: &AppState, user_id: Option<&str>) -> Option<Value> {
+    let cache: Value = crate::store::db(&state.data_dir).kv_get("workbuddy_credits_cache");
+    let fetched_ts = cache.get("fetched_ts").and_then(Value::as_f64).unwrap_or(0.0);
+    if fetched_ts <= 0.0 || now_secs() - fetched_ts < CACHE_TTL_SECS {
+        return None;
+    }
+    let cached_accounts = cache.get("accounts").cloned().unwrap_or(json!([]));
+    if cached_accounts.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        return None;
+    }
+    let accounts = match user_id {
+        Some(uid) => filter_accounts(cached_accounts, uid, "user_id"),
+        None => cached_accounts,
+    };
+    Some(json!({"ok": true, "cached": true, "refreshing": true, "accounts": accounts}))
+}
+
 fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -503,6 +529,89 @@ fn filter_accounts(v: Value, uid: &str, key: &str) -> Value {
     Value::Array(arr)
 }
 
+/// 并行执行（≤workers 并发），结果与逐项耗时按**原序**回填；抽成泛型便于单测锁定
+/// 「保序 + 确实并发」两条契约（f panic 就地捕获 → 槽位缺失返回 None，由调用方占位保序）。
+fn parallel_ordered<T, R, F>(items: &[T], workers: usize, f: F) -> (Vec<Option<R>>, Vec<u128>)
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    if items.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let workers = workers.clamp(1, items.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: std::sync::Mutex<Vec<Option<(R, u128)>>> =
+        std::sync::Mutex::new((0..items.len()).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= items.len() {
+                    break;
+                }
+                let t0 = std::time::Instant::now();
+                // panic 占位落实（2026-10-08 评审）：thread::scope 会向调用方传播未捕获
+                // panic（令整轮取数 Err），此处就地捕获——单账号异常只占位失败行，
+                // 对齐「单账号失败不拖垮整轮」语义
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&items[i])));
+                let ms = t0.elapsed().as_millis();
+                if let Ok(out) = out {
+                    if let Ok(mut guard) = slots.lock() {
+                        guard[i] = Some((out, ms));
+                    }
+                }
+            });
+        }
+    });
+    let mut results: Vec<Option<R>> = Vec::with_capacity(items.len());
+    let mut durations: Vec<u128> = Vec::with_capacity(items.len());
+    for slot in slots.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        match slot {
+            Some((r, ms)) => {
+                results.push(Some(r));
+                durations.push(ms);
+            }
+            None => {
+                results.push(None);
+                durations.push(0);
+            }
+        }
+    }
+    (results, durations)
+}
+
+/// 全池取数（并发 ≤ MAX_FETCH_WORKERS），结果按账号原序返回；线程异常的账号占位为失败行，
+/// 不让后续账号结果错位（对齐原有「单账号失败不拖垮整轮」语义）。
+fn fetch_accounts_parallel(
+    state: &AppState,
+    agent: &ureq::Agent,
+    accounts: &[Value],
+) -> (Vec<Value>, Vec<u128>) {
+    let (slots, durations) = parallel_ordered(accounts, MAX_FETCH_WORKERS, |acct| {
+        fetch_account(state, agent, acct)
+    });
+    let rows = slots
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.unwrap_or_else(|| {
+                json!({
+                    "user_id": accounts[i].get("id").cloned().unwrap_or(json!("")),
+                    "name": accounts[i].get("nickname").cloned().unwrap_or(json!("")),
+                    "ok": false,
+                    "message": "取数任务异常退出",
+                    "balance": Value::Null,
+                    "packages": [],
+                    "source": "none",
+                })
+            })
+        })
+        .collect();
+    (rows, durations)
+}
+
 /// 积分查询主入口（对齐 python main）：缓存 → 全池/单账号取数 → stale-on-error →
 /// 回写缓存。返回值即原 python stdout 末行 JSON（credits.rs 消费契约）。
 pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Result<Value, String> {
@@ -531,9 +640,23 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         accounts.retain(|a| a.get("id").and_then(Value::as_str) == Some(uid));
     }
 
-    let mut results: Vec<Value> = vec![];
-    for acct in &accounts {
-        results.push(fetch_account(state, &agent, acct));
+    let t_all = std::time::Instant::now();
+    let (results, durations) = fetch_accounts_parallel(state, &agent, &accounts);
+    if !accounts.is_empty() {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "[wb-credits] 取数 {} 账号 共 {}ms（并发 {} 路；逐账号 {}ms）",
+                accounts.len(),
+                t_all.elapsed().as_millis(),
+                accounts.len().min(MAX_FETCH_WORKERS),
+                durations
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            ),
+        );
     }
 
     // stale-on-error（F-59）：刷新失败（全部账号 ok=false）且存在历史缓存 →
@@ -669,5 +792,105 @@ mod wb_credits_tests {
             {"PackageCode": "p_b", "CapacitySize": 2},
         ]}});
         assert_eq!(package_codes_from(&body), vec!["p_b", "p_a"]);
+    }
+
+    // ── 并发取数 / SWR 缓存三态（2026-10-08 提速修订）────────────────────
+
+    fn temp_state(tag: &str) -> AppState {
+        let dir = std::env::temp_dir().join(format!("aiwork_wbcredits_{tag}_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("data"));
+        AppState {
+            data_dir: dir,
+            jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        }
+    }
+
+    #[test]
+    fn 并行取数保序且确实并发() {
+        let items: Vec<u32> = (0..8).collect();
+        let live = std::sync::atomic::AtomicUsize::new(0);
+        let max_live = std::sync::atomic::AtomicUsize::new(0);
+        let (out, durations) = parallel_ordered(&items, 4, |x| {
+            let cur = live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            max_live.fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            x * 2
+        });
+        let out: Vec<u32> = out.into_iter().map(|v| v.expect("槽位应齐全")).collect();
+        assert_eq!(out, vec![0, 2, 4, 6, 8, 10, 12, 14], "结果必须按原序回填");
+        assert_eq!(durations.len(), 8);
+        assert!(
+            max_live.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "应观察到并发执行（≥2 路同时在跑）"
+        );
+    }
+
+    #[test]
+    fn 并发取数panic占位不传播() {
+        // 2026-10-08 评审：f panic 必须就地捕获占位 None——thread::scope 会传播未捕获
+        // panic，若不捕获则单账号异常令整轮取数 Err（占位语义回归锁定）
+        let items: Vec<u32> = vec![1, 2, 3];
+        let (out, durations) = parallel_ordered(&items, 2, |x| {
+            if *x == 2 {
+                panic!("模拟单账号取数异常");
+            }
+            x * 10
+        });
+        assert_eq!(out[0], Some(10));
+        assert!(out[1].is_none(), "panic 项应占位 None");
+        assert_eq!(out[2], Some(30));
+        assert_eq!(durations[1], 0, "panic 项耗时占位 0");
+    }
+
+    #[test]
+    fn 缓存过期才先回旧值() {
+        let st = temp_state("stale_reply");
+        let store = crate::store::db(&st.data_dir);
+        // 无缓存 → None（交调用方同步拉）
+        assert!(stale_reply(&st, None).is_none());
+        // TTL 内 → None（照常命中缓存，无需转后台）
+        let _ = store.kv_set(
+            "workbuddy_credits_cache",
+            &json!({"fetched_ts": now_secs() - 60.0, "accounts": [{"user_id": "u1", "balance": 1.0}]}),
+        );
+        assert!(stale_reply(&st, None).is_none());
+        // 过期 → 先回旧值 + refreshing 标记；不打 stale
+        //（stale 是 F-59「刷新失败回退」语义，SWR 只是转后台刷新，并未失败）
+        let _ = store.kv_set(
+            "workbuddy_credits_cache",
+            &json!({
+                "fetched_ts": now_secs() - CACHE_TTL_SECS - 1.0,
+                "accounts": [{"user_id": "u1", "balance": 1.0}],
+            }),
+        );
+        let reply = stale_reply(&st, None).expect("过期缓存应能先回旧值");
+        assert_eq!(reply["cached"], json!(true));
+        assert_eq!(reply["refreshing"], json!(true));
+        assert!(reply.get("stale").is_none(), "SWR 回旧值不应打 stale");
+        assert_eq!(reply["accounts"].as_array().unwrap().len(), 1);
+        // 单账号过滤：命中 1 条、未命中 0 条
+        assert_eq!(
+            stale_reply(&st, Some("u1")).unwrap()["accounts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            stale_reply(&st, Some("nope")).unwrap()["accounts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        // 账号明细为空的缓存视为无缓存 → None（无数据可展示，只能同步拉）
+        let _ = store.kv_set(
+            "workbuddy_credits_cache",
+            &json!({"fetched_ts": now_secs(), "accounts": []}),
+        );
+        assert!(stale_reply(&st, None).is_none());
+        let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 }

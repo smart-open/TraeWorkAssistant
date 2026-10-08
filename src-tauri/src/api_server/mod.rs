@@ -434,6 +434,16 @@ impl ErrKind {
             ErrKind::Forbidden => "Forbidden",
         }
     }
+
+    /// 账号级长冷却/禁用（issue #67）：该类错误应解绑账号的全部粘性绑定，
+    /// 避免其他会话在 TTL 窗口内反复解析到不可用账号。SoftRate/Server/Client
+    /// 等短冷却保留绑定（冷却过后会话可无缝续接）。
+    pub fn unbinds_sticky(self) -> bool {
+        matches!(
+            self,
+            ErrKind::HardCredit | ErrKind::SessionDead | ErrKind::Forbidden
+        )
+    }
 }
 
 /// 4001/model config is empty：模型在当前 function 下不可用（模型问题非账号问题）
@@ -466,11 +476,25 @@ pub fn is_model_config_mismatch(text: &str) -> bool {
         || is_code_4001("\"error_code\": 4001")
 }
 
+/// 积分耗尽短语表（issue #67）：与 wb_route::classify_wb_error 对齐。
+/// 有意不含 "quota exceeded"——Trae 侧 4008 quota=频率限流（SoftRate 60s），
+/// 归入 HardCredit（次日 04:00 冷却）会误杀
+pub fn is_credit_exhausted_error(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("insufficient credit")
+        || lower.contains("积分不足")
+        || lower.contains("额度不足")
+}
+
 /// 按 HTTP 状态码 + body 判定错误类别
 pub fn classify_error(status: u16, body: &str) -> ErrKind {
     // 4001：模型问题非账号问题，不冷却账号
     if is_model_config_mismatch(body) {
         return ErrKind::None;
+    }
+    // 积分耗尽（issue #67）：短语命中 → 硬冷却，优先于状态码口径
+    if is_credit_exhausted_error(body) {
+        return ErrKind::HardCredit;
     }
     // 1005：精确匹配 JSON 键 + plan limit 短语（避免任意 "1005"/"plan" 字样误判）
     let lower_body = body.to_lowercase();
@@ -505,6 +529,11 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     // 4001: 模型配置不存在（model config is empty）→ 不冷却账号，是模型问题非账号问题
     if code == 4001 || msg_lower.contains("model config is empty") {
         return ErrKind::None;
+    }
+    // 积分耗尽（issue #67）：流内 message 短语 → 硬冷却（次日 04:00），
+    // 避免落入 4008 SoftRate（60s）冷却后很快被再次选中、循环薅同一账号
+    if is_credit_exhausted_error(msg) {
+        return ErrKind::HardCredit;
     }
     // 4008: 请求频率超限（quota exceeded）→ 60 秒短冷却，避免误杀
     if code == 4008

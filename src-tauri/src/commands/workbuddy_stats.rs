@@ -204,14 +204,16 @@ fn record_model(value: &Value) -> String {
         .to_string()
 }
 
-/// 递归收集 jsonl（跳过 subagents 子代理目录——重复父会话上下文，不计入用量）
+/// 递归收集 jsonl（跳过 subagents 子代理目录——重复父会话上下文，不计入用量）。
+/// 性能（2026-10-07）：目录判定用 `DirEntry::file_type()`（Windows 读目录项自带，
+/// 免一次额外 stat），替代原 `path.is_dir()`。
 fn collect_jsonl(root: &Path, output: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             if path.file_name().and_then(|name| name.to_str()) != Some("subagents") {
                 collect_jsonl(&path, output);
             }
@@ -219,6 +221,20 @@ fn collect_jsonl(root: &Path, output: &mut Vec<PathBuf>) {
             output.push(path);
         }
     }
+}
+
+/// 子目录列表（仅目录；`DirEntry::file_type()` 免额外 stat）。
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            out.push(entry.path());
+        }
+    }
+    out
 }
 
 /// 项目名：行内 cwd 尾段优先，回退 projects 下首级目录名；路径形态目录名脱敏为「未知项目」
@@ -322,7 +338,11 @@ impl DayTotals {
 
 /// 解析器行为版本：解析逻辑变更（如兼容性容错修复）时 +1。
 /// 增量缓存条目 rev 不匹配时强制重解析，避免旧版本误计数的 parse_errors 滞留展示。
-const PARSE_REV: u32 = 2;
+/// 2 → 3（2026-10-07）：解析路径引入 `"usage"` 快速预筛（不含该字面量的行不再解析，
+/// parse_errors 语义随之收紧），旧缓存条目须强制重解析一次以清除口径差。
+/// 3 → 4（2026-10-08）：CodeBuddy IDE 源新增跨文件按 request id 去重（`FileCacheEntry::ids`），
+/// 旧条目没有 id 列表无法判重，须强制重解析一次。
+const PARSE_REV: u32 = 4;
 
 /// 单文件增量缓存条目
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -338,6 +358,12 @@ struct FileCacheEntry {
     by_model: HashMap<String, HashMap<String, DayTotals>>,
     /// project → date → 聚合
     by_project: HashMap<String, HashMap<String, DayTotals>>,
+    /// 本文件**实际计入**的 request id（仅 CodeBuddy IDE 索引源填充；JSONL 源为空）。
+    /// 用途：同一批请求会被以**新的会话 id** 重新登记到另一个 uid 的目录下（实测同一
+    /// workspace 下 609 个 id 跨 uid 重复，仅靠「文件内去重」会整份多计），聚合层据此
+    /// 做跨文件去重：整份重复 → 整文件跳过；无重复 → 走快路径；部分重复 → 过滤重解析。
+    #[serde(default)]
+    ids: Vec<String>,
     parse_errors: u64,
 }
 
@@ -360,6 +386,12 @@ fn parse_file(path: &Path, fallback_project: &str) -> FileCacheEntry {
         let is_last = lines.peek().is_none();
         let s = line.trim().trim_start_matches('\u{feff}').trim();
         if s.is_empty() {
+            continue;
+        }
+        // 快速预筛（2026-10-07 性能）：本函数只消费含 usage 的记录，不含 `"usage"`
+        // 字面量的行无需解析——会话 jsonl 里多数行是用户/工具消息，实测可省掉大半
+        // serde 开销（344 MB jsonl 集的逐行解析是冷扫的可变成本主项）。
+        if !s.contains("\"usage\"") {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(s) else {
@@ -496,16 +528,68 @@ fn codebuddy_ide_root() -> Option<PathBuf> {
     Some(Path::new(&dir).join("CodeBuddyExtension").join("Data"))
 }
 
-/// 递归收集 CodeBuddy IDE 历史下的 `index.json`（限深防病态目录树）。
-fn collect_codebuddy_indexes(dir: &Path, depth: usize, output: &mut Vec<PathBuf>) {
+/// 收集 CodeBuddy IDE 历史下的**会话级** `index.json`。
+///
+/// 性能（2026-10-07）：改为**按已知结构定向下探**，
+/// `Data\<uid>\<product>\<workspace>\history\<ws-hash>\<session>\index.json`——
+/// 只收集会话级 index.json（工作区级那个由 `conversation_model` 按需直读，
+/// 不进本列表，省掉一次无用解析；实测工作区级索引不含 `requests`，排除无损失）。
+/// 原实现从 `Data` 整树递归找「名为 index.json 且祖先含 history」的文件——
+/// 该根下有约 1 万个目录 / 10 万个文件（约 1.5 GB，含 `messages\`、file-tree、
+/// check-point 等无关子树），为找数百个会话索引要把整棵树 stat 一遍
+/// （实测遍历+stat 约 7~12s），是「Token 统计慢」的主要成本。
+///
+/// `<product>` 不写死：实测至少存在 `CodeBuddyIDE` 与 `VSCode` 两套布局，
+/// 后者同样落 `history\<ws-hash>\<session>\index.json` 且含真实用量
+/// （本机 45 个会话索引中 4 个有用量），只看 `CodeBuddyIDE` 会静默漏计。
+/// 结构异常（新版布局变化）时按**产品子树**回退限深递归兜底（剪掉已知重子树）。
+fn collect_codebuddy_indexes(data_root: &Path, output: &mut Vec<PathBuf>) {
+    for uid_dir in subdirs(data_root) {
+        for product_dir in subdirs(&uid_dir) {
+            let before = output.len();
+            collect_session_indexes(&product_dir, output);
+            if output.len() == before {
+                // 兜底按**产品子树**判零：某产品布局漂移（如新增层级）而其余产品仍
+                // 命中时，全局判零不会触发兜底、该子树的会话索引会被静默漏收。
+                // 子树级判零只对异常子树限深递归，正常子树零慢路径不变；
+                // 起点比全局兜底深一层、深度预算更足，覆盖原全局兜底的全部搜索
+                // 范围（Data 根直接子树即全部 product_dir，根上文件本就不含
+                // history 祖先），故不再保留全局兜底。
+                collect_codebuddy_indexes_deep(&product_dir, 0, output);
+            }
+        }
+    }
+}
+
+/// 单个产品子树的结构化定向下探：`<workspace>\history\<ws-hash>\<session>\index.json`。
+fn collect_session_indexes(product_dir: &Path, output: &mut Vec<PathBuf>) {
+    for workspace_root in subdirs(product_dir) {
+        let history = workspace_root.join("history");
+        for ws_hash in subdirs(&history) {
+            for session in subdirs(&ws_hash) {
+                let idx = session.join("index.json");
+                if idx.is_file() {
+                    output.push(idx);
+                }
+            }
+        }
+    }
+}
+
+/// 兜底用的限深递归（剪掉已知重子树：messages/file-tree/check-point/plan-task）。
+fn collect_codebuddy_indexes_deep(dir: &Path, depth: usize, output: &mut Vec<PathBuf>) {
     if depth > 8 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            collect_codebuddy_indexes(&path, depth + 1, output);
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(name, "messages" | "file-tree" | "check-point" | "plan-task") {
+                continue;
+            }
+            collect_codebuddy_indexes_deep(&path, depth + 1, output);
         } else if path.file_name().and_then(|n| n.to_str()) == Some("index.json")
             && path
                 .components()
@@ -518,7 +602,18 @@ fn collect_codebuddy_indexes(dir: &Path, depth: usize, output: &mut Vec<PathBuf>
 
 /// 解析 CodeBuddy IDE 会话索引为按日聚合（与 parse_file 同构的增量缓存单元）。
 /// 工作区级 index.json（只有 conversations/current）自然产出空条目，零误计。
-fn parse_codebuddy_index(path: &Path, memo: &mut HashMap<String, Value>) -> FileCacheEntry {
+///
+/// 去重分两层（实测驱动，2026-10-08）：
+/// 1. **文件内**：同一会话内按 request id 去重（原地）；
+/// 2. **跨文件**：由聚合层做（见 `aggregate_files` 的 IDE 分支）——同一批请求会被以
+///    **新的会话 id** 重新登记到另一个 uid 的目录下（实测同一 workspace 下 609 个 id
+///    跨 uid 重复，仅靠文件内去重会整份多计）。此处把「实际计入的 id」记进 `entry.ids`，
+///    `skip` 非空时跳过其中已计的 id（跨文件部分重复时的重算路径）。
+fn parse_codebuddy_index(
+    path: &Path,
+    memo: &mut HashMap<String, Value>,
+    skip: Option<&HashSet<String>>,
+) -> FileCacheEntry {
     let mut entry = FileCacheEntry { rev: PARSE_REV, ..Default::default() };
     let Ok(raw) = std::fs::read(path) else {
         entry.parse_errors = 1;
@@ -537,7 +632,7 @@ fn parse_codebuddy_index(path: &Path, memo: &mut HashMap<String, Value>) -> File
         .and_then(|n| n.to_str())
         .unwrap_or("");
     let workspace_dir = session_dir.and_then(|p| p.parent());
-    // 同会话内按 request id 去重（跨会话副本不去重——本工具不复制该目录）
+    // 同会话内按 request id 去重（跨文件/跨 uid 副本由聚合层判重，见函数注释）
     let mut seen_ids: HashSet<&str> = HashSet::new();
     for request in requests {
         let Some(object) = request.as_object() else { continue };
@@ -554,6 +649,12 @@ fn parse_codebuddy_index(path: &Path, memo: &mut HashMap<String, Value>) -> File
             continue;
         }
         let Some(day) = object.get("startedAt").and_then(ms_date) else { continue };
+        // 实际计入的 id（供聚合层跨文件判重）；skip 命中表示该 id 已在别的文件计过，
+        // 只登记不聚合。聚合结果是文件的纯函数（与 skip 无关时），故仍可进增量缓存
+        entry.ids.push(id.to_string());
+        if skip.is_some_and(|counted| counted.contains(id)) {
+            continue;
+        }
         let req_type = object.get("type").and_then(Value::as_str).unwrap_or("craft");
         let model = match workspace_dir {
             Some(ws) => conversation_model(memo, ws, conv_id, req_type),
@@ -626,9 +727,13 @@ fn scan_root(
     cache: &mut HashMap<String, FileCacheEntry>,
     seen: &mut HashSet<String>,
 ) -> Value {
+    let t_walk = Instant::now();
     let mut paths = Vec::new();
     collect_jsonl(root, &mut paths);
-    aggregate_files(ScanKind::SessionJsonl, root, name, paths, cutoff, cache, seen)
+    let walk_ms = t_walk.elapsed().as_millis() as u64;
+    let mut view = aggregate_files(ScanKind::SessionJsonl, root, name, paths, cutoff, cache, seen);
+    view["walk_ms"] = json!(walk_ms);
+    view
 }
 
 /// 扫描 CodeBuddy IDE 明细根（`%LOCALAPPDATA%\CodeBuddyExtension\Data`）：
@@ -639,9 +744,11 @@ fn scan_codebuddy_ide(
     cache: &mut HashMap<String, FileCacheEntry>,
     seen: &mut HashSet<String>,
 ) -> Value {
+    let t_walk = Instant::now();
     let mut paths = Vec::new();
-    collect_codebuddy_indexes(root, 0, &mut paths);
-    aggregate_files(
+    collect_codebuddy_indexes(root, &mut paths);
+    let walk_ms = t_walk.elapsed().as_millis() as u64;
+    let mut view = aggregate_files(
         ScanKind::CodebuddyIndex,
         root,
         "codebuddy-ide",
@@ -649,7 +756,9 @@ fn scan_codebuddy_ide(
         cutoff,
         cache,
         seen,
-    )
+    );
+    view["walk_ms"] = json!(walk_ms);
+    view
 }
 
 /// 扫描来源类型：决定「路径 → 增量缓存条目」所用的解析器
@@ -685,6 +794,12 @@ fn aggregate_files(
     let mut parse_errors: u64 = 0;
     let mut coverage_start: Option<i64> = None;
     let mut coverage_end: Option<i64> = None;
+    // 性能指标（2026-10-07）：命中/解析计数与解析耗时，随视图返回供 app_log 汇总
+    let mut hits: u64 = 0;
+    let mut parsed: u64 = 0;
+    let mut parse_ms: u64 = 0;
+    // 本轮扫描已计入的 request id（仅 CodeBuddy IDE 源使用，见下方跨文件去重）
+    let mut counted_ids: HashSet<String> = HashSet::new();
 
     for path in &paths {
         let key = path.to_string_lossy().to_string();
@@ -698,18 +813,53 @@ fn aggregate_files(
             _ => false,
         };
         let entry = if hit {
+            hits += 1;
             cache.get(&key).cloned().unwrap_or_default()
         } else {
+            let t_parse = Instant::now();
             let mut e = match kind {
                 ScanKind::SessionJsonl => parse_file(path, &dir_project_name(root, path)),
-                ScanKind::CodebuddyIndex => parse_codebuddy_index(path, &mut memo),
+                ScanKind::CodebuddyIndex => parse_codebuddy_index(path, &mut memo, None),
             };
+            parsed += 1;
+            parse_ms = parse_ms.saturating_add(t_parse.elapsed().as_millis() as u64);
             if let Some((mtime, size)) = meta {
                 e.mtime_ms = mtime;
                 e.size = size;
             }
             cache.insert(key, e.clone());
             e
+        };
+
+        // CodeBuddy IDE 源：跨文件按 request id 全局去重（见 FileCacheEntry::ids）。
+        // 同一批请求会被以**新的会话 id** 重新登记到另一个 uid 的目录下，若只做文件内
+        // 去重会整份多计（实测本机 609/4123 行、约 16.7% 的 IDE 源用量）。
+        let entry = if kind == ScanKind::CodebuddyIndex && !entry.ids.is_empty() {
+            let dup = entry
+                .ids
+                .iter()
+                .filter(|id| counted_ids.contains(id.as_str()))
+                .count();
+            if dup == entry.ids.len() {
+                // 整份重复：整文件跳过（其全部请求都已在别的文件计入）
+                parse_errors = parse_errors.saturating_add(entry.parse_errors);
+                continue;
+            }
+            let mut filtered: Option<FileCacheEntry> = None;
+            if dup > 0 {
+                // 部分重复：按「本文件之前已计 id」过滤后重算。过滤结果依赖扫描顺序，
+                // 故不进增量缓存（缓存只存与顺序无关的全量聚合）
+                let t_reparse = Instant::now();
+                filtered = Some(parse_codebuddy_index(path, &mut memo, Some(&counted_ids)));
+                parsed += 1;
+                parse_ms = parse_ms.saturating_add(t_reparse.elapsed().as_millis() as u64);
+            }
+            for id in &entry.ids {
+                counted_ids.insert(id.clone());
+            }
+            filtered.unwrap_or(entry)
+        } else {
+            entry
         };
 
         parse_errors = parse_errors.saturating_add(entry.parse_errors);
@@ -785,6 +935,11 @@ fn aggregate_files(
         "parse_errors": parse_errors,
         "coverage_start_at": coverage_start,
         "coverage_end_at": coverage_end,
+        // 性能指标（2026-10-07）：命中数与解析数分开计数（原 cache_hit_files 误为
+        // 「扫到的文件数」）；parse_ms 为本源解析耗时合计，walk_ms 由 scan_* 回填
+        "cache_hit_files": hits,
+        "files_parsed": parsed,
+        "parse_ms": parse_ms,
     })
 }
 
@@ -812,6 +967,7 @@ pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Val
 /// 实现（本命令与调度器 wb-credits-snapshot Token 同步共用）：
 /// fresh=true（前端「重扫」/调度同步）跳过结果缓存强制重扫（仍享受增量缓存）
 pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value {
+    let t_impl = Instant::now();
     if !fresh {
         if let Ok(guard) = RESULT_CACHE.lock() {
             if let Some((at, v)) = guard.as_ref() {
@@ -826,8 +982,12 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
     let now_ms = chrono::Utc::now().timestamp_millis();
     let cutoff = cutoff_date_str();
 
+    // 文件级增量缓存（键=文件路径，值=按日聚合）——整块读写，故单独计时（持全局
+    // DB 锁期间会阻塞 App 其他读写，2026-10-07 埋点纳入观察）
+    let t_db_read = Instant::now();
     let mut cache: HashMap<String, FileCacheEntry> =
         crate::store::db(&state.data_dir).kv_get("token_stats_files");
+    let db_read_ms = t_db_read.elapsed().as_millis() as u64;
     let mut seen: HashSet<String> = HashSet::new();
 
     let mut merged = scan_root(
@@ -850,7 +1010,9 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
 
     // 已删除文件的缓存条目清理（须在三路扫描都完成后执行）
     cache.retain(|k, _| seen.contains(k));
+    let t_db_write = Instant::now();
     let _ = crate::store::db(&state.data_dir).kv_set("token_stats_files", &cache);
+    let db_write_ms = t_db_write.elapsed().as_millis() as u64;
 
     // 合并三路来源：summary/daily/models/projects/daily_by_model 累加
     let ide = third.as_ref();
@@ -882,18 +1044,46 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
         merged.get_mut("daily_by_model"),
         ide.and_then(|v| v.get("daily_by_model")),
     );
-    let files = merged.get("files_scanned").and_then(Value::as_u64).unwrap_or(0)
-        + second.get("files_scanned").and_then(Value::as_u64).unwrap_or(0)
-        + ide.and_then(|v| v.get("files_scanned")).and_then(Value::as_u64).unwrap_or(0);
-    let errs = merged.get("parse_errors").and_then(Value::as_u64).unwrap_or(0)
-        + second.get("parse_errors").and_then(Value::as_u64).unwrap_or(0)
-        + ide.and_then(|v| v.get("parse_errors")).and_then(Value::as_u64).unwrap_or(0);
+    // 三路指标汇总（含 2026-10-07 新增的命中/解析分离计数与分段耗时）
+    let pick = |v: Option<&Value>, key: &str| -> u64 {
+        v.and_then(|x| x.get(key)).and_then(Value::as_u64).unwrap_or(0)
+    };
+    let first = Some(&merged);
+    let sec = Some(&second);
+    let files = pick(first, "files_scanned") + pick(sec, "files_scanned") + pick(ide, "files_scanned");
+    let errs = pick(first, "parse_errors") + pick(sec, "parse_errors") + pick(ide, "parse_errors");
+    let hits = pick(first, "cache_hit_files") + pick(sec, "cache_hit_files") + pick(ide, "cache_hit_files");
+    let parsed = pick(first, "files_parsed") + pick(sec, "files_parsed") + pick(ide, "files_parsed");
+    let parse_ms = pick(first, "parse_ms") + pick(sec, "parse_ms") + pick(ide, "parse_ms");
+    let walk_ms = pick(first, "walk_ms") + pick(sec, "walk_ms") + pick(ide, "walk_ms");
     merged["files_scanned"] = json!(files);
     merged["parse_errors"] = json!(errs);
     merged["generated_at"] = json!(now_ms);
     merged["window_days"] = json!(WINDOW_DAYS);
-    merged["cache_hit_files"] = json!(seen.len().saturating_sub(0));
+    // 修正语义（原为 seen.len()＝扫到的文件数，与字段名不符）
+    merged["cache_hit_files"] = json!(hits);
+    merged["files_parsed"] = json!(parsed);
+    merged["scan_ms"] = json!(t_impl.elapsed().as_millis() as u64);
     merged["fresh"] = json!(fresh);
+
+    // 分段耗时埋点（2026-10-07 性能优化配套）：用于对比优化前后与定位回退
+    // （walk=遍历+stat，parse=逐文件解析，db=文件级缓存整块读写）
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "[wb-token] 扫描 {:.2}s：文件 {}（命中 {} / 解析 {}），walk {}ms / parse {}ms / db 读 {}ms 写 {}ms，缓存条目 {}，解析错误 {}",
+            t_impl.elapsed().as_millis() as f64 / 1000.0,
+            files,
+            hits,
+            parsed,
+            walk_ms,
+            parse_ms,
+            db_read_ms,
+            db_write_ms,
+            cache.len(),
+            errs
+        ),
+    );
 
     if let Ok(mut guard) = RESULT_CACHE.lock() {
         *guard = Some((Instant::now(), merged.clone()));
@@ -1056,10 +1246,28 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wb_stats_p2_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.jsonl");
-        // 中间坏行（换行结尾）→ 计数；末行半截 JSON（无换行）→ 视为写入中，忽略
-        std::fs::write(&path, "{broken}\n{\"timestamp\":1,\"usage\":{\"in").unwrap();
+        // 中间坏行（含 usage 锚点，换行结尾）→ 计数；末行半截 JSON（无换行）→ 视为写入中，忽略
+        std::fs::write(&path, "{\"usage\":{broken}\n{\"timestamp\":1,\"usage\":{\"in").unwrap();
         let e = parse_file(&path, "p");
         assert_eq!(e.parse_errors, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 2026-10-07 性能预筛：不含 `"usage"` 字面量的行不解析（会话 jsonl 里多数行是
+    /// 用户/工具消息），故这类坏行也不再计入 parse_errors——语义由本测锁定。
+    #[test]
+    fn parse_file_skips_lines_without_usage_anchor() {
+        let dir = std::env::temp_dir().join(format!("wb_stats_p3_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        std::fs::write(
+            &path,
+            "{broken-no-usage}\n{\"role\":\"user\",\"content\":\"hi\"}\n",
+        )
+        .unwrap();
+        let e = parse_file(&path, "p");
+        assert_eq!(e.parse_errors, 0, "无 usage 锚点的行不解析、不计数");
+        assert_eq!(e.days.len(), 0);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1096,6 +1304,133 @@ mod tests {
         assert_eq!(ms_date(&ms), ms_date(&secs));
         assert!(ms_date(&json!("不是时间")).is_none());
         assert!(ms_date(&json!({})).is_none());
+    }
+
+    /// 跨文件/跨 uid 的同一请求只计一次（2026-10-08 实测缺陷回归：同一批请求会以**新的
+    /// 会话 id** 落到另一个 uid 的目录下）——整份重复的文件整份跳过、部分重复只补新 id，
+    /// 且二次扫描（全命中增量缓存）结果一致（去重只作用于聚合层，不污染缓存）。
+    #[test]
+    fn codebuddy_index_cross_file_request_id_dedup() {
+        let root = std::env::temp_dir().join(format!("wb_stats_dedup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = "d41d8cd98f00b204e9800998ecf8427e";
+        let stamp = 1_757_000_000_000i64;
+        let req = |id: &str, input: u64| {
+            json!({
+                "id": id, "type": "craft", "state": "complete", "startedAt": stamp,
+                "usage": { "inputTokens": input, "outputTokens": 1 }
+            })
+        };
+        let write_session = |uid: &str, conv: &str, requests: Vec<Value>| {
+            let dir = root
+                .join(uid)
+                .join("CodeBuddyIDE")
+                .join(uid)
+                .join("history")
+                .join(ws)
+                .join(conv);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("index.json"),
+                json!({ "requests": requests }).to_string(),
+            )
+            .unwrap();
+        };
+        // A：r1/r2；B：完全相同的一批（另一 uid、新会话 id）；C：r2 重复 + r3 新增
+        write_session("uA", "conv-a", vec![req("r1", 100), req("r2", 200)]);
+        write_session("uB", "conv-b", vec![req("r1", 100), req("r2", 200)]);
+        write_session("uC", "conv-c", vec![req("r2", 200), req("r3", 400)]);
+
+        let mut paths = Vec::new();
+        collect_codebuddy_indexes(&root, &mut paths);
+        assert_eq!(paths.len(), 3, "三个会话索引都应被收集: {paths:?}");
+
+        let mut cache = HashMap::new();
+        let mut seen = HashSet::new();
+        let view = aggregate_files(
+            ScanKind::CodebuddyIndex,
+            &root,
+            "codebuddy-ide",
+            paths,
+            "1970-01-01",
+            &mut cache,
+            &mut seen,
+        );
+        // 唯一请求 3 条：100 + 200 + 400
+        assert_eq!(view["summary"]["input"], json!(700));
+        assert_eq!(view["summary"]["calls"], json!(3));
+        assert_eq!(view["files_scanned"], json!(3));
+
+        // 二次扫描：三个文件全部命中增量缓存，去重仍须得到同样结果
+        let mut paths2 = Vec::new();
+        collect_codebuddy_indexes(&root, &mut paths2);
+        let mut cache2 = cache.clone();
+        let mut seen2 = HashSet::new();
+        let view2 = aggregate_files(
+            ScanKind::CodebuddyIndex,
+            &root,
+            "codebuddy-ide",
+            paths2,
+            "1970-01-01",
+            &mut cache2,
+            &mut seen2,
+        );
+        assert_eq!(view2["summary"]["input"], json!(700));
+        assert_eq!(view2["summary"]["calls"], json!(3));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 手动诊断（默认忽略）：在**真实** CodeBuddy IDE 目录上对比「跨文件去重前/后」，
+    /// 用于确认重复计入的规模：
+    /// `cargo test probe_codebuddy_ide_dedup -- --ignored --nocapture`
+    #[test]
+    #[ignore = "本机诊断：需真实 CodeBuddy IDE 历史目录"]
+    fn probe_codebuddy_ide_dedup() {
+        let Some(root) = codebuddy_ide_root() else {
+            println!("[probe] 未找到 CodeBuddy IDE 数据目录，跳过");
+            return;
+        };
+        let mut paths = Vec::new();
+        collect_codebuddy_indexes(&root, &mut paths);
+        if paths.is_empty() {
+            println!("[probe] 未收集到会话索引，跳过");
+            return;
+        }
+        let mut cache = HashMap::new();
+        let mut seen = HashSet::new();
+        let t0 = Instant::now();
+        let view = aggregate_files(
+            ScanKind::CodebuddyIndex,
+            &root,
+            "codebuddy-ide",
+            paths.clone(),
+            "1970-01-01",
+            &mut cache,
+            &mut seen,
+        );
+        let elapsed = t0.elapsed().as_millis();
+        let dedup_total = view["summary"]["total"].as_u64().unwrap_or(0);
+        // 对照：不做跨文件去重（各文件全量聚合并列相加，即修复前的口径）
+        let raw_total: u64 = cache
+            .values()
+            .map(|e| {
+                e.days
+                    .values()
+                    .map(|d| d.input.saturating_add(d.output).saturating_add(d.write))
+                    .sum::<u64>()
+            })
+            .sum();
+        let dup = raw_total.saturating_sub(dedup_total);
+        let pct = if raw_total > 0 {
+            dup as f64 / raw_total as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "[probe] 会话索引 {} 个：去重前 total={raw_total}，去重后 total={dedup_total}，\
+             多计 {dup}（{pct:.1}%）；聚合耗时 {elapsed}ms",
+            paths.len()
+        );
     }
 
     /// 端到端：夹具目录 → 计入 complete/canceled、跳过 running 与全 0、同 id 去重、
@@ -1160,8 +1495,11 @@ mod tests {
         .unwrap();
 
         let mut memo: HashMap<String, Value> = HashMap::new();
-        let entry = parse_codebuddy_index(&session.join("index.json"), &mut memo);
+        let entry = parse_codebuddy_index(&session.join("index.json"), &mut memo, None);
         assert_eq!(entry.parse_errors, 0);
+        // 只登记**实际计入**的 id（r1 会话内重复只算一次、r2 running 与 r3 全 0 跳过）
+        assert_eq!(entry.ids.len(), 2, "应只登记 r1/r4: {:?}", entry.ids);
+        assert!(entry.ids.iter().any(|id| id == "r1") && entry.ids.iter().any(|id| id == "r4"));
         let day = entry.days.get(&expected_day).expect("应有当日聚合");
         assert_eq!(day.calls, 2);
         assert_eq!(day.input, 1007);
@@ -1187,10 +1525,115 @@ mod tests {
             .expect("项目维度记常量");
         assert_eq!(project.calls, 2);
 
-        // 收集器只认 history 祖先下的 index.json（工作区索引也在其中，由解析层空产出）
+        // 收集器按结构只收**会话级** index.json（2026-10-07 性能优化：
+        // 不再从 Data 整树递归）；工作区级索引由 conversation_model 按需直读，不进列表。
+        // 产品子树不写死：`VSCode` 布局与 `CodeBuddyIDE` 同构且含真实用量，
+        // 只看 CodeBuddyIDE 会静默漏计（本机实测 45 个 VSCode 会话索引中 4 个有用量）。
+        let vscode_session = root
+            .join(uid)
+            .join("VSCode")
+            .join(uid)
+            .join("history")
+            .join(ws)
+            .join("vscode-conv");
+        std::fs::create_dir_all(&vscode_session).unwrap();
+        std::fs::write(
+            vscode_session.join("index.json"),
+            json!({ "messages": [], "requests": [] }).to_string(),
+        )
+        .unwrap();
+
+        let dir_name = |p: &PathBuf| -> Option<String> {
+            p.parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        };
         let mut paths = Vec::new();
-        collect_codebuddy_indexes(&root, 0, &mut paths);
-        assert_eq!(paths.len(), 2, "工作区索引 + 会话索引各一：{paths:?}");
+        collect_codebuddy_indexes(&root, &mut paths);
+        assert_eq!(paths.len(), 2, "两套产品布局的会话级索引都应收集：{paths:?}");
+        assert!(
+            paths.iter().any(|p| dir_name(p).as_deref() == Some(conv)),
+            "CodeBuddyIDE 会话索引应命中：{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| dir_name(p).as_deref() == Some("vscode-conv")),
+            "VSCode 布局的会话索引也应命中：{paths:?}"
+        );
+        // 同结构下再次调用应稳定（stale 自愈路径不触发）
+        let mut again = Vec::new();
+        collect_codebuddy_indexes(&root, &mut again);
+        assert_eq!(again.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 兜底按**产品子树**判零：某产品布局漂移（此处 history\<ws> 下多出一层）
+    /// 而其余产品仍正常命中时，漂移子树由限深兜底补收、不再静默漏收，
+    /// 正常子树仍走结构化快路径（评审 #1 修复的回归锁定）。
+    #[test]
+    fn collect_codebuddy_indexes_falls_back_per_product_on_layout_drift() {
+        let root = std::env::temp_dir().join(format!("wb_stats_p4_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let uid = "u1";
+        let ws = "d41d8cd98f00b204e9800998ecf8427e";
+
+        // VSCode 子树：正常布局（结构化下探命中）
+        let vscode_ok = root
+            .join(uid)
+            .join("VSCode")
+            .join(uid)
+            .join("history")
+            .join(ws)
+            .join("vscode-conv");
+        std::fs::create_dir_all(&vscode_ok).unwrap();
+        std::fs::write(
+            vscode_ok.join("index.json"),
+            json!({ "messages": [], "requests": [] }).to_string(),
+        )
+        .unwrap();
+
+        // CodeBuddyIDE 子树：布局漂移——history\<ws> 与会话目录之间多了一层 v2，
+        // 结构化下探（只认 history\<ws>\<session>\index.json）在该子树零命中
+        let drifted = root
+            .join(uid)
+            .join("CodeBuddyIDE")
+            .join(uid)
+            .join("history")
+            .join(ws)
+            .join("v2")
+            .join("drifted-conv");
+        std::fs::create_dir_all(&drifted).unwrap();
+        std::fs::write(
+            drifted.join("index.json"),
+            json!({ "messages": [], "requests": [] }).to_string(),
+        )
+        .unwrap();
+
+        let dir_name = |p: &PathBuf| -> Option<String> {
+            p.parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        };
+        let mut paths = Vec::new();
+        collect_codebuddy_indexes(&root, &mut paths);
+        assert_eq!(
+            paths.len(),
+            2,
+            "正常子树快路径 + 漂移子树兜底都应收集：{paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| dir_name(p).as_deref() == Some("vscode-conv")),
+            "VSCode 正常布局应结构化命中：{paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| dir_name(p).as_deref() == Some("drifted-conv")),
+            "CodeBuddyIDE 漂移布局应由子树级兜底补收，不静默漏收：{paths:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

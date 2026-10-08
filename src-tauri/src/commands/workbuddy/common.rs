@@ -244,17 +244,20 @@ pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &
 }
 
 pub(super) fn is_running() -> bool {
+    #[cfg(windows)]
+    {
+        // 原 tasklist 子进程（单次实测 ~260ms）改为 sysinfo 进程表枚举 + 短 TTL 复用
+        // （见 switcher::proc::any_running）；概览页与顶栏同轮切换会各问一次
+        crate::switcher::proc::any_running(&["WorkBuddy"])
+    }
     #[cfg(target_os = "macos")]
     {
         // M-1 ⑥：映像名均为 Electron，按 bundle 主进程路径段匹配
         crate::commands::process::mac_app_running(&["WorkBuddy"])
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let out = crate::platform::cmd::sys_command("tasklist")
-            .args(["/FI", "IMAGENAME eq WorkBuddy.exe", "/NH"])
-            .output();
-        matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains("WorkBuddy.exe"))
+        false
     }
 }
 
