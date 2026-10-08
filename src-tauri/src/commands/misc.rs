@@ -242,26 +242,23 @@ fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// 目录内 `proxy_req_*.log`，文件名升序（= 时间升序）
-fn proxy_log_files(log_dir: &Path) -> Vec<String> {
+/// 目录内 `proxy_req_*.log`，文件名升序（= 时间升序）。
+/// 目录读取失败返回 Err（对齐基线错误语义；吞成空表会连带清空全部索引缓存）
+fn proxy_log_files(log_dir: &Path) -> Result<Vec<String>, String> {
     let mut files: Vec<String> = std::fs::read_dir(log_dir)
-        .ok()
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if name.starts_with("proxy_req_") && name.ends_with(".log") {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+        .map_err(|e| format!("读取代理日志目录失败: {e}"))?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("proxy_req_") && name.ends_with(".log") {
+                Some(name)
+            } else {
+                None
+            }
         })
-        .unwrap_or_default();
+        .collect();
     files.sort();
-    files
+    Ok(files)
 }
 
 /// 索引缓存清理：磁盘上已不存在的日志文件（轮转 / 删除）不再占内存
@@ -287,6 +284,15 @@ fn read_range(path: &Path, from: u64, to: u64) -> Result<Vec<u8>, String> {
     f.take(to - from)
         .read_to_end(&mut buf)
         .map_err(|e| format!("读取日志文件失败: {e}"))?;
+    // 短读 = 文件在索引构建/条目定位与本次读取之间被轮转/截断：报错走既有的
+    // 「单条/单文件降级」路径，不静默返回截断内容造成摘要与正文错位
+    if buf.len() as u64 != to - from {
+        return Err(format!(
+            "日志内容短于预期（可能已被轮转或截断）: 期望 {} 字节，实际 {} 字节",
+            to - from,
+            buf.len()
+        ));
+    }
     Ok(buf)
 }
 
@@ -478,7 +484,7 @@ fn proxy_logs_list_impl(
     let offset = opts.offset.unwrap_or(0);
     let limit = opts.limit.unwrap_or(50);
 
-    let files = proxy_log_files(log_dir);
+    let files = proxy_log_files(log_dir)?;
     retain_alive_indexes(log_dir, &files);
 
     // 候选收集：多线程（文件之间互不依赖；冷建索引与关键字全文扫描都是 IO+CPU 密集）。
@@ -507,6 +513,9 @@ fn proxy_logs_list_impl(
     }
     candidates.reverse();
 
+    // total 口径 = 非空块数（与列表 id 的「文件内原始分块序号」语义绑定）：
+    // 极少数解析失败的畸形块计入 total 但页内跳过（末页可短）；若在索引构建期
+    // 过滤会移动原始序号、破坏详情 id 对齐，故保留该口径
     let total = candidates.len();
     let entries: Vec<ProxyLogEntry> = candidates
         .into_iter()
@@ -1454,7 +1463,7 @@ mod tests {
             .join("logs");
         assert!(dir.is_dir(), "日志目录不存在: {}", dir.display());
         let mut total_bytes = 0u64;
-        for name in proxy_log_files(&dir) {
+        for name in proxy_log_files(&dir).unwrap() {
             total_bytes += std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
         }
 
@@ -1476,7 +1485,7 @@ mod tests {
 
         println!(
             "日志目录 {} 个文件 / {}MB，条目 {}（冷建索引 {}ms / 热命中 {}ms / 深翻页 {}ms / 关键字 {}ms，关键字命中 {}）",
-            proxy_log_files(&dir).len(),
+            proxy_log_files(&dir).unwrap().len(),
             total_bytes / 1024 / 1024,
             cold.total,
             cold_ms,

@@ -1070,7 +1070,8 @@ fn pick_p2c<'a>(
     Some(if sa >= sb { a } else { b })
 }
 
-/// 次日 04:00（本地东八区，与代码库其它处 local_ts 约定一致）的 Unix 秒
+/// 次日 04:00 的 Unix 秒。固定按北京时区（UTC+8）取日界——上游积分按北京时间重置，
+/// 与运行机器的本地时区无关（注意与代码库其它处 local_ts 的本地时区约定不同）
 pub fn next_0400(now: i64) -> i64 {
     let local = now + 8 * 3600;
     let day_start = local - (local % 86400);

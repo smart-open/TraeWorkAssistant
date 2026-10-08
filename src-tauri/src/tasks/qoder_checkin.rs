@@ -595,7 +595,8 @@ enum FallbackOutcome {
 }
 
 /// 盲发兜底聚合判定（纯函数，可单测）。优先级：
-/// Success > Failed(fail_parts) > AlreadyReplayed > Failed(stale_parts) > Failed(空表)。
+/// Failed(fail_parts) > Success > AlreadyReplayed > Failed(stale_parts) > Failed(空表)
+/// （fail 掩码 success：宁 fail 不假 success，与下方 bullet 及测试一致）。
 /// - fail_parts（账号级/网络级真实失败）掩码一切：宁 fail 不假 already/success
 ///   （claim 幂等，重试无重复领取副作用）
 /// - stale_parts（409 CAMPAIGN_NOT_ACTIVE = 候选 id 过期，issue #66 健壮性②）

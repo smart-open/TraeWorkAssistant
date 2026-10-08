@@ -581,6 +581,7 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&a, &b));
     }
 
+    #[cfg(windows)]
     #[test]
     fn post_wm_close_对不存在pid无副作用() {
         post_wm_close(u32::MAX - 1);

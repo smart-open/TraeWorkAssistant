@@ -8,7 +8,6 @@
 //! macOS 分支只需替换占位实现，不动调用方。检索标记：`macOS 适配预留`。
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tauri::State;
 
 use crate::state::AppState;
@@ -586,7 +585,8 @@ fn spawn_first_existing(candidates: Vec<PathBuf>, display: &str) -> Result<(), S
             .map_err(|e| format!("启动 {display} 失败: {e}"))?;
         return Ok(());
     }
-    Command::new(&exe)
+    // sys_command_path 跨平台等价（mac=裸 Command 透传 / Windows=加 CREATE_NO_WINDOW），F-75 收敛
+    crate::platform::cmd::sys_command_path(&exe)
         .spawn()
         .map_err(|e| format!("启动 {display} 失败: {e}"))?;
     Ok(())

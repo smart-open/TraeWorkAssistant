@@ -34,13 +34,14 @@ pub fn stale_reply(state: &AppState, user_id: Option<&str>) -> Option<Value> {
         return None;
     }
     let cached_accounts = cache.get("accounts").cloned().unwrap_or(json!([]));
-    if cached_accounts.as_array().map(|a| a.is_empty()).unwrap_or(true) {
-        return None;
-    }
     let accounts = match user_id {
         Some(uid) => filter_accounts(cached_accounts, uid, "user_id"),
         None => cached_accounts,
     };
+    // 空判定放在 uid 过滤之后：uid 未命中回空列表无意义，交调用方走同步路径拉全量
+    if accounts.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        return None;
+    }
     Some(json!({"ok": true, "cached": true, "refreshing": true, "accounts": accounts}))
 }
 
@@ -870,7 +871,7 @@ mod wb_credits_tests {
         assert_eq!(reply["refreshing"], json!(true));
         assert!(reply.get("stale").is_none(), "SWR 回旧值不应打 stale");
         assert_eq!(reply["accounts"].as_array().unwrap().len(), 1);
-        // 单账号过滤：命中 1 条、未命中 0 条
+        // 单账号过滤：命中 1 条；未命中 → None（回空旧值无意义，交调用方同步拉全量）
         assert_eq!(
             stale_reply(&st, Some("u1")).unwrap()["accounts"]
                 .as_array()
@@ -878,12 +879,9 @@ mod wb_credits_tests {
                 .len(),
             1
         );
-        assert_eq!(
-            stale_reply(&st, Some("nope")).unwrap()["accounts"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
+        assert!(
+            stale_reply(&st, Some("nope")).is_none(),
+            "uid 未命中不回空旧值，交调用方同步拉取"
         );
         // 账号明细为空的缓存视为无缓存 → None（无数据可展示，只能同步拉）
         let _ = store.kv_set(

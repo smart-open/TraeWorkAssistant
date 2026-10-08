@@ -217,8 +217,9 @@ export const api = {
     }) => invoke<ProxyLogListResult>('proxy_logs_list', {
       opts: {
         keyword: opts.keyword,
-        start_time: opts.startTime,
-        end_time: opts.endTime,
+        // 后端 ProxyLogQueryOpts 为 serde camelCase：此前发 snake_case 被静默忽略，UI 日期筛选失效
+        startTime: opts.startTime,
+        endTime: opts.endTime,
         offset: opts.offset,
         limit: opts.limit,
       },

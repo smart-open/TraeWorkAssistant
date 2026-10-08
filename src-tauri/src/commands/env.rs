@@ -4,6 +4,8 @@ use std::collections::HashMap;
 #[cfg(not(target_os = "macos"))]
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+// 仅 Windows 探测链兜底缓存消费（mac bundle 链无注册表/进程反查兜底）
+#[cfg(not(target_os = "macos"))]
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, State};
 

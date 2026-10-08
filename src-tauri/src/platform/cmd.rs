@@ -24,6 +24,23 @@ pub fn sys_command(program: &str) -> std::process::Command {
     }
 }
 
+/// 构建无窗口子进程（exe **路径**版）：`Command::new` 接受任意可执行文件路径，
+/// 平台标志语义与 `sys_command` 完全一致。典型消费方：启动客户端应用二进制
+/// （qoder/common.rs `spawn_first_existing` 的手动路径候选）。
+pub fn sys_command_path(program: &std::path::Path) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new(program);
+        c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(program)
+    }
+}
+
 /// Windows 专用：构建无窗口子进程，先追加若干**常规**参数、再追加一条**原生**命令行
 /// 参数（不经 MSVC 转义）。`raw_arg` 同属 Windows-only `CommandExt`，故一并圈进本模块——
 /// 典型消费方：`cmd /c start "" "<url>"`（`/c` 常规参数 + URL 内嵌引号必须原样直达 cmd）。

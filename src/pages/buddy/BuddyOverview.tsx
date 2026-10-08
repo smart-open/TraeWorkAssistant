@@ -118,23 +118,24 @@ export default function BuddyOverview() {
   }, []);
 
   // stale-while-revalidate（2026-10-08）：后端缓存过期时先回旧值并转后台刷新
-  // （返回 refreshing=true），这里稍后重取一次即拿到新值；最多 4 次、间隔 1.5s 递增，
-  // 覆盖慢网络（全局代理）下的刷新耗时。拿到新值（refreshing 消失）后计数归零。
+  // （返回 refreshing=true），这里稍后重取一次即拿到新值；前 4 次间隔 1.5s 递增，
+  // 之后转 30s 慢轮询直到 refreshing 消失——后台刷新是逐账号串行请求，慢网络
+  // （全局代理）下可超 15s，链路不先于刷新完成而放弃。拿到新值后计数归零。
   const creditsPollRef = useRef(0);
   useEffect(() => {
     if (!credits?.refreshing) {
       creditsPollRef.current = 0;
       return;
     }
-    if (creditsPollRef.current >= 4) return;
+    const n = creditsPollRef.current;
     const timer = window.setTimeout(() => {
-      creditsPollRef.current += 1;
+      creditsPollRef.current = n + 1;
       api.workbuddy
         .creditsFetch()
         .then(setCredits)
         // 失败也要制造一次状态更新：否则 credits 引用不变、effect 不重跑，重试链首败即断
         .catch(() => setCredits((p) => (p ? { ...p } : p)));
-    }, 1500 * (creditsPollRef.current + 1));
+    }, n < 4 ? 1500 * (n + 1) : 30_000);
     return () => window.clearTimeout(timer);
   }, [credits]);
 
