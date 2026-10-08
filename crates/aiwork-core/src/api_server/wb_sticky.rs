@@ -205,6 +205,19 @@ impl StickyStore {
         );
     }
 
+    /// 按账号解绑全部粘性绑定（issue #67，移植 main@36d628f）：账号进入硬冷却/禁用时调用，
+    /// 清理其绑定避免其他会话在 TTL 窗口内反复解析到该账号（resolve 返回的
+    /// Binding 还有调用方 pick_by_uid 的 selectable 校验兜底，此处为卫生性
+    /// 清理，让重绑定立即可见）。有变更时重置 save 节流，下一次 save 立即落盘。
+    pub fn unbind_uid(&self, uid: &str) {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = map.len();
+        map.retain(|_, b| b.uid != uid);
+        if map.len() != before {
+            *self.last_save.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     /// 清理全部过期绑定，返回清理条数（save 落库前调用，控制绑定表无界增长）。
     /// 显式模式 TTL 读运行时配置值（per-pool 可配后固定 1800 会在用户调大 TTL
     /// 时提前删除仍有效的绑定，F-76② per-pool 版修正）

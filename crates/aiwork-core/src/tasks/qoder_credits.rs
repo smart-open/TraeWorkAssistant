@@ -784,11 +784,11 @@ pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
     let parsed = fetch_credits(state, None, true)?;
     // stale-on-error 缺口（审查修复）：fresh=true 下 cached=true 仅此一路——全部账号
     // 本轮拉取失败、返回的是历史缓存行（行内全 ok=true，failed 为空），快照未落且
-    // 失败性质不可见。按暂态处理交调度器 30 分钟冷却重试，不能按「完成」记账
+    // 失败性质不可见。按暂态处理交调度器退避冷却重试，不能按「完成」记账
     //（否则 mark_run 固化当日已跑，当日快照静默丢失且无重试）
     if parsed.get("cached").and_then(Value::as_bool) == Some(true) {
         return Err(
-            "积分快照本轮全部账号拉取失败（已回退历史缓存），未落当日快照，30 分钟后重试".into(),
+            "积分快照本轮全部账号拉取失败（已回退历史缓存），未落当日快照，稍后自动重试".into(),
         );
     }
     let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(false);
@@ -817,7 +817,7 @@ pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
     let transient = failed.len() - permanent;
     if transient > 0 {
         return Err(format!(
-            "积分快照拉取暂态失败 {transient}/{}（永久 {permanent}），未落当日快照，30 分钟后重试",
+            "积分快照拉取暂态失败 {transient}/{}（永久 {permanent}），未落当日快照，稍后自动重试",
             rows.len()
         ));
     }

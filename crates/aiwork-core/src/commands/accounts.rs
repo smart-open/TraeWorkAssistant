@@ -1212,6 +1212,11 @@ pub fn refresh_remaining_credits_impl(state: &AppState) -> Result<usize, String>
     rc.updated_at = Some(fs_utils::now_iso());
     crate::store::docs::remaining_credits_save(&crate::store::db(&state.data_dir), &rc)?;
 
+    // issue #67（移植 main@36d628f）：网关运行中把新积分快照回写池内条目（expire_first
+    // 等策略读取的是池内快照；只写库不回写池 → 秃号持续被选中）。docker 适配：网关
+    // 常驻经 gateway_shared 判定，无需 runtime 句柄传参
+    crate::commands::api_server::push_credits_if_running(state);
+
     // 记录每日积分快照（total / earned / consumed）
     record_daily_snapshot(state, &rc, &pack_earned_daily);
 

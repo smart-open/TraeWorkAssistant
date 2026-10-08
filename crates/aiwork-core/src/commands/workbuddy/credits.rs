@@ -13,20 +13,79 @@ use super::common::{as_str, auth_file_path_of, load_pool, save_pool};
 // ── M5 积分（F-20/F-22，python 三件套 + 缓存）──────────────────────────────
 
 pub fn workbuddy_credits_fetch(state: &AppState, user_id: Option<String>, fresh: Option<bool>) -> Result<serde_json::Value, String> {
+    let fresh = fresh.unwrap_or(false);
+    let uid = user_id.as_deref();
+    // stale-while-revalidate（移植 main@36d628f）：缓存过期时先回旧值并转后台刷新，切板块不再等网络
+    if !fresh {
+        if let Some(reply) = crate::tasks::wb_credits::stale_reply(state, uid) {
+            spawn_background_refresh(state);
+            return Ok(reply);
+        }
+    }
+    credits_refresh_now(state, uid, fresh)
+}
+
+/// 同步刷新积分并完成全部回写（SWR 后台线程与前端直调共用；移植 main@36d628f）。
+/// 注意保留 docker 特有守卫：单账号查询（uid 过滤）不落快照——否则会以单账号余额
+/// 同日覆盖全池快照，次日恢复后差分出现虚假「消耗+获得」对
+fn credits_refresh_now(state: &AppState, uid: Option<&str>, fresh: bool) -> Result<serde_json::Value, String> {
     // Rust 直调 tasks::wb_credits（原 python workbuddy_credits.py 移植）；
     // 失败以 Err 返回，成功恒为 {"ok":true,"cached":bool,"accounts":[...]}（消费契约见 tasks/wb_credits.rs 模块注释）
-    let parsed = crate::tasks::wb_credits::fetch_credits(state, user_id.as_deref(), fresh.unwrap_or(false))?;
+    let parsed = crate::tasks::wb_credits::fetch_credits(state, uid, fresh)?;
     // 回写账号池余额缓存（列表/概述展示）
     write_back_pool_balances(state, &parsed);
     // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
     backfill_edition_from_payment_type(state);
-    // 每日余额快照（F-27 数据源）：非缓存命中且为全池查询时追加，按日去重，cap 365 天。
-    // 单账号查询（user_id 过滤）不落快照——否则会以单账号余额同日覆盖全池快照，
-    // 次日恢复后差分出现虚假「消耗+获得」对
-    if user_id.is_none() && parsed.get("cached") != Some(&serde_json::json!(true)) {
+    // 每日余额快照（F-27 数据源）：非缓存命中且为全池查询时追加，按日去重，cap 365 天
+    if uid.is_none() && parsed.get("cached") != Some(&serde_json::json!(true)) {
         append_credits_snapshot(state, &parsed);
     }
     Ok(parsed)
+}
+
+/// SWR 后台刷新（移植 main@36d628f）：单飞 AtomicBool 防并发重入，
+/// Drop 守卫保证 panic 也能复位；AppState 可 Clone，直接克隆进线程。
+/// 后台固定全池强刷（uid=None, fresh=true），与 main 语义一致。
+/// 审查加固：swap 成功后线程内守卫尚未就位，若 state.clone()/
+/// thread::spawn panic 会永久卡死单飞标志——外层 armed 守卫覆盖该窗口，
+/// spawn 成功后解除武装，复位职责移交线程内守卫
+fn spawn_background_refresh(state: &AppState) {
+    static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    struct ArmedReset(bool);
+    impl Drop for ArmedReset {
+        fn drop(&mut self) {
+            if self.0 {
+                IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+    let mut guard = ArmedReset(true);
+    let st = state.clone();
+    std::thread::spawn(move || {
+        struct ResetInFlight;
+        impl Drop for ResetInFlight {
+            fn drop(&mut self) {
+                IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetInFlight;
+        let started = std::time::Instant::now();
+        match credits_refresh_now(&st, None, true) {
+            Ok(_) => fs_utils::app_log(
+                &st.data_dir,
+                &format!("[wb-credits] 后台刷新完成，共 {}ms", started.elapsed().as_millis()),
+            ),
+            Err(e) => fs_utils::app_log(
+                &st.data_dir,
+                &format!("[wb-credits] 后台刷新失败（{}ms）：{e}", started.elapsed().as_millis()),
+            ),
+        }
+    });
+    // spawn 成功：解除武装（普通赋值不会 panic），线程内守卫接管复位
+    guard.0 = false;
 }
 
 /// 将积分查询结果中的余额回写账号池缓存（列表/概述展示；命令与调度器快照任务共用）

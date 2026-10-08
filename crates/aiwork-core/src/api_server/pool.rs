@@ -321,6 +321,19 @@ impl ApiPool {
         }
     }
 
+    /// 运行期积分回写（issue #67，移植 main@36d628f）：仅更新池内条目的 credits 快照，
+    /// 不触碰冷却/inflight/禁用等运行态（与 sync_from_accounts 全量重建互补——
+    /// 后者会重置 hard_until/last_used 等运行状态）。未提及的账号保持原值。
+    /// 修复「秃号内存中 credits>0 永远 selectable、策略持续命中同一账号」。
+    pub fn update_credits(&self, credits: &HashMap<String, f64>) {
+        let mut entries = safe_lock(&self.entries);
+        for (uid, c) in credits {
+            if let Some(e) = entries.get_mut(uid) {
+                e.credits = Some(*c);
+            }
+        }
+    }
+
     /// 从 WorkBuddy 账号同步池（T2.1/F-28）：WB 上游账号进同一调度引擎，
     /// 携带区域/企业域信息供上游 headers 使用
     pub fn sync_from_wb(&self, accounts: &[WbSyncAccount], enabled: &[String]) {

@@ -3,7 +3,7 @@
 //! 运行时句柄（ApiServerRuntime）不平移；原句柄参数改经
 //! `crate::api_server::runtime::gateway_shared()` 读全局注册的共享状态。
 
-use crate::models::{ApiPoolFile, PoolStatus};
+use crate::models::{ApiPoolFile, PoolStatus, RemainingCreditsFile};
 use crate::state::AppState;
 
 use crate::api_server::models_sync;
@@ -327,6 +327,32 @@ pub fn qoder_pool_status() -> Vec<PoolStatus> {
         Some(shared) => shared.qoder_pool.status_list(),
         None => vec![],
     }
+}
+
+/// 网关运行中回写 Trae 池积分快照（issue #67，移植 main@36d628f）：
+/// refresh_remaining_credits 刷新后调用，让 expire_first 等策略基于最新积分选号。
+/// 此前刷新只写库不回写池，秃号内存中 credits>0 永远 selectable、粘性/策略持续
+/// 命中同一账号。网关未注册（启动早期）时 no-op；仅回写 Trae 池（WB/Qoder 池积分
+/// 随各自 sync_* 数据链走，不适用）。
+/// docker 适配：main 版取 `Mutex<Option<ApiServerRuntime>>` 句柄；server 单体网关
+/// 常驻运行，改经 `gateway_shared()` 读全局注册的共享状态。
+pub fn push_credits_if_running(state: &AppState) {
+    let Some(shared) = crate::api_server::runtime::gateway_shared() else {
+        return;
+    };
+    let credits_file: RemainingCreditsFile =
+        crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
+    // 池积分语义与 apply_pool_snapshot 一致：优先 general 表，回退旧总积分表
+    let pool_credits: std::collections::HashMap<String, f64> = credits_file
+        .credits
+        .iter()
+        .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
+        .collect();
+    shared.pool.update_credits(&pool_credits);
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!("API服务池积分回写(运行期): n={}", pool_credits.len()),
+    );
 }
 
 /// 列出 API 日志可用日期列表

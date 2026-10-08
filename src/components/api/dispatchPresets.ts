@@ -36,7 +36,7 @@ export const DISPATCH_PRESETS: DispatchPreset[] = [
   {
     key: 'fresh',
     name: '积分保鲜',
-    desc: '各池均优先服务积分先到期的账号：优先消耗临期积分包，减少浪费',
+    desc: '各池均优先服务积分先到期的账号：集中消耗临期积分包直至该账号耗尽后自动切换，非均匀轮换，减少浪费',
     inter: 'smart',
     trae: 'expire_first',
     buddy: 'expire_first',

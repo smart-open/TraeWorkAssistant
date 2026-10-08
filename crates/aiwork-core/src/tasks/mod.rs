@@ -82,7 +82,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 Err(format!(
-                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（30 分钟后自动重试）"
+                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（稍后自动重试）"
                 ))
             } else {
                 Ok(done)
