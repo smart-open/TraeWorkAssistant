@@ -132,7 +132,8 @@ export default function BuddyOverview() {
       api.workbuddy
         .creditsFetch()
         .then(setCredits)
-        .catch(() => {});
+        // 失败也要制造一次状态更新：否则 credits 引用不变、effect 不重跑，重试链首败即断
+        .catch(() => setCredits((p) => (p ? { ...p } : p)));
     }, 1500 * (creditsPollRef.current + 1));
     return () => window.clearTimeout(timer);
   }, [credits]);

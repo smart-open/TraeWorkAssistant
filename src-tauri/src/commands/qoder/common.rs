@@ -7,7 +7,6 @@
 //! 全部 Windows 专属实现已按「逐函数 cfg 门控 + 非 Windows 同名占位」隔离，
 //! macOS 分支只需替换占位实现，不动调用方。检索标记：`macOS 适配预留`。
 
-#[cfg(windows)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::State;

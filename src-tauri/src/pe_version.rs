@@ -21,7 +21,10 @@ pub fn product_or_file_version(path: &str) -> Option<String> {
 
 /// macOS 适配预留：PE 版本资源是 Windows 专属概念，mac 由调用方回退原实现
 ///（pgrep/属性读取），此处恒 None。
+/// allow：唯一调用点 env::version_of 为 cfg(windows)，mac 构建下本桩零调用方，
+/// 不加门控会触发 dead_code 警告（零警告红线）。
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub fn product_or_file_version(_path: &str) -> Option<String> {
     None
 }

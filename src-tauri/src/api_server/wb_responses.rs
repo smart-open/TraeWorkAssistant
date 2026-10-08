@@ -154,7 +154,8 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| {
                         seq += 1;
-                        format!("call_{}", seq)
+                        // missing_call_ 前缀防与客户端显式 "call_N" 撞名导致结果配对错乱
+                        format!("missing_call_{}", seq)
                     });
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
@@ -269,11 +270,11 @@ fn emit_tool_results(
         })
         .unwrap_or_default();
     for call_id in order {
-        let text = results
-            .iter()
-            .find(|(c, _)| c == &call_id)
-            .map(|(_, t)| t.clone())
-            .unwrap_or_else(|| "(tool did not return a result)".to_string());
+        // 按 id 逐个弹出：tool_calls 含重复 id 时各取各的结果，不再 find-first 遮蔽
+        let text = match results.iter().position(|(c, _)| c == &call_id) {
+            Some(pos) => results.remove(pos).1,
+            None => "(tool did not return a result)".to_string(),
+        };
         messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": text}));
     }
     results.clear();
@@ -696,21 +697,28 @@ mod tests {
         assert_eq!(msgs[4]["content"], json!("dev note"));
     }
 
-    /// function_call 缺 call_id：call_N 兜底自增，可与显式 call_N 结果配对
+    /// function_call 缺 call_id：missing_call_N 兜底自增，不与客户端显式 "call_N" 撞名，
+    /// 两路调用各配各的结果（旧 call_N 兜底会撞名遮蔽显式 id 的结果）
     #[test]
     fn function_call_without_call_id_falls_back_to_sequential_id() {
         let body = json!({
             "model": "m",
             "input": [
                 {"type": "function_call", "name": "a", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "call_1", "output": "r"},
+                {"type": "function_call", "call_id": "call_1", "name": "b", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "missing_call_1", "output": "r1"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "r2"},
             ],
         });
         let chat = responses_to_chat(&body).unwrap();
         let msgs = chat["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0]["tool_calls"][0]["id"], json!("call_1"));
-        assert_eq!(msgs[1]["tool_call_id"], json!("call_1"));
-        assert_eq!(msgs[1]["content"], json!("r"));
+        // 两次调用合并进同一条 assistant，窗口关闭后按 tool_calls 顺序回填两条结果
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], json!("missing_call_1"));
+        assert_eq!(msgs[0]["tool_calls"][1]["id"], json!("call_1"));
+        assert_eq!(msgs[1]["tool_call_id"], json!("missing_call_1"));
+        assert_eq!(msgs[1]["content"], json!("r1"));
+        assert_eq!(msgs[2]["tool_call_id"], json!("call_1"));
+        assert_eq!(msgs[2]["content"], json!("r2"));
     }
 }

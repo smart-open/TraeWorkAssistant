@@ -3,8 +3,6 @@ use std::collections::HashMap;
 // Windows 直启链专用（mac 走 `open` bundle 启动，不经 Command）
 #[cfg(not(target_os = "macos"))]
 use std::process::Command;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, State};
@@ -994,7 +992,7 @@ fn resolve_reg_profile_candidate(
 /// 运行进程反查 exe 路径（应用运行中时最准）：精确映像名匹配，取首个带路径的进程。
 /// 原 powershell 实现（单次 1.2s+）改 sysinfo 直读（`switcher::proc::running_exe_exact`，
 /// main 合并）；仅 Windows 探测链消费（mac 走 bundle 定位链的进程回退级）。
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn process_exe_path(proc_names: &[&str]) -> Option<String> {
     let exe = crate::switcher::proc::running_exe_exact(proc_names)?;
     let s = exe.to_string_lossy().to_string();
