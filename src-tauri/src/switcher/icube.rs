@@ -231,10 +231,9 @@ fn warn_if_slot_identity_mismatch(
 /// `uid=<10~20 位数字>`。会话目录名固定 15 字符且字典序=时间序，只看最新会话
 /// （当前客户端这次运行）；最新会话无 uid 记录则返回 None——绝不回捞旧会话，
 /// 旧会话的 uid 可能是切换前的账号，误报比不报更危险（调用方 fail-open）。
-/// 注意：该日志结构目前仅有 Windows 真机实测证据，mac 数据根
-///（~/Library/Application Support/Trae CN）下是否同构待真机确认——若不同构，
-/// mac 上本函数恒返回 None，L2 守卫静默失效（fail-open + Warn），防护退化为
-/// L1 命令层守卫（storage.json 证据 + 桥标记，平台无关仍有效）。
+/// 注意：mac 数据根（~/Library/Application Support/Trae CN）2026-10-09 真机
+/// 实测同构：`logs/yyyymmddThhmmss/` 会话目录与 `dynamicConfig.log` 均存在，
+/// 且含 `uid=<16 位数字>` 请求 URL，本函数在 mac 同样生效（原仅 Windows 实测）。
 pub fn detect_live_uid(app_data_dir: &Path) -> Option<String> {
     let logs_dir = app_data_dir.join("logs");
     let newest = std::fs::read_dir(&logs_dir)

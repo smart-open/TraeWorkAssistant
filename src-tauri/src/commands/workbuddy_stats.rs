@@ -4,8 +4,10 @@
 //!    cache_read 别名链优先正值（cache_read_input_tokens → prompt_cache_hit_tokens），
 //!    兼容嵌套 prompt_tokens_details / inputTokensDetails；
 //!    cache_write 仅认显式别名（prompt_cache_miss_tokens 是新增输入，不是写入）。
-//! ② `%LOCALAPPDATA%\CodeBuddyExtension\Data\<uid>\CodeBuddyIDE\<uid>\history\<md5(工作区)>
-//!    \<convId>\index.json` 的 `requests[]`（CodeBuddy **IDE** 侧，2026-10-06 接入）——
+//! ② `%LOCALAPPDATA%\CodeBuddyExtension\Data`（mac 为 `~/Library/Application
+//!    Support/CodeBuddyExtension/Data`，真机实测同构）下的
+//!    `<uid>\CodeBuddyIDE\<uid>\history\<md5(工作区)>\<convId>\index.json` 的
+//!    `requests[]`（CodeBuddy **IDE** 侧，2026-10-06 接入）——
 //!    见 `parse_codebuddy_index` 的字段契约与口径说明。
 //!
 //! ⚠ serde 命名约定：输出字段全部 snake_case；响应只含聚合数字，不返回消息正文/凭证。
@@ -445,6 +447,8 @@ fn parse_file(path: &Path, fallback_project: &str) -> FileCacheEntry {
 // 'local-codebuddy-requests'）：
 //   %LOCALAPPDATA%\CodeBuddyExtension\Data\
 //     <uid>\CodeBuddyIDE\<uid>\history\<md5(工作区路径)>\<会话id>\index.json
+//   mac 基根：~/Library/Application Support/CodeBuddyExtension/Data/（2026-10-09
+//   真机实测同名同构，其余层级与字段契约一致）
 // 会话目录下的 messages/*.json 只有正文（无用量字段），**用量只在会话级 index.json**。
 //
 // 字段契约：
@@ -518,14 +522,33 @@ fn conversation_model(
         .unwrap_or_else(|| "未知模型".to_string())
 }
 
-/// `%LOCALAPPDATA%\CodeBuddyExtension\Data`（CodeBuddy IDE 历史根）；
-/// 缺环境变量或非 Windows 时返回 None（该源整体跳过，不影响另两路）。
+/// CodeBuddy IDE 历史根：Windows=`%LOCALAPPDATA%\CodeBuddyExtension\Data`；
+/// mac=`~/Library/Application Support/CodeBuddyExtension/Data`（2026-10-09 真机
+/// 实测同名同构：`<uid>\<product>\<workspace>\history\<ws-hash>\<session>\index.json`
+/// 七层结构与 `requests[]`/`usage` 字段契约与 Windows 完全一致）；其余平台返回
+/// None（该源整体跳过，不影响另两路）。
 fn codebuddy_ide_root() -> Option<PathBuf> {
-    let dir = std::env::var("LOCALAPPDATA").ok()?;
-    if dir.trim().is_empty() {
-        return None;
+    #[cfg(windows)]
+    {
+        let dir = std::env::var("LOCALAPPDATA").ok()?;
+        if dir.trim().is_empty() {
+            return None;
+        }
+        Some(Path::new(&dir).join("CodeBuddyExtension").join("Data"))
     }
-    Some(Path::new(&dir).join("CodeBuddyExtension").join("Data"))
+    #[cfg(target_os = "macos")]
+    {
+        // 与 switcher/authfile.rs::wb_auth_dir 同基根（F-75 跨平台收口）
+        let base = crate::platform::app_support_root_lossy();
+        if base.as_os_str().is_empty() {
+            return None;
+        }
+        Some(base.join("CodeBuddyExtension").join("Data"))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        None
+    }
 }
 
 /// 收集 CodeBuddy IDE 历史下的**会话级** `index.json`。
@@ -736,7 +759,8 @@ fn scan_root(
     view
 }
 
-/// 扫描 CodeBuddy IDE 明细根（`%LOCALAPPDATA%\CodeBuddyExtension\Data`）：
+/// 扫描 CodeBuddy IDE 明细根（Windows=`%LOCALAPPDATA%\CodeBuddyExtension\Data`，
+/// mac=`~/Library/Application Support/CodeBuddyExtension/Data`，见 `codebuddy_ide_root`）：
 /// 会话索引 `requests[]` 与 WorkBuddy 侧合并进同一个「本地源」。
 fn scan_codebuddy_ide(
     root: &Path,
@@ -951,7 +975,8 @@ fn aggregate_files(
 /// ② `~/.codebuddy/projects`——CodeBuddy CLI 会话 JSONL，本机实测仅有 agent 的
 ///    memory/*.md、零 jsonl（扫描保留以兼容其他环境）；
 /// ③ `%LOCALAPPDATA%\CodeBuddyExtension\Data\<uid>\CodeBuddyIDE\<uid>\history\...\`——
-///    **CodeBuddy IDE 侧**，用量在会话级 `index.json` 的 `requests[]`（见
+///    **CodeBuddy IDE 侧**（mac 基根 `~/Library/Application Support/...`，同构，
+///    见 `codebuddy_ide_root`），用量在会话级 `index.json` 的 `requests[]`（见
 ///    `parse_codebuddy_index`）。此项为本轮新增覆盖：此前误判为「IDE 侧无本地用量」
 ///    （当时只查了 messages/*.json，那里确实只有正文）。
 /// 故「本地源」现为「WorkBuddy 桌面端 + CodeBuddy IDE」口径；未走本地记录的部分
@@ -1004,7 +1029,8 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
         &mut cache,
         &mut seen,
     );
-    // 第三路：CodeBuddy IDE 会话索引 requests[]（%LOCALAPPDATA%\CodeBuddyExtension\Data）
+    // 第三路：CodeBuddy IDE 会话索引 requests[]（Windows=%LOCALAPPDATA%\...，
+    // mac=~/Library/Application Support/...，见 codebuddy_ide_root）
     let third = codebuddy_ide_root()
         .map(|root| scan_codebuddy_ide(&root, &cutoff, &mut cache, &mut seen));
 
@@ -1378,6 +1404,18 @@ mod tests {
         assert_eq!(view2["summary"]["input"], json!(700));
         assert_eq!(view2["summary"]["calls"], json!(3));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// mac 数据根形态锁定：CodeBuddy IDE 历史根 =
+    /// `~/Library/Application Support/CodeBuddyExtension/Data`（2026-10-09 真机
+    /// 实测与 Windows `%LOCALAPPDATA%` 布局同构）。其余平台不参与本断言。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codebuddy_ide_root_resolves_app_support_on_macos() {
+        let root = codebuddy_ide_root().expect("mac 上应能解析 CodeBuddy IDE 数据根");
+        assert!(root.ends_with(std::path::Path::new(
+            "Library/Application Support/CodeBuddyExtension/Data"
+        )));
     }
 
     /// 手动诊断（默认忽略）：在**真实** CodeBuddy IDE 目录上对比「跨文件去重前/后」，
