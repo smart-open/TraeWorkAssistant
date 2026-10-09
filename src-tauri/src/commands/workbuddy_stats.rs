@@ -1412,7 +1412,16 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn codebuddy_ide_root_resolves_app_support_on_macos() {
-        let root = codebuddy_ide_root().expect("mac 上应能解析 CodeBuddy IDE 数据根");
+        let Some(root) = codebuddy_ide_root() else {
+            // 仅 HOME 缺失/非 Unicode 时 app_support_root() 返回 Err、根合法地为
+            // None——属环境异常而非缺陷，不误报（HOME 为空串时 env::var 返回
+            // Ok("")，得到相对路径 Some，走下方主断言分支，同样不失败）
+            let home_usable = std::env::var("HOME")
+                .map(|h| !h.trim().is_empty())
+                .unwrap_or(false);
+            assert!(!home_usable, "HOME 存在时 mac 数据根必须可解析");
+            return;
+        };
         assert!(root.ends_with(std::path::Path::new(
             "Library/Application Support/CodeBuddyExtension/Data"
         )));

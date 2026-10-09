@@ -582,16 +582,22 @@ fn run_renewal(state: &AppState, renew_url: &str, probe_url: &str) -> Value {
         }
         let merged = merge_diffs_into_pool(&mut latest, &changes);
         if merged > 0 {
-            if let Ok(file) =
-                serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(latest)
-            {
-                // 吞错落日志（审查 P3）：写盘失败静默丢弃会让巡检结果看似成功实则丢失
-                if let Err(e) = crate::commands::doubao::save_pool(state, &file) {
-                    crate::fs_utils::app_log(
-                        &state.data_dir,
-                        &format!("豆包巡检：额度合并保存池失败: {e}"),
-                    );
+            match serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(latest) {
+                Ok(file) => {
+                    // 吞错落日志（审查 P3）：写盘失败静默丢弃会让巡检结果看似成功实则丢失
+                    if let Err(e) = crate::commands::doubao::save_pool(state, &file) {
+                        crate::fs_utils::app_log(
+                            &state.data_dir,
+                            &format!("豆包巡检：续期合并保存池失败: {e}"),
+                        );
+                    }
                 }
+                // 反序列化失败同样落日志（对照 run_batch 的 ? 传播）：静默丢变更
+                // 会让巡检结果看似成功实则丢失
+                Err(e) => crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("豆包巡检：续期合并池反序列化失败，本轮变更未回写: {e}"),
+                ),
             }
         }
     }

@@ -27,7 +27,9 @@ import type { PlatformScope } from './KpiRow';
  * 三源（口径不同，独立展示不合并）：
  * 本地 = workbuddy_token_stats（365 天，WorkBuddy 桌面端会话 `~/.workbuddy/projects` +
  *        CodeBuddy CLI `~/.codebuddy/projects` + CodeBuddy IDE 会话索引 requests[]
- *        `%LOCALAPPDATA%\CodeBuddyExtension\Data\`；未走本地记录的流量仍由「API网关」源单列）；
+ *        `%LOCALAPPDATA%\CodeBuddyExtension\Data\`，mac 为 `~/Library/Application
+ *        Support/CodeBuddyExtension/Data`（真机实测同构，见 codebuddy_ide_root）；
+ *        未走本地记录的流量仍由「API网关」源单列）；
  * API 网关 = api_usage_stats / api_wb_usage_stats（90 天，代理转发口径；custom 池仅 API 服务页展示）；
  * 官网 = Trae usage_history token 字段（365 天）；Buddy 官网无按日 token 明细（§8.2 诚实空态）。
  * 统一口径：总 Token = input + output + cache_write（官网/网关 cache_write 恒 0，即 input + output）；
