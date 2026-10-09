@@ -111,7 +111,9 @@ fn write_back_pool_balances(state: &AppState, parsed: &Value) {
                 }
             }
         }
-        let _ = save_pool(state, &pool);
+        if let Err(e) = save_pool(state, &pool) {
+            fs_utils::app_log(&state.data_dir, &format!("[wb-credits] 余额缓存保存池失败: {e}"));
+        }
     }
 }
 
@@ -224,7 +226,9 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
         }
     }
     if filled > 0 {
-        let _ = save_pool(state, &pool);
+        if let Err(e) = save_pool(state, &pool) {
+            fs_utils::app_log(&state.data_dir, &format!("workbuddy: 套餐回填保存池失败: {e}"));
+        }
         fs_utils::app_log(&state.data_dir, "workbuddy: 会员套餐已回填（payment-type → edition_type，仅补空）");
     }
     filled

@@ -1714,7 +1714,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             }
                             // issue #67：流未开始（零内容流出）的账号级错误 → 换号重试
                             // （对齐空完成分支：错误帧未下发，重试流可在同一连接续传；
-                            // ErrKind::None 属请求级错误，换号无意义，照旧延迟透传）
+                            // ErrKind::None 非账号级错误、此处不处理，由下方
+                            // inline_error_action 统一口径——流未开始同样换号重试）
                             if !sent_any && kind != ErrKind::None {
                                 state.logger.log_request_ttfb(
                                     "trae", "POST", proto.log_path(), &model, stream,
@@ -2690,9 +2691,28 @@ pub(crate) fn stream_msg_or_fallback(msg: &str, code: i64) -> Cow<'_, str> {
     if (100..=599).contains(&code) {
         return msg_or_fallback(msg, code as u16);
     }
-    Cow::Owned(format!(
-        "上游返回错误码 {code} 但未提供错误详情：常见于网络波动、上游服务异常，或本地全局代理（Clash 等）劫持 127.0.0.1 回环流量；请检查网络与代理设置，详见应用运行日志"
-    ))
+    Cow::Owned(business_code_fallback_text(&code.to_string()))
+}
+
+/// 业务码（非 HTTP 语义）空 message 兜底文案：code 原样嵌入，保证与 error.code
+/// 字段一致（审查 P2-1：qoder/wb 流式入口 code 为字符串形态，非数字业务码若
+/// 解析为 0 嵌入文案，会与 error.code 原值不一致、误导客户端）
+pub(crate) fn business_code_fallback_text(code_display: &str) -> String {
+    format!(
+        "上游返回错误码 {code_display} 但未提供错误详情：常见于网络波动、上游服务异常，或本地全局代理（Clash 等）劫持 127.0.0.1 回环流量；请检查网络与代理设置，详见应用运行日志"
+    )
+}
+
+/// 流式错误 message 兜底（字符串 code 形态，qoder/wb 的 send_stream_error 用）：
+/// 数字 code 走 i64 口径（区分 HTTP 状态码/业务码语义），非数字业务码原样嵌入
+pub(crate) fn stream_msg_or_fallback_str<'a>(msg: &'a str, code: &str) -> Cow<'a, str> {
+    if !msg.trim().is_empty() {
+        return Cow::Borrowed(msg);
+    }
+    match code.trim().parse::<i64>() {
+        Ok(code_num) => stream_msg_or_fallback(msg, code_num),
+        Err(_) => Cow::Owned(business_code_fallback_text(code.trim())),
+    }
 }
 
 /// OpenAI 错误响应格式（wb_route 复用）

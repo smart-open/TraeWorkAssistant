@@ -788,10 +788,11 @@ mod doubao_quota_tests {
     /// 账号保留、被删账号不复活、并发方更新的其他字段不被覆盖。
     #[test]
     fn merge_quota_updates_preserves_pool_changes_during_window() {
-        // 模巡检快照之后的最新池：u1 被并发方改了 last_keepalive_at；u2 已被删除；
+        // 模巡检快照之后的最新池：u1 被并发方改了 sid_guard（账号级真实字段，
+        // 此前误用池级字段 last_keepalive_at 作夹具）；u2 已被删除；
         // u3 为窗口内新入池账号
         let mut latest = json!({"accounts": [
-            {"user_id": "u1", "name": "甲", "session_id": "sid-AAA", "last_keepalive_at": "keep-1"},
+            {"user_id": "u1", "name": "甲", "session_id": "sid-AAA", "sid_guard": "sg-keep-1"},
             {"user_id": "u3", "name": "新入池", "session_id": "sid-CCC"},
         ]});
         let updates = vec![
@@ -819,7 +820,7 @@ mod doubao_quota_tests {
         assert_eq!(a1["quota_summary"], "剩余较多");
         assert_eq!(a1["quota_checked_at"], "2026-10-09T00:00:00Z");
         assert_eq!(
-            a1["last_keepalive_at"], "keep-1",
+            a1["sid_guard"], "sg-keep-1",
             "并发方更新的其他字段不被覆盖"
         );
         let a3 = accounts.iter().find(|a| a["user_id"] == "u3").unwrap();

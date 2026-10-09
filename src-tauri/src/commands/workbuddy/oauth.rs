@@ -10,7 +10,7 @@
 //!   ④ GET /v2/plugin/login/account?state= 带 Bearer 取 uid/nickname → 自动入池 + 凭证回写 token store
 //! 每流程独立 cookie jar（手工捕获 Set-Cookie 回传，不引新依赖）；凭证零明文输出（不进日志/事件/UI）。
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -349,7 +349,10 @@ pub fn workbuddy_oauth_login(app: AppHandle) -> Result<(), String> {
         return Err("已有 OAuth 扫码流程进行中".into());
     }
     std::thread::spawn(move || {
-        let payload = match AppState::new().and_then(|st| oauth_flow(&app, &st)) {
+        // 托管状态克隆（审查 P1-1）：与 UI 侧共享同一组池锁实例；
+        // 自建 AppState 的锁彼此隔离，oauth_flow 的入池回写会与池操作互斥失效
+        let st = app.state::<AppState>().inner().clone();
+        let payload = match oauth_flow(&app, &st) {
             Ok((id, nickname)) => serde_json::json!({
                 "ok": true,
                 "id": id,

@@ -1183,6 +1183,10 @@ pub fn doubao_account_get_credential(
 /// 返回 Some(说明) = 本次发生了写入（前端据此提示并刷新）；None = 无凭证/无 uid/未入池/内容未变。
 #[tauri::command]
 pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<String>, String> {
+    // 读-改-写互斥：罩住 凭证/uid 读取→load→幂等检查→apply_credential（内含 save）段，
+    // 防旧副本整文档覆盖；凭证与 uid 同锁内读取——两者同源于抓包文件，若锁外/锁内
+    // 各读一次，窗口期可能拼出「A 凭证 + B uid」的跨账号污染（审查 P2）
+    let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     // 读最新抓包凭证（凭证只进 vault，审查 P2 收敛：优先 vault ns，兼容回退旧 kv 一次）
     let v = crate::vault::doubao_captured_get(&state.data_dir).unwrap_or(serde_json::Value::Null);
     if v.is_null() {
@@ -1212,8 +1216,6 @@ pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<Str
         .unwrap_or_default()
         .to_string();
 
-    // 读-改-写互斥：罩住 load→幂等检查→apply_credential（内含 save）段，防旧副本整文档覆盖
-    let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     // 目标账号 = 抓包文件自带的 uid（代理 MITM 层用该请求 Cookie 里的 multi_sids
     // 按 **同一条 sessionid** 匹配出的主人）——凭证与归属天然自洽，不允许跨来源拼装。

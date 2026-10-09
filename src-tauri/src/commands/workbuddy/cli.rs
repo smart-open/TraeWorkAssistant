@@ -352,6 +352,8 @@ fn cli_rotate_cycle(state: &AppState) -> serde_json::Value {
 
 /// 后台轮换线程（F-59 检查间隔）：按配置间隔静默执行；开关关闭时空转。
 /// 独立重建 AppState（cli_rotate_cycle 仅依赖 data_dir 下文件，无 UI 事件）。
+/// ⚠ 禁止在此实例上写 wb 池：独立实例的 wb_pool_lock 与托管状态不共享，
+/// 写入会绕过互斥造成 lost-update（审查 P3 留档；当前仅读配置/写 CLI 状态 kv，安全）。
 pub fn start_cli_rotate_thread() {
     std::thread::spawn(move || {
         loop {

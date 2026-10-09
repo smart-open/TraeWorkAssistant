@@ -334,11 +334,7 @@ fn stream_convert_src(
         }
     }
 
-    (
-        error_info.map(|(code, msg)| (code, msg)),
-        sent_any,
-        pending_usage,
-    )
+    (error_info, sent_any, pending_usage)
 }
 
 /// 流式转换：SOLO SSE → OpenAI legacy text completion SSE（/v1/completions，T9）
@@ -939,11 +935,7 @@ fn stream_convert_anthropic_src(
     // 但「工具已缓冲 + 中途错误」时 error 分支已就地透传错误事件，
     // 需计入 sent_any，否则调用方会重复下发 error / 误触发重试重放
     let sent_any = message_started || (!tools.is_empty() && error_info.is_some());
-    (
-        error_info.map(|(code, msg)| (code, msg)),
-        sent_any,
-        usage,
-    )
+    (error_info, sent_any, usage)
 }
 
 /// 非流式聚合：SOLO SSE → Anthropic message 对象（/v1/messages）

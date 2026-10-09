@@ -230,8 +230,9 @@ fn read_multi_sids(user_data: &Path) -> HashMap<String, String> {
         .to_string();
     let mut out = HashMap::new();
     if let Some(i) = ent.find("x-tt-multi-sids") {
-        // 对齐 python：跳过 18 字节（15 字符键 + `":"`），取至下一引号
-        let after = &ent[(i + "x-tt-multi-sids\":\"".len()).min(ent.len())..];
+        // 对齐 python：跳过 18 字节（15 字符键 + `":"`），取至下一引号；
+        // get 切片防畸形输入越界（审查 P3）
+        let after = ent.get((i + "x-tt-multi-sids\":\"".len()).min(ent.len())..).unwrap_or("");
         let val = after.split('"').next().unwrap_or("");
         let decoded = urlencoding::decode(val).unwrap_or_default();
         for pair in decoded.split('|') {
@@ -584,7 +585,13 @@ fn run_renewal(state: &AppState, renew_url: &str, probe_url: &str) -> Value {
             if let Ok(file) =
                 serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(latest)
             {
-                let _ = crate::commands::doubao::save_pool(state, &file);
+                // 吞错落日志（审查 P3）：写盘失败静默丢弃会让巡检结果看似成功实则丢失
+                if let Err(e) = crate::commands::doubao::save_pool(state, &file) {
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("豆包巡检：额度合并保存池失败: {e}"),
+                    );
+                }
             }
         }
     }

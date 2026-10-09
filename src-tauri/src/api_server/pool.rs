@@ -284,8 +284,12 @@ impl ApiPool {
                 //   按 uid 派生（与签到伪设备同一派生体系）。绝不发送空 device_id：
                 //   "x-device-id: ''" 是显性指纹异常，容易在上游形成聚集特征触发影子风控。
                 let (device_id, machine_id) = match device_map.get(uid) {
-                    Some(d) => (d.device_id.clone(), seeded_hex(64, uid, "mach")),
-                    None => (
+                    // 空/空白 device_id（手工登记残缺）视同缺条目回落派生，对齐
+                    // trae_checkin get_device_for 口径——绝不发送空 device_id
+                    Some(d) if !d.device_id.trim().is_empty() => {
+                        (d.device_id.clone(), seeded_hex(64, uid, "mach"))
+                    }
+                    _ => (
                         crate::commands::accounts::derive_device(uid).device_id,
                         seeded_hex(64, uid, "mach"),
                     ),

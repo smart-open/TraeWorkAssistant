@@ -1009,11 +1009,6 @@ pub const DOUBAO_TASK_NAME: &str = "AIWorkAssistant_DoubaoRenew";
 /// 豆包额度巡检每日计划任务名（批量查额度 + 回写缓存/历史 + 用完记录）
 pub const DOUBAO_QUOTA_TASK_NAME: &str = "AIWorkAssistant_DoubaoQuotaCheck";
 
-// 运行 schtasks 并正确解码输出。
-// 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")
-// 以 GBK 字节输出；若直接 from_utf8_lossy 会读成 ϵͳ... 乱码，导致 "找不到" 永远匹配不上、
-// 错误文案变成乱码。前置 `chcp 65001` 让 schtasks 以 UTF-8 输出，从而能正确匹配与展示。
-// 返回 (成功?, stdout, stderr)，三者均为 UTF-8 字符串。
 /// 严格校验 HH:MM 时间格式（schtasks /ST 参数）。
 /// 审查修复（命令注入）：time 经 `cmd /c … && schtasks /ST <time>` 执行，cmd 对不含
 /// 空格/引号的参数不做引号包裹，`12:00&calc` 类输入会把 `&` 解释为命令分隔符实现
@@ -1053,6 +1048,11 @@ pub(crate) fn schtasks_gate() -> Result<(), String> {
     Ok(())
 }
 
+// 运行 schtasks 并正确解码输出。
+// 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")
+// 以 GBK 字节输出；若直接 from_utf8_lossy 会读成 ϵͳ... 乱码，导致 "找不到" 永远匹配不上、
+// 错误文案变成乱码。前置 `chcp 65001` 让 schtasks 以 UTF-8 输出，从而能正确匹配与展示。
+// 返回 (成功?, stdout, stderr)，三者均为 UTF-8 字符串。
 pub(crate) fn run_schtasks(args: &[&str]) -> Result<(bool, String, String), String> {
     let mut full: Vec<String> = vec![
         "/c".to_string(),
