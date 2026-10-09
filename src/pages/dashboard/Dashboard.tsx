@@ -348,9 +348,10 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       .filter((r) => r.date === today)
       .reduce((s, r) => s + (r.reward ?? 0), 0);
     const todayEarned = snapEarned != null ? Math.max(0, snapEarned) : checkinEarned;
-    // 今日消耗：官方用量优先（31 天窗口），回退快照差分
+    // 今日消耗：官方用量优先（31 天窗口），回退快照差分；两源冷启动均可能返回
+    // {status:'empty'} 空态（缺 summary 字段），?. 只保护第一层，summary 须可选链（issue #72）
     const todayConsumed =
-      wbOfficial?.summary.usage_today ?? wbFallback?.summary.usage_today ?? 0;
+      wbOfficial?.summary?.usage_today ?? wbFallback?.summary?.usage_today ?? 0;
     return {
       accounts: accs.length,
       totalCredits,
