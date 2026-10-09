@@ -1056,6 +1056,8 @@ pub async fn qoder_catalog_sync(state: State<'_, AppState>) -> Result<usize, Str
         data_dir: state.data_dir.clone(),
         jwt_refresh_lock: state.inner().jwt_refresh_lock.clone(),
         qoder_pool_lock: state.inner().qoder_pool_lock.clone(),
+        wb_pool_lock: state.inner().wb_pool_lock.clone(),
+        doubao_pool_lock: state.inner().doubao_pool_lock.clone(),
     };
     tauri::async_runtime::spawn_blocking(move || {
         // run_task 返回 json：{ok:true, models:n} 或 {ok:true, skipped:...}

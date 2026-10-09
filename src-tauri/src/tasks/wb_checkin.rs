@@ -412,6 +412,8 @@ fn fetch_wb_credits_balance(state: &AppState, aid: &str) -> Option<f64> {
 /// 刷新成功后回写账号池 token 过期时间（调度/到期日历数据源）
 fn sync_pool_expiry(state: &AppState, aid: &str, creds: &Creds) {
     // SQLite 化（P3）：wb_accounts 表
+    // 读-改-写互斥：罩住 load→改→save 段，防命令/后台/调度线程旧副本整文档覆盖
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool: Value = crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir));
     let mut changed = false;
     if let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) {

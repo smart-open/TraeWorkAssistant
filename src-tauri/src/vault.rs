@@ -582,6 +582,8 @@ pub fn migrate_ns_on_startup(state: &AppState) {
     }
     // ③ 豆包账号池（doubao_accounts 表）
     {
+        // 读-改-写互斥：load→save 持池锁，防启动迁移与并发写方互踩
+        let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         let pool = crate::store::docs::doubao_pool_load(&crate::store::db(&state.data_dir));
         let plain = pool
             .accounts

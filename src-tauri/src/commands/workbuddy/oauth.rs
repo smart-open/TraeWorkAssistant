@@ -289,39 +289,45 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
     // 不再重复入池，快照/分组引用不悬空），未命中才新增；凭证副本写回保留 id 名下。
     let id = account_id_of(&token);
     let now_s = chrono::Utc::now().timestamp();
-    let mut pool = load_pool(state);
-    let target_id = if let Some(a) = super::accounts::find_uid_or_id(&mut pool, &uid, &id) {
-        if !uid.is_empty() {
-            a.uid = uid.clone();
-        }
-        if !nickname.is_empty() {
-            a.nickname = nickname.clone();
-        }
-        if !phone_masked.is_empty() {
-            a.phone_masked = phone_masked.clone();
-        }
-        if !edition.is_empty() {
-            a.edition_type = edition.clone();
-        }
-        a.access_token_expires_at = exp_s;
-        a.auth_saved_at = Some(now_s);
-        a.needs_relogin = false;
-        a.relogin_reason.clear();
-        a.id.clone()
-    } else {
-        pool.accounts.push(WorkBuddyAccount {
-            id: id.clone(),
-            uid: uid.clone(),
-            nickname: nickname.clone(),
-            phone_masked,
-            edition_type: edition,
-            access_token_expires_at: exp_s,
-            auth_saved_at: Some(now_s),
-            ..Default::default()
-        });
-        id.clone()
+    // 读-改-写互斥：块作用域罩住 load→合并→save 池段，防旧副本整文档覆盖；
+    // upsert_token_store 留在锁外，缩短临界区
+    let target_id = {
+        let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = load_pool(state);
+        let target_id = if let Some(a) = super::accounts::find_uid_or_id(&mut pool, &uid, &id) {
+            if !uid.is_empty() {
+                a.uid = uid.clone();
+            }
+            if !nickname.is_empty() {
+                a.nickname = nickname.clone();
+            }
+            if !phone_masked.is_empty() {
+                a.phone_masked = phone_masked.clone();
+            }
+            if !edition.is_empty() {
+                a.edition_type = edition.clone();
+            }
+            a.access_token_expires_at = exp_s;
+            a.auth_saved_at = Some(now_s);
+            a.needs_relogin = false;
+            a.relogin_reason.clear();
+            a.id.clone()
+        } else {
+            pool.accounts.push(WorkBuddyAccount {
+                id: id.clone(),
+                uid: uid.clone(),
+                nickname: nickname.clone(),
+                phone_masked,
+                edition_type: edition,
+                access_token_expires_at: exp_s,
+                auth_saved_at: Some(now_s),
+                ..Default::default()
+            });
+            id.clone()
+        };
+        save_pool(state, &pool)?;
+        target_id
     };
-    save_pool(state, &pool)?;
     let creds = serde_json::json!({
         "access_token": token,
         "refresh_token": if refresh_token.is_empty() { None } else { Some(refresh_token) },

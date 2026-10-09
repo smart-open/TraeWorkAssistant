@@ -242,7 +242,37 @@ fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// 目录内 `proxy_req_*.log`，文件名升序（= 时间升序）。
+/// 文件名 → (日期, 分片序号)：`proxy_req_YYYY-MM-DD.log` → (day, 0)，同日轮转分片
+/// `proxy_req_YYYY-MM-DD.log.N` → (day, N)。其余（含序号非纯数字、day 非合法日期）→ None。
+/// 列表与详情白名单共用，保证两边口径一致。
+fn proxy_log_shard_key(name: &str) -> Option<(&str, u32)> {
+    let rest = name.strip_prefix("proxy_req_")?;
+    let (day, seq) = match rest.strip_suffix(".log") {
+        Some(day) => (day, 0),
+        None => {
+            let dot = rest.rfind(".log.")?;
+            let n = rest.get(dot + ".log.".len()..)?;
+            (rest.get(..dot)?, n.parse::<u32>().ok()?)
+        }
+    };
+    is_log_shard_day(day).then_some((day, seq))
+}
+
+/// day 段必须是合法 `%Y-%m-%d` 日期（写入端恒为此形态，见 logger::ensure_file）：
+/// 形态校验拦住 `xxx.log.log` 类畸形名，语义校验拦住 `2026-13-99` 非法日期。
+fn is_log_shard_day(day: &str) -> bool {
+    let b = day.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+        && chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok()
+}
+
+/// 目录内 `proxy_req_*.log` 及同日轮转分片 `.log.N`，排序 = 日期升序 + 分片序号升序
+/// （即写入时间升序；字典序会把 `.log.10` 排到 `.log.2` 前，须按序号数值排）。
 /// 目录读取失败返回 Err（对齐基线错误语义；吞成空表会连带清空全部索引缓存）
 fn proxy_log_files(log_dir: &Path) -> Result<Vec<String>, String> {
     let mut files: Vec<String> = std::fs::read_dir(log_dir)
@@ -250,14 +280,18 @@ fn proxy_log_files(log_dir: &Path) -> Result<Vec<String>, String> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("proxy_req_") && name.ends_with(".log") {
+            if proxy_log_shard_key(&name).is_some() {
                 Some(name)
             } else {
                 None
             }
         })
         .collect();
-    files.sort();
+    files.sort_by(|a, b| {
+        let ka = proxy_log_shard_key(a).unwrap_or(("", 0));
+        let kb = proxy_log_shard_key(b).unwrap_or(("", 0));
+        ka.cmp(&kb)
+    });
     Ok(files)
 }
 
@@ -488,7 +522,8 @@ fn proxy_logs_list_impl(
     retain_alive_indexes(log_dir, &files);
 
     // 候选收集：多线程（文件之间互不依赖；冷建索引与关键字全文扫描都是 IO+CPU 密集）。
-    // 分片按文件名升序切分，拼接后仍是「文件升序 + 文件内升序」= 时间升序
+    // 文件按（日期, 分片序号）升序切分，拼接后仍是「文件升序 + 文件内升序」= 时间升序，
+    // 翻页 skip/take 作用在合并后的全量候选集上 → 天然跨日期、跨轮转分片
     let threads = files.len().min(4).max(1);
     let chunk = files.len().div_ceil(threads).max(1);
     let keyword_ref: &str = &keyword;
@@ -545,10 +580,10 @@ fn proxy_log_detail_impl(log_dir: &Path, id: &str) -> Result<String, String> {
     }
     let file_name = parts[0];
     let index: usize = parts[1].parse().map_err(|_| "无效的索引")?;
-    // 审查修复（任意文件读取/路径遍历）：文件名与列表接口同一白名单，
+    // 审查修复（任意文件读取/路径遍历）：文件名与列表接口同一白名单（含 `.log.N` 轮转分片），
     // 并拒绝路径分隔符——"..\..\x:0" 类输入此前可直接 join 读任意文件
     if !file_name.starts_with("proxy_req_")
-        || !file_name.ends_with(".log")
+        || proxy_log_shard_key(file_name).is_none()
         || file_name.contains('\\')
         || file_name.contains('/')
         || file_name.contains("..")
@@ -1543,6 +1578,80 @@ mod tests {
         // 关键字路径同样跳过
         let kw = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, Some("body"), None, None)).unwrap();
         assert_eq!(kw.total, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归（2026-10-09）：同日 >100MB 轮转出的 `.log.N` 分片必须进列表、可跨分片翻页、
+    /// 可打开详情；排序 = 日期升序 + 分片序号数值升序（字典序会把 `.log.10` 排到 `.log.2` 前）；
+    /// 详情白名单放行 `.log.N`，仍拒绝非分片后缀与路径遍历输入。
+    #[test]
+    fn proxy_logs_list_covers_rotated_shards_across_pages() {
+        let dir = tmp_dir("proxy_logs_shards");
+        // 同日 3 个分片（写入时间序：.log → .log.1 → .log.2，与写入端 ensure_file 语义一致）+ 前一天
+        write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-01.log",
+            &[proxy_entry_text("2026-10-01 10:00:00", "GET", "a.example.com/x", "200 OK", "day1")],
+        );
+        write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-02.log",
+            &[proxy_entry_text("2026-10-02 10:00:00", "GET", "a.example.com/x", "200 OK", "shard0")],
+        );
+        write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-02.log.1",
+            &[proxy_entry_text("2026-10-02 11:00:00", "GET", "b.example.com/y", "200 OK", "shard1")],
+        );
+        write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-02.log.2",
+            &[proxy_entry_text("2026-10-02 12:00:00", "GET", "c.example.com/z", "200 OK", "shard2")],
+        );
+
+        // 分片计入总数；顺序 = 时间倒序（.log.2 → .log.1 → .log → 前一天）
+        let all = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, None, None, None)).unwrap();
+        assert_eq!(all.total, 4);
+        assert_eq!(all.entries[0].id, "proxy_req_2026-10-02.log.2:0");
+        assert_eq!(all.entries[1].id, "proxy_req_2026-10-02.log.1:0");
+        assert_eq!(all.entries[2].id, "proxy_req_2026-10-02.log:0");
+        assert_eq!(all.entries[3].id, "proxy_req_2026-10-01.log:0");
+
+        // 翻页跨分片：offset=1 / limit=1 应命中 .log.1 的条目
+        let page = proxy_logs_list_impl(&dir, &proxy_opts(1, 1, None, None, None)).unwrap();
+        assert_eq!(page.entries[0].id, "proxy_req_2026-10-02.log.1:0");
+
+        // 关键字筛选命中分片内条目
+        let kw = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, Some("shard2"), None, None)).unwrap();
+        assert_eq!(kw.total, 1);
+        assert_eq!(kw.entries[0].id, "proxy_req_2026-10-02.log.2:0");
+
+        // 详情可直接打开分片条目
+        let detail = proxy_log_detail_impl(&dir, "proxy_req_2026-10-02.log.1:0").unwrap();
+        assert!(detail.contains("shard1"), "分片条目详情应可读: {detail}");
+
+        // 分片序号按数值排：.log.10 晚于 .log.2（字典序会颠倒）
+        write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-02.log.10",
+            &[proxy_entry_text("2026-10-02 13:00:00", "GET", "d.example.com/w", "200 OK", "shard10")],
+        );
+        let many = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, None, None, None)).unwrap();
+        assert_eq!(many.entries[0].id, "proxy_req_2026-10-02.log.10:0");
+        assert_eq!(many.entries[1].id, "proxy_req_2026-10-02.log.2:0");
+
+        // 白名单：非 `.log[.N]` 后缀 / 遍历输入仍拒绝
+        assert!(proxy_log_detail_impl(&dir, "proxy_req_2026-10-02.log.exe:0").is_err());
+        assert!(proxy_log_detail_impl(&dir, "proxy_req_2026-10-02.log.x:0").is_err());
+        assert!(proxy_log_detail_impl(&dir, "proxy_req_..\\..\\proxy.log:0").is_err());
+        assert!(proxy_log_detail_impl(&dir, "other_req_2026-10-02.log:0").is_err());
+
+        // day 段非合法日期（手工投放的畸形名）同样拒绝，不放行进列表/详情
+        assert!(proxy_log_shard_key("proxy_req_2026-10-02.log.log").is_none());
+        assert!(proxy_log_shard_key("proxy_req_foo.log").is_none());
+        assert!(proxy_log_shard_key("proxy_req_2026-13-99.log").is_none());
+        assert!(proxy_log_shard_key("proxy_req_2026-10-02.log.0").is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -45,7 +45,7 @@ use super::wb_sse;
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{lines_with_first_byte_hedged, lines_with_first_byte_timeout, InterruptibleLines};
 use super::{ApiSharedState, ErrKind, InflightGuard};
-use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
 use crate::tasks::qoder_common::QoderCreds;
 use crate::tasks::qoder_upstream::{self, ErrMeta, UpstreamKind};
 
@@ -1376,6 +1376,10 @@ fn send_stream_error(
     code: &str,
     msg: &str,
 ) {
+    // 空 message 兜底（issue #71）：本函数 code 为字符串形态（含非数字业务码），
+    // 解析为 i64 后走统一兜底；非数字按 0（缺失语义）处理，不冒充 HTTP 状态码
+    let code_num = code.parse::<i64>().unwrap_or(0);
+    let msg = stream_msg_or_fallback(msg, code_num);
     match proto {
         Protocol::Anthropic => {
             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});

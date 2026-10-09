@@ -143,6 +143,13 @@ pub struct AppState {
     /// Qoder 账号池读-改-写互斥（F-80 I09）：OAuth/PAT/IDE 导入、改名/移除、
     /// 签到回写过期时间、指纹回填等路径并发时整池覆盖会丢更新，统一持锁执行
     pub qoder_pool_lock: Arc<Mutex<()>>,
+    /// WorkBuddy 账号池读-改-写互斥：全部「load_pool→内存改→save_pool」写点
+    /// （命令线程/后台刷新线程/调度器三方并发）持锁执行，防旧副本整文档覆盖
+    /// 丢账号（lost-update）；长窗口网络调用（回填/续期）在锁外完成后短临界区写回
+    pub wb_pool_lock: Arc<Mutex<()>>,
+    /// Doubao 账号池读-改-写互斥：同 wb_pool_lock，罩住命令/巡检任务/保活线程
+    /// 与 vault 启动迁移的全部写点
+    pub doubao_pool_lock: Arc<Mutex<()>>,
 }
 
 /// 配置文件名列表（路由到 conf/ 目录）
@@ -169,6 +176,8 @@ impl AppState {
             data_dir,
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
+            wb_pool_lock: Arc::new(Mutex::new(())),
+            doubao_pool_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -383,6 +392,8 @@ mod tests {
             data_dir: d,
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
+            wb_pool_lock: Arc::new(Mutex::new(())),
+            doubao_pool_lock: Arc::new(Mutex::new(())),
         }
     }
 

@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::wb_upstream::InterruptibleLines;
+use crate::api_server::routes::stream_msg_or_fallback;
 
 /// 上游停滞期间的断连轮询间隔：每 500ms 醒来检查一次客户端是否断连
 /// （tx.is_closed()），对齐 sse.rs LINE_POLL——避免「断连 + 上游停滞」时
@@ -488,7 +489,9 @@ pub fn stream_forward_ex(
             }
             Some(WbEvent::Error { code, msg }) => {
                 if sent_any {
-                    // 已有数据流出：就地透传错误并收尾（failed_inline 标记给调用方）
+                    // 已有数据流出：就地透传错误并收尾（failed_inline 标记给调用方）；
+                    // 空 message 兜底（issue #71）：inline 与延迟透传同防线
+                    let msg = stream_msg_or_fallback(&msg, code);
                     match proto {
                         crate::api_server::routes::Protocol::Anthropic => {
                             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});

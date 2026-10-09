@@ -489,9 +489,10 @@ fn run_renewal(state: &AppState, renew_url: &str, probe_url: &str) -> Value {
         .unwrap_or_default();
     let agent = probe_agent();
     let mut results: Vec<Value> = Vec::new();
-    // 回填用的完整账号对象（含 skipped 与未变更字段）：禁止用 results 摘要替换账号池
-    //（审查 #1：曾用摘要整体回写导致 session_id/sid_guard 等全字段丢失、skipped 账号被删）
-    let mut updated: Vec<Value> = Vec::new();
+    // 巡检变更收集（两阶段）：按 uid 记录本轮真正变更的字段对，锁外网络完成后
+    // 短临界区合并回最新池——不再用快照副本整体替换，巡检窗口内新入池账号保留、
+    // 被删账号不复活（防 lost-update 丢账号；对照审查 #1 摘要整体回写教训）
+    let mut changes: Vec<(String, Vec<(String, Value)>)> = Vec::new();
     let (mut ok_n, mut expired_n, mut error_n, mut skipped_n) = (0usize, 0usize, 0usize, 0usize);
 
     for mut acc in accounts {
@@ -503,9 +504,9 @@ fn run_renewal(state: &AppState, renew_url: &str, probe_url: &str) -> Value {
             .to_string();
         if sid.is_empty() {
             skipped_n += 1;
-            updated.push(acc); // 无凭据账号原样保留在池中
-            continue;
+            continue; // 无凭据账号无变更，不参与回写（最新池中保持原样）
         }
+        let acc_before = acc.clone(); // 供回写段 diff：只合并本轮真正变更的字段
         // ① 权威判定：已登录 JSON 端点（code=0 有效 / 710012001 失效）
         let (first_status, first_detail) = api_probe(&agent, &sid, probe_url);
         let (status, detail, new_cookies) = match first_status.as_str() {
@@ -555,20 +556,66 @@ fn run_renewal(state: &AppState, renew_url: &str, probe_url: &str) -> Value {
             }
         }
         results.push(entry);
-        updated.push(acc); // 完整账号对象（含本轮新 session_id/sid_guard 等）回填
+        // diff：只记录本轮真正变更的字段（ok/expired 改的 expired/last_renew_at/
+        // session_id/sid_guard/session_expire_at），error 账号 diff 为空不回写
+        if let (Some(b), Some(a)) = (acc_before.as_object(), acc.as_object()) {
+            let diff: Vec<(String, Value)> = a
+                .iter()
+                .filter(|(k, v)| b.get(*k) != Some(*v))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if !diff.is_empty() {
+                changes.push((uid.clone(), diff));
+            }
+        }
     }
-    // 仅在拿到结果时回写（python 同款；空池不触发写盘）。
-    // 回填 updated（完整账号对象）而非 results（摘要），字段零丢失（对照 doubao_quota::run_batch）
-    if !results.is_empty() {
-        pool["accounts"] = Value::Array(updated);
-        if let Ok(file) = serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(pool) {
-            let _ = crate::commands::doubao::save_pool(state, &file);
+    // 仅在有实际变更时回写（python 同款；空池不触发写盘）。
+    // 两阶段短临界区：持锁重读最新池按 uid 合并 diff——巡检窗口内新入池账号保留、
+    // 被删账号不复活；字段级合并避免覆盖并发方的其他字段更新
+    if !changes.is_empty() {
+        let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut latest: Value =
+            serde_json::to_value(crate::commands::doubao::load_pool(state)).unwrap_or(json!({}));
+        if !latest.is_object() {
+            latest = json!({"accounts": []});
+        }
+        let merged = merge_diffs_into_pool(&mut latest, &changes);
+        if merged > 0 {
+            if let Ok(file) =
+                serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(latest)
+            {
+                let _ = crate::commands::doubao::save_pool(state, &file);
+            }
         }
     }
     json!({
         "ok": ok_n, "expired": expired_n, "error": error_n, "skipped": skipped_n,
         "accounts": results,
     })
+}
+
+/// 续期回写合并（纯函数，供两阶段短临界区调用）：将按 uid 收集的 diff 字段对
+/// 合并进最新池——只更新仍存在账号，被删账号不复活（返回 0 合并数即无需写盘）、
+/// 新入池账号不受影响；字段级 insert 不覆盖并发方更新的其他字段。
+fn merge_diffs_into_pool(latest: &mut Value, changes: &[(String, Vec<(String, Value)>)]) -> usize {
+    let mut merged = 0usize;
+    if let Some(arr) = latest.get_mut("accounts").and_then(Value::as_array_mut) {
+        for (uid, diff) in changes {
+            let Some(dst) = arr
+                .iter_mut()
+                .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid.as_str()))
+            else {
+                continue; // 巡检期间被删除的账号不复活
+            };
+            if let Some(obj) = dst.as_object_mut() {
+                for (k, v) in diff {
+                    obj.insert(k.clone(), v.clone());
+                }
+                merged += 1;
+            }
+        }
+    }
+    merged
 }
 
 // ── 主入口 ─────────────────────────────────────────────────────────────────
@@ -620,6 +667,8 @@ mod tests {
             data_dir: dir,
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -656,5 +705,52 @@ mod tests {
         assert_eq!(a3["name"], "丙（无凭据）", "无凭据账号原样保留");
         // summary 侧仍输出摘要（前端契约不变）
         assert_eq!(summary["accounts"].as_array().unwrap().len(), 2);
+    }
+
+    /// 回归（档 B 两阶段回写）：合并只动 diff 字段——巡检窗口内新入池账号保留、
+    /// 被删账号不复活、并发方更新的其他字段不被覆盖（防 lost-update 三语义）。
+    #[test]
+    fn merge_diffs_preserves_pool_changes_during_window() {
+        // 模拟巡检快照之后的最新池：1001 被并发方改了 name；1002 已被删除；
+        // 1003 为窗口内新入池账号
+        let mut latest = json!({"accounts": [
+            {"user_id": "1001", "name": "甲改名", "session_id": "sid-AAA"},
+            {"user_id": "1003", "name": "新入池", "session_id": "sid-CCC"},
+        ]});
+        let changes = vec![
+            // 1001：本轮巡检 diff（不含 name——并发方的 name 更新不被覆盖）
+            (
+                "1001".to_string(),
+                vec![
+                    ("last_renew_at".to_string(), json!("2026-10-09T00:00:00Z")),
+                    ("expired".to_string(), json!(false)),
+                ],
+            ),
+            // 1002：巡检期间被删除 → 不得复活
+            ("1002".to_string(), vec![("expired".to_string(), json!(true))]),
+        ];
+        let merged = merge_diffs_into_pool(&mut latest, &changes);
+        assert_eq!(merged, 1, "被删账号不参与合并，merged 只计仍存在账号");
+        let accounts = latest["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 2, "被删账号不复活、无新账号混入");
+        let a1 = accounts.iter().find(|a| a["user_id"] == "1001").unwrap();
+        assert_eq!(a1["last_renew_at"], "2026-10-09T00:00:00Z", "diff 字段写入");
+        assert_eq!(a1["expired"], json!(false));
+        assert_eq!(a1["name"], "甲改名", "并发方更新的其他字段不被覆盖");
+        assert_eq!(a1["session_id"], "sid-AAA", "未变更字段保留");
+        let a3 = accounts.iter().find(|a| a["user_id"] == "1003").unwrap();
+        assert_eq!(a3["name"], "新入池", "窗口内新入池账号保留");
+        assert_eq!(a3["session_id"], "sid-CCC");
+    }
+
+    /// 空池形态（load 出非对象）走合并应安全返回 0，不写盘。
+    #[test]
+    fn merge_diffs_on_empty_pool_is_noop() {
+        let mut latest = json!({});
+        let changes = vec![(
+            "1001".to_string(),
+            vec![("expired".to_string(), json!(true))],
+        )];
+        assert_eq!(merge_diffs_into_pool(&mut latest, &changes), 0);
     }
 }

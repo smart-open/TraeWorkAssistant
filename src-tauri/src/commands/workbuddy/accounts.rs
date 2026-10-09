@@ -190,6 +190,8 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
 
 #[tauri::command]
 pub fn workbuddy_account_save(state: State<AppState>, user_id: String, name: Option<String>, note: Option<String>) -> Result<(), String> {
+    // 池读-改-写互斥（wb_pool_lock）：防与其他写点并发时旧副本整文档覆盖丢改动
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     let acct = pool
         .accounts
@@ -210,6 +212,8 @@ pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_
     // 审查 P1：id 将作为 profiles_workbuddy/<id> 目录名参与 remove_dir_all，
     // 先过字符集白名单，杜绝 `..`/绝对路径注入导致的目录逃逸删除
     fs_utils::ensure_uid_safe(&user_id)?;
+    // 池读-改-写互斥（wb_pool_lock）：仅罩住池段，后续快照/CLI 状态清理不涉池
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     let before = pool.accounts.len();
     pool.accounts.retain(|a| a.id != user_id);
@@ -423,23 +427,28 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
         .or_else(|| as_str(fs_utils::dig(&raw, &["nickname", "displayName", "name"])))
         .unwrap_or_else(|| uid.chars().take(8).collect());
 
-    let mut pool = load_pool(&state);
-    let target_id = merge_auth_entry(
-        &mut pool,
-        AuthMerge {
-            id,
-            uid: uid.clone(),
-            nickname,
-            edition_type: as_str(fs_utils::dig(&raw, &["editionType", "edition"])).unwrap_or_default(),
-            // expires 键对齐 creds_of 超集（与 scan 同口径）
-            access_token_expires_at: as_ts_seconds(fs_utils::dig(
-                &raw,
-                &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_in_ms", "accessTokenExpiresAtMs"],
-            )),
-            refresh_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["refreshExpiresAt", "refresh_expires_at"])),
-        },
-    );
-    save_pool(&state, &pool)?;
+    // 池读-改-写互斥（wb_pool_lock）：仅罩住池段；凭证副本落库（token store 锁）在锁外
+    let target_id = {
+        let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = load_pool(&state);
+        let target_id = merge_auth_entry(
+            &mut pool,
+            AuthMerge {
+                id,
+                uid: uid.clone(),
+                nickname,
+                edition_type: as_str(fs_utils::dig(&raw, &["editionType", "edition"])).unwrap_or_default(),
+                // expires 键对齐 creds_of 超集（与 scan 同口径）
+                access_token_expires_at: as_ts_seconds(fs_utils::dig(
+                    &raw,
+                    &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_in_ms", "accessTokenExpiresAtMs"],
+                )),
+                refresh_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["refreshExpiresAt", "refresh_expires_at"])),
+            },
+        );
+        save_pool(&state, &pool)?;
+        target_id
+    };
 
     // 工具侧凭证副本（F-10 双源化）：写回保留的原 id 名下（换 token 重导入时与池条目对齐，
     // 避免 pool 用旧 id / token store 用新 id 导致凭证与账号脱钩）
@@ -493,13 +502,16 @@ pub fn workbuddy_refresh_token(
         .try_lock()
         .map_err(|_| "该账号正在续期中，请等待当前续期完成后再试".to_string())?;
 
-    let mut pool = load_pool(&state);
-    let acct = pool
-        .accounts
-        .iter()
-        .find(|a| a.id == user_id)
-        .ok_or_else(|| format!("账号不存在: {user_id}"))?
-        .clone();
+    // 只读快照取账号（clone）：网络续期期间不持池副本（原实现持有旧副本跨 30s
+    // 网络，写回会整体抹掉窗口内的导入/删除/其他回写——lost-update）
+    let acct = {
+        let pool = load_pool(&state);
+        pool.accounts
+            .iter()
+            .find(|a| a.id == user_id)
+            .ok_or_else(|| format!("账号不存在: {user_id}"))?
+            .clone()
+    };
 
     // 惰性续期门（force=false 时生效）：判定抽为纯函数 lazy_renew_skippable。
     // expires_at 缺失时放行（无法判定就续一次，顺带拿到准确的 expiresIn）。
@@ -597,13 +609,19 @@ pub fn workbuddy_refresh_token(
         "refresh_expires_at_ms": rexp_ms,
     });
     upsert_token_store(&state, &acct.id, &creds)?;
-    if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == acct.id) {
-        a.access_token_expires_at = exp_ms.map(|m| m / 1000);
-        a.refresh_token_expires_at = rexp_ms.map(|m| m / 1000);
-        a.needs_relogin = false;
-        a.relogin_reason.clear();
+    // 短临界区写回：重读最新池 → 按 id 更新仍存在的账号；窗口内账号已被删除
+    // 则跳过池回写（token store 副本已更新，删除方本就不保留该账号）
+    {
+        let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = load_pool(&state);
+        if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == acct.id) {
+            a.access_token_expires_at = exp_ms.map(|m| m / 1000);
+            a.refresh_token_expires_at = rexp_ms.map(|m| m / 1000);
+            a.needs_relogin = false;
+            a.relogin_reason.clear();
+            save_pool(&state, &pool)?;
+        }
     }
-    save_pool(&state, &pool)?;
     fs_utils::app_log(&state.data_dir, &format!("WorkBuddy 凭证续期成功: {}", acct.id));
     Ok("凭证已续期".into())
 }
@@ -717,6 +735,9 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
     let mut with_cred = 0usize;
     // 审查 P1：被拒绝条目逐条标注原因（id 非法/缺失的不入池，避免注入任意目录名）
     let mut rejected: Vec<serde_json::Value> = Vec::new();
+    // 读-改-写互斥：罩住 load→逐条合并→save 全段，防并发写方用旧副本整文档覆盖丢账号；
+    // 循环内 upsert_token_store 与池锁无嵌套，持锁调用无死锁（同 qoder data_io 先例）
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     for a in accounts {
         let id = a.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();

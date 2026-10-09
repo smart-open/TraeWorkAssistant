@@ -507,9 +507,10 @@ fn append_history(state: &AppState, event: Value) {
 /// 查额度 → 回写账号池缓存 + 追加运维历史 → 汇总。
 pub fn run_batch(state: &AppState) -> Result<Value, String> {
     // SQLite 化（P3）：doubao_accounts 表
-    let mut pool: Value =
+    // 两阶段：先只读快照收集目标，锁外网络巡检，最后短临界区合并回写
+    let pool: Value =
         serde_json::to_value(crate::commands::doubao::load_pool(state)).unwrap_or(json!({}));
-    let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) else {
+    let Some(accounts) = pool.get("accounts").and_then(Value::as_array) else {
         return Err("账号池解析失败".to_string());
     };
 
@@ -522,18 +523,18 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
         .unwrap_or_else(crate::models::default_doubao_quota_url);
 
     let agent = http_agent(TIMEOUT_SECS);
-    // 先收集可巡检目标（uid + 凭证），避免边遍历边写
-    let targets: Vec<(usize, String, String, Option<String>)> = accounts
+    // 先收集可巡检目标（uid + 凭证 + name），避免边遍历边写
+    let targets: Vec<(String, String, Option<String>, String)> = accounts
         .iter()
-        .enumerate()
-        .filter_map(|(i, acc)| {
+        .filter_map(|acc| {
             let uid = acc.get("user_id").and_then(Value::as_str)?.to_string();
             let sid = acc.get("session_id").and_then(Value::as_str)?.to_string();
             if uid.is_empty() || sid.is_empty() {
                 return None;
             }
             let sg = acc.get("sid_guard").and_then(Value::as_str).map(|s| s.to_string());
-            Some((i, uid, sid, sg))
+            let name = acc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            Some((uid, sid, sg, name))
         })
         .collect();
 
@@ -541,39 +542,18 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
     let mut fail_n = 0usize;
     let mut exhausted: Vec<Value> = vec![];
     let mut errors: Vec<Value> = vec![];
-    let mut changed = false;
+    // 巡检变更收集（两阶段）：锁外网络完成后短临界区按 uid 合并回最新池，
+    // 防旧快照整体替换丢掉巡检期间新入池/被删账号（lost-update）
+    let mut quota_updates: Vec<(String, Value, Option<String>, String)> = Vec::new();
 
-    for (i, uid, sid, sg) in targets {
+    for (uid, sid, sg, name) in targets {
         let now = fs_utils::now_ts();
         match query_account(&agent, &url, &sid, sg.as_deref()) {
             Ok(r) => {
                 ok_n += 1;
                 let parsed = r.get("parsed").cloned().unwrap_or(Value::Null);
                 let summary = summarize_parsed(&parsed);
-                let name = accounts[i]
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(acc) = accounts[i].as_object_mut() {
-                    acc.insert(
-                        "quota_level".into(),
-                        parsed.get("level").cloned().unwrap_or(Value::Null),
-                    );
-                    acc.insert(
-                        "quota_expire_at".into(),
-                        parsed.get("expire_at").cloned().unwrap_or(Value::Null),
-                    );
-                    acc.insert(
-                        "quota_summary".into(),
-                        summary
-                            .clone()
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
-                    );
-                    acc.insert("quota_checked_at".into(), Value::String(now.clone()));
-                }
-                changed = true;
+                quota_updates.push((uid.clone(), parsed.clone(), summary.clone(), now.clone()));
                 let windows: Vec<Value> = parsed
                     .get("items")
                     .and_then(Value::as_array)
@@ -634,11 +614,19 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
         }
     }
 
-    if changed {
+    if !quota_updates.is_empty() {
+        // 读-改-写互斥：短临界区重读最新池按 uid 合并额度字段——巡检期间被删账号
+        // 跳过不复活、新入池账号保留；quota_checked_at 沿用查询时刻。
         // 账号池含全部账号会话凭证（等同密码），事务内整表替换
-        let file = serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(pool)
-            .map_err(|e| e.to_string())?;
-        crate::commands::doubao::save_pool(state, &file)?;
+        let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut latest: Value =
+            serde_json::to_value(crate::commands::doubao::load_pool(state)).unwrap_or(json!({}));
+        let merged = merge_quota_updates_into_pool(&mut latest, &quota_updates);
+        if merged > 0 {
+            let file = serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(latest)
+                .map_err(|e| e.to_string())?;
+            crate::commands::doubao::save_pool(state, &file)?;
+        }
     }
     Ok(json!({
         "ok": true, "mode": "all", "url": url,
@@ -646,6 +634,43 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
         "exhausted": exhausted, "errors": errors,
         "finished_at": fs_utils::now_ts(),
     }))
+}
+
+/// 额度回写合并（纯函数，供两阶段短临界区调用）：将按 uid 收集的额度查询结果
+/// 合并进最新池——只更新仍存在账号（quota_level/quota_expire_at/quota_summary/
+/// quota_checked_at 四字段），被删账号不复活（返回 0 即无需写盘）、新入池账号
+/// 不受影响；字段级 insert 不覆盖并发方更新的其他字段。
+fn merge_quota_updates_into_pool(
+    latest: &mut Value,
+    updates: &[(String, Value, Option<String>, String)],
+) -> usize {
+    let mut merged = 0usize;
+    if let Some(arr) = latest.get_mut("accounts").and_then(Value::as_array_mut) {
+        for (uid, parsed, summary, checked_at) in updates {
+            let Some(acc) = arr
+                .iter_mut()
+                .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid.as_str()))
+            else {
+                continue; // 巡检期间被删除的账号不复活
+            };
+            let Some(obj) = acc.as_object_mut() else { continue };
+            obj.insert(
+                "quota_level".into(),
+                parsed.get("level").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "quota_expire_at".into(),
+                parsed.get("expire_at").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "quota_summary".into(),
+                summary.clone().map(Value::String).unwrap_or(Value::Null),
+            );
+            obj.insert("quota_checked_at".into(), Value::String(checked_at.clone()));
+            merged += 1;
+        }
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -757,5 +782,67 @@ mod doubao_quota_tests {
     fn summarize_empty_returns_none() {
         assert_eq!(summarize_parsed(&json!({"items": []})), None);
         assert_eq!(summarize_parsed(&json!({})), None);
+    }
+
+    /// 回归（档 B 两阶段回写）：额度合并只动四个额度字段——巡检窗口内新入池
+    /// 账号保留、被删账号不复活、并发方更新的其他字段不被覆盖。
+    #[test]
+    fn merge_quota_updates_preserves_pool_changes_during_window() {
+        // 模巡检快照之后的最新池：u1 被并发方改了 last_keepalive_at；u2 已被删除；
+        // u3 为窗口内新入池账号
+        let mut latest = json!({"accounts": [
+            {"user_id": "u1", "name": "甲", "session_id": "sid-AAA", "last_keepalive_at": "keep-1"},
+            {"user_id": "u3", "name": "新入池", "session_id": "sid-CCC"},
+        ]});
+        let updates = vec![
+            (
+                "u1".to_string(),
+                json!({"level": 2, "expire_at": "2026-11-01"}),
+                Some("剩余较多".to_string()),
+                "2026-10-09T00:00:00Z".to_string(),
+            ),
+            // u2：巡检期间被删除 → 不得复活
+            (
+                "u2".to_string(),
+                json!({"level": 4, "expire_at": "2026-12-01"}),
+                None,
+                "2026-10-09T00:00:00Z".to_string(),
+            ),
+        ];
+        let merged = merge_quota_updates_into_pool(&mut latest, &updates);
+        assert_eq!(merged, 1, "被删账号不参与合并，merged 只计仍存在账号");
+        let accounts = latest["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 2, "被删账号不复活、无新账号混入");
+        let a1 = accounts.iter().find(|a| a["user_id"] == "u1").unwrap();
+        assert_eq!(a1["quota_level"], 2, "额度字段写入");
+        assert_eq!(a1["quota_expire_at"], "2026-11-01");
+        assert_eq!(a1["quota_summary"], "剩余较多");
+        assert_eq!(a1["quota_checked_at"], "2026-10-09T00:00:00Z");
+        assert_eq!(
+            a1["last_keepalive_at"], "keep-1",
+            "并发方更新的其他字段不被覆盖"
+        );
+        let a3 = accounts.iter().find(|a| a["user_id"] == "u3").unwrap();
+        assert_eq!(a3["name"], "新入池", "窗口内新入池账号保留");
+        assert_eq!(a3["session_id"], "sid-CCC");
+    }
+
+    /// summary 为 None 时落库为 null（parse 出无摘要的形态）。
+    #[test]
+    fn merge_quota_updates_none_summary_becomes_null() {
+        let mut latest = json!({"accounts": [{"user_id": "u1"}]});
+        let updates = vec![(
+            "u1".to_string(),
+            json!({}),
+            None,
+            "2026-10-09T00:00:00Z".to_string(),
+        )];
+        let merged = merge_quota_updates_into_pool(&mut latest, &updates);
+        assert_eq!(merged, 1);
+        let a1 = latest["accounts"].as_array().unwrap().first().unwrap();
+        assert_eq!(a1["quota_level"], Value::Null);
+        assert_eq!(a1["quota_expire_at"], Value::Null);
+        assert_eq!(a1["quota_summary"], Value::Null);
+        assert_eq!(a1["quota_checked_at"], "2026-10-09T00:00:00Z");
     }
 }

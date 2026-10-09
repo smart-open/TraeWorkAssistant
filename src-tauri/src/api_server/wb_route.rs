@@ -35,7 +35,7 @@ use super::wb_sse;
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{self, WbCreds};
 use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
-use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
 fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
@@ -1700,6 +1700,11 @@ fn send_stream_error_wb(
     code: &str,
     msg: &str,
 ) {
+    // 空 message 兜底（issue #71）：与 routes/qoder 的 send_stream_error 同防线；
+    // 本函数 code 为字符串形态（含非数字业务码），解析为 i64 后走统一兜底，
+    // 非数字按 0（缺失语义）处理，不冒充 HTTP 状态码
+    let code_num = code.parse::<i64>().unwrap_or(0);
+    let msg = stream_msg_or_fallback(msg, code_num);
     match proto {
         Protocol::Anthropic => {
             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});

@@ -332,6 +332,8 @@ pub fn doubao_account_save(
     }
     // uid 后续会被拼进快照槽/备份等文件路径，入口统一做字符集白名单校验
     fs_utils::ensure_uid_safe(&user_id)?;
+    // 读-改-写互斥：罩住 load→改→save 段，防命令/巡检/保活线程旧副本整文档覆盖
+    let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     if let Some(acc) = pool.accounts.iter_mut().find(|a| a.user_id == user_id) {
         if let Some(n) = name {
@@ -369,6 +371,8 @@ pub fn doubao_account_save(
 pub fn doubao_account_remove(state: State<AppState>, user_id: String) -> Result<(), String> {
     // uid 是快照槽/备份目录名的唯一键，入口先做防路径注入校验
     fs_utils::ensure_uid_safe(user_id.trim())?;
+    // 读-改-写互斥：罩住 load→retain→save 段，防旧副本整文档覆盖复活已删账号
+    let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     let before = pool.accounts.len();
     pool.accounts.retain(|a| a.user_id != user_id);
@@ -866,9 +870,13 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
         super::switch::finish_action_thread(&app2, "keepalive-done", &data_dir, result, serde_json::Value::Null);
         if ok {
             // 记录池级保活时间戳 + 运维历史（写入失败不影响保活结果；SQLite 化 P3 经 store）
-            let mut pool = load_pool(&st2);
-            pool.last_keepalive_at = Some(fs_utils::now_ts());
-            let _ = save_pool(&st2, &pool);
+            // 读-改-写互斥：后台线程写点持池锁，块作用域缩短临界区
+            {
+                let _guard = st2.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pool = load_pool(&st2);
+                pool.last_keepalive_at = Some(fs_utils::now_ts());
+                let _ = save_pool(&st2, &pool);
+            }
             append_history_event(
                 &data_dir,
                 serde_json::json!({
@@ -933,6 +941,8 @@ pub fn doubao_quota_fetch(state: State<AppState>, user_id: String) -> Result<ser
 /// level 为空 = 免费或未识别，仍记录 checked_at，前端据此显示「免费」标识。
 /// 成功时返回一句话摘要（供运维历史事件复用）。
 fn update_quota_cache(state: &State<AppState>, uid: &str, parsed: &serde_json::Value) -> Result<Option<String>, String> {
+    // 读-改-写互斥：罩住 load→改→save 段，防旧副本整文档覆盖
+    let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(state);
     let Some(acc) = pool.accounts.iter_mut().find(|a| a.user_id == uid) else {
         // 未入池账号（仅快照）不缓存额度；入池后首次查询即可
@@ -1138,6 +1148,8 @@ pub fn doubao_account_set_credential(
     sid_guard: Option<String>,
     ttwid: Option<String>,
 ) -> Result<(), String> {
+    // 读-改-写互斥：罩住 load→apply_credential（内含 save）段，防旧副本整文档覆盖
+    let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     apply_credential(&state, &mut pool, user_id.trim(), session_id, sid_guard, ttwid, "manual", true)
 }
@@ -1200,6 +1212,8 @@ pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<Str
         .unwrap_or_default()
         .to_string();
 
+    // 读-改-写互斥：罩住 load→幂等检查→apply_credential（内含 save）段，防旧副本整文档覆盖
+    let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     // 目标账号 = 抓包文件自带的 uid（代理 MITM 层用该请求 Cookie 里的 multi_sids
     // 按 **同一条 sessionid** 匹配出的主人）——凭证与归属天然自洽，不允许跨来源拼装。

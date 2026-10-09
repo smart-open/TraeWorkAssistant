@@ -86,7 +86,8 @@ pub fn workbuddy_groups_remove(state: State<AppState>, id: String) -> Result<(),
     let mut defs = load_defs(&state);
     defs.retain(|g| g.id != id);
     save_defs(&state, &defs)?;
-    // 组内账号回落「未分组」
+    // 组内账号回落「未分组」（读-改-写互斥：罩住池段防旧副本整文档覆盖）
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     let mut changed = false;
     for a in pool.accounts.iter_mut() {
@@ -108,6 +109,8 @@ pub fn workbuddy_account_move(
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
+    // 读-改-写互斥：罩住 load→改→save 段防旧副本整文档覆盖
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     let acct = pool
         .accounts

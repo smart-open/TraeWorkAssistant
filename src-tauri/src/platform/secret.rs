@@ -160,6 +160,8 @@ mod tests {
             data_dir: dir.clone(),
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         // 首次：无文件 → None
         assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), None);
@@ -191,6 +193,8 @@ mod tests {
             data_dir: dir.clone(),
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         let pwd: Vec<u8> = (0..32u8).collect();
         let hex: String = pwd.iter().map(|b| format!("{b:02x}")).collect();
