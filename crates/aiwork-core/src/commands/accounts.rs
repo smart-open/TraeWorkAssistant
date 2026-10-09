@@ -2168,6 +2168,7 @@ mod tests {
             data_dir: dir,
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             events: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         let now = chrono::Utc::now().timestamp();

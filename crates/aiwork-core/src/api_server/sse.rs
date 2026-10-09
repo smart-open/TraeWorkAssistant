@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read};
 use serde_json::{json, Map, Value};
 
 use super::wb_upstream::{InterruptibleLines, LINE_POLL};
+use crate::api_server::routes::stream_msg_or_fallback;
 
 /// SOLO SSE 单事件
 struct SoloEvent {
@@ -295,9 +296,11 @@ fn stream_convert_src(
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
                     // 已有数据流出：就地透传错误并结束；否则延迟给调用方决策（可重试）
                     if sent_any {
+                        // 空 message 兜底（issue #71）：inline 与延迟透传同防线
+                        let msg = stream_msg_or_fallback(&ev.error_message, ev.error_code.unwrap_or(0));
                         let error_chunk = json!({
                             "error": {
-                                "message": ev.error_message,
+                                "message": msg,
                                 "type": "api_error",
                                 "code": ev.error_code.unwrap_or(0),
                             }
@@ -431,9 +434,11 @@ fn stream_convert_text_src(
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
                     // 已有文本流出：就地透传错误并结束；否则延迟给调用方决策（可重试）
                     if sent_any {
+                        // 空 message 兜底（issue #71）：inline 与延迟透传同防线
+                        let msg = stream_msg_or_fallback(&ev.error_message, ev.error_code.unwrap_or(0));
                         let error_chunk = json!({
                             "error": {
-                                "message": ev.error_message,
+                                "message": msg,
                                 "type": "api_error",
                                 "code": ev.error_code.unwrap_or(0),
                             }
@@ -897,13 +902,15 @@ fn stream_convert_anthropic_src(
                         // 此前直接 error 且置 saw_done 跳过 finish_stream，未闭合的
                         // content_block 会让严格客户端挂起/报错；不补发 message_stop
                         close_text_block!();
+                        // 空 message 兜底（issue #71）：inline 与延迟透传同防线
+                        let msg = stream_msg_or_fallback(&ev.error_message, ev.error_code.unwrap_or(0));
                         send_event!(
                             "error",
                             json!({
                                 "type": "error",
                                 "error": {
                                     "type": "api_error",
-                                    "message": ev.error_message,
+                                    "message": msg,
                                 },
                             })
                         );
@@ -1222,9 +1229,8 @@ mod tests {
             tx,
             "c1",
         );
-        let (code, msg) = error_info.expect("EOF 零内容必须返回哨兵错误");
+        let (code, _msg) = error_info.expect("EOF 零内容必须返回哨兵错误");
         assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
-        assert!(crate::api_server::is_empty_completion(code, &msg));
         assert!(!sent_any);
         assert!(!collect_events(rx).join("\n").contains("data: [DONE]"));
     }

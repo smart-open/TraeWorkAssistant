@@ -579,6 +579,8 @@ pub fn refresh_token_once_ex(agent: &ureq::Agent, creds: &Creds) -> (Option<Cred
 /// （CheckinOpts::daily() 默认不跳过，勿在日志/文案中宣称「调度自动跳过」）。
 pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
     let store = crate::store::db(&state.data_dir);
+    // 读-改-写互斥：罩住 load→改→save 段，防命令/后台/调度线程旧副本整文档覆盖
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = crate::store::docs::wb_pool_load(&store);
     let mut changed = false;
     if let Some(arr) = pool.get_mut("accounts").and_then(Value::as_array_mut) {

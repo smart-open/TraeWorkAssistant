@@ -15,6 +15,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::wb_upstream::{InterruptibleLines, LINE_POLL};
+use crate::api_server::routes::stream_msg_or_fallback;
 
 /// WB 上游单个 SSE 事件（已归一化）
 #[derive(Debug)]
@@ -460,7 +461,9 @@ pub fn stream_forward_ex(
             }
             Some(WbEvent::Error { code, msg }) => {
                 if sent_any {
-                    // 已有数据流出：就地透传错误并收尾（failed_inline 标记给调用方）
+                    // 已有数据流出：就地透传错误并收尾（failed_inline 标记给调用方）；
+                    // 空 message 兜底（issue #71）：inline 与延迟透传同防线
+                    let msg = stream_msg_or_fallback(&msg, code);
                     match proto {
                         crate::api_server::routes::Protocol::Anthropic => {
                             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});

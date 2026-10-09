@@ -507,6 +507,7 @@ pub async fn api_qoder_catalog_sync(state: &AppState) -> Result<usize, String> {
         data_dir: state.data_dir.clone(),
         jwt_refresh_lock: state.jwt_refresh_lock.clone(),
         qoder_pool_lock: state.qoder_pool_lock.clone(),
+        wb_pool_lock: state.wb_pool_lock.clone(),
         events: state.events.clone(),
     };
     // 阻塞网络请求放入阻塞线程池，避免卡住异步运行时

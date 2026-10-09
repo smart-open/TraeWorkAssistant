@@ -45,7 +45,7 @@ use super::wb_sse;
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{lines_with_first_byte_hedged, lines_with_first_byte_timeout, InterruptibleLines};
 use super::{ApiSharedState, ErrKind, InflightGuard};
-use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
 use crate::tasks::qoder_common::QoderCreds;
 use crate::tasks::qoder_upstream::{self, ErrMeta, UpstreamKind};
 
@@ -1344,6 +1344,7 @@ fn send_stream_error(
     code: i64,
     msg: &str,
 ) {
+    let msg = stream_msg_or_fallback(msg, code);
     match proto {
         Protocol::Anthropic => {
             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});

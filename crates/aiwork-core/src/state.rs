@@ -201,6 +201,10 @@ pub struct AppState {
     pub jwt_refresh_lock: Arc<Mutex<()>>,
     /// Qoder 账号池整池读写锁：防并发整池覆盖丢写（直操原始 JSON 路径共用）
     pub qoder_pool_lock: Arc<Mutex<()>>,
+    /// WorkBuddy 账号池读-改-写互斥：全部「load_pool→内存改→save_pool」写点
+    /// （命令线程/后台刷新线程/调度器三方并发）持锁执行，防旧副本整文档覆盖
+    /// 丢账号（lost-update）；长窗口网络调用（回填/续期）在锁外完成后短临界区写回
+    pub wb_pool_lock: Arc<Mutex<()>>,
     /// 事件广播通道（Web 版事件出口）：scheduler 等后台模块 emit 看板刷新等
     /// 软通知，aiwork-server 的 admin events（WS/SSE）订阅转发给前端。
     /// None（启动早期/未注入）时 emit 静默丢弃——事件不参与业务正确性
@@ -243,6 +247,7 @@ impl AppState {
             data_dir,
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
+            wb_pool_lock: Arc::new(Mutex::new(())),
             events: Arc::new(Mutex::new(None)),
         })
     }
@@ -254,6 +259,7 @@ impl AppState {
             data_dir,
             jwt_refresh_lock: Arc::new(Mutex::new(())),
             qoder_pool_lock: Arc::new(Mutex::new(())),
+            wb_pool_lock: Arc::new(Mutex::new(())),
             events: Arc::new(Mutex::new(None)),
         }
     }

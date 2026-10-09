@@ -88,9 +88,12 @@ fn spawn_background_refresh(state: &AppState) {
     guard.0 = false;
 }
 
-/// 将积分查询结果中的余额回写账号池缓存（列表/概述展示；命令与调度器快照任务共用）
+/// 将积分查询结果中的余额回写账号池缓存（列表/概述展示；命令与调度器快照任务共用）。
+/// 持 wb_pool_lock 罩住整段读-改-写：命令线程/后台刷新线程/调度器三方并发时
+/// 不持锁的整文档写回会用旧副本抹掉彼此改动（lost-update）
 fn write_back_pool_balances(state: &AppState, parsed: &Value) {
     if let Some(accounts) = parsed.get("accounts").and_then(|v| v.as_array()) {
+        let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut pool = load_pool(state);
         let now_ts = chrono::Utc::now().timestamp();
         for acc in accounts {
@@ -160,9 +163,15 @@ fn payment_type_to_edition(pt: &str) -> String {
 /// POST /v2/billing/meter/get-payment-type（域随凭证 domain 路由）→ 映射套餐名回写池。
 /// 仅补空，不覆盖 OAuth 已写入的 editionType；单账号失败静默跳过（纯展示增强，fail-open）。
 /// 回填一次后池内不再为空，后续调用零网络开销。
+///
+/// 两阶段防 lost-update（原实现在跨 N×10s 网络调用期间持整个池旧副本，写回会
+/// 整体抹掉窗口内的并发改动——导入的新账号被旧副本覆盖即凭据丢失）：
+///   Phase 1（锁外）：读池收集待回填账号 → 逐账号网络请求，仅收集 (id → edition) 结果；
+///   Phase 2（短临界区）：重读最新池 → 按 id 只更新仍存在且 edition_type 仍为空的账号
+///   （窗口内删除的账号自动跳过、OAuth 已填套餐的账号不被覆盖）。
 fn backfill_edition_from_payment_type(state: &AppState) -> usize {
-    let mut pool = load_pool(state);
-    let need: Vec<String> = pool
+    // Phase 1（锁外）：收集 + 网络
+    let need: Vec<String> = load_pool(state)
         .accounts
         .iter()
         .filter(|a| a.edition_type.is_empty())
@@ -174,7 +183,7 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
     let store: Value = crate::tasks::wb_common::load_token_store(state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
-    let mut filled = 0usize;
+    let mut results: Vec<(String, String)> = Vec::new(); // (id, edition)
     for id in need {
         let Some(rec) = tokens.get(&id) else { continue };
         let Some(token) = as_str(fs_utils::dig(rec, &["access_token"])).filter(|t| !t.is_empty()) else {
@@ -196,9 +205,21 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
         else {
             continue;
         };
-        if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == id) {
-            a.edition_type = payment_type_to_edition(&pt);
-            filled += 1;
+        results.push((id, payment_type_to_edition(&pt)));
+    }
+    if results.is_empty() {
+        return 0;
+    }
+    // Phase 2（短临界区）：重读最新池，按 id 合并（保「仅补空」语义）
+    let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = load_pool(state);
+    let mut filled = 0usize;
+    for (id, edition) in &results {
+        if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == *id) {
+            if a.edition_type.is_empty() {
+                a.edition_type = edition.clone();
+                filled += 1;
+            }
         }
     }
     if filled > 0 {

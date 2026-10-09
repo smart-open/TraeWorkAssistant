@@ -6,6 +6,37 @@
 
 ---
 
+## [1.4.5] · 2026-10-09 · 移植 WB 账号池互斥防丢失 + 上游空 message 兜底
+
+> 合并点自 `main@5d0dd66` 推进至 `main@bc58506`（3 个提交，手工语义移植）。
+
+### 修复加强
+
+- **WB 账号池读-改-写互斥防 lost-update**（`6284ef3`）：`AppState` 新增 `wb_pool_lock`，全部运行期「load_pool→内存改→save_pool」写点（命令 10 处 + 每日签到 `sync_pool_expiry` + `mark_needs_relogin`）持锁执行，防命令/后台/调度线程用旧池副本整文档覆盖丢账号；额度巡检、凭证续期、套餐回填改**两阶段回写**——锁外网络调用，短临界区重读最新池按 id 字段级合并（窗口内删除的账号自动跳过、OAuth 已填套餐不被覆盖）。
+- **空完成取证**（`6284ef3`）：Trae 对冲竞速捕获上游响应头摘要（logid / x-tt-logid 等 7 头，截断 96 字符），接管生效时取对冲侧摘要，空完成日志可溯源上游侧证据。
+- **device_map 缺条目回落**（`6284ef3`）：Trae 调度取设备指纹时缺映射条目改按 uid 确定性派生 device_id，不再发送空 `x-device-id`（影子风控）。
+- **上游错误空 message 统一兜底（issue #71）**（`67f9e5b`）：新增 `msg_or_fallback` / `stream_msg_or_fallback`，空 message 回填含状态码或错误码的诊断文案（网络波动/上游异常/全局代理劫持回环多因并列）；OpenAI/Anthropic inline 错误与 Trae/WB/Qoder 三个流式 `send_stream_error` 全部接入，消除 `{"message":""}` 透传旁路；业务码不冒充 HTTP 状态码、与 `error.code` 字段一致。
+
+### 文档
+
+- user-manual 补「客户端报 502 upstream_error（全局代理劫持回环流量）」FAQ（端口适配 Web 版网关 8080）。
+
+### 发布前全面审查
+
+- 逐文件 diff 与 main 语义比对 + 锁序专项 + 安全/兼容交叉复核。修复 1 项：FAQ 第三条「浏览器直开根路径看到 `api_key_required`」系 main 桌面版语义（网关独占端口），docker 单体根路径落入静态托管（SPA 登录页），已改用 `GET /v1/models`（不带 Key）的网关鉴权层探活口径。
+- 锁序确认单向（`wb_pool_lock` → `WB_TOKEN_STORE_LOCK`）：`mark_needs_relogin` 持池锁调用 `reload_pools_after_change` 全链无重入池锁、无反向获取；`wb_pool_save` 全部调用点核查无锁外写点遗漏（migrate.rs:398 为启动期迁移，与 main 口径一致不加锁）。
+- 验证阶段暴露 aiwork-server 3 处测试直构 `AppState` 缺 `wb_pool_lock`（E0063，admin_tokens/cmd_bridge/ip_allow），已补齐——再次印证 AppState 增字段必须 `cargo test --workspace` 全量编译。
+
+### 跳过（桌面/OS 专属）
+
+- doubao 双池锁全套（`doubao_pool_lock`、commands/doubao、tasks/doubao_quota、tasks/doubao_session、vault doubao 迁移段）、代理日志分片数值排序（misc 抓包 docker 已下线）。
+
+### 验证
+
+- `cargo test --workspace` 597 通过（含新增 3 项兜底单测）· `npx tsc --noEmit` 0 错误 · `npm test` 61 通过。
+
+---
+
 ## [1.4.4] · 2026-10-08 · 移植 Qoder 签到健壮性四连修 + 网关调度五连修 + WB 积分并发/SWR
 
 > 合并点自 `main@813db35` 推进至 `main@5d0dd66`（20 个提交，手工语义移植，4 个 merge / 2 个 docs 不计内容）。⚠️ 行为变更：Qoder 签到连续失败冷却改 30→60→120 分钟指数退避（原固定 30 分钟）；积分耗尽账号由 60s 软冷却改硬冷却至次日 04:00。
