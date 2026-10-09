@@ -48,7 +48,9 @@ export function traeUsageToPoints(usage: UsageHistoryResult | null): BoardPoint[
 
 /** Buddy 官网用量聚合（workbuddy_usage_official_all，日合计，31 天零填充） */
 export function wbOfficialAllToPoints(r: WbUsageOfficialAll | null): BoardPoint[] {
-  if (!r) return [];
+  // 冷启动无账号凭证时后端返回 {status:'empty'} 空态（无 daily 字段；类型别名按 main
+  // 口径未建模联合），判空防 TypeError（issue #72 整页崩溃）
+  if (!r || !r.daily) return [];
   return r.daily.map((d) => ({ date: d.date.slice(0, 10), credits: d.usage, models: {} }));
 }
 
@@ -76,7 +78,8 @@ export function qoderEarnedByDate(snaps: QoderCreditsSnapshot[]): Map<string, nu
 
 /** Buddy 快照差分回退（workbuddy_usage_fallback，日合计，365 天快照史） */
 export function wbFallbackToPoints(fb: WbUsageFallback | null): BoardPoint[] {
-  if (!fb) return [];
+  // 快照不足两天时后端同样返回 {status:'empty'} 空态（无 daily），判空防崩（issue #72）
+  if (!fb || !fb.daily) return [];
   return fb.daily.map((d) => ({ date: d.date.slice(0, 10), credits: d.usage, models: {} }));
 }
 
