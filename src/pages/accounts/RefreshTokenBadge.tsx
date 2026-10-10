@@ -1,22 +1,38 @@
-import { AlertTriangle, Clock, ShieldOff, Save } from 'lucide-react';
+import { AlertTriangle, Clock, ShieldOff, Save, KeyRound } from 'lucide-react';
 import { Badge } from '../../components/ui';
 
 /**
  * F-78 批次 3：refresh_token 生命周期徽标（账号管理 + API 服务账号池两处消费）。
- * 优先级：已判定失效 > 连续刷新失败 > 即将过期；无异常时若有凭证保存时间则渲染灰色时间戳。
+ * 优先级：已判定失效 > 无凭证（历史导入）> 连续刷新失败 > 即将过期；无异常时若有凭证保存时间则渲染灰色时间戳。
+ * missing（issue #76 痛点②）：历史导入账号无 refresh_token，无法自动刷新——
+ * 灰徽标降噪（批量导入时不刷屏），title 给出恢复路径（重新 OAuth 登录按账号 id 自动更新既有账号）。
+ * 失效优先于 missing：invalid 蕴含凭证质量问题，比「无凭证」更需要用户行动。
  */
 export function RefreshTokenBadge({
   invalid,
   fails,
   expiresAt,
   savedAt,
+  missing,
 }: {
   invalid?: boolean;
   fails?: number;
   expiresAt?: number | null;
   /** 凭证最近落盘时间（OAuth 登录/刷新/导入时更新，F-78 批次 3 收尾） */
   savedAt?: string | null;
+  /** 账号无 refresh_token（历史导入/手贴 JWT），无法自动刷新（issue #76 痛点②） */
+  missing?: boolean;
 }) {
+  if (missing && !invalid) {
+    return (
+      <Badge
+        tone="slate"
+        title="该账号无 refresh_token，无法自动刷新/续期，JWT 过期后签到与查询将失败。恢复：走「添加账号」重新 OAuth 登录该账号，登录会按账号 id 自动更新既有账号的凭证"
+      >
+        <KeyRound size={12} /> 无 Refresh
+      </Badge>
+    );
+  }
   if (invalid) {
     return (
       <Badge tone="red" title="refresh_token 已失效，需重新 OAuth 登录后恢复">

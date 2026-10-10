@@ -662,12 +662,14 @@ export default function ApiService() {
                             {(a.general_credits ?? 0).toFixed(0)} 通用积分
                           </span>
                         )}
-                        {/* F-78 批次 3：refresh_token 生命周期徽标（失效账号同时被调度禁用） */}
+                        {/* F-78 批次 3：refresh_token 生命周期徽标（失效账号同时被调度禁用）；
+                            missing=无 refresh_token 的历史导入账号（issue #76 痛点②） */}
                         <RefreshTokenBadge
                           invalid={a.refresh_token_invalid}
                           fails={a.refresh_token_fails}
                           expiresAt={a.refresh_token_expires_at}
                           savedAt={a.auth_saved_at}
+                          missing={!a.has_refresh_token}
                         />
                         {/* 运行时健康徽标：禁用/积分耗尽/冷却原因/零积分/在途·就绪（三池共用） */}
                         <PoolHealthBadges s={poolItem} running tokenInvalid={a.refresh_token_invalid} />

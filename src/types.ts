@@ -604,6 +604,10 @@ export interface OAuthLoginResult {
   jwt: string;
   refresh_token: string;
   has_refresh_token: boolean;
+  /** 本次登录是否与已有账号同 uid（合并更新而非新增） */
+  merged: boolean;
+  /** 合并时被更新的已有账号名（merged=false 时为 null） */
+  existing_name: string | null;
 }
 
 // API Key 数据文件视图（api_keys_list 返回：列表 + 鉴权开关）

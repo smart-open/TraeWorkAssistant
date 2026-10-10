@@ -146,6 +146,11 @@ fn vendor_of(canonical: &str) -> &'static str {
         ("gpt", "OpenAI"),
         ("o1", "OpenAI"),
         ("o3", "OpenAI"),
+        // 2026-10-10 产品确认（main 10627d0 移植）：Space-Bunny（太空兔）为
+        // MiniMax 模型、MiMo 为小米自研大模型系列
+        ("space-bunny", "MiniMax"),
+        ("spacebunny", "MiniMax"),
+        ("mimo", "小米"),
     ] {
         if canonical.starts_with(prefix) {
             return vendor;

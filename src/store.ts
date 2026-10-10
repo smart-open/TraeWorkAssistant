@@ -646,7 +646,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const result = await api.oauth.login(callbackUrl, accountName, groupId);
       await get().refreshAccounts();
-      get().pushToast('success', `OAuth 登录成功：账号「${result.name}」已添加`);
+      // 同 uid 合并场景如实提示「更新已有账号」而非「已添加」（issue #80）
+      if (result.merged) {
+        const actual = result.existing_name || result.name;
+        get().pushToast(
+          'success',
+          `OAuth 登录成功：与已有账号「${actual}」同 uid，已更新其凭证（未新增账号）`,
+        );
+      } else {
+        get().pushToast('success', `OAuth 登录成功：账号「${result.name}」已添加`);
+      }
     } catch (err) {
       get().pushToast('error', `OAuth 登录失败：${String(err)}`);
       throw err;

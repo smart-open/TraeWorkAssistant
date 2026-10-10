@@ -481,6 +481,8 @@ mod tests {
         let mut f = RemainingCreditsFile::default();
         f.credits.insert("u1".into(), 123.45);
         f.expire_times.insert("u1".into(), 1790000000);
+        f.general_expire_times.insert("u1".into(), 1791000000);
+        f.general_expire_times.insert("u2".into(), 1792000000);
         f.work.insert("u1".into(), 50.0);
         f.total_limit.insert("u2".into(), 2000.0);
         f.updated_at = Some("2026-09-15T10:00:00".into());
@@ -488,6 +490,12 @@ mod tests {
         let got = remaining_credits_load(&s);
         assert_eq!(got.credits.get("u1"), Some(&123.45));
         assert_eq!(got.expire_times.get("u1"), Some(&1790000000));
+        // 调度口径通用到期（issue #75）：混合口径与调度口径分离持久化
+        assert_eq!(got.general_expire_times.get("u1"), Some(&1791000000));
+        // u2 仅靠 general_expire_time 入并集，行不丢
+        assert_eq!(got.general_expire_times.get("u2"), Some(&1792000000));
+        // 缺键账号不误报（None 语义 = 无到期约束）
+        assert!(got.general_expire_times.get("u3").is_none());
         assert_eq!(got.work.get("u1"), Some(&50.0));
         assert_eq!(got.total_limit.get("u2"), Some(&2000.0));
         assert!(got.general.is_empty());
@@ -824,7 +832,7 @@ pub fn groups_save(s: &Store, f: &GroupsFile) -> Result<(), String> {
     })
 }
 
-// ── 剩余积分缓存（remaining_credits.json → remaining_credits 表，7 平行 map 合并行）──
+// ── 剩余积分缓存（remaining_credits.json → remaining_credits 表，8 平行 map 合并行）──
 
 pub fn remaining_credits_load(s: &Store) -> RemainingCreditsFile {
     let mut f = RemainingCreditsFile::default();
@@ -836,6 +844,10 @@ pub fn remaining_credits_load(s: &Store) -> RemainingCreditsFile {
         }
         if let Some(v) = get_i("expire_time") {
             f.expire_times.insert(uid.clone(), v);
+        }
+        // 通用积分到期（API 网关调度口径，issue #28）；缺键 = 无到期约束/未刷新
+        if let Some(v) = get_i("general_expire_time") {
+            f.general_expire_times.insert(uid.clone(), v);
         }
         if let Some(v) = get_f("general") {
             f.general.insert(uid.clone(), v);
@@ -858,11 +870,15 @@ pub fn remaining_credits_load(s: &Store) -> RemainingCreditsFile {
 }
 
 pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(), String> {
-    // 并集 of 7 map 的键；每账号一行，仅写入存在的字段（缺省语义由 load 侧空值兜底）
+    // 并集 of 8 map 的键；每账号一行，仅写入存在的字段（缺省语义由 load 侧空值兜底）
     let maps_f: [&std::collections::HashMap<String, f64>; 4] =
         [&f.credits, &f.general, &f.work, &f.total_limit];
-    let maps_i: [&std::collections::HashMap<String, i64>; 3] =
-        [&f.expire_times, &f.membership_expire, &f.membership_next_billing];
+    let maps_i: [&std::collections::HashMap<String, i64>; 4] = [
+        &f.expire_times,
+        &f.general_expire_times,
+        &f.membership_expire,
+        &f.membership_next_billing,
+    ];
     let mut uids: Vec<String> = Vec::new();
     for m in maps_f.iter() {
         for k in m.keys() {
@@ -894,6 +910,7 @@ pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(),
             };
             ins_f(&mut obj, "credits", &f.credits);
             ins_i(&mut obj, "expire_time", &f.expire_times);
+            ins_i(&mut obj, "general_expire_time", &f.general_expire_times);
             ins_f(&mut obj, "general", &f.general);
             ins_f(&mut obj, "work", &f.work);
             ins_f(&mut obj, "total_limit", &f.total_limit);
