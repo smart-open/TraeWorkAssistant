@@ -144,8 +144,11 @@ fn get_device_for(state: &AppState, uid: &str) -> DeviceEntry {
 /// 否则原样透传。未识别（上游改文案）时不影响原始错误可见性。
 pub fn humanize_device_limit(message: &str) -> String {
     let lower = message.to_lowercase();
-    let hit = message.contains("已达上限")
-        || message.contains("账户数量")
+    // 审查修复：特征词收窄为设备绑定上限的完整短语「绑定的账户数量已达上限」。
+    // 此前「已达上限」过宽——「使用额度已达上限」等非设备绑定类错误也会被误追加
+    // 引导（对账提示用户重新 OAuth 登录，实则无用）；英文形态由
+    // device limit / bound to this device 兜底
+    let hit = message.contains("绑定的账户数量已达上限")
         || lower.contains("device limit")
         || lower.contains("bound to this device");
     if !hit {
@@ -804,6 +807,16 @@ mod tests {
         // 未命中 → 原样透传（不影响常规错误可见性）
         assert_eq!(humanize_device_limit("HTTP 502"), "HTTP 502");
         assert_eq!(humanize_device_limit(""), "");
+        // 审查修复：含「账户数量」但与设备绑定无关的错误不再被误追加引导
+        assert_eq!(
+            humanize_device_limit("该账户数量超出套餐范围"),
+            "该账户数量超出套餐范围"
+        );
+        // 审查修复：含「已达上限」但与设备绑定无关的错误同样不误追加
+        assert_eq!(
+            humanize_device_limit("当前套餐使用额度已达上限"),
+            "当前套餐使用额度已达上限"
+        );
     }
 
     #[test]

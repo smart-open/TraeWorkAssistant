@@ -130,9 +130,14 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
     {
         let cer = certs_dir.join("ca.cer");
         let cer_arg = cer.to_string_lossy().replace('\\', "/").to_string();
+        // 审查修复：-ArgumentList 以 PS 单引号字面量传参，路径含撇号（用户名如
+        // O'Brien，Windows 目录名合法 → USERPROFILE 含撇号）时未转义会致整条
+        // 命令语法错误，提权安装恒败并白耗一次 UAC。PS 单引号转义规则：' → ''
+        // 仅用于 ps 字符串；下方 certutil 直调必须保留原始未转义 cer_arg
+        let cer_arg_ps = cer_arg.replace('\'', "''");
         let ps = format!(
             "try {{ $p = Start-Process certutil -ArgumentList '-addstore','-f','Root','\"{}\"' -Verb RunAs -Wait -PassThru -ErrorAction Stop; exit $p.ExitCode }} catch {{ exit 1223 }}",
-            cer_arg
+            cer_arg_ps
         );
         let run_elevated = || -> Result<std::process::ExitStatus, std::io::Error> {
             powershell_command()
@@ -210,6 +215,14 @@ pub fn cert_install(app: AppHandle, state: State<AppState>) -> Result<CertStatus
         }
         Ok(result)
     }
+
+    // 审查修复：其余平台（Linux 等）兜底——项目仅声明 Windows/macOS 构建目标，
+    // 此分支保证非目标平台也能编译（否则 cfg 块全部剥离后函数尾退化为 ()，
+    // 与返回类型不符），运行期如实报平台不支持
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err("当前平台不支持自动安装证书（仅支持 Windows/macOS），请手动导入 ca.cer 到受信任的根证书颁发机构".into())
+    }
 }
 
 /// 打开证书目录：安装失败时引导用户手动导入 ca.cer（issue #12/#79，
@@ -229,12 +242,19 @@ pub fn cert_open_folder(state: State<AppState>) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("打开目录失败: {e}"))?;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
         crate::platform::cmd::sys_command("explorer")
             .arg(&certs_dir)
             .spawn()
             .map_err(|e| format!("打开目录失败: {e}"))?;
+    }
+    // 审查修复：其余平台（Linux 等）不再误走 explorer（spawn 必 NotFound），
+    // 如实报平台不支持
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = &certs_dir;
+        return Err("当前平台不支持打开证书目录（仅支持 Windows/macOS）".into());
     }
     Ok(())
 }

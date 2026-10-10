@@ -455,7 +455,9 @@ fn replace_identity_key(
     }
     if scalar
         && !creds.access_token.is_empty()
-        && matches!(lk.as_str(), "accesstoken" | "access_token" | "token")
+        // 审查修复：不再匹配裸键 "token"——壳模板内语义无关的私有 token 字段
+        // 会被误改写为新 access_token，违反「客户端私有字段不碰」原则
+        && matches!(lk.as_str(), "accesstoken" | "access_token")
     {
         set_str(v, &creds.access_token);
         hits.access = true;
@@ -534,6 +536,35 @@ fn rewrite_identity_keys(j: &mut serde_json::Value, creds: &Creds) -> RewriteHit
         }
     }
     walk(j, creds, &mut hits);
+    // 审查修复：裸键 "token" fallback——live auth 文件实测存在裸键 token 形态的
+    // access token（issue #58 诊断，extract_access_token 候选键含 "token"）。主
+    // walk 不匹配裸键（防壳内语义无关的私有 token 字段被误改写），但整树未命中
+    // 任何 access 键时，标量 "token" 键即身份位：不二次改写会让旧 token 残留与
+    // 补写 accessToken 共存，最坏导致切换无效。命中后置 hits.access 阻止补写块
+    // 再插 accessToken，保持壳原有键形态稳定
+    if !hits.access && !creds.access_token.is_empty() {
+        fn walk_bare_token(j: &mut serde_json::Value, creds: &Creds) -> bool {
+            match j {
+                serde_json::Value::Object(map) => {
+                    for (k, v) in map.iter_mut() {
+                        if k.eq_ignore_ascii_case("token") && v.is_string() {
+                            *v = json!(creds.access_token);
+                            return true;
+                        }
+                        if walk_bare_token(v, creds) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                serde_json::Value::Array(items) => items.iter_mut().any(|v| walk_bare_token(v, creds)),
+                _ => false,
+            }
+        }
+        if walk_bare_token(j, creds) {
+            hits.access = true;
+        }
+    }
     hits
 }
 
@@ -650,7 +681,8 @@ pub fn synthesize_auth_snapshot(
     if let Err(e) =
         std::fs::write(dest.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default())
     {
-        // meta 缺失不阻塞合成结果：confirm 期望 uid 回退 slot 名，后续完整备份会重写
+        // meta 缺失不阻塞合成结果：confirm 期望 uid 回退会话暂存的合成真实 uid
+        //（bootstrap_uid），后续完整备份会重写 meta
         sink.step("bootstrap", StepStatus::Warn, &format!("meta.json 写入失败: {e}"));
     }
     sink.step(
@@ -659,6 +691,21 @@ pub fn synthesize_auth_snapshot(
         &format!("已用凭证副本合成账号 {slot} 的最小登录态快照（仅 auth 文件）"),
     );
     Some(creds.uid.clone())
+}
+
+/// 槽位 meta.json 是否标记为合成最小快照（synthesize_auth_snapshot 落槽时写入
+/// "bootstrap": true）。backup_authfile 重写 meta 时不带该键，升级后标记自然清除。
+/// 审查修复：bootstrap_done 仅存在于当次会话——若合成后切换未走完（进程退出/重试），
+/// 下次会话切到同槽成功确认时据此仍能触发完整快照升级（issue #78 方案 A 补强）
+pub fn slot_marked_bootstrap(sess: &Session, slot: &str) -> bool {
+    let meta_file = sess.prof.profiles_dir.join(slot).join("meta.json");
+    std::fs::read_to_string(&meta_file)
+        .ok()
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')).ok()
+        })
+        .and_then(|m| m.get("bootstrap").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
 }
 
 /// 切换确认结果（PS 返回 'ok'/'timeout'）
@@ -690,13 +737,17 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
     let auth_file = &sess.auth_file;
     let snap_file = sess.prof.data_dir.join("storage").join("skeleton").join("account-snapshot.json");
     let meta_file = sess.prof.profiles_dir.join(slot).join("meta.json");
-    // 期望 uid：meta.json 优先，缺失回退 slot 名
+    // 期望 uid：meta.json 优先；缺失时回退链 = 会话暂存的合成真实 uid（合成路径
+    // meta.json 写入失败仍可正确确认，审查修复）→ 槽名（wb-<hash>，仅作最后兜底）
     let mut expect_uid: Option<String> = std::fs::read_to_string(&meta_file)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')).ok())
         .and_then(|m| m.get("uid").and_then(|v| v.as_str()).map(|s| s.to_string()));
     if expect_uid.is_none() {
-        expect_uid = Some(slot.to_string());
+        expect_uid = sess
+            .bootstrap_uid
+            .clone()
+            .or_else(|| Some(slot.to_string()));
     }
     let expect_uid = expect_uid.unwrap_or_default();
     let has_snap_dir = snap_file.parent().map(|p| p.exists()).unwrap_or(false);

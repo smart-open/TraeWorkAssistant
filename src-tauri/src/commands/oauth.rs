@@ -12,6 +12,7 @@ use crate::state::AppState;
 /// 会被授权页原样回传为回调的 loginTraceID），PKCE verifier 供 AuthCode 交换。
 /// device_id：本会话选定的凭证设备（issue #76 轮转）——登录 URL 参数、
 /// ExchangeToken DeviceInfo、device_map 回写三者共用同一台，保证同源。
+#[derive(Clone)]
 struct PendingLogin {
     state: String,
     pkce_verifier: String,
@@ -642,29 +643,40 @@ pub fn oauth_parse_callback(
     let user_name = params.get("userName").cloned().or(user_name);
     let avatar = params.get("avatar").cloned().or(avatar);
 
+    // 审查修复：入口一次性快照整份会话。此前 state/verifier/device_id 分 5 处独立
+    // lock 读取，exchange_code（分钟级网络调用）横跨两个 lock 窗口，重叠登录会话
+    // （oauth_get_login_url 会整体覆盖写入）会让回调透传的 device_id 与实际交换
+    // 设备错配 → device_map 静默污染。快照后本次回调全部读值同源，竞态消除。
+    let session = LAST_OAUTH_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let issued_state = session.as_ref().map(|p| p.state.clone());
+    let issued_verifier = session.as_ref().map(|p| p.pkce_verifier.clone());
+    let issued_device_id = session.as_ref().map(|p| p.device_id.clone());
+    // 审查修复：无在途会话（重启后粘贴回调）的回退设备入口选定一次，供下方
+    // AuthCode 交换与尾部透传共用——此前两处独立 select_login_device 横跨
+    // exchange_code（分钟级网络调用）窗口，重叠登录会话（oauth_get_login_url
+    // 整体覆盖写入 LAST_OAUTH_STATE）会让两处选中不同设备 → 交换设备与
+    // device_map 回写/刷新交换设备错配。选择是确定性的，同状态下两次调用
+    // 结果一致，去重后仅消除窗口期漂移，行为不变
+    let fallback_device = issued_device_id
+        .clone()
+        .unwrap_or_else(|| select_login_device(&state).0);
+
     // CSRF 校验（抓包固化：state 已不适用，native_ide 流程回调不回传 state，改用
     // loginTraceID 双向绑定——授权页把 login_trace_id 原样回传为 loginTraceID）。
     // 本进程签发过登录会话且回调携带 loginTraceID 时两者必须一致；回调不带
     // loginTraceID 或本进程未签发过（重启后粘贴回调）时保持宽容，不阻断正常登录。
     if let Some(cb_trace) = params.get("loginTraceID").or_else(|| params.get("login_trace_id")) {
-        let issued = LAST_OAUTH_STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|p| p.state.clone());
-        if let Some(expected) = issued {
-            if !expected.is_empty() && cb_trace != &expected {
+        if let Some(expected) = &issued_state {
+            if !expected.is_empty() && cb_trace != expected {
                 return Err("OAuth loginTraceID 校验失败：回调 URL 与本机发起的登录请求不匹配（可能为伪造或重放），已拒绝".into());
             }
         }
     } else if auth_code.is_some() {
         // 新流程回调必带 loginTraceID：缺失且本机有在途会话时视为不匹配
-        let issued = LAST_OAUTH_STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|p| p.state.clone());
-        if issued.is_some() {
+        if issued_state.is_some() {
             return Err("OAuth 回调缺少 loginTraceID，无法确认与本机登录请求的对应关系，已拒绝".into());
         }
     }
@@ -686,25 +698,16 @@ pub fn oauth_parse_callback(
             let code = auth_code
                 .or_else(|| params.get("code").cloned())
                 .ok_or_else(|| "回调 URL 中缺少 authCodeInfo/refreshToken 参数".to_string())?;
-            let verifier = LAST_OAUTH_STATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .map(|p| p.pkce_verifier.clone());
+            let verifier = issued_verifier.as_deref();
             // 会话设备优先（登录 URL 签发时轮转选定）；无在途会话（重启后粘贴回调）
-            // 重新按轮转规则选定——选择是确定性的，同状态下两次调用结果一致
-            let device_id = LAST_OAUTH_STATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .map(|p| p.device_id.clone())
-                .unwrap_or_else(|| select_login_device(&state).0);
+            // 用入口选定的 fallback_device（与回调尾部透传同一台，见上方审查修复注释）
+            let device_id = fallback_device.clone();
             // host：授权页回传的 API 域（main.js 逆向：交换 URL = ${host}/trae/api/v3/oauth/ExchangeToken）
             let host = params
                 .get("host")
                 .cloned()
                 .unwrap_or_else(|| "https://api.trae.com.cn".into());
-            match exchange_code(&code, verifier.as_deref(), &device_id, &host, &state.data_dir) {
+            match exchange_code(&code, verifier, &device_id, &host, &state.data_dir) {
                 Ok((at, rt)) => {
                     access_token = Some(at);
                     rt
@@ -725,14 +728,7 @@ pub fn oauth_parse_callback(
         user_name,
         avatar,
         // 会话设备透传给 oauth_login：刷新交换与 device_map 回写共用同一台
-        device_id: Some(
-            LAST_OAUTH_STATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .map(|p| p.device_id.clone())
-                .unwrap_or_else(|| select_login_device(&state).0),
-        ),
+        device_id: Some(fallback_device),
     })
 }
 

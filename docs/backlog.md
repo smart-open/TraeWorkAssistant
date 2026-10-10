@@ -1,7 +1,8 @@
 # 产品优化需求清单（全应用统一待办）
 
-> **文档版本**: v3.0.1 · 2026-10-06
+> **文档版本**: v3.0.2 · 2026-10-10
 > **定位**: 全项目**唯一待办依据**——所有未实施的优化与需求项均在此登记，每条含需求概述 / 实现路径 / 参考开源项目。
+> **v3.0.2 变更**（2026-10-10，合并代码审查补记）：新增 **F-81 macOS OAuth 登录 URL 设备指纹硬编码 Windows**（Info 级存量，git 证实 9a7ca17 引入，与 Windows 抓包凭证模拟链自洽）——v3.7.5 合并审查（merge aec8509）中裁定不属本次引入、不构成功能缺陷，登记待评估。
 > **v3.0.1 变更**（2026-10-06，补记）：**F-80 Qoder 平台全面支持 ✅ 已完成**——v3.7.0（2026-10-04）交付（详见 CHANGELOG 3.7.0 与本文 F-80 条目）：COSY 签名上游网关 + 积分看板三平台化（Trae/Buddy/Qoder）+ 账号三通道入池（PAT / OAuth 设备流 / IDE 扫描）+ 每日双活动签到 + qoder 四表；API 网关由三池升级为 **trae / buddy / qoder / custom 四池调度**。F-80-余 后续优化项状态见总览。
 > **v3.0 变更**（2026-09-26，待办全量复核 + F-75 收官）：① **F-75 macOS 平台支持标记 ✅ 已完成**——macos_main 分支产品化（2026-09-17~26，22 提交）：platform 服务层 + 平台门控 + dmg 构建流水线（db4efd4）、app_locate mac bundle 分派 + LaunchServices 启动（5c1f79a）、平台抽象层收敛（113350a）、R1-R3 真机收口 + 双平台二轮审查修复（4adf498）、三/四轮真机修复——vault 双源密钥 + mac JWT 本地捕获 + 切换链收口（97e4dd5）、CI 三产物矩阵 aarch64/x64/universal + 可选自签（3c89310）、package_macos.mjs dmg + 便携 zip（81a9870）、dmg 打包重试（16a9b3d）、局域网网卡黑名单补 mac 虚拟接口（3a31d17）、内置更新竞态修复（#37）+ macOS 手动安装引导（e96a218）；随 3.6.1/3.6.2 发 mac dmg，AGENT.md §11.1 双平台发版红线在案；② 其余待办经代码检索复核状态无变化（F-70 余项 tc 直读仍未接入 `apps_accounts_discover`；F-38/E-01/E-02/F-69/F-79 等确认未实施，状态属实）。
 > **v2.9 变更**（2026-09-16，网关请求链路堵塞分析批次落地）：① 新增 **F-79 网关流式上游异步化**（reqwest + async SSE，原「D-2 二期」）——同批已落地的过渡方案：调度配置内存缓存（A）+ API 日志异步写入（B）+ 用量/Key 记账削峰落盘（C/E）+ 流式专用阻塞池线程隔离（D-1），P0 级堵塞（spawn_blocking 池耗尽、async worker 同步 SQLite）已消除，F-79 为彻底形态；② 其余待办项状态复核无变化。
@@ -47,6 +48,7 @@
 | F-72 | 网关上游多级回退 + 分档竞速调度 | 网关 | P3 | — | 远期（调度增强方向） |
 | F-73 | 网关反哺 IDE（第三方模型进 Trae） | Trae/网关 | P3 | — | 远期留档（方向验证） |
 | F-80-余 ✅ | Qoder 域后续优化（网关 v2 对冲/粘性 / Global 区 CN-only 标注 / 导出加密迁移提示 / 活动档期日历 / 帮助双语化不做） | Qoder/网关 | P3 | 1~2 天（实际 1 天） | 已完成（2026-10-02，双语化明确不做、Global 区降级为 CN-only 标注说明，详见条目） |
+| F-81 | macOS OAuth 登录 URL 设备指纹硬编码 Windows（x_device_type=windows） | Trae 生态 | P3 | 0.5~1 天（含真机验证） | 待评估（存量，Info 级，详见条目） |
 
 > 已完成项不再列于此（F-13 到期日历 / F-43 CC Switch 协同等已在版本中落地，详见 CHANGELOG.md）。
 
@@ -351,6 +353,13 @@
 - **对齐方案交付归档（2026-10-02）**：qoder-dispatch-alignment-plan.md 的 P1（资源调度菜单）/ P2（API 管理对接 G3-G8）/ P3（模型清单治理）与 §7 验收清单经逐项核对**全部交付**（QoderApiService 页 + 调度策略中心/预设/API Key/用量统计/池指标/模型目录补 Qoder + 6 模型下线 + Step 5 Preview 厂商标注），无未完成项；文档已完成使命并删除，历史引用改指本条目。
 - **实现路径**：均已落地；网关通路 v2 以 F-76/F-77 既有网关基建为底座按 WB 池同构扩展。
 - **参考开源项目**：无直接同类（同构扩展参照本项目 WB 池实现与 user-manual.md「Qoder 应用」章节）。
+
+### F-81 macOS OAuth 登录 URL 设备指纹硬编码 Windows（P3 → 待评估·存量）
+
+- **需求概述**：`oauth_get_login_url`（src-tauri/src/commands/oauth.rs）构造授权页 URL 时硬编码 `x_device_type=windows` / `x_os_version=Windows` 等设备指纹字段，未随目标平台（macOS 构建）切换。来源核实：git 证实为合并前存量（9a7ca17 引入），**非 2026-10-10 合并（aec8509）引入**；与「Windows 抓包凭证 + 模拟链」的既有 OAuth 登录链路自洽，当前不构成功能缺陷。
+- **风险/影响**：Info 级——授权服务端可能按设备指纹下发风控策略（限流/验证码/审计），macOS 端伪装 Windows 客户端指纹的可持续性依赖上游行为不变；若未来服务端加强设备指纹校验，需同步改造。
+- **实现路径**：① 将设备指纹构造收敛为 platform 门控参数（`#[cfg(target_os="macos")]` 下切换 `x_device_type`/`x_os_version` 为 mac 值），与 issue #76 设备轮转（`select_login_device`/`writeback_oauth_device`）链路对齐；② 真机验证授权页 + code 交换在 mac 指纹下的兼容性；③ 若上游风控对指纹突变敏感，保留 Windows 模拟作为可配置回退。
+- **参考开源项目**：无直接同类（设备指纹构造参照本项目 oauth.rs 既有 Windows 抓包凭证链与 issue #76 设备绑定改造）。
 
 ---
 
