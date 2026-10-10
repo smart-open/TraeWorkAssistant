@@ -147,8 +147,11 @@ fn get_device_for(state: &AppState, uid: &str) -> DeviceEntry {
 /// 否则原样透传。未识别（上游改文案）时不影响原始错误可见性。
 pub fn humanize_device_limit(message: &str) -> String {
     let lower = message.to_lowercase();
-    let hit = message.contains("已达上限")
-        || message.contains("账户数量")
+    // 特征词 =「账户数量已达上限」且同现「绑定」（移植 main 8628629 收窄 + 兼容变体）：
+    // 「已达上限」「账户数量」单独出现是「使用额度已达上限」等非设备绑定类错误的
+    // 子串，过宽会误追加重新 OAuth 登录引导；完整短语硬编码「的」会漏判上游
+    // 「绑定账户数量已达上限」等无「的」变体，故拆为两词同现判断
+    let hit = (message.contains("账户数量已达上限") && message.contains("绑定"))
         || lower.contains("device limit")
         || lower.contains("bound to this device");
     if !hit {
@@ -809,6 +812,24 @@ mod tests {
         // 英文形态（上游改版兜底）
         let out2 = humanize_device_limit("Account limit reached for this device (device limit)");
         assert!(out2.contains("设备绑定数已达服务端上限"));
+        // 无「的」变体（上游文案差异）同样命中
+        let out3 = humanize_device_limit("该设备绑定账户数量已达上限");
+        assert!(out3.starts_with("该设备绑定账户数量已达上限"));
+        assert!(out3.contains("重新执行一次 OAuth 登录"));
+        // 「账户数量已达上限」但无「绑定」前置词 → 不命中
+        assert_eq!(
+            humanize_device_limit("可添加的账户数量已达上限"),
+            "可添加的账户数量已达上限"
+        );
+        // 反例（移植 main 8628629）：非设备绑定类「已达上限」不命中——特征词过宽会误引导重新 OAuth 登录
+        assert_eq!(
+            humanize_device_limit("当前套餐使用额度已达上限"),
+            "当前套餐使用额度已达上限"
+        );
+        assert_eq!(
+            humanize_device_limit("该账户数量超出套餐范围"),
+            "该账户数量超出套餐范围"
+        );
         // 未命中 → 原样透传（不影响常规错误可见性）
         assert_eq!(humanize_device_limit("HTTP 502"), "HTTP 502");
         assert_eq!(humanize_device_limit(""), "");

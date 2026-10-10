@@ -836,6 +836,12 @@ fn run_wb_stream(
                                     Err(e) => {
                                         *safe_lock(&state.last_error) =
                                             Some(format!("wb refresh uid={} err={}", picked.uid, e));
+                                        // 他方进程刷新中（≠真实刷新失败，移植 main 8628629）：本轮直接
+                                        // 换号，不走 classify_error→note_error，防瞬时忙态误置 disabled；
+                                        // 对方刷新结果由下轮请求持锁二次检查/stale 对比复用
+                                        if e == wb_upstream::ERR_PEER_REFRESHING {
+                                            break; // 换号
+                                        }
                                     }
                                 }
                             }
@@ -1147,6 +1153,12 @@ pub async fn wb_aggregate_chat(
                                         Err(e) => {
                                             *safe_lock(&state.last_error) =
                                                 Some(format!("wb refresh uid={} err={}", picked.uid, e));
+                                            // 他方进程刷新中（移植 main 8628629）：本轮换号且不走
+                                            // note_error（防瞬时忙态误置 disabled），对方刷新结果由
+                                            // 下轮请求持锁二次检查复用
+                                            if e == wb_upstream::ERR_PEER_REFRESHING {
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -1516,6 +1528,15 @@ pub async fn wb_tool_exec_chat(
                                                 "wb-toolexec refresh uid={} err={}",
                                                 picked.uid, e
                                             ));
+                                            // 他方进程刷新中（移植 main 8628629）：以 Err 收束本轮 outcome
+                                            //（跳过 classify_error→note_error 防误置 disabled），外层换号
+                                            // 重试；对方刷新结果由下轮请求持锁二次检查复用
+                                            if e == wb_upstream::ERR_PEER_REFRESHING {
+                                                break Err(format!(
+                                                    "wb-toolexec refresh uid={} 他方进程正在刷新，本轮换号",
+                                                    picked.uid
+                                                ));
+                                            }
                                         }
                                     }
                                 }

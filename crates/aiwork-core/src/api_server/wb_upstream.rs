@@ -428,6 +428,12 @@ pub fn lines_with_first_byte_hedged<T>(
 
 // ==================== T2.6 双源 token 保活（网关 401 路径） ====================
 
+/// 忙态哨兵错误（移植 main 8628629）：他方进程（GUI/CLI）正在刷新同一账号——
+/// 区别于真实刷新失败。调用方（wb_route 401 自愈）应据此本轮换号且不记 401
+/// 致命错误（防瞬时忙态被 classify_error 误判 SessionDead → disabled 踢出轮转）；
+/// 对方刷新落库后，下轮请求经持锁二次检查/stale 对比直接复用新凭证。
+pub const ERR_PEER_REFRESHING: &str = "他方进程正在刷新该账号凭证，本次跳过";
+
 /// 网关侧刷新（T2.6）：读 token store → POST refresh → 原子回写工具侧副本。
 /// 与 commands::workbuddy::workbuddy_refresh_token 同一端点/红线；此处面向
 /// API 网关 401 自动续期（无 Tauri State 依赖，仅 data_dir）。
@@ -450,8 +456,9 @@ pub fn refresh_access_token(
     let lock = crate::tasks::wb_common::refresh_lock_for(account_id);
     let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let Some(_cross) = crate::tasks::wb_common::cross_refresh_lock(data_dir, account_id) else {
-        // 他方进程刷新中：本侧放弃自愈（调用方换号，下次 401 再试），不与之一同竞写
-        return Err("他方进程正在刷新该账号凭证，本次跳过".into());
+        // 他方进程刷新中：返回忙态哨兵（调用方换号不禁用，下次 401 经二次检查复用），
+        // 不与真实刷新失败混同
+        return Err(ERR_PEER_REFRESHING.to_string());
     };
 
     // 持锁二次检查 + 凭证收敛读取（secure 回填：DB 占位 + vault 明文内存态）

@@ -501,6 +501,7 @@ export default function Accounts() {
       />
       <DeleteAccountConfirmModal
         target={deleteTarget}
+        busy={deleteBusy}
         onClose={() => setDeleteTarget(null)}
         onConfirm={() => void confirmDelete()}
       />

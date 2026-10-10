@@ -1,25 +1,33 @@
 import { Modal } from '../../components/ui';
 import type { AccountView } from '../../types';
 
-/** 删除账号确认弹框（禁 window.confirm，红线） */
+/** 删除账号确认弹框（禁 window.confirm，红线）。
+ *  busy（移植 main 8628629 F9）：确认请求 pending 期间禁用按钮并阻止关闭，
+ *  防 1s withMinDelay 最小展示窗口内连点二次触发 */
 export function DeleteAccountConfirmModal({
   target,
+  busy = false,
   onClose,
   onConfirm,
 }: {
   target: AccountView | null;
+  busy?: boolean;
   onClose: () => void;
   onConfirm: () => void;
 }) {
   return (
     <Modal
       open={target != null}
-      onClose={onClose}
+      onClose={() => {
+        if (!busy) onClose();
+      }}
       title="删除账号"
       footer={
         <>
-          <button className="btn-outline" onClick={onClose}>取消</button>
-          <button className="btn-primary !bg-rose-600 hover:!bg-rose-500" onClick={onConfirm}>确认删除</button>
+          <button className="btn-outline" onClick={onClose} disabled={busy}>取消</button>
+          <button className="btn-primary !bg-rose-600 hover:!bg-rose-500" onClick={onConfirm} disabled={busy}>
+            {busy ? '删除中…' : '确认删除'}
+          </button>
         </>
       }
     >

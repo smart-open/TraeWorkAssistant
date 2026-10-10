@@ -582,6 +582,19 @@ pub fn oauth_parse_callback(
         }
     }
 
+    // 无在途会话 fallback 设备入口一次性选定（移植 main 8628629 去漂移）：会话快照的
+    // device_id 优先，缺失时按轮转规则 select_login_device。AuthCode 交换与尾部
+    // device_id 透传必须共用同一选择——两处若横跨 exchange_code（分钟级网络调用）
+    // 独立选定，期间重叠登录会话整体覆盖写入 LAST_OAUTH_STATE，绑定数分布变化会让
+    // 两处选中不同设备 → 实际交换设备与 device_map 回写/刷新交换设备错配。
+    // 选择是确定性的，同状态下结果一致，去重仅消除窗口期漂移，行为不变
+    let fallback_device = LAST_OAUTH_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|p| p.device_id.clone())
+        .unwrap_or_else(|| select_login_device(state).0);
+
     let mut access_token = params
         .get("accessToken")
         .or_else(|| params.get("access_token"))
@@ -605,21 +618,12 @@ pub fn oauth_parse_callback(
                 .as_ref()
                 .map(|p| p.pkce_verifier.clone());
             // 会话设备优先（登录 URL 签发时轮转选定）；无在途会话（重启后粘贴回调）
-            // 重新按轮转规则选定——选择是确定性的，前提是 device_map/vault 自签发
-            // 后未变；若期间有其他登录成功回写 device_map，绑定计数变化可能选到
-            // 另一台（20403 时由变体探测链自愈，不阻断）
-            let device_id = LAST_OAUTH_STATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .map(|p| p.device_id.clone())
-                .unwrap_or_else(|| select_login_device(state).0);
-            // host：授权页回传的 API 域（main.js 逆向：交换 URL = ${host}/trae/api/v3/oauth/ExchangeToken）
+            // 用入口一次性选定的 fallback_device（与尾部透传共用，见上）
             let host = params
                 .get("host")
                 .cloned()
                 .unwrap_or_else(|| "https://api.trae.com.cn".into());
-            match exchange_code(&code, verifier.as_deref(), &device_id, &host, &state.data_dir) {
+            match exchange_code(&code, verifier.as_deref(), &fallback_device, &host, &state.data_dir) {
                 Ok((at, rt)) => {
                     access_token = Some(at);
                     rt
@@ -640,14 +644,8 @@ pub fn oauth_parse_callback(
         user_name,
         avatar,
         // 会话设备透传给 oauth_login：刷新交换与 device_map 回写共用同一台
-        device_id: Some(
-            LAST_OAUTH_STATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .map(|p| p.device_id.clone())
-                .unwrap_or_else(|| select_login_device(state).0),
-        ),
+        //（与 AuthCode 交换共用入口选定值，防分钟级交换窗口内两处漂移）
+        device_id: Some(fallback_device),
     })
 }
 

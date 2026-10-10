@@ -606,6 +606,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('success', `分组「${name}」已创建`);
     } catch (err) {
       get().pushToast('error', `创建分组失败：${String(err)}`);
+      // rethrow（移植 main 8628629 F14）：供 GroupsModal 统一捕获——失败保留输入便于重试
+      throw err;
     }
   },
   updateGroup: async (id, patch) => {
@@ -614,6 +616,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       await get().refreshGroups();
     } catch (err) {
       get().pushToast('error', `更新分组失败：${String(err)}`);
+      throw err;
     }
   },
   removeGroup: async (id) => {
@@ -624,6 +627,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('info', '分组已删除');
     } catch (err) {
       get().pushToast('error', `删除分组失败：${String(err)}`);
+      throw err;
     }
   },
   moveAccount: async (userId, groupId) => {

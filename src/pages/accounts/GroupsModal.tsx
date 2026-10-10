@@ -32,6 +32,8 @@ export function GroupsModal({
   // 新建请求进行中（审查 F3.3）：请求期间按钮禁用，防连点创建重复分组；
   // 失败提示由调用方 toast 呈现（此处捕获仅防 unhandled rejection，保留输入便于重试）
   const [createBusy, setCreateBusy] = useState(false);
+  // 删除 pending（移植 main 8628629 F14）：防连点重复删除；进行中禁关闭与按钮
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   useEffect(() => {
     setEditingNames((prev) => {
@@ -145,26 +147,32 @@ export function GroupsModal({
       {/* 删除分组确认弹框（禁 window.confirm，红线） */}
       <Modal
         open={deleteGroupTarget != null}
-        onClose={() => setDeleteGroupTarget(null)}
+        onClose={() => {
+          if (!deleteBusy) setDeleteGroupTarget(null);
+        }}
         title="删除分组"
         footer={
           <>
-            <button className="btn-outline" onClick={() => setDeleteGroupTarget(null)}>取消</button>
+            <button className="btn-outline" onClick={() => setDeleteGroupTarget(null)} disabled={deleteBusy}>取消</button>
             <button
               className="btn-primary !bg-rose-600 hover:!bg-rose-500"
               onClick={async () => {
                 const target = deleteGroupTarget;
-                setDeleteGroupTarget(null);
-                if (target) {
-                  try {
-                    await onDelete(target.id);
-                  } catch {
-                    /* 失败 toast 由调用方负责 */
-                  }
+                if (!target || deleteBusy) return;
+                setDeleteBusy(true);
+                try {
+                  // 失败保留确认弹框便于重试（移植 main 8628629 F14），toast 由调用方负责
+                  await onDelete(target.id);
+                  setDeleteGroupTarget(null);
+                } catch {
+                  /* 失败 toast 由调用方负责 */
+                } finally {
+                  setDeleteBusy(false);
                 }
               }}
+              disabled={deleteBusy}
             >
-              确认删除
+              {deleteBusy ? '删除中…' : '确认删除'}
             </button>
           </>
         }
