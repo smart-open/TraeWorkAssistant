@@ -3,6 +3,7 @@ import { CheckCircle2, Circle, ChevronRight, Info } from 'lucide-react';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { Badge } from './ui';
+import CertManualGuide, { caCerExists } from './CertManualGuide';
 
 interface Step {
   key: string;
@@ -25,6 +26,8 @@ export default function SetupGuide() {
   const refreshCert = useAppStore((s) => s.refreshCert);
 
   const [busy, setBusy] = useState<string | null>(null);
+  // cert 步骤失败后展示手动导入指引（issue #12/#79）
+  const [certGuideOpen, setCertGuideOpen] = useState(false);
 
   // 每一步的「完成」判定均来自 store 实时状态，组件重渲染时自动刷新
   const steps: Step[] = [
@@ -103,6 +106,9 @@ export default function SetupGuide() {
     } catch (e) {
       // proxy 等步骤内部已有 toast；cert 等纯 invoke 步骤的错误在此兜底弹出（issue #6：静默吞错导致"点了没反应"）
       toast('error', String(e));
+      // cert 失败时卡片内给出手动导入三步指引（issue #12/#79）；ca.cer 未生成
+      // （ensure_ca 失败）时指引无意义，仅保留报错 toast
+      if (step.key === 'cert' && (await caCerExists())) setCertGuideOpen(true);
     } finally {
       setBusy(null);
     }
@@ -152,6 +158,10 @@ export default function SetupGuide() {
           </li>
         ))}
       </ol>
+
+      {certGuideOpen && !certInstalled && (
+        <CertManualGuide onClose={() => setCertGuideOpen(false)} />
+      )}
 
       {proxy.running && proxy.captured === 0 && (
         <div className="border-t border-slate-100 bg-amber-50/60 px-4 py-3 text-sm text-amber-700 dark:border-zinc-800 dark:bg-amber-500/10 dark:text-amber-300">

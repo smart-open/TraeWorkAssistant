@@ -114,8 +114,10 @@ export const api = {
     codebuddyEnvCheck: () => invoke<CodeBuddyEnvCheck>('codebuddy_env_check'),
   },
   cert: {
-    status: () => invoke<{ installed: boolean }>('cert_status'),
-    install: () => invoke<{ installed: boolean }>('cert_install'),
+    status: () => invoke<{ installed: boolean; ca_exists: boolean }>('cert_status'),
+    install: () => invoke<{ installed: boolean; ca_exists: boolean }>('cert_install'),
+    /** 打开证书目录（资源管理器）：安装失败时引导用户手动导入 ca.cer（issue #12/#79） */
+    openFolder: () => invoke('cert_open_folder'),
   },
   proxy: {
     start: (port: number) => invoke<ProxyStatus>('proxy_start', { port }),

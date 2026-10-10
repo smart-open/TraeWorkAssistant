@@ -414,10 +414,15 @@ pub fn save_current_login(
         };
         if let Some(live) = live_id {
             if !live.is_empty() && live != user_id.trim() {
-                let msg = format!(
-                    "客户端当前登录的是账号 {live}，与要保存的账号 {user_id} 不一致，已拒绝保存（防止账号槽位被互相覆盖污染）。\
-                     请先「切换」到目标账号并在客户端确认登录，再点「保存当前登录态」。"
-                );
+                // issue #55 同型修复（issue #78 复审补齐）：拒绝文案按槽位状态分流
+                // （无快照首存→指引客户端手动登录；槽位污染→指引退出重登；其余→
+                // 通用文案），替换原一刀切「先切换」对首存场景不可执行的对仗文案
+                let profiles_dir = crate::switcher::profile::profile_for(
+                    TargetApp::parse(target_app.as_deref().unwrap_or("WorkBuddy")),
+                    &state.data_dir,
+                )
+                .profiles_dir;
+                let msg = crate::switcher::save_reject_message(&profiles_dir, user_id.trim(), &live);
                 fs_utils::app_log(&state.data_dir, &format!("保存登录态被守卫拦截: {msg}"));
                 return Err(msg);
             }

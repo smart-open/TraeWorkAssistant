@@ -159,6 +159,7 @@ fn main() {
             commands::env::codebuddy_env_check,
             commands::cert::cert_status,
             commands::cert::cert_install,
+            commands::cert::cert_open_folder,
             commands::proxy::proxy_start,
             commands::proxy::proxy_stop,
             commands::proxy::proxy_status,

@@ -897,16 +897,22 @@ export interface OAuthLoginResult {
   jwt: string;
   refresh_token: string;
   has_refresh_token: boolean;
+  /** 本次登录是否与已有账号同 uid（合并更新而非新增） */
+  merged: boolean;
+  /** 合并时被更新的已有账号名（merged=false 时为 null） */
+  existing_name: string | null;
 }
 
 /** 本机回环监听器落库完成事件（oauth-login-done）负载 */
 export interface OAuthLoginDoneEvent {
   ok: boolean;
   message: string;
-  /** 登录成功时的账号备注名 */
+  /** 登录成功时的账号备注名（合并场景为实际被更新的已有账号名） */
   account: string | null;
   /** 登录成功时的 user_id */
   user_id: string | null;
+  /** 登录成功时标记是否与已有账号同 uid（合并更新而非新增）；失败时为 null */
+  merged?: boolean | null;
 }
 
 // ---- 应用自更新 ----

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { RefreshCw, ShieldCheck, Users, CheckCircle2, Circle, ChevronRight, TrendingUp, HeartPulse } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { StatCard, Badge } from '../../components/ui';
+import CertManualGuide, { caCerExists } from '../../components/CertManualGuide';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import type { AppLocate, DoubaoAccountView, DoubaoHistoryEvent } from '../../types';
@@ -26,6 +27,8 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
   const refreshCert = useAppStore((s) => s.refreshCert);
 
   const [busy, setBusy] = useState<string | null>(null);
+  // cert 步骤失败后展示手动导入指引（issue #12/#79）
+  const [certGuideOpen, setCertGuideOpen] = useState(false);
   const snapshotCount = accounts.filter((a) => a.has_snapshot).length;
   const quotaChecked = accounts.some((a) => a.quota_checked_at);
 
@@ -94,6 +97,9 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
     } catch (e) {
       // 兜底弹出真实错误（issue #6：静默吞错导致"点了没反应"）
       pushToast('error', String(e));
+      // cert 失败时卡片内给出手动导入三步指引（issue #12/#79）；ca.cer 未生成
+      // （ensure_ca 失败）时指引无意义，仅保留报错 toast
+      if (step.key === 'cert' && (await caCerExists())) setCertGuideOpen(true);
     } finally {
       setBusy(null);
     }
@@ -137,6 +143,10 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
           </li>
         ))}
       </ol>
+
+      {certGuideOpen && !certInstalled && (
+        <CertManualGuide onClose={() => setCertGuideOpen(false)} />
+      )}
 
       {allDone && (
         <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-zinc-800 dark:bg-emerald-500/10 dark:text-emerald-300">

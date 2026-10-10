@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import SetupGuide from '../components/SetupGuide';
+import CertManualGuide, { caCerExists } from '../components/CertManualGuide';
 import { StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
@@ -35,6 +36,8 @@ export default function Dashboard() {
   const isDark = useIsDark();
   // 近 30 天签到结果趋势（堆叠柱状图数据，T8）
   const [trends, setTrends] = useState<CheckinTrendPoint[]>([]);
+  // 证书一键安装失败后展开手动导入指引（issue #12/#79）
+  const [showCertGuide, setShowCertGuide] = useState(false);
 
   const loadTrends = async () => {
     try {
@@ -247,12 +250,20 @@ export default function Dashboard() {
                 toast('success', '证书安装成功（可在 certmgr「受信任的根证书颁发机构」中搜索 TraeDeviceProxyCA 验证）');
               } catch (e) {
                 toast('error', `证书安装失败：${String(e)}`);
+                // ca.cer 已生成（安装阶段失败）才弹手动导入指引；ca.cer 未生成
+                // （ensure_ca 失败）时指引无意义，仅保留报错 toast
+                if (await caCerExists()) setShowCertGuide(true);
               }
             }}
             className="btn-primary"
           >
             一键安装证书
           </button>
+        </div>
+      )}
+      {showCertGuide && !certInstalled && (
+        <div className="mt-3 card overflow-hidden">
+          <CertManualGuide onClose={() => setShowCertGuide(false)} />
         </div>
       )}
 

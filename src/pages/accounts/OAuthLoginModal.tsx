@@ -60,7 +60,12 @@ export function OAuthLoginModal({
           void api.oauth.stopLoopback().catch(() => {});
           void refreshAccounts();
           void refreshGroups();
-          toast('success', e.account ? `账号已添加：${e.account}` : '账号已添加');
+          // 同 uid 合并场景下后端 message 已如实描述「更新已有账号而非新增」，直接透传（issue #80）
+          if (e.merged) {
+            toast('success', e.message);
+          } else {
+            toast('success', e.account ? `账号已添加：${e.account}` : '账号已添加');
+          }
           onCloseRef.current();
         } else {
           toast('error', `自动登录失败：${e.message}，可改用下方手动粘贴兜底`);

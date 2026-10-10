@@ -134,8 +134,10 @@ const REMOVED_MODEL_IDS: &[&str] = &[
 /// （前端未命中显示 `—`）。
 const MODEL_VENDORS: &[(&str, &str)] = &[
     ("step5preview", "阶跃星辰"),
-    // Space-Bunny：产品确认供应商未知（2026-10-02），目录标注「未知」而非回落 Qoder
-    ("spacebunny", "未知"),
+    // Space-Bunny（太空兔）：2026-10-10 产品确认为 MiniMax 模型（此前标注「未知」）
+    ("spacebunny", "MiniMax"),
+    // MiMo：小米自研大模型系列（2026-10-10 产品确认）
+    ("mimo", "小米"),
     // 其余按需补充：Qwen 系→阿里 / GLM 系→智谱 / Kimi 系→月之暗面 /
     // DeepSeek 系→深度求索 / MiniMax 系→MiniMax
 ];

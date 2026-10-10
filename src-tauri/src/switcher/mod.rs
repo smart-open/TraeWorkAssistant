@@ -141,6 +141,10 @@ pub struct Session {
     /// Cookies qoderuid 解密传入（Work/其他为空）。L2 守卫优先采用；为空时按布局
     /// 回退（icube 仅 Trae 系走日志探测，见 save_identity_guard）
     pub expected_current_uid: String,
+    /// issue #78 方案 A：本次切换由「凭证副本合成最小快照」引导（切换前该账号
+    /// 无任何快照）。confirm_switch 确认成功后据此升级完整快照；每次 run_action
+    /// 独立会话，无需跨动作传递
+    pub bootstrap_done: bool,
 }
 
 impl Session {
@@ -158,6 +162,7 @@ impl Session {
             auth_file: authfile::wb_auth_file(),
             detected_live_uid: None,
             expected_current_uid: args.expected_current_uid.clone(),
+            bootstrap_done: false,
         }
     }
 }
@@ -758,6 +763,81 @@ fn post_restore_missing(sess: &Session) -> Vec<String> {
     }
 }
 
+/// issue #78 方案 A：目标账号无任何快照时，尝试用工具侧凭证副本（token store
+/// wb_tokens 表，账号登录/OAuth 时自动留存）合成最小 authfile 快照，解除
+/// 「切换要快照 → 快照要保存 → 保存被守卫拒绝（客户端当前登录是别的账号）→
+/// 旧账号不会被自动登出」的冷启动死锁。合成最小快照恢复出登录态后，客户端
+/// 接受并确认，再由 switch_flow 在 confirm Ok 后备份完整登录态升级快照。
+/// 仅 WorkBuddy：共享 auth 文件是 WorkBuddy 登录驱动源（F2-4）；CodeBuddy 登录
+/// 真源在客户端加密 vscdb 内，工具侧无法离线合成。
+/// 返回 true = 合成成功（预检放行，继续切换）；false = 无法合成（调用方 fatal）。
+fn bootstrap_snapshot_from_token_store(sess: &Session, uid: &str, sink: &dyn ProgressSink) -> bool {
+    if sess.prof.app_name != "WorkBuddy" {
+        return false;
+    }
+    sink.step(
+        "bootstrap",
+        StepStatus::Info,
+        &format!("目标账号 {uid} 无快照，尝试用工具侧凭证副本合成最小登录态…"),
+    );
+    let store = crate::tasks::wb_common::token_store_load_secure(&sess.data_dir);
+    let Some(rec) = store.get("tokens").and_then(|t| t.get(uid)) else {
+        sink.step(
+            "bootstrap",
+            StepStatus::Warn,
+            &format!(
+                "凭证副本（token store）中无账号 {uid} 的记录，无法合成。\
+                 请在客户端手动登录账号 {uid} 后点「保存当前登录态」建立首个快照"
+            ),
+        );
+        return false;
+    };
+    let creds = crate::tasks::wb_common::creds_of(rec);
+    if creds.access_token.is_empty() {
+        sink.step(
+            "bootstrap",
+            StepStatus::Warn,
+            &format!(
+                "凭证副本中账号 {uid} 无有效 access_token，无法合成。\
+                 请在客户端手动登录账号 {uid} 后点「保存当前登录态」建立首个快照"
+            ),
+        );
+        return false;
+    }
+    // 真实 uid 以账号池条目为准（uid 是 uuid 体系，槽名 wb-<hash> 只是池 id）；
+    // 池缺失时回退凭证记录里的 uid
+    let pool = crate::store::docs::wb_pool_load(&crate::store::db(&sess.data_dir));
+    let pool_uid = pool
+        .get("accounts")
+        .and_then(|a| a.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(uid))
+                .and_then(|a| a.get("uid"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .filter(|s| !s.is_empty());
+    let real_uid = pool_uid.or_else(|| {
+        if creds.uid.is_empty() {
+            None
+        } else {
+            Some(creds.uid.clone())
+        }
+    });
+    let Some(real_uid) = real_uid else {
+        sink.step(
+            "bootstrap",
+            StepStatus::Warn,
+            "无法确定账号真实 uid（账号池与凭证记录均缺失），无法合成",
+        );
+        return false;
+    };
+    let mut creds = creds;
+    creds.uid = real_uid;
+    authfile::synthesize_auth_snapshot(sess, uid, &creds, sink).is_some()
+}
+
 /// Switch 主流程（PS 1415-1477 逐段对译，含防误覆盖守卫与恢复后校验回滚）
 fn switch_flow(
     sess: &mut Session,
@@ -769,11 +849,32 @@ fn switch_flow(
     let target = sess.prof.profiles_dir.join(uid);
     let target_bak = sess.prof.profiles_dir.join(format!("{uid}.bak"));
     if !target.exists() && !target_bak.exists() {
-        // 兜底预检（switch_account 命令层已有同步预检，正常到不了这里——如 Restore
-        // 直调入口）：文案与命令层引导一致，uid 保留供日志排查
-        let msg = format!("账号 {uid} 尚未保存登录态：请先用此账号登录客户端，然后点击「保存当前登录态」，成功后即可一键切换");
-        sink.step("fatal", StepStatus::Error, &msg);
-        return Err(fatal_line(&msg));
+        // issue #78 方案 A：authfile 布局先尝试凭证副本合成最小快照（冷启动死锁
+        // 解除），合成成功继续正常切换；失败走改进 fatal 文案（明示守卫闭环与
+        // 手动出路，替换原「请先登录并保存」对冷启动场景不可执行的对仗文案）
+        let bootstrapped = if sess.prof.layout == Layout::Authfile {
+            bootstrap_snapshot_from_token_store(sess, uid, sink)
+        } else {
+            false
+        };
+        if !bootstrapped {
+            let msg = match (sess.prof.layout, sess.prof.app_name) {
+                (Layout::Authfile, "CodeBuddy") => format!(
+                    "目标账号 {uid} 无快照，且 CodeBuddy 登录真源在客户端加密数据库（vscdb），\
+                     工具无法自动合成。这是「切换要快照、快照要保存、保存又被当前登录不一致拒绝」\
+                     的冷启动闭环：请先在客户端手动登录账号 {uid}（旧账号暂不退出也可直接切换登录），\
+                     再点「保存当前登录态」建立首个快照"
+                ),
+                (Layout::Authfile, _) => format!(
+                    "目标账号 {uid} 无快照，凭证副本中也没有该账号的有效登录凭证，无法自动合成。\
+                     请先在客户端手动登录账号 {uid}，再点「保存当前登录态」建立首个快照"
+                ),
+                _ => format!("目标账号 {uid} 无快照，请先登录该账号并点击「保存当前登录态」"),
+            };
+            sink.step("fatal", StepStatus::Error, &msg);
+            return Err(fatal_line(&msg));
+        }
+        sess.bootstrap_done = true;
     }
     proc::stop_app(sess, sink)?;
 
@@ -914,7 +1015,29 @@ fn switch_flow(
                     ),
                 );
             }
-            authfile::VerifyResult::Ok => {}
+            authfile::VerifyResult::Ok => {
+                // issue #78 方案 A：本次切换由合成最小快照引导（此前该账号无任何
+                // 快照）。登录身份已确认切到目标账号，客户端此刻落盘的登录态已是
+                // 完整现场——立即备份升级快照（rotate_bak 顺带把合成槽轮转为 .bak
+                // 留作回退）。best-effort：失败仅告警，下次「保存当前登录态」可补。
+                if sess.bootstrap_done {
+                    sess.bootstrap_done = false;
+                    match backup_current(sess, uid, sink) {
+                        Ok(()) => sink.step(
+                            "backup",
+                            StepStatus::Ok,
+                            &format!("客户端完整登录态已升级至账号 {uid} 快照"),
+                        ),
+                        Err(e) => sink.step(
+                            "backup",
+                            StepStatus::Warn,
+                            &format!(
+                                "完整登录态升级失败（不影响本次切换，之后点「保存当前登录态」可补）: {e}"
+                            ),
+                        ),
+                    }
+                }
+            }
         }
     }
     done(sink, &format!("已切换至账号 {uid}"))
@@ -1175,5 +1298,142 @@ mod tests {
         assert_eq!(v["status"], "running");
         assert_eq!(v["message"], "正在关闭 Trae Work");
         assert!(v["time"].as_str().unwrap().contains(':'));
+    }
+
+    // ── bootstrap_snapshot_from_token_store（issue #78 方案 A）─────────────────
+
+    const BOOT_SLOT: &str = "wb-abc123";
+    /// 工具侧凭证副本明文记录（与 save_token_store 写入形态同构：DB 明文路径，
+    /// vault 无记录时保留明文，token_store_load_secure 可直接读出）
+    const BOOT_REC: &str = r#"{"account":{"uid":"real-uuid-1"},"auth":{"accessToken":"tok-a","refreshToken":"tok-r","expiresAtMs":1760000000000,"refreshExpiresAtMs":1790000000000},"domain":"example.com"}"#;
+
+    /// bootstrap 测试用 Session：全部 IO 路径注入纳秒级临时目录（store db、
+    /// profiles_dir、auth 文件均不触碰真实机器路径）
+    fn bootstrap_session(tag: &str, app: TargetApp) -> Session {
+        let base = std::env::temp_dir().join(format!(
+            "sw-boot-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let args = RunArgs {
+            action: Action::Switch,
+            target_app: app,
+            user_id: Some(BOOT_SLOT.into()),
+            proxy_port: None,
+            include_indexeddb: false,
+            expected_current_uid: String::new(),
+            machine_id_override: None,
+            data_dir: base.clone(),
+        };
+        let mut sess = Session::new(&args);
+        sess.prof.data_dir = base.join("appdata");
+        let fake_auth = base.join("fake-auth");
+        sess.auth_dir = fake_auth;
+        sess.auth_file = base.join("fake-auth").join("workbuddy-desktop.info");
+        sess
+    }
+
+    /// 无记录 / 记录无 access_token / CodeBuddy 三类拒绝：false 且不建槽
+    #[test]
+    fn bootstrap_无记录或无access_token或codebuddy_拒绝() {
+        let _guard = test_io_lock();
+        let sink = MemSink::new();
+        // ① token store 无该账号记录 → false
+        let sess = bootstrap_session("norec", TargetApp::WorkBuddy);
+        assert!(!bootstrap_snapshot_from_token_store(&sess, BOOT_SLOT, &sink));
+        assert!(!sess.prof.profiles_dir.join(BOOT_SLOT).exists());
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+        // ② 记录存在但无 access_token → false
+        let sess = bootstrap_session("notok", TargetApp::WorkBuddy);
+        crate::store::docs::wb_token_store_upsert(
+            &crate::store::db(&sess.data_dir),
+            BOOT_SLOT,
+            &serde_json::json!({"account": {"uid": "real-uuid-1"}}),
+        )
+        .unwrap();
+        assert!(!bootstrap_snapshot_from_token_store(&sess, BOOT_SLOT, &sink));
+        assert!(!sess.prof.profiles_dir.join(BOOT_SLOT).exists());
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+        // ③ CodeBuddy：即便记录齐全也不合成（登录真源在客户端加密 vscdb）
+        let sess = bootstrap_session("cb", TargetApp::CodeBuddy);
+        crate::store::docs::wb_token_store_upsert(
+            &crate::store::db(&sess.data_dir),
+            BOOT_SLOT,
+            &serde_json::from_str::<serde_json::Value>(BOOT_REC).unwrap(),
+        )
+        .unwrap();
+        assert!(!bootstrap_snapshot_from_token_store(&sess, BOOT_SLOT, &sink));
+        assert!(!sess.prof.profiles_dir.join(BOOT_SLOT).exists());
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 明文凭证记录 + 池条目 → 合成成功：uid 以池条目为准（uuid 权威体系），
+    /// 槽内 auth 文件可读出池 uid，meta 带 bootstrap 标记，sink 留 Ok 步骤
+    #[test]
+    fn bootstrap_明文记录加池条目_合成成功且uid以池为准() {
+        let _guard = test_io_lock();
+        let sess = bootstrap_session("ok", TargetApp::WorkBuddy);
+        crate::store::docs::wb_token_store_upsert(
+            &crate::store::db(&sess.data_dir),
+            BOOT_SLOT,
+            &serde_json::from_str::<serde_json::Value>(BOOT_REC).unwrap(),
+        )
+        .unwrap();
+        crate::store::docs::wb_pool_save(
+            &crate::store::db(&sess.data_dir),
+            &serde_json::json!({"accounts": [{"id": BOOT_SLOT, "uid": "pool-uuid-9"}]}),
+        )
+        .unwrap();
+        let sink = MemSink::new();
+        assert!(bootstrap_snapshot_from_token_store(&sess, BOOT_SLOT, &sink));
+        let slot = sess.prof.profiles_dir.join(BOOT_SLOT);
+        let j: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(slot.join("auth").join("workbuddy-desktop.info")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(j["account"]["uid"], "pool-uuid-9");
+        assert_eq!(j["auth"]["accessToken"], "tok-a");
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(slot.join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["uid"], "pool-uuid-9");
+        assert_eq!(meta["bootstrap"], true);
+        assert!(sink
+            .steps
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(s, st, _)| s == "bootstrap" && st == "ok"));
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 池缺失 → 回退凭证记录内的 uid（兜底链路）
+    #[test]
+    fn bootstrap_池缺失_凭证uid兜底() {
+        let _guard = test_io_lock();
+        let sess = bootstrap_session("fallback", TargetApp::WorkBuddy);
+        crate::store::docs::wb_token_store_upsert(
+            &crate::store::db(&sess.data_dir),
+            BOOT_SLOT,
+            &serde_json::from_str::<serde_json::Value>(BOOT_REC).unwrap(),
+        )
+        .unwrap();
+        assert!(bootstrap_snapshot_from_token_store(&sess, BOOT_SLOT, &MemSink::new()));
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                sess.prof
+                    .profiles_dir
+                    .join(BOOT_SLOT)
+                    .join("meta.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["uid"], "real-uuid-1");
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
     }
 }

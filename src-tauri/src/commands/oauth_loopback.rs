@@ -36,10 +36,12 @@ const IDLE_CHECK_INTERVAL_SECS: i64 = 30;
 pub struct OAuthLoginDoneEvent {
     pub ok: bool,
     pub message: String,
-    /// 登录成功时的账号备注名
+    /// 登录成功时的账号备注名（合并场景为实际被更新的已有账号名）
     pub account: Option<String>,
     /// 登录成功时的 user_id
     pub user_id: Option<String>,
+    /// 登录成功时标记是否与已有账号同 uid（合并更新而非新增）；失败时为 None
+    pub merged: Option<bool>,
 }
 
 /// 回环监听器运行句柄（全局唯一；重启登录时先停旧的）
@@ -97,10 +99,30 @@ async fn handle_authorize(AxumState(st): AxumState<Arc<LoopbackState>>, uri: Uri
     })
     .await;
 
-    let (ok, message, account, user_id) = match result {
-        Ok(Ok(r)) => (true, format!("账号 [{}] 登录成功", r.name), Some(r.name), Some(r.user_id)),
-        Ok(Err(e)) => (false, e, None, None),
-        Err(e) => (false, format!("登录任务执行异常: {e}"), None, None),
+    let (ok, message, account, user_id, merged) = match result {
+        Ok(Ok(r)) => {
+            if r.merged {
+                // 同 uid 合并：文案与账号名都指向实际被更新的已有账号，避免误报「新增」（issue #80）
+                let actual = r.existing_name.clone().unwrap_or_else(|| r.name.clone());
+                (
+                    true,
+                    format!("账号 [{actual}] 登录成功（与本次登录同 uid，已更新其凭证，未新增账号）"),
+                    Some(actual),
+                    Some(r.user_id),
+                    Some(true),
+                )
+            } else {
+                (
+                    true,
+                    format!("账号 [{}] 登录成功", r.name),
+                    Some(r.name),
+                    Some(r.user_id),
+                    Some(false),
+                )
+            }
+        }
+        Ok(Err(e)) => (false, e, None, None, None),
+        Err(e) => (false, format!("登录任务执行异常: {e}"), None, None, None),
     };
 
     // 通知前端（自动收尾：ok=true 关闭弹窗刷新列表；ok=false 提示走手动粘贴兜底）
@@ -111,20 +133,21 @@ async fn handle_authorize(AxumState(st): AxumState<Arc<LoopbackState>>, uri: Uri
             message: message.clone(),
             account,
             user_id,
+            merged,
         },
     );
 
     // 登录流程已结束，自动关闭监听（释放端口；下一次登录由 oauth_start_loopback 重启）
     let _ = st.shutdown_tx.send(true);
 
-    html_response(ok, &message, &callback_url)
+    html_response(ok, merged.unwrap_or(false), &message, &callback_url)
 }
 
 /// 浏览器展示的中文结果页（成功：可关闭此页；失败：提示手动复制 URL 兜底）
 ///
 /// 安全（P0 缺陷6）：`message` 含上游错误详情、`callback_url` 含浏览器可控的
 /// path/query，均必须 HTML 转义后再插值，防回调页 XSS
-fn html_response(ok: bool, message: &str, callback_url: &str) -> Html<String> {
+fn html_response(ok: bool, merged: bool, message: &str, callback_url: &str) -> Html<String> {
     // HTML 实体转义：&, <, >, ", '（属性与文本上下文均覆盖）
     fn esc(s: &str) -> String {
         s.replace('&', "&amp;")
@@ -139,10 +162,17 @@ fn html_response(ok: bool, message: &str, callback_url: &str) -> Html<String> {
         ("✕", "登录失败", "#dc2626")
     };
     let body = if ok {
+        // 同 uid 合并场景如实表述「同步更新」而非「已添加」（issue #80）
+        let tail = if merged {
+            "账号信息已同步到 AIWorkAssistant，可关闭此页面返回应用。"
+        } else {
+            "账号已添加到 AIWorkAssistant，可关闭此页面返回应用。"
+        };
         format!(
             "<p>{}</p>\
-             <p>账号已添加到 AIWorkAssistant，可关闭此页面返回应用。</p>",
-            esc(message)
+             <p>{}</p>",
+            esc(message),
+            esc(tail)
         )
     } else {
         format!(
@@ -300,6 +330,7 @@ mod tests {
         // P0 缺陷6 回归：script 注入必须被实体转义，不得原样出现在 HTML 中
         let html = html_response(
             false,
+            false,
             "兑换失败: <script>alert(1)</script>",
             "http://127.0.0.1:17388/authorize?code=ab&state=<img src=x onerror=alert(2)>",
         )
@@ -315,8 +346,20 @@ mod tests {
 
     #[test]
     fn html_response_success_page() {
-        let html = html_response(true, "账号 [测试] 登录成功", "").0;
+        // 新增场景：第二段文案为「已添加」
+        let html = html_response(true, false, "账号 [测试] 登录成功", "").0;
         assert!(html.contains("登录成功"));
         assert!(html.contains("账号 [测试] 登录成功"));
+        assert!(html.contains("账号已添加到 AIWorkAssistant"));
+        // 同 uid 合并场景（issue #80）：第二段文案为「已同步」，不得再出现「已添加」
+        let merged_html = html_response(
+            true,
+            true,
+            "账号 [测试] 登录成功（与本次登录同 uid，已更新其凭证，未新增账号）",
+            "",
+        )
+        .0;
+        assert!(merged_html.contains("账号信息已同步到 AIWorkAssistant"));
+        assert!(!merged_html.contains("账号已添加到"));
     }
 }

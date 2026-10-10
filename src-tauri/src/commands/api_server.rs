@@ -95,6 +95,25 @@ pub async fn do_start(
     };
     // 诊断口径与池装配一致：通用积分余额/到期（老缓存账号回退混合口径）
     let merged_expires = merge_pool_expire_times(&credits_file);
+    // 同 uid 重复条目告警：服务端同 uid 即同一账号，池装配与凭证更新仅按 uid 单条生效，
+    // 多条目会加剧「多账号」错觉（issue #80）；建议保留一条、删除多余
+    let mut seen_uids: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for a in &accounts.accounts {
+        if let Some(uid) = a.user_id.as_deref() {
+            match seen_uids.get(uid) {
+                Some(first_name) => fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "  账号池告警: 发现重复 uid={}（已有账号 [{}]，当前账号 [{}]）；池装配与凭证更新仅按 uid 单条生效，建议保留一条、删除多余条目",
+                        uid, first_name, a.name
+                    ),
+                ),
+                None => {
+                    seen_uids.insert(uid, a.name.as_str());
+                }
+            }
+        }
+    }
     for a in &accounts.accounts {
         let uid = a.user_id.as_deref().unwrap_or("(none)");
         let name = &a.name;
@@ -1756,6 +1775,31 @@ mod pool_merge_tests {
         rc.general.insert("u1".into(), 0.0);
         let got = merge_pool_expire_times(&rc);
         assert!(got.get("u1").is_none());
+    }
+
+    #[test]
+    fn merge_expires_end_to_end_after_persistence_roundtrip() {
+        // issue #75 验收链路：刷新任务写 general_expire_times → 持久化 →
+        // 重启后 load 恢复 → merge 命中调度口径（Work 包混合口径不泄漏）。
+        // 持久化层断链回归测试：save/load 列名或字段不一致时此处必失败。
+        let dir = std::env::temp_dir().join(format!("twa_merge_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let s = crate::store::db(&dir);
+            let mut rc = RemainingCreditsFile::default();
+            rc.general.insert("u1".into(), 90.0);
+            rc.expire_times.insert("u1".into(), 1000);
+            rc.general_expire_times.insert("u1".into(), 2000);
+            crate::store::docs::remaining_credits_save(&s, &rc).unwrap();
+        }
+        let got = {
+            let s = crate::store::db(&dir);
+            let rc = crate::store::docs::remaining_credits_load(&s);
+            merge_pool_expire_times(&rc)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got.get("u1"), Some(&2000));
     }
 
     #[test]

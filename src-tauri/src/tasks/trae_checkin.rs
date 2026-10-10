@@ -138,6 +138,24 @@ fn get_device_for(state: &AppState, uid: &str) -> DeviceEntry {
 
 // ── status 预检 / claim（对齐 python status_check / _signin_request）────────
 
+/// 识别「设备绑定数已达上限」类服务端错误并转译为可操作引导（issue #76）：
+/// 服务端按 device_id 统计账号绑定数，超限后该设备上新登录的账号能换到 token
+/// 但使用类接口（签到/积分查询）全拒。命中特征词时在原文后追加解决路径，
+/// 否则原样透传。未识别（上游改文案）时不影响原始错误可见性。
+pub fn humanize_device_limit(message: &str) -> String {
+    let lower = message.to_lowercase();
+    let hit = message.contains("已达上限")
+        || message.contains("账户数量")
+        || lower.contains("device limit")
+        || lower.contains("bound to this device");
+    if !hit {
+        return message.to_string();
+    }
+    format!(
+        "{message} —— 设备绑定数已达服务端上限：对本账号重新执行一次 OAuth 登录即可自动轮换到其他本机设备凭证，或在 Trae 客户端解绑不再使用的账号"
+    )
+}
+
 /// status 预检结果
 struct StatusOutcome {
     ok: bool,
@@ -194,7 +212,7 @@ fn status_check(
             ok: false,
             checked_in,
             credits,
-            message: if msg.is_empty() { format!("HTTP {status}") } else { msg },
+            message: if msg.is_empty() { format!("HTTP {status}") } else { humanize_device_limit(&msg) },
         };
     }
     StatusOutcome { ok: true, checked_in, credits, message: msg }
@@ -226,7 +244,7 @@ fn signin_request(
             let msg = data
                 .get("message")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .map(humanize_device_limit)
                 .unwrap_or_else(|| format!("HTTP {status}"));
             (code == Some(0), msg, code, status, Some(data))
         }
@@ -770,6 +788,22 @@ mod tests {
         // 层3：签到前余额缺失 → (None, 0)
         let (c, d, s) = resolve_claim_credits(Some(&json!({})), None, None::<&mut dyn FnMut() -> (bool, Option<i64>)>);
         assert_eq!((c, d, s), (None, 0, "legacy"));
+    }
+
+    /// issue #76：设备绑定上限错误转译——命中特征词追加解决路径，其余原样透传
+    #[test]
+    fn humanize_device_limit_命中特征词追加引导() {
+        let server_msg = "该设备绑定的账户数量已达上限。";
+        let out = humanize_device_limit(server_msg);
+        assert!(out.starts_with(server_msg));
+        assert!(out.contains("重新执行一次 OAuth 登录"));
+        assert!(out.contains("解绑"));
+        // 英文形态（上游改版兜底）
+        let out2 = humanize_device_limit("Account limit reached for this device (device limit)");
+        assert!(out2.contains("设备绑定数已达服务端上限"));
+        // 未命中 → 原样透传（不影响常规错误可见性）
+        assert_eq!(humanize_device_limit("HTTP 502"), "HTTP 502");
+        assert_eq!(humanize_device_limit(""), "");
     }
 
     #[test]

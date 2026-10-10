@@ -22,6 +22,7 @@ use serde_json::json;
 
 use super::copy;
 use super::{ProgressSink, Session, StepStatus};
+use crate::tasks::wb_common::Creds;
 
 // 路径常量（与 commands/workbuddy/common.rs::auth_file_path 同值，注释互指；
 // CodeBuddyExtension 宿主目录 + workbuddy 产品线文件名，实测确认）
@@ -88,6 +89,11 @@ pub fn auth_file_uid(path: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let j: serde_json::Value =
         serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok()?;
+    auth_file_uid_value(&j)
+}
+
+/// 纯 Value 版 uid 提取（四键兼容，供快照合成后自检复用）
+fn auth_file_uid_value(j: &serde_json::Value) -> Option<String> {
     for v in [
         j.get("account").and_then(|a| a.get("uid")),
         j.get("uid"),
@@ -399,6 +405,260 @@ pub fn restore_authfile(
         &format!("已恢复账号 {slot} 的登录态 ({restored} 项)"),
     );
     Ok(())
+}
+
+// ── 快照合成（issue #78 方案 A：冷启动死锁解除）────────────────────────────
+//
+// 「切换要快照 → 快照要保存 → 保存被 F2-5 守卫拒绝（客户端当前登录是别的账号）→
+//  旧账号不会被自动登出」闭环成死锁（issue #78）。方案 A：无快照账号改由工具侧
+// 凭证副本（token store，账号登录/OAuth 时自动留存）合成一份**最小可用**的
+// authfile 快照（仅 L1 auth 文件 + meta），让「切换」能先恢复出该账号登录态；
+// 客户端接受后 confirm_switch 确认，再由 switch_flow 调 backup_current 升级为
+// 完整快照（rotate_bak 顺带把合成槽轮转为 .bak 留作回退）。
+
+/// 递归键替换命中报告：各组是否至少改写一处（决定合成后是否需要补写默认键位）
+#[derive(Default)]
+struct RewriteHits {
+    uid: bool,
+    access: bool,
+    refresh: bool,
+    expires: bool,
+    refresh_expires: bool,
+}
+
+/// 过期时间值形态保持：壳中原值是字符串（RFC3339 形态）则仍写字符串，
+/// 否则写毫秒数；毫秒转 RFC3339 失败回退毫秒数
+fn expires_value(orig: Option<&serde_json::Value>, ms: i64) -> serde_json::Value {
+    if orig.is_some_and(serde_json::Value::is_string) {
+        if let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) {
+            return json!(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        }
+    }
+    json!(ms)
+}
+
+/// 尝试把单个键按身份组替换（键名大小写不敏感；仅标量形态替换、仅非空值替换），
+/// 返回是否替换。嵌套形态（键值仍是对象）返回 false 交由递归下钻。
+fn replace_identity_key(
+    k: &str,
+    v: &mut serde_json::Value,
+    creds: &Creds,
+    hits: &mut RewriteHits,
+) -> bool {
+    let lk = k.to_ascii_lowercase();
+    let scalar = v.is_string() || v.is_null() || v.is_number();
+    let set_str = |v: &mut serde_json::Value, s: &str| *v = json!(s);
+    if scalar && !creds.uid.is_empty() && matches!(lk.as_str(), "uid" | "userid" | "user_id") {
+        set_str(v, &creds.uid);
+        hits.uid = true;
+        return true;
+    }
+    if scalar
+        && !creds.access_token.is_empty()
+        && matches!(lk.as_str(), "accesstoken" | "access_token" | "token")
+    {
+        set_str(v, &creds.access_token);
+        hits.access = true;
+        return true;
+    }
+    if scalar
+        && !creds.refresh_token.is_empty()
+        && matches!(lk.as_str(), "refreshtoken" | "refresh_token")
+    {
+        set_str(v, &creds.refresh_token);
+        hits.refresh = true;
+        return true;
+    }
+    // 过期键保留原值形态（字符串 RFC3339 / 数字毫秒），仅换值；
+    // expiresat/expires_at 为 RFC3339 形态键名（与 refreshexpiresat 对称覆盖）
+    if scalar
+        && creds.expires_at_ms.is_some()
+        && matches!(
+            lk.as_str(),
+            "expiresatms" | "expires_at_ms" | "accesstokenexpiresatms" | "expires_in_ms"
+                | "expiresat" | "expires_at"
+        )
+    {
+        *v = expires_value(Some(v), creds.expires_at_ms.unwrap_or_default());
+        hits.expires = true;
+        return true;
+    }
+    if scalar
+        && creds.refresh_expires_at_ms.is_some()
+        && matches!(
+            lk.as_str(),
+            "refreshexpiresatms" | "refresh_expires_at_ms" | "refreshexpiresat"
+        )
+    {
+        *v = expires_value(Some(v), creds.refresh_expires_at_ms.unwrap_or_default());
+        hits.refresh_expires = true;
+        return true;
+    }
+    if scalar && !creds.nickname.is_empty() && matches!(lk.as_str(), "nickname" | "nick_name") {
+        set_str(v, &creds.nickname);
+        return true;
+    }
+    if scalar
+        && !creds.edition.is_empty()
+        && matches!(lk.as_str(), "editiontype" | "edition_type" | "edition")
+    {
+        set_str(v, &creds.edition);
+        return true;
+    }
+    if scalar && !creds.domain.is_empty() && lk == "domain" {
+        set_str(v, &creds.domain);
+        return true;
+    }
+    false
+}
+
+/// 递归替换壳内身份键：保持壳文件原有形态（嵌套位置/值类型/客户端私有字段一律
+/// 不动，只改值），改写不了的形态原样保留（客户端私有校验字段不碰）
+fn rewrite_identity_keys(j: &mut serde_json::Value, creds: &Creds) -> RewriteHits {
+    let mut hits = RewriteHits::default();
+    fn walk(j: &mut serde_json::Value, creds: &Creds, hits: &mut RewriteHits) {
+        match j {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map.iter_mut() {
+                    if !replace_identity_key(k, v, creds, hits) {
+                        walk(v, creds, hits);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items.iter_mut() {
+                    walk(v, creds, hits);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(j, creds, &mut hits);
+    hits
+}
+
+/// 用凭证副本合成最小 authfile 快照（issue #78 方案 A 核心步骤）。
+/// 壳模板优先取 live auth 文件（保留客户端私有字段与真实结构），无 live 文件
+/// （首次使用/从未登录）时用默认最小壳。返回 Some(真实 uid) = 合成成功；
+/// None = 无法合成（凭证缺失 / 槽位已存在——后者绝不覆盖，防污染）。
+pub fn synthesize_auth_snapshot(
+    sess: &Session,
+    slot: &str,
+    creds: &Creds,
+    sink: &dyn ProgressSink,
+) -> Option<String> {
+    if creds.uid.is_empty() || creds.access_token.is_empty() {
+        sink.step("bootstrap", StepStatus::Warn, "凭证缺失（uid 或 access_token 为空），无法合成");
+        return None;
+    }
+    let dest = sess.prof.profiles_dir.join(slot);
+    if dest.exists() {
+        // 合成只发生在「该账号从无快照」场景；槽位已在 = 历史快照存在（可能污染），
+        // 绝不覆盖，交由正常切换/守卫链路处理
+        sink.step("bootstrap", StepStatus::Warn, &format!("槽位 {slot} 已存在快照，跳过合成"));
+        return None;
+    }
+    // 壳模板：live auth 文件优先（解析失败/非对象回退默认壳）
+    let mut shell: serde_json::Value = std::fs::read_to_string(&sess.auth_file)
+        .ok()
+        .and_then(|raw| serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| json!({"account": {}, "auth": {}}));
+    let hits = rewrite_identity_keys(&mut shell, &creds);
+
+    // 壳缺失键位补写（默认壳/结构未知壳）：uid 按 auth_file_uid 四键兼容保证可读，
+    // 凭证字段按 camelCase 惯例（与 token store / 实测 auth 文件形态一致）补齐
+    if let Some(obj) = shell.as_object_mut() {
+        if !hits.uid {
+            obj.insert("uid".into(), json!(creds.uid));
+            let acc = obj.entry("account").or_insert(json!({}));
+            if let Some(a) = acc.as_object_mut() {
+                a.insert("uid".into(), json!(creds.uid));
+                if !creds.nickname.is_empty() {
+                    a.insert("nickname".into(), json!(creds.nickname));
+                }
+                if !creds.edition.is_empty() {
+                    a.insert("editionType".into(), json!(creds.edition));
+                }
+            }
+        }
+        if !hits.access || !hits.refresh || !hits.expires || !hits.refresh_expires {
+            let auth = obj.entry("auth").or_insert(json!({}));
+            if let Some(a) = auth.as_object_mut() {
+                if !hits.access && !creds.access_token.is_empty() {
+                    a.insert("accessToken".into(), json!(creds.access_token));
+                }
+                if !hits.refresh && !creds.refresh_token.is_empty() {
+                    a.insert("refreshToken".into(), json!(creds.refresh_token));
+                }
+                if !hits.expires {
+                    if let Some(ms) = creds.expires_at_ms {
+                        a.insert("expiresAtMs".into(), json!(ms));
+                    }
+                }
+                if !hits.refresh_expires {
+                    if let Some(ms) = creds.refresh_expires_at_ms {
+                        a.insert("refreshExpiresAtMs".into(), json!(ms));
+                    }
+                }
+            }
+        }
+        if !creds.domain.is_empty() {
+            // 壳内已有 domain 时 replace 已改写为新值，此处同值重插无副作用
+            obj.insert("domain".into(), json!(creds.domain));
+        }
+    }
+    // 自检：合成结果必须能被 auth_file_uid 读出身份（四键兼容），否则客户端与
+    // 工具侧校验都无据可依，宁可不合成
+    let uid_written = auth_file_uid_value(&shell);
+    if uid_written.as_deref() != Some(creds.uid.as_str()) {
+        sink.step(
+            "bootstrap",
+            StepStatus::Warn,
+            "合成结果无法解析出目标 uid（壳结构不识别），已放弃合成",
+        );
+        return None;
+    }
+
+    // 落槽：仅 L1 auth 文件 + meta（L2/L3 属体验增强，由 confirm 后的完整备份补齐）；
+    // 序列化失败绝不落空文件（空 auth 文件会被客户端视为损坏，宁可不合成）
+    let body = match serde_json::to_string(&shell) {
+        Ok(s) => s,
+        Err(e) => {
+            sink.step("bootstrap", StepStatus::Warn, &format!("合成快照序列化失败: {e}"));
+            return None;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(dest.join("auth"))
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            std::fs::write(dest.join("auth").join(WB_AUTH_FILE_NAME), &body)
+                .map_err(|e| e.to_string())
+        })
+    {
+        sink.step("bootstrap", StepStatus::Warn, &format!("合成快照写入失败: {e}"));
+        return None;
+    }
+    let meta = json!({
+        "schemaVersion": 1,
+        "layout": "authfile",
+        "app": sess.prof.app_name,
+        "uid": creds.uid,
+        "savedAt": crate::fs_utils::now_ts(),
+        "bootstrap": true,
+    });
+    if let Err(e) =
+        std::fs::write(dest.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default())
+    {
+        // meta 缺失不阻塞合成结果：confirm 期望 uid 回退 slot 名，后续完整备份会重写
+        sink.step("bootstrap", StepStatus::Warn, &format!("meta.json 写入失败: {e}"));
+    }
+    sink.step(
+        "bootstrap",
+        StepStatus::Ok,
+        &format!("已用凭证副本合成账号 {slot} 的最小登录态快照（仅 auth 文件）"),
+    );
+    Some(creds.uid.clone())
 }
 
 /// 切换确认结果（PS 返回 'ok'/'timeout'）
@@ -766,6 +1026,110 @@ mod tests {
             .join("user-100")
             .join("kv")
             .exists());
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    // ── synthesize_auth_snapshot（issue #78 方案 A）────────────────────────────
+
+    fn test_creds() -> Creds {
+        Creds {
+            uid: "new-uid".into(),
+            access_token: "new-a".into(),
+            refresh_token: "new-r".into(),
+            expires_at_ms: Some(1_760_000_000_000),
+            refresh_expires_at_ms: Some(1_790_000_000_000),
+            nickname: "测试昵称".into(),
+            edition: "pro".into(),
+            domain: "example.com".into(),
+        }
+    }
+
+    /// live auth 文件存在 → 作壳模板，身份键全替换（递归、大小写不敏感、值形态保持），
+    /// 客户端私有字段不碰，meta 带 bootstrap 标记
+    #[test]
+    fn 合成快照_壳模板身份键全替换() {
+        let _guard = test_io_lock();
+        let sess = session(TargetApp::WorkBuddy, "synth");
+        let sink = QuietSink;
+        std::fs::create_dir_all(&sess.auth_dir).unwrap();
+        std::fs::write(
+            &sess.auth_file,
+            r#"{"account":{"uid":"old","nickname":"old-n","editionType":"free"},"auth":{"accessToken":"old-a","refreshToken":"old-r","expiresAtMs":111,"refreshExpiresAtMs":222},"domain":"old","vendor":{"marker":{"color":"keep"}}}"#,
+        )
+        .unwrap();
+        let slot = "wb-abc123";
+        assert_eq!(
+            synthesize_auth_snapshot(&sess, slot, &test_creds(), &sink).as_deref(),
+            Some("new-uid")
+        );
+        let f = sess.prof.profiles_dir.join(slot).join("auth").join(WB_AUTH_FILE_NAME);
+        let j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert_eq!(j["account"]["uid"], "new-uid");
+        assert_eq!(j["account"]["nickname"], "测试昵称");
+        assert_eq!(j["account"]["editionType"], "pro");
+        assert_eq!(j["auth"]["accessToken"], "new-a");
+        assert_eq!(j["auth"]["refreshToken"], "new-r");
+        // 数字形态保持（原值是数字 → 仍写毫秒数）
+        assert_eq!(j["auth"]["expiresAtMs"], 1_760_000_000_000_i64);
+        assert_eq!(j["auth"]["refreshExpiresAtMs"], 1_790_000_000_000_i64);
+        assert_eq!(j["domain"], "example.com");
+        // 客户端私有字段不碰（递归替换只命中身份键，非身份键原样保留）
+        assert_eq!(j["vendor"]["marker"]["color"], "keep");
+        // meta 带 bootstrap 标记与目标 uid
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(sess.prof.profiles_dir.join(slot).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["bootstrap"], true);
+        assert_eq!(meta["uid"], "new-uid");
+        assert_eq!(meta["layout"], "authfile");
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 无 live auth 文件（首次使用/从未登录）→ 默认最小壳，合成结果必须能被
+    /// auth_file_uid 四键兼容读出身份，凭证字段按 camelCase 惯例补齐
+    #[test]
+    fn 合成快照_无live文件回退默认壳() {
+        let _guard = test_io_lock();
+        let sess = session(TargetApp::WorkBuddy, "synthdef");
+        let sink = QuietSink;
+        let slot = "wb-def456";
+        assert_eq!(
+            synthesize_auth_snapshot(&sess, slot, &test_creds(), &sink).as_deref(),
+            Some("new-uid")
+        );
+        let f = sess.prof.profiles_dir.join(slot).join("auth").join(WB_AUTH_FILE_NAME);
+        assert_eq!(auth_file_uid(&f).as_deref(), Some("new-uid"));
+        let j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert_eq!(j["uid"], "new-uid");
+        assert_eq!(j["account"]["uid"], "new-uid");
+        assert_eq!(j["auth"]["accessToken"], "new-a");
+        assert_eq!(j["auth"]["refreshToken"], "new-r");
+        assert_eq!(j["auth"]["expiresAtMs"], 1_760_000_000_000_i64);
+        assert_eq!(j["auth"]["refreshExpiresAtMs"], 1_790_000_000_000_i64);
+        assert_eq!(j["domain"], "example.com");
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 槽位已存在 → None 且原内容绝不动（防污染）；凭证缺失（uid/access_token 空）→
+    /// None 且不建槽
+    #[test]
+    fn 合成快照_槽位已存在或凭证缺失拒绝() {
+        let _guard = test_io_lock();
+        let sess = session(TargetApp::WorkBuddy, "synthdeny");
+        let sink = QuietSink;
+        let slot_dir = sess.prof.profiles_dir.join("wb-xyz");
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        std::fs::write(slot_dir.join("keep.txt"), "origin").unwrap();
+        assert!(synthesize_auth_snapshot(&sess, "wb-xyz", &test_creds(), &sink).is_none());
+        assert_eq!(std::fs::read_to_string(slot_dir.join("keep.txt")).unwrap(), "origin");
+        let no_uid = Creds { uid: String::new(), ..test_creds() };
+        assert!(synthesize_auth_snapshot(&sess, "wb-new", &no_uid, &sink).is_none());
+        let no_tok = Creds { access_token: String::new(), ..test_creds() };
+        assert!(synthesize_auth_snapshot(&sess, "wb-new", &no_tok, &sink).is_none());
+        assert!(!sess.prof.profiles_dir.join("wb-new").exists());
         let _ = std::fs::remove_dir_all(&sess.data_dir);
     }
 }
