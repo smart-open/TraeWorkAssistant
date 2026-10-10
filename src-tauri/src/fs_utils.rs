@@ -1,13 +1,37 @@
 //! 文件读写工具：原子替换 + 容错加载 + 时间辅助。
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 读取 JSON，文件不存在或解析失败返回默认值。
+/// P1（审查）：解析前剥 UTF-8 BOM（Windows 记事本编辑过的配置带 EF BB BF 前缀，
+/// 不剥会解析失败→静默回退默认值→后续写回覆盖用户配置）；解析失败经 app_log
+/// 打印文件名与原因（可见化），仍返回默认值不 panic。
 pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
     match fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        Ok(s) if !s.trim().is_empty() => {
+            let s = s.trim_start_matches('\u{feff}');
+            match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(e) => {
+                    app_log_default(&format!(
+                        "JSON 解析失败（已回退默认值）: {}: {e}",
+                        path.display()
+                    ));
+                    T::default()
+                }
+            }
+        }
         _ => T::default(),
+    }
+}
+
+/// 无 data_dir 入参场景的兜底 app_log：fs_utils 多数调用方只持文件路径，按
+/// state.rs 同源规则（%APPDATA%\AIWorkAssistant）定位数据目录；解析失败静默
+/// 放弃（日志失败不影响读取主流程）。
+fn app_log_default(msg: &str) {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        app_log(&PathBuf::from(appdata).join(crate::state::DATA_DIR_NAME), msg);
     }
 }
 

@@ -441,6 +441,11 @@ fn writeback_oauth_device(state: &AppState, uid: &str, device_id: &str) {
         return;
     }
     let store = crate::store::db(&state.data_dir);
+    // C3（审查）：整表 load→save 持 DEVICE_MAP_LOCK（叶子锁）——签到
+    // get_device_for 写回分支并发时防整表覆盖丢条目
+    let _g = crate::store::docs::DEVICE_MAP_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut map = crate::store::docs::device_map_load(&store);
     let entry = map.entry(uid.to_string()).or_insert_with(|| {
         let d = crate::commands::accounts::derive_device(uid);
@@ -728,6 +733,7 @@ pub fn oauth_parse_callback(
         user_name,
         avatar,
         // 会话设备透传给 oauth_login：刷新交换与 device_map 回写共用同一台
+        //（与 AuthCode 交换共用入口选定值，防分钟级交换窗口内两处漂移）
         device_id: Some(fallback_device),
     })
 }

@@ -122,6 +122,11 @@ fn http_post(
 /// （代理捕获/切换流程写入，与新 JWT 的设备指纹校验匹配），缺失时按 uid 确定性派生
 ///（与 python gen=2 同算法）并落盘共享给 device_proxy。
 fn get_device_for(state: &AppState, uid: &str) -> DeviceEntry {
+    // C3（审查）：写回分支整表 load→save 持 DEVICE_MAP_LOCK（叶子锁）——OAuth
+    // 登录回写 writeback_oauth_device 并发时防整表覆盖丢条目（指纹漂移）
+    let _g = crate::store::docs::DEVICE_MAP_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // SQLite 化（P3）：device_map 表
     let map = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
     if let Some(e) = map.get(uid) {
@@ -144,10 +149,8 @@ fn get_device_for(state: &AppState, uid: &str) -> DeviceEntry {
 /// 否则原样透传。未识别（上游改文案）时不影响原始错误可见性。
 pub fn humanize_device_limit(message: &str) -> String {
     let lower = message.to_lowercase();
-    // 审查修复：特征词收窄为设备绑定上限的完整短语「绑定的账户数量已达上限」。
-    // 此前「已达上限」过宽——「使用额度已达上限」等非设备绑定类错误也会被误追加
-    // 引导（对账提示用户重新 OAuth 登录，实则无用）；英文形态由
-    // device limit / bound to this device 兜底
+    // 特征词必须是设备绑定上限消息的完整短语：「已达上限」「账户数量」单独出现
+    // 是「使用额度已达上限」等非设备绑定类错误的子串，过宽会误追加重新登录引导
     let hit = message.contains("绑定的账户数量已达上限")
         || lower.contains("device limit")
         || lower.contains("bound to this device");
@@ -312,6 +315,11 @@ fn classify_error(http_status: i32, code: Option<i64>) -> (&'static str, i64) {
 /// 写入/更新账号冷却状态到 account_cooldowns.json（语义对齐 python save_cooldown）。
 /// Server/Client 类错误前 2 次仅计数不冷却（until=0），第 3 次起进入冷却。
 fn save_cooldown(state: &AppState, uid: &str, error_type: &str, cooldown_seconds: i64, reason: &str) {
+    // C4（审查）：整表 load→save 持 ACCOUNT_COOLDOWNS_LOCK（叶子锁）——与手动
+    // 清理命令/解冻回写并发时防整表覆盖丢冷却条目（已冷却账号被重新探测）
+    let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // SQLite 化（P3）：account_cooldowns 表
     let store = crate::store::db(&state.data_dir);
     let mut data = crate::store::docs::account_cooldowns_load(&store);
@@ -804,6 +812,15 @@ mod tests {
         // 英文形态（上游改版兜底）
         let out2 = humanize_device_limit("Account limit reached for this device (device limit)");
         assert!(out2.contains("设备绑定数已达服务端上限"));
+        // 反例：非设备绑定类「已达上限」不命中（特征词过宽会误引导重新 OAuth 登录）
+        assert_eq!(
+            humanize_device_limit("当前套餐使用额度已达上限"),
+            "当前套餐使用额度已达上限"
+        );
+        assert_eq!(
+            humanize_device_limit("该账户数量超出套餐范围"),
+            "该账户数量超出套餐范围"
+        );
         // 未命中 → 原样透传（不影响常规错误可见性）
         assert_eq!(humanize_device_limit("HTTP 502"), "HTTP 502");
         assert_eq!(humanize_device_limit(""), "");

@@ -486,8 +486,9 @@ function ApiLogsTab() {
         setSelected(d[0]);
         void loadDetail(d[0]);
       }
-    } catch {
-      /* ignore */
+    } catch (e) {
+      // F13：失败补 toast，与「确无日志」区分
+      toast('error', `读取日志日期列表失败：${String(e)}`);
     } finally {
       setRefreshing(false);
     }
@@ -505,8 +506,10 @@ function ApiLogsTab() {
     try {
       const c = await withMinDelay(api.apiServer.logsDetail(date));
       setContent(c);
-    } catch {
+    } catch (e) {
+      // F13：失败补 toast，与「确无日志」区分
       setContent(null);
+      toast('error', `读取 ${date} 日志内容失败：${String(e)}`);
     } finally {
       setLoading(false);
     }
@@ -524,8 +527,10 @@ function ApiLogsTab() {
         keyword: kw.trim() || undefined,
       }));
       setContent(c);
-    } catch {
+    } catch (e) {
+      // F13：失败补 toast，与「搜索无结果」区分
       setContent(null);
+      toast('error', `日志搜索失败：${String(e)}`);
     } finally {
       setSearching(false);
     }

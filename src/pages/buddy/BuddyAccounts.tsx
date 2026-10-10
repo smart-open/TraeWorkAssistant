@@ -32,6 +32,7 @@ import { BuddyHelpModal } from './HelpModal';
 import { GroupSelect } from '../accounts/GroupSelect';
 import { GroupsModal } from '../accounts/GroupsModal';
 import { listen } from '@tauri-apps/api/event';
+import { save } from '@tauri-apps/plugin-dialog';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
@@ -628,16 +629,19 @@ export default function BuddyAccounts() {
     setExportBusy(true);
     try {
       const data = await withMinDelay(api.workbuddy.accountsExport(exportWithCreds), 1000);
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `workbuddy_accounts_${new Date().toISOString().slice(0, 10)}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
+      // 原生另存为对话框：用户可选保存位置，defaultPath 给出默认文件名
+      //（对齐 Accounts.tsx 导出；不再走 WebView 伪下载——落盘位置不可控且不弹对话框）
+      const filePath = await save({
+        defaultPath: `workbuddy_accounts_${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!filePath) return;
+      await api.misc.writeTextFile(filePath, JSON.stringify(data, null, 2));
       pushToast(
         'success',
-        exportWithCreds ? '账号池已导出（含凭证，文件等同密码请妥善保管）' : '账号元数据已导出（凭证不导出）',
+        exportWithCreds
+          ? `账号池已导出（含凭证，文件等同密码请妥善保管）：${filePath}`
+          : `账号元数据已导出（凭证不导出）：${filePath}`,
       );
       setExportOpen(false);
     } catch (err) {
@@ -1673,26 +1677,47 @@ export default function BuddyAccounts() {
       </Modal>
 
       {/* 分组管理弹框（复用 Trae GroupsModal，WB 分组走 workbuddy_groups_* 命令） */}
+      {/* F4：四个回调补 try/catch + toast，失败 rethrow 由 Modal 统一捕获防 unhandled rejection */}
       <GroupsModal
         open={groupOpen}
         onClose={() => setGroupOpen(false)}
         groups={wbGroups}
         onCreate={async (name, color) => {
-          await api.workbuddy.groups.create(name, color);
-          reloadGroups();
+          try {
+            await api.workbuddy.groups.create(name, color);
+            reloadGroups();
+          } catch (err) {
+            pushToast('error', `创建分组失败：${String(err)}`);
+            throw err;
+          }
         }}
         onRename={async (id, name) => {
-          await api.workbuddy.groups.update(id, { name });
-          reloadGroups();
+          try {
+            await api.workbuddy.groups.update(id, { name });
+            reloadGroups();
+          } catch (err) {
+            pushToast('error', `重命名分组失败：${String(err)}`);
+            throw err;
+          }
         }}
         onRecolor={async (id, color) => {
-          await api.workbuddy.groups.update(id, { color });
-          reloadGroups();
+          try {
+            await api.workbuddy.groups.update(id, { color });
+            reloadGroups();
+          } catch (err) {
+            pushToast('error', `修改分组颜色失败：${String(err)}`);
+            throw err;
+          }
         }}
         onDelete={async (id) => {
-          await api.workbuddy.groups.remove(id);
-          reloadGroups();
-          await refresh(); // 组内账号回落「未分组」，列表同步
+          try {
+            await api.workbuddy.groups.remove(id);
+            reloadGroups();
+            await refresh(); // 组内账号回落「未分组」，列表同步
+          } catch (err) {
+            pushToast('error', `删除分组失败：${String(err)}`);
+            throw err;
+          }
         }}
       />
 

@@ -58,6 +58,8 @@ export default function ApiKeysManager({
   // 新增 Key 时的资源池选择（issue #25）
   const [newBindPool, setNewBindPool] = useState('');
   const [deleteForKey, setDeleteForKey] = useState<ApiKeyEntry | null>(null);
+  // F8：关闭鉴权二次确认（全局安全开关，误触即放行所有无 Key 请求；重新开启不确认）
+  const [authConfirmOpen, setAuthConfirmOpen] = useState(false);
   // 子 Key 配置候选（三池上游账号；打开弹框时刷新）：
   // poolStatus = Trae 池（invoke pool_status），buddyPoolStatus = Buddy/WB 池，
   // qoderPoolStatus = Qoder 池（fail-open 全量含凭证账号）
@@ -105,10 +107,21 @@ export default function ApiKeysManager({
 
   const toggleAuthDisabled = () => {
     const next = !authDisabled;
+    // F8：关闭鉴权 = 放行所有无 Key 请求的全局安全开关，补确认 Modal；重新开启不确认
+    if (next) {
+      setAuthConfirmOpen(true);
+      return;
+    }
+    void saveKeys(apiKeys, '已开启鉴权：未配置启用 Key 时请求将被拒绝', next);
+  };
+
+  /** F8：确认关闭鉴权（二次确认后实际写盘生效） */
+  const confirmAuthDisable = () => {
+    setAuthConfirmOpen(false);
     void saveKeys(
       apiKeys,
-      next ? '已关闭鉴权：无启用 Key 时任何本机程序均可调用（不推荐）' : '已开启鉴权：未配置启用 Key 时请求将被拒绝',
-      next,
+      '已关闭鉴权：无启用 Key 时任何本机程序均可调用（不推荐）',
+      true,
     );
   };
 
@@ -285,8 +298,8 @@ export default function ApiKeysManager({
 
   // 子弹框开关状态上报（供主弹窗屏蔽 ESC 双关）
   useEffect(() => {
-    onSubModalChange?.(editKey != null || deleteForKey != null);
-  }, [editKey, deleteForKey, onSubModalChange]);
+    onSubModalChange?.(editKey != null || deleteForKey != null || authConfirmOpen);
+  }, [editKey, deleteForKey, authConfirmOpen, onSubModalChange]);
 
   // 今日按 Key 的 token 用量（Keys 表「今日已用」并列展示；日期口径与后端一致 = 本地时区 YYYY-MM-DD）
   const todayKey = new Date().toLocaleDateString('sv-SE');
@@ -734,6 +747,30 @@ export default function ApiKeysManager({
         <div className="text-sm">
           确认删除 Key「{deleteForKey?.name}」？
           <div className="mt-1 text-xs text-slate-400">使用该 Key 的客户端将立即无法访问（401）。</div>
+        </div>
+      </Modal>
+
+      {/* F8：关闭鉴权二次确认弹框（禁 window.confirm，红线） */}
+      <Modal
+        open={authConfirmOpen}
+        onClose={() => setAuthConfirmOpen(false)}
+        title="确认关闭鉴权"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setAuthConfirmOpen(false)}>取消</button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              onClick={confirmAuthDisable}
+              disabled={keysSaving}
+            >
+              我已知晓风险，关闭鉴权
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-2 text-sm">
+          <div>关闭鉴权后，未配置启用 Key 时任何本机程序都无需 Key 即可调用模型网关。</div>
+          <div className="text-xs text-slate-400">仅建议在完全本机、无可信边界顾虑的环境临时使用；用完请及时重新开启。</div>
         </div>
       </Modal>
     </div>

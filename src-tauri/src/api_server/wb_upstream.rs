@@ -441,19 +441,43 @@ pub fn lines_with_first_byte_hedged<T>(
 
 // ==================== T2.6 双源 token 保活（网关 401 路径） ====================
 
-/// token store 进程级写锁（读-改-写分段持锁，网络刷新段不持锁防长阻塞）：
-/// 并发刷新不同账号时防止整份 store 互相覆盖丢更新（与 api_keys::KEYS_LOCK 同策略）
-static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// 忙态哨兵错误：他方进程（GUI/CLI）正在刷新同一账号——区别于真实刷新失败。
+/// 调用方（wb_route 401 自愈）应据此本轮换号且不记 401 致命错误（防瞬时忙态被
+/// classify_error 误判 SessionDead → disabled 踢出轮转）；对方刷新落库后，下轮
+/// 请求经持锁双检/stale 对比直接复用新凭证。
+pub const ERR_PEER_REFRESHING: &str = "他方进程正在刷新该账号，本轮跳过";
 
 /// 网关侧刷新（T2.6）：读 token store → POST refresh → 原子回写工具侧副本。
 /// 与 commands::workbuddy::workbuddy_refresh_token 同一端点/红线；此处面向
 /// API 网关 401 自动续期（无 Tauri State 依赖，仅 data_dir）。
 /// 成功返回新 accessToken；失败返回 Err（调用方按 SwitchKey 换号）。
-pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Result<String, String> {
+///
+/// C1（审查 H-1）：与 tasks 侧共用每账号刷新锁（refresh_lock_for）+ 跨进程锁
+///（cross_refresh_lock，按 data_dir 传参）——网关 401 自愈与 wb-renew/签到/积分
+/// 刷新并发同一账号时串行化，防「后落库者覆盖先落库者」（服务端一次性轮换下
+/// refresh_token 可能一并丢失被迫重登）。
+/// `stale_access`：调用方本次失效的 accessToken，持锁后二次检查——token store
+/// 已有他人刷新落库的新值（≠ stale）则直接复用，不发网络请求。
+/// 锁序：每账号刷新锁 → 跨进程锁 → WB_TOKEN_STORE_LOCK（与 tasks 侧一致）。
+pub fn refresh_access_token(
+    data_dir: &std::path::Path,
+    account_id: &str,
+    stale_access: Option<&str>,
+) -> Result<String, String> {
+    // C1 ①：进程内每账号刷新锁串行化；②跨进程命名互斥体（GUI/CLI 双进程）
+    let lock = wb_common::refresh_lock_for(account_id);
+    let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(_cross) = wb_common::cross_refresh_lock(data_dir, account_id) else {
+        // 他方进程刷新中：返回忙态哨兵错误（调用方换号不禁用），不与真实刷新失败混同
+        return Err(ERR_PEER_REFRESHING.to_string());
+    };
     // SQLite 化（P4）：死引用修复——原读写 data_dir **根**路径的 workbuddy_token_store.json
     // （正牌在 data/ 子目录，此分叉使网关 401 刷新永远读写错位文件），现统一走 store wb_tokens 表
-    let refresh = {
-        let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // C2（审查）：表锁与 tasks 侧统一为 WB_TOKEN_STORE_LOCK（原独立 TOKEN_STORE_LOCK
+    // 废除——两把锁互不相干时同账号读-改-写互相覆盖丢更新）
+    let (store_access, refresh) = {
+        let _guard =
+            wb_common::WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 凭证收敛（P0-1）：secure 回填（DB 占位 + vault 明文内存态）
         let store: serde_json::Value =
             crate::tasks::wb_common::token_store_load_secure(data_dir);
@@ -462,12 +486,25 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
             .and_then(|t| t.get(account_id))
             .cloned()
             .unwrap_or_default();
-        rec.get("refresh_token")
+        let access = rec
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let refresh = rec
+            .get("refresh_token")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .ok_or("该账号无 refreshToken（不可刷新，需重新登录）")?
-            .to_string()
+            .to_string();
+        (access, refresh)
     };
+    // C1 持锁二次检查：他人已刷新落库（store access ≠ 调用方失效凭证）→ 直接复用
+    if let Some(stale) = stale_access {
+        if !store_access.is_empty() && store_access != stale {
+            return Ok(store_access);
+        }
+    }
 
     // 红线：X-Refresh-Token 仅出现在 refresh 端点
     let resp = ureq::AgentBuilder::new()
@@ -517,9 +554,10 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
         .unwrap_or(0);
 
     // 原子回写工具侧副本（F-10 双源谁新用谁：expiresAtMs 更晚者胜出）：
-    // 锁内重读最新 store 再合并写回（网络段已释放锁），并发刷新不丢他账号更新
+    // 锁内重读最新 store 再合并写回（网络段已释放表锁），并发刷新不丢他账号更新
     {
-        let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard =
+            wb_common::WB_TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut r = {
             // 凭证收敛（P0-1）：secure 回填（vault 明文内存态参与 merge）
             let store: serde_json::Value =
@@ -661,7 +699,7 @@ mod tests {
         // 空 store → 无 refreshToken → 明确报错（不静默）
         let dir = std::env::temp_dir().join(format!("wb_up_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let r = refresh_access_token(&dir, "wb-none");
+        let r = refresh_access_token(&dir, "wb-none", None);
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

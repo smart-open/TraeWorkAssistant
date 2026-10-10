@@ -111,6 +111,11 @@ export default function Accounts() {
   // 删除确认（禁 window.confirm，红线）：删除账号 / 删除快照
   const [deleteTarget, setDeleteTarget] = useState<AccountView | null>(null);
   const [deleteSlot, setDeleteSlot] = useState<string | null>(null);
+  // F9：三层防重入 + loading 态（对齐 Buddy 版）——顶部刷新 / 删除确认 / 行内操作
+  //（刷新 JWT、解除冷却）：连点会逐账号重复打上游积分查询或重复触发确认
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [rowOpUid, setRowOpUid] = useState<string | null>(null);
   // 导出凭证确认（审查 P0-2；禁 window.confirm，红线）：Trae 导出恒含明文 JWT / refreshToken
   const [exportConfirming, setExportConfirming] = useState(false);
   // 切换/保存 90s 看门狗（对齐 BuddyAccounts）：switch-done / save-login-done 事件异常缺失
@@ -166,16 +171,23 @@ export default function Accounts() {
     }
   };
 
-  /** 刷新账号 + 套餐身份（先拉套餐缓存，再重建账号视图） */
+  /** 刷新账号 + 套餐身份（先拉套餐缓存，再重建账号视图）。
+   *  F9：防重入——连点会逐账号重复打上游积分查询，易频控 */
   const refreshAccountsAndPay = async () => {
+    if (refreshBusy) return;
+    setRefreshBusy(true);
     try {
-      await api.accounts.refreshPayStatus();
-    } catch {
-      /* 套餐刷新失败不阻断账号刷新 */
+      try {
+        await api.accounts.refreshPayStatus();
+      } catch {
+        /* 套餐刷新失败不阻断账号刷新 */
+      }
+      void refreshAccounts();
+      void refreshGroups();
+      await refreshRemainingCredits();
+    } finally {
+      setRefreshBusy(false);
     }
-    void refreshAccounts();
-    void refreshGroups();
-    void refreshRemainingCredits();
   };
 
   const filtered = useMemo(() => {
@@ -195,20 +207,36 @@ export default function Accounts() {
   };
 
   const confirmDelete = async () => {
-    if (!deleteTarget) return;
+    if (!deleteTarget || deleteBusy) return;
+    // F9：删除确认 1s withMinDelay 窗口可连点二次触发——busy 防重入
+    setDeleteBusy(true);
     try {
       await withMinDelay(deleteAccount(deleteTarget.user_id, true));
     } finally {
+      setDeleteBusy(false);
       setDeleteTarget(null);
     }
   };
 
   const confirmDeleteSlot = async () => {
-    if (!deleteSlot) return;
+    if (!deleteSlot || deleteBusy) return;
+    setDeleteBusy(true);
     try {
       await withMinDelay(profileDelete(deleteSlot));
     } finally {
+      setDeleteBusy(false);
       setDeleteSlot(null);
+    }
+  };
+
+  /** F9：行内操作互斥（刷新 JWT / 解除冷却）——执行期间全表行内按钮禁用 + 当前行 spinner */
+  const runRowOp = async (uid: string, op: () => Promise<void>) => {
+    if (rowOpUid) return;
+    setRowOpUid(uid);
+    try {
+      await op();
+    } finally {
+      setRowOpUid(null);
     }
   };
 
@@ -329,8 +357,13 @@ export default function Accounts() {
         }
         actions={
           <>
-            <button onClick={() => void refreshAccountsAndPay()} className="btn-outline" title="刷新账号列表、套餐与积分数据">
-              <RefreshCw size={15} /> 刷新
+            <button
+              onClick={() => void refreshAccountsAndPay()}
+              disabled={refreshBusy}
+              className={refreshBusy ? 'btn-outline cursor-not-allowed opacity-60' : 'btn-outline'}
+              title="刷新账号列表、套餐与积分数据"
+            >
+              {refreshBusy ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} 刷新
             </button>
             <button onClick={() => setOAuthOpen(true)} className="btn-outline" title="通过 OAuth 授权登录添加账号">
               <Globe size={15} /> OAuth 登录
@@ -546,20 +579,22 @@ export default function Accounts() {
                         )}
                         {a.has_refresh_token && (
                           <button
-                            title="刷新 JWT"
-                            onClick={() => void refreshJwt(a.user_id)}
-                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                            title={rowOpUid ? '行内操作进行中' : '刷新 JWT'}
+                            onClick={() => void runRowOp(a.user_id, () => refreshJwt(a.user_id))}
+                            disabled={rowOpUid != null}
+                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10 disabled:cursor-not-allowed disabled:opacity-40"
                           >
-                            <Zap size={14} />
+                            {rowOpUid === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
                           </button>
                         )}
                         {a.cooldown_type && (
                           <button
-                            title="解除冷却"
-                            onClick={() => void cooldownClear(a.user_id)}
-                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                            title={rowOpUid ? '行内操作进行中' : '解除冷却'}
+                            onClick={() => void runRowOp(a.user_id, () => cooldownClear(a.user_id))}
+                            disabled={rowOpUid != null}
+                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10 disabled:cursor-not-allowed disabled:opacity-40"
                           >
-                            <Snowflake size={14} />
+                            {rowOpUid === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Snowflake size={14} />}
                           </button>
                         )}
                         <button
@@ -701,11 +736,13 @@ export default function Accounts() {
       />
       <DeleteAccountConfirmModal
         target={deleteTarget}
+        busy={deleteBusy}
         onClose={() => setDeleteTarget(null)}
         onConfirm={() => void confirmDelete()}
       />
       <DeleteSlotConfirmModal
         slot={deleteSlot}
+        busy={deleteBusy}
         onClose={() => setDeleteSlot(null)}
         onConfirm={() => void confirmDeleteSlot()}
       />

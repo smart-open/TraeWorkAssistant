@@ -132,7 +132,11 @@ export default function DoubaoSettings() {
       pushToast('warn', '端点需以 http(s):// 开头');
       return;
     }
-    await saveSettings({ doubao_renew_url: v || null });
+    try {
+      await saveSettings({ doubao_renew_url: v || null });
+    } catch {
+      return; // store.saveSettings 失败时已 pushToast 错误详情，此处仅阻断成功提示
+    }
     pushToast('success', v ? '保活端点已保存' : '已恢复默认端点（info/v2 轻量探活）');
   };
 
@@ -142,7 +146,11 @@ export default function DoubaoSettings() {
       pushToast('warn', '接口地址需以 http(s):// 开头');
       return;
     }
-    await saveSettings({ doubao_quota_url: v || null });
+    try {
+      await saveSettings({ doubao_quota_url: v || null });
+    } catch {
+      return; // store.saveSettings 失败时已 pushToast 错误详情，此处仅阻断成功提示
+    }
     pushToast('success', v ? '会员额度接口已保存' : '已恢复默认会员额度接口');
   };
 

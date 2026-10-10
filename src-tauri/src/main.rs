@@ -446,6 +446,17 @@ fn main() {
                 ),
             );
 
+            // P2（审查）：调度按 chrono::Local 触发，生效时区不可观测——TZ 被
+            // 覆盖/清空时签到时刻会静默偏移，启动日志输出生效时区偏移与本地时间
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "生效时区: 偏移{}，本地时间 {}",
+                    chrono::Local::now().format("%:z"),
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                ),
+            );
+
             // issue #46：配置已声明 maximized:true，此处程序化最大化做兜底——
             // 若创建期最大化未生效或状态失同步，启动时强制重建一次
             if let Some(window) = app.get_webview_window("main") {

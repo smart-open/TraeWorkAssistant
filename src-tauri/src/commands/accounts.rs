@@ -1249,9 +1249,12 @@ pub fn refresh_remaining_credits_impl(
 ) -> Result<usize, String> {
     let accounts = crate::vault::load_accounts(state);
     let mut rc: RemainingCreditsFile = crate::store::docs::remaining_credits_load(&crate::store::db(&state.data_dir));
-    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
+    // C4（审查）：本快照仅作解冻判定只读源（不持锁、不回写）；解冻回写改两阶段，
+    // 落库前锁内重读最新表（见函数尾部），防查询窗口内他方写入的冷却条目被覆盖
+    let cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     let mut ok_count = 0usize;
-    let mut thawed_count = 0usize;
+    // (uid, 快照条目)：回写阶段仅移除与快照一致的条目，防扫描窗口内他方重写的新冷却被误清（见函数尾部）
+    let mut thawed_uids: Vec<(String, crate::models::CooldownEntry)> = Vec::new();
     let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
     for a in &accounts.accounts {
         let uid = a
@@ -1306,16 +1309,15 @@ pub fn refresh_remaining_credits_impl(
                 ok_count += 1;
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
                 if stats.total > 0.0 {
-                    let thaw_type = cd.cooldowns.get(&uid).and_then(|e| {
+                    let thaw = cd.cooldowns.get(&uid).and_then(|e| {
                         if e.error_type != "SessionDead" && !e.error_type.is_empty() {
-                            Some(e.error_type.clone())
+                            Some((e.error_type.clone(), e.clone()))
                         } else {
                             None
                         }
                     });
-                    if let Some(et) = thaw_type {
-                        cd.cooldowns.remove(&uid);
-                        thawed_count += 1;
+                    if let Some((et, snap)) = thaw {
+                        thawed_uids.push((uid.clone(), snap));
                         crate::fs_utils::app_log(
                             &state.data_dir,
                             &format!("自动解冻 [{}]: 类型={} 积分={}", a.name, et, stats.total),
@@ -1343,7 +1345,26 @@ pub fn refresh_remaining_credits_impl(
     // 记录每日积分快照（total / earned / consumed）
     record_daily_snapshot(state, &rc, &pack_earned_daily);
 
-    if thawed_count > 0 {
+    if !thawed_uids.is_empty() {
+        // C4（审查）：解冻回写两阶段第二段——锁内重读最新表、仅移除本次解冻的
+        // uid（查询流程不持锁；他方窗口期写入的其他条目原样保留）
+        let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut cd = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
+        for (uid, snap) in &thawed_uids {
+            // 竞态防护：扫描窗口内调度签到/手动操作重写的新冷却（until/计数等已变化）
+            // 不得误清——仅移除与快照完全一致的条目；条目已消失（他方已清）则跳过
+            let unchanged_since_snap = cd.cooldowns.get(uid).map_or(true, |e| {
+                e.error_type == snap.error_type
+                    && e.until == snap.until
+                    && e.reason == snap.reason
+                    && e.error_count == snap.error_count
+            });
+            if unchanged_since_snap {
+                cd.cooldowns.remove(uid);
+            }
+        }
         cd.updated_at = Some(fs_utils::now_iso());
         crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
     }
@@ -1468,6 +1489,11 @@ pub fn credits_daily_list(state: State<AppState>) -> Vec<CreditsDailySnapshot> {
 /// 手动清除指定账号的冷却状态
 #[tauri::command]
 pub fn cooldown_clear(state: State<AppState>, user_id: String) -> Result<(), String> {
+    // C8（审查）：写库前持 ACCOUNT_COOLDOWNS_LOCK（叶子锁），与签到写方
+    //（save_cooldown）互斥，防整表读改写互相覆盖
+    let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
     if cd.cooldowns.remove(&user_id).is_some() {
         cd.updated_at = Some(fs_utils::now_iso());
@@ -1483,13 +1509,21 @@ pub fn cooldown_clear_all(
     state: State<AppState>,
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
 ) -> Result<usize, String> {
-    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
-    let file_count = cd.cooldowns.len();
-    if file_count > 0 {
-        cd.cooldowns.clear();
-        cd.updated_at = Some(fs_utils::now_iso());
-        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
-    }
+    // C8（审查）：文件部分持 ACCOUNT_COOLDOWNS_LOCK（叶子锁）写库；内存池清理
+    //（clear_cooldowns 内部持池锁）在锁外执行——叶子锁不得嵌套其他锁
+    let file_count = {
+        let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
+        let n = cd.cooldowns.len();
+        if n > 0 {
+            cd.cooldowns.clear();
+            cd.updated_at = Some(fs_utils::now_iso());
+            crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
+        }
+        n
+    };
 
     // 同时清除运行中 API 池的内存冷却状态
     let mem_count = {
@@ -1631,10 +1665,12 @@ fn try_recover_from_local(state: &AppState, user_id: &str) -> bool {
 /// refresh_jwt 核心逻辑（&AppState，供命令与测试探针共用）
 pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<String, String> {
     // 并发安全：持锁防止多个并发请求同时 ExchangeToken
+    // C7（审查）：into_inner 恢复毒化锁——持锁线程 panic 一次后其余线程仍可继续
+    //（map_err 拒绝式处理会让所有账号 JWT 刷新永久失败直到重启）
     let _lock = state
         .jwt_refresh_lock
         .lock()
-        .map_err(|_| "JWT 刷新锁获取失败")?;
+        .unwrap_or_else(|e| e.into_inner());
 
     // D 短冷却：失败后 60s 内拒绝重试（持锁检查，防并发穿透）
     {
@@ -1829,10 +1865,21 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
     // 自动解冻（含 SessionDead）：新 JWT 刚从 ExchangeToken 换发、必然有效，
     // 此前签到 401 打上的 SessionDead 永久冷却若不清除，调度会永远跳过该账号
     //（自动解冻逻辑明确排除 SessionDead，见 refresh_remaining_credits）
-    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
-    if let Some(entry) = cd.cooldowns.remove(user_id) {
-        cd.updated_at = Some(fs_utils::now_iso());
-        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
+    // C4/C8（审查）：冷却整表读改写持 ACCOUNT_COOLDOWNS_LOCK（叶子锁），与
+    // 签到写方/手动清理命令互斥；app_log 在锁外执行
+    let thaw_entry = {
+        let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
+        let removed = cd.cooldowns.remove(user_id);
+        if removed.is_some() {
+            cd.updated_at = Some(fs_utils::now_iso());
+            crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
+        }
+        removed
+    };
+    if let Some(entry) = thaw_entry {
         fs_utils::app_log(
             &state.data_dir,
             &format!("JWT 刷新成功自动解冻 [{}]（原冷却类型={}）", log_name, entry.error_type),

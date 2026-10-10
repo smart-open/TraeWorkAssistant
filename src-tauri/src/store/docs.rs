@@ -712,6 +712,12 @@ pub fn accounts_save_raw(s: &Store, root: &Value) -> Result<(), String> {
 
 // ── 设备映射（device_map.json → device_map 表）───────────────────────────────
 
+/// device_map 表级读改写互斥（审查 C3）：签到 get_device_for 写回分支与 OAuth
+/// 登录回写 writeback_oauth_device 并发时，整表 load→save 互相覆盖丢条目
+///（指纹漂移）。两个运行期写点持锁覆盖 load→save 全程；只读点不持锁。
+/// 叶子锁：持锁期间不得再获取其他锁。
+pub static DEVICE_MAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn device_map_load(s: &Store) -> DeviceMap {
     s.rows_all("device_map")
         .unwrap_or_default()
@@ -890,6 +896,12 @@ pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(),
 }
 
 // ── 冷却状态（account_cooldowns.json → account_cooldowns 表）─────────────────
+
+/// account_cooldowns 表级读改写互斥（审查 C4）：调度签到 save_cooldown 与手动
+/// 清理命令（cooldown_clear 等）/解冻回写并发时，整表 load→save 互相覆盖丢冷却
+/// 条目（已冷却账号被重新探测、对上游连打）。全部读改写点持锁；只读点不持锁。
+/// 叶子锁：持锁期间不得再获取其他锁。
+pub static ACCOUNT_COOLDOWNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn account_cooldowns_load(s: &Store) -> AccountCooldownsFile {
     let cooldowns = s

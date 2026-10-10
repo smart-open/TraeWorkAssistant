@@ -27,8 +27,12 @@ export function GroupsModal({
   const [name, setName] = useState('');
   const [color, setColor] = useState(PRESET_COLORS[0]);
   const [editingNames, setEditingNames] = useState<Record<string, string>>({});
+  // F14：新建 pending（防连点创建重复分组）
+  const [createBusy, setCreateBusy] = useState(false);
   // 删除分组确认弹框（禁 window.confirm，红线）
   const [deleteGroupTarget, setDeleteGroupTarget] = useState<GroupView | null>(null);
+  // F14：删除 pending（防连点重复删除）
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   useEffect(() => {
     setEditingNames((prev) => {
@@ -51,10 +55,20 @@ export function GroupsModal({
           <button onClick={onClose} className="btn-ghost">关闭</button>
           <button
             onClick={async () => {
-              if (!name.trim()) return;
-              await onCreate(name.trim(), color);
-              setName('');
+              const trimmed = name.trim();
+              if (!trimmed || createBusy) return;
+              // F14：统一捕获调用方 rethrow——失败保留输入便于重试，不产生 unhandled rejection
+              setCreateBusy(true);
+              try {
+                await onCreate(trimmed, color);
+                setName('');
+              } catch {
+                /* 失败提示由调用方 toast 发出 */
+              } finally {
+                setCreateBusy(false);
+              }
             }}
+            disabled={createBusy}
             className="btn-primary"
           >
             <Plus size={14} /> 新建
@@ -96,20 +110,23 @@ export function GroupsModal({
               onBlur={(e) => {
                 const val = e.target.value.trim();
                 if (val && val !== g.name) {
-                  void onRename(g.id, val).then(() => {
-                    setEditingNames((prev) => {
-                      const next = { ...prev };
-                      delete next[g.id];
-                      return next;
-                    });
-                  });
+                  // F14：捕获 rethrow 防 unhandled rejection；失败时 .then 不执行，编辑态保留便于重试
+                  onRename(g.id, val)
+                    .then(() => {
+                      setEditingNames((prev) => {
+                        const next = { ...prev };
+                        delete next[g.id];
+                        return next;
+                      });
+                    })
+                    .catch(() => {});
                 }
               }}
               className="input !py-1 flex-1 !text-xs"
             />
             <select
               value={g.color}
-              onChange={(e) => void onRecolor(g.id, e.target.value)}
+              onChange={(e) => onRecolor(g.id, e.target.value).catch(() => {})}
               className="input !py-1 !text-xs w-24"
             >
               {PRESET_COLORS.map((c) => (
@@ -131,20 +148,32 @@ export function GroupsModal({
       {/* 删除分组确认弹框（禁 window.confirm，红线） */}
       <Modal
         open={deleteGroupTarget != null}
-        onClose={() => setDeleteGroupTarget(null)}
+        onClose={() => {
+          if (!deleteBusy) setDeleteGroupTarget(null);
+        }}
         title="删除分组"
         footer={
           <>
-            <button className="btn-outline" onClick={() => setDeleteGroupTarget(null)}>取消</button>
+            <button className="btn-outline" onClick={() => setDeleteGroupTarget(null)} disabled={deleteBusy}>取消</button>
             <button
               className="btn-primary !bg-rose-600 hover:!bg-rose-500"
               onClick={async () => {
                 const target = deleteGroupTarget;
-                setDeleteGroupTarget(null);
-                if (target) await onDelete(target.id);
+                if (!target || deleteBusy) return;
+                setDeleteBusy(true);
+                try {
+                  // F14：统一捕获调用方 rethrow，防 unhandled rejection（失败提示由调用方 toast 发出）
+                  await onDelete(target.id);
+                  setDeleteGroupTarget(null);
+                } catch {
+                  /* 保留确认弹框便于重试 */
+                } finally {
+                  setDeleteBusy(false);
+                }
               }}
+              disabled={deleteBusy}
             >
-              确认删除
+              {deleteBusy ? '删除中…' : '确认删除'}
             </button>
           </>
         }

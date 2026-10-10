@@ -280,23 +280,21 @@ pub(crate) fn refresh_lock_remove(acct_id: &str) {
 /// 插件）双进程并存，进程内锁无法约束跨进程并发。命名互斥体按账号隔离
 ///（ns="wb"，scope=账号 id，锁名含 data_dir 短哈希）；抢锁失败幂等跳过本次刷新
 ///（沿用现有凭证，仅少一次自愈机会，无损失）。
-fn cross_refresh_lock(
-    state: &AppState,
+/// C1（审查）：改按 data_dir 传参——网关侧 wb_upstream::refresh_access_token
+/// 无 AppState，与 tasks 侧复用同一把锁；pub(crate) 供 api_server 模块调用。
+pub(crate) fn cross_refresh_lock(
+    data_dir: &std::path::Path,
     acct_id: &str,
 ) -> Option<crate::tasks::qoder_common::CrossProcLock> {
-    let (guard, fail) = crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
-        &state.data_dir,
-        "wb",
-        acct_id,
-        5000,
-    );
+    let (guard, fail) =
+        crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(data_dir, "wb", acct_id, 5000);
     if guard.is_none() {
         let reason = fail
             .as_ref()
             .map(|f| f.describe())
             .unwrap_or_default();
         fs_utils::app_log(
-            &state.data_dir,
+            data_dir,
             &format!("[wb-fresh] 跨进程刷新锁未获取(id={acct_id}, {reason})，本轮沿用现有凭证"),
         );
     }
@@ -738,7 +736,7 @@ pub fn ensure_fresh(
     // H-1 ①：进程内每账号锁串行化；②跨进程命名互斥体（GUI/CLI 双进程）
     let lock = refresh_lock_for(acct_id);
     let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(_cross) = cross_refresh_lock(state, acct_id) else {
+    let Some(_cross) = cross_refresh_lock(&state.data_dir, acct_id) else {
         // 他方进程刷新中：幂等跳过（沿用现有凭证，不误标 needs_relogin）
         return (creds, false, "refresh_failed");
     };
@@ -777,7 +775,7 @@ pub fn refresh_token_once_locked(
 ) -> (Option<Creds>, Option<RefreshFail>) {
     let lock = refresh_lock_for(acct_id);
     let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(_cross) = cross_refresh_lock(state, acct_id) else {
+    let Some(_cross) = cross_refresh_lock(&state.data_dir, acct_id) else {
         return (None, Some(RefreshFail::Busy));
     };
     // 二次检查：store 权威源中该账号已换新 token（他人刷新落库）→ 直接复用。

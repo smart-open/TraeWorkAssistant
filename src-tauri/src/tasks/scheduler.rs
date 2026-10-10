@@ -662,7 +662,11 @@ fn write_entry(st: &AppState, key: &str, entry: Value) {
         let tasks = obj.entry("tasks".to_string()).or_insert_with(|| json!({}));
         tasks[key] = entry;
     }
-    let _ = crate::store::db(&st.data_dir).kv_set("scheduler_state", &root);
+    // C6（审查）：落库失败补日志不静默——last_run_date 丢失 → 当日任务重复执行；
+    // last_fail_ts 丢失 → 失败冷却失效引发重试风暴。保持不 panic
+    if let Err(e) = crate::store::db(&st.data_dir).kv_set("scheduler_state", &root) {
+        fs_utils::app_log(&st.data_dir, &format!("[调度器] 状态落库失败({key}): {e}"));
+    }
 }
 
 /// 结果 JSON → 单行摘要（签到轮次取 ok/already/failed 计数，其余截断展示）

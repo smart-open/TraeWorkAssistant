@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { listen } from '@tauri-apps/api/event';
+import { save } from '@tauri-apps/plugin-dialog';
 import {
   AppWindow,
   Archive,
@@ -594,22 +595,26 @@ export default function QoderAccounts() {
     setExportBusy(true);
     try {
       const data = await api.qoder.accountsExport(exportWithCreds, exportWithCreds ? exportPwd || undefined : undefined);
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
       // 本地日期命名（对齐 QoderCheckin/Dashboard：toISOString 为 UTC，跨日会错一天）
       const now = new Date();
       const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-      a.href = url;
-      a.download = `qoder_accounts_${localDate}.json`;
-      a.click();
-      // 延迟回收 blob URL：click() 后立即 revoke 可能中断部分浏览器对 blob 的异步读取
-      setTimeout(() => URL.revokeObjectURL(url), 1_000);
+      // 原生另存为对话框：用户可选保存位置（对齐 Accounts.tsx 导出，替代 WebView 伪下载）
+      const filePath = await save({
+        defaultPath: `qoder_accounts_${localDate}.json`,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!filePath) {
+        // 取消保存对话框视同关闭弹框：清空密码残留，避免下次导出被预填（审查 F2 同语义）
+        setExportPwd('');
+        setExportPwd2('');
+        return;
+      }
+      await api.misc.writeTextFile(filePath, JSON.stringify(data, null, 2));
       pushToast(
         'success',
         exportWithCreds
-          ? '账号池已导出（含凭证，已用导出密码加密；导入时需输入同一密码）'
-          : '账号元数据已导出（凭证不导出）',
+          ? `账号池已导出（含凭证，已用导出密码加密；导入时需输入同一密码）：${filePath}`
+          : `账号元数据已导出（凭证不导出）：${filePath}`,
       );
       setExportOpen(false);
       setExportPwd('');

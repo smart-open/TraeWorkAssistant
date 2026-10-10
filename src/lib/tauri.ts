@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   AccountView,
@@ -91,6 +91,65 @@ import type {
   QoderResetResult,
   QoderSettings,
 } from '../types';
+
+// ---- F1/F11：invoke 统一超时 + 错误源头翻译 ----
+// Tauri IPC 的 Promise 无法中止（invoke 无 AbortSignal 支持），用 Promise.race 竞速超时：
+// 超时后外层 Promise 以可读文案 reject（底层调用若最终完成其结果被丢弃），避免按钮 loading 永久转圈。
+const INVOKE_TIMEOUT_MS = 120_000;
+/** 长耗时命令覆盖表：null = 不设超时（后端有意不限时），数值 = 放宽后的毫秒上限 */
+const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
+  // 大文件安装包下载：后端注释明示「大文件慢速下载不能被整体超时掐断」，前端同步豁免
+  update_download: null,
+  // 多账号串行网络操作：耗时随账号数线性增长，放宽到 10 分钟
+  doubao_renew_run: 600_000,
+  workbuddy_env_reset: 600_000,
+  workbuddy_cli_rotate_run: 600_000,
+  workbuddy_usage_official_all: 600_000,
+  workbuddy_credits_fetch: 600_000,
+  // 全量账号积分刷新：逐账号串行网络请求（单请求内部超时即 120s），耗时随账号数增长，放宽到 10 分钟
+  refresh_remaining_credits: 600_000,
+  // 证书安装：PowerShell RunAs 触发 UAC，等待用户点击无时长上限（取消/失败会立即返回错误）
+  cert_install: null,
+};
+
+/** F11：底层错误在源头翻译为可读文案——剥冗余 "Error: " 前缀、网络类错误转人话；
+ *  全库 catch 均 String(err) 展示，此处统一处理后各处文案自动受益 */
+function translateInvokeError(err: unknown, cmd: string): string {
+  let msg = typeof err === 'string' ? err : err instanceof Error ? err.message : String(err);
+  msg = msg.replace(/^Error:\s*/, '');
+  if (/failed to fetch|networkerror|network error|load failed|err_connection/i.test(msg)) {
+    return '网络连接失败，请检查网络后重试';
+  }
+  if (!msg.trim()) return `命令 ${cmd} 调用失败（无错误详情）`;
+  return msg;
+}
+
+/** 全库唯一 invoke 入口：api.* 各命令均经此发出（titlebar 窗口控制等非后端命令除外） */
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const timeout = Object.prototype.hasOwnProperty.call(INVOKE_TIMEOUT_OVERRIDES, cmd)
+    ? INVOKE_TIMEOUT_OVERRIDES[cmd]
+    : INVOKE_TIMEOUT_MS;
+  try {
+    if (timeout === null) return await tauriInvoke<T>(cmd, args);
+    // 竞速超时；以字符串 reject 保证 String(err) 无 "Error: " 前缀
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        tauriInvoke<T>(cmd, args),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(`命令 ${cmd} 超过 ${Math.round(timeout / 1000)} 秒未响应，已中止等待；请重试，若持续失败请重启应用`),
+            timeout,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  } catch (err) {
+    throw translateInvokeError(err, cmd);
+  }
+}
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
 export const api = {

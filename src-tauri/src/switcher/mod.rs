@@ -145,9 +145,10 @@ pub struct Session {
     /// 无任何快照）。confirm_switch 确认成功后据此升级完整快照；每次 run_action
     /// 独立会话，无需跨动作传递
     pub bootstrap_done: bool,
-    /// 审查修复：合成快照落槽 meta.json 写入的真实 uid（槽名 wb-<hash> 只是池 id，
-    /// ≠ 真实 uid）。meta.json 写入失败时 confirm_switch 据此回退期望 uid，
-    /// 避免三信号因期望 uid 错误恒不命中（每次切换 30s 空转且快照升级永不触发）
+    /// 合成快照的真实 uid（会话暂存，与落槽 meta.json 的 uid 同源）：meta.json
+    /// 写失败不阻塞合成结果（仅告警），confirm_switch 期望 uid 回退链
+    /// meta.json → 此值 → 槽名——槽名 wb-<hash> 是池 id ≠ uuid 体系真实 uid，
+    /// 无此暂存时 meta 写失败场景三信号确认恒不命中、每次切换空转 30 秒
     pub bootstrap_uid: Option<String>,
 }
 
@@ -775,8 +776,9 @@ fn post_restore_missing(sess: &Session) -> Vec<String> {
 /// 接受并确认，再由 switch_flow 在 confirm Ok 后备份完整登录态升级快照。
 /// 仅 WorkBuddy：共享 auth 文件是 WorkBuddy 登录驱动源（F2-4）；CodeBuddy 登录
 /// 真源在客户端加密 vscdb 内，工具侧无法离线合成。
-/// 返回 Some(真实 uid) = 合成成功（与 synthesize_auth_snapshot 落槽 meta.json 的
-/// uid 同源，供会话暂存给 confirm_switch 做期望 uid 回退）；None = 无法合成
+/// 返回 Some(真实 uid) = 合成成功（预检放行，继续切换）；None = 无法合成（调用方
+/// fatal）。uid 与落槽 meta.json 的 uid 同源，暂存会话供 confirm_switch 在 meta
+/// 写失败时回退（槽名是池 id ≠ 真实 uid，不能作确认依据）。
 fn bootstrap_snapshot_from_token_store(
     sess: &Session,
     uid: &str,
@@ -844,9 +846,8 @@ fn bootstrap_snapshot_from_token_store(
         return None;
     };
     let mut creds = creds;
-    creds.uid = real_uid.clone();
-    // synthesize 成功返回 Some(creds.uid)（即真实 uid），透传给调用方暂存会话
-    authfile::synthesize_auth_snapshot(sess, uid, &creds, sink).map(|_| real_uid)
+    creds.uid = real_uid;
+    authfile::synthesize_auth_snapshot(sess, uid, &creds, sink)
 }
 
 /// Switch 主流程（PS 1415-1477 逐段对译，含防误覆盖守卫与恢复后校验回滚）
@@ -863,12 +864,12 @@ fn switch_flow(
         // issue #78 方案 A：authfile 布局先尝试凭证副本合成最小快照（冷启动死锁
         // 解除），合成成功继续正常切换；失败走改进 fatal 文案（明示守卫闭环与
         // 手动出路，替换原「请先登录并保存」对冷启动场景不可执行的对仗文案）
-        let bootstrapped = if sess.prof.layout == Layout::Authfile {
+        let bootstrap_uid = if sess.prof.layout == Layout::Authfile {
             bootstrap_snapshot_from_token_store(sess, uid, sink)
         } else {
             None
         };
-        let Some(bootstrap_uid) = bootstrapped else {
+        let Some(bootstrap_uid) = bootstrap_uid else {
             let msg = match (sess.prof.layout, sess.prof.app_name) {
                 (Layout::Authfile, "CodeBuddy") => format!(
                     "目标账号 {uid} 无快照，且 CodeBuddy 登录真源在客户端加密数据库（vscdb），\
@@ -1032,9 +1033,9 @@ fn switch_flow(
                 // 快照）。登录身份已确认切到目标账号，客户端此刻落盘的登录态已是
                 // 完整现场——立即备份升级快照（rotate_bak 顺带把合成槽轮转为 .bak
                 // 留作回退）。best-effort：失败仅告警，下次「保存当前登录态」可补。
-                // 审查修复：bootstrap_done 仅当次会话——合成后切换未走完（进程退
-                // 出/重试）的场景，槽位 meta.json 的 bootstrap 标记在下次会话成功
-                // 确认时仍可触发升级（backup_authfile 重写 meta 后标记自然清除）
+                // 升级条件除当次会话的 bootstrap_done 外，还查槽位持久化 bootstrap
+                // 标记（slot_marked_bootstrap）：bootstrap_done 仅当次会话有效，
+                // 合成后切换未走完（进程退出/失败重试）的跨会话重试也要能升级
                 if sess.bootstrap_done || authfile::slot_marked_bootstrap(sess, uid) {
                     sess.bootstrap_done = false;
                     match backup_current(sess, uid, sink) {
@@ -1404,7 +1405,7 @@ mod tests {
         )
         .unwrap();
         let sink = MemSink::new();
-        // 返回值 = 合成真实 uid（池条目权威），供 confirm_switch 期望 uid 回退
+        // 返回值 = 池条目权威真实 uid（透传自 synthesize_auth_snapshot，与 meta 同源）
         let boot_uid = bootstrap_snapshot_from_token_store(&sess, BOOT_SLOT, &sink);
         assert_eq!(boot_uid.as_deref(), Some("pool-uuid-9"));
         let slot = sess.prof.profiles_dir.join(BOOT_SLOT);
@@ -1439,6 +1440,7 @@ mod tests {
             &serde_json::from_str::<serde_json::Value>(BOOT_REC).unwrap(),
         )
         .unwrap();
+        // 池缺失 → 回退凭证记录内的 uid（兜底链路），返回值同为该兜底真实 uid
         let boot_uid = bootstrap_snapshot_from_token_store(&sess, BOOT_SLOT, &MemSink::new());
         assert_eq!(boot_uid.as_deref(), Some("real-uuid-1"));
         let meta: serde_json::Value = serde_json::from_str(

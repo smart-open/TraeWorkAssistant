@@ -82,6 +82,9 @@ interface AppState {
   accounts: AccountView[];
   groups: GroupView[];
   settings: Settings | null;
+  /** F3：settings_get 是否成功加载过。false 时 store.settings 只是默认值兜底，
+   *  saveSettings 拒绝写入，防止用默认值整表覆盖服务端真实配置 */
+  settingsLoaded: boolean;
   logs: LogLine[];
   creditsHistory: CreditRecord[];
   creditsDaily: CreditsDailySnapshot[];
@@ -265,6 +268,34 @@ let logsPollInflight = false;
 let logsReqSeq = 0;
 // 同因 toast 限频：读取持续失败期间每 60s 最多弹一次（防 toast 风暴）；手动调用直通
 let lastLogsErrToastAt = 0;
+// F5：签到看门狗定时器（模块级，store 单例持有）
+let checkinWatchdog: ReturnType<typeof setTimeout> | null = null;
+/** F5：签到看门狗时长——覆盖多账号 + 2 轮失败重试的最坏耗时 */
+const CHECKIN_WATCHDOG_MS = 15 * 60 * 1000;
+
+function disarmCheckinWatchdog() {
+  if (checkinWatchdog) {
+    clearTimeout(checkinWatchdog);
+    checkinWatchdog = null;
+  }
+}
+
+/** F5：武装/续期签到看门狗。事件通道丢帧时 done 事件可能永不到达，
+ *  checkin.active 只能由 done/exit 复位 → 「签到进行中」永久卡死、开始按钮永久禁用。
+ *  任一签到事件到达即续期；超时自动解除 active 并提示（迟到的事件仍会正常归约展示）。 */
+function armCheckinWatchdog() {
+  disarmCheckinWatchdog();
+  checkinWatchdog = setTimeout(() => {
+    checkinWatchdog = null;
+    const s = useAppStore.getState();
+    if (!s.checkin.active) return;
+    s.pushToast(
+      'warn',
+      '签到超过 15 分钟未收到任何进度事件（事件通道可能异常），已自动解除「签到进行中」状态；结果请以账号列表与签到记录为准',
+    );
+    useAppStore.setState((st) => ({ checkin: { ...st.checkin, active: false, retry: null } }));
+  }, CHECKIN_WATCHDOG_MS);
+}
 
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
@@ -280,6 +311,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   accounts: [],
   groups: [],
   settings: null,
+  settingsLoaded: false,
   logs: [],
   creditsHistory: [],
   creditsDaily: [],
@@ -449,6 +481,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   setShowApiManager: (v) => set({ showApiManager: v }),
 
   applyCheckinEvent: (e) => {
+    // F5：done 解除看门狗，其余事件（start/retry/account）到达即续期
+    if (e.type === 'done') disarmCheckinWatchdog();
+    else armCheckinWatchdog();
     set((s) => {
       if (e.type === 'start') {
         // Rust 侧 start 带 scope 内全集清单（候选 pending / 跳过带原因 / 重试轮沿用上轮状态），
@@ -702,9 +737,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       }
       settings.app_icons = cleanIcons;
-      set({ settings });
+      set({ settings, settingsLoaded: true });
     } catch {
-      set({ settings: defaultSettings() });
+      // F3：读取失败回退默认值仅供 UI 渲染；settingsLoaded 置 false 让 saveSettings
+      // 拒绝写入，防止随后保存把默认值整表覆盖服务端真实配置（数据丢失）
+      set({ settings: defaultSettings(), settingsLoaded: false });
     }
   },
   refreshLogs: async (q, manual) => {
@@ -864,6 +901,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('success', `分组「${name}」已创建`);
     } catch (err) {
       get().pushToast('error', `创建分组失败：${String(err)}`);
+      // F14：rethrow 供 GroupsModal 统一捕获（失败保留输入便于重试，防 unhandled rejection）
+      throw err;
     }
   },
   updateGroup: async (id, patch) => {
@@ -872,6 +911,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       await get().refreshGroups();
     } catch (err) {
       get().pushToast('error', `更新分组失败：${String(err)}`);
+      throw err;
     }
   },
   removeGroup: async (id) => {
@@ -882,6 +922,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('info', '分组已删除');
     } catch (err) {
       get().pushToast('error', `删除分组失败：${String(err)}`);
+      throw err;
     }
   },
   moveAccount: async (userId, groupId) => {
@@ -973,9 +1014,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   startCheckin: async (opts) => {
     // 重置签到状态，避免显示上一次的进度
     set({ checkin: { active: true, total: 0, index: 0, results: [], done: null, retry: null } });
+    // F5：发起即武装看门狗（后续事件到达续期，done 解除）
+    armCheckinWatchdog();
     try {
       await api.checkin.start(opts);
     } catch (err) {
+      disarmCheckinWatchdog();
       set((s) => ({ checkin: { ...s.checkin, active: false } }));
       get().pushToast('error', `发起签到失败：${String(err)}`);
     }
@@ -1016,6 +1060,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   saveSettings: async (patch) => {
+    // F3：settings_get 失败时 store.settings 只是默认值兜底，此时保存会把默认值
+    // 整表写回、覆盖服务端真实配置（数据丢失）——守卫拒绝写入并提示
+    if (!get().settingsLoaded) {
+      const msg = '设置读取失败，为避免用默认值覆盖真实配置已拒绝保存；请重启应用恢复后重试';
+      get().pushToast('error', msg);
+      // 以字符串抛出：调用方 String(err) 展示无 "Error: " 前缀
+      throw msg;
+    }
     const current = get().settings ?? defaultSettings();
     const next = { ...current, ...patch } as Settings;
     set({ settings: next });
@@ -1112,7 +1164,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       const id = ++toastSeq;
       set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }));
-      setTimeout(() => get().dismissToast(id), 4200);
+      // F12：error 级驻留 10s（长错误文案需要阅读时间），其余维持 4.2s
+      setTimeout(() => get().dismissToast(id), kind === 'error' ? 10_000 : 4200);
     }
 
     if (mode === 'system' || mode === 'both') {
