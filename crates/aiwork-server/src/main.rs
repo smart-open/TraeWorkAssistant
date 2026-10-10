@@ -105,6 +105,17 @@ async fn main() {
     println!("{started}");
     fs_utils::app_log(&state.data_dir, &started);
 
+    // 调度触发的时区可观测（审查-兼容 P6）：全部 HH:MM 任务按 chrono::Local 触发，
+    // TZ 被覆盖/清空时签到时刻会静默偏移；启动时输出生效时区与偏移供部署核对
+    let tz_now = chrono::Local::now();
+    let tz_hours = (tz_now.offset().local_minus_utc() as f64) / 3600.0;
+    let tz_info = format!(
+        "调度时区（HH:MM 任务触发依据）: UTC{tz_hours:+.2}（本地 {}）——Docker 部署需 TZ=Asia/Shanghai",
+        tz_now.format("%Y-%m-%d %H:%M:%S"),
+    );
+    println!("{tz_info}");
+    fs_utils::app_log(&state.data_dir, &tz_info);
+
     // 双门禁启动侧（9ba5fd0 移植）：非环回监听时提示 auth_disabled 不生效（运行期
     // 强制在 aiwork-core auth.rs::bearer_auth，此处仅可观测提示）
     if !aiwork_core::api_server::auth::listen_is_loopback() {

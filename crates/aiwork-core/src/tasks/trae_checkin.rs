@@ -122,7 +122,10 @@ fn http_post(
 /// （代理捕获/切换流程写入，与新 JWT 的设备指纹校验匹配），缺失时按 uid 确定性派生
 ///（与 python gen=2 同算法）并落盘共享给 device_proxy。
 fn get_device_for(state: &AppState, uid: &str) -> DeviceEntry {
-    // SQLite 化（P3）：device_map 表
+    // SQLite 化（P3）：device_map 表。
+    // 整表读-改-写互斥（审查 P4/P5）：与 OAuth 登录回写等其他写方共锁，
+    // 防并发整表覆盖丢他账号条目
+    let _dm = crate::store::docs::DEVICE_MAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let map = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
     if let Some(e) = map.get(uid) {
         if !e.device_id.is_empty() {
@@ -309,7 +312,12 @@ fn classify_error(http_status: i32, code: Option<i64>) -> (&'static str, i64) {
 /// 写入/更新账号冷却状态到 account_cooldowns.json（语义对齐 python save_cooldown）。
 /// Server/Client 类错误前 2 次仅计数不冷却（until=0），第 3 次起进入冷却。
 fn save_cooldown(state: &AppState, uid: &str, error_type: &str, cooldown_seconds: i64, reason: &str) {
-    // SQLite 化（P3）：account_cooldowns 表
+    // SQLite 化（P3）：account_cooldowns 表。
+    // 整表读-改-写互斥（审查 P4）：与冷却清理命令等其他写方共锁，
+    // 防并发整表覆盖丢冷却条目（丢条目 = 已冷却账号被重新探测连打上游）
+    let _cd = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let store = crate::store::db(&state.data_dir);
     let mut data = crate::store::docs::account_cooldowns_load(&store);
     if cooldown_seconds == 0 {

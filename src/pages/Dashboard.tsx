@@ -11,7 +11,7 @@ import {
   LabelList,
   Legend,
 } from 'recharts';
-import { RefreshCw, CheckCircle2, Circle, ChevronRight } from 'lucide-react';
+import { RefreshCw, CheckCircle2, Circle, ChevronRight, Loader2 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { StatCard, Badge } from '../components/ui';
 import { useAppStore } from '../store';
@@ -114,18 +114,30 @@ export default function Dashboard() {
     );
   };
 
+  // 刷新防重入（审查 F3.2）：连点重复整套刷新 + 逐账号上游积分查询；
+  // 成功提示移到积分查询完成后，语义更准（此前积分还在后台跑就弹「已刷新」）
+  const [refreshing, setRefreshing] = useState(false);
   const refresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
     toast('info', '刷新中…');
-    const s = useAppStore.getState();
-    await Promise.all([
-      s.refreshAccounts(),
-      s.refreshGroups(),
-      s.refreshCreditsDaily(),
-      loadTrends(),
-    ]);
-    // 刷新剩余可用积分（会再次 refreshAccounts 更新 UI）
-    void api.accounts.refreshRemainingCredits().then(() => s.refreshAccounts()).catch(() => {});
-    toast('success', '已刷新');
+    try {
+      const s = useAppStore.getState();
+      await Promise.all([
+        s.refreshAccounts(),
+        s.refreshGroups(),
+        s.refreshCreditsDaily(),
+        loadTrends(),
+      ]);
+      // 刷新剩余可用积分（会再次 refreshAccounts 更新 UI）
+      await api.accounts
+        .refreshRemainingCredits()
+        .then(() => s.refreshAccounts())
+        .catch(() => {});
+      toast('success', '已刷新');
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   // 告警提醒：JWT 24h 内将过期 + 积分 7 日内将过期（含已过期）的账号数
@@ -176,8 +188,8 @@ export default function Dashboard() {
         title="Trae · 概览"
         desc="多账号签到与账号管理总览 · 告警提醒 · 签到趋势与积分榜"
         actions={
-          <button onClick={refresh} className="btn-outline">
-            <RefreshCw size={15} /> 刷新
+          <button onClick={() => void refresh()} disabled={refreshing} className="btn-outline">
+            {refreshing ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} 刷新
           </button>
         }
       />

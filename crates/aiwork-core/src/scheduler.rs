@@ -434,10 +434,12 @@ pub fn scheduler_config_set(st: &AppState, cfg: Value) -> Result<Value, String> 
             modes.insert(k.clone(), s.to_string());
         }
     }
-    let _ = crate::store::db(&st.data_dir).kv_set(
+    // 落库失败必须上抛（审查 P3）：静默成功会让用户以为配置已保存，
+    // 实际重启后回退旧配置；磁盘/busy 异常时命令如实报错
+    crate::store::db(&st.data_dir).kv_set(
         "scheduler_cfg",
         &json!({ "disabled_tasks": disabled, "task_times": times, "task_modes": modes }),
-    );
+    )?;
     fs_utils::app_log(
         &st.data_dir,
         &format!(
@@ -768,7 +770,14 @@ fn write_entry(st: &AppState, key: &str, entry: Value) {
         let tasks = obj.entry("tasks".to_string()).or_insert_with(|| json!({}));
         tasks[key] = entry;
     }
-    let _ = crate::store::db(&st.data_dir).kv_set("scheduler_state", &root);
+    // 状态落库失败不可静默（审查 P3）：last_run_date 丢失 → 当日任务重复执行；
+    // last_fail_ts 丢失 → 失败冷却失效引发重试风暴。记日志供排查（不阻断主流程）
+    if let Err(e) = crate::store::db(&st.data_dir).kv_set("scheduler_state", &root) {
+        fs_utils::app_log(
+            &st.data_dir,
+            &format!("[调度器] 任务状态落库失败（task={key}）: {e}"),
+        );
+    }
 }
 
 /// 结果 JSON → 单行摘要（含 summary 字段直接取用；签到轮次取 ok/already/failed 计数，其余截断展示）

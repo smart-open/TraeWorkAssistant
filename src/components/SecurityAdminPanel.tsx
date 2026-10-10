@@ -4,6 +4,7 @@ import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
 import { copyText } from '../lib/clipboard';
 import { api } from '../lib/tauri';
+import { Modal } from './ui';
 import type { IpAllowlistConfig, AdminTokenView, Settings } from '../types';
 
 /**
@@ -20,6 +21,8 @@ export default function SecurityAdminPanel() {
   const [tokenLabel, setTokenLabel] = useState('');
   const [tokenBusy, setTokenBusy] = useState(false);
   const [newTokenPlain, setNewTokenPlain] = useState<string | null>(null);
+  // 吊销确认（审查 F2.1）：吊销即刻断开持有者全部会话，属「删除类」危险操作需二次确认
+  const [revokeTarget, setRevokeTarget] = useState<AdminTokenView | null>(null);
 
   const loadTokens = () => {
     api.adminTokens
@@ -115,6 +118,17 @@ export default function SecurityAdminPanel() {
       .catch(() => setWebAuthOff(false));
   }, []);
 
+  // 免令牌开启确认（审查 F2.3）：公网部署误触即放开管理面；恢复令牌登录无需确认
+  const [webAuthConfirm, setWebAuthConfirm] = useState(false);
+
+  const requestToggleWebAuth = () => {
+    if (!webAuthOff) {
+      setWebAuthConfirm(true);
+      return;
+    }
+    void toggleWebAuth();
+  };
+
   const toggleWebAuth = async () => {
     setWebAuthSaving(true);
     try {
@@ -183,7 +197,7 @@ export default function SecurityAdminPanel() {
                     {new Date(t.created_at).toLocaleString()}
                   </span>
                   <button
-                    onClick={() => revokeToken(t.id)}
+                    onClick={() => setRevokeTarget(t)}
                     disabled={tokenBusy}
                     className="btn-outline ml-auto text-xs text-red-500"
                   >
@@ -203,7 +217,7 @@ export default function SecurityAdminPanel() {
             <Globe size={16} className="text-brand-500" />
             <h3 className="font-medium">WebUI 免令牌访问</h3>
           </div>
-          <button onClick={toggleWebAuth} disabled={webAuthSaving} className="btn-primary">
+          <button onClick={requestToggleWebAuth} disabled={webAuthSaving} className="btn-primary">
             <Save size={15} /> {webAuthSaving ? '保存中…' : webAuthOff ? '恢复令牌登录' : '开启免令牌'}
           </button>
         </div>
@@ -215,12 +229,67 @@ export default function SecurityAdminPanel() {
           <input
             type="checkbox"
             checked={webAuthOff}
-            onChange={toggleWebAuth}
+            onChange={requestToggleWebAuth}
             disabled={webAuthSaving}
           />
           免令牌访问{webAuthOff ? '（已开启）' : '（已关闭）'}
         </label>
       </section>
+
+      {/* 吊销令牌二次确认（审查 F2.1） */}
+      <Modal
+        open={revokeTarget != null}
+        onClose={() => setRevokeTarget(null)}
+        title="吊销管理员令牌"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setRevokeTarget(null)}>取消</button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              disabled={tokenBusy}
+              onClick={async () => {
+                const target = revokeTarget;
+                setRevokeTarget(null);
+                if (target) await revokeToken(target.id);
+              }}
+            >
+              确认吊销
+            </button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          确认吊销令牌「{revokeTarget?.label}」（{revokeTarget?.token_masked}）？
+          持有该令牌的设备/同事将即刻失去管理面访问，需重新创建令牌分发。
+        </div>
+      </Modal>
+
+      {/* 开启免令牌访问二次确认（审查 F2.3） */}
+      <Modal
+        open={webAuthConfirm}
+        onClose={() => setWebAuthConfirm(false)}
+        title="开启免令牌访问"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setWebAuthConfirm(false)}>取消</button>
+            <button
+              className="btn-primary"
+              disabled={webAuthSaving}
+              onClick={async () => {
+                setWebAuthConfirm(false);
+                await toggleWebAuth();
+              }}
+            >
+              确认开启
+            </button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          开启后任何能访问本服务的人无需令牌即可操作账号、签到与网关配置。
+          仅建议在受信任的内网使用；公网部署请保持关闭并配合 IP 允许列表。
+        </div>
+      </Modal>
 
       {/* IP 允许列表：独立配置即时保存 */}
       {ipForm && (

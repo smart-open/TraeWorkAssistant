@@ -115,8 +115,17 @@ export default function ApiKeysManager({
     }
   };
 
-  const toggleAuthDisabled = () => {
+  // 关闭鉴权二次确认（审查 F2.2）：全局安全开关，误触即放行所有无 Key 请求；
+  // 重新开启鉴权无风险不需确认
+  const [authOffConfirm, setAuthOffConfirm] = useState(false);
+
+  const toggleAuthDisabled = (confirmed = false) => {
     const next = !authDisabled;
+    if (next && !confirmed) {
+      setAuthOffConfirm(true);
+      return;
+    }
+    setAuthOffConfirm(false);
     void saveKeys(
       apiKeys,
       next ? '已关闭鉴权：无启用 Key 时任何本机程序均可调用（不推荐）' : '已开启鉴权：未配置启用 Key 时请求将被拒绝',
@@ -438,7 +447,7 @@ export default function ApiKeysManager({
               ? 'bg-emerald-500/90 text-white hover:bg-emerald-500'
               : 'bg-amber-500/90 text-white hover:bg-amber-500'
           }`}
-          onClick={toggleAuthDisabled}
+          onClick={() => toggleAuthDisabled()}
           disabled={keysSaving}
         >
           {authDisabled ? '开启鉴权' : '关闭鉴权'}
@@ -746,6 +755,30 @@ export default function ApiKeysManager({
         <div className="text-sm">
           确认删除 Key「{deleteForKey?.name}」？
           <div className="mt-1 text-xs text-slate-400">使用该 Key 的客户端将立即无法访问（401）。</div>
+        </div>
+      </Modal>
+
+      {/* 关闭鉴权二次确认（审查 F2.2） */}
+      <Modal
+        open={authOffConfirm}
+        onClose={() => setAuthOffConfirm(false)}
+        title="关闭网关鉴权"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setAuthOffConfirm(false)}>取消</button>
+            <button
+              className="btn-primary !bg-amber-500 hover:!bg-amber-400"
+              disabled={keysSaving}
+              onClick={() => toggleAuthDisabled(true)}
+            >
+              确认关闭
+            </button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          确认关闭网关鉴权？关闭后任何能访问本服务的程序无需 Key 即可调用全部模型与账号积分。
+          仅建议本机/受信任内网临时使用，公网部署务必保持开启。
         </div>
       </Modal>
     </div>

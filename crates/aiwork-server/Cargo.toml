@@ -1,6 +1,6 @@
 [package]
 name = "aiwork-server"
-version = "1.4.6"
+version = "1.4.7"
 description = "AI Work 助手 Web 版服务端（管理面 + OpenAI 网关 + 调度器，单进程 axum）"
 edition = "2021"
 rust-version = "1.89"
@@ -22,3 +22,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SSE 事件流：broadcast 通道 → Stream 适配（BroadcastStream 需 sync feature）
 tokio-stream = { version = "0.1", features = ["sync"] }
+# 启动日志的调度时区可观测（chrono 已在 workspace 树内，无额外编译成本）
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

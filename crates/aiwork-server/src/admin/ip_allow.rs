@@ -201,6 +201,13 @@ fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trust_proxy: bool) -> Op
     peer
 }
 
+/// 登录审计取来源 IP（与 ip_middleware 同口径：trust_proxy 读进程内缓存，
+/// 关闭时仅信 TCP 对端）。仅用于失败日志，不参与安全判定。
+pub(super) fn audit_ip(headers: &HeaderMap, peer: Option<IpAddr>) -> Option<IpAddr> {
+    let trust_proxy = CACHE.read().unwrap_or_else(|e| e.into_inner()).trust_proxy;
+    client_ip(headers, peer, trust_proxy)
+}
+
 /// 解析单条 CIDR/IP（裸 IP 视为 /32 或 /128）；失败返回 None。
 /// IPv4-mapped IPv6 归一为 IPv4：前缀 ≤32 按 v4 位宽，96..=128 按减 96 折算。
 fn parse_net(s: &str) -> Option<AllowedNet> {

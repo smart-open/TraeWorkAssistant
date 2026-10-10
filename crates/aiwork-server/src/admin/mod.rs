@@ -180,8 +180,13 @@ pub(super) async fn auth_middleware(
 }
 
 /// POST /api/login：body `{"token": "..."}`；匹配 → 200 `{"ok":true}` +
-/// Set-Cookie 会话（HttpOnly / SameSite=Lax / 7 天）；不匹配 → 401。
-async fn login(State(admin): State<Arc<AdminState>>, body: Bytes) -> Response {
+/// Set-Cookie 会话（HttpOnly / SameSite=Lax / 7 天，HTTPS 到达时附 Secure）；不匹配 → 401。
+async fn login(
+    State(admin): State<Arc<AdminState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
     let supplied = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| {
@@ -193,17 +198,35 @@ async fn login(State(admin): State<Arc<AdminState>>, body: Bytes) -> Response {
     // 主 token 或附加管理员令牌任一命中即可登录（T12b，主 token 常量时间比较）；
     // 会话 Cookie 存登录所用 token
     if !(ct_eq(supplied.as_bytes(), admin.token.as_bytes()) || admin_tokens::contains(&supplied)) {
+        // 失败审计（审查 B2）：0.0.0.0 部署时该端点全网可达，失败完全不可见
+        // = 爆破行为不可观测；按 ip_middleware 同口径记录来源 IP（不参与判定）
+        let ip = ip_allow::audit_ip(&headers, Some(peer.ip()))
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        fs_utils::app_log(&admin.state.data_dir, &format!("管理面登录失败（来源 ip={ip}）"));
         return json_response(
             StatusCode::UNAUTHORIZED,
             json!({"ok": false, "error": "token 无效"}),
         );
     }
     // 登录事件单条日志（无逐请求鉴权噪音）
-    fs_utils::app_log(&admin.state.data_dir, "管理面登录成功");
-    // Cookie 存登录所用 token（附加令牌登录时不得回写主 token，避免泄露）
+    let ip = ip_allow::audit_ip(&headers, Some(peer.ip()))
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    fs_utils::app_log(&admin.state.data_dir, &format!("管理面登录成功（来源 ip={ip}）"));
+    // Cookie 存登录所用 token（附加令牌登录时不得回写主 token，避免泄露）。
+    // Secure 属性（审查 B3）：仅当请求确认经 HTTPS 到达（反代 x-forwarded-proto）
+    // 时附加——纯 HTTP 内网部署带 Secure 会被浏览器拒收，无该头维持原行为
+    let via_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
     let cookie = format!(
-        "{COOKIE_NAME}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={COOKIE_MAX_AGE_SECS}",
-        supplied
+        "{COOKIE_NAME}={}; HttpOnly; SameSite=Lax;{} Path=/; Max-Age={COOKIE_MAX_AGE_SECS}",
+        supplied,
+        if via_https { " Secure;" } else { "" },
     );
     let mut resp = json_response(StatusCode::OK, json!({"ok": true}));
     if let Ok(v) = HeaderValue::from_str(&cookie) {
@@ -259,15 +282,25 @@ mod tests {
         assert_eq!(cookie_value("", COOKIE_NAME), None);
     }
 
-    /// 会话 cookie 帧格式：HttpOnly + SameSite=Lax + Path=/ + Max-Age=7 天
+    /// 会话 cookie 帧格式：HttpOnly + SameSite=Lax + Path=/ + Max-Age=7 天；
+    /// HTTPS 到达（x-forwarded-proto=https）时附加 Secure（审查 B3）
     #[test]
     fn login_cookie_frame_format() {
-        let cookie = format!(
-            "{COOKIE_NAME}=<token>; HttpOnly; SameSite=Lax; Path=/; Max-Age={COOKIE_MAX_AGE_SECS}"
+        let base = format!(
+            "{COOKIE_NAME}=<token>; HttpOnly; SameSite=Lax;{} Path=/; Max-Age={COOKIE_MAX_AGE_SECS}",
+            ""
         );
         assert_eq!(
-            cookie,
+            base,
             "aiwork_admin=<token>; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800"
+        );
+        let secure = format!(
+            "{COOKIE_NAME}=<token>; HttpOnly; SameSite=Lax;{} Path=/; Max-Age={COOKIE_MAX_AGE_SECS}",
+            " Secure;"
+        );
+        assert_eq!(
+            secure,
+            "aiwork_admin=<token>; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=604800"
         );
     }
 }

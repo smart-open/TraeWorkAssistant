@@ -428,20 +428,37 @@ pub fn lines_with_first_byte_hedged<T>(
 
 // ==================== T2.6 双源 token 保活（网关 401 路径） ====================
 
-/// token store 进程级写锁（读-改-写分段持锁，网络刷新段不持锁防长阻塞）：
-/// 并发刷新不同账号时防止整份 store 互相覆盖丢更新（与 api_keys::KEYS_LOCK 同策略）
-static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// 网关侧刷新（T2.6）：读 token store → POST refresh → 原子回写工具侧副本。
 /// 与 commands::workbuddy::workbuddy_refresh_token 同一端点/红线；此处面向
 /// API 网关 401 自动续期（无 Tauri State 依赖，仅 data_dir）。
-/// 成功返回新 accessToken；失败返回 Err（调用方按 SwitchKey 换号）。
-pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Result<String, String> {
+/// 审查加固（H-1 对齐）：与 tasks 侧刷新共用**每账号锁 + 跨进程锁 + 持锁二次检查**
+/// ——网关 401 自愈与 wb-renew/wb-checkin/积分刷新对同一账号并发刷新时，服务端
+/// 一次性轮换下后落库者覆盖先落库者（H-1 事故场景），此前网关路径未闭合；
+/// 表锁同步一至 `WB_TOKEN_STORE_LOCK`（与 tasks/commands 写方共锁，防同账号
+/// 读-改-写互相覆盖，P2 双锁分裂修复）。
+/// `stale_access`：本次请求 401 所用凭证——store 中已是不同新值（他人已刷新落库）
+/// 时直接复用，不发网络请求。成功返回新 accessToken；失败返回 Err（调用方按
+/// SwitchKey 换号）。
+pub fn refresh_access_token(
+    data_dir: &std::path::Path,
+    account_id: &str,
+    stale_access: &str,
+) -> Result<String, String> {
     // SQLite 化（P4）：死引用修复——原读写 data_dir **根**路径的 workbuddy_token_store.json
-    // （正牌在 data/ 子目录，此分叉使网关 401 刷新永远读写错位文件），现统一走 store wb_tokens 表
+    // （正牌在 data/ 子目录，此分叉使网关 401 刷新永远读写错位文件），现统一走 store wb_tokens 表。
+    // 锁序约定（单向）：每账号刷新锁 → WB_TOKEN_STORE_LOCK（与 tasks 侧一致，无环）
+    let lock = crate::tasks::wb_common::refresh_lock_for(account_id);
+    let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(_cross) = crate::tasks::wb_common::cross_refresh_lock(data_dir, account_id) else {
+        // 他方进程刷新中：本侧放弃自愈（调用方换号，下次 401 再试），不与之一同竞写
+        return Err("他方进程正在刷新该账号凭证，本次跳过".into());
+    };
+
+    // 持锁二次检查 + 凭证收敛读取（secure 回填：DB 占位 + vault 明文内存态）
     let refresh = {
-        let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // 凭证收敛（P0-1）：secure 回填（DB 占位 + vault 明文内存态）
+        let _table = crate::tasks::wb_common::WB_TOKEN_STORE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let store: serde_json::Value =
             crate::tasks::wb_common::token_store_load_secure(data_dir);
         let rec = store
@@ -449,6 +466,11 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
             .and_then(|t| t.get(account_id))
             .cloned()
             .unwrap_or_default();
+        // 二次检查：他人已刷新落库 → 直接复用新凭证（不发网络请求）
+        let cur_access = rec.get("access_token").and_then(|v| v.as_str()).unwrap_or("");
+        if !cur_access.is_empty() && cur_access != stale_access {
+            return Ok(cur_access.to_string());
+        }
         rec.get("refresh_token")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
@@ -506,7 +528,9 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
     // 原子回写工具侧副本（F-10 双源谁新用谁：expiresAtMs 更晚者胜出）：
     // 锁内重读最新 store 再合并写回（网络段已释放锁），并发刷新不丢他账号更新
     {
-        let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::tasks::wb_common::WB_TOKEN_STORE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut r = {
             // 凭证收敛（P0-1）：secure 回填（vault 明文内存态参与 merge）
             let store: serde_json::Value =
@@ -648,7 +672,7 @@ mod tests {
         // 空 store → 无 refreshToken → 明确报错（不静默）
         let dir = std::env::temp_dir().join(format!("wb_up_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let r = refresh_access_token(&dir, "wb-none");
+        let r = refresh_access_token(&dir, "wb-none", "");
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

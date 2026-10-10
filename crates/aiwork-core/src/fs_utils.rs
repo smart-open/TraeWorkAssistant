@@ -4,9 +4,22 @@ use std::io::Write;
 use std::path::Path;
 
 /// 读取 JSON，文件不存在或解析失败返回默认值。
+/// UTF-8 BOM 容错（审查-兼容）：Windows 记事本等编辑器写入 BOM 会让 serde 解析
+/// 失败 → 此前静默回退默认值，后续写回会覆盖用户配置；解析失败时记录文件名。
 pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
     match fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        Ok(mut s) if !s.trim().is_empty() => {
+            if s.starts_with('\u{feff}') {
+                s.remove(0);
+            }
+            serde_json::from_str(&s).unwrap_or_else(|e| {
+                eprintln!(
+                    "[fs_utils] 配置解析失败（已回退默认值，注意保存会覆盖原文件）: {} : {e}",
+                    path.display()
+                );
+                T::default()
+            })
+        }
         _ => T::default(),
     }
 }

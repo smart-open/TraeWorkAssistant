@@ -191,7 +191,8 @@ function ApiLogsTab() {
         void loadDetail(d[0]);
       }
     } catch {
-      /* ignore */
+      // 失败可见化（审查 F1.3）：静默吞错让「故障」与「确无日志」不可区分
+      toast('error', 'API 日志日期列表读取失败');
     } finally {
       setRefreshing(false);
     }
@@ -211,6 +212,7 @@ function ApiLogsTab() {
       setContent(c);
     } catch {
       setContent(null);
+      toast('error', `API 日志详情读取失败（${date}）`);
     } finally {
       setLoading(false);
     }
@@ -230,6 +232,7 @@ function ApiLogsTab() {
       setContent(c);
     } catch {
       setContent(null);
+      toast('error', 'API 日志搜索失败');
     } finally {
       setSearching(false);
     }

@@ -83,17 +83,37 @@ export const UNAUTHORIZED_EVENT = 'aiwork:unauthorized';
 
 // 命令桥调用：body 按原命令参数名传键（顶层 camelCase 自动转 snake_case）；
 // 成功解包 data，失败抛 ApiError；401 时同步派发全局未登录事件。
+// 超时兜底（审查 F6.1）：后端/反代挂起时此前会永久等待（按钮 loading 转圈不归），
+// 统一 120s 上限（覆盖导入/模型同步等慢命令）；网络层失败翻译为可读文案
+//（审查 F4.1：此前 String(err) 直出 "TypeError: Failed to fetch"）。
+const INVOKE_TIMEOUT_MS = 120_000;
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'TimeoutError') {
+      throw new ApiError(0, `请求超时（${Math.round(timeoutMs / 1000)}s 无响应），请检查服务端状态后重试`);
+    }
+    throw new ApiError(0, '网络连接失败：无法访问服务端（服务未启动或网络中断）');
+  }
+}
+
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   let body: Record<string, unknown> | undefined;
   if (args) {
     body = {};
     for (const [k, v] of Object.entries(args)) body[toSnakeKey(k)] = v;
   }
-  const res = await fetch(`/api/cmd/${command}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body ?? {}),
-  });
+  const res = await fetchWithTimeout(
+    `/api/cmd/${command}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    },
+    INVOKE_TIMEOUT_MS,
+  );
   if (res.status === 401) {
     window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
     throw new ApiError(401, '未登录或登录已过期');
@@ -112,13 +132,17 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
 
 // ---- 登录会话（ADR-4）----
 
-/** token 登录：成功后服务端下发 HttpOnly 会话 cookie（Max-Age 7 天） */
+/** token 登录：成功后服务端下发 HttpOnly 会话 cookie（Max-Age 7 天；HTTPS 到达附 Secure） */
 export async function login(token: string): Promise<void> {
-  const res = await fetch('/api/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token }),
-  });
+  const res = await fetchWithTimeout(
+    '/api/login',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    },
+    30_000,
+  );
   if (res.ok) return;
   let msg = `登录失败（HTTP ${res.status}）`;
   try {
@@ -148,6 +172,9 @@ const RT_EVENT_NAMES = [
   'qoder-oauth-done',
   // 调度器看板数据同步成功（issue #61）：Dashboard 按 platform 静默重读缓存
   'board-data-synced',
+  // WS 慢消费者丢帧通知（审查 F6.3）：此前前端对该事件名只 console.warn 丢弃，
+  // 丢帧完全不可感知；纳入订阅后 store 可监听并提示用户数据可能滞后
+  'ws-lagged',
 ];
 const RT_ALIASES: Record<string, string[]> = {
   'checkin-progress': ['checkin-progress', 'checkin-done'],
@@ -194,6 +221,11 @@ function closeSse() {
 let wsSock: WebSocket | null = null;
 let wsHeartbeat: number | null = null;
 let wsRetryTimer: number | null = null;
+// 最近一次收到 pong 的时刻（审查 F6.2）：此前心跳只发不收，TCP 半开（休眠唤醒/
+// 网络切换）时 readyState 仍 OPEN、onclose 不触发 → 事件通道静默死亡且永不回退 SSE。
+// 连续两个心跳周期无 pong 即判定半开，主动关闭走 SSE 回退
+let wsLastPong = 0;
+const WS_PONG_DEAD_MS = 70_000;
 
 function wsUrl() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -205,6 +237,7 @@ function closeWs() {
     clearInterval(wsHeartbeat);
     wsHeartbeat = null;
   }
+  wsLastPong = 0;
   const sock = wsSock;
   wsSock = null;
   if (sock) {
@@ -236,18 +269,33 @@ function tryWs() {
   sock.onopen = () => {
     // 显式订阅全部事件（防服务端默认语义漂移）；30s 心跳防反代 idle 断连
     sock.send(JSON.stringify({ type: 'subscribe', events: RT_EVENT_NAMES }));
+    wsLastPong = Date.now();
     wsHeartbeat = window.setInterval(() => {
-      if (wsSock?.readyState === WebSocket.OPEN) wsSock.send('{"type":"ping"}');
+      if (wsSock?.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - wsLastPong > WS_PONG_DEAD_MS) {
+        // 两个心跳周期无 pong：半开连接，主动关闭走 SSE 回退
+        //（closeWs 会摘掉 onclose，回退需在此显式执行）
+        closeWs();
+        ensureSseConnection();
+        scheduleWsRetry();
+        return;
+      }
+      wsSock.send('{"type":"ping"}');
     }, 30_000);
     // WS 就绪后关闭 SSE，避免同一事件重复消费
     closeSse();
   };
   sock.onmessage = (ev) => {
-    let frame: { event?: string; payload?: unknown };
+    let frame: { event?: string; type?: string; payload?: unknown };
     try {
       frame = JSON.parse(ev.data as string);
     } catch {
-      return; // pong / 非事件帧
+      return; // 非 JSON 帧
+    }
+    // 心跳应答：刷新 pong 时间戳（半开检测依据）
+    if (!frame.event && frame.type === 'pong') {
+      wsLastPong = Date.now();
+      return;
     }
     if (frame.event) dispatchEvent(frame.event, frame.payload);
   };

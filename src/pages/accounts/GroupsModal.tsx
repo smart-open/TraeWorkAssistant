@@ -29,6 +29,9 @@ export function GroupsModal({
   const [editingNames, setEditingNames] = useState<Record<string, string>>({});
   // 删除分组确认弹框（禁 window.confirm，红线）
   const [deleteGroupTarget, setDeleteGroupTarget] = useState<GroupView | null>(null);
+  // 新建请求进行中（审查 F3.3）：请求期间按钮禁用，防连点创建重复分组；
+  // 失败提示由调用方 toast 呈现（此处捕获仅防 unhandled rejection，保留输入便于重试）
+  const [createBusy, setCreateBusy] = useState(false);
 
   useEffect(() => {
     setEditingNames((prev) => {
@@ -51,10 +54,18 @@ export function GroupsModal({
           <button onClick={onClose} className="btn-ghost">关闭</button>
           <button
             onClick={async () => {
-              if (!name.trim()) return;
-              await onCreate(name.trim(), color);
-              setName('');
+              if (!name.trim() || createBusy) return;
+              setCreateBusy(true);
+              try {
+                await onCreate(name.trim(), color);
+                setName('');
+              } catch {
+                /* 失败 toast 由调用方负责 */
+              } finally {
+                setCreateBusy(false);
+              }
             }}
+            disabled={createBusy}
             className="btn-primary"
           >
             <Plus size={14} /> 新建
@@ -96,20 +107,23 @@ export function GroupsModal({
               onBlur={(e) => {
                 const val = e.target.value.trim();
                 if (val && val !== g.name) {
-                  void onRename(g.id, val).then(() => {
-                    setEditingNames((prev) => {
-                      const next = { ...prev };
-                      delete next[g.id];
-                      return next;
-                    });
-                  });
+                  // 失败不清理编辑态（保留输入便于重试），toast 由调用方呈现
+                  void onRename(g.id, val)
+                    .then(() => {
+                      setEditingNames((prev) => {
+                        const next = { ...prev };
+                        delete next[g.id];
+                        return next;
+                      });
+                    })
+                    .catch(() => {});
                 }
               }}
               className="input !py-1 flex-1 !text-xs"
             />
             <select
               value={g.color}
-              onChange={(e) => void onRecolor(g.id, e.target.value)}
+              onChange={(e) => void onRecolor(g.id, e.target.value).catch(() => {})}
               className="input !py-1 !text-xs w-24"
             >
               {PRESET_COLORS.map((c) => (
@@ -141,7 +155,13 @@ export function GroupsModal({
               onClick={async () => {
                 const target = deleteGroupTarget;
                 setDeleteGroupTarget(null);
-                if (target) await onDelete(target.id);
+                if (target) {
+                  try {
+                    await onDelete(target.id);
+                  } catch {
+                    /* 失败 toast 由调用方负责 */
+                  }
+                }
               }}
             >
               确认删除

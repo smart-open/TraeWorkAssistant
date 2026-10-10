@@ -313,7 +313,7 @@ export default function BuddyCheckin() {
               type="checkbox"
               className="mt-0.5"
               checked={settings?.growth_travel ?? true}
-              onChange={(e) => void saveSettings({ growth_travel: e.target.checked })}
+              onChange={(e) => void saveSettings({ growth_travel: e.target.checked }).catch(() => {})}
             />
             <span className="text-sm">
               Buddy 旅行
@@ -325,7 +325,7 @@ export default function BuddyCheckin() {
               type="checkbox"
               className="mt-0.5"
               checked={settings?.growth_lottery ?? true}
-              onChange={(e) => void saveSettings({ growth_lottery: e.target.checked })}
+              onChange={(e) => void saveSettings({ growth_lottery: e.target.checked }).catch(() => {})}
             />
             <span className="text-sm">
               盲盒抽取
@@ -337,7 +337,7 @@ export default function BuddyCheckin() {
               type="checkbox"
               className="mt-0.5"
               checked={settings?.growth_tasks ?? true}
-              onChange={(e) => void saveSettings({ growth_tasks: e.target.checked })}
+              onChange={(e) => void saveSettings({ growth_tasks: e.target.checked }).catch(() => {})}
             />
             <span className="text-sm">
               任务领奖

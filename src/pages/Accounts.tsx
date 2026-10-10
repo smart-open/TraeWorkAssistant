@@ -77,6 +77,12 @@ export default function Accounts() {
   const [exportBusy, setExportBusy] = useState(false);
   // Web 版文件选择：隐藏 input 触发系统文件选择框
   const importInputRef = useRef<HTMLInputElement>(null);
+  // 刷新防重入（审查 F3.1）：连点会对上游逐账号重复发积分查询（易频控）
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  // 删除确认防连点（审查 F3.4）：1s withMinDelay 窗口内可二次触发（Buddy 版已修，Trae 版对齐）
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  // 行内操作互斥（审查 F3.5，对齐 Buddy 版 rowOp）：解除冷却/刷新 JWT 期间禁重复触发
+  const [rowOpUid, setRowOpUid] = useState<string | null>(null);
 
   const filtered = useMemo(() => {
     if (filter === 'all') return accounts;
@@ -94,11 +100,35 @@ export default function Accounts() {
   };
 
   const confirmDelete = async () => {
-    if (!deleteTarget) return;
+    if (!deleteTarget || deleteBusy) return;
+    setDeleteBusy(true);
     try {
       await withMinDelay(deleteAccount(deleteTarget.user_id, true));
     } finally {
+      setDeleteBusy(false);
       setDeleteTarget(null);
+    }
+  };
+
+  /** 行内操作互斥执行（审查 F3.5）：同账号操作进行中再次点击直接忽略 */
+  const runRowOp = async (uid: string, op: () => Promise<void>) => {
+    if (rowOpUid) return;
+    setRowOpUid(uid);
+    try {
+      await op();
+    } finally {
+      setRowOpUid(null);
+    }
+  };
+
+  /** 刷新防重入（审查 F3.1） */
+  const onRefresh = async () => {
+    if (refreshBusy) return;
+    setRefreshBusy(true);
+    try {
+      await Promise.all([refreshAccounts(), refreshRemainingCredits()]);
+    } finally {
+      setRefreshBusy(false);
     }
   };
 
@@ -221,8 +251,8 @@ export default function Accounts() {
         }
         actions={
           <>
-            <button onClick={() => { void refreshAccounts(); void refreshRemainingCredits(); }} className="btn-outline" title="刷新账号列表与积分数据">
-              <RefreshCw size={15} /> 刷新
+            <button onClick={() => void onRefresh()} disabled={refreshBusy} className="btn-outline" title="刷新账号列表与积分数据">
+              {refreshBusy ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} 刷新
             </button>
             <button onClick={() => setOAuthOpen(true)} className="btn-outline" title="通过 OAuth 授权登录添加账号">
               <Globe size={15} /> OAuth 登录
@@ -391,8 +421,9 @@ export default function Accounts() {
                         {a.cooldown_type && (
                           <button
                             title="解除冷却"
-                            onClick={() => void cooldownClear(a.user_id)}
-                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                            onClick={() => void runRowOp(a.user_id, () => cooldownClear(a.user_id))}
+                            disabled={rowOpUid !== null}
+                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-sky-500/10"
                           >
                             <Snowflake size={14} />
                           </button>
@@ -400,8 +431,9 @@ export default function Accounts() {
                         {a.has_refresh_token && (
                           <button
                             title="刷新 JWT"
-                            onClick={() => void refreshJwt(a.user_id)}
-                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                            onClick={() => void runRowOp(a.user_id, () => refreshJwt(a.user_id))}
+                            disabled={rowOpUid !== null}
+                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-sky-500/10"
                           >
                             <Zap size={14} />
                           </button>

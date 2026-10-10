@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api, setupListeners, ApiError, UNAUTHORIZED_EVENT, type CheckinProgressEvent } from './lib/tauri';
+import { api, setupListeners, listen, ApiError, UNAUTHORIZED_EVENT, type CheckinProgressEvent } from './lib/tauri';
 import type {
   AccountView,
   CheckinAccountResult,
@@ -68,6 +68,9 @@ interface AppState {
   accounts: AccountView[];
   groups: GroupView[];
   settings: Settings | null;
+  /** 设置是否已从服务端成功加载（审查 F5.1）：false 时 saveSettings 拒绝写入——
+   * 防止「读取失败 → 默认值渲染 → 用户保存」把默认值整表覆盖到服务端 */
+  settingsLoaded: boolean;
   logs: LogLine[];
   creditsDaily: CreditsDailySnapshot[];
   checkin: CheckinState;
@@ -132,6 +135,34 @@ let unsubs: Array<() => void> = [];
 let initStarted = false;
 /** 全局 401 拦截是否已绑定（绑定一次即可） */
 let unauthorizedBound = false;
+
+/** 签到看门狗（审查 F5.2）：active 只能由 done/exit 事件复位，WS/SSE 断线丢帧时
+ * 「签到进行中」会永久卡死、按钮永久禁用。事件到达即续期；超时未有任何事件则
+ * 解除卡死并提示用户手动核对（不误报：15min 覆盖多账号 + 2 轮重试的最坏时长） */
+const CHECKIN_WATCHDOG_MS = 15 * 60_000;
+let checkinWatchdog: number | null = null;
+function clearCheckinWatchdog() {
+  if (checkinWatchdog !== null) {
+    clearTimeout(checkinWatchdog);
+    checkinWatchdog = null;
+  }
+}
+/** 看门狗超时回调：解除「签到进行中」卡死并提示（实际结果以签到记录页为准） */
+function checkinWatchdogFired() {
+  checkinWatchdog = null;
+  const s = useAppStore.getState();
+  if (!s.checkin.active) return;
+  useAppStore.setState((st) => ({ checkin: { ...st.checkin, active: false } }));
+  s.pushToast(
+    'error',
+    '签到进度长时间未收到事件（连接可能中断），已解除「进行中」卡死；实际结果请到签到记录页核对',
+  );
+}
+function armCheckinWatchdog() {
+  clearCheckinWatchdog();
+  checkinWatchdog = window.setTimeout(checkinWatchdogFired, CHECKIN_WATCHDOG_MS);
+}
+
 
 function defaultSettings(): Settings {
   return {
@@ -210,6 +241,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   accounts: [],
   groups: [],
   settings: null,
+  settingsLoaded: false,
   logs: [],
   creditsDaily: [],
   checkin: { active: false, total: 0, index: 0, results: [], done: null, retry: null },
@@ -233,14 +265,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       const validNotify = ['toast', 'system', 'both', 'none'];
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
       normalizeAppDisplay(settings);
-      set({ settings, authed: true });
+      set({ settings, authed: true, settingsLoaded: true });
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         set({ authed: false, ready: true });
         return;
       }
-      // 非 401（网络/服务异常）：仍进入主界面，由各页面 toast 呈现具体错误
-      set({ settings: get().settings ?? defaultSettings(), authed: true });
+      // 非 401（网络/服务异常）：仍进入主界面，由各页面 toast 呈现具体错误。
+      // settingsLoaded=false（审查 F5.1）：默认值仅用于渲染兜底，禁止触发保存回写
+      set({ settings: get().settings ?? defaultSettings(), authed: true, settingsLoaded: false });
     }
     await get().afterLogin();
   },
@@ -253,6 +286,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       onCheckinProgress: (e) => get().applyCheckinEvent(e),
       onQoderCheckinProgress: (line) => get().applyQoderCheckinLine(line),
     });
+    // WS 慢消费者丢帧通知（审查 F6.3）：此前该事件被前端静默丢弃。
+    // 丢帧意味着界面状态可能滞后于服务端——提示用户，签到进行中时同步缩短看门狗
+    unsubs.push(
+      await listen<{ missed?: number }>('ws-lagged', (e) => {
+        const missed = e.payload?.missed;
+        get().pushToast(
+          'info',
+          `实时事件通道丢帧（${missed ?? '未知'} 条），界面状态可能滞后；签到结果请以签到记录页为准`,
+        );
+      }),
+    );
     await Promise.all([
       get().refreshAccounts(),
       get().refreshGroups(),
@@ -265,6 +309,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   resetAuth: () => {
     unsubs.forEach((fn) => fn());
     unsubs = [];
+    clearCheckinWatchdog();
     // 保留 ready 与主题等本地态；数据清空防止串号
     set({
       authed: false,
@@ -275,6 +320,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       checkin: { active: false, total: 0, index: 0, results: [], done: null, retry: null },
       // 审查 #19：qoderCheckin 与 checkin 同款清空，防止重登录后残留上一会话进度串号
       qoderCheckin: { running: false, lines: [], done: null, doneRev: 0 },
+      settingsLoaded: false,
     });
   },
 
@@ -283,6 +329,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   setShowApiManager: (v) => set({ showApiManager: v }),
 
   applyCheckinEvent: (e) => {
+    // 看门狗（审查 F5.2）：任一事件到达即续期；done 事件解除
+    if (e.type === 'done') clearCheckinWatchdog();
+    else armCheckinWatchdog();
     set((s) => {
       if (e.type === 'start') {
         // start 带 scope 内全集清单（候选 pending / 跳过带原因 / 重试轮沿用上轮状态），
@@ -480,9 +529,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       const validNotify = ['toast', 'system', 'both', 'none'];
       if (!validNotify.includes(settings.notify)) settings.notify = 'toast';
       normalizeAppDisplay(settings);
-      set({ settings });
+      set({ settings, settingsLoaded: true });
     } catch {
-      set({ settings: defaultSettings() });
+      // 读取失败不得用默认值顶替真实配置（审查 F5.1）：保留当前渲染值，
+      // 标记未加载——后续 saveSettings 会被守卫拒绝，防默认值整表覆盖服务端配置
+      set({ settingsLoaded: false });
     }
   },
   refreshLogs: async (q, manual) => {
@@ -586,9 +637,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   startCheckin: async (opts) => {
     // 重置签到状态，避免显示上一次的进度
     set({ checkin: { active: true, total: 0, index: 0, results: [], done: null, retry: null } });
+    // 看门狗（审查 F5.2）：事件通道断线丢帧时 done 事件永久缺失会让按钮永久禁用
+    armCheckinWatchdog();
     try {
       await api.checkin.start(opts);
     } catch (err) {
+      clearCheckinWatchdog();
       set((s) => ({ checkin: { ...s.checkin, active: false } }));
       get().pushToast('error', `发起签到失败：${String(err)}`);
     }
@@ -629,6 +683,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   saveSettings: async (patch) => {
+    // 守卫（审查 F5.1）：服务端配置从未成功加载时禁止保存——当前内存里的
+    // settings 可能是默认值兜底，整表写回会把服务端真实配置静默覆盖
+    if (!get().settingsLoaded) {
+      const err = new ApiError(0, '设置尚未从服务端加载成功，禁止保存（刷新页面恢复后重试）');
+      get().pushToast('error', err.message);
+      throw err;
+    }
     const current = get().settings ?? defaultSettings();
     const next = { ...current, ...patch } as Settings;
     set({ settings: next });
@@ -668,7 +729,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (mode === 'none') return;
     const id = ++toastSeq;
     set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }));
-    setTimeout(() => get().dismissToast(id), 4200);
+    // 错误驻留延长（审查 F4.2）：4.2s 读不完长错误文案（如导入拒绝原因列表）
+    setTimeout(() => get().dismissToast(id), kind === 'error' ? 10_000 : 4200);
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 }));

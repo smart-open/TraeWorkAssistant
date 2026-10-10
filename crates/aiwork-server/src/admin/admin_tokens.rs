@@ -55,14 +55,16 @@ static CACHE: LazyLock<RwLock<Arc<HashSet<String>>>> =
 pub fn reload(state: &AppState) {
     let file: AdminTokensFile = aiwork_core::store::db(&state.data_dir).kv_get(KV_KEY);
     let set: HashSet<String> = file.tokens.iter().map(|t| t.token.clone()).collect();
-    *CACHE.write().expect("admin_tokens 缓存锁中毒") = Arc::new(set);
+    // 毒化恢复（审查 B5）：contains 在鉴权热路径上，expect 会在锁中毒后
+    // 让所有 /api/* 请求逐任务 panic（表现「假死+连接重置」）；数据未破坏可安全续用
+    *CACHE.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(set);
 }
 
 /// 附加令牌命中校验（主 token 由调用方先行比对，此处仅查附加集）
 pub fn contains(candidate: &str) -> bool {
     CACHE
         .read()
-        .expect("admin_tokens 缓存锁中毒")
+        .unwrap_or_else(|e| e.into_inner())
         .contains(candidate)
 }
 

@@ -863,27 +863,52 @@ export default function BuddyAccounts() {
         )}
       </Modal>
 
-      {/* 分组管理弹框（复用 Trae GroupsModal，WB 分组走 workbuddy_groups_* 命令） */}
+      {/* 分组管理弹框（复用 Trae GroupsModal，WB 分组走 workbuddy_groups_* 命令）。
+          写操作反馈对齐 Trae 侧（审查 F1.1）：成功 toast + 失败 catch 提示，
+          不再静默 reject（此前失败无任何提示且产生 unhandled rejection） */}
       <GroupsModal
         open={groupOpen}
         onClose={() => setGroupOpen(false)}
         groups={wbGroups}
         onCreate={async (name, color) => {
-          await api.workbuddy.groups.create(name, color);
-          reloadGroups();
+          try {
+            await api.workbuddy.groups.create(name, color);
+            reloadGroups();
+            pushToast('success', `分组「${name}」已创建`);
+          } catch (err) {
+            pushToast('error', `创建分组失败：${String(err)}`);
+            throw err;
+          }
         }}
         onRename={async (id, name) => {
-          await api.workbuddy.groups.update(id, { name });
-          reloadGroups();
+          try {
+            await api.workbuddy.groups.update(id, { name });
+            reloadGroups();
+            pushToast('success', '分组已重命名');
+          } catch (err) {
+            pushToast('error', `重命名失败：${String(err)}`);
+            throw err;
+          }
         }}
         onRecolor={async (id, color) => {
-          await api.workbuddy.groups.update(id, { color });
-          reloadGroups();
+          try {
+            await api.workbuddy.groups.update(id, { color });
+            reloadGroups();
+          } catch (err) {
+            pushToast('error', `改色失败：${String(err)}`);
+            throw err;
+          }
         }}
         onDelete={async (id) => {
-          await api.workbuddy.groups.remove(id);
-          reloadGroups();
-          await refresh(); // 组内账号回落「未分组」，列表同步
+          try {
+            await api.workbuddy.groups.remove(id);
+            reloadGroups();
+            await refresh(); // 组内账号回落「未分组」，列表同步
+            pushToast('info', '分组已删除');
+          } catch (err) {
+            pushToast('error', `删除分组失败：${String(err)}`);
+            throw err;
+          }
         }}
       />
 

@@ -377,6 +377,9 @@ fn writeback_oauth_device(state: &AppState, uid: &str, device_id: &str) {
     if uid.is_empty() || device_id.is_empty() {
         return;
     }
+    // 整表读-改-写互斥（审查 P5）：与签到路径 get_device_for 等写方共锁，
+    // 防并发整表覆盖丢他账号条目
+    let _dm = crate::store::docs::DEVICE_MAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let store = crate::store::db(&state.data_dir);
     let mut map = crate::store::docs::device_map_load(&store);
     let entry = map.entry(uid.to_string()).or_insert_with(|| {

@@ -771,6 +771,18 @@ pub fn device_map_load(s: &Store) -> DeviceMap {
         .collect()
 }
 
+// ── 整文档读-改-写共享互斥（审查 P4/P5）────────────────────────────────────
+// device_map / account_cooldowns 的运行期写方为「load 整表 → 内存改 → save 整表」，
+// 并发写者（签到调度线程 / 手动签到 / OAuth 登录回写 / 冷却清理命令）后写者以
+// 旧整表副本覆盖，会丢先写者条目（丢冷却 → 已冷却账号被重复探测；丢设备映射
+// → 指纹漂移）。写侧统一在 load→save 全程持锁；启动迁移（migrate.rs）单线程
+// 不持锁。锁序：这两把为叶子锁，不得在持锁时再获取其他锁。
+
+/// device_map 整表读-改-写互斥
+pub(crate) static DEVICE_MAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// account_cooldowns 整表读-改-写互斥
+pub(crate) static ACCOUNT_COOLDOWNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn device_map_save(s: &Store, map: &DeviceMap) -> Result<(), String> {
     let rows: Vec<(String, Value)> = map
         .iter()

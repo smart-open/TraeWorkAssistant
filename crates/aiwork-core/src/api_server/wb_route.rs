@@ -827,7 +827,7 @@ fn run_wb_stream(
                             // T2.6：401 → 刷新一次凭证后同号重试（每账号每请求一次）
                             if status == 401 && !refreshed.contains(&picked.uid) {
                                 refreshed.insert(picked.uid.clone());
-                                match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid) {
+                                match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid, &creds.token) {
                                     Ok(new_token) => {
                                         state.wb_pool.update_jwt(&picked.uid, &new_token);
                                         creds.token = new_token;
@@ -1138,7 +1138,7 @@ pub async fn wb_aggregate_chat(
                             RetryAction::SwitchKey => {
                                 if status == 401 && !refreshed.contains(&picked.uid) {
                                     refreshed.insert(picked.uid.clone());
-                                    match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid) {
+                                    match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid, &creds.token) {
                                         Ok(new_token) => {
                                             state.wb_pool.update_jwt(&picked.uid, &new_token);
                                             creds.token = new_token;
@@ -1505,7 +1505,7 @@ pub async fn wb_tool_exec_chat(
                             RetryAction::SwitchKey => {
                                 if status == 401 && !refreshed.contains(&picked.uid) {
                                     refreshed.insert(picked.uid.clone());
-                                    match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid) {
+                                    match wb_upstream::refresh_access_token(&state.data_dir, &picked.uid, &creds.token) {
                                         Ok(new_token) => {
                                             state.wb_pool.update_jwt(&picked.uid, &new_token);
                                             creds.token = new_token;
