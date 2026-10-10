@@ -452,6 +452,8 @@ pub fn update_account_jwt(ctx: &ProxyCtx, user_id: &str, jwt_full: &str) -> &'st
 /// 并发读（签到/另一次捕获）会看到半更新数据）。
 /// 语义对齐 Python 两函数合用：JWT exp 防降级（skipped 不阻塞 refresh 更新）、
 /// refresh 同值 unchanged、追加账号时两者一并写入。
+/// 锁序：持 ACCOUNTS_LOCK 期间嵌套获取 ACCOUNT_COOLDOWNS_LOCK（clear_cooldown）
+/// 为全库唯一嵌套点，单向无死锁（详见 clear_cooldown 内锁序声明）。
 fn update_account_jwt_and_refresh(
     ctx: &ProxyCtx,
     user_id: &str,
@@ -569,6 +571,14 @@ fn write_accounts(ctx: &ProxyCtx, cfg: &serde_json::Value) -> Result<(), String>
 /// Python 版实为 NameError 空转，此处为真实修复）
 fn clear_cooldown(ctx: &ProxyCtx, user_id: &str) {
     // SQLite 化（P3）：冷却状态经 store 读写
+    // C4（审查）：整表 load→save 持 ACCOUNT_COOLDOWNS_LOCK——与签到
+    // save_cooldown/手动清理命令并发时防整表覆盖丢条目（与 accounts.rs 修复同构）。
+    // 锁序声明：唯一嵌套调用点 update_account_jwt_and_refresh 持 ACCOUNTS_LOCK
+    // 后进入本函数，锁序恒为 ACCOUNTS_LOCK → ACCOUNT_COOLDOWNS_LOCK（全库无反向
+    // 获取路径，无死锁）；其余调用点（签到/手动清理/解冻回写）均作叶子锁使用
+    let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut cd = crate::store::docs::account_cooldowns_load(&crate::store::db(&ctx.data_dir));
     if cd.cooldowns.remove(user_id).is_some() {
         cd.updated_at = Some(crate::fs_utils::now_iso());

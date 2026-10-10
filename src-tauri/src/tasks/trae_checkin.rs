@@ -821,19 +821,10 @@ mod tests {
             humanize_device_limit("该账户数量超出套餐范围"),
             "该账户数量超出套餐范围"
         );
-        // 未命中 → 原样透传（不影响常规错误可见性）
+        // 未命中 → 原样透传（不影响常规错误可见性；含「账户数量」/「已达上限」
+        // 但与设备绑定无关的错误不再被误追加引导）
         assert_eq!(humanize_device_limit("HTTP 502"), "HTTP 502");
         assert_eq!(humanize_device_limit(""), "");
-        // 审查修复：含「账户数量」但与设备绑定无关的错误不再被误追加引导
-        assert_eq!(
-            humanize_device_limit("该账户数量超出套餐范围"),
-            "该账户数量超出套餐范围"
-        );
-        // 审查修复：含「已达上限」但与设备绑定无关的错误同样不误追加
-        assert_eq!(
-            humanize_device_limit("当前套餐使用额度已达上限"),
-            "当前套餐使用额度已达上限"
-        );
     }
 
     #[test]

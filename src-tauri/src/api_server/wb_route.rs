@@ -843,6 +843,14 @@ fn run_wb_stream(
                                         // classify_error→note_error，防瞬时忙态误置 disabled；
                                         // 对方刷新结果由下轮请求持锁双检/stale 对比复用
                                         if e == wb_upstream::ERR_PEER_REFRESHING {
+                                            // 即时观测日志：接通「401→他方刷新→换号」反查通道
+                                            //（与其余换号路径一致；此为中间态，usage 由终态统一落账）
+                                            state.logger.log_request(
+                                                "buddy", "POST", "/v2/chat/completions", model, true, status, &picked.uid,
+                                                start_ts.elapsed().as_millis() as u64,
+                                                &key_name, &state.wb_pool.name_of(&picked.uid),
+                                                Some("401 → 他方进程刷新中，换号（未记冷却）"),
+                                            );
                                             break;
                                         }
                                     }
@@ -1160,6 +1168,14 @@ pub async fn wb_aggregate_chat(
                                             // 他方进程刷新中：本轮换号且不走 note_error（防瞬时
                                             // 忙态误置 disabled），对方刷新结果由下轮请求复用
                                             if e == wb_upstream::ERR_PEER_REFRESHING {
+                                                // 即时观测日志：接通「401→他方刷新→换号」反查通道
+                                                //（此为中间态，usage 由终态路径统一落账）
+                                                state.logger.log_request(
+                                                    "buddy", "POST", "/v2/chat/completions", &model, stream, status, &picked.uid,
+                                                    start_ts.elapsed().as_millis() as u64,
+                                                    &key_name, &state.wb_pool.name_of(&picked.uid),
+                                                    Some("401 → 他方进程刷新中，换号（未记冷却）"),
+                                                );
                                                 break;
                                             }
                                         }
@@ -1539,6 +1555,14 @@ pub async fn wb_tool_exec_chat(
                                             // classify_error→note_error 防误置 disabled），外层
                                             // 换号重试；对方刷新结果由下轮请求持锁双检复用
                                             if e == wb_upstream::ERR_PEER_REFRESHING {
+                                                // 即时观测日志：接通「401→他方刷新→换号」反查通道
+                                                //（与其余路径一致；此为中间态，usage 由终态统一落账）
+                                                state.logger.log_request(
+                                                    "buddy", "POST", "/v1/responses", &model, stream, status, &picked.uid,
+                                                    start_ts.elapsed().as_millis() as u64,
+                                                    &key_name, &state.wb_pool.name_of(&picked.uid),
+                                                    Some("401 → 他方进程刷新中，换号（未记冷却）"),
+                                                );
                                                 break Err(format!(
                                                     "wb-toolexec refresh uid={} 他方进程正在刷新，本轮换号",
                                                     picked.uid

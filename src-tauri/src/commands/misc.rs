@@ -18,6 +18,11 @@ pub const INVITE_LINK: &str =
 #[tauri::command]
 pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), String> {
     // SQLite 化（P3）：device_map.json → device_map 表
+    // C3（审查）：整表 load→save 持 DEVICE_MAP_LOCK（叶子锁）——与签到写回/
+    // OAuth 登录回写并发时防整表覆盖丢条目（删除被并发回写复活）
+    let _g = crate::store::docs::DEVICE_MAP_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let store = crate::store::db(&state.data_dir);
     let mut map: DeviceMap = crate::store::docs::device_map_load(&store);
     map.remove(&user_id);

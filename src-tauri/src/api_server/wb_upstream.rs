@@ -519,7 +519,9 @@ pub fn refresh_access_token(
         .set("Content-Type", "application/json")
         .send_string("{}");
     let body: serde_json::Value = match resp {
-        Ok(r) => r.into_json().unwrap_or_default(),
+        // 区分「响应体读取失败」与「读取成功但无 accessToken」——后者才是需要
+        // 上层引导重新登录的语义，前者是传输/解码层故障（对齐 wb_common P2 口径）
+        Ok(r) => r.into_json().map_err(|e| format!("刷新响应读取失败: {e}"))?,
         Err(ureq::Error::Status(code, _)) => {
             return Err(format!("刷新失败（HTTP {code}）：refresh token 可能已失效，需重新登录"))
         }

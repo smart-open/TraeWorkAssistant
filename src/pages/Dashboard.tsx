@@ -145,6 +145,10 @@ export default function Dashboard() {
         /* 积分刷新失败不阻断整体刷新提示 */
       }
       toast('success', '已刷新');
+    } catch {
+      // 结构性兜底：当前 9 个 refresh 成员均内部吞错，但未来任一成员改为可 reject
+      // 时不能静默失败（unhandled rejection + 用户无反馈）
+      toast('error', '刷新失败，请稍后重试');
     } finally {
       setRefreshing(false);
     }

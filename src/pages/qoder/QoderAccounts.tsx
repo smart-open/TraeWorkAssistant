@@ -604,7 +604,8 @@ export default function QoderAccounts() {
         filters: [{ name: 'JSON', extensions: ['json'] }],
       });
       if (!filePath) {
-        // 取消保存对话框视同关闭弹框：清空密码残留，避免下次导出被预填（审查 F2 同语义）
+        // 取消保存对话框：凭据确认子弹框已先关闭，仅清空密码残留避免下次导出
+        // 被预填（审查 F2 同语义）；导出弹框保持打开供用户重试
         setExportPwd('');
         setExportPwd2('');
         return;
@@ -1623,7 +1624,8 @@ export default function QoderAccounts() {
         </div>
       </Modal>
 
-      {/* 分组管理弹窗（对齐 BuddyAccounts：复用 GroupsModal，强加 Buddy 分组体系） */}
+      {/* 分组管理弹窗（对齐 BuddyAccounts：复用 GroupsModal，强加 Buddy 分组体系）；
+          F14：四回调失败 toast 后 rethrow，由 GroupsModal 统一捕获防 unhandled rejection */}
       <GroupsModal
         open={groupOpen}
         onClose={() => setGroupOpen(false)}
@@ -1631,41 +1633,41 @@ export default function QoderAccounts() {
         onCreate={async (name, color) => {
           try {
             await api.qoder.groups.create(name, color);
+            reloadGroups();
           } catch (err) {
             pushToast('error', `新建分组失败：${String(err)}`);
-            return;
+            throw err;
           }
-          reloadGroups();
         }}
         onRename={async (id, name) => {
           try {
             await api.qoder.groups.update(id, { name });
+            reloadGroups();
           } catch (err) {
             pushToast('error', `重命名失败：${String(err)}`);
-            return;
+            throw err;
           }
-          reloadGroups();
         }}
         onRecolor={async (id, color) => {
           try {
             await api.qoder.groups.update(id, { color });
+            reloadGroups();
           } catch (err) {
             pushToast('error', `修改颜色失败：${String(err)}`);
-            return;
+            throw err;
           }
-          reloadGroups();
         }}
         onDelete={async (id) => {
           try {
             await api.qoder.groups.remove(id);
+            // 组内账号本地同步回落「未分组」（后端 with_pool_mut 已置空，前端对齐）
+            setAccounts((prev) => prev.map((x) => (x.group_id === id ? { ...x, group_id: '' } : x)));
+            if (filter === id) setFilter('all');
+            reloadGroups();
           } catch (err) {
             pushToast('error', `删除分组失败：${String(err)}`);
-            return;
+            throw err;
           }
-          // 组内账号本地同步回落「未分组」（后端 with_pool_mut 已置空，前端对齐）
-          setAccounts((prev) => prev.map((x) => (x.group_id === id ? { ...x, group_id: '' } : x)));
-          if (filter === id) setFilter('all');
-          reloadGroups();
         }}
       />
 

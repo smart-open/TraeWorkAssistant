@@ -110,6 +110,12 @@ const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   refresh_remaining_credits: 600_000,
   // 证书安装：PowerShell RunAs 触发 UAC，等待用户点击无时长上限（取消/失败会立即返回错误）
   cert_install: null,
+  // OAuth 回调交换：后端最多 5 个协议变体串行兜底探测（单请求内部超时 120s），
+  // 最坏总耗时可达 600s，默认 120s 会让前端先报超时而后端仍在交换，放宽到 11 分钟。
+  // oauth_login 内部调用同一套 oauth_parse_callback 交换逻辑（手动粘贴登录的实际链路），
+  // 两者须同放宽，否则覆盖形同虚设
+  oauth_parse_callback: 660_000,
+  oauth_login: 660_000,
 };
 
 /** F11：底层错误在源头翻译为可读文案——剥冗余 "Error: " 前缀、网络类错误转人话；
