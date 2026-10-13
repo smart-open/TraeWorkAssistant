@@ -240,6 +240,8 @@ pub fn stream_forward_ex(
     // 真实内容标记（正文/思考链/工具调用任一非空）：空完成（影子风控）检测依据
     // （issue #57）；占位帧（Responses created / 空 delta chunk）不计入
     let mut has_content = false;
+    // OpenAI 归一化：role 只在首个下发帧保留（部分上游每个 delta 都带 role）
+    let mut openai_role_sent = false;
     let mut usage: Option<Value> = None;
     let mut error_info: Option<(i64, String)> = None;
 
@@ -611,23 +613,60 @@ pub fn stream_forward_ex(
                 } else {
                     match proto {
                         crate::api_server::routes::Protocol::OpenAi => {
-                            // OpenAI chunk 归一化透传（rewrite id/model）
-                            let mut choice = json!({"index":0,"delta":delta});
-                            if !finish.is_empty() {
-                                choice["finish_reason"] = json!(finish);
+                            // OpenAI chunk 归一化透传（rewrite id/model）。
+                            // SSE 归一化（严格客户端思考碎片化修复）：部分上游（cmb 系）
+                            // 每个 delta 都携带 tool_calls:[] / role:"assistant" / 空串
+                            // content·reasoning_content·refusal / null extra_fields·function_call
+                            // 噪声字段；AI SDK 系流式客户端见到 tool_calls 字段（含空数组）
+                            // 即认为思考已结束，把 reasoning part 封口重开，一次深度思考
+                            // 被撕成数百个碎片。透传前就地剥除：空 tool_calls 数组、非首个
+                            // delta 的 role、空串字段与恒 null 噪声键；剥空且无 finish/usage
+                            // 的纯噪声帧整帧不下发（sent_any 语义不变，issue #57 空完成
+                            // 哨兵不受影响）。
+                            let mut delta = delta;
+                            if let Some(obj) = delta.as_object_mut() {
+                                if obj
+                                    .get("tool_calls")
+                                    .and_then(|v| v.as_array())
+                                    .map_or(false, |a| a.is_empty())
+                                {
+                                    obj.remove("tool_calls");
+                                }
+                                if openai_role_sent {
+                                    obj.remove("role");
+                                } else if obj.contains_key("role") {
+                                    openai_role_sent = true;
+                                }
+                                for key in ["content", "reasoning_content", "refusal"].iter() {
+                                    if obj.get(*key).and_then(|v| v.as_str()) == Some("") {
+                                        obj.remove(*key);
+                                    }
+                                }
+                                for key in ["extra_fields", "function_call"].iter() {
+                                    if obj.get(*key).map_or(false, |v| v.is_null()) {
+                                        obj.remove(*key);
+                                    }
+                                }
                             }
-                            let mut chunk = json!({
-                                "id": if id.is_empty() { chat_id.to_string() } else { id },
-                                "object": "chat.completion.chunk",
-                                "created": now_ts(),
-                                "model": model,
-                                "choices": [choice],
-                            });
-                            if let Some(x) = &usage {
-                                chunk["usage"] = x.clone();
+                            let frame_empty = delta.as_object().map_or(true, |o| o.is_empty());
+                            if !(frame_empty && finish.is_empty() && usage.is_none()) {
+                                let mut choice = json!({"index":0,"delta":delta});
+                                if !finish.is_empty() {
+                                    choice["finish_reason"] = json!(finish);
+                                }
+                                let mut chunk = json!({
+                                    "id": if id.is_empty() { chat_id.to_string() } else { id },
+                                    "object": "chat.completion.chunk",
+                                    "created": now_ts(),
+                                    "model": model,
+                                    "choices": [choice],
+                                });
+                                if let Some(x) = &usage {
+                                    chunk["usage"] = x.clone();
+                                }
+                                send!(format!("data: {}\n\n", chunk));
+                                sent_any = true;
                             }
-                            send!(format!("data: {}\n\n", chunk));
-                            sent_any = true;
                         }
                         crate::api_server::routes::Protocol::OpenAiText => {
                             // delta.content → text 块；tool_calls 无对应字段跳过
@@ -1239,6 +1278,81 @@ mod tests {
         assert_eq!(err.unwrap(), (9, "boom".to_string()));
         assert!(!sent_any);
         assert!(!failed_inline);
+    }
+
+    /// SSE 归一化（严格客户端思考碎片化修复）：上游每个 delta 都携带
+    /// tool_calls:[] / role / 空串与 null 噪声字段 → 下游帧剥离空 tool_calls、
+    /// 非首个 role、空串与 null 噪声；纯噪声帧不下发；思考与正文内容不受影响
+    #[test]
+    fn stream_forward_openai_strips_verbose_delta_noise() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let verbose = |text: &str| {
+            format!(
+                "data: {}",
+                json!({"choices":[{"delta":{
+                    "content":"","extra_fields":null,"function_call":null,
+                    "reasoning_content":text,"refusal":"","role":"assistant","tool_calls":[]
+                },"index":0}],"created":1,"id":"cmb_x","model":"step-5-preview"})
+            )
+        };
+        let noise_only = verbose("");
+        let content_chunk = format!(
+            "data: {}",
+            json!({"choices":[{"delta":{
+                "content":"你好","extra_fields":null,"function_call":null,
+                "reasoning_content":"","refusal":"","role":"assistant","tool_calls":[]
+            },"index":0}],"created":1,"id":"cmb_x","model":"step-5-preview"})
+        );
+        let finish_chunk = format!(
+            "data: {}",
+            json!({"choices":[{"delta":{
+                "content":"","extra_fields":null,"function_call":null,
+                "reasoning_content":"","refusal":"","role":"assistant","tool_calls":[]
+            },"index":0,"finish_reason":"stop"}],"created":1,"id":"cmb_x","model":"step-5-preview","usage":{"prompt_tokens":1,"completion_tokens":2}})
+        );
+        let l0 = verbose("The");
+        let l1 = verbose(" user");
+        let lines = lines(&[
+            l0.as_str(),
+            "",
+            l1.as_str(),
+            "",
+            noise_only.as_str(),
+            "",
+            content_chunk.as_str(),
+            "",
+            finish_chunk.as_str(),
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, failed_inline, _u) =
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new());
+        assert!(err.is_none() && sent_any && !failed_inline);
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        // 空 tool_calls 数组必须剥除（AI SDK 见字段即封口思考 part）
+        assert!(!body.contains("\"tool_calls\":[]"), "空 tool_calls 未剥除: {body}");
+        // role 只保留首个下发帧
+        assert_eq!(
+            body.matches("\"role\":\"assistant\"").count(),
+            1,
+            "role 应只出现一次: {body}"
+        );
+        // 纯噪声帧整帧不下发（收尾帧 delta 也为空但必带 finish_reason，不受影响）
+        assert!(
+            !body.contains("\"delta\":{},\"index\""),
+            "纯噪声帧未跳过: {body}"
+        );
+        // 思考/正文内容完整，收尾照常
+        assert!(body.contains("\"reasoning_content\":\"The\""), "{body}");
+        assert!(body.contains("\"reasoning_content\":\" user\""), "{body}");
+        assert!(body.contains("\"content\":\"你好\""), "{body}");
+        assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
     }
 
     /// Anthropic message_delta 的 usage 附带 input_tokens（上游已知时）
