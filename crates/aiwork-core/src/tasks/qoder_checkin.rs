@@ -189,6 +189,11 @@ const EMPTY_CAMPAIGNS_TAG: &str = "empty_campaigns";
 /// 是否冷却重试，避免全天约 28 轮无效重试（审查 minor）
 const PERMANENT_AUTH_TAG: &str = "permanent_auth";
 
+/// 409 过期 id 特征码（describe_blind_failure 的 409 分支与
+/// fallback_with_relearn 的同轮补学重试共用，勿在消费侧绕开常量硬编码）：
+/// 上游 claim 对过期活动返回 `{"code":{"code":"CAMPAIGN_NOT_ACTIVE",...}}`。
+const CAMPAIGN_NOT_ACTIVE_TAG: &str = "CAMPAIGN_NOT_ACTIVE";
+
 /// 拉取活动列表（**全量，不过滤**）。返回 Ok(全量 campaign 列表)；
 /// Err(kind, message)：auth（401，调用方刷新重试）| fail。
 /// 全量返回的原因：列表内 CLAIMED grant 是「每日奖励已领取」的判定数据源
@@ -430,22 +435,31 @@ fn claim_one(
 
 // ── 已知每日活动兜底直领 ────────────────────────────────────────────────────
 //
-// 根因（探针 probe_sash_campaigns_headers 实证）：campaigns 列表端点对工具
-// 请求形态按投放条件过滤 CLAIMABLE 条目（已领 grant 无条件展示），工具全天
-// 看不到 CLAIMABLE → 列表零可领项 → 依赖盲发兜底；而 claim 端点不受列表过滤
-// 约束（幂等，重复领取返回 replayed=true 回放）。extend_client_device_headers
-// 头对齐生效后列表应可见 CLAIMABLE，本表仅作列表仍不可见时的兜底。
+// 根因（探针 probe_sash_campaigns_headers 实证）：campaigns 列表端点按请求
+// 形态分桶投放——「带设备指纹头族」的容器请求形态看不到 CLAIMABLE 条目（已领
+// grant 无条件展示），列表零可领项 → 依赖盲发兜底；而 claim 端点不受列表过滤
+// 约束（幂等，重复领取返回 replayed=true 回放）。
 //
-// ⚠ 每日轮换：每日 100 Credits 活动的 campaignId 每天更换（UUIDv7 前缀+随机
-// 后缀，单日 24h 窗口；下表 ID = act-20260930-664，2026-10-07 当日窗口）。过期
-// ID 盲发会得到非成功响应——经 classify_blind_step 如实归 Failed（fail 触发
-// 指数退避重试与 UI 真话），不再静默归 already（2026-10-07「已领（此前已领）」
-// 误报的直接根因）。过期 ID 由 learn_daily_campaign_ids 从当日活动列表自动
-// 重学覆盖（重学候选优先于本表），本表仅作列表结构变更致重学失效时的人工兜底。
+// ⚠ 活动批次轮换：每日 100 Credits 的 campaignId 随活动批次更换（campaignKey
+// 形如 act-YYYYMMDD-NNN，一批数日窗口，同批内 id 不变）。过期 ID 盲发得到
+// 409 CAMPAIGN_NOT_ACTIVE——经 classify_blind_step 如实归 Failed（宁 fail 不假
+// already），不再静默归 already（2026-10-07「已领（此前已领）」误报的根因）。
+//
+// 2026-10-14 全天 409 事故固化——过期 id 由三路自动/半自动补正（候选优先级
+// conf 覆盖表 > 当日重学 > 本表）：
+//   ① learn_daily_campaign_ids：从当日活动列表重学（列表含已领 grant 时可用）；
+//   ② learn_from_min_headers：最小头补学（只带鉴权四件套，不带设备指纹头族）
+//      ——10-14 探针实证同 IP 同 token 下，最小头请求形态可见 CLAIMABLE 条目，
+//      而带派生设备头的容器形态全天不可见（当日在 409 全败的直接根因）；
+//   ③ conf 覆盖表 <conf>/qoder_campaigns.json：免重编译人工下发（格式见
+//      parse_conf_campaigns），上游换批次而①②失效时改文件即可。
+// 本表为最后人工兜底（①②③皆失效时）；更新时直接替换下方条目。
 /// 已知每日活动常量表：(campaignId, 展示名)。campaignId 仅允许 [A-Za-z0-9_-]
 ///（路径安全白名单，known_daily_fallback 内强制校验）。
+/// 当前条目 = act-20261013-603（2026-10-14 探针实测，窗口 10-14 10:00 →
+/// 10-15 10:29 CST，盲发直领 4/4 账号 200+CLAIMED+replayed=false）。
 const KNOWN_DAILY_CAMPAIGNS: &[(&str, &str)] = &[
-    ("01a0f1cd-945c-7217-b373-f62e70da792d", "每日领 100 Credits"),
+    ("01a130ea-7c31-71b3-a22b-cbe019571350", "每日领 100 Credits"),
 ];
 
 /// 从活动列表学习当日「每日 100 Credits」活动 id（issue #66 健壮性①：每日轮换
@@ -499,6 +513,183 @@ fn merge_learned(learned: &mut Vec<(String, String)>, found: Vec<(String, String
     for (id, name) in found {
         if !learned.iter().any(|(e, _)| e == &id) {
             learned.push((id, name));
+        }
+    }
+}
+
+// ── conf 覆盖表与最小头补学（2026-10-14 全天 409 事故固化）──────────────────
+
+/// conf 覆盖表解析（纯函数，可单测）。文件格式两种皆收：
+///   [{"id": "...", "name": "每日领 100 Credits"}, ...]
+///   {"campaigns": [...同上...]}
+/// id 校验与路径白名单同口径（[A-Za-z0-9_-]，len 1..=128）；name 缺失回退 id
+/// 前 8 位；解析失败/非法条目静默忽略（调用方 load_campaign_table 负责 app_log
+/// 留痕，本层保持纯函数）。
+fn parse_conf_campaigns(raw: &str) -> Vec<(String, String)> {
+    let Ok(v) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let arr = match v {
+        Value::Array(_) => Some(&v),
+        Value::Object(_) => v.get("campaigns").filter(|c| c.is_array()),
+        _ => None,
+    };
+    let Some(arr) = arr.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for c in arr {
+        let Some(id) = fs_utils::dig(c, &["id", "campaignId", "campaign_id"])
+            .and_then(Value::as_str)
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if id.is_empty()
+            || id.len() > 128
+            || !id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            continue;
+        }
+        let cname = fs_utils::dig(c, &["name", "title"])
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| id.chars().take(8).collect());
+        out.push((id.to_string(), cname));
+    }
+    out
+}
+
+/// 常量表与 conf 条目合并（纯函数，可单测）：conf 在前（人工下发的最新 id 优先
+/// 盲发），常量表按 id 去重补后。
+fn merge_campaign_table(
+    mut conf: Vec<(String, String)>,
+    builtins: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    for (id, name) in builtins {
+        if !conf.iter().any(|(e, _)| e == id) {
+            conf.push(((*id).to_string(), (*name).to_string()));
+        }
+    }
+    conf
+}
+
+/// 装配本轮盲发候选常量表：conf 覆盖表（<conf>/qoder_campaigns.json，每轮读取，
+/// 免重编译换 id）+ KNOWN_DAILY_CAMPAIGNS 去重补后。文件存在但零有效条目时
+/// app_log 留痕（人工改错的可见性）。
+fn load_campaign_table(state: &AppState) -> Vec<(String, String)> {
+    let raw = std::fs::read_to_string(state.conf_path("qoder_campaigns.json")).ok();
+    let conf = raw.as_deref().map(parse_conf_campaigns).unwrap_or_default();
+    if raw.is_some() && conf.is_empty() {
+        fs_utils::app_log(
+            &state.data_dir,
+            "[qoder] conf 覆盖表 qoder_campaigns.json 存在但无有效条目（格式见 parse_conf_campaigns），已忽略",
+        );
+    } else if !conf.is_empty() {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] conf 覆盖表载入 {} 条活动 id（优先于内置常量表）", conf.len()),
+        );
+    }
+    merge_campaign_table(conf, KNOWN_DAILY_CAMPAIGNS)
+}
+
+/// 最小头（只带鉴权四件套）请求头：不带设备指纹头族（Cosy-MachineId/MachineToken/
+/// Version/MachineOS/MachineHostname/MachineCode/MachineType）。
+///
+/// 依据（2026-10-14 19:26 探针实证）：上游 campaigns 列表按请求形态分桶投放，
+/// 带派生设备头的容器形态全天看不到 CLAIMABLE 条目，同 IP 同 token 的最小头
+/// 请求可见；claim 端点两形态均可用。仅用于列表学习，不替代主请求形态。
+fn minimal_auth_headers(access_token: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "Authorization".to_string(),
+            format!("Bearer {access_token}"),
+        ),
+        (
+            "Cosy-ClientType".to_string(),
+            qoder_common::COSY_CLIENT_TYPE.to_string(),
+        ),
+        (
+            "User-Agent".to_string(),
+            qoder_common::CLIENT_USER_AGENT.to_string(),
+        ),
+        ("Content-Type".to_string(), "application/json".to_string()),
+    ]
+}
+
+/// Unix 秒 → "MM-DD HH:MM"（CST）诊断展示（窗口起止用；解析失败给空串）。
+fn cst_hhmm(secs: i64) -> String {
+    use chrono::TimeZone;
+    chrono::FixedOffset::east_opt(8 * 3600)
+        .and_then(|tz| tz.timestamp_opt(secs, 0).single())
+        .map(|t| t.format("%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// 最小头补学：以最小头拉一次活动列表并重学当日「每日 100 Credits」id。
+/// 与主列表请求同端点（GET 幂等，无副作用）；失败/空表返回空（尽力而为，
+/// 不阻塞主流程）。列表视野（脱敏：activityKey/id/状态/窗口，无任何凭证）
+/// 全量落 app_log——2026-10-14 排障时「工具到底看到了什么」无据可查的教训。
+fn learn_from_min_headers(
+    state: &AppState,
+    agent: &ureq::Agent,
+    access_token: &str,
+    urls: &QoderUrls,
+    now_secs: i64,
+) -> Vec<(String, String)> {
+    let headers = minimal_auth_headers(access_token);
+    match list_campaigns(agent, &headers, urls) {
+        Ok(campaigns) => {
+            let learned = learn_daily_campaign_ids(&campaigns, now_secs);
+            let view: Vec<String> = campaigns
+                .iter()
+                .map(|c| {
+                    let key = s_of(c.get("campaignKey"));
+                    let cid = s_of(fs_utils::dig(c, &["campaignId", "campaign_id"]));
+                    let act = s_of(c.get("actionType"));
+                    let st = s_of(fs_utils::dig(c, &["claimStatus", "claim_status"]));
+                    let kind = c
+                        .get("benefit")
+                        .and_then(|x| x.get("kind"))
+                        .map(|v| s_of(Some(v)))
+                        .unwrap_or_default();
+                    let start = c
+                        .get("startAt")
+                        .and_then(|v| num_or_none(Some(v)))
+                        .map(|v| v as i64)
+                        .unwrap_or(0);
+                    let end = c
+                        .get("endAt")
+                        .and_then(|v| num_or_none(Some(v)))
+                        .map(|v| v as i64)
+                        .unwrap_or(0);
+                    format!(
+                        "{key}({cid} {act}/{st}/{kind} {}~{})",
+                        cst_hhmm(start),
+                        cst_hhmm(end)
+                    )
+                })
+                .collect();
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[qoder] 最小头列表视野 {} 条，可学 {}：{}",
+                    campaigns.len(),
+                    learned.len(),
+                    view.join("；")
+                ),
+            );
+            learned
+        }
+        Err((k, m)) => {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("[qoder] 最小头学习拉取失败（{k}）：{m}"),
+            );
+            Vec::new()
         }
     }
 }
@@ -561,7 +752,7 @@ fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String
     // 409 CAMPAIGN_NOT_ACTIVE（issue #66 健壮性②）：明确归因为「候选 id 错」
     // 而非账号/网络错——盲发到已过期的每日活动 id 的特征形态，给准确提示
     //（旧实现落通用「（HTTP 409）{head}」不可读，也与账号级失败无法区分）
-    if code == 409 && raw.contains("CAMPAIGN_NOT_ACTIVE") {
+    if code == 409 && raw.contains(CAMPAIGN_NOT_ACTIVE_TAG) {
         return "每日活动 id 已过期（409 CAMPAIGN_NOT_ACTIVE，活动每日轮换）——将从活动列表自动重学".into();
     }
     let head: String = raw.chars().take(120).collect();
@@ -619,20 +810,22 @@ fn aggregate_fallback(
 }
 
 /// 列表零 CLAIMABLE 时的每日活动盲发直领。候选序（issue #66 健壮性①）：
-/// **learned 优先**（learn_daily_campaign_ids 从当日列表重学的 id，最新鲜），
-/// 硬编码 KNOWN_DAILY_CAMPAIGNS 去重补后兜底。逐条盲发 claim，单步经
-/// classify_blind_step 归类后经 aggregate_fallback 聚合；任一 401 → 中断遍历
-/// 返回 `Auth`（已累计 reward 不丢弃）。409 过期 id 会从 `learned` 原地剔除
-///（&mut），同轮后续账号不再重复盲发。
+/// **learned 优先**（当日列表/最小头补学重学的 id，最新鲜），`table` 去重补后
+/// 兜底（conf 覆盖表 + 硬编码表，由 load_campaign_table 装配）。逐条盲发
+/// claim，单步经 classify_blind_step 归类后经 aggregate_fallback 聚合；任一
+/// 401 → 中断遍历返回 `Auth`（已累计 reward 不丢弃）。409 过期 id 会从
+/// `learned` 与 `table` 原地剔除（&mut），同轮后续账号不再重复盲发同一 409
+///（table 是整轮共享的候选池，剔除跨账号生效）。
 fn known_daily_fallback(
     agent: &ureq::Agent,
     headers: &[(String, String)],
     learned: &mut Vec<(String, String)>,
+    table: &mut Vec<(String, String)>,
 ) -> FallbackOutcome {
     let mut candidates: Vec<(String, String)> = learned.clone();
-    for (cid, cname) in KNOWN_DAILY_CAMPAIGNS {
+    for (cid, cname) in table.iter() {
         if !candidates.iter().any(|(e, _)| e == cid) {
-            candidates.push((cid.to_string(), cname.to_string()));
+            candidates.push((cid.clone(), cname.clone()));
         }
     }
     let mut messages: Vec<String> = Vec::new();
@@ -684,12 +877,13 @@ fn known_daily_fallback(
             }
             BlindStep::Failed(code) => {
                 let reason = describe_blind_failure(code, claimed.as_deref(), &raw);
-                // 409 CAMPAIGN_NOT_ACTIVE = 候选 id 过期（活动每日轮换）→ 归
+                // 409 CAMPAIGN_NOT_ACTIVE = 候选 id 过期（活动批次轮换）→ 归
                 // stale_parts 不掩码新鲜成功/回放；其余真实失败照旧掩码。
-                // 过期 id 同步从本轮共享学习池剔除（审查修复：跨午夜竞态下
-                // 首个账号学到的 id 已过期时，后续账号不再重复盲发同一 409）
-                if code == 409 && raw.contains("CAMPAIGN_NOT_ACTIVE") {
+                // 过期 id 同步从本轮共享学习池与候选表剔除（审查修复：跨午夜
+                // 竞态下首个账号学到的 id 已过期时，后续账号不再重复盲发同一 409）
+                if code == 409 && raw.contains(CAMPAIGN_NOT_ACTIVE_TAG) {
                     learned.retain(|(e, _)| e != cid);
+                    table.retain(|(e, _)| e != cid);
                     stale_parts.push(format!("{cname} 盲发失败：{reason}"));
                 } else {
                     fail_parts.push(format!("{cname} 盲发失败：{reason}"));
@@ -701,15 +895,48 @@ fn known_daily_fallback(
     aggregate_fallback(any_fresh, any_replay, &messages, &fail_parts, &stale_parts, reward)
 }
 
+/// 盲发兜底 + 409 同轮自愈（2026-10-14 事故固化）：先正常盲发；若整批候选
+/// 均因 CAMPAIGN_NOT_ACTIVE 过期（无新鲜成功/回放/真实失败掩码），用最小头
+/// 补学一次（learn_from_min_headers），拿到新 id 立即重试盲发——同轮自愈，
+/// 不等调度器下一轮（旧实现 409 后只能等 30 分钟起步的退避重试，且下一轮
+/// 若主列表视野依旧不可见则永远收敛不了）。
+/// 注意：过期候选已在首轮盲发中从 learned/table 剔除，重试候选天然只含新 id。
+fn fallback_with_relearn(
+    state: &AppState,
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    urls: &QoderUrls,
+    access_token: &str,
+    learned: &mut Vec<(String, String)>,
+    table: &mut Vec<(String, String)>,
+) -> FallbackOutcome {
+    let outcome = known_daily_fallback(agent, headers, learned, table);
+    if let FallbackOutcome::Failed(m) = &outcome {
+        if m.contains(CAMPAIGN_NOT_ACTIVE_TAG) {
+            let before = learned.len();
+            let found =
+                learn_from_min_headers(state, agent, access_token, urls, chrono::Utc::now().timestamp());
+            merge_learned(learned, found);
+            if learned.len() > before {
+                return known_daily_fallback(agent, headers, learned, table);
+            }
+        }
+    }
+    outcome
+}
+
 /// 处理单账号签到（含 401 刷新一次重试，禁二次刷新）。返回 account 事件（不含 index）。
 /// `learned`：本轮跨账号共享的当日活动 id 重学习结果（多账号场景首个账号学到的
 /// id 直接惠及后续账号，campaign id 全局有效与账号无关）。
+/// `table`：本轮共享的盲发候选常量表（conf 覆盖表 + 内置表），409 过期 id 剔除
+/// 跨账号生效。
 fn process_account(
     state: &AppState,
     agent: &ureq::Agent,
     acct: &Value,
     opts: &QoderCheckinOpts,
     learned: &mut Vec<(String, String)>,
+    table: &mut Vec<(String, String)>,
 ) -> Value {
     let aid = s_of(acct.get("id"));
     let name = acct
@@ -765,6 +992,9 @@ fn process_account(
     // 体现为余额增长，不能凭「余额未动」判未到账——仅全 CREDITS 时才启用降级；
     // 盲发兜底候选口径强制 CREDITS，天然保持 true）
     let mut all_credits = true;
+    // 最小头补学的鉴权头（2026-10-14 固化：容器形态列表看不到 CLAIMABLE，
+    // 最小头形态可见；凭证就绪后构建一次，学习路径共用）
+    let min_token = creds.access_token.clone();
 
     let (mut kind, mut message, mut reward) = match list_campaigns(agent, &headers, &urls) {
         Ok(campaigns) => {
@@ -774,6 +1004,20 @@ fn process_account(
                 learned,
                 learn_daily_campaign_ids(&campaigns, chrono::Utc::now().timestamp()),
             );
+            // 健壮性①+：主列表（容器形态）零可学条目时，用最小头形态补学一次
+            //（learned 整轮共享，仅每轮首个扑空账号实际发起，后续账号跳过）
+            if learned.is_empty() {
+                merge_learned(
+                    learned,
+                    learn_from_min_headers(
+                        state,
+                        agent,
+                        &min_token,
+                        &urls,
+                        chrono::Utc::now().timestamp(),
+                    ),
+                );
+            }
             let claimable = filter_claimable(&campaigns);
             if claimable.is_empty() {
                 // 列表零 CLAIMABLE：campaigns 列表对工具请求形态按投放过滤
@@ -787,7 +1031,15 @@ fn process_account(
                 if daily_credits_claimed_in_list(&campaigns, now) {
                     ("already".into(), "每日奖励已领取".into(), None)
                 } else {
-                    match known_daily_fallback(agent, &headers, learned) {
+                    match fallback_with_relearn(
+                        state,
+                        agent,
+                        &headers,
+                        &urls,
+                        &min_token,
+                        learned,
+                        table,
+                    ) {
                         FallbackOutcome::Success(m, r) => ("success".into(), m, r),
                         FallbackOutcome::AlreadyReplayed => {
                             ("already".into(), "每日奖励已领取（盲发回放确认）".into(), None)
@@ -875,6 +1127,20 @@ fn process_account(
                             learned,
                             learn_daily_campaign_ids(&campaigns, chrono::Utc::now().timestamp()),
                         );
+                        // 重试路径同款最小头补学（learned 仍空时；整轮共享，通常
+                        // 首个账号已补学到位，此处多为空转跳过。用刷新后的新令牌）
+                        if learned.is_empty() {
+                            merge_learned(
+                                learned,
+                                learn_from_min_headers(
+                                    state,
+                                    agent,
+                                    &new.access_token,
+                                    &urls,
+                                    chrono::Utc::now().timestamp(),
+                                ),
+                            );
+                        }
                         let claimable = filter_claimable(&campaigns);
                         if claimable.is_empty() {
                             // 与首次路径同口径：先查列表内当日已领 grant，再盲发
@@ -883,7 +1149,15 @@ fn process_account(
                             if daily_credits_claimed_in_list(&campaigns, now) {
                                 ("already".into(), "每日奖励已领取".into(), None)
                             } else {
-                                match known_daily_fallback(agent, &headers, learned) {
+                                match fallback_with_relearn(
+                                    state,
+                                    agent,
+                                    &headers,
+                                    &urls,
+                                    &min_token,
+                                    learned,
+                                    table,
+                                ) {
                                     FallbackOutcome::Success(m, r) => ("success".into(), m, r),
                                     FallbackOutcome::AlreadyReplayed => (
                                         "already".into(),
@@ -1001,6 +1275,18 @@ fn process_account(
             &format!("qoder 签到空活动列表: {aid}（Cosy-ClientType={} 已带；若持续出现请核查活动状态/接口结构 R-9）", qoder_common::COSY_CLIENT_TYPE),
         );
     }
+    // 409 全过期诊断（2026-10-14 事故教训：当时只知道 409，不知道候选池还剩什么）
+    // ——记本轮候选池现状，供判断是「表过期未补」还是「补学也扑空（上游结构变更）」
+    if message.contains(CAMPAIGN_NOT_ACTIVE_TAG) {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "[qoder] 409 过期诊断 {aid}: learned={} table={}",
+                learned.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>().join(","),
+                table.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>().join(","),
+            ),
+        );
+    }
     let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": status_txt, "message": message });
     // 结构化失败类别（审查 L-empty_campaigns）：调度器/CLI/UI 统计一律消费
     // fail_kind 字段，不再各自耦合 message 文案；前缀派生已收敛到
@@ -1067,6 +1353,9 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
     // 当日活动 id 重学习结果（issue #66 健壮性①）：跨账号共享——campaign id 全局
     // 有效，首个账号学到的 id 直接供后续账号盲发兜底使用（多账号不再各自试错）
     let mut learned_ids: Vec<(String, String)> = Vec::new();
+    // 盲发候选常量表（conf 覆盖表 + 内置表；2026-10-14 固化）：整轮共享，
+    // 409 过期 id 从中剔除，跨账号不再重复盲发同一过期 id
+    let mut campaign_table = load_campaign_table(state);
     // 多账号签到间隔（任务配置页可改，默认 3s，0=关闭）：防上游频控，账号间串行等待
     let gap_secs = crate::models::effective_checkin_gap(state.settings().qoder_checkin_gap_secs);
     for (i, acct) in accounts.iter().enumerate() {
@@ -1074,7 +1363,7 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
         // 单账号失败不中断整轮（对齐 wb try/except 语义）
-        let mut ev = process_account(state, &agent, acct, opts, &mut learned_ids);
+        let mut ev = process_account(state, &agent, acct, opts, &mut learned_ids, &mut campaign_table);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);
@@ -1380,6 +1669,50 @@ mod tests {
         assert_eq!(learned.len(), 2);
         assert_eq!(learned[0], ("id-a".to_string(), "先到".to_string()));
         assert_eq!(learned[1], ("id-b".to_string(), "新".to_string()));
+    }
+
+    /// conf 覆盖表解析（2026-10-14 固化）：裸数组/对象包裹两种格式皆收；
+    /// id 路径白名单/长度校验；name 缺失回退 id 前 8 位；垃圾输入零条目
+    #[test]
+    fn parse_conf_campaigns_shapes() {
+        // 裸数组
+        let out = parse_conf_campaigns(
+            r#"[{"id":"abc-123","name":"每日领 100 Credits"}]"#,
+        );
+        assert_eq!(out, vec![("abc-123".to_string(), "每日领 100 Credits".to_string())]);
+        // 对象包裹 + name 缺失回退 id 前 8 位
+        let out = parse_conf_campaigns(
+            r#"{"campaigns":[{"campaignId":"01a130ea-7c31-71b3-a22b-cbe019571350"}]}"#,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, "01a130ea");
+        // 非法 id（路径白名单外字符）与缺 id 条目跳过；合法条目保留
+        let out = parse_conf_campaigns(
+            r#"[{"id":"../evil?"},{"id":"ok-1"},{"name":"no-id"}]"#,
+        );
+        assert_eq!(out, vec![("ok-1".to_string(), "ok-1".to_string())]);
+        // 超长 id 拒绝
+        let long = "a".repeat(129);
+        let out = parse_conf_campaigns(&format!(r#"[{{"id":"{long}"}}]"#));
+        assert!(out.is_empty());
+        // 垃圾输入 → 空（load_campaign_table 负责留痕，解析层保持纯函数）
+        assert!(parse_conf_campaigns("not json").is_empty());
+        assert!(parse_conf_campaigns(r#"{"other":1}"#).is_empty());
+    }
+
+    /// 候选表合并：conf 条目在前（人工下发的最新 id 优先盲发），常量表按 id
+    /// 去重补后
+    #[test]
+    fn merge_campaign_table_conf_first() {
+        let conf = vec![("new-id".to_string(), "新".to_string())];
+        let builtins = [("new-id", "重不覆盖"), ("old-id", "旧")];
+        let out = merge_campaign_table(conf, &builtins);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], ("new-id".to_string(), "新".to_string()));
+        assert_eq!(out[1], ("old-id".to_string(), "旧".to_string()));
+        // conf 为空 → 恰为常量表
+        let out = merge_campaign_table(Vec::new(), &builtins);
+        assert_eq!(out.len(), 2);
     }
 
     /// 盲发聚合判定（issue #66 健壮性②）：stale（409 id 过期）不掩码新鲜成功/
