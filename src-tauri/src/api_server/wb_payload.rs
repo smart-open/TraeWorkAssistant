@@ -393,6 +393,11 @@ pub fn empty_sample_note(exhaust_tag: &str, pool: &str, body: &[u8]) -> String {
     if exhaust_tag != "CHANNEL_FINGERPRINT_BLOCK" {
         return String::new();
     }
+    // 空 body（序列化失败 unwrap_or_default）不产生样本（审查修复 L）：
+    // "body 解析失败" 占位无诊断价值，不入环形缓冲占额
+    if body.is_empty() {
+        return String::new();
+    }
     let sample = fingerprint_sample(body);
     record_fingerprint_sample("empty", pool, &sample, &template_hit_note());
     format!(" 指纹样本: {sample}")

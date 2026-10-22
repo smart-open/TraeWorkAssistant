@@ -610,8 +610,11 @@ pub fn stream_forward_ex_ns(
                 if let Some(x) = u {
                     usage = Some(x);
                 }
-                // 真实内容标记（issue #57 空完成检测）：空 delta chunk 不计入
-                if delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                // 真实内容标记（issue #57 空完成检测）：空 delta chunk 不计入。
+                // 同帧载荷判定复用为 Anthropic message_start 的延迟发送条件
+                //（审查修复 L：纯噪声帧不再提前触发 message_start）
+                let frame_has_payload =
+                    delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
                     || delta
                         .get("reasoning_content")
                         .and_then(|c| c.as_str())
@@ -619,12 +622,18 @@ pub fn stream_forward_ex_ns(
                     || delta
                         .get("tool_calls")
                         .and_then(|t| t.as_array())
-                        .map_or(false, |a| !a.is_empty())
-                {
+                        .map_or(false, |a| !a.is_empty());
+                if frame_has_payload {
                     has_content = true;
                 }
                 if proto == crate::api_server::routes::Protocol::Anthropic {
-                    anthropic_start(tx, &mut message_started, chat_id, model);
+                    // 审查修复（issue #96 噪声帧 + 空完成换号重试协议违规）：
+                    // message_start 延迟到首个真实载荷帧再发——纯噪声 delta 帧
+                    // 不提前开启 message，避免空完成换号重试时同一 SSE 流收到
+                    // 重复 message_start / 悬空 message（严格客户端协议违规）
+                    if frame_has_payload {
+                        anthropic_start(tx, &mut message_started, chat_id, model);
+                    }
                     // T5.3/F-62：思考链增量 → thinking block（先于文本块）
                     if let Some(t) = delta.get("reasoning_content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
                         if !thinking_block_open {

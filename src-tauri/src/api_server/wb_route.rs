@@ -1361,15 +1361,22 @@ pub async fn wb_aggregate_chat(
                             exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK",
                         );
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无
-                        // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）
+                        // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）。
+                        // empty_sample_note 同时入环形缓冲（kind=empty，issue #125
+                        // 与流式/qoder 路径同口径，审查修复补齐本路径缺口）
                         if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                            let sample_note = wb_payload::empty_sample_note(
+                                &exhaust_tag,
+                                state.pool_label(),
+                                &body_vec,
+                            );
                             state.logger.log_debug_line(format!(
-                                "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool={} 指纹样本: {}",
+                                "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool={}{}",
                                 tried.len(),
                                 attempts,
                                 empty_hits,
                                 state.pool_label(),
-                                wb_payload::fingerprint_sample(&body_vec),
+                                sample_note,
                             ));
                         }
                         return Err(exhaust_msg);
@@ -1474,11 +1481,11 @@ pub async fn wb_aggregate_chat(
                         match (resp, error_info) {
                             (Some(mut r), None) => {
                                 if super::aggregated_response_is_empty(&r) {
-                                    // 空完成（影子风控/上游异常，issue #57）：换号重试，
-                                    // 口径同下方「empty response」（Server 级短冷却）
+                                    // 空完成（影子风控/上游异常，issue #57）：换号重试。
+                                    // 不冷却、不推高模型失败（审查修复 M5：与流式/toolexec
+                                    // 路径对齐——指纹拦截与账号/模型无关，记 Server 冷却
+                                    // 会把整池账号轮番打入冷却并掩盖 empty_hits 主导判定）
                                     empty_hits += 1;
-                                    state.route_pool().note_error(win_uid, ErrKind::Server);
-                                    note_model_failure(&state, &model);
                                     // 每请求终态单行（审查问题6）：换号是中间态不落账
                                     // （终局由后续成功行/耗尽 none 行统一落）
                                     state.logger.log_request_ttfb(
@@ -1512,7 +1519,8 @@ pub async fn wb_aggregate_chat(
                             (None, Some((code, msg))) => {
                                 // 11128 流内形态（issue #123）：口径同下方 Err 分支——
                                 // 未清洗 → 强制清洗同号重试一次；已清洗仍命中 →
-                                // 落指纹样本后换号（不冷却：指纹拦截与账号无关）
+                                // 落指纹样本后 Fatal 终局（不冷却：指纹拦截与账号
+                                // 无关，实现为下方 return，与注释对齐）
                                 if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
                                     if !sanitize {
                                         sanitize = true;
@@ -1542,7 +1550,9 @@ pub async fn wb_aggregate_chat(
                                     // 已清洗仍命中：指纹拦截与账号无关，换号必再命中
                                     //（issue #57 口径）——Fatal 终局，外层透传 400
                                     let fatal_msg = format!("upstream 400 error: 11128 {}", msg);
-                                    state.record_usage_bucket(state.usage_bucket(), &model, &picked.uid, &key_id, false, stream, duration_ms, 0, 0);
+                                    // 归因统一 win_uid（对冲胜者可能与 picked 不一致，
+                                    // 与下方日志及流式路径同口径，审查修复）
+                                    state.record_usage_bucket(state.usage_bucket(), &model, win_uid, &key_id, false, stream, duration_ms, 0, 0);
                                     state.logger.log_request_ttfb(
                                         state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 400, win_uid,
                                         duration_ms, Some(ttfb_ms), &key_name,
@@ -1819,6 +1829,9 @@ pub async fn wb_tool_exec_chat(
         let mut final_completion: Option<Value> = None;
         let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
         let mut last_err: Option<String> = None;
+        // 11128 清洗已启用仍命中（渠道指纹拦截，与账号无关）：Fatal 终局标记
+        //（审查修复 H1：toolexec 原走换号烧全池，口径对齐流式/聚合路径）
+        let mut fatal_11128: Option<String> = None;
         // F-76① TTFT：各轮首字耗时（最终轮即最终回复的首字延迟）
         let mut last_ttfb_ms: Option<u64> = None;
         // 请求级 usage 累加（跨账号跨轮次，含失败账号与中间轮的真实消耗）——
@@ -1931,7 +1944,8 @@ pub async fn wb_tool_exec_chat(
                             // 11128 流内形态（issue #123）：口径同下方 Err 分支——
                             // round 回退重跑当前轮（不消耗轮次，下一轮循环顶部
                             // 按新 sanitize 重建请求体）；已清洗仍命中 → 落指纹
-                            // 样本后按原路径换号（不冷却：指纹拦截与账号无关）
+                            // 样本后 Fatal 终局（不冷却：指纹拦截与账号无关，
+                            // 审查修复 H1，不再换号）
                             if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
                                 if !sanitize {
                                     sanitize = true;
@@ -1962,6 +1976,9 @@ pub async fn wb_tool_exec_chat(
                                 *safe_lock(&state.last_error) = Some(format!(
                                     "wb-toolexec uid={} code={} msg={}", picked.uid, code, msg
                                 ));
+                                // issue #57：已清洗仍命中 = 渠道指纹拦截，换号必再命中
+                                // ——Fatal 终局（口径对齐流式/聚合），不再换号烧全池
+                                fatal_11128 = Some(format!("upstream 400 error: 11128 {}", msg));
                                 break Err(msg);
                             }
                             let kind = classify_wb_error(code, &msg);
@@ -2104,6 +2121,14 @@ pub async fn wb_tool_exec_chat(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );
                             }
+                            // issue #57：已清洗仍命中 = 渠道指纹拦截，与账号无关
+                            // ——Fatal 终局（口径对齐流式/聚合路径），不再走
+                            // retry_plan 换号重试烧全池（审查修复 H1）
+                            fatal_11128 = Some(format!(
+                                "upstream 400 error: 11128 {}",
+                                safe_slice(&resp_body, 300)
+                            ));
+                            break Err(fatal_11128.clone().unwrap_or_default());
                         }
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
@@ -2174,6 +2199,12 @@ pub async fn wb_tool_exec_chat(
                 }
                 Err(e) => {
                     last_err = Some(e);
+                    // 11128 清洗已启用仍命中（渠道指纹拦截，与账号无关）→ Fatal
+                    // 终局，不再换号（H1 复审修正：仅设 fatal_11128 标记并 break Err
+                    // 不足以阻断本循环的 continue 换号，必须在此截断）
+                    if fatal_11128.is_some() {
+                        break;
+                    }
                     continue; // 换号
                 }
             }
@@ -2213,32 +2244,46 @@ pub async fn wb_tool_exec_chat(
                     state.pool_label(), "POST", "/v1/responses", &model, stream, 502, "wb-toolexec",
                     duration_ms, &key_name, "", last_err.as_deref(),
                 );
-                // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                Err(last_err.unwrap_or_else(|| {
-                    let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
-                    let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message("buddy", empty_hits, attempts, healthy_total);
+                // 11128 清洗已启用仍命中 → Fatal 终局透传（口径对齐流式/聚合，
+                // 审查修复 H1；usage/日志记账已在上方完成）
+                if let Some(fatal) = fatal_11128 {
+                    return Err(fatal);
+                }
+                // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义。
+                // 与 last_err 解耦（审查修复 M4）：toolexec 的空完成/失败路径均以
+                // break Err 收束并写入 last_err，若仅在 last_err 为 None 时计算，
+                // 本收尾（mark_channel_fp_block / kind=empty 样本）永不触发；现
+                // 无条件计算，空完成主导（CHANNEL_FINGERPRINT_BLOCK）时以
+                // exhaust_message 终局，否则沿用 last_err
+                let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
+                let (exhaust_msg, exhaust_tag) =
+                    super::routes::exhaust_message("buddy", empty_hits, attempts, healthy_total);
+                if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
                     // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
-                    super::wb_payload::mark_channel_fp_block(
-                        state.pool_label(),
-                        exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK",
-                    );
+                    super::wb_payload::mark_channel_fp_block(state.pool_label(), true);
                     // issue #99 ①：影子风控收尾落原始指纹样本（chat_body 轮末已追加
-                    // tool 消息，样本取首条 system + 工具清单，语义不受影响）
-                    if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                    // tool 消息，样本取首条 system + 工具清单，语义不受影响）。
+                    // empty_sample_note 同时入环形缓冲（kind=empty，issue #125
+                    // 与流式/聚合路径同口径，审查修复补齐本路径缺口）
+                    let body_vec = serde_json::to_vec(&chat_body).unwrap_or_default();
+                    let sample_note = wb_payload::empty_sample_note(
+                        &exhaust_tag,
+                        state.pool_label(),
+                        &body_vec,
+                    );
+                    if !sample_note.is_empty() {
                         state.logger.log_debug_line(format!(
-                            "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool={} 指纹样本: {}",
+                            "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool={}{}",
                             tried.len(),
                             attempts,
                             empty_hits,
                             state.pool_label(),
-                            wb_payload::fingerprint_sample(
-                                &serde_json::to_vec(&chat_body).unwrap_or_default()
-                            ),
+                            sample_note,
                         ));
                     }
-                    exhaust_msg
-                }))
+                    return Err(exhaust_msg);
+                }
+                Err(last_err.unwrap_or_else(|| exhaust_msg))
             }
         }
     })

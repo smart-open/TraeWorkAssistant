@@ -892,7 +892,11 @@ fn growth_tasks(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) 
     let mut skipped = 0usize;
     for t in tasks {
         let Some(obj) = t.as_object() else { continue };
-        if !py_truthy(obj.get("has_reward")) && fs_utils::dig(t, &["hasReward"]).is_none() {
+        if !py_truthy(obj.get("has_reward"))
+            && fs_utils::dig(t, &["hasReward"])
+                .map(|v| !py_truthy(Some(v)))
+                .unwrap_or(true)
+        {
             continue;
         }
         // accept_status：顶层缺省时 dig 兜底；空值归一 ""（对齐 python `or ""` + str()）

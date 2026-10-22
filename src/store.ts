@@ -304,6 +304,9 @@ function defaultSettings(): Settings {
 let logsPollInflight = false;
 // 日志查询并发序号（最新请求胜出）：手动刷新与轮询并发时，旧响应直接丢弃
 let logsReqSeq = 0;
+// 账号列表并发序号（最新请求胜出，审查修复 M2）：refreshAccounts 被捕获事件/
+// 签到完成/页面挂载等多源高频并发触发，先发后至的旧列表不得覆盖新数据
+let accountsReqSeq = 0;
 // 同因 toast 限频：读取持续失败期间每 60s 最多弹一次（防 toast 风暴）；手动调用直通
 let lastLogsErrToastAt = 0;
 // F5：签到看门狗定时器（模块级，store 单例持有）
@@ -523,6 +526,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         );
         void get().refreshProfiles();
       },
+    }).catch((e) => {
+      // 审查修复 M3：监听注册失败时复位幂等锁，允许重试——否则 initStarted
+      // 恒为 true，任何重试调用直接 return，ready 永远 false，应用卡死在未就绪态
+      initStarted = false;
+      throw e;
     });
     await Promise.all([
       get().refreshEnv(),
@@ -846,11 +854,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   refreshAccounts: async () => {
+    // 并发序号（审查修复 M2，同 logsReqSeq 最新胜出模式）：旧响应直接丢弃，
+    // 防「刚捕获的账号闪没」
+    const seq = ++accountsReqSeq;
     try {
       const accounts = await api.accounts.list();
-      set({ accounts });
+      if (seq === accountsReqSeq) set({ accounts });
     } catch (err) {
-      get().pushToast('error', `读取账号失败：${String(err)}`);
+      if (seq === accountsReqSeq) {
+        get().pushToast('error', `读取账号失败：${String(err)}`);
+      }
     }
   },
   refreshGroups: async () => {

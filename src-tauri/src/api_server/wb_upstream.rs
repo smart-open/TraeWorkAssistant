@@ -68,7 +68,13 @@ fn resolve_client_fingerprint(global_region: bool) -> WbClientFingerprint {
             ua: ua_template(global_region, &v),
             version: v,
         },
-        _ => WbClientFingerprint { ua: WB_UA.into(), version: WB_CLI_VERSION.into() },
+        // 回落也按区域出模板：Intl 兜底若携带 CN 品牌 UA（CLI/CodeBuddy）恰是
+        // #123 要消除的指纹形态；CN 分支 ua_template(false, WB_CLI_VERSION)==WB_UA
+        // 零行为变化（fingerprint_ua_template_invariants 锁定）
+        _ => WbClientFingerprint {
+            ua: ua_template(global_region, WB_CLI_VERSION),
+            version: WB_CLI_VERSION.into(),
+        },
     }
 }
 
@@ -209,7 +215,7 @@ pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
     let base = c.chat_base();
     let referer = format!("{}{}", base, WB_CHAT_PATH);
     // UA/X-IDE-Version 动态解析（issue #123）：优先本机客户端真实版本，
-    // 解析失败回落常量（WB_UA/WB_CLI_VERSION）
+    // 解析失败按区域模板回落常量版本（CN 形态即 WB_UA）
     let fp = wb_client_fingerprint(c.global_region);
     let mut h: Vec<(&'static str, String)> = vec![
         ("content-type", "application/json".into()),
@@ -1091,7 +1097,7 @@ mod tests {
                 .and_then(|exe| crate::commands::env::version_of(&exe))
             {
                 Some(v) if !v.is_empty() => ua_template(g, &v),
-                _ => WB_UA.to_string(),
+                _ => ua_template(g, WB_CLI_VERSION),
             };
             let h = build_chat_headers(&creds(g, "u", "", ""));
             assert_eq!(get_ua(&h), expect, "区域 {} UA 接线不一致", g);

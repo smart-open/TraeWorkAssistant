@@ -809,12 +809,16 @@ fn run_qoder_stream(
                     // （kind=empty），返回日志注记供反查漏网触发句
                     let sample_note =
                         super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
-                    state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool=qoder{sample_note}",
-                        tried.len(),
-                        attempts,
-                        empty_hits,
-                    ));
+                    // 与非流式收尾同门控（审查修复 L）：NO_HEALTHY_ACCOUNT 耗尽不再
+                    // 落空注记调试行，流式/非流式日志口径一致
+                    if !sample_note.is_empty() {
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool=qoder{sample_note}",
+                            tried.len(),
+                            attempts,
+                            empty_hits,
+                        ));
+                    }
                     // 审查 P1-1：无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
                     // 各自形态，helper 内已含收尾帧），不再硬编码 OpenAI 格式。
                     // 审查 #8：message 改传 exhaust_msg（对齐 routes.rs Trae 流式收尾
@@ -875,8 +879,8 @@ fn run_qoder_stream(
                         state.qoder_sticky.unbind_uid(&picked.uid);
                     }
                     *safe_lock(&state.last_error) = Some(format!(
-                        // 审查修复：err 原文（上游响应/URL 片段可能含令牌）截断脱敏，
-                        // 同 HTTP 分支 safe_slice 口径
+                        // 审查修复：err 原文截断（safe_slice 仅截断、不脱敏，上游
+                        // 响应/URL 片段若内嵌令牌需在上游侧规避），同 HTTP 分支口径
                         "qoder identity uid={} err={}",
                         picked.uid,
                         safe_slice(&e, 200)
@@ -1508,7 +1512,7 @@ pub async fn qoder_aggregate_chat(
                             state.qoder_sticky.unbind_uid(&picked.uid);
                         }
                         *safe_lock(&state.last_error) = Some(format!(
-                            // 审查修复：同流式分支，err 原文截断脱敏
+                            // 审查修复：同流式分支，err 原文截断（safe_slice 仅截断、不脱敏）
                             "qoder identity uid={} err={}",
                             picked.uid,
                             safe_slice(&e, 200)

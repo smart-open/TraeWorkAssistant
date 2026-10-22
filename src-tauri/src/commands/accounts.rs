@@ -1011,7 +1011,18 @@ pub(crate) fn probe_trae_jwt_alive_detail(state: &AppState, user_id: &str) -> Jw
             // （docs/product-design.md 记录的形态；对齐 Python status_check 顶层取 code 的口径，
             // 不用 dig 深挖以免误伤嵌套业务对象里的 code）。其余业务码（如 1005 套餐限额）
             // 说明 JWT 鉴权仍通过 → 放行
-            if body.get("code").and_then(|v| v.as_i64()) == Some(1001) {
+            // 短语命中优先于 code==1001 判死（审查修复 M1）：#128 形态的拒绝响应
+            // 可能同时携带顶层 1001，若先判死则 Indeterminate 降级分支不可达
+            if body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .is_some_and(crate::tasks::trae_checkin::is_auth_rejected_error)
+            {
+                // #128 形态（HTTP 200 + 业务码拒绝短语）：status 与 claim 风控链路
+                // 不同源，无法确认判活——降级 Indeterminate 放行续期（续期/重捕获
+                // 正是 AuthRejected 的恢复路径），对齐 #126「无法判定不阻断」意图
+                JwtAliveVerdict::Indeterminate
+            } else if body.get("code").and_then(|v| v.as_i64()) == Some(1001) {
                 JwtAliveVerdict::Dead(dead_msg)
             } else {
                 JwtAliveVerdict::Alive
@@ -1365,7 +1376,8 @@ pub fn fetch_remaining_credits(state: State<AppState>, user_id: String) -> Resul
 
 /// 刷新所有账号的剩余积分（批量请求 API），返回成功数量。
 /// 刷新所有账号剩余积分（管理页/积分页刷新按钮入口）。
-/// 同时执行自动解冻：签到成功且有积分（credits > 0）且冷却类型非 SessionDead → 清除冷却。
+/// 同时执行自动解冻：有积分（credits > 0）且冷却类型不属于 SessionDead/AuthRejected/
+/// DeviceSigned（凭证级与设备级失效不因积分可查而解除，见 refresh_remaining_credits_impl）→ 清除冷却。
 #[tauri::command(async)]
 pub fn refresh_remaining_credits(
     state: State<AppState>,
@@ -1456,10 +1468,18 @@ pub fn refresh_remaining_credits_impl(
                 }
                 ok_count += 1;
                 synced_uids.insert(uid.clone());
-                // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
+                // 自动解冻：有积分 + 冷却类型不属于「积分查询成功不能解除」的三类 → 清除。
+                // SessionDead/AuthRejected 是凭证级失效、DeviceSigned 是设备级当日去重——
+                // 积分域查询与签到 claim 链路风控不同源，这类账号余额照常可查，若随积分
+                // 刷新解冻会形成「解冻→重试→再冷却」横跳，抵消永久/当日冷却语义（#128/#110）。
+                // 合法解除路径：签到成功 clear、JWT 刷新成功 remove、代理捕获 remove、手动清理
                 if stats.total > 0.0 {
                     let thaw = cd.cooldowns.get(&uid).and_then(|e| {
-                        if e.error_type != "SessionDead" && !e.error_type.is_empty() {
+                        if !matches!(
+                            e.error_type.as_str(),
+                            "SessionDead" | "AuthRejected" | "DeviceSigned"
+                        ) && !e.error_type.is_empty()
+                        {
                             Some((e.error_type.clone(), e.clone()))
                         } else {
                             None
@@ -1789,9 +1809,19 @@ pub fn renew_jwt_preflight(state: State<AppState>, user_id: String) -> Result<()
     if remain_h.map(|h| h <= 0.0).unwrap_or(true) {
         return Ok(());
     }
+    // 冷却表仲裁（审查修复 H2）：claim 风控链路（AuthRejected/SessionDead 永久冷却）
+    // 与 status 探活不同源——冷却中的账号即使 status 答活，也放行续期/重捕获
+    //（正是其恢复路径），否则下方 Alive 中止会堵死恢复入口
+    let cred_cooldown_active = {
+        let cd = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
+        cd.cooldowns.get(user_id.as_str()).map_or(false, |e| {
+            matches!(e.error_type.as_str(), "SessionDead" | "AuthRejected") && e.until > 0
+        })
+    };
     // 三态探活（审查修复）：仅「服务端确认判活」才中止——网络故障 Indeterminate 放行
     // （至多白切一场），不得误报「JWT 仍有效」误导用户；判死 Dead 放行（切换+捕获正是恢复手段）
-    if matches!(
+    if !cred_cooldown_active
+        && matches!(
         probe_trae_jwt_alive_detail(&state, &user_id),
         JwtAliveVerdict::Alive
     ) {
@@ -2114,7 +2144,7 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
 
     // 自动解冻（含 SessionDead）：新 JWT 刚从 ExchangeToken 换发、必然有效，
     // 此前签到 401 打上的 SessionDead 永久冷却若不清除，调度会永远跳过该账号
-    //（自动解冻逻辑明确排除 SessionDead，见 refresh_remaining_credits）
+    //（积分刷新式自动解冻仅对非凭证/设备级类型生效，排除口径见 refresh_remaining_credits）
     // C4/C8（审查）：冷却整表读改写持 ACCOUNT_COOLDOWNS_LOCK（叶子锁），与
     // 签到写方/手动清理命令互斥；app_log 在锁外执行
     let thaw_entry = {
@@ -2122,7 +2152,18 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
-        let removed = cd.cooldowns.remove(user_id);
+        // DeviceSigned 不解冻（审查修复 M3）：设备级当日去重与凭证无关（换发仍用
+        // 同一 bound_device），解冻只会形成「解冻→重试→再冷却」横跳，等次日
+        // 00:05 自然到期；SessionDead/AuthRejected 为凭证级，续期正是恢复路径
+        let is_device_signed = cd
+            .cooldowns
+            .get(user_id)
+            .map_or(false, |e| e.error_type == "DeviceSigned");
+        let removed = if is_device_signed {
+            None
+        } else {
+            cd.cooldowns.remove(user_id)
+        };
         if removed.is_some() {
             cd.updated_at = Some(fs_utils::now_iso());
             crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;

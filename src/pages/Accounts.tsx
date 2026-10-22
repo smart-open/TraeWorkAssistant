@@ -607,9 +607,10 @@ export default function Accounts() {
                         >
                           {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
                         </button>
-                        {/* SessionDead（JWT 被服务端吊销）时 exp 往往未到，必须常显续期入口，
-                            否则与签到/切换失败的「点续期 JWT」指引断链（issue #9 审查项） */}
-                        {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead') && (
+                        {/* SessionDead（JWT 被服务端吊销）/AuthRejected（服务端拒绝认证，
+                            issue #128）时 exp 往往未到，必须常显续期入口，否则与签到/
+                            切换失败的「点续期 JWT」指引断链（issue #9 审查项 + #128 审查修复） */}
+                        {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead' || a.cooldown_type === 'AuthRejected') && (
                           <button
                             /* issue #126 语义澄清：本按钮是「被动捕获」，依赖 TRAE 重新鉴权才有新 JWT */
                             title={
@@ -638,10 +639,13 @@ export default function Accounts() {
                         )}
                         {/* 重新 OAuth 登录：无 refresh_token / RT 失效 / RT 已过期
                             的账号无法自动续期，定向重新授权更新凭证（后端按 uid 校验防登错）。
+                            AuthRejected（issue #128，审查修复）常显：恢复指引要求重新 OAuth，
+                            而该类账号 RT 往往仍有效，无此入口则指引断链。
                             地球图标语义=打开浏览器授权；sky 配色在全部 6 个主题（含暗夜紫/
                             琥珀暖夜）上均有足够对比 */}
                         {(!a.has_refresh_token ||
                           a.refresh_token_invalid ||
+                          a.cooldown_type === 'AuthRejected' ||
                           (a.refresh_token_expires_at != null &&
                             a.refresh_token_expires_at > 0 &&
                             a.refresh_token_expires_at <= Math.floor(Date.now() / 1000))) && (

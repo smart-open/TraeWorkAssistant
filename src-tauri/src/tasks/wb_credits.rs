@@ -443,27 +443,40 @@ fn fetch_round(
     let balance = balance_from_summary(&body);
     let codes = package_codes_from(&body);
 
-    // paid/free 带 PackageCodes + 分页回查（到期时间/周期明细数据源）
+    // paid/free 带 PackageCodes + 分页回查（到期时间/周期明细数据源）。
+    // 分页翻页（审查修复 L）：包数 >100 时原固定 PageNumber:1 会漏明细，
+    // 按「返回条数满 PageSize 继续翻页」取全，防御上限 50 页（5000 包）
     let mut enriched: Vec<Value> = vec![];
     let mut enriched_codes: std::collections::HashSet<String> = Default::default();
     let mut saw_auth = false;
     if !codes.is_empty() {
-        let req = json!({"PackageCodes": codes, "PageNumber": 1, "PageSize": 100});
         for url in [paid_url, free_url] {
-            let (st2, body2) = wb_common::post_json(agent, url, headers, &req);
-            if st2 == 401 {
-                saw_auth = true;
-                continue;
-            }
-            if st2 == 200 {
-                if let Some(b2) = body2.filter(|b| b.is_object()) {
-                    for p in packages_from(&b2) {
-                        if let Some(code) = p.get("code").and_then(Value::as_str) {
-                            enriched_codes.insert(code.to_string());
-                        }
-                        enriched.push(p);
-                    }
+            let mut page = 1u32;
+            loop {
+                let req = json!({"PackageCodes": &codes, "PageNumber": page, "PageSize": 100});
+                let (st2, body2) = wb_common::post_json(agent, url, headers, &req);
+                if st2 == 401 {
+                    saw_auth = true;
+                    break;
                 }
+                if st2 != 200 {
+                    break;
+                }
+                let Some(b2) = body2.filter(|b| b.is_object()) else {
+                    break;
+                };
+                let items: Vec<Value> = packages_from(&b2);
+                let got = items.len();
+                for p in items {
+                    if let Some(code) = p.get("code").and_then(Value::as_str) {
+                        enriched_codes.insert(code.to_string());
+                    }
+                    enriched.push(p);
+                }
+                if got < 100 || page >= 50 {
+                    break;
+                }
+                page += 1;
             }
         }
     }

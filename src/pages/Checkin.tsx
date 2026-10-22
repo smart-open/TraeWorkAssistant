@@ -7,6 +7,7 @@ import { daysFromTrendPoints, type CheckinCalendarDay } from '../components/chec
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { normZero } from '../lib/format';
+import { cooldownLabel, cooldownRemaining, isPermanentCooldown } from '../lib/cooldownTypes';
 import type { AccountView, DeviceConflictGroup } from '../types';
 
 function MiniJwtBadge({ hours }: { hours: number | null }) {
@@ -16,31 +17,13 @@ function MiniJwtBadge({ hours }: { hours: number | null }) {
   return <span className="text-xs text-emerald-500"><CheckCircle2 size={11} className="inline" /> {hours.toFixed(0)}h</span>;
 }
 
-const COOLDOWN_LABELS: Record<string, string> = {
-  PlanLimit: '套餐限额',
-  SoftRate: '限流',
-  SessionDead: '会话失效',
-  NotFound: '接口异常',
-  Server: '服务端错误',
-  Client: '客户端错误',
-  BusinessError: '业务错误',
-  DeviceSigned: '设备已签',
-  AuthRejected: '认证被拒',
-};
+// 冷却标签/永久判定/剩余时长改用共享模块（审查修复：与 CooldownBadge 单一来源，
+// 新增冷却类型不再需要双处同步）
 
 function MiniCooldownBadge({ type, until }: { type: string; until: number | null }) {
-  const label = COOLDOWN_LABELS[type] ?? type;
-  // SessionDead=JWT 吊销（永久）；AuthRejected=服务端拒绝认证（issue #128，永久，需重走 OAuth）
-  const isPermanent = type === 'SessionDead' || type === 'AuthRejected';
-  let remaining = '';
-  if (!isPermanent && until) {
-    const secs = until - Math.floor(Date.now() / 1000);
-    if (secs > 0) {
-      const h = Math.floor(secs / 3600);
-      const m = Math.floor((secs % 3600) / 60);
-      remaining = h > 0 ? `${h}h${m}m` : `${m}m`;
-    }
-  }
+  const label = cooldownLabel(type);
+  const isPermanent = isPermanentCooldown(type);
+  const remaining = cooldownRemaining(type, until);
   return (
     <span className={`text-xs ${isPermanent ? 'text-rose-500' : 'text-amber-500'}`}>
       <Snowflake size={11} className="inline" /> {label}{remaining && ` ${remaining}`}
@@ -461,7 +444,7 @@ export default function Checkin() {
                   </span>
                   {r.error_type && (
                     <span className="text-xs text-amber-500">
-                      <Snowflake size={11} className="inline" /> {COOLDOWN_LABELS[r.error_type] ?? r.error_type}
+                      <Snowflake size={11} className="inline" /> {cooldownLabel(r.error_type)}
                     </span>
                   )}
                   {r.elapsed != null && <span className="text-xs text-slate-400">{r.elapsed.toFixed(1)}s</span>}

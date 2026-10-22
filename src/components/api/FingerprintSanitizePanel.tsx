@@ -78,6 +78,9 @@ export default function FingerprintSanitizePanel() {
       setSavedAt(view.updated_at);
     } catch (e) {
       toast('error', `加载清洗规则失败：${e}`);
+      // 上抛（审查修复 M6）：switchTier 依赖失败信号回滚档位，否则 tier 与
+      // rules 数据错位会把旧档规则保存进新档位键（跨档位数据污染）
+      throw e;
     } finally {
       setLoading(false);
     }
@@ -92,7 +95,8 @@ export default function FingerprintSanitizePanel() {
   }, []);
 
   useEffect(() => {
-    void load('wb');
+    // load 失败会上抛（switchTier 回滚依赖），初始加载就地吞掉避免 unhandled rejection
+    void load('wb').catch(() => {});
     void loadSamples();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -126,7 +130,14 @@ export default function FingerprintSanitizePanel() {
       return false;
     }
     setTier(next);
-    await load(next);
+    try {
+      await load(next);
+    } catch {
+      // 加载失败回滚档位（审查修复 M6）：load 已 toast，此处保证 tier 与
+      // rules 始终同档，防旧档规则被保存进新档位键
+      setTier(tier);
+      return false;
+    }
     return true;
   };
 
@@ -184,7 +195,13 @@ export default function FingerprintSanitizePanel() {
         rules.map((r) => ({ from: r.from.trim(), to: r.to === null ? null : r.to.trim() })),
         tier,
       );
-      await load(tier);
+      // load 现在上抛（审查修复 M6）：保存已成功，回读失败不应误报「保存失败」
+      try {
+        await load(tier);
+      } catch {
+        toast('warn', '规则已保存，但回读刷新失败，请手动刷新');
+        return;
+      }
       toast('success', '清洗规则已保存，下一条请求即生效');
     } catch (e) {
       toast('error', `保存失败：${e}`);
@@ -199,7 +216,13 @@ export default function FingerprintSanitizePanel() {
     setSaving(true);
     try {
       await api.apiServer.templateMapSet([], tier);
-      await load(tier);
+      // 同上（审查修复 M6）：回读失败不误报「恢复默认失败」
+      try {
+        await load(tier);
+      } catch {
+        toast('warn', '已恢复内置默认，但回读刷新失败，请手动刷新');
+        return;
+      }
       toast('success', '已恢复内置默认规则，下一条请求即生效');
     } catch (e) {
       toast('error', `恢复默认失败：${e}`);

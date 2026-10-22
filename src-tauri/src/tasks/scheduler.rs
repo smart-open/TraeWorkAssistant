@@ -489,9 +489,38 @@ fn run_task(
         "trae-checkin" => {
             let accounts = crate::vault::load_accounts(st);
             let retry = st.settings().retry.max(0) as u32;
+            // 审查修复 M2：调度轮跳过冷却中账号（until > now，含 SessionDead/
+            // AuthRejected 永久冷却与 DeviceSigned 当日去重）——冷却账号每轮真实
+            // 请求只会再失败再冷却，对齐 UI 签到路径「冷却中跳过」口径
+            let now_ts = chrono::Utc::now().timestamp();
+            let cooled: std::collections::HashSet<String> =
+                crate::store::docs::account_cooldowns_load(&crate::store::db(&st.data_dir))
+                    .cooldowns
+                    .into_iter()
+                    .filter(|(_, e)| e.until > now_ts)
+                    .map(|(uid, _)| uid)
+                    .collect();
+            let mut skipped_cooldown = 0usize;
+            let active: Vec<_> = accounts
+                .accounts
+                .into_iter()
+                .filter(|a| match a.user_id.as_deref() {
+                    Some(uid) if cooled.contains(uid) => {
+                        skipped_cooldown += 1;
+                        false
+                    }
+                    _ => true,
+                })
+                .collect();
+            if skipped_cooldown > 0 {
+                crate::fs_utils::app_log(
+                    &st.data_dir,
+                    &format!("Trae 签到：跳过 {skipped_cooldown} 个冷却中账号"),
+                );
+            }
             let mut events: Vec<Value> = Vec::new();
             let done =
-                super::trae_checkin::run_round(st, &accounts.accounts, retry, &mut |ev| events.push(ev.clone()));
+                super::trae_checkin::run_round(st, &active, retry, &mut |ev| events.push(ev.clone()));
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
             let failed_permanent = events
                 .iter()

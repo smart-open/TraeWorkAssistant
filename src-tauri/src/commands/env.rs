@@ -737,8 +737,11 @@ pub(crate) fn custom_path_kv(data_dir: &std::path::Path, app: &str) -> Option<St
 }
 
 /// mac 变体：无注册表概念，恒 None——bundle 探测/Spotlight 兜底由调用方
-///（api_server::wb_upstream::locate_client_exe mac 分支）走 bundle 定位链
+///（api_server::wb_upstream::locate_client_exe mac 分支）走 bundle 定位链。
+/// 零调用方依据：唯一调用点位于 `#[cfg(not(macos))]` 块内，mac 构建不编译该
+/// 调用（同 pe_version 桩口径），保留本函数维持双平台对称 API
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub(crate) fn registry_app_path_for(_app: &str) -> Option<String> {
     None
 }
