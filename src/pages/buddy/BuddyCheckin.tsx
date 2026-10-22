@@ -168,6 +168,9 @@ export default function BuddyCheckin() {
         } else {
           setLines([]);
           setDoneInfo(null);
+          // issue #134：后台轮次（调度器/启动补签/托盘/CLI）也会发 start 事件，
+          // 运行态同步置位——否则后台轮次期间页面零显示，用户点击必撞锁
+          setRunning(true);
         }
       } else if ('type' in parsed && parsed.type === 'done') {
         if (parsed.mode === 'growth') {

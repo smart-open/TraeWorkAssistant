@@ -30,13 +30,124 @@ pub struct WbCheckinOpts {
 /// 并发轮次会互相踩踏——tokio Mutex try_lock 拿不到即拒绝，不排队不阻塞。
 static WB_ROUND_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// 入口尝试获取轮次锁；guard 移交工作线程并持有至轮次结束
+/// 持有者标签登记（issue #134 方案2）：(标签, 起始时刻, 超时已告警)。
+/// std Mutex 短临界区（登记/清除/读取），panic 中毒时 into_inner 继续读写
+///（登记丢失只降级报错详情，不值得连锁 panic）
+static WB_ROUND_HOLDER: std::sync::Mutex<Option<(String, std::time::Instant, bool)>> =
+    std::sync::Mutex::new(None);
+
+fn wb_holder_lock() -> std::sync::MutexGuard<'static, Option<(String, std::time::Instant, bool)>> {
+    WB_ROUND_HOLDER.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// 进程内轮次锁守卫：tokio 锁 + 持有者登记 RAII（drop 清登记）。
+/// tokio MutexGuard 本身 Send——UI 路径在本结构内移交工作线程持有至轮次结束
+struct WbRoundLocalGuard {
+    _round: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for WbRoundLocalGuard {
+    fn drop(&mut self) {
+        *wb_holder_lock() = None;
+    }
+}
+
+/// 完整轮次锁守卫（issue #134 方案2+4）：进程内 tokio 锁 + Windows 命名互斥体跨进程锁。
+/// ⚠ 仅限获取线程内持有至轮次结束：Windows mutex 所有权线程亲和，跨线程移交会令
+/// ReleaseMutex 报 ERROR_NOT_OWNER 且所有权挂死在长存线程（如 tauri async worker）上，
+/// 互斥体永久锁死——完整版各调用点（调度器/启动补签/托盘/CLI）均为同线程执行全程。
+/// UI 路径例外：command 线程仅取 local 守卫 + 预检跨进程锁，正式持有在工作线程内完成。
+pub(crate) struct WbRoundGuard {
+    _local: WbRoundLocalGuard,
+    _cross: Option<crate::tasks::qoder_common::CrossProcLock>,
+}
+
+/// 撞锁详情（issue #134 方案2）：报错携带持有者标签与已运行分钟数，
+/// 让「谁在跑、跑了多久」一眼可辨；持有超 15 分钟疑似卡死，落 app_log 告警一次
+///（warned 标记防同轮重复告警——告警由下一次撞锁触发，无后台时钟依赖）
+fn wb_round_busy_detail(data_dir: &std::path::Path) -> String {
+    let mut holder = wb_holder_lock();
+    let Some((holder_tag, since, warned)) = holder.as_mut() else {
+        return "已有签到/成长任务在执行中，请等待当前轮次完成".to_string();
+    };
+    let mins = since.elapsed().as_secs() / 60;
+    let overlong = since.elapsed() >= std::time::Duration::from_secs(15 * 60);
+    let need_warn = overlong && !*warned;
+    if need_warn {
+        *warned = true;
+    }
+    let holder_tag = holder_tag.clone();
+    drop(holder);
+    if need_warn {
+        fs_utils::app_log(
+            data_dir,
+            &format!("[WB 轮次] 持有者「{holder_tag}」已运行超 15 分钟，疑似卡死，请排查"),
+        );
+    }
+    // 撞锁多发生在持有初期（最常见场景）：不足 1 分钟显示「刚启动」，避免「已运行 0 分钟」
+    let ran = if mins < 1 { "刚启动".to_string() } else { format!("已运行 {mins} 分钟") };
+    format!("已有签到/成长任务在执行中（{holder_tag}，{ran}），请等待当前轮次完成")
+}
+
+/// 进程内 tokio 锁获取 + 持有者登记（UI local 路径共用）
+fn try_tokio_round(tag: &str, data_dir: &std::path::Path) -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
+    let Ok(round) = WB_ROUND_LOCK.try_lock() else {
+        return Err(wb_round_busy_detail(data_dir));
+    };
+    *wb_holder_lock() = Some((tag.to_string(), std::time::Instant::now(), false));
+    Ok(round)
+}
+
+/// 跨进程轮次锁获取（issue #134 方案4，wait 0 非阻塞）：GUI 进程与 schtasks CLI
+/// 进程（--task-run）双进程互斥。Err 文案可直接上抛 UI / 落日志 / 输出 skipped_busy。
+/// CreateFailed/WaitFailed 一并 fail-closed（对齐 qoder cross_refresh_guard 口径）：
+/// 锁机制不可用时带病降级会静默丢失 GUI vs CLI 落盘互斥保障。
+/// Err = (文案, 是否真占用)：Busy（他方持有）幂等跳过不落日志——调度器每 tick
+/// 撞锁时会与调用方各自的 skipped 日志重复刷屏；机制性失败（创建/等待系统错误）
+/// 需落日志人工排查（对齐 CrossProcLockFail 文档分级）
+fn wb_cross_round_guard(
+    data_dir: &std::path::Path,
+) -> Result<crate::tasks::qoder_common::CrossProcLock, (String, bool)> {
+    use crate::tasks::qoder_common::CrossProcLockFail;
+    let (g, fail) =
+        crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(data_dir, "wb", "round", 0);
+    match g {
+        Some(g) => Ok(g),
+        None => {
+            let fail = fail.unwrap_or(CrossProcLockFail::Busy);
+            let busy = fail == CrossProcLockFail::Busy;
+            Err((fail.describe(), busy))
+        }
+    }
+}
+
+/// 入口尝试获取完整轮次锁（进程内 + 跨进程）；guard 在获取线程内持有至轮次结束
 ///（RAII：正常结束与 panic 展开均可靠释放，防泄漏）。
-/// pub(crate)：应用内调度器（tasks/scheduler.rs）到点跑签到轮次时同样抢锁互斥。
-pub(crate) fn try_acquire_wb_round() -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
-    WB_ROUND_LOCK
-        .try_lock()
-        .map_err(|_| "已有签到/成长任务在执行中，请等待当前轮次完成".to_string())
+/// pub(crate)：应用内调度器（tasks/scheduler.rs）、启动补签、托盘、CLI 任务
+///（tasks/mod.rs）到点跑签到/成长轮次时同样抢锁互斥。
+pub(crate) fn try_acquire_wb_round(tag: &str, data_dir: &std::path::Path) -> Result<WbRoundGuard, String> {
+    let cross = wb_cross_round_guard(data_dir).map_err(|(why, busy)| {
+        // 仅机制性失败（CreateFailed/WaitFailed）落日志供人工排查；Busy（他方持有）
+        // 不落——调度器每 tick 撞锁时与调用方 skipped_busy 日志语义重复，纯刷屏
+        if !busy {
+            fs_utils::app_log(data_dir, &format!("WorkBuddy 轮次锁获取失败：{why}"));
+        }
+        format!("其他进程正在执行签到轮次（{why}），请稍后再试")
+    })?;
+    let Ok(round) = WB_ROUND_LOCK.try_lock() else {
+        // 立即归还跨进程锁，避免占坑令他方进程误判忙
+        drop(cross);
+        return Err(wb_round_busy_detail(data_dir));
+    };
+    *wb_holder_lock() = Some((tag.to_string(), std::time::Instant::now(), false));
+    Ok(WbRoundGuard { _local: WbRoundLocalGuard { _round: round }, _cross: Some(cross) })
+}
+
+/// 仅进程内锁版（UI command 线程专用，issue #134 方案4 配套）：不碰跨进程锁——
+/// Windows mutex 所有权线程亲和，command 线程取得的跨进程锁不能随 tokio 守卫移交
+/// 工作线程；跨进程锁由 spawn_wb_round 在工作线程内正式获取（command 线程另行预检）
+fn try_acquire_wb_round_local(tag: &str, data_dir: &std::path::Path) -> Result<WbRoundLocalGuard, String> {
+    Ok(WbRoundLocalGuard { _round: try_tokio_round(tag, data_dir)? })
 }
 
 /// WB 自动签到开关（应用内调度器 wb-checkin 任务的启用判定，与启动补签同源设置）
@@ -44,8 +155,10 @@ pub(crate) fn wb_auto_checkin_enabled(state: &AppState) -> bool {
     load_settings(state).auto_checkin
 }
 
-/// NDJSON 事件转发（原 python 管线同款：emit 序列化 JSON 字符串，前端逐行 JSON.parse）
-fn emit_wb_event(app: &AppHandle, ev: &Value) {
+/// NDJSON 事件转发（原 python 管线同款：emit 序列化 JSON 字符串，前端逐行 JSON.parse）。
+/// pub(crate)：issue #134 方案1——调度器后台轮次（wb-checkin/wb-growth）同步接入
+/// 事件管线，前端运行态不再只由 UI 点击驱动
+pub(crate) fn emit_wb_event(app: &AppHandle, ev: &Value) {
     if let Ok(line) = serde_json::to_string(ev) {
         let _ = app.emit("wb-checkin-progress", &line);
     }
@@ -53,10 +166,13 @@ fn emit_wb_event(app: &AppHandle, ev: &Value) {
 
 /// 直调轮次共通封装：轮次锁 guard 移交工作线程，执行完发 exit 事件
 ///（原 python 子进程管线退出事件同款，前端据 "type":"exit" 复位运行态）。
+/// 跨进程锁在本工作线程内正式获取（issue #134 方案4）：command 线程已预检，
+/// 但 Windows mutex 所有权线程亲和、跨线程移交会挂死互斥体，故正式持有与
+/// 释放均在本线程；获取失败（CLI 计划任务正在跑）→ 事件流反馈原因后空转收尾
 fn spawn_wb_round<F>(
     app: AppHandle,
     state: AppState,
-    round: tokio::sync::MutexGuard<'static, ()>,
+    round: WbRoundLocalGuard,
     f: F,
 ) -> Result<(), String>
 where
@@ -64,7 +180,36 @@ where
 {
     std::thread::spawn(move || {
         let _guard = round;
-        f(&app, &state);
+        // 跨进程锁正式持有（wait 0 + 短重试，issue #134 方案4）：调度器 tick 同刻
+        // 抢到跨进程锁后立即因进程内锁（本线程持有）失败而释放（微秒级占坑），
+        // wait=0 探测可能恰好撞上——重试两次吸收该竞态窗口；真占用（CLI 计划任务
+        // 整轮数分钟）重试无果依旧放弃，失败原因进事件流
+        let mut cross = wb_cross_round_guard(&state.data_dir);
+        for _ in 0..2 {
+            if cross.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            cross = wb_cross_round_guard(&state.data_dir);
+        }
+        let _cross = match cross {
+            Ok(g) => Some(g),
+            Err((why, _busy)) => {
+                fs_utils::app_log(&state.data_dir, &format!("WorkBuddy 签到轮次放弃：{why}"));
+                // 进度列表反馈一行失败原因（前端 fail 行渲染逻辑同款，无新契约）
+                emit_wb_event(
+                    &app,
+                    &serde_json::json!({
+                        "index": 1, "user_id": "", "name": "", "status": "fail",
+                        "message": format!("其他进程正在执行签到轮次（{why}），本轮放弃"),
+                    }),
+                );
+                None
+            }
+        };
+        if _cross.is_some() {
+            f(&app, &state);
+        }
         // 终态事件（前端据 "type":"exit" 复位运行态）：emit 失败落日志（issue #44 遗留项）。
         // 注意：wb-checkin-progress 前端契约是 NDJSON **字符串**（listen<string> 后
         // JSON.parse）——payload 必须序列化为 String，传对象会破坏 parseLine 导致
@@ -84,7 +229,13 @@ where
 /// NDJSON → `wb-checkin-progress` 事件（独立管线，避免与 Trae checkin 状态串扰）。
 #[tauri::command(async)]
 pub fn workbuddy_checkin_start(app: AppHandle, state: State<AppState>, opts: WbCheckinOpts) -> Result<(), String> {
-    let round = try_acquire_wb_round()?;
+    // 先取进程内锁：同进程调度器/托盘/启动补签持锁时报错携带持有者标签与已运行
+    // 时长，避免把同进程占用误报为「其他进程」（跨进程预检放在其后——此时失败
+    // 才是真他方进程 CLI 计划任务在跑，即时报错避免白等一整轮，issue #134 方案4）
+    let round = try_acquire_wb_round_local("ui-checkin", &state.data_dir)?;
+    if let Err((why, _busy)) = wb_cross_round_guard(&state.data_dir) {
+        return Err(format!("其他进程正在执行签到轮次（{why}），请稍后再试"));
+    }
     let o = CheckinOpts {
         uids: opts.user_ids.unwrap_or_default(),
         skip_checked: opts.skip_checked_in,
@@ -99,7 +250,11 @@ pub fn workbuddy_checkin_start(app: AppHandle, state: State<AppState>, opts: WbC
 /// 成长中心执行（F-17；旅行/盲盒/任务开关随设置）
 #[tauri::command(async)]
 pub fn workbuddy_growth_run(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let round = try_acquire_wb_round()?;
+    // 先取进程内锁再跨进程预检（同 workbuddy_checkin_start，issue #134 方案4）
+    let round = try_acquire_wb_round_local("ui-growth", &state.data_dir)?;
+    if let Err((why, _busy)) = wb_cross_round_guard(&state.data_dir) {
+        return Err(format!("其他进程正在执行签到轮次（{why}），请稍后再试"));
+    }
     let s = load_settings(&state);
     let flags = GrowthOpts {
         travel: s.growth_travel,
@@ -346,14 +501,18 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
     std::thread::spawn(move || {
         // 与 Trae 静默签到同款延迟 60s，避开启动高峰
         std::thread::sleep(std::time::Duration::from_secs(60));
-        // 抢轮次锁（审查修复 #15）：与 UI 签到/成长轮次互斥，共享结果落盘并发会踩踏；
-        // 抢不到则本轮静默跳过（补签幂等，下轮启动/次日定时任务会再核验）
-        let Ok(_round) = try_acquire_wb_round() else {
-            fs_utils::app_log(&state2.data_dir, "WorkBuddy 启动补签跳过：已有签到/成长任务在执行中");
+        // 抢完整轮次锁（审查修复 #15 + issue #134 方案2+4）：与 UI 签到/成长轮次、
+        // CLI 计划任务互斥；抢不到则本轮静默跳过（补签幂等，下轮启动/次日定时任务会再核验）
+        let Ok(_round) = try_acquire_wb_round("启动补签", &state2.data_dir) else {
+            let why = "WorkBuddy 启动补签跳过：已有签到/成长任务在执行中";
+            fs_utils::app_log(&state2.data_dir, why);
             return;
         };
         fs_utils::app_log(&state2.data_dir, "WorkBuddy 启动补签：开始核验签到状态");
-        let done = wb_checkin::run_checkin_round(&state2, &CheckinOpts::daily(), &mut |_| {});
+        // issue #134 方案1：后台轮次接入事件管线（此前空闭包，前端零显示撞锁不可辨）
+        let done = wb_checkin::run_checkin_round(&state2, &CheckinOpts::daily(), &mut |ev| {
+            emit_wb_event(&app2, ev);
+        });
         let msg = format!(
             "WorkBuddy 启动补签完成: 成功 {}，已签 {}，失败 {}",
             done["ok"].as_i64().unwrap_or(0),
@@ -380,9 +539,10 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
 /// 串行避免并发踩踏），各阶段完成发系统通知。
 /// Trae 签到由 main.rs 复用 start_checkin_core 并行触发，互不阻塞。
 pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
-    // 抢轮次锁（审查修复 #15）：与 UI 签到/成长轮次互斥（共享结果落盘并发会踩踏）；
-    // 抢不到则通知并跳过，不排队阻塞托盘线程（签到幂等，稍后可再点）
-    let Ok(_round) = try_acquire_wb_round() else {
+    // 抢完整轮次锁（审查修复 #15 + issue #134 方案2+4）：与 UI 签到/成长轮次、
+    // CLI 计划任务互斥（共享结果落盘并发会踩踏）；抢不到则通知并跳过，不排队阻塞
+    // 托盘线程（签到幂等，稍后可再点）。报错文案带持有者标签与已运行时长
+    let Ok(_round) = try_acquire_wb_round("托盘一键签到", &state.data_dir) else {
         let msg = "已有签到/成长任务在执行中，一键签到已跳过";
         fs_utils::app_log(&state.data_dir, msg);
         push_notify(Some(app), &state.data_dir, "一键签到", msg, crate::notify::NotifyEvent::Other);
@@ -390,7 +550,10 @@ pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
     };
     let s = load_settings(state);
     // 阶段 1：签到（每日任务同款参数：skip_checked + lazy 24h）
-    let done = wb_checkin::run_checkin_round(state, &CheckinOpts::daily(), &mut |_| {});
+    // issue #134 方案1：托盘后台轮次接入事件管线（同启动补签）
+    let done = wb_checkin::run_checkin_round(state, &CheckinOpts::daily(), &mut |ev| {
+        emit_wb_event(app, ev);
+    });
     let summary = match (
         done["ok"].as_i64(),
         done["already"].as_i64(),
@@ -402,13 +565,15 @@ pub fn tray_checkin_all(app: &AppHandle, state: &AppState) {
     let msg = format!("WorkBuddy 签到: {summary}");
     fs_utils::app_log(&state.data_dir, &msg);
     push_notify(Some(app), &state.data_dir, "一键签到", &msg, crate::notify::NotifyEvent::CheckinDone);
-    // 阶段 2：成长计划（旅行/盲盒/任务开关随设置）
+    // 阶段 2：成长计划（旅行/盲盒/任务开关随设置）——同接入事件管线（issue #134 方案1）
     let flags = GrowthOpts {
         travel: s.growth_travel,
         lottery: s.growth_lottery,
         tasks: s.growth_tasks,
     };
-    wb_checkin::run_growth_round(state, &flags, &[], &mut |_| {});
+    wb_checkin::run_growth_round(state, &flags, &[], &mut |ev| {
+        emit_wb_event(app, ev);
+    });
     let msg = "WorkBuddy 成长计划: 完成";
     fs_utils::app_log(&state.data_dir, msg);
     push_notify(Some(app), &state.data_dir, "一键签到", msg, crate::notify::NotifyEvent::CheckinDone);

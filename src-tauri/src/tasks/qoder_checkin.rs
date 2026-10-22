@@ -201,6 +201,7 @@ const CAMPAIGN_NOT_ACTIVE_TAG: &str = "CAMPAIGN_NOT_ACTIVE";
 /// 与 [`list_campaigns`] 的区别：不把空列表判为 fail——盲发兜底当轮重学
 ///（issue #105）需要「列表为空 → 学不到 → 放弃重学」而非「列表为空 → 整账号失败」。
 fn fetch_campaigns(
+    state: &AppState,
     agent: &ureq::Agent,
     headers: &[(String, String)],
     urls: &QoderUrls,
@@ -220,10 +221,22 @@ fn fetch_campaigns(
         return Err(("fail".into(), "campaigns 响应非 JSON".into()));
     };
     // 信封穿透（fs_utils::dig 含 data 包裹下钻）
-    Ok(fs_utils::dig(&b, &["campaigns"])
+    let campaigns = fs_utils::dig(&b, &["campaigns"])
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default();
+    // 空表诊断（2026-10-21 起 CN 侧持续空表，issue #132）：记录 HTTP 状态、
+    // campaigns 键是否存在、响应体头部——用于区分「真空数组」「键缺失/改名」
+    // 「信封错误」。响应体为活动元数据，不含任何凭证。
+    if campaigns.is_empty() {
+        let head: String = raw.chars().take(400).collect();
+        let has_key = fs_utils::dig(&b, &["campaigns"]).is_some();
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] campaigns 空表: http={status} campaigns_key={has_key} body={head}"),
+        );
+    }
+    Ok(campaigns)
 }
 
 /// 拉取活动列表（**全量，不过滤**）。返回 Ok(全量 campaign 列表)；
@@ -231,11 +244,12 @@ fn fetch_campaigns(
 /// 全量返回的原因：列表内 CLAIMED grant 是「每日奖励已领取」的判定数据源
 ///（daily_credits_claimed_in_list），CLAIMABLE 过滤交给调用方（filter_claimable）。
 fn list_campaigns(
+    state: &AppState,
     agent: &ureq::Agent,
     headers: &[(String, String)],
     urls: &QoderUrls,
 ) -> Result<Vec<Value>, (String, String)> {
-    let campaigns = fetch_campaigns(agent, headers, urls)?;
+    let campaigns = fetch_campaigns(state, agent, headers, urls)?;
     // ⚠ campaigns 为空 ≠ 已签：可能活动未开始 / Cosy-ClientType 缺失（本层
     // 恒带）/ 接口结构变更——与「无可领项」显式区分，kind=fail 触发 UI 提示（§5.2）
     if campaigns.is_empty() {
@@ -245,6 +259,61 @@ fn list_campaigns(
         ));
     }
     Ok(campaigns)
+}
+
+/// 拉活动列表（完整头 → 空表则最小头复取一次）。
+///
+/// 上游对 campaigns 列表按**请求形态**分桶投放：完整设备头族形态可能返回
+/// `showCampaign=false` + `campaigns: []`（HTTP 200），而同刻最小头形态可见
+/// 活动条目（2026-10-14、2026-10-21 两次实测，issue #132）。[`list_campaigns`]
+/// 把空数组判为 fail，而最小头补学 `learn_from_min_headers` 写在
+/// `process_account` 的 Ok 分支内——空表走 Err，补学从未执行，故此处兜一层。
+///
+/// 错误口径：复取自身失败（401 / 429 / 5xx / 网络）时**透传其错误**，不伪装成
+/// empty_campaigns——否则 401 进不了凭证刷新自愈，暂态故障还会被调度器按
+/// `failed_empty_campaigns` 排除当日重试。仅当复取同样为空表时才回退到首次的
+/// 空表错误。
+///
+/// 返回值第二项 = 列表是否来自最小头复取：调用方据此跳过 `learn_from_min_headers`
+/// 的重复补学（否则同一 token/头/URL 会立刻再 GET 一次）。
+fn list_campaigns_with_fallback(
+    state: &AppState,
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    min_token: &str,
+    urls: &QoderUrls,
+    aid: &str,
+) -> Result<(Vec<Value>, bool), (String, String)> {
+    match list_campaigns(state, agent, headers, urls) {
+        Err((k, m)) if m.starts_with(EMPTY_CAMPAIGNS_TAG) => {
+            match list_campaigns(state, agent, &minimal_auth_headers(min_token), urls) {
+                Ok(c) => {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("[qoder] 完整头空表、最小头复取得 {} 条活动（{aid}）", c.len()),
+                    );
+                    Ok((c, true))
+                }
+                Err((_, m2)) if m2.starts_with(EMPTY_CAMPAIGNS_TAG) => {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("[qoder] 完整头与最小头均返回空活动列表（{aid}）"),
+                    );
+                    Err((k, m))
+                }
+                Err((k2, m2)) => {
+                    // 复取自身故障（401 / 429 / 5xx / 网络）：如实透传，保留
+                    // 刷新自愈与当日重试资格
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("[qoder] 最小头复取失败（{k2}）: {m2}（{aid}）"),
+                    );
+                    Err((k2, m2))
+                }
+            }
+        }
+        other => other.map(|c| (c, false)),
+    }
 }
 
 /// 过滤 claimStatus==CLAIMABLE（大小写宽容，纯函数可单测），双活动自然全覆盖。
@@ -739,7 +808,7 @@ fn learn_from_min_headers(
     now_secs: i64,
 ) -> Vec<(String, String)> {
     let headers = minimal_auth_headers(access_token);
-    match fetch_campaigns(agent, &headers, urls) {
+    match fetch_campaigns(state, agent, &headers, urls) {
         Ok(campaigns) => {
             // 严格档优先，产空回退宽松档（与主列表重学同口径：宽松档仅在
             // 严格档产空时兜底）。最小头补学是 409 同轮自愈链的最后一环，
@@ -1129,6 +1198,7 @@ fn blind_round(
 /// issue #114：claim 端点完整头被风控 503 拦截；重学 GET 用最小头视野为完整头
 /// 形态的超集——CLAIMABLE 条目可见，学习可见性只增不减）。
 fn known_daily_fallback(
+    state: &AppState,
     agent: &ureq::Agent,
     access_token: &str,
     urls: &QoderUrls,
@@ -1158,7 +1228,9 @@ fn known_daily_fallback(
     // already 只能来自服务端 replayed/CLAIMED 回放确认（classify_blind_step），
     // 学习值本身不会把未领活动误归 already
     let mut retry: Vec<(String, String)> = Vec::new();
-    if let Ok(campaigns) = fetch_campaigns(agent, &minimal_auth_headers(access_token), urls) {
+    if let Ok(campaigns) =
+        fetch_campaigns(state, agent, &minimal_auth_headers(access_token), urls)
+    {
         merge_learned(&mut retry, learn_daily_campaign_ids_lenient(&campaigns));
     }
     retry.retain(|(cid, _)| !tried.iter().any(|t| t == cid));
@@ -1203,7 +1275,7 @@ fn fallback_with_relearn(
             attempted.push(cid.clone());
         }
     }
-    let outcome = known_daily_fallback(agent, access_token, urls, learned, table);
+    let outcome = known_daily_fallback(state, agent, access_token, urls, learned, table);
     if let FallbackOutcome::Failed(m, _, _) = &outcome {
         if m.contains(CAMPAIGN_NOT_ACTIVE_TAG) {
             let before = learned.len();
@@ -1220,7 +1292,7 @@ fn fallback_with_relearn(
             merge_learned(learned, found);
             // 过滤后 merge 仍增长 = 确有未试过的新 id 才值得重试盲发
             if learned.len() > before {
-                return known_daily_fallback(agent, access_token, urls, learned, table);
+                return known_daily_fallback(state, agent, access_token, urls, learned, table);
             }
         }
     }
@@ -1304,7 +1376,14 @@ fn process_account(
     // 指纹头族被上游风控 503 拦截，最小头通过；401 刷新成功后随新令牌更新）
     let mut min_token = creds.access_token.clone();
 
-    let (mut kind, mut message, mut reward) = match list_campaigns(agent, &headers, &urls) {
+    // 列表请求：完整头（容器派生设备头形态）返回空表时，用最小头复取一次
+    //（issue #132：空表走 Err 分支，原 Ok 分支内的最小头补学从未执行）。
+    // 实证依据见 minimal_auth_headers 注释与 list_campaigns_with_fallback。
+    let list_call = list_campaigns_with_fallback(state, agent, &headers, &min_token, &urls, &aid);
+    // 列表已由最小头复取得到时，不再用同一形态重复补学（见封装注释）
+    let list_from_min = matches!(&list_call, Ok((_, true)));
+    let list_res = list_call.map(|(c, _)| c);
+    let (mut kind, mut message, mut reward) = match list_res {
         Ok(campaigns) => {
             // 健壮性①：从列表反学当日活动 id（列表虽过滤 CLAIMABLE 状态，条目
             // 本身可见），供盲发兜底优先使用；401 重试路径同款
@@ -1313,8 +1392,9 @@ fn process_account(
                 learn_daily_campaign_ids(&campaigns, chrono::Utc::now().timestamp()),
             );
             // 健壮性①+（PR #106 移植）：主列表（容器形态）零可学条目时，用最小头
-            // 形态补学一次（learned 整轮共享，仅每轮首个扑空账号实际发起，后续账号跳过）
-            if learned.is_empty() {
+            // 形态补学一次（learned 整轮共享，仅每轮首个扑空账号实际发起，后续账号
+            // 跳过；列表本身已由最小头复取得到时跳过——同形态再 GET 只是重复请求）
+            if learned.is_empty() && !list_from_min {
                 merge_learned(
                     learned,
                     learn_from_min_headers(
@@ -1439,16 +1519,21 @@ fn process_account(
                 // issue #114：重试路径的补学与 claim 均须用新令牌，旧令牌已被
                 // 一次性轮换作废，用旧令牌补学必 401）
                 min_token = new.access_token.clone();
-                let retry = match list_campaigns(agent, &headers, &urls) {
-                    Ok(campaigns) => {
+                // 刷新后同样走「完整头 → 空表则最小头复取」（issue #132）：本次
+                // 修复针对的正是完整头持续空表，只用完整头重试会立刻再次空表并结束
+                let retry = match list_campaigns_with_fallback(
+                    state, agent, &headers, &min_token, &urls, &aid,
+                ) {
+                    Ok((campaigns, from_min)) => {
                         // 重试路径同样重学（新令牌下列表视野可能不同，多学无害）
                         merge_learned(
                             learned,
                             learn_daily_campaign_ids(&campaigns, chrono::Utc::now().timestamp()),
                         );
                         // 重试路径同款最小头补学（learned 仍空时；整轮共享，通常
-                        // 首个账号已补学到位，此处多为空转跳过。用刷新后的新令牌）
-                        if learned.is_empty() {
+                        // 首个账号已补学到位，此处多为空转跳过。用刷新后的新令牌；
+                        // 列表本身已来自最小头复取时不重复请求）
+                        if learned.is_empty() && !from_min {
                             merge_learned(
                                 learned,
                                 learn_from_min_headers(

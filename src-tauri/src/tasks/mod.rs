@@ -87,15 +87,24 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
     }
     let result = match name {
         "doubao-quota" => doubao_quota::run_batch(state),
-        // WorkBuddy 每日签到（schtasks 直调；--json-stream --skip-checked 同款参数）
-        "wb-checkin" => Ok(wb_checkin::run_checkin_round(
-            state,
-            &wb_checkin::CheckinOpts::daily(),
-            &mut print_progress,
-        )),
+        // WorkBuddy 每日签到（schtasks 直调；--json-stream --skip-checked 同款参数）。
+        // issue #134 方案4：抢完整轮次锁与 GUI 进程互斥——CLI 是独立进程，GUI 进程内
+        // 的 tokio 轮次锁对它无效，必须靠跨进程命名互斥体；GUI 正在跑（UI/调度器/
+        // 启动补签/托盘）时幂等跳过，避免双进程并发落盘踩踏
+        "wb-checkin" => {
+            match crate::commands::workbuddy::try_acquire_wb_round("CLI 签到", &state.data_dir) {
+                Ok(_round) => Ok(wb_checkin::run_checkin_round(
+                    state,
+                    &wb_checkin::CheckinOpts::daily(),
+                    &mut print_progress,
+                )),
+                Err(why) => Ok(serde_json::json!({ "ok": true, "skipped": why, "skipped_busy": true })),
+            }
+        }
         // WorkBuddy 每周兜底续期（对齐 python --renew-only，lazy 24h）
         "wb-renew" => Ok(wb_checkin::run_renew_only(state, 24)),
-        // WorkBuddy 每日成长（任务配置页；调度器/CLI 共用，成长三开关驱动）
+        // WorkBuddy 每日成长（任务配置页；调度器/CLI 共用，成长三开关驱动）。
+        // issue #134 方案4：抢完整轮次锁同 wb-checkin
         "wb-growth" => {
             let s = crate::commands::workbuddy::load_settings(state);
             let flags = wb_checkin::GrowthOpts {
@@ -103,8 +112,13 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 lottery: s.growth_lottery,
                 tasks: s.growth_tasks,
             };
-            wb_checkin::run_growth_round(state, &flags, &[], &mut print_progress);
-            Ok(serde_json::json!({ "ok": true }))
+            match crate::commands::workbuddy::try_acquire_wb_round("CLI 成长", &state.data_dir) {
+                Ok(_round) => {
+                    wb_checkin::run_growth_round(state, &flags, &[], &mut print_progress);
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+                Err(why) => Ok(serde_json::json!({ "ok": true, "skipped": why, "skipped_busy": true })),
+            }
         }
         // Qoder 每日签到（F-80；schtasks 直调 + 应用内调度器共用；10:15 单次覆盖双活动）
         "qoder-checkin" => {
