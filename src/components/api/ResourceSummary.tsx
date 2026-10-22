@@ -61,6 +61,7 @@ const POOL_LABELS: Record<string, string> = {
   trae: 'Trae 池',
   qoder: 'Qoder 池',
   'buddy-ai': 'BuddyAI 国际池',
+  custom: '自定义上游池',
 };
 
 const selectCls =
@@ -69,8 +70,8 @@ const selectCls =
 const inputCls =
   'h-7 w-44 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none placeholder:text-slate-300 focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200';
 
-/** 池间候选序全集（优先级编辑补尾与沉尾写回用全量；可见池排列的候选序在组件内按可见性动态派生） */
-const POOL_KEYS = ['buddy', 'trae', 'qoder', 'buddy-ai'];
+/** 池间候选序全集（优先级编辑补尾与沉尾写回用全量；可见池排列的候选序在组件内按可见性动态派生。v3：custom 入池间策略全集，尾部兜底位） */
+const POOL_KEYS = ['buddy', 'trae', 'qoder', 'buddy-ai', 'custom'];
 
 /** 全排列（per_model 候选序选项：n 池 n! 种，覆盖全部合法顺序） */
 function permutations(arr: string[]): string[][] {

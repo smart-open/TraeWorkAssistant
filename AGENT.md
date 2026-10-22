@@ -1,13 +1,14 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.7.12
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.8.2
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
 
 ## 1. 一句话
 
-Windows / macOS 双平台桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / CodeBuddy / 豆包 / Qoder / Qoder Work 六应用**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；桥档案表可扩展更多应用；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom 四池调度**，每池独立开关。**所有数据仅存在本地数据目录（Windows `%APPDATA%\AIWorkAssistant\`，macOS `~/Library/Application Support/AIWorkAssistant/`），零外部网络**。
+Windows / macOS 双平台桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / CodeBuddy / 豆包 / Qoder / Qoder Work 六应用**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；桥档案表可扩展更多应用；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom / buddy-ai 多池统一调度**（custom 为自定义上游组：组内负载均衡 + 熔断；默认候选序尾部兜底），每池独立开关。**所有数据仅存在本地数据目录（Windows `%APPDATA%\AIWorkAssistant\`，macOS `~/Library/Application Support/AIWorkAssistant/`），零外部网络**。
 
 > **macOS 支持（F-75）**：平台服务层 `platform/` 分层归位（子进程构建 / 数据目录 / vault Keychain / 系统代理 networksetup / CA security / 进程 SIGTERM / bundle 定位），打包 dmg（aarch64 + x64 双架构，`tauri.macos.conf.json`）。应用域灰度放开中（`mac_supported`，待各应用 mac 版数据布局侦察），设计与进度见 `docs/tmp/f75-macos-support-design.md`。schtasks 系统级定时、MachineGuid 系统级重置、UI 点击兜底为 Windows 专属（mac 由内置调度器 + 开机自启覆盖，入口按 platform 标志隐藏）。
+
 
 ## 2. Quick Start
 
@@ -160,7 +161,7 @@ ai-work-assistant/
 | API | `api_keys_list()` / `api_keys_save(keys)` | 多 API Key 列表管理（T2，data/api_keys.json，每日配额；主 Key 双轨已移除） |
 | API | `api_unified_models(available_only?)` | 统一模型目录（v3.3.x）：Trae 官网同步 + WB 目录 + 自定义模型三源合并（canonical_id trim+lowercase 归并），元数据四层兜底（L1 人工覆盖 trae_model_meta.json → L2 官网 → L3 默认 → L4 系列推断）；与 `GET /v1/models` 共用视图 |
 | API | `dispatch_policy_get()` / `dispatch_policy_set(policy)` | 池间调度策略（data/dispatch_policy.json）：`strategy`（smart=到期优先→倍率→健康积分和 / priority=严格按序）、`priority`（trae/buddy/qoder 数组，缺省 ["buddy","trae","qoder"]）、`per_model` 模型级覆盖（显式覆盖不做智能重排）、`fallback` 跨池回退开关；带 mtime 兜底解析缓存 |
-| API | `custom_models_list()` / `custom_models_save(model)` / `custom_model_test(model)` | 自定义 OpenAI 兼容上游（data/custom_models.json，v3.3.x）：列表 / upsert（name/base_url 必填、canonical 不重复、id `cm-<12hex>` 自动生成）/ 连通性测试（与保存同口径预检）；模型命中即直达 custom 池，不参与 dispatch 池间策略 |
+| API | `custom_models_list()` / `custom_models_save(model)` / `custom_models_remove(id)` / `custom_model_test(model)` / `custom_lb_status()` | 自定义 OpenAI 兼容上游（data/custom_models.json）：列表 / upsert（name/base_url 必填；**同名多条 = 上游组**——仅拒绝完全重复（同名+同 base_url+同 api_key），id `cm-<12hex>` 自动生成；条目字段含 `weight`（负载权重，默认 1）/ `standby`（备胎标记，默认 false））/ 连通性测试（与保存同口径预检）/ 熔断快照（每条冷却中上游的 fails/cooling_secs，重启清零）。**调度语义（v3）**：上游组经 custom_lb 组内加权轮询 + 主备 failover + 实例级熔断（30s×2ⁿ 封顶 480s，401/403/402 长 600s，成功即清）；作为第五资源池参与 dispatch 统一调度（默认候选序尾部兜底），`custom/模型名` 前缀锁池直达、Key 绑定 "custom" 与 per_model 写 "custom" 全链路生效 |
 | API | `api_wb_usage_stats(days?)` / `api_custom_usage_stats(days?)` / `api_qoder_usage_stats(days?)` | WB 池 / 自定义池 / Qoder 池用量按日统计（四桶分库查询，days 默认 14 clamp 1~90；Qoder 桶上游接入后产生数据） |
 | 日志 | `logs_query({ opts: { log_type, date, keyword, limit } })` → `LogLine[]` | `split_time` 会 strip BOM 前缀 |
 | 日志 | `logs_clear(log_type)` → `u32` | 按类型删除日志文件（all/proxy/checkin/switch，T6，幂等） |
@@ -229,12 +230,12 @@ ai-work-assistant/
 - **运维接口（T2.3/F-32）**：`/healthz`（无健康账号 503）；`/v1/models` 合并 WB 目录（owned_by=workbuddy）；`/status`、`/health` 增加 `wb` 段（池画像/模型冷却/粘性会话数/上游健康探针 `probe_ok`+`probe_ts_ms`：-1 未探测/0 不可达/1 在线，§2.2 频控 5min+0-60s 抖动）；请求日志含 TTFB（WB 与 SOLO 流式均覆盖，SOLO 经 `log_request_ttfb` 结构化字段）。
 - **ck_ 子 Key 体系（F-35，批次3）**：对外子 Key（`ck_` 前缀，前端 crypto 随机源生成；旧 `sk-` 兼容）与上游真实凭证分离。`api_keys.json` 条目扩展：`allowed_accounts`（上游 uid 白名单，空=不限）、`schedule_mode`（`expire_first` 临期优先默认 / `dedicated` 专一固定 `dedicated_account`）、`daily_stats`（按日请求统计 cap 90 天）。鉴权中间件把 `ResolvedKey` 快照注入 extensions；wb_route 流式/非流式取号统一走 `pick_excluding_constrained`（专一锁定 > 白名单过滤 > 池策略），粘性绑定不白名单内时忽略粘性。
 
-### 5.3 三池调度与统一模型目录（v3.3.x）
+### 5.3 多池调度与统一模型目录（v3.3.x；2026-10-22 custom 上游组改造）
 
-- **资源池**：`trae`（SOLO `llm_utils_chat`，积分 208）/ `buddy`（copilot.tencent.com 或 www.workbuddy.ai，按账号 domain 判定）/ `custom`（自定义 OpenAI 兼容上游 `custom_models.json`，**命中即直达、不参与池间策略**）。协议细节见 tech-framework.md §5.5 与附录 B。
-- **池间策略（`dispatch.rs`）**：`smart` 默认——按请求模型对可用源池排序：① 池内最早积分到期优先（无到期数据后置）→ ② 该模型倍率小者优先（0=免费最优）→ ③ 健康账号剩余积分总和多优先；全并列回退固定序（Buddy 优先现状）。`priority` 为改造前严格按序行为。`per_model` 显式覆盖不做智能重排（用户显式配置优先）；`fallback=false` 时仅用首选池。
-- **统一目录（`unified_catalog.rs`）**：`api_unified_models` 与 `GET /v1/models` 共用；Trae 模型元数据四层兜底——L1 人工覆盖（`trae_model_meta.json`，编辑弹框 upsert/clear）→ L2 官网同步 → L3 默认 128K / 倍率参考（含 2026-09-13 审查补充的 5 个官网同步缺失倍率）→ L4 系列/思考档位/图片支持推断。倍率口径冲突时只补缺失条目、不改既有值。
-- **custom 路由（`custom_route.rs` / `custom_models.rs`）**：请求模型名 canonical（trim+lowercase）命中 enabled 自定义模型即直转其 `chat/completions`（`chat_url` 归一 base 含 `/v1` 与否两种形态），Bearer 用条目 API Key；响应侧复用既有协议输出层。
+- **资源池**：`trae`（SOLO `llm_utils_chat`，积分 208）/ `buddy`（copilot.tencent.com 或 www.workbuddy.ai，按账号 domain 判定）/ `qoder` / `buddy-ai` / `custom`（自定义 OpenAI 兼容上游组 `custom_models.json`，同名多条 = 上游组；v3 起为第五资源池参与统一调度，**默认候选序尾部兜底**，纯 custom 模型唯一源直达）。协议细节见 tech-framework.md §5.5 与附录 B。
+- **池间策略（`dispatch.rs`）**：`smart` 默认——按请求模型对可用源池排序：① 池内最早积分到期优先（无到期数据后置）→ ② 该模型倍率小者优先（0=免费最优；custom 取组内最小 rate）→ ③ 健康账号剩余积分总和多优先（custom 后置）；全并列回退固定序（Buddy 优先现状）。`priority` 为严格按序行为。`per_model` 显式覆盖不做智能重排（用户显式配置优先，值可写 `"custom"` 任意位置）；`fallback=false` 时仅用首选池。默认候选序 = `[buddy, trae, qoder, custom]`（priority 缺省不含 custom，尾部补全循环追加）。
+- **统一目录（`unified_catalog.rs`）**：`api_unified_models` 与 `GET /v1/models` 共用；Trae 模型元数据四层兜底——L1 人工覆盖（`trae_model_meta.json`，编辑弹框 upsert/clear）→ L2 官网同步 → L3 默认 128K / 倍率参考（含 2026-09-13 审查补充的 5 个官网同步缺失倍率）→ L4 系列/思考档位/图片支持推断。倍率口径冲突时只补缺失条目、不改既有值。同名多条 custom 条目聚合为单行（倍率取组内最小，任一条 enabled 即可命中）。
+- **custom 上游组（`custom_route.rs` / `custom_models.rs` / `custom_lb.rs`）**：请求模型名 canonical（trim+lowercase）命中上游组（全部 enabled 条目）；组内 `pick_upstream` 加权轮询选路（粘性优先，TTL 60s；standby 备胎仅在活跃条目全失败/全熔断时启用），所选上游失败且未向客户端产出字节（`!sent_any`）时换组内下一上游重试（≤ min(N,3) 轮），`sent_any` 后就地收尾（SSE 铁律）。专用 agent 连接超时 3s（快速失败）/首字 10s/空闲读 300s；请求体每次 attempt 按所选条目重建（模型名对齐条目 name 原文）。实例级熔断（custom_lb）键 = cm.id：Server 类渐进冷却 30s×2ⁿ 封顶 480s（递增条件 = 既有窗口已过期，防单请求轮换放大），401/403/402 直接 600s 长窗；成功即清、重启清零；半开 = 窗口到期后下一请求自然放行，探测失败由组内轮换立即兜底客户端无感。custom 全熔断 → `NoHealthy(Custom)` → 现有 fallback 按序回退下一池。
 
 ### 5.4 Qoder 约定（F-80）
 

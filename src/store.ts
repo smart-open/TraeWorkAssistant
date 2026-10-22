@@ -265,6 +265,8 @@ function defaultSettings(): Settings {
     pinned_app: 'trae',
     hidden_apps: [],
     app_icons: {},
+    // 侧边栏应用显示顺序：空 = 内置默认顺序（APP_TABS 声明序），拖拽排序后写入
+    app_order: [],
     buddy_ai_visible: false,
     // buddy-ai 每日活跃打卡（阶段 3b）：调度开关默认关（显式开启制）、时刻 09:20、间隔 3s
     buddy_ai_checkin_enabled: false,

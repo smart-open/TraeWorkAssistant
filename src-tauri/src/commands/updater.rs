@@ -17,9 +17,11 @@
 //                      SHA256 比对（不匹配即删除并报错），通过后落 .sha256 sidecar；
 //                      ③ update_run_installer 安装前校验「文件名与资产名绑定 + SHA256 复验」。
 //                      返回文件路径由前端确认后再安装；
-//   update_run_installer 以 /P /UPDATE /R 启动 NSIS 安装器：
+//   update_run_installer 经 cmd /c start 中转以 /P /UPDATE /R 启动 NSIS 安装器（issue #135）：
 //                      /P 被动模式（仅显示进度条）+ /UPDATE 跳过卸载直接覆盖 + /R 安装完成后自动重启应用
-//                      （自定义模板 build-assets/installer.nsi 支持上述标志），随后应用退出。
+//                      （自定义模板 build-assets/installer.nsi 支持上述标志）；中转启动令安装器在应用
+//                      退出前即脱离本应用进程树，避免安装器 PREINSTALL 的 taskkill 树杀误伤自身，
+//                      随后应用退出。
 
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -743,7 +745,11 @@ pub fn update_run_installer(
         return Ok(());
     }
 
-    // Windows：/P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用
+    // Windows：/P 进度条可见 + /UPDATE 跳过卸载直接覆盖 + /R 完成后自动重启应用。
+    // issue #135（main 侧并入）：经 `cmd /c start` 中转启动——cmd 启动安装器后立即退出，
+    // 安装器随即脱离本应用的进程树，PREINSTALL 钩子 taskkill 主程序（无 /T）不会波及
+    // 安装器；取代旧 CREATE_BREAKAWAY_FROM_JOB 方案（issue #37）。CREATE_NO_WINDOW
+    // 防止 cmd 控制台窗口闪现。
     // 审查修复（P1，整体黑盒复审）：整体 cfg 门控——mac 构建中上方 return 之后
     // 本段不可达，未门控会触发 unreachable_code 警告（零警告红线）
     #[cfg(not(target_os = "macos"))]
@@ -751,29 +757,22 @@ pub fn update_run_installer(
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            // Issue #37 加固：CREATE_BREAKAWAY_FROM_JOB 让安装器脱离本应用的 Job 对象，
-            // 防止应用退出时 Job 的 kill-on-close 连带终止安装器；它不改变父子关系，
-            // 进程树竞态由安装钩子（UpdateMode 等待退出 + 无 /T 兜底）主修复。
-            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-            let mut cmd = std::process::Command::new(path);
-            cmd.args(["/P", "/UPDATE", "/R"]);
-            let spawned = cmd
-                .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
-                .spawn()
-                .or_else(|_| {
-                    // 当前 Job 不允许脱离等场景启动失败 → 回退普通方式启动
-                    cmd.creation_flags(0).spawn().map_err(|e| {
-                        format!("启动安装程序失败: {e}（可手动运行：{file_path}）")
-                    })
-                });
-            spawned?;
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            std::process::Command::new(path)
-                .args(["/P", "/UPDATE", "/R"])
-                .spawn()
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            // .status() 等待 cmd 自身退出（cmd 启动 start 后立即退出，毫秒级，不阻塞脱树）：
+            // spawn 成功只代表 cmd 进程创建成功，start 的 ShellExecute 失败（如杀软拦截、
+            // 文件关联损坏）时 cmd 返回非零——校验退出码可在此报错提示手动运行安装包，
+            // 而不是照常 emit+exit 静默失败（issue #135 加固）
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "start", "", file_path.as_str(), "/P", "/UPDATE", "/R"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
                 .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
+            if !status.success() {
+                return Err(format!(
+                    "启动安装程序失败（退出码 {}），可手动运行：{file_path}",
+                    status.code().unwrap_or(-1)
+                ));
+            }
         }
 
         // 提示前端后退出，让安装器接管（安装钩子已先等本进程自行退出再兜底解锁）

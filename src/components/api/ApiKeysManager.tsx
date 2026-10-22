@@ -39,7 +39,9 @@ const bindPoolLabel = (p: string) =>
         ? 'BuddyAI 国际池'
         : p === 'qoder'
           ? 'Qoder 池'
-          : 'Trae/Buddy/Qoder/BuddyAI 国际池';
+          : p === 'custom'
+            ? '自定义上游池'
+            : 'Trae/Buddy/Qoder/BuddyAI/自定义';
 
 export default function ApiKeysManager({
   onSubModalChange,
@@ -217,7 +219,7 @@ export default function ApiKeysManager({
     // issue #30：bind="" 旧数据裸 uid 显示时归一为 buddy: 前缀（与候选编码对齐，
     // UI 勾选状态与实际限定一致）；原值存入 editOrigRef，保存时未改动则写回原值
     const norm = (v: string) =>
-      !k.bind_pool && v && !/^(trae|buddy|buddy-ai|qoder):/i.test(v) ? `buddy:${v}` : v;
+      !k.bind_pool && v && !/^(trae|buddy|buddy-ai|qoder|custom):/i.test(v) ? `buddy:${v}` : v;
     editOrigRef.current = { allowed: k.allowed_accounts, dedicated: k.dedicated_account || '' };
     setEditAllowed(new Set(k.allowed_accounts.map(norm)));
     setEditMode(k.schedule_mode || 'expire_first');
@@ -559,6 +561,7 @@ export default function ApiKeysManager({
               { key: 'buddy', label: 'Buddy', title: '优先走 Buddy，异常可回退' },
               { key: 'buddy-ai', label: 'BuddyAI', title: '优先走 BuddyAI 国际池，异常可回退' },
               { key: 'qoder', label: 'Qoder', title: '优先走 Qoder，异常可回退' },
+              { key: 'custom', label: '自定义', title: '优先走自定义上游组，异常可回退' },
               // 应用显隐联动：新增 Key 不提供隐藏应用的池选项
             ].filter((p) => p.key === '' || isPoolVisible(settings, p.key)).map((p) => (
               <button
@@ -811,6 +814,7 @@ export default function ApiKeysManager({
                 { key: 'buddy', label: 'Buddy 池', desc: '优先走 Buddy，异常可回退' },
                 { key: 'buddy-ai', label: 'BuddyAI 池', desc: '优先走 BuddyAI，异常可回退' },
                 { key: 'qoder', label: 'Qoder 池', desc: '优先走 Qoder，异常可回退' },
+                { key: 'custom', label: '自定义上游池', desc: '优先走自定义上游组，异常可回退' },
                 // 应用显隐联动：保留全量按钮（存量 bind_pool 指向隐藏池时需有选中态），
                 // 隐藏池加「已隐藏」徽标——隐藏不停功能、不删数据
               ].map((p) => (

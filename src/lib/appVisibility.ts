@@ -42,6 +42,23 @@ export function getVisibleApps(settings: Settings | null): AppKey[] {
   return ALL_APPS.filter((a) => isAppVisible(settings, a));
 }
 
+/**
+ * 应用展示顺序（用户自定义 + 默认兜底）：app_order 中出现的合法 key 按存储顺序在前
+ * （后端 state.rs 已去重，这里再防御一次），未提及的按 ALL_APPS 默认顺序补在末尾——
+ * 新版本新增应用对老配置（app_order 缺该 key）天然兼容；空 app_order = 全默认顺序
+ */
+export function getOrderedApps(settings: Settings | null): AppKey[] {
+  const seen = new Set<AppKey>();
+  const saved: AppKey[] = [];
+  for (const k of settings?.app_order ?? []) {
+    if (ALL_APPS.includes(k) && !seen.has(k)) {
+      seen.add(k);
+      saved.push(k);
+    }
+  }
+  return [...saved, ...ALL_APPS.filter((a) => !seen.has(a))];
+}
+
 /** 可见资源池列表（trae/buddy/qoder/buddy-ai 的可见子集） */
 export function getVisiblePools(settings: Settings | null): string[] {
   return POOL_APPS.filter((p) => isPoolVisible(settings, p));

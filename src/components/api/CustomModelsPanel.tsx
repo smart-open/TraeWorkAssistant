@@ -1,13 +1,14 @@
 /**
  * 全局 API 管理 · 自定义模型（custom_models.json）
  * 列表方式维护 OpenAI 兼容自定义模型：名称（请求模型名，路由键）/ API 地址 / Key /
- * 其他字段（上下文长度 / 最大输出 / 图片支持 / 倍率 / 备注 / 启用开关）。
- * 调度语义：请求模型名 canonical 命中 enabled 条目即直达该上游（用户显式配置优先），
- * 未命中回落 Trae/Buddy/Qoder 统一管线；数据源：custom_models_list / save / remove。
+ * 其他字段（上下文长度 / 最大输出 / 图片支持 / 倍率 / 负载权重 / 备胎 / 备注 / 启用开关）。
+ * 调度语义（v3）：同名多条 = 上游组（组内加权轮询 + 主备 failover + 熔断切换），
+ * 作为第五资源池参与统一调度（默认候选序尾部兜底），custom/ 前缀锁池直达；
+ * 数据源：custom_models_list / save / remove / custom_lb_status（熔断徽标）。
  * 子弹框（编辑/删除确认）沿用 Modal 叠加，onSubModalChange 上报供主弹窗屏蔽 ESC 双关。
  */
-import { useCallback, useEffect, useState } from 'react';
-import { Blocks, Pencil, Plus, Power, RefreshCw, Trash2 } from 'lucide-react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { Blocks, ChevronDown, ChevronRight, Pencil, Plus, Power, RefreshCw, Trash2 } from 'lucide-react';
 import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
@@ -28,6 +29,8 @@ const EMPTY_FORM: CustomModel = {
   rate: 0,
   note: '',
   updated_at: 0,
+  weight: 1,
+  standby: false,
 };
 
 /** 常用供应商预设（datalist 建议，可自由输入其他值） */
@@ -71,11 +74,22 @@ export default function CustomModelsPanel({
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
   // 倍率输入框文本态（避免受控数字输入打断小数点输入）
   const [rateText, setRateText] = useState('');
+  // 同名上游组折叠态（默认展开；键 = canonical 名称）
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // 熔断状态快照（P3 可观测）：cm.id → 剩余冷却秒
+  const [circuits, setCircuits] = useState<Map<string, number>>(new Map());
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       setModels(await api.apiServer.customModelsList());
+      // 熔断快照并行刷新（失败静默——仅可观测徽标，不阻塞列表）
+      try {
+        const snap = await api.apiServer.customLbStatus();
+        setCircuits(new Map(snap.map((s) => [s.id, s.cooling_secs])));
+      } catch {
+        setCircuits(new Map());
+      }
     } catch {
       /* 保留空列表 */
     } finally {
@@ -91,6 +105,30 @@ export default function CustomModelsPanel({
   useEffect(() => {
     onSubModalChange?.(form != null || deleteFor != null);
   }, [form, deleteFor, onSubModalChange]);
+
+  /** 同名多条按 canonical 名称分组（P1：同名多条 = 上游组展示） */
+  const groups = useMemo(() => {
+    const g: { key: string; members: CustomModel[] }[] = [];
+    const idx = new Map<string, number>();
+    for (const m of models) {
+      const key = m.name.trim().toLowerCase();
+      const i = idx.get(key);
+      if (i != null) g[i].members.push(m);
+      else {
+        idx.set(key, g.length);
+        g.push({ key, members: [m] });
+      }
+    }
+    return g;
+  }, [models]);
+
+  const toggleGroup = (key: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
   /** 打开/关闭编辑弹框（同时清内联错误与测试结果） */
   const openForm = (f: CustomModel) => {
@@ -151,6 +189,20 @@ export default function CustomModelsPanel({
       toast('error', '请完善必填项');
       return;
     }
+    // 完全重复拦截（与后端 upsert 同口径：同名 + 同地址 + 同 Key = 无意义冗余；
+    // 同名不同上游 = 合法上游组成员，放行并提示负载均衡语义）
+    const norm = (s: string) => s.trim().replace(/\/+$/, '');
+    const dup = models.find(
+      (x) =>
+        x.id !== form.id &&
+        x.name.trim().toLowerCase() === form.name.trim().toLowerCase() &&
+        norm(x.base_url) === norm(form.base_url) &&
+        x.api_key === form.api_key,
+    );
+    if (dup) {
+      toast('error', `保存失败：相同模型与上游地址/Key 的条目已存在（${dup.name}）`);
+      return;
+    }
     const ok = await runTest();
     if (!ok) return;
     setSaving(true);
@@ -198,6 +250,79 @@ export default function CustomModelsPanel({
   const set = <K extends keyof CustomModel>(k: K, v: CustomModel[K]) =>
     setForm((f) => (f ? { ...f, [k]: v } : f));
 
+  /** 单条成员行（inGroup = 上游组成员行：名称列缩进展示主/备角色，组名由组头呈现） */
+  const renderRow = (m: CustomModel, inGroup: boolean) => (
+    <tr
+      key={m.id}
+      className="row-hover border-b border-slate-100 last:border-0 dark:border-zinc-800"
+    >
+      <td className="py-2 pr-4">
+        <div className={`flex items-center gap-1.5 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200 ${inGroup ? 'pl-4' : ''}`}>
+          {inGroup ? (
+            <>
+              {m.standby ? (
+                <Badge tone="amber" className="!px-1.5 !text-[10px]">备</Badge>
+              ) : (
+                <Badge tone="green" className="!px-1.5 !text-[10px]">主</Badge>
+              )}
+              {m.weight !== 1 && <Badge tone="slate" className="!px-1.5 !text-[10px]">权重×{m.weight}</Badge>}
+            </>
+          ) : (
+            <>
+              {m.name}
+              {m.vendor && <Badge tone="slate" className="ml-1.5 !px-1.5 !text-[10px]">{m.vendor}</Badge>}
+            </>
+          )}
+        </div>
+        {m.note && <div className="mt-0.5 max-w-48 truncate text-[11px] text-slate-400" title={m.note}>{m.note}</div>}
+      </td>
+      <td className="max-w-56 truncate py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400" title={m.base_url}>
+        {m.base_url}
+      </td>
+      <td className="py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400">
+        {m.api_key ? maskApiKey(m.api_key) : '—'}
+      </td>
+      <td className="py-2 pr-4 tabular-nums text-xs text-slate-500 dark:text-zinc-400">
+        {m.context_length > 0 ? fmtK(m.context_length) : '—'}
+        {' / '}
+        {m.max_tokens > 0 ? fmtK(m.max_tokens) : '—'}
+        {m.supports_image && (
+          <Badge tone="blue" className="ml-1.5 !px-1.5 !text-[10px]">图片</Badge>
+        )}
+      </td>
+      <td className="py-2 pr-4 text-xs text-slate-500 dark:text-zinc-400">
+        {m.rate === 0 ? <Badge tone="green">免费</Badge> : `×${m.rate.toFixed(2)}`}
+      </td>
+      <td className="py-2 pr-4">
+        <div className="flex items-center gap-1">
+          {m.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
+          {circuits.get(m.id) != null && (
+            <Badge tone="amber" title="上游连续失败进入渐进冷却（成功即恢复），冷却期内组内选路自动跳过">
+              熔断中 {circuits.get(m.id)}s
+            </Badge>
+          )}
+        </div>
+      </td>
+      <td className="py-2">
+        <div className="flex items-center gap-1">
+          <button
+            className="btn-ghost !p-1.5"
+            title={m.enabled ? '禁用（禁用后该模型名回落 Trae/Buddy/Qoder 调度）' : '启用'}
+            onClick={() => void toggleEnabled(m)}
+          >
+            <Power size={14} className={m.enabled ? 'text-emerald-500' : 'text-slate-400'} />
+          </button>
+          <button className="btn-ghost !p-1.5" title="编辑" onClick={() => openForm({ ...m })}>
+            <Pencil size={14} />
+          </button>
+          <button className="btn-ghost !p-1.5" title="删除" onClick={() => setDeleteFor(m)}>
+            <Trash2 size={14} className="text-rose-500" />
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+
   return (
     <div className="card p-4">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -205,7 +330,7 @@ export default function CustomModelsPanel({
           <Blocks size={16} className="text-brand-500" />
           <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">自定义模型</h3>
           <span className="hidden text-xs text-slate-400 sm:inline">
-            OpenAI 兼容上游直通 · 模型名命中即直达，未命中回落 Trae/Buddy/Qoder 调度
+            OpenAI 兼容上游 · 同名多条组成上游组（负载均衡轮询），参与统一调度（默认尾部兜底），custom/前缀锁池直达
           </span>
         </div>
         <div className="flex items-center gap-1">
@@ -223,7 +348,7 @@ export default function CustomModelsPanel({
       {models.length === 0 ? (
         <p className="py-6 text-center text-sm text-slate-400">
           暂无自定义模型 — 点击「新建模型」接入任意 OpenAI 兼容 API（中转站 / 自建服务）；
-          模型名命中即直达，未命中回落 Trae/Buddy/Qoder 统一调度
+          同名多条组成上游组负载均衡，参与统一调度，未命中回落 Trae/Buddy/Qoder
         </p>
       ) : (
         <div className="overflow-x-auto">
@@ -240,57 +365,36 @@ export default function CustomModelsPanel({
               </tr>
             </thead>
             <tbody>
-              {models.map((m) => (
-                <tr
-                  key={m.id}
-                  className="row-hover border-b border-slate-100 last:border-0 dark:border-zinc-800"
-                >
-                  <td className="py-2 pr-4">
-                    <div className="font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
-                      {m.name}
-                      {m.vendor && <Badge tone="slate" className="ml-1.5 !px-1.5 !text-[10px]">{m.vendor}</Badge>}
-                    </div>
-                    {m.note && <div className="mt-0.5 max-w-48 truncate text-[11px] text-slate-400" title={m.note}>{m.note}</div>}
-                  </td>
-                  <td className="max-w-56 truncate py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400" title={m.base_url}>
-                    {m.base_url}
-                  </td>
-                  <td className="py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400">
-                    {m.api_key ? maskApiKey(m.api_key) : '—'}
-                  </td>
-                  <td className="py-2 pr-4 tabular-nums text-xs text-slate-500 dark:text-zinc-400">
-                    {m.context_length > 0 ? fmtK(m.context_length) : '—'}
-                    {' / '}
-                    {m.max_tokens > 0 ? fmtK(m.max_tokens) : '—'}
-                    {m.supports_image && (
-                      <Badge tone="blue" className="ml-1.5 !px-1.5 !text-[10px]">图片</Badge>
-                    )}
-                  </td>
-                  <td className="py-2 pr-4 text-xs text-slate-500 dark:text-zinc-400">
-                    {m.rate === 0 ? <Badge tone="green">免费</Badge> : `×${m.rate.toFixed(2)}`}
-                  </td>
-                  <td className="py-2 pr-4">
-                    {m.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
-                  </td>
-                  <td className="py-2">
-                    <div className="flex items-center gap-1">
-                      <button
-                        className="btn-ghost !p-1.5"
-                        title={m.enabled ? '禁用（禁用后该模型名回落 Trae/Buddy/Qoder 调度）' : '启用'}
-                        onClick={() => void toggleEnabled(m)}
+              {groups.map((g) => {
+                const multi = g.members.length > 1;
+                const isCollapsed = collapsed.has(g.key);
+                const head = g.members[0];
+                return (
+                  <Fragment key={g.key}>
+                    {multi ? (
+                      <tr
+                        className="row-hover cursor-pointer border-b border-slate-100 bg-slate-50/60 dark:border-zinc-800 dark:bg-zinc-800/40"
+                        onClick={() => toggleGroup(g.key)}
                       >
-                        <Power size={14} className={m.enabled ? 'text-emerald-500' : 'text-slate-400'} />
-                      </button>
-                      <button className="btn-ghost !p-1.5" title="编辑" onClick={() => openForm({ ...m })}>
-                        <Pencil size={14} />
-                      </button>
-                      <button className="btn-ghost !p-1.5" title="删除" onClick={() => setDeleteFor(m)}>
-                        <Trash2 size={14} className="text-rose-500" />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                        <td className="py-2 pr-4" colSpan={7}>
+                          <div className="flex flex-wrap items-center gap-1.5 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
+                            {isCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                            {head.name}
+                            {head.vendor && <Badge tone="slate" className="!px-1.5 !text-[10px]">{head.vendor}</Badge>}
+                            <Badge tone="blue" className="!px-1.5 !text-[10px]">{g.members.length} 个上游</Badge>
+                            <span className="text-[11px] font-normal text-slate-400">
+                              同名多条 = 上游组 · 加权轮询负载均衡 · 失败自动切换
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : null}
+                    {!multi || !isCollapsed
+                      ? g.members.map((m) => renderRow(m, multi))
+                      : null}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -331,7 +435,9 @@ export default function CustomModelsPanel({
               {errors.name ? (
                 <span className="mt-1 block text-[11px] text-rose-500">{errors.name}</span>
               ) : (
-                <span className="mt-1 block text-[11px] text-slate-400">路由键：匹配时忽略大小写与首尾空格</span>
+                <span className="mt-1 block text-[11px] text-slate-400">
+                  路由键：匹配时忽略大小写与首尾空格；同名多条将组成上游组，负载均衡轮询
+                </span>
               )}
             </label>
             <label className="block sm:col-span-1">
@@ -416,6 +522,21 @@ export default function CustomModelsPanel({
               </datalist>
               <span className="mt-1 block text-[11px] text-slate-400">展示用，可选预设或自由输入</span>
             </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-slate-500">负载权重（上游组）</span>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                className="input"
+                value={form.weight || ''}
+                placeholder="1"
+                onChange={(e) => set('weight', Math.min(100, Math.max(1, parseInt(e.target.value) || 1)))}
+              />
+              <span className="mt-1 block text-[11px] text-slate-400">
+                组内加权轮询分摊比例（默认 1）；同名多条时生效
+              </span>
+            </label>
             <label className="block sm:col-span-2">
               <span className="mb-1 block text-xs font-medium text-slate-500">备注</span>
               <input
@@ -441,6 +562,14 @@ export default function CustomModelsPanel({
                   onChange={(e) => set('supports_image', e.target.checked)}
                 />
                 支持图片输入
+              </label>
+              <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={form.standby}
+                  onChange={(e) => set('standby', e.target.checked)}
+                />
+                备胎（活跃条目全部失败/熔断时才启用）
               </label>
             </div>
             {testResult && (

@@ -33,8 +33,9 @@ pub fn default_priority() -> Vec<String> {
     vec!["buddy".into(), "trae".into(), "qoder".into()]
 }
 
-/// 资源池标识（对外统一 `trae` / `buddy` / `qoder` / `buddy-ai`；`custom` 仅供展示/日志，
-/// 不参与策略配置——parse("custom") 返回 None）
+/// 资源池标识（对外统一 `trae` / `buddy` / `qoder` / `buddy-ai` / `custom`）。
+/// v3 拍板：custom 为第五资源池参与统一调度规则（priority / per_model / Smart /
+/// Key 绑定 / fallback 全链路生效），默认候选序尾部兜底——不再「命中即直达」
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetPool {
     Trae,
@@ -44,8 +45,8 @@ pub enum TargetPool {
     /// 默认不启用（buddy_ai_enabled，用户在 API 服务页显式开启国际档——避免
     /// 用户仍在国内账号消耗时模型被静默路由到国际池的歧义）
     BuddyAi,
-    /// 自定义模型（custom_models.json 命中即直达，用户显式配置优先；
-    /// 不参与 dispatch_policy 优先级/回退——parse("custom") 返回 None）
+    /// 自定义模型上游组（P1 同名多条 = 上游组；custom_lb 组内负载均衡 + 熔断；
+    /// v3：普通池参与统一调度，`custom/模型名` 前缀锁池、per_model/Key 绑定可写 custom）
     Custom,
     /// Qoder 上游（p3-3，gateway.qoder.com.cn 推理网关；Qoder 目录命中即源）
     Qoder,
@@ -68,13 +69,17 @@ impl TargetPool {
             "buddy" => Some(TargetPool::Buddy),
             "buddy-ai" => Some(TargetPool::BuddyAi),
             "qoder" => Some(TargetPool::Qoder),
+            // v3 拍板：custom 转正——前缀锁池（custom/xxx）与 per_model/priority
+            // 写入 "custom" 随 parse 打通自然生效
+            "custom" => Some(TargetPool::Custom),
             _ => None,
         }
     }
 }
 
 /// 解析池前缀模型 id（issue #90 修复③a）：`trae/xxx` / `buddy/xxx` / `qoder/xxx`
-/// → (锁定池, 裸模型名)。custom 不参与前缀（自定义模型走 custom_models 直达）。
+/// / `custom/xxx` → (锁定池, 裸模型名)。v3：custom 前缀锁池直达（单池候选、
+/// 不可用显式报错不跨池回退，与其他池前缀同语义）。
 /// 前缀段/裸名均 trim + 小写比对；裸名为空视为无效前缀，原样透传（不误吞
 /// 斜杠模型名）。白名单准入（routes::whitelist_check）复用本函数剥离前缀。
 pub(crate) fn split_pool_prefix(model: &str) -> Option<(TargetPool, &str)> {
@@ -285,6 +290,10 @@ struct ModelSources {
     /// Qoder 源（p3-3）：Qoder 目录命中（Some(目录归一化 id)）；
     /// upstreamKey/efforts 等请求素材由执行路径经 qoder_upstream::resolve 再查
     qoder: Option<String>,
+    /// custom 上游组（P1::find_enabled_all 结果，空 = 无 custom 源；v3 第四源：
+    /// 与 buddy/trae/qoder 并列参与源集合判定与 fallback 管线，组内选路/熔断
+    /// 由 custom_lb 在执行路径自理，pool_health 仅判「任一上游未熔断」）
+    custom: Vec<super::custom_models::CustomModel>,
 }
 
 impl ModelSources {
@@ -317,11 +326,15 @@ impl ModelSources {
         if self.qoder.is_some() && qoder_enabled {
             n += 1;
         }
+        // custom 上游组（v3 第四源）：组非空即独立失败域计数（组内熔断细节由
+        // pool_health 判定，此处只算源存在性）
+        if !self.custom.is_empty() {
+            n += 1;
+        }
         n
     }
 
-    /// 源是否可用（trae/buddy/qoder 各感知自己的池开关；custom 走 resolve_target
-    /// 顶部短路，不进入源集合判定——恒 false 仅为匹配穷尽）
+    /// 源是否可用（trae/buddy/qoder/custom 各感知自己的池状态；custom = 组非空）
     fn available(
         &self,
         pool: TargetPool,
@@ -342,7 +355,9 @@ impl ModelSources {
                     && (self.buddy_intl_only || self.buddy_in_both)
             }
             TargetPool::Qoder => self.qoder.is_some() && qoder_enabled,
-            TargetPool::Custom => false,
+            // v3：custom 为真源判定（原恒 false 仅为匹配穷尽）——组非空即可候选，
+            // 全熔断由 pool_health 拦截走 fallback
+            TargetPool::Custom => !self.custom.is_empty(),
         }
     }
 }
@@ -413,23 +428,10 @@ pub fn resolve_target(
         Some((pool, bare)) => (Some(pool), bare),
         None => (None, model),
     };
-    // ⓪ 自定义模型直达（custom_models.json 命中 enabled 条目）：用户显式配置
-    // 优先于内置目录；单源无跨池回退，模型名原样透传（custom_route 按条目
-    // base_url/key 直连）。mtime 缓存读取，未配置时零开销跳过。
-    // issue #90 修复③a：池前缀锁定（trae/xxx 等）时跳过 custom 短路——否则
-    // 自定义模型与裸名同名时会劫持显式锁池请求到 Custom 池
-    if forced_pool.is_none() {
-        if let Some(cm) = super::custom_models::find_enabled(&state.data_dir, model) {
-            let _ = cm; // 命中信息由执行路径重新按 data_dir 读取（条目可能热更新）
-            return Ok(Resolved {
-                pool: TargetPool::Custom,
-                model: model.to_string(),
-                effort_hint: None,
-                max_mode_hint: false,
-                fallback_from: None,
-            });
-        }
-    }
+    // v3（P4）：⓪ custom 短路已移除——custom 为独立源，与前缀锁定解耦：
+    // 源集合照常收集（下方 sources.custom 填充），前缀锁定只影响候选序
+    //（custom/xxx = 单池候选直达；同名多源默认按统一调度规则、custom 尾部兜底）。
+    // 纯 custom 模型（无同名 trae/buddy/qoder 源）为唯一源，天然直达不受序影响
 
     // ② 模型名归一化（四段管线）+ Buddy 源判定：管线命中目录 → Buddy 源存在
     let cfg = wb_model_route::load_config(&state.data_dir);
@@ -586,6 +588,10 @@ pub fn resolve_target(
         trae: trae_hit,
         trae_final,
         qoder: qoder_hit,
+        // v3 第四源：custom 上游组（P1 find_enabled_all，与 buddy/qoder 判定并列
+        // 全量收集后按序筛选同构；命中信息由执行路径重新按 data_dir 读取一致性
+        // 由 config_cache 5s TTL 保证，此处仅做源存在性与健康判定）
+        custom: super::custom_models::find_enabled_all(&state.data_dir, model),
     };
 
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
@@ -613,16 +619,27 @@ pub fn resolve_target(
             buddy_ai_enabled,
         )
         && !(sources.qoder.is_some() && qoder_enabled)
+        && sources.custom.is_empty()
     {
         return Err(DispatchError::WbDisabled);
     }
     // 仅 Qoder 源模型 + qoder_enabled=false → 同语义镜像
-    if sources.qoder.is_some() && !sources.trae && sources.buddy.is_none() && !qoder_enabled {
+    if sources.qoder.is_some()
+        && !sources.trae
+        && sources.buddy.is_none()
+        && !qoder_enabled
+        && sources.custom.is_empty()
+    {
         return Err(DispatchError::QoderDisabled);
     }
     // 仅 Trae 源模型 + trae_enabled=false → 同族镜像（Trae 开关默认开，
     // 关闭属用户显式动作，与"池耗尽 503"区分开）
-    if sources.trae && sources.buddy.is_none() && sources.qoder.is_none() && !trae_enabled {
+    if sources.trae
+        && sources.buddy.is_none()
+        && sources.qoder.is_none()
+        && !trae_enabled
+        && sources.custom.is_empty()
+    {
         return Err(DispatchError::TraeDisabled);
     }
 
@@ -678,9 +695,13 @@ pub fn resolve_target(
         // issue #90 修复③a：单池候选（不追加其他池，无跨池回退）
         vec![p]
     } else if let Some(b) = bind {
-        // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"buddy-ai"/"qoder"，无需再 parse
+        // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"buddy-ai"/"qoder"/"custom"，无需再 parse
         if b == "trae" {
             vec![TargetPool::Trae, TargetPool::Buddy]
+        } else if b == "custom" {
+            // v3 决策 C：绑定 custom = custom 优先 + 不可用按序回退（「偏好非硬限制」）；
+            // 其余池由尾部补全循环按默认序追加
+            vec![TargetPool::Custom]
         } else if b == "qoder" {
             // Qoder 绑定（审查修复：原先落 else 被当 Buddy 处理，「Key 绑定池 >
             // 全局策略」对 Qoder 断链——多源模型先打 Buddy，仅回退才到 Qoder）
@@ -702,9 +723,10 @@ pub fn resolve_target(
             .collect()
     };
     // per_model / 绑定序可能只写了部分池：其余可用源追加尾部，保证多源回退有序
-    // （issue #90 修复③a：前缀锁定 = 单池候选，不追加）
+    // （issue #90 修复③a：前缀锁定 = 单池候选，不追加。v3：custom 尾部兜底位——
+    // 默认候选序 = [buddy, trae, qoder, custom]）
     if forced_pool.is_none() {
-        for p in [TargetPool::Buddy, TargetPool::BuddyAi, TargetPool::Trae, TargetPool::Qoder] {
+        for p in [TargetPool::Buddy, TargetPool::BuddyAi, TargetPool::Trae, TargetPool::Qoder, TargetPool::Custom] {
             if !order.contains(&p) {
                 order.push(p);
             }
@@ -839,8 +861,9 @@ pub fn resolve_target(
 }
 
 /// 会话池粘性键（§4.4：复用现有粘性会话键，conversation 维度）。
-/// 空指纹（无 messages / 无 conversation_id）不可粘 → None
-fn pool_session_key(body: &Value) -> Option<String> {
+/// 空指纹（无 messages / 无 conversation_id）不可粘 → None。
+/// pub：custom 上游组会话粘上游（custom_lb）复用同款会话键口径
+pub fn pool_session_key(body: &Value) -> Option<String> {
     let key = super::wb_sticky::SessionKey::from_body(body).cache_key();
     // 空指纹的 cache_key 为 "fp:"（无内容后缀）→ 不可粘
     (!key.is_empty() && !key.ends_with(':')).then_some(key)
@@ -915,6 +938,13 @@ fn smart_pool_order(
                 .and_then(Value::as_str)
                 .and_then(qoder_upstream::credits_rate_of)
         });
+    // custom 组倍率键（v3 四池参与）：组内最小 rate 正常参与（rate=0 免费上游
+    // 可在 Smart 下自然胜出）；到期/积分两键无数据按后置处理，不阻塞排序
+    let custom_rate = sources
+        .custom
+        .iter()
+        .map(|m| m.rate)
+        .fold(None::<f64>, |acc, r| Some(acc.map_or(r, |a| a.min(r))));
     let key_of = |p: TargetPool| -> SmartKey {
         let ((earliest, total), rate) = match p {
             TargetPool::Trae => (trae_stats, trae_rate),
@@ -923,7 +953,9 @@ fn smart_pool_order(
             // 未收录 Intl 目录回退 CN 目录值；R-9 同账号体系定价同构），积分快照取国际池
             TargetPool::BuddyAi => (buddy_ai_stats, buddy_ai_rate),
             TargetPool::Qoder => (qoder_stats, qoder_rate),
-            TargetPool::Custom => ((None, 0.0), None),
+            // custom：到期 = i64::MAX 后置、倍率 = 组内最小 rate 正常参与、
+            // 积分和 = f64::MIN（-total = f64::MAX，第三键后置）
+            TargetPool::Custom => ((None, f64::MIN), custom_rate),
         };
         (
             earliest.unwrap_or(i64::MAX),
@@ -1015,8 +1047,19 @@ fn pool_health(
             }
             Ok(())
         }
-        // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
-        TargetPool::Custom => Ok(()),
+        // v3：custom 上游组健康判定——任一上游未熔断即可候选（组内选路跳过
+        // 熔断条目；全熔断 → NoHealthyAccount 走现有 fallback 按序回退下一池）
+        TargetPool::Custom => {
+            if sources
+                .custom
+                .iter()
+                .any(|cm| !super::custom_lb::circuit_open(&cm.id))
+            {
+                Ok(())
+            } else {
+                Err(FallbackReason::NoHealthyAccount)
+            }
+        }
     }
 }
 
@@ -1095,8 +1138,7 @@ fn take_sticky(state: &Arc<ApiSharedState>, key: &str) -> Option<TargetPool> {
 }
 
 /// 池粘性 TTL 按胜出池取值（per-pool 三参数，F-76② 拆分版）：
-/// Custom 为自定义模型直达变体（parse("custom") 返回 None，实际不会被记录），
-/// 兜底取 Trae 值
+/// Custom（v3：custom 胜出后正常 record_sticky）无独立 TTL 配置，兜底取 Trae 值
 ///
 /// 命名区分（勿混淆，issue 复核）：`*_pool_sticky_ttl_secs` = 池粘性 TTL
 /// （本函数唯一消费方，内存态 state.pool_sticky，重启即清）；`*_sticky_ttl_secs`
@@ -1230,6 +1272,8 @@ mod tests {
             buddy_ai_enabled: AtomicBool::new(false),
             buddy_ai_sticky_enabled: AtomicBool::new(false),
             buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            custom_upstream_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
+            custom_lb_counters: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Fixture { dir, state }
     }
@@ -1339,8 +1383,9 @@ mod tests {
 
     // ---------- issue #90 修复③a：池前缀模型 id ----------
 
-    /// split_pool_prefix：合法前缀解析（trim/大小写宽容）；custom、未知池名、
-    /// 空裸名、无前缀 → None（原样透传，不误吞斜杠模型名）
+    /// split_pool_prefix：合法前缀解析（trim/大小写宽容）；未知池名、
+    /// 空裸名、无前缀 → None（原样透传，不误吞斜杠模型名）。
+    /// v3：custom 转正为合法前缀（锁池 Custom）
     #[test]
     fn t90_split_pool_prefix_parse() {
         assert_eq!(
@@ -1355,7 +1400,8 @@ mod tests {
             split_pool_prefix(" buddy/ hy4 "),
             Some((TargetPool::Buddy, "hy4"))
         );
-        assert_eq!(split_pool_prefix("custom/m1"), None);
+        // v3 决策 B：custom/ 前缀锁池转正
+        assert_eq!(split_pool_prefix("custom/m1"), Some((TargetPool::Custom, "m1")));
         assert_eq!(split_pool_prefix("openai/gpt-4o"), None);
         assert_eq!(split_pool_prefix("trae/"), None);
         assert_eq!(split_pool_prefix("glm-5.3"), None);
@@ -1388,12 +1434,16 @@ mod tests {
         );
     }
 
-    /// 前缀锁池优先于 custom 短路：自定义模型与裸名同名（glm-5.3）时，
-    /// `trae/glm-5.3` 不得被 ⓪ 段 custom 直达劫持到 Custom 池
-    /// （issue #90 修复③a 审查修正回归）
+    /// v3：同名 custom + trae/buddy 多源全部健康 → 按统一调度规则落 Buddy
+    /// （custom 尾部兜底位，不再 ⓪ 短路恒赢；替代原「custom 恒赢」断言）；
+    /// `custom/xxx` 前缀锁池直达；`trae/xxx` 前缀不被 custom 劫持。
+    /// 用 Priority 策略隔离 Smart 干扰（custom rate=0 免费在 Smart 下按设计可胜出，
+    /// 该行为由 Smart 排序键语义保证，不属本用例断言范围）
     #[test]
     fn t90_prefix_lock_not_hijacked_by_same_name_custom() {
-        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
         f.seed_healthy(true);
         f.seed_healthy(false);
         let cm: super::super::custom_models::CustomModel = serde_json::from_value(json!({
@@ -1403,12 +1453,176 @@ mod tests {
         }))
         .unwrap();
         super::super::custom_models::upsert(&f.dir, cm).unwrap();
-        // 裸名仍走 custom 直达（原语义不变）
-        assert_eq!(f.resolve_no_session("glm-5.3").unwrap().pool, TargetPool::Custom);
+        // v3：裸名按统一调度规则 → Buddy（默认候选序 custom 尾部兜底）
+        assert_eq!(f.resolve_no_session("glm-5.3").unwrap().pool, TargetPool::Buddy);
+        // custom/ 前缀锁池直达（v3 决策 B 转正）
+        let r = f.resolve_no_session("custom/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom);
+        assert_eq!(r.model, "glm-5.3");
         // 前缀锁池不被劫持：显式点名 Trae 池服务
         let r = f.resolve_no_session("trae/glm-5.3").unwrap();
         assert_eq!(r.pool, TargetPool::Trae);
         assert_eq!(r.model, "glm-5.3");
+    }
+
+    /// v3 P4：纯 custom 模型（无同名 trae/buddy/qoder 源）= 唯一源直达 Custom
+    /// （主场景回归——自建中转等用法零行为变化）
+    #[test]
+    fn t91_custom_only_model_direct() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "my-relay-model",
+                "base_url": "https://relay.example.invalid",
+                "enabled": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let r = f.resolve_no_session("my-relay-model").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom);
+        assert_eq!(r.model, "my-relay-model");
+    }
+
+    /// v3 P4：custom 组全熔断 + 多源 → 按候选序回退下一池（fallback_from=Custom）
+    #[test]
+    fn t91_custom_all_circuit_falls_back() {
+        let mut p = policy_default();
+        p.per_model.insert("glm-5.3".into(), vec!["custom".into(), "trae".into()]);
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        let cm: super::super::custom_models::CustomModel = serde_json::from_value(json!({
+            "name": "glm-5.3",
+            "base_url": "https://custom.example.invalid",
+            "enabled": true
+        }))
+        .unwrap();
+        let list = super::super::custom_models::upsert(&f.dir, cm).unwrap();
+        // 单条上游全熔断（组内任一未熔断即可用 → 记账唯一一条即整体不健康）
+        super::super::custom_lb::note_circuit_failure(&list[0].id, super::super::custom_lb::FailKind::Server);
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.fallback_from, Some(TargetPool::Custom));
+        assert!(f
+            .app_log_contains("dispatch fallback: model=glm-5.3 pool=trae preferred=custom reason=no_healthy_account"));
+        super::super::custom_lb::clear_circuit(&list[0].id);
+    }
+
+    /// v3 P4：custom/xxx 前缀锁池 + 组全熔断 → NoHealthy(Custom) 显式报错
+    /// 不跨池回退（单池候选语义）
+    #[test]
+    fn t91_custom_prefix_lock_errors_when_exhausted() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let cm: super::super::custom_models::CustomModel = serde_json::from_value(json!({
+            "name": "glm-5.3",
+            "base_url": "https://custom.example.invalid",
+            "enabled": true
+        }))
+        .unwrap();
+        let list = super::super::custom_models::upsert(&f.dir, cm).unwrap();
+        super::super::custom_lb::note_circuit_failure(&list[0].id, super::super::custom_lb::FailKind::Server);
+        assert_eq!(
+            f.resolve_no_session("custom/glm-5.3").unwrap_err(),
+            DispatchError::NoHealthy(TargetPool::Custom)
+        );
+        super::super::custom_lb::clear_circuit(&list[0].id);
+    }
+
+    /// v3 决策 C：Key 绑定 custom + 同名多源 → 落 custom（绑定优先）
+    #[test]
+    fn t91_bind_custom_prefers_custom() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "glm-5.3",
+                "base_url": "https://custom.example.invalid",
+                "enabled": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        f.seed_key("k-custom", "custom", &[]);
+        assert_eq!(f.resolve_key("glm-5.3", "k-custom").unwrap().pool, TargetPool::Custom);
+    }
+
+    /// v3 P4：per_model 数组写 "custom"（任意位置）→ 校验放行且生效
+    #[test]
+    fn t91_per_model_custom_position() {
+        let mut p = policy_default();
+        p.per_model.insert("glm-5.3".into(), vec!["custom".into(), "buddy".into()]);
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "glm-5.3",
+                "base_url": "https://custom.example.invalid",
+                "enabled": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(f.resolve_no_session("glm-5.3").unwrap().pool, TargetPool::Custom);
+        // load_policy 防御过滤后 custom 条目保留（不再被 parse=None 过滤丢弃）
+        let loaded = load_policy(&f.dir);
+        assert_eq!(
+            loaded.per_model.get("glm-5.3").map(|v| v.join(",")),
+            Some("custom,buddy".to_string())
+        );
+    }
+
+    /// v3 §7.4：Smart 重排四池——custom rate=0（免费）+ trae 同名（rate 未声明）
+    /// → Smart 按倍率键 custom 胜出（无 per_model/priority 显式覆盖时）
+    #[test]
+    fn t91_smart_free_custom_wins_over_trae() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "glm-5.3",
+                "base_url": "https://custom.example.invalid",
+                "enabled": true,
+                "rate": 0.0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // 默认 Smart 策略：可用源 = trae + custom ≥2 → 重排生效；
+        // custom rate=0（免费）< trae 未声明（f64::MAX 后置）→ custom 胜出
+        assert_eq!(f.resolve_no_session("glm-5.3").unwrap().pool, TargetPool::Custom);
+    }
+
+    /// v3 §7.4：同名双源 trae 不健康（池空 = 无健康账号）→ 序回退落 custom
+    /// （per_model ["trae","custom"] 显式序；fallback 管线复用）
+    #[test]
+    fn t91_trae_unhealthy_falls_back_custom() {
+        let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
+        p.per_model.insert("glm-5.3".into(), vec!["trae".into(), "custom".into()]);
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&p));
+        // 不 seed trae 池（空池 = 无健康账号）；custom 组健康
+        super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "glm-5.3",
+                "base_url": "https://custom.example.invalid",
+                "enabled": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom);
+        assert_eq!(r.fallback_from, Some(TargetPool::Trae));
     }
 
 

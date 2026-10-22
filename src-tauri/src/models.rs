@@ -410,6 +410,10 @@ pub struct Settings {
     /// 缺失/非法回退 APP_TABS 内置默认图标）
     #[serde(default)]
     pub app_icons: HashMap<String, String>,
+    /// 侧边栏应用显示顺序（AppKey 列表，按用户拖拽后的顺序存储；空/缺省 = 内置默认
+    /// 顺序；未提及的应用由前端按默认顺序补在末尾，新版本新增应用对老配置天然兼容）
+    #[serde(default)]
+    pub app_order: Vec<String>,
     /// BuddyAI（buddy-ai 国际版）应用 Tab 显示开关（默认 false = 不展示）：
     /// 独立于 hidden_apps——存量用户 hidden_apps 已持久化为 []，若借道隐藏列表
     /// 无法区分「默认隐藏」与「用户显式取消隐藏」，故用独立 opt-in 字段；

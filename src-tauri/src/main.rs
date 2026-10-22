@@ -279,6 +279,7 @@ fn main() {
             commands::api_server::custom_models_save,
             commands::api_server::custom_models_remove,
             commands::api_server::custom_model_test,
+            commands::api_server::custom_lb_status,
             commands::api_server::trae_model_meta_set,
             commands::api_server::trae_model_meta_get,
             commands::api_server::trae_model_meta_clear,

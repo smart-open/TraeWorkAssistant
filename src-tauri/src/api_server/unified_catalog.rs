@@ -291,6 +291,18 @@ pub struct UnifiedSource {
     pub enabled: bool,
 }
 
+/// 自定义模型上游组的目录聚合中间态（P1：同 canonical 多条合并为单行）——
+/// rate 取组内最小、vendor/img/ctx/mt 取首个 enabled 条目、enabled = 组内任一 enabled
+struct CustomGroupAgg {
+    name: String,
+    rate: Option<f64>,
+    enabled: bool,
+    vendor: String,
+    img: bool,
+    ctx: Option<u64>,
+    mt: Option<u64>,
+}
+
 /// 统一目录条目（api_unified_models 命令 / GET /v1/models 共用）
 #[derive(Debug, Clone, Serialize)]
 pub struct UnifiedModel {
@@ -633,41 +645,83 @@ pub fn unified_models_ex(
         }
     }
 
-    // 源3：自定义模型（custom_models.json，对外标识 custom）——命中即直达的
-    // 第三资源来源；同 canonical 与内置目录合并时仅追加来源标记（调度短路 custom）
+    // 源3：自定义模型（custom_models.json，对外标识 custom）——P1 同名多条 = 上游组：
+    // 同 canonical 多条必须聚合为单行单源标记（否则 /v1/models 出现重复模型名）。
+    // 倍率取组内最小（展示口径与 Smart 调度「倍率小者优先」一致）；vendor /
+    // supports_image / context / max_tokens 取首条 enabled 条目；组内任一条
+    // enabled 即整体可命中（find_enabled_all 已按 enabled 过滤，天然一致）
+    let mut custom_groups: Vec<(String, CustomGroupAgg)> = Vec::new();
+    let mut custom_idx: HashMap<String, usize> = HashMap::new();
     for m in super::custom_models::load(data_dir).iter() {
         let canonical = canonical_id(&m.name);
         if canonical.is_empty() {
             continue;
         }
-        if !m.vendor.is_empty() {
-            custom_vendor.insert(canonical.clone(), m.vendor.clone());
+        let cctx = if m.context_length > 0 { Some(m.context_length) } else { None };
+        let cmt = if m.max_tokens > 0 { Some(m.max_tokens) } else { None };
+        match custom_idx.get(&canonical) {
+            Some(&i) => {
+                let g = &mut custom_groups[i].1;
+                if m.enabled {
+                    if !g.enabled {
+                        // 首条为 disabled：整组展示值改由首个 enabled 条目接手
+                        // （rate 此前为 None 占位，直接赋值即脱离 disabled 污染）
+                        g.enabled = true;
+                        g.vendor = m.vendor.clone();
+                        g.img = m.supports_image;
+                        g.ctx = cctx;
+                        g.mt = cmt;
+                    }
+                    g.rate = Some(g.rate.map_or(m.rate, |r| r.min(m.rate)));
+                }
+            }
+            None => {
+                custom_idx.insert(canonical.clone(), custom_groups.len());
+                custom_groups.push((
+                    canonical,
+                    CustomGroupAgg {
+                        name: m.name.clone(),
+                        // 倍率只统计 enabled 条目（disabled 条目 0=免费 会污染组内
+                        // 最小倍率，展示「免费」而实际服务条目有价）——disabled
+                        // 首条以 None 占位，首个 enabled 条目接手时直接赋值
+                        rate: if m.enabled { Some(m.rate) } else { None },
+                        enabled: m.enabled,
+                        vendor: m.vendor.clone(),
+                        img: m.supports_image,
+                        ctx: cctx,
+                        mt: cmt,
+                    },
+                ));
+            }
+        }
+    }
+    for (canonical, g) in &custom_groups {
+        if !g.vendor.is_empty() {
+            custom_vendor.insert(canonical.clone(), g.vendor.clone());
         }
         // 展示倍率：0 = 免费（有效语义，透传聚合层）——命中 custom 即按免费展示；
         // 聚合尾部 rate=命中侧倍率，disabled 的 custom 源不会被命中，不影响 Trae/Buddy 侧
-        let crate_rate: Option<f64> = Some(m.rate);
-        let cctx = if m.context_length > 0 { Some(m.context_length) } else { None };
-        let cmt = if m.max_tokens > 0 { Some(m.max_tokens) } else { None };
-        match acc.get_mut(&canonical) {
+        let crate_rate: Option<f64> = g.rate;
+        match acc.get_mut(canonical) {
             Some(u) => {
                 u.sources.push(UnifiedSource {
                     pool: "custom",
                     rate: crate_rate,
-                    enabled: m.enabled,
+                    enabled: g.enabled,
                 });
-                if let Some(r) = crate_rate {
-                    u.rate = Some(r);
-                }
-                if let Some(c) = cctx {
-                    u.context_length = Some(c);
-                }
-                if let Some(t) = cmt {
-                    u.max_tokens = Some(t);
-                }
-                // 审查修复：disabled 自定义条目不参与顶层 supports_image 覆盖
-                // （停用模型的多模态声明不得改变聚合视图展示，仅 enabled 条目参与）
-                if m.enabled {
-                    u.supports_image = Some(m.supports_image);
+                if g.enabled {
+                    if let Some(r) = crate_rate {
+                        u.rate = Some(r);
+                    }
+                    if let Some(c) = g.ctx {
+                        u.context_length = Some(c);
+                    }
+                    if let Some(t) = g.mt {
+                        u.max_tokens = Some(t);
+                    }
+                    // 审查修复：disabled 自定义条目不参与顶层 supports_image 覆盖
+                    // （停用模型的多模态声明不得改变聚合视图展示，仅 enabled 条目参与）
+                    u.supports_image = Some(g.img);
                 }
             }
             None => {
@@ -675,20 +729,20 @@ pub fn unified_models_ex(
                 acc.insert(
                     canonical.clone(),
                     UnifiedModel {
-                        id: m.name.clone(),
-                        display: m.name.clone(),
-                        vendor: m.vendor.clone(),
+                        id: g.name.clone(),
+                        display: g.name.clone(),
+                        vendor: g.vendor.clone(),
                         region: None,
-                        rate: crate_rate,
+                        rate: if g.enabled { crate_rate } else { None },
                         efforts: Vec::new(),
                         max_mode: false,
-                        context_length: cctx,
-                        max_tokens: cmt,
-                        supports_image: Some(m.supports_image),
+                        context_length: g.ctx,
+                        max_tokens: g.mt,
+                        supports_image: g.enabled.then_some(g.img),
                         sources: vec![UnifiedSource {
                             pool: "custom",
                             rate: crate_rate,
-                            enabled: m.enabled,
+                            enabled: g.enabled,
                         }],
                         manual: false,
                     },
@@ -1403,6 +1457,48 @@ mod tests {
         let m = find(&list, "my-free-model");
         assert_eq!(m.rate, Some(0.0), "rate=0 必须透传为免费（Some(0.0)）");
         assert_eq!(m.sources[0].rate, Some(0.0));
+    }
+
+    /// P1 上游组目录聚合（方案 §4.4/§4.6）：同 canonical 两条 custom 条目
+    /// 聚合后目录单行单 custom 源；倍率取组内最小；组内一条 disabled 不影响
+    /// 整体可命中（enabled = 任一条 enabled）
+    #[test]
+    fn t13b_custom_group_aggregates_single_row_min_rate() {
+        let f = fixture(&[], &[], None);
+        let cm = |id: &str, url: &str, rate: f64, enabled: bool| {
+            crate::api_server::custom_models::CustomModel {
+                id: id.into(),
+                name: "My-Relay-Model".into(),
+                base_url: url.into(),
+                enabled,
+                rate,
+                ..Default::default()
+            }
+        };
+        crate::store::docs::custom_models_save(
+            &crate::store::db(&f.dir),
+            &crate::api_server::custom_models::CustomModelsFile {
+                models: vec![
+                    cm("cm-a", "https://a.example.com", 0.05, true),
+                    cm("cm-b", "https://b.example.com", 0.01, true),
+                    // 完全第三条：disabled —— find_enabled_all 已过滤，聚合不含其倍率
+                    // 完全第三条：disabled 且 rate=0（免费）——不得污染组内最小倍率
+                    cm("cm-c", "https://c.example.com", 0.0, false),
+                ],
+                updated_at: 0,
+            },
+        )
+        .unwrap();
+        super::super::config_cache::invalidate(&f.dir, "custom_models");
+        let list = unified_models(&f.dir, true, true, true);
+        let hits: Vec<_> = list.iter().filter(|m| m.id == "My-Relay-Model").collect();
+        assert_eq!(hits.len(), 1, "同 canonical 多条必须聚合为目录单行");
+        let m = hits[0];
+        let custom_sources: Vec<_> = m.sources.iter().filter(|s| s.pool == "custom").collect();
+        assert_eq!(custom_sources.len(), 1, "单 custom 源标记（非多条）");
+        assert_eq!(custom_sources[0].rate, Some(0.01), "倍率取组内 enabled 最小（disabled 免费(0) 条目不污染）");
+        assert!(custom_sources[0].enabled, "任一条 enabled 即整体可命中");
+        assert_eq!(m.rate, Some(0.01), "顶层展示倍率随聚合倍率");
     }
 
     // ==================== issue #26 全局模型白名单 ====================

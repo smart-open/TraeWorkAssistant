@@ -2,6 +2,7 @@ pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
 pub mod config_cache;
+pub mod custom_lb;
 pub mod custom_models;
 pub mod custom_route;
 pub mod dispatch;
@@ -181,6 +182,72 @@ pub struct ApiSharedState {
     /// 物理同源，改配置未重启时不再出现「配置值 vs 实际监听值」分离导致的
     /// fail-open 误判（配置改非环回但服务仍绑环回时按实际值豁免，反之按实际值走鉴权）
     pub listen_host: std::sync::Mutex<String>,
+    /// custom 上游组会话粘上游（P2）：session_key → (cm.id, 过期 Instant)，
+    /// TTL 60s，内存态不落盘（与池粘性同口径；custom_lb 模块消费）
+    pub custom_upstream_sticky:
+        Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    /// custom 上游组加权轮询计数（P2）：canonical 模型名 → 组内共享计数器——
+    /// 按模型分组各计各的，避免单全局计数器跨组交替破坏组内分布
+    pub custom_lb_counters: Mutex<std::collections::HashMap<String, std::sync::atomic::AtomicUsize>>,
+}
+
+/// 测试专用：全字段默认构造（custom_route 端到端轮换测试等无 fixture 的
+/// 测试模块复用；开关取生产默认值，池为空池）
+#[cfg(test)]
+pub(crate) fn test_shared_state(data_dir: std::path::PathBuf) -> ApiSharedState {
+    ApiSharedState {
+        pool: pool::ApiPool::new(),
+        wb_pool: pool::ApiPool::new(),
+        wb_enabled: std::sync::atomic::AtomicBool::new(true),
+        wb_sanitize: std::sync::atomic::AtomicBool::new(true),
+        wb_default_thinking: std::sync::atomic::AtomicBool::new(false),
+        wb_tool_exec: std::sync::atomic::AtomicBool::new(false),
+        wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
+        wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
+        wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        trae_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
+        wb_sticky: wb_sticky::StickyStore::default(),
+        buddy_ai_sticky: wb_sticky::StickyStore::default(),
+        pool_sticky: Mutex::new(std::collections::HashMap::new()),
+        model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        default_model: String::new(),
+        logger: ApiLogger::new(data_dir.join("logs")),
+        data_dir,
+        total_requests: AtomicU64::new(0),
+        inflight: Arc::new(AtomicU64::new(0)),
+        active_uid: Mutex::new(None),
+        last_error: Mutex::new(None),
+        debug_enabled: std::sync::atomic::AtomicBool::new(false),
+        usage: Mutex::new(usage::UsageFile::default()),
+        usage_dirty: Mutex::new(Vec::new()),
+        wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
+        buddy_ai_probe_ok: std::sync::atomic::AtomicI64::new(-1),
+        fallback_log_last_ms: Mutex::new(std::collections::HashMap::new()),
+        trae_jwt_refresh: None,
+        trae_enabled: std::sync::atomic::AtomicBool::new(true),
+        qoder_pool: pool::ApiPool::new(),
+        qoder_enabled: std::sync::atomic::AtomicBool::new(true),
+        qoder_identity: None,
+        qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        qoder_sticky: wb_sticky::StickyStore::default(),
+        trae_sticky: wb_sticky::StickyStore::default(),
+        buddy_ai_pool: pool::ApiPool::new(),
+        buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
+        listen_host: Mutex::new("127.0.0.1".to_string()),
+        custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+        custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
+    }
 }
 
 impl ApiSharedState {
@@ -877,6 +944,8 @@ mod inflight_tests {
             buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
+            custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+            custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
         };
         {
             let _g = state.inflight_guard();

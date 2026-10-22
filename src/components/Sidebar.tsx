@@ -20,7 +20,7 @@ import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
 import { nextTheme } from '../lib/themes';
 import { resolveAppIcon } from '../lib/appIcons';
-import { getPinnedApp, isAppVisible } from '../lib/appVisibility';
+import { getPinnedApp, isAppVisible, getOrderedApps } from '../lib/appVisibility';
 import type { AppKey, ViewKey } from '../types';
 import AboutDialog from './AboutDialog';
 import SystemDialog from './SystemDialog';
@@ -86,8 +86,8 @@ export const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disable
 /** 全部合法应用 key（settings 脏值兜底用） */
 export const APP_KEYS = APP_TABS.map((t) => t.key);
 
-/** 栅格列数必须使用字面量，Tailwind JIT 才能扫描生成 */
-const GRID_COLS = ['grid-cols-1', 'grid-cols-2', 'grid-cols-3', 'grid-cols-4', 'grid-cols-5'] as const;
+/** 栅格列数必须使用字面量，Tailwind JIT 才能扫描生成（应用 Tab 最多 4 列，>4 个折两行） */
+const GRID_COLS = ['grid-cols-1', 'grid-cols-2', 'grid-cols-3', 'grid-cols-4'] as const;
 
 export default function Sidebar({
   view,
@@ -104,11 +104,18 @@ export default function Sidebar({
   const [showAbout, setShowAbout] = useState(false);
   const [showSystem, setShowSystem] = useState(false);
 
-  // 侧边栏应用显示（系统设置「应用显示」维护）：固定应用始终可见，其余按隐藏列表过滤。
+  // 侧边栏应用显示（系统设置「应用显示」维护）：固定应用始终可见，其余按隐藏列表过滤；
+  // 展示顺序跟随系统设置「应用显示」拖拽排序（app_order），未提及应用按默认顺序补尾。
   // 口径统一由 lib/appVisibility 提供（pinned 非法/缺失回退 trae；buddy-ai 不参与固定、
   // 默认隐藏，仅 settings.buddy_ai_visible = true 时显示）
   const pinnedApp = getPinnedApp(settings);
-  const visibleTabs = APP_TABS.filter((t) => isAppVisible(settings, t.key));
+  const visibleTabs = getOrderedApps(settings).flatMap((key) => {
+    const tab = APP_TABS.find((t) => t.key === key);
+    return tab && isAppVisible(settings, key) ? [tab] : [];
+  });
+
+  // 应用 Tab 自适应列数：≤4 个单行铺满；>4 个固定 4 列自动折两行（按顺序排列：5→4+1 / 6→4+2 / 7→4+3 / 8→4+4）
+  const tabCols = Math.min(4, Math.max(1, visibleTabs.length));
 
   // 当前激活应用被隐藏（或固定项变更）时自动回落固定应用主页，避免停留在无 Tab 的应用
   useEffect(() => {
@@ -175,7 +182,7 @@ export default function Sidebar({
         <div
           className={cn(
             'grid gap-1 rounded-lg bg-slate-100 p-1 dark:bg-zinc-900',
-            GRID_COLS[visibleTabs.length - 1] ?? 'grid-cols-4',
+            GRID_COLS[tabCols - 1] ?? 'grid-cols-4',
           )}
         >
           {visibleTabs.map((tab) => {

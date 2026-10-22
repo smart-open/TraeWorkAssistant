@@ -371,6 +371,8 @@ async fn do_start_inner(
         buddy_ai_enabled: std::sync::atomic::AtomicBool::new(pool_file.buddy_ai_enabled),
         listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
+        custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
+        custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
@@ -2124,6 +2126,24 @@ pub async fn custom_model_test(
         Ok(Err(e)) => Err(format!("测试任务失败: {e}")),
         Err(_) => Err("测试超时（30 秒）".into()),
     }
+}
+
+/// 自定义上游熔断状态快照（P3 可观测）：每条仍在冷却中的上游
+/// (cm.id, 连续失败片段数, 剩余冷却秒)。UI 徽标消费，与 custom_models_list
+/// 按 id 关联展示「熔断中」态；重启清零（内存态）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CustomUpstreamCircuitStatus {
+    pub id: String,
+    pub fails: u32,
+    pub cooling_secs: u64,
+}
+
+#[tauri::command]
+pub fn custom_lb_status() -> Vec<CustomUpstreamCircuitStatus> {
+    crate::api_server::custom_lb::circuit_snapshot()
+        .into_iter()
+        .map(|(id, fails, cooling_secs)| CustomUpstreamCircuitStatus { id, fails, cooling_secs })
+        .collect()
 }
 
 /// Trae 模型元数据人工覆盖（L1 覆盖层，键 canonical_id；编辑后聚合视图即时生效）

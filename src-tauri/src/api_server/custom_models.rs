@@ -1,12 +1,13 @@
-//! 自定义模型资源池（OpenAI 兼容上游直通）
+//! 自定义模型资源池（OpenAI 兼容上游组）
 //!
 //! `data/custom_models.json`：用户以列表方式维护的自定义模型——
 //! 名称（请求模型名，路由键）、OpenAI 兼容 API 地址、API Key 及模型其他字段
-//! （上下文长度 / 最大输出 / 图片支持 / 倍率 / 备注 / 启用开关）。
+//! （上下文长度 / 最大输出 / 图片支持 / 倍率 / 负载权重 / 备胎 / 备注 / 启用开关）。
 //!
-//! 调度语义（dispatch.rs ⓪ 段）：请求模型名 canonical 命中 enabled 条目 →
-//! 直达自定义上游（用户显式配置优先于内置目录），单源无跨池回退；
-//! 未命中或 enabled=false → 回落 Trae/Buddy 统一调度管线。
+//! 调度语义（v3，dispatch.rs）：同名多条 = 上游组（custom_lb 组内加权轮询 +
+//! 主备 failover + 熔断切换）；作为第五资源池参与统一调度（默认候选序尾部兜底），
+//! `custom/模型名` 前缀锁池直达、Key 绑定 "custom" 与 per_model 写 "custom" 生效；
+//! 纯 custom 模型（无同名内置源）为唯一源直达。
 //!
 //! 协议约定：上游为 OpenAI 兼容 chat completions（`{base}/v1/chat/completions`，
 //! base 以 `/v1` 结尾时直接拼 `/chat/completions`），Bearer 鉴权。
@@ -51,6 +52,13 @@ pub struct CustomModel {
     pub note: String,
     #[serde(default)]
     pub updated_at: i64,
+    /// 负载权重（默认 1；0 视为 1）——上游组内加权轮询用（P2 生效）
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    /// 备胎标记（默认 false）：false = 活跃条目（正常参与加权轮询）；
+    /// true = 备胎（活跃条目全部失败/熔断时才启用）——failover 主备语义
+    #[serde(default)]
+    pub standby: bool,
 }
 
 impl Default for CustomModel {
@@ -69,12 +77,18 @@ impl Default for CustomModel {
             rate: 0.0,
             note: String::new(),
             updated_at: 0,
+            weight: 1,
+            standby: false,
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_weight() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -114,11 +128,15 @@ pub fn save_list(data_dir: &Path, models: Vec<CustomModel>) -> Result<(), String
 }
 
 /// upsert 单条：id 为空或不存在则新增（生成 cm-<12hex> id），存在则整条覆盖。
-/// 返回保存后的完整列表。校验：name / base_url 必填；name canonical 不得与其他条目重复。
+/// 返回保存后的完整列表。校验：name / base_url 必填；仅拒绝「同名 + 同 base_url +
+/// 同 api_key」完全重复——同名不同上游 = 合法上游组成员（P1：同名多条 = 上游组）。
 pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, String> {
     m.name = m.name.trim().to_string();
     m.base_url = m.base_url.trim().trim_end_matches('/').to_string();
     m.vendor = m.vendor.trim().to_string();
+    if m.weight == 0 {
+        m.weight = 1; // 0 视为 1，防除零与无效权重
+    }
     if m.name.is_empty() {
         return Err("模型名称不能为空".into());
     }
@@ -129,12 +147,15 @@ pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, S
     }
     let mut list = load(data_dir);
     let canonical = canonical_id(&m.name);
-    // 名称唯一性：canonical 冲突即拒绝（同一路由键两个上游无确定性语义）
-    if let Some(dup) = list
-        .iter()
-        .find(|e| canonical_id(&e.name) == canonical && e.id != m.id)
-    {
-        return Err(format!("模型名称与既有条目重复：{}", dup.name));
+    // 完全重复校验（P1 放宽）：同名（canonical 相同）+ 同 base_url + 同 api_key
+    // = 无意义冗余，拒绝；同名不同上游（base_url 或 api_key 不同）= 上游组成员，放行
+    if let Some(dup) = list.iter().find(|e| {
+        e.id != m.id
+            && canonical_id(&e.name) == canonical
+            && e.base_url == m.base_url
+            && e.api_key == m.api_key
+    }) {
+        return Err(format!("相同模型与上游地址/Key 的条目已存在：{}", dup.name));
     }
     match list.iter_mut().find(|e| e.id == m.id && !m.id.is_empty()) {
         Some(slot) => {
@@ -168,16 +189,22 @@ pub fn remove(data_dir: &Path, id: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
-/// 请求模型名命中 enabled 自定义模型（canonical 匹配；调度热路径入口）。
-/// 同 canonical 多条（异常态）取首条。
-pub fn find_enabled(data_dir: &Path, model: &str) -> Option<CustomModel> {
+/// 请求模型名命中全部 enabled 自定义模型（canonical 匹配；上游组语义入口）。
+/// 同 canonical 多条 = 上游组（P1），组内负载均衡轮询（P2）。
+pub fn find_enabled_all(data_dir: &Path, model: &str) -> Vec<CustomModel> {
     let canonical = canonical_id(model);
     if canonical.is_empty() {
-        return None;
+        return Vec::new();
     }
     load(data_dir)
         .into_iter()
-        .find(|m| m.enabled && canonical_id(&m.name) == canonical)
+        .filter(|m| m.enabled && canonical_id(&m.name) == canonical)
+        .collect()
+}
+
+/// 单条语义兼容包装（白名单预检 / catalog 等调用方零改动）：返回首条 enabled 条目。
+pub fn find_enabled(data_dir: &Path, model: &str) -> Option<CustomModel> {
+    find_enabled_all(data_dir, model).into_iter().next()
 }
 
 /// OpenAI 兼容 chat completions URL：
@@ -243,15 +270,34 @@ mod tests {
         assert!(find_enabled(&f.0, "my-model").is_some());
         assert!(find_enabled(&f.0, "MY-MODEL").is_some());
         assert!(find_enabled(&f.0, "other").is_none());
-        // 名称 canonical 冲突拒绝（trim+lowercase 同键）
-        assert!(upsert(&f.0, CustomModel { name: "MY-Model".into(), base_url: "https://x.com".into(), ..Default::default() })
+        // 名称 canonical 冲突拒绝（trim+lowercase 同键）——同名同上游完全重复
+        assert!(upsert(&f.0, CustomModel { name: "MY-Model".into(), base_url: "https://api.example.com".into(), api_key: "sk-test".into(), ..Default::default() })
             .is_err());
+        // 同名不同上游（不同 base_url）= 上游组成员，放行（P1）
+        let list2 = upsert(&f.0, CustomModel { name: "MY-Model".into(), base_url: "https://x.com".into(), ..Default::default() })
+            .unwrap();
+        assert_eq!(list2.len(), 2, "同名不同 base_url 构成上游组");
         // 编辑（同 id 覆盖）
         let mut edited = list[0].clone();
         edited.enabled = false;
         let list = upsert(&f.0, edited).unwrap();
         assert!(!list[0].enabled);
-        assert!(find_enabled(&f.0, "my-model").is_none(), "disabled 不命中");
+        // 组内首条禁用后，find_enabled 回退第二条；两条全禁用才不命中（P1 组语义）
+        let second = list
+            .iter()
+            .find(|e| e.base_url == "https://x.com")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            find_enabled(&f.0, "my-model").unwrap().id,
+            second.id,
+            "组内禁用一条回退另一条"
+        );
+        let mut edited2 = second.clone();
+        edited2.enabled = false;
+        let _ = upsert(&f.0, edited2).unwrap();
+        assert!(find_enabled(&f.0, "my-model").is_none(), "组内全禁用不命中");
+        assert!(find_enabled_all(&f.0, "my-model").is_empty());
     }
 
     /// remove / save_load 往返
@@ -282,5 +328,51 @@ mod tests {
         let f = Fixture::new();
         assert!(upsert(&f.0, CustomModel { name: "".to_string(), base_url: "https://a.com".into(), ..Default::default() }).is_err());
         assert!(upsert(&f.0, CustomModel { name: "x".into(), base_url: "ftp://a.com".into(), ..Default::default() }).is_err());
+    }
+
+    /// P1：同名不同 base_url 多条 upsert 成功（上游组）；find_enabled_all 全量返回；
+    /// find_enabled 兼容包装仍返回首条
+    #[test]
+    fn t05_same_name_multi_upstream() {
+        let f = Fixture::new();
+        let _ = upsert(&f.0, CustomModel { name: "glm-5.3".into(), base_url: "https://a.com".into(), api_key: "k1".into(), ..Default::default() }).unwrap();
+        let _ = upsert(&f.0, CustomModel { name: "GLM-5.3".into(), base_url: "https://b.com".into(), api_key: "k2".into(), ..Default::default() }).unwrap();
+        let _ = upsert(&f.0, CustomModel { name: "glm-5.3".into(), base_url: "https://a.com".into(), api_key: "k3".into(), ..Default::default() }).unwrap();
+        let group = find_enabled_all(&f.0, "glm-5.3");
+        assert_eq!(group.len(), 3, "同名不同上游构成 3 条上游组");
+        assert_eq!(find_enabled(&f.0, "GLM-5.3").unwrap().base_url, "https://a.com", "兼容包装返回首条");
+        // 同上游不同 api_key（同上游多 Key 分摊）也是合法组成员
+        assert_eq!(group.iter().filter(|m| m.base_url == "https://a.com").count(), 2);
+    }
+
+    /// P1：完全重复（同名 + 同 base_url + 同 api_key）拒绝；同名不同 api_key 放行
+    #[test]
+    fn t06_exact_duplicate_rejected() {
+        let f = Fixture::new();
+        let _ = upsert(&f.0, CustomModel { name: "m".into(), base_url: "https://a.com".into(), api_key: "k1".into(), ..Default::default() }).unwrap();
+        // 完全重复（新条目 id 为空 != 既有 id，命中查重）
+        assert!(upsert(&f.0, CustomModel { name: "M".into(), base_url: "https://a.com".into(), api_key: "k1".into(), ..Default::default() }).is_err());
+        // 同 base_url 不同 api_key 放行
+        assert!(upsert(&f.0, CustomModel { name: "m".into(), base_url: "https://a.com".into(), api_key: "k2".into(), ..Default::default() }).is_ok());
+        // 同 api_key 不同 base_url 放行
+        assert!(upsert(&f.0, CustomModel { name: "m".into(), base_url: "https://b.com".into(), api_key: "k1".into(), ..Default::default() }).is_ok());
+        // 编辑自身（同 id）不命中查重
+        let list = load(&f.0);
+        let mut edited = list[0].clone();
+        edited.note = "updated".into();
+        assert!(upsert(&f.0, edited).is_ok());
+    }
+
+    /// P1：旧 JSON（无 weight/standby 字段）反序列化 weight=1、standby=false（零迁移）
+    #[test]
+    fn t07_weight_default() {
+        let legacy = r#"{"id":"cm-aaaabbbbcccc","name":"old","base_url":"https://o.com","api_key":"k","enabled":true}"#;
+        let m: CustomModel = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.weight, 1);
+        assert!(!m.standby);
+        // weight=0 视为 1（upsert 归一）
+        let f = Fixture::new();
+        let list = upsert(&f.0, CustomModel { name: "w".into(), base_url: "https://w.com".into(), weight: 0, ..Default::default() }).unwrap();
+        assert_eq!(list[0].weight, 1);
     }
 }
