@@ -152,8 +152,9 @@ fn parse_data(data: &str) -> Option<WbEvent> {
         Ok(v) => v,
         Err(_) => return None,
     };
-    // 错误帧：{"error": {...}}（与 OpenAI 一致；兼容顶层 code/message）
-    if let Some(err) = v.get("error") {
+    // 错误帧：{"error": {...}}（与 OpenAI 一致；兼容顶层 code/message）。
+    // filter null：{"error": null} 非错误帧（部分网关心跳形态），不得产生伪错误
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         let msg = err
             .get("message")
             .or_else(|| err.get("msg"))
@@ -171,6 +172,26 @@ fn parse_data(data: &str) -> Option<WbEvent> {
             })
             .unwrap_or(0);
         return Some(WbEvent::Error { code, msg });
+    }
+    // 顶层错误形态（issue #123）：渠道风控直发 {"code":11128,"msg":"request
+    // illegal",...}（无 error 包裹、无 choices）——此前落入 Chunk 分支产出
+    // 空 delta → 空完成黑洞，11128 身份彻底丢失。识别为流内错误交由调用方
+    // 处置（口径与 error 包裹帧一致）。map_or true："choices": null 同样
+    // 视为无 choices（Some(Value::Null) 会绕过 is_none 漏检）
+    if v.get("choices").map_or(true, |c| c.is_null()) {
+        let code = v
+            .get("code")
+            .and_then(|c| c.as_i64().or_else(|| c.as_str().and_then(|s| s.parse::<i64>().ok())))
+            .unwrap_or(0);
+        if code >= 400 {
+            let msg = v
+                .get("msg")
+                .or_else(|| v.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("upstream error")
+                .to_string();
+            return Some(WbEvent::Error { code, msg });
+        }
     }
     let choice = v
         .get("choices")
@@ -1451,6 +1472,25 @@ mod tests {
             }
             _ => panic!("expect error"),
         }
+    }
+
+    /// 边缘加固：error 包裹块 null 值不产生伪错误；"choices": null 仍走顶层
+    /// 错误判定（Some(Value::Null) 会绕过 is_none 漏检）
+    #[test]
+    fn parse_data_null_edge_cases() {
+        // {"error": null}：非错误帧（部分网关心跳形态），不得产生伪 Error
+        let ev = parse_data(r#"{"error":null}"#);
+        assert!(!matches!(ev, Some(WbEvent::Error { .. })), "error:null 不得误报错误");
+        // {"choices": null, "code": 11128}：顶层错误帧必须被识别
+        match parse_data(r#"{"choices":null,"code":11128,"msg":"request illegal"}"#) {
+            Some(WbEvent::Error { code, msg }) => {
+                assert_eq!(code, 11128);
+                assert_eq!(msg, "request illegal");
+            }
+            other => panic!("choices:null 顶层错误帧应被识别，实际 {:?}", other),
+        }
+        // {"choices": null} 无 code：不误报错误（落空 Chunk）
+        assert!(!matches!(parse_data(r#"{"choices":null}"#), Some(WbEvent::Error { .. })));
     }
 
     #[test]

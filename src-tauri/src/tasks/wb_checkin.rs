@@ -174,7 +174,9 @@ fn deep_reward_dig(v: &Value, depth: usize) -> Option<f64> {
     }
 }
 
-/// 递归找余额数值字段：键名含 remaining/balance/capacity（大小写不敏感，排除 total）。
+/// 递归找余额数值字段：键名含 remain/balance（大小写不敏感，排除 total；不含
+/// 裸 capacity——CapacitySize/UsedCapacity 是总量/已用键，当余额即翻倍类错误，
+/// 对齐 wb_credits M3「总量不当余额」原则）。
 /// 用于 billing summary 结构未知时的余额差值兜底（pre/post 同结构，首命中稳定）。
 fn deep_balance_dig(v: &Value, depth: usize) -> Option<f64> {
     if depth > 8 {
@@ -184,9 +186,7 @@ fn deep_balance_dig(v: &Value, depth: usize) -> Option<f64> {
         Value::Object(m) => {
             for (k, val) in m {
                 let kl = k.to_ascii_lowercase();
-                if (kl.contains("remaining") || kl.contains("balance") || kl.contains("capacity"))
-                    && !kl.contains("total")
-                {
+                if (kl.contains("remain") || kl.contains("balance")) && !kl.contains("total") {
                     if let Some(n) = num_or_none(Some(val)) {
                         return Some(n);
                     }

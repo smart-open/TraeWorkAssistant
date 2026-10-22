@@ -955,22 +955,34 @@ fn query_ent_packs(jwt: &str, dev: &DeviceEntry) -> Result<Vec<serde_json::Value
 }
 
 /// TRAE 切换/一键打开前预检：账号池中该 uid 的 JWT 在服务端是否仍有效。
+/// JWT 服务端探活三态结论（审查修复：二值 Result 无法区分「判活」与「网络故障
+/// fail-open」，而两者对调用方语义不同——切换预检两者都放行；续期预检仅「判活」
+/// 才应中止，网络故障放行切换至多白切一场，误报「JWT 仍有效」才是错误指引）。
+pub(crate) enum JwtAliveVerdict {
+    /// 服务端确认 JWT 鉴权通过
+    Alive,
+    /// 服务端确认 JWT 已吊销/失效（附判死说明）
+    Dead(String),
+    /// 无法判定（网络故障/账号不在池/无 JWT）——调用方按各自 fail-open 口径处理
+    Indeterminate,
+}
+
 /// 背景（issue #9，2026-09-11 诊断）：TRAE 服务端会吊销 JWT（该账号在别处重新登录被顶替、
 /// IDE 内退出登录、风控等），本地快照文件完好但服务端已判死——切换恢复后 IDE 一联网即被
 /// 强制登出，表现为「切换成功但账号没变/未登录」。调签到 status 轻量只读接口探活：
 /// HTTP 401 判死 → 中止切换并给补救指引；无 JWT/网络故障/其他错误一律 fail-open 不阻断
 /// （与豆包 probe_slot_session_alive 策略对齐）。
-pub(crate) fn probe_trae_jwt_alive(state: &AppState, user_id: &str) -> Result<(), String> {
+pub(crate) fn probe_trae_jwt_alive_detail(state: &AppState, user_id: &str) -> JwtAliveVerdict {
     let accounts = crate::vault::load_accounts(state);
     let Some(account) = accounts
         .accounts
         .iter()
         .find(|a| a.user_id.as_deref() == Some(user_id))
     else {
-        return Ok(()); // 账号池无此账号（纯快照场景）→ 不预检，交给快照管线
+        return JwtAliveVerdict::Indeterminate; // 账号池无此账号（纯快照场景）→ 不预检，交给快照管线
     };
     if account.jwt.trim().is_empty() {
-        return Ok(()); // 无 JWT 无法探活 → fail-open
+        return JwtAliveVerdict::Indeterminate; // 无 JWT 无法探活 → fail-open
     }
     // 预检专用短超时（15s）：网络故障时 fail-open 快速放行，不让用户点切换后白等
     let agent = ureq::AgentBuilder::new()
@@ -978,9 +990,9 @@ pub(crate) fn probe_trae_jwt_alive(state: &AppState, user_id: &str) -> Result<()
         .build();
     let dev = resolve_device(state, user_id);
     // 判死文案：name(user_id) 双标识——toast 面向用户用账号名可读，日志保留 uid 便于排查。
-    // 注意：Err 仅在「判死」时产生（网络故障已在下方 fail-open 为 Ok），调用方据此放行切换
-    // 并把本条作为警示写入进度流——切回该账号重新登录正是恢复手段，硬拒绝会形成死结
-    //（签到 401 → SessionDead 的账号预检必判死 → 用户永远无法通过「切换」找回该账号）。
+    // 注意：Dead 仅在「判死」时产生（网络故障/无 JWT/不在池均为 Indeterminate），调用方据此
+    // 放行切换并把本条作为警示写入进度流——切回该账号重新登录正是恢复手段，硬拒绝会形成
+    // 死结（签到 401 → SessionDead 的账号预检必判死 → 用户永远无法通过「切换」找回该账号）。
     let dead_msg = format!(
         "账号 {}({}) 的登录已失效（JWT 被服务端吊销，常见原因：该账号在别处重新登录、在 IDE 内退出登录或触发风控）。\
          将照常切换到该账号：请在 TRAE 启动后重新登录 → 点击「保存当前登录态」保留新登录，\
@@ -1000,13 +1012,23 @@ pub(crate) fn probe_trae_jwt_alive(state: &AppState, user_id: &str) -> Result<()
             // 不用 dig 深挖以免误伤嵌套业务对象里的 code）。其余业务码（如 1005 套餐限额）
             // 说明 JWT 鉴权仍通过 → 放行
             if body.get("code").and_then(|v| v.as_i64()) == Some(1001) {
-                Err(dead_msg)
+                JwtAliveVerdict::Dead(dead_msg)
             } else {
-                Ok(())
+                JwtAliveVerdict::Alive
             }
         }
-        Err(e) if e.contains("status code 401") => Err(dead_msg),
-        Err(_) => Ok(()), // 网络故障/其他错误 fail-open，不阻断切换
+        Err(e) if e.contains("status code 401") => JwtAliveVerdict::Dead(dead_msg),
+        Err(_) => JwtAliveVerdict::Indeterminate, // 网络故障/其他错误无法判定，不阻断切换
+    }
+}
+
+/// 二值口径薄包装（switch.rs 切换预检专用契约，审查修复：保留原语义——Err 仅在
+/// 「判死」时产生，网络故障/无 JWT/不在池一律 fail-open 为 Ok；续期预检请改用
+/// probe_trae_jwt_alive_detail 三态版区分「判活」与「网络故障」，见 renew_jwt_preflight）
+pub(crate) fn probe_trae_jwt_alive(state: &AppState, user_id: &str) -> Result<(), String> {
+    match probe_trae_jwt_alive_detail(state, user_id) {
+        JwtAliveVerdict::Dead(msg) => Err(msg),
+        JwtAliveVerdict::Alive | JwtAliveVerdict::Indeterminate => Ok(()),
     }
 }
 
@@ -1743,6 +1765,62 @@ pub fn refresh_jwt(
         }
     }
     result
+}
+
+/// issue #126 续期前置判活：钥匙按钮（renewJwt = 启动代理 + 切换账号被动捕获）
+/// 只在该账号 JWT 已失效、TRAE IDE 重新鉴权时才能捕获到新凭证——JWT 服务端仍存活时
+/// IDE 静默复用旧 token，切换跑完什么也抓不到（用户感知为「续期没有效果」）。
+/// 发起切换前探活：存活 → Err(带出路指引，前端直接提示并中止，省一轮 30-90s 白切换)；
+/// 判死 / 本地已过期 / 账号不在池（纯快照场景）/ 网络故障（fail-open）→ Ok(照常切换捕获)。
+#[tauri::command(async)]
+pub fn renew_jwt_preflight(state: State<AppState>, user_id: String) -> Result<(), String> {
+    let accounts = crate::vault::load_accounts(&state);
+    let Some(acct) = accounts
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id.as_str()))
+    else {
+        return Ok(()); // 账号池无此账号（纯快照场景）→ 不预检，交给快照管线
+    };
+    let remain_h = jwt::parse(&acct.jwt)
+        .exp_timestamp
+        .map(|exp| (exp - chrono::Utc::now().timestamp()) as f64 / 3600.0);
+    // 本地已过期 / exp 缺失无法解析：不用探测，判死放行（切换+捕获正是恢复手段）
+    if remain_h.map(|h| h <= 0.0).unwrap_or(true) {
+        return Ok(());
+    }
+    // 三态探活（审查修复）：仅「服务端确认判活」才中止——网络故障 Indeterminate 放行
+    // （至多白切一场），不得误报「JWT 仍有效」误导用户；判死 Dead 放行（切换+捕获正是恢复手段）
+    if matches!(
+        probe_trae_jwt_alive_detail(&state, &user_id),
+        JwtAliveVerdict::Alive
+    ) {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "续期预检中止 [{}]({}): JWT 服务端仍有效（剩余 {:.1}h），重新捕获不会产生新凭证",
+                acct.name,
+                user_id,
+                remain_h.unwrap_or(0.0)
+            ),
+        );
+        let has_rt = acct
+            .refresh_token
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let tail = if has_rt {
+            "本账号有 refresh_token：请使用「刷新 JWT」按钮直接换发新凭证（约 13 天全新有效期）"
+        } else {
+            "本账号无 refresh_token：请保持代理开启与 TRAE 运行，JWT 过期后 TRAE 会自动重新登录并自动捕获新凭证；或对该账号重新 OAuth 登录"
+        };
+        return Err(format!(
+            "JWT 仍有效（剩余 {:.1} 小时），TRAE 不会重新鉴权，切换+捕获不会产生新 JWT。{}",
+            remain_h.unwrap_or(0.0),
+            tail
+        ));
+    }
+    Ok(())
 }
 
 /// refresh 失败短冷却（D，60s）：同账号刷新失败后 60s 内直接拒绝重试，

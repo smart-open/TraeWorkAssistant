@@ -58,24 +58,25 @@ fn gen_uuid_like() -> String {
     )
 }
 
-/// 文本指纹清洗（issue #57）：strip_cc + 模板映射（与 WB 管线同一套规则表）
-fn sanitize_text(s: &str, templates: &[(String, String)]) -> String {
+/// 文本指纹清洗（issue #57）：strip_cc + 模板映射（与 WB 管线同一套规则表）；
+/// seed 透传多候选改写选择（issue #122 方案 C1）
+fn sanitize_text(s: &str, templates: &[(String, String)], seed: u64) -> String {
     let washed = super::wb_payload::strip_cc_fingerprints(s);
-    super::wb_payload::apply_template_map(&washed, templates)
+    super::wb_payload::apply_template_map_seeded(&washed, templates, seed)
 }
 
 /// content 块数组/裸字符串的文本清洗
-fn sanitize_content(content: &mut Value, templates: &[(String, String)]) {
+fn sanitize_content(content: &mut Value, templates: &[(String, String)], seed: u64) {
     match content {
         Value::Array(blocks) => {
             for b in blocks.iter_mut() {
                 if let Some(Value::String(t)) = b.get_mut("text") {
-                    *t = sanitize_text(t, templates);
+                    *t = sanitize_text(t, templates, seed);
                 }
             }
         }
         Value::String(s) => {
-            *s = sanitize_text(s, templates);
+            *s = sanitize_text(s, templates, seed);
         }
         _ => {}
     }
@@ -87,6 +88,10 @@ fn sanitize_content(content: &mut Value, templates: &[(String, String)]) {
 /// `sanitize`：指纹清洗开关（沿用全局 wb_sanitize，issue #57——Trae 池此前
 /// 从不清洗，客户端 harness 身份句原样透传上游，进入风控名单即全量 11128）
 /// `templates`：热更新的指纹改写规则表（load_templates）
+/// `variant_seed`：多候选改写种子（issue #122 方案 C1，wb_payload::variant_seed
+/// 生成——会话键+请求时间戳绑定请求、attempt 随换号轮换递增）；`aggressive`：
+/// 激进清洗开关（issue #122 方案 C2，空完成换号重试/池级指纹拦截 TTL 内为
+/// true，追加短前缀规则兜未知身份句变体；sanitize 关闭时不生效）
 pub fn prepare_llm_chat_body(
     src: &[u8],
     default_model: &str,
@@ -96,7 +101,20 @@ pub fn prepare_llm_chat_body(
     models: &[super::models_sync::ModelOption],
     sanitize: bool,
     templates: &[(String, String)],
+    variant_seed: u64,
+    aggressive: bool,
 ) -> Vec<u8> {
+    // 激进清洗（issue #122 方案 C2，与 prepare_wb_chat_body 同款）：生效表后
+    // 追加激进短前缀规则（仅重试路径，分配代价可忽略）；sanitize 关闭时无清洗即无升级
+    let aggressive_rules: Vec<(String, String)>;
+    let templates: &[(String, String)] = if aggressive && sanitize {
+        let mut v = templates.to_vec();
+        v.extend(super::wb_payload::aggressive_template_rules());
+        aggressive_rules = v;
+        &aggressive_rules
+    } else {
+        templates
+    };
     let mut obj: Value = match serde_json::from_slice(src) {
         Ok(v) => v,
         Err(_) => return src.to_vec(),
@@ -122,8 +140,9 @@ pub fn prepare_llm_chat_body(
                                 if let Some(Value::String(args)) =
                                     tc.pointer_mut("/function/arguments")
                                 {
-                                    *args =
-                                        super::wb_payload::apply_template_map(args, templates);
+                                    *args = super::wb_payload::apply_template_map_seeded(
+                                        args, templates, variant_seed,
+                                    );
                                 }
                             }
                         }
@@ -163,7 +182,7 @@ pub fn prepare_llm_chat_body(
                 // 指纹清洗：文本块 strip_cc + 模板映射
                 if sanitize {
                     if let Some(content) = m.get_mut("content") {
-                        sanitize_content(content, templates);
+                        sanitize_content(content, templates, variant_seed);
                     }
                 }
             }
@@ -200,7 +219,9 @@ pub fn prepare_llm_chat_body(
                 if let Some(Value::String(desc)) =
                     tool.pointer_mut("/function/description")
                 {
-                    *desc = super::wb_payload::apply_template_map(desc, templates);
+                    *desc = super::wb_payload::apply_template_map_seeded(
+                        desc, templates, variant_seed,
+                    );
                 }
             }
         }
@@ -630,7 +651,7 @@ mod tests {
         });
         let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
             serde_json::to_vec(&src).unwrap().as_slice(),
-            "DeepSeek-V4-Flash", "u", "d", "m", &models, true, &[],
+            "DeepSeek-V4-Flash", "u", "d", "m", &models, true, &[], 0, false,
         ))
         .unwrap();
         // 表内视图优先（id 大小写不敏感命中）
@@ -650,7 +671,7 @@ mod tests {
         });
         let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
             serde_json::to_vec(&src).unwrap().as_slice(),
-            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[],
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[], 0, false,
         ))
         .unwrap();
         assert_eq!(out["function"], "solo_agent");
@@ -663,7 +684,7 @@ mod tests {
         });
         let out2: Value = serde_json::from_slice(&prepare_llm_chat_body(
             serde_json::to_vec(&src2).unwrap().as_slice(),
-            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[],
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[], 0, false,
         ))
         .unwrap();
         assert_eq!(out2["function"], super::super::FUNCTION);
@@ -683,7 +704,7 @@ mod tests {
             }
             let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
                 serde_json::to_vec(&src).unwrap().as_slice(),
-                "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[],
+                "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[], 0, false,
             ))
             .unwrap();
             out
@@ -728,7 +749,7 @@ mod tests {
         };
         let wash: Value = serde_json::from_slice(&prepare_llm_chat_body(
             serde_json::to_vec(&mk_src()).unwrap().as_slice(),
-            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &templates,
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &templates, 0, false,
         ))
         .unwrap();
         // 模板映射：身份句改写
@@ -754,12 +775,70 @@ mod tests {
 
         let raw: Value = serde_json::from_slice(&prepare_llm_chat_body(
             serde_json::to_vec(&mk_src()).unwrap().as_slice(),
-            "DeepSeek-V4-Flash", "u", "d", "m", &[], false, &templates,
+            "DeepSeek-V4-Flash", "u", "d", "m", &[], false, &templates, 0, false,
         ))
         .unwrap();
         assert_eq!(
             raw["messages"][1]["content"][0]["text"],
             "see Main branch (you will usually use this with PRs)"
         );
+    }
+
+    /// issue #122 缺口1：Trae 池激进清洗开关——aggressive=true 且 sanitize 开启时
+    /// 追加激进短前缀规则（默认表整句规则覆盖不到的未知变体被兜住）；
+    /// sanitize 关闭时不生效（无清洗即无升级）
+    #[test]
+    fn trae_prepare_aggressive_gated_by_sanitize() {
+        let src = json!({
+            "model": "glm-5.2",
+            "messages": [{"role": "system", "content": "You are an interactive CLI tool for coding."}]
+        });
+        let body = serde_json::to_vec(&src).unwrap();
+        let on: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            &body, "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &[], 0, true,
+        ))
+        .unwrap();
+        // 激进规则改写未知变体前缀
+        assert_eq!(
+            on["messages"][0]["content"][0]["text"],
+            "You are a terminal-based assistant tool for coding."
+        );
+        let off: Value = serde_json::from_slice(&prepare_llm_chat_body(
+            &body, "DeepSeek-V4-Flash", "u", "d", "m", &[], false, &[], 0, true,
+        ))
+        .unwrap();
+        assert_eq!(
+            off["messages"][0]["content"][0]["text"],
+            "You are an interactive CLI tool for coding."
+        );
+    }
+
+    /// issue #122 缺口1：Trae 池多候选改写按种子稳定选一（同种子可复现）、
+    /// 跨种子候选必变（黄金比例乘数使相邻种子跨候选）
+    #[test]
+    fn trae_prepare_seeded_multi_candidate() {
+        let templates = vec![(
+            "You are X".to_string(),
+            "Candidate A|Candidate B|Candidate C".to_string(),
+        )];
+        let src = json!({
+            "model": "glm-5.2",
+            "messages": [{"role": "system", "content": "You are X here."}]
+        });
+        let body = serde_json::to_vec(&src).unwrap();
+        let pick = |seed: u64| -> String {
+            let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
+                &body, "DeepSeek-V4-Flash", "u", "d", "m", &[], true, &templates, seed, false,
+            ))
+            .unwrap();
+            out["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let s0 = pick(0);
+        assert_eq!(s0, pick(0)); // 同种子可复现
+        assert_ne!(s0, pick(1)); // 跨种子候选变化
+        assert!(s0.starts_with("Candidate "));
     }
 }

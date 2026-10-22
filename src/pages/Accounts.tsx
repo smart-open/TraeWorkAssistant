@@ -611,7 +611,14 @@ export default function Accounts() {
                             否则与签到/切换失败的「点续期 JWT」指引断链（issue #9 审查项） */}
                         {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead') && (
                           <button
-                            title={switchingTo || savingLogin ? '切换/保存进行中，暂不能续期' : '续期 JWT（启动代理并切换账号）'}
+                            /* issue #126 语义澄清：本按钮是「被动捕获」，依赖 TRAE 重新鉴权才有新 JWT */
+                            title={
+                              switchingTo || savingLogin
+                                ? '切换/保存进行中，暂不能续期'
+                                : a.has_refresh_token
+                                  ? '续期 JWT（启动代理并切换账号捕获；JWT 仍有效时抓不到新凭证，请改用「刷新 JWT」）'
+                                  : '重新捕获 JWT（仅当 JWT 已失效、TRAE 重新鉴权时才能捕获新凭证；凭证仍有效请保持代理开启等待过期自动续期，或重新 OAuth 登录）'
+                            }
                             onClick={() => void renewJwt(a.user_id)}
                             disabled={busy}
                             className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-amber-500/10"

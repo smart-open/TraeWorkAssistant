@@ -478,6 +478,8 @@ pub fn resolve_target(
                 // Intl 目录提供模型（CN 目录候选 id 在 Intl 上游可能不存在，双收录
                 // 模型的廉价候选常为 CN 专属 id），Buddy 池仍用 CN 目录；两域候选
                 // 均过白名单过滤，候选不存在时回落原模型（不降级）
+                //（合并说明：main 侧「CN∩Intl 交集过滤」方案与本「分域取候选」方案
+                // 同修 #19，本方案每池候选出自自身域目录、覆盖更优，保留本侧结构）
                 let bg_on = state
                     .wb_bg_downgrade
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -2253,9 +2255,14 @@ mod tests {
         assert!(msg.contains("bind=trae"), "{msg}");
         assert!(msg.contains("whitelist=1"), "{msg}");
         assert!(msg.contains("healthy_in_scope=0"), "{msg}");
+        // issue #130 指引：约束排除全部健康账号（池内尚有 1 个）→ 显式 hint
+        assert!(msg.contains("hint=约束排除了池内全部健康账号"), "{msg}");
+        assert!(msg.contains("池内尚有 1 个"), "{msg}");
 
         let msg2 = super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "k2");
         assert!(msg2.contains("healthy_in_scope=1"), "{msg2}");
+        // 作用域内有健康账号 → 不追加 hint（避免噪音）
+        assert!(!msg2.contains("hint="), "{msg2}");
     }
 
     /// 修复1 直测：调度阶段失败落 API 请求日志——NoHealthy → status=503、
@@ -2334,6 +2341,62 @@ mod tests {
         super::super::unified_catalog::save_whitelist(&f.dir, &[]).unwrap();
         let r = resolve_target(&f.state, "glm-5.3", &bg_body(), None).unwrap();
         assert_eq!(r.model, "hy4-preview", "空白名单不限 → 后台任务降级取目录最低倍率");
+    }
+
+    /// 审查 #19 Case A 回归锁定（分域取候选方案）：国际档开启 + 双收录模型
+    /// （glm-5.3 ∈ CN∩Intl）时，后台降级候选按目标池自身域目录取——
+    /// Buddy(CN) 池取 CN 目录最低价（hy4-preview 0.00），BuddyAi 池取 Intl
+    /// 目录候选（静态表倍率全为占位 1.0，并列取首条 hy4-preview-f），
+    /// 从构造上保证「发往 buddy-ai 池的降级 id 必在 Intl 目录存在」
+    ///（main 侧「CN∩Intl 交集过滤」方案同修 #19，本方案覆盖更优，断言随本方案调整）。
+    /// 与 t38（国际档关闭不过滤）构成双向口径。
+    #[test]
+    fn t38a_bg_downgrade_intl_filter_requires_intl_enabled() {
+        use std::sync::atomic::Ordering;
+        let bg = || {
+            json!({"model": "glm-5.3", "max_tokens": 16,
+                   "messages": [{"role": "user", "content": "生成标题"}]})
+        };
+
+        // ① Buddy(CN) 池：降级候选取 CN 域目录最低价
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        f.state.buddy_ai_enabled.store(true, Ordering::Relaxed);
+        f.state.wb_bg_downgrade.store(true, Ordering::Relaxed);
+        super::super::unified_catalog::save_whitelist(&f.dir, &[]).unwrap();
+        let r = resolve_target(&f.state, "glm-5.3", &bg(), None).unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.model, "hy4-preview", "Buddy 池降级候选出自 CN 域目录最低价");
+
+        // ② BuddyAi 池：候选出自 Intl 域目录（CN 专属 id 不会发往国际上游）
+        let f2 = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f2.state.wb_enabled.store(false, Ordering::Relaxed);
+        f2.state.trae_enabled.store(false, Ordering::Relaxed);
+        f2.state.buddy_ai_enabled.store(true, Ordering::Relaxed);
+        f2.state.wb_bg_downgrade.store(true, Ordering::Relaxed);
+        f2.state.buddy_ai_pool.sync_from_wb(
+            &[super::super::pool::WbSyncAccount {
+                uid: "g1".into(),
+                name: "intl".into(),
+                token: "tk".into(),
+                domain: "www.workbuddy.ai".into(),
+                enterprise_id: String::new(),
+                global_region: true,
+                credits: Some(10.0),
+                credits_expire_at: None,
+                credits_fetched_at: None,
+                needs_relogin: false,
+                group_id: String::new(),
+            }],
+            &["g1".to_string()],
+        );
+        super::super::unified_catalog::save_whitelist(&f2.dir, &[]).unwrap();
+        let r2 = resolve_target(&f2.state, "glm-5.3", &bg(), None).unwrap();
+        assert_eq!(r2.pool, TargetPool::BuddyAi);
+        assert_eq!(
+            r2.model, "hy4-preview-f",
+            "BuddyAi 池降级候选出自 Intl 域目录（CN 目录最低价 hy4-preview 非 Intl 收录，不会被选用）"
+        );
     }
 
     // ==================== Qoder 源参与调度（p3-3） ====================

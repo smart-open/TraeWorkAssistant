@@ -699,6 +699,50 @@ where
     v
 }
 
+/// api_server 指纹解析复用：读 settings 自定义路径（键与 app_locate 同源，
+/// 仅读 kv 不依赖 AppState；无自定义或路径无效返回 None）
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn custom_path_kv(data_dir: &std::path::Path, app: &str) -> Option<String> {
+    let profile = app_profile(Some(app));
+    let key = profile.settings_key?;
+    let settings: serde_json::Value = crate::store::db(data_dir).kv_get("app_settings");
+    let p = settings.get(key)?.as_str()?.trim().to_string();
+    (!p.is_empty() && std::path::Path::new(&p).is_file()).then_some(p)
+}
+
+/// api_server 指纹解析复用：注册表卸载键解析（复用 app_locate 的 registry 源）
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn registry_app_path_for(app: &str) -> Option<String> {
+    registry_app_path(&app_profile(Some(app)))
+}
+
+/// mac 变体：settings 自定义路径为 .app bundle 目录形态（非文件），校验口径
+/// 与 app_locate_macos 的 settings 分支同源（is_bundle_dir）；键名表与
+/// app_locate_macos 档案表一致
+#[cfg(target_os = "macos")]
+pub(crate) fn custom_path_kv(data_dir: &std::path::Path, app: &str) -> Option<String> {
+    use crate::switcher::locate::is_bundle_dir;
+    let key = match app.to_lowercase().as_str() {
+        "trae" | "trae_cn" | "traecn" | "ide" => "trae_cn_path",
+        "doubao" => "doubao_path",
+        "workbuddy" => "workbuddy_path",
+        "codebuddy" => "codebuddy_path",
+        "workbuddy_ai" => "workbuddy_ai_path",
+        "codebuddy_ai" => "codebuddy_ai_path",
+        _ => return None,
+    };
+    let settings: serde_json::Value = crate::store::db(data_dir).kv_get("app_settings");
+    let p = settings.get(key)?.as_str()?.trim().to_string();
+    (!p.is_empty() && is_bundle_dir(std::path::Path::new(&p))).then_some(p)
+}
+
+/// mac 变体：无注册表概念，恒 None——bundle 探测/Spotlight 兜底由调用方
+///（api_server::wb_upstream::locate_client_exe mac 分支）走 bundle 定位链
+#[cfg(target_os = "macos")]
+pub(crate) fn registry_app_path_for(_app: &str) -> Option<String> {
+    None
+}
+
 /// app_locate 的内部版本（供 open_* 命令与 workbuddy 模块复用；无需 Option 包装）。
 /// F-75 P2-2 平台分派：mac 走 bundle 定位链，Windows 走四级探测链（两链互斥编译）。
 pub(crate) fn app_locate_inner(state: &State<AppState>, app: &str) -> AppLocate {

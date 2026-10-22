@@ -381,15 +381,17 @@ pub(crate) fn dispatch_error_response(
 /// 轮换耗尽收尾文案（issue #57 后续可观测）：区分「渠道指纹拦截」与「账号池耗尽」。
 /// 空完成（影子风控，HTTP 200 零内容）与账号无关，换号轮换打满整池后原文案
 /// "no healthy account available" 会误导用户排查账号——现按 empty_hits 分流：
-/// 空完成主导（过半轮换账号返回空完成）→ 明示指纹拦截语义（账号/模型无关，
-/// 提示更新清洗规则表）；混合失败（空完成仅零星出现、以限流/5xx 为主）时
-/// 维持原文案，避免 "switching won't help" 误导排障方向。返回 (错误消息, 诊断日志标记)。
+/// 空完成主导（过半轮换账号返回空完成，且最小样本量 ≥2）→ 明示指纹拦截语义
+/// （账号/模型无关，提示更新清洗规则表）；混合失败（空完成仅零星出现、以
+/// 限流/5xx 为主）或样本不足（issue #130：单号轮换 1 次空完成即宣判易误报，
+/// 上游瞬时抖动同样返回空完成）时维持原文案，避免 "switching won't help"
+/// 误导排障方向。返回 (错误消息, 诊断日志标记)。
 /// pool 取池标识（"trae"/"buddy"/"qoder"）：池名与处置建议按池区分（审查 2026-10-07
 /// ——原实现三池共用 trae 文案；qoder 无 wb_template_map/sanitize 机制，其空完成
 /// 根因是设备指纹分桶，正确处置是在真实客户端建立设备信任）。trae 文案与原实现
 /// 逐字一致（存量测试/日志兼容）
 pub(crate) fn exhaust_message(pool: &str, empty_hits: usize, rotated: usize, healthy_total: usize) -> (String, &'static str) {
-    if rotated > 0 && empty_hits * 2 > rotated {
+    if rotated >= 2 && empty_hits * 2 > rotated {
         let pool_upper = match pool {
             "buddy" => "WB",
             "qoder" => "Qoder",
@@ -447,8 +449,17 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
                 Some(s) => s.len().to_string(),
             };
             let ded = c.dedicated.as_deref().unwrap_or("-");
+            // issue #130：池内尚有健康账号但约束作用域内为 0（healthy_in_scope=0）
+            // → 追加显式指引，避免用户误判为账号池整体耗尽而无效换号排查
+            let hint = if healthy_scope == 0 && healthy_total > 0 {
+                format!(
+                    " hint=约束排除了池内全部健康账号（池内尚有 {healthy_total} 个）：请编辑该 Key 的账号白名单/专一账号后重试"
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{base} key={name} bind={bind} whitelist={wl} dedicated={ded} healthy_in_scope={healthy_scope}"
+                "{base} key={name} bind={bind} whitelist={wl} dedicated={ded} healthy_in_scope={healthy_scope}{hint}"
             )
         }
     }
@@ -1741,6 +1752,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
+        let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
+        // 多候选改写种子基底（issue #122 方案 C1）：会话键 + 请求时间戳绑定请求，
+        // tried.len() 随换号轮换递增——跨重试候选必变
+        let seed_base = format!("{}#{}", sticky_conv, now_ts());
 
         for _ in 0..MAX_ROTATE {
             // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽。
@@ -1789,12 +1804,30 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             // 审查修复（L1）：绑定成功才更新「最近绑定账号」（CAS 拒绝的候选不算）
             last_bound_uid = Some(picked.uid.clone());
 
+            // 多候选改写种子（issue #122 方案 C1）：tried.len() 随换号轮换递增；
+            // 空完成后（empty_hits>0）或池级指纹拦截 TTL 内（issue #122 缺口2）
+            // 追加激进清洗（issue #122 方案 C2）
+            let seed = super::wb_payload::variant_seed(&seed_base, tried.len() as u64);
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
                 sanitize, &templates,
+                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
             );
+            // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
+            // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
+            if sanitize {
+                if let Some(note) = super::wb_payload::residual_fingerprint_note(&converted) {
+                    if last_residual_note.as_deref() != Some(note.as_str()) {
+                        last_residual_note = Some(note.clone());
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] 残指纹自检命中: {note} pool=trae uid={}",
+                            picked.uid
+                        ));
+                    }
+                }
+            }
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
             // 重试计数，换号后随新账号归零；总轮换上限仍受 MAX_ROTATE 约束
@@ -1813,6 +1846,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         let mut win = match race_trae_first_byte(
                             &state, &picked.uid, reader, primary_hdr, &tried, trae_allowed.as_ref(),
                             trae_dedicated.as_deref(), &body_vec, sanitize, &templates,
+                            // 对冲重建沿用主请求的激进口径与种子（issue #122 C1/C2）
+                            seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -2017,10 +2052,13 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 state.logger.log_sched_event(&format!(
                                     "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
                                 ));
+                                // aggressive=true（issue #122 缺口3）：11128 是显式
+                                // 指纹确认，强制清洗即全力清洗（激进规则一并生效）
                                 converted = super::payload::prepare_llm_chat_body(
                                     &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                                     &super::models_sync::load_models(&state.data_dir),
                                     true, &templates,
+                                    seed, true,
                                 );
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
@@ -2039,11 +2077,18 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             let sample = super::wb_payload::fingerprint_sample(&body_vec);
                             if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                 last_11128_sample = Some(sample.clone());
+                                let note = super::wb_payload::template_hit_note();
                                 state.logger.log_sched_event(&format!(
                                     "11128 指纹样本: {}{}",
-                                    sample,
-                                    super::wb_payload::template_hit_note()
+                                    sample, note
                                 ));
+                                // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
+                                super::wb_payload::record_fingerprint_sample(
+                                    "11128",
+                                    "trae",
+                                    &sample,
+                                    &note,
+                                );
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );
@@ -2156,6 +2201,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (exhaust_msg, exhaust_tag) = exhaust_message("trae", empty_hits, attempts, healthy_total);
+        // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
+        // TTL 内同池新请求直接激进起步，不再从零试探烧账号
+        super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
             .iter()
@@ -2182,13 +2230,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             let h = (local_ts % 86400) / 3600;
             let m = (local_ts % 3600) / 60;
             let s = local_ts % 60;
-            // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本（对齐 wb_route
-            // 口径），供反查漏网触发句
-            let sample_note = if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
-                format!(" 指纹样本: {}", super::wb_payload::fingerprint_sample(&body_vec))
-            } else {
-                String::new()
-            };
+            // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲（kind=empty），
+            // 并返回日志注记供反查漏网触发句
+            let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "trae", &body_vec);
             let diag_line = format!(
                 "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} attempts={} empty_hits={} pool=trae reasons=[{}]{}",
                 h, m, s, tried.len(), attempts, empty_hits, diag_summary.join(", "), sample_note,
@@ -2311,6 +2355,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
+        let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
+        // 多候选改写种子基底（issue #122 方案 C1）：会话键 + 请求时间戳绑定请求，
+        // tried.len() 随换号轮换递增——跨重试候选必变
+        let seed_base = format!("{}#{}", sticky_conv, now_ts());
 
         for _ in 0..MAX_ROTATE {
             // 取号：粘性命中优先（每请求仅首轮），否则按 Key 约束 + 调度策略；
@@ -2346,12 +2394,30 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             attempts += 1;
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
+            // 多候选改写种子（issue #122 方案 C1）：tried.len() 随换号轮换递增；
+            // 空完成后（empty_hits>0）或池级指纹拦截 TTL 内（issue #122 缺口2）
+            // 追加激进清洗（issue #122 方案 C2）
+            let seed = super::wb_payload::variant_seed(&seed_base, tried.len() as u64);
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
                 sanitize, &templates,
+                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
             );
+            // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
+            // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
+            if sanitize {
+                if let Some(note) = super::wb_payload::residual_fingerprint_note(&converted) {
+                    if last_residual_note.as_deref() != Some(note.as_str()) {
+                        last_residual_note = Some(note.clone());
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] 残指纹自检命中: {note} pool=trae uid={}",
+                            picked.uid
+                        ));
+                    }
+                }
+            }
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
             // 重试计数，换号后随新账号归零；总轮换上限仍受 MAX_ROTATE 约束
@@ -2497,10 +2563,13 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 state.logger.log_sched_event(&format!(
                                     "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
                                 ));
+                                // aggressive=true（issue #122 缺口3）：11128 是显式
+                                // 指纹确认，强制清洗即全力清洗（激进规则一并生效）
                                 converted = super::payload::prepare_llm_chat_body(
                                     &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                                     &super::models_sync::load_models(&state.data_dir),
                                     true, &templates,
+                                    seed, true,
                                 );
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 continue;
@@ -2511,11 +2580,14 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             let sample = super::wb_payload::fingerprint_sample(&body_vec);
                             if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                 last_11128_sample = Some(sample.clone());
+                                let note = super::wb_payload::template_hit_note();
                                 state.logger.log_sched_event(&format!(
                                     "11128 指纹样本: {}{}",
                                     sample,
-                                    super::wb_payload::template_hit_note()
+                                    note
                                 ));
+                                // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
+                                super::wb_payload::record_fingerprint_sample("11128", "trae", &sample, &note);
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );
@@ -2612,6 +2684,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // 轮换耗尽收尾：空完成主导 → 明示渠道指纹拦截语义，否则维持原文案
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (exhaust_msg, exhaust_tag) = exhaust_message("trae", empty_hits, attempts, healthy_total);
+        // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
+        // TTL 内同池新请求直接激进起步，不再从零试探烧账号
+        super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
         let diag = state.pool.diagnose();
         // 用量记账（所有账号不可用）
         state.record_usage(false, &model, "none", &key_id, false, stream, duration_ms, 0, 0);
@@ -2632,13 +2707,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         );
         // 写入诊断日志
         {
-            // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本（对齐 wb_route
-            // 口径），供反查漏网触发句
-            let sample_note = if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
-                format!(" 指纹样本: {}", super::wb_payload::fingerprint_sample(&body_vec))
-            } else {
-                String::new()
-            };
+            // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲（kind=empty），
+            // 并返回日志注记供反查漏网触发句
+            let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "trae", &body_vec);
             state.logger.log_debug_line(format!(
                 "[DEBUG] {exhaust_tag}(non-stream) tried={} attempts={} empty_hits={} pool=trae reasons=[{}]{}",
                 tried.len(), attempts, empty_hits, diag_summary.join(", "), sample_note,
@@ -2726,7 +2797,9 @@ struct TraeRaceWin {
 /// 时与纯首字超时语义完全一致；开启时主请求首字节超阈值 → 从池内取第二账号
 /// （走同一 busy 过滤/负载因子——主账号已 inflight 天然让位）发对冲请求，
 /// 先出首字者胜。对冲请求体按对冲账号指纹重建（device/machine id 逐账号
-/// 注入，不能复用主请求体）
+/// 注入，不能复用主请求体）。`seed`/`aggressive`（issue #122 方案 C1/C2）：
+/// 对冲侧种子做黄金比例翻搅——候选与主请求不同，避免主/对冲同指纹改写；
+/// aggressive 沿用主请求口径
 #[allow(clippy::too_many_arguments)]
 fn race_trae_first_byte(
     state: &Arc<ApiSharedState>,
@@ -2739,6 +2812,8 @@ fn race_trae_first_byte(
     body_vec: &[u8],
     sanitize: bool,
     templates: &[(String, String)],
+    seed: u64,
+    aggressive: bool,
 ) -> Result<TraeRaceWin, ()> {
     let hedge_ms = state
         .trae_hedge_threshold_ms
@@ -2759,6 +2834,8 @@ fn race_trae_first_byte(
     let dedicated2 = dedicated.map(str::to_string);
     let body = body_vec.to_vec();
     let templates2 = templates.to_vec();
+    // 对冲侧种子：黄金比例翻搅（候选与主请求不同，issue #122 方案 C1）
+    let hedge_seed = seed ^ 0x9E37_79B9_7F4A_7C15;
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, TraeHedgeLease)> {
         let (picked2, ev) = state2
             .pool
@@ -2779,6 +2856,8 @@ fn race_trae_first_byte(
             &super::models_sync::load_models(&state2.data_dir),
             sanitize,
             &templates2,
+            hedge_seed,
+            aggressive,
         );
         let (reader2, hdr2) = make_upstream_request(
             &picked2.jwt,
@@ -3236,6 +3315,15 @@ mod tests {
     fn exhaust_message_no_empty_hits_keeps_original() {
         // 无空完成（401/429/5xx 等真实不健康）：维持原文案，避免误导
         let (msg, tag) = exhaust_message("trae", 0, 3, 0);
+        assert_eq!(msg, "no healthy account available");
+        assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
+    }
+
+    #[test]
+    fn exhaust_message_single_empty_hit_keeps_original() {
+        // issue #130 防误报：单号轮换 + 1 次空完成（样本不足）不宣判指纹拦截，
+        // 上游瞬时抖动同样返回空完成，"switching won't help" 会误导排障方向
+        let (msg, tag) = exhaust_message("trae", 1, 1, 3);
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }

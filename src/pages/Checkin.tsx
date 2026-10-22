@@ -25,11 +25,13 @@ const COOLDOWN_LABELS: Record<string, string> = {
   Client: '客户端错误',
   BusinessError: '业务错误',
   DeviceSigned: '设备已签',
+  AuthRejected: '认证被拒',
 };
 
 function MiniCooldownBadge({ type, until }: { type: string; until: number | null }) {
   const label = COOLDOWN_LABELS[type] ?? type;
-  const isPermanent = type === 'SessionDead';
+  // SessionDead=JWT 吊销（永久）；AuthRejected=服务端拒绝认证（issue #128，永久，需重走 OAuth）
+  const isPermanent = type === 'SessionDead' || type === 'AuthRejected';
   let remaining = '';
   if (!isPermanent && until) {
     const secs = until - Math.floor(Date.now() / 1000);
@@ -453,7 +455,9 @@ export default function Checkin() {
                     {r.status === 'fail' &&
                       (r.error_type === 'SessionDead'
                         ? 'JWT 已被服务端吊销，请重新登录该账号并保存'
-                        : (r.message ?? '失败'))}
+                        : r.error_type === 'AuthRejected'
+                          ? '凭证被服务端拒绝认证，请对该账号重新 OAuth 登录'
+                          : (r.message ?? '失败'))}
                   </span>
                   {r.error_type && (
                     <span className="text-xs text-amber-500">

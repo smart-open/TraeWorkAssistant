@@ -203,12 +203,86 @@ fn walk_capable_dicts<'a>(v: &'a Value, depth: usize, out: &mut Vec<&'a Value>) 
     }
 }
 
+/// 包标识码（summary 明细包均有；分类汇总行没有）。数值型 code 同样算明细包——
+/// 上游序列化形态不固定，按字符串过滤会把它误判为无 code 汇总行而丢弃。
+fn package_code_of(item: &Value) -> Option<String> {
+    let v = fs_utils::dig(item, &["PackageCode", "packageCode"])?;
+    let s = match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    (!s.is_empty()).then_some(s)
+}
+
+/// 已知分类汇总行名单（平台奖励积分 / 套餐基础积分 …）：summary 响应里这些行的
+/// 数值是同类明细包的合计，与明细并存时重复计入会让余额精确翻倍。
+const CATEGORY_SUMMARY_NAMES: [&str; 4] =
+    ["平台奖励积分", "套餐基础积分", "套餐赠送积分", "购买积分"];
+
+/// 无 code 项是否可识别为「已知分类汇总行」：只有这类无 code 行才与明细包重复、
+/// 可在 has_coded 时跳过；其余无 code 项是旧结构真实包，不可静默丢弃（会少计）。
+/// 顶层直查名字键优先——真实包顶层名不中黑名单即保留，不受子树内嵌名字干扰；
+/// 顶层全缺时才降级 dig 深搜，保留「信封包裹的汇总行/包裹层」跳过能力（删深搜
+/// 会让包裹层漏判 → 重复计数复发，比误丢无顶层名的真实包更严重）。
+fn is_category_summary_row(item: &Value) -> bool {
+    const NAME_KEYS: [&str; 6] =
+        ["PackageName", "packageName", "Name", "name", "ProductCode", "description"];
+    let hit = NAME_KEYS
+        .iter()
+        .find_map(|k| item.get(*k))
+        .or_else(|| fs_utils::dig(item, &NAME_KEYS));
+    hit.and_then(Value::as_str)
+        .map_or(false, |n| CATEGORY_SUMMARY_NAMES.contains(&n))
+}
+
+/// 聚合父容器判定（issue #120：`data.CycleRemainCapacity` 与 `data.Packages[]` 并存时
+/// 父/子重复计数导致余额精确翻倍）：该无 code 项的子树里含任何一个带 code 的明细包
+/// dict，则它只是明细的包裹层，其容量字段是明细合计——存在明细包时必须跳过。
+fn is_aggregate_container(item: &Value, coded: &[&Value]) -> bool {
+    fn contains(v: &Value, coded: &[&Value], depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match v {
+            Value::Array(arr) => arr.iter().any(|e| {
+                coded.iter().any(|c| std::ptr::eq(*c, e)) || contains(e, coded, depth + 1)
+            }),
+            Value::Object(map) => map.values().any(|e| contains(e, coded, depth + 1)),
+            _ => false,
+        }
+    }
+    contains(item, coded, 0)
+}
+
+/// `packages_from` / `balance_from_summary` 共用的跳过谓词：存在带 code 明细时，
+/// 无 code 项仅当「已知分类汇总行」或「聚合父容器」才跳过（其余是真实包，不可丢）。
+fn is_skippable_uncoded(item: &Value, has_coded: bool, coded: &[&Value]) -> bool {
+    has_coded
+        && package_code_of(item).is_none()
+        && (is_category_summary_row(item) || is_aggregate_container(item, coded))
+}
+
 /// 从三件套/旧接口响应提取包列表（容量键全树收集，6 种嵌套路径兼容）。
+///
+/// 混排响应过滤（2026-10-18，issue #120 后续）：summary 同时返回带 PackageCode 的
+/// 明细包与无 code 的分类汇总行（数值是同类明细合计），汇总行不是积分包——存在
+/// 明细包时必须跳过（实测包数 24→20、76→72）；但只按 code 过滤会丢掉上游未打 code
+/// 的真实包（余额/包列表少计），因此只跳过「已知汇总行」与「聚合父容器」。
 fn packages_from(body: &Value) -> Vec<Value> {
     let mut found = vec![];
     walk_capable_dicts(body, 0, &mut found);
+    let coded: Vec<&Value> = found
+        .iter()
+        .copied()
+        .filter(|d| package_code_of(d).is_some())
+        .collect();
+    let has_coded = !coded.is_empty();
     let mut out = vec![];
     for item in found {
+        if is_skippable_uncoded(item, has_coded, &coded) {
+            continue;
+        }
         let total = total_of(item);
         let remaining = remaining_of(item, total);
         if remaining.is_none() && total.is_none() {
@@ -225,12 +299,7 @@ fn packages_from(body: &Value) -> Vec<Value> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "积分包".to_string());
         // PackageCode：跨接口去重/合并用（summary 与 paid/free 的 name 字段不同源）
-        let code = fs_utils::dig(item, &["PackageCode", "packageCode"])
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .filter(|s| !s.is_empty());
+        let code = package_code_of(item);
         // 到期字段宽容链（§3.6）→ to_ts 归一 Unix 秒；expire_ts 有值 ⟺ end_time 有值
         //（此前 end_time 仅字符串原始值时回填致明细「到期时间未知」而日历正常，已统一由
         // expire_ts 生成，与到期日历口径严格对齐）
@@ -269,8 +338,10 @@ fn packages_from(body: &Value) -> Vec<Value> {
 /// summary 响应 → 余额。旧结构：顶层 RemainingCapacity/Balance 等字段；
 /// 新结构（2026-09 实测）：data.Packages[] 各包 CycleRemainCapacity 求和。
 /// 聚合父字段（如 data.CycleRemainCapacity）与 Packages[] 明细并存时，父/子
-/// 不可重复计数（issue #120 余额翻倍根因）：存在带 PackageCode 的明细 dict 时
-/// 仅对其求和，全部无 code 的旧形态回退全量和。
+/// 不可重复计数（issue #120 余额翻倍根因）。与 `packages_from` 同口径：存在带
+/// PackageCode 的明细包时跳过「已知分类汇总行」与「聚合父容器」，其余无 code 项
+/// （老结构/上游未打 code 的真实包）计入；明细读不出时宁可返回 None，不得回退
+/// 「全量和」把汇总行加回来。
 pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
     if let Some(t) = num_of(fs_utils::dig(
         body,
@@ -280,39 +351,25 @@ pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
     }
     let mut found = vec![];
     walk_capable_dicts(body, 0, &mut found);
-    let sum_of = |items: &[&Value]| -> Option<f64> {
-        let mut s = 0.0;
-        let mut has = false;
-        for item in items {
-            // 审查修复（M3）：逐项走 remaining_of 宽键链（含 CycleCapacityRemainPrecise
-            // 等实测首选字段 + used/total 倒推）——此前仅识别 3 键，明细仅携带
-            // CycleCapacityRemainPrecise 时 coded 求和落空、静默跌回全量和，
-            // issue #120 父/子翻倍形态复发
-            if let Some(v) = remaining_of(item, total_of(item)) {
-                s += v;
-                has = true;
-            }
-        }
-        has.then_some(s)
-    };
     let coded: Vec<&Value> = found
         .iter()
         .copied()
-        .filter(|d| {
-            fs_utils::dig(d, &["PackageCode", "packageCode"])
-                .and_then(Value::as_str)
-                .map_or(false, |c| !c.is_empty())
-        })
+        .filter(|d| package_code_of(d).is_some())
         .collect();
-    if !coded.is_empty() {
-        if let Some(s) = sum_of(&coded) {
-            return Some(s);
+    let has_coded = !coded.is_empty();
+    let mut s = 0.0;
+    let mut has = false;
+    for item in found {
+        if is_skippable_uncoded(item, has_coded, &coded) {
+            continue;
+        }
+        // 逐项走 remaining_of 宽键链（含 CycleCapacityRemainPrecise 与 used/total 倒推）
+        if let Some(v) = remaining_of(item, total_of(item)) {
+            s += v;
+            has = true;
         }
     }
-    // 审查修复（M3）：删除「总量键」回退分支——CycleCapacitySizePrecise/
-    // CycleTotalCapacity/CapacitySize 是周期**总量**而非剩余（见 remaining_of
-    // 注释），末级把总量当余额会凭空虚报（宁缺勿错，交由调用方按失败处理）
-    sum_of(&found)
+    has.then_some(s)
 }
 
 /// summary 响应 → PackageCode 列表（去重，保序）。2026-09 起 paid/free 接口要求
@@ -322,9 +379,9 @@ fn package_codes_from(body: &Value) -> Vec<String> {
     walk_capable_dicts(body, 0, &mut found);
     let mut codes: Vec<String> = vec![];
     for item in found {
-        if let Some(c) = fs_utils::dig(item, &["PackageCode", "packageCode"]).and_then(Value::as_str) {
-            if !c.is_empty() && !codes.iter().any(|x| x == c) {
-                codes.push(c.to_string());
+        if let Some(c) = package_code_of(item) {
+            if !codes.iter().any(|x| *x == c) {
+                codes.push(c);
             }
         }
     }
@@ -830,6 +887,92 @@ mod wb_credits_tests {
             "Accounts": [{"RemainingCapacity": 10.0}]
         }});
         assert_eq!(balance_from_summary(&legacy), Some(40.0));
+    }
+
+    /// 分类汇总行（无 code，数值是同类明细包的合计）不得出现在积分包列表里。
+    /// 余额在 M3 之后已只加明细包，但包列表仍会把汇总行当包（实测包数多出 4 条）。
+    #[test]
+    fn summary_rows_not_listed_as_packages() {
+        let body = json!({"data": {
+            "Packages": [
+                {"PackageCode": "p_reward", "PackageName": "裂变包",
+                 "CycleRemainCapacity": 100.0, "CycleTotalCapacity": 100.0},
+                {"PackageCode": "p_base", "PackageName": "基础包",
+                 "CycleRemainCapacity": 50.5, "CycleTotalCapacity": 50.5}
+            ],
+            "Summary": [
+                {"Name": "平台奖励积分", "CycleRemainCapacity": 100.0},
+                {"Name": "套餐基础积分", "CycleRemainCapacity": 50.5}
+            ]
+        }});
+        assert_eq!(packages_from(&body).len(), 2, "汇总行不是积分包");
+        assert_eq!(balance_from_summary(&body), Some(150.5));
+    }
+
+    /// 顶层无余额字段时，不能把某个包的 remaining 当成总余额
+    ///（`fs_utils::dig` 是全树深搜，命中第一个包就返回 → 少计）。
+    #[test]
+    fn balance_does_not_use_single_package_as_total() {
+        let body = json!({"data": {"Packages": [
+            {"PackageCode": "p_a", "RemainingCapacity": 100.0},
+            {"PackageCode": "p_b", "RemainingCapacity": 50.0}
+        ]}});
+        assert_eq!(balance_from_summary(&body), Some(150.0));
+    }
+
+    /// 混排形态：带 code 明细包 + 无 code 但**不是**已知分类汇总行的真实包，
+    /// 后者必须保留（只按 code 过滤会少计），余额与包列表同口径。
+    #[test]
+    fn mixed_uncoded_real_package_is_kept() {
+        let body = json!({"data": {"Packages": [
+            {"PackageCode": "p_a", "PackageName": "裂变包", "CycleRemainCapacity": 100.0},
+            {"PackageName": "老结构体验包", "CycleRemainCapacity": 50.0}
+        ]}});
+        assert_eq!(packages_from(&body).len(), 2, "无 code 真实包不应被丢弃");
+        assert_eq!(balance_from_summary(&body), Some(150.0));
+    }
+
+    /// PackageCode 为数值型（上游序列化差异）时同样算明细包，
+    /// 不能误判为无 code 汇总行而丢弃。
+    #[test]
+    fn numeric_package_code_counts_as_detail() {
+        let body = json!({"data": {"Packages": [
+            {"PackageCode": 123456, "PackageName": "裂变包", "CycleRemainCapacity": 100.0},
+            {"PackageCode": "p_b", "PackageName": "基础包", "CycleRemainCapacity": 20.0},
+            {"Name": "平台奖励积分", "CycleRemainCapacity": 120.0}
+        ]}});
+        assert_eq!(packages_from(&body).len(), 2);
+        assert_eq!(balance_from_summary(&body), Some(120.0));
+    }
+
+    /// 明细包只带总量、没有剩余（上游换字段名/新口径）时宁缺勿错：不得回退
+    /// 「全量和」把分类汇总行加回来（那是翻倍的另一种触发路径）。
+    #[test]
+    fn unreadable_details_do_not_fall_back_to_summary_rows() {
+        let body = json!({"data": {
+            "Packages": [{"PackageCode": "p_a", "PackageName": "裂变包", "CapacitySize": 100.0}],
+            "Summary": [{"Name": "平台奖励积分", "CycleRemainCapacity": 100.0}]
+        }});
+        assert_eq!(balance_from_summary(&body), None);
+    }
+
+    /// issue #120 评论区 5 账号实测形态（回归锁定）：聚合父字段与明细并存 + 无 code
+    /// 分类汇总行「平台奖励积分」（== coded Σ）+「套餐基础积分 ↔ CodeBuddy个人体验版」
+    /// 同值双口径对 → coded Σ + 体验版值；汇总行/父容器不进包列表。
+    #[test]
+    fn balance_from_summary_issue120_comment_shape() {
+        let body = json!({"data": {
+            "CycleRemainCapacity": 1386.5,
+            "Packages": [
+                {"PackageName": "每日签到裂变包", "PackageCode": "TCACA_code_007_a",
+                 "CycleRemainCapacity": 1200.0},
+                {"PackageName": "平台奖励积分", "CycleRemainCapacity": 1200.0},
+                {"PackageName": "套餐基础积分", "CycleRemainCapacity": 186.5},
+                {"PackageName": "CodeBuddy个人体验版", "CycleRemainCapacity": 186.5}
+            ]
+        }});
+        assert_eq!(balance_from_summary(&body), Some(1386.5));
+        assert_eq!(packages_from(&body).len(), 2, "汇总行与父容器不是积分包");
     }
 
     #[test]

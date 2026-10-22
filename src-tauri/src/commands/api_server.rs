@@ -321,6 +321,10 @@ async fn do_start_inner(
         );
     }
 
+    // 指纹解析 data_dir 注册（issue #123）：settings 自定义路径读取需要，
+    // 必须在首个 wb_client_fingerprint 调用（api 启动预检）前完成
+    crate::api_server::wb_upstream::set_fingerprint_data_dir(&state.data_dir);
+
     let shared = Arc::new(ApiSharedState {
         pool,
         wb_pool,

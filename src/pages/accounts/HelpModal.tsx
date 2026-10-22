@@ -106,6 +106,8 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
           <p className="text-xs leading-relaxed text-sky-800 dark:text-sky-200">
             JWT 默认 13 天过期。带有刷新令牌的账号（显示闪电图标）可点击「刷新」自动续期。
             不支持自动刷新的账号请点击「续期」图标，系统会启动代理并切换到该账号，通过代理捕获新 JWT。
+            注意：「续期」依赖 TRAE 重新鉴权——JWT 仍有效时 TRAE 不会换发新凭证，此时会提示原因与出路
+            （无刷新令牌的账号请保持代理开启，JWT 过期后 TRAE 自动重新登录即可捕获）。
           </p>
         </section>
       </div>

@@ -10,6 +10,7 @@
 //! 上游只回 SSE：非流式由 wb_sse::aggregate 本地聚合（payload 层强制 stream:true）。
 
 use std::io::{BufRead, BufReader, Read};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::fs_utils;
@@ -27,6 +28,142 @@ pub const WB_CLI_VERSION: &str = "2.63.2";
 pub const WB_REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
 /// 首字超时（F-34）：上游建连后 10s 内未产出任何字节 → 故障转移
 pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 动态客户端指纹（issue #123）：UA/X-IDE-Version 从本机已安装客户端解析，
+/// 解析失败回落编译期常量（零行为变化）。每进程每区域仅解析一次。
+pub struct WbClientFingerprint {
+    pub ua: String,
+    pub version: String,
+}
+
+static FP_CN: OnceLock<WbClientFingerprint> = OnceLock::new();
+static FP_INTL: OnceLock<WbClientFingerprint> = OnceLock::new();
+/// 指纹解析用 data_dir（settings 自定义路径读取需要；api_server 启动时注册）
+static FP_DATA_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+pub fn set_fingerprint_data_dir(dir: &std::path::Path) {
+    let _ = FP_DATA_DIR.set(dir.to_path_buf());
+}
+
+fn fingerprint_data_dir() -> Option<&'static std::path::Path> {
+    FP_DATA_DIR.get().map(|p| p.as_path())
+}
+
+pub fn wb_client_fingerprint(global_region: bool) -> &'static WbClientFingerprint {
+    let cell = if global_region { &FP_INTL } else { &FP_CN };
+    cell.get_or_init(|| resolve_client_fingerprint(global_region))
+}
+
+fn resolve_client_fingerprint(global_region: bool) -> WbClientFingerprint {
+    // 版本读取走 env::version_of 三平台分派（Windows: PE 资源直读+powershell 兜底，
+    // mac: .app bundle Info.plist，共享 version_cached 缓存基建）——此前直调
+    // pe_version 在 mac 恒 None，动态版本失效落常量兜底
+    let resolved = locate_client_exe(global_region)
+        .and_then(|exe| crate::commands::env::version_of(&exe));
+    match resolved {
+        Some(v) if !v.is_empty() => WbClientFingerprint {
+            // Intl 实证格式（issue #123 BuddySwitch 对照）：
+            //   WorkBuddy/5.8.4 WorkBuddy AI/5.8.4
+            // CN 沿用既有常量模板仅换版本：CLI/5.8.4 CodeBuddy/5.8.4
+            ua: ua_template(global_region, &v),
+            version: v,
+        },
+        _ => WbClientFingerprint { ua: WB_UA.into(), version: WB_CLI_VERSION.into() },
+    }
+}
+
+/// 区域 UA 模板（纯函数，测试用独立字面量锁定格式，防 Intl/CN 模板拼错）
+fn ua_template(global_region: bool, v: &str) -> String {
+    if global_region {
+        format!("WorkBuddy/{v} WorkBuddy AI/{v}", v = v)
+    } else {
+        format!("CLI/{v} CodeBuddy/{v}", v = v)
+    }
+}
+
+/// 定位本机客户端 exe（口径同 commands::env app_locate：settings 自定义路径
+/// → 默认路径候选 → 注册表卸载键兜底；process 探测对指纹场景无意义不复制）。
+/// mac：自定义路径为 .app bundle 目录形态（custom_path_kv mac 变体 is_bundle_dir
+/// 校验）→ bundle 探测（/Applications、~/Applications）→ Spotlight mdfind 兜底，
+/// 档案名/CFBundleIdentifier 白名单与 app_locate_macos 同表；返回 bundle 根路径，
+/// env::version_of 对 .app 直读 Info.plist（起点即 bundle 分支已覆盖）
+fn locate_client_exe(global_region: bool) -> Option<String> {
+    let app = if global_region { "workbuddy_ai" } else { "workbuddy" };
+    // 1) settings 自定义路径（用户在设置页手动指定的 exe）
+    if let Some(dir) = fingerprint_data_dir() {
+        if let Some(p) = crate::commands::env::custom_path_kv(dir, app) {
+            return Some(p);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use crate::switcher::locate::{locate_bundle_dir, mdfind_bundle};
+        let (display, proc_names, bundle_ids): (&str, &[&str], &[&str]) = if global_region {
+            (
+                "WorkBuddy AI",
+                &["WorkBuddyAI", "WorkBuddy AI"],
+                &["com.workbuddy.workbuddy-ai"],
+            )
+        } else {
+            ("WorkBuddy", &["WorkBuddy"], &["com.tencent.workbuddy.mac"])
+        };
+        let mut names: Vec<&str> = vec![display];
+        for n in proc_names {
+            if !names.contains(n) {
+                names.push(n);
+            }
+        }
+        // 2) bundle 探测（显示名 + 主进程名作目录名候选，白名单防串台）
+        for name in &names {
+            if let Some(found) = locate_bundle_dir(name, proc_names, bundle_ids) {
+                return Some(found.to_string_lossy().to_string());
+            }
+        }
+        // 3) Spotlight 兜底（mdfind 秒回；仅上面未命中时）
+        for name in &names {
+            if let Some(found) = mdfind_bundle(name, proc_names, bundle_ids) {
+                return Some(found.to_string_lossy().to_string());
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // 2) 默认路径候选
+        if let Some(p) = default_exe_candidates(global_region) {
+            return Some(p);
+        }
+        // 3) 注册表卸载键兜底
+        crate::commands::env::registry_app_path_for(app)
+    }
+}
+
+/// 默认路径候选（LOCALAPPDATA Programs 布局 + Program Files 系统级安装兜底）
+#[cfg(not(target_os = "macos"))]
+fn default_exe_candidates(global_region: bool) -> Option<String> {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let mut cands: Vec<String> = if global_region {
+        vec![
+            format!(r"{}\Programs\WorkBuddyAI\WorkBuddyAI.exe", local),
+            format!(r"{}\Programs\WorkBuddyAI\WorkBuddy AI.exe", local),
+            format!(r"{}\Programs\WorkBuddy\WorkBuddyAI.exe", local),
+        ]
+    } else {
+        vec![format!(r"{}\Programs\WorkBuddy\WorkBuddy.exe", local)]
+    };
+    // Program Files 系统级安装兜底
+    for pf in ["ProgramFiles", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(|k| std::env::var(k).ok())
+    {
+        if global_region {
+            cands.push(format!(r"{}\WorkBuddyAI\WorkBuddyAI.exe", pf));
+        } else {
+            cands.push(format!(r"{}\WorkBuddy\WorkBuddy.exe", pf));
+        }
+    }
+    cands.into_iter().find(|p| std::path::Path::new(p).is_file())
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct WbCreds {
@@ -71,10 +208,13 @@ pub fn wb_agent() -> ureq::Agent {
 pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
     let base = c.chat_base();
     let referer = format!("{}{}", base, WB_CHAT_PATH);
+    // UA/X-IDE-Version 动态解析（issue #123）：优先本机客户端真实版本，
+    // 解析失败回落常量（WB_UA/WB_CLI_VERSION）
+    let fp = wb_client_fingerprint(c.global_region);
     let mut h: Vec<(&'static str, String)> = vec![
         ("content-type", "application/json".into()),
         ("accept", "text/event-stream".into()),
-        ("user-agent", WB_UA.into()),
+        ("user-agent", fp.ua.clone()),
         // 铁律 1：Origin/Referer 必带
         ("origin", base.into()),
         ("referer", referer),
@@ -98,7 +238,7 @@ pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
         // 个人中心「请求明细」按这些头识别客户端，缺失时客户端列显示 "-"
         ("X-IDE-Type", "CLI".into()),
         ("X-IDE-Name", "CLI".into()),
-        ("X-IDE-Version", WB_CLI_VERSION.into()),
+        ("X-IDE-Version", fp.version.clone()),
         ("X-Request-ID", uuid::Uuid::new_v4().simple().to_string()),
     ];
     // 设备/会话指纹（issue #48）：账号级稳定派生（同账号恒定、跨账号隔离）；
@@ -119,14 +259,49 @@ pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
     h
 }
 
+/// 会话头三件套（dsh-xdpool#58 实证 2026-10-19：国际版网关硬校验，缺任一即
+/// 400 11128 "request illegal"；值不校验仅查存在性，官方客户端每个 chat 请求
+/// 都带）。X-Conversation-ID 取调用方传入的 conv_id——make_wb_request 收到
+/// 的与 prepare 注入请求体的是同一份（调用方作用域现成有，免得此处再全量
+/// 反序列化一遍 body），同会话稳定，上游前缀缓存不被打散；空串兜底随机
+/// uuid。另两个头每请求随机。仅 chat 路径附带——生图/目录（wb_images/
+/// wb_catalog 复用 build_chat_headers）非 chat 网关不校验，不扩散。
+fn conversation_headers(conv_id: &str) -> Vec<(&'static str, String)> {
+    let cid = if conv_id.is_empty() {
+        uuid::Uuid::new_v4().simple().to_string()
+    } else {
+        conv_id.to_string()
+    };
+    vec![
+        ("X-Conversation-ID", cid),
+        (
+            "X-Conversation-Request-ID",
+            uuid::Uuid::new_v4().simple().to_string(),
+        ),
+        (
+            "X-Conversation-Message-ID",
+            uuid::Uuid::new_v4().simple().to_string(),
+        ),
+    ]
+}
+
 /// 上游请求错误：(HTTP 状态 | 502 传输错误, body 摘要, Retry-After 秒)
 pub type UpstreamErr = (u16, String, Option<u64>);
 
-/// 发起 WB 对话请求，返回 SSE 流 reader
-pub fn make_wb_request(c: &WbCreds, body: &[u8]) -> Result<Box<dyn Read + Send>, UpstreamErr> {
+/// 发起 WB 对话请求，返回 SSE 流 reader。conv_id 为调用方 prepare 时注入
+/// 请求体的同一份会话 id
+pub fn make_wb_request(
+    c: &WbCreds,
+    conv_id: &str,
+    body: &[u8],
+) -> Result<Box<dyn Read + Send>, UpstreamErr> {
     let url = format!("{}{}", c.chat_base(), WB_CHAT_PATH);
     let mut req = wb_agent().post(&url);
     for (k, v) in build_chat_headers(c) {
+        req = req.set(k, &v);
+    }
+    // dsh-xdpool#58：X-Conversation 三头缺一即 11128（国际版硬校验）
+    for (k, v) in conversation_headers(conv_id) {
         req = req.set(k, &v);
     }
     match req.send_bytes(body) {
@@ -864,12 +1039,14 @@ mod tests {
         assert_eq!(get("X-Enterprise-Id").as_deref(), Some("e1"));
         assert_eq!(get("X-Domain").as_deref(), Some("d1"));
         assert_eq!(get("X-Product").as_deref(), Some("SaaS"));
-        // UA 伪装
-        assert_eq!(get("user-agent").as_deref(), Some(WB_UA));
+        // UA 指纹（issue #123）：与动态解析器输出自洽（解析成功 = 真实客户端
+        // 版本；解析失败 = 回落常量），不再断言硬编码 WB_UA
+        let fp = wb_client_fingerprint(false);
+        assert_eq!(get("user-agent").as_deref(), Some(fp.ua.as_str()));
         // CLI 身份指纹（issue #48）：与 UA 版本一致
         assert_eq!(get("X-IDE-Type").as_deref(), Some("CLI"));
         assert_eq!(get("X-IDE-Name").as_deref(), Some("CLI"));
-        assert_eq!(get("X-IDE-Version").as_deref(), Some(WB_CLI_VERSION));
+        assert_eq!(get("X-IDE-Version").as_deref(), Some(fp.version.as_str()));
         // 设备/会话指纹：32 位 hex、machine ≠ session
         let mid = get("X-Machine-ID").expect("X-Machine-ID 必须存在");
         let sid = get("X-Session-ID").expect("X-Session-ID 必须存在");
@@ -888,6 +1065,44 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_ua_template_invariants() {
+        // 模板格式不变量（独立字面量断言，防 Intl/CN 模板拼错，issue #123）
+        assert_eq!(ua_template(false, "5.8.4"), "CLI/5.8.4 CodeBuddy/5.8.4");
+        assert_eq!(ua_template(true, "5.8.4"), "WorkBuddy/5.8.4 WorkBuddy AI/5.8.4");
+        // 回落常量必须 = CN 模板 + 编译期版本（模板与常量不同步即爆）
+        assert_eq!(ua_template(false, WB_CLI_VERSION), WB_UA);
+        // 任意版本：ua 必含版本串（X-IDE-Version 与 UA 一致性的前提）
+        for v in ["2.63.2", "5.8.4", "9.9.9"] {
+            for g in [false, true] {
+                assert!(ua_template(g, v).contains(v));
+            }
+        }
+    }
+
+    #[test]
+    fn fingerprint_wiring_consistent() {
+        // 接线不变量：build_chat_headers 的 UA 必须来自动态解析链且区域模板
+        // 正确（复刻解析链推断期望分支，防接线回归；模板格式由上一测试锁定）
+        let get_ua = |h: &[(&'static str, String)]| {
+            h.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v.clone()).unwrap()
+        };
+        for g in [false, true] {
+            let expect = match locate_client_exe(g)
+                .and_then(|exe| crate::commands::env::version_of(&exe))
+            {
+                Some(v) if !v.is_empty() => ua_template(g, &v),
+                _ => WB_UA.to_string(),
+            };
+            let h = build_chat_headers(&creds(g, "u", "", ""));
+            assert_eq!(get_ua(&h), expect, "区域 {} UA 接线不一致", g);
+            let fp = wb_client_fingerprint(g);
+            assert_eq!(fp.ua, expect);
+            // 版本一致性：UA 内嵌版本 == X-IDE-Version 来源（两分支均成立）
+            assert!(expect.contains(&fp.version));
+        }
+    }
+
+    #[test]
     fn request_id_varies_per_call() {
         // X-Request-ID 每次请求随机（uuid4 hex，32 位）
         let c = creds(false, "u", "", "");
@@ -902,6 +1117,31 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn conversation_headers_stable_per_conversation() {
+        // dsh-xdpool#58：调用方 conv_id 稳定透传（同会话上游前缀缓存不打散）；
+        // 另两个头每请求随机；空串兜底随机 uuid（32 位小写 hex，与 X-Request-ID 同款）
+        let a = conversation_headers("conv-1");
+        let b = conversation_headers("conv-1");
+        let get = |h: &[(&'static str, String)], k: &str| {
+            h.iter().find(|(n, _)| *n == k).unwrap().1.clone()
+        };
+        assert_eq!(get(&a, "X-Conversation-ID"), "conv-1");
+        assert_eq!(get(&b, "X-Conversation-ID"), "conv-1");
+        assert_ne!(
+            get(&a, "X-Conversation-Request-ID"),
+            get(&b, "X-Conversation-Request-ID")
+        );
+        assert_ne!(
+            get(&a, "X-Conversation-Message-ID"),
+            get(&b, "X-Conversation-Message-ID")
+        );
+        let fb = conversation_headers("");
+        let id = get(&fb, "X-Conversation-ID");
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

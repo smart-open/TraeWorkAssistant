@@ -483,7 +483,9 @@ fn run_task(
     match key {
         // Trae 每日签到：与 `--task-run checkin` 同款（vault 全账号单轮，状态核验幂等）。
         // 审查 P2：存在可重试失败时返 Err，交调度器 30 分钟冷却重试（对齐 qoder-checkin）；
-        // 永久性失败（未配置 jwt，重试注定成功无望）从重试判定剔除——否则全天 ~28 轮无效重试
+        // 永久/当日不可恢复失败从重试判定剔除——否则全天 ~28 轮无效重试 + 当日首败误报
+        //（口径对齐 UI 重试筛选：未配置 jwt（历史口径 message 匹配）+ SessionDead=401 吊销 /
+        //  AuthRejected=服务端拒绝认证（issue #128）/ DeviceSigned=设备当日去重）
         "trae-checkin" => {
             let accounts = crate::vault::load_accounts(st);
             let retry = st.settings().retry.max(0) as u32;
@@ -494,8 +496,16 @@ fn run_task(
             let failed_permanent = events
                 .iter()
                 .filter(|e| {
-                    e.get("status").and_then(Value::as_str) == Some("fail")
-                        && e.get("message").and_then(Value::as_str) == Some("未配置 jwt")
+                    if e.get("status").and_then(Value::as_str) != Some("fail") {
+                        return false;
+                    }
+                    if e.get("message").and_then(Value::as_str) == Some("未配置 jwt") {
+                        return true;
+                    }
+                    matches!(
+                        e.get("error_type").and_then(Value::as_str),
+                        Some("SessionDead") | Some("AuthRejected") | Some("DeviceSigned")
+                    )
                 })
                 .count() as i64;
             let retryable = (failed - failed_permanent).max(0);

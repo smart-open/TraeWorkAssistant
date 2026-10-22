@@ -1160,6 +1160,25 @@ export interface SanitizeMapView {
   builtin?: boolean;
 }
 
+// 清洗规则档位（issue #129：§4.3 分区清洗）：'wb' = wb 池与 Trae 池共用键；
+// 'buddy-ai' = 国际档独立键（buddy_ai_template_map）
+export type SanitizeTier = 'wb' | 'buddy-ai';
+
+// 网关命中（11128 拦截 / 空完成影子风控）落下的指纹样本（内存环形缓冲，最新在前；
+// 重启即清空）。sample 为 fingerprint_sample 输出：system="<首条 system 前 300 字符>" tools=[…]
+export interface FingerprintSample {
+  /** "11128" = 清洗已启用仍被拦；"empty" = 空完成影子风控 */
+  kind: string;
+  /** 来源池：buddy-ai / buddy / trae / qoder */
+  pool: string;
+  /** 采集时间（unix 秒） */
+  ts: number;
+  /** fingerprint_sample 输出（空白压缩 + 300 字符截断 + 引号转替的加工文本，非逐字原文；from 预填后需对照客户端实际 system 校对） */
+  sample: string;
+  /** 模板命中注记（已有规则命中时非空） */
+  note: string;
+}
+
 // 下载完成后的安装包信息（update_download 返回，供「确认安装」使用）
 export interface UpdateDownloaded {
   file_path: string;

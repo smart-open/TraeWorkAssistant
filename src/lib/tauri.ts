@@ -12,6 +12,8 @@ import type {
   ApiKeysFileView,
   SanitizeMapView,
   SanitizeRule,
+  SanitizeTier,
+  FingerprintSample,
   AppLocate,
   CheckinDone,
   CheckinOpts,
@@ -224,6 +226,9 @@ export const api = {
       invoke<number>('cooldown_clear_all'),
     refreshJwt: (userId: string, force = false) =>
       invoke<string>('refresh_jwt', { userId, force }),
+    // issue #126：续期前置判活——JWT 服务端仍存活时 Err(出路指引)，判死/fail-open 时 Ok
+    renewPreflight: (userId: string) =>
+      invoke<void>('renew_jwt_preflight', { userId }),
     exportRaw: () => invoke<Record<string, unknown>>('accounts_export_raw'),
     importAccounts: (content: string, only?: number[]) =>
       invoke<ImportReport>('accounts_import', { content, only }),
@@ -1055,13 +1060,20 @@ export const api = {
     keysSave: (keys: ApiKeyEntry[], authDisabled?: boolean) =>
       invoke('api_keys_save', { keys, authDisabled: authDisabled ?? null }),
     // ---- 指纹清洗规则表（wb_template_map KV）----
-    // builtin=true = 当前生效内置默认规则（尚未自定义）；保存后成为独立自定义副本
-    templateMapGet: () => invoke<SanitizeMapView>('wb_template_map_get'),
+    // builtin=true = 当前生效内置默认规则（尚未自定义）；保存后成为独立自定义副本。
+    // issue #129：档位分区——'wb'（wb 池 + Trae 池共用键）| 'buddy-ai'（国际档独立键）
+    templateMapGet: (tier?: SanitizeTier) =>
+      invoke<SanitizeMapView>('wb_template_map_get', { tier: tier ?? null }),
     // 整体替换保存；load_templates 每请求读取，保存即对下一请求生效，无需重启网关
-    templateMapSet: (templates: SanitizeRule[]) =>
+    templateMapSet: (templates: SanitizeRule[], tier?: SanitizeTier) =>
       invoke<void>('wb_template_map_set', {
+        tier: tier ?? null,
         map: { templates, updated_at: Math.floor(Date.now() / 1000) },
       }),
+    // ---- 指纹样本（issue #125 增强：一键从样本生成规则）----
+    // 网关命中（11128/空完成影子风控）落下的样本环形缓冲（最新在前，重启即清空）
+    fingerprintSamplesGet: () => invoke<FingerprintSample[]>('fingerprint_samples_get'),
+    fingerprintSamplesClear: () => invoke<void>('fingerprint_samples_clear'),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),

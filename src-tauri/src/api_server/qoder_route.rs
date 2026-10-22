@@ -805,17 +805,15 @@ fn run_qoder_stream(
                         "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "", Some(&exhaust_msg),
                     );
+                    // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲
+                    // （kind=empty），返回日志注记供反查漏网触发句
+                    let sample_note =
+                        super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool=qoder{}",
+                        "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool=qoder{sample_note}",
                         tried.len(),
                         attempts,
                         empty_hits,
-                        // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本（三池同口径）
-                        if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
-                            format!(" 指纹样本: {}", super::wb_payload::fingerprint_sample(body_vec))
-                        } else {
-                            String::new()
-                        }
                     ));
                     // 审查 P1-1：无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
                     // 各自形态，helper 内已含收尾帧），不再硬编码 OpenAI 格式。
@@ -1454,15 +1452,17 @@ pub async fn qoder_aggregate_chat(
                         let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
                             "qoder", empty_hits, attempts, healthy_total,
                         );
-                        // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无收尾
-                        // [DEBUG] 行，就地补齐；三池同口径）
-                        if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
+                        // issue #99 ① + #125 增强：影子风控收尾采样入内存环形缓冲
+                        // （kind=empty，非流式路径无收尾 [DEBUG] 行，就地补齐；三池同口径）
+                        let sample_note = super::wb_payload::empty_sample_note(
+                            &exhaust_tag, "qoder", &body_vec,
+                        );
+                        if !sample_note.is_empty() {
                             state.logger.log_debug_line(format!(
-                                "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool=qoder 指纹样本: {}",
+                                "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} pool=qoder{sample_note}",
                                 tried.len(),
                                 attempts,
                                 empty_hits,
-                                super::wb_payload::fingerprint_sample(&body_vec),
                             ));
                         }
                         return Err(exhaust_msg);

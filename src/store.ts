@@ -91,6 +91,9 @@ interface AppState {
   proxyLog: string[];
   switchProgress: string[];
   switchingTo: string | null;
+  /** issue #126 续期在途标记：记录发起续期的 uid 与切换前 jwt_exp_hours，
+      switch-done 后对比有效期得出「捕获成功/空手」结论（null=非续期切换） */
+  renewPending: { uid: string; expBefore: number | null } | null;
   saveLoginProgress: string[];
   savingLogin: string | null;
   deviceResetProgress: string[];
@@ -356,6 +359,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   proxyLog: [],
   switchProgress: [],
   switchingTo: null,
+  renewPending: null,
   saveLoginProgress: [],
   savingLogin: null,
   deviceResetProgress: [],
@@ -412,19 +416,54 @@ export const useAppStore = create<AppState>((set, get) => ({
           : e.success
             ? '[完成] 登录态切换成功'
             : `[失败] ${reason ?? '登录态切换未完成，请查看日志'}`;
+        // issue #126：续期流程（renewPending 命中本次切换）以 JWT 有效期对比结论
+        // 替换通用成功 toast——捕获空手时诚实说明原因与出路，不再静默「没效果」；
+        // 失败/身份未确认仍走通用提示
+        const doneUid = get().switchingTo;
+        const renewing = get().renewPending;
+        const isRenewal = !!renewing && renewing.uid === doneUid;
+        const renewalConcluded = isRenewal && e.success && !warnUnconfirmed;
+        if (isRenewal) set({ renewPending: null });
         set((s) => ({
           switchingTo: null,
           switchProgress: [...s.switchProgress.slice(-49), doneLine],
         }));
-        get().pushToast(
-          warnUnconfirmed ? 'warn' : e.success ? 'success' : 'error',
-          warnUnconfirmed
-            ? '已执行切换，但 30 秒内未确认登录身份——请打开客户端核实；若未登录，请重新登录后「保存当前登录态」'
-            : e.success
-              ? '登录态切换完成'
-              : `切换失败：${reason ?? '请查看系统日志'}`,
-        );
-        void get().refreshAccounts();
+        if (renewalConcluded) {
+          void (async () => {
+            await get().refreshAccounts();
+            const after = get().accounts.find((a) => a.user_id === doneUid);
+            const expAfter = after?.jwt_exp_hours ?? null;
+            const before = renewing.expBefore;
+            // 新 JWT 寿命约 13 天（~312h）：剩余有效期较切换前显著增长才算捕获成功
+            const renewed =
+              expAfter != null && (before == null ? expAfter > 24 : expAfter > before + 24);
+            if (renewed) {
+              const line = `[完成] 续期成功：新 JWT 剩余 ${expAfter.toFixed(0)} 小时`;
+              set((s) => ({ switchProgress: [...s.switchProgress.slice(-49), line] }));
+              get().pushToast('success', `续期成功：新 JWT 剩余 ${expAfter.toFixed(0)} 小时`);
+            } else {
+              const guide = after?.has_refresh_token
+                ? '本账号有 refresh_token：请使用「刷新 JWT」按钮直接换发新凭证'
+                : '本账号无 refresh_token：请保持代理开启与 TRAE 运行，JWT 过期后 TRAE 会自动重新登录并自动捕获；或重新 OAuth 登录';
+              const line = `[警告] 未捕获到新 JWT（有效期未变化）。${guide}`;
+              set((s) => ({ switchProgress: [...s.switchProgress.slice(-49), line] }));
+              get().pushToast(
+                'info',
+                `切换完成，但未捕获到新 JWT——TRAE 凭证仍有效时不会重新鉴权。${guide}`,
+              );
+            }
+          })();
+        } else {
+          get().pushToast(
+            warnUnconfirmed ? 'warn' : e.success ? 'success' : 'error',
+            warnUnconfirmed
+              ? '已执行切换，但 30 秒内未确认登录身份——请打开客户端核实；若未登录，请重新登录后「保存当前登录态」'
+              : e.success
+                ? '登录态切换完成'
+                : `切换失败：${reason ?? '请查看系统日志'}`,
+          );
+          void get().refreshAccounts();
+        }
         void get().refreshProxy();
         // 登录中徽标（localEntitlement）刷新：切换完成后本机登录 uid 已变，
         // 立即刷新一次；客户端启动写入本机使用证据需数秒，延迟再刷一次兜底
@@ -652,6 +691,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       const deadCount = get().checkin.results.filter(
         (r) => r?.status === 'fail' && r.error_type === 'SessionDead',
       ).length;
+      // 服务端拒绝认证类失败的精确提示（issue #128）：凭证级认证拒绝与版本升级无关，
+      // 自动重试无法恢复，给出临时方案引导
+      const authRejectedCount = get().checkin.results.filter(
+        (r) => r?.status === 'fail' && r.error_type === 'AuthRejected',
+      ).length;
       // 签到完成后静默刷新剩余积分（内部会再次 refreshAccounts）
       void api.accounts.refreshRemainingCredits().then(() => {
         get().refreshAccounts();
@@ -668,6 +712,12 @@ export const useAppStore = create<AppState>((set, get) => ({
         get().pushToast(
           'error',
           `${deadCount} 个账号 JWT 已被服务端吊销（该账号在别处重新登录/IDE 内退出过登录）：请在 TRAE 中重新登录该账号并「保存当前登录态」，再点「续期 JWT」重新捕获`,
+        );
+      }
+      if (authRejectedCount > 0) {
+        get().pushToast(
+          'error',
+          `${authRejectedCount} 个账号凭证被 Trae 服务端拒绝认证（服务端认证失败，与版本升级无关，自动重试无法恢复）：请在账号管理对该账号重新执行一次 OAuth 登录即可恢复签到`,
         );
       }
     }
@@ -1059,7 +1109,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   clearSwitchLocks: () => {
-    set({ switchingTo: null, savingLogin: null });
+    set({ switchingTo: null, savingLogin: null, renewPending: null });
   },
   saveCurrentLogin: async (userId, targetApp) => {
     try {
@@ -1083,6 +1133,35 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   renewJwt: async (userId) => {
     try {
+      // 先占住 busy：preflight 探测最长 15s，期间按钮必须禁用，防止并发发起
+      // 第二次切换/续期（对齐 switchTo「先 set busy 再 await」口径，防双击竞态）
+      set({
+        switchingTo: userId,
+        switchProgress: ['[探测] 正在核验 JWT 服务端状态…'],
+      });
+      // 审查修复：先刷新账号列表取权威 expBefore——陈旧快照里 jwt_exp_hours=null 而
+      // JWT 已被服务端吊销时，before==null 会让续期结论误报「续期成功」（expAfter>24
+      // 即判成功，见 switch-done 分支）。refreshAccounts 失败自吞（内部 toast）不抛出，
+      // 此处退化为沿用陈旧值，不劣于原行为；必须放在 set busy 之后，避免撕开防双击窗口
+      await get().refreshAccounts();
+      const acct = get().accounts.find((a) => a.user_id === userId);
+      const expBefore = acct?.jwt_exp_hours ?? null;
+      set({ renewPending: { uid: userId, expBefore } });
+      // issue #126 前置判活：JWT 服务端仍存活时 TRAE 不会重新鉴权，切换+捕获必然空手——
+      // 先探活，存活则直接给出路指引并中止，省一轮 30-90s 白切换。
+      // 本地已过期/未知（expBefore<=0/null）不探测：判死放行，捕获链路正是恢复手段
+      if (expBefore != null && expBefore > 0) {
+        try {
+          await api.accounts.renewPreflight(userId);
+        } catch (guide) {
+          set({ switchingTo: null, renewPending: null });
+          get().pushToast('warn', String(guide));
+          return;
+        }
+      }
+      set((s) => ({
+        switchProgress: [...s.switchProgress.slice(-49), '[探测] 通过，开始切换捕获'],
+      }));
       // 若代理未运行则先启动
       if (!get().proxy.running) {
         get().pushToast('info', '正在启动代理以续期 JWT…');
@@ -1096,12 +1175,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 切换到目标账号，TRAE 重启后走代理，新 JWT 会被自动捕获
       // skipJwtProbe=true：续期场景目标账号 JWT 本就可能已被服务端吊销，跳过切换前预检
       // issue #44 遗留项：纳入切换状态机——进度面板与 90s 看门狗均依赖 switchingTo
-      // 非空；终态由 switch-done 事件统一复位（含失败 toast）
-      set({ switchingTo: userId, switchProgress: [] });
+      // 非空；终态由 switch-done 事件统一复位（含失败 toast）。busy 已在探测前置位，
+      // 此处仅续写进度流（switchProgress 不可重置，会抹掉探测行）
       get().pushToast('info', '正在切换账号以捕获新 JWT，请稍候…');
       await api.switchAccount(userId, undefined, true, proxyPort);
     } catch (err) {
-      set({ switchingTo: null });
+      set({ switchingTo: null, renewPending: null });
       get().pushToast('error', `续期失败：${String(err)}`);
     }
   },

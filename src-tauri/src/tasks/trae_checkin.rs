@@ -44,7 +44,8 @@ const CLAIM_REWARD_KEYS: [&str; 10] = [
 
 /// 单轮结果（供命令层重试编排消费）：per-uid 最终状态与失败类型。
 /// statuses: uid -> success/already/fail；error_types: 仅失败且分类非 Unknown 时登记
-///（SessionDead=JWT 被吊销为永久失效，重试轮据此排除）。
+///（SessionDead=JWT 被吊销为永久失效，AuthRejected=服务端拒绝认证（#128）同为永久，
+/// DeviceSigned=设备当日去重次日解除，重试轮据此排除）。
 #[derive(Default)]
 pub struct RoundOutcome {
     pub statuses: HashMap<String, &'static str>,
@@ -183,11 +184,32 @@ pub fn humanize_device_signed(message: &str) -> String {
     )
 }
 
+/// 「服务端拒绝认证」特征词判定（纯函数供单测，issue #128）：HTTP 200 + 业务码
+/// （如 4014）拒绝的凭证级认证失败，服务端按凭证状态拒绝而非 401 吊销——重试无法
+/// 恢复，需重走 OAuth。特征词取服务端完整短语（小写比对），过宽会误伤其他业务
+/// 错误触发重新登录引导（对齐 #76 特征词窄口径教训）
+fn is_auth_rejected_error(message: &str) -> bool {
+    message.to_lowercase().contains("not able to authenticate you")
+}
+
+/// 识别「服务端拒绝认证」类错误并追加 Tip（issue #128）：命中特征词时在原文后
+/// 追加错误详情说明与用户临时解决方案，否则原样透传。
+/// Tip 随 message 流入事件/摘要/日志/前端，重试轮与调度器据此 error_type=AuthRejected 排除。
+pub fn humanize_auth_rejected(message: &str) -> String {
+    if !is_auth_rejected_error(message) {
+        return message.to_string();
+    }
+    format!(
+        "{message} —— Tip: 该账号登录凭证被 Trae 服务端拒绝认证（服务端侧认证失败，与工具版本升级无关，自动重试无法恢复）。临时方案：在账号管理对该账号重新执行一次 OAuth 登录，新凭证生效后签到即恢复"
+    )
+}
+
 /// 签到/状态错误文案统一转译入口：设备绑定上限（issue #76）+ 设备当日已签（issue #110）
-/// append-only 契约：两级转译仅在原文后追加引导、不改写原文——run_round 对转译后
+/// + 服务端拒绝认证（issue #128）。
+/// append-only 契约：各级转译仅在原文后追加引导、不改写原文——run_round 对转译后
 /// 消息再做 is_device_signed_error 特征词判定依赖此前提，改写式实现会丢特征词
 pub fn humanize_checkin_error(message: &str) -> String {
-    humanize_device_signed(&humanize_device_limit(message))
+    humanize_auth_rejected(&humanize_device_signed(&humanize_device_limit(message)))
 }
 
 /// 「设备当日已签」冷却终点：明日 00:05（服务端按自然日去重，跨零点即解除；
@@ -707,6 +729,12 @@ pub fn run_round(
         } else {
             // 签到失败 → 分类错误并写入冷却（Unknown 不落盘不外发）
             let (mut error_type, mut cooldown_secs) = classify_error(http_status, code);
+            // 「服务端拒绝认证」（issue #128）：HTTP 200 + 业务码拒绝的凭证级失效，
+            // 重试与短冷却均无法自愈——单列永久类型供重试轮排除（对齐 SessionDead 口径）
+            if is_auth_rejected_error(&msg) {
+                error_type = "AuthRejected";
+                cooldown_secs = -1;
+            }
             // 「设备当日已签」（issue #110）：当日去重不因重试解除，单列类型供重试轮
             // 排除（对齐 SessionDead 口径）；冷却拨到明日 00:05，避免固定时长跨日误挡次日签到
             if is_device_signed_error(&msg) {
@@ -903,6 +931,55 @@ mod tests {
         assert!(signed.contains("每日仅计一次签到"));
         // 两者都不命中 → 原样透传
         assert_eq!(humanize_checkin_error("HTTP 502"), "HTTP 502");
+    }
+
+    /// issue #128：服务端拒绝认证错误转译——命中特征词追加 Tip（原因+临时方案），
+    /// 其余原样透传
+    #[test]
+    fn humanize_auth_rejected_命中特征词追加引导() {
+        let server_msg = "We're sorry, but we are not able to authenticate you. If you continue to experience issues, please contact our support team for assistance.";
+        let out = humanize_auth_rejected(server_msg);
+        // 原文前置保留（服务端原文可见性优先），Tip 后置
+        assert!(out.starts_with(server_msg));
+        assert!(out.contains("Tip:"));
+        assert!(out.contains("OAuth 登录"));
+        // 大小写不敏感（上游改大小写兜底）
+        assert_ne!(
+            humanize_auth_rejected("We are NOT ABLE TO AUTHENTICATE YOU now"),
+            "We are NOT ABLE TO AUTHENTICATE YOU now"
+        );
+        // 未命中 → 原样透传（authenticate 单独出现不命中，窄口径防误引导）
+        assert_eq!(
+            humanize_auth_rejected("failed to authenticate, please retry"),
+            "failed to authenticate, please retry"
+        );
+        assert_eq!(humanize_auth_rejected(""), "");
+    }
+
+    #[test]
+    fn humanize_checkin_error_认证拒绝命中并保留原有两级() {
+        // #128 命中 Tip
+        let auth = humanize_checkin_error("We're sorry, but we are not able to authenticate you.");
+        assert!(auth.contains("Tip:"));
+        assert!(auth.contains("OAuth 登录"));
+        // 原有 #76/#110 两级不回归
+        let limit = humanize_checkin_error("该设备绑定的账户数量已达上限。");
+        assert!(limit.contains("设备绑定数已达服务端上限"));
+        let signed = humanize_checkin_error("当前设备今日已经签到，请明日再来哦~");
+        assert!(signed.contains("每日仅计一次签到"));
+        assert_eq!(humanize_checkin_error("HTTP 502"), "HTTP 502");
+    }
+
+    /// issue #128：is_auth_rejected_error 判定边界——命中短语完整出现（大小写不敏感），
+    /// 其余透传
+    #[test]
+    fn is_auth_rejected_error_特征词窄口径() {
+        assert!(is_auth_rejected_error(
+            "We're sorry, but we are not able to authenticate you."
+        ));
+        assert!(!is_auth_rejected_error("authenticate failed"));
+        assert!(!is_auth_rejected_error("not able to authenticate")); // 短语不完整
+        assert!(!is_auth_rejected_error(""));
     }
 
     #[test]
