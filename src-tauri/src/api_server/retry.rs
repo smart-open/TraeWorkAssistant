@@ -30,22 +30,32 @@ pub fn is_thinking_signature_error(body: &str) -> bool {
 pub fn is_illegal_channel_error(body: &str) -> bool {
     body.contains("Illegal API invocation")
         || body.contains("unapproved channel")
-        || contains_code_11128(body)
+        || contains_code_value(body, "11128")
 }
 
-/// `"code": 11128` 宽松匹配：容忍键/冒号/值之间的序列化空白差异
+/// 11140 账号级风控识别（issue #136 反馈）：上游判定「账号存在异常行为，
+/// 已被限制使用」，账号整体被限制、需申诉恢复。与 11128 渠道级（按请求
+/// 指纹、与账号无关、换号无意义）相反——11140 换号有意义，受限账号由
+/// classify → Forbidden 禁用（申诉成功后 UI 手动启用恢复）。
+/// 中文关键词 + code 数字边界匹配（报文可能只带关键词或只带 code）
+pub fn is_account_restricted_error(body: &str) -> bool {
+    body.contains("账号存在异常")
+        || body.contains("已被限制使用")
+        || contains_code_value(body, "11140")
+}
+
+/// `"code": <code>` 宽松匹配：容忍键/冒号/值之间的序列化空白差异
 /// （Go encoding/json 紧凑无空格，但报文可能经中间层重序列化）；
 /// 值须带数字边界（`111280`/`111289` 不误撞），键名引号边界天然排除
 /// `some_code` 等字段名
-fn contains_code_11128(body: &str) -> bool {
+fn contains_code_value(body: &str, code: &str) -> bool {
     const KEY: &str = "\"code\"";
-    const CODE: &str = "11128";
     let mut rest = body;
     while let Some(pos) = rest.find(KEY) {
         let after_key = rest[pos + KEY.len()..].trim_start();
         if let Some(after_colon) = after_key.strip_prefix(':') {
             let after_colon = after_colon.trim_start();
-            if let Some(tail) = after_colon.strip_prefix(CODE) {
+            if let Some(tail) = after_colon.strip_prefix(code) {
                 if !tail.starts_with(|c: char| c.is_ascii_digit()) {
                     return true;
                 }
@@ -72,6 +82,12 @@ pub fn retry_plan(status: u16, body: &str, attempt: u32, retry_after: Option<u64
     // 400 + 积分耗尽（issue #67）：请求本身合法、账号积分已尽 → 换号。
     // 默认 400 → Fatal 会把积分耗尽直接透传终止，池内其余账号积压不用
     if status == 400 && super::is_credit_exhausted_error(body) {
+        return RetryAction::SwitchKey;
+    }
+    // 400 + 11140 账号级风控（issue #136 反馈）：账号被上游限制使用，与 11128
+    // 渠道级相反——换号有意义（受限账号由 classify → Forbidden 禁用），
+    // Fatal 会把请求卡死在受限账号上每问必败
+    if status == 400 && is_account_restricted_error(body) {
         return RetryAction::SwitchKey;
     }
     match status {
@@ -228,5 +244,33 @@ mod tests {
         // 关键词兜底仍有效
         assert!(is_illegal_channel_error("Illegal API invocation from channel"));
         assert!(!is_illegal_channel_error("normal upstream error"));
+    }
+
+    #[test]
+    fn account_restricted_error_and_retry_plan() {
+        // 11140 账号级风控识别（issue #136 反馈）：code 形态 + 关键词形态
+        assert!(is_account_restricted_error(
+            r#"{"error":{"code":11140,"msg":"账号存在异常行为，已被限制使用"}}"#
+        ));
+        assert!(is_account_restricted_error(
+            "系统检测到该账号存在异常使用行为，如需申诉请提交反馈 11140"
+        ));
+        assert!(is_account_restricted_error("账号已被限制使用"));
+        // 数字边界：更长/相邻数字不误撞
+        assert!(!is_account_restricted_error(r#"{"code":111400}"#));
+        assert!(!is_account_restricted_error(r#"{"code":11141}"#));
+        assert!(!is_account_restricted_error("insufficient credit"));
+        // 400 + 11140 → SwitchKey（换号接替），不得 Fatal 卡死在受限账号
+        assert_eq!(
+            retry_plan(400, r#"{"code":11140,"msg":"账号存在异常行为，已被限制使用"}"#, 0, None),
+            RetryAction::SwitchKey
+        );
+        // 与 11128 渠道级互不误撞
+        assert!(!is_illegal_channel_error(
+            r#"{"code":11140,"msg":"账号存在异常行为"}"#
+        ));
+        assert!(!is_account_restricted_error(
+            r#"{"code":11128,"msg":"request illegal"}"#
+        ));
     }
 }

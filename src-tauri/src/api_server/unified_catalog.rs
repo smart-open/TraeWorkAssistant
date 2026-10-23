@@ -917,10 +917,17 @@ pub fn unified_models_ex(
                 })
             })
             .or_else(|| u.sources.first().map(|s| s.pool));
-        // rate = 命中侧倍率；未声明退可用源 → 首源 → 保持原值
+        // rate = 命中侧倍率；未声明退可用源（A2：同 POOL_FIXED_ORDER 口径）→ 首源 → 保持原值
         u.rate = hit
             .and_then(|hp| u.sources.iter().find(|s| s.pool == hp).and_then(|s| s.rate))
-            .or_else(|| u.sources.iter().find(|s| s.enabled).and_then(|s| s.rate))
+            .or_else(|| {
+                super::dispatch::POOL_FIXED_ORDER.iter().find_map(|p| {
+                    u.sources
+                        .iter()
+                        .find(|s| s.pool == p.as_str() && s.enabled)
+                        .and_then(|s| s.rate)
+                })
+            })
             .or_else(|| u.sources.first().and_then(|s| s.rate))
             .or(u.rate);
         // context_length 跟随命中侧（issue #38-4）：命中 buddy → WB 目录值；

@@ -419,6 +419,9 @@ pub(crate) fn exhaust_message(pool: &str, empty_hits: usize, rotated: usize, hea
 /// NoHealthy 详情（issue #29 修复2）：错误消息携带 Key 约束细节（绑定池/白名单
 /// 条数/专一账号）与池内健康计数，帮助用户自查 Key 配置（匿名/未知 Key 仅报
 /// 池健康数）；healthy_in_scope 为约束作用域内健康账号数，0 即「约束排除致败」。
+/// issue #136 hint 按根因分流：allowed=Some(空集)（约束条目全指向其他池，本池被
+/// 整体排除，调度优先级对该 Key 形同虚设）与 allowed=Some(非空) 但作用域内账号
+/// 均不可用，两种根因用户动作不同，混用同一文案会误导排障方向。
 /// pub(crate)：dispatch 测试模块经 Fixture 直测（与 trae_pool_constraints 同模式）
 pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_str: &str) -> String {
     let pool_ref = match pool {
@@ -450,12 +453,46 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
                 Some(s) => s.len().to_string(),
             };
             let ded = c.dedicated.as_deref().unwrap_or("-");
-            // issue #130：池内尚有健康账号但约束作用域内为 0（healthy_in_scope=0）
-            // → 追加显式指引，避免用户误判为账号池整体耗尽而无效换号排查
+            // issue #136：hint 按根因分流——
+            // A) allowed=Some(空集)：约束条目全指向其他池（或专一锁他池），本池被整体
+            //    排除；列出约束实际涉及的池，提示「模型由本池提供但白名单未覆盖」
+            // B) allowed=Some(非空) 且作用域内 0 健康：白名单指向的本池账号均不可用
             let hint = if healthy_scope == 0 && healthy_total > 0 {
-                format!(
-                    " hint=约束排除了池内全部健康账号（池内尚有 {healthy_total} 个）：请编辑该 Key 的账号白名单/专一账号后重试"
-                )
+                if matches!(&c.allowed, Some(s) if s.is_empty()) {
+                    // 约束条目涉及的池集合（裸 uid 防御性归属 buddy，与 pool_constraints 同口径）
+                    let mut pools: Vec<&'static str> = Vec::new();
+                    for u in &rk.allowed_accounts {
+                        let (p, _) = super::api_keys::split_pool_tagged(u);
+                        let p = p.unwrap_or("buddy");
+                        if !pools.contains(&p) {
+                            pools.push(p);
+                        }
+                    }
+                    if rk.schedule_mode == super::api_keys::MODE_DEDICATED {
+                        let (p, _) = super::api_keys::split_pool_tagged(&rk.dedicated_account);
+                        if let Some(p) = p {
+                            if !pools.contains(&p) {
+                                pools.push(p);
+                            }
+                        }
+                    }
+                    if pools.is_empty() {
+                        format!(
+                            " hint=该 Key 的账号约束未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号后重试",
+                            pool = pool.as_str(),
+                        )
+                    } else {
+                        format!(
+                            " hint=该 Key 的账号约束均指向其他资源池（{pools}），未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号纳入 {pool} 池，或检查约束目标池的账号健康度后重试",
+                            pools = pools.join("/"),
+                            pool = pool.as_str(),
+                        )
+                    }
+                } else {
+                    format!(
+                        " hint=约束排除了池内全部健康账号（池内尚有 {healthy_total} 个）：白名单/专一指向的本池账号均不可用，请检查这些账号状态或编辑该 Key 的账号白名单/专一账号后重试"
+                    )
+                }
             } else {
                 String::new()
             };

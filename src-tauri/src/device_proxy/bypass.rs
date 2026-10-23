@@ -57,7 +57,7 @@ pub fn cleanup_residual_bypass(data_dir: &Path) {
         crate::fs_utils::app_log(data_dir, "清理 OAuth 豁免残留：读取 ProxyEnable 失败，保留标记待下次启动重试");
         return;
     };
-    if enable.as_deref() == Some("0x1") {
+    if win::proxy_enabled(enable.as_deref()) {
         let Ok(override_val) = win::reg_query_value(key, "ProxyOverride") else {
             crate::fs_utils::app_log(data_dir, "清理 OAuth 豁免残留：读取 ProxyOverride 失败，保留标记待重试（不以空表覆盖写）");
             return;
@@ -181,12 +181,7 @@ pub fn enable_oauth_bypass(data_dir: &Path) -> Result<bool, String> {
     };
     // ProxyEnable/ProxyServer 读失败保守按「不匹配」处理（Ok(false) 不改写）：
     // 无法确认系统代理指向本软件时绝不触碰用户配置
-    if win::reg_query_value(key, "ProxyEnable")
-        .ok()
-        .flatten()
-        .as_deref()
-        != Some("0x1")
-    {
+    if !win::proxy_enabled(win::reg_query_value(key, "ProxyEnable").ok().flatten().as_deref()) {
         return Ok(false);
     }
     // 仅当系统代理确实指向本软件 MITM 端口时才改写（用户自己的代理不碰）
@@ -250,7 +245,7 @@ pub fn disable_oauth_bypass(data_dir: &Path) -> Result<(), String> {
     match enable {
         // ProxyEnable 值缺失 = 系统代理从未开启，豁免天然失效，清账
         None => {}
-        Some(v) if v.as_str() == "0x1" => {
+        Some(v) if win::proxy_enabled(Some(v.as_str())) => {
             let Ok(override_val) = win::reg_query_value(key, "ProxyOverride") else {
                 return Err("读取 ProxyOverride 失败，保留 OAuth 豁免清单待重试（不以空表覆盖写）".into());
             };
@@ -374,38 +369,51 @@ mod win {
     const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
     pub(super) fn reg_query_value(key: &str, name: &str) -> Result<Option<String>, String> {
-        let out = crate::platform::cmd::sys_command("reg")
-            .args(["query", key, "/v", name])
-            .output()
-            .map_err(|e| format!("reg query 执行失败: {e}"))?;
-        if !out.status.success() {
-            // 退出码 1 = 值不存在（正常语义），不视为错误
-            if out.status.code() == Some(1) {
-                return Ok(None);
-            }
-            return Err(format!(
-                "reg query 异常退出(code={:?}): {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+        // windows-registry 进程内读取，替代 reg query 子进程（issue #137：开机自启
+        // 后登录早期 spawn 的 reg.exe 撞系统初始化窗口期报 0xc0000142）。
+        // 值不存在按「未设置」处理（Ok(None)）；键打开失败返回 Err，保留调用方
+        // 「读失败保留标记/清单待重试」语义，绝不据此覆盖写或清账
+        use windows_registry::CURRENT_USER;
+        let sub = key
+            .strip_prefix(r"HKCU\")
+            .ok_or_else(|| format!("注册表键非 HKCU: {key}"))?;
+        let k = CURRENT_USER
+            .open(sub)
+            .map_err(|e| format!("打开注册表键失败({sub}): {e}"))?;
+        if let Ok(s) = k.get_string(name) {
+            return Ok(Some(s));
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        Ok(text
-            .lines()
-            .find(|l| l.trim_start().starts_with(name))
-            .and_then(|l| l.split_whitespace().last().map(|s| s.to_string())))
+        // REG_DWORD（ProxyEnable）转十进制字符串（"1"/"0"，无 0x 前缀）。
+        // 上游必须用 proxy_enabled 判断：旧 reg.exe 打印十六进制 "0x1"，
+        // 直接与其精确比较将永不匹配（本地审查发现的回归，勿复现）
+        Ok(k.get_u32(name).ok().map(|v| v.to_string()))
+    }
+
+    /// ProxyEnable 读值是否表示开启（REG_DWORD 经 reg_query_value 返回十进制字符串）
+    pub(super) fn proxy_enabled(v: Option<&str>) -> bool {
+        v == Some("1")
     }
 
     pub(super) fn run_reg(key: &str, name: &str, ty: &str, value: &str) -> Result<(), String> {
-        let out = crate::platform::cmd::sys_command("reg")
-            .args(["add", key, "/v", name, "/t", ty, "/d", value, "/f"])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if out.status.success() {
-            Ok(())
+        // windows-registry 进程内写入，替代 reg add 子进程（issue #137）
+        use windows_registry::CURRENT_USER;
+        let sub = key
+            .strip_prefix(r"HKCU\")
+            .ok_or_else(|| format!("注册表键非 HKCU: {key}"))?;
+        let k = CURRENT_USER
+            .create(sub)
+            .map_err(|e| format!("reg 写入失败({name}): {e}"))?;
+        // ty 对齐原 reg add 语义：REG_DWORD 走数值写入，其余一律 REG_SZ
+        let res = if ty.eq_ignore_ascii_case("REG_DWORD") {
+            let n = value
+                .trim()
+                .parse::<u32>()
+                .map_err(|e| format!("REG_DWORD 值解析失败({name}={value}): {e}"))?;
+            k.set_u32(name, n)
         } else {
-            Err(String::from_utf8_lossy(&out.stderr).to_string())
-        }
+            k.set_string(name, value)
+        };
+        res.map_err(|e| format!("reg 写入失败({name}): {e}"))
     }
 
     /// 通知 WinINet 系统代理设置已变化（否则浏览器可能继续用旧配置）

@@ -2,7 +2,7 @@
 //
 // 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.mjs）：
 //   AI Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
-//   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
+//   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（仅作手动安装备选；应用内更新不使用，见 pick_asset）
 //   AI Work 助手_<ver>_aarch64.dmg     ← macOS 安装镜像（Apple Silicon；人工拖拽安装）
 //   AI Work 助手_<ver>_x64.dmg         ← macOS 安装镜像（Intel；updater 按运行时 ARCH 挑选，
 //                                         _universal.dmg 命名亦兼容）
@@ -180,12 +180,15 @@ fn fetch_releases() -> Result<Vec<serde_json::Value>, String> {
 }
 
 /// 平台安装包资产后缀（优先级序，F-75 M3-3.2 随 cfg 分派）：
-/// Windows：NSIS（_x64-setup.exe）> MSI（_x64_zh-CN.msi）；
+/// Windows：仅 NSIS（_x64-setup.exe）——MSI 不参与挑选（P4，#135 审查收尾）：
+/// update_run_installer 统一按 NSIS 参数（/P /UPDATE /R）启动安装器，msiexec 语义中
+/// /P 是补丁模式——旧「MSI 兜底」选出即死路，宁可返回 None 走「没有可用的安装包
+/// 资产」显式报错引导手动下载，也不静默选出必然失败的资产。
 /// macOS（双架构支持）：本机架构精确匹配 > universal > 另一架构（Rosetta 兜底）。
 /// 附带收益：Windows 版不会误选 dmg、mac 版不会误选 exe——双产品线同 Release 共存。
 #[cfg(windows)]
 fn asset_suffixes() -> &'static [&'static str] {
-    &["_x64-setup.exe", "_x64_zh-CN.msi"]
+    &["_x64-setup.exe"]
 }
 #[cfg(target_os = "macos")]
 fn asset_suffixes() -> &'static [&'static str] {
@@ -209,9 +212,8 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
             parsed.push((name, url, size, prio));
         }
     }
-    // 后缀优先级升序（NSIS 0 先于 MSI 1）；同类型取文件名版本号最大者
-    // （release 内一般只有一个，防御性处理）。Windows 行为与原 (is_nsis, version)
-    // 降序排序等价：NSIS=true 恒先于 MSI=false，版本大者先。
+    // 后缀优先级升序（表内位置靠前者先选）；同类型取文件名版本号最大者
+    // （release 内一般只有一个，防御性处理）。
     parsed.sort_by(|a, b| {
         let va = version_from_asset(&a.0).unwrap_or((0, 0, 0));
         let vb = version_from_asset(&b.0).unwrap_or((0, 0, 0));
@@ -494,9 +496,30 @@ pub struct UpdateDownloaded {
     pub version: String,
 }
 
+/// 资产文件名白名单（D1，cmd 元字符注入防御）：update_run_installer 将安装包
+/// 路径传入 `cmd /C start` 拼接，且 asset_name 参与临时目录/sidecar 路径 join。
+/// Rust Command 对含空格参数自动加引号，但 `"` 可闭合引导，`&`/`^`/`%`/`!` 等
+/// 在 cmd 解析层存在注入面。白名单仅放行字母数字（Unicode 语义，含既有资产名
+/// 中文）+ 空格 `. _ - ( ) #`——发布流资产名 "AI Work 助手_<ver>_x64-setup.exe"
+/// / "_x64_zh-CN.msi" 全命中，其余一律拒绝。
+fn ensure_safe_asset_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("资产文件名为空，已中止".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '(' | ')' | '#'))
+    {
+        return Err(format!("资产文件名包含非法字符，已中止: {name}"));
+    }
+    Ok(())
+}
+
 /// 校验下载目标：资产名版本必须与检查结果一致，且大于当前版本。
 /// 同时防御路径注入：资产名只允许安全文件名字符（来自 GitHub API，纵深防御）。
 fn validate_target(asset_name: &str, expected_version: &str) -> Result<(u64, u64, u64), String> {
+    // D1（cmd 元字符注入防御，先于路径校验）：文件名将参与 `cmd /C start` 拼接
+    ensure_safe_asset_name(asset_name)?;
     if asset_name.contains(['/', '\\', ':'])
         || asset_name.split(['.', ' ']).any(|seg| seg == "..")
         || asset_name.contains("..")
@@ -706,7 +729,15 @@ pub fn update_run_installer(
         Some(v) if cmp_version(v, current) == std::cmp::Ordering::Greater => {}
         _ => return Err("安装包版本不大于当前版本，已中止".to_string()),
     }
-    // 文件名与资产名绑定校验（防 file_path / asset_name 错位组合安装）
+    // 审查修复（H4，闸③）：安装前两道校验——
+    // ① 文件名与资产名绑定：拒绝「A 文件路径 + B 资产名」的组合，防止借合法资产名
+    //    通过版本校验后执行任意文件
+    // ② SHA256 复验：读取下载时落盘的 .sha256 sidecar，对磁盘文件重新计算并比对，
+    //    覆盖「下载后、安装前」窗口期的替换/篡改；sidecar 缺失或损坏同样拒绝
+    //    （fail-closed：正常流程必有 sidecar，缺失说明文件不是本次更新流程下载的）
+    // 注：asset_name 白名单由下方绑定校验（file_name == asset_name）+
+    // is_safe_installer_name（D1）覆盖，下载侧 validate_target 已先过
+    // ensure_safe_asset_name，无需重复校验。
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -889,7 +920,8 @@ mod tests {
     #[test]
     fn pick_asset_跨平台互斥_忽略dmg并优先nsis() {
         // M3-3.2 验收：双产品线同 Release 共存——Windows 更新器绝不误选 mac dmg，
-        // 且 NSIS 优先于 MSI（mac 侧对应分支由 cfg(target_os = "macos") 编译，真机验证）
+        // MSI/dmg 在场亦一律忽略（P4 #135：pick_asset 仅接受 NSIS；
+        // mac 侧对应分支由 cfg(target_os = "macos") 编译，真机验证）
         let assets = serde_json::json!([
             { "name": "AI Work 助手_3.5.4_aarch64.dmg", "browser_download_url": "u-dmg", "size": 9 },
             { "name": "AI Work 助手_3.5.4_x64-setup.exe", "browser_download_url": "u-nsis", "size": 1 },
@@ -944,6 +976,71 @@ mod tests {
         assert!(!is_sha256_hex(&"a".repeat(63))); // 不足 64 位
         assert!(!is_sha256_hex(&"g".repeat(64))); // 非十六进制字符
         assert!(!is_sha256_hex(""));
+    }
+
+    /// D1：资产文件名白名单——既有发布流资产名全命中，cmd 元字符一律拒绝
+    #[test]
+    fn safe_asset_name_whitelist() {
+        assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64-setup.exe").is_ok());
+        assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64_zh-CN.msi").is_ok());
+        assert!(ensure_safe_asset_name("AI.Work._3.3.3_x64-setup.exe").is_ok());
+        assert!(ensure_safe_asset_name("setup(1).exe").is_ok());
+        // cmd 元字符 / 引号 / 分隔符 / 控制字符一律拒绝
+        for bad in [
+            "x&calc.exe",
+            "x|ver.exe",
+            "x^1.exe",
+            "x%PATH%.exe",
+            "x!U!.exe",
+            "a\"b.exe",
+            "a<b.exe",
+            "a>b.exe",
+            "a;b.exe",
+            "a'b.exe",
+            "a`b.exe",
+            "a\\b.exe",
+            "a/b.exe",
+            "a:b.exe",
+            "a$b.exe",
+            "a=b.exe",
+            "a,cmd.exe",
+            "a@x.exe",
+            "x\t.exe",
+            "x\n.exe",
+        ] {
+            assert!(ensure_safe_asset_name(bad).is_err(), "须拒绝: {bad:?}");
+        }
+        assert!(ensure_safe_asset_name("").is_err(), "空名拒绝");
+    }
+
+    /// P4（#135 审查收尾）：pick_asset 仅接受 NSIS——MSI 兜底是死路
+    /// （update_run_installer 统一按 NSIS 参数启动，msiexec /P 为补丁模式），
+    /// 仅 MSI 的 release 显式报「没有可用的安装包资产」引导手动下载。
+    #[test]
+    fn pick_asset_nsis_only() {
+        let asset = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "browser_download_url": format!("https://example.com/{name}"),
+                "size": 1u64,
+            })
+        };
+        // NSIS 优先：MSI 在场也不影响
+        let (name, _, _) = pick_asset(&[
+            asset("AI Work 助手_3.8.1_x64_zh-CN.msi"),
+            asset("AI Work 助手_3.8.2_x64-setup.exe"),
+        ])
+        .unwrap();
+        assert_eq!(name, "AI Work 助手_3.8.2_x64-setup.exe");
+        // 仅 MSI → None（旧逻辑会选中并必然失败于 msiexec）
+        assert!(pick_asset(&[asset("AI Work 助手_3.8.2_x64_zh-CN.msi")]).is_none());
+        // 同类多资产取版本最高者
+        let (name, _, _) = pick_asset(&[
+            asset("AI Work 助手_3.8.1_x64-setup.exe"),
+            asset("AI Work 助手_3.8.2_x64-setup.exe"),
+        ])
+        .unwrap();
+        assert_eq!(name, "AI Work 助手_3.8.2_x64-setup.exe");
     }
 
     #[test]

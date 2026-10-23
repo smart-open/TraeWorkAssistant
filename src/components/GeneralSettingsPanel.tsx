@@ -32,7 +32,7 @@ export default function GeneralSettingsPanel() {
   // 应用图标选择器：当前展开替换哪个应用的图标（null = 全部收起）
   const [iconPickerFor, setIconPickerFor] = useState<AppKey | null>(null);
   // 侧边栏显示拖拽排序态：dragKey = 正在拖拽的行（半透明反馈）；listRef = 列表容器
-  // （mousemove 据此定位指针所在行）；「侧边栏显示」列表行序即侧边栏应用 Tab 展示顺序
+  // （pointermove 据此定位指针所在行）；「侧边栏显示」列表行序即侧边栏应用 Tab 展示顺序
   const [dragKey, setDragKey] = useState<AppKey | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   // 当前拖拽的监听器清理函数（onUp）：拖拽中组件被卸载（如 Esc 关闭设置弹框）时兜底移除
@@ -276,7 +276,8 @@ export default function GeneralSettingsPanel() {
           控制左下角侧边栏显示哪些应用。「固定应用」始终显示且不可隐藏（默认 Trae）；其余应用可自由勾选。
           「侧边栏显示」行可上下拖动调整展示顺序（保存后侧边栏应用 Tab 按新顺序排列）；
           隐藏仅收起入口，<b>不删除账号数据、不影响签到 / 保活等定时任务</b>，重新勾选即可恢复；
-          若当前正在浏览的应用被隐藏，会自动跳回固定应用。按住行首抓手上下拖动调整顺序，图标可点击更换应用图标。
+          若当前正在浏览的应用被隐藏，会自动跳回固定应用。按住行首抓手上下拖动调整顺序（触屏/触笔同样支持），
+          或聚焦抓手后按 ↑/↓ 键与相邻行换位；图标可点击更换应用图标。
         </p>
         <div className="grid gap-x-8 gap-y-2 sm:grid-cols-2">
           <div className="space-y-2">

@@ -840,18 +840,24 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
                     None => continue,
                 }
             }
-            // app_order 防御性校验（C4）：Settings 以 Vec<String> 反序列化——非数组
-            //（含 null）不写入避免破坏加载；数组含非字符串元素则显式报错（对齐
-            // _hhmm 报错风格：格式非法即拒绝，不静默截断用户排序改动）
+            // C4：app_order 元素合法性校验——合法键走 models::is_valid_app_key 单一来源
+            // （与 state.rs 读取侧归一同谓词），任意字符串不得入库；非法元素剔除 +
+            // HashSet 全量去重保序（对齐读取侧，Vec::dedup 只去相邻重复）；
+            // 非数组形态不写入（防破坏 Vec<String> 反序列化）
             if k == "app_order" {
-                match v.as_array() {
-                    None => continue,
-                    Some(arr) => {
-                        if arr.iter().any(|e| !e.is_string()) {
-                            return Err("app_order 数组元素必须为字符串".into());
-                        }
-                    }
-                }
+                let Some(arr) = v.as_array() else {
+                    continue;
+                };
+                let mut seen = std::collections::HashSet::new();
+                let cleaned: Vec<serde_json::Value> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .filter(|s| crate::models::is_valid_app_key(s))
+                    .filter(|s| seen.insert(*s))
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect();
+                current_obj.insert(k.clone(), serde_json::Value::Array(cleaned));
+                continue;
             }
             current_obj.insert(k.clone(), v.clone());
         }

@@ -11,50 +11,63 @@
   ;    应用内「检查更新」自动安装时安装器先于应用退出启动，靠此兜底解锁文件占用
   ;    （正常流程应用已自行退出）。
   ;    注意：不结束老品牌进程 "Trae Work 助手.exe"——两版并存，不得干扰老版本运行。
-  ;    注意：本产品两行禁用 /T（树杀，issue #135）——应用内更新场景下安装器经
-  ;    updater 的 `cmd /c start` 中转启动（已脱离本应用进程树），但防树杀误伤
-  ;    仍为红线（含旧版升级器/杀软中转等非常规父子形态）；主程序
+  ;    注意：本产品两行禁用 /T（树杀，issue #135）——应用内更新场景下安装器是本产品
+  ;    主程序的子进程，/T 会连同安装器一起强杀，安装中途静默中断升级失败；主程序
   ;    文件锁由主进程映像持有，杀主进程即解锁，无需树杀（CheckIfAppIsRunning 会兜底）。
-  ;    老品牌二进制行保留 /T：老品牌进程不可能是本安装器的祖先，树杀无副作用。
-  ;    审查修复（D2）：当前主程序改为优雅关闭 + 宽限等待——应用内更新（/UPDATE）
-  ;    场景下安装器先于应用退出启动（updater emit 后才 exit），覆盖安装时应用可能
-  ;    仍在收尾退出；先发无 /F 的 WM_CLOSE 请求，宽限 Sleep 1.2s + 至多 30 次探测
-  ;    轮询（存活则每轮 Sleep 500ms），满 30 次仍存活才 /F 兜底强杀，避免直接 /F
-  ;    截断退出收尾（未保存状态丢失）；应用未运行时第一轮探测即通过，仅多耗 1.2s。
-  ;    历史命名残留进程无退出收尾可言，直接 /F 强杀。
+  ;    trae-work-assistant.exe 行保留 /T：考古确认该名是本产品 v2.4.4 时代的构建
+  ;    二进制名（package_portable.py 直引 target/release/trae-work-assistant.exe），
+  ;    强杀属本产品旧命名自清理（POSTINSTALL 同口径，兼防自定义/便携解压目录重合
+  ;    的文件锁）；该时期无应用内更新器，进程不可能是本安装器的祖先，树杀无副作用。
+  ;    真正不触碰的老品牌进程是 "Trae Work 助手.exe"（独立安装目录，两版并存）。
   nsExec::Exec 'taskkill /F /IM "AI Work 助手.exe"'
   Pop $R9
   nsExec::Exec 'taskkill /F /IM "trae-work-assistant.exe" /T'
   Pop $R9
-  ; 1) 优雅关闭请求（无 /F → 发 WM_CLOSE，应用未运行则无副作用）
-  nsExec::Exec 'taskkill /IM "ai-work-assistant.exe"'
-  Pop $R9
-  ; 2) 宽限等待：Sleep 1.2s + 至多 30 次探测轮询（存活则 Sleep 500ms 再探，
-  ;    满 30 次仍存活直接转强杀，不白等末轮 Sleep——N1 审查修正；
-  ;    tasklist 输出探测——审查修复：/FI 无匹配时退出码恒为 0（实测），
-  ;    无法区分进程存在性；改按 /NH 表格首列映像名前缀判定（不依赖退出码
-  ;    与系统语言）：有匹配 = 进程行 / 无匹配 = 本地化无任务提示（INFO:/信息:））
-  Sleep 1200
-  StrCpy $R8 0
-hook_graceful_wait:
-  IntOp $R8 $R8 + 1
-  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq ai-work-assistant.exe" /NH'
-  Pop $R9  ; 退出码（恒 0，不参与判定；ExecToStack 启动失败时为 "error"）
-  Pop $R0  ; 输出：有匹配=进程行 / 无匹配=本地化提示（启动失败时为空）
-  StrCmp $R9 "error" hook_graceful_kill  ; C5 审查加固：探测命令启动失败 →
-                                         ; fail-safe 直接转强杀（taskkill 对
-                                         ; 不存在进程无副作用），防空输出被
-                                         ; 误判为"进程已退出"而跳过兜底
-  StrCpy $R0 $R0 21  ; 截取前缀（映像名 "ai-work-assistant.exe" 长 21 字符）
-  StrCmp $R0 "ai-work-assistant.exe" 0 hook_gone  ; 无匹配 = 进程已退出
-  IntCmp $R8 30 hook_graceful_kill 0 0  ; 满 30 次探测仍存活 → 强杀（不白等）
-  Sleep 500
-  Goto hook_graceful_wait
-hook_graceful_kill:
-  ; 3) 超时兜底强杀解锁（无 /T，#135 红线）
   nsExec::Exec 'taskkill /F /IM "ai-work-assistant.exe"'
   Pop $R9
-hook_gone:
+
+  ; ---- 升级宽限等待（D2 恢复回归 + M-1 修正存活判定）----
+  ; 首轮 taskkill 后静默 1.2s 给应用退出链留时间（updater 侧 800ms 延迟退出，
+  ; 两值耦合：应用退出 < 安装器兜底强杀，调整需同步）。
+  ; 存活探测不依赖退出码——tasklist /FI 无匹配时退出码恒为 0，IntCmp 退出码判定
+  ; 是死逻辑（M-1 实证）；改用 nsExec::ExecToStack 捕获 /NH 输出，取首列定长映像名
+  ; StrCmp 判定（Unicode NSIS 按字符计数；无匹配时输出为 INFO 行，首列 ≠ 映像名，
+  ; 天然判「不在」）。任一本产品线进程仍存活 → Sleep 500 重试，上限 30 次（≈15s）；
+  ; 超时仍存活 → taskkill /F 兜底强杀后继续安装。
+  Sleep 1200
+  StrCpy $R8 0
+preinstall_grace_loop:
+  ; 探测 1/3：ai-work-assistant.exe（首列 21 字符）
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq ai-work-assistant.exe" /NH'
+  Pop $R9 ; 退出码（恒 0，不用于判定）
+  Pop $R7 ; 输出首行
+  StrCpy $R7 "$R7" 21
+  StrCmp $R7 "ai-work-assistant.exe" preinstall_grace_alive
+  ; 探测 2/3：AI Work 助手.exe（首列 14 字符）
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq AI Work 助手.exe" /NH'
+  Pop $R9
+  Pop $R7
+  StrCpy $R7 "$R7" 14
+  StrCmp $R7 "AI Work 助手.exe" preinstall_grace_alive
+  ; 探测 3/3：trae-work-assistant.exe（首列 23 字符）
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq trae-work-assistant.exe" /NH'
+  Pop $R9
+  Pop $R7
+  StrCpy $R7 "$R7" 23
+  StrCmp $R7 "trae-work-assistant.exe" preinstall_grace_alive
+  Goto preinstall_grace_done
+preinstall_grace_alive:
+  Sleep 500
+  IntOp $R8 $R8 + 1
+  IntCmp $R8 30 preinstall_grace_kill preinstall_grace_loop preinstall_grace_kill
+preinstall_grace_kill:
+  nsExec::Exec 'taskkill /F /IM "AI Work 助手.exe"'
+  Pop $R9
+  nsExec::Exec 'taskkill /F /IM "trae-work-assistant.exe" /T'
+  Pop $R9
+  nsExec::Exec 'taskkill /F /IM "ai-work-assistant.exe"'
+  Pop $R9
+preinstall_grace_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL

@@ -795,6 +795,7 @@ export default function ApiKeysManager({
         open={editKey != null}
         onClose={() => setEditKey(null)}
         title={`调度配置 · ${editKey?.name ?? ''}`}
+        widthClass="max-w-[42.7rem]"
         footer={
           <>
             <button className="btn-outline" onClick={() => setEditKey(null)}>取消</button>

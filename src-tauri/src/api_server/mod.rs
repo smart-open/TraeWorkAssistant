@@ -713,6 +713,13 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
     if is_credit_exhausted_error(body) {
         return ErrKind::HardCredit;
     }
+    // 11140 账号级风控（issue #136 反馈）：账号被上游限制使用 → Forbidden
+    // 禁用待申诉（申诉成功后 UI 手动启用恢复）；优先于状态码口径，
+    // 该错误以 HTTP 400 形态到达时默认 400 → Client 仅短冷却，账号会被
+    // 持续调度每请求必败
+    if retry::is_account_restricted_error(body) {
+        return ErrKind::Forbidden;
+    }
     // 1005：精确匹配 JSON 键 + plan limit 短语（避免任意 "1005"/"plan" 字样误判）
     let lower_body = body.to_lowercase();
     if (body.contains("\"code\":1005") || body.contains("\"code\": 1005"))

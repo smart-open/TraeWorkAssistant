@@ -365,6 +365,12 @@ pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
     if code == 4001 || is_model_config_mismatch(msg) {
         return ErrKind::None;
     }
+    // 11140 账号级风控（issue #136 反馈）：账号被上游限制使用 → Forbidden
+    // 禁用待申诉（申诉成功后 UI 手动启用恢复）；流内走既有 kind 分支——
+    // 未流出 break 换号接替 / 已流出就地收尾，禁用与解绑粘性由 note_error 生效
+    if code == 11140 || super::retry::is_account_restricted_error(msg) {
+        return ErrKind::Forbidden;
+    }
     let lower = msg.to_lowercase();
     if code == 401 || lower.contains("unauthorized") || lower.contains("token expired") {
         return ErrKind::SessionDead;
@@ -2508,6 +2514,14 @@ mod tests {
         assert!(matches!(classify_wb_error(0, "weird"), ErrKind::Server));
         // message 关键词优先级不受 code 分段影响
         assert!(matches!(classify_wb_error(200, "积分不足"), ErrKind::HardCredit));
+        // 11140 账号级风控（issue #136 反馈）：流内 code / 关键词均 → Forbidden
+        assert!(matches!(classify_wb_error(11140, "x"), ErrKind::Forbidden));
+        assert!(matches!(
+            classify_wb_error(200, "系统检测到该账号存在异常使用行为，如需申诉请提交反馈"),
+            ErrKind::Forbidden
+        ));
+        // 与渠道级 11128 互不误撞
+        assert!(!matches!(classify_wb_error(11128, "request illegal"), ErrKind::Forbidden));
     }
 
     /// 6004 限额文案 → 精确恢复时刻（agent2api errors.rs 同源语义；

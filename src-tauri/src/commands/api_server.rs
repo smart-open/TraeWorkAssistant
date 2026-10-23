@@ -2119,7 +2119,8 @@ pub fn custom_models_remove(state: State<'_, AppState>, id: String) -> Result<bo
 
 /// 自定义模型连通性测试：向上游发一条最小 chat 请求（max_tokens=16），
 /// 成功返回摘要、失败返回原因（保存/编辑前的前置校验入口）。
-/// 阻塞 IO 放 spawn_blocking，外加 30s 总超时（覆盖连接 3s + 首字 10s + 出字余量）。
+/// 阻塞 IO 放 spawn_blocking，外加 30s 总超时（覆盖连接 5s + 首字读 10s + 出字余量；
+/// probe 走独立短超时 agent，不复用主路径 custom_agent 连接池——B3）。
 #[tauri::command]
 pub async fn custom_model_test(
     model: crate::api_server::custom_models::CustomModel,

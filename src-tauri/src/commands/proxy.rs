@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 
 use crate::fs_utils;
+#[cfg(target_os = "macos")] // 唯一消费方为 mac port_pids 的 netstat 查询
 use crate::platform::cmd::sys_command;
 use crate::state::AppState;
 
@@ -52,50 +53,122 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// 查询监听指定端口的进程 PID 列表（对齐 Python port_pids 诊断；netstat -ano 解析，
-/// 探测失败返回空表，仅供错误信息展示）。列格式：TCP 本地地址 远程地址 状态 PID。
+/// 查询监听指定端口的进程 PID 列表（对齐 Python port_pids 诊断，仅供端口占用
+/// 错误信息展示，查询失败返回空表→调用方显示「未知」）。经 GetExtendedTcpTable
+/// 进程内查询替代 netstat 子进程：spawn 控制台子进程在开机自启登录早期可能撞
+/// 系统初始化窗口期报 0xc0000142（issue #137 同类风险在 proxy.rs 的最后清零）。
+/// IPv4/IPv6 监听表双查，按 PID 去重。
+#[cfg(target_os = "windows")]
 fn port_pids(port: u16) -> Vec<String> {
-    // F-75 审查补齐：mac netstat 旗标为 `-an -p tcp`（小写协议名），输出列为
-    // `tcp4 0 0 127.0.0.1.<port> *.* LISTEN`（PID 列不存在，仅端口占用提示用）——
-    // mac 分支返回「占用」判定本身即可，PID 信息缺失无碍（仅错误文案展示）。
-    #[cfg(target_os = "macos")]
-    {
-        let Ok(out) = sys_command("netstat").args(["-an", "-p", "tcp"]).output() else {
-            return vec![];
-        };
-        let text = String::from_utf8_lossy(&out.stdout);
-        let suffix = format!("127.0.0.1.{port}");
-        // F-75 审查补齐：首列 tcp4/tcp6 前缀过滤——表头行等非连接行不得误判「占用」
-        return if text.lines().any(|l| {
-            let cols: Vec<&str> = l.split_whitespace().collect();
-            cols.len() > 3 && cols[0].starts_with("tcp") && cols[3] == suffix
-        }) {
-            vec!["?".to_string()] // mac netstat 无 PID 列，占位表示「有监听」
-        } else {
-            vec![]
-        };
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let Ok(out) = sys_command("netstat").args(["-ano", "-p", "TCP"]).output() else {
-            return vec![];
-        };
-        let text = String::from_utf8_lossy(&out.stdout);
-        let suffix = format!(":{port}");
-        let mut pids: Vec<String> = Vec::new();
-        for line in text.lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() >= 5
-                && cols[0].eq_ignore_ascii_case("TCP")
-                && cols[1].ends_with(&suffix)
-                && cols[3].eq_ignore_ascii_case("LISTENING")
-                && !pids.iter().any(|p| p == cols[4])
-            {
-                pids.push(cols[4].to_string());
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    // 拉取一张监听表的原始行缓冲（探测/分配二段式；表在两次调用间变长即
+    // ERROR_INSUFFICIENT_BUFFER，最多重试 3 次）。行缓冲用 u32 分配保证 4 字节
+    // 对齐（两代表字段全部为 u32/[u8;16]，对齐要求均 ≤4）
+    fn listen_table(af: u32) -> Option<Vec<u32>> {
+        for _ in 0..3 {
+            let mut size: u32 = 0;
+            let status = unsafe {
+                GetExtendedTcpTable(
+                    std::ptr::null_mut(),
+                    &mut size,
+                    0,
+                    af,
+                    TCP_TABLE_OWNER_PID_LISTENER,
+                    0,
+                )
+            };
+            if status != ERROR_INSUFFICIENT_BUFFER || size == 0 {
+                return None;
+            }
+            let mut buf = vec![0u32; (size as usize + 3) / 4];
+            let mut buf_len = (buf.len() * 4) as u32;
+            let status = unsafe {
+                GetExtendedTcpTable(
+                    buf.as_mut_ptr().cast(),
+                    &mut buf_len,
+                    0,
+                    af,
+                    TCP_TABLE_OWNER_PID_LISTENER,
+                    0,
+                )
+            };
+            match status {
+                0 => return Some(buf),
+                ERROR_INSUFFICIENT_BUFFER => continue,
+                _ => return None,
             }
         }
-        pids
+        None
     }
+
+    // 行端口字段为网络字节序存于低 16 位（ntohs 语义，实证单测锁定）；
+    // 行数以能完整装入缓冲为上限兜底（status==0 时 OS 保证 dwNumEntries 行
+    // 完整，min 仅为防御性收窄，杜绝越界读）
+    let mut pids: Vec<u32> = Vec::new();
+    let mut record = |local_port: u32, pid: u32| {
+        if u16::from_be((local_port & 0xFFFF) as u16) == port && !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    };
+    if let Some(buf) = listen_table(AF_INET as u32) {
+        let table = unsafe { &*buf.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>() };
+        let rows = unsafe {
+            std::slice::from_raw_parts(
+                table.table.as_ptr(),
+                (table.dwNumEntries as usize).min(buf.len().saturating_sub(1) / 6),
+            )
+        };
+        for row in rows {
+            record(row.dwLocalPort, row.dwOwningPid);
+        }
+    }
+    if let Some(buf) = listen_table(AF_INET6 as u32) {
+        let table = unsafe { &*buf.as_ptr().cast::<MIB_TCP6TABLE_OWNER_PID>() };
+        let rows = unsafe {
+            std::slice::from_raw_parts(
+                table.table.as_ptr(),
+                (table.dwNumEntries as usize).min(buf.len().saturating_sub(1) / 14),
+            )
+        };
+        for row in rows {
+            record(row.dwLocalPort, row.dwOwningPid);
+        }
+    }
+    pids.iter().map(|p| p.to_string()).collect()
+}
+
+/// macOS：无 GetExtendedTcpTable，退 netstat 进程外查询（0xc0000142 spawn 撞窗
+/// 系 Windows 特有，mac 无碍）。F-75 审查补齐：mac netstat 旗标为 `-an -p tcp`
+/// （小写协议名），输出列为 `tcp4 0 0 127.0.0.1.<port> *.* LISTEN`（PID 列不存在，
+/// 仅端口占用提示用）——返回「占用」判定本身即可，PID 信息缺失无碍（仅错误文案展示）
+#[cfg(target_os = "macos")]
+fn port_pids(port: u16) -> Vec<String> {
+    let Ok(out) = sys_command("netstat").args(["-an", "-p", "tcp"]).output() else {
+        return vec![];
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let suffix = format!("127.0.0.1.{port}");
+    // F-75 审查补齐：首列 tcp4/tcp6 前缀过滤——表头行等非连接行不得误判「占用」
+    if text.lines().any(|l| {
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        cols.len() > 3 && cols[0].starts_with("tcp") && cols[3] == suffix
+    }) {
+        vec!["?".to_string()] // mac netstat 无 PID 列，占位表示「有监听」
+    } else {
+        vec![]
+    }
+}
+
+/// 非 Windows/macOS 平台无此诊断路径：返回空表
+#[cfg(not(any(windows, target_os = "macos")))]
+fn port_pids(_port: u16) -> Vec<String> {
+    vec![]
 }
 
 /// 安全获取 Mutex 锁，即使中毒也能恢复（避免 panic 级联）。
@@ -649,22 +722,17 @@ fn notify_wininet_changed() {
 
 #[cfg(target_os = "windows")]
 fn reg_query_value(key: &str, name: &str) -> Option<String> {
-    let out = sys_command("reg")
-        .args(["query", key, "/v", name])
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    for line in s.lines() {
-        let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix(name) {
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            // parts[0] = 类型(REG_SZ/REG_DWORD)，parts[1..] = 值
-            if parts.len() >= 2 {
-                return Some(parts[1..].join(" "));
-            }
-        }
+    // windows-registry 进程内读取，不再 spawn reg.exe 子进程（issue #137：
+    // 开机自启后登录早期 spawn 的 reg.exe 撞系统初始化窗口期报 0xc0000142）
+    use windows_registry::CURRENT_USER;
+    let sub = key.strip_prefix(r"HKCU\")?;
+    let k = CURRENT_USER.open(sub).ok()?;
+    // REG_SZ 直读；REG_DWORD（ProxyEnable）转十进制字符串，
+    // 上游仅做 contains("1") 判断，语义与原 reg.exe 输出解析一致
+    if let Ok(s) = k.get_string(name) {
+        return Some(s);
     }
-    None
+    k.get_u32(name).ok().map(|v| v.to_string())
 }
 
 /// 读取启动前的系统代理设置。返回 (enabled, server, override)。
@@ -688,14 +756,25 @@ pub(crate) fn get_existing_win_proxy() -> Option<(bool, String, String)> {
 
 #[cfg(target_os = "windows")]
 fn run_reg(key: &str, name: &str, kind: &str, value: &str) -> Result<(), String> {
-    let status = sys_command("reg")
-        .args(["add", key, "/v", name, "/t", kind, "/d", value, "/f"])
-        .status()
+    // windows-registry 进程内写入，替代 reg add 子进程（issue #137）
+    use windows_registry::CURRENT_USER;
+    let sub = key
+        .strip_prefix(r"HKCU\")
+        .ok_or_else(|| format!("注册表键非 HKCU: {key}"))?;
+    let k = CURRENT_USER
+        .create(sub)
         .map_err(|e| format!("设置系统代理失败: {e}"))?;
-    if !status.success() {
-        return Err(format!("reg add 失败: {name}"));
-    }
-    Ok(())
+    // kind 对齐原 reg add 语义：REG_DWORD 走数值写入，其余一律 REG_SZ
+    let res = if kind.eq_ignore_ascii_case("REG_DWORD") {
+        let n = value
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| format!("REG_DWORD 值解析失败({name}={value}): {e}"))?;
+        k.set_u32(name, n)
+    } else {
+        k.set_string(name, value)
+    };
+    res.map_err(|e| format!("reg 写入失败({name}): {e}"))
 }
 
 // F-75 M2-2.1：原「仅 Windows 支持系统代理设置」stub 已由上方 mac 实现替代
@@ -704,4 +783,35 @@ fn run_reg(key: &str, name: &str, kind: &str, value: &str) -> Result<(), String>
 /// 应用退出路径使用：标记「主动停止」，让看门狗静默（退出清理由 RunEvent::Exit 统一完成）
 pub(crate) fn mark_intentional_stop() {
     PROXY_INTENTIONAL_STOP.store(true, Ordering::Relaxed);
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    /// 实证回归：监听表行端口字段为网络字节序（from_be 解码）。自身进程绑定
+    /// 临时端口后必须被 port_pids 命中——字节序若写错，解码端口将不等于绑定
+    /// 端口、本测试即红（行为锁定对齐旧 netstat -ano 解析）
+    #[test]
+    fn port_pids_命中自身监听进程() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口");
+        let port = listener.local_addr().expect("取本地端口").port();
+        let me = std::process::id().to_string();
+        let pids = port_pids(port);
+        assert!(
+            pids.iter().any(|p| p == &me),
+            "port_pids({port}) = {pids:?} 应含自身 PID {me}"
+        );
+    }
+
+    /// 反向锁定：无监听的临时端口不得产生误报（防「匹配一切行」类回归）。
+    /// 极端并发下端口被其他进程抢绑属可容忍抖动（本查询仅供诊断展示）
+    #[test]
+    fn port_pids_无监听端口返回空表() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定临时端口");
+            l.local_addr().expect("取本地端口").port()
+        };
+        assert!(port_pids(port).is_empty(), "port_pids({port}) 应为空");
+    }
 }

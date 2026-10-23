@@ -1,7 +1,7 @@
 //! 自定义模型上游执行路径（OpenAI 兼容直通）
 //!
 //! 与 WB 上游同策略：请求体强制 `stream:true`，上游只回 OpenAI 风格 SSE——
-//! - 流式：wb_sse::stream_forward 按客户端协议转发；
+//! - 流式：wb_sse::stream_forward_ex 按客户端协议转发（含 failed_inline 就地收尾）；
 //! - 非流式：wb_sse::aggregate 本地聚合为单个 OpenAI completion 后按协议转换。
 //!
 //! P2 上游组语义（custom_lb.rs）：入参为同名多条构成的上游组（Vec<CustomModel>）——
@@ -69,31 +69,12 @@ fn custom_agent() -> &'static ureq::Agent {
     })
 }
 
-/// 探活专用 agent（B3 审查修复）：不与网关 agent 共用——网关读超时 300s，
-/// probe 若复用，命令层 30s 超时返回后慢上游仍会把阻塞线程拖住最长 300s。
-/// 独立 20s 读/总超时 + 3s 连接：探活全链路收敛在 30s 命令超时内
-fn probe_agent() -> &'static ureq::Agent {
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(20))
-            .timeout_read(std::time::Duration::from_secs(20))
-            .timeout_write(std::time::Duration::from_secs(10))
-            .timeout_connect(std::time::Duration::from_secs(3))
-            .build()
-    })
-}
-
-/// 发起自定义上游请求（Bearer 鉴权；custom 专用 agent）
-fn make_custom_request(cm: &CustomModel, body: &[u8]) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
-    make_request_with(cm, body, custom_agent())
-}
-
-/// make_custom_request 的 agent 参数化形态（探活复用独立短超时 agent）
-fn make_request_with(
+/// 发起自定义上游请求（Bearer 鉴权；agent 由调用方指定——主路径 custom_agent
+/// 快速失败参数，probe 独立短超时 agent，两池连接互不干扰）
+fn send_request(
+    agent: &ureq::Agent,
     cm: &CustomModel,
     body: &[u8],
-    agent: &ureq::Agent,
 ) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
     let url = custom_models::chat_url(&cm.base_url);
     let mut req = agent.post(&url);
@@ -110,6 +91,22 @@ fn make_request_with(
         }
         Err(e) => Err((502, format!("自定义上游传输错误: {e}"))),
     }
+}
+
+/// 主路径请求入口（custom 专用 agent）
+fn make_custom_request(cm: &CustomModel, body: &[u8]) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
+    send_request(&custom_agent(), cm, body)
+}
+
+/// probe 专用 agent（B3）：独立连接池 + 全程短超时，不复用主路径 custom_agent
+/// （空闲读 300s 的连接池宿主——探测借用会受慢上游陈旧连接拖累，且命令层
+/// 30s 外部超时仅兜底不精准）。连接 5s / 读 10s（对齐网关首字超时口径）/ 写 10s
+fn probe_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_read(std::time::Duration::from_secs(10))
+        .timeout_write(std::time::Duration::from_secs(10))
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .build()
 }
 
 /// 失败类别判定（熔断记账口径）：401/403/402 = 配置/账户错误落 600s 长窗，
@@ -131,15 +128,16 @@ fn acct_display(cm: &CustomModel) -> String {
     }
 }
 
-/// 组内选下一上游：粘性命中优先（跳过计数器；粘住条目已 tried 时忽略重选），
-/// 否则组内加权轮询（pick_with_state，熔断中/已试条目排除）
+/// 组内选下一上游：粘性命中优先（跳过计数器；粘住条目已 tried 或被 Key 白名单
+/// 排除时忽略重选），否则组内加权轮询（pick_with_state，熔断中/已试/白名单外
+/// 条目排除——A1/M-2 与预检侧 dispatch::pool_health 同口径）
 fn pick_next(
     state: &Arc<ApiSharedState>,
     group: &[CustomModel],
     tried: &HashSet<String>,
-    allowed: Option<&HashSet<String>>,
     session_key: Option<&String>,
     canonical: &str,
+    allowed: Option<&HashSet<String>>,
 ) -> Option<CustomModel> {
     if let Some(sk) = session_key {
         if let Some(id) = custom_lb::sticky_upstream(state, sk) {
@@ -153,9 +151,11 @@ fn pick_next(
     custom_lb::pick_with_state(state, canonical, group, tried, allowed)
 }
 
-/// Key 白名单约束解析（A1 审查修复：与 qoder_route 取号同模式——从 key_id
-/// 解析 custom 池约束，None = 不限；绑定/混合白名单 Key 不再漏进白名单外上游）
-fn allowed_for_key(state: &ApiSharedState, key_id: &str) -> Option<HashSet<String>> {
+/// 命中 Key 的 custom 池白名单（A1/M-2 路由侧口径）。与 dispatch::key_allowed_for
+/// 对 custom 池结果等价：未绑定且非 mixed 的旧 Key，pool_constraints("custom")
+/// 因 constrains_pool 仅认绑定池/buddy 而天然返回 None，无需再走门控。
+/// None = 不感知白名单；Some(集) = 白名单外 cm.id 一律不选。
+fn key_allowed_for_custom(state: &Arc<ApiSharedState>, key_id: &str) -> Option<HashSet<String>> {
     super::api_keys::constraints_for(&state.data_dir, key_id)
         .and_then(|rk| rk.pool_constraints("custom"))
         .and_then(|c| c.allowed)
@@ -174,7 +174,7 @@ pub fn probe(cm: &CustomModel) -> Result<String, String> {
     })
     .to_string()
     .into_bytes();
-    let reader = make_request_with(cm, &body, probe_agent()).map_err(|(status, resp_body)| {
+    let reader = send_request(&probe_agent(), cm, &body).map_err(|(status, resp_body)| {
         let preview: String = resp_body.chars().take(200).collect();
         if preview.is_empty() {
             format!("上游返回 status {status}（无响应体；请检查 API 地址与 Key）")
@@ -246,8 +246,6 @@ pub fn custom_stream_chat(
         let chat_id = chat_id_for(proto);
         // 请求日志附带：API Key 展示名 + 自定义模型名（即"账号"，匿名 → "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
-        // A1 审查修复：Key 白名单约束传入组内选路（含粘性命中过滤）
-        let allowed = allowed_for_key(&state, &key_id);
 
         // SSE keep-alive 15s：防中间层回收长流（与 WB/solo 路径同策略）。
         // P1 修复：与 routes.rs 同款 watch + DoneSignal 方案，替换旧 AtomicBool
@@ -287,11 +285,13 @@ pub fn custom_stream_chat(
         let max_attempts = group.len().min(3);
         let mut attempt = 0usize;
         let mut last_err = String::from("自定义上游组内无可用条目");
+        // A1/M-2：命中 Key 的 custom 白名单 loop 外解析一次（constraints_for 缓存读）
+        let allowed = key_allowed_for_custom(&state, &key_id);
 
         loop {
-            let Some(cm) = pick_next(&state, &group, &tried, allowed.as_ref(), session_key.as_ref(), &canonical)
+            let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical, allowed.as_ref())
             else {
-                // 组内全熔断/已试尽（pool_health 前置下理论不可达，防御性兜底）
+                // 组内全熔断/已试尽/白名单排除（pool_health 前置下理论不可达，防御性兜底）
                 set_last_error(&state, format!("custom model={} group exhausted", model));
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, true, 503, "custom",
@@ -366,6 +366,8 @@ pub fn custom_stream_chat(
                         let (error_info, sent_any, failed_inline, up_usage, eof_truncated) =
                             wb_sse::stream_forward_ex(lines, &tx, proto, &chat_id, &model);
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
+                        // 记账成功口径（对齐 wb_route）：无流内错误且未流内失败
+                        let ok = error_info.is_none() && !failed_inline;
                         {
                             // 宽口径提取（别名 + 字符串数字形态，审查 P2）
                             let (pt, ct) = up_usage.as_ref().map(wb_sse::u64_pair).unwrap_or((0, 0));
@@ -376,9 +378,19 @@ pub fn custom_stream_chat(
                             );
                             // B1 审查修复：failed_inline 时 error_info=None 但非成功
                             state.record_usage_custom(
-                                &model, &key_id, error_info.is_none() && !failed_inline, true,
+                                &model, &key_id, ok, true,
                                 duration_ms, pt, ct,
                             );
+                        }
+                        if failed_inline {
+                            // 流内失败已透传客户端（wb_route 同口径）：不重试、不清熔断、
+                            // 不绑粘性、亦不记账熔断——错误已原样给到客户端，内容类失败
+                            // 计入冷却会造成上游过度冷却
+                            state.logger.log_request(
+                                "custom", "POST", proto.log_path(), &model, true, 200, "custom",
+                                duration_ms, &key_name, &acct_name, Some("流内失败已透传客户端"),
+                            );
+                            break;
                         }
                         match error_info {
                             None => {
@@ -476,7 +488,7 @@ pub async fn custom_aggregate_chat(
         // 请求日志附带：API Key 展示名 + 自定义模型名（即"账号"，匿名 → "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         // A1 审查修复：Key 白名单约束传入组内选路（含粘性命中过滤）
-        let allowed = allowed_for_key(&state, &key_id);
+        let allowed = key_allowed_for_custom(&state, &key_id);
         let prepared_core = parse_body_once(&body_vec);
         let session_key = super::dispatch::pool_session_key(&prepared_core);
         let canonical = super::unified_catalog::canonical_id(&model);
@@ -490,9 +502,9 @@ pub async fn custom_aggregate_chat(
         let mut last_status = 503u16;
 
         loop {
-            let Some(cm) = pick_next(&state, &group, &tried, allowed.as_ref(), session_key.as_ref(), &canonical)
+            let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical, allowed.as_ref())
             else {
-                // 组内全熔断/已试尽（pool_health 前置下理论不可达，防御性兜底）；
+                // 组内全熔断/已试尽/白名单排除（pool_health 前置下理论不可达，防御性兜底）；
                 // [DEBUG] 排障行由 loop 后收尾统一落（此处 break 即达，不重复）
                 set_last_error(&state, format!("custom model={} group exhausted", model));
                 state.logger.log_request(

@@ -3,9 +3,6 @@ use std::collections::HashMap;
 // Windows 直启链专用（mac 走 `open` bundle 启动，不经 Command）
 #[cfg(not(target_os = "macos"))]
 use std::process::Command;
-// Windows 静默窗口标志（creation_flags）专用 API——非 Windows 平台无此符号
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 // Windows 直启链 stdio 静默专用（mac 启动走 `open`，不经 Command）
 #[cfg(not(target_os = "macos"))]
 use std::process::Stdio;
@@ -1020,78 +1017,41 @@ fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Optio
     }
 }
 
-/// 注册表卸载键搜索（按应用档案的 DisplayName 片段与 exe 名参数化）
+/// 注册表卸载键搜索（按应用档案的 DisplayName 片段与 exe 名参数化）。
+/// windows-registry 进程内枚举（HKCU + HKLM 64 位视图，与原 `reg query /s /f`
+/// 语义对齐）：DisplayName 含模式串 → DisplayIcon / InstallLocation 解析。
+/// 不再 spawn reg.exe 子进程（issue #137：开机自启后登录早期 spawn 的 reg.exe
+/// 撞系统初始化窗口期报 0xc0000142），同时消除 /s /f 全量搜索 ~250ms/次开销；
+/// 同键直读三个值，原「/f 输出不全再回查全值」的两段式不再需要。
+/// Windows 注册表通道专用（mac 无注册表；调用方 app_locate 链同门控）
 #[cfg(not(target_os = "macos"))]
 fn registry_app_path(profile: &AppProfile) -> Option<String> {
+    use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
+    let uninstall_sub = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
     for pattern in profile.reg_patterns {
-        for root in ["HKCU", "HKLM"] {
-            let out = match sys_command("reg")
-                .args([
-                    "query",
-                    &format!("{root}\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
-                    "/s",
-                    "/f",
-                    pattern,
-                ])
-                .output()
-            {
-                Ok(o) => o,
-                Err(_) => continue,
+        let pat_upper = pattern.to_uppercase();
+        for root in [CURRENT_USER, LOCAL_MACHINE] {
+            let Ok(uninstall) = root.open(uninstall_sub) else {
+                continue;
             };
-            let s = String::from_utf8_lossy(&out.stdout);
-            let pat_upper = pattern.to_uppercase();
-            let mut icon: Option<String> = None;
-            let mut loc: Option<String> = None;
-            let mut name_ok = false;
-            let mut cur_key: Option<String> = None;
-            for line in s.lines() {
-                let line = line.trim();
-                if line.starts_with("HKEY_") {
-                    if name_ok {
-                        if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
-                            return Some(hit);
-                        }
-                        // reg query /f 输出只含匹配值行（2026-10-17 实测：DisplayName
-                        // 命中时同键的 DisplayIcon/InstallLocation 往往不在 /f 输出），
-                        // 按键路径回查该键全部值再解析一次
-                        if let Some(k) = cur_key.as_deref() {
-                            let (i2, l2) = reg_query_key_values(k);
-                            if let Some(hit) = resolve_reg_profile_candidate(&i2, &l2, profile) {
-                                return Some(hit);
-                            }
-                        }
-                    }
-                    icon = None;
-                    loc = None;
-                    name_ok = false;
-                    cur_key = Some(line.to_string());
+            let Ok(subkeys) = uninstall.keys() else {
+                continue;
+            };
+            for key in subkeys {
+                let Ok(item) = uninstall.open(&key) else {
+                    continue;
+                };
+                // 原实现仅接受 DisplayName 数据含模式串的键（/f 命中行人工过滤）
+                let Ok(display) = item.get_string("DisplayName") else {
+                    continue;
+                };
+                if !display.to_uppercase().contains(&pat_upper) {
                     continue;
                 }
-                if let Some(v) = line.strip_prefix("DisplayName") {
-                    if let Some(val) = v.split("REG_SZ").nth(1) {
-                        if val.to_uppercase().contains(&pat_upper) {
-                            name_ok = true;
-                        }
-                    }
-                } else if let Some(v) = line.strip_prefix("DisplayIcon") {
-                    if let Some(val) = v.split("REG_SZ").nth(1) {
-                        icon = Some(val.trim().to_string());
-                    }
-                } else if let Some(v) = line.strip_prefix("InstallLocation") {
-                    if let Some(val) = v.split("REG_SZ").nth(1) {
-                        loc = Some(val.trim().to_string());
-                    }
-                }
-            }
-            if name_ok {
+                let icon = item.get_string("DisplayIcon").ok();
+                let loc = item.get_string("InstallLocation").ok();
                 if let Some(hit) = resolve_reg_profile_candidate(&icon, &loc, profile) {
                     return Some(hit);
-                }
-                if let Some(k) = cur_key.as_deref() {
-                    let (i2, l2) = reg_query_key_values(k);
-                    if let Some(hit) = resolve_reg_profile_candidate(&i2, &l2, profile) {
-                        return Some(hit);
-                    }
                 }
             }
         }
@@ -1136,35 +1096,6 @@ fn resolve_reg_profile_candidate(
         }
     }
     None
-}
-
-/// 按键路径回查单个卸载键的全部值（DisplayIcon / InstallLocation）。
-/// `reg query <key>`（无 /f）输出该键所有值行；失败静默返回空。
-/// Windows 注册表通道专用（mac 无 reg；调用方 registry_app_path 同门控）
-#[cfg(not(target_os = "macos"))]
-fn reg_query_key_values(key: &str) -> (Option<String>, Option<String>) {
-    let Ok(out) = Command::new("reg")
-        .args(["query", key])
-        .creation_flags(0x08000000)
-        .output()
-    else {
-        return (None, None);
-    };
-    let mut icon = None;
-    let mut loc = None;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let line = line.trim();
-        if let Some(v) = line.strip_prefix("DisplayIcon") {
-            if let Some(val) = v.split("REG_SZ").nth(1) {
-                icon = Some(val.trim().to_string());
-            }
-        } else if let Some(v) = line.strip_prefix("InstallLocation") {
-            if let Some(val) = v.split("REG_SZ").nth(1) {
-                loc = Some(val.trim().to_string());
-            }
-        }
-    }
-    (icon, loc)
 }
 
 /// 运行进程反查 exe 路径（应用运行中时最准）：精确映像名匹配，取首个带路径的进程。

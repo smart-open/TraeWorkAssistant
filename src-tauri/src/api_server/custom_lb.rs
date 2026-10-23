@@ -43,15 +43,14 @@ pub enum FailKind {
 
 /// 组内选路：加权轮询（组内共享计数器），跳过熔断中的上游（P3 表查询）与
 /// 已试条目；优先活跃条目（standby=false），活跃候选为空时才启用备胎。
-/// `allowed` = Key 白名单约束（issue #25 体系）：None = 不限；Some = 仅集合内
-/// 条目可选中（A1 审查修复：白名单全链路——预检 pool_health 与执行侧选路
-/// 同口径，绑定/混合白名单 Key 不再漏进白名单外上游）。
-/// 返回 None = 组内全部熔断/已试尽/白名单外（交由调用方按错误矩阵处置）。
+/// `allowed`：Key 白名单（cm.id 集合，A1/M-2 执行侧口径）——None = 不感知，
+/// Some = 白名单外条目视同不存在（预检与执行同口径，杜绝绕过/误伤）。
+/// 返回 None = 组内全部熔断/已试尽/被白名单排除（交由调用方按错误矩阵处置）。
 pub fn pick_upstream(
     group: &[CustomModel],
     tried: &HashSet<String>,
-    allowed: Option<&HashSet<String>>,
     counter: &AtomicUsize,
+    allowed: Option<&HashSet<String>>,
 ) -> Option<CustomModel> {
     let weight_of = |m: &CustomModel| m.weight.max(1) as usize;
     // 候选 = 组内 enabled - tried - 熔断中 - 白名单外（find_enabled_all 已按
@@ -109,7 +108,7 @@ fn pick_locked(
 ) -> Option<CustomModel> {
     let mut map = counters.lock().unwrap_or_else(|e| e.into_inner());
     let counter = map.entry(canonical.to_string()).or_default();
-    pick_upstream(group, tried, allowed, counter)
+    pick_upstream(group, tried, counter, allowed)
 }
 
 // ==================== 会话粘上游（P2） ====================
@@ -299,7 +298,7 @@ mod tests {
         let c = counter();
         let mut hits = HashMap::new();
         for _ in 0..8 {
-            let picked = pick_upstream(&group, &HashSet::new(), None, &c).unwrap();
+            let picked = pick_upstream(&group, &HashSet::new(), &c, None).unwrap();
             *hits.entry(picked.id).or_insert(0usize) += 1;
         }
         assert_eq!(hits[&ida], 6);
@@ -314,14 +313,14 @@ mod tests {
         let c = counter();
         let mut tried = HashSet::new();
         tried.insert(ida.clone());
-        let picked = pick_upstream(&group, &tried, None, &c).unwrap();
+        let picked = pick_upstream(&group, &tried, &c, None).unwrap();
         assert_eq!(picked.id, idb);
         tried.insert(idb.clone());
-        assert!(pick_upstream(&group, &tried, None, &c).is_none());
+        assert!(pick_upstream(&group, &tried, &c, None).is_none());
     }
 
-    /// 白名单约束（A1 审查修复）：allowed 外条目不参与选路；空白名单 = 排除；
-    /// None = 不限
+    /// 白名单补充断言（macos_main）：组外条目无害、空白名单 = 排除、
+    /// None 解除限制后全组可轮询命中（核心语义与 t08 同口径）
     #[test]
     fn t02b_allowed_whitelist() {
         let (ida, idb) = (uid(9), uid(9));
@@ -332,20 +331,23 @@ mod tests {
         allowed.insert(idb.clone());
         for _ in 0..4 {
             assert_eq!(
-                pick_upstream(&group, &HashSet::new(), Some(&allowed), &c).unwrap().id,
+                pick_upstream(&group, &HashSet::new(), &c, Some(&allowed)).unwrap().id,
                 idb
             );
         }
         // 白名单含组外条目（无害）：仅组内交集参与
         allowed.insert("not-in-group".to_string());
-        assert_eq!(pick_upstream(&group, &HashSet::new(), Some(&allowed), &c).unwrap().id, idb);
+        assert_eq!(
+            pick_upstream(&group, &HashSet::new(), &c, Some(&allowed)).unwrap().id,
+            idb
+        );
         // 空白名单 = 该池被该 Key 排除 → None
         let empty: HashSet<String> = HashSet::new();
-        assert!(pick_upstream(&group, &HashSet::new(), Some(&empty), &c).is_none());
+        assert!(pick_upstream(&group, &HashSet::new(), &c, Some(&empty)).is_none());
         // None = 不限：恢复全组轮询（ida/idb 均可命中）
         let mut hits = HashMap::new();
         for _ in 0..8 {
-            let p = pick_upstream(&group, &HashSet::new(), None, &c).unwrap();
+            let p = pick_upstream(&group, &HashSet::new(), &c, None).unwrap();
             *hits.entry(p.id).or_insert(0usize) += 1;
         }
         assert!(hits.contains_key(&ida) && hits.contains_key(&idb));
@@ -359,20 +361,20 @@ mod tests {
         let c = counter();
         // 活跃健康：备胎永不命中
         for _ in 0..6 {
-            assert_ne!(pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id, ids);
+            assert_ne!(pick_upstream(&group, &HashSet::new(), &c, None).unwrap().id, ids);
         }
         // 活跃全熔断 → 备胎接管
         note_circuit_failure(&ida, FailKind::Server);
         note_circuit_failure(&idb, FailKind::Server);
         assert_eq!(
-            pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id,
+            pick_upstream(&group, &HashSet::new(), &c, None).unwrap().id,
             ids,
             "活跃全熔断时备胎接管"
         );
         // 活跃恢复 → 回流活跃
         clear_circuit(&ida);
         clear_circuit(&idb);
-        assert_ne!(pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id, ids);
+        assert_ne!(pick_upstream(&group, &HashSet::new(), &c, None).unwrap().id, ids);
     }
 
     /// 熔断：连续失败进入冷却、选路跳过；窗口未过期内多次记账不递增（防放大）；
@@ -401,12 +403,12 @@ mod tests {
         let group = vec![cm(&id, 1, false), cm(&idb, 1, false)];
         let c = counter();
         for _ in 0..4 {
-            assert_eq!(pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id, idb);
+            assert_eq!(pick_upstream(&group, &HashSet::new(), &c, None).unwrap().id, idb);
         }
         // 成功即清
         clear_circuit(&id);
         assert!(!circuit_open(&id), "成功即清");
-        assert_eq!(pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id, id);
+        assert_eq!(pick_upstream(&group, &HashSet::new(), &c, None).unwrap().id, id);
     }
 
     /// Auth 长窗：401/403/402 直接落 600s，不吃渐进表
@@ -495,5 +497,25 @@ mod tests {
         }
         assert_eq!(a_hits[&ida], 6);
         assert_eq!(a_hits[&idb], 2);
+    }
+
+    /// 白名单（A1/M-2 执行侧口径）：allowed 外条目视同不存在——
+    /// 白名单内条目胜出；白名单排除全部条目 → None；None = 不感知放行全组
+    #[test]
+    fn t08_allowed_whitelist_filter() {
+        let (ida, idb) = (uid(9), uid(9));
+        let group = vec![cm(&ida, 3, false), cm(&idb, 1, false)];
+        let c = counter();
+        // 白名单仅含 idb → 权重 3 的 ida 被排除，必命中 idb
+        let mut allowed: HashSet<String> = HashSet::new();
+        allowed.insert(idb.clone());
+        for _ in 0..4 {
+            assert_eq!(pick_upstream(&group, &HashSet::new(), &c, Some(&allowed)).unwrap().id, idb);
+        }
+        // 白名单排除全组 → None（与全熔断同出口，交由调用方走 fallback）
+        let empty_allowed: HashSet<String> = HashSet::new();
+        assert!(pick_upstream(&group, &HashSet::new(), &c, Some(&empty_allowed)).is_none());
+        // None = 不感知 → 全组参与轮询
+        assert!(pick_upstream(&group, &HashSet::new(), &c, None).is_some());
     }
 }

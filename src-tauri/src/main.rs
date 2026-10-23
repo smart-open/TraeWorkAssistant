@@ -112,10 +112,14 @@ fn main() {
     // 重建为主 exe 直调（GUI 子系统，无控制台）。部分失败不置位完成标记，下次启动重试。
     // 后台执行：任务枚举 + 逐任务 XML 查询可达数秒，不阻塞启动（取代原 PS 桥启动器迁移）。
     // 仅 Windows 有 schtasks 体系（cfg! 运行时判断保持函数可达，mac 无 dead_code 警告，
-    // 也不会每启动空跑注定失败的 cmd 子进程——该路径无完成标记可提前短路）
+    // 也不会每启动空跑注定失败的 cmd 子进程——该路径无完成标记可提前短路）。
+    // 先延迟 120s 再扫描（合并 origin/main #137 修复）：迁移链路会 spawn cmd/schtasks
+    // 控制台程序，开机自启登录早期 spawn 控制台程序可能撞系统初始化窗口期报
+    // 0xc0000142；迁移有一次性完成标记兜底，失败不置位、下次启动自动重试，故延迟无功能损害
     if cfg!(windows) {
         let data_dir = state.data_dir.clone();
         std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(120));
             if let Some(note) = commands::misc::try_migrate_cmd_wrapped_tasks(&data_dir) {
                 fs_utils::app_log(&data_dir, &note);
             }
