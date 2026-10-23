@@ -2088,24 +2088,38 @@ pub fn custom_models_list(
 }
 
 /// 保存自定义模型（upsert：id 为空新增并生成 cm- id，存在则整条覆盖；
-/// 校验 name/base_url 必填 + 名称 canonical 唯一；返回保存后的完整列表）
+/// 校验 name/base_url 必填 + 同名仅拒绝「同名+同 base_url+同 api_key」完全重复
+/// （同名不同上游 = 上游组成员）；返回保存后的完整列表）。
+/// 编辑（id 非空）同步清该条目实例级熔断（B2 审查修复：否则修正 base_url/
+/// 换 api_key 后旧冷却窗口仍拦到重启，配置改动看似无效）
 #[tauri::command]
 pub fn custom_models_save(
     state: State<'_, AppState>,
     model: crate::api_server::custom_models::CustomModel,
 ) -> Result<Vec<crate::api_server::custom_models::CustomModel>, String> {
-    crate::api_server::custom_models::upsert(&state.data_dir, model)
+    let edited_id = if model.id.is_empty() { None } else { Some(model.id.clone()) };
+    let list = crate::api_server::custom_models::upsert(&state.data_dir, model)?;
+    if let Some(id) = edited_id {
+        crate::api_server::custom_lb::clear_circuit(&id);
+    }
+    Ok(list)
 }
 
-/// 删除自定义模型（按 id）；返回是否确有删除
+/// 删除自定义模型（按 id）；返回是否确有删除。
+/// 删除成功同步清除该条目的实例级熔断残留（审查修复：否则同 id 复用/残留
+/// 冷却窗口在重启前一直存在；粘性条目不在组内时选路自然回落，TTL 60s 自愈）
 #[tauri::command]
 pub fn custom_models_remove(state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    crate::api_server::custom_models::remove(&state.data_dir, &id)
+    let removed = crate::api_server::custom_models::remove(&state.data_dir, &id)?;
+    if removed {
+        crate::api_server::custom_lb::clear_circuit(&id);
+    }
+    Ok(removed)
 }
 
 /// 自定义模型连通性测试：向上游发一条最小 chat 请求（max_tokens=16），
 /// 成功返回摘要、失败返回原因（保存/编辑前的前置校验入口）。
-/// 阻塞 IO 放 spawn_blocking，外加 30s 总超时（覆盖连接 10s + 首字 10s + 出字余量）。
+/// 阻塞 IO 放 spawn_blocking，外加 30s 总超时（覆盖连接 3s + 首字 10s + 出字余量）。
 #[tauri::command]
 pub async fn custom_model_test(
     model: crate::api_server::custom_models::CustomModel,

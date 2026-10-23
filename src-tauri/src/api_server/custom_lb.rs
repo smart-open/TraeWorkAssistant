@@ -43,18 +43,27 @@ pub enum FailKind {
 
 /// 组内选路：加权轮询（组内共享计数器），跳过熔断中的上游（P3 表查询）与
 /// 已试条目；优先活跃条目（standby=false），活跃候选为空时才启用备胎。
-/// 返回 None = 组内全部熔断/已试尽（交由调用方按错误矩阵处置）。
+/// `allowed` = Key 白名单约束（issue #25 体系）：None = 不限；Some = 仅集合内
+/// 条目可选中（A1 审查修复：白名单全链路——预检 pool_health 与执行侧选路
+/// 同口径，绑定/混合白名单 Key 不再漏进白名单外上游）。
+/// 返回 None = 组内全部熔断/已试尽/白名单外（交由调用方按错误矩阵处置）。
 pub fn pick_upstream(
     group: &[CustomModel],
     tried: &HashSet<String>,
+    allowed: Option<&HashSet<String>>,
     counter: &AtomicUsize,
 ) -> Option<CustomModel> {
     let weight_of = |m: &CustomModel| m.weight.max(1) as usize;
-    // 候选 = 组内 enabled - tried - 熔断中（find_enabled_all 已按 enabled 过滤，
-    // 此处再过滤一次防御调用方直传全量列表）
+    // 候选 = 组内 enabled - tried - 熔断中 - 白名单外（find_enabled_all 已按
+    // enabled 过滤，此处再过滤一次防御调用方直传全量列表）
     let candidates: Vec<&CustomModel> = group
         .iter()
-        .filter(|m| m.enabled && !tried.contains(&m.id) && !circuit_open(&m.id))
+        .filter(|m| {
+            m.enabled
+                && !tried.contains(&m.id)
+                && !circuit_open(&m.id)
+                && allowed.map_or(true, |set| set.contains(&m.id))
+        })
         .collect();
     // 主备两步：① 活跃非空 → 活跃集轮询；② 活跃为空 → 备胎集轮询；③ 皆空 → None
     let active: Vec<&CustomModel> = candidates.iter().copied().filter(|m| !m.standby).collect();
@@ -85,8 +94,9 @@ pub fn pick_with_state(
     canonical: &str,
     group: &[CustomModel],
     tried: &HashSet<String>,
+    allowed: Option<&HashSet<String>>,
 ) -> Option<CustomModel> {
-    pick_locked(&state.custom_lb_counters, canonical, group, tried)
+    pick_locked(&state.custom_lb_counters, canonical, group, tried, allowed)
 }
 
 /// pick_with_state 的 map 直收形态（测试/无状态环境复用）
@@ -95,10 +105,11 @@ fn pick_locked(
     canonical: &str,
     group: &[CustomModel],
     tried: &HashSet<String>,
+    allowed: Option<&HashSet<String>>,
 ) -> Option<CustomModel> {
     let mut map = counters.lock().unwrap_or_else(|e| e.into_inner());
     let counter = map.entry(canonical.to_string()).or_default();
-    pick_upstream(group, tried, counter)
+    pick_upstream(group, tried, allowed, counter)
 }
 
 // ==================== 会话粘上游（P2） ====================
@@ -188,6 +199,8 @@ pub fn note_circuit_failure(cm_id: &str, kind: FailKind) {
                 }
             }
             FailKind::Server => {
+                // fails 恒 ≥1（首插即 1，成功即整条清除），无需 fails==0 兜底分支
+                //（审查修复：原 else-if 分支不可达死代码）
                 if Instant::now() >= *until {
                     // 既有窗口已过期 = 新一次失败片段 → 递增并重设窗口；
                     // 未过期 = 同片段内的换号/并发失败，窗口维持原截止不后延
@@ -195,11 +208,6 @@ pub fn note_circuit_failure(cm_id: &str, kind: FailKind) {
                     let delay = (CIRCUIT_BASE_SECS << (*fails).saturating_sub(1).min(4))
                         .min(CIRCUIT_MAX_SECS);
                     *until = Instant::now() + Duration::from_secs(delay);
-                } else if *fails == 0 {
-                    let cand = Instant::now() + Duration::from_secs(CIRCUIT_BASE_SECS);
-                    if cand > *until {
-                        *until = cand;
-                    }
                 }
             }
         })
@@ -291,7 +299,7 @@ mod tests {
         let c = counter();
         let mut hits = HashMap::new();
         for _ in 0..8 {
-            let picked = pick_upstream(&group, &HashSet::new(), &c).unwrap();
+            let picked = pick_upstream(&group, &HashSet::new(), None, &c).unwrap();
             *hits.entry(picked.id).or_insert(0usize) += 1;
         }
         assert_eq!(hits[&ida], 6);
@@ -306,10 +314,41 @@ mod tests {
         let c = counter();
         let mut tried = HashSet::new();
         tried.insert(ida.clone());
-        let picked = pick_upstream(&group, &tried, &c).unwrap();
+        let picked = pick_upstream(&group, &tried, None, &c).unwrap();
         assert_eq!(picked.id, idb);
         tried.insert(idb.clone());
-        assert!(pick_upstream(&group, &tried, &c).is_none());
+        assert!(pick_upstream(&group, &tried, None, &c).is_none());
+    }
+
+    /// 白名单约束（A1 审查修复）：allowed 外条目不参与选路；空白名单 = 排除；
+    /// None = 不限
+    #[test]
+    fn t02b_allowed_whitelist() {
+        let (ida, idb) = (uid(9), uid(9));
+        let group = vec![cm(&ida, 3, false), cm(&idb, 1, false)];
+        let c = counter();
+        // 仅白名单内 idb：即使 ida 权重更高也不命中
+        let mut allowed: HashSet<String> = HashSet::new();
+        allowed.insert(idb.clone());
+        for _ in 0..4 {
+            assert_eq!(
+                pick_upstream(&group, &HashSet::new(), Some(&allowed), &c).unwrap().id,
+                idb
+            );
+        }
+        // 白名单含组外条目（无害）：仅组内交集参与
+        allowed.insert("not-in-group".to_string());
+        assert_eq!(pick_upstream(&group, &HashSet::new(), Some(&allowed), &c).unwrap().id, idb);
+        // 空白名单 = 该池被该 Key 排除 → None
+        let empty: HashSet<String> = HashSet::new();
+        assert!(pick_upstream(&group, &HashSet::new(), Some(&empty), &c).is_none());
+        // None = 不限：恢复全组轮询（ida/idb 均可命中）
+        let mut hits = HashMap::new();
+        for _ in 0..8 {
+            let p = pick_upstream(&group, &HashSet::new(), None, &c).unwrap();
+            *hits.entry(p.id).or_insert(0usize) += 1;
+        }
+        assert!(hits.contains_key(&ida) && hits.contains_key(&idb));
     }
 
     /// 主备：活跃条目存在时备胎永不命中；活跃全熔断 → 备胎接管；活跃恢复 → 回流活跃
@@ -320,20 +359,20 @@ mod tests {
         let c = counter();
         // 活跃健康：备胎永不命中
         for _ in 0..6 {
-            assert_ne!(pick_upstream(&group, &HashSet::new(), &c).unwrap().id, ids);
+            assert_ne!(pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id, ids);
         }
         // 活跃全熔断 → 备胎接管
         note_circuit_failure(&ida, FailKind::Server);
         note_circuit_failure(&idb, FailKind::Server);
         assert_eq!(
-            pick_upstream(&group, &HashSet::new(), &c).unwrap().id,
+            pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id,
             ids,
             "活跃全熔断时备胎接管"
         );
         // 活跃恢复 → 回流活跃
         clear_circuit(&ida);
         clear_circuit(&idb);
-        assert_ne!(pick_upstream(&group, &HashSet::new(), &c).unwrap().id, ids);
+        assert_ne!(pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id, ids);
     }
 
     /// 熔断：连续失败进入冷却、选路跳过；窗口未过期内多次记账不递增（防放大）；
@@ -362,12 +401,12 @@ mod tests {
         let group = vec![cm(&id, 1, false), cm(&idb, 1, false)];
         let c = counter();
         for _ in 0..4 {
-            assert_eq!(pick_upstream(&group, &HashSet::new(), &c).unwrap().id, idb);
+            assert_eq!(pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id, idb);
         }
         // 成功即清
         clear_circuit(&id);
         assert!(!circuit_open(&id), "成功即清");
-        assert_eq!(pick_upstream(&group, &HashSet::new(), &c).unwrap().id, id);
+        assert_eq!(pick_upstream(&group, &HashSet::new(), None, &c).unwrap().id, id);
     }
 
     /// Auth 长窗：401/403/402 直接落 600s，不吃渐进表
@@ -449,10 +488,10 @@ mod tests {
         let mut a_hits = HashMap::new();
         let empty = HashSet::new();
         for _ in 0..8 {
-            let p = pick_locked(&counters, "model-a", &ga, &empty).unwrap();
+            let p = pick_locked(&counters, "model-a", &ga, &empty, None).unwrap();
             *a_hits.entry(p.id).or_insert(0) += 1;
             // B 组单条模型夹在中间轮询，不得影响 A 组分布
-            assert_eq!(pick_locked(&counters, "model-b", &gb, &empty).unwrap().id, idc);
+            assert_eq!(pick_locked(&counters, "model-b", &gb, &empty, None).unwrap().id, idc);
         }
         assert_eq!(a_hits[&ida], 6);
         assert_eq!(a_hits[&idb], 2);

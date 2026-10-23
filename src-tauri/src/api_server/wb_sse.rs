@@ -9,7 +9,7 @@
 //!
 //! 输入统一为行迭代器（便于首字超时等上层封装），不直接持有 Reader。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -917,21 +917,6 @@ pub fn stream_forward_ex_ns(
     (error_info, sent_any, failed_inline, usage, eof_truncated)
 }
 
-/// 兼容封装：旧三元组返回（既有调用方不感知流内失败标记；
-/// 新调用方请用 stream_forward_ex）
-pub fn stream_forward(
-    lines: InterruptibleLines,
-    tx: &Sender,
-    proto: crate::api_server::routes::Protocol,
-    chat_id: &str,
-    model: &str,
-    encoded: &HashSet<String>,
-) -> (Option<(i64, String)>, bool, Option<Value>) {
-    let (error_info, sent_any, _failed_inline, usage, _eof_truncated) =
-        stream_forward_ex_ns(lines, tx, proto, chat_id, model, encoded);
-    (error_info, sent_any, usage)
-}
-
 /// 非流式聚合：WB SSE → 内部 OpenAI completion（tool_calls 按 index 合并）
 /// 返回 (completion|None, error|None)
 pub fn aggregate<L: Iterator<Item = String>>(
@@ -1562,16 +1547,17 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, usage) = stream_forward(
+        let (err, sent_any, failed_inline, usage, eof_truncated) = stream_forward_ex(
             lines,
             &tx,
             crate::api_server::routes::Protocol::Responses,
             "resp_1",
             "glm-5.3",
-            &HashSet::new(),
         );
         assert!(err.is_none());
         assert!(sent_any);
+        assert!(!failed_inline);
+        assert!(!eof_truncated);
         assert!(usage.is_some());
         drop(tx);
 

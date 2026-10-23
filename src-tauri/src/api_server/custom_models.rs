@@ -140,19 +140,38 @@ pub fn upsert(data_dir: &Path, mut m: CustomModel) -> Result<Vec<CustomModel>, S
     if m.name.is_empty() {
         return Err("模型名称不能为空".into());
     }
+    // 审查修复（A5）：scheme 不区分大小写（RFC 3986）——`HTTPS://a.com` 合法，
+    // 原实现对大写 scheme 误拒；校验用小写副本，存储保留用户书写原样
+    let lower_url = m.base_url.to_ascii_lowercase();
     if m.base_url.is_empty()
-        || (!m.base_url.starts_with("http://") && !m.base_url.starts_with("https://"))
+        || (!lower_url.starts_with("http://") && !lower_url.starts_with("https://"))
     {
         return Err("API 地址必须以 http:// 或 https:// 开头".into());
     }
     let mut list = load(data_dir);
     let canonical = canonical_id(&m.name);
     // 完全重复校验（P1 放宽）：同名（canonical 相同）+ 同 base_url + 同 api_key
-    // = 无意义冗余，拒绝；同名不同上游（base_url 或 api_key 不同）= 上游组成员，放行
+    // = 无意义冗余，拒绝；同名不同上游（base_url 或 api_key 不同）= 上游组成员，放行。
+    // 审查修复（M-4）：base_url 比较做 trim + 去尾斜杠 + ASCII 小写归一——
+    // `https://A.com/v1` 与 `https://a.com/v1/` 是同一上游，不因书写差异绕过判定
+    // 审查修复（A6）：再剥 scheme 默认端口——`https://a.com:443` 与
+    // `https://a.com` 同上游（根路径形态；带路径形态如 `:443/v1` 与 IDN 同属
+    // 已知等价形态不做深归一，重复判定另有同名 + 同 api_key 双重约束兜底）。
+    // 仅剥与 scheme 匹配的默认端口（http://a.com:443 是显式非默认端口，保留）
+    let norm_base = |u: &str| {
+        let l = u.trim().trim_end_matches('/').to_ascii_lowercase();
+        if l.starts_with("https://") {
+            l.strip_suffix(":443").unwrap_or(&l).to_string()
+        } else if l.starts_with("http://") {
+            l.strip_suffix(":80").unwrap_or(&l).to_string()
+        } else {
+            l
+        }
+    };
     if let Some(dup) = list.iter().find(|e| {
         e.id != m.id
             && canonical_id(&e.name) == canonical
-            && e.base_url == m.base_url
+            && norm_base(&e.base_url) == norm_base(&m.base_url)
             && e.api_key == m.api_key
     }) {
         return Err(format!("相同模型与上游地址/Key 的条目已存在：{}", dup.name));
@@ -322,12 +341,14 @@ mod tests {
         assert_eq!(chat_url("https://api.openai.com/v1/"), "https://api.openai.com/v1/chat/completions");
     }
 
-    /// 校验：空名称 / 非法 base_url 拒绝
+    /// 校验：空名称 / 非法 base_url 拒绝；大写 scheme 合法（A5：scheme 不区分大小写）
     #[test]
     fn t04_validation() {
         let f = Fixture::new();
         assert!(upsert(&f.0, CustomModel { name: "".to_string(), base_url: "https://a.com".into(), ..Default::default() }).is_err());
         assert!(upsert(&f.0, CustomModel { name: "x".into(), base_url: "ftp://a.com".into(), ..Default::default() }).is_err());
+        // A5 审查修复：大写 scheme 不再误拒（RFC 3986 scheme 大小写不敏感）
+        assert!(upsert(&f.0, CustomModel { name: "up".into(), base_url: "HTTPS://a.com".into(), ..Default::default() }).is_ok());
     }
 
     /// P1：同名不同 base_url 多条 upsert 成功（上游组）；find_enabled_all 全量返回；
@@ -374,5 +395,25 @@ mod tests {
         let f = Fixture::new();
         let list = upsert(&f.0, CustomModel { name: "w".into(), base_url: "https://w.com".into(), weight: 0, ..Default::default() }).unwrap();
         assert_eq!(list[0].weight, 1);
+    }
+
+    /// A6 审查修复：默认端口归一——https://a.com:443 与 https://a.com 判同一上游
+    /// （重复拒绝）；显式非默认端口（:8443）与 scheme 不匹配端口（http://:443）
+    /// 保留，不误判
+    #[test]
+    fn t08_default_port_normalized() {
+        let f = Fixture::new();
+        let _ = upsert(&f.0, CustomModel { name: "m".into(), base_url: "https://a.com".into(), api_key: "k1".into(), ..Default::default() }).unwrap();
+        // 显式默认端口 = 同上游（root 形态），完全重复拒绝
+        assert!(upsert(&f.0, CustomModel { name: "m".into(), base_url: "https://a.com:443".into(), api_key: "k1".into(), ..Default::default() }).is_err());
+        // 显式非默认端口 = 不同上游，放行
+        assert!(upsert(&f.0, CustomModel { name: "m".into(), base_url: "https://a.com:8443".into(), api_key: "k1".into(), ..Default::default() }).is_ok());
+        // http 服务的 :443 是显式非默认端口，与 https://a.com 不同上游，放行
+        assert!(upsert(&f.0, CustomModel { name: "m".into(), base_url: "http://a.com:443".into(), api_key: "k1".into(), ..Default::default() }).is_ok());
+        // http 默认端口 :80 同样归一
+        let _ = upsert(&f.0, CustomModel { name: "h".into(), base_url: "http://b.com".into(), api_key: "k1".into(), ..Default::default() }).unwrap();
+        assert!(upsert(&f.0, CustomModel { name: "h".into(), base_url: "http://b.com:80".into(), api_key: "k1".into(), ..Default::default() }).is_err());
+        // :4430 等 443 前缀端口不受 strip_suffix 误剥影响
+        assert!(upsert(&f.0, CustomModel { name: "m".into(), base_url: "https://a.com:4430".into(), api_key: "k1".into(), ..Default::default() }).is_ok());
     }
 }

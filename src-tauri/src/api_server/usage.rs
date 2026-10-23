@@ -230,7 +230,8 @@ impl DayStats {
 }
 
 /// 用量分桶（资源池维度分账）：Trae = Trae 模型请求；Wb = WB 上游请求；
-/// Custom = 自定义模型（custom_models.json 命中直达）请求；Qoder = Qoder 上游请求；
+/// Custom = 自定义模型（custom_models.json 上游组，统一调度尾部兜底源）请求；
+/// Qoder = Qoder 上游请求；
 /// BuddyAi = Buddy 国际版（buddy-ai 独立池）请求（§3.1 记账分区，与国内混计禁止）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageBucket {

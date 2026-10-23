@@ -89,6 +89,14 @@ fn cmp_version(a: (u64, u64, u64), b: (u64, u64, u64)) -> std::cmp::Ordering {
     a.cmp(&b)
 }
 
+/// D1 审查修复：安装包文件名白名单——Windows 路径会被拼入 `cmd /C start` 命令行，
+/// 仅放行字母/数字（含 Unicode，中文安装包名合法）/点/下划线/连字符/空格，
+/// 拒绝一切 cmd 元字符（& | ^ % < > " ! 等非白名单字符）与控制字符，杜绝命令
+/// 注入（防御纵深：file_path 已有 temp 目录归属 + 资产名绑定 + SHA256 三道校验）。
+fn is_safe_installer_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
+}
+
 /// 读当前系统代理（即用户 VPN）为 ureq 可用的代理 URL；未启用或格式异常返回 None。
 /// Windows：注册表 ProxyServer 有两种形态："host:port" 或 "http=..;https=..;ftp=.."（按协议区分）。
 /// macOS：scutil --proxies（F-75 M2-2.1 接线 platform::proxy_ctl——原直调
@@ -699,9 +707,16 @@ pub fn update_run_installer(
         _ => return Err("安装包版本不大于当前版本，已中止".to_string()),
     }
     // 文件名与资产名绑定校验（防 file_path / asset_name 错位组合安装）
-    if path.file_name().map(|n| n.to_string_lossy().into_owned()).as_deref() != Some(asset_name.as_str())
-    {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if file_name != asset_name {
         return Err("安装包文件名与资产名不匹配，已中止".to_string());
+    }
+    // D1 审查修复：文件名白名单（拒绝 cmd 元字符，防命令注入）
+    if !is_safe_installer_name(&file_name) {
+        return Err(format!("安装包文件名含非法字符，已中止：{file_name}"));
     }
     // 下载-安装窗口 TOCTOU 防护（H-4）：对磁盘文件复验下载步落盘的 sidecar
     // 校验清单——仅「通过过完整性校验」的安装包才允许进入安装
@@ -775,7 +790,8 @@ pub fn update_run_installer(
             }
         }
 
-        // 提示前端后退出，让安装器接管（安装钩子已先等本进程自行退出再兜底解锁）
+        // 提示前端后退出，让安装器接管（安装钩子已先宽限等待本进程自行退出：
+        // WM_CLOSE 优雅请求 + Sleep 1.2s + 30×500ms 轮询，超时才 /F 兜底强杀解锁）
         // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
         crate::events::emit_logged(
             &app,
@@ -985,5 +1001,20 @@ mod tests {
         let text = r#"{ "version": "3.2.9", "assets": {} }"#;
         let m: UpdateManifest = serde_json::from_str(text).unwrap();
         assert_ne!(parse_version(&m.version), Some((3, 3, 3)));
+    }
+
+    #[test]
+    fn safe_installer_name_白名单与cmd元字符拒绝() {
+        // D1 审查修复：常规资产名（字母数字点下划线连字符空格/中文）放行，
+        // cmd 元字符与控制字符拒绝（防 `cmd /C start` 命令注入）
+        assert!(is_safe_installer_name("AI Work 助手_3.5.4_x64-setup.exe"));
+        assert!(is_safe_installer_name("AI.Work._3.3.3_x64-setup.exe"));
+        for bad in [
+            "a&calc.exe", "a|calc.exe", "a^b.exe", "a%PATH%.exe", "a<b.exe",
+            "a>b.exe", "a\"b.exe", "a!b.exe", "a\tb.exe", "a\nb.exe", "a;b.exe",
+        ] {
+            assert!(!is_safe_installer_name(bad), "应拒绝: {bad:?}");
+        }
+        assert!(!is_safe_installer_name(""));
     }
 }

@@ -128,15 +128,26 @@ export default function GeneralSettingsPanel() {
     });
   };
 
-  // 抓手按下启动拖拽：window 级 mousemove 实时检测指针所在行并换位（松开即止）。
+  // 抓手按下启动拖拽：window 级 pointermove 实时检测指针所在行并换位（松开即止）。
   // 不用 HTML5 DnD——Tauri Windows 端 dragDropEnabled 默认开启，原生文件拖放
-  // 处理器会拦截网页内 dragstart，draggable 完全失效（实测无法拖动）
-  const beginDrag = (key: AppKey) => (e: React.MouseEvent) => {
+  // 处理器会拦截网页内 dragstart，draggable 完全失效（实测无法拖动）。
+  // C2 审查修复：mouse* → pointer*（统一鼠标/触屏/触控笔）；setPointerCapture
+  // 保证拖出窗口边缘时 move/up 仍派发到抓手（捕获目标事件照常冒泡至 window），
+  // pointercancel（系统手势打断/设备切换）与 buttons===0（焦点被抢走后松键落别处）
+  // 双兜底，杜绝拖拽态卡死到下一次点击
+  const beginDrag = (key: AppKey) => (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (e.button !== 0) return; // 仅左键/主指针启动拖拽（右/中键不触发换位，contextmenu 正常弹出）
     e.preventDefault(); // 防止拖动时选中文字
+    const handle = e.currentTarget;
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch {
+      /* 捕获失败不致命：window 级监听仍覆盖窗口内场景 */
+    }
     let current = key;
     setDragKey(current);
-    const onMove = (ev: MouseEvent) => {
-      // 鼠标按键已全部抬起却没有收到 mouseup：焦点被抢走（alt-tab/系统弹窗）后
+    const onMove = (ev: PointerEvent) => {
+      // 鼠标按键已全部抬起却没有收到 pointerup：焦点被抢走（alt-tab/系统弹窗）后
       // 松开鼠标的事件落在了别处。此时若继续处理移动会无按键持续换位、拖拽态
       // 卡死到下一次点击，且乱序会被「保存设置」持久化——立即结束拖拽。
       if (ev.buttons === 0) {
@@ -159,13 +170,31 @@ export default function GeneralSettingsPanel() {
     };
     const onUp = () => {
       setDragKey(null);
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
       dragCleanupRef.current = null;
     };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
     dragCleanupRef.current = onUp;
+  };
+
+  // C1 审查修复（键盘替代）：抓手聚焦后 ↑/↓ 方向键逐位移动——与拖拽共用同一
+  // splice 换位算法与 getOrderedApps 展示序，到达边界时不动
+  const moveByKeyboard = (key: AppKey, dir: -1 | 1) => {
+    setForm((prev) => {
+      if (!prev) return prev;
+      const order = getOrderedApps(prev);
+      const idx = order.indexOf(key);
+      const to = idx + dir;
+      if (idx < 0 || to < 0 || to >= order.length) return prev;
+      const next = [...order];
+      next.splice(idx, 1);
+      next.splice(to, 0, key);
+      return { ...prev, app_order: next };
+    });
   };
 
   // 设置应用图标：null 或与内置默认同名 = 删除自定义项（回退 APP_TABS 默认图标）
@@ -289,18 +318,32 @@ export default function GeneralSettingsPanel() {
                     dragging ? 'opacity-40' : pinned && 'opacity-60',
                   )}
                 >
-                  {/* 拖拽抓手：按住上下拖动实时换位（仅抓手触发，避免误碰勾选/图标按钮） */}
-                  <span
-                    title="按住拖动调整显示顺序"
-                    className="flex shrink-0 cursor-grab active:cursor-grabbing"
+                  {/* 拖拽抓手：按住上下拖动实时换位（仅抓手触发，避免误碰勾选/图标按钮）。
+                      C1 审查修复：span → button——键盘用户可 Tab 聚焦后用 ↑/↓ 逐位移动
+                      （aria-label 声明操作方式）；touch-action:none 防触屏拖动时页面滚动 */}
+                  <button
+                    type="button"
+                    title="拖动或按 ↑/↓ 方向键调整显示顺序"
+                    aria-label={`调整「${tab.label}」的侧边栏显示顺序`}
+                    onPointerDown={beginDrag(tab.key)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        moveByKeyboard(tab.key, -1);
+                      } else if (e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        moveByKeyboard(tab.key, 1);
+                      }
+                    }}
+                    style={{ touchAction: 'none' }}
+                    className="flex h-7 w-5 shrink-0 cursor-grab items-center justify-center rounded-md bg-transparent active:cursor-grabbing focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
                   >
                     <GripVertical
                       size={14}
-                      onMouseDown={beginDrag(tab.key)}
                       className="text-slate-300 dark:text-zinc-600"
                       aria-hidden
                     />
-                  </span>
+                  </button>
                   {/* 行首图标：点击弹出候选表更换该应用在侧边栏的显示图标（仅 UI 偏好） */}
                   <button
                     type="button"

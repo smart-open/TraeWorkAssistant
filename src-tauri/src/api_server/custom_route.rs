@@ -53,21 +53,50 @@ fn rebuild_body(core: &Value, cm: &CustomModel) -> Vec<u8> {
 }
 
 /// custom 专用 agent（快速失败参数）：连接超时 3s（快速失败切换——连接拒绝/
-/// 3s 超时立即进入组内轮换）/ 写 30s / 空闲读 300s（与 wb_agent 同读口径）
-fn custom_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_read(std::time::Duration::from_secs(300))
-        .timeout_write(std::time::Duration::from_secs(30))
-        .timeout_connect(std::time::Duration::from_secs(3))
-        .max_idle_connections(20)
-        .max_idle_connections_per_host(20)
-        .build()
+/// 3s 超时立即进入组内轮换）/ 写 30s / 空闲读 300s（与 wb_agent 同读口径）。
+/// 审查修复（M-1）：静态复用（OnceLock）——Agent 即连接池宿主，每次请求新建
+/// 会让 max_idle_connections 等池参数形同虚设、每次 attempt 全新 TCP/TLS 握手
+fn custom_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_read(std::time::Duration::from_secs(300))
+            .timeout_write(std::time::Duration::from_secs(30))
+            .timeout_connect(std::time::Duration::from_secs(3))
+            .max_idle_connections(20)
+            .max_idle_connections_per_host(20)
+            .build()
+    })
+}
+
+/// 探活专用 agent（B3 审查修复）：不与网关 agent 共用——网关读超时 300s，
+/// probe 若复用，命令层 30s 超时返回后慢上游仍会把阻塞线程拖住最长 300s。
+/// 独立 20s 读/总超时 + 3s 连接：探活全链路收敛在 30s 命令超时内
+fn probe_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(20))
+            .timeout_read(std::time::Duration::from_secs(20))
+            .timeout_write(std::time::Duration::from_secs(10))
+            .timeout_connect(std::time::Duration::from_secs(3))
+            .build()
+    })
 }
 
 /// 发起自定义上游请求（Bearer 鉴权；custom 专用 agent）
 fn make_custom_request(cm: &CustomModel, body: &[u8]) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
+    make_request_with(cm, body, custom_agent())
+}
+
+/// make_custom_request 的 agent 参数化形态（探活复用独立短超时 agent）
+fn make_request_with(
+    cm: &CustomModel,
+    body: &[u8],
+    agent: &ureq::Agent,
+) -> Result<Box<dyn std::io::Read + Send>, (u16, String)> {
     let url = custom_models::chat_url(&cm.base_url);
-    let mut req = custom_agent().post(&url);
+    let mut req = agent.post(&url);
     req = req.set("content-type", "application/json");
     req = req.set("accept", "text/event-stream");
     if !cm.api_key.is_empty() {
@@ -93,7 +122,8 @@ fn classify_failure(status: u16) -> FailKind {
     }
 }
 
-/// 请求日志 acct_name：`name#id前4` 区分同组多条（同名不同上游日志可读性）
+/// 请求日志 acct_name：`name#id第4~7字节` 区分同组多条（同名不同上游日志可读性；
+/// id 形如 `cm-<12hex>`，非标 id 安全回退 name）
 fn acct_display(cm: &CustomModel) -> String {
     match cm.id.get(3..7) {
         Some(s) if !s.is_empty() => format!("{}#{}", cm.name, s),
@@ -107,24 +137,34 @@ fn pick_next(
     state: &Arc<ApiSharedState>,
     group: &[CustomModel],
     tried: &HashSet<String>,
+    allowed: Option<&HashSet<String>>,
     session_key: Option<&String>,
     canonical: &str,
 ) -> Option<CustomModel> {
     if let Some(sk) = session_key {
         if let Some(id) = custom_lb::sticky_upstream(state, sk) {
-            if !tried.contains(&id) {
+            if !tried.contains(&id) && allowed.map_or(true, |set| set.contains(&id)) {
                 if let Some(cm) = group.iter().find(|m| m.id == id) {
                     return Some(cm.clone());
                 }
             }
         }
     }
-    custom_lb::pick_with_state(state, canonical, group, tried)
+    custom_lb::pick_with_state(state, canonical, group, tried, allowed)
+}
+
+/// Key 白名单约束解析（A1 审查修复：与 qoder_route 取号同模式——从 key_id
+/// 解析 custom 池约束，None = 不限；绑定/混合白名单 Key 不再漏进白名单外上游）
+fn allowed_for_key(state: &ApiSharedState, key_id: &str) -> Option<HashSet<String>> {
+    super::api_keys::constraints_for(&state.data_dir, key_id)
+        .and_then(|rk| rk.pool_constraints("custom"))
+        .and_then(|c| c.allowed)
 }
 
 /// 连通性探活（custom_model_test 命令底层）：向自定义上游发一条最小 chat 请求
 /// （max_tokens=16 + stream:true，与网关同款 SSE 处理），返回成功摘要 / 失败原因。
 /// 阻塞调用——调用方需放入 spawn_blocking 并外加超时（命令层 30s）。
+/// B3 审查修复：走 probe_agent 独立短超时（20s），命令层超时后不再有长残留线程
 pub fn probe(cm: &CustomModel) -> Result<String, String> {
     let body = json!({
         "model": cm.name,
@@ -134,7 +174,7 @@ pub fn probe(cm: &CustomModel) -> Result<String, String> {
     })
     .to_string()
     .into_bytes();
-    let reader = make_custom_request(cm, &body).map_err(|(status, resp_body)| {
+    let reader = make_request_with(cm, &body, probe_agent()).map_err(|(status, resp_body)| {
         let preview: String = resp_body.chars().take(200).collect();
         if preview.is_empty() {
             format!("上游返回 status {status}（无响应体；请检查 API 地址与 Key）")
@@ -206,6 +246,8 @@ pub fn custom_stream_chat(
         let chat_id = chat_id_for(proto);
         // 请求日志附带：API Key 展示名 + 自定义模型名（即"账号"，匿名 → "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        // A1 审查修复：Key 白名单约束传入组内选路（含粘性命中过滤）
+        let allowed = allowed_for_key(&state, &key_id);
 
         // SSE keep-alive 15s：防中间层回收长流（与 WB/solo 路径同策略）。
         // P1 修复：与 routes.rs 同款 watch + DoneSignal 方案，替换旧 AtomicBool
@@ -247,7 +289,7 @@ pub fn custom_stream_chat(
         let mut last_err = String::from("自定义上游组内无可用条目");
 
         loop {
-            let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical)
+            let Some(cm) = pick_next(&state, &group, &tried, allowed.as_ref(), session_key.as_ref(), &canonical)
             else {
                 // 组内全熔断/已试尽（pool_health 前置下理论不可达，防御性兜底）
                 set_last_error(&state, format!("custom model={} group exhausted", model));
@@ -317,11 +359,12 @@ pub fn custom_stream_chat(
                         }
                     }
                     Ok(lines) => {
-                        // 可中断行源：stream_forward 停滞期间周期性检查客户端断连。
-                        // 自定义上游无 namespace 展平编码 → 空集合禁用编码名拆分（审查 F4）
-                        let (error_info, sent_any, up_usage) = wb_sse::stream_forward(
-                            lines, &tx, proto, &chat_id, &model, &std::collections::HashSet::new(),
-                        );
+                        // 可中断行源：stream_forward_ex 停滞期间周期性检查客户端断连。
+                        // 自定义上游无 namespace 展平编码 → ex 内部按空集合禁用编码名拆分（审查 F4）
+                        // B1 审查修复：迁移 stream_forward_ex——获取 failed_inline/eof_truncated，
+                        // 流内失败事件（failed/error 已就地透传）不再被误记为成功
+                        let (error_info, sent_any, failed_inline, up_usage, eof_truncated) =
+                            wb_sse::stream_forward_ex(lines, &tx, proto, &chat_id, &model);
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         {
                             // 宽口径提取（别名 + 字符串数字形态，审查 P2）
@@ -331,13 +374,25 @@ pub fn custom_stream_chat(
                                 super::usage::UsageBucket::Custom,
                                 up_usage.as_ref().map(wb_sse::cached_tokens_of).unwrap_or(0),
                             );
+                            // B1 审查修复：failed_inline 时 error_info=None 但非成功
                             state.record_usage_custom(
-                                &model, &key_id, error_info.is_none(), true,
+                                &model, &key_id, error_info.is_none() && !failed_inline, true,
                                 duration_ms, pt, ct,
                             );
                         }
                         match error_info {
                             None => {
+                                if failed_inline {
+                                    // B1 审查修复：流内失败已就地透传客户端（对齐 wb_route 语义）——
+                                    // 不重试、不清熔断、不绑粘性、不记成功；亦不计熔断失败
+                                    // （内容类失败计入冷却会造成上游过度冷却）
+                                    state.logger.log_request(
+                                        "custom", "POST", proto.log_path(), &model, true, 200, "custom",
+                                        duration_ms, &key_name, &acct_name,
+                                        Some("流内失败已透传客户端"),
+                                    );
+                                    break;
+                                }
                                 // 成功：清熔断 + 记会话粘上游
                                 custom_lb::clear_circuit(&cm.id);
                                 if let Some(sk) = &session_key {
@@ -345,7 +400,9 @@ pub fn custom_stream_chat(
                                 }
                                 state.logger.log_request(
                                     "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                                    duration_ms, &key_name, &acct_name, None,
+                                    duration_ms, &key_name, &acct_name,
+                                    // B1 审查修复：EOF 截断的成功行标注截断（与上游原貌不符，排障可观测）
+                                    eof_truncated.then(|| "上游 EOF 截断（未收到 Done），已按协议补齐终止帧"),
                                 );
                                 break;
                             }
@@ -355,7 +412,9 @@ pub fn custom_stream_chat(
                                 set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
                                 state.logger.log_request(
                                     "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                                    duration_ms, &key_name, &acct_name, Some(&msg),
+                                    duration_ms, &key_name, &acct_name,
+                                    // 审查修复（M-3）：失败 attempt 错误标注带上游业务码
+                                    Some(&format!("upstream code={} msg={}", code, msg)),
                                 );
                                 // SSE 铁律：sent_any 后就地收尾，不轮换（不拼第二份响应）
                                 attempt += 1;
@@ -416,6 +475,8 @@ pub async fn custom_aggregate_chat(
         let _inflight = guard; // 随聚合完成释放（§4.5）
         // 请求日志附带：API Key 展示名 + 自定义模型名（即"账号"，匿名 → "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        // A1 审查修复：Key 白名单约束传入组内选路（含粘性命中过滤）
+        let allowed = allowed_for_key(&state, &key_id);
         let prepared_core = parse_body_once(&body_vec);
         let session_key = super::dispatch::pool_session_key(&prepared_core);
         let canonical = super::unified_catalog::canonical_id(&model);
@@ -423,9 +484,13 @@ pub async fn custom_aggregate_chat(
         let max_attempts = group.len().min(3);
         let mut attempt = 0usize;
         let mut last_err = String::from("自定义上游组内无可用条目");
+        // 终态 HTTP 状态码（审查修复 M-2：与流式路径口径对齐——组耗尽 503 /
+        // 上游 HTTP 错误透传 status / 首字超时 504 / 空响应与流内错误 502，
+        // 不再一律 502，客户端可按状态码区分失败类别）
+        let mut last_status = 503u16;
 
         loop {
-            let Some(cm) = pick_next(&state, &group, &tried, session_key.as_ref(), &canonical)
+            let Some(cm) = pick_next(&state, &group, &tried, allowed.as_ref(), session_key.as_ref(), &canonical)
             else {
                 // 组内全熔断/已试尽（pool_health 前置下理论不可达，防御性兜底）；
                 // [DEBUG] 排障行由 loop 后收尾统一落（此处 break 即达，不重复）
@@ -455,6 +520,7 @@ pub async fn custom_aggregate_chat(
                     );
                     attempt += 1;
                     if attempt >= max_attempts {
+                        last_status = status;
                         break;
                     }
                     continue; // 换组内下一上游
@@ -473,6 +539,7 @@ pub async fn custom_aggregate_chat(
                     last_err = "自定义上游 10 秒内未响应（首字超时）".into();
                     attempt += 1;
                     if attempt >= max_attempts {
+                        last_status = 504;
                         break;
                     }
                     continue;
@@ -508,12 +575,17 @@ pub async fn custom_aggregate_chat(
                     set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
                     state.logger.log_request(
                         "custom", "POST", proto.log_path(), &model, stream, 200, "custom",
-                        duration_ms, &key_name, &acct_name, Some(&msg),
+                        duration_ms, &key_name, &acct_name,
+                        // 审查修复（M-3）：失败 attempt 错误标注带上游业务码，
+                        // 排障时不被 200（上游 HTTP 层真实状态）误导
+                        Some(&format!("upstream code={} msg={}", code, msg)),
                     );
                     // 本地聚合未向客户端产出任何字节 → 可安全轮换
                     last_err = msg;
                     attempt += 1;
                     if attempt >= max_attempts {
+                        // 流内业务码非 HTTP 状态语义 → 终态按 502 报客户端
+                        last_status = 502;
                         break;
                     }
                 }
@@ -527,6 +599,7 @@ pub async fn custom_aggregate_chat(
                     last_err = "自定义上游返回为空".into();
                     attempt += 1;
                     if attempt >= max_attempts {
+                        last_status = 502;
                         break;
                     }
                 }
@@ -540,7 +613,7 @@ pub async fn custom_aggregate_chat(
             stream,
             last_err,
         ));
-        Err(last_err)
+        Err((last_status, last_err))
     })
     .await;
 
@@ -570,10 +643,15 @@ pub async fn custom_aggregate_chat(
                         .unwrap()
                 })
         }
-        Ok(Err(msg)) => match proto {
-            Protocol::Anthropic => anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &msg),
-            _ => openai_error(StatusCode::BAD_GATEWAY, "upstream_error", &msg),
-        },
+        Ok(Err((status, msg))) => {
+            // 审查修复（M-2）：终态状态码与流式路径口径对齐（组耗尽 503 / 上游
+            // HTTP 错误透传 / 首字超时 504 / 空响应与流内错误 502），不再一律 502
+            let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            match proto {
+                Protocol::Anthropic => anthropic_error(sc, "api_error", &msg),
+                _ => openai_error(sc, "upstream_error", &msg),
+            }
+        }
         Err(e) => openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",

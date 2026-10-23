@@ -1278,8 +1278,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 全量发送会把那些字段回滚成旧值
       await api.misc.settingsSet(patch);
     } catch (err) {
-      // 回滚到修改前的值，避免 UI 显示与后端不一致
-      set({ settings: current });
+      // 字段级回滚（C3 审查修复）：只还原本次 patch 涉及的字段，且以最新 state
+      // 为基做函数式合并——整表回滚会把保存期间其他通道刚写入的字段一并回滚
+      set((s) => {
+        const revert: Partial<Settings> = {};
+        for (const k of Object.keys(patch) as Array<keyof Settings>) {
+          (revert as Record<string, unknown>)[k] = current[k];
+        }
+        return { settings: { ...(s.settings ?? defaultSettings()), ...revert } };
+      });
       get().pushToast('error', `保存设置失败：${String(err)}`);
       // rethrow：让调用方 catch 感知失败，避免误弹「已保存」成功提示
       throw err;

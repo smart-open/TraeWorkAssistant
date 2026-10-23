@@ -124,7 +124,7 @@ impl ResolvedKey {
     }
 
     /// 返回绑定的池标识（归一化后 Some("trae")/Some("buddy")/Some("buddy-ai")/
-    /// Some("qoder")；空或非法 = None）
+    /// Some("qoder")/Some("custom")；空或非法 = None）
     pub fn bind_pool(&self) -> Option<&'static str> {
         parse_bind_pool(&self.bind_pool)
     }

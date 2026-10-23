@@ -37,11 +37,6 @@ export function isPoolVisible(settings: Settings | null, pool: string): boolean 
   return app != null ? isAppVisible(settings, app) : true;
 }
 
-/** 可见应用列表（按固定顺序） */
-export function getVisibleApps(settings: Settings | null): AppKey[] {
-  return ALL_APPS.filter((a) => isAppVisible(settings, a));
-}
-
 /**
  * 应用展示顺序（用户自定义 + 默认兜底）：app_order 中出现的合法 key 按存储顺序在前
  * （后端 state.rs 已去重，这里再防御一次），未提及的按 ALL_APPS 默认顺序补在末尾——

@@ -32,6 +32,16 @@ use crate::tasks::qoder_upstream;
 pub fn default_priority() -> Vec<String> {
     vec!["buddy".into(), "trae".into(), "qoder".into()]
 }
+/// A2 审查修复：固定候选序共享常量（与缺省 priority 序对齐的尾部补全序）。
+/// dispatch 尾部补全与 unified_catalog 显示层「无显式序命中」回退共用——
+/// 此前显示层按 sources 插入序（trae→buddy→…）回退，与调度侧固定序漂移。
+pub const POOL_FIXED_ORDER: [TargetPool; 5] = [
+    TargetPool::Buddy,
+    TargetPool::Trae,
+    TargetPool::Qoder,
+    TargetPool::BuddyAi,
+    TargetPool::Custom,
+];
 
 /// 资源池标识（对外统一 `trae` / `buddy` / `qoder` / `buddy-ai` / `custom`）。
 /// v3 拍板：custom 为第五资源池参与统一调度规则（priority / per_model / Smart /
@@ -114,7 +124,8 @@ pub struct DispatchPolicy {
     /// 池间调度策略（缺省 smart）
     #[serde(default)]
     pub strategy: DispatchStrategy,
-    /// 池优先级顺序数组（取值 `trae` / `buddy`；priority 模式或 smart 并列时生效）
+    /// 池优先级顺序数组（取值 `trae` / `buddy` / `qoder` / `buddy-ai` / `custom`；
+    /// priority 模式或 smart 并列时生效，缺省序尾部补全循环追加 buddy-ai/custom）
     #[serde(default = "default_priority")]
     pub priority: Vec<String>,
     /// 模型级覆盖（键为 canonical_id，值同为优先级数组），优先于 priority；
@@ -573,9 +584,16 @@ pub fn resolve_target(
         (model.to_string(), None, false)
     };
     let canonical = canonical_id(&trae_final.0);
+    // v3 第四源：custom 上游组（P1 find_enabled_all，仅 enabled；提前求值供
+    // Trae 透传判定与 sources 填充共用，保证两处口径同源）
+    let custom_group = super::custom_models::find_enabled_all(&state.data_dir, model);
     // Trae 透传语义收窄：Qoder 目录命中的模型不再默认透传 Trae（透传会让
-    // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）
-    let trae_hit = (buddy_hit.0.is_none() && qoder_hit.is_none())
+    // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）。
+    // 审查修复（H-1）：custom 组命中的模型同样不再无条件透传 Trae——纯
+    // custom 模型（无同名 trae/buddy/qoder 源）为唯一源直达（见下方 v3 注释），
+    // 否则 Priority 策略下 Trae 排在 custom 之前，自建中转模型会被截胡打到
+    // Trae 上游报「模型不存在」；Smart 下仅靠「Trae 未声明倍率后置」侥幸正确
+    let trae_hit = (buddy_hit.0.is_none() && qoder_hit.is_none() && custom_group.is_empty())
         || trae_list.iter().any(|m| canonical_id(&m.id) == canonical);
     let sources = ModelSources {
         buddy: buddy_hit.0,
@@ -591,7 +609,7 @@ pub fn resolve_target(
         // v3 第四源：custom 上游组（P1 find_enabled_all，与 buddy/qoder 判定并列
         // 全量收集后按序筛选同构；命中信息由执行路径重新按 data_dir 读取一致性
         // 由 config_cache 5s TTL 保证，此处仅做源存在性与健康判定）
-        custom: super::custom_models::find_enabled_all(&state.data_dir, model),
+        custom: custom_group,
     };
 
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
@@ -726,7 +744,11 @@ pub fn resolve_target(
     // （issue #90 修复③a：前缀锁定 = 单池候选，不追加。v3：custom 尾部兜底位——
     // 默认候选序 = [buddy, trae, qoder, custom]）
     if forced_pool.is_none() {
-        for p in [TargetPool::Buddy, TargetPool::BuddyAi, TargetPool::Trae, TargetPool::Qoder, TargetPool::Custom] {
+        // 尾部补全固定序与缺省 priority 序对齐（[buddy, trae, qoder, buddy-ai,
+        // custom]）——审查修复：旧序把 buddy-ai 插在 trae 之前，Key 绑定 custom
+        // 等部分序回退时 buddy-ai 会先于 trae/qoder 接管，与默认候选序口径不一
+        // （A2 审查修复：序抽 POOL_FIXED_ORDER 共享常量，与显示层回退同源）
+        for p in POOL_FIXED_ORDER {
             if !order.contains(&p) {
                 order.push(p);
             }
@@ -1047,14 +1069,17 @@ fn pool_health(
             }
             Ok(())
         }
-        // v3：custom 上游组健康判定——任一上游未熔断即可候选（组内选路跳过
-        // 熔断条目；全熔断 → NoHealthyAccount 走现有 fallback 按序回退下一池）
+        // v3：custom 上游组健康判定——任一上游未熔断且（若 Key 绑定白名单）
+        // 在 allowed 内即可候选（组内选路跳过熔断与白名单外条目；全不可选 →
+        // NoHealthyAccount 走现有 fallback 按序回退下一池）。审查修复：预检
+        // 补 allowed 感知，与执行侧 pick_upstream 同口径（对齐四池
+        // has_selectable_in）——否则白名单排除组内全部健康条目时预检误判 Ok
+        // → pick_next None → 503 exhausted，丢失本可成功的跨池 fallback
         TargetPool::Custom => {
-            if sources
-                .custom
-                .iter()
-                .any(|cm| !super::custom_lb::circuit_open(&cm.id))
-            {
+            if sources.custom.iter().any(|cm| {
+                allowed.map_or(true, |set| set.contains(&cm.id))
+                    && !super::custom_lb::circuit_open(&cm.id)
+            }) {
                 Ok(())
             } else {
                 Err(FallbackReason::NoHealthyAccount)
@@ -1486,6 +1511,30 @@ mod tests {
         assert_eq!(r.model, "my-relay-model");
     }
 
+    /// 审查修复（H-1）：Priority 策略下纯 custom 模型不被 Trae 透传截胡——
+    /// trae_hit 透传分支须对 custom 组命中收窄，否则候选序 [trae, custom]
+    /// 让 Trae 先接管并报「模型不存在」（Smart 仅靠倍率后置侥幸正确，无测试固化）
+    #[test]
+    fn t91_custom_only_model_priority_not_hijacked_by_trae() {
+        let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&p));
+        f.seed_healthy(true);
+        super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "my-relay-model",
+                "base_url": "https://relay.example.invalid",
+                "enabled": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let r = f.resolve_no_session("my-relay-model").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom);
+        assert_eq!(r.model, "my-relay-model");
+    }
+
     /// v3 P4：custom 组全熔断 + 多源 → 按候选序回退下一池（fallback_from=Custom）
     #[test]
     fn t91_custom_all_circuit_falls_back() {
@@ -1508,6 +1557,42 @@ mod tests {
         assert!(f
             .app_log_contains("dispatch fallback: model=glm-5.3 pool=trae preferred=custom reason=no_healthy_account"));
         super::super::custom_lb::clear_circuit(&list[0].id);
+    }
+
+    /// 审查修复（Major-2）：pool_health Custom 分支补齐 allowed 白名单感知（与
+    /// 四池 has_selectable_in 同口径）——Key 绑定 custom 白名单排除组内全部
+    /// 健康条目时，预检须判不健康走跨池 fallback；修复前误判 Ok 选中 Custom，
+    /// 执行侧 pick_next None → 503 exhausted，丢失本可成功的回退
+    #[test]
+    fn t91_custom_whitelist_excluded_falls_back() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        let list = super::super::custom_models::upsert(
+            &f.dir,
+            serde_json::from_value(json!({
+                "name": "glm-5.3",
+                "base_url": "https://custom.example.invalid",
+                "enabled": true,
+                // 显式唯一 id：upsert 仅在 id 为空时按时间戳生成，并行测试同时间片
+                // 可能撞键（进程级全局熔断表按 id 键控）→ 显式 id 隔离熔断状态
+                "id": "cm-wlfix00000001"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cm_id = list[0].id.clone();
+        // 两个 Key 均须在首次 resolve 前种入：constraints_for 经 KEYS_STATE
+        // 首读固化内存副本，其后 seed 的 Key 不可见（bind 丢失走默认候选序）
+        f.seed_key("k-exclude", "custom", &["custom:other-model", "trae:t1"]);
+        f.seed_key("k-include", "custom", &[format!("custom:{cm_id}").as_str(), "trae:t1"]);
+        // 白名单不含组内唯一条目（trae:t1 保 fallback 目标池健康）→ 预检不健康 → 回退 Trae
+        let r = f.resolve_key("glm-5.3", "k-exclude").unwrap();
+        assert_eq!(r.pool, TargetPool::Trae);
+        assert_eq!(r.fallback_from, Some(TargetPool::Custom));
+        // 正对照：白名单含组内条目 → 正常选中 Custom，不误伤
+        let r = f.resolve_key("glm-5.3", "k-include").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom);
+        assert_eq!(r.fallback_from, None);
     }
 
     /// v3 P4：custom/xxx 前缀锁池 + 组全熔断 → NoHealthy(Custom) 显式报错

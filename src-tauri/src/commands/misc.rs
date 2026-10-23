@@ -840,6 +840,19 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
                     None => continue,
                 }
             }
+            // app_order 防御性校验（C4）：Settings 以 Vec<String> 反序列化——非数组
+            //（含 null）不写入避免破坏加载；数组含非字符串元素则显式报错（对齐
+            // _hhmm 报错风格：格式非法即拒绝，不静默截断用户排序改动）
+            if k == "app_order" {
+                match v.as_array() {
+                    None => continue,
+                    Some(arr) => {
+                        if arr.iter().any(|e| !e.is_string()) {
+                            return Err("app_order 数组元素必须为字符串".into());
+                        }
+                    }
+                }
+            }
             current_obj.insert(k.clone(), v.clone());
         }
     }

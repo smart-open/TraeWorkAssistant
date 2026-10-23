@@ -652,6 +652,14 @@ pub fn unified_models_ex(
     // enabled 即整体可命中（find_enabled_all 已按 enabled 过滤，天然一致）
     let mut custom_groups: Vec<(String, CustomGroupAgg)> = Vec::new();
     let mut custom_idx: HashMap<String, usize> = HashMap::new();
+    // 多源条目的 custom 侧声明候选（审查修复 M-5：镜像 buddy_ctx/qoder_ctx 模式，
+    // 由末段按命中侧选定，不再无条件覆盖 Trae/Buddy 侧声明）
+    let mut custom_ctx: HashMap<String, u64> = HashMap::new();
+    let mut custom_mt: HashMap<String, u64> = HashMap::new();
+    let mut custom_img: HashMap<String, bool> = HashMap::new();
+    // A3 审查修复：倍率同 ctx/mt/img 模式——多源条目的 custom 侧倍率候选记入
+    // map，由末段按命中侧选定（创建时的无条件 u.rate 覆盖为 v2 残留，口径不一致）
+    let mut custom_rate: HashMap<String, f64> = HashMap::new();
     for m in super::custom_models::load(data_dir).iter() {
         let canonical = canonical_id(&m.name);
         if canonical.is_empty() {
@@ -710,18 +718,24 @@ pub fn unified_models_ex(
                     enabled: g.enabled,
                 });
                 if g.enabled {
+                    // A3 审查修复：倍率不再无条件覆盖（v2 残留）——记入 map，
+                    // 由末段按命中侧选定，与 ctx/mt/img 口径一致
                     if let Some(r) = crate_rate {
-                        u.rate = Some(r);
+                        custom_rate.insert(canonical.clone(), r);
                     }
+                    // 审查修复（M-5，镜像 buddy_ctx/qoder_ctx 模式）：ctx/mt/img 候选
+                    // 记入 map，由末段按命中侧选定——v2「custom 命中即直达」语义残留
+                    // 的无条件覆盖，在 v3 尾部兜底后会把 Trae/Buddy 侧声明拖改成
+                    // custom 条目残留值
                     if let Some(c) = g.ctx {
-                        u.context_length = Some(c);
+                        custom_ctx.insert(canonical.clone(), c);
                     }
                     if let Some(t) = g.mt {
-                        u.max_tokens = Some(t);
+                        custom_mt.insert(canonical.clone(), t);
                     }
-                    // 审查修复：disabled 自定义条目不参与顶层 supports_image 覆盖
+                    // disabled 自定义条目不参与声明覆盖
                     // （停用模型的多模态声明不得改变聚合视图展示，仅 enabled 条目参与）
-                    u.supports_image = Some(g.img);
+                    custom_img.insert(canonical.clone(), g.img);
                 }
             }
             None => {
@@ -880,24 +894,28 @@ pub fn unified_models_ex(
             .iter()
             .filter_map(|s| TargetPool::parse(s))
             .collect();
-        // 命中池：自定义来源命中即直达（dispatch ⓪ 短路）→ 显示层同步命中 custom；
-        // 否则优先级序首个 enabled 源 → 任一 enabled 源 → 首源
-        let hit = u
-            .sources
+        // 命中池：审查修复（M-5）——v3 起 custom 为统一调度尾部兜底源（⓪ 短路
+        // 已移除），不再无条件优先，按 per_model/priority 序首个 enabled 源选定，
+        // 与 dispatch Priority 口径一致（Smart 动态重排属运行期行为，显示层取静态序）；
+        // 无显式序命中 → 按 dispatch 固定候选序（A2 审查修复：POOL_FIXED_ORDER，
+        // 旧实现按 sources 插入序 trae 先于 buddy/qoder，与调度侧尾部补全序漂移）
+        // → 首源
+        let hit = pools
             .iter()
-            .find(|s| s.pool == "custom" && s.enabled)
-            .map(|s| s.pool)
-            .or_else(|| {
-                pools
+            .find_map(|p| {
+                u.sources
                     .iter()
-                    .find_map(|p| {
-                        u.sources
-                            .iter()
-                            .find(|s| s.pool == p.as_str() && s.enabled)
-                            .map(|s| s.pool)
-                    })
+                    .find(|s| s.pool == p.as_str() && s.enabled)
+                    .map(|s| s.pool)
             })
-            .or_else(|| u.sources.iter().find(|s| s.enabled).map(|s| s.pool))
+            .or_else(|| {
+                super::dispatch::POOL_FIXED_ORDER.iter().find_map(|p| {
+                    u.sources
+                        .iter()
+                        .find(|s| s.pool == p.as_str() && s.enabled)
+                        .map(|s| s.pool)
+                })
+            })
             .or_else(|| u.sources.first().map(|s| s.pool));
         // rate = 命中侧倍率；未声明退可用源 → 首源 → 保持原值
         u.rate = hit
@@ -906,7 +924,8 @@ pub fn unified_models_ex(
             .or_else(|| u.sources.first().and_then(|s| s.rate))
             .or(u.rate);
         // context_length 跟随命中侧（issue #38-4）：命中 buddy → WB 目录值；
-        // 命中 trae/custom 或未命中 → Trae 四层链值（L1/L2/L3 诚实口径）。
+        // 命中 custom → 自定义条目声明（见下）；命中 trae 或未命中 → Trae 四层链值
+        //（L1/L2/L3 诚实口径）。
         // WB 池未启用时命中侧不可能是 buddy，残留快照数值不再拖低双源条目
         if hit == Some("buddy") {
             if let Some(c) = buddy_ctx.get(&canonical) {
@@ -927,6 +946,25 @@ pub fn unified_models_ex(
                 u.supports_image = Some(*img);
             }
         }
+        // context_length/max_tokens/supports_image 命中 custom → 自定义条目声明
+        // （审查修复 M-5：镜像 qoder/buddy 模式——纯 custom 条目命中侧必为 custom
+        // 而值已在创建时初始化、map 为空不影响；多源条目按命中侧取 custom 声明）
+        if hit == Some("custom") {
+            if let Some(c) = custom_ctx.get(&canonical) {
+                u.context_length = Some(*c);
+            }
+            if let Some(t) = custom_mt.get(&canonical) {
+                u.max_tokens = Some(*t);
+            }
+            if let Some(img) = custom_img.get(&canonical) {
+                u.supports_image = Some(*img);
+            }
+            // A3 审查修复：倍率同模式按命中侧选定（与上方 sources 命中侧取值
+            // 恒等，防御纵深：不依赖 UnifiedSource.rate 填充的隐式正确性）
+            if let Some(r) = custom_rate.get(&canonical) {
+                u.rate = Some(*r);
+            }
+        }
         // display：L1 人工 label 绝对最高优先（§3.2，覆盖双源展示名）；
         // 未人工维护时命中 buddy → 取 WB 展示名，命中 trae → 保持 Trae 侧（已含 L2 label）
         if let Some(label) = l1.get(&canonical).and_then(|m| m.label.clone()) {
@@ -944,6 +982,15 @@ pub fn unified_models_ex(
             }
         } else if u.supports_image.is_none() {
             if let Some(img) = buddy_img.get(&canonical) {
+                u.supports_image = Some(*img);
+            }
+        }
+        // enabled custom 条目声明兜底（有值优先，§3.3 #2 同款，审查修复 M-5）：
+        // 命中侧未声明图片能力而 enabled custom 组声明了 → 补齐——custom 是该
+        // 模型的可用源（任一 enabled 即可命中），声明真实可服务；disabled 条目
+        // 不入 map 不参与（t13 断言保持）
+        if u.supports_image.is_none() {
+            if let Some(img) = custom_img.get(&canonical) {
                 u.supports_image = Some(*img);
             }
         }
