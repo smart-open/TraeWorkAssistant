@@ -701,9 +701,9 @@ fn run_wb_stream(
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
-    // issue #138 P0：peek DOM 用完即弃——块内一次性提取 sticky/longctx 提示与
-    // effort 后立即释放，不再存活整条流（大 body 下 DOM 放大 3~6 倍）；sticky
-    // 键改走 from_slice 窄探测，块内也不再有整包 DOM
+    // issue #138 P0：peek DOM 用完即弃——块内一次性提取 longctx 提示与 effort
+    // 后立即释放，不再存活整条流（大 body 下 DOM 放大 3~6 倍）；sticky 键改走
+    // from_slice 窄探测，提取不再依赖整包 DOM
     let (sticky_key, effort_hint) = {
         let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
         // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
@@ -1302,9 +1302,9 @@ pub async fn wb_aggregate_chat(
         let state = WbView::new(state, buddy_ai);
         // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
-        // issue #138 P0：peek DOM 用完即弃——块内一次性提取 sticky/longctx 提示
-        // 与 effort 后立即释放，不再存活整条闭包；sticky 键改走 from_slice 窄探测，
-        // 块内也不再有整包 DOM（大 body 下 DOM 放大 3~6 倍）
+        // issue #138 P0：peek DOM 用完即弃——块内一次性提取 longctx 提示与 effort
+        // 后立即释放，不再存活整条闭包；sticky 键改走 from_slice 窄探测，提取不
+        // 再依赖整包 DOM（大 body 下 DOM 放大 3~6 倍）
         let (sticky_key, effort_hint) = {
             let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
             // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）

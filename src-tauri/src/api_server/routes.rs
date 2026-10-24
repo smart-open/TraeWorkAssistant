@@ -501,9 +501,7 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
                         // 如 trae:xxx）：交集为空即本池被整池排除。此时按原始白名单
                         // 条目回拼池名会得出「约束均指向其他池（trae）」，与本池即
                         // trae 的排除事实同句矛盾——直接给组/标签口径提示
-                        format!(
-                            " hint=该 Key 的组/标签约束与本池账号交集为空（交集为空即整池排除）：请编辑该 Key 的组/标签或账号白名单后重试"
-                        )
+                        " hint=该 Key 的组/标签约束与本池账号交集为空（交集为空即整池排除）：请编辑该 Key 的组/标签或账号白名单后重试".to_string()
                     } else {
                         // 约束条目涉及的池集合（裸 uid 防御性归属 buddy，与 pool_constraints 同口径）
                         let mut pools: Vec<&'static str> = Vec::new();
@@ -1947,7 +1945,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         let mut win = match race_trae_first_byte(
                             &state, &picked.uid, reader, primary_hdr, &tried, trae_allowed.as_ref(),
                             trae_dedicated.as_deref(), &body_vec, sanitize, &templates,
-                            // 对冲重建沿用主请求的激进口径与种子（issue #122 C1/C2）
+                            // 对冲重建沿用主请求的激进口径与种子基准（issue #122
+                            // C1/C2）：种子在 race_trae_first_byte 内经黄金比例
+                            // 翻搅，主/对冲异种子异指纹；激进口径原样沿用
                             seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
                         ) {
                             Ok(w) => w,

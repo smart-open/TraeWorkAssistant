@@ -651,6 +651,20 @@ mod tests {
         let raw = serde_json::to_vec(&body).unwrap();
         assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&body));
         assert!(matches!(SessionKey::from_slice(&raw), SessionKey::Fingerprint(k) if !k.is_empty()));
+
+        // ⑨ 根为非对象（数组/标量/数字）：probe 结构体反序列化失败 → 空指纹，
+        // 与 from_body 的 get("messages") 为 None 口径一致——防 probe 实现
+        // 改动引入两侧分歧
+        for nonobj in [json!([1, 2, 3]), json!("scalar"), json!(42)] {
+            let raw = serde_json::to_vec(&nonobj).unwrap();
+            assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&nonobj));
+            assert_eq!(
+                SessionKey::from_slice(&raw),
+                SessionKey::Fingerprint(String::new()),
+                "根为非对象应为空指纹：{:?}",
+                nonobj
+            );
+        }
     }
 
     #[test]
