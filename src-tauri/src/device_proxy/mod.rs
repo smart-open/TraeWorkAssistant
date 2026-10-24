@@ -207,7 +207,8 @@ impl ProxyServer {
         // p3-2e：直连白名单域（命中域跳过上游 VPN 直连目标，qoder 国内域经 VPN 实测全挂）
         log.log(&format!("上游直连白名单域: {}", direct_domains.join(", ")));
         // CA 安装状态如实探测输出（原为无条件提示，已安装也提示安装，误导用户）。
-        // 三平台收口走 cert_query（Windows=certutil 根存储 / mac=security find-certificate）
+        // 三平台收口走 cert_query（Windows=CryptoAPI 根存储进程内查询，#137 后
+        // certutil 不再参与探测 / mac=security find-certificate）
         if crate::platform::cert_ctl::cert_query("TraeDeviceProxyCA") {
             log.log("CA 证书已安装到系统信任域（TraeDeviceProxyCA）✅");
         } else {

@@ -108,8 +108,9 @@ fn port_pids(port: u16) -> Vec<String> {
     }
 
     // 行端口字段为网络字节序存于低 16 位（ntohs 语义，实证单测锁定）；
-    // 行数以能完整装入缓冲为上限兜底（status==0 时 OS 保证 dwNumEntries 行
-    // 完整，min 仅为防御性收窄，杜绝越界读）
+    // 行数以能完整装入缓冲为上限兜底（IPv4 行 6×u32 / IPv6 行 12×u32——
+    // MIB_TCP6ROW_OWNER_PID 为 48 字节；status==0 时 OS 保证 dwNumEntries 行
+    // 完整，min 仅为防御性收窄，杜绝越界读；步长须与行宽一致，/14 会漏读尾行）
     let mut pids: Vec<u32> = Vec::new();
     let mut record = |local_port: u32, pid: u32| {
         if u16::from_be((local_port & 0xFFFF) as u16) == port && !pids.contains(&pid) {
@@ -133,7 +134,7 @@ fn port_pids(port: u16) -> Vec<String> {
         let rows = unsafe {
             std::slice::from_raw_parts(
                 table.table.as_ptr(),
-                (table.dwNumEntries as usize).min(buf.len().saturating_sub(1) / 14),
+                (table.dwNumEntries as usize).min(buf.len().saturating_sub(1) / 12),
             )
         };
         for row in rows {

@@ -93,6 +93,8 @@ fn cmp_version(a: (u64, u64, u64), b: (u64, u64, u64)) -> std::cmp::Ordering {
 /// 仅放行字母/数字（含 Unicode，中文安装包名合法）/点/下划线/连字符/空格，
 /// 拒绝一切 cmd 元字符（& | ^ % < > " ! 等非白名单字符）与控制字符，杜绝命令
 /// 注入（防御纵深：file_path 已有 temp 目录归属 + 资产名绑定 + SHA256 三道校验）。
+/// 集合与下载侧 ensure_safe_asset_name 严格一致（审查 L4：两侧漂移会造成
+/// 「能下载、装不了」的安装包滞留）。
 fn is_safe_installer_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
 }
@@ -500,16 +502,14 @@ pub struct UpdateDownloaded {
 /// 路径传入 `cmd /C start` 拼接，且 asset_name 参与临时目录/sidecar 路径 join。
 /// Rust Command 对含空格参数自动加引号，但 `"` 可闭合引导，`&`/`^`/`%`/`!` 等
 /// 在 cmd 解析层存在注入面。白名单仅放行字母数字（Unicode 语义，含既有资产名
-/// 中文）+ 空格 `. _ - ( ) #`——发布流资产名 "AI Work 助手_<ver>_x64-setup.exe"
-/// / "_x64_zh-CN.msi" 全命中，其余一律拒绝。
+/// 中文）+ 空格 `. _ -`——与安装侧 is_safe_installer_name 同一严格集合（审查 L4：
+/// 括号/# 移出，发布流资产名不含这些字符；原宽集曾致 "setup(1).exe" 能下载、
+/// 安装被拒的滞留）。其余一律拒绝。
 fn ensure_safe_asset_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("资产文件名为空，已中止".to_string());
     }
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '(' | ')' | '#'))
-    {
+    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-')) {
         return Err(format!("资产文件名包含非法字符，已中止: {name}"));
     }
     Ok(())
@@ -821,8 +821,11 @@ pub fn update_run_installer(
             }
         }
 
-        // 提示前端后退出，让安装器接管（安装钩子已先宽限等待本进程自行退出：
-        // WM_CLOSE 优雅请求 + Sleep 1.2s + 30×500ms 轮询，超时才 /F 兜底强杀解锁）
+        // 提示前端后退出，让安装器接管（安装钩子首轮即 /F 强杀解锁文件占用，随后
+        // Sleep 1.2s + 30×500ms 存活探测轮询，超时才再 /F 兜底；应用内自动更新时
+        // 强杀可能先于本退出链执行，被打断的系统代理还原由下次在本应用内直开
+        // Trae/豆包等客户端（未注入代理）时的 cleanup_stale_local_proxy 自愈，
+        // 见 installer-hooks.nsh PREINSTALL 注释）
         // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
         crate::events::emit_logged(
             &app,
@@ -984,7 +987,9 @@ mod tests {
         assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64-setup.exe").is_ok());
         assert!(ensure_safe_asset_name("AI Work 助手_3.3.3_x64_zh-CN.msi").is_ok());
         assert!(ensure_safe_asset_name("AI.Work._3.3.3_x64-setup.exe").is_ok());
-        assert!(ensure_safe_asset_name("setup(1).exe").is_ok());
+        // 括号/# 随严格集拒绝（审查 L4：与安装侧 is_safe_installer_name 同集合，
+        // 防「能下载、装不了」）
+        assert!(ensure_safe_asset_name("setup(1).exe").is_err());
         // cmd 元字符 / 引号 / 分隔符 / 控制字符一律拒绝
         for bad in [
             "x&calc.exe",
@@ -1016,6 +1021,7 @@ mod tests {
     /// P4（#135 审查收尾）：pick_asset 仅接受 NSIS——MSI 兜底是死路
     /// （update_run_installer 统一按 NSIS 参数启动，msiexec /P 为补丁模式），
     /// 仅 MSI 的 release 显式报「没有可用的安装包资产」引导手动下载。
+    #[cfg(windows)] // mac 侧 asset_suffixes 只认 dmg，本测试的 exe 资产在 mac 上必 unwrap panic
     #[test]
     fn pick_asset_nsis_only() {
         let asset = |name: &str| {

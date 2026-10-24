@@ -714,7 +714,8 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
         return ErrKind::HardCredit;
     }
     // 11140 账号级风控（issue #136 反馈）：账号被上游限制使用 → Forbidden
-    // 禁用待申诉（申诉成功后 UI 手动启用恢复）；优先于状态码口径，
+    // 禁用待申诉（禁用为内存态，无手动启用入口——申诉处理后重启应用或重新登录
+    // 账号即随池快照重建恢复调度）；优先于状态码口径，
     // 该错误以 HTTP 400 形态到达时默认 400 → Client 仅短冷却，账号会被
     // 持续调度每请求必败
     if retry::is_account_restricted_error(body) {

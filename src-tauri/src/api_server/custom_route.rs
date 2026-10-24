@@ -394,17 +394,10 @@ pub fn custom_stream_chat(
                         }
                         match error_info {
                             None => {
-                                if failed_inline {
-                                    // B1 审查修复：流内失败已就地透传客户端（对齐 wb_route 语义）——
-                                    // 不重试、不清熔断、不绑粘性、不记成功；亦不计熔断失败
-                                    // （内容类失败计入冷却会造成上游过度冷却）
-                                    state.logger.log_request(
-                                        "custom", "POST", proto.log_path(), &model, true, 200, "custom",
-                                        duration_ms, &key_name, &acct_name,
-                                        Some("流内失败已透传客户端"),
-                                    );
-                                    break;
-                                }
+                                // （合并清理：此臂内原残留一段 failed_inline 处理——已在
+                                // 上方 failed_inline 分支 break，永不可达，属两侧同名修复
+                                // 叠加残留；wb_route.rs 的同名块无提前 break，非死代码，
+                                // 勿连带删除）
                                 // 成功：清熔断 + 记会话粘上游
                                 custom_lb::clear_circuit(&cm.id);
                                 if let Some(sk) = &session_key {

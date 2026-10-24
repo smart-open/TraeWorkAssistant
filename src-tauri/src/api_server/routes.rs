@@ -459,6 +459,15 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
             // B) allowed=Some(非空) 且作用域内 0 健康：白名单指向的本池账号均不可用
             let hint = if healthy_scope == 0 && healthy_total > 0 {
                 if matches!(&c.allowed, Some(s) if s.is_empty()) {
+                    // 组/标签约束键（审查 L2）：本池排除可能源于展开交集为空——原始
+                    // 白名单条目仍指向本池，按原始条目生成「均指向其他池」文案会同句
+                    // 自相矛盾；org 键直接给组/标签口径提示
+                    if rk.org_constrained {
+                        return format!(
+                            "{base} key={name} bind={bind} whitelist=0 dedicated={ded} healthy_in_scope=0 hint=该 Key 配置了组/标签约束，展开后与账号集合的交集未覆盖 {pool} 池账号（交集为空即整池排除）：请编辑该 Key 的组/标签或账号白名单后重试",
+                            pool = pool.as_str(),
+                        );
+                    }
                     // 约束条目涉及的池集合（裸 uid 防御性归属 buddy，与 pool_constraints 同口径）
                     let mut pools: Vec<&'static str> = Vec::new();
                     for u in &rk.allowed_accounts {

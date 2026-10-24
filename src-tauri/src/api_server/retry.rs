@@ -36,7 +36,8 @@ pub fn is_illegal_channel_error(body: &str) -> bool {
 /// 11140 账号级风控识别（issue #136 反馈）：上游判定「账号存在异常行为，
 /// 已被限制使用」，账号整体被限制、需申诉恢复。与 11128 渠道级（按请求
 /// 指纹、与账号无关、换号无意义）相反——11140 换号有意义，受限账号由
-/// classify → Forbidden 禁用（申诉成功后 UI 手动启用恢复）。
+/// classify → Forbidden 禁用（内存态，无手动启用入口——申诉处理后重启应用
+/// 或重新登录账号即随池快照重建恢复调度）。
 /// 中文关键词 + code 数字边界匹配（报文可能只带关键词或只带 code）
 pub fn is_account_restricted_error(body: &str) -> bool {
     body.contains("账号存在异常")
