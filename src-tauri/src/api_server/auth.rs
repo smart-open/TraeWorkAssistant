@@ -60,7 +60,7 @@ pub async fn bearer_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
     {
-        if len > super::routes::MAX_BODY_BYTES {
+        if len > super::routes::max_body_bytes() {
             return body_too_large();
         }
     }

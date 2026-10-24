@@ -12,9 +12,12 @@
 //! 旧根路径 JSON 文件仅作启动加载兼容。
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 
 /// 显式模式 TTL 默认值（滚动续期）；实际生效值可经
@@ -48,6 +51,7 @@ pub struct StickyStore {
 }
 
 /// 会话键：显式 conversationId 或消息指纹
+#[derive(Debug, PartialEq, Eq)]
 pub enum SessionKey {
     Explicit(String),
     Fingerprint(String),
@@ -63,12 +67,49 @@ impl SessionKey {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            // 审查 P3：cid 进 sticky 表做会话匹配并随绑定留档，超长值放大存储
-            // 体积——限长 128 字符；SessionKey 由 WB/Qoder 路由共用，两侧
-            // 确定性截断保证匹配一致性
-            return SessionKey::Explicit(cid.chars().take(128).collect());
+            return SessionKey::explicit(cid);
         }
         SessionKey::Fingerprint(fingerprint_messages(body))
+    }
+
+    /// 从原始请求字节提取会话键（P0-A issue #138 窄探测）：对 body 直接做
+    /// 目标字段反序列化，不构建整包 `serde_json::Value` DOM（DOM 内存开销
+    /// 约为原始字节 3~6 倍，大 body 下「只为取粘性键」的整包解析是驻留放大
+    /// 主力）。语义与 [SessionKey::from_body] 逐字节一致（回归测试锁定）：
+    /// 主探测失败（非 JSON / messages 非数组等罕见畸形）→ CidProbe 兜底显式键
+    /// → 仍失败则空指纹（与旧 `unwrap_or(json!({}))` 口径一致）。
+    pub fn from_slice(body: &[u8]) -> SessionKey {
+        if let Ok(p) = serde_json::from_slice::<SessionKeyProbe>(body) {
+            if let Some(cid) = p
+                .conversation_id
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return SessionKey::explicit(cid);
+            }
+            return SessionKey::Fingerprint(fingerprint_probe(&p.messages));
+        }
+        if let Ok(c) = serde_json::from_slice::<CidProbe>(body) {
+            if let Some(cid) = c
+                .conversation_id
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return SessionKey::explicit(cid);
+            }
+        }
+        SessionKey::Fingerprint(String::new())
+    }
+
+    /// 显式键统一构造：限长 128 字符（审查 P3：cid 进 sticky 表做会话匹配并随
+    /// 绑定留档，超长值放大存储体积；from_body / from_slice 两构造点共用，
+    /// 与 WB/Qoder 两侧确定性截断保证匹配一致性）
+    fn explicit(cid: &str) -> SessionKey {
+        SessionKey::Explicit(cid.chars().take(128).collect())
     }
 
     /// 缓存键（"cid:{id}" / "fp:{指纹}"）——池粘性键复用同一前缀约定（§4.4）
@@ -106,6 +147,15 @@ pub fn fingerprint_messages(body: &serde_json::Value) -> String {
             norm.push('|');
         }
     }
+    // 空 norm 早退已收口进 fingerprint_hex，两路径共用同一守卫
+    fingerprint_hex(norm)
+}
+
+/// 指纹落定：SHA256(norm) 前 6 位 hex。from_body / from_slice 两路径共用，
+/// 保证指纹逐字节一致（P0-A issue #138）。空 norm → 空串（不可粘）——
+/// 此守卫在此单点收口（SHA256("") ≠ 空，不早退会得到 "e3b0c4" 假指纹），
+/// 调用方无需重复判断。
+fn fingerprint_hex(norm: String) -> String {
     if norm.is_empty() {
         return String::new();
     }
@@ -113,6 +163,108 @@ pub fn fingerprint_messages(body: &serde_json::Value) -> String {
     h.update(norm.as_bytes());
     let digest = h.finalize();
     digest.iter().take(3).map(|b| format!("{:02x}", b)).collect()
+}
+
+// ---------- P0-A 窄探测类型族（issue #138）：不构建整包 DOM ----------
+
+/// 主探测：仅声明 sticky 所需字段，serde 未声明字段自动零分配流式跳过。
+/// conversation_id / role 统一经 Option<Value> 中转后 as_str() 判型——非字符串
+/// 不致主探测失败，退化为与 from_body 相同的空串/指纹口径。
+#[derive(Deserialize)]
+struct SessionKeyProbe {
+    #[serde(default)]
+    conversation_id: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "first_three_messages")]
+    messages: Vec<ProbeMessage>,
+}
+
+/// 兜底探测：主探测失败（罕见畸形，如 messages 为对象/标量）时仍尽力保留
+/// 显式粘性
+#[derive(Deserialize)]
+struct CidProbe {
+    #[serde(default)]
+    conversation_id: Option<serde_json::Value>,
+}
+
+/// 单条消息探测：content 见 [ProbeContent]。Default 派生供 visit_seq 的
+/// Value 中转容错使用——前 3 条中出现非对象元素（字符串/数字/null）时不致
+/// 主探测失败，落 Default（role=None/content=空）与 from_body 的
+/// "role 为空|content 为空|" 归一化口径一致（审查修复 2）
+#[derive(Debug, Default, Deserialize)]
+struct ProbeMessage {
+    #[serde(default)]
+    role: Option<serde_json::Value>,
+    #[serde(default)]
+    content: ProbeContent,
+}
+
+/// content 探测：String 原样 / 数组取 block.text 拼接 / null·对象·标量 → 空，
+/// 与 fingerprint_messages 的 content 规范化完全同款；任何 JSON 类型都解析
+/// 成功，不致主探测失败。仅前 3 条消息的 content 落地（第 4+ 条不解析）
+#[derive(Debug, Default)]
+struct ProbeContent(String);
+
+impl<'de> Deserialize<'de> for ProbeContent {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // 经 Value 中转做一次规范化 match：这是与 from_body 口径逐字节对齐的
+        // 最稳妥写法（手写全类型 visitor 易漏分支导致与 from_body 分歧）；
+        // 仅前 3 条消息的 content 有此瞬时开销，长对话尾部大字段不经过此处
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(Self(match v {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        }))
+    }
+}
+
+/// messages 反序列化：只实例化前 3 条（与 from_body 的 take(3) 对齐），第 4+ 条
+/// 经 IgnoredAny 零分配流式跳过——长对话尾部的图片 base64 等大字段完全不落地；
+/// 非数组（对象/标量/null）→ 解析失败，由 from_slice 走 CidProbe 兜底，与
+/// from_body「非数组 → 空指纹」口径对齐。数组元素若为非对象（审查修复 2），
+/// 经 Value 中转 from_value 失败即落 Default，不致主探测失败
+fn first_three_messages<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ProbeMessage>, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Vec<ProbeMessage>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("messages 数组")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut msgs = Vec::with_capacity(3);
+            for _ in 0..3 {
+                // Value 中转 + from_value 容错：非对象元素（"..." / 42 / null）
+                // 不上抛，落 Default 后归一化口径与 from_body 一致；仅前 3 条
+                // 有此瞬时开销，与 ProbeContent 的 Value 中转同口径
+                match seq.next_element::<serde_json::Value>()? {
+                    Some(v) => msgs.push(serde_json::from_value::<ProbeMessage>(v).unwrap_or_default()),
+                    None => break,
+                }
+            }
+            // 第 4+ 条：IgnoredAny 流式跳过，不构建 DOM
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(msgs)
+        }
+    }
+    d.deserialize_seq(V)
+}
+
+/// 探测指纹：与 fingerprint_messages 同构（前 ≤3 条 role|content.trim()|），
+/// 尾段共用 fingerprint_hex 落定，保证与 from_body 指纹逐字节一致
+fn fingerprint_probe(msgs: &[ProbeMessage]) -> String {
+    let mut norm = String::new();
+    for msg in msgs {
+        let role = msg.role.as_ref().and_then(|r| r.as_str()).unwrap_or("");
+        norm.push_str(role);
+        norm.push('|');
+        norm.push_str(msg.content.0.trim());
+        norm.push('|');
+    }
+    fingerprint_hex(norm)
 }
 
 /// 多池共用 sticky_bindings 表的键命名空间登记（F-80-余 v2）。
@@ -397,6 +549,108 @@ mod tests {
         assert_eq!(a, a2); // string 与 [{type:text}] 等价
         // 空 messages → 空指纹
         assert_eq!(fingerprint_messages(&json!({"messages":[]})), "");
+    }
+
+    /// P0-A 回归（issue #138）：from_slice（窄探测）与 from_body（全量 DOM）
+    /// 语义逐字节一致——显式（含 trim 与 128 截断）/ 指纹（string 与 blocks
+    /// 等价、第 4+ 条不参与）/ 畸形 messages（非数组 → 空指纹）/ 非 JSON body
+    #[test]
+    fn from_slice_matches_from_body_semantics() {
+        // ① 显式：trim 后同键，且与 from_body 相等
+        let body = body_with(Some("  conv-1 "), json!([{"role":"user","content":"hi"}]));
+        let raw = serde_json::to_vec(&body).unwrap();
+        assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&body));
+        assert_eq!(SessionKey::from_slice(&raw), SessionKey::Explicit("conv-1".into()));
+
+        // 显式：超长 cid 按 chars 限长 128，两构造点一致
+        let long = "长".repeat(200);
+        let body = body_with(Some(&long), json!([{"role":"user","content":"x"}]));
+        let raw = serde_json::to_vec(&body).unwrap();
+        match (SessionKey::from_body(&body), SessionKey::from_slice(&raw)) {
+            (SessionKey::Explicit(a), SessionKey::Explicit(b)) => {
+                assert_eq!(a, b);
+                assert_eq!(a.chars().count(), 128);
+            }
+            _ => panic!("显式键两侧应一致"),
+        }
+
+        // ② 指纹：string 与 blocks 等价、第 4+ 条不参与指纹（大体量尾部不解析）
+        let body = json!({"messages": [
+            {"role":"system","content":"you are helpful"},
+            {"role":"user","content":"hello"},
+            {"role":"assistant","content":[{"type":"text","text":"hi"},{"type":"text","text":" there"}]},
+            {"role":"user","content":"tail-ignored"},
+            {"role":"user","content":{"ignored":"object"}},
+        ]});
+        let raw = serde_json::to_vec(&body).unwrap();
+        assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&body));
+        assert!(matches!(SessionKey::from_slice(&raw), SessionKey::Fingerprint(k) if !k.is_empty()));
+
+        // ③ 畸形 messages（对象/标量/null）→ 空指纹，两侧一致
+        for bad in [
+            json!({"messages": {"role": "user"}}),
+            json!({"messages": "not-array"}),
+            json!({"messages": null}),
+        ] {
+            let raw = serde_json::to_vec(&bad).unwrap();
+            assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&bad));
+            assert_eq!(SessionKey::from_slice(&raw), SessionKey::Fingerprint(String::new()));
+        }
+
+        // ④ 非 JSON body → 空指纹（与旧 peek unwrap_or(json!({})) 口径一致）
+        assert_eq!(SessionKey::from_slice(b"not-json"), SessionKey::from_body(&json!({})));
+
+        // ⑤ cid / role 为非字符串：两侧一致退化为指纹路径（Option<Value> 口径）
+        let body = json!({"conversation_id": 42, "messages": [{"role": 1, "content":"x"}]});
+        let raw = serde_json::to_vec(&body).unwrap();
+        assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&body));
+        assert!(matches!(SessionKey::from_slice(&raw), SessionKey::Fingerprint(_)));
+
+        // ⑥ 空 norm → 空指纹单点收口回归（审查修复 1）：无 messages / 空数组 /
+        // cid trim 后为空 三类输入，两侧相等**且均为 Fingerprint("")**——
+        // 防「双侧同为 e3b0c4」的假修复（SHA256("") ≠ 空串，fingerprint_hex
+        // 不早退即得到假指纹，粘性判定 ends_with(':') 翻转、常量键粘死单账号）
+        for empty in [
+            json!({"model": "gpt-x"}),
+            json!({"messages": []}),
+            json!({"conversation_id": "   "}),
+            json!({"conversation_id": 42}),
+        ] {
+            let raw = serde_json::to_vec(&empty).unwrap();
+            assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&empty));
+            assert_eq!(
+                SessionKey::from_slice(&raw),
+                SessionKey::Fingerprint(String::new()),
+                "空 norm 应为空指纹而非 e3b0c4：{:?}",
+                empty
+            );
+        }
+
+        // ⑦ 非空 norm 不早退：content 全 null 时 norm = "||"（非空），
+        // 两侧相等且指纹非空——锁「仅真空 norm 早退」语义
+        let body = json!({"messages": [{"content": null}]});
+        let raw = serde_json::to_vec(&body).unwrap();
+        assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&body));
+        assert!(matches!(SessionKey::from_slice(&raw), SessionKey::Fingerprint(k) if !k.is_empty()));
+
+        // ⑧ 前 3 条中的非对象元素不致主探测失败（审查修复 2）：Value 中转
+        // from_value 失败落 Default，归一化 "role 空|content 空|" 与 from_body
+        // 的 msg.get() 返回 None 口径一致，两侧指纹逐字节相等
+        let body = json!({"messages": [
+            "not-an-object",
+            {"role": "user", "content": "hi"},
+        ]});
+        let raw = serde_json::to_vec(&body).unwrap();
+        assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&body));
+        assert!(matches!(SessionKey::from_slice(&raw), SessionKey::Fingerprint(k) if !k.is_empty()));
+
+        let body = json!({"messages": [
+            {"role": "user", "content": "a"},
+            null,
+        ]});
+        let raw = serde_json::to_vec(&body).unwrap();
+        assert_eq!(SessionKey::from_slice(&raw), SessionKey::from_body(&body));
+        assert!(matches!(SessionKey::from_slice(&raw), SessionKey::Fingerprint(k) if !k.is_empty()));
     }
 
     #[test]

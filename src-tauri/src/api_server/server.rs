@@ -205,9 +205,10 @@ fn build_router(state: Arc<ApiSharedState>) -> Router {
         .route("/v1/images/generations", post(routes::images_generations))
         .route("/v1/images/edits", post(routes::images_edits))
         // issue #21：axum 对 `Bytes` 提取器默认限制 2MiB，超限请求在进 handler 前
-        // 就被 413 纯文本拒绝（handler 内 8MB 检查不可达）；显式放开到
-        // routes::MAX_BODY_BYTES（32MiB），与 handler 内检查阈值保持一致
-        .layer(DefaultBodyLimit::max(routes::MAX_BODY_BYTES))
+        // 就被 413 纯文本拒绝（handler 内检查不可达）；显式放开到
+        // routes::max_body_bytes()，与 handler 内检查阈值保持一致（issue #138 P1：
+        // 默认 8MiB，环境变量 AIWORK_MAX_BODY_BYTES 可覆盖，区间 [256KiB, 64MiB]）
+        .layer(DefaultBodyLimit::max(routes::max_body_bytes()))
         .layer(from_fn_with_state(state.clone(), auth::bearer_auth))
         .with_state(state)
 }

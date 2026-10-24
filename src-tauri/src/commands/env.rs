@@ -1018,25 +1018,30 @@ fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Optio
 }
 
 /// 注册表卸载键搜索（按应用档案的 DisplayName 片段与 exe 名参数化）。
-/// windows-registry 进程内枚举（HKCU + HKLM 64 位视图 + Wow6432Node 32 位视图，
-/// 与原 `reg query /s /f` 递归语义对齐）：DisplayName 含模式串 →
-/// DisplayIcon / InstallLocation 解析。
+/// windows-registry 进程内枚举（HKCU + HKLM 64 位视图 + 32 位视图 WOW6432Node，
+/// 与原 `reg query /s /f` 语义对齐）：DisplayName 含模式串 → DisplayIcon /
+/// InstallLocation 解析。
 /// 不再 spawn reg.exe 子进程（issue #137：开机自启后登录早期 spawn 的 reg.exe
 /// 撞系统初始化窗口期报 0xc0000142），同时消除 /s /f 全量搜索 ~250ms/次开销；
 /// 同键直读三个值，原「/f 输出不全再回查全值」的两段式不再需要。
+/// WOW6432Node：64 位进程视角不发生 WOW64 重定向，32 位安装器条目的真实落点是
+/// HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall（reg query
+/// 实证存在大量此类子键），只枚举直接卸载键会漏检；HKCU\Software 无 WOW64
+/// 重定向、其下对应视图键通常不存在，open 失败自然跳过。
 /// Windows 注册表通道专用（mac 无注册表；调用方 app_locate 链同门控）
 #[cfg(not(target_os = "macos"))]
 fn registry_app_path(profile: &AppProfile) -> Option<String> {
     use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
     let uninstall_sub = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    let uninstall_views = [
+        uninstall_sub,
+        "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    ];
     for pattern in profile.reg_patterns {
         let pat_upper = pattern.to_uppercase();
         for root in [CURRENT_USER, LOCAL_MACHINE] {
-            // 64 位视图 + Wow6432Node（32 位安装器写入的卸载键）双覆盖，对齐原
-            // `reg query /s` 的递归语义（审查 L3：仅枚举直接子键曾整段漏检 32 位
-            // 条目；键不存在时 open 失败自然跳过）
-            for sub in [uninstall_sub.to_string(), format!("{uninstall_sub}\\Wow6432Node")] {
-                let Ok(uninstall) = root.open(&sub) else {
+            for view in uninstall_views {
+                let Ok(uninstall) = root.open(view) else {
                     continue;
                 };
                 let Ok(subkeys) = uninstall.keys() else {

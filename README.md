@@ -122,6 +122,14 @@ macOS 版为 **ad-hoc 签名**（暂未购买 Developer ID 公证），首次打
 
 > 从 3.4.x 之前的版本升级：旧版 `data/` 下的 JSON 状态文件会在首次启动时**自动导入 SQLite** 并移入 `data/backup/`，无需手动迁移。
 
+## 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `AIWORK_MAX_BODY_BYTES` | `8388608`（8MiB） | API 网关请求体上限（单位：字节），合法区间 256KiB~64MiB，非法 / 越界值回退默认并在日志告警。长上下文客户端报 413 `request_too_large` 时可设 `AIWORK_MAX_BODY_BYTES=33554432` 恢复升级前的 32MiB |
+
+修改后需重启应用生效（进程启动时解析一次）。
+
 ## 文档
 
 - [更新日志](CHANGELOG.md) — 各版本变更记录

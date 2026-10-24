@@ -446,11 +446,14 @@ fn race_qoder_first_byte(
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
     primary_session_ids: &Option<(String, String, String)>,
+    converted_len: usize,
 ) -> Result<QoderRaceWin, ()> {
     let hedge_ms = state
         .qoder_hedge_threshold_ms
         .load(std::sync::atomic::Ordering::Relaxed);
-    if hedge_ms == 0 {
+    // issue #138 P1：大 body 跳过首字对冲——对冲需整包重建 agent 信封，
+    // 大包下内存瞬时翻倍，得不偿失（默认 256KiB，与 WB/Trae 池同口径）
+    if hedge_ms == 0 || converted_len > super::routes::HEDGE_SKIP_BODY_BYTES {
         let lines = lines_with_first_byte_timeout(primary_reader)?;
         return Ok(QoderRaceWin {
             lines,
@@ -955,6 +958,7 @@ fn run_qoder_stream(
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
                         &envelope_ids,
+                        converted.len(),
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -1558,6 +1562,7 @@ pub async fn qoder_aggregate_chat(
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
                             &envelope_ids,
+                            converted.len(),
                         ) {
                             Ok(w) => w,
                             Err(()) => {

@@ -33,15 +33,52 @@ use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState
 /// 才成功的场景，会提前报 no_healthy_account——如需对齐 WB/Qoder 口径再放开此值，
 /// 调整前需先评估首字延迟回归）
 const MAX_ROTATE: usize = 3;
-/// 请求体上限（issue #21）：axum `Bytes` 提取器受 DefaultBodyLimit 约束（默认 2MiB），
-/// build_router 已显式放开到本值，两处阈值必须一致。32MiB 适配长上下文客户端
-/// （每轮重发完整历史 + 图片 base64 场景）
-pub(super) const MAX_BODY_BYTES: usize = 32 << 20;
-
-/// 请求体超限文案（issue #21）：由常量推导，避免阈值调整后文案脱节
-pub(super) fn body_too_large_msg() -> String {
-    format!("request body exceeds {}MB limit", MAX_BODY_BYTES >> 20)
+/// 请求体上限（issue #21；issue #138 P1 环境变量化）：axum `Bytes` 提取器受
+/// DefaultBodyLimit 约束（默认 2MiB），build_router 已显式放开，两处阈值必须一致。
+/// 默认 8MiB 适配长上下文客户端（每轮重发完整历史 + 图片 base64 场景）；可用
+/// 环境变量 AIWORK_MAX_BODY_BYTES 覆盖（单位字节，合法区间 [256KiB, 64MiB]，
+/// 非法/越界值回退默认并 stderr 告警），解析结果进程内缓存（OnceLock 只解析一次）
+pub(super) fn max_body_bytes() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        const DEFAULT: usize = 8 << 20;
+        const MIN: usize = 256 << 10;
+        const MAX: usize = 64 << 20;
+        match std::env::var("AIWORK_MAX_BODY_BYTES") {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(n) if (MIN..=MAX).contains(&n) => n,
+                _ => {
+                    eprintln!(
+                        "[aiwork] AIWORK_MAX_BODY_BYTES=\"{raw}\" 非法（合法范围 {}~{}），回退默认 {}",
+                        fmt_size_human(MIN),
+                        fmt_size_human(MAX),
+                        fmt_size_human(DEFAULT)
+                    );
+                    DEFAULT
+                }
+            },
+            Err(_) => DEFAULT,
+        }
+    })
 }
+
+/// 字节数人性化（issue #138 P1）：整 MiB 显示 "8MB"，否则按 KiB 显示
+fn fmt_size_human(n: usize) -> String {
+    if n != 0 && n % (1 << 20) == 0 {
+        format!("{}MB", n >> 20)
+    } else {
+        format!("{}KiB", n >> 10)
+    }
+}
+
+/// 请求体超限文案（issue #21）：由阈值推导，避免阈值调整后文案脱节
+pub(super) fn body_too_large_msg() -> String {
+    format!("request body exceeds {} limit", fmt_size_human(max_body_bytes()))
+}
+
+/// issue #138 P1：首字对冲大 body 门槛——请求体超过该值跳过对冲竞速
+/// （对冲需全量快照 + 按账号整包重建，大包下内存瞬时翻倍，得不偿失）
+pub(super) const HEDGE_SKIP_BODY_BYTES: usize = 256 << 10;
 
 /// 客户端协议：决定响应/流事件的输出格式（请求侧均已统一转为 OpenAI 内部格式）
 #[derive(Clone, Copy, PartialEq)]
@@ -459,43 +496,44 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
             // B) allowed=Some(非空) 且作用域内 0 健康：白名单指向的本池账号均不可用
             let hint = if healthy_scope == 0 && healthy_total > 0 {
                 if matches!(&c.allowed, Some(s) if s.is_empty()) {
-                    // 组/标签约束键（审查 L2）：本池排除可能源于展开交集为空——原始
-                    // 白名单条目仍指向本池，按原始条目生成「均指向其他池」文案会同句
-                    // 自相矛盾；org 键直接给组/标签口径提示
                     if rk.org_constrained {
-                        return format!(
-                            "{base} key={name} bind={bind} whitelist=0 dedicated={ded} healthy_in_scope=0 hint=该 Key 配置了组/标签约束，展开后与账号集合的交集未覆盖 {pool} 池账号（交集为空即整池排除）：请编辑该 Key 的组/标签或账号白名单后重试",
-                            pool = pool.as_str(),
-                        );
-                    }
-                    // 约束条目涉及的池集合（裸 uid 防御性归属 buddy，与 pool_constraints 同口径）
-                    let mut pools: Vec<&'static str> = Vec::new();
-                    for u in &rk.allowed_accounts {
-                        let (p, _) = super::api_keys::split_pool_tagged(u);
-                        let p = p.unwrap_or("buddy");
-                        if !pools.contains(&p) {
-                            pools.push(p);
-                        }
-                    }
-                    if rk.schedule_mode == super::api_keys::MODE_DEDICATED {
-                        let (p, _) = super::api_keys::split_pool_tagged(&rk.dedicated_account);
-                        if let Some(p) = p {
+                        // 组/标签约束（api_keys::apply_org_expansion 展开条目必带池前缀
+                        // 如 trae:xxx）：交集为空即本池被整池排除。此时按原始白名单
+                        // 条目回拼池名会得出「约束均指向其他池（trae）」，与本池即
+                        // trae 的排除事实同句矛盾——直接给组/标签口径提示
+                        format!(
+                            " hint=该 Key 的组/标签约束与本池账号交集为空（交集为空即整池排除）：请编辑该 Key 的组/标签或账号白名单后重试"
+                        )
+                    } else {
+                        // 约束条目涉及的池集合（裸 uid 防御性归属 buddy，与 pool_constraints 同口径）
+                        let mut pools: Vec<&'static str> = Vec::new();
+                        for u in &rk.allowed_accounts {
+                            let (p, _) = super::api_keys::split_pool_tagged(u);
+                            let p = p.unwrap_or("buddy");
                             if !pools.contains(&p) {
                                 pools.push(p);
                             }
                         }
-                    }
-                    if pools.is_empty() {
-                        format!(
-                            " hint=该 Key 的账号约束未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号后重试",
-                            pool = pool.as_str(),
-                        )
-                    } else {
-                        format!(
-                            " hint=该 Key 的账号约束均指向其他资源池（{pools}），未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号纳入 {pool} 池，或检查约束目标池的账号健康度后重试",
-                            pools = pools.join("/"),
-                            pool = pool.as_str(),
-                        )
+                        if rk.schedule_mode == super::api_keys::MODE_DEDICATED {
+                            let (p, _) = super::api_keys::split_pool_tagged(&rk.dedicated_account);
+                            if let Some(p) = p {
+                                if !pools.contains(&p) {
+                                    pools.push(p);
+                                }
+                            }
+                        }
+                        if pools.is_empty() {
+                            format!(
+                                " hint=该 Key 的账号约束未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号后重试",
+                                pool = pool.as_str(),
+                            )
+                        } else {
+                            format!(
+                                " hint=该 Key 的账号约束均指向其他资源池（{pools}），未包含 {pool} 池账号，而本次请求由 {pool} 池提供：请编辑该 Key 的账号白名单/专一账号纳入 {pool} 池，或检查约束目标池的账号健康度后重试",
+                                pools = pools.join("/"),
+                                pool = pool.as_str(),
+                            )
+                        }
                     }
                 } else {
                     format!(
@@ -567,12 +605,30 @@ pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // 收敏（2026-10-12 审查 P2）：/health 在 auth.rs 免鉴权放行（探活豁免），
     // 原实现透出 total_credits/active_uid/last_error/池账号数——非环回监听时
     // 局域网内无 Key 即可抓取账号与积分画像，与「非环回强制鉴权」防线矛盾。
-    // 探活只需存活布尔；完整诊断由需鉴权的 GET /status 承载（字段超集）
-    let _ = &state;
-    Json(json!({
+    // 探活仅透出低敏指标（issue #138 P2）：inflight 在途计数 + rss_kib（仅
+    // Linux，供内存压力观察）；完整诊断由需鉴权的 GET /status 承载（字段超集）
+    #[cfg(target_os = "linux")]
+    let rss_kib = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| {
+        s.lines().find_map(|line| {
+            line.strip_prefix("VmRSS:").and_then(|rest| {
+                rest.trim().split_whitespace().next().and_then(|v| v.parse::<u64>().ok())
+            })
+        })
+    });
+    #[cfg(target_os = "linux")]
+    let body = json!({
         "status": "ok",
         "running": true,
-    }))
+        "inflight": state.inflight.load(std::sync::atomic::Ordering::Relaxed),
+        "rss_kib": rss_kib,
+    });
+    #[cfg(not(target_os = "linux"))]
+    let body = json!({
+        "status": "ok",
+        "running": true,
+        "inflight": state.inflight.load(std::sync::atomic::Ordering::Relaxed),
+    });
+    Json(body)
 }
 
 /// /healthz（T2.3/F-32）：三池均无可用账号 → 503，供探活/看门狗。
@@ -864,7 +920,7 @@ pub async fn chat_completions(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
@@ -991,7 +1047,7 @@ pub async fn responses_api(
     key_id: Option<Extension<KeyId>>,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
@@ -1243,7 +1299,7 @@ pub async fn messages(
     key_id: Option<Extension<KeyId>>,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return anthropic_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request_error",
@@ -1393,7 +1449,7 @@ pub async fn completions(
     key_id: Option<Extension<KeyId>>,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return openai_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request_too_large",
@@ -1564,7 +1620,7 @@ async fn images_entry(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // inflight guard（§4.5）：async fn 全程 inline await，作用域即请求生命周期
     let _guard = state.inflight_guard();
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > max_body_bytes() {
         return openai_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", &body_too_large_msg());
     }
     let peek: Value = match serde_json::from_slice(&body) {
@@ -1748,8 +1804,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // conversationId / 消息指纹命中且账号健康 → 首选粘住账号（上游 KV cache
         // 复用；busy 且有空闲候选时让位，F-77④ 同构）。子 Key 限定上游不含
         // 粘性账号时忽略粘性
-        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or_else(|_| json!({}));
-        let sticky_key = SessionKey::from_body(&peek);
+        // issue #138 P0：sticky 键窄探测——不再整包解析 DOM，仅提取会话键所需
+        // 字段（conversation_id + 前 3 条消息），大 body 下省 3~6 倍解析放大
+        let sticky_key = SessionKey::from_slice(&body_vec);
         // 空指纹（无 messages / 无 conversation_id）不可粘
         let sticky_usable = !sticky_key.cache_key().ends_with(':');
         let sticky0: Option<String> = if sticky_usable {
@@ -2355,8 +2412,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // 会话→账号粘性（per-pool 三参数批次，与流式路径同构）：显式
         // conversationId / 消息指纹命中且账号健康 → 首选粘住账号；子 Key 限定
         // 上游不含粘性账号时忽略粘性
-        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or_else(|_| json!({}));
-        let sticky_key = SessionKey::from_body(&peek);
+        // issue #138 P0：sticky 键窄探测——不再整包解析 DOM，仅提取会话键所需
+        // 字段（conversation_id + 前 3 条消息），大 body 下省 3~6 倍解析放大
+        let sticky_key = SessionKey::from_slice(&body_vec);
         // 空指纹（无 messages / 无 conversation_id）不可粘
         let sticky_usable = !sticky_key.cache_key().ends_with(':');
         let sticky0: Option<String> = if sticky_usable {
@@ -2862,7 +2920,9 @@ fn race_trae_first_byte(
     let hedge_ms = state
         .trae_hedge_threshold_ms
         .load(std::sync::atomic::Ordering::Relaxed);
-    if hedge_ms == 0 {
+    // issue #138 P1：大 body 跳过首字对冲——对冲请求体需按账号整包重建
+    // （device/machine id 逐账号注入），大包下内存瞬时翻倍，得不偿失
+    if hedge_ms == 0 || body_vec.len() > HEDGE_SKIP_BODY_BYTES {
         let lines = super::wb_upstream::lines_with_first_byte_timeout(reader)?;
         return Ok(TraeRaceWin {
             lines,
