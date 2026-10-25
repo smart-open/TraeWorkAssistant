@@ -175,23 +175,29 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
     }
 
     // L2 体验：~\<app_data>\storage\user-<uid>* 目录
-    let mut uid = auth_file_uid(&auth_file);
-    // 审查复审修复（M7 假警报）：CodeBuddy 系推定 auth 文件名未命中（国际版文件
-    // 不存在）时 auth_file_uid 返回 None → meta uid=null → confirm_switch 的
-    // expect_uid 回退到槽名（wb-<hash> 池 id），与信号④读到的 live storage.json
-    // genie.userId（真实 uuid）恒不等 → 每次健康切换都误报「已回退到其他账号」。
-    // CodeBuddy 登录真源在 vscdb（L3），此处从同源 storage.json 读 genie.userId
-    // 兜底落 meta uid（顺带让 L2 的 user-<uid>* 目录匹配也能命中）
-    if uid.is_none() && matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
-        if let Some(gs_dir) = &sess.prof.cb_global_storage_dir {
-            let raw = crate::fs_utils::read_json::<serde_json::Value>(&gs_dir.join("storage.json"));
-            if let Some(s) =
-                crate::fs_utils::dig(&raw, &["genie.userId"]).and_then(|v| v.as_str())
-            {
-                uid = Some(s.to_string());
-            }
-        }
-    }
+    // CodeBuddy 系（CN/AI）登录真源在自身 vscdb，与 WorkBuddy 共享的 auth 文件
+    // **无关**——该文件记录的是 WorkBuddy 当前登录账号。旧实现无条件先读 auth 文件，
+    // 导致 CodeBuddy 端账号与 WorkBuddy 端不一致时把 WorkBuddy 的 uid 写进 CodeBuddy
+    // 槽位 meta.json（2026-10-25 实测：wb-942afcc2655a 槽 meta.uid=18448c06（WorkBuddy
+    // 的橡皮4）而槽内 vscdb genie=3e385602（橡皮2）；wb-ab99a7e0848e 槽同理），
+    // confirm_switch 以该 uid 当期望值 → 客户端明明登进了目标账号也被判「已回退到
+    // 其他账号」。改为 CodeBuddy 系优先读 genie.userId，缺失才回退 auth 文件。
+    let uid = if matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
+        sess.prof
+            .cb_global_storage_dir
+            .as_ref()
+            .and_then(|gs_dir| {
+                let raw =
+                    crate::fs_utils::read_json::<serde_json::Value>(&gs_dir.join("storage.json"));
+                crate::fs_utils::dig(&raw, &["genie.userId"])
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| auth_file_uid(&auth_file))
+    } else {
+        auth_file_uid(&auth_file)
+    };
     match &uid {
         Some(uid) => {
             let storage_dir = sess.prof.data_dir.join("storage");
@@ -893,13 +899,30 @@ pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Ve
     let auth_file = &sess.auth_file;
     let snap_file = sess.prof.data_dir.join("storage").join("skeleton").join("account-snapshot.json");
     let meta_file = sess.prof.profiles_dir.join(slot).join("meta.json");
-    // 期望 uid 回退链：meta.json → 会话暂存 bootstrap_uid（合成快照真实 uid，与
-    // meta 同源；meta.json 写失败不阻塞合成时的回退依据）→ slot 名（wb-<hash>
-    // 池 id ≠ uuid 体系真实 uid，仅作最后兜底——回退到它会让三信号确认恒不命中）
-    let mut expect_uid: Option<String> = std::fs::read_to_string(&meta_file)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')).ok())
-        .and_then(|m| m.get("uid").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    // 期望 uid 回退链：CodeBuddy 系优先取**槽内** vscdb/storage.json 的 genie.userId
+    //（恢复会把它原样拷进 live，是「恢复后应当登录谁」的权威答案；历史槽位 meta.uid
+    // 曾被 WorkBuddy 共享 auth 文件的 uid 污染，用 meta 会误判「回退到其他账号」）
+    // → meta.json → 会话暂存 bootstrap_uid（合成快照真实 uid，与 meta 同源；meta.json
+    // 写失败不阻塞合成时的回退依据）→ slot 名（wb-<hash> 池 id ≠ uuid 体系真实 uid，
+    // 仅作最后兜底——回退到它会让三信号确认恒不命中）
+    let mut expect_uid: Option<String> =
+        if matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
+            let raw = crate::fs_utils::read_json::<serde_json::Value>(
+                &sess.prof.profiles_dir.join(slot).join("vscdb").join("storage.json"),
+            );
+            crate::fs_utils::dig(&raw, &["genie.userId"])
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+    if expect_uid.is_none() {
+        expect_uid = std::fs::read_to_string(&meta_file)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')).ok())
+            .and_then(|m| m.get("uid").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    }
     if expect_uid.is_none() {
         expect_uid = sess.bootstrap_uid.clone();
     }

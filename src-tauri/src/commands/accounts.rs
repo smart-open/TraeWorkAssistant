@@ -2086,6 +2086,7 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
         if let Some(exp) = crate::fs_utils::dig(
             &body,
             &[
+                "RefreshExpireAt",
                 "refresh_token_expires_at",
                 "refresh_expires_at",
                 "refreshTokenExpiresAt",

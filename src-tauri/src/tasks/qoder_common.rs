@@ -784,34 +784,72 @@ pub fn refresh_token_once_ex(
     let Some(body) = body else {
         return (None, RefreshFail::Transient);
     };
-    let acc = s_of(fs_utils::dig(&body, &["accessToken", "access_token", "token"]));
-    if acc.is_empty() {
-        return (None, RefreshFail::Transient);
-    }
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut out = creds.clone();
+    if !apply_refresh_response(&mut out, &body, now_ms) {
+        return (None, RefreshFail::Transient);
+    }
+    (Some(out), RefreshFail::Transient)
+}
+
+/// 解析刷新响应（deviceToken/refresh 与 jobToken/refresh 两种形态）：
+/// - access token：`accessToken` / `access_token` / `token` / **`device_token` / `deviceToken`**
+///   （2026-10-25 实测 deviceToken/refresh 返回的是 `device_token`，旧实现只认
+///   accessToken → 明明 200 成功却被判「响应结构异常」，手动续期恒失败）；
+/// - 到期：`expiresIn` / `expires_in`（毫秒/秒）或 `expires_at` / `expiresAt`（RFC3339）；
+/// - refresh token：`refreshToken` / `refresh_token`；
+/// - refresh 到期：`refresh_token_expires_in` / `refreshTokenExpiresIn` 或
+///   `refresh_expires_at` / `refreshExpiresAt`（RFC3339）。
+fn apply_refresh_response(out: &mut QoderCreds, body: &serde_json::Value, now_ms: i64) -> bool {
+    let acc = s_of(fs_utils::dig(
+        body,
+        &[
+            "accessToken",
+            "access_token",
+            "token",
+            "device_token",
+            "deviceToken",
+        ],
+    ));
+    if acc.is_empty() {
+        return false;
+    }
     out.access_token = acc;
-    let ref_tok = s_of(fs_utils::dig(&body, &["refreshToken", "refresh_token"]));
+    let ref_tok = s_of(fs_utils::dig(body, &["refreshToken", "refresh_token"]));
     if !ref_tok.is_empty() {
         out.refresh_token = ref_tok;
     }
-    if let Some(e) = i_of(fs_utils::dig(&body, &["expiresIn", "expires_in"])) {
-        out.expires_at_ms = Some(now_ms + normalize_expires_in(e));
-    } else {
-        // P2：响应缺 expiresIn 时落保守本地过期基准（now+12h）——否则 expires_at 恒为
-        // None，ensure_fresh 的临期判定永无基准，每次调用都重发刷新请求。12h 低于客户端
-        // 典型 24h 有效期，宁多刷不误用；clamp_expires_at 仅钳非正/超界畸形值，
-        // now+12h 在合法域内不受影响
-        out.expires_at_ms = Some(now_ms + 12 * 3_600_000);
-    }
+    out.expires_at_ms = Some(
+        i_of(fs_utils::dig(body, &["expiresIn", "expires_in"]))
+            .map(|e| now_ms + normalize_expires_in(e))
+            .or_else(|| {
+                let s = s_of(fs_utils::dig(body, &["expires_at", "expiresAt"]));
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|d| d.timestamp_millis())
+            })
+            // P2：响应缺 expiresIn 时落保守本地过期基准（now+12h）——否则 expires_at 恒为
+            // None，ensure_fresh 的临期判定永无基准，每次调用都重发刷新请求。12h 低于客户端
+            // 典型 24h 有效期，宁多刷不误用；clamp_expires_at 仅钳非正/超界畸形值，
+            // now+12h 在合法域内不受影响
+            .unwrap_or(now_ms + 12 * 3_600_000),
+    );
     // 刷新令牌过期时刻随行解析（R-6 实测 refresh_token_expires_in≈48h ms；审查 L-RT）
     if let Some(e) = i_of(fs_utils::dig(
-        &body,
+        body,
         &["refresh_token_expires_in", "refreshTokenExpiresIn"],
     )) {
         out.refresh_expires_at_ms = Some(now_ms + normalize_expires_in(e));
+    } else {
+        let s = s_of(fs_utils::dig(
+            body,
+            &["refresh_expires_at", "refreshExpiresAt"],
+        ));
+        if let Ok(d) = chrono::DateTime::parse_from_rfc3339(&s) {
+            out.refresh_expires_at_ms = Some(d.timestamp_millis());
+        }
     }
-    (Some(out), RefreshFail::Transient)
+    true
 }
 
 // ── userinfo（PAT 导入时回填 uid/昵称；失败容错不阻塞导入）──────────────────
@@ -1445,6 +1483,46 @@ impl CrossProcLock {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 2026-10-25 实测 deviceToken/refresh 的 200 响应：token 字段叫 `device_token`，
+    /// 到期是 RFC3339 的 `expires_at`。旧解析只认 accessToken/expiresIn → 手动续期恒报
+    /// 「响应结构异常」；本用例锁定修复后的字段兼容。
+    #[test]
+    fn device_token_refresh_response_parses_device_token_and_expires_at() {
+        let body = json!({
+            "created_at": "2026-10-25T04:41:16Z",
+            "device_token": "dt-test",
+            "expires_at": "2026-11-24T04:41:16Z",
+            "refresh_token": "drt-test"
+        });
+        let mut c = QoderCreds::default();
+        assert!(apply_refresh_response(&mut c, &body, 0));
+        assert_eq!(c.access_token, "dt-test");
+        assert_eq!(c.refresh_token, "drt-test");
+        assert_eq!(
+            c.expires_at_ms,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-24T04:41:16Z")
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
+    }
+
+    /// 兼容 PAT/jobToken 通道的旧响应形态（accessToken + expiresIn 毫秒）。
+    #[test]
+    fn legacy_refresh_response_still_parses_expires_in() {
+        let body = json!({
+            "accessToken": "jt-test",
+            "expiresIn": 86_400_000_i64,
+            "refreshToken": "jrt-test"
+        });
+        let mut c = QoderCreds::default();
+        assert!(apply_refresh_response(&mut c, &body, 1_000));
+        assert_eq!(c.access_token, "jt-test");
+        assert_eq!(c.refresh_token, "jrt-test");
+        assert_eq!(c.expires_at_ms, Some(1_000 + 86_400_000));
+    }
 
     /// 跨进程锁名可用性回归（2026-10-04）：锁名误用多段路径 `Global\a\b\c` 时，
     /// 内核对象命名空间 `\BaseNamedObjects` 下无中间对象目录 → CreateMutexW 恒

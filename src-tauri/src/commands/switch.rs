@@ -226,7 +226,9 @@ pub fn switch_account(
                 &crate::switcher::authfile::wb_ai_auth_file(),
             ),
         }
-        .and_then(|uid| super::workbuddy::buddy_ai_pool_account_id_by_uid(&state, &uid));
+        // 池外账号保留原始 uid（不落回桥标记）：回写守卫会因槽位不存在而跳过，
+        // 避免把「手动登录的池外账号」现场写进旧标记账号的快照
+        .map(|uid| super::workbuddy::buddy_ai_pool_account_id_by_uid(&state, &uid).unwrap_or(uid));
         by_live
             .or_else(|| {
                 super::workbuddy::current_account_marker(
@@ -241,16 +243,30 @@ pub fn switch_account(
         // CodeBuddy 登录真源信号 = live storage.json genie.userId（共享 auth 文件属
         // WorkBuddy，会被其覆盖，不能作为 CodeBuddy 登录证据；桥标记只反映上次切换
         // 目标，客户端手动重登后失真）→ genie 实测优先，桥标记兜底。
-        // 取不到 → 空串 fail-open 不阻断
+        // 取不到 → 空串 fail-open 不阻断。池外 uid 保留原值（不落回标记）——
+        // 回写守卫按槽位存在性会安全跳过，防止污染旧标记账号槽位。
         match buddy_app {
             BuddyApp::CodeBuddy => crate::commands::workbuddy::codebuddy_live_uid()
-                .and_then(|uid| crate::commands::workbuddy::pool_account_id_by_uid(&state, &uid))
+                .map(|uid| {
+                    crate::commands::workbuddy::pool_account_id_by_uid(&state, &uid)
+                        .unwrap_or(uid)
+                })
                 .or_else(|| {
                     crate::commands::workbuddy::current_account_marker(&state, "CodeBuddy")
                 })
                 .unwrap_or_default(),
             BuddyApp::WorkBuddy => {
-                buddy_current_account_id(&state, buddy_app).unwrap_or_default()
+                crate::switcher::authfile::auth_file_uid(
+                    &crate::switcher::authfile::wb_auth_file(),
+                )
+                .map(|uid| {
+                    crate::commands::workbuddy::pool_account_id_by_uid(&state, &uid)
+                        .unwrap_or(uid)
+                })
+                .or_else(|| {
+                    crate::commands::workbuddy::current_account_marker(&state, "WorkBuddy")
+                })
+                .unwrap_or_default()
             }
         }
     } else if is_qoder {
