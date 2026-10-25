@@ -193,12 +193,19 @@ fn generate_password() -> Result<Vec<u8>, String> {
 /// 静默重生成新密码会与既有密文永久失配（macOS Keychain 条目丢失 → 每次 save_accounts
 /// 报 BadFileKey，凭据不可恢复且读路径静默降级为空 JWT）。此时必须显式报错，
 /// 由用户决定重置 vault 或恢复密码源，绝不静默换钥。
+/// 快照是否「实际存在」（含数据）：0 字节空快照视为不存在（审查修复 低-5：
+/// 首启 `Stronghold::new` 先建文件、随后崩溃的残留——空文件不含任何 client，
+/// 应按「首次创建」处理；若按存在判定，会被错配防护永久拒开，只能手工删文件恢复）。
+fn snapshot_has_data(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
 fn vault_password_at(data_dir: &Path) -> Result<Vec<u8>, String> {
     if let Some(pwd) = crate::platform::secret::load_vault_password_at(data_dir)? {
         return Ok(pwd);
     }
     let snapshot = data_dir.join("conf").join("vault.stronghold");
-    if snapshot.exists() {
+    if snapshot_has_data(&snapshot) {
         return Err(format!(
             "vault 主密码源缺失但快照已存在（{}），拒绝静默重生成密码；\
              若快照内凭据已全部失效，可备份后删除该文件重置 vault",
@@ -263,8 +270,44 @@ pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 密钥文件原子写入（审查修复 中-1 / 低-3 共用）：同目录临时文件 + rename 原子替换。
+/// 直接 `fs::write` 会先 truncate 原文件，写入中断（崩溃/断电）会留下
+/// 「V2: + 残缺 hex」损坏密钥，Windows 无 Keychain 兜底 → vault 永久不可开；
+/// rename 在同一文件系统内原子生效，任意时刻中断，原文件要么完好（旧格式仍可
+/// 由平台原生路径解析）要么已是完整 V2: 文本。unix 下临时文件以 0600 创建
+/// （mac key file 权限不变量，rename 后权限随临时文件）。
+pub(crate) fn write_key_file_atomic(key_path: &Path, content: &str) -> Result<(), String> {
+    let tmp_path = key_path.with_extension("bin.v2tmp");
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("创建临时密钥文件失败: {e}"))?;
+        f.write_all(content.as_bytes())
+            .map_err(|e| format!("写入临时密钥文件失败: {e}"))?;
+        // rename 前确保持久化：中断残留的临时文件不影响原文件，但 rename 后
+        // 必须保证内容完整（密钥文件是 vault 解密真值，宁可多一次 fsync）
+        f.sync_all()
+            .map_err(|e| format!("刷盘临时密钥文件失败: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&tmp_path, content.as_bytes())
+        .map_err(|e| format!("写入临时密钥文件失败: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp_path, key_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("原子替换密钥文件失败: {e}"));
+    }
+    Ok(())
+}
+
 /// 共享模式开关：环境变量 AIWORK_VAULT_SHARED（1/true，大小写不敏感，容忍首尾空白）
-fn vault_shared_mode() -> bool {
+pub(crate) fn vault_shared_mode() -> bool {
     std::env::var("AIWORK_VAULT_SHARED")
         .ok()
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
@@ -282,14 +325,23 @@ pub(crate) fn maybe_convert_to_v2(key_path: &Path, blob: &[u8], pwd: &[u8], data
     if !vault_shared_mode() {
         return;
     }
+    convert_to_v2_impl(key_path, blob, pwd, data_dir);
+}
+
+/// 迁移核心（共享模式判定已由调用方 [maybe_convert_to_v2] 完成）。独立函数便于
+/// 测试参数注入，避免单测触碰进程级全局环境变量（审查修复 中-2：env 并行竞争
+/// + panic 泄漏面）。pub(crate) 供 platform::secret 测试直调。
+pub(crate) fn convert_to_v2_impl(key_path: &Path, blob: &[u8], pwd: &[u8], data_dir: &Path) {
     if String::from_utf8_lossy(blob).trim().starts_with("V2:") {
         return; // 已是 V2: 文本，无需转换
     }
     let content = format!("V2:{}", bytes_to_hex(pwd));
-    match std::fs::write(key_path, content.as_bytes()) {
+    match write_key_file_atomic(key_path, &content) {
+        // 审查修复（信息-7）：措辞不再硬编码「DPAPI blob」——mac 纯 hex 场景
+        // 走同一路径，按来源无关的通用措辞描述
         Ok(()) => fs_utils::app_log(
             data_dir,
-            "vault: AIWORK_VAULT_SHARED 已开启，vault_key.bin 已由 DPAPI blob 转换为 V2: 文本格式（可与 aiwork-server 共享 conf；密钥现为明文 hex，注意目录访问控制）",
+            "vault: AIWORK_VAULT_SHARED 已开启，vault_key.bin 已迁移为 V2: 文本格式（可与 aiwork-server 共享 conf；密钥现为明文 hex，注意目录访问控制）",
         ),
         Err(e) => fs_utils::app_log(
             data_dir,
@@ -312,8 +364,14 @@ fn with_open<T>(
         let conf = data_dir.join("conf");
         let _ = std::fs::create_dir_all(&conf);
         let path = conf.join("vault.stronghold");
-        // 快照存在性必须在 Stronghold::new 之前判定（new 可能立即创建空快照文件）
-        let snapshot_exists = path.exists();
+        // 快照存在性必须在 Stronghold::new 之前判定（new 可能立即创建空快照文件）；
+        // 0 字节空快照（首启建文件后崩溃残留）视为不存在，按首次创建处理（审查修复 低-5）
+        let snapshot_exists = snapshot_has_data(&path);
+        if !snapshot_exists && path.exists() {
+            // 空残留文件会让 Stronghold::new 报「invalid file not a snapshot」，
+            // 先行删除（0 字节不含任何数据，无凭据丢失风险），让 new 全新创建
+            let _ = std::fs::remove_file(&path);
+        }
         let password = vault_password_at(data_dir)?;
         let sh = Stronghold::new(&path, password).map_err(|e| format!("打开 vault 失败: {e}"))?;
         // 快照数据不会自动进入 clients map，必须显式 load_client（见单元测试 stronghold_快照往返）；
@@ -975,5 +1033,124 @@ mod tests {
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 密钥文件原子写入（审查修复 中-1）：首写/覆写内容正确、无临时文件残留、
+    /// unix 下保持 0600 权限不变量（mac key file 主源安全要求）
+    #[test]
+    fn write_key_file_atomic_首写覆写与无临时残留() {
+        let dir = std::env::temp_dir().join(format!("vault_atomic_write_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("vault_key.bin");
+        // 首写
+        write_key_file_atomic(&key_path, "V2:aaaa").expect("首次原子写");
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "V2:aaaa");
+        // 覆写已有内容（rename 替换路径）
+        write_key_file_atomic(&key_path, "V2:bbbb").expect("覆写原子写");
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "V2:bbbb");
+        // 无临时文件残留
+        assert!(
+            !key_path.with_extension("bin.v2tmp").exists(),
+            "临时密钥文件不应残留"
+        );
+        // unix：rename 后权限随临时文件，应为 0600
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "原子写后 key file 应保持 0600");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移核心（审查修复 中-2 参数注入）：原生格式（纯 hex）→ V2: 文本，
+    /// 密钥值回读一致；已是 V2: 时幂等跳过（内容不变）
+    #[test]
+    fn convert_to_v2_impl_原生格式迁移_已是v2跳过() {
+        let dir = std::env::temp_dir().join(format!("vault_convert_v2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("vault_key.bin");
+        let key = [0x11u8; 32];
+        // 原生纯 hex → 迁移为 V2: 文本
+        let native = bytes_to_hex(&key);
+        std::fs::write(&key_path, &native).unwrap();
+        convert_to_v2_impl(&key_path, native.as_bytes(), &key, &dir);
+        let migrated = std::fs::read_to_string(&key_path).unwrap();
+        assert!(
+            migrated.trim().starts_with("V2:"),
+            "迁移后应为 V2: 文本: {migrated}"
+        );
+        assert_eq!(
+            parse_v2_hex_text(&migrated).expect("迁移产物可解析"),
+            Some(key.to_vec()),
+            "迁移后密钥值不变"
+        );
+        // 已是 V2: → 幂等跳过，内容不变
+        convert_to_v2_impl(&key_path, migrated.as_bytes(), &key, &dir);
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap().trim(),
+            migrated.trim(),
+            "已是 V2: 格式时应跳过迁移"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空快照（0 字节）视为不存在（审查修复 低-5）：按「首次创建」处理可正常
+    /// 写入且落盘非空——首启 Stronghold::new 建文件后崩溃的残留不再永久拒开
+    #[test]
+    fn with_open_空快照视为不存在_正常首建() {
+        let dir = std::env::temp_dir().join(format!("vault_empty_snap_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        let snapshot = dir.join("conf").join("vault.stronghold");
+        // 0 字节空快照残留
+        std::fs::write(&snapshot, b"").unwrap();
+        // key file 以 V2: 共享格式提供主密码（两平台均可解析，不触碰 Keychain）
+        let pwd = [0x21u8; 32];
+        std::fs::write(
+            dir.join("conf").join("vault_key.bin"),
+            format!("V2:{}", bytes_to_hex(&pwd)),
+        )
+        .unwrap();
+        // 空快照按「首次创建」处理 → 写入成功
+        ns_set(&dir, "test", "k1", &serde_json::json!({"jwt": "j1"}))
+            .expect("空快照应按首次创建处理");
+        assert!(snapshot_has_data(&snapshot), "写入后快照应非空");
+        // 回读一致
+        assert_eq!(ns_get(&dir, "test", "k1"), Some(serde_json::json!({"jwt": "j1"})));
+        VAULTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 密钥与快照错配防护（审查修复 低-6）：快照存在但密钥被替换 → 拒绝打开
+    /// （Err），且空 client 不得经 save() 覆盖原快照（快照字节不变）。
+    /// Windows 路径：纯 hex 非 DPAPI blob → 读密钥失败 Err；macOS 路径：解析出
+    /// pwd2 后 Stronghold/load_client 对 pwd1 快照失败 → 错配防护 Err。
+    /// 两平台均 Err，断言不区分错误来源。
+    #[test]
+    fn with_open_密钥与快照错配_拒绝打开且快照不被覆盖() {
+        let dir = std::env::temp_dir().join(format!("vault_mismatch_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        let snapshot = dir.join("conf").join("vault.stronghold");
+        // 1) 用 pwd1 首建快照（V2: 共享格式主密码，两平台均可解析）
+        let pwd1 = [0x33u8; 32];
+        std::fs::write(
+            dir.join("conf").join("vault_key.bin"),
+            format!("V2:{}", bytes_to_hex(&pwd1)),
+        )
+        .unwrap();
+        ns_set(&dir, "test", "k1", &serde_json::json!({"jwt": "j1"}))
+            .expect("首建快照应成功");
+        assert!(snapshot_has_data(&snapshot));
+        let before = std::fs::read(&snapshot).unwrap();
+        // 2) 篡改 key file 为另一密钥的纯 hex，并强制下次重开（缓存里还是 pwd1 句柄）
+        let pwd2 = [0xEEu8; 32];
+        std::fs::write(dir.join("conf").join("vault_key.bin"), bytes_to_hex(&pwd2)).unwrap();
+        VAULTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&dir);
+        // 3) 错配 → Err，且快照字节不变（防空 client 覆盖）
+        let r = ns_set(&dir, "test", "k1", &serde_json::json!({"jwt": "j2"}));
+        assert!(r.is_err(), "密钥与快照错配时必须拒绝打开");
+        assert_eq!(std::fs::read(&snapshot).unwrap(), before, "快照不得被空 client 覆盖");
+        VAULTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
