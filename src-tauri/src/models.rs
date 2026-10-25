@@ -50,6 +50,13 @@ pub struct AccountView {
     /// F-78 批次 3 收尾，对齐 Buddy 侧 auth_saved_at 先例）
     #[serde(default)]
     pub auth_saved_at: Option<String>,
+    /// 客户端快照保存时间（sidecar savedAtMs；无快照为 None）
+    #[serde(default)]
+    pub snapshot_saved_at_ms: Option<i64>,
+    /// 最近一次切换到该账号时客户端未确认登录的时间（切换超时/token 失效；
+    /// 成功切换或重新保存登录态后清空）
+    #[serde(default)]
+    pub snapshot_verify_failed_at_ms: Option<i64>,
     /// JWT data.id 与 user_id 归属不一致（issue #55：此时扫描「已入池」可能经该账号
     /// JWT 命中其他 uid，列表却无从对账；显式暴露供列表警示。快照槽位按 user_id
     /// 命名，自动改写会孤儿化既有快照，故仅警示不强修）

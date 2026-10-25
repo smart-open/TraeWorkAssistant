@@ -1024,38 +1024,63 @@ fn switch_flow(
     // 故跳过并警告——last 槽始终有完整备份可回退。
     if let Some(cur) = get_current_account(sess) {
         if cur != uid {
-            match classify_current_writeback(&expected_uid, not_logged_in, &cur) {
-                CurrentWriteback::Backup(slot) => {
-                    backup_current(sess, &slot, sink)?;
-                    sink.step(
-                        "backup",
-                        StepStatus::Ok,
-                        &format!("当前账号 {slot} 的登录态已备份"),
-                    );
-                }
-                CurrentWriteback::SkipNotLoggedIn => {
-                    sink.step(
-                        "backup",
-                        StepStatus::Warn,
-                        &format!(
-                            "客户端本次运行期间未登录（最新会话日志无登录请求记录），已跳过回写该账号槽位，\
-                             防止把未登录现场写入账号 {cur} 的快照（当前态仍备份到 last）"
-                        ),
-                    );
-                }
-                CurrentWriteback::SkipMismatch => {
-                    sink.step(
-                        "backup",
-                        StepStatus::Warn,
-                        &format!(
-                            "检测到的当前登录（{}）与标记账号 {cur} 不一致，已跳过回写该账号槽位（当前态仍备份到 last），防止误覆盖",
-                            if expected_uid.is_empty() {
-                                "未识别或未检测到登录会话"
-                            } else {
-                                &expected_uid
-                            }
-                        ),
-                    );
+            // 手动登录兜底：客户端被用户手动切成池内另一个账号 X 时，标记仍是旧账号 cur。
+            // 旧逻辑只写 last、跳过账号槽，导致 X 的登录态永远存不进它自己的快照。
+            // 这里在「探测到的实际登录 ≠ 标记 ≠ 本次目标」且 X 的槽位已存在时，
+            // 把当前现场回写到 X 的槽位（身份来自 stop 后权威探测；未入池/无槽位仍走原跳过逻辑）。
+            let detected_slot = (!expected_uid.is_empty()
+                && expected_uid != uid
+                && !not_logged_in
+                && (sess.prof.profiles_dir.join(&expected_uid).is_dir()
+                    || sess
+                        .prof
+                        .profiles_dir
+                        .join(format!("{expected_uid}.bak"))
+                        .is_dir()))
+            .then(|| expected_uid.clone());
+            if let Some(slot) = detected_slot {
+                backup_current(sess, &slot, sink)?;
+                sink.step(
+                    "backup",
+                    StepStatus::Ok,
+                    &format!(
+                        "检测到客户端实际登录为 {slot}（原标记为 {cur}），已把当前登录态回写到该账号槽位"
+                    ),
+                );
+            } else {
+                match classify_current_writeback(&expected_uid, not_logged_in, &cur) {
+                    CurrentWriteback::Backup(slot) => {
+                        backup_current(sess, &slot, sink)?;
+                        sink.step(
+                            "backup",
+                            StepStatus::Ok,
+                            &format!("当前账号 {slot} 的登录态已备份"),
+                        );
+                    }
+                    CurrentWriteback::SkipNotLoggedIn => {
+                        sink.step(
+                            "backup",
+                            StepStatus::Warn,
+                            &format!(
+                                "客户端本次运行期间未登录（最新会话日志无登录请求记录），已跳过回写该账号槽位，\
+                                 防止把未登录现场写入账号 {cur} 的快照（当前态仍备份到 last）"
+                            ),
+                        );
+                    }
+                    CurrentWriteback::SkipMismatch => {
+                        sink.step(
+                            "backup",
+                            StepStatus::Warn,
+                            &format!(
+                                "检测到的当前登录（{}）与标记账号 {cur} 不一致，已跳过回写该账号槽位（当前态仍备份到 last），防止误覆盖",
+                                if expected_uid.is_empty() {
+                                    "未识别或未检测到登录会话"
+                                } else {
+                                    &expected_uid
+                                }
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -1190,6 +1215,8 @@ fn switch_flow(
                 // 说 uid」误报为当前登录（保存守卫文案失真、扫描误报已入池）。
                 // set_current_account 会同步刷新 switchedAt，hybrid 读侧据此采信
                 set_current_account(sess, &actual);
+                // 账号列表红色「快照异常」徽标：本次切换未登进目标账号
+                icube::mark_snapshot_verify_failed(&sess.prof.profiles_dir, uid);
                 sink.step(
                     "switch",
                     StepStatus::Warn,
@@ -1207,6 +1234,8 @@ fn switch_flow(
                 // 标记维持 uid：超时可能是 NEED_REFRESH 慢登录（稍后仍会登入 uid），
                 // 也可能确实未登录（此时标记过期，但保存侧 L2 三态探测 fail-closed
                 // 已兜底，不会据此误写入槽位），无更优单值可写
+                // 账号列表红色「快照异常」徽标：本次切换未确认登录（橡皮4 式失效快照）
+                icube::mark_snapshot_verify_failed(&sess.prof.profiles_dir, uid);
                 return done(
                     sink,
                     &format!(
@@ -1215,7 +1244,10 @@ fn switch_flow(
                     ),
                 );
             }
-            icube::SwitchVerify::Ok => {}
+            icube::SwitchVerify::Ok => {
+                // 确认登录成功 → 清除该槽位的历史验证失败徽标
+                icube::clear_snapshot_verify_failed(&sess.prof.profiles_dir, uid);
+            }
         }
     }
 

@@ -108,12 +108,16 @@ fn build_args(
 
 /// 后台执行 run_action 并发射终态事件；成功后可选回调（dc id 回填等，携带 data_dir）。
 /// `pre`：run_action 之前执行的前置作业（F-74 会话迁移；其进度自行 emit，不走 sink）
+/// `post_check`：run_action 成功后、发终态事件前的登录身份复核（返回警告文案；None=通过）。
+/// 用于 Qoder/QoderWork 这类切换管线本身没有内建 verify 的应用——文案必须含
+/// 「未确认登录身份」字样，前端据此把 toast 降级为 warn（对齐 Trae/attrfile 口径）。
 fn run_in_background(
     app: AppHandle,
     event_progress: &'static str,
     event_done: &'static str,
     args: RunArgs,
     pre: Option<Box<dyn FnOnce(&AppHandle) + Send>>,
+    post_check: Option<Box<dyn FnOnce(&AppHandle, &std::path::Path) -> Option<String> + Send>>,
     on_success: Option<Box<dyn FnOnce(&AppHandle, &std::path::Path) + Send>>,
 ) {
     std::thread::spawn(move || {
@@ -127,6 +131,24 @@ fn run_in_background(
             let sink = TauriSink::new(&app, event_progress, &data_dir);
             crate::switcher::run_action(args, &sink)
         }));
+        // Qoder 系补登录身份确认（失败仅改 done 文案，不改变切换成功语义）
+        let result = match result {
+            Ok(Ok(msg)) => match post_check {
+                Some(check) => {
+                    let warn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        check(&app, &data_dir)
+                    }))
+                    .ok()
+                    .flatten();
+                    match warn {
+                        Some(w) => Ok(Ok(format!("{msg}（警告：{w}）"))),
+                        None => Ok(Ok(msg)),
+                    }
+                }
+                None => Ok(Ok(msg)),
+            },
+            other => other,
+        };
         let ok = matches!(&result, Ok(Ok(_)));
         finish_action_thread(&app, event_done, &data_dir, result, serde_json::Value::Null);
         if ok {
@@ -364,7 +386,79 @@ pub fn switch_account(
     let is_doubao2 = is_doubao;
     let is_qoder2 = is_qoder;
     let is_qoder_work2 = is_qoder_work;
-    run_in_background(app2, "switch-progress", "switch-done", args, migrate_job, Some(Box::new(move |_app, dc_dir| {
+    // Qoder/QoderWork 切换管线没有内建 verify（Trae 走日志 uid、authfile 走 auth 文件/
+    // vscdb 信号），这里用现成的实时登录探测补一轮身份确认：失败只降级 done 文案 +
+    // 打快照异常标记，不改变「文件已恢复、客户端已启动」的成功语义。
+    let qd_state = state.inner().clone();
+    let qd_uid = user_id.trim().to_string();
+    let qd_post_check: Option<
+        Box<dyn FnOnce(&AppHandle, &std::path::Path) -> Option<String> + Send>,
+    > = if is_qoder || is_qoder_work {
+        Some(Box::new(move |app, dc_dir| {
+            let target = if is_qoder {
+                crate::switcher::TargetApp::Qoder
+            } else {
+                crate::switcher::TargetApp::QoderWork
+            };
+            let profiles_dir =
+                crate::switcher::profile::profile_for(target, &qd_state.data_dir).profiles_dir;
+            let mark = || {
+                if is_qoder2 {
+                    crate::switcher::icube::mark_snapshot_verify_failed(&profiles_dir, &qd_uid);
+                } else {
+                    crate::switcher::electron_root::mark_snapshot_verify_failed(
+                        &profiles_dir,
+                        &qd_uid,
+                    );
+                }
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let live = if is_qoder2 {
+                    crate::commands::qoder::live_account_id(&qd_state)
+                } else {
+                    crate::commands::qoder::live_work_account_id(&qd_state)
+                }
+                .filter(|s| !s.is_empty());
+                if let Some(live_id) = live {
+                    if live_id == qd_uid {
+                        if is_qoder2 {
+                            crate::switcher::icube::clear_snapshot_verify_failed(
+                                &profiles_dir,
+                                &qd_uid,
+                            );
+                        } else {
+                            crate::switcher::electron_root::clear_snapshot_verify_failed(
+                                &profiles_dir,
+                                &qd_uid,
+                            );
+                        }
+                        return None;
+                    }
+                    mark();
+                    let msg = format!(
+                        "20 秒内未确认登录身份（客户端实际登录为 {live_id}，与目标 {qd_uid} 不一致；\
+                         快照登录态可能已失效或发生回退，请在客户端核实，必要时重新登录后「保存当前登录态」）"
+                    );
+                    emit_switch_step(app, dc_dir, "verify", "warn", &msg);
+                    return Some(msg);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            mark();
+            let msg = "20 秒内未确认登录身份（客户端可能未登录或尚未完成鉴权）；该快照的登录会话可能已失效，\
+                 请打开客户端核实，若未登录请重新登录后「保存当前登录态」"
+                .to_string();
+            emit_switch_step(app, dc_dir, "verify", "warn", &msg);
+            Some(msg)
+        }))
+    } else {
+        None
+    };
+    run_in_background(app2, "switch-progress", "switch-done", args, migrate_job, qd_post_check, Some(Box::new(move |_app, dc_dir| {
         // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
         // 仅 icube 布局（Trae）有意义；豆包快照无 storage.json，跳过；
         // Qoder/QoderWork 无 icube-dc 通道（qoder_uid 另行回填），同样跳过
@@ -504,7 +598,7 @@ pub fn save_current_login(
     let is_qoder_work = target_app.as_deref() == Some("QoderWork");
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
-    run_in_background(app2, "save-login-progress", "save-login-done", args, None, Some(Box::new(move |_app, dc_dir| {
+    run_in_background(app2, "save-login-progress", "save-login-done", args, None, None, Some(Box::new(move |_app, dc_dir| {
         // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
         // 仅 icube 布局（Trae）有意义；豆包快照无 storage.json，跳过；
         // Qoder/QoderWork 无 icube-dc 通道，同样跳过
@@ -538,6 +632,6 @@ pub fn reset_device_ids(
         None,
         state.data_dir.clone(),
     )?;
-    run_in_background(app, "device-reset-progress", "device-reset-done", args, None, None);
+    run_in_background(app, "device-reset-progress", "device-reset-done", args, None, None, None);
     Ok(())
 }

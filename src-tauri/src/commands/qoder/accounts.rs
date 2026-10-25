@@ -37,6 +37,16 @@ pub struct QoderAccountView {
     pub fingerprint: Option<String>,
     /// 完整设备指纹（§5.10；指纹查看弹框数据源）
     pub device_profile: Option<crate::tasks::qoder_device::QoderDeviceProfile>,
+    /// IDE 端登录态快照存在（profiles_qoder/<id>/）
+    pub has_snapshot: bool,
+    /// Qoder Work 端登录态快照存在（profiles_qoder_work/<id>/）
+    pub has_snapshot_work: bool,
+    /// IDE 快照保存时间 / 最近一次切换未确认登录时间（ms）
+    pub snapshot_saved_at_ms: Option<i64>,
+    pub snapshot_verify_failed_at_ms: Option<i64>,
+    /// Work 快照保存时间 / 最近一次切换未确认登录时间（ms）
+    pub snapshot_saved_at_work_ms: Option<i64>,
+    pub snapshot_verify_failed_work_at_ms: Option<i64>,
     /// 共享标签 tag id 列表（account_tags 表联表填充，不改账号持久化结构，D3）
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -52,7 +62,12 @@ fn tag_map_cached(state: &AppState) -> std::collections::HashMap<String, Vec<Str
     crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir))
 }
 
-fn view_of(a: &QoderAccount, tokens: &Value, tags: Vec<String>) -> QoderAccountView {
+fn view_of(
+    state: &AppState,
+    a: &QoderAccount,
+    tokens: &Value,
+    tags: Vec<String>,
+) -> QoderAccountView {
     let rec = tokens
         .get("tokens")
         .and_then(|t| t.get(&a.id));
@@ -65,6 +80,30 @@ fn view_of(a: &QoderAccount, tokens: &Value, tags: Vec<String>) -> QoderAccountV
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
+    // 双端快照健康：IDE 走 icube sidecar，Work 走 electron-root snapshot_meta.json
+    let profiles_ide = crate::switcher::profile::profile_for(
+        crate::switcher::TargetApp::Qoder,
+        &state.data_dir,
+    )
+    .profiles_dir;
+    let profiles_work = crate::switcher::profile::profile_for(
+        crate::switcher::TargetApp::QoderWork,
+        &state.data_dir,
+    )
+    .profiles_dir;
+    let (snapshot_saved_at_ms, snapshot_verify_failed_at_ms) =
+        crate::switcher::icube::read_snapshot_sidecar(&profiles_ide, &a.id);
+    let (snapshot_saved_at_work_ms, snapshot_verify_failed_work_at_ms) = {
+        let (s, f) = crate::switcher::electron_root::read_snapshot_meta(&profiles_work, &a.id);
+        if s.is_none() && f.is_none() {
+            crate::switcher::electron_root::read_snapshot_meta(
+                &profiles_work,
+                &format!("{}.bak", a.id),
+            )
+        } else {
+            (s, f)
+        }
+    };
     QoderAccountView {
         id: a.id.clone(),
         uid: a.uid.clone(),
@@ -88,6 +127,14 @@ fn view_of(a: &QoderAccount, tokens: &Value, tags: Vec<String>) -> QoderAccountV
             // I12：按字符截取，防非 ASCII machine_id 触发字节切片 panic
             .map(|p| p.machine_id.chars().take(8).collect::<String>()),
         device_profile: a.device_profile.clone(),
+        has_snapshot: profiles_ide.join(&a.id).is_dir()
+            || profiles_ide.join(format!("{}.bak", a.id)).is_dir(),
+        has_snapshot_work: profiles_work.join(&a.id).is_dir()
+            || profiles_work.join(format!("{}.bak", a.id)).is_dir(),
+        snapshot_saved_at_ms,
+        snapshot_verify_failed_at_ms,
+        snapshot_saved_at_work_ms,
+        snapshot_verify_failed_work_at_ms,
         tags,
     }
 }
@@ -111,7 +158,7 @@ pub async fn qoder_accounts_list(state: State<'_, AppState>) -> Result<Vec<Qoder
         let tag_map = tag_map_cached(&st);
         Ok(accounts
             .iter()
-            .map(|a| view_of(a, &tokens, tag_map.get(&a.id).cloned().unwrap_or_default()))
+            .map(|a| view_of(&st, a, &tokens, tag_map.get(&a.id).cloned().unwrap_or_default()))
             .collect())
     })
     .await
@@ -366,7 +413,7 @@ pub async fn qoder_account_import_pat(
         accounts
             .iter()
             .find(|a| a.id == effective_id)
-            .map(|a| view_of(a, &tokens, account_tags_for(&st, &a.id)))
+            .map(|a| view_of(&st, a, &tokens, account_tags_for(&st, &a.id)))
             .ok_or_else(|| "导入后读取账号失败".into())
     })
     .await
@@ -403,7 +450,7 @@ pub async fn qoder_account_refresh_token(
                 accounts
                     .iter()
                     .find(|a| a.id == account_id)
-                    .map(|a| view_of(a, &tokens, account_tags_for(&st, &a.id)))
+                    .map(|a| view_of(&st, a, &tokens, account_tags_for(&st, &a.id)))
                     .ok_or_else(|| "续期后回读失败".to_string())
             }
             "no_credential" => Err("该账号无可用凭证，请先导入 PAT 或重新登录".into()),

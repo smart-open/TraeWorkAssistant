@@ -46,12 +46,77 @@ fn write_meta(slot_dir: &std::path::Path) -> Result<(), String> {
         "schemaVersion": 1,
         "layout": "electron-root",
         "created_at": crate::fs_utils::now_iso(),
+        "savedAtMs": chrono::Utc::now().timestamp_millis(),
     });
     std::fs::write(
         slot_dir.join("snapshot_meta.json"),
         serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
+}
+
+/// 读取 electron-root 槽位 snapshot_meta.json 的（保存时间 ms, 最近一次切换验证失败 ms）。
+/// 旧快照只有 created_at（RFC3339）→ 解析回填；缺失/损坏返回 (None, None)。
+pub(crate) fn read_snapshot_meta(
+    profiles_dir: &std::path::Path,
+    slot: &str,
+) -> (Option<i64>, Option<i64>) {
+    let path = profiles_dir.join(slot).join("snapshot_meta.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return (None, None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (None, None);
+    };
+    let saved_ms = v
+        .get("savedAtMs")
+        .and_then(|x| x.as_i64())
+        .or_else(|| {
+            v.get("created_at")
+                .and_then(|x| x.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.timestamp_millis())
+        });
+    (
+        saved_ms,
+        v.get("verifyFailedAtMs").and_then(|x| x.as_i64()),
+    )
+}
+
+/// 标记 QoderWork 切换未确认登录；槽位快照存在才写，缺失静默跳过。
+pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
+    let path = profiles_dir.join(slot).join("snapshot_meta.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "verifyFailedAtMs".into(),
+        serde_json::json!(chrono::Utc::now().timestamp_millis()),
+    );
+    let _ = std::fs::write(&path, v.to_string());
+}
+
+/// 清除 QoderWork 切换验证失败标记。
+pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
+    let path = profiles_dir.join(slot).join("snapshot_meta.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    if obj.remove("verifyFailedAtMs").is_some() {
+        let _ = std::fs::write(&path, v.to_string());
+    }
 }
 
 /// 备份（根级白名单整项拷贝；Local State 与 Cookies 均缺失视为应用从未登录/启动）。

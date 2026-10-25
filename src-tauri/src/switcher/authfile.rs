@@ -349,6 +349,7 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
         "app": sess.prof.app_name,
         "uid": uid,
         "savedAt": crate::fs_utils::now_ts(),
+        "savedAtMs": chrono::Utc::now().timestamp_millis(),
     });
     if let Err(e) =
         std::fs::write(dest.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default())
@@ -832,6 +833,7 @@ pub fn synthesize_auth_snapshot(
         "app": sess.prof.app_name,
         "uid": creds.uid,
         "savedAt": crate::fs_utils::now_ts(),
+        "savedAtMs": chrono::Utc::now().timestamp_millis(),
         "bootstrap": true,
     });
     if let Err(e) =
@@ -864,6 +866,71 @@ pub fn slot_marked_bootstrap(sess: &Session, slot: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 读取 authfile 槽位 meta.json 的（快照保存时间 ms, 最近一次切换验证失败时间 ms）。
+/// 旧快照只有 `savedAt`（本地时间字符串）→ 宽松解析回填；损坏/缺失返回 (None, None)。
+pub(crate) fn read_slot_snapshot_meta(
+    profiles_dir: &std::path::Path,
+    slot: &str,
+) -> (Option<i64>, Option<i64>) {
+    let path = profiles_dir.join(slot).join("meta.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return (None, None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')) else {
+        return (None, None);
+    };
+    let saved_ms = v
+        .get("savedAtMs")
+        .and_then(|x| x.as_i64())
+        .or_else(|| {
+            v.get("savedAt")
+                .and_then(|x| x.as_str())
+                .and_then(crate::fs_utils::parse_ts_loose)
+                .map(|s| s * 1000)
+        });
+    (
+        saved_ms,
+        v.get("verifyFailedAtMs").and_then(|x| x.as_i64()),
+    )
+}
+
+/// 标记「切换到该账号时客户端未确认登录」（authfile 布局，Buddy/BuddyAI 共用）。
+/// 只读改写槽位 meta.json；槽位不存在时静默跳过。
+pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
+    let path = profiles_dir.join(slot).join("meta.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')) else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "verifyFailedAtMs".into(),
+        serde_json::json!(chrono::Utc::now().timestamp_millis()),
+    );
+    let _ = std::fs::write(&path, v.to_string());
+}
+
+/// 清除切换验证失败标记（确认登录成功或重新保存快照时）。
+pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
+    let path = profiles_dir.join(slot).join("meta.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')) else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    if obj.remove("verifyFailedAtMs").is_some() {
+        let _ = std::fs::write(&path, v.to_string());
+    }
+}
+
 /// 切换确认结果（PS 返回 'ok'/'timeout'）
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VerifyResult {
@@ -890,6 +957,19 @@ pub enum VerifyResult {
 ///（实测 4 秒即"确认成功"而客户端根本未接受登录）。
 /// fail-open：超时仅警告不判失败（快照已恢复、客户端已启动）。
 pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> VerifyResult {
+    let result = confirm_switch_inner(sess, slot, sink);
+    // 账号列表「快照异常」徽标数据源：失败（超时/身份回退）打标，确认成功清除
+    match result {
+        VerifyResult::Ok => clear_snapshot_verify_failed(&sess.prof.profiles_dir, slot),
+        VerifyResult::Timeout | VerifyResult::Reverted => {
+            mark_snapshot_verify_failed(&sess.prof.profiles_dir, slot)
+        }
+    }
+    result
+}
+
+/// 切换后轮询确认（真正的实现，见上方注释）。
+fn confirm_switch_inner(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> VerifyResult {
     let auth_file = &sess.auth_file;
     let snap_file = sess.prof.data_dir.join("storage").join("skeleton").join("account-snapshot.json");
     let meta_file = sess.prof.profiles_dir.join(slot).join("meta.json");

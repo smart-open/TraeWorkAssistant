@@ -204,6 +204,58 @@ fn warn_if_slot_identity_mismatch(
     }
 }
 
+/// 读取快照 sidecar 的（保存时间, 最近一次切换验证失败时间）。
+/// sidecar 缺失/损坏 → (None, None)，不阻断账号列表渲染。
+pub(crate) fn read_snapshot_sidecar(profiles_dir: &Path, slot: &str) -> (Option<i64>, Option<i64>) {
+    let Ok(text) = std::fs::read_to_string(profiles_dir.join(format!("{slot}.meta.json"))) else {
+        return (None, None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (None, None);
+    };
+    (
+        v.get("savedAtMs").and_then(|x| x.as_i64()),
+        v.get("verifyFailedAtMs").and_then(|x| x.as_i64()),
+    )
+}
+
+/// 标记「切换到该账号时客户端未确认登录（超时/身份不符）」——账号列表红色徽标的数据源。
+/// sidecar 不存在（无快照）时静默跳过；成功切换或重新保存登录态时由 clear/backup 清除。
+pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &Path, slot: &str) {
+    let path = profiles_dir.join(format!("{slot}.meta.json"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "verifyFailedAtMs".into(),
+        serde_json::json!(chrono::Utc::now().timestamp_millis()),
+    );
+    let _ = std::fs::write(&path, v.to_string());
+}
+
+/// 清除切换验证失败标记（切换到该账号并确认登录，或重新保存快照时调用）。
+pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &Path, slot: &str) {
+    let path = profiles_dir.join(format!("{slot}.meta.json"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    if obj.remove("verifyFailedAtMs").is_some() {
+        let _ = std::fs::write(&path, v.to_string());
+    }
+}
+
 /// 「客户端当前登录」探测三态（2026-10-14 合并版实测增强）：
 /// - [`LiveUidProbe::Uid`]：最新会话日志有明文 uid——当前登录的直接证据；
 /// - [`LiveUidProbe::SessionNoUid`]：最新会话的 dynamicConfig.log 存在但无 uid——
@@ -397,6 +449,34 @@ mod tests {
     struct QuietSink;
     impl ProgressSink for QuietSink {
         fn step(&self, _: &str, _: StepStatus, _: &str) {}
+    }
+
+    #[test]
+    fn sidecar_快照验证失败标记_读写与清除() {
+        let dir = std::env::temp_dir().join(format!(
+            "sw-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let slot = "1234567890123456";
+        assert_eq!(read_snapshot_sidecar(&dir, slot), (None, None));
+        std::fs::write(
+            dir.join(format!("{slot}.meta.json")),
+            r#"{"slot":"1234567890123456","savedAtMs":123,"detectedUid":"1234567890123456"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_snapshot_sidecar(&dir, slot), (Some(123), None));
+        mark_snapshot_verify_failed(&dir, slot);
+        assert!(read_snapshot_sidecar(&dir, slot).1.is_some());
+        // 清除后保存时间保持不变
+        clear_snapshot_verify_failed(&dir, slot);
+        assert_eq!(read_snapshot_sidecar(&dir, slot), (Some(123), None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn session(tag: &str) -> Session {

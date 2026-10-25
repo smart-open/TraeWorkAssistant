@@ -41,6 +41,11 @@ pub struct WorkBuddyAccountView {
     pub has_snapshot: bool,
     /// F2-2 已录 CodeBuddy 快照（profiles_codebuddy/<id>/）——双端登录态分端展示
     pub has_snapshot_codebuddy: bool,
+    /// 双端快照保存时间（ms）与最近一次切换未确认登录时间（ms）
+    pub snapshot_saved_at_workbuddy_ms: Option<i64>,
+    pub snapshot_saved_at_codebuddy_ms: Option<i64>,
+    pub snapshot_verify_failed_workbuddy_ms: Option<i64>,
+    pub snapshot_verify_failed_codebuddy_ms: Option<i64>,
     /// F2-2 WorkBuddy 端当前账号（桥 profiles_workbuddy/current_account.txt 标记）
     pub is_current_workbuddy: bool,
     /// F2-2 CodeBuddy 端当前账号（桥 profiles_codebuddy/current_account.txt 标记）
@@ -163,7 +168,23 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
         .map(|a| {
             let has_cred = store_tokens.get(&a.id).is_some()
                 || auth_uid.as_deref() == Some(a.uid.as_str());
-            let has_snapshot = snap_path.join(&a.id).is_dir();
+            let has_snapshot = snap_path.join(&a.id).is_dir()
+                || snap_path.join(format!("{}.bak", a.id)).is_dir();
+            let has_snapshot_cb = snap_cb_path.join(&a.id).is_dir()
+                || snap_cb_path.join(format!("{}.bak", a.id)).is_dir();
+            let meta = |dir: &std::path::Path, id: &str| {
+                let (s, f) = crate::switcher::authfile::read_slot_snapshot_meta(dir, id);
+                if s.is_none() && f.is_none() {
+                    crate::switcher::authfile::read_slot_snapshot_meta(
+                        dir,
+                        &format!("{id}.bak"),
+                    )
+                } else {
+                    (s, f)
+                }
+            };
+            let (snap_saved, snap_failed) = meta(&snap_path, &a.id);
+            let (snap_cb_saved, snap_cb_failed) = meta(&snap_cb_path, &a.id);
             WorkBuddyAccountView {
                 id: a.id.clone(),
                 uid: a.uid.clone(),
@@ -182,7 +203,11 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 is_current: auth_uid.is_some() && auth_uid == Some(a.uid.clone()),
                 has_credential: has_cred,
                 has_snapshot: has_snapshot,
-                has_snapshot_codebuddy: snap_cb_path.join(&a.id).is_dir(),
+                has_snapshot_codebuddy: has_snapshot_cb,
+                snapshot_saved_at_workbuddy_ms: snap_saved,
+                snapshot_saved_at_codebuddy_ms: snap_cb_saved,
+                snapshot_verify_failed_workbuddy_ms: snap_failed,
+                snapshot_verify_failed_codebuddy_ms: snap_cb_failed,
                 is_current_workbuddy: cur_wb.as_deref() == Some(a.id.as_str()),
                 is_current_codebuddy: cb_live_id.as_deref() == Some(a.id.as_str()),
                 tags: tag_map.get(&a.id).cloned().unwrap_or_default(),
