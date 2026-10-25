@@ -110,6 +110,11 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
     } else {
         qoder_oauth::DeviceFlow::new()
     };
+    // SSO 基址覆盖可观测性（审查修复 中-1）：env 覆盖生效（http 附加告警）/
+    // 非法回退均落日志——官方端点轮换排障与 env 注入发现都依赖此线索
+    if let Some(note) = &flow.sso_base_note {
+        fs_utils::app_log(&state.inner().data_dir, note);
+    }
     let auth_url = flow.auth_url.clone();
     emit_progress(&app, "init", "正在打开 Qoder 登录页…", Some(&auth_url));
     if let Err(e) = open_in_browser(&auth_url) {

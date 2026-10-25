@@ -90,9 +90,43 @@ pub fn load_vault_password_at(data_dir: &std::path::Path) -> Result<Option<Vec<u
 }
 
 /// 首次生成后写入受保护的 vault 主密码（与 [load_vault_password_at] 配对）。
+/// 共享模式（`AIWORK_VAULT_SHARED=1`）：直接原子写 `V2:` 文本到 key file
+/// （审查修复 低-3：原先共享模式下仍按平台原生格式落盘，服务端读到 DPAPI blob /
+/// 非 V2: hex 后无法解析，直至下次 load 触发迁移，首次写入与共享语义不一致）。
 /// Windows：DPAPI 密文落 `conf/vault_key.bin`；macOS：hex 双写——key file（0600，
 /// 成功为准）+ Keychain（尽力而为，失败降级容忍并记日志）。
 pub fn store_vault_password_at(data_dir: &std::path::Path, pwd: &[u8]) -> Result<(), String> {
+    // 共享开关参数注入版（审查修复 中-2）：进程级 env 判定收敛在此唯一入口，
+    // 测试直调 [store_vault_password_at_impl] 注入布尔值，不触碰 AIWORK_VAULT_SHARED
+    store_vault_password_at_impl(data_dir, pwd, crate::vault::vault_shared_mode())
+}
+
+/// [store_vault_password_at] 实现核心（共享开关注入）。
+/// 共享模式优先：key file 主源直接写 V2: 共享格式（与服务端 docker_main 一致），
+/// 原子写入；mac 额外做 Keychain 兜底（与原生路径同一策略）
+fn store_vault_password_at_impl(
+    data_dir: &std::path::Path,
+    pwd: &[u8],
+    shared: bool,
+) -> Result<(), String> {
+    if shared {
+        let hex = crate::vault::bytes_to_hex(pwd);
+        let key_path = data_dir.join("conf").join("vault_key.bin");
+        crate::vault::write_key_file_atomic(&key_path, &format!("V2:{hex}"))?;
+        #[cfg(target_os = "macos")]
+        {
+            // Keychain 兜底尽力而为（存纯 hex，无 V2: 前缀，与 load 兜底解码路径一致）
+            if let Ok(entry) = keyring_entry() {
+                if let Err(e) = entry.set_password(&hex) {
+                    crate::fs_utils::app_log(
+                        data_dir,
+                        &format!("vault 密钥 Keychain 兜底写入失败（已由 key file 主源保障）: {e}"),
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
     #[cfg(windows)]
     {
         let blob = crate::vault::dpapi::protect(pwd)?;
@@ -209,6 +243,43 @@ mod tests {
         assert!(decode_hex("zz").is_err());
     }
 
+    /// 共享模式 store 分支（审查修复 中-2 之前零覆盖的两平台行为分叉点）：
+    /// 参数注入 shared=true（不触碰 AIWORK_VAULT_SHARED env）——
+    /// Windows：写 V2: 文本而非 DPAPI blob（服务端 docker_main 必须可解析）；
+    /// macOS：key file 原子写 0600（Keychain 兜底尽力而为，测试环境失败被容忍）。
+    /// 写入后经非共享 load 的 V2: 解析路径读回一致（与 store 配对的完整往返）。
+    #[test]
+    fn vault密码_共享模式store写v2文本_读回一致_不落dpapi() {
+        let dir =
+            std::env::temp_dir().join(format!("platform_secret_shared_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        let state = AppState {
+            data_dir: dir.clone(),
+            jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        };
+        let pwd: Vec<u8> = (0..32u8).collect();
+        store_vault_password_at_impl(&state.data_dir, &pwd, true).unwrap();
+        let key_path = state.conf_path("vault_key.bin");
+        // 必须是 V2: 文本（若误落 DPAPI blob 则 read_to_string 直接失败）
+        let content = std::fs::read_to_string(&key_path).unwrap();
+        assert!(
+            content.starts_with("V2:") && content.contains(&crate::vault::bytes_to_hex(&pwd)),
+            "共享模式 store 应写 V2:<hex> 文本: {content}"
+        );
+        // 非共享 load 的 V2: 解析路径读回一致（store/load 配对往返）
+        assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), Some(pwd.clone()));
+        // 幂等：重复 store 内容稳定（原子写不残留临时文件）
+        store_vault_password_at_impl(&state.data_dir, &pwd, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), content);
+        assert!(!key_path.with_extension("bin.v2tmp").exists(), "不得残留临时文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn mac_key_file主源优先_不触碰keychain() {
@@ -262,15 +333,24 @@ mod tests {
         // 1) V2: 共享格式直接可读
         std::fs::write(&key_path, format!("V2:{}", crate::vault::bytes_to_hex(&pwd))).unwrap();
         assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), Some(pwd.clone()));
-        // 2) 纯 hex + AIWORK_VAULT_SHARED=1 → 读回一致，且文件就地迁移为 V2: 文本
+        // 2) 纯 hex → 读回一致；再以参数注入直调迁移核心（审查修复 中-2：不触碰
+        //    进程级全局环境变量，避免并行测试竞争与 panic 泄漏面），驱动纯 hex →
+        //    V2: 一次性迁移（与 AIWORK_VAULT_SHARED=1 时 maybe_convert_to_v2 的
+        //    内部行为一致，仅省去 env 门判定）
         std::fs::write(&key_path, crate::vault::bytes_to_hex(&pwd)).unwrap();
-        std::env::set_var("AIWORK_VAULT_SHARED", "1");
         assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), Some(pwd.clone()));
+        let hex_text = std::fs::read_to_string(&key_path).unwrap();
+        crate::vault::convert_to_v2_impl(&key_path, hex_text.as_bytes(), &pwd, &state.data_dir);
         let migrated = std::fs::read_to_string(&key_path).unwrap();
         assert!(migrated.trim().starts_with("V2:"), "迁移后应为 V2: 文本: {migrated}");
-        // 迁移后再次读取仍一致（V2: 回读路径）
+        // 迁移后再次读取仍一致（V2: 回读路径）；重复迁移幂等（内容不变）
         assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), Some(pwd.clone()));
-        std::env::remove_var("AIWORK_VAULT_SHARED");
+        crate::vault::convert_to_v2_impl(&key_path, migrated.as_bytes(), &pwd, &state.data_dir);
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap().trim(),
+            migrated.trim(),
+            "已是 V2: 格式时迁移核心应跳过（幂等）"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

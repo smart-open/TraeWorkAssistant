@@ -37,7 +37,41 @@ pub const DEVICE_AUTH_BASE: &str = "https://qoder.cn/device/selectAccounts";
 /// SSO 登录页基址（issue #140 修复 2026-10-24）：设备授权页自构 SSO 跳转时向
 /// oauth_callback 写入显式 `:443` 端口，被 SSO 端点回调白名单（仅 `https://qoder.cn`）
 /// 拒绝 → 400 Bad Request。客户端改为直连本页并自构正确回调（实测 200）。
+/// 可用环境变量 `AIWORK_QODER_SSO_BASE` 覆盖（审查修复 低-4：官方端点轮换/
+/// 自托管代理场景免改代码；仅接受 http(s) URL，非法值一律回退本常量）。
 pub const SSO_LOGIN_BASE: &str = "https://qoder.cn/sso/login/aliyun";
+
+/// SSO 基址解析核心（参数注入版，审查修复 低-4 + 中-2 同一原则：单测不触碰
+/// 进程级全局环境变量）。覆盖值要求：去除首尾空白与尾部 `/` 后必须以
+/// `https://` 或 `http://` 开头，否则回退默认常量。
+/// 返回 (生效基址, 诊断日志)（审查修复 中-1：覆盖生效/非法回退必须留痕——
+/// 官方端点轮换排障与 env 被注入的告警均依赖此线索；缺失/空白视为未设置不落日志）。
+fn sso_login_base_from(env: Option<&str>) -> (String, Option<String>) {
+    let candidate = env
+        .map(str::trim)
+        .map(|v| v.trim_end_matches('/'))
+        .filter(|v| v.starts_with("https://") || v.starts_with("http://"));
+    match candidate {
+        Some(v) => {
+            // http 明文基址：回调 URL（含 challenge/nonce）将发往非加密信道且
+            // 页面可被仿冒——不构成 token 泄露（verifier 仅走 poll 端点），但属
+            // 真实钓鱼面，落日志告警
+            let warn = if v.starts_with("http://") {
+                "（警告：非 https 明文基址，存在仿冒/劫持面，仅限本机调试）"
+            } else {
+                ""
+            };
+            (v.to_string(), Some(format!("AIWORK_QODER_SSO_BASE 覆盖生效{warn}: {v}")))
+        }
+        None => match env.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(bad) => (
+                SSO_LOGIN_BASE.to_string(),
+                Some(format!("AIWORK_QODER_SSO_BASE 值非法（{bad}），已回退默认基址")),
+            ),
+            None => (SSO_LOGIN_BASE.to_string(), None),
+        },
+    }
+}
 
 /// 授权页 client_id（官方注册常量，新版 Qoder CN 客户端 `authClientIds.prod`）。
 /// 实测 2026-10-02：随机生成 client_id 会被授权页判「参数无效」；社区实现
@@ -61,22 +95,25 @@ pub struct DeviceFlow {
     pub client_id: Option<String>,
     /// SSO 登录页完整 URL（oauth_callback 指向设备授权页，challenge = BASE64URL(SHA256(verifier))，S256）
     pub auth_url: String,
+    /// SSO 基址解析诊断（审查修复 中-1）：env 覆盖生效/非法回退的日志内容，
+    /// 由登录入口落 app_log；默认路径为 None
+    pub(crate) sso_base_note: Option<String>,
 }
 
 impl DeviceFlow {
     /// 常规模式：携带官方注册固定 client_id（与真实客户端跳转逐字一致）
     pub fn new() -> Self {
-        Self::build(true)
+        Self::build(true, None)
     }
 
     /// 兼容模式：不带 client_id（2026-10-02 审查预案落地）——官方常量一旦被
     /// Qoder 轮换导致授权页「参数无效」，改用本模式即可恢复（前端在授权超时后
     /// 自动切换到本模式重试）。
     pub fn new_compat() -> Self {
-        Self::build(false)
+        Self::build(false, None)
     }
 
-    fn build(with_client_id: bool) -> Self {
+    fn build(with_client_id: bool, injected_sso_base: Option<String>) -> Self {
         // verifier：双 uuid v4 拼接 = 64 hex 字符（抓包样本同为 64 字符长度量级）
         let verifier = format!(
             "{}{}",
@@ -100,10 +137,15 @@ impl DeviceFlow {
         if let Some(cid) = &client_id {
             device_url.push_str(&format!("&client_id={cid}"));
         }
-        // 直连 SSO 登录页，oauth_callback 全量百分号编码（跳过授权页损坏的重定向）
-        let auth_url =
-            format!("{SSO_LOGIN_BASE}?oauth_callback={}", urlencoding::encode(&device_url));
-        Self { nonce, verifier, machine_id, client_id, auth_url }
+        // 直连 SSO 登录页，oauth_callback 全量百分号编码（跳过授权页损坏的重定向）；
+        // 基址可用 AIWORK_QODER_SSO_BASE 覆盖（审查修复 低-4）；覆盖/回退诊断随
+        // 会话返回由登录入口落日志（审查修复 中-1）
+        let (sso_base, sso_base_note) = match injected_sso_base {
+            Some(b) => (b, None),
+            None => sso_login_base_from(std::env::var("AIWORK_QODER_SSO_BASE").ok().as_deref()),
+        };
+        let auth_url = format!("{sso_base}?oauth_callback={}", urlencoding::encode(&device_url));
+        Self { nonce, verifier, machine_id, client_id, auth_url, sso_base_note }
     }
 }
 
@@ -246,6 +288,36 @@ mod tests {
         let expect = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(f.verifier.as_bytes()));
         assert!(device_url.contains(&format!("challenge={expect}")));
+    }
+
+    /// SSO 基址环境变量覆盖与回退（审查修复 低-4）：参数注入版解析核心，
+    /// 非法/空/缺失值一律回退默认常量，合法 http(s) URL 去尾斜杠后生效；
+    /// 覆盖生效/非法回退必须携带诊断日志（审查修复 中-1），缺失/空白不带
+    #[test]
+    fn sso_login_base_env覆盖与回退() {
+        // 缺失 / 空白 / 非法协议 → 回退默认常量；缺失/空白不落日志
+        assert_eq!(sso_login_base_from(None), (SSO_LOGIN_BASE.to_string(), None));
+        assert_eq!(sso_login_base_from(Some("")), (SSO_LOGIN_BASE.to_string(), None));
+        assert_eq!(sso_login_base_from(Some("   ")), (SSO_LOGIN_BASE.to_string(), None));
+        // 非法协议 → 回退 + 诊断日志（「改了 env 没生效」的可观测性）
+        let (_, note) = sso_login_base_from(Some("ftp://mirror.example.com"));
+        assert!(note.unwrap().contains("ftp://mirror.example.com"));
+        let (_, note) = sso_login_base_from(Some("qoder.cn/sso/login/aliyun"));
+        assert!(note.unwrap().contains("qoder.cn/sso/login/aliyun"));
+        // 合法覆盖：https / http 均接受；首尾空白与尾部斜杠被清理；均携带生效日志
+        let (base, note) = sso_login_base_from(Some("https://mirror.example.com/sso/login/aliyun/"));
+        assert_eq!(base, "https://mirror.example.com/sso/login/aliyun");
+        assert!(note.unwrap().starts_with("AIWORK_QODER_SSO_BASE 覆盖生效: "));
+        let (base, note) = sso_login_base_from(Some("  http://127.0.0.1:8080/sso/login/aliyun  "));
+        assert_eq!(base, "http://127.0.0.1:8080/sso/login/aliyun");
+        let note = note.unwrap();
+        assert!(note.contains("警告：非 https") && note.contains("127.0.0.1:8080"));
+        // 覆盖基址确实拼入 DeviceFlow 的 auth_url 前缀（参数注入直调 build，
+        // 不触碰进程级 env；默认常量路径另由 flow_generates_distinct_sessions_and_pkce_url 锁定）
+        let f = DeviceFlow::build(true, Some("https://mirror.example.com/sso/login/aliyun".into()));
+        assert!(f.auth_url.starts_with("https://mirror.example.com/sso/login/aliyun?oauth_callback="));
+        // 注入基址不携带 env 诊断（该路径不经 env 解析）
+        assert!(f.sso_base_note.is_none());
     }
 
     #[test]
