@@ -1,14 +1,22 @@
-//! Qoder OAuth 设备流（F-80 M1，R-10 抓包固化 2026-09-27）。
+//! Qoder OAuth 设备流（F-80 M1，R-10 抓包固化 2026-09-27；issue #140 修复 2026-10-24）。
 //!
 //! 客户端真实链路（PKCE device flow）：
 //! 1. 生成 `nonce`（uuid v4）、`verifier`（64 字符）、`machine_id`（uuid v4）；`client_id` 用官方固定常量
-//! 2. 浏览器打开 `https://qoder.cn/device/selectAccounts?challenge=<BASE64URL(SHA256(verifier))>
-//!    &challenge_method=S256&nonce=..&machine_id=..&client_id=732aef47-..`
-//!    （用户在页面完成授权；**client_id 必须用官方注册的固定常量**——2026-10-02 实测：
-//!    随机生成 client_id 会被授权页判「参数无效」。该值取自新版 Qoder CN 客户端
-//!    `authClientIds.prod`，与真实客户端跳转样例逐字一致；社区实现（10router/
-//!    cockpit-tools）则完全不带 client_id，同样可用。**任何实现都不携带 directLogin**，
-//!    回调 URL 里的 directLogin 系授权页登录流程自行追加，与发起方无关）
+//! 2. 浏览器打开 SSO 登录页并自构 oauth_callback（issue #140 修复）：
+//!    `https://qoder.cn/sso/login/aliyun?oauth_callback=<百分号编码的设备授权页 URL>`
+//!    回调（设备授权页）形如 `https://qoder.cn/device/selectAccounts?challenge=..
+//!    &challenge_method=S256&nonce=..&machine_id=..&directLogin=true&client_id=732aef47-..`
+//!    —— **client_id 必须用官方注册的固定常量**（2026-10-02 实测：随机生成 client_id
+//!    会被判「参数无效」；值取自新版 Qoder CN 客户端 `authClientIds.prod`，与真实
+//!    客户端跳转样例逐字一致；社区实现（10router/cockpit-tools）则完全不带
+//!    client_id，同样可用）。directLogin=true 仅出现一次（模拟授权页自身生成的
+//!    回调形态；2026-10-02 的「参数无效」系 directLogin 重复所致，单个安全）。
+//!    **不再直接打开 /device/selectAccounts**：2026-10-24 实测（issue #140）该页
+//!    在前端自构 SSO 跳转时会向 oauth_callback 写入显式 `:443` 端口
+//!    （`https://qoder.cn:443/device/...`），与其 SSO 端点的回调白名单（仅
+//!    `https://qoder.cn`）不匹配，未登录用户经授权页登录必现 400 Bad Request。
+//!    客户端直连 SSO 登录页绕过该损坏的重定向（实测 200 正常登录表单），用户
+//!    完成阿里云登录后回跳设备授权页继续 PKCE 流程
 //! 3. 轮询 `GET {open_api}/api/v1/deviceToken/poll?nonce=..&verifier=..&challenge_method=S256`
 //!    - **pending = HTTP 404** `{"errorCode":"NotFound",...}`（实测）
 //!    - **成功 = HTTP 200**：`{id, token(dt-), user_id, expires_in:2591999999(≈30d ms),
@@ -25,6 +33,11 @@ use crate::fs_utils;
 
 /// 授权页基址（需求方实测样例：qoder.cn/device/selectAccounts）
 pub const DEVICE_AUTH_BASE: &str = "https://qoder.cn/device/selectAccounts";
+
+/// SSO 登录页基址（issue #140 修复 2026-10-24）：设备授权页自构 SSO 跳转时向
+/// oauth_callback 写入显式 `:443` 端口，被 SSO 端点回调白名单（仅 `https://qoder.cn`）
+/// 拒绝 → 400 Bad Request。客户端改为直连本页并自构正确回调（实测 200）。
+pub const SSO_LOGIN_BASE: &str = "https://qoder.cn/sso/login/aliyun";
 
 /// 授权页 client_id（官方注册常量，新版 Qoder CN 客户端 `authClientIds.prod`）。
 /// 实测 2026-10-02：随机生成 client_id 会被授权页判「参数无效」；社区实现
@@ -46,7 +59,7 @@ pub struct DeviceFlow {
     /// 兼容模式（None）时不携带：社区实现（10router/cockpit-tools）验证可正常授权
     #[allow(dead_code)]
     pub client_id: Option<String>,
-    /// 授权页完整 URL（challenge = BASE64URL(SHA256(verifier))，S256）
+    /// SSO 登录页完整 URL（oauth_callback 指向设备授权页，challenge = BASE64URL(SHA256(verifier))，S256）
     pub auth_url: String,
 }
 
@@ -77,13 +90,20 @@ impl DeviceFlow {
         // challenge：BASE64URL_NO_PAD(SHA256(verifier))（PKCE S256）
         let digest = Sha256::digest(verifier.as_bytes());
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-        let mut url = format!(
-            "{DEVICE_AUTH_BASE}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}"
+        // 设备授权页完整 URL（不再直接打开——issue #140：该页自构 SSO 跳转时向
+        // oauth_callback 写入显式 :443 端口，被 SSO 回调白名单拒绝 → 400）。
+        // directLogin=true 单个出现，模拟授权页自身生成的回调形态（去 :443 后
+        // 实测 200；2026-10-02「参数无效」系重复参数所致，单个安全）。
+        let mut device_url = format!(
+            "{DEVICE_AUTH_BASE}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}&directLogin=true"
         );
         if let Some(cid) = &client_id {
-            url.push_str(&format!("&client_id={cid}"));
+            device_url.push_str(&format!("&client_id={cid}"));
         }
-        Self { nonce, verifier, machine_id, client_id, auth_url: url }
+        // 直连 SSO 登录页，oauth_callback 全量百分号编码（跳过授权页损坏的重定向）
+        let auth_url =
+            format!("{SSO_LOGIN_BASE}?oauth_callback={}", urlencoding::encode(&device_url));
+        Self { nonce, verifier, machine_id, client_id, auth_url }
     }
 }
 
@@ -100,7 +120,7 @@ pub fn poll_once(agent: &ureq::Agent, flow: &DeviceFlow) -> (u16, Option<Value>)
         "{}/api/v1/deviceToken/poll?nonce={}&verifier={}&challenge_method=S256",
         qoder_common::OPEN_API_BASE,
         flow.nonce,
-        urlencode(&flow.verifier)
+        urlencoding::encode(&flow.verifier)
     );
     let headers = vec![
         ("User-Agent".to_string(), qoder_common::CLIENT_USER_AGENT.to_string()),
@@ -165,12 +185,6 @@ pub fn parse_poll_success(body: &Value, expected_nonce: &str) -> Option<(QoderCr
     ))
 }
 
-/// verifier 进 query 前的最小转义（verifier 实为双 uuid4 simple 拼接的 64 位纯 hex，
-/// 正常不含任何需转义字符；此转义仅为防御性兜底，防 verifier 构造变化引入保留字）
-fn urlencode(s: &str) -> String {
-    s.replace('%', "%25").replace(' ', "%20").replace('&', "%26").replace('=', "%3D").replace('~', "%7E")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,22 +196,37 @@ mod tests {
         assert_ne!(f1.nonce, f2.nonce);
         assert_ne!(f1.verifier, f2.verifier);
         assert_eq!(f1.verifier.len(), 64);
-        assert!(f1.auth_url.starts_with(DEVICE_AUTH_BASE));
-        // query 参数完整性（与真实客户端跳转参数集一致）
-        for key in ["challenge=", "challenge_method=S256", "nonce=", "machine_id=", "client_id="] {
-            assert!(f1.auth_url.contains(key), "auth_url 缺少 {key}");
+        // auth_url 直连 SSO 登录页（issue #140），oauth_callback 全量编码且无顶层附加参数
+        assert!(f1.auth_url.starts_with(SSO_LOGIN_BASE));
+        let (_, cb) = f1.auth_url.split_once("?oauth_callback=").unwrap();
+        assert!(!cb.contains('&'), "oauth_callback 必须全量编码，SSO URL 不得有其他顶层参数");
+        let device_url = urlencoding::decode(cb).unwrap().into_owned();
+        // 回调不得携带显式 :443 端口（issue #140 的 400 根因）
+        assert!(!device_url.contains(":443"), "oauth_callback 不得携带 :443 端口");
+        // 回调 query 参数完整性（模拟授权页自身生成的形态，与真实客户端跳转参数集一致）
+        for key in ["challenge=", "challenge_method=S256", "nonce=", "machine_id=", "directLogin=true", "client_id="] {
+            assert!(device_url.contains(key), "oauth_callback 缺少 {key}");
         }
+        // 值绑定：URL 中必须是本会话 f1 的值（防参数互串回归）
+        assert!(
+            device_url.contains(&format!("nonce={}", f1.nonce)),
+            "oauth_callback nonce 未绑定本会话"
+        );
+        assert!(
+            device_url.contains(&format!("machine_id={}", f1.machine_id)),
+            "oauth_callback machine_id 未绑定本会话"
+        );
         // client_id 必须是官方注册固定常量（随机 uuid 会被判「参数无效」）
         assert!(
-            f1.auth_url.contains(&format!("client_id={DEVICE_AUTH_CLIENT_ID}")),
-            "auth_url client_id 必须为官方固定常量"
+            device_url.contains(&format!("client_id={DEVICE_AUTH_CLIENT_ID}")),
+            "oauth_callback client_id 必须为官方固定常量"
         );
-        // 不携带 directLogin：官方客户端与社区实现均不发送该参数
-        assert!(!f1.auth_url.contains("directLogin"), "auth_url 不应携带 directLogin");
+        // directLogin 仅出现一次（2026-10-02 实测：重复参数被授权页判「参数无效」）
+        assert_eq!(device_url.matches("directLogin").count(), 1, "directLogin 只能出现一次");
         // challenge 可由 verifier 复算（S256 绑定）
         let expect = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(f1.verifier.as_bytes()));
-        assert!(f1.auth_url.contains(&format!("challenge={expect}")));
+        assert!(device_url.contains(&format!("challenge={expect}")));
     }
 
     /// 兼容模式（2026-10-02 审查预案）：不带 client_id，其余参数集与 PKCE 绑定不变
@@ -205,13 +234,18 @@ mod tests {
     fn flow_compat_omits_client_id() {
         let f = DeviceFlow::new_compat();
         assert!(f.client_id.is_none());
-        assert!(!f.auth_url.contains("client_id="), "兼容模式不应携带 client_id");
-        assert!(f.auth_url.contains("challenge=") && f.auth_url.contains("challenge_method=S256"));
-        assert!(f.auth_url.contains("nonce=") && f.auth_url.contains("machine_id="));
-        assert!(!f.auth_url.contains("directLogin"));
+        let (_, cb) = f.auth_url.split_once("?oauth_callback=").unwrap();
+        let device_url = urlencoding::decode(cb).unwrap().into_owned();
+        assert!(!device_url.contains("client_id="), "兼容模式不应携带 client_id");
+        assert!(
+            device_url.contains("challenge=") && device_url.contains("challenge_method=S256")
+        );
+        assert!(device_url.contains("nonce=") && device_url.contains("machine_id="));
+        assert!(!device_url.contains(":443"));
+        assert_eq!(device_url.matches("directLogin").count(), 1);
         let expect = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(f.verifier.as_bytes()));
-        assert!(f.auth_url.contains(&format!("challenge={expect}")));
+        assert!(device_url.contains(&format!("challenge={expect}")));
     }
 
     #[test]

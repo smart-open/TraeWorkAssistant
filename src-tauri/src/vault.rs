@@ -2,8 +2,11 @@
 //!
 //! 设计：
 //! - vault 快照 `conf/vault.stronghold` 权威保存各账号 jwt / refresh_token（按 uid 一条记录）；
-//! - vault 主密码为随机 32 字节，经 Windows DPAPI 加密存放在 `conf/vault_key.bin`
-//!   （仅本机当前用户可解，拷贝到其他机器/用户无法解密）；
+//! - vault 主密码为随机 32 字节，存放在 `conf/vault_key.bin`，读取双格式自适应（issue #139）：
+//!   `V2:`+64hex 文本（服务端 docker_main 格式，conf 目录共享场景）优先，
+//!   否则按 Windows DPAPI blob 解密（仅本机当前用户可解）；
+//!   新建文件默认 DPAPI；设置 `AIWORK_VAULT_SHARED=1` 时把已有 DPAPI 密钥一次性转换为
+//!   V2: 文本以便与服务端共享 conf（代价：密钥明文 hex 落盘，显式开启方生效）；
 //! - `checkin_accounts.json` 只保留占位（jwt/refresh_token 清空），其余字段（name/user_id 等）不动；
 //! - 所有账号文件读写统一走 `load_accounts` / `save_accounts`：
 //!   读：JSON 明文优先（更新鲜，如 MITM 新捕获）→ 否则从 vault 回填；
@@ -181,8 +184,11 @@ fn generate_password() -> Result<Vec<u8>, String> {
 
 /// 读取（或首次生成）受保护的主密码（per-data_dir：主密码落 `<data_dir>/conf/`）。
 /// 平台分派收口 `platform::secret`（F-75 M0-0.4）——
-/// Windows 走 DPAPI + `conf/vault_key.bin`（main 行为零变化，错误文案逐字保留）；
-/// macOS 走 key file 主源 + Keychain 兜底（首启无条目 → 生成随机主密码写入，用户无感）。
+/// Windows 走 `conf/vault_key.bin` 双格式自适应（issue #139：`V2:`+64hex 文本优先、
+/// DPAPI blob 回退；`AIWORK_VAULT_SHARED=1` 时一次性迁移 DPAPI→V2:，
+/// 见 parse_v2_hex_text / parse_key_file / maybe_convert_to_v2）；
+/// macOS 走 key file 主源（纯 hex，兼容读取 V2: 共享文件，共享模式开启时同样
+/// 迁移为 V2:）+ Keychain 兜底（首启无条目 → 生成随机主密码写入，用户无感）。
 /// 防御（macos_main 实测缺陷修复，全平台生效）：主密码源缺失但 vault 快照已存在时，
 /// 静默重生成新密码会与既有密文永久失配（macOS Keychain 条目丢失 → 每次 save_accounts
 /// 报 BadFileKey，凭据不可恢复且读路径静默降级为空 JWT）。此时必须显式报错，
@@ -204,6 +210,94 @@ fn vault_password_at(data_dir: &Path) -> Result<Vec<u8>, String> {
     Ok(pwd)
 }
 
+/// 解析 `V2:` + 64 位 hex 文本密钥（issue #139 服务端 docker_main 共享格式）。
+/// 跨平台共用（macos_main 合并适配）：非 `V2:` 前缀返回 `Ok(None)`，由调用方
+/// 回退到平台原生格式（Windows=DPAPI blob / macOS=纯 hex 文本）；
+/// 带 `V2:` 前缀但格式非法返回 Err（长度/hex 字符校验，防多字节 char boundary panic）。
+pub(crate) fn parse_v2_hex_text(text: &str) -> Result<Option<Vec<u8>>, String> {
+    let Some(hex) = text.trim().strip_prefix("V2:") else {
+        return Ok(None);
+    };
+    if hex.len() != 64 {
+        return Err(format!(
+            "vault 密钥格式异常（V2: 后期望 64 位 hex，实际 {hex_len} 字符）",
+            hex_len = hex.len()
+        ));
+    }
+    // hexdigit 全量校验：len() 是字节长度，多字节 UTF-8 字符可凑足 64 字节，
+    // 直接按字节切片会在 char boundary 中间 panic；先统一收敛为友好 Err。
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(
+            "vault 密钥格式异常（V2: 后应为 64 位 ASCII hex，实际含非 hex 字符）".into(),
+        );
+    }
+    let mut key = [0u8; 32];
+    for i in 0..32 {
+        key[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("vault 密钥 hex 解码失败: {e}"))?;
+    }
+    Ok(Some(key.to_vec()))
+}
+
+/// 解析密钥文件（issue #139 双格式自适应，Windows 专属——macOS 由
+/// platform::secret 组合 parse_v2_hex_text + 纯 hex 解析）：
+/// - `V2:` 前缀 + 64 位 hex → 32 字节（服务端 docker_main 格式，conf 目录共享场景）；
+/// - 其余内容按 DPAPI blob 解密（桌面版原生格式）。
+/// 失败时区分两种格式分别报错，替代原先笼统的 CryptUnprotectData 提示。
+#[cfg(windows)]
+pub(crate) fn parse_key_file(raw: &[u8], path: &Path) -> Result<Vec<u8>, String> {
+    let text = String::from_utf8_lossy(raw);
+    match parse_v2_hex_text(&text)? {
+        Some(key) => Ok(key),
+        None => dpapi::unprotect(raw).map_err(|e| {
+            format!(
+                "vault 密钥解析失败（{}：既非 V2: 文本格式，也非本机可解的 DPAPI blob）: {e}",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// 字节 → 小写 hex（V2: 密钥文件存储格式，与服务端 docker_main 一致）
+pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 共享模式开关：环境变量 AIWORK_VAULT_SHARED（1/true，大小写不敏感，容忍首尾空白）
+fn vault_shared_mode() -> bool {
+    std::env::var("AIWORK_VAULT_SHARED")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+        .unwrap_or(false)
+}
+
+/// 共享模式一次性迁移（issue #139）：`AIWORK_VAULT_SHARED=1` 且文件当前为平台原生
+/// 密钥格式（Windows=DPAPI blob / macOS=纯 hex 文本）时，就地重写为 `V2:` 文本格式，
+/// 使 aiwork-server（docker_main）可读同一 conf 目录。跨平台共用（macos_main 合并
+/// 适配：mac 纯 hex→V2: 镜像 main 在 Windows 的 DPAPI→V2: 语义，复用同一实现）。
+/// 结果与失败均落日志；失败不阻断本次打开（下次启动重试）。
+/// 注意：转换后密钥以明文 hex 落盘（Windows 失去 DPAPI 的「仅本机当前用户可解」
+/// 保护；macOS 原生即为明文 hex，仅格式变化），由用户显式开启共享模式来接受该权衡。
+pub(crate) fn maybe_convert_to_v2(key_path: &Path, blob: &[u8], pwd: &[u8], data_dir: &Path) {
+    if !vault_shared_mode() {
+        return;
+    }
+    if String::from_utf8_lossy(blob).trim().starts_with("V2:") {
+        return; // 已是 V2: 文本，无需转换
+    }
+    let content = format!("V2:{}", bytes_to_hex(pwd));
+    match std::fs::write(key_path, content.as_bytes()) {
+        Ok(()) => fs_utils::app_log(
+            data_dir,
+            "vault: AIWORK_VAULT_SHARED 已开启，vault_key.bin 已由 DPAPI blob 转换为 V2: 文本格式（可与 aiwork-server 共享 conf；密钥现为明文 hex，注意目录访问控制）",
+        ),
+        Err(e) => fs_utils::app_log(
+            data_dir,
+            &format!("vault: vault_key.bin 转换 V2: 写入失败（下次启动重试）: {e}"),
+        ),
+    }
+}
+
 /// 打开（并缓存）data_dir 对应的 vault，然后在持锁状态下执行 `f(sh)`。
 /// 首次调用时加载快照或创建新 client；主密码/快照打开失败保留 None 条目待下次重试。
 fn with_open<T>(
@@ -218,11 +312,21 @@ fn with_open<T>(
         let conf = data_dir.join("conf");
         let _ = std::fs::create_dir_all(&conf);
         let path = conf.join("vault.stronghold");
+        // 快照存在性必须在 Stronghold::new 之前判定（new 可能立即创建空快照文件）
+        let snapshot_exists = path.exists();
         let password = vault_password_at(data_dir)?;
         let sh = Stronghold::new(&path, password).map_err(|e| format!("打开 vault 失败: {e}"))?;
         // 快照数据不会自动进入 clients map，必须显式 load_client（见单元测试 stronghold_快照往返）；
-        // 仅当快照中不存在该 client（首次创建）时才新建，防止空 client 覆盖已有快照导致凭据丢失
+        // 仅当快照中不存在该 client（首次创建）时才新建，防止空 client 覆盖已有快照导致凭据丢失。
+        // 密钥/快照错配防护（issue #139）：快照存在但 load_client 失败，大概率是 vault_key.bin
+        // 与快照不匹配（如共享迁移期间替换过密钥）——拒绝打开，禁止空 client 经 save() 覆盖原快照
         if sh.load_client(CLIENT_PATH.to_vec()).is_err() {
+            if snapshot_exists {
+                return Err(format!(
+                    "vault 快照已存在但 client 加载失败（{}）：大概率 vault_key.bin 与快照不匹配（如迁移期间替换过密钥）。已拒绝打开，防止空 client 覆盖快照；请恢复匹配的密钥或快照备份",
+                    path.display()
+                ));
+            }
             sh.create_client(CLIENT_PATH.to_vec())
                 .map_err(|e| format!("创建 vault client 失败: {e}"))?;
         }
@@ -778,6 +882,59 @@ mod tests {
         assert_ne!(blob, plain.to_vec());
         let round = dpapi::unprotect(&blob).expect("unprotect");
         assert_eq!(round, plain.to_vec());
+    }
+
+    #[test]
+    fn parse_v2_hex文本解析与hex往返() {
+        let key = [0xABu8; 32];
+        // 标准格式：V2: + 64 位小写 hex（与服务端 docker_main 写出格式一致）
+        let text = format!("V2:{}", bytes_to_hex(&key));
+        assert_eq!(parse_v2_hex_text(&text).expect("parse V2"), Some(key.to_vec()));
+        // 带首尾空白（复制粘贴常见）也能解析
+        let text = format!("  V2:{}\r\n", bytes_to_hex(&key));
+        assert_eq!(
+            parse_v2_hex_text(&text).expect("parse trimmed"),
+            Some(key.to_vec())
+        );
+        // 非 V2: 前缀 → Ok(None)（交由调用方平台原生格式回退）
+        assert_eq!(parse_v2_hex_text("deadbeef").unwrap(), None);
+        assert_eq!(parse_v2_hex_text("").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_v2_hex长度或字符非法时报错() {
+        // 长度不对（63 位 hex）
+        let short = format!("V2:{}a", "ab".repeat(31));
+        let err = parse_v2_hex_text(&short).unwrap_err();
+        assert!(err.contains("64 位 hex"), "实际报错: {err}");
+        // 非 hex 字符（ASCII）→ 被 hexdigit 全量校验拦下
+        let bad = format!("V2:{}", "z".repeat(64));
+        let err = parse_v2_hex_text(&bad).unwrap_err();
+        assert!(err.contains("非 hex 字符"), "实际报错: {err}");
+        // 多字节 UTF-8 且总字节长恰为 64（共享目录手工编辑污染场景）：
+        // é 从奇数字节偏移 61 开始，旧代码按字节切片会在 char boundary
+        // 中间 panic；须收敛为友好 Err（panic 回归用例）
+        let multibyte = format!("V2:{}éa", "a".repeat(61));
+        assert_eq!(multibyte.len(), 67); // 3 前缀 + 61 + 2 + 1 = 67 字节
+        let err = parse_v2_hex_text(&multibyte).unwrap_err();
+        assert!(err.contains("非 hex 字符"), "实际报错: {err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_key_file_dpapi回退与非双格式报错() {
+        let dir = std::env::temp_dir().join(format!("vault_parse_dpapi_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vault_key.bin");
+        // DPAPI blob（无 V2: 前缀）→ 走回退分支解出原密钥
+        let key = [0x5Au8; 32];
+        std::fs::write(&path, dpapi::protect(&key).unwrap()).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(parse_key_file(&raw, &path).expect("dpapi fallback"), key.to_vec());
+        // 既非 V2: 也非 DPAPI（随机字节）→ 明确报错且点出两种格式
+        let err = parse_key_file(&[0xFF, 0x00, 0x13, 0x37], &path).unwrap_err();
+        assert!(err.contains("既非 V2:") && err.contains("DPAPI"), "实际报错: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

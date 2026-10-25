@@ -1,8 +1,10 @@
 //! 凭证保险库原语（F-75 M0-0.4）：
-//! - Windows：DPAPI（CryptProtectData）加密 vault 主密码落 `conf/vault_key.bin`
-//!   ——原 vault.rs 内联逻辑原样收口至此，**行为零变化**（文件布局/错误文案不变）；
-//! - macOS：`conf/vault_key.bin`（hex 明文，0600）**主源** + Keychain generic password
-//!   （keyring crate）兜底。
+//! - Windows：`conf/vault_key.bin` 双格式自适应（issue #139：`V2:`+64hex 文本优先、
+//!   DPAPI blob 回退；`AIWORK_VAULT_SHARED=1` 时一次性迁移 DPAPI→V2:）——原
+//!   vault.rs 内联逻辑收口至此，文件布局/错误文案不变；
+//! - macOS：`conf/vault_key.bin`（纯 hex 明文 0600 为主源，兼容读取服务端
+//!   docker_main 写出的 `V2:` 共享格式；`AIWORK_VAULT_SHARED=1` 时一次性迁移
+//!   纯 hex→`V2:`）+ Keychain generic password（keyring crate）兜底。
 //!
 //! mac 双源决策（实测教训，2026-09-20）：dev 场景二进制反复重编译，macOS 对
 //! ad-hoc 签名应用的 Keychain 条目访问不稳定（多次 NoEntry），曾导致「静默重生成
@@ -28,9 +30,11 @@ pub const KEYCHAIN_SERVICE: &str = "com.aiwork.assistant.vault";
 pub const KEYCHAIN_ACCOUNT: &str = "stronghold-master";
 
 /// 读取受保护的 vault 主密码；不存在（首次运行）返回 Ok(None)。
-/// Windows：读 `conf/vault_key.bin` + DPAPI 解密（文件存在但解密失败仍为 Err，
-/// 与原 vault.rs 行为逐字一致——绝不静默重生成覆盖既有密文）；
-/// macOS：key file 主源 + Keychain 兜底（见模块注释）。
+/// Windows：读 `conf/vault_key.bin` 双格式自适应（issue #139：V2: 文本优先、
+/// DPAPI blob 回退；文件存在但解析失败仍为 Err——绝不静默重生成覆盖既有密文），
+/// 共享模式开启时一次性迁移 DPAPI→V2:；
+/// macOS：key file 主源（纯 hex，兼容 V2: 共享格式）+ Keychain 兜底（见模块注释），
+/// 共享模式开启时一次性迁移纯 hex→V2:。
 /// data_dir 参数化（vault 多 data_dir 化后 vault_password_at 直调；
 /// `data_dir/conf/vault_key.bin` 与 state.conf_path 同一物理位置）。
 pub fn load_vault_password_at(data_dir: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
@@ -41,7 +45,11 @@ pub fn load_vault_password_at(data_dir: &std::path::Path) -> Result<Option<Vec<u
             return Ok(None);
         }
         let blob = std::fs::read(&key_path).map_err(|e| format!("读取 vault 密钥失败: {e}"))?;
-        crate::vault::dpapi::unprotect(&blob).map(Some)
+        // issue #139 双格式自适应：V2: 文本优先，DPAPI blob 回退
+        let pwd = crate::vault::parse_key_file(&blob, &key_path)?;
+        // 共享模式一次性迁移：DPAPI 密钥 → V2: 文本（AIWORK_VAULT_SHARED=1 方生效）
+        crate::vault::maybe_convert_to_v2(&key_path, &blob, &pwd, data_dir);
+        Ok(Some(pwd))
     }
     #[cfg(target_os = "macos")]
     {
@@ -52,11 +60,20 @@ pub fn load_vault_password_at(data_dir: &std::path::Path) -> Result<Option<Vec<u
                 Ok(t) => t,
                 Err(e) => return Err(format!("读取 vault 密钥失败: {e}")),
             };
-            match decode_hex(text.trim()) {
-                Ok(bytes) => return Ok(Some(bytes)),
-                // file 损坏（如写一半崩溃）→ fail-open 到 Keychain 兜底线索
-                Err(_) => {}
+            // issue #139：V2: 共享格式（服务端 docker_main 写出的 conf 共享场景）优先，
+            // 带 V2: 前缀但非法 → 直接报错（格式明确，静默降级会掩盖文件损坏）；
+            // 无 V2: 前缀 → 本分支原生纯 hex 格式
+            let file_pwd = match crate::vault::parse_v2_hex_text(&text)? {
+                Some(k) => Some(k),
+                None => decode_hex(text.trim()).ok(),
+            };
+            if let Some(pwd) = file_pwd {
+                // 共享模式一次性迁移：纯 hex → V2: 文本（AIWORK_VAULT_SHARED=1，
+                // 镜像 main 在 Windows 的 DPAPI→V2: 迁移语义，复用同一实现）
+                crate::vault::maybe_convert_to_v2(&key_path, text.as_bytes(), &pwd, data_dir);
+                return Ok(Some(pwd));
             }
+            // file 损坏（如写一半崩溃）→ fail-open 到 Keychain 兜底线索
         }
         // 2) 兜底：Keychain（任何失败一律降级 None，不阻断主流程——dev 重签场景
         // 实测读不回自己写的条目，此时按首次运行处理，由 store 双写重建一致性）
@@ -221,6 +238,39 @@ mod tests {
         std::fs::write(&key_path, "zz").unwrap();
         let r = load_vault_password_at(&state.data_dir);
         assert!(r.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_key_file_v2共享格式可读_共享模式迁移为v2() {
+        // issue #139 mac 适配：key file 兼容服务端 docker_main 写出的 V2: 共享格式；
+        // AIWORK_VAULT_SHARED=1 时纯 hex → V2: 一次性迁移（镜像 main 在 Windows 的语义）
+        let dir = std::env::temp_dir().join(format!("platform_secret_mac_v2_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        let state = AppState {
+            data_dir: dir.clone(),
+            jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            group_defs_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        };
+        let pwd: Vec<u8> = (0..32u8).collect();
+        let key_path = state.conf_path("vault_key.bin");
+        // 1) V2: 共享格式直接可读
+        std::fs::write(&key_path, format!("V2:{}", crate::vault::bytes_to_hex(&pwd))).unwrap();
+        assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), Some(pwd.clone()));
+        // 2) 纯 hex + AIWORK_VAULT_SHARED=1 → 读回一致，且文件就地迁移为 V2: 文本
+        std::fs::write(&key_path, crate::vault::bytes_to_hex(&pwd)).unwrap();
+        std::env::set_var("AIWORK_VAULT_SHARED", "1");
+        assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), Some(pwd.clone()));
+        let migrated = std::fs::read_to_string(&key_path).unwrap();
+        assert!(migrated.trim().starts_with("V2:"), "迁移后应为 V2: 文本: {migrated}");
+        // 迁移后再次读取仍一致（V2: 回读路径）
+        assert_eq!(load_vault_password_at(&state.data_dir).unwrap(), Some(pwd.clone()));
+        std::env::remove_var("AIWORK_VAULT_SHARED");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

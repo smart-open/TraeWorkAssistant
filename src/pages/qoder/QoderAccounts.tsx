@@ -420,7 +420,7 @@ export default function QoderAccounts() {
     setOauthCanceling(false);
     // 兼容模式（上次授权超时后自动切换）：授权 URL 不带 client_id（预案见 qoder_oauth.rs）
     const compat = oauthCompatRef.current;
-    setOauthMsg(compat ? '正在打开 Qoder 授权页（兼容模式）…' : '正在打开 Qoder 授权页…');
+    setOauthMsg(compat ? '正在打开 Qoder 登录页（兼容模式）…' : '正在打开 Qoder 登录页…');
     if (compat) pushToast('info', '本次 OAuth 使用兼容模式（不带 client_id），用于绕过授权页「参数无效」');
     setOauthUrl(null);
     setShowOauth(true);

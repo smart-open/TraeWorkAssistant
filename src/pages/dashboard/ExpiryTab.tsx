@@ -101,10 +101,14 @@ export default function ExpiryTab({
       for (const a of qoderCredits?.accounts ?? []) {
         // 包计数与 KPI 口径对齐：剩余未知或 > 0 计入（已用完不计）
         const activePkgs = (a.packages ?? []).filter((p) => p.amount == null || p.amount > 0);
+        // 长期有效哨兵过滤（issue #141）：上游对长期有效包返回 9999-12-31 大哨兵，
+        // dateStrToEndTs 正常换算后 Math.min 会把「最近到期」显示成 9999/12/31——
+        // 与 Trae 分支 / 到期日历（ExpiryCalendar PERPETUAL_TS）同口径剔除；
+        // 全部包为长期有效时 nearestExpire=null 显示「—」（日历仍以「长期有效」展示）
         const expires: number[] = [];
         for (const p of activePkgs) {
           const endTs = dateStrToEndTs(p.expire_at);
-          if (endTs != null) expires.push(endTs);
+          if (endTs != null && endTs < PERPETUAL_TS) expires.push(endTs);
         }
         // 最近到期含 Plan 订阅周期（到期即重置；仅剩余额度 > 0 计入，与到期日历一致）
         const planEnd = dateStrToEndTs(a.plan_expires_at);
@@ -113,7 +117,9 @@ export default function ExpiryTab({
         const hasPlanPkg = (a.packages ?? []).some((p) => p.source === 'plan');
         const pkgCount =
           activePkgs.length + (!hasPlanPkg && planEnd != null && (a.plan_credits ?? 0) > 0 ? 1 : 0);
-        if (planEnd != null && (a.plan_credits ?? 0) > 0) expires.push(planEnd);
+        if (planEnd != null && planEnd < PERPETUAL_TS && (a.plan_credits ?? 0) > 0) {
+          expires.push(planEnd);
+        }
         out.push({
           key: `qoder-${a.user_id}`,
           platform: 'Qoder',

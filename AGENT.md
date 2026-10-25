@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.8.3
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.8.4
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -195,7 +195,7 @@ ai-work-assistant/
 | WB 配置 | `fingerprint_samples_get()` / `fingerprint_samples_clear()` | 指纹样本环形缓冲读取/清空（issue #125 增强）：网关命中 11128 拦截或空完成影子风控（CHANNEL_FINGERPRINT_BLOCK）时自动采集 fingerprint_sample（kind=11128/empty，pool 标注来源池），内存 VecDeque cap 50、队尾三元组去重、重启清空（持久反查靠 app.log「指纹样本:」行）；UI「指纹清洗」tab 展示并一键预填清洗规则（from=样本首句、to 走中性改写/剥离兜底） |
 | Buddy 双应用 | `open_workbuddy_app()` / `open_codebuddy_app()` / `codebuddy_env_check()` | 启动 WorkBuddy / CodeBuddy 桌面客户端（app_locate 探测，未装返回明确错误，不注入代理）；CodeBuddy 环境探测 `{installed,running,exe,version,uid,nickname}`（CodeBuddy CN 桌面与 WorkBuddy 共享 auth 文件 `%LOCALAPPDATA%\CodeBuddyExtension\...\workbuddy-desktop.info`，uid 同源 → 账号页「CodeBuddy在线」徽标）；`-TargetApp CodeBuddy`（authfile 布局）切换/保存快照落 profiles_codebuddy |
 | Qoder | `qoder_env_check()` / `qoder_open_ide()` / `qoder_open_work()` | Qoder IDE 环境探测 / 启动 IDE / 启动 Qoder Work（app_locate 四级探测，`target_app=Qoder`） |
-| Qoder | `qoder_oauth_login()` / `qoder_oauth_cancel()` | PKCE 设备流登录（R-10 抓包固化）：nonce+verifier 生成 → 系统浏览器开 `qoder.cn/device/selectAccounts?challenge=...` → 轮询 `GET /api/v1/deviceToken/poll`（pending=404，≤180s/1s）→ **响应 nonce 回验**（防会话混淆）→ 自动入池落库；事件 qoder-oauth-progress / qoder-oauth-done |
+| Qoder | `qoder_oauth_login()` / `qoder_oauth_cancel()` | PKCE 设备流登录（R-10 抓包固化；issue #140 修复后）：nonce+verifier 生成 → 系统浏览器开 **SSO 登录页** `qoder.cn/sso/login/aliyun?oauth_callback=<百分号编码的设备授权页>`（授权页 URL 附 `directLogin=true`+challenge；不可直开授权页——上游自构 SSO 跳转会向 oauth_callback 写入显式 `:443` 端口被白名单拒 400）→ 登录后回调授权页 → 轮询 `GET /api/v1/deviceToken/poll`（pending=404，≤180s/1s）→ **响应 nonce 回验**（防会话混淆）→ 自动入池落库；事件 qoder-oauth-progress / qoder-oauth-done |
 | Qoder | `qoder_settings_get()` / `qoder_settings_set(patch)` | kv("qoder_settings")：auto_checkin（启动补签）/ checkin_hhmm / credits_sync_hhmm / credits_sync_enabled / lazy_refresh_hours |
 | Qoder | `qoder_accounts_list` → `QoderAccountView[]` | 账号池 ∪ token store 合并视图（脱敏：只回凭证 kind 徽标不回 token）；列表前惰性回填每账号设备指纹（§5.4）；async |
 | Qoder | `qoder_account_save/remove/move` | 改名备注（脏检查：名称/备注均未变直接跳过，不触发网关池 reload）/ 移除（同步清 token store + vault，DB 落库成功才清 vault；池外孤儿凭证（token store 有记录而池条目缺失）仍可清理，清理失败返 Err 透出）/ 分组移动（跨组移动联动网关池热重载——api_pool 按 group_id 过滤调度）；save（有变更）/remove/move/import_pat/OAuth 入池/IDE 扫描/账号导入均联动网关池热重载 |
