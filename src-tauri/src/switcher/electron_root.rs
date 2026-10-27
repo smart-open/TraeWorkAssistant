@@ -506,6 +506,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 捕获进度步的 sink（身份 mismatch Warn 断言用）
+    struct CaptureSink(std::sync::Mutex<Vec<(String, StepStatus, String)>>);
+    impl ProgressSink for CaptureSink {
+        fn step(&self, stage: &str, status: StepStatus, msg: &str) {
+            self.0.lock().unwrap().push((stage.to_string(), status, msg.to_string()));
+        }
+    }
+
+    /// 3.8.5 审查修复（M-C2）：主槽 meta 缺失时 mark/clear 回退 {slot}.bak——
+    /// rotate_bak 后主槽不存在、切换实际经 .bak 恢复的场景，失败徽标不再漏报
+    #[test]
+    fn mark_clear_verify_failed_bak_fallback() {
+        let _guard = test_io_lock();
+        let base = std::env::temp_dir().join(format!("sw-er-vmk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let profiles = base.join("profiles");
+        // 仅 .bak 回退槽有 meta（meta 在槽目录内，rotate 时随目录迁入 .bak）
+        std::fs::create_dir_all(profiles.join("qd-a.bak")).unwrap();
+        std::fs::write(
+            profiles.join("qd-a.bak").join("snapshot_meta.json"),
+            r#"{"schemaVersion":1,"layout":"electron-root","detectedUid":"qd-a"}"#,
+        )
+        .unwrap();
+        mark_snapshot_verify_failed(&profiles, "qd-a");
+        assert!(
+            read_snapshot_meta(&profiles, "qd-a.bak").1.is_some(),
+            "mark 应落 .bak 回退槽"
+        );
+        // 双槽并存：主槽优先（不重复写 .bak）
+        std::fs::create_dir_all(profiles.join("qd-a")).unwrap();
+        std::fs::write(
+            profiles.join("qd-a").join("snapshot_meta.json"),
+            r#"{"schemaVersion":1,"layout":"electron-root"}"#,
+        )
+        .unwrap();
+        mark_snapshot_verify_failed(&profiles, "qd-a");
+        assert!(read_snapshot_meta(&profiles, "qd-a").1.is_some());
+        // clear 双槽幂等清除
+        clear_snapshot_verify_failed(&profiles, "qd-a");
+        assert!(read_snapshot_meta(&profiles, "qd-a").1.is_none());
+        assert!(read_snapshot_meta(&profiles, "qd-a.bak").1.is_none());
+        // 两候选均无 meta：静默不 panic
+        mark_snapshot_verify_failed(&profiles, "qd-none");
+        clear_snapshot_verify_failed(&profiles, "qd-none");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 3.8.5 审查修复（M-C3）：restore 前身份校验三分支——meta detectedUid 与槽位
+    /// 不符 → Warn 不阻断；回退自 .bak（src 槽名≠目标）跳过比对；旧快照无
+    /// detectedUid 静默放行（对齐 icube warn_if_slot_identity_mismatch）
+    #[test]
+    fn snapshot_identity_mismatch_warn() {
+        let _guard = test_io_lock();
+        let base = std::env::temp_dir().join(format!("sw-er-mis-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let profiles = base.join("profiles");
+        let data_dir = base.join("appdata");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let args = crate::switcher::RunArgs {
+            action: crate::switcher::Action::Switch,
+            target_app: crate::switcher::TargetApp::QoderWork,
+            user_id: Some("qd-a".into()),
+            proxy_port: None,
+            include_indexeddb: false,
+            expected_current_uid: String::new(),
+            machine_id_override: None,
+            data_dir: base.clone(),
+        };
+        let mut sess = crate::switcher::Session::new(&args);
+        sess.prof.data_dir = data_dir;
+        sess.prof.profiles_dir = profiles.clone();
+        let slot_dir = profiles.join("qd-a");
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        // 污染快照：保存时探测身份是 qd-b
+        std::fs::write(
+            slot_dir.join("snapshot_meta.json"),
+            r#"{"schemaVersion":1,"layout":"electron-root","detectedUid":"qd-b"}"#,
+        )
+        .unwrap();
+        let sink = CaptureSink(Default::default());
+        warn_if_snapshot_identity_mismatch(&sess, &slot_dir, "qd-a", &sink);
+        assert!(
+            sink.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, st, m)| *st == StepStatus::Warn && m.contains("与槽位账号不符")),
+            "mismatch 必须 Warn"
+        );
+        // 回退自 .bak（src 槽名≠目标 slot）：跳过代际比对
+        let sink2 = CaptureSink(Default::default());
+        warn_if_snapshot_identity_mismatch(&sess, &profiles.join("qd-a.bak"), "qd-a", &sink2);
+        assert!(sink2.0.lock().unwrap().is_empty(), "回退代际不做比对");
+        // 旧快照无 detectedUid：静默放行
+        std::fs::write(
+            slot_dir.join("snapshot_meta.json"),
+            r#"{"schemaVersion":1,"layout":"electron-root"}"#,
+        )
+        .unwrap();
+        let sink3 = CaptureSink(Default::default());
+        warn_if_snapshot_identity_mismatch(&sess, &slot_dir, "qd-a", &sink3);
+        assert!(sink3.0.lock().unwrap().is_empty(), "无 detectedUid 静默放行");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// 二次保存触发两代轮转：<slot>.bak 保留上一代快照（Work 无 live 身份守卫，
     /// 误覆盖场景下 .bak 是唯一找回手段——对齐 icube/chromium/authfile）
     #[test]

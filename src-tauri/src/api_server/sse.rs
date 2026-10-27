@@ -131,7 +131,10 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
         }
         "done" => {
             if let Some(s) = obj.get("finish_reason").and_then(|v| v.as_str()) {
-                ev.finish_reason = s.to_string();
+                // 3.8.5 审查 L1：与 turn_completion 同口径词表白名单归一化——
+                // 上游偶发走 done 收尾携带非词表值（如 "completed"）同样污染
+                // OpenAI 出口（收尾帧 / aggregate / aggregate_text）
+                ev.finish_reason = normalize_finish(s);
             }
         }
         "turn_completion" => {
@@ -142,17 +145,11 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
             // 审查加固：值过 OpenAI 词表白名单，词表外/空值归 stop——旧实现
             // 硬编码 stop 兼具归一化效果，裸透传会让非词表值（如 "completed"）
             // 污染 OpenAI 出口（收尾帧 / aggregate / aggregate_text）
-            const KNOWN_FINISH: [&str; 5] =
-                ["stop", "length", "tool_calls", "function_call", "content_filter"];
             let fr = obj
                 .get("finish_reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            ev.finish_reason = if KNOWN_FINISH.contains(&fr) {
-                fr.to_string()
-            } else {
-                "stop".to_string()
-            };
+            ev.finish_reason = normalize_finish(fr);
         }
         "error" => {
             ev.error_code = obj.get("code").and_then(|v| v.as_i64());
@@ -805,10 +802,25 @@ struct ToolBuf {
     slot: usize,
 }
 
+/// OpenAI finish_reason 词表白名单归一化（词表外/空值归 stop）。
+/// done 与 turn_completion 两个收尾事件共用（3.8.5 审查 L1）
+fn normalize_finish(fr: &str) -> String {
+    const KNOWN_FINISH: [&str; 5] =
+        ["stop", "length", "tool_calls", "function_call", "content_filter"];
+    if KNOWN_FINISH.contains(&fr) {
+        fr.to_string()
+    } else {
+        "stop".to_string()
+    }
+}
+
 fn anthropic_stop_reason(finish: &str) -> &'static str {
     match finish {
         "length" => "max_tokens",
         "tool_calls" | "function_call" => "tool_use",
+        // 3.8.5 审查 L4：content_filter 是真实截断语义（对齐 1010 行注释口径），
+        // 静默映射 end_turn 会让客户端误判正常收尾；Anthropic 词表对应 refusal
+        "content_filter" => "refusal",
         _ => "end_turn",
     }
 }
@@ -1737,6 +1749,38 @@ mod tests {
         let resp = resp.expect("聚合结果");
         assert_eq!(resp["stop_reason"], "tool_use");
         assert!(resp["content"].as_array().expect("blocks").iter().any(|b| b["type"] == "tool_use"));
+    }
+
+    // ==================== 3.8.5 审查修复：done 词表归一化 + content_filter 映射 ====================
+
+    #[test]
+    fn done_nonwhitelist_finish_reason_normalized_to_stop() {
+        // done 收尾携带词表外值（如 "completed"）→ 出口归一化为 stop，
+        // 不裸透传污染 OpenAI 出口（对齐 turn_completion 词表白名单口径）
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"hi\"}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"completed\"}\n\n",
+        );
+        let (resp, err) = aggregate(std::io::Cursor::new(input), "c1", None);
+        assert!(err.is_none());
+        let resp = resp.expect("聚合结果");
+        assert_eq!(
+            resp["choices"][0]["finish_reason"], "stop",
+            "done 非词表值必须归一化为 stop"
+        );
+    }
+
+    #[test]
+    fn anthropic_content_filter_maps_to_refusal() {
+        // Anthropic 映射：content_filter 是真实截断语义，不得静默降级 end_turn
+        let input = concat!(
+            "event: output\ndata: {\"response\":\"部分输出\"}\n\n",
+            "event: done\ndata: {\"finish_reason\":\"content_filter\"}\n\n",
+        );
+        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "msg_t", "m", None);
+        assert!(err.is_none());
+        let resp = resp.expect("聚合结果");
+        assert_eq!(resp["stop_reason"], "refusal");
     }
 
     #[test]

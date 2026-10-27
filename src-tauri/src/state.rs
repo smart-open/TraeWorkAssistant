@@ -484,6 +484,35 @@ mod tests {
         }
     }
 
+    /// 3.8.5 审查修复（L1）：kv 半写/损坏（键存在但内容非法）→ 双开关回填默认开；
+    /// 显式关闭（合法 kv）不被回填复活
+    #[test]
+    fn settings_corrupt_kv_backfills_doubao_switches() {
+        let st = tmp_state("corrupt_kv");
+        crate::store::db(&st.data_dir)
+            .kv_set_raw("app_settings", "{invalid json")
+            .unwrap();
+        let s = st.settings();
+        assert!(
+            s.doubao_keepalive_enabled && s.doubao_quota_enabled,
+            "损坏 kv 路径必须回填默认开"
+        );
+        crate::store::db(&st.data_dir)
+            .kv_set(
+                "app_settings",
+                &serde_json::json!({
+                    "doubao_keepalive_enabled": false,
+                    "doubao_quota_enabled": false
+                }),
+            )
+            .unwrap();
+        let s2 = st.settings();
+        assert!(
+            !s2.doubao_keepalive_enabled && !s2.doubao_quota_enabled,
+            "显式关闭不被回填复活"
+        );
+    }
+
     /// 旧 workbuddy_settings 通知字段 → app Settings 一次性搬运：回写 app_settings 持久化 +
     /// 移除旧 kv 通知键（push_notify 裸读 kv，必须落盘才能读到迁移值）
     #[test]

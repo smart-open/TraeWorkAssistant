@@ -1472,6 +1472,19 @@ mod tests {
         );
     }
 
+    /// 3.8.5 审查修复（L2）：豆包巡检结果（bool ok + success/failed/exhausted）
+    /// 走可读摘要分支，不再落入 JSON 截断展示；签到类 i64 三元组不受影响
+    #[test]
+    fn summarize_doubao_quota_bool_ok() {
+        let v = json!({ "ok": true, "mode": "all", "total": 4, "success": 3, "failed": 1, "exhausted": 2 });
+        assert_eq!(summarize(&v, "doubao-quota"), "巡检成功 3，失败 1，额度耗尽 2");
+        let v2 = json!({ "ok": true, "success": 1, "failed": 0 });
+        assert_eq!(summarize(&v2, "doubao-quota"), "巡检成功 1，失败 0，额度耗尽 0");
+        // 签到类 ok/already/failed（i64）仍走第一分支
+        let v3 = json!({ "ok": 2, "already": 1, "failed": 0 });
+        assert_eq!(summarize(&v3, "trae-checkin"), "成功 2，已签 1，失败 0");
+    }
+
     /// 看板同步/模型同步的调度计划：默认 every_hours 每2小时（issue #82）；
     /// hourly/daily 生效；off 关闭；非法值回退 every_hours；间隔小时数可手工设置并 clamp；
     /// 模型同步默认开、时刻可改、关闭后 Skip

@@ -41,10 +41,14 @@ export default function ToolAliasPanel() {
   // 「恢复内置默认」两段式确认（同指纹清洗面板内联模式）
   const [confirmReset, setConfirmReset] = useState(false);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 规则行删除两段式确认（3.8.5 审查 L5）：按行 key 定位，计时器独立于恢复默认
+  const [confirmDeleteKey, setConfirmDeleteKey] = useState<number | null>(null);
+  const deleteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(
     () => () => {
       if (confirmTimer.current) clearTimeout(confirmTimer.current);
+      if (deleteTimer.current) clearTimeout(deleteTimer.current);
     },
     [],
   );
@@ -237,10 +241,23 @@ export default function ToolAliasPanel() {
                 停用
               </label>
               <button
-                onClick={() => setRows((rs) => rs.filter((_, k) => k !== i))}
+                onClick={() => {
+                  if (deleteTimer.current) clearTimeout(deleteTimer.current);
+                  if (confirmDeleteKey === key) {
+                    deleteTimer.current = null;
+                    setConfirmDeleteKey(null);
+                    setRows((rs) => rs.filter((row) => row.key !== key));
+                  } else {
+                    setConfirmDeleteKey(key);
+                    deleteTimer.current = setTimeout(() => {
+                      setConfirmDeleteKey(null);
+                      deleteTimer.current = null;
+                    }, 3000);
+                  }
+                }}
                 className="shrink-0 rounded-md px-2 py-1 text-xs text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-900/20"
               >
-                删除
+                {confirmDeleteKey === key ? '确认删除？' : '删除'}
               </button>
             </div>
           );

@@ -167,7 +167,8 @@ fn content_text(content: &Value) -> String {
 }
 
 /// 会话分组键（issue #149 P2）：取前 2 条消息（role|content| 拼接）SHA256 前
-/// 4 字节 hex，"cv|" 前缀。不复用 sticky 指纹（pool_session_key 取前 3 条窗口，
+/// 8 字节 hex，"cv|" 前缀（3.8.5 审查 L1 由 4 字节升级，降碰撞误归并）。不复用
+/// sticky 指纹（pool_session_key 取前 3 条窗口，
 /// 轮 2+ 起 assistant/tool 消息挤入后跨轮不稳定）；前 2 条为对话开场白，多轮间
 /// 稳定不变。
 fn conversation_key(core: &Value) -> String {
@@ -183,7 +184,10 @@ fn conversation_key(core: &Value) -> String {
         feed.push('|');
     }
     let digest = Sha256::digest(feed.as_bytes());
-    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    // 3.8.5 审查 L1：取 8 字节（64-bit）——4 字节生日碰撞约 6.5 万条开场白即过半，
+    // 碰撞会把两个不同会话在保留期窗口内永久归并且无法拆分。升级边界说明：存量
+    // 行仍是 4 字节键，跨升级边界的同一会话会拆成两条展示，90 天保留期内自愈
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     format!("cv|{hex}")
 }
 

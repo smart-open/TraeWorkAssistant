@@ -255,38 +255,55 @@ pub(crate) fn read_snapshot_sidecar(profiles_dir: &Path, slot: &str) -> (Option<
 
 /// 标记「切换到该账号时客户端未确认登录（超时/身份不符）」——账号列表红色徽标的数据源。
 /// sidecar 不存在（无快照）时静默跳过；成功切换或重新保存登录态时由 clear/backup 清除。
+/// 3.8.5 审查修复（复审 M1，对齐 electron_root 同型修复）：主槽 sidecar 缺失时
+/// 回退写 `{slot}.bak.meta.json`——rotate_bak 只轮转槽目录不轮转 sidecar，主槽
+/// 无快照而 .bak 存在时（切换实际经 .bak 恢复），此前标记恒丢失、徽标漏报
+///（读取侧 accounts.rs 已有 .bak 回退，此处补齐写入侧闭环）。
 pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &Path, slot: &str) {
-    let path = profiles_dir.join(format!("{slot}.meta.json"));
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let candidates = [
+        profiles_dir.join(format!("{slot}.meta.json")),
+        profiles_dir.join(format!("{slot}.bak.meta.json")),
+    ];
+    for path in candidates {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            continue;
+        };
+        obj.insert(
+            "verifyFailedAtMs".into(),
+            serde_json::json!(chrono::Utc::now().timestamp_millis()),
+        );
+        let _ = std::fs::write(&path, v.to_string());
         return;
-    };
-    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
-    };
-    let Some(obj) = v.as_object_mut() else {
-        return;
-    };
-    obj.insert(
-        "verifyFailedAtMs".into(),
-        serde_json::json!(chrono::Utc::now().timestamp_millis()),
-    );
-    let _ = std::fs::write(&path, v.to_string());
+    }
 }
 
 /// 清除切换验证失败标记（切换到该账号并确认登录，或重新保存快照时调用）。
+/// 主槽与 .bak 回退 sidecar 都清（哪份被恢复过就清哪份，双写幂等），
+/// 对齐 mark 的回退链。
 pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &Path, slot: &str) {
-    let path = profiles_dir.join(format!("{slot}.meta.json"));
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
-    };
-    let Some(obj) = v.as_object_mut() else {
-        return;
-    };
-    if obj.remove("verifyFailedAtMs").is_some() {
-        let _ = std::fs::write(&path, v.to_string());
+    let candidates = [
+        profiles_dir.join(format!("{slot}.meta.json")),
+        profiles_dir.join(format!("{slot}.bak.meta.json")),
+    ];
+    for path in candidates {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            continue;
+        };
+        if obj.remove("verifyFailedAtMs").is_some() {
+            let _ = std::fs::write(&path, v.to_string());
+        }
     }
 }
 

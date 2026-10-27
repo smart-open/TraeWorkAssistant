@@ -145,6 +145,17 @@ describe('mergeDay（两条日记录合并）', () => {
     expect(r.p95_ttfb_ms).toBe(700);
   });
 
+  it('cached_tokens 求和、p50 取保守最大（3.8.5 审查 M-B1 契约补齐锁定）', () => {
+    const a = day('2026-01-01', { cached_tokens: 100, p50_duration_ms: 700 });
+    const b = day('2026-01-01', { cached_tokens: 40 });
+    const r = mergeDay(a, b);
+    expect(r.cached_tokens).toBe(140);
+    expect(r.p50_duration_ms).toBe(700);
+    // 任一侧缺省按 0/undefined 口径
+    expect(mergeDay(day('2026-01-01'), b).cached_tokens).toBe(40);
+    expect(mergeDay(a, day('2026-01-01')).p50_duration_ms).toBe(700);
+  });
+
   it('嵌套计数器/token 按同名合并', () => {
     const a = day('2026-01-01', {
       models: [ctr('gpt', 10)],

@@ -350,8 +350,10 @@ pub fn merged_tool_alias_rules(
     merged
 }
 
-/// 请求侧工具名别名改写（issue #150 治本）：入参为 prepare_llm_chat_body /
-/// prepare_wb_chat_body 产物（llm_utils_chat 形态），覆盖三个透传点——
+/// 请求侧工具名别名改写（issue #150 治本）：入参为 prepare_llm_chat_body 产物
+/// （llm_utils_chat 形态；仅 Trae 池接线，wb_route 未接入——wb 产物历史轮为
+/// `tool_calls[].function.name` 形态，未来接入时历史轮改名点需补 `function/name`
+/// 分支），覆盖三个透传点——
 /// `tools[].function.name`、`tool_choice`（normalize 后为字符串工具名）、
 /// `messages[].tool_calls[].function_call.name`（历史轮）。命中才改（窄口径，
 /// 逐字匹配），改写后返回逆映射（别名→原名）供响应侧回改；无 tools / 零命中

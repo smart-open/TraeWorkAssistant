@@ -181,6 +181,8 @@ export interface UsageSessionView {
   model: string;
   /** 会话模式（agent/chat 等；上游缺失为空串） */
   mode: string;
+  /** 失败行标记（custom 会话明细返回；其他来源缺省，徽标判定用结构化字段） */
+  failed?: boolean;
   /** 消耗积分（credits_float，兜底 amount_float） */
   credits: number;
   /** 消耗金额（cost_money_float；上游缺失为 0） */
@@ -895,6 +897,8 @@ export interface UsageDayView {
   /** 上游计费原值（original_credits，峰谷折扣前），用于对账 */
   original_credits: number;
   avg_duration_ms: number;
+  /** 缓存读 tokens 累计（M4 审查修复：上游未下发时为 0；「全部」跨桶合并求和） */
+  cached_tokens?: number;
   /** 总耗时 P50/P95/最大值（F-76；样本不足时缺省） */
   p50_duration_ms?: number;
   p95_duration_ms?: number;

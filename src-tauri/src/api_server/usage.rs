@@ -498,12 +498,34 @@ pub struct CustomSessionCtx {
 pub fn load(data_dir: &Path) -> UsageFile {
     let mut f = crate::store::docs::api_usage_load(&crate::store::db(data_dir));
     f.trim(RETENTION_DAYS);
-    let _ = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
-    // issue #82 问题5：Qoder 会话流水与 api_usage 同口径保留期裁剪（启动一次）
-    let _ = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
-    // issue #149 P2：Custom 会话流水同口径保留期裁剪（启动一次）
-    let _ = crate::store::docs::custom_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+    // 3.8.5 审查 L3：保留期裁剪按「数据目录 + 本地日」节流——load 在统计查询
+    // 热路径被 query_recent_in 反复调用，此前每次刷新/切天数都执行 3 个 DELETE
+    // 全表扫描。日期粒度按本地自然日，跨零点后首查自然重新裁剪，语义不变；
+    // 测试各用独立临时目录，首查仍会执行。当日新写入数据由记账侧当日单行
+    // upsert / 流水 insert 保证不越期，无「当日行未被裁剪」窗口
+    if prune_should_run(data_dir) {
+        let _ = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+        // issue #82 问题5：Qoder 会话流水与 api_usage 同口径保留期裁剪（启动一次）
+        let _ = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+        // issue #149 P2：Custom 会话流水同口径保留期裁剪（启动一次）
+        let _ = crate::store::docs::custom_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+    }
     f
+}
+
+/// 保留期裁剪当日节流判定（同目录同日只跑一轮；进程内记忆，重启即重跑无持久态）
+fn prune_should_run(data_dir: &Path) -> bool {
+    static DONE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    let done = DONE.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let today = chrono::Local::now().date_naive().to_string();
+    let mut m = done.lock().unwrap_or_else(|e| e.into_inner());
+    if m.get(data_dir).map(|d| d.as_str()) == Some(today.as_str()) {
+        return false;
+    }
+    m.insert(data_dir.to_path_buf(), today);
+    true
 }
 
 /// 持久化当日单行（flusher 记账削峰路径：单行 UPSERT 替代原整表 DELETE+重插）。

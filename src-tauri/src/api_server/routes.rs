@@ -441,7 +441,7 @@ pub(crate) fn exhaust_message(pool: &str, empty_hits: usize, rotated: usize, hea
         };
         (
             format!(
-                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts ({pool_upper} shadow risk control, account/model agnostic — switching won't help); {advice} (pool={pool} healthy={healthy_total}); client agent-tool fingerprint suspected too (issue #150) — disabling agent tools / plain chat on the client bypasses it",
+                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts ({pool_upper} shadow risk control, account/model agnostic — switching won't help); {advice} (pool={pool} healthy={healthy_total}); client agent-tool fingerprint suspected too (issue #150) — configure the 'Tool Alias' tab in API Manager (治本) or disable agent tools / plain chat on the client to bypass it",
             ),
             "CHANNEL_FINGERPRINT_BLOCK",
         )
