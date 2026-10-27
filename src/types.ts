@@ -109,6 +109,10 @@ export interface AccountView {
    *  到期日历与「7 天内到期」KPI 按包口径展示/计算；刷新过积分即有值（可为空数组），
    *  缺省 undefined = 老缓存未刷新过 → 前端回退账号级汇总口径 */
   credit_packs?: CreditPackDetail[];
+  /** 登录态快照最近一次保存时间（Unix ms；未保存过为 null，老后端缺省 undefined） */
+  snapshot_saved_at_ms?: number | null;
+  /** 最近一次切换后登录身份未确认时间（Unix ms；null = 快照健康，老后端缺省 undefined） */
+  snapshot_verify_failed_at_ms?: number | null;
 }
 
 // ---- 积分消耗历史（Trae query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----
@@ -379,6 +383,10 @@ export interface Settings {
   doubao_quota_url: string | null;
   /** 豆包快照可选纳入 Default/IndexedDB（对话历史等完整状态随账号迁移；体积代价大） */
   doubao_snapshot_include_idb: boolean;
+  /** issue #147：豆包会话每日续期应用内调度开关（默认开，环境配置页可关） */
+  doubao_keepalive_enabled: boolean;
+  /** issue #147：豆包会员额度每日巡检应用内调度开关（默认开，环境配置页可关） */
+  doubao_quota_enabled: boolean;
   /** WorkBuddy 桌面版 exe 手动路径（环境配置页） */
   workbuddy_path: string | null;
   /** CodeBuddy 桌面版 exe 手动路径（环境配置页） */
@@ -626,11 +634,15 @@ export interface ApiServiceStatus {
 }
 
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
-/** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
+/** 统一模型目录来源池标记（enabled 为运行时派生，不落盘；
+ *  disabled 为 L1 显式静态禁用（issue #145 渠道内单模型开关，meta.enabled=false），
+ *  与运行时 enabled 徽章不同构：disabled 源不参与调度且不对外发布） */
 export interface UnifiedModelSource {
   pool: 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'custom';
   rate: number | null;
   enabled: boolean;
+  /** L1 显式禁用（issue #145）：true = 该源被管理端单模型开关停用 */
+  disabled: boolean;
 }
 
 /** 统一模型目录条目（api_unified_models 返回，实时聚合派生视图） */
@@ -727,6 +739,8 @@ export interface TraeModelMeta {
   context_length?: number | null;
   max_tokens?: number | null;
   supports_image?: boolean | null;
+  /** 渠道内单模型开关（issue #145）：null = 默认启用；false = 禁用该模型（不路由 Trae 源） */
+  enabled?: boolean | null;
 }
 
 /** 模型选项：id = 上游 config_name，label = 官方展示名 */
@@ -1174,6 +1188,17 @@ export interface SanitizeMapView {
 // 'buddy-ai' = 国际档独立键（buddy_ai_template_map）
 export type SanitizeTier = 'wb' | 'buddy-ai';
 
+// ---- 工具名别名表（issue #150：tool_alias_map KV；Trae 池 tools 工具集指纹识别治本）----
+// 请求侧 tools[].function.name / tool_choice / 历史轮 tool_calls 名 → 通用别名，
+// 响应侧按逆映射回改（协议对客户端透明）。合并语义同指纹清洗：内置默认表始终
+// 生效，自定义表按 from 覆盖/追加；to=null 停用该规则（原名透传）。
+// 注意：别名必须请求/响应双向一致，不支持指纹清洗的 to="" 剥离语义
+export interface ToolAliasMapView {
+  rules: SanitizeRule[];
+  updated_at: number | null;
+  builtin?: boolean;
+}
+
 // 网关命中（11128 拦截 / 空完成影子风控）落下的指纹样本（内存环形缓冲，最新在前；
 // 重启即清空）。sample 为 fingerprint_sample 输出：system="<首条 system 前 300 字符>" tools=[…]
 export interface FingerprintSample {
@@ -1238,6 +1263,14 @@ export interface BuddyAiAccountView {
   has_snapshot_workbuddy?: boolean;
   /** CodeBuddy AI 端快照槽已建立 */
   has_snapshot_codebuddy?: boolean;
+  /** WorkBuddy AI 快照最近一次保存时间（Unix ms；null = 未保存过，老后端缺省 undefined） */
+  snapshot_saved_at_workbuddy_ms?: number | null;
+  /** CodeBuddy AI 快照最近一次保存时间（Unix ms；null = 未保存过，老后端缺省 undefined） */
+  snapshot_saved_at_codebuddy_ms?: number | null;
+  /** WorkBuddy AI 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  snapshot_verify_failed_workbuddy_ms?: number | null;
+  /** CodeBuddy AI 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  snapshot_verify_failed_codebuddy_ms?: number | null;
 }
 
 /** BuddyAI 官网按模型用量点（get-user-request-usage 聚合；镜像 WbUsageModelPoint） */
@@ -1320,6 +1353,14 @@ export interface WorkBuddyAccountView {
   is_current_workbuddy: boolean;
   /** CodeBuddy 端当前账号（桥按端写入的 current_account.txt 标记） */
   is_current_codebuddy: boolean;
+  /** WorkBuddy 快照最近一次保存时间（Unix ms；null = 未保存过，老后端缺省 undefined） */
+  snapshot_saved_at_workbuddy_ms?: number | null;
+  /** CodeBuddy 快照最近一次保存时间（Unix ms；null = 未保存过，老后端缺省 undefined） */
+  snapshot_saved_at_codebuddy_ms?: number | null;
+  /** WorkBuddy 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  snapshot_verify_failed_workbuddy_ms?: number | null;
+  /** CodeBuddy 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  snapshot_verify_failed_codebuddy_ms?: number | null;
 }
 
 export interface WorkBuddyEnvCheck {
@@ -1661,6 +1702,18 @@ export interface QoderAccountView {
   fingerprint: string | null;
   /** 完整设备指纹（指纹查看弹框数据源） */
   device_profile: QoderDeviceProfile | null;
+  /** IDE 端登录态快照存在（profiles_qoder/<id>/，含 .bak） */
+  has_snapshot: boolean;
+  /** Qoder Work 端登录态快照存在（profiles_qoder_work/<id>/，含 .bak） */
+  has_snapshot_work: boolean;
+  /** IDE 快照最近一次保存时间（Unix ms；null = 未保存过，老后端缺省 undefined） */
+  snapshot_saved_at_ms?: number | null;
+  /** IDE 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  snapshot_verify_failed_at_ms?: number | null;
+  /** Work 快照最近一次保存时间（Unix ms；null = 未保存过，老后端缺省 undefined） */
+  snapshot_saved_at_work_ms?: number | null;
+  /** Work 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  snapshot_verify_failed_work_at_ms?: number | null;
 }
 
 export interface QoderSettings {

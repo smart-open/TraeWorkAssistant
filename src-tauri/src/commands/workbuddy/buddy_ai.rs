@@ -474,6 +474,16 @@ fn buddy_ai_account_view(a: &WorkBuddyAccount, rec: Option<&Value>, ctx: &BuddyA
     let slot_exists = |dir: &std::path::Path, id: &str| {
         dir.join(id).exists() || dir.join(format!("{id}.bak")).exists()
     };
+    let meta = |dir: &std::path::Path, id: &str| {
+        let (saved, failed) = crate::switcher::authfile::read_slot_snapshot_meta(dir, id);
+        if saved.is_none() && failed.is_none() {
+            crate::switcher::authfile::read_slot_snapshot_meta(dir, &format!("{id}.bak"))
+        } else {
+            (saved, failed)
+        }
+    };
+    let (wb_saved, wb_failed) = meta(&ctx.profiles_wb_ai, &a.id);
+    let (cb_saved, cb_failed) = meta(&ctx.profiles_cb, &a.id);
     json!({
         "id": a.id,
         "uid": a.uid,
@@ -504,6 +514,10 @@ fn buddy_ai_account_view(a: &WorkBuddyAccount, rec: Option<&Value>, ctx: &BuddyA
         "is_current_codebuddy": ctx.cb_live_uid.as_deref() == Some(a.uid.as_str()) && !a.uid.is_empty(),
         "has_snapshot_workbuddy": slot_exists(&ctx.profiles_wb_ai, &a.id),
         "has_snapshot_codebuddy": slot_exists(&ctx.profiles_cb, &a.id),
+        "snapshot_saved_at_workbuddy_ms": wb_saved,
+        "snapshot_saved_at_codebuddy_ms": cb_saved,
+        "snapshot_verify_failed_workbuddy_ms": wb_failed,
+        "snapshot_verify_failed_codebuddy_ms": cb_failed,
     })
 }
 
@@ -1709,6 +1723,7 @@ pub fn buddy_ai_sessions_query(
                 model: m.to_string(),
                 // buddy-ai 官网行级明细无 mode/cost/token 字段 → 全空（前端显示 —）
                 mode: String::new(),
+                failed: None,
                 credits: r.get("credits").and_then(Value::as_f64).unwrap_or(0.0),
                 cost_money: 0.0,
                 input_tokens: 0,

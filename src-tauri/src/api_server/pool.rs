@@ -863,6 +863,16 @@ impl ApiPool {
                     // P2 修复10：不重置 cb_trips——熔断记忆只应在 note_success 重置，
                     // 否则 Server 熔断记忆被非 Server 错误意外清零
                 }
+                ErrKind::PaidRestricted => {
+                    // issue #145：付费受限（模型仅付费账号可用）是账号订阅档位与
+                    // 模型的固有不匹配，非瞬时故障——不冷却不禁用不熔断（防止
+                    // 免费账号被 403/400 兜底误冷却缩减可用池）。failures 计数
+                    // 照加：不触发任何账号级处置，但会参与 weighted_score 成功率
+                    // （×3.0 权重）软性拉低评分——有意取舍，保留调度侧「该账号
+                    // 近期尝试受限模型」的可观测信号。换号重试仅覆盖 403/Solo
+                    // 形态（400 形态经 retry_plan 判 Fatal 直接透传——多账号
+                    // 同败时换号无意义，fail-fast）；根治靠单模型开关
+                }
                 _ => {
                     e.err_count += 1;
                     if e.err_count >= 3 {
@@ -1424,6 +1434,29 @@ mod tests {
             "未装配 log_ctx 不应产生日志文件"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// issue #145：付费受限（PaidRestricted）是账号订阅档位与模型的固有不匹配，
+    /// note_error 必须完全 no-op——不冷却/不禁用/不推进熔断，防止免费账号调度
+    /// 付费模型必败被误冷却缩减可用池；failures 计数照加仅作统计
+    #[test]
+    fn note_error_paid_restricted_is_noop() {
+        let pool = build_pool(&[("uid_a", 100.0, 4_000_001_000)]);
+        for _ in 0..3 {
+            pool.note_error("uid_a", ErrKind::PaidRestricted);
+        }
+        {
+            let entries = safe_lock(&pool.entries);
+            let e = entries.get("uid_a").unwrap();
+            assert_eq!(e.failures, 3, "failures 照加仅作统计");
+            assert_eq!(e.until, 0, "不短冷却");
+            assert_eq!(e.hard_until, 0, "不硬冷却");
+            assert!(!e.disabled, "不禁用");
+            assert_eq!(e.err_count, 0, "不推进熔断计数（连续报错也不触发）");
+            assert!(e.reason.is_empty(), "不留处置标记");
+        }
+        // 可用性不受影响：账号仍可被调度
+        assert!(pool.has_selectable());
     }
 
     #[test]

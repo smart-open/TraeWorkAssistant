@@ -1049,19 +1049,43 @@ export default function BuddyAccounts() {
                             </Badge>
                           )}
                         </div>
-                        {/* F2-2 双端登录态快照分端展示：一份账号池，两套快照槽 */}
+                        {/* F2-2 双端登录态快照分端展示：一份账号池，两套快照槽（验证失败 → 红色警示） */}
                         <div className="flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-zinc-500">
                           <span
-                            className={a.has_snapshot ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-300 dark:text-zinc-600'}
-                            title="WorkBuddy 登录态快照（profiles_workbuddy）"
+                            className={
+                              a.snapshot_verify_failed_workbuddy_ms != null
+                                ? 'text-red-600 dark:text-red-400'
+                                : a.has_snapshot
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : 'text-slate-300 dark:text-zinc-600'
+                            }
+                            title={
+                              a.snapshot_verify_failed_workbuddy_ms != null
+                                ? `WorkBuddy 快照最近一次切换未确认登录身份（${new Date(a.snapshot_verify_failed_workbuddy_ms).toLocaleString('zh-CN')}）：登录态可能已失效，请核实后重新「保存当前登录态」`
+                                : a.snapshot_saved_at_workbuddy_ms != null
+                                  ? `WorkBuddy 登录态快照，最近保存于 ${new Date(a.snapshot_saved_at_workbuddy_ms).toLocaleString('zh-CN')}`
+                                  : 'WorkBuddy 登录态快照（profiles_workbuddy）'
+                            }
                           >
-                            WB{a.has_snapshot ? '快照✓' : '快照—'}
+                            WB{a.snapshot_verify_failed_workbuddy_ms != null ? '快照⚠' : a.has_snapshot ? '快照✓' : '快照—'}
                           </span>
                           <span
-                            className={a.has_snapshot_codebuddy ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-300 dark:text-zinc-600'}
-                            title="CodeBuddy 登录态快照（profiles_codebuddy，含 vscdb 登录真源）"
+                            className={
+                              a.snapshot_verify_failed_codebuddy_ms != null
+                                ? 'text-red-600 dark:text-red-400'
+                                : a.has_snapshot_codebuddy
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : 'text-slate-300 dark:text-zinc-600'
+                            }
+                            title={
+                              a.snapshot_verify_failed_codebuddy_ms != null
+                                ? `CodeBuddy 快照最近一次切换未确认登录身份（${new Date(a.snapshot_verify_failed_codebuddy_ms).toLocaleString('zh-CN')}）：登录态可能已失效，请核实后重新「保存当前登录态」`
+                                : a.snapshot_saved_at_codebuddy_ms != null
+                                  ? `CodeBuddy 登录态快照（profiles_codebuddy，含 vscdb 登录真源），最近保存于 ${new Date(a.snapshot_saved_at_codebuddy_ms).toLocaleString('zh-CN')}`
+                                  : 'CodeBuddy 登录态快照（profiles_codebuddy，含 vscdb 登录真源）'
+                            }
                           >
-                            CB{a.has_snapshot_codebuddy ? '快照✓' : '快照—'}
+                            CB{a.snapshot_verify_failed_codebuddy_ms != null ? '快照⚠' : a.has_snapshot_codebuddy ? '快照✓' : '快照—'}
                           </span>
                         </div>
                       </div>

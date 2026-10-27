@@ -214,6 +214,9 @@ function defaultSettings(): Settings {
     doubao_renew_url: 'https://www.doubao.com/info/v2/',
     doubao_quota_url: 'https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/',
     doubao_snapshot_include_idb: false,
+    // issue #147：豆包应用内调度开关默认开
+    doubao_keepalive_enabled: true,
+    doubao_quota_enabled: true,
     workbuddy_path: null,
     codebuddy_path: null,
     wb_auth_file_path: null,

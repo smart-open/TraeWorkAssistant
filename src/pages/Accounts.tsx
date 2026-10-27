@@ -515,6 +515,24 @@ export default function Accounts() {
                             Trae 登录中
                           </Badge>
                         )}
+                        {/* 快照健康度：切换后登录身份未确认 → 红色警示；健康 → 灰色快照态（含保存时间） */}
+                        {a.snapshot_verify_failed_at_ms != null ? (
+                          <Badge
+                            tone="red"
+                            title={`最近一次切换后未确认登录身份（${new Date(a.snapshot_verify_failed_at_ms).toLocaleString('zh-CN')}）：快照登录态可能已失效，请打开客户端核实，必要时重新登录后「保存当前登录态」`}
+                          >
+                            快照验证失败
+                          </Badge>
+                        ) : (
+                          a.snapshot_saved_at_ms != null && (
+                            <Badge
+                              tone="slate"
+                              title={`登录态快照最近保存于 ${new Date(a.snapshot_saved_at_ms).toLocaleString('zh-CN')}`}
+                            >
+                              快照✓
+                            </Badge>
+                          )
+                        )}
                       </div>
                       <div className="text-xs text-slate-400">{a.user_id}</div>
                     </td>

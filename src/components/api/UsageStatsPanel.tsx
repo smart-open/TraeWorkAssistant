@@ -8,8 +8,8 @@
  * api_custom_usage_stats / api_qoder_usage_stats
  * （落盘数据，服务未运行也可查看，口径与键名不变 §9.6）。
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { BarChart3, RefreshCw } from 'lucide-react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { BarChart3, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
 import {
   Bar,
   BarChart,
@@ -26,7 +26,14 @@ import { fmtTokens } from '../../lib/format';
 import { cn } from '../../lib/cn';
 import { useAppStore } from '../../store';
 import { isPoolVisible } from '../../lib/appVisibility';
-import type { UsageCounterView, UsageDayView, UsageKeyTokenView, UsageModelLatencyView } from '../../types';
+import type {
+  UsageCounterView,
+  UsageDayView,
+  UsageKeyTokenView,
+  UsageModelLatencyView,
+  UsageSessionView,
+  UsageSessionsResult,
+} from '../../types';
 
 /** 资源池筛选（§5.2：全部/Trae/Buddy/BuddyAI 国际/Qoder/自定义模型） */
 export type PoolFilter = 'all' | 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'custom';
@@ -41,7 +48,7 @@ const FILTER_LABELS: Record<PoolFilter, string> = {
 };
 
 /** 同名计数器合并（模型/账号/Key 维度通用） */
-function mergeCounters(a: UsageCounterView[], b: UsageCounterView[]): UsageCounterView[] {
+export function mergeCounters(a: UsageCounterView[], b: UsageCounterView[]): UsageCounterView[] {
   const map = new Map<string, UsageCounterView>();
   for (const c of [...a, ...b]) {
     const e = map.get(c.name);
@@ -58,7 +65,7 @@ function mergeCounters(a: UsageCounterView[], b: UsageCounterView[]): UsageCount
 }
 
 /** 按 Key 的 token 用量合并 */
-function mergeKeyTokens(a: UsageKeyTokenView[], b: UsageKeyTokenView[]): UsageKeyTokenView[] {
+export function mergeKeyTokens(a: UsageKeyTokenView[], b: UsageKeyTokenView[]): UsageKeyTokenView[] {
   const map = new Map<string, UsageKeyTokenView>();
   for (const t of [...a, ...b]) {
     const e = map.get(t.name);
@@ -73,7 +80,7 @@ function mergeKeyTokens(a: UsageKeyTokenView[], b: UsageKeyTokenView[]): UsageKe
 }
 
 /** 两条日记录合并（avg_duration 按请求数加权；TTFT 按样本数加权） */
-function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
+export function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
   const total = a.total_requests + b.total_requests;
   const ttfbSamples = (a.ttfb_samples ?? 0) + (b.ttfb_samples ?? 0);
   const avgTtfb =
@@ -114,19 +121,19 @@ function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
 }
 
 /** 可选数值取较大者（P95/最大值跨桶合并取保守值） */
-function maxOpt(a?: number, b?: number): number | undefined {
+export function maxOpt(a?: number, b?: number): number | undefined {
   if (a == null && b == null) return undefined;
   return Math.max(a ?? 0, b ?? 0);
 }
 
 /** 多日可选 P95 取最大值（跨天聚合取保守值） */
-function maxOptList(values: (number | undefined)[]): number | undefined {
+export function maxOptList(values: (number | undefined)[]): number | undefined {
   const vs = values.filter((v): v is number => v != null);
   return vs.length > 0 ? Math.max(...vs) : undefined;
 }
 
 /** 按模型的延迟分位合并（F-76①） */
-function mergeModelLatency(
+export function mergeModelLatency(
   a: UsageModelLatencyView[] = [],
   b: UsageModelLatencyView[] = [],
 ): UsageModelLatencyView[] {
@@ -148,7 +155,7 @@ function mergeModelLatency(
 }
 
 /** 多桶按日合并（同日相加），按日期升序 */
-function mergeBuckets(...buckets: UsageDayView[][]): UsageDayView[] {
+export function mergeBuckets(...buckets: UsageDayView[][]): UsageDayView[] {
   const map = new Map<string, UsageDayView>();
   for (const bucket of buckets) {
     for (const d of bucket) {
@@ -157,6 +164,19 @@ function mergeBuckets(...buckets: UsageDayView[][]): UsageDayView[] {
     }
   }
   return [...map.values()].sort((x, y) => x.date.localeCompare(y.date));
+}
+
+/** 本地日 YYYY-MM-DD（custom 会话明细区间端点） */
+export function localDateStr(dt: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
+}
+
+/** 当日时刻 HH:MM:SS（custom 会话明细行时间列，自然日已在会话行体现） */
+export function fmtClock(ts: number): string {
+  const d = new Date(ts * 1000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 export default function UsageStatsPanel() {
@@ -214,6 +234,81 @@ export default function UsageStatsPanel() {
     if (effFilter === 'custom') return customUsage;
     return mergeBuckets(traeUsage, buddyUsage, buddyAiUsage, qoderUsage, customUsage);
   }, [effFilter, traeUsage, buddyUsage, buddyAiUsage, qoderUsage, customUsage]);
+
+  // ---- Custom 池会话明细（issue #149 P2）：仅 effFilter==='custom' 时加载 ----
+  const [sessData, setSessData] = useState<UsageSessionsResult | null>(null);
+  const [sessPage, setSessPage] = useState(1);
+  const [sessLoading, setSessLoading] = useState(false);
+  // 审查对齐 SessionsTab No.11 口径：查询失败持久错误态（失败静默归零会被误读为「暂无流水」）
+  const [sessError, setSessError] = useState<string | null>(null);
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [detail, setDetail] = useState<UsageSessionView[] | null>(null);
+  const sessSeqRef = useRef(0);
+  // 明细请求序号守卫（对齐 SessionsTab）：快速切换展开行时旧响应可能后到，
+  // 仅最新一次请求可写明细态
+  const detailSeqRef = useRef(0);
+
+  const loadSess = async (d: number, p: number) => {
+    const seq = ++sessSeqRef.current;
+    setSessLoading(true);
+    try {
+      const end = localDateStr(new Date());
+      const start = localDateStr(new Date(Date.now() - (d - 1) * 86_400_000));
+      const r = await api.apiServer.customSessionsQuery({ start, end, page: p, pageSize: 20 });
+      if (seq === sessSeqRef.current) {
+        setSessData(r);
+        setSessError(null);
+      }
+    } catch (err) {
+      if (seq === sessSeqRef.current) {
+        setSessData(null);
+        setSessError(String(err));
+      }
+    } finally {
+      if (seq === sessSeqRef.current) setSessLoading(false);
+    }
+  };
+
+  // 展开/明细随主查询重置（对齐 SessionsTab resetExpanded）：翻页或改天数后
+  // 行键可能恰好重合，陈旧明细不得残留
+  const resetExpanded = () => {
+    detailSeqRef.current++;
+    setExpandedKey(null);
+    setDetail(null);
+  };
+
+  // 展开会话看各轮：session_id = conversation_key 精确匹配（后端 LIMIT 500）
+  const toggleSessDetail = (r: UsageSessionView) => {
+    const key = `${r.date}|${r.user_id}|${r.session_id}|${r.preview}`;
+    if (expandedKey === key) {
+      resetExpanded();
+      return;
+    }
+    const seq = ++detailSeqRef.current;
+    setExpandedKey(key);
+    setDetail(null);
+    void api.apiServer
+      .customSessionDetail({
+        date: r.date,
+        uid: r.user_id,
+        sessionId: r.session_id,
+        preview: r.preview,
+      })
+      .then((rows) => {
+        if (seq !== detailSeqRef.current) return;
+        setDetail(rows);
+      })
+      .catch(() => {
+        if (seq !== detailSeqRef.current) return;
+        setDetail([]);
+      });
+  };
+
+  useEffect(() => {
+    resetExpanded();
+    if (effFilter === 'custom') void loadSess(days, sessPage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effFilter, days, sessPage]);
 
   // 汇总（跨天聚合）+ 图表数据（与原页面统计逻辑一致，纯搬移）
   const summary = useMemo(() => {
@@ -508,6 +603,150 @@ export default function UsageStatsPanel() {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {/* Custom 池会话明细（issue #149 P2）：请求级流水按会话两遍归并；无积分语义 */}
+      {effFilter === 'custom' && (
+        <div className="mt-4">
+          <div className="mb-2 flex items-center justify-between">
+            <p className="text-xs font-medium text-slate-500 dark:text-zinc-400">
+              会话明细（近 {days} 天 · 点击行展开看各轮请求阶段）
+            </p>
+            {sessData && sessData.total > 0 && (
+              <div className="flex items-center gap-2 text-xs text-slate-400">
+                <button
+                  className="rounded px-1.5 py-0.5 hover:bg-slate-100 disabled:opacity-40 dark:hover:bg-zinc-800"
+                  disabled={sessData.page <= 1 || sessLoading}
+                  onClick={() => setSessPage(sessData.page - 1)}
+                >
+                  上一页
+                </button>
+                <span className="tabular-nums">
+                  {sessData.page}/{Math.max(1, Math.ceil(sessData.total / sessData.page_size))}
+                </span>
+                <button
+                  className="rounded px-1.5 py-0.5 hover:bg-slate-100 disabled:opacity-40 dark:hover:bg-zinc-800"
+                  disabled={
+                    sessData.page >= Math.ceil(sessData.total / sessData.page_size) || sessLoading
+                  }
+                  onClick={() => setSessPage(sessData.page + 1)}
+                >
+                  下一页
+                </button>
+              </div>
+            )}
+          </div>
+          {!sessData || sessData.rows.length === 0 ? (
+            <p className="py-4 text-center text-xs text-slate-400">
+              {sessLoading
+                ? '加载中…'
+                : sessError
+                  ? `会话流水加载失败：${sessError}`
+                  : '暂无会话流水 — 自定义上游发起一轮对话后这里会展示按会话聚合的请求明细'}
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
+                    <th className="pb-2 pr-4 font-medium">时间</th>
+                    <th className="pb-2 pr-4 font-medium">Key</th>
+                    <th className="pb-2 pr-4 font-medium">会话说明</th>
+                    <th className="pb-2 pr-4 font-medium">模型</th>
+                    <th className="pb-2 pr-4 font-medium">请求</th>
+                    <th className="pb-2 font-medium">Token</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sessData.rows.map((r) => {
+                    const key = `${r.date}|${r.user_id}|${r.session_id}|${r.preview}`;
+                    const open = expandedKey === key;
+                    return (
+                      <Fragment key={key}>
+                        <tr
+                          className={cn(
+                            'cursor-pointer border-b border-slate-100 dark:border-zinc-800',
+                            open && 'bg-slate-50 dark:bg-zinc-800/40',
+                          )}
+                          onClick={() => toggleSessDetail(r)}
+                        >
+                          <td className="py-2 pr-4 tabular-nums text-slate-600 dark:text-zinc-300">
+                            <span className="inline-flex items-center gap-1">
+                              {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                              {fmtClock(r.ts)}
+                            </span>
+                          </td>
+                          <td className="py-2 pr-4 font-mono text-xs text-slate-700 dark:text-zinc-200">
+                            {r.account_name || r.user_id}
+                          </td>
+                          <td className="py-2 pr-4 text-slate-600 dark:text-zinc-300">
+                            <span className="block max-w-[16rem] truncate" title={r.preview}>
+                              {r.preview || '（空）'}
+                            </span>
+                          </td>
+                          <td className="py-2 pr-4 font-mono text-xs text-slate-700 dark:text-zinc-200">
+                            {r.model}
+                          </td>
+                          <td className="py-2 pr-4 text-xs text-slate-500 dark:text-zinc-400">
+                            {r.mode || '1 次请求'}
+                          </td>
+                          <td className="py-2 tabular-nums text-xs text-slate-500 dark:text-zinc-400">
+                            {fmtTokens(r.input_tokens)} / {fmtTokens(r.output_tokens)}
+                          </td>
+                        </tr>
+                        {open && (
+                          <tr className="border-b border-slate-100 bg-slate-50/60 dark:border-zinc-800 dark:bg-zinc-800/20">
+                            <td colSpan={6} className="px-2 py-2">
+                              {detail === null ? (
+                                <p className="py-1 text-center text-xs text-slate-400">加载明细中…</p>
+                              ) : detail.length === 0 ? (
+                                <p className="py-1 text-center text-xs text-slate-400">无请求级明细</p>
+                              ) : (
+                                <div className="space-y-1">
+                                  {detail.map((d, i) => (
+                                    <div key={i} className="flex items-center gap-2 text-xs">
+                                      <span className="w-16 shrink-0 tabular-nums text-slate-400">
+                                        {fmtClock(d.ts)}
+                                      </span>
+                                      <span
+                                        className={cn(
+                                          'shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium',
+                                          d.mode.includes('失败')
+                                            ? 'bg-rose-500/10 text-rose-600 dark:text-rose-400'
+                                            : d.mode === '工具轮'
+                                              ? 'bg-violet-500/10 text-violet-600 dark:text-violet-400'
+                                              : 'bg-brand-500/10 text-brand-600 dark:text-brand-400',
+                                        )}
+                                      >
+                                        {d.mode || '未知阶段'}
+                                      </span>
+                                      <span className="shrink-0 font-mono text-slate-600 dark:text-zinc-300">
+                                        {d.model}
+                                      </span>
+                                      <span
+                                        className="truncate text-slate-500 dark:text-zinc-400"
+                                        title={d.preview}
+                                      >
+                                        {d.preview || '（空）'}
+                                      </span>
+                                      <span className="ml-auto shrink-0 tabular-nums text-slate-400">
+                                        {fmtTokens(d.input_tokens)} / {fmtTokens(d.output_tokens)}
+                                      </span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
     </div>

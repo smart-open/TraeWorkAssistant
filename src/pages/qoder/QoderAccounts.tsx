@@ -953,6 +953,38 @@ export default function QoderAccounts() {
                             IDE 登录中
                           </Badge>
                         )}
+                        {/* 快照健康度（双端）：切换后登录身份未确认 → 红色警示；健康 → 灰色快照态（含保存时间） */}
+                        {a.snapshot_verify_failed_at_ms != null && (
+                          <Badge
+                            tone="red"
+                            title={`IDE 快照最近一次切换未确认登录身份（${new Date(a.snapshot_verify_failed_at_ms).toLocaleString('zh-CN')}）：登录态可能已失效，请打开客户端核实，必要时重新登录后「保存当前登录态」`}
+                          >
+                            IDE 快照验证失败
+                          </Badge>
+                        )}
+                        {a.snapshot_verify_failed_work_at_ms != null && (
+                          <Badge
+                            tone="red"
+                            title={`Work 快照最近一次切换未确认登录身份（${new Date(a.snapshot_verify_failed_work_at_ms).toLocaleString('zh-CN')}）：登录态可能已失效，请打开客户端核实，必要时重新登录后「保存当前登录态」`}
+                          >
+                            Work 快照验证失败
+                          </Badge>
+                        )}
+                        {a.snapshot_verify_failed_at_ms == null &&
+                          a.snapshot_verify_failed_work_at_ms == null &&
+                          (a.snapshot_saved_at_ms != null || a.snapshot_saved_at_work_ms != null) && (
+                            <Badge
+                              tone="slate"
+                              title={[
+                                a.snapshot_saved_at_ms != null && `IDE 快照保存于 ${new Date(a.snapshot_saved_at_ms).toLocaleString('zh-CN')}`,
+                                a.snapshot_saved_at_work_ms != null && `Work 快照保存于 ${new Date(a.snapshot_saved_at_work_ms).toLocaleString('zh-CN')}`,
+                              ]
+                                .filter(Boolean)
+                                .join('；')}
+                            >
+                              快照✓
+                            </Badge>
+                          )}
                       </div>
                       <div className="text-xs text-slate-400">{[a.uid, a.note].filter(Boolean).join(' · ') || a.id}</div>
                     </td>

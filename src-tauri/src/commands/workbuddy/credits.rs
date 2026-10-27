@@ -1333,6 +1333,7 @@ pub fn workbuddy_sessions_query(
                 // Buddy 官网行级明细无 mode/cost/token 字段 → 全空（前端显示 —）；
                 // 会话说明取上游 input/inputTrunc（旧缓存行无此字段时为空串）
                 mode: String::new(),
+                failed: None,
                 credits: r.get("credits").and_then(Value::as_f64).unwrap_or(0.0),
                 cost_money: 0.0,
                 input_tokens: 0,

@@ -37,6 +37,10 @@ export default function DoubaoSettings() {
   // ── 快照设置（C4：IndexedDB 可选纳入）──
   const [includeIdb, setIncludeIdb] = useState(false);
 
+  // ── 应用内调度开关（issue #147，默认开）──
+  const [keepaliveEnabled, setKeepaliveEnabled] = useState(true);
+  const [quotaEnabled, setQuotaEnabled] = useState(true);
+
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
     try {
@@ -49,6 +53,40 @@ export default function DoubaoSettings() {
       );
     } catch (err) {
       setIncludeIdb(!v);
+      pushToast('error', `保存设置失败：${String(err)}`);
+    }
+  };
+
+  // 应用内调度器 doubao-keepalive 开关（issue #147）；Windows 计划任务仅该平台存在，提示按平台条件显示
+  const toggleKeepalive = async (v: boolean) => {
+    setKeepaliveEnabled(v);
+    try {
+      await saveSettings({ doubao_keepalive_enabled: v });
+      pushToast(
+        'success',
+        v
+          ? '已开启：应用内调度恢复每日会话续期'
+          : `已关闭：应用内调度不再每日拉起豆包执行续期${platform === 'windows' ? '（不影响已注册的 Windows 计划任务）' : ''}`,
+      );
+    } catch (err) {
+      setKeepaliveEnabled(!v);
+      pushToast('error', `保存设置失败：${String(err)}`);
+    }
+  };
+
+  // 应用内调度器 doubao-quota 开关（issue #147）
+  const toggleQuotaEnabled = async (v: boolean) => {
+    setQuotaEnabled(v);
+    try {
+      await saveSettings({ doubao_quota_enabled: v });
+      pushToast(
+        'success',
+        v
+          ? '已开启：应用内调度恢复每日额度巡检'
+          : `已关闭：应用内调度不再执行每日额度巡检${platform === 'windows' ? '（不影响已注册的 Windows 计划任务）' : ''}`,
+      );
+    } catch (err) {
+      setQuotaEnabled(!v);
       pushToast('error', `保存设置失败：${String(err)}`);
     }
   };
@@ -85,7 +123,12 @@ export default function DoubaoSettings() {
     if (settings?.doubao_path) setPath(settings.doubao_path);
     if (settings?.doubao_renew_url) setRenewUrl(settings.doubao_renew_url);
     if (settings?.doubao_quota_url) setQuotaUrl(settings.doubao_quota_url);
-    if (settings) setIncludeIdb(!!settings.doubao_snapshot_include_idb);
+    if (settings) {
+      setIncludeIdb(!!settings.doubao_snapshot_include_idb);
+      // !== false：旧版后端缺字段时按默认开展示（issue #147 新字段向后兼容）
+      setKeepaliveEnabled(settings.doubao_keepalive_enabled !== false);
+      setQuotaEnabled(settings.doubao_quota_enabled !== false);
+    }
     // 审查修复（P2）：schtasks 状态查询仅 Windows 发起——mac 上后端恒 Err，
     // catch 静默吞掉徒增无谓 IPC；注册卡片本就按平台隐藏
     if (platform === 'windows') {
@@ -93,7 +136,7 @@ export default function DoubaoSettings() {
       void refreshQuotaTaskStatus();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled]);
 
   const detect = async () => {
     setDetecting(true);
@@ -319,6 +362,23 @@ export default function DoubaoSettings() {
             {taskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
           </div>
 
+          {/* 应用内每日调度开关（issue #147）：关闭后不再每日拉起客户端；无账号/客户端缺失时自动跳过 */}
+          <label className="flex cursor-pointer items-start gap-2.5">
+            <input
+              type="checkbox"
+              checked={keepaliveEnabled}
+              onChange={(e) => void toggleKeepalive(e.target.checked)}
+              className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-500"
+            />
+            <span>
+              <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日调度（每日 09:20 启动豆包续期）</span>
+              <span className="mt-0.5 block leading-relaxed">
+                {/* macOS 兼容：「每日任务」schtasks 卡仅 Windows 渲染，跨平台引用不可见元素会误导 */}
+                {`关闭后应用内调度器不再执行会话每日续期（不再拉起客户端）${platform === 'windows' ? '；与上方「每日任务」（Windows 计划任务）相互独立' : ''}。无豆包账号或未找到豆包客户端时自动跳过，不记失败、不推送通知。`}
+              </span>
+            </span>
+          </label>
+
           {/* 手动巡检 */}
           <div className="flex flex-wrap items-center gap-2">
             <span className="shrink-0 text-slate-500">手动巡检</span>
@@ -447,6 +507,24 @@ export default function DoubaoSettings() {
             )}
             {quotaTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
           </div>
+
+          {/* 应用内每日巡检调度开关（issue #147） */}
+          <label className="flex cursor-pointer items-start gap-2.5">
+            <input
+              type="checkbox"
+              checked={quotaEnabled}
+              onChange={(e) => void toggleQuotaEnabled(e.target.checked)}
+              className="mt-0.5 h-4 w-4 shrink-0 accent-amber-500"
+            />
+            <span>
+              <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日巡检调度（每日 09:30）</span>
+              <span className="mt-0.5 block leading-relaxed">
+                {/* macOS 兼容：「每日巡检」schtasks 卡仅 Windows 渲染，同上 */}
+                {`关闭后应用内调度器不再定时批量巡检额度${platform === 'windows' ? '；与上方「每日巡检」（Windows 计划任务）相互独立' : ''}。无豆包账号时自动跳过。`}
+              </span>
+            </span>
+          </label>
+
           <p>
             注册后每日定时批量查询池内全部有凭证账号的会员额度：自动回写缓存与历史（概述页趋势图/健康度卡的数据源），
             额度用完的账号会在应用内提醒。

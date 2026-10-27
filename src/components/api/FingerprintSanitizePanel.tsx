@@ -33,11 +33,16 @@ const TIER_OPTIONS: Array<[SanitizeTier, string]> = [
   ['buddy-ai', 'Buddy-ai 国际档'],
 ];
 
+/** 规则行（稳定 key 包装）：key 自增分配、与规则内容无关——编辑 from 或删除
+ * 中间行时 React 按 key 复用 DOM，受控输入焦点不串行 */
+type RuleRow = { key: number; rule: SanitizeRule };
+
 export default function FingerprintSanitizePanel() {
   const toast = useAppStore((s) => s.pushToast);
   // 清洗规则档位（issue #129）：wb 池与 Trae 池共用键 | buddy-ai 国际档独立键
   const [tier, setTier] = useState<SanitizeTier>('wb');
-  const [rules, setRules] = useState<SanitizeRule[]>([]);
+  // 规则行（稳定 key 包装，见 RuleRow 注记）
+  const [rows, setRows] = useState<RuleRow[]>([]);
   const [savedRules, setSavedRules] = useState<SanitizeRule[]>([]);
   const [builtin, setBuiltin] = useState(true);
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -53,10 +58,12 @@ export default function FingerprintSanitizePanel() {
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 「清空样本」二次确认倒计时句柄（独立定时器，避免与 confirmReset 互相干扰）
   const confirmClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // applySample 切档后需读最新规则（setRules 异步、闭包持旧值），ref 镜像最新值；
+  // applySample 切档后需读最新规则（setRows 异步、闭包持旧值），ref 镜像最新值；
   // 除 effect 同步外，load() 内也会显式回写（审查问题1：await load 返回与 effect
   // 提交时序无保证，切档后立即读取不能依赖 effect 已执行）
   const rulesRef = useRef<SanitizeRule[]>([]);
+  // 行 key 自增序列（跨 load/添加唯一，不随规则内容变化）
+  const rowSeq = useRef(0);
 
   useEffect(
     () => () => {
@@ -70,7 +77,7 @@ export default function FingerprintSanitizePanel() {
     setLoading(true);
     try {
       const view = await api.apiServer.templateMapGet(t);
-      setRules(view.templates);
+      setRows(view.templates.map((rule) => ({ key: ++rowSeq.current, rule })));
       // 显式同步（不等 effect）：applySample 切档后立即读 ref 做重复校验
       rulesRef.current = view.templates;
       setSavedRules(view.templates);
@@ -111,15 +118,15 @@ export default function FingerprintSanitizePanel() {
   };
 
   const dirty = useMemo(
-    () => JSON.stringify(rules) !== JSON.stringify(savedRules),
-    [rules, savedRules],
+    () => JSON.stringify(rows.map((r) => r.rule)) !== JSON.stringify(savedRules),
+    [rows, savedRules],
   );
 
   // rulesRef 声明在组件顶部（load 内也回写，见审查问题1）；此处兜底同步
   // applySample 切档外路径的 rules 变化（增删行、编辑等）
   useEffect(() => {
-    rulesRef.current = rules;
-  }, [rules]);
+    rulesRef.current = rows.map((r) => r.rule);
+  }, [rows]);
 
   /** 切换档位（issue #129）：dirty 时阻断切换防丢改动，切换后重载对应档位规则；
    * 返回是否就绪（applySample 依赖此前置） */
@@ -159,7 +166,7 @@ export default function FingerprintSanitizePanel() {
       return;
     }
     const to = neutralRewrite(from);
-    setRules((rs) => [...rs, { from, to }]);
+    setRows((rs) => [...rs, { key: ++rowSeq.current, rule: { from, to } }]);
     if (to) {
       toast(
         'success',
@@ -173,8 +180,8 @@ export default function FingerprintSanitizePanel() {
   /** 保存前置校验：from 必填且全局唯一（from 是改写锚点，重复会导致不可预期次序） */
   const validate = (): string | null => {
     const seen = new Set<string>();
-    for (let i = 0; i < rules.length; i++) {
-      const from = rules[i].from.trim();
+    for (let i = 0; i < rows.length; i++) {
+      const from = rows[i].rule.from.trim();
       if (!from) return `第 ${i + 1} 条规则的「原文指纹」不能为空`;
       if (seen.has(from)) return `「原文指纹」重复：${from.slice(0, 40)}…`;
       seen.add(from);
@@ -192,7 +199,7 @@ export default function FingerprintSanitizePanel() {
     try {
       // to=null（停用）原样落库；to=""（剥离）保留空串，两者不可混淆
       await api.apiServer.templateMapSet(
-        rules.map((r) => ({ from: r.from.trim(), to: r.to === null ? null : r.to.trim() })),
+        rows.map((r) => ({ from: r.rule.from.trim(), to: r.rule.to === null ? null : r.rule.to.trim() })),
         tier,
       );
       // load 现在上抛（审查修复 M6）：保存已成功，回读失败不应误报「保存失败」
@@ -232,7 +239,9 @@ export default function FingerprintSanitizePanel() {
   };
 
   const updateRow = (i: number, patch: Partial<SanitizeRule>) => {
-    setRules((rs) => rs.map((r, k) => (k === i ? { ...r, ...patch } : r)));
+    setRows((rs) =>
+      rs.map((row, k) => (k === i ? { ...row, rule: { ...row.rule, ...patch } } : row)),
+    );
   };
 
   if (loading) {
@@ -355,7 +364,7 @@ export default function FingerprintSanitizePanel() {
           ))}
         </div>
         <Badge tone={builtin ? 'slate' : 'blue'}>{builtin ? '内置默认' : '自定义'}</Badge>
-        <span className="text-xs text-slate-400">{rules.length} 条</span>
+        <span className="text-xs text-slate-400">{rows.length} 条</span>
         <div className="ml-auto flex items-center gap-2">
           <button
             onClick={() => {
@@ -390,10 +399,10 @@ export default function FingerprintSanitizePanel() {
 
       {/* 规则行 */}
       <div className="space-y-1.5">
-        {rules.map((r, i) => {
+        {rows.map(({ key, rule: r }, i) => {
           const disabled = r.to === null;
           return (
-            <div key={i} className={`flex items-center gap-2 ${disabled ? 'opacity-60' : ''}`}>
+            <div key={key} className={`flex items-center gap-2 ${disabled ? 'opacity-60' : ''}`}>
               <span className="w-6 shrink-0 text-right text-xs tabular-nums text-slate-400">{i + 1}</span>
               <input
                 value={r.from}
@@ -424,7 +433,7 @@ export default function FingerprintSanitizePanel() {
                 停用
               </label>
               <button
-                onClick={() => setRules((rs) => rs.filter((_, k) => k !== i))}
+                onClick={() => setRows((rs) => rs.filter((_, k) => k !== i))}
                 className="shrink-0 rounded-md px-2 py-1 text-xs text-rose-500 transition hover:bg-rose-50 dark:hover:bg-rose-900/20"
               >
                 删除
@@ -433,7 +442,9 @@ export default function FingerprintSanitizePanel() {
           );
         })}
         <button
-          onClick={() => setRules((rs) => [...rs, { from: '', to: '' }])}
+          onClick={() =>
+            setRows((rs) => [...rs, { key: ++rowSeq.current, rule: { from: '', to: '' } }])
+          }
           className="flex w-full items-center justify-center gap-1 rounded-md border border-dashed border-slate-300 py-2 text-xs text-slate-500 transition hover:border-brand-400 hover:text-brand-500 dark:border-zinc-700 dark:text-zinc-400"
         >
           <Plus size={13} />

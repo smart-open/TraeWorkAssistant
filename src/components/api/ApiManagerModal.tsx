@@ -18,9 +18,10 @@ import CustomModelsPanel from './CustomModelsPanel';
 import EcoAccess from './EcoAccess';
 import FingerprintSanitizePanel from './FingerprintSanitizePanel';
 import ResourceSummary from './ResourceSummary';
+import ToolAliasPanel from './ToolAliasPanel';
 import UsageStatsPanel from './UsageStatsPanel';
 
-type TabKey = 'overview' | 'config' | 'keys' | 'usage' | 'custom' | 'eco' | 'sanitize';
+type TabKey = 'overview' | 'config' | 'keys' | 'usage' | 'custom' | 'eco' | 'sanitize' | 'toolalias';
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
@@ -30,6 +31,7 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: 'custom', label: '自定义模型' },
   { key: 'eco', label: '生态接入' },
   { key: 'sanitize', label: '指纹清洗' },
+  { key: 'toolalias', label: '工具别名' },
 ];
 
 export default function ApiManagerModal() {
@@ -102,6 +104,7 @@ export default function ApiManagerModal() {
         )}
         {tab === 'eco' && <EcoAccess />}
         {tab === 'sanitize' && <FingerprintSanitizePanel />}
+        {tab === 'toolalias' && <ToolAliasPanel />}
       </div>
     </Modal>
   );

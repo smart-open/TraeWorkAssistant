@@ -25,12 +25,12 @@ const POOL_LABELS: Record<string, string> = {
 };
 
 /** 倍率取当前可用且可见来源池最小值（同一模型多池服务时按最低消耗展示）。
- * 仅统计 enabled 且可见来源：不可用池不承接请求、隐藏池不面向当前用户展示，
- * 其倍率不应参与展示，否则用户会看到实际路由不到的低价（与「实际生效倍率」口径背离）；
- * 全部不可用或未声明 → null（显示 —） */
+ * 仅统计 enabled 且未被 L1 禁用（disabled，issue #145）且可见的来源：不可用/已禁池不承接
+ * 请求、隐藏池不面向当前用户展示，其倍率不应参与展示，否则用户会看到实际路由不到的低价
+ * （与「实际生效倍率」口径背离）；全部不可用或未声明 → null（显示 —） */
 function minRateOf(m: UnifiedModel, settings: Settings | null): number | null {
   const rates = m.sources
-    .filter((s) => s.enabled && isPoolVisible(settings, s.pool))
+    .filter((s) => s.enabled && !s.disabled && isPoolVisible(settings, s.pool))
     .map((s) => s.rate)
     .filter((r): r is number => r != null && Number.isFinite(r));
   return rates.length ? Math.min(...rates) : null;
@@ -305,9 +305,11 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
               </thead>
               <tbody>
                 {filtered.map((m) => {
-                  // 行内来源按可见性过滤（隐藏池徽章不展示，避免泄露；enabled 口径同步取可见来源）
+                  // 行内来源按可见性过滤（隐藏池徽章不展示，避免泄露）；enabled 口径同步取
+                  // 可见且未被 L1 禁用（issue #145）的来源——被禁模型不发布 /v1/models，
+                  // 此处不能呈现为可用
                   const visibleSources = m.sources.filter((s) => isPoolVisible(settings, s.pool));
-                  const enabled = visibleSources.some((s) => s.enabled);
+                  const enabled = visibleSources.some((s) => s.enabled && !s.disabled);
                   const rate = minRateOf(m, settings);
                   return (
                     <tr
@@ -355,7 +357,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                       <td className="px-2 py-2">
                         <div className="flex flex-wrap gap-1">
                           {visibleSources.map((s) => (
-                            <Badge key={s.pool} tone={s.enabled ? 'slate' : 'amber'}>
+                            <Badge key={s.pool} tone={s.enabled && !s.disabled ? 'slate' : 'amber'}>
                               {POOL_LABELS[s.pool] ?? s.pool}
                             </Badge>
                           ))}

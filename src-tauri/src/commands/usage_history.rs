@@ -659,6 +659,11 @@ pub struct UsageSessionView {
     pub date: String,
     pub model: String,
     pub mode: String,
+    /// 失败行结构化标记（3.8.5 审查 L6：明细行失败徽标此前依赖
+    /// `mode.contains("失败")` 字符串耦合，标签措辞变更会静默失效）。
+    /// custom 会话明细写入真实值；Qoder/Buddy 侧无此语义，None 且不序列化
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<bool>,
     pub credits: f64,
     pub cost_money: f64,
     pub input_tokens: u64,
@@ -739,6 +744,7 @@ pub fn usage_sessions_query(
                     date: date.clone(),
                     model: r.model.clone(),
                     mode: r.mode.clone(),
+                    failed: None,
                     credits: r.credits,
                     cost_money: r.cost_money,
                     input_tokens: r.input_tokens,

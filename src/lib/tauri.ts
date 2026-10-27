@@ -13,6 +13,7 @@ import type {
   SanitizeMapView,
   SanitizeRule,
   SanitizeTier,
+  ToolAliasMapView,
   FingerprintSample,
   AppLocate,
   CheckinDone,
@@ -1013,6 +1014,31 @@ export const api = {
     // 自定义模型用量统计（custom_days 桶，API 管理·用量统计「自定义」筛选）
     customUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_custom_usage_stats', { days: days ?? null }),
+    // 自定义池会话明细（issue #149 P2：custom_sessions 请求级流水，读时两遍归并）
+    customSessionsQuery: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('custom_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
+    // 自定义池会话展开明细（session_id = conversation_key 精确匹配；mode 位 = 阶段标签）
+    customSessionDetail: (opts: { date: string; uid: string; sessionId: string; preview: string }) =>
+      invoke<UsageSessionView[]>('custom_session_detail_query', {
+        date: opts.date,
+        uid: opts.uid,
+        sessionId: opts.sessionId,
+        preview: opts.preview,
+      }),
     // Qoder 上游用量统计（qoder_days 桶，与 Trae/WB/Custom 侧分账；上游接入前恒空）
     qoderUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_qoder_usage_stats', { days: days ?? null }),
@@ -1072,6 +1098,16 @@ export const api = {
       invoke<void>('wb_template_map_set', {
         tier: tier ?? null,
         map: { templates, updated_at: Math.floor(Date.now() / 1000) },
+      }),
+    // ---- 工具名别名表（issue #150：tool_alias_map KV，单键不分档）----
+    // Trae 池 tools 工具集指纹识别治本：请求侧工具名→别名、响应侧逆映射回改。
+    // builtin=true = 当前生效内置默认表（尚未自定义）；保存后成为独立自定义副本
+    // （合并语义：内置表全量生效，自定义按 from 覆盖/追加，to=null 停用）。
+    // load_tool_alias_rules 每请求读取，保存即对下一请求生效，无需重启网关
+    toolAliasMapGet: () => invoke<ToolAliasMapView>('wb_tool_alias_map_get'),
+    toolAliasMapSet: (rules: SanitizeRule[]) =>
+      invoke<void>('wb_tool_alias_map_set', {
+        map: { rules, updated_at: Math.floor(Date.now() / 1000) },
       }),
     // ---- 指纹样本（issue #125 增强：一键从样本生成规则）----
     // 网关命中（11128/空完成影子风控）落下的样本环形缓冲（最新在前，重启即清空）

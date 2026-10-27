@@ -796,6 +796,34 @@ export default function BuddyAiAccounts() {
                       {a.is_current_codebuddy && (
                         <Badge tone="blue" title="CodeBuddy AI 端当前账号（live storage.json genie.uid 匹配）">CB当前</Badge>
                       )}
+                      {/* 快照健康度（双端）：切换后登录身份未确认 → 红色警示；健康 → 灰色快照态（含保存时间） */}
+                      {(() => {
+                        const wbFail = a.snapshot_verify_failed_workbuddy_ms != null;
+                        const cbFail = a.snapshot_verify_failed_codebuddy_ms != null;
+                        const fmt = (ms: number | null | undefined) =>
+                          ms != null ? new Date(ms).toLocaleString('zh-CN') : null;
+                        if (wbFail || cbFail) {
+                          const parts = [
+                            wbFail && `WorkBuddy AI 快照最近一次切换未确认登录身份（${fmt(a.snapshot_verify_failed_workbuddy_ms)}）`,
+                            cbFail && `CodeBuddy AI 快照最近一次切换未确认登录身份（${fmt(a.snapshot_verify_failed_codebuddy_ms)}）`,
+                          ].filter(Boolean);
+                          return (
+                            <Badge
+                              tone="red"
+                              title={`${parts.join('；')}：登录态可能已失效，请打开客户端核实，必要时重新登录后「保存当前登录态」`}
+                            >
+                              快照验证失败
+                            </Badge>
+                          );
+                        }
+                        const saved = [
+                          a.snapshot_saved_at_workbuddy_ms != null && `WorkBuddy AI 快照保存于 ${fmt(a.snapshot_saved_at_workbuddy_ms)}`,
+                          a.snapshot_saved_at_codebuddy_ms != null && `CodeBuddy AI 快照保存于 ${fmt(a.snapshot_saved_at_codebuddy_ms)}`,
+                        ].filter(Boolean);
+                        return saved.length > 0 ? (
+                          <Badge tone="slate" title={saved.join('；')}>快照✓</Badge>
+                        ) : null;
+                      })()}
                     </div>
                     <div className="font-mono text-xs text-slate-400">
                       {a.uid || a.id}

@@ -441,7 +441,7 @@ pub(crate) fn exhaust_message(pool: &str, empty_hits: usize, rotated: usize, hea
         };
         (
             format!(
-                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts ({pool_upper} shadow risk control, account/model agnostic — switching won't help); {advice} (pool={pool} healthy={healthy_total})",
+                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts ({pool_upper} shadow risk control, account/model agnostic — switching won't help); {advice} (pool={pool} healthy={healthy_total}); client agent-tool fingerprint suspected too (issue #150) — disabling agent tools / plain chat on the client bypasses it",
             ),
             "CHANNEL_FINGERPRINT_BLOCK",
         )
@@ -804,6 +804,27 @@ pub async fn status(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     }))
 }
 
+/// 对外 /v1/models 条目可见性（issue #145）：
+/// ① WB 准入口径——wb_enabled=false 时仅 WB 系源（buddy / buddy-ai）的条目不发布，
+///    多源模型保留（仍可由 Trae 源服务 §3.4；buddy-ai 开启时 CN 目录模型经 buddy-ai
+///    池仍可路由，不得在准入目录层被滤掉——与 dispatch available 门控同口径）。
+///    判定将 s.disabled 视同源不存在，防「WB 关 + 仅剩 Trae 源被 L1 禁用」组合
+///    产生幽灵条目（目录列出但任何请求都 400 wb_upstream_disabled）；
+/// ② issue #145：全部源被 L1 显式禁用的条目不对外发布（管理端 api_unified_models
+///    不受此限，仍可见以便重新启用）
+fn models_entry_visible(
+    m: &unified_catalog::UnifiedModel,
+    wb_enabled: bool,
+    buddy_ai_enabled: bool,
+) -> bool {
+    (wb_enabled
+        || buddy_ai_enabled
+        || !m.sources
+            .iter()
+            .all(|s| s.pool == "buddy" || s.pool == "buddy-ai" || s.disabled))
+        && !m.sources.iter().all(|s| s.disabled)
+}
+
 pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
     // 统一模型目录（§3.4）：实时聚合 data/api_models.json（Trae，元数据四层链）
     // 与 data/wb_model_catalog.json（Buddy），纯派生不落盘。官网/目录同步后
@@ -849,15 +870,13 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // wb_enabled=false：仅 WB 系源（buddy / buddy-ai）的模型过滤，多源模型保留
     //（仍可由 Trae 源服务 §3.4；buddy-ai 开启时 CN 目录模型经 buddy-ai 池仍可路由，
     // 不得在准入目录层被滤掉——与 dispatch available 门控同口径）
+    // issue #145：全部源被 L1 显式禁用的条目不对外发布（管理端 api_unified_models
+    // 不受此限，仍可见以便重新启用）
+    let entry_visible =
+        |m: &unified_catalog::UnifiedModel| models_entry_visible(m, wb_enabled, buddy_ai_enabled);
     let mut data: Vec<Value> = list
         .iter()
-        .filter(|m| {
-            wb_enabled
-                || buddy_ai_enabled
-                || !m.sources
-                    .iter()
-                    .all(|s| s.pool == "buddy" || s.pool == "buddy-ai")
-        })
+        .filter(|m| entry_visible(m))
         .map(|m| {
             json!({
                 "id": m.id,
@@ -885,9 +904,11 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // 白名单按裸名放行（whitelist_check 同步剥离）；别名条目随基础条目白名单
     // 过滤结果派生，不重复过滤
     if source_labels {
-        for m in list.iter().filter(|m| m.sources.len() >= 2) {
+        // 别名随基础条目可见性派生（issue #145：全禁条目不生成别名）；
+        // 被禁单源不发布前缀别名（trae/xxx 指向不可路由源无意义）
+        for m in list.iter().filter(|m| entry_visible(m) && m.sources.len() >= 2) {
             // v3：custom 入别名列表（custom/xxx 前缀锁池直达与其他池同语义）
-            for s in m.sources.iter() {
+            for s in m.sources.iter().filter(|s| !s.disabled) {
                 data.push(json!({
                     "id": format!("{}/{}", s.pool, m.id),
                     "object": "model",
@@ -1851,6 +1872,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
+        // 工具别名表（issue #150）：sanitize 门控下请求侧正向改写 + 响应侧逆映射
+        // 回改（客户端按名匹配 tool_calls，单向改名即废）；表热更新、保存即生效
+        let tool_alias_rules =
+            super::wb_route::load_tool_alias_rules(&super::wb_route::WbView::wb(state.clone()));
         let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
         // 多候选改写种子基底（issue #122 方案 C1）：会话键 + 请求时间戳绑定请求，
         // tried.len() 随换号轮换递增——跨重试候选必变
@@ -1914,6 +1939,13 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 sanitize, &templates,
                 seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
             );
+            // 工具别名正向改写（issue #150）：sanitize 门控；逆映射供响应侧回改
+            //（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，零命中 None 直通）
+            let mut tool_alias: Option<std::collections::HashMap<String, String>> = None;
+            if sanitize {
+                tool_alias =
+                    super::wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
+            }
             // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
             // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
             if sanitize {
@@ -1945,6 +1977,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         let mut win = match race_trae_first_byte(
                             &state, &picked.uid, reader, primary_hdr, &tried, trae_allowed.as_ref(),
                             trae_dedicated.as_deref(), &body_vec, sanitize, &templates,
+                            &tool_alias_rules,
                             // 对冲重建沿用主请求的激进口径与种子基准（issue #122
                             // C1/C2）：种子在 race_trae_first_byte 内经黄金比例
                             // 翻搅，主/对冲异种子异指纹；激进口径原样沿用
@@ -1998,7 +2031,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
                         let (error_info, sent_any, up_usage) = match proto {
                             Protocol::OpenAi => {
-                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id);
+                                let (e, s, u) =
+                                    sse::stream_convert_lines(lines, tx.clone(), &chat_id, tool_alias.as_ref());
                                 (e, s, u)
                             }
                             Protocol::OpenAiText => {
@@ -2007,13 +2041,15 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 (e, s, u)
                             }
                             Protocol::Anthropic => {
-                                let (e, s, u) =
-                                    sse::stream_convert_anthropic_lines(lines, tx.clone(), &chat_id, &model);
+                                let (e, s, u) = sse::stream_convert_anthropic_lines(
+                                    lines, tx.clone(), &chat_id, &model, tool_alias.as_ref(),
+                                );
                                 (e, s, u)
                             }
                             // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 透传
                             Protocol::Responses => {
-                                let (e, s, u) = sse::stream_convert_lines(lines, tx.clone(), &chat_id);
+                                let (e, s, u) =
+                                    sse::stream_convert_lines(lines, tx.clone(), &chat_id, tool_alias.as_ref());
                                 (e, s, u)
                             }
                         };
@@ -2161,6 +2197,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                     true, &templates,
                                     seed, true,
                                 );
+                                // 11128 强制清洗后别名改写同步重放（issue #150）：
+                                // rebuild 以原始 body_vec 为基，逆映射按新表重算
+                                tool_alias =
+                                    super::wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
                                 if tx.is_closed() {
@@ -2457,6 +2497,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
+        // 工具别名表（issue #150）：sanitize 门控下请求侧正向改写 + 响应侧逆映射
+        // 回改（客户端按名匹配 tool_calls，单向改名即废）；表热更新、保存即生效
+        let tool_alias_rules =
+            super::wb_route::load_tool_alias_rules(&super::wb_route::WbView::wb(state.clone()));
         let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
         // 多候选改写种子基底（issue #122 方案 C1）：会话键 + 请求时间戳绑定请求，
         // tried.len() 随换号轮换递增——跨重试候选必变
@@ -2507,6 +2551,13 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                 sanitize, &templates,
                 seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
             );
+            // 工具别名正向改写（issue #150）：sanitize 门控；逆映射供响应侧回改
+            //（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，零命中 None 直通）
+            let mut tool_alias: Option<std::collections::HashMap<String, String>> = None;
+            if sanitize {
+                tool_alias =
+                    super::wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
+            }
             // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
             // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
             if sanitize {
@@ -2534,11 +2585,13 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             Protocol::Responses => format!("resp_{}", now_ts()),
                         };
                         let (resp, error_info) = match proto {
-                            Protocol::OpenAi => sse::aggregate(reader, &chat_id),
+                            Protocol::OpenAi => sse::aggregate(reader, &chat_id, tool_alias.as_ref()),
                             Protocol::OpenAiText => sse::aggregate_text(reader, &chat_id, &model),
-                            Protocol::Anthropic => sse::aggregate_anthropic(reader, &chat_id, &model),
+                            Protocol::Anthropic => {
+                                sse::aggregate_anthropic(reader, &chat_id, &model, tool_alias.as_ref())
+                            }
                             // Responses 仅走 WB 上游；solo 管线兜底按 OpenAI 聚合
-                            Protocol::Responses => sse::aggregate(reader, &chat_id),
+                            Protocol::Responses => sse::aggregate(reader, &chat_id, tool_alias.as_ref()),
                         };
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {
@@ -2673,6 +2726,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     true, &templates,
                                     seed, true,
                                 );
+                                // 11128 强制清洗后别名改写同步重放（issue #150）：
+                                // rebuild 以原始 body_vec 为基，逆映射按新表重算
+                                tool_alias =
+                                    super::wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 continue;
                             }
@@ -2914,6 +2971,7 @@ fn race_trae_first_byte(
     body_vec: &[u8],
     sanitize: bool,
     templates: &[(String, String)],
+    tool_alias_rules: &[(String, String)],
     seed: u64,
     aggressive: bool,
 ) -> Result<TraeRaceWin, ()> {
@@ -2951,7 +3009,7 @@ fn race_trae_first_byte(
         // 租约先于建连获取：建连失败（下行 `?`）时随闭包局部变量 Drop 自动 -1
         let mut lease = TraeHedgeLease::acquire(&state2, &picked2.uid);
         // 对冲请求体按对冲账号指纹重建
-        let converted2 = super::payload::prepare_llm_chat_body(
+        let mut converted2 = super::payload::prepare_llm_chat_body(
             &body,
             &state2.default_model,
             &picked2.uid,
@@ -2963,6 +3021,12 @@ fn race_trae_first_byte(
             hedge_seed,
             aggressive,
         );
+        // 工具别名正向改写（issue #150）：与主请求同规则表——别名集跨主/对冲
+        // 一致（表不依赖种子，见 wb_payload::merged_tool_alias_rules 注记），
+        // 任一侧胜出，响应侧逆映射（stream_chat 持有）均能正确回改
+        if sanitize {
+            let _ = super::wb_payload::apply_tool_alias_forward(&mut converted2, tool_alias_rules);
+        }
         let (reader2, hdr2) = make_upstream_request(
             &picked2.jwt,
             &picked2.uid,
@@ -3412,6 +3476,8 @@ mod tests {
         assert!(msg.contains("3 empty completion(s) across 3 rotated accounts"), "{msg}");
         assert!(msg.contains("healthy=4"), "{msg}");
         assert!(msg.contains("wb_template_map.json"), "{msg}");
+        // issue #150：客户端侧绕过提示（agent 工具形态识别，关工具/普通对话可绕过）
+        assert!(msg.contains("agent-tool fingerprint"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
     }
 
@@ -3470,6 +3536,60 @@ mod tests {
         assert!(msg.contains("wb_template_map.json"), "{msg}");
         assert!(msg.contains("pool=buddy"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+    }
+
+    // ==================== /v1/models 条目可见性（issue #145） ====================
+
+    /// 最小 UnifiedModel 构造（仅可见性判定用字段）
+    fn um(id: &str, sources: Vec<unified_catalog::UnifiedSource>) -> unified_catalog::UnifiedModel {
+        unified_catalog::UnifiedModel {
+            id: id.into(),
+            display: id.into(),
+            vendor: String::new(),
+            region: None,
+            rate: None,
+            efforts: vec![],
+            max_mode: false,
+            context_length: None,
+            max_tokens: None,
+            supports_image: None,
+            sources,
+            manual: false,
+        }
+    }
+
+    fn src(pool: &'static str, disabled: bool) -> unified_catalog::UnifiedSource {
+        unified_catalog::UnifiedSource {
+            pool,
+            rate: None,
+            enabled: false,
+            disabled,
+        }
+    }
+
+    #[test]
+    fn models_entry_visible_filters_ghost_and_all_disabled() {
+        // 幽灵条目（issue #145 审查修复）：WB 关 + buddy-ai 关 + 多源模型仅剩的
+        // Trae 源被 L1 禁用 → buddy 源不可路由、trae 源被禁，条目不得对外发布
+        //（旧行为两子句均放行，发布后任何请求都 400 wb_upstream_disabled）
+        let ghost = um("m1", vec![src("buddy", false), src("trae", true)]);
+        assert!(!models_entry_visible(&ghost, false, false));
+        // 同条目 WB 开启 → buddy 源可路由，正常发布
+        assert!(models_entry_visible(&ghost, true, false));
+        // 对照：trae 未禁时 WB 关仍保留条目（由 Trae 源服务，§3.4 既有口径）
+        let multi = um("m2", vec![src("buddy", false), src("trae", false)]);
+        assert!(models_entry_visible(&multi, false, false));
+        // 唯一 Trae 源被 L1 全禁 → 不发布（无论 WB 开关，全禁条款 ②）
+        let trae_only = um("m3", vec![src("trae", true)]);
+        assert!(!models_entry_visible(&trae_only, false, false));
+        assert!(!models_entry_visible(&trae_only, true, false));
+        // 仅 WB 系源 + WB 关 → 准入口径过滤（既有行为不回退）
+        let buddy_only = um("m4", vec![src("buddy", false)]);
+        assert!(!models_entry_visible(&buddy_only, false, false));
+        assert!(models_entry_visible(&buddy_only, true, false));
+        // 纯 Trae 源未禁 + WB 关 → 保留（trae 不受 WB 准入约束）
+        let trae_ok = um("m5", vec![src("trae", false)]);
+        assert!(models_entry_visible(&trae_ok, false, false));
     }
 
     // ==================== P2 修复6：safe_slice 字符边界截断 ====================

@@ -212,10 +212,14 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
     }
   };
 
-  // 应用可见性联动：默认模型下拉只列出「任一来源池可见」的模型（隐藏池模型不出现在选项中，
-  // 但已保存的默认模型经占位兜底保留可选，仍按原配置生效）
+  // 应用可见性联动：默认模型下拉只列出「任一来源池可见且未被 L1 禁用」的模型（隐藏池/
+  // issue #145 已禁源模型不出现在选项中——选中将得到必失败的 cURL 示例；但已保存的
+  // 默认模型经占位兜底保留可选，仍按原配置生效）
   const visibleModels = useMemo(
-    () => models.filter((m) => m.sources.some((s) => isPoolVisible(settings, s.pool))),
+    () =>
+      models.filter((m) =>
+        m.sources.some((s) => isPoolVisible(settings, s.pool) && !s.disabled),
+      ),
     [models, settings],
   );
 

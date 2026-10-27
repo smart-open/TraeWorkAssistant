@@ -370,7 +370,9 @@ impl ApiSharedState {
     }
 
     /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
-    /// uid 固定 "custom"，落盘策略与 record_usage 相同
+    /// uid 固定 "custom"，落盘策略与 record_usage 相同。
+    /// `session`：请求级会话上下文（issue #149 P2）——同步直写 custom_sessions 流水
+    /// （request_id 内部生成 uuid，纯 INSERT；写失败静默，不影响记账主路径）
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage_custom(
         &self,
@@ -381,8 +383,10 @@ impl ApiSharedState {
         duration_ms: u64,
         prompt_tokens: u64,
         completion_tokens: u64,
+        session: &usage::CustomSessionCtx,
     ) {
-        // 入口取定 day（同 record_usage_ttfb 的 G3 对齐，防跨零点账/脏标记分裂）
+        // day 先取定（同 record_usage_qoder）：用量行、流水行与标脏行共用同一日期键，
+        // 杜绝跨零点时三者分裂到不同日期
         let day = usage::today_key();
         let mut guard = self
             .usage
@@ -396,6 +400,24 @@ impl ApiSharedState {
         );
         // 批次 C 削峰：同 record_usage_ttfb，仅标脏不落盘
         drop(guard);
+        // issue #149 P2：请求级流水同步落库（静默，不影响记账主路径）
+        let _ = crate::store::docs::custom_session_insert(
+            &crate::store::db(&self.data_dir),
+            &uuid::Uuid::new_v4().to_string(),
+            &session.session_id,
+            &session.uid,
+            &day,
+            chrono::Local::now().timestamp(),
+            model,
+            session.stage,
+            &session.key_name,
+            prompt_tokens as i64,
+            completion_tokens as i64,
+            duration_ms as i64,
+            is_stream,
+            ok,
+            &session.preview,
+        );
         self.usage_dirty
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -621,6 +643,10 @@ pub enum ErrKind {
     HardCredit,
     /// 403 封禁（F-29 v1.2）：禁用账号，标注需人工确认
     Forbidden,
+    /// 付费受限（issue #145）：模型仅付费账号可用（如 Kimi K3.1 Pro），
+    /// 属账号订阅档位与模型的固有不匹配——不冷却不禁用（note_error no-op），
+    /// 由 routes 层换号重试；根治手段是渠道内单模型开关（TraeModelMeta.enabled）
+    PaidRestricted,
 }
 
 impl ErrKind {
@@ -633,8 +659,11 @@ impl ErrKind {
             // 熔断基础时长 30m；指数递增在 pool::note_error 内按 cb_trips 计算
             ErrKind::Server => std::time::Duration::from_secs(30 * 60),
             ErrKind::Client => std::time::Duration::from_secs(10 * 60),
-            // 由 note_error 特殊处理（次日 04:00 / 直接禁用），无固定时长
-            ErrKind::HardCredit | ErrKind::Forbidden | ErrKind::None => std::time::Duration::ZERO,
+            // 由 note_error 特殊处理（次日 04:00 / 直接禁用 / no-op），无固定时长
+            ErrKind::HardCredit
+            | ErrKind::Forbidden
+            | ErrKind::PaidRestricted
+            | ErrKind::None => std::time::Duration::ZERO,
         }
     }
 
@@ -649,6 +678,7 @@ impl ErrKind {
             ErrKind::Client => "Client",
             ErrKind::HardCredit => "HardCredit",
             ErrKind::Forbidden => "Forbidden",
+            ErrKind::PaidRestricted => "PaidRestricted",
         }
     }
 
@@ -703,6 +733,25 @@ pub fn is_credit_exhausted_error(body: &str) -> bool {
         || lower.contains("额度不足")
 }
 
+/// 付费受限短语表（issue #145）：模型仅付费账号/付费套餐可用（如 Kimi K3.1 Pro）。
+/// 命中 → PaidRestricted：不冷却账号（免费账号调度付费模型必败是固有不匹配，
+/// 冷却 10 分钟只会白白缩减可用池），由 routes 层换号重试、管理端单模型开关根治。
+/// 有意采用保守长短语（吸取 contains("plan") 误判 planned maintenance 的教训），
+/// 且调用方排在显式配额信号（积分耗尽/1005 plan limit）之后，防
+/// "plan limit exceeded, upgrade your plan" 类配额报文被归为付费受限
+pub fn is_paid_restricted_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("requires a paid")
+        || lower.contains("paid plan")
+        || lower.contains("paid subscription")
+        || lower.contains("upgrade to a paid")
+        || lower.contains("仅限付费")
+        || lower.contains("付费用户")
+        || lower.contains("付费账号")
+        || lower.contains("升级套餐")
+        || lower.contains("套餐不支持")
+}
+
 /// 按 HTTP 状态码 + body 判定错误类别
 pub fn classify_error(status: u16, body: &str) -> ErrKind {
     // 4001：模型问题非账号问题，不冷却账号
@@ -726,6 +775,11 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
         && (lower_body.contains("plan limit") || lower_body.contains("plan_limit"))
     {
         return ErrKind::PlanLimit;
+    }
+    // 付费受限（issue #145）：排在显式配额信号之后，防配额报文误判；
+    // 不冷却账号（PaidRestricted → note_error no-op）
+    if is_paid_restricted_error(body) {
+        return ErrKind::PaidRestricted;
     }
     match status {
         401 => ErrKind::SessionDead,
@@ -758,6 +812,11 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     // 避免落入 4008 SoftRate（60s）冷却后很快被再次选中、循环薅同一账号
     if is_credit_exhausted_error(msg) {
         return ErrKind::HardCredit;
+    }
+    // 付费受限（issue #145）：排在显式配额信号之后、4008 宽泛分支之前
+    //（防 "exceeded" 等宽泛词把付费受限报文归为 SoftRate 误冷却）
+    if is_paid_restricted_error(msg) {
+        return ErrKind::PaidRestricted;
     }
     // 4008: 请求频率超限（quota exceeded）→ 60 秒短冷却，避免误杀
     if code == 4008
@@ -985,5 +1044,83 @@ mod inflight_tests {
         assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 1);
         drop(g2);
         assert_eq!(acct.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+}
+
+/// issue #145 错误分类测试：付费受限（PaidRestricted）识别与排序防误判
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    /// 付费受限长短语命中与保守性（不含付费语义的报文不误判）
+    #[test]
+    fn t01_paid_restricted_phrases() {
+        assert!(is_paid_restricted_error(
+            "This model requires a paid subscription to use."
+        ));
+        assert!(is_paid_restricted_error("请升级套餐后再使用该模型"));
+        assert!(is_paid_restricted_error("该模型仅限付费用户使用"));
+        // 保守性：宽泛 "plan" 字样不命中（吸取 contains("plan") 误判 planned
+        // maintenance 的教训）
+        assert!(!is_paid_restricted_error("planned maintenance"));
+        assert!(!is_paid_restricted_error("plan limit exceeded"));
+    }
+
+    /// classify_error：付费受限在状态码兜底（403/400 → Forbidden/Client）之前
+    /// 识别——否则免费账号调度付费模型会被 403/400 兜底误冷却
+    #[test]
+    fn t02_error_paid_restricted_before_status_fallback() {
+        assert_eq!(
+            classify_error(403, "model requires a paid subscription"),
+            ErrKind::PaidRestricted
+        );
+        assert_eq!(
+            classify_error(400, "该模型仅限付费账号使用"),
+            ErrKind::PaidRestricted
+        );
+    }
+
+    /// 排序防误判①：显式配额信号（积分耗尽 / 1005 plan limit）优先于付费受限，
+    /// "plan limit exceeded, upgrade your plan" 类配额报文不误归付费受限
+    #[test]
+    fn t03_explicit_quota_signals_win_over_paid_restricted() {
+        assert_eq!(
+            classify_error(400, "insufficient credit, upgrade your plan"),
+            ErrKind::HardCredit
+        );
+        assert_eq!(
+            classify_error(
+                400,
+                "{\"code\":1005,\"message\":\"plan limit exceeded, upgrade your plan\"}"
+            ),
+            ErrKind::PlanLimit
+        );
+        assert_eq!(
+            classify_solo_error(1005, "plan limit exceeded, upgrade your plan"),
+            ErrKind::PlanLimit
+        );
+    }
+
+    /// 排序防误判②：classify_solo_error 付费受限检查在 4008 宽泛分支
+    /// （contains "quota"/"exceeded"/"rate"）之前，防付费报文误归 SoftRate（60s）
+    #[test]
+    fn t04_solo_paid_restricted_before_generic_quota() {
+        assert_eq!(
+            classify_solo_error(0, "该模型仅限付费用户使用，请升级套餐"),
+            ErrKind::PaidRestricted
+        );
+        // 对照：无付费短语的 exceeded 报文仍按既有口径归 SoftRate
+        assert_eq!(classify_solo_error(4008, "quota exceeded"), ErrKind::SoftRate);
+    }
+
+    /// 冷却语义：零时长（note_error no-op 的前置约定）、标识串、不解绑粘性
+    #[test]
+    fn t05_paid_restricted_cooldown_semantics() {
+        assert_eq!(
+            ErrKind::PaidRestricted.cooldown_duration(),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(ErrKind::PaidRestricted.as_str(), "PaidRestricted");
+        assert!(!ErrKind::PaidRestricted.unbinds_sticky());
     }
 }

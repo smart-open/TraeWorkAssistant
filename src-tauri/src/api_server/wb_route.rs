@@ -353,6 +353,19 @@ pub fn load_templates(state: &WbView) -> Vec<(String, String)> {
     wb_payload::merged_template_rules(custom)
 }
 
+/// 工具别名表加载（issue #150）：kv `tool_alias_map`，合并语义同模板表
+/// （内置默认全量生效，自定义按 from 覆盖/追加，to=null/空串=停用）。
+/// 单键不分档；当前接线面仅 Trae 池（routes.rs solo 管线：流式/聚合/对冲
+/// converted2/11128 rebuild 重放 + 响应侧 sse.rs 四回改点）——WB 池（wb_sse
+/// 管线）与 qoder 未接入，接入时同键复用即可（工具集指纹是上游风控家族
+/// 共性，分档无收益）；每请求读取（kv 单行 + mtime 缓存），保存即对下一请求生效
+pub fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
+    let custom = crate::store::db(&state.data_dir)
+        .kv_get::<wb_payload::ToolAliasFile>("tool_alias_map")
+        .into_rules();
+    wb_payload::merged_tool_alias_rules(custom)
+}
+
 // ==================== 错误分类（WB 上游） ====================
 
 /// WB 流内错误 → ErrKind：WB 无 SOLO 业务码体系，按类 HTTP 状态码 +

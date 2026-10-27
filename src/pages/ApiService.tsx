@@ -30,12 +30,13 @@ import type {
 /** 思考档位选项（编辑弹框多选，顺序固定） */
 const EFFORT_OPTIONS = ['low', 'medium', 'high'] as const;
 
-/** 表单数值解析：空串 → null（未设置）；非法数字返回 NaN 由调用方拦截 */
+/** 表单数值解析：空串 → null（未设置）；非法数字或负数返回 NaN 由调用方拦截 */
 const numOrNull = (s: string) => {
   const t = s.trim();
   if (t === '') return null;
   const n = Number(t);
-  return Number.isFinite(n) ? n : NaN;
+  // 倍率/上下文/max_tokens 均无负值语义；min="0" 只约束 spinner，需在保存侧拦截
+  return Number.isFinite(n) && n >= 0 ? n : NaN;
 };
 
 export default function ApiService() {
@@ -87,8 +88,13 @@ export default function ApiService() {
   const [fContext, setFContext] = useState('');
   const [fMaxTokens, setFMaxTokens] = useState('');
   const [fImage, setFImage] = useState<'' | 'true' | 'false'>('');
+  // 渠道内单模型开关（issue #145）：'' = 默认启用（未设置），'false' = 禁用该模型
+  const [fEnabled, setFEnabled] = useState<'' | 'true' | 'false'>('');
   const [savingMeta, setSavingMeta] = useState(false);
   const [clearingMeta, setClearingMeta] = useState(false);
+  // metaGet 回填中（issue #146）：回填完成前禁用表单与保存/清除按钮，
+  // 防止用户基于残留/空表单提前保存、或输入被异步回填覆盖
+  const [loadingMeta, setLoadingMeta] = useState(false);
 
   useEffect(() => {
     void refreshAccounts();
@@ -328,13 +334,27 @@ export default function ApiService() {
 
   // 打开弹框：回显 L1 人工值（metaGet 读取 data/trae_model_meta.json，跨会话可回显）；
   // 读取失败时全表单留空 = 交由下层兜底（绝不把聚合值当人工值回填，区分 L1 与 L2-L4，§6.1）。
-  // editReqRef 令牌守卫：快速连点两个模型时仅让最后一次请求回填，防止慢响应覆盖新弹框。
-  const editReqRef = useRef('');
+  // editReqRef 自增序号令牌：每次 openEdit 产生唯一序号，仅最后一次请求回填——
+  // 防止快速连点/同一模型快速重开时慢响应覆盖新弹框（按 id 判重无法区分同一模型的两次请求）。
+  // 表单字段在 metaGet 返回前同步清空并禁用编辑（issue #146）：弹框关闭时 state 不清空，
+  // 残留的上一个模型输入值会在下次打开时被误显示/误保存，且回填不能覆盖用户已输入内容。
+  const editReqRef = useRef(0);
   const openEdit = async (m: UnifiedModel) => {
-    editReqRef.current = m.id;
+    editReqRef.current += 1;
+    const reqSeq = editReqRef.current;
     setEditing(m);
+    setLoadingMeta(true);
+    // 先同步清空全部表单字段（而非等 metaGet 返回才回填）
+    setFLabel('');
+    setFRate('');
+    setFEfforts(new Set());
+    setFContext('');
+    setFMaxTokens('');
+    setFImage('');
+    setFEnabled('');
     const known = await api.apiServer.metaGet(m.id).catch(() => null);
-    if (editReqRef.current !== m.id) return;
+    if (editReqRef.current !== reqSeq) return;
+    setLoadingMeta(false);
     setFLabel(known?.label ?? '');
     setFRate(known?.rate != null ? String(known.rate) : '');
     setFEfforts(new Set(known?.efforts ?? []));
@@ -343,6 +363,7 @@ export default function ApiService() {
     setFImage(
       known?.supports_image === true ? 'true' : known?.supports_image === false ? 'false' : '',
     );
+    setFEnabled(known?.enabled === true ? 'true' : known?.enabled === false ? 'false' : '');
   };
 
   const saveMeta = async () => {
@@ -362,6 +383,7 @@ export default function ApiService() {
       context_length: context,
       max_tokens: maxTokens,
       supports_image: fImage === '' ? null : fImage === 'true',
+      enabled: fEnabled === '' ? null : fEnabled === 'true',
     };
     setSavingMeta(true);
     try {
@@ -416,6 +438,8 @@ export default function ApiService() {
   // 输入框通用样式（沿用页面表单惯例）
   const inputCls =
     'h-7 w-full rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200';
+  // 元数据编辑弹框专用：metaGet 回填期间输入禁用并降透明度提示（issue #146）
+  const metaInputCls = loadingMeta ? `${inputCls} opacity-60` : inputCls;
 
   return (
     <div>
@@ -932,13 +956,24 @@ export default function ApiService() {
                   </tr>
                 </thead>
                 <tbody>
-                  {models.map((m) => (
+                  {models.map((m) => {
+                    const traeDisabled =
+                      m.sources.find((s) => s.pool === 'trae')?.disabled === true;
+                    return (
                     <tr
                       key={m.id}
                       className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
                     >
                       <td className="py-2 pr-3 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
                         {m.id}
+                        {traeDisabled && (
+                          <sup
+                            className="ml-0.5 font-sans text-[9px] font-bold leading-none text-slate-400 dark:text-zinc-500"
+                            title="L1 已禁用：请求不再路由 Trae 源（可在编辑弹框重新启用）"
+                          >
+                            已禁
+                          </sup>
+                        )}
                         {m.max_mode && (
                           <sup
                             className="ml-0.5 font-sans text-[9px] font-bold leading-none text-amber-500 dark:text-amber-400"
@@ -991,7 +1026,8 @@ export default function ApiService() {
                         </button>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1002,7 +1038,13 @@ export default function ApiService() {
       {/* 模型元数据编辑弹框（L1 覆盖层，§6.1）：字段全部可留空 = 交由下层自动来源兜底 */}
       <Modal
         open={editing !== null}
-        onClose={() => setEditing(null)}
+        onClose={() => {
+          // 确认弹框叠开时 Esc 仅关确认层，避免 keydown 按挂载序把编辑弹框一并关闭
+          //（参照 ApiManagerModal subOpenRef 模式）；保存/清除进行中屏蔽 Esc/背景/X 关闭，
+          // 与「取消」按钮禁用保持一致，防止操作中弹框被关闭
+          if (metaClearConfirm || savingMeta || clearingMeta) return;
+          setEditing(null);
+        }}
         title={`编辑模型元数据 · ${editing?.id ?? ''}`}
         footer={
           <>
@@ -1010,20 +1052,24 @@ export default function ApiService() {
               <button
                 className="btn-outline mr-auto flex items-center gap-1"
                 onClick={() => setMetaClearConfirm(true)}
-                disabled={clearingMeta || savingMeta}
+                disabled={clearingMeta || savingMeta || loadingMeta}
                 title="清除 L1 人工覆盖，恢复自动来源链（官网同步 > 内置参考 > 名称推断）"
               >
                 <Eraser size={14} />
                 {clearingMeta ? '清除中…' : '清除人工值'}
               </button>
             )}
-            <button className="btn-ghost" onClick={() => setEditing(null)} disabled={savingMeta}>
+            <button
+              className="btn-ghost"
+              onClick={() => setEditing(null)}
+              disabled={savingMeta || clearingMeta}
+            >
               取消
             </button>
             <button
               className="btn-primary flex items-center gap-1"
               onClick={() => void saveMeta()}
-              disabled={savingMeta}
+              disabled={savingMeta || loadingMeta || clearingMeta}
             >
               {savingMeta ? <Spinner className="text-white" /> : <Save size={15} />}
               {savingMeta ? '保存中…' : '保存'}
@@ -1038,22 +1084,24 @@ export default function ApiService() {
           <div>
             <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">展示名</label>
             <input
-              className={inputCls}
+              className={metaInputCls}
               value={fLabel}
               onChange={(e) => setFLabel(e.target.value)}
               placeholder="留空 = 自动来源"
+              disabled={loadingMeta}
             />
           </div>
           <div>
             <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">积分倍率</label>
             <input
-              className={inputCls}
+              className={metaInputCls}
               type="number"
               step="0.01"
               min="0"
               value={fRate}
               onChange={(e) => setFRate(e.target.value)}
               placeholder="留空 = 自动来源"
+              disabled={loadingMeta}
             />
           </div>
           <div className="col-span-2">
@@ -1067,6 +1115,7 @@ export default function ApiService() {
                     type="checkbox"
                     className="h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
                     checked={fEfforts.has(e)}
+                    disabled={loadingMeta}
                     onChange={() =>
                       setFEfforts((prev) => {
                         const next = new Set(prev);
@@ -1084,37 +1133,53 @@ export default function ApiService() {
           <div>
             <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">上下文长度</label>
             <input
-              className={inputCls}
+              className={metaInputCls}
               type="number"
               step="1"
               min="0"
               value={fContext}
               onChange={(e) => setFContext(e.target.value)}
               placeholder="如 1000000"
+              disabled={loadingMeta}
             />
           </div>
           <div>
             <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">max_tokens</label>
             <input
-              className={inputCls}
+              className={metaInputCls}
               type="number"
               step="1"
               min="0"
               value={fMaxTokens}
               onChange={(e) => setFMaxTokens(e.target.value)}
               placeholder="如 96000"
+              disabled={loadingMeta}
             />
           </div>
           <div>
             <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">图片支持</label>
             <select
-              className={inputCls}
+              className={metaInputCls}
               value={fImage}
               onChange={(e) => setFImage(e.target.value as '' | 'true' | 'false')}
+              disabled={loadingMeta}
             >
               <option value="">未设置（自动来源）</option>
               <option value="true">支持</option>
               <option value="false">不支持</option>
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">模型启用</label>
+            <select
+              className={metaInputCls}
+              value={fEnabled}
+              onChange={(e) => setFEnabled(e.target.value as '' | 'true' | 'false')}
+              disabled={loadingMeta}
+            >
+              <option value="">未设置（默认启用）</option>
+              <option value="true">启用</option>
+              <option value="false">禁用（不路由 Trae 源）</option>
             </select>
           </div>
         </div>

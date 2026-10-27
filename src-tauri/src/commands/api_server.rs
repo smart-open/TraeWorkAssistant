@@ -1911,7 +1911,8 @@ pub fn api_unified_models(
         qoder_flash_free,
     );
     if available_only.unwrap_or(false) {
-        list.retain(|m| m.sources.iter().any(|s| s.enabled));
+        // issue #145：可用口径须含 L1 静态禁用——disabled 源不承接请求，不能计为可用
+        list.retain(|m| m.sources.iter().any(|s| s.enabled && !s.disabled));
     }
     list
 }

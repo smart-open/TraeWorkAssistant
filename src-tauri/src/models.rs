@@ -50,6 +50,13 @@ pub struct AccountView {
     /// F-78 批次 3 收尾，对齐 Buddy 侧 auth_saved_at 先例）
     #[serde(default)]
     pub auth_saved_at: Option<String>,
+    /// 客户端快照保存时间（sidecar savedAtMs；无快照为 None）
+    #[serde(default)]
+    pub snapshot_saved_at_ms: Option<i64>,
+    /// 最近一次切换到该账号时客户端未确认登录的时间（切换超时/token 失效；
+    /// 成功切换或重新保存登录态后清空）
+    #[serde(default)]
+    pub snapshot_verify_failed_at_ms: Option<i64>,
     /// JWT data.id 与 user_id 归属不一致（issue #55：此时扫描「已入池」可能经该账号
     /// JWT 命中其他 uid，列表却无从对账；显式暴露供列表警示。快照槽位按 user_id
     /// 命名，自动改写会孤儿化既有快照，故仅警示不强修）
@@ -185,6 +192,13 @@ pub struct Settings {
     /// 豆包快照可选纳入 Default/IndexedDB（C4：对话历史等完整状态随账号迁移；体积代价大，默认排除）
     #[serde(default)]
     pub doubao_snapshot_include_idb: bool,
+    /// 豆包会话每日续期调度开关（issue #147，默认开）：调度器 doubao-keepalive 可关闭；
+    /// state::settings 对 kv 完全缺失路径回填默认开（派生 Default bool=false 漏开防御）
+    #[serde(default = "default_true")]
+    pub doubao_keepalive_enabled: bool,
+    /// 豆包会员额度每日巡检调度开关（issue #147，默认开）：调度器 doubao-quota 可关闭
+    #[serde(default = "default_true")]
+    pub doubao_quota_enabled: bool,
     /// Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；
     /// Windows 计划任务注册时间复用该值）
     #[serde(default = "default_trae_checkin_hhmm")]

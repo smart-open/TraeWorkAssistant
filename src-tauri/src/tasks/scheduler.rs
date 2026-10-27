@@ -340,9 +340,10 @@ fn tick(
                         &st.data_dir,
                         &format!("[调度器] {}（{}）：{}（不记当日已跑，稍后重试）", t.name, trigger, summary),
                     );
-                // 审查 #15：skipped_empty_pool（buddy-ai 打卡空轮，本轮无账号参与）
-                // 同样不 mark_run——mark_run 会写 last_run_date=今日，当日新增账号
-                // 不再被调度（补打窗口被吞）。仅记日志；账号导入后下一 tick 正常执行
+                // 审查 #15：skipped_empty_pool（buddy-ai 打卡空轮 / 豆包续期与巡检
+                // 空池或客户端缺失，本轮无账号参与）同样不 mark_run——mark_run 会写
+                // last_run_date=今日，当日新增账号不再被调度（补打窗口被吞）。仅记
+                // 日志；账号导入/客户端就绪后下一 tick 正常执行
                 } else if v.get("skipped_empty_pool").is_none() {
                     mark_run(st, t.key, &today, &summary);
                     fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
@@ -454,6 +455,10 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "qoder-refresh" => st.settings().qoder_token_renew_enabled,
         // Qoder 会话流水定时合并（环境配置页可关；默认开，每日 04:30）
         "qoder-sessions-compact" => st.settings().qoder_sessions_compact_enabled,
+        // 豆包会话每日续期（issue #147）：环境配置页可关（默认开）
+        "doubao-keepalive" => st.settings().doubao_keepalive_enabled,
+        // 豆包会员额度每日巡检（issue #147）：环境配置页可关（默认开）
+        "doubao-quota" => st.settings().doubao_quota_enabled,
         // 看板数据同步（积分/Token/消耗明细）：mode=off 即关闭（其余模式均视为启用；
         // buddy-ai 旧 enabled 布尔已由 state 归一化派生进 mode）
         "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" | "qoder-credits-snapshot"
@@ -918,6 +923,12 @@ fn run_task(
         }
         // 豆包会话每日续期：与 `--task-run doubao-keepalive` 同款
         "doubao-keepalive" => {
+            // 前置检查（issue #147）：无账号/客户端缺失时静默跳过。3.8.5 审查修复
+            // （M-D）：透传 skipped_empty_pool（对齐 #15 空池豁免口径）——普通
+            // skipped 语义会 mark_run 吞掉当日补装客户端/导入账号的补打窗口
+            if let Some(reason) = super::doubao_keepalive_skip_reason(st) {
+                return Ok(json!({ "ok": true, "skipped_empty_pool": reason }));
+            }
             let sink = crate::switcher::CliSink::new(&st.data_dir);
             match crate::switcher::run_action(
                 crate::switcher::RunArgs {
@@ -1253,6 +1264,16 @@ fn summarize(v: &Value, task_key: &str) -> String {
             let unit = if task_key == "buddy-ai-checkin" { "已打" } else { "已签" };
             return format!("成功 {o}，{unit} {a}，失败 {f}");
         }
+        // 豆包额度巡检（ok 为 bool、计数为 success/failed/exhausted，3.8.5 审查 L2：
+        // 旧逻辑只认 i64 ok 三元组，巡检轮次落入 JSON 截断展示、明细不可读）
+        if let (Some(true), Some(succ), Some(fail)) = (
+            v.get("ok").and_then(Value::as_bool),
+            get("success"),
+            get("failed"),
+        ) {
+            let exh = get("exhausted").unwrap_or(0);
+            return format!("巡检成功 {succ}，失败 {fail}，额度耗尽 {exh}");
+        }
     }
     let s = serde_json::to_string(v).unwrap_or_default();
     s.chars().take(120).collect()
@@ -1408,6 +1429,47 @@ mod tests {
         let st = temp_state("off");
         seed_settings(&st, false, "09:00");
         assert!(!enabled(&st, "trae-renew"));
+    }
+
+    /// 豆包调度开关（issue #147）：无 kv 回填链路默认开；显式关闭后 enabled=false 且计划 Skip
+    #[test]
+    fn doubao_switches_default_on_and_disabled_skips() {
+        let st = temp_state("doubao_sw");
+        assert!(enabled(&st, "doubao-keepalive"), "豆包续期调度默认启用");
+        assert!(enabled(&st, "doubao-quota"), "豆包额度巡检默认启用");
+        let keep = || TASKS.iter().find(|t| t.key == "doubao-keepalive").unwrap();
+        let quota = || TASKS.iter().find(|t| t.key == "doubao-quota").unwrap();
+        assert!(matches!(sched_plan(&st, keep()), SchedPlan::Daily(_)));
+        crate::store::db(&st.data_dir)
+            .kv_set("app_settings", &json!({ "doubao_keepalive_enabled": false, "doubao_quota_enabled": false }))
+            .unwrap();
+        assert!(!enabled(&st, "doubao-keepalive"));
+        assert!(!enabled(&st, "doubao-quota"));
+        assert!(matches!(sched_plan(&st, keep()), SchedPlan::Skip));
+        assert!(matches!(sched_plan(&st, quota()), SchedPlan::Skip));
+    }
+
+    /// 豆包保活前置检查（issue #147）：空账号池 → 返回跳过原因，不触发六级 exe 发现
+    #[test]
+    fn doubao_keepalive_skip_reason_empty_pool() {
+        let st = temp_state("doubao_sk");
+        assert_eq!(
+            crate::tasks::doubao_keepalive_skip_reason(&st).as_deref(),
+            Some("无豆包账号")
+        );
+    }
+
+    /// 豆包额度巡检空池跳过（issue #147）：`skipped_empty_pool` 豁免口径（审查 #15
+    /// 对齐，不 mark_run 保留当日补打窗口），不返 Err
+    #[test]
+    fn doubao_quota_empty_pool_skips() {
+        let st = temp_state("doubao_qsk");
+        let out = crate::tasks::doubao_quota::run_batch(&st).unwrap();
+        assert_eq!(out.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            out.get("skipped_empty_pool").and_then(Value::as_str),
+            Some("无豆包账号")
+        );
     }
 
     /// 看板同步/模型同步的调度计划：默认 every_hours 每2小时（issue #82）；

@@ -276,6 +276,212 @@ pub fn merged_template_rules(
     merged
 }
 
+// ==================== 工具名别名改写（issue #150：tools 工具集指纹识别） ====================
+
+/// 内置工具别名默认表（issue #150）：上游风控升级为按请求 `tools` 工具名集合
+/// 识别 agent 客户端——system 句表清洗后样本 system 已空仍被拦，换号无效
+/// （拦「客户端形态」不拦账号），无 tools 请求不受影响。句表机制结构性无解：
+/// tools 是 function calling 协议定义，客户端按名匹配响应 tool_calls，单向
+/// 改名即废。本表在请求侧把特征工具名改写为语义保持的通用名（模型仍可凭
+/// 描述选对工具），响应侧按逆映射回改（协议对客户端透明）。
+/// 仅收「特定 agent 客户端独家命名」（glob/grep/edit 等通用名不改，避免
+/// 无谓的模型侧语义损失）；表随样本画像持续补齐（UI「工具别名」tab 热更新）。
+pub fn default_tool_alias_rules() -> Vec<(String, String)> {
+    vec![
+        ("ask_user_question".to_string(), "ask_user".to_string()),
+        ("create_goal".to_string(), "set_goal".to_string()),
+        ("exit_plan_mode".to_string(), "finish_plan".to_string()),
+        ("get_goal".to_string(), "read_goal".to_string()),
+        ("interrupt_agent".to_string(), "pause_agent".to_string()),
+        ("job_kill".to_string(), "stop_job".to_string()),
+        ("job_list".to_string(), "list_jobs".to_string()),
+    ]
+}
+
+/// 工具别名表 KV 文件形态（kv `tool_alias_map`）：与审核模板表同一结构
+/// （rules[].from 逐字工具名，to 语义见 TemplateRule 注记）。Default 为
+/// store::kv_get 的读取兜底约束（KV 缺失 = 纯内置默认表）
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct ToolAliasFile {
+    #[serde(default)]
+    pub rules: Vec<TemplateRule>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+impl ToolAliasFile {
+    /// 自定义表 → (from, to?) 列表（to=None/Some("") 统一为停用——工具名不可
+    /// 为空串，与模板表的「空串=剥离」语义在此不适用）
+    pub fn into_rules(self) -> Option<Vec<(String, Option<String>)>> {
+        if self.rules.is_empty() {
+            return None;
+        }
+        Some(
+            self.rules
+                .into_iter()
+                .map(|r| (r.from, r.to.filter(|t| !t.is_empty())))
+                .collect(),
+        )
+    }
+}
+
+/// 工具别名合并语义（对齐 merged_template_rules）：内置默认表全量生效，自定义
+/// 按 from 同名覆盖/追加；to=None 或空串 = 停用（从生效表移除，原名透传）。
+/// 注意：工具别名不支持 `|` 多候选——别名改写必须请求/响应双向一致，候选
+/// 随轮换种子变化会导致响应侧逆映射失配（模板表无回程不受此限）
+pub fn merged_tool_alias_rules(
+    custom: Option<Vec<(String, Option<String>)>>,
+) -> Vec<(String, String)> {
+    let mut merged = default_tool_alias_rules();
+    if let Some(rules) = custom {
+        for (from, to) in rules {
+            match to {
+                None => merged.retain(|(f, _)| *f != from),
+                Some(t) => {
+                    if let Some(slot) = merged.iter_mut().find(|(f, _)| *f == from) {
+                        slot.1 = t;
+                    } else {
+                        merged.push((from, t));
+                    }
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// 请求侧工具名别名改写（issue #150 治本）：入参为 prepare_llm_chat_body /
+/// prepare_wb_chat_body 产物（llm_utils_chat 形态），覆盖三个透传点——
+/// `tools[].function.name`、`tool_choice`（normalize 后为字符串工具名）、
+/// `messages[].tool_calls[].function_call.name`（历史轮）。命中才改（窄口径，
+/// 逐字匹配），改写后返回逆映射（别名→原名）供响应侧回改；无 tools / 零命中
+/// 返回 None（响应侧零开销直通）。
+/// 一致性约束：逆映射按「别名→首个原名」先到先得——两条规则映射到同一别名时
+/// 第二个原名不改写（配置冲突的防御性兜底，内置表无冲突；UI 侧不拦截）。
+/// 碰撞防御：别名命中请求内其他真实工具名（且该名未被更早规则改名让出）时，
+/// 该规则本请求整条跳过（tools/tool_choice/历史轮三处统一原名透传）——否则上游
+/// 收到重复工具名，且响应侧逆映射会把真实工具的调用错误回改（静默错工具执行）；
+/// tool_choice 仅跟随 tools 实际发生的改写（输家工具的 tool_choice 不改名，
+/// 避免上游收到指向不存在/错误工具的 tool_choice）。
+/// 注意：改写会改变 JSON 长度（别名 ≠ 原名字节数），故入参必须是
+/// `&mut Vec<u8>` 整体替换回写——切片定长 copy_from_slice 会 panic。
+pub fn apply_tool_alias_forward(
+    body: &mut Vec<u8>,
+    rules: &[(String, String)],
+) -> Option<std::collections::HashMap<String, String>> {
+    if rules.is_empty() {
+        return None;
+    }
+    let mut v: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let obj = match v.as_object_mut() {
+        Some(o) => o,
+        None => return None,
+    };
+    // 生效前向表：from → to（停用规则不在表内——to 非空才入表）
+    let forward: Vec<(&str, &str)> = rules
+        .iter()
+        .filter(|(_, to)| !to.is_empty())
+        .map(|(from, to)| (from.as_str(), to.as_str()))
+        .collect();
+    if forward.is_empty() {
+        return None;
+    }
+    // 碰撞防御（审查修复）：改名前采集请求内全部真实工具名；别名命中存活真实名
+    // 时该规则跳过。freed = 已被更早接受规则改名让出的原名——链式改写（B→C 后
+    // A→B）在规则序下合法放行，仅拦真实重复
+    let real: std::collections::HashSet<String> = obj
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut freed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let effective: std::collections::HashMap<&str, &str> = forward
+        .into_iter()
+        .filter(|(from, to)| {
+            if real.contains(*to) && !freed.contains(*to) {
+                return false; // 别名与存活真实名碰撞：整条跳过，原名透传
+            }
+            freed.insert(*from);
+            true
+        })
+        .collect();
+    let mut reverse: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut renamed = false;
+    // tools[].function/name
+    if let Some(Value::Array(tools)) = obj.get_mut("tools") {
+        for tool in tools.iter_mut() {
+            if let Some(name) = tool.pointer_mut("/function/name").and_then(|v| v.as_str()) {
+                let orig = name.to_string();
+                if let Some(alias) = effective.get(orig.as_str()) {
+                    // 同别名冲突先到先得：第二个原名不改写
+                    let conflict = reverse
+                        .get(*alias)
+                        .map(|prev| prev != &orig)
+                        .unwrap_or(false);
+                    if !conflict {
+                        if let Some(slot) = tool.pointer_mut("/function/name") {
+                            *slot = Value::String((*alias).to_string());
+                        }
+                        reverse.insert((*alias).to_string(), orig);
+                        renamed = true;
+                    }
+                }
+            }
+        }
+    }
+    // tool_choice（normalize_tool_choice 后为字符串工具名）：仅跟随 tools 实际
+    // 发生的改写——输家（同别名冲突被跳过）或碰撞跳过规则的 tool_choice 保持原名，
+    // 避免上游收到指向不存在/错误工具的 tool_choice
+    if let Some(Value::String(tc)) = obj.get_mut("tool_choice") {
+        if reverse.values().any(|orig| orig == tc) {
+            if let Some(alias) = effective.get(tc.as_str()) {
+                *tc = (*alias).to_string();
+                renamed = true;
+            }
+        }
+    }
+    // messages[].tool_calls[].function_call.name（prepare 已改名为 function_call）
+    if let Some(Value::Array(msgs)) = obj.get_mut("messages") {
+        for msg in msgs.iter_mut() {
+            let Some(tcs) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for tc in tcs.iter_mut() {
+                if let Some(name) = tc.pointer_mut("/function_call/name").and_then(|v| v.as_str())
+                {
+                    let orig = name.to_string();
+                    if let Some(alias) = effective.get(orig.as_str()) {
+                        let conflict = reverse
+                            .get(*alias)
+                            .map(|prev| prev != &orig)
+                            .unwrap_or(false);
+                        if !conflict {
+                            if let Some(slot) = tc.pointer_mut("/function_call/name") {
+                                *slot = Value::String((*alias).to_string());
+                            }
+                            reverse.insert((*alias).to_string(), orig);
+                            renamed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !renamed {
+        return None;
+    }
+    *body = serde_json::to_vec(&v).ok()?;
+    Some(reverse)
+}
+
 /// 模板映射命中计数（issue #57 指纹反查）：
 /// 热路径仅内存计数（命中才加锁）；11128 强制清洗重试 / 空完成换号重试等
 /// 风控命中路径用 template_hit_note() 导出随日志落盘——ZCode/DSH/REASONIX
@@ -426,7 +632,10 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
         .take(300)
         .collect();
     let mut out = format!("system=\"{}\"", sys.replace('"', "'"));
-    let tools: Vec<String> = v
+    // 工具名画像（issue #150 增强）：此前仅截前 10 个，tools 工具集指纹识别
+    // 升级后需全量画像定位「哪类客户端形态在被拦」——展示前 10 + 全量总数 +
+    // 排序名 FNV-1a 短哈希（同名集合跨请求稳定聚合，日志侧可按 hash 分桶统计）
+    let tool_names: Vec<String> = v
         .get("tools")
         .and_then(|t| t.as_array())
         .map(|arr| {
@@ -438,12 +647,19 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
                         .and_then(|n| n.as_str())
                         .map(str::to_string)
                 })
-                .take(10)
                 .collect()
         })
         .unwrap_or_default();
-    if !tools.is_empty() {
-        out.push_str(&format!(" tools=[{}]", tools.join(",")));
+    if !tool_names.is_empty() {
+        let total = tool_names.len();
+        let shown: Vec<String> = tool_names.iter().take(10).cloned().collect();
+        let mut sorted = tool_names.clone();
+        sorted.sort();
+        let set_hash = fnv1a(&sorted.join("\u{1}")) & 0xFFFF_FFFF;
+        out.push_str(&format!(
+            " tools=[{}](total={total} hash={set_hash:08x})",
+            shown.join(",")
+        ));
     }
     out
 }
@@ -1858,5 +2074,192 @@ mod tests {
         let s4 = v4["messages"][0]["content"].as_str().unwrap();
         assert!(s4.contains("that helps the user with programming work"), "{s4}");
         assert!(!s4.contains("DeepSeek Harness"), "{s4}");
+    }
+
+    fn alias_rules() -> Vec<(String, String)> {
+        vec![
+            ("ask_user_question".to_string(), "ask_user".to_string()),
+            ("create_goal".to_string(), "set_goal".to_string()),
+        ]
+    }
+
+    /// issue #150 请求侧改写三透传点：tools[].function.name / tool_choice /
+    /// 历史轮 tool_calls[].function_call.name；通用名（grep）不改；逆映射
+    /// 别名→原名供响应侧回改
+    #[test]
+    fn tool_alias_forward_renames_three_points() {
+        let body = json!({
+            "tools": [
+                {"type": "function", "function": {"name": "ask_user_question", "description": "d1", "parameters": {}}},
+                {"type": "function", "function": {"name": "grep", "description": "d2", "parameters": {}}}
+            ],
+            "tool_choice": "ask_user_question",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "t1", "type": "function",
+                     "function_call": {"name": "ask_user_question", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "t1", "content": "ans"}
+            ]
+        });
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse = apply_tool_alias_forward(&mut buf, &alias_rules()).expect("应发生改写");
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("ask_user"));
+        assert_eq!(v["tools"][1]["function"]["name"], json!("grep"), "通用名不改");
+        assert_eq!(v["tool_choice"], json!("ask_user"));
+        assert_eq!(
+            v["messages"][1]["tool_calls"][0]["function_call"]["name"],
+            json!("ask_user")
+        );
+        assert_eq!(reverse.get("ask_user").map(String::as_str), Some("ask_user_question"));
+    }
+
+    /// 零命中返回 None（响应侧零开销直通）：无 tools 请求 / 工具名均不在表内
+    #[test]
+    fn tool_alias_forward_zero_hit_returns_none() {
+        let body = json!({
+            "tools": [{"type": "function", "function": {"name": "grep", "parameters": {}}}],
+            "messages": []
+        });
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        assert!(apply_tool_alias_forward(&mut buf, &alias_rules()).is_none());
+        let body2 = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let mut b2 = serde_json::to_vec(&body2).unwrap();
+        assert!(apply_tool_alias_forward(&mut b2, &alias_rules()).is_none());
+    }
+
+    /// 同别名冲突先到先得：两条规则映射到同一别名时第二个原名不改写
+    /// （配置冲突的防御性兜底，保证响应侧逆映射无歧义）
+    #[test]
+    fn tool_alias_forward_conflict_first_wins() {
+        let rules = vec![
+            ("tool_a".to_string(), "shared".to_string()),
+            ("tool_b".to_string(), "shared".to_string()),
+        ];
+        let body = json!({"tools": [
+            {"function": {"name": "tool_a"}},
+            {"function": {"name": "tool_b"}}
+        ]});
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse = apply_tool_alias_forward(&mut buf, &rules).unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("shared"));
+        assert_eq!(v["tools"][1]["function"]["name"], json!("tool_b"), "冲突第二个不改写");
+        assert_eq!(reverse.get("shared").map(String::as_str), Some("tool_a"));
+    }
+
+    /// 碰撞防御（审查修复）：别名命中请求内其他真实工具名时该规则整条跳过——
+    /// tools/tool_choice/历史轮三处统一原名透传，零改写返回 None。否则上游收到
+    /// 重复工具名 + 响应侧逆映射误改真实工具调用（静默错工具执行）
+    #[test]
+    fn tool_alias_forward_real_name_collision_skips_rule() {
+        let rules = vec![("ask_user_question".to_string(), "ask_user".to_string())];
+        let body = json!({
+            "tools": [
+                {"function": {"name": "ask_user_question"}},
+                {"function": {"name": "ask_user"}}
+            ],
+            "tool_choice": "ask_user_question",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "t1", "type": "function",
+                     "function_call": {"name": "ask_user_question", "arguments": "{}"}}
+                ]}
+            ]
+        });
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        assert!(
+            apply_tool_alias_forward(&mut buf, &rules).is_none(),
+            "碰撞规则整条跳过：零改写返回 None"
+        );
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("ask_user_question"));
+        assert_eq!(v["tools"][1]["function"]["name"], json!("ask_user"));
+        assert_eq!(v["tool_choice"], json!("ask_user_question"));
+        assert_eq!(
+            v["messages"][0]["tool_calls"][0]["function_call"]["name"],
+            json!("ask_user_question")
+        );
+    }
+
+    /// tool_choice 仅跟随 tools 实际发生的改写：同别名冲突输家的 tool_choice
+    /// 保持原名（上游不会收到指向不存在/错误工具的 tool_choice）；赢家照改
+    #[test]
+    fn tool_choice_follows_actual_renames_only() {
+        let rules = vec![
+            ("tool_a".to_string(), "shared".to_string()),
+            ("tool_b".to_string(), "shared".to_string()),
+        ];
+        // 输家 tool_b 的 tool_choice 不改名
+        let body = json!({
+            "tools": [{"function": {"name": "tool_a"}}, {"function": {"name": "tool_b"}}],
+            "tool_choice": "tool_b"
+        });
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse = apply_tool_alias_forward(&mut buf, &rules).unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tool_choice"], json!("tool_b"), "输家不改写");
+        assert_eq!(reverse.get("shared").map(String::as_str), Some("tool_a"));
+        // 赢家 tool_a 的 tool_choice 照改
+        let body2 = json!({
+            "tools": [{"function": {"name": "tool_a"}}, {"function": {"name": "tool_b"}}],
+            "tool_choice": "tool_a"
+        });
+        let mut buf2 = serde_json::to_vec(&body2).unwrap();
+        apply_tool_alias_forward(&mut buf2, &rules).unwrap();
+        let v2: Value = serde_json::from_slice(&buf2).unwrap();
+        assert_eq!(v2["tool_choice"], json!("shared"));
+    }
+
+    /// 碰撞放行的链式改写：更早规则已把真实名改名让出（freed）时，后续规则的
+    /// 别名可复用该名——规则序 B→C、A→B 合法，响应侧逆映射双向无歧义
+    #[test]
+    fn tool_alias_forward_chain_free_allows_alias() {
+        let rules = vec![
+            ("b".to_string(), "c".to_string()),
+            ("a".to_string(), "b".to_string()),
+        ];
+        let body = json!({"tools": [{"function": {"name": "a"}}, {"function": {"name": "b"}}]});
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse = apply_tool_alias_forward(&mut buf, &rules).unwrap();
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("b"), "a→b（b 已让出）");
+        assert_eq!(v["tools"][1]["function"]["name"], json!("c"), "b→c");
+        assert_eq!(reverse.get("b").map(String::as_str), Some("a"));
+        assert_eq!(reverse.get("c").map(String::as_str), Some("b"));
+    }
+
+    /// 工具别名合并语义：默认表全量生效；自定义同名覆盖；to=None 停用（从
+    /// 生效表移除）；空串 to 经 into_rules 过滤后等价停用；新条目追加
+    #[test]
+    fn tool_alias_merged_rules_disable_and_override() {
+        let base = merged_tool_alias_rules(None);
+        assert!(base.iter().any(|(f, t)| f == "ask_user_question" && t == "ask_user"));
+        // 同名覆盖
+        let custom = vec![("ask_user_question".to_string(), Some("clarify".to_string()))];
+        let m1 = merged_tool_alias_rules(Some(custom));
+        assert!(m1.iter().any(|(f, t)| f == "ask_user_question" && t == "clarify"));
+        // to=None 停用：仅移除该条，其余默认规则不受影响
+        let custom2 = vec![("ask_user_question".to_string(), None)];
+        let m2 = merged_tool_alias_rules(Some(custom2));
+        assert!(!m2.iter().any(|(f, _)| f == "ask_user_question"));
+        assert!(m2.iter().any(|(f, _)| f == "create_goal"));
+        // 空串 to：into_rules 统一过滤为停用（工具名不可为空）
+        let file = ToolAliasFile {
+            rules: vec![TemplateRule {
+                from: "create_goal".to_string(),
+                to: Some(String::new()),
+            }],
+            updated_at: None,
+        };
+        let m3 = merged_tool_alias_rules(file.into_rules());
+        assert!(!m3.iter().any(|(f, _)| f == "create_goal"));
+        // 新条目追加
+        let custom4 = vec![("custom_tool".to_string(), Some("generic".to_string()))];
+        let m4 = merged_tool_alias_rules(Some(custom4));
+        assert!(m4.iter().any(|(f, t)| f == "custom_tool" && t == "generic"));
+        assert_eq!(m4.len(), default_tool_alias_rules().len() + 1);
     }
 }

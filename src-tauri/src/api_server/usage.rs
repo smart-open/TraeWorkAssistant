@@ -479,6 +479,19 @@ impl QoderSessionCtx {
     }
 }
 
+/// Custom 网关请求级会话上下文（issue #149 P2：custom_sessions 流水行）。
+/// request_id 由记账入口内部生成 uuid（custom 上游无信封可取，纯 INSERT 无幂等诉求）；
+/// session_id = conversation_key（前 2 条消息指纹，"cv|" 前缀，跨轮稳定）；
+/// stage = 请求阶段（main_first / main / tool / unknown）。
+pub struct CustomSessionCtx {
+    pub session_id: String,
+    pub stage: &'static str,
+    /// 请求所用 API Key 的 key_id（custom 桶用量 uid 固定 "custom"，流水行落真实 key_id）
+    pub uid: String,
+    pub key_name: String,
+    pub preview: String,
+}
+
 /// 从存储加载用量数据（缺失/损坏回退空结构），并裁剪过期日期。
 /// SQLite 化 P3：api_usage 表；P7 修订：记账改为当日单行 upsert 后，
 /// 存储侧保留期裁剪在启动 load 时一次性执行。
@@ -488,6 +501,8 @@ pub fn load(data_dir: &Path) -> UsageFile {
     let _ = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
     // issue #82 问题5：Qoder 会话流水与 api_usage 同口径保留期裁剪（启动一次）
     let _ = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+    // issue #149 P2：Custom 会话流水同口径保留期裁剪（启动一次）
+    let _ = crate::store::docs::custom_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
     f
 }
 

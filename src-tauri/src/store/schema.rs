@@ -266,6 +266,27 @@ const DDL: &[&str] = &[
         record_id   TEXT NOT NULL DEFAULT ''
     )",
     "CREATE INDEX IF NOT EXISTS idx_qoder_sessions_date ON qoder_sessions(date)",
+    // issue #149 P2：custom 网关请求级会话流水（自研用量低频，无 compact 定时合并，
+    // 仅 90 天保留期裁剪）。request_id 内部生成 uuid（custom 上游无信封可取，纯 INSERT）；
+    // session_id = conversation_key（"cv|" 前缀，前 2 条消息指纹，跨轮稳定）；
+    // stage = 请求阶段（main_first/main/tool/unknown）；uid 落 key_id，key_name = Key 展示名。
+    "CREATE TABLE IF NOT EXISTS custom_sessions (
+        request_id  TEXT PRIMARY KEY,
+        session_id  TEXT NOT NULL DEFAULT '',
+        uid         TEXT NOT NULL DEFAULT '',
+        date        TEXT NOT NULL,
+        ts          INTEGER NOT NULL DEFAULT 0,
+        model       TEXT NOT NULL DEFAULT '',
+        stage       TEXT NOT NULL DEFAULT '',
+        key_name    TEXT NOT NULL DEFAULT '',
+        pt          INTEGER NOT NULL DEFAULT 0,
+        ct          INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        stream      INTEGER NOT NULL DEFAULT 0,
+        ok          INTEGER NOT NULL DEFAULT 1,
+        preview     TEXT NOT NULL DEFAULT ''
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_custom_sessions_date ON custom_sessions(date)",
     // P6 流水迁出：会话粘性绑定（原 kv wb_sticky_sessions；过期项落库前清理）
     "CREATE TABLE IF NOT EXISTS sticky_bindings (
         key        TEXT PRIMARY KEY,

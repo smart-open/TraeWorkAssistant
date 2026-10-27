@@ -513,6 +513,13 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
     let Some(accounts) = pool.get("accounts").and_then(Value::as_array) else {
         return Err("账号池解析失败".to_string());
     };
+    // 无豆包账号时跳过（issue #147）：对齐审查 #15 的 `skipped_empty_pool` 豁免
+    // 口径——mark_run 会固化「当日已跑」、吞掉当日导入账号的补打窗口，故空池空轮
+    // 不 mark_run、仅静默空转（与 buddy-ai 打卡空轮同调；调度器与 CLI 双路径静默，
+    // 不落失败记录、不触发首败通知）
+    if accounts.is_empty() {
+        return Ok(json!({ "ok": true, "skipped_empty_pool": "无豆包账号" }));
+    }
 
     // 端点：settings.doubao_quota_url（state.settings() 已对空值回填默认）
     let url = state

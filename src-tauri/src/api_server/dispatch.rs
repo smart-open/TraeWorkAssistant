@@ -584,6 +584,14 @@ pub fn resolve_target(
         (model.to_string(), None, false)
     };
     let canonical = canonical_id(&trae_final.0);
+    // issue #145 渠道内单模型开关：L1 meta.enabled=false 的模型不再作为 Trae 源
+    // 参与调度（目录保留条目，管理端可重新启用）。其余源判定不受影响——多源模型
+    // 仍可由 Buddy/Qoder/custom 服务；唯一源被禁则选池循环耗尽 → NoHealthy
+    //（免费账号请求付费受限模型的场景由该开关根治，配合 PaidRestricted 不误冷却）
+    let trae_model_disabled = super::unified_catalog::load_meta(&state.data_dir)
+        .get(&canonical)
+        .and_then(|l| l.enabled)
+        .map_or(false, |e| !e);
     // v3 第四源：custom 上游组（P1 find_enabled_all，仅 enabled；提前求值供
     // Trae 透传判定与 sources 填充共用，保证两处口径同源）
     let custom_group = super::custom_models::find_enabled_all(&state.data_dir, model);
@@ -593,8 +601,9 @@ pub fn resolve_target(
     // custom 模型（无同名 trae/buddy/qoder 源）为唯一源直达（见下方 v3 注释），
     // 否则 Priority 策略下 Trae 排在 custom 之前，自建中转模型会被截胡打到
     // Trae 上游报「模型不存在」；Smart 下仅靠「Trae 未声明倍率后置」侥幸正确
-    let trae_hit = (buddy_hit.0.is_none() && qoder_hit.is_none() && custom_group.is_empty())
-        || trae_list.iter().any(|m| canonical_id(&m.id) == canonical);
+    let trae_hit = !trae_model_disabled
+        && ((buddy_hit.0.is_none() && qoder_hit.is_none() && custom_group.is_empty())
+            || trae_list.iter().any(|m| canonical_id(&m.id) == canonical));
     let sources = ModelSources {
         buddy: buddy_hit.0,
         // issue #19：BuddyAi 域降级候选随源携带（按目标池取域）

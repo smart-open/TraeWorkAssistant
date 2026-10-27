@@ -126,6 +126,78 @@ fn template_map_set_at(
     crate::store::db(data_dir).kv_set(key, map)
 }
 
+// ==================== 工具别名表（issue #150：kv `tool_alias_map`，单键不分档） ====================
+//
+// Trae 池 tools 工具集指纹识别的治本配置：请求侧把特征工具名改写为通用别名、
+// 响应侧按逆映射回改（wb_payload::apply_tool_alias_forward / sse.rs 回改点）。
+// 别名表必须请求/响应双向一致，故单键不分档、不支持 `|` 多候选（模板表的
+// variant_seed 多候选语义在此结构性不适用）。
+
+#[tauri::command]
+pub fn wb_tool_alias_map_get(state: State<AppState>) -> Result<Value, String> {
+    tool_alias_map_get_at(&state.data_dir)
+}
+
+#[tauri::command]
+pub fn wb_tool_alias_map_set(state: State<AppState>, map: Value) -> Result<(), String> {
+    tool_alias_map_set_at(&state.data_dir, &map)
+}
+
+fn tool_alias_map_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
+    // 无自定义（KV 缺失或 rules 空 = load_tool_alias_rules 走纯默认）时回显
+    // 内置默认表并标记 builtin:true——前端「工具别名」tab 以此展示生效中规则；
+    // 保存后成为自定义覆盖表（合并语义：默认表全量生效，自定义按 from 覆盖/
+    // 追加，to null = 停用该规则原名透传；与 merged_tool_alias_rules 口径一致）
+    let file: crate::api_server::wb_payload::ToolAliasFile =
+        crate::store::db(data_dir).kv_get("tool_alias_map");
+    if file.rules.is_empty() {
+        let rules: Vec<serde_json::Value> =
+            crate::api_server::wb_payload::default_tool_alias_rules()
+                .into_iter()
+                .map(|(from, to)| serde_json::json!({"from": from, "to": to}))
+                .collect();
+        return Ok(serde_json::json!({ "rules": rules, "updated_at": null, "builtin": true }));
+    }
+    let mut v = serde_json::to_value(&file).map_err(|e| format!("序列化工具别名表失败: {e}"))?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("builtin".into(), serde_json::Value::Bool(false));
+    }
+    Ok(v)
+}
+
+/// 结构校验：对齐 wb_route::load_tool_alias_rules 的读取形状（ToolAliasFile）——
+/// rules 为 [{from,to?}] 数组（from 必填字符串；to 为 null/缺省=停用），updated_at
+/// 可空。语义收紧两处：from 非空且唯一（重复项在合并语义中靠后覆盖，UI 编辑态
+/// 不应产生，落库层兜底拒绝）；to 拒绝空串（工具名不可为空，读取侧虽将空串统一
+/// 解释为停用，落库层直接拒绝以免用户误存「改名成空」的残规则）
+fn tool_alias_map_set_at(data_dir: &std::path::Path, map: &Value) -> Result<(), String> {
+    if !map.is_object() {
+        return Err("工具别名表必须是 JSON 对象（含 rules 数组）".into());
+    }
+    let file: crate::api_server::wb_payload::ToolAliasFile =
+        serde_json::from_value(map.clone()).map_err(|e| {
+            format!("工具别名表格式不正确（rules[].from 必填，to 可为字符串/null）: {e}")
+        })?;
+    let mut seen = std::collections::HashSet::new();
+    for r in &file.rules {
+        if r.from.is_empty() {
+            return Err("工具别名规则 from 不能为空".into());
+        }
+        if !seen.insert(r.from.clone()) {
+            return Err(format!("工具别名规则 from 重复: {}", r.from));
+        }
+        if let Some(to) = &r.to {
+            if to.is_empty() {
+                return Err(format!(
+                    "工具别名规则 to 不能为空串（停用请传 null）: {}",
+                    r.from
+                ));
+            }
+        }
+    }
+    crate::store::db(data_dir).kv_set("tool_alias_map", map)
+}
+
 // ==================== 指纹样本（issue #125 增强：一键从样本生成规则） ====================
 
 /// 读取网关命中（11128 拦截 / 空完成影子风控）落下的指纹样本。
@@ -278,6 +350,66 @@ mod tests {
         // 未知档位拒绝（get/set 均报错，不得落库）
         assert!(template_map_set_at(&dir, Some("qoder"), &json!({})).is_err());
         assert!(template_map_get_at(&dir, Some("qoder")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 工具别名表校验拒绝畸形结构（缺 from / 空 from / 重复 from / to 空串 /
+    /// 非对象根）；拒绝后不得落库。to null = 停用（合法落库）
+    #[test]
+    fn tool_alias_map_validation_rejects_malformed() {
+        let dir = tmp_dir("alias_invalid");
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"to": "b"}]})).is_err());
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "", "to": "b"}]})).is_err());
+        assert!(tool_alias_map_set_at(
+            &dir,
+            &json!({"rules": [{"from": "a", "to": "b"}, {"from": "a", "to": "c"}]})
+        )
+        .is_err());
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "a", "to": ""}]})).is_err());
+        assert!(tool_alias_map_set_at(&dir, &json!([1, 2])).is_err());
+        // 拒绝后不得落库
+        assert!(crate::store::db(&dir).kv_get_raw("tool_alias_map").is_none());
+        // to 缺省/null = 停用规则（合法）
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "a", "to": null}]})).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 工具别名表写后可读回（get/set 走同一读取语义）
+    #[test]
+    fn tool_alias_map_set_then_get_roundtrip() {
+        let dir = tmp_dir("alias_roundtrip");
+        let map = json!({"rules": [{"from": "ask_user_question", "to": "ask_user"}], "updated_at": 123});
+        tool_alias_map_set_at(&dir, &map).unwrap();
+        assert!(crate::store::db(&dir).kv_get_raw("tool_alias_map").is_some());
+        let got = tool_alias_map_get_at(&dir).unwrap();
+        assert_eq!(got["rules"][0]["from"], json!("ask_user_question"));
+        assert_eq!(got["rules"][0]["to"], json!("ask_user"));
+        assert_eq!(got["updated_at"], json!(123));
+        assert_eq!(got["builtin"], json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无自定义（空 KV）时回显内置默认表 + builtin 标志；保存空 rules =
+    /// 恢复默认（合并语义走纯内置表）；to null 停用规则原样回读
+    #[test]
+    fn tool_alias_map_get_falls_back_to_builtin_defaults() {
+        let dir = tmp_dir("alias_builtin");
+        let got = tool_alias_map_get_at(&dir).unwrap();
+        assert_eq!(got["builtin"], json!(true));
+        let n = got["rules"].as_array().expect("默认规则数组").len();
+        assert_eq!(n, crate::api_server::wb_payload::default_tool_alias_rules().len());
+        // 自定义后 builtin 翻转 false；保存空数组 = 恢复默认
+        tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "x", "to": "y"}]})).unwrap();
+        assert_eq!(tool_alias_map_get_at(&dir).unwrap()["builtin"], json!(false));
+        tool_alias_map_set_at(&dir, &json!({"rules": [], "updated_at": 1})).unwrap();
+        let got2 = tool_alias_map_get_at(&dir).unwrap();
+        assert_eq!(got2["builtin"], json!(true));
+        assert_eq!(got2["rules"].as_array().unwrap().len(), n);
+        // to null 停用：自定义态原样回读 null
+        tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "a", "to": null}]})).unwrap();
+        let got3 = tool_alias_map_get_at(&dir).unwrap();
+        assert_eq!(got3["builtin"], json!(false));
+        assert_eq!(got3["rules"][0]["to"], serde_json::Value::Null);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

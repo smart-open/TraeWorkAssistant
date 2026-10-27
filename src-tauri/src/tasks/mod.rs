@@ -66,6 +66,30 @@ pub(crate) fn qoder_sessions_compact_days(state: &AppState) -> i64 {
         .clamp(1, 90)
 }
 
+/// 豆包保活前置检查（issue #147）：返回 Some(跳过原因) 时不应拉起客户端。
+/// ① 账号池为空 → 无可续期的豆包会话；② 六级发现找不到豆包客户端
+///（Windows Doubao.exe / macOS Doubao.app）→ 启动注定失败（避免每日失败日志与当日首败通知）
+pub fn doubao_keepalive_skip_reason(state: &AppState) -> Option<String> {
+    if crate::commands::doubao::load_pool(state).accounts.is_empty() {
+        return Some("无豆包账号".into());
+    }
+    let args = crate::switcher::RunArgs {
+        action: crate::switcher::Action::KeepAlive,
+        target_app: crate::switcher::TargetApp::Doubao,
+        user_id: None,
+        proxy_port: None,
+        include_indexeddb: false,
+        expected_current_uid: String::new(),
+        machine_id_override: None,
+        data_dir: state.data_dir.clone(),
+    };
+    let mut sess = crate::switcher::Session::new(&args);
+    if crate::switcher::locate::find_exe(&mut sess).is_none() {
+        return Some("未找到豆包客户端".into());
+    }
+    None
+}
+
 /// CLI 任务分发：执行后返回进程退出码。
 /// stdout 末行 JSON（对齐原 python 脚本输出约定，便于排查与双轨对照）；
 /// 成功输出任务结果，失败输出 {"ok":false,"error":...}。
@@ -218,21 +242,27 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // 豆包会话保活（schtasks 直调主 exe；原 PS 桥 KeepAlive 已 Rust 化）：
         // 进度 NDJSON 打印到 stdout（任务日志可查），终态 {"ok":bool}
         "doubao-keepalive" => {
-            let sink = crate::switcher::CliSink::new(&state.data_dir);
-            crate::switcher::run_action(
-                crate::switcher::RunArgs {
-                    action: crate::switcher::Action::KeepAlive,
-                    target_app: crate::switcher::TargetApp::Doubao,
-                    user_id: None,
-                    proxy_port: None,
-                    include_indexeddb: false,
-                    expected_current_uid: String::new(),
-                    machine_id_override: None,
-                    data_dir: state.data_dir.clone(),
-                },
-                &sink,
-            )
-            .map(|_| serde_json::json!({ "ok": true }))
+            // 前置检查（issue #147）：无账号/客户端缺失时静默跳过，不拉起客户端；
+            // 键名与调度器分支同口径（skipped_empty_pool，3.8.5 审查 M-D 对齐 #15）
+            if let Some(reason) = doubao_keepalive_skip_reason(state) {
+                Ok(serde_json::json!({ "ok": true, "skipped_empty_pool": reason }))
+            } else {
+                let sink = crate::switcher::CliSink::new(&state.data_dir);
+                crate::switcher::run_action(
+                    crate::switcher::RunArgs {
+                        action: crate::switcher::Action::KeepAlive,
+                        target_app: crate::switcher::TargetApp::Doubao,
+                        user_id: None,
+                        proxy_port: None,
+                        include_indexeddb: false,
+                        expected_current_uid: String::new(),
+                        machine_id_override: None,
+                        data_dir: state.data_dir.clone(),
+                    },
+                    &sink,
+                )
+                .map(|_| serde_json::json!({ "ok": true }))
+            }
         }
         // 刷新全部账号剩余积分：按积分包 CycleStartTime 归日口径重算 credits_daily
         // 快照（今日 earned + API 可见历史修正），无需启动 GUI。

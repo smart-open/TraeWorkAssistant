@@ -56,14 +56,21 @@ const ROOT_ITEMS: [&str; 11] = [
     "Cookies-journal",
 ];
 
-/// 登录会话 Cookies 路径（平台分派：Windows 在 Network/ 内，mac 直挂数据根）
+/// 登录会话 Cookies 路径（平台分派：Windows 在 Network/ 内，mac 直挂数据根）。
+/// pub(crate)：switch_flow 的 QoderWork 软校验（mod.rs）必须复用本分派——
+/// 3.8.5 审查修复（M-C1）：硬编码 Network/Cookies 在 mac 恒缺失，导致 macOS
+/// 每次切换 QoderWork 都误报「快照不含 Cookies」。
 #[cfg(windows)]
-fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
     base.join("Network").join("Cookies")
 }
 #[cfg(target_os = "macos")]
-fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
     base.join("Cookies")
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) fn cookies_path(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("Network").join("Cookies")
 }
 
 /// mac 恢复对称清理域：根级 Cookies 与 auth 三件套同语义（快照缺失而数据目录
@@ -76,17 +83,105 @@ const ROOT_COOKIES_FILES: [&str; 2] = ["Cookies", "Cookies-journal"];
 /// 防旧版快照恢复后残留上一账号凭据——Work 启动读 auth.v1.dat 优先于 Cookies）
 const AUTH_FILES: [&str; 3] = ["auth.v1.dat", "auth.machine-id", "auth-profile-overlays.v1.dat"];
 
-fn write_meta(slot_dir: &std::path::Path) -> Result<(), String> {
+fn write_meta(slot_dir: &std::path::Path, detected_uid: Option<&str>) -> Result<(), String> {
     let meta = json!({
         "schemaVersion": 1,
         "layout": "electron-root",
         "created_at": crate::fs_utils::now_iso(),
+        "savedAtMs": chrono::Utc::now().timestamp_millis(),
+        // 3.8.5 审查修复（M-C3）：记录保存时探测到的客户端身份（对齐 icube sidecar
+        // 的 detectedUid），restore 前据此校验可发现「误把 A 存进 B 槽」的历史污染
+        "detectedUid": detected_uid,
     });
     std::fs::write(
         slot_dir.join("snapshot_meta.json"),
         serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
+}
+
+/// 读取 electron-root 槽位 snapshot_meta.json 的（保存时间 ms, 最近一次切换验证失败 ms）。
+/// 旧快照只有 created_at（RFC3339）→ 解析回填；缺失/损坏返回 (None, None)。
+pub(crate) fn read_snapshot_meta(
+    profiles_dir: &std::path::Path,
+    slot: &str,
+) -> (Option<i64>, Option<i64>) {
+    let path = profiles_dir.join(slot).join("snapshot_meta.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return (None, None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (None, None);
+    };
+    let saved_ms = v
+        .get("savedAtMs")
+        .and_then(|x| x.as_i64())
+        .or_else(|| {
+            v.get("created_at")
+                .and_then(|x| x.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.timestamp_millis())
+        });
+    (
+        saved_ms,
+        v.get("verifyFailedAtMs").and_then(|x| x.as_i64()),
+    )
+}
+
+/// 标记 QoderWork 切换未确认登录；槽位快照存在才写，缺失静默跳过。
+/// 3.8.5 审查修复（M-C2）：主槽 meta 缺失（如 rotate_bak 后主槽已不存在、切换
+/// 实际经 .bak 回退槽恢复）时回退写 `{slot}.bak`——读取侧（qoder accounts 视图）
+/// 一直有 .bak 回退，写入侧此前不对称，导致该场景失败徽标永不点亮。
+pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
+    // 主槽优先；主槽无 meta 时尝试 .bak 回退槽（两代轮转内的上一份快照）
+    let candidates = [
+        profiles_dir.join(slot).join("snapshot_meta.json"),
+        profiles_dir
+            .join(format!("{slot}.bak"))
+            .join("snapshot_meta.json"),
+    ];
+    for path in candidates {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            continue;
+        };
+        obj.insert(
+            "verifyFailedAtMs".into(),
+            serde_json::json!(chrono::Utc::now().timestamp_millis()),
+        );
+        let _ = std::fs::write(&path, v.to_string());
+        return;
+    }
+}
+
+/// 清除 QoderWork 切换验证失败标记。主槽与 .bak 回退槽都清（哪份快照被恢复过
+/// 就清哪份，双写幂等），对齐 mark 的回退链。
+pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
+    let candidates = [
+        profiles_dir.join(slot).join("snapshot_meta.json"),
+        profiles_dir
+            .join(format!("{slot}.bak"))
+            .join("snapshot_meta.json"),
+    ];
+    for path in candidates {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            continue;
+        };
+        if obj.remove("verifyFailedAtMs").is_some() {
+            let _ = std::fs::write(&path, v.to_string());
+        }
+    }
 }
 
 /// 备份（根级白名单整项拷贝；Local State 与 Cookies 均缺失视为应用从未登录/启动）。
@@ -129,7 +224,7 @@ pub fn backup_electron_root(sess: &Session, slot: &str, sink: &dyn ProgressSink)
             sess.prof.app_name
         ));
     }
-    write_meta(&dest)?;
+    write_meta(&dest, sess.detected_live_uid.as_deref())?;
     sink.step(
         "backup",
         StepStatus::Ok,
@@ -177,6 +272,43 @@ fn test_snapshot_integrity(src: &std::path::Path, app: &str, sink: &dyn Progress
     Ok(())
 }
 
+/// restore 前的身份校验（3.8.5 审查修复 M-C3，对齐 icube 的
+/// warn_if_slot_identity_mismatch）：快照 meta 记录的保存时身份与槽位账号不符
+/// （历史污染事故：误把 A 的登录态存进 B 槽）时提前 Warn。仅主槽校验（.bak 是
+/// 覆盖前的旧代，代际不对应无法比对）；mismatch 只 Warn 不阻断——拦死会封死
+/// 「切回该账号重新登录自救」的路；旧快照无 detectedUid 时静默放行。
+fn warn_if_snapshot_identity_mismatch(
+    sess: &Session,
+    src: &std::path::Path,
+    slot: &str,
+    sink: &dyn ProgressSink,
+) {
+    if src.file_name() != Some(std::ffi::OsStr::new(slot)) {
+        return; // 回退自 .bak：不做代际比对
+    }
+    let Ok(text) = std::fs::read_to_string(
+        sess.prof.profiles_dir.join(slot).join("snapshot_meta.json"),
+    ) else {
+        return; // 旧快照无 meta：静默放行
+    };
+    let Some(saved) = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("detectedUid").and_then(|x| x.as_str()).map(String::from))
+    else {
+        return;
+    };
+    if !saved.is_empty() && saved != slot {
+        sink.step(
+            "restore",
+            StepStatus::Warn,
+            &format!(
+                "快照 {slot} 保存时检测到的客户端身份是账号 {saved}，与槽位账号不符，\
+                 该快照可能已被其他账号的数据污染；建议恢复后重新登录并再次「保存当前登录态」覆盖修复"
+            ),
+        );
+    }
+}
+
 /// 恢复（对称回写白名单项；Local State 必随 Cookies 一起回写，否则 cookie 无法解密）。
 /// 恢复项计数写入 sess.last_restored_count（switch_flow 恢复后校验用，对齐 icube）
 pub fn restore_electron_root(
@@ -185,6 +317,7 @@ pub fn restore_electron_root(
     sink: &dyn ProgressSink,
 ) -> Result<(), String> {
     let (src, _slot_label) = resolve_slot(sess, slot, sink)?;
+    warn_if_snapshot_identity_mismatch(sess, &src, slot, sink);
     test_snapshot_integrity(&src, sess.prof.app_name, sink)?;
     let dest = sess.prof.data_dir.clone();
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;

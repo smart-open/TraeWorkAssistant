@@ -1751,6 +1751,51 @@ pub fn qoder_sessions_prune(s: &Store, keep_days: i64) -> Result<usize, String> 
     s.with_conn(|c| Ok(c.execute("DELETE FROM qoder_sessions WHERE date < ?1", [cutoff.as_str()])?))
 }
 
+// ── Custom 网关会话流水（issue #149 P2：custom_sessions 表）──────────────────
+
+/// 单请求会话行插入（request_id 由调用方内部生成 uuid，无冲突可能，纯 INSERT）。
+/// 记账热路径直写，失败由调用方静默（与 qoder_session_insert 同策略）；
+/// 每次 attempt 各记一行（成功/失败如实落账）。
+#[allow(clippy::too_many_arguments)]
+pub fn custom_session_insert(
+    s: &Store,
+    request_id: &str,
+    session_id: &str,
+    uid: &str,
+    date: &str,
+    ts: i64,
+    model: &str,
+    stage: &str,
+    key_name: &str,
+    pt: i64,
+    ct: i64,
+    duration_ms: i64,
+    stream: bool,
+    ok: bool,
+    preview: &str,
+) -> Result<(), String> {
+    s.with_conn(|c| {
+        c.execute(
+            "INSERT INTO custom_sessions
+             (request_id, session_id, uid, date, ts, model, stage, key_name, pt, ct, duration_ms, stream, ok, preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                request_id, session_id, uid, date, ts, model, stage, key_name, pt, ct,
+                duration_ms, stream as i64, ok as i64, preview
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// custom_sessions 保留期裁剪（与 qoder_sessions 同口径 90 天；低频附带执行）
+pub fn custom_sessions_prune(s: &Store, keep_days: i64) -> Result<usize, String> {
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(keep_days))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| Ok(c.execute("DELETE FROM custom_sessions WHERE date < ?1", [cutoff.as_str()])?))
+}
+
 /// 合并保留窗默认值（天）：早于 N 天的请求级流水参与合并（date < today-N），
 /// 近 N 天保留请求级明细供排查；实际窗口经 settings.qoder_sessions_compact_days
 /// 可配（环境配置页，非法/越界回退本值并 clamp 1..=90）

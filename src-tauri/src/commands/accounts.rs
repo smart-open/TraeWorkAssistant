@@ -2122,6 +2122,7 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
         if let Some(exp) = crate::fs_utils::dig(
             &body,
             &[
+                "RefreshExpireAt",
                 "refresh_token_expires_at",
                 "refresh_expires_at",
                 "refreshTokenExpiresAt",
@@ -2347,6 +2348,12 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
     }
 
     let now_ts = chrono::Local::now().timestamp();
+    // 客户端快照 sidecar（profiles_trae/<uid>.meta.json）：保存时间 + 最近一次切换验证失败
+    let profiles_dir = crate::switcher::profile::profile_for(
+        crate::switcher::TargetApp::Trae,
+        &state.data_dir,
+    )
+    .profiles_dir;
     let tag_map = crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
     let mut out = Vec::new();
     for a in &accounts.accounts {
@@ -2423,6 +2430,9 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
                 .as_deref()
                 .map(|j| !j.is_empty() && j != raw_user_id)
                 .unwrap_or(false);
+        // 客户端快照健康度：无 sidecar = 无快照；verifyFailedAtMs = 上次切换未确认登录
+        let (snapshot_saved_at_ms, snapshot_verify_failed_at_ms) =
+            crate::switcher::icube::read_snapshot_sidecar(&profiles_dir, &uid);
         out.push(AccountView {
             user_id: uid.clone(),
             name: a.name.clone(),
@@ -2458,6 +2468,8 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             refresh_token_fails: a.refresh_token_fails,
             refresh_token_invalid: a.refresh_token_invalid,
             auth_saved_at: a.auth_saved_at.clone(),
+            snapshot_saved_at_ms,
+            snapshot_verify_failed_at_ms,
             jwt_uid_mismatch,
             jwt_uid,
             // 共享标签（account_tags 表联表填充，不落账号持久化结构，D3）
