@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { FolderSearch, Save, Clock3, MapPin, ShieldCheck, RefreshCw, Timer, Coins, Database } from 'lucide-react';
+import { FolderSearch, Save, Clock3, MapPin, ShieldCheck, RefreshCw, Timer, Coins, Database, CalendarCheck } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -38,6 +38,13 @@ export default function DoubaoSettings() {
   // ── 应用内调度开关（issue #147，默认开）──
   const [keepaliveEnabled, setKeepaliveEnabled] = useState(true);
   const [quotaEnabled, setQuotaEnabled] = useState(true);
+
+  // ── 每日签到任务 ──
+  const [checkinTaskTime, setCheckinTaskTime] = useState('09:15');
+  const [checkinTaskState, setCheckinTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
+  const [checkinTaskTimeShown, setCheckinTaskTimeShown] = useState('');
+  const [checkinRunning, setCheckinRunning] = useState(false);
+  const [checkinEnabled, setCheckinEnabled] = useState(true);
 
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
@@ -85,6 +92,21 @@ export default function DoubaoSettings() {
     }
   };
 
+  // 应用内调度器 doubao-checkin 开关（默认开）
+  const toggleCheckinEnabled = async (v: boolean) => {
+    setCheckinEnabled(v);
+    try {
+      await saveSettings({ doubao_checkin_enabled: v });
+      pushToast(
+        'success',
+        v ? '已开启：应用内调度恢复每日自动签到' : '已关闭：应用内调度不再执行每日自动签到（不影响已注册的 Windows 计划任务）',
+      );
+    } catch (err) {
+      setCheckinEnabled(!v);
+      pushToast('error', `保存设置失败：${String(err)}`);
+    }
+  };
+
   const refreshTaskStatus = async () => {
     try {
       const s = await api.doubao.taskStatus();
@@ -113,6 +135,20 @@ export default function DoubaoSettings() {
     }
   };
 
+  const refreshCheckinTaskStatus = async () => {
+    try {
+      const s = await api.doubao.checkinTaskStatus();
+      if (s.startsWith('registered:')) {
+        setCheckinTaskState('registered');
+        setCheckinTaskTimeShown(s.slice('registered:'.length));
+      } else {
+        setCheckinTaskState('not_registered');
+      }
+    } catch {
+      setCheckinTaskState('not_registered');
+    }
+  };
+
   useEffect(() => {
     if (settings?.doubao_path) setPath(settings.doubao_path);
     if (settings?.doubao_renew_url) setRenewUrl(settings.doubao_renew_url);
@@ -122,11 +158,13 @@ export default function DoubaoSettings() {
       // !== false：旧版后端缺字段时按默认开展示（issue #147 新字段向后兼容）
       setKeepaliveEnabled(settings.doubao_keepalive_enabled !== false);
       setQuotaEnabled(settings.doubao_quota_enabled !== false);
+      setCheckinEnabled(settings.doubao_checkin_enabled !== false);
     }
     void refreshTaskStatus();
     void refreshQuotaTaskStatus();
+    void refreshCheckinTaskStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled]);
 
   const detect = async () => {
     setDetecting(true);
@@ -234,6 +272,57 @@ export default function DoubaoSettings() {
       pushToast('info', '额度巡检任务已注销');
     } catch (err) {
       pushToast('error', `注销失败：${String(err)}`);
+    }
+  };
+
+  const registerCheckinTask = async () => {
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(checkinTaskTime)) {
+      pushToast('warn', '时间格式应为 HH:MM');
+      return;
+    }
+    try {
+      await api.doubao.checkinTaskRegister(checkinTaskTime);
+      await refreshCheckinTaskStatus();
+      pushToast('success', `每日签到任务已注册（每日 ${checkinTaskTime}）`);
+    } catch (err) {
+      pushToast('error', `注册失败：${String(err)}`);
+    }
+  };
+
+  const unregisterCheckinTask = async () => {
+    try {
+      await api.doubao.checkinTaskUnregister();
+      await refreshCheckinTaskStatus();
+      pushToast('info', '每日签到任务已注销');
+    } catch (err) {
+      pushToast('error', `注销失败：${String(err)}`);
+    }
+  };
+
+  const runCheckinNow = async () => {
+    setCheckinRunning(true);
+    try {
+      // 返回契约：batch → { ok, total, success, already, failed, reward_total, errors, finished_at }
+      const r = (await api.doubao.checkinRun()) as {
+        skipped?: string;
+        total?: number;
+        success?: number;
+        already?: number;
+        failed?: number;
+        reward_total?: number;
+      };
+      if (r.skipped) {
+        pushToast('info', `签到跳过：${r.skipped}`);
+      } else {
+        pushToast(
+          'success',
+          `签到完成：共 ${r.total ?? 0} 个账号，成功 ${r.success ?? 0} · 已签 ${r.already ?? 0} · 失败 ${r.failed ?? 0}，新增额度 +${r.reward_total ?? 0}`,
+        );
+      }
+    } catch (err) {
+      pushToast('error', `签到失败：${String(err)}`);
+    } finally {
+      setCheckinRunning(false);
     }
   };
 
@@ -515,6 +604,71 @@ export default function DoubaoSettings() {
             注册后每日定时批量查询池内全部有凭证账号的会员额度：自动回写缓存与历史（概述页趋势图/健康度卡的数据源），
             额度用完的账号会在应用内提醒。
           </p>
+        </div>
+      </div>
+
+      {/* 每日签到 */}
+      <div className="mt-4 card p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <CalendarCheck size={16} className="text-rose-500" />
+          <span className="text-sm font-medium">每日签到</span>
+        </div>
+
+        <div className="space-y-3 text-xs text-slate-500">
+          <p>
+            签到端点已按抓包固化（<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">/alice/ug/campaign/landing/checkin</code>）。
+            注册后每日定时对池内全部账号签到领额度，结果按日落库（概述页签到结果与额度看板的数据源）；
+            当日已签的账号自动跳过（幂等）；未签成功的账号次日自动补签，同日也可在账号页再次手动签到，多次结果按最终状态合并。
+          </p>
+
+          {/* 每日签到任务 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="shrink-0 text-slate-500">每日任务</span>
+            <input
+              value={checkinTaskTime}
+              onChange={(e) => setCheckinTaskTime(e.target.value)}
+              placeholder="HH:MM"
+              className="input w-24 text-xs"
+            />
+            <button onClick={() => void registerCheckinTask()} className="btn-outline shrink-0">
+              <Timer size={14} /> 注册
+            </button>
+            {checkinTaskState === 'registered' && (
+              <>
+                <Badge tone="green">已注册 {checkinTaskTimeShown}</Badge>
+                <button onClick={() => void unregisterCheckinTask()} className="btn-ghost text-rose-500">
+                  注销
+                </button>
+              </>
+            )}
+            {checkinTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+          </div>
+
+          {/* 应用内每日签到调度开关 */}
+          <label className="flex cursor-pointer items-start gap-2.5">
+            <input
+              type="checkbox"
+              checked={checkinEnabled}
+              onChange={(e) => void toggleCheckinEnabled(e.target.checked)}
+              className="mt-0.5 h-4 w-4 shrink-0 accent-rose-500"
+            />
+            <span>
+              <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日签到调度（每日 09:15）</span>
+              <span className="mt-0.5 block leading-relaxed">
+                关闭后应用内调度器不再执行每日自动签到；与上方「每日任务」（Windows 计划任务）相互独立。
+                无豆包账号时自动跳过，不记失败、不推送通知。
+              </span>
+            </span>
+          </label>
+
+          {/* 手动签到 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="shrink-0 text-slate-500">手动签到</span>
+            <button onClick={() => void runCheckinNow()} disabled={checkinRunning} className="btn-outline shrink-0">
+              <CalendarCheck size={14} /> {checkinRunning ? '签到中…' : '立即签到全部'}
+            </button>
+            <span className="text-slate-400">单账号签到见「账号管理」各行签到按钮</span>
+          </div>
         </div>
       </div>
     </div>

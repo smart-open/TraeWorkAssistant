@@ -199,6 +199,13 @@ pub struct Settings {
     /// 豆包会员额度每日巡检调度开关（issue #147，默认开）：调度器 doubao-quota 可关闭
     #[serde(default = "default_true")]
     pub doubao_quota_enabled: bool,
+    /// 豆包每日签到调度开关（默认开）：调度器 doubao-checkin 可关闭；
+    /// detail 查询未签账号 → landing/checkin 提交 → 按日落库 + 池回写
+    #[serde(default = "default_true")]
+    pub doubao_checkin_enabled: bool,
+    /// 豆包每日签到调度触发时刻 HH:MM（默认 09:15，错峰 quota 09:30；环境配置页可改）
+    #[serde(default = "default_doubao_checkin_hhmm")]
+    pub doubao_checkin_hhmm: String,
     /// Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；
     /// Windows 计划任务注册时间复用该值）
     #[serde(default = "default_trae_checkin_hhmm")]
@@ -483,6 +490,10 @@ fn default_wb_growth_hhmm() -> String {
 }
 fn default_wb_checkin_hhmm() -> String {
     "09:10".into()
+}
+/// 豆包每日签到调度默认 09:15（错峰额度巡检 09:30）
+fn default_doubao_checkin_hhmm() -> String {
+    "09:15".into()
 }
 /// buddy-ai 打卡调度默认 09:20（§4.5 补篇：对齐外部项目 scheduler 口径）
 fn default_buddy_ai_checkin_hhmm() -> String {

@@ -27,6 +27,7 @@ import type {
   DiscoveredAccount,
   DoubaoAccountView,
   DoubaoCapturedCredential,
+  DoubaoDashboardStats,
   DoubaoChatdataInfo,
   DoubaoChatdataResult,
   DoubaoExportResult,
@@ -430,6 +431,15 @@ export const api = {
     taskUnregister: () => invoke('doubao_renew_task_unregister'),
     // ---- 会员额度 ----
     fetchQuota: (userId: string) => invoke<DoubaoQuotaResult>('doubao_quota_fetch', { userId }),
+    // ---- 每日签到（landing/checkin；结果按日落库） ----
+    /** 手动签到：userId 缺省 = 全池批量（空池返回 skipped） */
+    checkinRun: (userId?: string) => invoke<Record<string, unknown>>('doubao_checkin_run', { userId: userId ?? null }),
+    /** 额度看板统计（池聚合 + 今日签到 + 近 30 天趋势） */
+    dashboardStats: () => invoke<DoubaoDashboardStats>('doubao_dashboard_stats'),
+    // ---- 每日签到定时任务（schtasks AIWorkAssistant_DoubaoCheckin） ----
+    checkinTaskRegister: (time: string) => invoke('doubao_checkin_task_register', { time }),
+    checkinTaskStatus: () => invoke<string>('doubao_checkin_task_status'),
+    checkinTaskUnregister: () => invoke('doubao_checkin_task_unregister'),
     // 按需取完整会话凭证（列表接口只回掩码值；编辑弹框回填场景调用）
     getCredential: (userId: string) =>
       invoke<{ session_id: string | null; sid_guard: string | null; ttwid: string | null }>(

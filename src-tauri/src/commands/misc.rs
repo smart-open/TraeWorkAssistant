@@ -1006,6 +1006,8 @@ pub const LEGACY_TASK_NAME: &str = "TraeWorkAssistant_DailyCheckin";
 pub const DOUBAO_TASK_NAME: &str = "AIWorkAssistant_DoubaoRenew";
 /// 豆包额度巡检每日计划任务名（批量查额度 + 回写缓存/历史 + 用完记录）
 pub const DOUBAO_QUOTA_TASK_NAME: &str = "AIWorkAssistant_DoubaoQuotaCheck";
+/// 豆包每日签到计划任务名（detail 查未签 → landing/checkin 提交 → 按日落库）
+pub const DOUBAO_CHECKIN_TASK_NAME: &str = "AIWorkAssistant_DoubaoCheckin";
 
 // 运行 schtasks 并正确解码输出。
 // 关键：默认控制台代码页是 GBK（中文 Windows），schtasks 的中文报错(如"系统找不到指定的文件")
@@ -1352,6 +1354,7 @@ fn task_cli_arg(name: &str) -> Option<&'static str> {
         TASK_NAME => Some("checkin"),
         DOUBAO_TASK_NAME => Some("doubao-keepalive"),
         DOUBAO_QUOTA_TASK_NAME => Some("doubao-quota"),
+        DOUBAO_CHECKIN_TASK_NAME => Some("doubao-checkin"),
         crate::commands::workbuddy::checkin::WB_RENEW_TASK_NAME => Some("wb-renew"),
         n if n.starts_with(crate::commands::workbuddy::checkin::WB_CHECKIN_TASK_PREFIX) => {
             Some("wb-checkin")
@@ -1386,6 +1389,7 @@ pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<Strin
             n == TASK_NAME
                 || n == DOUBAO_TASK_NAME
                 || n == DOUBAO_QUOTA_TASK_NAME
+                || n == DOUBAO_CHECKIN_TASK_NAME
                 || n == crate::commands::workbuddy::checkin::WB_RENEW_TASK_NAME
                 || n.starts_with(&prefix_wb)
                 || n.starts_with(&prefix_qoder)

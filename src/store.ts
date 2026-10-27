@@ -215,6 +215,9 @@ function defaultSettings(): Settings {
     // issue #147：豆包应用内调度开关默认开
     doubao_keepalive_enabled: true,
     doubao_quota_enabled: true,
+    // 豆包每日签到（landing/checkin）：调度开关默认开、默认 09:15 错峰 quota 09:30
+    doubao_checkin_enabled: true,
+    doubao_checkin_hhmm: '09:15',
     workbuddy_path: null,
     codebuddy_path: null,
     wb_auth_file_path: null,

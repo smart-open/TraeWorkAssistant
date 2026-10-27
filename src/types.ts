@@ -387,6 +387,10 @@ export interface Settings {
   doubao_keepalive_enabled: boolean;
   /** issue #147：豆包会员额度每日巡检应用内调度开关（默认开，环境配置页可关） */
   doubao_quota_enabled: boolean;
+  /** 豆包每日签到调度开关（默认开，环境配置页可关） */
+  doubao_checkin_enabled: boolean;
+  /** 豆包每日签到时刻 HH:MM（默认 09:15，任务配置页可改） */
+  doubao_checkin_hhmm: string;
   /** WorkBuddy 桌面版 exe 手动路径（环境配置页） */
   workbuddy_path: string | null;
   /** CodeBuddy 桌面版 exe 手动路径（环境配置页） */
@@ -1003,6 +1007,37 @@ export interface DoubaoAccountView {
   session_source: string | null;
   /** 池级：最近一次 KeepAlive 保活时间（所有行同值） */
   last_keepalive_at: string | null;
+  // ── 签到/总额度缓存（tasks/doubao_checkin 巡检回写）──
+  /** 总额度（campaign detail progress.total_amount，签到巡检成功后回写） */
+  quota_total: number | null;
+  /** 连续签到天数 */
+  checkin_continuous_days: number | null;
+  /** 最近一次成功签到日期（YYYY-MM-DD） */
+  checkin_last_date: string | null;
+  /** 最近一次签到巡检运行时间（成功/失败均更新） */
+  checkin_last_run_at: string | null;
+}
+
+/** 签到趋势单日点（doubao_checkin_results 按日聚合；doubao_checkin_results_query / dashboard trend 共用） */
+export interface DoubaoCheckinTrendPoint {
+  date: string;
+  ok: number;
+  already: number;
+  failed: number;
+  reward_total: number;
+}
+
+/** 额度看板统计（doubao_dashboard_stats：池聚合 + 今日签到 + 近 30 天趋势） */
+export interface DoubaoDashboardStats {
+  account_count: number;
+  quota_total: number;
+  quota_known_count: number;
+  today_reward: number;
+  today_ok: number;
+  today_already: number;
+  today_failed: number;
+  max_continuous_days: number | null;
+  trend: DoubaoCheckinTrendPoint[];
 }
 
 /** 续期巡检摘要 JSON（Rust tasks/doubao_session.rs，原 doubao_renew.py） */

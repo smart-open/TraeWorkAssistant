@@ -4,6 +4,7 @@
 mod commands;
 mod checkin_results;
 mod device_proxy;
+mod doubao_checkin_results;
 mod events;
 mod fs_utils;
 mod icube_auth;
@@ -306,6 +307,11 @@ fn main() {
             commands::doubao::doubao_quota_task_register,
             commands::doubao::doubao_quota_task_status,
             commands::doubao::doubao_quota_task_unregister,
+            commands::doubao::doubao_checkin_run,
+            commands::doubao::doubao_dashboard_stats,
+            commands::doubao::doubao_checkin_task_register,
+            commands::doubao::doubao_checkin_task_status,
+            commands::doubao::doubao_checkin_task_unregister,
             commands::doubao::doubao_open_as_account,
             commands::doubao::doubao_snapshot_meta,
             commands::doubao::doubao_chatdata_backup,

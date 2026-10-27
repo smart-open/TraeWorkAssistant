@@ -67,6 +67,9 @@ const TASKS: &[SchedTask] = &[
     SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30", kind: "fix" },
     SchedTask { key: "doubao-keepalive", name: "豆包会话每日续期", hhmm: "09:20", kind: "fix" },
     SchedTask { key: "doubao-quota", name: "豆包会员额度每日巡检", hhmm: "09:30", kind: "fix" },
+    // 豆包每日签到（landing/checkin）：默认 09:15 错峰 quota 09:30，环境配置页可改
+    //（settings.doubao_checkin_hhmm）；结果按日落库（doubao_checkin_results）
+    SchedTask { key: "doubao-checkin", name: "豆包每日签到", hhmm: "09:15", kind: "fix" },
     // F-80 Qoder 每日签到：默认 10:15 单次覆盖「0 点签到」与「10:00 登录奖励」双活动
     //（§2.2 调度设计结论；settings.qoder_checkin_hhmm 可改，任务配置页）
     SchedTask { key: "qoder-checkin", name: "Qoder 每日签到", hhmm: "10:15", kind: "fix" },
@@ -396,6 +399,7 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "wb-catalog-sync" => Some(st.settings().wb_catalog_sync_hhmm),
         "trae-models-sync" => Some(st.settings().trae_models_sync_hhmm),
         "qoder-catalog-sync" => Some(st.settings().qoder_catalog_sync_hhmm),
+        "doubao-checkin" => Some(st.settings().doubao_checkin_hhmm),
         _ => None,
     };
     let Some(v) = configured else {
@@ -444,6 +448,8 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "doubao-keepalive" => st.settings().doubao_keepalive_enabled,
         // 豆包会员额度每日巡检（issue #147）：环境配置页可关（默认开）
         "doubao-quota" => st.settings().doubao_quota_enabled,
+        // 豆包每日签到：环境配置页可关（默认开）
+        "doubao-checkin" => st.settings().doubao_checkin_enabled,
         // 看板数据同步（积分/Token/消耗明细）：mode=off 即关闭（其余模式均视为启用；
         // buddy-ai 旧 enabled 布尔已由 state 归一化派生进 mode）
         "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" | "qoder-credits-snapshot"
@@ -842,6 +848,8 @@ fn run_task(
         }
         // 豆包会员额度每日巡检：与 `--task-run doubao-quota` 同款
         "doubao-quota" => super::doubao_quota::run_batch(st),
+        // 豆包每日签到：与 `--task-run doubao-checkin` 同款（空池跳过不计失败）
+        "doubao-checkin" => super::doubao_checkin::run_batch(st),
         // WorkBuddy 积分与 Token 数据同步（看板定时同步）：积分 fresh 拉取+池回写+快照为主目标
         // （空池自然空转不报错）；顺带 Token 统计重扫（本地增量缓存）与官方请求用量刷新——
         // 统计尽力而为不上抛（页面打开时本就有各自缓存/降级链路）；用量刷全账号聚合缓存

@@ -68,6 +68,18 @@ pub struct DoubaoAccount {
     /// 最近一次额度查询时间（Some = 已查询过，据此展示免费/会员标识）
     #[serde(default)]
     pub quota_checked_at: Option<String>,
+    /// 总额度（campaign detail progress.total_amount，签到巡检成功后回写）
+    #[serde(default)]
+    pub quota_total: Option<i64>,
+    /// 连续签到天数（detail daily_checkin.continuous_days）
+    #[serde(default)]
+    pub checkin_continuous_days: Option<i64>,
+    /// 最近一次成功签到日期（YYYY-MM-DD）
+    #[serde(default)]
+    pub checkin_last_date: Option<String>,
+    /// 最近一次签到巡检运行时间（成功/失败均更新）
+    #[serde(default)]
+    pub checkin_last_run_at: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
@@ -108,6 +120,11 @@ pub struct DoubaoAccountView {
     pub quota_expire_at: Option<String>,
     pub quota_summary: Option<String>,
     pub quota_checked_at: Option<String>,
+    // ── P5 签到/总额度缓存（tasks/doubao_checkin 巡检回写）──
+    pub quota_total: Option<i64>,
+    pub checkin_continuous_days: Option<i64>,
+    pub checkin_last_date: Option<String>,
+    pub checkin_last_run_at: Option<String>,
     /// 池级：最近一次 KeepAlive 保活时间（所有行同值，供前端提醒判断）
     pub last_keepalive_at: Option<String>,
 }
@@ -246,6 +263,10 @@ pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountV
             quota_expire_at: a.quota_expire_at.clone(),
             quota_summary: a.quota_summary.clone(),
             quota_checked_at: a.quota_checked_at.clone(),
+            quota_total: a.quota_total,
+            checkin_continuous_days: a.checkin_continuous_days,
+            checkin_last_date: a.checkin_last_date.clone(),
+            checkin_last_run_at: a.checkin_last_run_at.clone(),
             last_keepalive_at: keepalive_at.clone(),
         })
         .collect();
@@ -302,6 +323,10 @@ pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountV
                     quota_expire_at: None,
                     quota_summary: None,
                     quota_checked_at: None,
+                    quota_total: None,
+                    checkin_continuous_days: None,
+                    checkin_last_date: None,
+                    checkin_last_run_at: None,
                     last_keepalive_at: keepalive_at.clone(),
                 });
             }
@@ -361,6 +386,10 @@ pub fn doubao_account_save(
             quota_expire_at: None,
             quota_summary: None,
             quota_checked_at: None,
+            quota_total: None,
+            checkin_continuous_days: None,
+            checkin_last_date: None,
+            checkin_last_run_at: None,
         });
     }
     save_pool(&state, &pool)
@@ -1124,6 +1153,10 @@ fn apply_credential(
             quota_expire_at: None,
             quota_summary: None,
             quota_checked_at: None,
+            quota_total: None,
+            checkin_continuous_days: None,
+            checkin_last_date: None,
+            checkin_last_run_at: None,
         });
     }
     let acc = pool
@@ -1441,6 +1474,152 @@ pub fn doubao_quota_task_unregister(state: State<AppState>) -> Result<(), String
         return Err(stderr.trim().to_string());
     }
     fs_utils::app_log(&state.data_dir, "豆包额度巡检定时任务已注销");
+    Ok(())
+}
+
+// ── 每日签到（需求③④）：手动签到 / 按日结果查询 / 额度看板统计 / schtasks 三命令 ──
+// 执行层在 tasks/doubao_checkin.rs（detail 查状态 → landing/checkin 提交 → 落库回写）。
+
+/// 手动签到：传 user_id 单账号；不传则全量（遍历池内有凭证账号）。
+/// 含网络请求，async 防 UI 冻结。
+#[tauri::command(async)]
+pub fn doubao_checkin_run(
+    state: State<AppState>,
+    user_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    match user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(uid) => crate::tasks::doubao_checkin::checkin_single(&state, uid),
+        None => crate::tasks::doubao_checkin::run_batch(&state),
+    }
+}
+
+/// 额度看板统计（需求④，参考 Trae 积分看板）：账号数 / 总额度 / 今日新增额度 / 趋势
+#[derive(serde::Serialize, Clone)]
+pub struct DoubaoDashboardStats {
+    /// 账号数（账号池全量，含未录入凭证的）
+    pub account_count: u64,
+    /// 总额度合计（各账号 quota_total 之和，签到/巡检回写；未回写账号按 0）
+    pub quota_total: i64,
+    /// 已知总额度的账号数（quota_total 已回写计数，供前端展示覆盖率）
+    pub quota_known_count: u64,
+    /// 今日新增额度（当日签到 reward 合计，来自按日落库）
+    pub today_reward: i64,
+    pub today_ok: u64,
+    pub today_already: u64,
+    pub today_failed: u64,
+    /// 最高连续签到天数（展示用）
+    pub max_continuous_days: Option<i64>,
+    /// 最近 30 天趋势（日期升序）
+    pub trend: Vec<crate::doubao_checkin_results::TrendPoint>,
+}
+
+#[tauri::command]
+pub fn doubao_dashboard_stats(state: State<AppState>) -> Result<DoubaoDashboardStats, String> {
+    // 账号数与总额度：账号池（快照槽孤儿账号不入统计口径，与列表主表一致）
+    let pool = load_pool(&state);
+    let mut quota_total = 0i64;
+    let mut quota_known_count = 0u64;
+    let mut max_continuous: Option<i64> = None;
+    for a in &pool.accounts {
+        if let Some(t) = a.quota_total {
+            quota_total += t;
+            quota_known_count += 1;
+        }
+        if let Some(d) = a.checkin_continuous_days {
+            max_continuous = Some(match max_continuous {
+                Some(m) => m.max(d),
+                None => d,
+            });
+        }
+    }
+    // 今日签到结果 + 30 天趋势：按日落库
+    let results = crate::doubao_checkin_results::load(&state.data_dir);
+    let today = crate::doubao_checkin_results::today_key();
+    let (today_ok, today_already, today_failed, today_reward) = results
+        .days
+        .get(&today)
+        .map(|day| {
+            let mut ok = 0u64;
+            let mut already = 0u64;
+            let mut failed = 0u64;
+            let mut reward = 0i64;
+            for st in day.accounts.values() {
+                match st.status.as_str() {
+                    "success" => {
+                        ok += 1;
+                        reward += st.reward.unwrap_or(0);
+                    }
+                    "already" => already += 1,
+                    _ => failed += 1,
+                }
+            }
+            (ok, already, failed, reward)
+        })
+        .unwrap_or((0, 0, 0, 0));
+    let trend = crate::doubao_checkin_results::query_recent(&state.data_dir, 30);
+    Ok(DoubaoDashboardStats {
+        account_count: pool.accounts.len() as u64,
+        quota_total,
+        quota_known_count,
+        today_reward,
+        today_ok,
+        today_already,
+        today_failed,
+        max_continuous_days: max_continuous,
+        trend,
+    })
+}
+
+/// 注册豆包每日签到计划任务（schtasks 直调主 exe --task-run doubao-checkin，
+/// 对齐 doubao_quota_task_register）
+#[tauri::command(async)]
+pub fn doubao_checkin_task_register(state: State<AppState>, time: String) -> Result<(), String> {
+    // 命令注入防护：严格 HH:MM 白名单校验（同 quota/renew）
+    crate::commands::misc::validate_hhmm(&time)?;
+    let exe = std::env::current_exe().map_err(|e| format!("获取主程序路径失败: {e}"))?;
+    let tr = format!("\"{}\" --task-run doubao-checkin", exe.to_string_lossy());
+    let (ok, _stdout, stderr) = crate::commands::misc::run_schtasks(&[
+        "/Create",
+        "/TN",
+        crate::commands::misc::DOUBAO_CHECKIN_TASK_NAME,
+        "/TR",
+        tr.as_str(),
+        "/SC",
+        "DAILY",
+        "/ST",
+        time.as_str(),
+        "/F",
+    ])?;
+    if !ok {
+        return Err(schtasks_create_failure(&state, "每日签到", &stderr));
+    }
+    fs_utils::app_log(&state.data_dir, &format!("豆包每日签到定时任务已注册: {time}（直调主 exe）"));
+    Ok(())
+}
+
+/// 查询豆包每日签到计划任务状态
+#[tauri::command(async)]
+pub fn doubao_checkin_task_status(_state: State<AppState>) -> Result<String, String> {
+    let name = crate::commands::misc::DOUBAO_CHECKIN_TASK_NAME;
+    let (ok, stdout, _stderr) =
+        crate::commands::misc::run_schtasks(&["/Query", "/TN", name, "/FO", "LIST"])?;
+    if !ok {
+        return Ok("not_registered".to_string());
+    }
+    let time = extract_hhmm(&stdout);
+    Ok(format!("registered:{time}"))
+}
+
+/// 注销豆包每日签到计划任务
+#[tauri::command(async)]
+pub fn doubao_checkin_task_unregister(state: State<AppState>) -> Result<(), String> {
+    let name = crate::commands::misc::DOUBAO_CHECKIN_TASK_NAME;
+    let (ok, _stdout, stderr) =
+        crate::commands::misc::run_schtasks(&["/Delete", "/TN", name, "/F"])?;
+    if !ok && !stderr.contains("不存在") && !stderr.contains("does not exist") {
+        return Err(stderr.trim().to_string());
+    }
+    fs_utils::app_log(&state.data_dir, "豆包每日签到定时任务已注销");
     Ok(())
 }
 

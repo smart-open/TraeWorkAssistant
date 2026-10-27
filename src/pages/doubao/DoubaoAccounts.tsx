@@ -8,6 +8,8 @@ import {
   Rocket,
   Timer,
   Coins,
+  CalendarCheck,
+  TrendingUp,
   Save,
   Pencil,
   Trash2,
@@ -19,13 +21,14 @@ import {
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import SwitchProgressPanel from '../../components/SwitchProgressPanel';
-import { Badge, Modal } from '../../components/ui';
+import { Badge, Modal, StatCard } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
 import { useAppStore } from '../../store';
 import type {
   DoubaoAccountView,
   DoubaoChatdataInfo,
+  DoubaoDashboardStats,
   DoubaoQuotaResult,
   DoubaoRenewSummary,
   DoubaoSnapshotMeta,
@@ -72,6 +75,9 @@ export default function DoubaoAccounts() {
   const [keepaliveProgress, setKeepaliveProgress] = useState<string[]>([]);
   const [quotaRunningFor, setQuotaRunningFor] = useState<string | null>(null);
   const [quotaResult, setQuotaResult] = useState<{ userId: string; result: DoubaoQuotaResult } | null>(null);
+  // 每日签到/额度看板：行级签到忙碌标记 + 看板统计（doubao_dashboard_stats 单命令聚合）
+  const [checkinRunningFor, setCheckinRunningFor] = useState<string | null>(null);
+  const [stats, setStats] = useState<DoubaoDashboardStats | null>(null);
   // 保存当前登录态表单
   const [uidInput, setUidInput] = useState('');
   const [nameInput, setNameInput] = useState('');
@@ -124,6 +130,11 @@ export default function DoubaoAccounts() {
   const reload = async (notifyExpiry = false) => {
     setLoading(true);
     try {
+      // 看板统计与账号列表并行拉取（失败不影响主列表）
+      void api.doubao
+        .dashboardStats()
+        .then(setStats)
+        .catch(() => setStats(null));
       const list = await api.doubao.accountsList();
       setAccounts(list);
       if (notifyExpiry) checkExpiry(list);
@@ -480,6 +491,32 @@ export default function DoubaoAccounts() {
     }
   };
 
+  /** 单账号每日签到（landing/checkin 端点；已签当天幂等跳过，成功后回写总额度缓存并刷新看板） */
+  const doCheckin = async (a: DoubaoAccountView) => {
+    if (a.session_state === 'none') {
+      pushToast('warn', `账号 ${a.name} 尚无会话凭证，无法签到：开启代理自动写入或编辑弹框手动录入`);
+      return;
+    }
+    setCheckinRunningFor(a.user_id);
+    try {
+      // 返回契约：single → { ok, outcome: { status, message, ... }, finished_at }
+      const r = (await api.doubao.checkinRun(a.user_id)) as {
+        outcome?: { status?: string; message?: string };
+      };
+      const o = r.outcome;
+      if (o?.status === 'fail') {
+        pushToast('error', `账号 ${a.name} 签到失败：${o.message ?? '未知错误'}`);
+      } else {
+        pushToast('success', `账号 ${a.name} 签到完成：${o?.message ?? 'OK'}`);
+      }
+    } catch (err) {
+      pushToast('error', `签到失败：${String(err)}`);
+    } finally {
+      setCheckinRunningFor(null);
+      await reload();
+    }
+  };
+
   /** D1：备份对话数据（IndexedDB / DoubaoStorage 客户端状态；自动先关豆包，覆盖式备份） */
   const doChatBackup = (a: DoubaoAccountView) => {
     setChatConfirm({ kind: 'backup', account: a });
@@ -715,6 +752,7 @@ export default function DoubaoAccounts() {
                   <th className="whitespace-nowrap px-3 py-2 text-left">备注</th>
                   <th className="whitespace-nowrap px-3 py-2 text-left">快照</th>
                   <th className="whitespace-nowrap px-3 py-2 text-left">会话</th>
+                  <th className="whitespace-nowrap px-3 py-2 text-left">总额度</th>
                   <th className="whitespace-nowrap px-3 py-2 text-left">最后修改</th>
                   <th className="whitespace-nowrap px-3 py-2 text-right">操作</th>
                 </tr>
@@ -755,6 +793,22 @@ export default function DoubaoAccounts() {
                       )}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2">{sessionBadge(a)}</td>
+                    <td className="whitespace-nowrap px-3 py-2 text-xs">
+                      {a.quota_total != null ? (
+                        <div title={`最近签到：${a.checkin_last_date ?? '—'}${a.checkin_last_run_at ? ` · 巡检 ${a.checkin_last_run_at}` : ''}`}>
+                          <div className="font-medium text-amber-600 dark:text-amber-400">
+                            {a.quota_total.toLocaleString()}
+                          </div>
+                          {a.checkin_continuous_days != null && (
+                            <div className="text-slate-400">连续签 {a.checkin_continuous_days} 天</div>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-slate-400" title="签到或巡检成功后自动回写总额度">
+                          —
+                        </span>
+                      )}
+                    </td>
                     <td className="whitespace-nowrap px-3 py-2 text-xs text-slate-500">
                       {a.last_modified || a.added_at || '—'}
                     </td>
@@ -783,6 +837,17 @@ export default function DoubaoAccounts() {
                           className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:opacity-30 dark:hover:bg-amber-500/10"
                         >
                           <Coins size={14} className={quotaRunningFor === a.user_id ? 'animate-pulse' : ''} />
+                        </button>
+                        <button
+                          title="每日签到（landing/checkin；当天已签幂等跳过，成功后回写总额度）"
+                          onClick={() => void doCheckin(a)}
+                          disabled={anyBusy || checkinRunningFor === a.user_id}
+                          className="btn-ghost !p-2 text-rose-400 hover:bg-rose-50 disabled:opacity-30 dark:hover:bg-rose-500/10"
+                        >
+                          <CalendarCheck
+                            size={14}
+                            className={checkinRunningFor === a.user_id ? 'animate-pulse' : ''}
+                          />
                         </button>
                         <button
                           title={
@@ -844,9 +909,123 @@ export default function DoubaoAccounts() {
           「以账号打开」= 恢复该账号快照后直接启动豆包（代理运行中自动注入代理）；「切换」= 关闭豆包 →
           当前登录态自动备份（last 槽 + 原账号槽）→ 恢复目标快照 → 重启豆包。
           会话保活与每日定时任务在「环境配置」页设置；有会话凭证的账号会自动查询会员额度并在账号名后显示会员/免费标识，悬停账号名可查看详情。
+          「日历」图标 = 单账号每日签到（当日已签幂等跳过）；签到成功后回写总额度与连续签到天数，定时签到在「环境配置 → 每日签到」开启。
           账号行新增的「备份对话数据 / 恢复对话数据 / 导出对话」图标用于对话历史保护与迁移，详见右上角帮助。
         </div>
       </div>
+
+      {/* 额度看板（参考 Trae 积分看板：账号数 / 总额度 / 今日新增 + 额度统计 + 近 30 天趋势图） */}
+      {stats && (
+        <div className="mt-5 card p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <TrendingUp size={16} className="text-amber-500" />
+            <span className="text-sm font-medium">额度看板</span>
+            <span className="text-xs text-slate-400">近 30 天签到与额度汇总（签到/巡检成功后自动更新）</span>
+          </div>
+          <div className="grid gap-4 lg:grid-cols-3">
+            <div className="space-y-4">
+              <StatCard label="账号数" value={String(stats.account_count)} hint="当前豆包账号池规模" tone="violet" />
+              <StatCard
+                label="总额度"
+                value={stats.quota_total.toLocaleString()}
+                hint={stats.quota_known_count > 0 ? `${stats.quota_known_count} 个账号已知额度` : '签到/巡检后自动回写'}
+                tone="amber"
+              />
+              <StatCard
+                label="今日新增额度"
+                value={`+${stats.today_reward.toLocaleString()}`}
+                hint={
+                  stats.today_ok + stats.today_already + stats.today_failed > 0
+                    ? `签到成功 ${stats.today_ok} · 已签 ${stats.today_already} · 失败 ${stats.today_failed}`
+                    : '今日尚未签到'
+                }
+                tone="green"
+              />
+            </div>
+            <div className="card p-4">
+              <div className="mb-2 text-sm font-medium">额度统计</div>
+              <div className="space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500">已知额度账号</span>
+                  <span className="font-medium">
+                    {stats.quota_known_count} / {stats.account_count}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500">今日签到成功</span>
+                  <span className="font-medium text-emerald-600 dark:text-emerald-400">{stats.today_ok}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500">今日已签跳过</span>
+                  <span className="font-medium text-slate-400">{stats.today_already}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500">今日签到失败</span>
+                  <span className={`font-medium ${stats.today_failed > 0 ? 'text-rose-500' : ''}`}>{stats.today_failed}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500">最长连续签到</span>
+                  <span className="font-medium text-violet-600 dark:text-violet-400">
+                    {stats.max_continuous_days != null ? `${stats.max_continuous_days} 天` : '—'}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div className="card p-4">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-sm font-medium">额度趋势（近 30 天）</span>
+                <Badge tone="violet">+{stats.trend.reduce((s, p) => s + p.reward_total, 0).toLocaleString()}</Badge>
+              </div>
+              {stats.trend.length === 0 ? (
+                <div className="py-8 text-center text-xs text-slate-400">暂无签到数据，执行一次签到后生成趋势</div>
+              ) : (
+                <>
+                  <svg viewBox="0 0 280 72" className="h-20 w-full" preserveAspectRatio="none">
+                    {(() => {
+                      const W = 280;
+                      const H = 72;
+                      const slot = W / stats.trend.length;
+                      const barW = Math.max(2, Math.min(10, slot - 2));
+                      const totals = stats.trend.map((p) => p.ok + p.already + p.failed);
+                      const maxTotal = Math.max(1, ...totals);
+                      const scale = (H - 6) / maxTotal;
+                      return stats.trend.map((p, i) => {
+                        const x = i * slot + (slot - barW) / 2;
+                        let y = H - 2;
+                        const seg = (v: number, cls: string) => {
+                          const h = v * scale;
+                          const rect = h > 0 ? <rect key={cls} x={x} y={y - h} width={barW} height={h} rx={1} className={cls} /> : null;
+                          y -= h;
+                          return rect;
+                        };
+                        return (
+                          <g key={p.date}>
+                            {p.ok + p.already + p.failed === 0 && (
+                              <rect x={x} y={H - 2} width={barW} height={1.5} rx={0.75} className="fill-slate-200 dark:fill-zinc-700" />
+                            )}
+                            {seg(p.ok, 'fill-emerald-500')}
+                            {seg(p.already, 'fill-slate-300 dark:fill-zinc-600')}
+                            {seg(p.failed, 'fill-rose-500')}
+                          </g>
+                        );
+                      });
+                    })()}
+                  </svg>
+                  <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
+                    <span>{stats.trend[0]?.date}</span>
+                    <span className="flex items-center gap-2">
+                      <em className="inline-block h-2 w-2 rounded-sm bg-emerald-500" /> 成功
+                      <em className="inline-block h-2 w-2 rounded-sm bg-slate-300 dark:bg-zinc-600" /> 已签
+                      <em className="inline-block h-2 w-2 rounded-sm bg-rose-500" /> 失败
+                    </span>
+                    <span>{stats.trend[stats.trend.length - 1]?.date}</span>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 会员额度结果弹框 */}
       <Modal
