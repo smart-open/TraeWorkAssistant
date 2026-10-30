@@ -310,7 +310,7 @@ pub struct Settings {
     /// Trae 模型列表同步触发时刻 HH:MM（默认 05:40）
     #[serde(default = "default_trae_models_sync_hhmm")]
     pub trae_models_sync_hhmm: String,
-    // ── 通知渠道（F-19；Trae/Buddy 全平台共用，系统设置页通知渠道面板维护） ──
+    // ── 通知渠道（F-19；全部应用共用，系统设置页通知渠道面板维护） ──
     /// 通知总开关（默认开；关闭后所有事件渠道静默）
     #[serde(default = "default_true")]
     pub notify_enabled: bool,
@@ -329,6 +329,15 @@ pub struct Settings {
     /// Server酱 SendKey（空 = 关闭）
     #[serde(default)]
     pub notify_serverchan_sendkey: Option<String>,
+    /// PushPlus Token（pushplus.plus 微信推送；空 = 关闭该渠道，issue #157）
+    #[serde(default)]
+    pub notify_pushplus_token: Option<String>,
+    /// PushPlus 推送模板 html/txt/markdown（空 = 默认 txt，纯文本保留换行）
+    #[serde(default)]
+    pub notify_pushplus_template: Option<String>,
+    /// PushPlus 群组编码 topic（一对多群发；空 = 仅发给自己）
+    #[serde(default)]
+    pub notify_pushplus_topic: Option<String>,
     /// 会话明细概述显示开关（issue #82 T6.1，默认开；关闭仅隐藏 UI 展示，不删存量缓存）
     #[serde(default = "default_true")]
     pub sessions_preview_enabled: bool,

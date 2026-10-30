@@ -347,6 +347,11 @@ pub struct InterruptibleLines {
     rx: std::sync::mpsc::Receiver<std::io::Result<String>>,
     /// 首行（from_reader 首字窗口内产出；Iterator/next_timeout 下优先取出）
     pending: Option<String>,
+    /// 首个读错误（issue #158 报错A，P2-1）：转发线程上抛的 io::Error 此前
+    /// 被 next_timeout/Iterator::next 折叠为 EOF，长流被上游 h2 RST_STREAM
+    /// 掐断时静默伪装成正常完成、完全不可观测。此处留存错误本体供 sse 层
+    /// 经 take_read_error 取出识别（行为不变：对外仍折叠为 EOF）
+    last_read_error: Option<std::io::Error>,
 }
 
 impl InterruptibleLines {
@@ -362,6 +367,7 @@ impl InterruptibleLines {
             Ok(Ok(first)) => Ok(Self {
                 rx,
                 pending: Some(first),
+                last_read_error: None,
             }),
             _ => Err(()),
         }
@@ -377,7 +383,13 @@ impl InterruptibleLines {
                 }
             }
         });
-        Self { rx, pending: None }
+        Self { rx, pending: None, last_read_error: None }
+    }
+
+    /// 取出留存的首个读错误（issue #158 报错A，P2-1）：仅捕获一次，取出后
+    /// 置 None。sse 层在 EOF 兜底处调用，按传输掐断特征识别上抛哨兵
+    pub fn take_read_error(&mut self) -> Option<std::io::Error> {
+        self.last_read_error.take()
     }
 
     /// 带超时取行：
@@ -391,7 +403,14 @@ impl InterruptibleLines {
         }
         match self.rx.recv_timeout(dur) {
             Ok(Ok(line)) => Ok(Some(line)),
-            Ok(Err(_)) => Ok(None),
+            Ok(Err(e)) => {
+                // 读错误留存供 take_read_error 取出（issue #158 报错A），
+                // 对外语义不变：仍折叠为 EOF
+                if self.last_read_error.is_none() {
+                    self.last_read_error = Some(e);
+                }
+                Ok(None)
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(()),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(None),
         }
@@ -406,8 +425,15 @@ impl Iterator for InterruptibleLines {
         }
         match self.rx.recv() {
             Ok(Ok(line)) => Some(line),
-            Ok(Err(_)) => None, // 读错误折叠为 EOF（与既有语义一致）
-            Err(_) => None,     // 转发线程退出 = EOF
+            Ok(Err(e)) => {
+                // 读错误留存供 take_read_error 取出（issue #158 报错A），
+                // 对外语义不变：仍折叠为 EOF
+                if self.last_read_error.is_none() {
+                    self.last_read_error = Some(e);
+                }
+                None
+            }
+            Err(_) => None, // 转发线程退出 = EOF
         }
     }
 }
@@ -421,6 +447,42 @@ pub fn lines_with_first_byte_timeout<R: Read + Send + 'static>(
     reader: R,
 ) -> Result<Box<dyn Iterator<Item = String> + Send>, ()> {
     Ok(Box::new(InterruptibleLines::from_reader(reader)?))
+}
+
+// ==================== 读错误共享槽（issue #158 P2-2）====================
+
+/// 读错误共享槽：relay 线程的 io::Error 需要跨所有权边界读取时使用——
+/// 行源被再包裹（竞速 `chain_rest` 的 `filter_map(.ok())` 折叠 /
+/// `Box<dyn Iterator>` 擦拭 `InterruptibleLines` 类型 / QoderTranslate 桥接）
+/// 后，`InterruptibleLines::last_read_error` 随所有权下沉不可达。共享槽让
+/// 错误在折叠点留存，最终消费方（wb_sse / 路由层）在 EOF 兜底处取出上抛
+/// 传输掐断哨兵。槽存 Display 文本（io::Error 不可 Clone，消费方只做特征
+/// 识别与日志，不需要错误本体）。
+pub type ReadErrSlot = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
+/// 新建空读错误槽
+pub fn new_read_err_slot() -> ReadErrSlot {
+    std::sync::Arc::new(std::sync::Mutex::new(None))
+}
+
+/// 取出留存的首个读错误文本（仅捕获一次，取出后置 None）
+pub fn take_read_error_slot(slot: &ReadErrSlot) -> Option<String> {
+    slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// 带 读错误槽 的首字超时行封装：与 `lines_with_first_byte_timeout` 等价，
+/// 额外把后续行的读错误写入共享槽（供被 Box 擦拭类型的行源跨层读取）。
+/// 首字窗口内的读错误仍返回 Err(())（与 from_reader 语义一致：故障转移）
+pub fn lines_with_first_byte_timeout_tracked<R: Read + Send + 'static>(
+    reader: R,
+    read_slot: ReadErrSlot,
+) -> Result<Box<dyn Iterator<Item = String> + Send>, ()> {
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+    relay_lines(reader, tx);
+    match rx.recv_timeout(FIRST_BYTE_TIMEOUT) {
+        Ok(Ok(first)) => Ok(chain_rest(first, rx, read_slot)),
+        _ => Err(()),
+    }
 }
 
 /// 同 lines_with_first_byte_timeout，但返回可中断行源：sse.rs 流式转换
@@ -446,7 +508,7 @@ fn relay_lines<R: Read + Send + 'static>(
     });
 }
 
-/// 断连感知退避等待（issue #41 系列补漏）：RetrySame 退避原为整段
+/// 断连感知退避等待（issue #41 系列补漏，macos_main 保留）：RetrySame 退避原为整段
 /// `thread::sleep`（最长 60s），客户端断连也要等满全程才检查——期间持续占用
 /// 账号并发槽。改为 500ms 步进分段睡眠，每段前检查 `gone`（客户端断连信号），
 /// 命中即刻返回 false 终止等待。
@@ -464,14 +526,36 @@ pub fn backoff_wait(gone: &dyn Fn() -> bool, delay_ms: u64) -> bool {
     !gone()
 }
 
-/// 首行 + 剩余行组装为行迭代器（竞速对冲路径使用：胜者 receiver 直接折叠）
+/// 首行 + 剩余行组装为行迭代器（竞速对冲路径使用：胜者 receiver 直接折叠）。
+/// 胜者行源后续行携带的读错误（h2 RST_STREAM 等传输层掐断）写入共享槽——
+/// `filter_map(.ok())` 折叠处是错误本体的最后可见点，此处不留存则彻底丢失、
+/// 掐断长流被伪装成正常完成（issue #158 P2-2）
 fn chain_rest(
     first: String,
     rx: std::sync::mpsc::Receiver<std::io::Result<String>>,
+    read_slot: ReadErrSlot,
 ) -> Box<dyn Iterator<Item = String> + Send> {
-    Box::new(
-        std::iter::once(first).chain(rx.into_iter().filter_map(|r| r.ok())),
-    ) as Box<dyn Iterator<Item = String> + Send>
+    Box::new(std::iter::once(first).chain(rx.into_iter().scan(
+        false,
+        move |ended, r| {
+            if *ended {
+                return None; // 已 EOF：不再拉取底层（rx 随链 Drop → relay 退出）
+            }
+            match r {
+                Ok(line) => Some(line),
+                Err(e) => {
+                    {
+                        let mut slot = read_slot.lock().unwrap_or_else(|p| p.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(e.to_string());
+                        }
+                    }
+                    *ended = true; // 对外语义不变：读错误折叠为 EOF，且立即终止拉取
+                    None
+                }
+            }
+        },
+    ))) as Box<dyn Iterator<Item = String> + Send>
 }
 
 // ==================== F-76③ 慢请求竞速对冲 ====================
@@ -492,6 +576,10 @@ pub struct RaceOutcome<T> {
     /// 审查修复（L2）：对冲请求侧已死（EOF/IO 错误/超窗，败于竞速）——
     /// 主胜成功时对冲侧败者同理补记
     pub hedge_failed: bool,
+    /// 胜者行源的读错误共享槽（issue #158 P2-2）：胜者流中途被掐断（h2 RST
+    /// 等）时错误本体留存于此，调用方在 EOF 兜底处取出上抛传输掐断哨兵；
+    /// 败者侧槽随竞速 Drop（败者死亡已由 primary_failed/hedge_failed 记账）
+    pub read_slot: ReadErrSlot,
 }
 
 /// 慢请求竞速对冲（F-76③，P2C 调度理念的请求级延伸）：
@@ -519,16 +607,21 @@ pub fn lines_with_first_byte_hedged<T>(
     let started = Instant::now();
     let (tx1, rx1) = std::sync::mpsc::channel::<std::io::Result<String>>();
     relay_lines(primary, tx1);
+    // 主/对冲两侧各自持一个读错误槽：胜者槽随 RaceOutcome 带出，败者槽
+    // 随竞速 Drop（败者死亡已由 primary_failed/hedge_failed 记账，不缺观测）
+    let slot1 = new_read_err_slot();
+    let slot2 = new_read_err_slot();
 
     // 阶段一：对冲窗口内主请求先出首字 → 未触发对冲，与原首字超时语义一致
     match rx1.recv_timeout(hedge_delay) {
         Ok(Ok(first)) => {
             return Ok(RaceOutcome {
-                lines: chain_rest(first, rx1),
+                lines: chain_rest(first, rx1, slot1.clone()),
                 takeover: false,
                 hedge: None,
                 primary_failed: false,
                 hedge_failed: false,
+                read_slot: slot1,
             })
         }
         // 主请求窗口内即失败（EOF/IO 错误）或窗口耗尽 → 进入对冲路径
@@ -542,11 +635,12 @@ pub fn lines_with_first_byte_hedged<T>(
         let deadline = started + FIRST_BYTE_TIMEOUT;
         return match rx1.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ok(first)) => Ok(RaceOutcome {
-                lines: chain_rest(first, rx1),
+                lines: chain_rest(first, rx1, slot1.clone()),
                 takeover: false,
                 hedge: None,
                 primary_failed: false,
                 hedge_failed: false,
+                read_slot: slot1,
             }),
             _ => Err(()),
         };
@@ -571,13 +665,14 @@ pub fn lines_with_first_byte_hedged<T>(
                 match rx1.try_recv() {
                     Ok(Ok(line)) => {
                         return Ok(RaceOutcome {
-                            lines: chain_rest(line, rx1),
+                            lines: chain_rest(line, rx1, slot1.clone()),
                             takeover: false,
                             hedge: Some(hedge),
                             primary_failed: false,
                             // 审查修复（L2）：对冲侧已死（EOF/IO/超窗）而主胜出——
                             // 对冲败者带标记返回，由 settle_hedge 补记错误
                             hedge_failed: hedge_dead,
+                            read_slot: slot1,
                         })
                     }
                     Ok(Err(_)) | Err(TryRecvError::Disconnected) => primary_dead = true,
@@ -592,13 +687,14 @@ pub fn lines_with_first_byte_hedged<T>(
                 match rx2.try_recv() {
                     Ok(Ok(line)) => {
                         return Ok(RaceOutcome {
-                            lines: chain_rest(line, rx2),
+                            lines: chain_rest(line, rx2, slot2.clone()),
                             takeover: true,
                             hedge: Some(hedge),
                             // 审查修复（L2）：主侧已死（EOF/IO/超窗）而对冲接管——
                             // 主败者带标记返回，由 settle_hedge 补记错误
                             primary_failed: primary_dead,
                             hedge_failed: false,
+                            read_slot: slot2,
                         })
                     }
                     Ok(Err(_)) | Err(TryRecvError::Disconnected) => hedge_dead = true,
@@ -611,21 +707,23 @@ pub fn lines_with_first_byte_hedged<T>(
         }
         // 仅剩一侧：退化为阻塞等待该侧剩余窗口
         if primary_dead {
-            return wait_single(rx2, hedge_deadline).map(|lines| RaceOutcome {
+            return wait_single(rx2, hedge_deadline, slot2.clone()).map(|lines| RaceOutcome {
                 lines,
                 takeover: true,
                 hedge: Some(hedge),
                 primary_failed: true,
                 hedge_failed: false,
+                read_slot: slot2,
             });
         }
         if hedge_dead {
-            return wait_single(rx1, primary_deadline).map(|lines| RaceOutcome {
+            return wait_single(rx1, primary_deadline, slot1.clone()).map(|lines| RaceOutcome {
                 lines,
                 takeover: false,
                 hedge: Some(hedge),
                 primary_failed: false,
                 hedge_failed: true,
+                read_slot: slot1,
             });
         }
         std::thread::sleep(POLL);
@@ -634,9 +732,10 @@ pub fn lines_with_first_byte_hedged<T>(
     fn wait_single(
         rx: Receiver<std::io::Result<String>>,
         deadline: Instant,
+        read_slot: ReadErrSlot,
     ) -> Result<Box<dyn Iterator<Item = String> + Send>, ()> {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Ok(first)) => Ok(chain_rest(first, rx)),
+            Ok(Ok(first)) => Ok(chain_rest(first, rx, read_slot)),
             _ => Err(()),
         }
     }
@@ -903,7 +1002,10 @@ fn refresh_access_token_intl(
         .set("Content-Type", "application/json")
         .send_string("{}");
     let body: serde_json::Value = match resp {
-        Ok(r) => r.into_json().unwrap_or_default(),
+        // intl 版对齐 CN 版：传输层故障如实上抛，不伪装「刷新响应中无 accessToken」
+        Ok(r) => r
+            .into_json()
+            .map_err(|e| format!("刷新响应读取失败: {e}"))?,
         Err(ureq::Error::Status(code, r)) => {
             // issue #118：读错误响应体透传上游 error/error_description，便于区分会话失效与账号封禁
             return Err(wb_common::refresh_fail_msg(
@@ -1197,6 +1299,50 @@ mod tests {
         lines.collect()
     }
 
+    // ==================== 读错误共享槽（issue #158 P2-2）====================
+
+    /// 产出一段 SSE 行后抛读错误的 reader（模拟 h2 RST_STREAM 掐断长流）
+    struct CutAfterFirstRead {
+        n: u8,
+    }
+    impl Read for CutAfterFirstRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.n == 0 {
+                self.n = 1;
+                let d = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+                buf[..d.len()].copy_from_slice(d);
+                Ok(d.len())
+            } else {
+                Err(std::io::Error::other("h2 RST_STREAM pushed"))
+            }
+        }
+    }
+
+    #[test]
+    fn tracked_lines_record_read_error_into_slot() {
+        let slot = new_read_err_slot();
+        let lines = lines_with_first_byte_timeout_tracked(CutAfterFirstRead { n: 0 }, slot.clone())
+            .expect("首字窗口内应有产出");
+        let got: Vec<String> = lines.collect();
+        assert!(!got.is_empty(), "掐断前产出的行应保留（折叠 EOF 但内容不丢）");
+        let e = take_read_error_slot(&slot).expect("读错误应留存于共享槽");
+        assert!(e.contains("RST_STREAM"), "错误本体应留存，实际: {e}");
+        assert!(take_read_error_slot(&slot).is_none(), "仅捕获一次，取出后置 None");
+    }
+
+    #[test]
+    fn tracked_lines_clean_eof_keeps_slot_empty() {
+        let slot = new_read_err_slot();
+        let lines = lines_with_first_byte_timeout_tracked(
+            std::io::Cursor::new(b"data: [DONE]\n".to_vec()),
+            slot.clone(),
+        )
+        .expect("首字窗口内应有产出");
+        let got: Vec<String> = lines.collect();
+        assert_eq!(got, vec!["data: [DONE]"], "正常完成行不受影响");
+        assert!(take_read_error_slot(&slot).is_none(), "正常完成不留读错误");
+    }
+
     /// Drop 副作用探针：验证对冲上下文 T 的 RAII 配对契约
     struct DropProbe(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for DropProbe {
@@ -1225,6 +1371,7 @@ mod tests {
         let mut src = InterruptibleLines {
             rx,
             pending: None,
+            last_read_error: None,
         };
         assert_eq!(src.next_timeout(Duration::from_millis(30)), Err(()));
         tx.send(Ok("late".into())).unwrap();
@@ -1242,11 +1389,46 @@ mod tests {
         let mut src = InterruptibleLines {
             rx,
             pending: None,
+            last_read_error: None,
         };
         tx.send(Err(std::io::Error::other("boom"))).unwrap();
         assert_eq!(src.next_timeout(Duration::from_millis(500)), Ok(None));
         drop(tx); // 释放 sender：否则下方阻塞式 next() 永久等待（recv 无界）
         assert_eq!(src.next(), None);
+    }
+
+    #[test]
+    fn interruptible_lines_captures_read_error_via_take() {
+        // issue #158 P2-1：读错误对外仍折叠为 EOF，但错误本体留存可取——
+        // take 一次有值、二次 None（仅捕获首个）；next_timeout 与 Iterator
+        // 两条路径均须捕获
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        let mut src = InterruptibleLines {
+            rx,
+            pending: None,
+            last_read_error: None,
+        };
+        tx.send(Ok("line".into())).unwrap();
+        tx.send(Err(std::io::Error::other("http2 stream error RST_STREAM"))).unwrap();
+        assert_eq!(src.next_timeout(Duration::from_millis(500)), Ok(Some("line".into())));
+        assert_eq!(src.next_timeout(Duration::from_millis(500)), Ok(None)); // 折叠为 EOF
+        let e = src.take_read_error().expect("读错误应被捕获");
+        assert!(
+            crate::api_server::is_transport_cut_text(&e.to_string()),
+            "错误文本应命中传输掐断特征: {e}"
+        );
+        assert!(src.take_read_error().is_none(), "仅捕获首个，取出后置 None");
+        // Iterator 路径同样捕获
+        let (tx2, rx2) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        let mut src2 = InterruptibleLines {
+            rx: rx2,
+            pending: None,
+            last_read_error: None,
+        };
+        tx2.send(Err(std::io::Error::other("connection reset by peer"))).unwrap();
+        drop(tx2);
+        assert_eq!(src2.next(), None);
+        assert!(src2.take_read_error().is_some(), "Iterator 路径也应捕获");
     }
 
     #[test]

@@ -44,7 +44,10 @@ pub fn sys_command_path(program: &std::path::Path) -> std::process::Command {
 /// Windows 专用：构建无窗口子进程，先追加若干**常规**参数、再追加一条**原生**命令行
 /// 参数（不经 MSVC 转义）。`raw_arg` 同属 Windows-only `CommandExt`，故一并圈进本模块——
 /// 典型消费方：`cmd /c start "" "<url>"`（`/c` 常规参数 + URL 内嵌引号必须原样直达 cmd）。
+/// 3.8.6 合并（issue #153 修复 4）：浏览器打开改 ShellExecuteW 后暂无生产消费方，
+/// 保留工具备用（与下方 sys_output 同款 allow）
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn sys_command_raw(program: &str, args: &[&str], raw: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     let mut c = sys_command(program);
@@ -69,6 +72,34 @@ pub fn sys_output(cmd: &mut std::process::Command) -> Result<String, String> {
         ));
     }
     Ok(stdout.to_string())
+}
+
+/// macOS 专用：运行命令并在超时内等待退出（轮询 try_wait，超时 kill+收尸），
+/// 返回退出码供调用方可观测。审查修复（Low）：`open` 走 LaunchServices 常态
+/// <100ms，但异常挂起时 `.output()` 无超时会无限阻塞命令线程——本 helper 保留
+/// 退出码校验能力的同时兜底超时（手法对齐 qoder_common 的 3s 子进程上限）
+#[cfg(target_os = "macos")]
+pub fn sys_status_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::ExitStatus, String> {
+    use std::time::{Duration, Instant};
+    let mut child = cmd.spawn().map_err(|e| format!("执行失败: {e}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("执行超时（>{timeout:?}），已强制终止"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("进程等待失败: {e}")),
+        }
+    }
 }
 
 #[cfg(test)]

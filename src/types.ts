@@ -484,6 +484,12 @@ export interface Settings {
   notify_webhook_url: string | null;
   /** Server酱 SendKey（空 = 关闭） */
   notify_serverchan_sendkey: string | null;
+  /** PushPlus Token（pushplus.plus 微信推送；空 = 关闭该渠道） */
+  notify_pushplus_token: string | null;
+  /** PushPlus 推送模板 html/txt/markdown（空 = 默认 txt，纯文本保留换行） */
+  notify_pushplus_template: string | null;
+  /** PushPlus 群组编码 topic（一对多群发；空 = 仅发给自己） */
+  notify_pushplus_topic: string | null;
   // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
   /** 固定应用 key：始终显示在侧边栏且不可隐藏（单选，默认 'trae'） */
   pinned_app: AppKey;
@@ -833,7 +839,7 @@ export interface ApiPoolFile {
   qoder_hedge_threshold_ms?: number;
   /** Qoder 会话粘性开关（F-80-余 v2）：同会话 TTL 内绑定同一 Qoder 账号（默认关） */
   qoder_sticky_enabled?: boolean;
-  /** Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：目录倍率按 0 处理 + 取号豁免零积分过滤 */
+  /** 免费活动模型倍率覆盖（issue #111/#156，默认开）：Qwen3.8-Flash / DeepSeek-Flash 目录倍率按 0 处理 + 取号豁免零积分过滤 */
   qoder_flash_free_rate?: boolean;
   /** Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
   qoder_account_concurrency_limit?: number;
@@ -892,13 +898,13 @@ export interface UsageDayView {
   stream_requests: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /** 缓存读 tokens 累计（M4 审查修复；上游未下发时为 0） */
+  cached_tokens: number;
   /** 网关测量的累计消耗积分（issue #82 T2：仅 Qoder 桶非零；上游未下发 usage 的请求不计入） */
   credits: number;
   /** 上游计费原值（original_credits，峰谷折扣前），用于对账 */
   original_credits: number;
   avg_duration_ms: number;
-  /** 缓存读 tokens 累计（M4 审查修复：上游未下发时为 0；「全部」跨桶合并求和） */
-  cached_tokens?: number;
   /** 总耗时 P50/P95/最大值（F-76；样本不足时缺省） */
   p50_duration_ms?: number;
   p95_duration_ms?: number;
@@ -1191,6 +1197,13 @@ export interface SanitizeMapView {
 // 清洗规则档位（issue #129：§4.3 分区清洗）：'wb' = wb 池与 Trae 池共用键；
 // 'buddy-ai' = 国际档独立键（buddy_ai_template_map）
 export type SanitizeTier = 'wb' | 'buddy-ai';
+
+// 池级指纹清洗开关视图（issue #158 P1-4）：仅内存热切换、重启复位默认开
+// wb = wb_sanitize（wb + Trae 池共用）；qoder = qoder_sanitize（Qoder 池独立）
+export interface SanitizeSwitches {
+  wb: boolean;
+  qoder: boolean;
+}
 
 // ---- 工具名别名表（issue #150：tool_alias_map KV；Trae 池 tools 工具集指纹识别治本）----
 // 请求侧 tools[].function.name / tool_choice / 历史轮 tool_calls 名 → 通用别名，

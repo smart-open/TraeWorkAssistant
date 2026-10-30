@@ -95,7 +95,10 @@ fn view_of(
         let (s, f) = crate::switcher::icube::read_snapshot_sidecar(&profiles_ide, &a.id);
         if s.is_none() && f.is_none() {
             // 3.8.5 审查修复（L2）：主槽 sidecar 缺失时回退 .bak 代际——与 Work 端
-            // （下方 96-106）及 has_snapshot 口径对齐，「仅 .bak 存在」时徽标不再静默丢失
+            // （下方 96-106）及 has_snapshot 口径对齐，「仅 .bak 存在」时徽标不再静默丢失。
+            // 写入侧闭环：icube::mark_snapshot_verify_failed 主槽缺失时回退写
+            // `{id}.bak.meta.json`（sidecar 不随 rotate_bak 轮转，经 .bak 恢复场景
+            // 的标记必须落回退文件），读取侧此处对称回退
             crate::switcher::icube::read_snapshot_sidecar(
                 &profiles_ide,
                 &format!("{}.bak", a.id),
@@ -497,6 +500,12 @@ pub async fn qoder_account_refresh_token(
                     .ok_or_else(|| "续期后回读失败".to_string())
             }
             "no_credential" => Err("该账号无可用凭证，请先导入 PAT 或重新登录".into()),
+            // 暂态：vault 系统性故障凭证读空（issue #153 修复 2）——故障恢复后
+            // 凭证仍在，可重试；不得提示「无凭证」误导用户重新导入
+            "vault_down" => Err("凭证加密存储暂时不可用（vault 故障），请检查日志后重试".into()),
+            // 暂态：账号级刷新锁被他进程/线程持有（ensure_fresh 沿用现有凭证返回）
+            // ——可稍后重试；英文 note 不得透传用户
+            "refresh_busy" => Err("续期未执行：该账号正在另一任务中刷新，请稍后重试".into()),
             // 暂态失败（网络/服务端抖动）：可重试
             "refresh_failed" => Err("续期失败：网络或服务端异常，请稍后重试".into()),
             // 刷新成功但落库失败（refresh_token 一次性轮换，旧 RT 已作废）：
@@ -514,8 +523,6 @@ pub async fn qoder_account_refresh_token(
             "expired_needs_relogin" | "auth_dead" => {
                 Err("凭证已失效且无法自动续期，请重新登录客户端或更新 PAT".into())
             }
-            // 并发保护（H3）：他进程正在刷新同账号（跨进程锁被占）——暂态，可重试
-            "refresh_busy" => Err("另一进程正在续期该账号凭证，请稍后重试".into()),
             other => Err(format!("续期未执行（{other}）")),
         }
     })

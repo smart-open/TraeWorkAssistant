@@ -44,7 +44,10 @@ pub fn load_vault_password_at(data_dir: &std::path::Path) -> Result<Option<Vec<u
         if !key_path.exists() {
             return Ok(None);
         }
-        let blob = std::fs::read(&key_path).map_err(|e| format!("读取 vault 密钥失败: {e}"))?;
+        // issue #153 修复 3：os error 448（不受信任的挂载点，conf 被 Junction 化）等
+        // IO 错误经 vault_key_io_err 映射为可操作提示
+        let blob =
+            std::fs::read(&key_path).map_err(|e| crate::vault::vault_key_io_err("读取", &key_path, e))?;
         // issue #139 双格式自适应：V2: 文本优先，DPAPI blob 回退
         let pwd = crate::vault::parse_key_file(&blob, &key_path)?;
         // 共享模式一次性迁移：DPAPI 密钥 → V2: 文本（AIWORK_VAULT_SHARED=1 方生效）
@@ -131,7 +134,8 @@ fn store_vault_password_at_impl(
     {
         let blob = crate::vault::dpapi::protect(pwd)?;
         let key_path = data_dir.join("conf").join("vault_key.bin");
-        std::fs::write(&key_path, &blob).map_err(|e| format!("写入 vault 密钥失败: {e}"))
+        std::fs::write(&key_path, &blob)
+            .map_err(|e| crate::vault::vault_key_io_err("写入", &key_path, e))
     }
     #[cfg(target_os = "macos")]
     {

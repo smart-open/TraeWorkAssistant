@@ -165,6 +165,30 @@ pub struct AppState {
 /// 配置文件名列表（路由到 conf/ 目录）
 const CONF_FILES: &[&str] = &["app_settings.json"];
 
+/// 修复 3（issue #153）：canonicalize 解析 Junction/目录联接到真实路径。
+/// APPDATA 下若存在联接链（如用户手工迁移目录），路径不解析会让 vault
+/// 等组件踩 os error 448（ERROR_UNTRUSTED_MOUNT_POINT）；解析失败（理论上
+/// 仅在极端 IO 环境发生）退回未解析路径，不阻塞启动。
+/// macos_main 合并适配：Windows canonicalize 返回 verbatim 路径（\\?\C:\…），
+/// strip 前缀还原普通形态（与 app_support_root 拼接口径一致，防日志/配置
+/// 展示与路径等值比较出现两套写法；macOS canonicalize 无此前缀，无副作用）。
+/// 提取为独立函数供测试同口径断言（审查修复：测试机 APPDATA 存在 Junction
+/// 时，裸 expected 与解析后 data_dir 不等会误报）。
+fn canonicalized_data_dir(path: std::path::PathBuf) -> std::path::PathBuf {
+    match path.canonicalize() {
+        Ok(c) => {
+            let s = c.to_string_lossy().to_string();
+            // Windows verbatim 还原：\\?\C:\… → C:\…；\\?\UNC\server\share → \\server\share
+            if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                std::path::PathBuf::from(format!(r"\\{rest}"))
+            } else {
+                std::path::PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+            }
+        }
+        Err(_) => path,
+    }
+}
+
 impl AppState {
     pub fn new() -> Result<Self, String> {
         // 数据目录：%APPDATA%\AIWorkAssistant（macOS: ~/Library/Application Support/AIWorkAssistant，
@@ -173,6 +197,8 @@ impl AppState {
         let data_dir = crate::platform::app_support_root()?.join(DATA_DIR_NAME);
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
+
+        let data_dir = canonicalized_data_dir(data_dir);
 
         // 创建子目录结构
         let conf_dir = data_dir.join("conf");
@@ -272,11 +298,16 @@ impl AppState {
         //（派生 Default bool=false）会漏开——kv 无 app_settings 键即「从未配置」，
         // 回填默认开；kv 存在时新增字段由 serde default_true 兜底，
         // 用户显式关闭后不会被此处重新打开。外层布尔守卫：默认开的常规路径
-        // 不追加第二次 kv 查询（settings() 为高频调用）
+        // 不追加第二次 kv 查询（settings() 为高频调用）。
+        // 「从未配置」判定含损坏 kv（审查 Low）：值存在但解析失败时 kv_get 已
+        // 回退默认（豆包双开关落 false），仅按键存在性放行会把损坏行误当
+        // 「已配置」漏回填——值不可解析同样视为从未配置
         if !s.doubao_keepalive_enabled || !s.doubao_quota_enabled {
             // 「从未配置」判定：键缺失，或键存在但内容损坏——kv_get 对损坏内容
             // 回退 Settings::default()（双开关落 false）而 kv_get_raw 返回 Some，
-            // 只判键缺失会漏掉损坏路径（3.8.5 审查 L1：kv 半写/手改后双开关恒关）
+            // 只判键缺失会漏掉损坏路径（3.8.5 审查 L1：kv 半写/手改后双开关恒关）。
+            // 解析口径与 kv_get::<Settings> 一致（合法 JSON 但按 Settings 解析失败
+            // 同样回退默认，Value 口径会漏判这类行）
             let never_configured = match crate::store::db(&self.data_dir).kv_get_raw("app_settings") {
                 None => true,
                 Some(raw) => serde_json::from_str::<Settings>(&raw).is_err(),
@@ -410,7 +441,7 @@ impl AppState {
         s.app_order.retain(|k| crate::models::is_valid_app_key(k));
         let mut seen_order = std::collections::HashSet::new();
         s.app_order.retain(|k| seen_order.insert(k.clone()));
-        // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，Trae/Buddy 共用）：
+        // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，全部应用共用）：
         // app_settings 渠道字段双 None 时从旧 workbuddy_settings 一次性搬运。
         // 命中即 kv_set 回写持久化——push_notify 裸读 kv 不经过本函数，仅内存视图会让
         // 推送链路读不到迁移值（老用户通知静默失效）；同时移除旧 kv 的通知键，
@@ -462,6 +493,9 @@ mod tests {
         let expected = crate::platform::app_support_root()
             .expect("app_support_root")
             .join(DATA_DIR_NAME);
+        // 同口径 canonicalize（审查修复：测试机 APPDATA 为 Junction 时裸路径
+        // 与解析后 data_dir 不等——正是 canonicalized_data_dir 修复的目标场景）
+        let expected = canonicalized_data_dir(expected);
         assert_eq!(s.data_dir, expected);
         // 子目录结构（conf/data/logs）在 new() 内已创建
         assert!(s.data_dir.join("conf").is_dir());

@@ -12,6 +12,7 @@ import type {
   ApiKeysFileView,
   SanitizeMapView,
   SanitizeRule,
+  SanitizeSwitches,
   SanitizeTier,
   ToolAliasMapView,
   FingerprintSample,
@@ -868,7 +869,7 @@ export const api = {
         qoderHedgeThresholdMs?: number;
         /** Qoder 会话粘性开关（F-80-余 v2）；null/未传 = 保留原值 */
         qoderStickyEnabled?: boolean;
-        /** Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；null/未传 = 保留原值 */
+        /** 免费活动模型倍率覆盖开关（issue #111/#156，默认开）；null/未传 = 保留原值 */
         qoderFlashFreeRate?: boolean;
         /** Qoder 池入池白名单（qd- 账号 id）；null/未传 = 保留原值 */
         qoderUids?: string[];
@@ -1113,6 +1114,11 @@ export const api = {
     // 网关命中（11128/空完成影子风控）落下的样本环形缓冲（最新在前，重启即清空）
     fingerprintSamplesGet: () => invoke<FingerprintSample[]>('fingerprint_samples_get'),
     fingerprintSamplesClear: () => invoke<void>('fingerprint_samples_clear'),
+    // ---- 池级指纹清洗开关（issue #158 P1-4：仅内存热切换，重启复位默认开）----
+    // wb = wb_sanitize（wb + Trae 池共用）；qoder = qoder_sanitize（Qoder 池独立）
+    sanitizeSwitchesGet: () => invoke<SanitizeSwitches>('sanitize_switches_get'),
+    sanitizeSwitchSet: (pool: 'wb' | 'qoder', enabled: boolean) =>
+      invoke<void>('sanitize_switch_set', { pool, enabled }),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),

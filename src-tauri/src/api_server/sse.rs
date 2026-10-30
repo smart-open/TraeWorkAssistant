@@ -386,8 +386,36 @@ fn stream_convert_src(
         }
     }
 
+    // 传输层掐断捕获（issue #158 报错A，P2-1）：读错误此前被折叠为 EOF——
+    // 有内容时补帧静默伪装成功、零内容时误计空完成。按文本特征识别为传输
+    // 掐断哨兵上抛（其余读错误维持折叠语义不变）
+    let read_cut = src
+        .take_read_error()
+        .filter(|e| super::is_transport_cut_text(&e.to_string()));
+
     if !saw_done && error_info.is_none() {
-        if !has_content {
+        if let Some(e) = read_cut {
+            if !has_content {
+                // 零内容被掐：传输掐断哨兵（不用 EMPTY——网络掐断不应计入
+                // 空完成指纹口径）；不发 [DONE]，交调用方换号重试
+                error_info = Some((
+                    super::TRANSPORT_CUT_CODE,
+                    format!("{}{}", super::TRANSPORT_CUT_MSG_PREFIX, e),
+                ));
+            } else {
+                // 有内容被掐：照旧补发收尾帧+[DONE]（客户端可见行为不变，
+                // issue #148 口径维持），但不再静默伪装成功——上抛哨兵供
+                // route 层结构化日志观测（长流被掐从「不可见」变「可见」）
+                let finish = if saw_tool_calls { "tool_calls" } else { "stop" };
+                let data = write_chunk(json!({}), finish, &pending_usage);
+                let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                error_info = Some((
+                    super::TRANSPORT_CUT_CODE,
+                    format!("{}{}", super::TRANSPORT_CUT_MSG_PREFIX, e),
+                ));
+            }
+        } else if !has_content {
             // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）；判定与
             // 客户端在线解耦——断连也上抛哨兵，否则调用方误判成功绑粘性
             //（审查 F7 / main 审查问题6 同口径：HEAD 旧实现 && !sender.is_closed()
@@ -532,8 +560,31 @@ fn stream_convert_text_src(
         }
     }
 
+    // 传输层掐断捕获（issue #158 报错A，P2-1）：同 stream_convert_lines
+    let read_cut = src
+        .take_read_error()
+        .filter(|e| super::is_transport_cut_text(&e.to_string()));
+
     if !saw_done && error_info.is_none() {
-        if !has_content {
+        if let Some(e) = read_cut {
+            if !has_content {
+                // 零内容被掐：传输掐断哨兵（不用 EMPTY）；不发 [DONE]，交调用方换号
+                error_info = Some((
+                    super::TRANSPORT_CUT_CODE,
+                    format!("{}{}", super::TRANSPORT_CUT_MSG_PREFIX, e),
+                ));
+            } else {
+                // 有内容被掐：照旧补发收尾帧+[DONE]（客户端可见行为不变），
+                // 再上抛哨兵供 route 层观测
+                let data = write_chunk("", "stop", &pending_usage);
+                let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                error_info = Some((
+                    super::TRANSPORT_CUT_CODE,
+                    format!("{}{}", super::TRANSPORT_CUT_MSG_PREFIX, e),
+                ));
+            }
+        } else if !has_content {
             // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）；判定与
             // 客户端在线解耦——断连也上抛哨兵，否则调用方误判成功绑粘性（同 L329）
             error_info = Some((
@@ -562,6 +613,12 @@ struct PlainCollect {
     error_info: Option<(i64, String)>,
     /// 按 index（缺省回退 id）分段合并后的 tool_calls（与流式侧对称）
     tool_calls: Vec<Value>,
+    /// 传输层掐断读错误（issue #158 报错A，P2-1 聚合侧补齐）：此前读错误被
+    /// `Err(_) => break` 静默折叠为 EOF——上游 h2 RST/连接重置掐断长响应时，
+    /// 半截内容以 finish_reason="stop" 完整返回客户端，tool_calls 残缺也不换号。
+    /// 仅留存传输掐断特征读错误（对齐流式侧 is_transport_cut_text 过滤口径），
+    /// 其余读错误维持折叠语义不变；saw_done 后的读错误不算（完整响应后关闭）
+    read_error: Option<String>,
 }
 
 /// 归一单个上游工具调用分片：function_call→function（legacy 形态）、
@@ -642,11 +699,23 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
         usage: None,
         error_info: None,
         tool_calls: Vec::new(),
+        read_error: None,
     };
     for line in br.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break,
+            Err(e) => {
+                // 传输层掐断捕获（聚合侧补齐，口径同流式侧 take_read_error）：
+                // 仅 !saw_done 且无业务错误时留存哨兵，交 aggregate/aggregate_text
+                // 上抛；其余读错误维持折叠语义
+                if !saw_done && out.error_info.is_none() {
+                    let text = e.to_string();
+                    if super::is_transport_cut_text(&text) {
+                        out.read_error = Some(text);
+                    }
+                }
+                break;
+            }
         };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
@@ -695,6 +764,17 @@ pub fn aggregate<R: Read + Send>(
     let mut c = collect_plain(reader);
     if let Some((code, msg)) = &c.error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    // 传输层掐断哨兵上抛（聚合侧补齐，P2-1）：半截内容不得以 finish_reason="stop"
+    // 伪装成功，交调用方丢弃换号重试（routes 聚合错误分支 is_transport_cut 预检）
+    if let Some(e) = c.read_error {
+        return (
+            None,
+            Some((
+                super::TRANSPORT_CUT_CODE,
+                format!("{} {e}", super::TRANSPORT_CUT_MSG_PREFIX),
+            )),
+        );
     }
     // issue #150：别名回改——合并后的 tool_calls.function.name 还原客户端原名
     if let Some(m) = tool_alias {
@@ -763,6 +843,16 @@ pub fn aggregate_text<R: Read + Send>(
     if let Some((code, msg)) = &c.error_info {
         return (None, Some((*code, msg.clone())));
     }
+    // 传输层掐断哨兵上抛（聚合侧补齐，P2-1）：同 aggregate
+    if let Some(e) = c.read_error {
+        return (
+            None,
+            Some((
+                super::TRANSPORT_CUT_CODE,
+                format!("{} {e}", super::TRANSPORT_CUT_MSG_PREFIX),
+            )),
+        );
+    }
 
     let mut resp = json!({
         "id": completion_id,
@@ -818,8 +908,9 @@ fn anthropic_stop_reason(finish: &str) -> &'static str {
     match finish {
         "length" => "max_tokens",
         "tool_calls" | "function_call" => "tool_use",
-        // 3.8.5 审查 L4：content_filter 是真实截断语义（对齐 1010 行注释口径），
-        // 静默映射 end_turn 会让客户端误判正常收尾；Anthropic 词表对应 refusal
+        // 3.8.5 审查 L4 / main 同口径：content_filter 是真实截断语义（映射
+        // refusal，对齐 wb_sse 聚合出口），静默归 end_turn 会把「内容被过滤」
+        // 伪装成「自然结束」
         "content_filter" => "refusal",
         _ => "end_turn",
     }
@@ -1202,6 +1293,11 @@ fn stream_convert_anthropic_src(
         }
     }
 
+    // 传输层掐断捕获（issue #158 报错A，P2-1）：同 stream_convert_lines
+    let read_cut = src
+        .take_read_error()
+        .filter(|e| super::is_transport_cut_text(&e.to_string()));
+
     if !saw_done {
         if message_started || !tools.is_empty() {
             // 上游未发 done 即断流：把已收到的内容按正常收尾发出，避免客户端挂起
@@ -1209,14 +1305,32 @@ fn stream_convert_anthropic_src(
             if !disconnected {
                 finish_stream!();
             }
+            // 传输掐断：就地收尾后上抛哨兵供 route 层观测（不覆盖流内错误事件）
+            if error_info.is_none() {
+                if let Some(e) = read_cut {
+                    error_info = Some((
+                        super::TRANSPORT_CUT_CODE,
+                        format!("{}{}", super::TRANSPORT_CUT_MSG_PREFIX, e),
+                    ));
+                }
+            }
         } else if error_info.is_none() {
-            // 空流：以空完成哨兵上抛（原发一个空的合法 message，issue #57 改为
-            // 换号重试，避免客户端收到 "empty provider response"）；判定与客户
-            // 端在线解耦——断连也上抛，否则调用方误判成功绑粘性
-            error_info = Some((
-                crate::api_server::EMPTY_COMPLETION_CODE,
-                super::EMPTY_COMPLETION_MSG.to_string(),
-            ));
+            if let Some(e) = read_cut {
+                // 零内容被掐：传输掐断哨兵（不用 EMPTY——网络掐断不应计入
+                // 空完成指纹口径）；交调用方换号重试
+                error_info = Some((
+                    super::TRANSPORT_CUT_CODE,
+                    format!("{}{}", super::TRANSPORT_CUT_MSG_PREFIX, e),
+                ));
+            } else {
+                // 空流：以空完成哨兵上抛（原发一个空的合法 message，issue #57 改为
+                // 换号重试，避免客户端收到 "empty provider response"）；判定与客户
+                // 端在线解耦——断连也上抛，否则调用方误判成功绑粘性
+                error_info = Some((
+                    crate::api_server::EMPTY_COMPLETION_CODE,
+                    super::EMPTY_COMPLETION_MSG.to_string(),
+                ));
+            }
         }
     }
 
@@ -1547,6 +1661,181 @@ mod tests {
         assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
         assert!(!sent_any);
         assert!(!collect_events(rx).join("\n").contains("data: [DONE]"));
+    }
+
+    // ==================== 传输层掐断哨兵（issue #158 报错A，P2-1） ====================
+
+    /// 传输掐断文案识别矩阵：RST_STREAM 变体与干扰词正反例
+    #[test]
+    fn is_transport_cut_text_keyword_matrix() {
+        let hits = [
+            "http2 stream error RST_STREAM",
+            "stream error received: RST Stream",
+            "connection error: GOAWAY",
+            "Connection reset by peer (os error 104)",
+            "broken pipe (os error 32)",
+            "connection closed before message completed",
+            "h2 error: protocol violation",
+        ];
+        for s in hits {
+            assert!(crate::api_server::is_transport_cut_text(s), "应命中: {s}");
+        }
+        let misses = [
+            "",
+            "weird os error 42",
+            "upstream 500: internal server error",
+            "stream completed normally",
+        ];
+        for s in misses {
+            assert!(!crate::api_server::is_transport_cut_text(s), "不应命中: {s}");
+        }
+    }
+
+    /// 哨兵双口径判定（对齐 is_empty_completion：码相等 || msg 前缀）
+    #[test]
+    fn is_transport_cut_matches_code_or_prefix() {
+        assert!(crate::api_server::is_transport_cut(
+            crate::api_server::TRANSPORT_CUT_CODE,
+            "anything"
+        ));
+        assert!(crate::api_server::is_transport_cut(0, "transport cut: http2 ..."));
+        assert!(!crate::api_server::is_transport_cut(
+            crate::api_server::EMPTY_COMPLETION_CODE,
+            crate::api_server::EMPTY_COMPLETION_MSG
+        ));
+    }
+
+    /// 产出行后抛读错误的 Reader（模拟上游 h2 RST_STREAM 掐断长流）
+    struct CutAfterReader {
+        data: Vec<u8>,
+        pos: usize,
+        err: &'static str,
+    }
+    impl std::io::Read for CutAfterReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos < self.data.len() {
+                let n = (self.data.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, self.err))
+            }
+        }
+    }
+
+    #[test]
+    fn transport_cut_with_content_keeps_client_frames_but_raises_sentinel() {
+        // 有内容被掐：客户端可见行为不变（内容帧 + 补发收尾帧 + [DONE]），
+        // 但后端不再静默伪装成功——上抛传输掐断哨兵
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = InterruptibleLines::from_reader(CutAfterReader {
+            // Trae SOLO 协议（stream_convert_lines 解析目标格式）
+            data: b"event: output\ndata: {\"response\":\"hi\"}\n\n".to_vec(),
+            pos: 0,
+            err: "http2 stream error RST_STREAM",
+        })
+        .expect("首行应正常产出");
+        let (error_info, sent_any, _) = stream_convert_lines(src, tx, "c1", None);
+        let (code, msg) = error_info.expect("掐断应上抛哨兵");
+        assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(msg.starts_with("transport cut:"), "msg 应带前缀: {msg}");
+        assert!(sent_any, "有内容被掐 sent_any 应为 true");
+        // 不得误标空完成（网络掐断不进空完成指纹口径）
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+        let events = collect_events(rx);
+        let joined = events.join("\n");
+        assert!(joined.contains("hi"), "内容帧应已发出");
+        assert!(joined.contains("\"finish_reason\":\"stop\""), "应补发收尾帧");
+        assert!(
+            events.last().map(|e| e.contains("[DONE]")).unwrap_or(false),
+            "应发 [DONE]，客户端按正常结束处理"
+        );
+    }
+
+    #[test]
+    fn transport_cut_without_content_raises_sentinel_not_empty_completion() {
+        // 零内容被掐：传输掐断哨兵（不用 EMPTY），不发 [DONE]，交调用方换号
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = InterruptibleLines::from_reader(CutAfterReader {
+            data: b": keepalive\n\n".to_vec(),
+            pos: 0,
+            err: "connection reset by peer",
+        })
+        .expect("首行应正常产出");
+        let (error_info, sent_any, _) = stream_convert_lines(src, tx, "c1", None);
+        let (code, msg) = error_info.expect("掐断应上抛哨兵");
+        assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(!sent_any, "零内容被掐未流出 sent_any 应为 false");
+        assert!(
+            !crate::api_server::is_empty_completion(code, &msg),
+            "网络掐断不得计入空完成指纹口径"
+        );
+        assert!(!collect_events(rx).join("\n").contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn non_transport_read_error_keeps_legacy_eof_semantics() {
+        // 对照组：非传输特征读错误维持旧行为——零内容折叠为 EOF → 空完成哨兵
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = InterruptibleLines::from_reader(CutAfterReader {
+            data: b": keepalive\n\n".to_vec(),
+            pos: 0,
+            err: "weird os error 42",
+        })
+        .expect("首行应正常产出");
+        let (error_info, sent_any, _) = stream_convert_lines(src, tx, "c1", None);
+        let (code, _msg) = error_info.expect("EOF 零内容仍应命中空完成哨兵");
+        assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
+        assert!(!sent_any);
+        assert!(!collect_events(rx).join("\n").contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn anthropic_transport_cut_with_content_finishes_and_raises_sentinel() {
+        // Anthropic 版有内容被掐：就地收尾（message_stop）+ 上抛哨兵
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        // 输入为 Trae SOLO 上游协议（scan_line 解析 event: output / response 字段）
+        let src = InterruptibleLines::from_reader(CutAfterReader {
+            data: b"event: output\ndata: {\"response\":\"hi\"}\n\n".to_vec(),
+            pos: 0,
+            err: "http2 stream error RST_STREAM",
+        })
+        .expect("首行应正常产出");
+        let (error_info, sent_any, _) =
+            stream_convert_anthropic_lines(src, tx, "msg_t", "m", None);
+        let (code, msg) = error_info.expect("掐断应上抛哨兵");
+        assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
+        assert!(sent_any, "有内容被掐 sent_any 应为 true");
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+        assert!(
+            collect_events(rx).join("\n").contains("event: message_stop"),
+            "有内容被掐应就地收尾"
+        );
+    }
+
+    #[test]
+    fn anthropic_transport_cut_without_content_raises_sentinel() {
+        // Anthropic 版零内容被掐：传输掐断哨兵（不用 EMPTY）
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = InterruptibleLines::from_reader(CutAfterReader {
+            data: b": keepalive\n\n".to_vec(),
+            pos: 0,
+            err: "connection reset by peer",
+        })
+        .expect("首行应正常产出");
+        let (error_info, sent_any, _) =
+            stream_convert_anthropic_lines(src, tx, "msg_t", "m", None);
+        let (code, _msg) = error_info.expect("掐断应上抛哨兵");
+        assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
+        assert!(!sent_any, "零内容被掐 sent_any 应为 false");
+        assert!(
+            !crate::api_server::is_empty_completion(code, _msg.as_str()),
+            "网络掐断不得计入空完成指纹口径"
+        );
+        assert!(!collect_events(rx).join("\n").contains("message_stop"));
     }
 
     #[test]

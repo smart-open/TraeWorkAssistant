@@ -263,6 +263,9 @@ function defaultSettings(): Settings {
     notify_bark_url: null,
     notify_webhook_url: null,
     notify_serverchan_sendkey: null,
+    notify_pushplus_token: null,
+    notify_pushplus_template: null,
+    notify_pushplus_topic: null,
     // 侧边栏应用显示：默认固定 Trae，其余应用全部显示；
     // BuddyAI（buddy-ai 国际版）默认不展示（独立 opt-in 开关，见应用显示面板）
     pinned_app: 'trae',

@@ -64,35 +64,58 @@ pub(super) fn jwt_claims(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// 系统浏览器打开 URL（仅放行 http/https 且无引号空格）。
-/// URL 必须包一层引号再交给 cmd：裸 URL 里的 `&` 会被 cmd 解析成命令分隔符把链接截断
-/// （实测 `.../login?platform=CLI&state=xxx` 打开后浏览器停在裸登录页，state 丢失）。
-/// 注意必须用 raw_arg 直拼命令行：普通 .arg() 会把参数内嵌引号按 MSVC 规则转义成 `\"`，
-/// cmd 不识别 `\"`，整串会被 start 当成带反斜杠的文件路径（实测报「Windows 找不到文件」）。
+/// 系统浏览器打开 URL（issue #153 修复 4：ShellExecuteW「open」动词直开 URL，
+/// 由系统按协议关联选默认浏览器——cmd start 依赖 shell 解析且控制台隐藏不稳定；
+/// 仅放行 http/https 且无引号空格，单参数直传无 shell 层，& / % 等保留字无需转义）
 #[cfg(windows)]
 pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
     }
-    // 审查修复（P0）：重构时丢失了 `/c`——`cmd start "" "<url>"` 无 /c 时 cmd 不执行
-    // start 而是进交互态立即退出，浏览器打不开（Windows OAuth 链路回归）
-    crate::platform::cmd::sys_command_raw("cmd", &["/c"], &format!("start \"\" \"{url}\""))
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("打开浏览器失败: {e}"))
+    let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb_wide: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb_wide.as_ptr(),
+            url_wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    // 返回值 > 32 = 成功的 HINSTANCE；≤ 32 为 SE_ERR 错误码
+    if result as usize > 32 {
+        Ok(())
+    } else {
+        Err(format!("打开浏览器失败（ShellExecuteW 错误码 {}）", result as usize))
+    }
 }
 
 /// macOS：`open <url>` 走 LaunchServices，无引号转义问题（URL 校验同 Windows 分支）。
+/// 审查修复（Low）：等待退出并校验状态码（对齐 Windows 分支失败可观测口径）。
 #[cfg(target_os = "macos")]
 pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
     }
-    crate::platform::cmd::sys_command("open")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("打开浏览器失败: {e}"))
+    // 审查修复（Low）：改用带超时等待——open 异常挂起时 .output() 会无限阻塞
+    // 命令线程；10s 上限远大于常态 <100ms，超时 kill 保线程可用
+    let mut cmd = crate::platform::cmd::sys_command("open");
+    cmd.arg(url);
+    let status = crate::platform::cmd::sys_status_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| format!("打开浏览器失败: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "打开浏览器失败（open 退出码 {:?}）",
+            status.code()
+        ))
+    }
 }
 
 /// 判断 URL 的 query 中是否已含指定 key（按 & 分段取 = 前缀，大小写不敏感）

@@ -21,11 +21,15 @@ export function parseSampleSystem(sample: string): string | null {
   return m ? m[1] : null;
 }
 
-/** 中性改写策略表（一键生成 to 值）：按序应用首个命中的改写 */
+/** 中性改写策略表（一键生成 to 值）：由 neutralRewrite 按序全量应用（命中即改写，组合句式逐条清洗） */
 export const NEUTRAL_REWRITE: Array<{ re: RegExp; to: string }> = [
   // issue #129：TraeCode harness 身份句——去掉 "in TraeCode" 品牌短语（与后端
   // default_template_map 同口径：to 零品牌词，避免改写句二次指纹化）
   { re: /\s+in TraeCode\b/g, to: '' },
+  // issue #155：ZCode harness 身份句——去掉品牌词 ZCode（与后端默认表同口径：
+  // "You are ZCode, ..." → "You are ..."、"interactive ZCode agent" → "interactive agent"）
+  { re: /\bYou are ZCode, /g, to: 'You are ' },
+  { re: /\binteractive ZCode agent\b/g, to: 'interactive agent' },
   // issue #125（DSH）："You are an AI agent powered by DeepSeek Harness." → "You are an AI agent."
   // 通用化：任意 "powered by <词组> Harness." 句式，句号保留在前半句
   { re: /\s+powered by [\w -]+ Harness\./g, to: '.' },
@@ -58,11 +62,11 @@ export function extractFingerprintFrom(sample: string): string | null {
   }
 }
 
-/** 一键生成 to：应用 NEUTRAL_REWRITE，均未命中返回空串（= 剥离兜底） */
+/** 一键生成 to：按序应用全部命中规则（组合句式逐条清洗，issue #155 双身份句连写），均未命中返回空串（= 剥离兜底） */
 export function neutralRewrite(from: string): string {
+  let out = from;
   for (const { re, to } of NEUTRAL_REWRITE) {
-    const out = from.replace(re, to);
-    if (out !== from) return out;
+    out = out.replace(re, to);
   }
-  return '';
+  return out === from ? '' : out;
 }

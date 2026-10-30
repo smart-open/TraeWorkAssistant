@@ -10,7 +10,7 @@
  *   1. 以两客户端的请求形态（OpenAI 兼容 /v1/chat/completions）打本机网关，
  *      验证「指纹句进站 → 清洗 → 正常完成」链路端到端可用；
  *   2. probe 模式：单请求携带全部已知 harness 身份句（Claude Code / Codex /
- *      OpenCode / TraeCode / Cline / Roo / Gemini CLI），验证清洗生效——
+ *      OpenCode / TraeCode / Cline / Roo / Gemini CLI / ZCode），验证清洗生效——
  *      网关调度日志应出现「11128 强制清洗重试；模板命中: …」或命中计数；
  *   3. --system-file 注入真实抓包的 system prompt（ZCode/DSH 迭代通道：
  *      跑真实客户端抓包 → 注入本脚本复现 → 未布防则写 wb_template_map.json 热更新）。
@@ -47,11 +47,13 @@ const DSH_SYSTEM =
   "- Working directory: d:\\demo-project\n" +
   "- Platform: win32\n";
 
-// ZCode（Z.ai 桌面 harness，GLM 系）：身份句无公开资料，此处为 speculative
-// 占位（含 ZCode 字样便于日志反查）；真实句请抓包后经 --system-file 注入
+// ZCode（Z.ai 桌面 harness，GLM 系）：issue #155 实证身份句（用户指纹样本
+// 抓包原文，pool=trae 空完成影子风控），已布防 default_template_map
 const ZCODE_SYSTEM =
-  "You are ZCode Agent, the default agent in ZCode. " +
-  "You help the user with software engineering tasks.\n\n" +
+  // 双身份句连写形态（与 issue #155 指纹样本原文一致：两句间无句号，前端
+  // extractFingerprintFrom 按首个 '. ' 截取会把两句并成一个 from）
+  "You are ZCode, an interactive coding agent " +
+  "You are an interactive ZCode agent that helps users with software engineering tasks.\n\n" +
   "# Workspace\n" +
   "- Workspace root: d:\\demo-project\n";
 
@@ -64,6 +66,9 @@ const PROBE_SYSTEM = [
   "You are Codex, a coding agent based on GPT-5.",
   "You are a coding agent running in the Codex CLI.",
   TRAE_CODE_SENTENCE,
+  // ZCode 实证句（issue #155，与 ZCODE_SYSTEM 同源，已布防 default_template_map）
+  "You are ZCode, an interactive coding agent",
+  "You are an interactive ZCode agent that helps users with software engineering tasks.",
   "You are Cline, a highly skilled software engineer with extensive knowledge",
   "You are Roo, a highly skilled software engineer with extensive knowledge",
   "You are an interactive CLI agent specializing in software engineering tasks.",

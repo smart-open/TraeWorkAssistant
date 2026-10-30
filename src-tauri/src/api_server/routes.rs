@@ -388,10 +388,15 @@ pub(crate) fn dispatch_error_response(
             // 审查修复（模型冷却归因）：池标识改取错误携带的真实目标池，不再
             // 硬编码 "buddy"——buddy-ai/qoder 的模型级 429 在 API 请求日志与
             // 用量看板中按发起池准确归因
+            // issue #158 P0-1：ModelCooling 到达客户端即意味着无跨池回退
+            // （dispatch 层 can_fallback=false：单源/fallback 关闭/无后续可用源），
+            // 响应体附加排障指引——日志评论区高频疑问「为啥 429 不自动换池」
             DispatchError::ModelCooling(rem, pool) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 pool.as_str(),
-                format!("model {model} cooling down, retry after {rem}s"),
+                format!(
+                    "model {model} cooling down, retry after {rem}s（当前无跨池回退可用：该模型仅此上游或无后续可用源；如需自动切池，可在 API 服务页「资源总览」的 per_model 模型绑定池中为该模型配置备用上游池）"
+                ),
                 "model_cooldown",
                 "rate_limit_error",
             ),
@@ -426,8 +431,17 @@ pub(crate) fn dispatch_error_response(
 /// pool 取池标识（"trae"/"buddy"/"qoder"）：池名与处置建议按池区分（审查 2026-10-07
 /// ——原实现三池共用 trae 文案；qoder 无 wb_template_map/sanitize 机制，其空完成
 /// 根因是设备指纹分桶，正确处置是在真实客户端建立设备信任）。trae 文案与原实现
-/// 逐字一致（存量测试/日志兼容）
-pub(crate) fn exhaust_message(pool: &str, empty_hits: usize, rotated: usize, healthy_total: usize) -> (String, &'static str) {
+/// 逐字一致（存量测试/日志兼容）。
+/// issue #156：`hard` = 池内处于积分耗尽硬冷却（次日 04:00 恢复）的账号数，
+/// >0 时在消息中携带冷却原因与恢复时间，使客户端可见「积分耗尽 04:00 重置」
+/// （此前该语义只在管理端徽标与日志，对 API 客户端隐形）
+pub(crate) fn exhaust_message(
+    pool: &str,
+    empty_hits: usize,
+    rotated: usize,
+    healthy_total: usize,
+    hard: usize,
+) -> (String, &'static str) {
     if rotated >= 2 && empty_hits * 2 > rotated {
         let pool_upper = match pool {
             "buddy" => "WB",
@@ -444,6 +458,22 @@ pub(crate) fn exhaust_message(pool: &str, empty_hits: usize, rotated: usize, hea
                 "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts ({pool_upper} shadow risk control, account/model agnostic — switching won't help); {advice} (pool={pool} healthy={healthy_total}); client agent-tool fingerprint suspected too (issue #150) — configure the 'Tool Alias' tab in API Manager (治本) or disable agent tools / plain chat on the client to bypass it",
             ),
             "CHANNEL_FINGERPRINT_BLOCK",
+        )
+    } else if hard > 0 {
+        // issue #156：积分耗尽硬冷却账号存在时，携带冷却原因与次日 04:00 恢复
+        // 语义。hard 冷却账号不参与轮换（healthy() 直接剔除），rotated 计的是
+        // 本次实际试过且因其他原因（401/429/5xx/超时）失败的账号——rotated>0
+        // 时补充诚实语境，避免把其他失败也归因于积分耗尽
+        let rotated_note = if rotated > 0 {
+            format!("; {rotated} further account(s) also failed this rotation")
+        } else {
+            String::new()
+        };
+        (
+            format!(
+                "no healthy account available: credit exhausted on {hard} account(s), auto-retry after next 04:00 (Asia/Shanghai daily reset){rotated_note}; top up credits or switch accounts to recover sooner"
+            ),
+            "NO_HEALTHY_ACCOUNT_CREDIT",
         )
     } else {
         (
@@ -471,8 +501,22 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
         TargetPool::Custom => return "no healthy account available".to_string(),
     };
     let (healthy_total, _) = pool_ref.selectable_stats_in(None, false);
+    // issue #156：积分耗尽（硬冷却到次日 04:00）账号数 >0 时在诊断消息中携带
+    // 冷却原因与恢复时间——此前该语义只体现在管理端徽标，对 API 客户端隐形
+    let (hard_credit_cnt, hard_until) = pool_ref.hard_credit_stats();
+    let hard_note = if hard_credit_cnt > 0 {
+        match hard_until {
+            Some(ts) => {
+                let remain = ts.saturating_sub(now_ts() as i64);
+                format!(" credit_exhausted={hard_credit_cnt} (auto-retry in ~{remain}s at next 04:00 Asia/Shanghai)")
+            }
+            None => format!(" credit_exhausted={hard_credit_cnt}"),
+        }
+    } else {
+        String::new()
+    };
     let base = format!(
-        "no healthy account available (pool={} healthy={healthy_total})",
+        "no healthy account available (pool={} healthy={healthy_total}){hard_note}",
         pool.as_str(),
     );
     // 单锁快照：一次取（展示名, 约束），替代 constraints_for + key_name_for 双加锁
@@ -1871,6 +1915,12 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        // 11128 显式指纹确认置位（issue #122 缺口3 审查补口）：强制清洗 rebuild 后
+        // 同号重试直接消费 rebuild 结果（内层循环不重算 converted），但换号到下一
+        // 账号 / 触发对冲竞速时循环顶会以 empty_hits>0 || fp_block_recent 重算激进
+        // 位——纯 11128 首拦两条件均假，激进意图被丢弃且主/对冲清洗强度不一致。
+        // 此处置位后循环顶与对冲重建统一沿用全力清洗
+        let mut force_aggressive = false;
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
         // 工具别名表（issue #150）：sanitize 门控下请求侧正向改写 + 响应侧逆映射
         // 回改（客户端按名匹配 tool_calls，单向改名即废）；表热更新、保存即生效
@@ -1929,15 +1979,15 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             last_bound_uid = Some(picked.uid.clone());
 
             // 多候选改写种子（issue #122 方案 C1）：tried.len() 随换号轮换递增；
-            // 空完成后（empty_hits>0）或池级指纹拦截 TTL 内（issue #122 缺口2）
-            // 追加激进清洗（issue #122 方案 C2）
+            // 空完成后（empty_hits>0）、池级指纹拦截 TTL 内（issue #122 缺口2）
+            // 或 11128 强制清洗置位（force_aggressive）时追加激进清洗（方案 C2）
             let seed = super::wb_payload::variant_seed(&seed_base, tried.len() as u64);
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
                 sanitize, &templates,
-                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
+                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae") || force_aggressive,
             );
             // 工具别名正向改写（issue #150）：sanitize 门控；逆映射供响应侧回改
             //（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，零命中 None 直通）
@@ -1978,10 +2028,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             &state, &picked.uid, reader, primary_hdr, &tried, trae_allowed.as_ref(),
                             trae_dedicated.as_deref(), &body_vec, sanitize, &templates,
                             &tool_alias_rules,
-                            // 对冲重建沿用主请求的激进口径与种子基准（issue #122
-                            // C1/C2）：种子在 race_trae_first_byte 内经黄金比例
-                            // 翻搅，主/对冲异种子异指纹；激进口径原样沿用
-                            seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
+                            // 对冲重建沿用主请求的激进口径与种子（issue #122 C1/C2；
+                            // 11128 强制清洗后 force_aggressive 贯穿，主/对冲同强度）
+                            seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae") || force_aggressive,
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -2111,6 +2160,44 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 );
                                 break; // 退出重试循环 → 换号
                             }
+                            // 传输层掐断哨兵（issue #158 报错A，P2-1）：上游 h2
+                            // RST_STREAM/连接重置掐断长流——与账号质量无关：不冷却、
+                            // 不解绑粘性、不计空完成指纹。须在 classify_solo_error
+                            // 之前预检（哨兵码经分类器会落 Server 误冷却）。按
+                            // sent_any 分流：
+                            // - 有内容被掐：sse 层已补收尾帧，客户端正常收完——
+                            //   就地收尾落账（success=false，诚实记账），结构化
+                            //   日志让「~5min 长流被掐」从不可见变可见
+                            // - 零内容被掐：错误帧未下发，换号重试（不落账，
+                            //   中间态与空完成换号同口径）
+                            if super::is_transport_cut(code, &msg) {
+                                if sent_any {
+                                    state.logger.log_request_ttfb(
+                                        "trae", "POST", proto.log_path(), &model, stream,
+                                        200, &win_uid, duration_ms, ttfb_ms, &key_name,
+                                        &state.pool.name_of(&win_uid),
+                                        Some(&format!(
+                                            "长流被上游掐断（{}）→ 就地收尾 [upstream: {}]",
+                                            safe_slice(&msg, 160),
+                                            upstream_hdr
+                                        )),
+                                    );
+                                    if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                        state.logger.log_debug(&win_uid, &converted, None, 200, Some(&msg));
+                                    }
+                                    return;
+                                }
+                                state.logger.log_request_ttfb(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    200, &win_uid, duration_ms, ttfb_ms, &key_name,
+                                    &state.pool.name_of(&win_uid),
+                                    Some(&format!(
+                                        "传输层掐断（未流出）→ 换号重试 [upstream: {}]",
+                                        upstream_hdr
+                                    )),
+                                );
+                                break; // 退出重试循环 → 换号
+                            }
                             let kind = classify_solo_error(code, &msg);
                             if kind != ErrKind::None {
                                 state.pool.note_error(&win_uid, kind);
@@ -2186,6 +2273,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
                             if !sanitize {
                                 sanitize = true;
+                                // 激进口径贯穿（issue #122 缺口3）：置位后换号/对冲重建
+                                // 仍全力清洗，不被循环顶重算丢弃
+                                force_aggressive = true;
                                 state.logger.log_sched_event(&format!(
                                     "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
                                 ));
@@ -2341,7 +2431,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // duration/ttfb），此处池耗尽终态落一行（uid="none"、零 tokens）
         state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
-        let (exhaust_msg, exhaust_tag) = exhaust_message("trae", empty_hits, attempts, healthy_total);
+        let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
+        let (exhaust_msg, exhaust_tag) =
+            exhaust_message("trae", empty_hits, attempts, healthy_total, hard_credit_cnt);
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
         super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
@@ -2496,6 +2588,12 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
         // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        // 11128 显式指纹确认置位（issue #122 缺口3 审查补口）：强制清洗 rebuild 后
+        // 同号重试直接消费 rebuild 结果（内层循环不重算 converted），但换号到下一
+        // 账号 / 触发对冲竞速时循环顶会以 empty_hits>0 || fp_block_recent 重算激进
+        // 位——纯 11128 首拦两条件均假，激进意图被丢弃且主/对冲清洗强度不一致。
+        // 此处置位后循环顶与对冲重建统一沿用全力清洗
+        let mut force_aggressive = false;
         let templates = super::wb_route::load_templates(&super::wb_route::WbView::wb(state.clone()));
         // 工具别名表（issue #150）：sanitize 门控下请求侧正向改写 + 响应侧逆映射
         // 回改（客户端按名匹配 tool_calls，单向改名即废）；表热更新、保存即生效
@@ -2541,15 +2639,15 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
             // 多候选改写种子（issue #122 方案 C1）：tried.len() 随换号轮换递增；
-            // 空完成后（empty_hits>0）或池级指纹拦截 TTL 内（issue #122 缺口2）
-            // 追加激进清洗（issue #122 方案 C2）
+            // 空完成后（empty_hits>0）、池级指纹拦截 TTL 内（issue #122 缺口2）
+            // 或 11128 强制清洗置位（force_aggressive）时追加激进清洗（方案 C2）
             let seed = super::wb_payload::variant_seed(&seed_base, tried.len() as u64);
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
                 sanitize, &templates,
-                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae"),
+                seed, empty_hits > 0 || super::wb_payload::fp_block_recent("trae") || force_aggressive,
             );
             // 工具别名正向改写（issue #150）：sanitize 门控；逆映射供响应侧回改
             //（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，零命中 None 直通）
@@ -2643,6 +2741,20 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 return Ok(r);
                             }
                             (None, Some((code, msg))) => {
+                                // 传输层掐断预检（issue #158 报错A，P2-1 聚合侧补齐，
+                                // 须在 classify_solo_error 之前——与流式侧 2119 行同口径）：
+                                // 账号无关传输故障，不冷却、不解绑粘性、不计空完成指纹；
+                                // 非流式未向客户端发出任何内容，直接丢弃截断响应 break 换号
+                                //（截断的部分响应可能含残缺 tool_calls，不得当成功交付）
+                                if super::is_transport_cut(code, &msg) {
+                                    state.logger.log_request(
+                                        "trae", "POST", proto.log_path(), &model, stream,
+                                        200, &picked.uid, duration_ms, &key_name,
+                                        &state.pool.name_of(&picked.uid),
+                                        Some("传输层掐断（聚合响应已丢弃）→ 换号重试"),
+                                    );
+                                    break; // 换号
+                                }
                                 // 空完成哨兵（-9901，影子风控）计入指纹拦截观测；
                                 // 冷却行为维持现状（classify_solo_error → Server）
                                 if super::is_empty_completion(code, &msg) {
@@ -2715,6 +2827,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
                             if !sanitize {
                                 sanitize = true;
+                                // 激进口径贯穿（issue #122 缺口3）：置位后换号重建
+                                // 仍全力清洗，不被循环顶重算丢弃
+                                force_aggressive = true;
                                 state.logger.log_sched_event(&format!(
                                     "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
                                 ));
@@ -2842,7 +2957,9 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         // 轮换耗尽收尾：空完成主导 → 明示渠道指纹拦截语义，否则维持原文案
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
-        let (exhaust_msg, exhaust_tag) = exhaust_message("trae", empty_hits, attempts, healthy_total);
+        let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
+        let (exhaust_msg, exhaust_tag) =
+            exhaust_message("trae", empty_hits, attempts, healthy_total, hard_credit_cnt);
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
         super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
@@ -3471,7 +3588,7 @@ mod tests {
     #[test]
     fn exhaust_message_empty_hits_indicates_fingerprint_block() {
         // 空完成主导：明示指纹拦截语义（账号/模型无关），带清洗规则表提示与健康计数
-        let (msg, tag) = exhaust_message("trae", 3, 3, 4);
+        let (msg, tag) = exhaust_message("trae", 3, 3, 4, 0);
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert!(msg.contains("3 empty completion(s) across 3 rotated accounts"), "{msg}");
         assert!(msg.contains("healthy=4"), "{msg}");
@@ -3484,7 +3601,7 @@ mod tests {
     #[test]
     fn exhaust_message_no_empty_hits_keeps_original() {
         // 无空完成（401/429/5xx 等真实不健康）：维持原文案，避免误导
-        let (msg, tag) = exhaust_message("trae", 0, 3, 0);
+        let (msg, tag) = exhaust_message("trae", 0, 3, 0, 0);
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
@@ -3493,7 +3610,7 @@ mod tests {
     fn exhaust_message_single_empty_hit_keeps_original() {
         // issue #130 防误报：单号轮换 + 1 次空完成（样本不足）不宣判指纹拦截，
         // 上游瞬时抖动同样返回空完成，"switching won't help" 会误导排障方向
-        let (msg, tag) = exhaust_message("trae", 1, 1, 3);
+        let (msg, tag) = exhaust_message("trae", 1, 1, 3, 0);
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
@@ -3502,7 +3619,7 @@ mod tests {
     fn exhaust_message_minority_empty_hits_keeps_original() {
         // 混合失败：仅 1 次空完成 + 其余限流/5xx，空完成非主导 → 不宣判指纹拦截，
         // 避免 "switching won't help" 误导排障方向（限流等待冷却即可自愈）
-        let (msg, tag) = exhaust_message("trae", 1, 10, 2);
+        let (msg, tag) = exhaust_message("trae", 1, 10, 2, 0);
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
@@ -3510,7 +3627,7 @@ mod tests {
     #[test]
     fn exhaust_message_majority_empty_hits_indicates_fingerprint_block() {
         // 过半轮换账号返回空完成（6/10）→ 判定指纹拦截主导
-        let (msg, tag) = exhaust_message("trae", 6, 10, 2);
+        let (msg, tag) = exhaust_message("trae", 6, 10, 2, 0);
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
     }
@@ -3519,7 +3636,7 @@ mod tests {
     fn exhaust_message_qoder_pool_gets_device_trust_advice() {
         // qoder 池无 wb_template_map/sanitize 机制：处置建议指向客户端设备信任，
         // 池名展示为 Qoder（审查 2026-10-07 按池区分归因文案）
-        let (msg, tag) = exhaust_message("qoder", 6, 10, 2);
+        let (msg, tag) = exhaust_message("qoder", 6, 10, 2, 0);
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert!(msg.contains("Qoder shadow risk control"), "{msg}");
         assert!(msg.contains("rebuild device trust"), "{msg}");
@@ -3531,11 +3648,31 @@ mod tests {
     #[test]
     fn exhaust_message_buddy_pool_labels_wb() {
         // buddy 池沿用清洗规则表建议，池名展示为 WB
-        let (msg, tag) = exhaust_message("buddy", 3, 3, 4);
+        let (msg, tag) = exhaust_message("buddy", 3, 3, 4, 0);
         assert!(msg.contains("WB shadow risk control"), "{msg}");
         assert!(msg.contains("wb_template_map.json"), "{msg}");
         assert!(msg.contains("pool=buddy"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+    }
+
+    #[test]
+    fn exhaust_message_hard_credit_carries_0400_reset_hint() {
+        // issue #156：无空完成但存在积分耗尽硬冷却账号 → 消息携带冷却原因与
+        // 次日 04:00 恢复语义，客户端可见「积分耗尽 04:00 重置」而非裸 no healthy
+        let (msg, tag) = exhaust_message("trae", 0, 3, 0, 2);
+        assert!(msg.contains("no healthy account available"), "{msg}");
+        assert!(msg.contains("credit exhausted on 2 account(s)"), "{msg}");
+        assert!(msg.contains("next 04:00"), "{msg}");
+        assert_eq!(tag, "NO_HEALTHY_ACCOUNT_CREDIT");
+        // 混合失败诚实语境：轮换过其他账号（如 401 软熔断）时补充 further note，
+        // 避免把其他失败也归因于积分耗尽
+        let (msg_mix, _) = exhaust_message("trae", 0, 1, 0, 2);
+        assert!(msg_mix.contains("credit exhausted on 2 account(s)"), "{msg_mix}");
+        assert!(msg_mix.contains("1 further account(s) also failed this rotation"), "{msg_mix}");
+        // 指纹拦截主导优先级高于积分耗尽提示（指纹拦截与账号无关，积分提示会误导）
+        let (msg_fp, tag_fp) = exhaust_message("trae", 6, 10, 2, 2);
+        assert!(msg_fp.contains("channel fingerprint block suspected"), "{msg_fp}");
+        assert_eq!(tag_fp, "CHANNEL_FINGERPRINT_BLOCK");
     }
 
     // ==================== /v1/models 条目可见性（issue #145） ====================
@@ -3687,6 +3824,7 @@ mod tests {
             qoder_identity: None,
             qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
             buddy_ai_sticky: super::super::wb_sticky::StickyStore::default(),

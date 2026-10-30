@@ -107,12 +107,24 @@ export default function App() {
   const init = useAppStore((s) => s.init);
   const ready = useAppStore((s) => s.ready);
   const settings = useAppStore((s) => s.settings);
+  const platform = useAppStore((s) => s.platform);
 
   useEffect(() => {
     void init().catch((err) => {
       console.error('初始化失败:', err);
     });
   }, [init]);
+
+  // issue #152 审查修复：最小宽度按平台分档——1920px 是 Windows 高 DPI（2x 缩放
+  // ≈3840 物理像素）的防挤压口径，mac 内建屏逻辑视口普遍 1440-1728 CSS px，
+  // 恒小于 1920 会永久横向滚动。mac 降档 1440px（覆盖全系内建屏 + 常见外接），
+  // Windows 口径不变；platform_info 拉取成功后覆盖（init 前按 UA 兜底也已正确）
+  useEffect(() => {
+    document.documentElement.style.setProperty(
+      '--app-min-width',
+      platform === 'macos' ? '1440px' : '1920px',
+    );
+  }, [platform]);
 
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
@@ -141,12 +153,15 @@ export default function App() {
   return (
     <div className="flex h-full flex-col bg-slate-100 text-slate-800 dark:bg-zinc-950 dark:text-zinc-100">
       <TitleBar />
-      <div className="flex min-h-0 flex-1">
-        <Sidebar view={view} onNav={setView} />
-        <main className="relative flex min-w-0 flex-1 flex-col">
-          <TopBar />
-          <div className="relative min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
-        </main>
+      {/* issue #152：横向滚动容器。视口 < --app-min-width 时内容行整体滚动，不再挤压布局 */}
+      <div className="min-h-0 flex-1 overflow-x-auto">
+        <div className="flex h-full min-w-[var(--app-min-width)]">
+          <Sidebar view={view} onNav={setView} />
+          <main className="relative flex min-w-0 flex-1 flex-col">
+            <TopBar />
+            <div className="relative min-h-0 flex-1 overflow-auto p-5">{renderView(view)}</div>
+          </main>
+        </div>
       </div>
       <Toaster />
       {/* 全局 API 管理弹窗（任意 activeApp 视图均可打开，unified-api-gateway-design §5.2） */}

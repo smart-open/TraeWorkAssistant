@@ -147,7 +147,7 @@ pub struct WorkBuddySettings {
     /// ⑤ 最小剩余积分：目标低于该值不切（0 = 关闭）
     #[serde(default)]
     pub cli_min_remaining_credits: f64,
-    // 失败通知渠道（F-19）：已迁移至 app Settings（通知渠道面板，Trae/Buddy 全平台共用）
+    // 失败通知渠道（F-19）：已迁移至 app Settings（通知渠道面板，全部应用共用）
     // UI 坐标点击签到兜底（F-18，批次4 T4.2）：仅手动触发，默认关闭
     #[serde(default)]
     pub ui_click_enabled: bool,
@@ -227,14 +227,49 @@ pub(crate) fn load_settings(state: &AppState) -> WorkBuddySettings {
     s
 }
 
-/// 失败通知统一入口（F-19；通知渠道面板，Trae/Buddy 全平台共用）：
-/// 桌面通知（有 AppHandle 时）+ Bark/通用 Webhook/Server酱 可选渠道。
+/// 失败通知统一入口（F-19；通知渠道面板，全部应用共用）：
+/// 桌面通知（有 AppHandle 时）+ Bark/通用 Webhook/Server酱/PushPlus 可选渠道。
 /// 配置来自 app Settings（kv `app_settings`，通知渠道面板维护）；
 /// 总开关 + 事件开关过滤；渠道失败静默记日志，不影响主流程。
 pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &str, body: &str, event: crate::notify::NotifyEvent) {
+    let Some(channels) = resolve_notify_channels(data_dir, event) else {
+        return;
+    };
+    crate::notify::notify_all(app, data_dir, title, body, &channels);
+}
+
+/// 后台线程版 push_notify（审查修复 M，托盘专用）：开关过滤留在调用线程快路径
+///（过滤命中直接返回，零开销），四渠道 HTTP 分发（最坏 ~40s）移交后台线程——
+/// 托盘菜单回调运行在主线程，同步版会让 UI 事件循环（托盘/菜单响应）最长卡
+/// 40s（#157 PushPlus 加第四渠道后阻塞面进一步放大）。同步版保持原语义供
+/// 后台任务线程与同步时序测试使用。
+pub fn push_notify_bg(
+    app: Option<AppHandle>,
+    data_dir: std::path::PathBuf,
+    title: &str,
+    body: &str,
+    event: crate::notify::NotifyEvent,
+) {
+    let Some(channels) = resolve_notify_channels(&data_dir, event) else {
+        return;
+    };
+    let title = title.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        crate::notify::notify_all(app.as_ref(), &data_dir, &title, &body, &channels);
+    });
+}
+
+/// 开关过滤 + 渠道装配（push_notify / push_notify_bg 共用前置段，上游同源
+/// dfa6e02）：
+/// None = 被总开关/事件开关过滤，调用方直接返回
+fn resolve_notify_channels(
+    data_dir: &std::path::Path,
+    event: crate::notify::NotifyEvent,
+) -> Option<crate::notify::NotifyChannels> {
     let s: crate::models::Settings = crate::store::db(data_dir).kv_get("app_settings");
     if !s.notify_enabled {
-        return;
+        return None;
     }
     let on = match event {
         crate::notify::NotifyEvent::CheckinDone => s.notify_on_checkin,
@@ -242,14 +277,16 @@ pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &
         crate::notify::NotifyEvent::Other => true,
     };
     if !on {
-        return;
+        return None;
     }
-    let channels = crate::notify::NotifyChannels {
+    Some(crate::notify::NotifyChannels {
         bark_url: s.notify_bark_url.clone().filter(|x| !x.trim().is_empty()),
         wechat_webhook: s.notify_webhook_url.clone().filter(|x| !x.trim().is_empty()),
         serverchan_sendkey: s.notify_serverchan_sendkey.clone().filter(|x| !x.trim().is_empty()),
-    };
-    crate::notify::notify_all(app, data_dir, title, body, &channels);
+        pushplus_token: s.notify_pushplus_token.clone().filter(|x| !x.trim().is_empty()),
+        pushplus_template: s.notify_pushplus_template.clone(),
+        pushplus_topic: s.notify_pushplus_topic.clone(),
+    })
 }
 
 pub(super) fn is_running() -> bool {

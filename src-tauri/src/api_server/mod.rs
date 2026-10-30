@@ -88,9 +88,9 @@ pub struct ApiSharedState {
     /// buddy-ai 显式会话粘性开关（§4.2：qoder_sticky_enabled 同款独立开关，
     /// 默认关——国际档显式开启制；wb 档粘性恒开不受此字段影响）
     pub buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool,
-    /// Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：开启时该模型目录
-    /// 倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游活动结束后关闭恢复
-    /// 官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
+    /// 免费活动模型倍率覆盖（issue #111/#156，默认开）：开启时 Qwen3.8-Flash /
+    /// DeepSeek-Flash 目录倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游
+    /// 活动结束后关闭恢复官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
     pub qoder_flash_free_rate: std::sync::atomic::AtomicBool,
     /// 会话粘性双模式存储（T2.4/F-31，仅 WB 上游消费）
     pub wb_sticky: wb_sticky::StickyStore,
@@ -166,6 +166,10 @@ pub struct ApiSharedState {
     /// Qoder 会话粘性存储（F-80-余 v2）：与 wb_sticky 共用 sticky_bindings 表，
     /// 键命名空间 "q:" 隔离，互不串绑
     pub qoder_sticky: wb_sticky::StickyStore,
+    /// Qoder 池指纹清洗开关（issue #158，默认开）：请求侧 sanitize + 模板映射 +
+    /// 工具别名正向改写、响应侧逆映射回改；与 Trae 池 wb_sanitize 独立（池级
+    /// 风控画像不同，分开治理），UI「指纹清洗」tab 池级开关热切换
+    pub qoder_sanitize: std::sync::atomic::AtomicBool,
     // ── Buddy 国际版（buddy-ai）独立池（§3.4 隔离清单）─────────────────────
     /// buddy-ai 上游账号池：与 wb 池并列的独立池实例（§3.1 硬约束 1：禁止混居；
     /// 阶段 1 仅注册 + healthz selectable，dispatch 接线在阶段 2）
@@ -241,6 +245,7 @@ pub(crate) fn test_shared_state(data_dir: std::path::PathBuf) -> ApiSharedState 
         qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
         qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
         qoder_sticky: wb_sticky::StickyStore::default(),
+        qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
         trae_sticky: wb_sticky::StickyStore::default(),
         buddy_ai_pool: pool::ApiPool::new(),
         buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -860,6 +865,51 @@ pub fn is_empty_completion(code: i64, msg: &str) -> bool {
     code == EMPTY_COMPLETION_CODE || msg.starts_with("empty completion:")
 }
 
+// ==================== 传输层掐断识别（issue #158 报错A，P2-1） ====================
+
+/// 传输层掐断哨兵码：上游 h2 RST_STREAM / 连接重置等传输层错误掐断长流。
+/// 与账号质量无关（classify_solo_error 对该码落 Server 仅为 rotating 计算
+/// 兜底），调用方 routes 须在 classify 之前经 is_transport_cut 预检——
+/// 不冷却、不解绑粘性、不计空完成指纹，按 sent_any 分流（就地收尾/换号）
+pub const TRANSPORT_CUT_CODE: i64 = -9902;
+pub const TRANSPORT_CUT_MSG_PREFIX: &str = "transport cut:";
+
+/// 传输层掐断文案识别（issue #158 报错A：Trae 池 ~5min 长流被上游
+/// RST_STREAM 掐断）。仅作用于 io::Error 的 Display 文本（reqwest/hyper
+/// 传输层错误消息），不作用于上游业务错误消息——业务侧 4xx/5xx 文本即使
+/// 含相近词也不会走到这里（读错误只可能来自传输层）。
+/// 特征词按子串宽匹配（"http2"/"stream error" 偏宽）：误报后果是把普通读错误
+/// 也按掐断处理（不冷却/换号而非折叠 EOF），比漏报保守——审查决议维持现状，
+/// 出现误判样本再收紧
+pub fn is_transport_cut_text(text: &str) -> bool {
+    let m = text.to_ascii_lowercase();
+    m.contains("rst_stream")
+        || m.contains("rst stream")
+        || m.contains("stream error")
+        || m.contains("http2")
+        || m.contains("h2 error")
+        || m.contains("goaway")
+        || m.contains("connection reset")
+        || m.contains("broken pipe")
+        || m.contains("connection closed before")
+}
+
+/// 判定是否传输层掐断哨兵（对齐 is_empty_completion 双口径：码相等 ||
+/// msg 前缀；sse 层上抛 / routes 消费共用）
+pub fn is_transport_cut(code: i64, msg: &str) -> bool {
+    code == TRANSPORT_CUT_CODE || msg.starts_with(TRANSPORT_CUT_MSG_PREFIX)
+}
+
+/// 从 wb_upstream 读错误共享槽构建传输掐断哨兵（issue #158 P2-2）：
+/// 竞速桥接/tracked 行源路径的读错误被 Box 擦拭类型后，wb_sse 层只见桥
+/// EOF，路由层在 EOF 兜底处经此取出上抛。槽空返回 None（正常完成）
+pub fn transport_cut_from_slot(
+    slot: &crate::api_server::wb_upstream::ReadErrSlot,
+) -> Option<(i64, String)> {
+    crate::api_server::wb_upstream::take_read_error_slot(slot)
+        .map(|e| (TRANSPORT_CUT_CODE, format!("{TRANSPORT_CUT_MSG_PREFIX} {e}")))
+}
+
 /// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
 /// 无正文 + 无思考链 + 无工具调用即视为空完成（换号重试）。
 /// legacy `message.function_call` 一并判定（防御性：聚合器当前会把
@@ -1002,6 +1052,7 @@ mod inflight_tests {
             qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: wb_sticky::StickyStore::default(),
+            qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
             trae_sticky: wb_sticky::StickyStore::default(),
             buddy_ai_sticky: wb_sticky::StickyStore::default(),
             buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),

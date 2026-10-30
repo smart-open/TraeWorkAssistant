@@ -246,8 +246,8 @@ export default function UsageStatsPanel() {
   const [sessError, setSessError] = useState<string | null>(null);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<UsageSessionView[] | null>(null);
-  // 明细查询失败态（3.8.5 审查 M-B2）：失败与「无明细」同文案会被误读为
-  // 该会话确实没有流水，对齐列表侧 SessionsTab No.11 错误态口径
+  // 明细加载失败独立错误态（审查 M-B2）：失败静默归空会被误读为「无请求级明细」，
+  // 对齐列表侧 sessError「失败不得伪装成空数据」口径
   const [detailError, setDetailError] = useState(false);
   const sessSeqRef = useRef(0);
   // 明细请求序号守卫（对齐 SessionsTab）：快速切换展开行时旧响应可能后到，
@@ -259,15 +259,16 @@ export default function UsageStatsPanel() {
     setSessLoading(true);
     try {
       const end = localDateStr(new Date());
-      // 近 N 天起点用日历运算（3.8.5 审查 L5：毫秒减法跨 DST 边界会偏移一天）
-      const startD = new Date();
-      startD.setDate(startD.getDate() - (d - 1));
-      const start = localDateStr(startD);
+      // 起点用日历回退（setDate）而非毫秒减法（3.8.5 审查 L5）：跨 DST 边界时
+      // 86400000*d 不等于 d 个自然日，毫秒偏移会把起点错推一天
+      const startDt = new Date();
+      startDt.setDate(startDt.getDate() - (d - 1));
+      const start = localDateStr(startDt);
       const r = await api.apiServer.customSessionsQuery({ start, end, page: p, pageSize: 20 });
       if (seq === sessSeqRef.current) {
         setSessData(r);
-        // 后端越界页夹取后回写（3.8.5 审查 L4）：否则本地 state 与实际页码分叉，
-        // 下次切天数仍以旧页发起（功能不出错，仅状态不同步）
+        // 后端越界页夹取后回写实际页码（审查 L4）：否则本地 state 与实际页码
+        // 分叉、分页器停留在越界页展示与数据错位，下次切天数仍以旧页发起
         setSessPage(r.page);
         setSessError(null);
       }
@@ -314,8 +315,8 @@ export default function UsageStatsPanel() {
       })
       .catch(() => {
         if (seq !== detailSeqRef.current) return;
-        setDetailError(true);
         setDetail(null);
+        setDetailError(true);
       });
   };
 

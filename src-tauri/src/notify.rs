@@ -1,8 +1,8 @@
 //! 系统通知封装（tauri-plugin-notification，Rust 侧）+ 失败通知渠道分发（F-19，批次3 T3.6）。
 //!
 //! 用于托盘操作、后台任务（签到完成 / API 服务启停）等无窗口交互场景的结果反馈。
-//! F-19 渠道扩展：企业微信群机器人 webhook / Server酱——作为桌面通知之外的可选渠道，
-//! 由 workbuddy_settings.json 配置；渠道失败静默记日志，绝不影响主流程。
+//! F-19 渠道扩展：企业微信群机器人 webhook / Server酱 / PushPlus（issue #157）——
+//! 作为桌面通知之外的可选渠道，由 app Settings 配置；渠道失败静默记日志，绝不影响主流程。
 
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
@@ -12,7 +12,7 @@ pub fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
-// ── F-19 通知渠道（Trae/Buddy 全平台共用，配置存 app Settings） ─────────────
+// ── F-19 通知渠道（全部应用共用，配置存 app Settings） ─────────────
 
 /// 通知事件类别：用于按事件开关过滤推送（总开关之后二级过滤）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,14 +34,25 @@ pub struct NotifyChannels {
     pub wechat_webhook: Option<String>,
     /// Server酱 SendKey（https://sctapi.ftqq.com/<sendkey>.send）
     pub serverchan_sendkey: Option<String>,
+    /// PushPlus Token（https://www.pushplus.plus/send；空 = 关闭该渠道）
+    pub pushplus_token: Option<String>,
+    /// PushPlus 推送模板 html/txt/markdown（空 = 默认 txt，纯文本保留换行）
+    pub pushplus_template: Option<String>,
+    /// PushPlus 群组编码 topic（一对多群发；空 = 仅发给自己）
+    pub pushplus_topic: Option<String>,
 }
 
 impl NotifyChannels {
-    /// 三渠道均未配置
+    /// 四渠道均未配置（PushPlus 仅以 token 是否配置为准，模板/群组编码是其从属项）
     pub fn is_empty(&self) -> bool {
-        [self.bark_url.as_deref(), self.wechat_webhook.as_deref(), self.serverchan_sendkey.as_deref()]
-            .iter()
-            .all(|c| c.map_or(true, |s| s.trim().is_empty()))
+        [
+            self.bark_url.as_deref(),
+            self.wechat_webhook.as_deref(),
+            self.serverchan_sendkey.as_deref(),
+            self.pushplus_token.as_deref(),
+        ]
+        .iter()
+        .all(|c| c.map_or(true, |s| s.trim().is_empty()))
     }
 }
 
@@ -111,6 +122,77 @@ pub fn notify_serverchan(sendkey: &str, title: &str, body: &str) -> Result<(), S
     Ok(())
 }
 
+/// PushPlus 允许的模板白名单（issue #157：html / txt / markdown）
+const PUSHPLUS_TEMPLATES: [&str; 3] = ["html", "txt", "markdown"];
+
+/// 解析 PushPlus 响应体：上游业务失败同样返回 HTTP 200，必须查 body 的 code 字段
+/// （200 成功；903 token 无效 / 905 未实名 / 888 积分不足 / 900 限流等）
+fn parse_pushplus_resp(body: &str) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|_| "PushPlus 响应非 JSON（网关或网络异常）".to_string())?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code == 200 {
+        return Ok(());
+    }
+    let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("").trim();
+    if msg.is_empty() {
+        Err(format!("PushPlus 返回业务码 {code}"))
+    } else {
+        Err(format!("PushPlus 返回业务码 {code}: {msg}"))
+    }
+}
+
+/// PushPlus：POST JSON 到 https://www.pushplus.plus/send（push1 单发 / push2 topic 群发共用端点）。
+/// 模板缺省 txt（纯文本保留换行；上游默认 html 会吞掉 \n）；markdown 模板对齐 Server酱 的换行转换。
+pub fn notify_pushplus(
+    token: &str,
+    title: &str,
+    body: &str,
+    template: Option<&str>,
+    topic: Option<&str>,
+) -> Result<(), String> {
+    let key = token.trim();
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("PushPlus Token 格式不正确（pushplus.plus 获取）".into());
+    }
+    let tpl = template
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("txt");
+    if !PUSHPLUS_TEMPLATES.contains(&tpl) {
+        return Err(format!("PushPlus 模板仅支持 {}", PUSHPLUS_TEMPLATES.join("/")));
+    }
+    let topic = topic.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(tp) = topic {
+        if !tp.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err("PushPlus 群组编码格式不正确（仅字母/数字/-/_）".into());
+        }
+    }
+    // markdown 模板下换行转两空格+换行保持段落（与 Server酱 desp 同手法）
+    let content = if tpl == "markdown" { body.replace('\n', "  \n") } else { body.to_string() };
+    let mut payload = serde_json::json!({
+        "token": key,
+        "title": title,
+        "content": content,
+        "template": tpl,
+    });
+    if let Some(tp) = topic {
+        payload["topic"] = serde_json::Value::String(tp.to_string());
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let resp = agent
+        .post("https://www.pushplus.plus/send")
+        .set("Content-Type", "application/json; charset=utf-8")
+        .send_string(&payload.to_string())
+        .map_err(|e| format!("PushPlus 请求失败: {e}"))?;
+    let text = resp
+        .into_string()
+        .map_err(|e| format!("PushPlus 响应读取失败: {e}"))?;
+    parse_pushplus_resp(&text)
+}
+
 /// 统一分发入口：桌面通知（有 AppHandle 时）+ 可选渠道；渠道失败仅记日志。
 pub fn notify_all(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &str, body: &str, channels: &NotifyChannels) {
     if let Some(app) = app {
@@ -134,19 +216,33 @@ pub fn notify_all(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &s
             crate::fs_utils::app_log(data_dir, &format!("通知渠道(Server酱)失败: {e}"));
         }
     }
+    if let Some(token) = channels.pushplus_token.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Err(e) = notify_pushplus(
+            token,
+            title,
+            body,
+            channels.pushplus_template.as_deref(),
+            channels.pushplus_topic.as_deref(),
+        ) {
+            crate::fs_utils::app_log(data_dir, &format!("通知渠道(PushPlus)失败: {e}"));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 三渠道空判定：默认全空；任一渠道有值（含空白包裹）即非空
+    /// 四渠道空判定：默认全空；任一渠道有值（含空白包裹）即非空
     #[test]
     fn channels_empty_detection() {
         assert!(NotifyChannels::default().is_empty());
         assert!(!NotifyChannels { bark_url: Some(" https://api.day.app/k ".into()), ..Default::default() }.is_empty());
         assert!(!NotifyChannels { serverchan_sendkey: Some("SCT123".into()), ..Default::default() }.is_empty());
         assert!(!NotifyChannels { wechat_webhook: Some("https://qyapi.weixin.qq.com/x".into()), ..Default::default() }.is_empty());
+        assert!(!NotifyChannels { pushplus_token: Some("pp123".into()), ..Default::default() }.is_empty());
+        // 仅模板/群组编码有值而 token 为空：渠道仍视为未配置
+        assert!(NotifyChannels { pushplus_template: Some("html".into()), pushplus_topic: Some("dev".into()), ..Default::default() }.is_empty());
     }
 
     /// Bark 地址校验（错误路径，不触网）：协议 / 空 Key / 非 alnum Key 均拒绝
@@ -189,7 +285,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 三渠道均配置无效值：分发到每个渠道 → 格式校验失败 → app_log 各落一条失败记录（不触网）
+    /// 四渠道均配置无效值：分发到每个渠道 → 格式校验失败 → app_log 各落一条失败记录（不触网）
     #[test]
     fn notify_all_invalid_channels_all_logged() {
         let dir = tmp_dir("invalid");
@@ -197,13 +293,34 @@ mod tests {
             bark_url: Some("http://api.day.app/abc".into()),          // 非 https 拒绝
             wechat_webhook: Some("ftp://qyapi.example.com/x".into()), // 非 https 拒绝
             serverchan_sendkey: Some("SCT abc!".into()),              // 含空格/非法字符拒绝
+            pushplus_token: Some("pp abc!".into()),                   // 含空格/非法字符拒绝
+            ..Default::default()
         };
         notify_all(None, &dir, "标题", "内容", &ch);
         let log = read_log(&dir);
         assert!(log.contains("通知渠道(Bark)失败"), "log: {log}");
         assert!(log.contains("通知渠道(企业微信)失败"), "log: {log}");
         assert!(log.contains("通知渠道(Server酱)失败"), "log: {log}");
+        assert!(log.contains("通知渠道(PushPlus)失败"), "log: {log}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PushPlus 入参校验（错误路径，不触网）：token / 模板白名单 / 群组编码字符
+    #[test]
+    fn pushplus_validation_rejects_bad_input() {
+        assert!(notify_pushplus("", "t", "b", None, None).is_err(), "空 token 拒绝");
+        assert!(notify_pushplus("pp abc!", "t", "b", None, None).is_err(), "非法字符 token 拒绝");
+        assert!(notify_pushplus("abc123", "t", "b", Some("xml"), None).is_err(), "白名单外模板拒绝");
+        assert!(notify_pushplus("abc123", "t", "b", None, Some("群组")).is_err(), "非法群组编码拒绝");
+    }
+
+    /// PushPlus 响应码解析（纯函数，不触网）：200 成功；业务码带出 msg；非 JSON 拒绝
+    #[test]
+    fn parse_pushplus_resp_codes() {
+        assert!(parse_pushplus_resp(r#"{"code":200,"msg":"请求成功","data":"..."}"#).is_ok());
+        assert!(parse_pushplus_resp(r#"{"code":903,"msg":"无效的token"}"#).is_err());
+        assert!(parse_pushplus_resp(r#"{"code":888,"msg":""}"#).is_err());
+        assert!(parse_pushplus_resp("不是 JSON").is_err());
     }
 
     /// 合法格式 + 本地不可达端点（127.0.0.1:1 保留端口，回环立即拒连）：

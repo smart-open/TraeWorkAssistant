@@ -2,12 +2,7 @@
 //! 浏览器打开 SSO 登录页（qoder.cn/sso/login/aliyun?oauth_callback=设备授权页）→ 轮询
 //! deviceToken/poll → dt- 令牌入池。事件契约对齐 wb-oauth（qoder-oauth-progress / qoder-oauth-done）。
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::path::Path;
-// 唯一使用点在 cfg(windows) open_in_browser，门控避免 macOS 构建未用导入警告
-#[cfg(windows)]
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::json;
@@ -40,17 +35,31 @@ fn validate_open_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Windows：explorer.exe 直开 URL（issue #140 复审移除 cmd 层，消除密集 %XX URL
-/// 的理论 %VAR% 展开面；URL 先经 validate_open_url 校验，& / % 等保留字无需转义）
+/// 系统浏览器打开 URL（issue #153 修复 4：ShellExecuteW「open」动词直开 URL，
+/// 由系统按协议关联选默认浏览器——explorer.exe 直开在部分受限/精简环境下会被
+/// 拒绝或无窗口；URL 先经 validate_open_url 校验，单参数传递无 shell 层，
+/// & / % 等保留字无需转义）
 #[cfg(windows)]
 fn open_in_browser(url: &str) -> Result<(), String> {
     validate_open_url(url)?;
-    Command::new("explorer")
-        .arg(url)
-        .creation_flags(0x08000000)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("打开浏览器失败: {e}"))
+    let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb_wide: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb_wide.as_ptr(),
+            url_wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    // 返回值 > 32 = 成功的 HINSTANCE；≤ 32 为 SE_ERR 错误码
+    if result as usize > 32 {
+        Ok(())
+    } else {
+        Err(format!("打开浏览器失败（ShellExecuteW 错误码 {}）", result as usize))
+    }
 }
 
 /// macOS 实装（2026-10-05 合并审查）：`open <url>` 走 LaunchServices 默认浏览器，
@@ -60,11 +69,26 @@ fn open_in_browser(url: &str) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn open_in_browser(url: &str) -> Result<(), String> {
     validate_open_url(url)?;
-    crate::platform::cmd::sys_command("open")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("打开浏览器失败: {e}"))
+    // 审查修复（Low）：等待 `open` 退出并校验状态码——LaunchServices 层失败
+    // （无默认浏览器/无 URL handler）只反映在退出码里，spawn 即 Ok 会漏报
+    //（对齐 Windows 分支 ShellExecuteW ≤32 失败可观测口径；open 通常 <100ms 返回）
+    // 审查修复（Low）：改用带超时等待——open 异常挂起时 .output() 会无限阻塞
+    // 命令线程；10s 上限远大于常态 <100ms，超时 kill 保线程可用
+    let mut cmd = crate::platform::cmd::sys_command("open");
+    cmd.arg(url);
+    let status = crate::platform::cmd::sys_status_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| format!("打开浏览器失败: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "打开浏览器失败（open 退出码 {:?}）",
+            status.code()
+        ))
+    }
 }
 
 /// 其余平台占位（无统一系统浏览器打开入口，维持拒绝）
@@ -118,6 +142,9 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
     let auth_url = flow.auth_url.clone();
     emit_progress(&app, "init", "正在打开 Qoder 登录页…", Some(&auth_url));
     if let Err(e) = open_in_browser(&auth_url) {
+        // 打开失败必须发终态事件（issue #153 修复 4）：仅复位 OAUTH_RUNNING 时
+        // 前端 oauthRunning 弹窗永挂（对齐 emit_done 注释里 issue #44 约定）
+        emit_done(&app, &state.data_dir, false, "", "", &format!("打开登录页失败: {e}"));
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
         return Err(e);
     }

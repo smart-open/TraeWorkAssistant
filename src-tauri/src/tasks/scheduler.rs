@@ -335,6 +335,13 @@ fn tick(
                 // 失败账号将失去当日调度兜底；空池空轮记账则会让当日新增账号失去
                 // 调度补打。skipped_busy 落日志（低频、值得留痕）；空轮纯静默
                 //（池空期间每 tick 触发，落日志会刷屏，对齐「空池静默空转」定调）
+                //
+                // 其余普通 skipped（含豆包/trae/wb/qoder 各任务空池 `{"ok":true,
+                // "skipped":"无 X 账号"}`，issue #147 口径）走 mark_run + 落日志——
+                // 有意取舍（定调）：这类任务无奖励属性、空池空转无收益，mark_run
+                // 关闭当日重复触发可防空转；当日新增账号次日生效可接受（需即刻
+                // 巡检可手动触发）。仅 buddy-ai 每日活跃打卡豁免（漏打=丢奖励），
+                // 新增空池任务若同属「漏跑=丢收益」语义，须改打 skipped_empty_pool
                 if v.get("skipped_busy").is_some() {
                     fs_utils::app_log(
                         &st.data_dir,

@@ -85,6 +85,27 @@ describe('neutralRewrite', () => {
     ).toBe('You are an interactive agent that helps the USER with software engineering tasks.');
   });
 
+  it('issue #155：ZCode 身份句去品牌词后零残留', () => {
+    // 首句："You are ZCode, an interactive coding agent" → "You are an interactive coding agent"
+    expect(neutralRewrite('You are ZCode, an interactive coding agent')).toBe(
+      'You are an interactive coding agent',
+    );
+    // 第二身份句："interactive ZCode agent" → "interactive agent"
+    expect(
+      neutralRewrite('You are an interactive ZCode agent that helps users with software engineering tasks'),
+    ).toBe('You are an interactive agent that helps users with software engineering tasks');
+    // issue #155 实证样本：双身份句之间无句号连写，extractFingerprintFrom 按
+    // 首个 '. ' 截取会把两句并成一个 from——改写须逐条应用全部命中规则，两句
+    // 都清洗、零 ZCode 残留（与后端 apply_template_map_seeded 全量应用同口径）
+    expect(
+      neutralRewrite(
+        'You are ZCode, an interactive coding agent You are an interactive ZCode agent that helps users with software engineering tasks',
+      ),
+    ).toBe(
+      'You are an interactive coding agent You are an interactive agent that helps users with software engineering tasks',
+    );
+  });
+
   it('未命中回退空串（剥离兜底）', () => {
     expect(neutralRewrite("You are Claude Code, Anthropic's official CLI for Claude.")).toBe('');
     expect(neutralRewrite('')).toBe('');

@@ -349,8 +349,9 @@ fn load_device_profile(state: &AppState, acct_id: &str) -> Option<super::qoder_d
 }
 
 /// 写工具侧凭证副本（version≠1 拒写；非空字段 merge + updated_at，对齐 wb_common 同语义）。
-/// 凭证收敛（P0-1）：敏感字段进 vault、DB 占位；vault 写失败时仍落占位库并返回 Err
-///（对齐 Trae 红线：宁可丢本次凭据更新，也不把 token/pat 明文写进 SQLite）。
+/// 凭证收敛（P0-1）：敏感字段进 vault、DB 占位；vault 写失败时**数据库保持原状**
+///（issue #153 修复 1：原「落占位库 + 返 Err」会销毁 DB 中未收敛的明文凭证，
+/// 迁移场景无处恢复）——不落库直接返回 Err，凭据仅存内存，重新登录可恢复。
 pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Result<(), String> {
     let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = load_token_store(state);
@@ -406,7 +407,20 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
             return Err("token_store 版本不识别，拒绝写入".to_string());
         }
     }
-    let vault_result = secure_store_for_save(&state.data_dir, &mut store).map(|_| ());
+    // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；vault 写入后落库
+    // 走逐行 UPSERT（仅覆盖目标行，见下方说明），进程间并发保存互不丢行。
+    // vault 写失败（issue #153 修复 1）：数据库保持原状，不落 fresh 表——
+    // 此时 store 里的敏感字段尚未占位化（secure_store_for_save 在 ns_set 失败时
+    // 早退，占位循环未执行），若继续落库会把明文凭证写进 SQLite，恰与红线相反
+    if let Err(e) = secure_store_for_save(&state.data_dir, &mut store) {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] vault 写入失败，token store 未落库（id={id}，凭据未持久化）: {e}"),
+        );
+        return Err(format!(
+            "Qoder 凭据加密存储失败（数据库未改动，凭据未持久化，重新登录可恢复）: {e}"
+        ));
+    }
     // 落库改逐行 UPSERT（审查 P2 跨进程 last-writer-wins 修复，方案 A）：原
     // 「重读整表 → 仅目标行替换 → qoder_token_store_save 整表 rows_replace」已把
     // 覆盖窗口从「vault 全程」收窄到数毫秒，但窗口内他进程对**其他账号行**的写入
@@ -422,7 +436,7 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
     // 明文行，直接落库会把明文凭证写进 SQLite（直到下次启动迁移才收敛，且
     // token_store_load_secure「DB 明文优先」会持续旁路 vault 回填）。落库前必须与
     // secure_store_for_save 同口径占位——DB qoder_tokens 一律空串，明文唯一驻留地
-    // 是 vault；vault 失败时同样落占位行（重新登录可恢复）
+    // 是 vault（vault 写失败已在上方提前返回，不会走到本处）
     let mut row = target;
     if let Some(rm) = row.as_object_mut() {
         for k in TOKEN_SENSITIVE_KEYS {
@@ -433,9 +447,7 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
     }
     crate::store::docs::qoder_token_store_row_upsert(&crate::store::db(&state.data_dir), id, &row)?;
     crate::store::db(&state.data_dir).kv_set_raw("qoder_tokens_meta", "1")?;
-    vault_result.map_err(|e| {
-        format!("Qoder 凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}")
-    })
+    Ok(())
 }
 
 /// 删除 token store 记录（账号移除时同步清理 vault 凭证）。
@@ -1276,10 +1288,13 @@ fn is_pat_channel(creds: &QoderCreds) -> bool {
 }
 
 /// 惰性刷新：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
-/// 返回 (creds, refreshed, note)，note ∈ no_credential/fresh/near_expiry_no_refresh/
-/// expired_needs_relogin/refreshed/refreshed_unsaved/refresh_failed/auth_dead/pat_rejected/
-/// refresh_busy。refresh_busy（H3 审查修复）：账号级跨进程刷新锁被他进程持有时，沿用
-/// 当前凭证返回——暂态语义，调用方不得据此永久禁用账号。
+/// 返回 (creds, refreshed, note)，note ∈ no_credential/vault_down/fresh/
+/// near_expiry_no_refresh/expired_needs_relogin/refreshed/refreshed_unsaved/
+/// refresh_failed/auth_dead/pat_rejected/refresh_busy。
+/// vault_down（issue #153 修复 2）：vault 系统性故障（DPAPI/快照/锁）导致凭证
+/// 读出为空，与「确实无凭证」区分——暂态语义，调用方不得据此永久禁用账号。
+/// refresh_busy（H3 审查修复）：账号级跨进程刷新锁被他进程持有时，沿用当前
+/// 凭证返回——暂态语义，调用方不得据此永久禁用账号。
 ///
 /// PAT 通道（R-6）：pt- 不被 sash 业务端点接受（实测 401），先经 jobToken 换取
 /// 24h 作业令牌；作业令牌临期（< lazy_hours，与客户端通道同语义）或已过期时用
@@ -1296,6 +1311,12 @@ pub fn ensure_fresh(
     let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let creds = effective_creds(state, acct_id);
     if creds.access_token.is_empty() {
+        // 修复 2（issue #153）：vault 系统性故障时 ns_get fail-secure 返回 None，
+        // 与「无凭证」不可区分——故障期返回暂态 vault_down，调用方按暂态处理
+        // （不永久禁用账号，故障恢复后自动自愈）
+        if !crate::vault::available(&state.data_dir) {
+            return (creds, false, "vault_down");
+        }
         return (creds, false, "no_credential");
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1327,6 +1348,14 @@ pub fn ensure_fresh(
         // 持锁后二次检查（对齐 H-1 进程内锁语义）：等锁期间他进程可能已换好落库；
         // now_ms 重取（3.8.5 审查 L4：跨进程锁等待最长 5s，复用锁前时刻会临界偏差）
         let creds = effective_creds(state, acct_id);
+        if creds.access_token.is_empty() {
+            // 修复 2（issue #153）同构缺口补齐：等锁期间 vault 故障 → 空 creds
+            // 会被下游误分类（空 PAT 换取 4xx → pat_rejected 永久），先探测 vault
+            if !crate::vault::available(&state.data_dir) {
+                return (creds, false, "vault_down");
+            }
+            return (creds, false, "no_credential");
+        }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let need = creds.access_token.starts_with("pt-")
             || creds
@@ -1402,6 +1431,14 @@ pub fn ensure_fresh(
     // 持锁后二次检查：等锁期间他进程可能已刷新落库，直接复用新令牌；
     // now_ms 重取（3.8.5 审查 L4：同上，锁等待后旧时刻临界偏差）
     let creds = effective_creds(state, acct_id);
+    if creds.access_token.is_empty() {
+        // 修复 2（issue #153）同构缺口补齐：等锁期间 vault 故障 → 空 creds 会
+        // 落进空 RT 判定误报 expired_needs_relogin（永久），先探测 vault
+        if !crate::vault::available(&state.data_dir) {
+            return (creds, false, "vault_down");
+        }
+        return (creds, false, "no_credential");
+    }
     let now_ms = chrono::Utc::now().timestamp_millis();
     if let Some(exp) = creds.expires_at_ms {
         let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
@@ -1675,6 +1712,9 @@ impl Drop for CrossProcLock {
 /// 隔离（便携版多数据目录互不误伤）；scope 白名单外字符替换为 `_`（Windows 锁名
 /// 单段名教训的文件系统对应物——路径分隔符会把锁文件写进子目录）。等待策略：
 /// LOCK_EX|LOCK_NB 每 25ms 轮询至 wait_ms 超时（WaitForSingleObject 的最小等价物）。
+/// 平台语义差异（审查提示）：flock 不可重入（同线程二次获取即 EWOULDBLOCK），
+/// 且按 open file description 在同进程跨线程同样互斥——与 Windows Mutex 的
+/// 「同线程可重入」不同；新增调用方不得嵌套获取同名锁（现有各 ns/scope 无嵌套）。
 #[cfg(target_os = "macos")]
 pub struct CrossProcLock {
     /// 持有锁文件句柄：Drop 关闭 fd 即释放 flock

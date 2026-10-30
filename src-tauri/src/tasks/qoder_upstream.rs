@@ -24,8 +24,9 @@
 //!    `to_err_kind` 映射到账号池 `ErrKind`；
 //! ④ 传输+翻译：`make_qoder_request`（COSY 签名 + x-model 头 + 四分型传输错误）
 //!    与 `QoderTranslate`（信封拆解 + ThinkingParser）；
-//! ⑤ 流式/聚合入口：`open_qoder_stream`（首字超时→翻译→可中断行源）、
-//!    `aggregate_qoder`（首字超时→翻译→aggregate）。
+//! ⑤ 流式/聚合入口：`open_qoder_stream`（首字超时→翻译→可中断行源）；非流式
+//!    聚合在 qoder_route::qoder_aggregate_chat 内联实现（QoderTranslate +
+//!    `wb_sse::aggregate`，独立 aggregate 入口已删——审查清理无人调用的僵尸代码）。
 //!
 //! ── 硬约束 ────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件非测试代码零 unwrap/expect/panic；
@@ -38,7 +39,6 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use serde_json::{json, Value};
 
-use crate::api_server::wb_sse;
 use crate::api_server::wb_upstream::{lines_with_first_byte_timeout, InterruptibleLines};
 use crate::tasks::qoder_common::{self, QoderCreds};
 use crate::tasks::qoder_sign::{self, CosyIdentity};
@@ -543,21 +543,31 @@ pub fn resolve(model_id: &str, region: QoderRegion) -> Option<Value> {
     None
 }
 
-/// Qwen3.8-Flash 免费活动模型 id（norm_model_id 归一比较，容忍命名漂移）
-pub const FLASH_FREE_MODEL: &str = "Qwen3.8-Flash";
+/// 免费活动模型集合（norm_model_id 归一比较，容忍命名漂移）。
+/// issue #156：Qwen3.8-Flash 之外新增 DeepSeek-Flash——issue 贴图证实其免费活动
+/// 期 usage.billable=false 实际不扣分，与 #111 同形态；目录价随低峰折扣漂移
+/// （CN 0.1/Global 0.2）不反映免费，需与 Qwen3.8-Flash 同走倍率覆盖通道
+pub const FLASH_FREE_MODELS: &[&str] = &["Qwen3.8-Flash", "DeepSeek-Flash"];
 
-/// Qwen3.8-Flash 免费活动倍率覆盖（issue #111，资源调度页开关）：
+/// 免费活动模型判定（归一比较）
+pub fn is_flash_free_model(model_id: &str) -> bool {
+    FLASH_FREE_MODELS
+        .iter()
+        .any(|m| norm_model_id(m) == norm_model_id(model_id))
+}
+
+/// 免费活动倍率覆盖（issue #111 / #156，资源调度页开关）：
 /// 上游免费活动期 usage.billable=false 实际不扣分，但 model/list 目录价随
-/// 低峰折扣漂移（0.1/0.08），不反映免费——开关开启时把该模型条目倍率改写
-/// 为 0，使 entry_is_free 判真：取号豁免零积分过滤 + /v1/models 展示 0×。
-/// 只改调用方持有的条目副本，进程目录缓存不受影响；上游活动结束后关闭
-/// 开关即恢复官方同步倍率。
+/// 低峰折扣漂移（Qwen3.8-Flash 0.1/0.08、DeepSeek-Flash 0.1/0.2），不反映
+/// 免费——开关开启时把免费活动模型条目倍率改写为 0，使 entry_is_free 判真：
+/// 取号豁免零积分过滤 + /v1/models 展示 0×。只改调用方持有的条目副本，
+/// 进程目录缓存不受影响；上游活动结束后关闭开关即恢复官方同步倍率。
 pub fn apply_flash_free_override(entry: &mut Value, enabled: bool) {
     if !enabled {
         return;
     }
     let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
-    if norm_model_id(id) == norm_model_id(FLASH_FREE_MODEL) {
+    if is_flash_free_model(id) {
         if let Some(object) = entry.as_object_mut() {
             object.insert(
                 "credits".to_string(),
@@ -759,6 +769,11 @@ pub enum UpstreamKind {
     /// **模型排队中**（业务码 10605）：不是错误，是「暂时排不上号」。
     /// 不冷却不换号（换谁都一样在排队），也不该给「登录态已失效」误导用户
     Queued,
+    /// **传输层掐断**（issue #158 P2-2）：上游 h2 RST_STREAM/连接重置掐断长流，
+    /// 行源 relay 线程上抛 io::Error 被 EOF 折叠。账号无关的传输故障：
+    /// 不冷却账号/模型、不解绑粘性、不计空完成指纹，按是否已产出内容分流
+    ///（未流出 → 换号重试；已流出 → 就地收尾落账失败，与 Trae 池 sse.rs 同口径）
+    TransportCut,
     /// 其它（换账号也没用）
     Unknown,
 }
@@ -778,6 +793,8 @@ impl UpstreamKind {
             Self::Forbidden => crate::api_server::ErrKind::Forbidden,
             Self::Server | Self::Unknown => crate::api_server::ErrKind::Server,
             Self::Queued => crate::api_server::ErrKind::None,
+            // 传输层掐断与账号健康无关，冷却只会误伤（同 Queued 口径）
+            Self::TransportCut => crate::api_server::ErrKind::None,
         }
     }
 }
@@ -1525,12 +1542,30 @@ pub struct QoderTranslate<L: Iterator<Item = String>> {
     model: String,
     /// 流内错误槽（Arc 共享：翻译器被 from_iterator 消费后路由层仍可读）
     err_slot: Arc<Mutex<Option<ErrMeta>>>,
+    /// 底层读错误共享槽（issue #158 P2-2）：行源为 wb_upstream 竞速/首字超时
+    /// 产物（InterruptibleLines 类型被 Box 擦拭，relay 线程的 io::Error 在
+    /// chain_rest 折叠点写入共享槽）。EOF 时槽有错误 = 流被传输层掐断而非
+    /// 正常结束——flush_finish 据此不补 [DONE] 并写入 TransportCut ErrMeta
+    read_slot: Option<crate::api_server::wb_upstream::ReadErrSlot>,
 }
 
 impl<L: Iterator<Item = String>> QoderTranslate<L> {
     pub fn new(
         lines: L,
         err_slot: Arc<Mutex<Option<ErrMeta>>>,
+        chat_id: &str,
+        model: &str,
+    ) -> Self {
+        Self::with_read_slot(lines, err_slot, None, chat_id, model)
+    }
+
+    /// 带底层读错误槽构造（issue #158 P2-2）：路由层从竞速胜者
+    ///（`QoderRaceWin.read_slot`）或 tracked 行源取槽传入；测试/内存切分
+    /// 形态传 None（行为与 new 完全一致）
+    pub fn with_read_slot(
+        lines: L,
+        err_slot: Arc<Mutex<Option<ErrMeta>>>,
+        read_slot: Option<crate::api_server::wb_upstream::ReadErrSlot>,
         chat_id: &str,
         model: &str,
     ) -> Self {
@@ -1543,6 +1578,7 @@ impl<L: Iterator<Item = String>> QoderTranslate<L> {
             chat_id: chat_id.to_string(),
             model: model.to_string(),
             err_slot,
+            read_slot,
         }
     }
 
@@ -1703,7 +1739,16 @@ impl<L: Iterator<Item = String>> QoderTranslate<L> {
         self.push_chunk(chunk_id, delta, None, "");
     }
 
-    /// 流收尾：冲拆解器尾巴 + 发 [DONE]（幂等；错误路径已置 done 时不再发）
+    /// 流收尾：冲拆解器尾巴 + 发 [DONE]（幂等；错误路径已置 done 时不再发）。
+    ///
+    /// 传输层掐断识别（issue #158 P2-2）：EOF 伴随读错误槽有值 = 流被上游
+    /// 传输层掐断（h2 RST_STREAM/连接重置），不是正常结束——
+    /// ① **不补 [DONE]**：下游 WbSseParser 视作 EOF 断流（流式按 EOF-有内容
+    ///    补终止帧、聚合不得把部分响应当成功返回）；
+    /// ② err_slot 尚无业务错误时写入 TransportCut ErrMeta（err_slot 已有
+    ///    信封业务错误时保留之——业务错误更具诊断价值，业务错误帧路径本就
+    ///    不发 [DONE]）。
+    /// 上游自行下发 [DONE]（SseEvent::Done）走不到 EOF 分支，不受影响。
     fn flush_finish(&mut self) {
         if self.done {
             return;
@@ -1712,6 +1757,31 @@ impl<L: Iterator<Item = String>> QoderTranslate<L> {
         self.thinker.finish();
         for piece in self.thinker.take() {
             self.emit_piece(&chat_id, &piece.text, piece.is_thinking);
+        }
+        let cut = self
+            .read_slot
+            .as_ref()
+            .and_then(|s| crate::api_server::wb_upstream::take_read_error_slot(s));
+        if let Some(e) = cut {
+            {
+                let mut slot = self.err_slot.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.is_none() {
+                    *slot = Some(ErrMeta {
+                        kind: UpstreamKind::TransportCut,
+                        status: 0,
+                        message: format!(
+                            "{} {}",
+                            crate::api_server::TRANSPORT_CUT_MSG_PREFIX,
+                            e
+                        ),
+                        raw: String::new(),
+                        pricing_url: None,
+                        queue: None,
+                    });
+                }
+            }
+            self.done = true; // 流是断的，不是完的：不发 [DONE]
+            return;
         }
         self.queue.push_back("data: [DONE]".to_string());
         self.done = true;
@@ -1757,21 +1827,6 @@ pub fn open_qoder_stream(
     Ok(InterruptibleLines::from_iterator(Box::new(translated)))
 }
 
-/// 聚合入口：reader → 首字超时 → 翻译 → `wb_sse::aggregate`
-///（tool_calls 按 index 合并、usage/finish 收集）。
-/// 返回 (completion, error)；Err(()) = 首字超时（调用方按 Server 换号）。
-#[allow(dead_code)] // p3-3-wire（dispatch/payload）消费
-pub fn aggregate_qoder(
-    reader: Box<dyn Read + Send>,
-    err_slot: Arc<Mutex<Option<ErrMeta>>>,
-    chat_id: &str,
-    model: &str,
-) -> Result<(Option<Value>, Option<(i64, String)>), ()> {
-    let lines = lines_with_first_byte_timeout(reader)?;
-    let translated = QoderTranslate::new(lines, err_slot, chat_id, model);
-    Ok(wb_sse::aggregate(translated, chat_id))
-}
-
 // ==================== ⑦ 请求体构造（OpenAI → Qoder agent 信封） ====================
 //
 // 移植蓝本：agent2api protocol.rs（build_upstream_body 一族）。下游按 OpenAI
@@ -1810,18 +1865,64 @@ pub fn content_to_text(content: &Value) -> String {
     }
 }
 
-/// 抽出消息里的图片块（OpenAI 的 image_url 形态）
+/// 抽出消息里的图片块：主形态 OpenAI `image_url`；防御性识别 Anthropic `image`
+/// 与 Responses `input_image` 变体（issue #154——payload.rs/wb_responses.rs 投影
+/// 后已是 image_url，此处覆盖绕过投影直入 chat completions 的非标准块），
+/// 统一归一为 image_url 形态
 fn images_of(content: &Value) -> Vec<Value> {
     content
         .as_array()
         .map(|items| {
             items
                 .iter()
-                .filter(|item| item.get("type").and_then(Value::as_str) == Some("image_url"))
-                .cloned()
+                .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+                    Some("image_url") => Some(item.clone()),
+                    Some("image") => anthropic_image_as_url(item),
+                    Some("input_image") => responses_image_as_url(item),
+                    _ => None,
+                })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Anthropic image block（source.type = base64/url）→ image_url 形态
+///（自抄 api_server::payload::anthropic_image_to_openai：跨层私有不可复用）
+fn anthropic_image_as_url(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    let url = match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media = source.get("media_type").and_then(Value::as_str)?;
+            // 审查修复（Low）：media_type 白名单与 payload.rs::anthropic_image_to_openai
+            // 同口径——客户端可控 MIME 不直透 data URL 上游，防注入异常类型
+            if !matches!(media, "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
+                return None;
+            }
+            let data = source.get("data").and_then(Value::as_str)?;
+            if data.is_empty() {
+                return None;
+            }
+            format!("data:{media};base64,{data}")
+        }
+        Some("url") => source.get("url").and_then(Value::as_str)?.to_string(),
+        _ => return None,
+    };
+    if url.is_empty() {
+        return None;
+    }
+    Some(json!({ "type": "image_url", "image_url": { "url": url } }))
+}
+
+/// Responses input_image part（image_url/url 字段）→ image_url 形态
+fn responses_image_as_url(part: &Value) -> Option<Value> {
+    let url = part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .or_else(|| part.get("url").and_then(Value::as_str))?;
+    if url.is_empty() {
+        return None;
+    }
+    Some(json!({ "type": "image_url", "image_url": { "url": url } }))
 }
 
 /// 把 OpenAI 的 messages 规整成上游能吃的形状（源实现 normalizeMessages）：
@@ -2320,6 +2421,7 @@ pub fn prepare_qoder_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_server::wb_sse;
 
     // ── issue #90 修复③b：跨池命名别名归一 ──
 
@@ -2431,6 +2533,31 @@ mod tests {
             .find(|m| m.get("id").and_then(Value::as_str) == Some("Qwen3.8-Max"))
             .expect("list 应含 max");
         assert_eq!(mx["credits"], "x0.5 credits");
+        // issue #156：DeepSeek-Flash 纳入免费活动集合——两区目录均被覆盖改写 0，
+        // 取号豁免联动为真；关闭时保持官方倍率（CN 0.1 / Global 0.2）
+        for region in [QoderRegion::Cn, QoderRegion::Global] {
+            let mut df = resolve("DeepSeek-Flash", region).expect("DeepSeek-Flash 应在兜底表");
+            assert!(
+                !entry_is_free(&df),
+                "覆盖前目录价非 0，不应判免费"
+            );
+            apply_flash_free_override(&mut df, true);
+            assert_eq!(
+                df["credits"], "x0.0 credits",
+                "DeepSeek-Flash 开启时应改写为 0"
+            );
+            assert!(entry_is_free(&df), "DeepSeek-Flash 改写后应判免费");
+        }
+        assert!(
+            resolve_overridden("DeepSeek-Flash", QoderRegion::Cn, false)
+                .map(|e| !entry_is_free(&e))
+                .unwrap_or(false),
+            "DeepSeek-Flash 关闭时 resolve_overridden 保持非免费"
+        );
+        // is_flash_free_model 归一比较：命名漂移命中、非集合模型不命中
+        assert!(is_flash_free_model("deepseek-flash"));
+        assert!(is_flash_free_model("DeepSeek  FLASH"));
+        assert!(!is_flash_free_model("DeepSeek-V4-Pro"));
     }
 
     // ── 工具 ──
@@ -2570,7 +2697,8 @@ mod tests {
         let t = QoderTranslate::new(lines.into_iter(), slot.clone(), "chat-1", "M");
         let ilines = InterruptibleLines::from_iterator(Box::new(t));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let (err, sent_any, _fi, _u, _t) = wb_sse::stream_forward_ex(ilines, &tx, proto, "chat-1", "M");
+        let (err, sent_any, _fi, _u, _t) =
+            wb_sse::stream_forward_ex(ilines, &tx, proto, "chat-1", "M", &std::collections::HashSet::new(), None);
         drop(tx);
         let mut sent = Vec::new();
         while let Ok(frame) = rx.try_recv() {
@@ -2590,6 +2718,78 @@ mod tests {
         assert!(err.is_some(), "错误必须上抛供路由层换号");
         assert!(!sent_any);
         assert!(sent.is_empty(), "不得向客户端下发任何帧: {sent:?}");
+    }
+
+    // ── 传输层掐断（issue #158 P2-2）：EOF 伴随读错误 → 不补 [DONE] + TransportCut ──
+
+    /// 预填读错误的共享槽
+    fn cut_slot(msg: &str) -> crate::api_server::wb_upstream::ReadErrSlot {
+        let s = crate::api_server::wb_upstream::new_read_err_slot();
+        *s.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.to_string());
+        s
+    }
+
+    fn meta_of(err_slot: &Arc<Mutex<Option<ErrMeta>>>) -> Option<ErrMeta> {
+        err_slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// EOF 伴随读错误：不补 [DONE]（流是断的不是完的）+ 写 TransportCut ErrMeta；
+    /// 已产出的内容帧保留（就地收尾口径）
+    #[test]
+    fn transport_cut_eof_skips_done_and_writes_errmeta() {
+        let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+        let t = QoderTranslate::with_read_slot(
+            vec![envelope(r#"{"choices":[{"delta":{"content":"部分输出"}}]}"#)].into_iter(),
+            err_slot.clone(),
+            Some(cut_slot("h2 RST_STREAM pushed")),
+            "chat-1",
+            "M",
+        );
+        let frames: Vec<String> = t.collect();
+        assert!(
+            !frames.iter().any(|f| f.contains("[DONE]")),
+            "掐断流不得补 [DONE]: {frames:?}"
+        );
+        assert!(frames.iter().any(|f| f.contains("部分输出")), "已产出内容帧保留");
+        let meta = meta_of(&err_slot).expect("EOF 掐断必须写 ErrMeta");
+        assert!(matches!(meta.kind, UpstreamKind::TransportCut));
+        assert!(meta.message.starts_with("transport cut:"), "实际: {}", meta.message);
+    }
+
+    /// 对照组：正常 EOF（槽空）仍补 [DONE]，err_slot 保持 None
+    #[test]
+    fn clean_eof_still_emits_done() {
+        let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+        let t = QoderTranslate::with_read_slot(
+            vec![envelope(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)].into_iter(),
+            err_slot.clone(),
+            Some(crate::api_server::wb_upstream::new_read_err_slot()),
+            "chat-1",
+            "M",
+        );
+        let frames: Vec<String> = t.collect();
+        assert!(frames.last().map(|f| f.contains("[DONE]")).unwrap_or(false));
+        assert!(meta_of(&err_slot).is_none(), "正常完成不写 ErrMeta");
+    }
+
+    /// err_slot 已有业务错误时保留之（业务错误更具诊断价值），仍不补 [DONE]
+    #[test]
+    fn transport_cut_keeps_existing_business_errmeta() {
+        let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+        let t = QoderTranslate::with_read_slot(
+            vec![ERR_ENVELOPE.to_string()].into_iter(),
+            err_slot.clone(),
+            Some(cut_slot("connection reset")),
+            "chat-1",
+            "M",
+        );
+        let frames: Vec<String> = t.collect();
+        let meta = meta_of(&err_slot).expect("业务错误帧应写 ErrMeta");
+        assert!(
+            matches!(meta.kind, UpstreamKind::Quota),
+            "业务错误不得被 TransportCut 覆盖"
+        );
+        assert!(!frames.iter().any(|f| f.contains("[DONE]")));
     }
 
     /// 空 delta（role-only）帧在错误之前到达：翻译器整帧丢弃，错误仍在
@@ -2646,6 +2846,7 @@ mod tests {
                 tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
             wb_sse::stream_forward_ex(
                 ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-1", "M",
+                &std::collections::HashSet::new(), None,
             )
         };
         assert!(err.is_none(), "内容已流出，错误不得上抛换号");
@@ -2774,7 +2975,7 @@ mod tests {
         let reader = std::io::Cursor::new(text.into_bytes());
         let ilines = open_qoder_stream(Box::new(reader), slot, "chat-1", "M")
             .expect("首字正常应成功");
-        let (completion, err) = wb_sse::aggregate(ilines, "chat-1");
+        let (completion, err) = wb_sse::aggregate(ilines, "chat-1", None);
         assert!(err.is_none(), "无流内错误");
         let completion = completion.expect("必须聚合出 completion");
         assert_eq!(completion["choices"][0]["message"]["content"], "你好");
@@ -3214,6 +3415,43 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["content"], "q1");
         assert_eq!(out[1]["content"], "q2");
+    }
+
+    /// issue #154：images_of 变体识别——Anthropic image / Responses input_image
+    /// 直入 chat completions 时归一为 image_url 形态；坏块丢弃；OpenAI 主形态
+    /// 原样保留
+    #[test]
+    fn normalize_messages_image_variants() {
+        let messages = vec![
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "看图"},
+                // Anthropic base64 形态
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                // Responses input_image 形态
+                {"type": "input_image", "image_url": "https://example.com/x.png"},
+                // 坏块：空 data 应丢弃
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}},
+                // OpenAI 主形态
+                {"type": "image_url", "image_url": {"url": "https://example.com/y.png"}},
+            ]}),
+        ];
+        let out = normalize_messages(&messages);
+        let content = out[0]["content"].as_array().unwrap();
+        // 文本 + 3 张有效图（坏块被滤掉）
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}})
+        );
+        assert_eq!(
+            content[2],
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/x.png"}})
+        );
+        assert_eq!(
+            content[3],
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/y.png"}})
+        );
     }
 
     #[test]

@@ -38,8 +38,9 @@ export default function QoderApiService() {
   // F-80-余 v2：竞速对冲阈值（0 = 关闭）+ 会话粘性开关（默认关）
   const [qoderHedgeThresholdMs, setQoderHedgeThresholdMs] = useState(8_000);
   const [qoderStickyEnabled, setQoderStickyEnabled] = useState(false);
-  // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：目录倍率按 0 处理 +
-  // 取号豁免零积分过滤；上游活动结束后关闭恢复官方同步倍率
+  // 免费活动模型倍率覆盖（issue #111/#156，默认开）：Qwen3.8-Flash 与
+  // DeepSeek-Flash 目录倍率按 0 处理 + 取号豁免零积分过滤；上游活动结束后
+  // 关闭恢复官方同步倍率
   const [flashFreeRate, setFlashFreeRate] = useState(true);
   const [savingFlashFree, setSavingFlashFree] = useState(false);
   // per-pool 调度参数（Qoder 池专属，与 Trae/Buddy 互不共享）：并发 0 = 不限、池粘性 0 = 关
@@ -192,14 +193,6 @@ export default function QoderApiService() {
         }),
         600,
       );
-      // 审查 H-3 修复：保存成功后回读池快照——本页常驻期间全局 API 管理弹窗
-      // 可能改过池配置，旧快照下次保存原样回传会静默覆盖他端配置
-      //（BuddyApiService 同款修复；回读失败保留旧快照，不阻断成功提示）
-      try {
-        setPool(await api.apiServer.poolList());
-      } catch {
-        /* 回读失败保留旧快照 */
-      }
       pushToast('success', 'Qoder 上游配置已保存（服务运行中即时生效）');
       // 审查修复（H3）：保存成功后回读后端最新池配置（对齐 BuddyAiApiService.savePool 模式）——
       // 本页 poolSet 用页面加载时的 pool 旧快照原样回传 uids/strategy/groups，其他端改过的
@@ -231,8 +224,8 @@ export default function QoderApiService() {
       pushToast(
         'success',
         flashFreeRate
-          ? '已开启：Qwen3.8-Flash 倍率按 0 处理，零积分账号可参与该模型调度'
-          : '已关闭：Qwen3.8-Flash 恢复官方同步倍率',
+          ? '已开启：Qwen3.8-Flash / DeepSeek-Flash 倍率按 0 处理，零积分账号可参与该模型调度'
+          : '已关闭：免费活动模型恢复官方同步倍率',
       );
       // 审查修复（H3）：同 saveFlags——保存成功后回读最新池配置，避免其他端改动被
       // 页面加载时的旧快照静默回退后本地无感知（回读失败静默，不误报保存失败）
@@ -787,10 +780,11 @@ export default function QoderApiService() {
                   : '已关闭定时同步，仅手动同步'}
               </span>
             </div>
-            {/* Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：上游免费活动期
+            {/* 免费活动模型倍率覆盖（issue #111/#156，默认开）：上游免费活动期
                 usage.billable=false 实际不扣分，但 model/list 目录价随低峰折扣漂移
-               （0.1/0.08）不反映免费——开启时该模型倍率按 0 处理（展示 0× + 零积分
-                账号豁免参与调度），上游活动结束后关闭恢复官方同步倍率 */}
+               （Qwen3.8-Flash 0.1/0.08、DeepSeek-Flash 0.1/0.2）不反映免费——开启时
+                免费活动模型倍率按 0 处理（展示 0× + 零积分账号豁免参与调度），上游
+                活动结束后关闭恢复官方同步倍率 */}
             <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-slate-100 p-2.5 text-xs dark:border-zinc-800">
               <label className="flex cursor-pointer items-center gap-1.5">
                 <input
@@ -798,7 +792,7 @@ export default function QoderApiService() {
                   checked={flashFreeRate}
                   onChange={(e) => setFlashFreeRate(e.target.checked)}
                 />
-                Qwen3.8-Flash 免费（0 倍率）
+                免费活动模型（0 倍率）
               </label>
               <button
                 className="btn-outline !px-2 !py-1"
@@ -809,7 +803,7 @@ export default function QoderApiService() {
               </button>
               <span className="text-slate-400 dark:text-zinc-500">
                 {flashFreeRate
-                  ? '免费活动期倍率按 0 处理（零积分账号可调度该模型）；活动结束后请关闭'
+                  ? '免费活动期倍率按 0 处理（Qwen3.8-Flash / DeepSeek-Flash，零积分账号可调度）；活动结束后请关闭'
                   : '使用官方同步倍率（低峰折扣价，零积分账号不参与该模型调度）'}
               </span>
             </div>

@@ -163,11 +163,12 @@ pub(crate) fn load_pool(state: &AppState) -> DoubaoAccountPool {
 }
 
 /// 保存账号池（SQLite 化 P3：doubao_accounts 表整表替换）。
-/// 凭证收敛（P0-1）：非空凭证字段级合并写入 vault，DB 落占位（None）；
-/// vault 写失败时仅落占位并返回 Err（对齐 Trae 红线：禁止明文落库）。
+/// 凭证收敛（P0-1）：非空凭证字段级合并写入 vault，DB 落占位（None）。
+/// vault 写失败时**数据库保持原状**（issue #153 修复 1：原「落占位 + 返 Err」会把
+/// DB 中未收敛的明文凭证当场清空销毁）——不落库直接返回 Err，凭据仅存内存，
+/// 重新录入会话可恢复。
 pub(crate) fn save_pool(state: &AppState, pool: &DoubaoAccountPool) -> Result<(), String> {
     let mut secured = pool.clone();
-    let mut vault_err: Option<String> = None;
     for a in secured.accounts.iter_mut() {
         let mut entry = crate::vault::ns_get(&state.data_dir, "doubao", &a.user_id)
             .unwrap_or_else(|| serde_json::json!({}));
@@ -184,21 +185,25 @@ pub(crate) fn save_pool(state: &AppState, pool: &DoubaoAccountPool) -> Result<()
         }
         if dirty {
             if let Err(e) = crate::vault::ns_set(&state.data_dir, "doubao", &a.user_id, &entry) {
-                vault_err = vault_err.or(Some(e));
+                // vault 写失败：数据库保持原状，不落库（issue #153 修复 1）
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "[doubao] vault 写入失败，账号池未落库（uid={}，凭据未持久化）: {e}",
+                        a.user_id
+                    ),
+                );
+                return Err(format!(
+                    "豆包凭证加密存储失败（数据库未改动，凭据未持久化，重新录入会话可恢复）: {e}"
+                ));
             }
         }
-        // 一律占位（无论 vault 成败：明文禁止进 SQLite）
+        // vault 已持久化 → 占位（明文唯一驻留地是 vault）
         a.session_id = None;
         a.sid_guard = None;
         a.ttwid = None;
     }
-    crate::store::docs::doubao_pool_save(&crate::store::db(&state.data_dir), &secured)?;
-    match vault_err {
-        None => Ok(()),
-        Some(e) => Err(format!(
-            "豆包凭证加密存储失败（已仅保存账号占位信息，重新录入会话可恢复）: {e}"
-        )),
-    }
+    crate::store::docs::doubao_pool_save(&crate::store::db(&state.data_dir), &secured)
 }
 
 /// 读取当前账号（PS 桥 Set-CurrentAccount 写 profiles_doubao/current_account.txt，UTF8 带 BOM）

@@ -89,8 +89,8 @@ fn write_meta(slot_dir: &std::path::Path, detected_uid: Option<&str>) -> Result<
         "layout": "electron-root",
         "created_at": crate::fs_utils::now_iso(),
         "savedAtMs": chrono::Utc::now().timestamp_millis(),
-        // 3.8.5 审查修复（M-C3）：记录保存时探测到的客户端身份（对齐 icube sidecar
-        // 的 detectedUid），restore 前据此校验可发现「误把 A 存进 B 槽」的历史污染
+        // 保存时探测到的客户端身份（对齐 icube sidecar detectedUid，M-C3）：
+        // restore 前据此可发现历史污染槽位（守卫上线前/fail-open 保存的快照）
         "detectedUid": detected_uid,
     });
     std::fs::write(
@@ -128,39 +128,43 @@ pub(crate) fn read_snapshot_meta(
     )
 }
 
-/// 标记 QoderWork 切换未确认登录；槽位快照存在才写，缺失静默跳过。
-/// 3.8.5 审查修复（M-C2）：主槽 meta 缺失（如 rotate_bak 后主槽已不存在、切换
-/// 实际经 .bak 回退槽恢复）时回退写 `{slot}.bak`——读取侧（qoder accounts 视图）
-/// 一直有 .bak 回退，写入侧此前不对称，导致该场景失败徽标永不点亮。
-pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
-    // 主槽优先；主槽无 meta 时尝试 .bak 回退槽（两代轮转内的上一份快照）
-    let candidates = [
-        profiles_dir.join(slot).join("snapshot_meta.json"),
-        profiles_dir
-            .join(format!("{slot}.bak"))
-            .join("snapshot_meta.json"),
-    ];
-    for path in candidates {
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let Some(obj) = v.as_object_mut() else {
-            continue;
-        };
-        obj.insert(
-            "verifyFailedAtMs".into(),
-            serde_json::json!(chrono::Utc::now().timestamp_millis()),
-        );
-        let _ = std::fs::write(&path, v.to_string());
-        return;
+/// meta 写入目标（M-C2 修复）：主槽 snapshot_meta.json 优先，缺失时回退 .bak 槽
+/// ——对齐读取侧（commands/qoder/accounts.rs 主槽双空回退 .bak）：经 .bak 恢复后
+/// 标记若只写主槽会静默丢失，红色「快照异常」徽标漏报。两者皆缺 → None 静默跳过
+fn meta_write_target(profiles_dir: &std::path::Path, slot: &str) -> Option<std::path::PathBuf> {
+    let main = profiles_dir.join(slot).join("snapshot_meta.json");
+    if main.exists() {
+        return Some(main);
     }
+    let bak = profiles_dir
+        .join(format!("{slot}.bak"))
+        .join("snapshot_meta.json");
+    bak.exists().then_some(bak)
+}
+
+/// 标记 QoderWork 切换未确认登录；槽位快照存在才写，缺失静默跳过（主槽缺失回退 .bak）。
+pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
+    let Some(path) = meta_write_target(profiles_dir, slot) else {
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "verifyFailedAtMs".into(),
+        serde_json::json!(chrono::Utc::now().timestamp_millis()),
+    );
+    let _ = std::fs::write(&path, v.to_string());
 }
 
 /// 清除 QoderWork 切换验证失败标记。主槽与 .bak 回退槽都清（哪份快照被恢复过
-/// 就清哪份，双写幂等），对齐 mark 的回退链。
+/// 就清哪份，双槽幂等），对齐 mark 的回退链。
 pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
     let candidates = [
         profiles_dir.join(slot).join("snapshot_meta.json"),
@@ -224,6 +228,8 @@ pub fn backup_electron_root(sess: &Session, slot: &str, sink: &dyn ProgressSink)
             sess.prof.app_name
         ));
     }
+    // detected_uid：save_identity_guard 一致分支记录的客户端身份（M-C3），
+    // None = fail-open 保存（未登录/解密失败），meta 落 null
     write_meta(&dest, sess.detected_live_uid.as_deref())?;
     sink.step(
         "backup",
@@ -272,23 +278,21 @@ fn test_snapshot_integrity(src: &std::path::Path, app: &str, sink: &dyn Progress
     Ok(())
 }
 
-/// restore 前的身份校验（3.8.5 审查修复 M-C3，对齐 icube 的
-/// warn_if_slot_identity_mismatch）：快照 meta 记录的保存时身份与槽位账号不符
-/// （历史污染事故：误把 A 的登录态存进 B 槽）时提前 Warn。仅主槽校验（.bak 是
-/// 覆盖前的旧代，代际不对应无法比对）；mismatch 只 Warn 不阻断——拦死会封死
-/// 「切回该账号重新登录自救」的路；旧快照无 detectedUid 时静默放行。
-fn warn_if_snapshot_identity_mismatch(
-    sess: &Session,
+/// restore 前的快照身份自检（对齐 icube warn_if_slot_identity_mismatch，M-C3）：
+/// 快照保存时探测到的客户端身份（detectedUid）与槽位账号不符 → Warn 提醒污染可能。
+/// 仅主槽比对（.bak 是覆盖前的旧代，meta 代际不对应）；旧快照无 detectedUid 时
+/// 静默放行；mismatch 只 Warn 不阻断——拦死会封死「切回该账号重新登录自救」的路
+fn warn_if_slot_identity_mismatch(
     src: &std::path::Path,
     slot: &str,
+    profiles_dir: &std::path::Path,
     sink: &dyn ProgressSink,
 ) {
     if src.file_name() != Some(std::ffi::OsStr::new(slot)) {
         return; // 回退自 .bak：不做代际比对
     }
-    let Ok(text) = std::fs::read_to_string(
-        sess.prof.profiles_dir.join(slot).join("snapshot_meta.json"),
-    ) else {
+    let Ok(text) = std::fs::read_to_string(profiles_dir.join(slot).join("snapshot_meta.json"))
+    else {
         return; // 旧快照无 meta：静默放行
     };
     let Some(saved) = serde_json::from_str::<serde_json::Value>(&text)
@@ -317,8 +321,8 @@ pub fn restore_electron_root(
     sink: &dyn ProgressSink,
 ) -> Result<(), String> {
     let (src, _slot_label) = resolve_slot(sess, slot, sink)?;
-    warn_if_snapshot_identity_mismatch(sess, &src, slot, sink);
     test_snapshot_integrity(&src, sess.prof.app_name, sink)?;
+    warn_if_slot_identity_mismatch(&src, slot, &sess.prof.profiles_dir, sink);
     let dest = sess.prof.data_dir.clone();
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
     let mut restored = 0usize;
@@ -586,7 +590,7 @@ mod tests {
         )
         .unwrap();
         let sink = CaptureSink(Default::default());
-        warn_if_snapshot_identity_mismatch(&sess, &slot_dir, "qd-a", &sink);
+        warn_if_slot_identity_mismatch(&slot_dir, "qd-a", &sess.prof.profiles_dir, &sink);
         assert!(
             sink.0
                 .lock()
@@ -597,7 +601,7 @@ mod tests {
         );
         // 回退自 .bak（src 槽名≠目标 slot）：跳过代际比对
         let sink2 = CaptureSink(Default::default());
-        warn_if_snapshot_identity_mismatch(&sess, &profiles.join("qd-a.bak"), "qd-a", &sink2);
+        warn_if_slot_identity_mismatch(&profiles.join("qd-a.bak"), "qd-a", &sess.prof.profiles_dir, &sink2);
         assert!(sink2.0.lock().unwrap().is_empty(), "回退代际不做比对");
         // 旧快照无 detectedUid：静默放行
         std::fs::write(
@@ -606,7 +610,7 @@ mod tests {
         )
         .unwrap();
         let sink3 = CaptureSink(Default::default());
-        warn_if_snapshot_identity_mismatch(&sess, &slot_dir, "qd-a", &sink3);
+        warn_if_slot_identity_mismatch(&slot_dir, "qd-a", &sess.prof.profiles_dir, &sink3);
         assert!(sink3.0.lock().unwrap().is_empty(), "无 detectedUid 静默放行");
         let _ = std::fs::remove_dir_all(&base);
     }

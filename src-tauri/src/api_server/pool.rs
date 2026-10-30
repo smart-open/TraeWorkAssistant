@@ -1019,6 +1019,31 @@ impl ApiPool {
         (total, in_allowed)
     }
 
+    /// hard_credit（积分耗尽）账号统计（issue #156）：返回 (处于次日 04:00 硬冷却
+    /// 的账号数, 最早恢复时刻 Unix 秒)。供 exhaust_message / no_healthy_detail
+    /// 携带「积分耗尽·次日 04:00 恢复」语义，使客户端可见冷却原因与恢复时间
+    /// （此前该状态只体现在管理端徽标与 app.log，对 API 客户端隐形）。
+    /// 无冷却中账号时恢复时刻为 None。
+    /// 禁用账号（SessionDead / refresh_token 失效）不计入——其 hard_until 可能是
+    /// 禁用前遗留的截止时刻，计入会把「次日 04:00 自动恢复」挂在需重新登录的
+    /// 账号上，排障方向被带偏（审查修复）。
+    pub fn hard_credit_stats(&self) -> (usize, Option<i64>) {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let mut count = 0usize;
+        let mut earliest: Option<i64> = None;
+        for e in entries.values() {
+            if e.hard_until > now && !e.disabled {
+                count += 1;
+                earliest = Some(match earliest {
+                    Some(t) => t.min(e.hard_until),
+                    None => e.hard_until,
+                });
+            }
+        }
+        (count, earliest)
+    }
+
     /// 诊断：返回所有账号被过滤的原因（用于 "no healthy account" 排查）
     pub fn diagnose(&self) -> Vec<PoolDiagnosis> {
         let entries = safe_lock(&self.entries);
@@ -1401,6 +1426,64 @@ mod tests {
             &HashMap::new(),
         );
         pool
+    }
+
+    // ==================== hard_credit_stats（issue #156） ====================
+
+    #[test]
+    fn hard_credit_stats_counts_and_earliest() {
+        // issue #156：hard_credit_stats 统计冷却中账号数与最早恢复时刻。
+        // note_error 仅对已存在条目生效——先经 build_pool 注入账号再 note。
+        let pool = build_pool(&[("qd-a", 50.0, 0), ("qd-b", 50.0, 0), ("qd-c", 50.0, 0)]);
+        let (n0, until0) = pool.hard_credit_stats();
+        assert_eq!(n0, 0, "初始无冷却账号");
+        assert!(until0.is_none(), "初始无恢复时刻");
+
+        // note_error 仅对已存在条目生效：未注入的 uid 直接被忽略
+        pool.note_error("qd-not-exist", ErrKind::HardCredit);
+        let (n_none, _) = pool.hard_credit_stats();
+        assert_eq!(n_none, 0, "未存在条目的 note_error 不应计入");
+
+        pool.note_error("qd-a", ErrKind::HardCredit);
+        let (n1, until1) = pool.hard_credit_stats();
+        assert_eq!(n1, 1, "HardCredit 后应计 1 个冷却账号");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let until = until1.expect("应有恢复时刻");
+        assert!(until > now, "恢复时刻应在未来（下个 04:00）");
+
+        // 两个账号均冷却时取更早恢复时刻：note_error 生成的 hard_until 同秒内
+        // 必然相等（同映射到同一 04:00）。min() 语义用两个受控的绝对未来时刻
+        // 验证——不可用 now+3600 之类相对值：03:00–04:00 之间跑测时该值会晚于
+        // 04:00 截止，min() 取 04:00 导致断言偶发失败（时刻依赖型测试的坑）。
+        pool.note_error("qd-b", ErrKind::HardCredit);
+        let later = now_ts() + 7200; // 2 小时后恢复
+        let earlier = now_ts() + 3600; // 1 小时后恢复（更早）
+        {
+            let mut entries = safe_lock(&pool.entries);
+            if let Some(e) = entries.get_mut("qd-a") {
+                e.hard_until = later;
+            }
+            if let Some(e) = entries.get_mut("qd-b") {
+                e.hard_until = earlier;
+            }
+        }
+        let (n2, until2) = pool.hard_credit_stats();
+        assert_eq!(n2, 2, "两个账号冷却后应计 2 个");
+        assert_eq!(until2, Some(earlier), "多账号时应取最早恢复时刻（qd-b 的 1 小时后）");
+
+        // 禁用账号不计入：禁用需重新登录，挂「次日 04:00 自动恢复」会误导排障
+        {
+            let mut entries = safe_lock(&pool.entries);
+            if let Some(e) = entries.get_mut("qd-a") {
+                e.disabled = true;
+            }
+        }
+        let (n3, until3) = pool.hard_credit_stats();
+        assert_eq!(n3, 1, "禁用账号不进入积分耗尽统计");
+        assert_eq!(until3, Some(earlier), "剩余最早恢复时刻取未禁用账号");
     }
 
     // ==================== F-80：冷却/禁用标记落 app.log ====================
