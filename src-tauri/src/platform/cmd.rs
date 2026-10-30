@@ -97,7 +97,13 @@ pub fn sys_status_timeout(
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(e) => return Err(format!("进程等待失败: {e}")),
+            // try_wait 自身出错（进程句柄异常等）：与超时路径对称 kill+wait 收尸，
+            // 防止子进程残留为僵尸存活至应用退出（对齐 qoder_common 同款手法）
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("进程等待失败: {e}"));
+            }
         }
     }
 }
