@@ -260,8 +260,7 @@ pub fn push_notify_bg(
     });
 }
 
-/// 开关过滤 + 渠道装配（push_notify / push_notify_bg 共用前置段，上游同源
-/// dfa6e02）：
+/// 开关过滤 + 渠道装配（push_notify / push_notify_bg 共用前置段）：
 /// None = 被总开关/事件开关过滤，调用方直接返回
 fn resolve_notify_channels(
     data_dir: &std::path::Path,

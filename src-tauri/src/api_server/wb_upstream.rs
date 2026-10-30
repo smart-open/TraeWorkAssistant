@@ -821,9 +821,11 @@ pub fn refresh_access_token(
         .set("Content-Type", "application/json")
         .send_string("{}");
     let body: serde_json::Value = match resp {
-        // 区分「响应体读取失败」与「读取成功但无 accessToken」——后者才是需要
-        // 上层引导重新登录的语义，前者是传输/解码层故障（对齐 wb_common P2 口径）
-        Ok(r) => r.into_json().map_err(|e| format!("刷新响应读取失败: {e}"))?,
+        // 传输层故障如实上抛：unwrap_or_default 会把解码失败落 Value::Null，
+        // 最终误报「刷新响应中无 accessToken」伪装成凭证缺失，误导用户重新登录
+        Ok(r) => r
+            .into_json()
+            .map_err(|e| format!("刷新响应读取失败: {e}"))?,
         Err(ureq::Error::Status(code, r)) => {
             // issue #118：读错误响应体透传上游 error/error_description，便于区分会话失效与账号封禁
             return Err(wb_common::refresh_fail_msg(

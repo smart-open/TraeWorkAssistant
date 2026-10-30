@@ -509,8 +509,8 @@ pub fn custom_stream_chat(
                                 // stream_forward_ex EOF-with-content 分支补发）
                                 if super::is_transport_cut(code, &msg) {
                                     last_err = format!("code={code} msg={msg}");
-                                    // 审查修复（Low）：对齐业务错误分支——管理端
-                                    // last_error 可观测（此前仅落请求日志）
+                                    // 观测口径对齐业务错误分支：掐断同样写 last_error，
+                                    // 管理端「最后错误」不因错误类别分裂
                                     set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
                                     state.logger.log_request_stage(
                                         "custom", "POST", proto.log_path(), &model, true, 200, "custom",
@@ -716,7 +716,7 @@ pub async fn custom_aggregate_chat(
                     // 换组内下一上游重试
                     if super::is_transport_cut(code, &msg) {
                         state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0, &session_ctx);
-                        // 观测口径对齐业务错误分支（同流式掐断分支，上游同源 dfa6e02）
+                        // 观测口径对齐业务错误分支（同流式掐断分支）
                         set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
                         state.logger.log_request_stage(
                             "custom", "POST", proto.log_path(), &model, stream, 200, "custom",

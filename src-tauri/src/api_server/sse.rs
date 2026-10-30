@@ -1357,11 +1357,23 @@ pub fn aggregate_anthropic<R: Read + Send>(
     let mut usage: Option<Value> = None;
     let mut tools: Vec<ToolBuf> = Vec::new();
     let mut error_info: Option<(i64, String)> = None;
+    // 传输层掐断读错误（与 collect_plain.read_error 同模式）：半截内容不得以
+    // 正常 stop_reason 伪装成功——仅 !saw_done 且无业务错误时留存传输掐断
+    // 特征读错误（口径同流式侧），其余读错误维持折叠语义
+    let mut read_error: Option<String> = None;
 
     for line in br.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break,
+            Err(e) => {
+                if !saw_done && error_info.is_none() {
+                    let text = e.to_string();
+                    if super::is_transport_cut_text(&text) {
+                        read_error = Some(text);
+                    }
+                }
+                break;
+            }
         };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
@@ -1451,6 +1463,17 @@ pub fn aggregate_anthropic<R: Read + Send>(
 
     if let Some((code, msg)) = &error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    // 传输层掐断哨兵上抛（对齐 aggregate/aggregate_text）：半截内容不得以
+    // 正常 stop_reason 伪装成功，交调用方丢弃换号重试（routes 聚合预检）
+    if let Some(e) = read_error {
+        return (
+            None,
+            Some((
+                super::TRANSPORT_CUT_CODE,
+                format!("{} {e}", super::TRANSPORT_CUT_MSG_PREFIX),
+            )),
+        );
     }
 
     let mut blocks: Vec<Value> = Vec::new();
@@ -2038,6 +2061,44 @@ mod tests {
         let resp = resp.expect("聚合结果");
         assert_eq!(resp["stop_reason"], "tool_use");
         assert!(resp["content"].as_array().expect("blocks").iter().any(|b| b["type"] == "tool_use"));
+    }
+
+    #[test]
+    fn aggregate_anthropic_transport_cut_with_content_raises_sentinel() {
+        // Anthropic 非流式聚合：半截内容 + 传输掐断读错误 → 上抛哨兵，
+        // 不得以正常 stop_reason 伪装成功（交调用方丢弃换号重试）
+        let reader = CutAfterReader {
+            data: b"event: output\ndata: {\"response\":\"hi\"}\n\n".to_vec(),
+            pos: 0,
+            err: "connection reset by peer",
+        };
+        let (resp, err) = aggregate_anthropic(reader, "msg_t", "m", None);
+        let (code, msg) = err.expect("掐断应上抛哨兵");
+        assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(
+            msg.starts_with(crate::api_server::TRANSPORT_CUT_MSG_PREFIX),
+            "哨兵消息须携带 transport cut: 前缀（is_transport_cut 双口径之一）：{msg}"
+        );
+        assert!(resp.is_none(), "半截内容不得伪装为正常聚合结果");
+        assert!(
+            !crate::api_server::is_empty_completion(code, &msg),
+            "网络掐断不得计入空完成指纹口径"
+        );
+    }
+
+    #[test]
+    fn aggregate_anthropic_non_transport_read_error_keeps_legacy_semantics() {
+        // 对照组：非传输特征读错误维持旧折叠语义——折叠为 EOF，
+        // 零内容照常返回空聚合结果（不触发传输掐断哨兵）
+        let reader = CutAfterReader {
+            data: b": keepalive\n\n".to_vec(),
+            pos: 0,
+            err: "weird os error 42",
+        };
+        let (resp, err) = aggregate_anthropic(reader, "msg_t", "m", None);
+        assert!(err.is_none(), "非传输读错误不得触发哨兵");
+        assert!(resp.is_some(), "折叠 EOF 应照常返回聚合结果");
     }
 
     // ==================== 3.8.5 审查修复：done 词表归一化 + content_filter 映射 ====================

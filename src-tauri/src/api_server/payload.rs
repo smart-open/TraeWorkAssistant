@@ -423,8 +423,9 @@ fn anthropic_image_to_openai(block: &Value) -> Option<Value> {
     let url = match source.get("type").and_then(|t| t.as_str()) {
         Some("base64") => {
             let media = source.get("media_type").and_then(|m| m.as_str())?;
-            // 审查修复（Low）：media_type 白名单——客户端可控值直接拼进 data URL
-            // 透传上游，限定常见位图类型，防注入异常 MIME（上游拒绝即丢弃该块）
+            // MIME 白名单（客户端可控字段不直透上游）：异常 MIME 可注入 data: URL
+            // 前缀（如 text/html 诱导上游内容嗅探）。白名单外丢弃该块（同坏块丢弃
+            // 语义，不整条消息拒绝）
             if !matches!(media, "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
                 return None;
             }
@@ -823,7 +824,7 @@ mod tests {
     }
 
     /// media_type 白名单（客户端可控 MIME 不直透上游）：白名单外丢弃该块，
-    /// 其余合法块不受影响（上游同源 dfa6e02）
+    /// 其余合法块不受影响
     #[test]
     fn anthropic_image_media_type_whitelist() {
         let src = json!({

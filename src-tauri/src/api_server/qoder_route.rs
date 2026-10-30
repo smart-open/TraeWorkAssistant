@@ -709,7 +709,7 @@ fn run_qoder_stream(
     let Some(entry) = qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn) else {
         let msg = format!("model {model} not in Qoder catalog");
         state.logger.log_request(
-            "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
+            "qoder", "POST", proto.log_path(), model, true, 404, "-",
             start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
         );
         send_stream_error(tx, proto, "404", &msg);
@@ -723,7 +723,7 @@ fn run_qoder_stream(
             "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
         );
         state.logger.log_request(
-            "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
+            "qoder", "POST", proto.log_path(), model, true, 404, "-",
             start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
         );
         send_stream_error(tx, proto, "404", &msg);
@@ -735,7 +735,7 @@ fn run_qoder_stream(
     if body_has_image(&peek) {
         let msg = "upstream 400 error: Qoder 池暂不支持图片输入（图片上传通道未接线，issue #154），请移除图片或改用支持视觉的非 Qoder 模型";
         state.logger.log_request(
-            "qoder", "POST", "/v1/chat/completions", model, true, 400, "-",
+            "qoder", "POST", proto.log_path(), model, true, 400, "-",
             start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
         );
         send_stream_error(tx, proto, "400", &msg);
@@ -880,7 +880,7 @@ fn run_qoder_stream(
                 note_model_server_cooldown(model);
             }
             state.logger.log_request(
-                "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
+                "qoder", "POST", proto.log_path(), model, true, 503, "none",
                 duration_ms, &key_name, "", Some(&exhaust_msg),
             );
             // issue #158 P1：池级指纹拦截短记忆（对齐 trae/buddy 池）——空完成主导
@@ -928,7 +928,7 @@ fn run_qoder_stream(
                         hard_credit_cnt,
                     );
                     state.logger.log_request(
-                        "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
+                        "qoder", "POST", proto.log_path(), model, true, 503, "none",
                         duration_ms, &key_name, "", Some(&exhaust_msg),
                     );
                     // issue #158 P1：池级指纹拦截短记忆（对齐 trae/buddy 池）——空完成
@@ -986,7 +986,7 @@ fn run_qoder_stream(
         let creds: QoderCreds = match state.qoder_identity.as_ref() {
             None => {
                 state.logger.log_request(
-                    "qoder", "POST", "/v1/chat/completions", model, true, 503, &picked.uid,
+                    "qoder", "POST", proto.log_path(), model, true, 503, &picked.uid,
                     start_ts.elapsed().as_millis() as u64, &key_name,
                     &state.qoder_pool.name_of(&picked.uid), Some("qoder identity 回调未注入"),
                 );
@@ -1015,7 +1015,7 @@ fn run_qoder_stream(
                         safe_slice(&e, 200)
                     ));
                     state.logger.log_request(
-                        "qoder", "POST", "/v1/chat/completions", model, true, 503, &picked.uid,
+                        "qoder", "POST", proto.log_path(), model, true, 503, &picked.uid,
                         start_ts.elapsed().as_millis() as u64, &key_name,
                         &state.qoder_pool.name_of(&picked.uid), Some("凭证解析失败"),
                     );
@@ -1064,7 +1064,7 @@ fn run_qoder_stream(
             Ok(b) => b,
             Err(e) => {
                 state.logger.log_request(
-                    "qoder", "POST", "/v1/chat/completions", model, true, 500, &picked.uid,
+                    "qoder", "POST", proto.log_path(), model, true, 500, &picked.uid,
                     start_ts.elapsed().as_millis() as u64, &key_name,
                     &state.qoder_pool.name_of(&picked.uid), Some(&e),
                 );
@@ -1191,7 +1191,7 @@ fn run_qoder_stream(
                                             &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
                                         );
                                         state.logger.log_request_ttfb(
-                                            "qoder", "POST", "/v1/chat/completions", model, true,
+                                            "qoder", "POST", proto.log_path(), model, true,
                                             200, &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                             &state.qoder_pool.name_of(&win_uid), Some(&msg),
                                         );
@@ -1225,7 +1225,7 @@ fn run_qoder_stream(
                                                 &session_ctx(&peek),
                                             );
                                             state.logger.log_request(
-                                                "qoder", "POST", "/v1/chat/completions",
+                                                "qoder", "POST", proto.log_path(),
                                                 model, true, 429, &win_uid, duration_ms,
                                                 &key_name,
                                                 &state.qoder_pool.name_of(&win_uid),
@@ -1320,7 +1320,7 @@ fn run_qoder_stream(
                                 &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
                             );
                             state.logger.log_request_ttfb(
-                                "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                "qoder", "POST", proto.log_path(), model, true, 200,
                                 &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                 &state.qoder_pool.name_of(&win_uid), Some(&msg),
                             );
@@ -1330,7 +1330,7 @@ fn run_qoder_stream(
                             if failed_inline {
                                 // 流内失败已就地透传客户端：不重试不记账冷却（同 wb_route）
                                 state.logger.log_request_ttfb(
-                                    "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                    "qoder", "POST", proto.log_path(), model, true, 200,
                                     &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                     &state.qoder_pool.name_of(&win_uid),
                                     Some("流内失败已透传客户端"),
@@ -1352,7 +1352,7 @@ fn run_qoder_stream(
                                     &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
                                 );
                                 state.logger.log_request_ttfb(
-                                    "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                    "qoder", "POST", proto.log_path(), model, true, 200,
                                     &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                     &state.qoder_pool.name_of(&win_uid),
                                     Some("传输层掐断（内容已流出）→ 就地收尾落账失败"),
@@ -1388,7 +1388,7 @@ fn run_qoder_stream(
                                 state.qoder_sticky.save(&state.data_dir);
                             }
                             state.logger.log_request_ttfb(
-                                "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                "qoder", "POST", proto.log_path(), model, true, 200,
                                 &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                 &state.qoder_pool.name_of(&win_uid),
                                 // 审查 #6：EOF 截断的成功行标注截断（与上游原貌不符，排障可观测）。
@@ -1452,7 +1452,7 @@ fn run_qoder_stream(
                                         &session_ctx(&peek),
                                     );
                                     state.logger.log_request(
-                                        "qoder", "POST", "/v1/chat/completions", model, true,
+                                        "qoder", "POST", proto.log_path(), model, true,
                                         429, &picked.uid, duration_ms, &key_name,
                                         &state.qoder_pool.name_of(&picked.uid),
                                         Some("模型冷却中，终止轮换"),
@@ -1499,7 +1499,7 @@ fn run_qoder_stream(
                                 now_cn_timestamp()
                             ));
                             state.logger.log_request(
-                                "qoder", "POST", "/v1/chat/completions", model, true, status,
+                                "qoder", "POST", proto.log_path(), model, true, status,
                                 &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
                                 &state.qoder_pool.name_of(&picked.uid),
                                 Some(&format!("upstream status={status}")),
@@ -1516,7 +1516,7 @@ fn run_qoder_stream(
                                 start_ts.elapsed().as_millis() as u64, 0, 0,
                                 None, None, None, &session_ctx(&peek));
                             state.logger.log_request(
-                                "qoder", "POST", "/v1/chat/completions", model, true, status,
+                                "qoder", "POST", proto.log_path(), model, true, status,
                                 &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
                                 &state.qoder_pool.name_of(&picked.uid), Some(&msg),
                             );
@@ -1927,7 +1927,7 @@ pub async fn qoder_aggregate_chat(
                             Some(qoder_upstream::UpstreamKind::TransportCut)
                         ) {
                             state.logger.log_request_ttfb(
-                                "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
+                                "qoder", "POST", proto.log_path(), &model, stream, 200,
                                 &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                 &state.qoder_pool.name_of(&win_uid),
                                 Some("传输层掐断（部分响应已丢弃）→ 换号重试"),
@@ -1972,7 +1972,7 @@ pub async fn qoder_aggregate_chat(
                                     state.qoder_sticky.save(&state.data_dir);
                                 }
                                 state.logger.log_request_ttfb(
-                                    "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
+                                    "qoder", "POST", proto.log_path(), &model, stream, 200,
                                     &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                     &state.qoder_pool.name_of(&win_uid), None,
                                 );
@@ -2011,7 +2011,7 @@ pub async fn qoder_aggregate_chat(
                                                     &session_ctx(&peek),
                                                 );
                                                 state.logger.log_request_ttfb(
-                                                    "qoder", "POST", "/v1/chat/completions",
+                                                    "qoder", "POST", proto.log_path(),
                                                     &model, stream, 429, &win_uid, duration_ms,
                                                     Some(ttfb_ms), &key_name,
                                                     &state.qoder_pool.name_of(&win_uid),
@@ -2058,7 +2058,7 @@ pub async fn qoder_aggregate_chat(
                                     now_cn_timestamp()
                                 ));
                                 state.logger.log_request_ttfb(
-                                    "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
+                                    "qoder", "POST", proto.log_path(), &model, stream, 200,
                                     &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                     &state.qoder_pool.name_of(&win_uid), Some(&msg),
                                 );
@@ -2070,7 +2070,7 @@ pub async fn qoder_aggregate_chat(
                                 empty_hits += 1;
                                 state.qoder_pool.note_error(&win_uid, ErrKind::Server);
                                 state.logger.log_request_ttfb(
-                                    "qoder", "POST", "/v1/chat/completions", &model, stream, 502,
+                                    "qoder", "POST", proto.log_path(), &model, stream, 502,
                                     &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                     &state.qoder_pool.name_of(&win_uid),
                                     Some("empty response"),
@@ -2109,7 +2109,7 @@ pub async fn qoder_aggregate_chat(
                                             start_ts.elapsed().as_millis() as u64, 0, 0,
                                             None, None, None, &session_ctx(&peek));
                                         state.logger.log_request(
-                                            "qoder", "POST", "/v1/chat/completions", &model,
+                                            "qoder", "POST", proto.log_path(), &model,
                                             stream, 429, &picked.uid,
                                             start_ts.elapsed().as_millis() as u64, &key_name,
                                             &state.qoder_pool.name_of(&picked.uid),
@@ -2152,7 +2152,7 @@ pub async fn qoder_aggregate_chat(
                                 // qoder 桶 requests/errors 虚高）；终态由成功/取号
                                 // no-healthy 分支统一落一行（审查 P2-4，与 wb/trae 对齐）
                                 state.logger.log_request(
-                                    "qoder", "POST", "/v1/chat/completions", &model, stream,
+                                    "qoder", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64, &key_name,
                                     &state.qoder_pool.name_of(&picked.uid),
@@ -2170,7 +2170,7 @@ pub async fn qoder_aggregate_chat(
                                     None, None, None, &session_ctx(&peek),
                                 );
                                 state.logger.log_request(
-                                    "qoder", "POST", "/v1/chat/completions", &model, stream,
+                                    "qoder", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid,
                                     start_ts.elapsed().as_millis() as u64, &key_name,
                                     &state.qoder_pool.name_of(&picked.uid),

@@ -664,9 +664,8 @@ fn main() {
                                     // 全部应用共用），避免与 notify::notify 重复弹窗。
                                     // 事件类别取 Other（手动操作结果，不受「任务失败」事件开关
                                     // 限制）：托盘菜单无其他反馈通道，若被事件开关静默，
-                                    // 用户点了「启动服务」却只看到没起来、原因全无（静默失败红线）
-                                    // 审查修复（M）：托盘回调在主线程，用后台线程版防渠道
-                                    // HTTP 串行（最坏 4×10s）卡 UI 事件循环
+                                    // 用户点了「启动服务」却只看到没起来、原因全无（静默失败红线）。
+                                    // 后台线程版：菜单回调在主线程，四渠道 HTTP（最坏 ~40s）不得阻塞 UI 事件循环
                                     commands::workbuddy::push_notify_bg(
                                         Some(app.clone()),
                                         st.data_dir.clone(),
@@ -710,7 +709,7 @@ fn main() {
                                     // 渠道推送统一入口（含桌面通知 + Bark/Server酱/Webhook，
                                     // 全部应用共用），避免与 notify::notify 重复弹窗。
                                     // 同上：托盘直操取 Other，不被「任务失败」事件开关静默；
-                                    // 主线程回调用后台线程版（审查修复 M）
+                                    // 后台线程版防渠道 HTTP 阻塞主线程
                                     commands::workbuddy::push_notify_bg(
                                         Some(app.clone()),
                                         st.data_dir.clone(),
