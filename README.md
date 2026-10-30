@@ -43,6 +43,16 @@ Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 1
 
 **使用本工具即表示你已阅读、理解并同意上述全部免责声明。**
 
+## 🔗 相关：多平台合集面板
+
+如果你同时在用别的 AI 编程平台账号，可以看看这块合集面板：
+
+**[WorkBuddy2API Panel](https://github.com/xu20060420fan-cell/workbuddy2api-trae-qoder-minimax-panel)**
+
+同样支持 **Trae**（IDE 账号池、切号、签到、积分、客户端提取令牌），另外还统管 **WorkBuddy / CodeBuddy / Qoder / MiniMax / 豆包 Doubao / 华为云 CodeArts 码道**，全部账号共用一个 OpenAI 兼容网关。
+
+---
+
 ## 功能
 
 - **账号管理**：多账号录入/编辑/OAuth 登录（含 WorkBuddy 扫码、Qoder OAuth 设备流 / PAT 导入）、分组管理、设备 ID 隔离、**本机 Trae 账号自动发现**、WorkBuddy/CodeBuddy auth 文件扫描入池、豆包抓包凭证回写、Qoder IDE 登录态扫描入池
