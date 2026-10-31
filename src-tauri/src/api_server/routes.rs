@@ -420,6 +420,42 @@ pub(crate) fn exhaust_message(
     healthy_total: usize,
     hard: usize,
 ) -> (String, &'static str) {
+    exhaust_message_with_transport_cut(empty_hits, rotated, healthy_total, hard, 0)
+}
+
+/// 在通用耗尽文案上补充传输掐断归因（issue #158 同族可见化）：
+/// 全部轮换账号都在响应中途被掐时，不再误报 "no healthy account available"；
+/// 混合失败则保留原归因并追加 cut 计数，避免把网络问题当成账号健康问题。
+pub(crate) fn exhaust_message_with_transport_cut(
+    empty_hits: usize,
+    rotated: usize,
+    healthy_total: usize,
+    hard: usize,
+    cut_hits: usize,
+) -> (String, &'static str) {
+    if cut_hits > 0 && rotated > 0 && cut_hits >= rotated {
+        return (
+            format!(
+                "transport cut suspected: {cut_hits} transport cut(s) across {rotated} rotated accounts (upstream connection closed mid-response, account/model agnostic — retry later or check local network/proxy; pool=trae healthy={healthy_total})"
+            ),
+            "TRANSPORT_CUT",
+        );
+    }
+    let (mut msg, tag) = exhaust_message_without_cut(empty_hits, rotated, healthy_total, hard);
+    if cut_hits > 0 && rotated > 0 {
+        msg.push_str(&format!(
+            "; {cut_hits} transport cut(s) across {rotated} rotated accounts (upstream connection closed mid-response, account/model agnostic — retry later or check local network/proxy)"
+        ));
+    }
+    (msg, tag)
+}
+
+fn exhaust_message_without_cut(
+    empty_hits: usize,
+    rotated: usize,
+    healthy_total: usize,
+    hard: usize,
+) -> (String, &'static str) {
     if rotated >= 2 && empty_hits * 2 > rotated {
         (
             format!(
@@ -1856,6 +1892,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
         let mut empty_hits: usize = 0;
+        // 传输掐断计数：与空完成分开归因，耗尽时用于修正 "no healthy account" 文案
+        let mut cut_hits: usize = 0;
         // 11128 诊断样本按请求去重（换号轮换重复命中不重复打样）
         let mut last_11128_sample: Option<String> = None;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
@@ -2117,6 +2155,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             // - 零内容被掐：错误帧未下发，换号重试（不落账，
                             //   中间态与空完成换号同口径）
                             if super::is_transport_cut(code, &msg) {
+                                cut_hits += 1;
                                 if sent_any {
                                     state.logger.log_request_ttfb(
                                         "trae", "POST", proto.log_path(), &model, stream,
@@ -2356,13 +2395,15 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             }
         }
 
-        // 所有账号不可用（空完成主导 → 明示渠道指纹拦截语义，否则维持原文案）
+        // 所有账号不可用（空完成/传输掐断主导 → 明示对应归因，否则维持原文案）
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
         let (exhaust_msg, exhaust_tag) =
-            exhaust_message(empty_hits, tried.len(), healthy_total, hard_credit_cnt);
+            exhaust_message_with_transport_cut(
+                empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+            );
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
         super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
@@ -2396,8 +2437,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             // 并返回日志注记供反查漏网触发句
             let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "trae", &body_vec);
             let diag_line = format!(
-                "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} empty_hits={} pool=trae reasons=[{}]{}",
-                h, m, s, tried.len(), empty_hits, diag_summary.join(", "), sample_note,
+                "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} empty_hits={} cut_hits={} pool=trae reasons=[{}]{}",
+                h, m, s, tried.len(), empty_hits, cut_hits, diag_summary.join(", "), sample_note,
             );
             state.logger.log_debug_line(format!("[DEBUG] {diag_line}"));
         }
@@ -2509,6 +2550,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
         let mut empty_hits: usize = 0;
+        // 传输掐断计数：与空完成分开归因，耗尽时用于修正 "no healthy account" 文案
+        let mut cut_hits: usize = 0;
         // 11128 诊断样本按请求去重（换号轮换重复命中不重复打样）
         let mut last_11128_sample: Option<String> = None;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
@@ -2667,18 +2710,30 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                             }
                             (None, Some((code, msg))) => {
                                 // 传输层掐断预检（issue #158 报错A，P2-1 聚合侧补齐，
-                                // 须在 classify_solo_error 之前——与流式侧 2119 行同口径）：
+                                // 须在 classify_solo_error 之前——与流式侧同口径）：
                                 // 账号无关传输故障，不冷却、不解绑粘性、不计空完成指纹；
                                 // 非流式未向客户端发出任何内容，直接丢弃截断响应 break 换号
-                                //（截断的部分响应可能含残缺 tool_calls，不得当成功交付）
+                                //（截断的部分响应可能含残缺 tool_calls，不得当成功交付）。
+                                // PR #162：cut_hits 计入轮换耗尽归因——全池被掐时
+                                // exhaust_message_with_transport_cut 报传输掐断而非
+                                // "no healthy account available"；日志 502 对齐
+                                // empty response 分支（本次尝试未向客户端交付）
                                 if super::is_transport_cut(code, &msg) {
+                                    cut_hits += 1;
                                     state.logger.log_request(
                                         "trae", "POST", proto.log_path(), &model, stream,
-                                        200, &picked.uid, duration_ms, &key_name,
+                                        502, &picked.uid, duration_ms, &key_name,
                                         &state.pool.name_of(&picked.uid),
-                                        Some("传输层掐断（聚合响应已丢弃）→ 换号重试"),
+                                        Some(&format!(
+                                            "传输层掐断（聚合响应已丢弃）→ 换号重试：{} [upstream: {}]",
+                                            safe_slice(&msg, 160),
+                                            primary_hdr
+                                        )),
                                     );
-                                    break; // 换号
+                                    if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                        state.logger.log_debug(&picked.uid, &converted, None, 502, Some(&msg));
+                                    }
+                                    break; // 换号，不冷却、不计空完成指纹
                                 }
                                 // 空完成哨兵（-9901，影子风控）计入指纹拦截观测；
                                 // 冷却行为维持现状（classify_solo_error → Server）
@@ -2880,11 +2935,13 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         }
 
         let duration_ms = start_ts.elapsed().as_millis() as u64;
-        // 轮换耗尽收尾：空完成主导 → 明示渠道指纹拦截语义，否则维持原文案
+        // 轮换耗尽收尾：空完成/传输掐断主导 → 明示对应归因，否则维持原文案
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
         let (exhaust_msg, exhaust_tag) =
-            exhaust_message(empty_hits, tried.len(), healthy_total, hard_credit_cnt);
+            exhaust_message_with_transport_cut(
+                empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+            );
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
         super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
@@ -2912,8 +2969,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             // 并返回日志注记供反查漏网触发句
             let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "trae", &body_vec);
             state.logger.log_debug_line(format!(
-                "[DEBUG] {exhaust_tag}(non-stream) tried={} empty_hits={} pool=trae reasons=[{}]{}",
-                tried.len(), empty_hits, diag_summary.join(", "), sample_note,
+                "[DEBUG] {exhaust_tag}(non-stream) tried={} empty_hits={} cut_hits={} pool=trae reasons=[{}]{}",
+                tried.len(), empty_hits, cut_hits, diag_summary.join(", "), sample_note,
             ));
         }
         Err(AggregateFail::NoHealthy(exhaust_msg))
@@ -3506,6 +3563,37 @@ mod tests {
         let (msg, tag) = exhaust_message(6, 10, 2, 0);
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+    }
+
+    #[test]
+    fn exhaust_message_transport_cut_only_does_not_blame_accounts() {
+        let (msg, tag) = exhaust_message_with_transport_cut(0, 3, 5, 0, 3);
+        assert!(msg.contains("transport cut suspected"), "{msg}");
+        assert!(msg.contains("3 transport cut(s) across 3 rotated accounts"), "{msg}");
+        assert!(!msg.contains("no healthy account available"), "{msg}");
+        assert_eq!(tag, "TRANSPORT_CUT");
+    }
+
+    #[test]
+    fn exhaust_message_transport_cut_mixed_appends_note() {
+        // 空完成主导仍保留原归因，但必须补充 cut 计数，不能让网络掐断从诊断中消失
+        let (msg, tag) = exhaust_message_with_transport_cut(3, 3, 4, 0, 1);
+        assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
+        assert!(msg.contains("1 transport cut(s) across 3 rotated accounts"), "{msg}");
+        assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+
+        // 积分硬冷却分支同样补注，避免把 cut 混入账号归因
+        let (msg_credit, tag_credit) = exhaust_message_with_transport_cut(0, 3, 0, 2, 1);
+        assert!(msg_credit.contains("credit exhausted on 2 account(s)"), "{msg_credit}");
+        assert!(msg_credit.contains("1 transport cut(s) across 3 rotated accounts"), "{msg_credit}");
+        assert_eq!(tag_credit, "NO_HEALTHY_ACCOUNT_CREDIT");
+    }
+
+    #[test]
+    fn exhaust_message_without_transport_cut_keeps_legacy_text() {
+        let (msg, tag) = exhaust_message_with_transport_cut(0, 3, 0, 0, 0);
+        assert_eq!(msg, "no healthy account available");
+        assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
 
     #[test]
