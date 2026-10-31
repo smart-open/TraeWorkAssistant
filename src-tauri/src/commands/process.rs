@@ -20,8 +20,7 @@
 use crate::platform::cmd::sys_command;
 use std::time::{Duration, Instant};
 
-/// 检查任一映像名是否仍在运行（Windows：tasklist 精确匹配 IMAGENAME；
-/// macOS：sysinfo 进程名精确匹配，剥离 .exe 后缀比对）
+/// 检查任一映像名是否仍在运行（Windows：tasklist 精确匹配 IMAGENAME）。
 /// F-75：mac 改用 mac_app_running（bundle 段信号），本函数仅 Windows 编译消费
 #[cfg(not(target_os = "macos"))]
 pub fn images_running(images: &[&str]) -> Vec<String> {
@@ -38,24 +37,6 @@ pub fn images_running(images: &[&str]) -> Vec<String> {
                 })
                 .unwrap_or(false);
             if running {
-                alive.push(img.to_string());
-            }
-        }
-        alive
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let sys = mac_snapshot();
-        let mut alive = Vec::new();
-        for img in images {
-            // mac 进程名无 .exe 后缀（待 M-1 侦察 6 核对各应用 mac 主进程名）；
-            // images_for_app 的 Windows 形态名单经剥离后精确比对
-            let want = img.strip_suffix(".exe").unwrap_or(img);
-            if sys
-                .processes()
-                .values()
-                .any(|p| p.name().to_string_lossy().eq_ignore_ascii_case(want))
-            {
                 alive.push(img.to_string());
             }
         }
@@ -134,43 +115,6 @@ pub fn graceful_kill_images(images: &[&str]) -> Result<(), String> {
         // ---- 第二级：强杀进程树（/T /F），最长等待 2s ----
         for img in &alive {
             run_taskkill(&["/T", "/F", "/IM", img]);
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if images_running(images).is_empty() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // ---- 第一级：优雅关闭（SIGTERM，Electron 正常落盘），最长等待 3s ----
-        {
-            let sys = mac_snapshot();
-            for p in sys.processes().values() {
-                if mac_name_matches(images, &p.name().to_string_lossy()) {
-                    let _ = p.kill_with(sysinfo::Signal::Term); // SIGTERM
-                }
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if images_running(images).is_empty() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-
-        // ---- 第二级：强杀（SIGKILL，sysinfo kill()），最长等待 2s ----
-        {
-            let sys = mac_snapshot();
-            for p in sys.processes().values() {
-                if mac_name_matches(images, &p.name().to_string_lossy()) {
-                    let _ = p.kill(); // unix = SIGKILL
-                }
-            }
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {

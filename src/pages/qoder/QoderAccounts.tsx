@@ -514,7 +514,9 @@ export default function QoderAccounts() {
     if (!editing || editBusy) return;
     setEditBusy(true);
     try {
-      await api.qoder.accountSave(editing.id, editName.trim(), editNote);
+      // 空名 → undefined（不修改 nickname）：后端 Some("") 会把昵称清空为空串，
+      // 对齐 Buddy/Doubao 账号编辑「留空即保持原名」的既有语义
+      await api.qoder.accountSave(editing.id, editName.trim() || undefined, editNote);
       pushToast('success', '已保存');
       setEditing(null);
       void refresh();

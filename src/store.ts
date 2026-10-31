@@ -601,11 +601,12 @@ export const useAppStore = create<AppState>((set, get) => ({
           api.env.locate('workbuddy_ai').catch(() => null),
           api.env.locate('codebuddy_ai').catch(() => null),
         ]);
-        // 探测期间用户可能在设置面板显式开启（onChange 已落标记）：以其选择为准不覆盖
-        if (get().settings?.buddy_ai_visible === true) {
-          localStorage.setItem(BUDDY_AI_VIS_DECIDED_KEY, '1');
-          return;
-        }
+        // 探测期间用户可能在设置面板显式切换过开关（onChange 同步落 decided 标记，
+        // 开启与关闭都算）：以其选择为准，自动逻辑退避不覆盖。审查修复（Medium）：
+        // 原仅回读 settings.buddy_ai_visible===true 挡「显式开启」，显式关闭仍会被
+        // 下方 saveSettings 翻回 true。重读 decided 后到 saveSettings 间仍有毫秒级
+        // 窗口（一次性启动逻辑，用户最终一次保存会再覆盖，不再加重）
+        if (localStorage.getItem(BUDDY_AI_VIS_DECIDED_KEY)) return;
         // 探测完成即落标记：无论是否安装，本机只自动探测一次
         localStorage.setItem(BUDDY_AI_VIS_DECIDED_KEY, '1');
         if (wb?.exe || cb?.exe) {

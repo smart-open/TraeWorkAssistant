@@ -254,36 +254,21 @@ pub async fn qoder_live_logins(state: State<'_, AppState>) -> Result<QoderLiveLo
 // ── 环境检测（M0 侦察结论固化为候选路径；M0 R-1/R-2 缺口闭合后扩展）─────────
 
 /// 0.4.3+ 拆分形态检测：真 IDE 已独立安装。
-/// Windows 判定 exe 存在性（`%LOCALAPPDATA%\Programs\Qoder CN IDE\Qoder CN IDE.exe`），
-/// macOS 改为 `.app` bundle 目录存在性判定（审查修复：补齐 mac 分支）。
+/// Windows 判定 exe 存在性（`%LOCALAPPDATA%\Programs\Qoder CN IDE\Qoder CN IDE.exe`）；
+/// macOS / 其他平台见下方独立 cfg 版本（审查 Low 清理：本函数体内嵌的 mac/兜底
+/// cfg 块被外层 windows 门控短路永不编译，纯死代码已删除——真实分支即下方两份）
 #[cfg(target_os = "windows")]
 pub(crate) fn ide_split_installed() -> bool {
-    #[cfg(windows)]
-    {
-        std::env::var("LOCALAPPDATA")
-            .ok()
-            .map(|l| {
-                PathBuf::from(l)
-                    .join("Programs")
-                    .join("Qoder CN IDE")
-                    .join("Qoder CN IDE.exe")
-                    .exists()
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // mac 形态（2026-10-05 实测）：/Applications、~/Applications 双根下
-        // Qoder CN IDE.app bundle 存在即视为已装拆分形态——此前直读 LOCALAPPDATA
-        // 恒 false，拆分形态判定在 mac 上语义失效（审查 L）
-        mac_app_bases()
-            .iter()
-            .any(|b| b.join("Qoder CN IDE.app").is_dir())
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        false
-    }
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|l| {
+            PathBuf::from(l)
+                .join("Programs")
+                .join("Qoder CN IDE")
+                .join("Qoder CN IDE.exe")
+                .exists()
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -303,29 +288,18 @@ pub(crate) fn ide_split_installed() -> bool {
 /// 过期 IDE 手动路径：指向 `Programs\Qoder CN\Qoder CN.exe`（0.4.3 前该路径是
 /// IDE，现在语义已是 Work 本体）。拆分形态已装时判定过期，忽略手动值走默认候选。
 /// 审查修复：该过期语义仅存在于 Windows 拆分布局，非 Windows 显式声明恒 false
+///（见下方独立 cfg 版本；内嵌 not(windows) 死块随审查 Low 清理删除）
 #[cfg(target_os = "windows")]
 fn is_stale_ide_manual(p: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        std::env::var("LOCALAPPDATA")
-            .ok()
-            .map(|l| {
-                p == PathBuf::from(l)
-                    .join("Programs")
-                    .join("Qoder CN")
-                    .join("Qoder CN.exe")
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        // mac 无「0.4.3 前该路径是 IDE」旧语义（旧一体化布局仅存在于 Windows），
-        // 手动值无需过期降级——恒 false，ide_exe_candidates 的降级分支自然不触发
-        // （审查 L：此前直读 LOCALAPPDATA 在 mac 恒 None → false，语义相同但成因
-        // 是巧合而非设计，显式声明防误读）
-        let _ = p;
-        false
-    }
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|l| {
+            p == PathBuf::from(l)
+                .join("Programs")
+                .join("Qoder CN")
+                .join("Qoder CN.exe")
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(not(target_os = "windows"))]

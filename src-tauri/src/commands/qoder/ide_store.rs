@@ -102,9 +102,11 @@ const SECURITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90)
 #[cfg(target_os = "macos")]
 fn read_keychain_password(svc: &str) -> Result<String, String> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
-    let mut child = Command::new("security")
+    // 审查修复（Medium，sys_command 红线）：系统 CLI 一律经 platform::cmd 构建，
+    // 禁止散写 Command::new（mac 分支虽无窗口标志需求，口径必须统一）
+    let mut child = crate::platform::cmd::sys_command("security")
         .args(["find-generic-password", "-w", "-s", svc])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

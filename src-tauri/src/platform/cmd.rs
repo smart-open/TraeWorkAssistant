@@ -108,6 +108,53 @@ pub fn sys_status_timeout(
     }
 }
 
+/// macOS 专用：运行命令并在超时内等待退出，收集 stdout（utf-8 宽容解码）。
+/// 审查修复（Medium）：mdfind 等兜底探测在 Spotlight 索引异常时可长时间挂起，
+/// `.output()` 无超时会卡死调用线程（切换链 locate → mdfind_bundle）。stdout 量
+/// 小（.app 路径行），轮询 try_wait 不存在 pipe 填满死锁（对齐 ide_store 同款判断）
+#[cfg(target_os = "macos")]
+pub fn sys_output_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("执行失败: {e}"))?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("执行超时（>{timeout:?}），已强制终止"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // try_wait 出错：对称 kill+wait 收尸，防子进程残留为僵尸（对齐上方同款）
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("进程等待失败: {e}"));
+            }
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut p) = child.stdout.take() {
+        let _ = p.read_to_string(&mut stdout);
+    }
+    if !status.success() {
+        return Err(format!("退出码 {:?}", status.code()));
+    }
+    Ok(stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

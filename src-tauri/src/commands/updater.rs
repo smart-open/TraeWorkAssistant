@@ -869,10 +869,13 @@ pub fn update_restart_app(app: AppHandle) -> Result<(), String> {
                 );
             }
         }
-        // `open <bundle>` 经 LaunchServices 拉起（异步提交激活请求）；status() 取退出码
-        let status = crate::platform::cmd::sys_command("open")
-            .arg(&bundle)
-            .status()
+        // `open <bundle>` 经 LaunchServices 拉起（异步提交激活请求）；取退出码校验。
+        // 审查修复（Medium）：LS 常态 <100ms，异常挂起时无超时 status() 会无限阻塞
+        // 命令线程（重启按钮永久转圈且应用无法退出）——sys_status_timeout 5s 兜底
+        // 强杀，超时报错不退出，应用保持可用可手动重启
+        let mut cmd = crate::platform::cmd::sys_command("open");
+        cmd.arg(&bundle);
+        let status = crate::platform::cmd::sys_status_timeout(&mut cmd, Duration::from_secs(5))
             .map_err(|e| format!("拉起新版应用失败: {e}"))?;
         if !status.success() {
             return Err(format!(

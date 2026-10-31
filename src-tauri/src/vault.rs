@@ -527,11 +527,31 @@ pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
 /// 豆包代理抓包凭证快照读取（审查 P2 收敛配套）：优先 vault ns `doubao_captured`
 /// （handler.rs 写入点已收敛至此），未命中回退旧 kv `doubao_captured_credentials`
 /// 一次——兼容「应用升级后尚未重启、迁移未执行」场景下读取方仍能拿到快照；
-/// 两处皆无返回 None。历史明文 kv 由 [migrate_ns_on_startup] ④ 迁入 vault 后清空。
+/// 再未命中回退 3.7.1 旧 vault ns `doubao`/`captured`（b1531f5 引入时的命名，
+/// 当时的迁移已把明文 kv 搬进去并删除——只回退 kv 会漏掉这批用户，审查 Medium
+/// 断代修复），命中即自愈搬迁到新 ns 并清理旧条目（搬迁失败仍返回旧值不丢凭证，
+/// 下次读取重试）。两处皆无返回 None。历史明文 kv 由 [migrate_ns_on_startup] ④
+/// 迁入 vault 后清空。
 /// 消费方：commands/doubao.rs（read_captured_uid / doubao_captured_credential /
 /// doubao_credential_auto_apply）与 tasks/doubao_chats.rs（detect_uid）共 4 处。
 pub fn doubao_captured_get(data_dir: &Path) -> Option<serde_json::Value> {
     if let Some(v) = ns_get(data_dir, "doubao_captured", "credentials") {
+        return Some(v);
+    }
+    if let Some(v) = ns_get(data_dir, "doubao", "captured") {
+        match ns_set(data_dir, "doubao_captured", "credentials", &v) {
+            Ok(()) => {
+                ns_remove(data_dir, "doubao", "captured");
+                fs_utils::app_log(
+                    data_dir,
+                    "vault: 豆包抓包凭证已从旧 ns doubao/captured 搬迁至 doubao_captured/credentials",
+                );
+            }
+            Err(e) => log_once(
+                data_dir,
+                &format!("vault: 豆包抓包凭证旧 ns 搬迁失败（保留旧条目，下次读取重试）: {e}"),
+            ),
+        }
         return Some(v);
     }
     let v: serde_json::Value = crate::store::db(data_dir).kv_get("doubao_captured_credentials");

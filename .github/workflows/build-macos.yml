@@ -70,6 +70,10 @@ jobs:
             ~/.cargo/git
             src-tauri/target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          # 审查修复（Low）：Cargo.lock 变更（升级依赖）后精确键 miss，无 restore-keys
+          # 会全量重编译——回退到本架构最近一次缓存增量编译
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - run: npm ci
 

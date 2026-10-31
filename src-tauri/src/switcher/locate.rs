@@ -246,6 +246,10 @@ pub(crate) fn locate_bundle_dir(name: &str, exe_names: &[&str], bundle_ids: &[&s
 /// Spotlight 兜底：mdfind 查 .app，逐个经白名单防串台
 #[cfg(target_os = "macos")]
 pub(crate) fn mdfind_bundle(name: &str, exe_names: &[&str], bundle_ids: &[&str]) -> Option<PathBuf> {
+    use std::time::Duration;
+    // 审查修复（Medium）：Spotlight 索引异常时 mdfind 可长时间挂起，无超时会卡死
+    // 切换链——sys_output_timeout 3s 兜底强杀（常态秒回，3s 足够宽裕）
+    const MDFIND_TIMEOUT: Duration = Duration::from_secs(3);
     // 逐应用目录查询（用户级 ~/Applications 与系统级 /Applications 同等常见）
     let mut roots = vec!["/Applications".to_string()];
     let home = std::env::var("HOME").unwrap_or_default();
@@ -253,18 +257,20 @@ pub(crate) fn mdfind_bundle(name: &str, exe_names: &[&str], bundle_ids: &[&str])
         roots.push(format!("{home}/Applications"));
     }
     for root in roots {
-        let out = crate::platform::cmd::sys_command("mdfind")
-            .args([
+        let out = match crate::platform::cmd::sys_output_timeout(
+            crate::platform::cmd::sys_command("mdfind").args([
                 &format!("kMDItemKind == 'Application' && kMDItemDisplayName == '*{name}*'cd"),
                 "-onlyin",
                 &root,
-            ])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
+            ]),
+            MDFIND_TIMEOUT,
+        ) {
+            Ok(s) => s,
+            // 超时/启动失败：跳过该 root 继续下一个（原 .output().ok()? 会整体放弃，
+            // 连用户级目录都不再尝试）
+            Err(_) => continue,
+        };
+        let text = out;
         for line in text.lines() {
             let p = PathBuf::from(line.trim());
             if is_bundle_dir(&p) && bundle_exe_matches(&p, exe_names, bundle_ids) {

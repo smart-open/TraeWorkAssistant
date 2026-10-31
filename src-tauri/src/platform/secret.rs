@@ -140,29 +140,15 @@ fn store_vault_password_at_impl(
     #[cfg(target_os = "macos")]
     {
         let hex: String = pwd.iter().map(|b| format!("{b:02x}")).collect();
-        // 1) 主源：key file，0600 权限（写失败必须报错——它是 vault 的解密真值）。
-        //    审查 P2：OpenOptions unix 扩展 mode(0o600) 在 create 时即以最小权限
-        //    建立文件，消除原「fs::write 先 0644 创建再 set_permissions」的权限窗口；
-        //    set_permissions 保留为既有文件（历史 0644 / umask 放宽）的兜底，
-        //    失败按本函数 Result 语义传播（key file 是 vault 解密真值，权限放宽
-        //    等同明文暴露，不得静默吞掉）
+        // 1) 主源：key file（写失败必须报错——它是 vault 的解密真值）。
+        //    审查修复（Low）：原 create+truncate 与 write_all 两步非原子，中途崩溃/
+        //    断电会留下 0 字节 key file（decode_hex 已按损坏源防御，但会 fail-open
+        //    到 Keychain 兜底，旧值可能已过期且与密文失配）——复用
+        //    vault::write_key_file_atomic（tmp 0600 创建 + fsync + rename 原子替换，
+        //    rename 失败清 tmp），写纯 hex 格式不变；rename 后新 inode 即 0600，
+        //    原 set_permissions 兜底随之删除
         let key_path = data_dir.join("conf").join("vault_key.bin");
-        {
-            use std::io::Write;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&key_path)
-                .map_err(|e| format!("写入 vault 密钥失败: {e}"))?;
-            f.write_all(hex.as_bytes())
-                .map_err(|e| format!("写入 vault 密钥失败: {e}"))?;
-            // 兜底：文件已存在时 mode() 不改变既有权限，统一收紧到 0600
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("vault 密钥权限收紧为 0600 失败: {e}"))?;
-        }
+        crate::vault::write_key_file_atomic(&key_path, &hex)?;
         // 2) 兜底：Keychain 尽力而为（dev 重签场景实测写后读不回/可能失败，不影响主源）
         if let Ok(entry) = keyring_entry() {
             if let Err(e) = entry.set_password(&hex) {
@@ -187,10 +173,10 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     // 审查修复（P2）：按字节切片——`&s[i..i+2]` 字节索引落在多字节 UTF-8 字符
     // 中间会直接 panic（Keychain 内容理论上由本应用写入，防御性处理）
     let bytes = s.as_bytes();
-    // 审查修复：空串判为损坏源——store 是 create+truncate 与 write_all 两步，
-    // 中途崩溃/断电会留下 0 字节 key file；空输入若返回 Ok(vec![])，空密码会
-    // 直达 Stronghold 解锁必败，且跳过 Keychain fail-open 兜底（Keychain 可能
-    // 仍持有写入中断前的旧值）。空串与损坏 hex 同等对待。
+    // 审查修复：空串判为损坏源——store 已改为原子写（tmp+rename），不再产生
+    // 0 字节 key file，但历史文件/外部写入仍可能为空；空输入若返回 Ok(vec![])，
+    // 空密码会直达 Stronghold 解锁必败，且跳过 Keychain fail-open 兜底（Keychain
+    // 可能仍持有旧值）。空串与损坏 hex 同等对待。
     if bytes.is_empty() {
         return Err("vault 密钥为空（key file 可能写入中断）".into());
     }
