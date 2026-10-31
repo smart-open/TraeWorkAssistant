@@ -283,11 +283,14 @@ fn inject_trae_outbound(
     body_vec: Vec<u8>,
     wire: Option<String>,
     max_mode_hint: bool,
+    ctx_max: bool,
     requested_model: &str,
     model: &str,
 ) -> Vec<u8> {
-    let inject_max =
-        max_mode_hint && efforts::trae_max_mode_supported(&unified_catalog::canonical_id(model));
+    // Trae 页「长上下文」开关（context_window::trae_wants_max）与 `-max` 入口为「或」关系：
+    // 开关只能开启、不关闭显式 -max；同受 Max Mode 支持表门控
+    let inject_max = (max_mode_hint || ctx_max)
+        && efforts::trae_max_mode_supported(&unified_catalog::canonical_id(model));
     let rewrite_model = requested_model != model;
     if wire.is_none() && !inject_max && !rewrite_model {
         return body_vec;
@@ -306,11 +309,12 @@ fn inject_trae_outbound(
             crate::fs_utils::app_log(
                 data_dir,
                 &format!(
-                    "trae outbound: model={} requested_model={} effort_injected={} max_mode_injected={}",
+                    "trae outbound: model={} requested_model={} effort_injected={} max_mode_injected={} ctx_max={}",
                     model,
                     requested_model,
                     wire.is_some(),
                     inject_max,
+                    ctx_max,
                 ),
             );
             serde_json::to_vec(&obj).unwrap_or(body_vec)
@@ -386,7 +390,8 @@ pub(crate) fn dispatch_error_response(
             DispatchError::NoHealthy(pool) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 pool.as_str(),
-                no_healthy_detail(state, pool, key_str),
+                // issue #159：传模型名——503 归因可见「前置池因模型冷却被跳过」
+                no_healthy_detail_with_model(state, pool, key_str, Some(model)),
                 "no_healthy_account",
                 "api_error",
             ),
@@ -493,8 +498,23 @@ fn exhaust_message_without_cut(
 /// issue #136 hint 按根因分流：allowed=Some(空集)（约束条目全指向其他池，本池被
 /// 整体排除，调度优先级对该 Key 形同虚设）与 allowed=Some(非空) 但作用域内账号
 /// 均不可用，两种根因用户动作不同，混用同一文案会误导排障方向。
-/// pub(crate)：dispatch 测试模块经 Fixture 直测（与 trae_pool_constraints 同模式）
+/// pub(crate)：dispatch 测试模块经 Fixture 直测（与 trae_pool_constraints 同模式）；
+/// 生产调用点已统一走 no_healthy_detail_with_model（issue #159），本包装仅测试用
+#[cfg(test)]
 pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_str: &str) -> String {
+    no_healthy_detail_with_model(state, pool, key_str, None)
+}
+
+/// NoHealthy 详情（带模型上下文版本，issue #159）：model=Some 时追加「被跳过池
+/// 的模型级冷却归因」——调度按候选序取失败池之前的池，若该池已启用且同名模型
+/// 正处于模型级冷却，503 的真实根因是该池被冷却表整池跳过（池内其余健康账号
+/// 被无视），显式归因避免用户误排账号/Key 配置
+pub(crate) fn no_healthy_detail_with_model(
+    state: &ApiSharedState,
+    pool: TargetPool,
+    key_str: &str,
+    model: Option<&str>,
+) -> String {
     let pool_ref = match pool {
         TargetPool::Trae => &state.pool,
         TargetPool::Buddy => &state.wb_pool,
@@ -519,8 +539,12 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
     } else {
         String::new()
     };
+    // issue #159：模型上下文可用时归因「前置候选池因模型级冷却被整体跳过」
+    let skip_note = model
+        .map(|m| skipped_pool_note(state, pool, m))
+        .unwrap_or_default();
     let base = format!(
-        "no healthy account available (pool={} healthy={healthy_total}){hard_note}",
+        "no healthy account available (pool={} healthy={healthy_total}){hard_note}{skip_note}",
         pool.as_str(),
     );
     // 单锁快照：一次取（展示名, 约束），替代 constraints_for + key_name_for 双加锁
@@ -595,6 +619,60 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
                 "{base} key={name} bind={bind} whitelist={wl} dedicated={ded} healthy_in_scope={healthy_scope}{hint}"
             )
         }
+    }
+}
+
+/// issue #159：NoHealthy 时归因「排在失败池之前的候选池因模型级冷却被整体跳过」。
+/// 按 POOL_FIXED_ORDER 取失败池之前的池：Buddy 需 wb_enabled 且同名模型在 wb
+/// 冷却表内、BuddyAi 需 buddy_ai_enabled 且同名模型在 buddy-ai 冷却表内、
+/// Qoder 需 qoder_enabled 且同名模型在 qoder 冷却表内——满足即说明调度在到达
+/// 失败池前就已因模型冷却放弃该池。无命中返回空串（消息不变）。
+/// 仅覆盖这三类有模型冷却表的池（Trae 无模型级冷却；冷却键为请求模型名，与
+/// note_model_failure_ex/pool_health 的常规路径一致，别名改写场景归因尽力而为）
+fn skipped_pool_note(state: &ApiSharedState, failed: TargetPool, model: &str) -> String {
+    let Some(failed_idx) = dispatch::POOL_FIXED_ORDER.iter().position(|p| *p == failed) else {
+        return String::new();
+    };
+    let mut notes: Vec<String> = Vec::new();
+    for p in &dispatch::POOL_FIXED_ORDER[..failed_idx] {
+        let rem: Option<i64> = match p {
+            TargetPool::Buddy => {
+                if state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    wb_route::model_cooldown_remaining_on(state, false, model)
+                } else {
+                    None
+                }
+            }
+            TargetPool::Qoder => {
+                if state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    super::qoder_route::model_cooling_remaining_secs(model).map(|s| s as i64)
+                } else {
+                    None
+                }
+            }
+            TargetPool::BuddyAi => {
+                if state
+                    .buddy_ai_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    wb_route::model_cooldown_remaining_on(state, true, model)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(rem) = rem {
+            notes.push(format!(
+                "{} skipped: model_cooldown remaining={rem}s",
+                p.as_str()
+            ));
+        }
+    }
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", notes.join("; "))
     }
 }
 
@@ -1081,8 +1159,9 @@ pub async fn chat_completions(
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
+                let ctx_max = super::context_window::trae_wants_max(&state.data_dir, &r.model);
                 let body_vec = inject_trae_outbound(
-                    &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
+                    &state.data_dir, body_vec, wire, r.max_mode_hint, ctx_max, &model, &r.model,
                 );
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard)
@@ -1465,8 +1544,9 @@ pub async fn messages(
                     _ => None,
                 };
                 let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
+                let ctx_max = super::context_window::trae_wants_max(&state.data_dir, &r.model);
                 let body_vec = inject_trae_outbound(
-                    &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
+                    &state.data_dir, body_vec, wire, r.max_mode_hint, ctx_max, &model, &r.model,
                 );
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard)
@@ -1604,8 +1684,9 @@ pub async fn completions(
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
                 let wire = trae_effort_wire(&state, r.effort_hint, None, &r.model);
+                let ctx_max = super::context_window::trae_wants_max(&state.data_dir, &r.model);
                 let body_vec = inject_trae_outbound(
-                    &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
+                    &state.data_dir, body_vec, wire, r.max_mode_hint, ctx_max, &model, &r.model,
                 );
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard)
@@ -4025,7 +4106,7 @@ mod tests {
         // 测试桩：注入函数现需 data_dir 落可观测性日志（issue #38-5），指向临时目录
         let dir = std::env::temp_dir();
         let inject = |body: Vec<u8>, wire: Option<String>, mm: bool, requested: &str, model: &str| {
-            inject_trae_outbound(&dir, body, wire, mm, requested, model)
+            inject_trae_outbound(&dir, body, wire, mm, false, requested, model)
         };
         let body = br#"{"model":"glm-5.3","messages":[]}"#.to_vec();
 
@@ -4078,5 +4159,34 @@ mod tests {
         // 非 JSON body → 原样
         let raw = b"not-json".to_vec();
         assert_eq!(inject(raw.clone(), Some("high".into()), true, "glm-5.3", "glm-5.3"), raw);
+    }
+
+    /// 长上下文开关（ctx_max）→ Trae 出站：生效 / 未设置零变化 / 表外模型不炸
+    #[test]
+    fn inject_trae_outbound_ctx_max() {
+        let dir = std::env::temp_dir();
+        let body = br#"{"model":"glm-5.3","messages":[]}"#.to_vec();
+        // 开关开启：无 -max 后缀也注入 is_max_mode
+        let out = inject_trae_outbound(&dir, body.clone(), None, false, true, "glm-5.3", "glm-5.3");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["is_max_mode"], true);
+        assert_eq!(v["model"], "glm-5.3");
+        // 未开启：逐字节原样（不 parse 不重排）
+        let spaced = b"{ \"model\" : \"glm-5.3\", \"messages\":[] }".to_vec();
+        assert_eq!(
+            inject_trae_outbound(&dir, spaced.clone(), None, false, false, "glm-5.3", "glm-5.3"),
+            spaced
+        );
+        // 支持表外模型：开关无法执行 → 原样，不注入
+        let other = br#"{"model":"doubao-seed-code","messages":[]}"#.to_vec();
+        assert_eq!(
+            inject_trae_outbound(&dir, other.clone(), None, false, true, "doubao-seed-code", "doubao-seed-code"),
+            other
+        );
+        // 与 -max 入口叠加：仍单次注入
+        let out = inject_trae_outbound(&dir, body, None, true, true, "glm-5.3-max", "glm-5.3");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["is_max_mode"], true);
+        assert_eq!(v["model"], "glm-5.3");
     }
 }

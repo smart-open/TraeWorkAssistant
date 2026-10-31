@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.8.6
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.8.7
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -157,6 +157,7 @@ ai-work-assistant/
 | API | `api_usage_stats(days?)` → `UsageDayView[]` | 网关用量按日统计（T1，data/api_usage.json，保留 90 天，直读落盘） |
 | API | `api_keys_list()` / `api_keys_save(keys)` | 多 API Key 列表管理（T2，data/api_keys.json，每日配额；主 Key 双轨已移除） |
 | API | `api_unified_models(available_only?)` | 统一模型目录（v3.3.x）：Trae 官网同步 + WB 目录 + 自定义模型三源合并（canonical_id trim+lowercase 归并），元数据四层兜底（L1 人工覆盖 trae_model_meta.json → L2 官网 → L3 默认 → L4 系列推断）；与 `GET /v1/models` 共用视图 |
+| API | `trae_long_context_list()` / `trae_long_context_set(model,enabled)` / `qoder_context_length_list()` / `qoder_context_length_set(model,tokens)` | 按模型长上下文（issue #163，**按池分表、互不影响**，各自只在本池页面设置，只影响请求侧，不改 `/v1/models` 与计费；保存即对下一请求生效）：Trae kv `trae_long_context`（canonical_id 集合；开启 = 注入 `is_max_mode`，与 `-max` 后缀为或关系、不关闭显式 -max，Max Mode 支持表外模型拒绝开启；关闭 = 跟随上游）、Qoder kv `qoder_context_length`（`{canonical_id: tokens}`，区间 1024~10M，tokens null/0 = 清除跟随上游；设置 → `parameters.context_length`，上游 400 时错误信息附恢复指引）；Buddy 无请求侧字段不提供设置 |
 | API | `dispatch_policy_get()` / `dispatch_policy_set(policy)` | 池间调度策略（data/dispatch_policy.json）：`strategy`（smart=到期优先→倍率→健康积分和 / priority=严格按序）、`priority`（trae/buddy/qoder 数组，缺省 ["buddy","trae","qoder"]）、`per_model` 模型级覆盖（显式覆盖不做智能重排）、`fallback` 跨池回退开关；带 mtime 兜底解析缓存 |
 | API | `custom_models_list()` / `custom_models_save(model)` / `custom_models_remove(id)` / `custom_model_test(model)` / `custom_lb_status()` | 自定义 OpenAI 兼容上游（data/custom_models.json）：列表 / upsert（name/base_url 必填；**同名多条 = 上游组**——仅拒绝完全重复（同名+同 base_url+同 api_key），id `cm-<12hex>` 自动生成；条目字段含 `weight`（负载权重，默认 1）/ `standby`（备胎标记，默认 false））/ 连通性测试（与保存同口径预检）/ 熔断快照（每条冷却中上游的 fails/cooling_secs，重启清零）。**调度语义（v3）**：上游组经 custom_lb 组内加权轮询 + 主备 failover + 实例级熔断（30s×2ⁿ 封顶 480s，401/403/402 长 600s，成功即清）；作为第五资源池参与 dispatch 统一调度（默认候选序尾部兜底），`custom/模型名` 前缀锁池直达、Key 绑定 "custom" 与 per_model 写 "custom" 全链路生效 |
 | API | `api_wb_usage_stats(days?)` / `api_custom_usage_stats(days?)` / `api_qoder_usage_stats(days?)` | WB 池 / 自定义池 / Qoder 池用量按日统计（四桶分库查询，days 默认 14 clamp 1~90；Qoder 桶上游接入后产生数据） |

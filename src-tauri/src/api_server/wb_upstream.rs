@@ -445,6 +445,14 @@ pub fn lines_with_first_byte_timeout_interruptible<R: Read + Send + 'static>(
 }
 
 /// reader → channel 行转发线程（首字超时/竞速共用）
+///
+/// 读错误（对端 FIN 后 read 恒 Err、h2 RST_STREAM 等）转发一次后立即退出：
+/// 不 break 则对恒错误 reader 全速空转（Err → send → Err → …），若下游
+/// 消费者吞掉 Err（如 `filter_map(.ok())`）即形成双线程死循环、CPU 恒烧
+/// 不自愈（issue #164）。转发一次保证错误仍达折叠点（read_slot /
+/// last_read_error），随后 reader 随线程退出 Drop——CLOSE-WAIT fd 同步关闭。
+/// 消费者侧（InterruptibleLines / chain_rest）本就把 Err 折叠为 EOF，
+/// 转发线程退出 → Disconnected → 消费者自然收尾，语义不变。
 fn relay_lines<R: Read + Send + 'static>(
     reader: R,
     tx: std::sync::mpsc::Sender<std::io::Result<String>>,
@@ -452,7 +460,11 @@ fn relay_lines<R: Read + Send + 'static>(
     std::thread::spawn(move || {
         let br = BufReader::new(reader);
         for line in br.lines() {
+            let midstream_err = line.is_err();
             if tx.send(line).is_err() {
+                break;
+            }
+            if midstream_err {
                 break;
             }
         }
@@ -1276,6 +1288,57 @@ mod tests {
         let got: Vec<String> = lines.collect();
         assert_eq!(got, vec!["data: [DONE]"], "正常完成行不受影响");
         assert!(take_read_error_slot(&slot).is_none(), "正常完成不留读错误");
+    }
+
+    /// read 恒 Err 的 reader（issue #164 触发源：对端 FIN 后每次 read 立即
+    /// 返回错误，非阻塞、非 EOF，DeadlineStream 兜不住）
+    struct AlwaysErrRead;
+    impl Read for AlwaysErrRead {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("connection reset by peer"))
+        }
+    }
+
+    /// 限时等 Disconnected：超时即视为转发线程未退出（死循环回归）。
+    /// 返回 (转发行数, 转发错误数)
+    fn wait_relay_disconnected(
+        rx: &std::sync::mpsc::Receiver<std::io::Result<String>>,
+    ) -> (usize, usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut lines, mut errs) = (0usize, 0usize);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(_)) => lines += 1,
+                Ok(Err(_)) => errs += 1,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return (lines, errs),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "转发线程 5s 内未退出（issue #164 死循环回归）"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn relay_lines_exits_on_persistent_read_error() {
+        // issue #164：恒错误 reader 下转发线程必须有限步退出（不 break 则
+        // Err → send → Err → … 全速空转，与吞 Err 的消费者互相泵错误）
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        relay_lines(AlwaysErrRead, tx);
+        let (lines, errs) = wait_relay_disconnected(&rx);
+        assert_eq!(lines, 0, "读错误 reader 不应产出行");
+        assert_eq!(errs, 1, "读错误应恰好转发一次供下游折叠点留存");
+    }
+
+    #[test]
+    fn relay_lines_exits_after_midstream_cut() {
+        // 流中途掐断（先产出再恒 Err）：错误转发一次后线程退出 →
+        // Disconnected，chain_rest / InterruptibleLines 折叠 EOF 自然收尾
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        relay_lines(CutAfterFirstRead { n: 0 }, tx);
+        let (lines, errs) = wait_relay_disconnected(&rx);
+        assert_eq!(lines, 2, "掐断前产出的行应已转发（数据行 + 尾随空行）");
+        assert_eq!(errs, 1, "掐断错误应恰好转发一次");
     }
 
     /// Drop 副作用探针：验证对冲上下文 T 的 RAII 配对契约
