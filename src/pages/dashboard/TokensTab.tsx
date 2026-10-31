@@ -13,17 +13,18 @@ import {
 import { Activity } from 'lucide-react';
 import ChartFilterBar, { SOURCE_LABELS, type BoardSource } from '../../components/ChartFilterBar';
 import ActivityHeatmap from '../../components/charts/ActivityHeatmap';
-import ModelRanking from '../../components/charts/ModelRanking';
+import ModelTrendChart from '../../components/charts/ModelTrendChart';
 import { Badge, EmptyState, StatCard } from '../../components/ui';
 import { useDateRange } from '../../hooks/useDateRange';
 import { useIsDark } from '../../lib/useIsDark';
 import type { UsageDayView, UsageHistoryResult, WbTokenStats } from '../../types';
 import type { PlatformScope } from './KpiRow';
+import { buildModelTrend } from './modelTrend';
 
 /**
  * Token 统计 Tab（credits-dashboard-plan.md §3.2/§5.2，批次 3 = issue #35 Bug2 用户可见修复）：
  * ① 总 Token 统计卡（总/输入/输出/缓存命中率）② Token 与调用趋势（双轴堆叠柱 + 调用虚线）
- * ③ 模型消耗排行 ④ 年度活动热力图。
+ * ③ 各模型消耗趋势（issue #160）④ 年度活动热力图。
  * 三源（口径不同，独立展示不合并）：
  * 本地 = workbuddy_token_stats（365 天，WB/CodeBuddy 客户端会话）；
  * API 网关 = api_usage_stats / api_wb_usage_stats（90 天，代理转发口径；custom 池仅 API 服务页展示）；
@@ -105,7 +106,16 @@ export default function TokensTab({
   // ---- 范围 × 模型 × 平台 聚合 ----
   const agg = useMemo(() => {
     const byDate = new Map<string, DayAgg>();
-    const byModel = new Map<string, { tokens: number; calls: number }>();
+    // 各模型消耗趋势（issue #160）：模型 → 日期 → 数值（恒为全模型，不随模型筛选联动）
+    const modelByDate = new Map<string, Map<string, number>>();
+    const addModelDay = (date: string, model: string, v: number) => {
+      let m = modelByDate.get(model);
+      if (!m) {
+        m = new Map();
+        modelByDate.set(model, m);
+      }
+      m.set(date, (m.get(date) ?? 0) + v);
+    };
     const addDay = (date: string, p: DayAgg) => {
       const cur = byDate.get(date) ?? emptyAgg();
       cur.input += p.input;
@@ -118,9 +128,11 @@ export default function TokensTab({
 
     if (source === 'local' && buddyActive && tokenStats) {
       for (const [model, points] of Object.entries(tokenStats.daily_by_model)) {
-        if (modelFilter && model !== modelFilter) continue;
         for (const p of points) {
           if (!p.date || !inRange(p.date)) continue;
+          // 趋势恒为全模型（总 Token 口径 = input + output + cache_write），先累积再走模型筛选
+          addModelDay(p.date, model, (p.input ?? 0) + (p.output ?? 0) + (p.cache_write ?? 0));
+          if (modelFilter && model !== modelFilter) continue;
           addDay(p.date, {
             input: p.input ?? 0,
             output: p.output ?? 0,
@@ -128,10 +140,6 @@ export default function TokensTab({
             cache_write: p.cache_write ?? 0,
             calls: p.calls ?? 0,
           });
-          const m = byModel.get(model) ?? { tokens: 0, calls: 0 };
-          m.tokens += (p.input ?? 0) + (p.output ?? 0) + (p.cache_write ?? 0);
-          m.calls += p.calls ?? 0;
-          byModel.set(model, m);
         }
       }
     }
@@ -146,11 +154,8 @@ export default function TokensTab({
           calls: day.total_requests,
         });
         for (const m of day.models) {
-          if (modelFilter && m.name !== modelFilter) continue;
-          const e = byModel.get(m.name) ?? { tokens: 0, calls: 0 };
-          // 网关源无按模型 token 明细，排行口径 = 请求数（§3.1 同款诚实声明）
-          e.calls += m.requests;
-          byModel.set(m.name, e);
+          // 趋势图恒为全模型；网关源无按模型 token 明细，趋势口径 = 请求数（§3.1 同款诚实声明）
+          addModelDay(day.date, m.name, m.requests);
         }
       }
     }
@@ -176,7 +181,7 @@ export default function TokensTab({
       cache_write += v.cache_write;
       calls += v.calls;
     }
-    return { byDate, byModel, input, output, cache_read, cache_write, calls };
+    return { byDate, modelByDate, input, output, cache_read, cache_write, calls };
   }, [source, buddyActive, traeActive, tokenStats, gateway, scope, usage, modelFilter, startStr, todayStr]);
 
   // ---- 口径派生：总 Token / 缓存命中率 / 堆叠段 ----
@@ -219,17 +224,18 @@ export default function TokensTab({
     [dateList, range, agg, source],
   );
   const chartEmpty = trend.every((d) => (d.calls as number) === 0 && segments.every((k) => !(d[k] as number)));
+  const showDots = range === 'today' || range === '7d';
 
-  // ---- 模型排行（local=tokens；gateway=请求数口径；official 无按模型明细）----
-  const ranking = useMemo(
-    () =>
-      [...agg.byModel.entries()].map(([model, m]) => ({
-        model,
-        value: source === 'local' ? m.tokens : m.calls,
-        calls: source === 'local' ? m.calls : undefined,
-      })),
-    [agg, source],
+  // ---- 各模型消耗趋势（issue #160：日 × 模型折线，Top8 + 其他聚合）----
+  // local = 按模型 token（总 Token 口径：input + output + cache_write）；gateway = 请求数（无按模型 token 明细，
+  // 诚实声明）；official 无按模型明细 → 诚实空态。恒为全模型，不随模型筛选联动。
+  const hasModelDaily = source === 'local' || source === 'gateway';
+  const modelTrend = useMemo(
+    () => buildModelTrend(agg.modelByDate, dateList, range),
+    [agg.modelByDate, dateList, range],
   );
+  const modelFmt = source === 'local' ? fmtTokens : (n: number) => n.toLocaleString('zh-CN');
+  const modelUnitLabel = source === 'local' ? 'tokens' : '请求数';
 
   // ---- 会话总数（§3.3：local=summary.calls；gateway=范围内请求合计；official=范围内 sessions）----
   const sessions = useMemo(() => {
@@ -426,25 +432,30 @@ export default function TokensTab({
             )}
           </div>
 
-          {/* ③ 模型消耗排行（local=tokens；gateway=请求数口径，诚实声明） */}
+          {/* ③ 各模型消耗趋势（issue #160：日 × 模型折线；official 无按模型 token 明细 → 诚实空态） */}
           <div className="mt-5 border-t border-slate-100 pt-4 dark:border-zinc-800">
             <div className="mb-2 flex items-center gap-2">
-              <h4 className="text-sm font-medium">模型消耗排行</h4>
-              <span className="text-xs text-slate-400">所选区间 · Top8 + 其余合计</span>
+              <h4 className="text-sm font-medium">各模型消耗趋势</h4>
+              {hasModelDaily && modelTrend.series.length > 0 && (
+                <span className="text-xs text-slate-400">所选区间 · Top8 + 其他 · 口径 = {modelUnitLabel}</span>
+              )}
               {source === 'gateway' && <Badge tone="amber">网关源无按模型 token 明细，口径 = 请求数</Badge>}
             </div>
-            <ModelRanking
-              items={ranking}
-              fmtValue={source === 'local' ? fmtTokens : (n: number) => n.toLocaleString('zh-CN')}
-              unit={source === 'local' ? 'tokens' : '次请求'}
-              emptyHint={
-                source === 'official'
-                  ? '官网源无按模型 token 明细（日粒度仅 input/output/cache 汇总）。'
-                  : source === 'gateway'
-                    ? '该区间暂无网关请求记录。'
-                    : '该范围内暂无本地 Token 记录。'
-              }
-            />
+            {!hasModelDaily ? (
+              <EmptyState
+                icon={<Activity size={22} />}
+                title="官网源无按模型 token 明细"
+                hint="官网日粒度仅 input/output/cache 汇总，无按模型拆分；模型趋势请切「本地」或「API网关」源。"
+              />
+            ) : modelTrend.series.length === 0 ? (
+              <EmptyState
+                icon={<Activity size={22} />}
+                title="暂无模型趋势数据"
+                hint={source === 'gateway' ? '该区间暂无网关请求记录。' : '该范围内暂无本地 Token 记录。'}
+              />
+            ) : (
+              <ModelTrendChart rows={modelTrend.rows} series={modelTrend.series} showDots={showDots} fmtValue={modelFmt} />
+            )}
           </div>
 
           {/* ④ 年度活动热力图 */}

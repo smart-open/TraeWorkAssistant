@@ -112,6 +112,13 @@ export default function ApiService() {
   // 已开启模型的 canonical id 集合；null = 未加载（开关禁用，避免基于空表误操作）
   const [longCtx, setLongCtx] = useState<Set<string> | null>(null);
   const [savingLongCtx, setSavingLongCtx] = useState<string | null>(null);
+  // 在途镜像 ref（审查修复）：loadModels 的整表回填不得回退在途 toggle 的函数式回填
+  // ——state 闭包值在 useCallback 中恒为挂载时旧值，守卫须读 ref 实时值
+  const savingLongCtxRef = useRef<string | null>(null);
+  // 快照序号（审查修复 TOCTOU）：toggle 落库成功时递增，使「先发出、toggle 落库
+  // 后才返回」的旧整表快照失效——ref 镜像只覆盖「快照返回时 toggle 在途」，
+  // 不覆盖该反向时序（快照返回时 ref 已清空，旧值会覆盖刚勾选的项）
+  const longCtxSeq = useRef(0);
 
   useEffect(() => {
     void refreshAccounts();
@@ -155,9 +162,17 @@ export default function ApiService() {
       try {
         const list = await withMinDelay(api.apiServer.unifiedModels(), 250);
         setModels(list.filter((m) => m.sources.some((s) => s.pool === 'trae')));
-        // 长上下文开关随目录刷新（失败保留旧值，不影响目录展示）
+        // 长上下文开关随目录刷新（失败保留旧值，不影响目录展示）；
+        // 在途 toggle 期间跳过整表覆盖（审查修复：防旧快照回退刚勾选的项）；
+        // 快照发起时记录序号，返回时若期间已有 toggle 落库则本次快照作废（TOCTOU）
+        const lcSeq = longCtxSeq.current;
         const lc = await api.apiServer.traeLongContextList().catch(() => null);
-        if (lc) setLongCtx(new Set(lc.enabled));
+        if (lc && lcSeq === longCtxSeq.current)
+          setLongCtx((prev) => (savingLongCtxRef.current ? prev : new Set(lc.enabled)));
+        else if (lc === null && longCtx === null)
+          // 审查 Low：首次加载失败时开关列整列禁用（longCtx===null），静默禁用
+          // 让用户无从知晓原因 → 提示一次；已有旧值的手动刷新失败不打扰
+          toast('error', '长上下文开关状态加载失败，开关暂不可用');
       } catch {
         // 初始化失败静默保留空列表；手动点击刷新失败需给出提示
         if (manual) toast('error', '加载模型目录失败，请重试');
@@ -165,7 +180,7 @@ export default function ApiService() {
         setLoadingModels(false);
       }
     },
-    [toast],
+    [toast, longCtx],
   );
 
   // 同步官网模型（models_sync 沿用现有调用）；L1 人工覆盖层不受同步影响
@@ -329,19 +344,34 @@ export default function ApiService() {
   const toggleLongCtx = async (model: string, enabled: boolean) => {
     const id = model.trim().toLowerCase();
     setSavingLongCtx(id);
+    savingLongCtxRef.current = id;
     try {
       const on = await withMinDelay(api.apiServer.traeLongContextSet(model, enabled), 250);
+      // 快照序号失效 + 主动重拉（对齐 Qoder onSaved 模式）：服务端已按本次 toggle
+      // 变更，发出早于此刻的整表快照不再可信（TOCTOU）；重拉携带新序号，仅应用
+      // 最后一次请求结果，失败保留函数式回填值
+      const seq = ++longCtxSeq.current;
       setLongCtx((prev) => {
         const next = new Set(prev ?? []);
         if (on) next.add(id);
         else next.delete(id);
         return next;
       });
+      // 后台对齐全表：快照期其他端的外部变更随即收敛（守卫语义与 loadModels 一致：
+      // 序号已被更新一次的请求作废、期间有在途 toggle 则跳过整表覆盖）
+      void api.apiServer
+        .traeLongContextList()
+        .then((lc) => {
+          if (seq === longCtxSeq.current)
+            setLongCtx((prev) => (savingLongCtxRef.current ? prev : new Set(lc.enabled)));
+        })
+        .catch(() => {});
       toast('success', on ? `${model} 已开启长上下文` : `${model} 已恢复跟随上游`);
     } catch (e) {
       toast('error', `保存失败：${String(e)}`);
     } finally {
       setSavingLongCtx(null);
+      savingLongCtxRef.current = null;
     }
   };
 

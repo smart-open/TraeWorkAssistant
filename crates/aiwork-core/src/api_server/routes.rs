@@ -395,7 +395,8 @@ pub(crate) fn dispatch_error_response(
             DispatchError::NoHealthy(pool) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 pool.as_str(),
-                no_healthy_detail(state, pool, key_str),
+                // issue #159：传模型名——503 归因可见「前置池因模型冷却被跳过」
+                no_healthy_detail_with_model(state, pool, key_str, Some(model)),
                 "no_healthy_account",
                 "api_error",
             ),
@@ -426,6 +427,46 @@ pub(crate) fn dispatch_error_response(
 /// M5 审查收口：`pool` = 发起收尾的池名（trae/buddy/buddy-ai/qoder）——此前
 /// 文案硬编码 pool=trae，qoder 池复用后排障文案把用户指向错误池
 pub(crate) fn exhaust_message(
+    pool: &str,
+    empty_hits: usize,
+    rotated: usize,
+    healthy_total: usize,
+    hard: usize,
+) -> (String, &'static str) {
+    exhaust_message_with_transport_cut(pool, empty_hits, rotated, healthy_total, hard, 0)
+}
+
+/// 在通用耗尽文案上补充传输掐断归因（issue #158 同族可见化，PR #162）：
+/// 全部轮换账号都在响应中途被掐时，不再误报 "no healthy account available"；
+/// 混合失败则保留原归因并追加 cut 计数，避免把网络问题当成账号健康问题。
+/// `pool` 参数为本分支多池签名（M5 收口）适配：transport cut 专属文案同样
+/// 携带实际池名，qoder/buddy 池复用时不把用户指向错误池
+pub(crate) fn exhaust_message_with_transport_cut(
+    pool: &str,
+    empty_hits: usize,
+    rotated: usize,
+    healthy_total: usize,
+    hard: usize,
+    cut_hits: usize,
+) -> (String, &'static str) {
+    if cut_hits > 0 && rotated > 0 && cut_hits >= rotated {
+        return (
+            format!(
+                "transport cut suspected: {cut_hits} transport cut(s) across {rotated} rotated accounts (upstream connection closed mid-response, account/model agnostic — retry later or check local network/proxy; pool={pool} healthy={healthy_total})"
+            ),
+            "TRANSPORT_CUT",
+        );
+    }
+    let (mut msg, tag) = exhaust_message_without_cut(pool, empty_hits, rotated, healthy_total, hard);
+    if cut_hits > 0 && rotated > 0 {
+        msg.push_str(&format!(
+            "; {cut_hits} transport cut(s) across {rotated} rotated accounts (upstream connection closed mid-response, account/model agnostic — retry later or check local network/proxy)"
+        ));
+    }
+    (msg, tag)
+}
+
+fn exhaust_message_without_cut(
     pool: &str,
     empty_hits: usize,
     rotated: usize,
@@ -469,8 +510,23 @@ pub(crate) fn exhaust_message(
 /// issue #136 hint 按根因分流：allowed=Some(空集)（约束条目全指向其他池，本池被
 /// 整体排除，调度优先级对该 Key 形同虚设）与 allowed=Some(非空) 但作用域内账号
 /// 均不可用，两种根因用户动作不同，混用同一文案会误导排障方向。
-/// pub(crate)：dispatch 测试模块经 Fixture 直测（与 trae_pool_constraints 同模式）
+/// pub(crate)：dispatch 测试模块经 Fixture 直测（与 trae_pool_constraints 同模式）；
+/// 生产调用点已统一走 no_healthy_detail_with_model（issue #159），本包装仅测试用
+#[cfg(test)]
 pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_str: &str) -> String {
+    no_healthy_detail_with_model(state, pool, key_str, None)
+}
+
+/// NoHealthy 详情（带模型上下文版本，issue #159）：model=Some 时追加「被跳过池
+/// 的模型级冷却归因」——调度按候选序取失败池之前的池，若该池已启用且同名模型
+/// 正处于模型级冷却，503 的真实根因是该池被冷却表整池跳过（池内其余健康账号
+/// 被无视），显式归因避免用户误排账号/Key 配置
+pub(crate) fn no_healthy_detail_with_model(
+    state: &ApiSharedState,
+    pool: TargetPool,
+    key_str: &str,
+    model: Option<&str>,
+) -> String {
     let pool_ref = match pool {
         TargetPool::Trae => &state.pool,
         TargetPool::Buddy => &state.wb_pool,
@@ -495,15 +551,21 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
     } else {
         String::new()
     };
+    // issue #159：模型上下文可用时归因「前置候选池因模型级冷却被整体跳过」
+    let skip_note = model
+        .map(|m| skipped_pool_note(state, pool, m))
+        .unwrap_or_default();
     let base = format!(
-        "no healthy account available (pool={} healthy={healthy_total}){hard_note}",
+        "no healthy account available (pool={} healthy={healthy_total}){hard_note}{skip_note}",
         pool.as_str(),
     );
     // 单锁快照：一次取（展示名, 约束），替代 constraints_for + key_name_for 双加锁
     let Some((name, rk)) = super::api_keys::key_snapshot_for(&state.data_dir, key_str) else {
         return base;
     };
-    let name = if name.is_empty() { key_str } else { name.as_str() };
+    // 展示名缺失回退固定占位符（审查 Low）：回退原始 API Key 会把密钥原文
+    // 拼进 503 响应体/日志，最小暴露面
+    let name = if name.is_empty() { "unnamed" } else { name.as_str() };
     let bind = rk.bind_pool().unwrap_or("-");
     match rk.pool_constraints(pool.as_str()) {
         None => format!("{base} key={name} bind={bind} constraint=none"),
@@ -573,6 +635,100 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
             )
         }
     }
+}
+
+/// issue #159：NoHealthy 时归因「排在失败池之前的候选池因模型级冷却被整体跳过」。
+/// 按 POOL_FIXED_ORDER 取失败池之前的池：Buddy 需 wb_enabled 且同名模型在 wb
+/// 冷却表内、BuddyAi 需 buddy_ai_enabled 且同名模型在 buddy-ai 冷却表内、
+/// Qoder 需 qoder_enabled 且同名模型在 qoder 冷却表内——满足即说明调度在到达
+/// 失败池前就已因模型冷却放弃该池。无命中返回空串（消息不变）。
+/// 仅覆盖这三类有模型冷却表的池（Trae 无模型级冷却）。
+/// 冷却键改候选键列表（审查 Low）：别名改写场景下实际写入冷却表的键是管线/目录
+/// 归一名而非请求名，只查请求名会静默漏归因——候选命中任一即归因，取最大剩余秒。
+/// 残留缺口：后台任务降级/长上下文降档会把请求改写为降级候选模型（判定依赖请求
+/// 体，此处只有模型名无 body），该形态归因尽力而为
+fn skipped_pool_note(state: &ApiSharedState, failed: TargetPool, model: &str) -> String {
+    let Some(failed_idx) = dispatch::POOL_FIXED_ORDER.iter().position(|p| *p == failed) else {
+        return String::new();
+    };
+    let cooldown_keys = cooldown_key_candidates(state, model);
+    let mut notes: Vec<String> = Vec::new();
+    for p in &dispatch::POOL_FIXED_ORDER[..failed_idx] {
+        let rem: Option<i64> = match p {
+            TargetPool::Buddy => {
+                if state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    cooldown_keys
+                        .iter()
+                        .filter_map(|k| wb_route::model_cooldown_remaining_on(state, false, k))
+                        .max()
+                } else {
+                    None
+                }
+            }
+            TargetPool::Qoder => {
+                if state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    cooldown_keys
+                        .iter()
+                        .filter_map(|k| {
+                            super::qoder_route::model_cooling_remaining_secs(k).map(|s| s as i64)
+                        })
+                        .max()
+                } else {
+                    None
+                }
+            }
+            TargetPool::BuddyAi => {
+                if state
+                    .buddy_ai_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    cooldown_keys
+                        .iter()
+                        .filter_map(|k| wb_route::model_cooldown_remaining_on(state, true, k))
+                        .max()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(rem) = rem {
+            notes.push(format!(
+                "{} skipped: model_cooldown remaining={rem}s",
+                p.as_str()
+            ));
+        }
+    }
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", notes.join("; "))
+    }
+}
+
+/// 503 归因的冷却键候选列表：请求名 + ① wb 路由管线归一名（别名→规则→系列
+/// 通配→后缀剥离，Buddy/BuddyAi 共用此管线，note_model_failure 记的是归一名）
+/// + ② Qoder 目录归一 id（resolve 命中条目的 id，覆盖别名表/大小写形态漂移）。
+/// 只在 503 收尾路径调用（低频），目录/管线加载成本可接受
+fn cooldown_key_candidates(state: &ApiSharedState, model: &str) -> Vec<String> {
+    let mut keys = vec![model.to_string()];
+    let cfg = wb_model_route::load_config(&state.data_dir);
+    let catalog = wb_catalog::load(&state.data_dir);
+    let routed = wb_model_route::resolve(&cfg, &catalog, model).model;
+    if !routed.is_empty() && !keys.contains(&routed) {
+        keys.push(routed);
+    }
+    if let Some(id) = crate::tasks::qoder_upstream::resolve(
+        model,
+        crate::tasks::qoder_upstream::QoderRegion::Cn,
+    )
+    .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
+    {
+        if !id.is_empty() && !keys.contains(&id) {
+            keys.push(id);
+        }
+    }
+    keys
 }
 
 /// issue #26 全局模型白名单准入：请求模型不在白名单时返回按协议格式化的 404。
@@ -1915,6 +2071,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
         let mut empty_hits: usize = 0;
+        // 传输掐断计数：与空完成分开归因，耗尽时用于修正 "no healthy account" 文案
+        let mut cut_hits: usize = 0;
         // 11128 诊断样本按请求去重（换号轮换重复命中不重复打样）
         let mut last_11128_sample: Option<String> = None;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
@@ -2191,6 +2349,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             // - 零内容被掐：错误帧未下发，换号重试（不落账，
                             //   中间态与空完成换号同口径）
                             if super::is_transport_cut(code, &msg) {
+                                cut_hits += 1;
                                 if sent_any {
                                     state.logger.log_request_ttfb(
                                         "trae", "POST", proto.log_path(), &model, stream,
@@ -2430,13 +2589,14 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             }
         }
 
-        // 所有账号不可用（空完成主导 → 明示渠道指纹拦截语义，否则维持原文案）
+        // 所有账号不可用（空完成/传输掐断主导 → 明示对应归因，否则维持原文案）
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
-        let (exhaust_msg, exhaust_tag) =
-            exhaust_message("trae", empty_hits, tried.len(), healthy_total, hard_credit_cnt);
+        let (exhaust_msg, exhaust_tag) = exhaust_message_with_transport_cut(
+            "trae", empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+        );
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
         super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
@@ -2470,8 +2630,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             // 并返回日志注记供反查漏网触发句
             let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "trae", &body_vec);
             let diag_line = format!(
-                "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} empty_hits={} pool=trae reasons=[{}]{}",
-                h, m, s, tried.len(), empty_hits, diag_summary.join(", "), sample_note,
+                "{exhaust_tag} [{:02}:{:02}:{:02}] tried={} empty_hits={} cut_hits={} pool=trae reasons=[{}]{}",
+                h, m, s, tried.len(), empty_hits, cut_hits, diag_summary.join(", "), sample_note,
             );
             state.logger.log_debug_line(format!("[DEBUG] {diag_line}"));
         }
@@ -2582,6 +2742,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut refreshed_401 = HashSet::new();
         // 空完成计数（issue #57 后续可观测）：轮换耗尽收尾时区分「渠道指纹拦截」与「账号池耗尽」
         let mut empty_hits: usize = 0;
+        // 传输掐断计数：与空完成分开归因，耗尽时用于修正 "no healthy account" 文案
+        let mut cut_hits: usize = 0;
         // 11128 诊断样本按请求去重（换号轮换重复命中不重复打样）
         let mut last_11128_sample: Option<String> = None;
         // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
@@ -2741,15 +2903,27 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 // 须在 classify_solo_error 之前——与流式侧同口径）：
                                 // 账号无关传输故障，不冷却、不解绑粘性、不计空完成指纹；
                                 // 非流式未向客户端发出任何内容，直接丢弃截断响应 break 换号
-                                //（截断的部分响应可能含残缺 tool_calls，不得当成功交付）
+                                //（截断的部分响应可能含残缺 tool_calls，不得当成功交付）。
+                                // PR #162：cut_hits 计入轮换耗尽归因——全池被掐时
+                                // exhaust_message_with_transport_cut 报传输掐断而非
+                                // "no healthy account available"；日志 502 对齐
+                                // empty response 分支（本次尝试未向客户端交付）
                                 if super::is_transport_cut(code, &msg) {
+                                    cut_hits += 1;
                                     state.logger.log_request(
                                         "trae", "POST", proto.log_path(), &model, stream,
-                                        200, &picked.uid, duration_ms, &key_name,
+                                        502, &picked.uid, duration_ms, &key_name,
                                         &state.pool.name_of(&picked.uid),
-                                        Some("传输层掐断（聚合响应已丢弃）→ 换号重试"),
+                                        Some(&format!(
+                                            "传输层掐断（聚合响应已丢弃）→ 换号重试：{} [upstream: {}]",
+                                            safe_slice(&msg, 160),
+                                            primary_hdr
+                                        )),
                                     );
-                                    break; // 换号
+                                    if state.debug_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                                        state.logger.log_debug(&picked.uid, &converted, None, 502, Some(&msg));
+                                    }
+                                    break; // 换号，不冷却、不计空完成指纹
                                 }
                                 // 空完成哨兵（-9901，影子风控）计入指纹拦截观测；
                                 // 冷却行为维持现状（classify_solo_error → Server）
@@ -2951,11 +3125,12 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         }
 
         let duration_ms = start_ts.elapsed().as_millis() as u64;
-        // 轮换耗尽收尾：空完成主导 → 明示渠道指纹拦截语义，否则维持原文案
+        // 轮换耗尽收尾：空完成/传输掐断主导 → 明示对应归因，否则维持原文案
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
-        let (exhaust_msg, exhaust_tag) =
-            exhaust_message("trae", empty_hits, tried.len(), healthy_total, hard_credit_cnt);
+        let (exhaust_msg, exhaust_tag) = exhaust_message_with_transport_cut(
+            "trae", empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+        );
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
         super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
@@ -2983,8 +3158,8 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             // 并返回日志注记供反查漏网触发句
             let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "trae", &body_vec);
             state.logger.log_debug_line(format!(
-                "[DEBUG] {exhaust_tag}(non-stream) tried={} empty_hits={} pool=trae reasons=[{}]{}",
-                tried.len(), empty_hits, diag_summary.join(", "), sample_note,
+                "[DEBUG] {exhaust_tag}(non-stream) tried={} empty_hits={} cut_hits={} pool=trae reasons=[{}]{}",
+                tried.len(), empty_hits, cut_hits, diag_summary.join(", "), sample_note,
             ));
         }
         Err(AggregateFail::NoHealthy(exhaust_msg))
@@ -3616,6 +3791,37 @@ mod tests {
         let (msg, tag) = exhaust_message("trae", 6, 10, 2, 0);
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+    }
+
+    #[test]
+    fn exhaust_message_transport_cut_only_does_not_blame_accounts() {
+        let (msg, tag) = exhaust_message_with_transport_cut("trae", 0, 3, 5, 0, 3);
+        assert!(msg.contains("transport cut suspected"), "{msg}");
+        assert!(msg.contains("3 transport cut(s) across 3 rotated accounts"), "{msg}");
+        assert!(!msg.contains("no healthy account available"), "{msg}");
+        assert_eq!(tag, "TRANSPORT_CUT");
+    }
+
+    #[test]
+    fn exhaust_message_transport_cut_mixed_appends_note() {
+        // 空完成主导仍保留原归因，但必须补充 cut 计数，不能让网络掐断从诊断中消失
+        let (msg, tag) = exhaust_message_with_transport_cut("trae", 3, 3, 4, 0, 1);
+        assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
+        assert!(msg.contains("1 transport cut(s) across 3 rotated accounts"), "{msg}");
+        assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
+
+        // 积分硬冷却分支同样补注，避免把 cut 混入账号归因
+        let (msg_credit, tag_credit) = exhaust_message_with_transport_cut("trae", 0, 3, 0, 2, 1);
+        assert!(msg_credit.contains("credit exhausted on 2 account(s)"), "{msg_credit}");
+        assert!(msg_credit.contains("1 transport cut(s) across 3 rotated accounts"), "{msg_credit}");
+        assert_eq!(tag_credit, "NO_HEALTHY_ACCOUNT_CREDIT");
+    }
+
+    #[test]
+    fn exhaust_message_without_transport_cut_keeps_legacy_text() {
+        let (msg, tag) = exhaust_message_with_transport_cut("trae", 0, 3, 0, 0, 0);
+        assert_eq!(msg, "no healthy account available");
+        assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
 
     #[test]

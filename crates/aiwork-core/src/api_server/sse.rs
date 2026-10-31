@@ -685,6 +685,15 @@ fn merge_tool_slot(t: &mut Value, call: &Value) {
     }
 }
 
+/// 非流式读错误 → 传输掐断哨兵：响应未收到完成事件前，任何读取失败都意味着
+/// 聚合结果可能截断（含残缺 tool_calls JSON），不得按成功交付。
+fn read_cut_error(e: &std::io::Error) -> (i64, String) {
+    (
+        crate::api_server::TRANSPORT_CUT_CODE,
+        format!("{} {}", crate::api_server::TRANSPORT_CUT_MSG_PREFIX, e),
+    )
+}
+
 /// 读取完整 SOLO SSE，收集文本/结束原因/用量/错误
 fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
     let br = BufReader::new(reader);
@@ -705,7 +714,8 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
             Err(e) => {
                 // 传输层掐断捕获（聚合侧补齐，口径同流式侧 take_read_error）：
                 // 仅 !saw_done 且无业务错误时留存哨兵，交 aggregate/aggregate_text
-                // 上抛；其余读错误维持折叠语义
+                // 上抛；其余读错误维持折叠语义（main 保守门控，PR #162 的
+                // read_cut_error 助手由 aggregate_anthropic 复用）
                 if !saw_done && out.error_info.is_none() {
                     let text = e.to_string();
                     if super::is_transport_cut_text(&text) {
@@ -1363,7 +1373,18 @@ pub fn aggregate_anthropic<R: Read + Send>(
     for line in br.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break,
+            Err(e) => {
+                // 口径同 collect_plain（is_transport_cut_text 门控，PR #162 补齐
+                // main 侧缺口）：完成前断流按传输掐断上抛哨兵（read_cut_error），
+                // 不把截断的 Anthropic message 当成功交付；其余读错误维持折叠语义
+                if !saw_done && error_info.is_none() {
+                    let text = e.to_string();
+                    if super::is_transport_cut_text(&text) {
+                        error_info = Some(read_cut_error(&e));
+                    }
+                }
+                break;
+            }
         };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
@@ -1855,6 +1876,70 @@ mod tests {
         let joined = collect_events(rx).join("\n");
         assert!(joined.contains("hi"), "output 文本应已转发");
         assert!(joined.ends_with("data: [DONE]"));
+    }
+
+    // ==================== 非流式聚合断流（issue #158 同族缺口）====================
+
+    #[test]
+    fn nonstream_partial_transport_cut_discards_response() {
+        let reader = CutAfterReader {
+            data: b"event: output\ndata: {\"response\":\"partial\"}\n\n".to_vec(),
+            pos: 0,
+            err: "http2 stream error RST_STREAM",
+        };
+        let (resp, err) = aggregate(reader, "c1", None);
+        assert!(resp.is_none(), "截断的部分响应必须丢弃，不得当成功交付");
+        let (code, msg) = err.expect("断流必须转错误通道");
+        assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(
+            !crate::api_server::is_empty_completion(code, &msg),
+            "传输掐断不得计入空完成指纹口径"
+        );
+    }
+
+    #[test]
+    fn nonstream_zero_content_transport_cut_is_not_empty_completion() {
+        let reader = CutAfterReader {
+            data: b": keepalive\n\n".to_vec(),
+            pos: 0,
+            err: "connection reset by peer",
+        };
+        let (resp, err) = aggregate(reader, "c1", None);
+        assert!(resp.is_none());
+        let (code, msg) = err.expect("零内容断流也必须上抛哨兵");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(
+            !crate::api_server::is_empty_completion(code, &msg),
+            "网络掐断不得误判为影子风控空完成"
+        );
+    }
+
+    #[test]
+    fn nonstream_done_then_read_error_keeps_complete_response() {
+        let reader = CutAfterReader {
+            data: b"event: output\ndata: {\"response\":\"complete\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n".to_vec(),
+            pos: 0,
+            err: "http2 stream error RST_STREAM",
+        };
+        let (resp, err) = aggregate(reader, "c1", None);
+        assert!(err.is_none(), "已收到 done 后的连接收尾错误不得推翻完整响应");
+        let resp = resp.expect("完整响应应正常返回");
+        assert_eq!(resp["choices"][0]["message"]["content"], "complete");
+    }
+
+    #[test]
+    fn nonstream_anthropic_partial_transport_cut_discards_message() {
+        let reader = CutAfterReader {
+            data: b"event: output\ndata: {\"response\":\"partial\"}\n\n".to_vec(),
+            pos: 0,
+            err: "http2 stream error RST_STREAM",
+        };
+        let (resp, err) = aggregate_anthropic(reader, "msg_1", "m", None);
+        assert!(resp.is_none(), "截断的 Anthropic message 必须丢弃");
+        let (code, msg) = err.expect("断流必须转错误通道");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
     }
 
     // ==================== 非流式聚合 tool_calls 合并（审查修复 M6）====================

@@ -346,10 +346,14 @@ fn packages_from(body: &Value) -> Vec<Value> {
 /// summary 响应 → 余额。旧结构：顶层 RemainingCapacity/Balance 等字段；
 /// 新结构（2026-09 实测）：data.Packages[] 各包 CycleRemainCapacity 求和。
 /// 聚合父字段（如 data.CycleRemainCapacity）与 Packages[] 明细并存时，父/子
-/// 不可重复计数（移植自 main 5f88dfe，issue #120 余额翻倍根因）。与
-/// `packages_from` 同口径：存在带 PackageCode 的明细包时跳过「已知分类汇总行」
-/// 与「聚合父容器」，其余无 code 项（老结构/上游未打 code 的真实包）计入；
-/// 明细读不出时宁可返回 None，不得回退「全量和」把汇总行加回来。
+/// 不可重复计数（issue #120 余额翻倍根因）。与 `packages_from` 同口径：存在带
+/// PackageCode 的明细包时跳过「聚合父容器」与「已知分类汇总行」；补充（issue
+/// #120 评论区 5 账号实测，2026-10-31 并入 stash 值去重口径）：分类汇总行/无
+/// code 项按 remaining 值判重——与 coded Σ、任一 coded 明细同值，或与已计入
+/// 的无 code 项同值（「套餐基础积分 ↔ CodeBuddy个人体验版」是同一笔积分的
+/// 两个视图）均属重复口径只计其一；汇总行的值对不上任何明细时是唯一真实
+/// 视图，计入以免套餐积分整体漏算（看板比官方少算）。明细读不出时宁可返回
+/// None，不得回退「全量和」把汇总行加回来。
 pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
     if let Some(t) = num_of(fs_utils::dig(
         body,
@@ -364,20 +368,56 @@ pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
         .copied()
         .filter(|d| package_code_of(d).is_some())
         .collect();
-    let has_coded = !coded.is_empty();
-    let mut s = 0.0;
-    let mut has = false;
-    for item in found {
-        if is_skippable_uncoded(item, has_coded, &coded) {
+    if coded.is_empty() {
+        // 全部无 PackageCode 的旧形态：回退全量和（原行为不变）
+        let mut s = 0.0;
+        let mut has = false;
+        for item in found {
+            if let Some(v) = remaining_of(item, total_of(item)) {
+                s += v;
+                has = true;
+            }
+        }
+        return has.then_some(s);
+    }
+    // 新形态：coded 明细求和为基础（含 CycleCapacityRemainPrecise 与 used/total
+    // 倒推宽键链）；明细读不出 → None，不回退汇总行。
+    let coded_vals: Vec<Option<f64>> = coded
+        .iter()
+        .map(|d| remaining_of(d, total_of(d)))
+        .collect();
+    let base = coded_vals.iter().copied().sum::<Option<f64>>()?;
+    // 无 code 补充口径：父容器跳过；分类汇总行若值与 coded Σ 或任一 coded 明细
+    // 重复则不计（那是同类明细的合计视图）；所有无 code 项之间同值去重（双视图
+    // 的名字未必都在黑名单里，按值兜底）；非汇总行的无 code 真实包保留。
+    let mut seen: Vec<f64> = vec![];
+    let mut extra = 0.0;
+    for d in found.iter().copied() {
+        if package_code_of(d).is_some() || is_aggregate_container(d, &coded) {
             continue;
         }
-        // 逐项走 remaining_of 宽键链（含 CycleCapacityRemainPrecise 与 used/total 倒推）
-        if let Some(v) = remaining_of(item, total_of(item)) {
-            s += v;
-            has = true;
+        let Some(v) = remaining_of(d, total_of(d)) else {
+            continue;
+        };
+        let dup_of_coded =
+            approx_f64(v, base) || coded_vals.iter().any(|c| c.is_some_and(|c| approx_f64(c, v)));
+        if is_category_summary_row(d) && dup_of_coded {
+            continue;
         }
+        if seen.iter().any(|s| approx_f64(*s, v)) {
+            continue;
+        }
+        seen.push(v);
+        extra += v;
     }
-    has.then_some(s)
+    Some(base + extra)
+}
+
+/// 浮点近似相等（相对误差 1e-6）：聚合父包是上游按明细求和落库的，与本地
+/// Σ 存在浮点尾数差；套餐双口径连尾数都一致（186.55000009），故用近似比较
+/// 兜住两种来源。
+fn approx_f64(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0)
 }
 
 /// summary 响应 → PackageCode 列表（去重，保序）。2026-09 起 paid/free 接口要求
@@ -1022,6 +1062,28 @@ mod wb_credits_tests {
         }});
         assert_eq!(balance_from_summary(&body), Some(1386.5));
         assert_eq!(packages_from(&body).len(), 2, "汇总行与父容器不是积分包");
+    }
+
+    #[test]
+    fn balance_from_summary_uncoded_pair_and_aggregate() {
+        // issue #120 评论区 5 账号实测形态：coded 明细 + 无 code「聚合父包」
+        //（== coded Σ，不计）+「套餐基础积分 ↔ 个人体验版」同值双口径（只计
+        // 其一）→ coded Σ + 套餐值，而非漏算套餐
+        let body = json!({"data": {"Packages": [
+            {"PackageName": "每日签到裂变包", "PackageCode": "TCACA_code_007_a", "CycleRemainCapacity": 1200.0},
+            {"PackageName": "平台奖励积分", "CycleRemainCapacity": 1200.0},
+            {"PackageName": "套餐基础积分", "CycleRemainCapacity": 186.5},
+            {"PackageName": "CodeBuddy个人体验版", "CycleRemainCapacity": 186.5}
+        ]}});
+        assert_eq!(balance_from_summary(&body), Some(1386.5));
+        // 不同值的无 code 包都计（去重仅针对同值重复视图）；父包仍排除
+        let distinct = json!({"data": {"Packages": [
+            {"PackageCode": "p_a", "CycleRemainCapacity": 500.0},
+            {"PackageName": "平台奖励积分", "CycleRemainCapacity": 500.0},
+            {"PackageName": "套餐基础积分", "CycleRemainCapacity": 186.5},
+            {"PackageName": "其他权益包", "CycleRemainCapacity": 42.5}
+        ]}});
+        assert_eq!(balance_from_summary(&distinct), Some(729.0));
     }
 
     #[test]

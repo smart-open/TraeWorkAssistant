@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, Save, Coins, ToggleLeft, Activity, Layers } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner, StatCard } from '../../components/ui';
@@ -65,6 +65,9 @@ export default function QoderApiService() {
     () => new Map((ctxView?.items ?? []).map((it) => [it.model, it.tokens])),
     [ctxView],
   );
+  // 上下文长度列表请求序号（审查修复）：refresh 与弹框保存后的后台对齐共用，
+  // 仅应用最后一次发起的结果——防并发 refresh 的旧快照回退刚保存的值
+  const ctxListSeq = useRef(0);
   const [syncing, setSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -81,6 +84,7 @@ export default function QoderApiService() {
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
+    const ctxSeq = ++ctxListSeq.current;
     try {
       // 审查 F1：账号列表失败时返回 null（区别于「成功但空数组」）
       let accsErr: unknown = null;
@@ -101,8 +105,9 @@ export default function QoderApiService() {
         api.apiServer.qoderContextLengthList().catch(() => null),
       ]);
       setPool(pf);
-      // 失败保留旧值（列内按跟随上游展示，入口禁用）
-      if (ctx) setCtxView(ctx);
+      // 失败保留旧值（列内按跟随上游展示，入口禁用）；
+      // 仅应用最后一次发起的快照（审查修复：防旧快照回退刚保存的值）
+      if (ctx && ctxSeq === ctxListSeq.current) setCtxView(ctx);
       if (accs === null) {
         // 审查 F1：读取失败 → 错误态 + toast，不落空数组（不触发空集引导）
         setAccountsError(String(accsErr));
@@ -946,7 +951,15 @@ export default function QoderApiService() {
               ],
             },
           );
-          void api.apiServer.qoderContextLengthList().then(setCtxView).catch(() => {});
+          // 后台对齐全表：发起新序号，仅应用最后一次请求结果（审查修复：防并发
+          // refresh 的旧快照延迟反超本次回填；失败保留本地即时回填值）
+          const seq = ++ctxListSeq.current;
+          void api.apiServer
+            .qoderContextLengthList()
+            .then((v) => {
+              if (seq === ctxListSeq.current) setCtxView(v);
+            })
+            .catch(() => {});
         }}
       />
     </div>

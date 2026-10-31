@@ -821,11 +821,28 @@ impl ApiPool {
         }
     }
 
-    /// 记录错误并冷却（T2.2 错误三态 + 分级冷却）。
+    /// 记录错误并冷却（T2.2 错误三态 + 分级冷却）——无上游解冻信息的便捷入口，
+    /// 委托 [`Self::note_error_until`]（unfreeze=None 维持既有固定时长口径）
+    pub fn note_error(&self, uid: &str, kind: ErrKind) {
+        self.note_error_until(uid, kind, None);
+    }
+
+    /// 记录错误并冷却，可携带上游文案解析出的**账号级**精确解冻时刻（issue #159）。
+    /// 根因背景：单账号限额（6004/429 带解冻话术）此前会连带把模型级冷却表写至
+    /// 解冻时刻 → 整池同名模型被 pool_health 跳过（无视其余健康账号）→ 回退池
+    /// 无账号 → 503 no healthy。解耦后：账号级冷却精确到该账号的解冻时刻，
+    /// 模型级冷却由调用方按错误类别另行判定。
+    /// unfreeze 仅对账号级冷却类生效：
+    /// - HardCredit → hard_until = unfreeze（缺省回退下个 04:00）；
+    /// - PlanLimit/SoftRate/NotFound → until = unfreeze（缺省回退固定时长）；
+    /// - SessionDead/Forbidden（禁用）与 Server/Client/None（熔断/计数）忽略该值，
+    ///   维持既有行为。
+    /// unfreeze 有效性钳制（防调用侧解析异常）：[now+60s, now+7d]。
     /// 冷却/禁用标记发生时同步落一条 app.log（F-80 可观测）：
     /// `account cooldown: pool=<池> acct=<名称> uid=<uid> kind=<错误分类> action=<处置>`，
     /// 排查「账号何时、为何被打冷却→选池 no_healthy_account→跨池回退」链路时可直接定位
-    pub fn note_error(&self, uid: &str, kind: ErrKind) {
+    pub fn note_error_until(&self, uid: &str, kind: ErrKind, unfreeze: Option<i64>) {
+        let now = now_ts();
         let mut entries = safe_lock(&self.entries);
         let mut cooldown_ev: Option<(String, String)> = None;
         if let Some(e) = entries.get_mut(uid) {
@@ -838,25 +855,35 @@ impl ApiPool {
                     action = Some("action=disabled".to_string());
                 }
                 ErrKind::HardCredit => {
-                    // 积分耗尽：冷却到次日 04:00，到期自动恢复探测（F-29 v1.2）
-                    let until = next_0400(now_ts());
+                    // 积分耗尽：优先上游解冻时刻（issue #159），缺省冷却到下个
+                    // 04:00（凌晨 00:00–04:00 窗口内为当天，next_0400 语义），
+                    // 到期自动恢复探测（F-29 v1.2）
+                    let until = match unfreeze {
+                        Some(u) => clamp_unfreeze(u, now),
+                        None => next_0400(now),
+                    };
                     e.hard_until = until;
                     e.reason = "hard_credit".to_string();
                     e.err_count = 0;
                     action = Some(format!(
-                        "action=hard_cooldown until={} (下个04:00)",
-                        fmt_local_ts(until)
+                        "action=hard_cooldown until={} ({})",
+                        fmt_local_ts(until),
+                        if unfreeze.is_some() { "上游解冻时刻" } else { "下个04:00" }
                     ));
                 }
                 ErrKind::PlanLimit | ErrKind::SoftRate | ErrKind::NotFound => {
-                    let secs = kind.cooldown_duration().as_secs() as i64;
-                    let until = now_ts() + secs;
+                    let until = match unfreeze {
+                        Some(u) => clamp_unfreeze(u, now),
+                        None => now + kind.cooldown_duration().as_secs() as i64,
+                    };
                     e.until = until;
                     e.reason = kind.as_str().to_string();
                     e.err_count = 0;
                     action = Some(format!(
-                        "action=cooldown secs={secs} until={}",
-                        fmt_local_ts(until)
+                        "action=cooldown secs={} until={} ({})",
+                        until - now,
+                        fmt_local_ts(until),
+                        if unfreeze.is_some() { "上游解冻时刻" } else { "固定时长" }
                     ));
                     // P2 修复10：不重置 cb_trips——熔断记忆只应在 note_success 重置，
                     // 否则 Server 熔断记忆被非 Server 错误意外清零
@@ -877,7 +904,7 @@ impl ApiPool {
                         // 熔断器：30m 起指数递增（×2/次），封顶 6h
                         let exp = 30 * 60u64 << e.cb_trips.min(4);
                         let capped = exp.min(6 * 3600);
-                        let until = now_ts() + capped as i64;
+                        let until = now + capped as i64;
                         e.until = until;
                         e.reason = "consecutive_errors".to_string();
                         e.err_count = 0;
@@ -1331,6 +1358,13 @@ fn pick_p2c<'a>(
     let sa = a.weighted_score(total_credits, now);
     let sb = b.weighted_score(total_credits, now);
     Some(if sa >= sb { a } else { b })
+}
+
+/// unfreeze 有效性钳制（issue #159，note_error_until 配套）：[now+60s, now+7d]。
+/// 下限防上游异常文案（如相对秒极小）让冷却形同虚设；上限与
+/// parse_quota_reset_at 的 ≤7 天口径一致，防解析异常把账号钉死过久
+fn clamp_unfreeze(unfreeze: i64, now: i64) -> i64 {
+    unfreeze.clamp(now + 60, now + 7 * 24 * 3600)
 }
 
 /// 次日 04:00（本地东八区，与代码库其它处 local_ts 约定一致）的 Unix 秒
@@ -2152,6 +2186,63 @@ mod tests {
         {
             let entries = safe_lock(&pool.entries);
             assert_eq!(entries.get("uid_a").unwrap().cb_trips, 0);
+        }
+    }
+
+    // ==================== issue #159：note_error_until 上游解冻时刻 ====================
+
+    #[test]
+    fn note_error_until_uses_and_clamps_unfreeze() {
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0), ("uid_c", 10.0, 0)]);
+        let now = now_ts();
+        // ① HardCredit：合法解冻时刻（未来 1h，在 [now+60s, now+7d] 内）原样生效
+        pool.note_error_until("uid_a", ErrKind::HardCredit, Some(now + 3600));
+        // ② HardCredit：低于下限钳到内部 now+60（断言区间容忍测试执行耗时）
+        pool.note_error_until("uid_b", ErrKind::HardCredit, Some(now + 30));
+        // ③ HardCredit：高于 7 天上限钳到 now+7d
+        pool.note_error_until("uid_c", ErrKind::HardCredit, Some(now + 30 * 24 * 3600));
+        {
+            let entries = safe_lock(&pool.entries);
+            assert_eq!(entries.get("uid_a").unwrap().hard_until, now + 3600);
+            let b = entries.get("uid_b").unwrap().hard_until;
+            assert!((now + 60..=now + 70).contains(&b), "下限钳制 60s: {b}");
+            let c = entries.get("uid_c").unwrap().hard_until;
+            assert!(
+                (now + 7 * 24 * 3600..=now + 7 * 24 * 3600 + 70).contains(&c),
+                "上限钳制 7 天: {c}"
+            );
+        }
+        // ④ PlanLimit 同口径：解冻时刻优先于固定 12h 冷却
+        pool.note_error_until("uid_a", ErrKind::PlanLimit, Some(now + 7200));
+        {
+            let entries = safe_lock(&pool.entries);
+            assert_eq!(entries.get("uid_a").unwrap().until, now + 7200);
+        }
+    }
+
+    #[test]
+    fn note_error_until_none_falls_back_and_non_freezable_ignores() {
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        // ① HardCredit 无解冻时刻 → 回退下个 04:00（既有语义不变；断言双端点
+        //    容忍测试执行跨 04:00 边界的秒级抖动）
+        let now = now_ts();
+        pool.note_error_until("uid_a", ErrKind::HardCredit, None);
+        {
+            let entries = safe_lock(&pool.entries);
+            let got = entries.get("uid_a").unwrap().hard_until;
+            assert!(
+                got == next_0400(now) || got == next_0400(now + 5),
+                "应回退下个 04:00: {got}"
+            );
+        }
+        // ② Server 类错误即便携带解冻时刻也不冷却（单次失败不熔断）——
+        //    网关/模型级故障与账号解冻时刻无关，解冻值被忽略
+        pool.note_error_until("uid_b", ErrKind::Server, Some(now + 3600));
+        {
+            let entries = safe_lock(&pool.entries);
+            let e = entries.get("uid_b").unwrap();
+            assert_eq!(e.until, 0, "Server 单次失败不进入冷却");
+            assert_eq!(e.hard_until, 0);
         }
     }
 

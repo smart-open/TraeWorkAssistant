@@ -873,6 +873,8 @@ fn run_qoder_stream(
 
     let mut tried: HashSet<String> = HashSet::new();
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+    // PR #162：传输掐断计数——全池被掐时耗尽收尾改报传输掐断而非误报无健康账号
+    let mut cut_hits: usize = 0;
     // issue #156：轮换总预算 deadline（45s）。首字超时 10s×N 账号的逐号轮换
     // 会拖过客户端 60s 读超时窗口——TRAE 不等终局错误直接报
     // "Timeout after 60000ms (4028)"（issue 贴图），用户只见超时不见原因。
@@ -906,12 +908,13 @@ fn run_qoder_stream(
             state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
             let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
             let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
-            let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+            let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
                 "qoder",
                 empty_hits,
                 tried.len(),
                 healthy_total,
                 hard_credit_cnt,
+                cut_hits,
             );
             // 模型级 Server 冷却与指纹判定同口径：空完成主导（指纹拦截）时模型
             // 本身可用（拦的是请求指纹，换号无效），不记 Server 冷却——否则指纹
@@ -930,9 +933,10 @@ fn run_qoder_stream(
             super::wb_payload::mark_channel_fp_block("qoder", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
             let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
             state.logger.log_debug_line(format!(
-                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
+                "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
                 tried.len(),
                 empty_hits,
+                cut_hits,
             ));
             // 按客户端协议分流错误帧（Anthropic 收 event: error、Responses 收
             // response.failed，不再裸 data: 帧不可读）；code 保持字符串
@@ -984,12 +988,13 @@ fn run_qoder_stream(
                     // code 保持 no_healthy_account（客户端兼容）
                     let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
                     let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
-                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
                         "qoder",
                         empty_hits,
                         tried.len(),
                         healthy_total,
                         hard_credit_cnt,
+                        cut_hits,
                     );
                     state.logger.log_request(
                         "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
@@ -1003,9 +1008,10 @@ fn run_qoder_stream(
                     let sample_note =
                         super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder{sample_note}",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder{sample_note}",
                         tried.len(),
                         empty_hits,
+                        cut_hits,
                     ));
                     // 按客户端协议分流错误帧（同预算耗尽收尾口径）
                     send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
@@ -1287,6 +1293,10 @@ fn run_qoder_stream(
                                         );
                                         return;
                                     }
+                                    // PR #162：cut_hits 计入轮换耗尽归因——全池被掐时
+                                    // exhaust_message_with_transport_cut 报传输掐断而非
+                                    // 误报 "no healthy account available"（与 trae 池同口径）
+                                    cut_hits += 1;
                                     break;
                                 }
                                 Some(UpstreamKind::Queued) => {
@@ -1733,6 +1743,8 @@ pub async fn qoder_aggregate_chat(
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // PR #162：传输掐断计数（聚合侧对齐流式路径）
+        let mut cut_hits: usize = 0;
         // 轮换预算（issue #156 聚合侧补齐，对齐流式路径）：聚合含「首字超时 10s × N
         // 账号」逐号等待，无预算可拖过客户端读超时；仅约束「换号再试」（首个账号
         // tried 空不受影响），超预算按 exhaust 语义收尾
@@ -1752,12 +1764,13 @@ pub async fn qoder_aggregate_chat(
                 );
                 let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
                 let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
-                let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
                     "qoder",
                     empty_hits,
                     tried.len(),
                     healthy_total,
                     hard_credit_cnt,
+                    cut_hits,
                 );
                 // 模型级冷却与指纹判定同口径（对齐流式预算收尾）：空完成主导（指纹
                 // 拦截）时模型本身可用，不记 Server 冷却——冷却误伤且跨池回退拦不住
@@ -1773,9 +1786,10 @@ pub async fn qoder_aggregate_chat(
                 );
                 if !sample_note.is_empty() {
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
                         tried.len(),
                         empty_hits,
+                        cut_hits,
                     ));
                 }
                 state.logger.log_request(
@@ -1817,12 +1831,13 @@ pub async fn qoder_aggregate_chat(
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
                         let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
-                        let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                        let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
                             "qoder",
                             empty_hits,
                             tried.len(),
                             healthy_total,
                             hard_credit_cnt,
+                            cut_hits,
                         );
                         // issue #158 P1：池级指纹拦截短记忆（对齐 trae/buddy 池）——空完成
                         // 主导（指纹拦截）才标记，TTL 600s 内同池新请求激进清洗起步
@@ -1834,9 +1849,10 @@ pub async fn qoder_aggregate_chat(
                         );
                         if !sample_note.is_empty() {
                             state.logger.log_debug_line(format!(
-                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder{sample_note}",
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder{sample_note}",
                                 tried.len(),
                                 empty_hits,
+                                cut_hits,
                             ));
                         }
                         return Err(exhaust_msg);
@@ -2013,6 +2029,8 @@ pub async fn qoder_aggregate_chat(
                                 &state.qoder_pool.name_of(&win_uid),
                                 Some("传输层掐断（部分响应已丢弃）→ 换号重试"),
                             );
+                            // PR #162：cut_hits 计入轮换耗尽归因（与流式路径同口径）
+                            cut_hits += 1;
                             break;
                         }
                         match (resp, error) {
@@ -2084,7 +2102,9 @@ pub async fn qoder_aggregate_chat(
                                         // 传输层掐断（issue #158 P2-2）：账号无关的传输
                                         // 故障——不冷却账号/模型、不解绑粘性、不计空完成
                                         // 指纹；下方公共收尾统一落 last_error + 日志 +
-                                        // break 换号重试
+                                        // break 换号重试。PR #162：计入 cut_hits，全池
+                                        // 被掐时耗尽收尾改报传输掐断而非误报无健康账号
+                                        cut_hits += 1;
                                     }
                                     Some(UpstreamKind::Queued) => {
                                         // 排队：同号退避重试为主（对冲接管后不适用，
