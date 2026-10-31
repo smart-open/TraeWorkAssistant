@@ -9,8 +9,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// 历史数据保留天数（超出部分读写时裁剪）
-pub const RETENTION_DAYS: i64 = 90;
+/// 历史数据保留天数（超出部分读写时裁剪；365 天支撑额度看板「近一年」区间）
+pub const RETENTION_DAYS: i64 = 365;
 
 /// 单账号某日最终签到状态
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn trim_drops_old_days() {
         let mut f = ResultsFile::default();
-        let old = (chrono::Local::now().date_naive() - chrono::Duration::days(120))
+        let old = (chrono::Local::now().date_naive() - chrono::Duration::days(RETENTION_DAYS + 30))
             .format("%Y-%m-%d")
             .to_string();
         f.days.insert(old, DayRecord::default());

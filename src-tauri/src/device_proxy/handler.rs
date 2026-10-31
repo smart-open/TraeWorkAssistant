@@ -757,6 +757,120 @@ fn try_capture_doubao_credentials(ctx: &ProxyCtx, host: &str, req_headers: &[(St
     ));
 }
 
+/// 豆包 campaign 请求形态捕获（排障专用）：命中 `/alice/ug/campaign/` 的请求记录
+/// 方法 + 路径 + 查询参数名（msToken/a_bogus 一次性 token 只记前缀长度）+ Cookie
+/// 键名清单 + POST body + 响应状态/前 500 字符，落 proxy 日志与 app_log。
+/// 同时把**完整 query 参数（剔除一次性 a_bogus）+ msToken** 存入 vault（ns "doubao"/"campaign_probe"，
+/// 本地加密存储、凭证同红线），供 doubao_checkin 复用客户端真实参数对齐请求形态
+/// （修复 CLI 签到 710010702 system error：客户端参数集含 device_id/web_id/fp 等
+/// 设备指纹，CLI 缺失被风控拒绝）。
+fn try_capture_doubao_campaign(
+    ctx: &ProxyCtx,
+    host: &str,
+    method: &str,
+    path: &str,
+    req_headers: &[(String, String)],
+    body: &[u8],
+    status: u16,
+    resp_body: &[u8],
+    resp_headers: &[(String, String)],
+) {
+    let host_l = host.to_ascii_lowercase();
+    if !host_l.ends_with("doubao.com") || !path.contains("/alice/ug/campaign/") {
+        return;
+    }
+    let (p, q) = path.split_once('?').unwrap_or((path, ""));
+    // 完整参数（入 vault）与脱敏摘要（入日志）双份
+    let mut params = serde_json::Map::new();
+    let mut qdesc_parts: Vec<String> = Vec::new();
+    for kv in q.split('&') {
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        // 入 vault 前先百分号解码：load_campaign_probe 侧会统一再编码——若这里存原始
+        // 编码值会造成双重编码（%7B → %257B），服务端解析必错（2026-10-28 审查修复）
+        let decoded = urlencoding::decode(v)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| v.to_string());
+        // a_bogus 为一次性反爬 token（与 msToken 不同：msToken 是有意复用的会话级值），
+        // 复用过期值比回退内置稳定参数更易触发风控——不进 vault，仅日志记名供比对
+        //（2026-10-29 审查修复 L5）
+        if k != "a_bogus" {
+            params.insert(k.to_string(), serde_json::Value::String(decoded));
+        }
+        if k == "msToken" || k == "a_bogus" {
+            qdesc_parts.push(format!(
+                "{k}={}…({}字符)",
+                v.chars().take(6).collect::<String>(),
+                v.len()
+            ));
+        } else {
+            qdesc_parts.push(format!("{k}=…"));
+        }
+    }
+    let qdesc = qdesc_parts.join("&");
+    let cookie = req_headers
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let jar = parse_cookie_header(cookie);
+    let cookie_names = jar.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(",");
+    // msToken 优先取 query（客户端每请求带新鲜值），缺失回退 cookie
+    let ms_token = params
+        .get("msToken")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            jar.iter()
+                .find(|(k, _)| k == "msToken")
+                .map(|(_, v)| v.clone())
+        });
+    let body_s = String::from_utf8_lossy(&body[..body.len().min(2048)]).to_string();
+    let ua = req_headers
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    // 客户端请求带 accept-encoding（代理降级为 gzip/deflate）→ 响应体多为压缩字节。
+    // 审查修复（2026-10-31）：先按 content-encoding 解压——否则下面 resp_ok 的 JSON
+    // 解析恒失败，campaign_probe 永远不会落库，CLI 永远用回退旧参数（实测 3 天未入库）
+    let resp_plain = super::logger::decompress_body(resp_body, resp_headers);
+    let resp_s = String::from_utf8_lossy(&resp_plain[..resp_plain.len().min(500)]).to_string();
+    let line = format!(
+        "[doubao-campaign] {method} {p}?{qdesc} -> {status} resp={resp_s} cookies=[{cookie_names}] body={body_s} ua={ua}"
+    );
+    ctx.log.log(&format!("  {line}"));
+    crate::fs_utils::app_log(&ctx.data_dir, &line);
+    // 完整参数 + msToken 入 vault（仅 landing/checkin 与 v3/detail 两类目标端点；
+    // 任何一次命中都刷新——参数是设备指纹非一次性值，msToken 取最新）。
+    // 审查修复（2026-10-28）：仅当上游信封 code==0 才落库——客户端自己被风控拒绝的
+    // 请求参数不得覆盖可用参数集（响应体非 JSON/解析失败也视为不可信，跳过）
+    let resp_ok = status == 200
+        && serde_json::from_slice::<serde_json::Value>(&resp_plain[..resp_plain.len().min(65536)])
+            .map(|v| {
+                v.get("code")
+                    .map(|c| c.as_i64() == Some(0) || c.as_str() == Some("0"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+    if resp_ok && (p.ends_with("/landing/checkin") || p.contains("/v3/detail/")) {
+        if !params.is_empty() {
+            let probe = serde_json::json!({
+                "captured_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                "params": serde_json::Value::Object(params),
+                "ms_token": ms_token,
+                "ua": ua,
+            });
+            if let Err(e) = crate::vault::ns_set(&ctx.data_dir, "doubao", "campaign_probe", &probe) {
+                ctx.log.log(&format!("  [doubao-campaign] 参数入 vault 失败（仅日志可比对）: {e}"));
+            }
+        }
+    }
+}
+
 // ---------------- 上游转发 ----------------
 
 /// 提取 hyper 错误的完整 source 链（诊断修复）：legacy Client 的 Display 只有
@@ -880,6 +994,23 @@ async fn forward_upstream<S: AsyncRead + AsyncWrite + Unpin>(
                 let resp_h = resp_pairs.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     try_capture_doubao_credentials(&ctx2, &host2, &req_h, &resp_h);
+                });
+            }
+            // campaign 请求形态捕获（2026-10-28 排障：CLI 签到 710010702 system error、
+            // detail 同会话正常——需要客户端真实请求对齐 scene/参数/头；客户端手动签到
+            // 走本代理时落 app_log 供比对；完整 query 参数 + msToken 入 vault 供 CLI 复用）
+            {
+                let ctx2 = Arc::clone(ctx);
+                let host2 = host.to_string();
+                let m2 = method.clone();
+                let path2 = req.path.clone();
+                let req_h = req.headers.clone();
+                let body2 = req.body.clone();
+                let status2 = status;
+                let resp2 = resp_body.clone();
+                let resp_h2 = resp_pairs.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    try_capture_doubao_campaign(&ctx2, &host2, &m2, &path2, &req_h, &body2, status2, &resp2, &resp_h2);
                 });
             }
             ctx.req_logger.log_request(

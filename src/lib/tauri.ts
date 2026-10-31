@@ -28,6 +28,7 @@ import type {
   DoubaoAccountView,
   DoubaoCapturedCredential,
   DoubaoDashboardStats,
+  DoubaoDayDetail,
   DoubaoChatdataInfo,
   DoubaoChatdataResult,
   DoubaoExportResult,
@@ -115,6 +116,7 @@ const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   update_download: null,
   // 多账号串行网络操作：耗时随账号数线性增长，放宽到 10 分钟
   doubao_renew_run: 600_000,
+  doubao_checkin_run: 600_000,
   workbuddy_env_reset: 600_000,
   workbuddy_cli_rotate_run: 600_000,
   workbuddy_usage_official_all: 600_000,
@@ -384,8 +386,14 @@ export const api = {
   // ---- 豆包账号池（Rust doubao.rs；字段名严格 snake_case）----
   doubao: {
     accountsList: () => invoke<DoubaoAccountView[]>('doubao_accounts_list'),
-    accountSave: (userId: string, name?: string, note?: string) =>
-      invoke('doubao_account_save', { userId, name: name ?? null, note: note ?? null }),
+    accountSave: (userId: string, name?: string, note?: string, groupId?: string | null) =>
+      invoke('doubao_account_save', {
+        userId,
+        name: name ?? null,
+        note: note ?? null,
+        // undefined = 保持不变（null）；null/'' = 清空为未分组（''）
+        groupId: groupId === undefined ? null : groupId || '',
+      }),
     accountRemove: (userId: string) => invoke('doubao_account_remove', { userId }),
     detectUid: () => invoke<string | null>('doubao_detect_uid'),
     launch: (proxyPort?: number) => invoke('open_doubao_app', { proxyPort: proxyPort ?? null }),
@@ -432,10 +440,13 @@ export const api = {
     // ---- 会员额度 ----
     fetchQuota: (userId: string) => invoke<DoubaoQuotaResult>('doubao_quota_fetch', { userId }),
     // ---- 每日签到（landing/checkin；结果按日落库） ----
-    /** 手动签到：userId 缺省 = 全池批量（空池返回 skipped） */
+    /** 手动签到：userId 缺省 = 全池批量（空池返回 skipped）；批量逐账号串行较慢，超时放宽 10 分钟 */
     checkinRun: (userId?: string) => invoke<Record<string, unknown>>('doubao_checkin_run', { userId: userId ?? null }),
     /** 额度看板统计（池聚合 + 今日签到 + 近 30 天趋势） */
     dashboardStats: () => invoke<DoubaoDashboardStats>('doubao_dashboard_stats'),
+    /** 签到按日明细（额度看板「额度趋势」数据源；days 缺省 30，clamp 1~365） */
+    resultsDetail: (days?: number) =>
+      invoke<DoubaoDayDetail[]>('doubao_checkin_results_detail', { days: days ?? null }),
     // ---- 每日签到定时任务（schtasks AIWorkAssistant_DoubaoCheckin） ----
     checkinTaskRegister: (time: string) => invoke('doubao_checkin_task_register', { time }),
     checkinTaskStatus: () => invoke<string>('doubao_checkin_task_status'),

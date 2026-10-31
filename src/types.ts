@@ -12,6 +12,8 @@ export type ViewKey =
   // 豆包应用页面（侧边栏应用切换 Tab → 豆包）
   | 'doubao-overview'
   | 'doubao-accounts'
+  | 'doubao-checkin'
+  | 'doubao-quota'
   | 'doubao-settings'
   // Buddy 应用页面（侧边栏应用切换 Tab → Buddy，批次1）
   | 'buddy-overview'
@@ -391,6 +393,12 @@ export interface Settings {
   doubao_checkin_enabled: boolean;
   /** 豆包每日签到时刻 HH:MM（默认 09:15，任务配置页可改） */
   doubao_checkin_hhmm: string;
+  /** 豆包数据同步模式：off/hourly/every_hours/every_days/daily（默认 every_hours） */
+  doubao_sync_mode: string;
+  /** 豆包数据同步 every_hours 间隔小时数（1-24，默认 2） */
+  doubao_sync_hours: string;
+  /** 豆包数据同步 daily 模式时刻 HH:MM（默认 23:50） */
+  doubao_sync_hhmm: string;
   /** WorkBuddy 桌面版 exe 手动路径（环境配置页） */
   workbuddy_path: string | null;
   /** CodeBuddy 桌面版 exe 手动路径（环境配置页） */
@@ -979,6 +987,8 @@ export interface DoubaoAccountView {
   user_id: string;
   name: string;
   note: string;
+  /** 共享分组 id（shg_*；null = 未分组） */
+  group_id: string | null;
   has_snapshot: boolean;
   size_bytes: number;
   file_count: number;
@@ -1038,6 +1048,22 @@ export interface DoubaoDashboardStats {
   today_failed: number;
   max_continuous_days: number | null;
   trend: DoubaoCheckinTrendPoint[];
+}
+
+/** 额度趋势明细：单账号某日签到结果（doubao_checkin_results_detail） */
+export interface DoubaoDayAccountResult {
+  user_id: string;
+  name: string;
+  /** success | already | fail */
+  status: string;
+  /** 签到奖励额度（success 时非空） */
+  reward: number | null;
+}
+
+/** 额度趋势单日明细（同 uid 同日一条，重试轮覆盖为最终态；日期升序） */
+export interface DoubaoDayDetail {
+  date: string;
+  accounts: DoubaoDayAccountResult[];
 }
 
 /** 续期巡检摘要 JSON（Rust tasks/doubao_session.rs，原 doubao_renew.py） */

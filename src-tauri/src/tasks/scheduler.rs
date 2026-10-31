@@ -67,6 +67,11 @@ const TASKS: &[SchedTask] = &[
     SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30", kind: "fix" },
     SchedTask { key: "doubao-keepalive", name: "豆包会话每日续期", hhmm: "09:20", kind: "fix" },
     SchedTask { key: "doubao-quota", name: "豆包会员额度每日巡检", hhmm: "09:30", kind: "fix" },
+    // 豆包数据同步（2026-10-28，对齐 Trae/Buddy/Qoder 积分同步五模式）：额度巡检
+    // run_batch（quota + detail 探针）→ 池回写；页面全部读本地池，不再每次打开都
+    // 依赖远端/重扫。默认 every_hours 每 2 小时（settings.doubao_sync_mode/hours/hhmm，
+    // 环境配置-任务配置可改）
+    SchedTask { key: "doubao-sync", name: "豆包额度数据同步", hhmm: "23:50", kind: "credits" },
     // 豆包每日签到（landing/checkin）：默认 09:15 错峰 quota 09:30，环境配置页可改
     //（settings.doubao_checkin_hhmm）；结果按日落库（doubao_checkin_results）
     SchedTask { key: "doubao-checkin", name: "豆包每日签到", hhmm: "09:15", kind: "fix" },
@@ -170,6 +175,7 @@ fn credits_sync_mode(st: &AppState, key: &str) -> String {
         "wb-credits-snapshot" => s.wb_credits_sync_mode.as_str(),
         "qoder-credits-snapshot" => s.qoder_credits_sync_mode.as_str(),
         "buddy-ai-credits-sync" => s.buddy_ai_credits_sync_mode.as_str(),
+        "doubao-sync" => s.doubao_sync_mode.as_str(),
         _ => s.trae_credits_sync_mode.as_str(),
     };
     match raw.trim() {
@@ -185,6 +191,7 @@ fn credits_sync_hours(st: &AppState, key: &str) -> i64 {
         "wb-credits-snapshot" => s.wb_credits_sync_hours.as_str(),
         "qoder-credits-snapshot" => s.qoder_credits_sync_hours.as_str(),
         "buddy-ai-credits-sync" => s.buddy_ai_credits_sync_hours.as_str(),
+        "doubao-sync" => s.doubao_sync_hours.as_str(),
         _ => s.trae_credits_sync_hours.as_str(),
     };
     raw.trim().parse::<i64>().unwrap_or(2).clamp(1, 24)
@@ -400,6 +407,7 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "trae-models-sync" => Some(st.settings().trae_models_sync_hhmm),
         "qoder-catalog-sync" => Some(st.settings().qoder_catalog_sync_hhmm),
         "doubao-checkin" => Some(st.settings().doubao_checkin_hhmm),
+        "doubao-sync" => Some(st.settings().doubao_sync_hhmm),
         _ => None,
     };
     let Some(v) = configured else {
@@ -453,7 +461,7 @@ fn enabled(st: &AppState, key: &str) -> bool {
         // 看板数据同步（积分/Token/消耗明细）：mode=off 即关闭（其余模式均视为启用；
         // buddy-ai 旧 enabled 布尔已由 state 归一化派生进 mode）
         "wb-credits-snapshot" | "trae-credits-snapshot" | "trae-usage-sync" | "qoder-credits-snapshot"
-        | "buddy-ai-credits-sync" => {
+        | "buddy-ai-credits-sync" | "doubao-sync" => {
             credits_sync_mode(st, key) != "off"
         }
         // 模型同步开关（默认开；无账号时任务内部静默跳过不计失败）
@@ -848,6 +856,9 @@ fn run_task(
         }
         // 豆包会员额度每日巡检：与 `--task-run doubao-quota` 同款
         "doubao-quota" => super::doubao_quota::run_batch(st),
+        // 豆包额度数据同步：同 run_batch（quota + detail 探针 → 池回写）；
+        // 页面读本地池，远端刷新收敛到本任务（2026-10-28 性能专项）
+        "doubao-sync" => super::doubao_quota::run_batch(st),
         // 豆包每日签到：与 `--task-run doubao-checkin` 同款（空池跳过不计失败）
         "doubao-checkin" => super::doubao_checkin::run_batch(st),
         // WorkBuddy 积分与 Token 数据同步（看板定时同步）：积分 fresh 拉取+池回写+快照为主目标
