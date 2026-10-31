@@ -172,7 +172,7 @@ function CheckinResultsCard({ trend }: { trend: DoubaoCheckinTrendPoint[] }) {
   );
 
   const W = 300;
-  const H = 72;
+  const H = 48;
   const slot = trend.length > 0 ? W / trend.length : W;
   const barW = Math.max(2, Math.min(10, slot - 2));
   const maxTotal = Math.max(1, ...trend.map((d) => d.ok + d.already + d.failed));
@@ -207,6 +207,10 @@ function CheckinResultsCard({ trend }: { trend: DoubaoCheckinTrendPoint[] }) {
                   {okH > 0 && <rect x={x} y={H - 1 - okH} width={barW} height={okH} rx="1" className="fill-emerald-500" />}
                   {faH > 0 && <rect x={x} y={H - 1 - okH - faH} width={barW} height={faH} rx="1" className="fill-rose-500" />}
                   {okH + faH <= 0 && <rect x={x} y={H - 4} width={barW} height={3} rx="1" className="fill-slate-100 dark:fill-zinc-800" />}
+                  {/* 悬停提示：透明命中区覆盖整列（细柱不必瞄准），原生 title 展示当日成功/失败 */}
+                  <rect x={i * slot} y={0} width={slot} height={H} fill="transparent" className="cursor-help">
+                    <title>{`${d.date.slice(5)} · 成功 ${d.ok + d.already} · 失败 ${d.failed}`}</title>
+                  </rect>
                 </g>
               );
             })}
@@ -225,7 +229,7 @@ function CheckinResultsCard({ trend }: { trend: DoubaoCheckinTrendPoint[] }) {
   );
 }
 
-/** 额度 TOP 榜：各账号额度柱状图，从高到低（quota_total 未知不参与） */
+/** 额度 TOP 榜：竖向柱状图（对齐「近 30 天签到结果」图式），从高到低 Top 8（quota_total 未知不参与） */
 function QuotaTopCard({ accounts }: { accounts: DoubaoAccountView[] }) {
   const top = useMemo(
     () =>
@@ -235,11 +239,17 @@ function QuotaTopCard({ accounts }: { accounts: DoubaoAccountView[] }) {
         .slice(0, 8),
     [accounts],
   );
-  const max = top.length > 0 ? Math.max(1, top[0].quota_total ?? 1) : 1;
+  const W = 300;
+  const H = 48;
+  const slot = top.length > 0 ? W / top.length : W;
+  const barW = Math.max(2, Math.min(10, slot - 2));
+  const max = top.length > 0 ? Math.max(1, ...top.map((a) => a.quota_total ?? 0)) : 1;
+  // 柱顶数值紧凑格式：≥1万用「x.x万」，避免窄槽位溢出
+  const compact = (v: number) => (v >= 10000 ? `${(v / 10000).toFixed(1)}万` : v.toLocaleString());
 
   return (
     <div className="card p-4">
-      <div className="mb-3 flex items-center gap-2">
+      <div className="mb-2 flex items-center gap-2">
         <Trophy size={16} className="text-amber-500" />
         <span className="text-sm font-medium">额度 TOP 榜</span>
         <span className="text-xs text-slate-400">从高到低 · Top {top.length || 0}</span>
@@ -249,34 +259,48 @@ function QuotaTopCard({ accounts }: { accounts: DoubaoAccountView[] }) {
           数据积累中：完成签到或查询额度后，账号总额度会自动回写并参与排行。
         </p>
       ) : (
-        <div className="space-y-2.5">
-          {top.map((a, i) => {
-            const pct = Math.max(2, Math.round(((a.quota_total ?? 0) / max) * 100));
-            return (
-              <div key={a.user_id} className="flex items-center gap-3">
-                <span
-                  className={`w-5 shrink-0 text-center text-xs font-semibold ${
-                    i === 0 ? 'text-amber-500' : i === 1 ? 'text-slate-400' : i === 2 ? 'text-orange-400' : 'text-slate-300 dark:text-zinc-600'
-                  }`}
-                >
-                  {i + 1}
-                </span>
-                <div className="w-28 shrink-0 truncate text-xs font-medium text-slate-700 dark:text-zinc-200" title={a.name}>
-                  {a.name}
-                </div>
-                <div className="h-4 min-w-0 flex-1 overflow-hidden rounded bg-slate-100 dark:bg-zinc-800">
-                  <div
-                    className={`h-full rounded ${i === 0 ? 'bg-gradient-to-r from-amber-500 to-orange-400' : 'bg-gradient-to-r from-amber-400/80 to-amber-300/80'}`}
-                    style={{ width: `${pct}%` }}
+        <>
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="额度 TOP 榜柱状图">
+            <line x1="0" y1={H - 1} x2={W} y2={H - 1} className="stroke-slate-200 dark:stroke-zinc-700" strokeWidth="1" />
+            {top.map((a, i) => {
+              const v = a.quota_total ?? 0;
+              const h = Math.max(4, (v / max) * (H - 20));
+              const x = i * slot + (slot - barW) / 2;
+              return (
+                <g key={a.user_id}>
+                  <text
+                    x={x + barW / 2}
+                    y={H - 1 - h - 4}
+                    textAnchor="middle"
+                    fontSize="8"
+                    className="fill-slate-500 font-mono dark:fill-zinc-400"
+                  >
+                    {compact(v)}
+                  </text>
+                  <rect
+                    x={x}
+                    y={H - 1 - h}
+                    width={barW}
+                    height={h}
+                    rx="1"
+                    className={i === 0 ? 'fill-amber-500' : 'fill-amber-400/70'}
                   />
-                </div>
-                <div className="w-16 shrink-0 text-right font-mono text-xs font-semibold tabular-nums text-amber-600 dark:text-amber-400">
-                  {(a.quota_total ?? 0).toLocaleString()}
-                </div>
-              </div>
-            );
-          })}
-        </div>
+                </g>
+              );
+            })}
+          </svg>
+          <div className="mt-1 flex items-start justify-between">
+            {top.map((a) => (
+              <span
+                key={a.user_id}
+                className="min-w-0 flex-1 truncate px-0.5 text-center text-[10px] text-slate-500 dark:text-zinc-400"
+                title={`${a.name} · ${(a.quota_total ?? 0).toLocaleString()}`}
+              >
+                {a.name}
+              </span>
+            ))}
+          </div>
+        </>
       )}
     </div>
   );

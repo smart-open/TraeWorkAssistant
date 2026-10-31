@@ -39,7 +39,10 @@ pub struct ResultsFile {
 }
 
 impl ResultsFile {
-    /// 合并记录一日结果：同 uid 以最后一次状态为准（重试轮自然覆盖为最终态）
+    /// 合并记录一日结果：同 uid 以最后一次状态为准（重试轮自然覆盖为最终态）。
+    /// 例外（2026-10-31）：fail 不得覆盖当日已有的 success/already——客户端手动签到
+    /// 由代理捕获落库（success+reward），随后 CLI 轮次对该账号可能报 fail（风控拒绝
+    /// 幂等提交），若照搬「最后写入者胜」会把已到账的 reward 抹掉。
     pub fn record_day(
         &mut self,
         date: &str,
@@ -47,6 +50,13 @@ impl ResultsFile {
     ) {
         let day = self.days.entry(date.to_string()).or_default();
         for (uid, name, status, reward) in entries {
+            if status == "fail" {
+                if let Some(prev) = day.accounts.get(&uid) {
+                    if prev.status == "success" || prev.status == "already" {
+                        continue; // 成功是当日最终事实，失败重试不回退
+                    }
+                }
+            }
             day.accounts.insert(
                 uid,
                 AccountResult {
@@ -209,6 +219,26 @@ mod tests {
         f.trim(RETENTION_DAYS);
         assert_eq!(f.days.len(), 1);
         assert!(f.days.contains_key(&today_key()));
+    }
+
+    /// fail 不得覆盖当日 success/already（客户端签到落库后 CLI fail 轮不得抹掉 reward）
+    #[test]
+    fn record_day_fail_不覆盖成功() {
+        let today = today_key();
+        let mut f = ResultsFile::default();
+        f.record_day(&today, [("u1".to_string(), "甲".into(), "success".into(), Some(200))]);
+        f.record_day(&today, [("u1".to_string(), "甲".into(), "fail".into(), None)]);
+        let r = &f.days[&today].accounts["u1"];
+        assert_eq!(r.status, "success");
+        assert_eq!(r.reward, Some(200));
+        // 反向：成功覆盖失败（重试成功为最终态）
+        f.record_day(&today, [("u2".to_string(), "乙".into(), "fail".into(), None)]);
+        f.record_day(&today, [("u2".to_string(), "乙".into(), "already".into(), None)]);
+        assert_eq!(f.days[&today].accounts["u2"].status, "already");
+        // fail 覆盖 fail（同态刷新 updated_at 正常）
+        f.record_day(&today, [("u3".to_string(), "丙".into(), "fail".into(), None)]);
+        f.record_day(&today, [("u3".to_string(), "丙".into(), "fail".into(), None)]);
+        assert_eq!(f.days[&today].accounts["u3"].status, "fail");
     }
 
     #[test]

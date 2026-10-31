@@ -178,8 +178,17 @@ export default function DoubaoSettings() {
     try {
       const s = await api.doubao.checkinTaskStatus();
       if (s.startsWith('registered:')) {
+        const shown = s.slice('registered:'.length);
         setCheckinTaskState('registered');
-        setCheckinTaskTimeShown(s.slice('registered:'.length));
+        setCheckinTaskTimeShown(shown);
+        // 输入框对齐真实注册时刻（2026-10-31 修复：此前读 settings 默认值 09:15，
+        // 与 schtasks 实际注册时刻（如 15:00）各说各话）；settings 漂移时一并收敛
+        if (/^([01]\d|2[0-3]):([0-5]\d)$/.test(shown)) {
+          setCheckinTaskTime(shown);
+          if (settings?.doubao_checkin_hhmm !== shown) {
+            void saveSettings({ doubao_checkin_hhmm: shown });
+          }
+        }
       } else {
         setCheckinTaskState('not_registered');
       }
@@ -674,7 +683,9 @@ export default function DoubaoSettings() {
                 className="mt-0.5 h-4 w-4 shrink-0 accent-rose-500"
               />
               <span>
-                <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日签到调度（每日 09:15）</span>
+                <span className="font-medium text-slate-600 dark:text-zinc-200">
+                  应用内每日签到调度（每日 {settings?.doubao_checkin_hhmm || '09:15'}）
+                </span>
                 <span className="mt-0.5 block leading-relaxed">
                   关闭后应用内调度器不再执行每日自动签到；与上方「每日任务」（Windows 计划任务）相互独立。
                   无豆包账号时自动跳过，不记失败、不推送通知。
@@ -691,10 +702,9 @@ export default function DoubaoSettings() {
               <span className="text-slate-400">逐账号签到见「一键签到」页</span>
             </div>
           </div>
-        </section>
 
-        {/* 豆包数据同步（对齐 Trae「积分数据同步」交互） */}
-        <section className="card mt-4 p-4">
+          {/* 额度数据同步（对齐 Trae「积分数据同步」交互）：置于任务配置底部 */}
+          <div className="mt-4 border-t border-slate-100 pt-3 dark:border-zinc-800">
           <h3 className="mb-1 font-medium">额度数据同步</h3>
           <div className="space-y-3 text-xs text-slate-500">
             <p>
@@ -737,6 +747,7 @@ export default function DoubaoSettings() {
             <p className="text-slate-400">
               修改后立即生效（保存即写库）；手动单账号查询仍可在账号管理行内「查询额度」触发。
             </p>
+          </div>
           </div>
         </section>
       </div>

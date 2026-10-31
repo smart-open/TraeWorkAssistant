@@ -1726,6 +1726,22 @@ pub fn doubao_checkin_task_register(state: State<AppState>, time: String) -> Res
     if !ok {
         return Err(schtasks_create_failure(&state, "每日签到", &stderr));
     }
+    // 单一时刻源（2026-10-31 修复）：Windows 计划任务注册成功后同步 settings.doubao_checkin_hhmm，
+    // 否则应用内调度（默认 09:15）与计划任务（用户自定，如 15:00）双轨时刻漂移——
+    // 前端「每日任务」输入框读 settings、徽标读 schtasks，会出现 09:15/15:00 各说各话
+    {
+        let store = crate::store::db(&state.data_dir);
+        let mut current: serde_json::Value = store.kv_get("app_settings");
+        if !current.is_object() {
+            current = serde_json::json!({});
+        }
+        if let Some(obj) = current.as_object_mut() {
+            obj.insert("doubao_checkin_hhmm".to_string(), serde_json::json!(time));
+        }
+        if let Err(e) = store.kv_set("app_settings", &current) {
+            fs_utils::app_log(&state.data_dir, &format!("签到时刻写入设置失败（计划任务已注册）: {e}"));
+        }
+    }
     fs_utils::app_log(&state.data_dir, &format!("豆包每日签到定时任务已注册: {time}（直调主 exe）"));
     Ok(())
 }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw, PlayCircle, Users, CheckCircle2, CircleSlash, XCircle, Loader2, CalendarDays } from 'lucide-react';
+import { PlayCircle, Users, CheckCircle2, CircleSlash, XCircle, Loader2, CalendarDays } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Progress } from '../../components/ui';
 import CheckinCalendarCard from '../../components/CheckinCalendar';
@@ -151,15 +151,7 @@ export default function DoubaoCheckin() {
 
   return (
     <div className="animate-fade-in">
-      <PageHeader
-        title="豆包 · 一键签到"
-        desc="有会话凭证的账号批量完成每日签到 · 成功后自动回写总额度与连续签到天数"
-        actions={
-          <button onClick={() => void reload()} className="btn-outline" disabled={loading || running}>
-            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
-          </button>
-        }
-      />
+      <PageHeader title="豆包 · 一键签到" desc="有会话凭证的账号批量完成每日签到 · 成功后自动回写总额度与连续签到天数" />
 
       {accounts.length === 0 ? (
         <div className="mt-5 card p-8 text-center">
@@ -224,14 +216,6 @@ export default function DoubaoCheckin() {
                     全选可签
                   </button>
                 )}
-                <button
-                  onClick={() => void run()}
-                  className="btn-outline"
-                  disabled={running || loading || candidates.length === 0}
-                >
-                  {running ? <Loader2 size={15} className="animate-spin" /> : <PlayCircle size={15} />}
-                  {running ? '签到进行中…' : `开始签到（${candidates.length}）`}
-                </button>
               </div>
             </div>
 
@@ -321,6 +305,19 @@ export default function DoubaoCheckin() {
                   })}
                 </tbody>
               </table>
+            </div>
+
+            {/* 开始签到：账号表格右下方、签到进度上方 */}
+            <div className="mt-3 flex items-center justify-end gap-3">
+              <span className="text-xs text-slate-400">将对上方 {candidates.length} 个候选账号逐个执行</span>
+              <button
+                onClick={() => void run()}
+                className="btn-primary"
+                disabled={running || loading || candidates.length === 0}
+              >
+                {running ? <Loader2 size={15} className="animate-spin" /> : <PlayCircle size={15} />}
+                {running ? '签到进行中…' : `开始签到（${candidates.length}）`}
+              </button>
             </div>
           </div>
 

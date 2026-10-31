@@ -868,6 +868,61 @@ fn try_capture_doubao_campaign(
                 ctx.log.log(&format!("  [doubao-campaign] 参数入 vault 失败（仅日志可比对）: {e}"));
             }
         }
+        // 客户端手动签到成功 → 按日落库（2026-10-31）：额度看板「今日新增额度」口径
+        // 原本只有 CLI 签到落库，客户端手动签到的 reward 看不见。此处解析 checkin
+        // code==0 响应的 reward_amount，按 cookie sessionid 逐账号比对 vault 明文凭证
+        // 定位归属账号后 record_today（fail-不覆盖-success 规则见 record_day）。
+        if p.ends_with("/landing/checkin") {
+            let parsed = serde_json::from_slice::<serde_json::Value>(&resp_plain[..resp_plain.len().min(65536)])
+                .ok()
+                .and_then(|v| v.get("data").cloned());
+            let checked = parsed
+                .as_ref()
+                .and_then(|d| d.get("checked_in"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let idempotent = parsed
+                .as_ref()
+                .and_then(|d| d.get("idempotent"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if checked || idempotent {
+                let reward = parsed
+                    .as_ref()
+                    .and_then(|d| d.get("reward_amount"))
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|v| *v > 0);
+                let status = if checked { "success" } else { "already" };
+                let sessionid = jar.iter().find(|(k, _)| k == "sessionid").map(|(_, v)| v.clone());
+                let mut matched: Option<(String, String)> = None;
+                if let Some(sid) = sessionid {
+                    let pool = crate::store::docs::doubao_pool_load(&crate::store::db(&ctx.data_dir));
+                    for a in &pool.accounts {
+                        let Some(v) = crate::vault::ns_get(&ctx.data_dir, "doubao", &a.user_id) else {
+                            continue;
+                        };
+                        if v.get("session_id").and_then(serde_json::Value::as_str) == Some(sid.as_str()) {
+                            let name = if a.name.is_empty() { a.user_id.clone() } else { a.name.clone() };
+                            matched = Some((a.user_id.clone(), name));
+                            break;
+                        }
+                    }
+                }
+                match matched {
+                    Some((uid, name)) => {
+                        crate::doubao_checkin_results::record_today(
+                            &ctx.data_dir,
+                            [(uid.clone(), name, status.to_string(), reward)],
+                        );
+                        ctx.log
+                            .log(&format!("  [doubao-campaign] 客户端签到落库: uid={uid} status={status} reward={reward:?}"));
+                    }
+                    None => ctx
+                        .log
+                        .log("  [doubao-campaign] 客户端签到成功但 cookie sessionid 未匹配到池内账号，跳过落库"),
+                }
+            }
+        }
     }
 }
 

@@ -61,6 +61,8 @@ export default function DoubaoQuotaDashboard() {
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [detail, setDetail] = useState<DoubaoDayDetail[]>([]);
   const [loading, setLoading] = useState(false);
+  // 最近一次成功刷新时间（刷新按钮的可见反馈）
+  const [refreshedAt, setRefreshedAt] = useState('');
   const [range, setRange] = useState<RangeKey>('30d');
   // 多选筛选（对齐 Trae 积分面板）：空数组 = 不限
   const [groupSel, setGroupSel] = useState<string[]>([]);
@@ -86,6 +88,8 @@ export default function DoubaoQuotaDashboard() {
       setAccounts(accs);
       setGroups(gs);
       setDetail(det);
+      // 刷新可见反馈：数据无变化时也明确「已刷新到几点几分」（修复点击无反馈的观感问题）
+      setRefreshedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
     } catch (err) {
       pushToast('error', `读取额度看板失败：${String(err)}`);
     } finally {
@@ -146,22 +150,33 @@ export default function DoubaoQuotaDashboard() {
     return set;
   }, [groupUids, accountSel]);
 
-  /** 按筛选条件聚合出趋势序列：每日新增额度（柱）+ 累计新增（线） */
+  /** 按筛选条件聚合出趋势序列：每日新增额度（柱）+ 总额度（线）。
+   *  总额度为倒推值：当日总额度 = 当前总额度 − 之后各日新增合计（额度只增口径，
+   *  尾点精确对齐账号池当前真实总额度；随 uid 筛选联动取对应账号集的总额度）。 */
   const series = useMemo(() => {
     const start = rangeStart(range);
-    let acc = 0;
-    return detail
-      .filter((d) => (start ? d.date >= start : true))
-      .map((d) => {
-        let reward = 0;
-        for (const r of d.accounts) {
-          if (uidSel && !uidSel.has(r.user_id)) continue;
-          reward += r.reward ?? 0;
-        }
-        acc += reward;
-        return { date: d.date.slice(5), reward, cumulative: acc };
-      });
-  }, [detail, range, uidSel]);
+    const days = detail.filter((d) => (start ? d.date >= start : true));
+    const rewards = days.map((d) => {
+      let reward = 0;
+      for (const r of d.accounts) {
+        if (uidSel && !uidSel.has(r.user_id)) continue;
+        reward += r.reward ?? 0;
+      }
+      return { date: d.date, reward };
+    });
+    const currentTotal = (uidSel ? accounts.filter((a) => uidSel.has(a.user_id)) : accounts).reduce(
+      (s, a) => s + (a.quota_total ?? 0),
+      0,
+    );
+    // suffix[i] = 第 i 日及之后的新增合计（多留一位便于取「之后各日」）
+    const suffix = new Array(rewards.length + 1).fill(0);
+    for (let i = rewards.length - 1; i >= 0; i--) suffix[i] = suffix[i + 1] + rewards[i].reward;
+    return rewards.map((d, i) => ({
+      date: d.date.slice(5),
+      reward: d.reward,
+      totalQuota: currentTotal - suffix[i + 1],
+    }));
+  }, [detail, range, uidSel, accounts]);
 
   const rangeReward = series.reduce((s, p) => s + p.reward, 0);
 
@@ -178,11 +193,6 @@ export default function DoubaoQuotaDashboard() {
       <PageHeader
         title="豆包 · 额度看板"
         desc="账号池额度汇总与签到额度趋势（签到/巡检成功后自动回写）"
-        actions={
-          <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
-            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新数据
-          </button>
-        }
       />
 
       {/* KPI 一行：账号数 / 总额度 / 今日新增额度（今日新增跟随筛选，Trae 面板同款） */}
@@ -250,6 +260,11 @@ export default function DoubaoQuotaDashboard() {
                 </button>
               ))}
             </div>
+            {/* 刷新数据：紧邻时间段选择（页头按钮过远难以感知 loading） */}
+            <button onClick={() => void refresh()} className="btn-outline !py-1 !text-xs" disabled={loading}>
+              <RefreshCw size={13} className={loading ? 'animate-spin' : ''} /> {loading ? '刷新中…' : '刷新数据'}
+            </button>
+            {refreshedAt && !loading && <span className="text-[11px] text-slate-400">刷新于 {refreshedAt}</span>}
           </div>
         </div>
 
@@ -270,20 +285,30 @@ export default function DoubaoQuotaDashboard() {
               <ComposedChart data={series} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-slate-200 dark:stroke-zinc-700" vertical={false} />
                 <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={24} />
-                <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={48} />
+                {/* 双轴：左轴每日新增（绿，对齐 KPI「今日新增额度」）、右轴总额度（琥珀，对齐 KPI「总额度」） */}
+                <YAxis yAxisId="reward" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={48} />
+                <YAxis yAxisId="total" orientation="right" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} width={52} />
                 <Tooltip
                   contentStyle={{ fontSize: 12 }}
                   formatter={(value: number | string, name: string) => [
                     Number(value).toLocaleString(),
-                    name === 'reward' ? '每日新增' : '累计新增',
+                    name === 'reward' ? '每日新增额度' : '总额度',
                   ]}
                 />
                 <Legend
-                  formatter={(v: string) => (v === 'reward' ? '每日新增额度' : '累计新增额度')}
+                  formatter={(v: string) => (v === 'reward' ? '每日新增额度' : '总额度')}
                   wrapperStyle={{ fontSize: 12 }}
                 />
-                <Bar dataKey="reward" name="reward" fill="#f59e0b" radius={[2, 2, 0, 0]} maxBarSize={18} />
-                <Line type="monotone" dataKey="cumulative" name="cumulative" stroke="#10b981" strokeWidth={2} dot={false} />
+                <Bar yAxisId="reward" dataKey="reward" name="reward" fill="#10b981" radius={[2, 2, 0, 0]} maxBarSize={18} />
+                <Line
+                  yAxisId="total"
+                  type="monotone"
+                  dataKey="totalQuota"
+                  name="totalQuota"
+                  stroke="#f59e0b"
+                  strokeWidth={2}
+                  dot={false}
+                />
               </ComposedChart>
             </ResponsiveContainer>
           </div>

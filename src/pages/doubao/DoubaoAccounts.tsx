@@ -18,6 +18,7 @@ import {
   Download,
   Tags,
   FolderCog,
+  Loader2,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import SwitchProgressPanel from '../../components/SwitchProgressPanel';
@@ -858,7 +859,7 @@ export default function DoubaoAccounts() {
                           <div className="font-medium text-amber-600 dark:text-amber-400">
                             {a.quota_total.toLocaleString()}
                           </div>
-                          {a.checkin_continuous_days != null && (
+                          {a.checkin_continuous_days != null && a.checkin_continuous_days > 0 && (
                             <div className="text-slate-400">连续签 {a.checkin_continuous_days} 天</div>
                           )}
                         </div>
@@ -901,7 +902,7 @@ export default function DoubaoAccounts() {
                           title="一键以该账号打开豆包：恢复快照后直接启动（代理运行中自动注入代理）"
                           onClick={() => void openDoubaoAs(a.user_id, proxy.running ? proxy.port : undefined)}
                           disabled={anyBusy || !a.has_snapshot}
-                          className="btn-ghost !p-2 text-violet-500 hover:bg-violet-50 disabled:opacity-30 dark:hover:bg-violet-500/10"
+                          className="btn-ghost !p-2 text-violet-500 hover:bg-violet-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-violet-500/10"
                         >
                           <Rocket size={14} />
                         </button>
@@ -909,7 +910,7 @@ export default function DoubaoAccounts() {
                           title="切换到此账号（自动备份当前登录态到 last 槽 + 原账号槽）"
                           onClick={() => void switchTo(a.user_id, 'Doubao')}
                           disabled={anyBusy || !a.has_snapshot}
-                          className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 disabled:opacity-30 dark:hover:bg-sky-500/10"
+                          className="btn-ghost !p-2 text-emerald-600 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-40 dark:text-emerald-400 dark:hover:bg-emerald-500/10"
                         >
                           <LogIn size={14} />
                         </button>
@@ -917,20 +918,25 @@ export default function DoubaoAccounts() {
                           title="查询/刷新会员额度（结果缓存后悬停账号名可查看额度状态 / 会员 / 到期时间）"
                           onClick={() => void doFetchQuota(a)}
                           disabled={anyBusy || quotaRunningFor === a.user_id}
-                          className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:opacity-30 dark:hover:bg-amber-500/10"
+                          className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-amber-500/10"
                         >
-                          <Coins size={14} className={quotaRunningFor === a.user_id ? 'animate-pulse' : ''} />
+                          {quotaRunningFor === a.user_id ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <Coins size={14} />
+                          )}
                         </button>
                         <button
                           title="每日签到（landing/checkin；当天已签幂等跳过，成功后回写总额度）"
                           onClick={() => void doCheckin(a)}
                           disabled={anyBusy || checkinRunningFor === a.user_id}
-                          className="btn-ghost !p-2 text-rose-400 hover:bg-rose-50 disabled:opacity-30 dark:hover:bg-rose-500/10"
+                          className="btn-ghost !p-2 text-rose-400 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-rose-500/10"
                         >
-                          <CalendarCheck
-                            size={14}
-                            className={checkinRunningFor === a.user_id ? 'animate-pulse' : ''}
-                          />
+                          {checkinRunningFor === a.user_id ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <CalendarCheck size={14} />
+                          )}
                         </button>
                         <button
                           title={
@@ -940,9 +946,13 @@ export default function DoubaoAccounts() {
                           }
                           onClick={() => void doChatBackup(a)}
                           disabled={anyBusy || chatBusyFor === a.user_id}
-                          className="btn-ghost !p-2 text-teal-500 hover:bg-teal-50 disabled:opacity-30 dark:hover:bg-teal-500/10"
+                          className="btn-ghost !p-2 text-teal-500 hover:bg-teal-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-teal-500/10"
                         >
-                          <DatabaseBackup size={14} className={chatBusyFor === a.user_id ? 'animate-pulse' : ''} />
+                          {chatBusyFor === a.user_id ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <DatabaseBackup size={14} />
+                          )}
                         </button>
                         <button
                           title={
@@ -952,7 +962,7 @@ export default function DoubaoAccounts() {
                           }
                           onClick={() => void doChatRestore(a)}
                           disabled={anyBusy || chatBusyFor === a.user_id || !chatdataInfos[a.user_id]?.backed}
-                          className="btn-ghost !p-2 text-sky-600 hover:bg-sky-50 disabled:opacity-30 dark:hover:bg-sky-500/10"
+                          className="btn-ghost !p-2 text-sky-600 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-sky-500/10"
                         >
                           <ArchiveRestore size={14} />
                         </button>
@@ -960,7 +970,7 @@ export default function DoubaoAccounts() {
                           title="导出对话记录（官方接口拉取会话与消息 → data/exports/ 生成 markdown + json；需已录入凭证）"
                           onClick={() => void doExportChats(a)}
                           disabled={anyBusy || chatBusyFor === a.user_id}
-                          className="btn-ghost !p-2 text-indigo-500 hover:bg-indigo-50 disabled:opacity-30 dark:hover:bg-indigo-500/10"
+                          className="btn-ghost !p-2 text-indigo-500 hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-indigo-500/10"
                         >
                           <Download size={14} />
                         </button>
@@ -976,7 +986,7 @@ export default function DoubaoAccounts() {
                           title="删除账号（含快照，不可恢复）"
                           onClick={() => doRemove(a.user_id)}
                           disabled={anyBusy}
-                          className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 disabled:opacity-30 dark:hover:bg-rose-500/10"
+                          className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-rose-500/10"
                         >
                           <Trash2 size={14} />
                         </button>
