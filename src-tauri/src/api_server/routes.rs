@@ -424,29 +424,33 @@ pub(crate) fn exhaust_message(
     rotated: usize,
     healthy_total: usize,
     hard: usize,
+    pool: &str,
 ) -> (String, &'static str) {
-    exhaust_message_with_transport_cut(empty_hits, rotated, healthy_total, hard, 0)
+    exhaust_message_with_transport_cut(empty_hits, rotated, healthy_total, hard, 0, pool)
 }
 
 /// 在通用耗尽文案上补充传输掐断归因（issue #158 同族可见化）：
 /// 全部轮换账号都在响应中途被掐时，不再误报 "no healthy account available"；
 /// 混合失败则保留原归因并追加 cut 计数，避免把网络问题当成账号健康问题。
+/// `pool` = 调用方池名（文案按池标注，qoder/wb 复用时不再误标 trae）
 pub(crate) fn exhaust_message_with_transport_cut(
     empty_hits: usize,
     rotated: usize,
     healthy_total: usize,
     hard: usize,
     cut_hits: usize,
+    pool: &str,
 ) -> (String, &'static str) {
     if cut_hits > 0 && rotated > 0 && cut_hits >= rotated {
         return (
             format!(
-                "transport cut suspected: {cut_hits} transport cut(s) across {rotated} rotated accounts (upstream connection closed mid-response, account/model agnostic — retry later or check local network/proxy; pool=trae healthy={healthy_total})"
+                "transport cut suspected: {cut_hits} transport cut(s) across {rotated} rotated accounts (upstream connection closed mid-response, account/model agnostic — retry later or check local network/proxy; pool={pool} healthy={healthy_total})"
             ),
             "TRANSPORT_CUT",
         );
     }
-    let (mut msg, tag) = exhaust_message_without_cut(empty_hits, rotated, healthy_total, hard);
+    let (mut msg, tag) =
+        exhaust_message_without_cut(empty_hits, rotated, healthy_total, hard, pool);
     if cut_hits > 0 && rotated > 0 {
         msg.push_str(&format!(
             "; {cut_hits} transport cut(s) across {rotated} rotated accounts (upstream connection closed mid-response, account/model agnostic — retry later or check local network/proxy)"
@@ -460,11 +464,12 @@ fn exhaust_message_without_cut(
     rotated: usize,
     healthy_total: usize,
     hard: usize,
+    pool: &str,
 ) -> (String, &'static str) {
     if rotated >= 2 && empty_hits * 2 > rotated {
         (
             format!(
-                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts (Trae shadow risk control, account/model agnostic — switching won't help); try updating wb_template_map.json (UI「指纹清洗」tab) or the tool alias table (UI「工具别名」tab) or enabling sanitize (pool=trae healthy={healthy_total}); client agent-tool fingerprint suspected too (issue #150) — disabling agent tools / plain chat on the client bypasses it",
+                "channel fingerprint block suspected: {empty_hits} empty completion(s) across {rotated} rotated accounts ({pool} shadow risk control, account/model agnostic — switching won't help); try updating wb_template_map.json (UI「指纹清洗」tab) or the tool alias table (UI「工具别名」tab) or enabling sanitize (pool={pool} healthy={healthy_total}); client agent-tool fingerprint suspected too (issue #150) — disabling agent tools / plain chat on the client bypasses it",
             ),
             "CHANNEL_FINGERPRINT_BLOCK",
         )
@@ -551,7 +556,9 @@ pub(crate) fn no_healthy_detail_with_model(
     let Some((name, rk)) = super::api_keys::key_snapshot_for(&state.data_dir, key_str) else {
         return base;
     };
-    let name = if name.is_empty() { key_str } else { name.as_str() };
+    // 展示名缺失回退固定占位符（审查 Low）：回退原始 API Key 会把密钥原文
+    // 拼进 503 响应体/日志，最小暴露面
+    let name = if name.is_empty() { "unnamed" } else { name.as_str() };
     let bind = rk.bind_pool().unwrap_or("-");
     match rk.pool_constraints(pool.as_str()) {
         None => format!("{base} key={name} bind={bind} constraint=none"),
@@ -627,25 +634,37 @@ pub(crate) fn no_healthy_detail_with_model(
 /// 冷却表内、BuddyAi 需 buddy_ai_enabled 且同名模型在 buddy-ai 冷却表内、
 /// Qoder 需 qoder_enabled 且同名模型在 qoder 冷却表内——满足即说明调度在到达
 /// 失败池前就已因模型冷却放弃该池。无命中返回空串（消息不变）。
-/// 仅覆盖这三类有模型冷却表的池（Trae 无模型级冷却；冷却键为请求模型名，与
-/// note_model_failure_ex/pool_health 的常规路径一致，别名改写场景归因尽力而为）
+/// 仅覆盖这三类有模型冷却表的池（Trae 无模型级冷却）。
+/// 冷却键改候选键列表（审查 Low）：别名改写场景下实际写入冷却表的键是管线/目录
+/// 归一名而非请求名，只查请求名会静默漏归因——候选命中任一即归因，取最大剩余秒。
+/// 残留缺口：后台任务降级/长上下文降档会把请求改写为降级候选模型（判定依赖请求
+/// 体，此处只有模型名无 body），该形态归因尽力而为
 fn skipped_pool_note(state: &ApiSharedState, failed: TargetPool, model: &str) -> String {
     let Some(failed_idx) = dispatch::POOL_FIXED_ORDER.iter().position(|p| *p == failed) else {
         return String::new();
     };
+    let cooldown_keys = cooldown_key_candidates(state, model);
     let mut notes: Vec<String> = Vec::new();
     for p in &dispatch::POOL_FIXED_ORDER[..failed_idx] {
         let rem: Option<i64> = match p {
             TargetPool::Buddy => {
                 if state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                    wb_route::model_cooldown_remaining_on(state, false, model)
+                    cooldown_keys
+                        .iter()
+                        .filter_map(|k| wb_route::model_cooldown_remaining_on(state, false, k))
+                        .max()
                 } else {
                     None
                 }
             }
             TargetPool::Qoder => {
                 if state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                    super::qoder_route::model_cooling_remaining_secs(model).map(|s| s as i64)
+                    cooldown_keys
+                        .iter()
+                        .filter_map(|k| {
+                            super::qoder_route::model_cooling_remaining_secs(k).map(|s| s as i64)
+                        })
+                        .max()
                 } else {
                     None
                 }
@@ -655,7 +674,10 @@ fn skipped_pool_note(state: &ApiSharedState, failed: TargetPool, model: &str) ->
                     .buddy_ai_enabled
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    wb_route::model_cooldown_remaining_on(state, true, model)
+                    cooldown_keys
+                        .iter()
+                        .filter_map(|k| wb_route::model_cooldown_remaining_on(state, true, k))
+                        .max()
                 } else {
                     None
                 }
@@ -674,6 +696,31 @@ fn skipped_pool_note(state: &ApiSharedState, failed: TargetPool, model: &str) ->
     } else {
         format!("; {}", notes.join("; "))
     }
+}
+
+/// 503 归因的冷却键候选列表：请求名 + ① wb 路由管线归一名（别名→规则→系列
+/// 通配→后缀剥离，Buddy/BuddyAi 共用此管线，note_model_failure 记的是归一名）
+/// + ② Qoder 目录归一 id（resolve 命中条目的 id，覆盖别名表/大小写形态漂移）。
+/// 只在 503 收尾路径调用（低频），目录/管线加载成本可接受
+fn cooldown_key_candidates(state: &ApiSharedState, model: &str) -> Vec<String> {
+    let mut keys = vec![model.to_string()];
+    let cfg = wb_model_route::load_config(&state.data_dir);
+    let catalog = wb_catalog::load(&state.data_dir);
+    let routed = wb_model_route::resolve(&cfg, &catalog, model).model;
+    if !routed.is_empty() && !keys.contains(&routed) {
+        keys.push(routed);
+    }
+    if let Some(id) = crate::tasks::qoder_upstream::resolve(
+        model,
+        crate::tasks::qoder_upstream::QoderRegion::Cn,
+    )
+    .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
+    {
+        if !id.is_empty() && !keys.contains(&id) {
+            keys.push(id);
+        }
+    }
+    keys
 }
 
 /// issue #26 全局模型白名单准入：请求模型不在白名单时返回按协议格式化的 404。
@@ -2483,7 +2530,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
         let (exhaust_msg, exhaust_tag) =
             exhaust_message_with_transport_cut(
-                empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+                empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits, "trae",
             );
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
@@ -3021,7 +3068,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
         let (exhaust_msg, exhaust_tag) =
             exhaust_message_with_transport_cut(
-                empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+                empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits, "trae",
             );
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
@@ -3602,7 +3649,7 @@ mod tests {
     #[test]
     fn exhaust_message_empty_hits_indicates_fingerprint_block() {
         // 空完成主导：明示指纹拦截语义（账号/模型无关），带清洗规则表提示与健康计数
-        let (msg, tag) = exhaust_message(3, 3, 4, 0);
+        let (msg, tag) = exhaust_message(3, 3, 4, 0, "trae");
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert!(msg.contains("3 empty completion(s) across 3 rotated accounts"), "{msg}");
         assert!(msg.contains("healthy=4"), "{msg}");
@@ -3615,7 +3662,7 @@ mod tests {
     #[test]
     fn exhaust_message_no_empty_hits_keeps_original() {
         // 无空完成（401/429/5xx 等真实不健康）：维持原文案，避免误导
-        let (msg, tag) = exhaust_message(0, 3, 0, 0);
+        let (msg, tag) = exhaust_message(0, 3, 0, 0, "trae");
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
@@ -3624,7 +3671,7 @@ mod tests {
     fn exhaust_message_single_empty_hit_keeps_original() {
         // issue #130 防误报：单号轮换 + 1 次空完成（样本不足）不宣判指纹拦截，
         // 上游瞬时抖动同样返回空完成，"switching won't help" 会误导排障方向
-        let (msg, tag) = exhaust_message(1, 1, 3, 0);
+        let (msg, tag) = exhaust_message(1, 1, 3, 0, "trae");
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
@@ -3633,7 +3680,7 @@ mod tests {
     fn exhaust_message_minority_empty_hits_keeps_original() {
         // 混合失败：仅 1 次空完成 + 其余限流/5xx，空完成非主导 → 不宣判指纹拦截，
         // 避免 "switching won't help" 误导排障方向（限流等待冷却即可自愈）
-        let (msg, tag) = exhaust_message(1, 10, 2, 0);
+        let (msg, tag) = exhaust_message(1, 10, 2, 0, "trae");
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
@@ -3641,14 +3688,14 @@ mod tests {
     #[test]
     fn exhaust_message_majority_empty_hits_indicates_fingerprint_block() {
         // 过半轮换账号返回空完成（6/10）→ 判定指纹拦截主导
-        let (msg, tag) = exhaust_message(6, 10, 2, 0);
+        let (msg, tag) = exhaust_message(6, 10, 2, 0, "trae");
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
     }
 
     #[test]
     fn exhaust_message_transport_cut_only_does_not_blame_accounts() {
-        let (msg, tag) = exhaust_message_with_transport_cut(0, 3, 5, 0, 3);
+        let (msg, tag) = exhaust_message_with_transport_cut(0, 3, 5, 0, 3, "trae");
         assert!(msg.contains("transport cut suspected"), "{msg}");
         assert!(msg.contains("3 transport cut(s) across 3 rotated accounts"), "{msg}");
         assert!(!msg.contains("no healthy account available"), "{msg}");
@@ -3658,13 +3705,13 @@ mod tests {
     #[test]
     fn exhaust_message_transport_cut_mixed_appends_note() {
         // 空完成主导仍保留原归因，但必须补充 cut 计数，不能让网络掐断从诊断中消失
-        let (msg, tag) = exhaust_message_with_transport_cut(3, 3, 4, 0, 1);
+        let (msg, tag) = exhaust_message_with_transport_cut(3, 3, 4, 0, 1, "trae");
         assert!(msg.contains("channel fingerprint block suspected"), "{msg}");
         assert!(msg.contains("1 transport cut(s) across 3 rotated accounts"), "{msg}");
         assert_eq!(tag, "CHANNEL_FINGERPRINT_BLOCK");
 
         // 积分硬冷却分支同样补注，避免把 cut 混入账号归因
-        let (msg_credit, tag_credit) = exhaust_message_with_transport_cut(0, 3, 0, 2, 1);
+        let (msg_credit, tag_credit) = exhaust_message_with_transport_cut(0, 3, 0, 2, 1, "trae");
         assert!(msg_credit.contains("credit exhausted on 2 account(s)"), "{msg_credit}");
         assert!(msg_credit.contains("1 transport cut(s) across 3 rotated accounts"), "{msg_credit}");
         assert_eq!(tag_credit, "NO_HEALTHY_ACCOUNT_CREDIT");
@@ -3672,7 +3719,7 @@ mod tests {
 
     #[test]
     fn exhaust_message_without_transport_cut_keeps_legacy_text() {
-        let (msg, tag) = exhaust_message_with_transport_cut(0, 3, 0, 0, 0);
+        let (msg, tag) = exhaust_message_with_transport_cut(0, 3, 0, 0, 0, "trae");
         assert_eq!(msg, "no healthy account available");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT");
     }
@@ -3681,18 +3728,18 @@ mod tests {
     fn exhaust_message_hard_credit_carries_0400_reset_hint() {
         // issue #156：无空完成但存在积分耗尽硬冷却账号 → 消息携带冷却原因与
         // 次日 04:00 恢复语义，客户端可见「积分耗尽 04:00 重置」而非裸 no healthy
-        let (msg, tag) = exhaust_message(0, 3, 0, 2);
+        let (msg, tag) = exhaust_message(0, 3, 0, 2, "trae");
         assert!(msg.contains("no healthy account available"), "{msg}");
         assert!(msg.contains("credit exhausted on 2 account(s)"), "{msg}");
         assert!(msg.contains("next 04:00"), "{msg}");
         assert_eq!(tag, "NO_HEALTHY_ACCOUNT_CREDIT");
         // 混合失败诚实语境：轮换过其他账号（如 401 软熔断）时补充 further note，
         // 避免把其他失败也归因于积分耗尽
-        let (msg_mix, _) = exhaust_message(0, 1, 0, 2);
+        let (msg_mix, _) = exhaust_message(0, 1, 0, 2, "trae");
         assert!(msg_mix.contains("credit exhausted on 2 account(s)"), "{msg_mix}");
         assert!(msg_mix.contains("1 further account(s) also failed this rotation"), "{msg_mix}");
         // 指纹拦截主导优先级高于积分耗尽提示（指纹拦截与账号无关，积分提示会误导）
-        let (msg_fp, tag_fp) = exhaust_message(6, 10, 2, 2);
+        let (msg_fp, tag_fp) = exhaust_message(6, 10, 2, 2, "trae");
         assert!(msg_fp.contains("channel fingerprint block suspected"), "{msg_fp}");
         assert_eq!(tag_fp, "CHANNEL_FINGERPRINT_BLOCK");
     }

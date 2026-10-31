@@ -141,6 +141,10 @@ export default function ApiService() {
         const lc = await api.apiServer.traeLongContextList().catch(() => null);
         if (lc && lcSeq === longCtxSeq.current)
           setLongCtx((prev) => (savingLongCtxRef.current ? prev : new Set(lc.enabled)));
+        else if (lc === null && longCtx === null)
+          // 审查 Low：首次加载失败时开关列整列禁用（longCtx===null），静默禁用
+          // 让用户无从知晓原因 → 提示一次；已有旧值的手动刷新失败不打扰
+          toast('error', '长上下文开关状态加载失败，开关暂不可用');
       } catch {
         // 初始化失败静默保留空列表；手动点击刷新失败需给出提示
         if (manual) toast('error', '加载模型目录失败，请重试');
@@ -148,7 +152,7 @@ export default function ApiService() {
         setLoadingModels(false);
       }
     },
-    [toast],
+    [toast, longCtx],
   );
 
   // 同步官网模型（models_sync 沿用现有调用）；L1 人工覆盖层不受同步影响
@@ -366,6 +370,17 @@ export default function ApiService() {
         return next;
       });
       toast('success', on ? `${model} 已开启长上下文` : `${model} 已恢复跟随上游`);
+      // 快照期其他端变更收敛（审查修复）：本端乐观回填只是瞬时态，后台重拉整表
+      // 并按快照序号守卫回填（与 loadModels 同语义），其他端在 toggle 期间的变更
+      // 即时收敛；失败静默（乐观回填已生效，下次进入页面/手动刷新仍有兜底）
+      const seq = longCtxSeq.current;
+      void api.apiServer
+        .traeLongContextList()
+        .then((lc) => {
+          if (seq === longCtxSeq.current)
+            setLongCtx((prev) => (savingLongCtxRef.current ? prev : new Set(lc.enabled)));
+        })
+        .catch(() => {});
     } catch (e) {
       toast('error', `保存失败：${String(e)}`);
     } finally {

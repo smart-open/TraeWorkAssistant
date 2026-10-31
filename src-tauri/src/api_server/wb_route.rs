@@ -363,14 +363,18 @@ pub(crate) fn parse_account_unfreeze_at(msg: &str) -> Option<i64> {
 }
 
 /// 相对秒形态解析（零正则，项目约定）：
+/// 入口统一 ASCII 小写归一（审查修复）：「30S后」「After 30 Seconds」等大写
+/// 变体与文档词形一致命中；to_ascii_lowercase 逐字节替换不改长度与 UTF-8 边界，
+/// 后续切片/数字解析安全；归一化后锚点与单位均为精确比较。
 /// - 中文锚点「秒后」「s后」：数字在锚点前（允许一个空格），如「30秒后重试」「45s后恢复」；
 /// - 英文锚点「after」「 in 」：数字在锚点后（允许空格），且必须跟完整词形秒单位
-///   （s/sec/secs/second/seconds，大小写不敏感，单位后须为词边界）——
+///   （s/sec/secs/second/seconds，单位后须为词边界）——
 ///   防「after 3 min」「in 10 steps」等非秒词误判。
 /// 数字有效性：>0 且 ≤7 天；超长数字段（>9 位）视为解析异常不命中；
 /// 数字段前紧贴「.」「,」视为小数/千分位片段（如「3.5s后」）不命中，避免截断误读
 fn parse_relative_unfreeze_secs(msg: &str) -> Option<i64> {
     const MAX_SECS: i64 = 7 * 24 * 3600;
+    let msg = &msg.to_ascii_lowercase();
     let b = msg.as_bytes();
     // 从 i（不含）向前跳过一个空格后回扫连续 ASCII 数字，返回数值
     fn digits_before(b: &[u8], i: usize) -> Option<i64> {
@@ -423,8 +427,9 @@ fn parse_relative_unfreeze_secs(msg: &str) -> Option<i64> {
                 if j < b.len() && b[j] == b' ' {
                     j += 1;
                 }
-                // 审查修复：单位须为完整词形（大小写不敏感）且后接词边界（非
-                // ASCII 字母数字），防「steps/sessions」类 s 开头非秒词误判
+                // 审查修复：单位须为完整词形且后接词边界（非 ASCII 字母数字），
+                // 防「steps/sessions」类 s 开头非秒词误判；大小写由入口归一化
+                // 覆盖，此处精确比较即可
                 for unit in [
                     "seconds".as_bytes(),
                     "second".as_bytes(),
@@ -434,7 +439,7 @@ fn parse_relative_unfreeze_secs(msg: &str) -> Option<i64> {
                 ] {
                     let k = j + unit.len();
                     if k <= b.len()
-                        && b[j..k].eq_ignore_ascii_case(unit)
+                        && &b[j..k] == unit
                         && (k >= b.len() || !b[k].is_ascii_alphanumeric())
                     {
                         if let Ok(v) = msg[start..i].parse::<i64>() {
@@ -937,6 +942,8 @@ fn run_wb_stream(
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+    // PR #162：传输掐断计数——全池被掐时耗尽收尾改报传输掐断而非误报无健康账号
+    let mut cut_hits: usize = 0;
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
     let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
     // 审查修复（L1）：最近绑定账号（绑定成功才更新）——外层断连终局归因复用，
@@ -973,11 +980,9 @@ fn run_wb_stream(
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
                     let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
                     let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
-                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
-                        empty_hits,
-                        tried.len(),
-                        healthy_total,
-                        hard_credit_cnt,
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
+                        empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+                        state.pool_label(),
                     );
                     // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）
                     // 才标记，TTL 内同池新请求直接激进起步，不再从零试探烧账号
@@ -1000,9 +1005,10 @@ fn run_wb_stream(
                     let sample_note =
                         wb_payload::empty_sample_note(&exhaust_tag, state.pool_label(), body_vec);
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} reasons=[{}]{}",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool={} reasons=[{}]{}",
                         tried.len(),
                         empty_hits,
+                        cut_hits,
                         state.pool_label(),
                         diag_summary.join(", "),
                         sample_note,
@@ -1170,6 +1176,10 @@ fn run_wb_stream(
                                     );
                                     return;
                                 }
+                                // PR #162：cut_hits 计入轮换耗尽归因——全池被掐时
+                                // exhaust_message_with_transport_cut 报传输掐断而非
+                                // 误报 "no healthy account available"（与 trae 池同口径）
+                                cut_hits += 1;
                                 break;
                             }
                             if super::is_empty_completion(code, &msg) {
@@ -1532,6 +1542,8 @@ pub async fn wb_aggregate_chat(
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // PR #162：传输掐断计数（聚合侧对齐流式路径）
+        let mut cut_hits: usize = 0;
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
         let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
 
@@ -1551,11 +1563,9 @@ pub async fn wb_aggregate_chat(
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
                         let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
-                        let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
-                            empty_hits,
-                            tried.len(),
-                            healthy_total,
-                            hard_credit_cnt,
+                        let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
+                            empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+                            state.pool_label(),
                         );
                         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
                         super::wb_payload::mark_channel_fp_block(
@@ -1566,9 +1576,10 @@ pub async fn wb_aggregate_chat(
                         // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）
                         if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
                             state.logger.log_debug_line(format!(
-                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} 指纹样本: {}",
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool={} 指纹样本: {}",
                                 tried.len(),
                                 empty_hits,
+                                cut_hits,
                                 state.pool_label(),
                                 wb_payload::fingerprint_sample(&body_vec),
                             ));
@@ -1720,6 +1731,8 @@ pub async fn wb_aggregate_chat(
                                         duration_ms, Some(ttfb_ms), &key_name,
                                         &state.route_pool().name_of(win_uid), Some(&msg),
                                     );
+                                    // PR #162：cut_hits 计入轮换耗尽归因（与流式路径同口径）
+                                    cut_hits += 1;
                                     break;
                                 }
                                 // 11128 流内形态（issue #123）：口径同下方 Err 分支——
@@ -2457,6 +2470,7 @@ pub async fn wb_tool_exec_chat(
                         tried.len(),
                         healthy_total,
                         hard_credit_cnt,
+                        "wb",
                     );
                     // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
                     super::wb_payload::mark_channel_fp_block(
@@ -2873,7 +2887,7 @@ mod tests {
         assert_eq!(parse_account_unfreeze_at("3.5s后重试"), None);
         assert_eq!(parse_account_unfreeze_at("3.5秒后重试"), None);
         assert_eq!(parse_account_unfreeze_at("1,500秒后重试"), None);
-        // ⑥ 完整词形秒单位仍命中（大小写不敏感 + 词边界放行标点/结尾）
+        // ⑥ 完整词形秒单位仍命中（入口归一化 + 词边界放行标点/结尾）
         let now2 = now_ts();
         for (msg, expect) in [
             ("after 30 secs", 30i64),
@@ -2886,6 +2900,20 @@ mod tests {
                 (expect..=expect + 5).contains(&(ts - now2)),
                 "相对秒偏差: {msg} got {}",
                 ts - now2
+            );
+        }
+        // ⑦ 大写变体回归（入口归一化修复）：锚点/单位大写形态与文档词形一致命中
+        let now3 = now_ts();
+        for (msg, expect) in [
+            ("30S后恢复", 30i64),
+            ("After 30 Seconds", 30),
+            ("Retry AFTER 45 Secs.", 45),
+        ] {
+            let ts = parse_account_unfreeze_at(msg).unwrap_or_else(|| panic!("应解析: {msg}"));
+            assert!(
+                (expect..=expect + 5).contains(&(ts - now3)),
+                "相对秒偏差: {msg} got {}",
+                ts - now3
             );
         }
     }
