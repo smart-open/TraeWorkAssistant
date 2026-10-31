@@ -46,6 +46,13 @@ pub struct WorkBuddyAccountView {
     pub snapshot_saved_at_codebuddy_ms: Option<i64>,
     pub snapshot_verify_failed_workbuddy_ms: Option<i64>,
     pub snapshot_verify_failed_codebuddy_ms: Option<i64>,
+    pub snapshot_verify_timeout_workbuddy_ms: Option<i64>,
+    pub snapshot_verify_timeout_codebuddy_ms: Option<i64>,
+    /// 快照不可用（身份不符 / 槽内没有登录态）：读取时派生，不需要写盘。
+    /// 身份不符 = 槽位 meta.uid 与账号 uid 不一致（被别的账号覆盖）；
+    /// CodeBuddy 另查 vscdb 是否含 `planning-genie.*accessToken*` 登录键（登出态快照）。
+    pub snapshot_invalid_workbuddy: bool,
+    pub snapshot_invalid_codebuddy: bool,
     /// F2-2 WorkBuddy 端当前账号（桥 profiles_workbuddy/current_account.txt 标记）
     pub is_current_workbuddy: bool,
     /// F2-2 CodeBuddy 端当前账号（桥 profiles_codebuddy/current_account.txt 标记）
@@ -90,6 +97,14 @@ pub struct WorkBuddyScanResult {
 
 // ── M1 环境检测（workbuddy_env_check）──────────────────────────────────────
 
+/// 登录快照字段取值：现版本客户端把身份嵌在 `primary` 下
+/// （`{"primary":{"uid","nickname","type","savedAt"}}`），旧实现只读顶层
+/// `uid`/`nickname` → 恒为 None（概览页「登录账号」兜底失效、切换确认信号①失效）。
+/// 解析与切换确认共用 `switcher::authfile::snapshot_field`，避免两处键序漂移。
+fn snap_field(snap: &serde_json::Value, key: &str, legacy: &[&str]) -> Option<String> {
+    crate::switcher::authfile::snapshot_field(snap, key, legacy)
+}
+
 #[tauri::command(async)]
 pub fn workbuddy_env_check(state: State<AppState>) -> WorkBuddyEnvCheck {
     // 复用 F-01 app_locate 四级探测（env.rs 内部实现走注册表/默认路径/进程反查）
@@ -105,8 +120,12 @@ pub fn workbuddy_env_check(state: State<AppState>) -> WorkBuddyEnvCheck {
         auth_file_path: auth_path.display().to_string(),
         auth_file_exists: auth_path.exists(),
         data_dir_exists: wb_data_dir().exists(),
-        snapshot_uid: if has_snap { as_str(fs_utils::dig(&snap, &["uid", "accountId"])) } else { None },
-        snapshot_nickname: if has_snap { as_str(fs_utils::dig(&snap, &["nickname", "displayName", "name"])) } else { None },
+        snapshot_uid: if has_snap { snap_field(&snap, "uid", &["uid", "accountId"]) } else { None },
+        snapshot_nickname: if has_snap {
+            snap_field(&snap, "nickname", &["nickname", "displayName", "name"])
+        } else {
+            None
+        },
         snapshot_edition: if has_snap { as_str(fs_utils::dig(&snap, &["editionType", "edition"])) } else { None },
     }
 }
@@ -136,6 +155,32 @@ pub fn workbuddy_accounts_list(state: State<AppState>) -> Result<Vec<WorkBuddyAc
     accounts_list_inner(&state)
 }
 
+/// CodeBuddy 快照槽是否缺登录令牌：vscdb 的 ItemTable 里应有
+/// `secret://…coding-copilot…accessToken…` 键（实测键名为
+/// `planning-genie.new.accessTokencn`）。无 vscdb（老快照/未建槽）或查询失败 → false，
+/// 不做判断，避免误标；这就是「客户端登出后把现场写进槽位」留下的坏快照形态。
+fn cb_slot_missing_login(slot_dir: &std::path::Path) -> bool {
+    let db = slot_dir.join("vscdb").join("state.vscdb");
+    if !db.is_file() {
+        return false;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return false;
+    };
+    let has: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ItemTable \
+             WHERE key LIKE 'secret://%coding-copilot%' AND key LIKE '%accessToken%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    has == 0
+}
+
 fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, String> {
     let pool = load_pool(state);
     // 在线判定：auth 文件 uid 与账号一致（客户端当前生效登录）
@@ -143,6 +188,20 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
         let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(state));
         if raw.is_object() { as_str(fs_utils::dig(&raw, &["uid"])) } else { None }
     };
+    // live 登录信号优先（仅客户端运行时）：WorkBuddy 切换后不再回写共享 auth 文件
+    //（本机实测 auth mtime 停在 10/23，而 skeleton 快照随每次登录/切换重写），
+    // 继续只看 auth 文件会让「在客户端里手动切账号」后在线徽标停在旧账号。
+    // 客户端未运行时不采用快照：它是上次会话残留，而助手刚恢复的登录态以 auth 文件为准。
+    let live_uid = if is_running() {
+        snap_field(
+            &fs_utils::read_json::<serde_json::Value>(&snapshot_json_path()),
+            "uid",
+            &["uid", "accountId"],
+        )
+    } else {
+        None
+    };
+    let current_uid = live_uid.or_else(|| auth_uid.clone());
     let snap_path = state.data_dir.join("data").join("profiles_workbuddy");
     // F2-2：CodeBuddy 快照目录 + 双端"当前账号"标记（桥按端写入 <profiles>/current_account.txt）
     let snap_cb_path = state.data_dir.join("data").join("profiles_codebuddy");
@@ -152,7 +211,8 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
     // genie.userId（客户端随登录/切换改写，池内按 uid 反查账号 id）。桥标记只反映
     // 上次切换目标：客户端内手动重登、切换后客户端未接受恢复（守卫跳过回写）时均失真，
     // 徽标会指向未登录的账号。genie 不可读（客户端未装/storage.json 缺失）回退桥标记。
-    // WorkBuddy 端不受影响：is_current 用 auth 文件 uid（本就是 WorkBuddy 登录真源）。
+    // WorkBuddy 端同理：客户端运行时用 skeleton 快照的 primary.uid（live），未运行才回退
+    // auth 文件 uid（恢复后的登录态由它承载；快照此时是上次会话残留）。
     let cb_live_id = codebuddy_live_uid()
         .and_then(|uid| {
             pool.accounts.iter().find(|a| a.uid == uid).map(|a| a.id.clone())
@@ -173,18 +233,29 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
             let has_snapshot_cb = snap_cb_path.join(&a.id).is_dir()
                 || snap_cb_path.join(format!("{}.bak", a.id)).is_dir();
             let meta = |dir: &std::path::Path, id: &str| {
-                let (s, f) = crate::switcher::authfile::read_slot_snapshot_meta(dir, id);
+                let (s, f, t) = crate::switcher::authfile::read_slot_snapshot_meta(dir, id);
                 if s.is_none() && f.is_none() {
                     crate::switcher::authfile::read_slot_snapshot_meta(
                         dir,
                         &format!("{id}.bak"),
                     )
                 } else {
-                    (s, f)
+                    (s, f, t)
                 }
             };
-            let (snap_saved, snap_failed) = meta(&snap_path, &a.id);
-            let (snap_cb_saved, snap_cb_failed) = meta(&snap_cb_path, &a.id);
+            let (snap_saved, snap_failed, snap_timeout) = meta(&snap_path, &a.id);
+            let (snap_cb_saved, snap_cb_failed, snap_cb_timeout) = meta(&snap_cb_path, &a.id);
+            // 快照可用性自检（2026-10-30）：槽位 meta.uid 与账号 uid 不一致 = 快照被别的
+            // 账号污染（实测 CodeBuddy 侧客户端回退后把 A 的登录态写进 A' 槽位）；
+            // CodeBuddy 快照还要确认 vscdb 里确实有登录令牌（登出态快照切回来必失败）。
+            let mismatch = |dir: &std::path::Path| {
+                crate::switcher::authfile::read_slot_uid(dir, &a.id)
+                    .map(|u| u != a.uid)
+                    .unwrap_or(false)
+            };
+            let snap_invalid = mismatch(&snap_path);
+            let snap_cb_invalid = mismatch(&snap_cb_path)
+                || cb_slot_missing_login(&snap_cb_path.join(&a.id));
             WorkBuddyAccountView {
                 id: a.id.clone(),
                 uid: a.uid.clone(),
@@ -200,7 +271,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 note: a.note.clone(),
                 credits_balance: a.credits_balance,
                 credits_fetched_at: a.credits_fetched_at.clone(),
-                is_current: auth_uid.is_some() && auth_uid == Some(a.uid.clone()),
+                is_current: current_uid.is_some() && current_uid == Some(a.uid.clone()),
                 has_credential: has_cred,
                 has_snapshot: has_snapshot,
                 has_snapshot_codebuddy: has_snapshot_cb,
@@ -208,6 +279,10 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 snapshot_saved_at_codebuddy_ms: snap_cb_saved,
                 snapshot_verify_failed_workbuddy_ms: snap_failed,
                 snapshot_verify_failed_codebuddy_ms: snap_cb_failed,
+                snapshot_verify_timeout_workbuddy_ms: snap_timeout,
+                snapshot_verify_timeout_codebuddy_ms: snap_cb_timeout,
+                snapshot_invalid_workbuddy: snap_invalid,
+                snapshot_invalid_codebuddy: snap_cb_invalid,
                 is_current_workbuddy: cur_wb.as_deref() == Some(a.id.as_str()),
                 is_current_codebuddy: cb_live_id.as_deref() == Some(a.id.as_str()),
                 tags: tag_map.get(&a.id).cloned().unwrap_or_default(),
@@ -1246,4 +1321,29 @@ mod tests {
             Some(1_700_000_000)
         );
     }
+}
+
+
+/// 人工清除「需重登」标记（2026-10-30）：标记由「签到/续期时 refresh 被拒」写入，
+/// 之后该账号的切换按钮会被硬禁用。现实中存在两种误判场景——标记已过期（用户已在
+/// 客户端手动登录）、或凭证其实仍可用想强行试一次——故提供显式解除入口。
+///
+/// 只清标记与原因，**不动任何凭证**：若凭证确实已失效，下一轮签到/续期会重新标记。
+#[tauri::command(async)]
+pub fn workbuddy_clear_relogin(state: State<AppState>, id: String) -> Result<(), String> {
+    let mut pool = super::common::load_pool(&state);
+    let Some(a) = pool.accounts.iter_mut().find(|a| a.id == id) else {
+        return Err(format!("账号 {id} 不在池内"));
+    };
+    if !a.needs_relogin {
+        return Ok(());
+    }
+    a.needs_relogin = false;
+    a.relogin_reason.clear();
+    super::common::save_pool(&state, &pool)?;
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!("wb: 已人工清除「需重登」标记 {id}（凭证未改动）"),
+    );
+    Ok(())
 }

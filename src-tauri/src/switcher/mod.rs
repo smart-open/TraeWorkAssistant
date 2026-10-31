@@ -1018,6 +1018,15 @@ fn switch_flow(
         }
     }
 
+    // 会话已死守卫（2026-10-30）：客户端本次启动若被服务端注销会话，会自行登出——
+    // 此时现场虽"被写过"（vscdb/auth mtime 变化），登录态其实已是空的；把当前态回写
+    // 账号槽会把该账号快照写成未登录（实测 橡皮3 槽位因此丢了 accessToken 键）。
+    // 命中时只保留 last 备份，账号槽保持原样。
+    // 仅 authfile 布局（WorkBuddy / CodeBuddy）：Trae/Qoder 的日志是 VS Code 形态，
+    // 同一批标记词可能来自无关请求，误判会白白跳过写回。
+    let live_session_dead = sess.prof.layout == Layout::Authfile
+        && authfile::client_log_says_session_dead(&sess.prof.data_dir, None);
+
     // 防误覆盖守卫：仅当桌面端检测到的当前登录（expected_uid）与标记文件一致时才
     // 回写账号槽。不一致/未检测到 = 客户端很可能已手动重登或处于未登录态，此时把
     // "当前态"刷进标记槽会把错误内容覆盖掉该账号的快照（实测 B 被覆盖根因），
@@ -1028,16 +1037,21 @@ fn switch_flow(
             // 旧逻辑只写 last、跳过账号槽，导致 X 的登录态永远存不进它自己的快照。
             // 这里在「探测到的实际登录 ≠ 标记 ≠ 本次目标」且 X 的槽位已存在时，
             // 把当前现场回写到 X 的槽位（身份来自 stop 后权威探测；未入池/无槽位仍走原跳过逻辑）。
-            let detected_slot = (!expected_uid.is_empty()
-                && expected_uid != uid
+            // 现场探测值同样拼路径写盘，先过 uid 白名单（与迁移 src 同标准），
+            // 非法值回落下方跳过分支，不再触碰文件系统
+            let detected_uid = expected_uid.trim();
+            let detected_slot = (!detected_uid.is_empty()
+                && detected_uid != uid
                 && !not_logged_in
-                && (sess.prof.profiles_dir.join(&expected_uid).is_dir()
+                && !live_session_dead
+                && crate::fs_utils::ensure_uid_safe(detected_uid).is_ok()
+                && (sess.prof.profiles_dir.join(detected_uid).is_dir()
                     || sess
                         .prof
                         .profiles_dir
-                        .join(format!("{expected_uid}.bak"))
+                        .join(format!("{detected_uid}.bak"))
                         .is_dir()))
-            .then(|| expected_uid.clone());
+            .then(|| detected_uid.to_string());
             if let Some(slot) = detected_slot {
                 backup_current(sess, &slot, sink)?;
                 sink.step(
@@ -1045,6 +1059,15 @@ fn switch_flow(
                     StepStatus::Ok,
                     &format!(
                         "检测到客户端实际登录为 {slot}（原标记为 {cur}），已把当前登录态回写到该账号槽位"
+                    ),
+                );
+            } else if live_session_dead {
+                sink.step(
+                    "backup",
+                    StepStatus::Warn,
+                    &format!(
+                        "客户端本次启动已自行登出（登录会话被服务端注销），已跳过回写账号 {cur} 的槽位\
+                         （当前态仍备份到 last）；请重新登录该账号后「保存当前登录态」"
                     ),
                 );
             } else {
@@ -1196,6 +1219,8 @@ fn switch_flow(
     set_current_account(sess, uid);
     // baseline：start 前的最新会话，供切换后身份确认只认「比它更新的会话」
     let baseline = icube::newest_session_dir(&sess.prof.data_dir);
+    // 启动锚点：切换确认只认这之后写入的客户端日志（防读到上一次运行的登出记录）
+    let launched_at = std::time::SystemTime::now();
     proc::start_app(sess, sink)?;
 
     // Trae 登录身份确认（2026-10-14 合并版实测增强）：合并版客户端启动即产生新
@@ -1256,7 +1281,7 @@ fn switch_flow(
     //（switcher.log 实测 4/4 超时）；Reverted = live 身份被客户端回退到旧账号（信号④），
     // 同样如实告知
     if sess.prof.layout == Layout::Authfile {
-        match authfile::confirm_switch(sess, uid, sink) {
+        match authfile::confirm_switch(sess, uid, sink, launched_at) {
             authfile::VerifyResult::Timeout => {
                 return done(
                     sink,

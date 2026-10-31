@@ -3,6 +3,7 @@ import {
   RefreshCw,
   Download,
   Upload,
+  Eraser,
   ScanSearch,
   Globe,
   ShieldAlert,
@@ -90,6 +91,13 @@ function tokenTone(ts: number | null): string {
   if (days < 0) return 'text-rose-500';
   if (days < 1) return 'text-amber-500';
   return 'text-emerald-600 dark:text-emerald-400';
+}
+
+/** 快照保存日（MM-DD；无则 null）——列表只显示到日，悬停 title 给完整时刻 */
+function snapDay(ms?: number | null): string | null {
+  if (ms == null) return null;
+  const d = new Date(ms);
+  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 /** chatdata_info 状态条目（id → meta / null = 查询失败降级） */
@@ -492,6 +500,17 @@ export default function BuddyAccounts() {
       pushToast('error', `导入失败：${String(err)}`);
     } finally {
       setConfirmImportBusy(false);
+    }
+  };
+
+  /** 人工清除「需重登」标记（不动凭证）：标记可能是过期误判，或用户想强行试一次切换 */
+  const handleClearRelogin = async (a: WorkBuddyAccountView) => {
+    try {
+      await api.workbuddy.clearRelogin(a.id);
+      pushToast('success', `已清除「需重登」标记：${a.nickname || a.id}（凭证未改动）`);
+      await refresh();
+    } catch (err) {
+      pushToast('error', `清除标记失败：${String(err)}`);
     }
   };
 
@@ -1048,39 +1067,51 @@ export default function BuddyAccounts() {
                         <div className="flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-zinc-500">
                           <span
                             className={
-                              a.snapshot_verify_failed_workbuddy_ms != null
-                                ? 'text-red-600 dark:text-red-400'
-                                : a.has_snapshot
-                                  ? 'text-emerald-600 dark:text-emerald-400'
-                                  : 'text-slate-300 dark:text-zinc-600'
+                              a.snapshot_verify_failed_workbuddy_ms || a.snapshot_invalid_workbuddy
+                                ? 'text-rose-500'
+                                : a.snapshot_verify_timeout_workbuddy_ms
+                                  ? 'text-amber-500'
+                                  : a.has_snapshot
+                                    ? 'text-emerald-600 dark:text-emerald-400'
+                                    : 'text-slate-300 dark:text-zinc-600'
                             }
                             title={
-                              a.snapshot_verify_failed_workbuddy_ms != null
-                                ? `WorkBuddy 快照最近一次切换未确认登录身份（${new Date(a.snapshot_verify_failed_workbuddy_ms).toLocaleString('zh-CN')}）：登录态可能已失效，请核实后重新「保存当前登录态」`
-                                : a.snapshot_saved_at_workbuddy_ms != null
-                                  ? `WorkBuddy 登录态快照，最近保存于 ${new Date(a.snapshot_saved_at_workbuddy_ms).toLocaleString('zh-CN')}`
-                                  : 'WorkBuddy 登录态快照（profiles_workbuddy）'
+                              a.snapshot_invalid_workbuddy
+                                ? '快照不可用：槽内没有有效登录态，或登录身份与该账号不符（被其它账号的登录态覆盖）；切换回来必然失败，请在客户端登录该账号后重新「保存当前登录态」'
+                                : a.snapshot_verify_failed_workbuddy_ms
+                                  ? `上次切换到 WorkBuddy 时客户端登录身份不符/发生回退（${new Date(a.snapshot_verify_failed_workbuddy_ms).toLocaleString()}）；建议重新登录后「保存当前登录态」`
+                                  : a.snapshot_verify_timeout_workbuddy_ms
+                                    ? `上次切换到 WorkBuddy 后 20 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_workbuddy_ms).toLocaleString()}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
+                                    : a.has_snapshot
+                                      ? `WorkBuddy 登录态快照保存于 ${a.snapshot_saved_at_workbuddy_ms ? new Date(a.snapshot_saved_at_workbuddy_ms).toLocaleString() : '未知时间'}`
+                                      : '没有 WorkBuddy 登录态快照'
                             }
                           >
-                            WB{a.snapshot_verify_failed_workbuddy_ms != null ? '快照⚠' : a.has_snapshot ? '快照✓' : '快照—'}
+                            WB{a.snapshot_verify_failed_workbuddy_ms || a.snapshot_invalid_workbuddy ? '快照异常' : a.snapshot_verify_timeout_workbuddy_ms ? '快照未确认' : `快照${a.has_snapshot ? ` ${snapDay(a.snapshot_saved_at_workbuddy_ms) ?? '✓'}` : '—'}`}
                           </span>
                           <span
                             className={
-                              a.snapshot_verify_failed_codebuddy_ms != null
-                                ? 'text-red-600 dark:text-red-400'
-                                : a.has_snapshot_codebuddy
-                                  ? 'text-emerald-600 dark:text-emerald-400'
-                                  : 'text-slate-300 dark:text-zinc-600'
+                              a.snapshot_verify_failed_codebuddy_ms || a.snapshot_invalid_codebuddy
+                                ? 'text-rose-500'
+                                : a.snapshot_verify_timeout_codebuddy_ms
+                                  ? 'text-amber-500'
+                                  : a.has_snapshot_codebuddy
+                                    ? 'text-emerald-600 dark:text-emerald-400'
+                                    : 'text-slate-300 dark:text-zinc-600'
                             }
                             title={
-                              a.snapshot_verify_failed_codebuddy_ms != null
-                                ? `CodeBuddy 快照最近一次切换未确认登录身份（${new Date(a.snapshot_verify_failed_codebuddy_ms).toLocaleString('zh-CN')}）：登录态可能已失效，请核实后重新「保存当前登录态」`
-                                : a.snapshot_saved_at_codebuddy_ms != null
-                                  ? `CodeBuddy 登录态快照（profiles_codebuddy，含 vscdb 登录真源），最近保存于 ${new Date(a.snapshot_saved_at_codebuddy_ms).toLocaleString('zh-CN')}`
-                                  : 'CodeBuddy 登录态快照（profiles_codebuddy，含 vscdb 登录真源）'
+                              a.snapshot_invalid_codebuddy
+                                ? '快照不可用：槽内没有有效登录态，或登录身份与该账号不符（被其它账号的登录态覆盖）；切换回来必然失败，请在客户端登录该账号后重新「保存当前登录态」'
+                                : a.snapshot_verify_failed_codebuddy_ms
+                                  ? `上次切换到 CodeBuddy 时客户端登录身份不符/发生回退（${new Date(a.snapshot_verify_failed_codebuddy_ms).toLocaleString()}）；建议重新登录后「保存当前登录态」`
+                                  : a.snapshot_verify_timeout_codebuddy_ms
+                                    ? `上次切换到 CodeBuddy 后 20 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_codebuddy_ms).toLocaleString()}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
+                                    : a.has_snapshot_codebuddy
+                                      ? `CodeBuddy 登录态快照（含 vscdb 登录真源）保存于 ${a.snapshot_saved_at_codebuddy_ms ? new Date(a.snapshot_saved_at_codebuddy_ms).toLocaleString() : '未知时间'}`
+                                      : '没有 CodeBuddy 登录态快照'
                             }
                           >
-                            CB{a.snapshot_verify_failed_codebuddy_ms != null ? '快照⚠' : a.has_snapshot_codebuddy ? '快照✓' : '快照—'}
+                            CB{a.snapshot_verify_failed_codebuddy_ms || a.snapshot_invalid_codebuddy ? '快照异常' : a.snapshot_verify_timeout_codebuddy_ms ? '快照未确认' : `快照${a.has_snapshot_codebuddy ? ` ${snapDay(a.snapshot_saved_at_codebuddy_ms) ?? '✓'}` : '—'}`}
                           </span>
                         </div>
                       </div>
@@ -1095,6 +1126,18 @@ export default function BuddyAccounts() {
                         >
                           {switching ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                         </button>
+                        {/* 需重登标记解除（2026-10-30）：标记可能是过期误判（用户已在客户端
+                            手动登录）或想强行试一次切换；只清标记不动凭证 */}
+                        {a.needs_relogin && (
+                          <button
+                            title={`清除「需重登」标记（忽略即可切换，凭证不改）${a.relogin_reason ? `\n原因：${a.relogin_reason}` : ''}`}
+                            onClick={() => void handleClearRelogin(a)}
+                            disabled={busy}
+                            className="btn-ghost !p-2 text-slate-500 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-zinc-800"
+                          >
+                            <Eraser size={14} />
+                          </button>
+                        )}
                         <button
                           title={savingLogin === a.id ? '正在保存登录态…' : '保存当前登录态（选择目标应用）'}
                           onClick={(e) => openAppMenu(a, 'save', e)}
