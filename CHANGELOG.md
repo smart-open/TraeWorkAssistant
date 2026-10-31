@@ -6,6 +6,28 @@
 
 ---
 
+## [1.6.0] · 2026-10-31 · 按模型上下文窗口设置（issue #163 / PR #165）+ 配置缓存与静态缓存修复
+
+> 合并 PR #165（feat/model-context-window）。按池注入各客户端官方支持的上下文控制入口，未设置的模型请求逐字节保持现状；另修两处会让「保存即生效 / 部署可见」失效的基础设施问题。main 分支无对应提交，本条目为本分支自管记录。
+
+### 新功能
+
+- **按模型上下文窗口设置（issue #163，PR #165）**：Trae/Qoder/WorkBuddy 三池分别提供管理面入口，保存即对下一请求生效；未设置的模型不注入任何字段，请求逐字节保持现状。
+  - **Trae 池**：按模型勾选「长上下文」，出站注入 `is_max_mode:true`——与请求侧 `-max` 后缀为或关系，受 11 模型支持表门控（表外模型 UI 显示「—」且后端拒绝），chat/completions/messages 三协议端点全覆盖。
+  - **Qoder 池**：按模型设置数值（1024 ~ 10,000,000），出站下发 `parameters.context_length`，流式与聚合路径全覆盖。
+  - **WorkBuddy 池**：客户端无请求侧上下文字段（ACP `overrideContextWindow` 仅本地预算），明确不提供、不发明行为。
+- **管理面口径澄清（issue #163）**：模型目录「默认上下文」列改名并补 tooltip，目录声明同步标注——原静态 `context_length` 展示易被误解为按模型可配置的生效值。
+
+### 修复与加固
+
+- **Qoder 400 拒绝 context_length 如实分类（issue #163）**：上游 400 报文含 context_length 信号时按业务拒绝分类，不再落入额度泛词被误判 Quota 而冷却健康账号；信封 400（HTTP 200 + statusCodeValue=400）终局处理不换号不冷却，错误信息附「清空该模型上下文长度设置」指引。
+- **config_cache 每键代际校验**：失效递增代际号、锁外加载回填前校验——迟到回填不再覆盖失效后的新值，修复「保存成功但下一请求仍读旧配置」。
+- **静态资源缓存头**：`/assets/*` 2xx 响应 `public, max-age=31536000, immutable`，其余响应（含 404）`no-store`，杜绝部署后旧 chunk 被继续引用。
+
+### 验证
+
+- `cargo test --workspace`（896 通过 0 失败）、`npx tsc --noEmit`、`npm test`（81 通过）全部通过。
+
 ## [1.5.9] · 2026-10-30 · 语义移植 main f04d495 => dfa6e02
 
 > 语义移植 main `f04d495`（不含）=> `dfa6e02`（7 提交，未 merge）。跳过桌面/OS 专属或本分支不适用内容：托盘与通知渠道系统（main.rs/notify.rs/PushPlus，含 dfa6e02 托盘 push_notify_bg 与 workbuddy push_notify 后台线程版重构——本分支 Web 化已移除桌面通知栈）、豆包存储链路（commands/doubao.rs）、桌面浏览器打开（Web 化已移除）、QoderWork 快照 .bak 回退（无 switcher 模块）、版本号 chore（本分支版本自管）。
