@@ -60,6 +60,7 @@ import type {
   LanIfaceIp,
   DispatchPolicy,
   TraeModelMeta,
+  TraeLongContextView,
   UnifiedModel,
   UsageDayView,
   CustomModel,
@@ -89,6 +90,7 @@ import type {
   UsageSessionsResult,
   TraeExpiredEntsResult,
   QoderAccountView,
+  QoderContextLengthView,
   QoderCheckinRecord,
   QoderCliStatus,
   QoderLiveLogins,
@@ -1084,6 +1086,16 @@ export const api = {
       invoke<void>('trae_model_meta_set', { model, meta }),
     // 清除人工覆盖（恢复自动来源链）；返回是否确有删除
     metaClear: (model: string) => invoke<boolean>('trae_model_meta_clear', { model }),
+    // Trae 长上下文开关（kv trae_long_context，仅 Trae 池；勾选即对下一请求生效）
+    traeLongContextList: () => invoke<TraeLongContextView>('trae_long_context_list'),
+    // 返回生效状态；模型不支持长上下文时开启被拒绝
+    traeLongContextSet: (model: string, enabled: boolean) =>
+      invoke<boolean>('trae_long_context_set', { model, enabled }),
+    // Qoder 上下文长度（kv qoder_context_length，仅 Qoder 池；保存即对下一请求生效）
+    qoderContextLengthList: () => invoke<QoderContextLengthView>('qoder_context_length_list'),
+    // tokens 为 null/0 = 清除（恢复跟随上游）；返回生效值（清除 → null），越界整体拒绝
+    qoderContextLengthSet: (model: string, tokens: number | null) =>
+      invoke<number | null>('qoder_context_length_set', { model, tokens }),
     // T2：多 API Key 管理（统一列表，无主/子之分）
     keysList: () => invoke<ApiKeysFileView>('api_keys_list'),
     // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）

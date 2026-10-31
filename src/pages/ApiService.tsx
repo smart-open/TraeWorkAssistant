@@ -95,6 +95,17 @@ export default function ApiService() {
   // metaGet 回填中（issue #146）：回填完成前禁用表单与保存/清除按钮，
   // 防止用户基于残留/空表单提前保存、或输入被异步回填覆盖
   const [loadingMeta, setLoadingMeta] = useState(false);
+  // 长上下文开关（kv trae_long_context，仅 Trae 池；与 Qoder 页的上下文长度互不影响）：
+  // 已开启模型的 canonical id 集合；null = 未加载（开关禁用，避免基于空表误操作）
+  const [longCtx, setLongCtx] = useState<Set<string> | null>(null);
+  const [savingLongCtx, setSavingLongCtx] = useState<string | null>(null);
+  // 在途镜像 ref（审查修复）：loadModels 的整表回填不得回退在途 toggle 的函数式回填
+  // ——state 闭包值在 useCallback 中恒为挂载时旧值，守卫须读 ref 实时值
+  const savingLongCtxRef = useRef<string | null>(null);
+  // 快照序号（审查修复 TOCTOU）：toggle 落库成功时递增，使「先发出、toggle 落库
+  // 后才返回」的旧整表快照失效——ref 镜像只覆盖「快照返回时 toggle 在途」，
+  // 不覆盖该反向时序（快照返回时 ref 已清空，旧值会覆盖刚勾选的项）
+  const longCtxSeq = useRef(0);
 
   useEffect(() => {
     void refreshAccounts();
@@ -123,6 +134,17 @@ export default function ApiService() {
       try {
         const list = await withMinDelay(api.apiServer.unifiedModels(), 250);
         setModels(list.filter((m) => m.sources.some((s) => s.pool === 'trae')));
+        // 长上下文开关随目录刷新（失败保留旧值，不影响目录展示）；
+        // 在途 toggle 期间跳过整表覆盖（审查修复：防旧快照回退刚勾选的项）；
+        // 快照发起时记录序号，返回时若期间已有 toggle 落库则本次快照作废（TOCTOU）
+        const lcSeq = longCtxSeq.current;
+        const lc = await api.apiServer.traeLongContextList().catch(() => null);
+        if (lc && lcSeq === longCtxSeq.current)
+          setLongCtx((prev) => (savingLongCtxRef.current ? prev : new Set(lc.enabled)));
+        else if (lc === null && longCtx === null)
+          // 审查 Low：首次加载失败时开关列整列禁用（longCtx===null），静默禁用
+          // 让用户无从知晓原因 → 提示一次；已有旧值的手动刷新失败不打扰
+          toast('error', '长上下文开关状态加载失败，开关暂不可用');
       } catch {
         // 初始化失败静默保留空列表；手动点击刷新失败需给出提示
         if (manual) toast('error', '加载模型目录失败，请重试');
@@ -130,7 +152,7 @@ export default function ApiService() {
         setLoadingModels(false);
       }
     },
-    [toast],
+    [toast, longCtx],
   );
 
   // 同步官网模型（models_sync 沿用现有调用）；L1 人工覆盖层不受同步影响
@@ -327,6 +349,43 @@ export default function ApiService() {
       toast('error', `保存账号池失败：${String(err)}`);
     } finally {
       setSavingPool(false);
+    }
+  };
+
+  // ---- 长上下文开关（仅 Trae 池，勾选即保存、对下一请求生效） ----
+  // 以后端返回的生效状态回填；失败保持原勾选状态并提示
+  const toggleLongCtx = async (model: string, enabled: boolean) => {
+    const id = model.trim().toLowerCase();
+    setSavingLongCtx(id);
+    savingLongCtxRef.current = id;
+    try {
+      const on = await withMinDelay(api.apiServer.traeLongContextSet(model, enabled), 250);
+      // 快照序号失效（审查修复 TOCTOU）：服务端已按本次 toggle 变更，发出早于
+      // 此刻的整表快照不再可信；失败路径不改服务端状态，无需递增
+      longCtxSeq.current += 1;
+      setLongCtx((prev) => {
+        const next = new Set(prev ?? []);
+        if (on) next.add(id);
+        else next.delete(id);
+        return next;
+      });
+      toast('success', on ? `${model} 已开启长上下文` : `${model} 已恢复跟随上游`);
+      // 快照期其他端变更收敛（审查修复）：本端乐观回填只是瞬时态，后台重拉整表
+      // 并按快照序号守卫回填（与 loadModels 同语义），其他端在 toggle 期间的变更
+      // 即时收敛；失败静默（乐观回填已生效，下次进入页面/手动刷新仍有兜底）
+      const seq = longCtxSeq.current;
+      void api.apiServer
+        .traeLongContextList()
+        .then((lc) => {
+          if (seq === longCtxSeq.current)
+            setLongCtx((prev) => (savingLongCtxRef.current ? prev : new Set(lc.enabled)));
+        })
+        .catch(() => {});
+    } catch (e) {
+      toast('error', `保存失败：${String(e)}`);
+    } finally {
+      setSavingLongCtx(null);
+      savingLongCtxRef.current = null;
     }
   };
 
@@ -950,7 +1009,18 @@ export default function ApiService() {
                     <th className="pb-2 pr-3 font-medium">厂商</th>
                     <th className="pb-2 pr-3 text-right font-medium">倍率</th>
                     <th className="pb-2 pr-3 font-medium">思考档位</th>
-                    <th className="pb-2 pr-3 text-right font-medium">上下文</th>
+                    <th
+                      className="pb-2 pr-3 text-right font-medium"
+                      title="上游默认档：未开启「长上下文」时实际使用的上下文长度。开启后改走 1M 档，本列数值不随开关变化"
+                    >
+                      默认上下文
+                    </th>
+                    <th
+                      className="pb-2 pr-3 text-center font-medium"
+                      title="开启 = 该模型经 Trae 池的请求以长上下文模式发出；关闭 = 跟随上游。仅对 Trae 池生效，勾选即保存"
+                    >
+                      长上下文
+                    </th>
                     <th className="pb-2 pr-3 text-center font-medium">图片</th>
                     <th className="pb-2 text-right font-medium">操作</th>
                   </tr>
@@ -959,6 +1029,8 @@ export default function ApiService() {
                   {models.map((m) => {
                     const traeDisabled =
                       m.sources.find((s) => s.pool === 'trae')?.disabled === true;
+                    const ctxId = m.id.trim().toLowerCase();
+                    const ctxOn = longCtx?.has(ctxId) === true;
                     return (
                     <tr
                       key={m.id}
@@ -977,7 +1049,7 @@ export default function ApiService() {
                         {m.max_mode && (
                           <sup
                             className="ml-0.5 font-sans text-[9px] font-bold leading-none text-amber-500 dark:text-amber-400"
-                            title="支持 Max Mode（1M 上下文）"
+                            title="支持 Max Mode（1M 上下文）——默认请求不启用：需模型 ID 加 -max 后缀，或勾选「长上下文」"
                           >
                             Max
                           </sup>
@@ -1006,6 +1078,29 @@ export default function ApiService() {
                       </td>
                       <td className="py-2 pr-3 text-right tabular-nums text-xs text-slate-500 dark:text-zinc-400">
                         {m.context_length != null ? `${Math.round(m.context_length / 1000)}k` : '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-center text-xs">
+                        {m.max_mode ? (
+                          savingLongCtx === ctxId ? (
+                            <Spinner />
+                          ) : (
+                            <input
+                              type="checkbox"
+                              className="h-3.5 w-3.5 cursor-pointer rounded border-slate-300 text-brand-600 focus:ring-brand-500 disabled:cursor-not-allowed"
+                              checked={ctxOn}
+                              disabled={longCtx === null || savingLongCtx !== null}
+                              title={ctxOn ? '已开启长上下文（取消勾选 = 跟随上游）' : '跟随上游（勾选开启长上下文）'}
+                              onChange={(e) => void toggleLongCtx(m.id, e.target.checked)}
+                            />
+                          )
+                        ) : (
+                          <span
+                            className="text-slate-300 dark:text-zinc-600"
+                            title="该模型不支持长上下文，始终跟随上游"
+                          >
+                            —
+                          </span>
+                        )}
                       </td>
                       <td className="py-2 pr-3 text-center text-xs">
                         {m.supports_image === true ? (
@@ -1131,7 +1226,12 @@ export default function ApiService() {
             </div>
           </div>
           <div>
-            <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">上下文长度</label>
+            <label
+              className="mb-1 block text-xs text-slate-500 dark:text-zinc-400"
+              title="目录声明：只影响展示，不改变实际请求。需要更长的上下文请用目录表的「长上下文」开关"
+            >
+              上下文长度（目录声明）
+            </label>
             <input
               className={metaInputCls}
               type="number"
@@ -1142,6 +1242,9 @@ export default function ApiService() {
               placeholder="如 1000000"
               disabled={loadingMeta}
             />
+            <p className="mt-1 text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+              只影响展示，不改变实际请求；需要更长的上下文请勾选目录表的「长上下文」
+            </p>
           </div>
           <div>
             <label className="mb-1 block text-xs text-slate-500 dark:text-zinc-400">max_tokens</label>

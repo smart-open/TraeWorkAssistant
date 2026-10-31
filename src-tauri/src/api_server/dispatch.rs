@@ -219,7 +219,7 @@ pub fn save_policy(data_dir: &Path, policy: &DispatchPolicy) -> Result<(), Strin
 // ==================== 选池决策（§4.3/§4.4） ====================
 
 /// 调度错误（错误矩阵 §4.3，由端点按客户端协议映射响应格式）
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DispatchError {
     /// 仅 Buddy 源模型且 wb_enabled=false（保持现有 wb_upstream_disabled 语义）
     WbDisabled,
@@ -236,6 +236,14 @@ pub enum DispatchError {
     ModelCooling(i64, TargetPool),
     /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却
     NoHealthy(TargetPool),
+    /// 池耗尽提前终止 + 主选池循环耗尽（issue #159 归因增强，合并审查 Medium
+    /// 修复）：附带本轮实际候选序——503 归因注记「前置池因模型冷却被跳过」
+    /// 必须按实际序判断，按 POOL_FIXED_ORDER 硬编码在前缀锁定/Key 绑定/
+    /// per_model 场景会虚假归因（不在候选序里的池被注记 skipped）或漏归因
+    /// （真实前置池不在固定序前缀里）。两处构造点同在 resolve_target ④ 段
+    /// order 变量作用域（提前终止在循环迭代借用中需 clone，循环尾 move），
+    /// 零重算成本
+    NoHealthyWithOrder(TargetPool, Vec<TargetPool>),
 }
 
 /// 选池结果
@@ -868,7 +876,12 @@ pub fn resolve_target(
                             .unwrap_or(0) as i64;
                             DispatchError::ModelCooling(secs, TargetPool::Qoder)
                         }
-                        (p, _) => DispatchError::NoHealthy(p),
+                        // 审查修复：提前终止路径同样携带实际候选序——普通
+                        // NoHealthy 会让 routes 层回退 POOL_FIXED_ORDER 硬编码序，
+                        // Key 绑定（如 bind=qoder 序 [Qoder,Buddy,Trae]）/per_model
+                        // 场景下固定序前置池被虚假注记 skipped、真实前置池漏注记
+                        // （order 处于循环迭代借用中，此处只能 clone）
+                        (p, _) => DispatchError::NoHealthyWithOrder(p, order.clone()),
                     });
                 }
                 if fallback_from.is_none() {
@@ -881,10 +894,14 @@ pub fn resolve_target(
     // 循环内 !can_fallback 提前终止并落同款归因日志（issue #136）。落盘调度
     // 日志便于排查轮询异常（issue #30：凭证调度可观测，含 Key 展示名）
     log_dispatch_exhausted(state, model, key_id, preferred, &pool_reasons);
-    Err(DispatchError::NoHealthy(
-        // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
-        // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）
-        forced_pool.or(preferred).unwrap_or(TargetPool::Trae),
+    // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
+    // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）。
+    // 携带实际候选序（NoHealthyWithOrder）供 503 注记按真实序归因
+    Err(DispatchError::NoHealthyWithOrder(
+        // 审查修复：能走到循环尾说明零可用源（有可用池失败必在循环内
+        // !can_fallback 提前终止），preferred 恒为 None，死防御 .or(preferred) 移除
+        forced_pool.unwrap_or(TargetPool::Trae),
+        order,
     ))
 }
 
@@ -1493,6 +1510,8 @@ mod tests {
     }
 
     /// 锁定池无该模型源/池耗尽 → NoHealthy(锁定池)，不回退其他池、不误报 Trae
+    ///（主选循环耗尽现统一走 NoHealthyWithOrder 携带实际候选序——前缀锁定 = 单池
+    /// [锁定池]，503 注记侧无前置池可归因，行为不变）
     #[test]
     fn t90_prefix_unavailable_source_errors_locked_pool() {
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
@@ -1500,7 +1519,7 @@ mod tests {
         f.seed_healthy(false);
         assert_eq!(
             f.resolve("qoder/glm-5.3").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Qoder)
+            DispatchError::NoHealthyWithOrder(TargetPool::Qoder, vec![TargetPool::Qoder])
         );
     }
 
@@ -1616,15 +1635,16 @@ mod tests {
             &f.dir,
             serde_json::from_value(json!({
                 "name": "glm-5.3",
-                "base_url": "https://custom.example.invalid",
-                "enabled": true,
-                // 显式唯一 id：upsert 仅在 id 为空时按时间戳生成，并行测试同时间片
-                // 可能撞键（进程级全局熔断表按 id 键控）→ 显式 id 隔离熔断状态
-                "id": "cm-wlfix00000001"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+                "base_url": "https://custom.example.invalid",
+                "enabled": true,
+                // 显式唯一 id：upsert 仅在 id 为空时按时间戳生成，并行测试同时间片
+                // 可能撞键（进程级全局熔断表按 id 键控）→ 显式 id 隔离熔断状态
+                "id": "cm-wlfix00000001"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
         let cm_id = list[0].id.clone();
         // 两个 Key 均须在首次 resolve 前种入：constraints_for 经 KEYS_STATE
         // 首读固化内存副本，其后 seed 的 Key 不可见（bind 丢失走默认候选序）
@@ -1706,7 +1726,7 @@ mod tests {
         super::super::custom_lb::note_circuit_failure(&list[0].id, super::super::custom_lb::FailKind::Server);
         assert_eq!(
             f.resolve_no_session("custom/glm-5.3").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Custom)
+            DispatchError::NoHealthyWithOrder(TargetPool::Custom, vec![TargetPool::Custom])
         );
         super::super::custom_lb::clear_circuit(&list[0].id);
     }
@@ -1951,14 +1971,14 @@ mod tests {
         assert_eq!(f.resolve("hy4").unwrap_err(), DispatchError::WbDisabled);
     }
 
-    /// 仅 Buddy 源 + Buddy 池耗尽 → 503 语义（NoHealthy），不跨池回退
+    /// 仅 Buddy 源 + Buddy 池耗尽 → 503 语义（NoHealthyWithOrder），不跨池回退
     #[test]
     fn t12_buddy_only_exhausted_errors() {
         let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
         f.seed_healthy(true); // Trae 池健康但非双源，不得回退
         assert_eq!(
             f.resolve("hy4").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Buddy)
+            DispatchError::NoHealthyWithOrder(TargetPool::Buddy, POOL_FIXED_ORDER.to_vec())
         );
     }
 
@@ -2000,7 +2020,7 @@ mod tests {
         f.seed_healthy(false); // Buddy 池健康但非双源
         assert_eq!(
             f.resolve("Doubao-Seed-Evolving").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Trae)
+            DispatchError::NoHealthyWithOrder(TargetPool::Trae, POOL_FIXED_ORDER.to_vec())
         );
     }
 
@@ -2013,7 +2033,52 @@ mod tests {
         f.seed_healthy(true); // Trae 池健康，但 fallback 关闭
         assert_eq!(
             f.resolve("glm-5.3").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Buddy)
+            // 审查修复：错误携带实际候选序。glm-5.3 双源（≥2）且默认 Smart 策略
+            // → smart 重排后的实际候选序非 POOL_FIXED_ORDER；Qoder 无源
+            // unavailable 跳过，Buddy 有源但池空且 fallback 关 → 在 Buddy 提前
+            // 终止（健康的 Trae 不被越过，正是本测试要锁的语义）
+            DispatchError::NoHealthyWithOrder(
+                TargetPool::Buddy,
+                vec![
+                    TargetPool::Qoder,
+                    TargetPool::Buddy,
+                    TargetPool::BuddyAi,
+                    TargetPool::Trae,
+                    TargetPool::Custom,
+                ]
+            )
+        );
+    }
+
+    /// 审查修复回归：池耗尽提前终止同样携带实际候选序（NoHealthyWithOrder）——
+    /// per_model 自定义序 [buddy-ai, trae] 下：BuddyAi 源缺失跳过 → Trae 池空
+    /// 但后继 Buddy 有源（can_fallback 成立）→ 回退 Buddy → Buddy 也空且后继
+    /// [Qoder, Custom] 零可用源 → 在 Buddy 提前终止（非循环尾耗尽），错误须附
+    /// 真实序。旧实现回退普通 NoHealthy → routes 层按 POOL_FIXED_ORDER 硬编码
+    /// 序归因，真实序前置池的冷却会被漏注记（归因序与真实序错位）
+    #[test]
+    fn t16b_early_terminate_carries_real_order() {
+        let mut p = policy_default();
+        p.per_model.insert(
+            "glm-5.3".into(),
+            vec!["buddy-ai".into(), "trae".into()],
+        );
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        assert_eq!(
+            f.resolve("glm-5.3").unwrap_err(),
+            DispatchError::NoHealthyWithOrder(
+                // 提前终止发生在首个「有源但无后继可用源」的失败池 = Buddy
+                TargetPool::Buddy,
+                // per_model [buddy-ai, trae] + 尾部按 POOL_FIXED_ORDER 补全
+                // （Buddy 不在 per_model 序中，补全时排在 Trae 之后）
+                vec![
+                    TargetPool::BuddyAi,
+                    TargetPool::Trae,
+                    TargetPool::Buddy,
+                    TargetPool::Qoder,
+                    TargetPool::Custom,
+                ]
+            )
         );
     }
 
@@ -2539,7 +2604,16 @@ mod tests {
         f2.seed_key("k1", "trae", &[]);
         assert_eq!(
             f2.resolve_key("glm-5.3", "k1").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Trae)
+            DispatchError::NoHealthyWithOrder(
+                TargetPool::Trae,
+                vec![
+                    TargetPool::Trae,
+                    TargetPool::Buddy,
+                    TargetPool::Qoder,
+                    TargetPool::BuddyAi,
+                    TargetPool::Custom,
+                ]
+            )
         );
     }
 
@@ -2561,7 +2635,7 @@ mod tests {
         f2.seed_key("k1", "buddy", &["b2"]);
         assert_eq!(
             f2.resolve_key("glm-5.3", "k1").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Buddy)
+            DispatchError::NoHealthyWithOrder(TargetPool::Buddy, POOL_FIXED_ORDER.to_vec())
         );
     }
 
@@ -2621,6 +2695,32 @@ mod tests {
     }
 
     // ---------- issue #29 调度失败可观测性 ----------
+
+    /// issue #159：NoHealthy 归因「前置候选池因模型级冷却被跳过」——buddy 池
+    /// 已启用且同名模型在冷却表内时，503 消息显式携带 buddy skipped 注记
+    #[test]
+    fn t39b_no_healthy_detail_attributes_model_cooldown_skip() {
+        let f = fixture(&[], None, None);
+        let view = super::super::wb_route::WbView::wb(f.state.clone());
+        // 渐进退避路径：无消息 → 模型冷却 10s（足以触发归因注记）
+        super::super::wb_route::note_model_failure_ex(&view, "hy4", None);
+        let msg = super::super::routes::no_healthy_detail_with_model(
+            &f.state,
+            TargetPool::Trae,
+            "anonymous",
+            Some("hy4"),
+            // None = 无实际候选序上下文，注记回退 POOL_FIXED_ORDER（Buddy 在 Trae 前）
+            None,
+        );
+        assert!(
+            msg.contains("buddy skipped: model_cooldown remaining="),
+            "{msg}"
+        );
+        // 无模型上下文（旧包装口径）不追加归因
+        let plain =
+            super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "anonymous");
+        assert!(!plain.contains("skipped:"), "{plain}");
+    }
 
     /// NoHealthy 详情（修复2）：匿名/未知 Key 仅报池健康数，不编造约束细节
     #[test]
@@ -2708,7 +2808,10 @@ mod tests {
         // trae 有源但 Key 作用域空集 → no_healthy_account；无源池 → unavailable
         // → 无更多回退目标，提前终止归因 trae
         let r = f.resolve_key("glm-5.3", "k1");
-        assert!(matches!(r, Err(DispatchError::NoHealthy(TargetPool::Trae))), "{r:?}");
+        assert!(
+            matches!(r, Err(DispatchError::NoHealthyWithOrder(TargetPool::Trae, _))),
+            "{r:?}"
+        );
         assert!(
             f.app_log_contains("dispatch exhausted: model=glm-5.3 key=k1"),
             "应落逐池归因日志"
@@ -2902,7 +3005,7 @@ mod tests {
         );
     }
 
-    /// 仅 Qoder 源 + 池耗尽 → 503 语义 NoHealthy(Qoder)，不回退 Buddy/Trae
+    /// 仅 Qoder 源 + 池耗尽 → 503 语义 NoHealthyWithOrder(Qoder)，不回退 Buddy/Trae
     #[test]
     fn t42_qoder_only_exhausted_errors() {
         let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
@@ -2912,7 +3015,7 @@ mod tests {
         // 池空 = 无健康账号（单源不跨池回退）
         assert_eq!(
             f.resolve("MiniMax-M2.7").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Qoder)
+            DispatchError::NoHealthyWithOrder(TargetPool::Qoder, POOL_FIXED_ORDER.to_vec())
         );
     }
 

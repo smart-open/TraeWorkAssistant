@@ -1,0 +1,7 @@
+# 该文件 HEAD blob 为 CRLF 存储（全仓唯一 CRLF 文本文件，经全量 blob 扫描确认）。
+# 本机 core.autocrlf=true（以及任何 text=auto 处理）会在 add 时把磁盘 CRLF
+# 归一化为 LF 入库，造成全文件 diff、blame 断裂与后续合并噪音——显式禁用
+# 该路径的行尾转换，保持与 HEAD 字节一致。
+# 其余文本文件 HEAD blob 均为 LF，维持默认处理（autocrlf 入库归一为 LF 正确）；
+# 图标等二进制由 git 二进制检测自动豁免；新增 CRLF-blob 文本文件时需在此追加。
+src-tauri/src/api_server/dispatch.rs -text

@@ -751,6 +751,23 @@ export interface TraeModelMeta {
   enabled?: boolean | null;
 }
 
+/** Trae 长上下文开关（kv trae_long_context；trae_long_context_list）。仅 Trae 池生效，
+ *  与 Qoder 上下文长度分表存储、互不影响；未列出的模型 = 跟随上游 */
+export interface TraeLongContextView {
+  /** 已开启长上下文的模型（canonical_id） */
+  enabled: string[];
+}
+
+/** Qoder 上下文长度（kv qoder_context_length；qoder_context_length_list）。仅 Qoder 池生效，
+ *  请求体下发 parameters.context_length；未列出的模型 = 跟随上游（不下发字段） */
+export interface QoderContextLengthView {
+  /** 已设置条目（model 为 canonical_id） */
+  items: { model: string; tokens: number }[];
+  /** 合法区间（token，含端点） */
+  min: number;
+  max: number;
+}
+
 /** 模型选项：id = 上游 config_name，label = 官方展示名 */
 export interface ModelOption {
   id: string;

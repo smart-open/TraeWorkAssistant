@@ -577,6 +577,40 @@ pub fn apply_flash_free_override(entry: &mut Value, enabled: bool) {
     }
 }
 
+/// 条目副本上的上下文长度目标键（网关内部键，不进上游 model_config / 目录）：
+/// prepare_qoder_body 读取后写入 `parameters.context_length`
+pub const CONTEXT_TARGET_KEY: &str = "contextLengthTarget";
+
+/// 上下文长度覆盖（Qoder 页单模型设置，api_server::context_window::qoder_target）：
+/// 只改调用方持有的条目副本；None = 未设置，条目不变（请求体零变化）。
+/// 对冲路径克隆条目即随带，无需另行传参
+pub fn apply_context_override(entry: &mut Value, target: Option<u64>) {
+    if let (Some(n), Some(object)) = (target, entry.as_object_mut()) {
+        object.insert(CONTEXT_TARGET_KEY.to_string(), Value::from(n));
+    }
+}
+
+/// 上游 400 且本请求带了上下文长度覆盖 → 错误信息尾部追加恢复指引（否则空串）。
+/// 上游档位白名单未知，覆盖值不被接受时 400 是最可能的表现，须让调用方看得出原因。
+/// 审查修复：加正文信号校验（与下方 ③' 分类同口径）——仅当响应正文提及
+/// context_length 相关字样才附指引，避免与覆盖无关的 400 被误导去清设置；
+/// 信封层消费方（envelope_context_reject）据 hint 非空把 Unknown 400 从轮换
+/// 改终局，无信号校验会放大该终局面。代价：上游真实参数拒绝但不点名字段时
+/// 丢指引（此时上游原文仍完整透传），属可接受权衡
+pub fn context_override_hint(entry: &Value, status: u16, body: &str) -> String {
+    match entry.get(CONTEXT_TARGET_KEY).and_then(Value::as_u64) {
+        Some(n)
+            if status == 400 && CONTEXT_PARAM_SIGNALS.iter().any(|s| body.contains(s)) =>
+        {
+            format!(
+                "（本请求按 Qoder 页设置下发了 parameters.context_length={n}；若上游不接受该值，\
+                 请在 Qoder 资源调度页清空该模型的上下文长度，恢复跟随上游）"
+            )
+        }
+        _ => String::new(),
+    }
+}
+
 /// [`resolve`] + 免费活动覆盖一步到位（取号豁免/预检口径统一走此入口）
 pub fn resolve_overridden(model_id: &str, region: QoderRegion, flash_free: bool) -> Option<Value> {
     let mut entry = resolve(model_id, region)?;
@@ -861,6 +895,9 @@ const AUTH_CODES: &[&str] = &["105"];
 const QUOTA_CODES: &[&str] =
     &["110", "112", "113", "114", "115", "116", "117", "118", "119", "122"];
 
+/// 上下文长度参数的正文特征（小写比对；contextlength 覆盖 camelCase 字段名）
+const CONTEXT_PARAM_SIGNALS: &[&str] = &["context_length", "contextlength", "context length"];
+
 /// 嵌套 JSON 的钻取深度上限（防病态输入下的环；实测两层就到底）
 const SIGNAL_SCAN_DEPTH: usize = 5;
 
@@ -1066,6 +1103,18 @@ pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
     }
     if status == 429 {
         return ClassifiedError::new(UpstreamKind::Rate, "请求过于频繁，请稍后重试", None);
+    }
+    // ③' 上下文参数被拒（400 + 正文点名 context_length）：前置于额度泛词——
+    // "context_length exceeded the model limit" 含 "exceeded" 会被误判 Quota，
+    // 健康账号被 HardCredit 冷却到次日 04:00，且路由层「上下文被拒」终局分支
+    // （仅接 Unknown）永不命中。排队/鉴权/额度业务码与 401/429 已在上方先判，
+    // 不会被吞；仅限 400，403 等仍走原链
+    if status == 400 && CONTEXT_PARAM_SIGNALS.iter().any(|signal| body.contains(signal)) {
+        return ClassifiedError::new(
+            UpstreamKind::Unknown,
+            "上游拒绝了上下文长度参数（context_length）",
+            None,
+        );
     }
     // ④ 额度关键词 / 定价页链接（蓝本判定链；401/429 已前置特判，
     // 此处只兜 403/4xx 正文携带额度语义的形态）
@@ -2403,7 +2452,7 @@ pub fn prepare_qoder_body(
         .or_else(|| peek.get("user").and_then(Value::as_str))
         .map(|s| s.chars().take(128).collect::<String>())
         .or_else(|| first_user_fingerprint(&messages));
-    let body = build_upstream_body(
+    let mut body = build_upstream_body(
         model_key,
         &config,
         &messages,
@@ -2413,6 +2462,13 @@ pub fn prepare_qoder_body(
         user_id,
         session_seed.as_deref(),
     );
+    // 上下文档位（官方客户端 `parameters.context_length` 数值字段，不选不发）：
+    // 仅条目带覆盖目标时插入，未设置时请求体与改造前一致
+    if let Some(n) = entry.get(CONTEXT_TARGET_KEY).and_then(Value::as_u64) {
+        if let Some(params) = body.get_mut("parameters").and_then(Value::as_object_mut) {
+            params.insert("context_length".to_string(), Value::from(n));
+        }
+    }
     serde_json::to_vec(&body).map_err(|e| format!("Qoder 请求体序列化失败: {e}"))
 }
 
@@ -3366,6 +3422,62 @@ mod tests {
         assert_eq!(v["parameters"]["max_tokens"], MAX_OUTPUT_TOKENS);
         assert_eq!(v["chat_context"]["text"], "你好世界");
         assert_eq!(v["business"]["name"], "你好世界");
+    }
+
+    /// 上下文窗口覆盖：设置 → parameters.context_length；未设置 → 请求体除随机
+    /// id/时间戳外与改造前一致；覆盖键不泄漏进上游 model_config
+    #[test]
+    fn context_override_injects_parameters_only_when_set() {
+        let peek = json!({
+            "model": "Qwen3.8Flash",
+            "session_id": "s-1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        });
+        // 去掉每次构造必变的字段（uuid / 时间戳），其余逐字段比较
+        let stable = |bytes: Vec<u8>| {
+            let mut v: Value = serde_json::from_slice(&bytes).unwrap();
+            let obj = v.as_object_mut().unwrap();
+            obj.remove("request_id");
+            obj.remove("business");
+            v
+        };
+        let base = stable(prepare_qoder_body(&peek, &catalog_entry(), "u-1").unwrap());
+        assert!(base["parameters"].get("context_length").is_none(), "未设置不下发");
+
+        let mut unset = catalog_entry();
+        apply_context_override(&mut unset, None);
+        assert_eq!(unset, catalog_entry(), "None 不改条目");
+        assert_eq!(stable(prepare_qoder_body(&peek, &unset, "u-1").unwrap()), base);
+
+        let mut set = catalog_entry();
+        apply_context_override(&mut set, Some(1_000_000));
+        let got = stable(prepare_qoder_body(&peek, &set, "u-1").unwrap());
+        assert_eq!(got["parameters"]["context_length"], 1_000_000);
+        assert_eq!(got["parameters"]["enable_thinking"], true, "既有参数保留");
+        assert!(got["model_config"].get(CONTEXT_TARGET_KEY).is_none());
+        // 仅 parameters 多一个字段，其余不变
+        assert!(context_override_hint(&set, 400, "context_length out of range")
+            .contains("context_length=1000000"));
+        // 审查修复：正文无 context_length 信号的 400 不附指引（避免无关 400 被误导清设置）
+        assert_eq!(
+            context_override_hint(&set, 400, "unrelated invalid request"),
+            "",
+            "无信号 400 不附指引"
+        );
+        assert_eq!(
+            context_override_hint(&set, 404, "context_length out of range"),
+            "",
+            "非 400 不附指引"
+        );
+        assert_eq!(
+            context_override_hint(&unset, 400, "context_length out of range"),
+            "",
+            "未设置不附指引"
+        );
+        let mut got_rest = got.clone();
+        got_rest["parameters"].as_object_mut().unwrap().remove("context_length");
+        assert_eq!(got_rest, base);
     }
 
     #[test]

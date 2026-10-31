@@ -707,7 +707,10 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
             Err(e) => {
                 // 传输层掐断捕获（聚合侧补齐，口径同流式侧 take_read_error）：
                 // 仅 !saw_done 且无业务错误时留存哨兵，交 aggregate/aggregate_text
-                // 上抛；其余读错误维持折叠语义
+                // 上抛；其余读错误维持折叠语义。移植注记：main 侧（PR #162）封装了
+                // read_cut_error(&io::Error) -> (i64, String) 助手调用；本侧未移植
+                // 该助手，沿用既有 read_error 延迟上抛模式（循环尾统一
+                // TRANSPORT_CUT_CODE），两者语义等价
                 if !saw_done && out.error_info.is_none() {
                     let text = e.to_string();
                     if super::is_transport_cut_text(&text) {
@@ -1366,6 +1369,11 @@ pub fn aggregate_anthropic<R: Read + Send>(
         let line = match line {
             Ok(l) => l,
             Err(e) => {
+                // 口径同 collect_plain（is_transport_cut_text 门控）：完成前断流
+                // 留存传输掐断特征读错误（read_error，循环尾统一上抛哨兵），不把
+                // 截断的 Anthropic message 当成功交付；其余读错误维持折叠语义。
+                // 移植注记：main 侧以 read_cut_error 助手封装同款逻辑，本侧为
+                // 内联写法（无独立助手），语义等价
                 if !saw_done && error_info.is_none() {
                     let text = e.to_string();
                     if super::is_transport_cut_text(&text) {
@@ -1877,6 +1885,70 @@ mod tests {
         let joined = collect_events(rx).join("\n");
         assert!(joined.contains("hi"), "output 文本应已转发");
         assert!(joined.ends_with("data: [DONE]"));
+    }
+
+    // ==================== 非流式聚合断流（issue #158 同族缺口）====================
+
+    #[test]
+    fn nonstream_partial_transport_cut_discards_response() {
+        let reader = CutAfterReader {
+            data: b"event: output\ndata: {\"response\":\"partial\"}\n\n".to_vec(),
+            pos: 0,
+            err: "http2 stream error RST_STREAM",
+        };
+        let (resp, err) = aggregate(reader, "c1", None);
+        assert!(resp.is_none(), "截断的部分响应必须丢弃，不得当成功交付");
+        let (code, msg) = err.expect("断流必须转错误通道");
+        assert_eq!(code, crate::api_server::TRANSPORT_CUT_CODE);
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(
+            !crate::api_server::is_empty_completion(code, &msg),
+            "传输掐断不得计入空完成指纹口径"
+        );
+    }
+
+    #[test]
+    fn nonstream_zero_content_transport_cut_is_not_empty_completion() {
+        let reader = CutAfterReader {
+            data: b": keepalive\n\n".to_vec(),
+            pos: 0,
+            err: "connection reset by peer",
+        };
+        let (resp, err) = aggregate(reader, "c1", None);
+        assert!(resp.is_none());
+        let (code, msg) = err.expect("零内容断流也必须上抛哨兵");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(
+            !crate::api_server::is_empty_completion(code, &msg),
+            "网络掐断不得误判为影子风控空完成"
+        );
+    }
+
+    #[test]
+    fn nonstream_done_then_read_error_keeps_complete_response() {
+        let reader = CutAfterReader {
+            data: b"event: output\ndata: {\"response\":\"complete\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n".to_vec(),
+            pos: 0,
+            err: "http2 stream error RST_STREAM",
+        };
+        let (resp, err) = aggregate(reader, "c1", None);
+        assert!(err.is_none(), "已收到 done 后的连接收尾错误不得推翻完整响应");
+        let resp = resp.expect("完整响应应正常返回");
+        assert_eq!(resp["choices"][0]["message"]["content"], "complete");
+    }
+
+    #[test]
+    fn nonstream_anthropic_partial_transport_cut_discards_message() {
+        let reader = CutAfterReader {
+            data: b"event: output\ndata: {\"response\":\"partial\"}\n\n".to_vec(),
+            pos: 0,
+            err: "http2 stream error RST_STREAM",
+        };
+        let (resp, err) = aggregate_anthropic(reader, "msg_1", "m", None);
+        assert!(resp.is_none(), "截断的 Anthropic message 必须丢弃");
+        let (code, msg) = err.expect("断流必须转错误通道");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
     }
 
     // ==================== 非流式聚合 tool_calls 合并（审查修复 M6）====================

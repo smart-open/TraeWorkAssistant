@@ -835,8 +835,18 @@ mod tests {
         std::thread::spawn(move || {
             for (i, conn) in listener.incoming().enumerate() {
                 let Ok(mut s) = conn else { break };
-                let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
+                // 读完整个请求（头部 + content-length 指定的 body）：单次 read 可能只
+                // 收到头部，写完响应立即 drop 会因接收缓冲残留未读数据触发 RST，与
+                // 响应竞争 → 客户端偶发「远程主机强迫关闭」（Windows 回环，全量跑
+                // 时偶现 flaky）。收齐后再响应 + FIN 关闭，竞态消除
+                let mut req: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !read_request_complete(&req) {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&chunk[..n]),
+                    }
+                }
                 let resp: &[u8] = if i == 0 {
                     b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                 } else {
@@ -853,6 +863,27 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// 请求是否收齐：见到头部结束标记且累计字节数达到 content-length（无 body 视为收齐）
+    fn read_request_complete(req: &[u8]) -> bool {
+        let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+            return false;
+        };
+        let content_length = std::str::from_utf8(&req[..end])
+            .ok()
+            .and_then(|h| {
+                h.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        v.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(0);
+        req.len() >= end + content_length
     }
 
     fn cm(id: &str, base_url: &str) -> CustomModel {
