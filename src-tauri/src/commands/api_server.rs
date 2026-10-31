@@ -407,8 +407,10 @@ pub async fn do_start(
                     return Err(match status {
                         // refresh_busy（H3）：跨进程刷新锁被他进程持有——暂态，
                         // 必须与 refresh_failed 同走熔断可自愈，否则会被误标
-                        // SessionDead 永久禁用（误标恰是 H3 要消除的后果）
-                        "refresh_failed" | "refresh_busy" => format!(
+                        // SessionDead 永久禁用（误标恰是 H3 要消除的后果）；
+                        // vault_down（issue #153 修复 2）：vault 系统性故障导致凭证
+                        // 读空——暂态，同样走熔断，故障恢复后自动自愈
+                        "refresh_failed" | "refresh_busy" | "vault_down" => format!(
                             "{}qoder 凭证暂不可用(id={acct_id}, status={status}；网络/服务端暂态或他进程正在刷新，稍后自动恢复)",
                             crate::tasks::qoder_common::TRANSIENT_ERR_TAG
                         ),
@@ -424,6 +426,7 @@ pub async fn do_start(
             pool_file.qoder_hedge_threshold_ms,
         ),
         qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(pool_file.qoder_sticky_enabled),
+        qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
         qoder_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "q:"),
     });
 
@@ -1486,6 +1489,59 @@ pub fn buddy_ai_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>)
     }
 }
 
+// ==================== 池级指纹清洗开关（issue #158 P1-4） ====================
+
+/// 池级指纹清洗开关视图：`wb_sanitize`（wb + Trae 池共用）与 `qoder_sanitize`
+/// （Qoder 池独立，池级风控画像分开治理）。清洗是防风控手段，默认恒开；
+/// 服务未运行时返回错误（与 sanitize_switch_set 同口径）——前端按加载失败
+/// 置灰展示，避免「可点但保存必失败」的误导态（审查修复：此前回显默认值，
+/// 置灰设计失效）
+#[tauri::command]
+pub fn sanitize_switches_get(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Result<serde_json::Value, String> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => Ok(serde_json::json!({
+            "wb": rt.shared.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed),
+            "qoder": rt
+                .shared
+                .qoder_sanitize
+                .load(std::sync::atomic::Ordering::Relaxed),
+        })),
+        None => Err("API 服务未运行，开关不可用".into()),
+    }
+}
+
+/// 池级指纹清洗开关热切换：仅改内存 AtomicBool，下一请求即生效，无持久化
+/// （重启复位默认开——关清洗属临时排障手段，不做持久默认）
+#[tauri::command]
+pub fn sanitize_switch_set(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    pool: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let guard = safe_lock(&runtime);
+    let Some(rt) = guard.as_ref() else {
+        return Err("API 服务未运行，开关不可用".into());
+    };
+    let (flag, label) = match pool.as_str() {
+        "wb" => (&rt.shared.wb_sanitize, "wb/Trae"),
+        "qoder" => (&rt.shared.qoder_sanitize, "qoder"),
+        other => return Err(format!("未知清洗开关池: {other}")),
+    };
+    flag.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    // 关清洗是排障动作（会重新暴露客户端指纹、可能触发渠道风控），落一行
+    // app.log 留痕：事后复盘「何时关过哪个池」可查，无需依赖用户记忆
+    crate::fs_utils::app_log(
+        &rt.shared.data_dir,
+        &format!(
+            "指纹清洗开关热切换：pool={label} enabled={enabled}（仅内存生效，网关重启复位为开启）"
+        ),
+    );
+    Ok(())
+}
+
 /// 手动同步 Qoder 模型目录（Qoder「资源调度」页；复用每日调度任务入口
 /// qoder_catalog::run_task，按池序逐可用账号拉取 CN 区 model/list 并原子采纳）。
 /// 返回采纳的模型数；无账号/无凭证返回 Ok(0) 语义的信息（与调度器静默跳过一致）
@@ -2131,6 +2187,72 @@ pub fn trae_model_meta_get(
 #[tauri::command]
 pub fn trae_model_meta_clear(state: State<'_, AppState>, model: String) -> Result<bool, String> {
     crate::api_server::unified_catalog::meta_clear(&state.data_dir, &model)
+}
+
+// ==================== 按模型长上下文（按池隔离：Trae 开关 / Qoder 数值） ====================
+
+/// Trae 长上下文开关视图：已开启的模型（canonical_id）；未列出 = 跟随上游
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TraeLongContextView {
+    pub enabled: Vec<String>,
+}
+
+#[tauri::command]
+pub fn trae_long_context_list(state: State<'_, AppState>) -> TraeLongContextView {
+    TraeLongContextView {
+        enabled: crate::api_server::context_window::trae_list(&state.data_dir)
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// 开启/关闭单模型长上下文（仅 Trae 池）；支持表外模型拒绝开启。返回生效状态
+#[tauri::command]
+pub fn trae_long_context_set(
+    state: State<'_, AppState>,
+    model: String,
+    enabled: bool,
+) -> Result<bool, String> {
+    crate::api_server::context_window::trae_set(&state.data_dir, &model, enabled)
+}
+
+/// Qoder 上下文长度单条（管理面列表行）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QoderContextLengthItem {
+    pub model: String,
+    pub tokens: u64,
+}
+
+/// Qoder 上下文长度视图：已设置条目 + 合法区间（未列出的模型 = 跟随上游）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QoderContextLengthView {
+    pub items: Vec<QoderContextLengthItem>,
+    pub min: u64,
+    pub max: u64,
+}
+
+#[tauri::command]
+pub fn qoder_context_length_list(state: State<'_, AppState>) -> QoderContextLengthView {
+    use crate::api_server::context_window as cw;
+    QoderContextLengthView {
+        items: cw::qoder_list(&state.data_dir)
+            .into_iter()
+            .map(|(model, tokens)| QoderContextLengthItem { model, tokens })
+            .collect(),
+        min: cw::QODER_MIN_TOKENS,
+        max: cw::QODER_MAX_TOKENS,
+    }
+}
+
+/// 设置单模型 Qoder 上下文长度（仅 Qoder 池）；`tokens` 为 null/0 = 清除（跟随上游）。
+/// 保存即对下一请求生效（config_cache 显式失效），返回生效值
+#[tauri::command]
+pub fn qoder_context_length_set(
+    state: State<'_, AppState>,
+    model: String,
+    tokens: Option<u64>,
+) -> Result<Option<u64>, String> {
+    crate::api_server::context_window::qoder_set(&state.data_dir, &model, tokens)
 }
 
 // ==================== 单元测试：pool_set 合并语义（调度策略收口） ====================

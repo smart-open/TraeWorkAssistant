@@ -149,13 +149,17 @@ export default function ToolAliasPanel() {
         <div>
           <p>
             上游风控会按请求 tools 中的工具名集合识别 agent 客户端（换账号无效）。此处把特征工具名
-            （如 ask_user_question）改写为通用别名（如 ask_user），响应侧自动回改原名，对客户端透明。
+            （如 ask_user_question、TodoWrite、write_to_file）改写为语义保持的别名
+            （如 ask_user、task_notes、file_edit），响应侧自动回改原名，对客户端透明。
+            内置默认表已按指纹清洗布防客户端补齐各家独家工具名（Trae SOLO / Claude Code /
+            Cline·Roo / Codex / DSH / CodeBuddy / Qoder）。
           </p>
           <p className="mt-1 opacity-80">
             仅收特定客户端独家命名，glob/grep 等通用名不改。规则为逐字精确匹配（无正则）；
             别名必须非空且请求/响应双向一致，不支持留空剥离与多候选；别名不得与请求中
-            其他真实工具名重名（重名时该规则自动跳过、原名透传）。当前仅对 Trae 池
-            （SOLO 管线）请求生效。规则表为增量覆盖：
+            其他真实工具名重名（重名时该规则自动跳过、原名透传）。生效面：Trae 池
+            （SOLO 管线）与 Qoder 池（issue #158，受「指纹清洗」tab 池级开关门控，
+            默认开）；WB 池未接入。规则表为增量覆盖：
             内置默认表始终生效，此处可覆盖、追加或停用（停用 = 原名透传）。保存即对下一条请求生效，
             无需重启网关；
             {builtin ? '当前生效内置默认表，保存后成为自定义覆盖副本。' : '当前为自定义覆盖副本（默认表仍在其下生效）。'}

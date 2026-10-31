@@ -20,7 +20,12 @@ import { Plus, RotateCcw, Save, ShieldCheck, Wand2 } from 'lucide-react';
 import { Badge, Spinner } from '../ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { FingerprintSample, SanitizeRule, SanitizeTier } from '../../types';
+import type {
+  FingerprintSample,
+  SanitizeRule,
+  SanitizeSwitches,
+  SanitizeTier,
+} from '../../types';
 import { extractFingerprintFrom, neutralRewrite } from './fingerprintSamples';
 
 /** 时间戳 → 本地时间展示；null/0 = 从未自定义 */
@@ -54,6 +59,9 @@ export default function FingerprintSanitizePanel() {
   // 指纹样本（issue #125 增强）：网关命中（11128 拦截 / 空完成影子风控）自动采集，
   // 内存环形缓冲（最新在前），重启清空——持久反查靠 app.log
   const [samples, setSamples] = useState<FingerprintSample[]>([]);
+  // 池级清洗开关（issue #158 P1-4）：wb_sanitize（wb+Trae）与 qoder_sanitize
+  // 独立热切换；null = 加载失败（服务未运行/后端不可达），开关置灰按默认开展示
+  const [switches, setSwitches] = useState<SanitizeSwitches | null>(null);
   // 「恢复内置默认」二次确认倒计时句柄：重复点击需先撤销旧定时器，卸载必须清理
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 「清空样本」二次确认倒计时句柄（独立定时器，避免与 confirmReset 互相干扰）
@@ -98,9 +106,34 @@ export default function FingerprintSanitizePanel() {
     }
   }, []);
 
+  const loadSwitches = useCallback(async () => {
+    try {
+      setSwitches(await api.apiServer.sanitizeSwitchesGet());
+    } catch {
+      setSwitches(null);
+    }
+  }, []);
+
+  /** 开关热切换（issue #158 P1-4）：乐观更新 + 失败回滚；即时生效无保存按钮 */
+  const toggleSwitch = async (pool: 'wb' | 'qoder', enabled: boolean) => {
+    const prev = switches;
+    setSwitches((s) => (s ? { ...s, [pool]: enabled } : s));
+    try {
+      await api.apiServer.sanitizeSwitchSet(pool, enabled);
+      toast(
+        'success',
+        `已${enabled ? '开启' : '关闭'}${pool === 'qoder' ? ' Qoder' : ' Buddy/Trae'}池指纹清洗，下一条请求即生效`,
+      );
+    } catch (e) {
+      setSwitches(prev);
+      toast('error', `切换清洗开关失败：${e}`);
+    }
+  };
+
   useEffect(() => {
     void load('wb');
     void loadSamples();
+    void loadSwitches();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -247,6 +280,67 @@ export default function FingerprintSanitizePanel() {
             {builtin ? '当前生效内置默认规则，保存后成为自定义覆盖副本。' : '当前为自定义覆盖副本（默认表仍在其下生效）。'}
             {savedAt && !builtin && ` 最近保存：${fmtTs(savedAt)}`}
           </p>
+        </div>
+      </div>
+
+      {/* 池级清洗开关（issue #158 P1-4）：按池独立启停，热切换下一请求即生效；
+          switches=null（加载失败/服务未运行）置灰按默认开展示 */}
+      <div className="rounded-lg border border-slate-200 px-3 py-2 dark:border-zinc-700">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium">池级开关</span>
+          <span className="truncate text-xs text-slate-400">
+            按池独立启停指纹清洗与工具别名改写，热切换、下一请求即生效；重启网关复位为开启
+          </span>
+          {/* 网关可能在面板挂载后才启动：给一个刷新入口，避免开关一直置灰（置灰原因见下方提示） */}
+          <button
+            onClick={() => void loadSwitches()}
+            className="ml-auto shrink-0 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-600 transition hover:bg-slate-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          >
+            刷新
+          </button>
+        </div>
+        {switches === null && (
+          <p className="mt-1 text-[11px] leading-4 text-amber-600 dark:text-amber-400">
+            网关未运行或开关读取失败：已按默认（开启）展示并置灰，启动 API 服务后点「刷新」即可操作
+          </p>
+        )}
+        <div className="mt-1.5 flex flex-col gap-0.5">
+          <label
+            className={`flex items-start gap-2.5 rounded-md px-1.5 py-1 transition hover:bg-slate-100/60 dark:hover:bg-zinc-800/60 ${switches ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}
+          >
+            <input
+              type="checkbox"
+              className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+              checked={switches?.wb ?? true}
+              disabled={!switches}
+              onChange={(e) => void toggleSwitch('wb', e.target.checked)}
+            />
+            <span className="min-w-0">
+              <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                Buddy / Trae 池
+              </span>
+              <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                共享开关（wb_sanitize）：身份声明改写 + 工具别名；关闭后原名透传（排障用）
+              </span>
+            </span>
+          </label>
+          <label
+            className={`flex items-start gap-2.5 rounded-md px-1.5 py-1 transition hover:bg-slate-100/60 dark:hover:bg-zinc-800/60 ${switches ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}
+          >
+            <input
+              type="checkbox"
+              className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+              checked={switches?.qoder ?? true}
+              disabled={!switches}
+              onChange={(e) => void toggleSwitch('qoder', e.target.checked)}
+            />
+            <span className="min-w-0">
+              <span className="block text-xs text-slate-700 dark:text-zinc-200">Qoder 池</span>
+              <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                独立开关（qoder_sanitize，issue #158）：空完成影子风控治理管线总闸，与上方开关互不影响
+              </span>
+            </span>
+          </label>
         </div>
       </div>
 

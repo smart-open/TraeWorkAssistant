@@ -3,7 +3,7 @@ import { Line, XAxis, YAxis, ComposedChart, ResponsiveContainer, Tooltip, Cartes
 import { Coins } from 'lucide-react';
 import ChartFilterBar, { SOURCE_LABELS, type BoardSource } from '../../components/ChartFilterBar';
 import ActivityHeatmap from '../../components/charts/ActivityHeatmap';
-import ModelRanking from '../../components/charts/ModelRanking';
+import ModelTrendChart from '../../components/charts/ModelTrendChart';
 import { Badge, EmptyState, StatCard } from '../../components/ui';
 import { useDateRange } from '../../hooks/useDateRange';
 import { useIsDark } from '../../lib/useIsDark';
@@ -34,12 +34,13 @@ import {
   wbOfficialAllToPoints,
   wbSnapshotEarnedByDate,
 } from './adapters';
+import { buildModelTrend } from './modelTrend';
 
 /**
  * 积分统计 Tab（credits-dashboard-plan.md §3.1/§5.1）：
- * ① 总积分统计卡（区间总获得/区间总消耗/净获得）② 积分趋势图 ③ 模型消耗排行 ④ 年度活动热力图。
+ * ① 总积分统计卡（区间总获得/区间总消耗/净获得）② 积分趋势图 ③ 各模型消耗趋势（issue #160）④ 年度活动热力图。
  * 三源口径（§8 页面内诚实标注，不做静默合并）：
- * 官网 = Trae usage_history（365 天，日×模型）+ Buddy usage_official（31 天，日合计；模型排行另含 Buddy 31 天全窗口汇总）；
+ * 官网 = Trae usage_history（365 天，日×模型）+ Buddy usage_official（31 天，日合计；无按日模型明细，各模型趋势走空态）；
  * 本地 = WB 快照差分（365 天，日合计）+ Qoder 快照差分（365 天，日合计；官网无按日明细）；
  * API 网关 = Trae/Buddy 池 usage_stats（90 天，请求数口径——api_usage 仅记 tokens 不记积分扣减，§3.1 决策）+
  * Qoder 池（90 天，积分测量口径——网关从上游 usage.credits 提取实测值，issue #82 T2，仅覆盖走网关流量）。
@@ -144,7 +145,6 @@ export default function CreditsTab({
   const agg = useMemo(() => {
     const consumeByDate = new Map<string, number>();
     const earnedByDate = new Map<string, number>();
-    const modelTotals = new Map<string, number>();
     let sessions = 0;
     let requests = 0;
     let okRequests = 0;
@@ -153,6 +153,16 @@ export default function CreditsTab({
     let earnedSkippedDates = 0;
     const addConsume = (date: string, v: number) => {
       consumeByDate.set(date, (consumeByDate.get(date) ?? 0) + v);
+    };
+    // 各模型消耗趋势（issue #160）：模型 → 日期 → 数值（仅日×模型粒度可用的源累积）
+    const modelByDate = new Map<string, Map<string, number>>();
+    const addModelDay = (date: string, model: string, v: number) => {
+      let m = modelByDate.get(model);
+      if (!m) {
+        m = new Map();
+        modelByDate.set(model, m);
+      }
+      m.set(date, (m.get(date) ?? 0) + v);
     };
     if (isGateway) {
       // 网关源。Qoder = 积分测量口径（issue #82 T2.4：上游 usage.credits 实测值，
@@ -180,19 +190,20 @@ export default function CreditsTab({
         addConsume(day.date, dayConsume);
         requests += dayConsume;
         for (const m of day.models) {
-          if (modelFilter && m.name !== modelFilter) continue;
-          modelTotals.set(m.name, (modelTotals.get(m.name) ?? 0) + (isGatewayCredits ? m.credits : m.requests));
+          // 趋势图恒为全模型（issue #160 替换排行；模型筛选仅作用于上方消耗合计线/KPI）
+          const v = isGatewayCredits ? m.credits : m.requests;
+          addModelDay(day.date, m.name, v);
         }
       }
     } else {
-      // Trae 官网源：日 × 模型粒度（模型筛选仅作用于消耗合计线，排行恒为全模型）
+      // Trae 官网源：日 × 模型粒度（模型筛选仅作用于消耗合计线）
       if (traeActive && source === 'official') {
         for (const p of traePoints) {
           if (!inRange(p.date)) continue;
           sessions += p.calls ?? 0;
           addConsume(p.date, modelFilter ? (p.models[modelFilter]?.credits ?? 0) : (p.credits ?? 0));
           for (const [model, m] of Object.entries(p.models)) {
-            modelTotals.set(model, (modelTotals.get(model) ?? 0) + (m.credits ?? 0));
+            addModelDay(p.date, model, m.credits ?? 0);
           }
         }
       }
@@ -201,13 +212,6 @@ export default function CreditsTab({
         for (const p of buddyPoints) {
           if (!inRange(p.date)) continue;
           addConsume(p.date, p.credits ?? 0);
-        }
-      }
-      // Buddy 模型排行（官网源：wbOfficial.models = 官网接口 31 天全窗口跨账号汇总；本地快照差分无模型明细）
-      if (buddyActive && source === 'official' && wbOfficial?.models) {
-        for (const m of wbOfficial.models) {
-          if (modelFilter && m.model !== modelFilter) continue;
-          modelTotals.set(m.model, (modelTotals.get(m.model) ?? 0) + m.credit);
         }
       }
       // 获得积分（与消耗同源：仅官网源计 Trae 快照 earned；本地/网关源无 Trae 获得数据，避免净消耗系统性偏负）
@@ -254,7 +258,7 @@ export default function CreditsTab({
     for (const v of consumeByDate.values()) consumed += v;
     let earned = 0;
     for (const v of earnedByDate.values()) earned += v;
-    return { consumeByDate, earnedByDate, modelTotals, consumed, earned, sessions, requests, okRequests, errRequests, earnedSkippedDates };
+    return { consumeByDate, earnedByDate, modelByDate, consumed, earned, sessions, requests, okRequests, errRequests, earnedSkippedDates };
 
     function consumeEarned(date: string, v: number) {
       earnedByDate.set(date, (earnedByDate.get(date) ?? 0) + v);
@@ -281,6 +285,17 @@ export default function CreditsTab({
   const hasTrend = trend.some((d) => d.consumed != null || d.earned != null);
   const showDots = range === 'today' || range === '7d';
   const consumeLabel = isGateway ? (isGatewayCredits ? '消耗积分（测量）' : '请求数') : '消耗积分';
+
+  // ---- 各模型消耗趋势（issue #160：日 × 模型折线，Top8 + 其他聚合）----
+  // 仅日×模型粒度可用的源渲染：官网源 Trae / 网关源；Buddy 官网（仅 31 天全窗口汇总）与
+  // 本地源（快照差分无模型明细）走诚实空态。恒为全模型，不随模型筛选联动。
+  const hasModelDaily = isGateway || (traeActive && source === 'official');
+  const modelTrend = useMemo(
+    () => buildModelTrend(agg.modelByDate, dateList, range),
+    [agg.modelByDate, dateList, range],
+  );
+  const modelFmt = isGateway && !isGatewayCredits ? (n: number) => n.toLocaleString('zh-CN') : fmtCredits;
+  const modelUnitLabel = isGateway && !isGatewayCredits ? '请求数' : '积分';
 
   // ---- 年度热力图（全量历史，不受区间/模型筛选影响；按平台维度过滤）----
   const heatValues = useMemo(() => {
@@ -530,42 +545,42 @@ export default function CreditsTab({
             )}
           </div>
 
-          {/* ③ 模型消耗排行（官网源 = Trae 区间明细 + Buddy 31 天全窗口汇总；网关源请求数；本地快照差分无模型明细） */}
+          {/* ③ 各模型消耗趋势（issue #160：日 × 模型折线，Top8 + 其他聚合；
+              Buddy 官网仅 31 天全窗口汇总、本地快照差分无模型明细 → 诚实空态） */}
           <div className="mt-5 border-t border-slate-100 pt-4 dark:border-zinc-800">
             <div className="mb-2 flex items-center gap-2">
-              <h4 className="text-sm font-medium">模型消耗排行</h4>
-              <span className="text-xs text-slate-400">
-                {source === 'official' && buddyActive && (wbOfficial?.models?.length ?? 0) > 0
-                  ? 'Top8 + 其余合计'
-                  : '所选区间 · Top8 + 其余合计'}
-              </span>
-              {source === 'official' && buddyActive && (wbOfficial?.models?.length ?? 0) > 0 && (
-                <Badge
-                  tone="slate"
-                  title="Buddy 模型积分为官网接口 31 天全窗口跨账号汇总，不随上方区间筛选变化；Trae 部分为所选区间口径，同名模型两者相加。"
-                >
-                  Buddy 口径：31 天全窗口
-                </Badge>
+              <h4 className="text-sm font-medium">各模型消耗趋势</h4>
+              {hasModelDaily && modelTrend.series.length > 0 && (
+                <span className="text-xs text-slate-400">所选区间 · Top8 + 其他 · 口径 = {modelUnitLabel}</span>
               )}
             </div>
-            <ModelRanking
-              items={[...agg.modelTotals.entries()].map(([model, value]) => ({ model, value }))}
-              fmtValue={isGateway && !isGatewayCredits ? (n: number) => n.toLocaleString('zh-CN') : fmtCredits}
-              unit={isGateway && !isGatewayCredits ? '次请求' : '积分'}
-              emptyHint={
-                source === 'official'
-                  ? scope === 'buddy'
-                    ? 'Buddy 官网暂无模型消耗记录（31 天窗口），点「刷新数据」重拉后再试。'
-                    : '该区间暂无模型粒度消耗记录。'
-                  : source === 'local'
-                    ? qoderActive
+            {!hasModelDaily ? (
+              <EmptyState
+                icon={<Coins size={22} />}
+                title="该数据源无按日模型明细"
+                hint={
+                  source === 'official'
+                    ? 'Buddy 官网仅提供 31 天全窗口模型汇总（无按日明细），无法绘制各模型消耗趋势。'
+                    : qoderActive
                       ? 'Qoder 快照仅有日合计，无模型明细；官网也未提供消耗明细接口。'
-                      : '本地源仅有日合计（快照差分），无模型明细；切「官网」查看模型排行。'
-                    : isGatewayCredits
+                      : '本地源仅有日合计（快照差分），无模型明细；Buddy 官网也无按日模型数据。'
+                }
+              />
+            ) : modelTrend.series.length === 0 ? (
+              <EmptyState
+                icon={<Coins size={22} />}
+                title="暂无模型趋势数据"
+                hint={
+                  isGateway
+                    ? isGatewayCredits
                       ? '该区间暂无积分测量记录：上游下发 usage 后按模型展示实测消耗。'
                       : '该区间暂无网关请求记录。'
-              }
-            />
+                    : '该区间暂无模型粒度消耗记录。'
+                }
+              />
+            ) : (
+              <ModelTrendChart rows={modelTrend.rows} series={modelTrend.series} showDots={showDots} fmtValue={modelFmt} />
+            )}
           </div>
 
           {/* ④ 年度活动热力图 */}

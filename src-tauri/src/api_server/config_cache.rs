@@ -11,7 +11,12 @@
 //! - **TTL 兜底**：5s 短 TTL 覆盖「本进程外」的写入（CLI `--task-run` 子进程、手工改库），
 //!   最迟 5s 可见；
 //! - 缓存值以 `Arc<serde_json::Value>` 快照存放，命中时 `from_value` 反序列化
-//!   （配置文档均为 KB 级小文档，反序列化开销远低于一次 SQLite 读）。
+//!   （配置文档均为 KB 级小文档，反序列化开销远低于一次 SQLite 读）；
+//! - **代际校验回填**：load 在注册表锁外执行，miss 时先记下该键代际，回填前校验
+//!   代际未变。`invalidate` 递增代际——load 期间若有写路径完成「写库 + 失效」，
+//!   这次（可能读到旧表的）迟到回填被丢弃，不会在失效之后把旧快照重新挂回缓存
+//!   并续上一整个 TTL。被丢弃的那次调用本身仍返回其读到的值（与写并发，
+//!   线性化在写之前），失效之后发起的读一律重新读库。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,33 +31,68 @@ struct Entry {
     at: Instant,
 }
 
-fn registry() -> &'static Mutex<HashMap<(PathBuf, &'static str), Entry>> {
-    static REG: OnceLock<Mutex<HashMap<(PathBuf, &'static str), Entry>>> = OnceLock::new();
+/// 单键槽位：失效只清 `entry`、不删槽位——代际须跨失效保留，迟到回填才校验得出
+/// （键为静态名 × data_dir，槽位数有界）
+#[derive(Default)]
+struct Slot {
+    gen: u64,
+    entry: Option<Entry>,
+}
+
+type Registry = HashMap<(PathBuf, &'static str), Slot>;
+
+fn registry() -> &'static Mutex<Registry> {
+    static REG: OnceLock<Mutex<Registry>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 取缓存或加载（miss/过期时调用 `load` 并回填；load 在注册表锁外执行，不放大临界区）
+/// 未过期命中 → `Ok(v)`；否则 `Err((代际快照, 过期旧快照))`，供锁外 load 后校验回填
+fn probe<T: serde::de::DeserializeOwned>(
+    cache_key: &(PathBuf, &'static str),
+) -> Result<T, (u64, Option<std::sync::Arc<serde_json::Value>>)> {
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slot) = reg.get(cache_key) else {
+        return Err((0, None));
+    };
+    let mut stale = None;
+    if let Some(e) = &slot.entry {
+        if e.at.elapsed() < TTL {
+            if let Ok(v) = serde_json::from_value::<T>((*e.val).clone()) {
+                return Ok(v);
+            }
+            // 类型不匹配（理论不可达）：视作脏条目，走重载
+        } else {
+            stale = Some(e.val.clone());
+        }
+    }
+    Err((slot.gen, stale))
+}
+
+/// 回填：仅当代际仍等于 miss 时的快照才写入（期间发生过失效 → 丢弃迟到回填）
+fn refill<T: serde::Serialize>(cache_key: (PathBuf, &'static str), gen: u64, v: &T) {
+    let Ok(json) = serde_json::to_value(v) else {
+        return;
+    };
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let slot = reg.entry(cache_key).or_default();
+    if slot.gen == gen {
+        slot.entry = Some(Entry { val: std::sync::Arc::new(json), at: Instant::now() });
+    }
+}
+
+/// 取缓存或加载（miss/过期时调用 `load` 并回填；load 在注册表锁外执行，不放大临界区；
+/// 回填经代际校验，见模块文档）
 pub fn get_or_load<T>(data_dir: &Path, key: &'static str, load: impl FnOnce() -> T) -> T
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
     let cache_key = (data_dir.to_path_buf(), key);
-    {
-        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(e) = reg.get(&cache_key) {
-            if e.at.elapsed() < TTL {
-                if let Ok(v) = serde_json::from_value::<T>((*e.val).clone()) {
-                    return v;
-                }
-                // 类型不匹配（理论不可达）：视作脏条目，走下方重载
-            }
-        }
-    }
+    let gen = match probe::<T>(&cache_key) {
+        Ok(v) => return v,
+        Err((gen, _)) => gen,
+    };
     let v = load();
-    if let Ok(json) = serde_json::to_value(&v) {
-        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-        reg.insert(cache_key, Entry { val: std::sync::Arc::new(json), at: Instant::now() });
-    }
+    refill(cache_key, gen, &v);
     v
 }
 
@@ -75,26 +115,13 @@ where
 {
     let cache_key = (data_dir.to_path_buf(), key);
     // 未过期命中直接返回；过期条目暂存（快照引用），load 失败时兜底用
-    let mut stale: Option<std::sync::Arc<serde_json::Value>> = None;
-    {
-        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(e) = reg.get(&cache_key) {
-            if e.at.elapsed() < TTL {
-                if let Ok(v) = serde_json::from_value::<T>((*e.val).clone()) {
-                    return v;
-                }
-                // 类型不匹配（理论不可达）：视作脏条目，走下方重载
-            } else {
-                stale = Some(e.val.clone());
-            }
-        }
-    }
+    let (gen, stale) = match probe::<T>(&cache_key) {
+        Ok(v) => return v,
+        Err(miss) => miss,
+    };
     match load() {
         Ok(v) => {
-            if let Ok(json) = serde_json::to_value(&v) {
-                let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-                reg.insert(cache_key, Entry { val: std::sync::Arc::new(json), at: Instant::now() });
-            }
+            refill(cache_key, gen, &v);
             v
         }
         Err(err) => {
@@ -109,10 +136,13 @@ where
     }
 }
 
-/// 写路径显式失效（保存函数写库后调用，配置改动即时生效）
+/// 写路径显式失效（保存函数写库后调用，配置改动即时生效）：清快照并递增代际，
+/// 失效前已开始、尚未回填的 load 结果随之作废
 pub fn invalidate(data_dir: &Path, key: &'static str) {
     let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-    reg.remove(&(data_dir.to_path_buf(), key));
+    let slot = reg.entry((data_dir.to_path_buf(), key)).or_default();
+    slot.gen = slot.gen.wrapping_add(1);
+    slot.entry = None;
 }
 
 #[cfg(test)]
@@ -132,5 +162,47 @@ mod tests {
         let v3 = get_or_load(&dir, "t1", || { n += 1; n });
         assert_eq!(v3, 2, "失效后重载");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读线程卡在 load 里（已读到旧值），写者此刻完成「写库 + invalidate」，
+    /// 再放读线程回填：迟到的旧快照不得挂回缓存
+    fn late_refill_after_invalidate(fallible: bool) {
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join(format!("cfgcache_late_{fallible}_{}", std::process::id()));
+        let key: &'static str = if fallible { "t_late_fallible" } else { "t_late" };
+        let (loaded_tx, loaded_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let d = dir.clone();
+        let reader = std::thread::spawn(move || {
+            let slow_load = || {
+                let old = 1u32; // load 已读到旧表
+                loaded_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                old
+            };
+            if fallible {
+                get_or_load_fallible(&d, key, || Ok::<_, String>(slow_load()), || 0)
+            } else {
+                get_or_load(&d, key, slow_load)
+            }
+        });
+        loaded_rx.recv().unwrap();
+        invalidate(&dir, key); // 写者：kv_set(新值) 后失效
+        go_tx.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), 1, "并发中的读返回其读到的值");
+        let v = get_or_load(&dir, key, || 2u32);
+        assert_eq!(v, 2, "失效后不得再命中迟到回填的旧快照");
+        // 正常回填仍生效（不退化为每次读库）
+        assert_eq!(get_or_load(&dir, key, || 3u32), 2);
+    }
+
+    #[test]
+    fn 失效后迟到回填被丢弃() {
+        late_refill_after_invalidate(false);
+    }
+
+    #[test]
+    fn 失效后迟到回填被丢弃_fallible() {
+        late_refill_after_invalidate(true);
     }
 }

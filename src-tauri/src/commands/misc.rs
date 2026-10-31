@@ -771,9 +771,12 @@ pub fn notify_test(state: State<AppState>) -> Result<String, String> {
         bark_url: s.notify_bark_url.clone().filter(|x| !x.trim().is_empty()),
         wechat_webhook: s.notify_webhook_url.clone().filter(|x| !x.trim().is_empty()),
         serverchan_sendkey: s.notify_serverchan_sendkey.clone().filter(|x| !x.trim().is_empty()),
+        pushplus_token: s.notify_pushplus_token.clone().filter(|x| !x.trim().is_empty()),
+        pushplus_template: s.notify_pushplus_template.clone(),
+        pushplus_topic: s.notify_pushplus_topic.clone(),
     };
     if channels.is_empty() {
-        return Err("尚未配置任何通知渠道（Bark / 通用 Webhook / Server酱）".into());
+        return Err("尚未配置任何通知渠道（Bark / 通用 Webhook / Server酱 / PushPlus）".into());
     }
     if !s.notify_enabled {
         return Err("通知推送总开关未启用".into());
@@ -794,6 +797,11 @@ pub fn notify_test(state: State<AppState>) -> Result<String, String> {
     if let Some(sk) = channels.serverchan_sendkey.as_deref().filter(|x| !x.trim().is_empty()) {
         if let Err(e) = crate::notify::notify_serverchan(sk, title, body) {
             errs.push(format!("Server酱: {e}"));
+        }
+    }
+    if let Some(pp) = channels.pushplus_token.as_deref().filter(|x| !x.trim().is_empty()) {
+        if let Err(e) = crate::notify::notify_pushplus(pp, title, body, channels.pushplus_template.as_deref(), channels.pushplus_topic.as_deref()) {
+            errs.push(format!("PushPlus: {e}"));
         }
     }
     if errs.is_empty() {

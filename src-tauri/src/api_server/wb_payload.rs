@@ -32,6 +32,14 @@ pub fn default_template_map() -> Vec<(String, String)> {
         // 句号结尾，逗号变体（"...for Claude, running inside the VS Code extension."
         // 等）必然漏匹配；前缀匹配覆盖任意续接。精确触发句以「11128 指纹样本」
         // 诊断日志核实后经 UI 热更新迭代，无须发版
+        // Claude Code v2.1.312（Agent SDK harness）实证身份句：system 为数组
+        // 多块、身份句在第二 text 块（首块空串），anthropic_to_openai 无缝
+        // 拼接后落首条 system 消息可命中；整句改写去除品牌词（Claude/Anthropic/
+        // Agent SDK），零残指纹 + 幂等由回归门自动锁定
+        (
+            "You are a Claude agent, built on Anthropic's Claude Agent SDK.".to_string(),
+            "You are a coding agent, built on an internal agent toolkit.".to_string(),
+        ),
         (
             "You are Claude Code, Anthropic's official CLI for Claude,".to_string(),
             "You are Claude Code, Anthropic's official CLI tool for Claude,".to_string(),
@@ -63,6 +71,25 @@ pub fn default_template_map() -> Vec<(String, String)> {
         (
             "You are a coding agent running in the Codex CLI".to_string(),
             "You are a coding agent working in the Codex CLI".to_string(),
+        ),
+        // Codex CLI 0.145.0（2026-10-29 /v1/responses 抓包实证，经
+        // responses_to_chat 投影后走统一清洗管线）：instructions 首句续句 +
+        // 语境内指代句——品牌词 Codex/OpenAI 双点，与 v4 首句规则句式不同
+        // （新缺口）。整句同义改写连根消除（C3 口径：to 零品牌词，回归门
+        // default_map_outputs_are_residue_free_and_idempotent 锁定）。
+        // RESIDUAL_MARKERS 不可加 "codex"——旧 v1-v4 规则改写句含 Codex/GPT-5
+        // （无实证品牌词被拦，按 #9 cat-and-mouse 以实证为准保留），纳入即触发
+        // 回归门误报
+        (
+            "Codex CLI is an open source project led by OpenAI.".to_string(),
+            "The command-line coding tool is an open source project maintained by a dedicated engineering team."
+                .to_string(),
+        ),
+        (
+            "Within this context, Codex refers to the open-source agentic coding interface (not the old Codex language model built by OpenAI)."
+                .to_string(),
+            "Within this context, the product name refers to the open-source agentic coding interface (not the older language model that once shared the name)."
+                .to_string(),
         ),
         // TraeCode harness：system 首句身份声明（日志实证 pool=trae 请求原文，
         // 预防性兜底——同一指纹句一旦进入风控名单即全量 11128）。
@@ -137,6 +164,13 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You are operating as and within a terminal-based agentic coding tool built by OpenAI."
                 .to_string(),
         ),
+        // OpenCode v2.2.1（2026-10-29 抓包实证）：新版身份句品牌词在句中
+        // （running in OpenCode），与上方旧版 "You are opencode…" 前缀形态完全
+        // 不同，旧规则与本表其余规则均不命中——整句同义改写连根消除（C3 口径）
+        (
+            "You are an AI agent running in OpenCode, a coding agent harness.".to_string(),
+            "You are an AI agent working in a local coding workspace.".to_string(),
+        ),
         // DeepSeek Harness（DSH，2026-10-06 测试机日志实证：pool=trae 空完成影子
         // 风控，4 账号全 healthy 仍全灭；请求日志抓到身份句原文）。首句身份声明 +
         // 模型句 "powered by" 复现（glm 前缀匹配覆盖 5.3/5.3-flash 变体）。
@@ -151,6 +185,64 @@ pub fn default_template_map() -> Vec<(String, String)> {
         (
             "You are a coding agent powered by the glm-".to_string(),
             "You help the user with programming work using the glm-".to_string(),
+        ),
+        // 2026-10-29 抓包实证（DSH 0.2.1-rc.2 headless 样本）：模型句池前缀
+        // 升级为 buddy/deepseek-v4.1-flash，上方 glm- 前缀规则不命中——按 glm
+        // 句同款句式整句同义改写，保留模型名衔接；RESIDUAL_MARKERS 的
+        // "deepseek harness" 是整词组，模型名 deepseek-v4.1-flash 不触发回归门
+        (
+            "You are a coding agent powered by the buddy/deepseek-v4.1-flash model.".to_string(),
+            "You help the user with programming work using the buddy/deepseek-v4.1-flash model."
+                .to_string(),
+        ),
+        // CodeBuddy 1.106.1（2026-10-29 抓包实证，buddy 池 /v1/chat/completions
+        // 单一形态 ×10）：模型句句式与 glm- 前缀规则（"You are a coding agent
+        // powered by the glm-"）不同——"an AI coding assistant, powered by"
+        // 逗号续接形态，逐字整句同义改写保留模型名衔接；正文两处独家品牌句
+        // 一并布防（".codebuddy" 文件夹警告句 + CodeBuddy docs 官网域名句，
+        // 品牌词 ×4 强指纹连根消除，C3 口径：to 零品牌词，回归门锁定）。
+        // RESIDUAL_MARKERS 新增 "codebuddy" 整词组——模型名 buddy/glm-5.3-flash
+        // 不含该词组，不触发回归门
+        (
+            "You are an AI coding assistant, powered by buddy/glm-5.3-flash model.".to_string(),
+            "You help the user with programming work using the buddy/glm-5.3-flash model."
+                .to_string(),
+        ),
+        (
+            "**IMPORTANT**: \".codebuddy\" folder stores project-related data and is NOT a temporary cache. Please do NOT delete this folder!".to_string(),
+            "**IMPORTANT**: This project stores its configuration data in a dedicated local folder that is NOT a temporary cache. Please do NOT delete this folder!".to_string(),
+        ),
+        (
+            "When the user asks about CodeBuddy or how to use one of its features (eg. \"can CodeBuddy do...\", \"how do I implement a hook / write a slash command / install an MCP server\"), read the CodeBuddy docs at https://www.codebuddy.ai/docs/zh/ide/User-guide/Overview with the web_fetch tool instead of guessing — if web_fetch is not in your tool list, retrieve it with ToolSearch first.".to_string(),
+            "When the user asks about this coding tool or how to use one of its features (eg. \"can it do...\", \"how do I implement a hook / write a slash command / install an MCP server\"), read its official online documentation with the web_fetch tool instead of guessing — if web_fetch is not in your tool list, retrieve it with ToolSearch first.".to_string(),
+        ),
+        // ZCode harness（issue #155，2026-10 实证：pool=trae 空完成影子风控，
+        // 3 账号轮换全空后 503；请求指纹样本抓到身份句原文）。首句身份声明 +
+        // 第二身份句双句声明（DSH 式双声明形态）。整句同义改写连根消除品牌词
+        // ZCode（C3 口径：to 零品牌词，回归门 default_map_outputs_are_residue_
+        // free_and_idempotent 锁定；RESIDUAL_MARKERS 已纳入 "zcode"）
+        (
+            "You are ZCode, an interactive coding agent".to_string(),
+            "You are an interactive coding agent".to_string(),
+        ),
+        (
+            "You are an interactive ZCode agent that helps users with software engineering tasks".to_string(),
+            "You are an interactive agent that helps users with software engineering tasks".to_string(),
+        ),
+        // Qoder CN 0.4.11（2026-10-29 混淆包逆向实证，QoderWork worker）：chat
+        // 生成请求经 @qoder-ai/qoder-cn-agent-sdk worker 直连网关绕过代理，
+        // 线上 payload 无法 MITM——base64+XOR 循环密钥解码混淆包还原身份句
+        // 原文。主身份句双品牌点（QoderWork + Qoder team）整句同义改写连根
+        // 消除；变体句（Qoder's + Qoder team 双点）同款处理（C3 口径：to 零
+        // 品牌词，回归门 default_map_outputs_are_residue_free_and_idempotent
+        // 锁定；RESIDUAL_MARKERS 已纳入 "qoderwork" / "qoder team" 整词组）
+        (
+            "You are QoderWork, a desktop agentic assistant developed by Qoder team. You are built for daily work, helping users improve their productivity. Use the instructions below and the tools available to you to assist the user.".to_string(),
+            "You are a desktop work companion built by an internal productivity team. You are made for everyday tasks, helping users get more done. Follow the instructions below and use the tools available to you to help the user.".to_string(),
+        ),
+        (
+            "You are Qoder's desktop agentic assistant, built by the Qoder team to help users solve problems and get things done with clarity and confidence.".to_string(),
+            "You are a desktop work companion built by an internal productivity team to help users solve problems and get things done with clarity and confidence.".to_string(),
         ),
     ]
 }
@@ -183,6 +275,17 @@ pub fn aggressive_template_rules() -> Vec<(String, String)> {
             "You are OpenCode".to_string(),
             "You are a pragmatic senior engineer".to_string(),
         ),
+        // OpenCode v2.2.1 句中兜底（2026-10-29 抓包实证：品牌词在句中，上方
+        // 前缀规则不命中）；长规则先行防短规则截断破句，未知后缀/flavor 变体
+        // 由此兜住
+        (
+            "running in OpenCode, a coding agent harness".to_string(),
+            "working in a local coding workspace".to_string(),
+        ),
+        (
+            "running in OpenCode".to_string(),
+            "working in a local coding environment".to_string(),
+        ),
         // 未知 CLI harness（REASONIX/ZCode 等无公开资料客户端）的通用身份前缀
         (
             "You are an interactive CLI".to_string(),
@@ -193,6 +296,23 @@ pub fn aggressive_template_rules() -> Vec<(String, String)> {
         (
             "powered by DeepSeek Harness".to_string(),
             "that helps the user with programming work".to_string(),
+        ),
+        // DSH 0.2.1-rc.2（2026-10-29 抓包实证）模型句前缀兜底：默认表逐字覆盖
+        // buddy/deepseek-v4.1-flash 实证句、glm- 前缀覆盖 glm 变体，未知模型名
+        // 变体由此兜住；置于 "powered by DeepSeek Harness" 兜底之后——DSH 品牌
+        // 变体优先走连根消除规则，避免本规则改写后 "using the DeepSeek Harness"
+        // 反向残留品牌词
+        (
+            "You are a coding agent powered by the ".to_string(),
+            "You help the user with programming work using the ".to_string(),
+        ),
+        // CodeBuddy 1.106.1（2026-10-29 抓包实证）模型句前缀兜底：默认表逐字
+        // 覆盖 buddy/glm-5.3-flash 实证句，未知模型名变体由此兜住；前缀
+        // "You are an AI coding assistant" 为 CodeBuddy 独有形态（其余已布防
+        // 客户端身份句无此前缀），误伤面仅限该前缀句；置于 DSH 前缀兜底之后
+        (
+            "You are an AI coding assistant, powered by ".to_string(),
+            "You help the user with programming work using the ".to_string(),
         ),
         // issue #129：Trae 客户端身份句前缀兜底（默认表只覆盖已知整句，chat
         // 模式 / 新版本变体由此兜住）；长前缀规则先行，避免 "You are Trae AI"
@@ -212,6 +332,64 @@ pub fn aggressive_template_rules() -> Vec<(String, String)> {
         (
             "You are Trae".to_string(),
             "You are an AI assistant".to_string(),
+        ),
+        // Claude Code v2.1.312（Agent SDK harness）身份句前缀兜底：默认表覆盖
+        // 实证整句，新版后缀/flavor 变体（SDK 版本号等）由此兜住；改写保尾部
+        // 衔接，品牌前缀连根消除
+        (
+            "You are a Claude agent".to_string(),
+            "You are a coding agent".to_string(),
+        ),
+        // issue #155：ZCode 身份句前缀兜底（默认表覆盖两条实证整句，新版
+        // 后缀/flavor 变体由此兜住；"You are ZCode" 短规则居后，避免截断
+        // "You are ZCode, an interactive coding agent" 整句规则的改写衔接）
+        (
+            "You are ZCode, an interactive coding agent".to_string(),
+            "You are an interactive coding agent".to_string(),
+        ),
+        (
+            "You are ZCode".to_string(),
+            "You are an interactive agent".to_string(),
+        ),
+        (
+            "You are an interactive ZCode agent".to_string(),
+            "You are an interactive agent".to_string(),
+        ),
+        // Codex 0.145.0（2026-10-29 /v1/responses 抓包实证）身份句前缀兜底：
+        // 默认表逐字覆盖首句续句与语境内指代句实证整句，新版后缀/flavor 变体
+        // 由此兜住；改写保留 "open source project" 谓语衔接，品牌前缀连根消除
+        (
+            "Codex CLI is an open source project".to_string(),
+            "The command-line coding tool is an open source project".to_string(),
+        ),
+        // Qoder CN 0.4.11（2026-10-29 混淆包逆向实证）身份句前缀兜底：默认表
+        // 覆盖两条实证整句，未知 flavor/后缀变体由此兜住。主句品牌词双点
+        // （QoderWork + Qoder team）——长前缀整段兜底先行；句中品牌词组按
+        // OpenCode "running in OpenCode" / DSH "powered by" 中段规则先例兜住；
+        // "You are QoderWork" / "You are Qoder's" 短规则居后防截断长规则
+        (
+            "You are QoderWork, a desktop agentic assistant developed by Qoder team".to_string(),
+            "You are a desktop work companion built by an internal productivity team".to_string(),
+        ),
+        (
+            "You are Qoder's desktop agentic assistant, built by the Qoder team".to_string(),
+            "You are a desktop work companion built by an internal productivity team".to_string(),
+        ),
+        (
+            "developed by Qoder team".to_string(),
+            "built by an internal productivity team".to_string(),
+        ),
+        (
+            "built by the Qoder team".to_string(),
+            "built by an internal productivity team".to_string(),
+        ),
+        (
+            "You are QoderWork".to_string(),
+            "You are a desktop work companion".to_string(),
+        ),
+        (
+            "You are Qoder's".to_string(),
+            "You are a".to_string(),
         ),
     ]
 }
@@ -286,8 +464,25 @@ pub fn merged_template_rules(
 /// 描述选对工具），响应侧按逆映射回改（协议对客户端透明）。
 /// 仅收「特定 agent 客户端独家命名」（glob/grep/edit 等通用名不改，避免
 /// 无谓的模型侧语义损失）；表随样本画像持续补齐（UI「工具别名」tab 热更新）。
+/// 收录口径与指纹清洗 default_template_map 布防客户端对齐（同 issue #150 一体
+/// 治理——客户端形态识别不止 system 句一条通道）：Claude Code / Codex /
+/// Cline / Roo 的实证独家名逐家补齐；OpenCode v2.2.1（2026-10-29 抓包）实证
+/// 12 工具全通用小写名（edit/glob/grep/question/read/shell/skill/subagent/
+/// webfetch/websearch/write/execute）；DSH 0.2.1-rc.2（2026-10-29 headless
+/// 抓包）实证 25 工具——6 个与 Trae 段同名天然覆盖、4 个独家名见下方 DSH 段，
+/// 其余 15 个为通用名不改；CodeBuddy 1.106.1（2026-10-29 抓包）实证 18 工具
+/// ——4 个经既有段同名规则天然覆盖（replace_in_file/write_to_file/
+/// ask_followup_question/ToolSearch）、7 个独家名见下方 CodeBuddy 段、
+/// 7 个通用名不改；ZCode 工具集尚无样本可采信——无独家名可布防
+/// （瞎编名字零收益）；Qoder CN 0.4.11（2026-10-29 混淆包逆向实证）实证工具
+/// 集与 Claude Code 同构（Read/Write/Edit/Glob/Grep/Agent/TodoWrite/WebFetch/
+/// WebSearch/AskUserQuestion/NotebookEdit 同名经 Claude Code 段天然覆盖），
+/// 独家名为 mcp 三件套 mcp_list/mcp_get/mcp_call + SendMessage/TaskCreate，
+/// 见下方 Qoder 段；
+/// 待样本画像核实后经自定义表热补（指纹表对未知客户端也是先句表、后精确迭代）。
 pub fn default_tool_alias_rules() -> Vec<(String, String)> {
     vec![
+        // ==================== Trae SOLO 独家（v3.8.5 首发实证） ====================
         ("ask_user_question".to_string(), "ask_user".to_string()),
         ("create_goal".to_string(), "set_goal".to_string()),
         ("exit_plan_mode".to_string(), "finish_plan".to_string()),
@@ -295,6 +490,89 @@ pub fn default_tool_alias_rules() -> Vec<(String, String)> {
         ("interrupt_agent".to_string(), "pause_agent".to_string()),
         ("job_kill".to_string(), "stop_job".to_string()),
         ("job_list".to_string(), "list_jobs".to_string()),
+        // Trae CN 1.107.1（2026-10-29 live harness 实证）补两条：PureShowWidget
+        // 为 camelCase 连写特征（别名按 TodoWrite→task_notes 先例拆 snake_case
+        // 语义保持）、browser_waiting_for_user_interaction 为长蛇形用户交互
+        // 等待通道（别名缩写语义保持）
+        ("PureShowWidget".to_string(), "show_widget".to_string()),
+        ("browser_waiting_for_user_interaction".to_string(), "wait_for_user".to_string()),
+        // ==================== Claude Code 独家 ====================
+        // v2.1.312（Agent SDK harness 懒加载架构）实证新增六条：主请求 14 工具
+        // 中的独家命名；Workflow 虽为通用词，但作为 14 工具集指纹的组成成员
+        // 一并改写（响应侧逆映射对客户端透明）；下方两条旧版兼容保留
+        // camelCase 多词连写是 Claude Code 工具名强特征（通用客户端均用
+        // snake_case）；逐字精确匹配须按真实注册名大小写；别名反向用
+        // snake_case 拆词——语义保持且特征形态互换（TodoWrite→task_notes）
+        ("TodoWrite".to_string(), "task_notes".to_string()),
+        ("AskUserQuestion".to_string(), "user_input".to_string()),
+        ("ListAgents".to_string(), "list_subagents".to_string()),
+        ("ReportFindings".to_string(), "summarize_results".to_string()),
+        ("ScheduleWakeup".to_string(), "set_reminder".to_string()),
+        ("ToolSearch".to_string(), "find_tools".to_string()),
+        ("DeferredToolPlaceholder".to_string(), "reserved_tool_slot".to_string()),
+        ("Workflow".to_string(), "pipeline".to_string()),
+        // ==================== Cline / Roo 独家 ====================
+        // write_to_file / replace_in_file 双编辑器拆分是 Cline/Roo 特有协议
+        // （其余客户端统一单 edit 入口）；attempt_completion 是其任务终结
+        // 专用签名工具，tools 集合中出现即直指该客户端；
+        // ask_followup_question 同为 Cline/Roo 独家追问名
+        ("write_to_file".to_string(), "file_edit".to_string()),
+        ("replace_in_file".to_string(), "file_patch".to_string()),
+        ("attempt_completion".to_string(), "present_result".to_string()),
+        ("ask_followup_question".to_string(), "user_reply".to_string()),
+        // ==================== DSH 独家（0.2.1-rc.2 抓包实证） ====================
+        // 2026-10-29 headless 抓包实证 25 工具：6 个与 Trae 段同名天然覆盖
+        // （create_goal/get_goal/exit_plan_mode/interrupt_agent/job_kill/
+        // job_list），其余 15 个为通用名不改；下方 4 条为独家名——job_output
+        // 与 Trae 段 job_kill/job_list 同族管理面、subagent_fork 的 fork 后缀
+        // 区分通用 subagent（DSH 同时注册两者，别名不可取 subagent 否则触发
+        // 同请求碰撞防御整条跳过）、pwsh 为 DSH 特有 shell 入口命名、
+        // working_directory 为其工作目录探针
+        ("subagent_fork".to_string(), "spawn_subagent".to_string()),
+        ("job_output".to_string(), "read_job_log".to_string()),
+        ("pwsh".to_string(), "run_shell".to_string()),
+        ("working_directory".to_string(), "work_dir".to_string()),
+        // ==================== CodeBuddy 独家（1.106.1 抓包实证） ====================
+        // 2026-10-29 buddy CLI 抓包实证 18 工具：replace_in_file/write_to_file/
+        // ask_followup_question 经 Cline/Roo 段、ToolSearch 经 Claude Code 段
+        // 天然覆盖（CodeBuddy 为 Cline 系 DNA 的 VS Code fork），其余 7 个为
+        // 通用名不改；下方 7 条为独家名——read_lints 为 lint 探针、
+        // execute_command 为 Cline 家族 shell 入口经典名（未来 Cline/Roo 实证
+        // 天然覆盖）、update_memory/read_rules/use_skill 为其记忆/规则/技能
+        // 面板、send_message 为用户消息通道、DeferExecuteTool 为懒加载占位
+        // （与 Claude Code DeferredToolPlaceholder 同族异名，别名按 camelCase
+        // 特征改 snake_case 拆词——先例 TodoWrite→task_notes）
+        ("read_lints".to_string(), "check_lints".to_string()),
+        ("execute_command".to_string(), "run_command".to_string()),
+        ("update_memory".to_string(), "save_memory".to_string()),
+        ("use_skill".to_string(), "load_skill".to_string()),
+        ("read_rules".to_string(), "load_rules".to_string()),
+        ("send_message".to_string(), "notify_user".to_string()),
+        ("DeferExecuteTool".to_string(), "defer_execute".to_string()),
+        // ==================== Qoder 独家（0.4.11 混淆包逆向实证） ====================
+        // 2026-10-29 解码 @qoder-ai/qoder-cn-agent-sdk 实证：工具集与 Claude
+        // Code 同构（Read/Write/Edit/Glob/Grep/Agent/TodoWrite/WebFetch/
+        // WebSearch/AskUserQuestion/NotebookEdit 同名经 Claude Code 段天然
+        // 覆盖——共享名不重复收录），独家名为 mcp 三件套（懒加载 MCP 发现/
+        // 取 schema/调用，mcp__server__tool 命名协议层形态通用不改）+
+        // SendMessage/TaskCreate 团队协作两件（PascalCase 连写特征，别名按
+        // camelCase 先例拆 snake_case 语义保持）
+        ("mcp_list".to_string(), "tool_catalog".to_string()),
+        ("mcp_get".to_string(), "tool_schema".to_string()),
+        ("mcp_call".to_string(), "tool_invoke".to_string()),
+        ("SendMessage".to_string(), "relay_message".to_string()),
+        ("TaskCreate".to_string(), "queue_task".to_string()),
+        // ==================== Codex 独家 ====================
+        // apply_patch 的统一 diff/patch 语法是 Codex 家族特有工具协议；
+        // update_plan 为 Codex 计划跟踪专用名。0.145.0（2026-10-29 /v1/responses
+        // 抓包实证）补两条：update_goal 为 goal 家族管理面（create_goal/get_goal
+        // 经 Trae 段同名规则天然覆盖，别名按 update_plan→refresh_plan 家族先例
+        // 取 refresh_goal）、request_user_input 为用户输入请求通道（别名避开
+        // ask_user/user_input/user_reply 既有三件）
+        ("update_goal".to_string(), "refresh_goal".to_string()),
+        ("request_user_input".to_string(), "request_input".to_string()),
+        ("apply_patch".to_string(), "patch_source".to_string()),
+        ("update_plan".to_string(), "refresh_plan".to_string()),
     ]
 }
 
@@ -369,17 +647,25 @@ pub fn apply_tool_alias_forward(
     body: &mut Vec<u8>,
     rules: &[(String, String)],
 ) -> Option<std::collections::HashMap<String, String>> {
+    let mut v: Value = serde_json::from_slice(body).ok()?;
+    let reverse = apply_tool_alias_forward_value(&mut v, rules)?;
+    *body = serde_json::to_vec(&v).ok()?;
+    Some(reverse)
+}
+
+/// Value 层别名正向改写核心（issue #158 P1-1：Qoder peek 已是预解析 Value，
+/// 字节层包装的拆出避免热路径反复序列化）。语义与 [apply_tool_alias_forward]
+/// 完全一致，另覆盖 OpenAI 标准形态历史轮 `tool_calls[].function.name`——
+/// llm_utils_chat 管线已改名 function_call，该分支对 Trae 零命中无副作用；
+/// Qoder peek 原生 OpenAI 形态经此分支改写（AGENT.md §14 透传点契约同改）。
+pub fn apply_tool_alias_forward_value(
+    v: &mut Value,
+    rules: &[(String, String)],
+) -> Option<std::collections::HashMap<String, String>> {
     if rules.is_empty() {
         return None;
     }
-    let mut v: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-    let obj = match v.as_object_mut() {
-        Some(o) => o,
-        None => return None,
-    };
+    let obj = v.as_object_mut()?;
     // 生效前向表：from → to（停用规则不在表内——to 非空才入表）
     let forward: Vec<(&str, &str)> = rules
         .iter()
@@ -455,22 +741,30 @@ pub fn apply_tool_alias_forward(
                 continue;
             };
             for tc in tcs.iter_mut() {
-                if let Some(name) = tc.pointer_mut("/function_call/name").and_then(|v| v.as_str())
-                {
-                    let orig = name.to_string();
-                    if let Some(alias) = effective.get(orig.as_str()) {
+                // 双形态历史轮（issue #158 P1-1）：function_call（llm_utils_chat，
+                // Trae 管线改名后形态）与 function（OpenAI 标准，Qoder peek 原生）
+                // ——同一 tool_call 仅存其一，function_call 优先命中即停
+                for key in ["function_call", "function"] {
+                    let Some(name) = tc
+                        .pointer_mut(&format!("/{key}/name"))
+                        .and_then(|v| v.as_str().map(str::to_string))
+                    else {
+                        continue;
+                    };
+                    if let Some(alias) = effective.get(name.as_str()) {
                         let conflict = reverse
-                            .get(*alias)
-                            .map(|prev| prev != &orig)
+                            .get(alias.to_string().as_str())
+                            .map(|prev| prev != &name)
                             .unwrap_or(false);
                         if !conflict {
-                            if let Some(slot) = tc.pointer_mut("/function_call/name") {
+                            if let Some(slot) = tc.pointer_mut(&format!("/{key}/name")) {
                                 *slot = Value::String((*alias).to_string());
                             }
-                            reverse.insert((*alias).to_string(), orig);
+                            reverse.insert((*alias).to_string(), name);
                             renamed = true;
                         }
                     }
+                    break;
                 }
             }
         }
@@ -478,7 +772,6 @@ pub fn apply_tool_alias_forward(
     if !renamed {
         return None;
     }
-    *body = serde_json::to_vec(&v).ok()?;
     Some(reverse)
 }
 
@@ -689,19 +982,29 @@ fn first_system_text(v: &Value) -> String {
 
 /// 已知上游风控特征词（issue #122 实证：opencode / DeepSeek Harness 品牌词与
 /// 「interactive CLI」n-gram 残留即秒拒；issue #129 实证：TraeCode 品牌词被
-/// buddy-ai 国际档渠道验证拦截）：整句改写后首条 system 应零残留。
+/// buddy-ai 国际档渠道验证拦截；issue #155 实证：ZCode 品牌词触发 pool=trae
+/// 空完成影子风控；2026-10-29 CodeBuddy 1.106.1 抓包实证：品牌词以
+/// ".codebuddy" 文件夹警告句与 codebuddy.ai docs 域名句连片出现于正文）：
+/// 整句改写后首条 system 应零残留。
 /// 默认表通用 CLI 规则的改写句已同步去除 interactive（见 default_template_map）
-const RESIDUAL_MARKERS: &[&str] = &["opencode", "deepseek harness", "interactive cli", "traecode"];
+const RESIDUAL_MARKERS: &[&str] = &[
+    // Qoder CN 0.4.11（2026-10-29 混淆包逆向实证）：QoderWork 身份句整词组 +
+    // "qoder team" 句中双品牌词组——整词组口径防域名/模型名误报
+    // （qoder.com.cn 等域名词与 "Qoder" 单词不触发）
+    "qoderwork",
+    "qoder team",
+    "codebuddy",
+    "opencode",
+    "deepseek harness",
+    "interactive cli",
+    "traecode",
+    "zcode",
+];
 
-/// 残指纹自检（issue #122 方案 C3）：模板改写后对首条 system 消息扫描已知
-/// 特征词，命中返回小写特征词列表（逗号连接），无命中 None。
-/// 仅查首条 system——用户正文/工具结果含品牌词属正常业务内容，不参与自检
-/// 避免误报；调用方在 sanitize 开启时落 debug 日志（按请求去重）
-pub fn residual_fingerprint_note(body: &[u8]) -> Option<String> {
-    let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return None;
-    };
-    let system = first_system_text(&v).to_lowercase();
+/// 残指纹自检 Value 核心（issue #158 P1-1：Qoder 池已在 active_peek 上持有
+/// 解析好的 Value，直接扫描避免热路径多一次序列化/反序列化）
+pub fn residual_fingerprint_note_value(v: &Value) -> Option<String> {
+    let system = first_system_text(v).to_lowercase();
     if system.is_empty() {
         return None;
     }
@@ -715,6 +1018,17 @@ pub fn residual_fingerprint_note(body: &[u8]) -> Option<String> {
     } else {
         Some(hits.join(","))
     }
+}
+
+/// 残指纹自检（issue #122 方案 C3）：模板改写后对首条 system 消息扫描已知
+/// 特征词，命中返回小写特征词列表（逗号连接），无命中 None。
+/// 仅查首条 system——用户正文/工具结果含品牌词属正常业务内容，不参与自检
+/// 避免误报；调用方在 sanitize 开启时落 debug 日志（按请求去重）
+pub fn residual_fingerprint_note(body: &[u8]) -> Option<String> {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return None;
+    };
+    residual_fingerprint_note_value(&v)
 }
 
 // ==================== 池级指纹拦截短记忆（issue #122 缺口2） ====================
@@ -1217,6 +1531,7 @@ mod tests {
     /// 样本环形缓冲（issue #125）：入队/去重/容量上限/逆序拉取/清空
     #[test]
     fn fingerprint_sample_store_records_and_clears() {
+        let _guard = fp_sample_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         fingerprint_sample_entries_clear();
         record_fingerprint_sample("11128", "wb", "s1", "");
         record_fingerprint_sample("11128", "wb", "s1", ""); // 队尾三元组重复 → 去重
@@ -1609,6 +1924,199 @@ mod tests {
         assert_eq!(apply_template_map(&out, &tpl), out);
     }
 
+    /// OpenCode v2.2.1 身份句整句同义改写（2026-10-29 抓包实证：新版品牌词在
+    /// 句中「running in OpenCode」，旧版前缀形态的 aggressive 规则与默认表
+    /// 4 条旧规则均不命中）+ aggressive 句中兜底未知后缀变体
+    #[test]
+    fn opencode_v2_identity_sentence_rewritten() {
+        let tpl = default_template_map();
+        // 抓包原文（system 首条消息首句 + 尾句任务说明）
+        let src = "You are an AI agent running in OpenCode, a coding agent harness. Help the user accomplish their goals using the tools you have available.";
+        let out = apply_template_map(src, &tpl);
+        assert!(out.contains("working in a local coding workspace"), "{out}");
+        // 品牌/特征词零残留（大小写不敏感，harness 词一并消除）
+        assert!(!out.to_lowercase().contains("opencode"), "{out}");
+        assert!(!out.contains("harness"), "{out}");
+        // 尾句保留（只改身份句本体）
+        assert!(
+            out.ends_with("Help the user accomplish their goals using the tools you have available."),
+            "{out}"
+        );
+        // 改写结果不再命中任何规则（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+        // aggressive 句中兜底：默认表未覆盖的后缀变体仍消除品牌片段
+        let mut agg = tpl;
+        agg.extend(aggressive_template_rules());
+        let out2 = apply_template_map(
+            "You are an AI agent running in OpenCode, a coding agent harness v2. Help the user.",
+            &agg,
+        );
+        assert!(!out2.to_lowercase().contains("opencode"), "{out2}");
+        assert!(!out2.contains("harness"), "{out2}");
+    }
+
+    /// DSH 0.2.1-rc.2 模型句整句同义改写（2026-10-29 headless 抓包实证：模型
+    /// 句池前缀升级为 buddy/deepseek-v4.1-flash，glm- 前缀规则不命中）——逐字
+    /// 改写保留模型名衔接（RESIDUAL_MARKERS 的 "deepseek harness" 为整词组，
+    /// 模型名不含该词组，不触发回归门）+ aggressive 前缀兜未知模型名变体
+    #[test]
+    fn dsh_model_sentence_rewritten() {
+        let tpl = default_template_map();
+        // 抓包原文（system 首条前两句：首句身份声明 + 模型句）
+        let src = "You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent powered by the buddy/deepseek-v4.1-flash model.";
+        let out = apply_template_map(src, &tpl);
+        assert!(
+            out.contains(
+                "You help the user with programming work using the buddy/deepseek-v4.1-flash model."
+            ),
+            "{out}"
+        );
+        // 品牌/特征词零残留
+        assert!(!out.contains("powered by"), "{out}");
+        assert!(!out.to_lowercase().contains("deepseek harness"), "{out}");
+        assert!(!out.contains("coding agent"), "{out}");
+        // 改写结果不再命中任何规则（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+        // aggressive 前缀兜底：未知模型名变体（默认表零命中）在换号重试场景兜住
+        let mut agg = tpl;
+        agg.extend(aggressive_template_rules());
+        let out2 = apply_template_map(
+            "You are a coding agent powered by the buddy/deepseek-v9-flash model.",
+            &agg,
+        );
+        assert_eq!(
+            out2,
+            "You help the user with programming work using the buddy/deepseek-v9-flash model."
+        );
+        // glm- 前缀句仍由既有规则覆盖，新前缀兜底不破坏其改写
+        let out3 = apply_template_map("You are a coding agent powered by the glm-5.3-flash model.", &agg);
+        assert_eq!(
+            out3,
+            "You help the user with programming work using the glm-5.3-flash model."
+        );
+    }
+
+    /// CodeBuddy 1.106.1 指纹布防回归（2026-10-29 buddy CLI 抓包实证）：
+    /// 模型句句式与 glm- 前缀规则不同（"an AI coding assistant, powered by"
+    /// 逗号续接形态），逐字整句改写保留模型名衔接；正文两处独家品牌句
+    /// （".codebuddy" 文件夹警告 + CodeBuddy docs 官网域名）连根消除 +
+    /// aggressive 前缀兜未知模型名变体
+    #[test]
+    fn codebuddy_fingerprints_whole_rewrite() {
+        let tpl = default_template_map();
+        // 模型句（抓包原文 system 首句）
+        let out = apply_template_map(
+            "You are an AI coding assistant, powered by buddy/glm-5.3-flash model.",
+            &tpl,
+        );
+        assert_eq!(
+            out,
+            "You help the user with programming work using the buddy/glm-5.3-flash model."
+        );
+        // 正文品牌句 ×2（抓包原文逐字）
+        let out1 = apply_template_map(
+            "**IMPORTANT**: \".codebuddy\" folder stores project-related data and is NOT a temporary cache. Please do NOT delete this folder!",
+            &tpl,
+        );
+        assert!(!out1.contains("codebuddy"), "{out1}");
+        assert!(out1.contains("Please do NOT delete this folder!"), "{out1}");
+        let out2 = apply_template_map(
+            "When the user asks about CodeBuddy or how to use one of its features (eg. \"can CodeBuddy do...\", \"how do I implement a hook / write a slash command / install an MCP server\"), read the CodeBuddy docs at https://www.codebuddy.ai/docs/zh/ide/User-guide/Overview with the web_fetch tool instead of guessing — if web_fetch is not in your tool list, retrieve it with ToolSearch first.",
+            &tpl,
+        );
+        assert!(!out2.contains("CodeBuddy"), "{out2}");
+        assert!(!out2.contains("codebuddy.ai"), "{out2}");
+        // 改写结果不再命中任何规则（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+        assert_eq!(apply_template_map(&out1, &tpl), out1, "改写须幂等");
+        assert_eq!(apply_template_map(&out2, &tpl), out2, "改写须幂等");
+        // aggressive 前缀兜底：未知模型名变体（默认表零命中）在换号重试场景兜住
+        let mut agg = tpl;
+        agg.extend(aggressive_template_rules());
+        let out3 = apply_template_map(
+            "You are an AI coding assistant, powered by buddy/glm-9-flash model.",
+            &agg,
+        );
+        assert_eq!(
+            out3,
+            "You help the user with programming work using the buddy/glm-9-flash model."
+        );
+    }
+
+    /// ZCode 身份句整句同义改写（issue #155，2026-10 实证：pool=trae 空完成
+    /// 影子风控，3 账号轮换全空；指纹样本抓到双身份句原文）——品牌词 ZCode
+    /// 连根消除（C3 口径：改写句零品牌词/特征 n-gram）
+    #[test]
+    fn zcode_identity_sentences_whole_rewrite() {
+        let tpl = default_template_map();
+        // issue #155 指纹样本原文（system 首条前两句）
+        let src = "You are ZCode, an interactive coding agent You are an interactive ZCode agent that helps users with software engineering tasks. IMPORTANT: Assist with authorized security testing...";
+        let out = apply_template_map(src, &tpl);
+        assert!(!out.contains("ZCode"), "{out}");
+        assert!(out.starts_with("You are an interactive coding agent"), "{out}");
+        assert!(out.contains("an interactive agent that helps users with software engineering tasks"), "{out}");
+        // 改写结果不再命中任何规则（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out);
+    }
+
+    /// Qoder CN 0.4.11 指纹布防回归（2026-10-29 混淆包逆向实证：chat 生成
+    /// 请求经 agent SDK worker 直连网关无法 MITM，身份句自解码字符串原文）：
+    /// 主身份句双品牌点（QoderWork + Qoder team）+ 变体句整句同义改写连根
+    /// 消除 + aggressive 长前缀/中段/短前缀兜未知变体
+    #[test]
+    fn qoder_fingerprints_whole_rewrite() {
+        let tpl = default_template_map();
+        // 主身份句（解码串原文逐字）
+        let out = apply_template_map(
+            "You are QoderWork, a desktop agentic assistant developed by Qoder team. You are built for daily work, helping users improve their productivity. Use the instructions below and the tools available to you to assist the user.",
+            &tpl,
+        );
+        assert!(!out.to_lowercase().contains("qoder"), "{out}");
+        assert!(out.starts_with("You are a desktop work companion"), "{out}");
+        // 变体句（解码串原文逐字）
+        let out2 = apply_template_map(
+            "You are Qoder's desktop agentic assistant, built by the Qoder team to help users solve problems and get things done with clarity and confidence.",
+            &tpl,
+        );
+        assert!(!out2.to_lowercase().contains("qoder"), "{out2}");
+        assert!(out2.ends_with("clarity and confidence."), "{out2}");
+        // 改写结果不再命中任何规则（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+        assert_eq!(apply_template_map(&out2, &tpl), out2, "改写须幂等");
+        // aggressive 兜底：未知 flavor 变体（默认表零命中）在换号重试场景兜住
+        let mut agg = tpl;
+        agg.extend(aggressive_template_rules());
+        // 短前缀变体（QoderWork 后接未知后缀，长前缀规则零命中）
+        let out3 = apply_template_map("You are QoderWork, an agent for daily productivity.", &agg);
+        assert!(!out3.to_lowercase().contains("qoder"), "{out3}");
+        // 中段品牌词组变体（非 "You are" 开头的正文品牌句）
+        let out4 = apply_template_map("This agent was developed by Qoder team for desktop use.", &agg);
+        assert!(!out4.to_lowercase().contains("qoder"), "{out4}");
+    }
+
+    /// Claude Code v2.1.312（Agent SDK harness）身份句布防回归：默认表整句
+    /// 去品牌改写 + aggressive 前缀兜未知后缀变体（system 数组多块经
+    /// anthropic_to_openai 无缝拼接，第二块身份句可被首条 system 改写命中）
+    #[test]
+    fn claude_agent_sdk_identity_sentence_rewritten() {
+        let tpl = default_template_map();
+        let src = "You are a Claude agent, built on Anthropic's Claude Agent SDK. You help with software engineering tasks.";
+        let out = apply_template_map(src, &tpl);
+        assert!(!out.contains("Claude agent"), "{out}");
+        assert!(!out.contains("Anthropic"), "{out}");
+        assert!(out.ends_with("software engineering tasks."), "{out}");
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+        // aggressive 兜底：默认表未覆盖的后缀变体仍消除品牌前缀
+        let mut agg = tpl;
+        agg.extend(aggressive_template_rules());
+        let out2 = apply_template_map(
+            "You are a Claude agent, built on Anthropic's Claude Agent SDK v2.",
+            &agg,
+        );
+        assert!(!out2.contains("Claude agent"), "{out2}");
+        assert!(out2.starts_with("You are a coding agent"), "{out2}");
+    }
+
     /// 默认表全部改写句零残指纹 + 幂等（issue #122 方案 C3 口径回归锁定）：
     /// 改写句自身含特征词 = 指纹仍在（首轮请求激进规则不兜底）+
     /// residual_fingerprint_note 设计性误报；任何新增/修改默认规则必须过此门
@@ -1776,7 +2284,8 @@ mod tests {
         assert_eq!(out["tool_choice"], json!("auto"));
     }
 
-    /// Codex CLI 身份句指纹清洗（v1/v2 harness 首句，最小改写绕过逐字匹配）
+    /// Codex CLI 身份句指纹清洗（v1-v4 harness 首句最小改写 + 0.145.0
+    /// 续句/语境内指代句整句同义改写，C3 口径改写句零品牌词）
     #[test]
     fn codex_identity_sentences_minimal_rewrite() {
         let tpl = default_template_map();
@@ -1809,6 +2318,22 @@ mod tests {
             apply_template_map("You are Codex, built on GPT-5.", &tpl),
             "You are Codex, built on GPT-5."
         );
+        // 0.145.0（2026-10-29 /v1/responses 抓包实证）首句续句：品牌词
+        // Codex/OpenAI 双点整句同义改写连根消除（C3 口径：to 零品牌词）
+        let cont = "Codex CLI is an open source project led by OpenAI.";
+        let out = apply_template_map(cont, &tpl);
+        assert_ne!(out, cont);
+        assert!(out.starts_with("The command-line coding tool is an open source project"));
+        assert!(!out.contains("Codex"), "{out}");
+        assert!(!out.contains("OpenAI"), "{out}");
+        assert_eq!(apply_template_map(&out, &tpl), out);
+        // 语境内指代句（"Codex" 消歧句）同款整句同义改写
+        let ctx = "Within this context, Codex refers to the open-source agentic coding interface (not the old Codex language model built by OpenAI).";
+        let out = apply_template_map(ctx, &tpl);
+        assert_ne!(out, ctx);
+        assert!(!out.contains("Codex"), "{out}");
+        assert!(!out.contains("OpenAI"), "{out}");
+        assert_eq!(apply_template_map(&out, &tpl), out);
     }
 
     /// Codex instructions → system 消息端到端清洗（responses_to_chat 产物形态）
@@ -1831,6 +2356,41 @@ mod tests {
         let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, false, &tpl, 0, false);
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert!(v["messages"][0]["content"].as_str().unwrap().contains("based on GPT-5"));
+    }
+
+    /// Codex 0.145.0 三句端到端（responses_to_chat 投影后的 system 消息形态）：
+    /// v4 首句 + 续句 + 语境内指代句一次清洗；user 正文提及 Codex 不受影响；
+    /// 残指纹自检 None（"codex" 非 RESIDUAL_MARKERS 成员的设计性口径——v1-v4
+    /// 规则改写句含 Codex/GPT-5，纳入即回归门误报）
+    #[test]
+    fn sanitize_covers_codex_0145_sentences_end_to_end() {
+        let src = json!({"messages":[
+            {"role":"system","content":"You are a coding agent running in the Codex CLI. Codex CLI is an open source project led by OpenAI. Within this context, Codex refers to the open-source agentic coding interface (not the old Codex language model built by OpenAI)."},
+            {"role":"user","content":"Codex CLI 怎么配置 MCP？"}
+        ]});
+        let src_bytes = serde_json::to_vec(&src).unwrap();
+        let tpl = default_template_map();
+        let out = prepare_wb_chat_body(&src_bytes, "m", "", "", None, true, &tpl, 0, false);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let s = v["messages"][0]["content"].as_str().unwrap();
+        // v4 首句改写保留 Codex CLI（无实证品牌词被拦，按 #9 cat-and-mouse 口径）
+        assert!(s.contains("working in the Codex CLI"), "{s}");
+        // 续句 + 指代句整句同义改写，品牌词连根消除
+        assert!(
+            s.contains("The command-line coding tool is an open source project"),
+            "{s}"
+        );
+        assert!(
+            s.contains("the product name refers to the open-source agentic coding interface"),
+            "{s}"
+        );
+        assert!(!s.contains("led by OpenAI"), "{s}");
+        assert!(!s.contains("old Codex language model"), "{s}");
+        // user 正文品牌词不动
+        assert_eq!(v["messages"][1]["content"], json!("Codex CLI 怎么配置 MCP？"));
+        // 改写结果幂等 + 残指纹自检 None（设计性口径锁定）
+        assert_eq!(apply_template_map(s, &tpl), s);
+        assert_eq!(residual_fingerprint_note(&out), None);
     }
 
     /// TraeCode 身份句整句同义改写（日志实证 pool=trae system 首句原文；
@@ -1883,6 +2443,30 @@ mod tests {
         let out = apply_template_map(src, &tpl);
         assert!(out.starts_with("You are an AI assistant, powered by"), "{out}");
         assert!(!out.contains("assistant AI"), "{out}");
+    }
+
+    /// aggressive ZCode 规则（issue #155）：未知 flavor/新版后缀变体兜底——
+    /// 默认表两条实证整句只覆盖已知句式，短前缀兜住变体；与 Trae 规则同理，
+    /// 长前缀 "You are ZCode, ..." 居前，短规则 "You are ZCode" 不破句
+    #[test]
+    fn aggressive_zcode_rules_catch_unknown_variants() {
+        let mut tpl = default_template_map();
+        tpl.extend(aggressive_template_rules());
+        // 已知整句（默认表命中，aggressive 不再参与）
+        let known = "You are ZCode, an interactive coding agent. Review my diff.";
+        let out = apply_template_map(known, &tpl);
+        assert!(out.starts_with("You are an interactive coding agent"), "{out}");
+        assert!(!out.contains("ZCode"), "{out}");
+        // 未知变体（默认表未覆盖，aggressive 短前缀兜底）
+        let variant = "You are ZCode v9, the ultimate harness. Do the task.";
+        let out2 = apply_template_map(variant, &tpl);
+        assert!(out2.starts_with("You are an interactive agent"), "{out2}");
+        assert!(!out2.contains("ZCode"), "{out2}");
+        // 另一变体形态（interactive ZCode agent 中插词）
+        let variant2 = "You are an interactive ZCode agent pro. Do the task.";
+        let out3 = apply_template_map(variant2, &tpl);
+        assert!(out3.starts_with("You are an interactive agent"), "{out3}");
+        assert!(!out3.contains("ZCode"), "{out3}");
     }
 
     /// tools[].function.description 指纹清洗（CLI harness 将身份句嵌入工具
@@ -1970,6 +2554,29 @@ mod tests {
         assert_eq!(apply_template_map_seeded("a FP_X b", &strip, 5), "a  b");
     }
 
+    /// 多候选含空串（剥离语义）按种子命中：命中空候选时输出彻底为空、无残句
+    /// 拼接；连续种子取遍含空串的全部候选（`|` 首尾变体均覆盖）
+    #[test]
+    fn multi_candidate_empty_strip_candidate_seeded() {
+        // 尾空候选："Alpha|" 两候选（"Alpha" 与 ""）
+        let tpls = vec![("FP_D".to_string(), "Alpha|".to_string())];
+        for seed in 0u64..8 {
+            let out = apply_template_map_seeded("FP_D", &tpls, seed);
+            assert!(out == "Alpha" || out.is_empty(), "seed={seed} out={out:?}");
+        }
+        let outs: std::collections::HashSet<String> = (0u64..8)
+            .map(|s| apply_template_map_seeded("FP_D", &tpls, s))
+            .collect();
+        assert!(
+            outs.contains("Alpha") && outs.contains(""),
+            "连续种子应取遍含空串的全部候选: {outs:?}"
+        );
+        // 首空候选："|Beta" 剥离落点前后缀保留、原文消失，无残句拼接
+        let tpls2 = vec![("FP_D2".to_string(), "|Beta".to_string())];
+        let out = apply_template_map_seeded("x FP_D2 y", &tpls2, 3);
+        assert!(out == "x  y" || out == "x Beta y", "seed=3 out={out:?}");
+    }
+
     /// issue #122 方案 C1：variant_seed 请求种子——同入参稳定、任一变化即漂移
     /// （跨换号重试/工具执行轮次的候选必变）
     #[test]
@@ -2031,6 +2638,37 @@ mod tests {
         assert_eq!(residual_fingerprint_note(&nosys), None);
     }
 
+    /// 残指纹自检边界：数组多块 system（Claude SDK harness 形态，首块空串、
+    /// 次块命中）参与自检；单条 system 多 marker 逗号全列；空 system 串 → None
+    #[test]
+    fn residual_fingerprint_detection_array_system_and_multi_markers() {
+        // 数组多块 system：首块空串 + 次块含特征词 → Some（first_system_text
+        // 拼接两块文本后扫描）
+        let arr = json!({"messages":[
+            {"role":"system","content":[
+                {"type":"text","text":""},
+                {"type":"text","text":"You are an AI agent running in OpenCode, a coding agent harness."}
+            ]}
+        ]});
+        let b = serde_json::to_vec(&arr).unwrap();
+        let note = residual_fingerprint_note(&b).expect("数组多块 system 应参与自检");
+        assert!(note.contains("opencode"), "{note}");
+        // 单条 system 同时含三类特征词组 → 逗号全列（顺序按特征表，不锁死）
+        let multi = json!({"messages":[
+            {"role":"system","content":"You are an interactive CLI tool. Powered by DeepSeek Harness. Running in OpenCode."}
+        ]});
+        let b2 = serde_json::to_vec(&multi).unwrap();
+        let note2 = residual_fingerprint_note(&b2).expect("多 marker 应全部列出");
+        assert!(note2.contains("interactive cli"), "{note2}");
+        assert!(note2.contains("deepseek harness"), "{note2}");
+        assert!(note2.contains("opencode"), "{note2}");
+        assert_eq!(note2.split(',').count(), 3, "三 marker 逗号连接: {note2}");
+        // 空 system 串 → None（无文本可扫描）
+        let empty =
+            serde_json::to_vec(&json!({"messages":[{"role":"system","content":""}]})).unwrap();
+        assert_eq!(residual_fingerprint_note(&empty), None);
+    }
+
     /// issue #122 方案 C2：激进清洗仅在 aggressive=true（空完成换号重试）时
     /// 应用——未知变体短前缀兜底；已知句默认表整句规则先行（激进不产生二次
     /// 差异）；sanitize=false 时激进规则不生效
@@ -2069,6 +2707,105 @@ mod tests {
         let s4 = v4["messages"][0]["content"].as_str().unwrap();
         assert!(s4.contains("that helps the user with programming work"), "{s4}");
         assert!(!s4.contains("DeepSeek Harness"), "{s4}");
+    }
+
+    /// aggressive Codex 0.145.0 前缀兜底：默认表逐字整句先行（激进不产生二次
+    /// 差异，规则顺序回归锁定）；未知后缀/flavor 变体由短前缀兜底改写；
+    /// prepare 首轮透传、换号重试（aggressive=true）兜底
+    #[test]
+    fn aggressive_codex_rules_catch_unknown_variants() {
+        let mut tpl = default_template_map();
+        tpl.extend(aggressive_template_rules());
+        // 已知整句：默认表先行命中，改写句零品牌词 + 幂等
+        let known = "Codex CLI is an open source project led by OpenAI.";
+        let out = apply_template_map(known, &tpl);
+        assert!(
+            out.starts_with(
+                "The command-line coding tool is an open source project maintained by a dedicated engineering team."
+            ),
+            "{out}"
+        );
+        assert_eq!(apply_template_map(&out, &tpl), out);
+        // 未知后缀变体：aggressive 短前缀兜底，品牌前缀连根消除 + 幂等
+        let variant = "Codex CLI is an open source project driven by volunteers.";
+        let out2 = apply_template_map(variant, &tpl);
+        assert!(
+            out2.starts_with("The command-line coding tool is an open source project"),
+            "{out2}"
+        );
+        assert!(!out2.contains("Codex"), "{out2}");
+        assert_eq!(apply_template_map(&out2, &tpl), out2);
+        // 规则顺序回归：已知整句 prepare aggressive=true 与 false 输出一致
+        // （若激进前缀被挪到默认表之前，"led by OpenAI" 残留即触发本断言）
+        let src = json!({"messages":[{"role":"system","content":known}]});
+        let b = serde_json::to_vec(&src).unwrap();
+        let t0 = prepare_wb_chat_body(&b, "m", "", "", None, true, &tpl, 0, false);
+        let t1 = prepare_wb_chat_body(&b, "m", "", "", None, true, &tpl, 0, true);
+        assert_eq!(t0, t1, "默认表已整句改写，激进规则不应产生二次差异");
+        // prepare 端到端：首轮（false）透传、重试（true）兜底改写——prepare
+        // 自行按 aggressive 标志追加激进规则，此处传纯默认表
+        let src2 = json!({"messages":[{"role":"system","content":variant}]});
+        let b2 = serde_json::to_vec(&src2).unwrap();
+        let tpl_plain = default_template_map();
+        let out0 = prepare_wb_chat_body(&b2, "m", "", "", None, true, &tpl_plain, 0, false);
+        let v0: Value = serde_json::from_slice(&out0).unwrap();
+        assert_eq!(v0["messages"][0]["content"], json!(variant), "首轮不应用激进规则");
+        let out1 = prepare_wb_chat_body(&b2, "m", "", "", None, true, &tpl_plain, 0, true);
+        let v1: Value = serde_json::from_slice(&out1).unwrap();
+        let s1 = v1["messages"][0]["content"].as_str().unwrap();
+        assert!(s1.contains("The command-line coding tool"), "{s1}");
+        assert!(!s1.contains("Codex"), "{s1}");
+    }
+
+    /// 环形缓冲测试互斥锁：empty_sample_note 与既有缓冲测试共用全局 store，
+    /// 串行化防并行交错破坏绝对计数断言
+    fn fp_sample_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// empty_sample_note 收尾门控（issue #99 ① + issue #125）：仅
+    /// CHANNEL_FINGERPRINT_BLOCK 收尾返回「 指纹样本: …」注记并落环形缓冲
+    /// （kind=empty）；其余收尾空串不采样；同 (kind,pool,sample) 去重、跨池
+    /// 不互吞；坏 body 落「body 解析失败」兜底不 panic
+    #[test]
+    fn empty_sample_note_gated_by_exhaust_tag() {
+        let _guard = fp_sample_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        fingerprint_sample_entries_clear();
+        let body = serde_json::to_vec(&json!({
+            "messages":[{"role":"system","content":"You are opencode, an interactive CLI tool that helps users with software engineering tasks."}],
+            "tools":[{"type":"function","function":{"name":"grep","parameters":{"type":"object"}}}]
+        }))
+        .unwrap();
+        // 非指纹拦截收尾：空串注记、不采样
+        assert_eq!(empty_sample_note("POOL_EXHAUSTED", "trae", &body), "");
+        assert_eq!(empty_sample_note("", "wb", &body), "");
+        assert!(fingerprint_sample_entries().is_empty(), "非指纹拦截收尾不采样");
+        // 命中收尾：返回注记并落缓冲（system 画像 + 工具名画像）
+        let note = empty_sample_note("CHANNEL_FINGERPRINT_BLOCK", "trae", &body);
+        assert!(note.starts_with(" 指纹样本: system=\""), "{note}");
+        assert!(note.contains("opencode"), "{note}");
+        assert!(note.contains("tools=[grep](total=1"), "{note}");
+        let entries = fingerprint_sample_entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].kind, "empty");
+        assert_eq!(entries[0].pool, "trae");
+        assert!(entries[0].ts > 0, "unix 秒时间戳");
+        // 同 (kind,pool,sample) 重复收尾去重，不重复占位（注记仍返回）
+        let note2 = empty_sample_note("CHANNEL_FINGERPRINT_BLOCK", "trae", &body);
+        assert!(note2.starts_with(" 指纹样本: "), "{note2}");
+        assert_eq!(fingerprint_sample_entries().len(), 1, "同三元组去重");
+        // 换池不互吞去重
+        assert!(
+            empty_sample_note("CHANNEL_FINGERPRINT_BLOCK", "wb", &body).starts_with(" 指纹样本: ")
+        );
+        assert_eq!(fingerprint_sample_entries().len(), 2, "跨池不互吞");
+        // 坏 body：样本注记「body 解析失败」兜底，不 panic
+        let note3 = empty_sample_note("CHANNEL_FINGERPRINT_BLOCK", "trae", b"not json");
+        assert!(note3.contains("body 解析失败"), "{note3}");
+        assert_eq!(fingerprint_sample_entries().len(), 3);
+        fingerprint_sample_entries_clear();
+        assert!(fingerprint_sample_entries().is_empty());
     }
 
     fn alias_rules() -> Vec<(String, String)> {
@@ -2224,6 +2961,86 @@ mod tests {
         assert_eq!(v["tools"][1]["function"]["name"], json!("c"), "b→c");
         assert_eq!(reverse.get("b").map(String::as_str), Some("a"));
         assert_eq!(reverse.get("c").map(String::as_str), Some("b"));
+    }
+
+    /// 内置默认表收录口径回归（对齐指纹清洗布防客户端，issue #150）：① 各
+    /// 客户端实证独家名在表（Claude Code camelCase 按真实注册名大小写）；
+    /// ② 别名互不相同（同别名冲突先到先得会让第二条静默失效）；
+    /// ③ 别名不与任何规则 from 重名（默认表不依赖链式让出例外）
+    #[test]
+    fn default_tool_alias_rules_cover_client_fingerprints() {
+        let rules = default_tool_alias_rules();
+        // Trae SOLO 独家（v3.8.5 首发七条 + 1.107.1 live harness 补两条）
+        for from in [
+            "ask_user_question",
+            "create_goal",
+            "exit_plan_mode",
+            "get_goal",
+            "interrupt_agent",
+            "job_kill",
+            "job_list",
+            "PureShowWidget",
+            "browser_waiting_for_user_interaction",
+        ] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
+        // Claude Code 独家（camelCase 多词连写特征；v2.1.312 懒加载架构新增六条）
+        for from in [
+            "TodoWrite",
+            "AskUserQuestion",
+            "ListAgents",
+            "ReportFindings",
+            "ScheduleWakeup",
+            "ToolSearch",
+            "DeferredToolPlaceholder",
+            "Workflow",
+        ] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
+        // Cline / Roo 独家（双编辑器拆分 + 任务终结签名 + 追问）
+        for from in [
+            "write_to_file",
+            "replace_in_file",
+            "attempt_completion",
+            "ask_followup_question",
+        ] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
+        // Codex 独家（patch 协议 + 计划跟踪 + 0.145.0 补 goal 管理面与用户输入通道）
+        for from in ["apply_patch", "update_plan", "update_goal", "request_user_input"] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
+        // DSH 独家（0.2.1-rc.2 抓包实证；6 个同名工具经 Trae 段规则覆盖，
+        // 此为剩余独家名）
+        for from in ["subagent_fork", "job_output", "pwsh", "working_directory"] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
+        // CodeBuddy 独家（1.106.1 抓包实证；4 个同名工具经 Cline/Roo 与
+        // Claude Code 段规则覆盖，此为剩余独家名）
+        for from in [
+            "read_lints",
+            "execute_command",
+            "update_memory",
+            "use_skill",
+            "read_rules",
+            "send_message",
+            "DeferExecuteTool",
+        ] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
+        // Qoder 独家（0.4.11 混淆包逆向实证；与 Claude Code 同构的同名工具经
+        // Claude Code 段天然覆盖，此为独家名——mcp 三件套 + 团队协作两件）
+        for from in ["mcp_list", "mcp_get", "mcp_call", "SendMessage", "TaskCreate"] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
+        // 别名卫生：非空、互不相同、不与任何规则 from 重名
+        let aliases: Vec<&str> = rules.iter().map(|(_, t)| t.as_str()).collect();
+        let froms: Vec<&str> = rules.iter().map(|(f, _)| f.as_str()).collect();
+        for a in &aliases {
+            assert!(!a.is_empty());
+            assert_eq!(aliases.iter().filter(|x| *x == a).count(), 1, "别名 {a} 重复");
+            assert!(!froms.contains(a), "别名 {a} 与规则 from 重名");
+        }
     }
 
     /// 工具别名合并语义：默认表全量生效；自定义同名覆盖；to=None 停用（从

@@ -2,10 +2,7 @@
 //! 浏览器打开 SSO 登录页（qoder.cn/sso/login/aliyun?oauth_callback=设备授权页）→ 轮询
 //! deviceToken/poll → dt- 令牌入池。事件契约对齐 wb-oauth（qoder-oauth-progress / qoder-oauth-done）。
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::json;
@@ -30,20 +27,33 @@ impl Drop for OAuthGuard {
     }
 }
 
-/// 系统浏览器打开 URL（explorer.exe 直开：URL 先经 https/http 前缀 + 引号/空格校验，
-/// 再以单参数传递，& / % 等保留字无需 cmd 层转义——issue #140 复审移除 cmd 层，
-/// 消除密集 %XX URL 的理论 %VAR% 展开面）
+/// 系统浏览器打开 URL（issue #153 修复 4：ShellExecuteW「open」动词直开 URL，
+/// 由系统按协议关联选默认浏览器——explorer.exe 直开在部分受限/精简环境下会被
+/// 拒绝或无窗口；URL 先经 https/http 前缀 + 引号/空格校验，单参数传递无 shell
+/// 层，& / % 等保留字无需转义）
 #[cfg(windows)]
 fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
     }
-    Command::new("explorer")
-        .arg(url)
-        .creation_flags(0x08000000)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("打开浏览器失败: {e}"))
+    let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb_wide: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb_wide.as_ptr(),
+            url_wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    // 返回值 > 32 = 成功的 HINSTANCE；≤ 32 为 SE_ERR 错误码
+    if result as usize > 32 {
+        Ok(())
+    } else {
+        Err(format!("打开浏览器失败（ShellExecuteW 错误码 {}）", result as usize))
+    }
 }
 
 /// 非 Windows 占位（explorer/creation_flags 为 Windows 专属，逐函数门控
@@ -96,6 +106,9 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
     let auth_url = flow.auth_url.clone();
     emit_progress(&app, "init", "正在打开 Qoder 登录页…", Some(&auth_url));
     if let Err(e) = open_in_browser(&auth_url) {
+        // 打开失败必须发终态事件（issue #153 修复 4）：仅复位 OAUTH_RUNNING 时
+        // 前端 oauthRunning 弹窗永挂（对齐 emit_done 注释里 issue #44 约定）
+        emit_done(&app, &state.data_dir, false, "", "", &format!("打开登录页失败: {e}"));
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
         return Err(e);
     }

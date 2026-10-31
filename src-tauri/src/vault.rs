@@ -11,7 +11,8 @@
 //! - 所有账号文件读写统一走 `load_accounts` / `save_accounts`：
 //!   读：JSON 明文优先（更新鲜，如 MITM 新捕获）→ 否则从 vault 回填；
 //!   写：非空凭据先写入 vault 并落盘快照 → JSON 占位化；
-//!   vault 写失败时仅保存占位化 JSON 并返回 Err（禁止明文 jwt/refresh_token 落盘）；
+//!   vault 写失败时数据库保持原状并返回 Err（禁止明文落盘，也不销毁库中既有凭据——
+//!   issue #153 修复 1）；
 //! - Rust 签到直调后凭据全程内存传递（原 Python 脚本方案需写解密临时文件，已移除；
 //!   启动清理逻辑保留，兜底清理旧版本残留的临时凭据文件）。
 
@@ -182,7 +183,8 @@ fn vault_password_at(data_dir: &Path) -> Result<Vec<u8>, String> {
     let _ = std::fs::create_dir_all(&conf);
     let key_path = conf.join("vault_key.bin");
     if key_path.exists() {
-        let blob = std::fs::read(&key_path).map_err(|e| format!("读取 vault 密钥失败: {e}"))?;
+        let blob =
+            std::fs::read(&key_path).map_err(|e| vault_key_io_err("读取", &key_path, e))?;
         let pwd = parse_key_file(&blob, &key_path)?;
         // 共享模式一次性迁移：DPAPI 密钥 → V2: 文本（显式开启方生效，见 maybe_convert_to_v2）
         maybe_convert_to_v2(&key_path, &blob, &pwd, data_dir);
@@ -190,8 +192,37 @@ fn vault_password_at(data_dir: &Path) -> Result<Vec<u8>, String> {
     } else {
         let pwd = generate_password()?;
         let blob = dpapi::protect(&pwd)?;
-        std::fs::write(&key_path, &blob).map_err(|e| format!("写入 vault 密钥失败: {e}"))?;
+        std::fs::write(&key_path, &blob).map_err(|e| vault_key_io_err("写入", &key_path, e))?;
         Ok(pwd)
+    }
+}
+
+/// vault 密钥文件 IO 错误映射（issue #153 修复 3）：os error 448 =
+/// ERROR_UNTRUSTED_MOUNT_POINT，典型场景是 conf 目录被改成了 Junction/目录联接
+/// （如用户手工迁移目录），系统拒绝跨联接访问——给出可操作提示而不是裸 OS 码
+fn vault_key_io_err(op: &str, path: &Path, e: std::io::Error) -> String {
+    if e.raw_os_error() == Some(448) {
+        return format!(
+            "{op} vault 密钥失败（os error 448：不受信任的挂载点）——{} 可能位于 Junction/目录联接之下，Windows 拒绝跨联接访问。请将 conf 目录恢复为真实目录（删除联接、把内容移回原位）后重启应用",
+            path.display()
+        );
+    }
+    format!("{op} vault 密钥失败: {e}")
+}
+
+/// 同一错误消息只落一次日志（issue #153 修复 3）：vault 故障期 ns_get 会被
+/// 每账号每次 ensure_fresh 高频触发，相同失败原因会把 app_log 刷爆——进程内
+/// 按消息去重，仅首条落盘；不同消息（不同 key/不同故障）各自首条仍落
+fn log_once(data_dir: &Path, msg: &str) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(msg.to_string())
+    {
+        crate::fs_utils::app_log(data_dir, msg);
     }
 }
 
@@ -316,6 +347,20 @@ fn ns_vault_key(ns: &str, key: &str) -> Vec<u8> {
     format!("ns:{ns}:{key}").into_bytes()
 }
 
+/// 探测 vault 当前是否可用（issue #153 修复 2）：不读写任何记录，仅验证
+/// 打开+取 client 成功。用于调用方区分「vault 系统性故障」与「确实无凭证」——
+/// ns_get 对两者都返回 None（fail-secure），凭证消费方（如 ensure_fresh）
+/// 借此把故障期误判为 no_credential 的情况识别出来，避免触发永久禁用等
+/// 不可自愈的下游处置。
+pub fn available(data_dir: &Path) -> bool {
+    with_open(data_dir, |sh| {
+        sh.get_client(CLIENT_PATH.to_vec())
+            .map(|_| ())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))
+    })
+    .is_ok()
+}
+
 /// 读取命名空间凭证（vault 不可用 / 记录缺失 / 解析失败均返回 None，fail-secure）。
 /// 系统性故障（DPAPI/快照/锁）与「无凭证」在返回值上不可区分——错误先落日志
 /// 留排查线索再回退 None（审查修复：读取侧原完全静默，vault 故障表现为
@@ -336,7 +381,7 @@ pub fn ns_get(data_dir: &Path, ns: &str, key: &str) -> Option<serde_json::Value>
         }
     })
     .inspect_err(|e| {
-        crate::fs_utils::app_log(data_dir, &format!("[vault] ns_get {ns}:{key} 失败: {e}"));
+        log_once(data_dir, &format!("[vault] ns_get {ns}:{key} 失败: {e}"));
     })
     .ok()
     .flatten()
@@ -420,26 +465,29 @@ pub fn load_accounts(state: &AppState) -> AccountsFile {
 }
 
 /// 保存账号文件：非空凭据写入 vault（字段级合并）并落盘快照，JSON 占位化。
-/// vault 写失败时**禁止明文落盘**（审查 P1）：仅保存占位化 JSON（凭据字段清空），
-/// 返回 Err 明确告知「加密存储失败，签到功能不可用直至修复」——宁可丢本次凭据更新，
-/// 也不把 jwt/refresh_token 明文写到磁盘。
-/// 注意：成功与降级路径都会就地清空调用方结构体中的 jwt / refresh_token 字段。
+/// vault 写失败时**禁止明文落盘**（审查 P1）且**数据库保持原状**（issue #153 修复 1）：
+/// 原实现「wipe 占位 + 落库」会在 vault 故障（如 os error 448）时当场销毁库中既有的
+/// 明文凭据（启动迁移场景）且无处恢复；现改为不落库直接返回 Err——迁移场景明文
+/// 保留在库中待 vault 修复后下次启动重试收敛，常规场景本次凭据更新仅存内存。
+/// 注意：仅成功路径会就地清空调用方结构体中的 jwt / refresh_token 字段。
 pub fn save_accounts(state: &AppState, accounts: &mut AccountsFile) -> Result<(), String> {
-    let vault_result = write_vault_secrets(state, accounts);
-    // 无论 vault 写入成败，落盘前一律占位化：vault 失败时严禁明文凭据进入 JSON
-    wipe_placeholders(accounts);
-    if let Err(reason) = &vault_result {
-        fs_utils::app_log(
-            &state.data_dir,
-            &format!("vault 写入失败，已仅保存账号占位信息（禁止明文落盘）: {reason}"),
-        );
+    match write_vault_secrets(state, accounts) {
+        Ok(()) => {
+            // vault 已持久化 → 落库占位（明文唯一驻留地是 vault）
+            wipe_placeholders(accounts);
+            crate::store::docs::accounts_save(&crate::store::db(&state.data_dir), accounts)?;
+            Ok(())
+        }
+        Err(reason) => {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("vault 写入失败，数据库未改动（凭据未持久化，禁止明文落库）: {reason}"),
+            );
+            Err(format!(
+                "加密存储失败，数据库未改动，凭据未持久化（vault 错误: {reason}）"
+            ))
+        }
     }
-    crate::store::docs::accounts_save(&crate::store::db(&state.data_dir), accounts)?;
-    vault_result.map_err(|reason| {
-        format!(
-            "加密存储失败，已仅保存账号占位信息，签到功能不可用直至修复（vault 错误: {reason}）"
-        )
-    })
 }
 
 /// 将账号结构体中的明文凭据占位化（清空 jwt / refresh_token）
@@ -553,7 +601,7 @@ pub fn migrate_on_startup(state: &AppState) {
         ),
         Err(e) => fs_utils::app_log(
             &state.data_dir,
-            &format!("启动迁移: 写入 vault 失败（已仅保留占位信息，禁止明文落盘）: {e}"),
+            &format!("启动迁移: 写入 vault 失败（数据库未改动，明文保留待下次启动重试）: {e}"),
         ),
     }
 }
@@ -594,7 +642,7 @@ pub fn migrate_ns_on_startup(state: &AppState) {
                     Err(e) => fs_utils::app_log(
                         &state.data_dir,
                         &format!(
-                            "启动迁移: WB 账号 {id} 凭证入 vault 失败（已落占位，禁止明文）: {e}"
+                            "启动迁移: WB 账号 {id} 凭证入 vault 失败（数据库未改动，明文保留待重试）: {e}"
                         ),
                     ),
                 }
@@ -617,7 +665,7 @@ pub fn migrate_ns_on_startup(state: &AppState) {
         Ok(_) => {}
         Err(e) => fs_utils::app_log(
             &state.data_dir,
-            &format!("启动迁移: Qoder 凭证入 vault 失败（已落占位，禁止明文）: {e}"),
+            &format!("启动迁移: Qoder 凭证入 vault 失败（数据库未改动，明文保留待重试）: {e}"),
         ),
     }
     // ③ 豆包账号池（doubao_accounts 表）
@@ -642,7 +690,7 @@ pub fn migrate_ns_on_startup(state: &AppState) {
                 ),
                 Err(e) => fs_utils::app_log(
                     &state.data_dir,
-                    &format!("启动迁移: 豆包凭证入 vault 失败（已落占位，禁止明文）: {e}"),
+                    &format!("启动迁移: 豆包凭证入 vault 失败（数据库未改动，明文保留待重试）: {e}"),
                 ),
             }
         }

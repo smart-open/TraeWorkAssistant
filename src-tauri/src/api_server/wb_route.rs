@@ -208,7 +208,22 @@ pub(crate) fn gen_conv_id() -> String {
 
 /// 模型是否处于冷却中；返回剩余秒数（视图感知：buddy-ai 档读独立冷却表）
 pub fn model_cooling_remaining(state: &WbView, model: &str) -> Option<i64> {
-    let map = safe_lock(&state.route_model_cooldowns());
+    model_cooldown_remaining_on(state, state.buddy_ai, model)
+}
+
+/// 指定池档的模型冷却剩余秒数（issue #159 归因用）：不经 WbView 直接按 buddy_ai
+/// 布尔选冷却表——routes.rs 侧仅有 ApiSharedState（无视图上下文），池健康预检
+/// （dispatch pool_health）与此处读同一张表，归因才准确
+pub(crate) fn model_cooldown_remaining_on(
+    state: &ApiSharedState,
+    buddy_ai: bool,
+    model: &str,
+) -> Option<i64> {
+    let map = safe_lock(if buddy_ai {
+        &state.buddy_ai_model_cooldowns
+    } else {
+        &state.model_cooldowns
+    });
     let (until, _) = map.get(model)?;
     let now = now_ts();
     if *until > now {
@@ -332,6 +347,116 @@ fn upstream_msg(resp_body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 从上游错误文案解析**账号级**解冻时刻（issue #159，pool::note_error_until 配套）：
+/// ① 绝对时刻：复用 parse_quota_reset_at（「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」）；
+/// ② 相对秒：「N秒后…」「N 秒后…」「Ns后…」「after Ns / after N seconds」等
+///    恢复/重试话术。
+/// 返回 Unix 秒，有效性钳制与 parse_quota_reset_at 同口径（未来且 ≤7 天）。
+/// 账号级/模型级冷却解耦后，该值仅供 note_error_until 冷却对应账号，
+/// 不再连带冷却整池同名模型（原缺陷：单账号限额把模型冷却表钉到解冻时刻 →
+/// pool_health 跳过整个 buddy 池 → 回退池无账号 → 503 no healthy）
+pub(crate) fn parse_account_unfreeze_at(msg: &str) -> Option<i64> {
+    if let Some(ts) = parse_quota_reset_at(msg) {
+        return Some(ts);
+    }
+    parse_relative_unfreeze_secs(msg).map(|secs| now_ts() + secs)
+}
+
+/// 相对秒形态解析（零正则，项目约定）：
+/// 入口统一 ASCII 小写归一（审查修复）：「30S后」「After 30 Seconds」等大写
+/// 变体与文档词形一致命中；to_ascii_lowercase 逐字节替换不改长度与 UTF-8 边界，
+/// 后续切片/数字解析安全；归一化后锚点与单位均为精确比较。
+/// - 中文锚点「秒后」「s后」：数字在锚点前（允许一个空格），如「30秒后重试」「45s后恢复」；
+/// - 英文锚点「after」「 in 」：数字在锚点后（允许空格），且必须跟完整词形秒单位
+///   （s/sec/secs/second/seconds，单位后须为词边界）——
+///   防「after 3 min」「in 10 steps」等非秒词误判。
+/// 数字有效性：>0 且 ≤7 天；超长数字段（>9 位）视为解析异常不命中；
+/// 数字段前紧贴「.」「,」视为小数/千分位片段（如「3.5s后」）不命中，避免截断误读
+fn parse_relative_unfreeze_secs(msg: &str) -> Option<i64> {
+    const MAX_SECS: i64 = 7 * 24 * 3600;
+    let msg = &msg.to_ascii_lowercase();
+    let b = msg.as_bytes();
+    // 从 i（不含）向前跳过一个空格后回扫连续 ASCII 数字，返回数值
+    fn digits_before(b: &[u8], i: usize) -> Option<i64> {
+        let mut j = i;
+        if j > 0 && b[j - 1] == b' ' {
+            j -= 1;
+        }
+        let end = j;
+        while j > 0 && b[j - 1].is_ascii_digit() {
+            j -= 1;
+        }
+        if j == end || end - j > 9 {
+            return None;
+        }
+        // 审查修复：数字段前紧贴「.」或「,」为小数/千分位片段（如「3.5s后」会截成
+        // 5、「1,500秒后」会截成 500），拒绝命中交由默认固定时长冷却兜底
+        if j > 0 && (b[j - 1] == b'.' || b[j - 1] == b',') {
+            return None;
+        }
+        b[j..end].iter().try_fold(0i64, |acc, c| {
+            acc.checked_mul(10)
+                .and_then(|a| a.checked_add((*c - b'0') as i64))
+        })
+    }
+    // 中文锚点（数字在锚点前）
+    for anchor in ["秒后", "s后"] {
+        let mut from = 0usize;
+        while let Some(rel) = msg[from..].find(anchor) {
+            let at = from + rel;
+            if let Some(v) = digits_before(b, at).filter(|v| *v > 0 && *v <= MAX_SECS) {
+                return Some(v);
+            }
+            from = at + anchor.len();
+        }
+    }
+    // 英文锚点（数字在锚点后，秒单位须为完整词形 s/sec/secs/second/seconds）
+    for anchor in ["after", " in "] {
+        let mut from = 0usize;
+        while let Some(rel) = msg[from..].find(anchor) {
+            let mut i = from + rel + anchor.len();
+            while i < b.len() && b[i] == b' ' {
+                i += 1;
+            }
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > start && i - start <= 9 {
+                let mut j = i;
+                if j < b.len() && b[j] == b' ' {
+                    j += 1;
+                }
+                // 审查修复：单位须为完整词形且后接词边界（非 ASCII 字母数字），
+                // 防「steps/sessions」类 s 开头非秒词误判；大小写由入口归一化
+                // 覆盖，此处精确比较即可
+                for unit in [
+                    "seconds".as_bytes(),
+                    "second".as_bytes(),
+                    "secs".as_bytes(),
+                    "sec".as_bytes(),
+                    "s".as_bytes(),
+                ] {
+                    let k = j + unit.len();
+                    if k <= b.len()
+                        && &b[j..k] == unit
+                        && (k >= b.len() || !b[k].is_ascii_alphanumeric())
+                    {
+                        if let Ok(v) = msg[start..i].parse::<i64>() {
+                            if v > 0 && v <= MAX_SECS {
+                                return Some(v);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            from = start.max(from + anchor.len());
+        }
+    }
+    None
+}
+
 /// 请求成功后清除该模型的冷却与失败计数
 pub fn clear_model_failure(state: &WbView, model: &str) {
     safe_lock(&state.route_model_cooldowns()).remove(model);
@@ -355,10 +480,13 @@ pub fn load_templates(state: &WbView) -> Vec<(String, String)> {
 
 /// 工具别名表加载（issue #150）：kv `tool_alias_map`，合并语义同模板表
 /// （内置默认全量生效，自定义按 from 覆盖/追加，to=null/空串=停用）。
-/// 单键不分档；当前接线面仅 Trae 池（routes.rs solo 管线：流式/聚合/对冲
-/// converted2/11128 rebuild 重放 + 响应侧 sse.rs 四回改点）——WB 池（wb_sse
-/// 管线）与 qoder 未接入，接入时同键复用即可（工具集指纹是上游风控家族
-/// 共性，分档无收益）；每请求读取（kv 单行 + mtime 缓存），保存即对下一请求生效
+/// 单键不分档；当前接线面：① Trae 池（routes.rs solo 管线：流式/聚合/对冲
+/// converted2/11128 rebuild 重放 + 响应侧 sse.rs 四回改点）；② Qoder 池
+/// （issue #158 P1-1/P1-2：qoder_route 经 `apply_tool_alias_forward_value`
+/// 在 active_peek 上改写 → 响应侧 wb_sse 三回改点 + completion_to_anthropic 逆
+/// 映射，受 `qoder_sanitize` 池级开关门控）。WB 池（wb_sse 管线）未接入，接入时
+/// 同键复用即可（工具集指纹是上游风控家族共性，分档无收益）；每请求读取
+///（kv 单行 + mtime 缓存），保存即对下一请求生效
 pub fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
     let custom = crate::store::db(&state.data_dir)
         .kv_get::<wb_payload::ToolAliasFile>("tool_alias_map")
@@ -440,6 +568,46 @@ impl Drop for HedgeLease {
     }
 }
 
+/// 竞速桥接行源读错误（wb_upstream 共享槽）合并进 error_info（issue #158 P2-2）：
+/// 行源被 `Box<dyn Iterator>` 擦拭类型 + `from_iterator` 桥接后，wb_sse 层只见
+/// 桥 EOF，读错误须由路由层从槽取出。仅覆盖「无错误」与「空完成哨兵」两种占位
+/// ——流内业务错误帧的 error_info 更具诊断价值，保留不覆盖。
+/// 返回 Some(哨兵) 表示该流/聚合被传输层掐断。
+fn merge_transport_cut_info(
+    error_info: Option<(i64, String)>,
+    read_slot: &wb_upstream::ReadErrSlot,
+) -> Option<(i64, String)> {
+    match super::transport_cut_from_slot(read_slot) {
+        Some(cut) => match error_info {
+            None => Some(cut),
+            Some((c, m)) if super::is_empty_completion(c, &m) => Some(cut),
+            other => other,
+        },
+        None => error_info,
+    }
+}
+
+/// 聚合路径的掐断结果改写：槽有读错误时丢弃部分响应（非流式不得把截断数据
+/// 当成功交付，可能含残缺 tool_calls JSON），改写为 (None, Some(哨兵)) 走
+/// 流内错误换号路径；业务错误已存在时保留。空完成哨兵同样覆盖（审查修复：
+/// 零内容掐断时 aggregate 先落空完成哨兵，is_none() 守卫会漏合并——掐断被
+/// 计入空完成指纹口径，轮换耗尽时可误判 CHANNEL_FINGERPRINT_BLOCK；与流式
+/// merge_transport_cut_info 同口径：网络掐断不属于空完成）
+fn aggregate_with_transport_cut(
+    resp: Option<serde_json::Value>,
+    error_info: Option<(i64, String)>,
+    read_slot: &wb_upstream::ReadErrSlot,
+) -> (Option<serde_json::Value>, Option<(i64, String)>) {
+    match super::transport_cut_from_slot(read_slot) {
+        Some(cut) => match error_info {
+            None => (None, Some(cut)),
+            Some((c, m)) if super::is_empty_completion(c, &m) => (None, Some(cut)),
+            other => (resp, other),
+        },
+        None => (resp, error_info),
+    }
+}
+
 /// 首字竞速胜者信息：生效账号（主/对冲接管者）+ 对冲计数租约
 struct RaceWin {
     lines: Box<dyn Iterator<Item = String> + Send>,
@@ -453,6 +621,10 @@ struct RaceWin {
     /// settle_hedge 据此对败者补记错误/冷却，账单可解释
     primary_failed: bool,
     hedge_failed: bool,
+    /// 胜者行源读错误共享槽（issue #158 P2-2）：行源被 Box 擦拭类型 + 桥接
+    /// 后，relay 线程的 io::Error 只能经槽跨层读取——路由层在 EOF 兜底处
+    /// 取出合并为传输掐断哨兵
+    read_slot: wb_upstream::ReadErrSlot,
 }
 
 /// 首字竞速（F-76③）：对冲关闭（阈值 0）时与纯首字超时语义完全一致；开启时
@@ -475,14 +647,18 @@ fn race_first_byte(
     // issue #138 P1：大 body 跳过首字对冲——对冲需 converted.to_vec() 全量快照
     // 并按 hedge 账号整包重建请求，大包下内存瞬时翻倍，得不偿失（默认 256KiB）
     if hedge_ms == 0 || converted.len() > super::routes::HEDGE_SKIP_BODY_BYTES {
-        return wb_upstream::lines_with_first_byte_timeout(reader).map(|lines| RaceWin {
-            lines,
-            uid: primary_uid.to_string(),
-            hedge: None,
-            takeover: false,
-            primary_failed: false,
-            hedge_failed: false,
-        });
+        // P2-2：tracked 变体——行源被 Box 擦拭类型后读错误须经共享槽跨层读取
+        let read_slot = wb_upstream::new_read_err_slot();
+        return wb_upstream::lines_with_first_byte_timeout_tracked(reader, read_slot.clone())
+            .map(|lines| RaceWin {
+                lines,
+                uid: primary_uid.to_string(),
+                hedge: None,
+                takeover: false,
+                primary_failed: false,
+                hedge_failed: false,
+                read_slot,
+            });
     }
     let state2 = state.clone();
     let tried2 = tried.clone();
@@ -535,6 +711,7 @@ fn race_first_byte(
                 takeover: out.takeover,
                 primary_failed: out.primary_failed,
                 hedge_failed: out.hedge_failed,
+                read_slot: out.read_slot,
             })
         }
         Err(()) => {
@@ -765,6 +942,8 @@ fn run_wb_stream(
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+    // PR #162：传输掐断计数——全池被掐时耗尽收尾改报传输掐断而非误报无健康账号
+    let mut cut_hits: usize = 0;
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
     let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
     // 审查修复（L1）：最近绑定账号（绑定成功才更新）——外层断连终局归因复用，
@@ -800,8 +979,11 @@ fn run_wb_stream(
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
                     let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
-                    let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
+                        empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+                        state.pool_label(),
+                    );
                     // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）
                     // 才标记，TTL 内同池新请求直接激进起步，不再从零试探烧账号
                     super::wb_payload::mark_channel_fp_block(
@@ -823,9 +1005,10 @@ fn run_wb_stream(
                     let sample_note =
                         wb_payload::empty_sample_note(&exhaust_tag, state.pool_label(), body_vec);
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} reasons=[{}]{}",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool={} reasons=[{}]{}",
                         tried.len(),
                         empty_hits,
+                        cut_hits,
                         state.pool_label(),
                         diag_summary.join(", "),
                         sample_note,
@@ -948,7 +1131,10 @@ fn run_wb_stream(
                         Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
                     );
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded);
+                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded, None);
+                    // P2-2：竞速桥接行源的读错误在共享槽（wb_sse 只见桥 EOF）——
+                    // 合并为传输掐断哨兵，按账号无关故障处置
+                    let error_info = merge_transport_cut_info(error_info, &win.read_slot);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         // 宽口径提取（别名 + 字符串数字形态，审查 P2）
@@ -976,6 +1162,26 @@ fn run_wb_stream(
                     }
                     match error_info {
                         Some((code, msg)) => {
+                            if super::is_transport_cut(code, &msg) {
+                                // 传输层掐断（issue #158 P2-2，与 Trae 池 sse.rs 同口径）：
+                                // 账号无关的传输故障——不冷却、不解绑粘性、不计空完成
+                                // 指纹。未流出 → 换号（收尾帧未发）；已流出 → 就地收尾
+                                // （终止帧已由 stream_forward_ex EOF-with-content 分支
+                                // 补发，客户端看到完整流），上方通用记账块已落失败行
+                                if sent_any {
+                                    state.logger.log_request_ttfb(
+                                        state.pool_label(), "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.route_pool().name_of(win_uid), Some(&msg),
+                                    );
+                                    return;
+                                }
+                                // PR #162：cut_hits 计入轮换耗尽归因——全池被掐时
+                                // exhaust_message_with_transport_cut 报传输掐断而非
+                                // 误报 "no healthy account available"（与 trae 池同口径）
+                                cut_hits += 1;
+                                break;
+                            }
                             if super::is_empty_completion(code, &msg) {
                                 // sent_any 护栏（对齐 qoder_route）：内容已流出时换号重发
                                 // 会向同一 SSE 流拼接第二份完整响应 → 就地收尾不再重试
@@ -1065,8 +1271,15 @@ fn run_wb_stream(
                             }
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
-                                state.route_pool().note_error(win_uid, kind);
-                                note_model_failure_ex(state, model, Some(&msg));
+                                // issue #159：账号级/模型级冷却解耦——账号级错误带解冻
+                                // 时刻精确冷却该账号；模型级冷却仅对网关/模型级故障
+                                // （Server/NotFound/Client）生效，防单账号限额把整池
+                                // 同名模型钉死 → pool_health 跳过 buddy 池 → 503
+                                let unfreeze = parse_account_unfreeze_at(&msg);
+                                state.route_pool().note_error_until(win_uid, kind, unfreeze);
+                                if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
+                                    note_model_failure_ex(state, model, Some(&msg));
+                                }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
@@ -1198,12 +1411,21 @@ fn run_wb_stream(
                                 }
                             }
                             let kind = classify_error(status, &resp_body);
-                            state.route_pool().note_error(&picked.uid, kind);
-                            // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                            if kind.unbinds_sticky() {
-                                state.route_sticky().unbind_uid(&picked.uid);
+                            if kind != ErrKind::None {
+                                // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
+                                // 账号级/模型级冷却解耦——模型级冷却仅对网关/模型级故障生效，
+                                // 防单账号限额文案把整池同名模型钉死 → 503
+                                let upstream = upstream_msg(&resp_body);
+                                let unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
+                                state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
+                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                if kind.unbinds_sticky() {
+                                    state.route_sticky().unbind_uid(&picked.uid);
+                                }
+                                if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
+                                    note_model_failure_ex(state, model, upstream.as_deref());
+                                }
                             }
-                            note_model_failure_ex(state, model, upstream_msg(&resp_body).as_deref());
                             *safe_lock(&state.last_error) = Some(format!(
                                 "wb uid={} status={} body={}",
                                 picked.uid,
@@ -1320,6 +1542,8 @@ pub async fn wb_aggregate_chat(
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // PR #162：传输掐断计数（聚合侧对齐流式路径）
+        let mut cut_hits: usize = 0;
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
         let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
 
@@ -1338,8 +1562,11 @@ pub async fn wb_aggregate_chat(
                             start_ts.elapsed().as_millis() as u64, 0, 0);
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
-                        let (exhaust_msg, exhaust_tag) =
-                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
+                        let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
+                            empty_hits, tried.len(), healthy_total, hard_credit_cnt, cut_hits,
+                            state.pool_label(),
+                        );
                         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
                         super::wb_payload::mark_channel_fp_block(
                             state.pool_label(),
@@ -1349,9 +1576,10 @@ pub async fn wb_aggregate_chat(
                         // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）
                         if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
                             state.logger.log_debug_line(format!(
-                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool={} 指纹样本: {}",
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool={} 指纹样本: {}",
                                 tried.len(),
                                 empty_hits,
+                                cut_hits,
                                 state.pool_label(),
                                 wb_payload::fingerprint_sample(&body_vec),
                             ));
@@ -1449,7 +1677,12 @@ pub async fn wb_aggregate_chat(
                         guard = settle_hedge(&state, &mut win, guard, &picked.uid);
                         let win_uid = win.uid.as_str();
                         let (resp, error_info) =
-                            wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()));
+                            wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()), None);
+                        // P2-2：读错误槽合并——掐断时丢弃部分响应（非流式不得把
+                        // 截断数据当成功交付，可能含残缺 tool_calls JSON），按流内
+                        // 错误换号重试
+                        let (resp, error_info) =
+                            aggregate_with_transport_cut(resp, error_info, &win.read_slot);
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {
                             (Some(mut r), None) => {
@@ -1490,6 +1723,18 @@ pub async fn wb_aggregate_chat(
                                 return Ok(r);
                             }
                             (None, Some((code, msg))) => {
+                                // P2-2：传输层掐断（账号无关传输故障）——不冷却、不解绑
+                                // 粘性、不计空完成指纹，换号重试
+                                if super::is_transport_cut(code, &msg) {
+                                    state.logger.log_request_ttfb(
+                                        state.pool_label(), "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.route_pool().name_of(win_uid), Some(&msg),
+                                    );
+                                    // PR #162：cut_hits 计入轮换耗尽归因（与流式路径同口径）
+                                    cut_hits += 1;
+                                    break;
+                                }
                                 // 11128 流内形态（issue #123）：口径同下方 Err 分支——
                                 // 未清洗 → 强制清洗同号重试一次；已清洗仍命中 →
                                 // 落指纹样本后换号（不冷却：指纹拦截与账号无关）
@@ -1532,8 +1777,12 @@ pub async fn wb_aggregate_chat(
                                 }
                                 let kind = classify_wb_error(code, &msg);
                                 if kind != ErrKind::None {
-                                    state.route_pool().note_error(win_uid, kind);
-                                    note_model_failure_ex(&state, &model, Some(&msg));
+                                    // issue #159：账号级/模型级冷却解耦（口径同流式路径）
+                                    let unfreeze = parse_account_unfreeze_at(&msg);
+                                    state.route_pool().note_error_until(win_uid, kind, unfreeze);
+                                    if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
+                                        note_model_failure_ex(&state, &model, Some(&msg));
+                                    }
                                     // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {
                                         state.route_sticky().unbind_uid(&win_uid);
@@ -1630,12 +1879,20 @@ pub async fn wb_aggregate_chat(
                                     }
                                 }
                                 let kind = classify_error(status, &resp_body);
-                                state.route_pool().note_error(&picked.uid, kind);
-                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                if kind.unbinds_sticky() {
-                                    state.route_sticky().unbind_uid(&picked.uid);
+                                if kind != ErrKind::None {
+                                    // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
+                                    // 账号级/模型级冷却解耦（口径同流式路径）
+                                    let upstream = upstream_msg(&resp_body);
+                                    let unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
+                                    state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
+                                    // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                    if kind.unbinds_sticky() {
+                                        state.route_sticky().unbind_uid(&picked.uid);
+                                    }
+                                    if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
+                                        note_model_failure_ex(&state, &model, upstream.as_deref());
+                                    }
                                 }
-                                note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
                                 // 每请求终态单行（审查问题6）：SwitchKey → 换号是中间态，
@@ -1680,6 +1937,7 @@ pub async fn wb_aggregate_chat(
                     &resp,
                     &format!("msg_{}", now_ts()),
                     &model_out,
+                    None,
                 ),
                 Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_out),
                 Protocol::Responses => super::wb_responses::completion_to_responses(
@@ -1884,7 +2142,10 @@ pub async fn wb_tool_exec_chat(
                 let ttfb_start = Instant::now();
                 match wb_upstream::make_wb_request(&creds, &conv_id, &converted) {
                     Ok(reader) => {
-                        let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
+                        // P2-2：tracked 行源 + 槽——聚合 EOF 掐断可识别，截断响应
+                        // 不得当成功交付（代执行场景会拿到残缺 tool_calls）
+                        let read_slot = wb_upstream::new_read_err_slot();
+                        let lines = match wb_upstream::lines_with_first_byte_timeout_tracked(reader, read_slot.clone()) {
                             Ok(l) => l,
                             Err(()) => {
                                 state.route_pool().note_error(&picked.uid, ErrKind::Server);
@@ -1894,8 +2155,23 @@ pub async fn wb_tool_exec_chat(
                         };
                         last_ttfb_ms = Some(ttfb_start.elapsed().as_millis() as u64);
                         let (completion, error_info) =
-                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
+                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), None);
+                        // P2-2：读错误槽合并——掐断丢弃部分响应，按轮失败处理
+                        let (completion, error_info) =
+                            aggregate_with_transport_cut(completion, error_info, &read_slot);
                         if let Some((code, msg)) = error_info {
+                            // 传输层掐断（issue #158 P2-2）：账号无关传输故障——
+                            // 不冷却账号/模型；本轮按上游失败如实失败（不伪装成功）
+                            if super::is_transport_cut(code, &msg) {
+                                state.logger.log_request_ttfb(
+                                    state.pool_label(), "POST", "/v1/responses", &model, stream, 200, &picked.uid,
+                                    start_ts.elapsed().as_millis() as u64, last_ttfb_ms, &key_name,
+                                    &state.route_pool().name_of(&picked.uid), Some(&msg),
+                                );
+                                *safe_lock(&state.last_error) =
+                                    Some(format!("wb-toolexec uid={} code={} msg={}", picked.uid, code, msg));
+                                break Err(msg);
+                            }
                             // 11128 流内形态（issue #123）：口径同下方 Err 分支——
                             // round 回退重跑当前轮（不消耗轮次，下一轮循环顶部
                             // 按新 sanitize 重建请求体）；已清洗仍命中 → 落指纹
@@ -1934,8 +2210,12 @@ pub async fn wb_tool_exec_chat(
                             }
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
-                                state.route_pool().note_error(&picked.uid, kind);
-                                note_model_failure_ex(&state, &model, Some(&msg));
+                                // issue #159：账号级/模型级冷却解耦（口径同流式路径）
+                                let unfreeze = parse_account_unfreeze_at(&msg);
+                                state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
+                                if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
+                                    note_model_failure_ex(&state, &model, Some(&msg));
+                                }
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.route_sticky().unbind_uid(&picked.uid);
@@ -2108,12 +2388,20 @@ pub async fn wb_tool_exec_chat(
                                     }
                                 }
                                 let kind = classify_error(status, &resp_body);
-                                state.route_pool().note_error(&picked.uid, kind);
-                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                if kind.unbinds_sticky() {
-                                    state.route_sticky().unbind_uid(&picked.uid);
+                                if kind != ErrKind::None {
+                                    // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
+                                    // 账号级/模型级冷却解耦（口径同流式路径）
+                                    let upstream = upstream_msg(&resp_body);
+                                    let unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
+                                    state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
+                                    // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                                    if kind.unbinds_sticky() {
+                                        state.route_sticky().unbind_uid(&picked.uid);
+                                    }
+                                    if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
+                                        note_model_failure_ex(&state, &model, upstream.as_deref());
+                                    }
                                 }
-                                note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
                                 break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 200)));
                             }
                             RetryAction::Fatal => {
@@ -2176,8 +2464,14 @@ pub async fn wb_tool_exec_chat(
                 // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                 Err(last_err.unwrap_or_else(|| {
                     let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
-                    let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
+                    let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                        empty_hits,
+                        tried.len(),
+                        healthy_total,
+                        hard_credit_cnt,
+                        "wb",
+                    );
                     // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导才标记
                     super::wb_payload::mark_channel_fp_block(
                         state.pool_label(),
@@ -2409,6 +2703,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merge_transport_cut_info_overrides_placeholder_only() {
+        // 槽空（正常完成/桥接未及拉取）：error_info 原样保留
+        let empty_slot = wb_upstream::new_read_err_slot();
+        assert!(merge_transport_cut_info(None, &empty_slot).is_none());
+        let business = Some((11128i64, "illegal channel".into()));
+        assert_eq!(
+            merge_transport_cut_info(business.clone(), &empty_slot).unwrap().0,
+            11128
+        );
+
+        // 槽有读错误：None → 哨兵
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST".into());
+        let merged = merge_transport_cut_info(None, &slot).expect("掐断必须上抛哨兵");
+        assert!(crate::api_server::is_transport_cut(merged.0, &merged.1));
+
+        // 槽有读错误：空完成哨兵被覆盖（不计 empty_hits）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST".into());
+        let empty = Some((
+            crate::api_server::EMPTY_COMPLETION_CODE,
+            crate::api_server::EMPTY_COMPLETION_MSG.to_string(),
+        ));
+        let merged = merge_transport_cut_info(empty, &slot).expect("覆盖空完成占位");
+        assert!(crate::api_server::is_transport_cut(merged.0, &merged.1));
+
+        // 槽有读错误：业务错误优先保留（不被覆盖）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST".into());
+        let business = Some((11128i64, "illegal channel".into()));
+        assert_eq!(
+            merge_transport_cut_info(business, &slot).unwrap().0,
+            11128,
+            "业务错误不得被掐断哨兵覆盖"
+        );
+    }
+
+    #[test]
+    fn aggregate_with_transport_cut_discards_partial_resp() {
+        // 掐断 + 无业务错误 → 丢弃部分响应，改写哨兵（换号路径）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST".into());
+        let partial = Some(serde_json::json!({"choices": [{"delta": {}}]}));
+        let (resp, err) = aggregate_with_transport_cut(partial, None, &slot);
+        assert!(resp.is_none(), "截断的部分响应必须丢弃");
+        let (code, msg) = err.expect("掐断必须转错误通道");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+
+        // 正常完成（槽空）→ 原样
+        let empty_slot = wb_upstream::new_read_err_slot();
+        let full = Some(serde_json::json!({"choices": []}));
+        let (resp, err) = aggregate_with_transport_cut(full.clone(), None, &empty_slot);
+        assert_eq!(resp, full);
+        assert!(err.is_none());
+
+        // 业务错误已存在 → 保留（含部分响应为 None 的常规错误形态）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("h2 RST".into());
+        let (resp, err) =
+            aggregate_with_transport_cut(None, Some((11128i64, "illegal".into())), &slot);
+        assert!(resp.is_none());
+        assert_eq!(err.unwrap().0, 11128);
+
+        // 零内容掐断（审查修复）：aggregate 先落空完成哨兵 → 必须覆盖为掐断
+        // 哨兵，不得计入空完成指纹口径（否则轮换耗尽可误判指纹拦截）
+        let slot = wb_upstream::new_read_err_slot();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some("connection reset by peer".into());
+        let (resp, err) = aggregate_with_transport_cut(
+            None,
+            Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                crate::api_server::EMPTY_COMPLETION_MSG.to_string(),
+            )),
+            &slot,
+        );
+        assert!(resp.is_none());
+        let (code, msg) = err.expect("掐断须覆盖空完成哨兵");
+        assert!(crate::api_server::is_transport_cut(code, &msg));
+        assert!(!crate::api_server::is_empty_completion(code, &msg));
+    }
+
+    #[test]
     fn classify_wb_error_ranges() {
         assert!(matches!(classify_wb_error(401, "x"), ErrKind::SessionDead));
         assert!(matches!(classify_wb_error(429, "x"), ErrKind::SoftRate));
@@ -2463,6 +2839,83 @@ mod tests {
             reset.format("%Y-%m-%d %H:%M:%S")
         );
         assert_eq!(parse_quota_reset_at(&dual), Some(reset.timestamp()));
+    }
+
+    /// issue #159：账号级解冻时刻解析——绝对形态与 parse_quota_reset_at 同源；
+    /// 相对秒形态覆盖中英文锚点；不可解析落 None（调用方回退固定时长冷却）
+    #[test]
+    fn parse_account_unfreeze_at_absolute_and_relative() {
+        // ① 绝对形态：与 parse_quota_reset_at 完全同源
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(3))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let abs_msg = format!(
+            "当前模型使用额度已达上限，将在 {} UTC+8 重置",
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        assert_eq!(
+            parse_account_unfreeze_at(&abs_msg),
+            parse_quota_reset_at(&abs_msg)
+        );
+        assert_eq!(parse_account_unfreeze_at(&abs_msg), Some(reset.timestamp()));
+        // ② 相对秒：中文锚点（含空格变体）与英文 after/in 秒单位锚点
+        // （区间断言容忍 now 采样与内部 now_ts 的秒级推进）
+        let now = now_ts();
+        for (msg, expect) in [
+            ("30秒后重试", 30i64),
+            ("30 秒后重试", 30),
+            ("45s后恢复", 45),
+            ("after 45s", 45),
+            ("retry after 45 seconds", 45),
+            ("retry in 20 seconds", 20),
+        ] {
+            let ts = parse_account_unfreeze_at(msg).unwrap_or_else(|| panic!("应解析: {msg}"));
+            assert!(
+                (expect..=expect + 5).contains(&(ts - now)),
+                "相对秒偏差: {msg} got {}",
+                ts - now
+            );
+            assert!(ts > now, "必须在未来: {msg}");
+        }
+        // ③ 不可解析 → None
+        assert_eq!(parse_account_unfreeze_at("quota exceeded"), None);
+        assert_eq!(parse_account_unfreeze_at("upstream 500 error"), None);
+        // ④ 审查修复回归：s 开头非秒词不误判（单位须完整词形 + 词边界）
+        assert_eq!(parse_account_unfreeze_at("done in 10 steps"), None);
+        assert_eq!(parse_account_unfreeze_at("quota exceeded after 5 sessions"), None);
+        assert_eq!(parse_account_unfreeze_at("ok in 2 sets"), None);
+        // ⑤ 小数/千分位片段不命中（digits_before 分隔符守卫）
+        assert_eq!(parse_account_unfreeze_at("3.5s后重试"), None);
+        assert_eq!(parse_account_unfreeze_at("3.5秒后重试"), None);
+        assert_eq!(parse_account_unfreeze_at("1,500秒后重试"), None);
+        // ⑥ 完整词形秒单位仍命中（入口归一化 + 词边界放行标点/结尾）
+        let now2 = now_ts();
+        for (msg, expect) in [
+            ("after 30 secs", 30i64),
+            ("try in 45 SECONDS", 45),
+            ("after 1 sec", 1),
+            ("10s后恢复", 10),
+        ] {
+            let ts = parse_account_unfreeze_at(msg).unwrap_or_else(|| panic!("应解析: {msg}"));
+            assert!(
+                (expect..=expect + 5).contains(&(ts - now2)),
+                "相对秒偏差: {msg} got {}",
+                ts - now2
+            );
+        }
+        // ⑦ 大写变体回归（入口归一化修复）：锚点/单位大写形态与文档词形一致命中
+        let now3 = now_ts();
+        for (msg, expect) in [
+            ("30S后恢复", 30i64),
+            ("After 30 Seconds", 30),
+            ("Retry AFTER 45 Secs.", 45),
+        ] {
+            let ts = parse_account_unfreeze_at(msg).unwrap_or_else(|| panic!("应解析: {msg}"));
+            assert!(
+                (expect..=expect + 5).contains(&(ts - now3)),
+                "相对秒偏差: {msg} got {}",
+                ts - now3
+            );
+        }
     }
 
     /// upstream_msg 三种字段形态（message / error.message / msg）提取

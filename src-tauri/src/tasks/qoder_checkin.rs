@@ -1295,7 +1295,11 @@ fn process_account(
     let (creds, refreshed, note) = qoder_common::ensure_fresh(state, agent, &aid, opts.lazy_hours);
     if creds.access_token.is_empty() {
         let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
-                       "message": format!("无可用凭证（{note}）") });
+                       "message": if note == "vault_down" {
+                           "凭证加密存储暂时不可用（vault 故障），稍后自动恢复".to_string()
+                       } else {
+                           format!("无可用凭证（{note}）")
+                       } });
         // 审查 M11：no_credential（store 无凭证）与 auth_dead 同属终态——重试
         // 不会凭空产生凭证，单列免全天无效重试；refresh_failed/refresh_busy 为
         // 暂态不标记（调度器冷却后自动重试）

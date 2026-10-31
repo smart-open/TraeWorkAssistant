@@ -56,8 +56,10 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
         let (_creds, _did, note) = qoder_common::ensure_fresh(state, &agent, id, LAZY_HOURS);
         match note {
             "refreshed" => refreshed += 1,
-            // 暂态失败（网络/服务端）：返 Err 交调度器 30 分钟冷却重试，可能自行恢复
-            "refresh_failed" => failed += 1,
+            // 暂态失败（网络/服务端）：返 Err 交调度器 30 分钟冷却重试，可能自行恢复；
+            // vault_down（issue #153 修复 2）：vault 系统性故障凭证读空——同样暂态，
+            // 不得计入 permanent（否则故障期账号被误判需重登）
+            "refresh_failed" | "vault_down" => failed += 1,
             // 永久失败（PAT 被拒 / 凭证过期需重登 / refresh_token 被服务端 4xx 永久拒绝
             // ——P1 分类后 auth_dead 已在 ensure_fresh 内回写池 needs_relogin）：
             // 重试无解。返 Ok 停止 30 分钟无效重试循环（原实现计失败会全天 48 次 tick

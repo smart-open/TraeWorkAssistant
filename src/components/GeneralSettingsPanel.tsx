@@ -502,7 +502,7 @@ export default function GeneralSettingsPanel() {
         </div>
       </section>
 
-      {/* 通知渠道（F-19，Trae/Buddy 全平台共用） */}
+      {/* 通知渠道（F-19，全部应用共用） */}
       <section className="card p-4">
         <div className="mb-1 flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -519,67 +519,117 @@ export default function GeneralSettingsPanel() {
           </button>
         </div>
         <p className="mb-3 text-xs text-slate-400">
-          签到完成 / 调度任务失败时推送到手机（Bark / Server酱）或自建 Webhook，Trae 与 Buddy 全平台共用，
+          签到完成 / 调度任务失败时推送到手机（Bark / Server酱 / PushPlus）或自建 Webhook，对全部应用（Trae、WorkBuddy、Qoder、豆包、Buddy 国际版）共用，
           未配置的渠道自动跳过；修改后点底部「保存设置」生效。
         </p>
-        <div className="grid gap-x-8 gap-y-3 text-sm sm:grid-cols-2">
-          <div className="space-y-3">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.notify_enabled}
-                onChange={(e) => update('notify_enabled', e.target.checked)}
-              />
-              启用通知推送（总开关）
-            </label>
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.notify_on_checkin}
-                onChange={(e) => update('notify_on_checkin', e.target.checked)}
-              />
-              签到完成时通知
-            </label>
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.notify_on_task_fail}
-                onChange={(e) => update('notify_on_task_fail', e.target.checked)}
-              />
-              调度任务失败时通知
-            </label>
+        {/* 事件开关组：横排一条，与下方渠道输入视觉分离 */}
+        <div className="mb-3 flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-slate-200/70 bg-slate-50/60 px-3.5 py-2.5 text-sm dark:border-zinc-700/50 dark:bg-zinc-800/30">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={form.notify_enabled}
+              onChange={(e) => update('notify_enabled', e.target.checked)}
+            />
+            启用通知推送（总开关）
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={form.notify_on_checkin}
+              onChange={(e) => update('notify_on_checkin', e.target.checked)}
+            />
+            签到完成时通知
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={form.notify_on_task_fail}
+              onChange={(e) => update('notify_on_task_fail', e.target.checked)}
+            />
+            调度任务失败时通知
+          </label>
+        </div>
+        <div className="grid gap-x-4 gap-y-3 text-sm sm:grid-cols-2">
+          <div>
+            <label className="label">Bark 推送地址</label>
+            <input
+              type="text"
+              value={form.notify_bark_url ?? ''}
+              onChange={(e) => update('notify_bark_url', e.target.value.trim() || null)}
+              placeholder="https://api.day.app/你的Key"
+              className="input"
+            />
           </div>
-          <div className="space-y-3">
-            <div>
-              <label className="label">Bark 推送地址</label>
-              <input
-                type="text"
-                value={form.notify_bark_url ?? ''}
-                onChange={(e) => update('notify_bark_url', e.target.value.trim() || null)}
-                placeholder="https://api.day.app/你的Key"
-                className="input"
-              />
+          <div>
+            <label className="label">Server酱 SendKey</label>
+            <input
+              type="text"
+              value={form.notify_serverchan_sendkey ?? ''}
+              onChange={(e) => update('notify_serverchan_sendkey', e.target.value.trim() || null)}
+              placeholder="SCT...（sct.ftqq.com 获取）"
+              className="input"
+            />
+          </div>
+          {/* PushPlus 子面板：三控件（Token / 模板 / 群组编码）收拢为一组，issue #157 */}
+          <div className="rounded-lg border border-slate-200/70 bg-slate-50/60 p-3.5 dark:border-zinc-700/50 dark:bg-zinc-800/30 sm:col-span-2">
+            <div className="mb-2.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+              <span className="text-xs font-medium text-slate-600 dark:text-zinc-300">PushPlus 微信推送</span>
+              <a
+                href="https://www.pushplus.plus/"
+                target="_blank"
+                rel="noreferrer"
+                className="text-[11px] text-slate-400 transition-colors hover:text-zinc-500 dark:text-zinc-500 dark:hover:text-zinc-400"
+              >
+                pushplus.plus · 微信扫码登录获取 Token ↗
+              </a>
             </div>
-            <div>
-              <label className="label">Server酱 SendKey</label>
-              <input
-                type="text"
-                value={form.notify_serverchan_sendkey ?? ''}
-                onChange={(e) => update('notify_serverchan_sendkey', e.target.value.trim() || null)}
-                placeholder="SCT...（sct.ftqq.com 获取）"
-                className="input"
-              />
+            <div className="space-y-3">
+              <div>
+                <label className="label">Token</label>
+                <input
+                  type="text"
+                  value={form.notify_pushplus_token ?? ''}
+                  onChange={(e) => update('notify_pushplus_token', e.target.value.trim() || null)}
+                  placeholder="PushPlus Token（留空 = 关闭该渠道）"
+                  className="input"
+                />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="label">推送模板</label>
+                  <select
+                    value={form.notify_pushplus_template ?? ''}
+                    onChange={(e) => update('notify_pushplus_template', e.target.value || null)}
+                    className="input"
+                  >
+                    <option value="">默认（txt，保留换行）</option>
+                    <option value="txt">txt · 纯文本</option>
+                    <option value="html">html · 网页</option>
+                    <option value="markdown">markdown</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="label">群组编码（可选）</label>
+                  <input
+                    type="text"
+                    value={form.notify_pushplus_topic ?? ''}
+                    onChange={(e) => update('notify_pushplus_topic', e.target.value.trim() || null)}
+                    placeholder="一对多群发；留空 = 仅发给自己"
+                    className="input"
+                  />
+                </div>
+              </div>
             </div>
-            <div>
-              <label className="label">通用 Webhook 地址</label>
-              <input
-                type="text"
-                value={form.notify_webhook_url ?? ''}
-                onChange={(e) => update('notify_webhook_url', e.target.value.trim() || null)}
-                placeholder="https://...（POST JSON，兼容企业微信机器人等自建端）"
-                className="input"
-              />
-            </div>
+          </div>
+          <div className="sm:col-span-2">
+            <label className="label">通用 Webhook 地址</label>
+            <input
+              type="text"
+              value={form.notify_webhook_url ?? ''}
+              onChange={(e) => update('notify_webhook_url', e.target.value.trim() || null)}
+              placeholder="https://...（POST JSON，兼容企业微信机器人等自建端）"
+              className="input"
+            />
           </div>
         </div>
       </section>

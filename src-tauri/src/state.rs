@@ -174,6 +174,12 @@ impl AppState {
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
 
+        // 修复 3（issue #153）：canonicalize 解析 Junction/目录联接到真实路径。
+        // APPDATA 下若存在联接链（如用户手工迁移目录），路径不解析会让 vault
+        // 等组件踩 os error 448（ERROR_UNTRUSTED_MOUNT_POINT）；解析失败（理论上
+        // 仅在极端 IO 环境发生）退回未解析路径，不阻塞启动
+        let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
+
         // 创建子目录结构
         let conf_dir = data_dir.join("conf");
         let data_subdir = data_dir.join("data");
@@ -408,7 +414,7 @@ impl AppState {
         s.app_order.retain(|k| crate::models::is_valid_app_key(k));
         let mut seen_order = std::collections::HashSet::new();
         s.app_order.retain(|k| seen_order.insert(k.clone()));
-        // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，Trae/Buddy 共用）：
+        // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，全部应用共用）：
         // app_settings 渠道字段双 None 时从旧 workbuddy_settings 一次性搬运。
         // 命中即 kv_set 回写持久化——push_notify 裸读 kv 不经过本函数，仅内存视图会让
         // 推送链路读不到迁移值（老用户通知静默失效）；同时移除旧 kv 的通知键，

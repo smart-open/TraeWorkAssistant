@@ -23,6 +23,20 @@ use crate::api_server::routes::stream_msg_or_fallback;
 /// 僵尸流死等上游下一行（最长 300s 读超时）、持续占用 WB 账号并发槽
 const LINE_POLL: Duration = Duration::from_millis(500);
 
+/// 工具名逆向回改映射（issue #150/#158 P1-2）：请求侧 apply_tool_alias_forward
+/// 产出的别名→原名逆映射，按请求作用域（与账号/轮换无关）；None = 无工具别名。
+/// 与 sse.rs（Trae 池）同型——wb_sse 服务 Qoder/Buddy/custom 多池，池侧按需传 None
+pub type ToolAliasReverse = std::collections::HashMap<String, String>;
+
+/// 工具名逆向回改（同 sse.rs::rename_tool_back）：响应侧把上游所见别名换回
+/// 客户端原名——客户端按名匹配响应 tool_calls/tool_use，单向改名即废。
+/// None / 未命中 = 原样
+fn rename_tool_back(map: Option<&ToolAliasReverse>, name: &mut String) {
+    if let Some(orig) = map.and_then(|m| m.get(name.as_str())) {
+        *name = orig.clone();
+    }
+}
+
 /// WB 上游单个 SSE 事件（已归一化）
 #[derive(Debug)]
 pub enum WbEvent {
@@ -110,6 +124,14 @@ impl<L: Iterator<Item = String>> WbSseParser<L> {
 }
 
 impl WbSseParser<InterruptibleLines> {
+    /// 取出留存的首个底层读错误（issue #158 P2-2）：仅本解析器直接持有
+    /// InterruptibleLines 时可用（custom 池流式直连 `from_reader` 行源）；
+    /// 竞速桥接路径（`from_iterator`）的读错误在 wb_upstream 共享槽，由
+    /// 路由层取出合并，本方法恒 None
+    pub fn take_read_error(&mut self) -> Option<std::io::Error> {
+        self.lines.take_read_error()
+    }
+
     /// 停滞感知取事件（WB 路由流式专用）：行源为可中断行源，上游停滞窗口内
     /// 周期性醒来检查客户端断连（client_gone，通常为 tx.is_closed()）——
     /// 断连即返回 None 终止转发，释放上游连接与账号并发槽；未断连则继续等待
@@ -124,7 +146,7 @@ impl WbSseParser<InterruptibleLines> {
         loop {
             let line = match self.lines.next_timeout(poll) {
                 Ok(Some(line)) => line,
-                Ok(None) => return None, // 流结束（读错误折叠为 EOF）
+                Ok(None) => return None, // 流结束（读错误折叠为 EOF；take_read_error 掐断哨兵已全池接线：Trae sse.rs 流式/聚合、qoder err_slot、custom 直连）
                 Err(()) => {
                     if client_gone() {
                         return None; // 客户端已断连：终止，不再读上游
@@ -265,6 +287,7 @@ pub fn stream_forward_ex(
     chat_id: &str,
     model: &str,
     encoded: &HashSet<String>,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, bool, Option<Value>) {
     let mut parser = WbSseParser::new(lines);
     let mut sent_any = false;
@@ -649,7 +672,10 @@ pub fn stream_forward_ex(
                             }
                             if let Some(n) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
                                 if !n.is_empty() {
-                                    e.1 = n.to_string();
+                                    // issue #158 P1-2：别名回改（缓冲即改，finish 发射自带原名）
+                                    let mut n = n.to_string();
+                                    rename_tool_back(tool_alias, &mut n);
+                                    e.1 = n;
                                 }
                             }
                             if let Some(a) = tc.get("function").and_then(|f| f.get("arguments")) {
@@ -704,6 +730,25 @@ pub fn stream_forward_ex(
                                 for key in ["extra_fields", "function_call"] {
                                     if obj.get(key).map_or(false, |v| v.is_null()) {
                                         obj.remove(key);
+                                    }
+                                }
+                                // issue #158 P1-2：工具别名逆映射回改——归一化透传前把
+                                // 上游所见别名换回客户端原名（客户端按名匹配 tool_calls，
+                                // 单向改名即废；仅 tool_calls[].function.name，正文不动）
+                                if let Some(tcs) = obj
+                                    .get_mut("tool_calls")
+                                    .and_then(|t| t.as_array_mut())
+                                {
+                                    for tc in tcs {
+                                        if let Some(mut n) = tc
+                                            .pointer("/function/name")
+                                            .and_then(|v| v.as_str().map(str::to_string))
+                                        {
+                                            rename_tool_back(tool_alias, &mut n);
+                                            if let Some(slot) = tc.pointer_mut("/function/name") {
+                                                *slot = Value::String(n);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -800,7 +845,10 @@ pub fn stream_forward_ex(
                                     }
                                     if let Some(n) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
                                         if !n.is_empty() {
-                                            e.1 = n.to_string();
+                                            // issue #158 P1-2：别名回改（缓冲即改，completed 发射自带原名）
+                                            let mut n = n.to_string();
+                                            rename_tool_back(tool_alias, &mut n);
+                                            e.1 = n;
                                         }
                                     }
                                     if let Some(a) = tc.get("function").and_then(|f| f.get("arguments")) {
@@ -832,6 +880,23 @@ pub fn stream_forward_ex(
         sent_any = true;
     }
 
+    // 传输层掐断哨兵（issue #158 P2-2）：EOF 伴随底层读错误（h2 RST_STREAM/
+    // 连接重置掐断长流）→ 哨兵上抛，对齐 Trae 池 sse.rs 口径。仅对直连
+    // InterruptibleLines 的调用方生效（custom 池流式；Qoder/Buddy 竞速桥接
+    // 路径的错误在 wb_upstream 共享槽，由路由层取出合并）。守卫与 EOF 断流
+    // 兜底同型：正常 Done 收尾（finished）/ 流内失败（failed_inline）不算
+    // 掐断；有内容时上方分支已补齐终止帧（客户端看到完整收尾），此处只补
+    // 上抛——调用方按失败落账（不绑粘性不记成功）；零内容时覆盖空完成哨兵
+    //（调用方换号且不计空完成指纹）
+    if error_info.is_none() && !finished && !failed_inline {
+        if let Some(e) = parser.take_read_error() {
+            error_info = Some((
+                super::TRANSPORT_CUT_CODE,
+                format!("{} {}", super::TRANSPORT_CUT_MSG_PREFIX, e),
+            ));
+        }
+    }
+
     // 空完成兜底（issue #57）：EOF 且零内容零错误 → 哨兵上抛；判定与客户端
     // 在线解耦——断连也上抛，否则调用方误判成功绑粘性（原样收尾会让客户端
     // 收到 "empty provider response"）
@@ -855,9 +920,10 @@ pub fn stream_forward(
     chat_id: &str,
     model: &str,
     encoded: &HashSet<String>,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
     let (error_info, sent_any, _failed_inline, usage) =
-        stream_forward_ex(lines, tx, proto, chat_id, model, encoded);
+        stream_forward_ex(lines, tx, proto, chat_id, model, encoded, tool_alias);
     (error_info, sent_any, usage)
 }
 
@@ -866,6 +932,7 @@ pub fn stream_forward(
 pub fn aggregate<L: Iterator<Item = String>>(
     lines: L,
     chat_id: &str,
+    tool_alias: Option<&ToolAliasReverse>,
 ) -> (Option<Value>, Option<(i64, String)>) {
     let mut parser = WbSseParser::new(lines);
     let mut content = String::new();
@@ -907,7 +974,10 @@ pub fn aggregate<L: Iterator<Item = String>>(
                         }
                         if let Some(n) = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
                             if !n.is_empty() {
-                                e.1 = n.to_string();
+                                // issue #158 P1-2：别名回改（收集即改，组装发射自带原名）
+                                let mut n = n.to_string();
+                                rename_tool_back(tool_alias, &mut n);
+                                e.1 = n;
                             }
                         }
                         if let Some(a) = tc.get("function").and_then(|f| f.get("arguments")) {
@@ -969,7 +1039,12 @@ fn finish_to_stop(finish: &str) -> &'static str {
 }
 
 /// 内部 OpenAI completion → Anthropic Messages 响应（非流式 /v1/messages）
-pub fn completion_to_anthropic(v: &Value, msg_id: &str, model: &str) -> Value {
+pub fn completion_to_anthropic(
+    v: &Value,
+    msg_id: &str,
+    model: &str,
+    tool_alias: Option<&ToolAliasReverse>,
+) -> Value {
     let choice = v
         .get("choices")
         .and_then(|c| c.as_array())
@@ -998,10 +1073,17 @@ pub fn completion_to_anthropic(v: &Value, msg_id: &str, model: &str) -> Value {
                 .and_then(|a| a.as_str())
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(json!({}));
+            // issue #158 P1-2：别名回改（发射前把上游所见别名换回客户端原名）
+            let mut name = tc
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            rename_tool_back(tool_alias, &mut name);
             content.push(json!({
                 "type": "tool_use",
                 "id": tc.get("id").cloned().unwrap_or(json!("toolu_0")),
-                "name": tc.pointer("/function/name").cloned().unwrap_or(json!("")),
+                "name": name,
                 "input": args,
             }));
         }
@@ -1204,7 +1286,7 @@ mod tests {
         let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
         let start = std::time::Instant::now();
         let (_err, sent_any, _fi, _u) = stream_forward_ex(
-            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(),
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(), None,
         );
         assert!(!sent_any, "断连后不得有任何事件下发");
         assert!(
@@ -1243,7 +1325,7 @@ mod tests {
         data.push(String::new());
         let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
         let (err, sent_any, _fi, usage) = stream_forward_ex(
-            src, &tx, crate::api_server::routes::Protocol::OpenAi, "chat_96", "step-5-preview", &HashSet::new(),
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "chat_96", "step-5-preview", &HashSet::new(), None,
         );
         assert!(err.is_none());
         assert!(sent_any);
@@ -1347,6 +1429,7 @@ mod tests {
                 "",
             ]),
             "chat-1",
+            None,
         );
         let (resp, err) = out;
         assert!(err.is_none());
@@ -1364,6 +1447,7 @@ mod tests {
         let (resp, err) = aggregate(
             lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]),
             "c",
+            None,
         );
         assert!(resp.is_none());
         assert_eq!(err.unwrap(), (9, "boom".to_string()));
@@ -1371,9 +1455,9 @@ mod tests {
 
     #[test]
     fn converters_roundtrip() {
-        let (resp, _) = aggregate(lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}", "data: [DONE]", ""]), "c1");
+        let (resp, _) = aggregate(lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}", "data: [DONE]", ""]), "c1", None);
         let v = resp.unwrap();
-        let anth = completion_to_anthropic(&v, "msg_1", "glm-5.3");
+        let anth = completion_to_anthropic(&v, "msg_1", "glm-5.3", None);
         assert_eq!(anth["type"], json!("message"));
         assert_eq!(anth["content"][0]["text"], json!("你好"));
         let txt = completion_to_text(&v, "glm-5.3");
@@ -1400,6 +1484,7 @@ mod tests {
             "resp_1",
             "glm-5.3",
             &HashSet::new(),
+            None,
         );
         assert!(err.is_none());
         assert!(sent_any);
@@ -1442,6 +1527,7 @@ mod tests {
             "resp_6",
             "m",
             &HashSet::from(["multi_agent_v1__spawn_agent".to_string()]),
+            None,
         );
         assert!(err.is_none());
         assert!(sent_any);
@@ -1478,7 +1564,7 @@ mod tests {
             "",
         ]);
         let (err, sent_any, failed_inline, _usage) = stream_forward_ex(
-            lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m", &HashSet::new(),
+            lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m", &HashSet::new(), None,
         );
         assert!(err.is_none(), "流内错误已就地下发，不得上抛触发换号重试");
         assert!(sent_any);
@@ -1504,7 +1590,7 @@ mod tests {
             "",
         ]);
         let (err, sent_any, failed_inline, usage) = stream_forward_ex(
-            lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_2", "m", &HashSet::new(),
+            lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_2", "m", &HashSet::new(), None,
         );
         assert!(err.is_none());
         assert!(sent_any);
@@ -1523,7 +1609,7 @@ mod tests {
             "",
         ]);
         let (err, _sent_any, failed_inline, _usage) = stream_forward_ex(
-            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_3", "m", &HashSet::new(),
+            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_3", "m", &HashSet::new(), None,
         );
         assert!(err.is_none());
         assert!(failed_inline);
@@ -1541,7 +1627,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
         let lines = lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]);
         let (err, sent_any, failed_inline, _usage) = stream_forward_ex(
-            lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(),
+            lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(), None,
         );
         assert_eq!(err.unwrap(), (9, "boom".to_string()));
         assert!(!sent_any);
@@ -1561,7 +1647,7 @@ mod tests {
             "",
         ]);
         let (err, sent_any, failed_inline, _u) = stream_forward_ex(
-            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_4", "m", &HashSet::new(),
+            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_4", "m", &HashSet::new(), None,
         );
         assert!(err.is_none() && sent_any && !failed_inline);
         drop(tx);
@@ -1585,7 +1671,7 @@ mod tests {
             "",
         ]);
         let _ = stream_forward_ex(
-            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_5", "m", &HashSet::new(),
+            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_5", "m", &HashSet::new(), None,
         );
         drop(tx);
         let mut body = String::new();
@@ -1624,6 +1710,71 @@ mod tests {
         // 全 0 与缺省均返回 0
         assert_eq!(cached_tokens_of(&json!({"cache_read_input_tokens": 0})), 0);
         assert_eq!(cached_tokens_of(&json!({})), 0);
+    }
+
+    // ==================== 传输层掐断哨兵（issue #158 P2-2）====================
+
+    /// 产出一段 SSE 行后抛读错误的 reader（模拟 h2 RST_STREAM 掐断长流）
+    struct CutAfterFirstRead {
+        n: u8,
+    }
+    impl std::io::Read for CutAfterFirstRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.n == 0 {
+                self.n = 1;
+                // 字节串不可含非 ASCII，正文用 ASCII 占位
+                let d = b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+                buf[..d.len()].copy_from_slice(d);
+                Ok(d.len())
+            } else {
+                Err(std::io::Error::other("h2 RST_STREAM pushed"))
+            }
+        }
+    }
+
+    /// 直连 InterruptibleLines（custom 池流式形态）：内容帧已下发后流被掐断 →
+    /// 哨兵上抛（-9902）+ 终止帧已按协议补发（客户端看到完整收尾）
+    #[test]
+    fn transport_cut_mid_stream_raises_sentinel_and_finishes() {
+        let ilines = InterruptibleLines::from_reader(CutAfterFirstRead { n: 0 })
+            .expect("首字窗口内应有产出");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+            ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-1", "M",
+            &HashSet::new(), None,
+        );
+        assert!(sent_any, "内容帧已流出发出");
+        assert!(!failed_inline);
+        let (code, msg) = err.expect("传输层掐断必须上抛哨兵");
+        assert_eq!(code, super::super::TRANSPORT_CUT_CODE, "哨兵码 -9902");
+        assert!(msg.starts_with("transport cut:"), "实际: {msg}");
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(body.contains("partial"), "掐断前内容已下发");
+        assert!(
+            body.contains("data: [DONE]"),
+            "EOF-with-content 分支应补齐终止帧，实际: {body}"
+        );
+    }
+
+    /// 正常 [DONE] 收尾不得被误判为掐断（finished 守卫）
+    #[test]
+    fn clean_done_stream_not_marked_as_cut() {
+        let ilines = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+            ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-2", "M",
+            &HashSet::new(), None,
+        );
+        assert!(err.is_none() && sent_any && !failed_inline);
     }
 
     /// 缓存写 tokens 宽口径提取：别名覆盖与正值过滤
@@ -1682,7 +1833,7 @@ mod tests {
             "",
         ]);
         let (err, sent_any, failed_inline, _u) = stream_forward_ex(
-            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_6", "m", &HashSet::new(),
+            lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_6", "m", &HashSet::new(), None,
         );
         assert!(err.is_none() && sent_any && !failed_inline);
         drop(tx);
@@ -1715,7 +1866,7 @@ mod tests {
                 "cache_creation_input_tokens": 5
             }
         });
-        let out = completion_to_anthropic(&v, "msg_7", "glm-5.3");
+        let out = completion_to_anthropic(&v, "msg_7", "glm-5.3", None);
         let usage = out.get("usage").cloned().unwrap_or(json!({}));
         assert_eq!(usage["input_tokens"], json!(9));
         assert_eq!(usage["output_tokens"], json!(1));

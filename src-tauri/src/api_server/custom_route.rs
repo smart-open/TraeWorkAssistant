@@ -250,7 +250,7 @@ pub fn probe(cm: &CustomModel) -> Result<String, String> {
     })?;
     let lines = wb_upstream::lines_with_first_byte_timeout(reader)
         .map_err(|_| "10 秒内未收到上游响应（首字超时）".to_string())?;
-    let (resp, error_info) = wb_sse::aggregate(lines, &format!("probe-{}", now_ts()));
+    let (resp, error_info) = wb_sse::aggregate(lines, &format!("probe-{}", now_ts()), None);
     match (resp, error_info) {
         (Some(r), None) => {
             let content = r
@@ -441,7 +441,7 @@ pub fn custom_stream_chat(
                         // （response.failed / error 帧）已就地透传客户端，此时 error_info
                         // 恒 None，旧三元组仅凭 is_none() 会把流内失败误判成功
                         let (error_info, sent_any, failed_inline, up_usage) = wb_sse::stream_forward_ex(
-                            lines, &tx, proto, &chat_id, &model, &std::collections::HashSet::new(),
+                            lines, &tx, proto, &chat_id, &model, &std::collections::HashSet::new(), None,
                         );
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         // 记账成功口径（对齐 wb_route）：无流内错误且未流内失败
@@ -483,6 +483,28 @@ pub fn custom_stream_chat(
                                 break;
                             }
                             Some((code, msg)) => {
+                                // P2-2：传输层掐断（账号无关传输故障，wb_sse 直连
+                                // InterruptibleLines 哨兵上抛）——不熔断该上游；未流出 →
+                                // 换组内下一上游；已流出 → 就地收尾（终止帧已由
+                                // stream_forward_ex EOF-with-content 分支补发）
+                                if super::is_transport_cut(code, &msg) {
+                                    last_err = format!("code={code} msg={msg}");
+                                    // 观测口径对齐业务错误分支：掐断同样写 last_error，
+                                    // 管理端「最后错误」不因错误类别分裂
+                                    set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
+                                    state.logger.log_request_stage(
+                                        "custom", "POST", proto.log_path(), &model, true, 200, "custom",
+                                        duration_ms, &key_name, &acct_name, Some(stage), Some(&msg),
+                                    );
+                                    attempt += 1;
+                                    if sent_any || attempt >= max_attempts {
+                                        if !sent_any {
+                                            send_stream_error(&tx, proto, code, &msg);
+                                        }
+                                        break;
+                                    }
+                                    continue; // 换组内下一上游
+                                }
                                 custom_lb::note_circuit_failure(&cm.id, FailKind::Server);
                                 last_err = format!("code={code} msg={msg}");
                                 set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
@@ -604,7 +626,9 @@ pub async fn custom_aggregate_chat(
                     continue; // 换组内下一上游
                 }
             };
-            let lines = match wb_upstream::lines_with_first_byte_timeout(reader) {
+            // P2-2：tracked 行源 + 槽——聚合 EOF 掐断可识别，截断响应不得当成功交付
+            let read_slot = wb_upstream::new_read_err_slot();
+            let lines = match wb_upstream::lines_with_first_byte_timeout_tracked(reader, read_slot.clone()) {
                 Ok(l) => l,
                 Err(()) => {
                     custom_lb::note_circuit_failure(&cm.id, FailKind::Server);
@@ -622,7 +646,19 @@ pub async fn custom_aggregate_chat(
                     continue;
                 }
             };
-            let (resp, error_info) = wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
+            let (resp, error_info) = wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), None);
+            // P2-2：读错误槽合并——掐断丢弃部分响应，换组内下一上游。空完成
+            // 哨兵同样覆盖（审查修复，与 wb_route::aggregate_with_transport_cut
+            // 同口径：零内容掐断不得计入空完成指纹，否则轮换耗尽可误判
+            // CHANNEL_FINGERPRINT_BLOCK）；业务错误保留
+            let (resp, error_info) = match super::transport_cut_from_slot(&read_slot) {
+                Some(cut) => match error_info {
+                    None => (None, Some(cut)),
+                    Some((c, m)) if super::is_empty_completion(c, &m) => (None, Some(cut)),
+                    other => (resp, other),
+                },
+                None => (resp, error_info),
+            };
             let duration_ms = start_ts.elapsed().as_millis() as u64;
             match (resp, error_info) {
                 (Some(mut r), None) => {
@@ -647,6 +683,24 @@ pub async fn custom_aggregate_chat(
                     return Ok(r);
                 }
                 (None, Some((code, msg))) => {
+                    // P2-2：传输层掐断（账号无关传输故障）——不熔断该上游（模型
+                    // 服务本身健康）；丢弃部分响应（已在上方合并时置 None），
+                    // 换组内下一上游重试
+                    if super::is_transport_cut(code, &msg) {
+                        state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0, &session_ctx);
+                        // 观测口径对齐业务错误分支（同流式掐断分支）
+                        set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
+                        state.logger.log_request_stage(
+                            "custom", "POST", proto.log_path(), &model, stream, 200, "custom",
+                            duration_ms, &key_name, &acct_name, Some(stage), Some(&msg),
+                        );
+                        last_err = msg;
+                        attempt += 1;
+                        if attempt >= max_attempts {
+                            break;
+                        }
+                        continue;
+                    }
                     custom_lb::note_circuit_failure(&cm.id, FailKind::Server);
                     state.record_usage_custom(&model, &key_id, false, stream, duration_ms, 0, 0, &session_ctx);
                     set_last_error(&state, format!("custom model={} code={} msg={}", model, code, msg));
@@ -695,6 +749,7 @@ pub async fn custom_aggregate_chat(
                     &resp,
                     &format!("msg_{}", now_ts()),
                     &model_outer,
+                    None,
                 ),
                 Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_outer),
                 Protocol::Responses => super::wb_responses::completion_to_responses(
@@ -743,8 +798,18 @@ mod tests {
         std::thread::spawn(move || {
             for (i, conn) in listener.incoming().enumerate() {
                 let Ok(mut s) = conn else { break };
-                let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
+                // 读完整个请求（头部 + content-length 指定的 body）：单次 read 可能只
+                // 收到头部，写完响应立即 drop 会因接收缓冲残留未读数据触发 RST，与
+                // 响应竞争 → 客户端偶发「远程主机强迫关闭」（Windows 回环，全量跑
+                // 时偶现 flaky）。收齐后再响应 + FIN 关闭，竞态消除
+                let mut req: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !read_request_complete(&req) {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&chunk[..n]),
+                    }
+                }
                 let resp: &[u8] = if i == 0 {
                     b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                 } else {
@@ -761,6 +826,27 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{port}/v1")
+    }
+
+    /// 请求是否收齐：见到头部结束标记且累计字节数达到 content-length（无 body 视为收齐）
+    fn read_request_complete(req: &[u8]) -> bool {
+        let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+            return false;
+        };
+        let content_length = std::str::from_utf8(&req[..end])
+            .ok()
+            .and_then(|h| {
+                h.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        v.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(0);
+        req.len() >= end + content_length
     }
 
     fn cm(id: &str, base_url: &str) -> CustomModel {

@@ -1051,7 +1051,8 @@ fn pool_health(
                 .as_deref()
                 .map(|m| {
                     // 免费活动覆盖与取号同口径（resolve_overridden），否则开关开启时
-                    // Qwen3.8-Flash 预检仍按 0.1 目录价判非免费，零积分池被误挡
+                    // 免费活动模型（Qwen3.8-Flash / DeepSeek-Flash，issue #156）预检
+                    // 仍按目录价判非免费，零积分池被误挡
                     qoder_upstream::resolve_overridden(
                         m,
                         qoder_upstream::QoderRegion::Cn,
@@ -1287,6 +1288,7 @@ mod tests {
             qoder_identity: None,
             qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
             qoder_sticky_enabled: AtomicBool::new(false),
+            qoder_sanitize: AtomicBool::new(true),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
             buddy_ai_sticky: super::super::wb_sticky::StickyStore::default(),
@@ -2526,6 +2528,30 @@ mod tests {
         assert!(msg.starts_with("no healthy account available"), "{msg}");
         assert!(msg.contains("pool=trae healthy=0"), "{msg}");
         assert!(!msg.contains("key="), "匿名 Key 不应携带约束细节: {msg}");
+    }
+
+    /// issue #159：NoHealthy 归因「前置候选池因模型级冷却被跳过」——buddy 池
+    /// 已启用且同名模型在冷却表内时，503 消息显式携带 buddy skipped 注记
+    #[test]
+    fn t39b_no_healthy_detail_attributes_model_cooldown_skip() {
+        let f = fixture(&[], None, None);
+        let view = super::super::wb_route::WbView::wb(f.state.clone());
+        // 渐进退避路径：无消息 → 模型冷却 10s（足以触发归因注记）
+        super::super::wb_route::note_model_failure_ex(&view, "hy4", None);
+        let msg = super::super::routes::no_healthy_detail_with_model(
+            &f.state,
+            TargetPool::Trae,
+            "anonymous",
+            Some("hy4"),
+        );
+        assert!(
+            msg.contains("buddy skipped: model_cooldown remaining="),
+            "{msg}"
+        );
+        // 无模型上下文（旧包装口径）不追加归因
+        let plain =
+            super::super::routes::no_healthy_detail(&f.state, TargetPool::Trae, "anonymous");
+        assert!(!plain.contains("skipped:"), "{plain}");
     }
 
     /// NoHealthy 详情（修复2）：Key 约束细节（绑定池/白名单条数/作用域健康数）——

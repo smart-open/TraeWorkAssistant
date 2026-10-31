@@ -326,8 +326,9 @@ fn load_device_profile(state: &AppState, acct_id: &str) -> Option<super::qoder_d
 }
 
 /// 写工具侧凭证副本（version≠1 拒写；非空字段 merge + updated_at，对齐 wb_common 同语义）。
-/// 凭证收敛（P0-1）：敏感字段进 vault、DB 占位；vault 写失败时仍落占位库并返回 Err
-///（对齐 Trae 红线：宁可丢本次凭据更新，也不把 token/pat 明文写进 SQLite）。
+/// 凭证收敛（P0-1）：敏感字段进 vault、DB 占位；vault 写失败时**数据库保持原状**
+///（issue #153 修复 1：原「落占位库 + 返 Err」会销毁 DB 中未收敛的明文凭证，
+/// 迁移场景无处恢复）——不落库直接返回 Err，凭据仅存内存，重新登录可恢复。
 pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Result<(), String> {
     let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = load_token_store(state);
@@ -387,7 +388,16 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
     // 读时快照整表替换，而是重新 load DB 最新表做「仅目标行替换」的行级合并，
     // 把进程间 last-writer-wins 的覆盖窗口从「vault 全程」收窄到「load→replace 数毫秒」
     //（审查 H-1 第②步；进程内并发由 TOKEN_STORE_LOCK + 每账号刷新锁防护）。
-    let vault_result = secure_store_for_save(&state.data_dir, &mut store).map(|_| ());
+    // vault 写失败（issue #153 修复 1）：数据库保持原状，不落 fresh 表——
+    // 此时 store 里的敏感字段尚未占位化（secure_store_for_save 在 ns_set 失败时
+    // 早退，占位循环未执行），若继续落库会把明文凭证写进 SQLite，恰与红线相反
+    if let Err(e) = secure_store_for_save(&state.data_dir, &mut store) {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] vault 写入失败，token store 未落库（id={id}，凭据未持久化）: {e}"),
+        );
+        return Err(format!("Qoder 凭据加密存储失败（数据库未改动，凭据未持久化，重新登录可恢复）: {e}"));
+    }
     let mut fresh = crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
     if !fresh.is_object() {
         fresh = serde_json::json!({});
@@ -418,10 +428,7 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
             t.insert(id.to_string(), row);
         }
     }
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &fresh)?;
-    vault_result.map_err(|e| {
-        format!("Qoder 凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}")
-    })
+    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &fresh)
 }
 
 /// 删除 token store 记录（账号移除时同步清理 vault 凭证）。
@@ -1087,8 +1094,11 @@ fn is_pat_channel(creds: &QoderCreds) -> bool {
 }
 
 /// 惰性刷新：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
-/// 返回 (creds, refreshed, note)，note ∈ no_credential/fresh/expired_needs_relogin/
-/// refreshed/refreshed_unsaved/refresh_failed/auth_dead/pat_rejected/refresh_busy。
+/// 返回 (creds, refreshed, note)，note ∈ no_credential/vault_down/fresh/
+/// expired_needs_relogin/refreshed/refreshed_unsaved/refresh_failed/auth_dead/
+/// pat_rejected/refresh_busy。
+/// vault_down（issue #153 修复 2）：vault 系统性故障（DPAPI/快照/锁）导致凭证
+/// 读出为空，与「确实无凭证」区分——暂态语义，调用方不得据此永久禁用账号。
 /// refresh_busy（H3 审查修复）：账号级跨进程刷新锁被他进程持有时，沿用当前
 /// 凭证返回——暂态语义，调用方不得据此永久禁用账号。
 ///
@@ -1107,6 +1117,12 @@ pub fn ensure_fresh(
     let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let creds = effective_creds(state, acct_id);
     if creds.access_token.is_empty() {
+        // 修复 2（issue #153）：vault 系统性故障时 ns_get fail-secure 返回 None，
+        // 与「无凭证」不可区分——故障期返回暂态 vault_down，调用方按暂态处理
+        // （不永久禁用账号，故障恢复后自动自愈）
+        if !crate::vault::available(&state.data_dir) {
+            return (creds, false, "vault_down");
+        }
         return (creds, false, "no_credential");
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1137,6 +1153,14 @@ pub fn ensure_fresh(
         };
         // 持锁后二次检查（对齐 H-1 进程内锁语义）：等锁期间他进程可能已换好落库
         let creds = effective_creds(state, acct_id);
+        if creds.access_token.is_empty() {
+            // 修复 2（issue #153）同构缺口补齐：等锁期间 vault 故障 → 空 creds
+            // 会被下游误分类（空 PAT 换取 4xx → pat_rejected 永久），先探测 vault
+            if !crate::vault::available(&state.data_dir) {
+                return (creds, false, "vault_down");
+            }
+            return (creds, false, "no_credential");
+        }
         let need = creds.access_token.starts_with("pt-")
             || creds
                 .expires_at_ms
@@ -1202,6 +1226,14 @@ pub fn ensure_fresh(
     };
     // 持锁后二次检查：等锁期间他进程可能已刷新落库，直接复用新令牌
     let creds = effective_creds(state, acct_id);
+    if creds.access_token.is_empty() {
+        // 修复 2（issue #153）同构缺口补齐：等锁期间 vault 故障 → 空 creds 会
+        // 落进空 RT 判定误报 expired_needs_relogin（永久），先探测 vault
+        if !crate::vault::available(&state.data_dir) {
+            return (creds, false, "vault_down");
+        }
+        return (creds, false, "no_credential");
+    }
     if let Some(exp) = creds.expires_at_ms {
         let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
         if remain_h > lazy_hours as f64 {

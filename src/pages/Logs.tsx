@@ -735,8 +735,8 @@ export default function Logs({ embedded = false }: { embedded?: boolean }) {
     <div className="flex h-full animate-fade-in flex-col">
       {!embedded && (
         <PageHeader
-          title="Trae · 系统日志"
-          desc="查看运行日志、代理请求日志与 API 请求日志"
+          title="系统日志"
+          desc="查看全部应用的运行日志、代理请求日志与 API 请求日志"
         />
       )}
 

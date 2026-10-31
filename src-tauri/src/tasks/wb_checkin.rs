@@ -486,7 +486,12 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     }
     let (creds, refreshed, note) = wb_common::ensure_fresh(state, agent, acct, opts.lazy_hours);
     if creds.access_token.is_empty() {
-        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "message": format!("无可用凭证（{note}）") });
+        let msg = if note == "vault_down" {
+            "凭证加密存储暂时不可用（vault 故障），稍后自动恢复".to_string()
+        } else {
+            format!("无可用凭证（{note}）")
+        };
+        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail", "message": msg });
     }
     if refreshed {
         sync_pool_expiry(state, &aid, &creds);
@@ -948,7 +953,12 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     let base_ev = json!({"type": "growth", "user_id": aid, "name": name});
     let (creds, _refreshed, note) = wb_common::ensure_fresh(state, agent, acct, 24);
     if creds.access_token.is_empty() {
-        return json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": "fail", "message": format!("无可用凭证（{note}）") });
+        let msg = if note == "vault_down" {
+            "凭证加密存储暂时不可用（vault 故障），稍后自动恢复".to_string()
+        } else {
+            format!("无可用凭证（{note}）")
+        };
+        return json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": "fail", "message": msg });
     }
     let urls = urls_for(wb_common::region_billing_base(&creds.domain));
 
@@ -1036,7 +1046,9 @@ pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Value {
             sync_pool_expiry(state, &aid, &creds);
         }
         let mut item = json!({"user_id": aid, "refreshed": refreshed, "note": note});
-        if creds.access_token.is_empty() {
+        if creds.access_token.is_empty() && note != "vault_down" {
+            // vault_down（issue #153 修复 2）不得被覆写为 no_credential——
+            // 否则下游按「账号无凭证」处理，掩盖 vault 故障真相
             item["note"] = json!("no_credential");
         }
         items.push(item);

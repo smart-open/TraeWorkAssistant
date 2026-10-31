@@ -209,8 +209,9 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
     let mut pending_calls: Vec<String> = Vec::new();
     // 窗口内已收到的工具结果 (call_id, text)，窗口关闭/收尾时按 tool_calls 顺序回填
     let mut results: Vec<(String, String)> = Vec::new();
-    // 配对窗口内被推迟的非 tool 消息（role 已降级：developer→user，system 保留）
-    let mut deferred: Vec<(String, String)> = Vec::new();
+    // 配对窗口内被推迟的非 tool 消息（role 已降级：developer→user，system 保留）；
+    // content 为 Value 以携带图片数组形态（issue #154）
+    let mut deferred: Vec<(String, Value)> = Vec::new();
     // 缺 call_id 时的兜底自增序号
     let mut seq: usize = 0;
     // 当前收集 tool_calls 的 assistant 消息下标
@@ -295,14 +296,20 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("user")
                     .to_string();
-                let text = content_text(item.get("content"));
+                // issue #154：message content 数组中的 input_image 不再静默丢弃，
+                // 投影成 OpenAI image_url；无图时维持纯字符串（下游文本消费方零影响）
+                let content = message_content(item.get("content"));
+                let text = content
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_default();
                 if pending_calls.is_empty() {
                     let role = if role == "assistant" || role == "system" {
                         role
                     } else {
                         "user".to_string()
                     };
-                    messages.push(json!({"role": role, "content": text}));
+                    messages.push(json!({"role": role, "content": content}));
                 } else if role == "assistant" {
                     // 窗口内的 assistant 文本并入 tool_calls 载体（同一轮输出）
                     if !text.is_empty() {
@@ -310,10 +317,10 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
                             append_assistant_text(&mut messages[i], &text);
                         }
                     }
-                } else if !text.is_empty() {
+                } else if !text.is_empty() || content.as_array().is_some_and(|a| !a.is_empty()) {
                     // user/developer/system：推迟到本批工具结果之后补回，保住配对连续性
                     let r = if role == "system" { "system" } else { "user" };
-                    deferred.push((r.to_string(), text));
+                    deferred.push((r.to_string(), content));
                 }
             }
             // reasoning / local_shell_call / 其他：跳过（reasoning 不回投，上游自行产生）
@@ -329,9 +336,9 @@ fn convert_input_items(items: &[Value]) -> Vec<Value> {
 }
 
 /// 配对窗口结束后，把被推迟的非工具消息按原序补回（developer 已降级为 user）
-fn flush_deferred(messages: &mut Vec<Value>, deferred: &mut Vec<(String, String)>) {
-    for (role, text) in deferred.drain(..) {
-        messages.push(json!({"role": role, "content": text}));
+fn flush_deferred(messages: &mut Vec<Value>, deferred: &mut Vec<(String, Value)>) {
+    for (role, content) in deferred.drain(..) {
+        messages.push(json!({"role": role, "content": content}));
     }
 }
 
@@ -411,21 +418,57 @@ fn tool_output_text(output: Option<&Value>) -> String {
     }
 }
 
-/// content：string 或 content parts 数组（input_text/output_text/refusal → 拼接）
-fn content_text(content: Option<&Value>) -> String {
+/// message content → OpenAI content（issue #154）：无图时返回纯字符串（与旧
+/// content_text 行为一致），含 input_image 时返回 [{type:text},{type:image_url}]
+/// 数组。reasoning 之外的 content parts（input_text/output_text/refusal）拼接为
+/// 文本段，input_image 按序插入
+fn message_content(content: Option<&Value>) -> Value {
     match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| {
-                p.get("text")
+        Some(Value::String(s)) => json!(s),
+        Some(Value::Array(parts)) => {
+            let mut text = String::new();
+            let mut images: Vec<Value> = Vec::new();
+            for p in parts {
+                if p.get("type").and_then(|t| t.as_str()) == Some("input_image") {
+                    if let Some(img) = input_image_to_openai(p) {
+                        images.push(img);
+                    }
+                    continue;
+                }
+                if let Some(t) = p
+                    .get("text")
                     .and_then(|t| t.as_str())
                     .or_else(|| p.get("refusal").and_then(|t| t.as_str()))
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
+                {
+                    text.push_str(t);
+                }
+            }
+            if images.is_empty() {
+                return json!(text);
+            }
+            let mut out: Vec<Value> = Vec::new();
+            if !text.is_empty() {
+                out.push(json!({ "type": "text", "text": text }));
+            }
+            out.extend(images);
+            json!(out)
+        }
+        _ => json!(""),
     }
+}
+
+/// Responses input_image part → OpenAI image_url 块（issue #154）：
+/// `image_url`（规范字段）或 `url`（宽容形态）取一；data URL/base64 均直透。
+/// 两者皆缺/为空时返回 None（丢弃单个坏块而非整条消息）
+fn input_image_to_openai(part: &Value) -> Option<Value> {
+    let url = part
+        .get("image_url")
+        .and_then(|u| u.as_str())
+        .or_else(|| part.get("url").and_then(|u| u.as_str()))?;
+    if url.is_empty() {
+        return None;
+    }
+    Some(json!({ "type": "image_url", "image_url": { "url": url } }))
 }
 
 /// 内部 OpenAI completion → Responses 对象（非流式 /v1/responses）
@@ -595,6 +638,73 @@ mod tests {
         // input 缺失 → 宽容降级为空 user 消息
         let chat = responses_to_chat(&json!({"model": "m"})).unwrap();
         assert_eq!(chat["messages"][0]["role"], json!("user"));
+    }
+
+    /// issue #154：message content 数组中的 input_image 投影成 image_url，
+    /// 无图消息维持纯字符串；data URL / url 两种取值字段都识别
+    #[test]
+    fn converts_message_input_image() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "这是什么？"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}
+                ]},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "这张呢？"},
+                    {"type": "input_image", "url": "https://example.com/b.png"}
+                ]},
+                {"type": "message", "role": "user", "content": "纯文本"},
+            ],
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        let c0 = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(c0.len(), 2);
+        assert_eq!(c0[0], json!({"type": "text", "text": "这是什么？"}));
+        assert_eq!(
+            c0[1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}})
+        );
+        let c1 = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(
+            c1[1],
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/b.png"}})
+        );
+        assert_eq!(msgs[2]["content"], json!("纯文本"));
+    }
+
+    /// issue #154：配对窗口内含图的 user 消息经 deferred 携带数组 content，
+    /// 补回后形态不丢
+    #[test]
+    fn defers_image_message_after_tool_window() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list"}]},
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "顺便看图"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,QQ=="}
+                ]},
+                {"type": "function_call_output", "call_id": "c1", "output": "a.txt"},
+            ],
+        });
+        let chat = responses_to_chat(&body).unwrap();
+        let msgs = chat["messages"].as_array().unwrap();
+        // user(list) / assistant(tool_calls) / tool(a.txt) / user(文本+图)
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[2]["role"], json!("tool"));
+        assert_eq!(msgs[3]["role"], json!("user"));
+        let c = msgs[3]["content"].as_array().unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0]["type"], json!("text"));
+        assert_eq!(
+            c[1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,QQ=="}})
+        );
     }
 
     #[test]

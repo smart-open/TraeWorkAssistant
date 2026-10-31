@@ -13,8 +13,6 @@
 //!   ④ GET /v2/plugin/login/account?state= 带 Bearer 取 uid/nickname → 自动入池 + 凭证回写 token store
 //! 每流程独立 cookie jar（手工捕获 Set-Cookie 回传，不引新依赖）；凭证零明文输出（不进日志/事件/UI）。
 
-use std::os::windows::process::CommandExt;
-use std::process::Command;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::fs_utils;
@@ -66,22 +64,31 @@ pub(super) fn jwt_claims(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// 系统浏览器打开 URL（Windows：cmd /c start，隐藏控制台；仅放行 http/https 且无引号空格）。
-/// URL 必须包一层引号再交给 cmd：裸 URL 里的 `&` 会被 cmd 解析成命令分隔符把链接截断
-/// （实测 `.../login?platform=CLI&state=xxx` 打开后浏览器停在裸登录页，state 丢失）。
-/// 注意必须用 raw_arg 直拼命令行：普通 .arg() 会把参数内嵌引号按 MSVC 规则转义成 `\"`，
-/// cmd 不识别 `\"`，整串会被 start 当成带反斜杠的文件路径（实测报「Windows 找不到文件」）。
+/// 系统浏览器打开 URL（issue #153 修复 4：ShellExecuteW「open」动词直开 URL，
+/// 由系统按协议关联选默认浏览器——cmd start 依赖 shell 解析且控制台隐藏不稳定；
+/// 仅放行 http/https 且无引号空格，单参数直传无 shell 层，& / % 等保留字无需转义）
 pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
     }
-    Command::new("cmd")
-        .arg("/c")
-        .raw_arg(format!("start \"\" \"{url}\""))
-        .creation_flags(0x08000000)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("打开浏览器失败: {e}"))
+    let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb_wide: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb_wide.as_ptr(),
+            url_wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    // 返回值 > 32 = 成功的 HINSTANCE；≤ 32 为 SE_ERR 错误码
+    if result as usize > 32 {
+        Ok(())
+    } else {
+        Err(format!("打开浏览器失败（ShellExecuteW 错误码 {}）", result as usize))
+    }
 }
 
 /// 判断 URL 的 query 中是否已含指定 key（按 & 分段取 = 前缀，大小写不敏感）

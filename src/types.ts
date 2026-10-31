@@ -492,6 +492,12 @@ export interface Settings {
   notify_webhook_url: string | null;
   /** Server酱 SendKey（空 = 关闭） */
   notify_serverchan_sendkey: string | null;
+  /** PushPlus Token（pushplus.plus 微信推送；空 = 关闭该渠道） */
+  notify_pushplus_token: string | null;
+  /** PushPlus 推送模板 html/txt/markdown（空 = 默认 txt，纯文本保留换行） */
+  notify_pushplus_template: string | null;
+  /** PushPlus 群组编码 topic（一对多群发；空 = 仅发给自己） */
+  notify_pushplus_topic: string | null;
   // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
   /** 固定应用 key：始终显示在侧边栏且不可隐藏（单选，默认 'trae'） */
   pinned_app: AppKey;
@@ -753,6 +759,23 @@ export interface TraeModelMeta {
   enabled?: boolean | null;
 }
 
+/** Trae 长上下文开关（kv trae_long_context；trae_long_context_list）。仅 Trae 池生效，
+ *  与 Qoder 上下文长度分表存储、互不影响；未列出的模型 = 跟随上游 */
+export interface TraeLongContextView {
+  /** 已开启长上下文的模型（canonical_id） */
+  enabled: string[];
+}
+
+/** Qoder 上下文长度（kv qoder_context_length；qoder_context_length_list）。仅 Qoder 池生效，
+ *  请求体下发 parameters.context_length；未列出的模型 = 跟随上游（不下发字段） */
+export interface QoderContextLengthView {
+  /** 已设置条目（model 为 canonical_id） */
+  items: { model: string; tokens: number }[];
+  /** 合法区间（token，含端点） */
+  min: number;
+  max: number;
+}
+
 /** 模型选项：id = 上游 config_name，label = 官方展示名 */
 export interface ModelOption {
   id: string;
@@ -841,7 +864,7 @@ export interface ApiPoolFile {
   qoder_hedge_threshold_ms?: number;
   /** Qoder 会话粘性开关（F-80-余 v2）：同会话 TTL 内绑定同一 Qoder 账号（默认关） */
   qoder_sticky_enabled?: boolean;
-  /** Qwen3.8-Flash 免费活动倍率覆盖（issue #111，默认开）：目录倍率按 0 处理 + 取号豁免零积分过滤 */
+  /** 免费活动模型倍率覆盖（issue #111/#156，默认开）：Qwen3.8-Flash / DeepSeek-Flash 目录倍率按 0 处理 + 取号豁免零积分过滤 */
   qoder_flash_free_rate?: boolean;
   /** Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
   qoder_account_concurrency_limit?: number;
@@ -1246,6 +1269,13 @@ export interface SanitizeMapView {
 // 清洗规则档位（issue #129：§4.3 分区清洗）：'wb' = wb 池与 Trae 池共用键；
 // 'buddy-ai' = 国际档独立键（buddy_ai_template_map）
 export type SanitizeTier = 'wb' | 'buddy-ai';
+
+// 池级指纹清洗开关视图（issue #158 P1-4）：仅内存热切换、重启复位默认开
+// wb = wb_sanitize（wb + Trae 池共用）；qoder = qoder_sanitize（Qoder 池独立）
+export interface SanitizeSwitches {
+  wb: boolean;
+  qoder: boolean;
+}
 
 // ---- 工具名别名表（issue #150：tool_alias_map KV；Trae 池 tools 工具集指纹识别治本）----
 // 请求侧 tools[].function.name / tool_choice / 历史轮 tool_calls 名 → 通用别名，

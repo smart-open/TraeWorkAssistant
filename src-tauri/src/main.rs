@@ -266,6 +266,9 @@ fn main() {
             commands::wb_config::wb_tool_alias_map_set,
             commands::wb_config::fingerprint_samples_get,
             commands::wb_config::fingerprint_samples_clear,
+            // 池级指纹清洗开关（issue #158 P1-4：wb_sanitize / qoder_sanitize 热切换）
+            commands::api_server::sanitize_switches_get,
+            commands::api_server::sanitize_switch_set,
             commands::api_server::api_unified_models,
             commands::api_server::dispatch_policy_get,
             commands::api_server::dispatch_policy_set,
@@ -282,6 +285,10 @@ fn main() {
             commands::api_server::trae_model_meta_set,
             commands::api_server::trae_model_meta_get,
             commands::api_server::trae_model_meta_clear,
+            commands::api_server::trae_long_context_list,
+            commands::api_server::trae_long_context_set,
+            commands::api_server::qoder_context_length_list,
+            commands::api_server::qoder_context_length_set,
             commands::ccswitch::ccswitch_status,
             commands::ccswitch::ccswitch_register,
             commands::profile::profile_list,
@@ -621,7 +628,19 @@ fn main() {
                                         &st.data_dir,
                                         &format!("托盘 API 服务操作失败: {e}"),
                                     );
-                                    notify::notify(app, "API 服务操作失败", &e);
+                                    // 渠道推送统一入口（含桌面通知 + Bark/Server酱/Webhook，
+                                    // 全部应用共用），避免与 notify::notify 重复弹窗。
+                                    // 事件类别取 Other（手动操作结果，不受「任务失败」事件开关
+                                    // 限制）：托盘菜单无其他反馈通道，若被事件开关静默，
+                                    // 用户点了「启动服务」却只看到没起来、原因全无（静默失败红线）。
+                                    // 后台线程版：菜单回调在主线程，四渠道 HTTP（最坏 ~40s）不得阻塞 UI 事件循环
+                                    commands::workbuddy::push_notify_bg(
+                                        Some(app.clone()),
+                                        st.data_dir.clone(),
+                                        "API 服务操作失败",
+                                        &e,
+                                        crate::notify::NotifyEvent::Other,
+                                    );
                                 }
                             }
                             "proxy-toggle" => {
@@ -655,7 +674,17 @@ fn main() {
                                         &st.data_dir,
                                         &format!("托盘代理操作失败: {e}"),
                                     );
-                                    notify::notify(app, "代理操作失败", &e);
+                                    // 渠道推送统一入口（含桌面通知 + Bark/Server酱/Webhook，
+                                    // 全部应用共用），避免与 notify::notify 重复弹窗。
+                                    // 同上：托盘直操取 Other，不被「任务失败」事件开关静默；
+                                    // 后台线程版防渠道 HTTP 阻塞主线程
+                                    commands::workbuddy::push_notify_bg(
+                                        Some(app.clone()),
+                                        st.data_dir.clone(),
+                                        "代理操作失败",
+                                        &e,
+                                        crate::notify::NotifyEvent::Other,
+                                    );
                                 }
                             }
                             "quit" => {
@@ -707,7 +736,15 @@ fn main() {
                     };
                     if let Err(e) = commands::checkin::start_checkin_core(&app2, &st, opts, true) {
                         fs_utils::app_log(&st.data_dir, &format!("静默签到失败: {e}"));
-                        notify::notify(&app2, "静默签到失败", &e);
+                        // 渠道推送统一入口（含桌面通知 + Bark/Server酱/Webhook，
+                        // 全部应用共用），最小化启动时也能收到，避免重复弹窗
+                        commands::workbuddy::push_notify(
+                            Some(&app2),
+                            &st.data_dir,
+                            "静默签到失败",
+                            &e,
+                            crate::notify::NotifyEvent::TaskFail,
+                        );
                     }
                 });
             }

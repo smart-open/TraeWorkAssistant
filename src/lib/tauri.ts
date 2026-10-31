@@ -12,6 +12,7 @@ import type {
   ApiKeysFileView,
   SanitizeMapView,
   SanitizeRule,
+  SanitizeSwitches,
   SanitizeTier,
   ToolAliasMapView,
   FingerprintSample,
@@ -61,6 +62,7 @@ import type {
   LanIfaceIp,
   DispatchPolicy,
   TraeModelMeta,
+  TraeLongContextView,
   UnifiedModel,
   UsageDayView,
   CustomModel,
@@ -90,6 +92,7 @@ import type {
   UsageSessionsResult,
   TraeExpiredEntsResult,
   QoderAccountView,
+  QoderContextLengthView,
   QoderCheckinRecord,
   QoderCliStatus,
   QoderLiveLogins,
@@ -878,7 +881,7 @@ export const api = {
         qoderHedgeThresholdMs?: number;
         /** Qoder 会话粘性开关（F-80-余 v2）；null/未传 = 保留原值 */
         qoderStickyEnabled?: boolean;
-        /** Qwen3.8-Flash 免费活动倍率覆盖开关（issue #111，默认开）；null/未传 = 保留原值 */
+        /** 免费活动模型倍率覆盖开关（issue #111/#156，默认开）；null/未传 = 保留原值 */
         qoderFlashFreeRate?: boolean;
         /** Qoder 池入池白名单（qd- 账号 id）；null/未传 = 保留原值 */
         qoderUids?: string[];
@@ -1093,6 +1096,16 @@ export const api = {
       invoke<void>('trae_model_meta_set', { model, meta }),
     // 清除人工覆盖（恢复自动来源链）；返回是否确有删除
     metaClear: (model: string) => invoke<boolean>('trae_model_meta_clear', { model }),
+    // Trae 长上下文开关（kv trae_long_context，仅 Trae 池；勾选即对下一请求生效）
+    traeLongContextList: () => invoke<TraeLongContextView>('trae_long_context_list'),
+    // 返回生效状态；模型不支持长上下文时开启被拒绝
+    traeLongContextSet: (model: string, enabled: boolean) =>
+      invoke<boolean>('trae_long_context_set', { model, enabled }),
+    // Qoder 上下文长度（kv qoder_context_length，仅 Qoder 池；保存即对下一请求生效）
+    qoderContextLengthList: () => invoke<QoderContextLengthView>('qoder_context_length_list'),
+    // tokens 为 null/0 = 清除（恢复跟随上游）；返回生效值（清除 → null），越界整体拒绝
+    qoderContextLengthSet: (model: string, tokens: number | null) =>
+      invoke<number | null>('qoder_context_length_set', { model, tokens }),
     // T2：多 API Key 管理（统一列表，无主/子之分）
     keysList: () => invoke<ApiKeysFileView>('api_keys_list'),
     // authDisabled 不传时保留服务端现值（避免整表保存覆盖鉴权开关）
@@ -1123,6 +1136,11 @@ export const api = {
     // 网关命中（11128/空完成影子风控）落下的样本环形缓冲（最新在前，重启即清空）
     fingerprintSamplesGet: () => invoke<FingerprintSample[]>('fingerprint_samples_get'),
     fingerprintSamplesClear: () => invoke<void>('fingerprint_samples_clear'),
+    // ---- 池级指纹清洗开关（issue #158 P1-4：仅内存热切换，重启复位默认开）----
+    // wb = wb_sanitize（wb + Trae 池共用）；qoder = qoder_sanitize（Qoder 池独立）
+    sanitizeSwitchesGet: () => invoke<SanitizeSwitches>('sanitize_switches_get'),
+    sanitizeSwitchSet: (pool: 'wb' | 'qoder', enabled: boolean) =>
+      invoke<void>('sanitize_switch_set', { pool, enabled }),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),

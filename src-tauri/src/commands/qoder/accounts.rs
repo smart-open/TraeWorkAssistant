@@ -456,6 +456,9 @@ pub async fn qoder_account_refresh_token(
                     .ok_or_else(|| "续期后回读失败".to_string())
             }
             "no_credential" => Err("该账号无可用凭证，请先导入 PAT 或重新登录".into()),
+            // 暂态：vault 系统性故障凭证读空（issue #153 修复 2）——故障恢复后
+            // 凭证仍在，可重试；不得提示「无凭证」误导用户重新导入
+            "vault_down" => Err("凭证加密存储暂时不可用（vault 故障），请检查日志后重试".into()),
             // 暂态：账号级刷新锁被他进程/线程持有（ensure_fresh 沿用现有凭证返回）
             // ——可稍后重试；英文 note 不得透传用户
             "refresh_busy" => Err("续期未执行：该账号正在另一任务中刷新，请稍后重试".into()),
