@@ -1029,6 +1029,64 @@ pub fn trae_model_meta_clear(state: &AppState, model: String) -> Result<bool, St
     crate::api_server::unified_catalog::meta_clear(&state.data_dir, &model)
 }
 
+// ==================== 按模型长上下文（按池隔离：Trae 开关 / Qoder 数值） ====================
+
+/// Trae 长上下文开关视图：已开启的模型（canonical_id）；未列出 = 跟随上游
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TraeLongContextView {
+    pub enabled: Vec<String>,
+}
+
+pub fn trae_long_context_list(state: &AppState) -> TraeLongContextView {
+    TraeLongContextView {
+        enabled: crate::api_server::context_window::trae_list(&state.data_dir)
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// 开启/关闭单模型长上下文（仅 Trae 池）；支持表外模型拒绝开启。返回生效状态
+pub fn trae_long_context_set(state: &AppState, model: String, enabled: bool) -> Result<bool, String> {
+    crate::api_server::context_window::trae_set(&state.data_dir, &model, enabled)
+}
+
+/// Qoder 上下文长度单条（管理面列表行）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QoderContextLengthItem {
+    pub model: String,
+    pub tokens: u64,
+}
+
+/// Qoder 上下文长度视图：已设置条目 + 合法区间（未列出的模型 = 跟随上游）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QoderContextLengthView {
+    pub items: Vec<QoderContextLengthItem>,
+    pub min: u64,
+    pub max: u64,
+}
+
+pub fn qoder_context_length_list(state: &AppState) -> QoderContextLengthView {
+    use crate::api_server::context_window as cw;
+    QoderContextLengthView {
+        items: cw::qoder_list(&state.data_dir)
+            .into_iter()
+            .map(|(model, tokens)| QoderContextLengthItem { model, tokens })
+            .collect(),
+        min: cw::QODER_MIN_TOKENS,
+        max: cw::QODER_MAX_TOKENS,
+    }
+}
+
+/// 设置单模型 Qoder 上下文长度（仅 Qoder 池）；`tokens` 为 null/0 = 清除（跟随上游）。
+/// 保存即对下一请求生效（config_cache 显式失效），返回生效值
+pub fn qoder_context_length_set(
+    state: &AppState,
+    model: String,
+    tokens: Option<u64>,
+) -> Result<Option<u64>, String> {
+    crate::api_server::context_window::qoder_set(&state.data_dir, &model, tokens)
+}
+
 // ==================== 单元测试：pool_set 合并语义（调度策略收口） ====================
 
 #[cfg(test)]

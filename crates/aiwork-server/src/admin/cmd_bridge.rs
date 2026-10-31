@@ -491,6 +491,19 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let model = arg(&args, "model")?;
             api_server_cmd::trae_model_meta_clear(state, model).and_then(to_json)
         }
+        // 按模型长上下文（按池隔离；只影响请求侧，不改目录/计费）
+        "trae_long_context_list" => to_json(api_server_cmd::trae_long_context_list(state)),
+        "trae_long_context_set" => {
+            let model = arg(&args, "model")?;
+            let enabled = arg(&args, "enabled")?;
+            api_server_cmd::trae_long_context_set(state, model, enabled).and_then(to_json)
+        }
+        "qoder_context_length_list" => to_json(api_server_cmd::qoder_context_length_list(state)),
+        "qoder_context_length_set" => {
+            let model = arg(&args, "model")?;
+            let tokens = opt_arg(&args, "tokens")?;
+            api_server_cmd::qoder_context_length_set(state, model, tokens).and_then(to_json)
+        }
 
         // ==================== wb_config（WB 手工配置） ====================
         "wb_route_config_get" => wb_config::wb_route_config_get(state),

@@ -246,7 +246,8 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                 <span className="font-medium text-slate-600 dark:text-zinc-300">Max Mode（1M 上下文，仅 Trae 池）：</span>
                 右表「Max」列为 ✓ 的模型在 ID 后加 <code>-max</code> 后缀即可启用（如 <code>glm-5.3-max</code>），
                 网关自动剥离后缀并向 Trae 注入；也可在 OpenAI 兼容请求体直传{' '}
-                <code>&quot;is_max_mode&quot;: true</code>。表外模型加后缀不生效；
+                <code>&quot;is_max_mode&quot;: true</code>；或在 Trae 资源调度页的模型目录勾选该模型的「长上下文」，
+                网关对该模型的每个 Trae 请求自动启用（不影响 Qoder 等其他池）。表外模型加后缀不生效；
                 特例 <code>qwen3.8-max</code> 本身以 -max 结尾，启用需写 <code>qwen3.8-max-max</code>。
               </p>
             </div>

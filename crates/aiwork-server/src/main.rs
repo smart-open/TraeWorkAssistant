@@ -201,14 +201,41 @@ async fn csp_html_middleware(
     resp
 }
 
+/// 静态资源缓存策略（部署可见性修复）：
+/// - `/assets/*` 带 vite 内容哈希，**仅 2xx** 可长期强缓存；
+/// - 非 2xx（部署瞬间文件尚未落盘的 404 等）一律 `no-store`——否则浏览器会把
+///   这次 404 当 immutable 记住一年，新版本上线后该 bundle 永久加载失败；
+/// - 其余（index.html、SPA 兜底页）一律 `no-store`——裸 ServeDir 只发 Last-Modified，
+///   浏览器启发式缓存会继续用旧 index.html 指向已删除的旧 bundle，表现为「部署完
+///   刷新也看不到新界面」，且旧 bundle 404 后整页白屏。
+async fn static_cache_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_asset = req.uri().path().starts_with("/assets/");
+    let mut resp = next.run(req).await;
+    let policy = if is_asset && resp.status().is_success() {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    };
+    if let Ok(value) = axum::http::HeaderValue::from_str(policy) {
+        resp.headers_mut()
+            .insert(axum::http::header::CACHE_CONTROL, value);
+    }
+    resp
+}
+
 /// 静态资源路由：AIWORK_WEB_DIST 目录存在 → ServeDir（目录自动补 index.html）；
 /// 不存在 → 指引占位页（T4 判据允许空壳）。默认 dist/（vite build 输出目录，T9 对齐）
 fn static_router() -> Router {
     let dir = std::env::var("AIWORK_WEB_DIST").unwrap_or_else(|_| "dist".to_string());
     if std::path::Path::new(&dir).is_dir() {
-        Router::new().fallback_service(
-            tower_http::services::ServeDir::new(&dir).append_index_html_on_directories(true),
-        )
+        Router::new()
+            .fallback_service(
+                tower_http::services::ServeDir::new(&dir).append_index_html_on_directories(true),
+            )
+            .layer(axum::middleware::from_fn(static_cache_headers))
     } else {
         Router::new().route(
             "/",
@@ -239,5 +266,53 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 起真实 ServeDir + 缓存中间件，裸 HTTP/1.1 取响应头（无额外测试依赖）
+    async fn fetch_head(addr: std::net::SocketAddr, path: &str) -> String {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            s.write_all(req.as_bytes()).unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out.split("\r\n\r\n").next().unwrap_or("").to_lowercase()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// codex 审查【2】：/assets/* 的 404（部署瞬间文件不在）不得带 immutable 长缓存
+    #[tokio::test]
+    async fn asset_cache_immutable_only_on_success() {
+        let dir = std::env::temp_dir().join(format!("aiwork-static-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets/app-abc.js"), "x").unwrap();
+        std::fs::write(dir.join("index.html"), "<html></html>").unwrap();
+        let app = Router::new()
+            .fallback_service(tower_http::services::ServeDir::new(&dir))
+            .layer(axum::middleware::from_fn(static_cache_headers));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let hit = fetch_head(addr, "/assets/app-abc.js").await;
+        assert!(hit.starts_with("http/1.1 200"), "{hit}");
+        assert!(hit.contains("cache-control: public, max-age=31536000, immutable"), "{hit}");
+
+        let miss = fetch_head(addr, "/assets/app-missing.js").await;
+        assert!(miss.starts_with("http/1.1 404"), "{miss}");
+        assert!(miss.contains("cache-control: no-store"), "404 不得长缓存: {miss}");
+        assert!(!miss.contains("immutable"), "{miss}");
+
+        let index = fetch_head(addr, "/index.html").await;
+        assert!(index.contains("cache-control: no-store"), "{index}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

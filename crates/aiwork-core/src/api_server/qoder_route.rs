@@ -419,6 +419,25 @@ fn safe_slice(s: &str, n: usize) -> &str {
     &s[..end]
 }
 
+/// 信封业务 400（HTTP 200 + statusCodeValue=400）且本请求下发了 context_length
+/// 覆盖 → 终局错误文案（原错误 + 清空设置指引），与 HTTP 层 Fatal 同前缀格式；
+/// 否则 None 走原有轮换。参数拒绝与账号无关：换号只会逐号复现并误冷却账号，
+/// 最终以「无健康账号」收尾吞掉可行动的指引。仅接 Unknown——排队/鉴权/额度
+/// 业务码各有既定语义，不在此劫持
+fn envelope_context_reject(entry: &Value, meta: Option<&ErrMeta>) -> Option<String> {
+    let meta = meta.filter(|m| m.kind == UpstreamKind::Unknown)?;
+    let hint = qoder_upstream::context_override_hint(entry, meta.status);
+    if hint.is_empty() {
+        return None;
+    }
+    let detail = if meta.raw.is_empty() {
+        meta.message.clone()
+    } else {
+        format!("{}: {}", meta.message, safe_slice(&meta.raw, 300))
+    };
+    Some(format!("upstream {} error: {detail}{hint}", meta.status))
+}
+
 // ==================== F-80-余 v2 慢请求竞速对冲（取号侧编排，wb_route 同构） ====================
 
 /// 对冲账号在途计数租约（镜像 wb_route::HedgeLease）：构造即 +1（竞速窗口
@@ -777,6 +796,11 @@ fn run_qoder_stream(
             state
                 .qoder_flash_free_rate
                 .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        // Qoder 页单模型上下文长度 → parameters.context_length（未设置不下发）
+        qoder_upstream::apply_context_override(
+            &mut e,
+            super::context_window::qoder_target(&state.data_dir, model),
         );
         e
     };
@@ -1226,6 +1250,20 @@ fn run_qoder_stream(
                     };
                     match error_info {
                         Some((code, msg)) => {
+                            // 信封 400 拒绝 context_length 覆盖：终局下发原错误 + 清空
+                            // 指引（不换号不冷却，同 HTTP 层 Fatal 口径）
+                            if !sent_any {
+                                if let Some(full) = envelope_context_reject(&entry, meta.as_ref()) {
+                                    record_usage(false);
+                                    state.logger.log_request_ttfb(
+                                        "qoder", "POST", "/v1/chat/completions", model, true,
+                                        400, &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.qoder_pool.name_of(&win_uid), Some(&full),
+                                    );
+                                    send_stream_error(tx, proto, 400, &full);
+                                    return;
+                                }
+                            }
                             // 流内错误分类以 ErrMeta 为准（translate 写入，含排队/额度信号）
                             match meta.as_ref().map(|m| m.kind) {
                                 Some(UpstreamKind::TransportCut) => {
@@ -1539,8 +1577,12 @@ fn run_qoder_stream(
                             break; // 换号
                         }
                         RetryAction::Fatal => {
-                            let msg =
-                                format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                            let msg = format!(
+                                "upstream {} error: {}{}",
+                                status,
+                                safe_slice(&resp_body, 300),
+                                qoder_upstream::context_override_hint(&entry, status),
+                            );
                             // 终态记账对齐「每请求一行」口径（移植 7883d1c，审查 F3）：
                             // Fatal 是请求终局（同 no-healthy 由取号分支记录），此前仅
                             // log_request 导致用量统计页缺口；ttfb/credits 无失败语义传 None
@@ -1624,6 +1666,11 @@ pub async fn qoder_aggregate_chat(
                 state
                     .qoder_flash_free_rate
                     .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            // Qoder 页单模型上下文长度 → parameters.context_length（未设置不下发）
+            qoder_upstream::apply_context_override(
+                &mut e,
+                super::context_window::qoder_target(&state.data_dir, &model),
             );
             e
         };
@@ -2017,6 +2064,21 @@ pub async fn qoder_aggregate_chat(
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .clone();
+                                // 信封 400 拒绝 context_length 覆盖：终局返回原错误 +
+                                // 清空指引（同流式分支）
+                                if let Some(full) = envelope_context_reject(&entry, meta.as_ref()) {
+                                    state.record_usage_qoder(
+                                        &model, &win_uid, &key_id, false, stream, duration_ms,
+                                        0, 0, Some(ttfb_ms), None, None,
+                                        &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
+                                    );
+                                    state.logger.log_request_ttfb(
+                                        "qoder", "POST", "/v1/chat/completions", &model, stream,
+                                        400, &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.qoder_pool.name_of(&win_uid), Some(&full),
+                                    );
+                                    return Err(full);
+                                }
                                 match meta.as_ref().map(|m| m.kind) {
                                     Some(UpstreamKind::TransportCut) => {
                                         // 传输层掐断（issue #158 P2-2）：账号无关的传输
@@ -2234,9 +2296,10 @@ pub async fn qoder_aggregate_chat(
                                     Some(&safe_slice(&resp_body, 300)),
                                 );
                                 return Err(format!(
-                                    "upstream {} error: {}",
+                                    "upstream {} error: {}{}",
                                     status,
-                                    safe_slice(&resp_body, 300)
+                                    safe_slice(&resp_body, 300),
+                                    qoder_upstream::context_override_hint(&entry, status),
                                 ));
                             }
                         }
@@ -2692,5 +2755,71 @@ mod tests {
         let entry = qoder_upstream::resolve("TwaG4Same", qoder_upstream::QoderRegion::Cn)
             .expect("CN 远程目录应命中");
         assert!(entry_is_global_only("TwaG4Same", &entry));
+    }
+
+    /// codex 审查【1】：HTTP 200 + 信封 statusCodeValue=400 走解码错误分支，
+    /// 此前只换号轮换、最终报「无健康账号」，context_length 清空指引丢失。
+    /// 完整复现解码链（信封行 → QoderTranslate → wb_sse::aggregate → ErrMeta）
+    fn decode_envelope_err(envelope: Value) -> Option<ErrMeta> {
+        let slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+        let lines = vec![format!("data: {envelope}"), String::new()].into_iter();
+        let translated =
+            qoder_upstream::QoderTranslate::new(lines, slot.clone(), "chatcmpl-t", "m");
+        let (resp, error) = wb_sse::aggregate(translated, "chatcmpl-t", None);
+        assert!(resp.is_none() && error.is_some(), "信封错误应落解码错误分支");
+        let meta = slot.lock().unwrap().clone();
+        meta
+    }
+
+    #[test]
+    fn envelope_400_with_context_override_surfaces_hint() {
+        let decode = decode_envelope_err;
+        let raw = "{\"code\":\"InvalidParameter\",\"message\":\"context_length out of range\"}";
+        let meta = decode(json!({"statusCodeValue": 400, "body": raw}));
+
+        let mut set = json!({"id": "m", "upstreamKey": "m"});
+        qoder_upstream::apply_context_override(&mut set, Some(1_000_000));
+        let msg = envelope_context_reject(&set, meta.as_ref()).expect("应终局附指引");
+        assert!(msg.starts_with("upstream 400 error: "), "{msg}");
+        assert!(msg.contains("context_length out of range"), "保留上游原错误: {msg}");
+        assert!(msg.contains("context_length=1000000"), "附清空指引: {msg}");
+
+        // 未设置覆盖：维持原有轮换
+        let unset = json!({"id": "m", "upstreamKey": "m"});
+        assert!(envelope_context_reject(&unset, meta.as_ref()).is_none());
+        // 非 400 / 有既定语义的业务码（排队）不劫持
+        let m500 = decode(json!({"statusCodeValue": 500, "body": "boom"}));
+        assert!(envelope_context_reject(&set, m500.as_ref()).is_none());
+        let queued = decode(json!({"statusCodeValue": 400, "body": "{\"code\":\"10605\"}"}));
+        assert!(envelope_context_reject(&set, queued.as_ref()).is_none());
+    }
+
+    /// codex 复核：上游参数错误正文 `context_length exceeded the model limit` 含
+    /// "exceeded"，此前被额度泛词判成 Quota——上下文被拒分支（仅接 Unknown）
+    /// 不命中，继续换号并给健康账号记 HardCredit。须先于额度泛词识别为参数
+    /// 被拒，同时不吞 110 额度 / 10605 排队 / 401 / 403 账号错误
+    #[test]
+    fn envelope_context_length_exceeded_is_param_reject_not_quota() {
+        let mut set = json!({"id": "m", "upstreamKey": "m"});
+        qoder_upstream::apply_context_override(&mut set, Some(1_000_000));
+        let raw = "{\"code\":\"InvalidParameter\",\"message\":\"参数错误: context_length exceeded the model limit\"}";
+        let meta = decode_envelope_err(json!({"statusCodeValue": 400, "body": raw}));
+        assert_eq!(meta.as_ref().map(|m| m.kind), Some(UpstreamKind::Unknown), "{meta:?}");
+        let msg = envelope_context_reject(&set, meta.as_ref()).expect("应终局附指引，不换号");
+        assert!(msg.contains("context_length exceeded the model limit"), "{msg}");
+        assert!(msg.contains("context_length=1000000"), "{msg}");
+
+        // 账号错误码即便正文同样点名 context_length 也维持原分类、不劫持
+        let cases = [
+            (400, "{\"code\":\"110\",\"message\":\"context_length exceeded\"}", UpstreamKind::Quota),
+            (400, "{\"code\":\"10605\",\"message\":\"context_length exceeded\"}", UpstreamKind::Queued),
+            (401, "context_length exceeded", UpstreamKind::Auth),
+            (403, "context_length exceeded", UpstreamKind::Quota),
+        ];
+        for (status, body, want) in cases {
+            let meta = decode_envelope_err(json!({"statusCodeValue": status, "body": body}));
+            assert_eq!(meta.as_ref().map(|m| m.kind), Some(want), "{status} {body}");
+            assert!(envelope_context_reject(&set, meta.as_ref()).is_none(), "{status} {body}");
+        }
     }
 }

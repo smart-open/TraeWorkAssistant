@@ -289,11 +289,14 @@ fn inject_trae_outbound(
     body_vec: Vec<u8>,
     wire: Option<String>,
     max_mode_hint: bool,
+    ctx_max: bool,
     requested_model: &str,
     model: &str,
 ) -> Vec<u8> {
-    let inject_max =
-        max_mode_hint && efforts::trae_max_mode_supported(&unified_catalog::canonical_id(model));
+    // Trae 页「长上下文」开关（context_window::trae_wants_max）与 `-max` 入口为「或」关系：
+    // 开关只能开启、不关闭显式 -max；同受 Max Mode 支持表门控
+    let inject_max = (max_mode_hint || ctx_max)
+        && efforts::trae_max_mode_supported(&unified_catalog::canonical_id(model));
     let rewrite_model = requested_model != model;
     if wire.is_none() && !inject_max && !rewrite_model {
         return body_vec;
@@ -312,11 +315,12 @@ fn inject_trae_outbound(
             crate::fs_utils::app_log(
                 data_dir,
                 &format!(
-                    "trae outbound: model={} requested_model={} effort_injected={} max_mode_injected={}",
+                    "trae outbound: model={} requested_model={} effort_injected={} max_mode_injected={} ctx_max={}",
                     model,
                     requested_model,
                     wire.is_some(),
                     inject_max,
+                    ctx_max,
                 ),
             );
             serde_json::to_vec(&obj).unwrap_or(body_vec)
@@ -1098,8 +1102,9 @@ pub async fn chat_completions(
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
+                let ctx_max = super::context_window::trae_wants_max(&state.data_dir, &r.model);
                 let body_vec = inject_trae_outbound(
-                    &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
+                    &state.data_dir, body_vec, wire, r.max_mode_hint, ctx_max, &model, &r.model,
                 );
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard)
@@ -1482,8 +1487,9 @@ pub async fn messages(
                     _ => None,
                 };
                 let wire = trae_effort_wire(&state, r.effort_hint, explicit, &r.model);
+                let ctx_max = super::context_window::trae_wants_max(&state.data_dir, &r.model);
                 let body_vec = inject_trae_outbound(
-                    &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
+                    &state.data_dir, body_vec, wire, r.max_mode_hint, ctx_max, &model, &r.model,
                 );
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard)
@@ -1621,8 +1627,9 @@ pub async fn completions(
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
                 let wire = trae_effort_wire(&state, r.effort_hint, None, &r.model);
+                let ctx_max = super::context_window::trae_wants_max(&state.data_dir, &r.model);
                 let body_vec = inject_trae_outbound(
-                    &state.data_dir, body_vec, wire, r.max_mode_hint, &model, &r.model,
+                    &state.data_dir, body_vec, wire, r.max_mode_hint, ctx_max, &model, &r.model,
                 );
                 if stream {
                     stream_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard)
@@ -4054,7 +4061,7 @@ mod tests {
         // 测试桩：注入函数现需 data_dir 落可观测性日志（issue #38-5），指向临时目录
         let dir = std::env::temp_dir();
         let inject = |body: Vec<u8>, wire: Option<String>, mm: bool, requested: &str, model: &str| {
-            inject_trae_outbound(&dir, body, wire, mm, requested, model)
+            inject_trae_outbound(&dir, body, wire, mm, false, requested, model)
         };
         let body = br#"{"model":"glm-5.3","messages":[]}"#.to_vec();
 
@@ -4107,5 +4114,34 @@ mod tests {
         // 非 JSON body → 原样
         let raw = b"not-json".to_vec();
         assert_eq!(inject(raw.clone(), Some("high".into()), true, "glm-5.3", "glm-5.3"), raw);
+    }
+
+    /// 长上下文开关（ctx_max）→ Trae 出站：生效 / 未设置零变化 / 表外模型不炸
+    #[test]
+    fn inject_trae_outbound_ctx_max() {
+        let dir = std::env::temp_dir();
+        let body = br#"{"model":"glm-5.3","messages":[]}"#.to_vec();
+        // 开关开启：无 -max 后缀也注入 is_max_mode
+        let out = inject_trae_outbound(&dir, body.clone(), None, false, true, "glm-5.3", "glm-5.3");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["is_max_mode"], true);
+        assert_eq!(v["model"], "glm-5.3");
+        // 未开启：逐字节原样（不 parse 不重排）
+        let spaced = b"{ \"model\" : \"glm-5.3\", \"messages\":[] }".to_vec();
+        assert_eq!(
+            inject_trae_outbound(&dir, spaced.clone(), None, false, false, "glm-5.3", "glm-5.3"),
+            spaced
+        );
+        // 支持表外模型：开关无法执行 → 原样，不注入
+        let other = br#"{"model":"doubao-seed-code","messages":[]}"#.to_vec();
+        assert_eq!(
+            inject_trae_outbound(&dir, other.clone(), None, false, true, "doubao-seed-code", "doubao-seed-code"),
+            other
+        );
+        // 与 -max 入口叠加：仍单次注入
+        let out = inject_trae_outbound(&dir, body, None, true, true, "glm-5.3-max", "glm-5.3");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["is_max_mode"], true);
+        assert_eq!(v["model"], "glm-5.3");
     }
 }
