@@ -525,9 +525,15 @@ fn message_model(value: &Value) -> Option<String> {
     if let Some(model) = pick(value) {
         return Some(model);
     }
-    let extra = value.get("extra").and_then(Value::as_str)?;
-    let parsed: Value = serde_json::from_str(extra).ok()?;
-    pick(&parsed)
+    // extra 实测为 JSON 字符串（IDE 落盘形态），兼容直接落对象的变体
+    match value.get("extra") {
+        Some(Value::String(extra)) => {
+            let parsed: Value = serde_json::from_str(extra).ok()?;
+            pick(&parsed)
+        }
+        Some(extra @ Value::Object(_)) => pick(extra),
+        _ => None,
+    }
 }
 
 /// 逐请求真实模型（2026-11-01 修复，替代会话级 `selectedModelId` 归属）：
@@ -538,6 +544,7 @@ fn message_model(value: &Value) -> Option<String> {
 fn request_model(session_dir: &Path, request: &Map<String, Value>) -> Option<String> {
     const MAX_TRIES: usize = 6;
     let ids = request.get("messages").and_then(Value::as_array)?;
+    // 末尾 3 条优先（助手响应在尾部），不足 3 条时与头部去重，免重复读盘
     let mut candidates: Vec<&str> = Vec::new();
     for id in ids.iter().rev().take(3) {
         if let Some(id) = id.as_str() {
@@ -546,7 +553,9 @@ fn request_model(session_dir: &Path, request: &Map<String, Value>) -> Option<Str
     }
     for id in ids.iter().take(3) {
         if let Some(id) = id.as_str() {
-            candidates.push(id);
+            if !candidates.contains(&id) {
+                candidates.push(id);
+            }
         }
     }
     for id in candidates.into_iter().take(MAX_TRIES) {
@@ -1740,6 +1749,21 @@ mod tests {
         // 回退值同样走归一：`custom-local:` 前缀不应让同一模型裂成两条线
         assert!(e.by_model.contains_key("deepseek-v4.1-flash"), "{:?}", e.by_model.keys());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `extra` 实测为 JSON 字符串形态，但直接落对象的变体同样要能取到模型。
+    #[test]
+    fn message_model_accepts_object_extra() {
+        assert_eq!(
+            message_model(&json!({ "extra": { "modelId": "custom-local:glm-5.3-flash" } })).as_deref(),
+            Some("glm-5.3-flash")
+        );
+        // 字符串形态（IDE 实际落盘形态）与无 extra 的 user 消息
+        assert_eq!(
+            message_model(&json!({ "extra": json!({ "modelId": "auto" }).to_string() })).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(message_model(&json!({ "role": "user" })), None);
     }
 
     /// 跨文件/跨 uid 的同一请求只计一次（2026-10-08 实测缺陷回归：同一批请求会以**新的
