@@ -1081,7 +1081,7 @@ export default function BuddyAccounts() {
                                 : a.snapshot_verify_failed_workbuddy_ms
                                   ? `上次切换到 WorkBuddy 时客户端登录身份不符/发生回退（${new Date(a.snapshot_verify_failed_workbuddy_ms).toLocaleString()}）；建议重新登录后「保存当前登录态」`
                                   : a.snapshot_verify_timeout_workbuddy_ms
-                                    ? `上次切换到 WorkBuddy 后 20 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_workbuddy_ms).toLocaleString()}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
+                                    ? `上次切换到 WorkBuddy 后 30 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_workbuddy_ms).toLocaleString()}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
                                     : a.has_snapshot
                                       ? `WorkBuddy 登录态快照保存于 ${a.snapshot_saved_at_workbuddy_ms ? new Date(a.snapshot_saved_at_workbuddy_ms).toLocaleString() : '未知时间'}`
                                       : '没有 WorkBuddy 登录态快照'
@@ -1105,7 +1105,7 @@ export default function BuddyAccounts() {
                                 : a.snapshot_verify_failed_codebuddy_ms
                                   ? `上次切换到 CodeBuddy 时客户端登录身份不符/发生回退（${new Date(a.snapshot_verify_failed_codebuddy_ms).toLocaleString()}）；建议重新登录后「保存当前登录态」`
                                   : a.snapshot_verify_timeout_codebuddy_ms
-                                    ? `上次切换到 CodeBuddy 后 20 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_codebuddy_ms).toLocaleString()}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
+                                    ? `上次切换到 CodeBuddy 后 30 秒内未确认登录身份（${new Date(a.snapshot_verify_timeout_codebuddy_ms).toLocaleString()}）；多为客户端启动慢或登录延迟，请稍后核实，再次成功切换或重新保存后自动清除`
                                     : a.has_snapshot_codebuddy
                                       ? `CodeBuddy 登录态快照（含 vscdb 登录真源）保存于 ${a.snapshot_saved_at_codebuddy_ms ? new Date(a.snapshot_saved_at_codebuddy_ms).toLocaleString() : '未知时间'}`
                                       : '没有 CodeBuddy 登录态快照'

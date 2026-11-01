@@ -437,7 +437,7 @@ fn buddy_ai_account_view(a: &WorkBuddyAccount, rec: Option<&Value>, ctx: &BuddyA
     };
     let meta = |dir: &std::path::Path, id: &str| {
         let (saved, failed, timeout) = crate::switcher::authfile::read_slot_snapshot_meta(dir, id);
-        if saved.is_none() && failed.is_none() {
+        if saved.is_none() && failed.is_none() && timeout.is_none() {
             crate::switcher::authfile::read_slot_snapshot_meta(dir, &format!("{id}.bak"))
         } else {
             (saved, failed, timeout)

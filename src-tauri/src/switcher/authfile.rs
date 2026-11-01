@@ -151,9 +151,13 @@ pub(crate) fn read_slot_uid(dir: &Path, id: &str) -> Option<String> {
 }
 
 /// 客户端当前 live 登录身份：CodeBuddy 系取 `globalStorage\storage.json` 的 genie.userId
-/// （缺失回退共享 auth 文件 uid），WorkBuddy 系取 auth 文件 uid。
+/// （缺失回退共享 auth 文件 uid），WorkBuddy 系优先 skeleton 登录快照 primary.uid、
+/// 缺失才回退 auth 文件 uid。
 /// 注意：共享 auth 文件记录的是 **WorkBuddy** 当前账号，与 CodeBuddy 端可能不一致，
-/// 故 CodeBuddy 系必须优先用 genie.userId。
+/// 故 CodeBuddy 系必须优先用 genie.userId；WorkBuddy 系同理——现版本客户端接受登录
+/// 后只重写 skeleton 快照、不回写 auth 文件（2026-10-30 实测 auth mtime 停在旧日期），
+/// 手动登录后立即「保存当前登录态」时 auth 文件可能仍停在上一个账号，用它会触发
+/// 槽位身份对齐守卫误拦；skeleton primary.uid 随每次登录/切换重写，是更可信的 live 信号。
 pub(crate) fn live_login_uid(sess: &Session) -> Option<String> {
     if matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
         sess.prof
@@ -169,8 +173,22 @@ pub(crate) fn live_login_uid(sess: &Session) -> Option<String> {
             })
             .or_else(|| auth_file_uid(&sess.auth_file))
     } else {
-        auth_file_uid(&sess.auth_file)
+        skeleton_snapshot_uid(sess).or_else(|| auth_file_uid(&sess.auth_file))
     }
+}
+
+/// WorkBuddy skeleton 登录快照（`storage\skeleton\account-snapshot.json`）的
+/// primary.uid（旧平铺键兜底）；缺失/损坏 → None。
+fn skeleton_snapshot_uid(sess: &Session) -> Option<String> {
+    let raw = crate::fs_utils::read_json::<serde_json::Value>(
+        &sess
+            .prof
+            .data_dir
+            .join("storage")
+            .join("skeleton")
+            .join("account-snapshot.json"),
+    );
+    snapshot_uid_of(&raw)
 }
 
 pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
@@ -1366,9 +1384,16 @@ const SESSION_DEAD_MARKERS: [&str; 6] = [
 
 /// 读日志尾部（最多 `tail_bytes`，非法 UTF-8 宽松解码）
 fn read_log_tail(path: &Path, tail_bytes: usize) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    let start = bytes.len().saturating_sub(tail_bytes);
-    Some(String::from_utf8_lossy(&bytes[start..]).to_string())
+    // 只读尾部：confirm 每 2s 轮询一次，全量 read 会在大日志（可上百 MB）上
+    // 把 30s 确认窗口的 IO 放大几十倍。seek 到 len-tail 处读即可。
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(tail_bytes as u64);
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).to_string())
 }
 
 /// 递归收集 dir 下最新的 `limit` 个 .log（按 mtime 降序；限深 4）

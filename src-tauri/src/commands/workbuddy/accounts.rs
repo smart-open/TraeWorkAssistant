@@ -234,7 +234,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 || snap_cb_path.join(format!("{}.bak", a.id)).is_dir();
             let meta = |dir: &std::path::Path, id: &str| {
                 let (s, f, t) = crate::switcher::authfile::read_slot_snapshot_meta(dir, id);
-                if s.is_none() && f.is_none() {
+                if s.is_none() && f.is_none() && t.is_none() {
                     crate::switcher::authfile::read_slot_snapshot_meta(
                         dir,
                         &format!("{id}.bak"),
