@@ -1688,6 +1688,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sess.data_dir);
     }
 
+    /// 2026-11-01 审查修复回归：live_login_uid WorkBuddy 系 skeleton 优先——客户端
+    /// 登录后只重写 skeleton 快照、不回写 auth 文件（auth 停在上个账号），槽位身份
+    /// 守卫必须采用 skeleton primary.uid；skeleton 缺失/损坏才回退 auth 文件 uid。
+    #[test]
+    fn 备份守卫采用skeleton身份而非陈旧auth文件() {
+        let _guard = test_io_lock();
+        let sess = session(TargetApp::WorkBuddy, "skeleton-live");
+        let sink = QuietSink;
+        // live 现场两层信号刻意错开：skeleton primary.uid = uid-skel（客户端刚登录），
+        // auth 文件停留上个账号 uid-auth（客户端从不回写）
+        let skeleton = sess.prof.data_dir.join("storage").join("skeleton");
+        std::fs::create_dir_all(&skeleton).unwrap();
+        std::fs::write(
+            skeleton.join("account-snapshot.json"),
+            r#"{"primary":{"uid":"uid-skel","nickname":"K","savedAt":123}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&sess.auth_dir).unwrap();
+        std::fs::write(&sess.auth_file, r#"{"account":{"uid":"uid-auth"}}"#).unwrap();
+
+        // 槽位 meta.uid = uid-skel：守卫按 skeleton 判一致 → 放行
+        //（若误用 auth 文件的 uid-auth 会误拦）
+        let slot = "100";
+        let slot_dir = sess.prof.profiles_dir.join(slot);
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        std::fs::write(slot_dir.join("meta.json"), r#"{"uid":"uid-skel"}"#).unwrap();
+        backup_authfile(&sess, slot, &sink).unwrap();
+        assert!(
+            slot_dir.join("auth").join(WB_AUTH_FILE_NAME).exists(),
+            "skeleton 身份与槽位一致时应放行备份"
+        );
+
+        // 对照：槽位 meta.uid = uid-auth（auth 文件视角一致、skeleton 视角不符）
+        // → 守卫按 skeleton 身份拒绝，且不动原槽位
+        let _ = std::fs::remove_dir_all(&slot_dir);
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        std::fs::write(slot_dir.join("meta.json"), r#"{"uid":"uid-auth"}"#).unwrap();
+        backup_authfile(&sess, slot, &sink).unwrap();
+        let meta = std::fs::read_to_string(slot_dir.join("meta.json")).unwrap();
+        assert!(
+            meta.contains("uid-auth"),
+            "守卫按 skeleton 身份拒绝时槽位 meta 不得被改写：{meta}"
+        );
+        assert!(
+            !slot_dir.join("auth").join(WB_AUTH_FILE_NAME).exists(),
+            "skeleton 身份不符时不得写入 auth 文件"
+        );
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
     #[test]
     fn 备份恢复round_trip_含meta与_l2() {
         let _guard = test_io_lock();
