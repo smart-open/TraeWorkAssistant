@@ -345,7 +345,7 @@ fn packages_from(body: &Value) -> Vec<Value> {
 /// 聚合父字段（如 data.CycleRemainCapacity）与 Packages[] 明细并存时，父/子
 /// 不可重复计数（issue #120 余额翻倍根因）。与 `packages_from` **同一跳过谓词**：
 /// 存在带 PackageCode 的明细时，「聚合父容器」与「已知分类汇总行」一律不计，
-/// 其余无 code 项（旧结构真实包）保留，同类不同行同值只计一次——
+/// 其余无 code 项（旧结构真实包）全量保留、不按值去重（同值可能是两个真实包）——
 /// 即「余额 ≡ 悬停明细的合计」。
 ///
 /// 分类汇总行不再按 remaining 值放行（上一版「值对不上明细就计入」的口径在此失效）：
@@ -388,10 +388,10 @@ pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
         .map(|d| remaining_of(d, total_of(d)))
         .sum::<Option<f64>>()?;
     // 无 code 补充口径：与 `packages_from` 同一谓词（聚合父容器 / 已知分类汇总行跳过，
-    // 无 code 真实包保留）；无 code 项之间同值去重（双视图的名字未必都在黑名单里，
-    // 按值兜底）。分类汇总行不参与判定——它是明细的合计视图，按子集合计时与 coded Σ
-    // 和单条明细都不相等，按值判重必然漏杀（余额被再加一遍）。
-    let mut seen: Vec<f64> = vec![];
+    // 无 code 真实包保留）。无 code 项之间刻意不做按值去重——同值可能是两个真实包，
+    // 按值兜底会让余额少计、打破「余额 ≡ 悬停明细合计」不变量（单测
+    // balance_equals_sum_of_listed_packages 末个形态锁定）；确属重复口径的未知命名
+    // 汇总行应扩 CATEGORY_SUMMARY_NAMES 黑名单，而非按值猜测。
     let mut extra = 0.0;
     for d in found.iter().copied() {
         if package_code_of(d).is_some() || is_skippable_uncoded(d, true, &coded) {
@@ -400,20 +400,9 @@ pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
         let Some(v) = remaining_of(d, total_of(d)) else {
             continue;
         };
-        if seen.iter().any(|s| approx_f64(*s, v)) {
-            continue;
-        }
-        seen.push(v);
         extra += v;
     }
     Some(base + extra)
-}
-
-/// 浮点近似相等（相对误差 1e-6）：聚合父包是上游按明细求和落库的，与本地
-/// Σ 存在浮点尾数差；套餐双口径连尾数都一致（186.55000009），故用近似比较
-/// 兜住两种来源。
-fn approx_f64(a: f64, b: f64) -> bool {
-    (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0)
 }
 
 /// summary 响应 → PackageCode 列表（去重，保序）。2026-09 起 paid/free 接口要求
@@ -1088,7 +1077,7 @@ mod wb_credits_tests {
         assert_eq!(balance_from_summary(&body), Some(1386.5));
         // 已知汇总行一律不计（它本身就是同类明细的合计视图，无明细可对照也不放行——
         // 按值放行在「子集合计」形态下必然翻倍，见 category_summary_subtotal_…）；
-        // 未识别的无 code 真实包保留（42.5），同值无 code 项仍去重
+        // 未识别的无 code 真实包保留（42.5），不按值去重（见 balance_equals_… 末形态）
         let distinct = json!({"data": {"Packages": [
             {"PackageCode": "p_a", "CycleRemainCapacity": 500.0},
             {"PackageName": "平台奖励积分", "CycleRemainCapacity": 500.0},
@@ -1126,8 +1115,8 @@ mod wb_credits_tests {
         assert_eq!(packages_from(&body).len(), 5, "只有明细包进列表");
     }
 
-    /// 余额必须恒等于包列表（悬停明细）的合计：两条口径共用一个跳过谓词，
-    /// 任何「余额 ≠ 明细合计」的形态都是回归。
+    /// 余额必须恒等于包列表（悬停明细）的合计：两条口径共用一个跳过谓词、
+    /// 都不做按值去重，任何「余额 ≠ 明细合计」的形态都是回归。
     #[test]
     fn balance_equals_sum_of_listed_packages() {
         let shapes = [
@@ -1152,6 +1141,13 @@ mod wb_credits_tests {
             ]}}),
             json!({"data": {"Accounts": [
                 {"PackageName": "体验包", "RemainingCapacity": 37.5}
+            ]}}),
+            // 同值无 code 对（2026-11-01 审查修正的盲区）：按值去重曾让余额少计
+            // 一条（150 vs 200）且与列表口径分裂——不按值去重后余额恒等明细合计
+            json!({"data": {"Packages": [
+                {"PackageCode": "p_a", "CycleRemainCapacity": 100.0},
+                {"PackageName": "旧结构包A", "CycleRemainCapacity": 50.0},
+                {"PackageName": "旧结构包B", "CycleRemainCapacity": 50.0}
             ]}}),
         ];
         for body in shapes {
