@@ -287,7 +287,7 @@ export default function QoderSettings() {
               </div>
               <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
                 <div className="mb-2 flex items-center justify-between font-medium text-slate-500">
-                  {platform === 'windows' ? 'QoderWork CN exe 路径' : 'QoderWork CN 路径（.app）'}
+                  {platform === 'windows' ? 'Qoder CN exe 路径' : 'Qoder CN 路径（.app）'}
                   <Badge tone={env?.qoderwork_exe ? 'green' : 'amber'}>{env?.qoderwork_exe ? '已检测到' : '未检测到'}</Badge>
                 </div>
                 <div className="flex items-center gap-2">

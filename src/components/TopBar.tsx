@@ -304,8 +304,8 @@ function BuddyTopBar() {
 }
 
 /**
- * Qoder 专区顶栏（F-80）：左列 IDE / QoderWork 安装徽标（hover 显路径）+ 证书/代理/API 网关状态，
- * 右列 打开IDE / 打开QoderWork / 启动代理 / 启动API网关。
+ * Qoder 专区顶栏（F-80）：左列 Qoder CN / Qoder CN IDE 安装徽标（hover 显路径）+ 证书/代理/API 网关状态，
+ * 右列 打开Qoder CN / 打开Qoder CN IDE / 启动代理 / 启动API网关。
  * 与 Buddy 顶栏同构（上下文不串）；客户端探测走 commands/qoder::qoder_env_check（Launcher 形态）。
  */
 function QoderTopBar() {
@@ -338,7 +338,7 @@ function QoderTopBar() {
 
   const launchApp = async (which: 'ide' | 'work') => {
     if (launching) return;
-    const label = which === 'ide' ? 'Qoder CN IDE' : 'QoderWork CN';
+    const label = which === 'ide' ? 'Qoder CN IDE' : 'Qoder CN';
     setLaunching(which);
     try {
       if (which === 'ide') await api.qoder.openIde();
@@ -356,32 +356,32 @@ function QoderTopBar() {
   return (
     <>
       <div className="flex items-center gap-2">
-        {env?.ide_installed ? (
-          <Badge
-            tone="green"
-            title={env.ide_version ? `Qoder IDE 当前版本：v${env.ide_version}` : (env.ide_exe ?? 'Qoder CN IDE')}
-          >
-            <MonitorCheck size={13} /> Qoder IDE已安装
-          </Badge>
-        ) : (
-          <Badge tone="red">
-            <MonitorX size={13} /> Qoder IDE未检测到
-          </Badge>
-        )}
         {env?.qoderwork_installed ? (
           <Badge
             tone="green"
             title={
               env.qoderwork_version
-                ? `QoderWork 当前版本：v${env.qoderwork_version}`
-                : (env.qoderwork_exe ?? 'QoderWork CN（Launcher）')
+                ? `Qoder CN 当前版本：v${env.qoderwork_version}`
+                : (env.qoderwork_exe ?? 'Qoder CN（Launcher）')
             }
           >
-            <MonitorCheck size={13} /> QoderWork已安装
+            <MonitorCheck size={13} /> Qoder CN已安装
           </Badge>
         ) : (
           <Badge tone="red">
-            <MonitorX size={13} /> QoderWork未检测到
+            <MonitorX size={13} /> Qoder CN未检测到
+          </Badge>
+        )}
+        {env?.ide_installed ? (
+          <Badge
+            tone="green"
+            title={env.ide_version ? `Qoder CN IDE 当前版本：v${env.ide_version}` : (env.ide_exe ?? 'Qoder CN IDE')}
+          >
+            <MonitorCheck size={13} /> Qoder CN IDE已安装
+          </Badge>
+        ) : (
+          <Badge tone="red">
+            <MonitorX size={13} /> Qoder CN IDE未检测到
           </Badge>
         )}
         {env?.cli_dir_exists ? (
@@ -410,11 +410,11 @@ function QoderTopBar() {
         </Badge>
       </div>
       <div className="flex items-center gap-2">
-        <button onClick={() => void launchApp('ide')} className="btn-outline" disabled={launching != null}>
-          {launching === 'ide' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开Qoder IDE
-        </button>
         <button onClick={() => void launchApp('work')} className="btn-outline" disabled={launching != null}>
-          {launching === 'work' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开QoderWork
+          {launching === 'work' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开Qoder CN
+        </button>
+        <button onClick={() => void launchApp('ide')} className="btn-outline" disabled={launching != null}>
+          {launching === 'ide' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开Qoder CN IDE
         </button>
         {proxy.running ? (
           <button onClick={stopProxy} className="btn-outline">
