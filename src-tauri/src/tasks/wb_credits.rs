@@ -23,8 +23,8 @@ const CACHE_TTL_SECS: f64 = 10.0 * 60.0; // ≥10min 缓存（频控红线，原
 const MAX_FETCH_WORKERS: usize = 4;
 
 /// 缓存过期时的「先回旧值」直出（stale-while-revalidate 的前半程，见
-/// commands/workbuddy/credits.rs）：TTL 内 / 无缓存 / 账号明细为空 → None，
-/// 交调用方走原路径（命中缓存或同步拉取）。
+/// commands/workbuddy/credits.rs）：TTL 内 / 无缓存 / 账号明细为空 / 单账号
+/// uid 未命中 → None，交调用方走原路径（命中缓存或同步拉取）。
 /// 返回体带 `cached:true, refreshing:true`，供前端稍后重取一次拿最新值；
 /// 刻意不打 `stale`——该字段是 F-59「刷新失败回退」语义，本处刷新只是转后台、并未失败。
 pub fn stale_reply(state: &AppState, user_id: Option<&str>) -> Option<Value> {
@@ -38,7 +38,16 @@ pub fn stale_reply(state: &AppState, user_id: Option<&str>) -> Option<Value> {
         return None;
     }
     let accounts = match user_id {
-        Some(uid) => filter_accounts(cached_accounts, uid, "user_id"),
+        Some(uid) => {
+            let filtered = filter_accounts(cached_accounts, uid, "user_id");
+            // uid 未命中：该账号无旧值可回，回空列表会让前端长期停在「无数据」
+            // 假象（数据到位依赖后台刷新成功 + 前端重取，后台还有 120s 节流）——
+            // 回 None 交调用方同步拉取该账号，与上方「全量空明细回 None」同一设计原则
+            if filtered.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                return None;
+            }
+            filtered
+        }
         None => cached_accounts,
     };
     Some(json!({"ok": true, "cached": true, "refreshing": true, "accounts": accounts}))
@@ -1305,7 +1314,8 @@ mod wb_credits_tests {
         assert_eq!(reply["refreshing"], json!(true));
         assert!(reply.get("stale").is_none(), "SWR 回旧值不应打 stale");
         assert_eq!(reply["accounts"].as_array().unwrap().len(), 1);
-        // 单账号过滤：命中 1 条、未命中 0 条
+        // 单账号过滤：命中 1 条；未命中回 None（无旧值可回，交调用方同步拉取，
+        // 不回空列表假象——与「全量空明细回 None」同一设计原则）
         assert_eq!(
             stale_reply(&st, Some("u1")).unwrap()["accounts"]
                 .as_array()
@@ -1313,13 +1323,7 @@ mod wb_credits_tests {
                 .len(),
             1
         );
-        assert_eq!(
-            stale_reply(&st, Some("nope")).unwrap()["accounts"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
+        assert!(stale_reply(&st, Some("nope")).is_none());
         // 账号明细为空的缓存视为无缓存 → None（无数据可展示，只能同步拉）
         let _ = store.kv_set(
             "workbuddy_credits_cache",
