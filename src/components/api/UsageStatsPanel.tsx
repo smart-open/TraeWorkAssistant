@@ -335,6 +335,7 @@ export default function UsageStatsPanel() {
         acc.errors += d.errors;
         acc.prompt += d.prompt_tokens;
         acc.completion += d.completion_tokens;
+        acc.cached += d.cached_tokens ?? 0;
         acc.weightedDuration += d.avg_duration_ms * d.total_requests;
         acc.ttfbSamples += d.ttfb_samples ?? 0;
         acc.weightedTtfb += (d.avg_ttfb_ms ?? 0) * (d.ttfb_samples ?? 0);
@@ -368,6 +369,7 @@ export default function UsageStatsPanel() {
         errors: 0,
         prompt: 0,
         completion: 0,
+        cached: 0,
         weightedDuration: 0,
         ttfbSamples: 0,
         weightedTtfb: 0,
@@ -478,7 +480,13 @@ export default function UsageStatsPanel() {
           label="Token 消耗"
           value={fmtTokens(summary.prompt + summary.completion)}
           tone="amber"
-          hint={`输入 ${fmtTokens(summary.prompt)} / 输出 ${fmtTokens(summary.completion)}`}
+          hint={
+            `输入 ${fmtTokens(summary.prompt)} / 输出 ${fmtTokens(summary.completion)}` +
+            // Trae 池 2026-10-28 起上游 token_usage 事件显式下发 cached_tokens=0（账单侧
+            // 正常计费，issue #169）；有缓存落库（cached_tokens>0 的历史数据或缓存正常的
+            // 池）时展示转发口径缓存值辅助识别
+            (summary.cached > 0 ? ` / 缓存读取 ${fmtTokens(summary.cached)}` : '')
+          }
         />
         <StatCard
           label="平均耗时"

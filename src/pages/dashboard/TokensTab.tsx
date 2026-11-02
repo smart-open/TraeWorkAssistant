@@ -23,7 +23,9 @@ import { buildModelTrend } from './modelTrend';
 
 /**
  * Token 统计 Tab（credits-dashboard-plan.md §3.2/§5.2，批次 3 = issue #35 Bug2 用户可见修复）：
- * ① 总 Token 统计卡（总/输入/输出/缓存命中率）② Token 与调用趋势（双轴堆叠柱 + 调用虚线）
+ * ① 总 Token 统计卡（总/输入/输出/缓存命中率；Trae 网关源条件渲染第 5 张
+ *    「账单口径缓存」对账卡，issue #169）
+ * ② Token 与调用趋势（双轴堆叠柱 + 调用虚线）
  * ③ 各模型消耗趋势（issue #160）④ 年度活动热力图。
  * 三源（口径不同，独立展示不合并）：
  * 本地 = workbuddy_token_stats（365 天，WB/CodeBuddy 客户端会话）；
@@ -31,6 +33,9 @@ import { buildModelTrend } from './modelTrend';
  * 官网 = Trae usage_history token 字段（365 天）；Buddy 官网无按日 token 明细（§8.2 诚实空态）。
  * 统一口径：总 Token = input + output + cache_write（官网/网关 cache_write 恒 0，即 input + output）；
  * 官网 input 按供应商语义假设已含缓存读取（与本地源一致），新增输入 = max(0, input − 缓存读取)。
+ * issue #169：Trae 上游 2026-10-28 起 token_usage 事件显式下发 cached_tokens=0（账单侧
+ * cache_read 正常计费），网关转发口径单请求无法恢复真实缓存值（不伪造，出站保持 0）。
+ * Trae 平台网关源并列展示官网账单口径 cache_read 作对账参照（数据独立不混合）。
  */
 
 const STACK_COLORS: Record<string, string> = {
@@ -146,10 +151,12 @@ export default function TokensTab({
     if (source === 'gateway') {
       for (const day of gwPoolsFor(gateway, scope)) {
         if (!inRange(day.date)) continue;
+        // issue #169 审查修复：缓存读取数据驱动（UsageDayView.cached_tokens），不再硬编码 0；
+        // Trae 池当前上游显式下发 0（展示如实为 0），WB/Qoder 池有真实入账
         addDay(day.date, {
           input: day.prompt_tokens,
           output: day.completion_tokens,
-          cache_read: 0,
+          cache_read: day.cached_tokens ?? 0,
           cache_write: 0,
           calls: day.total_requests,
         });
@@ -158,6 +165,24 @@ export default function TokensTab({
           addModelDay(day.date, m.name, m.requests);
         }
       }
+    }
+    // Trae 网关源的账单口径缓存对账（issue #169）：官网 usage_history 的 cache_read
+    // 是官方计费的真实缓存值；网关转发口径 cached_tokens 恒 0（上游事件层不携带）。
+    // 独立维度累计（不混入 agg.cache_read 的堆叠/命中率计算），仅对账卡展示；
+    // 命中率分母同源取官网 input（供应商语义已含缓存读取）。
+    // days 按自然日去重：accounts × daily 双层循环下多账号同日有缓存会重复计数
+    const billingCacheRead = { total: 0, input: 0, days: 0 };
+    const billingCacheDays = new Set<string>();
+    if (source === 'gateway' && traeActive && usage) {
+      for (const a of usage.accounts) {
+        for (const d of a.daily) {
+          if (!inRange(d.date)) continue;
+          billingCacheRead.total += d.cache_read_tokens;
+          billingCacheRead.input += d.input_tokens;
+          if (d.cache_read_tokens > 0) billingCacheDays.add(d.date);
+        }
+      }
+      billingCacheRead.days = billingCacheDays.size;
     }
     if (source === 'official' && traeActive && usage) {
       for (const a of usage.accounts) {
@@ -181,7 +206,7 @@ export default function TokensTab({
       cache_write += v.cache_write;
       calls += v.calls;
     }
-    return { byDate, modelByDate, input, output, cache_read, cache_write, calls };
+    return { byDate, modelByDate, input, output, cache_read, cache_write, calls, billingCacheRead };
   }, [source, buddyActive, traeActive, tokenStats, gateway, scope, usage, modelFilter, startStr, todayStr]);
 
   // ---- 口径派生：总 Token / 缓存命中率 / 堆叠段 ----
@@ -190,6 +215,13 @@ export default function TokensTab({
   const totalTokens = agg.input + agg.output + agg.cache_write;
   const hitRate =
     source !== 'gateway' && agg.input > 0 ? agg.cache_read / agg.input : null;
+  // Trae 网关源账单口径缓存命中率（issue #169 对账）：官方账单 cache_read / 官网 input
+  // （官网 input 按供应商语义已含缓存读取，与官网源 hitRate 同分母口径）。转发口径恒 0
+  // 时用户在此直接看到真实命中率
+  const billingHitRate =
+    traeActive && agg.billingCacheRead.total > 0 && agg.billingCacheRead.input > 0
+      ? agg.billingCacheRead.total / agg.billingCacheRead.input
+      : null;
   const segments =
     source === 'local'
       ? (['cache_read', 'new_input', 'output', 'cache_write'] as const)
@@ -349,7 +381,7 @@ export default function TokensTab({
         <EmptyState icon={<Activity size={22} />} title={unavailableHint.title} hint={unavailableHint.hint} />
       ) : (
         <>
-          {/* ① 总 Token 统计卡（4 卡） */}
+          {/* ① 总 Token 统计卡（4 卡；Trae 网关源追加「账单口径缓存」对账卡 = 5 卡） */}
           <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
             <StatCard
               label="总 Token"
@@ -374,13 +406,33 @@ export default function TokensTab({
               value={hitRate != null ? `${(hitRate * 100).toFixed(1)}%` : '—'}
               hint={
                 source === 'gateway'
-                  ? '网关源无缓存字段'
+                  ? // 审查修复：缓存提示数据驱动——WB/Qoder 池 cached_tokens 有真实入账，
+                    // 不得在值 > 0 时仍断言「上游未下发为 0」（Qoder 页默认网关源）
+                    `转发口径缓存 ${fmtTokens(agg.cache_read)}` +
+                    (agg.cache_read > 0 ? '' : '（上游未下发，如实保持 0）') +
+                    (agg.billingCacheRead.total > 0
+                      ? ` · 账单口径 ${fmtTokens(agg.billingCacheRead.total)}`
+                      : '')
                   : source === 'official'
                     ? '口径：缓存读取 / 输入总量（假设官网 input 已含缓存读取）'
                     : '口径：缓存读取 / 输入总量'
               }
               tone="amber"
             />
+            {/* Trae 网关源账单口径缓存对账卡（issue #169）：转发口径恒 0，官方账单
+                cache_read 真实计费；独立卡片并列展示，不混入转发口径统计 */}
+            {source === 'gateway' && traeActive && (
+              <StatCard
+                label="账单口径缓存"
+                value={fmtTokens(agg.billingCacheRead.total)}
+                hint={
+                  agg.billingCacheRead.total > 0
+                    ? `Trae 官网计费 cache_read · ${agg.billingCacheRead.days} 天有缓存 · 命中率 ${billingHitRate != null ? `${(billingHitRate * 100).toFixed(1)}%` : '—'}`
+                    : '官网明细暂无缓存记录（点「刷新数据」拉取消耗明细）'
+                }
+                tone="violet"
+              />
+            )}
           </div>
 
           {/* ② Token 与调用趋势（双轴：堆叠柱 + 调用虚线） */}

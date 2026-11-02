@@ -27,7 +27,17 @@ pub fn workbuddy_credits_fetch(state: &AppState, user_id: Option<String>, fresh:
             return Ok(reply);
         }
     }
-    credits_refresh_now(state, uid, fresh, shared.as_ref())
+    let parsed = credits_refresh_now(state, uid, fresh, shared.as_ref())?;
+    // 单账号同步拉取（cached:false，真走了网络）后补一次节流后台全量刷新：
+    // 单账号结果不回写池级缓存（防子集污染），该账号需等下一次全量刷新才能
+    // 进缓存——补触发让缓存自愈，后续同 uid 查询可走 SWR 回旧值，不再每次
+    // 重复 ≥3 次网络请求；spawn 内含 120s 节流 + 在途去重，重复触发安全
+    // （移植 main 864d3e5 缓存自愈；stale 回退 cached:true 不触发——刚经历
+    // 全失败，立刻重试大概率再失败，待下次调用自然重试）
+    if !fresh && uid.is_some() && parsed.get("cached") != Some(&serde_json::json!(true)) {
+        spawn_background_refresh(state);
+    }
+    Ok(parsed)
 }
 
 /// 同步刷新积分并完成全部回写（SWR 后台线程与前端直调共用；移植 main@36d628f）。
