@@ -834,13 +834,6 @@ fn try_capture_doubao_campaign(
         .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
-    // 账号归属信号（2026-11-01 修复）：query 的 use-olympus-account 值 ≈ 池内 user_id，
-    // 比客户端 cookie sessionid 可靠（豆包会话轮换后 sessionid 与 vault 存量不一致，
-    // 实测 08:48 客户端签到成功却匹配不到账号）。须在 params move 前取出。
-    let q_olympus_uid = params
-        .get("use-olympus-account")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
     // 客户端请求带 accept-encoding（代理降级为 gzip/deflate）→ 响应体多为压缩字节。
     // 审查修复（2026-10-31）：先按 content-encoding 解压——否则下面 resp_ok 的 JSON
     // 解析恒失败，campaign_probe 永远不会落库，CLI 永远用回退旧参数（实测 3 天未入库）
@@ -901,27 +894,37 @@ fn try_capture_doubao_campaign(
                     .filter(|v| *v > 0);
                 let status = if checked { "success" } else { "already" };
                 let sessionid = jar.iter().find(|(k, _)| k == "sessionid").map(|(_, v)| v.clone());
+                // uid 识别（2026-11-02 修复）：multi_sids 携带 uid:sessionid 映射，当前
+                // sessionid 对应的 uid 即签到账号——会话轮换免疫。实测 olympus 参数只是
+                // 开关位（"1"）、sessionid 与 vault 存量比对因轮换必然失配，均弃用
+                let cookie_header = req_headers
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                let uid_detected =
+                    doubao_uid_from_multi_sids(&cookie_header, sessionid.as_deref().unwrap_or(""));
                 let mut matched: Option<(String, String)> = None;
-                // 优先 olympus uid 直配；兜底 sessionid 比对（会话未轮换的老账号）
-                if let Some(q_uid) = q_olympus_uid.as_deref() {
+                if !uid_detected.is_empty() {
                     let pool = crate::store::docs::doubao_pool_load(&crate::store::db(&ctx.data_dir));
-                    if let Some(a) = pool.accounts.iter().find(|a| a.user_id == q_uid) {
+                    if let Some(a) = pool.accounts.iter().find(|a| a.user_id == uid_detected) {
                         let name = if a.name.is_empty() { a.user_id.clone() } else { a.name.clone() };
                         matched = Some((a.user_id.clone(), name));
                     }
                 }
-                if matched.is_none() {
-                    if let Some(sid) = sessionid.as_deref() {
-                        let pool = crate::store::docs::doubao_pool_load(&crate::store::db(&ctx.data_dir));
-                        for a in &pool.accounts {
-                            let Some(v) = crate::vault::ns_get(&ctx.data_dir, "doubao", &a.user_id) else {
-                                continue;
-                            };
-                            if v.get("session_id").and_then(serde_json::Value::as_str) == Some(sid) {
-                                let name = if a.name.is_empty() { a.user_id.clone() } else { a.name.clone() };
-                                matched = Some((a.user_id.clone(), name));
-                                break;
-                            }
+                if matched.is_none() && !sessionid.as_deref().unwrap_or_default().is_empty() {
+                    // 兜底：sessionid 与 vault 存量比对（客户端未轮换会话的老场景）
+                    let sid = sessionid.as_deref().unwrap_or_default();
+                    let pool = crate::store::docs::doubao_pool_load(&crate::store::db(&ctx.data_dir));
+                    for a in &pool.accounts {
+                        let Some(v) = crate::vault::ns_get(&ctx.data_dir, "doubao", &a.user_id) else {
+                            continue;
+                        };
+                        if v.get("session_id").and_then(serde_json::Value::as_str) == Some(sid) {
+                            let name = if a.name.is_empty() { a.user_id.clone() } else { a.name.clone() };
+                            matched = Some((a.user_id.clone(), name));
+                            break;
                         }
                     }
                 }
@@ -931,6 +934,26 @@ fn try_capture_doubao_campaign(
                             &ctx.data_dir,
                             [(uid.clone(), name, status.to_string(), reward)],
                         );
+                        // 客户端当前会话回写该账号 vault：豆包会话轮换，回写后 CLI 凭证
+                        // 始终与客户端一致（fresh），避免 CLI 会话过期类失败
+                        if let Some(mut v) = crate::vault::ns_get(&ctx.data_dir, "doubao", &uid) {
+                            if let Some(obj) = v.as_object_mut() {
+                                if let Some(sid) = sessionid.as_deref().filter(|s| !s.is_empty()) {
+                                    obj.insert("session_id".into(), serde_json::Value::String(sid.to_string()));
+                                }
+                                for ck in ["sid_guard", "ttwid"] {
+                                    if let Some(cv) = jar
+                                        .iter()
+                                        .find(|(k, _)| k == ck)
+                                        .map(|(_, v)| v.clone())
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        obj.insert(ck.to_string(), serde_json::Value::String(cv));
+                                    }
+                                }
+                            }
+                            let _ = crate::vault::ns_set(&ctx.data_dir, "doubao", &uid, &v);
+                        }
                         let line = format!(
                             "[doubao-campaign] 客户端签到落库: uid={uid} status={status} reward={reward:?}"
                         );
@@ -940,8 +963,7 @@ fn try_capture_doubao_campaign(
                     None => {
                         let sid_prefix = sessionid.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("无");
                         let line = format!(
-                            "[doubao-campaign] 客户端签到成功但未匹配到池内账号（olympus_uid={:?} sid前8={sid_prefix}），跳过落库",
-                            q_olympus_uid.as_deref().unwrap_or("无"),
+                            "[doubao-campaign] 客户端签到成功但未匹配到池内账号（multi_sids uid={uid_detected:?} sid前8={sid_prefix}），跳过落库",
                         );
                         ctx.log.log(&format!("  {line}"));
                         crate::fs_utils::app_log(&ctx.data_dir, &line);
