@@ -23,8 +23,8 @@ const CACHE_TTL_SECS: f64 = 10.0 * 60.0; // ≥10min 缓存（频控红线，原
 const MAX_FETCH_WORKERS: usize = 4;
 
 /// 缓存过期时的「先回旧值」直出（stale-while-revalidate 的前半程，见
-/// commands/workbuddy/credits.rs）：TTL 内 / 无缓存 / 账号明细为空 → None，
-/// 交调用方走原路径（命中缓存或同步拉取）。
+/// commands/workbuddy/credits.rs）：TTL 内 / 无缓存 / 账号明细为空 / 单账号
+/// uid 未命中 → None，交调用方走原路径（命中缓存或同步拉取）。
 /// 返回体带 `cached:true, refreshing:true`，供前端稍后重取一次拿最新值；
 /// 刻意不打 `stale`——该字段是 F-59「刷新失败回退」语义，本处刷新只是转后台、并未失败。
 pub fn stale_reply(state: &AppState, user_id: Option<&str>) -> Option<Value> {
@@ -34,14 +34,22 @@ pub fn stale_reply(state: &AppState, user_id: Option<&str>) -> Option<Value> {
         return None;
     }
     let cached_accounts = cache.get("accounts").cloned().unwrap_or(json!([]));
-    let accounts = match user_id {
-        Some(uid) => filter_accounts(cached_accounts, uid, "user_id"),
-        None => cached_accounts,
-    };
-    // 空判定放在 uid 过滤之后：uid 未命中回空列表无意义，交调用方走同步路径拉全量
-    if accounts.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+    if cached_accounts.as_array().map(|a| a.is_empty()).unwrap_or(true) {
         return None;
     }
+    let accounts = match user_id {
+        Some(uid) => {
+            let filtered = filter_accounts(cached_accounts, uid, "user_id");
+            // uid 未命中：该账号无旧值可回，回空列表会让前端长期停在「无数据」
+            // 假象（数据到位依赖后台刷新成功 + 前端重取，后台还有 120s 节流）——
+            // 回 None 交调用方同步拉取该账号，与上方「全量空明细回 None」同一设计原则
+            if filtered.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                return None;
+            }
+            filtered
+        }
+        None => cached_accounts,
+    };
     Some(json!({"ok": true, "cached": true, "refreshing": true, "accounts": accounts}))
 }
 
@@ -220,7 +228,7 @@ fn package_code_of(item: &Value) -> Option<String> {
 const CATEGORY_SUMMARY_NAMES: [&str; 4] =
     ["平台奖励积分", "套餐基础积分", "套餐赠送积分", "购买积分"];
 
-/// 无 code 项取可辨识名的键序（is_category_summary_row / uncoded_name_key 共用）。
+/// 无 code 项取可辨识名的键序（is_category_summary_row 判定用）。
 const UNCODED_NAME_KEYS: [&str; 6] =
     ["PackageName", "packageName", "Name", "name", "ProductCode", "description"];
 
@@ -236,18 +244,6 @@ fn is_category_summary_row(item: &Value) -> bool {
         .or_else(|| fs_utils::dig(item, &UNCODED_NAME_KEYS));
     hit.and_then(Value::as_str)
         .map_or(false, |n| CATEGORY_SUMMARY_NAMES.contains(&n))
-}
-
-/// 无 code 项判重的次级键（审查 #9）：与 is_category_summary_row 同键序取可辨识
-/// 名，trim + 小写归一（中文名不受影响，仅兜大小写漂移）；取不出名字返回 None。
-fn uncoded_name_key(item: &Value) -> Option<String> {
-    let hit = UNCODED_NAME_KEYS
-        .iter()
-        .find_map(|k| item.get(*k))
-        .or_else(|| fs_utils::dig(item, &UNCODED_NAME_KEYS));
-    hit.and_then(Value::as_str)
-        .map(|n| n.trim().to_lowercase())
-        .filter(|n| !n.is_empty())
 }
 
 /// 聚合父容器判定（issue #120：`data.CycleRemainCapacity` 与 `data.Packages[]` 并存时
@@ -335,7 +331,13 @@ fn packages_from(body: &Value) -> Vec<Value> {
             ],
         );
         let end_ts = to_ts(end_raw);
-        let used = num_of(fs_utils::dig(item, &["UsedCapacity", "used", "Used"]));
+        let used = num_of(fs_utils::dig(item, &["UsedCapacity", "used", "Used"]))
+            // 上游分包多数不带已用字段：缺省落 0 会让明细每行都显示「已用 0.00」
+            //（remaining=0 / total=1500 也显示 0），改按「总额 − 剩余」倒推
+            .or_else(|| match (total, remaining) {
+                (Some(t), Some(r)) => Some((t - r).max(0.0)),
+                _ => None,
+            });
         out.push(json!({
             "name": name,
             "code": code,
@@ -352,15 +354,18 @@ fn packages_from(body: &Value) -> Vec<Value> {
 /// summary 响应 → 余额。旧结构：顶层 RemainingCapacity/Balance 等字段；
 /// 新结构（2026-09 实测）：data.Packages[] 各包 CycleRemainCapacity 求和。
 /// 聚合父字段（如 data.CycleRemainCapacity）与 Packages[] 明细并存时，父/子
-/// 不可重复计数（issue #120 余额翻倍根因）。与 `packages_from` 同口径：存在带
-/// PackageCode 的明细包时跳过「聚合父容器」与「已知分类汇总行」；补充（issue
-/// #120 评论区 5 账号实测，2026-10-31 并入无 code 项判重口径）：分类汇总行与
-/// coded Σ、任一 coded 明细同值时不计（那是同类明细的合计视图）；无 code 项
-/// 之间的同值判重收紧（2026-10-31 审查 #9）：仅当一侧是已知汇总行（「套餐基础
-/// 积分 ↔ CodeBuddy个人体验版」是同一笔积分的两个视图，连尾数都一致，与顺序
-/// 无关）或两侧同名才判重复——纯按值去重会吞掉真实独立同值包；汇总行的值对
-/// 不上任何明细时是唯一真实视图，计入以免套餐积分整体漏算（看板比官方少算）。
-/// 明细读不出时宁可返回 None，不得回退「全量和」把汇总行加回来。
+/// 不可重复计数（issue #120 余额翻倍根因）。与 `packages_from` **同一跳过谓词**：
+/// 存在带 PackageCode 的明细时，「聚合父容器」与「已知分类汇总行」一律不计，
+/// 其余无 code 项（旧结构真实包）全量保留、不按值去重（同值可能是两个真实包）——
+/// 即「余额 ≡ 悬停明细的合计」。
+///
+/// 分类汇总行不再按 remaining 值放行（上一版「值对不上明细就计入」的口径在此失效）：
+/// 汇总行是同类明细的**合计视图**，而合计与明细常常是子集关系——既不等于 coded Σ，
+/// 也不等于任何单条明细（实测某账号 74 条明细只有 3 个分类，「平台奖励积分」= 裂变 +
+/// 拉新两个分类之和；coded Σ 与单条最大值都与之不等），按值判重必然漏杀，余额被
+/// 再加一遍（≈ 2 倍真实值）。汇总行不携带明细里没有的信息，存在明细时不存在
+/// 「它才是唯一真实视图」的情形。明细读不出时宁可返回 None，不得回退「全量和」
+/// 把汇总行加回来。
 pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
     if let Some(t) = num_of(fs_utils::dig(
         body,
@@ -389,48 +394,26 @@ pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
     }
     // 新形态：coded 明细求和为基础（含 CycleCapacityRemainPrecise 与 used/total
     // 倒推宽键链）；明细读不出 → None，不回退汇总行。
-    let coded_vals: Vec<Option<f64>> = coded
+    let base = coded
         .iter()
         .map(|d| remaining_of(d, total_of(d)))
-        .collect();
-    let base = coded_vals.iter().copied().sum::<Option<f64>>()?;
-    // 无 code 补充口径：父容器跳过；分类汇总行若值与 coded Σ 或任一 coded 明细
-    // 重复则不计（那是同类明细的合计视图）；无 code 项之间的同值判重收紧（审查
-    // #9）：仅当一侧是已知汇总行（双视图对与顺序无关）或两侧同名才判重复，
-    // 避免吞掉真实独立同值包；非汇总行的无 code 真实包保留。
-    let mut seen: Vec<(f64, bool, Option<String>)> = vec![];
+        .sum::<Option<f64>>()?;
+    // 无 code 补充口径：与 `packages_from` 同一谓词（聚合父容器 / 已知分类汇总行跳过，
+    // 无 code 真实包保留）。无 code 项之间刻意不做按值去重——同值可能是两个真实包，
+    // 按值兜底会让余额少计、打破「余额 ≡ 悬停明细合计」不变量（单测
+    // balance_equals_sum_of_listed_packages 末个形态锁定）；确属重复口径的未知命名
+    // 汇总行应扩 CATEGORY_SUMMARY_NAMES 黑名单，而非按值猜测。
     let mut extra = 0.0;
     for d in found.iter().copied() {
-        if package_code_of(d).is_some() || is_aggregate_container(d, &coded) {
+        if package_code_of(d).is_some() || is_skippable_uncoded(d, true, &coded) {
             continue;
         }
         let Some(v) = remaining_of(d, total_of(d)) else {
             continue;
         };
-        let is_sum = is_category_summary_row(d);
-        let name = uncoded_name_key(d);
-        let dup_of_coded =
-            approx_f64(v, base) || coded_vals.iter().any(|c| c.is_some_and(|c| approx_f64(c, v)));
-        if is_sum && dup_of_coded {
-            continue;
-        }
-        if seen.iter().any(|(s, sum, n)| {
-            approx_f64(*s, v)
-                && (is_sum || *sum || name.as_ref().zip(n.as_ref()).is_some_and(|(a, b)| a == b))
-        }) {
-            continue;
-        }
-        seen.push((v, is_sum, name));
         extra += v;
     }
     Some(base + extra)
-}
-
-/// 浮点近似相等（相对误差 1e-6）：聚合父包是上游按明细求和落库的，与本地
-/// Σ 存在浮点尾数差；套餐双口径连尾数都一致（186.55000009），故用近似比较
-/// 兜住两种来源。
-fn approx_f64(a: f64, b: f64) -> bool {
-    (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0)
 }
 
 /// summary 响应 → PackageCode 列表（去重，保序）。2026-09 起 paid/free 接口要求
@@ -620,6 +603,75 @@ fn fetch_credits_once(
     (vec![], None, "fetch_failed", new_creds)
 }
 
+/// 体验版（免费额度）是「按月下发」的：每月 1 日发放，次月 1 日 00:00（UTC+8）失效。
+/// 上游 paid/free 的到期字段给的是**包本体**有效期（实测 2034-12-09 / 2035-01-23，
+/// 约 10 年），与额度真实失效时刻不是一回事——直接用会让体验版包永远排在明细最后
+/// （F-56 按到期升序）、到期日历里落在 10 年后、「即将到期」永不触发。
+fn is_monthly_free_quota(name: &str) -> bool {
+    name.contains("体验版")
+}
+
+/// 次月 1 日 00:00（UTC+8）的 Unix 秒；12 月跨年。极端时间戳（无法换算）回退当前值。
+fn next_month_start_ts(now: i64) -> i64 {
+    use chrono::{Datelike, TimeZone};
+    let Some(cn) = chrono::FixedOffset::east_opt(8 * 3600) else {
+        return now;
+    };
+    let Some(dt) = cn.timestamp_opt(now, 0).single() else {
+        return now;
+    };
+    let (year, month) = if dt.month() == 12 {
+        (dt.year() + 1, 1)
+    } else {
+        (dt.year(), dt.month() + 1)
+    };
+    chrono::NaiveDate::from_ymd_opt(year, month, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|n| cn.from_local_datetime(&n).single())
+        .map(|d| d.timestamp())
+        .unwrap_or(now)
+}
+
+/// 体验版包到期重算：名称命中体验版的包把 `expire_ts/end_time` 改写为次月 1 日 00:00；
+/// 其余包原样保留。
+fn apply_monthly_quota_expire(pkgs: &mut [Value], now: i64) {
+    let ts = next_month_start_ts(now);
+    for p in pkgs.iter_mut() {
+        let hit = p
+            .get("name")
+            .and_then(Value::as_str)
+            .map(is_monthly_free_quota)
+            .unwrap_or(false);
+        if !hit {
+            continue;
+        }
+        p["expire_ts"] = json!(ts);
+        p["end_time"] = json!(fmt_ts(ts));
+    }
+}
+
+/// 明细收尾（顺序即语义）：先纠正体验版到期，再按到期升序排（最先到期最前，F-56；
+/// 无到期时间排最后），最后按纠正后的到期判 `expire_soon`（7 日内）。三步顺序颠倒会让
+/// 体验版继续排在 2035 的位置、「即将到期」也永不触发，故收在一处并由单测锁定。
+fn finalize_packages(pkgs: &mut [Value], now: i64) {
+    apply_monthly_quota_expire(pkgs, now);
+    pkgs.sort_by(|a, b| {
+        let ta = a.get("expire_ts").and_then(Value::as_i64);
+        let tb = b.get("expire_ts").and_then(Value::as_i64);
+        match (ta, tb) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    let soon_cut = now + 7 * 86400;
+    for p in pkgs.iter_mut() {
+        let exp = p.get("expire_ts").and_then(Value::as_i64);
+        p["expire_soon"] = json!(exp.map(|e| e < soon_cut).unwrap_or(false));
+    }
+}
+
 /// 单账号取数 → 输出行（字段契约与 python fetch_account 一致）。
 fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
     let aid = acct.get("id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -657,22 +709,8 @@ fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
             .filter_map(|p| p.get("remaining").and_then(Value::as_f64))
             .sum()
     });
-    // 按到期升序（最先到期排最前，F-56）；无到期时间排最后
-    pkgs.sort_by(|a, b| {
-        let ta = a.get("expire_ts").and_then(Value::as_i64);
-        let tb = b.get("expire_ts").and_then(Value::as_i64);
-        match (ta, tb) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
-    });
-    let soon_cut = now_secs() as i64 + 7 * 86400;
-    for p in pkgs.iter_mut() {
-        let exp = p.get("expire_ts").and_then(Value::as_i64);
-        p["expire_soon"] = json!(exp.map(|e| e < soon_cut).unwrap_or(false));
-    }
+    // 明细收尾：体验版到期按自然月重算 → 按到期升序 → expire_soon（顺序即语义）
+    finalize_packages(&mut pkgs, now_secs() as i64);
     json!({
         "user_id": aid, "name": name, "ok": true, "balance": balance,
         "packages": pkgs, "source": source, "fetched_at": fs_utils::now_ts(),
@@ -1061,14 +1099,144 @@ mod wb_credits_tests {
             {"PackageName": "CodeBuddy个人体验版", "CycleRemainCapacity": 186.5}
         ]}});
         assert_eq!(balance_from_summary(&body), Some(1386.5));
-        // 不同值的无 code 包都计（去重仅针对同值重复视图）；父包仍排除
+        // 已知汇总行一律不计（它本身就是同类明细的合计视图，无明细可对照也不放行——
+        // 按值放行在「子集合计」形态下必然翻倍，见 category_summary_subtotal_…）；
+        // 未识别的无 code 真实包保留（42.5），不按值去重（见 balance_equals_… 末形态）
         let distinct = json!({"data": {"Packages": [
             {"PackageCode": "p_a", "CycleRemainCapacity": 500.0},
             {"PackageName": "平台奖励积分", "CycleRemainCapacity": 500.0},
             {"PackageName": "套餐基础积分", "CycleRemainCapacity": 186.5},
             {"PackageName": "其他权益包", "CycleRemainCapacity": 42.5}
         ]}});
-        assert_eq!(balance_from_summary(&distinct), Some(729.0));
+        assert_eq!(balance_from_summary(&distinct), Some(542.5));
+    }
+
+    /// 分类汇总行是**多个明细的子集合计**：既不等 coded Σ，也不等任何单条明细，
+    /// 按值判重漏杀 → 余额被再加一遍（实测该形态下余额约为明细合计的 2 倍，
+    /// 多出来的正是「平台奖励积分 = 裂变 + 拉新」这条子集合计）。
+    #[test]
+    fn category_summary_subtotal_does_not_double_count() {
+        let body = json!({"data": {
+            "CycleRemainCapacity": 9862.36,
+            "Packages": [
+                {"PackageCode": "p_share", "PackageName": "个人版国内运营裂变包",
+                 "CycleRemainCapacity": 9000.0},
+                {"PackageCode": "p_share", "PackageName": "个人版国内运营裂变包",
+                 "CycleRemainCapacity": 162.36},
+                {"PackageCode": "p_new", "PackageName": "个人版拉新权益包",
+                 "CycleRemainCapacity": 50.0},
+                {"PackageCode": "p_new", "PackageName": "个人版拉新权益包",
+                 "CycleRemainCapacity": 150.0},
+                {"PackageCode": "p_free", "PackageName": "CodeBuddy个人体验版",
+                 "CycleRemainCapacity": 500.0},
+                // 分类汇总行：裂变 + 拉新 两个分类的合计（9162.36 + 200）
+                {"PackageName": "平台奖励积分", "CycleRemainCapacity": 9362.36},
+                // 与单条明细同值
+                {"PackageName": "套餐基础积分", "CycleRemainCapacity": 500.0}
+            ]
+        }});
+        assert_eq!(balance_from_summary(&body), Some(9862.36));
+        assert_eq!(packages_from(&body).len(), 5, "只有明细包进列表");
+    }
+
+    /// 余额必须恒等于包列表（悬停明细）的合计：两条口径共用一个跳过谓词、
+    /// 都不做按值去重，任何「余额 ≠ 明细合计」的形态都是回归。
+    #[test]
+    fn balance_equals_sum_of_listed_packages() {
+        let shapes = [
+            json!({"data": {"Packages": [
+                {"PackageCode": "p_a", "CycleRemainCapacity": 1200.0},
+                {"PackageName": "平台奖励积分", "CycleRemainCapacity": 1200.0},
+                {"PackageName": "套餐基础积分", "CycleRemainCapacity": 186.5},
+                {"PackageName": "CodeBuddy个人体验版", "CycleRemainCapacity": 186.5}
+            ]}}),
+            json!({"data": {
+                "CycleRemainCapacity": 9862.36,
+                "Packages": [
+                    {"PackageCode": "p_a", "CycleRemainCapacity": 9162.36},
+                    {"PackageCode": "p_b", "CycleRemainCapacity": 200.0},
+                    {"PackageCode": "p_c", "CycleRemainCapacity": 500.0},
+                    {"PackageName": "平台奖励积分", "CycleRemainCapacity": 9362.36}
+                ]
+            }}),
+            json!({"data": {"Packages": [
+                {"PackageCode": "p_a", "PackageName": "裂变包", "CycleRemainCapacity": 100.0},
+                {"PackageName": "旧结构体验包", "CycleRemainCapacity": 20.0}
+            ]}}),
+            json!({"data": {"Accounts": [
+                {"PackageName": "体验包", "RemainingCapacity": 37.5}
+            ]}}),
+            // 同值无 code 对（2026-11-01 审查修正的盲区）：按值去重曾让余额少计
+            // 一条（150 vs 200）且与列表口径分裂——不按值去重后余额恒等明细合计
+            json!({"data": {"Packages": [
+                {"PackageCode": "p_a", "CycleRemainCapacity": 100.0},
+                {"PackageName": "旧结构包A", "CycleRemainCapacity": 50.0},
+                {"PackageName": "旧结构包B", "CycleRemainCapacity": 50.0}
+            ]}}),
+        ];
+        for body in shapes {
+            let sum: f64 = packages_from(&body)
+                .iter()
+                .filter_map(|p| p.get("remaining").and_then(Value::as_f64))
+                .sum();
+            assert_eq!(
+                balance_from_summary(&body),
+                Some(sum),
+                "余额与明细合计必须一致（body={body}）"
+            );
+        }
+    }
+
+    /// 上游分包多数不带 UsedCapacity：缺省落 0 会让明细每行都显示「已用 0.00」
+    ///（remaining=0 / total=1500 也显示 0），改按「总额 − 剩余」倒推（不为负）。
+    #[test]
+    fn used_falls_back_to_total_minus_remaining() {
+        let body = json!({"data": {"Packages": [
+            {"PackageCode": "p_a", "CycleRemainCapacity": 0.0, "CycleTotalCapacity": 1500.0},
+            {"PackageCode": "p_b", "CycleRemainCapacity": 100.0, "CycleTotalCapacity": 100.0},
+            {"PackageCode": "p_c", "CycleRemainCapacity": 5.0, "CycleTotalCapacity": 10.0,
+             "UsedCapacity": 4.0}
+        ]}});
+        let pkgs = packages_from(&body);
+        assert_eq!(pkgs[0]["used"], json!(1500.0));
+        assert_eq!(pkgs[1]["used"], json!(0.0));
+        assert_eq!(pkgs[2]["used"], json!(4.0), "上游给了已用就不要倒推");
+    }
+
+    /// 体验版按月下发：到期是次月 1 日 00:00（UTC+8），不是上游给的包本体 10 年有效期。
+    #[test]
+    fn next_month_start_ts_rolls_to_first_day() {
+        let at = |s: &str| to_ts(Some(&json!(s))).unwrap();
+        // 月中 / 月末 / 12 月跨年
+        assert_eq!(
+            next_month_start_ts(at("2026-11-01 10:00:00")),
+            at("2026-12-01 00:00:00")
+        );
+        assert_eq!(
+            next_month_start_ts(at("2026-11-30 23:59:00")),
+            at("2026-12-01 00:00:00")
+        );
+        assert_eq!(
+            next_month_start_ts(at("2026-12-15 08:00:00")),
+            at("2027-01-01 00:00:00")
+        );
+    }
+
+    #[test]
+    fn trial_package_expire_is_rewritten_and_resorted() {
+        let now = to_ts(Some(&json!("2026-11-01 10:00:00"))).unwrap();
+        let next_month = to_ts(Some(&json!("2026-12-01 00:00:00"))).unwrap();
+        let mut pkgs = vec![
+            json!({"name": "CodeBuddy个人体验版", "remaining": 500.0,
+                   "expire_ts": to_ts(Some(&json!("2035-01-23 10:00:00"))), "expire_soon": false}),
+            json!({"name": "个人版国内运营裂变包", "remaining": 100.0,
+                   "expire_ts": to_ts(Some(&json!("2026-11-05 00:00:00"))), "expire_soon": false}),
+        ];
+        finalize_packages(&mut pkgs, now);
+        assert_eq!(pkgs[0]["name"], json!("个人版国内运营裂变包"), "按纠正后的到期升序");
+        assert_eq!(pkgs[1]["expire_ts"], json!(next_month), "体验版到期改为次月 1 日 00:00");
+        assert_eq!(pkgs[1]["expire_soon"], json!(false), "次月到期不算 7 日内");
+        assert_eq!(pkgs[0]["expire_soon"], json!(true));
     }
 
     /// 审查 #9 回归：无 code 项同值判重不得吞掉真实独立同值包——非汇总行且

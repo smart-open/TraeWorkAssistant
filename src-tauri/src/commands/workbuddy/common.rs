@@ -43,6 +43,26 @@ pub(super) fn snapshot_json_path() -> PathBuf {
     wb_data_dir().join("storage").join("skeleton").join("account-snapshot.json")
 }
 
+/// WorkBuddy 端 live 登录 uid：客户端运行时优先 skeleton 登录快照 primary.uid
+/// （现版本登录后只重写快照、不回写 auth 文件，auth 可能停在上个账号），未运行
+/// 时快照是上次会话残留、不采用，回退 auth 文件 uid（恢复后的登录态由它承载）。
+/// 账号列表在线判定（accounts_list_inner）与切换守卫 WorkBuddy 预探测
+///（commands::switch）共用，避免两处 live 口径漂移。
+pub fn wb_live_uid() -> Option<String> {
+    let live = if is_running() {
+        crate::switcher::authfile::snapshot_field(
+            &fs_utils::read_json::<serde_json::Value>(&snapshot_json_path()),
+            "uid",
+            &["uid", "accountId"],
+        )
+    } else {
+        None
+    };
+    live.or_else(|| {
+        crate::switcher::authfile::auth_file_uid(&crate::switcher::authfile::wb_auth_file())
+    })
+}
+
 pub(super) fn account_id_of(token: &str) -> String {
     let mut h = Sha256::new();
     h.update(token.as_bytes());

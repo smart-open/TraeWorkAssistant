@@ -32,7 +32,15 @@ pub fn workbuddy_credits_fetch(app: AppHandle, state: State<AppState>, user_id: 
             return Ok(reply);
         }
     }
-    credits_refresh_now(&state, uid, fresh, Some(rt_state.inner()))
+    let parsed = credits_refresh_now(&state, uid, fresh, Some(rt_state.inner()))?;
+    // 单账号同步拉取（cached:false，真走了网络）后补一次节流后台全量刷新：
+    // 单账号结果不回写池级缓存（防子集污染），该账号需等下一次全量刷新才能
+    // 进缓存——补触发让缓存自愈，后续同 uid 查询可走 SWR 回旧值，不再每次
+    // 重复 ≥3 次网络请求；spawn 内含 120s 节流 + 在途去重，重复触发安全
+    if !fresh && uid.is_some() && parsed.get("cached") != Some(&serde_json::json!(true)) {
+        spawn_background_refresh(&state, &app);
+    }
+    Ok(parsed)
 }
 
 /// 同步取数一轮：取数（缓存/网络）→ 池余额回写 → 套餐回填 → 非缓存命中时追加快照。
@@ -48,8 +56,12 @@ fn credits_refresh_now(
     write_back_pool_balances(state, &parsed, runtime);
     // 会员套餐回填（仅 edition_type 为空的账号，见 backfill_edition_from_payment_type）
     backfill_edition_from_payment_type(state);
-    // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天
-    if parsed.get("cached") != Some(&serde_json::json!(true)) {
+    // 每日余额快照（F-27 数据源）：非缓存命中时追加，按日去重，cap 365 天。
+    // 单账号过滤路径（uid=Some）不追加——结果只是池级数据的子集，写入会让当日
+    // 快照 total_balance/accounts 被子集覆盖（ON CONFLICT(date) DO UPDATE），
+    // usage_fallback 的日差分随之失真；对齐 fetch_credits 缓存回写的
+    // user_id.is_none() 同一防污染纪律
+    if uid.is_none() && parsed.get("cached") != Some(&serde_json::json!(true)) {
         append_credits_snapshot(state, &parsed);
     }
     Ok(parsed)

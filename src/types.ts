@@ -1391,10 +1391,16 @@ export interface WorkBuddyAccountView {
   snapshot_saved_at_workbuddy_ms?: number | null;
   /** CodeBuddy 快照最近一次保存时间（Unix ms；null = 未保存过，老后端缺省 undefined） */
   snapshot_saved_at_codebuddy_ms?: number | null;
-  /** WorkBuddy 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  /** WorkBuddy 快照最近一次切换身份不符/回退时间（Unix ms；null = 健康，老后端缺省 undefined） */
   snapshot_verify_failed_workbuddy_ms?: number | null;
-  /** CodeBuddy 快照最近一次切换未确认登录时间（Unix ms；null = 健康，老后端缺省 undefined） */
+  /** CodeBuddy 快照最近一次切换身份不符/回退时间（Unix ms；null = 健康，老后端缺省 undefined） */
   snapshot_verify_failed_codebuddy_ms?: number | null;
+  /** 双端最近一次切换确认超时时间（Unix ms；黄标「未确认」——fail-open 语义下慢启动也会命中） */
+  snapshot_verify_timeout_workbuddy_ms?: number | null;
+  snapshot_verify_timeout_codebuddy_ms?: number | null;
+  /** 快照不可用（槽内无有效登录态 / 身份与该账号不符；需重新登录后「保存当前登录态」） */
+  snapshot_invalid_workbuddy?: boolean;
+  snapshot_invalid_codebuddy?: boolean;
 }
 
 export interface WorkBuddyEnvCheck {

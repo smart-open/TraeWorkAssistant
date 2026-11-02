@@ -292,10 +292,14 @@ pub fn switch_account(
             .unwrap_or_default()
     } else if is_buddy {
         // F1-3/F2-5 authfile 布局切换守卫：按端取「当前登录账号 id」——
-        // WorkBuddy 由共享 auth 文件驱动 → auth 文件 uid 在池反查优先，桥标记兜底；
         // CodeBuddy 登录真源信号 = live storage.json genie.userId（共享 auth 文件属
         // WorkBuddy，会被其覆盖，不能作为 CodeBuddy 登录证据；桥标记只反映上次切换
         // 目标，客户端手动重登后失真）→ genie 实测优先，桥标记兜底。
+        // WorkBuddy 登录真源 = wb_live_uid（客户端运行时 skeleton 快照 primary.uid
+        // 优先——登录后只重写快照不回写 auth 文件；未运行回退 auth 文件 uid），
+        // 与槽位守卫/账号列表的 live 口径一致；桥标记兜底。此前直接读 auth 文件，
+        // 手动登录兜底回写会因「探测身份 ≠ 槽位 live 身份」被守卫误拦且外层误报
+        // 已回写成功（合并审查修复）。
         // 取不到 → 空串 fail-open 不阻断。池外 uid 保留原值（不落回标记）——
         // 回写守卫按槽位存在性会安全跳过，防止污染旧标记账号槽位。
         match buddy_app {
@@ -308,10 +312,7 @@ pub fn switch_account(
                     crate::commands::workbuddy::current_account_marker(&state, "CodeBuddy")
                 })
                 .unwrap_or_default(),
-            BuddyApp::WorkBuddy => {
-                crate::switcher::authfile::auth_file_uid(
-                    &crate::switcher::authfile::wb_auth_file(),
-                )
+            BuddyApp::WorkBuddy => crate::commands::workbuddy::wb_live_uid()
                 .map(|uid| {
                     crate::commands::workbuddy::pool_account_id_by_uid(&state, &uid)
                         .unwrap_or(uid)
@@ -319,8 +320,7 @@ pub fn switch_account(
                 .or_else(|| {
                     crate::commands::workbuddy::current_account_marker(&state, "WorkBuddy")
                 })
-                .unwrap_or_default()
-            }
+                .unwrap_or_default(),
         }
     } else if is_qoder {
         // F-80 §5.10 切换守卫：Qoder（icube 布局）当前登录真源 = IDE state.vscdb

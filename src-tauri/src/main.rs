@@ -349,6 +349,7 @@ fn main() {
             commands::workbuddy::workbuddy_open_auth_dir,
             commands::workbuddy::workbuddy_accounts_list,
             commands::workbuddy::workbuddy_account_save,
+            commands::workbuddy::workbuddy_clear_relogin,
             commands::workbuddy::workbuddy_account_move,
             commands::workbuddy::workbuddy_groups_list,
             commands::workbuddy::workbuddy_groups_create,

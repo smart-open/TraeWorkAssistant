@@ -602,6 +602,8 @@ export const api = {
       invoke<WorkBuddyAccountView>('workbuddy_account_import_auth', { name: name ?? null }),
     refreshToken: (userId: string, force = false) =>
       invoke<string>('workbuddy_refresh_token', { userId, force }),
+    /** 人工清除「需重登」标记（不动凭证；凭证真失效时下一轮签到会重新标记） */
+    clearRelogin: (id: string) => invoke<void>('workbuddy_clear_relogin', { id }),
     checkinStart: (opts: { user_ids?: string[]; skip_checked_in: boolean; skip_expired: boolean }) =>
       invoke('workbuddy_checkin_start', { opts }),
     growthRun: () => invoke('workbuddy_growth_run'),
