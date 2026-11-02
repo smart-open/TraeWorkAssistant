@@ -468,7 +468,7 @@ export default function QoderAccounts() {
       } else if (r.found) {
         pushToast('info', r.reason || '已发现 IDE 登录态，无需变更');
       } else {
-        pushToast('warn', r.reason || '未在 Qoder IDE 本地存储发现登录态');
+        pushToast('warn', r.reason || '未在 Qoder CN IDE 本地存储发现登录态');
       }
       void refresh();
     } catch (err) {
@@ -551,7 +551,7 @@ export default function QoderAccounts() {
     setSnapBusy(a.id);
     try {
       await api.profiles.backup(a.id, targetApp);
-      pushToast('info', `正在备份「${a.nickname || a.id}」的登录态快照（${targetApp === 'Qoder' ? 'Qoder IDE' : 'Qoder Work'}）…`);
+      pushToast('info', `正在备份「${a.nickname || a.id}」的登录态快照（${targetApp === 'Qoder' ? 'Qoder CN IDE' : 'Qoder CN'}）…`);
     } catch (err) {
       setSnapBusy(null);
       pushToast('error', `备份失败：${String(err)}`);
@@ -592,7 +592,7 @@ export default function QoderAccounts() {
       } else if (t.kind === 'restore') {
         setSnapBusy(t.slot);
         await api.profiles.restore(t.slot, snapTarget);
-        pushToast('info', `正在恢复「${t.name || t.slot}」的快照到 ${snapTarget === 'Qoder' ? 'Qoder IDE' : 'Qoder Work'}…`);
+        pushToast('info', `正在恢复「${t.name || t.slot}」的快照到 ${snapTarget === 'Qoder' ? 'Qoder CN IDE' : 'Qoder CN'}…`);
       } else {
         setSnapBusy(t.slot);
         await api.profiles.delete(t.slot, snapTarget);
@@ -943,12 +943,12 @@ export default function QoderAccounts() {
                         <span className="font-medium">{a.nickname || a.id}</span>
                         {/* 客户端当前登录标记：本机 auth.v1.dat/state.vscdb 解密 uid 与池匹配（对齐 Trae 双徽标） */}
                         {liveLogins?.work && (a.id === liveLogins.work || a.uid === liveLogins.work) && (
-                          <Badge tone="violet" title="当前 Qoder Work 客户端登录的账号">
+                          <Badge tone="violet" title="当前 Qoder CN 客户端登录的账号">
                             Work 登录中
                           </Badge>
                         )}
                         {liveLogins?.ide && (a.id === liveLogins.ide || a.uid === liveLogins.ide) && (
-                          <Badge tone="brand" title="当前 Qoder IDE 客户端登录的账号">
+                          <Badge tone="brand" title="当前 Qoder CN IDE 客户端登录的账号">
                             IDE 登录中
                           </Badge>
                         )}
@@ -1025,7 +1025,7 @@ export default function QoderAccounts() {
                       <div className="flex justify-end gap-1">
                         <button
                           className={`btn-ghost !p-2 ${switchingTo === a.id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${busy && switchingTo !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          title="切换此账号到…（Qoder Work / Qoder IDE 双目标）"
+                          title="切换此账号到…（Qoder CN / Qoder CN IDE 双目标）"
                           disabled={busy}
                           onClick={(e) => openAppMenu(a, 'switch', e)}
                         >
@@ -1033,7 +1033,7 @@ export default function QoderAccounts() {
                         </button>
                         <button
                           className={`btn-ghost !p-2 ${snapBusy === a.id ? 'text-amber-500' : ''} ${(snapBusy != null || busy) && snapBusy !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          title="保存当前登录态到该账号槽位（Qoder Work / Qoder IDE 双目标）"
+                          title="保存当前登录态到该账号槽位（Qoder CN / Qoder CN IDE 双目标）"
                           disabled={snapBusy != null || busy}
                           onClick={(e) => openAppMenu(a, 'save', e)}
                         >
@@ -1098,8 +1098,8 @@ export default function QoderAccounts() {
             </div>
             <div className="grid grid-cols-2 gap-2 p-3 pt-1.5">
               {([
-                { app: 'QoderWork' as const, label: 'Qoder Work', desc: 'Qoder Work 桌面客户端', Icon: AppWindow },
-                { app: 'Qoder' as const, label: 'Qoder IDE', desc: 'Qoder CN IDE 桌面客户端', Icon: TerminalSquare },
+                { app: 'QoderWork' as const, label: 'Qoder CN', desc: 'Qoder CN 桌面客户端', Icon: AppWindow },
+                { app: 'Qoder' as const, label: 'Qoder CN IDE', desc: 'Qoder CN IDE 桌面客户端', Icon: TerminalSquare },
               ]).map((opt) => (
                 <button
                   key={opt.app}
@@ -1196,7 +1196,7 @@ export default function QoderAccounts() {
         onClose={() => {
           if (!snapBusy) setShowSnapshots(false);
         }}
-        title={snapTarget === 'Qoder' ? '登录态快照 · Qoder IDE' : '登录态快照 · Qoder Work'}
+        title={snapTarget === 'Qoder' ? '登录态快照 · Qoder CN IDE' : '登录态快照 · Qoder CN'}
         footer={
           <div className="flex w-full items-center justify-between">
             <button
@@ -1225,7 +1225,7 @@ export default function QoderAccounts() {
                   void refreshSnapshots(t);
                 }}
               >
-                {t === 'Qoder' ? 'Qoder IDE' : 'Qoder Work'}
+                {t === 'Qoder' ? 'Qoder CN IDE' : 'Qoder CN'}
               </button>
             ))}
           </div>
@@ -1234,14 +1234,14 @@ export default function QoderAccounts() {
             <span>
               {snapTarget === 'Qoder'
                 ? '快照保存于 data/profiles_qoder/<账号 id>/，含 IDE 登录态与本地存储；恢复到客户端时自动注入该账号绑定的设备指纹。建议先在 IDE 登录目标账号后，于账号池点击「备份」保存其登录态。'
-                : '快照保存于 data/profiles_qoder_work/<账号 id>/，为「以 Work 打开/切换 Work」准备的登录态副本；切回 IDE 不受影响。可在账号池「以…打开」菜单选择 Qoder Work 备份。'}
+                : '快照保存于 data/profiles_qoder_work/<账号 id>/，为「以 Qoder CN 打开/切换 Qoder CN」准备的登录态副本；切回 IDE 不受影响。可在账号池「以…打开」菜单选择 Qoder CN 备份。'}
             </span>
           </div>
           {snapshotSlots.length === 0 ? (
             <p className="py-4 text-center text-xs text-slate-400">
               {snapTarget === 'Qoder'
                 ? '暂无快照。在账号池操作列点击「备份」为当前 IDE 登录态建档。'
-                : '暂无 Qoder Work 快照。在账号行「保存当前登录态到…」菜单选择 Qoder Work 建档。'}
+                : '暂无 Qoder CN 快照。在账号行「保存当前登录态到…」菜单选择 Qoder CN 建档。'}
             </p>
           ) : (
             <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
@@ -1274,7 +1274,7 @@ export default function QoderAccounts() {
                         <td className="px-3 py-1.5">
                           <div className="flex justify-end gap-1">
                             <button
-                              title="恢复（将该槽位快照恢复到 Qoder IDE，覆盖当前登录态）"
+                              title="恢复（将该槽位快照恢复到 Qoder CN IDE，覆盖当前登录态）"
                               className="btn-ghost !p-2 text-sky-500"
                               disabled={snapBusy != null}
                               onClick={() => restoreSnapshot(p.slot, label)}
@@ -1334,7 +1334,7 @@ export default function QoderAccounts() {
           {confirmTarget?.kind === 'restore' && (
             <>
               确认将账号「{confirmTarget.name || confirmTarget.slot}」的快照恢复到
-              {snapTarget === 'Qoder' ? 'Qoder IDE' : 'Qoder Work'}？
+              {snapTarget === 'Qoder' ? 'Qoder CN IDE' : 'Qoder CN'}？
               <div className="mt-1 text-xs text-amber-600 dark:text-amber-400">
                 当前{snapTarget === 'Qoder' ? ' IDE' : ' Work'}登录态将被覆盖。
               </div>
