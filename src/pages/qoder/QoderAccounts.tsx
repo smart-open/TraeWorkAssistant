@@ -1113,9 +1113,12 @@ export default function QoderAccounts() {
                     const { id, kind } = appMenu;
                     setAppMenu(null);
                     const target = accounts.find((x) => x.id === id);
-                    if (kind === 'switch') {
+                    if (!target) {
+                      // 菜单打开到点击之间账号可能被删除/列表已刷新（对齐 BuddyAccounts 门禁）
+                      pushToast('warn', '账号信息已变化，请刷新列表后重试');
+                    } else if (kind === 'switch') {
                       void switchTo(id, opt.app);
-                    } else if (target) {
+                    } else {
                       void backupSnapshot(target, opt.app);
                     }
                   }}

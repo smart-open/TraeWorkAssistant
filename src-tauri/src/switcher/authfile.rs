@@ -135,8 +135,9 @@ fn auth_file_uid_value(j: &serde_json::Value) -> Option<String> {
     ] {
         if let Some(v) = v {
             if let Some(s) = v.as_str() {
-                if !s.is_empty() {
-                    return Some(s.to_string());
+                let t = s.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
                 }
             }
         }
@@ -456,8 +457,12 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
         "savedAt": crate::fs_utils::now_ts(),
         "savedAtMs": chrono::Utc::now().timestamp_millis(),
     });
-    if let Err(e) =
-        std::fs::write(dest.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default())
+    // 原子写对齐 mark_slot_key：非原子 std::fs::write 中断会留半截 meta.json——
+    // 守卫 fail-open 尚可，但徽标静默消失/标记静默丢失
+    if let Err(e) = crate::fs_utils::write_text_atomic(
+        &dest.join("meta.json"),
+        &serde_json::to_string(&meta).unwrap_or_default(),
+    )
     {
         sink.step(
             "backup",
@@ -937,15 +942,27 @@ pub fn synthesize_auth_snapshot(
             return None;
         }
     };
+    let synth_auth_path = dest.join("auth").join(slot_auth_name(sess));
     if let Err(e) = std::fs::create_dir_all(dest.join("auth"))
         .map_err(|e| e.to_string())
         .and_then(|()| {
-            std::fs::write(dest.join("auth").join(slot_auth_name(sess)), &body)
+            std::fs::write(&synth_auth_path, &body)
                 .map_err(|e| e.to_string())
         })
     {
         sink.step("bootstrap", StepStatus::Warn, &format!("合成快照写入失败: {e}"));
         return None;
+    }
+    // 合成 auth 文件含 accessToken/refreshToken 明文，std::fs::write 落盘权限为
+    // umask 默认（通常 0644），mac 多用户机上其他用户可读——收紧为 0600
+    //（备份/恢复走 fs::copy 会保留源权限，不受此影响）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &synth_auth_path,
+            std::fs::Permissions::from_mode(0o600),
+        );
     }
     let meta = json!({
         "schemaVersion": 1,
@@ -956,8 +973,11 @@ pub fn synthesize_auth_snapshot(
         "savedAtMs": chrono::Utc::now().timestamp_millis(),
         "bootstrap": true,
     });
-    if let Err(e) =
-        std::fs::write(dest.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default())
+    // 原子写对齐 backup_authfile：中断不留半截 meta.json
+    if let Err(e) = crate::fs_utils::write_text_atomic(
+        &dest.join("meta.json"),
+        &serde_json::to_string(&meta).unwrap_or_default(),
+    )
     {
         // meta 缺失不阻塞合成结果：confirm 期望 uid 回退会话暂存 bootstrap_uid
         //（与 meta 的 uid 同源），后续完整备份会重写 meta
@@ -1190,16 +1210,24 @@ fn confirm_switch_inner(
             );
             crate::fs_utils::dig(&raw, &["genie.userId"])
                 .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
         } else {
             None
         };
     if expect_uid.is_none() {
+        // trim + 空串过滤对齐 read_slot_meta_uid：外部编辑/半截写入的 "uid":""
+        // 若不过滤会变成 Some("")，短路 bootstrap_uid/槽名兜底 → 三信号比对恒
+        // false，表现为「每次切该账号都 30s 超时（黄标）」
         expect_uid = std::fs::read_to_string(&meta_file)
             .ok()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')).ok())
-            .and_then(|m| m.get("uid").and_then(|v| v.as_str()).map(|s| s.to_string()));
+            .and_then(|m| {
+                m.get("uid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
     }
     if expect_uid.is_none() {
         expect_uid = sess.bootstrap_uid.clone();
@@ -1556,10 +1584,11 @@ fn confirm_ok(sess: &Session, slot: &str, expect_uid: &str, sink: &dyn ProgressS
     for _ in 0..3 {
         std::thread::sleep(Duration::from_secs(2));
         let raw = crate::fs_utils::read_json::<serde_json::Value>(&live_file);
+        // trim 对齐 slot_held_uid/live_login_uid 的口径：尾随空白会让两侧比对失配
         let uid = crate::fs_utils::dig(&raw, &["genie.userId"])
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
         if !uid.is_empty() {
             if uid == expect_uid {
                 sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");

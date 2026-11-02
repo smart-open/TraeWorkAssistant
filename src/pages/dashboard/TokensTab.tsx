@@ -217,8 +217,12 @@ export default function TokensTab({
   // 统一口径：总 Token = input + output + cache_write（官网/网关 cache_write 恒 0）；
   // 官网 input 假设已含缓存读取（与本地源供应商语义一致），不重复计。
   const totalTokens = agg.input + agg.output + agg.cache_write;
+  // 网关源：仅当有真实缓存入账（WB/Qoder 池）才计算，转发口径恒 0（Trae 上游未
+  // 下发）保持 '—'——0 数据与「无缓存字段」不可区分，展示 0.0% 反而误导
   const hitRate =
-    source !== 'gateway' && agg.input > 0 ? agg.cache_read / agg.input : null;
+    agg.input > 0 && (source !== 'gateway' || agg.cache_read > 0)
+      ? agg.cache_read / agg.input
+      : null;
   // Trae 网关源账单口径缓存命中率（issue #169 对账）：官方账单 cache_read / 官网 input
   // （官网 input 按供应商语义已含缓存读取，与官网源 hitRate 同分母口径）。转发口径恒 0
   // 时用户在此直接看到真实命中率
@@ -273,10 +277,22 @@ export default function TokensTab({
   const modelFmt = source === 'local' ? fmtTokens : (n: number) => n.toLocaleString('zh-CN');
   const modelUnitLabel = source === 'local' ? 'tokens' : '请求数';
 
-  // ---- 会话总数（§3.3：local=summary.calls；gateway=范围内请求合计；official=范围内 sessions）----
+  // ---- 会话/请求总数（三源统一按所选区间过滤——local=365 天/gateway=90 天窗口的
+  // 全量口径会让徽标不随区间切换，与同屏按区间统计的卡片互相矛盾；且 official
+  // 原实现就按区间过滤，三源必须同口径）----
   const sessions = useMemo(() => {
-    if (source === 'local') return tokenStats?.summary.calls ?? null;
-    if (source === 'gateway') return gwPoolsFor(gateway, scope).reduce((s, d) => s + d.total_requests, 0);
+    if (source === 'local') {
+      if (!tokenStats) return null;
+      return tokenStats.daily.reduce(
+        (s, d) => (d.date && inRange(d.date) ? s + d.calls : s),
+        0,
+      );
+    }
+    if (source === 'gateway')
+      return gwPoolsFor(gateway, scope).reduce(
+        (s, d) => (inRange(d.date) ? s + d.total_requests : s),
+        0,
+      );
     if (!traeActive || !usage) return null;
     return usage.accounts.reduce(
       (s, a) => s + a.daily.reduce((x, d) => (inRange(d.date) ? x + d.sessions : x), 0),
@@ -367,11 +383,12 @@ export default function TokensTab({
         }
         sessions={sessions}
         models={
+          // 仅 local 有按模型过滤语义；网关源无按模型 token 明细（趋势恒为全模型、
+          // 总卡/热力图也不响应筛选），渲染下拉是哑控件——不传，由 ChartFilterBar
+          // 在空列表时不渲染下拉
           source === 'local'
             ? (tokenStats?.models ?? []).map((m) => m.key ?? '').filter(Boolean)
-            : source === 'gateway'
-              ? [...new Set(gwPoolsFor(gateway, scope).flatMap((d) => d.models.map((m) => m.name)))].sort()
-              : []
+            : []
         }
         modelFilter={modelFilter}
         onModelFilter={setModelFilter}
@@ -431,7 +448,9 @@ export default function TokensTab({
                 hint={
                   agg.billingCacheRead.total > 0
                     ? `Trae 官网计费 cache_read · ${agg.billingCacheRead.days} 天有缓存 · 命中率 ${billingHitRate != null ? `${(billingHitRate * 100).toFixed(1)}%` : '—'}`
-                    : '官网明细暂无缓存记录（点「刷新数据」拉取消耗明细）'
+                    : usage == null
+                      ? '官网明细未加载或加载失败（点「刷新数据」重试后仍为空再视为无记录）'
+                      : '官网明细暂无缓存记录（点「刷新数据」拉取消耗明细）'
                 }
                 tone="violet"
               />

@@ -273,6 +273,16 @@ fn is_skippable_uncoded(item: &Value, has_coded: bool, coded: &[&Value]) -> bool
         && (is_category_summary_row(item) || is_aggregate_container(item, coded))
 }
 
+/// 上游一页响应里「含容量字段的 dict」总数（过滤前口径）——分页翻页的满页判定
+/// 不得用 `packages_from` 过滤后条数：满页 100 行里只要有一行被过滤（汇总行/
+/// 聚合容器/缺容量字段），过滤后条数 <100 会提前终止翻页，>100 包账号第 2 页
+/// 之后的到期明细全部丢失。
+fn raw_capable_count(body: &Value) -> usize {
+    let mut found: Vec<&Value> = vec![];
+    walk_capable_dicts(body, 0, &mut found);
+    found.len()
+}
+
 /// 从三件套/旧接口响应提取包列表（容量键全树收集，6 种嵌套路径兼容）。
 ///
 /// 混排响应过滤（2026-10-18，issue #120 后续）：summary 同时返回带 PackageCode 的
@@ -495,6 +505,11 @@ fn fetch_round(
     let mut saw_auth = false;
     if !codes.is_empty() {
         for url in [paid_url, free_url] {
+            // 凭证已 401：两个端点共用同一份凭证，继续打剩余端点必然再 401，
+            // 纯浪费一次往返并拖慢 401→刷新链路（saw_auth 语义不变，两处都会置位）
+            if saw_auth {
+                break;
+            }
             let mut page = 1u32;
             loop {
                 let req = json!({"PackageCodes": &codes, "PageNumber": page, "PageSize": 100});
@@ -510,10 +525,15 @@ fn fetch_round(
                     break;
                 };
                 let items: Vec<Value> = packages_from(&b2);
-                let got = items.len();
+                // 满页判定用过滤前口径（raw_capable_count），见其文档
+                let got = raw_capable_count(&b2);
                 for p in items {
                     if let Some(code) = p.get("code").and_then(Value::as_str) {
-                        enriched_codes.insert(code.to_string());
+                        // 跨页按 PackageCode 去重：上游若不真正分页（恒回同一满页），
+                        // 无条件 push 会翻满 50 页 × 100 条重复明细进包列表/悬停明细
+                        if !enriched_codes.insert(code.to_string()) {
+                            continue;
+                        }
                     }
                     enriched.push(p);
                 }
@@ -633,7 +653,9 @@ fn next_month_start_ts(now: i64) -> i64 {
 }
 
 /// 体验版包到期重算：名称命中体验版的包把 `expire_ts/end_time` 改写为次月 1 日 00:00；
-/// 其余包原样保留。
+/// 其余包原样保留。**改写取 min(原值, 次月 1 日)**——上游给的多为包本体 ~10 年有效期
+/// （需改写），但限时体验包可能带早于次月 1 日的真实到期，此时保留原值，避免「即将
+/// 到期」被推迟、到期日历失真。
 fn apply_monthly_quota_expire(pkgs: &mut [Value], now: i64) {
     let ts = next_month_start_ts(now);
     for p in pkgs.iter_mut() {
@@ -644,6 +666,11 @@ fn apply_monthly_quota_expire(pkgs: &mut [Value], now: i64) {
             .unwrap_or(false);
         if !hit {
             continue;
+        }
+        if let Some(cur) = p.get("expire_ts").and_then(Value::as_i64) {
+            if cur <= ts {
+                continue;
+            }
         }
         p["expire_ts"] = json!(ts);
         p["end_time"] = json!(fmt_ts(ts));
@@ -668,7 +695,9 @@ fn finalize_packages(pkgs: &mut [Value], now: i64) {
     let soon_cut = now + 7 * 86400;
     for p in pkgs.iter_mut() {
         let exp = p.get("expire_ts").and_then(Value::as_i64);
-        p["expire_soon"] = json!(exp.map(|e| e < soon_cut).unwrap_or(false));
+        // 已过期（e <= now）不算「即将到期」——那是「已过期」，与 7 日内语义不同；
+        // 二者共用一个布尔会把过期包伪装成即将到期
+        p["expire_soon"] = json!(exp.map(|e| e > now && e < soon_cut).unwrap_or(false));
     }
 }
 
@@ -1022,7 +1051,8 @@ mod wb_credits_tests {
     }
 
     /// 顶层无余额字段时，不能把某个包的 remaining 当成总余额
-    ///（`fs_utils::dig` 是全树深搜，命中第一个包就返回 → 少计）。
+    ///（`fs_utils::dig` 只沿 ENVELOPE_KEYS 信封键 + 数组逐层下钻，`data.Packages[]`
+    /// 内的包级容量键不会被命中——首个候选即顶层余额字段，不存在「抢先返回包值」）。
     #[test]
     fn balance_does_not_use_single_package_as_total() {
         let body = json!({"data": {"Packages": [
@@ -1237,6 +1267,34 @@ mod wb_credits_tests {
         assert_eq!(pkgs[1]["expire_ts"], json!(next_month), "体验版到期改为次月 1 日 00:00");
         assert_eq!(pkgs[1]["expire_soon"], json!(false), "次月到期不算 7 日内");
         assert_eq!(pkgs[0]["expire_soon"], json!(true));
+    }
+
+    /// 体验版改写取 min(原值, 次月 1 日)：限时体验包真实到期早于次月 1 日时保留原值，
+    /// 不得被推迟（否则「即将到期」延后触发、到期日历失真）。
+    #[test]
+    fn trial_package_with_earlier_real_expire_is_kept() {
+        let now = to_ts(Some(&json!("2026-11-01 10:00:00"))).unwrap();
+        let real_expire = to_ts(Some(&json!("2026-11-10 00:00:00"))).unwrap();
+        let mut pkgs = vec![json!({"name": "限时体验版", "remaining": 500.0,
+               "expire_ts": real_expire, "expire_soon": false})];
+        finalize_packages(&mut pkgs, now);
+        assert_eq!(pkgs[0]["expire_ts"], json!(real_expire), "更早的真实到期不被改写");
+        assert_eq!(pkgs[0]["expire_soon"], json!(false), "距 now 9 日 > 7 日，不算即将到期");
+    }
+
+    /// 已过期（expire_ts <= now）不算「即将到期」：那是「已过期」，与 7 日内语义不同。
+    #[test]
+    fn expired_package_is_not_marked_expire_soon() {
+        let now = to_ts(Some(&json!("2026-11-01 10:00:00"))).unwrap();
+        let past = to_ts(Some(&json!("2026-10-30 00:00:00"))).unwrap();
+        let future = to_ts(Some(&json!("2026-11-05 00:00:00"))).unwrap();
+        let mut pkgs = vec![
+            json!({"name": "已过期包", "remaining": 1.0, "expire_ts": past, "expire_soon": false}),
+            json!({"name": "即将到期包", "remaining": 1.0, "expire_ts": future, "expire_soon": false}),
+        ];
+        finalize_packages(&mut pkgs, now);
+        assert_eq!(pkgs[0]["expire_soon"], json!(false), "已过期不算即将到期");
+        assert_eq!(pkgs[1]["expire_soon"], json!(true));
     }
 
     /// 审查 #9 回归：无 code 项同值判重不得吞掉真实独立同值包——非汇总行且

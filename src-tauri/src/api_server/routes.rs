@@ -404,14 +404,6 @@ pub(crate) fn dispatch_error_response(
                 "model_cooldown",
                 "rate_limit_error",
             ),
-            DispatchError::NoHealthy(pool) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                pool.as_str(),
-                // issue #159：传模型名——503 归因可见「前置池因模型冷却被跳过」
-                no_healthy_detail_with_model(state, pool, key_str, Some(model), None),
-                "no_healthy_account",
-                "api_error",
-            ),
             // issue #159 归因增强：主选循环耗尽携带调度实际候选序，skip-note 按
             // 实际序归因（硬编码 POOL_FIXED_ORDER 在前缀锁定/Key 绑定/per_model
             // 场景会把不在候选序里的池虚假归因 skipped）

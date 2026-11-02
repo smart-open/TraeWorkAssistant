@@ -173,9 +173,10 @@ ai-work-assistant/
 | 计划 | `task_register(time)` / `task_status()` / `task_unregister()` | `schtasks` 注册每日签到 |
 | 更新 | `update_check()` / `update_download(...)` → `UpdateDownloaded` / `update_run_installer({file_path, asset_name})` | 两步确认制：下载（确认一）→ 安装（确认二）。安装器参数 `/P /UPDATE /R`：被动进度条 + 跳过卸载直接覆盖 + 完成后自动重启应用；`run_installer` 校验路径必须位于临时更新目录 |
 | WorkBuddy | `workbuddy_env_check()` → `WorkBuddyEnvCheck` | 客户端安装/运行/版本 + auth 文件存在性 + `~/.workbuddy` 快照解析（uid/昵称/editionType）；复用 app_locate 四级探测 |
-| WorkBuddy | `workbuddy_accounts_list` → `WorkBuddyAccountView[]` | 账号池（data/workbuddy_accounts.json）+ 在线标记（auth 文件 uid 匹配）+ 快照/凭证副本存在性；id = `wb-<sha256(token)前12位>`（同 token 稳定同 id） |
+| WorkBuddy | `workbuddy_accounts_list` → `WorkBuddyAccountView[]` | 账号池（data/workbuddy_accounts.json）+ 在线标记（auth 文件 uid 匹配）+ 快照/凭证副本存在性 + 切换验证标记（`snapshot_verify_failed_*_ms` 红=身份不符/回退、`snapshot_verify_timeout_*_ms` 黄=确认超时 fail-open、`snapshot_invalid_*` 红=快照不可用需重新保存登录态；id = `wb-<sha256(token)前12位>`（同 token 稳定同 id） |
 | WorkBuddy | `workbuddy_account_save/remove` / `workbuddy_scan_auth_file` / `workbuddy_account_import_auth` | 别名备注 / 删除 / auth 文件扫描预览 / 确认入池（凭证入 token store 副本，零明文出 Rust） |
 | WorkBuddy | `workbuddy_refresh_token(userId)` | plugin refresh 端点（X-Refresh-Token 仅限此端点）+ 回写 token store 与账号池过期时间；失败提示需重登 |
+| WorkBuddy | `workbuddy_clear_relogin(id)` | 人工清除「需重登」标记（只清账号池条目的 needs_relogin 标记与原因，不动凭证；快照槽位验证标记 snapshot_verify_* 不受影响）；凭证真失效时下一轮签到会重新标记；幂等（已清直接 Ok）；async |
 | WorkBuddy | `workbuddy_checkin_start(opts)` → NDJSON `wb-checkin-progress` | Rust 直调 `tasks/wb_checkin.rs::run_checkin_round`（状态查询回退旧路径 / code:10001 已签容错 / 401 刷新一次重试 / 零 token 输出）；opts: `{ user_ids?, skip_checked_in, skip_expired, lazy_hours? }` |
 | WorkBuddy | `workbuddy_growth_run()` | 成长中心执行入口（旅行/盲盒/任务开关从 workbuddy_settings.json 读取；`wb_checkin::run_growth_round` 链式执行：travel status→claim→config→depart / lottery chances→draw 循环（上限 20）/ tasks→accept，各步独立容错、401 刷新一次重试、奖励数额以接口返回为准） |
 | WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（wb_checkin_results 表 90 天滚动，默认展示 30 天；**纯追加**：同日同账号多轮并存，返回新→旧序；活动档期日历聚合 `daysFromWbRecords` 按账号取当日最终态——任一 success/already 即当日已领、仅全失败计 fail） |

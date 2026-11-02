@@ -54,19 +54,23 @@ export default function ChartFilterBar({
         {badges}
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        <select
-          className="input !w-auto !py-1 text-xs"
-          value={modelFilter}
-          onChange={(e) => onModelFilter(e.target.value)}
-          title="筛选趋势与消耗合计的模型"
-        >
-          <option value="">全部模型</option>
-          {models.map((m) => (
-            <option key={m} value={m}>
-              {m}
-            </option>
-          ))}
-        </select>
+        {/* 无模型列表时不渲染筛选下拉：该数据源无按模型过滤语义（如网关/官网源），
+            渲染成哑控件会让用户以为筛选生效实则纹丝不动 */}
+        {models.length > 0 && (
+          <select
+            className="input !w-auto !py-1 text-xs"
+            value={modelFilter}
+            onChange={(e) => onModelFilter(e.target.value)}
+            title="筛选趋势与消耗合计的模型"
+          >
+            <option value="">全部模型</option>
+            {models.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        )}
         <div className="flex items-center gap-1">
           {RANGES.map((r) => (
             <button

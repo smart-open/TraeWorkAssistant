@@ -196,23 +196,32 @@ export default function UsageStatsPanel() {
   // 防止旧数据覆盖新结果
   const loadSeqRef = useRef(0);
 
+  // 五桶统计加载失败数（审查 M：`.catch(()=>[])` 吞错把「查询失败」伪装成「暂无
+  // 数据」——对齐同文件 sessError「失败不得伪装成空数据」口径。全部失败 → 错误态；
+  // 部分失败且无数据 → 空态文案注明失败源数）
+  const [loadFailedCount, setLoadFailedCount] = useState(0);
+
   const load = async (d: number) => {
     const seq = ++loadSeqRef.current;
     setLoading(true);
+    setLoadFailedCount(0);
     try {
-      const [trae, buddy, buddyAi, custom, qoder] = await Promise.all([
-        api.apiServer.usageStats(d).catch(() => [] as UsageDayView[]),
-        api.apiServer.wbUsageStats(d).catch(() => [] as UsageDayView[]),
-        api.apiServer.buddyAiUsageStats(d).catch(() => [] as UsageDayView[]),
-        api.apiServer.customUsageStats(d).catch(() => [] as UsageDayView[]),
-        api.apiServer.qoderUsageStats(d).catch(() => [] as UsageDayView[]),
+      const results = await Promise.allSettled([
+        api.apiServer.usageStats(d),
+        api.apiServer.wbUsageStats(d),
+        api.apiServer.buddyAiUsageStats(d),
+        api.apiServer.customUsageStats(d),
+        api.apiServer.qoderUsageStats(d),
       ]);
       if (seq !== loadSeqRef.current) return;
-      setTraeUsage(trae);
-      setBuddyUsage(buddy);
-      setBuddyAiUsage(buddyAi);
-      setCustomUsage(custom);
-      setQoderUsage(qoder);
+      const ok = (r: PromiseSettledResult<UsageDayView[]>): UsageDayView[] =>
+        r.status === 'fulfilled' ? r.value : [];
+      setLoadFailedCount(results.filter((r) => r.status === 'rejected').length);
+      setTraeUsage(ok(results[0]));
+      setBuddyUsage(ok(results[1]));
+      setBuddyAiUsage(ok(results[2]));
+      setCustomUsage(ok(results[3]));
+      setQoderUsage(ok(results[4]));
     } finally {
       if (seq === loadSeqRef.current) setLoading(false);
     }
@@ -467,7 +476,7 @@ export default function UsageStatsPanel() {
           label="总请求数"
           value={summary.requests}
           tone="brand"
-          hint={`近 ${days} 天 · ${filterHint}`}
+          hint={`近 ${days} 天 · ${filterHint}${loadFailedCount > 0 ? ` · ${loadFailedCount} 源加载失败` : ''}`}
         />
         <StatCard
           label="成功率"
@@ -525,8 +534,16 @@ export default function UsageStatsPanel() {
             </BarChart>
           </ResponsiveContainer>
         </div>
+      ) : loadFailedCount === 5 ? (
+        // 五桶全部失败：不得伪装成空态引导（与 custom 明细 sessError 同口径）
+        <p className="py-6 text-center text-sm text-rose-500">
+          用量统计加载失败（5 个数据源均未响应）——请检查 API 服务状态后点「刷新数据」重试
+        </p>
       ) : (
         <p className="py-6 text-center text-sm text-slate-400">
+          {loadFailedCount > 0
+            ? `${loadFailedCount} 个数据源加载失败，以下仅展示成功源（点「刷新数据」重试）· `
+            : ''}
           暂无请求数据 — 发起一次 API 调用后这里会展示按日趋势（{filterHint}）
         </p>
       )}

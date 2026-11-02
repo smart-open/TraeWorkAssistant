@@ -548,11 +548,14 @@ fn message_model(value: &Value) -> Option<String> {
 fn request_model(session_dir: &Path, request: &Map<String, Value>) -> Option<String> {
     const MAX_TRIES: usize = 6;
     let ids = request.get("messages").and_then(Value::as_array)?;
-    // 末尾 3 条优先（助手响应在尾部），不足 3 条时与头部去重，免重复读盘
+    // 末尾 3 条优先（助手响应在尾部）；头/尾候选各自去重（尾部自身也可能含重复
+    // id——如 messages 尾部 [a, b, a]），免同一消息文件重复读盘
     let mut candidates: Vec<&str> = Vec::new();
     for id in ids.iter().rev().take(3) {
         if let Some(id) = id.as_str() {
-            candidates.push(id);
+            if !candidates.contains(&id) {
+                candidates.push(id);
+            }
         }
     }
     for id in ids.iter().take(3) {
@@ -1230,7 +1233,18 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
         // 最多一个 TTL）；已过期 → SWR（先回旧值 + 后台重扫，并水合为「立即过期」条目，
         // 后续轮询走上面的内存过期分支免重复读 kv）；完全没有落盘缓存 → 同步全量扫。
         let kv_cached: Value = crate::store::db(&state.data_dir).kv_get(RESULT_KV_KEY);
-        if let Some(payload) = kv_cached.get("payload").filter(|v| v.is_object()) {
+        // rev 校验（对齐文件级缓存的 rev 失效开关，文件级在 aggregate_files 判定）：
+        // 升级（PARSE_REV 变更）后旧落盘结果仍是旧口径（如会话级模型归因），直接
+        // 命中或 SWR 回旧值会让用户在 TTL+后台重扫窗口内看到修复前数据，误判修复
+        // 无效——rev 不匹配视为无缓存，跳过命中与水合走下方同步全量重扫，重扫
+        // 完成后落盘带新 rev，后续请求恢复命中路径
+        let kv_rev_ok =
+            kv_cached.get("rev").and_then(Value::as_u64) == Some(u64::from(PARSE_REV));
+        let payload_hit = kv_cached
+            .get("payload")
+            .filter(|v| v.is_object())
+            .filter(|_| kv_rev_ok);
+        if let Some(payload) = payload_hit {
             let fetched = kv_cached
                 .get("fetched_at_ms")
                 .and_then(Value::as_i64)
@@ -1382,7 +1396,9 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
     }
     // 落盘结果缓存（B2，issue #84）：与进程内 RESULT_CACHE 同步写入，
     // 供重启后首个请求直接命中或 SWR 兜底，避免每次启动必然全量重扫。
+    // rev 随结果落盘：读取侧据此在升级后跳过旧口径命中（见上方 kv_rev_ok）。
     let wrapper = json!({
+        "rev": PARSE_REV,
         "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
         "payload": merged.clone(),
     });
@@ -1801,6 +1817,46 @@ mod tests {
             Some("auto")
         );
         assert_eq!(message_model(&json!({ "role": "user" })), None);
+    }
+
+    /// 尾部候选自身含重复 id（如 [a, b, a]）时仍按「尾部优先」顺序取模型、extra:null
+    /// 兼容、无模型消息 continue 不终止循环。候选去重的真实收益是免重复读盘（行为
+    /// 不可观测），本测试锁定「去重不改变取模结果」（交叉复审更名如实化）。
+    #[test]
+    fn request_model_tail_first_order_survives_duplicate_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "wb_stats_req_dedup_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let msg_dir = root.join("messages");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        let write_msg = |id: &str, model: Option<&str>| {
+            let extra = model.map(|m| json!({ "modelId": m }).to_string());
+            std::fs::write(
+                msg_dir.join(format!("{id}.json")),
+                json!({ "id": id, "extra": extra }).to_string(),
+            )
+            .unwrap();
+        };
+        // 尾部 [a, b, a]：a 无模型、b 有——重复的 a 不得挤占候选位或改变顺序
+        write_msg("a1", None);
+        write_msg("b2", Some("glm-5.3-flash"));
+        let request = json!({
+            "id": "r1",
+            "messages": ["a1", "b2", "a1", "a1"],
+        });
+        let map = request.as_object().cloned().unwrap();
+        assert_eq!(
+            request_model(&root, &map).as_deref(),
+            Some("glm-5.3-flash"),
+            "尾部去重后 b2 仍在候选且命中"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 跨文件/跨 uid 的同一请求只计一次（2026-10-08 实测缺陷回归：同一批请求会以**新的

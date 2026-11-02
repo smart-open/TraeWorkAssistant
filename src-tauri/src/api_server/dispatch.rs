@@ -234,15 +234,15 @@ pub enum DispatchError {
     /// 响应层硬编码 "buddy"，buddy-ai/qoder 的模型级 429 在用量看板与
     /// app_log 中归因失真
     ModelCooling(i64, TargetPool),
-    /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却
-    NoHealthy(TargetPool),
-    /// 池耗尽提前终止 + 主选池循环耗尽（issue #159 归因增强，合并审查 Medium
-    /// 修复）：附带本轮实际候选序——503 归因注记「前置池因模型冷却被跳过」
-    /// 必须按实际序判断，按 POOL_FIXED_ORDER 硬编码在前缀锁定/Key 绑定/
-    /// per_model 场景会虚假归因（不在候选序里的池被注记 skipped）或漏归因
-    /// （真实前置池不在固定序前缀里）。两处构造点同在 resolve_target ④ 段
-    /// order 变量作用域（提前终止在循环迭代借用中需 clone，循环尾 move），
-    /// 零重算成本
+    /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却。附带本轮实际候选序
+    /// （issue #159 归因增强，合并审查 Medium 修复）——503 归因注记「前置池
+    /// 因模型冷却被跳过」必须按实际序判断，按 POOL_FIXED_ORDER 硬编码在前缀
+    /// 锁定/Key 绑定/per_model 场景会虚假归因（不在候选序里的池被注记
+    /// skipped）或漏归因（真实前置池不在固定序前缀里）。两处构造点同在
+    /// resolve_target ④ 段 order 变量作用域（提前终止在循环迭代借用中需
+    /// clone，循环尾 move），零重算成本。
+    /// （原独立 NoHealthy(TargetPool) 变体已并入本变体：生产构造点全部携带
+    /// 实际候选序，旧变体仅测试直调残留，成为 dead code 警告源）
     NoHealthyWithOrder(TargetPool, Vec<TargetPool>),
 }
 
@@ -1709,7 +1709,7 @@ mod tests {
         super::super::custom_lb::clear_circuit("cm-whitelist0001");
     }
 
-    /// v3 P4：custom/xxx 前缀锁池 + 组全熔断 → NoHealthy(Custom) 显式报错
+    /// v3 P4：custom/xxx 前缀锁池 + 组全熔断 → NoHealthyWithOrder(Custom) 显式报错
     /// 不跨池回退（单池候选语义）
     #[test]
     fn t91_custom_prefix_lock_errors_when_exhausted() {
@@ -2838,7 +2838,9 @@ mod tests {
 
         let resp = super::super::routes::dispatch_error_response(
             &f.state,
-            DispatchError::NoHealthy(TargetPool::Trae),
+            // 旧 NoHealthy 变体已并入 NoHealthyWithOrder：直测用固定序（与原
+            // None 回退口径等价）
+            DispatchError::NoHealthyWithOrder(TargetPool::Trae, POOL_FIXED_ORDER.to_vec()),
             super::super::routes::Protocol::OpenAi,
             "glm-5.3",
             false,
