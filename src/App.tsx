@@ -107,24 +107,12 @@ export default function App() {
   const init = useAppStore((s) => s.init);
   const ready = useAppStore((s) => s.ready);
   const settings = useAppStore((s) => s.settings);
-  const platform = useAppStore((s) => s.platform);
 
   useEffect(() => {
     void init().catch((err) => {
       console.error('初始化失败:', err);
     });
   }, [init]);
-
-  // issue #152 审查修复：最小宽度按平台分档——1920px 是 Windows 高 DPI（2x 缩放
-  // ≈3840 物理像素）的防挤压口径，mac 内建屏逻辑视口普遍 1440-1728 CSS px，
-  // 恒小于 1920 会永久横向滚动。mac 降档 1440px（覆盖全系内建屏 + 常见外接），
-  // Windows 口径不变；platform_info 拉取成功后覆盖（init 前按 UA 兜底也已正确）
-  useEffect(() => {
-    document.documentElement.style.setProperty(
-      '--app-min-width',
-      platform === 'macos' ? '1440px' : '1920px',
-    );
-  }, [platform]);
 
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
