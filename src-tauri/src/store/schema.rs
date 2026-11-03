@@ -212,6 +212,16 @@ const DDL: &[&str] = &[
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
         payload TEXT NOT NULL
     )",
+    // 豆包每日签到结果（按日落库，per-uid 最终态 + 奖励额度；额度看板趋势数据源）
+    "CREATE TABLE IF NOT EXISTS doubao_checkin_results (
+        day        TEXT NOT NULL,
+        uid        TEXT NOT NULL,
+        name       TEXT NOT NULL DEFAULT '',
+        status     TEXT NOT NULL DEFAULT '',
+        reward     INTEGER,
+        updated_at TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (day, uid)
+    )",
     // P6 流水迁出：WB 每日积分快照（原 kv workbuddy_credits_history，同日覆盖 + 365 天）
     // earned = 当日新增积分（credits-dashboard-plan.md §2.2 方案 B：余额差分 + 签到 reward 归并）；
     // NULL = 未统计（v2 老库行 / 首日无历史差分时可能仅签到口径）

@@ -2014,6 +2014,67 @@ pub fn checkin_results_save(s: &Store, f: &crate::checkin_results::ResultsFile) 
     })
 }
 
+// ── 豆包签到结果（按日落库 → doubao_checkin_results 表）─────────────────────
+
+pub fn doubao_checkin_results_load(
+    s: &Store,
+) -> crate::doubao_checkin_results::ResultsFile {
+    use std::collections::BTreeMap;
+    let mut days: BTreeMap<String, crate::doubao_checkin_results::DayRecord> = BTreeMap::new();
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT day, uid, name, status, reward, updated_at FROM doubao_checkin_results ORDER BY day, uid",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    for (day, uid, name, status, reward, updated_at) in rows {
+        days.entry(day).or_default().accounts.insert(
+            uid,
+            crate::doubao_checkin_results::AccountResult { name, status, reward, updated_at },
+        );
+    }
+    crate::doubao_checkin_results::ResultsFile { days }
+}
+
+pub fn doubao_checkin_results_save(
+    s: &Store,
+    f: &crate::doubao_checkin_results::ResultsFile,
+) -> Result<(), String> {
+    s.with_conn(|c| {
+        c.execute_batch("BEGIN; DELETE FROM doubao_checkin_results;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO doubao_checkin_results(day, uid, name, status, reward, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (day, rec) in &f.days {
+                for (uid, a) in &rec.accounts {
+                    stmt.execute(rusqlite::params![day, uid, a.name, a.status, a.reward, a.updated_at])?;
+                }
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
 // ── WorkBuddy 签到结果（workbuddy_checkin_results.json → wb_checkin_results 表）──
 
 /// 读回 {results: [...]}（按 id 升序 = 原追加序）
