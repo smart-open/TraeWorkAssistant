@@ -202,7 +202,7 @@ export default function QoderOverview() {
     {
       key: 'client',
       title: '安装 Qoder 客户端',
-      desc: 'IDE / QoderWork / CLI 任一即可（全家桶账号三端共享 Credits）。路径未自动识别时可在「环境配置」人工指定。',
+      desc: 'IDE / Qoder CN / CLI 任一即可（全家桶账号三端共享 Credits）。路径未自动识别时可在「环境配置」人工指定。',
       done: clientReady,
       actionLabel: clientReady ? '打开客户端' : '安装后自动识别',
       view: 'qoder-settings',
@@ -234,7 +234,7 @@ export default function QoderOverview() {
     {
       key: 'client-cred',
       title: '客户端本地凭证接入（可选）',
-      desc: 'IDE auth.v1.dat / QoderWork 存储自动发现随 M0 R-2/R-8 侦察闭合后开放，届时免 PAT 手工导入。',
+      desc: 'IDE auth.v1.dat / Qoder CN 存储自动发现随 M0 R-2/R-8 侦察闭合后开放，届时免 PAT 手工导入。',
       done: false,
       actionLabel: '待侦察闭合',
       view: 'qoder-settings',
@@ -265,7 +265,7 @@ export default function QoderOverview() {
     <div className="animate-fade-in">
       <PageHeader
         title="Qoder · 概述"
-        desc="Qoder CN（IDE / Work / CLI）运行总览 · 登录账号 / 本机套餐 / 告警提醒 / 签到趋势与积分榜"
+        desc="Qoder CN（Qoder CN IDE / Qoder CN / CLI）运行总览 · 登录账号 / 本机套餐 / 告警提醒 / 签到趋势与积分榜"
         actions={
           <button onClick={() => void refresh(true)} className="btn-outline" disabled={refreshing}>
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
@@ -481,9 +481,9 @@ export default function QoderOverview() {
         {/* Qoder 说明（三端审计：签到收益账号级，三端共享 Credits） */}
         <div className="mt-3 border-t border-slate-100 px-4 pt-3 text-xs leading-relaxed text-slate-400 dark:border-zinc-800">
           <b className="font-medium text-slate-500 dark:text-zinc-400">Qoder 说明：</b>
-          全家桶账号贯穿 IDE / QoderWork / CLI 三端，Credits 共享消耗（FEFO：最先到期优先）；
+          全家桶账号贯穿 IDE / Qoder CN / CLI 三端，Credits 共享消耗（FEFO：最先到期优先）；
           签到收益为账号级 Add-on Credits，任一端领取即全端受益。两条产品线不互通：
-          原灵码订单（lingma_ 前缀）的 Credits 不在 QoderWork / CLI 生效。
+          原灵码订单（lingma_ 前缀）的 Credits 不在 Qoder CN / CLI 生效。
         </div>
         {allDone && (
           <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-zinc-800 dark:bg-emerald-500/10 dark:text-emerald-300">

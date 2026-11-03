@@ -72,7 +72,7 @@ export function QoderHelpModal({ open, onClose }: { open: boolean; onClose: () =
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             点「快照管理」查看按账号槽位存放的登录态快照（
             <code className="mx-0.5 rounded bg-slate-100 px-1 dark:bg-zinc-800">data/profiles_qoder/&lt;账号id&gt;/</code>
-            ），支持「恢复」到 Qoder IDE 与删除，均需二次确认。恢复快照时会自动注入该账号绑定的设备指纹，支持多账号并存。
+            ），支持「恢复」到 Qoder CN IDE 与删除，均需二次确认。恢复快照时会自动注入该账号绑定的设备指纹，支持多账号并存。
           </p>
         </section>
 

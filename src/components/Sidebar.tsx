@@ -82,7 +82,7 @@ const BUDDYAI_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
 export const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disabled?: boolean; title?: string }[] = [
   { key: 'trae', label: 'Trae', icon: Sparkles },
   { key: 'buddy', label: 'Buddy', icon: Bot, title: 'WorkBuddy / CodeBuddy' },
-  { key: 'qoder', label: 'Qoder', icon: Boxes, title: 'Qoder CN（IDE / Work / CLI）' },
+  { key: 'qoder', label: 'Qoder', icon: Boxes, title: 'Qoder CN（Qoder CN IDE / Qoder CN / CLI）' },
   { key: 'doubao', label: '豆包', icon: LayoutGrid },
   { key: 'buddy-ai', label: 'BuddyAI', icon: Globe, title: 'Buddy 国际版（buddy-ai 独立池）' },
 ];

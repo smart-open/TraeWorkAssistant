@@ -436,15 +436,16 @@ fn buddy_ai_account_view(a: &WorkBuddyAccount, rec: Option<&Value>, ctx: &BuddyA
         dir.join(id).exists() || dir.join(format!("{id}.bak")).exists()
     };
     let meta = |dir: &std::path::Path, id: &str| {
-        let (saved, failed) = crate::switcher::authfile::read_slot_snapshot_meta(dir, id);
-        if saved.is_none() && failed.is_none() {
+        let (saved, failed, timeout) = crate::switcher::authfile::read_slot_snapshot_meta(dir, id);
+        if saved.is_none() && failed.is_none() && timeout.is_none() {
             crate::switcher::authfile::read_slot_snapshot_meta(dir, &format!("{id}.bak"))
         } else {
-            (saved, failed)
+            (saved, failed, timeout)
         }
     };
-    let (wb_saved, wb_failed) = meta(&ctx.profiles_wb_ai, &a.id);
-    let (cb_saved, cb_failed) = meta(&ctx.profiles_cb, &a.id);
+    // 第三项是「确认超时」标记（Buddy 账号页用黄标区分慢启动）；BuddyAI 视图暂不展示
+    let (wb_saved, wb_failed, _) = meta(&ctx.profiles_wb_ai, &a.id);
+    let (cb_saved, cb_failed, _) = meta(&ctx.profiles_cb, &a.id);
     json!({
         "id": a.id,
         "uid": a.uid,

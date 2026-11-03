@@ -130,6 +130,67 @@ fn auth_file_uid_value(j: &serde_json::Value) -> Option<String> {
 }
 
 /// 备份（PS Backup-AuthFileProfile 965-1060 对译）
+/// 具名账号槽位（排除 last / last.bak / last.bak2 这类「当前现场」备份槽）
+fn is_named_slot(slot: &str) -> bool {
+    !matches!(slot, "last" | "last.bak" | "last.bak2")
+}
+
+/// 槽位 meta.json 记录的登录身份（缺失/损坏 → None）
+fn read_slot_meta_uid(slot_dir: &Path) -> Option<String> {
+    let raw = crate::fs_utils::read_json::<serde_json::Value>(&slot_dir.join("meta.json"));
+    raw.get("uid")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 账号列表用：槽位 meta.uid（`dir/<id>/meta.json`）；缺槽/缺字段 → None。
+/// 与账号 uid 不一致 = 快照里装的是别的账号的登录态（需重新保存）。
+pub(crate) fn read_slot_uid(dir: &Path, id: &str) -> Option<String> {
+    read_slot_meta_uid(&dir.join(id))
+}
+
+/// 客户端当前 live 登录身份：CodeBuddy 系取 `globalStorage\storage.json` 的 genie.userId
+/// （缺失回退共享 auth 文件 uid），WorkBuddy 系优先 skeleton 登录快照 primary.uid、
+/// 缺失才回退 auth 文件 uid。
+/// 注意：共享 auth 文件记录的是 **WorkBuddy** 当前账号，与 CodeBuddy 端可能不一致，
+/// 故 CodeBuddy 系必须优先用 genie.userId；WorkBuddy 系同理——现版本客户端接受登录
+/// 后只重写 skeleton 快照、不回写 auth 文件（2026-10-30 实测 auth mtime 停在旧日期），
+/// 手动登录后立即「保存当前登录态」时 auth 文件可能仍停在上一个账号，用它会触发
+/// 槽位身份对齐守卫误拦；skeleton primary.uid 随每次登录/切换重写，是更可信的 live 信号。
+pub(crate) fn live_login_uid(sess: &Session) -> Option<String> {
+    if matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
+        sess.prof
+            .cb_global_storage_dir
+            .as_ref()
+            .and_then(|gs_dir| {
+                let raw =
+                    crate::fs_utils::read_json::<serde_json::Value>(&gs_dir.join("storage.json"));
+                crate::fs_utils::dig(&raw, &["genie.userId"])
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| auth_file_uid(&sess.auth_file))
+    } else {
+        skeleton_snapshot_uid(sess).or_else(|| auth_file_uid(&sess.auth_file))
+    }
+}
+
+/// WorkBuddy skeleton 登录快照（`storage\skeleton\account-snapshot.json`）的
+/// primary.uid（旧平铺键兜底）；缺失/损坏 → None。
+fn skeleton_snapshot_uid(sess: &Session) -> Option<String> {
+    let raw = crate::fs_utils::read_json::<serde_json::Value>(
+        &sess
+            .prof
+            .data_dir
+            .join("storage")
+            .join("skeleton")
+            .join("account-snapshot.json"),
+    );
+    snapshot_uid_of(&raw)
+}
+
 pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
     let auth_file = &sess.auth_file;
     // 关闭客户端后先等 auth 文件静默（残留进程可能延迟回写旧登录，实测 3 秒后才落盘）
@@ -149,6 +210,31 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
         );
         return Ok(());
     }
+    // live 身份（L2 用，同时做槽位身份对齐守卫）：CodeBuddy 系优先读 genie.userId，
+    // 缺失才回退共享 auth 文件（auth 文件记录的是 WorkBuddy 当前登录账号，与 CodeBuddy
+    // 端不一致时会把 WorkBuddy 的 uid 写进 CodeBuddy 槽位 meta）。
+    let uid = live_login_uid(sess);
+
+    // 槽位身份对齐守卫（2026-10-30 实测）：客户端把无效会话回退到账号 A 后，流程仍按
+    // 「检测到的目标 A'」把现场写进 A' 槽位，结果 A' 槽里装的是 A 的登录态（槽 meta.uid
+    // 与槽位账号不符，下次切换必然失败）。具名槽位写入前比对原有 meta.uid 与当前 live
+    // 身份，不一致就跳过；last/last.bak 是"当前现场"备份，放行。
+    if is_named_slot(slot) {
+        if let (Some(live), Some(prev)) = (uid.as_deref(), read_slot_meta_uid(&dest)) {
+            if prev != live {
+                sink.step(
+                    "backup",
+                    StepStatus::Warn,
+                    &format!(
+                        "槽位 {slot} 原有登录身份 {prev}，与客户端当前实际登录 {live} 不一致，\
+                         已跳过回写（防止把别的账号登录态写进该槽位）；请确认客户端已登录目标账号后重试"
+                    ),
+                );
+                return Ok(());
+            }
+        }
+    }
+
     // 单代回滚保护（对齐豆包：覆盖前挪 .bak）
     copy::rotate_bak(&dest, slot, sink);
     std::fs::create_dir_all(dest.join("auth")).map_err(|e| format!("创建快照目录失败: {e}"))?;
@@ -174,30 +260,9 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
         }
     }
 
-    // L2 体验：~\<app_data>\storage\user-<uid>* 目录
-    // CodeBuddy 系（CN/AI）登录真源在自身 vscdb，与 WorkBuddy 共享的 auth 文件
-    // **无关**——该文件记录的是 WorkBuddy 当前登录账号。旧实现无条件先读 auth 文件，
-    // 导致 CodeBuddy 端账号与 WorkBuddy 端不一致时把 WorkBuddy 的 uid 写进 CodeBuddy
-    // 槽位 meta.json（2026-10-25 实测：wb-942afcc2655a 槽 meta.uid=18448c06（WorkBuddy
-    // 的橡皮4）而槽内 vscdb genie=3e385602（橡皮2）；wb-ab99a7e0848e 槽同理），
-    // confirm_switch 以该 uid 当期望值 → 客户端明明登进了目标账号也被判「已回退到
-    // 其他账号」。改为 CodeBuddy 系优先读 genie.userId，缺失才回退 auth 文件。
-    let uid = if matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
-        sess.prof
-            .cb_global_storage_dir
-            .as_ref()
-            .and_then(|gs_dir| {
-                let raw =
-                    crate::fs_utils::read_json::<serde_json::Value>(&gs_dir.join("storage.json"));
-                crate::fs_utils::dig(&raw, &["genie.userId"])
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            })
-            .or_else(|| auth_file_uid(&auth_file))
-    } else {
-        auth_file_uid(&auth_file)
-    };
+    // L2 体验：~\<app_data>\storage\user-<uid>* 目录（uid 见函数开头的 live_login_uid；
+    // CodeBuddy 系不从共享 auth 文件取号——那是 WorkBuddy 的登录账号，2026-10-25 实测
+    // 会把 WorkBuddy 的 uid 写进 CodeBuddy 槽位 meta，导致确认期误判「已回退」）
     match &uid {
         Some(uid) => {
             let storage_dir = sess.prof.data_dir.join("storage");
@@ -420,6 +485,19 @@ pub fn restore_authfile(
         }
         restored += 1;
         sink.step("restore", StepStatus::Ok, "L1 auth 文件已恢复");
+
+        // 清除客户端的「登出标记」（2026-10-30 实测）：客户端登出时会写
+        // `{auth}.logged-out`，启动时读到它就 `Auth logout marker found, ignoring
+        // stored session` —— 恢复进去的登录态被**静默忽略**，表现为「切换成功但客户端
+        // 一直未登录」。一次切到失效快照就会留下该标记，此后本端所有切换全部失效，
+        // 故必须在恢复后无条件清掉。
+        if clear_logout_marker(&auth_file) {
+            sink.step(
+                "restore",
+                StepStatus::Ok,
+                "已清除客户端登出标记（.logged-out）：否则客户端会忽略恢复的登录态",
+            );
+        }
 
         // 回写校验：确认落盘内容确为目标账号（防复制中途失败或复制后立即被其他进程回写）
         let want_uid = auth_file_uid(&auth_src);
@@ -872,18 +950,19 @@ pub fn slot_marked_bootstrap(sess: &Session, slot: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 读取 authfile 槽位 meta.json 的（快照保存时间 ms, 最近一次切换验证失败时间 ms）。
-/// 旧快照只有 `savedAt`（本地时间字符串）→ 宽松解析回填；损坏/缺失返回 (None, None)。
+/// 读取 authfile 槽位 meta.json 的（快照保存时间 ms, 最近一次身份不符/回退 ms,
+/// 最近一次确认超时 ms）。旧快照只有 `savedAt`（本地时间字符串）→ 宽松解析回填；
+/// 损坏/缺失返回 (None, None, None)。
 pub(crate) fn read_slot_snapshot_meta(
     profiles_dir: &std::path::Path,
     slot: &str,
-) -> (Option<i64>, Option<i64>) {
+) -> (Option<i64>, Option<i64>, Option<i64>) {
     let path = profiles_dir.join(slot).join("meta.json");
     let Ok(raw) = std::fs::read_to_string(&path) else {
-        return (None, None);
+        return (None, None, None);
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')) else {
-        return (None, None);
+        return (None, None, None);
     };
     let saved_ms = v
         .get("savedAtMs")
@@ -897,12 +976,23 @@ pub(crate) fn read_slot_snapshot_meta(
     (
         saved_ms,
         v.get("verifyFailedAtMs").and_then(|x| x.as_i64()),
+        v.get("verifyTimeoutAtMs").and_then(|x| x.as_i64()),
     )
 }
 
-/// 标记「切换到该账号时客户端未确认登录」（authfile 布局，Buddy/BuddyAI 共用）。
-/// 只读改写槽位 meta.json；槽位不存在时静默跳过。
+/// 标记「切换到该账号时客户端未确认登录（身份不符/回退）」。只读改写槽位 meta.json；
+/// 槽位不存在时静默跳过。
 pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
+    mark_slot_key(profiles_dir, slot, "verifyFailedAtMs");
+}
+
+/// 标记「切换后确认登录超时」（确定性不如身份不符：慢启动/NEED_REFRESH 也可能超时）。
+/// 与 verifyFailedAtMs 分开落盘，前端据此用黄标而非红标，减少慢启动误报。
+pub(crate) fn mark_snapshot_timeout(profiles_dir: &std::path::Path, slot: &str) {
+    mark_slot_key(profiles_dir, slot, "verifyTimeoutAtMs");
+}
+
+fn mark_slot_key(profiles_dir: &std::path::Path, slot: &str, key: &str) {
     let path = profiles_dir.join(slot).join("meta.json");
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return;
@@ -913,14 +1003,22 @@ pub(crate) fn mark_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: 
     let Some(obj) = v.as_object_mut() else {
         return;
     };
+    // 最新一次复核结果覆盖旧标记：超时可把历史红标降级为黄标，反之亦然，
+    // 避免上一轮的标记在下一轮已重新切换后永久残留
+    let other = if key == "verifyFailedAtMs" {
+        "verifyTimeoutAtMs"
+    } else {
+        "verifyFailedAtMs"
+    };
+    obj.remove(other);
     obj.insert(
-        "verifyFailedAtMs".into(),
+        key.into(),
         serde_json::json!(chrono::Utc::now().timestamp_millis()),
     );
-    let _ = std::fs::write(&path, v.to_string());
+    let _ = crate::fs_utils::write_text_atomic(&path, &v.to_string());
 }
 
-/// 清除切换验证失败标记（确认登录成功或重新保存快照时）。
+/// 清除切换验证标记（身份不符 / 超时均清；确认登录成功或重新保存快照时）。
 pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
     let path = profiles_dir.join(slot).join("meta.json");
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -932,9 +1030,28 @@ pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &std::path::Path, slot:
     let Some(obj) = v.as_object_mut() else {
         return;
     };
-    if obj.remove("verifyFailedAtMs").is_some() {
-        let _ = std::fs::write(&path, v.to_string());
+    let removed = obj.remove("verifyFailedAtMs").is_some()
+        | obj.remove("verifyTimeoutAtMs").is_some();
+    if removed {
+        let _ = crate::fs_utils::write_text_atomic(&path, &v.to_string());
     }
+}
+
+/// 客户端「登出标记」路径：`{auth_file}.logged-out`（客户端登出时写入，启动时据此
+/// 忽略已存登录态）。用 OsString 拼接，避免 display() 对非 UTF-8 路径 lossy。
+fn logout_marker_path(auth_file: &Path) -> PathBuf {
+    let mut p = auth_file.as_os_str().to_os_string();
+    p.push(".logged-out");
+    PathBuf::from(p)
+}
+
+/// 删除登出标记；返回 true = 确实删除了（供日志用）
+fn clear_logout_marker(auth_file: &Path) -> bool {
+    let marker = logout_marker_path(auth_file);
+    if marker.exists() && std::fs::remove_file(&marker).is_ok() {
+        return true;
+    }
+    false
 }
 
 /// 切换确认结果（PS 返回 'ok'/'timeout'）
@@ -962,20 +1079,65 @@ pub enum VerifyResult {
 /// 无 skeleton 的应用额外要求 mtime 偏离恢复落盘锚点——防恢复内容原样躺着的假阳性
 ///（实测 4 秒即"确认成功"而客户端根本未接受登录）。
 /// fail-open：超时仅警告不判失败（快照已恢复、客户端已启动）。
-pub fn confirm_switch(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> VerifyResult {
-    let result = confirm_switch_inner(sess, slot, sink);
-    // 账号列表「快照异常」徽标数据源：失败（超时/身份回退）打标，确认成功清除
+/// 30 秒窗口是**故意保留**的：切换失败需要人工登录时，用户有 30 秒在客户端里登录，
+/// 一旦登录成功信号①（快照 uid）立刻命中即确认。做得快的前提是「成功能立刻看见」，
+/// 不是把窗口缩短——缩短会让「需要人工登录」的场景来不及确认。
+/// skeleton 登录快照 → 当前登录 uid。
+/// 现版本客户端结构：`{"primary":{"uid":"…","nickname":"…","savedAt":…}}`；
+/// 旧结构把 uid 放顶层 / `account.uid` / `accountId`。
+/// **2026-10-30 修复**：旧实现只读后三者，现版本一个都读不到 → 信号①恒不命中；
+/// 而信号②要求客户端重写 auth 文件，实测客户端从不回写（auth mtime 停在旧日期），
+/// 于是 WorkBuddy 切换「实际成功」也必然走到 30 秒超时。`primary` 优先、旧键兜底。
+fn snapshot_uid_of(j: &serde_json::Value) -> Option<String> {
+    snapshot_field(j, "uid", &["uid", "accountId"])
+}
+
+/// 登录快照字段取值（`primary` 优先，旧平铺键兜底）。
+/// `pub(crate)`：账号列表/环境检测（commands/workbuddy/accounts.rs）复用同一份解析，
+/// 避免两处各写一套键序而漂移。
+pub(crate) fn snapshot_field(
+    j: &serde_json::Value,
+    key: &str,
+    legacy: &[&str],
+) -> Option<String> {
+    j.get("primary")
+        .and_then(|p| p.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            crate::fs_utils::dig(j, legacy)
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+pub fn confirm_switch(
+    sess: &Session,
+    slot: &str,
+    sink: &dyn ProgressSink,
+    launched_at: std::time::SystemTime,
+) -> VerifyResult {
+    let result = confirm_switch_inner(sess, slot, sink, launched_at);
+    // 账号列表快照徽标数据源：身份不符/回退 → 红（verifyFailedAtMs）；超时 →
+    // 黄（verifyTimeoutAtMs，fail-open 语义下慢启动也会超时，不与身份不符同判）；
+    // 确认成功 → 两类标记都清除
     match result {
         VerifyResult::Ok => clear_snapshot_verify_failed(&sess.prof.profiles_dir, slot),
-        VerifyResult::Timeout | VerifyResult::Reverted => {
-            mark_snapshot_verify_failed(&sess.prof.profiles_dir, slot)
-        }
+        VerifyResult::Reverted => mark_snapshot_verify_failed(&sess.prof.profiles_dir, slot),
+        VerifyResult::Timeout => mark_snapshot_timeout(&sess.prof.profiles_dir, slot),
     }
     result
 }
 
 /// 切换后轮询确认（真正的实现，见上方注释）。
-fn confirm_switch_inner(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> VerifyResult {
+fn confirm_switch_inner(
+    sess: &Session,
+    slot: &str,
+    sink: &dyn ProgressSink,
+    launched_at: std::time::SystemTime,
+) -> VerifyResult {
     let auth_file = &sess.auth_file;
     let snap_file = sess.prof.data_dir.join("storage").join("skeleton").join("account-snapshot.json");
     let meta_file = sess.prof.profiles_dir.join(slot).join("meta.json");
@@ -1059,15 +1221,48 @@ fn confirm_switch_inner(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> 
     let mut revert_warned = false;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_secs(2));
+        // 会话已死优先于一切「已重写」信号（2026-10-30 实测）：客户端启动后若因 401
+        // 自行登出，同样会写 vscdb / auth 文件——不先判死，登出就会被当成切换成功
+        //（橡皮3 槽位因此被回写成未登录态）。
+        // 仅 CodeBuddy 提前判：它的日志按启动分目录、无跨会话污染；WorkBuddy 主线程
+        // 日志跨启动累积（同一文件），启动初期尾部可能仍是上一次运行的内容，提前判
+        // 有误报风险——WorkBuddy 仍由 `.logged-out` 标记（早判）+ 超时归因（晚判）覆盖。
+        let check_dead_early = matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI");
+        if check_dead_early && client_log_says_session_dead(&sess.prof.data_dir, Some(launched_at)) {
+            sink.step(
+                "verify",
+                StepStatus::Warn,
+                &format!(
+                    "客户端本次启动已自行登出（登录会话被服务端注销）：恢复的登录态不可用，\
+                     请重新登录 {} 后「保存当前登录态」（刷新凭证无效）",
+                    sess.prof.app_name
+                ),
+            );
+            return VerifyResult::Reverted;
+        }
         // 信号②：共享 auth 文件 uid（仅 WorkBuddy；连续两次命中才确认）
         let auth_uid = if check_auth { auth_file_uid(&auth_file) } else { None };
         let mut auth_rewritten = true;
-        if !has_snap_dir {
+        if !has_snap_dir || check_auth {
+            // 2026-10-30 实测修正：auth 文件就是我们刚复制进去的副本，uid 必然等于目标，
+            // 「连续两次命中」会立刻成立（4 秒假成功 → 客户端其实没登录）。故 WorkBuddy
+            // 系一律要求客户端确实重写过该文件（mtime 偏离恢复锚点），不再只在无 skeleton
+            // 时要求。
             auth_rewritten = std::fs::metadata(&auth_file)
                 .and_then(|m| m.modified())
                 .ok()
                 .map(|t| Some(t) != restore_mtime)
                 .unwrap_or(false);
+        }
+        // 登出标记重新出现 = 客户端拒绝恢复的登录态并主动登出（多半是服务端会话已注销）。
+        // 恢复阶段已无条件清除该标记，此处再出现即客户端自己写的，直接判失败不再空等 30 秒。
+        if check_auth && logout_marker_path(&auth_file).exists() {
+            sink.step(
+                "verify",
+                StepStatus::Warn,
+                "客户端已登出（检测到 .logged-out 标记）：恢复的登录态被拒绝，通常意味着服务端会话已被注销，需要重新登录该账号",
+            );
+            return VerifyResult::Reverted;
         }
         // 信号③（仅 CodeBuddy）：客户端启动后重写自身登录库（vscdb mtime 偏离恢复锚点）
         let vscdb_rewritten = match (vscdb_file.as_deref(), vscdb_mtime) {
@@ -1091,7 +1286,12 @@ fn confirm_switch_inner(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> 
             }
         } else {
             auth_hits = 0;
-            if check_auth && auth_uid.is_some() && !revert_warned {
+            // 只在「uid 确实与目标不同」时告警：uid 相同但客户端尚未重写文件属于
+            // 等待期（信号①会先确认），此前无条件告警会打出「与目标不一致」的假消息
+            if check_auth
+                && auth_uid.as_deref().is_some_and(|u| u != expect_uid)
+                && !revert_warned
+            {
                 revert_warned = true;
                 let short: String = auth_uid
                     .as_deref()
@@ -1115,15 +1315,7 @@ fn confirm_switch_inner(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> 
                 if let Ok(j) = serde_json::from_str::<serde_json::Value>(
                     raw.trim_start_matches('\u{feff}'),
                 ) {
-                    let uid = [
-                        j.get("uid"),
-                        j.get("account").and_then(|a| a.get("uid")),
-                        j.get("accountId"),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .find_map(|v| v.as_str().map(|s| s.to_string()));
-                    if uid.as_deref() == Some(expect_uid.as_str()) {
+                    if snapshot_uid_of(&j).as_deref() == Some(expect_uid.as_str()) {
                         return confirm_ok(sess, slot, &expect_uid, sink);
                     }
                 }
@@ -1159,7 +1351,142 @@ fn confirm_switch_inner(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> 
             "30 秒内未确认到目标 uid（客户端可能未启动/未联网），请打开客户端核实",
         );
     }
+    // 归因（2026-10-30）：客户端日志里出现 invalid_grant / Offline user session /
+    // Auth logout marker found → 服务端会话已被注销，本地怎么修都没用，只能重新登录。
+    // 判红（而非黄）以免用户反复重试无效切换。
+    if client_log_says_session_dead(&sess.prof.data_dir, Some(launched_at)) {
+        sink.step(
+            "verify",
+            StepStatus::Warn,
+            &format!(
+                "客户端日志显示登录会话已被服务端注销（invalid_grant / 登出标记），恢复的登录态无法使用：\
+                 请重新登录 {} 后「保存当前登录态」（刷新凭证无效）",
+                sess.prof.app_name
+            ),
+        );
+        return VerifyResult::Reverted;
+    }
     VerifyResult::Timeout
+}
+
+/// 会话已死的判定标记：任一命中即认为本次启动的登录态已被服务端注销。
+/// - WorkBuddy 主线程日志：刷新令牌被拒（invalid_grant）/ 离线会话 / 登出标记；
+/// - CodeBuddy 插件日志：会话过期主动登出 / 刷新令牌 401（主进程只写 "Logout started"，
+///   真正的判据在插件日志，2026-10-30 实测 橡皮3 即此形态）。
+const SESSION_DEAD_MARKERS: [&str; 6] = [
+    "invalid_grant",
+    "Offline user session",
+    "Auth logout marker found",
+    "session expired logout triggered",
+    "401 code logout",
+    "/v2/plugin/auth/token/refresh | Status: 401",
+];
+
+/// 读日志尾部（最多 `tail_bytes`，非法 UTF-8 宽松解码）
+fn read_log_tail(path: &Path, tail_bytes: usize) -> Option<String> {
+    // 只读尾部：confirm 每 2s 轮询一次，全量 read 会在大日志（可上百 MB）上
+    // 把 30s 确认窗口的 IO 放大几十倍。seek 到 len-tail 处读即可。
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(tail_bytes as u64);
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// 递归收集 dir 下最新的 `limit` 个 .log（按 mtime 降序；限深 4）
+fn newest_log_files(dir: &Path, limit: usize) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<(std::time::SystemTime, PathBuf)>, depth: usize) {
+        if depth > 4 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out, depth + 1);
+            } else if p.extension().map(|x| x.eq_ignore_ascii_case("log")).unwrap_or(false) {
+                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                    out.push((m, p));
+                }
+            }
+        }
+    }
+    let mut all = Vec::new();
+    walk(dir, &mut all, 0);
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.into_iter().take(limit).map(|(_, p)| p).collect()
+}
+
+/// 本次启动对应的日志文件（只认启动时间之后写过的，避免读到上一次运行的登出记录）：
+/// - WorkBuddy：`logs/<日期>/workbuddyMainThread__*.log`（目录按天，文件按启动，不能按目录取最新）；
+/// - CodeBuddy：`logs/<YYYYMMDDTHHMMSS>/main.log` + 该会话目录下最新若干插件日志。
+fn launch_log_files(logs_root: &Path, not_before: Option<std::time::SystemTime>) -> Vec<PathBuf> {
+    let fresh = |m: std::time::SystemTime| not_before.map(|b| m >= b).unwrap_or(true);
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut wb_best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut cb_best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let Ok(entries) = std::fs::read_dir(logs_root) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        // CodeBuddy 会话目录名：20261030T042344（日期+T+时间）
+        let name = e.file_name().to_string_lossy().to_string();
+        let is_cb_session = name.len() >= 9
+            && name.contains('T')
+            && name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+        if is_cb_session {
+            if let Ok(m) = std::fs::metadata(&p).and_then(|m| m.modified()) {
+                if fresh(m) && cb_best.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+                    cb_best = Some((m, p.clone()));
+                }
+            }
+        }
+        let Ok(files) = std::fs::read_dir(&p) else { continue };
+        for f in files.flatten() {
+            let fname = f.file_name().to_string_lossy().to_string();
+            if !fname.starts_with("workbuddyMainThread") {
+                continue;
+            }
+            let Ok(m) = f.metadata().and_then(|m| m.modified()) else { continue };
+            if fresh(m) && wb_best.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+                wb_best = Some((m, f.path()));
+            }
+        }
+    }
+    if let Some((_, p)) = wb_best {
+        out.push(p);
+    }
+    if let Some((_, dir)) = cb_best {
+        let main = dir.join("main.log");
+        if main.is_file() {
+            out.push(main);
+        }
+        for p in newest_log_files(&dir, 8) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// 扫客户端本次启动的日志，判断是否出现「登录会话已被服务端注销」证据。
+/// `not_before`：启动锚点（取 start_app 之前的时间），用于排除上一次运行的残留日志。
+pub(crate) fn client_log_says_session_dead(
+    data_dir: &Path,
+    not_before: Option<std::time::SystemTime>,
+) -> bool {
+    let logs_root = data_dir.join("logs");
+    launch_log_files(&logs_root, not_before).iter().any(|p| {
+        read_log_tail(p, 128 * 1024)
+            .map(|tail| SESSION_DEAD_MARKERS.iter().any(|m| tail.contains(m)))
+            .unwrap_or(false)
+    })
 }
 
 /// 确认收尾 + 信号④ live 身份复核（仅 CodeBuddy）。
@@ -1220,6 +1547,34 @@ mod tests {
     struct QuietSink;
     impl ProgressSink for QuietSink {
         fn step(&self, _: &str, _: StepStatus, _: &str) {}
+    }
+
+    /// 登出标记路径与清理（2026-10-30 实测事故的回归锁）：
+    /// 标记存在时客户端会忽略恢复的登录态，恢复流程必须能把它清掉。
+    #[test]
+    fn 登出标记路径与清理() {
+        let dir = std::env::temp_dir().join(format!(
+            "sw-auth-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth = dir.join(WB_AUTH_FILE_NAME);
+        std::fs::write(&auth, "{}").unwrap();
+        let marker = logout_marker_path(&auth);
+        assert_eq!(
+            marker.file_name().unwrap().to_string_lossy(),
+            "workbuddy-desktop.info.logged-out"
+        );
+        // 无标记 → 不报删除
+        assert!(!clear_logout_marker(&auth));
+        std::fs::write(&marker, "uuid").unwrap();
+        assert!(clear_logout_marker(&auth), "标记存在时必须删除成功");
+        assert!(!marker.exists(), "标记应已被删除");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Session 构造：auth 路径注入临时目录（不触碰真实 auth 文件），
@@ -1295,6 +1650,91 @@ mod tests {
         // 建快照但缺 auth 文件 → 中止
         std::fs::create_dir_all(sess.prof.profiles_dir.join("100")).unwrap();
         assert!(restore_authfile(&sess, "100", &sink).is_err());
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 2026-10-30 实测形态：客户端把无效会话回退到账号 A（live uid 变成 A），流程仍按
+    /// 「检测到的目标 A'」把现场写进 A' 槽位 → 槽里装的是 A 的登录态（meta.uid 与槽位
+    /// 账号不符，切回来必失败）。守卫必须在写入前拒绝，且不动原槽位。
+    #[test]
+    fn 备份拒绝对身份不一致的具名槽位写入() {
+        let _guard = test_io_lock();
+        let sess = session(TargetApp::WorkBuddy, "identity-guard");
+        let sink = QuietSink;
+        let slot = "100";
+        let slot_dir = sess.prof.profiles_dir.join(slot);
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        std::fs::write(slot_dir.join("meta.json"), r#"{"uid":"uid-x"}"#).unwrap();
+        std::fs::create_dir_all(&sess.auth_dir).unwrap();
+        std::fs::write(&sess.auth_file, r#"{"account":{"uid":"uid-y"}}"#).unwrap();
+
+        backup_authfile(&sess, slot, &sink).expect("身份不符应跳过并返回 Ok");
+        let meta = std::fs::read_to_string(slot_dir.join("meta.json")).unwrap();
+        assert!(meta.contains("uid-x"), "槽位 meta 不得被改写：{meta}");
+        assert!(
+            !slot_dir.join("auth").join(WB_AUTH_FILE_NAME).exists(),
+            "身份不符时不得写入 auth 文件"
+        );
+
+        // last 是「当前现场」备份槽，不参与身份对齐守卫
+        backup_authfile(&sess, "last", &sink).unwrap();
+        assert!(sess
+            .prof
+            .profiles_dir
+            .join("last")
+            .join("auth")
+            .join(WB_AUTH_FILE_NAME)
+            .exists());
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 2026-11-01 审查修复回归：live_login_uid WorkBuddy 系 skeleton 优先——客户端
+    /// 登录后只重写 skeleton 快照、不回写 auth 文件（auth 停在上个账号），槽位身份
+    /// 守卫必须采用 skeleton primary.uid；skeleton 缺失/损坏才回退 auth 文件 uid。
+    #[test]
+    fn 备份守卫采用skeleton身份而非陈旧auth文件() {
+        let _guard = test_io_lock();
+        let sess = session(TargetApp::WorkBuddy, "skeleton-live");
+        let sink = QuietSink;
+        // live 现场两层信号刻意错开：skeleton primary.uid = uid-skel（客户端刚登录），
+        // auth 文件停留上个账号 uid-auth（客户端从不回写）
+        let skeleton = sess.prof.data_dir.join("storage").join("skeleton");
+        std::fs::create_dir_all(&skeleton).unwrap();
+        std::fs::write(
+            skeleton.join("account-snapshot.json"),
+            r#"{"primary":{"uid":"uid-skel","nickname":"K","savedAt":123}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&sess.auth_dir).unwrap();
+        std::fs::write(&sess.auth_file, r#"{"account":{"uid":"uid-auth"}}"#).unwrap();
+
+        // 槽位 meta.uid = uid-skel：守卫按 skeleton 判一致 → 放行
+        //（若误用 auth 文件的 uid-auth 会误拦）
+        let slot = "100";
+        let slot_dir = sess.prof.profiles_dir.join(slot);
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        std::fs::write(slot_dir.join("meta.json"), r#"{"uid":"uid-skel"}"#).unwrap();
+        backup_authfile(&sess, slot, &sink).unwrap();
+        assert!(
+            slot_dir.join("auth").join(WB_AUTH_FILE_NAME).exists(),
+            "skeleton 身份与槽位一致时应放行备份"
+        );
+
+        // 对照：槽位 meta.uid = uid-auth（auth 文件视角一致、skeleton 视角不符）
+        // → 守卫按 skeleton 身份拒绝，且不动原槽位
+        let _ = std::fs::remove_dir_all(&slot_dir);
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        std::fs::write(slot_dir.join("meta.json"), r#"{"uid":"uid-auth"}"#).unwrap();
+        backup_authfile(&sess, slot, &sink).unwrap();
+        let meta = std::fs::read_to_string(slot_dir.join("meta.json")).unwrap();
+        assert!(
+            meta.contains("uid-auth"),
+            "守卫按 skeleton 身份拒绝时槽位 meta 不得被改写：{meta}"
+        );
+        assert!(
+            !slot_dir.join("auth").join(WB_AUTH_FILE_NAME).exists(),
+            "skeleton 身份不符时不得写入 auth 文件"
+        );
         let _ = std::fs::remove_dir_all(&sess.data_dir);
     }
 
@@ -1441,6 +1881,157 @@ mod tests {
         let no_tok = Creds { access_token: String::new(), ..test_creds() };
         assert!(synthesize_auth_snapshot(&sess, "wb-new", &no_tok, &sink).is_none());
         assert!(!sess.prof.profiles_dir.join("wb-new").exists());
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 2026-10-30：现版本客户端快照把身份嵌在 `primary` 下。旧实现只读顶层
+    /// `uid`/`account.uid`/`accountId` → 返回 None → 信号①恒不命中，WorkBuddy
+    /// 实际切成功也只会在 30 秒后报「未确认」。
+    #[test]
+    fn snapshot_uid_reads_primary_and_legacy_shapes() {
+        // 本机 2026-10-30 实测结构
+        let cur = serde_json::json!({
+            "primary": {
+                "version": 1,
+                "uid": "a5e7e8f5-d1ff-4d54-a106-a54c5b3cb2e4",
+                "nickname": "橡皮",
+                "savedAt": 1_793_303_935_381_i64
+            }
+        });
+        assert_eq!(
+            snapshot_uid_of(&cur).as_deref(),
+            Some("a5e7e8f5-d1ff-4d54-a106-a54c5b3cb2e4"),
+            "primary.uid 必须能读到（本次修复的核心）"
+        );
+        // 旧平铺结构保持兼容
+        assert_eq!(snapshot_uid_of(&serde_json::json!({"uid": "u1"})).as_deref(), Some("u1"));
+        assert_eq!(
+            snapshot_uid_of(&serde_json::json!({"account": {"uid": "u2"}})).as_deref(),
+            Some("u2")
+        );
+        assert_eq!(
+            snapshot_uid_of(&serde_json::json!({"accountId": "u3"})).as_deref(),
+            Some("u3")
+        );
+        // 空串 / 缺失不得产生假命中
+        assert_eq!(snapshot_uid_of(&serde_json::json!({"primary": {"uid": ""}})), None);
+        assert_eq!(snapshot_uid_of(&serde_json::json!({})), None);
+    }
+
+    /// 临时日志根目录（测试隔离）
+    fn tmp_log_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sw-wblogs-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// 2026-10-30 实测形态：CodeBuddy 会话被服务端注销后，客户端启动 4 秒即自行登出。
+    /// 主进程日志只有 "Logout started"（不足以判定），插件日志才有 401 刷新失败 → 必须判死，
+    /// 否则「登出写 vscdb」会被当成切换成功。
+    #[test]
+    fn session_dead_detects_codebuddy_logout() {
+        let _guard = test_io_lock();
+        let dir = tmp_log_dir("cb-dead");
+        let sess = dir.join("logs").join("20261030T042344");
+        let ext = sess.join("window1").join("exthost").join("Tencent-Cloud.coding-copilot");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(
+            sess.join("main.log"),
+            "2026-10-30 04:23:48.991 [AuthMainService][IDE-NATIVE-AUTH] Logout started in IDE main process\n",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(
+            !client_log_says_session_dead(&dir, None),
+            "只有 Logout started、没有 401 归因时不得判死（防误判）"
+        );
+        std::fs::write(
+            ext.join("腾讯云代码助手.log"),
+            "2026-10-30 04:23:48.925 401 code logout, url: /v2/plugin/auth/token/refresh\n\
+             2026-10-30 04:23:48.925 [AuthenticationManager] session expired logout triggered\n",
+        )
+        .unwrap();
+        assert!(client_log_says_session_dead(&dir, None), "401 刷新失败 + 主动登出 = 会话已死");
+        // 启动锚点晚于日志写入 → 属于上一次运行的残留，不判死
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(!client_log_says_session_dead(&dir, Some(later)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WorkBuddy 侧：主线程日志出现 invalid_grant / 登出标记即判死
+    #[test]
+    fn session_dead_detects_workbuddy_invalid_grant() {
+        let _guard = test_io_lock();
+        let dir = tmp_log_dir("wb-dead");
+        let day = dir.join("logs").join("2026-10-30");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join("workbuddyMainThread__abc.log"),
+            "token refresh failed: invalid_grant\n",
+        )
+        .unwrap();
+        assert!(client_log_says_session_dead(&dir, None));
+        // 换一天的新目录（无标记）→ 不判死
+        let day2 = dir.join("logs").join("2026-10-31");
+        std::fs::create_dir_all(&day2).unwrap();
+        std::fs::write(day2.join("workbuddyMainThread__def.log"), "all good\n").unwrap();
+        assert!(
+            !client_log_says_session_dead(&dir, None),
+            "只认最新一次启动的日志，旧会话的登出记录不得跨会话误判"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-30 回归：现版本客户端只重写 skeleton 快照（primary.uid），不回写 auth 文件。
+    /// 确认必须在第一个轮询周期就成功，而不是空等 30 秒后报「未确认」。
+    #[test]
+    fn 确认信号一_primary快照首轮即确认() {
+        let _guard = test_io_lock();
+        let sess = session(TargetApp::WorkBuddy, "confirm-primary");
+        let sink = QuietSink;
+        let target = "a5e7e8f5-0000-4000-8000-000000000001";
+        let slot = "wb-target";
+        let slot_dir = sess.prof.profiles_dir.join(slot);
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        std::fs::write(slot_dir.join("meta.json"), format!(r#"{{"uid":"{target}"}}"#)).unwrap();
+        // 恢复落盘的 auth 文件（uid 已是目标；客户端不会再写它 → mtime 不变）
+        std::fs::create_dir_all(&sess.auth_dir).unwrap();
+        std::fs::write(
+            &sess.auth_file,
+            format!(r#"{{"account":{{"uid":"{target}"}}}}"#),
+        )
+        .unwrap();
+        // 客户端接受恢复的登录态后重写 skeleton 快照（现版本 primary 包裹）
+        let snap = sess
+            .prof
+            .data_dir
+            .join("storage")
+            .join("skeleton")
+            .join("account-snapshot.json");
+        std::fs::create_dir_all(snap.parent().unwrap()).unwrap();
+        std::fs::write(
+            &snap,
+            format!(r#"{{"primary":{{"uid":"{target}","savedAt":1793303935381}}}}"#),
+        )
+        .unwrap();
+        let t0 = std::time::Instant::now();
+        let r = confirm_switch(&sess, slot, &sink, std::time::SystemTime::now());
+        assert!(
+            matches!(r, VerifyResult::Ok),
+            "primary 快照命中应确认成功（修复前信号①恒不命中，只能 30s 超时）"
+        );
+        assert!(
+            t0.elapsed().as_secs() < 10,
+            "应在第一个轮询周期内确认，实际 {:?}",
+            t0.elapsed()
+        );
         let _ = std::fs::remove_dir_all(&sess.data_dir);
     }
 }
