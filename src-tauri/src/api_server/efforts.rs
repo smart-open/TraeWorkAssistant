@@ -90,9 +90,14 @@ pub fn trae_declared_unified(canonical: &str) -> Vec<String> {
 /// 非模型名变体；支持集取官方文档 Max Mode 1M 上下文档（原
 /// unified_catalog::MAX_MODE_1M 占位迁入，单一事实源）。
 /// 表外模型不注入（未知字段不冒进，与 effort 实证表同规）
-pub const TRAE_MAX_MODE_REF: [&str; 11] = [
+///
+/// glm-5.3-flash（issue #176，2026-11-03 实证补入）：官方客户端提供 Max 开关
+/// （用户截图，开启后 1M）+ 官网同步声明 `context_window_tokens.max = 1M`
+/// + 注入形态与 glm-5.3 同款（issue #38 矩阵 200），三证据闭环入表。
+pub const TRAE_MAX_MODE_REF: [&str; 12] = [
     "doubao-seed-evolving",
     "glm-5.3",
+    "glm-5.3-flash",
     "glm-5.2",
     "deepseek-v4-pro",
     "deepseek-v4-pro-official",
@@ -277,10 +282,11 @@ mod tests {
     #[test]
     fn t07_max_mode_supported() {
         assert!(trae_max_mode_supported("glm-5.3"));
+        assert!(trae_max_mode_supported("glm-5.3-flash"));
         assert!(trae_max_mode_supported("qwen3.8-max"));
         assert!(trae_max_mode_supported("doubao-seed-evolving"));
         assert!(!trae_max_mode_supported("doubao-seed-code"));
-        assert!(!trae_max_mode_supported("glm-5.3-flash"));
+        assert!(!trae_max_mode_supported("glm-5.3-flashx"));
         assert!(!trae_max_mode_supported(""));
     }
 }
