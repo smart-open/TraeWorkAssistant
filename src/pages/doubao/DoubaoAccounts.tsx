@@ -130,11 +130,13 @@ export default function DoubaoAccounts() {
   const reload = async (notifyExpiry = false) => {
     setLoading(true);
     try {
-      // 看板统计与账号列表并行拉取（失败不影响主列表）
+      // 看板统计与账号列表并行拉取（失败保留旧值：看板不因单次失败整块消失）
       void api.doubao
         .dashboardStats()
         .then(setStats)
-        .catch(() => setStats(null));
+        .catch(() => {
+          /* 保留上次成功值，不置空看板 */
+        });
       const list = await api.doubao.accountsList();
       setAccounts(list);
       if (notifyExpiry) checkExpiry(list);
@@ -467,6 +469,8 @@ export default function DoubaoAccounts() {
   const anyBusy =
     renewRunning ||
     keepaliveRunning ||
+    !!quotaRunningFor ||
+    !!chatBusyFor ||
     ((!!switchingTo || !!savingLogin) && !lockTimedOut);
 
   /** 查询会员额度（需该账号已有会话凭证；成功后结果会缓存进账号池，徽标/悬停提示随之更新） */

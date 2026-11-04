@@ -382,7 +382,29 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
 
 /// 批量签到（调度器/CLI `--task-run doubao-checkin`）：遍历池内有凭证账号 → 签到 →
 /// 按日落库 + 池回写 + 运维历史 → 汇总。空池跳过（对齐 doubao-quota 惯例）。
+/// 跨进程轮次锁（对齐 wb-checkin try_acquire_wb_round 先例）：GUI 调度器与
+/// schtasks CLI 双进程互斥；Busy 幂等跳过、机制性失败 fail-closed。
 pub fn run_batch(state: &AppState) -> Result<Value, String> {
+    use crate::tasks::qoder_common::CrossProcLockFail;
+    let _cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+        &state.data_dir,
+        "doubao",
+        "checkin-round",
+        0,
+    ) {
+        (Some(g), _) => g,
+        (None, fail) => {
+            let fail = fail.unwrap_or(CrossProcLockFail::Busy);
+            if fail != CrossProcLockFail::Busy {
+                // 仅机制性失败（创建/等待系统错误）落日志；Busy 是正常互斥不刷屏
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("豆包签到轮次锁获取失败：{}", fail.describe()),
+                );
+            }
+            return Ok(json!({ "ok": true, "skipped": "其他进程正在执行签到，本轮跳过", "reason": fail.describe() }));
+        }
+    };
     let targets = collect_targets(state)?;
     if targets.is_empty() {
         return Ok(json!({ "ok": true, "skipped": "无豆包账号" }));

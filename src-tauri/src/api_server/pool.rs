@@ -822,6 +822,20 @@ impl ApiPool {
         self.note_error_until(uid, kind, None);
     }
 
+    /// 记录上游 429/SoftRate 限流（issue #178）：上游下发 Retry-After（秒）时以
+    /// now+Retry-After 为解冻时刻（走 [`Self::note_error_until`] 统一钳制
+    /// [now+60s, now+7d]，下限兜底防短退避解冻后立刻重试）；未下发时维持
+    /// SoftRate 默认 60s。其余 ErrKind 原样委托（各分类固定时长口径不变）。
+    pub fn note_error_retry_after(&self, uid: &str, kind: ErrKind, retry_after: Option<u64>) {
+        if kind == ErrKind::SoftRate {
+            if let Some(secs) = retry_after {
+                self.note_error_until(uid, kind, Some(now_ts() + secs.max(1) as i64));
+                return;
+            }
+        }
+        self.note_error(uid, kind);
+    }
+
     /// 记录错误并冷却，可携带上游文案解析出的**账号级**精确解冻时刻（issue #159）。
     /// 根因背景：单账号限额（6004/429 带解冻话术）此前会连带把模型级冷却表写至
     /// 解冻时刻 → 整池同名模型被 pool_health 跳过（无视其余健康账号）→ 回退池
@@ -970,10 +984,16 @@ impl ApiPool {
                 name: e.name.clone(),
                 credits: e.credits,
                 credits_expire_at: e.credits_expire_at,
+                // 过期时间戳不再外泄（契约清理：reason/hard_until 随冷却过期一并置空）
                 cooling: e.until > 0 && now < e.until,
-                cooldown_until: if e.until > 0 { Some(e.until) } else { None },
-                cooldown_reason: if e.reason.is_empty() { None } else { Some(e.reason.clone()) },
+                cooldown_until: if e.until > 0 && now < e.until { Some(e.until) } else { None },
+                cooldown_reason: if e.until > 0 && now < e.until && !e.reason.is_empty() {
+                    Some(e.reason.clone())
+                } else {
+                    None
+                },
                 hard_credit: e.hard_until > 0 && now < e.hard_until,
+                hard_until: if e.hard_until > 0 && now < e.hard_until { Some(e.hard_until) } else { None },
                 disabled: e.disabled,
                 err_count: e.err_count,
                 state: e.state_str(now).to_string(),
@@ -2128,6 +2148,48 @@ mod tests {
             let entries = safe_lock(&pool.entries);
             assert_eq!(entries.get("uid_a").unwrap().cb_trips, 0);
         }
+    }
+
+    #[test]
+    fn retry_after_soft_rate_sets_until() {
+        // issue #178：429 带上游 Retry-After（秒）→ 解冻时刻 = now+Retry-After
+        //（统一钳制口径内原样生效）；非 SoftRate 不受影响维持各分类默认时长
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        pool.note_error_retry_after("uid_a", ErrKind::SoftRate, Some(120));
+        let s = &pool.status_list()[0];
+        assert!(s.cooling);
+        let delta = s.cooldown_until.unwrap() - now_ts();
+        assert!((119..=121).contains(&delta), "Retry-After=120 应解冻于 ~120s，实际 {}s", delta);
+        // 极短退避被下限钳制到 60s（防解冻后立刻重试）
+        pool.clear_cooldowns();
+        pool.note_error_retry_after("uid_a", ErrKind::SoftRate, Some(0));
+        let clamped = pool.status_list()[0].cooldown_until.unwrap() - now_ts();
+        assert!((59..=61).contains(&clamped), "0s 退避应钳制到 ~60s，实际 {}s", clamped);
+        // 非 SoftRate 忽略 retry_after：用 PlanLimit 验证（单次失败即冷却 12h；
+        // Server 单次不冷却——熔断需连续 3 次，cooldown_until 为 None 断言不了）
+        pool.clear_cooldowns();
+        pool.note_error_retry_after("uid_a", ErrKind::PlanLimit, Some(5));
+        let plan_secs = pool.status_list()[0].cooldown_until.unwrap() - now_ts();
+        assert!(plan_secs > 1000, "PlanLimit 不应采用 5s Retry-After（应 12h 固定时长），实际 {}s", plan_secs);
+    }
+
+    #[test]
+    fn status_list_expires_stale_fields() {
+        // 契约清理：冷却过期后 reason/cooldown_until/hard_until 不再外泄 Some
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        {
+            let mut entries = safe_lock(&pool.entries);
+            let e = entries.get_mut("uid_a").unwrap();
+            e.until = now_ts() - 1; // 已过期的软冷却
+            e.reason = "soft_rate".to_string();
+            e.hard_until = now_ts() - 1; // 已过期的硬冷却
+        }
+        let s = &pool.status_list()[0];
+        assert!(!s.cooling);
+        assert!(!s.hard_credit);
+        assert!(s.cooldown_until.is_none(), "过期 cooldown_until 不应外泄");
+        assert!(s.cooldown_reason.is_none(), "过期 reason 不应外泄");
+        assert!(s.hard_until.is_none(), "过期 hard_until 不应外泄");
     }
 
     #[test]

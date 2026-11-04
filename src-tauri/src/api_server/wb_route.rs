@@ -1416,7 +1416,14 @@ fn run_wb_stream(
                                 // 账号级/模型级冷却解耦——模型级冷却仅对网关/模型级故障生效，
                                 // 防单账号限额文案把整池同名模型钉死 → 503
                                 let upstream = upstream_msg(&resp_body);
-                                let unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
+                                // issue #178：账号级解冻时刻——上游文案解析优先；
+                                // 429/SoftRate 未解析出时以 Retry-After（秒）为解冻基准
+                                let mut unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
+                                if unfreeze.is_none() && kind == ErrKind::SoftRate {
+                                    if let Some(secs) = retry_after {
+                                        unfreeze = Some(now_ts() + secs.max(1) as i64);
+                                    }
+                                }
                                 state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
@@ -1883,7 +1890,14 @@ pub async fn wb_aggregate_chat(
                                     // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
                                     // 账号级/模型级冷却解耦（口径同流式路径）
                                     let upstream = upstream_msg(&resp_body);
-                                    let unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
+                                    // issue #178：账号级解冻时刻——上游文案解析优先；
+                                    // 429/SoftRate 未解析出时以 Retry-After（秒）为解冻基准
+                                    let mut unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
+                                    if unfreeze.is_none() && kind == ErrKind::SoftRate {
+                                        if let Some(secs) = retry_after {
+                                            unfreeze = Some(now_ts() + secs.max(1) as i64);
+                                        }
+                                    }
                                     state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
                                     // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {
@@ -2392,7 +2406,14 @@ pub async fn wb_tool_exec_chat(
                                     // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
                                     // 账号级/模型级冷却解耦（口径同流式路径）
                                     let upstream = upstream_msg(&resp_body);
-                                    let unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
+                                    // issue #178：账号级解冻时刻——上游文案解析优先；
+                                    // 429/SoftRate 未解析出时以 Retry-After（秒）为解冻基准
+                                    let mut unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
+                                    if unfreeze.is_none() && kind == ErrKind::SoftRate {
+                                        if let Some(secs) = retry_after {
+                                            unfreeze = Some(now_ts() + secs.max(1) as i64);
+                                        }
+                                    }
                                     state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
                                     // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {

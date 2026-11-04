@@ -1028,6 +1028,9 @@ pub struct PoolStatus {
     /// 前端显示「就绪」却不可选（可观测盲点）
     #[serde(default)]
     pub hard_credit: bool,
+    /// 硬冷却截止时刻（Unix 秒，issue #178；hard_credit=true 时有值，前端显示恢复倒计时）
+    #[serde(default)]
+    pub hard_until: Option<i64>,
     pub disabled: bool,
     pub err_count: i32,
     /// 账号五态机（T2.2/F-29 v1.2）：Available/QuotaProtection/RateLimited/Forbidden/ProxyDisabled

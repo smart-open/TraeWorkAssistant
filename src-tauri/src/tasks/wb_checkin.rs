@@ -5,8 +5,9 @@
 //! - 成长：travel（status→claim→config→depart）/ lottery（chances→draw 循环上限 20）/
 //!   tasks（has_reward 过滤 → accept）各步独立容错，401 同款刷新重试
 //! - NDJSON 事件契约（wb-checkin-progress 管线，前端逐行 JSON.parse）：
-//!   start {type,total[,mode]} / account {user_id,name,status,message[,reward],index} /
-//!   growth {type:"growth",...,index} / done {type:"done"[,mode],ok,already,failed}
+//!   start {type,total[,mode]} / account {user_id,name,status,message[,reward]
+//!   [,reward_pending,pre_balance,pre_wb_credits][,checkin_streak],index} /
+//!   growth {type:"growth",...,checkin_streak,index} / done {type:"done"[,mode],ok,already,failed}
 //! - 结果 90 天滚动存储；刷新成功回写账号池过期时间（调度/到期日历数据源）
 //! 红线：全程零 token 输出（凭证不入日志/事件）。
 
@@ -141,6 +142,40 @@ fn scalar_of(v: &Value) -> Option<f64> {
     num_or_none(Some(v))
 }
 
+/// 签到连签天数（issue #180）：checkin-activity-status 响应的 streak_days——
+/// 与 growth/streak 的「活跃连签」（使用事件驱动）是两个不同指标
+fn streak_days_from(body: &Value) -> Option<f64> {
+    num_or_none(fs_utils::dig(body, &["streak_days", "streakDays"]))
+}
+
+/// 延迟到账判定（issue #180）：credit_delayed 真值 = 签到积分次日到账（此时
+/// data.credit 常为空，不应记「奖励未识别」）
+fn delayed_credit_pending(body: &Value) -> bool {
+    py_truthy(fs_utils::dig(body, &["credit_delayed", "creditDelayed"]))
+}
+
+/// T+1 待入账差值回填（issue #180）：billing meter 优先、WB credits 兜底（与
+/// 签到当场差值兜底同序），仅差值 >0 采信（防并发扣减负值误报）
+fn backfill_diff(
+    pre_billing: Option<f64>,
+    post_billing: Option<f64>,
+    pre_wb: Option<f64>,
+    post_wb: Option<f64>,
+) -> Option<f64> {
+    let round2 = |d: f64| (d * 100.0).round() / 100.0;
+    if let (Some(pre), Some(post)) = (pre_billing, post_billing) {
+        if post > pre {
+            return Some(round2(post - pre));
+        }
+    }
+    if let (Some(pre), Some(post)) = (pre_wb, post_wb) {
+        if post > pre {
+            return Some(round2(post - pre));
+        }
+    }
+    None
+}
+
 /// 递归深挖奖励数额：键名含奖励语义子串的数值字段（宽容解析，对齐 doubao_quota
 /// deep dig 模式）。刻意不含 balance/total/remaining 语义——避免把账户余额误当本次奖励。
 fn deep_reward_dig(v: &Value, depth: usize) -> Option<f64> {
@@ -234,16 +269,18 @@ fn first_str(parts: &[Option<String>]) -> String {
 
 // ── 签到端点（对齐 python checkin_status / checkin_do / fetch_balance）─────
 
-/// 查询今日是否已签：新路径回退旧路径；返回 (today_checked_in, status_ok)
+/// 查询今日是否已签：新路径回退旧路径；返回 (today_checked_in, streak_days, status_ok)。
+/// streak_days（issue #180）：同响应携带的签到连签天数，此前被丢弃导致前端只能
+/// 展示 growth/streak 的活跃连签
 fn checkin_status(
     agent: &ureq::Agent,
     headers: &[(String, String)],
     urls: &Urls,
-) -> (Option<bool>, bool) {
+) -> (Option<bool>, Option<f64>, bool) {
     for url in [&urls.checkin_status, &urls.checkin_status_old] {
         let (status, body) = wb_common::post_json(agent, url, headers, &json!({}));
         if status == 401 {
-            return (None, false);
+            return (None, None, false);
         }
         if status == 200 {
             if let Some(b) = body.filter(|b| b.is_object()) {
@@ -253,25 +290,27 @@ fn checkin_status(
                     v = fs_utils::dig(&b, &["checked", "is_checked"]);
                 }
                 if let Some(v) = v {
-                    return (Some(py_truthy(Some(v))), true);
+                    return (Some(py_truthy(Some(v))), streak_days_from(&b), true);
                 }
-                return (None, true); // 200 但字段缺失：视为未知但不失败（执行时容错）
+                return (None, streak_days_from(&b), true); // 200 但字段缺失：视为未知但不失败（执行时容错）
             }
         }
         // 其它状态码尝试旧路径
     }
-    (None, false)
+    (None, None, false)
 }
 
-/// 执行签到。返回 (kind, message, reward)：success / already / fail（auth 由调用方刷新重试）
-/// 签到执行。返回 (kind, message, reward, dbg_keys)：
-/// success / already / fail（auth 由调用方刷新重试）；dbg_keys = 成功但奖励未识别时
-/// 的响应键路径（仅键名不含值，供 app.log 诊断校准，见 process_account）
+/// 签到执行。返回 (kind, message, reward, delayed, checkin_streak, dbg_keys)：
+/// success / already / fail（auth 由调用方刷新重试）；delayed = 成功但奖励为空且
+/// 带 credit_delayed（积分次日到账，issue #180）；checkin_streak = 签到响应内
+/// streak_days（post-checkin 口径，比预检值新——当日首签时预检值少 1）；
+/// dbg_keys = 成功但奖励未识别时的响应键路径（仅键名不含值，供 app.log 诊断
+/// 校准，见 process_account）
 fn checkin_do(
     agent: &ureq::Agent,
     headers: &[(String, String)],
     urls: &Urls,
-) -> (String, String, Option<f64>, Option<String>) {
+) -> (String, String, Option<f64>, bool, Option<f64>, Option<String>) {
     let (mut status, mut body, mut raw) =
         wb_common::post_json_raw(agent, &urls.checkin_do, headers, &json!({}));
     if status == 0 {
@@ -285,7 +324,7 @@ fn checkin_do(
         }
     }
     if status == 401 {
-        return ("auth".into(), "登录态失效（401）".into(), None, None);
+        return ("auth".into(), "登录态失效（401）".into(), None, false, None, None);
     }
     let code: Option<i64> = body
         .as_ref()
@@ -298,23 +337,32 @@ fn checkin_do(
         .map(|v| s_of(Some(v)));
     if status == 0 {
         let head: String = raw.chars().take(120).collect();
-        return ("fail".into(), format!("网络不可达: {head}"), None, None);
+        return ("fail".into(), format!("网络不可达: {head}"), None, false, None, None);
     }
     if (200..=201).contains(&status) || code.is_some_and(|c| c == 0 || c == 200) {
         // 奖励数额以接口返回为准，不硬编码（F-17）；精确键未命中走递归深挖，
-        // 仍无则兜底走签到前后余额差值（process_account）
+        // 仍无则兜底走签到前后余额差值（process_account）。
+        // issue #180：服务端奖励在 data.credit（单数）——精确键表补 credit（dig
+        // 精确等值匹配不会命中 credits_packages 等余额字段；deep_reward_dig 的
+        // contains 表刻意不加裸 credit，避免误命中余额类字段）
         let reward = body.as_ref().and_then(|b| {
             num_or_none(fs_utils::dig(
                 b,
                 &[
-                    "reward", "credits", "points", "amount", "integral", "score", "bonus",
-                    "reward_amount", "add_integral", "addCredits", "earned",
+                    "reward", "credits", "credit", "points", "amount", "integral", "score",
+                    "bonus", "reward_amount", "add_integral", "addCredits", "earned",
                 ],
             ))
             .or_else(|| deep_reward_dig(b, 0))
         });
+        // issue #180：credit_delayed 真值 = 积分次日到账（常伴随 credit 为空），
+        // 标记待入账而非「未识别」（调用方据此区分展示与 T+1 回填）
+        let delayed = reward.is_none() && body.as_ref().is_some_and(delayed_credit_pending);
+        // 签到连签（post-checkin）：签到响应自带 streak_days，当日首签时比
+        // 预检值新 1 天（审查修复：预检值在成功路径会少计当日）
+        let checkin_streak = body.as_ref().and_then(|b| streak_days_from(b));
         // 奖励未识别时收集响应键路径（不含值）供诊断校准
-        let dbg_keys = if reward.is_none() {
+        let dbg_keys = if reward.is_none() && !delayed {
             body.as_ref().map(|b| {
                 let mut paths = Vec::new();
                 collect_key_paths(b, "", 0, &mut paths);
@@ -323,14 +371,16 @@ fn checkin_do(
         } else {
             None
         };
-        return ("success".into(), "签到成功".into(), reward, dbg_keys);
+        return ("success".into(), "签到成功".into(), reward, delayed, checkin_streak, dbg_keys);
     }
     // 已签容错（F-15）：code:10001 / message 含「已签到」/「repeat」
     let msg_low = message.as_deref().unwrap_or("").to_ascii_lowercase();
     if code == Some(10001)
         || ["已签到", "repeat", "already"].iter().any(|k| msg_low.contains(k))
     {
-        return ("already".into(), "今日已签到".into(), None, None);
+        // already 响应同样可能带 streak_days（post-checkin 口径）
+        let checkin_streak = body.as_ref().and_then(|b| streak_days_from(b));
+        return ("already".into(), "今日已签到".into(), None, false, checkin_streak, None);
     }
     let head: String = raw.chars().take(120).collect();
     let shown = message
@@ -339,6 +389,8 @@ fn checkin_do(
     (
         "fail".into(),
         format!("{shown}（code={}）", code.map(|c| c.to_string()).unwrap_or_else(|| "None".into())),
+        None,
+        false,
         None,
         None,
     )
@@ -464,10 +516,71 @@ fn append_results(state: &AppState, events: &[Value]) {
         if let Some(r) = ev.get("reward").filter(|r| !r.is_null()) {
             rec["reward"] = r.clone();
         }
+        // 待入账记录（issue #180）：存 pending 标记 + 签到前余额，供 T+1 差值回填
+        if ev.get("reward_pending").and_then(Value::as_bool) == Some(true) {
+            rec["reward_pending"] = json!(true);
+            for k in ["pre_balance", "pre_wb_credits"] {
+                if let Some(v) = ev.get(k).filter(|v| !v.is_null()) {
+                    rec[k] = v.clone();
+                }
+            }
+        }
         kept.push(rec);
     }
     data["results"] = json!(kept);
     let _ = crate::store::docs::wb_checkin_results_save(&store, &data);
+}
+
+/// T+1 待入账回填入口（issue #180）：加载结果文档 → 差值回填 → 有变更则落库。
+/// success/already 主流程与 already 早返回分支共用。返回回填的差值。
+fn try_backfill_pending(
+    state: &AppState,
+    aid: &str,
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    base: &str,
+) -> Option<f64> {
+    let mut results: Value =
+        crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
+    let diff = backfill_pending_reward(state, aid, agent, headers, base, &mut results)?;
+    let _ = crate::store::docs::wb_checkin_results_save(&crate::store::db(&state.data_dir), &results);
+    Some(diff)
+}
+
+/// T+1 待入账差值回填（issue #180）：找该账号最近一条 reward_pending 且 date < 今日的
+/// 记录，用当前余额 - 记录中签到前余额（billing 优先，WB credits 兜底，仅差值>0
+/// 采信）回填 reward 并清 pending 标记。无待回填记录时不发起任何网络请求。
+/// 返回回填的差值（None = 无待回填记录或差值未命中）。
+fn backfill_pending_reward(
+    state: &AppState,
+    aid: &str,
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    base: &str,
+    results: &mut Value,
+) -> Option<f64> {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let recs = results.get_mut("results")?.as_array_mut()?;
+    let idx = recs.iter().rposition(|r| {
+        r.get("reward_pending").and_then(Value::as_bool) == Some(true)
+            && r.get("user_id").and_then(Value::as_str) == Some(aid)
+            && r
+                .get("date")
+                .and_then(Value::as_str)
+                .is_some_and(|d| d < today.as_str())
+    })?;
+    let rec = &recs[idx];
+    let pre_b = rec.get("pre_balance").and_then(Value::as_f64);
+    let pre_w = rec.get("pre_wb_credits").and_then(Value::as_f64);
+    if pre_b.is_none() && pre_w.is_none() {
+        return None; // 无签到前余额基准，无法差值回填（保持待入账态）
+    }
+    let post_b = fetch_balance(agent, headers, base);
+    let post_w = fetch_wb_credits_balance(state, aid);
+    let diff = backfill_diff(pre_b, post_b, pre_w, post_w)?;
+    recs[idx]["reward"] = json!(diff);
+    recs[idx]["reward_pending"] = json!(false);
+    Some(diff)
 }
 
 // ── 签到主流程 ─────────────────────────────────────────────────────────────
@@ -499,9 +612,18 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     let base = wb_common::region_billing_base(&creds.domain);
     let urls = urls_for(base);
     let mut headers = wb_common::build_auth_headers(&creds, false);
-    let (checked, ok) = checkin_status(agent, &headers, &urls);
+    let (checked, status_streak, ok) = checkin_status(agent, &headers, &urls);
     if ok && checked == Some(true) {
-        return json!({ "user_id": aid, "name": base_ev["name"], "status": "already", "message": "今日已签到" });
+        let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": "already", "message": "今日已签到" });
+        if let Some(s) = status_streak {
+            ev["checkin_streak"] = json!(s);
+        }
+        // T+1 待入账回填在早返回分支同样执行：今日已在别处签到时主流程不可达，
+        // 漏跑会导致昨日 pending 当日不回填（审查修复）
+        if let Some(diff) = try_backfill_pending(state, &aid, agent, &headers, base) {
+            ev["message"] = json!(format!("今日已签到；昨日待入账积分已到账 +{diff}"));
+        }
+        return ev;
     }
     // 签到前余额（获得积分差值兜底数据源；两级恒取：①billing meter 通用积分
     // ②WB credits 域 WorkBuddy 积分——查询失败不阻塞签到。恒取两级的原因：
@@ -509,7 +631,8 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     // 仍需 WB credits 差值兜底）
     let pre_balance = fetch_balance(agent, &headers, base);
     let pre_wb_credits = fetch_wb_credits_balance(state, &aid);
-    let (mut kind, mut message, mut reward, mut dbg_keys) = checkin_do(agent, &headers, &urls);
+    let (mut kind, mut message, mut reward, mut delayed, mut do_streak, mut dbg_keys) =
+        checkin_do(agent, &headers, &urls);
     if kind == "auth" {
         // 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）。
         // H-1：加锁刷新 + 二次检查（他人已刷新落库直接复用）+ 内部落库
@@ -522,13 +645,17 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                 kind = r.0;
                 message = r.1;
                 reward = r.2;
-                dbg_keys = r.3;
+                delayed = r.3;
+                do_streak = r.4;
+                dbg_keys = r.5;
                 // 二次失败（审查 P1-4）：新凭证仍 401 → 标记重登录，归一为 fail
                 if kind == "auth" {
                     wb_common::mark_needs_relogin(state, &aid, "签到重试后仍 401");
                     kind = "fail".into();
                     message = "登录态失效（刷新后仍 401），需重新登录".into();
                     reward = None;
+                    delayed = false;
+                    do_streak = None;
                 }
             }
             None => {
@@ -550,6 +677,8 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                     None => "登录态失效且刷新失败，需重新登录".into(),
                 };
                 reward = None;
+                delayed = false;
+                do_streak = None;
             }
         }
     }
@@ -557,7 +686,9 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     // 仅差值>0 才采信（防并发扣减/查询时点差造成负值误报）。
     // 两级数据源都尝试：①billing meter（通用积分）②WB credits（WorkBuddy 积分）
     let mut balance_shrunk = false; // 差值兜底期间检测到余额下降（并发扣减），用于诊断区分「无奖励」与「未能核实」
-    if kind == "success" && reward.is_none() {
+    // delayed（credit_delayed 次日到账）时跳过当场差值兜底：余额未变差值恒 0，
+    // 白打两次余额查询（issue #180）
+    if kind == "success" && reward.is_none() && !delayed {
         if let Some(pre) = pre_balance {
             if let Some(post) = fetch_balance(agent, &headers, base) {
                 if post > pre {
@@ -608,9 +739,27 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                     }))
             });
     }
+    // T+1 待入账回填（issue #180）：此前 credit_delayed 的记录积分次日才到账，
+    // 当场差值恒 0——今日账号健康（success/already）时用当前余额与记录中签到前
+    // 余额的差值回填并落库。已知权衡：差值窗口内其他入账（盲盒/任务等）会混入，
+    // 与「仅差值>0 采信」既有口径一致；回填只写历史记录，不改今日获取积分展示
+    let mut backfilled_msg = String::new();
+    if matches!(status_txt, "success" | "already") {
+        if let Some(diff) = try_backfill_pending(state, &aid, agent, &headers, base) {
+            backfilled_msg = format!("；昨日待入账积分已到账 +{diff}");
+        }
+    }
+    // 签到连签（issue #180）：success/already 以签到响应内 streak_days（post-checkin，
+    // 当日首签时预检值少 1）优先，预检值为回退；fail 时仅预检值可用
+    let checkin_streak = if matches!(kind.as_str(), "success" | "already") {
+        do_streak.or(status_streak)
+    } else {
+        status_streak
+    };
     // 诊断（脱敏红线：只输出键路径不含值）：成功但三层提取（精确键/深挖/双差值）
-    // 均未命中时记录响应键路径，便于按真实结构校准奖励键
-    if kind == "success" && reward.is_none() {
+    // 均未命中时记录响应键路径，便于按真实结构校准奖励键；
+    // delayed 属「待入账」非「未识别」，不打诊断日志
+    if kind == "success" && reward.is_none() && !delayed {
         fs_utils::app_log(
             &state.data_dir,
             &format!(
@@ -624,8 +773,25 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     if let Some(r) = reward {
         ev["reward"] = json!(r);
     }
+    if let Some(s) = checkin_streak {
+        ev["checkin_streak"] = json!(s);
+    }
+    if delayed && reward.is_none() {
+        // 待入账态（issue #180）：附带签到前余额供 T+1 差值回填；事件契约新增
+        // reward_pending / pre_balance / pre_wb_credits（前端消费 reward_pending）
+        ev["reward_pending"] = json!(true);
+        if let Some(p) = pre_balance {
+            ev["pre_balance"] = json!(p);
+        }
+        if let Some(p) = pre_wb_credits {
+            ev["pre_wb_credits"] = json!(p);
+        }
+    }
     if kind == "success" && note == "refreshed" {
         ev["message"] = json!(format!("{}（凭证已续期）", ev["message"].as_str().unwrap_or("")));
+    }
+    if !backfilled_msg.is_empty() {
+        ev["message"] = json!(format!("{}{}", ev["message"].as_str().unwrap_or(""), backfilled_msg));
     }
     ev
 }
@@ -916,7 +1082,10 @@ fn growth_tasks(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) 
     ("ok".into(), format!("领取 {claimed} 项任务奖励"))
 }
 
-/// 能量与连签天数（页面附注展示；对象响应归一为标量，防 [object Object]）
+/// 能量与连签天数（页面附注展示；对象响应归一为标量，防 [object Object]）。
+/// issue #180：growth/streak 的 streak 是「活跃连签」（使用事件驱动，成长任务
+/// 做完常为 0），另取 checkin-activity-status 的 streak_days 作为「签到连签」
+/// 分开展示（该接口为 POST，与签到预检同端点）
 fn growth_info(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) -> Vec<(&'static str, f64)> {
     let mut info = vec![];
     let (st, b, _r) = wb_common::get_json(agent, &urls.energy, headers);
@@ -937,6 +1106,12 @@ fn growth_info(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) -
             .and_then(|v| scalar_of(&v))
         {
             info.push(("streak", v));
+        }
+    }
+    let (st, b) = wb_common::post_json(agent, &urls.checkin_status, headers, &json!({}));
+    if st == 200 {
+        if let Some(v) = b.filter(|bb| bb.is_object()).and_then(|bb| streak_days_from(&bb)) {
+            info.push(("checkin_streak", v));
         }
     }
     info
@@ -1106,5 +1281,56 @@ mod wb_checkin_tests {
         assert_eq!(reward_text(Some(&json!({"reward": 1.5})), ""), "+1.5");
         assert_eq!(reward_text(Some(&json!({})), "oops"), "oops");
         assert_eq!(reward_text(Some(&json!({})), ""), "ok");
+    }
+
+    // ── issue #180：credit 键 / credit_delayed / streak_days / T+1 回填 ──
+
+    #[test]
+    fn credit_key_matched_by_precise_dig_not_by_deep_dig_substring() {
+        // 精确键表补单数 credit（issue #180 服务端真实奖励键）
+        let b = json!({"code": 0, "data": {"credit": 5, "is_streak_day": true}});
+        assert_eq!(
+            num_or_none(fs_utils::dig(&b, &["reward", "credits", "credit", "points"])),
+            Some(5.0)
+        );
+        // dig 精确等值匹配：单数 credit 不误命中复数/组合余额键
+        let b2 = json!({"data": {"credit": null, "credits_packages": [{"balance": 100}]}});
+        assert_eq!(num_or_none(fs_utils::dig(&b2, &["reward", "credits", "credit"])), None);
+        // deep_reward_dig contains 表刻意不含裸 credit：credits_packages 不误判为奖励
+        assert_eq!(deep_reward_dig(&b2, 0), None);
+    }
+
+    #[test]
+    fn delayed_credit_detected_only_when_reward_missing() {
+        assert!(delayed_credit_pending(&json!(
+            {"code": 0, "data": {"credit": null, "credit_delayed": true, "is_streak_day": true}}
+        )));
+        assert!(!delayed_credit_pending(&json!({"code": 0, "data": {"credit": 5}})));
+        assert!(!delayed_credit_pending(&json!({"code": 0, "data": {}})));
+    }
+
+    #[test]
+    fn streak_days_extracted_from_checkin_status_body() {
+        let b = json!({"code": 0, "data": {"today_checked_in": true, "streak_days": 5}});
+        assert_eq!(streak_days_from(&b), Some(5.0));
+        let b2 = json!({"data": {"streakDays": "3"}});
+        assert_eq!(streak_days_from(&b2), Some(3.0));
+        assert_eq!(streak_days_from(&json!({"data": {}})), None);
+        assert_eq!(streak_days_from(&json!({"data": {"streak_days": null}})), None);
+    }
+
+    #[test]
+    fn backfill_diff_prefers_billing_then_wb_positive_only() {
+        // billing 命中优先
+        assert_eq!(backfill_diff(Some(10.0), Some(15.0), Some(100.0), Some(103.0)), Some(5.0));
+        // billing 恒 0 → WB credits 兜底
+        assert_eq!(backfill_diff(Some(10.0), Some(10.0), Some(100.0), Some(103.0)), Some(3.0));
+        // 双双无变化/下降：不采信
+        assert_eq!(backfill_diff(Some(10.0), Some(10.0), Some(100.0), Some(100.0)), None);
+        assert_eq!(backfill_diff(Some(10.0), Some(8.0), None, None), None);
+        // 缺前值基准：不回填
+        assert_eq!(backfill_diff(None, Some(15.0), None, Some(103.0)), None);
+        // 差值四舍五入两位
+        assert_eq!(backfill_diff(None, None, Some(0.1), Some(0.14)), Some(0.04));
     }
 }

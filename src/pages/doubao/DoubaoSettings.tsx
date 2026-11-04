@@ -45,6 +45,8 @@ export default function DoubaoSettings() {
   const [checkinTaskTimeShown, setCheckinTaskTimeShown] = useState('');
   const [checkinRunning, setCheckinRunning] = useState(false);
   const [checkinEnabled, setCheckinEnabled] = useState(true);
+  // 应用内签到调度时刻（doubao_checkin_hhmm）：独立于 Windows 计划任务时间可改
+  const [checkinHhmm, setCheckinHhmm] = useState('09:15');
 
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
@@ -107,6 +109,17 @@ export default function DoubaoSettings() {
     }
   };
 
+  // 应用内签到调度时刻（doubao_checkin_hhmm）：立即保存，调度器下轮生效（与上方开关同款模式）
+  const saveCheckinHhmm = async (v: string) => {
+    const hhmm = v || '09:15';
+    setCheckinHhmm(hhmm);
+    try {
+      await saveSettings({ doubao_checkin_hhmm: hhmm });
+    } catch (err) {
+      pushToast('error', `保存签到调度时刻失败：${String(err)}`);
+    }
+  };
+
   const refreshTaskStatus = async () => {
     try {
       const s = await api.doubao.taskStatus();
@@ -159,12 +172,13 @@ export default function DoubaoSettings() {
       setKeepaliveEnabled(settings.doubao_keepalive_enabled !== false);
       setQuotaEnabled(settings.doubao_quota_enabled !== false);
       setCheckinEnabled(settings.doubao_checkin_enabled !== false);
+      if (settings.doubao_checkin_hhmm) setCheckinHhmm(settings.doubao_checkin_hhmm);
     }
     void refreshTaskStatus();
     void refreshQuotaTaskStatus();
     void refreshCheckinTaskStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_checkin_hhmm]);
 
   const detect = async () => {
     setDetecting(true);
@@ -313,6 +327,12 @@ export default function DoubaoSettings() {
       };
       if (r.skipped) {
         pushToast('info', `签到跳过：${r.skipped}`);
+      } else if ((r.failed ?? 0) > 0) {
+        // 有失败账号：warn 语气（批量结果恒 ok:true，不能靠返回值区分，按失败数定调）
+        pushToast(
+          'warn',
+          `签到完成：共 ${r.total ?? 0} 个账号，成功 ${r.success ?? 0} · 已签 ${r.already ?? 0} · 失败 ${r.failed ?? 0}，新增额度 +${r.reward_total ?? 0}`,
+        );
       } else {
         pushToast(
           'success',
@@ -653,7 +673,17 @@ export default function DoubaoSettings() {
               className="mt-0.5 h-4 w-4 shrink-0 accent-rose-500"
             />
             <span>
-              <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日签到调度（每日 09:15）</span>
+              <span className="font-medium text-slate-600 dark:text-zinc-200">
+                应用内每日签到调度（每日
+                <input
+                  type="time"
+                  value={checkinHhmm}
+                  onChange={(e) => void saveCheckinHhmm(e.target.value)}
+                  className="input mx-1 h-7 !w-28 align-middle text-xs"
+                  aria-label="应用内签到调度时刻"
+                />
+                ）
+              </span>
               <span className="mt-0.5 block leading-relaxed">
                 关闭后应用内调度器不再执行每日自动签到；与上方「每日任务」（Windows 计划任务）相互独立。
                 无豆包账号时自动跳过，不记失败、不推送通知。

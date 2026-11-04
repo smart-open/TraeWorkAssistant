@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { Snowflake } from 'lucide-react';
 import { Badge } from '../../components/ui';
 
@@ -11,6 +12,9 @@ const COOLDOWN_LABELS: Record<string, string> = {
   BusinessError: '业务错误',
   DeviceSigned: '设备已签',
   AuthRejected: '认证被拒',
+  // issue #178：PoolStatusBadge 透传池内 reason 值域（ErrKind::as_str 之外还有
+  // 熔断/积分耗尽两个专用 reason），缺键会显示英文原文
+  consecutive_errors: '连续错误熔断',
 };
 
 /** SessionDead（JWT 被服务端吊销）的恢复指引：重登 → 保存登录态 → 续期捕获新凭证 */
@@ -30,14 +34,22 @@ export function CooldownBadge({ type, until }: { type: string; until: number | n
   const isPermanent = type === 'SessionDead' || type === 'AuthRejected';
   const guide =
     type === 'SessionDead' ? SESSION_DEAD_GUIDE : type === 'AuthRejected' ? AUTH_REJECTED_GUIDE : undefined;
+  // 动态倒计时（issue #178）：冷却中每秒跳字。429 限流默认仅 60s，静态渲染
+  // 会停在「1m」误导用户；<1h 用秒级精度（Xm Ys / Xs），≥1h 沿用 Xh Ym 粗粒度
+  const [, setTick] = useState(0);
+  const secs = !isPermanent && until ? until - Math.floor(Date.now() / 1000) : 0;
+  const ticking = secs > 0;
+  useEffect(() => {
+    if (!ticking) return;
+    const t = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [ticking]);
   let remaining = '';
-  if (!isPermanent && until) {
-    const secs = until - Math.floor(Date.now() / 1000);
-    if (secs > 0) {
-      const h = Math.floor(secs / 3600);
-      const m = Math.floor((secs % 3600) / 60);
-      remaining = h > 0 ? `${h}h${m}m` : `${m}m`;
-    }
+  if (ticking) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    remaining = h > 0 ? `${h}h${m}m` : m > 0 ? `${m}m${String(s).padStart(2, '0')}s` : `${s}s`;
   }
   return (
     <Badge tone={isPermanent ? 'red' : 'amber'} title={guide}>

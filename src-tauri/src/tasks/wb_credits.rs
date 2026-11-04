@@ -365,10 +365,7 @@ fn packages_from(body: &Value) -> Vec<Value> {
 /// 「它才是唯一真实视图」的情形。明细读不出时宁可返回 None，不得回退「全量和」
 /// 把汇总行加回来。
 pub(crate) fn balance_from_summary(body: &Value) -> Option<f64> {
-    if let Some(t) = num_of(fs_utils::dig(
-        body,
-        &["RemainingCapacity", "remaining", "TotalRemaining", "Balance", "balance"],
-    )) {
+    if let Some(t) = num_of(fs_utils::dig(body, &TOP_LEVEL_BALANCE_KEYS)) {
         return Some(t);
     }
     let mut found = vec![];
@@ -442,6 +439,104 @@ fn billing_urls(domain: &str) -> (String, String, String, String) {
     )
 }
 
+/// 响应骨架（诊断，issue #179）：对象展开键名树、数组取前 2 个元素、长字符串
+/// 截断为长度标记；数值保留（容量/总量对定位有用，响应体不含 token）；限深 4
+fn shape_skeleton(v: &Value, depth: u32) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut o = serde_json::Map::new();
+            if depth < 4 {
+                for (k, x) in m {
+                    o.insert(k.clone(), shape_skeleton(x, depth + 1));
+                }
+            }
+            Value::Object(o)
+        }
+        Value::Array(a) => {
+            Value::Array(a.iter().take(2).map(|x| shape_skeleton(x, depth + 1)).collect())
+        }
+        Value::Null => json!(null),
+        Value::Bool(b) => json!(b),
+        Value::Number(n) => json!(n),
+        Value::String(s) => {
+            let n = s.chars().count();
+            if n > 32 {
+                json!(format!("str(len={n})"))
+            } else {
+                json!(s)
+            }
+        }
+    }
+}
+
+/// summary 顶层余额字段链（balance_from_summary 第一段出口的唯一键源，
+/// top_level_balance_hit 与之共用——两处各写一份将来漂移会让 message 判定
+/// 与余额实际来源失同步）
+const TOP_LEVEL_BALANCE_KEYS: [&str; 5] =
+    ["RemainingCapacity", "remaining", "TotalRemaining", "Balance", "balance"];
+
+/// summary 顶层余额字段链是否命中（balance_from_summary 第一段出口）。
+/// 「总分显示但包明细为空」时该标记区分两种根因：true = 余额读自顶层汇总字段
+/// （上游形状可能变化，包 dict 未被容量键命中）；false = 余额来自 coded 求和
+/// （与包空矛盾，不可能同时出现，出现即解析缺陷信号）
+fn top_level_balance_hit(body: &Value) -> bool {
+    num_of(fs_utils::dig(body, &TOP_LEVEL_BALANCE_KEYS)).is_some()
+}
+
+/// 包明细缺失/到期回查失败的诊断载荷（issue #179：此路径此前完全静默，
+/// 用户看板「总分在、积分包和最近到期没了」无从定位）。
+/// 纯函数便于单测；响应体不含 token，骨架仅键名树 + 容量数值，无敏感泄漏面。
+fn packages_diag(
+    summary_body: Option<&Value>,
+    summary_status: u16,
+    codes_count: usize,
+    paid_status: u16,
+    free_status: u16,
+    balance_present: bool,
+) -> Value {
+    let mut d = json!({
+        "warn": "wb-credits 包明细/到期诊断（issue #179）",
+        "summary_status": summary_status,
+        "codes_count": codes_count,
+        "paid_status": paid_status,
+        "free_status": free_status,
+        "balance_present": balance_present,
+    });
+    if let Some(b) = summary_body {
+        d["top_level_balance"] = json!(top_level_balance_hit(b));
+        // 包解析计数复盘：walk 命中 dict 数 / 带 code 明细数 / 被跳过谓词丢弃数
+        let mut found = vec![];
+        walk_capable_dicts(b, 0, &mut found);
+        let coded_refs: Vec<&Value> = found
+            .iter()
+            .copied()
+            .filter(|x| package_code_of(x).is_some())
+            .collect();
+        let skipped = found
+            .iter()
+            .copied()
+            .filter(|x| is_skippable_uncoded(x, !coded_refs.is_empty(), &coded_refs))
+            .count();
+        d["walk_dicts"] = json!(found.len());
+        d["coded_dicts"] = json!(coded_refs.len());
+        d["skipped_dicts"] = json!(skipped);
+        d["shape"] = shape_skeleton(b, 0);
+    }
+    d
+}
+
+/// ok=true 但包明细为空时输出行携带的 message（前端状态列透出，诚实空态：
+/// 修复前显示「正常」+ 积分包 0 + 最近到期「—」，用户无从分辨是数据真没了还是取数降级）
+fn empty_packages_message(source: &str, top_level_balance: bool) -> String {
+    match source {
+        "local_quota" => "余额来自本机客户端兜底（云端积分包明细不可用，请检查凭证/网络后刷新）".into(),
+        _ if top_level_balance => {
+            "余额读自上游汇总字段，积分包明细未解析出（上游响应形状可能变化，详见 app.log）".into()
+        }
+        _ => "积分包明细未解析出（详见 app.log 诊断）".into(),
+    }
+}
+
 /// 旧接口参数（F-20 回退路径）
 fn old_body() -> Value {
     json!({
@@ -454,7 +549,7 @@ fn old_body() -> Value {
     })
 }
 
-/// 单轮取数 → (pkgs, balance, saw_auth, net_down)。
+/// 单轮取数 → (pkgs, balance, saw_auth, net_down, diag)。
 /// 2026-09 实测结构（代理诊断）：
 /// - summary：200，data.Packages[] 自带 PackageCode + 容量三项（**无到期时间字段**）；
 /// - paid/free：400 code=10001 "PackageCodes required"——需携带 summary 提取的
@@ -462,24 +557,26 @@ fn old_body() -> Value {
 /// 流程：summary（余额 + 包）→ paid/free 带 PackageCodes 回查到期 → 按 PackageCode
 /// 去重合并（paid/free 有到期信息的优先，summary 包补齐未被覆盖的）。
 /// paid/free 失败不影响 cloud 成功判定（仅缺到期信息，明细显示「未知」）。
+/// diag（issue #179 可观测）：仅两种异常形态构造——①包明细空而有余额（上游形状
+/// 可能变化，携带响应骨架）；②包在但 paid/free 到期回查全失败（最近到期全空）。
 fn fetch_round(
     agent: &ureq::Agent,
     headers: &[(String, String)],
     urls: (&str, &str, &str),
-) -> (Vec<Value>, Option<f64>, bool, bool) {
+) -> (Vec<Value>, Option<f64>, bool, bool, Option<Value>) {
     let (summary_url, paid_url, free_url) = urls;
     let (status, body) = wb_common::post_json(agent, summary_url, headers, &json!({}));
     if status == 0 {
-        return (vec![], None, false, true); // 网络不可达 → 供双探测判定
+        return (vec![], None, false, true, None); // 网络不可达 → 供双探测判定
     }
     if status == 401 {
-        return (vec![], None, true, false);
+        return (vec![], None, true, false, None);
     }
     if status != 200 {
-        return (vec![], None, false, false);
+        return (vec![], None, false, false, None);
     }
     let Some(body) = body.filter(|b| b.is_object()) else {
-        return (vec![], None, false, false);
+        return (vec![], None, false, false, None);
     };
 
     let balance = balance_from_summary(&body);
@@ -489,10 +586,17 @@ fn fetch_round(
     let mut enriched: Vec<Value> = vec![];
     let mut enriched_codes: std::collections::HashSet<String> = Default::default();
     let mut saw_auth = false;
+    let mut paid_status = 0u16;
+    let mut free_status = 0u16;
     if !codes.is_empty() {
         let req = json!({"PackageCodes": codes, "PageNumber": 1, "PageSize": 100});
-        for url in [paid_url, free_url] {
+        for (tag, url) in [("paid", paid_url), ("free", free_url)] {
             let (st2, body2) = wb_common::post_json(agent, url, headers, &req);
+            if tag == "paid" {
+                paid_status = st2;
+            } else {
+                free_status = st2;
+            }
             if st2 == 401 {
                 saw_auth = true;
                 continue;
@@ -522,22 +626,45 @@ fn fetch_round(
         }
         enriched.push(p);
     }
-    (enriched, balance, saw_auth, false)
+    // 诊断（issue #179）：此前「总分在、包空」与「包在、到期全空」两条路径完全静默
+    let diag = if enriched.is_empty() && balance.is_some() {
+        Some(packages_diag(
+            Some(&body),
+            status,
+            codes.len(),
+            paid_status,
+            free_status,
+            true,
+        ))
+    } else if !codes.is_empty() && paid_status != 200 && free_status != 200 {
+        let mut d = packages_diag(None, status, codes.len(), paid_status, free_status, balance.is_some());
+        d["warn"] = json!("paid/free 到期回查全失败，包明细将无到期时间");
+        Some(d)
+    } else {
+        None
+    };
+    (enriched, balance, saw_auth, false, diag)
 }
 
 /// 一次取数：summary（余额+包）→ paid/free 带 PackageCodes 回查到期 →
 /// 全 401 刷新一次仅重试失败分支 → 旧接口回退。
 /// 主域名整体网络不可达时切备用域名重试一轮（§2.2 域名双探测，仅一次、不循环）。
-/// 返回 (packages, balance, source, new_creds)。
+/// 返回 (packages, balance, source, new_creds, diag)——diag 仅异常形态非空（issue #179）。
 fn fetch_credits_once(
     state: &AppState,
     agent: &ureq::Agent,
     aid: &str,
     creds: &wb_common::Creds,
-) -> (Vec<Value>, Option<f64>, &'static str, Option<wb_common::Creds>) {
+) -> (
+    Vec<Value>,
+    Option<f64>,
+    &'static str,
+    Option<wb_common::Creds>,
+    Option<Value>,
+) {
     let headers = wb_common::build_auth_headers(creds, true);
     let (summary_url, paid_url, free_url, old_url) = billing_urls(&creds.domain);
-    let (mut pkgs, mut balance, mut saw_auth, net_down) =
+    let (mut pkgs, mut balance, mut saw_auth, net_down, mut diag) =
         fetch_round(agent, &headers, (&summary_url, &paid_url, &free_url));
     if net_down && pkgs.is_empty() && balance.is_none() {
         // 双探测（§2.2）：主域名网络不可达 → 备用域名重试一轮
@@ -551,6 +678,7 @@ fn fetch_credits_once(
         pkgs = r.0;
         balance = r.1;
         saw_auth = r.2;
+        diag = r.4;
     }
     let mut new_creds = None;
     if saw_auth && pkgs.is_empty() && balance.is_none() {
@@ -558,14 +686,15 @@ fn fetch_credits_once(
         //（原 refresh_token_once + 调用方 save，两步分离存在并发覆盖丢 token 面）
         if let (Some(nc), _, _) = wb_common::refresh_token_once_locked(state, agent, aid, creds) {
             let headers2 = wb_common::build_auth_headers(&nc, true);
-            let (p2, b2, _saw2, _nd2) = fetch_round(agent, &headers2, (&summary_url, &paid_url, &free_url));
+            let (p2, b2, _saw2, _nd2, d2) = fetch_round(agent, &headers2, (&summary_url, &paid_url, &free_url));
             pkgs = p2;
             balance = b2;
+            diag = d2;
             new_creds = Some(nc);
         }
     }
     if !pkgs.is_empty() || balance.is_some() {
-        return (pkgs, balance, "cloud", new_creds);
+        return (pkgs, balance, "cloud", new_creds, diag);
     }
     // 旧接口回退（F-20）
     let (status, body) = wb_common::post_json(agent, &old_url, &headers, &old_body());
@@ -577,15 +706,26 @@ fn fetch_credits_once(
                     .iter()
                     .filter_map(|p| p.get("remaining").and_then(Value::as_f64))
                     .sum();
-                return (pkgs, Some(bal), "legacy", new_creds);
+                return (pkgs, Some(bal), "legacy", new_creds, None);
             }
         }
     }
     // 本地 quota 端口发现兜底（T5.8/F-21）：云端全链失败 → 探测本机桌面服务
+    //（issue #179：此分支余额有值但包明细恒空——「总分在、积分包没了」的降级根因之一，
+    // 须携带诊断不静默）
     if let Some(local) = wb_common::local_quota_balance(agent) {
-        return (vec![], Some(local), "local_quota", new_creds);
+        return (
+            vec![],
+            Some(local),
+            "local_quota",
+            new_creds,
+            Some(json!({
+                "warn": "云端全链失败，余额来自本机 quota 端口兜底（无积分包明细/到期）",
+                "diag": "检查凭证有效期与网络后「刷新数据」重试",
+            })),
+        );
     }
-    (vec![], None, "fetch_failed", new_creds)
+    (vec![], None, "fetch_failed", new_creds, None)
 }
 
 /// 体验版（免费额度）是「按月下发」的：每月 1 日发放，次月 1 日 00:00（UTC+8）失效。
@@ -679,7 +819,7 @@ fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
             "packages": [], "source": "none",
         });
     }
-    let (pkgs, balance, source, _new_creds) = fetch_credits_once(state, agent, &aid, &creds);
+    let (pkgs, balance, source, _new_creds, diag) = fetch_credits_once(state, agent, &aid, &creds);
     // new_creds 已由 refresh_token_once_locked 内部落库（H-1），此处无须再 save
     if pkgs.is_empty() && balance.is_none() {
         return json!({
@@ -688,6 +828,27 @@ fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
             "packages": [], "source": source,
         });
     }
+    // 诊断落日志（issue #179）：包明细空/到期回查失败/local_quota 降级此前完全静默
+    if let Some(d) = &diag {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[wb-credits] {name}({aid}) 包明细/到期诊断: {d}"),
+        );
+    }
+    // ok=true 但包明细为空 → message 诚实标注（前端状态列透出；正常账号恒 null）
+    let empty_msg = if pkgs.is_empty() && balance.is_some() {
+        json!(
+            empty_packages_message(
+                source,
+                diag.as_ref()
+                    .and_then(|d| d.get("top_level_balance"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            )
+        )
+    } else {
+        Value::Null
+    };
     let mut pkgs = pkgs;
     let balance = balance.unwrap_or_else(|| {
         pkgs.iter()
@@ -698,6 +859,7 @@ fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
     finalize_packages(&mut pkgs, now_secs() as i64);
     json!({
         "user_id": aid, "name": name, "ok": true, "balance": balance,
+        "message": empty_msg, // 正常账号 null；包明细空时诚实标注（issue #179）
         "packages": pkgs, "source": source, "fetched_at": fs_utils::now_ts(),
     })
 }
@@ -1232,6 +1394,64 @@ mod wb_credits_tests {
             {"PackageCode": "p_b", "CapacitySize": 2},
         ]}});
         assert_eq!(package_codes_from(&body), vec!["p_b", "p_a"]);
+    }
+
+    // ── issue #179 诊断（包明细空/到期回查失败不再静默）─────────────────────
+
+    /// 骨架：长字符串截断为长度标记，数组取前 2 个元素（防日志膨胀）
+    #[test]
+    fn shape_skeleton_truncates_and_caps() {
+        let v = json!({
+            "long": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "arr": [1, 2, 3, 4, 5],
+        });
+        let s = shape_skeleton(&v, 0);
+        assert_eq!(s["long"], json!("str(len=42)"));
+        assert_eq!(s["arr"].as_array().unwrap().len(), 2);
+    }
+
+    /// 顶层余额链命中判定：旧结构顶层字段 / 新结构内嵌小写键均命中；仅明细包响应不误报
+    #[test]
+    fn top_level_balance_hit_distinguishes_sources() {
+        assert!(top_level_balance_hit(&json!({"data": {"RemainingCapacity": 100}})));
+        assert!(top_level_balance_hit(&json!({"Balance": 5})));
+        assert!(!top_level_balance_hit(&json!({
+            "data": {"Packages": [{"PackageCode": "p", "CycleRemainCapacity": 10}]}
+        })));
+    }
+
+    /// 「总分在、包空」诊断：携带骨架 + 解析计数（walk/coded/skipped）
+    #[test]
+    fn packages_diag_reports_counts_and_shape() {
+        let body = json!({"data": {"SomeNewContainer": [
+            {"PackageCode": "p_a", "CapacitySize": 10},
+            {"PackageName": "平台奖励积分", "UsedCapacity": 3},
+        ]}});
+        let d = packages_diag(Some(&body), 200, 0, 0, 0, true);
+        assert_eq!(d["walk_dicts"], json!(2), "CapacitySize/UsedCapacity 均命中容量键集");
+        assert_eq!(d["coded_dicts"], json!(1));
+        assert_eq!(d["skipped_dicts"], json!(1), "黑名单汇总行被跳过");
+        assert_eq!(d["top_level_balance"], json!(false), "body 无顶层余额字段，不误报");
+        let shape = d["shape"].to_string();
+        assert!(shape.contains("SomeNewContainer"), "骨架暴露新容器名供定位");
+        // 带顶层余额字段的形态（上游形状变化候选）：命中标记为 true
+        let d2 = packages_diag(
+            Some(&json!({"data": {"remaining": 100, "Foo": []}})),
+            200,
+            0,
+            0,
+            0,
+            true,
+        );
+        assert_eq!(d2["top_level_balance"], json!(true));
+    }
+
+    /// ok=true 且包空时的诚实 message：local_quota 降级 / 顶层余额 / 通用三态
+    #[test]
+    fn empty_packages_message_variants() {
+        assert!(empty_packages_message("local_quota", false).contains("本机客户端兜底"));
+        assert!(empty_packages_message("cloud", true).contains("上游响应形状可能变化"));
+        assert!(empty_packages_message("cloud", false).contains("app.log"));
     }
 
     // ── 并发取数 / SWR 缓存三态（2026-10-08 提速修订）────────────────────
