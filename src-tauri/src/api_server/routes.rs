@@ -177,20 +177,39 @@ fn resolve_wb_target(
     // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
     let whitelist = unified_catalog::load_whitelist(&state.data_dir);
     let in_wl = |m: &str| unified_catalog::whitelist_allows(&whitelist, m);
-    let final_model = if !intl_only
+    let (downgrade_reason, final_model) = if !intl_only
         && state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::is_background_task(body)
     {
-        wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
+        (
+            "bg",
+            wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl)
+                .unwrap_or(r.model.clone()),
+        )
     } else if !intl_only
         && state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::estimate_input_tokens(body)
             >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
     {
-        wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
+        (
+            "longctx",
+            wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl)
+                .unwrap_or(r.model.clone()),
+        )
     } else {
-        r.model
+        ("", r.model.clone())
     };
+    // issue #184 修复（可观测性）：与 dispatch.rs 降级日志同口径——/v1/responses
+    // 路径降级改写同样落 app_log，此前仅 dispatch 路径有日志（审查补齐）
+    if !downgrade_reason.is_empty() && final_model != r.model {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "dispatch downgrade: requested={} routed={} -> downgraded={} reason={}",
+                model, r.model, final_model, downgrade_reason
+            ),
+        );
+    }
     Some((final_model, r.effort_hint))
 }
 

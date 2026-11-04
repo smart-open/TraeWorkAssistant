@@ -54,8 +54,155 @@ fn hide_main_window(app: &tauri::AppHandle) -> bool {
     }
 }
 
+/// 窗口几何失效判定阈值（issue #183）：与任一显示器工作区的交叠区域宽高均不足
+/// 150 物理像素即视为不可用——涵盖「窗口整体落在已断开的显示器坐标上」
+/// 和「仅露出一条边」（任务栏缩略图呈一条线）两种休眠唤醒后的典型损坏形态
+const MIN_VISIBLE_PX: i32 = 150;
+
+/// 尺寸退化判定阈值（物理像素）：正常 resize 受 minWidth/minHeight（960x600 逻辑）
+/// 约束，物理宽高不可能低于此值；低于即视为几何损坏
+const MIN_SIZE_PX: u32 = 200;
+
+/// 显示器几何快照（物理像素）：纯数据结构便于单测（tauri::Monitor 无法在测试中构造）
+struct MonitorGeom {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    scale: f64,
+}
+
+impl MonitorGeom {
+    fn from_monitor(m: &tauri::Monitor) -> Self {
+        let wa = m.work_area();
+        Self {
+            x: wa.position.x,
+            y: wa.position.y,
+            w: wa.size.width as i32,
+            h: wa.size.height as i32,
+            scale: m.scale_factor(),
+        }
+    }
+}
+
+/// 窗口矩形与显示器工作区矩形的交叠宽高（无交叠时对应维为负值）
+fn overlap_dims(wx: i32, wy: i32, ww: i32, wh: i32, m: &MonitorGeom) -> (i32, i32) {
+    (
+        (wx + ww).min(m.x + m.w) - wx.max(m.x),
+        (wy + wh).min(m.y + m.h) - wy.max(m.y),
+    )
+}
+
+/// 几何有效性纯判定：尺寸非退化，且与任一显示器工作区交叠宽高均 ≥ MIN_VISIBLE_PX
+fn geometry_valid(wx: i32, wy: i32, ww: i32, wh: i32, monitors: &[MonitorGeom]) -> bool {
+    if ww < MIN_SIZE_PX as i32 || wh < MIN_SIZE_PX as i32 {
+        return false;
+    }
+    monitors.iter().any(|m| {
+        let (dw, dh) = overlap_dims(wx, wy, ww, wh, m);
+        dw >= MIN_VISIBLE_PX && dh >= MIN_VISIBLE_PX
+    })
+}
+
+/// 校验窗口几何是否有效：尺寸非退化，且与任一显示器工作区有足够交叠。
+/// 枚举显示器失败时不误伤（返回 true），交由原有的最大化重建逻辑兜底。
+fn window_geometry_valid(window: &tauri::WebviewWindow) -> bool {
+    let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        return false;
+    };
+    if size.width < MIN_SIZE_PX || size.height < MIN_SIZE_PX {
+        return false;
+    }
+    let Ok(monitors) = window.available_monitors() else {
+        return true;
+    };
+    if monitors.is_empty() {
+        return true;
+    }
+    let geoms: Vec<MonitorGeom> = monitors.iter().map(MonitorGeom::from_monitor).collect();
+    geometry_valid(pos.x, pos.y, size.width as i32, size.height as i32, &geoms)
+}
+
+/// 几何失效后的修复（issue #183，审查问题 1/2/3）：保留用户尺寸，仅把窗口
+/// 平移回「交叠面积最大（无交叠时中心距离最近）」的显示器工作区内并钳制可见；
+/// 尺寸退化（一条线）时才按目标显示器 DPI 重置默认尺寸。全程物理坐标，
+/// 无跨 DPI 换算不一致；工作区对齐 Tauri 启动居中行为（不遮挡任务栏）。
+/// 目标显示器纯选择：交叠面积最大者；全部无交叠（如窗口挂在已断开的显示器上）
+/// 时取中心距离最近者（调用方保证 monitors 非空）
+fn pick_best_monitor<'a>(
+    wx: i32,
+    wy: i32,
+    ww: i32,
+    wh: i32,
+    monitors: &'a [MonitorGeom],
+) -> &'a MonitorGeom {
+    monitors
+        .iter()
+        .max_by_key(|m| {
+            let (dw, dh) = overlap_dims(wx, wy, ww, wh, m);
+            let area = (dw.max(0) as i64) * (dh.max(0) as i64);
+            let (dx, dy) = (wx + ww / 2 - (m.x + m.w / 2), wy + wh / 2 - (m.y + m.h / 2));
+            let dist = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
+            (area, -dist)
+        })
+        .expect("调用方保证 monitors 非空")
+}
+
+/// 修复后几何纯计算（物理像素 x, y, w, h）：保留用户尺寸并钳制到工作区；
+/// 仅退化时按目标显示器 DPI 重置默认尺寸；nw ≤ mw 保证 clamp 区间合法
+fn repaired_geometry(
+    wx: i32,
+    wy: i32,
+    ww: i32,
+    wh: i32,
+    m: &MonitorGeom,
+) -> (i32, i32, u32, u32) {
+    let (nw, nh) = if ww < MIN_SIZE_PX as i32 || wh < MIN_SIZE_PX as i32 {
+        (
+            ((1180.0 * m.scale) as i32).min(m.w),
+            ((760.0 * m.scale) as i32).min(m.h),
+        )
+    } else {
+        (ww.min(m.w), wh.min(m.h))
+    };
+    // 位置：原坐标钳制进工作区，保留用户相对摆放
+    let x = wx.clamp(m.x, m.x + m.w - nw);
+    let y = wy.clamp(m.y, m.y + m.h - nh);
+    (x, y, nw as u32, nh as u32)
+}
+
+fn repair_window_geometry(window: &tauri::WebviewWindow) {
+    // API 失败（Windows 上实际不可达，tao 对 GetWindowRect 失败直接 panic）
+    // 时的最后兜底：默认尺寸 + 居中
+    let fallback = || {
+        let _ = window.set_size(tauri::LogicalSize::new(1180.0, 760.0));
+        let _ = window.center();
+    };
+    let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        fallback();
+        return;
+    };
+    let Ok(monitors) = window.available_monitors() else {
+        fallback();
+        return;
+    };
+    if monitors.is_empty() {
+        fallback();
+        return;
+    }
+    let geoms: Vec<MonitorGeom> = monitors.iter().map(MonitorGeom::from_monitor).collect();
+    let (wx, wy, ww, wh) = (pos.x, pos.y, size.width as i32, size.height as i32);
+    let best = pick_best_monitor(wx, wy, ww, wh, &geoms);
+    let (x, y, nw, nh) = repaired_geometry(wx, wy, ww, wh, best);
+    let _ = window.set_size(tauri::PhysicalSize::new(nw, nh));
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
 /// 显示主窗口：unminimize + show + set_focus；若隐藏前为最大化，则强制
 /// unmaximize→maximize 重建最大化状态（issue #46：即使内部状态已失同步也能恢复）。
+/// show 前校验窗口几何，失效（休眠唤醒/显示器变更后落到屏外或尺寸退化）则
+/// 平移回最近显示器工作区并保留用户尺寸（issue #183：表现为任务栏有图标但
+/// 主页面无法显示、缩略图只有一条线）。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let was_maximized = app
@@ -63,6 +210,16 @@ fn show_main_window(app: &tauri::AppHandle) {
             .map(|f| f.0.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(false);
         let _ = window.unminimize();
+        if !window_geometry_valid(&window) {
+            if let Some(st) = app.try_state::<AppState>() {
+                fs_utils::app_log(
+                    &st.data_dir,
+                    "显示主窗口：检测到窗口几何失效（疑似休眠唤醒/显示器变更），已平移回最近显示器工作区",
+                );
+            }
+            let _ = window.unmaximize();
+            repair_window_geometry(&window);
+        }
         let _ = window.show();
         let _ = window.set_focus();
         if was_maximized {
@@ -854,4 +1011,74 @@ fn main() {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    fn mon(x: i32, y: i32, w: i32, h: i32) -> MonitorGeom {
+        MonitorGeom {
+            x,
+            y,
+            w,
+            h,
+            scale: 1.0,
+        }
+    }
+
+    /// issue #183：正常窗口（完全落在工作区内 / 跨屏两侧均有足够交叠）不误判
+    #[test]
+    fn valid_window_not_misjudged() {
+        let monitors = vec![mon(0, 0, 1920, 1040), mon(1920, 0, 1920, 1040)];
+        assert!(geometry_valid(100, 100, 1280, 800, &monitors));
+        // 跨屏窗口：对主屏交叠恰为 150px（阈值边界含等号）
+        assert!(geometry_valid(1770, 100, 300, 800, &monitors));
+    }
+
+    /// issue #183：整窗挂在已断开的显示器坐标上 → 无足够交叠 → 失效；
+    /// 仅露出一条边（< 150px，任务栏缩略图一条线形态）同样失效
+    #[test]
+    fn offscreen_or_sliver_window_invalid() {
+        let monitors = vec![mon(0, 0, 1920, 1040)];
+        assert!(!geometry_valid(-4000, 0, 1280, 800, &monitors));
+        assert!(!geometry_valid(1910, 100, 1280, 800, &monitors));
+    }
+
+    /// 退化尺寸（一条线窗口）直接判失效，与位置无关
+    #[test]
+    fn degenerate_size_invalid_even_on_screen() {
+        let monitors = vec![mon(0, 0, 1920, 1040)];
+        assert!(!geometry_valid(100, 100, 120, 800, &monitors));
+        assert!(!geometry_valid(100, 100, 1280, 5, &monitors));
+    }
+
+    /// 修复目标显示器：有交叠 → 面积最大者；全部无交叠 → 中心距离最近者
+    #[test]
+    fn best_monitor_by_overlap_then_distance() {
+        let monitors = vec![mon(0, 0, 1920, 1040), mon(1920, 0, 1920, 1040)];
+        // 窗口整体在双屏之外右侧：无交叠 → 距中心更近的副屏
+        assert_eq!(pick_best_monitor(4000, 100, 800, 600, &monitors).x, 1920);
+        // 跨屏窗口：主屏交叠 220px > 副屏 80px → 主屏
+        assert_eq!(pick_best_monitor(1700, 100, 300, 600, &monitors).x, 0);
+    }
+
+    /// 修复几何：屏外窗口仅平移保留用户尺寸；超大窗口钳制到工作区；
+    /// 退化尺寸按目标显示器 DPI 重置默认尺寸并钳制
+    #[test]
+    fn repaired_geometry_clamps_into_work_area() {
+        let m = mon(0, 0, 1920, 1040);
+        // 屏外窗口：仅平移回工作区原点，尺寸原样保留
+        assert_eq!(repaired_geometry(-4000, -3000, 1280, 800, &m), (0, 0, 1280, 800));
+        // 超大窗口：尺寸钳制到工作区，位置钳到原点（nw == mw 时 clamp 区间收缩为单点，合法）
+        assert_eq!(repaired_geometry(-500, -500, 4000, 3000, &m), (0, 0, 1920, 1040));
+        // 退化尺寸：1180*1.5=1770 > 1360 → 按工作区钳制；760*1.5=1140 > 768 同理
+        let hidpi = MonitorGeom {
+            scale: 1.5,
+            ..mon(0, 0, 1360, 768)
+        };
+        assert_eq!(repaired_geometry(100, 100, 100, 800, &hidpi), (0, 0, 1360, 768));
+        // 未越界窗口不改变位置（保留用户相对摆放）
+        assert_eq!(repaired_geometry(300, 200, 1280, 800, &m), (300, 200, 1280, 800));
+    }
 }

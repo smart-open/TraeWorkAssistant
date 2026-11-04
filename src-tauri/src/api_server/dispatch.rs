@@ -496,25 +496,43 @@ pub fn resolve_target(
                             || !buddy_in_both
                             || super::wb_catalog::find(&intl_catalog, m).is_some())
                 };
-                let final_model = if !buddy_intl_only
+                let (final_model, downgrade_reason) =
+                    if !buddy_intl_only
                     && state
                     .wb_bg_downgrade
                     .load(std::sync::atomic::Ordering::Relaxed)
                     && wb_model_route::is_background_task(body)
                 {
-                    wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl_intl)
-                        .unwrap_or_else(|| r.model.clone())
+                    (
+                        wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl_intl)
+                            .unwrap_or_else(|| r.model.clone()),
+                        "bg",
+                    )
                 } else if !buddy_intl_only
                     && state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
                     // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
                     && wb_model_route::estimate_input_tokens(body)
                         >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
                 {
-                    wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl_intl)
-                        .unwrap_or_else(|| r.model.clone())
+                    (
+                        wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl_intl)
+                            .unwrap_or_else(|| r.model.clone()),
+                        "longctx",
+                    )
                 } else {
-                    r.model.clone()
+                    (r.model.clone(), "")
                 };
+                // issue #184 修复（可观测性）：降级改写模型名必须落 app_log——
+                // 此前改写零日志，用户请求 A 实际服务 B 完全无感知，无从排查
+                if !downgrade_reason.is_empty() && final_model != r.model {
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!(
+                            "dispatch downgrade: requested={} routed={} -> downgraded={} reason={}",
+                            model, r.model, final_model, downgrade_reason
+                        ),
+                    );
+                }
                 (final_model, r.effort_hint.clone())
             })
             .or(intl_hit);
@@ -981,7 +999,13 @@ fn smart_pool_order(
         };
         (
             earliest.unwrap_or(i64::MAX),
-            rate.unwrap_or(f64::MAX),
+            // issue #184 同源修复（smart 调度）：倍率键遇 NaN 哨兵（目录
+            // rate:null → f64::NAN）时 partial_cmp→Equal 把该池与任意值并列、
+            // 退化回稳定优先级序——NaN = 元数据缺失，与 None 同语义后置（MAX）
+            match rate {
+                Some(x) if !x.is_nan() => x,
+                _ => f64::MAX,
+            },
             -total,
         )
     };
