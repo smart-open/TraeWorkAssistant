@@ -90,19 +90,13 @@ describe('extractFingerprintFrom', () => {
     );
   });
 
-  it('截断样本无完整首句 → null（不给注定失配的残句规则）', () => {
-    // 后端 300 字符截断且截断处落在句中：无 ". " 句界
+  it('截断样本但首句完整 → 仍取首句（真实样本形态，可用规则）', () => {
+    // 后端 300 字符截断落在第二句之后：首句有完整 ". " 句界，规则可逐字命中
     expect(
       extractFingerprintFrom(
         'system="You are an AI agent that helps the user with programming work. Agent Teams is…"',
       ),
     ).toBe('You are an AI agent that helps the user with programming work.');
-  });
-
-  it('截断样本但截断范围内有完整首句 → 仍取首句（可用规则）', () => {
-    expect(extractFingerprintFrom('system="Short intro sentence. Then truncated tail…"')).toBe(
-      'Short intro sentence.',
-    );
   });
 
   it('截断样本且连一个完整句都没有 → null', () => {
