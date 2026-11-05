@@ -940,34 +940,48 @@ pub fn synthesize_auth_snapshot(
     Some(creds.uid.clone())
 }
 
-/// 敏感文件原子落盘（unix 创建即 0600）：同目录 tmp 文件以 mode(0o600) 创建——
-/// 消除「先以 umask 0644 落盘再 set_permissions 收紧」的明文竞窗，中断也不留
-/// 半截明文文件；sync_all + rename 原子替换。用于合成 auth 快照等含明文 token 的落盘。
+/// 敏感文件原子落盘（unix 创建即 0600）：同目录唯一 tmp（pid+序号后缀，防同槽位
+/// 并发合成互踩）以 mode(0o600) 创建——消除「先以 umask 0644 落盘再 set_permissions
+/// 收紧」的明文竞窗；sync_all + rename 原子替换，失败路径 best-effort 清理 tmp
+///（进程被硬杀仍可能残留 0600 明文 tmp，属可接受兜底）。用于合成 auth 快照等
+/// 含明文 token 的落盘。
 fn write_private_file_atomic(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut tmp_name = path.as_os_str().to_os_string();
-    tmp_name.push(".tmp");
+    tmp_name.push(&format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let tmp = std::path::PathBuf::from(tmp_name);
-    #[cfg(unix)]
-    let mut f = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
+    let result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?
-    };
-    #[cfg(not(unix))]
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)?;
-    f.write_all(body)?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, path)
+            .open(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        // 失败路径 best-effort 清理：避免明文 token 残留磁盘（unix 下 tmp 本身 0600）
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// 槽位是否带合成标记（meta.json `"bootstrap": true`，合成落槽时写入）。

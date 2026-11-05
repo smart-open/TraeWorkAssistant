@@ -109,9 +109,11 @@ static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// （run_one 各 outcome 站点 / 调用方补打；旧 outcome 无 day 字段由调用方回退当日），
 /// 跨零点批次按各自日期归组逐日落库，不再统一记「当日」串日。
 /// 跨进程互斥：GUI 与 schtasks CLI 双进程并发落库同此丢行问题，命名互斥体串行化。
-/// 锁 Busy（他方持锁落库中）幂等跳过本轮——他方完成的是同批写入，本方超时后
-/// 降级整表 load→save 反而覆盖先到方（丢行竞态）；仅机制性失败（创建/等待出错）
-/// 才降级仅进程内锁继续写（尽力不丢，保留降级日志）。
+/// 锁 Busy（他方持锁落库中）幂等跳过本轮——同批签到的两进程入口并发时，他方完成
+/// 同批写入，跳过无损失，且避免本方超时后降级整表 load→save 覆盖先到方（丢行竞态）；
+/// 例外：代理实时捕获（success 落库）与批次落库并发且他方持锁超 3s 的极罕见场景，
+/// 跳过会丢失本轮条目（临界区常态毫秒级；属幂等权衡而非严格无损失）。仅机制性
+/// 失败（创建/等待出错）才降级仅进程内锁继续写（尽力不丢，保留降级日志）。
 pub fn record_day_at(
     data_dir: &Path,
     entries: impl IntoIterator<Item = (String, String, String, Option<i64>, String)>,
@@ -119,13 +121,17 @@ pub fn record_day_at(
     let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
         data_dir,
+        // 锁名随函数由 record_today 改为 record_day_at：跨版本升级窗口（新旧二进制
+        // 并存，如仅部分机器完成升级）内两代锁不同名互不互斥，属一次性瞬态，
+        // 同版分发无影响
         "doubao_checkin",
         "record_day_at",
         3_000,
     ) {
         (Some(g), _) => Some(g),
         (None, Some(crate::tasks::qoder_common::CrossProcLockFail::Busy)) => {
-            // 他方正持锁落库（同批签到的另一进程入口）：幂等跳过，无损失
+            // 他方正持锁落库：同批签到的另一进程入口并发时跳过无损失；极罕见的
+            // 代理捕获 vs 批次落库并发场景会随跳过丢失本轮（权衡见函数注释）
             crate::fs_utils::app_log(
                 data_dir,
                 "[doubao_checkin_results] record_day_at 跨进程锁 Busy（他方落库中），幂等跳过本轮",
