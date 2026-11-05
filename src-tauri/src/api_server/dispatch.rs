@@ -530,23 +530,17 @@ pub fn resolve_target(
                 // issue #184 修复（可观测性）：降级改写模型名必须落 app_log——
                 // 此前改写零日志，用户请求 A 实际服务 B 完全无感知，无从排查。
                 // 本侧为分域候选结构（#19），CN/Intl 两个 final 各自判定，
-                // 实际生效档位取 bg/longctx 开关共用序（bg 优先，与域无关）
+                // 实际生效档位取 bg/longctx 开关共用序（bg 优先，与域无关）。
+                // 两域候选改写合并为单行落盘：此处尚在候选闭包、池选定前，
+                // 单请求可能产出 CN/Intl 双行、误读为两次降级；实际是否启用
+                // 以选池结果为准
                 let downgrade_reason = if bg_on { "bg" } else if longctx_on { "longctx" } else { "" };
-                if !downgrade_reason.is_empty() && cn_final != r.model {
+                if !downgrade_reason.is_empty() && (cn_final != r.model || intl_final != r.model) {
                     crate::fs_utils::app_log(
                         &state.data_dir,
                         &format!(
-                            "dispatch downgrade: requested={} routed={} -> downgraded={} reason={} domain=cn",
-                            model, r.model, cn_final, downgrade_reason
-                        ),
-                    );
-                }
-                if !downgrade_reason.is_empty() && intl_final != r.model {
-                    crate::fs_utils::app_log(
-                        &state.data_dir,
-                        &format!(
-                            "dispatch downgrade: requested={} routed={} -> downgraded={} reason={} domain=intl",
-                            model, r.model, intl_final, downgrade_reason
+                            "dispatch downgrade: requested={} routed={} -> cn={} intl={} reason={}（候选改写，实际生效以选池结果为准）",
+                            model, r.model, cn_final, intl_final, downgrade_reason
                         ),
                     );
                 }

@@ -199,6 +199,7 @@ pub fn run_one(
                 // 幂等命中：当日实际已签（detail 未反映或并发窗口）
                 return json!({
                     "uid": uid, "name": name, "status": "already", "reward": Value::Null,
+                    "day": crate::doubao_checkin_results::today_key(),
                     "continuous_days": continuous.map(Value::from)
                         .or_else(|| detail.get("continuous_days").cloned()),
                     "total_amount": total_amount,
@@ -210,6 +211,7 @@ pub fn run_one(
             if checked {
                 return json!({
                     "uid": uid, "name": name, "status": "success",
+                    "day": crate::doubao_checkin_results::today_key(),
                     "reward": reward.map(Value::from).unwrap_or(Value::Null),
                     "continuous_days": continuous.map(Value::from)
                         .or_else(|| detail.get("continuous_days").cloned()),
@@ -221,6 +223,7 @@ pub fn run_one(
             }
             json!({
                 "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
+                "day": crate::doubao_checkin_results::today_key(),
                 "continuous_days": detail.get("continuous_days").cloned().unwrap_or(Value::Null),
                 "total_amount": total_amount,
                 "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
@@ -229,6 +232,7 @@ pub fn run_one(
         }
         Err(e) => json!({
             "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
+            "day": crate::doubao_checkin_results::today_key(),
             "continuous_days": detail.get("continuous_days").cloned().unwrap_or(Value::Null),
             "total_amount": total_amount,
             "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
@@ -324,16 +328,22 @@ fn collect_targets(state: &AppState) -> Result<Vec<(String, String, Option<Strin
 
 /// 落库 + 池回写 + 运维历史（batch/single 共用收尾）
 fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
-    // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）
+    // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）。
+    // day 取各 outcome 产生时刻（run_one 内打点），落库跨零点不串日；
+    // 旧记录无 day 字段时回退当前日期
     let entries = outcomes.iter().map(|o| {
         (
+            o.get("day")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(crate::doubao_checkin_results::today_key),
             o.get("uid").and_then(Value::as_str).unwrap_or("").to_string(),
             o.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             o.get("status").and_then(Value::as_str).unwrap_or("fail").to_string(),
             o.get("reward").and_then(Value::as_i64),
         )
     });
-    crate::doubao_checkin_results::record_today(&state.data_dir, entries);
+    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries);
 
     // ② 池回写（两阶段短临界区：重读最新池按 uid 合并）
     let run_at = fs_utils::now_ts();

@@ -946,23 +946,15 @@ pub fn synthesize_auth_snapshot(
     if let Err(e) = std::fs::create_dir_all(dest.join("auth"))
         .map_err(|e| e.to_string())
         .and_then(|()| {
-            std::fs::write(&synth_auth_path, &body)
-                .map_err(|e| e.to_string())
+            // 合成 auth 文件含 accessToken/refreshToken 明文，走 vault 同款
+            // 原子写（unix 下 tmp 0600 创建 + sync_all + rename）：杜绝
+            // 「先 0644 落盘再 set_permissions 收紧」的可读竞窗，且中断不留
+            // 半截明文文件（备份/恢复走 fs::copy 保留源权限，不受影响）
+            crate::vault::write_key_file_atomic(&synth_auth_path, &body)
         })
     {
         sink.step("bootstrap", StepStatus::Warn, &format!("合成快照写入失败: {e}"));
         return None;
-    }
-    // 合成 auth 文件含 accessToken/refreshToken 明文，std::fs::write 落盘权限为
-    // umask 默认（通常 0644），mac 多用户机上其他用户可读——收紧为 0600
-    //（备份/恢复走 fs::copy 会保留源权限，不受此影响）
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            &synth_auth_path,
-            std::fs::Permissions::from_mode(0o600),
-        );
     }
     let meta = json!({
         "schemaVersion": 1,

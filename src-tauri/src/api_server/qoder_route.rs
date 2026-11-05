@@ -771,8 +771,17 @@ fn run_qoder_stream(
     // 形态（三协议统一归一为 image_url）。非视觉模型（supportsImages=false）仍
     // F-63 红线明示拒绝而非静默丢图
     if body_has_image(&peek) && !entry_supports_images(&entry) {
+        // 文案区分两类 fail-closed 场景：目录显式 supportsImages=false（确知
+        // 不支持）vs 缺字段/类型异常（未声明，按不支持保守处理）——用户据此
+        // 分辨「换模型」还是「补目录声明」
+        let declared_no_vl = entry.get("supportsImages") == Some(&Value::Bool(false));
+        let reason = if declared_no_vl {
+            "不支持视觉输入（Qoder 目录 is_vl=false）"
+        } else {
+            "未声明视觉能力（Qoder 目录缺 supportsImages 声明），按不支持处理"
+        };
         let msg = format!(
-            "upstream 400 error: 模型 {model} 不支持视觉输入（Qoder 目录 is_vl=false），请移除图片或改用支持视觉的模型"
+            "upstream 400 error: 模型 {model} {reason}，请移除图片或改用支持视觉的模型"
         );
         state.logger.log_request(
             "qoder", "POST", proto.log_path(), model, true, 400, "-",

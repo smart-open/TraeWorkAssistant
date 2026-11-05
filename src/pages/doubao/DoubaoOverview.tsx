@@ -432,12 +432,14 @@ export default function DoubaoOverview() {
         api.env.locate('doubao').catch(() => null),
         api.doubao.accountsList().catch(() => [] as DoubaoAccountView[]),
         api.doubao.history().catch(() => [] as DoubaoHistoryEvent[]),
-        api.doubao.dashboardStats().catch(() => null),
+        // 失败哨兵 undefined：保留上次成功数据，不把已有统计清成空态
+        //（对齐 accountsList/history 失败给空数组的降级口径）
+        api.doubao.dashboardStats().catch(() => undefined),
       ]);
       setLocate(loc);
       setAccounts(accs);
       setHistory(hist);
-      setStats(st);
+      if (st !== undefined) setStats(st);
     } catch (err) {
       pushToast('error', `豆包概述刷新失败：${String(err)}`);
     } finally {

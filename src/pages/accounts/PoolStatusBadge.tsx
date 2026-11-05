@@ -15,6 +15,13 @@ import type { PoolStatus } from '../../types';
  */
 export function PoolStatusBadge({ status }: { status: PoolStatus | undefined }) {
   if (!status) return null;
+  if (status.disabled) {
+    return (
+      <Badge tone="slate" title="账号已禁用（SessionDead/Forbidden 等不可恢复状态）：转发侧已跳过该账号，需重新登录恢复">
+        已禁用
+      </Badge>
+    );
+  }
   if (status.hard_credit) {
     const secs = status.hard_until != null ? status.hard_until - Math.floor(Date.now() / 1000) : 0;
     const remaining =

@@ -235,7 +235,8 @@ pub fn fetch_dosage_info(
 /// 响应体解析（issue #179 兼容加固，与网络层解耦便于单测）：
 /// - 包条目**全响应**递归收集（不再依赖固定 Accounts 路径/容器名，包容器挪层级/改名
 ///   均能命中；包特征键足够特异，全树收集误收风险极低）；
-/// - Status 未知值 fail-open 保留并落诊断（上游新增状态值不再静默清空整包）；
+/// - Status 未知值 fail-open 保留明细与诊断（上游新增状态值不再静默清空整包），
+///   但不参与「最近到期」计算（未知状态可能是作废/异常包，到期不可信）；
 /// - 到期解析补 ISO/纯日期兜底；ExpiredTime 补字符串形态。
 /// `root` = 整个响应：包收集、TotalDosage 深挖、诊断骨架统一范围。
 pub fn parse_dosage_body(root: &Value) -> DosageInfo {
@@ -252,31 +253,37 @@ pub fn parse_dosage_body(root: &Value) -> DosageInfo {
             .as_i64()
             .or_else(|| status_raw.as_str().and_then(|s| s.trim().parse().ok()))
             .unwrap_or(0);
-        if status != 0 && status != 3 {
+        let known_status = status == 0 || status == 3;
+        if !known_status {
             unknown_statuses.push(status_raw.clone());
         }
         let cycle_end = a
             .get("CycleEndTime")
             .and_then(Value::as_str)
             .and_then(parse_expire_str);
-        if let Some(e) = cycle_end {
-            if e > now {
-                expire_candidates.push(e);
+        // 未知 Status 包保留明细与诊断（fail-open），但**不参与「最近到期」
+        // 计算**——未知状态可能是作废/异常/冻结包，其到期计入会把账号到期
+        // 误导为未来某刻（仅 0=有效/3=宽限的状态可信）
+        if known_status {
+            if let Some(e) = cycle_end {
+                if e > now {
+                    expire_candidates.push(e);
+                }
             }
-        }
-        // 旧字段兼容：数值/数字字符串 ExpiredTime（秒/毫秒归一）
-        let expired_num = a
-            .get("ExpiredTime")
-            .and_then(Value::as_f64)
-            .or_else(|| {
-                a.get("ExpiredTime")
-                    .and_then(Value::as_str)
-                    .and_then(|s| s.trim().parse::<f64>().ok())
-            });
-        if let Some(t) = expired_num {
-            let secs = if t > 1e12 { t / 1000.0 } else { t };
-            if secs > now as f64 {
-                expire_candidates.push(secs as i64);
+            // 旧字段兼容：数值/数字字符串 ExpiredTime（秒/毫秒归一）
+            let expired_num = a
+                .get("ExpiredTime")
+                .and_then(Value::as_f64)
+                .or_else(|| {
+                    a.get("ExpiredTime")
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.trim().parse::<f64>().ok())
+                });
+            if let Some(t) = expired_num {
+                let secs = if t > 1e12 { t / 1000.0 } else { t };
+                if secs > now as f64 {
+                    expire_candidates.push(secs as i64);
+                }
             }
         }
         packages.push(DosagePackage {
@@ -1586,14 +1593,18 @@ mod tests {
         assert_eq!(b.expire_secs, Some(date_only));
     }
 
-    /// 未知 Status fail-open：不再静默丢弃整包，且落诊断
+    /// 未知 Status fail-open：不再静默丢弃整包，且落诊断；其到期时间不参与
+    /// 「最近到期」计算（作废/异常包到期不可信）
     #[test]
     fn unknown_status_fail_open_and_diag() {
         let core = json!({ "TotalDosage": 5, "Accounts": [
-            { "PackageName": "A", "CapacityRemain": 2, "Status": 7 },
+            { "PackageName": "A", "CapacityRemain": 2, "Status": 7,
+              "CycleEndTime": "2099-01-01T00:00:00Z" },
         ]});
         let info = parse_dosage_body(&core);
         assert_eq!(info.packages.len(), 1, "未知状态保留");
+        assert!(info.packages[0].expire_secs.is_some(), "明细保留到期字段");
+        assert_eq!(info.expire_secs, None, "未知状态的到期不参与最近到期计算");
         let diag = info.parse_diag.expect("未知状态出诊断");
         assert!(diag.contains("7"), "诊断携带原始 Status 值");
     }

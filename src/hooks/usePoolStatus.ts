@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/tauri';
-import { useAppStore } from '../store';
 import type { PoolStatus } from '../types';
 
 /** 池种类 → 对应 pool_status 命令（issue #178 账号列表限流徽标数据源） */
@@ -21,19 +20,16 @@ const FETCHERS: Record<PoolKind, () => Promise<PoolStatus[]>> = {
  * 网关内存池（不落 account_cooldowns 持久表），账号 View 快照拿不到，
  * 必须经 pool_status 系命令实时读取。
  *
- * API 网关未启动 / 查询失败时降级为空 Map（冷却本来也随网关重启清零，
- * 不显示即正确语义）；倒计时跳动由 Badge 组件内部 interval 负责，本 hook
- * 固定 3s 刷新数据即可。
+ * 不按前端 apiStatus.running 门控轮询：托盘启停网关在 Rust 侧直接生效、
+ * 不经过前端 store，门控会把「运行中」误判为「未启动」导致徽标脱同步。
+ * 网关未启动/查询失败时 FETCHERS reject → catch 降级为空 Map（冷却本来
+ * 也随网关重启清零，不显示即正确语义）；倒计时跳动由 Badge 组件内部
+ * interval 负责，本 hook 固定 3s 刷新数据即可。
  */
 export function usePoolStatus(kind: PoolKind): Map<string, PoolStatus> {
-  const running = useAppStore((s) => s.apiStatus?.running ?? false);
   const [list, setList] = useState<PoolStatus[]>([]);
 
   useEffect(() => {
-    if (!running) {
-      setList([]);
-      return;
-    }
     let alive = true;
     const fetch = async () => {
       try {
@@ -50,7 +46,7 @@ export function usePoolStatus(kind: PoolKind): Map<string, PoolStatus> {
       alive = false;
       clearInterval(id);
     };
-  }, [kind, running]);
+  }, [kind]);
 
   return useMemo(() => new Map(list.map((s) => [s.uid, s])), [list]);
 }

@@ -635,17 +635,28 @@ fn fetch_round(
                 let items: Vec<Value> = packages_from(&b2);
                 // 满页判定用过滤前口径（raw_capable_count），见其文档
                 let got = raw_capable_count(&b2);
+                // 本页新增计数 + 带 code 标记：满页、含 code 却零新增 = 上游
+                // 不真正分页（恒回同一满页），继续翻只会空转到 50 页上限
+                let mut page_new = 0usize;
+                let mut page_has_code = false;
                 for p in items {
                     if let Some(code) = p.get("code").and_then(Value::as_str) {
+                        page_has_code = true;
                         // 跨页按 PackageCode 去重：上游若不真正分页（恒回同一满页），
                         // 无条件 push 会翻满 50 页 × 100 条重复明细进包列表/悬停明细
                         if !enriched_codes.insert(code.to_string()) {
                             continue;
                         }
                     }
+                    page_new += 1;
                     enriched.push(p);
                 }
                 if got < 100 || page >= 50 {
+                    break;
+                }
+                // 满页且本页带 code 却零新增：假分页（同页重复），终止翻页；
+                // 页内全部 code-less（无法按 code 判重）时保守继续，防丢数据
+                if got >= 100 && page_has_code && page_new == 0 {
                     break;
                 }
                 page += 1;

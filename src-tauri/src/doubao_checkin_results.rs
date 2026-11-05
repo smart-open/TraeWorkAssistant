@@ -121,30 +121,46 @@ pub fn save(data_dir: &Path, results: &ResultsFile) {
 }
 
 /// 当日落库进程内互斥：UI 手动签到、调度器/CLI 落库三路并发时，
-/// record_today 整表 load→record→save 的后保存方会覆盖先保存方的当日记录，
+/// record_day_at 整表 load→record→save 的后保存方会覆盖先保存方的当日记录，
 /// 持锁串行化保证同进程内不丢行
 static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 记录当日签到最终状态（签到完成后的 done 落库入口），随后写盘。
+/// 记录各日签到最终状态（签到完成后的 done 落库入口），随后写盘。
+/// entries 首项为 day 打点（run_one 在 outcome 产生时刻记下，见 doubao_checkin
+/// 的 json! 站点），本函数按 day 分组逐日 record_day——落库跨零点不串日。
 /// 跨进程互斥：GUI 与 schtasks CLI 双进程并发落库同此丢行问题，
-/// 命名互斥体串行化（对齐 checkin_results 锁语义）；抢锁失败降级仅进程内锁继续写。
-pub fn record_today(
+/// 命名互斥体串行化（对齐 checkin_results 锁语义）。抢锁失败分级处理：
+/// Busy（他方正持锁落库）幂等跳过本轮——他方必然完成同批写入，跳过无损失；
+/// 仅锁机制性失败（创建/等待出错）才降级进程内锁继续写。
+pub fn record_day_at(
     data_dir: &Path,
-    entries: impl IntoIterator<Item = (String, String, String, Option<i64>)>,
+    entries: impl IntoIterator<Item = (String, String, String, String, Option<i64>)>,
 ) {
     let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
         data_dir,
         "doubao_checkin",
-        "record_today",
+        "record_day_at",
         3_000,
     ) {
         (Some(g), _) => Some(g),
+        (None, Some(fail))
+            if matches!(
+                fail,
+                crate::tasks::qoder_common::CrossProcLockFail::Busy
+            ) =>
+        {
+            crate::fs_utils::app_log(
+                data_dir,
+                "[doubao_checkin_results] record_day_at 跨进程锁 Busy（他方落库中），本轮落库跳过",
+            );
+            return;
+        }
         (None, Some(fail)) => {
             crate::fs_utils::app_log(
                 data_dir,
                 &format!(
-                    "[doubao_checkin_results] record_today 跨进程锁未获取：{}（降级进程内锁继续）",
+                    "[doubao_checkin_results] record_day_at 跨进程锁未获取：{}（降级进程内锁继续）",
                     fail.describe()
                 ),
             );
@@ -165,7 +181,14 @@ pub fn record_today(
         }
     };
     f.trim(RETENTION_DAYS);
-    f.record_day(&today_key(), entries);
+    // 按 day 分组逐日落库（BTreeMap 保日期有序）
+    let mut by_day: BTreeMap<String, Vec<(String, String, String, Option<i64>)>> = BTreeMap::new();
+    for (day, uid, name, status, reward) in entries {
+        by_day.entry(day).or_default().push((uid, name, status, reward));
+    }
+    for (day, day_entries) in by_day {
+        f.record_day(&day, day_entries);
+    }
     save(data_dir, &f);
 }
 
