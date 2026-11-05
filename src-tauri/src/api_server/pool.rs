@@ -150,6 +150,12 @@ pub struct PoolEntry {
     /// None = 无时间信息（升级前旧数据/无快照），reserve 过滤同样不生效
     pub credits_fetched_at: Option<i64>,
     pub disabled: bool,
+    /// 配置级禁用（2026-11-05 审查 M-3）：仅由 sync_from_* 从持久化配置落地时置位
+    /// （WB = needs_relogin；Trae = 冷却表 SessionDead/refresh_token_invalid），
+    /// 运行期 note_error/note_refresh_invalid **不改写**——巡检指纹
+    /// （config_fingerprint）用本字段而非 disabled，因为运行期禁用是纯内存态，
+    /// DB 侧指纹观测不到，纳入必然永久漂移（详见 config_fingerprint 文档）
+    pub config_disabled: bool,
     pub err_count: i32,
     /// 冷却截止时间（Unix 秒），0 表示无冷却
     pub until: i64,
@@ -294,7 +300,20 @@ impl ApiPool {
         }
     }
 
-    /// 加权公平轮转取号（FairRotation）。
+    /// 重建条目后重置公平账本观察基线（2026-11-05 审查 L-2）：
+    /// sync_* 全量重建把 credits 重置为持久层快照值，若快照低于上次观察基线，
+    /// 下一次 pick_fair 的差分会把「重建回填差」误记为真实消耗、score 虚增。
+    /// 重建后统一以条目当前余额为新基线；无余额快照的条目移除基线（下次首见重立）。
+    /// 锁序：调用方持 entries 锁，此处取 fair —— 全库统一 entries → fair
+    fn rebase_fair_baselines(&self, entries: &HashMap<String, PoolEntry>) {
+        let mut fair = safe_lock(&self.fair);
+        fair.last_balance = entries
+            .values()
+            .filter_map(|e| e.credits.map(|c| (e.uid.clone(), c)))
+            .collect();
+    }
+
+    /// 加权公平轮转取号（FairRotation）——**两阶段第 1 步：试选，不记账**。
     ///
     /// 排序键：是否饥饿 → 加权消耗份额 → 在途数 → 取号序号。
     /// - 份额 = 实际消耗积分 / 权重（7 天内到期 2.0，其余 1.0）——
@@ -303,6 +322,10 @@ impl ApiPool {
     /// - 同份额用单调序号严格轮转，秒级时间戳相同、同刻并发都不会退化；
     /// - 在途数作为次序键，配合 busy_filter 避免并发请求扎堆同一账号；
     /// - 饥饿保护：闲置 ≥ STARVATION_SECS 的账号进入优先组（防低权重饿死）。
+    ///
+    /// 记账（份额递增 + 序号）延迟到 [`Self::commit_fair_pick`]：防惊群「100ms
+    /// 让位」会重选一次，若试选即记账，被让位的账号凭空多担一份份额且序号被
+    /// 消耗（2026-11-05 审查 M-2）——改为定选（真正服务请求的账号）后才记账。
     fn pick_fair<'a>(
         &self,
         cands: &[&'a PoolEntry],
@@ -340,18 +363,24 @@ impl ApiPool {
             }
         }
         let (picked, _) = best?;
-        // 选中即记账：按 1/权重 递增，权重 2 的账号份额翻倍
-        let w = fair_weight(picked, now);
-        let w = if w > 0.0 { w } else { 1.0 };
-        *fair.score.entry(picked.uid.clone()).or_insert(0.0) += 1.0 / w;
-        let next = fair.seq + 1;
-        fair.seq = next;
-        fair.last_seq.insert(picked.uid.clone(), next);
         Some(picked)
     }
 
+    /// 两阶段第 2 步：定选记账——按 `1/权重` 递增份额（权重 2 的账号份额翻倍）
+    /// 并消耗一个单调序号。仅对**最终**服务请求的账号调用（防惊群让位后的替补
+    /// 账号也是定选；首次试选被让位则不记账）。
+    fn commit_fair_pick(&self, uid: &str, weight: f64) {
+        let mut fair = safe_lock(&self.fair);
+        let w = if weight > 0.0 { weight } else { 1.0 };
+        *fair.score.entry(uid.to_string()).or_insert(0.0) += 1.0 / w;
+        let next = fair.seq + 1;
+        fair.seq = next;
+        fair.last_seq.insert(uid.to_string(), next);
+    }
+
     /// 统一选号入口（策略分派）：保持 pick_by_strategy 纯函数语义，
-    /// FairRotation 需要运行态（消耗记账 + 序号），单独走 pick_fair
+    /// FairRotation 需要运行态（消耗记账 + 序号），单独走 pick_fair。
+    /// **只试选不记账**——记账由调用方在定选后经 [`Self::commit_fair_pick`] 完成
     fn pick_candidates<'a>(
         &self,
         cands: &[&'a PoolEntry],
@@ -367,27 +396,26 @@ impl ApiPool {
     }
 
     /// 运行池身份/配置指纹（不含任何凭证明文）：一致性巡检比对用。
-    /// 组成：每条 (uid, 配置级 disabled, refresh_invalid(恒 0), 到期时间) 排序后
+    /// 组成：每条 (uid, config_disabled, refresh_invalid(恒 0), 到期时间) 排序后
     /// SHA256 前 8 字节。不含积分——积分由请求回写高频变动，纳入会导致巡检频繁误判重载。
     ///
-    /// **禁用位只统计「配置级禁用」**（`sync_from_wb` 落地的 `needs_relogin`，
-    /// 特征 = disabled 且 reason 为空）。运行期 `note_error(SessionDead/Forbidden)` /
-    /// `note_refresh_invalid` 产生的禁用/失效标记**不纳入**：它们是纯内存态，
-    /// DB 侧指纹（wb_pool_fingerprint 按 `needs_relogin|0|expire` 计算）永远观测不到，
-    /// 纳入必然永久漂移 → 每 60s 触发一次无意义热重载 + 日志，且每次重载
-    /// `sync_from_wb` 重建都会把死账号重新放行一轮（disabled = needs_relogin = false）。
-    /// refresh_invalid 位恒 0 与 DB 侧硬编码对齐（sync_from_wb 恒写 false；
-    /// 运行期置位属运行态，同上不纳入）。
+    /// **禁用位只统计「配置级禁用」**（[`PoolEntry::config_disabled`]，由
+    /// `sync_from_wb` 落地的 `needs_relogin` 置位）。运行期
+    /// `note_error(SessionDead/Forbidden)` / `note_refresh_invalid` 产生的禁用/
+    /// 失效标记**不纳入**：它们是纯内存态，DB 侧指纹（wb_pool_fingerprint 按
+    /// `needs_relogin|0|expire` 计算）永远观测不到，纳入必然永久漂移 → 每 60s
+    /// 触发一次无意义热重载 + 日志，且每次重载 `sync_from_wb` 重建都会把死账号
+    /// 重新放行一轮（disabled = needs_relogin = false）。refresh_invalid 位恒 0
+    /// 与 DB 侧硬编码对齐（sync_from_wb 恒写 false；运行期置位属运行态，同上不纳入）。
     pub fn config_fingerprint(&self) -> u64 {
         let entries = safe_lock(&self.entries);
         let mut parts: Vec<String> = entries
             .values()
             .map(|e| {
-                let config_disabled = e.disabled && e.reason.is_empty();
                 format!(
                     "{}|{}|{}|{}",
                     e.uid,
-                    config_disabled as u8,
+                    e.config_disabled as u8,
                     0u8,
                     e.credits_expire_at.unwrap_or(0)
                 )
@@ -589,6 +617,7 @@ impl ApiPool {
                         // 全量写入 credits 与 updated_at，时间戳对全体条目生效
                         credits_fetched_at,
                         disabled,
+                        config_disabled: disabled,
                         err_count: cd.error_count,
                         until: cd.until,
                         reason: cd.reason,
@@ -612,6 +641,7 @@ impl ApiPool {
             let mut inflight = safe_lock(&self.inflight);
             inflight.retain(|uid, _| entries.contains_key(uid));
         }
+        self.rebase_fair_baselines(&entries);
     }
 
     /// 池运行期三键拨新（issue #67 运行期回写 + issue #102 Qoder / issue #109
@@ -676,6 +706,7 @@ impl ApiPool {
                     credits_expire_at: a.credits_expire_at,
                     credits_fetched_at: a.credits_fetched_at,
                     disabled: a.needs_relogin,
+                    config_disabled: a.needs_relogin,
                     err_count: 0,
                     until: 0,
                     reason: String::new(),
@@ -698,6 +729,7 @@ impl ApiPool {
             let mut inflight = safe_lock(&self.inflight);
             inflight.retain(|uid, _| entries.contains_key(uid));
         }
+        self.rebase_fair_baselines(&entries);
     }
 
     /// 从 Qoder 账号同步池（p3-3）：Qoder 专用池实例（`ApiSharedState.qoder_pool`），
@@ -723,6 +755,7 @@ impl ApiPool {
                     credits_expire_at: a.credits_expire_at,
                     credits_fetched_at: a.credits_fetched_at,
                     disabled: a.needs_relogin,
+                    config_disabled: a.needs_relogin,
                     err_count: 0,
                     until: 0,
                     reason: String::new(),
@@ -745,6 +778,7 @@ impl ApiPool {
             let mut inflight = safe_lock(&self.inflight);
             inflight.retain(|uid, _| entries.contains_key(uid));
         }
+        self.rebase_fair_baselines(&entries);
     }
 
     /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None。
@@ -889,6 +923,12 @@ impl ApiPool {
         } else {
             None
         };
+        // FairRotation 定选记账（2026-11-05 审查 M-2）：试选不记账、定选才记，
+        // 防惊群让位后 picked 已是替补，首次试选的账号不留幽灵份额；
+        // busy_fallback 降级路径不记账（未走策略试选，min(inflight) 本身即分散）
+        if strategy == PoolStrategy::FairRotation && !busy_fallback {
+            self.commit_fair_pick(&picked.uid, fair_weight(picked, now));
+        }
         drop(cands); // 释放 entries 不可变借用后再更新 last_used
         if let Some(e) = entries.get_mut(&account.uid) {
             e.last_used = now;
@@ -978,6 +1018,10 @@ impl ApiPool {
             "sticky_yield from={sticky_uid} to={} inflight={} limit={}",
             picked.uid, sticky_inflight, limit
         ));
+        // FairRotation 定选记账（对齐主路径两阶段口径）
+        if strategy == PoolStrategy::FairRotation {
+            self.commit_fair_pick(&picked.uid, fair_weight(picked, now));
+        }
         if let Some(e) = entries.get_mut(&account.uid) {
             e.last_used = now;
         }
@@ -2238,6 +2282,7 @@ mod tests {
             uid: "a".into(), name: String::new(), jwt: String::new(),
             credits: Some(100.0), credits_expire_at: None,
             credits_fetched_at: Some(now_ts()), disabled: false,
+            config_disabled: false,
             err_count: 0, until: 0, reason: String::new(),
             device_id: String::new(), machine_id: String::new(),
             hard_until: 0, last_used: 1000, successes: 0, failures: 0, cb_trips: 0,
@@ -2250,6 +2295,7 @@ mod tests {
                 uid: "b".into(), name: String::new(), jwt: String::new(),
                 credits: Some(100.0), credits_expire_at: None,
                 credits_fetched_at: Some(now_ts()), disabled: false,
+                config_disabled: false,
                 err_count: 0, until: 0, reason: String::new(),
                 device_id: String::new(), machine_id: String::new(),
                 hard_until: 0, last_used: 0, successes: 0, failures: 0, cb_trips: 0,
@@ -2294,6 +2340,7 @@ mod tests {
             credits_expire_at: None,
             credits_fetched_at: Some(now_ts()),
             disabled: false,
+            config_disabled: false,
             err_count: 0,
             until: 0,
             reason: String::new(),
@@ -3147,11 +3194,14 @@ mod tests {
 
     #[test]
     fn fingerprint_ignores_runtime_disable_but_tracks_config_disable() {
-        // 巡检闭环（2026-11-05 审查 H-1）：运行期 note_error/note_refresh_invalid
+        // 巡检闭环（2026-11-05 审查 H-1 + M-3）：运行期 note_error/note_refresh_invalid
         // 的禁用是纯内存态，DB 侧指纹永远观测不到——若纳入，死账号一经禁用
         // 指纹即永久漂移 → 每 60s 无意义重载 + 日志，且每次重载 sync_from_wb
         // 重建都把死账号重新放行一轮。故运行期禁用不得改变指纹；
-        // 配置级禁用（sync_from_wb 落地 needs_relogin，reason 为空）仍必须反映。
+        // 配置级禁用（sync_from_wb 落地 needs_relogin）仍必须反映。
+        // M-3 守卫：clear_cooldowns 会清空 reason 但保留 disabled——若指纹靠
+        // 「disabled && reason.is_empty()」推断，此处会把运行期禁用误判为配置级
+        // → 漂移循环；显式 config_disabled 字段下不得改变指纹。
         let pool = build_pool(&[("a", 1000.0, 0)]);
         let fp0 = pool.config_fingerprint();
         pool.note_error("a", ErrKind::SessionDead);
@@ -3160,13 +3210,19 @@ mod tests {
             fp0,
             "运行期 SessionDead 禁用不得改变指纹"
         );
+        pool.clear_cooldowns();
+        assert_eq!(
+            pool.config_fingerprint(),
+            fp0,
+            "clear_cooldowns 清空 reason 后，运行期禁用仍不得被误判为配置级（M-3）"
+        );
         pool.note_refresh_invalid("a");
         assert_eq!(
             pool.config_fingerprint(),
             fp0,
             "运行期 refresh_invalid 禁用不得改变指纹"
         );
-        // 配置级禁用：needs_relogin=true 经 sync_from_wb 重建（reason 为空）→ 指纹必须变化
+        // 配置级禁用：needs_relogin=true 经 sync_from_wb 重建 → 指纹必须变化
         pool.sync_from_wb(
             &[crate::api_server::pool::WbSyncAccount {
                 uid: "a".into(),
@@ -3183,10 +3239,29 @@ mod tests {
             }],
             &["a".to_string()],
         );
+        let fp_config = pool.config_fingerprint();
         assert_ne!(
-            pool.config_fingerprint(),
+            fp_config,
             fp0,
             "配置级禁用（needs_relogin）必须改变指纹，否则 DB 侧禁用变更巡检不到"
         );
+        // 配置级禁用条目被运行期 note_refresh_invalid 覆写 reason（"" →
+        // "refresh_token_invalid"）——reason 启发式下会误判位翻转，显式字段下不漂移
+        pool.note_refresh_invalid("a");
+        assert_eq!(
+            pool.config_fingerprint(),
+            fp_config,
+            "运行期覆写 reason 不得扰动配置级禁用位（M-3）"
+        );
+        // 公平账本基线重定（审查 L-2）：重建把 credits 重置为快照值，
+        // 基线必须随重建重置为条目当前余额，否则下次差分把「回填差」记为消耗
+        {
+            let fair = safe_lock(&pool.fair);
+            assert_eq!(
+                fair.last_balance.get("a"),
+                Some(&1000.0),
+                "重建后公平账本基线应重置为快照余额"
+            );
+        }
     }
 }

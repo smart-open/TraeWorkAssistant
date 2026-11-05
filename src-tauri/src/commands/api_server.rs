@@ -1067,8 +1067,12 @@ fn wb_pool_fingerprint(state: &AppState) -> u64 {
     u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
 }
 
-/// 巡检线程去重闸门：重复 start/stop 不叠加线程
-static RECONCILER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 巡检线程代际号（2026-11-05 审查 M-1）：每次网关启动递增，线程每个 tick
+/// 比对自己的代际——被新启动取代的旧线程在下一个 tick 自退。
+/// 替代原 bool 闸门：bool 在「stop → 快速 start」竞态下会让新会话失去巡检线程
+/// （旧线程在 stop 窗口醒来 break、清位发生在新 start 跳过 spawn 之后）。
+/// 代价：重叠窗口内（≤ 一个巡检周期）新旧线程并存，指纹比对幂等无害。
+static RECONCILER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 巡检间隔（秒）
 const RECONCILE_INTERVAL_SECS: u64 = 60;
 
@@ -1077,20 +1081,29 @@ const RECONCILE_INTERVAL_SECS: u64 = 60;
 /// - 无变化 → 不重载（不产生日志噪音、不重置运行态）；
 /// - 有漂移 → 走与事件热重载完全相同的 apply_pool_snapshot 路径（原子替换，
 ///   在途请求持旧快照跑完，不中断）；
-/// - 服务停止（runtime 为 None）→ 线程自然退出，重启后由 do_start 重新拉起。
+/// - 服务停止（runtime 为 None）或被新启动取代（代际变化）→ 线程退出，
+///   重启后由 do_start 重新拉起。
+/// 线程体整体 catch_unwind（2026-11-05 审查 H-1）：巡检涉及文件 IO / JSON 解析 /
+/// 全量重建，任一 panic 若直接杀死线程，进程内巡检将静默永久失效——捕获后落
+/// app_log 留痕，由下次网关启动重建。
 ///
 /// 这是「事件驱动热重载」的兜底：任何未经 reload 调用就落库的写入（手工改库、
 /// 旧版本残留路径、第三方工具导入）都会被下一次巡检纠正。
 fn spawn_pool_reconciler(app: tauri::AppHandle) {
+    use std::panic::AssertUnwindSafe;
     use std::sync::atomic::Ordering;
-    if RECONCILER_RUNNING.swap(true, Ordering::SeqCst) {
-        return;
-    }
+    let gen = RECONCILER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    // 线程拉起失败时闭包（连同 app）已被消费，另持克隆用于失败留痕
+    let err_app = app.clone();
     let spawned = std::thread::Builder::new()
         .name("pool-reconciler".into())
         .spawn(move || {
-            loop {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| loop {
                 std::thread::sleep(std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS));
+                // 被新启动取代（代际变化）→ 旧线程退出，新线程接管巡检
+                if RECONCILER_GEN.load(Ordering::SeqCst) != gen {
+                    break;
+                }
                 let (Some(state), Some(runtime)) = (
                     app.try_state::<AppState>(),
                     app.try_state::<Mutex<Option<ApiServerRuntime>>>(),
@@ -1116,11 +1129,26 @@ fn spawn_pool_reconciler(app: tauri::AppHandle) {
                     );
                     reload_pools_if_running(state.inner(), runtime.inner());
                 }
+            }));
+            if result.is_err() {
+                // panic 防护留痕：巡检线程异常退出（凭据/积分不落日志）
+                if let Some(state) = app.try_state::<AppState>() {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        "池一致性巡检线程异常退出（panic），已记录；将由下次网关启动重建",
+                    );
+                }
             }
-            RECONCILER_RUNNING.store(false, Ordering::SeqCst);
         });
-    if spawned.is_err() {
-        RECONCILER_RUNNING.store(false, Ordering::SeqCst);
+    if let Err(e) = spawned {
+        // 线程拉起失败（极少见）：落日志留痕，本次运行期无巡检兜底，
+        // 事件驱动热重载路径不受影响
+        if let Some(state) = err_app.try_state::<AppState>() {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("池一致性巡检线程拉起失败: {e}；事件驱动热重载不受影响"),
+            );
+        }
     }
 }
 
