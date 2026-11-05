@@ -230,6 +230,7 @@ pub fn run_one(
                 "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
                 "continuous_days": Value::Null, "total_amount": Value::Null,
                 "last_checkin_date": Value::Null, "message": format!("detail 查询：{e}"),
+                "day": crate::doubao_checkin_results::today_key(),
             })
         }
     };
@@ -247,6 +248,7 @@ pub fn run_one(
             "total_amount": total_amount,
             "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
             "message": "今日已签到",
+            "day": crate::doubao_checkin_results::today_key(),
         });
     }
 
@@ -288,6 +290,7 @@ pub fn run_one(
                     "last_checkin_date": date.map(Value::from)
                         .or_else(|| detail.get("last_checkin_date").cloned()),
                     "message": "今日已签到（幂等）",
+                    "day": crate::doubao_checkin_results::today_key(),
                 });
             }
             if checked {
@@ -300,6 +303,7 @@ pub fn run_one(
                     "last_checkin_date": date.map(Value::from)
                         .or_else(|| detail.get("last_checkin_date").cloned()),
                     "message": format!("签到成功 +{} 额度", reward.unwrap_or(0)),
+                    "day": crate::doubao_checkin_results::today_key(),
                 });
             }
             json!({
@@ -308,6 +312,7 @@ pub fn run_one(
                 "total_amount": total_amount,
                 "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
                 "message": "签到未生效（checked_in=false）",
+                "day": crate::doubao_checkin_results::today_key(),
             })
         }
         Err(e) => {
@@ -324,6 +329,7 @@ pub fn run_one(
                             "total_amount": re.get("total_amount").cloned().unwrap_or(Value::Null),
                             "last_checkin_date": re.get("last_checkin_date").cloned().unwrap_or(Value::Null),
                             "message": format!("{e}；复查 detail 今日已签 → 按已签处理"),
+                            "day": crate::doubao_checkin_results::today_key(),
                         });
                     }
                     // detail 正常但提交被拒：按 detail 里有无 daily_signin 任务项分流定性
@@ -342,6 +348,7 @@ pub fn run_one(
                         "total_amount": re.get("total_amount").cloned().unwrap_or(Value::Null),
                         "last_checkin_date": re.get("last_checkin_date").cloned().unwrap_or(Value::Null),
                         "message": format!("{e}；{hint}"),
+                        "day": crate::doubao_checkin_results::today_key(),
                     });
                 }
             }
@@ -351,6 +358,7 @@ pub fn run_one(
                 "total_amount": total_amount,
                 "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
                 "message": format!("签到提交：{e}"),
+                "day": crate::doubao_checkin_results::today_key(),
             })
         }
     }
@@ -464,16 +472,19 @@ fn collect_targets(state: &AppState) -> Result<Vec<(String, String, Option<Strin
 
 /// 落库 + 池回写 + 运维历史（batch/single 共用收尾）
 fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
-    // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）
+    // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）。
+    // day 取 outcome 产生时刻打点（跨零点批次各归各日）；旧 outcome 无 day 回退当日
+    let today = crate::doubao_checkin_results::today_key();
     let entries = outcomes.iter().map(|o| {
         (
             o.get("uid").and_then(Value::as_str).unwrap_or("").to_string(),
             o.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             o.get("status").and_then(Value::as_str).unwrap_or("fail").to_string(),
             o.get("reward").and_then(Value::as_i64),
+            o.get("day").and_then(Value::as_str).unwrap_or(&today).to_string(),
         )
     });
-    crate::doubao_checkin_results::record_today(&state.data_dir, entries);
+    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries);
 
     // ② 池回写（两阶段短临界区：重读最新池按 uid 合并）
     let run_at = fs_utils::now_ts();

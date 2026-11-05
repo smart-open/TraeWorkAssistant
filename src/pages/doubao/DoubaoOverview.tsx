@@ -326,13 +326,15 @@ export default function DoubaoOverview() {
           return null;
         }),
         api.doubao.accountsList().catch(() => [] as DoubaoAccountView[]),
-        api.doubao.dashboardStats().catch(() => null),
+        api.doubao.dashboardStats().catch(() => undefined),
       ]);
       // locate 失败沿用原有失败路径（toast 提示环境检测问题），但不清空已有 locate、不丢其余数据
       if (loc == null) pushToast('error', `豆包环境检测失败：${String(locateErr)}`);
       else setLocate(loc);
       setAccounts(accs);
-      setStats(st);
+      // undefined 哨兵=「查询失败」保留旧统计；null 是 stats 的「空数据」语义，
+      // 失败也置 null 会把已有统计闪成空态（对齐 accountsList 降级口径）
+      if (st !== undefined) setStats(st);
     } finally {
       setRefreshing(false);
     }

@@ -115,7 +115,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // 豆包每日签到（需求③：schtasks 直调 + 应用内调度器共用；空池跳过）。
         // 轮次互斥（对齐 wb-checkin/wb-growth 分发处 skipped_busy 惯例）：锁名独立于
         // run_batch 内部轮次锁（"doubao"/"checkin-round"）与按日落库锁
-        //（"doubao_checkin"/"record_today"），不同名互斥体互不阻塞、无自锁死
+        //（"doubao_checkin"/"record_day_at"），不同名互斥体互不阻塞、无自锁死
         "doubao-checkin" => {
             match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
                 &state.data_dir,

@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/tauri';
-import { useAppStore } from '../store';
 import type { PoolStatus } from '../types';
 
 /** 池种类 → 对应 pool_status 命令（issue #178 账号列表限流徽标数据源） */
@@ -26,14 +25,12 @@ const FETCHERS: Record<PoolKind, () => Promise<PoolStatus[]>> = {
  * 固定 3s 刷新数据即可。
  */
 export function usePoolStatus(kind: PoolKind): Map<string, PoolStatus> {
-  const running = useAppStore((s) => s.apiStatus?.running ?? false);
   const [list, setList] = useState<PoolStatus[]>([]);
 
   useEffect(() => {
-    if (!running) {
-      setList([]);
-      return;
-    }
+    // 无条件轮询，不以前端 running 门控：托盘启停网关在 Rust 侧直接生效、不经
+    // 前端 store，running 快照滞后误判「未启动」会清空列表、丢运行期冷却徽标；
+    // 查询失败（网关真未启动）走 catch 清空即为正确语义（冷却随网关重启清零）
     let alive = true;
     const fetch = async () => {
       try {
@@ -50,7 +47,7 @@ export function usePoolStatus(kind: PoolKind): Map<string, PoolStatus> {
       alive = false;
       clearInterval(id);
     };
-  }, [kind, running]);
+  }, [kind]);
 
   return useMemo(() => new Map(list.map((s) => [s.uid, s])), [list]);
 }

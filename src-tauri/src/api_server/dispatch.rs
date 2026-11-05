@@ -523,12 +523,14 @@ pub fn resolve_target(
                     (r.model.clone(), "")
                 };
                 // issue #184 修复（可观测性）：降级改写模型名必须落 app_log——
-                // 此前改写零日志，用户请求 A 实际服务 B 完全无感知，无从排查
+                // 此前改写零日志，用户请求 A 实际服务 B 完全无感知，无从排查。
+                // 此处为选池前的候选改写（改写候选未必最终中选），日志注明
+                // 「实际生效以选池结果为准」，避免被读作已降级生效
                 if !downgrade_reason.is_empty() && final_model != r.model {
                     crate::fs_utils::app_log(
                         &state.data_dir,
                         &format!(
-                            "dispatch downgrade: requested={} routed={} -> downgraded={} reason={}",
+                            "dispatch downgrade (候选改写，实际生效以选池结果为准): requested={} routed={} -> cn_candidate={} reason={}",
                             model, r.model, final_model, downgrade_reason
                         ),
                     );

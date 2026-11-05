@@ -871,7 +871,7 @@ fn try_capture_doubao_campaign(
         // 客户端手动签到成功 → 按日落库（2026-10-31）：额度看板「今日新增额度」口径
         // 原本只有 CLI 签到落库，客户端手动签到的 reward 看不见。此处解析 checkin
         // code==0 响应的 reward_amount，按 cookie sessionid 逐账号比对 vault 明文凭证
-        // 定位归属账号后 record_today（fail-不覆盖-success 规则见 record_day）。
+        // 定位归属账号后 record_day_at（fail-不覆盖-success 规则见 record_day）。
         if p.ends_with("/landing/checkin") {
             let parsed = serde_json::from_slice::<serde_json::Value>(&resp_plain[..resp_plain.len().min(65536)])
                 .ok()
@@ -930,9 +930,15 @@ fn try_capture_doubao_campaign(
                 }
                 match matched {
                     Some((uid, name)) => {
-                        crate::doubao_checkin_results::record_today(
+                        crate::doubao_checkin_results::record_day_at(
                             &ctx.data_dir,
-                            [(uid.clone(), name, status.to_string(), reward)],
+                            [(
+                                uid.clone(),
+                                name,
+                                status.to_string(),
+                                reward,
+                                crate::doubao_checkin_results::today_key(),
+                            )],
                         );
                         // 客户端当前会话回写该账号 vault：豆包会话轮换，回写后 CLI 凭证
                         // 始终与客户端一致（fresh），避免 CLI 会话过期类失败

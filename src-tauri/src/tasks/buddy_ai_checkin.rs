@@ -259,8 +259,11 @@ pub fn parse_dosage_body(root: &Value) -> DosageInfo {
             .get("CycleEndTime")
             .and_then(Value::as_str)
             .and_then(parse_expire_str);
+        // 已知状态（0=有效/3=宽限）才参与「最近到期」汇总：未知 Status（上游新增
+        // 作废/异常/冻结包）fail-open 保留明细与诊断，但其到期不入池——否则未知包
+        // 的 CycleEndTime 会把账号到期误导为未来某刻
         if let Some(e) = cycle_end {
-            if e > now {
+            if (status == 0 || status == 3) && e > now {
                 expire_candidates.push(e);
             }
         }
@@ -275,7 +278,7 @@ pub fn parse_dosage_body(root: &Value) -> DosageInfo {
             });
         if let Some(t) = expired_num {
             let secs = if t > 1e12 { t / 1000.0 } else { t };
-            if secs > now as f64 {
+            if (status == 0 || status == 3) && secs > now as f64 {
                 expire_candidates.push(secs as i64);
             }
         }
@@ -1471,14 +1474,17 @@ mod tests {
         assert_eq!(b.expire_secs, Some(date_only));
     }
 
-    /// 未知 Status fail-open：不再静默丢弃整包，且落诊断
+    /// 未知 Status fail-open：不再静默丢弃整包，且落诊断；明细保留到期、
+    /// 汇总不入池（未知包 CycleEndTime 不得污染「最近到期」）
     #[test]
     fn unknown_status_fail_open_and_diag() {
         let core = json!({ "TotalDosage": 5, "Accounts": [
-            { "PackageName": "A", "CapacityRemain": 2, "Status": 7 },
+            { "PackageName": "A", "CapacityRemain": 2, "Status": 7, "CycleEndTime": "2035-01-01 00:00:00" },
         ]});
         let info = parse_dosage_body(&core);
         assert_eq!(info.packages.len(), 1, "未知状态保留");
+        assert!(info.packages[0].expire_secs.is_some(), "明细 fail-open 保留到期");
+        assert_eq!(info.expire_secs, None, "未知状态包到期不入「最近到期」汇总");
         let diag = info.parse_diag.expect("未知状态出诊断");
         assert!(diag.contains("7"), "诊断携带原始 Status 值");
     }

@@ -901,11 +901,16 @@ pub fn synthesize_auth_snapshot(
             return None;
         }
     };
+    // 合成 auth 快照含明文 token：原子落盘且 unix 创建即 0600——普通 fs::write 以
+    // umask 默认 0644 落盘，macOS 多用户机上其他用户在落盘窗口内可读明文凭证
     if let Err(e) = std::fs::create_dir_all(dest.join("auth"))
         .map_err(|e| e.to_string())
         .and_then(|()| {
-            std::fs::write(dest.join("auth").join(slot_auth_name(sess)), &body)
-                .map_err(|e| e.to_string())
+            write_private_file_atomic(
+                &dest.join("auth").join(slot_auth_name(sess)),
+                body.as_bytes(),
+            )
+            .map_err(|e| e.to_string())
         })
     {
         sink.step("bootstrap", StepStatus::Warn, &format!("合成快照写入失败: {e}"));
@@ -933,6 +938,36 @@ pub fn synthesize_auth_snapshot(
         &format!("已用凭证副本合成账号 {slot} 的最小登录态快照（仅 auth 文件）"),
     );
     Some(creds.uid.clone())
+}
+
+/// 敏感文件原子落盘（unix 创建即 0600）：同目录 tmp 文件以 mode(0o600) 创建——
+/// 消除「先以 umask 0644 落盘再 set_permissions 收紧」的明文竞窗，中断也不留
+/// 半截明文文件；sync_all + rename 原子替换。用于合成 auth 快照等含明文 token 的落盘。
+fn write_private_file_atomic(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?
+    };
+    #[cfg(not(unix))]
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    f.write_all(body)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)
 }
 
 /// 槽位是否带合成标记（meta.json `"bootstrap": true`，合成落槽时写入）。

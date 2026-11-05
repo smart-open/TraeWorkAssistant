@@ -99,52 +99,63 @@ pub fn save(data_dir: &Path, results: &ResultsFile) {
     }
 }
 
-/// 当日落库进程内互斥：UI 手动签到、调度器/CLI 落库三路并发时，
-/// record_today 整表 load→record→save 的后保存方会覆盖先保存方的当日记录，
+/// 当日落库进程内互斥：UI 手动签到、调度器/CLI 落库多路并发时，
+/// record_day_at 整表 load→record→save 的后保存方会覆盖先保存方的记录，
 /// 持锁串行化保证同进程内不丢行
 static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 记录当日签到最终状态（签到完成后的 done 落库入口），随后写盘。
-/// 跨进程互斥：GUI 与 schtasks CLI 双进程并发落库同此丢行问题，
-/// 命名互斥体串行化（对齐 checkin_results 锁语义）；抢锁失败降级仅进程内锁继续写。
-pub fn record_today(
+/// 记录签到最终状态（签到完成后的 done 落库入口），随后写盘。
+/// entries 为 (uid, name, status, reward, day) 五元组：day 由 outcome 产生时刻打点
+/// （run_one 各 outcome 站点 / 调用方补打；旧 outcome 无 day 字段由调用方回退当日），
+/// 跨零点批次按各自日期归组逐日落库，不再统一记「当日」串日。
+/// 跨进程互斥：GUI 与 schtasks CLI 双进程并发落库同此丢行问题，命名互斥体串行化。
+/// 锁 Busy（他方持锁落库中）幂等跳过本轮——他方完成的是同批写入，本方超时后
+/// 降级整表 load→save 反而覆盖先到方（丢行竞态）；仅机制性失败（创建/等待出错）
+/// 才降级仅进程内锁继续写（尽力不丢，保留降级日志）。
+pub fn record_day_at(
     data_dir: &Path,
-    entries: impl IntoIterator<Item = (String, String, String, Option<i64>)>,
+    entries: impl IntoIterator<Item = (String, String, String, Option<i64>, String)>,
 ) {
     let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // 跨进程锁重试（共 3 次尝试，3s→4s→4s 累计约 10s）：GUI+CLI 双进程同刻落库时，
-    // 单次 3s 超时即降级会让后到进程整表 load→record→save 覆盖先到方当日记录
-    //（丢行竞态）；全部尝试失败才降级进程内锁继续写（保留降级日志）
-    let mut cross = None;
-    let wait_plan = [3_000u32, 4_000, 4_000];
-    for (i, &wait_ms) in wait_plan.iter().enumerate() {
-        match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
-            data_dir,
-            "doubao_checkin",
-            "record_today",
-            wait_ms,
-        ) {
-            (Some(g), _) => {
-                cross = Some(g);
-                break;
-            }
-            (None, Some(fail)) => {
-                if i + 1 == wait_plan.len() {
-                    crate::fs_utils::app_log(
-                        data_dir,
-                        &format!(
-                            "[doubao_checkin_results] record_today 跨进程锁未获取：{}（降级进程内锁继续）",
-                            fail.describe()
-                        ),
-                    );
-                }
-            }
-            (None, None) => break,
+    let cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+        data_dir,
+        "doubao_checkin",
+        "record_day_at",
+        3_000,
+    ) {
+        (Some(g), _) => Some(g),
+        (None, Some(crate::tasks::qoder_common::CrossProcLockFail::Busy)) => {
+            // 他方正持锁落库（同批签到的另一进程入口）：幂等跳过，无损失
+            crate::fs_utils::app_log(
+                data_dir,
+                "[doubao_checkin_results] record_day_at 跨进程锁 Busy（他方落库中），幂等跳过本轮",
+            );
+            return;
         }
-    }
+        (None, Some(fail)) => {
+            // 机制性失败（创建/等待出错）：降级仅进程内锁继续写（尽力不丢）
+            crate::fs_utils::app_log(
+                data_dir,
+                &format!(
+                    "[doubao_checkin_results] record_day_at 跨进程锁失败：{}（降级进程内锁继续）",
+                    fail.describe()
+                ),
+            );
+            None
+        }
+        (None, None) => None, // 非 Windows 占位实现不会走到
+    };
     let _cross = cross;
     let mut f = load(data_dir);
-    f.record_day(&today_key(), entries);
+    // 按 outcome 携带的 day 归组逐日落库（BTreeMap 保证日期序稳定）
+    let mut by_day: std::collections::BTreeMap<String, Vec<(String, String, String, Option<i64>)>> =
+        Default::default();
+    for (uid, name, status, reward, day) in entries {
+        by_day.entry(day).or_default().push((uid, name, status, reward));
+    }
+    for (day, ents) in by_day {
+        f.record_day(&day, ents);
+    }
     save(data_dir, &f);
 }
 
