@@ -367,18 +367,28 @@ impl ApiPool {
     }
 
     /// 运行池身份/配置指纹（不含任何凭证明文）：一致性巡检比对用。
-    /// 组成：每条 (uid, disabled, refresh_invalid, 到期时间) 排序后 SHA256 前 8 字节。
-    /// 不含积分——积分由请求回写高频变动，纳入会导致巡检频繁误判重载
+    /// 组成：每条 (uid, 配置级 disabled, refresh_invalid(恒 0), 到期时间) 排序后
+    /// SHA256 前 8 字节。不含积分——积分由请求回写高频变动，纳入会导致巡检频繁误判重载。
+    ///
+    /// **禁用位只统计「配置级禁用」**（`sync_from_wb` 落地的 `needs_relogin`，
+    /// 特征 = disabled 且 reason 为空）。运行期 `note_error(SessionDead/Forbidden)` /
+    /// `note_refresh_invalid` 产生的禁用/失效标记**不纳入**：它们是纯内存态，
+    /// DB 侧指纹（wb_pool_fingerprint 按 `needs_relogin|0|expire` 计算）永远观测不到，
+    /// 纳入必然永久漂移 → 每 60s 触发一次无意义热重载 + 日志，且每次重载
+    /// `sync_from_wb` 重建都会把死账号重新放行一轮（disabled = needs_relogin = false）。
+    /// refresh_invalid 位恒 0 与 DB 侧硬编码对齐（sync_from_wb 恒写 false；
+    /// 运行期置位属运行态，同上不纳入）。
     pub fn config_fingerprint(&self) -> u64 {
         let entries = safe_lock(&self.entries);
         let mut parts: Vec<String> = entries
             .values()
             .map(|e| {
+                let config_disabled = e.disabled && e.reason.is_empty();
                 format!(
                     "{}|{}|{}|{}",
                     e.uid,
-                    e.disabled as u8,
-                    e.refresh_invalid as u8,
+                    config_disabled as u8,
+                    0u8,
                     e.credits_expire_at.unwrap_or(0)
                 )
             })
@@ -3133,5 +3143,50 @@ mod tests {
         // 身份集合变化必须改变指纹
         let pool2 = build_pool(&[("a", 1000.0, 0), ("b", 1000.0, 0)]);
         assert_ne!(pool2.config_fingerprint(), fp0);
+    }
+
+    #[test]
+    fn fingerprint_ignores_runtime_disable_but_tracks_config_disable() {
+        // 巡检闭环（2026-11-05 审查 H-1）：运行期 note_error/note_refresh_invalid
+        // 的禁用是纯内存态，DB 侧指纹永远观测不到——若纳入，死账号一经禁用
+        // 指纹即永久漂移 → 每 60s 无意义重载 + 日志，且每次重载 sync_from_wb
+        // 重建都把死账号重新放行一轮。故运行期禁用不得改变指纹；
+        // 配置级禁用（sync_from_wb 落地 needs_relogin，reason 为空）仍必须反映。
+        let pool = build_pool(&[("a", 1000.0, 0)]);
+        let fp0 = pool.config_fingerprint();
+        pool.note_error("a", ErrKind::SessionDead);
+        assert_eq!(
+            pool.config_fingerprint(),
+            fp0,
+            "运行期 SessionDead 禁用不得改变指纹"
+        );
+        pool.note_refresh_invalid("a");
+        assert_eq!(
+            pool.config_fingerprint(),
+            fp0,
+            "运行期 refresh_invalid 禁用不得改变指纹"
+        );
+        // 配置级禁用：needs_relogin=true 经 sync_from_wb 重建（reason 为空）→ 指纹必须变化
+        pool.sync_from_wb(
+            &[crate::api_server::pool::WbSyncAccount {
+                uid: "a".into(),
+                name: String::new(),
+                token: "tk".into(),
+                domain: "workbuddy.ai".into(),
+                enterprise_id: String::new(),
+                global_region: false,
+                credits: Some(1000.0),
+                credits_expire_at: None,
+                credits_fetched_at: None,
+                needs_relogin: true,
+                group_id: String::new(),
+            }],
+            &["a".to_string()],
+        );
+        assert_ne!(
+            pool.config_fingerprint(),
+            fp0,
+            "配置级禁用（needs_relogin）必须改变指纹，否则 DB 侧禁用变更巡检不到"
+        );
     }
 }

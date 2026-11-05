@@ -582,7 +582,8 @@ function DispatchCenterCard({
                 disabled={!pool || saving}
                 onChange={(e) => void save({ qoder: e.target.value })}
               >
-                <option value="">加权公平轮转（默认）</option>
+                {/* Qoder 池空值语义 = 跟随 Trae 池（resolve_qoder 未随 WB 改默认） */}
+                <option value="">跟随 Trae 池</option>
                 {STRATEGIES.map((s) => (
                   <option key={s} value={s}>
                     {STRATEGY_LABELS[s]}
@@ -600,7 +601,8 @@ function DispatchCenterCard({
                 disabled={!pool || saving}
                 onChange={(e) => void save({ buddyAi: e.target.value })}
               >
-                <option value="">加权公平轮转（默认）</option>
+                {/* buddy-ai 池空值语义 = 跟随 Trae 池（resolve_buddy_ai 未随 WB 改默认） */}
+                <option value="">跟随 Trae 池</option>
                 {STRATEGIES.map((s) => (
                   <option key={s} value={s}>
                     {STRATEGY_LABELS[s]}
