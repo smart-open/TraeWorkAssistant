@@ -4,6 +4,8 @@ import {
   Users,
   PlayCircle,
   Coins,
+  CalendarCheck,
+  TrendingUp,
   Settings,
   Server,
   KeyRound,
@@ -36,10 +38,12 @@ const NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'settings', label: '环境配置', icon: Settings },
 ];
 
-/** 豆包应用菜单（doubao-trae-switch-plan.md：概述 / 账号管理 / 环境配置） */
+/** 豆包应用菜单：概述 / 账号管理 / 一键签到 / 额度看板 / 环境配置 */
 const DOUBAO_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'doubao-overview', label: '概述', icon: LayoutDashboard },
   { key: 'doubao-accounts', label: '账号管理', icon: Users },
+  { key: 'doubao-checkin', label: '一键签到', icon: CalendarCheck },
+  { key: 'doubao-quota', label: '额度看板', icon: TrendingUp },
   { key: 'doubao-settings', label: '环境配置', icon: Settings },
 ];
 

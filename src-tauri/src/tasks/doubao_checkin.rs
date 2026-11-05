@@ -25,26 +25,79 @@ const SCENE: &str = "pc_incentive_task_mvp_v3";
 const DETAIL_URL: &str = "https://www.doubao.com/alice/ug/campaign/v3/detail/?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
 /// 签到执行端点（同上）
 const CHECKIN_URL: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
+/// 签到路径（抓包参数可用时拼客户端真实 query）
+const CHECKIN_BASE: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin";
 const REFERER: &str = "https://www.doubao.com/pc/agent-explore";
 /// 抓包 UA：桌面客户端自带 SamanthaDoubao 标识（区别于纯浏览器请求）
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 SamanthaDoubao/2.33.5";
 /// 批量模式下账号间隔（防上游频控，与 wb/trae 的 gap 思路一致，固定短间隔）
 const ACCOUNT_GAP_MS: u64 = 800;
 
-/// 构造 Cookie（对齐 doubao_quota::query_account：sessionid + sid_guard）
-fn cookie_of(sid: &str, sid_guard: Option<&str>) -> String {
+/// 构造 Cookie（对齐 doubao_quota::query_account：sessionid + sid_guard + 可选 msToken）
+fn cookie_of(sid: &str, sid_guard: Option<&str>, ms_token: Option<&str>) -> String {
     let mut cookie = format!("sessionid={sid}");
     if let Some(sg) = sid_guard.filter(|s| !s.is_empty()) {
         cookie.push_str(&format!("; sid_guard={sg}"));
     }
+    if let Some(mt) = ms_token.filter(|s| !s.is_empty()) {
+        cookie.push_str(&format!("; msToken={mt}"));
+    }
     cookie
 }
 
+/// 客户端抓包参数（代理 try_capture_doubao_campaign 存 vault ns "doubao"/"campaign_probe"）：
+/// 签到 query 用客户端真实参数集（device_id/web_id/fp 等设备指纹——CLI 缺失被上游风控
+/// 拒绝 710010702）+ msToken Cookie。24h 内新鲜有效，过期/缺失回退内置稳定参数。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CampaignProbe {
+    checkin_query: String,
+    ms_token: Option<String>,
+}
+
+fn load_campaign_probe(state: &AppState) -> Option<CampaignProbe> {
+    let v = crate::vault::ns_get(&state.data_dir, "doubao", "campaign_probe")?;
+    let captured_at = v.get("captured_at").and_then(Value::as_str).unwrap_or("");
+    let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(captured_at, "%Y-%m-%d %H:%M:%S") else {
+        return None;
+    };
+    let age = chrono::Local::now().naive_local() - ndt;
+    if age.num_hours() > 24 {
+        return None; // 设备参数虽稳定，msToken 会过期——超时整组弃用走回退
+    }
+    let params = v.get("params")?.as_object()?;
+    let query = params
+        .iter()
+        .map(|(k, val)| {
+            let val_s = val.as_str().unwrap_or_default();
+            format!("{k}={}", urlencoding::encode(val_s))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        return None;
+    }
+    Some(CampaignProbe {
+        checkin_query: query,
+        ms_token: v
+            .get("ms_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
+}
+
 /// POST JSON 通用（agw 信封）：code==0 视为成功返回 body；否则 Err（含登录失效提示）
-fn post_json(agent: &ureq::Agent, url: &str, sid: &str, sg: Option<&str>, body: &Value) -> Result<Value, String> {
+fn post_json(
+    agent: &ureq::Agent,
+    url: &str,
+    sid: &str,
+    sg: Option<&str>,
+    ms: Option<&str>,
+    body: &Value,
+) -> Result<Value, String> {
     let resp = agent
         .post(url)
-        .set("Cookie", &cookie_of(sid, sg))
+        .set("Cookie", &cookie_of(sid, sg, ms))
         .set("User-Agent", UA)
         .set("Referer", REFERER)
         .set("Origin", "https://www.doubao.com")
@@ -77,17 +130,35 @@ fn post_json(agent: &ureq::Agent, url: &str, sid: &str, sg: Option<&str>, body: 
                 other => other.to_string(),
             })
             .unwrap_or_else(|| "?".to_string());
-        // 常见码提示：710012001 = 登录态失效（凭证过期/不属于当前登录账号）
-        let hint = if code_v.and_then(Value::as_i64) == Some(710012001) {
-            "登录态已失效，请开启代理重新抓取凭证或重新保存该账号登录态"
-        } else {
-            ""
+        // 已知码提示矩阵（与 docs/tech-framework.md 错误码矩阵对齐）：
+        // 710012001 = 登录态失效（凭证过期/不属于当前登录账号）
+        // 712010702 = Cookie/设备指纹缺失或编码错误（重新保存登录态可解）
+        // 710022004 = 风控验证码（客户端人工验证后恢复）
+        let code_num = code_v.and_then(Value::as_i64);
+        let hint = match code_num {
+            Some(710012001) => "登录态已失效，请开启代理重新抓取凭证或重新保存该账号登录态",
+            Some(712010702) => "Cookie/设备指纹缺失或编码错误，请重新保存该账号登录态",
+            Some(710022004) => "触发风控验证码，请在豆包客户端完成一次人工验证后重试",
+            _ => "",
         };
-        return Err(if hint.is_empty() {
+        // 未知码必须透出上游 message（定位关键；如 710010702 等活动侧业务码）
+        let upstream = raw
+            .get("message")
+            .or_else(|| raw.get("msg"))
+            .or_else(|| raw.get("data").and_then(|d| d.get("message")))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        let mut msg = if hint.is_empty() {
             format!("接口返回异常 code={code_str}")
         } else {
             format!("接口返回异常 code={code_str}：{hint}")
-        });
+        };
+        if !upstream.is_empty() {
+            msg.push_str(&format!("（上游提示：{upstream}）"));
+        }
+        return Err(msg);
     }
     Ok(raw)
 }
@@ -104,11 +175,13 @@ pub fn parse_detail(body: &Value) -> Value {
     let mut continuous_days: Option<i64> = None;
     let mut last_checkin_date: Option<String> = None;
     let mut reward_amount: Option<i64> = None;
+    let mut has_signin_task = false;
     if let Some(tasks) = data.and_then(|d| d.get("tasks")).and_then(Value::as_array) {
         for t in tasks {
             if t.get("task_kind").and_then(Value::as_str) != Some("daily_signin") {
                 continue;
             }
+            has_signin_task = true;
             if let Some(dc) = t.get("daily_checkin").filter(|d| d.is_object()) {
                 checked_in_today = dc
                     .get("checked_in_today")
@@ -129,6 +202,7 @@ pub fn parse_detail(body: &Value) -> Value {
     }
     json!({
         "checked_in_today": checked_in_today,
+        "has_signin_task": has_signin_task,
         "continuous_days": continuous_days,
         "last_checkin_date": last_checkin_date,
         "reward_amount": reward_amount,
@@ -137,6 +211,7 @@ pub fn parse_detail(body: &Value) -> Value {
 }
 
 /// 单账号一轮签到（detail → 判定 → 未签则提交 checkin）。
+/// probe = 客户端抓包参数（None 回退内置稳定参数）。
 /// 返回 outcome：status ∈ success | already | fail。
 pub fn run_one(
     agent: &ureq::Agent,
@@ -144,15 +219,17 @@ pub fn run_one(
     sid: &str,
     sg: Option<&str>,
     name: &str,
+    probe: Option<&CampaignProbe>,
 ) -> Value {
+    let ms = probe.and_then(|p| p.ms_token.as_deref());
     // ① detail：签到状态 + 总额度
-    let detail = match post_json(agent, DETAIL_URL, sid, sg, &json!({"campaign_group_code": SCENE})) {
+    let detail = match post_json(agent, DETAIL_URL, sid, sg, ms, &json!({"campaign_group_code": SCENE})) {
         Ok(body) => parse_detail(&body),
         Err(e) => {
             return json!({
                 "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
                 "continuous_days": Value::Null, "total_amount": Value::Null,
-                "last_checkin_date": Value::Null, "message": e,
+                "last_checkin_date": Value::Null, "message": format!("detail 查询：{e}"),
             })
         }
     };
@@ -173,8 +250,14 @@ pub fn run_one(
         });
     }
 
-    // ③ 未签 → 提交 landing/checkin
-    match post_json(agent, CHECKIN_URL, sid, sg, &json!({"scene": SCENE})) {
+    // ③ 未签 → 提交 landing/checkin（有抓包参数时用客户端真实 query，否则内置稳定参数）
+    let checkin_url = match probe {
+        Some(p) if !p.checkin_query.is_empty() => {
+            format!("{CHECKIN_BASE}?{}", p.checkin_query)
+        }
+        _ => CHECKIN_URL.to_string(),
+    };
+    match post_json(agent, &checkin_url, sid, sg, ms, &json!({"scene": SCENE})) {
         Ok(body) => {
             let data = body.get("data");
             let checked = data
@@ -227,13 +310,49 @@ pub fn run_one(
                 "message": "签到未生效（checked_in=false）",
             })
         }
-        Err(e) => json!({
-            "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
-            "continuous_days": detail.get("continuous_days").cloned().unwrap_or(Value::Null),
-            "total_amount": total_amount,
-            "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
-            "message": e,
-        }),
+        Err(e) => {
+            // 业务码失败 → detail 复查兜底：部分活动侧业务码（如 710010702）实际对应
+            // 「已签/活动未覆盖」等状态。复查 detail 今日已签 → 按 already 落库（避免误报失败）；
+            // detail 正常且未签 → 会话健康、活动端点单独拒绝，大概率无签到资格（给出明确指引）
+            if e.starts_with("接口返回异常 code=") {
+                if let Ok(re_body) = post_json(agent, DETAIL_URL, sid, sg, ms, &json!({"campaign_group_code": SCENE})) {
+                    let re = parse_detail(&re_body);
+                    if re.get("checked_in_today").and_then(Value::as_bool).unwrap_or(false) {
+                        return json!({
+                            "uid": uid, "name": name, "status": "already", "reward": Value::Null,
+                            "continuous_days": re.get("continuous_days").cloned().unwrap_or(Value::Null),
+                            "total_amount": re.get("total_amount").cloned().unwrap_or(Value::Null),
+                            "last_checkin_date": re.get("last_checkin_date").cloned().unwrap_or(Value::Null),
+                            "message": format!("{e}；复查 detail 今日已签 → 按已签处理"),
+                        });
+                    }
+                    // detail 正常但提交被拒：按 detail 里有无 daily_signin 任务项分流定性
+                    // ① 无任务项 → scene 不匹配/无资格；② 有任务项 → 请求形态被风控（需抓包对齐）
+                    let has_task = re.get("has_signin_task").and_then(Value::as_bool).unwrap_or(false);
+                    let hint = if has_task {
+                        "detail 有 daily_signin 任务但提交被拒 → 请求形态疑似被上游风控拦截；\
+                         请开启代理后在豆包客户端手动签到一次，日志会捕获客户端真实请求用于对齐修复"
+                    } else {
+                        "detail 无 daily_signin 任务项 → 该账号未加入当前签到活动（scene 不匹配或无资格）；\
+                         若客户端能手动签到，同样请开代理抓一次真实请求"
+                    };
+                    return json!({
+                        "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
+                        "continuous_days": re.get("continuous_days").cloned().unwrap_or(Value::Null),
+                        "total_amount": re.get("total_amount").cloned().unwrap_or(Value::Null),
+                        "last_checkin_date": re.get("last_checkin_date").cloned().unwrap_or(Value::Null),
+                        "message": format!("{e}；{hint}"),
+                    });
+                }
+            }
+            json!({
+                "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
+                "continuous_days": detail.get("continuous_days").cloned().unwrap_or(Value::Null),
+                "total_amount": total_amount,
+                "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
+                "message": format!("签到提交：{e}"),
+            })
+        }
     }
 }
 
@@ -255,8 +374,11 @@ fn append_history(state: &AppState, event: Value) {
 
 /// 池回写合并（纯函数，两阶段短临界区调用）：将签到结果按 uid 合并进最新池——
 /// 只更新仍存在账号的 quota_total / checkin_continuous_days / checkin_last_date /
-/// checkin_last_run_at 四字段；fail 时仅回写 checkin_last_run_at（签到字段保留旧值）。
-/// 被删账号不复活（返回 0 即无需写盘）、新入池账号不受影响、并发方更新的其他字段不覆盖。
+/// checkin_last_run_at 四字段。quota_total 来自 detail 的 progress.total_amount
+/// （累计获得额度），detail 查询成功即有效——fail 也回写（2026-10-28 修复：活动端点
+/// 拒签时额度面板看不到 1400 累计额度）；仅 fail 且 detail 未成功（None）时签到字段
+/// 保留旧值。被删账号不复活（返回 0 即无需写盘）、新入池账号不受影响、并发方更新的
+/// 其他字段不覆盖。
 fn merge_checkin_updates_into_pool(
     latest: &mut Value,
     updates: &[(String, String, Option<i64>, Option<i64>, Option<String>, String)],
@@ -273,12 +395,14 @@ fn merge_checkin_updates_into_pool(
             };
             let Some(obj) = acc.as_object_mut() else { continue };
             obj.insert("checkin_last_run_at".into(), Value::String(run_at.clone()));
-            if status == "fail" {
-                merged += 1;
-                continue;
-            }
             if let Some(t) = quota_total {
                 obj.insert("quota_total".into(), Value::Number((*t).into()));
+            }
+            if status == "fail" {
+                // 语义（2026-10-28）：quota_total 来自 detail（查询成功即有效），
+                // fail 且 detail 成功也回写总额度（上方已统一插入）——签到字段保留旧值
+                merged += 1;
+                continue;
             }
             if let Some(d) = continuous {
                 obj.insert("checkin_continuous_days".into(), Value::Number((*d).into()));
@@ -290,6 +414,22 @@ fn merge_checkin_updates_into_pool(
         }
     }
     merged
+}
+
+/// 只读 detail 探针：查签到状态 + 累计获得额度（progress.total_amount），
+/// 供额度巡检/数据同步任务回写 quota_total——**与签到提交解耦**（detail 是只读接口，
+/// 会话有效即可查，签到是否成功无关）。Ok(parse_detail) / Err(_) → None。
+pub fn detail_probe(agent: &ureq::Agent, sid: &str, sg: Option<&str>, ms: Option<&str>) -> Option<Value> {
+    let body = post_json(
+        agent,
+        DETAIL_URL,
+        sid,
+        sg,
+        ms,
+        &json!({"campaign_group_code": SCENE}),
+    )
+    .ok()?;
+    Some(parse_detail(&body))
 }
 
 /// 收集池内可签到目标（uid + 凭证 + name），避免边遍历边写
@@ -411,12 +551,13 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
     }
 
     let agent = http_agent(TIMEOUT_SECS);
+    let probe = load_campaign_probe(state);
     let mut outcomes: Vec<Value> = Vec::new();
     for (i, (uid, sid, sg, name)) in targets.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(Duration::from_millis(ACCOUNT_GAP_MS));
         }
-        outcomes.push(run_one(&agent, uid, sid, sg.as_deref(), name));
+        outcomes.push(run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref()));
     }
     persist_outcomes(state, &outcomes, "task");
 
@@ -461,7 +602,8 @@ pub fn checkin_single(state: &AppState, uid: &str) -> Result<Value, String> {
         return Err(format!("账号 {uid} 不在账号池中或未录入 sessionid 凭证"));
     };
     let agent = http_agent(TIMEOUT_SECS);
-    let outcome = run_one(&agent, uid, sid, sg.as_deref(), name);
+    let probe = load_campaign_probe(state);
+    let outcome = run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref());
     persist_outcomes(state, std::slice::from_ref(&outcome), "manual");
     let ok = outcome.get("status").and_then(Value::as_str) != Some("fail");
     Ok(json!({
@@ -551,6 +693,8 @@ mod doubao_checkin_tests {
     #[test]
     fn merge_checkin_updates_fail_仅回写运行时间() {
         let mut latest = json!({"accounts": [{"user_id": "u1"}]});
+        // 语义更新（2026-10-28）：quota_total 来自 detail（查询成功即有效），
+        // fail 也回写总额度——否则活动端点拒签时额度面板永远看不到累计额度
         let updates = vec![(
             "u1".to_string(),
             "fail".to_string(),
@@ -563,7 +707,20 @@ mod doubao_checkin_tests {
         assert_eq!(merged, 1);
         let a1 = latest["accounts"].as_array().unwrap().first().unwrap();
         assert_eq!(a1["checkin_last_run_at"], "2026-10-27T09:15:00");
-        assert_eq!(a1.get("quota_total"), None, "失败不写总额度");
+        assert_eq!(a1["quota_total"], 1700, "fail 且 detail 成功 → 回写总额度");
         assert_eq!(a1.get("checkin_last_date"), None, "失败不写签到日期");
+        // fail 且 detail 未成功（quota_total=None）→ 不写，保留旧值
+        let mut latest2 = json!({"accounts": [{"user_id": "u2", "quota_total": 900}]});
+        let updates2 = vec![(
+            "u2".to_string(),
+            "fail".to_string(),
+            None,
+            None,
+            None,
+            "2026-10-27T09:15:00".to_string(),
+        )];
+        let _ = merge_checkin_updates_into_pool(&mut latest2, &updates2);
+        let a2 = latest2["accounts"].as_array().unwrap().first().unwrap();
+        assert_eq!(a2["quota_total"], 900, "fail 且 detail 未成功 → 保留旧总额度");
     }
 }

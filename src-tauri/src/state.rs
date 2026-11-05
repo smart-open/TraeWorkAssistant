@@ -364,11 +364,15 @@ impl AppState {
         if s.trae_credits_sync_mode.trim().is_empty() {
             s.trae_credits_sync_mode = "every_hours".into();
         }
+        if s.doubao_sync_mode.trim().is_empty() {
+            s.doubao_sync_mode = "every_hours".into();
+        }
         for field in [
             &mut s.wb_credits_sync_hours,
             &mut s.trae_credits_sync_hours,
             &mut s.qoder_credits_sync_hours,
             &mut s.buddy_ai_credits_sync_hours,
+            &mut s.doubao_sync_hours,
         ] {
             let v = field.trim().parse::<i64>().map(|h| h.clamp(1, 24)).unwrap_or(2);
             *field = v.to_string();

@@ -94,13 +94,33 @@ fn uids_by_gid_all(state: &AppState) -> std::collections::HashMap<String, Vec<St
             ),
         }
     }
+    // 豆包：doubao_accounts 行文档主键 = user_id（非 id 字段），单独扫描
+    match store.rows_all("doubao_accounts") {
+        Ok(rows) => {
+            for (_, data) in rows {
+                if let (Some(gid), Some(id)) = (
+                    data.get("group_id").and_then(|v| v.as_str()),
+                    data.get("user_id").and_then(|v| v.as_str()),
+                ) {
+                    if !gid.is_empty() {
+                        map.entry(gid.to_string()).or_default().push(id.to_string());
+                    }
+                }
+            }
+        }
+        Err(e) => crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("shared_groups_list 读 doubao_accounts 失败，该池成员按空处理：{e}"),
+        ),
+    }
     map
 }
 
 // ── 列表 ────────────────────────────────────────────────────────────────────
 
-/// 共享分组列表：defs 全局一份；uids = 三池成员并集（trae 数字 uid + wb- + qd-，
-/// 命名空间天然不冲突），count = uids.len()。供 API Key 分组绑定等跨池消费方使用。
+/// 共享分组列表：defs 全局一份；uids = 四池成员并集（trae 数字 uid + wb- + qd- +
+/// 豆包 user_id——大整数雪花号，与 trae 小数字 uid 实际不重叠），count = uids.len()。
+/// 供 API Key 分组绑定等跨池消费方使用。
 #[tauri::command]
 pub fn shared_groups_list(state: State<AppState>) -> Vec<GroupView> {
     let defs = defs_load(&state);
@@ -284,6 +304,22 @@ pub(crate) fn delete_inner(
         }
         if changed {
             crate::store::docs::buddy_ai_pool_save(&store, &pool)?;
+        }
+    }
+    // ①e 豆包成员回落（持 doubao_pool_lock；typed 池，group_id=None 即未分组）：
+    // 与 ①d 同理，防 doubao_accounts.group_id 悬空指向已删分组
+    {
+        let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = crate::store::docs::doubao_pool_load(&store);
+        let mut changed = false;
+        for a in pool.accounts.iter_mut() {
+            if a.group_id.as_deref() == Some(id) {
+                a.group_id = None;
+                changed = true;
+            }
+        }
+        if changed {
+            crate::store::docs::doubao_pool_save(&store, &pool)?;
         }
     }
     // ③ 清引用：api_pool 三池分组筛选 + api_keys.allowed_groups

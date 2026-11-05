@@ -218,6 +218,9 @@ function defaultSettings(): Settings {
     // 豆包每日签到（landing/checkin）：调度开关默认开、默认 09:15 错峰 quota 09:30
     doubao_checkin_enabled: true,
     doubao_checkin_hhmm: '09:15',
+    doubao_sync_mode: 'every_hours',
+    doubao_sync_hours: '2',
+    doubao_sync_hhmm: '23:50',
     workbuddy_path: null,
     codebuddy_path: null,
     wb_auth_file_path: null,

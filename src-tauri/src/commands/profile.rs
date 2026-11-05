@@ -234,6 +234,26 @@ fn store_stats(path: &Path, slot_mtime_ms: i64, size: u64, files: u64, data_dir:
     let _ = crate::store::db(data_dir).kv_set(PROFILE_STATS_KV, &kv_map);
 }
 
+/// 单槽位体积统计（带缓存）：供豆包 accounts_list 等非批量调用方使用（其余档走
+/// list_profiles_blocking 的批量并行路径）。TTL 5 分钟 + slot mtime 失效，命中即零遍历
+/// ——修复豆包账号管理/概述/看板每次打开都全量重扫快照目录导致的缓慢卡顿。
+/// 注意：本函数不做批量水合——调用方请在循环前自行调 `prime_stats_cache` 一次，
+/// 否则逐槽位水合会退化为 N+1 落盘 kv 读（2026-10-29 审查修复 L2）。
+pub(crate) fn dir_stats_cached(path: &Path, data_dir: &Path) -> (u64, u64) {
+    let mtime = std::fs::metadata(path).map(|m| mtime_ms(&m)).unwrap_or(0);
+    if let Some(v) = cached_stats(path, mtime, data_dir) {
+        return v;
+    }
+    let (size, files) = dir_stats(path);
+    store_stats(path, mtime, size, files, data_dir);
+    (size, files)
+}
+
+/// 批量水合体积缓存的对外入口（P3 同款）：列表循环前调用一次，整轮命中判定走内存。
+pub(crate) fn prime_stats_cache(data_dir: &Path) {
+    hydrate_stats_cache(data_dir);
+}
+
 /// 槽位内容被整体写入（备份）/删除后主动失效，避免 mtime 粒度或实现差异留下陈旧体积。
 /// 内存与落盘 kv 同步移除（kv 移除失败只是残留陈旧条目，mtime/TTL 判定兜底）。
 /// kv 读-改-写经 STATS_KV_LOCK 与 store_stats 串行（审查 P4），防移除被并发写回复活。

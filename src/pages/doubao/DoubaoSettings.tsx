@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
-import { FolderSearch, Save, Clock3, MapPin, ShieldCheck, RefreshCw, Timer, Coins, Database, CalendarCheck } from 'lucide-react';
+import { FolderSearch, Save, ShieldCheck, RefreshCw, Timer, Coins, CalendarCheck, SlidersHorizontal, ListChecks } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import type { AppLocate, DoubaoRenewSummary } from '../../types';
 
-/** 豆包环境配置：应用位置配置 + 会话保活 + 会员额度接口 */
+/** 豆包环境配置：两列布局（对齐 Trae 环境配置页）——
+ *  左列「通用配置」（应用位置 / 快照设置 / 接口端点），右列「任务配置」（会话保活 / 额度巡检 / 每日签到）。 */
 export default function DoubaoSettings() {
   const settings = useAppStore((s) => s.settings);
   const saveSettings = useAppStore((s) => s.saveSettings);
@@ -43,10 +44,12 @@ export default function DoubaoSettings() {
   const [checkinTaskTime, setCheckinTaskTime] = useState('09:15');
   const [checkinTaskState, setCheckinTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
   const [checkinTaskTimeShown, setCheckinTaskTimeShown] = useState('');
+  // ── 豆包数据同步（额度巡检定时远端拉取 → 池回写；页面读本地） ──
+  const [syncMode, setSyncMode] = useState('every_hours');
+  const [syncHours, setSyncHours] = useState('2');
+  const [syncHhmm, setSyncHhmm] = useState('23:50');
   const [checkinRunning, setCheckinRunning] = useState(false);
   const [checkinEnabled, setCheckinEnabled] = useState(true);
-  // 应用内签到调度时刻（doubao_checkin_hhmm）：独立于 Windows 计划任务时间可改
-  const [checkinHhmm, setCheckinHhmm] = useState('09:15');
 
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
@@ -109,15 +112,38 @@ export default function DoubaoSettings() {
     }
   };
 
-  // 应用内签到调度时刻（doubao_checkin_hhmm）：立即保存，调度器下轮生效（与上方开关同款模式）
-  const saveCheckinHhmm = async (v: string) => {
-    const hhmm = v || '09:15';
-    setCheckinHhmm(hhmm);
+  // 豆包数据同步（doubao-sync）：模式 + 间隔/时刻一并保存；后端归一化（间隔 clamp 1..24）
+  const saveSyncConfig = async (patch: { doubao_sync_mode?: string; doubao_sync_hours?: string; doubao_sync_hhmm?: string }) => {
     try {
-      await saveSettings({ doubao_checkin_hhmm: hhmm });
+      await saveSettings(patch);
+      return true;
     } catch (err) {
-      pushToast('error', `保存签到调度时刻失败：${String(err)}`);
+      pushToast('error', `保存设置失败：${String(err)}`);
+      return false;
     }
+  };
+  const changeSyncMode = async (v: string) => {
+    setSyncMode(v);
+    if (await saveSyncConfig({ doubao_sync_mode: v })) {
+      pushToast('success', v === 'off' ? '已关闭豆包数据同步' : '同步模式已保存');
+    }
+  };
+  const changeSyncHours = async (v: string) => {
+    setSyncHours(v);
+    const n = Number.parseInt(v, 10);
+    if (!Number.isFinite(n) || n < 1 || n > 24) {
+      pushToast('warn', '同步间隔应为 1-24 的整数（已保持原值）');
+      return;
+    }
+    if (await saveSyncConfig({ doubao_sync_hours: String(n) })) pushToast('success', `同步间隔已保存（每 ${n} 小时）`);
+  };
+  const changeSyncHhmm = async (v: string) => {
+    setSyncHhmm(v);
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(v)) {
+      pushToast('warn', '时间格式应为 HH:MM（如 23:50，已保持原值）');
+      return;
+    }
+    if (await saveSyncConfig({ doubao_sync_hhmm: v })) pushToast('success', `同步时刻已保存（每日 ${v}）`);
   };
 
   const refreshTaskStatus = async () => {
@@ -152,8 +178,17 @@ export default function DoubaoSettings() {
     try {
       const s = await api.doubao.checkinTaskStatus();
       if (s.startsWith('registered:')) {
+        const shown = s.slice('registered:'.length);
         setCheckinTaskState('registered');
-        setCheckinTaskTimeShown(s.slice('registered:'.length));
+        setCheckinTaskTimeShown(shown);
+        // 输入框对齐真实注册时刻（2026-10-31 修复：此前读 settings 默认值 09:15，
+        // 与 schtasks 实际注册时刻（如 15:00）各说各话）；settings 漂移时一并收敛
+        if (/^([01]\d|2[0-3]):([0-5]\d)$/.test(shown)) {
+          setCheckinTaskTime(shown);
+          if (settings?.doubao_checkin_hhmm !== shown) {
+            void saveSettings({ doubao_checkin_hhmm: shown });
+          }
+        }
       } else {
         setCheckinTaskState('not_registered');
       }
@@ -172,13 +207,15 @@ export default function DoubaoSettings() {
       setKeepaliveEnabled(settings.doubao_keepalive_enabled !== false);
       setQuotaEnabled(settings.doubao_quota_enabled !== false);
       setCheckinEnabled(settings.doubao_checkin_enabled !== false);
-      if (settings.doubao_checkin_hhmm) setCheckinHhmm(settings.doubao_checkin_hhmm);
+      if (settings.doubao_sync_mode) setSyncMode(settings.doubao_sync_mode);
+      if (settings.doubao_sync_hours) setSyncHours(settings.doubao_sync_hours);
+      if (settings.doubao_sync_hhmm) setSyncHhmm(settings.doubao_sync_hhmm);
     }
     void refreshTaskStatus();
     void refreshQuotaTaskStatus();
     void refreshCheckinTaskStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_checkin_hhmm]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled]);
 
   const detect = async () => {
     setDetecting(true);
@@ -327,12 +364,6 @@ export default function DoubaoSettings() {
       };
       if (r.skipped) {
         pushToast('info', `签到跳过：${r.skipped}`);
-      } else if ((r.failed ?? 0) > 0) {
-        // 有失败账号：warn 语气（批量结果恒 ok:true，不能靠返回值区分，按失败数定调）
-        pushToast(
-          'warn',
-          `签到完成：共 ${r.total ?? 0} 个账号，成功 ${r.success ?? 0} · 已签 ${r.already ?? 0} · 失败 ${r.failed ?? 0}，新增额度 +${r.reward_total ?? 0}`,
-        );
       } else {
         pushToast(
           'success',
@@ -369,337 +400,356 @@ export default function DoubaoSettings() {
     <div className="animate-fade-in">
       <PageHeader
         title="豆包 · 环境配置"
-        desc="应用位置、快照设置、会话保活与会员额度接口"
+        desc="通用配置（应用位置 / 快照 / 接口端点）与任务配置（保活 / 额度巡检 / 每日签到）"
       />
 
-      {/* 应用位置配置 */}
-      <div className="mt-5 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <MapPin size={16} className="text-violet-500" />
-          <span className="text-sm font-medium">应用位置配置</span>
-          {locate?.exe && <Badge tone="green">已定位</Badge>}
-        </div>
-
-        <div className="space-y-2 text-xs text-slate-500">
-          <p>
-            数据目录：<code className="rounded bg-slate-100 px-1 font-mono dark:bg-zinc-800">{locate?.user_data_dir ?? '%LOCALAPPDATA%\\Doubao\\User Data'}</code>
-            {locate?.version ? ` · 版本 ${locate.version}` : ''}
-          </p>
-        </div>
-
-        <div className="mt-3 flex items-center gap-2">
-          <input
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
-            placeholder="Doubao.exe 完整路径（如 C:\\Users\\<user>\\AppData\\Local\\Doubao\\Application\\Doubao.exe）"
-            className="input flex-1 font-mono text-xs"
-          />
-          <button onClick={() => void detect()} disabled={detecting} className="btn-outline shrink-0">
-            <FolderSearch size={15} /> {detecting ? '检测中…' : '自动检测'}
-          </button>
-          <button onClick={() => void save()} disabled={saving} className="btn-outline shrink-0">
-            <Save size={15} /> {saving ? '保存中…' : '保存'}
-          </button>
-        </div>
-
-        <p className="mt-2 text-xs text-slate-400">
-          自动检测顺序：手动指定 → 注册表卸载键 → 默认路径 → 运行进程反查。
-        </p>
-      </div>
-
-      {/* 会话保活 */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <Clock3 size={16} className="text-emerald-500" />
-          <span className="text-sm font-medium">会话保活</span>
-        </div>
-
-        <div className="space-y-3 text-xs text-slate-500">
-          <p>
-            续期原理：字节 passport 为 <b>sid_guard 30 天滑动续期</b>。实测豆包桌面客户端 cookie 为客户端级加密
-            （外部无法离线续写），因此<b>主路径为每日保活</b>——注册定时任务后自动「启动豆包 8 秒 → 优雅关闭」，
-            由客户端自己联网刷新会话；运行中则自动跳过。此外可对池内<b>明文 sessionid 凭证</b>（代理抓包自动写入或手动录入，账号管理 → 编辑 → 会话凭证可查看）做探活巡检。
-          </p>
-
-          {/* 保活端点（对明文凭证的探活生效：manual / proxy 来源均可） */}
-          <div className="flex items-center gap-2">
-            <span className="shrink-0 text-slate-500">保活端点</span>
-            <input
-              value={renewUrl}
-              onChange={(e) => setRenewUrl(e.target.value)}
-              placeholder="https://www.doubao.com/info/v2/（默认，探活巡检用；KeepAlive 不依赖此项）"
-              className="input flex-1 font-mono text-xs"
-            />
-            <button onClick={() => void saveRenewUrl()} className="btn-outline shrink-0">
-              <Save size={14} /> 保存
-            </button>
+      <div className="mt-5 grid items-start gap-4 md:grid-cols-2">
+        {/* 左列：通用配置（应用位置 + 快照设置 + 接口端点） */}
+        <section className="card p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <SlidersHorizontal size={16} className="text-emerald-500" />
+            <h2 className="font-medium">通用配置</h2>
           </div>
 
-          {/* 定时任务 */}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="shrink-0 text-slate-500">每日任务</span>
-            <input
-              value={taskTime}
-              onChange={(e) => setTaskTime(e.target.value)}
-              placeholder="HH:MM"
-              className="input w-24 text-xs"
-            />
-            <button onClick={() => void registerTask()} className="btn-outline shrink-0">
-              <Timer size={14} /> 注册
-            </button>
-            {taskState === 'registered' && (
-              <>
-                <Badge tone="green">已注册 {taskTimeShown}</Badge>
-                <button onClick={() => void unregisterTask()} className="btn-ghost text-rose-500">
-                  注销
-                </button>
-              </>
-            )}
-            {taskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+          <h3 className="mb-1 font-medium">应用位置</h3>
+          <div className="space-y-2 text-xs text-slate-500">
+            <p>
+              数据目录：<code className="rounded bg-slate-100 px-1 font-mono dark:bg-zinc-800">{locate?.user_data_dir ?? '%LOCALAPPDATA%\\Doubao\\User Data'}</code>
+              {locate?.version ? ` · 版本 ${locate.version}` : ''}
+              {locate?.exe && <span className="ml-2"><Badge tone="green">已定位</Badge></span>}
+            </p>
+            <div className="flex items-center gap-2">
+              <input
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                placeholder="Doubao.exe 完整路径（如 C:\\Users\\<user>\\AppData\\Local\\Doubao\\Application\\Doubao.exe）"
+                className="input flex-1 font-mono text-xs"
+              />
+              <button onClick={() => void detect()} disabled={detecting} className="btn-outline shrink-0">
+                <FolderSearch size={15} /> {detecting ? '检测中…' : '自动检测'}
+              </button>
+              <button onClick={() => void save()} disabled={saving} className="btn-outline shrink-0">
+                <Save size={15} /> {saving ? '保存中…' : '保存'}
+              </button>
+            </div>
+            <p className="text-slate-400">自动检测顺序：手动指定 → 注册表卸载键 → 默认路径 → 运行进程反查。</p>
           </div>
 
-          {/* 应用内每日调度开关（issue #147）：关闭后不再每日拉起客户端；无账号/客户端缺失时自动跳过 */}
-          <label className="flex cursor-pointer items-start gap-2.5">
-            <input
-              type="checkbox"
-              checked={keepaliveEnabled}
-              onChange={(e) => void toggleKeepalive(e.target.checked)}
-              className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-500"
-            />
-            <span>
-              <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日调度（每日 09:20 启动豆包续期）</span>
-              <span className="mt-0.5 block leading-relaxed">
-                关闭后应用内调度器不再执行会话每日续期（不再拉起客户端）；与上方「每日任务」（Windows 计划任务）相互独立。
-                无豆包账号或未找到豆包客户端时自动跳过，不记失败、不推送通知。
+          <h3 className="mb-1 mt-4 font-medium">快照设置</h3>
+          <div className="space-y-3 text-xs text-slate-500">
+            <p>
+              快照自带<b>版本元数据</b>（schemaVersion + 豆包内核版本），恢复前自动校验完整性（leveldb 结构），
+              豆包升级后若旧快照不兼容会中止并提示重新保存；在「账号管理」悬停快照列可查看版本信息。
+            </p>
+            <label className="flex cursor-pointer items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={includeIdb}
+                onChange={(e) => void toggleIncludeIdb(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-sky-500"
+              />
+              <span>
+                <span className="font-medium text-slate-600 dark:text-zinc-200">快照纳入 IndexedDB（对话历史等完整状态）</span>
+                <span className="mt-0.5 block leading-relaxed">
+                  默认排除以控制体积。开启后，保存/切换会把 Default/IndexedDB 一并纳入快照，
+                  对话历史等完整状态随账号迁移；代价是快照体积明显增大（可达数百 MB），保存/切换耗时也会变长。
+                  已有快照需重新「保存当前登录态」后才会纳入。
+                </span>
               </span>
-            </span>
-          </label>
-
-          {/* 手动巡检 */}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="shrink-0 text-slate-500">手动巡检</span>
-            <button onClick={() => void runRenew(false)} disabled={running} className="btn-outline shrink-0">
-              <ShieldCheck size={14} /> {running ? '巡检中…' : '探活巡检'}
-            </button>
-            <button onClick={() => void runRenew(true)} disabled={running} className="btn-outline shrink-0">
-              <RefreshCw size={14} /> Cookie 诊断
-            </button>
-            <span className="text-slate-400">每日保活任务见上方「每日任务」</span>
+            </label>
           </div>
 
-          {/* 巡检结果 */}
-          {summary && (
-            <div className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
-              <div className="mb-1 text-xs font-medium text-slate-600 dark:text-zinc-300">
-                {summary.finished_at} · {summary.mode === 'full' ? `巡检（${summary.renew_url}）` : '仅同步'}
-                {summary.sync ? ` · Cookie 同步 ${summary.sync.synced} 个` : ''}
+          <h3 className="mb-1 mt-4 font-medium">接口端点</h3>
+          <div className="space-y-3 text-xs text-slate-500">
+            {/* 保活端点（对明文凭证的探活生效：manual / proxy 来源均可） */}
+            <div className="flex items-center gap-2">
+              <span className="w-16 shrink-0 text-slate-500">保活端点</span>
+              <input
+                value={renewUrl}
+                onChange={(e) => setRenewUrl(e.target.value)}
+                placeholder="https://www.doubao.com/info/v2/（默认，探活巡检用；KeepAlive 不依赖此项）"
+                className="input flex-1 font-mono text-xs"
+              />
+              <button onClick={() => void saveRenewUrl()} className="btn-outline shrink-0">
+                <Save size={14} /> 保存
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="w-16 shrink-0 text-slate-500">额度接口</span>
+              <input
+                value={quotaUrl}
+                onChange={(e) => setQuotaUrl(e.target.value)}
+                placeholder="https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/（默认）"
+                className="input flex-1 font-mono text-xs"
+              />
+              <button onClick={() => void saveQuotaUrl()} className="btn-outline shrink-0">
+                <Save size={14} /> 保存
+              </button>
+            </div>
+            <p>
+              会员额度接口已按代理抓包实测固化（<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">/alice/commerce/sale/subscription/quota/summary/</code>），
+              默认即可用。豆包若更新接口，可在此修改。之后即可在「账号管理」中对已录入会话凭证的账号点击额度按钮查询
+              （会员等级 / 到期时间 / 剩余额度条）。
+            </p>
+          </div>
+        </section>
+
+        {/* 右列：任务配置（会话保活 + 额度巡检 + 每日签到） */}
+        <section className="card p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <ListChecks size={16} className="text-emerald-500" />
+            <h2 className="font-medium">任务配置</h2>
+          </div>
+
+          <h3 className="mb-1 font-medium">会话保活（每日续期）</h3>
+          <div className="space-y-3 text-xs text-slate-500">
+            <p>
+              续期原理：字节 passport 为 <b>sid_guard 30 天滑动续期</b>。实测豆包桌面客户端 cookie 为客户端级加密
+              （外部无法离线续写），因此<b>主路径为每日保活</b>——注册定时任务后自动「启动豆包 8 秒 → 优雅关闭」，
+              由客户端自己联网刷新会话；运行中则自动跳过。此外可对池内<b>明文 sessionid 凭证</b>（代理抓包自动写入或手动录入，账号管理 → 编辑 → 会话凭证可查看）做探活巡检。
+            </p>
+
+            {/* 定时任务 */}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="shrink-0 text-slate-500">每日任务</span>
+              <input
+                value={taskTime}
+                onChange={(e) => setTaskTime(e.target.value)}
+                placeholder="HH:MM"
+                className="input w-24 text-xs"
+              />
+              <button onClick={() => void registerTask()} className="btn-outline shrink-0">
+                <Timer size={14} /> 注册
+              </button>
+              {taskState === 'registered' && (
+                <>
+                  <Badge tone="green">已注册 {taskTimeShown}</Badge>
+                  <button onClick={() => void unregisterTask()} className="btn-ghost text-rose-500">
+                    注销
+                  </button>
+                </>
+              )}
+              {taskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+            </div>
+
+            {/* 应用内每日调度开关（issue #147）：关闭后不再每日拉起客户端；无账号/客户端缺失时自动跳过 */}
+            <label className="flex cursor-pointer items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={keepaliveEnabled}
+                onChange={(e) => void toggleKeepalive(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-500"
+              />
+              <span>
+                <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日调度（每日 09:20 启动豆包续期）</span>
+                <span className="mt-0.5 block leading-relaxed">
+                  关闭后应用内调度器不再执行会话每日续期（不再拉起客户端）；与上方「每日任务」（Windows 计划任务）相互独立。
+                  无豆包账号或未找到豆包客户端时自动跳过，不记失败、不推送通知。
+                </span>
+              </span>
+            </label>
+
+            {/* 手动巡检 */}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="shrink-0 text-slate-500">手动巡检</span>
+              <button onClick={() => void runRenew(false)} disabled={running} className="btn-outline shrink-0">
+                <ShieldCheck size={14} /> {running ? '巡检中…' : '探活巡检'}
+              </button>
+              <button onClick={() => void runRenew(true)} disabled={running} className="btn-outline shrink-0">
+                <RefreshCw size={14} /> Cookie 诊断
+              </button>
+              <span className="text-slate-400">每日保活任务见上方「每日任务」</span>
+            </div>
+
+            {/* 巡检结果 */}
+            {summary && (
+              <div className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
+                <div className="mb-1 text-xs font-medium text-slate-600 dark:text-zinc-300">
+                  {summary.finished_at} · {summary.mode === 'full' ? `巡检（${summary.renew_url}）` : '仅同步'}
+                  {summary.sync ? ` · Cookie 同步 ${summary.sync.synced} 个` : ''}
+                </div>
+                {summary.renew && (
+                  <div className="mb-1 text-xs text-slate-500">
+                    有效 {summary.renew.ok} · 过期 {summary.renew.expired} · 异常 {summary.renew.error} · 跳过 {summary.renew.skipped}
+                  </div>
+                )}
+                {summary.accounts && summary.accounts.length > 0 && (
+                  <div className="max-h-40 space-y-0.5 overflow-auto font-mono text-xs text-slate-500 dark:text-zinc-400">
+                    {summary.accounts.map((a) => (
+                      <div key={a.user_id}>
+                        {a.user_id}: {a.status}
+                        {a.detail ? `（${a.detail}）` : ''}
+                        {a.renewed ? ' · 已续期' : ''}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {summary.logs && summary.logs.length > 0 && (
+                  <div className="mt-1 max-h-24 space-y-0.5 overflow-auto text-xs text-slate-400">
+                    {summary.logs.map((l, i) => (
+                      <div key={i}>{l}</div>
+                    ))}
+                  </div>
+                )}
               </div>
-              {summary.renew && (
-                <div className="mb-1 text-xs text-slate-500">
-                  有效 {summary.renew.ok} · 过期 {summary.renew.expired} · 异常 {summary.renew.error} · 跳过 {summary.renew.skipped}
-                </div>
+            )}
+          </div>
+
+          <h3 className="mb-1 mt-4 font-medium">会员额度巡检</h3>
+          <div className="space-y-3 text-xs text-slate-500">
+            {/* 每日额度巡检任务 */}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="shrink-0 text-slate-500">每日巡检</span>
+              <input
+                value={quotaTaskTime}
+                onChange={(e) => setQuotaTaskTime(e.target.value)}
+                placeholder="HH:MM"
+                className="input w-24 text-xs"
+              />
+              <button onClick={() => void registerQuotaTask()} className="btn-outline shrink-0">
+                <Timer size={14} /> 注册
+              </button>
+              {quotaTaskState === 'registered' && (
+                <>
+                  <Badge tone="green">已注册 {quotaTaskTimeShown}</Badge>
+                  <button onClick={() => void unregisterQuotaTask()} className="btn-ghost text-rose-500">
+                    注销
+                  </button>
+                </>
               )}
-              {summary.accounts && summary.accounts.length > 0 && (
-                <div className="max-h-40 space-y-0.5 overflow-auto font-mono text-xs text-slate-500 dark:text-zinc-400">
-                  {summary.accounts.map((a) => (
-                    <div key={a.user_id}>
-                      {a.user_id}: {a.status}
-                      {a.detail ? `（${a.detail}）` : ''}
-                      {a.renewed ? ' · 已续期' : ''}
-                    </div>
-                  ))}
-                </div>
+              {quotaTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+            </div>
+
+            {/* 应用内每日巡检调度开关（issue #147） */}
+            <label className="flex cursor-pointer items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={quotaEnabled}
+                onChange={(e) => void toggleQuotaEnabled(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-amber-500"
+              />
+              <span>
+                <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日巡检调度（每日 09:30）</span>
+                <span className="mt-0.5 block leading-relaxed">
+                  关闭后应用内调度器不再定时批量巡检额度；与上方「每日巡检」（Windows 计划任务）相互独立。
+                  无豆包账号时自动跳过。
+                </span>
+              </span>
+            </label>
+
+            <p>
+              注册后每日定时批量查询池内全部有凭证账号的会员额度：自动回写缓存与历史（概述页趋势图/健康度卡的数据源），
+              额度用完的账号会在应用内提醒。
+            </p>
+          </div>
+
+          <h3 className="mb-1 mt-4 font-medium">每日签到</h3>
+          <div className="space-y-3 text-xs text-slate-500">
+            <p>
+              签到端点已按抓包固化（<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">/alice/ug/campaign/landing/checkin</code>）。
+              注册后每日定时对池内全部账号签到领额度，结果按日落库（概述页签到结果与额度看板的数据源）；
+              当日已签的账号自动跳过（幂等）；未签成功的账号次日自动补签，同日也可在「一键签到」页再次手动签到，多次结果按最终状态合并。
+            </p>
+
+            {/* 每日签到任务 */}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="shrink-0 text-slate-500">每日任务</span>
+              <input
+                value={checkinTaskTime}
+                onChange={(e) => setCheckinTaskTime(e.target.value)}
+                placeholder="HH:MM"
+                className="input w-24 text-xs"
+              />
+              <button onClick={() => void registerCheckinTask()} className="btn-outline shrink-0">
+                <Timer size={14} /> 注册
+              </button>
+              {checkinTaskState === 'registered' && (
+                <>
+                  <Badge tone="green">已注册 {checkinTaskTimeShown}</Badge>
+                  <button onClick={() => void unregisterCheckinTask()} className="btn-ghost text-rose-500">
+                    注销
+                  </button>
+                </>
               )}
-              {summary.logs && summary.logs.length > 0 && (
-                <div className="mt-1 max-h-24 space-y-0.5 overflow-auto text-xs text-slate-400">
-                  {summary.logs.map((l, i) => (
-                    <div key={i}>{l}</div>
-                  ))}
-                </div>
+              {checkinTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+            </div>
+
+            {/* 应用内每日签到调度开关 */}
+            <label className="flex cursor-pointer items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={checkinEnabled}
+                onChange={(e) => void toggleCheckinEnabled(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-rose-500"
+              />
+              <span>
+                <span className="font-medium text-slate-600 dark:text-zinc-200">
+                  应用内每日签到调度（每日 {settings?.doubao_checkin_hhmm || '09:15'}）
+                </span>
+                <span className="mt-0.5 block leading-relaxed">
+                  关闭后应用内调度器不再执行每日自动签到；与上方「每日任务」（Windows 计划任务）相互独立。
+                  无豆包账号时自动跳过，不记失败、不推送通知。
+                </span>
+              </span>
+            </label>
+
+            {/* 手动签到 */}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="shrink-0 text-slate-500">手动签到</span>
+              <button onClick={() => void runCheckinNow()} disabled={checkinRunning} className="btn-outline shrink-0">
+                <CalendarCheck size={14} /> {checkinRunning ? '签到中…' : '立即签到全部'}
+              </button>
+              <span className="text-slate-400">逐账号签到见「一键签到」页</span>
+            </div>
+          </div>
+
+          {/* 额度数据同步（对齐 Trae「积分数据同步」交互）：置于任务配置底部 */}
+          <div className="mt-4 border-t border-slate-100 pt-3 dark:border-zinc-800">
+          <h3 className="mb-1 font-medium">额度数据同步</h3>
+          <div className="space-y-3 text-xs text-slate-500">
+            <p>
+              应用运行期间按所选模式自动拉取账号额度与累计额度（含额度窗口、会员等级、总额度）并回写本地账号池；
+              账号管理 / 额度看板等页面只读本地数据，不再每次打开都请求远端。无账号时静默跳过。
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="shrink-0 text-slate-500">同步模式</span>
+              <select value={syncMode} onChange={(e) => void changeSyncMode(e.target.value)} className="input w-32 text-xs">
+                <option value="off">关闭</option>
+                <option value="hourly">每小时</option>
+                <option value="every_hours">每N小时</option>
+                <option value="daily">每天 HH:MM</option>
+              </select>
+              {syncMode === 'every_hours' && (
+                <>
+                  <input
+                    value={syncHours}
+                    onChange={(e) => setSyncHours(e.target.value)}
+                    onBlur={(e) => void changeSyncHours(e.target.value)}
+                    inputMode="numeric"
+                    className="input w-16 text-xs"
+                  />
+                  <span>小时（1-24）；距上次成功同步满 N 小时自动执行一次</span>
+                </>
+              )}
+              {syncMode === 'daily' && (
+                <>
+                  <input
+                    value={syncHhmm}
+                    onChange={(e) => setSyncHhmm(e.target.value)}
+                    onBlur={(e) => void changeSyncHhmm(e.target.value)}
+                    placeholder="HH:MM"
+                    className="input w-20 text-xs"
+                  />
+                  <span>每日该时刻执行一次</span>
+                </>
               )}
             </div>
-          )}
-        </div>
-      </div>
-
-      {/* 快照设置（C3/C4） */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <Database size={16} className="text-sky-500" />
-          <span className="text-sm font-medium">快照设置</span>
-        </div>
-
-        <div className="space-y-3 text-xs text-slate-500">
-          <p>
-            快照自带<b>版本元数据</b>（schemaVersion + 豆包内核版本），恢复前自动校验完整性（leveldb 结构），
-            豆包升级后若旧快照不兼容会中止并提示重新保存；在「账号管理」悬停快照列可查看版本信息。
-          </p>
-          <label className="flex cursor-pointer items-start gap-2.5">
-            <input
-              type="checkbox"
-              checked={includeIdb}
-              onChange={(e) => void toggleIncludeIdb(e.target.checked)}
-              className="mt-0.5 h-4 w-4 shrink-0 accent-sky-500"
-            />
-            <span>
-              <span className="font-medium text-slate-600 dark:text-zinc-200">快照纳入 IndexedDB（对话历史等完整状态）</span>
-              <span className="mt-0.5 block leading-relaxed">
-                默认排除以控制体积。开启后，保存/切换会把 Default/IndexedDB 一并纳入快照，
-                对话历史等完整状态随账号迁移；代价是快照体积明显增大（可达数百 MB），保存/切换耗时也会变长。
-                已有快照需重新「保存当前登录态」后才会纳入。
-              </span>
-            </span>
-          </label>
-        </div>
-      </div>
-
-      {/* 会员额度 */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <Coins size={16} className="text-amber-500" />
-          <span className="text-sm font-medium">会员额度</span>
-        </div>
-
-        <div className="space-y-3 text-xs text-slate-500">
-          <p>
-            会员额度接口已按代理抓包实测固化（<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">/alice/commerce/sale/subscription/quota/summary/</code>），
-            默认即可用。豆包若更新接口，可在此修改。之后即可在「账号管理」中对已录入会话凭证的账号点击额度按钮查询
-            （会员等级 / 到期时间 / 剩余额度条）。
-          </p>
-
-          <div className="flex items-center gap-2">
-            <span className="shrink-0 text-slate-500">额度接口</span>
-            <input
-              value={quotaUrl}
-              onChange={(e) => setQuotaUrl(e.target.value)}
-              placeholder="https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/（默认）"
-              className="input flex-1 font-mono text-xs"
-            />
-            <button onClick={() => void saveQuotaUrl()} className="btn-outline shrink-0">
-              <Save size={14} /> 保存
-            </button>
+            <p className="text-slate-400">
+              修改后立即生效（保存即写库）；手动单账号查询仍可在账号管理行内「查询额度」触发。
+            </p>
           </div>
-
-          {/* 每日额度巡检任务 */}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="shrink-0 text-slate-500">每日巡检</span>
-            <input
-              value={quotaTaskTime}
-              onChange={(e) => setQuotaTaskTime(e.target.value)}
-              placeholder="HH:MM"
-              className="input w-24 text-xs"
-            />
-            <button onClick={() => void registerQuotaTask()} className="btn-outline shrink-0">
-              <Timer size={14} /> 注册
-            </button>
-            {quotaTaskState === 'registered' && (
-              <>
-                <Badge tone="green">已注册 {quotaTaskTimeShown}</Badge>
-                <button onClick={() => void unregisterQuotaTask()} className="btn-ghost text-rose-500">
-                  注销
-                </button>
-              </>
-            )}
-            {quotaTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
           </div>
-
-          {/* 应用内每日巡检调度开关（issue #147） */}
-          <label className="flex cursor-pointer items-start gap-2.5">
-            <input
-              type="checkbox"
-              checked={quotaEnabled}
-              onChange={(e) => void toggleQuotaEnabled(e.target.checked)}
-              className="mt-0.5 h-4 w-4 shrink-0 accent-amber-500"
-            />
-            <span>
-              <span className="font-medium text-slate-600 dark:text-zinc-200">应用内每日巡检调度（每日 09:30）</span>
-              <span className="mt-0.5 block leading-relaxed">
-                关闭后应用内调度器不再定时批量巡检额度；与上方「每日巡检」（Windows 计划任务）相互独立。
-                无豆包账号时自动跳过。
-              </span>
-            </span>
-          </label>
-
-          <p>
-            注册后每日定时批量查询池内全部有凭证账号的会员额度：自动回写缓存与历史（概述页趋势图/健康度卡的数据源），
-            额度用完的账号会在应用内提醒。
-          </p>
-        </div>
-      </div>
-
-      {/* 每日签到 */}
-      <div className="mt-4 card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <CalendarCheck size={16} className="text-rose-500" />
-          <span className="text-sm font-medium">每日签到</span>
-        </div>
-
-        <div className="space-y-3 text-xs text-slate-500">
-          <p>
-            签到端点已按抓包固化（<code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">/alice/ug/campaign/landing/checkin</code>）。
-            注册后每日定时对池内全部账号签到领额度，结果按日落库（概述页签到结果与额度看板的数据源）；
-            当日已签的账号自动跳过（幂等）；未签成功的账号次日自动补签，同日也可在账号页再次手动签到，多次结果按最终状态合并。
-          </p>
-
-          {/* 每日签到任务 */}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="shrink-0 text-slate-500">每日任务</span>
-            <input
-              value={checkinTaskTime}
-              onChange={(e) => setCheckinTaskTime(e.target.value)}
-              placeholder="HH:MM"
-              className="input w-24 text-xs"
-            />
-            <button onClick={() => void registerCheckinTask()} className="btn-outline shrink-0">
-              <Timer size={14} /> 注册
-            </button>
-            {checkinTaskState === 'registered' && (
-              <>
-                <Badge tone="green">已注册 {checkinTaskTimeShown}</Badge>
-                <button onClick={() => void unregisterCheckinTask()} className="btn-ghost text-rose-500">
-                  注销
-                </button>
-              </>
-            )}
-            {checkinTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
-          </div>
-
-          {/* 应用内每日签到调度开关 */}
-          <label className="flex cursor-pointer items-start gap-2.5">
-            <input
-              type="checkbox"
-              checked={checkinEnabled}
-              onChange={(e) => void toggleCheckinEnabled(e.target.checked)}
-              className="mt-0.5 h-4 w-4 shrink-0 accent-rose-500"
-            />
-            <span>
-              <span className="font-medium text-slate-600 dark:text-zinc-200">
-                应用内每日签到调度（每日
-                <input
-                  type="time"
-                  value={checkinHhmm}
-                  onChange={(e) => void saveCheckinHhmm(e.target.value)}
-                  className="input mx-1 h-7 !w-28 align-middle text-xs"
-                  aria-label="应用内签到调度时刻"
-                />
-                ）
-              </span>
-              <span className="mt-0.5 block leading-relaxed">
-                关闭后应用内调度器不再执行每日自动签到；与上方「每日任务」（Windows 计划任务）相互独立。
-                无豆包账号时自动跳过，不记失败、不推送通知。
-              </span>
-            </span>
-          </label>
-
-          {/* 手动签到 */}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="shrink-0 text-slate-500">手动签到</span>
-            <button onClick={() => void runCheckinNow()} disabled={checkinRunning} className="btn-outline shrink-0">
-              <CalendarCheck size={14} /> {checkinRunning ? '签到中…' : '立即签到全部'}
-            </button>
-            <span className="text-slate-400">单账号签到见「账号管理」各行签到按钮</span>
-          </div>
-        </div>
+        </section>
       </div>
     </div>
   );

@@ -473,6 +473,7 @@ fn main() {
             commands::doubao::doubao_quota_task_unregister,
             commands::doubao::doubao_checkin_run,
             commands::doubao::doubao_dashboard_stats,
+            commands::doubao::doubao_checkin_results_detail,
             commands::doubao::doubao_checkin_task_register,
             commands::doubao::doubao_checkin_task_status,
             commands::doubao::doubao_checkin_task_unregister,

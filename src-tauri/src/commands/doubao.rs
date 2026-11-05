@@ -24,6 +24,9 @@ pub struct DoubaoAccount {
     /// 备注
     #[serde(default)]
     pub note: String,
+    /// 共享分组 id（shared groups 体系 shg_*；None = 未分组。serde default 向后兼容）
+    #[serde(default)]
+    pub group_id: Option<String>,
     /// 入池时间（YYYY-MM-DD HH:MM:SS）
     #[serde(default)]
     pub added_at: String,
@@ -97,6 +100,8 @@ pub struct DoubaoAccountView {
     pub user_id: String,
     pub name: String,
     pub note: String,
+    /// 共享分组 id（shared groups 体系；None = 未分组）
+    pub group_id: Option<String>,
     pub has_snapshot: bool,
     pub size_bytes: u64,
     pub file_count: u64,
@@ -249,6 +254,7 @@ pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountV
             user_id: a.user_id.clone(),
             name: if a.name.is_empty() { a.user_id.clone() } else { a.name.clone() },
             note: a.note.clone(),
+            group_id: a.group_id.clone(),
             has_snapshot: false,
             size_bytes: 0,
             file_count: 0,
@@ -278,18 +284,26 @@ pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountV
 
     // 并入快照槽（last 为 PS 桥安全备份槽，不在账号列表展示）
     if let Ok(entries) = std::fs::read_dir(&root) {
+        // 循环前批量水合体积缓存一次（审查 L2）：逐槽位 dir_stats_cached 不再各自
+        // 读落盘 kv，整轮命中判定走内存（P3 批量路径同款）
+        crate::commands::profile::prime_stats_cache(&state.data_dir);
         for entry in entries.flatten() {
             if !entry.path().is_dir() {
                 continue;
             }
             let slot = entry.file_name().to_string_lossy().to_string();
-            // last = PS 桥安全备份槽；*.bak = 单代回滚代次（Backup-ChromiumProfile 覆盖前的
-            // 旧快照）——两者都是内部回滚数据而非账号，不进账号列表（否则用户会看到一堆
-            // "xxx.bak 账号"误以为多了账号）
-            if slot == "last" || slot.ends_with(".bak") {
+            // last = PS 桥安全备份槽；*.bak / *.bak2 = 单/双代回滚代次（Backup-ChromiumProfile
+            // 覆盖前的旧快照，rotate_bak 轮换产物）——都是内部回滚数据而非账号，不进账号列表
+            //（否则用户会看到一堆 "last.bak2 账号" 误以为多了账号）
+            if slot == "last"
+                || slot.starts_with("last.")
+                || slot.ends_with(".bak")
+                || slot.ends_with(".bak2")
+            {
                 continue;
             }
-            let (size_bytes, file_count) = crate::commands::profile::dir_stats(&entry.path());
+            let (size_bytes, file_count) =
+                crate::commands::profile::dir_stats_cached(&entry.path(), &state.data_dir);
             let last_modified = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -310,6 +324,7 @@ pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountV
                     user_id: slot.clone(),
                     name: slot,
                     note: String::new(),
+                    group_id: None,
                     has_snapshot: true,
                     size_bytes,
                     file_count,
@@ -348,13 +363,16 @@ pub fn doubao_accounts_list(state: State<AppState>) -> Result<Vec<DoubaoAccountV
     Ok(views)
 }
 
-/// 收录/更新账号（upsert 别名与备注；不存在则入池）
+/// 收录/更新账号（upsert 别名/备注/分组；不存在则入池）。
+/// group_id 语义对齐 buddy_ai_account_save：Some=设置（trim 后空串 = 清空为未分组），None=保持不变；
+/// 分组定义走共享分组体系（shg_*，shared_groups.rs），成员关系各池自理（D1 决策）
 #[tauri::command]
 pub fn doubao_account_save(
     state: State<AppState>,
     user_id: String,
     name: Option<String>,
     note: Option<String>,
+    group_id: Option<String>,
 ) -> Result<(), String> {
     let user_id = user_id.trim().to_string();
     if user_id.is_empty() {
@@ -362,6 +380,7 @@ pub fn doubao_account_save(
     }
     // uid 后续会被拼进快照槽/备份等文件路径，入口统一做字符集白名单校验
     fs_utils::ensure_uid_safe(&user_id)?;
+    let group_norm = group_id.map(|g| g.trim().to_string());
     // 读-改-写互斥：罩住 load→改→save 段，防命令/巡检/保活线程旧副本整文档覆盖
     let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
@@ -372,10 +391,14 @@ pub fn doubao_account_save(
         if let Some(n) = note {
             acc.note = n.trim().to_string();
         }
+        if let Some(g) = &group_norm {
+            acc.group_id = if g.is_empty() { None } else { Some(g.clone()) };
+        }
     } else {
         pool.accounts.push(DoubaoAccount {
             name: name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| user_id.clone()),
             note: note.map(|n| n.trim().to_string()).unwrap_or_default(),
+            group_id: group_norm,
             user_id,
             added_at: fs_utils::now_ts(),
             last_active_at: None,
@@ -429,10 +452,39 @@ pub fn doubao_account_remove(state: State<AppState>, user_id: String) -> Result<
 // async：探测链含 leveldb/文件遍历，避免 UI 冻结（内部逻辑不变）
 #[tauri::command(async)]
 pub fn doubao_detect_uid(state: State<AppState>) -> Result<Option<String>, String> {
+    // 切换新鲜度门（2026-10-28 修复）：应用内切换完成时 switch_flow 会写
+    // profiles_doubao/current_account.meta.json {"switchedAtMs": epoch_ms}。
+    // leveldb client_device_info 只在客户端启动时重写——若其 currentLaunchTime
+    // 早于最近一次切换，说明切换后客户端尚未重启（或手动重登未重启），此时
+    // leveldb/抓包/Local State 全部只能反映切换前的旧会话，直接采信切换标记。
+    let switched_at_ms = std::fs::read_to_string(profiles_root(&state).join("current_account.meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("switchedAtMs").and_then(serde_json::Value::as_i64))
+        .unwrap_or(0);
+    let ls_probe = crate::tasks::doubao_chats::detect_uid(&state);
+    let ls_uid = ls_probe
+        .get("user_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // currentLaunchTime 为 epoch ms（与抓包 captured_at 秒级比较处同口径）；非 epoch ms 视为不可比
+    let ls_ts_ms = ls_probe.get("launch_ts_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
+    let ls_ts_valid = ls_ts_ms >= 1_000_000_000_000;
+    let switch_fresher = switched_at_ms > 0 && (!ls_ts_valid || switched_at_ms > ls_ts_ms);
+    if switch_fresher {
+        if let Some(cur) = read_current_uid(&state) {
+            eprintln!(
+                "[detect-uid] 本地探测信号（launch={ls_ts_ms}）不新于最近切换（{switched_at_ms}），采信切换标记"
+            );
+            return Ok(Some(cur));
+        }
+    }
     // 首选：豆包客户端 Local Storage 的 client_device_info.userId（客户端每次启动自写，
     // **不依赖代理**；与抓包文件按时间戳比新鲜度取新者）——修复无代理时重新登录识别不到
     // 新账号的问题（Local State 的 saman.user_id 同 profile 重登不更新、抓包文件无代理不更新）
-    if let Some(uid) = detect_uid_from_local_storage(&state) {
+    if let Some(uid) = ls_uid {
         return Ok(Some(uid));
     }
     // 兜底链：抓包 uid → Local State → public_config → current_account.txt
@@ -985,6 +1037,23 @@ pub fn doubao_quota_fetch(state: State<AppState>, user_id: String) -> Result<ser
 /// level 为空 = 免费或未识别，仍记录 checked_at，前端据此显示「免费」标识。
 /// 成功时返回一句话摘要（供运维历史事件复用）。
 fn update_quota_cache(state: &State<AppState>, uid: &str, parsed: &serde_json::Value) -> Result<Option<String>, String> {
+    // detail 只读探针（2026-10-28 解耦）：顺手回写累计获得额度/签到状态快照——
+    // 额度数值与签到动作无关，会话有效即可查。探针失败不影响本函数主流程。
+    // 审查修复（2026-10-28）：探针含网络调用，必须在锁外执行——
+    // 原先放在临界区内会阻塞一切池读写（切换/保存/巡检回写全部卡住）。
+    // 审查修复（2026-10-29 L4）：手动刷新额度时探针串行叠加在 quota 查询之后，
+    // 用 8s 短超时（轻量只读端点，巡检批量路径仍用 15s）压缩单账号刷新耗时。
+    let probe = {
+        let pool = load_pool(state);
+        pool.accounts
+            .iter()
+            .find(|a| a.user_id == uid)
+            .and_then(|a| a.session_id.clone().map(|sid| (sid, a.sid_guard.clone())))
+            .and_then(|(sid, sg)| {
+                let agent = crate::tasks::http_agent(8);
+                crate::tasks::doubao_checkin::detail_probe(&agent, &sid, sg.as_deref(), None)
+            })
+    };
     // 读-改-写互斥：罩住 load→改→save 段，防旧副本整文档覆盖
     let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(state);
@@ -1012,6 +1081,14 @@ fn update_quota_cache(state: &State<AppState>, uid: &str, parsed: &serde_json::V
     acc.quota_expire_at = expire;
     acc.quota_summary = summary.clone();
     acc.quota_checked_at = Some(fs_utils::now_ts());
+    if let Some(d) = probe {
+        acc.quota_total = d.get("total_amount").and_then(serde_json::Value::as_i64);
+        acc.checkin_continuous_days = d.get("continuous_days").and_then(serde_json::Value::as_i64);
+        acc.checkin_last_date = d
+            .get("last_checkin_date")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
+    }
     save_pool(state, &pool)?;
     Ok(summary)
 }
@@ -1143,6 +1220,7 @@ fn apply_credential(
         pool.accounts.push(DoubaoAccount {
             name: user_id.to_string(),
             note: String::new(),
+            group_id: None,
             user_id: user_id.to_string(),
             added_at: fs_utils::now_ts(),
             last_active_at: None,
@@ -1575,6 +1653,56 @@ pub fn doubao_dashboard_stats(state: State<AppState>) -> Result<DoubaoDashboardS
     })
 }
 
+/// 额度趋势明细点：单账号某日签到结果（成功/已签/失败 + 奖励额度）
+#[derive(serde::Serialize, Clone)]
+pub struct DoubaoDayAccountResult {
+    pub user_id: String,
+    pub name: String,
+    /// success | already | fail
+    pub status: String,
+    /// 签到奖励额度（success 时非空）
+    pub reward: Option<i64>,
+}
+
+/// 额度趋势单日明细：date → 逐账号结果（同 uid 同日一条，重试轮覆盖为最终态）
+#[derive(serde::Serialize, Clone)]
+pub struct DoubaoDayDetail {
+    pub date: String,
+    pub accounts: Vec<DoubaoDayAccountResult>,
+}
+
+/// 签到按日明细查询（额度看板「额度趋势」数据源）：日期升序、限量最近 N 天（默认 30，clamp 1~365）。
+/// 返回逐账号明细，前端按分组 / 账号 / 时间区间自行过滤聚合（概览/看板共用一份按日落库）。
+#[tauri::command]
+pub fn doubao_checkin_results_detail(
+    state: State<AppState>,
+    days: Option<u32>,
+) -> Result<Vec<DoubaoDayDetail>, String> {
+    let results = crate::doubao_checkin_results::load(&state.data_dir);
+    let days = days.unwrap_or(30).clamp(1, 365) as usize;
+    let mut sorted: Vec<(&String, &crate::doubao_checkin_results::DayRecord)> =
+        results.days.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let skip = sorted.len().saturating_sub(days);
+    Ok(sorted
+        .into_iter()
+        .skip(skip)
+        .map(|(date, day)| DoubaoDayDetail {
+            date: date.clone(),
+            accounts: day
+                .accounts
+                .iter()
+                .map(|(uid, r)| DoubaoDayAccountResult {
+                    user_id: uid.clone(),
+                    name: r.name.clone(),
+                    status: r.status.clone(),
+                    reward: r.reward,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
 /// 注册豆包每日签到计划任务（schtasks 直调主 exe --task-run doubao-checkin，
 /// 对齐 doubao_quota_task_register）
 #[tauri::command(async)]
@@ -1597,6 +1725,22 @@ pub fn doubao_checkin_task_register(state: State<AppState>, time: String) -> Res
     ])?;
     if !ok {
         return Err(schtasks_create_failure(&state, "每日签到", &stderr));
+    }
+    // 单一时刻源（2026-10-31 修复）：Windows 计划任务注册成功后同步 settings.doubao_checkin_hhmm，
+    // 否则应用内调度（默认 09:15）与计划任务（用户自定，如 15:00）双轨时刻漂移——
+    // 前端「每日任务」输入框读 settings、徽标读 schtasks，会出现 09:15/15:00 各说各话
+    {
+        let store = crate::store::db(&state.data_dir);
+        let mut current: serde_json::Value = store.kv_get("app_settings");
+        if !current.is_object() {
+            current = serde_json::json!({});
+        }
+        if let Some(obj) = current.as_object_mut() {
+            obj.insert("doubao_checkin_hhmm".to_string(), serde_json::json!(time));
+        }
+        if let Err(e) = store.kv_set("app_settings", &current) {
+            fs_utils::app_log(&state.data_dir, &format!("签到时刻写入设置失败（计划任务已注册）: {e}"));
+        }
     }
     fs_utils::app_log(&state.data_dir, &format!("豆包每日签到定时任务已注册: {time}（直调主 exe）"));
     Ok(())
