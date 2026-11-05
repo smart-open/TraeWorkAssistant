@@ -532,6 +532,23 @@ pub fn default_tool_alias_rules() -> Vec<(String, String)> {
         ("job_output".to_string(), "read_job_log".to_string()),
         ("pwsh".to_string(), "run_shell".to_string()),
         ("working_directory".to_string(), "work_dir".to_string()),
+        // DSH 0.2.1-rc.3 实证补十条（2026-11-05 会话 request/header 抓包 141 工具）：
+        // rc.2 的 25 工具样本未涵盖插件化后的新增面——Cordis 内省二件、Agent Teams
+        // 协作六件（list_agents/spawn_teammate/team_task_*/wait_agent）、插件管理、
+        // 工作区依赖探针均为该客户端独家命名；glob/grep/read/write/edit/web_* 等
+        // 通用名维持不改（避免模型侧语义损失）。别名一律取语义保持的 snake_case
+        // 通用词，且逐一核对不与请求内存活真实名、不与既有规则 to 值碰撞
+        ("cordis_inspect_list".to_string(), "ext_inspect_list".to_string()),
+        ("cordis_inspect_query".to_string(), "ext_inspect_query".to_string()),
+        ("list_agents".to_string(), "list_teammates".to_string()),
+        ("spawn_teammate".to_string(), "add_teammate".to_string()),
+        ("wait_agent".to_string(), "await_teammate".to_string()),
+        ("team_task_create".to_string(), "new_shared_task".to_string()),
+        ("team_task_get".to_string(), "read_shared_task".to_string()),
+        ("team_task_list".to_string(), "list_shared_tasks".to_string()),
+        ("team_task_update".to_string(), "update_shared_task".to_string()),
+        ("plugin_manager".to_string(), "extension_manager".to_string()),
+        ("load_workspace_dependencies".to_string(), "load_deps".to_string()),
         // ==================== CodeBuddy 独家（1.106.1 抓包实证） ====================
         // 2026-10-29 buddy CLI 抓包实证 18 工具：replace_in_file/write_to_file/
         // ask_followup_question 经 Cline/Roo 段、ToolSearch 经 Claude Code 段
