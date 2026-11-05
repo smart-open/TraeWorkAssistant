@@ -33,15 +33,18 @@ use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState
 /// 才成功的场景，会提前报 no_healthy_account——如需对齐 WB/Qoder 口径再放开此值，
 /// 调整前需先评估首字延迟回归）
 const MAX_ROTATE: usize = 3;
-/// 请求体上限（issue #21；issue #138 P1 环境变量化）：axum `Bytes` 提取器受
-/// DefaultBodyLimit 约束（默认 2MiB），build_router 已显式放开，两处阈值必须一致。
-/// 默认 8MiB 适配长上下文客户端（每轮重发完整历史 + 图片 base64 场景）；可用
-/// 环境变量 AIWORK_MAX_BODY_BYTES 覆盖（单位字节，合法区间 [256KiB, 64MiB]，
-/// 非法/越界值回退默认并 stderr 告警），解析结果进程内缓存（OnceLock 只解析一次）
+/// 请求体上限（issue #21；issue #138 P1 环境变量化；issue #181 默认回调 32MiB）：
+/// axum `Bytes` 提取器受 DefaultBodyLimit 约束（默认 2MiB），build_router 已显式
+/// 放开，两处阈值必须一致。issue #138 曾默认 32MiB→8MiB，但 agent CLI（DSH 等）
+/// 每轮全量重发会话历史 + 工具输出，大仓库场景稳定超 8MiB 被 413 拒绝且被客户端
+/// 误判为「超出上下文窗口」（issue #181）——默认回调 32MiB（#138 引入环境变量前
+/// 的历史默认）；可用环境变量 AIWORK_MAX_BODY_BYTES 覆盖（单位字节，合法区间
+/// [256KiB, 64MiB]，非法/越界值回退默认并 stderr 告警），解析结果进程内缓存
+/// （OnceLock 只解析一次）
 pub(super) fn max_body_bytes() -> usize {
     static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        const DEFAULT: usize = 8 << 20;
+        const DEFAULT: usize = 32 << 20;
         const MIN: usize = 256 << 10;
         const MAX: usize = 64 << 20;
         match std::env::var("AIWORK_MAX_BODY_BYTES") {
@@ -62,7 +65,7 @@ pub(super) fn max_body_bytes() -> usize {
     })
 }
 
-/// 字节数人性化（issue #138 P1）：整 MiB 显示 "8MB"，否则按 KiB 显示
+/// 字节数人性化（issue #138 P1）：整 MiB 显示 "32MB"，否则按 KiB 显示
 fn fmt_size_human(n: usize) -> String {
     if n != 0 && n % (1 << 20) == 0 {
         format!("{}MB", n >> 20)
@@ -71,9 +74,15 @@ fn fmt_size_human(n: usize) -> String {
     }
 }
 
-/// 请求体超限文案（issue #21）：由阈值推导，避免阈值调整后文案脱节
+/// 请求体超限文案（issue #21；issue #181 补自助指引）：由阈值推导，避免阈值调整后
+/// 文案脱节。附环境变量指引——issue #181 实证 agent CLI 用户把 413
+/// `request_too_large` 误判为「超出上下文窗口」，报错里给出自救路径可免开 issue
 pub(super) fn body_too_large_msg() -> String {
-    format!("request body exceeds {} limit", fmt_size_human(max_body_bytes()))
+    format!(
+        "request body exceeds {} limit; set environment variable AIWORK_MAX_BODY_BYTES (bytes, up to {}) to raise it",
+        fmt_size_human(max_body_bytes()),
+        fmt_size_human(64 << 20),
+    )
 }
 
 /// issue #138 P1：首字对冲大 body 门槛——请求体超过该值跳过对冲竞速
@@ -185,20 +194,39 @@ fn resolve_wb_target(
     // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
     let whitelist = unified_catalog::load_whitelist(&state.data_dir);
     let in_wl = |m: &str| unified_catalog::whitelist_allows(&whitelist, m);
-    let final_model = if !intl_only
+    let (downgrade_reason, final_model) = if !intl_only
         && state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::is_background_task(body)
     {
-        wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
+        (
+            "bg",
+            wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl)
+                .unwrap_or(r.model.clone()),
+        )
     } else if !intl_only
         && state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::estimate_input_tokens(body)
             >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
     {
-        wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
+        (
+            "longctx",
+            wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl)
+                .unwrap_or(r.model.clone()),
+        )
     } else {
-        r.model
+        ("", r.model.clone())
     };
+    // issue #184 修复（可观测性）：与 dispatch.rs 降级日志同口径——/v1/responses
+    // 路径降级改写同样落 app_log，此前仅 dispatch 路径有日志（审查补齐）
+    if !downgrade_reason.is_empty() && final_model != r.model {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "dispatch downgrade: requested={} routed={} -> downgraded={} reason={}",
+                model, r.model, final_model, downgrade_reason
+            ),
+        );
+    }
     Some((final_model, r.effort_hint, origin))
 }
 
@@ -2569,7 +2597,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                     }
                                 }
                                 let kind = classify_error(status, &resp_body);
-                                state.pool.note_error(&picked.uid, kind);
+                                // issue #178：429 带上游 Retry-After（秒）时以其为账号解冻时刻；
+                                // ErrKind::None 属请求级错误，不落池（对齐 solo 路径守卫）
+                                if kind != ErrKind::None {
+                                    state.pool.note_error_retry_after(&picked.uid, kind, retry_after);
+                                }
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.trae_sticky.unbind_uid(&picked.uid);
@@ -3119,7 +3151,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     }
                                 }
                                 let kind = classify_error(status, &resp_body);
-                                state.pool.note_error(&picked.uid, kind);
+                                // issue #178：429 带上游 Retry-After（秒）时以其为账号解冻时刻；
+                                // ErrKind::None 属请求级错误，不落池（对齐 solo 路径守卫）
+                                if kind != ErrKind::None {
+                                    state.pool.note_error_retry_after(&picked.uid, kind, retry_after);
+                                }
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.trae_sticky.unbind_uid(&picked.uid);
@@ -4403,5 +4439,21 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["is_max_mode"], true);
         assert_eq!(v["model"], "glm-5.3");
+    }
+
+    // ==================== 请求体上限与 413 文案（issue #21/#138/#181） ====================
+
+    #[test]
+    fn body_limit_default_is_32mib_and_env_message_carries_self_help() {
+        // issue #181：默认 32MiB（agent CLI 大包不再被 413），文案由阈值推导且
+        // 附带环境变量自助指引（用户看到报错即可自救，不必开 issue）
+        let msg = body_too_large_msg();
+        assert!(msg.contains("exceeds 32MB limit"), "{msg}");
+        assert!(msg.contains("AIWORK_MAX_BODY_BYTES"), "{msg}");
+        assert!(msg.contains("64MB"), "{msg}");
+        // 人性化函数：整 MiB / 非整 MiB 两分支
+        assert_eq!(fmt_size_human(32 << 20), "32MB");
+        assert_eq!(fmt_size_human((32 << 20) + 512), "32768KiB");
+        assert_eq!(fmt_size_human(256 << 10), "256KiB");
     }
 }

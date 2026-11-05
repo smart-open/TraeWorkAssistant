@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Snowflake } from 'lucide-react';
 import { Badge } from '../../components/ui';
+// 标签/剩余计算抽自 lib/cooldownTypes（与 Checkin.tsx 共享口径）；
+// main 侧 #178 新增的 consecutive_errors 标签与秒级精度已并入该库
 import { cooldownLabel, cooldownRemaining, isPermanentCooldown } from '../../lib/cooldownTypes';
 
 /** SessionDead（JWT 被服务端吊销）的恢复指引：重登 → 保存登录态 → 续期捕获新凭证 */
@@ -15,17 +17,20 @@ const AUTH_REJECTED_GUIDE =
   '临时方案：在「账号管理」对该账号重新执行一次 OAuth 登录，新凭证生效后签到自动恢复。';
 
 export function CooldownBadge({ type, until }: { type: string; until: number | null }) {
-  // 分钟级时钟驱动（审查修复 L）：停留页面时剩余时长不再冻结在首帧值
+  // 动态倒计时（issue #178）：冷却中每秒跳字。429 限流默认仅 60s，静态渲染
+  // 会停在「1m」误导用户；<1h 用秒级精度（Xm Ys / Xs），≥1h 沿用 Xh Ym 粗粒度
   const [, setTick] = useState(0);
-  useEffect(() => {
-    if (isPermanentCooldown(type) || !until) return;
-    const timer = setInterval(() => setTick((n) => n + 1), 30_000);
-    return () => clearInterval(timer);
-  }, [type, until]);
   const label = cooldownLabel(type);
   const isPermanent = isPermanentCooldown(type);
   const guide =
     type === 'SessionDead' ? SESSION_DEAD_GUIDE : type === 'AuthRejected' ? AUTH_REJECTED_GUIDE : undefined;
+  const secs = !isPermanent && until ? until - Math.floor(Date.now() / 1000) : 0;
+  const ticking = secs > 0;
+  useEffect(() => {
+    if (!ticking) return;
+    const t = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [ticking]);
   const remaining = cooldownRemaining(type, until);
   return (
     <Badge tone={isPermanent ? 'red' : 'amber'} title={guide}>

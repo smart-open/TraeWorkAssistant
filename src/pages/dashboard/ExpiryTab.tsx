@@ -2,6 +2,8 @@ import { useMemo } from 'react';
 import { Coins } from 'lucide-react';
 import { Badge, EmptyState } from '../../components/ui';
 import ExpiryCalendar, { type ExpiryItem } from '../../components/ExpiryCalendar';
+import { PoolStatusBadge } from '../accounts/PoolStatusBadge';
+import { usePoolStatus } from '../../hooks/usePoolStatus';
 import { fmtCredits, dateStrToEndTs } from '../../lib/format';
 import type { AccountView, QoderCreditsResult, TraeExpiredEntsResult, WbCreditsResult } from '../../types';
 import type { PlatformScope } from './KpiRow';
@@ -19,6 +21,8 @@ const PERPETUAL_TS = 4102444800;
 interface AccountRow {
   key: string;
   platform: 'Trae' | 'Buddy' | 'Qoder';
+  /** 池联表键（user_id = 各池内存池 uid，issue #178 限流徽标注入用） */
+  uid: string;
   name: string;
   balance: number | null;
   packages: number;
@@ -46,6 +50,10 @@ export default function ExpiryTab({
   /** Trae 逐包到期实时查询（issue #82 T5.1：expired_ents，含已过期包；credit_packs 只含未过期可用包） */
   expiredEnts: TraeExpiredEntsResult | null;
 }) {
+  // 运行期限流/冷却徽标（issue #178）：三池内存状态联表（平台筛选由行内 platform 决定取哪张表）
+  const traePool = usePoolStatus('trae');
+  const wbPool = usePoolStatus('wb');
+  const qoderPool = usePoolStatus('qoder');
   const rows = useMemo<AccountRow[]>(() => {
     const nowSec = Date.now() / 1000;
     const out: AccountRow[] = [];
@@ -65,6 +73,7 @@ export default function ExpiryTab({
         out.push({
           key: `trae-${a.user_id}`,
           platform: 'Trae',
+          uid: a.user_id,
           name: a.name,
           balance: a.remaining_credits,
           packages: hasPacks
@@ -87,12 +96,15 @@ export default function ExpiryTab({
         out.push({
           key: `buddy-${a.user_id}`,
           platform: 'Buddy',
+          uid: a.user_id,
           name: a.name,
           balance: a.balance,
           packages: activePkgs.length,
           nearestExpire: expires.length > 0 ? Math.min(...expires) : null,
           ok: a.ok,
-          status: a.ok ? '正常' : a.message || '查询失败',
+          // issue #179：ok=true 但包明细空时后端携带诚实标注 message（如 local_quota
+          // 降级/上游形状变化），状态列不再恒显「正常」掩盖降级
+          status: a.ok ? a.message || '正常' : a.message || '查询失败',
           source: a.source,
         });
       }
@@ -123,6 +135,7 @@ export default function ExpiryTab({
         out.push({
           key: `qoder-${a.user_id}`,
           platform: 'Qoder',
+          uid: a.user_id,
           name: a.name,
           balance: a.total,
           packages: pkgCount,
@@ -344,13 +357,19 @@ export default function ExpiryTab({
                     {fmtExpire(r.nearestExpire)}
                   </td>
                   <td className="px-4 py-2">
-                    {r.ok ? (
-                      <Badge tone="green">{r.status}</Badge>
-                    ) : (
-                      <Badge tone="red" title={r.status}>
-                        异常
-                      </Badge>
-                    )}
+                    <div className="flex flex-wrap items-center gap-1">
+                      {r.ok ? (
+                        <Badge tone="green">{r.status}</Badge>
+                      ) : (
+                        <Badge tone="red" title={r.status}>
+                          异常
+                        </Badge>
+                      )}
+                      {/* 运行期限流/冷却（issue #178）：按平台取对应池内存状态，无则不渲染 */}
+                      <PoolStatusBadge
+                        status={(r.platform === 'Trae' ? traePool : r.platform === 'Buddy' ? wbPool : qoderPool).get(r.uid)}
+                      />
+                    </div>
                   </td>
                 </tr>
               ))}

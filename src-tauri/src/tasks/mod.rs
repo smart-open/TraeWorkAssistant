@@ -15,6 +15,7 @@
 //! P1 `doubao-quota`；P2 `wb-checkin`/`wb-renew`/`checkin`；P3 `doubao-renew`。
 
 pub mod doubao_chats;
+pub mod doubao_checkin;
 pub mod doubao_quota;
 pub mod doubao_session;
 pub mod qoder_catalog;
@@ -111,6 +112,8 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
     }
     let result = match name {
         "doubao-quota" => doubao_quota::run_batch(state),
+        // 豆包每日签到（需求③：schtasks 直调 + 应用内调度器共用；空池跳过）
+        "doubao-checkin" => doubao_checkin::run_batch(state),
         // WorkBuddy 每日签到（schtasks 直调；--json-stream --skip-checked 同款参数）。
         // issue #134 方案4：抢完整轮次锁与 GUI 进程互斥——CLI 是独立进程，GUI 进程内
         // 的 tokio 轮次锁对它无效，必须靠跨进程命名互斥体；GUI 正在跑（UI/调度器/

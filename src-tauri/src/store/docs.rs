@@ -2023,6 +2023,82 @@ pub fn checkin_results_save(s: &Store, f: &crate::checkin_results::ResultsFile) 
     })
 }
 
+// ── 豆包签到结果（按日落库 → doubao_checkin_results 表）─────────────────────
+
+pub fn doubao_checkin_results_load(
+    s: &Store,
+) -> crate::doubao_checkin_results::ResultsFile {
+    doubao_checkin_results_try_load(s).unwrap_or_default()
+}
+
+/// 带失败透传的加载：DB 错误返回 None（读路径展示可用 load 回空；
+/// 写路径 record_today 遇 None 必须中止——否则「load 失败回空 + 全量写」
+/// 会把历史清空。配合 save 的按日 upsert 双保险）
+pub fn doubao_checkin_results_try_load(
+    s: &Store,
+) -> Option<crate::doubao_checkin_results::ResultsFile> {
+    use std::collections::BTreeMap;
+    let mut days: BTreeMap<String, crate::doubao_checkin_results::DayRecord> = BTreeMap::new();
+    let rows = s
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT day, uid, name, status, reward, updated_at FROM doubao_checkin_results ORDER BY day, uid",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .ok()?;
+    for (day, uid, name, status, reward, updated_at) in rows {
+        days.entry(day).or_default().accounts.insert(
+            uid,
+            crate::doubao_checkin_results::AccountResult { name, status, reward, updated_at },
+        );
+    }
+    Some(crate::doubao_checkin_results::ResultsFile { days })
+}
+
+pub fn doubao_checkin_results_save(
+    s: &Store,
+    f: &crate::doubao_checkin_results::ResultsFile,
+) -> Result<(), String> {
+    s.with_conn(|c| {
+        c.execute_batch("BEGIN;")?;
+        // 按日裁剪保留期外的历史（替代原「全表 DELETE + 重插」：
+        // load 失败回空时全表替换会把 90 天历史清成仅当日，数据静默丢失）
+        c.execute(
+            "DELETE FROM doubao_checkin_results WHERE day < ?1",
+            rusqlite::params![f.cutoff_day(crate::doubao_checkin_results::RETENTION_DAYS)],
+        )?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT OR REPLACE INTO doubao_checkin_results(day, uid, name, status, reward, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (day, rec) in &f.days {
+                for (uid, a) in &rec.accounts {
+                    stmt.execute(rusqlite::params![day, uid, a.name, a.status, a.reward, a.updated_at])?;
+                }
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
 // ── WorkBuddy 签到结果（workbuddy_checkin_results.json → wb_checkin_results 表）──
 
 /// 读回 {results: [...]}（按 id 升序 = 原追加序）

@@ -14,6 +14,9 @@ export const COOLDOWN_LABELS: Record<string, string> = {
   BusinessError: '业务错误',
   DeviceSigned: '设备已签',
   AuthRejected: '认证被拒',
+  // issue #178：PoolStatusBadge 透传池内 reason 值域（ErrKind::as_str 之外还有
+  // 熔断/积分耗尽两个专用 reason），缺键会显示英文原文
+  consecutive_errors: '连续错误熔断',
   Unknown: '未知错误',
 };
 
@@ -24,12 +27,13 @@ export const cooldownLabel = (type: string): string => COOLDOWN_LABELS[type] ?? 
 export const isPermanentCooldown = (type: string): boolean =>
   type === 'SessionDead' || type === 'AuthRejected';
 
-/** 临时冷却剩余展示文案（分钟级精度）；永久冷却或已到期返回空串 */
+/** 临时冷却剩余展示文案（issue #178：<1h 秒级精度 Xm Ys / Xs，≥1h 沿用 Xh Ym 粗粒度）；永久冷却或已到期返回空串 */
 export const cooldownRemaining = (type: string, until: number | null): string => {
   if (isPermanentCooldown(type) || !until) return '';
   const secs = until - Math.floor(Date.now() / 1000);
   if (secs <= 0) return '';
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
-  return h > 0 ? `${h}h${m}m` : `${m}m`;
+  const s = secs % 60;
+  return h > 0 ? `${h}h${m}m` : m > 0 ? `${m}m${String(s).padStart(2, '0')}s` : `${s}s`;
 };

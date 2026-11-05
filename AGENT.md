@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.8.8
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.9.0
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -421,7 +421,7 @@ ai-work-assistant/
 - CI 双平台分别生成清单（Windows 落 `release/windows/`、mac 落 `release/mac/`，`rename_release.mjs` 仅同目录自动合并），**发布时必须人工合并为一份全资产清单再上传**；发布前逐项核对 6 资产均在 `assets` 键内
 - 清单格式契约（`updater.rs` 消费）：`{ "version": "x.y.z", "assets": { "<本地原始文件名>": "<sha256hex>" } }`，2 空格缩进、中文原样、无末尾换行；键为**纯文件名**（含空格/中文），**严禁带任何本地路径前缀**（v3.6.3 事故：临时脚本把 `d:\code\...` 绝对路径写进键里，路径归一后无法匹配资产名）；GitHub 重写后的资产名（空格→`.`、中文→`_`）由 updater 宽松键归一匹配
 
-**GitHub Release 标题固定格式**：`v{MAJOR}.{MINOR}.{PATCH} 版本发布`（如 `v3.1.1 版本发布`），不额外加描述后缀
+**GitHub Release 标题命名规则（红线，2026-11-04 起）**：标题固定为 `v{MAJOR}.{MINOR}.{PATCH} 版本发布`（如 `v3.8.8 版本发布`），**严禁追加描述后缀**（历史 v3.8.2~v3.8.8 曾用「vX · 描述（#issue）」格式，已于 2026-11-04 全部统一回标准格式；后续发布一律不再使用）。
 
 ## 12. 安全与合规
 

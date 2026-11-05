@@ -527,6 +527,29 @@ pub fn resolve_target(
                 };
                 let cn_final = domain_candidate(false).unwrap_or_else(|| r.model.clone());
                 let intl_final = domain_candidate(true).unwrap_or_else(|| r.model.clone());
+                // issue #184 修复（可观测性）：降级改写模型名必须落 app_log——
+                // 此前改写零日志，用户请求 A 实际服务 B 完全无感知，无从排查。
+                // 本侧为分域候选结构（#19），CN/Intl 两个 final 各自判定，
+                // 实际生效档位取 bg/longctx 开关共用序（bg 优先，与域无关）
+                let downgrade_reason = if bg_on { "bg" } else if longctx_on { "longctx" } else { "" };
+                if !downgrade_reason.is_empty() && cn_final != r.model {
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!(
+                            "dispatch downgrade: requested={} routed={} -> downgraded={} reason={} domain=cn",
+                            model, r.model, cn_final, downgrade_reason
+                        ),
+                    );
+                }
+                if !downgrade_reason.is_empty() && intl_final != r.model {
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        &format!(
+                            "dispatch downgrade: requested={} routed={} -> downgraded={} reason={} domain=intl",
+                            model, r.model, intl_final, downgrade_reason
+                        ),
+                    );
+                }
                 ((cn_final, r.effort_hint.clone()), intl_final)
             })
             .map(|(hit, intl_final)| (Some(hit), Some(intl_final)))
@@ -1041,7 +1064,13 @@ fn smart_pool_order(
         };
         (
             earliest.unwrap_or(i64::MAX),
-            rate.unwrap_or(f64::MAX),
+            // issue #184 同源修复（smart 调度）：倍率键遇 NaN 哨兵（目录
+            // rate:null → f64::NAN）时 partial_cmp→Equal 把该池与任意值并列、
+            // 退化回稳定优先级序——NaN = 元数据缺失，与 None 同语义后置（MAX）
+            match rate {
+                Some(x) if !x.is_nan() => x,
+                _ => f64::MAX,
+            },
             -total,
         )
     };

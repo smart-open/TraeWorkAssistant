@@ -126,7 +126,7 @@ macOS 版为 **ad-hoc 签名**（暂未购买 Developer ID 公证），首次打
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `AIWORK_MAX_BODY_BYTES` | `8388608`（8MiB） | API 网关请求体上限（单位：字节），合法区间 256KiB~64MiB，非法 / 越界值回退默认并在日志告警。长上下文客户端报 413 `request_too_large` 时可设 `AIWORK_MAX_BODY_BYTES=33554432` 恢复升级前的 32MiB |
+| `AIWORK_MAX_BODY_BYTES` | `33554432`（32MiB） | API 网关请求体上限（单位：字节），合法区间 256KiB~64MiB，非法 / 越界值回退默认并在日志告警。agent CLI 等长上下文客户端若仍报 413 `request_too_large`，可调高至 64MiB 内的任意值 |
 
 修改后需重启应用生效（进程启动时解析一次）。
 
