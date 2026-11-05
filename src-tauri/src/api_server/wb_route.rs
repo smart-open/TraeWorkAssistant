@@ -1873,6 +1873,12 @@ pub async fn wb_aggregate_chat(
                                     &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
                                     seed, true,
                                 );
+                                // 重建后须重做工具别名（issue #150，合并审查补漏）：
+                                // 内层 loop 重发 converted 不会再走顶部 prepare 段，
+                                // 强制清洗重试若不带别名，11128 仍以原名工具集发出
+                                tool_alias = wb_payload::apply_tool_alias_forward(
+                                    &mut converted, &tool_alias_rules,
+                                );
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 continue;
                             }
