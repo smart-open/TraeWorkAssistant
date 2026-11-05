@@ -936,7 +936,15 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
         .chars()
         .take(300)
         .collect();
-    let mut out = format!("system=\"{}\"", sys.replace('"', "'"));
+    // 截断标记：原文超出 300 字符时尾部补省略号。UI「生成规则」取首句作 from
+    // （模板改写是逐字 contains+replace 精确匹配），首句完整才可逐字命中；省略号
+    // 让调用方明确区分「首句已完整」与「被截断的残句」，避免拿残句当规则落库
+    let truncated = system.chars().count() > 300;
+    let mut out = format!(
+        "system=\"{}{}\"",
+        sys.replace('"', "'"),
+        if truncated { "…" } else { "" }
+    );
     // 工具名画像（issue #150 增强）：此前仅截前 10 个，tools 工具集指纹识别
     // 升级后需全量画像定位「哪类客户端形态在被拦」——展示前 10 + 全量总数 +
     // 排序名 FNV-1a 短哈希（同名集合跨请求稳定聚合，日志侧可按 hash 分桶统计）
@@ -969,18 +977,26 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
     out
 }
 
-/// 首条 system 消息文本提取（string 与 text blocks 两种形态；无 → 空串）。
-/// fingerprint_sample 与 residual_fingerprint_note 共用
+/// 首条系统提示消息文本提取（string 与 text blocks 两种形态；无 → 空串）。
+/// fingerprint_sample 与 residual_fingerprint_note 共用。
+///
+/// role 口径：`system` 与 `developer` 均视为系统提示（大小写不敏感）。后者是
+/// OpenAI 规范里的系统级角色，部分客户端（DSH 的 developer workspace 指令）用它
+/// 承载系统提示——只看 `system` 时这类请求样本恒为空串，诊断闭环断裂
+/// （issue #99 样本「system=""」即此因）。`prepare_wb_chat_body` 在转发前已把
+/// developer 归一为 system，故此处对齐同一口径，避免取样与清洗看到不同消息
+fn is_system_role(msg: &Value) -> bool {
+    msg.get("role")
+        .and_then(|r| r.as_str())
+        .map(|r| r.eq_ignore_ascii_case("system") || r.eq_ignore_ascii_case("developer"))
+        .unwrap_or(false)
+}
+
 fn first_system_text(v: &Value) -> String {
     v.get("messages")
         .and_then(|m| m.as_array())
         .and_then(|msgs| {
-            msgs.iter().find(|msg| {
-                msg.get("role")
-                    .and_then(|r| r.as_str())
-                    .map(|r| r.eq_ignore_ascii_case("system"))
-                    .unwrap_or(false)
-            })
+            msgs.iter().find(|msg| is_system_role(msg))
         })
         .and_then(|msg| msg.get("content"))
         .map(|c| match c {
@@ -1617,6 +1633,8 @@ mod tests {
         assert!(s.starts_with("system=\"say 'hi' x"), "{s}");
         // 300 字符截断：总长远小于 400 源文本
         assert!(s.len() < 400, "len={}", s.len());
+        // 截断标记：原文超 300 字符时尾部有省略号，供 UI 区分「首句完整」与「残句」
+        assert!(s.contains("…\""), "截断样本应带省略号标记: {s}");
         // Responses 原生工具形态（无 function 包裹）回退顶层 name
         let body2 = json!({
             "messages":[{"role":"system","content":"s"}],
@@ -1624,6 +1642,50 @@ mod tests {
         });
         let s2 = fingerprint_sample(&serde_json::to_vec(&body2).unwrap());
         assert!(s2.contains("tools=[web_search]"), "{s2}");
+        // 未超 300 字符 → 不带省略号（避免 UI 误判为残句）
+        assert!(!s2.contains("…"), "短样本不应带省略号: {s2}");
+    }
+
+    /// role=developer 承载系统提示时样本不得为空（issue #99 样本 system="" 根因）：
+    /// 只看 role=system 会让这类请求的样本恒为空串，诊断闭环与「生成规则」全失效
+    #[test]
+    fn fingerprint_sample_reads_developer_role_system_prompt() {
+        let body = json!({
+            "messages":[
+                {"role":"developer","content":"You are an AI agent powered by DeepSeek Harness."},
+                {"role":"user","content":"hi"}
+            ]
+        });
+        let s = fingerprint_sample(&serde_json::to_vec(&body).unwrap());
+        assert!(!s.starts_with("system=\"\""), "developer 角色应参与取样: {s}");
+        assert!(s.contains("DeepSeek Harness"), "{s}");
+
+        // 数组块形态的 developer content 同样参与取样
+        let body2 = json!({
+            "messages":[
+                {"role":"developer","content":[
+                    {"type":"text","text":"You are an AI agent powered by DeepSeek Harness."}
+                ]},
+                {"role":"user","content":"hi"}
+            ]
+        });
+        let s2 = fingerprint_sample(&serde_json::to_vec(&body2).unwrap());
+        assert!(s2.contains("DeepSeek Harness"), "{s2}");
+
+        // 残指纹自检同口径：developer 承载的已知 marker 必须被检出
+        let note = residual_fingerprint_note(&serde_json::to_vec(&body).unwrap())
+            .expect("developer 角色的系统提示应参与残指纹自检");
+        assert!(note.contains("deepseek harness"), "{note}");
+
+        // role 大小写不敏感（"DEVELOPER"/"Developer" 皆参与）
+        let body3 = json!({
+            "messages":[
+                {"role":"Developer","content":"You are an AI agent powered by DeepSeek Harness."},
+                {"role":"user","content":"hi"}
+            ]
+        });
+        let s3 = fingerprint_sample(&serde_json::to_vec(&body3).unwrap());
+        assert!(s3.contains("DeepSeek Harness"), "{s3}");
     }
 
     /// issue #99 布防：VS Code 扩展身份句逗号续接变体（现有句号规则必然漏匹配）
