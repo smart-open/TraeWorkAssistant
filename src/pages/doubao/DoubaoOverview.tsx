@@ -317,17 +317,22 @@ export default function DoubaoOverview() {
   const refresh = async () => {
     setRefreshing(true);
     try {
-      // 环境检测 / 账号池 / 看板统计并行；后两者失败不阻断概述
+      // 环境检测 / 账号池 / 看板统计并行；后两者失败不阻断概述。
+      // locate 单独 catch 为 null：否则 reject 会短路 Promise.all，丢弃已成功的账号池/看板统计结果
+      let locateErr: unknown = null;
       const [loc, accs, st] = await Promise.all([
-        api.env.locate('doubao'),
+        api.env.locate('doubao').catch((e) => {
+          locateErr = e;
+          return null;
+        }),
         api.doubao.accountsList().catch(() => [] as DoubaoAccountView[]),
         api.doubao.dashboardStats().catch(() => null),
       ]);
-      setLocate(loc);
+      // locate 失败沿用原有失败路径（toast 提示环境检测问题），但不清空已有 locate、不丢其余数据
+      if (loc == null) pushToast('error', `豆包环境检测失败：${String(locateErr)}`);
+      else setLocate(loc);
       setAccounts(accs);
       setStats(st);
-    } catch (err) {
-      pushToast('error', `豆包环境检测失败：${String(err)}`);
     } finally {
       setRefreshing(false);
     }

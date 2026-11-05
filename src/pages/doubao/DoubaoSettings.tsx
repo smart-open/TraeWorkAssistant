@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FolderSearch, Save, ShieldCheck, RefreshCw, Timer, Coins, CalendarCheck, SlidersHorizontal, ListChecks } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
@@ -21,7 +21,7 @@ export default function DoubaoSettings() {
   // ── 会话保活 ──
   const [renewUrl, setRenewUrl] = useState('');
   const [taskTime, setTaskTime] = useState('09:00');
-  const [taskState, setTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
+  const [taskState, setTaskState] = useState<'loading' | 'registered' | 'not_registered' | 'error'>('loading');
   const [taskTimeShown, setTaskTimeShown] = useState('');
   const [running, setRunning] = useState(false);
   const [summary, setSummary] = useState<DoubaoRenewSummary | null>(null);
@@ -30,7 +30,7 @@ export default function DoubaoSettings() {
   const [quotaUrl, setQuotaUrl] = useState('');
   // ── 额度巡检定时任务 ──
   const [quotaTaskTime, setQuotaTaskTime] = useState('09:30');
-  const [quotaTaskState, setQuotaTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
+  const [quotaTaskState, setQuotaTaskState] = useState<'loading' | 'registered' | 'not_registered' | 'error'>('loading');
   const [quotaTaskTimeShown, setQuotaTaskTimeShown] = useState('');
 
   // ── 快照设置（C4：IndexedDB 可选纳入）──
@@ -42,8 +42,14 @@ export default function DoubaoSettings() {
 
   // ── 每日签到任务 ──
   const [checkinTaskTime, setCheckinTaskTime] = useState('09:15');
-  const [checkinTaskState, setCheckinTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
+  const [checkinTaskState, setCheckinTaskState] = useState<'loading' | 'registered' | 'not_registered' | 'error'>('loading');
   const [checkinTaskTimeShown, setCheckinTaskTimeShown] = useState('');
+  // 应用内每日签到的签到时刻（单源 settings.doubao_checkin_hhmm）：纯应用内调度（不注册 schtasks）用户的修改入口，
+  // 与上方 checkinTaskTime（Windows 计划任务注册时刻）是两个独立输入框
+  const [checkinHhmm, setCheckinHhmm] = useState('09:15');
+  // 回写打回防护：checkinTaskTime 编辑期间（脏标记或输入框聚焦中）refresh 不回填覆盖，注册成功后复位恢复收敛
+  const checkinTimeDirtyRef = useRef(false);
+  const checkinTaskTimeInputRef = useRef<HTMLInputElement>(null);
   // ── 豆包数据同步（额度巡检定时远端拉取 → 池回写；页面读本地） ──
   const [syncMode, setSyncMode] = useState('every_hours');
   const [syncHours, setSyncHours] = useState('2');
@@ -145,6 +151,20 @@ export default function DoubaoSettings() {
     }
     if (await saveSyncConfig({ doubao_sync_hhmm: v })) pushToast('success', `同步时刻已保存（每日 ${v}）`);
   };
+  // 应用内签到时刻（单源 doubao_checkin_hhmm）：交互对齐 syncHhmm（onChange 暂存、失焦校验后保存）
+  const changeCheckinHhmm = async (v: string) => {
+    setCheckinHhmm(v);
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(v)) {
+      pushToast('warn', '时间格式应为 HH:MM（如 09:15，已保持原值）');
+      return;
+    }
+    try {
+      await saveSettings({ doubao_checkin_hhmm: v });
+      pushToast('success', `应用内签到时刻已保存（每日 ${v}）`);
+    } catch {
+      return; // store.saveSettings 失败时已 pushToast 错误详情，此处仅阻断成功提示
+    }
+  };
 
   const refreshTaskStatus = async () => {
     try {
@@ -156,7 +176,7 @@ export default function DoubaoSettings() {
         setTaskState('not_registered');
       }
     } catch {
-      setTaskState('not_registered');
+      setTaskState('error'); // 查询失败 ≠ 未注册：置 error 态避免误导用户重复注册
     }
   };
 
@@ -170,7 +190,7 @@ export default function DoubaoSettings() {
         setQuotaTaskState('not_registered');
       }
     } catch {
-      setQuotaTaskState('not_registered');
+      setQuotaTaskState('error'); // 同上：后端故障与未注册区分展示
     }
   };
 
@@ -184,16 +204,19 @@ export default function DoubaoSettings() {
         // 输入框对齐真实注册时刻（2026-10-31 修复：此前读 settings 默认值 09:15，
         // 与 schtasks 实际注册时刻（如 15:00）各说各话）；settings 漂移时一并收敛
         if (/^([01]\d|2[0-3]):([0-5]\d)$/.test(shown)) {
-          setCheckinTaskTime(shown);
-          if (settings?.doubao_checkin_hhmm !== shown) {
-            void saveSettings({ doubao_checkin_hhmm: shown });
+          // 用户正在编辑注册时刻（脏标记或输入框聚焦中）时不打回；注册成功复位脏标记后恢复收敛
+          if (!checkinTimeDirtyRef.current && document.activeElement !== checkinTaskTimeInputRef.current) {
+            setCheckinTaskTime(shown);
+            if (settings?.doubao_checkin_hhmm !== shown) {
+              void saveSettings({ doubao_checkin_hhmm: shown });
+            }
           }
         }
       } else {
         setCheckinTaskState('not_registered');
       }
     } catch {
-      setCheckinTaskState('not_registered');
+      setCheckinTaskState('error'); // 同上：后端故障与未注册区分展示
     }
   };
 
@@ -210,6 +233,7 @@ export default function DoubaoSettings() {
       if (settings.doubao_sync_mode) setSyncMode(settings.doubao_sync_mode);
       if (settings.doubao_sync_hours) setSyncHours(settings.doubao_sync_hours);
       if (settings.doubao_sync_hhmm) setSyncHhmm(settings.doubao_sync_hhmm);
+      if (settings.doubao_checkin_hhmm) setCheckinHhmm(settings.doubao_checkin_hhmm);
     }
     void refreshTaskStatus();
     void refreshQuotaTaskStatus();
@@ -333,6 +357,7 @@ export default function DoubaoSettings() {
     }
     try {
       await api.doubao.checkinTaskRegister(checkinTaskTime);
+      checkinTimeDirtyRef.current = false; // 注册成功：复位脏标记，让随后的 refresh 恢复「按真实注册时刻回填收敛」
       await refreshCheckinTaskStatus();
       pushToast('success', `每日签到任务已注册（每日 ${checkinTaskTime}）`);
     } catch (err) {
@@ -530,6 +555,14 @@ export default function DoubaoSettings() {
                 </>
               )}
               {taskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+              {taskState === 'error' && (
+                <>
+                  <Badge tone="amber">状态未知</Badge>
+                  <button onClick={() => void refreshTaskStatus()} className="btn-ghost">
+                    重试
+                  </button>
+                </>
+              )}
             </div>
 
             {/* 应用内每日调度开关（issue #147）：关闭后不再每日拉起客户端；无账号/客户端缺失时自动跳过 */}
@@ -618,6 +651,14 @@ export default function DoubaoSettings() {
                 </>
               )}
               {quotaTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+              {quotaTaskState === 'error' && (
+                <>
+                  <Badge tone="amber">状态未知</Badge>
+                  <button onClick={() => void refreshQuotaTaskStatus()} className="btn-ghost">
+                    重试
+                  </button>
+                </>
+              )}
             </div>
 
             {/* 应用内每日巡检调度开关（issue #147） */}
@@ -655,8 +696,12 @@ export default function DoubaoSettings() {
             <div className="flex flex-wrap items-center gap-2">
               <span className="shrink-0 text-slate-500">每日任务</span>
               <input
+                ref={checkinTaskTimeInputRef}
                 value={checkinTaskTime}
-                onChange={(e) => setCheckinTaskTime(e.target.value)}
+                onChange={(e) => {
+                  setCheckinTaskTime(e.target.value);
+                  checkinTimeDirtyRef.current = true; // 编辑中：refresh 回填暂不打回
+                }}
                 placeholder="HH:MM"
                 className="input w-24 text-xs"
               />
@@ -672,6 +717,14 @@ export default function DoubaoSettings() {
                 </>
               )}
               {checkinTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+              {checkinTaskState === 'error' && (
+                <>
+                  <Badge tone="amber">状态未知</Badge>
+                  <button onClick={() => void refreshCheckinTaskStatus()} className="btn-ghost">
+                    重试
+                  </button>
+                </>
+              )}
             </div>
 
             {/* 应用内每日签到调度开关 */}
@@ -686,6 +739,14 @@ export default function DoubaoSettings() {
                 <span className="font-medium text-slate-600 dark:text-zinc-200">
                   应用内每日签到调度（每日 {settings?.doubao_checkin_hhmm || '09:15'}）
                 </span>
+                {/* 可编辑签到时刻（单源 doubao_checkin_hhmm）：纯应用内调度用户修改时刻的入口；交互对齐 syncHhmm（onChange 暂存、失焦校验保存） */}
+                <input
+                  value={checkinHhmm}
+                  onChange={(e) => setCheckinHhmm(e.target.value)}
+                  onBlur={(e) => void changeCheckinHhmm(e.target.value)}
+                  placeholder="HH:MM"
+                  className="input ml-2 w-20 text-xs"
+                />
                 <span className="mt-0.5 block leading-relaxed">
                   关闭后应用内调度器不再执行每日自动签到；与上方「每日任务」（Windows 计划任务）相互独立。
                   无豆包账号时自动跳过，不记失败、不推送通知。

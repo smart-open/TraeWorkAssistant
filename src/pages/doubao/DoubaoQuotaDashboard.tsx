@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, TrendingUp } from 'lucide-react';
 import {
   Bar,
@@ -48,6 +48,14 @@ function rangeStart(key: RangeKey): string | null {
   return null;
 }
 
+/** 今日日期键（本机时区 YYYY-MM-DD，与 DoubaoCheckin 的 todayKey 口径一致；
+ *  每次渲染现取而非 useMemo 固化，跨零点后「今日新增额度」自动翻新到当日） */
+function todayKey(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 /** 豆包 · 额度看板（自账号管理页迁移）：KPI 一行 + 额度趋势图（分组/账号/时间段筛选）。
  *  数据源 = doubao_dashboard_stats（池聚合）+ doubao_checkin_results_detail（按日逐账号明细，
  *  前端按筛选条件聚合出「每日新增额度」柱 + 「累计新增额度」曲线）。
@@ -68,13 +76,13 @@ export default function DoubaoQuotaDashboard() {
   const [groupSel, setGroupSel] = useState<string[]>([]);
   const [accountSel, setAccountSel] = useState<string[]>([]);
 
-  const today = useMemo(() => {
-    const d = new Date();
-    const p = (n: number) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-  }, []);
+  const today = todayKey();
 
+  // 刷新并发序号（对齐 store.ts logsReqSeq 模式）：手动刷新与挂载请求并发时旧响应直接丢弃；
+  // 卸载后组件销毁无需 cleanup（重新挂载是新实例、新 seqRef），seq 单调递增即可保证旧响应不落地
+  const seqRef = useRef(0);
   const refresh = async () => {
+    const seq = ++seqRef.current;
     setLoading(true);
     try {
       const [st, accs, gs, det] = await Promise.all([
@@ -84,6 +92,8 @@ export default function DoubaoQuotaDashboard() {
         // 明细一次拉满 365 天窗口，时间段切换纯前端过滤（后端已按 365 天裁剪）
         api.doubao.resultsDetail(365).catch(() => [] as DoubaoDayDetail[]),
       ]);
+      // 过期响应（已被更新请求取代或组件已卸载）：各 set 与 pushToast 前校验，避免旧数据回写/全局 toast
+      if (seq !== seqRef.current) return;
       setStats(st);
       setAccounts(accs);
       setGroups(gs);
@@ -91,9 +101,11 @@ export default function DoubaoQuotaDashboard() {
       // 刷新可见反馈：数据无变化时也明确「已刷新到几点几分」（修复点击无反馈的观感问题）
       setRefreshedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
     } catch (err) {
+      if (seq !== seqRef.current) return;
       pushToast('error', `读取额度看板失败：${String(err)}`);
     } finally {
-      setLoading(false);
+      // 仅最新请求可复位 loading（过期请求不得关闭新请求的加载态）
+      if (seq === seqRef.current) setLoading(false);
     }
   };
 
@@ -152,25 +164,33 @@ export default function DoubaoQuotaDashboard() {
 
   /** 按筛选条件聚合出趋势序列：每日新增额度（柱）+ 总额度（线）。
    *  总额度为倒推值：当日总额度 = 当前总额度 − 之后各日新增合计（额度只增口径，
-   *  尾点精确对齐账号池当前真实总额度；随 uid 筛选联动取对应账号集的总额度）。 */
+   *  尾点精确对齐账号池当前真实总额度；随 uid 筛选联动取对应账号集的总额度）。
+   *  倒推扣减仅统计「已知总额度账号」的 reward（明细含 uid 可按账号归属）：
+   *  基线 currentTotal 只累计 quota_total 已知账号，未知额度账号的新增若也参与扣减，
+   *  会把历史点系统性压低——柱保持全量口径，仅线的扣减与基线同口径。 */
   const series = useMemo(() => {
     const start = rangeStart(range);
     const days = detail.filter((d) => (start ? d.date >= start : true));
+    // 已知总额度的账号集（quota_total != null），倒推扣减的口径集合
+    const knownUids = new Set(accounts.filter((a) => a.quota_total != null).map((a) => a.user_id));
     const rewards = days.map((d) => {
-      let reward = 0;
+      let reward = 0; // 柱：筛选内全部账号新增（口径不变）
+      let knownReward = 0; // 线：仅已知额度账号新增（参与倒推扣减，与基线口径一致）
       for (const r of d.accounts) {
         if (uidSel && !uidSel.has(r.user_id)) continue;
-        reward += r.reward ?? 0;
+        const rw = r.reward ?? 0;
+        reward += rw;
+        if (knownUids.has(r.user_id)) knownReward += rw;
       }
-      return { date: d.date, reward };
+      return { date: d.date, reward, knownReward };
     });
     const currentTotal = (uidSel ? accounts.filter((a) => uidSel.has(a.user_id)) : accounts).reduce(
       (s, a) => s + (a.quota_total ?? 0),
       0,
     );
-    // suffix[i] = 第 i 日及之后的新增合计（多留一位便于取「之后各日」）
+    // suffix[i] = 第 i 日及之后「已知额度账号」的新增合计（多留一位便于取「之后各日」）
     const suffix = new Array(rewards.length + 1).fill(0);
-    for (let i = rewards.length - 1; i >= 0; i--) suffix[i] = suffix[i + 1] + rewards[i].reward;
+    for (let i = rewards.length - 1; i >= 0; i--) suffix[i] = suffix[i + 1] + rewards[i].knownReward;
     return rewards.map((d, i) => ({
       date: d.date.slice(5),
       reward: d.reward,
@@ -217,6 +237,13 @@ export default function DoubaoQuotaDashboard() {
             }
             tone="green"
           />
+        </div>
+      )}
+
+      {/* 最长连续签到徽标（后端 stats.max_continuous_days 此前零消费，此处补展示；stats 为空或无数据时隐藏） */}
+      {stats && stats.max_continuous_days != null && (
+        <div className="mt-2 text-xs text-slate-400">
+          <Badge tone="amber">最长连续签到 {stats.max_continuous_days} 天</Badge>
         </div>
       )}
 

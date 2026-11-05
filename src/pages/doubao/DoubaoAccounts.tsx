@@ -79,10 +79,11 @@ export default function DoubaoAccounts() {
   // done 事件异常缺失时解除按钮互斥并清空 store 进行中状态
   const [lockTimedOut, setLockTimedOut] = useState(false);
   const [keepaliveProgress, setKeepaliveProgress] = useState<string[]>([]);
-  const [quotaRunningFor, setQuotaRunningFor] = useState<string | null>(null);
+  // 额度查询：行级忙碌标记（按账号 uid 键控，函数式更新避免连续操作不同账号时互相覆盖忙碌态）
+  const [quotaRunningFor, setQuotaRunningFor] = useState<Record<string, boolean>>({});
   const [quotaResult, setQuotaResult] = useState<{ userId: string; result: DoubaoQuotaResult } | null>(null);
-  // 每日签到：行级签到忙碌标记
-  const [checkinRunningFor, setCheckinRunningFor] = useState<string | null>(null);
+  // 每日签到：行级签到忙碌标记（按账号 uid 键控，同上防互踩）
+  const [checkinRunningFor, setCheckinRunningFor] = useState<Record<string, boolean>>({});
   // 分组/标签（共享分组体系 shg_*，标签 uid 跨池通用；对齐 Trae/BuddyAI 列表设计）
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [tagDefs, setTagDefs] = useState<TagView[]>([]);
@@ -111,6 +112,10 @@ export default function DoubaoAccounts() {
   // 编辑弹框凭证回填：loading 态 + 请求序号守卫（快速切换账号时仅最后一次请求回填）
   const [credLoading, setCredLoading] = useState(false);
   const credReqRef = useRef(0);
+  // 凭证读取失败标记：失败时禁止提交，防止把回填失败的空凭证当"清空"上送（后端对空凭证为无条件清空语义）
+  const [credLoadFailed, setCredLoadFailed] = useState(false);
+  // 列表刷新请求序号守卫：并发触发（挂载/事件/20s 轮询/操作完成）时仅最新一次 reload 落盘，防旧响应覆盖新列表
+  const reloadSeqRef = useRef(0);
 
   /** 到期提醒：
    *  ① 池级保活：距 last_keepalive_at 超过 25 天（sid_guard 30 天滑动窗口临近耗尽）；
@@ -142,17 +147,21 @@ export default function DoubaoAccounts() {
   };
 
   const reload = async (notifyExpiry = false) => {
+    // 请求序号守卫（仿 openEditDialog 的 credReqRef 模式）：旧响应到达时直接丢弃，不覆盖新一轮列表
+    const seq = ++reloadSeqRef.current;
     setLoading(true);
     try {
       // 共享分组 + 标签（增强面：失败不阻塞账号列表，保留旧值）
       void Promise.all([api.groups.sharedList(), api.tags.list(), api.tags.map()])
         .then(([gs, tds, tm]) => {
+          if (seq !== reloadSeqRef.current) return;
           setGroups(gs);
           setTagDefs(tds);
           setTagMap(tm);
         })
         .catch(() => undefined);
       const list = await api.doubao.accountsList();
+      if (seq !== reloadSeqRef.current) return;
       setAccounts(list);
       if (notifyExpiry) checkExpiry(list);
       // C3：加载快照版本元数据（有快照的账号并行读取本地 JSON，供快照列悬停展示）
@@ -167,6 +176,7 @@ export default function DoubaoAccounts() {
             }
           }),
         );
+        if (seq !== reloadSeqRef.current) return;
         setSnapshotMetas(Object.fromEntries(entries));
       } else {
         setSnapshotMetas({});
@@ -181,11 +191,14 @@ export default function DoubaoAccounts() {
           }
         }),
       );
+      if (seq !== reloadSeqRef.current) return;
       setChatdataInfos(Object.fromEntries(chatEntries));
     } catch (err) {
+      if (seq !== reloadSeqRef.current) return;
       pushToast('error', `读取豆包账号失败：${String(err)}`);
     } finally {
-      setLoading(false);
+      // 过期请求不回落 loading：loading 归属最新一次 reload
+      if (seq === reloadSeqRef.current) setLoading(false);
     }
   };
 
@@ -259,10 +272,15 @@ export default function DoubaoAccounts() {
     const pending = accounts.filter((a) => a.session_state !== 'none' && !a.quota_checked_at);
     quotaAutoFetched.current = true;
     if (pending.length === 0) return;
+    // 卸载守卫（仿上方 20s 轮询 effect 的 stopped 模式）：组件卸载/依赖变化后停止循环，
+    // 不再继续请求、不再 toast、不再触发 reload
+    let stopped = false;
     (async () => {
       for (const a of pending) {
+        if (stopped) return;
         try {
           const r = await api.doubao.fetchQuota(a.user_id);
+          if (stopped) return;
           const exhaustedWin = (r.parsed?.items ?? []).find(
             (it) => 'used_percent' in it && (it.exhausted || it.used_percent >= 100),
           );
@@ -273,12 +291,17 @@ export default function DoubaoAccounts() {
             );
           }
         } catch (err) {
+          if (stopped) return;
           // 查询失败不再静默：提示原因（常见：凭证过期 710012001 / 接口未配置），下次进入页面会重试
           pushToast('warn', `账号 ${a.name} 额度自动查询失败：${String(err)}`);
         }
       }
+      if (stopped) return;
       void reload();
     })();
+    return () => {
+      stopped = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts, loading]);
 
@@ -347,6 +370,8 @@ export default function DoubaoAccounts() {
     setEditSidGuard('');
     setEditTtwid('');
     setDialog({ mode: 'edit', userId: a.user_id, name: a.name, note: a.note });
+    // 打开时重置读取失败标记（重新打开弹框会重新拉取凭证，恢复可保存）
+    setCredLoadFailed(false);
     const seq = ++credReqRef.current;
     setCredLoading(true);
     api.doubao
@@ -356,9 +381,11 @@ export default function DoubaoAccounts() {
         setEditSessionId(c.session_id ?? '');
         setEditSidGuard(c.sid_guard ?? '');
         setEditTtwid(c.ttwid ?? '');
+        setCredLoadFailed(false);
       })
       .catch((err) => {
         if (credReqRef.current !== seq) return;
+        setCredLoadFailed(true);
         pushToast('error', `读取会话凭证失败：${String(err)}`);
       })
       .finally(() => {
@@ -392,6 +419,8 @@ export default function DoubaoAccounts() {
 
   const submitEdit = async () => {
     if (!dialog || dialog.mode !== 'edit') return;
+    // 凭证回填进行中禁止提交：输入框尚未回填完整值，此时提交会把空串当"清空"上送
+    if (credLoading) return;
     try {
       // 分组：editGroupId 为 null（未分组）时传 '' 清空，非空串传 id；均与弹框选择一致
       await api.doubao.accountSave(
@@ -400,13 +429,16 @@ export default function DoubaoAccounts() {
         editNote.trim(),
         editGroupId ?? '',
       );
-      // 凭证字段已回填现有值：修改即覆盖，清空后保存即删除凭证（ttwid 仅非空时更新，清空不影响）
-      await api.doubao.accountSetCredential(
-        dialog.userId,
-        editSessionId.trim() || undefined,
-        editSidGuard.trim() || undefined,
-        editTtwid.trim() || undefined,
-      );
+      // 凭证读取失败时跳过凭证保存（防误清空），别名/备注/分组仍按上方 accountSave 路径照常保存
+      if (!credLoadFailed) {
+        // 凭证字段已回填现有值：修改即覆盖，清空后保存即删除凭证（ttwid 仅非空时更新，清空不影响）
+        await api.doubao.accountSetCredential(
+          dialog.userId,
+          editSessionId.trim() || undefined,
+          editSidGuard.trim() || undefined,
+          editTtwid.trim() || undefined,
+        );
+      }
       pushToast('success', '账号信息已更新');
       setDialog(null);
       void reload();
@@ -513,7 +545,8 @@ export default function DoubaoAccounts() {
       );
       return;
     }
-    setQuotaRunningFor(a.user_id);
+    // 函数式更新按 uid 置位：连续操作不同账号时忙碌态互不覆盖
+    setQuotaRunningFor((m) => ({ ...m, [a.user_id]: true }));
     setQuotaResult(null);
     try {
       const r = await api.doubao.fetchQuota(a.user_id);
@@ -522,7 +555,12 @@ export default function DoubaoAccounts() {
     } catch (err) {
       pushToast('error', `额度查询失败：${String(err)}`);
     } finally {
-      setQuotaRunningFor(null);
+      // 仅清除本账号标记（函数式更新，不抹掉其它账号的忙碌态）
+      setQuotaRunningFor((m) => {
+        const next = { ...m };
+        delete next[a.user_id];
+        return next;
+      });
     }
   };
 
@@ -532,7 +570,8 @@ export default function DoubaoAccounts() {
       pushToast('warn', `账号 ${a.name} 尚无会话凭证，无法签到：开启代理自动写入或编辑弹框手动录入`);
       return;
     }
-    setCheckinRunningFor(a.user_id);
+    // 函数式更新按 uid 置位：连续操作不同账号时忙碌态互不覆盖
+    setCheckinRunningFor((m) => ({ ...m, [a.user_id]: true }));
     try {
       // 返回契约：single → { ok, outcome: { status, message, ... }, finished_at }
       const r = (await api.doubao.checkinRun(a.user_id)) as {
@@ -547,7 +586,12 @@ export default function DoubaoAccounts() {
     } catch (err) {
       pushToast('error', `签到失败：${String(err)}`);
     } finally {
-      setCheckinRunningFor(null);
+      // 仅清除本账号标记（函数式更新，不抹掉其它账号的忙碌态）
+      setCheckinRunningFor((m) => {
+        const next = { ...m };
+        delete next[a.user_id];
+        return next;
+      });
       await reload();
     }
   };
@@ -841,7 +885,7 @@ export default function DoubaoAccounts() {
                         <span className="font-medium">{a.name}</span>
                         {a.is_current && <Badge tone="green">当前</Badge>}
                         {quotaBadge(a)}
-                        {quotaRunningFor === a.user_id && <Badge tone="violet">查询中…</Badge>}
+                        {quotaRunningFor[a.user_id] && <Badge tone="violet">查询中…</Badge>}
                       </div>
                       <div className="font-mono text-xs text-slate-400">{a.user_id}</div>
                     </td>
@@ -917,10 +961,10 @@ export default function DoubaoAccounts() {
                         <button
                           title="查询/刷新会员额度（结果缓存后悬停账号名可查看额度状态 / 会员 / 到期时间）"
                           onClick={() => void doFetchQuota(a)}
-                          disabled={anyBusy || quotaRunningFor === a.user_id}
+                          disabled={anyBusy || !!quotaRunningFor[a.user_id]}
                           className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-amber-500/10"
                         >
-                          {quotaRunningFor === a.user_id ? (
+                          {quotaRunningFor[a.user_id] ? (
                             <Loader2 size={14} className="animate-spin" />
                           ) : (
                             <Coins size={14} />
@@ -929,10 +973,10 @@ export default function DoubaoAccounts() {
                         <button
                           title="每日签到（landing/checkin；当天已签幂等跳过，成功后回写总额度）"
                           onClick={() => void doCheckin(a)}
-                          disabled={anyBusy || checkinRunningFor === a.user_id}
+                          disabled={anyBusy || !!checkinRunningFor[a.user_id]}
                           className="btn-ghost !p-2 text-rose-400 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-rose-500/10"
                         >
-                          {checkinRunningFor === a.user_id ? (
+                          {checkinRunningFor[a.user_id] ? (
                             <Loader2 size={14} className="animate-spin" />
                           ) : (
                             <CalendarCheck size={14} />
@@ -1219,12 +1263,21 @@ export default function DoubaoAccounts() {
               <p className="mt-1 text-xs text-slate-400">
                 凭证等同密码，仅存本地。清空 sessionid 与 sid_guard 后保存即删除该账号凭证（ttwid 仅在非空时更新）。
               </p>
+              {credLoadFailed && (
+                <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700 dark:border-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+                  ⚠ 凭证读取失败，为防误清空本次不保存凭证
+                </div>
+              )}
             </div>
             <div className="flex justify-end gap-2">
               <button onClick={() => setDialog(null)} className="btn-outline">
                 取消
               </button>
-              <button onClick={() => void submitEdit()} className="btn-primary">
+              <button
+                onClick={() => void submitEdit()}
+                className="btn-primary"
+                disabled={credLoading || credLoadFailed}
+              >
                 保存
               </button>
             </div>

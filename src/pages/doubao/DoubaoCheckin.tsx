@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { PlayCircle, Users, CheckCircle2, CircleSlash, XCircle, Loader2, CalendarDays } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Progress } from '../../components/ui';
@@ -22,7 +22,7 @@ type Scope = 'all' | 'group' | 'selected';
 interface ResultLine {
   userId: string;
   name: string;
-  status: 'success' | 'already' | 'fail' | 'skip';
+  status: 'success' | 'already' | 'fail';
   message?: string;
   reward?: number;
 }
@@ -45,6 +45,13 @@ export default function DoubaoCheckin() {
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<ResultLine[]>([]);
   const [summary, setSummary] = useState<{ ok: number; failed: number; reward: number } | null>(null);
+
+  // 组件存活标记：切页卸载后终止批量签到循环（单账号 invoke 超时 600s，不守卫会后台继续发真实签到请求；
+  // 重进页面是新实例、running 归零，不守卫还会造成并发双跑）
+  const aliveRef = useRef(true);
+  useEffect(() => () => {
+    aliveRef.current = false;
+  }, []);
 
   const today = todayKey();
 
@@ -106,6 +113,8 @@ export default function DoubaoCheckin() {
     for (let i = 0; i < candidates.length; i++) {
       const a = candidates[i];
       if (i > 0) await new Promise((r) => setTimeout(r, GAP_MS));
+      // 卸载守卫：每轮 invoke 前校验，切页后立即停止，不再发起后续账号的真实签到请求
+      if (!aliveRef.current) return;
       try {
         const r = (await api.doubao.checkinRun(a.user_id)) as {
           outcome?: { status?: string; message?: string; reward?: number };
@@ -130,6 +139,8 @@ export default function DoubaoCheckin() {
         setLines((prev) => [...prev, { userId: a.user_id, name: a.name, status: 'fail', message: String(err) }]);
       }
     }
+    // 卸载后跳过全部收尾（组件已销毁，running 无需复位；pushToast/reload 均为多余副作用）
+    if (!aliveRef.current) return;
     setSummary({ ok, failed, reward });
     setRunning(false);
     pushToast(
@@ -142,7 +153,6 @@ export default function DoubaoCheckin() {
   const lineIcon = (st: ResultLine['status']) => {
     if (st === 'success') return <CheckCircle2 size={14} className="text-emerald-500" />;
     if (st === 'already') return <CircleSlash size={14} className="text-sky-500" />;
-    if (st === 'skip') return <CircleSlash size={14} className="text-slate-400" />;
     return <XCircle size={14} className="text-rose-500" />;
   };
 
