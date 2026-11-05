@@ -45,7 +45,7 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
 }
 
 /** 池内调度策略取值（Trae / Buddy 同一套，pool.rs PoolStrategy） */
-const STRATEGIES = ['expire_first', 'credit_first', 'random', 'weighted', 'p2c'] as const;
+const STRATEGIES = ['expire_first', 'credit_first', 'random', 'weighted', 'p2c', 'fair_rotation'] as const;
 
 /** 池内调度策略文案（与账号池选择下拉一致） */
 const STRATEGY_LABELS: Record<string, string> = {
@@ -54,6 +54,7 @@ const STRATEGY_LABELS: Record<string, string> = {
   random: '随机',
   weighted: '三因子加权随机',
   p2c: 'P2C 随机二选一',
+  fair_rotation: '加权公平轮转',
 };
 
 const POOL_LABELS: Record<string, string> = {
@@ -563,7 +564,7 @@ function DispatchCenterCard({
                 disabled={!pool || saving}
                 onChange={(e) => void save({ buddy: e.target.value })}
               >
-                <option value="">跟随 Trae 池</option>
+                <option value="">加权公平轮转（默认）</option>
                 {STRATEGIES.map((s) => (
                   <option key={s} value={s}>
                     {STRATEGY_LABELS[s]}
@@ -581,7 +582,7 @@ function DispatchCenterCard({
                 disabled={!pool || saving}
                 onChange={(e) => void save({ qoder: e.target.value })}
               >
-                <option value="">跟随 Trae 池</option>
+                <option value="">加权公平轮转（默认）</option>
                 {STRATEGIES.map((s) => (
                   <option key={s} value={s}>
                     {STRATEGY_LABELS[s]}
@@ -599,7 +600,7 @@ function DispatchCenterCard({
                 disabled={!pool || saving}
                 onChange={(e) => void save({ buddyAi: e.target.value })}
               >
-                <option value="">跟随 Trae 池</option>
+                <option value="">加权公平轮转（默认）</option>
                 {STRATEGIES.map((s) => (
                   <option key={s} value={s}>
                     {STRATEGY_LABELS[s]}

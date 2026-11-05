@@ -506,6 +506,18 @@ pub(super) fn oauth_flow(
         ),
     );
 
+    // 修复（2026-11）：扫码入池成功后**必须**热重载运行中的网关池。
+    // 改前此处直接返回：账号与凭证已落库，但网关内存快照不变 →
+    // 新账号零请求、积分不消耗，必须手动「保存池设置」才生效
+    //（导入路径 workbuddy::accounts 早有此调用，扫码路径漏了）。
+    // 锁序：池锁 sink.lock 已在上面块作用域释放，凭证 upsert 亦已结束，
+    // 此处取 runtime 锁不存在嵌套；CN 与 buddy-ai 两个 sink 共用本路径。
+    if let Some(rt) =
+        app.try_state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>()
+    {
+        crate::commands::api_server::reload_pools_if_running(state, rt.inner());
+    }
+
     let label = if nickname.is_empty() { target_id.clone() } else { nickname.clone() };
     emit("success", &format!("账号「{label}」已扫码登录并自动入池"), None);
     Ok((target_id, label))
