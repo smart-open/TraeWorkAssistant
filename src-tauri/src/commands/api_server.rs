@@ -623,6 +623,10 @@ async fn do_start_inner(
     };
     crate::notify::notify(app, "API 网关已启动", &notify_body);
 
+    // 运行时一致性巡检（2026-11 修复）：60s 比对 DB 账号指纹与运行池快照指纹，
+    // 漂移才重载——兜住「事件漏触发」的路径（OAuth/导入/删除/禁用之外的写入）
+    spawn_pool_reconciler(app.clone());
+
     Ok(status)
 }
 
@@ -1015,6 +1019,111 @@ pub fn reload_pools_if_running(
         ),
     );
 }
+
+/// WorkBuddy 池「应由哪些账号组成」的指纹（纯计算，无副作用、不落日志含凭证）。
+///
+/// 与 pool.rs `config_fingerprint()` 必须同口径：每条
+/// `uid | disabled | refresh_invalid | credits_expire_at` 排序后 SHA256 前 8 字节。
+/// 刻意不含积分余额——余额随请求高频变动，纳入会让巡检每 60s 误判重载，
+/// 反而把刚回写的运行期余额覆盖回旧库值。
+fn wb_pool_fingerprint(state: &AppState) -> u64 {
+    use sha2::{Digest, Sha256};
+    let pool_file = load_pool_file(&state.data_dir);
+    let db = crate::store::db(&state.data_dir);
+    let tag_map = crate::store::docs::account_tags_map(&db);
+    let accounts_all = crate::commands::workbuddy::wb_upstream_accounts(state);
+    let group_filter: Option<std::collections::HashSet<&str>> = if pool_file.wb_group_ids.is_empty() {
+        None
+    } else {
+        Some(pool_file.wb_group_ids.iter().map(|s| s.as_str()).collect())
+    };
+    let tag_filter = crate::api_server::org_index::tag_uid_set(&pool_file.wb_tag_ids, &tag_map);
+    let accounts: Vec<_> = accounts_all
+        .into_iter()
+        .filter(|a| group_filter.as_ref().map_or(true, |f| f.contains(a.group_id.as_str())))
+        .filter(|a| tag_filter.as_ref().map_or(true, |t| t.contains(&a.uid)))
+        .collect();
+    let uids = effective_wb_uids(&pool_file, &accounts);
+    let enabled: std::collections::HashSet<&str> = uids.iter().map(|s| s.as_str()).collect();
+    let mut parts: Vec<String> = accounts
+        .iter()
+        .filter(|a| enabled.contains(a.uid.as_str()) && !a.token.is_empty())
+        .map(|a| {
+            format!(
+                "{}|{}|0|{}",
+                a.uid,
+                a.needs_relogin as u8,
+                a.credits_expire_at.unwrap_or(0)
+            )
+        })
+        .collect();
+    parts.sort();
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update(b"\n");
+    }
+    let d = h.finalize();
+    u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
+}
+
+/// 巡检线程去重闸门：重复 start/stop 不叠加线程
+static RECONCILER_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 巡检间隔（秒）
+const RECONCILE_INTERVAL_SECS: u64 = 60;
+
+/// 运行时一致性巡检（修复 3，2026-11）：每 60s 比较「数据库应有的 WB 账号集合」
+/// 与「运行池快照」的指纹，不一致才重载：
+/// - 无变化 → 不重载（不产生日志噪音、不重置运行态）；
+/// - 有漂移 → 走与事件热重载完全相同的 apply_pool_snapshot 路径（原子替换，
+///   在途请求持旧快照跑完，不中断）；
+/// - 服务停止（runtime 为 None）→ 线程自然退出，重启后由 do_start 重新拉起。
+///
+/// 这是「事件驱动热重载」的兜底：任何未经 reload 调用就落库的写入（手工改库、
+/// 旧版本残留路径、第三方工具导入）都会被下一次巡检纠正。
+fn spawn_pool_reconciler(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    if RECONCILER_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("pool-reconciler".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS));
+                let (Some(state), Some(runtime)) = (
+                    app.try_state::<AppState>(),
+                    app.try_state::<Mutex<Option<ApiServerRuntime>>>(),
+                ) else {
+                    break;
+                };
+                // 服务已停止 → 结束线程（下次 do_start 重新拉起）
+                let rt_fp = {
+                    let guard = safe_lock(&runtime);
+                    match guard.as_ref() {
+                        Some(rt) => Some(rt.shared.wb_pool.config_fingerprint()),
+                        None => None,
+                    }
+                };
+                let Some(rt_fp) = rt_fp else { break };
+                let db_fp = wb_pool_fingerprint(state.inner());
+                if db_fp != rt_fp {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!(
+                            "池一致性巡检: 发现漂移 db_fp={db_fp:016x} rt_fp={rt_fp:016x} → 触发热重载（凭据/积分不落日志）"
+                        ),
+                    );
+                    reload_pools_if_running(state.inner(), runtime.inner());
+                }
+            }
+            RECONCILER_RUNNING.store(false, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        RECONCILER_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
 
 /// 网关运行中回写 Trae 池积分快照（issue #67）：refresh_remaining_credits 刷新后
 /// 调用，让 expire_first 等策略基于最新积分选号。此前刷新只写库不回写池，秃号

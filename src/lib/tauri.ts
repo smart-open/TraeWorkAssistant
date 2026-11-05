@@ -829,7 +829,7 @@ export const api = {
     status: () => invoke<ApiServiceStatus>('api_server_status'),
     poolList: () => invoke<ApiPoolFile>('pool_list'),
     // T10：池设置扩展调度策略与分组筛选；T5.2/T5.3/T5.5/T5.6③ 扩展 WB 开关组；
-    // 任务7：wbStrategy 为 Buddy 池独立策略（空串 = 跟随 Trae 池策略）
+    // 任务7：wbStrategy 为 Buddy 池独立策略（空串 = 加权公平轮转，2026-11 起）
     poolSet: (
       uids: string[],
       strategy?: string,

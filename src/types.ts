@@ -799,6 +799,7 @@ export interface ApiPoolFile {
   /** 调度策略：expire_first（默认）/ credit_first / random（T10） */
   strategy?: string;
   /** Buddy 池调度策略（取值同 strategy）；空 = 跟随 Trae 池（两池同策略） */
+  /** Buddy(WorkBuddy) 池策略；空 = 加权公平轮转（fair_rotation，WB 专属默认） */
   wb_strategy?: string;
   /** 参与调度的分组 id 列表；空 = 不限分组（T10） */
   group_ids?: string[];
