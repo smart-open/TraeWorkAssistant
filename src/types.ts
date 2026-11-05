@@ -584,6 +584,8 @@ export interface PoolStatus {
   cooldown_reason: string | null;
   /** 积分耗尽硬冷却中（次日 04:00 自动恢复探测；cooling 仅覆盖软冷却，旧后端未返回时为 undefined） */
   hard_credit?: boolean;
+  /** 硬冷却截止时刻（Unix 秒，issue #178；hard_credit=true 时有值，显示恢复倒计时；旧后端未返回时为 undefined） */
+  hard_until?: number | null;
   disabled: boolean;
   err_count: number;
   /** 账号实时在途并发数（F-77⑤ 可观测；旧后端未返回时为 undefined） */
@@ -1225,6 +1227,8 @@ export interface WbCheckinRecord {
   message: string;
   /** 签到获得积分（接口返回或前后余额差值兜底） */
   reward?: number;
+  /** issue #180：积分次日到账（credit_delayed）待入账标记；T+1 回填后置 false */
+  reward_pending?: boolean;
 }
 
 /** WB 上游模型目录条目（Rust wb_catalog::WbModel，snake_case 对齐） */

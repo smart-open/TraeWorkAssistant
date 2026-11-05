@@ -25,6 +25,8 @@ import { GroupSelect } from '../accounts/GroupSelect';
 import { GroupsModal, computePoolBadges } from '../accounts/GroupsModal';
 import { TagChips } from '../accounts/TagSelect';
 import { AccountTagsEditModal, TagsModal } from '../accounts/TagsModal';
+import { PoolStatusBadge } from '../accounts/PoolStatusBadge';
+import { usePoolStatus } from '../../hooks/usePoolStatus';
 import { listen, api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
@@ -66,6 +68,8 @@ function tokenTone(ts: number | null): string {
 
 export default function BuddyAccounts() {
   const pushToast = useAppStore((s) => s.pushToast);
+  // 运行期限流/冷却徽标（issue #178）：429 软冷却/积分耗尽硬冷却只在网关内存池，联表注入
+  const poolStatus = usePoolStatus('wb');
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [helpOpen, setHelpOpen] = useState(false);
   const [credits, setCredits] = useState<Map<string, WbCreditPackage[]>>(new Map());
@@ -586,6 +590,10 @@ export default function BuddyAccounts() {
                             <ShieldAlert size={12} />
                           </span>
                         )}
+                        {/* 运行期限流/冷却（issue #178）：网关内存池状态，无则不渲染。
+                            池条目以内部账号 id（wb-<hash>）为键——wb_upstream_accounts
+                            的 uid=a.id，而非真实用户 uuid（View.uid），勿用 a.uid 联表 */}
+                        <PoolStatusBadge status={poolStatus.get(a.id)} />
                       </div>
                       <div className="font-mono text-xs text-slate-400">{maskUid(a.uid)}</div>
                     </td>

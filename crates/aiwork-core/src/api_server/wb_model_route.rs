@@ -244,13 +244,18 @@ pub fn strip_max_suffix(name: &str) -> Option<String> {
 /// 目录内倍率最低的模型（后台任务降级目标，T5.6③/F-65）；
 /// 全目录倍率相同/为空时取首个。
 /// issue #26：生产路由一律走白名单感知的 `cheapest_catalog_model_filtered`
+/// issue #184 修复：rate = NaN 哨兵（动态目录元数据缺失）不参与比价——
+/// NaN 与任何值 partial_cmp 均 None，min_by 视为相等，遍历序靠前的 NaN 条目
+/// 会钉住"最小值"挡住其后真实更低倍率（如 glm-5.3-flash 0.06 挡住
+/// deepseek-v4-flash 0.03），导致降级目标随机化。NaN 条目剔除后全空返回
+/// None，调用方跳过降级保持原模型（比猜测更保守正确）。
 pub fn cheapest_catalog_model_filtered(
     catalog: &[super::wb_catalog::WbModel],
     allowed: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
     catalog
         .iter()
-        .filter(|m| allowed(&m.id))
+        .filter(|m| allowed(&m.id) && !m.rate.is_nan())
         .min_by(|a, b| a.rate.partial_cmp(&b.rate).unwrap_or(std::cmp::Ordering::Equal))
         .map(|m| m.id.clone())
 }
@@ -319,13 +324,14 @@ pub fn estimate_input_tokens(body: &serde_json::Value) -> u64 {
 // ==================== issue #26 白名单感知降级 ====================
 
 /// 白名单感知的 flash 档降档：flash 子集先过 `allowed`，空则回退白名单内全局最低倍率
+/// （issue #184 修复：NaN 哨兵同 `cheapest_catalog_model_filtered` 剔除，不参与比价）
 pub fn flash_catalog_model_filtered(
     catalog: &[super::wb_catalog::WbModel],
     allowed: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
     let flash: Vec<&super::wb_catalog::WbModel> = catalog
         .iter()
-        .filter(|m| m.id.to_lowercase().contains("flash") && allowed(&m.id))
+        .filter(|m| m.id.to_lowercase().contains("flash") && allowed(&m.id) && !m.rate.is_nan())
         .collect();
     if flash.is_empty() {
         cheapest_catalog_model_filtered(catalog, allowed)
@@ -604,5 +610,51 @@ mod tests {
             Some("glm-5.3")
         );
         // 谓词 canonical 匹配（大小写不敏感场景由 whitelist_allows 承担，此处直传）
+    }
+
+    // ==================== issue #184 NaN 哨兵不参与降级比价 ====================
+
+    /// issue #184：动态目录 rate=null → f64::NAN 哨兵（wb_catalog::deserialize_rate）。
+    /// NaN 与任何值 partial_cmp 均 None → min_by 视为相等 → 遍历序先到者钉住最小值，
+    /// 挡住其后真实更低倍率条目（复现：glm-5.3-flash 0.06 在前、deepseek-v4-flash
+    /// 0.03 在后但 rate 缺失为 NaN → 修复前错误选中 glm-5.3-flash）。
+    /// 修复后 NaN 条目剔除不参与比价；候选全 NaN → None（调用方跳过降级）。
+    #[test]
+    fn nan_rate_sentinel_excluded_from_downgrade_candidates() {
+        fn m(id: &str, rate: f64) -> super::super::wb_catalog::WbModel {
+            serde_json::from_value(json!({"id": id, "rate": rate})).unwrap()
+        }
+        // NaN 条目（遍历序在前）不得挡住其后更低倍率条目
+        let cat = vec![
+            m("glm-5.3-flash", 0.06),
+            m("deepseek-v4-flash", f64::NAN), // 序列化回路等价于 rate=null
+        ];
+        assert_eq!(
+            cheapest_catalog_model_filtered(&cat, &|_| true).as_deref(),
+            Some("glm-5.3-flash"),
+            "NaN 条目剔除后取剩余最低，而非遍历序钉住的 NaN 条目"
+        );
+        assert_eq!(
+            flash_catalog_model_filtered(&cat, &|_| true).as_deref(),
+            Some("glm-5.3-flash"),
+            "flash 降档同规则：NaN 不参与比价"
+        );
+        // 更低倍率条目自身带 NaN → 仍取其余正常条目中的最低
+        let cat2 = vec![m("a", 1.0), m("b", f64::NAN), m("c", 0.5)];
+        assert_eq!(cheapest_catalog_model_filtered(&cat2, &|_| true).as_deref(), Some("c"));
+        // 候选全为 NaN → None（调用方 unwrap_or 保持原模型 = 跳过降级）
+        let cat_all_nan = vec![m("x", f64::NAN), m("y", f64::NAN)];
+        assert_eq!(cheapest_catalog_model_filtered(&cat_all_nan, &|_| true), None);
+        // null 反序列化等价 NaN 哨兵（deserialize_rate 通路回归）
+        let with_null: Vec<super::super::wb_catalog::WbModel> =
+            serde_json::from_value(json!([
+                {"id": "glm-5.3-flash", "rate": 0.06},
+                {"id": "deepseek-v4-flash", "rate": null},
+            ]))
+            .unwrap();
+        assert_eq!(
+            cheapest_catalog_model_filtered(&with_null, &|_| true).as_deref(),
+            Some("glm-5.3-flash")
+        );
     }
 }

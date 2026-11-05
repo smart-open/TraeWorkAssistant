@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Coins } from 'lucide-react';
 import { Badge, EmptyState } from '../../components/ui';
 import ExpiryCalendar, { type ExpiryItem } from '../../components/ExpiryCalendar';
+import { PoolStatusBadge } from '../accounts/PoolStatusBadge';
+import { usePoolStatus } from '../../hooks/usePoolStatus';
 import { fmtCredits, dateStrToEndTs } from '../../lib/format';
 import { api } from '../../lib/tauri';
 import type { AccountView, CreditPackDetail, QoderCreditsResult, TraeExpiredEntsResult, WbCreditsResult } from '../../types';
@@ -33,6 +35,8 @@ interface AccountRow {
   status: string;
   /** Buddy 取数来源标记（cloud/legacy/local_quota/none/fetch_failed；Trae 行无此字段） */
   source?: string;
+  /** issue #178：运行期限流/冷却徽标联表键——各池取数响应里的账号标识 */
+  uid?: string;
 }
 
 export default function ExpiryTab({
@@ -91,6 +95,11 @@ export default function ExpiryTab({
     };
   }, [scope, traeUserIds]);
 
+  // 运行期限流/冷却徽标（issue #178）：三池内存池状态，3s 轮询联表注入
+  const traePool = usePoolStatus('trae');
+  const buddyPool = usePoolStatus('wb');
+  const qoderPool = usePoolStatus('qoder');
+
   const rows = useMemo<AccountRow[]>(() => {
     const nowSec = Date.now() / 1000;
     const out: AccountRow[] = [];
@@ -127,6 +136,7 @@ export default function ExpiryTab({
               : cooling
                 ? '冷却中'
                 : '正常',
+          uid: a.user_id,
         });
       }
     }
@@ -145,8 +155,11 @@ export default function ExpiryTab({
           packages: activePkgs.length,
           nearestExpire: expires.length > 0 ? Math.min(...expires) : null,
           ok: a.ok,
-          status: a.ok ? '正常' : a.message || '查询失败',
+          // issue #179：ok=true 但包明细空时后端携带诚实标注 message（如 local_quota
+          // 降级/上游形状变化），状态列不再恒显「正常」掩盖降级
+          status: a.ok ? a.message || '正常' : a.message || '查询失败',
           source: a.source,
+          uid: a.user_id,
         });
       }
     }
@@ -187,6 +200,7 @@ export default function ExpiryTab({
           ok: a.ok,
           status: a.ok ? '正常' : a.message || '查询失败',
           source: a.source,
+          uid: a.user_id,
         });
       }
     }
@@ -391,13 +405,19 @@ export default function ExpiryTab({
                     {fmtExpire(r.nearestExpire)}
                   </td>
                   <td className="px-4 py-2">
-                    {r.ok ? (
-                      <Badge tone="green">{r.status}</Badge>
-                    ) : (
-                      <Badge tone="red" title={r.status}>
-                        异常
-                      </Badge>
-                    )}
+                    <div className="flex flex-wrap items-center gap-1">
+                      {r.ok ? (
+                        <Badge tone="green">{r.status}</Badge>
+                      ) : (
+                        <Badge tone="red" title={r.status}>
+                          异常
+                        </Badge>
+                      )}
+                      {/* 运行期限流/冷却（issue #178）：按平台联表对应池 */}
+                      {r.platform === 'Trae' && <PoolStatusBadge status={traePool.get(r.uid ?? '')} />}
+                      {r.platform === 'Buddy' && <PoolStatusBadge status={buddyPool.get(r.uid ?? '')} />}
+                      {r.platform === 'Qoder' && <PoolStatusBadge status={qoderPool.get(r.uid ?? '')} />}
+                    </div>
                   </td>
                 </tr>
               ))}

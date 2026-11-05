@@ -25,6 +25,8 @@ import { copyText } from '../lib/clipboard';
 import type { AccountView, ImportPreview, TagView } from '../types';
 import { AddAccountModal } from './accounts/AddAccountModal';
 import { CooldownBadge } from './accounts/CooldownBadge';
+import { PoolStatusBadge } from './accounts/PoolStatusBadge';
+import { usePoolStatus } from '../hooks/usePoolStatus';
 import { CreditCell } from './accounts/CreditCell';
 import { CreditsExpireBadge } from './accounts/CreditsExpireBadge';
 import { DeleteAccountConfirmModal } from './accounts/DeleteConfirmModals';
@@ -58,6 +60,8 @@ export default function Accounts() {
   const refreshJwt = useAppStore((s) => s.refreshJwt);
   const toast = useAppStore((s) => s.pushToast);
   const oauthLogin = useAppStore((s) => s.oauthLogin);
+  // 运行期限流/冷却徽标（issue #178）：429 软冷却/积分耗尽硬冷却只在网关内存池，联表注入
+  const poolStatus = usePoolStatus('trae');
 
   const [filter, setFilter] = useState<string>('all');
   const [addOpen, setAddOpen] = useState(false);
@@ -460,11 +464,15 @@ export default function Accounts() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      {a.cooldown_type ? (
-                        <CooldownBadge type={a.cooldown_type} until={a.cooldown_until} />
-                      ) : (
-                        <span className="text-xs text-slate-300">-</span>
-                      )}
+                      <div className="flex flex-wrap items-center gap-1">
+                        {a.cooldown_type ? (
+                          <CooldownBadge type={a.cooldown_type} until={a.cooldown_until} />
+                        ) : (
+                          <span className="text-xs text-slate-300">-</span>
+                        )}
+                        {/* 运行期限流/冷却（issue #178）：与持久表签到冷却并存，无则不渲染 */}
+                        <PoolStatusBadge status={poolStatus.get(a.user_id)} />
+                      </div>
                     </td>
                     <td className="px-4 py-3 text-right">
                       <CreditCell account={a} />

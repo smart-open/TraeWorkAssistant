@@ -25,6 +25,8 @@ import { GroupSelect } from '../accounts/GroupSelect';
 import { GroupsModal, computePoolBadges } from '../accounts/GroupsModal';
 import { TagChips } from '../accounts/TagSelect';
 import { AccountTagsEditModal, TagsModal } from '../accounts/TagsModal';
+import { PoolStatusBadge } from '../accounts/PoolStatusBadge';
+import { usePoolStatus } from '../../hooks/usePoolStatus';
 import { QoderHelpModal } from './HelpModal';
 import { useAppStore } from '../../store';
 import type {
@@ -95,6 +97,8 @@ function FingerprintBadge({ a, onOpen }: { a: QoderAccountView; onOpen: (a: Qode
 
 export default function QoderAccounts() {
   const pushToast = useAppStore((s) => s.pushToast);
+  // 运行期限流/冷却徽标（issue #178）：429 软冷却/积分耗尽硬冷却只在网关内存池，联表注入
+  const poolStatus = usePoolStatus('qoder');
   const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
   const [loading, setLoading] = useState(true);
   // 帮助弹框（对齐 BuddyAccounts leftExtra 帮助入口）
@@ -645,6 +649,10 @@ export default function QoderAccounts() {
                     <td className="px-4 py-3">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="font-medium">{a.nickname || a.id}</span>
+                        {/* 运行期限流/冷却（issue #178）：网关内存池状态，无则不渲染。
+                            池条目以内部账号 id（qd-<hash>）为键——QoderSyncAccount
+                            的 uid=a.id，而非全家桶 uid（View.uid），勿用 a.uid 联表 */}
+                        <PoolStatusBadge status={poolStatus.get(a.id)} />
                       </div>
                       <div className="text-xs text-slate-400">{[a.uid, a.note].filter(Boolean).join(' · ') || a.id}</div>
                     </td>

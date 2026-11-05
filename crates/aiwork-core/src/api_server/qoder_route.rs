@@ -405,6 +405,17 @@ fn content_has_image(content: &Value) -> bool {
     }
 }
 
+/// 目录条目视觉能力判定（issue #182）：查顶层 `supportsImages === true`（与
+/// build_qoder_catalog 的 vision 探测字段同源——正常/含两种形态）。
+/// T08/T09 存量条目缺该字段（无 sources/含 manual）时保守按不支持处理，与 #182
+/// 决策一致：「无证据不支持即拒绝」，宁可让少数存量条目显式 400 也不静默丢图。
+fn entry_supports_images(entry: &Value) -> bool {
+    entry
+        .get("supportsImages")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// 字符边界安全截断（自抄 wb_route::safe_slice，私有不可复用）：
 /// 字节落点在多字节字符内时回退到前一个边界，避免超长上游响应体
 /// 整段进入错误消息/日志
@@ -763,11 +774,15 @@ fn run_qoder_stream(
         send_stream_error(tx, proto, 404, &msg);
         return;
     }
-    // issue #154 图片门控：Qoder 上游是 agent 信封，图片走独立 image_urls 上传
-    // 通道（本项目未接线），messages 里的图片块上游读不到——与其静默丢图
-    //（F-63 红线：能力缺失必须明示），不如执行入口直接 400 拒绝
-    if body_has_image(&peek) {
-        let msg = "upstream 400 error: Qoder 池暂不支持图片输入（图片上传通道未接线，issue #154），请移除图片或改用支持视觉的非 Qoder 模型";
+    // issue #182/#154 图片门控收窄：上游已实证可读 messages 图片块（2026-11-04
+    // 探针变体 C：qfmodel 对 data URL 红图正确答"红色"；变体 A 证伪 image_urls
+    // 直填通道），视觉模型放行直传——信封构造 normalize_messages 本就保留图片块
+    // 形态（三协议统一归一为 image_url）。非视觉模型（supportsImages=false）仍
+    // F-63 红线明示拒绝而非静默丢图
+    if body_has_image(&peek) && !entry_supports_images(&entry) {
+        let msg = format!(
+            "upstream 400 error: 模型 {model} 不支持视觉输入（Qoder 目录 is_vl=false），请移除图片或改用支持视觉的模型"
+        );
         state.logger.log_request(
             "qoder", "POST", "/v1/chat/completions", model, true, 400, "-",
             start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
@@ -1557,7 +1572,8 @@ fn run_qoder_stream(
                             }
                             let kind = classified.kind.to_err_kind();
                             if kind != ErrKind::None {
-                                state.qoder_pool.note_error(&picked.uid, kind);
+                                // issue #178：429 带上游 Retry-After（秒）时以其为账号解冻时刻
+                                state.qoder_pool.note_error_retry_after(&picked.uid, kind, retry_after);
                                 // issue #67（移植 main@36d628f）：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.qoder_sticky.unbind_uid(&picked.uid);
@@ -1649,13 +1665,13 @@ pub async fn qoder_aggregate_chat(
                 "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
             ));
         }
-        // issue #154：聚合路径同流式门控——Qoder 上游对图片输入 400 且报错信息
-        // 不可读，入口显式拒绝给出可行动提示（与流式路径同文案）
-        if body_has_image(&peek) {
-            return Err(
-                "upstream 400 error: Qoder 池暂不支持图片输入（图片上传通道未接线，issue #154），请移除图片或改用支持视觉的非 Qoder 模型"
-                    .to_string(),
+        // issue #154：聚合路径同流式门控——issue #182 收窄：上游已实证可读
+        // messages 图片块（探针变体 C），视觉模型放行直传；非视觉模型仍明示拒绝
+        if body_has_image(&peek) && !entry_supports_images(&entry) {
+            let msg = format!(
+                "upstream 400 error: 模型 {model} 不支持视觉输入（Qoder 目录 is_vl=false），请移除图片或改用支持视觉的模型"
             );
+            return Err(msg);
         }
         let model_key = entry
             .get("upstreamKey")
@@ -2270,7 +2286,8 @@ pub async fn qoder_aggregate_chat(
                                 }
                                 let kind = classified.kind.to_err_kind();
                                 if kind != ErrKind::None {
-                                    state.qoder_pool.note_error(&picked.uid, kind);
+                                    // issue #178：429 带上游 Retry-After（秒）时以其为账号解冻时刻
+                                    state.qoder_pool.note_error_retry_after(&picked.uid, kind, retry_after);
                                     // issue #67（移植 main@36d628f）：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {
                                         state.qoder_sticky.unbind_uid(&picked.uid);
@@ -2697,6 +2714,18 @@ mod tests {
         // 无 messages / 空 content
         assert!(!body_has_image(&json!({})));
         assert!(!body_has_image(&json!({"messages": [{"role": "user"}]})));
+    }
+
+    /// issue #182：视觉门控收窄——supportsImages 判定，缺字段 fail-closed
+    /// （能力不明不放行图片，F-63 红线同口径）
+    #[test]
+    fn entry_supports_images_gate() {
+        assert!(entry_supports_images(&json!({"supportsImages": true})));
+        assert!(!entry_supports_images(&json!({"supportsImages": false})));
+        // 缺字段 fail-closed
+        assert!(!entry_supports_images(&json!({})));
+        // 字段类型异常按缺字段同口径
+        assert!(!entry_supports_images(&json!({"supportsImages": "true"})));
     }
 
     /// 远程目录测试条目（adopt_remote 接受的最小合法信封载荷）

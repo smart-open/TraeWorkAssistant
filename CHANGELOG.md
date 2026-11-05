@@ -6,6 +6,32 @@
 
 ---
 
+## [1.6.0] · 2026-11-05 · 语义移植 main 864d3e5 => origin/main（池状态可观测 + 签到待入账 + 网关加固）
+
+> 语义移植 origin/main `864d3e5`（不含）=> `484f6e79`（9 提交，未 merge）。跳过桌面/OS 专属：f5fdb643 豆包签到链路（本分支无 doubao 模块）、60644a8e / 573f3f06 版本号与 main 自身 CHANGELOG、484f6e79 的 main.rs 窗口几何自愈（GUI 专属）。
+
+### 新功能
+
+- **四池限流/耗尽徽标（issue #178，7385e586）**：Trae/Buddy/Qoder/BuddyAi 账号页与到期看板实时展示 429 软冷却（按原因标注 + 秒级倒计时）、积分耗尽硬冷却、连续错误熔断；`PoolStatus` 新增 `hard_until`，冷却字段不再返回陈旧值；新增 `usePoolStatus` hook（3s 轮询）与 `PoolStatusBadge` 组件。
+- **429 Retry-After 传播（issue #178，7385e586）**：Trae/Qoder/WB 上游 429 带 Retry-After 时软冷却按其值生效（钳制 60s~7d），限额类错误不受影响。
+- **WB 签到「待入账」全链路（issue #180，7385e586）**：奖励次日到账（credit_delayed）不再误记「奖励未识别」——事件新增 `reward_pending/pre_balance/pre_wb_credits/checkin_streak` 字段并存储签到前余额，次日签到按「billing 优先、WB credits 兜底」差值自动回填（仅差值>0 采信，already 分支同样回填）；前端显示「奖励待入账（T+1）」徽标。
+- **WB 签到连签展示（issue #180，7385e586）**：提取 streak_days，前端区分「活跃连签」与「签到连签」；精确奖励键表补 `credit`。
+
+### 修复与加固
+
+- **Buddy 积分解析加固（issue #179，7385e586）**：包条目改全树特征键收集（不再依赖固定容器路径）、到期宽容解析、未知 Status fail-open 落诊断；包明细为空不覆盖历史明细，message 诚实标注三态并透出到期看板。
+- **网关请求体上限 32MiB（issue #181，7385e586）**：8MiB → 32MiB，超限错误附 `AIWORK_MAX_BODY_BYTES` 自助指引。
+- **Qoder 视觉模型图片放行（issue #182，7385e586）**：`is_vl` 门控收窄为 `entry.supportsImages === true`（fail-closed），视觉模型直传、非视觉仍明示拒绝；探针测试④随移植落地（零新依赖）。
+- **NaN 哨兵防降级候选污染（issue #184，484f6e79）**：目录条目 rate 为 NaN（上游脏数据）时不再被误判为零费率最优候选，dispatch 排序与 bg/longctx 降级候选均排除。
+- **/v1/responses 降级可观测（issue #183，484f6e79）**：bg/longctx 降级改写落 app_log，与 dispatch 路径同口径。
+- **glm-5.3-flash 长上下文支持（cba97334）**：`TRAE_MAX_MODE_REF` 支持表补齐（12 模型）。
+- **小屏可用性（576845da）**：应用最小宽度 1920px → 1280px（issue #172），全局滚动条加宽提亮。
+- **Qoder CN 文案（6c39dd01）**：签到页注释统一「Qoder CN 签到」。
+
+### 验证
+
+- `cargo test --workspace`（aiwork-core 923 / aiwork-server 13 通过）、`npx tsc --noEmit`、`npm test`（88 通过）全部通过。
+
 ## [1.5.12] · 2026-11-02 · 语义移植 main f53e213a => origin/main（Buddy 积分口径 + 缓存对账）
 
 > 语义移植 main `f53e213a`（不含）=> `origin/main`（864d3e5，含 PR #166/#167/#168、issue #169 修复与 864d3e5 SWR 审查修复，未 merge）。跳过：PR #167 WorkBuddy 切换验证与 PR #168 模型趋势逐请求归属（均为桌面客户端逻辑——读本机切换器 auth 文件/客户端日志/vscdb 与 CodeBuddy IDE 会话文件，本分支无对应代码路径）；版本号 chore（本分支版本自管）。

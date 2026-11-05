@@ -76,6 +76,9 @@ pub struct DosageInfo {
     pub total: f64,
     pub expire_secs: Option<i64>,
     pub packages: Vec<DosagePackage>,
+    /// 解析诊断（issue #179）：包明细为空 / 出现未知 Status 值时携带响应骨架，
+    /// None = 正常形态。调用方落 app_log 留证（响应体不含 token，无敏感泄漏面）
+    pub parse_diag: Option<String>,
 }
 
 /// 官网日期时间字符串解析（"YYYY-MM-DD HH:MM:SS"，+08:00 墙钟 → epoch 秒）
@@ -86,11 +89,119 @@ pub fn parse_cn_datetime(s: &str) -> Option<i64> {
     Some(offset.from_local_datetime(&dt).single()?.timestamp())
 }
 
+/// 到期字符串宽容解析（issue #179）：官网墙钟 "%Y-%m-%d %H:%M:%S"（+08:00）→
+/// RFC3339/ISO 带时区 → 无时区 ISO "%Y-%m-%dT%H:%M:%S"（按 +08:00 墙钟）→
+/// 纯日期（当日 23:59:59 +08:00）
+pub fn parse_expire_str(s: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(t) = parse_cn_datetime(s) {
+        return Some(t);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        let offset = chrono::FixedOffset::east_opt(8 * 3600)?;
+        return Some(offset.from_local_datetime(&dt).single()?.timestamp());
+    }
+    let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let offset = chrono::FixedOffset::east_opt(8 * 3600)?;
+    let dt = d.and_hms_opt(23, 59, 59)?;
+    Some(offset.from_local_datetime(&dt).single()?.timestamp())
+}
+
+/// 包特征键：名字类（PackageCode/PackageName）或容量类（Precise 优先的 remain/size）。
+/// 上游换容器名/挪层级时条目仍带这些字段——据此全树识别而非依赖固定路径
+const PACKAGE_SIG_KEYS: [&str; 6] = [
+    "PackageCode",
+    "PackageName",
+    "CapacityRemainPrecise",
+    "CapacityRemain",
+    "CycleCapacitySizePrecise",
+    "CycleCapacitySize",
+];
+
+fn looks_like_package(o: &serde_json::Map<String, Value>) -> bool {
+    PACKAGE_SIG_KEYS.iter().any(|k| o.contains_key(*k))
+}
+
+/// 全树递归收集包条目（限深 8）：命中特征键的对象不再下钻（防嵌套重复收集）。
+/// 旧实现固定 `core.get("Accounts")` 路径，上游换层级/容器改名即整包清零而
+/// TotalDosage（递归 dig）仍显示——「总分在、包和到期全空」的 issue #179 症状
+fn collect_package_items<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
+    fn walk<'a>(v: &'a Value, depth: u32, out: &mut Vec<&'a Value>) {
+        if depth > 8 {
+            return;
+        }
+        match v {
+            Value::Object(m) => {
+                if looks_like_package(m) {
+                    out.push(v);
+                    return;
+                }
+                for x in m.values() {
+                    walk(x, depth + 1, out);
+                }
+            }
+            Value::Array(a) => {
+                for x in a {
+                    walk(x, depth + 1, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, 0, out);
+}
+
+/// 响应骨架（诊断，issue #179）：对象展开键名树、数组取前 2 个元素、长字符串
+/// 截断为长度标记；数值保留（容量/总量对定位有用，响应体不含 token）；限深 4
+fn skeleton(v: &Value, depth: u32) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut o = serde_json::Map::new();
+            if depth < 4 {
+                for (k, x) in m {
+                    o.insert(k.clone(), skeleton(x, depth + 1));
+                }
+            }
+            Value::Object(o)
+        }
+        Value::Array(a) => Value::Array(a.iter().take(2).map(|x| skeleton(x, depth + 1)).collect()),
+        Value::Null => json!(null),
+        Value::Bool(b) => json!(b),
+        Value::Number(n) => json!(n),
+        Value::String(s) => {
+            let n = s.chars().count();
+            if n > 32 {
+                json!(format!("str(len={n})"))
+            } else {
+                json!(s)
+            }
+        }
+    }
+}
+
 /// 包条目字段取值：Precise 字符串优先（精度丢失小），回退整数字段
 fn pkg_f64(obj: &Value, precise_key: &str, plain_key: &str) -> f64 {
     dig_f64(obj, precise_key)
         .or_else(|| dig_f64(obj, plain_key))
         .unwrap_or(0.0)
+}
+
+/// 解析诊断落日志（issue #179）：仅异常形态（明细空/未知 Status）时记录，
+/// 正常取数零开销零噪音
+fn log_parse_diag(state: &AppState, acct_id: &str, info: &Option<DosageInfo>) {
+    if let Some(d) = info.as_ref().and_then(|i| i.parse_diag.as_deref()) {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("buddy-ai: 积分解析诊断 {acct_id}: {d}"),
+        );
+    }
 }
 
 pub fn fetch_dosage_info(
@@ -110,62 +221,110 @@ pub fn fetch_dosage_info(
         .ok()?;
     let v: Value = resp.into_json().ok()?;
     // R-6 实测嵌套：{data: {Response: {Data: {TotalDosage, Accounts[...]}}}}。
-    // ⚠️ dig 的信封穿透表 ENVELOPE_KEYS 全小写，"Response"/"Data" 大写不命中——
-    // 固定层级用 fs_utils::path 严格下钻，回退 dig 平铺形态（兼容旧版）
-    let data = digv(&v, &["data"]);
-    let core = data
-        .and_then(|d| crate::fs_utils::path(d, &["Response", "Data"]))
-        .or(data)?;
+    // ⚠️ dig 的信封穿透表 ENVELOPE_KEYS 全小写，"Response"/"Data" 大写不命中。
+    // 无 data 信封 = 响应不可信（登录失效/接口变更），维持 None 口径——调用方
+    // 跳过回写，不得把 total=0 写进池。解析本身以整个响应为范围（issue #179：
+    // 包收集/total 深挖/骨架都不再受固定 Response/Data 层级约束）
+    digv(&v, &["data"])?;
+    Some(parse_dosage_body(&v))
+}
+
+/// 响应体解析（issue #179 兼容加固，与网络层解耦便于单测）：
+/// - 包条目**全响应**递归收集（不再依赖固定 Accounts 路径/容器名，包容器挪层级/改名
+///   均能命中；包特征键足够特异，全树收集误收风险极低）；
+/// - Status 未知值 fail-open 保留并落诊断（上游新增状态值不再静默清空整包）；
+/// - 到期解析补 ISO/纯日期兜底；ExpiredTime 补字符串形态。
+/// `root` = 整个响应：包收集、TotalDosage 深挖、诊断骨架统一范围。
+pub fn parse_dosage_body(root: &Value) -> DosageInfo {
     let now = chrono::Utc::now().timestamp();
-    // 分包明细（Status 0=有效/3=宽限；其余状态不计）
+    // 分包明细（Status 0=有效/3=宽限；未知值保留 + 记诊断）
     let mut packages = Vec::new();
     let mut expire_candidates: Vec<i64> = Vec::new();
-    if let Some(arr) = core.get("Accounts").and_then(Value::as_array) {
-        for a in arr {
-            let status = a.get("Status").and_then(Value::as_i64).unwrap_or(0);
-            if status != 0 && status != 3 {
-                continue;
-            }
-            let cycle_end = a
-                .get("CycleEndTime")
-                .and_then(Value::as_str)
-                .and_then(parse_cn_datetime);
-            if let Some(e) = cycle_end {
-                if e > now {
-                    expire_candidates.push(e);
-                }
-            }
-            // 旧字段兼容：数值型 ExpiredTime（秒/毫秒归一）
-            if let Some(t) = a.get("ExpiredTime").and_then(Value::as_f64) {
-                let secs = if t > 1e12 { t / 1000.0 } else { t };
-                if secs > now as f64 {
-                    expire_candidates.push(secs as i64);
-                }
-            }
-            packages.push(DosagePackage {
-                name: a
-                    .get("PackageName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                code: a
-                    .get("PackageCode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                remain: pkg_f64(a, "CapacityRemainPrecise", "CapacityRemain"),
-                size: pkg_f64(a, "CycleCapacitySizePrecise", "CycleCapacitySize"),
-                expire_secs: cycle_end,
-            });
+    let mut unknown_statuses: Vec<Value> = Vec::new();
+    let mut items = Vec::new();
+    collect_package_items(root, &mut items);
+    for a in items {
+        let status_raw = a.get("Status").cloned().unwrap_or(Value::Null);
+        let status = status_raw
+            .as_i64()
+            .or_else(|| status_raw.as_str().and_then(|s| s.trim().parse().ok()))
+            .unwrap_or(0);
+        if status != 0 && status != 3 {
+            unknown_statuses.push(status_raw.clone());
         }
+        let cycle_end = a
+            .get("CycleEndTime")
+            .and_then(Value::as_str)
+            .and_then(parse_expire_str);
+        if let Some(e) = cycle_end {
+            if e > now {
+                expire_candidates.push(e);
+            }
+        }
+        // 旧字段兼容：数值/数字字符串 ExpiredTime（秒/毫秒归一）
+        let expired_num = a
+            .get("ExpiredTime")
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                a.get("ExpiredTime")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+            });
+        if let Some(t) = expired_num {
+            let secs = if t > 1e12 { t / 1000.0 } else { t };
+            if secs > now as f64 {
+                expire_candidates.push(secs as i64);
+            }
+        }
+        packages.push(DosagePackage {
+            name: a
+                .get("PackageName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            code: a
+                .get("PackageCode")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            remain: pkg_f64(a, "CapacityRemainPrecise", "CapacityRemain"),
+            size: pkg_f64(a, "CycleCapacitySizePrecise", "CycleCapacitySize"),
+            expire_secs: cycle_end,
+        });
     }
-    let total = dig_f64(core, "TotalDosage").unwrap_or_else(|| packages.iter().map(|p| p.remain).sum());
+    // TotalDosage 从整个响应递归深挖（core 内固定层级外的候选也命中；dig 全树递归）
+    let total = dig_f64(root, "TotalDosage").unwrap_or_else(|| packages.iter().map(|p| p.remain).sum());
+    // 解析诊断（issue #179）：明细为空（形状可能变化）或未知 Status 时携带证据，
+    // 调用方落 app_log——修复前此场景完全静默，无法定位。骨架基于整个响应
+    // （包容器挪出 core 时骨架仍能看到新容器名）
+    let parse_diag = if packages.is_empty() {
+        Some(
+            json!({
+                "warn": "get-user-resource 包明细解析为空，上游响应形状可能变化（issue #179）",
+                "total": total,
+                "statuses": unknown_statuses,
+                "shape": skeleton(root, 0),
+            })
+            .to_string(),
+        )
+    } else if !unknown_statuses.is_empty() {
+        Some(
+            json!({
+                "warn": "get-user-resource 出现未知 Status 值，已计入明细",
+                "statuses": unknown_statuses,
+            })
+            .to_string(),
+        )
+    } else {
+        None
+    };
     let expire_secs = expire_candidates.iter().copied().min();
-    Some(DosageInfo {
+    DosageInfo {
         total,
         expire_secs,
         packages,
-    })
+        parse_diag,
+    }
 }
 
 /// dig 单键 f64（数值或数字字符串兜底）
@@ -305,6 +464,7 @@ fn process_account(
 
     // ⑥ 前置：打卡前积分快照（失败不阻塞打卡——到账校验是加分项不是门槛）
     let before = fetch_dosage_info(agent, base, token, uid);
+    log_parse_diag(state, acct_id, &before);
 
     // ① 建会话
     let body = json!({
@@ -712,6 +872,7 @@ fn process_account(
 
     // ⑥ 到账校验 + 幂等戳落盘 + 池快照回写（成功才落盘，§4.5：不成功不记打卡）
     let after = fetch_dosage_info(agent, base, token, uid);
+    log_parse_diag(state, acct_id, &after);
     let gain = match (&before, &after) {
         (Some(b), Some(a)) if a.total > b.total => Some(a.total - b.total),
         _ => None,
@@ -1177,6 +1338,142 @@ mod tests {
         assert_eq!(pkg_f64(&b, "CapacityRemainPrecise", "CapacityRemain"), 100.0);
         let c = json!({});
         assert_eq!(pkg_f64(&c, "CapacityRemainPrecise", "CapacityRemain"), 0.0);
+    }
+
+    // ── issue #179 兼容加固回归 ─────────────────────────────────────────────
+
+    /// 包条目全树递归收集：容器改名/挪层级不再整包清零（总分在、包全空的 #179 症状）
+    #[test]
+    fn packages_collected_recursively_across_containers() {
+        let core = json!({
+            "TotalDosage": 100,
+            "ResourcePackages": [
+                {
+                    "PackageName": "A",
+                    "CapacityRemainPrecise": "12.5",
+                    "CycleCapacitySizePrecise": "100",
+                    "CycleEndTime": "2035-01-01 00:00:00",
+                },
+                { "PackageName": "B", "CapacityRemain": 3 },
+            ],
+        });
+        let info = parse_dosage_body(&core);
+        assert_eq!(info.packages.len(), 2);
+        assert_eq!(info.packages[0].remain, 12.5);
+        assert_eq!(info.packages[1].remain, 3.0);
+        assert!(info.expire_secs.is_some());
+        assert_eq!(info.total, 100.0);
+        assert!(info.parse_diag.is_none(), "正常形态不出诊断");
+    }
+
+    /// 深层嵌套（信封外再包一层）同样命中：条目在 core 任意深度都能收集
+    #[test]
+    fn packages_found_at_arbitrary_depth() {
+        let core = json!({
+            "TotalDosage": 7,
+            "Wrapper": { "Deep": { "Accounts": [
+                { "PackageCode": "p1", "CapacityRemain": 7 },
+            ] } },
+        });
+        let info = parse_dosage_body(&core);
+        assert_eq!(info.packages.len(), 1);
+        assert_eq!(info.packages[0].code, "p1");
+    }
+
+    /// 包容器挪出 core（data 信封其他分支 / 响应顶层）仍能收集——收集范围是
+    /// 整个响应而非仅 core（审查修复：原实现只扫 core，挪出 core 症状依旧）
+    #[test]
+    fn packages_collected_outside_core() {
+        let _core = json!({ "TotalDosage": 7 }); // 对照：core 内并无 Packages（收集范围是整个响应）
+        let root = json!({
+            "code": 0,
+            "data": { "Response": { "Data": { "TotalDosage": 7 } } },
+            "Packages": [ { "PackageName": "A", "CapacityRemain": 7 } ],
+        });
+        let info = parse_dosage_body(&root);
+        assert_eq!(info.packages.len(), 1);
+        assert_eq!(info.packages[0].name, "A");
+        assert_eq!(info.total, 7.0);
+    }
+
+    /// CycleEndTime 兼容：ISO 带时区 / 无时区 ISO / 纯日期（当日 23:59:59 +08:00）
+    #[test]
+    fn cycle_end_iso_and_date_only_fallback() {
+        use chrono::TimeZone;
+        let core = json!({ "TotalDosage": 1, "Accounts": [
+            { "PackageName": "A", "CapacityRemain": 1, "CycleEndTime": "2035-01-02T03:04:05+08:00" },
+            { "PackageName": "B", "CapacityRemain": 1, "CycleEndTime": "2035-02-03" },
+        ]});
+        let info = parse_dosage_body(&core);
+        let offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let iso = offset
+            .from_local_datetime(
+                &chrono::NaiveDateTime::parse_from_str("2035-01-02T03:04:05", "%Y-%m-%dT%H:%M:%S")
+                    .unwrap(),
+            )
+            .single()
+            .unwrap()
+            .timestamp();
+        let date_only = offset
+            .from_local_datetime(&chrono::NaiveDate::parse_from_str("2035-02-03", "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(23, 59, 59)
+                .unwrap())
+            .single()
+            .unwrap()
+            .timestamp();
+        // 「最近过期」= 两者最小值
+        assert_eq!(info.expire_secs, Some(iso.min(date_only)));
+        let a = info.packages.iter().find(|p| p.name == "A").unwrap();
+        assert_eq!(a.expire_secs, Some(iso));
+        let b = info.packages.iter().find(|p| p.name == "B").unwrap();
+        assert_eq!(b.expire_secs, Some(date_only));
+    }
+
+    /// 未知 Status fail-open：不再静默丢弃整包，且落诊断
+    #[test]
+    fn unknown_status_fail_open_and_diag() {
+        let core = json!({ "TotalDosage": 5, "Accounts": [
+            { "PackageName": "A", "CapacityRemain": 2, "Status": 7 },
+        ]});
+        let info = parse_dosage_body(&core);
+        assert_eq!(info.packages.len(), 1, "未知状态保留");
+        let diag = info.parse_diag.expect("未知状态出诊断");
+        assert!(diag.contains("7"), "诊断携带原始 Status 值");
+    }
+
+    /// 包明细解析为空：出诊断并携带响应骨架（#179 修复前此场景完全静默）
+    #[test]
+    fn empty_packages_diag_with_shape() {
+        let core = json!({ "TotalDosage": 9, "SomeNewContainer": [{ "Unrelated": 1 }] });
+        let info = parse_dosage_body(&core);
+        assert!(info.packages.is_empty());
+        assert_eq!(info.total, 9.0);
+        let diag = info.parse_diag.expect("明细空出诊断");
+        assert!(diag.contains("#179"));
+        assert!(diag.contains("SomeNewContainer"), "骨架暴露新容器名供定位");
+    }
+
+    /// ExpiredTime 字符串形态兼容（数字字符串，秒/毫秒归一）
+    #[test]
+    fn expired_time_string_form() {
+        let core = json!({ "TotalDosage": 0, "Accounts": [
+            { "PackageName": "A", "CapacityRemain": 1, "ExpiredTime": "4102444800000" },
+        ]});
+        let info = parse_dosage_body(&core);
+        assert_eq!(info.expire_secs, Some(4_102_444_800), "毫秒字符串归一为秒");
+    }
+
+    /// 骨架：长字符串截断为长度标记（防日志膨胀），数组取前 2 个元素
+    #[test]
+    fn skeleton_truncates_and_caps() {
+        let v = json!({
+            "long": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "arr": [1, 2, 3, 4, 5],
+        });
+        let s = skeleton(&v, 0);
+        assert_eq!(s["long"], json!("str(len=42)"));
+        assert_eq!(s["arr"].as_array().unwrap().len(), 2);
     }
 
     /// with_backoff：4xx 不重试直返、Ok 直返

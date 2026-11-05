@@ -1828,6 +1828,171 @@ mod tests {
         print_probe_result("chat+encode0", req.send_string(&body.to_string()));
     }
 
+    /// 探针 ④（issue #182/#154 图片通道）：上游到底从哪里读图。
+    /// 内存生成 64×64 纯红 PNG（flate2 zlib + 手写 CRC32，零新依赖），三组判别变体：
+    ///   A. data URL 直填顶层 image_urls + chat_context.imageUrls → 问颜色（期望"红"）
+    ///   B. 外链 URL（百度 logo，内容可判别）同字段直填 → 问文字/背景色（期望可描述）
+    ///   C. 图片块留在 messages（image_url data URL 形态，image_urls 恒 null）→ 问颜色
+    /// A 命中 = 接线零侦察成本；B 命中 = 上游真抓 URL，需上传端点侦察换 URL；
+    /// C 命中 = 推翻 #154「messages 图片块上游读不到」前提，直接透传即可。
+    /// 运行：cargo test probe_gateway_chat_image_urls -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_gateway_chat_image_urls() {
+        use base64::Engine as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        // ── 内存生成纯红 64×64 PNG ──
+        fn crc32(data: &[u8]) -> u32 {
+            let mut table = [0u32; 256];
+            for (i, slot) in table.iter_mut().enumerate() {
+                let mut c = i as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+                *slot = c;
+            }
+            let mut c = 0xFFFF_FFFFu32;
+            for &b in data {
+                c = table[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+            }
+            c ^ 0xFFFF_FFFF
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+        }
+        let (w, h) = (64u32, 64u32);
+        let mut raw = Vec::with_capacity(h as usize * (1 + w as usize * 3));
+        for _ in 0..h {
+            raw.push(0u8); // filter: none
+            for _ in 0..w {
+                raw.extend_from_slice(&[0xDE, 0x10, 0x10]); // 深红
+            }
+        }
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8bit RGB
+        chunk(&mut png, b"IHDR", &ihdr);
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&raw).unwrap();
+        chunk(&mut png, b"IDAT", &z.finish().unwrap());
+        chunk(&mut png, b"IEND", &[]);
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+        println!("png bytes = {}, data_url len = {}", png.len(), data_url.len());
+        // 落盘供人工核验 PNG 本体有效（颜色应为深红 #DE1010）
+        let _ = std::fs::write("../temp/probe_red.png", &png);
+
+        // ── 真凭证 ──
+        let state = crate::state::AppState::new().expect("构造 AppState 失败");
+        let acct_id = probe_first_account(&state);
+        let agent = probe_agent();
+        let (creds, _r, note) = ensure_fresh(&state, &agent, &acct_id, 24);
+        println!("acct = {acct_id}, ensure_fresh = {note}");
+        assert!(!creds.access_token.is_empty(), "无可用凭证（vault 被锁或池空）");
+        let config = json!({"is_reasoning": true, "is_vl": true});
+
+        // 单变体发送 + 全量聚合回答（生产传输路径：encode_body + 真 COSY 签名）。
+        // 10605 isQueued = 上游排队（免费档常态）：等 20s 重发，最多 4 次
+        fn send_and_answer(tag: &str, body: &Value, creds: &QoderCreds) -> String {
+            for attempt in 1..=4 {
+                let body_bytes = body.to_string().into_bytes();
+                let mut reader = match super::super::qoder_upstream::make_qoder_request(
+                    creds, &body_bytes, "qfmodel", "system",
+                ) {
+                    Ok(r) => r,
+                    Err((code, msg, _ra)) => {
+                        println!("[{tag}] HTTP {code}: {}",
+                            msg.chars().take(500).collect::<String>());
+                        return format!("<HTTP {code}>");
+                    }
+                };
+                let mut resp_text = String::new();
+                reader.read_to_string(&mut resp_text).unwrap_or(0);
+                // 排队检测：首个信封 403 + 10605/isQueued → 等待重试
+                let queued = resp_text.contains("10605") && resp_text.contains("isQueued");
+                if queued && attempt < 4 {
+                    println!("[{tag}] 排队中（第 {attempt} 次），20s 后重试…");
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    continue;
+                }
+                let mut answer = String::new();
+                let mut raw_dump = 0usize;
+                for l in resp_text.lines() {
+                    if l.is_empty() { continue }
+                    if raw_dump < 6 {
+                        println!("[{tag}] << {}", &l.chars().take(200).collect::<String>());
+                        raw_dump += 1;
+                    }
+                    let Some(data) = l.strip_prefix("data:").map(str::trim_start) else { continue };
+                    if data == "[DONE]" { break }
+                    let Ok(env) = serde_json::from_str::<Value>(data) else { continue };
+                    if env.get("statusCodeValue").and_then(Value::as_i64).is_some_and(|c| c != 200) {
+                        println!("[{tag}] 业务错误: {}", env);
+                        break;
+                    }
+                    if let Some(inner) = env.get("body").and_then(Value::as_str) {
+                        if let Ok(chunk) = serde_json::from_str::<Value>(inner) {
+                            if let Some(text) =
+                                chunk.pointer("/choices/0/delta/content").and_then(Value::as_str)
+                            {
+                                answer.push_str(text);
+                            }
+                        }
+                    }
+                }
+                println!("[{tag}] 回答: {answer}");
+                return answer;
+            }
+            String::from("<排队重试耗尽>")
+        }
+        let new_body = |question: &str| {
+            super::super::qoder_upstream::build_upstream_body(
+                "qfmodel", &config,
+                &[json!({"role": "user", "content": question})],
+                None, None,
+                &super::super::qoder_upstream::ThinkingChoice { enable: None, effort: None },
+                &creds.uid, None,
+            )
+        };
+
+        // 变体 A：data URL 直填 image_urls
+        let mut a = new_body("这张图片主要是什么颜色？只回答颜色名称。");
+        a["image_urls"] = json!([data_url]);
+        a["chat_context"]["imageUrls"] = json!([data_url.clone()]);
+        let ans_a = send_and_answer("A data-url→image_urls", &a, &creds);
+
+        // 变体 B：外链 URL 直填 image_urls（百度 logo：蓝字白底，内容可判别）
+        let baidu = "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png";
+        let mut b = new_body("这张图片里有什么文字或标志？背景是什么颜色？简短回答。");
+        b["image_urls"] = json!([baidu]);
+        b["chat_context"]["imageUrls"] = json!([baidu]);
+        let ans_b = send_and_answer("B ext-url→image_urls", &b, &creds);
+
+        // 变体 C：图片块留 messages（image_url data URL），image_urls 恒 null
+        let mut c = new_body("这张图片主要是什么颜色？只回答颜色名称。");
+        c["messages"] = json!([{"role": "user", "content": [
+            {"type": "text", "text": "这张图片主要是什么颜色？只回答颜色名称。"},
+            {"type": "image_url", "image_url": {"url": data_url}}
+        ]}]);
+        let ans_c = send_and_answer("C image-in-messages", &c, &creds);
+
+        // 判读
+        println!("=== 判读 ===");
+        println!("A(data→image_urls): {ans_a} {}", if ans_a.contains("红") { "✅" } else { "❌" });
+        println!("B(外链→image_urls): {ans_b} {}", if ans_b.contains("百度") || ans_b.contains("Baidu") || ans_b.contains("baidu") { "✅" } else { "❌" });
+        println!("C(messages 图块): {ans_c} {}", if ans_c.contains("红") { "✅" } else { "❌" });
+    }
+
     /// 探针 ③（p3-2d）：model/list 真 COSY 签名全量重抓。
     /// 背景：抓包日志预览此前截断 8KB，model/list（解压 67856B）只拿到前 12%，
     /// MiniMax-M2.7 与 chat 数组外的其余配置段缺失；256KB 上限修复后需重抓，

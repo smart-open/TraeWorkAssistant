@@ -11,7 +11,7 @@ import type { QoderAccountView, QoderCheckinRecord } from '../../types';
 /**
  * qoder-checkin 每日签到（F-80 §5.8，对照 BuddyCheckin 裁剪复刻）：
  * 签到控制卡（NDJSON 进度）+ 双活动说明卡。
- * 双活动：0 点刷新的 QoderWork 签到（100 Credits/天）+ 10:00 开窗的每日登录奖励
+ * 双活动：0 点刷新的 Qoder CN 签到（100 Credits/天）+ 10:00 开窗的每日登录奖励
  * （100 Add-on Credits/天）——接口层同源 sash campaigns，一次触发自然全覆盖。
  * 疑点⑦：签到进行态由 store 单例持有（qoder-checkin-progress 监听也在 store 层
  * setupListeners 注册），页面切走/卸载不丢事件，切回时进度/汇总完好。

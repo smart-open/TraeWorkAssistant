@@ -85,7 +85,15 @@ pub(crate) fn buddy_pool_write_credits(
     if expire_secs.is_some() {
         a.credits_expire_at = expire_secs; // 秒级时间戳（WorkBuddyAccount 口径）
     }
-    if packages.is_some() {
+    // 空明细不覆盖旧值（issue #179）：上游形状变化/瞬时抖动一次就抹掉历史明细
+    // 且无任何痕迹；「包用完」上游仍返回 remain=0 条目，不经此分支。对齐 expire
+    // 仅 Some 才覆盖的口径
+    let has_pkgs = packages
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if has_pkgs {
         a.credits_packages = packages; // 分包明细（P9）
     }
     save_buddy_pool(state, &pool)?;
@@ -931,6 +939,10 @@ pub fn buddy_ai_credits_sync_impl(state: &AppState) -> Result<Vec<Value>, String
         };
         let base = crate::tasks::wb_common::region_activity_base(&intl_domain_or(as_str(fs_utils::dig(&rec, &["domain"]))));
         let snap = crate::tasks::buddy_ai_checkin::fetch_dosage_info(&agent, base, &token, &uid);
+        // 解析诊断落日志（issue #179）：明细空/未知 Status 等异常形态留证
+        if let Some(d) = snap.as_ref().and_then(|i| i.parse_diag.as_deref()) {
+            fs_utils::app_log(&state.data_dir, &format!("buddy-ai: 积分解析诊断 {}: {d}", a.id));
+        }
         out.push((a.id.clone(), snap));
     }
     // 短临界区回写快照三键
@@ -946,8 +958,13 @@ pub fn buddy_ai_credits_sync_impl(state: &AppState) -> Result<Vec<Value>, String
                     if info.expire_secs.is_some() {
                         a.credits_expire_at = info.expire_secs; // 秒级时间戳
                     }
-                    // P9 分包明细（get-user-resource Accounts[] 深度解析）
-                    a.credits_packages = serde_json::to_value(&info.packages).ok();
+                    // P9 分包明细（get-user-resource Accounts[] 深度解析）；空明细
+                    // 不覆盖旧值（issue #179，对齐 buddy_pool_write_credits 口径）
+                    if let Ok(p) = serde_json::to_value(&info.packages) {
+                        if p.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                            a.credits_packages = Some(p);
+                        }
+                    }
                 }
             }
         }

@@ -21,6 +21,10 @@ interface WbAccountLine {
   status: 'success' | 'already' | 'fail';
   message?: string;
   reward?: number;
+  // issue #180：积分次日到账（credit_delayed）时的待入账标记
+  reward_pending?: boolean;
+  // 签到连签（checkin-activity-status.streak_days，区别于成长中心活跃连签）
+  checkin_streak?: number;
 }
 
 interface WbGrowthLine {
@@ -35,6 +39,7 @@ interface WbGrowthLine {
   tasks?: string;
   energy?: number;
   streak?: number;
+  checkin_streak?: number;
 }
 
 type ParsedEvent =
@@ -197,17 +202,24 @@ export default function BuddyCheckin() {
         // 能量/连签归一为标量（接口返回嵌套对象时防 [object Object] 展示）
         const energy = scalarNum(line.energy);
         const streak = scalarNum(line.streak);
+        const checkinStreak = scalarNum(line.checkin_streak);
         setGrowthLines((prev) => {
           const next = prev.slice();
-          next[line.index - 1] = { ...line, energy: energy ?? undefined, streak: streak ?? undefined };
+          next[line.index - 1] = {
+            ...line,
+            energy: energy ?? undefined,
+            streak: streak ?? undefined,
+            checkin_streak: checkinStreak ?? undefined,
+          };
           return next;
         });
       } else if ('index' in parsed && parsed.index != null) {
         const line = parsed as WbAccountLine;
         const reward = scalarNum(line.reward);
+        const checkinStreak = scalarNum(line.checkin_streak);
         setLines((prev) => {
           const next = prev.slice();
-          next[line.index - 1] = { ...line, reward: reward ?? undefined };
+          next[line.index - 1] = { ...line, reward: reward ?? undefined, checkin_streak: checkinStreak ?? undefined };
           return next;
         });
       } else if ('type' in parsed && parsed.type === 'exit') {
@@ -271,7 +283,11 @@ export default function BuddyCheckin() {
   };
 
   // 本轮累计获得积分（汇总徽标展示；防浮点求和误差）
-  const earned = Math.round(lines.reduce((s, l) => s + (l.reward ?? 0), 0) * 100) / 100;
+  // 待入账不计入今日已得（credit_delayed 的次日回填金额不在实时行 reward 中）：
+  // live 行只累加无 pending 标记的成功行（普通账号 reward 有值即计入，不受影响）
+  const earned = Math.round(
+    lines.reduce((s, l) => s + (l.reward != null && l.reward_pending !== true ? l.reward : 0), 0) * 100,
+  ) / 100;
 
   // 实时结果按 user_id 索引（运行中覆盖列表列展示）
   const liveById = new Map(lines.map((l) => [l.user_id, l] as const));
@@ -291,6 +307,12 @@ export default function BuddyCheckin() {
       return recs.some((r) => r.status === 'success') ? 'success' : 'already';
     }
     return recs.find((r) => r.status === 'fail') ? 'fail' : null; // 新→旧序，find 即最近一次失败
+  };
+  // 该账号今日是否有待入账（credit_delayed 次日到账）记录：live 行优先，否则查历史
+  const pendingOf = (uid: string): boolean => {
+    const live = liveById.get(uid);
+    if (live) return live.reward_pending === true;
+    return (checkinMap.get(uid) ?? []).some((r) => r.reward_pending === true);
   };
 
   return (
@@ -365,11 +387,15 @@ export default function BuddyCheckin() {
                 <div className="flex items-center gap-3">
                   <Badge tone={g.status === 'fail' ? 'red' : 'green'}>{g.status === 'fail' ? '失败' : '完成'}</Badge>
                   <span className="min-w-0 flex-1 truncate font-medium">{g.name || g.user_id}</span>
-                  {(g.energy != null || g.streak != null) && (
+                  {(g.energy != null || g.streak != null || g.checkin_streak != null) && (
                     <span className="text-xs text-violet-500">
                       {g.energy != null && `能量 ${g.energy}`}
-                      {g.energy != null && g.streak != null && ' · '}
-                      {g.streak != null && `连签 ${g.streak} 天`}
+                      {g.energy != null && (g.streak != null || g.checkin_streak != null) && ' · '}
+                      {/* 活跃连签（使用事件驱动，成长任务做完常为 0）与签到连签（日历事件
+                          驱动）分开标注，避免混淆（issue #180） */}
+                      {g.streak != null && `活跃连签 ${g.streak} 天`}
+                      {g.streak != null && g.checkin_streak != null && ' · '}
+                      {g.checkin_streak != null && `签到连签 ${g.checkin_streak} 天`}
                     </span>
                   )}
                 </div>
@@ -450,9 +476,16 @@ export default function BuddyCheckin() {
                           <Badge tone="red">失败</Badge>
                         )}
                       </td>
-                      <td className="px-3 py-1.5 text-right tabular-nums text-xs">
+                      <td className="px-3 py-1.5 text-right text-xs">
                         {earn != null ? (
-                          <span className="text-emerald-600 dark:text-emerald-400">+{earn}</span>
+                          <span className="tabular-nums text-emerald-600 dark:text-emerald-400">+{earn}</span>
+                        ) : pendingOf(a.id) ? (
+                          <span
+                            className="rounded bg-amber-50 px-1.5 py-0.5 text-amber-600 dark:bg-amber-500/10 dark:text-amber-300"
+                            title="今日奖励为积分延迟到账（credit_delayed），次日 00:00 后运行签到时按余额差值自动回填到账金额"
+                          >
+                            奖励待入账（T+1）
+                          </span>
                         ) : (
                           <span className="text-slate-300 dark:text-zinc-600">—</span>
                         )}
@@ -525,6 +558,19 @@ export default function BuddyCheckin() {
                   {l.reward != null && (
                     <span className="shrink-0 rounded bg-emerald-50 px-1.5 py-0.5 text-xs font-medium text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-300">
                       获取积分 +{l.reward}
+                    </span>
+                  )}
+                  {l.reward == null && l.reward_pending === true && (
+                    <span
+                      className="shrink-0 rounded bg-amber-50 px-1.5 py-0.5 text-xs font-medium text-amber-600 dark:bg-amber-500/10 dark:text-amber-300"
+                      title="本次奖励为积分延迟到账（credit_delayed），次日 00:00 后运行签到时按余额差值自动回填到账金额"
+                    >
+                      奖励待入账（T+1）
+                    </span>
+                  )}
+                  {l.checkin_streak != null && (
+                    <span className="shrink-0 rounded bg-violet-50 px-1.5 py-0.5 text-xs font-medium text-violet-600 dark:bg-violet-500/10 dark:text-violet-300">
+                      签到连签 {l.checkin_streak} 天
                     </span>
                   )}
                 </div>

@@ -20,15 +20,19 @@
 
   /* 全局最小逻辑宽度（issue #152）：高 DPI 缩放下 WebView 逻辑视口可能被压到
      1024px 以下导致布局挤压不可用。视口 ≥ 此值时自动铺满，< 此值时整体出横向
-     滚动条而非挤压。1920 CSS px ≈ 3840 物理像素（2x 缩放口径），调整只需改这一行。
+     滚动条而非挤压。调整只需改这一行。
+     issue #172：1920px 过大——1080p@125%（逻辑视口 1536px）等主流配置下最大化
+     必然横向溢出 384px，而底部 8px 半透明滚动条几乎不可见，用户误以为内容被
+     无故裁切。降至 1280px：125%/150% 缩放的 1080p、200% 的 2K/4K 均可铺满，
+     仅真正挤压场景（逻辑视口 < 1280px）才出横向滚动。
      M7 审查收口：仅对 ≥768px 的桌面视口生效——移动端/窄屏浏览器保持流式
-     100% 宽，避免「响应式布局退化为 1920px 横向拖拽」的可用性回归。 */
+     100% 宽，避免「响应式布局退化为 1280px 横向拖拽」的可用性回归。 */
   --app-min-width: 100%;
 }
 
 @media (min-width: 768px) {
   :root {
-    --app-min-width: 1920px;
+    --app-min-width: 1280px;
   }
 }
 
@@ -123,17 +127,19 @@ html.dark a:focus-visible {
   outline-color: rgba(212, 212, 216, 0.7);
 }
 
-/* 滚动条（简约风） */
+/* 滚动条（简约风）。issue #172：8px + 35% 透明度在深色主题下与背景对比度
+   过低（实测 thumb #353243 vs 背景 #150F25），贴底边的横向滚动条形同隐身，
+   用户误以为「没有滚动条」。加大到 10px 并提高不透明度保证可发现性。 */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(130, 130, 150, 0.35);
-  border-radius: 4px;
+  background: rgba(130, 130, 150, 0.5);
+  border-radius: 5px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(130, 130, 150, 0.55);
+  background: rgba(130, 130, 150, 0.7);
 }
 
 @layer components {
