@@ -112,8 +112,25 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
     }
     let result = match name {
         "doubao-quota" => doubao_quota::run_batch(state),
-        // 豆包每日签到（需求③：schtasks 直调 + 应用内调度器共用；空池跳过）
-        "doubao-checkin" => doubao_checkin::run_batch(state),
+        // 豆包每日签到（需求③：schtasks 直调 + 应用内调度器共用；空池跳过）。
+        // 轮次互斥（对齐 wb-checkin/wb-growth 分发处 skipped_busy 惯例）：锁名独立于
+        // run_batch 内部轮次锁（"doubao"/"checkin-round"）与按日落库锁
+        //（"doubao_checkin"/"record_today"），不同名互斥体互不阻塞、无自锁死
+        "doubao-checkin" => {
+            match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+                &state.data_dir,
+                "doubao_checkin_batch",
+                "round",
+                0,
+            ) {
+                (Some(_round), _) => doubao_checkin::run_batch(state),
+                (None, _) => Ok(serde_json::json!({
+                    "ok": true,
+                    "skipped": "其他进程正在执行签到，本轮跳过",
+                    "skipped_busy": true
+                })),
+            }
+        }
         // WorkBuddy 每日签到（schtasks 直调；--json-stream --skip-checked 同款参数）。
         // issue #134 方案4：抢完整轮次锁与 GUI 进程互斥——CLI 是独立进程，GUI 进程内
         // 的 tokio 轮次锁对它无效，必须靠跨进程命名互斥体；GUI 正在跑（UI/调度器/

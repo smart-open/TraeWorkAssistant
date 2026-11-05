@@ -961,7 +961,11 @@ fn try_capture_doubao_campaign(
                         crate::fs_utils::app_log(&ctx.data_dir, &line);
                     }
                     None => {
-                        let sid_prefix = sessionid.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("无");
+                        // 按字符截前 8 位：字节切片遇多字节 UTF-8 边界会 panic
+                        let sid_prefix = sessionid
+                            .as_deref()
+                            .map(|s| s.chars().take(8).collect::<String>())
+                            .unwrap_or_else(|| "无".to_string());
                         let line = format!(
                             "[doubao-campaign] 客户端签到成功但未匹配到池内账号（multi_sids uid={uid_detected:?} sid前8={sid_prefix}），跳过落库",
                         );

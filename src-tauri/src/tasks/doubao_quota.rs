@@ -504,9 +504,32 @@ pub fn summarize_parsed(parsed: &Value) -> Option<String> {
     }
 }
 
+/// 成功（ok:true）quota 历史事件的内存去重集：(uid, 当日日期)。
+/// 仅内存态：进程重启后至多当日重复一条，可接受。
+static QUOTA_OK_SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, String)>>> =
+    std::sync::Mutex::new(None);
+
+/// 成功（ok:true）事件节流判定：每账号每日只记首条。doubao-sync 默认每 2h 全量
+/// 巡检逐账号 append_history，HISTORY_MAX=400 滚动窗会被高频成功事件挤爆（失败
+/// 事件被顶掉难排查）；失败事件不节流始终记录。日期滚动时清理过期条目防集合无界增长。
+fn quota_ok_should_record(uid: &str) -> bool {
+    let today = crate::doubao_checkin_results::today_key();
+    let mut seen = QUOTA_OK_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = seen.get_or_insert_with(Default::default);
+    set.retain(|(_, d)| d == &today);
+    set.insert((uid.to_string(), today))
+}
+
 /// 追加滚动运维历史（SQLite 化 P3：doubao_health_events 表，HISTORY_MAX 上限裁剪）。
 /// 与 commands/doubao.rs append_history_event 同构（CLI 独立进程路径）。
 fn append_history(state: &AppState, event: Value) {
+    // 成功（ok:true）事件每账号每日只记首条（节流原因见 quota_ok_should_record）；
+    // 失败事件（ok:false）始终记录
+    if event.get("ok").and_then(Value::as_bool) == Some(true)
+        && !quota_ok_should_record(event.get("uid").and_then(Value::as_str).unwrap_or(""))
+    {
+        return;
+    }
     let store = crate::store::db(&state.data_dir);
     let mut events = crate::store::docs::doubao_health_load(&store);
     events.push(event);

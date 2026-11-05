@@ -498,10 +498,21 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
             serde_json::to_value(crate::commands::doubao::load_pool(state)).unwrap_or(json!({}));
         let merged = merge_checkin_updates_into_pool(&mut latest, &updates);
         if merged > 0 {
-            if let Ok(file) =
-                serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(latest)
-            {
-                let _ = crate::commands::doubao::save_pool(state, &file);
+            // 回写失败不吞（收尾尽力而为，错误不上抛、不改变签名语义）：解析失败说明
+            // 池结构异常、保存失败说明落库故障，均落 app_log 便于排查（静默丢弃难定位）
+            match serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(latest) {
+                Ok(file) => {
+                    if let Err(e) = crate::commands::doubao::save_pool(state, &file) {
+                        fs_utils::app_log(
+                            &state.data_dir,
+                            &format!("[doubao-checkin] 池回写保存失败: {e}"),
+                        );
+                    }
+                }
+                Err(e) => fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("[doubao-checkin] 池回写解析失败（本次签到字段回写丢弃）: {e}"),
+                ),
             }
         }
     }
@@ -585,6 +596,31 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
             })
         })
         .collect();
+
+    // 存在失败账号时返 Err（对齐 qoder-checkin / buddy-ai-checkin 分发处惯例）：
+    // CLI `--task-run` 退出码 1 可见 + 调度器走 mark_fail 当日冷却重试（返 Ok 会
+    // mark_run 固化「当日已跑」关闭重试链）；落库/池回写/运维历史已在 persist_outcomes
+    // 完成，Err 仅改变汇总出口。GUI「立即签到全部」经此路径收到 Err 时 toast 展示
+    // 失败汇总，无数据副作用
+    if failed > 0 {
+        let err_head = errors
+            .iter()
+            .take(3)
+            .filter_map(|e| {
+                e.get("error").and_then(Value::as_str).map(|m| {
+                    format!(
+                        "{}：{}",
+                        e.get("name").and_then(Value::as_str).unwrap_or("未知账号"),
+                        m
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!(
+            "豆包签到：{success} 成功 / {already} 已领 / {failed} 失败：{err_head}"
+        ));
+    }
 
     Ok(json!({
         "ok": true, "mode": "all",

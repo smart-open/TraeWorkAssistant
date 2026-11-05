@@ -112,25 +112,37 @@ pub fn record_today(
     entries: impl IntoIterator<Item = (String, String, String, Option<i64>)>,
 ) {
     let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
-        data_dir,
-        "doubao_checkin",
-        "record_today",
-        3_000,
-    ) {
-        (Some(g), _) => Some(g),
-        (None, Some(fail)) => {
-            crate::fs_utils::app_log(
-                data_dir,
-                &format!(
-                    "[doubao_checkin_results] record_today 跨进程锁未获取：{}（降级进程内锁继续）",
-                    fail.describe()
-                ),
-            );
-            None
+    // 跨进程锁重试（共 3 次尝试，3s→4s→4s 累计约 10s）：GUI+CLI 双进程同刻落库时，
+    // 单次 3s 超时即降级会让后到进程整表 load→record→save 覆盖先到方当日记录
+    //（丢行竞态）；全部尝试失败才降级进程内锁继续写（保留降级日志）
+    let mut cross = None;
+    let wait_plan = [3_000u32, 4_000, 4_000];
+    for (i, &wait_ms) in wait_plan.iter().enumerate() {
+        match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+            data_dir,
+            "doubao_checkin",
+            "record_today",
+            wait_ms,
+        ) {
+            (Some(g), _) => {
+                cross = Some(g);
+                break;
+            }
+            (None, Some(fail)) => {
+                if i + 1 == wait_plan.len() {
+                    crate::fs_utils::app_log(
+                        data_dir,
+                        &format!(
+                            "[doubao_checkin_results] record_today 跨进程锁未获取：{}（降级进程内锁继续）",
+                            fail.describe()
+                        ),
+                    );
+                }
+            }
+            (None, None) => break,
         }
-        (None, None) => None,
-    };
+    }
+    let _cross = cross;
     let mut f = load(data_dir);
     f.record_day(&today_key(), entries);
     save(data_dir, &f);
