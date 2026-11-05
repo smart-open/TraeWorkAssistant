@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { extractFingerprintFrom, neutralRewrite, parseSampleSystem } from './fingerprintSamples';
+import {
+  extractFingerprintFrom,
+  isSampleTruncated,
+  neutralRewrite,
+  parseSampleSystem,
+} from './fingerprintSamples';
 
 describe('parseSampleSystem', () => {
   it('标准样本（带 tools 尾巴）提取 system 文本', () => {
@@ -21,6 +26,28 @@ describe('parseSampleSystem', () => {
 
   it('body 解析失败等非标准样本返回 null', () => {
     expect(parseSampleSystem('body 解析失败')).toBeNull();
+  });
+
+  it('后端截断标记「…」不进入 from（否则逐字匹配必然落空）', () => {
+    const sample = 'system="You are an AI agent that helps the user with programming work. The Team…"';
+    expect(parseSampleSystem(sample)).toBe(
+      'You are an AI agent that helps the user with programming work. The Team',
+    );
+    expect(parseSampleSystem(sample)).not.toContain('…');
+  });
+});
+
+describe('isSampleTruncated', () => {
+  it('尾部省略号 = 截断样本', () => {
+    expect(isSampleTruncated('system="abc def The Team…"')).toBe(true);
+  });
+
+  it('无省略号 = 未截断', () => {
+    expect(isSampleTruncated('system="abc def." tools=[x]')).toBe(false);
+  });
+
+  it('空 system 不算截断', () => {
+    expect(isSampleTruncated('system=""')).toBe(false);
   });
 });
 
@@ -61,6 +88,19 @@ describe('extractFingerprintFrom', () => {
     expect(neutralRewrite('You are an AI agent, e.g. a coding assistant powered by DeepSeek Harness.')).toBe(
       'You are an AI agent, e.g. a coding assistant.',
     );
+  });
+
+  it('截断样本但首句完整 → 仍取首句（真实样本形态，可用规则）', () => {
+    // 后端 300 字符截断落在第二句之后：首句有完整 ". " 句界，规则可逐字命中
+    expect(
+      extractFingerprintFrom(
+        'system="You are an AI agent that helps the user with programming work. Agent Teams is…"',
+      ),
+    ).toBe('You are an AI agent that helps the user with programming work.');
+  });
+
+  it('截断样本且连一个完整句都没有 → null', () => {
+    expect(extractFingerprintFrom('system="No sentence boundary here at all just words…"')).toBeNull();
   });
 });
 

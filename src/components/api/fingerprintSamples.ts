@@ -15,10 +15,20 @@
  *   语义去掉 harness 声明）；未命中回退空串（= 剥离，兜底最稳）。
  */
 
-/** 从样本行提取 system 文本；非标准样本（如 "body 解析失败"）返回 null */
+/** 从样本行提取 system 文本；非标准样本（如 "body 解析失败"）返回 null。
+ * 后端在原文超 300 字符时于引号内补 "…" 截断标记——去除该标记，避免把省略号
+ * 混进 from（sanitizer 是逐字 contains 匹配，带省略号的 from 必然落空） */
 export function parseSampleSystem(sample: string): string | null {
   const m = sample.match(/^system="([\s\S]*?)"/);
-  return m ? m[1] : null;
+  if (!m) return null;
+  return m[1].replace(/…$/, '');
+}
+
+/** 样本 system 文本是否被后端截断（尾部省略号标记）：截断样本的首句可能不完整，
+ * 生成规则前需提示用户校对 */
+export function isSampleTruncated(sample: string): boolean {
+  const m = sample.match(/^system="([\s\S]*?)"/);
+  return !!m && m[1].endsWith('…');
 }
 
 /** 中性改写策略表（一键生成 to 值）：由 neutralRewrite 按序全量应用（命中即改写，组合句式逐条清洗） */
@@ -49,14 +59,21 @@ function isAbbrevDot(text: string, dotIdx: number): boolean {
 }
 
 /** 预填 from：取 system 文本首句（首个非缩写 ". " 收尾，含句号）；无句界/
- * 不可解析时回退全文或 null（调用方对 null/空串禁用「生成规则」） */
+ * 不可解析时回退全文或 null（调用方对 null/空串禁用「生成规则」）。
+ *
+ * 截断样本（后端 300 字符截断）若在截断范围内找不到完整句界，回退全文即残句，
+ * 逐字匹配必然落空 → 返回 null，由调用方提示重新触发或手工填写，不静默给出
+ * 一条注定不命中的规则 */
 export function extractFingerprintFrom(sample: string): string | null {
   const text = parseSampleSystem(sample);
   if (text == null) return null;
   let from = 0;
   for (;;) {
     const idx = text.indexOf('. ', from);
-    if (idx < 0) return text;
+    if (idx < 0) {
+      // 无完整句界：截断样本即为残句，不给规则；未截断则全文本身就是完整单句
+      return isSampleTruncated(sample) ? null : text;
+    }
     if (!isAbbrevDot(text, idx)) return text.slice(0, idx + 1);
     from = idx + 1;
   }
