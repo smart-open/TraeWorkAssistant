@@ -217,6 +217,11 @@ pub struct Settings {
     /// 豆包每日签到调度触发时刻 HH:MM（默认 09:15，错峰 quota 09:30；环境配置页可改）
     #[serde(default = "default_doubao_checkin_hhmm")]
     pub doubao_checkin_hhmm: String,
+    /// 豆包 probe 自动保活（2026-11-06 方案 A，默认开）：签到时 probe 缺失/过期 →
+    /// 自动「启动代理 → 以账号打开豆包注入代理 → 等客户端首页 campaign 请求抓包
+    /// 入库 → 继续签到」，无需手动开代理+客户端签到对齐。710010702 设备指纹缺失的自愈链
+    #[serde(default = "default_true")]
+    pub doubao_probe_auto_keepalive: bool,
     /// Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；
     /// Windows 计划任务注册时间复用该值）
     #[serde(default = "default_trae_checkin_hhmm")]

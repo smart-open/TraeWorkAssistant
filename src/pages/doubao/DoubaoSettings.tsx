@@ -56,6 +56,7 @@ export default function DoubaoSettings() {
   const [syncHhmm, setSyncHhmm] = useState('23:50');
   const [checkinRunning, setCheckinRunning] = useState(false);
   const [checkinEnabled, setCheckinEnabled] = useState(true);
+  const [probeAutoKeepalive, setProbeAutoKeepalive] = useState(true);
 
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
@@ -114,6 +115,24 @@ export default function DoubaoSettings() {
       );
     } catch (err) {
       setCheckinEnabled(!v);
+      pushToast('error', `保存设置失败：${String(err)}`);
+    }
+  };
+
+  // probe 自动保活开关（方案 A，2026-11-06，默认开）：签到前 probe 缺失/过期时自动
+  // 开代理 + 切客户端抓包对齐（710010702 设备指纹缺失的自愈链）
+  const toggleProbeAutoKeepalive = async (v: boolean) => {
+    setProbeAutoKeepalive(v);
+    try {
+      await saveSettings({ doubao_probe_auto_keepalive: v });
+      pushToast(
+        'success',
+        v
+          ? '已开启：签到前自动抓包对齐（代理未运行会自动启动；豆包客户端会被短暂切换账号）'
+          : '已关闭：probe 缺失/过期时签到将回退内置参数（可能被上游风控拒绝 710010702）',
+      );
+    } catch (err) {
+      setProbeAutoKeepalive(!v);
       pushToast('error', `保存设置失败：${String(err)}`);
     }
   };
@@ -230,6 +249,7 @@ export default function DoubaoSettings() {
       setKeepaliveEnabled(settings.doubao_keepalive_enabled !== false);
       setQuotaEnabled(settings.doubao_quota_enabled !== false);
       setCheckinEnabled(settings.doubao_checkin_enabled !== false);
+      setProbeAutoKeepalive(settings.doubao_probe_auto_keepalive !== false);
       if (settings.doubao_sync_mode) setSyncMode(settings.doubao_sync_mode);
       if (settings.doubao_sync_hours) setSyncHours(settings.doubao_sync_hours);
       if (settings.doubao_sync_hhmm) setSyncHhmm(settings.doubao_sync_hhmm);
@@ -239,7 +259,7 @@ export default function DoubaoSettings() {
     void refreshQuotaTaskStatus();
     void refreshCheckinTaskStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_probe_auto_keepalive]);
 
   const detect = async () => {
     setDetecting(true);
@@ -750,6 +770,26 @@ export default function DoubaoSettings() {
                 <span className="mt-0.5 block leading-relaxed">
                   关闭后应用内调度器不再执行每日自动签到；与上方「每日任务」（Windows 计划任务）相互独立。
                   无豆包账号时自动跳过，不记失败、不推送通知。
+                </span>
+              </span>
+            </label>
+
+            {/* probe 自动保活开关（方案 A） */}
+            <label className="flex cursor-pointer items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={probeAutoKeepalive}
+                onChange={(e) => void toggleProbeAutoKeepalive(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-rose-500"
+              />
+              <span>
+                <span className="font-medium text-slate-600 dark:text-zinc-200">
+                  签到前自动抓包对齐（probe 自动保活）
+                </span>
+                <span className="mt-0.5 block leading-relaxed">
+                  开启后：签到时若抓包参数缺失/过期，自动启动代理（未运行时）→ 以账号打开豆包注入代理 →
+                  等客户端自动抓包入库（每账号约 30-60 秒）→ 继续签到。注意：豆包客户端会被短暂切换账号，
+                  结束停留在最后处理的账号；代理由保活启动的会在结束后自动停止还原。
                 </span>
               </span>
             </label>

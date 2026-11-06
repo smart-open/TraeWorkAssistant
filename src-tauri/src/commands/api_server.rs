@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use tauri::{Manager, State};
@@ -10,7 +11,7 @@ use crate::models::{
 use crate::state::AppState;
 
 use crate::api_server::models_sync;
-use crate::api_server::pool::ApiPool;
+use crate::api_server::pool::{ApiPool, PoolStrategy};
 use crate::api_server::server::{start_api_server, ApiServerHandle};
 use crate::api_server::{ApiLogger, ApiSharedState};
 
@@ -605,7 +606,220 @@ pub async fn do_start(
     };
     crate::notify::notify(app, "API 网关已启动", &notify_body);
 
+    // 启动一致性巡检线程（PR #187 移植）：兜底捕获「直接改库绕过热重载」的场景
+    spawn_pool_reconciler(app.clone(), state.data_dir.clone());
+
     Ok(status)
+}
+
+// ==================== 池配置一致性巡检（PR #187 移植） ====================
+
+/// WB 池配置指纹（api_server.rs 侧，PR #187）：与运行池 entries 同构——
+/// 仅统计「白名单命中 && token 非空」的账号（sync_from_wb 同门槛），
+/// 条目态 = needs_relogin 取反；指纹含有效策略，**不含积分/时间戳**
+///（余额波动不应触发整池重载）。运行侧 ApiPool::config_fingerprint 同口径
+fn wb_pool_fingerprint(
+    wb_accounts: &[crate::api_server::pool::WbSyncAccount],
+    enabled_uids: &HashSet<String>,
+    strategy: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut enabled: Vec<(&str, u8)> = wb_accounts
+        .iter()
+        .filter(|a| enabled_uids.contains(&a.uid) && !a.token.is_empty())
+        .map(|a| {
+            let en = if a.needs_relogin { 0u8 } else { 1u8 };
+            (a.uid.as_str(), en)
+        })
+        .collect();
+    enabled.sort_unstable();
+    let mut h = Sha256::new();
+    for (uid, en) in &enabled {
+        h.update(uid.as_bytes());
+        h.update([*en]);
+    }
+    h.update(strategy.as_bytes());
+    let digest = h.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// WB 池一致性巡检线程（PR #187）：每 60s 对比「DB 侧装配指纹 ↔ 运行池指纹」，
+/// 不一致则整池热重载（apply_pool_snapshot 全量重建，与 reload_pools_if_running
+/// 同路径）。
+///
+/// 兜底场景：扫码入池 / 导入 / token 失效标记等未触发 reload_pools_if_running
+/// 的写库路径——网关内存快照滞后于 DB（新账号零请求、失效账号仍被派单）。
+///
+/// 服务停止检测：runtime state 由 AppHandle.try_state 每 tick 重新获取
+///（线程持 AppHandle 即可随取，规避 &Mutex 的 'static 生命周期问题）；
+/// state 不存在（服务停止/退出）→ 线程自退并释放闸门，下次 do_start 重新拉起。
+/// 并发 do_start 场景靠原子闸门只保留一份巡检线程
+fn spawn_pool_reconciler(app: tauri::AppHandle, data_dir: std::path::PathBuf) {
+    const RECONCILE_INTERVAL_SECS: u64 = 60;
+    // 热重载未收敛退避 tick 数（审查修复）：重载后指纹仍未复现一致时跳过
+    // 若干轮再重试，防口径漂移场景下每 60s 无限全量重建
+    const RELOAD_BACKOFF_TICKS: u32 = 2;
+    // 退避计数器：Cell 随 move 闭包进入巡检线程，tick 间持久
+    let reload_backoff = std::cell::Cell::new(0u32);
+    // runtime 连续为 None 的 tick 计数（审查 F-1）：达到阈值视为服务停止自退
+    let absent_ticks = std::cell::Cell::new(0u32);
+    const RECONCILER_EXIT_TICKS: u32 = 2;
+    // 原子闸门：并发 do_start 场景只保留一份巡检线程
+    static RECONCILER_RUNNING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if RECONCILER_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let spawn_result = std::thread::Builder::new()
+        .name("wb-pool-reconciler".to_string())
+        .spawn(move || {
+            // panic 安全网：巡检循环内任何 panic（如 DB 读盘异常）会杀死线程，
+            // 若闸门不释放，后续 do_start 将永久无法重拉巡检（直到应用重启）。
+            // catch_unwind 兜底释放闸门； unwind 时持有中的锁 guard 随栈释放，
+            // safe_lock 防毒化恢复，不会留下死锁
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS));
+            let Some(runtime_state) = app.try_state::<Mutex<Option<ApiServerRuntime>>>() else {
+                // App 级退出（state 整体卸载，正常运行不会发生）：释放闸门并退出
+                RECONCILER_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            };
+            // 服务停止检测（审查 F-1 修复）：try_state 恒返回 Some（state 全程
+            // manage、从不 unmanage），上述分支不可达；真正的停止信号是 runtime
+            // 内容为 None（do_stop take() 清空）。先查 runtime 再做 DB 指纹计算，
+            // 避免停止后每 60s 仍全量读 DB；连续 N tick 为 None 才自退——
+            // do_start 装配窗口的短暂 None 不误退（60s 间隔下 N=2 ≈ 2 分钟）
+            if safe_lock(&runtime_state).is_none() {
+                absent_ticks.set(absent_ticks.get() + 1);
+                if absent_ticks.get() >= RECONCILER_EXIT_TICKS {
+                    RECONCILER_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                continue;
+            }
+            absent_ticks.set(0);
+            let state = app.state::<AppState>();
+            // ── DB 侧指纹：复刻 apply_pool_snapshot 的 WB 池装配口径 ──
+            //（分组筛选 ∩ 标签筛选 → effective_wb_uids 白名单）
+            let fingerprint_pair: Option<(String, String)> = (|| {
+                let pool_file = load_pool_file(&state.data_dir);
+                if !pool_file.wb_enabled {
+                    // WB 池未启用：跳过巡检（池仍可能保留旧账号，但路由层不派单）
+                    return None;
+                }
+                let wb_accounts_all = crate::commands::workbuddy::wb_upstream_accounts(&state);
+                let wb_group_filter: Option<std::collections::HashSet<&str>> =
+                    if pool_file.wb_group_ids.is_empty() {
+                        None
+                    } else {
+                        Some(pool_file.wb_group_ids.iter().map(|s| s.as_str()).collect())
+                    };
+                let tag_map =
+                    crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
+                let wb_tag_filter =
+                    crate::api_server::org_index::tag_uid_set(&pool_file.wb_tag_ids, &tag_map);
+                let wb_accounts: Vec<crate::api_server::pool::WbSyncAccount> =
+                    match (&wb_group_filter, &wb_tag_filter) {
+                        (Some(f), Some(t)) => wb_accounts_all
+                            .into_iter()
+                            .filter(|a| f.contains(a.group_id.as_str()) && t.contains(&a.uid))
+                            .collect(),
+                        (Some(f), None) => wb_accounts_all
+                            .into_iter()
+                            .filter(|a| f.contains(a.group_id.as_str()))
+                            .collect(),
+                        (None, Some(t)) => wb_accounts_all
+                            .into_iter()
+                            .filter(|a| t.contains(&a.uid))
+                            .collect(),
+                        (None, None) => wb_accounts_all,
+                    };
+                let wb_uids: HashSet<String> =
+                    effective_wb_uids(&pool_file, &wb_accounts).into_iter().collect();
+                let expected = wb_pool_fingerprint(
+                    &wb_accounts,
+                    &wb_uids,
+                    &PoolStrategy::resolve_wb(
+                        &pool_file.strategy,
+                        &pool_file.wb_strategy,
+                    )
+                    .as_str(),
+                );
+                let guard = safe_lock(&runtime_state);
+                let Some(rt) = guard.as_ref() else {
+                    return None; // 与停止竞态：本轮跳过
+                };
+                Some((expected, rt.shared.wb_pool.config_fingerprint()))
+            })();
+            let Some((expected, actual)) = fingerprint_pair else {
+                continue; // wb_enabled=false / 与停止竞态：本轮跳过
+            };
+            if expected == actual {
+                continue; // 一致：无事可做（绝大多数 tick 命中此分支）
+            }
+            // 退避中：跳过本轮重载（防口径漂移导致无限重载），计数递减
+            if reload_backoff.get() > 0 {
+                reload_backoff.set(reload_backoff.get() - 1);
+                continue;
+            }
+            fs_utils::app_log(
+                &data_dir,
+                &format!("池一致性巡检: WB 池指纹不一致（DB={expected} 运行={actual}）→ 触发热重载"),
+            );
+            // ── 热重载：全量重建三池（与 reload_pools_if_running 同路径）──
+            // POOL_CFG_LOCK guard 必须存活到装配完成（整文档读互斥纪律）
+            let cfg_guard = POOL_CFG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = safe_lock(&runtime_state);
+            let reload_result = match guard.as_ref() {
+                Some(rt) => Ok(apply_pool_snapshot(
+                    &state,
+                    &rt.shared.pool,
+                    &rt.shared.wb_pool,
+                    &rt.shared.qoder_pool,
+                    &rt.shared.buddy_ai_pool,
+                )),
+                None => Err("网关已停止".to_string()),
+            };
+            drop(guard);
+            drop(cfg_guard);
+            match reload_result {
+                Ok((_, wb_n, wb_total, _)) => {
+                    fs_utils::app_log(
+                        &data_dir,
+                        &format!("池一致性巡检: WB 池热重载完成（入池 {wb_n} / 上游 {wb_total} 个账号）"),
+                    );
+                    // 收敛复验（审查修复）：重载后重算运行池指纹比对 DB 侧口径，
+                    // 未收敛视为疑似口径漂移 → 进入退避，下轮重试
+                    let converged = {
+                        let guard = safe_lock(&runtime_state);
+                        guard
+                            .as_ref()
+                            .map(|rt| rt.shared.wb_pool.config_fingerprint() == expected)
+                            .unwrap_or(false)
+                    };
+                    if converged {
+                        reload_backoff.set(0);
+                    } else {
+                        reload_backoff.set(RELOAD_BACKOFF_TICKS);
+                        fs_utils::app_log(
+                            &data_dir,
+                            "池一致性巡检: 热重载后指纹仍未收敛（疑似口径漂移），进入退避、下轮重试",
+                        );
+                    }
+                }
+                Err(e) => fs_utils::app_log(
+                    &data_dir,
+                    &format!("池一致性巡检: 热重载失败(下轮重试) {e}"),
+                ),
+            }
+            }));
+            // 正常自退（含内层 return）与 panic 两条路径统一在此释放闸门
+            RECONCILER_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    if spawn_result.is_err() {
+        // 线程拉起失败：释放闸门，保证下次 do_start 能重试
+        RECONCILER_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[tauri::command]

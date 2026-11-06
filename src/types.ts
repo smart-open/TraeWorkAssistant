@@ -393,6 +393,8 @@ export interface Settings {
   doubao_checkin_enabled: boolean;
   /** 豆包每日签到时刻 HH:MM（默认 09:15，任务配置页可改） */
   doubao_checkin_hhmm: string;
+  /** 豆包 probe 自动保活（方案 A，默认开）：签到前 probe 缺失/过期时自动开代理+切客户端抓包对齐 */
+  doubao_probe_auto_keepalive: boolean;
   /** 豆包数据同步模式：off/hourly/every_hours/every_days/daily（默认 every_hours） */
   doubao_sync_mode: string;
   /** 豆包数据同步 every_hours 间隔小时数（1-24，默认 2） */
@@ -808,7 +810,7 @@ export interface ApiPoolFile {
   enabled_uids: string[];
   /** 调度策略：expire_first（默认）/ credit_first / random（T10） */
   strategy?: string;
-  /** Buddy 池调度策略（取值同 strategy）；空 = 跟随 Trae 池（两池同策略） */
+  /** Buddy 池调度策略（取值同 strategy）；空 = 加权公平轮转（fair_rotation，WB 专属默认，PR #187） */
   wb_strategy?: string;
   /** 参与调度的分组 id 列表；空 = 不限分组（T10） */
   group_ids?: string[];
@@ -1931,6 +1933,9 @@ export interface QoderCheckinDone {
   failed: number;
   /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
   empty: number;
+  /** failed 中「风控信任未建立（BLOCKED）」数：恢复需用户操作（切换账号+客户端建信任），
+   * 自动重试无效（issue #190，口径对齐 Rust 侧） */
+  blocked: number;
 }
 
 export interface QoderCreditPackage {

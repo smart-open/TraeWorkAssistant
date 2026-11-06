@@ -1,7 +1,10 @@
 /**
  * 资源总览（ResourceSummary）多池摘要指标的纯计算，抽出以便单测。
  * 池内成员口径（与后端 apply_pool_snapshot 装配语义一致）：
- * - Trae：enabled_uids（按 AccountView.user_id 匹配）；
+ * - Trae：enabled_uids（按 AccountView.user_id 匹配）∩ 分组筛选（group_ids）
+ *   ∩ 标签筛选（trae_tag_ids）——对齐后端 apply_pool_snapshot 装配语义
+ *   （先按 trae_tag_ids 过滤再 sync_from_accounts 做 enabled_uids ∩ group_ids
+ *   交集；分组筛选激活时未分组账号不入池）；
  * - Buddy：分组筛选（wb_group_ids）∩ 标签筛选（wb_tag_ids）→ 白名单
  *   （wb_enabled_uids 非空按名单取，空/缺失 = fail-open 全部含凭证账号入池）；
  * - Qoder：分组筛选（qoder_group_ids）∩ 标签筛选（qoder_tag_ids）→ 白名单
@@ -23,7 +26,7 @@ import type {
 } from '../../types';
 
 export interface PoolMetrics {
-  /** Trae 池内账号数（enabled_uids） */
+  /** Trae 池内账号数（enabled_uids ∩ 分组 ∩ 标签，对齐后端装配语义） */
   traePoolCount: number;
   /** Trae 池内账号通用积分之和 */
   traePoolCredits: number;
@@ -99,8 +102,17 @@ export function computePoolMetrics(
   buddyAiAccounts: BuddyAiAccountView[] = [],
   tags: TagView[] = [],
 ): PoolMetrics {
+  // Trae 池内口径：enabled_uids ∩ 分组（group_ids）∩ 标签（trae_tag_ids）。
+  // 此前仅按 enabled_uids 过滤，被分组/标签拦截的账号被计入池内，使
+  // ResourceSummary「未入池账号」差额漏报（审查修复，issue #186 排障目标）。
+  // group_id null（未分组）按空串比对：分组筛选激活时未分组账号不入池，
+  // 与后端 membership.get(uid).map_or(false, ...) 语义一致
   const traePoolUids = pool?.enabled_uids ?? [];
-  const traePoolAccounts = accounts.filter((a) => traePoolUids.includes(a.user_id));
+  const traeGroupIds = pool?.group_ids ?? [];
+  const traeTagSet = tagUidUnion(pool?.trae_tag_ids ?? [], tags);
+  const traePoolAccounts = accounts
+    .filter((a) => traePoolUids.includes(a.user_id))
+    .filter((a) => inOrgScope(a.group_id ?? '', traeGroupIds, a.user_id, traeTagSet));
 
   // Buddy 池内口径：分组 ∩ 标签过滤后，白名单非空按名单取（fail-open 冻结语义：
   // 显式名单优先；空/缺失 = 过滤后全集自动入池）

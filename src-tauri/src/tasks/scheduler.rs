@@ -758,7 +758,13 @@ fn run_task(
                 .get("failed_permanent")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty - failed_permanent > 0 {
+            // 风控信任未建立（issue #190）：BLOCKED 恢复需用户操作（切换账号 +
+            // 客户端建信任），自动重试注定失败且徒增风控暴露——一并剔除
+            let failed_blocked = done
+                .get("failed_blocked")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 return Err(format!(
@@ -860,7 +866,7 @@ fn run_task(
         // 页面读本地池，远端刷新收敛到本任务（2026-10-28 性能专项）
         "doubao-sync" => super::doubao_quota::run_batch(st),
         // 豆包每日签到：与 `--task-run doubao-checkin` 同款（空池跳过不计失败）
-        "doubao-checkin" => super::doubao_checkin::run_batch(st),
+        "doubao-checkin" => super::doubao_checkin::run_batch(st, app),
         // WorkBuddy 积分与 Token 数据同步（看板定时同步）：积分 fresh 拉取+池回写+快照为主目标
         // （空池自然空转不报错）；顺带 Token 统计重扫（本地增量缓存）与官方请求用量刷新——
         // 统计尽力而为不上抛（页面打开时本就有各自缓存/降级链路）；用量刷全账号聚合缓存

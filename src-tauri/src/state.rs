@@ -282,7 +282,7 @@ impl AppState {
         // 「从未配置」判定含损坏 kv（审查 Low）：值存在但解析失败时 kv_get 已
         // 回退默认（豆包双开关落 false），仅按键存在性放行会把损坏行误当
         // 「已配置」漏回填——值不可解析同样视为从未配置
-        if !s.doubao_keepalive_enabled || !s.doubao_quota_enabled {
+        if !s.doubao_keepalive_enabled || !s.doubao_quota_enabled || !s.doubao_probe_auto_keepalive {
             let never_configured =
                 match crate::store::db(&self.data_dir).kv_get_raw("app_settings") {
                     None => true,
@@ -291,6 +291,7 @@ impl AppState {
             if never_configured {
                 s.doubao_keepalive_enabled = true;
                 s.doubao_quota_enabled = true;
+                s.doubao_probe_auto_keepalive = true;
             }
         }
         // Trae JWT 续期调度（issue #27）：kv 完全缺失走 Settings::default()（bool=false/

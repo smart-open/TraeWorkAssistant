@@ -16,6 +16,7 @@
 
 pub mod doubao_chats;
 pub mod doubao_checkin;
+pub mod doubao_probe;
 pub mod doubao_quota;
 pub mod doubao_session;
 pub mod qoder_catalog;
@@ -123,7 +124,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 "round",
                 0,
             ) {
-                (Some(_round), _) => doubao_checkin::run_batch(state),
+                (Some(_round), _) => doubao_checkin::run_batch(state, None),
                 (None, _) => Ok(serde_json::json!({
                     "ok": true,
                     "skipped": "其他进程正在执行签到，本轮跳过",
@@ -183,7 +184,13 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 .get("failed_permanent")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty - failed_permanent > 0 {
+            // 风控信任未建立（issue #190）与调度器口径对齐：BLOCKED 恢复需用户
+            // 操作（切换账号 + 客户端建信任），计入 Err 只会造成次日误报
+            let failed_blocked = done
+                .get("failed_blocked")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 Err(format!(

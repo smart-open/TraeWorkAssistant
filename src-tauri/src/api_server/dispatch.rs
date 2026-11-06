@@ -220,7 +220,8 @@ pub fn save_policy(data_dir: &Path, policy: &DispatchPolicy) -> Result<(), Strin
 // ==================== 选池决策（§4.3/§4.4） ====================
 
 /// 调度错误（错误矩阵 §4.3，由端点按客户端协议映射响应格式）
-#[derive(Debug, Clone, Copy, PartialEq)]
+// Copy 随 issue #186 候选链摘要取消：NoHealthy 携带 String 后不可 Copy
+#[derive(Debug, Clone, PartialEq)]
 pub enum DispatchError {
     /// 仅 Buddy 源模型且 wb_enabled=false（保持现有 wb_upstream_disabled 语义）
     WbDisabled,
@@ -235,8 +236,11 @@ pub enum DispatchError {
     /// 响应层硬编码 "buddy"，buddy-ai/qoder 的模型级 429 在用量看板与
     /// app_log 中归因失真
     ModelCooling(i64, TargetPool),
-    /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却
-    NoHealthy(TargetPool),
+    /// 首选（唯一可用）池耗尽：无健康账号 / 全冷却。
+    /// .1 = 候选链摘要（issue #186：逐池失败原因，形如
+    /// `buddy=no_healthy_account,trae=no_healthy_account`，仅 resolve_target
+    /// 主循环两条耗尽路径携带；测试直调等无候选序上下文的构造点传 None）
+    NoHealthy(TargetPool, Option<String>),
 }
 
 /// 选池结果
@@ -340,6 +344,21 @@ impl ModelSources {
             n += 1;
         }
         n
+    }
+
+    /// 源存在性（忽略开关状态）：unavailable 归因细分用——
+    /// has_source 但 !available = 上游开关未启用（switch_off）；
+    /// !has_source = 该池无此模型源（no_source）
+    fn has_source(&self, pool: TargetPool) -> bool {
+        match pool {
+            TargetPool::Trae => self.trae,
+            TargetPool::Buddy => self.buddy.is_some() && !self.buddy_intl_only,
+            TargetPool::BuddyAi => {
+                self.buddy.is_some() && (self.buddy_intl_only || self.buddy_in_both)
+            }
+            TargetPool::Qoder => self.qoder.is_some(),
+            TargetPool::Custom => !self.custom.is_empty(),
+        }
     }
 
     /// 源是否可用（trae/buddy/qoder/custom 各感知自己的池状态；custom = 组非空）
@@ -789,7 +808,11 @@ pub fn resolve_target(
     let mut pool_reasons: Vec<String> = Vec::new();
     for (i, pool) in order.iter().copied().enumerate() {
         if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) {
-            pool_reasons.push(format!("{}=unavailable", pool.as_str()));
+            // 审查 F-3 修复：原 unavailable 二义（「上游开关未启用」与「该池无此
+            // 模型源」混用），用户无从判断该开开关还是换模型——细分为
+            // switch_off（源存在，去开开关）/ no_source（该池目录不含此模型）
+            let kind = if sources.has_source(pool) { "switch_off" } else { "no_source" };
+            pool_reasons.push(format!("{}={kind}", pool.as_str()));
             continue;
         }
         match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref()) {
@@ -865,7 +888,7 @@ pub fn resolve_target(
                             .unwrap_or(0) as i64;
                             DispatchError::ModelCooling(secs, TargetPool::Qoder)
                         }
-                        (p, _) => DispatchError::NoHealthy(p),
+                        (p, _) => DispatchError::NoHealthy(p, Some(pool_reasons.join(","))),
                     });
                 }
                 if fallback_from.is_none() {
@@ -882,6 +905,7 @@ pub fn resolve_target(
         // issue #90 修复③a：前缀锁定池不可用时错误指向该池（而非兜底 Trae，
         // 否则「qoder/xxx 但 qoder 池耗尽」报成 Trae 无健康账号，误导排障）
         forced_pool.or(preferred).unwrap_or(TargetPool::Trae),
+        Some(pool_reasons.join(",")),
     ))
 }
 
@@ -1480,10 +1504,10 @@ mod tests {
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
         f.seed_healthy(true);
         f.seed_healthy(false);
-        assert_eq!(
+        assert!(matches!(
             f.resolve("qoder/glm-5.3").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Qoder)
-        );
+            DispatchError::NoHealthy(TargetPool::Qoder, _)
+        ));
     }
 
     /// v3：同名 custom + trae/buddy 多源全部健康 → 按统一调度规则落 Buddy
@@ -1628,10 +1652,10 @@ mod tests {
         .unwrap();
         let list = super::super::custom_models::upsert(&f.dir, cm).unwrap();
         super::super::custom_lb::note_circuit_failure(&list[0].id, super::super::custom_lb::FailKind::Server);
-        assert_eq!(
+        assert!(matches!(
             f.resolve_no_session("custom/glm-5.3").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Custom)
-        );
+            DispatchError::NoHealthy(TargetPool::Custom, _)
+        ));
         super::super::custom_lb::clear_circuit(&list[0].id);
     }
 
@@ -1880,10 +1904,10 @@ mod tests {
     fn t12_buddy_only_exhausted_errors() {
         let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
         f.seed_healthy(true); // Trae 池健康但非双源，不得回退
-        assert_eq!(
+        assert!(matches!(
             f.resolve("hy4").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Buddy)
-        );
+            DispatchError::NoHealthy(TargetPool::Buddy, _)
+        ));
     }
 
     /// 仅 Buddy 源 + 模型级冷却 → 429 语义（ModelCooling）
@@ -1922,10 +1946,10 @@ mod tests {
     fn t15_trae_only_exhausted_errors() {
         let f = fixture(&["Doubao-Seed-Evolving"], Some(&["hy4"]), Some(&policy_default()));
         f.seed_healthy(false); // Buddy 池健康但非双源
-        assert_eq!(
+        assert!(matches!(
             f.resolve("Doubao-Seed-Evolving").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Trae)
-        );
+            DispatchError::NoHealthy(TargetPool::Trae, _)
+        ));
     }
 
     /// fallback=false + 双源 + 首选池耗尽 → 不回退，显式报错
@@ -1935,10 +1959,10 @@ mod tests {
         p.fallback = false;
         let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
         f.seed_healthy(true); // Trae 池健康，但 fallback 关闭
-        assert_eq!(
+        assert!(matches!(
             f.resolve("glm-5.3").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Buddy)
-        );
+            DispatchError::NoHealthy(TargetPool::Buddy, _)
+        ));
     }
 
     // ---------- 会话池粘性（§4.4） ----------
@@ -2461,10 +2485,10 @@ mod tests {
         let f2 = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
         f2.seed_healthy(false);
         f2.seed_key("k1", "trae", &[]);
-        assert_eq!(
+        assert!(matches!(
             f2.resolve_key("glm-5.3", "k1").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Trae)
-        );
+            DispatchError::NoHealthy(TargetPool::Trae, _)
+        ));
     }
 
     /// 绑定池白名单感知健康预检：绑定 buddy + 白名单 [b2]（池内仅 b1）→
@@ -2483,10 +2507,10 @@ mod tests {
         f2.seed_healthy(true);
         f2.seed_healthy(false);
         f2.seed_key("k1", "buddy", &["b2"]);
-        assert_eq!(
+        assert!(matches!(
             f2.resolve_key("glm-5.3", "k1").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Buddy)
-        );
+            DispatchError::NoHealthy(TargetPool::Buddy, _)
+        ));
     }
 
     /// D2 绑定是池偏好非模型过滤：绑定 trae + 模型仅 Buddy 源（hy4）→ 仍走 Buddy
@@ -2644,7 +2668,7 @@ mod tests {
     }
 
     /// issue #136 修复2：候选池耗尽/提前终止落逐池归因日志——「白名单把池排除」
-    /// （trae=no_healthy_account）与「源剔除」（buddy=unavailable）一行可辨；
+    /// （trae=no_healthy_account）与「源剔除」（buddy=switch_off/no_source）一行可辨；
     /// 实证路径是循环内提前 return（单可用池失败即终止），非循环末尾 exhausted 块
     #[test]
     fn t40c_dispatch_exhausted_logs_per_pool_reasons() {
@@ -2653,10 +2677,10 @@ mod tests {
         f.seed_key("k1", "", &["buddy-ai:u1"]); // 混合白名单仅国际版账号
 
         // buddy 无源目录走内置表 → 源存在但 wb_pool 无账号 → no_healthy_account；
-        // trae 有源但 Key 作用域空集 → no_healthy_account；无源池 → unavailable
+        // trae 有源但 Key 作用域空集 → no_healthy_account；qoder 开关关闭 → switch_off
         // → 无更多回退目标，提前终止归因 trae
         let r = f.resolve_key("glm-5.3", "k1");
-        assert!(matches!(r, Err(DispatchError::NoHealthy(TargetPool::Trae))), "{r:?}");
+        assert!(matches!(r, Err(DispatchError::NoHealthy(TargetPool::Trae, _))), "{r:?}");
         assert!(
             f.app_log_contains("dispatch exhausted: model=glm-5.3 key=k1"),
             "应落逐池归因日志"
@@ -2669,7 +2693,9 @@ mod tests {
             f.app_log_contains("buddy=no_healthy_account"),
             "目录命中但池内无账号同样记 no_healthy_account"
         );
-        assert!(f.app_log_contains("qoder=unavailable"), "无源池应记 unavailable");
+        // qoder 有 glm-5.3 源但 fixture qoder_enabled=false → switch_off
+        //（审查 F-3 细分归因：开关未启用 ≠ 无源；无源才记 no_source）
+        assert!(f.app_log_contains("qoder=switch_off"), "开关未启用的有源池应记 switch_off");
     }
 
     /// 修复1 直测：调度阶段失败落 API 请求日志——NoHealthy → status=503、
@@ -2683,7 +2709,7 @@ mod tests {
 
         let resp = super::super::routes::dispatch_error_response(
             &f.state,
-            DispatchError::NoHealthy(TargetPool::Trae),
+            DispatchError::NoHealthy(TargetPool::Trae, None),
             super::super::routes::Protocol::OpenAi,
             "glm-5.3",
             false,
@@ -2826,10 +2852,10 @@ mod tests {
             .qoder_enabled
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // 池空 = 无健康账号（单源不跨池回退）
-        assert_eq!(
+        assert!(matches!(
             f.resolve("MiniMax-M2.7").unwrap_err(),
-            DispatchError::NoHealthy(TargetPool::Qoder)
-        );
+            DispatchError::NoHealthy(TargetPool::Qoder, _)
+        ));
     }
 
     /// buddy+qoder 双源模型（不在 Trae 列表）：wb_enabled=false 且 qoder_enabled=true

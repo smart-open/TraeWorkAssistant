@@ -11,9 +11,9 @@ import type {
   WorkBuddyAccountView,
 } from '../../types';
 
-/** 最小 Trae 账号（仅单测所需字段，池键 = user_id） */
-const trae = (user_id: string, general_credits: number | null) =>
-  ({ user_id, general_credits }) as AccountView;
+/** 最小 Trae 账号（仅单测所需字段，池键 = user_id；group_id 供分组筛选口径） */
+const trae = (user_id: string, general_credits: number | null, group_id: string | null = null) =>
+  ({ user_id, general_credits, group_id }) as AccountView;
 
 /** 最小 Buddy 账号（仅单测所需字段，池键 = id） */
 const wb = (id: string, has_credential: boolean, credits_balance: number | null) =>
@@ -50,6 +50,39 @@ describe('computePoolMetrics（资源总览多池摘要口径）', () => {
     expect(m.traePoolCount).toBe(0);
     expect(m.traePoolCredits).toBe(0);
     expect(m.traeTotalCredits).toBe(30);
+  });
+
+  it('Trae 池：分组 ∩ 标签筛选叠加 enabled_uids（对齐后端装配语义；未分组账号在分组激活时排除）', () => {
+    const accounts = [
+      trae('u1', 100, 'g1'), // 名单 + g1 + t1 → 入池
+      trae('u2', 50, 'g1'), // 名单 + g1，无标签 → 标签激活时排除
+      trae('u3', 10, 'g2'), // 名单 + 标签 t1，但组不在筛选 → 排除
+      trae('u4', 20, null), // 名单但未分组 → 分组激活时排除
+    ];
+    const tags = [tag('t1', ['u1', 'u3'])];
+    // 分组 ∩ 标签双维交集：仅 u1
+    const m = computePoolMetrics(
+      {
+        enabled_uids: ['u1', 'u2', 'u3', 'u4'],
+        group_ids: ['g1'],
+        trae_tag_ids: ['t1'],
+      } as ApiPoolFile,
+      accounts, [], [], [], [], tags,
+    );
+    expect(m.traePoolCount).toBe(1);
+    expect(m.traePoolCredits).toBe(100);
+    // 仅分组筛选（标签未选 = 不限）：u1 + u2
+    const m2 = computePoolMetrics(
+      { enabled_uids: ['u1', 'u2', 'u3', 'u4'], group_ids: ['g1'] } as ApiPoolFile,
+      accounts, [], [], [], [],
+    );
+    expect(m2.traePoolCount).toBe(2);
+    // 不限分组/标签：退回 enabled_uids 既有口径
+    const m3 = computePoolMetrics(
+      { enabled_uids: ['u1', 'u2', 'u3', 'u4'] } as ApiPoolFile,
+      accounts, [], [], [], [],
+    );
+    expect(m3.traePoolCount).toBe(4);
   });
 
   it('Buddy 池：白名单非空按名单取成员（fail-open 冻结），可用积分只累计名单内账号', () => {

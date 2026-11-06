@@ -1564,16 +1564,30 @@ pub fn doubao_quota_task_unregister(state: State<AppState>) -> Result<(), String
 // 执行层在 tasks/doubao_checkin.rs（detail 查状态 → landing/checkin 提交 → 落库回写）。
 
 /// 手动签到：传 user_id 单账号；不传则全量（遍历池内有凭证账号）。
-/// 含网络请求，async 防 UI 冻结。
+/// 含网络请求，async 防 UI 冻结。app 用于 probe 自动保活（开代理/切客户端）。
+///
+/// 2026-11-06 实测修复：整个执行体挪到独立 std 线程——(async) 同步命令体跑在
+/// tokio 工作线程上，而 checkin 链路含 block_on（probe 保活启代理）+ ureq 同步
+/// 网络，直接在工作线程上执行会（a）block_on 饿死——实测 13:03:15 发起到
+/// 13:08:18 才轮到执行（5 分钟），期间保活闸门占死、后续账号全部跳过；（b）占满
+/// 全部 worker 后其他命令连带排队。独立线程彻底脱离运行时上下文。
 #[tauri::command(async)]
 pub fn doubao_checkin_run(
+    app: AppHandle,
     state: State<AppState>,
     user_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    match user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(uid) => crate::tasks::doubao_checkin::checkin_single(&state, uid),
-        None => crate::tasks::doubao_checkin::run_batch(&state),
-    }
+    let uid = user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let state = state.inner().clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = match uid.as_deref() {
+            Some(u) => crate::tasks::doubao_checkin::checkin_single(&state, Some(&app), u),
+            None => crate::tasks::doubao_checkin::run_batch(&state, Some(&app)),
+        };
+        let _ = tx.send(r);
+    });
+    rx.recv().unwrap_or_else(|_| Err("签到线程异常退出".to_string()))
 }
 
 /// 额度看板统计（需求④，参考 Trae 积分看板）：账号数 / 总额度 / 今日新增额度 / 趋势

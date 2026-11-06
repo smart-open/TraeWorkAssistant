@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { PlayCircle, Users, CheckCircle2, CircleSlash, XCircle, Loader2, CalendarDays } from 'lucide-react';
+import { PlayCircle, Users, CheckCircle2, CircleSlash, XCircle, CalendarDays } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Progress } from '../../components/ui';
 import CheckinCalendarCard from '../../components/CheckinCalendar';
@@ -49,8 +49,15 @@ export default function DoubaoCheckin() {
   // 组件存活标记：切页卸载后终止批量签到循环（单账号 invoke 超时 600s，不守卫会后台继续发真实签到请求；
   // 重进页面是新实例、running 归零，不守卫还会造成并发双跑）
   const aliveRef = useRef(true);
-  useEffect(() => () => {
-    aliveRef.current = false;
+  useEffect(() => {
+    // setup 复位必须与 cleanup 配对（2026-11-06 修复）：StrictMode（dev）effect 会按
+    // setup→cleanup→setup 双跑，cleanup 把守卫置 false 后若 setup 不复位，aliveRef
+    // 恒为 false → run() 在第一个 invoke 前静默 return，而 running 已置 true——
+    // 界面永远「运行中/正在签到第 1/3」、后端零请求零落库（生产构建 React 无双跑，不受影响）
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
   }, []);
 
   const today = todayKey();
@@ -172,9 +179,28 @@ export default function DoubaoCheckin() {
         </div>
       ) : (
         <>
-          <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+          {/* 风控验证状态横幅（2026-11-06）：显眼提示当前签到成功率仍在反复验证中，避免用户误判为稳定功能 */}
+          <div className="mt-4 flex items-start gap-2 rounded-lg border-l-4 border-rose-400 bg-rose-50 p-3 text-xs font-medium text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">
+            ⚠ 风控验证中：豆包签到目前上游风控还未完全验证通过，签到可能失败，需要反复验证中。
+            失败后可稍后重试，或直接在豆包客户端内完成签到（开启代理时结果会自动落库到本页日历）。
+          </div>
+
+          <div className="mt-2 flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
             ⚠ 每日签到走豆包官方 landing/checkin 接口：当天已签幂等跳过；请勿在一天内反复手动执行，避免触发风控。
             每日定时签到可在「环境配置 → 每日签到」开启。
+          </div>
+
+          {/* 签到流程依赖链说明（2026-11-06）：提交被上游风控强校验设备形态，
+              参数齐备与否直接决定成败——把依赖与自愈路径讲清楚 */}
+          <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-relaxed text-slate-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400">
+            <span className="font-medium text-slate-600 dark:text-zinc-200">签到流程依赖：</span>
+            ① 会话凭证（账号管理「保存当前登录态」或代理自动抓取）→
+            ② 设备抓包参数（代理运行时「以账号打开」豆包自动抓取，<b>按账号绑定设备指纹，24 小时有效</b>）→
+            ③ 提交签到（带本账号设备指纹 + 设备 Cookie 对齐客户端形态）。
+            参数缺失/过期时，签到前会<b>自动保活</b>（设置页可关）：自动启动代理 → 逐账号切换豆包客户端抓取参数（每账号约 30-60 秒，
+            客户端会被短暂切换登录态，结束停留在最后处理的账号），全程见日志 <code>[probe-keepalive]</code>。
+            若参数齐备仍报 <code>710010702</code>，说明上游要求客户端内一次性反爬令牌（CLI 无法重放）——
+            此时请直接在豆包客户端内完成签到（开启代理时结果会自动落库到本页日历）。
           </div>
 
           {/* 范围与账号选择 */}
@@ -325,7 +351,7 @@ export default function DoubaoCheckin() {
                 className="btn-primary"
                 disabled={running || loading || candidates.length === 0}
               >
-                {running ? <Loader2 size={15} className="animate-spin" /> : <PlayCircle size={15} />}
+                {running ? null : <PlayCircle size={15} />}
                 {running ? '签到进行中…' : `开始签到（${candidates.length}）`}
               </button>
             </div>
@@ -365,7 +391,7 @@ export default function DoubaoCheckin() {
                 ))}
                 {running && lines.length < candidates.length && (
                   <div className="flex items-center gap-2 text-xs text-slate-400">
-                    <Loader2 size={14} className="animate-spin" /> 正在签到第 {lines.length + 1}/{candidates.length} 个账号…
+                    正在签到第 {lines.length + 1}/{candidates.length} 个账号…
                   </div>
                 )}
               </div>

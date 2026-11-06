@@ -858,14 +858,37 @@ fn try_capture_doubao_campaign(
             .unwrap_or(false);
     if resp_ok && (p.ends_with("/landing/checkin") || p.contains("/v3/detail/")) {
         if !params.is_empty() {
+            // 设备级 Cookie（2026-11-06）：字节风控的设备标识，发奖端点 landing/checkin
+            // 强校验——仅 sessionid+sid_guard+msToken 三个会话 Cookie 会被 710010702 拒。
+            // 刻意排除会话类 Cookie（sessionid/sid_guard/sessionid_ss/multi_sids 等）：
+            // 会话凭证由凭证抓取链路按账号单独存，这里只收设备维度键
+            const DEVICE_COOKIE_KEYS: &[&str] = &["ttwid", "odin_tt", "tt_scid", "s_v_web_id"];
+            let device_cookies: serde_json::Map<String, serde_json::Value> = jar
+                .iter()
+                .filter(|(k, v)| DEVICE_COOKIE_KEYS.contains(&k.as_str()) && !v.is_empty())
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            // 按 sessionid 分键（设备指纹与登录会话绑定：跨账号复用 probe 会被拒），
+            // 全局键 campaign_probe 保留兜底（旧版 CLI/凭证轮换场景）
             let probe = serde_json::json!({
                 "captured_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                 "params": serde_json::Value::Object(params),
                 "ms_token": ms_token,
                 "ua": ua,
+                "device_cookies": serde_json::Value::Object(device_cookies),
             });
-            if let Err(e) = crate::vault::ns_set(&ctx.data_dir, "doubao", "campaign_probe", &probe) {
-                ctx.log.log(&format!("  [doubao-campaign] 参数入 vault 失败（仅日志可比对）: {e}"));
+            let mut stored = 0u8;
+            if let Some(sid_v) = jar.iter().find(|(k, _)| k == "sessionid").map(|(_, v)| v.clone()).filter(|v| !v.is_empty()) {
+                let sid_key = format!("campaign_probe:sid:{sid_v}");
+                if crate::vault::ns_set(&ctx.data_dir, "doubao", &sid_key, &probe).is_ok() {
+                    stored += 1;
+                }
+            }
+            if crate::vault::ns_set(&ctx.data_dir, "doubao", "campaign_probe", &probe).is_ok() {
+                stored += 1;
+            }
+            if stored == 0 {
+                ctx.log.log("  [doubao-campaign] 参数入 vault 失败（仅日志可比对）");
             }
         }
         // 客户端手动签到成功 → 按日落库（2026-10-31）：额度看板「今日新增额度」口径

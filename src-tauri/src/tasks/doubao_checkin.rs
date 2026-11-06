@@ -33,8 +33,13 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 /// 批量模式下账号间隔（防上游频控，与 wb/trae 的 gap 思路一致，固定短间隔）
 const ACCOUNT_GAP_MS: u64 = 800;
 
-/// 构造 Cookie（对齐 doubao_quota::query_account：sessionid + sid_guard + 可选 msToken）
-fn cookie_of(sid: &str, sid_guard: Option<&str>, ms_token: Option<&str>) -> String {
+/// 构造 Cookie（sessionid + sid_guard + 可选 msToken + 抓包设备级 Cookie 追加）
+fn cookie_of(
+    sid: &str,
+    sid_guard: Option<&str>,
+    ms_token: Option<&str>,
+    device_cookies: &[(String, String)],
+) -> String {
     let mut cookie = format!("sessionid={sid}");
     if let Some(sg) = sid_guard.filter(|s| !s.is_empty()) {
         cookie.push_str(&format!("; sid_guard={sg}"));
@@ -42,20 +47,70 @@ fn cookie_of(sid: &str, sid_guard: Option<&str>, ms_token: Option<&str>) -> Stri
     if let Some(mt) = ms_token.filter(|s| !s.is_empty()) {
         cookie.push_str(&format!("; msToken={mt}"));
     }
+    // 设备级 Cookie 追加（抓包对齐 2026-11-06）：会话键不追加（本账号会话为准），
+    // 设备键值对来自本账号 profile 的客户端抓包
+    for (k, v) in device_cookies {
+        if k.is_empty() || v.is_empty() {
+            continue;
+        }
+        if matches!(k.as_str(), "sessionid" | "sid_guard" | "msToken") {
+            continue;
+        }
+        cookie.push_str(&format!("; {k}={v}"));
+    }
     cookie
 }
 
-/// 客户端抓包参数（代理 try_capture_doubao_campaign 存 vault ns "doubao"/"campaign_probe"）：
-/// 签到 query 用客户端真实参数集（device_id/web_id/fp 等设备指纹——CLI 缺失被上游风控
-/// 拒绝 710010702）+ msToken Cookie。24h 内新鲜有效，过期/缺失回退内置稳定参数。
+/// 客户端抓包参数（代理 try_capture_doubao_campaign 存 vault ns "doubao"）：
+/// - query 用客户端真实参数集（device_id/web_id/fp 等设备指纹——CLI 缺失被上游风控
+///   拒绝 710010702）
+/// - msToken Cookie + ua（客户端版本随更新漂移，旧版本号 UA 也是风控信号）
+/// - device_cookies 设备级 Cookie（ttwid/odin_tt/tt_scid/s_v_web_id，非会话凭证）：
+///   landing/checkin 为发奖端点、风控强校验设备标识，仅 3 个会话 Cookie 会被拒
+/// 2026-11-06 起按 sessionid 分键存储（设备指纹与登录会话绑定——朱羽程的 device_id
+/// 配朱天伟的 sessionid 一样被拒），全局键 campaign_probe 兜底。
+/// 24h 内新鲜有效（msToken 会话级时效），过期/缺失回退内置稳定参数。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CampaignProbe {
     checkin_query: String,
     ms_token: Option<String>,
+    ua: Option<String>,
+    device_cookies: Vec<(String, String)>,
 }
 
-fn load_campaign_probe(state: &AppState) -> Option<CampaignProbe> {
-    let v = crate::vault::ns_get(&state.data_dir, "doubao", "campaign_probe")?;
+/// probe vault 键（sessionid 维度）
+pub(crate) fn probe_key_for_sid(sid: &str) -> String {
+    format!("campaign_probe:sid:{}", sid.trim())
+}
+
+/// 本账号自己的 probe 是否存在且新鲜（**不含全局回退**）：
+/// 保活触发判定专用——全局 probe 可能属于其他账号（设备指纹不匹配），
+/// 把它当「已新鲜」会让保活永久跳过（2026-11-06 12:1x 实测教训）
+pub(crate) fn probe_own_fresh(data_dir: &std::path::Path, sid: &str) -> bool {
+    crate::vault::ns_get(data_dir, "doubao", &probe_key_for_sid(sid))
+        .and_then(|v| parse_probe(&v))
+        .is_some()
+}
+
+/// 按优先级加载 probe：本账号 sessionid 维度 → 全局兜底；解析失败/过期视为未命中继续尝试
+pub(crate) fn load_campaign_probe(data_dir: &std::path::Path, sid: Option<&str>) -> Option<CampaignProbe> {
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(s) = sid.map(str::trim).filter(|s| !s.is_empty()) {
+        keys.push(probe_key_for_sid(s));
+    }
+    keys.push("campaign_probe".to_string());
+    for key in keys {
+        if let Some(v) = crate::vault::ns_get(data_dir, "doubao", &key) {
+            if let Some(p) = parse_probe(&v) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// 解析 vault probe（24h 新鲜期；设备 Cookie/UA 字段缺失时留空由调用方回退常量）
+fn parse_probe(v: &Value) -> Option<CampaignProbe> {
     let captured_at = v.get("captured_at").and_then(Value::as_str).unwrap_or("");
     let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(captured_at, "%Y-%m-%d %H:%M:%S") else {
         return None;
@@ -76,6 +131,24 @@ fn load_campaign_probe(state: &AppState) -> Option<CampaignProbe> {
     if query.is_empty() {
         return None;
     }
+    let ua = v
+        .get("ua")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty() && s.contains("SamanthaDoubao"))
+        .map(str::to_string);
+    let device_cookies = v
+        .get("device_cookies")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, val)| {
+                    val.as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| (k.clone(), s.to_string()))
+                })
+                .collect::<Vec<(String, String)>>()
+        })
+        .unwrap_or_default();
     Some(CampaignProbe {
         checkin_query: query,
         ms_token: v
@@ -83,10 +156,13 @@ fn load_campaign_probe(state: &AppState) -> Option<CampaignProbe> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        ua,
+        device_cookies,
     })
 }
 
-/// POST JSON 通用（agw 信封）：code==0 视为成功返回 body；否则 Err（含登录失效提示）
+/// POST JSON 通用（agw 信封）：code==0 视为成功返回 body；否则 Err（含登录失效提示）。
+/// ua/extra_cookies 来自抓包 probe（2026-11-06 对齐客户端请求形态），缺省回退内置常量
 fn post_json(
     agent: &ureq::Agent,
     url: &str,
@@ -94,11 +170,13 @@ fn post_json(
     sg: Option<&str>,
     ms: Option<&str>,
     body: &Value,
+    ua: &str,
+    extra_cookies: &[(String, String)],
 ) -> Result<Value, String> {
     let resp = agent
         .post(url)
-        .set("Cookie", &cookie_of(sid, sg, ms))
-        .set("User-Agent", UA)
+        .set("Cookie", &cookie_of(sid, sg, ms, extra_cookies))
+        .set("User-Agent", ua)
         .set("Referer", REFERER)
         .set("Origin", "https://www.doubao.com")
         .set("Accept", "application/json, text/plain, */*")
@@ -222,8 +300,25 @@ pub fn run_one(
     probe: Option<&CampaignProbe>,
 ) -> Value {
     let ms = probe.and_then(|p| p.ms_token.as_deref());
+    // 抓包对齐（2026-11-06）：UA/设备 Cookie 取本账号 probe，缺失回退内置常量
+    let ua_s = probe
+        .and_then(|p| p.ua.as_deref())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(UA);
+    let device_cookies: &[(String, String)] = probe
+        .map(|p| p.device_cookies.as_slice())
+        .unwrap_or(&[]);
     // ① detail：签到状态 + 总额度
-    let detail = match post_json(agent, DETAIL_URL, sid, sg, ms, &json!({"campaign_group_code": SCENE})) {
+    let detail = match post_json(
+        agent,
+        DETAIL_URL,
+        sid,
+        sg,
+        ms,
+        &json!({"campaign_group_code": SCENE}),
+        ua_s,
+        device_cookies,
+    ) {
         Ok(body) => parse_detail(&body),
         Err(e) => {
             return json!({
@@ -259,7 +354,16 @@ pub fn run_one(
         }
         _ => CHECKIN_URL.to_string(),
     };
-    match post_json(agent, &checkin_url, sid, sg, ms, &json!({"scene": SCENE})) {
+    match post_json(
+        agent,
+        &checkin_url,
+        sid,
+        sg,
+        ms,
+        &json!({"scene": SCENE}),
+        ua_s,
+        device_cookies,
+    ) {
         Ok(body) => {
             let data = body.get("data");
             let checked = data
@@ -320,7 +424,16 @@ pub fn run_one(
             // 「已签/活动未覆盖」等状态。复查 detail 今日已签 → 按 already 落库（避免误报失败）；
             // detail 正常且未签 → 会话健康、活动端点单独拒绝，大概率无签到资格（给出明确指引）
             if e.starts_with("接口返回异常 code=") {
-                if let Ok(re_body) = post_json(agent, DETAIL_URL, sid, sg, ms, &json!({"campaign_group_code": SCENE})) {
+                if let Ok(re_body) = post_json(
+                    agent,
+                    DETAIL_URL,
+                    sid,
+                    sg,
+                    ms,
+                    &json!({"campaign_group_code": SCENE}),
+                    ua_s,
+                    device_cookies,
+                ) {
                     let re = parse_detail(&re_body);
                     if re.get("checked_in_today").and_then(Value::as_bool).unwrap_or(false) {
                         return json!({
@@ -435,6 +548,8 @@ pub fn detail_probe(agent: &ureq::Agent, sid: &str, sg: Option<&str>, ms: Option
         sg,
         ms,
         &json!({"campaign_group_code": SCENE}),
+        UA,
+        &[],
     )
     .ok()?;
     Some(parse_detail(&body))
@@ -546,7 +661,7 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
 /// 按日落库 + 池回写 + 运维历史 → 汇总。空池跳过（对齐 doubao-quota 惯例）。
 /// 跨进程轮次锁（对齐 wb-checkin try_acquire_wb_round 先例）：GUI 调度器与
 /// schtasks CLI 双进程互斥；Busy 幂等跳过、机制性失败 fail-closed。
-pub fn run_batch(state: &AppState) -> Result<Value, String> {
+pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Value, String> {
     use crate::tasks::qoder_common::CrossProcLockFail;
     let _cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
         &state.data_dir,
@@ -568,17 +683,24 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
         }
     };
     let targets = collect_targets(state)?;
+    // probe 自动保活（方案 A，2026-11-06）：probe 缺失/过期 → 自动开客户端抓包对齐；
+    // 失败仅记日志，签到照常走既有 probe 链（缺失回退内置稳定参数）
+    if let Err(e) = super::doubao_probe::ensure_fresh_probes(state, app, &targets) {
+        fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
+    }
     if targets.is_empty() {
         return Ok(json!({ "ok": true, "skipped": "无豆包账号" }));
     }
 
     let agent = http_agent(TIMEOUT_SECS);
-    let probe = load_campaign_probe(state);
+    // 全局 probe 兜底（2026-11-06 起按 sessionid 分键，逐账号优先取自己的抓包参数）
+    let probe_global = load_campaign_probe(&state.data_dir, None);
     let mut outcomes: Vec<Value> = Vec::new();
     for (i, (uid, sid, sg, name)) in targets.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(Duration::from_millis(ACCOUNT_GAP_MS));
         }
+        let probe = load_campaign_probe(&state.data_dir, Some(sid)).or_else(|| probe_global.clone());
         outcomes.push(run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref()));
     }
     persist_outcomes(state, &outcomes, "task");
@@ -642,14 +764,23 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
     }))
 }
 
-/// 单账号签到（应用内手动路径）：读池凭证 → run_one → 落库/回写/历史 → 契约返回
-pub fn checkin_single(state: &AppState, uid: &str) -> Result<Value, String> {
+/// 单账号签到（应用内手动路径）：读池凭证 → probe 保活 → run_one → 落库/回写/历史
+pub fn checkin_single(state: &AppState, app: Option<&tauri::AppHandle>, uid: &str) -> Result<Value, String> {
     let targets = collect_targets(state)?;
     let Some((_, sid, sg, name)) = targets.iter().find(|(u, _, _, _)| u == uid) else {
         return Err(format!("账号 {uid} 不在账号池中或未录入 sessionid 凭证"));
     };
+    // probe 自动保活（方案 A）：本账号 probe 缺失/过期 → 自动开客户端抓包（失败照常签到）
+    if let Err(e) = super::doubao_probe::ensure_fresh_probes(
+        state,
+        app,
+        std::slice::from_ref(&targets.iter().find(|(u, _, _, _)| u == uid).unwrap()),
+    ) {
+        fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
+    }
     let agent = http_agent(TIMEOUT_SECS);
-    let probe = load_campaign_probe(state);
+    let probe = load_campaign_probe(&state.data_dir, Some(sid))
+        .or_else(|| load_campaign_probe(&state.data_dir, None));
     let outcome = run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref());
     persist_outcomes(state, std::slice::from_ref(&outcome), "manual");
     let ok = outcome.get("status").and_then(Value::as_str) != Some("fail");
@@ -663,6 +794,81 @@ pub fn checkin_single(state: &AppState, uid: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod doubao_checkin_tests {
     use super::*;
+
+    // ── probe 按 sessionid 分键（2026-11-06 设备-账号绑定对齐）──
+
+    fn probe_json(hours_ago: i64, ms_token: &str) -> Value {
+        let ts = (chrono::Local::now().naive_local() - chrono::Duration::hours(hours_ago))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        json!({
+            "captured_at": ts,
+            "params": {"device_id": "7288888888888888", "aid": "497858", "msToken": ms_token},
+            "ms_token": ms_token,
+            "ua": "Mozilla/5.0 Test SamanthaDoubao/2.35.4",
+            "device_cookies": {"ttwid": "tt1", "odin_tt": "od1", "tt_scid": "sc1"},
+        })
+    }
+
+    fn temp_probe_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("aiwork_checkin_probe_{tag}_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn probe_本账号sessionid维度优先_全局兜底() {
+        let d = temp_probe_dir("prio");
+        crate::vault::ns_set(&d, "doubao", "campaign_probe", &probe_json(1, "global_ms")).unwrap();
+        // 全局新鲜、本账号键缺失 → 回退全局
+        let p = load_campaign_probe(&d, Some("sid-A")).expect("应回退到全局");
+        assert_eq!(p.ms_token.as_deref(), Some("global_ms"));
+        // 本账号键存在且新鲜 → 优先本账号
+        crate::vault::ns_set(&d, "doubao", &probe_key_for_sid("sid-A"), &probe_json(0, "own_ms")).unwrap();
+        let p = load_campaign_probe(&d, Some("sid-A")).expect("应取本账号");
+        assert_eq!(p.ms_token.as_deref(), Some("own_ms"));
+        assert_eq!(p.device_cookies.iter().find(|(k, _)| k == "ttwid").map(|(_, v)| v.as_str()), Some("tt1"));
+        assert!(p.ua.as_deref().unwrap_or("").contains("2.35.4"));
+        // 其他账号不受影响 → 仍回退全局
+        let p = load_campaign_probe(&d, Some("sid-B")).expect("B 应回退全局");
+        assert_eq!(p.ms_token.as_deref(), Some("global_ms"));
+    }
+
+    #[test]
+    fn probe_本账号过期_全局新鲜时回退全局() {
+        let d = temp_probe_dir("stale");
+        crate::vault::ns_set(&d, "doubao", &probe_key_for_sid("sid-X"), &probe_json(30, "stale_ms")).unwrap();
+        crate::vault::ns_set(&d, "doubao", "campaign_probe", &probe_json(1, "fresh_ms")).unwrap();
+        let p = load_campaign_probe(&d, Some("sid-X")).expect("过期键应跳过取全局");
+        assert_eq!(p.ms_token.as_deref(), Some("fresh_ms"));
+    }
+
+    #[test]
+    fn probe_全部过期缺失_返回none() {
+        let d = temp_probe_dir("none");
+        assert!(load_campaign_probe(&d, Some("sid-C")).is_none());
+        assert!(load_campaign_probe(&d, None).is_none());
+        crate::vault::ns_set(&d, "doubao", &probe_key_for_sid("sid-C"), &probe_json(25, "old")).unwrap();
+        crate::vault::ns_set(&d, "doubao", "campaign_probe", &probe_json(25, "old")).unwrap();
+        assert!(load_campaign_probe(&d, Some("sid-C")).is_none());
+    }
+
+    #[test]
+    fn cookie_of_追加设备cookie_会话键不覆盖() {
+        let dc = vec![
+            ("ttwid".to_string(), "tt1".to_string()),
+            ("msToken".to_string(), "should_skip".to_string()),
+            ("sessionid".to_string(), "should_skip".to_string()),
+            (String::new(), "empty_key".to_string()),
+        ];
+        let c = cookie_of("sid-1", Some("sg-1"), Some("ms-1"), &dc);
+        assert!(c.starts_with("sessionid=sid-1"));
+        assert!(c.contains("sid_guard=sg-1"));
+        assert!(c.contains("msToken=ms-1"));
+        assert!(c.contains("ttwid=tt1"));
+        assert!(!c.contains("should_skip"));
+        assert!(!c.contains("empty_key"));
+    }
 
     #[test]
     fn parse_detail_抓包实测结构() {

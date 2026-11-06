@@ -291,15 +291,24 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
         fs_utils::app_log(&state2.data_dir, &msg);
         let failed = done["failed"].as_i64().unwrap_or(0);
         // empty_campaigns（活动未开始/不可用）非用户可操作失败：重试也无解，仅记日志
-        // 不推送打扰（审查 L；done.failed_empty_campaigns 由 run_checkin_round 单列）
+        // 不推送打扰（审查 L；done.failed_empty_campaigns 由 run_checkin_round 单列）。
+        // failed_blocked（issue #190 风控信任未建立）仍计入推送——它是用户可操作失败
+        // （切换账号 + 客户端建信任后可恢复），不推送会静默滞留（审查 Q2 修复）
+        let failed_blocked = done["failed_blocked"].as_i64().unwrap_or(0);
         let failed_actionable =
             failed - done["failed_empty_campaigns"].as_i64().unwrap_or(0);
         if failed_actionable > 0 {
+            let mut text = format!("启动补签有 {failed_actionable} 个账号失败，请在 Qoder 签到页查看");
+            if failed_blocked > 0 {
+                text.push_str(&format!(
+                    "（其中 {failed_blocked} 项被风控拦截：请在工具内切换到该账号后打开 Qoder 客户端使用一次建立信任，再手动重试）"
+                ));
+            }
             crate::commands::workbuddy::push_notify(
                 Some(&app2),
                 &state2.data_dir,
                 "Qoder 签到提醒",
-                &format!("启动补签有 {failed_actionable} 个账号失败，请在 Qoder 签到页查看"),
+                &text,
                 crate::notify::NotifyEvent::TaskFail,
             );
         }

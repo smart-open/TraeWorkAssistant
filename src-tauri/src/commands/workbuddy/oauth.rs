@@ -15,6 +15,7 @@
 
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::commands::api_server::ApiServerRuntime;
 use crate::fs_utils;
 use crate::state::AppState;
 
@@ -479,6 +480,18 @@ pub(super) fn oauth_flow(
     );
 
     let label = if nickname.is_empty() { target_id.clone() } else { nickname.clone() };
+
+    // 扫码入池热重载（PR #187 移植）：写池 + 写凭证后网关内存快照仍是旧的，
+    // 必须触发 reload_pools_if_running 否则新账号零请求（与导入路径
+    // accounts.rs 的入池热重载同口径）。失败仅记录——DB 已落，兜底由
+    // 一致性巡检线程 60s 内捕获
+    {
+        let runtime_state = app.try_state::<std::sync::Mutex<Option<ApiServerRuntime>>>();
+        if let Some(runtime_state) = runtime_state {
+            crate::commands::api_server::reload_pools_if_running(&app.state::<AppState>(), &runtime_state);
+        }
+    }
+
     emit("success", &format!("账号「{label}」已扫码登录并自动入池"), None);
     Ok((target_id, label))
 }
