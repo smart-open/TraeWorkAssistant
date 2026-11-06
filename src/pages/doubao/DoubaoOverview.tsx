@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw, ShieldCheck, Users, CheckCircle2, Circle, ChevronRight, TrendingUp, HeartPulse, Coins, CalendarCheck, Trophy } from 'lucide-react';
+import { RefreshCw, CheckCircle2, Circle, ChevronRight, CalendarCheck, Trophy, TriangleAlert } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { StatCard, Badge } from '../../components/ui';
 import CertManualGuide, { caCerExists } from '../../components/CertManualGuide';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { AppLocate, DoubaoAccountView, DoubaoCheckinTrendPoint, DoubaoDashboardStats, DoubaoHistoryEvent } from '../../types';
+import type { AppLocate, DoubaoAccountView, DoubaoCheckinTrendPoint, DoubaoDashboardStats } from '../../types';
 
 /** 豆包配置导航步骤定义（完成判定全部来自实时状态） */
 interface GuideStep {
@@ -17,7 +17,7 @@ interface GuideStep {
   run: () => Promise<void> | void;
 }
 
-/** 豆包配置导航卡：安装 → 保存登录态 → 证书 → 代理（自动抓凭证）→ 会员额度 */
+/** 豆包配置导航卡：安装 → 保存登录态 → 证书 → 代理（自动抓凭证）→ 完成首次签到 */
 function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; accounts: DoubaoAccountView[] }) {
   const certInstalled = useAppStore((s) => s.certInstalled);
   const proxy = useAppStore((s) => s.proxy);
@@ -30,7 +30,7 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
   // cert 步骤失败后展示手动导入指引（issue #12/#79）
   const [certGuideOpen, setCertGuideOpen] = useState(false);
   const snapshotCount = accounts.filter((a) => a.has_snapshot).length;
-  const quotaChecked = accounts.some((a) => a.quota_checked_at);
+  const checkinDone = accounts.some((a) => a.checkin_last_date);
 
   const steps: GuideStep[] = [
     {
@@ -77,12 +77,12 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
       },
     },
     {
-      key: 'quota',
-      title: '查看会员额度',
-      desc: '额度接口已内置默认值，无需配置。有会话凭证的账号会自动查询，并在账号名后显示会员等级或「免费」标识（悬停账号名看额度状态 / 到期时间）。',
-      done: quotaChecked,
-      actionLabel: '去账号管理',
-      run: () => setView('doubao-accounts'),
+      key: 'checkin',
+      title: '完成首次签到',
+      desc: '有会话凭证的账号可在「一键签到」完成每日签到，成功后自动回写总额度与连续签到天数。',
+      done: checkinDone,
+      actionLabel: '去签到',
+      run: () => setView('doubao-checkin'),
     },
   ];
 
@@ -150,175 +150,29 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
 
       {allDone && (
         <div className="border-t border-slate-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-700 dark:border-zinc-800 dark:bg-emerald-500/10 dark:text-emerald-300">
-          全部配置已完成，可在「账号管理」切换账号并查询会员额度。
+          全部配置已完成，可在「账号管理」切换账号，在「额度看板」查看额度趋势。
         </div>
       )}
     </div>
   );
 }
 
-/** 额度趋势 + 运维健康卡（A2/B2）：数据来自 doubao_health_history.json 运维历史 */
-function DoubaoInsights({ events }: { events: DoubaoHistoryEvent[] }) {
-  const setView = useAppStore((s) => s.setView);
-
-  // 趋势：取「当前时段」窗口的 used_percent，按天取最后一次，近 14 天
-  const trend = useMemo(() => {
-    const byDay = new Map<string, number>();
-    for (const e of events) {
-      if (e.kind !== 'quota' || !e.ok) continue;
-      const w = (e.windows ?? []).find((x) => x.name?.includes('当前时段'));
-      if (!w || typeof w.used_percent !== 'number') continue;
-      byDay.set(e.ts.slice(0, 10), Math.max(0, Math.min(100, w.used_percent)));
-    }
-    return [...byDay.entries()].sort(([a], [b]) => a.localeCompare(b)).slice(-14);
-  }, [events]);
-
-  // 健康：近 7 天各 kind 计数
-  const health = useMemo(() => {
-    const cutoff = Date.now() - 7 * 86400000;
-    const recent = events.filter((e) => new Date(e.ts.replace(' ', 'T')).getTime() >= cutoff);
-    const count = (k: DoubaoHistoryEvent['kind']) => recent.filter((e) => e.kind === k).length;
-    const lastKeepalive = [...events].reverse().find((e) => e.kind === 'keepalive');
-    return {
-      keepalive: count('keepalive'),
-      renew: count('renew'),
-      quota: count('quota'),
-      lastKeepaliveAt: lastKeepalive?.ts ?? null,
-    };
-  }, [events]);
-
-  const W = 280;
-  const H = 56;
-  const pts = trend.map(([, pct], i) => {
-    const x = trend.length === 1 ? W / 2 : (i / (trend.length - 1)) * (W - 8) + 4;
-    const y = 4 + (1 - pct / 100) * (H - 12);
-    return { x, y, pct };
-  });
-  const line = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-  const area = pts.length > 1 ? `${line} ${pts[pts.length - 1].x.toFixed(1)},${H - 2} ${pts[0].x.toFixed(1)},${H - 2}` : '';
-  const last = pts[pts.length - 1];
-
-  return (
-    <div className="mt-5 grid gap-4 lg:grid-cols-2">
-      {/* 额度趋势（近 14 天） */}
-      <div className="card p-4">
-        <div className="mb-2 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <TrendingUp size={16} className="text-amber-500" />
-            <span className="text-sm font-medium">额度趋势 · 当前时段</span>
-          </div>
-          {last && (
-            <span className={`text-xs font-medium ${last.pct >= 100 ? 'text-rose-500' : 'text-slate-500'}`}>
-              {trend[trend.length - 1][0]} 已用 {Math.round(last.pct)}%
-            </span>
-          )}
-        </div>
-        {pts.length >= 2 ? (
-          <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="额度使用趋势图">
-            <line x1="4" y1={H - 2} x2={W - 4} y2={H - 2} className="stroke-slate-200 dark:stroke-zinc-700" strokeWidth="1" />
-            <line x1="4" y1="4" x2={W - 4} y2="4" className="stroke-slate-100 dark:stroke-zinc-800" strokeWidth="1" strokeDasharray="3 3" />
-            {area && <polygon points={area} className="fill-amber-500/10" />}
-            <polyline points={line} className="fill-none stroke-amber-500" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
-            {last && <circle cx={last.x} cy={last.y} r="3" className="fill-amber-500" />}
-          </svg>
-        ) : (
-          <p className="py-6 text-center text-xs text-slate-400">
-            数据积累中：查询会员额度或注册「每日额度巡检」后，这里会展示近 14 天额度用量走势。
-          </p>
-        )}
-        <div className="mt-1 flex justify-between text-[11px] text-slate-400">
-          <span>{trend[0]?.[0] ?? ''}</span>
-          <span>{trend[trend.length - 1]?.[0] ?? ''}</span>
-        </div>
-      </div>
-
-      {/* 运维健康（近 7 天） */}
-      <div className="card p-4">
-        <div className="mb-2 flex items-center gap-2">
-          <HeartPulse size={16} className="text-emerald-500" />
-          <span className="text-sm font-medium">运维健康 · 近 7 天</span>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 text-xs">
-          <Badge tone={health.keepalive > 0 ? 'green' : 'slate'}>保活 {health.keepalive} 次</Badge>
-          <Badge tone={health.renew > 0 ? 'green' : 'slate'}>探活巡检 {health.renew} 次</Badge>
-          <Badge tone={health.quota > 0 ? 'green' : 'slate'}>额度查询 {health.quota} 次</Badge>
-        </div>
-        <p className="mt-2 text-xs text-slate-400">
-          {health.lastKeepaliveAt
-            ? `最近保活：${health.lastKeepaliveAt}（每日任务自动执行，超过 25 天未保活会提醒）`
-            : '尚未执行过保活：可在「账号管理」立即保活，或在「环境配置」注册每日保活任务。'}
-        </p>
-        <button onClick={() => setView('doubao-settings')} className="mt-2 text-xs text-brand-600 hover:underline dark:text-brand-400">
-          前往环境配置管理保活 / 巡检任务 →
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/** 额度榜 Top 卡：按账号总额度降序取前 5（quota_total 未知排后） */
-function QuotaTopCard({ accounts }: { accounts: DoubaoAccountView[] }) {
-  const top = useMemo(() => {
-    const ranked = accounts
-      .filter((a) => a.quota_total != null)
-      .sort((a, b) => (b.quota_total ?? 0) - (a.quota_total ?? 0))
-      .slice(0, 5);
-    return ranked;
-  }, [accounts]);
-
-  return (
-    <div className="card p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <Trophy size={16} className="text-amber-500" />
-        <span className="text-sm font-medium">额度榜 Top 5</span>
-      </div>
-      {top.length === 0 ? (
-        <p className="py-6 text-center text-xs text-slate-400">
-          数据积累中：注册「每日签到」或手动签到后，账号总额度会自动回写并参与排行。
-        </p>
-      ) : (
-        <div className="space-y-2">
-          {top.map((a, i) => (
-            <div key={a.user_id} className="flex items-center gap-3 rounded-lg border border-slate-100 p-2.5 dark:border-zinc-800">
-              <span className={`w-6 shrink-0 text-center text-sm font-semibold ${i === 0 ? 'text-amber-500' : i === 1 ? 'text-slate-400' : i === 2 ? 'text-orange-400' : 'text-slate-300 dark:text-zinc-600'}`}>
-                {i + 1}
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-medium text-slate-800 dark:text-zinc-100" title={a.name}>
-                  {a.name}
-                </div>
-                <div className="font-mono text-[11px] text-slate-400">{a.user_id}</div>
-              </div>
-              <div className="shrink-0 text-right">
-                <div className="text-sm font-semibold tabular-nums text-amber-600 dark:text-amber-400">
-                  {(a.quota_total ?? 0).toLocaleString()}
-                </div>
-                {a.checkin_continuous_days != null && (
-                  <div className="text-[11px] text-slate-400">连续签 {a.checkin_continuous_days} 天</div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** 近 30 天签到结果卡：ok/already/failed 按日堆叠 + 今日汇总徽标 */
+/**
+ * 近 30 天签到结果卡：按日落库保证同账号同日仅一条记录（重试轮覆盖为最终态），
+ * 展示成功（含已签，已签视为成功）/ 失败计数 + 按日双色柱状图
+ */
 function CheckinResultsCard({ trend }: { trend: DoubaoCheckinTrendPoint[] }) {
-  const last = trend[trend.length - 1];
   const sums = useMemo(
     () =>
       trend.reduce(
-        (acc, d) => ({ ok: acc.ok + d.ok, already: acc.already + d.already, failed: acc.failed + d.failed, reward: acc.reward + d.reward_total }),
-        { ok: 0, already: 0, failed: 0, reward: 0 },
+        (acc, d) => ({ ok: acc.ok + d.ok + d.already, failed: acc.failed + d.failed }),
+        { ok: 0, failed: 0 },
       ),
     [trend],
   );
 
-  const W = 280;
-  const H = 72;
+  const W = 300;
+  const H = 48;
   const slot = trend.length > 0 ? W / trend.length : W;
   const barW = Math.max(2, Math.min(10, slot - 2));
   const maxTotal = Math.max(1, ...trend.map((d) => d.ok + d.already + d.failed));
@@ -331,15 +185,13 @@ function CheckinResultsCard({ trend }: { trend: DoubaoCheckinTrendPoint[] }) {
           <span className="text-sm font-medium">近 30 天签到结果</span>
         </div>
         <div className="flex items-center gap-1.5 text-xs">
-          <Badge tone={sums.failed > 0 ? 'amber' : 'green'}>成功 {sums.ok}</Badge>
-          <Badge tone="slate">已签 {sums.already}</Badge>
-          {sums.failed > 0 && <Badge tone="red">失败 {sums.failed}</Badge>}
-          <Badge tone="violet">+{sums.reward.toLocaleString()}</Badge>
+          <Badge tone={sums.ok > 0 ? 'green' : 'slate'}>成功 {sums.ok}</Badge>
+          <Badge tone={sums.failed > 0 ? 'red' : 'slate'}>失败 {sums.failed}</Badge>
         </div>
       </div>
       {trend.length === 0 ? (
         <p className="py-6 text-center text-xs text-slate-400">
-          数据积累中：注册「每日签到」或手动签到后，这里会展示近 30 天每日签到结果。
+          数据积累中：注册「每日签到」或到「一键签到」手动签到后，这里会展示近 30 天每日签到结果。
         </p>
       ) : (
         <>
@@ -348,16 +200,17 @@ function CheckinResultsCard({ trend }: { trend: DoubaoCheckinTrendPoint[] }) {
             {trend.map((d, i) => {
               const x = i * slot + (slot - barW) / 2;
               const scale = (H - 6) / maxTotal;
-              const okH = d.ok * scale;
-              const alH = d.already * scale;
+              const okH = (d.ok + d.already) * scale;
               const faH = d.failed * scale;
-              const total = okH + alH + faH;
               return (
                 <g key={d.date}>
                   {okH > 0 && <rect x={x} y={H - 1 - okH} width={barW} height={okH} rx="1" className="fill-emerald-500" />}
-                  {alH > 0 && <rect x={x} y={H - 1 - okH - alH} width={barW} height={alH} rx="1" className="fill-slate-300 dark:fill-zinc-600" />}
-                  {faH > 0 && <rect x={x} y={H - 1 - okH - alH - faH} width={barW} height={faH} rx="1" className="fill-rose-500" />}
-                  {total <= 0 && <rect x={x} y={H - 4} width={barW} height={3} rx="1" className="fill-slate-100 dark:fill-zinc-800" />}
+                  {faH > 0 && <rect x={x} y={H - 1 - okH - faH} width={barW} height={faH} rx="1" className="fill-rose-500" />}
+                  {okH + faH <= 0 && <rect x={x} y={H - 4} width={barW} height={3} rx="1" className="fill-slate-100 dark:fill-zinc-800" />}
+                  {/* 悬停提示：透明命中区覆盖整列（细柱不必瞄准），原生 title 展示当日成功/失败 */}
+                  <rect x={i * slot} y={0} width={slot} height={H} fill="transparent" className="cursor-help">
+                    <title>{`${d.date.slice(5)} · 成功 ${d.ok + d.already} · 失败 ${d.failed}`}</title>
+                  </rect>
                 </g>
               );
             })}
@@ -365,11 +218,10 @@ function CheckinResultsCard({ trend }: { trend: DoubaoCheckinTrendPoint[] }) {
           <div className="mt-1 flex items-center justify-between text-[11px] text-slate-400">
             <span>{trend[0]?.date ?? ''}</span>
             <span className="flex items-center gap-2">
-              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-emerald-500" />成功</span>
-              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-slate-300 dark:bg-zinc-600" />已签</span>
+              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-emerald-500" />成功（含已签）</span>
               <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-rose-500" />失败</span>
             </span>
-            <span>{last?.date ?? ''}</span>
+            <span>{trend[trend.length - 1]?.date ?? ''}</span>
           </div>
         </>
       )}
@@ -377,38 +229,79 @@ function CheckinResultsCard({ trend }: { trend: DoubaoCheckinTrendPoint[] }) {
   );
 }
 
-/** 会员状态块（到期日历并入账号概览行）：过期红 / ≤7 天临期琥珀 / 其余灰 */
-function MemberExpiry({ a }: { a: DoubaoAccountView }) {
-  if (!a.quota_checked_at) {
-    return <div className="shrink-0 text-[11px] text-slate-300 dark:text-zinc-600">未查额度</div>;
-  }
-  if (!a.quota_expire_at) {
-    return <div className="shrink-0 text-xs text-slate-300 dark:text-zinc-600">免费账号</div>;
-  }
-  const ts = new Date(a.quota_expire_at.replace(' ', 'T')).getTime();
-  if (Number.isNaN(ts)) return null;
-  const days = Math.ceil((ts - Date.now()) / 86400000);
-  const date = a.quota_expire_at.slice(0, 10);
-  if (days <= 0) {
-    return (
-      <div className="shrink-0 text-right text-xs font-medium text-rose-500" title={`会员已于 ${date} 过期`}>
-        会员已过期
-        <div className="text-[11px] font-normal text-rose-400">{date}</div>
-      </div>
-    );
-  }
-  if (days <= 7) {
-    return (
-      <div className="shrink-0 text-right text-xs font-medium text-amber-500" title={`会员 ${date} 到期，剩余 ${days} 天`}>
-        {days} 天后到期
-        <div className="text-[11px] font-normal text-slate-400">{date}</div>
-      </div>
-    );
-  }
+/** 额度 TOP 榜：竖向柱状图（对齐「近 30 天签到结果」图式），从高到低 Top 8（quota_total 未知不参与） */
+function QuotaTopCard({ accounts }: { accounts: DoubaoAccountView[] }) {
+  const top = useMemo(
+    () =>
+      accounts
+        .filter((a) => a.quota_total != null)
+        .sort((a, b) => (b.quota_total ?? 0) - (a.quota_total ?? 0))
+        .slice(0, 8),
+    [accounts],
+  );
+  const W = 300;
+  const H = 48;
+  const slot = top.length > 0 ? W / top.length : W;
+  const barW = Math.max(2, Math.min(10, slot - 2));
+  const max = top.length > 0 ? Math.max(1, ...top.map((a) => a.quota_total ?? 0)) : 1;
+  // 柱顶数值紧凑格式：≥1万用「x.x万」，避免窄槽位溢出
+  const compact = (v: number) => (v >= 10000 ? `${(v / 10000).toFixed(1)}万` : v.toLocaleString());
+
   return (
-    <div className="shrink-0 text-right text-xs text-slate-500 dark:text-zinc-400" title={`会员 ${date} 到期`}>
-      会员到期
-      <div className="text-[11px] text-slate-400">{date}</div>
+    <div className="card p-4">
+      <div className="mb-2 flex items-center gap-2">
+        <Trophy size={16} className="text-amber-500" />
+        <span className="text-sm font-medium">额度 TOP 榜</span>
+        <span className="text-xs text-slate-400">从高到低 · Top {top.length || 0}</span>
+      </div>
+      {top.length === 0 ? (
+        <p className="py-6 text-center text-xs text-slate-400">
+          数据积累中：完成签到或查询额度后，账号总额度会自动回写并参与排行。
+        </p>
+      ) : (
+        <>
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="额度 TOP 榜柱状图">
+            <line x1="0" y1={H - 1} x2={W} y2={H - 1} className="stroke-slate-200 dark:stroke-zinc-700" strokeWidth="1" />
+            {top.map((a, i) => {
+              const v = a.quota_total ?? 0;
+              const h = Math.max(4, (v / max) * (H - 20));
+              const x = i * slot + (slot - barW) / 2;
+              return (
+                <g key={a.user_id}>
+                  <text
+                    x={x + barW / 2}
+                    y={H - 1 - h - 4}
+                    textAnchor="middle"
+                    fontSize="8"
+                    className="fill-slate-500 font-mono dark:fill-zinc-400"
+                  >
+                    {compact(v)}
+                  </text>
+                  <rect
+                    x={x}
+                    y={H - 1 - h}
+                    width={barW}
+                    height={h}
+                    rx="1"
+                    className={i === 0 ? 'fill-amber-500' : 'fill-amber-400/70'}
+                  />
+                </g>
+              );
+            })}
+          </svg>
+          <div className="mt-1 flex items-start justify-between">
+            {top.map((a) => (
+              <span
+                key={a.user_id}
+                className="min-w-0 flex-1 truncate px-0.5 text-center text-[10px] text-slate-500 dark:text-zinc-400"
+                title={`${a.name} · ${(a.quota_total ?? 0).toLocaleString()}`}
+              >
+                {a.name}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -418,27 +311,29 @@ export default function DoubaoOverview() {
   const setView = useAppStore((s) => s.setView);
   const [locate, setLocate] = useState<AppLocate | null>(null);
   const [accounts, setAccounts] = useState<DoubaoAccountView[]>([]);
-  const [history, setHistory] = useState<DoubaoHistoryEvent[]>([]);
   const [stats, setStats] = useState<DoubaoDashboardStats | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
   const refresh = async () => {
     setRefreshing(true);
     try {
-      // 环境检测 / 账号池 / 运维历史 / 看板统计并行；后三者失败不阻断概述。
-      // locate 同样降级（失败置 null → installed=false 走未安装提示），
-      // 避免 locate 单路失败 reject 拖垮已降级的其余三路
-      const [loc, accs, hist, st] = await Promise.all([
-        api.env.locate('doubao').catch(() => null),
+      // 环境检测 / 账号池 / 看板统计并行；后两者失败不阻断概述。
+      // locate 单独 catch 为 null：否则 reject 会短路 Promise.all，丢弃已成功的账号池/看板统计结果
+      let locateErr: unknown = null;
+      const [loc, accs, st] = await Promise.all([
+        api.env.locate('doubao').catch((e) => {
+          locateErr = e;
+          return null;
+        }),
         api.doubao.accountsList().catch(() => [] as DoubaoAccountView[]),
-        api.doubao.history().catch(() => [] as DoubaoHistoryEvent[]),
         // 失败哨兵 undefined：保留上次成功数据，不把已有统计清成空态
-        //（对齐 accountsList/history 失败给空数组的降级口径）
+        //（对齐 accountsList 失败给空数组的降级口径）
         api.doubao.dashboardStats().catch(() => undefined),
       ]);
-      setLocate(loc);
+      // locate 失败沿用原有失败路径（toast 提示环境检测问题），但不清空已有 locate、不丢其余数据
+      if (loc == null) pushToast('error', `豆包环境检测失败：${String(locateErr)}`);
+      else setLocate(loc);
       setAccounts(accs);
-      setHistory(hist);
       if (st !== undefined) setStats(st);
     } catch (err) {
       pushToast('error', `豆包概述刷新失败：${String(err)}`);
@@ -453,24 +348,48 @@ export default function DoubaoOverview() {
   }, []);
 
   const installed = !!locate?.exe;
-  const sourceText =
-    locate?.source === 'settings'
-      ? '手动指定'
-      : locate?.source === 'registry'
-        ? '注册表'
-        : locate?.source === 'default'
-          ? '默认路径'
-          : locate?.source === 'process'
-            ? '进程反查'
-            : '未检测到';
-  const snapshotCount = accounts.filter((a) => a.has_snapshot).length;
   const currentAccount = accounts.find((a) => a.is_current);
+
+  /** 告警汇总：会话过期 + 7 天内到期 + 超 25 天未保活（口径与账号管理页到期提醒一致） */
+  const alerts = useMemo(() => {
+    const expired = accounts.filter((a) => a.session_state === 'expired');
+    const soon = accounts.filter((a) => {
+      if (!a.session_expire_at || a.session_state === 'expired') return false;
+      const t = new Date(a.session_expire_at.replace(' ', 'T')).getTime();
+      return !Number.isNaN(t) && t - Date.now() < 7 * 24 * 3600 * 1000;
+    });
+    // 保活是全局任务：取所有账号中最新一次保活时间（'YYYY-MM-DD HH:MM:SS' 字典序=时间序）
+    const lastKa = accounts
+      .map((a) => a.last_keepalive_at)
+      .filter((v): v is string => !!v)
+      .sort()
+      .pop();
+    const kaStale =
+      !!lastKa && (() => {
+        const t = new Date(lastKa.replace(' ', 'T')).getTime();
+        return !Number.isNaN(t) && Date.now() - t > 25 * 24 * 3600 * 1000;
+      })();
+    return { expired: expired.length, soon: soon.length, kaStale, total: expired.length + soon.length + (kaStale ? 1 : 0) };
+  }, [accounts]);
+
+  const alertHint =
+    alerts.total === 0
+      ? accounts.length > 0
+        ? '暂无告警：会话与保活状态正常'
+        : '保存登录态后开始监控会话状态'
+      : [
+          alerts.expired > 0 ? `${alerts.expired} 个会话已过期` : '',
+          alerts.soon > 0 ? `${alerts.soon} 个 7 天内到期` : '',
+          alerts.kaStale ? '超 25 天未保活' : '',
+        ]
+          .filter(Boolean)
+          .join(' · ');
 
   return (
     <div className="animate-fade-in">
       <PageHeader
         title="豆包 · 概述"
-        desc="豆包桌面版多账号管理 · 快照切换 / 会话保活 / 会员额度"
+        desc="豆包桌面版多账号管理 · 签到 / 额度 / 会话总览"
         actions={
           <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
@@ -478,129 +397,67 @@ export default function DoubaoOverview() {
         }
       />
 
+      {/* 顶部 KPI：账号总数 / 总额度 / 登录账号 / 告警提醒 */}
       <div className="mt-5 grid grid-cols-2 gap-4 xl:grid-cols-4">
         <button className="text-left" onClick={() => setView('doubao-accounts')}>
           <StatCard
             label="账号总数"
             value={String(accounts.length)}
-            hint={
-              currentAccount
-                ? `当前：${currentAccount.name}`
-                : accounts.length > 0
-                  ? '尚无切换记录'
-                  : '在账号管理页保存登录态后计入'
-            }
+            hint={accounts.length > 0 ? '点击进入账号管理' : '在账号管理页保存登录态后计入'}
             tone="brand"
           />
         </button>
         <StatCard
-          label="安装情况"
-          value={installed ? '已安装' : '未检测到'}
-          hint={locate?.version ? `${sourceText} · v${locate.version}` : sourceText}
-          tone={installed ? 'green' : 'amber'}
+          label="总额度"
+          value={(stats?.quota_total ?? 0).toLocaleString()}
+          hint={
+            stats && stats.quota_known_count > 0
+              ? `${stats.quota_known_count}/${stats.account_count} 个账号已知额度`
+              : '签到/巡检后自动回写'
+          }
+          tone="amber"
         />
         <button className="text-left" onClick={() => setView('doubao-accounts')}>
           <StatCard
-            label="登录态快照"
-            value={String(snapshotCount)}
-            hint={snapshotCount > 0 ? '可随时切换/恢复' : '随首次保存登录态生成'}
+            label="登录账号"
+            value={
+              currentAccount ? (
+                <span className="flex items-center gap-2 text-xl">
+                  <span className="max-w-40 truncate">{currentAccount.name}</span>
+                  {currentAccount.quota_level ? (
+                    <Badge tone="amber">{currentAccount.quota_level}</Badge>
+                  ) : currentAccount.quota_checked_at ? (
+                    <Badge tone="slate">免费</Badge>
+                  ) : null}
+                </span>
+              ) : (
+                '未检测到'
+              )
+            }
+            hint={currentAccount ? `当前豆包登录账号 · ${currentAccount.user_id}` : '切换/保存登录态后展示'}
             tone="violet"
           />
         </button>
         <StatCard
-          label="数据目录"
-          value={locate?.user_data_dir ? '已定位' : '—'}
-          hint={locate?.user_data_dir}
-          tone="amber"
+          label="告警提醒"
+          value={
+            <span className="flex items-center gap-2">
+              {alerts.total > 0 && <TriangleAlert size={20} className="text-rose-500" />}
+              {alerts.total}
+            </span>
+          }
+          hint={alertHint}
+          tone={alerts.total > 0 ? 'red' : 'green'}
         />
       </div>
 
-      {/* 额度 KPI + 近 30 天签到结果 + 额度榜（需求①/④：总额度、签到结果、Top 榜） */}
-      {stats && (
-        <div className="mt-4 grid gap-4 lg:grid-cols-3">
-          <div className="space-y-4">
-            <StatCard
-              label="总额度"
-              value={stats.quota_total.toLocaleString()}
-              hint={stats.quota_known_count > 0 ? `${stats.quota_known_count}/${stats.account_count} 个账号已知额度` : '签到/巡检后自动回写'}
-              tone="amber"
-            />
-            <StatCard
-              label="今日新增额度"
-              value={`+${stats.today_reward.toLocaleString()}`}
-              hint={
-                stats.today_ok + stats.today_already + stats.today_failed > 0
-                  ? `签到成功 ${stats.today_ok} · 已签 ${stats.today_already} · 失败 ${stats.today_failed}`
-                  : '今日尚未签到'
-              }
-              tone="green"
-            />
-            {stats.max_continuous_days != null && (
-              <StatCard label="最长连续签到" value={`${stats.max_continuous_days} 天`} hint="池内账号当前连续签到天数最大值" tone="violet" />
-            )}
-          </div>
-          <CheckinResultsCard trend={stats.trend} />
-          <QuotaTopCard accounts={accounts} />
-        </div>
-      )}
-
-      {/* 洞察卡（额度趋势 + 运维健康）上移至账号概览之前 */}
-      {(history.length > 0 || accounts.length > 0) && <DoubaoInsights events={history} />}
-
-      {/* 账号概览：会员等级/到期状态并入行内（原到期日历信息） */}
-      {accounts.length > 0 && (
-        <div className="mt-5 card p-4">
-          <div className="mb-3 flex items-center gap-2">
-            <Users size={16} className="text-violet-500" />
-            <span className="text-sm font-medium">账号概览</span>
-          </div>
-          <div className="space-y-2">
-            {accounts.slice(0, 5).map((a) => (
-              <button
-                key={a.user_id}
-                onClick={() => setView('doubao-accounts')}
-                className="flex w-full items-center gap-3 rounded-lg border border-slate-100 p-3 text-left transition hover:bg-slate-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
-                title={a.quota_summary ? `额度：${a.quota_summary}${a.quota_checked_at ? `（${a.quota_checked_at} 查询）` : ''}` : undefined}
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    {a.name}
-                    {a.is_current && (
-                      <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
-                        当前账号
-                      </span>
-                    )}
-                    {a.quota_level ? (
-                      <Badge tone="violet">{a.quota_level}</Badge>
-                    ) : a.quota_checked_at ? (
-                      <Badge tone="slate">免费</Badge>
-                    ) : null}
-                  </div>
-                  <div className="font-mono text-xs text-slate-400">{a.user_id}</div>
-                </div>
-                <MemberExpiry a={a} />
-                <div className="shrink-0 text-xs text-slate-400">
-                  {a.has_snapshot ? `快照 ${a.last_modified || '—'}` : '无快照'}
-                </div>
-              </button>
-            ))}
-            {accounts.length > 5 && (
-              <button onClick={() => setView('doubao-accounts')} className="text-xs text-brand-600 hover:underline dark:text-brand-400">
-                查看全部 {accounts.length} 个账号 →
-              </button>
-            )}
-          </div>
-        </div>
-      )}
+      {/* 近 30 天签到结果 + 额度 TOP 榜（各占一行） */}
+      <div className="mt-4 space-y-4">
+        <CheckinResultsCard trend={stats?.trend ?? []} />
+        <QuotaTopCard accounts={accounts} />
+      </div>
 
       <DoubaoSetupGuide installed={installed} accounts={accounts} />
-
-      <div className="mt-4 flex items-start gap-2 rounded-lg border border-slate-100 p-3 text-xs text-slate-500 dark:border-zinc-800">
-        <ShieldCheck size={14} className="mt-0.5 shrink-0" />
-        <span>
-          合规说明：本工具仅管理本人合法持有的豆包账号，不破解、不绕过付费；会员额度仅做展示。会话凭证等同密码，仅本地存储并全程掩码展示。
-        </span>
-      </div>
     </div>
   );
 }

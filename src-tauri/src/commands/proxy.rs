@@ -31,11 +31,25 @@ static PROXY_GEN: AtomicU64 = AtomicU64::new(0);
 static PREV_SYSTEM_PROXY: Mutex<Option<(bool, String, String)>> = Mutex::new(None);
 
 /// 运行中的代理句柄（进程内 ProxyServer + 启动元数据）。
+/// 2026-11-06 起改为进程级静态：调度器任务线程（豆包 probe 自动保活）也需要
+/// 查询/启停代理，原 managed State 仅命令层可访问。语义不变：
 /// Drop 不需要 kill 子进程：ProxyServer 析构即发送 shutdown 信号终止 accept 循环。
 pub struct ProxyHandle {
     pub server: crate::device_proxy::ProxyServer,
     pub started_at: i64,
     pub gen: u64,
+}
+
+static PROXY_HANDLE: Mutex<Option<ProxyHandle>> = Mutex::new(None);
+
+/// 进程级句柄锁（防毒化恢复）；命令层与任务线程统一经此访问
+pub(crate) fn proxy_handle_lock() -> std::sync::MutexGuard<'static, Option<ProxyHandle>> {
+    PROXY_HANDLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 代理是否运行中（任务线程可查）
+pub(crate) fn proxy_is_running() -> bool {
+    proxy_handle_lock().is_some()
 }
 
 #[derive(serde::Serialize)]
@@ -172,11 +186,6 @@ fn port_pids(_port: u16) -> Vec<String> {
     vec![]
 }
 
-/// 安全获取 Mutex 锁，即使中毒也能恢复（避免 panic 级联）。
-fn safe_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// 同步托盘「代理」菜单文本（未运行显示"启动"，运行中显示"停止"）；
 /// 托盘 / 前端命令 / 开机自启三条路径都汇聚到 proxy_start/proxy_stop，此处统一覆盖
 fn sync_tray_proxy_text(app: &tauri::AppHandle, running: bool) {
@@ -193,13 +202,12 @@ fn sync_tray_proxy_text(app: &tauri::AppHandle, running: bool) {
 pub async fn do_start(
     app: &AppHandle,
     state: &AppState,
-    proxy_state: &Mutex<Option<ProxyHandle>>,
     port: u16,
 ) -> Result<ProxyStatus, String> {
     // 标记「非主动停止」，供看门狗区分崩溃与用户停止
     PROXY_INTENTIONAL_STOP.store(false, Ordering::Relaxed);
     {
-        let mut g = safe_lock(proxy_state);
+        let mut g = proxy_handle_lock();
         match &*g {
             Some(h) if h.server.is_running() => return Err("代理已在运行".into()),
             // 残留死句柄（崩溃后看门狗尚未清理）：直接回收后继续启动
@@ -367,7 +375,7 @@ pub async fn do_start(
     spawn_watchdog(app.clone(), state.data_dir.clone(), gen, server.exit_signal());
 
     {
-        let mut g = safe_lock(proxy_state);
+        let mut g = proxy_handle_lock();
         *g = Some(ProxyHandle { server, started_at, gen });
     }
 
@@ -412,8 +420,8 @@ fn spawn_watchdog(app: AppHandle, data_dir: PathBuf, gen: u64, mut exit_rx: watc
             return;
         }
         // 清理死句柄（仅当代际匹配，避免误清新实例）
-        if let Some(ps) = app.try_state::<Mutex<Option<ProxyHandle>>>() {
-            let mut g = ps.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut g = proxy_handle_lock();
             if g.as_ref().map(|h| h.gen) == Some(gen) {
                 g.take();
             }
@@ -445,19 +453,28 @@ fn spawn_watchdog(app: AppHandle, data_dir: PathBuf, gen: u64, mut exit_rx: watc
 pub async fn proxy_start(
     app: AppHandle,
     state: State<'_, AppState>,
-    proxy_state: State<'_, Mutex<Option<ProxyHandle>>>,
     port: u16,
 ) -> Result<ProxyStatus, String> {
-    do_start(&app, &state, &proxy_state, port).await
+    do_start(&app, &state, port).await
+}
+
+/// 同步启动代理（调度器任务线程用，2026-11-06 方案 A）：复用 do_start 全部语义
+/// （系统代理快照/上游透传/端口预检/看门狗）。任务线程非 async 上下文，经
+/// block_on 桥接（与托盘 proxy-toggle 同款模式）。
+pub(crate) fn start_proxy_blocking(
+    app: &AppHandle,
+    state: &AppState,
+    port: u16,
+) -> Result<ProxyStatus, String> {
+    tauri::async_runtime::block_on(do_start(app, state, port))
 }
 
 #[tauri::command]
 pub fn proxy_stop(
     app: AppHandle,
     state: State<AppState>,
-    proxy_state: State<Mutex<Option<ProxyHandle>>>,
 ) -> Result<ProxyStatus, String> {
-    let mut g = safe_lock(&proxy_state);
+    let mut g = proxy_handle_lock();
     let (port, captured) = match &*g {
         Some(h) => (h.server.port, h.server.captured.load(Ordering::Relaxed)),
         None => (0, 0),
@@ -500,13 +517,49 @@ pub fn proxy_stop(
     })
 }
 
+/// 同步停止代理（调度器任务线程用，2026-11-06 方案 A）：proxy_stop 命令的核心抽取，
+/// 事件/托盘同步在 app=None 时跳过（仅 app_log）。语义与命令层完全一致：
+/// 仅「确曾接管」才还原系统代理，重复调用幂等安全。
+pub(crate) fn stop_proxy_blocking(state: &AppState, app: Option<&AppHandle>) -> Result<ProxyStatus, String> {
+    let mut g = proxy_handle_lock();
+    let (port, captured) = match &*g {
+        Some(h) => (h.server.port, h.server.captured.load(Ordering::Relaxed)),
+        None => (0, 0),
+    };
+    let was_running = g.is_some();
+    if let Some(h) = g.take() {
+        PROXY_INTENTIONAL_STOP.store(true, Ordering::Relaxed);
+        let c = h.server.captured.load(Ordering::Relaxed);
+        h.server.stop();
+        fs_utils::app_log(&state.data_dir, &format!("代理已停止: 共捕获 {c} 个账号"));
+    }
+    if was_running {
+        if let Err(e) = restore_system_proxy(true) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("还原系统代理失败(可手动在设置中关闭): {e}"),
+            );
+        }
+    } else if let Some(app) = app {
+        let _ = app.emit("proxy-log", "代理未在运行，系统代理无需还原");
+    }
+    if let Some(app) = app {
+        sync_tray_proxy_text(app, false);
+    }
+    Ok(ProxyStatus {
+        running: false,
+        port,
+        captured,
+        started_at: None,
+    })
+}
+
 #[tauri::command]
 pub fn proxy_status(
     _app: AppHandle,
     _state: State<AppState>,
-    proxy_state: State<Mutex<Option<ProxyHandle>>>,
 ) -> ProxyStatus {
-    let g = safe_lock(&proxy_state);
+    let g = proxy_handle_lock();
     match &*g {
         Some(h) => ProxyStatus {
             running: h.server.is_running(),
@@ -557,7 +610,9 @@ pub(crate) fn clear_win_proxy() -> Result<(), String> {
 /// server 形态与 Windows 分支一致（"127.0.0.1:8899"）。
 #[cfg(target_os = "macos")]
 pub(crate) fn set_win_proxy(addr: &str) -> Result<(), String> {
-    crate::platform::proxy_ctl::apply_system_proxy(true, addr, "127.0.0.1;localhost;<local>")
+    // bypass 不带 Windows 专属 `<local>`（审查修复）：networksetup 不解析该关键字，
+    // 会写成字面量死条目；127.0.0.1/localhost 已覆盖本机 API 服务绕过
+    crate::platform::proxy_ctl::apply_system_proxy(true, addr, "127.0.0.1;localhost")
 }
 
 /// mac 还原清空：off 态逐服务关闭（bypass 列表不动——代理已关，列表不再生效，

@@ -132,7 +132,7 @@ interface AppState {
   refreshGroups: () => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshLogs: (q?: LogQuery, manual?: boolean) => Promise<void>;
-  refreshCreditsHistory: () => Promise<void>;
+  refreshCreditsHistory: () => Promise<boolean>;
   refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
   refreshLocalEntitlement: () => Promise<void>;
@@ -169,7 +169,8 @@ interface AppState {
     skip_checked_in: boolean;
     skip_expired: boolean;
   }) => Promise<void>;
-  refreshRemainingCredits: () => Promise<void>;
+  /** 逐账号上游刷新可用积分；返回是否成功（失败已弹 error toast），供调用方决定是否再弹「已刷新」 */
+  refreshRemainingCredits: () => Promise<boolean>;
   cooldownClear: (userId: string) => Promise<void>;
   refreshJwt: (userId: string, force?: boolean) => Promise<void>;
   saveSettings: (patch: Partial<Settings>) => Promise<void>;
@@ -220,6 +221,11 @@ function defaultSettings(): Settings {
     // 豆包每日签到（landing/checkin）：调度开关默认开、默认 09:15 错峰 quota 09:30
     doubao_checkin_enabled: true,
     doubao_checkin_hhmm: '09:15',
+    // 豆包 probe 自动保活（方案 A，默认开）：签到前 probe 缺失/过期自动抓包对齐
+    doubao_probe_auto_keepalive: true,
+    doubao_sync_mode: 'every_hours',
+    doubao_sync_hours: '2',
+    doubao_sync_hhmm: '23:50',
     workbuddy_path: null,
     codebuddy_path: null,
     wb_auth_file_path: null,
@@ -769,12 +775,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       // failed_empty_campaigns（活动未开始/不可用）为非用户可操作失败：与真实
       // 失败分开计数，避免用户对无解失败反复重试（口径对齐 Rust 侧补签通知）
       const empty = Math.max(0, num(ev.failed_empty_campaigns));
+      // failed_blocked（风控信任未建立 BLOCKED，issue #190）恢复需用户操作
+      // （切换账号 + 客户端建信任），单列提示操作路径，不混入可重试失败
+      const blocked = Math.max(0, num(ev.failed_blocked));
       const failed = num(ev.failed);
       const done: QoderCheckinDone = {
         ok: num(ev.ok),
         already: num(ev.already),
         failed,
         empty,
+        blocked,
       };
       set((s) => ({
         qoderCheckin: { ...s.qoderCheckin, running: false, done, doneRev: s.qoderCheckin.doneRev + 1 },
@@ -783,12 +793,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 可重试数 = failed - empty - permanent（口径对齐调度器 retryable 判定），
       // 文案明示其中哪些需重新登录/更新 PAT，防用户对终态失败反复手点重试；
       // 级别：含终态失败同样 warn（需要用户行动，不降级 success）
-      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - empty));
-      const retryable = failed - empty - permanent;
+      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - empty - blocked));
+      const retryable = failed - empty - permanent - blocked;
       get().pushToast(
-        retryable > 0 || permanent > 0 ? 'warn' : 'success',
+        retryable > 0 || permanent > 0 || blocked > 0 ? 'warn' : 'success',
         `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
           (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : '') +
+          (blocked > 0
+            ? `（其中 ${blocked} 项被风控拦截：请切换到该账号并打开 Qoder 客户端使用一次建立信任，再手动重试（信任生效可能有延迟）；若重试仍拦截，在客户端内重新登录该账号正常使用后，用「扫描本地账号」重新添加）`
+            : '') +
           (permanent > 0 ? `（其中 ${permanent} 项需重新登录/更新 PAT 后重试）` : ''),
       );
       return;
@@ -968,12 +981,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       logsPollInflight = false;
     }
   },
+  // 返回成功与否：看板刷新据其聚合 ok，避免「失败 error toast 与已刷新 success toast 并存」
   refreshCreditsHistory: async () => {
     try {
       const creditsHistory = await api.misc.creditsHistory();
       set({ creditsHistory });
+      return true;
     } catch (err) {
       get().pushToast('error', `读取积分历史失败：${String(err)}`);
+      return false;
     }
   },
   refreshCreditsDaily: async () => {
@@ -1242,8 +1258,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (ok > 0) {
         get().pushToast('success', `已刷新 ${ok} 个账号的可用积分`);
       }
+      return true;
     } catch (err) {
       get().pushToast('error', `刷新可用积分失败：${String(err)}`);
+      return false;
     }
   },
   cooldownClear: async (userId) => {

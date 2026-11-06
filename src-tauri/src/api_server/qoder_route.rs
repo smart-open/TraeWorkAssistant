@@ -1647,10 +1647,18 @@ pub async fn qoder_aggregate_chat(
         }
         // issue #182/#154 图片门控收窄（同流式路径注释）：视觉模型放行直传，
         // 非视觉模型 F-63 明示拒绝。"upstream 400 error:" 前缀走既有状态码
-        // 解析通道透传 400
+        // 解析通道透传 400。文案区分两类 fail-closed 场景（同流式路径）：
+        // 目录显式 supportsImages=false（确知不支持）vs 缺字段/类型异常
+        //（未声明，按不支持保守处理）——用户据此分辨「换模型」还是「补目录声明」
         if body_has_image(&peek) && !entry_supports_images(&entry) {
+            let declared_no_vl = entry.get("supportsImages") == Some(&Value::Bool(false));
+            let reason = if declared_no_vl {
+                "不支持视觉输入（Qoder 目录 is_vl=false）"
+            } else {
+                "未声明视觉能力（Qoder 目录缺 supportsImages 声明），按不支持处理"
+            };
             return Err(format!(
-                "upstream 400 error: 模型 {model} 不支持视觉输入（Qoder 目录 is_vl=false），请移除图片或改用支持视觉的模型"
+                "upstream 400 error: 模型 {model} {reason}，请移除图片或改用支持视觉的模型"
             ));
         }
         let model_key = entry

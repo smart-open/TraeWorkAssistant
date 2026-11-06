@@ -16,6 +16,7 @@
 
 pub mod doubao_chats;
 pub mod doubao_checkin;
+pub mod doubao_probe;
 pub mod doubao_quota;
 pub mod doubao_session;
 pub mod qoder_catalog;
@@ -112,8 +113,25 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
     }
     let result = match name {
         "doubao-quota" => doubao_quota::run_batch(state),
-        // 豆包每日签到（需求③：schtasks 直调 + 应用内调度器共用；空池跳过）
-        "doubao-checkin" => doubao_checkin::run_batch(state),
+        // 豆包每日签到（需求③：schtasks 直调 + 应用内调度器共用；空池跳过）。
+        // 轮次互斥（对齐 wb-checkin/wb-growth 分发处 skipped_busy 惯例）：锁名独立于
+        // run_batch 内部轮次锁（"doubao"/"checkin-round"）与按日落库锁
+        //（"doubao_checkin"/"record_day_at"），不同名互斥体互不阻塞、无自锁死
+        "doubao-checkin" => {
+            match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+                &state.data_dir,
+                "doubao_checkin_batch",
+                "round",
+                0,
+            ) {
+                (Some(_round), _) => doubao_checkin::run_batch(state, None),
+                (None, _) => Ok(serde_json::json!({
+                    "ok": true,
+                    "skipped": "其他进程正在执行签到，本轮跳过",
+                    "skipped_busy": true
+                })),
+            }
+        }
         // WorkBuddy 每日签到（schtasks 直调；--json-stream --skip-checked 同款参数）。
         // issue #134 方案4：抢完整轮次锁与 GUI 进程互斥——CLI 是独立进程，GUI 进程内
         // 的 tokio 轮次锁对它无效，必须靠跨进程命名互斥体；GUI 正在跑（UI/调度器/
@@ -168,7 +186,13 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 .get("failed_permanent")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty - failed_permanent > 0 {
+            // 风控信任未建立（issue #190）与调度器口径对齐：BLOCKED 恢复需用户
+            // 操作（切换账号 + 客户端建信任），计入 Err 只会造成次日误报
+            let failed_blocked = done
+                .get("failed_blocked")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 Err(format!(

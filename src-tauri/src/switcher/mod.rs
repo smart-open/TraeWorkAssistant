@@ -842,7 +842,12 @@ fn apply_fingerprint_override(sess: &Session, sink: &dyn ProgressSink) {
         Ok(n) => sink.step(
             "fingerprint",
             StepStatus::Ok,
-            &format!("本地设备指纹已按账号绑定覆写（{n} 处）"),
+            // issue #190：覆写成功后前置告知信任建立路径——服务端按「账号 × 设备指纹」
+            // 信任分桶，指纹刚同步时服务端尚未见过该指纹，首次盲发签到会被 BLOCKED
+            // 拦截；打开客户端正常使用一次即可建立信任
+            &format!(
+                "本地设备指纹已按账号绑定覆写（{n} 处）——首次签到前请打开 Qoder 客户端正常使用一次，以建立服务端信任（否则盲发签到会被风控拦截）"
+            ),
         ),
         Err(e) => sink.step(
             "fingerprint",

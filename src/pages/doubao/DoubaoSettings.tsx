@@ -51,6 +51,9 @@ export default function DoubaoSettings() {
   // checkinHhmm = 已保存生效值；checkinHhmmDraft = 输入草稿（合法才提交保存）
   const [checkinHhmm, setCheckinHhmm] = useState('09:15');
   const [checkinHhmmDraft, setCheckinHhmmDraft] = useState('09:15');
+  // probe 自动保活开关（main 2026-11-06，方案 A，默认开）：签到前 probe 缺失/过期时自动
+  // 开代理 + 切客户端抓包对齐（710010702 设备指纹缺失的自愈链）
+  const [probeAutoKeepalive, setProbeAutoKeepalive] = useState(true);
 
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
@@ -140,6 +143,23 @@ export default function DoubaoSettings() {
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(checkinHhmmDraft)) setCheckinHhmmDraft(checkinHhmm);
   };
 
+  // probe 自动保活开关（main 2026-11-06，方案 A，默认开）
+  const toggleProbeAutoKeepalive = async (v: boolean) => {
+    setProbeAutoKeepalive(v);
+    try {
+      await saveSettings({ doubao_probe_auto_keepalive: v });
+      pushToast(
+        'success',
+        v
+          ? '已开启：签到前自动抓包对齐（代理未运行会自动启动；豆包客户端会被短暂切换账号）'
+          : '已关闭：probe 缺失/过期时签到将回退内置参数（可能被上游风控拒绝 710010702）',
+      );
+    } catch (err) {
+      setProbeAutoKeepalive(!v);
+      pushToast('error', `保存设置失败：${String(err)}`);
+    }
+  };
+
   const refreshTaskStatus = async () => {
     try {
       const s = await api.doubao.taskStatus();
@@ -192,6 +212,7 @@ export default function DoubaoSettings() {
       setKeepaliveEnabled(settings.doubao_keepalive_enabled !== false);
       setQuotaEnabled(settings.doubao_quota_enabled !== false);
       setCheckinEnabled(settings.doubao_checkin_enabled !== false);
+      setProbeAutoKeepalive(settings.doubao_probe_auto_keepalive !== false);
       if (settings.doubao_checkin_hhmm) {
         setCheckinHhmm(settings.doubao_checkin_hhmm);
         setCheckinHhmmDraft(settings.doubao_checkin_hhmm);
@@ -205,7 +226,7 @@ export default function DoubaoSettings() {
       void refreshCheckinTaskStatus();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_checkin_hhmm]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_checkin_hhmm, settings?.doubao_probe_auto_keepalive]);
 
   const detect = async () => {
     setDetecting(true);
@@ -344,23 +365,22 @@ export default function DoubaoSettings() {
   const runCheckinNow = async () => {
     setCheckinRunning(true);
     try {
-      // 返回契约：batch → { ok, total, success, already, failed, reward_total, errors, finished_at }
+      // 返回契约（合并审查 D-M1 修正）：后端 run_batch 在 failed>0 时返回 Err
+      //（"豆包签到：N 成功 / N 已领 / N 失败：…"），部分成功走 catch；ok 载荷
+      // 仅在全部成功/已签时到达：{ ok, total, success, already, failed, reward_total, finished_at }
       const r = (await api.doubao.checkinRun()) as {
         skipped?: string;
+        /** 空池豁免口径（后端 run_batch：空池不返 skipped，防调度器 mark_run 固化当日已跑） */
+        skipped_empty_pool?: string;
         total?: number;
         success?: number;
         already?: number;
         failed?: number;
         reward_total?: number;
       };
-      if (r.skipped) {
-        pushToast('info', `签到跳过：${r.skipped}`);
-      } else if ((r.failed ?? 0) > 0) {
-        // 有失败账号：warn 语气（批量结果恒 ok:true，不能靠返回值区分，按失败数定调）
-        pushToast(
-          'warn',
-          `签到完成：共 ${r.total ?? 0} 个账号，成功 ${r.success ?? 0} · 已签 ${r.already ?? 0} · 失败 ${r.failed ?? 0}，新增额度 +${r.reward_total ?? 0}`,
-        );
+      const skippedMsg = r.skipped ?? r.skipped_empty_pool;
+      if (skippedMsg) {
+        pushToast('info', `签到跳过：${skippedMsg}`);
       } else {
         pushToast(
           'success',
@@ -368,7 +388,14 @@ export default function DoubaoSettings() {
         );
       }
     } catch (err) {
-      pushToast('error', `签到失败：${String(err)}`);
+      const msg = String(err);
+      // 部分成功也走 Err：识别汇总串降级 warn，避免把部分成功报成整体失败
+      const m = msg.match(/豆包签到：(\d+) 成功 \/ (\d+) 已领 \/ (\d+) 失败/);
+      if (m) {
+        pushToast('warn', `签到完成：成功 ${m[1]} · 已签 ${m[2]} · 失败 ${m[3]}，详见签到记录`);
+      } else {
+        pushToast('error', `签到失败：${msg}`);
+      }
     } finally {
       setCheckinRunning(false);
     }
@@ -720,6 +747,26 @@ export default function DoubaoSettings() {
                 {/* macOS 兼容：「每日任务」schtasks 卡仅 Windows 渲染，跨平台引用不可见元素会误导 */}
                 {`关闭后应用内调度器不再执行每日自动签到${platform === 'windows' ? '；与上方「每日任务」（Windows 计划任务）相互独立' : ''}。`}
                 无豆包账号时自动跳过，不记失败、不推送通知。
+              </span>
+            </span>
+          </label>
+
+          {/* probe 自动保活开关（main 2026-11-06，方案 A） */}
+          <label className="flex cursor-pointer items-start gap-2.5">
+            <input
+              type="checkbox"
+              checked={probeAutoKeepalive}
+              onChange={(e) => void toggleProbeAutoKeepalive(e.target.checked)}
+              className="mt-0.5 h-4 w-4 shrink-0 accent-rose-500"
+            />
+            <span>
+              <span className="font-medium text-slate-600 dark:text-zinc-200">
+                签到前自动抓包对齐（probe 自动保活）
+              </span>
+              <span className="mt-0.5 block leading-relaxed">
+                开启后：签到时若抓包参数缺失/过期，自动启动代理（未运行时）→ 以账号打开豆包注入代理 →
+                等客户端自动抓包入库（每账号约 30-60 秒）→ 继续签到。注意：豆包客户端会被短暂切换账号，
+                结束停留在最后处理的账号；代理由保活启动的会在结束后自动停止还原。
               </span>
             </span>
           </label>

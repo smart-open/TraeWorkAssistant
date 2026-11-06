@@ -1,10 +1,10 @@
-# 产品优化需求清单（全应用统一待办）
+﻿# 产品优化需求清单（全应用统一待办）
 
-> **文档版本**: v3.0.3 · 2026-10-14（macos_main 合并 origin/main 3.7.12：F-82 Trae 双应用合并适配 + issue #102/#105 同批吸收）
+> **文档版本**: v3.0.4 · 2026-11-06
 > **定位**: 全项目**唯一待办依据**——所有未实施的优化与需求项均在此登记，每条含需求概述 / 实现路径 / 参考开源项目。
+> **v3.0.4 变更**（2026-11-06）：新增 **F-83 网关客户端配置示例扩展 + 模型目录一键复制**（P2）、**F-84 网关结构化请求日志**（P3）、**F-85 网页类平台接入网关**（P3 远期留档）——源自 issue #174 用户反馈（统一网关：网页类平台入池 + Claude Code/Codex/cc-switch 配置示例）；需求 4（429 冷却/额度耗尽换号/竞速对冲）经现状核对已由既有机制覆盖（冷却矩阵 + tried 换号 + F-76 对冲 + F-77 并发感知），执行期跨池回退残余窗口已有 F-81 在册，不重复登记。另新增 **F-86 全自动静默更新（待评估）**——源自 issue #175（现有更新链路需用户两次确认，非全自动；后端三命令链已齐备，缺无人值守编排与默认策略决策）；**F-87 schtasks 唤醒与错过补跑设置（P2）**——同源自 issue #175 稳定性需求 1（schtasks 注册面未设 WakeToRun / StartWhenAvailable，睡眠跨过触发时刻后系统级任务不自动补跑；应用内调度器启动补跑语义已有，仅缺系统任务计划程序层开关）。
 > **v3.0.3 变更**（2026-10-14）：新增 **F-82 Trae 双应用合并适配 ✅ 已完成**——官方将 Trae Work（TRAE SOLO）与 Trae CN IDE 合并为单一客户端，全工程按四期方案收敛单应用（后端 TargetApp 退役 TraeWork 别名 / uid 推导证据源收敛 / 存量 settings 键与快照池自动迁移 / 前端与文档同步），方案全文见 `docs/completed/Trae双应用合并适配调整方案.md`。
 > **v3.0.2 变更**（2026-10-11）：新增 **F-81 池耗尽后跨池重试**（P2，源自 2026-10-11 shared-groups-tags 调度全链路审查）：双源模型首选池在**执行期**逐账号耗尽（401/积分耗尽/SessionDead）时直接 503，即便其余池可服务——跨池回退目前仅在首调 `pool_health` 预检失败时生效，执行期耗尽不在覆盖面；条目含编排器外提方案（方案 A）与最小补丁方案（方案 B）论证。同批审查修复项（org_index invalidate 补漏、KEYS_STATE 锁外展开、load_index 单事务、Trae savePool 防护、per_model 编辑 UI 等）随当日改动直接落地，不占待办编号。
-> **v3.0.2 变更**（2026-10-10，合并代码审查补记，随合并改号）：新增 **F-82 macOS OAuth 登录 URL 设备指纹硬编码 Windows**（Info 级存量，git 证实 9a7ca17 引入，与 Windows 抓包凭证模拟链自洽）——v3.7.5 合并审查（merge aec8509）中裁定不属本次引入、不构成功能缺陷，登记待评估。（原编号 F-81，2026-10-11 main 侧登记同名编号条目「池耗尽后跨池重试」，合并时本条让号改 F-82）
 > **v3.0.1 变更**（2026-10-06，补记）：**F-80 Qoder 平台全面支持 ✅ 已完成**——v3.7.0（2026-10-04）交付（详见 CHANGELOG 3.7.0 与本文 F-80 条目）：COSY 签名上游网关 + 积分看板三平台化（Trae/Buddy/Qoder）+ 账号三通道入池（PAT / OAuth 设备流 / IDE 扫描）+ 每日双活动签到 + qoder 四表；API 网关由三池升级为 **trae / buddy / qoder / custom 四池调度**。F-80-余 后续优化项状态见总览。
 > **v3.0 变更**（2026-09-26，待办全量复核 + F-75 收官）：① **F-75 macOS 平台支持标记 ✅ 已完成**——macos_main 分支产品化（2026-09-17~26，22 提交）：platform 服务层 + 平台门控 + dmg 构建流水线（db4efd4）、app_locate mac bundle 分派 + LaunchServices 启动（5c1f79a）、平台抽象层收敛（113350a）、R1-R3 真机收口 + 双平台二轮审查修复（4adf498）、三/四轮真机修复——vault 双源密钥 + mac JWT 本地捕获 + 切换链收口（97e4dd5）、CI 三产物矩阵 aarch64/x64/universal + 可选自签（3c89310）、package_macos.mjs dmg + 便携 zip（81a9870）、dmg 打包重试（16a9b3d）、局域网网卡黑名单补 mac 虚拟接口（3a31d17）、内置更新竞态修复（#37）+ macOS 手动安装引导（e96a218）；随 3.6.1/3.6.2 发 mac dmg，AGENT.md §11.1 双平台发版红线在案；② 其余待办经代码检索复核状态无变化（F-70 余项 tc 直读仍未接入 `apps_accounts_discover`；F-38/E-01/E-02/F-69/F-79 等确认未实施，状态属实）。
 > **v2.9 变更**（2026-09-16，网关请求链路堵塞分析批次落地）：① 新增 **F-79 网关流式上游异步化**（reqwest + async SSE，原「D-2 二期」）——同批已落地的过渡方案：调度配置内存缓存（A）+ API 日志异步写入（B）+ 用量/Key 记账削峰落盘（C/E）+ 流式专用阻塞池线程隔离（D-1），P0 级堵塞（spawn_blocking 池耗尽、async worker 同步 SQLite）已消除，F-79 为彻底形态；② 其余待办项状态复核无变化。
@@ -37,6 +37,11 @@
 | W-01 ❌ | Work 积分（209）接入 API 网关（多活会话编排） | Trae/网关 | — | — | 已排除（2026-09-15）：Trae 积分签到调整，前提与收益均不成立，见 §三/§四 |
 | F-70 | Trae tc 凭证直读 + ECDSA P-256 刷新情报核对 | Trae 生态 | **P2** | 1~2 天（余量） | **部分完成**（解密算法 + DeviceProof 已落地 2026-09-16；剩余账号发现直读接入） |
 | F-81 | 池耗尽后跨池重试（执行期耗尽的池间回退编排） | 网关 | **P2** | 2~3 天 | 待开发（2026-10-11 调度全链路审查产出，方案已论证见条目） |
+| F-83 | 网关客户端配置示例扩展 + 模型目录一键复制 | 网关/前端 | **P2** | 1~2 天 | 待开发（issue #174） |
+| F-84 | 网关结构化请求日志（最近请求的池/账号/结果视图） | 网关/前端 | P3 | 1~2 天 | 待开发（issue #174） |
+| F-85 | 网页类平台接入网关（网页会话类上游） | 网关 | P3 | — | 远期（前置=平台支持，暂未规划，issue #174） |
+| F-86 | 全自动静默更新（检查→下载→安装全程无确认） | 全应用 | P3 | 评估先行 | 待评估（issue #175：现状需用户两次确认，非全自动） |
+| F-87 | schtasks 唤醒计算机 + 错过尽快启动（睡眠后补跑） | 全应用 | **P2** | 0.5~1 天（含真机验证） | 待开发（issue #175） |
 | F-82 ✅ | Trae 双应用合并适配（Trae Work 并入 Trae CN 单客户端，全链路收敛 + 存量迁移） | Trae 生态 | **P1** | 2~3 天（P0~P3 于 2026-10-14 当日完成） | 已完成（2026-10-14，方案见 docs/completed/Trae双应用合并适配调整方案.md） |
 | F-69 | Trae 会话导出存档（Markdown + 存档浏览器） | Trae 生态 | **P3** | 2~3 天 | 待开发 |
 | F-79 | 网关流式上游异步化（reqwest + async SSE 迁移） | 网关 | **P3** | 2~3 天 | 待开发（过渡方案 D-1/A/B/C/E 已落地 2026-09-16） |
@@ -52,7 +57,6 @@
 | F-72 | 网关上游多级回退 + 分档竞速调度 | 网关 | P3 | — | 远期（调度增强方向） |
 | F-73 | 网关反哺 IDE（第三方模型进 Trae） | Trae/网关 | P3 | — | 远期留档（方向验证） |
 | F-80-余 ✅ | Qoder 域后续优化（网关 v2 对冲/粘性 / Global 区 CN-only 标注 / 导出加密迁移提示 / 活动档期日历 / 帮助双语化不做） | Qoder/网关 | P3 | 1~2 天（实际 1 天） | 已完成（2026-10-02，双语化明确不做、Global 区降级为 CN-only 标注说明，详见条目） |
-| F-82 | macOS OAuth 登录 URL 设备指纹硬编码 Windows（x_device_type=windows） | Trae 生态 | P3 | 0.5~1 天（含真机验证） | 待评估（存量，Info 级，详见条目） |
 
 > 已完成项不再列于此（F-13 到期日历 / F-43 CC Switch 协同等已在版本中落地，详见 CHANGELOG.md）。
 
@@ -327,29 +331,6 @@
 - **参考开源项目**：`tauri-apps/tauri`（v2 多平台打包与 updater 官方范式）；`hwchen/keyring-rs`（三平台 secret store 统一抽象）；本项目既有 Rust 资产（`switcher/` 平台分派设计、`tasks/scheduler.rs` 跨平台调度、sysinfo 进程管理）。
 - **边界与风险**：①各目标应用 macOS 版布局是最大不确定性，M-1 侦察不通过的应用域先不支持（档案表按应用×平台灰度）；②Apple 签名公证需要 Developer ID 账号；③MITM 抓包在 macOS 需 Keychain 信任授权交互；④豆包 cookie 解密 mac 形态（Keychain Safe Storage）与 Windows DPAPI+AES-GCM 完全不同，属重写而非移植；⑤`machine.rs` 注册表层 mac 无等价物（MachineGuid），设备重置覆盖面在 mac 上降级（如实提示）。
 - **验收**：macOS 上完成 Trae 双账号切换 + WorkBuddy 切换 + 自动签到（内置调度器）+ 网关代理全链路；Windows 行为零变化（回归：现有 Rust 测试全绿 + 前端 tsc）。
-- **v2.7 进展（2026-09-19，全仓 Windows/macOS 兼容性审查收口）**：①代理启动 CA 探测三平台收口 `cert_ctl::cert_query`（删除 `installed_in_windows_root` 的 `cfg(not)` 恒 false 兜底，修复 mac 启动日志误报「CA 证书未安装」）；②全仓 **16 处业务路径基根直读**（APPDATA/LOCALAPPDATA/USERPROFILE 裸读）收口至 `platform` 层 lossy helper（`home_dir`/`app_support_root_lossy`/`local_data_root_lossy`，Windows 输出与裸读 env 一致并由单测锁定）：oauth 外置配置与调试 CA、workbuddy 全家桶（auth 文件 / `~/.workbuddy` / `~/.codebuddy` / token 统计 / 环境重置 / CodeBuddy live uid）、豆包 6 处（User Data / Local State / public_config）、`icube_auth` 设备凭证、`trae_apps` 自动发现；③`trae_apps.rs` 反斜杠 SUFFIX 常量组件化 join（mac 上原样会拼成单文件名组件永远 miss）；④`misc.rs` `write_text_file` 系统目录防护补 mac 分支（/System、/Library、/private、/etc）+ 前缀归一化平台化；⑤warning 清零（`trae_app_dirs` 补 cfg(windows) 门控、`sys_output`/`mac_data_dir_guess` 补 allow 注记）。验证：`cargo check` 零警告 + `cargo test` 437 全绿。
-- **v2.8 进展（2026-09-20，Intel Mac / macOS 12.7.6 真机 R1+R2+R3 收口）**：
-  - **R1 双架构编译验证 ✅**：rustup stable 1.98.1，`cargo check --target x86_64-apple-darwin` / `--target aarch64-apple-darwin` 均 **0 错误 0 警告**；`cargo test`（x86_64 原生）**431 全绿 0 警告**。首编译暴露并修复：3 个错误（env.rs `resolve_reg_profile_candidate` 缺 `cfg(not(macos))`、icube.rs 缺 PathBuf import、frontendDist 未构建）+ 15 处 mac 专属 dead_code（Windows 专属生产路径全部 cfg 门控：checkin `task_exists`、local_capture `offline_ctx`/`ProxyCtx` 导入、state.rs `IDENTIFIER`、authfile `WB_AUTH_DIR_REL`、doubao_session `dpapi_unprotect` 非 Windows 桩删除 + `copy_cookies_db`、profile.rs 四个 Windows 专用字段 `cfg_attr(macos, allow)`、`glob_match_ci` 双子、cert/locate 测试 mod 导入）；两处 mac 首跑解锁的测试修复（cmd.rs sys_command 测试补 POSIX echo 传参、updater pick_asset mac 测试 ARCH→dmg 令牌映射 x86_64→`_x64.dmg`）。
-  - **R2 M-1 九项侦察结论 ✅**（真机实测）：①Trae CN / TRAE SOLO CN 数据布局与 Windows globalStorage 同构，差异：无 Local State、无 Network/ 目录、Cookies 在根级；②WorkBuddy auth 文件实测于 `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`（JSON account.uid 可解析），`~/.workbuddy/storage` 同构；③豆包 mac 版存在（Chromium 布局，Cookies 在 Default/ 根级——chromium.rs 新旧布局归一已兼容）；④SIGTERM 落盘待 R4 实测；⑤Keychain 存在 "Trae CN Safe Storage"/"Doubao Safe Storage"（同机快照复制不受影响）；⑥**四应用 CFBundleExecutable 均为 "Electron"**——映像名匹配失效且必串台，主进程判定改路径 bundle 段 + CFBundleIdentifier 白名单双信号；⑦sysinfo kill 就位待 R4；⑧macOS 12 无 `scutil --proxies`（读代理改 networksetup 逐服务）；⑨CodeBuddy 客户端从未启动（无 ~/.codebuddy 与数据目录）→ 维持灰度。
-  - **R3 档案表回填 + 侦察驱动修复 ✅**：`profile.rs` 五档案 `data_dir` 全部 os 维度化（`roaming_dir`/`local_dir`/`home_join` helper，Windows 输出与原 env 直读逐字一致）；**四域（Trae/TraeWork/WorkBuddy/豆包）`mac_supported=true`**、CodeBuddy 维持 false；`proc.rs` mac 主进程按 `/<App>.app/Contents/MacOS/` bundle 段匹配（Helper 不误命中），`list_procs`/`running_exe_of`/`kill_all` 统一 `proc_matches` 分派（Windows 行为零变化）；`locate.rs` bundle 定位白名单双信号（CFBundleExecutable OR CFBundleIdentifier）；`icube.rs` mac items（根级 Cookies/-journal）+ `rel_path` 组件化（Windows 清单反斜杠路径在 mac 恒 miss 的根治）；`authfile.rs` wb_auth_dir mac 分支；`proxy_ctl.rs` mac 读代理 scutil→networksetup 逐服务（parse_enabled/parse_field 单测锁定）；`env.rs`/`local_capture.rs`/`cmd.rs`/`secret.rs` 零散 mac 编译收口。
-  - **R6 本地 dmg 构建 ✅（x86_64 形态）**：`npm run tauri build -- --target x86_64-apple-darwin --bundles dmg` 产出 `AI Work 助手_3.5.6_x64.dmg`（14M，资产命名与 updater `_x64.dmg` 令牌映射一致）；aarch64/universal 形态与 CI `build-macos.yml` 首跑、updater mac 闭环、Gatekeeper 引导实测留待 R7。
-  - **二轮全仓双平台兼容审查（2026-09-20，用户要求复审后修复）**：①P1——`workbuddy_open_auth_dir` 直建 `explorer` 无平台分派，mac 上「打开 auth 目录」必失败 → 改 `sys_command(if cfg!(windows) { "explorer" } else { "open" })`；②P2——`device_proxy/ca.rs` `self_heal_acl_if_needed` 内联 CommandExt 直建 icacls，违反 cmd.rs「全仓唯一 CommandExt」收敛不变量 → 改经 `sys_command`（CREATE_NO_WINDOW 语义不变）。复审确认无误项：locate `is_bundle_dir`（.app 目录形态判断正确）、proxy parse_field 行首前缀匹配（Port 不误吸 Authenticated 段，单测锁定）、icube restore 对称删除（Windows 清单条目 mac 恒 miss 不误删）、updater 双平台安装分支互斥完整、GUI 应用启动的 `Command::new`（env.rs/proc.rs）不属系统 CLI 收敛范畴维持原状（Windows 零变化）。修复后复验：双架构 check 0 错 0 警 + cargo test 431 全绿。
-  - **三轮「环境配置」检测链修复（2026-09-20，用户真机反馈：五应用全装但 mac 检测恒失败）**：根因两层——①`app_locate_macos` 探测调用传空 `bundle_ids`（维持 CFBundleExecutable 单信号），而 M-1 ⑥ 已证实四应用 exe 名均为 "Electron" → 目录名命中后 Info.plist 白名单全拒绝，恒 not_found；②`is_running` 系列按映像名比对，mac 上映像名恒 "Electron" → running 恒 false。修复：`process.rs` 新增 `mac_app_running`（bundle 主进程路径段匹配，与 proc.rs mac_main_matches 同款语义）；`app_locate_macos` 档案表接入 profile.rs 侦察 bundle_ids（cn.trae.app / com.bot.pc.doubao / com.tencent.workbuddy.mac / com.tencent.codebuddycn / cn.trae.solo.app）并传全四处探测调用；`env_check`/`env_check_trae_cn` 平台分派（mac 复用 app_locate 链）；`open_trae_app`/`open_trae_cn_app` mac 分派（bundle 定位 + `open --args` 透传 --proxy-server）；`detect_*`/`version_of`/`expand_env`/`registry_trae_path`/`resolve_reg_candidate` 全部 cfg(not(macos)) 门控；workbuddy `is_running` mac 分支同修。真机验证：五 .app（Trae CN / TRAE SOLO CN / Doubao / WorkBuddy / CodeBuddy CN）目录名与 bundle id 逐一对上（mdfind 秒回）；双架构 check 0 错 0 警 + cargo test 450 全绿。另：mac 无边框窗口 `maximized: true` 不生效（Tauri v2 已知缺陷）→ main.rs setup mac 分支手动铺满所在屏幕（下移菜单栏高度）；Cargo.toml `[lints.rust] linker_messages = "allow"` 放行 aws-lc 预编译汇编的 Apple ld compact-unwind 提示。
-  - **四轮全仓双平台兼容复审（2026-09-20，用户要求）**：7 类扫描（Windows CLI 裸调 24 处、环境变量裸读、Command::new 直建、Windows-only API、cfg 分支配对、前端 platform 门控、Tauri 配置）。结论：**基根层（profile.rs/platform/switcher）+ 前端门控层已全面收口**；发现 1 个真实漏网——`graceful_kill_app` mac 分支虽写了 SIGTERM/SIGKILL 三级，但存活判断走 `images_running`（映像名比对，mac 恒空）→ 三级关闭整体 no-op（切换前关闭客户端静默失效，影响 7 个调用方：open_trae_app/trae_cn/doubao/workbuddy/codebuddy 导入与重置）。修复：`process.rs` 新增 `bundles_for_app` + `signal_bundle_apps` + `wait_bundle_exit` + `graceful_kill_bundle_apps`（与 mac_app_running 同款 exe 路径 bundle 段匹配）；`graceful_kill_app` 平台分派（Windows 走映像名链零变化，mac 走 bundle 链）；`images_running`/`images_for_app`/`graceful_kill_images`/`mac_name_matches` 全部 cfg(not(macos)) 门控（mac 无调用方）；doubao.rs 两处错误文案去 Windows 路径绑定（mac 不再显示 `%LOCALAPPDATA%\Doubao\User Data`）。已确认收口项：bypass.rs `reg` 调用在 `#[cfg(windows)] mod win` 内（私有复刻）；misc.rs schtasks 6 函数 + `task_exists`/`legacy_task_start_time` Windows 专属由 `schtasks_gate` 统一门控（mac 恒 Err 明示文案）；cert.rs certutil/icacls/powershell 全部 cfg(windows) 门控；proxy.rs netstat 双分支（mac lsof / Windows netstat）；updater.rs 双平台安装分支互斥完整；open_workbuddy_app/open_codebuddy_app/codebuddy_env_check 已平台分派（前轮已修）。复验：双架构 check 0 错 0 警 + cargo test 450 全绿。
-  - **无登录态快照时的切换引导（2026-09-20，用户反馈）**：此前无快照切换要等后台流程跑起来才报「目标账号 {uid} 无快照」（技术味重 + 触发 90s 看门狗风险）。三层改进：①`switch_account` 命令层新增同步预检 `target_slot_exists`（主槽或 .bak 回退槽，与 run_action 内部预检同条件）——无快照在进入后台流程**之前**直接 Err 引导文案「还没有该账号的登录态快照：请先用此账号登录客户端，然后到「账号管理」点击「保存当前登录态」，成功后即可一键切换」，不 progress 事件、不触发看门狗、不启动会话迁移前置作业；全部域（Trae/WorkBuddy/CodeBuddy/豆包）切换统一走该命令，入口全覆盖；②run_action 内部预检保留为兜底（Restore 直调入口），文案对齐引导式；③BuddyAccounts 切换菜单加本地拦截（`has_snapshot`/`has_snapshot_codebuddy` 数据现成，无快照直接 warn toast 不发请求）；豆包页已有 disabled 拦截；Trae 账号库（凭证池）与快照槽是两个概念、无本地标记，靠后端同步预检兜底。复验：双架构 check 0 错 0 警 + cargo test 450 全绿 + tsc 无错。
-  - **切换恒回滚 last 槽（2026-09-20 mac 实测，P1）**：用户报「无论怎么登录，切换总是最后一个登录的账号」。switcher.log 实证：备份/恢复均成功（13 项），但恢复后校验（issue #9 的 verify_restore）用 Windows 反斜杠清单直接 `data_dir.join("User\\globalStorage\\storage.json")`——mac 上整串被当作字面文件名 → 校验恒失败 → 恒从 last 槽回滚（= 最后登录账号）。快照槽实况证实快照本身完全有效（`User/globalStorage/storage.json` 18KB + `state.vscdb` 实存）。修复：`icube::rel_path` 提为 pub(super)，校验清单组件化 join；Windows join 结果与原样一致（零变化）。R3 组件化修复的漏网点即此一处。**Buddy/豆包同类排查结论：无此类问题**——chromium 布局全部逐段 join 平台无关（Cookies Network/ 根级自适应、leveldb 校验 read_dir 遍历）；authfile 布局槽文件根级无子目录、`wb_auth_dir` mac 分支逐段 join、`WB_AUTH_DIR_REL` 仅 cfg(windows)。复验：双架构 0 错 0 警 + 450 全绿。
-- **剩余任务**（2026-09-19 盘点，对照设计 §8.2 任务表：M0 全部 / M1.1-1.3 / M2 全部 / M3 全部代码已落地 ✅，其余如下）：
-
-| # | 任务 | 前置 | 解决方案 |
-|---|---|---|---|
-| R1 | ~~**mac 真机编译验证**（双架构）~~ ✅ 2026-09-20 | 无 | 已完成：双架构 cargo check 0 错 0 警 + cargo test 431 全绿 0 警（详见 v2.8 进展） |
-| R2 | ~~**M-1 真机侦察**（设计 §7 共 9 项，先决）~~ ✅ 2026-09-20 | mac 机 + 各应用 mac 版账号 | 已完成：9 项结论见 v2.8 进展；仅 ④⑦ 留待 R4 切换实测顺带验证 |
-| R3 | ~~**M1-1.4 档案表 mac 路径回填**~~ ✅ 2026-09-20 | R2 | 已完成：五档案 os 维度化 + 四域放开 + proc/locate/icube/authfile/proxy_ctl 侦察驱动修复（详见 v2.8 进展）；遗留：`mac_data_dir_guess` 字段与 platform 层 allow 标注待 R4 后评估移除 |
-| R4 | **M1-1.5 切换全链路 mac 实测** | R2、R3 | WorkBuddy 双账号互切（快照备份 → 恢复 → 守卫回滚）按设计 §十 验收矩阵 2/3 执行；Trae 域按侦察结论决定覆盖范围；`switcher/mod.rs` 主体预期零改动纯验证。**追加（2026-10-01 合并审查）**：验证 mac Trae 数据根下 `logs/<yyyymmddThhmmss>/dynamicConfig.log` 会话日志结构是否与 Windows 同构——该结构目前仅有 Windows 真机证据（`icube.rs` detect_live_uid 的 L2 守卫数据源）；若 mac 不同构，L2 恒 fail-open 静默失效（防护退化为 L1 命令层守卫，无功能破坏），需评估 mac 侧身份探测替代数据源 |
-| R5 | **M2 mac 真机复核** | R1（可与 R2 并行） | 逐项冒烟：`scutil --proxies` 读 / `networksetup` 逐服务写+还原 / `security add-trusted-cert` GUI 授权 / SO_REUSEADDR 重复启停无端口残留 / CA 信任后 MITM 抓包闭环（验收矩阵 6：装证书 → 接管代理 → 捕获 → 还原） |
-| R6 | **M3 dmg 构建 + 更新闭环验证**（x86_64 本地形态 ✅ 2026-09-20） | R1（推荐尽早，不依赖 R2） | 已完成：本地 `npm run tauri build -- --target x86_64-apple-darwin --bundles dmg` 产出 `AI Work 助手_3.5.6_x64.dmg`（含二轮审查修复）。剩余：aarch64/universal 形态走 CI `build-macos.yml` 首跑；updater mac 闭环实测（发现 dmg → 下载 → SHA256 fail-closed → open dmg → 重启，验收矩阵 8）；Gatekeeper 无签名首启引导实测（右键打开 + `xattr -d`，验收矩阵 1） |
-| R7 | **M4 集成验收 + 首个 mac 发布演练** | R1~R6 | 验收矩阵 1-9 全项通过（含 Windows 回归 §9.3：cargo test 全绿 + tsc + NSIS/MSI/portable 产物不变 + 手工冒烟）；tag 发布 Release 四资产 + 新 mac 机从 dmg 安装到登录使用成功；更新 CHANGELOG 与 AGENT.md SOP 实测补充 |
-| R8 | **延后项**（M-1 后评估，非阻塞） | R2 | ①豆包 cookie mac 直读（Keychain Safe Storage + AES-128-CBC，重写非移植，首版走 MITM 捕获）②launchd 系统级定时注册（内置调度器已覆盖）③Developer ID 签名公证（$99/年，决策后落地可根除 Gatekeeper 引导）④「更新重启前旧进程对新 .app 执行 `xattr -d`」自动化增强（设计 §9.4 留档） |
 - **落地落点（2026-09-17~26，macos_main 分支 22 提交，产品化闭环 ✅）**：
   - **主体（db4efd4，09-17）**：platform 服务层 + 平台门控 + dmg 构建流水线；cert（`security add-trusted-cert`）/ proxy（networksetup/scutil）/ process（sysinfo）/ oauth / env / updater / checkin / device_proxy（bypass + ca + 绑定）等原 13 个 Windows 依赖点全量 mac 分支落地；
   - **定位与启动（5c1f79a）**：`app_locate` mac bundle 分派——`/Applications/<App>.app` 探测链 + LaunchServices 启动；**平台抽象层收敛（113350a）** + 整体黑盒复审修复（9504e3a）；
@@ -398,12 +379,56 @@
 - **实现路径**：均已落地；网关通路 v2 以 F-76/F-77 既有网关基建为底座按 WB 池同构扩展。
 - **参考开源项目**：无直接同类（同构扩展参照本项目 WB 池实现与 user-manual.md「Qoder 应用」章节）。
 
-### F-82 macOS OAuth 登录 URL 设备指纹硬编码 Windows（P3 → 待评估·存量；原编号 F-81，合并时让号改 F-82）
+### F-83 网关客户端配置示例扩展 + 模型目录一键复制（P2，源自 issue #174）
 
-- **需求概述**：`oauth_get_login_url`（src-tauri/src/commands/oauth.rs）构造授权页 URL 时硬编码 `x_device_type=windows` / `x_os_version=Windows` 等设备指纹字段，未随目标平台（macOS 构建）切换。来源核实：git 证实为合并前存量（9a7ca17 引入），**非 2026-10-10 合并（aec8509）引入**；与「Windows 抓包凭证 + 模拟链」的既有 OAuth 登录链路自洽，当前不构成功能缺陷。
-- **风险/影响**：Info 级——授权服务端可能按设备指纹下发风控策略（限流/验证码/审计），macOS 端伪装 Windows 客户端指纹的可持续性依赖上游行为不变；若未来服务端加强设备指纹校验，需同步改造。
-- **实现路径**：① 将设备指纹构造收敛为 platform 门控参数（`#[cfg(target_os="macos")]` 下切换 `x_device_type`/`x_os_version` 为 mac 值），与 issue #76 设备轮转（`select_login_device`/`writeback_oauth_device`）链路对齐；② 真机验证授权页 + code 交换在 mac 指纹下的兼容性；③ 若上游风控对指纹突变敏感，保留 Windows 模拟作为可配置回退。
-- **参考开源项目**：无直接同类（设备指纹构造参照本项目 oauth.rs 既有 Windows 抓包凭证链与 issue #76 设备绑定改造）。
+- **需求概述**（issue #174 需求 2/3，2026-11-02）：面板提供各客户端「复制即可用」的现成配置片段，模型目录页支持一键复制 base_url / key / 模型名。**现状核对**：
+  - 已有：`InterfaceConfig.tsx` OpenAI 兼容配置示例卡（接口地址/API Key + 一键复制）；`EcoAccess.tsx` CC Switch 一键注册（Claude Code `/v1/messages` + Codex `/v1/responses` 统一条目，注册状态检测 + 整库备份）；API Keys 管理可复制 Key；`clipboard.ts` WebView2 剪贴板兜底已就绪。
+  - 缺口：① **Claude Code 直连示例**（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 环境变量片段，settings.json 形态）——CC Switch 未安装用户的零依赖路径；② **Cline / Continue / Roo 等 OpenAI 兼容客户端示例**；③ **模型目录页逐模型一键复制**（base_url / key / 模型名三字段）。
+- **实现路径**：
+  1. 配置示例卡扩展为按客户端 Tab（OpenAI 兼容 / Claude Code / Codex / Cline / Continue / Roo），每 Tab 生成含真实端口与 Key 占位（`ck_` 前缀提示）的片段 + 复制按钮，复用 `clipboard.ts`；
+  2. Claude Code 片段双形态：环境变量（PowerShell/bash 双版本）+ `settings.json` env 块；Codex 片段给 `config.toml` model_provider 直配形态；
+  3. 模型目录行 hover 复制按钮（模型名 / base_url / 携 Key 的完整示例三选），复制成功 toast 反馈。
+- **参考开源项目**：本项目 `InterfaceConfig.tsx` / `EcoAccess.tsx` / `clipboard.ts`（全部复用，零新增依赖）；cc-switch（`farion1231/cc-switch`，一键注册已实现仅作对照）。
+- **验收**：VS Code + Claude Code 依面板片段配置即跑通 `/v1/messages`（对齐 issue #174 验收第 1 条）；六个客户端 Tab 均可一键复制；模型目录三字段一键复制可用。
+
+### F-84 网关结构化请求日志（P3，源自 issue #174）
+
+- **需求概述**（issue #174 需求 5）：面板可查「最近 N 次网关请求」命中了哪个池/账号、结果与失败原因（脱敏）。**现状核对**：`api_logger` 已逐请求落库（含模型、耗时、TTFT、`fallback_from` 等字段），日志页（`Logs.tsx` ApiLogsTab）为**文本形态**（按日查看 + 关键字搜索 + Debug 开关），用量统计为聚合视图——缺一条**结构化单请求视图**：时间 / 协议端点 / 模型 / 池 / 账号（脱敏 uid 或名称）/ 结果 / 失败原因 / 耗时 / TTFT，默认最近 50 条可翻页筛选。
+- **实现路径**：
+  1. 后端新增查询命令（复用 `api_logs` 表既有字段，按时间倒序 limit/offset，无 DDL 迁移；失败原因沿用日志管线既有脱敏口径）；
+  2. 前端用量统计页新增「最近请求」子卡或 Logs 页新 Tab：表格 + 结果着色（成功/降级/失败）+ 按池/结果筛选；
+  3. 字段缺口补录：若单行未落池标识（`fallback_from` 仅记回退源），补「实际服务池/账号」两列写入（与 F-81 的 cross_pool_retry 日志联动）。
+- **参考开源项目**：本项目 `api_logger`（落库先例）、用量统计页聚合查询模式；one-api / new-api 的「日志页单请求视图」交互形态。
+- **验收**：面板可查最近 50 次请求的池与结果（对齐 issue #174 验收第 3 条）；失败原因脱敏展示；大数据量下翻页不卡顿。
+
+### F-85 网页类平台接入网关（P3，远期留档，源自 issue #174）
+
+- **需求概述**（issue #174 需求 1）：把智谱清言 / MiniMax / 魔搭等「网页会话类平台」作为网关上游入池，实现「领到的额度都能用」。**前置依赖**：平台本身的账号支持——README「支持的应用」已声明暂未规划（2026-11-06 口径，与 issue #173 回复一致：精力有限 + 风控趋严 + 维护成本）。**过渡路径**：custom 自定义池已可接入任意 OpenAI 兼容端点——若第三方存在此类平台的中转实现，用户可直接经 custom 池接入，无需等待本项。
+- **实现路径**：远期留档；待任一网页平台纳入账号支持（README 表格口径变化）后，按 F-80 Qoder 池同构模式扩展第五池（入池通道 / 清洗管线 / 冷却矩阵 / 路由层四件套）。
+- **参考开源项目**：本项目 `custom_route.rs`（OpenAI 兼容自定义池，过渡承接）；F-80 Qoder 池接入（同构扩展先例）。
+
+### F-86 全自动静默更新（P3，待评估，源自 issue #175）
+
+- **需求概述**（issue #175 发版节奏需求 3，2026-11-02）：更新全程**无用户确认与点击**——启动/空闲时后台检查 → 自动下载 → 自动安装 → 自动重启。**现状核对**：`commands/updater.rs` 三命令链已齐备（`update_check` 版本比较 + `update_download` 三通道下载 + SHA256 三道完整性闸 + `update_run_installer` NSIS `/P /UPDATE /R` 被动安装并自动重启），但编排由前端驱动：**用户至少两次确认（发起更新 + 确认安装文件路径）**，非全自动。差距只在「无人值守编排 + 默认策略」，不在底层能力。
+- **待评估决策点**（评估先行，未评估不实施）：
+  1. **静默重启的破坏面**：应用退出即中断进行中的网关长流请求（CLI 用户会话断连）、签到/切换/巡检任务——静默更新与这些长任务天然冲突，需「空闲窗口检测」（无在途网关请求 + 无运行中后台任务才安装）或退化为「下载静默、安装需确认」的折中档；
+  2. **安装器仍有 UI**：NSIS `/P` 被动模式显示进度条（非完全无感），完全无 UI 需 `/S` 静默参数验证（自定义 installer.nsi 是否支持 `/S` 与 `/UPDATE` 共存）；
+  3. **默认策略**：全自动默认开（用户预期）vs 默认关 + 设置页开关（安全默认）；建议默认关，开关文案明示「更新将自动重启应用」；
+  4. **时机**：仅启动时检查（现状）vs 每日定时检查 + 空闲安装；夜间/锁屏时段安装可规避打断（但计划任务进程与 GUI 进程的生命周期需理清）；
+  5. **安全红线不变**：SHA256 强制校验、资产名白名单、安装包路径/版本绑定三道闸全部保留，静默路径不得出现任何绕过分支。
+- **实现路径**（评估通过后，预估 1~2 天）：后端新增 `update_auto` 无人值守编排命令（check → download → 空闲判定 → run_installer）+ 设置项 `auto_update_silent`（默认关）+ 空闲判定（网关 inflight==0 && 调度器无运行中任务）；前端设置页开关卡 + 更新页「自动更新」状态展示；`--task-run` CLI 进程不参与自动更新（避免双进程竞争安装）。
+- **参考开源项目**：Tauri 官方 updater 插件（`tauri-plugin-updater`，内置 install on exit 语义可对照）；Chrome/Edge 的「后台静默下载、重启时生效」折中形态。
+- **验收**：开启开关后新版本发布 → 应用在空闲窗口自动完成下载安装并重启到新版，全程零点击；有长任务在途时推迟到空闲；关闭开关行为与现状完全一致；三道完整性闸在自动路径同样强制生效。
+- **登记来源**：issue #175（2026-11-02），用户 2026-11-06 裁定「待评估」。
+
+### F-87 schtasks 唤醒计算机 + 错过尽快启动——睡眠后自动补跑（P2，源自 issue #175）
+
+- **需求概述**（issue #175 稳定性需求 1，2026-11-02）：工作日白天电脑可能睡眠/锁屏，睡眠期间到点的计划任务唤醒后应**自动补跑**——计划任务勾选「唤醒计算机运行此任务」（WakeToRun）+「错过计划时间后尽快启动」（StartWhenAvailable）。**现状核对**：双层调度中应用内调度器（`tasks/scheduler.rs`）已有完整补跑语义（当日未跑 + 启动补跑 + 失败重试冷却 + 错峰），**但仅覆盖应用运行期**；schtasks 注册面（`/Create` 直调主 exe，issue #112 形态）未设置上述两项——睡眠跨过触发时刻时，系统级任务唤醒后不执行，只能等用户下次手动打开应用兜底。
+- **实现路径**（0.5~1 天含真机验证）：`schtasks /Create` 不支持这两项设置，注册成功后追加一步 PowerShell `Set-ScheduledTask -TaskName <name> -Settings (New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable)`（或改 XML 注册形态二选一，评估取干扰小者）；收敛为统一 helper（`commands/misc.rs::run_schtasks` 旁新增 `enable_wakeup_settings`），四处注册面统一接入：Trae 每日签到（`misc.rs::task_register`）、豆包签到/续期/额度巡检（`doubao.rs` 三处）、WB 签到系（`workbuddy/checkin.rs`）与 Qoder 签到任务注册面；设置失败仅 app_log 告警不阻断注册（兼容家庭版/组策略限制机器）。
+- **边界与风险**：① WakeToRun 唤醒机器有耗电争议——由「错过尽快启动」兜底即可覆盖多数场景（唤醒后补跑），唤醒本身可选不设（评估真机行为后定）；② `Set-ScheduledTask` 需与注册同权限上下文（当前任务以当前用户注册，无提权需求）；③ 中文/英文系统 PowerShell 输出差异不影响（仅 ExitCode 判定）。
+- **参考开源项目**：Microsoft Learn ScheduledTasks 模块文档（Settings 语义权威）；本项目 `run_schtasks` / `schtasks_create_failure`（统一注册面收口先例，helper 直接扩展）。
+- **验收**：注册后在 taskschd.msc 中两项设置生效；真机睡眠跨过触发时刻 → 唤醒（或登录）后任务自动补跑且结果落库；卸载/查询/重注册行为与现状一致；设置失败时注册本身仍成功且留有日志。
+- **登记来源**：issue #175（2026-11-02），2026-11-06 评估为真实缺口立项。
 
 ---
 
@@ -470,11 +495,15 @@
 ## 五、建议排序
 
 1. **F-38 DSH 引导页** —— 成本≈0，随手带上（当前唯一未完成的 P1）
-2. **E-01/E-02 豆包网关**（批次 0 探测实验 Gate 先行）—— 8~12 天，豆包积分资产化主路径
-3. **F-70 tc 凭证直读（剩余收尾）** —— 解密算法与 DeviceProof 已落地（`icube_auth.rs`），仅剩账号发现直读接入，1~2 天
-4. **F-81 池耗尽后跨池重试** —— 方案已论证（编排外提，三批次 2~3 天），网关可用性残余窗口补齐，F-72 的池间维度前序
-5. F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
-6. F-52 / F-71 / F-72 / F-73 —— 远期留档，随生态演进评估
-7. ~~W-01 Work 积分接入~~ —— 已排除（2026-09-15）：Trae 积分签到调整，见 §四
+2. **F-83 配置示例扩展 + 模型目录一键复制** —— 1~2 天，新用户接入体验补齐（issue #174，全部复用既有组件零新增依赖）
+3. **E-01/E-02 豆包网关**（批次 0 探测实验 Gate 先行）—— 8~12 天，豆包积分资产化主路径
+4. **F-70 tc 凭证直读（剩余收尾）** —— 解密算法与 DeviceProof 已落地（`icube_auth.rs`），仅剩账号发现直读接入，1~2 天
+5. **F-81 池耗尽后跨池重试** —— 方案已论证（编排外提，三批次 2~3 天），网关可用性残余窗口补齐，F-72 的池间维度前序
+6. **F-87 schtasks 唤醒与错过补跑设置** —— 0.5~1 天，定时签到稳定性补齐（issue #175）
+7. F-84 / F-69 / E-03 / F-41 / F-42 / F-66 —— 按需启动
+8. F-52 / F-71 / F-72 / F-73 / F-85 —— 远期留档，随生态演进评估
+9. ~~W-01 Work 积分接入~~ —— 已排除（2026-09-15）：Trae 积分签到调整，见 §四
+7. F-52 / F-71 / F-72 / F-73 / F-85 —— 远期留档，随生态演进评估
+8. ~~W-01 Work 积分接入~~ —— 已排除（2026-09-15）：Trae 积分签到调整，见 §四
 
 > 已完成项退出排序：F-76/F-77（2026-09-14）、F-78 全批次（批次 1+2 2026-09-14 / 批次 3 2026-09-16）、F-68/F-74（2026-09-15）、F-24-余（2026-09-16 真机复验闭环）、F-75（2026-09-26，macos_main 分支产品化）、F-80-余（2026-10-02，含帮助双语化明确不做与白名单/分组补登记）。

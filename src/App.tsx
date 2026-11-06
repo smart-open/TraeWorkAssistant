@@ -13,6 +13,8 @@ import Settings from './pages/Settings';
 import ApiService from './pages/ApiService';
 import DoubaoOverview from './pages/doubao/DoubaoOverview';
 import DoubaoAccounts from './pages/doubao/DoubaoAccounts';
+import DoubaoCheckin from './pages/doubao/DoubaoCheckin';
+import DoubaoQuotaDashboard from './pages/doubao/DoubaoQuotaDashboard';
 import DoubaoSettings from './pages/doubao/DoubaoSettings';
 import BuddyOverview from './pages/buddy/BuddyOverview';
 import BuddyAccounts from './pages/buddy/BuddyAccounts';
@@ -58,6 +60,10 @@ function renderView(view: string) {
       return <DoubaoOverview />;
     case 'doubao-accounts':
       return <DoubaoAccounts />;
+    case 'doubao-checkin':
+      return <DoubaoCheckin />;
+    case 'doubao-quota':
+      return <DoubaoQuotaDashboard />;
     case 'doubao-settings':
       return <DoubaoSettings />;
     case 'buddy-overview':

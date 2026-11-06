@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { extractFingerprintFrom, neutralRewrite, parseSampleSystem } from './fingerprintSamples';
+import {
+  extractFingerprintFrom,
+  isSampleTruncated,
+  neutralRewrite,
+  parseSampleSystem,
+} from './fingerprintSamples';
 
 describe('parseSampleSystem', () => {
   it('标准样本（带 tools 尾巴）提取 system 文本', () => {
@@ -21,6 +26,28 @@ describe('parseSampleSystem', () => {
 
   it('body 解析失败等非标准样本返回 null', () => {
     expect(parseSampleSystem('body 解析失败')).toBeNull();
+  });
+
+  it('后端截断标记「…」不进入 from（否则逐字匹配必然落空）', () => {
+    const sample = 'system="You are an AI agent that helps the user with programming work. The Team…"';
+    expect(parseSampleSystem(sample)).toBe(
+      'You are an AI agent that helps the user with programming work. The Team',
+    );
+    expect(parseSampleSystem(sample)).not.toContain('…');
+  });
+});
+
+describe('isSampleTruncated', () => {
+  it('尾部省略号 = 截断样本', () => {
+    expect(isSampleTruncated('system="abc def The Team…"')).toBe(true);
+  });
+
+  it('无省略号 = 未截断', () => {
+    expect(isSampleTruncated('system="abc def." tools=[x]')).toBe(false);
+  });
+
+  it('空 system 不算截断', () => {
+    expect(isSampleTruncated('system=""')).toBe(false);
   });
 });
 
@@ -62,6 +89,19 @@ describe('extractFingerprintFrom', () => {
       'You are an AI agent, e.g. a coding assistant.',
     );
   });
+
+  it('截断样本但首句完整 → 仍取首句（真实样本形态，可用规则）', () => {
+    // 后端 300 字符截断落在第二句之后：首句有完整 ". " 句界，规则可逐字命中
+    expect(
+      extractFingerprintFrom(
+        'system="You are an AI agent that helps the user with programming work. Agent Teams is…"',
+      ),
+    ).toBe('You are an AI agent that helps the user with programming work.');
+  });
+
+  it('截断样本且连一个完整句都没有 → null', () => {
+    expect(extractFingerprintFrom('system="No sentence boundary here at all just words…"')).toBeNull();
+  });
 });
 
 describe('neutralRewrite', () => {
@@ -78,28 +118,27 @@ describe('neutralRewrite', () => {
   });
 
   it('issue #129：TraeCode 身份句去品牌短语后零残留', () => {
+    // 输入须真实含 "in TraeCode"（规则 /\s+in TraeCode\b/），否则断言恒真、规则零覆盖
     expect(
       neutralRewrite(
-        'You are an interactive agent in TraeCode that helps the USER with software engineering tasks.',
+        'You are an interactive agent that helps the USER with software engineering tasks in TraeCode.',
       ),
     ).toBe('You are an interactive agent that helps the USER with software engineering tasks.');
   });
 
   it('issue #155：ZCode 身份句去品牌词后零残留', () => {
-    // 首句："You are ZCode, an interactive coding agent" → "You are an interactive coding agent"
-    expect(neutralRewrite('You are ZCode, an interactive coding agent')).toBe(
-      'You are an interactive coding agent',
-    );
-    // 第二身份句："interactive ZCode agent" → "interactive agent"
+    // 首句（无品牌词）无规则命中 → 未命中回退空串（neutralRewrite 语义：out === from 即剥离兜底）
+    expect(neutralRewrite('You are an interactive coding agent')).toBe('');
+    // 第二身份句："interactive ZCode agent" → "interactive agent"（输入须真实含品牌词，否则断言恒真）
     expect(
       neutralRewrite('You are an interactive ZCode agent that helps users with software engineering tasks'),
     ).toBe('You are an interactive agent that helps users with software engineering tasks');
-    // issue #155 实证样本：双身份句之间无句号连写，extractFingerprintFrom 按
-    // 首个 '. ' 截取会把两句并成一个 from——改写须逐条应用全部命中规则，两句
-    // 都清洗、零 ZCode 残留（与后端 apply_template_map_seeded 全量应用同口径）
+    // issue #155 实证样本：双规则组合（"You are ZCode, ..." 与 "interactive ZCode agent"
+    // 同现）——改写须逐条应用全部命中规则，两处品牌词都清洗、零 ZCode 残留
+    //（与后端 apply_template_map_seeded 全量应用同口径）
     expect(
       neutralRewrite(
-        'You are ZCode, an interactive coding agent You are an interactive ZCode agent that helps users with software engineering tasks',
+        'You are an interactive coding agent You are ZCode, an interactive ZCode agent that helps users with software engineering tasks',
       ),
     ).toBe(
       'You are an interactive coding agent You are an interactive agent that helps users with software engineering tasks',

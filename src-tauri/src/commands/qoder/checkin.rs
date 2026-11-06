@@ -101,6 +101,11 @@ pub struct QoderCheckinRecord {
     /// 历史数据（升级前）无此字段 → None，前端按整体状态渲染
     #[serde(skip_serializing_if = "Option::is_none")]
     pub campaigns: Option<Value>,
+    /// 失败归因（issue #190）：blocked_need_trust=风控信任未建立（自动重试无效，
+    /// 需用户建信任后手动重试）；permanent_auth=凭证终态。历史数据无此字段 → None，
+    /// 前端「待建信任」徽标按该字段判定（不耦合 message 文案）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_kind: Option<String>,
 }
 
 /// 签到日志（90 天存储，UI 默认展示 30 天）
@@ -130,6 +135,7 @@ pub fn qoder_checkin_results(
                 message: r.get("message").and_then(|v| v.as_str()).unwrap_or("").into(),
                 reward: r.get("reward").and_then(|v| v.as_f64()),
                 campaigns: r.get("campaigns").filter(|v| v.is_array()).cloned(),
+                fail_kind: r.get("fail_kind").and_then(|v| v.as_str()).map(String::from),
             });
         }
     }
@@ -301,15 +307,24 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
         fs_utils::app_log(&state2.data_dir, &msg);
         let failed = done["failed"].as_i64().unwrap_or(0);
         // empty_campaigns（活动未开始/不可用）非用户可操作失败：重试也无解，仅记日志
-        // 不推送打扰（审查 L；done.failed_empty_campaigns 由 run_checkin_round 单列）
+        // 不推送打扰（审查 L；done.failed_empty_campaigns 由 run_checkin_round 单列）。
+        // failed_blocked（issue #190 风控信任未建立）仍计入推送——它是用户可操作失败
+        // （切换账号 + 客户端建信任后可恢复），不推送会静默滞留（审查 Q2 修复）
+        let failed_blocked = done["failed_blocked"].as_i64().unwrap_or(0);
         let failed_actionable =
             failed - done["failed_empty_campaigns"].as_i64().unwrap_or(0);
         if failed_actionable > 0 {
+            let mut text = format!("启动补签有 {failed_actionable} 个账号失败，请在 Qoder 签到页查看");
+            if failed_blocked > 0 {
+                text.push_str(&format!(
+                    "（其中 {failed_blocked} 项被风控拦截：请在工具内切换到该账号后打开 Qoder 客户端使用一次建立信任，再手动重试）"
+                ));
+            }
             crate::commands::workbuddy::push_notify(
                 Some(&app2),
                 &state2.data_dir,
                 "Qoder 签到提醒",
-                &format!("启动补签有 {failed_actionable} 个账号失败，请在 Qoder 签到页查看"),
+                &text,
                 crate::notify::NotifyEvent::TaskFail,
             );
         }

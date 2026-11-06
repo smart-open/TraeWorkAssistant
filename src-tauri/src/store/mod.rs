@@ -156,6 +156,75 @@ impl Store {
         self.kv_set_raw(key, &content)
     }
 
+    /// KV 文档原子读-改-写（审查修复）：读、改、写在同一连接锁 + BEGIN IMMEDIATE
+    /// 事务内完成——连接锁保证进程内写者互斥，IMMEDIATE 事务从读前取写锁，把原子性
+    /// 提升到跨进程（GUI 与 --task-run CLI 并发时不再可能互相覆盖丢键）。f 返回 Err、
+    /// 读/写出错、f panic、COMMIT 失败四种情形都 rollback，保证共享连接上**不残留**
+    /// 未关闭事务（否则后续所有查询报 "cannot start a transaction within a
+    /// transaction" 永久污染连接）；内容无变化不写盘（事务内不写即空转提交）。
+    /// 缺失/损坏内容初始化为空对象（对齐各调用点既有语义）
+    pub fn kv_update<F>(&self, key: &str, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut serde_json::Value) -> Result<(), String>,
+    {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| format!("开启 kv_update 事务失败: {e}"))?;
+        // catch_unwind（复审加固）：f 为任意调用方闭包，panic 若直接外抛会把
+        // BEGIN IMMEDIATE 留在共享连接上，毒化进程内全部后续查询——捕获后 rollback
+        // 再以 Err 返回（与 f 返回 Err 同口径：整体放弃、不写半改状态）
+        let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool, String> {
+            let raw: Option<String> = conn
+                .query_row("SELECT content FROM kv WHERE key = ?1", [key], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|e| format!("SQLite 操作失败: {e}"))?;
+            let mut v: serde_json::Value = raw
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::Value::Null);
+            if !v.is_object() {
+                v = serde_json::json!({});
+            }
+            let before = v.clone();
+            f(&mut v)?;
+            if v == before {
+                return Ok(false);
+            }
+            let content = serde_json::to_string(&v).map_err(|e| format!("序列化失败: {e}"))?;
+            conn.execute(
+                "INSERT INTO kv(key, content, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
+                 ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                rusqlite::params![key, content],
+            )
+            .map_err(|e| format!("SQLite 操作失败: {e}"))?;
+            Ok(true)
+        }));
+        match inner {
+            // 无变化：空转提交（事务内无写，释放 IMMEDIATE 写锁）；COMMIT 失败
+            //（如 SQLITE_BUSY on commit）同样 rollback 清场后再上抛
+            Ok(Ok(_)) => match conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(format!("提交 kv_update 事务失败: {e}"))
+                }
+            },
+            Ok(Err(e)) => {
+                // 写回前任一步失败：rollback 整体放弃，不留半改状态
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+            Err(_payload) => {
+                // f panic：rollback 清场（panic 本身按既有口径继续外抛，由调用方
+                // 线程边界处理；此处不吞 panic，仅保证连接事务状态干净）
+                let _ = conn.execute_batch("ROLLBACK");
+                std::panic::resume_unwind(_payload);
+            }
+        }
+    }
+
     // ── 行文档表原语（单 pk + data JSON 的表）────────────────────────────────
     // 表名白名单：仅限本模块常量，杜绝拼接注入。
 

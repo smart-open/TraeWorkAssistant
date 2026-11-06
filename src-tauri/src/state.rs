@@ -302,7 +302,7 @@ impl AppState {
         // 「从未配置」判定含损坏 kv（审查 Low）：值存在但解析失败时 kv_get 已
         // 回退默认（豆包双开关落 false），仅按键存在性放行会把损坏行误当
         // 「已配置」漏回填——值不可解析同样视为从未配置
-        if !s.doubao_keepalive_enabled || !s.doubao_quota_enabled {
+        if !s.doubao_keepalive_enabled || !s.doubao_quota_enabled || !s.doubao_probe_auto_keepalive {
             // 「从未配置」判定：键缺失，或键存在但内容损坏——kv_get 对损坏内容
             // 回退 Settings::default()（双开关落 false）而 kv_get_raw 返回 Some，
             // 只判键缺失会漏掉损坏路径（3.8.5 审查 L1：kv 半写/手改后双开关恒关）。
@@ -315,6 +315,7 @@ impl AppState {
             if never_configured {
                 s.doubao_keepalive_enabled = true;
                 s.doubao_quota_enabled = true;
+                s.doubao_probe_auto_keepalive = true;
             }
         }
         // Trae JWT 续期调度（issue #27）：kv 完全缺失走 Settings::default()（bool=false/
@@ -395,11 +396,15 @@ impl AppState {
         if s.trae_credits_sync_mode.trim().is_empty() {
             s.trae_credits_sync_mode = "every_hours".into();
         }
+        if s.doubao_sync_mode.trim().is_empty() {
+            s.doubao_sync_mode = "every_hours".into();
+        }
         for field in [
             &mut s.wb_credits_sync_hours,
             &mut s.trae_credits_sync_hours,
             &mut s.qoder_credits_sync_hours,
             &mut s.buddy_ai_credits_sync_hours,
+            &mut s.doubao_sync_hours,
         ] {
             let v = field.trim().parse::<i64>().map(|h| h.clamp(1, 24)).unwrap_or(2);
             *field = v.to_string();

@@ -25,27 +25,158 @@ const SCENE: &str = "pc_incentive_task_mvp_v3";
 const DETAIL_URL: &str = "https://www.doubao.com/alice/ug/campaign/v3/detail/?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
 /// 签到执行端点（同上）
 const CHECKIN_URL: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
+/// 签到路径（抓包参数可用时拼客户端真实 query）
+const CHECKIN_BASE: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin";
 const REFERER: &str = "https://www.doubao.com/pc/agent-explore";
 /// 抓包 UA：桌面客户端自带 SamanthaDoubao 标识（区别于纯浏览器请求）
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 SamanthaDoubao/2.33.5";
 /// 批量模式下账号间隔（防上游频控，与 wb/trae 的 gap 思路一致，固定短间隔）
 const ACCOUNT_GAP_MS: u64 = 800;
 
-/// 构造 Cookie（对齐 doubao_quota::query_account：sessionid + sid_guard）
-fn cookie_of(sid: &str, sid_guard: Option<&str>) -> String {
+/// 构造 Cookie（sessionid + sid_guard + 可选 msToken + 抓包设备级 Cookie 追加）
+fn cookie_of(
+    sid: &str,
+    sid_guard: Option<&str>,
+    ms_token: Option<&str>,
+    device_cookies: &[(String, String)],
+) -> String {
     let mut cookie = format!("sessionid={sid}");
     if let Some(sg) = sid_guard.filter(|s| !s.is_empty()) {
         cookie.push_str(&format!("; sid_guard={sg}"));
     }
+    if let Some(mt) = ms_token.filter(|s| !s.is_empty()) {
+        cookie.push_str(&format!("; msToken={mt}"));
+    }
+    // 设备级 Cookie 追加（抓包对齐 2026-11-06）：会话键不追加（本账号会话为准），
+    // 设备键值对来自本账号 profile 的客户端抓包
+    for (k, v) in device_cookies {
+        if k.is_empty() || v.is_empty() {
+            continue;
+        }
+        if matches!(k.as_str(), "sessionid" | "sid_guard" | "msToken") {
+            continue;
+        }
+        cookie.push_str(&format!("; {k}={v}"));
+    }
     cookie
 }
 
-/// POST JSON 通用（agw 信封）：code==0 视为成功返回 body；否则 Err（含登录失效提示）
-fn post_json(agent: &ureq::Agent, url: &str, sid: &str, sg: Option<&str>, body: &Value) -> Result<Value, String> {
+/// 客户端抓包参数（代理 try_capture_doubao_campaign 存 vault ns "doubao"）：
+/// - query 用客户端真实参数集（device_id/web_id/fp 等设备指纹——CLI 缺失被上游风控
+///   拒绝 710010702）
+/// - msToken Cookie + ua（客户端版本随更新漂移，旧版本号 UA 也是风控信号）
+/// - device_cookies 设备级 Cookie（ttwid/odin_tt/tt_scid/s_v_web_id，非会话凭证）：
+///   landing/checkin 为发奖端点、风控强校验设备标识，仅 3 个会话 Cookie 会被拒
+/// 2026-11-06 起按 sessionid 分键存储（设备指纹与登录会话绑定——朱羽程的 device_id
+/// 配朱天伟的 sessionid 一样被拒），全局键 campaign_probe 兜底。
+/// 24h 内新鲜有效（msToken 会话级时效），过期/缺失回退内置稳定参数。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CampaignProbe {
+    checkin_query: String,
+    ms_token: Option<String>,
+    ua: Option<String>,
+    device_cookies: Vec<(String, String)>,
+}
+
+/// probe vault 键（sessionid 维度）
+pub(crate) fn probe_key_for_sid(sid: &str) -> String {
+    format!("campaign_probe:sid:{}", sid.trim())
+}
+
+/// 本账号自己的 probe 是否存在且新鲜（**不含全局回退**）：
+/// 保活触发判定专用——全局 probe 可能属于其他账号（设备指纹不匹配），
+/// 把它当「已新鲜」会让保活永久跳过（2026-11-06 12:1x 实测教训）
+pub(crate) fn probe_own_fresh(data_dir: &std::path::Path, sid: &str) -> bool {
+    crate::vault::ns_get(data_dir, "doubao", &probe_key_for_sid(sid))
+        .and_then(|v| parse_probe(&v))
+        .is_some()
+}
+
+/// 按优先级加载 probe：本账号 sessionid 维度 → 全局兜底；解析失败/过期视为未命中继续尝试
+pub(crate) fn load_campaign_probe(data_dir: &std::path::Path, sid: Option<&str>) -> Option<CampaignProbe> {
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(s) = sid.map(str::trim).filter(|s| !s.is_empty()) {
+        keys.push(probe_key_for_sid(s));
+    }
+    keys.push("campaign_probe".to_string());
+    for key in keys {
+        if let Some(v) = crate::vault::ns_get(data_dir, "doubao", &key) {
+            if let Some(p) = parse_probe(&v) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// 解析 vault probe（24h 新鲜期；设备 Cookie/UA 字段缺失时留空由调用方回退常量）
+fn parse_probe(v: &Value) -> Option<CampaignProbe> {
+    let captured_at = v.get("captured_at").and_then(Value::as_str).unwrap_or("");
+    let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(captured_at, "%Y-%m-%d %H:%M:%S") else {
+        return None;
+    };
+    let age = chrono::Local::now().naive_local() - ndt;
+    if age.num_hours() > 24 {
+        return None; // 设备参数虽稳定，msToken 会过期——超时整组弃用走回退
+    }
+    let params = v.get("params")?.as_object()?;
+    let query = params
+        .iter()
+        .map(|(k, val)| {
+            let val_s = val.as_str().unwrap_or_default();
+            format!("{k}={}", urlencoding::encode(val_s))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        return None;
+    }
+    let ua = v
+        .get("ua")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty() && s.contains("SamanthaDoubao"))
+        .map(str::to_string);
+    let device_cookies = v
+        .get("device_cookies")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, val)| {
+                    val.as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| (k.clone(), s.to_string()))
+                })
+                .collect::<Vec<(String, String)>>()
+        })
+        .unwrap_or_default();
+    Some(CampaignProbe {
+        checkin_query: query,
+        ms_token: v
+            .get("ms_token")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        ua,
+        device_cookies,
+    })
+}
+
+/// POST JSON 通用（agw 信封）：code==0 视为成功返回 body；否则 Err（含登录失效提示）。
+/// ua/extra_cookies 来自抓包 probe（2026-11-06 对齐客户端请求形态），缺省回退内置常量
+fn post_json(
+    agent: &ureq::Agent,
+    url: &str,
+    sid: &str,
+    sg: Option<&str>,
+    ms: Option<&str>,
+    body: &Value,
+    ua: &str,
+    extra_cookies: &[(String, String)],
+) -> Result<Value, String> {
     let resp = agent
         .post(url)
-        .set("Cookie", &cookie_of(sid, sg))
-        .set("User-Agent", UA)
+        .set("Cookie", &cookie_of(sid, sg, ms, extra_cookies))
+        .set("User-Agent", ua)
         .set("Referer", REFERER)
         .set("Origin", "https://www.doubao.com")
         .set("Accept", "application/json, text/plain, */*")
@@ -77,17 +208,35 @@ fn post_json(agent: &ureq::Agent, url: &str, sid: &str, sg: Option<&str>, body: 
                 other => other.to_string(),
             })
             .unwrap_or_else(|| "?".to_string());
-        // 常见码提示：710012001 = 登录态失效（凭证过期/不属于当前登录账号）
-        let hint = if code_v.and_then(Value::as_i64) == Some(710012001) {
-            "登录态已失效，请开启代理重新抓取凭证或重新保存该账号登录态"
-        } else {
-            ""
+        // 已知码提示矩阵（与 docs/tech-framework.md 错误码矩阵对齐）：
+        // 710012001 = 登录态失效（凭证过期/不属于当前登录账号）
+        // 712010702 = Cookie/设备指纹缺失或编码错误（重新保存登录态可解）
+        // 710022004 = 风控验证码（客户端人工验证后恢复）
+        let code_num = code_v.and_then(Value::as_i64);
+        let hint = match code_num {
+            Some(710012001) => "登录态已失效，请开启代理重新抓取凭证或重新保存该账号登录态",
+            Some(712010702) => "Cookie/设备指纹缺失或编码错误，请重新保存该账号登录态",
+            Some(710022004) => "触发风控验证码，请在豆包客户端完成一次人工验证后重试",
+            _ => "",
         };
-        return Err(if hint.is_empty() {
+        // 未知码必须透出上游 message（定位关键；如 710010702 等活动侧业务码）
+        let upstream = raw
+            .get("message")
+            .or_else(|| raw.get("msg"))
+            .or_else(|| raw.get("data").and_then(|d| d.get("message")))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        let mut msg = if hint.is_empty() {
             format!("接口返回异常 code={code_str}")
         } else {
             format!("接口返回异常 code={code_str}：{hint}")
-        });
+        };
+        if !upstream.is_empty() {
+            msg.push_str(&format!("（上游提示：{upstream}）"));
+        }
+        return Err(msg);
     }
     Ok(raw)
 }
@@ -104,11 +253,13 @@ pub fn parse_detail(body: &Value) -> Value {
     let mut continuous_days: Option<i64> = None;
     let mut last_checkin_date: Option<String> = None;
     let mut reward_amount: Option<i64> = None;
+    let mut has_signin_task = false;
     if let Some(tasks) = data.and_then(|d| d.get("tasks")).and_then(Value::as_array) {
         for t in tasks {
             if t.get("task_kind").and_then(Value::as_str) != Some("daily_signin") {
                 continue;
             }
+            has_signin_task = true;
             if let Some(dc) = t.get("daily_checkin").filter(|d| d.is_object()) {
                 checked_in_today = dc
                     .get("checked_in_today")
@@ -129,6 +280,7 @@ pub fn parse_detail(body: &Value) -> Value {
     }
     json!({
         "checked_in_today": checked_in_today,
+        "has_signin_task": has_signin_task,
         "continuous_days": continuous_days,
         "last_checkin_date": last_checkin_date,
         "reward_amount": reward_amount,
@@ -137,6 +289,7 @@ pub fn parse_detail(body: &Value) -> Value {
 }
 
 /// 单账号一轮签到（detail → 判定 → 未签则提交 checkin）。
+/// probe = 客户端抓包参数（None 回退内置稳定参数）。
 /// 返回 outcome：status ∈ success | already | fail。
 pub fn run_one(
     agent: &ureq::Agent,
@@ -144,15 +297,35 @@ pub fn run_one(
     sid: &str,
     sg: Option<&str>,
     name: &str,
+    probe: Option<&CampaignProbe>,
 ) -> Value {
+    let ms = probe.and_then(|p| p.ms_token.as_deref());
+    // 抓包对齐（2026-11-06）：UA/设备 Cookie 取本账号 probe，缺失回退内置常量
+    let ua_s = probe
+        .and_then(|p| p.ua.as_deref())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(UA);
+    let device_cookies: &[(String, String)] = probe
+        .map(|p| p.device_cookies.as_slice())
+        .unwrap_or(&[]);
     // ① detail：签到状态 + 总额度
-    let detail = match post_json(agent, DETAIL_URL, sid, sg, &json!({"campaign_group_code": SCENE})) {
+    let detail = match post_json(
+        agent,
+        DETAIL_URL,
+        sid,
+        sg,
+        ms,
+        &json!({"campaign_group_code": SCENE}),
+        ua_s,
+        device_cookies,
+    ) {
         Ok(body) => parse_detail(&body),
         Err(e) => {
             return json!({
                 "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
                 "continuous_days": Value::Null, "total_amount": Value::Null,
-                "last_checkin_date": Value::Null, "message": e,
+                "last_checkin_date": Value::Null, "message": format!("detail 查询：{e}"),
+                "day": crate::doubao_checkin_results::today_key(),
             })
         }
     };
@@ -170,11 +343,27 @@ pub fn run_one(
             "total_amount": total_amount,
             "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
             "message": "今日已签到",
+            "day": crate::doubao_checkin_results::today_key(),
         });
     }
 
-    // ③ 未签 → 提交 landing/checkin
-    match post_json(agent, CHECKIN_URL, sid, sg, &json!({"scene": SCENE})) {
+    // ③ 未签 → 提交 landing/checkin（有抓包参数时用客户端真实 query，否则内置稳定参数）
+    let checkin_url = match probe {
+        Some(p) if !p.checkin_query.is_empty() => {
+            format!("{CHECKIN_BASE}?{}", p.checkin_query)
+        }
+        _ => CHECKIN_URL.to_string(),
+    };
+    match post_json(
+        agent,
+        &checkin_url,
+        sid,
+        sg,
+        ms,
+        &json!({"scene": SCENE}),
+        ua_s,
+        device_cookies,
+    ) {
         Ok(body) => {
             let data = body.get("data");
             let checked = data
@@ -230,14 +419,61 @@ pub fn run_one(
                 "message": "签到未生效（checked_in=false）",
             })
         }
-        Err(e) => json!({
-            "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
-            "day": crate::doubao_checkin_results::today_key(),
-            "continuous_days": detail.get("continuous_days").cloned().unwrap_or(Value::Null),
-            "total_amount": total_amount,
-            "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
-            "message": e,
-        }),
+        Err(e) => {
+            // 业务码失败 → detail 复查兜底：部分活动侧业务码（如 710010702）实际对应
+            // 「已签/活动未覆盖」等状态。复查 detail 今日已签 → 按 already 落库（避免误报失败）；
+            // detail 正常且未签 → 会话健康、活动端点单独拒绝，大概率无签到资格（给出明确指引）
+            if e.starts_with("接口返回异常 code=") {
+                if let Ok(re_body) = post_json(
+                    agent,
+                    DETAIL_URL,
+                    sid,
+                    sg,
+                    ms,
+                    &json!({"campaign_group_code": SCENE}),
+                    ua_s,
+                    device_cookies,
+                ) {
+                    let re = parse_detail(&re_body);
+                    if re.get("checked_in_today").and_then(Value::as_bool).unwrap_or(false) {
+                        return json!({
+                            "uid": uid, "name": name, "status": "already", "reward": Value::Null,
+                            "continuous_days": re.get("continuous_days").cloned().unwrap_or(Value::Null),
+                            "total_amount": re.get("total_amount").cloned().unwrap_or(Value::Null),
+                            "last_checkin_date": re.get("last_checkin_date").cloned().unwrap_or(Value::Null),
+                            "message": format!("{e}；复查 detail 今日已签 → 按已签处理"),
+                            "day": crate::doubao_checkin_results::today_key(),
+                        });
+                    }
+                    // detail 正常但提交被拒：按 detail 里有无 daily_signin 任务项分流定性
+                    // ① 无任务项 → scene 不匹配/无资格；② 有任务项 → 请求形态被风控（需抓包对齐）
+                    let has_task = re.get("has_signin_task").and_then(Value::as_bool).unwrap_or(false);
+                    let hint = if has_task {
+                        "detail 有 daily_signin 任务但提交被拒 → 请求形态疑似被上游风控拦截；\
+                         请开启代理后在豆包客户端手动签到一次，日志会捕获客户端真实请求用于对齐修复"
+                    } else {
+                        "detail 无 daily_signin 任务项 → 该账号未加入当前签到活动（scene 不匹配或无资格）；\
+                         若客户端能手动签到，同样请开代理抓一次真实请求"
+                    };
+                    return json!({
+                        "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
+                        "continuous_days": re.get("continuous_days").cloned().unwrap_or(Value::Null),
+                        "total_amount": re.get("total_amount").cloned().unwrap_or(Value::Null),
+                        "last_checkin_date": re.get("last_checkin_date").cloned().unwrap_or(Value::Null),
+                        "message": format!("{e}；{hint}"),
+                        "day": crate::doubao_checkin_results::today_key(),
+                    });
+                }
+            }
+            json!({
+                "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
+                "continuous_days": detail.get("continuous_days").cloned().unwrap_or(Value::Null),
+                "total_amount": total_amount,
+                "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
+                "message": format!("签到提交：{e}"),
+                "day": crate::doubao_checkin_results::today_key(),
+            })
+        }
     }
 }
 
@@ -259,8 +495,11 @@ fn append_history(state: &AppState, event: Value) {
 
 /// 池回写合并（纯函数，两阶段短临界区调用）：将签到结果按 uid 合并进最新池——
 /// 只更新仍存在账号的 quota_total / checkin_continuous_days / checkin_last_date /
-/// checkin_last_run_at 四字段；fail 时仅回写 checkin_last_run_at（签到字段保留旧值）。
-/// 被删账号不复活（返回 0 即无需写盘）、新入池账号不受影响、并发方更新的其他字段不覆盖。
+/// checkin_last_run_at 四字段。quota_total 来自 detail 的 progress.total_amount
+/// （累计获得额度），detail 查询成功即有效——fail 也回写（2026-10-28 修复：活动端点
+/// 拒签时额度面板看不到 1400 累计额度）；仅 fail 且 detail 未成功（None）时签到字段
+/// 保留旧值。被删账号不复活（返回 0 即无需写盘）、新入池账号不受影响、并发方更新的
+/// 其他字段不覆盖。
 fn merge_checkin_updates_into_pool(
     latest: &mut Value,
     updates: &[(String, String, Option<i64>, Option<i64>, Option<String>, String)],
@@ -277,12 +516,14 @@ fn merge_checkin_updates_into_pool(
             };
             let Some(obj) = acc.as_object_mut() else { continue };
             obj.insert("checkin_last_run_at".into(), Value::String(run_at.clone()));
-            if status == "fail" {
-                merged += 1;
-                continue;
-            }
             if let Some(t) = quota_total {
                 obj.insert("quota_total".into(), Value::Number((*t).into()));
+            }
+            if status == "fail" {
+                // 语义（2026-10-28）：quota_total 来自 detail（查询成功即有效），
+                // fail 且 detail 成功也回写总额度（上方已统一插入）——签到字段保留旧值
+                merged += 1;
+                continue;
             }
             if let Some(d) = continuous {
                 obj.insert("checkin_continuous_days".into(), Value::Number((*d).into()));
@@ -294,6 +535,24 @@ fn merge_checkin_updates_into_pool(
         }
     }
     merged
+}
+
+/// 只读 detail 探针：查签到状态 + 累计获得额度（progress.total_amount），
+/// 供额度巡检/数据同步任务回写 quota_total——**与签到提交解耦**（detail 是只读接口，
+/// 会话有效即可查，签到是否成功无关）。Ok(parse_detail) / Err(_) → None。
+pub fn detail_probe(agent: &ureq::Agent, sid: &str, sg: Option<&str>, ms: Option<&str>) -> Option<Value> {
+    let body = post_json(
+        agent,
+        DETAIL_URL,
+        sid,
+        sg,
+        ms,
+        &json!({"campaign_group_code": SCENE}),
+        UA,
+        &[],
+    )
+    .ok()?;
+    Some(parse_detail(&body))
 }
 
 /// 收集池内可签到目标（uid + 凭证 + name），避免边遍历边写
@@ -326,8 +585,11 @@ fn collect_targets(state: &AppState) -> Result<Vec<(String, String, Option<Strin
         .collect())
 }
 
-/// 落库 + 池回写 + 运维历史（batch/single 共用收尾）
-fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
+/// 落库 + 池回写 + 运维历史（batch/single 共用收尾）。
+/// skip_on_busy（审查修复）：批量调度/CLI 轮次传 true（同批他方进程完成写入即可
+/// 覆盖，幂等跳过无损失）；手动单账号传 false——GUI 手动签到与另一进程批次并发
+/// 时两批内容不保证相同，跳过可能把手动 success 丢成 fail，降级进程内锁继续写。
+fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_busy: bool) {
     // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）。
     // day 取各 outcome 产生时刻（run_one 内打点），落库跨零点不串日；
     // 旧记录无 day 字段时回退当前日期
@@ -343,7 +605,9 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
             o.get("reward").and_then(Value::as_i64),
         )
     });
-    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries);
+    // skip_on_busy=true：调度器批次落库，他方（CLI/另一进程同轮）Busy 时必然
+    // 完成同批写入，幂等跳过无损失
+    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries, skip_on_busy);
 
     // ② 池回写（两阶段短临界区：重读最新池按 uid 合并）
     let run_at = fs_utils::now_ts();
@@ -407,7 +671,7 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
 /// 按日落库 + 池回写 + 运维历史 → 汇总。空池跳过（对齐 doubao-quota 惯例）。
 /// 跨进程轮次锁（对齐 wb-checkin try_acquire_wb_round 先例）：GUI 调度器与
 /// schtasks CLI 双进程互斥；Busy 幂等跳过、机制性失败 fail-closed。
-pub fn run_batch(state: &AppState) -> Result<Value, String> {
+pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Value, String> {
     use crate::tasks::qoder_common::CrossProcLockFail;
     let _cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
         &state.data_dir,
@@ -429,19 +693,32 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
         }
     };
     let targets = collect_targets(state)?;
+    // probe 自动保活（方案 A，2026-11-06）：probe 缺失/过期 → 自动开客户端抓包对齐；
+    // 失败仅记日志，签到照常走既有 probe 链（缺失回退内置稳定参数）
+    if let Err(e) = super::doubao_probe::ensure_fresh_probes(state, app, &targets) {
+        fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
+    }
     if targets.is_empty() {
-        return Ok(json!({ "ok": true, "skipped": "无豆包账号" }));
+        // skipped_empty_pool（审查修复）：签到是奖励型任务（漏跑=丢收益），普通
+        // skipped 会被调度器 mark_run 固化「当日已跑」，当日导入账号失去补打窗口；
+        // 对齐同批 doubao-quota / doubao-keepalive 的 #15 空池豁免口径
+        return Ok(json!({ "ok": true, "skipped_empty_pool": "无豆包账号" }));
     }
 
     let agent = http_agent(TIMEOUT_SECS);
+    // 逐账号取本账号 probe：load_campaign_probe(Some(sid)) 内部已做「本账号键→
+    // 全局键 campaign_probe」两级回退（审查清理：删除外层 or_else 全局快照——
+    // 仅在两次 vault 读之间全局键恰好变化时才命中，且取到的还是循环前的更旧
+    // 快照，2026-11-06 起按 sessionid 分键，全局键本就是兜底）
     let mut outcomes: Vec<Value> = Vec::new();
     for (i, (uid, sid, sg, name)) in targets.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(Duration::from_millis(ACCOUNT_GAP_MS));
         }
-        outcomes.push(run_one(&agent, uid, sid, sg.as_deref(), name));
+        let probe = load_campaign_probe(&state.data_dir, Some(sid));
+        outcomes.push(run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref()));
     }
-    persist_outcomes(state, &outcomes, "task");
+    persist_outcomes(state, &outcomes, "task", true);
 
     let success = outcomes
         .iter()
@@ -468,6 +745,31 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
         })
         .collect();
 
+    // 存在失败账号时返 Err（对齐 qoder-checkin / buddy-ai-checkin 分发处惯例）：
+    // CLI `--task-run` 退出码 1 可见 + 调度器走 mark_fail 当日冷却重试（返 Ok 会
+    // mark_run 固化「当日已跑」关闭重试链）；落库/池回写/运维历史已在 persist_outcomes
+    // 完成，Err 仅改变汇总出口。GUI「立即签到全部」经此路径收到 Err 时 toast 展示
+    // 失败汇总，无数据副作用
+    if failed > 0 {
+        let err_head = errors
+            .iter()
+            .take(3)
+            .filter_map(|e| {
+                e.get("error").and_then(Value::as_str).map(|m| {
+                    format!(
+                        "{}：{}",
+                        e.get("name").and_then(Value::as_str).unwrap_or("未知账号"),
+                        m
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!(
+            "豆包签到：{success} 成功 / {already} 已领 / {failed} 失败：{err_head}"
+        ));
+    }
+
     Ok(json!({
         "ok": true, "mode": "all",
         "total": outcomes.len(), "success": success, "already": already, "failed": failed,
@@ -477,15 +779,28 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
     }))
 }
 
-/// 单账号签到（应用内手动路径）：读池凭证 → run_one → 落库/回写/历史 → 契约返回
-pub fn checkin_single(state: &AppState, uid: &str) -> Result<Value, String> {
+/// 单账号签到（应用内手动路径）：读池凭证 → probe 保活 → run_one → 落库/回写/历史
+pub fn checkin_single(state: &AppState, app: Option<&tauri::AppHandle>, uid: &str) -> Result<Value, String> {
     let targets = collect_targets(state)?;
-    let Some((_, sid, sg, name)) = targets.iter().find(|(u, _, _, _)| u == uid) else {
+    let Some(found) = targets.iter().find(|(u, _, _, _)| u == uid) else {
         return Err(format!("账号 {uid} 不在账号池中或未录入 sessionid 凭证"));
     };
+    let (_, sid, sg, name) = found;
+    // probe 自动保活（方案 A）：本账号 probe 缺失/过期 → 自动开客户端抓包（失败照常签到）
+    // （审查清理：复用首查绑定 found，消除对同一不可变 Vec 的二次 find+unwrap）
+    if let Err(e) = super::doubao_probe::ensure_fresh_probes(
+        state,
+        app,
+        std::slice::from_ref(found),
+    ) {
+        fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
+    }
     let agent = http_agent(TIMEOUT_SECS);
-    let outcome = run_one(&agent, uid, sid, sg.as_deref(), name);
-    persist_outcomes(state, std::slice::from_ref(&outcome), "manual");
+    // 本账号 probe（内部含「本账号键→全局键」两级回退；审查清理：删除外层
+    // or_else 全局兜底死分支——与 run_batch 同口径）
+    let probe = load_campaign_probe(&state.data_dir, Some(sid));
+    let outcome = run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref());
+    persist_outcomes(state, std::slice::from_ref(&outcome), "manual", false);
     let ok = outcome.get("status").and_then(Value::as_str) != Some("fail");
     Ok(json!({
         "ok": ok,
@@ -497,6 +812,81 @@ pub fn checkin_single(state: &AppState, uid: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod doubao_checkin_tests {
     use super::*;
+
+    // ── probe 按 sessionid 分键（2026-11-06 设备-账号绑定对齐）──
+
+    fn probe_json(hours_ago: i64, ms_token: &str) -> Value {
+        let ts = (chrono::Local::now().naive_local() - chrono::Duration::hours(hours_ago))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        json!({
+            "captured_at": ts,
+            "params": {"device_id": "7288888888888888", "aid": "497858", "msToken": ms_token},
+            "ms_token": ms_token,
+            "ua": "Mozilla/5.0 Test SamanthaDoubao/2.35.4",
+            "device_cookies": {"ttwid": "tt1", "odin_tt": "od1", "tt_scid": "sc1"},
+        })
+    }
+
+    fn temp_probe_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("aiwork_checkin_probe_{tag}_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn probe_本账号sessionid维度优先_全局兜底() {
+        let d = temp_probe_dir("prio");
+        crate::vault::ns_set(&d, "doubao", "campaign_probe", &probe_json(1, "global_ms")).unwrap();
+        // 全局新鲜、本账号键缺失 → 回退全局
+        let p = load_campaign_probe(&d, Some("sid-A")).expect("应回退到全局");
+        assert_eq!(p.ms_token.as_deref(), Some("global_ms"));
+        // 本账号键存在且新鲜 → 优先本账号
+        crate::vault::ns_set(&d, "doubao", &probe_key_for_sid("sid-A"), &probe_json(0, "own_ms")).unwrap();
+        let p = load_campaign_probe(&d, Some("sid-A")).expect("应取本账号");
+        assert_eq!(p.ms_token.as_deref(), Some("own_ms"));
+        assert_eq!(p.device_cookies.iter().find(|(k, _)| k == "ttwid").map(|(_, v)| v.as_str()), Some("tt1"));
+        assert!(p.ua.as_deref().unwrap_or("").contains("2.35.4"));
+        // 其他账号不受影响 → 仍回退全局
+        let p = load_campaign_probe(&d, Some("sid-B")).expect("B 应回退全局");
+        assert_eq!(p.ms_token.as_deref(), Some("global_ms"));
+    }
+
+    #[test]
+    fn probe_本账号过期_全局新鲜时回退全局() {
+        let d = temp_probe_dir("stale");
+        crate::vault::ns_set(&d, "doubao", &probe_key_for_sid("sid-X"), &probe_json(30, "stale_ms")).unwrap();
+        crate::vault::ns_set(&d, "doubao", "campaign_probe", &probe_json(1, "fresh_ms")).unwrap();
+        let p = load_campaign_probe(&d, Some("sid-X")).expect("过期键应跳过取全局");
+        assert_eq!(p.ms_token.as_deref(), Some("fresh_ms"));
+    }
+
+    #[test]
+    fn probe_全部过期缺失_返回none() {
+        let d = temp_probe_dir("none");
+        assert!(load_campaign_probe(&d, Some("sid-C")).is_none());
+        assert!(load_campaign_probe(&d, None).is_none());
+        crate::vault::ns_set(&d, "doubao", &probe_key_for_sid("sid-C"), &probe_json(25, "old")).unwrap();
+        crate::vault::ns_set(&d, "doubao", "campaign_probe", &probe_json(25, "old")).unwrap();
+        assert!(load_campaign_probe(&d, Some("sid-C")).is_none());
+    }
+
+    #[test]
+    fn cookie_of_追加设备cookie_会话键不覆盖() {
+        let dc = vec![
+            ("ttwid".to_string(), "tt1".to_string()),
+            ("msToken".to_string(), "should_skip".to_string()),
+            ("sessionid".to_string(), "should_skip".to_string()),
+            (String::new(), "empty_key".to_string()),
+        ];
+        let c = cookie_of("sid-1", Some("sg-1"), Some("ms-1"), &dc);
+        assert!(c.starts_with("sessionid=sid-1"));
+        assert!(c.contains("sid_guard=sg-1"));
+        assert!(c.contains("msToken=ms-1"));
+        assert!(c.contains("ttwid=tt1"));
+        assert!(!c.contains("should_skip"));
+        assert!(!c.contains("empty_key"));
+    }
 
     #[test]
     fn parse_detail_抓包实测结构() {
@@ -574,6 +964,8 @@ mod doubao_checkin_tests {
     #[test]
     fn merge_checkin_updates_fail_仅回写运行时间() {
         let mut latest = json!({"accounts": [{"user_id": "u1"}]});
+        // 语义更新（2026-10-28）：quota_total 来自 detail（查询成功即有效），
+        // fail 也回写总额度——否则活动端点拒签时额度面板永远看不到累计额度
         let updates = vec![(
             "u1".to_string(),
             "fail".to_string(),
@@ -586,7 +978,20 @@ mod doubao_checkin_tests {
         assert_eq!(merged, 1);
         let a1 = latest["accounts"].as_array().unwrap().first().unwrap();
         assert_eq!(a1["checkin_last_run_at"], "2026-10-27T09:15:00");
-        assert_eq!(a1.get("quota_total"), None, "失败不写总额度");
+        assert_eq!(a1["quota_total"], 1700, "fail 且 detail 成功 → 回写总额度");
         assert_eq!(a1.get("checkin_last_date"), None, "失败不写签到日期");
+        // fail 且 detail 未成功（quota_total=None）→ 不写，保留旧值
+        let mut latest2 = json!({"accounts": [{"user_id": "u2", "quota_total": 900}]});
+        let updates2 = vec![(
+            "u2".to_string(),
+            "fail".to_string(),
+            None,
+            None,
+            None,
+            "2026-10-27T09:15:00".to_string(),
+        )];
+        let _ = merge_checkin_updates_into_pool(&mut latest2, &updates2);
+        let a2 = latest2["accounts"].as_array().unwrap().first().unwrap();
+        assert_eq!(a2["quota_total"], 900, "fail 且 detail 未成功 → 保留旧总额度");
     }
 }

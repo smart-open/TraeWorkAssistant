@@ -168,7 +168,8 @@ describe('matchPreset（调度策略收口：预设匹配）', () => {
       expect(p.name).toBeTruthy();
       expect(p.desc).toBeTruthy();
       expect(['smart', 'priority']).toContain(p.inter);
-      // 每组预设的池内策略四池齐备且为合法取值
+      // 每组预设的池内策略四池齐备且为合法取值（白名单与后端 PoolStrategy::parse
+      // 合法值同步，勿漏 fair_rotation）
       for (const s of [p.trae, p.buddy, p.qoder, p.buddyAi]) {
         expect(['expire_first', 'credit_first', 'random', 'weighted', 'p2c', 'fair_rotation']).toContain(s);
       }

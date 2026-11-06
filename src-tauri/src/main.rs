@@ -314,7 +314,6 @@ fn main() {
         ))
         .manage(state)
         .manage(MainWindowMaximized(std::sync::atomic::AtomicBool::new(false)))
-        .manage(Mutex::new(Option::<commands::proxy::ProxyHandle>::None))
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
@@ -482,6 +481,7 @@ fn main() {
             commands::doubao::doubao_quota_task_unregister,
             commands::doubao::doubao_checkin_run,
             commands::doubao::doubao_dashboard_stats,
+            commands::doubao::doubao_checkin_results_detail,
             commands::doubao::doubao_checkin_task_register,
             commands::doubao::doubao_checkin_task_status,
             commands::doubao::doubao_checkin_task_unregister,
@@ -847,25 +847,17 @@ fn main() {
                             "proxy-toggle" => {
                                 // 托盘启停代理：与前端共用 proxy_start/proxy_stop 命令
                                 //（菜单文本由 proxy.rs 内 sync_tray_proxy_text 统一同步，覆盖托盘/前端/自动启动三条路径）
-                                let running = app
-                                    .state::<Mutex<Option<commands::proxy::ProxyHandle>>>()
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .is_some();
+                                let running = commands::proxy::proxy_is_running();
                                 let result = if running {
                                     let st = app.state::<AppState>();
-                                    let ps =
-                                        app.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
-                                    commands::proxy::proxy_stop(app.clone(), st, ps).map(|_| ())
+                                    commands::proxy::proxy_stop(app.clone(), st).map(|_| ())
                                 } else {
                                     let port = app.state::<AppState>().settings().proxy_port;
                                     let st = app.state::<AppState>();
-                                    let ps =
-                                        app.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
                                     // P4 Rust 化：proxy_start 已是异步命令（进程内代理启动含异步绑定），
                                     // 托盘回调运行在主线程，用 block_on 等待（与 API 服务托盘同款模式）
                                     tauri::async_runtime::block_on(commands::proxy::proxy_start(
-                                        app.clone(), st, ps, port,
+                                        app.clone(), st, port,
                                     ))
                                     .map(|_| ())
                                 };
@@ -1014,8 +1006,7 @@ fn main() {
         if let tauri::RunEvent::Exit = event {
             // 应用退出时停止进程内代理（P4 Rust 化），防止端口占用
             commands::proxy::mark_intentional_stop();
-            let proxy_state = app_handle.state::<Mutex<Option<commands::proxy::ProxyHandle>>>();
-            let mut g = proxy_state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = commands::proxy::proxy_handle_lock();
             let mut proxy_was_running = false;
             if let Some(h) = g.take() {
                 proxy_was_running = true;

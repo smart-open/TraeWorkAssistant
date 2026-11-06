@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="build-assets/app-icon-rounded.png" alt="AI Work 助手" width="128" />
+<img src="build-assets/app-icon.png" alt="AI Work 助手" width="128" />
 
 # AI Work 助手（AI Work Assistant）
 
-Windows / macOS 双平台多账号签到与管理一站式工作台 · Tauri 2 + React 18 + Rust
+Windows 桌面端多账号签到与管理一站式工作台 · Tauri 2 + React 18 + Rust
 
 **GitHub**：[github.com/smart-open](https://github.com/smart-open) · **个人博客**：[blog.sopenai.cn](https://blog.sopenai.cn/)
 
@@ -12,7 +12,7 @@ Windows / macOS 双平台多账号签到与管理一站式工作台 · Tauri 2 +
 
 ![AI Work 助手](./docs/images/main.png)
 
-> 深度支持 **Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包 / Qoder** 五应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + Qoder + 自定义模型四池调度）、6 层设备标识重置等；WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份，Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池、每日双活动签到与网关上游接入（当前仅 CN 区）。**macOS 版已可用**（Apple Silicon + Intel dmg；部分 Windows 专属域按平台灰度，详见下方 macOS 说明）。后续规划扩展更多 AI 应用。
+> 深度支持 **Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包 / Qoder** 五应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + Qoder + 自定义模型四池调度）、6 层设备标识重置等；WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份，Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池、每日双活动签到与网关上游接入（当前仅 CN 区）。后续规划扩展更多 AI 应用。
 >
 > ⚠️ 本工具与 Trae / WorkBuddy / 豆包等官方均无任何关联，仅供学习研究。使用本工具可能违反相关服务条款，风险自担。请仅管理本人合法持有的账号。
 
@@ -21,6 +21,28 @@ Windows / macOS 双平台多账号签到与管理一站式工作台 · Tauri 2 +
 > **豆包「公开 Open API」相关功能暂时搁置，恢复时间待定。**
 >
 > 目前豆包官方风控较为严格，作者本人多个账号已被封禁。为避免更多用户遭受账号损失，该方向的功能暂停推进，请知悉并谨慎评估相关使用风险。
+
+## 支持的应用
+
+| 应用 | 状态 | 说明 |
+| --- | --- | --- |
+| Trae（Trae CN） | ✅ 已支持 | 多账号签到、登录态切换、积分看板、网关 Trae 账号池、6 层设备标识重置 |
+| WorkBuddy | ✅ 已支持 | 签到 + 成长中心自动化（旅行/盲盒/任务领奖）、积分三件套、定时保活/续期、网关 WorkBuddy 池 |
+| CodeBuddy | ✅ 已支持 | 与 WorkBuddy 共享账号体系，auth 文件扫描入池、签到与登录态切换 |
+| 豆包 | ✅ 已支持 | 签到、快照切换/保活/额度巡检/对话备份（公开 Open API 暂时搁置，见上方说明） |
+| Qoder CN（包含 IDE） | ✅ 已支持 | PAT / OAuth 设备流 / IDE 登录态扫描三通道入池、每日双活动签到、网关上游接入（当前仅 CN 区） |
+| WorkBuddy AI / CodeBuddy AI（国际版） | ✅ 已支持 | 国际版客户端 authfile 布局变体，独立账号池 |
+| 智谱清言 | 🕒 暂不支持 | 暂未规划。该平台每日登录可领积分，网页接口即可操作，未来或优先纳入 |
+| MiniMax Code | 🕒 暂不支持 | 暂未规划。该平台每日签到领 400 积分（第 4/7 天更多），网页登录态可复用 |
+| ModelScope 魔搭 | 🕒 暂不支持 | 暂未规划。该平台每日额度登录即发放，无签到端点，只适合做自动保活 + 额度巡检 |
+| 讯飞 Loomy | 🕒 暂不支持 | 暂未规划。该平台有积分体系，支持短信直登 |
+| ZCode / 智谱 GLM | 🕒 暂不支持 | 暂未规划。该平台额度经活动领取 |
+| 通义万相 | 🕒 暂不支持 | 暂未规划。该平台接口存活，登录态复用情况待确认 |
+| 腾讯元宝 | ❌ 暂不支持 | 签到仅在手机 App，桌面端无法实现 |
+| Kimi / 文心一言 / 通义千问 | ❌ 暂不支持 | 无每日签到机制 |
+| 妙手 CatPaw | ❌ 暂不支持 | 按套餐发放额度，无签到机制 |
+
+> 更多平台扩展需求欢迎在 [issues](https://github.com/smart-open/TraeWorkAssistant/issues) 中反馈。
 
 ## 版本与分支
 
@@ -62,7 +84,7 @@ Windows / macOS 双平台多账号签到与管理一站式工作台 · Tauri 2 +
 ```powershell
 npm install
 npm run tauri dev      # 开发模式
-npm run tauri build    # 打包（msi + nsis，Windows 平台自动合并 tauri.windows.conf.json）
+npm run tauri build    # 打包（msi + nsis）
 node scripts/rename_release.mjs     # 安装包统一输出到 release/，命名 AI Work 助手_<版本>_x64*
 node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x64_portable.zip）
 ```
@@ -70,23 +92,6 @@ node scripts/package_portable.mjs   # 便携版 zip（AI Work 助手_<版本>_x6
 前置：Node.js 18+、Rust 1.85+（`Cargo.toml` rust-version）、WebView2 Runtime、VS Build Tools (C++)
 
 测试：`cargo test`（Rust 单测）、`npm run test`（vitest 前端）、`npx tsc --noEmit`（类型检查）
-
-macOS（F-75，Apple Silicon + Intel）：
-
-```bash
-npm install
-npm run tauri build -- --bundles dmg   # 打包 dmg（自动合并 tauri.macos.conf.json，产出对应架构镜像）
-node scripts/rename_release.mjs        # 输出 release/，命名 AI Work 助手_<版本>_aarch64|x64.dmg
-```
-
-## macOS 安装与「无法验证开发者」放行（未公证应用）
-
-macOS 版为 **ad-hoc 签名**（暂未购买 Developer ID 公证），首次打开会被 Gatekeeper 拦截，两种放行方式任选其一：
-
-1. **右键打开**：在「应用程序」文件夹中**右键点击**「AI Work 助手」→「打开」→ 再点「打开」（此后不再提示）；
-2. **终端命令**：`xattr -d com.apple.quarantine "/Applications/AI Work 助手.app"`
-
-系统级定时注册（schtasks）与设备系统级 MachineGuid 重置仅 Windows 可用；macOS 签到由内置调度器 + 开机自启覆盖。各目标应用的 macOS 版数据布局支持范围以应用内提示为准（灰度逐步放开）。
 
 ## 从老版本升级
 

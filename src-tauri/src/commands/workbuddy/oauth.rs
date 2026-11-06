@@ -519,6 +519,12 @@ pub(super) fn oauth_flow(
     }
 
     let label = if nickname.is_empty() { target_id.clone() } else { nickname.clone() };
+
+    // 扫码入池热重载（PR #187 移植，审查修复去重）：上方 2026-11 修复块与 PR #187
+    // 移植块背靠背触发两次 reload_pools_if_running，语义完全重复——合并窗口内
+    // 网关可能以半新池状态参与调度且双份 reload 日志刷屏。保留上方块（含锁序
+    // 论证），此处仅留说明；兜底由一致性巡检线程 60s 内捕获。
+
     emit("success", &format!("账号「{label}」已扫码登录并自动入池"), None);
     Ok((target_id, label))
 }

@@ -1083,9 +1083,11 @@ const RECONCILE_INTERVAL_SECS: u64 = 60;
 ///   在途请求持旧快照跑完，不中断）；
 /// - 服务停止（runtime 为 None）或被新启动取代（代际变化）→ 线程退出，
 ///   重启后由 do_start 重新拉起。
-/// 线程体整体 catch_unwind（2026-11-05 审查 H-1）：巡检涉及文件 IO / JSON 解析 /
-/// 全量重建，任一 panic 若直接杀死线程，进程内巡检将静默永久失效——捕获后落
-/// app_log 留痕，由下次网关启动重建。
+/// 线程体整体 catch_unwind + while-let 自愈重启（2026-11-05 审查 H-1，panic 自愈
+/// 口径对齐 main d04de4f）：巡检涉及文件 IO / JSON 解析 / 全量重建，任一 panic 若
+/// 直接杀死线程，进程内巡检将静默永久失效——捕获 panic 落 app_log 留痕后重新进入
+/// 巡检循环（循环首行 sleep 60s，即 panic 后 60s 自动重启；代际检查同在循环首行，
+/// 被新启动取代时自然退出，不会僵尸双跑）。
 ///
 /// 这是「事件驱动热重载」的兜底：任何未经 reload 调用就落库的写入（手工改库、
 /// 旧版本残留路径、第三方工具导入）都会被下一次巡检纠正。
@@ -1098,7 +1100,7 @@ fn spawn_pool_reconciler(app: tauri::AppHandle) {
     let spawned = std::thread::Builder::new()
         .name("pool-reconciler".into())
         .spawn(move || {
-            let result = std::panic::catch_unwind(AssertUnwindSafe(|| loop {
+            while let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| loop {
                 std::thread::sleep(std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS));
                 // 被新启动取代（代际变化）→ 旧线程退出，新线程接管巡检
                 if RECONCILER_GEN.load(Ordering::SeqCst) != gen {
@@ -1129,13 +1131,21 @@ fn spawn_pool_reconciler(app: tauri::AppHandle) {
                     );
                     reload_pools_if_running(state.inner(), runtime.inner());
                 }
-            }));
-            if result.is_err() {
-                // panic 防护留痕：巡检线程异常退出（凭据/积分不落日志）
+            })) {
+                // panic 恢复点：提取 payload 记日志（&str/String 两种常见形态，
+                // 其余 panic 值记占位符），随后 while 重新进入巡检循环——循环首行
+                // sleep RECONCILE_INTERVAL_SECS，即 panic 后间隔 60s 自动重启
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
                 if let Some(state) = app.try_state::<AppState>() {
                     fs_utils::app_log(
                         &state.data_dir,
-                        "池一致性巡检线程异常退出（panic），已记录；将由下次网关启动重建",
+                        &format!(
+                            "池一致性巡检线程 panic（{msg}），{RECONCILE_INTERVAL_SECS}s 后自动重启巡检循环"
+                        ),
                     );
                 }
             }

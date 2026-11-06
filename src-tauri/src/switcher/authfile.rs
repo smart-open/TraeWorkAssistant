@@ -279,6 +279,17 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
     // 不消费共享 auth 文件、恢复侧跳过回写，文件缺失仅 Skip 不阻断）
     match std::fs::copy(&auth_file, dest.join("auth").join(slot_auth_name(sess))) {
         Ok(_) => {
+            // 权限收口（审查修复）：fs::copy 继承源文件权限位，客户端创建的 auth
+            // 文件权限不受本工具控制——明文 token 槽位快照统一收紧 0600（与
+            // synthesize_auth_snapshot 的 write_private_file_atomic 同口径）
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    dest.join("auth").join(slot_auth_name(sess)),
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
             copied += 1;
             sink.step("backup", StepStatus::Ok, "L1 auth 文件已备份");
         }
@@ -521,6 +532,13 @@ pub fn restore_authfile(
         } {
             sink.step("restore", StepStatus::Error, &format!("auth 文件恢复失败: {e}"));
             return Err(super::thrown(sink, "auth 文件恢复失败"));
+        }
+        // 权限收口（审查修复）：回写后收紧 0600——槽位快照即便被外部改动过权限，
+        // 回写到 live 路径的明文 token 也不外放（unix；Windows ACL 体系不同，不处理）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600));
         }
         restored += 1;
         sink.step("restore", StepStatus::Ok, "L1 auth 文件已恢复");
@@ -942,15 +960,16 @@ pub fn synthesize_auth_snapshot(
             return None;
         }
     };
-    let synth_auth_path = dest.join("auth").join(slot_auth_name(sess));
+    // 合成 auth 快照含明文 token：原子落盘且 unix 创建即 0600——普通 fs::write 以
+    // umask 默认 0644 落盘，macOS 多用户机上其他用户在落盘窗口内可读明文凭证
     if let Err(e) = std::fs::create_dir_all(dest.join("auth"))
         .map_err(|e| e.to_string())
         .and_then(|()| {
-            // 合成 auth 文件含 accessToken/refreshToken 明文，走 vault 同款
-            // 原子写（unix 下 tmp 0600 创建 + sync_all + rename）：杜绝
-            // 「先 0644 落盘再 set_permissions 收紧」的可读竞窗，且中断不留
-            // 半截明文文件（备份/恢复走 fs::copy 保留源权限，不受影响）
-            crate::vault::write_key_file_atomic(&synth_auth_path, &body)
+            write_private_file_atomic(
+                &dest.join("auth").join(slot_auth_name(sess)),
+                body.as_bytes(),
+            )
+            .map_err(|e| e.to_string())
         })
     {
         sink.step("bootstrap", StepStatus::Warn, &format!("合成快照写入失败: {e}"));
@@ -981,6 +1000,50 @@ pub fn synthesize_auth_snapshot(
         &format!("已用凭证副本合成账号 {slot} 的最小登录态快照（仅 auth 文件）"),
     );
     Some(creds.uid.clone())
+}
+
+/// 敏感文件原子落盘（unix 创建即 0600）：同目录唯一 tmp（pid+序号后缀，防同槽位
+/// 并发合成互踩）以 mode(0o600) 创建——消除「先以 umask 0644 落盘再 set_permissions
+/// 收紧」的明文竞窗；sync_all + rename 原子替换，失败路径 best-effort 清理 tmp
+///（进程被硬杀仍可能残留 0600 明文 tmp，属可接受兜底）。用于合成 auth 快照等
+/// 含明文 token 的落盘。
+fn write_private_file_atomic(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(&format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let tmp = std::path::PathBuf::from(tmp_name);
+    let result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        // 失败路径 best-effort 清理：避免明文 token 残留磁盘（unix 下 tmp 本身 0600）
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// 槽位是否带合成标记（meta.json `"bootstrap": true`，合成落槽时写入）。

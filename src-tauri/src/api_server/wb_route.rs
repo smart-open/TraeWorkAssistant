@@ -496,9 +496,12 @@ pub fn load_templates(state: &WbView) -> Vec<(String, String)> {
 /// converted2/11128 rebuild 重放 + 响应侧 sse.rs 四回改点）；② Qoder 池
 /// （issue #158 P1-1/P1-2：qoder_route 经 `apply_tool_alias_forward_value`
 /// 在 active_peek 上改写 → 响应侧 wb_sse 三回改点 + completion_to_anthropic 逆
-/// 映射，受 `qoder_sanitize` 池级开关门控）。WB 池（wb_sse 管线）未接入，接入时
-/// 同键复用即可（工具集指纹是上游风控家族共性，分档无收益）；每请求读取
-///（kv 单行 + mtime 缓存），保存即对下一请求生效
+/// 映射，受 `qoder_sanitize` 池级开关门控）；③ WB 族池（Buddy CN / BuddyAI Intl
+/// 共用本文件三入口：wb_stream_chat / wb_aggregate_chat / wb_tool_exec_chat，
+/// 请求侧 `apply_tool_alias_forward` + 11128 重建后重做，响应侧
+/// stream_forward_ex / aggregate / completion_to_anthropic 逆映射，受
+/// `wb_sanitize` 池级开关门控）。工具集指纹是上游风控家族共性，三池同键复用
+///（分档无收益）；每请求读取（kv 单行 + mtime 缓存），保存即对下一请求生效
 pub fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
     let custom = crate::store::db(&state.data_dir)
         .kv_get::<wb_payload::ToolAliasFile>("tool_alias_map")
@@ -909,6 +912,12 @@ fn run_wb_stream(
         )
     };
     let templates = load_templates(state);
+    // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）此前只接
+    // 身份声明清洗、未接工具名改写——上游按 tools 工具名集合识别 agent 客户端时，
+    // 洗干净的 system 仍配原名工具集即被 11128 拒（网关日志「指纹样本」实证：system=""
+    // 而 tools=[ask_user_question,create_goal,...] 全为原名）。与 Trae/Qoder 池同表
+    // 复用 kv `tool_alias_map`（工具集指纹是上游风控家族共性，分档无收益）。
+    let tool_alias_rules = load_tool_alias_rules(state);
     let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
     // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）。
@@ -1086,6 +1095,14 @@ fn run_wb_stream(
             body_vec, model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
             seed, empty_hits > 0 || wb_payload::fp_block_recent(state.pool_label()),
         );
+        // 工具别名正向改写（issue #150）：受 sanitize 门控（与 Trae/Qoder 池同口径）；
+        // 逆映射供响应侧回改（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，
+        // 零命中 None 直通）。改写改变 JSON 长度，故入参为 &mut Vec<u8> 整体替换
+        let mut tool_alias: Option<std::collections::HashMap<String, String>> = None;
+        if sanitize {
+            tool_alias =
+                wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
+        }
         // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
         // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
         if sanitize {
@@ -1154,7 +1171,7 @@ fn run_wb_stream(
                         Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
                     );
                     let (error_info, sent_any, failed_inline, usage, eof_truncated) =
-                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, ns_encoded, None);
+                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, ns_encoded, tool_alias.as_ref());
                     // P2-2：竞速桥接行源的读错误在共享槽（wb_sse 只见桥 EOF）——
                     // 合并为传输掐断哨兵，按账号无关故障处置
                     let error_info = merge_transport_cut_info(error_info, &win.read_slot);
@@ -1251,6 +1268,11 @@ fn run_wb_stream(
                                     converted = wb_payload::prepare_wb_chat_body(
                                         body_vec, model, &picked.uid, &conv_id, effort.as_deref(),
                                         true, &templates, seed, true,
+                                    );
+                                    // 重建后须重做工具别名（issue #150）：prepare 产物是
+                                    // 原名工具集，不重做即逆映射失配且指纹未消除
+                                    tool_alias = wb_payload::apply_tool_alias_forward(
+                                        &mut converted, &tool_alias_rules,
                                     );
                                     std::thread::sleep(std::time::Duration::from_millis(200));
                                     // 断连检测：重试等待期间客户端离开则终止
@@ -1384,6 +1406,10 @@ fn run_wb_stream(
                             converted = wb_payload::prepare_wb_chat_body(
                                 body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
                                 seed, true,
+                            );
+                            // 重建后须重做工具别名（issue #150）：与流内形态同口径
+                            tool_alias = wb_payload::apply_tool_alias_forward(
+                                &mut converted, &tool_alias_rules,
                             );
                             std::thread::sleep(std::time::Duration::from_millis(200));
                             // 断连检测：重试等待期间客户端离开则终止（审查 M5：补记失败终态用量）
@@ -1559,6 +1585,9 @@ pub async fn wb_aggregate_chat(
             )
         };
         let templates = load_templates(&state);
+        // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）共用；
+        // 与 wb_stream_chat 同口径（详见该入口注记）
+        let tool_alias_rules = load_tool_alias_rules(&state);
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
         // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
@@ -1697,6 +1726,13 @@ pub async fn wb_aggregate_chat(
                 &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
                 seed, empty_hits > 0 || wb_payload::fp_block_recent(state.pool_label()),
             );
+            // 工具别名正向改写（issue #150）：受 sanitize 门控，与 Trae/Qoder 池同口径；
+            // 逆映射随本轮账号产物，成功分支经 Ok((r, tool_alias)) 带出供响应侧回改
+            let mut tool_alias: Option<std::collections::HashMap<String, String>> = None;
+            if sanitize {
+                tool_alias =
+                    wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules);
+            }
             // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
             if sanitize {
                 if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
@@ -1750,7 +1786,7 @@ pub async fn wb_aggregate_chat(
                         guard = settle_hedge(&state, &mut win, guard, &picked.uid);
                         let win_uid = win.uid.as_str();
                         let (resp, error_info) =
-                            wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()), None);
+                            wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()), tool_alias.as_ref());
                         // P2-2：读错误槽合并——掐断时丢弃部分响应（非流式不得把
                         // 截断数据当成功交付，可能含残缺 tool_calls JSON），按流内
                         // 错误换号重试
@@ -1793,7 +1829,7 @@ pub async fn wb_aggregate_chat(
                                     duration_ms, Some(ttfb_ms), &key_name,
                                     &state.route_pool().name_of(win_uid), None,
                                 );
-                                return Ok(r);
+                                return Ok((r, tool_alias));
                             }
                             (None, Some((code, msg))) => {
                                 // P2-2：传输层掐断（账号无关传输故障）——不冷却、不解绑
@@ -1821,6 +1857,10 @@ pub async fn wb_aggregate_chat(
                                         converted = wb_payload::prepare_wb_chat_body(
                                             &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(),
                                             true, &templates, seed, true,
+                                        );
+                                        // 重建后须重做工具别名（issue #150）：与流式形态同口径
+                                        tool_alias = wb_payload::apply_tool_alias_forward(
+                                            &mut converted, &tool_alias_rules,
                                         );
                                         std::thread::sleep(std::time::Duration::from_millis(200));
                                         continue; // 内层 loop：同号重试
@@ -1901,6 +1941,12 @@ pub async fn wb_aggregate_chat(
                                 converted = wb_payload::prepare_wb_chat_body(
                                     &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
                                     seed, true,
+                                );
+                                // 重建后须重做工具别名（issue #150，合并审查补漏）：
+                                // 内层 loop 重发 converted 不会再走顶部 prepare 段，
+                                // 强制清洗重试若不带别名，11128 仍以原名工具集发出
+                                tool_alias = wb_payload::apply_tool_alias_forward(
+                                    &mut converted, &tool_alias_rules,
                                 );
                                 std::thread::sleep(std::time::Duration::from_millis(200));
                                 continue;
@@ -2023,8 +2069,12 @@ pub async fn wb_aggregate_chat(
     .await;
 
     match result {
-        Ok(Ok(resp)) => {
+        Ok(Ok((resp, _tool_alias))) => {
             let body = match proto {
+                // tool_alias 传 None（对齐 qoder_route 聚合分支正确范式）：resp 来自
+                // 闭包内 wb_sse::aggregate，流式收集阶段已按逆映射回改原名；此处再传
+                // tool_alias 会二次回改——链式别名规则（如 X→A、A→B 共存）下原名恰为
+                // 回改映射键时会把工具名改坏，客户端按名匹配响应即失配
                 Protocol::Anthropic => wb_sse::completion_to_anthropic(
                     &resp,
                     &format!("msg_{}", now_ts()),
@@ -2110,6 +2160,9 @@ pub async fn wb_tool_exec_chat(
         // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let templates = load_templates(&state);
+        // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）共用；
+        // 与 wb_stream_chat 同口径（详见该入口注记）
+        let tool_alias_rules = load_tool_alias_rules(&state);
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         // P1-6 劫持防护：false = 客户端已声明同名 function 工具，未注入代理工具，
         // 全程跳过代执行（客户端工具调用照常透传，由客户端自行执行）
@@ -2217,11 +2270,18 @@ pub async fn wb_tool_exec_chat(
                 // 多候选改写种子（issue #122 方案 C1）：conv_id 绑定账号、round 随
                 // 工具执行轮次递增；空完成后/池级拦截 TTL 内/11128 强制清洗
                 // （issue #122 缺口3）追加激进清洗（issue #122 方案 C2）
-                let converted = wb_payload::prepare_wb_chat_body(
+                let mut converted = wb_payload::prepare_wb_chat_body(
                     &body_bytes, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
                     wb_payload::variant_seed(&conv_id, round as u64),
                     empty_hits > 0 || force_aggressive || wb_payload::fp_block_recent(state.pool_label()),
                 );
+                // 工具别名正向改写（issue #150）：受 sanitize 门控，与 Trae/Qoder 池同口径；
+                // 每轮重建后都重做（continue 回顶部即重新走本段，逆映射随本轮产物）
+                let tool_alias: Option<std::collections::HashMap<String, String>> = if sanitize {
+                    wb_payload::apply_tool_alias_forward(&mut converted, &tool_alias_rules)
+                } else {
+                    None
+                };
                 // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
                 if sanitize {
                     if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
@@ -2253,7 +2313,7 @@ pub async fn wb_tool_exec_chat(
                         };
                         last_ttfb_ms = Some(ttfb_start.elapsed().as_millis() as u64);
                         let (completion, error_info) =
-                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), None);
+                            wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), tool_alias.as_ref());
                         // P2-2：读错误槽合并——掐断丢弃部分响应，按轮失败处理
                         let (completion, error_info) =
                             aggregate_with_transport_cut(completion, error_info, &read_slot);

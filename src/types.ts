@@ -12,6 +12,8 @@ export type ViewKey =
   // 豆包应用页面（侧边栏应用切换 Tab → 豆包）
   | 'doubao-overview'
   | 'doubao-accounts'
+  | 'doubao-checkin'
+  | 'doubao-quota'
   | 'doubao-settings'
   // Buddy 应用页面（侧边栏应用切换 Tab → Buddy，批次1）
   | 'buddy-overview'
@@ -393,6 +395,14 @@ export interface Settings {
   doubao_checkin_enabled: boolean;
   /** 豆包每日签到时刻 HH:MM（默认 09:15，任务配置页可改） */
   doubao_checkin_hhmm: string;
+  /** 豆包 probe 自动保活（方案 A，默认开）：签到前 probe 缺失/过期时自动开代理+切客户端抓包对齐 */
+  doubao_probe_auto_keepalive: boolean;
+  /** 豆包数据同步模式：off/hourly/every_hours/every_days/daily（默认 every_hours） */
+  doubao_sync_mode: string;
+  /** 豆包数据同步 every_hours 间隔小时数（1-24，默认 2） */
+  doubao_sync_hours: string;
+  /** 豆包数据同步 daily 模式时刻 HH:MM（默认 23:50） */
+  doubao_sync_hhmm: string;
   /** WorkBuddy 桌面版 exe 手动路径（环境配置页） */
   workbuddy_path: string | null;
   /** CodeBuddy 桌面版 exe 手动路径（环境配置页） */
@@ -804,7 +814,7 @@ export interface ApiPoolFile {
   enabled_uids: string[];
   /** 调度策略：expire_first（默认）/ credit_first / random（T10） */
   strategy?: string;
-  /** Buddy(WorkBuddy) 池策略；空 = 加权公平轮转（fair_rotation，WB 专属默认） */
+  /** Buddy 池调度策略（取值同 strategy）；空 = 加权公平轮转（fair_rotation，WB 专属默认，PR #187） */
   wb_strategy?: string;
   /** 参与调度的分组 id 列表；空 = 不限分组（T10） */
   group_ids?: string[];
@@ -1008,6 +1018,8 @@ export interface DoubaoAccountView {
   user_id: string;
   name: string;
   note: string;
+  /** 共享分组 id（shg_*；null = 未分组） */
+  group_id: string | null;
   has_snapshot: boolean;
   size_bytes: number;
   file_count: number;
@@ -1067,6 +1079,22 @@ export interface DoubaoDashboardStats {
   today_failed: number;
   max_continuous_days: number | null;
   trend: DoubaoCheckinTrendPoint[];
+}
+
+/** 额度趋势明细：单账号某日签到结果（doubao_checkin_results_detail） */
+export interface DoubaoDayAccountResult {
+  user_id: string;
+  name: string;
+  /** success | already | fail */
+  status: string;
+  /** 签到奖励额度（success 时非空） */
+  reward: number | null;
+}
+
+/** 额度趋势单日明细（同 uid 同日一条，重试轮覆盖为最终态；日期升序） */
+export interface DoubaoDayDetail {
+  date: string;
+  accounts: DoubaoDayAccountResult[];
 }
 
 /** 续期巡检摘要 JSON（Rust tasks/doubao_session.rs，原 doubao_renew.py） */
@@ -1893,6 +1921,9 @@ export interface QoderCheckinRecord {
   reward?: number;
   /** 逐活动明细（F-80-余 v2 档期日历；历史记录无此字段） */
   campaigns?: { id?: string; name?: string; kind?: string; reward?: number | null }[];
+  /** 失败归因（issue #190）：blocked_need_trust=风控信任未建立（需建信任后手动重试）；
+   * 历史记录无此字段 */
+  fail_kind?: string;
 }
 
 /** qoder-checkin-progress NDJSON 单行：逐账号结果（index 为本轮序号，1 起） */
@@ -1912,6 +1943,9 @@ export interface QoderCheckinDone {
   failed: number;
   /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
   empty: number;
+  /** failed 中「风控信任未建立（BLOCKED）」数：恢复需用户操作（切换账号+客户端建信任），
+   * 自动重试无效（issue #190，口径对齐 Rust 侧） */
+  blocked: number;
 }
 
 export interface QoderCreditPackage {

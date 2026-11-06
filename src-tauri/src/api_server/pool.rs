@@ -437,6 +437,18 @@ impl ApiPool {
         *safe_lock(&self.log_ctx) = Some((data_dir.to_path_buf(), label.to_string()));
     }
 
+    /// 更新账号 last_used（PR #187 审查修复，main 侧移植）：粘性直连/专一锁定等服务路径
+    /// 不经过主取号流程的 last_used 更新点，需单独记录；缺失会导致活跃粘性
+    /// 账号 last_used 恒为 0 → pick_fair 饥饿首键恒判 starving，
+    /// 非粘性流量持续抢占粘性账号（粘性 KV cache 收益被破坏）。
+    /// 仅在未持有 entries 锁时调用（内部自取锁，std Mutex 不可重入）
+    fn touch_last_used(&self, uid: &str) {
+        let mut entries = safe_lock(&self.entries);
+        if let Some(e) = entries.get_mut(uid) {
+            e.last_used = now_ts();
+        }
+    }
+
     /// 设置账号并发上限（F-77，pool_set 热应用；0 = 不限）
     pub fn set_concurrency_limit(&self, limit: u32) {
         self.concurrency_limit
@@ -653,6 +665,8 @@ impl ApiPool {
     /// 未提及的账号保持原值，不触碰冷却/inflight/禁用等运行态（与 sync_from_accounts
     /// 全量重建互补——后者会重置 hard_until/last_used 等运行状态）
     pub fn update_credits_snapshot(&self, snapshot: &HashMap<String, (f64, Option<i64>)>) {
+        // mac 侧口径：只更新条目余额，公平份额在 pick_fair 取号时按
+        // last_balance 差分惰性记账（与 main 侧推送式记账等价且免重复锁序）
         let mut entries = safe_lock(&self.entries);
         let now = now_ts();
         for (uid, (c, expire)) in snapshot {
@@ -834,10 +848,7 @@ impl ApiPool {
         if let Some(uid) = dedicated {
             if !tried.contains(uid) {
                 if let Some(p) = self.pick_by_uid(uid, skip_credit_filters) {
-                    let mut entries = safe_lock(&self.entries);
-                    if let Some(e) = entries.get_mut(uid) {
-                        e.last_used = now_ts();
-                    }
+                    self.touch_last_used(uid);
                     return Some((p, None));
                 }
             }
@@ -870,8 +881,11 @@ impl ApiPool {
 
         // 防惊群：100ms 内重复选中同一 uid 且还有其他候选 → 让位（T2.2）；
         // 全 busy 降级路径不参与——min(inflight) 本身即负载分散，策略让位反而
-        // 会破坏「取在途最小者」语义（F-77）
-        if !busy_fallback && cands.len() > 1 {
+        // 会破坏「取在途最小者」语义（F-77）。
+        // FairRotation 也不参与（PR #187 移植审查修复）：严格轮转/加权份额本身
+        // 就是防热点的，连选是权重份额的正常表现；若参与让位，权重 2 的账号
+        // 每次连选都被改派 → 实际服务比被拉回 1:1，加权公平完全失效
+        if !busy_fallback && cands.len() > 1 && strategy != PoolStrategy::FairRotation {
             let mut recent = safe_lock(&self.recent_pick);
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -933,6 +947,7 @@ impl ApiPool {
         if let Some(e) = entries.get_mut(&account.uid) {
             e.last_used = now;
         }
+        drop(entries);
         Some((account, event))
     }
 
@@ -956,6 +971,9 @@ impl ApiPool {
             // limit=0 未启用上限，CAS 侧按无条件绑定处理
             let mut sticky = sticky;
             sticky.over_limit = false;
+            // 直连服务路径同样更新 last_used（审查修复）：否则活跃粘性账号
+            // 恒判 starving，非粘性流量持续抢占粘性账号
+            self.touch_last_used(sticky_uid);
             return Some((sticky, None));
         }
         // 粘性账号 busy：判定其他健康候选（同 allowed 约束；首轮无 tried）是否存在空闲
@@ -973,10 +991,12 @@ impl ApiPool {
                 })
         };
         if !has_other {
+            self.touch_last_used(sticky_uid);
             return Some((sticky, None));
         }
         if !has_idle {
             // 全 busy：保持粘性（粘性缓存收益 > 换一个同样 busy 的账号）
+            self.touch_last_used(sticky_uid);
             return Some((
                 sticky,
                 Some(format!(
@@ -1001,6 +1021,13 @@ impl ApiPool {
             .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
             .unwrap_or(0);
         let Some(picked) = self.pick_candidates(&idle, strategy, rand_seed, now, &inflight) else {
+            // 回退保持粘性（让位候选在间隙消失）：持 entries 锁内直改 last_used——
+            // touch_last_used 会二次取 entries 锁死锁（std Mutex 不可重入）；与
+            // 全 busy/无其他候选回退分支同口径，粘性账号持续服务须记账，否则
+            // 加权策略的闲置补偿因子失真（持续服务却像闲置）
+            if let Some(e) = entries.get_mut(sticky_uid) {
+                e.last_used = now;
+            }
             return Some((sticky, None));
         };
         let account = PickedAccount {
@@ -1025,6 +1052,7 @@ impl ApiPool {
         if let Some(e) = entries.get_mut(&account.uid) {
             e.last_used = now;
         }
+        drop(entries);
         Some((account, event))
     }
 
@@ -1550,10 +1578,12 @@ fn pick_by_strategy<'a>(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
         }),
-        // FairRotation 需要运行态（消耗账本 + 单调序号），由
-        // ApiPool::pick_candidates 分流到 pick_fair；纯函数路径不应收到该策略，
-        // 防御性回退首个候选（确定性、不 panic、不引入新语义）
-        PoolStrategy::FairRotation => cands.first().copied(),
+        PoolStrategy::FairRotation => {
+            // 防御性回退（PR #187）：FairRotation 需要实例状态（fair/inflight 账本），
+            // 正常经 pick_candidates 分流不会走到这里；纯函数兜底退化为三因子
+            // 加权随机，保证语义不坍缩为 expire_first 的确定性硬排序
+            pick_weighted(cands, rand_seed, now, inflight)
+        }
     }
 }
 
@@ -3179,6 +3209,48 @@ mod tests {
     }
 
     #[test]
+    fn fair_rotation_strict_rotation_order() {
+        // 严格轮转：首轮热身后（各账号 score/last_seq 就位），后续轮次按
+        // 取号序号单调轮转——第 5-8 次的顺序必须复现第 1-4 次
+        let pool = build_pool(&[("u1", 10.0, 0), ("u2", 10.0, 0), ("u3", 10.0, 0), ("u4", 10.0, 0)]);
+        pool.set_strategy(PoolStrategy::FairRotation);
+        let mut order: Vec<String> = Vec::new();
+        for _ in 0..8 {
+            let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
+            order.push(picked.uid);
+        }
+        assert_eq!(order[0..4], order[4..8], "第二轮应严格复现首轮顺序：{order:?}");
+        let mut uniq = order[0..4].to_vec();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 4, "首轮 4 次应各不相同：{order:?}");
+    }
+
+    #[test]
+    fn fair_rotation_weight_gives_more_share_to_expiring() {
+        // 加权份额：7 天内到期账号（权重 2）应获得约 2 倍取号份额（无到期账号 1 份）
+        let now = now_ts();
+        let soon = now + 3 * 24 * 3600; // 3 天后到期 → 权重 2
+        let pool = build_pool(&[("u1", 10.0, soon), ("u2", 10.0, 0)]);
+        pool.set_strategy(PoolStrategy::FairRotation);
+        let (mut c1, mut c2) = (0usize, 0usize);
+        for _ in 0..32 {
+            let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
+            if picked.uid == "u1" {
+                c1 += 1;
+            } else {
+                c2 += 1;
+            }
+        }
+        assert!(c1 > c2, "到期权重账号份额应更多：u1={c1} u2={c2}");
+        let ratio = c1 as f64 / c2.max(1) as f64;
+        assert!(
+            (1.5..=2.5).contains(&ratio),
+            "份额比应收敛到约 2:1，实际 u1={c1} u2={c2} ratio={ratio}"
+        );
+    }
+
+    #[test]
     fn fair_rotation_fingerprint_ignores_credits_but_tracks_identity() {
         let pool = build_pool(&[("a", 1000.0, 0)]);
         let fp0 = pool.config_fingerprint();
@@ -3264,4 +3336,57 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn fair_rotation_starvation_guard() {
+        // 饥饿保护：闲置 ≥ 5 分钟的账号无条件排最前（即使份额落后）
+        let pool = build_pool(&[("u1", 10.0, 0), ("u2", 10.0, 0), ("u3", 10.0, 0)]);
+        pool.set_strategy(PoolStrategy::FairRotation);
+        let now = now_ts();
+        {
+            let mut entries = safe_lock(&pool.entries);
+            entries.get_mut("u1").unwrap().last_used = now;
+            entries.get_mut("u2").unwrap().last_used = now;
+            entries.get_mut("u3").unwrap().last_used = now - 3600; // 闲置 1 小时
+        }
+        let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
+        assert_eq!(picked.uid, "u3", "闲置超阈值账号应优先（饥饿保护）");
+    }
+
+    #[test]
+    fn fair_rotation_defensive_fallback_in_pure_fn() {
+        // 防御回退：纯函数 pick_by_strategy 收到 FairRotation（正常不会发生，
+        // pick_candidates 已分流）→ 退化为三因子加权随机，不 panic、
+        // 不坍缩为 expire_first 硬排序（两账号都可能被选中）
+        let e_a = test_entry("a", 10.0, 0);
+        let e_b = test_entry("b", 10.0, 0);
+        let cands = vec![&e_a, &e_b];
+        let inflight: HashMap<String, u32> = HashMap::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for seed in [1u64, 3u64, 5000u64, 9001u64] {
+            let picked = pick_by_strategy(&cands, PoolStrategy::FairRotation, seed, 2000, &inflight);
+            seen.insert(picked.unwrap().uid.to_string());
+        }
+        assert!(seen.contains("a") && seen.contains("b"), "防御回退应保持随机性：{seen:?}");
+    }
+
+    #[test]
+    fn fair_rotation_zero_snapshot_still_rotates() {
+        // 零消耗快照：积分回写余额不变（无消耗记账）→ 仍按基准成本
+        //（1/权重）轮转，不会因「无账可记」退化为单账号独占
+        let pool = build_pool(&[("u1", 10.0, 0), ("u2", 10.0, 0)]);
+        pool.set_strategy(PoolStrategy::FairRotation);
+        let mut snap = HashMap::new();
+        snap.insert("u1".to_string(), (10.0, None));
+        snap.insert("u2".to_string(), (10.0, None));
+        pool.update_credits_snapshot(&snap);
+        let mut seen: HashSet<String> = HashSet::new();
+        for _ in 0..4 {
+            let picked = pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap();
+            seen.insert(picked.uid);
+        }
+        assert_eq!(seen.len(), 2, "零消耗下两账号都应被轮转：{seen:?}");
+    }
+
+
 }

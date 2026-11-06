@@ -31,12 +31,15 @@ const SENSITIVE_HEADERS: &[&str] = &[
 /// 体级凭证键值脱敏：值整体替换为 "***"（fail-closed：编译期正则，无运行期失效路径）。
 /// 键集合覆盖 handler 采信的凭证键（含裸 "token"——handler::try_capture_doubao_creds
 /// 采信 inner.get("token") 为 access_token；client_secret 补漏——\bsecret\b 因下划线
-/// 属 word 字符永远匹配不到它）
+/// 属 word 字符永远匹配不到它；msToken 补漏——\btoken\b 因词边界（s→T 均为词字符）
+/// 匹配不到 "msToken" 内部的 Token，handler::try_capture_doubao_campaign 注释采信
+/// body 含 msToken 形态参数；sessionid_ss/ms_token/sid_tt 补漏——\bsessionid\b/
+/// \btoken\b/\bttwid\b 因下划线属 word 字符匹配不到带后缀变体，豆包 Cookie 实测存在）
 fn body_mask_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
         regex::Regex::new(
-            r#"(?i)((?:"(?:access_token|refresh_token|id_token|session_token|sessionid|sid_guard|ttwid|jwt|api_key|apikey|secret|client_secret|token|authorization|password|pass_token)"|\b(?:access_token|refresh_token|id_token|session_token|sessionid|sid_guard|ttwid|jwt|api_key|apikey|client_secret|token|authorization|password|pass_token)\b)\s*[=:]\s*)("[^"]*"|'[^']*'|[^,;&\s}]+)"#,
+            r#"(?i)((?:"(?:access_token|refresh_token|id_token|session_token|sessionid|sessionid_ss|sid_guard|sid_tt|ttwid|mstoken|ms_token|jwt|api_key|apikey|secret|client_secret|token|authorization|password|pass_token)"|\b(?:access_token|refresh_token|id_token|session_token|sessionid|sessionid_ss|sid_guard|sid_tt|ttwid|mstoken|ms_token|jwt|api_key|apikey|client_secret|token|authorization|password|pass_token)\b)\s*[=:]\s*)("[^"]*"|'[^']*'|[^,;&\s}]+)"#,
         )
         .expect("body mask regex")
     })
@@ -464,6 +467,21 @@ mod tests {
         assert!(!masked2.contains("cs-secret"));
         let masked3 = mask_body("token=abc.def&x=1");
         assert!(masked3.contains(r#"token="***""#), "urlencoded: {masked3}");
+        // msToken 补漏回归：\btoken\b 因词边界匹配不到 msToken 内部 Token，须显式键名
+        let masked4 = mask_body(r#"{"msToken":"AbCdEf123","q":"keep"}"#);
+        assert!(masked4.contains(r#""msToken":"***""#), "json msToken: {masked4}");
+        assert!(!masked4.contains("AbCdEf"));
+        let masked5 = mask_body("msToken=AbCdEf123&a_bogus=x9");
+        assert!(masked5.contains(r#"msToken="***""#), "urlencoded msToken: {masked5}");
+        assert!(masked5.contains("a_bogus=x9"), "非凭证键不误伤: {masked5}");
+        // sessionid_ss / ms_token / sid_tt 变体补漏回归：\bsessionid\b / \btoken\b /
+        // \bttwid\b 因下划线属 word 字符匹配不到带后缀键名（豆包 Cookie 实测存在）
+        let masked6 = mask_body(r#"{"sessionid_ss":"ss1","ms_token":"mt1","sid_tt":"st1","other":"keep"}"#);
+        assert!(masked6.contains(r#""sessionid_ss":"***""#), "json sessionid_ss: {masked6}");
+        assert!(masked6.contains(r#""ms_token":"***""#), "json ms_token: {masked6}");
+        assert!(masked6.contains(r#""sid_tt":"***""#), "json sid_tt: {masked6}");
+        assert!(masked6.contains(r#""other":"keep""#), "非凭证键不误伤: {masked6}");
+        assert!(!masked6.contains("ss1") && !masked6.contains("mt1") && !masked6.contains("st1"));
     }
 
     #[test]

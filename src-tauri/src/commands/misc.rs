@@ -826,16 +826,18 @@ pub fn notify_test(state: State<AppState>) -> Result<String, String> {
 
 #[tauri::command]
 pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<(), String> {
-    // SQLite 化（P2）：app_settings 入 kv 文档（patch 合并语义不变）
+    // SQLite 化（P2）：app_settings 入 kv 文档（patch 合并语义不变）。
+    // 原子读-改-写（审查修复）：读、校验、合并单锁完成，与后台 kv_update 写者
+    //（签到时刻同步 / 探测路径兜底）并发不再互相覆盖丢键
     let store = crate::store::db(&state.data_dir);
-    let mut current: serde_json::Value = store.kv_get("app_settings");
-    // 内容为 null 时初始化为空对象，避免 patch 被丢弃
-    if !current.is_object() {
-        current = serde_json::json!({});
-    }
-    if let (Some(current_obj), Some(patch_obj)) =
-        (current.as_object_mut(), patch.as_object())
-    {
+    store.kv_update("app_settings", |current| {
+        let Some(patch_obj) = patch.as_object() else {
+            return Ok(());
+        };
+        // kv_update 已保证为对象；非对象形态在锁内不可达，let-else 仅类型收窄
+        let Some(current_obj) = current.as_object_mut() else {
+            return Ok(());
+        };
         for (k, v) in patch_obj {
             // 调度时刻防御性校验：空 hhmm 的既有语义是「从未配置」（state.rs 据此回填
             // 默认开+默认时刻），显式存空串会破坏该前提（回填覆盖显式关闭）；
@@ -869,8 +871,8 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
             }
             current_obj.insert(k.clone(), v.clone());
         }
-    }
-    store.kv_set("app_settings", &current)
+        Ok(())
+    })
 }
 
 // ---------------- 积分历史（供看板/趋势图） ----------------

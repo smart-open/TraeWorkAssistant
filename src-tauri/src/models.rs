@@ -203,9 +203,25 @@ pub struct Settings {
     /// detail 查询未签账号 → landing/checkin 提交 → 按日落库 + 池回写
     #[serde(default = "default_true")]
     pub doubao_checkin_enabled: bool,
+    /// 豆包数据同步模式（对齐 Trae/Buddy/Qoder 积分同步五模式）：off/hourly/
+    /// every_hours/every_days/daily（默认 every_hours 每 2 小时）；同步动作 =
+    /// 额度巡检 run_batch（quota + detail 探针 → 池回写），页面读本地池
+    #[serde(default = "default_doubao_sync_mode")]
+    pub doubao_sync_mode: String,
+    /// 豆包数据同步 every_hours 间隔小时数（1..=24，默认 2；state 归一化 clamp）
+    #[serde(default = "default_doubao_sync_hours")]
+    pub doubao_sync_hours: String,
+    /// 豆包数据同步 daily 模式时刻 HH:MM（默认 23:50 错峰）
+    #[serde(default = "default_doubao_sync_hhmm")]
+    pub doubao_sync_hhmm: String,
     /// 豆包每日签到调度触发时刻 HH:MM（默认 09:15，错峰 quota 09:30；环境配置页可改）
     #[serde(default = "default_doubao_checkin_hhmm")]
     pub doubao_checkin_hhmm: String,
+    /// 豆包 probe 自动保活（2026-11-06 方案 A，默认开）：签到时 probe 缺失/过期 →
+    /// 自动「启动代理 → 以账号打开豆包注入代理 → 等客户端首页 campaign 请求抓包
+    /// 入库 → 继续签到」，无需手动开代理+客户端签到对齐。710010702 设备指纹缺失的自愈链
+    #[serde(default = "default_true")]
+    pub doubao_probe_auto_keepalive: bool,
     /// Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；
     /// Windows 计划任务注册时间复用该值）
     #[serde(default = "default_trae_checkin_hhmm")]
@@ -510,6 +526,16 @@ fn default_wb_checkin_hhmm() -> String {
 /// 豆包每日签到调度默认 09:15（错峰额度巡检 09:30）
 fn default_doubao_checkin_hhmm() -> String {
     "09:15".into()
+}
+/// 豆包数据同步默认每 2 小时（对齐 Trae 积分数据同步默认档）
+fn default_doubao_sync_mode() -> String {
+    "every_hours".into()
+}
+fn default_doubao_sync_hours() -> String {
+    "2".into()
+}
+fn default_doubao_sync_hhmm() -> String {
+    "23:50".into()
 }
 /// buddy-ai 打卡调度默认 09:20（§4.5 补篇：对齐外部项目 scheduler 口径）
 fn default_buddy_ai_checkin_hhmm() -> String {

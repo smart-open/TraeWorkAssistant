@@ -388,16 +388,29 @@ pub fn query_account(
     if !ok_code {
         let code_str = code_v.map(value_to_str).unwrap_or_else(|| "?".to_string());
         // 常见码提示：710012001 = 登录态失效（凭证过期/不属于当前登录账号）
-        let hint = if code_v.and_then(Value::as_i64) == Some(710012001) {
-            "登录态已失效，请开启代理重新抓取凭证或重新保存该账号登录态"
-        } else {
-            ""
+        let code_num = code_v.and_then(Value::as_i64);
+        let hint = match code_num {
+            Some(710012001) => "登录态已失效，请开启代理重新抓取凭证或重新保存该账号登录态",
+            _ => "",
         };
-        return Err(if hint.is_empty() {
+        // 未知码透出上游 message（定位关键）
+        let upstream = body
+            .get("message")
+            .or_else(|| body.get("msg"))
+            .or_else(|| body.get("data").and_then(|d| d.get("message")))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        let mut msg = if hint.is_empty() {
             format!("接口返回异常 code={code_str}")
         } else {
             format!("接口返回异常 code={code_str}：{hint}")
-        });
+        };
+        if !upstream.is_empty() {
+            msg.push_str(&format!("（上游提示：{upstream}）"));
+        }
+        return Err(msg);
     }
     Ok(json!({"ok": true, "parsed": parse_quota(&body)}))
 }
@@ -491,9 +504,32 @@ pub fn summarize_parsed(parsed: &Value) -> Option<String> {
     }
 }
 
+/// 成功（ok:true）quota 历史事件的内存去重集：(uid, 当日日期)。
+/// 仅内存态：进程重启后至多当日重复一条，可接受。
+static QUOTA_OK_SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, String)>>> =
+    std::sync::Mutex::new(None);
+
+/// 成功（ok:true）事件节流判定：每账号每日只记首条。doubao-sync 默认每 2h 全量
+/// 巡检逐账号 append_history，HISTORY_MAX=400 滚动窗会被高频成功事件挤爆（失败
+/// 事件被顶掉难排查）；失败事件不节流始终记录。日期滚动时清理过期条目防集合无界增长。
+fn quota_ok_should_record(uid: &str) -> bool {
+    let today = crate::doubao_checkin_results::today_key();
+    let mut seen = QUOTA_OK_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = seen.get_or_insert_with(Default::default);
+    set.retain(|(_, d)| d == &today);
+    set.insert((uid.to_string(), today))
+}
+
 /// 追加滚动运维历史（SQLite 化 P3：doubao_health_events 表，HISTORY_MAX 上限裁剪）。
 /// 与 commands/doubao.rs append_history_event 同构（CLI 独立进程路径）。
 fn append_history(state: &AppState, event: Value) {
+    // 成功（ok:true）事件每账号每日只记首条（节流原因见 quota_ok_should_record）；
+    // 失败事件（ok:false）始终记录
+    if event.get("ok").and_then(Value::as_bool) == Some(true)
+        && !quota_ok_should_record(event.get("uid").and_then(Value::as_str).unwrap_or(""))
+    {
+        return;
+    }
     let store = crate::store::db(&state.data_dir);
     let mut events = crate::store::docs::doubao_health_load(&store);
     events.push(event);
@@ -552,9 +588,23 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
     // 巡检变更收集（两阶段）：锁外网络完成后短临界区按 uid 合并回最新池，
     // 防旧快照整体替换丢掉巡检期间新入池/被删账号（lost-update）
     let mut quota_updates: Vec<(String, Value, Option<String>, String)> = Vec::new();
+    // detail 探针结果（uid, quota_total, continuous_days, last_checkin_date）
+    let mut detail_updates: Vec<(String, Option<i64>, Option<i64>, Option<String>)> = Vec::new();
 
     for (uid, sid, sg, name) in targets {
         let now = fs_utils::now_ts();
+        // detail 只读探针（2026-10-28 解耦）：查累计获得额度 + 签到状态快照回写——
+        // 额度数值与签到动作无关，会话有效即可查（签到失败/未配也能回写 quota_total）
+        if let Some(d) = crate::tasks::doubao_checkin::detail_probe(&agent, &sid, sg.as_deref(), None) {
+            detail_updates.push((
+                uid.clone(),
+                d.get("total_amount").and_then(Value::as_i64),
+                d.get("continuous_days").and_then(Value::as_i64),
+                d.get("last_checkin_date")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string()),
+            ));
+        }
         match query_account(&agent, &url, &sid, sg.as_deref()) {
             Ok(r) => {
                 ok_n += 1;
@@ -621,14 +671,17 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
         }
     }
 
-    if !quota_updates.is_empty() {
+    // detail 探针/额度查询任一有产出即回写（detail 可能独立成功：quota_url 未配时
+    // 探针仍能回写 quota_total——额度数值与签到/会员接口解耦的关键路径）
+    if !quota_updates.is_empty() || !detail_updates.is_empty() {
         // 读-改-写互斥：短临界区重读最新池按 uid 合并额度字段——巡检期间被删账号
         // 跳过不复活、新入池账号保留；quota_checked_at 沿用查询时刻。
         // 账号池含全部账号会话凭证（等同密码），事务内整表替换
         let _guard = state.doubao_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut latest: Value =
             serde_json::to_value(crate::commands::doubao::load_pool(state)).unwrap_or(json!({}));
-        let merged = merge_quota_updates_into_pool(&mut latest, &quota_updates);
+        let mut merged = merge_quota_updates_into_pool(&mut latest, &quota_updates);
+        merged += merge_detail_updates_into_pool(&mut latest, &detail_updates);
         if merged > 0 {
             let file = serde_json::from_value::<crate::commands::doubao::DoubaoAccountPool>(latest)
                 .map_err(|e| e.to_string())?;
@@ -641,6 +694,44 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
         "exhausted": exhausted, "errors": errors,
         "finished_at": fs_utils::now_ts(),
     }))
+}
+
+/// detail 探针回写合并（纯函数）：quota_total（累计获得额度）/ checkin_continuous_days /
+/// checkin_last_date 三字段。Some 才写（None = detail 查询失败，保留旧值不误清）。
+fn merge_detail_updates_into_pool(
+    latest: &mut Value,
+    updates: &[(String, Option<i64>, Option<i64>, Option<String>)],
+) -> usize {
+    let mut merged = 0usize;
+    if let Some(arr) = latest.get_mut("accounts").and_then(Value::as_array_mut) {
+        for (uid, total, continuous, last_date) in updates {
+            let Some(acc) = arr
+                .iter_mut()
+                .find(|a| a.get("user_id").and_then(Value::as_str) == Some(uid.as_str()))
+            else {
+                continue;
+            };
+            let Some(obj) = acc.as_object_mut() else { continue };
+            let mut touched = false;
+            if let Some(t) = total {
+                obj.insert("quota_total".into(), Value::Number((*t).into()));
+                touched = true;
+            }
+            if let Some(d) = continuous {
+                obj.insert("checkin_continuous_days".into(), Value::Number((*d).into()));
+                touched = true;
+            }
+            if let Some(dt) = last_date {
+                obj.insert("checkin_last_date".into(), Value::String(dt.clone()));
+                touched = true;
+            }
+            // 三字段全空（detail 返回异常形态）不计数，避免无意义写盘
+            if touched {
+                merged += 1;
+            }
+        }
+    }
+    merged
 }
 
 /// 额度回写合并（纯函数，供两阶段短临界区调用）：将按 uid 收集的额度查询结果

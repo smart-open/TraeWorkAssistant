@@ -26,7 +26,7 @@ import type {
   SanitizeSwitches,
   SanitizeTier,
 } from '../../types';
-import { extractFingerprintFrom, neutralRewrite } from './fingerprintSamples';
+import { extractFingerprintFrom, isSampleTruncated, neutralRewrite, parseSampleSystem } from './fingerprintSamples';
 
 /** 时间戳 → 本地时间展示；null/0 = 从未自定义 */
 const fmtTs = (ts: number | null) =>
@@ -189,9 +189,21 @@ export default function FingerprintSanitizePanel() {
    * issue #129：按样本来源池归档——buddy-ai 池样本写国际档独立键并自动切档，
    * 其余池样本写 wb/Trae 共用键 */
   const applySample = async (s: FingerprintSample) => {
+    // 空 system 样本（后端取样未命中系统提示消息）无法反查触发句，直接拒绝并
+    // 给出可执行的下一步，而不是让「生成规则」按钮静默无效
+    if (!parseSampleSystem(s.sample)) {
+      toast(
+        'warn',
+        '该样本未采集到 system 文本（可能是角色形态未识别或文本被压缩为空），无法生成规则；请用「刷新」重试，若仍为空说明本次拦截不来自系统提示',
+      );
+      return;
+    }
     const from = extractFingerprintFrom(s.sample);
     if (!from) {
-      toast('warn', '样本不可解析或不含 system 文本，无法生成规则');
+      toast(
+        'warn',
+        '样本的 system 文本被截断且不含完整首句，无法给出一条能逐字命中的规则；请复制样本原文手工填写「原文指纹」',
+      );
       return;
     }
     const target: SanitizeTier = s.pool === 'buddy-ai' ? 'buddy-ai' : 'wb';
@@ -202,13 +214,17 @@ export default function FingerprintSanitizePanel() {
     }
     const to = neutralRewrite(from);
     setRows((rs) => [...rs, { key: ++rowSeq.current, rule: { from, to } }]);
+    const truncatedHint = isSampleTruncated(s.sample) ? '（样本经截断，请核对首句完整性）' : '';
     if (to) {
       toast(
         'success',
-        `已按样本预填${target === 'buddy-ai' ? '国际档' : ''}规则（from 可编辑校对），保存后生效`,
+        `已按样本预填${target === 'buddy-ai' ? '国际档' : ''}规则（from 可编辑校对），保存后生效${truncatedHint}`,
       );
     } else {
-      toast('warn', '未命中已知句式，已预填剥离规则（to 为空=整句删除），请确认后再保存');
+      toast(
+        'warn',
+        `未命中已知句式，已预填剥离规则（to 为空=整句删除），请确认后再保存${truncatedHint}`,
+      );
     }
   };
 
