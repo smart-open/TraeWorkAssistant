@@ -260,11 +260,21 @@ export default function QoderCheckin() {
             {running ? (
               <Badge tone="blue">运行中</Badge>
             ) : doneInfo ? (
-              <Badge tone={doneInfo.failed - doneInfo.empty > 0 ? 'amber' : 'green'}>
-                完成：成功 {doneInfo.ok} · 已签 {doneInfo.already} · 失败 {doneInfo.failed}
-                {doneInfo.empty > 0 && `（含 ${doneInfo.empty} 项活动未开放）`}
-                {earned > 0 && ` · 获得 ${earned} Credits`}
-              </Badge>
+              <div className="flex flex-col items-end gap-1">
+                <Badge tone={doneInfo.failed - doneInfo.empty > 0 ? 'amber' : 'green'}>
+                  完成：成功 {doneInfo.ok} · 已签 {doneInfo.already} · 失败 {doneInfo.failed}
+                  {doneInfo.empty > 0 && `（含 ${doneInfo.empty} 项活动未开放）`}
+                  {earned > 0 && ` · 获得 ${earned} Credits`}
+                </Badge>
+                {/* 风控拦截单列（issue #190）：BLOCKED 自动重试无效，需用户在
+                    客户端使用该账号建立服务端信任后手动重试——与普通失败混在
+                    「失败 N」里会引导用户无效重试 */}
+                {doneInfo.blocked > 0 && (
+                  <Badge tone="red" title="服务端按「账号×设备指纹」信任分桶拒绝本次领取；在工具内切换该账号同步指纹后打开客户端使用一次，再手动重试">
+                    {doneInfo.blocked} 个账号被风控拦截：请在客户端使用该账号建立信任后重试
+                  </Badge>
+                )}
+              </div>
             ) : null}
           </div>
           <div className="space-y-1">

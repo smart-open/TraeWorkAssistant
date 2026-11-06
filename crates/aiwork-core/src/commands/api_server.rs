@@ -61,7 +61,7 @@ fn merge_pool_set(
     qoder_uids: Option<Vec<String>>,
     // Qoder 池分组筛选（共享分组 shg_ 前缀 id）；None = 保留原值
     qoder_group_ids: Option<Vec<String>>,
-    // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
+    // Qoder 池内调度策略；空串 = 跟随 Trae 池（wb_strategy 已改公平轮转专属默认，不在此列）；None = 保留原值
     qoder_strategy: Option<String>,
     trae_enabled: Option<bool>,
     // buddy-ai（国际版）显式会话粘性开关 + 池粘性 TTL（§4.2）；None = 保留原值
@@ -196,7 +196,7 @@ pub fn pool_set(
     // Qoder 池分组筛选（qoder_groups 分组 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页分组筛选保存；空数组 = 不限分组）
     qoder_group_ids: Option<Vec<String>>,
-    // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
+    // Qoder 池内调度策略；空串 = 跟随 Trae 池（wb_strategy 已改公平轮转专属默认，不在此列）；None = 保留原值
     qoder_strategy: Option<String>,
     // Trae 池参与调度开关（默认开）；None = 保留原值
     trae_enabled: Option<bool>,
@@ -543,6 +543,227 @@ pub fn push_credits_if_running(state: &AppState) {
         &state.data_dir,
         &format!("API服务池积分回写(运行期): n={}", pool_snapshot.len()),
     );
+}
+
+/// 池配置一致性巡检（PR #187 移植，docker 适配版）：每 60s 对比「DB 侧装配指纹 ↔
+/// 运行池指纹」，不一致则整池热重载（apply_pool_snapshot 全量重建，与
+/// reload_pools_after_change 同路径）。
+///
+/// 兜底场景：扫码入池 / 导入 / token 失效标记等未触发热重载的写库路径——
+/// 网关内存快照滞后于 DB（新账号零请求、失效账号仍被派单）。
+///
+/// docker 适配：main 版按 Tauri runtime 句柄检测服务停止（runtime 取空 N tick 自退）；
+/// server 单体网关常驻运行、gateway_shared 为 OnceLock 注册后不撤销，进程退出即
+/// 线程随之终止，无需自退逻辑，仅保留原子闸门防重复拉起。
+/// 退避逻辑保留：热重载后指纹仍未复现一致（疑似口径漂移）时跳过若干轮再重试，
+/// 防每 60s 无限全量重建
+pub fn spawn_pool_reconciler(state: AppState) {
+    const RECONCILE_INTERVAL_SECS: u64 = 60;
+    // 热重载未收敛退避 tick 数（审查修复）：重载后指纹仍未复现一致时跳过
+    // 若干轮再重试，防口径漂移场景下每 60s 无限全量重建
+    const RELOAD_BACKOFF_TICKS: u32 = 2;
+    // 原子闸门：防重复拉起（OnceLock 语义下单次进程只会注册一次，闸门为防御冗余）
+    static RECONCILER_RUNNING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if RECONCILER_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let spawn_result = std::thread::Builder::new()
+        .name("wb-pool-reconciler".to_string())
+        .spawn(move || {
+            // panic 自愈（审查 2026-11-06）：巡检循环内任何 panic（如 DB 读盘异常）
+            // 不应让巡检静默失效——服务器常驻进程里本巡检是「绕过热重载直接改库」
+            // 场景的唯一兜底驱动，本函数又只在进程启动时被调用一次，单次 panic
+            // 即永久失效（catch_unwind 仅释放闸门无济于事）。改为 while + catch_unwind
+            // 自愈结构：panic → 记 [SYS] 日志 → 重启巡检循环（首个 tick 前 sleep 60s，
+            // 不会紧绷重试）；reload_backoff 跨重启保留（panic 前若处于未收敛退避，
+            // 不因重启清零而立即重载）。unwind 时持有中的锁 guard 随栈释放，
+            // safe_lock 防毒化恢复，不会留下死锁。内层循环无 return/break，
+            // catch_unwind 返回 Ok 仅在理论自退路径成立 → while 条件不成立，
+            // 线程终止并在循环外统一释放闸门
+            let mut reload_backoff: u32 = 0;
+            while let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS));
+                // 网关未注册（CLI 任务模式 / 理论上不会到这）：本轮跳过
+                let Some(shared) = crate::api_server::runtime::gateway_shared() else {
+                    continue;
+                };
+                // ── DB 侧指纹：复刻 apply_pool_snapshot 的 WB 池装配口径 ──
+                //（分组筛选 ∩ 标签筛选 → effective_wb_uids 白名单）
+                let fingerprint_pair: Option<(String, String)> = (|| {
+                    let pool_file = crate::api_server::runtime::load_pool_file(&state.data_dir);
+                    if !pool_file.wb_enabled {
+                        // WB 池未启用：跳过巡检（池仍可能保留旧账号，但路由层不派单）
+                        return None;
+                    }
+                    let wb_accounts_all =
+                        crate::api_server::runtime::wb_upstream_accounts(&state);
+                    let wb_group_filter: Option<std::collections::HashSet<&str>> =
+                        if pool_file.wb_group_ids.is_empty() {
+                            None
+                        } else {
+                            Some(pool_file.wb_group_ids.iter().map(|s| s.as_str()).collect())
+                        };
+                    let tag_map =
+                        crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
+                    let wb_tag_filter = crate::api_server::org_index::tag_uid_set(
+                        &pool_file.wb_tag_ids,
+                        &tag_map,
+                    );
+                    let wb_accounts: Vec<crate::api_server::pool::WbSyncAccount> =
+                        match (&wb_group_filter, &wb_tag_filter) {
+                            (Some(f), Some(t)) => wb_accounts_all
+                                .into_iter()
+                                .filter(|a| f.contains(a.group_id.as_str()) && t.contains(&a.uid))
+                                .collect(),
+                            (Some(f), None) => wb_accounts_all
+                                .into_iter()
+                                .filter(|a| f.contains(a.group_id.as_str()))
+                                .collect(),
+                            (None, Some(t)) => wb_accounts_all
+                                .into_iter()
+                                .filter(|a| t.contains(&a.uid))
+                                .collect(),
+                            (None, None) => wb_accounts_all,
+                        };
+                    let wb_uids: std::collections::HashSet<String> =
+                        crate::api_server::runtime::effective_wb_uids(&pool_file, &wb_accounts)
+                            .into_iter()
+                            .collect();
+                    let expected = wb_pool_fingerprint(
+                        &wb_accounts,
+                        &wb_uids,
+                        &crate::api_server::pool::PoolStrategy::resolve_wb(
+                            &pool_file.strategy,
+                            &pool_file.wb_strategy,
+                        )
+                        .as_str(),
+                    );
+                    Some((expected, shared.wb_pool.config_fingerprint()))
+                })();
+                let Some((expected, actual)) = fingerprint_pair else {
+                    continue; // wb_enabled=false：本轮跳过
+                };
+                if expected == actual {
+                    continue; // 一致：无事可做（绝大多数 tick 命中此分支）
+                }
+                // 退避中：跳过本轮重载（防口径漂移导致无限重载），计数递减
+                if reload_backoff > 0 {
+                    reload_backoff -= 1;
+                    continue;
+                }
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("池一致性巡检: WB 池指纹不一致（DB={expected} 运行={actual}）→ 触发热重载"),
+                );
+                // ── 热重载：全量重建四池（与 reload_pools_after_change 同路径）──
+                // 纯读装配（apply_pool_snapshot 内部自读 kv，不写 api_pool），
+                // 不持 POOL_CFG_LOCK：cfg 锁为叶子锁，持锁期间严禁取池锁
+                //（sync_from_* 会取池条目锁），规范热重载路径同样不持锁
+                // 注意副作用：sync_from_* 全量重建会清零账号冷却/熔断计数
+                //（err_count/until/cb_trips）——与人工配置变更触发的重载同口径；
+                // 指纹不含冷却态，正常运行不会误触发，仅在 uid/策略真实漂移时发生
+                let (_, wb_n, wb_total, _) = crate::api_server::runtime::apply_pool_snapshot(
+                    &state,
+                    &shared.pool,
+                    &shared.wb_pool,
+                    &shared.qoder_pool,
+                    &shared.buddy_ai_pool,
+                );
+                // 策略同步（审查修复）：apply_pool_snapshot 只重建账号条目；
+                // 绕过 pool_set 直写 kv 改策略的场景运行侧指纹含旧策略永不
+                // 收敛 → 每 3 tick 空转重载。四池口径与 pool_set 热应用段/
+                // 启动装配一致
+                let pool_file_now = crate::api_server::runtime::load_pool_file(&state.data_dir);
+                shared.pool.set_strategy(crate::api_server::pool::PoolStrategy::parse(
+                    &pool_file_now.strategy,
+                ));
+                shared.wb_pool.set_strategy(crate::api_server::pool::PoolStrategy::resolve_wb(
+                    &pool_file_now.strategy,
+                    &pool_file_now.wb_strategy,
+                ));
+                shared.qoder_pool.set_strategy(
+                    crate::api_server::pool::PoolStrategy::resolve_qoder(
+                        &pool_file_now.strategy,
+                        &pool_file_now.qoder_strategy,
+                    ),
+                );
+                shared.buddy_ai_pool.set_strategy(
+                    crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
+                        &pool_file_now.strategy,
+                        &pool_file_now.buddy_ai_strategy,
+                    ),
+                );
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("池一致性巡检: WB 池热重载完成（入池 {wb_n} / 上游 {wb_total} 个账号）"),
+                );
+                // 收敛复验（审查修复）：重载后重算运行池指纹比对 DB 侧口径，
+                // 未收敛视为疑似口径漂移 → 进入退避，下轮重试
+                let converged = shared.wb_pool.config_fingerprint() == expected;
+                if converged {
+                    reload_backoff = 0;
+                } else {
+                    reload_backoff = RELOAD_BACKOFF_TICKS;
+                    crate::fs_utils::app_log(
+                        &state.data_dir,
+                        "池一致性巡检: 热重载后指纹仍未收敛（疑似口径漂移），进入退避、下轮重试",
+                    );
+                }
+            })) {
+                // panic 恢复点（移植 main d04de4fc）：提取 payload 记日志（&str/String
+                // 两种常见形态，其余 panic 值记占位符），随后 while 重新进入巡检循环
+                // ——循环首行 sleep RECONCILE_INTERVAL_SECS，即 panic 后间隔 60s 自动重启
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "池一致性巡检: 巡检线程 panic（{msg}），{RECONCILE_INTERVAL_SECS}s 后自动重启巡检循环"
+                    ),
+                );
+            }
+            // 闸门统一在此释放（移植 main d04de4fc）：仅正常自退路径（内层 return）
+            // 能到达——panic 路径在 while 分支记日志后重启循环，不会落到此处
+            RECONCILER_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    if spawn_result.is_err() {
+        // 线程拉起失败：释放闸门，保证后续重试
+        RECONCILER_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// WB 池配置指纹（巡检 DB 侧，PR #187）：与运行池 entries 同构——
+/// 仅统计「白名单命中 && token 非空」的账号（sync_from_wb 同门槛），
+/// 条目态 = needs_relogin 取反；指纹含有效策略，**不含积分/时间戳**
+///（余额波动不应触发整池重载）。运行侧 ApiPool::config_fingerprint 同口径
+fn wb_pool_fingerprint(
+    wb_accounts: &[crate::api_server::pool::WbSyncAccount],
+    enabled_uids: &std::collections::HashSet<String>,
+    strategy: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut enabled: Vec<(&str, u8)> = wb_accounts
+        .iter()
+        .filter(|a| enabled_uids.contains(&a.uid) && !a.token.is_empty())
+        .map(|a| {
+            let en = if a.needs_relogin { 0u8 } else { 1u8 };
+            (a.uid.as_str(), en)
+        })
+        .collect();
+    enabled.sort_unstable();
+    let mut h = Sha256::new();
+    for (uid, en) in &enabled {
+        h.update(uid.as_bytes());
+        h.update([*en]);
+    }
+    h.update(strategy.as_bytes());
+    let digest = h.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// 列出 API 日志可用日期列表
@@ -1413,5 +1634,60 @@ mod pool_merge_tests {
         assert_eq!(m.qoder_pool_sticky_ttl_secs, 300);
         assert_eq!(m.qoder_sticky_ttl_secs, 1800);
         assert!(m.trae_enabled);
+    }
+}
+
+/// WB 池装配指纹成对锁定（审查 2026-11-06）：巡检线程 DB 侧 `wb_pool_fingerprint`
+/// 手工复刻运行侧 `ApiPool::config_fingerprint` 口径，两侧无共享实现——任一侧
+/// 漂移（加字段/改排序/改门槛）即永久失配，巡检会误判不一致并按退避节奏无限
+/// 重建四池。本测试经 sync_from_wb 真实建池后断言两侧指纹逐策略相等
+#[cfg(test)]
+mod wb_fingerprint_pairing_tests {
+    use super::wb_pool_fingerprint;
+    use crate::api_server::pool::{ApiPool, PoolStrategy, WbSyncAccount};
+
+    fn acc(uid: &str, token: &str, needs_relogin: bool) -> WbSyncAccount {
+        WbSyncAccount {
+            uid: uid.to_string(),
+            name: format!("账号{uid}"),
+            token: token.to_string(),
+            domain: String::new(),
+            enterprise_id: String::new(),
+            global_region: false,
+            credits: Some(100.0),
+            credits_expire_at: None,
+            credits_fetched_at: None,
+            needs_relogin,
+            group_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn db_side_fingerprint_matches_runtime_pool_fingerprint() {
+        let accounts = vec![
+            acc("u1", "tok-1", false),
+            acc("u2", "tok-2", true),  // needs_relogin → 池内 disabled 条目（enabled 位 0）
+            acc("u3", "", false),      // 空 token：sync_from_wb 剔除（两侧同门槛）
+            acc("u4", "tok-4", false), // 不在白名单：两侧同剔除
+        ];
+        // u5 在白名单但无账号记录：两侧同剔除
+        let enabled: Vec<String> =
+            ["u1", "u2", "u3", "u5"].iter().map(|s| s.to_string()).collect();
+        let enabled_set: std::collections::HashSet<String> =
+            enabled.iter().cloned().collect();
+        // 空串 = WB 专属默认 fair_rotation（resolve_wb），并覆盖全部策略别名
+        for strat in [
+            "", "expire_first", "credit_first", "random", "weighted", "p2c", "fair_rotation",
+        ] {
+            let pool = ApiPool::new();
+            pool.sync_from_wb(&accounts, &enabled);
+            let effective = PoolStrategy::resolve_wb("expire_first", strat);
+            pool.set_strategy(effective);
+            assert_eq!(
+                pool.config_fingerprint(),
+                wb_pool_fingerprint(&accounts, &enabled_set, effective.as_str()),
+                "wb_strategy 输入 = {strat:?} 两侧装配指纹不一致"
+            );
+        }
     }
 }

@@ -171,6 +171,12 @@ fn append_results(state: &AppState, events: &[Value]) {
         if let Some(c) = ev.get("campaigns").filter(|c| c.is_array()) {
             rec["campaigns"] = c.clone();
         }
+        // 结构化失败归因（issue #190）：fail_kind 产源自 events 事件，落库与 events
+        // 同生命周期（checkin_results API 按该字段回传，前端徽标据此判定，不耦合
+        // message 文案——message 含账号名前缀，逐字比对不可靠）
+        if let Some(k) = ev.get("fail_kind").filter(|k| !k.is_null()) {
+            rec["fail_kind"] = k.clone();
+        }
         if let Err(e) = crate::store::docs::qoder_checkin_results_upsert(&store, &rec) {
             fs_utils::app_log(&state.data_dir, &format!("[qoder] 签到结果落库失败: {e}"));
         }
@@ -187,9 +193,19 @@ const EMPTY_CAMPAIGNS_TAG: &str = "empty_campaigns";
 
 /// 永久性认证失败标记（fail_kind 产源标记，与 EMPTY_CAMPAIGNS_TAG 同模式）：
 /// pat_rejected / expired_needs_relogin / auth_dead 前置拦截分支产出——
-/// 重试注定失败，调度器按 failed - failed_empty - failed_permanent 判定
-/// 是否冷却重试，避免全天约 28 轮无效重试（审查 minor）
+/// 重试注定失败，调度器按 failed - failed_empty - failed_permanent -
+/// failed_blocked 判定是否冷却重试，避免全天约 28 轮无效重试（审查 minor）
 const PERMANENT_AUTH_TAG: &str = "permanent_auth";
+
+/// 风控信任未建立标记（fail_kind 产源标记，与 EMPTY_CAMPAIGNS_TAG 同模式）：
+/// claim 响应 status=BLOCKED（HTTP 200）产出——服务端按「账号 × 设备指纹」信任
+/// 分桶拒绝本次领取（issue #190），登录态与积分不受影响。信任建立前重试注定
+/// 失败且徒增风控暴露，调度器/启动补签按该字段从重试与推送中剔除；恢复路径
+/// 需用户操作（工具内切换该账号同步指纹 → 打开客户端使用一次 → 手动重试），
+/// 非自动重试可解。产源消息含本标记（盲发/直领两路共用 describe_blind_failure
+/// 构造），process_account 尾部按 contains 派生（盲发消息带账号名前缀、多候选
+/// 拼接，starts_with 不成立——标记字符串唯一，contains 不误命中）
+const BLOCKED_NEED_TRUST_TAG: &str = "blocked_need_trust";
 
 /// 409 过期 id 特征码（describe_blind_failure 的 409 分支与 process_account
 /// 尾部 409 诊断共用，勿在消费侧绕开常量硬编码）：
@@ -481,6 +497,13 @@ fn claim_one(
         .as_ref()
         .and_then(|b| fs_utils::dig(b, &["status", "data.status"]))
         .map(|v| s_of(Some(v)).to_ascii_uppercase());
+    // BLOCKED 直领形态（issue #190）：与盲发共用标记归因——风控信任未建立，
+    // 重试注定失败，process_account 尾部按 contains 派生 fail_kind 剔除自动重试。
+    // 必须先于 2xx 宽容成功分支排除：实测形态为 HTTP 200 + status=BLOCKED，
+    // 若放在非 2xx 尾部，200+BLOCKED 会被下面的宽容分支误判为「领取成功」
+    if claimed_status.as_deref() == Some("BLOCKED") {
+        return ("fail".into(), describe_blind_failure(status, Some("BLOCKED"), &raw), None);
+    }
     if (200..=201).contains(&status) {
         // claim 响应顶层 benefit.amount（R-9 抓包实测含完整 benefit{kind,amount,validity}）
         let body_reward = body
@@ -906,7 +929,9 @@ fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool, kind:
 ///   重学习机制将自动补正
 fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String {
     if claimed == Some("BLOCKED") {
-        return "服务端风控拦截（status=BLOCKED，本次领取被拒绝）——该账号设备指纹未建立服务端信任：工具盲发指纹与客户端原生指纹不同信任桶，仅登录客户端无法消除（docker 版暂无指纹同步通道）；建议在客户端领取今日奖励或关注工具更新".into();
+        return format!(
+            "{BLOCKED_NEED_TRUST_TAG}：服务端风控拦截（status=BLOCKED，本次领取被拒绝）——该账号设备指纹未建立服务端信任：工具盲发指纹与客户端原生指纹不同信任桶，仅登录客户端无法消除（docker 版暂无指纹同步通道）；建议在客户端领取今日奖励或关注工具更新"
+        );
     }
     if code == 503 && raw.contains("RISK_DEPENDENCY_UNAVAILABLE") {
         return "服务端风控依赖暂不可用（503 RISK_DEPENDENCY_UNAVAILABLE），稍后将自动重试（本请求已用最小头形态，若持续出现说明上游风控再升级，请关注工具更新）".into();
@@ -1639,6 +1664,13 @@ fn process_account(
     // 不破坏统计，换标记只动常量一处）
     if message.starts_with(EMPTY_CAMPAIGNS_TAG) {
         ev["fail_kind"] = json!(EMPTY_CAMPAIGNS_TAG);
+    } else if message.contains(BLOCKED_NEED_TRUST_TAG) {
+        // 风控信任未建立（issue #190）：BLOCKED 消息（盲发带「{账号名} 盲发失败：」
+        // 前缀、直领为单条消息）按 contains 派生 fail_kind——调度器/启动补签据此
+        // 从自动重试与推送打扰中剔除（信任建立前重试注定失败且徒增风控暴露）。
+        // else-if：empty 与 blocked 互斥（blocked 消息不会以 empty 前缀开头），
+        // 保持「fail_kind 单值、empty 分类优先」的 run_fallback 既有契约
+        ev["fail_kind"] = json!(BLOCKED_NEED_TRUST_TAG);
     }
     if let Some(r) = reward {
         ev["reward"] = json!(r);
@@ -1682,7 +1714,8 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
         );
         let done = json!({
             "type": "done", "ok": 0, "already": 0, "failed": 0,
-            "failed_empty_campaigns": 0, "failed_permanent": 0, "skipped_busy": true,
+            "failed_empty_campaigns": 0, "failed_permanent": 0, "failed_blocked": 0,
+            "skipped_busy": true,
         });
         emit(&done);
         return done;
@@ -1756,13 +1789,27 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
                 && e.get("fail_kind").and_then(Value::as_str) == Some(PERMANENT_AUTH_TAG)
         })
         .count();
+    // 风控信任未建立单列（issue #190）：BLOCKED 恢复需用户操作（切换账号 + 客户端
+    // 建信任），自动重试注定失败——调度器/启动补签/前端 toast 按该字段剔除
+    let failed_blocked = events
+        .iter()
+        .filter(|e| {
+            e["status"] == "fail"
+                && e.get("fail_kind").and_then(Value::as_str) == Some(BLOCKED_NEED_TRUST_TAG)
+        })
+        .count();
     let done = json!({
         "type": "done", "ok": ok, "already": already, "failed": failed,
         "failed_empty_campaigns": failed_empty_campaigns,
         "failed_permanent": failed_permanent,
+        "failed_blocked": failed_blocked,
     });
-    emit(&done);
+    // 先落库再广播（issue #190 刷新反馈）：QoderAccounts 的 blockedCheckin 徽标
+    // 数据源为 checkin_results API（落库后可查）；若先广播，前端 done 回调内
+    // refreshBlockedCheckin 会在落库前查询，读不到本轮 fail_kind，「待建信任」
+    // 徽标与「重试」按钮不出现。先 append 后 emit，广播时记录已可查
     append_results(state, &events);
+    emit(&done);
     done
 }
 

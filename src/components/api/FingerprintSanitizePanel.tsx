@@ -257,6 +257,12 @@ export default function FingerprintSanitizePanel() {
   const addFromSample = (sample: string, whole: boolean) => {
     try {
       const from = whole ? parseSystemText(sample) : parsePrefix(sample);
+      // 整句档空 system 样本（system="" 或仅省略号截断）解析得空串：生成 from=""
+      // 草稿规则会被后端装配层 fail-safe 剔除，这里前置拦截并给出明确提示
+      if (!from) {
+        setSampleErr('样本未包含系统提示内容，无法生成规则草案');
+        return;
+      }
       if (rows.some((row) => row.rule.from.trim() === from)) {
         setSampleErr('该指纹的规则已存在，未重复添加');
         return;

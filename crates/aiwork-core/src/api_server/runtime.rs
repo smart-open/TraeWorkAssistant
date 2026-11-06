@@ -236,7 +236,7 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         ),
     );
 
-    // Buddy 池策略：wb_strategy 独立配置优先；空 = 跟随 Trae 池
+    // WB 池策略：wb_strategy 显式配置优先；空 = 加权公平轮转（WB 专属默认，2026-11 修复）
     let wb_strategy = PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy);
     let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -254,7 +254,7 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     wb_pool.set_strategy(wb_strategy);
 
     // Qoder 池启动概况（p3-3 + 池内策略）：qoder_strategy 空 = 跟随 Trae 池策略
-    //（与 Buddy 池 resolve_wb 同语义）
+    //（resolve_qoder 独立跟随，不走 WB 池的公平轮转专属默认）
     let qoder_strategy =
         PoolStrategy::resolve_qoder(&pool_file.strategy, &pool_file.qoder_strategy);
     qoder_pool.set_strategy(qoder_strategy);
@@ -269,7 +269,7 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
     );
 
     // buddy-ai 国际池启动概况（池内策略：buddy_ai_strategy 空 = 跟随 Trae 池，
-    // 与 Buddy/Qoder 池同语义；开关默认 false，未启用时不产生告警噪音）
+    // 与 Qoder 池同语义（不走 WB 池专属默认）；开关默认 false，未启用时不产生告警噪音）
     let buddy_ai_strategy = PoolStrategy::resolve_buddy_ai(
         &pool_file.strategy,
         &pool_file.buddy_ai_strategy,

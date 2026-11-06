@@ -448,6 +448,11 @@ fn oauth_flow(
     );
 
     let label = if nickname.is_empty() { target_id.clone() } else { nickname.clone() };
+    // 扫码入池热重载（PR #187 移植）：写池 + 写凭证后网关内存快照仍是旧的，
+    // 必须触发 reload_pools_after_change 否则新账号零请求（与导入路径
+    // accounts.rs 的入池热重载同口径）。网关未注册（CLI 任务模式）静默跳过；
+    // 极端竞态由池一致性巡检线程 60s 内兜底捕获
+    crate::api_server::runtime::reload_pools_after_change(state);
     emit_progress("success", &format!("账号「{label}」已扫码登录并自动入池"), None);
     Ok((target_id, label))
 }

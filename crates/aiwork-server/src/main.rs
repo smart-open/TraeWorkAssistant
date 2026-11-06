@@ -85,6 +85,11 @@ async fn main() {
     // 注册网关共享句柄：commands 层（pool_set / oauth_login / cooldown 清除）热重载据此取用
     set_gateway_shared(shared.clone());
 
+    // 池配置一致性巡检线程（PR #187 移植，docker 适配）：兜底捕获「直接改库绕过
+    // 热重载」的场景（扫码入池/导入/token 失效标记等），60s 周期指纹比对不一致
+    // 即整池热重载
+    aiwork_core::commands::api_server::spawn_pool_reconciler(state.clone());
+
     // 常驻任务：WB 健康探针 + 持久化 flusher（2s 周期）
     spawn_shared_tasks(shared.clone());
 

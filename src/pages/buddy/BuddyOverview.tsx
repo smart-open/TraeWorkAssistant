@@ -15,6 +15,7 @@ import {
 import PageHeader from '../../components/PageHeader';
 import { StatCard, Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
+import { withMinDelay } from '../../lib/delay';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
 import type {
@@ -77,19 +78,57 @@ export default function BuddyOverview() {
   const [records, setRecords] = useState<WbCheckinRecord[]>([]);
   const [refreshing, setRefreshing] = useState(false);
 
-  const refresh = async () => {
+  const refresh = async (fresh = false) => {
+    // 防重入：连点会重复触发逐账号上游积分查询（对齐 Trae 概述口径）
+    if (refreshing) return;
     setRefreshing(true);
-    try {
+    // 手动刷新给即时反馈（issue #188：点击无提示被感知为「没反应」）
+    if (fresh) pushToast('info', '刷新中…');
+    // credits 路线失败/stale 已弹专属提示，其余失败静默但计入 ok；
+    // 供手动刷新判定是否弹「已刷新」，避免失败提示与成功提示并存
+    let creditsFailed = false;
+    const work = async (): Promise<boolean> => {
+      let localOk = true;
       const [accs, cr, recs] = await Promise.all([
-        api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
-        api.workbuddy.creditsFetch().catch(() => null),
-        api.workbuddy.checkinResults(30).catch(() => [] as WbCheckinRecord[]),
+        api.workbuddy.accountsList().catch(() => {
+          localOk = false;
+          return [] as WorkBuddyAccountView[];
+        }),
+        // 手动刷新（fresh=true）强制走网络：SWR 缓存直回时数据不变且无提示，
+        // 用户感知即「点了没反应」（issue #188 根因）。fresh=true 失败时后端
+        // 回退历史缓存并标 stale，此处明示回退而非吞错
+        api.workbuddy
+          .creditsFetch(undefined, fresh)
+          .then((r) => {
+            if (r?.stale) {
+              creditsFailed = true;
+              pushToast('warn', 'Buddy 积分刷新失败，已回退展示历史缓存数据');
+            }
+            return r;
+          })
+          .catch((err) => {
+            creditsFailed = true;
+            pushToast('error', `Buddy 积分查询失败：${String(err)}`);
+            return null;
+          }),
+        api.workbuddy.checkinResults(30).catch(() => {
+          localOk = false;
+          return [] as WbCheckinRecord[];
+        }),
       ]);
       setAccounts(accs);
       setCredits(cr);
       setRecords(recs);
-    } catch (err) {
-      pushToast('error', `WorkBuddy 概述刷新失败：${String(err)}`);
+      return !creditsFailed && localOk;
+    };
+    try {
+      // 手动刷新兜最短展示时长：纯缓存命中时转圈一闪而过，感知同「无反应」
+      const ok = fresh ? await withMinDelay(work(), 600) : await work();
+      // 仅真实成功才弹「已刷新」；credits 失败已有专属提示，本地数据缺失补 warn
+      if (fresh && ok) pushToast('success', '已刷新');
+      else if (fresh && !ok && !creditsFailed) {
+        pushToast('warn', '部分本地数据加载失败（账号列表 / 签到记录）');
+      }
     } finally {
       setRefreshing(false);
     }
@@ -196,7 +235,7 @@ export default function BuddyOverview() {
         title="Buddy · 概述"
         desc="WorkBuddy / CodeBuddy 运行总览 · 账号 / 积分 / 告警提醒 · 签到趋势与积分榜"
         actions={
-          <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
+          <button onClick={() => void refresh(true)} className="btn-outline" disabled={refreshing}>
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
           </button>
         }

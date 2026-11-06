@@ -147,38 +147,38 @@ pub fn settings_get(state: &AppState) -> Settings {
 }
 
 pub fn settings_set(state: &AppState, patch: serde_json::Value) -> Result<(), String> {
-    // SQLite 化（P2）：app_settings 入 kv 文档（patch 合并语义不变）
+    // SQLite 化（P2）：app_settings 入 kv 文档（patch 合并语义不变）；
+    // 原子读-改-写（移植 main d04de4fc 审查修复）：两段式 kv_get→kv_set 之间
+    // 他方写入会被旧快照整体覆盖丢键，读改写改走 kv_update 同一连接锁区完成；
+    // 校验 Err 整体放弃写回（语义同先校验后写）
     let store = crate::store::db(&state.data_dir);
-    let mut current: serde_json::Value = store.kv_get("app_settings");
-    // 内容为 null 时初始化为空对象，避免 patch 被丢弃
-    if !current.is_object() {
-        current = serde_json::json!({});
-    }
-    if let (Some(current_obj), Some(patch_obj)) =
-        (current.as_object_mut(), patch.as_object())
-    {
-        for (k, v) in patch_obj {
-            // C4：app_order 元素合法性校验——合法键走 models::is_valid_app_key 单一来源
-            // （与 state.rs 读取侧归一同谓词），任意字符串不得入库；非法元素剔除 +
-            // HashSet 全量去重保序（对齐读取侧，Vec::dedup 只去相邻重复）；
-            // 非数组形态不写入（防破坏 Vec<String> 反序列化）
-            if k == "app_order" {
-                let Some(arr) = v.as_array() else {
+    store.kv_update("app_settings", |current| {
+        if let (Some(current_obj), Some(patch_obj)) =
+            (current.as_object_mut(), patch.as_object())
+        {
+            for (k, v) in patch_obj {
+                // C4：app_order 元素合法性校验——合法键走 models::is_valid_app_key 单一来源
+                // （与 state.rs 读取侧归一同谓词），任意字符串不得入库；非法元素剔除 +
+                // HashSet 全量去重保序（对齐读取侧，Vec::dedup 只去相邻重复）；
+                // 非数组形态不写入（防破坏 Vec<String> 反序列化）
+                if k == "app_order" {
+                    let Some(arr) = v.as_array() else {
+                        continue;
+                    };
+                    let mut seen = std::collections::HashSet::new();
+                    let cleaned: Vec<serde_json::Value> = arr
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .filter(|s| crate::models::is_valid_app_key(s))
+                        .filter(|s| seen.insert(*s))
+                        .map(|s| serde_json::Value::String(s.to_string()))
+                        .collect();
+                    current_obj.insert(k.clone(), serde_json::Value::Array(cleaned));
                     continue;
-                };
-                let mut seen = std::collections::HashSet::new();
-                let cleaned: Vec<serde_json::Value> = arr
-                    .iter()
-                    .filter_map(|x| x.as_str())
-                    .filter(|s| crate::models::is_valid_app_key(s))
-                    .filter(|s| seen.insert(*s))
-                    .map(|s| serde_json::Value::String(s.to_string()))
-                    .collect();
-                current_obj.insert(k.clone(), serde_json::Value::Array(cleaned));
-                continue;
+                }
+                current_obj.insert(k.clone(), v.clone());
             }
-            current_obj.insert(k.clone(), v.clone());
         }
-    }
-    store.kv_set("app_settings", &current)
+        Ok::<_, String>(true)
+    })
 }

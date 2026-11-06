@@ -300,11 +300,14 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   const [qoderGatewayReady, setQoderGatewayReady] = useState(false);
 
   const loadUsage = useCallback(
-    async (fresh: boolean) => {
+    // 返回是否成功，供 refresh 判定是否弹「看板数据已刷新」（失败已有专属 error toast）
+    async (fresh: boolean): Promise<boolean> => {
       try {
         setUsage(await api.accounts.usageHistory(fresh));
+        return true;
       } catch (err) {
         pushToast('error', `Trae 消耗明细查询失败：${String(err)}`);
+        return false;
       }
     },
     [pushToast],
@@ -312,26 +315,35 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
 
   // Trae 逐包到期（issue #82 T5.1）：expired_ents 实时轻请求；失败保留旧数据展示 + toast
   // （stale-on-error 惯例，不置 null 清空既有到期条目）
-  const loadExpiredEnts = useCallback(async () => {
+  const loadExpiredEnts = useCallback(async (): Promise<boolean> => {
     try {
       setExpiredEnts(await api.accounts.traeExpiredEnts());
+      return true;
     } catch (err) {
       pushToast('error', `Trae 逐包到期查询失败：${String(err)}`);
+      return false;
     }
   }, [pushToast]);
 
   const loadBuddy = useCallback(
-    async (fresh: boolean) => {
+    // 返回 credits 主链路是否真实成功（辅助源 allSettled 优雅回退不计失败），
+    // 供 refresh 决定是否弹「看板数据已刷新」，避免失败提示与成功提示并存
+    async (fresh: boolean): Promise<boolean> => {
+      let ok = true;
       await Promise.allSettled([
         api.workbuddy
           .creditsFetch(undefined, fresh)
           .then((r) => {
             setWbCredits(r);
             if (fresh && r.stale) {
+              ok = false;
               pushToast('warn', 'Buddy 积分刷新失败，已回退展示历史缓存数据');
             }
           })
-          .catch((err) => pushToast('error', `Buddy 积分查询失败：${String(err)}`)),
+          .catch((err) => {
+            ok = false;
+            pushToast('error', `Buddy 积分查询失败：${String(err)}`);
+          }),
         // 今日新增（§2.2 方案 A）+ 积分统计「区间总获得」：签到日志 reward 聚合（90 天）
         api.workbuddy
           .checkinResults(90)
@@ -353,6 +365,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
           .then((r) => setWbSnapshots(r.snapshots ?? []))
           .catch(() => setWbSnapshots([])),
       ]);
+      return ok;
     },
     [pushToast],
   );
@@ -362,16 +375,22 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   // 保证「今日快照」在首次装载即可见；签到日志取 90 天窗口（与 Buddy 侧同口径）：
   // KPI 今日新增回退 + 积分统计 Tab「区间总获得」共用，避免短窗口少计
   const loadQoder = useCallback(
-    async (fresh: boolean) => {
+    // 返回 credits 主链路是否真实成功（辅助源 allSettled 优雅回退不计失败），同 loadBuddy
+    async (fresh: boolean): Promise<boolean> => {
+      let ok = true;
       await api.qoder
         .creditsFetch(undefined, fresh)
         .then((r) => {
           setQoderCredits(r);
           if (fresh && r.stale) {
+            ok = false;
             pushToast('warn', 'Qoder 积分刷新失败，已回退展示历史缓存数据');
           }
         })
-        .catch((err) => pushToast('error', `Qoder 积分查询失败：${String(err)}`));
+        .catch((err) => {
+          ok = false;
+          pushToast('error', `Qoder 积分查询失败：${String(err)}`);
+        });
       await Promise.allSettled([
         api.qoder
           .creditsHistoryList()
@@ -382,12 +401,13 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
           .then(setQoderCheckin)
           .catch(() => setQoderCheckin([])),
       ]);
+      return ok;
     },
     [pushToast],
   );
 
   // ---- Token 统计 Tab 数据源（Web 版仅网关源；本地 token 扫描为桌面版专属）----
-  const loadGateway = useCallback(async () => {
+  const loadGateway = useCallback(async (): Promise<boolean> => {
     setGatewayLoading(true);
     try {
       // 看板按单平台展示，拉取 Trae/Buddy/Qoder 三池（custom 池仅 API 服务页 UsageStatsPanel 使用）
@@ -411,7 +431,9 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       setGateway({ trae, buddy, qoder });
       if (failed.length > 0) {
         pushToast('warn', `网关用量加载失败（${failed.join('、')}池）：已按空态展示，可点击「刷新」重试`);
+        return false;
       }
+      return true;
     } finally {
       setGatewayLoading(false);
     }
@@ -432,19 +454,24 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       // silent：调度器联动（board-data-synced）静默重读缓存——不置全局 loading、
       // 不强制最短展示时长，避免看板每次同步后闪烁并瞬时禁用刷新按钮
       if (!silent) setLoading(true);
-      const work = async () => {
+      // 汇总各真实数据源装载结果（失败方均已弹专属 toast），供末尾判定是否弹成功提示——
+      // 避免「已刷新」与失败提示并存造成语义矛盾
+      let ok = true;
+      const work = async (): Promise<boolean> => {
         // Trae fresh 时先串行刷新剩余积分：后端逐账号网络查询并落盘 credits_daily.json 快照
         // （旧页即串行保证此顺序），完成后再并行读取；否则日快照竞速先返回旧值，今日 KPI 滞后
-        if (isTrae && fresh) await refreshRemainingCredits();
+        if (isTrae && fresh) ok = (await refreshRemainingCredits()) && ok;
         await Promise.all([
           // 按平台只加载本侧数据源
           isTrae ? refreshCreditsDaily() : Promise.resolve(),
-          isTrae ? loadUsage(fresh) : Promise.resolve(),
+          isTrae ? loadUsage(fresh).then((v) => void (ok = ok && v)) : Promise.resolve(),
           // 逐包到期实时查询（issue #82 T5.1）：仅「刷新数据」联动重拉；
           // 进入页面由独立 effect 拉取、调度器静默同步不触发（避免后台静默网络请求）
-          isTrae && fresh ? loadExpiredEnts() : Promise.resolve(),
-          isTrae || isQoder ? Promise.resolve() : loadBuddy(fresh),
-          isQoder ? loadQoder(fresh) : Promise.resolve(),
+          isTrae && fresh ? loadExpiredEnts().then((v) => void (ok = ok && v)) : Promise.resolve(),
+          isTrae || isQoder
+            ? Promise.resolve()
+            : loadBuddy(fresh).then((v) => void (ok = ok && v)),
+          isQoder ? loadQoder(fresh).then((v) => void (ok = ok && v)) : Promise.resolve(),
           // Qoder 网关就绪探测（issue #82 T3.1）：统一目录含 enabled 的 qoder 源 → 点亮网关数据源
           isQoder
             ? api.apiServer
@@ -455,15 +482,17 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
                 .catch(() => setQoderGatewayReady(false))
             : Promise.resolve(),
           // 已加载过的源随全局刷新联动（fresh=true 网关直查）
-          gatewayLoadedRef.current && fresh ? loadGateway() : Promise.resolve(),
+          gatewayLoadedRef.current && fresh
+            ? loadGateway().then((v) => void (ok = ok && v))
+            : Promise.resolve(),
         ]);
         // 会话明细 Tab 纯读缓存：随看板刷新联动重查（含调度器静默同步）
         setSessionsRefreshKey((k) => k + 1);
+        return ok;
       };
       try {
-        if (silent) await work();
-        else await withMinDelay(work(), 600);
-        if (fresh) {
+        const allOk = silent ? await work() : await withMinDelay(work(), 600);
+        if (fresh && allOk) {
           pushToast('success', '看板数据已刷新');
         }
       } finally {

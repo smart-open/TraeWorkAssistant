@@ -536,10 +536,12 @@ pub struct ApiPoolFile {
     /// 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c
     #[serde(default)]
     pub strategy: String,
-    /// Buddy 池调度策略（取值同上）；空 = 沿用 strategy（兼容旧数据两池同策略）
+    /// Buddy 池调度策略（取值同上）；空 = 加权公平轮转 fair_rotation
+    ///（WB 专属默认，2026-11 修复，PR #187——改前「跟随 Trae 池」继承 expire_first 硬排序缺陷）
     #[serde(default)]
     pub wb_strategy: String,
-    /// Qoder 池调度策略（取值同上）；空 = 沿用 strategy（跟随 Trae 池，同 Buddy 语义）
+    /// Qoder 池调度策略（取值同上）；空 = 沿用 strategy（跟随 Trae 池；
+    /// 不与 Buddy 同语义——后者已改公平轮转专属默认）
     #[serde(default)]
     pub qoder_strategy: String,
     /// 参与调度的分组 id 列表；空 = 不限分组
@@ -660,7 +662,8 @@ pub struct ApiPoolFile {
     #[serde(default)]
     pub buddy_ai_tag_ids: Vec<String>,
     /// buddy-ai 池内调度策略（取值同 strategy；空串 = 跟随 Trae 池，与
-    /// wb_strategy / qoder_strategy 同语义）。启动（do_start）与热应用（pool_set）
+    /// qoder_strategy 同语义——wb_strategy 已改公平轮转专属默认，不在此列）。
+    /// 启动（do_start）与热应用（pool_set）
     /// 共用 PoolStrategy::resolve_buddy_ai 解析，保证两处行为一致
     #[serde(default)]
     pub buddy_ai_strategy: String,

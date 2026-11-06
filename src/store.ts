@@ -118,7 +118,8 @@ interface AppState {
     skip_checked_in: boolean;
     skip_expired: boolean;
   }) => Promise<void>;
-  refreshRemainingCredits: () => Promise<void>;
+  /** 逐账号上游刷新可用积分；返回是否成功（失败已弹 error toast），供调用方决定是否再弹「已刷新」 */
+  refreshRemainingCredits: () => Promise<boolean>;
   cooldownClear: (userId: string) => Promise<void>;
   refreshJwt: (userId: string, force?: boolean) => Promise<void>;
   saveSettings: (patch: Partial<Settings>) => Promise<void>;
@@ -529,11 +530,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 失败分开计数，避免用户对无解失败反复重试（口径对齐 Rust 侧补签通知）
       const empty = Math.max(0, num(ev.failed_empty_campaigns));
       const failed = num(ev.failed);
+      // failed_blocked（风控信任未建立 BLOCKED，issue #190）同为非用户可自动
+      // 重试失败：恢复需用户操作（切换账号 + 客户端建信任），文案单列引导
+      const blocked = Math.max(0, Math.min(num(ev.failed_blocked), failed - empty));
       const done: QoderCheckinDone = {
         ok: num(ev.ok),
         already: num(ev.already),
         failed,
         empty,
+        blocked,
       };
       set((s) => ({
         qoderCheckin: { ...s.qoderCheckin, running: false, done, doneRev: s.qoderCheckin.doneRev + 1 },
@@ -545,10 +550,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - empty));
       const retryable = failed - empty - permanent;
       get().pushToast(
-        retryable > 0 || permanent > 0 ? 'warn' : 'success',
+        retryable > 0 || permanent > 0 || blocked > 0 ? 'warn' : 'success',
         `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
           (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : '') +
-          (permanent > 0 ? `（其中 ${permanent} 项需重新登录/更新 PAT 后重试）` : ''),
+          (permanent > 0 ? `（其中 ${permanent} 项需重新登录/更新 PAT 后重试）` : '') +
+          (blocked > 0 ? `（其中 ${blocked} 项被风控拦截：需在客户端使用该账号建立信任后重试）` : ''),
       );
       return;
     }
@@ -741,6 +747,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `发起签到失败：${String(err)}`);
     }
   },
+  // 返回成功与否：看板刷新据其聚合 ok，避免「失败 error toast 与已刷新 success toast 并存」
   refreshRemainingCredits: async () => {
     try {
       const ok = await api.accounts.refreshRemainingCredits();
@@ -748,8 +755,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (ok > 0) {
         get().pushToast('success', `已刷新 ${ok} 个账号的可用积分`);
       }
+      return true;
     } catch (err) {
       get().pushToast('error', `刷新可用积分失败：${String(err)}`);
+      return false;
     }
   },
   cooldownClear: async (userId) => {

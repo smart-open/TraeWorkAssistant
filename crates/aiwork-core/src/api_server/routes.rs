@@ -418,11 +418,20 @@ pub(crate) fn dispatch_error_response(
                 "model_cooldown",
                 "rate_limit_error",
             ),
-            DispatchError::NoHealthy(pool) => (
+            DispatchError::NoHealthy(pool, candidates) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 pool.as_str(),
                 // issue #159：传模型名——503 归因可见「前置池因模型冷却被跳过」
-                no_healthy_detail_with_model(state, pool, key_str, Some(model)),
+                {
+                    let mut msg = no_healthy_detail_with_model(state, pool, key_str, Some(model));
+                    // issue #186：附加候选链摘要——此前只报最后失败的池，多源回退
+                    // 耗尽时用户会误以为系统跳过了前面的健康池（如 Buddy 池健康
+                    // 但不支持该模型，实际是该模型没有 Buddy 源）
+                    if let Some(c) = &candidates {
+                        msg.push_str(&candidates_note(c, pool));
+                    }
+                    msg
+                },
                 "no_healthy_account",
                 "api_error",
             ),
@@ -437,6 +446,39 @@ pub(crate) fn dispatch_error_response(
         Protocol::Anthropic => anthropic_error(status, anthro_code, &msg),
         _ => openai_error(status, oa_code, &msg),
     }
+}
+
+/// issue #186：候选链摘要——503 消息此前只报「最后失败的池」，用户会误以为
+/// 系统跳过了前面的健康池。链内容来自 dispatch 逐池归因（switch_off / no_source /
+/// no_healthy_account / model_cooldown），形如
+/// `candidates=buddy=no_healthy_account,trae=no_healthy_account`；
+/// 仅单池真正参与尝试且链中确有其他池被跳过时明示「无跨池回退」语义
+/// （审查修复：tried.len()==1 不等价于模型单源——fallback=false 时首选池失败即
+/// 提前终止，后续有源池未被遍历、链中不会有其跳过条目，此时按「单源」
+/// 断言会误导；仅当链含跳过条目时「本次调度仅 {pool} 池可服务」在当次
+/// 调度语义下恒成立。副作用：单源模型且其唯一池即首选池时不再提示——candidates
+/// 链本身仍可见，保守不误报。审查 F-3 修复：跳过归因已由单值 unavailable 细分为
+/// switch_off（开关未启用）/ no_source（无该模型源），本函数两者均视为跳过）
+fn candidates_note(chain: &str, pool: TargetPool) -> String {
+    let is_skipped = |s: &str| {
+        ["=unavailable", "=switch_off", "=no_source"]
+            .iter()
+            .any(|suf| s.ends_with(suf))
+    };
+    let tried: Vec<&str> = chain
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !is_skipped(s))
+        .collect();
+    let mut note = format!(" candidates={chain}");
+    let has_skipped = chain.split(',').any(|s| is_skipped(s.trim()));
+    if tried.len() == 1 && has_skipped {
+        note.push_str(&format!(
+            "（单源：本次调度仅 {} 池可服务该模型，无跨池回退；如需由其他池服务，请启用对应池上游开关或选择其模型目录内的模型）",
+            pool.as_str()
+        ));
+    }
+    note
 }
 
 /// 轮换耗尽收尾文案（issue #57 后续可观测）：区分「渠道指纹拦截」与「账号池耗尽」。
@@ -577,12 +619,28 @@ pub(crate) fn no_healthy_detail_with_model(
     } else {
         String::new()
     };
+    // issue #186：池空归因——healthy=0 且池内 0 账号时明示「账号未入池/被标签
+    // 过滤」，与「池内有账号但全冷却/积分耗尽」（hard_note 已覆盖）区分，
+    // 直接给出修复入口
+    let empty_pool_note: &str = if healthy_total == 0 && pool_ref.count() == 0 {
+        match pool {
+            TargetPool::Trae => " hint=Trae 池内 0 账号：请在「资源池管理」的 Trae 池设置中勾选账号入池（若账号总数>池内账号数，也可能被标签筛选拦截）",
+            TargetPool::Buddy => " hint=Buddy 池内 0 账号：请在「资源池管理」的 WB 上游池设置中勾选账号入池",
+            TargetPool::BuddyAi => " hint=Buddy 国际池内 0 账号：请在「资源池管理」的国际版池设置中勾选账号入池",
+            TargetPool::Qoder => " hint=Qoder 池内 0 账号：请检查 Qoder 池的分组/标签筛选与账号入池设置",
+            // Custom 池在上方 pool_ref 匹配处已 early-return，此分支不可达；
+            // 保留以满足穷尽匹配，防后续重构移动 early-return 时漏配文案
+            TargetPool::Custom => "",
+        }
+    } else {
+        ""
+    };
     // issue #159：模型上下文可用时归因「前置候选池因模型级冷却被整体跳过」
     let skip_note = model
         .map(|m| skipped_pool_note(state, pool, m))
         .unwrap_or_default();
     let base = format!(
-        "no healthy account available (pool={} healthy={healthy_total}){hard_note}{skip_note}",
+        "no healthy account available (pool={} healthy={healthy_total}){hard_note}{empty_pool_note}{skip_note}",
         pool.as_str(),
     );
     // 单锁快照：一次取（展示名, 约束），替代 constraints_for + key_name_for 双加锁

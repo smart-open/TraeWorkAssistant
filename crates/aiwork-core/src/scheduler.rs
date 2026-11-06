@@ -1083,7 +1083,11 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 .get("failed_permanent")
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty - failed_permanent > 0 {
+            // issue #190 收尾：BLOCKED 风控信任单列（blocked_need_trust）重试
+            // 同样注定失败（信任单列需用户在风控页确认），从重试判定剔除——
+            // 与 qoder_checkin 内部重试链同口径（审查修复）
+            let failed_blocked = done.get("failed_blocked").and_then(Value::as_i64).unwrap_or(0);
+            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
                 return Err(format!(

@@ -156,6 +156,49 @@ impl Store {
         self.kv_set_raw(key, &content)
     }
 
+    /// KV 文档原子读-改-写（移植 main d04de4fc 审查修复）：读、改、写在同一连接
+    /// Mutex 持锁区内完成（与 with_conn 同一加锁惯用法），消除「kv_get → 内存改 →
+    /// kv_set」两段式之间他方写入被旧快照整体覆盖丢键的窗口——app_settings 调用点
+    /// （settings_set patch 合并）与其他写入方（巡检/迁移路径）并发场景互踩丢键。
+    /// 回调约束：只做内存改写与校验，不得做 IO 或再次取连接锁（闭包持有连接锁）。
+    /// - 回调返回 Err：整体放弃写回（校验失败不落库，语义同原「先校验后写」）
+    /// - 回调返回 Ok(false)：内容无变化，不写盘（保留「仅在值变化时写盘」语义）
+    /// 读到缺失/损坏存量值回退空对象（语义对齐调用点 !is_object 初始化分支）；
+    /// 真实读错误（busy 超时/IO 故障/页损坏）显式上抛放弃写——fail-closed 同
+    /// kv_get_raw_checked 的 R1 纪律：空集会触发整份覆写的路径绝不静默当空集，
+    /// 否则 app_settings 其余键会被单 patch 对象覆盖丢失。
+    pub fn kv_update<E: ToString>(
+        &self,
+        key: &str,
+        f: impl FnOnce(&mut serde_json::Value) -> Result<bool, E>,
+    ) -> Result<(), String> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let raw = conn
+            .query_row("SELECT content FROM kv WHERE key = ?1", [key], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|e| format!("读取 kv[{key}] 失败，放弃改写以防覆盖丢失其他键: {e}"))?;
+        let mut current: serde_json::Value = raw
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        if !current.is_object() {
+            current = serde_json::json!({});
+        }
+        if !f(&mut current).map_err(|e| e.to_string())? {
+            return Ok(());
+        }
+        let content = serde_json::to_string(&current).map_err(|e| format!("序列化失败: {e}"))?;
+        conn.execute(
+            "INSERT INTO kv(key, content, updated_at) VALUES(?1, ?2, datetime('now','localtime'))
+             ON CONFLICT(key) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+            rusqlite::params![key, content],
+        )
+        .map_err(|e| format!("SQLite 操作失败: {e}"))?;
+        Ok(())
+    }
+
     // ── 行文档表原语（单 pk + data JSON 的表）────────────────────────────────
     // 表名白名单：仅限本模块常量，杜绝拼接注入。
 

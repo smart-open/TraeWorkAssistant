@@ -140,6 +140,11 @@ export default function QoderAccounts() {
   // 破坏性操作确认弹框（禁 window.confirm，红线）：移除账号
   const [confirmTarget, setConfirmTarget] = useState<QoderConfirm>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
+  // 待建信任徽标（issue #190）：当日签到被服务端风控拦截（fail_kind=blocked_need_trust）
+  // 的账号集合——自动重试已剔除，需用户按提示建信任后手动重试
+  const [blockedCheckin, setBlockedCheckin] = useState<Set<string>>(new Set());
+  const qoderCheckinRunning = useAppStore((s) => s.qoderCheckin.running);
+  const qoderCheckinDoneRev = useAppStore((s) => s.qoderCheckin.doneRev);
   // 导出/导入账号池（M4，对照 BuddyAccounts F-46 扩展）
   const [exportOpen, setExportOpen] = useState(false);
   const [exportWithCreds, setExportWithCreds] = useState(false);
@@ -197,6 +202,44 @@ export default function QoderAccounts() {
     }
   };
 
+  // 待建信任刷新（issue #190）：当日签到结果中 BLOCKED 归因的账号集合。
+  // checkinResults(1) 含今天+昨天，需按当日日期过滤（口径对齐 QoderCheckin todayStr；
+  // 按 fail_kind 判定，不耦合 message 文案）；记录逐轮追加（pk=日期|账号|时间戳）
+  // 且新→旧返回：同账号同日可能先 blocked 失败、后重试成功，徽标按「最新一条
+  // 记录」判定，避免重试成功后旧失败记录导致徽标残留；失败静默 → 徽标不展示
+  const refreshBlockedCheckin = useCallback(() => {
+    const today = new Date();
+    const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    api.qoder
+      .checkinResults(1)
+      .then((rows) => {
+        const latestByUser = new Map<string, (typeof rows)[number]>();
+        for (const r of rows) {
+          if (r.date !== todayStr || latestByUser.has(r.user_id)) continue;
+          latestByUser.set(r.user_id, r);
+        }
+        setBlockedCheckin(
+          new Set(
+            [...latestByUser.values()]
+              .filter((r) => r.status === 'fail' && r.fail_kind === 'blocked_need_trust')
+              .map((r) => r.user_id),
+          ),
+        );
+      })
+      .catch(() => {});
+  }, []);
+
+  /** 单账号签到重试（issue #190 待建信任闭环）：仅对当日 BLOCKED 账号露出。
+   * 后端有跨进程锁（busy 幂等跳过）+ store running 态全局禁用按钮防并发误触 */
+  const retryCheckin = async (a: QoderAccountView) => {
+    try {
+      await api.qoder.checkinStart({ user_ids: [a.id], skip_checked_in: true });
+      pushToast('info', `已发起「${a.nickname || a.id}」签到重试，结果请以签到页与通知为准`);
+    } catch (err) {
+      pushToast('error', `发起签到重试失败：${String(err)}`);
+    }
+  };
+
   // 分组过滤（对齐 BuddyAccounts：全部 / 未分组 / 指定分组）
   const filtered =
     filter === 'all'
@@ -209,6 +252,8 @@ export default function QoderAccounts() {
     void refresh();
     reloadGroups();
     reloadTags();
+    // 待建信任徽标初始加载（issue #190）：拉取失败静默
+    refreshBlockedCheckin();
     let disposed = false;
     void listen<QoderOauthProgress>('qoder-oauth-progress', (ev) => {
       const p = ev.payload;
@@ -250,7 +295,13 @@ export default function QoderAccounts() {
       oauthTimers.current = [];
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refresh]);
+  }, [refresh, refreshBlockedCheckin]);
+
+  // 签到轮次完成（调度/补签/账号页单账号重试均会递增 doneRev）后刷新待建信任徽标：
+  // 轻量拉取当日结果，重试成功 → 徽标消失，仍 BLOCKED → 徽标保留
+  useEffect(() => {
+    if (qoderCheckinDoneRev > 0) refreshBlockedCheckin();
+  }, [qoderCheckinDoneRev, refreshBlockedCheckin]);
 
   // OAuth 完成看门狗（对齐 BuddyAccounts wb-oauth 同款兜底）：后端轮询最长 180s，
   // 看门狗 310s 留足事件送达余量；done 事件异常缺失（桥挂死/事件丢失/后台线程 panic）
@@ -653,6 +704,16 @@ export default function QoderAccounts() {
                             池条目以内部账号 id（qd-<hash>）为键——QoderSyncAccount
                             的 uid=a.id，而非全家桶 uid（View.uid），勿用 a.uid 联表 */}
                         <PoolStatusBadge status={poolStatus.get(a.id)} />
+                        {/* 待建信任（issue #190）：当日签到被服务端风控拦截——自动重试
+                            已剔除，需用户完成信任建立后用操作列重试按钮手动重试 */}
+                        {blockedCheckin.has(a.id) && (
+                          <Badge
+                            tone="amber"
+                            title="今日签到被服务端风控拦截（设备指纹未建立服务端信任）：请切换到该账号并打开 Qoder 客户端正常使用一次，然后点操作列的重试按钮（信任生效可能有延迟，数分钟到数小时）；若重试仍被拦截，在客户端内退出后重新登录该账号并正常使用 10 分钟以上（期间在客户端内领取一次奖励），再重新导入账号池以捕获客户端真实指纹"
+                          >
+                            待建信任
+                          </Badge>
+                        )}
                       </div>
                       <div className="text-xs text-slate-400">{[a.uid, a.note].filter(Boolean).join(' · ') || a.id}</div>
                     </td>
@@ -692,6 +753,18 @@ export default function QoderAccounts() {
                     </td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex justify-end gap-1">
+                        {/* 单账号签到重试（issue #190 待建信任闭环）：仅当日 BLOCKED 账号露出；
+                            签到进行中全局禁用（后端跨进程锁幂等跳过兜底） */}
+                        {blockedCheckin.has(a.id) && (
+                          <button
+                            className={`btn-ghost !p-2 text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-500/10 ${qoderCheckinRunning ? 'opacity-40 cursor-not-allowed' : ''}`}
+                            title="重试该账号今日签到（建议先按「待建信任」徽标提示完成信任建立）"
+                            disabled={qoderCheckinRunning}
+                            onClick={() => void retryCheckin(a)}
+                          >
+                            <RefreshCw size={14} />
+                          </button>
+                        )}
                         <button
                           className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10"
                           title={renewingId === a.id ? '凭证续期中…' : '凭证续期（PAT 重换作业令牌 / refresh_token 换新 access_token）'}

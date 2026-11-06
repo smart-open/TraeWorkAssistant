@@ -93,6 +93,11 @@ pub struct QoderCheckinRecord {
     /// 历史数据（升级前）无此字段 → None，前端按整体状态渲染
     #[serde(skip_serializing_if = "Option::is_none")]
     pub campaigns: Option<Value>,
+    /// 失败归因（issue #190）：blocked_need_trust=风控信任未建立（自动重试无效，
+    /// 需用户建信任后手动重试）；permanent_auth=凭证终态。历史数据无此字段 → None，
+    /// 前端「待建信任」徽标按该字段判定（不耦合 message 文案）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_kind: Option<String>,
 }
 
 /// 签到日志（90 天存储，UI 默认展示 30 天）
@@ -121,6 +126,7 @@ pub fn qoder_checkin_results(
                 message: r.get("message").and_then(|v| v.as_str()).unwrap_or("").into(),
                 reward: r.get("reward").and_then(|v| v.as_f64()),
                 campaigns: r.get("campaigns").filter(|v| v.is_array()).cloned(),
+                fail_kind: r.get("fail_kind").and_then(|v| v.as_str()).map(String::from),
             });
         }
     }

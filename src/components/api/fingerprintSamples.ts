@@ -20,11 +20,14 @@ export function sampleTier(pool: string): SampleTier | null {
   return 'wb';
 }
 
-/** 解析样本中的 system 文本（system="…" 与 tools=[…] 两种段落顺序都兼容） */
+/** 解析样本中的 system 文本（system="…" 与 tools=[…] 两种段落顺序都兼容）。
+ * 后端在原文超 300 字符时于引号内尾部补 "…" 截断标记（区分「首句完整」与「残句」）
+ * ——此处剥离该标记，避免把省略号混进 from（sanitizer 是逐字 contains 匹配，
+ * 带省略号的 from 必然落空） */
 export function parseSystemText(sample: string): string {
   const m = /system="([\s\S]*?)"\s*(?:tools=|$)/.exec(sample.trim());
   if (!m) throw new FingerprintSampleParseError('未找到 system="…" 段落');
-  return m[1];
+  return m[1].replace(/…$/, '');
 }
 
 /** 解析可安全改写的前缀：首英文逗号/句号处截断（保留标点前的整段，含末尾空格不留） */
