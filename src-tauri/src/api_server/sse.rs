@@ -1139,12 +1139,24 @@ fn stream_convert_anthropic_src(
                 );
             }
             let mut out_tokens = None;
+            // input_tokens 回填（message_start 时上游 usage 未到达只能置 0）：
+            // 收尾时按 Anthropic 口径还原补入 message_delta.usage。语义差异：
+            // Anthropic input_tokens = 未缓存基数（完整输入 = input_tokens +
+            // cache_read + cache_creation）；OpenAI prompt_tokens = 含缓存命中
+            // 总量（cached_tokens 是其子集）。故上游原生 input_tokens 优先直取；
+            // 否则取 prompt_tokens 减 cached_tokens 还原未缓存基数，避免把
+            // "含缓存总量"错填进"未缓存基数"造成缓存场景系统性高估
+            let mut in_tokens = None;
             let mut cached_tokens = 0u64;
             // 缓存写 tokens（cache_creation_input_tokens）：与 WB 管线出口同口径
             let mut write_tokens = 0u64;
             if let Some(u) = &usage {
                 out_tokens = usage_i64(u, &["output_tokens", "completion_tokens"]);
                 cached_tokens = cached_tokens_of(u);
+                in_tokens = usage_i64(u, &["input_tokens"]).or_else(|| {
+                    usage_i64(u, &["prompt_tokens"])
+                        .map(|p| p.saturating_sub(cached_tokens.min(i64::MAX as u64) as i64))
+                });
                 write_tokens = cache_write_tokens_of(u);
             }
             // issue #148：工具回合不得把误标的 stop/空串回落为 end_turn（严格
@@ -1168,6 +1180,9 @@ fn stream_convert_anthropic_src(
             });
             if let Some(o) = out_tokens {
                 message_delta["usage"]["output_tokens"] = json!(o);
+            }
+            if let Some(i) = in_tokens {
+                message_delta["usage"]["input_tokens"] = json!(i);
             }
             if cached_tokens > 0 {
                 message_delta["usage"]["cache_read_input_tokens"] = json!(cached_tokens);
@@ -1804,6 +1819,66 @@ mod tests {
         assert_eq!(blocks[2]["thinking"], "想2");
         assert_eq!(blocks[3]["type"], "text");
         assert_eq!(blocks[3]["text"], "答2");
+    }
+
+    // ==================== usage input_tokens 口径还原 ====================
+
+    /// 从事件流中取 message_delta 的 usage 对象
+    fn message_delta_usage(events: &[String]) -> Value {
+        for e in events {
+            for line in e.lines() {
+                if let Some(rest) = line.strip_prefix("data: ") {
+                    if let Ok(v) = serde_json::from_str::<Value>(rest) {
+                        if v.get("type").and_then(|t| t.as_str()) == Some("message_delta") {
+                            return v["usage"].clone();
+                        }
+                    }
+                }
+            }
+        }
+        panic!("应含 message_delta 事件");
+    }
+
+    #[test]
+    fn anthropic_stream_usage_input_tokens_subtracts_cached_from_prompt() {
+        // OpenAI 口径：prompt_tokens 含缓存命中总量，须减 cached_tokens
+        // 还原 Anthropic "未缓存基数"语义
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\n\
+                     event: token_usage\ndata: {\"prompt_tokens\":1000,\"completion_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":800}}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, _, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None);
+        let usage = message_delta_usage(&collect_events(rx));
+        assert_eq!(usage["input_tokens"], 1000 - 800, "须按未缓存基数还原");
+        assert_eq!(usage["output_tokens"], 10);
+        assert_eq!(usage["cache_read_input_tokens"], 800);
+    }
+
+    #[test]
+    fn anthropic_stream_usage_prefers_native_input_tokens_without_subtraction() {
+        // 上游原生 input_tokens（已排除缓存）优先直取，不得再做减法
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\n\
+                     event: token_usage\ndata: {\"input_tokens\":50,\"output_tokens\":5,\"cache_read_input_tokens\":800}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, _, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None);
+        let usage = message_delta_usage(&collect_events(rx));
+        assert_eq!(usage["input_tokens"], 50, "原生 input_tokens 直取，不做减法");
+        assert_eq!(usage["cache_read_input_tokens"], 800);
     }
 
     // ==================== 行源等价性：IO 逐行读 vs 内存切分 ====================
