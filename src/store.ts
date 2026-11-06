@@ -130,7 +130,7 @@ interface AppState {
   refreshGroups: () => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshLogs: (q?: LogQuery, manual?: boolean) => Promise<void>;
-  refreshCreditsHistory: () => Promise<void>;
+  refreshCreditsHistory: () => Promise<boolean>;
   refreshCreditsDaily: () => Promise<void>;
   refreshProfiles: () => Promise<void>;
   refreshLocalEntitlement: () => Promise<void>;
@@ -167,7 +167,8 @@ interface AppState {
     skip_checked_in: boolean;
     skip_expired: boolean;
   }) => Promise<void>;
-  refreshRemainingCredits: () => Promise<void>;
+  /** 逐账号上游刷新可用积分；返回是否成功（失败已弹 error toast），供调用方决定是否再弹「已刷新」 */
+  refreshRemainingCredits: () => Promise<boolean>;
   cooldownClear: (userId: string) => Promise<void>;
   refreshJwt: (userId: string, force?: boolean) => Promise<void>;
   saveSettings: (patch: Partial<Settings>) => Promise<void>;
@@ -742,7 +743,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         retryable > 0 || permanent > 0 || blocked > 0 ? 'warn' : 'success',
         `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
           (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : '') +
-          (blocked > 0 ? `（其中 ${blocked} 项被风控拦截：请在工具内切换到该账号后打开 Qoder 客户端使用一次建立信任，再手动重试）` : '') +
+          (blocked > 0
+            ? `（其中 ${blocked} 项被风控拦截：请切换到该账号并打开 Qoder 客户端使用一次建立信任，再手动重试（信任生效可能有延迟）；若重试仍拦截，在客户端内重新登录该账号正常使用后，用「扫描本地账号」重新添加）`
+            : '') +
           (permanent > 0 ? `（其中 ${permanent} 项需重新登录/更新 PAT 后重试）` : ''),
       );
       return;
@@ -917,12 +920,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       logsPollInflight = false;
     }
   },
+  // 返回成功与否：看板刷新据其聚合 ok，避免「失败 error toast 与已刷新 success toast 并存」
   refreshCreditsHistory: async () => {
     try {
       const creditsHistory = await api.misc.creditsHistory();
       set({ creditsHistory });
+      return true;
     } catch (err) {
       get().pushToast('error', `读取积分历史失败：${String(err)}`);
+      return false;
     }
   },
   refreshCreditsDaily: async () => {
@@ -1183,8 +1189,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (ok > 0) {
         get().pushToast('success', `已刷新 ${ok} 个账号的可用积分`);
       }
+      return true;
     } catch (err) {
       get().pushToast('error', `刷新可用积分失败：${String(err)}`);
+      return false;
     }
   },
   cooldownClear: async (userId) => {

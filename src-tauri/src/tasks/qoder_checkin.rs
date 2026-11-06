@@ -171,6 +171,12 @@ fn append_results(state: &AppState, events: &[Value]) {
         if let Some(c) = ev.get("campaigns").filter(|c| c.is_array()) {
             rec["campaigns"] = c.clone();
         }
+        // 失败归因（issue #190）：process_account 尾部派生的 fail_kind（如
+        // blocked_need_trust）须随记录落库，否则 qoder_checkin_results 前端
+        // 无法区分「待建信任」，徽标与单账号重试入口永不展示
+        if let Some(fk) = ev.get("fail_kind").filter(|v| v.is_string()) {
+            rec["fail_kind"] = fk.clone();
+        }
         if let Err(e) = crate::store::docs::qoder_checkin_results_upsert(&store, &rec) {
             fs_utils::app_log(&state.data_dir, &format!("[qoder] 签到结果落库失败: {e}"));
         }
@@ -910,7 +916,10 @@ fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool, kind:
 ///   登录一次」无效：客户端登录建立的是客户端原生指纹的信任，与工具盲发
 ///   指纹不一致（issue #119）。有效路径：先在工具内切换到该账号（切换器会把
 ///   该账号指纹同步为本机 machineid/storage.json/state.vscdb），再开客户端
-///   正常使用一次，使服务端为该指纹建立信任，然后回工具重试
+///   正常使用一次，使服务端为该指纹建立信任，然后回工具重试（信任生效可能
+///   有时滞）。兜底路径（issue #190 用户实测：主路径对沉睡老号可能不生效）：
+///   客户端内重新登录该账号并真实使用，再「扫描本地账号」重新添加以捕获
+///   客户端已受信任的真实指纹
 /// - 503/RISK_DEPENDENCY_UNAVAILABLE：风控前置依赖暂不可用，调度器会自动重试
 ///   （issue #114 修复后 claim 已用最小头形态，此形态下仍 503 说明上游风控再升级）
 /// - 409/CAMPAIGN_NOT_ACTIVE：候选 campaignId 过期（活动批次轮换，issue #66），
@@ -920,7 +929,7 @@ fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String
         // 消息内嵌 BLOCKED_NEED_TRUST_TAG（issue #190）：process_account 尾部按
         // contains 派生 fail_kind，调度器/启动补签据此剔除无效重试与推送打扰
         return format!(
-            "{BLOCKED_NEED_TRUST_TAG}：服务端风控拦截（status=BLOCKED，本次领取被拒绝）——该账号设备指纹未建立服务端信任：请在工具内切换到该账号（切换会把该账号指纹同步到本机），再打开 Qoder 客户端正常使用一次建立信任，然后手动重试签到"
+            "{BLOCKED_NEED_TRUST_TAG}：服务端风控拦截（status=BLOCKED，本次领取被拒绝）——该账号设备指纹未建立服务端信任：请在工具内切换到该账号（切换会把该账号指纹同步到本机），再打开 Qoder 客户端正常使用一次建立信任，然后手动重试签到（信任生效可能有延迟，数分钟到数小时不等）；若重试仍被拦截，走兜底路径：在 Qoder 客户端内退出登录后用该账号重新登录并正常使用 10 分钟以上（期间在客户端内领取一次奖励），再回工具「扫描本地账号」重新添加该账号，以捕获客户端已受信任的真实指纹"
         );
     }
     if code == 503 && raw.contains("RISK_DEPENDENCY_UNAVAILABLE") {
@@ -1849,8 +1858,10 @@ pub fn run_checkin_round(
         "failed_permanent": failed_permanent,
         "failed_blocked": failed_blocked,
     });
-    emit(&done);
+    // 先落库再广播 done（issue #190）：账号页 doneRev 消费方收到事件后立即
+    // 回查 checkinResults，若先广播会在落库完成前读到旧快照，徽标滞后一轮
     append_results(state, &events);
+    emit(&done);
     done
 }
 

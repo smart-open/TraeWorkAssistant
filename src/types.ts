@@ -1914,6 +1914,9 @@ export interface QoderCheckinRecord {
   reward?: number;
   /** 逐活动明细（F-80-余 v2 档期日历；历史记录无此字段） */
   campaigns?: { id?: string; name?: string; kind?: string; reward?: number | null }[];
+  /** 失败归因（issue #190）：blocked_need_trust=风控信任未建立（需建信任后手动重试）；
+   * 历史记录无此字段 */
+  fail_kind?: string;
 }
 
 /** qoder-checkin-progress NDJSON 单行：逐账号结果（index 为本轮序号，1 起） */
