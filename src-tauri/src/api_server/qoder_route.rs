@@ -1609,8 +1609,16 @@ pub async fn qoder_aggregate_chat(
         // 非视觉模型 F-63 明示拒绝。"upstream 400 error:" 前缀走既有状态码
         // 解析通道透传 400
         if body_has_image(&peek) && !entry_supports_images(&entry) {
+            // 双文案口径对齐流式路径（767-777 注释）：目录显式声明不支持（supportsImages=false）
+            // 与缺字段/类型异常兜底分开表述——后者统一报「is_vl=false」会误导用户以为
+            // 目录声明错误去换模型，而非补目录声明
+            let why = if entry.get("supportsImages") == Some(&Value::Bool(false)) {
+                "目录声明不支持视觉输入（is_vl=false）"
+            } else {
+                "目录未声明视觉能力，按不支持处理"
+            };
             return Err(format!(
-                "upstream 400 error: 模型 {model} 不支持视觉输入（Qoder 目录 is_vl=false），请移除图片或改用支持视觉的模型"
+                "upstream 400 error: 模型 {model} 不支持视觉输入（{why}），请移除图片或改用支持视觉的模型"
             ));
         }
         let model_key = entry

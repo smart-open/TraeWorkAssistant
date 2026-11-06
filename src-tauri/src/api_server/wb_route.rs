@@ -1991,13 +1991,17 @@ pub async fn wb_aggregate_chat(
     .await;
 
     match result {
-        Ok(Ok((resp, tool_alias))) => {
+        Ok(Ok((resp, _tool_alias))) => {
             let body = match proto {
+                // tool_alias 传 None（对齐 qoder_route 聚合分支正确范式）：resp 来自
+                // 闭包内 wb_sse::aggregate，流式收集阶段已按逆映射回改原名；此处再传
+                // tool_alias 会二次回改——链式别名规则（如 X→A、A→B 共存）下原名恰为
+                // 回改映射键时会把工具名改坏，客户端按名匹配响应即失配
                 Protocol::Anthropic => wb_sse::completion_to_anthropic(
                     &resp,
                     &format!("msg_{}", now_ts()),
                     &model_out,
-                    tool_alias.as_ref(),
+                    None,
                 ),
                 Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_out),
                 Protocol::Responses => super::wb_responses::completion_to_responses(

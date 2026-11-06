@@ -3094,6 +3094,24 @@ mod tests {
         for from in ["subagent_fork", "job_output", "pwsh", "working_directory"] {
             assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
         }
+        // DSH 独家（0.2.1-rc.3 补录 2026-11-05 实证：Cordis 内省二件 + Agent
+        // Teams 协作七件 + 插件管理 + 工作区依赖探针——改动静默丢失别名时由
+        // 本守护拦截）
+        for from in [
+            "cordis_inspect_list",
+            "cordis_inspect_query",
+            "list_agents",
+            "spawn_teammate",
+            "wait_agent",
+            "team_task_create",
+            "team_task_get",
+            "team_task_list",
+            "team_task_update",
+            "plugin_manager",
+            "load_workspace_dependencies",
+        ] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
         // CodeBuddy 独家（1.106.1 抓包实证；4 个同名工具经 Cline/Roo 与
         // Claude Code 段规则覆盖，此为剩余独家名）
         for from in [

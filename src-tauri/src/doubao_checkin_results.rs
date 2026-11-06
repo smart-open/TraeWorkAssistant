@@ -2,7 +2,7 @@
 //! 落 SQLite `doubao_checkin_results` 表（与 Trae checkin_results 独立，互不混用）。
 //!
 //! 重试轮次自然合并为最终态（同 uid 同日多次记录以最后一次为准）；
-//! 保留 90 天自动裁剪；供豆包额度看板「签到趋势 / 今日新增额度」查询。
+//! 保留 365 天自动裁剪；供豆包额度看板「签到趋势 / 今日新增额度」查询。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -109,14 +109,19 @@ static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// （run_one 各 outcome 站点 / 调用方补打；旧 outcome 无 day 字段由调用方回退当日），
 /// 跨零点批次按各自日期归组逐日落库，不再统一记「当日」串日。
 /// 跨进程互斥：GUI 与 schtasks CLI 双进程并发落库同此丢行问题，命名互斥体串行化。
-/// 锁 Busy（他方持锁落库中）幂等跳过本轮——同批签到的两进程入口并发时，他方完成
-/// 同批写入，跳过无损失，且避免本方超时后降级整表 load→save 覆盖先到方（丢行竞态）；
-/// 例外：代理实时捕获（success 落库）与批次落库并发且他方持锁超 3s 的极罕见场景，
-/// 跳过会丢失本轮条目（临界区常态毫秒级；属幂等权衡而非严格无损失）。仅机制性
-/// 失败（创建/等待出错）才降级仅进程内锁继续写（尽力不丢，保留降级日志）。
+/// 锁 Busy（他方持锁落库中）行为由 skip_on_busy 决定：
+/// - skip_on_busy=true（调度器/CLI 批次落库）：幂等跳过本轮——同批签到的两进程入口
+///   并发时，他方完成同批写入，跳过无损失，且避免本方超时后降级整表 load→save
+///   覆盖先到方（丢行竞态）；
+/// - skip_on_busy=false（代理实时捕获，success 落库）：本轮条目是客户端侧独有
+///   reward（调度器同批写入不含这笔），跳过即永久丢失且无重试、「fail 不覆盖
+///   success」规则也救不回——降级进程内锁继续写（跨进程并发窗口内可能与持锁方
+///   互踩读改写，SQLite 写原子性兜底，尽力不丢优于确定性丢失），落日志留痕。
+/// 仅机制性失败（创建/等待出错）一律降级仅进程内锁继续写（尽力不丢，保留降级日志）。
 pub fn record_day_at(
     data_dir: &Path,
     entries: impl IntoIterator<Item = (String, String, String, Option<i64>, String)>,
+    skip_on_busy: bool,
 ) {
     let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
@@ -130,13 +135,21 @@ pub fn record_day_at(
     ) {
         (Some(g), _) => Some(g),
         (None, Some(crate::tasks::qoder_common::CrossProcLockFail::Busy)) => {
-            // 他方正持锁落库：同批签到的另一进程入口并发时跳过无损失；极罕见的
-            // 代理捕获 vs 批次落库并发场景会随跳过丢失本轮（权衡见函数注释）
+            if skip_on_busy {
+                // 他方正持锁落库：同批签到的另一进程入口并发时跳过无损失（权衡见函数注释）
+                crate::fs_utils::app_log(
+                    data_dir,
+                    "[doubao_checkin_results] record_day_at 跨进程锁 Busy（他方落库中），幂等跳过本轮",
+                );
+                return;
+            }
+            // 代理捕获路径：本轮条目是客户端侧独有 reward，跳过即永久丢失——
+            // 降级进程内锁继续写（尽力不丢，SQLite 写原子性兜底互踩风险，权衡见函数注释）
             crate::fs_utils::app_log(
                 data_dir,
-                "[doubao_checkin_results] record_day_at 跨进程锁 Busy（他方落库中），幂等跳过本轮",
+                "[doubao_checkin_results] record_day_at 跨进程锁 Busy，代理捕获路径降级进程内锁继续写（尽力不丢）",
             );
-            return;
+            None
         }
         (None, Some(fail)) => {
             // 机制性失败（创建/等待出错）：降级仅进程内锁继续写（尽力不丢）

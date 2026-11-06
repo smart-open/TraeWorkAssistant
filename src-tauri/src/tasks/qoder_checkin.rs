@@ -193,8 +193,8 @@ const EMPTY_CAMPAIGNS_TAG: &str = "empty_campaigns";
 
 /// 永久性认证失败标记（fail_kind 产源标记，与 EMPTY_CAMPAIGNS_TAG 同模式）：
 /// pat_rejected / expired_needs_relogin / auth_dead 前置拦截分支产出——
-/// 重试注定失败，调度器按 failed - failed_empty - failed_permanent 判定
-/// 是否冷却重试，避免全天约 28 轮无效重试（审查 minor）
+/// 重试注定失败，调度器按 failed - failed_empty - failed_permanent -
+/// failed_blocked 判定是否冷却重试，避免全天约 28 轮无效重试（审查 minor）
 const PERMANENT_AUTH_TAG: &str = "permanent_auth";
 
 /// 风控信任未建立标记（fail_kind 产源标记，与 EMPTY_CAMPAIGNS_TAG 同模式）：

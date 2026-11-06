@@ -622,6 +622,9 @@ pub(crate) fn no_healthy_detail_with_model(
             TargetPool::Buddy => " hint=Buddy 池内 0 账号：请在「资源池管理」的 WB 上游池设置中勾选账号入池",
             TargetPool::BuddyAi => " hint=Buddy 国际池内 0 账号：请在「资源池管理」的国际版池设置中勾选账号入池",
             TargetPool::Qoder => " hint=Qoder 池内 0 账号：请检查 Qoder 池的分组/标签筛选与账号入池设置",
+            // 防御性注释：Custom 池在本函数入口的 match 已 early-return（见上方
+            // 「custom 池无账号列表」分支），此臂不可达；Rust match 穷尽匹配要求
+            // 必须保留该臂，勿删
             TargetPool::Custom => "",
         }
     } else {

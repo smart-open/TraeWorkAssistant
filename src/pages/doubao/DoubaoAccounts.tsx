@@ -133,7 +133,13 @@ export default function DoubaoAccounts() {
     if (soon.length > 0) {
       pushToast('warn', `${soon.length} 个豆包账号会话 7 天内到期：${soon.map((a) => a.name).join('、')}`);
     }
-    const lastKa = list.find((a) => a.last_keepalive_at)?.last_keepalive_at;
+    // 保活是池级全局任务（对齐 Overview 口径）：取所有账号中最新一次保活时间，
+    // find 取首个非空值会被老账号滞留的旧时间戳误报「超 25 天未保活」
+    const lastKa = list
+      .map((a) => a.last_keepalive_at)
+      .filter((v): v is string => !!v)
+      .sort()
+      .pop();
     if (!lastKa && list.length > 0) {
       // 无记录不提醒（老数据/未注册任务）
       return;

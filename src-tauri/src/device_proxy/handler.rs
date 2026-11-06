@@ -827,7 +827,9 @@ fn try_capture_doubao_campaign(
                 .find(|(k, _)| k == "msToken")
                 .map(|(_, v)| v.clone())
         });
-    let body_s = String::from_utf8_lossy(&body[..body.len().min(2048)]).to_string();
+    // 落盘前脱敏（审查修复）：body/resp 可能含凭证类键值（msToken 等 token 形态参数），
+    // 必须过体级凭证键值掩码——完整参数已入加密 vault，排障价值保留
+    let body_s = super::logger::mask_body(&String::from_utf8_lossy(&body[..body.len().min(2048)]));
     let ua = req_headers
         .iter()
         .rev()
@@ -838,7 +840,9 @@ fn try_capture_doubao_campaign(
     // 审查修复（2026-10-31）：先按 content-encoding 解压——否则下面 resp_ok 的 JSON
     // 解析恒失败，campaign_probe 永远不会落库，CLI 永远用回退旧参数（实测 3 天未入库）
     let resp_plain = super::logger::decompress_body(resp_body, resp_headers);
-    let resp_s = String::from_utf8_lossy(&resp_plain[..resp_plain.len().min(500)]).to_string();
+    let resp_s = super::logger::mask_body(&String::from_utf8_lossy(
+        &resp_plain[..resp_plain.len().min(500)],
+    ));
     let line = format!(
         "[doubao-campaign] {method} {p}?{qdesc} -> {status} resp={resp_s} cookies=[{cookie_names}] body={body_s} ua={ua}"
     );
@@ -953,6 +957,8 @@ fn try_capture_doubao_campaign(
                 }
                 match matched {
                     Some((uid, name)) => {
+                        // skip_on_busy=false：本条是客户端侧独有 reward（调度器同批写入
+                        // 不含这笔），锁 Busy 时降级进程内锁继续写，尽力不丢
                         crate::doubao_checkin_results::record_day_at(
                             &ctx.data_dir,
                             [(
@@ -962,6 +968,7 @@ fn try_capture_doubao_campaign(
                                 reward,
                                 crate::doubao_checkin_results::today_key(),
                             )],
+                            false,
                         );
                         // 客户端当前会话回写该账号 vault：豆包会话轮换，回写后 CLI 凭证
                         // 始终与客户端一致（fresh），避免 CLI 会话过期类失败

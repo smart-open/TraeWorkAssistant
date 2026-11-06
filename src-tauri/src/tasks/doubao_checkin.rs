@@ -599,7 +599,8 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
             o.get("day").and_then(Value::as_str).unwrap_or(&today).to_string(),
         )
     });
-    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries);
+    // skip_on_busy=true：调度器/CLI 同批写入他方完成即可覆盖，幂等跳过无损失
+    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries, true);
 
     // ② 池回写（两阶段短临界区：重读最新池按 uid 合并）
     let run_at = fs_utils::now_ts();

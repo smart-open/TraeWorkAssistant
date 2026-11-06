@@ -86,29 +86,31 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
 /// 之后即使注册表/默认目录变化，也能用上次成功的路径直接启动。
 /// 用户手动指定（设置页）优先级更高，且仅在探测值与存量值不同时写盘。
 fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
-    // SQLite 化（P2）：app_settings 入 kv 文档
+    // SQLite 化（P2）：app_settings 入 kv 文档；
+    // 原子读-改-写（审查修复）：两段式 kv_get→kv_set 并发窗口内他方键
+    // （如用户同时保存设置面板）会被旧快照整体覆盖丢失
     let store = crate::store::db(&state.data_dir);
-    let mut current: serde_json::Value = store.kv_get("app_settings");
-    if !current.is_object() {
-        current = serde_json::json!({});
-    }
-    let changed = current
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s != exe)
-        .unwrap_or(true);
-    if changed {
-        if let Some(obj) = current.as_object_mut() {
-            obj.insert(key.to_string(), serde_json::json!(exe));
+    let result = store.kv_update("app_settings", |current| {
+        let changed = current
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s != exe)
+            .unwrap_or(true);
+        if changed {
+            if let Some(obj) = current.as_object_mut() {
+                obj.insert(key.to_string(), serde_json::json!(exe));
+            }
         }
-        // 审查修复（M13）：写失败原被 `let _` 吞掉——探测路径持久化兜底失效
-        // （注册表/默认目录变化后无法用上次成功路径启动）且无迹可循，落 app.log 留痕
-        if let Err(e) = store.kv_set("app_settings", &current) {
-            crate::fs_utils::app_log(
-                &state.data_dir,
-                &format!("app_settings 写入失败（探测路径 {key} 持久化兜底失效）: {e}"),
-            );
-        }
+        // 无变化不写盘（仅在探测值变化时写盘，语义不变）
+        Ok::<_, String>(changed)
+    });
+    // 审查修复（M13）：写失败原被 `let _` 吞掉——探测路径持久化兜底失效
+    // （注册表/默认目录变化后无法用上次成功路径启动）且无迹可循，落 app.log 留痕
+    if let Err(e) = result {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("app_settings 写入失败（探测路径 {key} 持久化兜底失效）: {e}"),
+        );
     }
 }
 

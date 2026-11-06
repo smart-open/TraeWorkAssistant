@@ -999,6 +999,13 @@ impl ApiPool {
             .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
             .unwrap_or(0);
         let Some(picked) = self.pick_candidates(&idle, strategy, rand_seed, now, &inflight) else {
+            // 回退保持粘性（让位候选在间隙消失）：持 entries 锁内直改 last_used——
+            // touch_last_used 会二次取 entries 锁死锁（std Mutex 不可重入）；与
+            // 全 busy/无其他候选回退分支同口径，粘性账号持续服务须记账，否则
+            // 加权策略的闲置补偿因子失真（持续服务却像闲置）
+            if let Some(e) = entries.get_mut(sticky_uid) {
+                e.last_used = now;
+            }
             return Some((sticky, None));
         };
         let account = PickedAccount {
