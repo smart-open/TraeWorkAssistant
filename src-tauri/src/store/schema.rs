@@ -213,12 +213,14 @@ const DDL: &[&str] = &[
         payload TEXT NOT NULL
     )",
     // 豆包每日签到结果（按日落库，per-uid 最终态 + 奖励额度；额度看板趋势数据源）
+    // message = 失败原因（2026-11-07 可观测性补齐；老库由 init 幂等补列）
     "CREATE TABLE IF NOT EXISTS doubao_checkin_results (
         day        TEXT NOT NULL,
         uid        TEXT NOT NULL,
         name       TEXT NOT NULL DEFAULT '',
         status     TEXT NOT NULL DEFAULT '',
         reward     INTEGER,
+        message    TEXT,
         updated_at TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (day, uid)
     )",
@@ -327,6 +329,9 @@ pub fn init(conn: &Connection) -> Result<(), String> {
     // 会话聚合（轮键落账）：chat_record_id = 同一段消息+模型+输出上限的确定性
     // 派生值，「展开会话看各轮明细」分组用；老库幂等补列（存量行空值回落 preview 口径）
     ensure_column(conn, "qoder_sessions", "record_id", "TEXT NOT NULL DEFAULT ''")?;
+    // 豆包签到结果补失败原因列（2026-11-07 可观测性：fail 的 message 落库，切页/重开后
+    // 日历明细仍可排障；老库存量行 NULL = 无记录）
+    ensure_column(conn, "doubao_checkin_results", "message", "TEXT")?;
     Ok(())
 }
 

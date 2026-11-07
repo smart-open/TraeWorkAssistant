@@ -121,6 +121,11 @@ export default function DoubaoCheckin() {
     let ok = 0;
     let failed = 0;
     let reward = 0;
+    // 失败首因 + probe 保活错误（失败排障透出，2026-11-07）：收尾 toast 不再只报计数——
+    // 全失败时用户只看到「失败 N」无法定性（probe 未对齐风控拒 vs 凭证过期 vs 无资格）。
+    // probe_keepalive_error 仅首个触发保活的账号响应携带（KEEPALIVE_GATE 串行保活）
+    let firstFailMsg = '';
+    let probeErr = '';
     for (let i = 0; i < candidates.length; i++) {
       const a = candidates[i];
       if (i > 0) await new Promise((r) => setTimeout(r, GAP_MS));
@@ -129,11 +134,14 @@ export default function DoubaoCheckin() {
       try {
         const r = (await api.doubao.checkinRun(a.user_id)) as {
           outcome?: { status?: string; message?: string; reward?: number };
+          probe_keepalive_error?: string | null;
         };
+        if (r.probe_keepalive_error) probeErr = r.probe_keepalive_error;
         const o = r.outcome;
         const st = o?.status;
         if (st === 'fail') {
           failed += 1;
+          if (!firstFailMsg) firstFailMsg = (o?.message ?? '').trim();
           setLines((prev) => [...prev, { userId: a.user_id, name: a.name, status: 'fail', message: o?.message }]);
         } else {
           // success / already 均视为当日已签（已签 = 之前已成功，标记成功）
@@ -147,6 +155,7 @@ export default function DoubaoCheckin() {
         }
       } catch (err) {
         failed += 1;
+        if (!firstFailMsg) firstFailMsg = String(err);
         setLines((prev) => [...prev, { userId: a.user_id, name: a.name, status: 'fail', message: String(err) }]);
       }
     }
@@ -154,9 +163,13 @@ export default function DoubaoCheckin() {
     if (!aliveRef.current) return;
     setSummary({ ok, failed, reward });
     setRunning(false);
+    // 失败时透出首因与 probe 保活状态（各自截断防 toast 过长；完整原因见结果列表行
+    // 与按日落库 message，重开页面日历明细仍可查）
+    const failHint = firstFailMsg ? `；首因：${firstFailMsg.slice(0, 80)}` : '';
+    const probeHint = probeErr ? `；抓包参数未对齐（${probeErr.slice(0, 60)}）——易被风控拒绝，请开启代理并保持豆包客户端打开后重试` : '';
     pushToast(
       failed > 0 ? 'warn' : 'success',
-      `签到完成：成功 ${ok} · 失败 ${failed}${reward > 0 ? ` · 新增额度 +${reward.toLocaleString()}` : ''}`,
+      `签到完成：成功 ${ok} · 失败 ${failed}${reward > 0 ? ` · 新增额度 +${reward.toLocaleString()}` : ''}${failHint}${probeHint}`,
     );
     await reload();
   };

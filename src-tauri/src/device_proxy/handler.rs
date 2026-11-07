@@ -966,6 +966,8 @@ fn try_capture_doubao_campaign(
                                 name,
                                 status.to_string(),
                                 reward,
+                                // 代理捕获为 success/already 形态，失败原因无从产生
+                                None,
                                 crate::doubao_checkin_results::today_key(),
                             )],
                             false,

@@ -21,6 +21,12 @@ pub struct AccountResult {
     /// 签到奖励额度（landing/checkin 响应 reward_amount；already/fail 时通常 None）
     #[serde(default)]
     pub reward: Option<i64>,
+    /// 失败原因（仅 fail 时携带；旧数据/成功记录为 None——serde default 兼容）。
+    /// 2026-11-07 可观测性补齐：此前失败 message 不落库，一键签到页切页后
+    /// 逐账号失败原因即丢失，用户只看到笼统「失败」无法排障（风控 710010702
+    /// 等需要看上游 message 才能定性）。长度可控（上游 message 透出 + 固定指引）。
+    #[serde(default)]
+    pub message: Option<String>,
     pub updated_at: String,
 }
 
@@ -43,13 +49,15 @@ impl ResultsFile {
     /// 例外（2026-10-31）：fail 不得覆盖当日已有的 success/already——客户端手动签到
     /// 由代理捕获落库（success+reward），随后 CLI 轮次对该账号可能报 fail（风控拒绝
     /// 幂等提交），若照搬「最后写入者胜」会把已到账的 reward 抹掉。
+    /// entries 为 (uid, name, status, reward, message) 五元组；message 仅 fail 携带
+    /// （失败原因持久化，2026-11-07 可观测性补齐），success/already 传 None 不膨胀落库。
     pub fn record_day(
         &mut self,
         date: &str,
-        entries: impl IntoIterator<Item = (String, String, String, Option<i64>)>,
+        entries: impl IntoIterator<Item = (String, String, String, Option<i64>, Option<String>)>,
     ) {
         let day = self.days.entry(date.to_string()).or_default();
-        for (uid, name, status, reward) in entries {
+        for (uid, name, status, reward, message) in entries {
             if status == "fail" {
                 if let Some(prev) = day.accounts.get(&uid) {
                     if prev.status == "success" || prev.status == "already" {
@@ -63,6 +71,7 @@ impl ResultsFile {
                     name,
                     status,
                     reward,
+                    message,
                     updated_at: crate::fs_utils::now_ts(),
                 },
             );
@@ -105,9 +114,10 @@ pub fn save(data_dir: &Path, results: &ResultsFile) {
 static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 记录签到最终状态（签到完成后的 done 落库入口），随后写盘。
-/// entries 为 (uid, name, status, reward, day) 五元组：day 由 outcome 产生时刻打点
+/// entries 为 (uid, name, status, reward, message, day) 六元组：day 由 outcome 产生时刻打点
 /// （run_one 各 outcome 站点 / 调用方补打；旧 outcome 无 day 字段由调用方回退当日），
-/// 跨零点批次按各自日期归组逐日落库，不再统一记「当日」串日。
+/// 跨零点批次按各自日期归组逐日落库，不再统一记「当日」串日。message 仅 fail 携带
+/// （失败原因落库，排障可见），success/already 传 None。
 /// 跨进程互斥：GUI 与 schtasks CLI 双进程并发落库同此丢行问题，命名互斥体串行化。
 /// 锁 Busy（他方持锁落库中）行为由 skip_on_busy 决定：
 /// - skip_on_busy=true（调度器/CLI 批次落库）：幂等跳过本轮——同批签到的两进程入口
@@ -122,7 +132,7 @@ static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 仅机制性失败（创建/等待出错）一律降级仅进程内锁继续写（尽力不丢，保留降级日志）。
 pub fn record_day_at(
     data_dir: &Path,
-    entries: impl IntoIterator<Item = (String, String, String, Option<i64>, String)>,
+    entries: impl IntoIterator<Item = (String, String, String, Option<i64>, Option<String>, String)>,
     skip_on_busy: bool,
 ) {
     let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -170,10 +180,12 @@ pub fn record_day_at(
     let _cross = cross;
     let mut f = load(data_dir);
     // 按 outcome 携带的 day 归组逐日落库（BTreeMap 保证日期序稳定）
-    let mut by_day: std::collections::BTreeMap<String, Vec<(String, String, String, Option<i64>)>> =
-        Default::default();
-    for (uid, name, status, reward, day) in entries {
-        by_day.entry(day).or_default().push((uid, name, status, reward));
+    let mut by_day: std::collections::BTreeMap<
+        String,
+        Vec<(String, String, String, Option<i64>, Option<String>)>,
+    > = Default::default();
+    for (uid, name, status, reward, message, day) in entries {
+        by_day.entry(day).or_default().push((uid, name, status, reward, message));
     }
     for (day, ents) in by_day {
         f.record_day(&day, ents);
@@ -192,14 +204,11 @@ pub struct TrendPoint {
     pub reward_total: i64,
 }
 
-/// 查询最近 N 天趋势（按日期升序，不足 N 天只返回已有的）
-pub fn query_recent(data_dir: &Path, days: u32) -> Vec<TrendPoint> {
-    let f = load(data_dir);
-    trend_from(&f, days)
-}
-
-/// 从结果结构聚合趋势点（按日期升序、限量最近 N 天）
-fn trend_from(f: &ResultsFile, days: u32) -> Vec<TrendPoint> {
+/// 从结果结构聚合趋势点（按日期升序、限量最近 N 天）。
+/// pub：供 doubao_dashboard_stats 等已持有 ResultsFile 的调用方直接复用，
+/// 避免为趋势再 load 一次 365 天全表（2026-11-07 打开卡顿修复：同一张表
+/// 此前被全量反序列化两次，原 load+query_recent 包装已移除）
+pub fn trend_from(f: &ResultsFile, days: u32) -> Vec<TrendPoint> {
     let mut sorted: Vec<(&String, &DayRecord)> = f.days.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
     let skip = sorted.len().saturating_sub(days as usize);
@@ -241,16 +250,41 @@ mod tests {
         let mut f = ResultsFile::default();
         let today = today_key();
         f.record_day(&today, [
-            ("u1".into(), "账号1".into(), "success".into(), Some(200)),
-            ("u2".into(), "账号2".into(), "fail".into(), None),
+            ("u1".into(), "账号1".into(), "success".into(), Some(200), None),
+            ("u2".into(), "账号2".into(), "fail".into(), None, Some("接口返回异常 code=710010702".into())),
         ]);
-        f.record_day(&today, [("u2".into(), "账号2".into(), "success".into(), Some(200))]);
+        f.record_day(&today, [("u2".into(), "账号2".into(), "success".into(), Some(200), None)]);
         let day = f.days.get(&today).unwrap();
         assert_eq!(day.accounts.get("u2").unwrap().status, "success");
         let trend = trend_from(&f, 30);
         assert_eq!(trend.len(), 1);
         assert_eq!(trend[0].ok, 2);
         assert_eq!(trend[0].reward_total, 400);
+    }
+
+    /// 失败原因落库 + 旧数据兼容（message 缺省 None，serde default 反序列化不报错）
+    #[test]
+    fn record_day_fail_原因落库且旧数据兼容() {
+        let today = today_key();
+        let mut f = ResultsFile::default();
+        f.record_day(&today, [(
+            "u1".to_string(),
+            "甲".into(),
+            "fail".into(),
+            None,
+            Some("触发风控验证码，请在豆包客户端完成一次人工验证后重试".into()),
+        )]);
+        let r = &f.days[&today].accounts["u1"];
+        assert_eq!(r.status, "fail");
+        assert!(r.message.as_deref().unwrap().contains("风控"));
+        // 旧格式 JSON（无 message 字段）反序列化兼容
+        let legacy = serde_json::json!({
+            "name": "乙", "status": "success", "reward": 100,
+            "updated_at": "2026-11-06 10:00:00"
+        });
+        let parsed: AccountResult = serde_json::from_value(legacy).expect("旧数据应可反序列化");
+        assert!(parsed.message.is_none());
+        assert_eq!(parsed.status, "success");
     }
 
     #[test]
@@ -271,18 +305,18 @@ mod tests {
     fn record_day_fail_不覆盖成功() {
         let today = today_key();
         let mut f = ResultsFile::default();
-        f.record_day(&today, [("u1".to_string(), "甲".into(), "success".into(), Some(200))]);
-        f.record_day(&today, [("u1".to_string(), "甲".into(), "fail".into(), None)]);
+        f.record_day(&today, [("u1".to_string(), "甲".into(), "success".into(), Some(200), None)]);
+        f.record_day(&today, [("u1".to_string(), "甲".into(), "fail".into(), None, None)]);
         let r = &f.days[&today].accounts["u1"];
         assert_eq!(r.status, "success");
         assert_eq!(r.reward, Some(200));
         // 反向：成功覆盖失败（重试成功为最终态）
-        f.record_day(&today, [("u2".to_string(), "乙".into(), "fail".into(), None)]);
-        f.record_day(&today, [("u2".to_string(), "乙".into(), "already".into(), None)]);
+        f.record_day(&today, [("u2".to_string(), "乙".into(), "fail".into(), None, None)]);
+        f.record_day(&today, [("u2".to_string(), "乙".into(), "already".into(), None, None)]);
         assert_eq!(f.days[&today].accounts["u2"].status, "already");
         // fail 覆盖 fail（同态刷新 updated_at 正常）
-        f.record_day(&today, [("u3".to_string(), "丙".into(), "fail".into(), None)]);
-        f.record_day(&today, [("u3".to_string(), "丙".into(), "fail".into(), None)]);
+        f.record_day(&today, [("u3".to_string(), "丙".into(), "fail".into(), None, None)]);
+        f.record_day(&today, [("u3".to_string(), "丙".into(), "fail".into(), None, None)]);
         assert_eq!(f.days[&today].accounts["u3"].status, "fail");
     }
 
@@ -293,9 +327,9 @@ mod tests {
             let d = (chrono::Local::now().date_naive() - chrono::Duration::days(i))
                 .format("%Y-%m-%d")
                 .to_string();
-            f.record_day(&d, [("u".into(), "n".into(), "fail".into(), None)]);
+            f.record_day(&d, [("u".into(), "n".into(), "fail".into(), None, None)]);
         }
-        f.record_day(&today_key(), [("u".into(), "n".into(), "success".into(), Some(200))]);
+        f.record_day(&today_key(), [("u".into(), "n".into(), "success".into(), Some(200), None)]);
         let got = trend_from(&f, 3);
         assert_eq!(got.len(), 3);
         assert_eq!(got.last().unwrap().date, today_key());
@@ -308,11 +342,18 @@ mod tests {
     fn results_file_roundtrip() {
         let dir = std::env::temp_dir().join(format!("twa_doubao_checkin_results_{}", std::process::id()));
         let mut f = ResultsFile::default();
-        f.record_day(&today_key(), [("u1".into(), "账号1".into(), "already".into(), None)]);
+        f.record_day(&today_key(), [
+            ("u1".into(), "账号1".into(), "already".into(), None, None),
+            ("u2".into(), "账号2".into(), "fail".into(), None, Some("接口返回异常 code=710010702（上游提示：…）".into())),
+        ]);
         save(&dir, &f);
         let loaded = load(&dir);
         let day = loaded.days.get(&today_key()).expect("应能读回当日数据");
         assert_eq!(day.accounts.get("u1").unwrap().status, "already");
+        // message 列往返（SQLite 列序/读写错误只有运行时暴露，回归必须走 save→load）
+        let u2 = day.accounts.get("u2").expect("fail 记录应落库");
+        assert_eq!(u2.status, "fail");
+        assert_eq!(u2.message.as_deref(), Some("接口返回异常 code=710010702（上游提示：…）"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

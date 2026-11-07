@@ -592,7 +592,9 @@ fn collect_targets(state: &AppState) -> Result<Vec<(String, String, Option<Strin
 /// 降级进程内锁继续写（池回写进程内锁保护，不受影响）
 fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_busy: bool) {
     // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）。
-    // day 取 outcome 产生时刻打点（跨零点批次各归各日）；旧 outcome 无 day 回退当日
+    // day 取 outcome 产生时刻打点（跨零点批次各归各日）；旧 outcome 无 day 回退当日。
+    // message 仅 fail 携带（失败原因落库，切页/重开后日历明细仍可排障）——
+    // success/already 的 message 恒为固定成功文案，落库只增体积无价值
     let today = crate::doubao_checkin_results::today_key();
     let entries = outcomes.iter().map(|o| {
         (
@@ -600,6 +602,14 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_
             o.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             o.get("status").and_then(Value::as_str).unwrap_or("fail").to_string(),
             o.get("reward").and_then(Value::as_i64),
+            (o.get("status").and_then(Value::as_str) == Some("fail"))
+                .then(|| {
+                    o.get("message")
+                        .and_then(Value::as_str)
+                        .filter(|m| !m.is_empty())
+                        .map(String::from)
+                })
+                .flatten(),
             o.get("day").and_then(Value::as_str).unwrap_or(&today).to_string(),
         )
     });
@@ -691,10 +701,17 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
     };
     let targets = collect_targets(state)?;
     // probe 自动保活（方案 A，2026-11-06）：probe 缺失/过期 → 自动开客户端抓包对齐；
-    // 失败仅记日志，签到照常走既有 probe 链（缺失回退内置稳定参数）
-    if let Err(e) = super::doubao_probe::ensure_fresh_probes(state, app, &targets) {
-        fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
-    }
+    // 失败仅记日志，签到照常走既有 probe 链（缺失回退内置稳定参数——该形态大概率被
+    // 上游风控拒）。2026-11-07 可观测性：错误透传到返回值/汇总 Err，前端批量签到
+    // 失败时用户能直接看到「抓包参数未对齐」这一根因，不再只看到笼统失败
+    let probe_keepalive_error: Option<String> =
+        match super::doubao_probe::ensure_fresh_probes(state, app, &targets) {
+            Ok(()) => None,
+            Err(e) => {
+                fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
+                Some(e)
+            }
+        };
     if targets.is_empty() {
         // 奖励型任务（漏跑=丢收益）空池豁免：调度器 tick 对 skipped_empty_pool 不
         // mark_run，当日导入账号后下一 tick 正常补打（对齐 buddy-ai #15 豁免口径）
@@ -759,8 +776,12 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
             })
             .collect::<Vec<_>>()
             .join("；");
+        let probe_hint = probe_keepalive_error
+            .as_deref()
+            .map(|e| format!("；此外抓包参数自动保活未完成（{e}），本次签到未对齐客户端指纹，易被风控拒绝——请开启代理并保持豆包客户端打开后重试"))
+            .unwrap_or_default();
         return Err(format!(
-            "豆包签到：{success} 成功 / {already} 已领 / {failed} 失败：{err_head}"
+            "豆包签到：{success} 成功 / {already} 已领 / {failed} 失败：{err_head}{probe_hint}"
         ));
     }
 
@@ -769,6 +790,7 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
         "total": outcomes.len(), "success": success, "already": already, "failed": failed,
         "reward_total": reward_total,
         "errors": errors,
+        "probe_keepalive_error": probe_keepalive_error,
         "finished_at": fs_utils::now_ts(),
     }))
 }
@@ -781,10 +803,16 @@ pub fn checkin_single(state: &AppState, app: Option<&tauri::AppHandle>, uid: &st
         return Err(format!("账号 {uid} 不在账号池中或未录入 sessionid 凭证"));
     };
     let (_, sid, sg, name) = target;
-    // probe 自动保活（方案 A）：本账号 probe 缺失/过期 → 自动开客户端抓包（失败照常签到）
-    if let Err(e) = super::doubao_probe::ensure_fresh_probes(state, app, std::slice::from_ref(target)) {
-        fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
-    }
+    // probe 自动保活（方案 A）：本账号 probe 缺失/过期 → 自动开客户端抓包（失败照常签到，
+    // 错误透传 probe_keepalive_error 供前端提示根因）
+    let probe_keepalive_error =
+        match super::doubao_probe::ensure_fresh_probes(state, app, std::slice::from_ref(target)) {
+            Ok(()) => None,
+            Err(e) => {
+                fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
+                Some(e)
+            }
+        };
     let agent = http_agent(TIMEOUT_SECS);
     // 回退语义由 load_campaign_probe 内部保证（本账号键 → 全局键两级回退，与
     // run_batch 同口径）；外层再 or_else 全局查询属死分支（内部已试过全局键）
@@ -795,6 +823,7 @@ pub fn checkin_single(state: &AppState, app: Option<&tauri::AppHandle>, uid: &st
     Ok(json!({
         "ok": ok,
         "outcome": outcome,
+        "probe_keepalive_error": probe_keepalive_error,
         "finished_at": fs_utils::now_ts(),
     }))
 }

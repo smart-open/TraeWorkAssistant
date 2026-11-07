@@ -1085,6 +1085,8 @@ export interface DoubaoDayAccountResult {
   status: string;
   /** 签到奖励额度（success 时非空） */
   reward: number | null;
+  /** 失败原因（仅 fail 时非空；旧数据/存量行为 null——失败原因落库后重开仍可排障） */
+  message?: string | null;
 }
 
 /** 额度趋势单日明细（同 uid 同日一条，重试轮覆盖为最终态；日期升序） */
