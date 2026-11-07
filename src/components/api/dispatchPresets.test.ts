@@ -15,13 +15,31 @@ describe('matchPreset（调度策略收口：预设匹配）', () => {
     expect(matchPreset(null, null)).toBeUndefined();
   });
 
-  it('默认配置（空策略 + 智能调度）命中「积分保鲜」', () => {
-    // api_pool.json 默认 strategy 空串（语义等同 expire_first），dispatch_policy 默认 smart
+  it('默认配置（全空策略 + 智能调度）不命中预设：Buddy 池空串 = fair_rotation 专属默认，不在预设集内（自定义组合）', () => {
+    // api_pool.json 默认全空串：trae/qoder/buddyAi 跟随 expire_first，但 Buddy 池
+    // 空串 = fair_rotation（WB 专属默认，与后端 resolve_wb 同口径）→ 无预设命中
     const hit = matchPreset(
       { strategy: '', wb_strategy: '', qoder_strategy: '', buddy_ai_strategy: '' },
       { strategy: 'smart' },
     );
-    expect(hit?.key).toBe('fresh');
+    expect(hit).toBeUndefined();
+  });
+
+  it('Buddy 池空串 = fair_rotation（与后端 resolve_wb 同口径），其余池空串跟随 Trae 池', () => {
+    // Buddy 空串（fair_rotation）与 Qoder/BuddyAI 空串（跟随 expire_first）→ 自定义
+    expect(
+      matchPreset(
+        { strategy: 'expire_first', wb_strategy: '', qoder_strategy: '', buddy_ai_strategy: '' },
+        { strategy: 'smart' },
+      ),
+    ).toBeUndefined();
+    // Buddy 显式 weighted + Qoder/BuddyAI 空串（跟随 weighted）→ 命中「智能均衡」
+    const hit = matchPreset(
+      { strategy: 'weighted', wb_strategy: 'weighted', qoder_strategy: '', buddy_ai_strategy: '' },
+      { strategy: 'smart' },
+    );
+    expect(hit?.key).toBe('balanced');
+    expect(hit?.recommended).toBe(true);
   });
 
   it('显式 expire_first 各池 + 智能调度命中「积分保鲜」', () => {
@@ -37,9 +55,9 @@ describe('matchPreset（调度策略收口：预设匹配）', () => {
     expect(hit?.key).toBe('fresh');
   });
 
-  it('Buddy/Qoder/BuddyAI 池空串跟随 Trae 池生效值（跟随 weighted 命中「智能均衡」）', () => {
+  it('Qoder/BuddyAI 池空串跟随 Trae 池生效值（跟随 weighted 命中「智能均衡」；Buddy 池不在此列）', () => {
     const hit = matchPreset(
-      { strategy: 'weighted', wb_strategy: '', qoder_strategy: '', buddy_ai_strategy: '' },
+      { strategy: 'weighted', wb_strategy: 'weighted', qoder_strategy: '', buddy_ai_strategy: '' },
       { strategy: 'smart' },
     );
     expect(hit?.key).toBe('balanced');
@@ -118,10 +136,17 @@ describe('matchPreset（调度策略收口：预设匹配）', () => {
         { strategy: 'smart' },
       )?.key,
     ).toBe('fast');
-    // qoder_strategy 显式独立配 weighted，其余空（跟随 weighted）→ 命中「智能均衡」
+    // qoder_strategy 显式独立配 weighted，其余空（Buddy=fair_rotation、BuddyAI 跟随 weighted）→ 自定义组合
     expect(
       matchPreset(
         { strategy: 'weighted', wb_strategy: '', qoder_strategy: 'weighted', buddy_ai_strategy: '' },
+        { strategy: 'smart' },
+      ),
+    ).toBeUndefined();
+    // Buddy 显式配 weighted、qoder 显式配 weighted，BuddyAI 空（跟随 weighted）→ 命中「智能均衡」
+    expect(
+      matchPreset(
+        { strategy: 'weighted', wb_strategy: 'weighted', qoder_strategy: 'weighted', buddy_ai_strategy: '' },
         { strategy: 'smart' },
       )?.key,
     ).toBe('balanced');
@@ -140,13 +165,20 @@ describe('matchPreset（调度策略收口：预设匹配）', () => {
         { strategy: 'smart' },
       ),
     ).toBeUndefined();
-    // buddy_ai_strategy 显式独立配 weighted，其余空（跟随 weighted）→ 命中「智能均衡」
+    // buddy_ai_strategy 显式独立配 weighted，Buddy/Qoder 显式 weighted → 命中「智能均衡」
+    expect(
+      matchPreset(
+        { strategy: 'weighted', wb_strategy: 'weighted', qoder_strategy: 'weighted', buddy_ai_strategy: 'weighted' },
+        { strategy: 'smart' },
+      )?.key,
+    ).toBe('balanced');
+    // BuddyAI 独立配 weighted，Buddy 空串（fair_rotation）→ 自定义组合（Buddy 不再跟随 Trae）
     expect(
       matchPreset(
         { strategy: 'weighted', wb_strategy: '', qoder_strategy: '', buddy_ai_strategy: 'weighted' },
         { strategy: 'smart' },
-      )?.key,
-    ).toBe('balanced');
+      ),
+    ).toBeUndefined();
   });
 
   it('预设定义完整：5 组且互不重复、均含名称与说明与四池策略', () => {

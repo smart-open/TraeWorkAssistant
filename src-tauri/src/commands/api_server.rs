@@ -216,7 +216,8 @@ pub async fn do_start(
         ),
     );
 
-    // Buddy 池策略：wb_strategy 独立配置优先；空 = 跟随 Trae 池（与 pool_set 热应用逻辑一致）
+    // Buddy 池策略：wb_strategy 独立配置优先；空 = 加权公平轮转 fair_rotation（WB
+    // 专属默认，PR #187；与 pool_set 热应用逻辑一致）
     let wb_strategy = crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy);
     let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -234,7 +235,7 @@ pub async fn do_start(
     wb_pool.set_strategy(wb_strategy);
 
     // Qoder 池启动概况（p3-3 + 池内策略）：开关默认 false，未启用时不产生告警噪音；
-    // qoder_strategy 空 = 跟随 Trae 池策略（与 Buddy 池 resolve_wb 同语义）
+    // qoder_strategy 空 = 跟随 Trae 池策略（wb_strategy 已改公平轮转专属默认，不在此列）
     let qoder_strategy =
         crate::api_server::pool::PoolStrategy::resolve_qoder(&pool_file.strategy, &pool_file.qoder_strategy);
     qoder_pool.set_strategy(qoder_strategy);
@@ -248,8 +249,8 @@ pub async fn do_start(
         ),
     );
 
-    // buddy-ai 国际池启动概况（池内策略：buddy_ai_strategy 空 = 跟随 Trae 池，
-    // 与 Buddy/Qoder 池同语义；开关默认 false，未启用时不产生告警噪音）
+    // buddy-ai 国际池启动概况（池内策略：buddy_ai_strategy 空 = 跟随 Trae 池，与 Qoder
+    // 池同语义——wb_strategy 已改公平轮转专属默认，不在此列；开关默认 false，未启用时不产生告警噪音）
     let buddy_ai_strategy = crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
         &pool_file.strategy,
         &pool_file.buddy_ai_strategy,
@@ -879,7 +880,8 @@ fn spawn_pool_reconciler(app: tauri::AppHandle, data_dir: std::path::PathBuf) {
                     // 策略热重设（审查修复）：apply_pool_snapshot 只重建账号条目不含
                     // 策略；指纹含策略（resolve_wb 口径），绕过 pool_set 直写 kv 改
                     // 策略时热重载不重设则指纹永不收敛 → 每 3 tick 空转整池重载。
-                    // 口径对齐 pool_set 热应用段（WB/Qoder/buddy-ai 空 = 跟随 Trae 池）
+                    // 口径对齐 pool_set 热应用段（Qoder/buddy-ai 空 = 跟随 Trae 池；
+                    // WB 空 = fair_rotation 专属默认，resolve_wb 各自解析）
                     let pool_file = load_pool_file(&state.data_dir);
                     // 收敛复验（审查修复）：重载后重算运行池指纹比对 DB 侧口径，
                     // 未收敛视为疑似口径漂移 → 进入退避，下轮重试
@@ -1417,7 +1419,7 @@ fn merge_pool_set(
     qoder_uids: Option<Vec<String>>,
     // Qoder 池分组筛选（共享分组 shg_ 前缀 id）；None = 保留原值
     qoder_group_ids: Option<Vec<String>>,
-    // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
+    // Qoder 池内调度策略；空串 = 跟随 Trae 池（wb_strategy 已改公平轮转专属默认，不在此列）；None = 保留原值
     qoder_strategy: Option<String>,
     trae_enabled: Option<bool>,
     // buddy-ai（国际版）显式会话粘性开关 + 池粘性 TTL（§4.2）；None = 保留原值

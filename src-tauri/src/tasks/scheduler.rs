@@ -328,12 +328,14 @@ fn tick(app: &AppHandle, st: &AppState) {
                 // 调度补打。skipped_busy 落日志（低频、值得留痕）；空轮纯静默
                 //（池空期间每 tick 触发，落日志会刷屏，对齐「空池静默空转」定调）
                 //
-                // 其余普通 skipped（含豆包/trae/wb/qoder 各任务空池 `{"ok":true,
-                // "skipped":"无 X 账号"}`，issue #147 口径）走 mark_run + 落日志——
-                // 有意取舍（定调）：这类任务无奖励属性、空池空转无收益，mark_run
-                // 关闭当日重复触发可防空转；当日新增账号次日生效可接受（需即刻
-                // 巡检可手动触发）。仅 buddy-ai 每日活跃打卡豁免（漏打=丢奖励），
-                // 新增空池任务若同属「漏跑=丢收益」语义，须改打 skipped_empty_pool
+                // 其余普通 skipped（含豆包额度巡检/保活、各池目录/快照/流水同步
+                // 任务空池 `{"ok":true,"skipped":"无 X 账号"}`，issue #147 口径）走
+                // mark_run + 落日志——有意取舍（定调）：这类任务无奖励属性、空池
+                // 空转无收益，mark_run 关闭当日重复触发可防空转；当日新增账号次日
+                // 生效可接受（需即刻巡检可手动触发）。奖励型签到任务豁免
+                //（漏跑=丢收益）：buddy-ai 每日活跃打卡、豆包/trae/wb/qoder 每日
+                // 签到空池改打 skipped_empty_pool，当日导入账号后下一 tick 正常
+                // 补打。新增空池任务若同属「漏跑=丢收益」语义，须同款豁免
                 if v.get("skipped_busy").is_some() {
                     fs_utils::app_log(
                         &st.data_dir,
@@ -493,6 +495,12 @@ fn run_task(
         //  AuthRejected=服务端拒绝认证（issue #128）/ DeviceSigned=设备当日去重）
         "trae-checkin" => {
             let accounts = crate::vault::load_accounts(st);
+            // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：签到漏跑
+            // =丢积分，mark_run 固化「当日已跑」会让当日导入账号失去调度补打——
+            // 空池提前返回 skipped_empty_pool，tick 不 mark_run、下一 tick 补打
+            if accounts.accounts.is_empty() {
+                return Ok(json!({ "ok": true, "skipped": "无 Trae 账号", "skipped_empty_pool": true }));
+            }
             let retry = st.settings().retry.max(0) as u32;
             let mut events: Vec<Value> = Vec::new();
             let done =
@@ -528,6 +536,15 @@ fn run_task(
         // 审查 P2：同 trae-checkin——可重试失败返 Err 交 30 分钟冷却重试；
         // 永久性凭证失败（需重新登录 / 无可用凭证，30 分钟内不会自愈）剔除出重试判定
         "wb-checkin" => {
+            // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：空池提前
+            // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）。
+            // 分支级早退而非任务层打标：wb 调度轮次会向前端转发 start/done 事件
+            //（issue #134 方案1），空池若仍每 tick 走整轮会向前端刷「成功 0」toast；
+            // 早退置于抢轮次锁之前——空轮不占锁，连击统计不动（空轮本就不变）
+            let pool = crate::store::docs::wb_pool_load(&crate::store::db(&st.data_dir));
+            if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
+                return Ok(json!({ "ok": true, "skipped": "无 WorkBuddy 账号", "skipped_empty_pool": true }));
+            }
             let _round = match crate::commands::workbuddy::try_acquire_wb_round("调度器签到", &st.data_dir) {
                 Ok(g) => g,
                 Err(why) => {
@@ -733,6 +750,13 @@ fn run_task(
         }
         // F-80 Qoder 每日签到：与 `--task-run qoder-checkin` 同款；抢轮次锁与 UI 路径互斥
         "qoder-checkin" => {
+            // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：空池提前
+            // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）；
+            // 早退置于抢轮次锁之前——空轮不占锁，连击/重试判定均不触及
+            let pool = crate::store::docs::qoder_pool_load(&crate::store::db(&st.data_dir));
+            if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
+                return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号", "skipped_empty_pool": true }));
+            }
             // 抢不到轮次锁（UI 路径正在签到）= 幂等跳过而非失败：返 Err 会被调度器记
             // 当日首败并推送「签到失败」误报通知（签到本身未失败，UI 路径会照常完成）
             let Ok(_round) = crate::tasks::qoder_checkin::try_acquire_qoder_round() else {
@@ -1519,5 +1543,23 @@ mod tests {
             v.get("skipped").and_then(Value::as_str).unwrap_or("").contains("当日暂停"),
             "跳过文案应说明当日暂停语义"
         );
+    }
+
+    /// 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：trae/wb/qoder
+    /// 签到空池时 run_task 返回 skipped_empty_pool——tick 据此不 mark_run，当日
+    /// 导入账号下一 tick 正常补打；早退在轮次锁/网络请求之前，测试无副作用
+    #[test]
+    fn reward_checkin_empty_pool_exemption() {
+        for key in ["trae-checkin", "wb-checkin", "qoder-checkin"] {
+            let st = temp_state("reward_empty_pool");
+            let v = run_task(key, &st, None, None).expect("空池应为 Ok 跳过");
+            assert_eq!(
+                v.get("skipped_empty_pool").and_then(Value::as_bool),
+                Some(true),
+                "{key} 空池须打 skipped_empty_pool（否则 mark_run 固化当日已跑，当日导入账号丢补打）"
+            );
+            assert!(v.get("skipped").and_then(Value::as_str).is_some(), "{key} 空池须带跳过原因");
+            assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
+        }
     }
 }

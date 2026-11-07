@@ -398,17 +398,20 @@ export default function DoubaoSettings() {
   const runCheckinNow = async () => {
     setCheckinRunning(true);
     try {
-      // 返回契约：batch → { ok, total, success, already, failed, reward_total, errors, finished_at }
+      // 返回契约：batch → { ok, total, success, already, failed, reward_total, errors, finished_at }；
+      // 空池 → { ok, skipped: "无豆包账号", skipped_empty_pool: true }（奖励型任务豁免，
+      // 调度器对后者不 mark_run；前端双字段统一判定，只判 skipped 会漏掉豁免语义）
       const r = (await api.doubao.checkinRun()) as {
         skipped?: string;
+        skipped_empty_pool?: boolean;
         total?: number;
         success?: number;
         already?: number;
         failed?: number;
         reward_total?: number;
       };
-      if (r.skipped) {
-        pushToast('info', `签到跳过：${r.skipped}`);
+      if (r.skipped ?? r.skipped_empty_pool) {
+        pushToast('info', `签到跳过：${r.skipped ?? '无豆包账号'}`);
       } else {
         pushToast(
           'success',

@@ -71,13 +71,17 @@ export default function DoubaoCheckin() {
         // 活动档期日历数据源：近 90 天按日逐账号明细（与签到主流程解耦，失败静默）
         api.doubao.resultsDetail(90).catch(() => [] as DoubaoDayDetail[]),
       ]);
+      // 卸载守卫（与 run() 同口径，审查 #12）：单账号 invoke 超时 600s，切页后
+      // 迟到响应不得 setState / pushToast / setLoading
+      if (!aliveRef.current) return;
       setAccounts(accs);
       setGroups(gs);
       setCalDays(daysFromDoubaoDetail(det));
     } catch (err) {
+      if (!aliveRef.current) return;
       pushToast('error', `读取豆包账号失败：${String(err)}`);
     } finally {
-      setLoading(false);
+      if (aliveRef.current) setLoading(false);
     }
   };
 

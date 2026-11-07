@@ -273,20 +273,29 @@ export default function DoubaoAccounts() {
    *  结果缓存进账号池（后端回写），账号名后即显示会员/免费标识。
    *  查到额度窗口已用完时弹一次提醒（含重置时间）。 */
   const quotaAutoFetched = useRef(false);
+  // 组件级挂载守卫：仅卸载置 false（setup 复位 true，StrictMode 双跑安全）。
+  // 不用随 deps 变化的 effect cleanup（stopped 模式）——循环执行期间同页 20s 凭证
+  // 回写 / done 事件任一 reload 都会中止在途串行查询，且 quotaAutoFetched ref 阻止
+  // 补跑 → pending 账号本次会话漏查
+  const mountedRef = useRef(true);
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const runQuotaAutoFetch = () => {
     if (quotaAutoFetched.current || loading || accounts.length === 0) return;
     const pending = accounts.filter((a) => a.session_state !== 'none' && !a.quota_checked_at);
     quotaAutoFetched.current = true;
     if (pending.length === 0) return;
-    // 卸载守卫（仿上方 20s 轮询 effect 的 stopped 模式）：组件卸载/依赖变化后停止循环，
-    // 不再继续请求、不再 toast、不再触发 reload
-    let stopped = false;
+    // 卸载守卫：只防组件卸载（mountedRef），同页 reload 不再误中止在途查询
     (async () => {
       for (const a of pending) {
-        if (stopped) return;
+        if (!mountedRef.current) return;
         try {
           const r = await api.doubao.fetchQuota(a.user_id);
-          if (stopped) return;
+          if (!mountedRef.current) return;
           const exhaustedWin = (r.parsed?.items ?? []).find(
             (it) => 'used_percent' in it && (it.exhausted || it.used_percent >= 100),
           );
@@ -297,17 +306,18 @@ export default function DoubaoAccounts() {
             );
           }
         } catch (err) {
-          if (stopped) return;
+          if (!mountedRef.current) return;
           // 查询失败不再静默：提示原因（常见：凭证过期 710012001 / 接口未配置），下次进入页面会重试
           pushToast('warn', `账号 ${a.name} 额度自动查询失败：${String(err)}`);
         }
       }
-      if (stopped) return;
+      if (!mountedRef.current) return;
       void reload();
     })();
-    return () => {
-      stopped = true;
-    };
+  };
+
+  useEffect(() => {
+    runQuotaAutoFetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts, loading]);
 

@@ -86,7 +86,12 @@ export default function DoubaoQuotaDashboard() {
     setLoading(true);
     try {
       const [st, accs, gs, det] = await Promise.all([
-        api.doubao.dashboardStats(),
+        // stats 独立降级（审查 #3/#14）：失败保留旧值（undefined 不覆盖 setStats）+
+        // 补失败 toast（读失败不得静默、不得伪装成「暂无数据」空态），不再短路
+        // Promise.all 连累已成功的 accs/gs/det——KPI 保留上次数据继续可见。
+        // 对齐 DoubaoOverview 的 undefined 哨兵口径；null 是 stats 的「空数据」语义，
+        // 失败置 null 会把已有统计闪成空态
+        api.doubao.dashboardStats().catch(() => undefined),
         api.doubao.accountsList().catch(() => [] as DoubaoAccountView[]),
         api.groups.sharedList().catch(() => [] as GroupView[]),
         // 明细一次拉满 365 天窗口，时间段切换纯前端过滤（后端已按 365 天裁剪）
@@ -94,7 +99,13 @@ export default function DoubaoQuotaDashboard() {
       ]);
       // 过期响应（已被更新请求取代或组件已卸载）：各 set 与 pushToast 前校验，避免旧数据回写/全局 toast
       if (seq !== seqRef.current) return;
-      setStats(st);
+      if (st === undefined) {
+        // 仅 stats 失败：可见反馈——已有旧数据提示「已保留」；首次加载（stats 仍
+        // 为 null）无数据可保留，文案如实提示暂无，accs/gs/det 与时间戳照常落地
+        pushToast('error', stats ? '额度概览读取失败，已保留上次数据' : '额度概览读取失败，暂无数据');
+      } else {
+        setStats(st);
+      }
       setAccounts(accs);
       setGroups(gs);
       setDetail(det);

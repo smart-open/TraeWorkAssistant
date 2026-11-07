@@ -585,8 +585,12 @@ fn collect_targets(state: &AppState) -> Result<Vec<(String, String, Option<Strin
         .collect())
 }
 
-/// 落库 + 池回写 + 运维历史（batch/single 共用收尾）
-fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
+/// 落库 + 池回写 + 运维历史（batch/single 共用收尾）。
+/// skip_on_busy 语义见 record_day_at：task 批量传 true（调度器/CLI 双进程并发时
+/// 他方必完成同批写入，幂等跳过无损失）；manual 单账号传 false——GUI 手动签到与
+/// CLI 批次并发时两批内容不保证相同，Busy 跳过会把手动签到结果丢成 fail，
+/// 降级进程内锁继续写（池回写进程内锁保护，不受影响）
+fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_busy: bool) {
     // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）。
     // day 取 outcome 产生时刻打点（跨零点批次各归各日）；旧 outcome 无 day 回退当日
     let today = crate::doubao_checkin_results::today_key();
@@ -599,8 +603,8 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
             o.get("day").and_then(Value::as_str).unwrap_or(&today).to_string(),
         )
     });
-    // skip_on_busy=true：调度器/CLI 同批写入他方完成即可覆盖，幂等跳过无损失
-    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries, true);
+    // skip_on_busy 由调用方按来源决定（task 批量=true / manual 单账号=false，见函数注释）
+    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries, skip_on_busy);
 
     // ② 池回写（两阶段短临界区：重读最新池按 uid 合并）
     let run_at = fs_utils::now_ts();
@@ -659,7 +663,9 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str) {
 }
 
 /// 批量签到（调度器/CLI `--task-run doubao-checkin`）：遍历池内有凭证账号 → 签到 →
-/// 按日落库 + 池回写 + 运维历史 → 汇总。空池跳过（对齐 doubao-quota 惯例）。
+/// 按日落库 + 池回写 + 运维历史 → 汇总。空池打 skipped_empty_pool（奖励型任务豁免，
+/// 见 scheduler tick 对该键不 mark_run 的注释）——签到漏跑=丢收益，mark_run 固化
+/// 「当日已跑」会让当日导入的账号失去调度补打。
 /// 跨进程轮次锁（对齐 wb-checkin try_acquire_wb_round 先例）：GUI 调度器与
 /// schtasks CLI 双进程互斥；Busy 幂等跳过、机制性失败 fail-closed。
 pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Value, String> {
@@ -690,21 +696,23 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
         fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
     }
     if targets.is_empty() {
-        return Ok(json!({ "ok": true, "skipped": "无豆包账号" }));
+        // 奖励型任务（漏跑=丢收益）空池豁免：调度器 tick 对 skipped_empty_pool 不
+        // mark_run，当日导入账号后下一 tick 正常补打（对齐 buddy-ai #15 豁免口径）
+        return Ok(json!({ "ok": true, "skipped": "无豆包账号", "skipped_empty_pool": true }));
     }
 
     let agent = http_agent(TIMEOUT_SECS);
-    // 全局 probe 兜底（2026-11-06 起按 sessionid 分键，逐账号优先取自己的抓包参数）
-    let probe_global = load_campaign_probe(&state.data_dir, None);
     let mut outcomes: Vec<Value> = Vec::new();
     for (i, (uid, sid, sg, name)) in targets.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(Duration::from_millis(ACCOUNT_GAP_MS));
         }
-        let probe = load_campaign_probe(&state.data_dir, Some(sid)).or_else(|| probe_global.clone());
+        // 回退语义由 load_campaign_probe 内部保证（本账号键 → 全局键两级回退）；
+        // 外层再 or_else 全局快照属死分支，且命中时取的是循环前更旧快照
+        let probe = load_campaign_probe(&state.data_dir, Some(sid));
         outcomes.push(run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref()));
     }
-    persist_outcomes(state, &outcomes, "task");
+    persist_outcomes(state, &outcomes, "task", true);
 
     let success = outcomes
         .iter()
@@ -768,22 +776,21 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
 /// 单账号签到（应用内手动路径）：读池凭证 → probe 保活 → run_one → 落库/回写/历史
 pub fn checkin_single(state: &AppState, app: Option<&tauri::AppHandle>, uid: &str) -> Result<Value, String> {
     let targets = collect_targets(state)?;
-    let Some((_, sid, sg, name)) = targets.iter().find(|(u, _, _, _)| u == uid) else {
+    // 首查绑定目标引用复用，消除同谓词二次 find(...).unwrap()（let-else 已保证存在）
+    let Some(target) = targets.iter().find(|(u, _, _, _)| u == uid) else {
         return Err(format!("账号 {uid} 不在账号池中或未录入 sessionid 凭证"));
     };
+    let (_, sid, sg, name) = target;
     // probe 自动保活（方案 A）：本账号 probe 缺失/过期 → 自动开客户端抓包（失败照常签到）
-    if let Err(e) = super::doubao_probe::ensure_fresh_probes(
-        state,
-        app,
-        std::slice::from_ref(&targets.iter().find(|(u, _, _, _)| u == uid).unwrap()),
-    ) {
+    if let Err(e) = super::doubao_probe::ensure_fresh_probes(state, app, std::slice::from_ref(target)) {
         fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
     }
     let agent = http_agent(TIMEOUT_SECS);
-    let probe = load_campaign_probe(&state.data_dir, Some(sid))
-        .or_else(|| load_campaign_probe(&state.data_dir, None));
+    // 回退语义由 load_campaign_probe 内部保证（本账号键 → 全局键两级回退，与
+    // run_batch 同口径）；外层再 or_else 全局查询属死分支（内部已试过全局键）
+    let probe = load_campaign_probe(&state.data_dir, Some(sid));
     let outcome = run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref());
-    persist_outcomes(state, std::slice::from_ref(&outcome), "manual");
+    persist_outcomes(state, std::slice::from_ref(&outcome), "manual", false);
     let ok = outcome.get("status").and_then(Value::as_str) != Some("fail");
     Ok(json!({
         "ok": ok,

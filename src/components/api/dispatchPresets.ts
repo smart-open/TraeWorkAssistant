@@ -2,9 +2,10 @@
  * 调度策略中心 · 最佳组合预设与匹配逻辑（纯函数，便于单测）
  * 从 ResourceSummary.tsx 抽出：预设定义 + 当前配置 → 预设命中判定。
  * 匹配规则：池间策略一致 + Trae 池策略一致（空串语义等同 expire_first 默认）
- * + Buddy 池策略一致（空 = 跟随 Trae 池生效值）+ Qoder 池策略一致（空 = 跟随
- * Trae 池生效值，同 Buddy 语义）+ BuddyAI 国际池策略一致（空 = 跟随 Trae 池
- * 生效值，同 Buddy/Qoder 语义）。
+ * + Buddy 池策略一致（空 = 加权公平轮转 fair_rotation，WB 专属默认 PR #187，
+ * 不再跟随 Trae 池）+ Qoder 池策略一致（空 = 跟随 Trae 池生效值）+ BuddyAI
+ * 国际池策略一致（空 = 跟随 Trae 池生效值，与 Qoder 同语义——wb_strategy
+ * 已改公平轮转专属默认，不在此列）。
  * 注意：Qoder 池与 Trae / Buddy 同等地位参与池间策略调度（默认优先级序位于
  * 尾部，可在「固定优先级」中上移，smart 重排同样覆盖 Qoder）；BuddyAI 国际池
  * 已参与池间候选序（后端 resolve_target 对缺失池自动补尾）；池内策略已纳入
@@ -86,7 +87,9 @@ export function matchPreset(
 ): DispatchPreset | undefined {
   if (!pool || !policy) return undefined;
   const trae = pool.strategy || 'expire_first';
-  const buddy = pool.wb_strategy || trae;
+  // Buddy 池空串 = fair_rotation（WB 专属默认，与后端 PoolStrategy::resolve_wb
+  // 同口径）；Qoder / BuddyAI 空串 = 跟随 Trae 池（resolve_qoder/resolve_buddy_ai）
+  const buddy = pool.wb_strategy || 'fair_rotation';
   const qoder = pool.qoder_strategy || trae;
   const buddyAi = pool.buddy_ai_strategy || trae;
   return DISPATCH_PRESETS.find(

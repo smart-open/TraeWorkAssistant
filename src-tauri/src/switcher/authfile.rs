@@ -242,8 +242,12 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
 
     // L1：auth 文件（WorkBuddy 系必选；CodeBuddy 端隔离可选——F2-4：CodeBuddy
     // 不消费共享 auth 文件、恢复侧跳过回写，文件缺失仅 Skip 不阻断）
-    match std::fs::copy(&auth_file, dest.join("auth").join(slot_auth_name(sess))) {
+    let snap_auth = dest.join("auth").join(slot_auth_name(sess));
+    match std::fs::copy(&auth_file, &snap_auth) {
         Ok(_) => {
+            // 快照权限收敛（审查 #7）：fs::copy 继承源文件权限位，明文 token 快照不得外放
+            #[cfg(unix)]
+            harden_auth_mode(&snap_auth);
             copied += 1;
             sink.step("backup", StepStatus::Ok, "L1 auth 文件已备份");
         }
@@ -483,6 +487,9 @@ pub fn restore_authfile(
             sink.step("restore", StepStatus::Error, &format!("auth 文件恢复失败: {e}"));
             return Err(super::thrown(sink, "auth 文件恢复失败"));
         }
+        // 回写权限收敛（审查 #7）：备份源文件权限不受本工具控制，恢复后的 live auth 同样不得外放
+        #[cfg(unix)]
+        harden_auth_mode(&auth_file);
         restored += 1;
         sink.step("restore", StepStatus::Ok, "L1 auth 文件已恢复");
 
@@ -982,6 +989,16 @@ fn write_private_file_atomic(path: &std::path::Path, body: &[u8]) -> std::io::Re
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// auth 文件权限收敛 0o600（unix；Windows 走 ACL 继承体系无需处理）：fs::copy 会
+/// 继承源文件权限位，客户端创建的明文 token auth 文件权限不受本工具控制——备份
+/// 快照与恢复回写后的 live 文件可能外放，故备份落盘后、恢复回写后各收口一次，
+/// 与 write_private_file_atomic 同口径。失败不阻断主流程（切换/恢复语义已完成）
+#[cfg(unix)]
+fn harden_auth_mode(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
 /// 槽位是否带合成标记（meta.json `"bootstrap": true`，合成落槽时写入）。

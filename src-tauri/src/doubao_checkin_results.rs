@@ -113,10 +113,12 @@ static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// - skip_on_busy=true（调度器/CLI 批次落库）：幂等跳过本轮——同批签到的两进程入口
 ///   并发时，他方完成同批写入，跳过无损失，且避免本方超时后降级整表 load→save
 ///   覆盖先到方（丢行竞态）；
-/// - skip_on_busy=false（代理实时捕获，success 落库）：本轮条目是客户端侧独有
-///   reward（调度器同批写入不含这笔），跳过即永久丢失且无重试、「fail 不覆盖
-///   success」规则也救不回——降级进程内锁继续写（跨进程并发窗口内可能与持锁方
-///   互踩读改写，SQLite 写原子性兜底，尽力不丢优于确定性丢失），落日志留痕。
+/// - skip_on_busy=false（代理实时捕获 / GUI manual 单账号签到，success 落库）：
+///   条目可能为本进程侧独有——代理捕获是客户端侧独有 reward（调度器同批写入
+///   不含这笔）；manual 单账号与 CLI 批次并发时两批账号不保证相同，跳过会把
+///   手动签到结果丢成 fail——跳过即永久丢失且无重试、「fail 不覆盖 success」
+///   规则也救不回——降级进程内锁继续写（跨进程并发窗口内可能与持锁方互踩
+///   读改写，SQLite 写原子性兜底，尽力不丢优于确定性丢失），落日志留痕。
 /// 仅机制性失败（创建/等待出错）一律降级仅进程内锁继续写（尽力不丢，保留降级日志）。
 pub fn record_day_at(
     data_dir: &Path,
@@ -143,11 +145,12 @@ pub fn record_day_at(
                 );
                 return;
             }
-            // 代理捕获路径：本轮条目是客户端侧独有 reward，跳过即永久丢失——
-            // 降级进程内锁继续写（尽力不丢，SQLite 写原子性兜底互踩风险，权衡见函数注释）
+            // skip_on_busy=false 路径（代理捕获/manual 单账号）：条目可能为本进程侧独有，
+            // 跳过即永久丢失——降级进程内锁继续写（尽力不丢，SQLite 写原子性兜底互踩
+            // 风险，权衡见函数注释）
             crate::fs_utils::app_log(
                 data_dir,
-                "[doubao_checkin_results] record_day_at 跨进程锁 Busy，代理捕获路径降级进程内锁继续写（尽力不丢）",
+                "[doubao_checkin_results] record_day_at 跨进程锁 Busy，skip_on_busy=false 路径降级进程内锁继续写（尽力不丢）",
             );
             None
         }
