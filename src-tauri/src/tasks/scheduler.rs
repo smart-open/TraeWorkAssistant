@@ -163,6 +163,37 @@ const BUDDY_AI_CHECKIN_FAIL_STREAK_LIMIT: i64 = 3;
 /// Intl 刷新失败有意不标 needs_relogin（防误杀真实凭证），永久失效账号会每日 +
 /// 每 30 分钟重试——调度侧熔断：连续 3 轮全败当日暂停，次日自动恢复
 const BUDDY_AI_RENEW_FAIL_STREAK_LIMIT: i64 = 3;
+/// trae 签到瞬时冷却补打的连续轮上限（M2 收窄的空转封顶）：瞬时冷却 ≤10min 自愈，
+/// 本应下一 tick 补打；但非自愈型瞬时错误（如服务端对该账号恒回业务错误码）会
+/// 冷却→到期→再失败循环——无上限时全天逐 tick 重跑整轮（健康账号每轮预检
+/// status_check，~1440 轮/天），比旧 Err 退避链（~8-28 轮/天）放大两个数量级。
+/// 连续达上限（≈一个完整自愈窗口 ×2）按当日完成处理，回归退避链
+const TRANSIENT_SKIP_ROUND_CAP: u32 = 10;
+
+/// 瞬时冷却补打连续轮计数表（进程内记忆，调度线程单线程访问）。**模块级单例**：
+/// bump/reset 两函数必须共用同一张表（审查教训——函数局部 static 是彼此独立的
+/// 实例，写者与读者各持一张表则计数永远失效）
+fn transient_skip_streaks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    static STREAKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    > = std::sync::OnceLock::new();
+    STREAKS.get_or_init(|| std::sync::Mutex::new(Default::default()))
+}
+
+fn transient_skip_streak_bump(task_key: &str) -> u32 {
+    let mut m = transient_skip_streaks().lock().unwrap_or_else(|e| e.into_inner());
+    let n = m.entry(task_key.to_string()).or_insert(0);
+    *n += 1;
+    *n
+}
+
+fn transient_skip_streak_reset(task_key: &str) {
+    transient_skip_streaks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(task_key);
+}
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
 /// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
@@ -346,23 +377,49 @@ fn tick(
                 // 调度补打。skipped_busy 落日志（低频、值得留痕）；空轮纯静默
                 //（池空期间每 tick 触发，落日志会刷屏，对齐「空池静默空转」定调）
                 //
-                // 其余普通 skipped（含豆包/trae/wb/qoder 各任务空池 `{"ok":true,
-                // "skipped":"无 X 账号"}`，issue #147 口径）走 mark_run + 落日志——
-                // 有意取舍（定调）：这类任务无奖励属性、空池空转无收益，mark_run
-                // 关闭当日重复触发可防空转；当日新增账号次日生效可接受（需即刻
-                // 巡检可手动触发）。仅 buddy-ai 每日活跃打卡豁免（漏打=丢奖励），
-                // 新增空池任务若同属「漏跑=丢收益」语义，须改打 skipped_empty_pool
+                // 其余普通 skipped（含豆包额度巡检/保活、各池目录/快照/流水同步
+                // 任务空池 `{"ok":true,"skipped":"无 X 账号"}`，issue #147 口径）走
+                // mark_run + 落日志——有意取舍（定调）：这类任务无奖励属性、空池
+                // 空转无收益，mark_run 关闭当日重复触发可防空转；当日新增账号次日
+                // 生效可接受（需即刻巡检可手动触发）。奖励型签到任务豁免
+                //（漏跑=丢收益）：buddy-ai 每日活跃打卡、豆包/trae/wb/qoder 每日
+                // 签到空池改打 skipped_empty_pool，当日导入账号后下一 tick 正常
+                // 补打。新增空池任务若同属「漏跑=丢收益」语义，须同款豁免
                 if v.get("skipped_busy").is_some() {
                     fs_utils::app_log(
                         &st.data_dir,
                         &format!("[调度器] {}（{}）：{}（不记当日已跑，稍后重试）", t.name, trigger, summary),
                     );
+                // 审查修复 M2 收窄：skipped_transient_cooldown（trae-checkin 瞬时冷却
+                // 账号待补打，≤10min 自愈）同样不 mark_run——跳过≠完成，mark_run 会
+                // 固化「当日已跑」关闭当日重试链致冷却账号当日签到丢失；仅落日志，
+                // 下一 tick 冷却到期后补打（不触发当日首败通知，无通知成本）。
+                // 空转封顶（审查修复）：连续达上限按当日完成处理，防非自愈型瞬时
+                // 错误全天逐 tick 重跑整轮（健康账号每轮预检）
+                } else if v.get("skipped_transient_cooldown").is_some() {
+                    let n = transient_skip_streak_bump(t.key);
+                    if n >= TRANSIENT_SKIP_ROUND_CAP {
+                        transient_skip_streak_reset(t.key);
+                        mark_run(st, t.key, &today, &summary);
+                        fs_utils::app_log(
+                            &st.data_dir,
+                            &format!("[调度器] {}（{}）：连续 {n} 轮瞬时冷却未自愈，按当日完成处理（停止补打；如需排查请手动触发查看根因）", t.name, trigger),
+                        );
+                    } else {
+                        fs_utils::app_log(
+                            &st.data_dir,
+                            &format!("[调度器] {}（{}）：{}（不记当日已跑，下一 tick 补打）", t.name, trigger, summary),
+                        );
+                    }
                 // 审查 #15：skipped_empty_pool（buddy-ai 打卡空轮 / 豆包续期与巡检
                 // 空池或客户端缺失，本轮无账号参与）同样不 mark_run——mark_run 会写
                 // last_run_date=今日，当日新增账号不再被调度（补打窗口被吞）。仅记
                 // 日志；账号导入/客户端就绪后下一 tick 正常执行
                 } else if v.get("skipped_empty_pool").is_none() {
                     mark_run(st, t.key, &today, &summary);
+                    // 瞬时冷却补打计数复位：本轮已真实执行/记账（bump 与 cap 归零分离，
+                    // cap 触发路径自行复位；此处覆盖正常 done 路径）
+                    transient_skip_streak_reset(t.key);
                     fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
                     // 看板数据同步成功 → 通知前端重读缓存（issue #61 前端联动：
                     // Dashboard listen 后按 platform 匹配静默 refresh(false)，零额外网络）
@@ -389,6 +446,8 @@ fn tick(
                     }
                 };
                 mark_fail(st, t.key, &summary);
+                // Err 路径已回归退避链（重试按 30→60→120min 冷却）——瞬时补打计数复位
+                transient_skip_streak_reset(t.key);
                 // 退避窗口按实际分钟数展示（连续失败 30→60→120 分钟封顶）
                 let cooldown_min = (retry_cooldown_ms(st, t.key) / 60_000).max(1);
                 fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）失败，{cooldown_min} 分钟后重试：{}", t.name, trigger, summary));
@@ -517,25 +576,39 @@ fn run_task(
         //  AuthRejected=服务端拒绝认证（issue #128）/ DeviceSigned=设备当日去重）
         "trae-checkin" => {
             let accounts = crate::vault::load_accounts(st);
+            // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：签到漏跑
+            // =丢积分，mark_run 固化「当日已跑」会让当日导入账号失去调度补打——
+            // 空池提前返回 skipped_empty_pool，tick 不 mark_run、下一 tick 补打
+            if accounts.accounts.is_empty() {
+                return Ok(json!({ "ok": true, "skipped": "无 Trae 账号", "skipped_empty_pool": true }));
+            }
             let retry = st.settings().retry.max(0) as u32;
-            // 审查修复 M2：调度轮跳过冷却中账号（until > now，含 SessionDead/
-            // AuthRejected 永久冷却与 DeviceSigned 当日去重）——冷却账号每轮真实
-            // 请求只会再失败再冷却，对齐 UI 签到路径「冷却中跳过」口径
+            // 审查修复 M2：调度轮跳过冷却中账号（until > now）——冷却账号每轮真实
+            // 请求只会再失败再冷却，对齐 UI 签到路径「冷却中跳过」口径。
+            // M2 收窄（审查修复）：按冷却类型分流——仅长/永久冷却（SessionDead 吊销/
+            // AuthRejected 拒绝/DeviceSigned 当日去重/PlanLimit 12h）静默跳过；
+            // 瞬时冷却（SoftRate 60s/BusinessError 300s/Server 600s 等 ≤10min 自愈）
+            // 同样不参与本轮真实请求（避免无效失败再冷却），但以 skipped_transient_
+            // cooldown 标记交 tick 不 mark_run——否则 mark_run 固化「当日已跑」关闭
+            // 当日重试链，UI/CLI 手动尝试产生的瞬时冷却账号当日签到丢失（旧逻辑
+            // Err 重试自愈）。冷却 ≤10min，60s tick 重跑时自然到期补打
+            const LONG_COOLDOWN_TYPES: [&str; 4] =
+                ["SessionDead", "AuthRejected", "DeviceSigned", "PlanLimit"];
             let now_ts = chrono::Utc::now().timestamp();
-            let cooled: std::collections::HashSet<String> =
+            let cooled: std::collections::HashMap<String, crate::models::CooldownEntry> =
                 crate::store::docs::account_cooldowns_load(&crate::store::db(&st.data_dir))
-                    .cooldowns
-                    .into_iter()
-                    .filter(|(_, e)| e.until > now_ts)
-                    .map(|(uid, _)| uid)
-                    .collect();
+                    .cooldowns;
             let mut skipped_cooldown = 0usize;
+            let mut skipped_transient = 0usize;
             let active: Vec<_> = accounts
                 .accounts
                 .into_iter()
-                .filter(|a| match a.user_id.as_deref() {
-                    Some(uid) if cooled.contains(uid) => {
+                .filter(|a| match a.user_id.as_deref().and_then(|uid| cooled.get(uid)) {
+                    Some(e) if e.until > now_ts => {
                         skipped_cooldown += 1;
+                        if !LONG_COOLDOWN_TYPES.contains(&e.error_type.as_str()) {
+                            skipped_transient += 1;
+                        }
                         false
                     }
                     _ => true,
@@ -544,7 +617,7 @@ fn run_task(
             if skipped_cooldown > 0 {
                 crate::fs_utils::app_log(
                     &st.data_dir,
-                    &format!("Trae 签到：跳过 {skipped_cooldown} 个冷却中账号"),
+                    &format!("Trae 签到：跳过 {skipped_cooldown} 个冷却中账号（其中瞬时冷却 {skipped_transient}，本轮不参与待补打）"),
                 );
             }
             let mut events: Vec<Value> = Vec::new();
@@ -574,6 +647,17 @@ fn run_task(
                     "Trae 签到：{ok} 成功 / {already} 已签 / {retryable} 失败（稍后自动重试）"
                 ));
             }
+            // M2 收窄（审查修复）：存在瞬时冷却账号（本轮未参与）时不 mark_run——
+            // 打 skipped_transient_cooldown 标记交 tick 仅落日志，下一 tick 冷却
+            // 到期后补打（避免误触发当日首败通知，对齐 skipped_busy 口径）
+            if skipped_transient > 0 {
+                let mut v = done.clone();
+                v["skipped"] = json!(format!(
+                    "{skipped_transient} 个账号瞬时冷却中（≤10min 自愈），本轮跳过待补打"
+                ));
+                v["skipped_transient_cooldown"] = json!(true);
+                return Ok(v);
+            }
             Ok(done)
         }
         // WorkBuddy 每日签到：与 `--task-run wb-checkin` 同款；抢完整轮次锁（进程内 +
@@ -581,6 +665,18 @@ fn run_task(
         // 审查 P2：同 trae-checkin——可重试失败返 Err 交 30 分钟冷却重试；
         // 永久性凭证失败（需重新登录 / 无可用凭证，30 分钟内不会自愈）剔除出重试判定
         "wb-checkin" => {
+            // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：空池提前
+            // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）。
+            // 分支级早退而非任务层打标：wb 调度轮次会向前端转发 start/done 事件
+            //（issue #134 方案1），空池若仍每 tick 走整轮会向前端刷「成功 0」toast；
+            // 早退置于抢轮次锁之前——空轮不占锁，连击统计不动（空轮本就不变）。
+            // 池读取失败与空池分流（审查修复）：吞错版 wb_pool_load 会把读取失败
+            // 误判成空池、静默丢当日签到——读取失败走 Err 重试链（mark_fail 可见）
+            let pool = crate::store::docs::wb_pool_load_checked(&crate::store::db(&st.data_dir))
+                .map_err(|e| format!("WorkBuddy 池读取失败：{e}"))?;
+            if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
+                return Ok(json!({ "ok": true, "skipped": "无 WorkBuddy 账号", "skipped_empty_pool": true }));
+            }
             let _round = match crate::commands::workbuddy::try_acquire_wb_round("调度器签到", &st.data_dir) {
                 Ok(g) => g,
                 Err(why) => {
@@ -813,6 +909,15 @@ fn run_task(
         }
         // F-80 Qoder 每日签到：与 `--task-run qoder-checkin` 同款；抢轮次锁与 UI 路径互斥
         "qoder-checkin" => {
+            // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：空池提前
+            // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）；
+            // 早退置于抢轮次锁之前——空轮不占锁，连击/重试判定均不触及。
+            // 池读取失败与空池分流（审查修复）：读取失败走 Err 重试链，见 wb-checkin
+            let pool = crate::store::docs::qoder_pool_load_checked(&crate::store::db(&st.data_dir))
+                .map_err(|e| format!("Qoder 池读取失败：{e}"))?;
+            if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
+                return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号", "skipped_empty_pool": true }));
+            }
             // 抢不到轮次锁（UI 路径正在签到）= 幂等跳过而非失败：返 Err 会被调度器记
             // 当日首败并推送「签到失败」误报通知（签到本身未失败，UI 路径会照常完成）
             let Ok(_round) = crate::tasks::qoder_checkin::try_acquire_qoder_round() else {
@@ -1400,6 +1505,21 @@ mod tests {
         assert!(enabled(&st, "trae-renew"), "默认应启用续期任务");
     }
 
+    /// 瞬时冷却补打计数：bump/reset 必须共享同一张表（审查教训——usage.rs 曾因
+    /// 两函数各持函数局部 static 导致写者与读者分表、节流恒失效），且 reset 后
+    /// 重新从 1 起算
+    #[test]
+    fn transient_skip_streak_bump_reset_share_one_registry() {
+        let key = "transient-streak-test";
+        transient_skip_streak_reset(key);
+        assert_eq!(transient_skip_streak_bump(key), 1);
+        assert_eq!(transient_skip_streak_bump(key), 2);
+        assert_eq!(transient_skip_streak_bump(key), 3);
+        transient_skip_streak_reset(key);
+        assert_eq!(transient_skip_streak_bump(key), 1, "reset 后应重新起算");
+        transient_skip_streak_reset(key);
+    }
+
     /// 环境配置页可改：合法 HH:MM 覆盖内置默认
     #[test]
     fn effective_hhmm_follows_settings() {
@@ -1831,5 +1951,24 @@ mod tests {
         // 与打卡连击键位隔离：renew 连击不影响打卡门禁读数
         day_scoped_streak_save(&st, BUDDY_AI_RENEW_STREAK_KEY, &today, 3);
         assert_eq!(buddy_ai_checkin_streak(&st, &today), 0);
+    }
+
+    /// 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：trae/wb/qoder
+    /// 签到空池时 run_task 返回 skipped_empty_pool——tick 据此不 mark_run，当日
+    /// 导入账号下一 tick 正常补打；早退在轮次锁/网络请求之前，测试无副作用
+    #[test]
+    fn reward_checkin_empty_pool_exemption() {
+        for key in ["trae-checkin", "wb-checkin", "qoder-checkin"] {
+            let st = temp_state("reward_empty_pool");
+            let v = run_task(key, &st, None, &mut BuddyAiAcctFailStreaks::default(), None)
+                .expect("空池应为 Ok 跳过");
+            assert_eq!(
+                v.get("skipped_empty_pool").and_then(Value::as_bool),
+                Some(true),
+                "{key} 空池须打 skipped_empty_pool（否则 mark_run 固化当日已跑，当日导入账号丢补打）"
+            );
+            assert!(v.get("skipped").and_then(Value::as_str).is_some(), "{key} 空池须带跳过原因");
+            assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
+        }
     }
 }

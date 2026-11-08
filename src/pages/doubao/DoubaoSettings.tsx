@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FolderSearch, Save, Clock3, MapPin, ShieldCheck, RefreshCw, Timer, Coins, Database, CalendarCheck } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
@@ -22,7 +22,9 @@ export default function DoubaoSettings() {
   // ── 会话保活 ──
   const [renewUrl, setRenewUrl] = useState('');
   const [taskTime, setTaskTime] = useState('09:00');
-  const [taskState, setTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
+  // 'error'（审查修复：恢复基线 error 态——查询失败 ≠ 未注册，伪装成未注册会误导
+  // 用户重复注册；amber「状态未知」+ 重试按钮区分展示）
+  const [taskState, setTaskState] = useState<'loading' | 'registered' | 'not_registered' | 'error'>('loading');
   const [taskTimeShown, setTaskTimeShown] = useState('');
   const [running, setRunning] = useState(false);
   const [summary, setSummary] = useState<DoubaoRenewSummary | null>(null);
@@ -31,8 +33,15 @@ export default function DoubaoSettings() {
   const [quotaUrl, setQuotaUrl] = useState('');
   // ── 额度巡检定时任务 ──
   const [quotaTaskTime, setQuotaTaskTime] = useState('09:30');
-  const [quotaTaskState, setQuotaTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
+  const [quotaTaskState, setQuotaTaskState] = useState<'loading' | 'registered' | 'not_registered' | 'error'>('loading');
   const [quotaTaskTimeShown, setQuotaTaskTimeShown] = useState('');
+
+  // ── 额度数据同步（审查修复：恢复被误删的配置入口——后端 scheduler 仍注册
+  // doubao-sync 并消费 doubao_sync_mode/hours/hhmm，UI 缺失则存量配置不可见、
+  // 新用户无法关闭每 2h 远端同步）
+  const [syncMode, setSyncMode] = useState('every_hours');
+  const [syncHours, setSyncHours] = useState('2');
+  const [syncHhmm, setSyncHhmm] = useState('23:50');
 
   // ── 快照设置（C4：IndexedDB 可选纳入）──
   const [includeIdb, setIncludeIdb] = useState(false);
@@ -43,10 +52,14 @@ export default function DoubaoSettings() {
 
   // ── 每日签到任务 ──
   const [checkinTaskTime, setCheckinTaskTime] = useState('09:15');
-  const [checkinTaskState, setCheckinTaskState] = useState<'loading' | 'registered' | 'not_registered'>('loading');
+  const [checkinTaskState, setCheckinTaskState] = useState<'loading' | 'registered' | 'not_registered' | 'error'>('loading');
   const [checkinTaskTimeShown, setCheckinTaskTimeShown] = useState('');
   const [checkinRunning, setCheckinRunning] = useState(false);
   const [checkinEnabled, setCheckinEnabled] = useState(true);
+  // 输入框对齐真实注册时刻（审查修复：恢复基线防呆——已注册 15:00 的用户打开页面
+  // 直接点注册会以初始 09:15 覆盖既有计划任务）；编辑中/聚焦中不打回
+  const checkinTimeDirtyRef = useRef(false);
+  const checkinTaskTimeInputRef = useRef<HTMLInputElement>(null);
   // 应用内签到调度时刻（doubao_checkin_hhmm）：独立于 Windows 计划任务时间可改。
   // checkinHhmm = 已保存生效值；checkinHhmmDraft = 输入草稿（合法才提交保存）
   const [checkinHhmm, setCheckinHhmm] = useState('09:15');
@@ -54,6 +67,10 @@ export default function DoubaoSettings() {
   // probe 自动保活开关（main 2026-11-06，方案 A，默认开）：签到前 probe 缺失/过期时自动
   // 开代理 + 切客户端抓包对齐（710010702 设备指纹缺失的自愈链）
   const [probeAutoKeepalive, setProbeAutoKeepalive] = useState(true);
+  // 回填一次性守卫（审查复核新发现）：下方 effect 依赖任一 settings key 变化都会重跑
+  //（如签到时刻保存成功），若每次重跑都回填，会把用户在 path/renewUrl/quotaUrl 等
+  // 输入框中未保存的编辑打回后端值——回填只在 settings 首次到达时执行一次
+  const backfillDoneRef = useRef(false);
 
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
@@ -124,16 +141,29 @@ export default function DoubaoSettings() {
 
   // 应用内签到调度时刻（doubao_checkin_hhmm）：草稿态输入，合法 HH:MM 才落盘，
   // 调度器下轮生效（与上方开关同款模式）。受控直存会在清空/中间态瞬间把
-  // 已保存值回写输入框（用户改不了时刻），故拆 draft 与已保存值
+  // 已保存值回写输入框（用户改不了时刻），故拆 draft 与已保存值。
+  // 审查修复：保存失败回滚已落 UI 的时刻（对齐 toggle* 失败回滚模式）+
+  // 序号守卫（连续快速改两个时刻时乱序落库只认最后一次输入，防 UI 与库内值分叉）
+  const checkinHhmmSaveSeqRef = useRef(0);
+  // 最后落库成功值（审查修复：回滚目标不再取「UI 上一值」——连续两次保存均失败时
+  // 上一值也可能是未落库草稿，回滚会驻留错误值）
+  const checkinHhmmSavedRef = useRef('09:15');
   const saveCheckinHhmm = (v: string) => {
     setCheckinHhmmDraft(v);
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) return;
+    const seq = ++checkinHhmmSaveSeqRef.current;
     setCheckinHhmm(v);
     void (async () => {
       try {
         await saveSettings({ doubao_checkin_hhmm: v });
-      } catch (err) {
-        pushToast('error', `保存签到调度时刻失败：${String(err)}`);
+        checkinHhmmSavedRef.current = v;
+      } catch {
+        // 仅最后一次输入的失败执行回滚（乱序完成时旧请求不打回新值）；
+        // store.saveSettings 失败时已 pushToast 错误详情，此处不再重复弹
+        if (seq === checkinHhmmSaveSeqRef.current) {
+          setCheckinHhmm(checkinHhmmSavedRef.current);
+          setCheckinHhmmDraft(checkinHhmmSavedRef.current);
+        }
       }
     })();
   };
@@ -160,6 +190,57 @@ export default function DoubaoSettings() {
     }
   };
 
+  // 额度数据同步（doubao-sync）：模式 + 间隔/时刻一并保存；后端归一化（间隔 clamp 1..24）。
+  // 审查修复：恢复被误删的配置入口（后端调度器仍按 doubao_sync_mode 运行）。
+  // 校验失败/保存失败一律回弹已保存值（store 中 settings 即最后成功落库值），
+  // 防输入框驻留非法草稿与「已保持原值」文案自相矛盾（审查修复）
+  const saveSyncConfig = async (patch: { doubao_sync_mode?: string; doubao_sync_hours?: string; doubao_sync_hhmm?: string }) => {
+    try {
+      await saveSettings(patch);
+      return true;
+    } catch {
+      // store.saveSettings 失败时已 pushToast 错误详情，此处不再重复弹（审查修复：双重 toast）
+      return false;
+    }
+  };
+  const savedSyncHours = settings?.doubao_sync_hours ?? '2';
+  const savedSyncHhmm = settings?.doubao_sync_hhmm ?? '23:50';
+  const changeSyncMode = async (v: string) => {
+    const prev = syncMode;
+    setSyncMode(v);
+    if (await saveSyncConfig({ doubao_sync_mode: v })) {
+      pushToast('success', v === 'off' ? '已关闭豆包数据同步' : '同步模式已保存');
+    } else {
+      setSyncMode(prev); // 保存失败回滚：防 select 显示与库内值分叉
+    }
+  };
+  const changeSyncHours = async (v: string) => {
+    setSyncHours(v);
+    if (!/^\d+$/.test(v.trim())) {
+      pushToast('warn', '同步间隔应为 1-24 的整数（已保持原值）');
+      setSyncHours(savedSyncHours);
+      return;
+    }
+    const n = Number.parseInt(v.trim(), 10);
+    if (n < 1 || n > 24) {
+      pushToast('warn', '同步间隔应为 1-24 的整数（已保持原值）');
+      setSyncHours(savedSyncHours);
+      return;
+    }
+    if (await saveSyncConfig({ doubao_sync_hours: String(n) })) pushToast('success', `同步间隔已保存（每 ${n} 小时）`);
+    else setSyncHours(savedSyncHours);
+  };
+  const changeSyncHhmm = async (v: string) => {
+    setSyncHhmm(v);
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(v)) {
+      pushToast('warn', '时间格式应为 HH:MM（如 23:50，已保持原值）');
+      setSyncHhmm(savedSyncHhmm);
+      return;
+    }
+    if (await saveSyncConfig({ doubao_sync_hhmm: v })) pushToast('success', `同步时刻已保存（每日 ${v}）`);
+    else setSyncHhmm(savedSyncHhmm);
+  };
+
   const refreshTaskStatus = async () => {
     try {
       const s = await api.doubao.taskStatus();
@@ -170,7 +251,7 @@ export default function DoubaoSettings() {
         setTaskState('not_registered');
       }
     } catch {
-      setTaskState('not_registered');
+      setTaskState('error'); // 查询失败 ≠ 未注册：置 error 态避免误导用户重复注册
     }
   };
 
@@ -184,7 +265,7 @@ export default function DoubaoSettings() {
         setQuotaTaskState('not_registered');
       }
     } catch {
-      setQuotaTaskState('not_registered');
+      setQuotaTaskState('error'); // 同上：后端故障与未注册区分展示
     }
   };
 
@@ -192,30 +273,48 @@ export default function DoubaoSettings() {
     try {
       const s = await api.doubao.checkinTaskStatus();
       if (s.startsWith('registered:')) {
+        const shown = s.slice('registered:'.length);
         setCheckinTaskState('registered');
-        setCheckinTaskTimeShown(s.slice('registered:'.length));
+        setCheckinTaskTimeShown(shown);
+        // 输入框对齐真实注册时刻（审查修复：恢复基线防呆——settings 漂移/默认值
+        // 09:15 与 schtasks 实际注册时刻（如 15:00）各说各话，直接点注册会覆盖）；
+        // 用户正在编辑（脏标记或输入框聚焦中）时不打回
+        if (/^([01]\d|2[0-3]):([0-5]\d)$/.test(shown)) {
+          if (!checkinTimeDirtyRef.current && document.activeElement !== checkinTaskTimeInputRef.current) {
+            setCheckinTaskTime(shown);
+          }
+        }
       } else {
         setCheckinTaskState('not_registered');
       }
     } catch {
-      setCheckinTaskState('not_registered');
+      setCheckinTaskState('error'); // 同上：后端故障与未注册区分展示
     }
   };
 
   useEffect(() => {
-    if (settings?.doubao_path) setPath(settings.doubao_path);
-    if (settings?.doubao_renew_url) setRenewUrl(settings.doubao_renew_url);
-    if (settings?.doubao_quota_url) setQuotaUrl(settings.doubao_quota_url);
-    if (settings) {
+    // 回填一次性（backfillDoneRef）：依赖任一 settings key 变化都会重跑本 effect，
+    // 文本输入（path/renewUrl/quotaUrl）的回填只应跟随 settings 首次到达，
+    // 重跑会覆盖用户未保存的编辑；开关/时刻类回填同理——它们各自有保存函数
+    // 即时落库，后端值即用户意图，回打无益
+    if (settings && !backfillDoneRef.current) {
+      backfillDoneRef.current = true;
+      if (settings.doubao_path) setPath(settings.doubao_path);
+      if (settings.doubao_renew_url) setRenewUrl(settings.doubao_renew_url);
+      if (settings.doubao_quota_url) setQuotaUrl(settings.doubao_quota_url);
       setIncludeIdb(!!settings.doubao_snapshot_include_idb);
       // !== false：旧版后端缺字段时按默认开展示（issue #147 新字段向后兼容）
       setKeepaliveEnabled(settings.doubao_keepalive_enabled !== false);
       setQuotaEnabled(settings.doubao_quota_enabled !== false);
       setCheckinEnabled(settings.doubao_checkin_enabled !== false);
       setProbeAutoKeepalive(settings.doubao_probe_auto_keepalive !== false);
+      if (settings.doubao_sync_mode) setSyncMode(settings.doubao_sync_mode);
+      if (settings.doubao_sync_hours) setSyncHours(settings.doubao_sync_hours);
+      if (settings.doubao_sync_hhmm) setSyncHhmm(settings.doubao_sync_hhmm);
       if (settings.doubao_checkin_hhmm) {
         setCheckinHhmm(settings.doubao_checkin_hhmm);
         setCheckinHhmmDraft(settings.doubao_checkin_hhmm);
+        checkinHhmmSavedRef.current = settings.doubao_checkin_hhmm;
       }
     }
     // 审查修复（P2）：schtasks 状态查询仅 Windows 发起——mac 上后端恒 Err，
@@ -345,6 +444,7 @@ export default function DoubaoSettings() {
     }
     try {
       await api.doubao.checkinTaskRegister(checkinTaskTime);
+      checkinTimeDirtyRef.current = false; // 注册成功：复位脏标记，随后的 refresh 恢复「按真实注册时刻回填收敛」
       await refreshCheckinTaskStatus();
       pushToast('success', `每日签到任务已注册（每日 ${checkinTaskTime}）`);
     } catch (err) {
@@ -365,22 +465,21 @@ export default function DoubaoSettings() {
   const runCheckinNow = async () => {
     setCheckinRunning(true);
     try {
-      // 返回契约（合并审查 D-M1 修正）：后端 run_batch 在 failed>0 时返回 Err
-      //（"豆包签到：N 成功 / N 已领 / N 失败：…"），部分成功走 catch；ok 载荷
-      // 仅在全部成功/已签时到达：{ ok, total, success, already, failed, reward_total, finished_at }
+      // 返回契约：batch → { ok, total, success, already, failed, reward_total, errors, finished_at }；
+      // 后端 run_batch 在 failed>0 时返回 Err（"豆包签到：N 成功 / N 已领 / N 失败：…"），
+      // 部分成功走 catch；空池 → { ok, skipped: "无豆包账号", skipped_empty_pool: true }
+      //（奖励型任务豁免，调度器对后者不 mark_run；前端双字段统一判定）
       const r = (await api.doubao.checkinRun()) as {
         skipped?: string;
-        /** 空池豁免口径（后端 run_batch：空池不返 skipped，防调度器 mark_run 固化当日已跑） */
-        skipped_empty_pool?: string;
+        skipped_empty_pool?: boolean;
         total?: number;
         success?: number;
         already?: number;
         failed?: number;
         reward_total?: number;
       };
-      const skippedMsg = r.skipped ?? r.skipped_empty_pool;
-      if (skippedMsg) {
-        pushToast('info', `签到跳过：${skippedMsg}`);
+      if (r.skipped ?? r.skipped_empty_pool) {
+        pushToast('info', `签到跳过：${r.skipped ?? '无豆包账号'}`);
       } else {
         pushToast(
           'success',
@@ -513,6 +612,14 @@ export default function DoubaoSettings() {
               </>
             )}
             {taskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+            {taskState === 'error' && (
+              <>
+                <Badge tone="amber">状态未知</Badge>
+                <button onClick={() => void refreshTaskStatus()} className="btn-ghost">
+                  重试
+                </button>
+              </>
+            )}
           </div>
 
           {/* 应用内每日调度开关（issue #147）：关闭后不再每日拉起客户端；无账号/客户端缺失时自动跳过 */}
@@ -638,6 +745,46 @@ export default function DoubaoSettings() {
             </button>
           </div>
 
+          {/* 额度数据同步（doubao-sync 调度任务；审查修复：恢复被误删的配置入口——
+              后端 scheduler 仍注册并消费 doubao_sync_mode/hours/hhmm，UI 缺失则
+              存量用户自定义配置不可见、新用户无法关闭默认每 2h 的远端同步） */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="shrink-0 text-slate-500">数据同步</span>
+            <select
+              value={syncMode}
+              onChange={(e) => void changeSyncMode(e.target.value)}
+              className="input w-40 text-xs"
+            >
+              <option value="every_hours">按间隔同步</option>
+              <option value="daily_at">每日定时同步</option>
+              <option value="off">关闭同步</option>
+            </select>
+            {syncMode === 'every_hours' && (
+              <>
+                <span className="shrink-0 text-slate-500">间隔（小时）</span>
+                <input
+                  value={syncHours}
+                  onChange={(e) => setSyncHours(e.target.value)}
+                  onBlur={(e) => void changeSyncHours(e.target.value)}
+                  placeholder="1-24"
+                  className="input w-16 text-xs"
+                />
+              </>
+            )}
+            {syncMode === 'daily_at' && (
+              <>
+                <span className="shrink-0 text-slate-500">时刻</span>
+                <input
+                  value={syncHhmm}
+                  onChange={(e) => setSyncHhmm(e.target.value)}
+                  onBlur={(e) => void changeSyncHhmm(e.target.value)}
+                  placeholder="HH:MM"
+                  className="input w-20 text-xs"
+                />
+              </>
+            )}
+          </div>
+
           {/* 每日额度巡检任务（schtasks 仅 Windows；mac 隐藏） */}
           <div className={`flex flex-wrap items-center gap-2 ${platform !== 'windows' ? 'hidden' : ''}`}>
             <span className="shrink-0 text-slate-500">每日巡检</span>
@@ -659,6 +806,14 @@ export default function DoubaoSettings() {
               </>
             )}
             {quotaTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+            {quotaTaskState === 'error' && (
+              <>
+                <Badge tone="amber">状态未知</Badge>
+                <button onClick={() => void refreshQuotaTaskStatus()} className="btn-ghost">
+                  重试
+                </button>
+              </>
+            )}
           </div>
 
           {/* 应用内每日巡检调度开关（issue #147） */}
@@ -704,7 +859,11 @@ export default function DoubaoSettings() {
             <span className="shrink-0 text-slate-500">每日任务</span>
             <input
               value={checkinTaskTime}
-              onChange={(e) => setCheckinTaskTime(e.target.value)}
+              onChange={(e) => {
+                checkinTimeDirtyRef.current = true; // 用户编辑中：refresh 不再按注册时刻打回
+                setCheckinTaskTime(e.target.value);
+              }}
+              ref={checkinTaskTimeInputRef}
               placeholder="HH:MM"
               className="input w-24 text-xs"
             />
@@ -720,6 +879,14 @@ export default function DoubaoSettings() {
               </>
             )}
             {checkinTaskState === 'not_registered' && <Badge tone="slate">未注册</Badge>}
+            {checkinTaskState === 'error' && (
+              <>
+                <Badge tone="amber">状态未知</Badge>
+                <button onClick={() => void refreshCheckinTaskStatus()} className="btn-ghost">
+                  重试
+                </button>
+              </>
+            )}
           </div>
 
           {/* 应用内每日签到调度开关 */}

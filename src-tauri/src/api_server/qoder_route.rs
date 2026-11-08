@@ -939,13 +939,17 @@ fn run_qoder_stream(
             // （指纹拦截）才标记，TTL 600s 内同池新请求激进清洗起步，不再从零试探
             super::wb_payload::mark_channel_fp_block("qoder", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
             let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
-            state.logger.log_debug_line(format!(
-                "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} cut_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
-                tried.len(),
-                attempts,
-                empty_hits,
-                cut_hits,
-            ));
+            // 与取号耗尽/非流式收尾同门控（审查修复 L 同构）：空注记不再落调试行，
+            // 流式/非流式日志口径一致
+            if !sample_note.is_empty() {
+                state.logger.log_debug_line(format!(
+                    "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} cut_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
+                    tried.len(),
+                    attempts,
+                    empty_hits,
+                    cut_hits,
+                ));
+            }
             // 审查修复（M）：错误帧按客户端协议分流（对齐下方取号耗尽收尾
             // send_stream_error 口径）——Anthropic 客户端收 event: error、
             // Responses 收 response.failed，不再硬编码 OpenAI data: 帧形态

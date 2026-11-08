@@ -1432,6 +1432,17 @@ pub fn wb_pool_load(s: &Store) -> Value {
     json!({ "accounts": accounts })
 }
 
+/// 读整池（可失败口径，调度器空池早退专用）：rows_all 错误原样上抛，用于区分
+/// 「池为空」与「池读取失败」——吞错版会把读取失败误判成空池、静默丢当日签到
+pub fn wb_pool_load_checked(s: &Store) -> Result<Value, String> {
+    let accounts: Vec<Value> = s
+        .rows_all("wb_accounts")?
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    Ok(json!({ "accounts": accounts }))
+}
+
 /// 写整池（对齐原「整文件写回」语义；pk = 账号 id，缺 id 用序号占位）
 pub fn wb_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
     let empty = Vec::new();
@@ -2042,7 +2053,7 @@ pub fn doubao_checkin_results_try_load(
     let rows = s
         .with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT day, uid, name, status, reward, updated_at FROM doubao_checkin_results ORDER BY day, uid",
+                "SELECT day, uid, name, status, reward, message, updated_at FROM doubao_checkin_results ORDER BY day, uid",
             )?;
             let rows = stmt
                 .query_map([], |r| {
@@ -2052,17 +2063,18 @@ pub fn doubao_checkin_results_try_load(
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, Option<i64>>(4)?,
-                        r.get::<_, String>(5)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, String>(6)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
         .ok()?;
-    for (day, uid, name, status, reward, updated_at) in rows {
+    for (day, uid, name, status, reward, message, updated_at) in rows {
         days.entry(day).or_default().accounts.insert(
             uid,
-            crate::doubao_checkin_results::AccountResult { name, status, reward, updated_at },
+            crate::doubao_checkin_results::AccountResult { name, status, reward, message, updated_at },
         );
     }
     Some(crate::doubao_checkin_results::ResultsFile { days })
@@ -2082,11 +2094,11 @@ pub fn doubao_checkin_results_save(
         )?;
         {
             let mut stmt = c.prepare(
-                "INSERT OR REPLACE INTO doubao_checkin_results(day, uid, name, status, reward, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR REPLACE INTO doubao_checkin_results(day, uid, name, status, reward, message, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for (day, rec) in &f.days {
                 for (uid, a) in &rec.accounts {
-                    stmt.execute(rusqlite::params![day, uid, a.name, a.status, a.reward, a.updated_at])?;
+                    stmt.execute(rusqlite::params![day, uid, a.name, a.status, a.reward, a.message, a.updated_at])?;
                 }
             }
         }
@@ -2334,6 +2346,16 @@ pub fn qoder_pool_load(s: &Store) -> Value {
         .map(|(_, data)| data)
         .collect();
     json!({ "accounts": accounts })
+}
+
+/// 读整池（可失败口径，调度器空池早退专用）：语义同 wb_pool_load_checked
+pub fn qoder_pool_load_checked(s: &Store) -> Result<Value, String> {
+    let accounts: Vec<Value> = s
+        .rows_all("qoder_accounts")?
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    Ok(json!({ "accounts": accounts }))
 }
 
 /// 写整池（pk = 账号 id，缺 id 用序号占位）

@@ -983,11 +983,13 @@ fn try_capture_doubao_campaign(
                         crate::doubao_checkin_results::record_day_at(
                             &ctx.data_dir,
                             [(
-                                crate::doubao_checkin_results::today_key(),
                                 uid.clone(),
                                 name,
                                 status.to_string(),
                                 reward,
+                                // 代理捕获为 success/already 形态，失败原因无从产生
+                                None,
+                                crate::doubao_checkin_results::today_key(),
                             )],
                             false,
                         );

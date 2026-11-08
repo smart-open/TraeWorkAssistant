@@ -1,8 +1,7 @@
 use serde::Serialize;
 use std::collections::HashMap;
-// Windows 直启链专用（mac 走 `open` bundle 启动，不经 Command）
-#[cfg(not(target_os = "macos"))]
-use std::process::Command;
+// 客户端启动统一经 platform::cmd::sys_command_path 收口（F-75 红线：禁止散写
+// Command::new；Windows 自动获得 CREATE_NO_WINDOW，mac 走 `open` bundle 启动）
 // Windows 直启链 stdio 静默专用（mac 启动走 `open`，不经 Command）
 #[cfg(not(target_os = "macos"))]
 use std::process::Stdio;
@@ -117,7 +116,7 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let mut cmd = Command::new(&exe);
+        let mut cmd = crate::platform::cmd::sys_command_path(std::path::Path::new(&exe));
         if let Some(port) = proxy_port {
             cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
         }
@@ -147,7 +146,8 @@ fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
         if changed {
             current[key] = serde_json::json!(exe);
         }
-        Ok(())
+        // 回调返回 Ok(false)（无变化）时 kv_update 空转提交不写盘
+        Ok::<_, String>(changed)
     }) {
         fs_utils::app_log(
             &state.data_dir,
@@ -486,7 +486,7 @@ fn launch_doubao(state: &State<AppState>, exe: &str, proxy_port: Option<u16>) ->
     if proxy_port.is_some() {
         crate::commands::process::graceful_kill_app("Doubao")?;
     }
-    let mut cmd = Command::new(exe);
+    let mut cmd = crate::platform::cmd::sys_command_path(std::path::Path::new(exe));
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
@@ -568,7 +568,7 @@ fn launch_buddy(exe: String, display: &str, proxy_port: Option<u16>) -> Result<(
 /// Buddy 启动平台分派（Windows：分离启动，行为零变化）
 #[cfg(not(target_os = "macos"))]
 fn launch_buddy(exe: String, display: &str, proxy_port: Option<u16>) -> Result<(), String> {
-    let mut cmd = Command::new(exe);
+    let mut cmd = crate::platform::cmd::sys_command_path(std::path::Path::new(&exe));
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }

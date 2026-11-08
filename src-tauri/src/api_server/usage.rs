@@ -504,28 +504,47 @@ pub fn load(data_dir: &Path) -> UsageFile {
     // 测试各用独立临时目录，首查仍会执行。当日新写入数据由记账侧当日单行
     // upsert / 流水 insert 保证不越期，无「当日行未被裁剪」窗口
     if prune_should_run(data_dir) {
-        let _ = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+        // 审查修复：三个 prune 全部成功才写当日 DONE 标记——任一 DELETE 失败
+        // （磁盘/锁故障）下次 load 即重试，不再等次日（失败时过期数据滞留窗口
+        // 从最长 24h 收敛到下次统计刷新）
+        let r1 = crate::store::docs::api_usage_prune(&crate::store::db(data_dir), RETENTION_DAYS);
         // issue #82 问题5：Qoder 会话流水与 api_usage 同口径保留期裁剪（启动一次）
-        let _ = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+        let r2 = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
         // issue #149 P2：Custom 会话流水同口径保留期裁剪（启动一次）
-        let _ = crate::store::docs::custom_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+        let r3 = crate::store::docs::custom_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+        if r1.is_ok() && r2.is_ok() && r3.is_ok() {
+            mark_prune_done(data_dir);
+        }
     }
     f
 }
 
-/// 保留期裁剪当日节流判定（同目录同日只跑一轮；进程内记忆，重启即重跑无持久态）
-fn prune_should_run(data_dir: &Path) -> bool {
+/// prune 当日 DONE 标记表（**模块级**单例，prune_should_run / mark_prune_done 共用）。
+/// 审查修复：原两函数各自持函数局部 static——函数局部 static 是彼此独立的实例，
+/// mark_prune_done 写入的表 prune_should_run 永远读不到 → 节流恒失效，load 每次
+/// 都执行 3 个 prune DELETE（load 处于统计查询热路径，用量页刷新/切天数即触发）
+fn prune_done_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>> {
     static DONE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
     > = std::sync::OnceLock::new();
-    let done = DONE.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    DONE.get_or_init(|| std::sync::Mutex::new(Default::default()))
+}
+
+/// 保留期裁剪当日节流判定（同目录同日只跑一轮；进程内记忆，重启即重跑无持久态）。
+/// 注意：本函数只做「到期判定」，DONE 标记由调用方在全部 prune 成功后经
+/// mark_prune_done 写入（失败当日不写标记，下次 load 重试）
+fn prune_should_run(data_dir: &Path) -> bool {
     let today = chrono::Local::now().date_naive().to_string();
-    let mut m = done.lock().unwrap_or_else(|e| e.into_inner());
-    if m.get(data_dir).map(|d| d.as_str()) == Some(today.as_str()) {
-        return false;
-    }
+    let m = prune_done_registry().lock().unwrap_or_else(|e| e.into_inner());
+    m.get(data_dir).map(|d| d.as_str()) != Some(today.as_str())
+}
+
+/// 全部 prune 成功后写入当日 DONE 标记（与 prune_should_run 共享同一进程内表）
+fn mark_prune_done(data_dir: &Path) {
+    let today = chrono::Local::now().date_naive().to_string();
+    let mut m = prune_done_registry().lock().unwrap_or_else(|e| e.into_inner());
     m.insert(data_dir.to_path_buf(), today);
-    true
 }
 
 /// 持久化当日单行（flusher 记账削峰路径：单行 UPSERT 替代原整表 DELETE+重插）。
@@ -748,6 +767,18 @@ pub fn query_recent_in(data_dir: &Path, days: u32, bucket: UsageBucket) -> Vec<U
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// prune 当日节流：mark_prune_done 写入后 prune_should_run 同日必须判否——
+    /// 两函数曾各持函数局部 static（彼此独立的实例），标记恒读不到导致 load 每次
+    /// 重跑 3 个 prune DELETE（统计查询热路径）；回归门：共享表修复后判定成立
+    #[test]
+    fn prune_throttle_mark_and_check_share_one_registry() {
+        let key = std::env::temp_dir().join(format!("prune-reg-test-{}", std::process::id()));
+        // 清场防同进程重跑（进程内表键只此一测试使用，正常仅跑一次）
+        mark_prune_done(&key);
+        mark_prune_done(&key); // 幂等：重复标记不报错
+        assert!(!prune_should_run(&key), "标记后同日应判定为已跑");
+    }
 
     #[test]
     fn record_aggregates_dimensions() {

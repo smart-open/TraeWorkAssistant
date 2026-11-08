@@ -832,11 +832,15 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
     let store = crate::store::db(&state.data_dir);
     store.kv_update("app_settings", |current| {
         let Some(patch_obj) = patch.as_object() else {
-            return Ok(());
+            return Ok::<_, String>(false);
         };
+        // 合并前快照：回调返回合并前后是否实际变化——patch 键全部被校验 continue
+        // 跳过 / 清洗后与存量相同时不触发写盘（对齐 kv_update Ok(false) 空转语义）；
+        // 须在 as_object_mut 可变借用前克隆（借用检查）
+        let before = current.clone();
         // kv_update 已保证为对象；非对象形态在锁内不可达，let-else 仅类型收窄
         let Some(current_obj) = current.as_object_mut() else {
-            return Ok(());
+            return Ok(false);
         };
         for (k, v) in patch_obj {
             // 调度时刻防御性校验：空 hhmm 的既有语义是「从未配置」（state.rs 据此回填
@@ -871,7 +875,7 @@ pub fn settings_set(state: State<AppState>, patch: serde_json::Value) -> Result<
             }
             current_obj.insert(k.clone(), v.clone());
         }
-        Ok(())
+        Ok(*current != before)
     })
 }
 

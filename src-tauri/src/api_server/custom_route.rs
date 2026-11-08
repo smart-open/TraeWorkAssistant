@@ -101,9 +101,12 @@ fn make_custom_request(cm: &CustomModel, body: &[u8]) -> Result<Box<dyn std::io:
 
 /// probe 专用 agent（B3）：独立连接池 + 全程短超时，不复用主路径 custom_agent
 /// （空闲读 300s 的连接池宿主——探测借用会受慢上游陈旧连接拖累，且命令层
-/// 30s 外部超时仅兜底不精准）。连接 5s / 读 10s（对齐网关首字超时口径）/ 写 10s
+/// 30s 外部超时仅兜底不精准）。连接 5s / 读 10s（对齐网关首字超时口径）/ 写 10s；
+/// 整体 20s 上限（审查修复）：分段空闲超时可被慢滴上游（每 <10s 滴一字节）
+/// 无限续期，无整体上限时 spawn_blocking 线程可在命令层 30s 超时后长期存活
 fn probe_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(20))
         .timeout_read(std::time::Duration::from_secs(10))
         .timeout_write(std::time::Duration::from_secs(10))
         .timeout_connect(std::time::Duration::from_secs(5))

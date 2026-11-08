@@ -637,6 +637,13 @@ fn apply_prev_proxy(enable: bool, server: &str, bypass: &str) -> Result<(), Stri
         // 其余服务 off 清接管残留（capture_proxy_snapshot_services 记录的清单）
         crate::platform::proxy_ctl::restore_system_proxy_services(enable, server, bypass)
     }
+    // 兜底占位（审查修复）：与 cert.rs 口径对齐——项目仅声明 Win/mac 目标，
+    // 但双 cfg 变体在其余目标下函数体为空与 Result 签名不符（E0308）
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (enable, server, bypass);
+        Err("当前平台不支持系统代理还原".into())
+    }
 }
 
 /// 还原系统代理（#14 提取共用）：启动前存在启用的外部代理（用户 VPN 梯子）→ 原样

@@ -41,6 +41,17 @@ pub(crate) static POOL_CFG_LOCK: Mutex<()> = Mutex::new(());
 /// 句柄」之间的 TOCTOU——并发双启动此前会双双通过检查。占位失败方直接报已运行。
 static DO_START_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 启动闸门 unwind 复位守卫（审查修复）：do_start_inner panic 时 Drop 仍复位
+/// DO_START_GATE——否则闸门永久 true，重启应用前所有启动报「已在运行或正在启动」
+///（对齐同文件 reconciler 的 panic 自愈口径）
+struct StartGateReset;
+
+impl Drop for StartGateReset {
+    fn drop(&mut self) {
+        DO_START_GATE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// 启动本地 LLM 网关服务（带 TOCTOU 闸门包装，见 DO_START_GATE）。
 /// 成功后同步托盘菜单文本并发送系统通知。
 pub async fn do_start(
@@ -51,8 +62,9 @@ pub async fn do_start(
     if DO_START_GATE.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Err("API 服务已在运行或正在启动".into());
     }
+    let _gate = StartGateReset;
     let out = do_start_inner(app, state, runtime).await;
-    DO_START_GATE.store(false, std::sync::atomic::Ordering::SeqCst);
+    drop(_gate);
     out
 }
 
@@ -233,7 +245,8 @@ async fn do_start_inner(
         ),
     );
 
-    // Buddy 池策略：wb_strategy 独立配置优先；空 = 跟随 Trae 池（与 pool_set 热应用逻辑一致）
+    // Buddy 池策略：wb_strategy 独立配置优先；空 = 加权公平轮转 fair_rotation（WB
+    // 专属默认，PR #187；与 pool_set 热应用逻辑一致）
     let wb_strategy = crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy);
     let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -251,7 +264,7 @@ async fn do_start_inner(
     wb_pool.set_strategy(wb_strategy);
 
     // Qoder 池启动概况（p3-3 + 池内策略）：开关默认 false，未启用时不产生告警噪音；
-    // qoder_strategy 空 = 跟随 Trae 池策略（与 Buddy 池 resolve_wb 同语义）
+    // qoder_strategy 空 = 跟随 Trae 池策略（wb_strategy 已改公平轮转专属默认，不在此列）
     let qoder_strategy =
         crate::api_server::pool::PoolStrategy::resolve_qoder(&pool_file.strategy, &pool_file.qoder_strategy);
     qoder_pool.set_strategy(qoder_strategy);
@@ -265,8 +278,8 @@ async fn do_start_inner(
         ),
     );
 
-    // buddy-ai 国际池启动概况（池内策略：buddy_ai_strategy 空 = 跟随 Trae 池，
-    // 与 Buddy/Qoder 池同语义；开关默认 false，未启用时不产生告警噪音）
+    // buddy-ai 国际池启动概况（池内策略：buddy_ai_strategy 空 = 跟随 Trae 池，与 Qoder
+    // 池同语义——wb_strategy 已改公平轮转专属默认，不在此列；开关默认 false，未启用时不产生告警噪音）
     let buddy_ai_strategy = crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
         &pool_file.strategy,
         &pool_file.buddy_ai_strategy,
@@ -1243,7 +1256,7 @@ fn merge_pool_set(
     qoder_uids: Option<Vec<String>>,
     // Qoder 池分组筛选（共享分组 shg_ 前缀 id）；None = 保留原值
     qoder_group_ids: Option<Vec<String>>,
-    // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
+    // Qoder 池内调度策略；空串 = 跟随 Trae 池（wb_strategy 已改公平轮转专属默认，不在此列）；None = 保留原值
     qoder_strategy: Option<String>,
     trae_enabled: Option<bool>,
     // buddy-ai（国际版）显式会话粘性开关 + 池粘性 TTL（§4.2）；None = 保留原值

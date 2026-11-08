@@ -586,28 +586,32 @@ fn collect_targets(state: &AppState) -> Result<Vec<(String, String, Option<Strin
 }
 
 /// 落库 + 池回写 + 运维历史（batch/single 共用收尾）。
-/// skip_on_busy（审查修复）：批量调度/CLI 轮次传 true（同批他方进程完成写入即可
-/// 覆盖，幂等跳过无损失）；手动单账号传 false——GUI 手动签到与另一进程批次并发
-/// 时两批内容不保证相同，跳过可能把手动 success 丢成 fail，降级进程内锁继续写。
-fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_busy: bool) {
+/// skip_on_busy 语义见 record_day_at：task 批量传 true（调度器/CLI 双进程并发时
+/// 他方必完成同批写入，幂等跳过无损失）；manual 单账号传 false——GUI 手动签到与
+/// CLI 批次并发时两批内容不保证相同，Busy 跳过会把手动签到结果丢成 fail，
+/// 降级进程内锁继续写（池回写进程内锁保护，不受影响）。
+/// 返回 false = 当日记录未落库（Busy 跳过/读库中止，语义见 record_day_at）——
+/// 批量调用方据此改打 skipped_busy 交调度器不 mark_run、下一轮补录。
+fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_busy: bool) -> bool {
     // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）。
-    // day 取各 outcome 产生时刻（run_one 内打点），落库跨零点不串日；
-    // 旧记录无 day 字段时回退当前日期
+    // day 取 outcome 产生时刻打点（跨零点批次各归各日）；旧 outcome 无 day 回退当日。
+    // message 仅 fail 携带（失败原因落库，切页/重开后日历明细仍可排障）——
+    // success/already 的 message 恒为固定成功文案，落库只增体积无价值
+    let today = crate::doubao_checkin_results::today_key();
     let entries = outcomes.iter().map(|o| {
         (
-            o.get("day")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(crate::doubao_checkin_results::today_key),
             o.get("uid").and_then(Value::as_str).unwrap_or("").to_string(),
             o.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             o.get("status").and_then(Value::as_str).unwrap_or("fail").to_string(),
             o.get("reward").and_then(Value::as_i64),
+            (o.get("status").and_then(Value::as_str) == Some("fail"))
+                .then(|| clamp_fail_message(o.get("message").and_then(Value::as_str)))
+                .flatten(),
+            o.get("day").and_then(Value::as_str).unwrap_or(&today).to_string(),
         )
     });
-    // skip_on_busy=true：调度器批次落库，他方（CLI/另一进程同轮）Busy 时必然
-    // 完成同批写入，幂等跳过无损失
-    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries, skip_on_busy);
+    // skip_on_busy 由调用方按来源决定（task 批量=true / manual 单账号=false，见函数注释）
+    let day_recorded = crate::doubao_checkin_results::record_day_at(&state.data_dir, entries, skip_on_busy);
 
     // ② 池回写（两阶段短临界区：重读最新池按 uid 合并）
     let run_at = fs_utils::now_ts();
@@ -653,7 +657,7 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_
         }
     }
 
-    // ③ 运维历史（逐账号，kind="checkin"）
+    // ③ 运维历史（逐账号，kind="checkin"；summary 同款钳制防多行日志干扰）
     for o in outcomes {
         let ok = o.get("status").and_then(Value::as_str) != Some("fail");
         append_history(
@@ -661,14 +665,31 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_
             json!({
                 "ts": fs_utils::now_ts(), "kind": "checkin", "uid": o.get("uid"), "ok": ok,
                 "status": o.get("status"), "reward": o.get("reward"),
-                "summary": o.get("message"), "source": source,
+                "summary": clamp_fail_message(o.get("message").and_then(Value::as_str)),
+                "source": source,
             }),
         );
     }
+    day_recorded
+}
+
+/// 失败原因落库/入历史前的钳制（审查修复）：截断 500 字符 + 剔除控制字符——
+/// 防上游异常文案把按日表（365 天窗口全量反序列化是看板成本敏感路径）撑爆、
+/// 防多行内容干扰日志 grep（日志注入面）；前端 toast 已另截 80 字符
+fn clamp_fail_message(v: Option<&str>) -> Option<String> {
+    v.filter(|m| !m.is_empty())
+        .map(|m| {
+            m.chars()
+                .filter(|c| !c.is_control())
+                .take(500)
+                .collect::<String>()
+        })
 }
 
 /// 批量签到（调度器/CLI `--task-run doubao-checkin`）：遍历池内有凭证账号 → 签到 →
-/// 按日落库 + 池回写 + 运维历史 → 汇总。空池跳过（对齐 doubao-quota 惯例）。
+/// 按日落库 + 池回写 + 运维历史 → 汇总。空池打 skipped_empty_pool（奖励型任务豁免，
+/// 见 scheduler tick 对该键不 mark_run 的注释）——签到漏跑=丢收益，mark_run 固化
+/// 「当日已跑」会让当日导入的账号失去调度补打。
 /// 跨进程轮次锁（对齐 wb-checkin try_acquire_wb_round 先例）：GUI 调度器与
 /// schtasks CLI 双进程互斥；Busy 幂等跳过、机制性失败 fail-closed。
 pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Value, String> {
@@ -694,15 +715,22 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
     };
     let targets = collect_targets(state)?;
     // probe 自动保活（方案 A，2026-11-06）：probe 缺失/过期 → 自动开客户端抓包对齐；
-    // 失败仅记日志，签到照常走既有 probe 链（缺失回退内置稳定参数）
-    if let Err(e) = super::doubao_probe::ensure_fresh_probes(state, app, &targets) {
-        fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
-    }
+    // 失败仅记日志，签到照常走既有 probe 链（缺失回退内置稳定参数——该形态大概率被
+    // 上游风控拒）。2026-11-07 可观测性：错误透传到返回值/汇总 Err，前端批量签到
+    // 失败时用户能直接看到「抓包参数未对齐」这一根因，不再只看到笼统失败
+    let probe_keepalive_error: Option<String> =
+        match super::doubao_probe::ensure_fresh_probes(state, app, &targets) {
+            Ok(()) => None,
+            Err(e) => {
+                fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
+                Some(e)
+            }
+        };
     if targets.is_empty() {
         // skipped_empty_pool（审查修复）：签到是奖励型任务（漏跑=丢收益），普通
         // skipped 会被调度器 mark_run 固化「当日已跑」，当日导入账号失去补打窗口；
         // 对齐同批 doubao-quota / doubao-keepalive 的 #15 空池豁免口径
-        return Ok(json!({ "ok": true, "skipped_empty_pool": "无豆包账号" }));
+        return Ok(json!({ "ok": true, "skipped": "无豆包账号", "skipped_empty_pool": true }));
     }
 
     let agent = http_agent(TIMEOUT_SECS);
@@ -718,7 +746,7 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
         let probe = load_campaign_probe(&state.data_dir, Some(sid));
         outcomes.push(run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref()));
     }
-    persist_outcomes(state, &outcomes, "task", true);
+    let day_recorded = persist_outcomes(state, &outcomes, "task", true);
 
     let success = outcomes
         .iter()
@@ -755,7 +783,9 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
             .iter()
             .take(3)
             .filter_map(|e| {
-                e.get("error").and_then(Value::as_str).map(|m| {
+                // 汇总文案同款钳制（审查修复）：errors 数组保原始 message 供前端
+                // 展示，Err 字符串走 CLI 退出输出/通知渠道，超长多行文案会污染两者
+                clamp_fail_message(e.get("error").and_then(Value::as_str)).map(|m| {
                     format!(
                         "{}：{}",
                         e.get("name").and_then(Value::as_str).unwrap_or("未知账号"),
@@ -765,39 +795,57 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
             })
             .collect::<Vec<_>>()
             .join("；");
+        let probe_hint = probe_keepalive_error
+            .as_deref()
+            .map(|e| format!("；此外抓包参数自动保活未完成（{e}），本次签到未对齐客户端指纹，易被风控拒绝——请开启代理并保持豆包客户端打开后重试"))
+            .unwrap_or_default();
         return Err(format!(
-            "豆包签到：{success} 成功 / {already} 已领 / {failed} 失败：{err_head}"
+            "豆包签到：{success} 成功 / {already} 已领 / {failed} 失败：{err_head}{probe_hint}"
         ));
     }
 
-    Ok(json!({
+    let mut ret = json!({
         "ok": true, "mode": "all",
         "total": outcomes.len(), "success": success, "already": already, "failed": failed,
         "reward_total": reward_total,
         "errors": errors,
+        "probe_keepalive_error": probe_keepalive_error,
         "finished_at": fs_utils::now_ts(),
-    }))
+    });
+    if !day_recorded {
+        // Busy 落库跳过（审查修复）：本轮签到已实际执行但当日记录未落库——打
+        // skipped_busy 交调度器不 mark_run，下一 tick 重跑补录（账号已签→already，
+        // 幂等）；若固化 mark_run 会「结果丢了且当日已跑」双重损失。字段仅在
+        // true 时存在（tick 按字段存在性分流，恒置 false 会误入 busy 分支）。
+        // 文案不承诺「自动补录」：调度器开启时由下一 tick 补录，GUI 手动路径
+        // 需用户稍后重试（签到幂等，重试只回 already，无重复奖励）
+        ret["skipped_busy"] = json!(true);
+        ret["skipped"] = json!("签到结果落库被其他进程占用，本轮结果未记录；稍后重试签到即可补录");
+    }
+    Ok(ret)
 }
 
 /// 单账号签到（应用内手动路径）：读池凭证 → probe 保活 → run_one → 落库/回写/历史
 pub fn checkin_single(state: &AppState, app: Option<&tauri::AppHandle>, uid: &str) -> Result<Value, String> {
     let targets = collect_targets(state)?;
-    let Some(found) = targets.iter().find(|(u, _, _, _)| u == uid) else {
+    // 首查绑定目标引用复用，消除同谓词二次 find(...).unwrap()（let-else 已保证存在）
+    let Some(target) = targets.iter().find(|(u, _, _, _)| u == uid) else {
         return Err(format!("账号 {uid} 不在账号池中或未录入 sessionid 凭证"));
     };
-    let (_, sid, sg, name) = found;
-    // probe 自动保活（方案 A）：本账号 probe 缺失/过期 → 自动开客户端抓包（失败照常签到）
-    // （审查清理：复用首查绑定 found，消除对同一不可变 Vec 的二次 find+unwrap）
-    if let Err(e) = super::doubao_probe::ensure_fresh_probes(
-        state,
-        app,
-        std::slice::from_ref(found),
-    ) {
-        fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
-    }
+    let (_, sid, sg, name) = target;
+    // probe 自动保活（方案 A）：本账号 probe 缺失/过期 → 自动开客户端抓包（失败照常签到，
+    // 错误透传 probe_keepalive_error 供前端提示根因）
+    let probe_keepalive_error =
+        match super::doubao_probe::ensure_fresh_probes(state, app, std::slice::from_ref(target)) {
+            Ok(()) => None,
+            Err(e) => {
+                fs_utils::app_log(&state.data_dir, &format!("[probe-keepalive] 保活未完成: {e}"));
+                Some(e)
+            }
+        };
     let agent = http_agent(TIMEOUT_SECS);
-    // 本账号 probe（内部含「本账号键→全局键」两级回退；审查清理：删除外层
-    // or_else 全局兜底死分支——与 run_batch 同口径）
+    // 回退语义由 load_campaign_probe 内部保证（本账号键 → 全局键两级回退，与
+    // run_batch 同口径）；外层再 or_else 全局查询属死分支（内部已试过全局键）
     let probe = load_campaign_probe(&state.data_dir, Some(sid));
     let outcome = run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref());
     persist_outcomes(state, std::slice::from_ref(&outcome), "manual", false);
@@ -805,6 +853,7 @@ pub fn checkin_single(state: &AppState, app: Option<&tauri::AppHandle>, uid: &st
     Ok(json!({
         "ok": ok,
         "outcome": outcome,
+        "probe_keepalive_error": probe_keepalive_error,
         "finished_at": fs_utils::now_ts(),
     }))
 }

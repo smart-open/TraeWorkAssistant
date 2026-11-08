@@ -257,8 +257,9 @@ fn fetch_campaigns(
 
 /// 拉取活动列表（**全量，不过滤**）。返回 Ok(全量 campaign 列表)；
 /// Err(kind, message)：auth（401，调用方刷新重试）| fail。
-/// 全量返回的原因：列表内 CLAIMED grant 是「每日奖励已领取」的判定数据源
-///（daily_credits_claimed_in_list），CLAIMABLE 过滤交给调用方（filter_claimable）。
+/// 全量返回的原因：列表内 CLAIMED grant 是「已领候选」的判定数据源
+///（daily_credits_claimed_grant，命中后重发 claim 服务端裁决），CLAIMABLE
+/// 过滤交给调用方（filter_claimable）。
 fn list_campaigns(
     state: &AppState,
     agent: &ureq::Agent,
@@ -345,23 +346,49 @@ fn filter_claimable(campaigns: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// 「每日 100 Credits」已领判定（纯函数，**从严**口径——宁 fail 不假 already）：
-/// 列表中存在同时满足以下**全部**条件的条目才算已领：
-/// - campaignId ∈ allowed_ids（审查 F8 收窄：同日窗口可能存在多个 CREDITS 活动，
-///   他活动已领、每日活动未领时宽匹配会误判 already 跳过领取；候选 id 由调用方
-///   从 learned 重学 + KNOWN 常量表合成。未命中不假 already——落入盲发兜底
-///   幂等直领，replayed 回放如实归类，行为安全）
+/// claim_one status==0 网络丢失路径「复查确认已领取」的固定 message（审查修复
+/// 提取为常量）：reclaim_list_claimed_grant 靠它区分「真回放 already」与「网络
+/// 丢失复查恒真 already」——两处必须同源，改文案只改本常量，杜绝裸字符串漂移
+const CLAIM_RECHECK_CONFIRMED_MSG: &str = "claim 网络异常，复查确认已领取";
+
+/// 「每日活动」候选 id 全集（统一口径，审查修复）：learned 重学 ∪ table（conf
+/// 覆盖表 ∪ KNOWN 内置表）——与盲发候选源（known_daily_fallback 装配的
+/// candidates）同源。
+fn daily_allowed_ids(learned: &[(String, String)], table: &[(String, String)]) -> Vec<String> {
+    learned
+        .iter()
+        .chain(table.iter())
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// 「每日 100 Credits」已领**候选**判定（纯函数，从严口径）：返回列表中同时满足
+/// 以下**全部**条件的 grant 条目（命中即候选已领，交调用方重发 claim 做服务端
+/// 裁决，**不在本层直接定 already**——issue #193）：
+/// - campaignId ∈ allowed_ids（与盲发候选源同源）：注（审查复核）——learn_daily_
+///   campaign_ids 不要求 claimStatus，同列表条目的 id 必然已入 learned → 本收窄
+///   对同列表条目过滤力为零（他活动 CLAIMED grant 仍可命中候选）；「他活动回放
+///   误短路」的防护由调用方承担——already 分支不短路、盲发兜底再裁决（见
+///   process_account 两处 match 的 already 分支注释）
 /// - claimStatus == CLAIMED（大小写宽容）
 /// - actionType == CLAIM_BENEFIT（排除 bogo 类 VIEW_DETAILS「只看不领」活动）
 /// - benefit.kind == CREDITS（每日 100 Credits 活动的奖励类型）
-/// - startAt <= now <= endAt（当日窗口内；字段缺失视为不命中——昨日的
-///   CLAIMED grant 无条件展示在列表里，没有窗口校验会把昨日已领误判今日已领）
-fn daily_credits_claimed_in_list(
+/// - startAt <= now <= endAt（窗口内；字段缺失视为不命中——窗口外的 CLAIMED
+///   grant 无条件展示在列表里，没有窗口校验会把过期已领误判当前已领）
+///
+/// 为什么不能只凭本函数定 already（issue #193 实证）：campaignId 按活动批次
+/// 轮换（一批数日窗口同批同 id，见 KNOWN_DAILY_CAMPAIGNS 注释），若 grant 的
+/// startAt/endAt 是批次级窗口，批次内首日领取后其余日期列表均可见 CLAIMED 且
+/// 窗口命中——纯列表判定会把「昨日（批次内早先）已领」误判为「今日已领」，
+/// 直接短路 already 后当天真实领取从未发生，积分不到账。故命中后必须对
+/// campaignId 幂等重发 claim：服务端回放（replayed=true）才算真已领，返回
+/// 新领取（CLAIMED+!replayed）则说明列表记录陈旧/未入账，本次真实到账。
+fn daily_credits_claimed_grant(
     campaigns: &[Value],
     now_secs: i64,
     allowed_ids: &[String],
-) -> bool {
-    campaigns.iter().any(|c| {
+) -> Option<Value> {
+    campaigns.iter().find_map(|c| {
         let cid = s_of(fs_utils::dig(c, &["campaignId", "campaign_id"]));
         let id_ok = !cid.is_empty() && allowed_ids.iter().any(|a| a == &cid);
         let claimed =
@@ -379,23 +406,84 @@ fn daily_credits_claimed_in_list(
             (Some(s), Some(e)) => now_secs >= s && now_secs <= e,
             _ => false,
         };
-        id_ok && claimed && action && credits && in_window
+        (id_ok && claimed && action && credits && in_window).then(|| c.clone())
     })
 }
 
-/// 「每日活动」候选 id 全集（统一口径，审查修复）：learned 重学 ∪ table（conf
-/// 覆盖表 ∪ KNOWN 内置表）——与盲发候选源（known_daily_fallback 装配的
-/// candidates）同源。此前已领快路径（daily_credits_claimed_in_list）只取
-/// learned+KNOWN，conf 表独有 id 时漏配、多一次徒劳盲发；抽公共函数防再分叉。
-fn daily_allowed_ids(
-    learned: &[(String, String)],
-    table: &[(String, String)],
-) -> Vec<String> {
-    learned
-        .iter()
-        .chain(table.iter())
-        .map(|(id, _)| id.clone())
-        .collect()
+/// 列表 CLAIMED grant 候选的复核领取（issue #193 服务端权威化）：对命中条目的
+/// campaignId 幂等重发 claim（`claim_one`，重复领取返回 replayed=true 回放、
+/// 无副作用），由服务端裁决真已领 / 记录陈旧。返回 (kind, message, reward, detail)：
+/// - replayed=true → 服务端确曾记录当前周期领取 → already（附回放证据文案）；
+/// - CLAIMED+!replayed → 列表 CLAIMED 记录陈旧（批次窗口误判），本次真实
+///   领取成功 → success（调用方既有到账校验 + 积分回写照常生效），并落
+///   app_log 留存「列表已领判定误判」实证；第 4 元携逐活动明细（档期日历）；
+/// - fail/409 等 → grant 已失效或网络异常 → 降级 fail 并落 app_log（宁 fail
+///   不假 already，保留调度器自动重试）；
+/// - auth → 原样上抛（调用方 401 自愈路径处理）。
+/// reclaim 真实到账（success）的逐活动明细条目（与 campaigns_log 同构，档期
+/// 日历数据源——缺失会导致日历主场景无 chips/dots，见 FallbackOutcome::Success）。
+fn reclaim_detail_entry(entry: &Value, reward: Option<f64>) -> Value {
+    let cid = s_of(fs_utils::dig(entry, &["campaignId", "campaign_id"]));
+    let cname = s_of(fs_utils::dig(
+        entry,
+        &["name", "title", "campaignName", "campaign_name"],
+    ));
+    json!({
+        "id": cid.clone(),
+        "name": if cname.is_empty() { cid } else { cname },
+        "kind": "success",
+        "reward": reward,
+    })
+}
+
+fn reclaim_list_claimed_grant(
+    state: &AppState,
+    agent: &ureq::Agent,
+    min_token: &str,
+    urls: &QoderUrls,
+    entry: &Value,
+    aid: &str,
+) -> (String, String, Option<f64>, Option<Vec<Value>>) {
+    let (k, m, r) = claim_one(agent, min_token, urls, entry);
+    match k.as_str() {
+        "already" if m == CLAIM_RECHECK_CONFIRMED_MSG => {
+            // claim_one status==0 网络丢失路径：候选本就 CLAIMED，复查恒真，
+            // 无法区分幂等回放与请求丢失——降级 fail 交盲发兜底/调度重试
+            //（宁 fail 不假 already，与本分支口径一致；reward 一并置 None 防
+            // 回放奖励沿 fail 载荷外泄）。落 app_log 留痕（网络抖动高频误判
+            // 可据此观测）
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[qoder] 列表 CLAIMED grant 复核遇网络丢失复查恒真 already: {aid}\
+                     （降级 fail 保留盲发兜底/自动重试）"
+                ),
+            );
+            ("fail".into(), m, None, None)
+        }
+        "already" => ("already".into(), format!("每日奖励已领取：{m}"), r, None),
+        "success" => {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[qoder] 列表 CLAIMED grant 重发 claim 实际领取成功: {aid}\
+                     （列表已领判定误判，issue #193；积分到账校验照常执行）"
+                ),
+            );
+            (k, m, r, Some(vec![reclaim_detail_entry(entry, r)]))
+        }
+        "auth" => (k, m, r, None),
+        _ => {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[qoder] 列表 CLAIMED grant 重发 claim 未回放: {aid}: {m}\
+                     （issue #193：grant 疑跨批次窗口/记录陈旧，降级 fail 保留自动重试）"
+                ),
+            );
+            ("fail".into(), m, r, None)
+        }
+    }
 }
 
 /// 复查判定（纯函数，可单测）：campaigns 列表中是否存在 campaignId 匹配且
@@ -504,7 +592,7 @@ fn claim_one(
         if recheck_claimed(agent, &headers, urls, &campaign_id) {
             return (
                 "already".into(),
-                "claim 网络异常，复查确认已领取".into(),
+                CLAIM_RECHECK_CONFIRMED_MSG.into(),
                 known_reward,
             );
         }
@@ -624,7 +712,7 @@ fn learned_entry_from(c: &Value) -> Option<(String, String)> {
 /// 工具请求形态过滤的是 **CLAIMABLE 状态**，活动条目本身（actionType/benefit/
 /// 窗口/campaignId）照常返回（已领 grant 无条件展示即是例证），足以反推出当日 id。
 ///
-/// 口径（对齐 daily_credits_claimed_in_list 但**不要求 claimStatus**——
+/// 口径（对齐 daily_credits_claimed_grant 但**不要求 claimStatus**——
 /// CLAIMED/CLAIMABLE/未领均为有效候选，保证零 CLAIMABLE 时仍能学到 id）：
 /// actionType == CLAIM_BENEFIT && benefit.kind == CREDITS && startAt <= now <= endAt。
 fn learn_daily_campaign_ids(campaigns: &[Value], now_secs: i64) -> Vec<(String, String)> {
@@ -1329,7 +1417,7 @@ fn fallback_with_relearn(
     outcome
 }
 
-/// 盲发兜底结果 → (kind, message, reward, campaigns_detail) 统一映射（4 处调用点
+/// 盲发兜底结果 → (kind, message, reward, campaigns_detail) 统一映射（6 处调用点
 /// 共用；第 4 元为本分支 FallbackOutcome 携带的逐活动明细（F-80-余 档期日历数据源，
 /// macos_main 适配：main 版仅 3 元会丢明细），空/无明细归一为 None，由调用方赋值
 /// 或并入既有 campaigns_detail）。
@@ -1338,8 +1426,10 @@ fn fallback_with_relearn(
 /// 抑制照旧），兜底详情追加在原消息之后而非整体替换（fail_kind 派生与空表
 /// app_log 诊断均按 starts_with 前缀判定，原消息在前不受影响；试领 409/503
 /// 详情透出后，候选池诊断 contains CAMPAIGN_NOT_ACTIVE_TAG 在空表路径恢复
-/// 可见）；`None`：零 CLAIMABLE 路径——Failed 直接归 fail，不掩盖（2026-10-07
-/// 误报「已领（此前已领）」修复点的延续口径）。
+/// 可见；issue #193 起第二个调用形态是列表 CLAIMED grant 重发复核 fail——
+/// 原分类 k 恒为 fail（复核消息在前），语义与空表路径同构）；`None`：零
+/// CLAIMABLE 路径——Failed 直接归 fail，不掩盖（2026-10-07 误报
+/// 「已领（此前已领）」修复点的延续口径）。
 fn run_fallback(
     state: &AppState,
     agent: &ureq::Agent,
@@ -1487,23 +1577,64 @@ fn process_account(
             if claimable.is_empty() {
                 // 列表零 CLAIMABLE：campaigns 列表对工具请求形态按投放过滤
                 // CLAIMABLE 条目（已领 grant 无条件展示）。两步定真话：
-                // ① 先查列表内当日「每日 100 Credits」CLAIMED grant（服务端对
-                //    已领无条件展示，命中即真实 already，不发起多余请求）；
-                // ② 否则盲发每日活动兜底直领（learned 重学 id 优先 + 硬编码表
-                //    兜底），结果如实归类（Failed 不再归 already——2026-10-07
-                //    误报「已领（此前已领）」的修复点）
+                // ① 先查列表内窗口命中的「每日 100 Credits」CLAIMED grant 候选，
+                //    对其幂等重发 claim 做服务端裁决（issue #193）：回放→真已领，
+                //    新领取→列表记录陈旧（批次窗口误判）本次真实到账，失败→降级
+                //    fail 保留自动重试——不再凭列表 claimStatus 直接短路 already
+                //    （campaignId 批次内多日同 id，跨天窗口会把早先已领误判今日）；
+                // ② 无候选或复核 fail 时盲发每日活动兜底直领（learned 重学 id
+                //    优先 + 硬编码表兜底），结果如实归类（Failed 不再归 already
+                //    ——2026-10-07 误报「已领（此前已领）」的修复点）
                 let now = chrono::Utc::now().timestamp();
                 // 候选 id 全集 = learned 重学 ∪ conf 覆盖表 ∪ KNOWN 内置表（与盲发
-                // 候选源同口径，审查修复：原仅 learned+KNOWN 会让 conf 独有 id 的
-                // 已领快路径漏配，落入盲发多一次徒劳 claim POST）
-                let allowed_ids = daily_allowed_ids(learned, table);
-                if daily_credits_claimed_in_list(&campaigns, now, &allowed_ids) {
-                    ("already".into(), "每日奖励已领取".into(), None)
-                } else {
-                    let (fk, fm, fr, fd) =
-                        run_fallback(state, agent, &min_token, &urls, learned, table, None);
-                    campaigns_detail = fd;
-                    (fk, fm, fr)
+                // 候选源同口径）。注（审查复核）：learn_daily_campaign_ids 不要求
+                // claimStatus，同列表条目的 id 必然刚被学进 learned——id 收窄对同列表
+                // 条目过滤力为零（防他活动误短路由下方 already 分支的兜底再裁决承担）
+                let reclaimed =
+                    daily_credits_claimed_grant(&campaigns, now, &daily_allowed_ids(learned, table))
+                        .map(|entry| {
+                            reclaim_list_claimed_grant(state, agent, &min_token, &urls, &entry, &aid)
+                        });
+                match reclaimed {
+                    Some((ref k, ref m, _, _)) if k == "fail" => {
+                        // 复核失败（409 过期/网络异常等）：盲发兜底再试一轮，
+                        // 全 miss 才维持 fail（原复核消息保留在前供排障）
+                        let (fk, fm, fr, fd) = run_fallback(
+                            state, agent, &min_token, &urls, learned, table,
+                            Some((k.as_str(), m.as_str())),
+                        );
+                        campaigns_detail = fd;
+                        (fk, fm, fr)
+                    }
+                    Some((ref k, ref m, r, d)) if k == "success" => {
+                        // 复核实为列表记录陈旧、本次真实到账（#193 核心路径）：
+                        // 补逐活动明细（缺失会导致日历无 chips/dots）
+                        campaigns_detail = d;
+                        (k.clone(), m.clone(), r)
+                    }
+                    Some((ref k, ref m, r, _)) if k == "already" => {
+                        // 复核已领（服务端回放）只对该 campaignId 成立——候选命中
+                        // 可能是同窗口他 CREDITS 活动（id 收窄同列表学习自我抵消，
+                        // 见上方注释），他活动已领回放 ≠ 每日活动已领，不得据此短路：
+                        // 盲发兜底再裁决一次（claim 幂等，真已领时回放归 already，
+                        // 每日活动未领则真实到账归 success）。兜底全 miss 归 fail 时
+                        // 保留复核 already 口径（无物可领，避免重试噪声）
+                        let (fk, fm, fr, fd) =
+                            run_fallback(state, agent, &min_token, &urls, learned, table, None);
+                        campaigns_detail = fd;
+                        if fk == "fail" {
+                            (k.clone(), m.clone(), r)
+                        } else {
+                            (fk, fm, fr)
+                        }
+                    }
+                    Some(res) => (res.0, res.1, res.2), // 仅剩 auth：原样上抛接 401 刷新闭环
+                    None => {
+                        let (fk, fm, fr, fd) =
+                            run_fallback(state, agent, &min_token, &urls, learned, table, None);
+                        campaigns_detail = fd;
+                        (fk, fm, fr)
+                    }
                 }
             } else {
                 let mut kind = String::new();
@@ -1622,27 +1753,83 @@ fn process_account(
                         }
                         let claimable = filter_claimable(&campaigns);
                         if claimable.is_empty() {
-                            // 与首次路径同口径：先查列表内当日已领 grant，再盲发
+                            // 与首次路径同口径（issue #193 服务端权威化）：列表
+                            // CLAIMED grant 候选重发幂等 claim 裁决，复核失败再盲发
                             // 兜底直领（learned 优先），失败如实归 fail（不掩盖）
                             let now = chrono::Utc::now().timestamp();
-                            // 与首次路径同口径：候选 id 全集 = learned ∪ table ∪ KNOWN
-                            let allowed_ids = daily_allowed_ids(learned, table);
-                            if daily_credits_claimed_in_list(&campaigns, now, &allowed_ids) {
-                                ("already".into(), "每日奖励已领取".into(), None)
-                            } else {
-                                let (fk, fm, fr, fd) = run_fallback(
-                                    state, agent, &min_token, &urls, learned, table, None,
-                                );
-                                // 兜底明细并入 campaigns_detail（保留 401 前已收部分，
-                                // 与非空分支的 retry_log 合并同口径）
-                                campaigns_detail = match (campaigns_detail.take(), fd) {
-                                    (Some(mut prev), Some(d)) => {
-                                        prev.extend(d);
-                                        Some(prev)
+                            let reclaimed = daily_credits_claimed_grant(
+                                &campaigns, now, &daily_allowed_ids(learned, table),
+                            )
+                            .map(|entry| {
+                                reclaim_list_claimed_grant(
+                                    state, agent, &min_token, &urls, &entry, &aid,
+                                )
+                            });
+                            match reclaimed {
+                                Some((ref k, ref m, _, _)) if k == "fail" => {
+                                    let (fk, fm, fr, fd) = run_fallback(
+                                        state, agent, &min_token, &urls, learned, table,
+                                        Some((k.as_str(), m.as_str())),
+                                    );
+                                    // 兜底明细并入 campaigns_detail（保留 401 前已收部分，
+                                    // 与非空分支的 retry_log 合并同口径）
+                                    campaigns_detail = match (campaigns_detail.take(), fd) {
+                                        (Some(mut prev), Some(d)) => {
+                                            prev.extend(d);
+                                            Some(prev)
+                                        }
+                                        (prev, d) => prev.or(d),
+                                    };
+                                    (fk, fm, fr)
+                                }
+                                Some((ref k, ref m, r, d)) if k == "success" => {
+                                    // 复核真实到账：明细并入 campaigns_detail（保留
+                                    // 401 前已收部分，同上方合并口径）
+                                    campaigns_detail = match (campaigns_detail.take(), d) {
+                                        (Some(mut prev), Some(e)) => {
+                                            prev.extend(e);
+                                            Some(prev)
+                                        }
+                                        (prev, e) => prev.or(e),
+                                    };
+                                    (k.clone(), m.clone(), r)
+                                }
+                                Some((ref k, ref m, r, _)) if k == "already" => {
+                                    // 与首次路径同口径（见上方 already 分支注释）：复核
+                                    // 已领不得短路每日活动领取，盲发兜底再裁决；兜底全
+                                    // miss 归 fail 时保留复核 already 口径防重试噪声
+                                    let (fk, fm, fr, fd) = run_fallback(
+                                        state, agent, &min_token, &urls, learned, table, None,
+                                    );
+                                    // 兜底明细并入 campaigns_detail（保留 401 前已收部分，
+                                    // 与非空分支的 retry_log 合并同口径）
+                                    campaigns_detail = match (campaigns_detail.take(), fd) {
+                                        (Some(mut prev), Some(d)) => {
+                                            prev.extend(d);
+                                            Some(prev)
+                                        }
+                                        (prev, d) => prev.or(d),
+                                    };
+                                    if fk == "fail" {
+                                        (k.clone(), m.clone(), r)
+                                    } else {
+                                        (fk, fm, fr)
                                     }
-                                    (prev, d) => prev.or(d),
-                                };
-                                (fk, fm, fr)
+                                }
+                                Some(res) => (res.0, res.1, res.2), // 仅剩 auth：接 401 后续闭环
+                                None => {
+                                    let (fk, fm, fr, fd) = run_fallback(
+                                        state, agent, &min_token, &urls, learned, table, None,
+                                    );
+                                    campaigns_detail = match (campaigns_detail.take(), fd) {
+                                        (Some(mut prev), Some(d)) => {
+                                            prev.extend(d);
+                                            Some(prev)
+                                        }
+                                        (prev, d) => prev.or(d),
+                                    };
+                                    (fk, fm, fr)
+                                }
                             }
                         } else {
                             // kind 空串起步（对照首次路径）：全部 claim 失败时应判 fail
@@ -1802,9 +1989,27 @@ fn process_account(
     // fetched_at，expire 以快照为准不动（签到奖励不改变订阅/包到期）；未到账降级已置
     // reward=None 天然不回写；非 CREDITS 活动（BOGO 等）金额不进余额无法归因，
     // 不回写；差值兜底采信（reward 从余额差值派生）同样覆盖。网关未运行/CLI 传
-    // None 跳过（shared 为 None）
-    if all_credits {
+    // None 跳过（shared 为 None）。
+    // 审查修复（issue #193）：必须限 kind == "success"——重发裁决后 already
+    // （幂等回放）例行携带 reward=Some(100)，回放是「此前已入账」的回执而非
+    // 本轮新入账（工具当日先前 success 已拨过），再回写会重复拨高 qoder_pool
+    //（2h 快照才自愈）；原列表 already 路径 reward 恒 None 掩盖了此耦合。
+    // 二次审查修复：混合轮（success+already 并存）轮级 reward 累计仍含回放奖励
+    //（claim_one 对 CLAIMABLE 条目也可能返回 replayed already+reward）——回写
+    // 金额从明细扣除 already 条目的奖励（差值钳 0，防浮点噪声转负），纯 already
+    // 轮 kind 门控已拦；明细缺失回落轮级累计（盲发兜底单条 success 无回放混杂）
+    if kind == "success" && all_credits {
+        let replayed: f64 = campaigns_detail
+            .as_ref()
+            .map(|es| {
+                es.iter()
+                    .filter(|e| e.get("kind").and_then(Value::as_str) == Some("already"))
+                    .filter_map(|e| e.get("reward").and_then(Value::as_f64))
+                    .sum()
+            })
+            .unwrap_or(0.0);
         if let (Some(shared), Some(r)) = (shared, reward) {
+            let r = (r - replayed).max(0.0);
             if r > 0.0 {
                 shared.qoder_pool.apply_credits_delta(&aid, r);
             }
@@ -2125,59 +2330,72 @@ mod tests {
         }
     }
 
-    /// 「每日 100 Credits」已领判定（从严口径）：campaignId ∈ 候选表 +
-    /// CLAIMED+CLAIM_BENEFIT+CREDITS+当日窗口全部命中才算已领——缺任一条件
-    /// 不得误判 already（宁 fail 不假 already；审查 F8 收窄后新增 id 白名单用例）
+    /// 「每日 100 Credits」已领候选判定（从严口径）：id ∈ 候选表 + CLAIMED+
+    /// CLAIM_BENEFIT+CREDITS+窗口全部命中才返回条目——缺任一条件不得视为候选
+    ///（宁 fail 不假 already）。命中只代表「候选」，是否真已领由重发 claim
+    /// 服务端裁决（#193）
     #[test]
     fn daily_credits_claimed_detection() {
         // act-20260930-664 当日窗口（startAt/endAt 取抓包实测值）
         let now = 1_791_380_000i64;
         let allowed = vec!["01a0f1cd-945c-7217-b373-f62e70da792d".to_string()];
-        // 完整命中 → 已领
+        // 完整命中 → 返回该条目（候选已领，交 reclaim 裁决）
         let hit = json!({
             "campaignId": "01a0f1cd-945c-7217-b373-f62e70da792d",
             "claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
             "benefit": {"kind": "CREDITS", "amount": 100},
             "startAt": 1_791_338_400, "endAt": 1_791_424_740,
         });
-        assert!(daily_credits_claimed_in_list(&[hit], now, &allowed));
-        // 审查 F8：他活动已领（id 不在候选表）、每日活动未领 → 不命中（宽匹配误报场景）
+        let got = daily_credits_claimed_grant(&[hit.clone()], now, &allowed).expect("hit");
+        assert_eq!(got, hit);
+        // F8：他活动已领（id 不在候选表）、每日活动未领/不可见 → 不命中
+        //（无约束会让他活动 replayed 回放误短路 already，跳过盲发兜底漏领）
         let other_id = json!({
             "campaignId": "other-campaign-uuid",
             "claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
             "benefit": {"kind": "CREDITS", "amount": 50},
             "startAt": 1_791_338_400, "endAt": 1_791_424_740,
         });
-        assert!(!daily_credits_claimed_in_list(&[other_id], now, &allowed));
+        assert!(daily_credits_claimed_grant(&[other_id], now, &allowed).is_none());
         // id 缺失 → 不命中（从严）
         let bare_id = json!({"claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
                              "benefit": {"kind": "CREDITS"},
                              "startAt": 1_791_338_400, "endAt": 1_791_424_740});
-        assert!(!daily_credits_claimed_in_list(&[bare_id], now, &allowed));
+        assert!(daily_credits_claimed_grant(&[bare_id], now, &allowed).is_none());
         // VIEW_DETAILS（bogo 只看不领）→ 不命中
         let view = json!({"claimStatus": "CLAIMED", "actionType": "VIEW_DETAILS",
                           "benefit": {"kind": "CREDITS"},
                           "startAt": 1_791_338_400, "endAt": 1_791_424_740});
-        assert!(!daily_credits_claimed_in_list(&[view], now, &allowed));
-        // 窗口外（昨日已领 grant 无条件展示在列表）→ 不命中
+        assert!(daily_credits_claimed_grant(&[view], now, &allowed).is_none());
+        // 窗口外（过期已领 grant 无条件展示在列表）→ 不命中
         let expired = json!({"claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
                              "benefit": {"kind": "CREDITS"},
                              "startAt": 1_791_252_000, "endAt": 1_791_260_640});
-        assert!(!daily_credits_claimed_in_list(&[expired], now, &allowed));
+        assert!(daily_credits_claimed_grant(&[expired], now, &allowed).is_none());
         // 仍 CLAIMABLE → 不命中
         let claimable = json!({"claimStatus": "CLAIMABLE", "actionType": "CLAIM_BENEFIT",
                                "benefit": {"kind": "CREDITS"},
                                "startAt": 1_791_338_400, "endAt": 1_791_424_740});
-        assert!(!daily_credits_claimed_in_list(&[claimable], now, &allowed));
+        assert!(daily_credits_claimed_grant(&[claimable], now, &allowed).is_none());
         // 字段缺失从严（无 benefit.kind / 无窗口）→ 不命中
         let bare = json!({"claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT"});
-        assert!(!daily_credits_claimed_in_list(&[bare], now, &allowed));
+        assert!(daily_credits_claimed_grant(&[bare], now, &allowed).is_none());
         // 大小写宽容 + snake_case 候选键（claimStatus 口径与 filter_claimable 同构）
         let lower = json!({"campaign_id": "01a0f1cd-945c-7217-b373-f62e70da792d",
                            "claim_status": "claimed", "actionType": "claim_benefit",
                            "benefit": {"kind": "credits"},
                            "startAt": 1_791_338_400, "endAt": 1_791_424_740});
-        assert!(daily_credits_claimed_in_list(&[lower], now, &allowed));
+        assert!(daily_credits_claimed_grant(&[lower], now, &allowed).is_some());
+        // 批次级跨天窗口（issue #193 场景：一批数日同 id，首日已领后其余日期
+        // 列表仍见 CLAIMED 且窗口命中）→ 仍返回候选（不在列表层短路 already，
+        // 由重发 claim 裁决：批次内当日周期未领取时服务端返回新领取非回放）
+        let batch = json!({
+            "campaignId": "01a0f1cd-945c-7217-b373-f62e70da792d",
+            "claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
+            "benefit": {"kind": "CREDITS", "amount": 100},
+            "startAt": 1_791_338_400, "endAt": 1_791_596_000,
+        });
+        assert!(daily_credits_claimed_grant(&[batch], now, &allowed).is_some());
     }
 
     /// 盲发单步归类：非明确成功/回放形态一律 Failed（宁 fail 不假 already）；
@@ -2312,7 +2530,7 @@ mod tests {
     }
 
     /// 重学习（issue #66 健壮性①）：不要求 claimStatus（CLAIMED/CLAIMABLE 均学），
-    /// 窗口/actionType/benefit 口径与 daily_credits_claimed_in_list 对齐；
+    /// 窗口/actionType/benefit 口径与 daily_credits_claimed_grant 对齐；
     /// 非法 id 丢弃；展示名缺失回退 id 前 8 位
     #[test]
     fn learn_daily_campaign_ids_from_list() {

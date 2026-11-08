@@ -802,15 +802,15 @@ pub fn update_run_installer(
     {
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            // 收口（审查修复）：子进程经 platform::cmd::sys_command 构建——CREATE_NO_WINDOW
+            // 由收口 helper 统一提供，删除本地 CommandExt/常量散写（恢复「CommandExt
+            // 全仓仅 platform/cmd.rs 一处」收口不变量）
             // .status() 等待 cmd 自身退出（cmd 启动 start 后立即退出，毫秒级，不阻塞脱树）：
             // spawn 成功只代表 cmd 进程创建成功，start 的 ShellExecute 失败（如杀软拦截、
             // 文件关联损坏）时 cmd 返回非零——校验退出码可在此报错提示手动运行安装包，
             // 而不是照常 emit+exit 静默失败（issue #135 加固）
-            let status = std::process::Command::new("cmd")
+            let status = crate::platform::cmd::sys_command("cmd")
                 .args(["/C", "start", "", file_path.as_str(), "/P", "/UPDATE", "/R"])
-                .creation_flags(CREATE_NO_WINDOW)
                 .status()
                 .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
             if !status.success() {

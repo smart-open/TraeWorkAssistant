@@ -163,7 +163,7 @@ export default function CheckinCalendarCard({
                     {e.name}
                   </span>
                   <Badge tone={STATUS_BADGE[e.status].tone}>{STATUS_BADGE[e.status].text}</Badge>
-                  {e.note && <span className="min-w-0 flex-1 truncate text-slate-400">{e.note}</span>}
+                  {e.note && <span title={e.note} className="min-w-0 flex-1 truncate text-slate-400">{e.note}</span>}
                 </div>
               ))}
             </div>

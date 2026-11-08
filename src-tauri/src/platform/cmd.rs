@@ -110,8 +110,12 @@ pub fn sys_status_timeout(
 
 /// macOS 专用：运行命令并在超时内等待退出，收集 stdout（utf-8 宽容解码）。
 /// 审查修复（Medium）：mdfind 等兜底探测在 Spotlight 索引异常时可长时间挂起，
-/// `.output()` 无超时会卡死调用线程（切换链 locate → mdfind_bundle）。stdout 量
-/// 小（.app 路径行），轮询 try_wait 不存在 pipe 填满死锁（对齐 ide_store 同款判断）
+/// `.output()` 无超时会卡死调用线程（切换链 locate → mdfind_bundle）。
+/// 审查修复（Low）：stderr 改 Stdio::null()——本函数仅回传 stdout，消费方
+/// （mdfind/security 等）无需 stderr 内容；双 pipe 轮询期间不排空，chatty
+/// stderr 写满 64KB 管道即阻塞子进程，try_wait 恒 None 直至 deadline 被 kill，
+/// 正常命令误报超时。stdout 仍 piped（量小为 .app 路径行，轮询 try_wait 不存在
+/// pipe 填满死锁，对齐 ide_store 同款判断）
 #[cfg(target_os = "macos")]
 pub fn sys_output_timeout(
     cmd: &mut std::process::Command,
@@ -122,7 +126,7 @@ pub fn sys_output_timeout(
     use std::time::{Duration, Instant};
     let mut child = cmd
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("执行失败: {e}"))?;
     let deadline = Instant::now() + timeout;

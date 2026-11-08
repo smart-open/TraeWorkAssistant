@@ -558,9 +558,10 @@ pub fn stream_forward_ex(
                 if !has_content {
                     // 空完成（影子风控/上游异常）：不发任何收尾帧，以哨兵错误上抛
                     // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）。
-                    // 审查 P2-9：Responses 协议若已发 created（空 delta chunk 触发
-                    // resp_created 置位），哨兵上抛前补发 response.failed 收尾——
-                    // Codex 等客户端在 created 后等待终态事件，悬空流会一直等待；
+                    // 审查 A1-1：created 仅随真实载荷帧下发（frame_has_payload ⇒
+                    // has_content），空完成路径 resp_created 恒 false——下方补发
+                    // response.failed 的防御分支按构造不可达，保留作为协议不变量
+                    // 兜底（若未来放宽 created 触发条件，悬空流仍会收到终态帧）；
                     // error.code=empty_completion 保留哨兵语义（调用方仍按空完成
                     // 换号重试，返回元组的 sent_any/failed_inline 语义不变）。
                     // 发送前检查在线（对齐下方 EOF 分支门控，避免向已关闭通道写帧）
@@ -849,10 +850,18 @@ pub fn stream_forward_ex(
                         }
                         crate::api_server::routes::Protocol::Anthropic => unreachable!(),
                         crate::api_server::routes::Protocol::Responses => {
-                            resp_ensure_created!();
-                            // created 帧已下发：后续流内错误必须就地 response.failed，
-                            // 不得再走「未发送数据」换号重试路径（否则客户端收到重复流）
-                            sent_any = true;
+                            // 对齐 Anthropic message_start 延迟发送口径（审查修复 L 同构）：
+                            // 纯噪声帧（role-only/空 delta/无 usage）不提前下发 created、
+                            // 不置位 sent_any——否则空完成哨兵触发时调用方误判「已有数据
+                            // 流出」就地收尾不换号，空完成换号重试（issue #57）对 Responses
+                            // 失效，且真换号将向已含 created 的流拼接第二份响应（与 P2-9
+                            // 注释矛盾）。流内 Error 帧路径保持无条件 created+failed 不受影响
+                            if frame_has_payload {
+                                resp_ensure_created!();
+                                // created 帧已下发：后续流内错误必须就地 response.failed，
+                                // 不得再走「未发送数据」换号重试路径（否则客户端收到重复流）
+                                sent_any = true;
+                            }
                             // 文本增量 → message 输出项 + output_text.delta
                             if let Some(t) = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
                                 if !resp_msg_open {
@@ -953,10 +962,12 @@ pub fn stream_forward_ex(
     // 客户端收到 "empty provider response"）。判定与客户端在线解耦——断连
     // 也上抛，否则调用方误判成功绑粘性；仅 response.failed 帧发送前检查在线，
     // 避免向已关闭通道写帧。
-    // 终审补齐（P2-9 同构）：resp_created 已置位（空 delta/usage chunk 触发）时
+    // 终审补齐（P2-9 同构）：resp_created 已置位（真实载荷帧触发）时
     // 与 Done 分支对称地补发 response.failed——EOF 断流同属「created 后悬空」
-    // 场景（qoder_route 证实 EOF 零完成真实存在，非理论不可达），补发后仍上抛
-    // 哨兵交调用方换号重试，sent_any/failed_inline 语义不变
+    // 场景（qoder_route 证实 EOF 零完成真实存在）。A1-1 后正常流
+    // created ⇒ has_content ⇒ 不会走到本分支，此处属不变量破坏时的防御
+    // 兜底（宁可补发 failed 也不留悬空 created），补发后仍上抛哨兵交调用方
+    // 换号重试，sent_any/failed_inline 语义不变
     if error_info.is_none() && !has_content && !failed_inline {
         if resp_created && !tx.is_closed() {
             let mut resp = responses_object(chat_id, model, "failed", vec![], None);
@@ -1403,15 +1414,17 @@ mod tests {
         );
     }
 
-    /// 审查 P2-9：Responses 协议空完成——created 已发（空 delta chunk 触发）时，
-    /// 哨兵上抛前补发 response.failed 收尾帧（客户端不再悬空等待终态事件）；
-    /// 哨兵语义不变：error_info 仍上抛空完成错误驱动调用方换号，failed_inline
-    /// 不置位（未按「失败已透传终态」处理）
+    /// 审查 A1-1：Responses 协议纯噪声帧（空 delta，无任何载荷）不再提前下发
+    /// created/置位 sent_any（对齐 Anthropic message_start 延迟发送口径）——
+    /// 空完成哨兵触发时 created 未下发，调用方可安全换号重试（issue #57 对
+    /// Responses 恢复生效）；流内无 created/failed 帧。
+    /// 注：P2-9 原测试（空 delta 触发 created → 空完成补发 response.failed）
+    /// 场景在 A1-1 后按构造不可达（created ⇒ has_content ⇒ 非空完成），已删除
     #[test]
-    fn stream_forward_responses_empty_completion_after_created_sends_failed_frame() {
+    fn stream_forward_responses_noise_only_empty_completion_retries_without_created() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         let src = lines(&[
-            // 空 delta chunk：触发 created 占位帧（不计入 has_content）
+            // 空 delta chunk：纯噪声，不触发 created 占位帧
             "data: {\"choices\":[{\"delta\":{}}]}",
             "",
             "data: [DONE]",
@@ -1433,18 +1446,15 @@ mod tests {
                 crate::api_server::EMPTY_COMPLETION_MSG.to_string()
             ))
         );
-        assert!(sent_any, "created 已下发");
+        assert!(!sent_any, "纯噪声流不下发 created，交调用方换号重试");
         assert!(!failed_inline);
         drop(tx); // 关闭通道后收集全部下发帧
         let mut body = String::new();
         while let Some(Ok(b)) = rx.try_recv().ok() {
             body.push_str(&String::from_utf8_lossy(&b));
         }
-        assert!(body.contains("event: response.created"));
-        assert!(body.contains("event: response.failed"));
-        assert!(body.contains("empty_completion"));
-        // 空完成不得伪装成正常完成
-        assert!(!body.contains("response.completed"));
+        assert!(!body.contains("event: response.created"));
+        assert!(!body.contains("event: response.failed"));
     }
 
     /// issue #96：Buddy 上游每个 delta 携带噪声字段（空 tool_calls 数组、逐帧

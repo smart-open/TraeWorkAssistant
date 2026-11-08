@@ -15,7 +15,10 @@ export function daysFromDoubaoDetail(detail: DoubaoDayDetail[]): CheckinCalendar
     const entries: CheckinCalendarEntry[] = d.accounts.map((r) => {
       if (r.status === 'fail') {
         fail += 1;
-        return { name: r.name, status: 'fail' };
+        // 失败原因透出（后端 message 落库）：日历明细点开即见根因
+        //（风控 710010702 / 凭证过期 710012001 等可定性），不再只显示笼统「失败」
+        const reason = (r.message ?? '').trim();
+        return { name: r.name, status: 'fail', note: reason || undefined };
       }
       ok += 1;
       const rw = r.reward ?? 0;

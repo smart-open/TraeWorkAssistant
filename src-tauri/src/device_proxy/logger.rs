@@ -33,8 +33,10 @@ const SENSITIVE_HEADERS: &[&str] = &[
 /// 采信 inner.get("token") 为 access_token；client_secret 补漏——\bsecret\b 因下划线
 /// 属 word 字符永远匹配不到它；msToken 补漏——\btoken\b 因词边界（s→T 均为词字符）
 /// 匹配不到 "msToken" 内部的 Token，handler::try_capture_doubao_campaign 注释采信
-/// body 含 msToken 形态参数；sessionid_ss/ms_token/sid_tt 补漏——\bsessionid\b/
-/// \btoken\b/\bttwid\b 因下划线属 word 字符匹配不到带后缀变体，豆包 Cookie 实测存在）
+/// body 含 msToken 形态参数；豆包 Cookie 变体键补漏（审查 #8）——sessionid_ss/
+/// ms_token/sid_tt 因下划线属 word 字符，裸键 \bsessionid\b/\bmstoken\b/\bsid_guard\b
+/// 的 \b 断言与引号组的精确匹配均命中不了，实测豆包 Cookie 明文入日志。经回溯验证
+/// sessionid 先匹配后 \b 失败会回溯到长分支（sessionid_ss），无前缀吞噬缺口）
 fn body_mask_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -474,14 +476,25 @@ mod tests {
         let masked5 = mask_body("msToken=AbCdEf123&a_bogus=x9");
         assert!(masked5.contains(r#"msToken="***""#), "urlencoded msToken: {masked5}");
         assert!(masked5.contains("a_bogus=x9"), "非凭证键不误伤: {masked5}");
-        // sessionid_ss / ms_token / sid_tt 变体补漏回归：\bsessionid\b / \btoken\b /
-        // \bttwid\b 因下划线属 word 字符匹配不到带后缀键名（豆包 Cookie 实测存在）
-        let masked6 = mask_body(r#"{"sessionid_ss":"ss1","ms_token":"mt1","sid_tt":"st1","other":"keep"}"#);
+        // 豆包 Cookie 变体键补漏回归（审查 #8）：sessionid_ss/ms_token/sid_tt 因下划线
+        // 属 word 字符，旧正则 \bsessionid\b/\bmstoken\b/\bsid_guard\b 均命中不了
+        let masked6 = mask_body(
+            r#"{"sessionid_ss":"ss-plain","ms_token":"mt-plain","sid_tt":"st-plain"}"#,
+        );
         assert!(masked6.contains(r#""sessionid_ss":"***""#), "json sessionid_ss: {masked6}");
         assert!(masked6.contains(r#""ms_token":"***""#), "json ms_token: {masked6}");
         assert!(masked6.contains(r#""sid_tt":"***""#), "json sid_tt: {masked6}");
-        assert!(masked6.contains(r#""other":"keep""#), "非凭证键不误伤: {masked6}");
-        assert!(!masked6.contains("ss1") && !masked6.contains("mt1") && !masked6.contains("st1"));
+        assert!(!masked6.contains("ss-plain"));
+        assert!(!masked6.contains("mt-plain"));
+        assert!(!masked6.contains("st-plain"));
+        let masked7 = mask_body("sessionid_ss=abc&ms_token=def&sid_tt=ghi");
+        assert!(masked7.contains(r#"sessionid_ss="***""#), "urlencoded sessionid_ss: {masked7}");
+        assert!(masked7.contains(r#"ms_token="***""#), "urlencoded ms_token: {masked7}");
+        assert!(masked7.contains(r#"sid_tt="***""#), "urlencoded sid_tt: {masked7}");
+        // 精度：变体键的更长尾巴不是凭证键，不得误伤（裸键 \b 在尾部字母处失配）
+        let masked8 = mask_body(r#"{"sessionid_ssx":"keep","sid_ttx":"keep2"}"#);
+        assert!(masked8.contains("keep"), "sessionid_ssx 不误伤: {masked8}");
+        assert!(masked8.contains("keep2"), "sid_ttx 不误伤: {masked8}");
     }
 
     #[test]

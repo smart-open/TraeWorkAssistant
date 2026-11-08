@@ -119,9 +119,9 @@ const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   update_download: null,
   // 多账号串行网络操作：耗时随账号数线性增长，放宽到 10 分钟
   doubao_renew_run: 600_000,
-  // 批量签到前置 probe 自动保活（默认开）逐账号串行 Switch 客户端 + 最长 75s 等
-  // 抓包（约 30-90s/账号；per-sid 分键后升级首跑存量账号全员判缺失），≥8 账号首轮
-  // 可超 10 分钟——放宽到 30 分钟防误报超时失败（后端独立线程继续执行并落库）
+  // 签到批量：签到逐账号串行 + probe 自动保活（保活开关默认开 + per-sid 分键，
+  // 升级后首跑存量账号全员判「缺失」→ 逐账号开客户端抓包最长 75s，约 30-90s/账号；
+  // ≥7-8 账号首轮即超 600s。保活 24h 新鲜期仅首轮触发，放宽到 30 分钟覆盖 20+ 账号）
   doubao_checkin_run: 1_800_000,
   workbuddy_env_reset: 600_000,
   workbuddy_cli_rotate_run: 600_000,
@@ -460,8 +460,9 @@ export const api = {
     // ---- 会员额度 ----
     fetchQuota: (userId: string) => invoke<DoubaoQuotaResult>('doubao_quota_fetch', { userId }),
     // ---- 每日签到（landing/checkin；结果按日落库） ----
-    /** 手动签到：userId 缺省 = 全池批量（空池返回 skipped_empty_pool）；批量含 probe
-     *  自动保活时逐账号串行可达 30 分钟，超时上限同步放宽（多账号首轮保活约 30-90s/账号） */
+    /** 手动签到：userId 缺省 = 全池批量；空池返回 skipped + skipped_empty_pool:true
+     *  （奖励型任务豁免，调度器不 mark_run）。批量逐账号串行较慢且 probe 自动保活
+     *  首轮逐账号开客户端抓包，超时放宽 30 分钟 */
     checkinRun: (userId?: string) => invoke<Record<string, unknown>>('doubao_checkin_run', { userId: userId ?? null }),
     /** 额度看板统计（池聚合 + 今日签到 + 近 30 天趋势） */
     dashboardStats: () => invoke<DoubaoDashboardStats>('doubao_dashboard_stats'),

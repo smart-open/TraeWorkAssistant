@@ -289,13 +289,14 @@ export default function DoubaoAccounts() {
    *  结果缓存进账号池（后端回写），账号名后即显示会员/免费标识。
    *  查到额度窗口已用完时弹一次提醒（含重置时间）。 */
   const quotaAutoFetched = useRef(false);
-  useEffect(() => {
+  // 组件级挂载守卫 mountedRef 见组件头部声明（仅卸载置 false，StrictMode 双跑安全）
+  const runQuotaAutoFetch = () => {
     if (quotaAutoFetched.current || loading || accounts.length === 0) return;
     const pending = accounts.filter((a) => a.session_state !== 'none' && !a.quota_checked_at);
     quotaAutoFetched.current = true;
     if (pending.length === 0) return;
     // 卸载守卫（审查修复）：循环判组件级 mountedRef，仅在真正卸载时中止——
-    // 原 effect cleanup 随 [accounts, loading] 依赖变化触发，同页 20s 凭证回写/
+    // effect cleanup 随 [accounts, loading] 依赖变化触发，同页 20s 凭证回写/
     // done 事件的 reload 会误中止在途循环，而 quotaAutoFetched 已置位、本次
     // 会话不再补查；卸载后不再请求、不再 toast、不再触发 reload
     (async () => {
@@ -322,6 +323,10 @@ export default function DoubaoAccounts() {
       if (!mountedRef.current) return;
       void reload();
     })();
+  };
+
+  useEffect(() => {
+    runQuotaAutoFetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts, loading]);
 

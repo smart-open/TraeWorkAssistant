@@ -836,7 +836,7 @@ export interface ApiPoolFile {
   buddy_ai_group_ids?: string[];
   /** buddy-ai 池标签筛选：与分组筛选取交集（D5）；空 = 不限标签 */
   buddy_ai_tag_ids?: string[];
-  /** buddy-ai 池内调度策略（取值同 strategy）；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  /** buddy-ai 池内调度策略（取值同 strategy）；空 = 跟随 Trae 池（与 qoder_strategy 同语义——wb_strategy 已改公平轮转专属默认，不在此列） */
   buddy_ai_strategy?: string;
   /** 默认深度思考（T5.3/F-62）：客户端未显式请求 reasoning_effort 时默认 high */
   wb_default_thinking?: boolean;
@@ -880,7 +880,7 @@ export interface ApiPoolFile {
   qoder_pool_sticky_ttl_secs?: number;
   /** Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800；仅会话粘性开启时生效） */
   qoder_sticky_ttl_secs?: number;
-  /** Qoder 池内调度策略；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  /** Qoder 池内调度策略；空 = 跟随 Trae 池（wb_strategy 已改公平轮转专属默认，不在此列） */
   qoder_strategy?: string;
   /** Qoder 池入池白名单（qd- 账号 id）；空 = fail-open 全部含凭证账号入池 */
   qoder_enabled_uids?: string[];
@@ -1089,6 +1089,8 @@ export interface DoubaoDayAccountResult {
   status: string;
   /** 签到奖励额度（success 时非空） */
   reward: number | null;
+  /** 失败原因（仅 fail 时非空；旧数据/存量行为 null——失败原因落库后重开仍可排障） */
+  message?: string | null;
 }
 
 /** 额度趋势单日明细（同 uid 同日一条，重试轮覆盖为最终态；日期升序） */

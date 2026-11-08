@@ -214,16 +214,21 @@ pub(crate) fn networksetup_apply_services(
                 }
             }
             // bypass 整表覆盖写（对齐 Windows ProxyOverride 语义）；
-            // 空列表用 man 页 Empty 关键字清空
-            let mut b = vec!["-setproxybypassdomains", svc];
-            let domains: Vec<&str> = bypass.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
-            if domains.is_empty() {
-                b.push("Empty");
-            } else {
-                b.extend(domains);
-            }
-            if let Some(e) = run(&b) {
-                errs.push(format!("{svc}: {e}"));
+            // 空列表用 man 页 Empty 关键字清空。
+            // 读失败哨兵（审查修复）：跳过 bypass 写回——快照未知 ≠ 用户本无
+            // bypass，覆盖写会清空用户白名单（bypass.rs「读失败不得按空表覆盖写」红线）
+            if bypass != BYPASS_READ_UNKNOWN {
+                let mut b = vec!["-setproxybypassdomains", svc];
+                let domains: Vec<&str> =
+                    bypass.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
+                if domains.is_empty() {
+                    b.push("Empty");
+                } else {
+                    b.extend(domains);
+                }
+                if let Some(e) = run(&b) {
+                    errs.push(format!("{svc}: {e}"));
+                }
             }
         } else {
             // off 态仍需带 domain/port 形参（networksetup 语法要求，off 时被忽略）
@@ -247,6 +252,13 @@ pub(crate) fn networksetup_apply_services(
         ))
     }
 }
+
+/// bypass 读失败哨兵（审查修复）：与「读成功但用户未配置 bypass（空表）」区分——
+/// 还原时哨兵跳过 bypass 写回（保留用户原白名单），空表才写 "Empty" 清空。
+/// 违背 bypass.rs「读失败不得按空表覆盖写」红线的历史缺陷：读失败降级空串入
+/// 快照，restore 按空表写 Empty 会清空用户 bypass
+#[cfg(target_os = "macos")]
+const BYPASS_READ_UNKNOWN: &str = "\u{0}bypass_read_unknown";
 
 /// 读系统代理（mac 分派，M-1 侦察 ⑧ 2026-09-20 实测）：macOS 12 的 `scutil`
 /// **不支持 `--proxies` 子命令**（unrecognized option），原 scutil_parse 恒 None
@@ -289,19 +301,21 @@ fn networksetup_read() -> Option<Vec<(String, String, String)>> {
         if host.is_empty() || port.is_empty() {
             continue;
         }
-        // bypass 取同服务 -getproxybypassdomains（逐行域列表；未设置时输出说明行，
-        // 读取失败降级为空串继续——bypass 丢失不应让整个快照作废）。
+        // bypass 取同服务 -getproxybypassdomains（逐行域列表；未设置时输出说明行）。
         // 过滤三重保险：空行 / 英文本地化说明（"aren't any"）/ 含空格的说明句
         // （中文 macOS 本地化说明行必含空格，bypass 域名不含空格——审查 P2）
-        let bypass = out(&["-getproxybypassdomains", svc])
-            .map(|t| {
-                t.lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty() && !l.contains("aren't any") && !l.contains(' '))
-                    .collect::<Vec<_>>()
-                    .join(";")
-            })
-            .unwrap_or_default();
+        // 审查修复：读失败不得降级为空串继续——空串入快照后 restore 会按空表
+        // 写 "Empty" 覆盖用户真实 bypass 白名单（读失败 ≠ 用户本无 bypass，
+        // bypass.rs 红线）；落哨兵，还原时跳过该服务的 bypass 写回
+        let bypass = match out(&["-getproxybypassdomains", svc]) {
+            Some(t) => t
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.contains("aren't any") && !l.contains(' '))
+                .collect::<Vec<_>>()
+                .join(";"),
+            None => BYPASS_READ_UNKNOWN.to_string(),
+        };
         // 快照逐服务记录（M6：还原按服务写回各自的值）
         result.push((svc.clone(), format!("{host}:{port}"), bypass));
     }

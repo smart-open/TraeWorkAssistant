@@ -92,6 +92,13 @@ pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     }
 }
 
+/// 其余平台兜底占位（审查修复）：与 cert.rs 口径对齐——项目仅声明 Win/mac 目标，
+/// 但仅双平台变体在其余目标下无实现（E0412）
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
+    Err(format!("当前平台不支持系统浏览器打开：{url}"))
+}
+
 /// macOS：`open <url>` 走 LaunchServices，无引号转义问题（URL 校验同 Windows 分支）。
 /// 审查修复（Low）：等待退出并校验状态码（对齐 Windows 分支失败可观测口径）。
 #[cfg(target_os = "macos")]

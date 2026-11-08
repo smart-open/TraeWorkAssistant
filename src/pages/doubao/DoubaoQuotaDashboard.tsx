@@ -81,32 +81,56 @@ export default function DoubaoQuotaDashboard() {
   // 刷新并发序号（对齐 store.ts logsReqSeq 模式）：手动刷新与挂载请求并发时旧响应直接丢弃；
   // 卸载后组件销毁无需 cleanup（重新挂载是新实例、新 seqRef），seq 单调递增即可保证旧响应不落地
   const seqRef = useRef(0);
+  // stats 最新值镜像（审查防御）：失败 toast 两态文案读 ref 而非渲染闭包——refresh
+  // 若未来被定时器/事件延迟调用，闭包 stats 可能陈旧导致文案判反
+  const statsRef = useRef(stats);
+  statsRef.current = stats;
   const refresh = async () => {
     const seq = ++seqRef.current;
     setLoading(true);
     try {
       const [st, accs, gs, det] = await Promise.all([
-        // 失败降级为 undefined（对齐 DoubaoOverview 口径）：KPI 数据源单点失败
-        // 不得拖垮整组——已成功的 accs/gs/det 保留展示，stats 区回落既有旧值
-        api.doubao.dashboardStats().catch(() => undefined as DoubaoDashboardStats | undefined),
-        api.doubao.accountsList().catch(() => [] as DoubaoAccountView[]),
-        api.groups.sharedList().catch(() => [] as GroupView[]),
+        // stats 独立降级（审查 #3/#14）：失败保留旧值（undefined 不覆盖 setStats）+
+        // 补失败 toast（读失败不得静默、不得伪装成「暂无数据」空态），不再短路
+        // Promise.all 连累已成功的 accs/gs/det——KPI 保留上次数据继续可见。
+        // 对齐 DoubaoOverview 的 undefined 哨兵口径；null 是 stats 的「空数据」语义，
+        // 失败置 null 会把已有统计闪成空态
+        api.doubao.dashboardStats().catch(() => undefined),
+        // accs/gs/det 同款哨兵化（审查修复：此前静默落地空数组——accounts 失败会让
+        // knownUids/currentTotal 归零，把积分曲线渲染成「0 − 前值」的负值跳水；
+        // detail 失败清空则伪装成「暂无签到数据」空态）：失败保留上次数据 + toast
+        api.doubao.accountsList().catch(() => undefined),
+        api.groups.sharedList().catch(() => undefined),
         // 明细一次拉满 365 天窗口，时间段切换纯前端过滤（后端已按 365 天裁剪）
-        api.doubao.resultsDetail(365).catch(() => [] as DoubaoDayDetail[]),
+        api.doubao.resultsDetail(365).catch(() => undefined),
       ]);
       // 过期响应（已被更新请求取代或组件已卸载）：各 set 与 pushToast 前校验，避免旧数据回写/全局 toast
       if (seq !== seqRef.current) return;
-      // stats 失败时保留旧值（undefined 不覆盖），避免「加载失败」伪装成「暂无数据」空态；
-      // 补一条失败 toast（项目硬性 UX 规则：读失败不得静默）——accs/gs/det 已成功的
-      // 数据照常落地，stats 区单独保留旧值
-      if (st !== undefined) {
-        setStats(st);
+      if (st === undefined) {
+        // 仅 stats 失败：可见反馈——已有旧数据提示「已保留」；首次加载（stats 仍
+        // 为 null）无数据可保留，文案如实提示暂无，accs/gs/det 与时间戳照常落地
+        pushToast('error', statsRef.current ? '额度概览读取失败，已保留上次数据' : '额度概览读取失败，暂无数据');
       } else {
-        pushToast('error', '额度看板统计加载失败（已保留上次数据）');
+        setStats(st);
       }
-      setAccounts(accs);
-      setGroups(gs);
-      setDetail(det);
+      // 失败源保留旧值（不落地空数组），成功源照常更新
+      if (accs !== undefined) setAccounts(accs);
+      if (gs !== undefined) setGroups(gs);
+      if (det !== undefined) setDetail(det);
+      // 辅助源失败汇总反馈（合并为一条 toast 防多源同时失败刷屏）
+      const failedSources: string[] = [];
+      if (accs === undefined) failedSources.push('账号列表');
+      if (gs === undefined) failedSources.push('分组列表');
+      if (det === undefined) failedSources.push('签到明细');
+      if (failedSources.length > 0) {
+        // 闭包中的 accounts/detail 是刷新前值（即「上次数据」），据此如实区分
+        // 「已保留」与「暂无」两态文案
+        const kept =
+          (accs === undefined && accounts.length > 0) ||
+          (gs === undefined && groups.length > 0) ||
+          (det === undefined && detail.length > 0);
+        pushToast('error', `${failedSources.join('、')}读取失败${kept ? '，已保留上次数据' : ''}`);
+      }
       // 刷新可见反馈：数据无变化时也明确「已刷新到几点几分」（修复点击无反馈的观感问题）
       setRefreshedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
     } catch (err) {

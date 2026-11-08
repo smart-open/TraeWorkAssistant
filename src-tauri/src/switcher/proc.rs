@@ -487,24 +487,38 @@ pub fn start_app_pid(sess: &mut Session, sink: &dyn ProgressSink) -> Result<u32,
             .iter()
             .map(|(pid, _)| *pid)
             .collect();
-        cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
         })?;
+        let mut spawned_pid = 0u32;
         for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_millis(500));
             if let Some((pid, _)) = list_procs(&sess.prof)
                 .iter()
                 .find(|(pid, _)| !pre_existing.contains(pid))
             {
-                return Ok(*pid);
+                spawned_pid = *pid;
+                break;
             }
         }
-        Ok(0)
+        // 收尸（审查修复）：短命 open 进程退出后 spawn 句柄即弃会成为僵尸存活至
+        // 应用退出——已退出 try_wait 直接收尸；仍存活（LaunchServices 异常挂起）
+        // kill+wait 兜底防残留（对齐 cmd.rs 收尸红线）
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        Ok(spawned_pid)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let mut cmd = std::process::Command::new(&exe);
+        // 收口（审查修复）：子进程经 platform::cmd::sys_command_path 构建——Windows
+        // 自动获得 CREATE_NO_WINDOW（对齐 env.rs 客户端启动链口径）
+        let mut cmd = crate::platform::cmd::sys_command_path(&exe);
         if let Some(port) = sess.launch_proxy_port.filter(|p| *p > 0) {
             sink.step(
                 "start",
