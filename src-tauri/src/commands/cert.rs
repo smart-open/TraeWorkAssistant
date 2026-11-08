@@ -48,7 +48,7 @@ fn system_powershell_path() -> Option<std::path::PathBuf> {
         .filter(|p| p.is_file())
 }
 
-fn powershell_command() -> Command {
+pub(crate) fn powershell_command() -> Command {
     match system_powershell_path() {
         Some(exe) => Command::new(exe),
         None => Command::new("powershell"),

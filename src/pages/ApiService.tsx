@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download, ToggleLeft, Gauge } from 'lucide-react';
+import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download, ToggleLeft, Gauge, Copy } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Modal, Spinner, StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
+import { copyText } from '../lib/clipboard';
+import { buildModelCopySnippet } from '../components/api/clientExamples';
 import { RefreshTokenBadge } from './accounts/RefreshTokenBadge';
 import { PoolHealthBadges } from '../components/api/PoolHealthBadges';
 import type {
@@ -107,6 +109,9 @@ export default function ApiService() {
   // 不覆盖该反向时序（快照返回时 ref 已清空，旧值会覆盖刚勾选的项）
   const longCtxSeq = useRef(0);
 
+  // F-83：网关端口（模型目录逐行复制片段使用；取不到回退默认 7864）
+  const [gwPort, setGwPort] = useState(7864);
+
   useEffect(() => {
     void refreshAccounts();
     void loadPool();
@@ -114,8 +119,18 @@ export default function ApiService() {
     void loadGroups();
     void loadTodayUsage();
     void loadModels();
+    api.apiServer.gatewaySettingsGet().then((s) => setGwPort(s.port)).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshAccounts]);
+
+  /** F-83（issue #174）：模型目录逐行复制 base_url / API Key / 模型名三字段片段 */
+  const copyModelConfig = async (id: string) => {
+    if (await copyText(buildModelCopySnippet(gwPort, id))) {
+      toast('success', `已复制 ${id} 的接入配置（接口地址 / API Key / 模型 ID）`);
+    } else {
+      toast('error', '复制失败');
+    }
+  };
 
   // 当日用量（query_recent 含今日；仅用于「活跃账号」指标）
   const loadTodayUsage = useCallback(async () => {
@@ -1112,6 +1127,13 @@ export default function ApiService() {
                         )}
                       </td>
                       <td className="py-2 text-right">
+                        <button
+                          className="btn-ghost !p-2"
+                          title="复制接入配置（接口地址 / API Key / 模型 ID）"
+                          onClick={() => void copyModelConfig(m.id)}
+                        >
+                          <Copy size={14} />
+                        </button>
                         <button
                           className="btn-ghost !p-2"
                           title="编辑模型元数据"

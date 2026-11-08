@@ -242,6 +242,85 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
     out
 }
 
+/// F-70 余项：storage.json 凭证批量直读的探针结果（账号发现消费）
+#[derive(Debug, Clone)]
+pub struct CredentialProbe {
+    /// 键内嵌的账户中心（dc）uid（纯数字，与 extract 侧同口径）
+    pub dc_uid: String,
+    /// tc 解密是否成功（解密失败 = 回退既有证据链/抓包路径）
+    pub decrypted: bool,
+    /// 明文中宽容发现的 JWT 形态字符串（eyJ… 三段式，按出现顺序去重；
+    /// 是否可用由调用方 crate::jwt::parse 裁决，本侧不校验签名）
+    pub jwt_candidates: Vec<String>,
+}
+
+/// 宽容挖掘 JSON 中的 JWT 形态字符串：eyJ 开头 + 恰好两个 '.' 分隔 + 长度 ≥ 100。
+/// 只作候选收集，不校验签名与 exp（调用方裁决）。
+fn dig_jwt_candidates(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if t.starts_with("eyJ")
+                && t.split('.').count() == 3
+                && t.len() >= 100
+                && !out.iter().any(|x| x == t)
+            {
+                out.push(t.to_string());
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|x| dig_jwt_candidates(x, out)),
+        serde_json::Value::Object(obj) => obj.values().for_each(|x| dig_jwt_candidates(x, out)),
+        _ => {}
+    }
+}
+
+/// F-70 余项：对 storage.json 的 `iCubeAuthInfo://icube-dc:*` 键做 tc 批量解密探针。
+/// 「解密成功优先、失败回退抓包」双路径的直读侧：解密成功且明文含 JWT 形态凭证时，
+/// 账号发现可不经 MITM 抓包直接推导 Cloud-IDE uid（JWT data.id 与账号池同体系）；
+/// 解密失败/无 JWT 时回退既有证据链（客户端日志 / hybrid / 抓包回填），行为不变。
+/// 仅读本机自有凭证；私钥与 JWT 不落盘、不进日志（调用方只用派生结果）。
+pub fn probe_credential_entries(storage_json: &serde_json::Value) -> Vec<CredentialProbe> {
+    let Some(obj) = storage_json.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (k, val) in obj {
+        let Some(id) = k.strip_prefix("iCubeAuthInfo://icube-dc:") else {
+            continue;
+        };
+        let Some(b64) = val.as_str() else { continue };
+        let dc_uid = id.trim().to_string();
+        if dc_uid.is_empty() || !dc_uid.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let probe = match tc_decrypt(b64, false) {
+            Ok(plain) => match serde_json::from_str::<serde_json::Value>(&plain) {
+                Ok(parsed) => {
+                    let mut jwt_candidates = Vec::new();
+                    dig_jwt_candidates(&parsed, &mut jwt_candidates);
+                    CredentialProbe {
+                        dc_uid,
+                        decrypted: true,
+                        jwt_candidates,
+                    }
+                }
+                Err(_) => CredentialProbe {
+                    dc_uid,
+                    decrypted: false,
+                    jwt_candidates: Vec::new(),
+                },
+            },
+            Err(_) => CredentialProbe {
+                dc_uid,
+                decrypted: false,
+                jwt_candidates: Vec::new(),
+            },
+        };
+        out.push(probe);
+    }
+    out
+}
+
 /// 从设备私钥推导 SPKI PEM 公钥（DeviceInfo.DevicePublicKey 用，不落盘）
 pub fn device_public_key_pem(cred: &DeviceCredential) -> Result<String, String> {
     use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
@@ -374,5 +453,61 @@ mod tests {
         ))
         .is_none());
         assert!(device_credential_from_json(&serde_json::json!(null)).is_none());
+    }
+
+    /// 构造合成 tc 信封（header + random + AES-CBC(sha512_tag || body)，与真实信封
+    /// 同格式），供 F-70 探针测试用——无需真实凭证样本
+    fn synthetic_envelope(plaintext: &str) -> String {
+        use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+        type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+        let random = [7u8; RANDOM_LEN];
+        let mut pepper = [0u8; 64];
+        for i in 0..64 {
+            pepper[i] = WOE_T[i] ^ VOE_T[i];
+        }
+        let (key, iv) = derive_keys(&random, &pepper);
+        let body = plaintext.as_bytes();
+        let mut padded_input = sha512(body).to_vec();
+        padded_input.extend_from_slice(body);
+        let ct = Aes128CbcEnc::new((&key).into(), (&iv).into())
+            .encrypt_padded_vec_mut::<Pkcs7>(&padded_input);
+        let mut raw = HEADER.to_vec();
+        raw.extend_from_slice(&random);
+        raw.extend_from_slice(&ct);
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+
+    /// F-70 探针：解密成功 + 明文 JWT 宽容挖掘；非 icube-dc 键/非数字 uid/解密失败均排除
+    #[test]
+    fn probe_credential_entries_digs_jwt_from_synthetic_envelope() {
+        let jwt = format!("eyJ{}.{}.{}", "e".repeat(57), "f".repeat(40), "g".repeat(60));
+        let env = synthetic_envelope(&serde_json::json!({
+            "privateKeyPEM": "-----BEGIN PRIVATE KEY-----\nabc\n",
+            "accessToken": jwt,
+        })
+        .to_string());
+        let storage = serde_json::json!({
+            "iCubeAuthInfo://icube-dc:123456789012345": env,
+            "iCubeAuthInfo://icube-dc:not-a-number": "x",
+            "someOtherKey": "y",
+        });
+        let probes = probe_credential_entries(&storage);
+        assert_eq!(probes.len(), 1, "仅纯数字 dc uid 键进入探针");
+        assert_eq!(probes[0].dc_uid, "123456789012345");
+        assert!(probes[0].decrypted);
+        assert_eq!(probes[0].jwt_candidates, vec![jwt]);
+    }
+
+    /// F-70 探针：解密失败（坏信封）→ decrypted=false、无候选（回退抓包路径的信号）
+    #[test]
+    fn probe_credential_entries_marks_undecrypted_on_bad_envelope() {
+        let storage = serde_json::json!({
+            "iCubeAuthInfo://icube-dc:123456789012345":
+                base64::engine::general_purpose::STANDARD.encode([9u8; 64]),
+        });
+        let probes = probe_credential_entries(&storage);
+        assert_eq!(probes.len(), 1);
+        assert!(!probes[0].decrypted);
+        assert!(probes[0].jwt_candidates.is_empty());
     }
 }

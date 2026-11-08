@@ -365,6 +365,7 @@ pub fn workbuddy_checkin_task_register(state: State<AppState>, times: Vec<String
         if !ok {
             return Err(format!("注册任务 {t} 失败: {}", stderr.trim()));
         }
+        crate::commands::misc::enable_task_wakeup_settings(&name);
     }
     fs_utils::app_log(
         &state.data_dir,
@@ -418,6 +419,7 @@ pub fn workbuddy_renew_task_register(state: State<AppState>, day: String, time: 
     if !ok {
         return Err(format!("注册续期任务失败: {}", stderr.trim()));
     }
+    crate::commands::misc::enable_task_wakeup_settings(WB_RENEW_TASK_NAME);
     fs_utils::app_log(
         &state.data_dir,
         &format!("WorkBuddy 每周续期定时任务已注册: 每周{d} {t}"),

@@ -277,6 +277,8 @@ export interface DiscoveredAccount {
   /** true = 仅经某账号 JWT 的 data.id 命中（该账号 user_id 与本 uid 不一致） */
   matched_via_jwt?: boolean;
   storage_path: string;
+  /** F-70：tc 凭证直读是否成功（false = 需回退 MITM 抓包路径获取凭证） */
+  tc_decrypted?: boolean;
 }
 
 // ---- Trae 会员/套餐信息 ----

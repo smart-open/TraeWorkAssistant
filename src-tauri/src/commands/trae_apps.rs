@@ -326,6 +326,9 @@ pub struct DiscoveredAccount {
     pub matched_via_jwt: bool,
     /// 命中的 storage.json 路径
     pub storage_path: String,
+    /// F-70 余项：tc 凭证直读是否成功（storage.json icube-dc 键解密成功 = DeviceProof
+    /// 可用、设备侧能力齐备；false = 需回退 MITM 抓包路径获取凭证）
+    pub tc_decrypted: bool,
 }
 
 /// 账号池已有 uid 集合：包含 user_id 字段与 JWT 解析出的 data.id（部分账号 user_id 为空）
@@ -389,6 +392,10 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
             // 未登录任何账号
             continue;
         }
+        // F-70 余项（凭证批量直读）：tc 解密探针——解密成功且明文含 JWT 形态凭证时
+        // 可直接推导 Cloud-IDE uid（不经 MITM 抓包）；失败回退既有证据链，行为不变
+        let probes = crate::icube_auth::probe_credential_entries(&storage);
+        let any_decrypted = probes.iter().any(|p| p.decrypted);
         // 推导当前登录账号的 Cloud-IDE uid（issue #55 审查修复：日志探测优先，
         // hybrid 回退）；失败则回退 dc uid（标记不置信，禁止入池）
         match live_cloud_uid(kind, &state.data_dir) {
@@ -411,21 +418,61 @@ pub fn apps_accounts_discover(state: State<AppState>) -> Vec<DiscoveredAccount> 
                     app: kind.to_string(),
                     app_label: app_label(kind).to_string(),
                     storage_path: path_display.clone(),
+                    tc_decrypted: any_decrypted,
                 });
             }
             None => {
                 for dc in &dc_uids {
-                    out.push(DiscoveredAccount {
-                        in_pool: false,
-                        matched_account_name: None,
-                        matched_via_jwt: false,
-                        dc_uid: Some(dc.clone()),
-                        uid_confident: false,
-                        user_id: dc.clone(),
-                        app: kind.to_string(),
-                        app_label: app_label(kind).to_string(),
-                        storage_path: path_display.clone(),
-                    });
+                    // F-70 直读路径优先：该 dc 键解密成功且明文含可用 JWT → data.id
+                    // 即 Cloud-IDE uid（与账号池同体系，is_uid_token 复核同口径）
+                    let direct_uid = probes
+                        .iter()
+                        .find(|p| p.dc_uid == *dc)
+                        .and_then(|p| {
+                            p.jwt_candidates
+                                .iter()
+                                .find_map(|t| crate::jwt::parse(t).user_id)
+                        })
+                        .filter(|u| is_uid_token(u));
+                    if let Some(cloud_uid) = direct_uid {
+                        let in_pool = known.contains(&cloud_uid);
+                        let (matched_account_name, matched_via_jwt) = if in_pool {
+                            pool_match_for(&accounts, &cloud_uid)
+                                .map(|(n, j)| (Some(n), j))
+                                .unwrap_or((None, false))
+                        } else {
+                            (None, false)
+                        };
+                        out.push(DiscoveredAccount {
+                            in_pool,
+                            matched_account_name,
+                            matched_via_jwt,
+                            dc_uid: Some(dc.clone()),
+                            uid_confident: true,
+                            user_id: cloud_uid,
+                            app: kind.to_string(),
+                            app_label: app_label(kind).to_string(),
+                            storage_path: path_display.clone(),
+                            tc_decrypted: true,
+                        });
+                    } else {
+                        out.push(DiscoveredAccount {
+                            in_pool: false,
+                            matched_account_name: None,
+                            matched_via_jwt: false,
+                            dc_uid: Some(dc.clone()),
+                            uid_confident: false,
+                            user_id: dc.clone(),
+                            app: kind.to_string(),
+                            app_label: app_label(kind).to_string(),
+                            storage_path: path_display.clone(),
+                            tc_decrypted: probes
+                                .iter()
+                                .find(|p| p.dc_uid == *dc)
+                                .map(|p| p.decrypted)
+                                .unwrap_or(false),
+                        });
+                    }
                 }
             }
         }

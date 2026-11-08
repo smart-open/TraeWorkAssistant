@@ -79,6 +79,11 @@ export function DiscoverModal({
                               该 uid 来自账号「{d.matched_account_name}」的 JWT（与其记录的账号 id 不一致），请检查该账号
                             </div>
                           )}
+                          {d.tc_decrypted === false && (
+                            <div className="text-[10px] text-slate-400 dark:text-zinc-500">
+                              设备凭证未直读（将经代理抓包回填 JWT）
+                            </div>
+                          )}
                         </div>
                         {d.in_pool ? (
                           <Badge

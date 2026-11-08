@@ -1079,6 +1079,52 @@ fn build_task_tr() -> Result<String, String> {
     Ok(format!("\"{}\" --task-run checkin", exe.to_string_lossy()))
 }
 
+// ── F-87（issue #175）：睡眠/锁屏跨过触发时刻后的系统级补跑 ──────────────────
+// schtasks /Create CLI 不支持「唤醒计算机运行此任务」（WakeToRun）与「错过计划
+// 时间后尽快启动」（StartWhenAvailable）两项设置，睡眠跨过触发时刻后系统级任务
+// 不会自动补跑（应用内调度器仅覆盖应用运行期）。故注册成功后追加一步 PowerShell
+// ScheduledTasks 模块设置；与注册同权限上下文（任务以当前用户注册，无提权需求）。
+// 设置失败仅 app_log 告警、不阻断注册（兼容家庭版/组策略限制机器）。
+
+/// 构造唤醒/补跑设置命令（纯函数，供单测覆盖转义与语句形态）
+fn wakeup_settings_powershell(task_name: &str) -> String {
+    // PS 单引号字面量转义（' → ''）：任务名为受控常量，防御性转义与 cert.rs 同口径
+    let name = task_name.replace('\'', "''");
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         (Set-ScheduledTask -TaskName '{name}' -Settings \
+         (New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable)) | Out-Null"
+    )
+}
+
+/// 为已注册计划任务补设 WakeToRun + StartWhenAvailable；失败仅 app_log 告警不阻断。
+/// 全部注册面（Trae/豆包/WB/Qoder）在 /Create 成功后统一调用本函数。
+pub(crate) fn enable_task_wakeup_settings(task_name: &str) {
+    if let Err(e) = enable_task_wakeup_settings_inner(task_name) {
+        crate::fs_utils::app_log_default(&format!(
+            "计划任务 {task_name} 唤醒/补跑设置失败（不影响任务注册，仅睡眠后到点不自动补跑）: {e}"
+        ));
+    }
+}
+
+fn enable_task_wakeup_settings_inner(task_name: &str) -> Result<(), String> {
+    let ps = wakeup_settings_powershell(task_name);
+    let out = crate::commands::cert::powershell_command()
+        .args(["-NoProfile", "-Command", &ps])
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|e| format!("执行 PowerShell 失败: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("Set-ScheduledTask 退出码 {:?}", out.status.code())
+        } else {
+            stderr
+        });
+    }
+    Ok(())
+}
+
 /// 注册每日签到任务（新任务名），供命令与旧任务迁移共用
 fn register_daily_task(time: &str) -> Result<(), String> {
     let tr = build_task_tr()?;
@@ -1117,6 +1163,7 @@ fn register_daily_task(time: &str) -> Result<(), String> {
         }
         return Err(detail.to_string());
     }
+    enable_task_wakeup_settings(TASK_NAME);
     Ok(())
 }
 
@@ -1442,6 +1489,7 @@ pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<Strin
         };
         match run_schtasks(&args) {
             Ok((true, _, _)) => {
+                enable_task_wakeup_settings(&name);
                 migrated += 1;
                 notes.push(format!("任务迁移完成 {name} → 主 exe 直调（{when}），不再弹黑框"));
             }
@@ -1480,6 +1528,21 @@ pub fn try_migrate_cmd_wrapped_tasks(data_dir: &std::path::Path) -> Option<Strin
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// F-87：唤醒/补跑设置命令形态（含 PS 单引号转义与两项设置齐全）
+    #[test]
+    fn wakeup_settings_powershell_contains_both_flags_and_escapes_quote() {
+        let ps = wakeup_settings_powershell("AIWorkAssistant_DailyCheckin");
+        assert!(ps.contains("-TaskName 'AIWorkAssistant_DailyCheckin'"));
+        assert!(ps.contains("-WakeToRun"));
+        assert!(ps.contains("-StartWhenAvailable"));
+        assert!(ps.contains("New-ScheduledTaskSettingsSet"));
+        assert!(ps.contains("Set-ScheduledTask"));
+        assert!(ps.starts_with("$ErrorActionPreference='Stop'"));
+        // 防御性转义：任务名含单引号时按 PS 字面量规则翻倍
+        let escaped = wakeup_settings_powershell("a'b");
+        assert!(escaped.contains("-TaskName 'a''b'"));
+    }
 
     /// 临时目录（独占 tag，避免测试间互踩）
     fn tmp_dir(tag: &str) -> PathBuf {

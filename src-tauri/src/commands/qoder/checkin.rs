@@ -208,6 +208,7 @@ pub fn qoder_checkin_task_register(state: State<AppState>, times: Vec<String>) -
                 stderr.trim()
             ));
         }
+        crate::commands::misc::enable_task_wakeup_settings(&name);
         new_names.push(name);
     }
     for name in qoder_checkin_task_names() {
