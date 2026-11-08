@@ -401,6 +401,10 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let opts = arg(&args, "opts")?;
             to_json(api_server_cmd::api_logs_search(state, opts))
         }
+        "api_logs_recent" => {
+            let opts = arg(&args, "opts")?;
+            to_json(api_server_cmd::api_logs_recent(state, opts))
+        }
         "api_debug_toggle" => api_server_cmd::api_debug_toggle().and_then(to_json),
         "api_debug_status" => to_json(api_server_cmd::api_debug_status()),
         "api_models_list" => to_json(api_server_cmd::api_models_list(state)),

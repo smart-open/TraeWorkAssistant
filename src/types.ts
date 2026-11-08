@@ -454,6 +454,42 @@ export interface CreditsDailySnapshot {
   accounts?: Record<string, number>;
 }
 
+/** F-84：网关单条请求的结构化视图（由当日文本日志行解析） */
+export interface ApiLogEntry {
+  /** 日志文件日期（YYYY-MM-DD） */
+  date: string;
+  /** 行首时间（HH:MM:SS） */
+  time: string;
+  method: string;
+  path: string;
+  /** 网关 API Key 展示名（匿名 = "-"） */
+  keyName: string;
+  /** 实际服务池（trae/buddy/buddy-ai/qoder/custom；调度早退行 = "-"） */
+  pool: string;
+  model: string;
+  /** 实际服务账号名（未取号 = "-"） */
+  acct: string;
+  /** 上游账号 uid 前 12 位 */
+  uid: string;
+  stream: boolean;
+  status: number;
+  durationMs: number;
+  /** TTFT（首字延迟，仅流式成功路径记录） */
+  ttfbMs?: number | null;
+  /** custom 池阶段标记 */
+  stage?: string | null;
+  /** 失败原因（落行管线既有脱敏口径） */
+  error?: string | null;
+}
+
+/** F-84：结构化「最近请求」分页结果 */
+export interface ApiLogRecentResult {
+  rows: ApiLogEntry[];
+  total: number;
+  /** true = 达到后端单次解析行数上限，total 仅统计已扫部分 */
+  truncated: boolean;
+}
+
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
 /** 统一模型目录来源池标记（enabled 为运行时派生，不落盘；
  *  disabled 为 L1 显式静态禁用（issue #145 渠道内单模型开关，meta.enabled=false），

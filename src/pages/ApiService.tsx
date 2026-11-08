@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download, ToggleLeft, Gauge } from 'lucide-react';
+import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download, ToggleLeft, Gauge, Copy } from 'lucide-react';
 import {
   BarChart,
   Bar,
@@ -15,6 +15,9 @@ import { useAppStore } from '../store';
 import { useIsDark } from '../lib/useIsDark';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
+import { gatewayBaseUrl } from '../lib/gateway';
+import { copyText } from '../lib/clipboard';
+import { buildModelCopySnippet } from '../components/api/clientExamples';
 import { RefreshTokenBadge } from './accounts/RefreshTokenBadge';
 import { PoolHealthBadges } from '../components/api/PoolHealthBadges';
 import type {
@@ -195,6 +198,15 @@ export default function ApiService() {
       toast('error', `同步官网模型失败：${String(err).slice(0, 120)}`);
     } finally {
       setSyncingModels(false);
+    }
+  };
+
+  /** F-83（issue #174）：模型目录逐行复制 base_url / API Key / 模型名三字段片段 */
+  const copyModelConfig = async (id: string) => {
+    if (await copyText(buildModelCopySnippet(gatewayBaseUrl(), id))) {
+      toast('success', `已复制 ${id} 的接入配置（接口地址 / API Key / 模型 ID）`);
+    } else {
+      toast('error', '复制失败');
     }
   };
 
@@ -1159,6 +1171,13 @@ export default function ApiService() {
                         )}
                       </td>
                       <td className="py-2 text-right">
+                        <button
+                          className="btn-ghost !p-2"
+                          title="复制接入配置（接口地址 / API Key / 模型 ID）"
+                          onClick={() => void copyModelConfig(m.id)}
+                        >
+                          <Copy size={14} />
+                        </button>
                         <button
                           className="btn-ghost inline-flex items-center gap-1 text-xs"
                           onClick={() => void openEdit(m)}

@@ -6,6 +6,22 @@
 
 ---
 
+## [1.6.3] · 2026-11-08 · 语义移植 main bfa0bc2 => dffcecc
+
+> 语义移植 3.9.2 两提交；跳过桌面/OS 专属项（schtasks 唤醒、Trae 凭证直读、静默更新链路）。
+
+### 新功能
+- **跨池重试第一期（F-81）**：调度时收集健康池候选链，流式耗尽按序移交下一池（wb/qoder/trae 收尾接入）；Responses 管线与聚合路径留待第二期。
+- **结构化请求日志（F-84）**：日志页新增「最近请求」双视图（池/结果筛选、TTFT、分页）；查询命令改只读实例，顺带修复 flusher 线程泄漏。
+- **客户端配置示例（F-83）**：接口配置页升级六客户端 Tab（OpenAI/Claude Code/Codex/Cline/Continue/Roo）；模型目录与网关帮助弹窗支持逐行复制接入配置。
+
+### 修复
+- logsSearch 发送 snake_case 键名被 Rust 端静默忽略，时间段过滤从未生效——改发 camelCase。
+- 日志读取命令的 date 参数加 `YYYY-MM-DD` 字面校验（阻断 `../` 路径穿越读任意 .log 文件；回归 `read_log_rejects_non_date_input`）。
+
+### 验证
+- `cargo test`（971+13）/ `cargo check` 零警告 / `tsc --noEmit` / `vitest` 全部通过。
+
 ## [1.6.2] · 2026-11-08 · 语义移植 main 245a611 => bfa0bc2
 
 > 语义移植 1 实质提交（网关流式守卫与豆包并发落库加固批次，未 merge）；跳过豆包全链路、switcher/env 桌面专属等不适用项。

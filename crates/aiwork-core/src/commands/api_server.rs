@@ -7,7 +7,7 @@ use crate::models::{ApiPoolFile, PoolStatus, RemainingCreditsFile};
 use crate::state::AppState;
 
 use crate::api_server::models_sync;
-use crate::api_server::ApiLogger;
+use crate::api_server::{ApiLogRecentResult, ApiLogger};
 
 // ==================== 池管理命令 ====================
 
@@ -772,13 +772,13 @@ fn wb_pool_fingerprint(
 
 /// 列出 API 日志可用日期列表
 pub fn api_logs_list(state: &AppState) -> Vec<String> {
-    let logger = ApiLogger::new(state.logs_dir());
+    let logger = ApiLogger::for_query(state.logs_dir());
     logger.list_dates(30)
 }
 
 /// 读取指定日期的 API 日志内容
 pub fn api_logs_detail(state: &AppState, date: String) -> Option<String> {
-    let logger = ApiLogger::new(state.logs_dir());
+    let logger = ApiLogger::for_query(state.logs_dir());
     logger.read_log(&date)
 }
 
@@ -796,12 +796,53 @@ pub struct ApiLogSearchOpts {
 }
 
 pub fn api_logs_search(state: &AppState, opts: ApiLogSearchOpts) -> Option<String> {
-    let logger = ApiLogger::new(state.logs_dir());
+    let logger = ApiLogger::for_query(state.logs_dir());
     logger.search_log(
         &opts.date,
         opts.start_time.as_deref().unwrap_or(""),
         opts.end_time.as_deref().unwrap_or(""),
         opts.keyword.as_deref().unwrap_or(""),
+    )
+}
+
+/// F-84（issue #174 需求 5）：结构化「最近请求」查询——解析最近 N 天请求行为
+/// 条目（新→旧），分页 + 池/结果筛选；池与账号取自既有落行字段，失败原因沿用
+/// 日志管线脱敏口径
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiLogRecentOpts {
+    /// 回看天数（1~30，默认 3）
+    #[serde(default = "default_recent_days")]
+    pub days: u32,
+    #[serde(default = "default_recent_page")]
+    pub page: u32,
+    #[serde(default = "default_recent_page_size")]
+    pub page_size: u32,
+    #[serde(default)]
+    pub pool: Option<String>,
+    /// "ok" = 2xx / "fail" = 非 2xx / None = 全部
+    #[serde(default)]
+    pub result: Option<String>,
+}
+
+fn default_recent_days() -> u32 {
+    3
+}
+fn default_recent_page() -> u32 {
+    1
+}
+fn default_recent_page_size() -> u32 {
+    50
+}
+
+pub fn api_logs_recent(state: &AppState, opts: ApiLogRecentOpts) -> ApiLogRecentResult {
+    let logger = ApiLogger::for_query(state.logs_dir());
+    logger.recent_entries(
+        opts.days,
+        opts.page,
+        opts.page_size,
+        opts.pool.as_deref(),
+        opts.result.as_deref(),
     )
 }
 

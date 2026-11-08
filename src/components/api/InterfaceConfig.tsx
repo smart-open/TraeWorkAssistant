@@ -16,6 +16,8 @@ import { copyText } from '../../lib/clipboard';
 import { getVisiblePoolText, isPoolVisible } from '../../lib/appVisibility';
 import { useAppStore } from '../../store';
 import { Badge, Modal } from '../ui';
+import { buildClientExamples, CLIENT_EXAMPLE_TABS } from './clientExamples';
+import type { ClientExampleKey } from './clientExamples';
 import type { GatewaySettings, UnifiedModel } from '../../types';
 
 /** 与后端 canonical_id 一致：trim + 小写（§3.3 #1） */
@@ -62,7 +64,9 @@ export default function InterfaceConfig() {
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [copying, setCopying] = useState(false);
+  // F-83：客户端配置示例 Tab（issue #174）与复制成功态（记录 Tab 键，2 秒复位）
+  const [exampleTab, setExampleTab] = useState<ClientExampleKey>('openai');
+  const [copiedTab, setCopiedTab] = useState<ClientExampleKey | null>(null);
 
   // ---- issue #26 模型白名单 ----
   const [whitelist, setWhitelist] = useState<string[]>([]);
@@ -159,35 +163,17 @@ export default function InterfaceConfig() {
     });
   };
 
-  const copyConfigExample = async () => {
+  /** F-83：复制当前客户端 Tab 的配置片段（issue #174，copiedTab 2 秒复位防重复点击误觉） */
+  const copyClientExample = async (key: ClientExampleKey) => {
     const m = gw?.default_model ?? 'glm-5.3';
     const base = gatewayBaseUrl();
-    const example = `# 客户端配置示例（OpenAI 兼容格式）
-接口地址: ${base}/v1
-API Key:  <在「API Keys 管理」中创建并复制>
-模型 ID:  ${m}（统一目录内任一模型均可，请求按模型 ID 匹配资源池）
-
-# Anthropic 兼容端点（Claude Code 等工具直连）
-POST ${base}/v1/messages
-鉴权头: x-api-key: your-api-key 或 Authorization: Bearer
-
-# cURL 测试（请将 API Key 替换为列表中的完整值）
-curl -X POST ${base}/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer your-api-key" \\
-  -d '{
-    "model": "${m}",
-    "messages": [{"role": "user", "content": "你好"}],
-    "stream": true
-  }'`;
-    setCopying(true);
-    try {
-      await withMinDelay(Promise.resolve(copyText(example)));
+    const example = buildClientExamples(base, m)[key];
+    if (await copyText(example)) {
+      setCopiedTab(key);
       toast('success', '配置示例已复制到剪贴板');
-    } catch {
+      window.setTimeout(() => setCopiedTab((cur) => (cur === key ? null : cur)), 2000);
+    } else {
       toast('error', '复制失败');
-    } finally {
-      setCopying(false);
     }
   };
 
@@ -327,15 +313,6 @@ curl -X POST ${base}/v1/chat/completions \\
         <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
           <div className="mb-2 flex items-center justify-between">
             <p className="font-medium">使用方式 & 配置示例</p>
-            <button
-              className="btn-ghost flex items-center gap-1 !p-1 text-xs"
-              onClick={() => void copyConfigExample()}
-              disabled={copying}
-              title="复制完整配置示例"
-            >
-              <Copy size={12} className={copying ? 'animate-pulse' : ''} />
-              {copying ? '复制中…' : '复制示例'}
-            </button>
           </div>
           <div className="space-y-1.5">
             <div>
@@ -374,6 +351,39 @@ curl -X POST ${base}/v1/chat/completions \\
                 支持模型（Max 列 ✓）ID 加 -max 后缀启用 1M 上下文，如 glm-5.3-max；qwen3.8-max 需写 qwen3.8-max-max
               </code>
             </div>
+          </div>
+
+          {/* F-83（issue #174）：客户端配置示例 Tab——每个客户端「复制即可用」，含真实接口地址与 Key 占位 */}
+          <div className="mt-3 border-t border-slate-200 pt-2.5 dark:border-zinc-700/60">
+            <div className="mb-2 flex flex-wrap items-center gap-1">
+              {CLIENT_EXAMPLE_TABS.map((t) => (
+                <button
+                  key={t.key}
+                  className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                    exampleTab === t.key
+                      ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-zinc-400 dark:hover:text-zinc-200'
+                  }`}
+                  onClick={() => setExampleTab(t.key)}
+                >
+                  {t.label}
+                </button>
+              ))}
+              <button
+                className="btn-ghost ml-auto flex items-center gap-1 !p-1 text-xs"
+                onClick={() => void copyClientExample(exampleTab)}
+                title={`复制 ${CLIENT_EXAMPLE_TABS.find((t) => t.key === exampleTab)?.label ?? ''} 配置片段`}
+              >
+                <Copy size={12} />
+                {copiedTab === exampleTab ? '已复制' : '复制'}
+              </button>
+            </div>
+            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md border border-slate-200 bg-white p-2.5 font-mono text-[11px] leading-relaxed text-slate-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+              {buildClientExamples(displayBase, gw?.default_model ?? 'glm-5.3')[exampleTab]}
+            </pre>
+            <p className="mt-1.5 text-[11px] text-slate-400">
+              片段中的 &lt;API Key&gt; 请替换为「API Keys 管理」中创建的完整 Key（ck_ 前缀）；模型 ID 可换成统一目录内任一模型。
+            </p>
           </div>
         </div>
       </div>

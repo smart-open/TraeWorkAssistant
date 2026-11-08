@@ -13,6 +13,7 @@ import { Badge, Modal } from '../ui';
 import { api } from '../../lib/tauri';
 import { gatewayBaseUrl } from '../../lib/gateway';
 import { copyText } from '../../lib/clipboard';
+import { buildModelCopySnippet } from './clientExamples';
 import { isPoolVisible } from '../../lib/appVisibility';
 import { useAppStore } from '../../store';
 import type { GatewaySettings, Settings, UnifiedModel } from '../../types';
@@ -94,6 +95,21 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
     );
   }, [visibleModels, query]);
 
+  // F-83（issue #174）：模型逐行复制——成功态按模型 ID 记录，2 秒复位；重复点击重置定时器
+  const [copiedModel, setCopiedModel] = useState<string | null>(null);
+  const copiedModelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const copyModelConfig = async (id: string) => {
+    if (await copyText(buildModelCopySnippet(base, id))) {
+      setCopiedModel(id);
+      toast('success', `已复制 ${id} 的接入配置（接口地址 / API Key / 模型 ID）`);
+      if (copiedModelTimerRef.current) clearTimeout(copiedModelTimerRef.current);
+      copiedModelTimerRef.current = setTimeout(() => setCopiedModel(null), 2000);
+    } else {
+      toast('error', '复制失败');
+    }
+  };
+
   const copyCurl = async () => {
     const m = exampleModel || 'glm-5.3';
     const example = `curl -X POST ${base}/v1/chat/completions \\
@@ -123,6 +139,7 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
   useEffect(
     () => () => {
       if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      if (copiedModelTimerRef.current) clearTimeout(copiedModelTimerRef.current);
     },
     [],
   );
@@ -274,13 +291,14 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
             <table className="w-full table-fixed text-left text-xs">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-[11px] text-slate-400 dark:border-zinc-700 dark:bg-zinc-800/50 dark:text-zinc-500">
-                  <th className="w-[12%] px-2 py-2 font-medium">供应商</th>
-                  <th className="w-[21%] px-2 py-2 font-medium">模型名称</th>
-                  <th className="w-[11%] px-2 py-2 text-right font-medium">倍率</th>
-                  <th className="w-[21%] px-2 py-2 font-medium" title="思考档位（统一六档）">档位</th>
-                  <th className="w-[6%] px-2 py-2 text-center font-medium" title="Max Mode（1M 上下文，仅 Trae 池）">Max</th>
-                  <th className="w-[6%] px-2 py-2 text-center font-medium">图片</th>
-                  <th className="w-[23%] px-2 py-2 font-medium">来源</th>
+                  <th className="w-[11%] px-2 py-2 font-medium">供应商</th>
+                  <th className="w-[19%] px-2 py-2 font-medium">模型名称</th>
+                  <th className="w-[10%] px-2 py-2 text-right font-medium">倍率</th>
+                  <th className="w-[18%] px-2 py-2 font-medium" title="思考档位（统一六档）">档位</th>
+                  <th className="w-[5%] px-2 py-2 text-center font-medium" title="Max Mode（1M 上下文，仅 Trae 池）">Max</th>
+                  <th className="w-[5%] px-2 py-2 text-center font-medium">图片</th>
+                  <th className="w-[20%] px-2 py-2 font-medium">来源</th>
+                  <th className="w-[12%] px-2 py-2 text-right font-medium" title="复制接入配置（接口地址 / API Key / 模型 ID）">复制</th>
                 </tr>
               </thead>
               <tbody>
@@ -344,12 +362,25 @@ export default function GatewayHelpModal({ open, onClose }: { open: boolean; onC
                           {!enabled && <Badge tone="amber">未启用</Badge>}
                         </div>
                       </td>
+                      <td className="px-2 py-2 text-right">
+                        <button
+                          className="btn-ghost inline-flex !p-1.5 text-slate-400 hover:text-brand-500"
+                          title="复制接入配置（接口地址 / API Key / 模型 ID）"
+                          onClick={() => void copyModelConfig(m.id)}
+                        >
+                          {copiedModel === m.id ? (
+                            <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400">已复制</span>
+                          ) : (
+                            <Copy size={13} />
+                          )}
+                        </button>
+                      </td>
                     </tr>
                   );
                 })}
                 {filtered.length === 0 && (
                   <tr>
-                    <td colSpan={7} className="px-2 py-6 text-center text-slate-400 dark:text-zinc-500">
+                    <td colSpan={8} className="px-2 py-6 text-center text-slate-400 dark:text-zinc-500">
                       {models.length === 0
                         ? '模型目录加载中或为空'
                         : visibleModels.length === 0

@@ -682,6 +682,7 @@ pub fn qoder_stream_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    fallback: Vec<super::dispatch::PoolCandidate>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -720,7 +721,7 @@ pub fn qoder_stream_chat(
             });
         }
 
-        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
+        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &fallback);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -732,8 +733,31 @@ pub fn qoder_stream_chat(
         .unwrap_or_else(|_| internal_error_response())
 }
 
+/// F-81：跨池移交尝试（流式两处耗尽收尾共用）。成功 = 剩余流已移交下一池
+///（调用方直接 return，不再发错误帧）；链空/客户端断连/全不支持 → false。
 #[allow(clippy::too_many_arguments)]
-fn run_qoder_stream(
+fn try_cross_pool(
+    state: &Arc<ApiSharedState>,
+    fallback: &[super::dispatch::PoolCandidate],
+    body_vec: &[u8],
+    proto: Protocol,
+    key_id: &str,
+    chat_id: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    guard: InflightGuard,
+    start_ts: Instant,
+) -> bool {
+    if fallback.is_empty() || tx.is_closed() {
+        return false;
+    }
+    super::cross_pool::continue_stream_on_next_pool(
+        state, "qoder", fallback, body_vec, proto, key_id, chat_id, tx, guard,
+        &std::collections::HashSet::new(), start_ts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_qoder_stream(
     state: &Arc<ApiSharedState>,
     body_vec: &[u8],
     model: &str,
@@ -743,6 +767,7 @@ fn run_qoder_stream(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     start_ts: Instant,
     mut guard: InflightGuard,
+    fallback: &[super::dispatch::PoolCandidate],
 ) {
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
@@ -967,6 +992,10 @@ fn run_qoder_stream(
             // 按客户端协议分流错误帧（Anthropic 收 event: error、Responses 收
             // response.failed，不再裸 data: 帧不可读）；code 保持字符串
             // "no_healthy_account"（客户端兼容）
+            // F-81 跨池移交：链非空 → 下一池接管剩余流（503 账面行保留）
+            if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, start_ts) {
+                return;
+            }
             send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
             return;
         }
@@ -1043,6 +1072,10 @@ fn run_qoder_stream(
                         ));
                     }
                     // 按客户端协议分流错误帧（同预算耗尽收尾口径）
+                    // F-81 跨池移交：链非空 → 下一池接管剩余流（503 账面行保留）
+                    if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, start_ts) {
+                        return;
+                    }
                     send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
                     return;
                 }
