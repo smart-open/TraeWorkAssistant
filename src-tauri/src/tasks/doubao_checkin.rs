@@ -680,6 +680,10 @@ fn clamp_fail_message(v: Option<&str>) -> Option<String> {
     v.filter(|m| !m.is_empty())
         .map(|m| {
             m.chars()
+                // 换行/制表先映射为空格（审查发现：原 is_control 直删会把多行文案
+                // 在行边界粘连成 "HTTP 401详情：xxx" 式畸形串，下游 clamp_msg 的
+                // 单行化 replace 恒不命中成死代码）；其余控制字符仍剔除
+                .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
                 .filter(|c| !c.is_control())
                 .take(500)
                 .collect::<String>()
@@ -710,7 +714,10 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
                     &format!("豆包签到轮次锁获取失败：{}", fail.describe()),
                 );
             }
-            return Ok(json!({ "ok": true, "skipped": "其他进程正在执行签到，本轮跳过", "reason": fail.describe() }));
+            // 审查发现（对齐 825-833 落库锁 Busy 与 wb/qoder 同场景口径）：轮次锁
+            // Busy 跳过也须携带 skipped_busy——否则调度器 tick 落入 mark_run 分支
+            // 固化「当日已跑」，赢家（他进程）批次失败时当日重试链与首败通知全丢
+            return Ok(json!({ "ok": true, "skipped_busy": true, "skipped": "其他进程正在执行签到，本轮跳过", "reason": fail.describe() }));
         }
     };
     let targets = collect_targets(state)?;
@@ -779,6 +786,16 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
     // 完成，Err 仅改变汇总出口。GUI「立即签到全部」经此路径收到 Err 时 toast 展示
     // 失败汇总，无数据副作用
     if failed > 0 {
+        // 审查 L-1：汇总串逐条钳制（单行化 + 120 字截断）——超长多行错误文案会污染
+        // CLI `--task-run` 退出输出与失败通知；errors 数组保原始完整供前端展示
+        let clamp_msg = |m: &str| -> String {
+            let one_line = m.replace(['\n', '\r'], " ");
+            let mut clamped: String = one_line.chars().take(120).collect();
+            if one_line.chars().count() > 120 {
+                clamped.push('…');
+            }
+            clamped
+        };
         let err_head = errors
             .iter()
             .take(3)
@@ -789,7 +806,7 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
                     format!(
                         "{}：{}",
                         e.get("name").and_then(Value::as_str).unwrap_or("未知账号"),
-                        m
+                        clamp_msg(m.as_str())
                     )
                 })
             })
@@ -818,7 +835,12 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
         // 幂等）；若固化 mark_run 会「结果丢了且当日已跑」双重损失。字段仅在
         // true 时存在（tick 按字段存在性分流，恒置 false 会误入 busy 分支）。
         // 文案不承诺「自动补录」：调度器开启时由下一 tick 补录，GUI 手动路径
-        // 需用户稍后重试（签到幂等，重试只回 already，无重复奖励）
+        // 需用户稍后重试（签到幂等，重试只回 already，无重复奖励）。
+        // 已知缺口（审查披露）：补录轮对已签账号走 already（reward=None）——
+        // 若本轮 success 账号的 reward 随落库失败一起丢失，服务端已发放的额度
+        // 明细不会回填当日结果表（池回写与运维历史不受影响），看板「今日新增」
+        // 可能缺失该笔；CLI 并发对下他方进程会写入同批 reward，窗口仅池变更/
+        // 跨版本并存时打开
         ret["skipped_busy"] = json!(true);
         ret["skipped"] = json!("签到结果落库被其他进程占用，本轮结果未记录；稍后重试签到即可补录");
     }

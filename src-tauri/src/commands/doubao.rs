@@ -1760,11 +1760,11 @@ pub fn doubao_checkin_task_register(state: State<AppState>, time: String) -> Res
     // 前端「每日任务」输入框读 settings、徽标读 schtasks，会出现 09:15/15:00 各说各话
     {
         let store = crate::store::db(&state.data_dir);
-        // 原子读-改-写（审查修复）：与 settings_set 的 patch 保存并发时，
-        // 旧两段式读-改-写可互相覆盖丢键；改走 kv_update 单锁合并
+        // 原子读-改-写（审查修复）：两段式 kv_get→kv_set 与用户同时保存设置面板
+        // 并发时，旧快照整体覆盖会丢对方刚写入的键；改走 kv_update 单锁合并。
+        // 审查 #20：比较值无变化时返回 Ok(false) 不写盘（对齐 env.rs::persist_detected_path
+        // / misc.rs 口径，消除计划任务注册重试路径的写放大）
         if let Err(e) = store.kv_update("app_settings", |v| {
-            // 变化检测（审查修复）：时刻与存量相同时返回 Ok(false) 空转，跳过
-            // 序列化+UPSERT+updated_at 刷新（对齐 env.rs/settings_set 口径）
             if v.get("doubao_checkin_hhmm").and_then(|x| x.as_str()) == Some(time.as_str()) {
                 return Ok::<_, String>(false);
             }

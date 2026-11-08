@@ -67,11 +67,6 @@ export default function DoubaoSettings() {
   // probe 自动保活开关（main 2026-11-06，方案 A，默认开）：签到前 probe 缺失/过期时自动
   // 开代理 + 切客户端抓包对齐（710010702 设备指纹缺失的自愈链）
   const [probeAutoKeepalive, setProbeAutoKeepalive] = useState(true);
-  // 回填一次性守卫（审查复核新发现）：下方 effect 依赖任一 settings key 变化都会重跑
-  //（如签到时刻保存成功），若每次重跑都回填，会把用户在 path/renewUrl/quotaUrl 等
-  // 输入框中未保存的编辑打回后端值——回填只在 settings 首次到达时执行一次
-  const backfillDoneRef = useRef(false);
-
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
     try {
@@ -190,55 +185,60 @@ export default function DoubaoSettings() {
     }
   };
 
-  // 额度数据同步（doubao-sync）：模式 + 间隔/时刻一并保存；后端归一化（间隔 clamp 1..24）。
-  // 审查修复：恢复被误删的配置入口（后端调度器仍按 doubao_sync_mode 运行）。
-  // 校验失败/保存失败一律回弹已保存值（store 中 settings 即最后成功落库值），
-  // 防输入框驻留非法草稿与「已保持原值」文案自相矛盾（审查修复）
+  // 豆包数据同步（doubao-sync）：模式 + 间隔/时刻一并保存；后端归一化（间隔 clamp 1..24）。
+  // 审查 #18 补齐（对齐 changeCheckinHhmm 范式）：三个 sync 孪生 handler 共用
+  // 并发序号守卫（失焦连发时仅最后请求可提示成功/回滚）+ 失败回滚输入框
+  const syncConfigSeqRef = useRef(0);
   const saveSyncConfig = async (patch: { doubao_sync_mode?: string; doubao_sync_hours?: string; doubao_sync_hhmm?: string }) => {
     try {
       await saveSettings(patch);
       return true;
     } catch {
-      // store.saveSettings 失败时已 pushToast 错误详情，此处不再重复弹（审查修复：双重 toast）
+      // store.saveSettings 失败时已 pushToast 错误详情，此处不再双弹
       return false;
     }
   };
-  const savedSyncHours = settings?.doubao_sync_hours ?? '2';
-  const savedSyncHhmm = settings?.doubao_sync_hhmm ?? '23:50';
   const changeSyncMode = async (v: string) => {
-    const prev = syncMode;
     setSyncMode(v);
+    const seq = ++syncConfigSeqRef.current;
     if (await saveSyncConfig({ doubao_sync_mode: v })) {
-      pushToast('success', v === 'off' ? '已关闭豆包数据同步' : '同步模式已保存');
-    } else {
-      setSyncMode(prev); // 保存失败回滚：防 select 显示与库内值分叉
+      if (seq === syncConfigSeqRef.current) pushToast('success', v === 'off' ? '已关闭豆包数据同步' : '同步模式已保存');
+    } else if (seq === syncConfigSeqRef.current) {
+      setSyncMode(settings?.doubao_sync_mode || 'every_hours');
     }
   };
   const changeSyncHours = async (v: string) => {
     setSyncHours(v);
-    if (!/^\d+$/.test(v.trim())) {
+    // 严格 /^\d+$/ 校验（审查 M-7⑤）：parseInt 会放行 "2x" 类输入（静默按 2 保存）。
+    // 校验失败回弹已保存值（store.settings 即最后成功落库值，审查 #18）——输入框
+    // 不驻留非法草稿，与「已保持原值」toast 口径一致
+    const n = /^\d+$/.test(v.trim()) ? Number.parseInt(v.trim(), 10) : NaN;
+    if (!Number.isFinite(n) || n < 1 || n > 24) {
       pushToast('warn', '同步间隔应为 1-24 的整数（已保持原值）');
-      setSyncHours(savedSyncHours);
+      setSyncHours(settings?.doubao_sync_hours || '2');
       return;
     }
-    const n = Number.parseInt(v.trim(), 10);
-    if (n < 1 || n > 24) {
-      pushToast('warn', '同步间隔应为 1-24 的整数（已保持原值）');
-      setSyncHours(savedSyncHours);
-      return;
+    const seq = ++syncConfigSeqRef.current;
+    if (await saveSyncConfig({ doubao_sync_hours: String(n) })) {
+      if (seq === syncConfigSeqRef.current) pushToast('success', `同步间隔已保存（每 ${n} 小时）`);
+    } else if (seq === syncConfigSeqRef.current) {
+      setSyncHours(settings?.doubao_sync_hours || '2');
     }
-    if (await saveSyncConfig({ doubao_sync_hours: String(n) })) pushToast('success', `同步间隔已保存（每 ${n} 小时）`);
-    else setSyncHours(savedSyncHours);
   };
   const changeSyncHhmm = async (v: string) => {
     setSyncHhmm(v);
     if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(v)) {
       pushToast('warn', '时间格式应为 HH:MM（如 23:50，已保持原值）');
-      setSyncHhmm(savedSyncHhmm);
+      // 校验失败回弹已保存值：输入框不驻留非法草稿（审查 M-7①）
+      setSyncHhmm(settings?.doubao_sync_hhmm || '23:50');
       return;
     }
-    if (await saveSyncConfig({ doubao_sync_hhmm: v })) pushToast('success', `同步时刻已保存（每日 ${v}）`);
-    else setSyncHhmm(savedSyncHhmm);
+    const seq = ++syncConfigSeqRef.current;
+    if (await saveSyncConfig({ doubao_sync_hhmm: v })) {
+      if (seq === syncConfigSeqRef.current) pushToast('success', `同步时刻已保存（每日 ${v}）`);
+    } else if (seq === syncConfigSeqRef.current) {
+      setSyncHhmm(settings?.doubao_sync_hhmm || '23:50');
+    }
   };
 
   const refreshTaskStatus = async () => {
@@ -292,31 +292,43 @@ export default function DoubaoSettings() {
     }
   };
 
+  // 审查修复：effect 体内回填的文本草稿仅在对应 settings 字段实际变化时才写回——
+  // 依赖数组里的开关（本页改动即保存）变化触发 effect 重跑时，不得清掉其他输入框
+  // 未保存的草稿（如「额度接口」打字未保存时翻动保活开关，无条件回填会打回旧值）
+  const prevTextSettingsRef = useRef<Record<string, string | null>>({});
+
   useEffect(() => {
-    // 回填一次性（backfillDoneRef）：依赖任一 settings key 变化都会重跑本 effect，
-    // 文本输入（path/renewUrl/quotaUrl）的回填只应跟随 settings 首次到达，
-    // 重跑会覆盖用户未保存的编辑；开关/时刻类回填同理——它们各自有保存函数
-    // 即时落库，后端值即用户意图，回打无益
-    if (settings && !backfillDoneRef.current) {
-      backfillDoneRef.current = true;
-      if (settings.doubao_path) setPath(settings.doubao_path);
-      if (settings.doubao_renew_url) setRenewUrl(settings.doubao_renew_url);
-      if (settings.doubao_quota_url) setQuotaUrl(settings.doubao_quota_url);
+    const prev = prevTextSettingsRef.current;
+    const cur: Record<string, string | null> = {
+      path: settings?.doubao_path ?? null,
+      renew_url: settings?.doubao_renew_url ?? null,
+      quota_url: settings?.doubao_quota_url ?? null,
+      sync_mode: settings?.doubao_sync_mode ?? null,
+      sync_hours: settings?.doubao_sync_hours ?? null,
+      sync_hhmm: settings?.doubao_sync_hhmm ?? null,
+      checkin_hhmm: settings?.doubao_checkin_hhmm ?? null,
+    };
+    if (cur.path && cur.path !== prev.path) setPath(cur.path);
+    if (cur.renew_url && cur.renew_url !== prev.renew_url) setRenewUrl(cur.renew_url);
+    if (cur.quota_url && cur.quota_url !== prev.quota_url) setQuotaUrl(cur.quota_url);
+    if (settings) {
       setIncludeIdb(!!settings.doubao_snapshot_include_idb);
       // !== false：旧版后端缺字段时按默认开展示（issue #147 新字段向后兼容）
       setKeepaliveEnabled(settings.doubao_keepalive_enabled !== false);
       setQuotaEnabled(settings.doubao_quota_enabled !== false);
       setCheckinEnabled(settings.doubao_checkin_enabled !== false);
       setProbeAutoKeepalive(settings.doubao_probe_auto_keepalive !== false);
-      if (settings.doubao_sync_mode) setSyncMode(settings.doubao_sync_mode);
-      if (settings.doubao_sync_hours) setSyncHours(settings.doubao_sync_hours);
-      if (settings.doubao_sync_hhmm) setSyncHhmm(settings.doubao_sync_hhmm);
-      if (settings.doubao_checkin_hhmm) {
-        setCheckinHhmm(settings.doubao_checkin_hhmm);
-        setCheckinHhmmDraft(settings.doubao_checkin_hhmm);
-        checkinHhmmSavedRef.current = settings.doubao_checkin_hhmm;
+      if (cur.sync_mode && cur.sync_mode !== prev.sync_mode) setSyncMode(cur.sync_mode);
+      if (cur.sync_hours && cur.sync_hours !== prev.sync_hours) setSyncHours(cur.sync_hours);
+      if (cur.sync_hhmm && cur.sync_hhmm !== prev.sync_hhmm) setSyncHhmm(cur.sync_hhmm);
+      if (cur.checkin_hhmm && cur.checkin_hhmm !== prev.checkin_hhmm) {
+        setCheckinHhmm(cur.checkin_hhmm);
+        // mac 草稿模型同步：draft 与已保存值基线一并推进（对齐 HEAD 回填口径）
+        setCheckinHhmmDraft(cur.checkin_hhmm);
+        checkinHhmmSavedRef.current = cur.checkin_hhmm;
       }
     }
+    prevTextSettingsRef.current = cur;
     // 审查修复（P2）：schtasks 状态查询仅 Windows 发起——mac 上后端恒 Err，
     // catch 静默吞掉徒增无谓 IPC；注册卡片本就按平台隐藏
     if (platform === 'windows') {
@@ -325,7 +337,7 @@ export default function DoubaoSettings() {
       void refreshCheckinTaskStatus();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_checkin_hhmm, settings?.doubao_probe_auto_keepalive]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_checkin_hhmm, settings?.doubao_sync_mode, settings?.doubao_sync_hours, settings?.doubao_sync_hhmm, settings?.doubao_probe_auto_keepalive]);
 
   const detect = async () => {
     setDetecting(true);
@@ -756,8 +768,17 @@ export default function DoubaoSettings() {
               className="input w-40 text-xs"
             >
               <option value="every_hours">按间隔同步</option>
-              <option value="daily_at">每日定时同步</option>
+              <option value="hourly">每小时同步</option>
+              {/* 每日档必须发 `daily`（后端 credits_sync_mode 合法集
+                  off/hourly/daily/every_hours/every_days）：曾误发 `daily_at`，
+                  落入未知值兜底被当成 every_hours 调度、时刻被忽略 */}
+              <option value="daily">每日定时同步</option>
               <option value="off">关闭同步</option>
+              {/* 存量旧值兼容显示（对齐 BuddyAiSettings 五档；值可经配置文件直写
+                  落库）：无匹配 option 时 select 渲染空白，存量配置不可见 */}
+              {!['every_hours', 'hourly', 'daily', 'off'].includes(syncMode) && (
+                <option value={syncMode}>{`旧版档位：${syncMode}`}</option>
+              )}
             </select>
             {syncMode === 'every_hours' && (
               <>
@@ -771,7 +792,7 @@ export default function DoubaoSettings() {
                 />
               </>
             )}
-            {syncMode === 'daily_at' && (
+            {syncMode === 'daily' && (
               <>
                 <span className="shrink-0 text-slate-500">时刻</span>
                 <input

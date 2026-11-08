@@ -1432,8 +1432,9 @@ pub fn wb_pool_load(s: &Store) -> Value {
     json!({ "accounts": accounts })
 }
 
-/// 读整池（可失败口径，调度器空池早退专用）：rows_all 错误原样上抛，用于区分
-/// 「池为空」与「池读取失败」——吞错版会把读取失败误判成空池、静默丢当日签到
+/// 可失败口径读整池（审查 M-4）：rows_all 读取失败（库损坏/IO 故障）如实上抛，
+/// 供调度器空池早退区分「真空池」与「读失败」——后者走 Err 重试链（mark_fail
+/// 可见），不再被 unwrap_or_default 吞成空池静默 skipped_empty_pool 当日无声丢失
 pub fn wb_pool_load_checked(s: &Store) -> Result<Value, String> {
     let accounts: Vec<Value> = s
         .rows_all("wb_accounts")?
@@ -2348,7 +2349,7 @@ pub fn qoder_pool_load(s: &Store) -> Value {
     json!({ "accounts": accounts })
 }
 
-/// 读整池（可失败口径，调度器空池早退专用）：语义同 wb_pool_load_checked
+/// 可失败口径读整池（审查 M-4，同 wb_pool_load_checked）
 pub fn qoder_pool_load_checked(s: &Store) -> Result<Value, String> {
     let accounts: Vec<Value> = s
         .rows_all("qoder_accounts")?

@@ -1008,8 +1008,6 @@ fn run_qoder_stream(
                     // 审查 #8：message 改传 exhaust_msg（对齐 routes.rs Trae 流式收尾
                     // L1949 同款）——空完成主导时归因文案（渠道指纹拦截/设备信任建议）
                     // 随错误帧回传客户端，客户端仅看干瘪「无可用账号」无法排障
-                    // （main 侧 send_stream_error_named 即本 helper 的 &str code 版，
-                    // macos 分支 dfa6e02 已统一为单 helper，语义一致）
                     send_stream_error(tx, proto, "no_healthy_account", &exhaust_msg);
                     return;
                 }

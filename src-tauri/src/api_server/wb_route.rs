@@ -1035,21 +1035,24 @@ fn run_wb_stream(
                     // （kind=empty，样本 = 清洗前原始请求体），返回日志注记供反查
                     let sample_note =
                         wb_payload::empty_sample_note(&exhaust_tag, state.pool_label(), body_vec);
-                    // 与取号耗尽/非流式收尾同门控（审查修复 L 同构）：空注记不再落
-                    // 调试行，流式/非流式日志口径一致
-                    if !sample_note.is_empty() {
-                        state.logger.log_debug_line(format!(
-                            "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} cut_hits={} pool={} reasons=[{}]{}",
-                            tried.len(),
-                            attempts,
-                            empty_hits,
-                            cut_hits,
-                            state.pool_label(),
-                            diag_summary.join(", "),
-                            sample_note,
-                        ));
-                    }
-                    // 审查 P1-1：无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
+                    // 审查 #8 修正（上游复查发现）：本行是 diag_summary（逐账号不可用
+                    // 原因）在 wb 路径的唯一落点——上方 log_request 的 exhaust_msg
+                    // 仅含聚合计数与归因语义、不含 reasons，若随指纹样本一并门控，
+                    // 最常见的非指纹耗尽（冷却/硬额度/transport cut）的逐账号原因
+                    // 将无任何日志可查（Trae 池同场景 reasons 行仍无条件落账）。
+                    // 故整行保留不门控；指纹样本后缀仍仅 CHANNEL_FINGERPRINT_BLOCK
+                    // 主导时非空（qoder 路径行不含 reasons，维持原门控不动）
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] {exhaust_tag} tried={} attempts={} empty_hits={} cut_hits={} pool={} reasons=[{}]{}",
+                        tried.len(),
+                        attempts,
+                        empty_hits,
+                        cut_hits,
+                        state.pool_label(),
+                        diag_summary.join(", "),
+                        sample_note,
+                    ));
+                    // 无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
                     // 各自形态，helper 内已含收尾帧），不再硬编码 OpenAI 格式；
                     // 文案对齐 qoder_route 口径下发 exhaust_msg（指纹拦截场景给出差异化
                     // 提示），code 保持 no_healthy_account（客户端兼容）

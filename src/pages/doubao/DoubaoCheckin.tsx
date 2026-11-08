@@ -137,7 +137,9 @@ export default function DoubaoCheckin() {
           outcome?: { status?: string; message?: string; reward?: number };
           probe_keepalive_error?: string | null;
         };
-        if (!probeErr && r.probe_keepalive_error) probeErr = r.probe_keepalive_error;
+        // 首因语义（审查 L-2）：首个非空值胜——probe_keepalive_error 仅首个触发
+        // 保活的账号响应携带，覆盖语义（最后非空值胜）与注释口径矛盾
+        if (r.probe_keepalive_error && !probeErr) probeErr = r.probe_keepalive_error;
         const o = r.outcome;
         const st = o?.status;
         if (st === 'fail') {
@@ -168,10 +170,9 @@ export default function DoubaoCheckin() {
     // 与按日落库 message，重开页面日历明细仍可查）。probeHint 仅失败>0 时拼接——
     // 全成功时该提示（建议重试）与结果自相矛盾
     const failHint = firstFailMsg ? `；首因：${firstFailMsg.slice(0, 80)}` : '';
-    const probeHint =
-      failed > 0 && probeErr
-        ? `；抓包参数未对齐（${probeErr.slice(0, 60)}）——易被风控拒绝，请开启代理并保持豆包客户端打开后重试`
-        : '';
+    // 仅失败时拼接抓包提示（审查 L-3）：全成功 toast 带「易被风控拒绝请重试」与
+    // 成功结果矛盾
+    const probeHint = failed > 0 && probeErr ? `；抓包参数未对齐（${probeErr.slice(0, 60)}）——易被风控拒绝，请开启代理并保持豆包客户端打开后重试` : '';
     pushToast(
       failed > 0 ? 'warn' : 'success',
       `签到完成：成功 ${ok} · 失败 ${failed}${reward > 0 ? ` · 新增额度 +${reward.toLocaleString()}` : ''}${failHint}${probeHint}`,

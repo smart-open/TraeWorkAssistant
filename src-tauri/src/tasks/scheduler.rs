@@ -386,10 +386,25 @@ fn tick(
                 // 签到空池改打 skipped_empty_pool，当日导入账号后下一 tick 正常
                 // 补打。新增空池任务若同属「漏跑=丢收益」语义，须同款豁免
                 if v.get("skipped_busy").is_some() {
-                    fs_utils::app_log(
-                        &st.data_dir,
-                        &format!("[调度器] {}（{}）：{}（不记当日已跑，稍后重试）", t.name, trigger, summary),
-                    );
+                    // 空转封顶（审查修复，对齐 skipped_transient_cooldown 先例）：不
+                    // mark_run 依赖「占用方稍后释放、下一 tick 补跑」的自愈假设；若
+                    // 轮次/落库锁被活进程异常长持（wait 超时恒 Busy），无上限时全天
+                    // 逐 tick 重跑整轮真实签到（每轮全账号网络请求）+ 逐 tick 刷屏
+                    // 日志。连续达上限按当日完成处理，停止补打
+                    let n = transient_skip_streak_bump(t.key);
+                    if n >= TRANSIENT_SKIP_ROUND_CAP {
+                        transient_skip_streak_reset(t.key);
+                        mark_run(st, t.key, &today, &summary);
+                        fs_utils::app_log(
+                            &st.data_dir,
+                            &format!("[调度器] {}（{}）：连续 {n} 轮锁占用未释放，按当日完成处理（停止补跑；如需排查请手动触发查看根因）", t.name, trigger),
+                        );
+                    } else {
+                        fs_utils::app_log(
+                            &st.data_dir,
+                            &format!("[调度器] {}（{}）：{}（不记当日已跑，稍后重试）", t.name, trigger, summary),
+                        );
+                    }
                 // 审查修复 M2 收窄：skipped_transient_cooldown（trae-checkin 瞬时冷却
                 // 账号待补打，≤10min 自愈）同样不 mark_run——跳过≠完成，mark_run 会
                 // 固化「当日已跑」关闭当日重试链致冷却账号当日签到丢失；仅落日志，
@@ -669,11 +684,11 @@ fn run_task(
             // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）。
             // 分支级早退而非任务层打标：wb 调度轮次会向前端转发 start/done 事件
             //（issue #134 方案1），空池若仍每 tick 走整轮会向前端刷「成功 0」toast；
-            // 早退置于抢轮次锁之前——空轮不占锁，连击统计不动（空轮本就不变）。
-            // 池读取失败与空池分流（审查修复）：吞错版 wb_pool_load 会把读取失败
-            // 误判成空池、静默丢当日签到——读取失败走 Err 重试链（mark_fail 可见）
+            // 早退置于抢轮次锁之前——空轮不占锁，连击统计不动（空轮本就不变）
+            // 审查 M-4：可失败口径读池——rows_all 读取失败走 Err 重试链（mark_fail
+            // 可见），不再被 unwrap_or_default 吞成空池静默 skipped_empty_pool
             let pool = crate::store::docs::wb_pool_load_checked(&crate::store::db(&st.data_dir))
-                .map_err(|e| format!("WorkBuddy 池读取失败：{e}"))?;
+                .map_err(|e| format!("WorkBuddy 账号池读取失败：{e}"))?;
             if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
                 return Ok(json!({ "ok": true, "skipped": "无 WorkBuddy 账号", "skipped_empty_pool": true }));
             }
@@ -911,10 +926,11 @@ fn run_task(
         "qoder-checkin" => {
             // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：空池提前
             // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）；
-            // 早退置于抢轮次锁之前——空轮不占锁，连击/重试判定均不触及。
-            // 池读取失败与空池分流（审查修复）：读取失败走 Err 重试链，见 wb-checkin
+            // 早退置于抢轮次锁之前——空轮不占锁，连击/重试判定均不触及
+            // 审查 M-4：可失败口径读池——rows_all 读取失败走 Err 重试链（mark_fail
+            // 可见），不再被 unwrap_or_default 吞成空池静默 skipped_empty_pool
             let pool = crate::store::docs::qoder_pool_load_checked(&crate::store::db(&st.data_dir))
-                .map_err(|e| format!("Qoder 池读取失败：{e}"))?;
+                .map_err(|e| format!("Qoder 账号池读取失败：{e}"))?;
             if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
                 return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号", "skipped_empty_pool": true }));
             }

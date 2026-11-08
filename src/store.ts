@@ -1307,13 +1307,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       await api.misc.settingsSet(patch);
     } catch (err) {
       // 字段级回滚（C3 审查修复）：只还原本次 patch 涉及的字段，且以最新 state
-      // 为基做函数式合并——整表回滚会把保存期间其他通道刚写入的字段一并回滚
+      // 为基做函数式合并——整表回滚会把保存期间其他通道刚写入的字段一并回滚。
+      // 条件回滚（审查修复）：仅当该字段当前值仍等于本次乐观写入值时才回滚——
+      // 同字段并发保存时（先发请求失败、后发请求成功在先返回），无条件回滚会把
+      // 后写成功值 clobber 回旧值，造成 store/UI 与后端不一致；调用方的 seq 守卫
+      // 只能拦住 handler 层回滚，拦不住 store 层这次 set
       set((s) => {
-        const revert: Partial<Settings> = {};
+        const cur = { ...(s.settings ?? defaultSettings()) } as unknown as Record<string, unknown>;
+        const optimistic = next as unknown as Record<string, unknown>;
         for (const k of Object.keys(patch) as Array<keyof Settings>) {
-          (revert as Record<string, unknown>)[k] = current[k];
+          if (cur[k] === optimistic[k]) {
+            cur[k] = (current as unknown as Record<string, unknown>)[k];
+          }
         }
-        return { settings: { ...(s.settings ?? defaultSettings()), ...revert } };
+        return { settings: cur as unknown as Settings };
       });
       get().pushToast('error', `保存设置失败：${String(err)}`);
       // rethrow：让调用方 catch 感知失败，避免误弹「已保存」成功提示

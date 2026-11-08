@@ -67,6 +67,8 @@ pub(super) fn jwt_claims(token: &str) -> Option<serde_json::Value> {
 /// 系统浏览器打开 URL（issue #153 修复 4：ShellExecuteW「open」动词直开 URL，
 /// 由系统按协议关联选默认浏览器——cmd start 依赖 shell 解析且控制台隐藏不稳定；
 /// 仅放行 http/https 且无引号空格，单参数直传无 shell 层，& / % 等保留字无需转义）
+/// 审查 #13：补逐函数 cfg 门控（对齐 qoder/oauth.rs 同型函数范式——windows_sys
+/// 为 Windows 专属，非 Windows 目标编译 E0433/E0308 一致性兜底）
 #[cfg(windows)]
 pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
@@ -92,8 +94,8 @@ pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     }
 }
 
-/// 其余平台兜底占位（审查修复）：与 cert.rs 口径对齐——项目仅声明 Win/mac 目标，
-/// 但仅双平台变体在其余目标下无实现（E0412）
+/// 非 Windows 非 macOS 占位：项目仅声明 Win/mac 目标，但仅双平台变体在
+/// 其余目标下无实现（E0412）
 #[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     Err(format!("当前平台不支持系统浏览器打开：{url}"))

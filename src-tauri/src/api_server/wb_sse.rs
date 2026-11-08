@@ -856,6 +856,8 @@ pub fn stream_forward_ex(
                             // 流出」就地收尾不换号，空完成换号重试（issue #57）对 Responses
                             // 失效，且真换号将向已含 created 的流拼接第二份响应（与 P2-9
                             // 注释矛盾）。流内 Error 帧路径保持无条件 created+failed 不受影响
+                            // （复用循环级 frame_has_payload：比上游分支局部版更严格——
+                            // finish/usage-only 帧亦视为噪声，空完成换号重试口径一致）
                             if frame_has_payload {
                                 resp_ensure_created!();
                                 // created 帧已下发：后续流内错误必须就地 response.failed，

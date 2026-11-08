@@ -359,6 +359,13 @@ fn stream_convert_src(
                     sent_any = true;
                 }
                 "error" => {
+                    // 迟到错误守卫（docker 审查 #2 同族）：done 已收口（[DONE] 已发）
+                    // 后上游再滴出的 error 不得再向客户端拼接第二份 error+[DONE] 帧、
+                    // 不得改写 error_info——已完整交付的请求被迟到错误记为失败会
+                    // 触发调用方误落账/冷却正常账号
+                    if saw_done {
+                        continue;
+                    }
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
                     // 已有数据流出：就地透传错误并结束；否则延迟给调用方决策（可重试）
                     if sent_any {
@@ -533,6 +540,10 @@ fn stream_convert_text_src(
                     sent_any = true;
                 }
                 "error" => {
+                    // 迟到错误守卫（docker 审查 #2 同族，与 stream_convert_lines 同款）
+                    if saw_done {
+                        continue;
+                    }
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
                     // 已有文本流出：就地透传错误并结束；否则延迟给调用方决策（可重试）
                     if sent_any {
@@ -1209,6 +1220,12 @@ fn stream_convert_anthropic_src(
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
+                    // 迟到事件守卫（docker 审查 #2）：done 已收口（message_stop 已发）
+                    // 后上游仍滴出的 output/thought 会重开 content_block 且永不闭合
+                    // ——message_stop 后协议违规，严格客户端挂起/报错。静默忽略
+                    if saw_done {
+                        continue;
+                    }
                     // thinking 投影：reasoning_content → thinking_delta（文本块
                     // 之前输出，语义对齐 Anthropic thinking→text 块顺序）
                     if !ev.reasoning.is_empty() {
@@ -1333,6 +1350,13 @@ fn stream_convert_anthropic_src(
                     saw_done = true;
                 }
                 "error" => {
+                    // 迟到错误守卫（docker 审查 #2 同族）：done 已收口（message_stop
+                    // 已发）后上游再滴出的 error 不得在 message_stop 后向客户端发
+                    // 越界 event: error 帧、不得改写 error_info——已完整交付的请求
+                    // 被迟到错误记为失败会触发调用方误落账/冷却/解绑正常账号
+                    if saw_done {
+                        continue;
+                    }
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message.clone()));
                     // 已有内容发出：就地透传错误并结束；否则延迟给调用方决策（可重试）
                     if message_started || !tools.is_empty() {
@@ -1586,21 +1610,23 @@ pub fn aggregate_anthropic<R: Read + Send>(
 
     let mut usage_obj = json!({ "input_tokens": 0, "output_tokens": 0 });
     if let Some(u) = &usage {
-        // input_tokens 还原与流式收尾同口径（审查发现）：Anthropic input_tokens =
-        // 未缓存基数；OpenAI prompt_tokens = 含缓存命中总量——原生 input_tokens
-        // 优先直取，否则 prompt_tokens 减 cached_tokens 还原，避免缓存场景
-        // 「含缓存总量」错填进「未缓存基数」系统性高估（流式见 finish_stream）
-        if let Some(v) = usage_i64(u, &["input_tokens"]).or_else(|| {
+        // 缓存读：宽口径提取（对齐 wb_sse::cached_tokens_of，正值过滤）
+        let cached = cached_tokens_of(u);
+        // 审查修复（docker #1）：对齐流式出口未缓存基数口径——Anthropic
+        // input_tokens = 未缓存基数（完整输入 = input_tokens + cache_read +
+        // cache_creation）；OpenAI prompt_tokens = 含缓存命中总量（cached 是
+        // 其子集）。上游原生 input_tokens 优先直取；否则取 prompt_tokens 减
+        // cached_tokens 还原未缓存基数，避免缓存场景系统性高估
+        let in_tokens = usage_i64(u, &["input_tokens"]).or_else(|| {
             usage_i64(u, &["prompt_tokens"])
-                .map(|p| p.saturating_sub(cached_tokens_of(u).min(i64::MAX as u64) as i64))
-        }) {
+                .map(|p| p.saturating_sub(cached.min(i64::MAX as u64) as i64))
+        });
+        if let Some(v) = in_tokens {
             usage_obj["input_tokens"] = json!(v);
         }
         if let Some(v) = usage_i64(u, &["output_tokens", "completion_tokens"]) {
             usage_obj["output_tokens"] = json!(v);
         }
-        // 缓存读：宽口径提取（对齐 wb_sse::cached_tokens_of，正值过滤）
-        let cached = cached_tokens_of(u);
         if cached > 0 {
             usage_obj["cache_read_input_tokens"] = json!(cached);
         }
@@ -1813,6 +1839,112 @@ mod tests {
         assert!(pos("答1") < pos("想2"), "第二个 thinking 段必须晚于第一段 text");
         assert!(pos("想2") < pos("答2"), "第二个 text 段必须晚于第二个 thinking 段");
         assert_eq!(joined.matches("event: content_block_start").count(), 4, "应展开为 4 个独立内容块");
+    }
+
+    /// docker 审查 #2 回归：done 收口（message_stop 已发）后上游迟到的
+    /// output/thought 事件不得重开 content_block——message_stop 后开新块
+    /// 永不闭合，属协议违规，严格客户端会挂起/报错。守卫应静默忽略
+    #[test]
+    fn anthropic_late_output_after_done_is_ignored() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"答\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n\
+                     event: output\ndata: {\"response\":\"迟到\"}\n\n\
+                     event: thought\ndata: {\"reasoning_content\":\"迟到思考\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None);
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("event: message_stop"), "正常收口应有 message_stop");
+        let stop = joined.find("event: message_stop").unwrap();
+        assert!(
+            !joined[stop..].contains("content_block_start"),
+            "message_stop 后不得重开内容块"
+        );
+        assert!(!joined.contains("迟到"), "迟到 output/thought 应被静默忽略");
+    }
+
+    /// docker 审查 #2 同族回归：done 收口后迟到的 error 不得在 message_stop 后
+    /// 向客户端发越界 event: error 帧、不得改写 error_info——已完整交付的请求
+    /// 被迟到错误记为失败会触发调用方误落账/冷却正常账号（守卫应静默忽略）
+    #[test]
+    fn anthropic_late_error_after_done_is_ignored() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"答\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n\
+                     event: error\ndata: {\"code\":500,\"message\":\"迟到错误\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None, "done 后迟到的 error 不得改写终态");
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        assert!(joined.contains("event: message_stop"), "正常收口应有 message_stop");
+        let stop = joined.find("event: message_stop").unwrap();
+        assert!(
+            !joined[stop..].contains("event: error"),
+            "message_stop 后不得再发越界 error 帧"
+        );
+        assert!(!joined.contains("迟到错误"), "迟到 error 应被静默忽略");
+    }
+
+    /// 同族回归（OpenAI chat 出口）：done 收口（[DONE] 已发）后迟到的 error
+    /// 不得再拼第二份 error+[DONE] 帧、不得改写 error_info
+    #[test]
+    fn openai_late_error_after_done_is_ignored() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"答\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n\
+                     event: error\ndata: {\"code\":500,\"message\":\"迟到错误\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            None,
+        );
+        assert_eq!(error_info, None, "done 后迟到的 error 不得改写终态");
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        let done = joined.find("data: [DONE]").expect("正常收口应有 [DONE]");
+        assert!(
+            !joined[done..].contains("迟到错误"),
+            "[DONE] 后不得再拼 error 帧"
+        );
+        assert_eq!(joined.matches("data: [DONE]").count(), 1, "不得重复 [DONE]");
+    }
+
+    /// 同族回归（OpenAI legacy text 出口）：同 stream_convert_lines 口径
+    #[test]
+    fn openai_text_late_error_after_done_is_ignored() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"答\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n\
+                     event: error\ndata: {\"code\":500,\"message\":\"迟到错误\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_text_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+            "m",
+        );
+        assert_eq!(error_info, None, "done 后迟到的 error 不得改写终态");
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        let done = joined.find("data: [DONE]").expect("正常收口应有 [DONE]");
+        assert!(
+            !joined[done..].contains("迟到错误"),
+            "[DONE] 后不得再拼 error 帧"
+        );
+        assert_eq!(joined.matches("data: [DONE]").count(), 1, "不得重复 [DONE]");
     }
 
     #[test]
@@ -2560,7 +2692,9 @@ mod tests {
     #[test]
     fn aggregate_anthropic_emits_cache_read_and_creation() {
         // SOLO token_usage 事件 → Anthropic usage：缓存读（宽口径正值）+ 缓存写透传
-        // （issue #94：Trae 池 Anthropic 出口需与 WB 管线同口径输出读/写两侧）
+        // （issue #94：Trae 池 Anthropic 出口需与 WB 管线同口径输出读/写两侧）。
+        // 审查修复（docker #1）：input_tokens 对齐流式出口未缓存基数口径——
+        // prompt_tokens(100) 含缓存命中，须减 cached(80) → 20
         let sse = concat!(
             "event: output\n",
             "data: {\"response\": \"hi\"}\n",
@@ -2578,14 +2712,54 @@ mod tests {
         assert!(err.is_none());
         let resp = resp.expect("message");
         let usage = &resp["usage"];
-        // input_tokens = 未缓存基数（prompt_tokens 100 - cached 80 = 20，与流式
-        // finish_stream 还原口径一致；审查修复：原直取 prompt_tokens 会把含缓存
-        // 总量错填进「未缓存基数」，缓存场景系统性高估——流式/聚合两出口账目还须一致）
-        assert_eq!(usage["input_tokens"], serde_json::json!(20));
+        assert_eq!(usage["input_tokens"], serde_json::json!(20), "prompt_tokens 100 减 cached 80 = 未缓存基数 20");
         assert_eq!(usage["output_tokens"], serde_json::json!(20));
         // 0 值别名（cache_read_input_tokens=0）不遮蔽有效别名（cache_read_token=80）
         assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(80));
         assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn aggregate_anthropic_prefers_native_input_tokens() {
+        // 上游原生 input_tokens 存在时优先直取（不误减 cached——OpenAI 网关
+        // 偶发同附 input_tokens 与 prompt_tokens 双字段，前者已是未缓存基数）
+        let sse = concat!(
+            "event: output\n",
+            "data: {\"response\": \"hi\"}\n",
+            "\n",
+            "event: token_usage\n",
+            "data: {\"input_tokens\": 30, \"prompt_tokens\": 100, ",
+            "\"cache_read_input_tokens\": 80, \"output_tokens\": 20}\n",
+            "\n",
+            "event: done\n",
+            "data: {\"finish_reason\": \"stop\"}\n",
+            "\n",
+        );
+        let (resp, err) = aggregate_anthropic(sse.as_bytes(), "msg_test", "glm-5.3", None);
+        assert!(err.is_none());
+        let resp = resp.expect("message");
+        let usage = &resp["usage"];
+        assert_eq!(usage["input_tokens"], serde_json::json!(30), "原生 input_tokens 优先，不做减法");
+    }
+
+    #[test]
+    fn aggregate_anthropic_prompt_tokens_without_cache_untouched() {
+        // 无缓存字段：prompt_tokens 原样透传为 input_tokens（不减法）
+        let sse = concat!(
+            "event: output\n",
+            "data: {\"response\": \"hi\"}\n",
+            "\n",
+            "event: token_usage\n",
+            "data: {\"prompt_tokens\": 50, \"output_tokens\": 10}\n",
+            "\n",
+            "event: done\n",
+            "data: {\"finish_reason\": \"stop\"}\n",
+            "\n",
+        );
+        let (resp, err) = aggregate_anthropic(sse.as_bytes(), "msg_test", "glm-5.3", None);
+        assert!(err.is_none());
+        let resp = resp.expect("message");
+        assert_eq!(resp["usage"]["input_tokens"], serde_json::json!(50));
     }
 
     // ==================== 工具名别名响应侧回改（issue #150）====================
