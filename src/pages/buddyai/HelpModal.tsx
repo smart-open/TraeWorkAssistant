@@ -7,7 +7,13 @@ import { Modal } from '../../components/ui';
  */
 export function BuddyAiHelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   return (
-    <Modal open={open} onClose={onClose} title="BuddyAI 账号管理使用帮助" size="xl">
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="BuddyAI 账号管理使用帮助"
+      size="xl"
+      bodyClass="max-h-[66.7vh] overflow-y-auto pr-1"
+    >
       <div className="space-y-4 text-sm">
         <section className="rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/20">
           <h3 className="mb-1.5 flex items-center gap-1.5 font-semibold text-amber-700 dark:text-amber-300">

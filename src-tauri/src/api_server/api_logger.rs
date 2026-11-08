@@ -283,6 +283,12 @@ impl ApiLogger {
 
     /// 读取指定日期的日志文件内容（按时间倒序排列）
     pub fn read_log(&self, date: &str) -> Option<String> {
+        // 安全收口（docker/macos 审查项）：date 直接拼文件路径，未校验的
+        // `../../x` 输入可穿越读任意 .log 文件。单点前置校验（search_log 委托
+        // 本函数自动覆盖）；合法日期零行为变化。
+        if !valid_date(date) {
+            return None;
+        }
         self.flush_pending();
         // date 格式: "2026-08-14"
         let path = self.dir.join(format!("api_{}.log", date));
@@ -409,7 +415,12 @@ impl ApiLogger {
                 // 匹配 api_YYYY-MM-DD.log
                 if name.starts_with("api_") && name.ends_with(".log") {
                     let date = &name[4..name.len() - 4];
-                    dates.push(date.to_string());
+                    // 与 read_log 的 valid_date 同口径（安全收口配套）：畸形文件名
+                    //（如手动备份 api_备份.log）不入列表——否则前端出现可点但
+                    // 恒无内容的死条目，非 ASCII 名倒序后还会抢占默认选中
+                    if valid_date(date) {
+                        dates.push(date.to_string());
+                    }
                 }
             }
         }
@@ -808,6 +819,18 @@ fn reverse_log_blocks(content: &str) -> String {
     blocks.join("\n")
 }
 
+/// 日期字面校验（安全收口）：仅接受 `YYYY-MM-DD` 纯数字形态，拒绝任何含
+/// 路径分隔符/非法字符的输入（防 `api_{date}.log` 拼接路径穿越）。
+fn valid_date(date: &str) -> bool {
+    let b = date.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +895,51 @@ mod tests {
         assert_eq!(e.stage.as_deref(), Some("upstream_1"));
         assert_eq!(e.ttfb_ms, None);
         assert_eq!(e.duration_ms, 900);
+    }
+
+    /// 安全收口（docker/macos 审查项）：read_log 对非法 date 一律 None，
+    /// 合法日期正常可读；search_log 委托 read_log 自动覆盖
+    #[test]
+    fn read_log_rejects_non_date_input() {
+        let dir = tmp_dir("traversal");
+        let logger = ApiLogger::new(dir.clone());
+        logger.log_request("buddy", "POST", "/v1/chat/completions", "m", false, 200, "u", 5, "k", "a", None);
+        let today = today();
+        logger.flush_pending();
+
+        // 合法日期可读
+        assert!(logger.read_log(&today).is_some(), "合法日期应正常读取");
+        assert!(logger.search_log(&today, "", "", "").is_some());
+
+        // 穿越与畸形输入一律 None（不落任何文件读取）
+        for bad in [
+            "../../etc/passwd",
+            "..\\..\\x",
+            "2026-08-14/../../secret",
+            "20260814",
+            "2026-8-4",
+            "aaaa-bb-cc",
+            "",
+        ] {
+            assert!(logger.read_log(bad).is_none(), "非法输入应拒绝: {bad:?}");
+            assert!(logger.search_log(bad, "", "", "").is_none(), "search 应拒绝: {bad:?}");
+        }
+    }
+
+    /// 安全收口配套：list_dates 与 read_log 校验同口径——畸形文件名不入日期列表
+    #[test]
+    fn list_dates_filters_malformed_filenames() {
+        let dir = tmp_dir("dates");
+        let logger = ApiLogger::new(dir.clone());
+        logger.log_request("buddy", "POST", "/v1/chat/completions", "m", false, 200, "u", 5, "k", "a", None);
+        let today = today();
+        logger.flush_pending();
+        // 模拟外来畸形文件混入日志目录（用户手动备份等）
+        std::fs::write(dir.join("api_备份.log"), "x").unwrap();
+        std::fs::write(dir.join("api_20260814.log"), "x").unwrap();
+        let dates = logger.list_dates(30);
+        assert!(dates.contains(&today), "合法日期应在列表: {dates:?}");
+        assert!(dates.iter().all(|d| valid_date(d)), "列表不得混入畸形日期: {dates:?}");
     }
 
     /// F-84：recent_entries 分页 + result 筛选（写线程异步落盘，用 flush_pending 兜底）

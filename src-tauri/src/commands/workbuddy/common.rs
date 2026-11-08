@@ -351,7 +351,18 @@ pub(super) fn auth_key_names(raw: &serde_json::Value) -> String {
 /// 对候选键逐个 dig，命中即决（语义与 dig 一致，null 不回退尝试后续候选键，避免误采其他 token 字段串号）：
 /// 命中且为非空字符串 → Ok；命中但为 null/非字符串/空串 → 「未登录/凭证为空」类错误（不再误报结构变更）；
 /// 全部候选键未命中 → 「结构可能已变更」+ 键名诊断（含值类型）。
+/// issue #198：值为 `$wbEncrypted` 包裹 → 客户端字段级加密形态专用报错（区别于「结构变更」），
+/// 附解密失败原因（hint，来自 decrypt_auth_file_fields 统计）。
+/// 无 hint 便捷版（现仅测试消费；生产路径一律带 decrypt hint 的 with_hint 版本）
+#[cfg(test)]
 pub(super) fn extract_access_token(raw: &serde_json::Value) -> Result<String, String> {
+    extract_access_token_with_hint(raw, None)
+}
+
+pub(super) fn extract_access_token_with_hint(
+    raw: &serde_json::Value,
+    decrypt_hint: Option<&str>,
+) -> Result<String, String> {
     for k in ["accessToken", "access_token", "token"] {
         let Some(v) = fs_utils::dig(raw, &[k]) else { continue };
         if let Some(s) = v.as_str() {
@@ -360,6 +371,15 @@ pub(super) fn extract_access_token(raw: &serde_json::Value) -> Result<String, St
             }
             return Err(format!(
                 "auth 文件 accessToken 为空字符串（可能未登录）：键 {k} 存在但无值，请先在 WorkBuddy 客户端登录后重试"
+            ));
+        }
+        if crate::workbuddy_atrest::is_encrypted_wrapper(v) {
+            let hint = decrypt_hint
+                .map(|h| format!("（{h}）"))
+                .unwrap_or_default();
+            return Err(format!(
+                "auth 文件凭证不可用：键 {k} 为客户端字段级加密形态（$wbEncrypted）且自动解密未成功{hint}；\
+                 解密密钥随客户端分发，请确认本机已安装 WorkBuddy / CodeBuddy 桌面客户端，或重试（首次解密约需数秒）"
             ));
         }
         return Err(format!(

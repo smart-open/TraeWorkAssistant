@@ -1512,7 +1512,7 @@ function DoubaoHelpModal({ open, onClose }: { open: boolean; onClose: () => void
       title="豆包账号管理使用帮助"
       size="lg"
       widthClass="max-w-[63rem]"
-      bodyClass="max-h-[80vh] overflow-y-auto pr-1"
+      bodyClass="max-h-[66.7vh] overflow-y-auto pr-1"
     >
       <div className="space-y-4 text-sm">
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">

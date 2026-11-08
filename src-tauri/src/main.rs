@@ -18,6 +18,7 @@ mod switcher;
 mod tasks;
 mod vault;
 mod api_server;
+mod workbuddy_atrest;
 mod workbuddy_cli;
 
 use state::AppState;
