@@ -237,7 +237,13 @@ fn resp_send(tx: &Sender, event: &str, data: Value) {
 }
 
 /// 构造 Responses response 对象（created/in_progress/completed/failed 共用骨架）
-fn responses_object(id: &str, model: &str, status: &str, output: Vec<Value>, usage: Option<&Value>) -> Value {
+pub(crate) fn responses_object(
+    id: &str,
+    model: &str,
+    status: &str,
+    output: Vec<Value>,
+    usage: Option<&Value>,
+) -> Value {
     let mut obj = json!({
         "id": id,
         "object": "response",
@@ -529,8 +535,8 @@ pub fn stream_forward_ex(
                 if !has_content {
                     // 空完成（影子风控/上游异常）：不发任何收尾帧，以哨兵错误上抛
                     // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）。
-                    // 注：Responses 协议若已发 created（空 delta chunk 触发），换号
-                    // 重试会重复 created——影子风控场景上游通常零 chunk，属可接受边界
+                    // 注：Responses 协议 created 仅在载荷帧时下发（噪声帧门控），
+                    // 影子风控场景上游零载荷 chunk → 未发 created，换号重试干净
                     error_info = Some((
                         super::EMPTY_COMPLETION_CODE,
                         super::EMPTY_COMPLETION_MSG.to_string(),
@@ -796,10 +802,24 @@ pub fn stream_forward_ex(
                         }
                         crate::api_server::routes::Protocol::Anthropic => unreachable!(),
                         crate::api_server::routes::Protocol::Responses => {
-                            resp_ensure_created!();
-                            // created 帧已下发：后续流内错误必须就地 response.failed，
-                            // 不得再走「未发送数据」换号重试路径（否则客户端收到重复流）
-                            sent_any = true;
+                            // 审查修复（macOS #1）：噪声帧门控——纯噪声帧（空 delta、
+                            // 无 finish、无 usage）不再提前下发 created / 置 sent_any。
+                            // 原实现空 delta chunk 也触发 created：空完成换号重试失效
+                            // （调用方据 sent_any 误判「已发送数据」不再重试），且真
+                            // 换号会向已含 created 的流拼接第二份响应（与下方 P2-9
+                            // 注释矛盾）。对齐 OpenAi 分支整帧跳过口径：仅载荷帧
+                            // （正文/思考/工具调用/finish/usage 任一非空）触发
+                            let frame_has_payload = frame_has_usage
+                                || !finish.is_empty()
+                                || delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                                || delta.get("reasoning_content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                                || delta.get("tool_calls").and_then(|t| t.as_array()).map_or(false, |a| !a.is_empty());
+                            if frame_has_payload {
+                                resp_ensure_created!();
+                                // created 帧已下发：后续流内错误必须就地 response.failed，
+                                // 不得再走「未发送数据」换号重试路径（否则客户端收到重复流）
+                                sent_any = true;
+                            }
                             // 文本增量 → message 输出项 + output_text.delta
                             if let Some(t) = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
                                 if !resp_msg_open {

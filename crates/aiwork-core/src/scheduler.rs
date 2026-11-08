@@ -798,8 +798,13 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）。
             // 分支级早退而非任务层打标：wb 调度轮次会向前端转发 start/done 事件
             //（issue #134 方案1），空池若仍每 tick 走整轮会向前端刷「成功 0」toast；
-            // 早退置于抢轮次锁之前——空轮不占锁，连击统计不动（空轮本就不变）
-            let pool = crate::store::docs::wb_pool_load(&crate::store::db(&st.data_dir));
+            // 早退置于抢轮次锁之前——空轮不占锁，连击统计不动（空轮本就不变）。
+            // 池读取失败走 mark_fail 重试链不再吞成空池（落库并发加固，main
+            // 245a611=>bfa0bc2 批次）：unwrap_or_default 在锁 Busy 瞬时会吞成空池
+            // → skipped_empty_pool 提前返回 → mark_run 固化当日已跑 → 当日导入
+            // 账号失去补打（与空池豁免定调矛盾）；? 上抛 Err 走 tick 失败冷却，
+            // 下一 tick 自动补打
+            let pool = crate::store::docs::wb_pool_load_raw(&crate::store::db(&st.data_dir))?;
             if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
                 return Ok(json!({ "ok": true, "skipped": "无 WorkBuddy 账号", "skipped_empty_pool": true }));
             }
@@ -1074,8 +1079,9 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         "qoder-checkin" => {
             // 奖励型签到空池豁免（审查修复，对齐 buddy-ai 口径）：空池提前
             // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）；
-            // 早退置于抢轮次锁之前——空轮不占锁，连击/重试判定均不触及
-            let pool = crate::store::docs::qoder_pool_load(&crate::store::db(&st.data_dir));
+            // 早退置于抢轮次锁之前——空轮不占锁，连击/重试判定均不触及。
+            // 池读取失败走 mark_fail 重试链不再吞成空池（同 wb-checkin 口径）
+            let pool = crate::store::docs::qoder_pool_load_raw(&crate::store::db(&st.data_dir))?;
             if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
                 return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号", "skipped_empty_pool": true }));
             }

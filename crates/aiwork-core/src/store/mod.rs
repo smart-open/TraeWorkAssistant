@@ -175,7 +175,8 @@ impl Store {
     /// 干净）；COMMIT 失败（提交期 SQLITE_BUSY 等）同样 rollback 后上抛。四种情形
     /// （f Err / 读写出错 / f panic / COMMIT 失败）均保证无事务残留；ROLLBACK
     /// 清场自身失败（连接损坏的极端情形）不吞——错误信息附加清场失败明细
-    /// （panic 路径打 stderr），由调用方落日志暴露。
+    /// （panic 路径打 stderr），由调用方落日志暴露；«no transaction is active»
+    /// 视为无残留（事务已自行结束的良性竞态），容错跳过。
     /// 读到缺失/损坏存量值回退空对象（语义对齐调用点 !is_object 初始化分支）；
     /// 真实读错误（busy 超时/IO 故障/页损坏）显式上抛放弃写——fail-closed 同
     /// kv_get_raw_checked 的 R1 纪律：空集会触发整份覆写的路径绝不静默当空集，
@@ -220,26 +221,40 @@ impl Store {
             Ok(Ok(())) => {
                 if let Err(e) = conn.execute_batch("COMMIT;") {
                     // ROLLBACK 失败不吞（交叉审查修复）：残留事务会毒化共享连接，
-                    // 须在错误信息中显式暴露（调用方落日志），不能静默成功返回
-                    let rb = match conn.execute_batch("ROLLBACK;") {
-                        Ok(_) => String::new(),
-                        Err(re) => format!("（回滚清场亦失败，连接疑似损坏: {re}）"),
-                    };
-                    return Err(format!("提交 kv[{key}] 事务失败: {e}{rb}"));
+                    // 须在错误信息中显式暴露（调用方落日志），不能静默成功返回。
+                    // «no transaction is active» 视为无残留（事务已自行结束的良性
+                    // 竞态），容错跳过（main 245a611=>bfa0bc2 批次补齐）
+                    if let Err(rb) = conn.execute_batch("ROLLBACK;") {
+                        if !rb.to_string().contains("no transaction") {
+                            return Err(format!(
+                                "提交 kv[{key}] 事务失败: {e}；且回滚清场也失败: {rb}（连接可能残留事务）"
+                            ));
+                        }
+                    }
+                    return Err(format!("提交 kv[{key}] 事务失败: {e}"));
                 }
                 Ok(())
             }
             Ok(Err(msg)) => {
-                if let Err(re) = conn.execute_batch("ROLLBACK;") {
-                    return Err(format!("{msg}（回滚清场失败，连接疑似损坏: {re}）"));
+                if let Err(rb) = conn.execute_batch("ROLLBACK;") {
+                    if !rb.to_string().contains("no transaction") {
+                        eprintln!(
+                            "[store::kv_update] kv[{key}] 写失败后回滚清场也失败: {rb}（连接可能残留事务，后续查询将报 cannot start a transaction）"
+                        );
+                        return Err(format!("{msg}；且回滚清场也失败: {rb}"));
+                    }
                 }
                 Err(msg)
             }
             Err(panic) => {
                 // f panic：先清场再恢复展开（不吞 panic，仅保证共享连接无事务残留）
-                if conn.execute_batch("ROLLBACK;").is_err() {
-                    // panic 展开路径无法返回错误，清场失败打印到 stderr 兜底
-                    eprintln!("[store] kv_update panic 回滚失败，连接疑似损坏: kv[{key}]");
+                if let Err(rb) = conn.execute_batch("ROLLBACK;") {
+                    if !rb.to_string().contains("no transaction") {
+                        // panic 路径无法返回 Err，打 stderr 留痕后照常 resume_unwind
+                        eprintln!(
+                            "[store::kv_update] kv[{key}] panic 后回滚清场也失败: {rb}（连接可能残留事务）"
+                        );
+                    }
                 }
                 std::panic::resume_unwind(panic);
             }

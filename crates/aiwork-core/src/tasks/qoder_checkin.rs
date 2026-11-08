@@ -1426,8 +1426,8 @@ fn process_account(
                 //    新领取→列表记录陈旧（批次窗口误判）本次真实到账，失败→降级
                 //    fail 保留自动重试——不再凭列表 claimStatus 直接短路 already
                 //    （campaignId 批次内多日同 id，跨天窗口会把早先已领误判今日）；
-                // ② 无候选或复核 fail 时盲发每日活动兜底直领（learned 重学 id
-                //    优先 + 候选表兜底），结果如实归类（Failed 不再归 already
+                // ② 无候选或复核 fail/already 时盲发每日活动兜底直领（learned 重学
+                //    id 优先 + 候选表兜底），结果如实归类（Failed 不再归 already
                 //    ——2026-10-07 误报「已领（此前已领）」的修复点）
                 let now = chrono::Utc::now().timestamp();
                 let reclaimed = daily_credits_claimed_grant(&campaigns, now).map(|entry| {
@@ -1441,6 +1441,19 @@ fn process_account(
                             state, agent, &urls, &min_token, learned, table,
                             Some((k.as_str(), m.as_str())),
                         )
+                    }
+                    // 审查 H-2（main 245a611=>bfa0bc2 批次）：已领回放（already）不
+                    // 直接短路——learn_daily_campaign_ids 不要求 claimStatus，命中
+                    // 候选可能是同列表他 CREDITS 活动的「真已领回放」，allowed_ids
+                    // 过滤力为零，短路会漏领当日每日 100 积分（与 issue #193「已领
+                    // 误判漏领」同型）。盲发兜底再裁决（claim 幂等：真已领→replayed
+                    // →already；每日未领→success 真实到账）；兜底全 miss 归 fail 时
+                    // 保留 reclaim already 口径，防无物可领时的重试噪声
+                    Some(res) if res.0 == "already" => {
+                        match run_fallback(state, agent, &urls, &min_token, learned, table, None) {
+                            (ref fk, _, _) if fk == "fail" => res,
+                            fb => fb,
+                        }
                     }
                     Some(res) => res,
                     None => run_fallback(state, agent, &urls, &min_token, learned, table, None),
@@ -1560,8 +1573,8 @@ fn process_account(
                         let claimable = filter_claimable(&campaigns);
                         if claimable.is_empty() {
                             // 与首次路径同口径（issue #193 服务端权威化）：列表
-                            // CLAIMED grant 候选重发幂等 claim 裁决，复核失败再盲发
-                            // 兜底直领（learned 优先），失败如实归 fail（不掩盖）
+                            // CLAIMED grant 候选重发幂等 claim 裁决，复核 fail/already
+                            // 均盲发兜底直领（learned 优先），失败如实归 fail（不掩盖）
                             let now = chrono::Utc::now().timestamp();
                             let reclaimed = daily_credits_claimed_grant(&campaigns, now)
                                 .map(|entry| {
@@ -1574,6 +1587,18 @@ fn process_account(
                                     state, agent, &urls, &min_token, learned, table,
                                     Some((k.as_str(), m.as_str())),
                                 ),
+                                // 审查 H-2（main 245a611=>bfa0bc2 批次）：与首次路径同
+                                // 口径——already 不直接短路，盲发兜底再裁决；兜底全
+                                // miss 归 fail 时保留 reclaim already 口径（防无物可领
+                                // 时的重试噪声）
+                                Some(res) if res.0 == "already" => {
+                                    match run_fallback(
+                                        state, agent, &urls, &min_token, learned, table, None,
+                                    ) {
+                                        (ref fk, _, _) if fk == "fail" => res,
+                                        fb => fb,
+                                    }
+                                }
                                 Some(res) => res,
                                 None => {
                                     run_fallback(state, agent, &urls, &min_token, learned, table, None)

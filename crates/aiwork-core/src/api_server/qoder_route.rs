@@ -954,12 +954,16 @@ fn run_qoder_stream(
             // （指纹拦截）才标记，TTL 600s 内同池新请求激进清洗起步，不再从零试探
             super::wb_payload::mark_channel_fp_block("qoder", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
             let sample_note = super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
-            state.logger.log_debug_line(format!(
-                "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
-                tried.len(),
-                empty_hits,
-                cut_hits,
-            ));
+            // 样例非空才落调试行（docker 审查 #2 同族）：空样例行无增量信息，
+            // 空完成洪峰下纯噪声刷屏干扰真实日志定位
+            if !sample_note.is_empty() {
+                state.logger.log_debug_line(format!(
+                    "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
+                    tried.len(),
+                    empty_hits,
+                    cut_hits,
+                ));
+            }
             // 按客户端协议分流错误帧（Anthropic 收 event: error、Responses 收
             // response.failed，不再裸 data: 帧不可读）；code 保持字符串
             // "no_healthy_account"（客户端兼容）
@@ -1029,12 +1033,15 @@ fn run_qoder_stream(
                     // （kind=empty），返回日志注记供反查漏网触发句
                     let sample_note =
                         super::wb_payload::empty_sample_note(&exhaust_tag, "qoder", body_vec);
-                    state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder{sample_note}",
-                        tried.len(),
-                        empty_hits,
-                        cut_hits,
-                    ));
+                    // 样例非空才落调试行（docker 审查 #2 同族，同上口径）
+                    if !sample_note.is_empty() {
+                        state.logger.log_debug_line(format!(
+                            "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool=qoder{sample_note}",
+                            tried.len(),
+                            empty_hits,
+                            cut_hits,
+                        ));
+                    }
                     // 按客户端协议分流错误帧（同预算耗尽收尾口径）
                     send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
                     return;

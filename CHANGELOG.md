@@ -6,6 +6,26 @@
 
 ---
 
+## [1.6.2] · 2026-11-08 · 语义移植 main 245a611 => bfa0bc2
+
+> 语义移植 1 实质提交（网关流式守卫与豆包并发落库加固批次，未 merge）；跳过豆包全链路、switcher/env 桌面专属等不适用项。
+
+### 修复与加固
+
+- **SSE 迟到事件守卫补全**：done 收口后迟到 error 静默忽略（OpenAI chat / legacy text / Anthropic），防已完整交付的请求被迟到错误误落账/误冷却。
+- **WB 池错误帧按协议分流**：11128 Fatal / 流内错误 / 池预算耗尽统一走 `send_stream_error_wb`（数字状态码透传、耗尽保持字符串 code）；Anthropic 补合成收口、Responses 错误帧补齐 SDK 必读字段。
+- **Responses 噪声帧门控**：纯噪声帧不再提前下发 created / 置 sent_any，空完成换号重试恢复。
+- **custom_route probe 整体 20s 超时**：慢滴上游分项超时拦不住，整体超时确保探测收敛。
+- **wb_payload 残留自检**：补 DSH 模型句特征词组。
+- **qoder_route 空完成调试行门控**：`sample_note` 非空才落，空完成洪峰不刷屏。
+- **kv_update 事务竞态容错**：回滚清场遇「事务已自行结束」不再误报连接损坏。
+- **scheduler 池读取失败走重试链**：空池判定改 `_raw` 加载器，DB 读失败不再被吞成 skipped_empty_pool。
+- **Qoder 签到已领回放不短路**：reclaim 裁决 already 时仍盲发兜底再裁决，防漏领每日 100 积分；兜底全 miss 保留 already 口径防重试噪声。
+
+### 验证
+
+- `cargo test`（workspace）、`tsc --noEmit`、`vitest` 全部通过。
+
 ## [1.6.1] · 2026-11-07 · 语义移植 main d04de4f => 245a611
 
 > 语义移植 4 实质提交（未 merge）；跳过桌面/OS 专属（豆包全链路、device_proxy/switcher）。

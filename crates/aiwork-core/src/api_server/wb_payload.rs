@@ -1059,6 +1059,13 @@ const RESIDUAL_MARKERS: &[&str] = &[
     // （qoder.com.cn 等域名词与 "Qoder" 单词不触发）
     "qoderwork",
     "qoder team",
+    // DSH 模型句特征词组（审查 M-5）：默认表前缀规则 "You are a coding agent
+    // powered by the " → "You help the user with programming work using the "
+    // 未命中/被覆盖时，指纹残留无法自检报出——补整词组让残留自检闭环。
+    // 既有规则改写结果均不含该词组（to 侧为 "You help the user ..." / "You are
+    // an AI agent ..." 句式），无误报；回归门
+    // default_map_outputs_are_residue_free_and_idempotent 自动覆盖
+    "coding agent powered by",
     "codebuddy",
     "opencode",
     "deepseek harness",
