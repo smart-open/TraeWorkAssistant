@@ -195,6 +195,23 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You help the user with programming work using the buddy/deepseek-v4.1-flash model."
                 .to_string(),
         ),
+        // ⚠ 顺序约束（docker 审查回归）：以下两条 DSH 品牌兜底必须先于下方
+        // #195 提升的前缀规则应用。前缀规则若先行，DSH 品牌变体句（"You are a
+        // coding agent powered by the DeepSeek Harness…"）会被改写成
+        // "using the DeepSeek Harness"——"deepseek harness" 是 RESIDUAL_MARKERS
+        // 成员，残留即指纹 → 上游 11128；且升级激进重试时激进表兜底
+        // （"powered by DeepSeek Harness"）的 from 已被改掉、无法补救，该变体
+        // 从「激进重试可净」退化为 Fatal。两个形态各布一条：带 the 变体与实证
+        // 模型句 "…powered by the <model>" 同构；不带 the 变体为 2026-10-06
+        // 身份句时代形态（对齐激进表既有兜底）。激进表同名规则保留兜幂等
+        (
+            "powered by the DeepSeek Harness".to_string(),
+            "that helps the user with programming work".to_string(),
+        ),
+        (
+            "powered by DeepSeek Harness".to_string(),
+            "that helps the user with programming work".to_string(),
+        ),
         // issue #195（2026-11-07 网关 11128 样本实证）：DSH 模型句模型名变体
         // 首轮兜底——3.8.8 时代模型句只布防 glm- 前缀与 buddy/deepseek-v4.1-flash
         // 逐字句（当时抓包的模型配置形态），用户侧模型名不带池前缀时（如
@@ -1045,6 +1062,13 @@ const RESIDUAL_MARKERS: &[&str] = &[
     // （qoder.com.cn 等域名词与 "Qoder" 单词不触发）
     "qoderwork",
     "qoder team",
+    // DSH 模型句特征词组（审查 M-5）：默认表前缀规则 "You are a coding agent
+    // powered by the " → "You help the user with programming work using the "
+    // 未命中/被覆盖时，指纹残留无法自检报出——补整词组让残留自检闭环。
+    // 既有规则改写结果均不含该词组（to 侧为 "You help the user ..." / "You are
+    // an AI agent ..." 句式），无误报；回归门
+    // default_map_outputs_are_residue_free_and_idempotent 自动覆盖
+    "coding agent powered by",
     "codebuddy",
     "opencode",
     "deepseek harness",
@@ -2071,6 +2095,46 @@ mod tests {
         );
         // 改写结果不再命中任何规则（幂等安全）
         assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+    }
+
+    /// docker 审查回归：DSH 品牌变体句不得被 #195 提升进默认表的前缀规则
+    /// 反向改写成 "using the DeepSeek Harness"——"deepseek harness" 是
+    /// RESIDUAL_MARKERS 成员，残留即指纹 → 上游 11128；且升级激进重试时激进表
+    /// 兜底（"powered by DeepSeek Harness"）的 from 已被改掉、无法补救，变体
+    /// 从「激进重试可净」退化为 Fatal。默认表两条品牌兜底（带/不带 the）必须
+    /// 先于前缀规则应用，首轮即连根消除品牌词 + 幂等安全；默认表与
+    /// 「默认+激进合并表」（aggressive=true 同款组合）双口径覆盖
+    #[test]
+    fn dsh_brand_variant_not_reversed_into_residual_by_prefix_rule() {
+        let variants = [
+            // 带 the 变体（与实证模型句 "…powered by the <model>" 同构）
+            "You are a coding agent powered by the DeepSeek Harness.",
+            // 不带 the 变体（2026-10-06 身份句时代形态，对齐激进表既有兜底）
+            "You are a coding agent powered by DeepSeek Harness.",
+        ];
+        // 默认表口径：首轮即净（激进重试不再需要）
+        let tpl = default_template_map();
+        for v in &variants {
+            let out = apply_template_map(v, &tpl);
+            assert!(
+                !out.to_lowercase().contains("deepseek harness"),
+                "品牌词残留: {v} → {out}"
+            );
+            assert!(!out.contains("powered by"), "{out}");
+            assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等: {v} → {out}");
+        }
+        // 默认+激进合并表口径：同款净改写，激进兜底不破坏
+        let mut agg = default_template_map();
+        agg.extend(aggressive_template_rules());
+        for v in &variants {
+            let out = apply_template_map(v, &agg);
+            assert!(
+                !out.to_lowercase().contains("deepseek harness"),
+                "品牌词残留: {v} → {out}"
+            );
+            assert!(!out.contains("powered by"), "{out}");
+            assert_eq!(apply_template_map(&out, &agg), out, "改写须幂等: {v} → {out}");
+        }
     }
 
     /// DSH 0.2.1-rc.2 模型句整句同义改写（2026-10-29 headless 抓包实证：模型

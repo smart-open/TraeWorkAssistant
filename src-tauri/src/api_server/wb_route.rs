@@ -1017,6 +1017,13 @@ fn run_wb_stream(
                     // （kind=empty，样本 = 清洗前原始请求体），返回日志注记供反查
                     let sample_note =
                         wb_payload::empty_sample_note(&exhaust_tag, state.pool_label(), body_vec);
+                    // 审查 #8 修正（复查发现）：本行是 diag_summary（逐账号不可用
+                    // 原因）在 wb 路径的唯一落点——上方 log_request 的 exhaust_msg
+                    // 仅含聚合计数与归因语义、不含 reasons，若随指纹样本一并门控，
+                    // 最常见的非指纹耗尽（冷却/硬额度/transport cut）的逐账号原因
+                    // 将无任何日志可查（Trae 池同场景 reasons 行仍无条件落账）。
+                    // 故整行保留不门控；指纹样本后缀仍仅 CHANNEL_FINGERPRINT_BLOCK
+                    // 主导时非空（qoder 路径行不含 reasons，维持原门控不动）
                     state.logger.log_debug_line(format!(
                         "[DEBUG] {exhaust_tag} tried={} empty_hits={} cut_hits={} pool={} reasons=[{}]{}",
                         tried.len(),
@@ -1026,13 +1033,42 @@ fn run_wb_stream(
                         diag_summary.join(", "),
                         sample_note,
                     ));
-                    let err_body = json!({
-                        "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
-                    });
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                        "data: {err_body}\n\n"
-                    ))));
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    // 按客户端协议分流错误帧（审查 #7：对齐 qoder 客户端口径）——
+                    // Anthropic 收 event: error、Responses 收 response.failed，
+                    // OpenAI 系维持 data: 错误帧；message 均为 exhaust_msg，
+                    // code 保持 no_healthy_account（客户端兼容）
+                    match proto {
+                        Protocol::Anthropic => {
+                            let err = json!({"type":"error","error":{"type":"api_error","message":exhaust_msg}});
+                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                                "event: error\ndata: {}\n\n",
+                                err
+                            ))));
+                        }
+                        Protocol::Responses => {
+                            let resp = json!({
+                                "id": format!("resp_{}", now_ts()),
+                                "object": "response",
+                                "status": "failed",
+                                "output": [],
+                                "error": {"code": "no_healthy_account", "message": exhaust_msg},
+                            });
+                            let body = json!({"type": "response.failed", "response": resp});
+                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                                "event: response.failed\ndata: {}\n\n",
+                                body
+                            ))));
+                        }
+                        _ => {
+                            let err_body = json!({
+                                "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
+                            });
+                            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                                "data: {err_body}\n\n"
+                            ))));
+                            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                        }
+                    }
                     return;
                 }
             },

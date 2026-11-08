@@ -1423,6 +1423,18 @@ pub fn wb_pool_load(s: &Store) -> Value {
     json!({ "accounts": accounts })
 }
 
+/// 可失败口径读整池（审查 M-4）：rows_all 读取失败（库损坏/IO 故障）如实上抛，
+/// 供调度器空池早退区分「真空池」与「读失败」——后者走 Err 重试链（mark_fail
+/// 可见），不再被 unwrap_or_default 吞成空池静默 skipped_empty_pool 当日无声丢失
+pub fn wb_pool_load_checked(s: &Store) -> Result<Value, String> {
+    let accounts: Vec<Value> = s
+        .rows_all("wb_accounts")?
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    Ok(json!({ "accounts": accounts }))
+}
+
 /// 写整池（对齐原「整文件写回」语义；pk = 账号 id，缺 id 用序号占位）
 pub fn wb_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
     let empty = Vec::new();
@@ -2311,6 +2323,16 @@ pub fn qoder_pool_load(s: &Store) -> Value {
         .map(|(_, data)| data)
         .collect();
     json!({ "accounts": accounts })
+}
+
+/// 可失败口径读整池（审查 M-4，同 wb_pool_load_checked）
+pub fn qoder_pool_load_checked(s: &Store) -> Result<Value, String> {
+    let accounts: Vec<Value> = s
+        .rows_all("qoder_accounts")?
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    Ok(json!({ "accounts": accounts }))
 }
 
 /// 写整池（pk = 账号 id，缺 id 用序号占位）

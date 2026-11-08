@@ -348,6 +348,13 @@ pub fn start_app_pid(sess: &mut Session, sink: &dyn ProgressSink) -> Result<u32,
         ));
     };
     let mut cmd = std::process::Command::new(&exe);
+    // 子进程收口（macOS 审查 #14）：GUI 启动客户端不闪控制台窗口
+    // （CREATE_NO_WINDOW；切换器 spawn 的都是 Electron GUI 子进程，无副作用）
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
     if let Some(port) = sess.launch_proxy_port.filter(|p| *p > 0) {
         sink.step(
             "start",

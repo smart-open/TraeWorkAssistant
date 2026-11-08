@@ -137,51 +137,82 @@ export default function DoubaoSettings() {
     }
   };
 
-  // 豆包数据同步（doubao-sync）：模式 + 间隔/时刻一并保存；后端归一化（间隔 clamp 1..24）
+  // 豆包数据同步（doubao-sync）：模式 + 间隔/时刻一并保存；后端归一化（间隔 clamp 1..24）。
+  // 审查 #18 补齐（对齐 changeCheckinHhmm 范式）：三个 sync 孪生 handler 共用
+  // 并发序号守卫（失焦连发时仅最后请求可提示成功/回滚）+ 失败回滚输入框
+  const syncConfigSeqRef = useRef(0);
   const saveSyncConfig = async (patch: { doubao_sync_mode?: string; doubao_sync_hours?: string; doubao_sync_hhmm?: string }) => {
     try {
       await saveSettings(patch);
       return true;
-    } catch (err) {
-      pushToast('error', `保存设置失败：${String(err)}`);
+    } catch {
+      // store.saveSettings 失败时已 pushToast 错误详情，此处不再双弹
       return false;
     }
   };
   const changeSyncMode = async (v: string) => {
     setSyncMode(v);
+    const seq = ++syncConfigSeqRef.current;
     if (await saveSyncConfig({ doubao_sync_mode: v })) {
-      pushToast('success', v === 'off' ? '已关闭豆包数据同步' : '同步模式已保存');
+      if (seq === syncConfigSeqRef.current) pushToast('success', v === 'off' ? '已关闭豆包数据同步' : '同步模式已保存');
+    } else if (seq === syncConfigSeqRef.current) {
+      setSyncMode(settings?.doubao_sync_mode || 'every_hours');
     }
   };
   const changeSyncHours = async (v: string) => {
     setSyncHours(v);
-    const n = Number.parseInt(v, 10);
+    // 严格 /^\d+$/ 校验（审查 M-7⑤）：parseInt 会放行 "2x" 类输入（静默按 2 保存）。
+    // 校验失败回弹已保存值（store.settings 即最后成功落库值，审查 #18）——输入框
+    // 不驻留非法草稿，与「已保持原值」toast 口径一致
+    const n = /^\d+$/.test(v.trim()) ? Number.parseInt(v.trim(), 10) : NaN;
     if (!Number.isFinite(n) || n < 1 || n > 24) {
       pushToast('warn', '同步间隔应为 1-24 的整数（已保持原值）');
+      setSyncHours(settings?.doubao_sync_hours || '2');
       return;
     }
-    if (await saveSyncConfig({ doubao_sync_hours: String(n) })) pushToast('success', `同步间隔已保存（每 ${n} 小时）`);
+    const seq = ++syncConfigSeqRef.current;
+    if (await saveSyncConfig({ doubao_sync_hours: String(n) })) {
+      if (seq === syncConfigSeqRef.current) pushToast('success', `同步间隔已保存（每 ${n} 小时）`);
+    } else if (seq === syncConfigSeqRef.current) {
+      setSyncHours(settings?.doubao_sync_hours || '2');
+    }
   };
   const changeSyncHhmm = async (v: string) => {
     setSyncHhmm(v);
     if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(v)) {
       pushToast('warn', '时间格式应为 HH:MM（如 23:50，已保持原值）');
+      // 校验失败回弹已保存值：输入框不驻留非法草稿（审查 M-7①）
+      setSyncHhmm(settings?.doubao_sync_hhmm || '23:50');
       return;
     }
-    if (await saveSyncConfig({ doubao_sync_hhmm: v })) pushToast('success', `同步时刻已保存（每日 ${v}）`);
+    const seq = ++syncConfigSeqRef.current;
+    if (await saveSyncConfig({ doubao_sync_hhmm: v })) {
+      if (seq === syncConfigSeqRef.current) pushToast('success', `同步时刻已保存（每日 ${v}）`);
+    } else if (seq === syncConfigSeqRef.current) {
+      setSyncHhmm(settings?.doubao_sync_hhmm || '23:50');
+    }
   };
-  // 应用内签到时刻（单源 doubao_checkin_hhmm）：交互对齐 syncHhmm（onChange 暂存、失焦校验后保存）
+  // 应用内签到时刻（单源 doubao_checkin_hhmm）：交互对齐 syncHhmm（onChange 暂存、失焦校验后保存）。
+  // 审查 #18：失败回滚 UI 时刻（对齐同文件开关的回滚模式）+ 并发序号守卫（失焦连发时
+  // 仅最后请求可提示成功/回滚，避免慢请求迟到覆盖新值）。
+  // 回滚目标 = store.settings（最后成功落库值；saveSettings 失败时已先回滚 store
+  // 再 rethrow，此处读到的是落库值而非 UI 草稿，连续失败不漂移，审查 M-7④）
+  const checkinHhmmSeqRef = useRef(0);
   const changeCheckinHhmm = async (v: string) => {
     setCheckinHhmm(v);
     if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(v)) {
       pushToast('warn', '时间格式应为 HH:MM（如 09:15，已保持原值）');
+      // 校验失败回弹已保存值：输入框不驻留非法草稿（审查 M-7①）
+      setCheckinHhmm(settings?.doubao_checkin_hhmm || '09:15');
       return;
     }
+    const seq = ++checkinHhmmSeqRef.current;
     try {
       await saveSettings({ doubao_checkin_hhmm: v });
-      pushToast('success', `应用内签到时刻已保存（每日 ${v}）`);
+      if (seq === checkinHhmmSeqRef.current) pushToast('success', `应用内签到时刻已保存（每日 ${v}）`);
     } catch {
-      return; // store.saveSettings 失败时已 pushToast 错误详情，此处仅阻断成功提示
+      // store.saveSettings 失败时已 pushToast 错误详情；此处回滚 UI 时刻并阻断成功提示
+      if (seq === checkinHhmmSeqRef.current) setCheckinHhmm(settings?.doubao_checkin_hhmm || '09:15');
     }
   };
 
@@ -239,10 +270,25 @@ export default function DoubaoSettings() {
     }
   };
 
+  // 审查修复：effect 体内回填的文本草稿仅在对应 settings 字段实际变化时才写回——
+  // 依赖数组里的开关（本页改动即保存）变化触发 effect 重跑时，不得清掉其他输入框
+  // 未保存的草稿（如「额度接口」打字未保存时翻动保活开关，无条件回填会打回旧值）
+  const prevTextSettingsRef = useRef<Record<string, string | null>>({});
+
   useEffect(() => {
-    if (settings?.doubao_path) setPath(settings.doubao_path);
-    if (settings?.doubao_renew_url) setRenewUrl(settings.doubao_renew_url);
-    if (settings?.doubao_quota_url) setQuotaUrl(settings.doubao_quota_url);
+    const prev = prevTextSettingsRef.current;
+    const cur: Record<string, string | null> = {
+      path: settings?.doubao_path ?? null,
+      renew_url: settings?.doubao_renew_url ?? null,
+      quota_url: settings?.doubao_quota_url ?? null,
+      sync_mode: settings?.doubao_sync_mode ?? null,
+      sync_hours: settings?.doubao_sync_hours ?? null,
+      sync_hhmm: settings?.doubao_sync_hhmm ?? null,
+      checkin_hhmm: settings?.doubao_checkin_hhmm ?? null,
+    };
+    if (cur.path && cur.path !== prev.path) setPath(cur.path);
+    if (cur.renew_url && cur.renew_url !== prev.renew_url) setRenewUrl(cur.renew_url);
+    if (cur.quota_url && cur.quota_url !== prev.quota_url) setQuotaUrl(cur.quota_url);
     if (settings) {
       setIncludeIdb(!!settings.doubao_snapshot_include_idb);
       // !== false：旧版后端缺字段时按默认开展示（issue #147 新字段向后兼容）
@@ -250,11 +296,12 @@ export default function DoubaoSettings() {
       setQuotaEnabled(settings.doubao_quota_enabled !== false);
       setCheckinEnabled(settings.doubao_checkin_enabled !== false);
       setProbeAutoKeepalive(settings.doubao_probe_auto_keepalive !== false);
-      if (settings.doubao_sync_mode) setSyncMode(settings.doubao_sync_mode);
-      if (settings.doubao_sync_hours) setSyncHours(settings.doubao_sync_hours);
-      if (settings.doubao_sync_hhmm) setSyncHhmm(settings.doubao_sync_hhmm);
-      if (settings.doubao_checkin_hhmm) setCheckinHhmm(settings.doubao_checkin_hhmm);
+      if (cur.sync_mode && cur.sync_mode !== prev.sync_mode) setSyncMode(cur.sync_mode);
+      if (cur.sync_hours && cur.sync_hours !== prev.sync_hours) setSyncHours(cur.sync_hours);
+      if (cur.sync_hhmm && cur.sync_hhmm !== prev.sync_hhmm) setSyncHhmm(cur.sync_hhmm);
+      if (cur.checkin_hhmm && cur.checkin_hhmm !== prev.checkin_hhmm) setCheckinHhmm(cur.checkin_hhmm);
     }
+    prevTextSettingsRef.current = cur;
     void refreshTaskStatus();
     void refreshQuotaTaskStatus();
     void refreshCheckinTaskStatus();

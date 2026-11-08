@@ -1760,12 +1760,21 @@ pub fn doubao_checkin_task_register(state: State<AppState>, time: String) -> Res
     {
         let store = crate::store::db(&state.data_dir);
         // 原子读-改-写（审查修复）：两段式 kv_get→kv_set 与用户同时保存设置面板
-        // 并发时，旧快照整体覆盖会丢对方刚写入的键
+        // 并发时，旧快照整体覆盖会丢对方刚写入的键。
+        // 审查 #20：比较值无变化时返回 Ok(false) 不写盘（对齐 env.rs::persist_detected_path
+        // / misc.rs 口径，消除计划任务注册重试路径的写放大）
         if let Err(e) = store.kv_update("app_settings", |current| {
-            if let Some(obj) = current.as_object_mut() {
-                obj.insert("doubao_checkin_hhmm".to_string(), serde_json::json!(time));
+            let changed = current
+                .get("doubao_checkin_hhmm")
+                .and_then(|v| v.as_str())
+                .map(|s| s != time)
+                .unwrap_or(true);
+            if changed {
+                if let Some(obj) = current.as_object_mut() {
+                    obj.insert("doubao_checkin_hhmm".to_string(), serde_json::json!(time));
+                }
             }
-            Ok::<_, String>(true)
+            Ok::<_, String>(changed)
         }) {
             fs_utils::app_log(&state.data_dir, &format!("签到时刻写入设置失败（计划任务已注册）: {e}"));
         }

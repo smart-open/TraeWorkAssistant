@@ -130,11 +130,25 @@ static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 ///   规则也救不回——降级进程内锁继续写（跨进程并发窗口内可能与持锁方互踩
 ///   读改写，SQLite 写原子性兜底，尽力不丢优于确定性丢失），落日志留痕。
 /// 仅机制性失败（创建/等待出错）一律降级仅进程内锁继续写（尽力不丢，保留降级日志）。
+/// 审查 #17：降级路径保存前重读盘上最新视图合并本批条目——降级意味着与持锁方
+/// 并发，锁判定后的首次 load 可能早于持锁方的 save（过期视图），直接保存会把
+/// 持锁方刚写入的 success+reward 整体回滚；重读后按 record_day 语义（fail 不
+/// 覆盖 success/already）合并，尽力保住并发 success（剩余窗口为重读~写盘间的
+/// 竞态，SQLite 写原子性兜底，属作者注释明示的已知权衡）。
+/// 审查 M-2：降级路径合并范围扩为**全部 uid/日期**（原仅本批触达 uid）——存储层
+/// save 为整表 DELETE+INSERT，快照中未触达账号的陈旧行仍会被盲覆盖（如调度器
+/// 并发写入的 success 被本进程过期 fail 覆盖）。最终重读按 updated_at 新者胜
+/// （fresh 优先级高者胜；本批刚写入行带最新时间戳天然胜出），fresh 独有 uid/日期
+/// 行也必须并入——否则整表替换会删除他进程新写入的行。
+///
+/// 返回是否实际落库（审查 M-3）：false 仅在 skip_on_busy=true 且锁 Busy 幂等跳过
+/// 时出现——调用方（run_batch）据此打 skipped_busy 交调度器不 mark_run、下一轮
+/// 重跑补录（已签账号幂等归 already），否则批次结果丢失且「当日已跑」被固化。
 pub fn record_day_at(
     data_dir: &Path,
     entries: impl IntoIterator<Item = (String, String, String, Option<i64>, Option<String>, String)>,
     skip_on_busy: bool,
-) {
+) -> bool {
     let _g = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
         data_dir,
@@ -148,12 +162,13 @@ pub fn record_day_at(
         (Some(g), _) => Some(g),
         (None, Some(crate::tasks::qoder_common::CrossProcLockFail::Busy)) => {
             if skip_on_busy {
-                // 他方正持锁落库：同批签到的另一进程入口并发时跳过无损失（权衡见函数注释）
+                // 他方正持锁落库：同批签到的另一进程入口并发时跳过无损失（权衡见函数注释）。
+                // 返回 false 供 run_batch 打 skipped_busy——tick 不 mark_run，下一轮重跑补录
                 crate::fs_utils::app_log(
                     data_dir,
                     "[doubao_checkin_results] record_day_at 跨进程锁 Busy（他方落库中），幂等跳过本轮",
                 );
-                return;
+                return false;
             }
             // skip_on_busy=false 路径（代理捕获/manual 单账号）：条目可能为本进程侧独有，
             // 跳过即永久丢失——降级进程内锁继续写（尽力不丢，SQLite 写原子性兜底互踩
@@ -177,9 +192,19 @@ pub fn record_day_at(
         }
         (None, None) => None, // 非 Windows 占位实现不会走到
     };
-    let _cross = cross;
+    // 审查 #17：降级路径（cross=None）与持锁方并发——从锁 Busy 判定到保存之间
+    // 持锁方可能已完成 save，首次 load 的快照属过期视图，直接保存会整体回滚其
+    // 刚写入的 success+reward。降级时保存前重读盘上最新视图，把本批条目合并到
+    // 最新状态上（record_day 的 fail-不覆盖-success 语义保住并发成功）；
+    // 持锁成功路径独占窗口内盘上数据即最新，单次 load 即可。
+    // 先按 cross 判定再 move 进 `_cross`（借用检查：move 后不得再读）
+    let degraded = cross.is_none();
     let mut f = load(data_dir);
-    // 按 outcome 携带的 day 归组逐日落库（BTreeMap 保证日期序稳定）
+    if degraded {
+        // 保存前重读：覆盖首次 load 读取窗口内持锁方落盘的写入
+        f = load(data_dir);
+    }
+    let _cross = cross;
     let mut by_day: std::collections::BTreeMap<
         String,
         Vec<(String, String, String, Option<i64>, Option<String>)>,
@@ -190,7 +215,44 @@ pub fn record_day_at(
     for (day, ents) in by_day {
         f.record_day(&day, ents);
     }
+    if degraded {
+        // 审查 M-2：保存前最终重读合并，范围扩为全部 uid/日期——上一步重读~record~
+        // save 之间持锁方/他进程仍可能落盘，且存储层 save 为整表 DELETE+INSERT，
+        // 快照（f）中未触达 uid 的行会被盲覆盖、他进程新写入的 uid/日期行会被删除。
+        // 剩余竞态窗口为本次重读~save 之间（SQLite 写原子性兜底，作者注释明示的
+        // 已知权衡）。胜负规则见 merge_fresh_into
+        merge_fresh_into(&mut f, load(data_dir));
+    }
     save(data_dir, &f);
+    true
+}
+
+/// 降级路径最终合并（审查 M-2）：fresh（保存前重读的盘上最新视图）并入快照 f。
+/// 胜负规则：一侧 success/already、另一侧 fail 时恒取成功侧——复刻 record_day
+/// 「fail 不覆盖 success/already」例外并跨进程双向适用：本批 fail 的 updated_at
+/// 是落库时刻 now、几乎必然比持锁方先写的 success 新，纯新者胜会把他进程刚到账的
+/// success+reward 抹成 fail；反向同理，更晚落库的他进程 fail 不得回退本批 success。
+/// 其余组合（含两行同为 fail）updated_at 新者胜（"YYYY-MM-DD HH:MM:SS" 字典序即
+/// 时间序，平局保留快照行，本批刚写入行带最新时间戳天然胜出）；fresh 独有
+/// uid/日期行必须并入——否则整表替换会删除他进程新写入的行
+fn merge_fresh_into(f: &mut ResultsFile, fresh: ResultsFile) {
+    for (day, fr) in fresh.days {
+        let rec = f.days.entry(day).or_default();
+        for (uid, a) in fr.accounts {
+            let fresh_wins = match rec.accounts.get(&uid) {
+                // 成功侧恒胜（双向）：快照行为 fail 而 fresh 行已到账 → fresh 胜
+                Some(prev) if prev.status == "fail" && a.status != "fail" => true,
+                // 快照行已到账而 fresh 行为 fail → 保留快照行
+                Some(prev) if prev.status != "fail" && a.status == "fail" => false,
+                // 其余组合：updated_at 新者胜，平局保留快照行
+                Some(prev) => prev.updated_at < a.updated_at,
+                None => true, // fresh 独有行并入，防整表替换丢他进程写入
+            };
+            if fresh_wins {
+                rec.accounts.insert(uid, a);
+            }
+        }
+    }
 }
 
 /// 趋势查询结果点（单日汇总计数 + 奖励额度合计）
@@ -320,8 +382,89 @@ mod tests {
         assert_eq!(f.days[&today].accounts["u3"].status, "fail");
     }
 
+    /// 降级路径最终合并（merge_fresh_into）回归：一侧 success/already、另一侧
+    /// fail 时恒取成功侧（双向），其余组合 updated_at 新者胜，fresh 独有行并入
     #[test]
-    fn query_recent_按日期升序且限量() {
+    fn merge_fresh_into_成功侧恒胜_纯新者胜不抹账() {
+        let today = today_key();
+        let mk = |status: &str, reward: Option<i64>, at: &str| AccountResult {
+            name: "甲".into(),
+            status: status.into(),
+            reward,
+            message: None,
+            updated_at: at.into(),
+        };
+        // ① 本批 fail（updated_at 更新）不得覆盖持锁方刚写入的 success+reward
+        // （record_day 例外跨进程复刻：成功是当日最终事实）
+        let mut f = ResultsFile::default();
+        f.record_day(&today, [("u1".into(), "甲".into(), "fail".into(), None, None)]);
+        let mut fresh = ResultsFile::default();
+        fresh.record_day(&today, [("u1".into(), "甲".into(), "success".into(), Some(200), None)]);
+        // 时间戳对齐真实时序：持锁方先写（旧）、本批后写（新）
+        for r in f.days.get_mut(&today).unwrap().accounts.values_mut() {
+            r.updated_at = "2026-11-08 10:00:02".into();
+        }
+        for r in fresh.days.get_mut(&today).unwrap().accounts.values_mut() {
+            r.updated_at = "2026-11-08 10:00:01".into();
+        }
+        merge_fresh_into(&mut f, fresh);
+        let r = &f.days[&today].accounts["u1"];
+        assert_eq!(r.status, "success", "本批更晚的 fail 不得抹掉他进程 success");
+        assert_eq!(r.reward, Some(200));
+
+        // ② 反向：本批 success（旧）不被更晚落库的他进程 fail 回退
+        let mut f = ResultsFile::default();
+        f.record_day(&today, [("u2".into(), "乙".into(), "success".into(), Some(300), None)]);
+        let mut fresh = ResultsFile::default();
+        fresh.record_day(&today, [("u2".into(), "乙".into(), "fail".into(), None, None)]);
+        for r in f.days.get_mut(&today).unwrap().accounts.values_mut() {
+            r.updated_at = "2026-11-08 10:00:01".into();
+        }
+        for r in fresh.days.get_mut(&today).unwrap().accounts.values_mut() {
+            r.updated_at = "2026-11-08 10:00:02".into();
+        }
+        merge_fresh_into(&mut f, fresh);
+        let r = &f.days[&today].accounts["u2"];
+        assert_eq!(r.status, "success", "更晚的 fail 不得回退本批 success");
+        assert_eq!(r.reward, Some(300));
+
+        // ③ 同态 success：新者胜（重试轮最终态覆盖）
+        let mut f = ResultsFile::default();
+        f.days.entry(today.clone()).or_default().accounts.insert(
+            "u3".into(),
+            mk("already", None, "2026-11-08 10:00:01"),
+        );
+        let mut fresh = ResultsFile::default();
+        fresh.days.entry(today.clone()).or_default().accounts.insert(
+            "u3".into(),
+            mk("success", Some(100), "2026-11-08 10:00:02"),
+        );
+        merge_fresh_into(&mut f, fresh);
+        assert_eq!(f.days[&today].accounts["u3"].status, "success");
+
+        // ④ fresh 独有 uid/日期行并入（防整表 DELETE+INSERT 丢他进程写入）
+        let mut f = ResultsFile::default();
+        f.days.entry(today.clone()).or_default().accounts.insert(
+            "u4".into(),
+            mk("fail", None, "2026-11-08 10:00:02"),
+        );
+        let mut fresh = ResultsFile::default();
+        fresh.days.entry(today.clone()).or_default().accounts.insert(
+            "u5".into(),
+            mk("success", Some(200), "2026-11-08 10:00:01"),
+        );
+        fresh.days.entry("2026-11-07".into()).or_default().accounts.insert(
+            "u6".into(),
+            mk("already", None, "2026-11-07 09:00:00"),
+        );
+        merge_fresh_into(&mut f, fresh);
+        assert!(f.days[&today].accounts.contains_key("u5"), "fresh 独有 uid 并入");
+        assert!(f.days["2026-11-07"].accounts.contains_key("u6"), "fresh 独有日期并入");
+        assert!(f.days[&today].accounts.contains_key("u4"), "快照既有行保留");
+    }
+
+    #[test]
+    fn trend_from_按日期升序且限量() {
         let mut f = ResultsFile::default();
         for i in 1..=5 {
             let d = (chrono::Local::now().date_naive() - chrono::Duration::days(i))

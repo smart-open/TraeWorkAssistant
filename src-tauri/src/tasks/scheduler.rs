@@ -541,7 +541,10 @@ fn run_task(
             // 分支级早退而非任务层打标：wb 调度轮次会向前端转发 start/done 事件
             //（issue #134 方案1），空池若仍每 tick 走整轮会向前端刷「成功 0」toast；
             // 早退置于抢轮次锁之前——空轮不占锁，连击统计不动（空轮本就不变）
-            let pool = crate::store::docs::wb_pool_load(&crate::store::db(&st.data_dir));
+            // 审查 M-4：可失败口径读池——rows_all 读取失败走 Err 重试链（mark_fail
+            // 可见），不再被 unwrap_or_default 吞成空池静默 skipped_empty_pool
+            let pool = crate::store::docs::wb_pool_load_checked(&crate::store::db(&st.data_dir))
+                .map_err(|e| format!("WorkBuddy 账号池读取失败：{e}"))?;
             if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
                 return Ok(json!({ "ok": true, "skipped": "无 WorkBuddy 账号", "skipped_empty_pool": true }));
             }
@@ -753,7 +756,10 @@ fn run_task(
             // 奖励型签到空池豁免（审查修复，对齐 doubao/buddy-ai 口径）：空池提前
             // 返回 skipped_empty_pool（tick 不 mark_run，当日导入账号下一 tick 补打）；
             // 早退置于抢轮次锁之前——空轮不占锁，连击/重试判定均不触及
-            let pool = crate::store::docs::qoder_pool_load(&crate::store::db(&st.data_dir));
+            // 审查 M-4：可失败口径读池——rows_all 读取失败走 Err 重试链（mark_fail
+            // 可见），不再被 unwrap_or_default 吞成空池静默 skipped_empty_pool
+            let pool = crate::store::docs::qoder_pool_load_checked(&crate::store::db(&st.data_dir))
+                .map_err(|e| format!("Qoder 账号池读取失败：{e}"))?;
             if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
                 return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号", "skipped_empty_pool": true }));
             }

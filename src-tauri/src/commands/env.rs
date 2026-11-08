@@ -74,6 +74,8 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
         }
     }
     let mut cmd = Command::new(&exe);
+    // 子进程收口（macOS 审查 #2）：同 open_doubao_app
+    cmd.creation_flags(0x0800_0000);
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
@@ -370,6 +372,9 @@ pub fn open_doubao_app(state: State<AppState>, proxy_port: Option<u16>) -> Resul
         crate::commands::process::graceful_kill_app("Doubao")?;
     }
     let mut cmd = Command::new(&exe);
+    // 子进程收口（macOS 审查 #2）：GUI 启动客户端不闪控制台窗口
+    // （open_trae_cn_app 同款；CREATE_NO_WINDOW 仅对 GUI 子进程无副作用）
+    cmd.creation_flags(0x0800_0000);
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }
@@ -434,6 +439,8 @@ fn open_buddy_app(
         crate::commands::process::graceful_kill_app(kill_kind)?;
     }
     let mut cmd = Command::new(&exe);
+    // 子进程收口（macOS 审查 #2）：同 open_doubao_app
+    cmd.creation_flags(0x0800_0000);
     if let Some(port) = proxy_port {
         cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
     }

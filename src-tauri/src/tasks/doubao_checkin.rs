@@ -589,8 +589,11 @@ fn collect_targets(state: &AppState) -> Result<Vec<(String, String, Option<Strin
 /// skip_on_busy 语义见 record_day_at：task 批量传 true（调度器/CLI 双进程并发时
 /// 他方必完成同批写入，幂等跳过无损失）；manual 单账号传 false——GUI 手动签到与
 /// CLI 批次并发时两批内容不保证相同，Busy 跳过会把手动签到结果丢成 fail，
-/// 降级进程内锁继续写（池回写进程内锁保护，不受影响）
-fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_busy: bool) {
+/// 降级进程内锁继续写（池回写进程内锁保护，不受影响）。
+/// 返回是否实际落库（审查 M-3）：false 仅在 task 批量 skip_on_busy=true 且跨进程
+/// 落库锁 Busy 幂等跳过时出现——调用方 run_batch 据此打 skipped_busy 交调度器
+/// 不 mark_run、下一轮重跑补录（已签账号幂等归 already），防结果丢失且无法补录。
+fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_busy: bool) -> bool {
     // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）。
     // day 取 outcome 产生时刻打点（跨零点批次各归各日）；旧 outcome 无 day 回退当日。
     // message 仅 fail 携带（失败原因落库，切页/重开后日历明细仍可排障）——
@@ -614,7 +617,7 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_
         )
     });
     // skip_on_busy 由调用方按来源决定（task 批量=true / manual 单账号=false，见函数注释）
-    crate::doubao_checkin_results::record_day_at(&state.data_dir, entries, skip_on_busy);
+    let persisted = crate::doubao_checkin_results::record_day_at(&state.data_dir, entries, skip_on_busy);
 
     // ② 池回写（两阶段短临界区：重读最新池按 uid 合并）
     let run_at = fs_utils::now_ts();
@@ -670,6 +673,7 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_
             }),
         );
     }
+    persisted
 }
 
 /// 批量签到（调度器/CLI `--task-run doubao-checkin`）：遍历池内有凭证账号 → 签到 →
@@ -729,7 +733,20 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
         let probe = load_campaign_probe(&state.data_dir, Some(sid));
         outcomes.push(run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref()));
     }
-    persist_outcomes(state, &outcomes, "task", true);
+    // 审查 M-3：落库锁 Busy 幂等跳过（结果未落库）时打 skipped_busy 交调度器不
+    // mark_run、下一 tick 重跑补录（已签账号幂等归 already，无重复奖励）——否则
+    // 返 Ok 会被 mark_run 固化「当日已跑」关闭当日重试链，丢失的结果无法补录。
+    // skipped_busy 字段条件插入（tick 按字段存在性分流）：仅确因 Busy 未落库才带
+    // 字段，正常落库不得恒置 false（否则会误入 busy 分支不记当日已跑）。
+    // GUI 手动触发（调度开关关闭时）无自动补录，文案不承诺自动重试（审查 新-L1），
+    // 如实提示稍后重试签到即可补录
+    if !persist_outcomes(state, &outcomes, "task", true) {
+        return Ok(json!({
+            "ok": true,
+            "skipped": "本轮签到结果未记录（落库锁被其他进程持有）；稍后重试签到即可补录（重复签到只回「已领」，无重复奖励）",
+            "skipped_busy": true,
+        }));
+    }
 
     let success = outcomes
         .iter()
@@ -762,6 +779,16 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
     // 完成，Err 仅改变汇总出口。GUI「立即签到全部」经此路径收到 Err 时 toast 展示
     // 失败汇总，无数据副作用
     if failed > 0 {
+        // 审查 L-1：汇总串逐条钳制（单行化 + 120 字截断）——超长多行错误文案会污染
+        // CLI `--task-run` 退出输出与失败通知；errors 数组保原始完整供前端展示
+        let clamp_msg = |m: &str| -> String {
+            let one_line = m.replace(['\n', '\r'], " ");
+            let mut clamped: String = one_line.chars().take(120).collect();
+            if one_line.chars().count() > 120 {
+                clamped.push('…');
+            }
+            clamped
+        };
         let err_head = errors
             .iter()
             .take(3)
@@ -770,7 +797,7 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
                     format!(
                         "{}：{}",
                         e.get("name").and_then(Value::as_str).unwrap_or("未知账号"),
-                        m
+                        clamp_msg(m)
                     )
                 })
             })

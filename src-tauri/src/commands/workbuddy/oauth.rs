@@ -68,6 +68,9 @@ pub(super) fn jwt_claims(token: &str) -> Option<serde_json::Value> {
 /// 系统浏览器打开 URL（issue #153 修复 4：ShellExecuteW「open」动词直开 URL，
 /// 由系统按协议关联选默认浏览器——cmd start 依赖 shell 解析且控制台隐藏不稳定；
 /// 仅放行 http/https 且无引号空格，单参数直传无 shell 层，& / % 等保留字无需转义）
+/// 审查 #13：补逐函数 cfg 门控（对齐 qoder/oauth.rs 同型函数范式——windows_sys
+/// 为 Windows 专属，非 Windows 目标编译 E0433/E0308 一致性兜底）
+#[cfg(windows)]
 pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
@@ -90,6 +93,13 @@ pub(super) fn open_in_browser(url: &str) -> Result<(), String> {
     } else {
         Err(format!("打开浏览器失败（ShellExecuteW 错误码 {}）", result as usize))
     }
+}
+
+/// 非 Windows 占位（逐函数门控对齐 qoder/oauth.rs 惯例；macOS 适配预留：
+/// `open <url>` 子进程等价替换，Linux 用 `xdg-open`）
+#[cfg(not(windows))]
+pub(super) fn open_in_browser(_url: &str) -> Result<(), String> {
+    Err("打开浏览器仅支持 Windows".into())
 }
 
 /// 判断 URL 的 query 中是否已含指定 key（按 & 分段取 = 前缀，大小写不敏感）
