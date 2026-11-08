@@ -2723,47 +2723,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             );
             state.logger.log_debug_line(format!("[DEBUG] {diag_line}"));
         }
-        match proto {
-            Protocol::OpenAi | Protocol::OpenAiText => {
-                let err_body = json!({
-                    "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
-                });
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                    "data: {}\n\n",
-                    err_body
-                ))));
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-            }
-            Protocol::Anthropic => {
-                let err = json!({
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": exhaust_msg,
-                    },
-                });
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                    "event: error\ndata: {}\n\n",
-                    err
-                ))));
-            }
-            Protocol::Responses => {
-                let body = json!({
-                    "type": "response.failed",
-                    "response": {
-                        "id": format!("resp_{}", now_ts()),
-                        "object": "response",
-                        "status": "failed",
-                        "output": [],
-                        "error": {"code": "no_healthy_account", "message": exhaust_msg},
-                    },
-                });
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                    "event: response.failed\ndata: {}\n\n",
-                    body
-                ))));
-            }
-        }
+        // 审查修复（批次 2 复审）：统一走 send_stream_error_full——此前此处仍为
+        // 内联三臂旧形态（Responses 6 字段裸骨架缺 SDK 必读字段、Anthropic 臂
+        // 无合成收口），与 wb/qoder 耗尽出口不一致。code 保持字符串
+        // no_healthy_account 客户端兼容（main 审查 #7 口径，OpenAI 臂原值透传）
+        send_stream_error_full(&tx, proto, &model, json!("no_healthy_account"), &exhaust_msg);
     });
 
     let stream = ReceiverStream::new(rx);
