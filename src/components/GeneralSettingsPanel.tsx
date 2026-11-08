@@ -497,6 +497,17 @@ export default function GeneralSettingsPanel() {
                 （用量看板「会话说明」列；关闭仅隐藏展示，不删除缓存）
               </span>
             </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.auto_update_silent}
+                onChange={(e) => update('auto_update_silent', e.target.checked)}
+              />
+              静默自动更新
+              <span className="text-xs text-slate-400">
+                （每 2 小时后台检查新版本，空闲时自动下载安装并重启应用，全程免确认；默认关）
+              </span>
+            </label>
             <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
           </div>
         </div>

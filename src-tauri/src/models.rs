@@ -396,6 +396,10 @@ pub struct Settings {
     ///（默认关；开启后切换前自动备份当前账号三件套并复制到目标账号名下）
     #[serde(default)]
     pub buddy_switch_migrate_chats: bool,
+    /// F-86（issue #175）：静默自动更新——开启后应用每 2 小时后台检查新版本，
+    /// 空闲时（网关无在途请求）自动下载安装并重启（NSIS /R），全程零确认（默认关）
+    #[serde(default)]
+    pub auto_update_silent: bool,
     // ── Qoder（F-80；M1 签到 MVP 调度键 + 客户端路径）──
     /// Qoder CN IDE 桌面版 exe 手动路径（M3 切换档案预留；默认 %LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe）
     #[serde(default)]

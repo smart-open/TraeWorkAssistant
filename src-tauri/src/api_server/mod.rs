@@ -6,6 +6,7 @@ pub mod context_window;
 pub mod custom_lb;
 pub mod custom_models;
 pub mod custom_route;
+pub mod cross_pool;
 pub mod dispatch;
 pub mod efforts;
 pub mod gateway_settings;
@@ -34,7 +35,7 @@ pub mod wb_upstream;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
-pub use api_logger::ApiLogger;
+pub use api_logger::{ApiLogRecentResult, ApiLogger};
 pub use pool::ApiPool;
 
 /// SOLO 上游常量

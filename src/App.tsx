@@ -4,6 +4,7 @@ import Sidebar from './components/Sidebar';
 import TopBar from './components/TopBar';
 import Toaster from './components/Toaster';
 import { useAppStore } from './store';
+import { api } from './lib/tauri';
 import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
 import Accounts from './pages/Accounts';
@@ -132,6 +133,22 @@ export default function App() {
     mq.addEventListener('change', apply);
     return () => mq.removeEventListener('change', apply);
   }, [settings?.theme]);
+
+  // F-86（issue #175）：静默自动更新——开关开启时每 2 小时后台检查一轮，
+  // 空闲（网关无在途请求）时自动下载安装并重启；关闭即停表。错误仅落 console
+  //（编排命令网络失败归 error action，不抛 Promise rejection 打扰用户）
+  useEffect(() => {
+    if (!settings?.auto_update_silent) return;
+    const id = window.setInterval(() => {
+      api.updater
+        .autoTick()
+        .then((r) => {
+          if (r.action === 'error') console.warn('[auto-update]', r.detail);
+        })
+        .catch((e) => console.warn('[auto-update] tick 失败:', e));
+    }, 2 * 60 * 60 * 1000);
+    return () => window.clearInterval(id);
+  }, [settings?.auto_update_silent]);
 
   if (!ready) {
     return (

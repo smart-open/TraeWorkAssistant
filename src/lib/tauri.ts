@@ -49,6 +49,8 @@ import type {
   OAuthLoginUrl,
   OAuthLoginResult,
   OAuthLoginDoneEvent,
+  ApiLogRecentResult,
+  UpdateAutoTickResult,
   PoolStatus,
   ProfileInfo,
   ProxyLogListResult,
@@ -991,9 +993,27 @@ export const api = {
     }) => invoke<string | null>('api_logs_search', {
       opts: {
         date: opts.date,
-        start_time: opts.startTime,
-        end_time: opts.endTime,
+        // 修复：Rust 端 ApiLogSearchOpts 为 camelCase 反序列化，原 snake_case 键
+        // 会被静默忽略导致时间段过滤从未生效
+        startTime: opts.startTime,
+        endTime: opts.endTime,
         keyword: opts.keyword,
+      },
+    }),
+    /** F-84：结构化「最近请求」查询（解析文本日志行，新→旧分页 + 池/结果筛选） */
+    logsRecent: (opts: {
+      days?: number;
+      page?: number;
+      pageSize?: number;
+      pool?: string;
+      result?: 'ok' | 'fail';
+    }) => invoke<ApiLogRecentResult>('api_logs_recent', {
+      opts: {
+        days: opts.days,
+        page: opts.page,
+        pageSize: opts.pageSize,
+        pool: opts.pool || undefined,
+        result: opts.result || undefined,
       },
     }),
     debugToggle: () => invoke<boolean>('api_debug_toggle'),
@@ -1170,6 +1190,9 @@ export const api = {
       ),
     onInstalling: async (cb: (assetName: string) => void): Promise<UnlistenFn> =>
       listen<string>('update-installing', (ev) => cb(ev.payload)),
+    // F-86：无人值守更新编排单轮 tick（check → 空闲判定 → download → install 自动重启；
+    // 设置 auto_update_silent 默认关，前端每 2h 调一次）
+    autoTick: () => invoke<UpdateAutoTickResult>('update_auto_tick'),
   },
 };
 

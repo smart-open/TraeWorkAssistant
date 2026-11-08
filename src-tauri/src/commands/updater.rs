@@ -22,7 +22,7 @@
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 
 const RELEASES_API: &str =
     "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
@@ -767,6 +767,103 @@ pub fn update_run_installer(
     // 后者绕过清理链，代理运行中重启更新会残留死系统代理导致全局断网
     let _ = app.exit(0);
     Ok(())
+}
+
+// ---------------- F-86：全自动静默更新编排（issue #175，设置默认关） ----------------
+
+/// 防重入闸：上一轮 tick 仍在下载/安装期间时跳过本轮（前端 2h 定时 + 此闸双保险）
+static AUTO_TICK_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct AutoTickGuard;
+impl Drop for AutoTickGuard {
+    fn drop(&mut self) {
+        AUTO_TICK_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 无人值守更新编排结果（前端仅用于状态展示与日志，不参与决策）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAutoTickResult {
+    /// skipped_cli / skipped_disabled / busy / busy_gateway / no_update / error / installed
+    pub action: String,
+    pub detail: String,
+}
+
+/// F-86：无人值守更新编排——check → 空闲判定 → download → run_installer。
+/// 由前端每 2 小时定时触发；设置 `auto_update_silent` 默认关。
+/// **安全红线**：三道完整性闸（发布方 SHA256 强制、下载比对、安装前复验）全部
+/// 沿用既有 update_download / update_run_installer 路径，静默路径零绕过分支；
+/// CLI 任务进程（--task-run）永不参与自动更新（避免双进程竞争安装）。
+#[tauri::command(async)]
+pub fn update_auto_tick(
+    app: AppHandle,
+    state: State<'_, crate::state::AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<UpdateAutoTickResult, String> {
+    use std::sync::atomic::Ordering;
+    let r = |action: &str, detail: String| {
+        Ok(UpdateAutoTickResult { action: action.to_string(), detail })
+    };
+    // CLI 任务进程排除（GUI 前端定时器不会在 CLI 进程运行，双保险）
+    if std::env::args().nth(1).as_deref() == Some("--task-run") {
+        return r("skipped_cli", "CLI 任务进程不参与自动更新".into());
+    }
+    // 设置开关（默认关）
+    if !state.settings().auto_update_silent {
+        return r("skipped_disabled", "静默自动更新未开启".into());
+    }
+    // 防重入
+    if AUTO_TICK_BUSY.swap(true, Ordering::SeqCst) {
+        return r("busy", "上一轮自动更新仍在进行".into());
+    }
+    let _guard = AutoTickGuard;
+    // 空闲判定：网关在途请求为 0 才安装（未运行 / 状态锁中毒均视为空闲——
+    // 安装会退出本进程，仅在途请求会被中断，故只挡 inflight > 0）
+    match runtime.lock() {
+        Ok(guard) => {
+            if let Some(rt) = guard.as_ref() {
+                if rt.shared.inflight.load(Ordering::Relaxed) > 0 {
+                    return r("busy_gateway", "网关存在在途请求，已推迟到下一轮".into());
+                }
+            }
+        }
+        Err(_) => { /* 状态锁中毒：按空闲继续（安装即退出，无中断面） */ }
+    }
+    // ① 检查（网络失败归 error，不 Err——避免前端定时器持续报未捕获错误）
+    let chk = match update_check() {
+        Ok(c) => c,
+        Err(e) => return r("error", format!("检查更新失败：{e}")),
+    };
+    if !chk.has_update {
+        return r("no_update", format!("已是最新版本 {}", chk.current_version));
+    }
+    // ② 下载（三道闸前两道在此路径内）
+    let dl = match update_download(
+        app.clone(),
+        chk.download_url.clone(),
+        chk.asset_name.clone(),
+        chk.latest_version.clone(),
+        chk.sha256.clone(),
+    ) {
+        Ok(d) => d,
+        Err(e) => return r("error", format!("下载 {} 失败：{e}", chk.latest_version)),
+    };
+    // 审查修复 P3：安装前二次空闲判定——下载耗时分钟级，期间新进的在途请求
+    // 会被安装重启中断；把竞态窗口从整个下载时长压缩到判定→安装的毫秒级。
+    // 本轮放弃的安装包留在更新缓存，下一轮/手动更新直接覆盖复用
+    if let Ok(rt_guard) = runtime.lock() {
+        if let Some(rt) = rt_guard.as_ref() {
+            if rt.shared.inflight.load(Ordering::Relaxed) > 0 {
+                return r("busy_gateway", "下载完成但网关出现新的在途请求，已推迟安装到下一轮".into());
+            }
+        }
+    }
+    // ③ 安装（第三道闸 + /R 装完自动重启；成功路径 emit update-installing 后进程退出）
+    match update_run_installer(app.clone(), dl.file_path, dl.asset_name) {
+        Ok(()) => r("installed", format!("已启动 {} 安装，应用将自动重启", dl.version)),
+        Err(e) => r("error", format!("安装失败：{e}")),
+    }
 }
 
 #[cfg(test)]

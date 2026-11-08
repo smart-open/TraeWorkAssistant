@@ -262,6 +262,17 @@ pub struct Resolved {
     /// 内部落 app_log；本字段供调度测试断言与 Phase 2 资源页展示预留）
     #[allow(dead_code)]
     pub fallback_from: Option<TargetPool>,
+    /// F-81：执行期跨池回退链——调度时点按候选序收集的全部健康池（不含本池，
+    /// 本池耗尽时按序移交执行）；policy.fallback 关闭或前缀锁定时恒空
+    pub fallback_chain: Vec<PoolCandidate>,
+}
+
+/// F-81：跨池回退链单项（轻量，仅执行期跨池所需字段；模型名按池归一化完毕）
+#[derive(Debug, Clone)]
+pub struct PoolCandidate {
+    pub pool: TargetPool,
+    pub model: String,
+    pub effort_hint: Option<String>,
 }
 
 /// 回退原因（供 warn 日志）
@@ -735,6 +746,8 @@ pub fn resolve_target(
                     effort_hint: effort_for(pool, &sources),
                     max_mode_hint: max_mode_for(pool, &sources),
                     fallback_from: None,
+                    // 粘性命中（TTL 60s 内刚成功）不构建跨池链：耗尽概率低，回退原错误矩阵
+                    fallback_chain: Vec::new(),
                 });
             }
         }
@@ -806,6 +819,10 @@ pub fn resolve_target(
     // 模型冷却），全部耗尽时随 app_log 落盘——「白名单把池排除」与「账号不健康」
     // 在一行日志内即可区分，替代盲猜调用路径
     let mut pool_reasons: Vec<String> = Vec::new();
+    // F-81：首个健康池（正式胜出者）字段暂存与跨池回退链收集——胜出后不立即
+    // 返回，继续遍历把其余健康池收进链（原实现 return 先于链收集，链恒空）
+    let mut win: Option<(TargetPool, String, Option<String>, bool)> = None;
+    let mut chain: Vec<PoolCandidate> = Vec::new();
     for (i, pool) in order.iter().copied().enumerate() {
         if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) {
             // 审查 F-3 修复：原 unavailable 二义（「上游开关未启用」与「该池无此
@@ -817,6 +834,24 @@ pub fn resolve_target(
         }
         match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref()) {
             Ok(()) => {
+                // F-81：首个健康池 = 正式胜出者（日志/sticky 语义不变）；
+                // 后续健康池仅收进跨池回退链（fallback 开 && 非前缀锁定）
+                if win.is_some() {
+                    if policy.fallback && forced_pool.is_none() {
+                        chain.push(PoolCandidate {
+                            pool,
+                            model: final_model_for(pool, &sources, model),
+                            effort_hint: effort_for(pool, &sources),
+                        });
+                    }
+                    continue;
+                }
+                win = Some((
+                    pool,
+                    final_model_for(pool, &sources, model),
+                    effort_for(pool, &sources),
+                    max_mode_for(pool, &sources),
+                ));
                 // 首个可用池胜出；此前有可用池失败 → 跨池回退 warn 日志（§4.5）。
                 // 源剔除（如 wb_enabled=false）不算回退，不记日志
                 if let Some((pref, reason)) = fallback_from {
@@ -837,16 +872,16 @@ pub fn resolve_target(
                 if let Some(sk) = &sticky_key {
                     record_sticky(state, sk, pool);
                 }
-                return Ok(Resolved {
-                    pool,
-                    model: final_model_for(pool, &sources, model),
-                    effort_hint: effort_for(pool, &sources),
-                    max_mode_hint: max_mode_for(pool, &sources),
-                    fallback_from: fallback_from.map(|(p, _)| p),
-                });
+                // F-81：胜出后不立即返回——继续遍历收集其余健康池进跨池链，
+                // 循环外统一组装 Resolved（链收集与胜出解耦）
             }
             Err(reason) => {
                 pool_reasons.push(format!("{}={}", pool.as_str(), reason.as_str()));
+                // F-81：已有胜出者时，后续池预检失败仅记录归因（不进链、不触发
+                // 提前 Err——胜出者循环外统一返回）
+                if win.is_some() {
+                    continue;
+                }
                 // 首选池不可用：双源 + fallback 开 + 后续还有可用源 → 按序回退；
                 // 单源（或 fallback 关）→ 错误矩阵显式报错（§4.3，不静默换池）。
                 // BM-3 审查修复：门控从 is_dual（家族计数，Buddy/BuddyAi 同族不叠加）
@@ -896,6 +931,18 @@ pub fn resolve_target(
                 }
             }
         }
+    }
+    // F-81：有胜出者 → 链已收齐，组装返回（fallback_from 语义不变：仅记录
+    // 胜出前的首个失败池）；无胜出者才走下方耗尽块
+    if let Some((pool, win_model, effort_hint, max_mode_hint)) = win {
+        return Ok(Resolved {
+            pool,
+            model: win_model,
+            effort_hint,
+            max_mode_hint,
+            fallback_from: fallback_from.map(|(p, _)| p),
+            fallback_chain: chain,
+        });
     }
     // 仅零可用源（循环内全部 continue）才走到此处；有可用池但失败的场景均在
     // 循环内 !can_fallback 提前终止并落同款归因日志（issue #136）。落盘调度
@@ -2301,6 +2348,61 @@ mod tests {
         assert_eq!(t.pool, TargetPool::Trae);
         assert_eq!(t.model, "Kimi-K3");
         assert!(t.effort_hint.is_none());
+    }
+
+    // ---------- F-81 跨池回退链（fallback_chain） ----------
+
+    /// 双源全健康：胜出 Buddy（smart 倍率序），其余健康池 Trae 按序收进跨池链
+    ///（回归锁定：原实现胜出即 return 先于链收集，链恒空 = F-81 整体失效）
+    #[test]
+    fn t81_fallback_chain_collects_remaining_healthy_pools() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.fallback_chain.len(), 1);
+        assert_eq!(r.fallback_chain[0].pool, TargetPool::Trae);
+        assert_eq!(r.fallback_chain[0].model, "glm-5.3");
+        // 单源模型：无其余健康池，链必空
+        let f2 = fixture(&["Kimi-K3"], Some(&["hy4"]), Some(&policy_default()));
+        f2.seed_healthy(true);
+        assert!(f2.resolve_no_session("Kimi-K3").unwrap().fallback_chain.is_empty());
+    }
+
+    /// fallback 关闭：其余健康池不进链（policy.fallback 门控；路由行为不变）
+    #[test]
+    fn t81_fallback_chain_empty_when_fallback_disabled() {
+        let mut p = policy_default();
+        p.fallback = false;
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert!(r.fallback_chain.is_empty());
+    }
+
+    /// 前缀锁定池（buddy/glm-5.3）：用户点名单池，不构建跨池链（forced_pool 门控）
+    #[test]
+    fn t81_fallback_chain_empty_on_pool_prefix_lock() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve_no_session("buddy/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert!(r.fallback_chain.is_empty());
+    }
+
+    /// 胜出后其余池不健康：不进链（链只收健康候选），胜出语义与归因日志不变
+    #[test]
+    fn t81_fallback_chain_skips_unhealthy_pools() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false); // 仅 Buddy 健康，Trae 池耗尽
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert!(r.fallback_chain.is_empty());
+        assert_eq!(r.fallback_from, None);
     }
 
     // ---------- 后缀剥离跨池（issue #31 T3.1） ----------

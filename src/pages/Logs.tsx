@@ -1,12 +1,12 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { RefreshCw, Search, Trash2, Copy, ChevronLeft, ChevronRight, Eye, Eraser, Bug, FileText, X } from 'lucide-react';
+import { RefreshCw, Search, Trash2, Copy, ChevronLeft, ChevronRight, Eye, Eraser, Bug, FileText, X, List, ScrollText } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, Modal } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
 import { copyText } from '../lib/clipboard';
-import type { ProxyLogEntry } from '../types';
+import type { ApiLogEntry, ProxyLogEntry } from '../types';
 
 const TYPES = [
   { v: 'all', label: '全部' },
@@ -453,6 +453,212 @@ function ProxyLogsTab() {
 
 // ======================== API 请求日志 Tab ========================
 
+// ======================== F-84 结构化「最近请求」视图 ========================
+
+const RECENT_PAGE_SIZE = 50;
+const RECENT_POOLS = [
+  { v: 'all', label: '全部' },
+  { v: 'trae', label: 'Trae' },
+  { v: 'buddy', label: 'Buddy' },
+  { v: 'buddy-ai', label: 'Buddy AI' },
+  { v: 'qoder', label: 'Qoder' },
+  { v: 'custom', label: '自定义' },
+];
+const RECENT_RESULTS = [
+  { v: 'all', label: '全部' },
+  { v: 'ok', label: '成功' },
+  { v: 'fail', label: '失败' },
+];
+
+/** 状态着色：2xx 成功 / 429 与 4xx 降级琥珀 / 5xx 失败红 */
+function statusChipCls(status: number): string {
+  if (status >= 200 && status < 300) {
+    return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
+  }
+  if (status >= 400 && status < 500) {
+    return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
+  }
+  return 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300';
+}
+
+function ApiRecentRequests() {
+  const [rows, setRows] = useState<ApiLogEntry[]>([]);
+  const [total, setTotal] = useState(0);
+  const [truncated, setTruncated] = useState(false);
+  const [page, setPage] = useState(1);
+  const [pool, setPool] = useState('all');
+  const [result, setResult] = useState('all');
+  const [loading, setLoading] = useState(false);
+  const reqIdRef = useRef(0);
+
+  const load = useCallback(async (p: number, pf: string, rf: string) => {
+    const reqId = ++reqIdRef.current;
+    setLoading(true);
+    try {
+      const r = await api.apiServer.logsRecent({
+        page: p,
+        pageSize: RECENT_PAGE_SIZE,
+        pool: pf === 'all' ? undefined : pf,
+        result: rf === 'all' ? undefined : (rf as 'ok' | 'fail'),
+      });
+      if (reqIdRef.current !== reqId) return;
+      setRows(r.rows);
+      setTotal(r.total);
+      setTruncated(r.truncated);
+      setPage(p);
+    } catch {
+      // 静默：查询失败保留上一页数据（日志面板非关键路径）
+    } finally {
+      if (reqIdRef.current === reqId) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load(1, pool, result);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const totalPages = Math.max(1, Math.ceil(total / RECENT_PAGE_SIZE));
+
+  return (
+    <div className="p-4">
+      {/* 筛选条 */}
+      <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-slate-200/70 bg-slate-50/60 p-2.5 dark:border-zinc-700/50 dark:bg-zinc-800/30">
+        <span className="text-xs text-slate-400">池</span>
+        <div className="flex flex-wrap gap-1">
+          {RECENT_POOLS.map((p) => (
+            <button
+              key={p.v}
+              className={`rounded-md px-2 py-0.5 text-xs font-medium transition ${
+                pool === p.v
+                  ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
+                  : 'bg-white text-slate-500 hover:bg-slate-100 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
+              }`}
+              onClick={() => { setPool(p.v); void load(1, p.v, result); }}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        <span className="ml-2 text-xs text-slate-400">结果</span>
+        <div className="flex gap-1">
+          {RECENT_RESULTS.map((r) => (
+            <button
+              key={r.v}
+              className={`rounded-md px-2 py-0.5 text-xs font-medium transition ${
+                result === r.v
+                  ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
+                  : 'bg-white text-slate-500 hover:bg-slate-100 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
+              }`}
+              onClick={() => { setResult(r.v); void load(1, pool, r.v); }}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+        <span className="ml-auto flex items-center gap-2 text-xs text-slate-400">
+          {truncated && (
+            <span className="rounded-md bg-amber-100 px-2 py-0.5 font-medium text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">
+              已达解析上限
+            </span>
+          )}
+          共 {total.toLocaleString()} 条
+          <button
+            className="btn-ghost flex items-center gap-1 !p-1 text-xs"
+            onClick={() => void load(page, pool, result)}
+            disabled={loading}
+            title="刷新"
+          >
+            <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
+          </button>
+        </span>
+      </div>
+
+      {/* 请求表 */}
+      <div className="max-h-[480px] overflow-auto rounded-lg border border-slate-200/70 dark:border-zinc-700/50">
+        <table className="w-full table-fixed text-left text-xs">
+          <thead className="sticky top-0 bg-slate-50 text-[11px] text-slate-400 dark:bg-zinc-800/80 dark:text-zinc-500">
+            <tr className="border-b border-slate-200 dark:border-zinc-700">
+              <th className="w-[13%] px-2 py-2 font-medium">时间</th>
+              <th className="w-[19%] px-2 py-2 font-medium">端点</th>
+              <th className="w-[14%] px-2 py-2 font-medium">模型</th>
+              <th className="w-[9%] px-2 py-2 font-medium">池</th>
+              <th className="w-[12%] px-2 py-2 font-medium">账号</th>
+              <th className="w-[7%] px-2 py-2 text-center font-medium">状态</th>
+              <th className="w-[8%] px-2 py-2 text-right font-medium">耗时</th>
+              <th className="w-[8%] px-2 py-2 text-right font-medium">TTFT</th>
+              <th className="w-[10%] px-2 py-2 font-medium">失败原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr
+                key={`${r.date}-${r.time}-${i}`}
+                className="border-b border-slate-100 hover:bg-slate-50/70 dark:border-zinc-800 dark:hover:bg-zinc-800/40"
+              >
+                <td className="truncate px-2 py-1.5 font-mono text-slate-500 dark:text-zinc-400" title={`${r.date} ${r.time}`}>
+                  {r.date.slice(5)} {r.time}
+                </td>
+                <td className="truncate px-2 py-1.5 font-mono text-slate-600 dark:text-zinc-300" title={`${r.method} ${r.path}${r.stream ? '（流式）' : ''}`}>
+                  {r.path}
+                  {r.stream && <span className="ml-1 text-[10px] text-sky-500">SSE</span>}
+                </td>
+                <td className="truncate px-2 py-1.5 text-slate-600 dark:text-zinc-300" title={r.model}>{r.model}</td>
+                <td className="truncate px-2 py-1.5 text-slate-500 dark:text-zinc-400">{r.pool}</td>
+                <td className="truncate px-2 py-1.5 text-slate-600 dark:text-zinc-300" title={`${r.acct}（${r.keyName}）`}>{r.acct}</td>
+                <td className="px-2 py-1.5 text-center">
+                  <span className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold ${statusChipCls(r.status)}`}>
+                    {r.status}
+                  </span>
+                </td>
+                <td className="px-2 py-1.5 text-right font-mono text-slate-500 dark:text-zinc-400">
+                  {r.durationMs >= 1000 ? `${(r.durationMs / 1000).toFixed(1)}s` : `${r.durationMs}ms`}
+                </td>
+                <td className="px-2 py-1.5 text-right font-mono text-slate-400 dark:text-zinc-500">
+                  {r.ttfbMs != null ? `${r.ttfbMs}ms` : '-'}
+                </td>
+                <td className="truncate px-2 py-1.5 text-rose-600 dark:text-rose-300" title={r.error ?? undefined}>
+                  {r.error ?? ''}
+                </td>
+              </tr>
+            ))}
+            {rows.length === 0 && !loading && (
+              <tr>
+                <td colSpan={9} className="px-2 py-6 text-center text-slate-400">
+                  {total === 0 ? '最近 3 天无匹配请求' : '加载中…'}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* 分页条 */}
+      {totalPages > 1 && (
+        <div className="mt-2 flex items-center justify-end gap-2 text-xs text-slate-500 dark:text-zinc-400">
+          <span>第 {page} / {totalPages} 页</span>
+          <button
+            className="btn-outline flex items-center gap-1 px-2 py-1 text-xs"
+            disabled={page <= 1 || loading}
+            onClick={() => void load(page - 1, pool, result)}
+          >
+            <ChevronLeft size={12} />
+            上一页
+          </button>
+          <button
+            className="btn-outline flex items-center gap-1 px-2 py-1 text-xs"
+            disabled={page >= totalPages || loading}
+            onClick={() => void load(page + 1, pool, result)}
+          >
+            下一页
+            <ChevronRight size={12} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** 整日日志内容渲染软上限：超过时截断展示，避免超大 <pre> 卡死主线程 */
 const MAX_API_LOG_CHARS = 200_000;
 
@@ -472,6 +678,8 @@ function ApiLogsTab() {
   const [endTime, setEndTime] = useState('');
   const [searching, setSearching] = useState(false);
   const [filtered, setFiltered] = useState(false);
+  // F-84：视图切换（结构化最近请求 / 原始整日文本）
+  const [view, setView] = useState<'recent' | 'raw'>('recent');
 
   // 当前选中日期的 ref：loadDates 不再依赖 selected 状态，避免 selected 变化导致 effect 二次拉取
   const selectedRef = useRef('');
@@ -600,6 +808,33 @@ function ApiLogsTab() {
             </span>
           </div>
           <div className="flex items-center gap-2">
+            {/* F-84：视图切换（结构化 / 原始文本） */}
+            <div className="flex overflow-hidden rounded-lg border border-slate-200 dark:border-zinc-700">
+              <button
+                className={`flex items-center gap-1 px-2 py-1 text-xs font-medium transition ${
+                  view === 'recent'
+                    ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
+                    : 'text-slate-500 hover:bg-slate-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                }`}
+                onClick={() => setView('recent')}
+                title="结构化最近请求（池/账号/结果/耗时/TTFT）"
+              >
+                <List size={12} />
+                最近请求
+              </button>
+              <button
+                className={`flex items-center gap-1 px-2 py-1 text-xs font-medium transition ${
+                  view === 'raw'
+                    ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
+                    : 'text-slate-500 hover:bg-slate-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                }`}
+                onClick={() => setView('raw')}
+                title="原始整日文本日志"
+              >
+                <ScrollText size={12} />
+                原始日志
+              </button>
+            </div>
             <button
               className={`flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition ${
                 debugEnabled
@@ -624,7 +859,9 @@ function ApiLogsTab() {
           </div>
         </div>
 
-        {dates.length === 0 ? (
+        {view === 'recent' ? (
+          <ApiRecentRequests />
+        ) : dates.length === 0 ? (
           <p className="py-12 text-center text-sm text-slate-400">暂无日志</p>
         ) : (
           <div className="p-4">

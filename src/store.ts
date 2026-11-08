@@ -200,6 +200,8 @@ function defaultSettings(): Settings {
     silent_checkin: false,
     /** issue #82 T6.1：会话明细概述显示开关（默认开） */
     sessions_preview_enabled: true,
+    // F-86：静默自动更新（默认关）
+    auto_update_silent: false,
     auto_start_proxy: true,
     auto_start_api: false,
     tray: true,

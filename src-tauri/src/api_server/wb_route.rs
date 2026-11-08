@@ -807,6 +807,7 @@ pub fn wb_stream_chat(
     key_id: String,
     guard: InflightGuard,
     encoded: std::collections::HashSet<String>,
+    fallback: Vec<super::dispatch::PoolCandidate>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -853,7 +854,7 @@ pub fn wb_stream_chat(
 
         // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核
         let view = WbView::new(state, buddy_ai);
-        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded);
+        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded, &fallback);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -871,7 +872,7 @@ pub fn wb_stream_chat(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_wb_stream(
+pub(crate) fn run_wb_stream(
     state: &WbView,
     body_vec: &[u8],
     model: &str,
@@ -882,6 +883,7 @@ fn run_wb_stream(
     start_ts: Instant,
     mut guard: InflightGuard,
     encoded: &std::collections::HashSet<String>,
+    fallback: &[super::dispatch::PoolCandidate],
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
@@ -1037,6 +1039,14 @@ fn run_wb_stream(
                     // Anthropic 收 event: error、Responses 收 response.failed，
                     // OpenAI 系维持 data: 错误帧；message 均为 exhaust_msg，
                     // code 保持 no_healthy_account（客户端兼容）
+                    // F-81 跨池移交：有健康候选链且客户端未断连 → 把剩余流生命
+                    // 周期交给下一池（guard move；503 账面行保留=本池尝试记录；
+                    // 移交成功不再发错误帧）；链空或全不支持 → 原收尾
+                    if !fallback.is_empty() && !tx.is_closed() {
+                        if super::cross_pool::continue_stream_on_next_pool(&state.state, state.pool_label(), fallback, body_vec, proto, key_id, chat_id, tx, guard, encoded, start_ts) {
+                            return;
+                        }
+                    }
                     match proto {
                         Protocol::Anthropic => {
                             let err = json!({"type":"error","error":{"type":"api_error","message":exhaust_msg}});
