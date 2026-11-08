@@ -976,6 +976,10 @@ fn run_wb_stream(
     let mut cut_hits: usize = 0;
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
     let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
+    // issue #195：11128 激进升级按请求一次。wb_sanitize 默认开时首轮已带默认
+    // 清洗，旧守卫 `!sanitize` 使升级分支永不进入 → 首轮 11128 直接 Fatal，
+    // 激进规则（兜未知指纹变体的唯一防线）形同虚设
+    let mut aggressive_tried = false;
     // 审查修复（L1）：最近绑定账号（绑定成功才更新）——外层断连终局归因复用，
     // 防换号重试期间断连落 "none" 致账单排查失据
     let mut last_bound_uid: Option<String> = None;
@@ -1093,11 +1097,13 @@ fn run_wb_stream(
             .and_then(|m| m.resolve_effort(effort_hint.as_deref()));
         // 多候选改写种子（issue #122 方案 C1）：conv_id 绑定请求、tried.len()
         // 随换号轮换递增——跨重试候选必变；空完成后（empty_hits>0）或池级指纹
-        // 拦截 TTL 内（issue #122 缺口2）追加激进清洗（issue #122 方案 C2）
+        // 拦截 TTL 内（issue #122 缺口2）追加激进清洗（issue #122 方案 C2）；
+        // 本请求内已 11128 升级（aggressive_tried，issue #195）后换号也保持激进——
+        // 新号重建请求体若回退默认表，指纹回归必再 11128（对齐 toolexec force_aggressive 口径）
         let seed = wb_payload::variant_seed(&conv_id, tried.len() as u64);
         let mut converted = wb_payload::prepare_wb_chat_body(
             body_vec, model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
-            seed, empty_hits > 0 || wb_payload::fp_block_recent(state.pool_label()),
+            seed, empty_hits > 0 || aggressive_tried || wb_payload::fp_block_recent(state.pool_label()),
         );
         // 工具别名正向改写（issue #150）：受 sanitize 门控（与 Trae/Qoder 池同口径）；
         // 逆映射供响应侧回改（覆盖 tools/tool_choice/历史 tool_calls 三个透传点，
@@ -1254,7 +1260,13 @@ fn run_wb_stream(
                                 // sent_any 护栏（审查修复，对齐上方空完成分支）：内容已
                                 // 流出时同号重试会向同一 SSE 流拼接第二份完整响应 →
                                 // 未清洗也不得重试，直接落下方 Fatal 终局
-                                if !sanitize && !sent_any {
+                                // issue #195：升级守卫改为按请求一次性旗标——wb_sanitize
+                                // 默认开时旧守卫 `!sanitize` 恒假，激进规则永不生效。
+                                // 现无论开关状态，11128 后先做一次默认表+激进规则全力
+                                // 清洗的同号重试（prepare 末参 aggressive=true 已是首轮
+                                // 超集），再命中才 Fatal
+                                if !aggressive_tried && !sent_any {
+                                    aggressive_tried = true;
                                     sanitize = true;
                                     state.logger.log_sched_event(&format!(
                                         "11128 强制清洗重试（流内）{}", wb_payload::template_hit_note()
@@ -1289,6 +1301,16 @@ fn run_wb_stream(
                                 wb_payload::record_fingerprint_sample(
                                     "11128", state.pool_label(), &sample, &note,
                                 );
+                                // issue #195：显式 11128 与空完成主导同视为渠道指纹
+                                // 确认，标记池级短记忆——TTL 内同池新请求首轮即激进
+                                // 起步（prepare 末参经 fp_block_recent 生效），不再
+                                // 每次都先吃一次 11128 才升级
+                                wb_payload::mark_channel_fp_block(state.pool_label(), true);
+                                // 清洗后残留自检（issue #195 可观测性）：给出清洗产物
+                                // 仍命中的已知特征词，缩小漏网触发句排查面
+                                if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
+                                    state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
+                                }
                                 // 终局说明（审查修复：区分两种不可重试情形——清洗后
                                 // 仍命中=模板需更新；内容已流出=不可同号重试）
                                 if sanitize {
@@ -1379,7 +1401,9 @@ fn run_wb_stream(
                     // 换号无意义。清洗未启用时强制清洗后同号重试一次；已清洗仍命中
                     // → 走下方 retry_plan 原样 Fatal（需更新 wb_template_map.json）
                     if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
-                        if !sanitize {
+                        // issue #195：升级守卫改为按请求一次性旗标（口径同流内分支）
+                        if !aggressive_tried {
+                            aggressive_tried = true;
                             sanitize = true;
                             state.logger.log_sched_event(&format!(
                                 "11128 强制清洗重试{}", wb_payload::template_hit_note()
@@ -1421,6 +1445,11 @@ fn run_wb_stream(
                                 &sample,
                                 &note,
                             );
+                            // issue #195：池级短记忆标记 + 清洗后残留自检（口径同流内 Fatal）
+                            wb_payload::mark_channel_fp_block(state.pool_label(), true);
+                            if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
+                                state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
+                            }
                             // Fatal 透传前的排查指引（仅日志，客户端响应体不变）
                             state.logger.log_sched_event(
                                 "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
@@ -1607,6 +1636,9 @@ pub async fn wb_aggregate_chat(
         let mut cut_hits: usize = 0;
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
         let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
+        // issue #195：11128 激进升级按请求一次（口径同流式路径——wb_sanitize
+        // 默认开时旧守卫 `!sanitize` 恒假，首轮 11128 直接 Fatal）
+        let mut aggressive_tried = false;
 
         loop {
             let picked = match first_pick.take() {
@@ -1685,11 +1717,12 @@ pub async fn wb_aggregate_chat(
             let effort = super::wb_catalog::find(&catalog, &model)
                 .and_then(|m| m.resolve_effort(effort_hint.as_deref()));
             // 多候选改写种子 + 激进清洗开关（issue #122 方案 C1/C2，同流式路径口径：
-            // 种子随换号轮换递增，空完成后/池级拦截 TTL 内追加激进规则）
+            // 种子随换号轮换递增，空完成后/池级拦截 TTL 内/本请求已 11128 升级
+            //（aggressive_tried，issue #195——换号保持激进，防指纹回归）追加激进规则）
             let seed = wb_payload::variant_seed(&conv_id, tried.len() as u64);
             let mut converted = wb_payload::prepare_wb_chat_body(
                 &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), sanitize, &templates,
-                seed, empty_hits > 0 || wb_payload::fp_block_recent(state.pool_label()),
+                seed, empty_hits > 0 || aggressive_tried || wb_payload::fp_block_recent(state.pool_label()),
             );
             // 工具别名正向改写（issue #150）：受 sanitize 门控，与 Trae/Qoder 池同口径；
             // 逆映射随本轮账号产物，成功分支经 Ok((r, tool_alias)) 带出供响应侧回改
@@ -1811,7 +1844,9 @@ pub async fn wb_aggregate_chat(
                                 // 未清洗 → 强制清洗同号重试一次；已清洗仍命中 →
                                 // 落指纹样本后换号（不冷却：指纹拦截与账号无关）
                                 if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
-                                    if !sanitize {
+                                    // issue #195：升级守卫改为按请求一次性旗标（口径同流式路径）
+                                    if !aggressive_tried {
+                                        aggressive_tried = true;
                                         sanitize = true;
                                         state.logger.log_sched_event(&format!(
                                             "11128 强制清洗重试（流内）{}", wb_payload::template_hit_note()
@@ -1837,6 +1872,12 @@ pub async fn wb_aggregate_chat(
                                     wb_payload::record_fingerprint_sample(
                                         "11128", state.pool_label(), &sample, &note,
                                     );
+                                    // issue #195：池级短记忆标记 + 清洗后残留自检
+                                    //（口径同流式 Fatal）
+                                    wb_payload::mark_channel_fp_block(state.pool_label(), true);
+                                    if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
+                                        state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
+                                    }
                                     state.logger.log_sched_event(
                                         "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                     );
@@ -1894,7 +1935,9 @@ pub async fn wb_aggregate_chat(
                     Err((status, resp_body, retry_after)) => {
                         // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后同号重试一次
                         if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
-                            if !sanitize {
+                            // issue #195：升级守卫改为按请求一次性旗标（口径同流式路径）
+                            if !aggressive_tried {
+                                aggressive_tried = true;
                                 sanitize = true;
                                 state.logger.log_sched_event(&format!(
                                     "11128 强制清洗重试{}", wb_payload::template_hit_note()
@@ -1931,6 +1974,12 @@ pub async fn wb_aggregate_chat(
                                     &sample,
                                     &note,
                                 );
+                                // issue #195：池级短记忆标记 + 清洗后残留自检
+                                //（口径同流式 Fatal）
+                                wb_payload::mark_channel_fp_block(state.pool_label(), true);
+                                if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
+                                    state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
+                                }
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );
@@ -2282,7 +2331,10 @@ pub async fn wb_tool_exec_chat(
                             // 按新 sanitize 重建请求体）；已清洗仍命中 → 落指纹
                             // 样本后按原路径换号（不冷却：指纹拦截与账号无关）
                             if code == 11128 || super::retry::is_illegal_channel_error(&msg) {
-                                if !sanitize {
+                                // issue #195：升级守卫改为 force_aggressive 未置位——
+                                // wb_sanitize 默认开时旧守卫 `!sanitize` 恒假，首轮
+                                // 11128 即 break Err Fatal（口径同流式/聚合路径）
+                                if !force_aggressive {
                                     sanitize = true;
                                     state.logger.log_sched_event(&format!(
                                         "11128 强制清洗重试（流内）{}", wb_payload::template_hit_note()
@@ -2304,6 +2356,12 @@ pub async fn wb_tool_exec_chat(
                                     wb_payload::record_fingerprint_sample(
                                         "11128", state.pool_label(), &sample, &note,
                                     );
+                                    // issue #195：池级短记忆标记 + 清洗后残留自检
+                                    //（口径同流式/聚合 Fatal）
+                                    wb_payload::mark_channel_fp_block(state.pool_label(), true);
+                                    if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
+                                        state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
+                                    }
                                     state.logger.log_sched_event(
                                         "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                     );
@@ -2422,7 +2480,8 @@ pub async fn wb_tool_exec_chat(
                         // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后重试
                         // （round 回退，不消耗轮次；下一轮循环顶部按新 sanitize 重建请求体）
                         if status == 400 && super::retry::is_illegal_channel_error(&resp_body) {
-                            if !sanitize {
+                            // issue #195：升级守卫改为 force_aggressive 未置位（口径同流内分支）
+                            if !force_aggressive {
                                 sanitize = true;
                                 state.logger.log_sched_event(&format!(
                                     "11128 强制清洗重试{}", wb_payload::template_hit_note()
@@ -2453,6 +2512,12 @@ pub async fn wb_tool_exec_chat(
                                     &sample,
                                     &note,
                                 );
+                                // issue #195：池级短记忆标记 + 清洗后残留自检
+                                //（口径同流式/聚合 Fatal）
+                                wb_payload::mark_channel_fp_block(state.pool_label(), true);
+                                if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
+                                    state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
+                                }
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );

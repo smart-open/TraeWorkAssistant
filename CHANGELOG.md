@@ -6,6 +6,30 @@
 
 ---
 
+## [1.6.1] · 2026-11-07 · 语义移植 main d04de4f => 245a611
+
+> 语义移植 4 实质提交（未 merge）；跳过桌面/OS 专属（豆包全链路、device_proxy/switcher）。
+
+### 新功能
+
+- **Anthropic 出口 thinking 思考块**：reasoning 按原始时序投影为标准 thinking content block（流式 `thinking_delta` 置于文本块前，工具调用/错误/finish 正确收口；非流式段序聚合）。
+- **WB 池 11128 激进清洗升级断链修复（issue #195）**：`wb_sanitize` 默认开后旧守卫恒假致升级分支永不进入——三路径改按请求一次性旗标，11128 后先全力清洗重试再 Fatal；换号保持激进；终局标记池级指纹短记忆 + 残留自检日志。
+- **wb_payload 默认表补 DSH 实证规则**：无池前缀模型句变体改写规则 + ACP 桥接三件工具别名。
+
+### 修复与加固
+
+- **Anthropic usage 回填 input_tokens**：上游有则透传，仅有 prompt_tokens 时按未缓存基数口径（`prompt_tokens - cached_tokens`）；移植审查补齐非流式聚合出口同款口径，消除流式/非流式数字分叉。
+- **Qoder 签到已领误判（issue #193）**：CLAIMED 回放经 claim_one 幂等裁决（回放原样 / 新领取落账），积分回写加 success 守卫防重复拨高。
+- **kv_update 事务化**：`BEGIN IMMEDIATE` 跨进程原子读-改-写；Err/Ok(false)/panic 均回滚，panic 经 `catch_unwind` 防连接毒化；回滚清场失败显式暴露不静默。
+- **Anthropic 流式出口 done 后迟到增量事件静默忽略**：防上游乱序/双尾巴在 message_stop 后重开永不闭合的内容块。
+- **奖励型签到空池豁免**：trae/wb/qoder 空池 tick 返回 `skipped_empty_pool` 不 mark_run，次日入池仍正常触发。
+- **审查修复（#195 默认表提升顺序约束）**：DSH 品牌变体句（"…powered by the DeepSeek Harness"）经前缀规则改写会反向残留 "deepseek harness" 指纹且激进重试无法补救——默认表在模型句前缀规则之前镜像 DeepSeek Harness 兜底规则（对齐激进表既有顺序约束），品牌变体首轮即连根消除。
+- **杂项**：签到日历 note title tooltip；.gitignore 补 target-testrun/；CHANGELOG 剥离误引入的 UTF-8 BOM。
+
+### 验证
+
+- `cargo test`（core 951 / server 13）、`tsc --noEmit`、`vitest`（90）全部通过。
+
 ## [1.6.0] · 2026-11-06 · 语义移植 main 864d3e5 => d04de4fc（池策略与可观测 + 工具别名 + 签到链路加固 + 审查修复）
 
 > 语义移植 main `864d3e5`（不含）=> `d04de4fc`（25 提交，未 merge）。跳过桌面/OS 专属：豆包全链路（probe 保活 / 签到时刻 / 前端页）、switcher/authfile 原子写、main.rs 窗口几何自愈、device_proxy msToken 脱敏、MultiSelectDropdown、版本号 chore 与 main 自身文档/merge 节点。

@@ -2,6 +2,8 @@
 dist/
 node_modules/
 target/
+# 并行测试运行独立 target（cargo test --target-dir target-testrun）
+target-testrun/
 
 # Logs
 *.log

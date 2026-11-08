@@ -195,6 +195,33 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You help the user with programming work using the buddy/deepseek-v4.1-flash model."
                 .to_string(),
         ),
+        // issue #195（2026-11-07 网关 11128 样本实证）：DSH 模型句模型名变体
+        // 首轮兜底——3.8.8 时代模型句只布防 glm- 前缀与 buddy/deepseek-v4.1-flash
+        // 逐字句（当时抓包的模型配置形态），用户侧模型名不带池前缀时（如
+        // deepseek-v4.1-flash）默认表不命中，而唯一能兜住的前缀规则在激进表——
+        // 又因 wb_sanitize 默认开时 11128 升级断链永不生效 → 首轮即 Fatal。
+        // 激进表同名规则提升为默认规则（改写形态一致，幂等），所有模型名变体
+        // 首轮即净；原激进规则保留兜幂等（默认表改写后激进 from 不再出现）
+        // ⚠ 顺序约束（审查修复）：下方前缀规则必须位于本两条 DeepSeek Harness
+        // 兜底之后——激进表注释同款约束（"置于 'powered by DeepSeek Harness'
+        // 兜底之后"）：DSH 品牌变体（模型名槽位填品牌名，"…powered by the
+        // DeepSeek Harness"）若先走前缀规则会反向残留 "using the DeepSeek
+        // Harness"（RESIDUAL_MARKERS 成员 "deepseek harness"），且激进表重试时
+        // from 已被改掉无法补救。激进表应用顺序恒在默认表之后，故默认表必须
+        // 自带先行兜底；带 the 变体（与实证模型句 "…powered by the <model>"
+        // 同构）与激进表既有不带 the 形态（2026-10-06 身份句时代）各布一条
+        (
+            "powered by the DeepSeek Harness".to_string(),
+            "that helps the user with programming work".to_string(),
+        ),
+        (
+            "powered by DeepSeek Harness".to_string(),
+            "that helps the user with programming work".to_string(),
+        ),
+        (
+            "You are a coding agent powered by the ".to_string(),
+            "You help the user with programming work using the ".to_string(),
+        ),
         // CodeBuddy 1.106.1（2026-10-29 抓包实证，buddy 池 /v1/chat/completions
         // 单一形态 ×10）：模型句句式与 glm- 前缀规则（"You are a coding agent
         // powered by the glm-"）不同——"an AI coding assistant, powered by"
@@ -532,6 +559,14 @@ pub fn default_tool_alias_rules() -> Vec<(String, String)> {
         ("job_output".to_string(), "read_job_log".to_string()),
         ("pwsh".to_string(), "run_shell".to_string()),
         ("working_directory".to_string(), "work_dir".to_string()),
+        // issue #195（2026-11-07 网关 11128 样本实证）：DSH ACP 桥接三件——IDE
+        // 桥接形态工具集（total=40 hash=c200e57d 于三份 11128 样本恒定）中
+        // acp_ 前缀为 ACP（Agent Client Protocol）桥接独家命名，不在 rc.2/rc.3
+        // 抓包样本的 25/141 工具内，此前未布防；别名取语义保持 snake_case，
+        // 逐一核对不与既有 to 值/真实名碰撞
+        ("acp_cache".to_string(), "tool_cache".to_string()),
+        ("acp_read_original_image".to_string(), "read_source_image".to_string()),
+        ("acp_status".to_string(), "runtime_status".to_string()),
         // DSH 0.2.1-rc.3 实证补十一条（2026-11-05 会话 request/header 抓包 141 工具）：
         // rc.2 的 25 工具样本未涵盖插件化后的新增面——Cordis 内省二件、Agent Teams
         // 协作七件（list_agents/spawn_teammate/wait_agent/team_task_* 四件）、
@@ -2103,6 +2138,68 @@ mod tests {
         assert!(!out2.contains("harness"), "{out2}");
     }
 
+    /// issue #195：DSH 模型句模型名变体（用户侧模型名不带池前缀）首轮即清洗
+    /// （2026-11-07 网关 11128 样本实证：deepseek-v4.1-flash 未带 buddy/ 前缀，
+    /// 默认表 glm- 前缀与 buddy/deepseek 逐字规则均不命中 → 残留指纹 → 上游
+    /// 11128 → 旧升级断链下直接 Fatal）。默认表新增的模型句签名前缀规则兜住
+    #[test]
+    fn dsh_model_sentence_unprefixed_variant_rewritten() {
+        let tpl = default_template_map();
+        let out = apply_template_map(
+            "You are a coding agent powered by the deepseek-v4.1-flash model.",
+            &tpl,
+        );
+        assert!(!out.contains("coding agent powered by"), "{out}");
+        assert!(
+            out.contains("using the deepseek-v4.1-flash model."),
+            "{out}"
+        );
+        // 改写结果不再命中任何规则（幂等安全）
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+    }
+
+    /// 审查修复（issue #195 默认表提升的顺序约束回归）：DSH 品牌变体
+    /// （"…powered by the DeepSeek Harness"）在默认表首轮即须连根消除品牌词，
+    /// 不得经前缀规则改写后反向残留 "using the DeepSeek Harness"（RESIDUAL_
+    /// MARKERS 成员 "deepseek harness"）——激进表重试时 from 已被改掉无法补救。
+    /// 默认表 DeepSeek Harness 兜底必须先于前缀规则应用
+    #[test]
+    fn dsh_brand_variant_not_reversed_into_residual_by_prefix_rule() {
+        let tpl = default_template_map();
+        // 带 the 变体（与实证模型句 "…powered by the <model>" 同构）
+        let out = apply_template_map(
+            "You are a coding agent powered by the DeepSeek Harness. Help the user.",
+            &tpl,
+        );
+        assert!(
+            !out.to_lowercase().contains("deepseek harness"),
+            "品牌词须连根消除: {out}"
+        );
+        assert!(!out.contains("coding agent powered by"), "{out}");
+        // 不带 the 变体（激进表既有形态，2026-10-06 身份句时代）
+        let out_no_the = apply_template_map(
+            "You are a coding agent powered by DeepSeek Harness. Help the user.",
+            &tpl,
+        );
+        assert!(
+            !out_no_the.to_lowercase().contains("deepseek harness"),
+            "品牌词须连根消除: {out_no_the}"
+        );
+        // 幂等安全（改写结果不再命中任何规则）
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+        // 默认+激进合并表口径一致（prepare_wb_chat_body aggressive=true 同款组合）
+        let mut agg = tpl;
+        agg.extend(aggressive_template_rules());
+        let out2 = apply_template_map(
+            "You are a coding agent powered by the DeepSeek Harness. Help the user.",
+            &agg,
+        );
+        assert!(
+            !out2.to_lowercase().contains("deepseek harness"),
+            "合并表下品牌词同样零残留: {out2}"
+        );
+    }
+
     /// DSH 0.2.1-rc.2 模型句整句同义改写（2026-10-29 headless 抓包实证：模型
     /// 句池前缀升级为 buddy/deepseek-v4.1-flash，glm- 前缀规则不命中）——逐字
     /// 改写保留模型名衔接（RESIDUAL_MARKERS 的 "deepseek harness" 为整词组，
@@ -3180,6 +3277,11 @@ mod tests {
         ] {
             assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
         }
+        // DSH 独家（ACP 桥接三件，issue #195 补录 2026-11-07 实证：IDE 桥接
+        // 形态 40 工具集，acp_ 前缀独家命名此前未布防）
+        for from in ["acp_cache", "acp_read_original_image", "acp_status"] {
+            assert!(rules.iter().any(|(f, _)| f == from), "{from} 应在默认表");
+        }
         // CodeBuddy 独家（1.106.1 抓包实证；4 个同名工具经 Cline/Roo 与
         // Claude Code 段规则覆盖，此为剩余独家名）
         for from in [
@@ -3206,6 +3308,34 @@ mod tests {
             assert_eq!(aliases.iter().filter(|x| *x == a).count(), 1, "别名 {a} 重复");
             assert!(!froms.contains(a), "别名 {a} 与规则 from 重名");
         }
+    }
+
+    /// issue #195：DSH ACP 桥接三件别名正向改写（tools 透传点名 + 逆映射可回改）
+    #[test]
+    fn dsh_acp_bridge_tools_aliased() {
+        let body = json!({
+            "tools": [
+                {"type": "function", "function": {"name": "acp_cache", "parameters": {}}},
+                {"type": "function", "function": {"name": "acp_read_original_image", "parameters": {}}},
+                {"type": "function", "function": {"name": "acp_status", "parameters": {}}}
+            ]
+        });
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse =
+            apply_tool_alias_forward(&mut buf, &default_tool_alias_rules()).expect("应发生改写");
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("tool_cache"));
+        assert_eq!(v["tools"][1]["function"]["name"], json!("read_source_image"));
+        assert_eq!(v["tools"][2]["function"]["name"], json!("runtime_status"));
+        assert_eq!(reverse.get("tool_cache").map(String::as_str), Some("acp_cache"));
+        assert_eq!(
+            reverse.get("read_source_image").map(String::as_str),
+            Some("acp_read_original_image")
+        );
+        assert_eq!(
+            reverse.get("runtime_status").map(String::as_str),
+            Some("acp_status")
+        );
     }
 
     /// 工具别名合并语义：默认表全量生效；自定义同名覆盖；to=None 停用（从

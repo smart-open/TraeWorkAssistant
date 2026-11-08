@@ -978,7 +978,9 @@ pub fn stream_convert_anthropic_lines(
 }
 
 /// 事件序列：message_start → content_block_start/delta/stop… → message_delta → message_stop
-/// 注：reasoning_content 暂不输出（Anthropic thinking 块需签名，严格客户端会拒绝未签名的 thinking_delta）
+/// 注：上游 reasoning_content 以未签名 thinking 块投影（thinking_delta 不带 signature）——
+/// 签名缺失不构成本网关内的回传污染：请求侧 anthropic_to_openai 本就会丢弃历史中的 thinking 块；
+/// Vercel AI SDK 系客户端解析 thinking_delta 不校验签名
 // 宏内末次赋值（message_started/text_block_open）在收尾路径后不再读取，属预期行为
 #[allow(unused_assignments)]
 fn stream_convert_anthropic_src(
@@ -991,6 +993,7 @@ fn stream_convert_anthropic_src(
     let mut st = SseState::new();
     let mut message_started = false;
     let mut text_block_open = false;
+    let mut thinking_block_open = false;
     let mut block_index: i64 = -1;
     let mut tools: Vec<ToolBuf> = Vec::new();
     let mut usage: Option<Value> = None;
@@ -1070,12 +1073,40 @@ fn stream_convert_anthropic_src(
         };
     }
 
+    macro_rules! open_thinking_block {
+        () => {{
+            block_index += 1;
+            thinking_block_open = true;
+            send_event!(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": { "type": "thinking", "thinking": "" },
+                })
+            );
+        }};
+    }
+
+    macro_rules! close_thinking_block {
+        () => {
+            if thinking_block_open {
+                thinking_block_open = false;
+                send_event!(
+                    "content_block_stop",
+                    json!({ "type": "content_block_stop", "index": block_index })
+                );
+            }
+        };
+    }
+
     macro_rules! finish_stream {
         () => {{
             // 审查 P2：纯 tool_calls 流（message_started=false，工具仅缓冲未输出）
             // EOF 收尾时先补 message_start——content_block 必须有 message 前缀，
             // 严格客户端（如 Claude Code）才会接受该序列；幂等（done 分支已先行调用）
             start_message!();
+            close_thinking_block!();
             close_text_block!();
             // 工具块：text 之后统一追加（content_block_start + input_json_delta + stop）
             for (i, t) in tools.iter().enumerate() {
@@ -1109,11 +1140,23 @@ fn stream_convert_anthropic_src(
                 );
             }
             let mut out_tokens = None;
+            // input_tokens 回填（message_start 时上游 usage 未到达只能置 0）：
+            // 收尾时按 Anthropic 口径还原补入 message_delta.usage。语义差异：
+            // Anthropic input_tokens = 未缓存基数（完整输入 = input_tokens +
+            // cache_read + cache_creation）；OpenAI prompt_tokens = 含缓存命中
+            // 总量（cached_tokens 是其子集）。故上游原生 input_tokens 优先直取；
+            // 否则取 prompt_tokens 减 cached_tokens 还原未缓存基数，避免把
+            // "含缓存总量"错填进"未缓存基数"造成缓存场景系统性高估
+            let mut in_tokens = None;
             let mut cached_tokens = 0u64;
             let mut cache_write_tokens = 0u64;
             if let Some(u) = &usage {
                 out_tokens = usage_i64(u, &["output_tokens", "completion_tokens"]);
                 cached_tokens = cached_tokens_of(u);
+                in_tokens = usage_i64(u, &["input_tokens"]).or_else(|| {
+                    usage_i64(u, &["prompt_tokens"])
+                        .map(|p| p.saturating_sub(cached_tokens.min(i64::MAX as u64) as i64))
+                });
                 cache_write_tokens = cache_write_tokens_of(u);
             }
             // issue #148：工具回合不得把误标的 stop/空串回落为 end_turn（严格
@@ -1137,6 +1180,9 @@ fn stream_convert_anthropic_src(
             });
             if let Some(o) = out_tokens {
                 message_delta["usage"]["output_tokens"] = json!(o);
+            }
+            if let Some(i) = in_tokens {
+                message_delta["usage"]["input_tokens"] = json!(i);
             }
             if cached_tokens > 0 {
                 message_delta["usage"]["cache_read_input_tokens"] = json!(cached_tokens);
@@ -1168,9 +1214,34 @@ fn stream_convert_anthropic_src(
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
+                    // 完成后迟到的增量事件静默忽略（交叉审查修复）：上游乱序/
+                    // 双尾巴时 done 后再到的 output 会重开内容块且永不闭合
+                    //（事件追加在 message_stop 之后属协议违规）；同 done 分支
+                    // 的 saw_done 守卫口径——首帧完成后不再接受任何增量
+                    if saw_done {
+                        continue;
+                    }
+                    // thinking 投影：reasoning_content → thinking_delta（文本块
+                    // 之前输出，语义对齐 Anthropic thinking→text 块顺序）
+                    if !ev.reasoning.is_empty() {
+                        start_message!();
+                        if !thinking_block_open {
+                            close_text_block!();
+                            open_thinking_block!();
+                        }
+                        send_event!(
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": { "type": "thinking_delta", "thinking": ev.reasoning },
+                            })
+                        );
+                    }
                     if !ev.response.is_empty() {
                         start_message!();
                         if !text_block_open {
+                            close_thinking_block!();
                             open_text_block!();
                         }
                         send_event!(
@@ -1182,7 +1253,6 @@ fn stream_convert_anthropic_src(
                             })
                         );
                     }
-                    // reasoning_content：跳过（见函数注释）
                     if let Some(tc) = &ev.tool_calls {
                         if let Some(arr) = tc.as_array() {
                             for (pos, call) in arr.iter().enumerate() {
@@ -1241,7 +1311,8 @@ fn stream_convert_anthropic_src(
                                         slot: idx,
                                     });
                                 }
-                                // 工具调用出现时先收口文本块
+                                // 工具调用出现时先收口文本块与 thinking 块
+                                close_thinking_block!();
                                 close_text_block!();
                             }
                         }
@@ -1280,6 +1351,7 @@ fn stream_convert_anthropic_src(
                         // P2 修复8：先收口打开的 content_block，再发 event:error——
                         // 此前直接 error 且置 saw_done 跳过 finish_stream，未闭合的
                         // content_block 会让严格客户端挂起/报错；不补发 message_stop
+                        close_thinking_block!();
                         close_text_block!();
                         // 空 message 兜底（issue #71）：inline 与延迟透传同防线
                         let msg = stream_msg_or_fallback(&ev.error_message, ev.error_code.unwrap_or(0));
@@ -1364,7 +1436,10 @@ pub fn aggregate_anthropic<R: Read + Send>(
     let br = BufReader::new(reader);
     let mut st = SseState::new();
     let mut saw_done = false;
-    let mut content = String::new();
+    // 段序聚合：按上游事件原始时序累积 (是否思考段, 文本)，仅合并相邻同类段。
+    // 交错思考（thinking→text→thinking→…）场景下块序必须与生成顺序一致，
+    // 事后归并（先拼完所有 reasoning 再拼 text）会破坏原始块序
+    let mut segments: Vec<(bool, String)> = Vec::new();
     let mut finish_reason = "stop".to_string();
     let mut usage: Option<Value> = None;
     let mut tools: Vec<ToolBuf> = Vec::new();
@@ -1389,7 +1464,20 @@ pub fn aggregate_anthropic<R: Read + Send>(
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
-                    content.push_str(&ev.response);
+                    // thinking 聚合：reasoning_content 以未签名 thinking 块输出
+                    //（安全性同流式侧函数注释）；按事件时序追加段，相邻同类合并
+                    if !ev.reasoning.is_empty() {
+                        match segments.last_mut() {
+                            Some((true, buf)) => buf.push_str(&ev.reasoning),
+                            _ => segments.push((true, ev.reasoning.clone())),
+                        }
+                    }
+                    if !ev.response.is_empty() {
+                        match segments.last_mut() {
+                            Some((false, buf)) => buf.push_str(&ev.response),
+                            _ => segments.push((false, ev.response.clone())),
+                        }
+                    }
                     if let Some(tc) = &ev.tool_calls {
                         if let Some(arr) = tc.as_array() {
                             for (pos, call) in arr.iter().enumerate() {
@@ -1477,8 +1565,13 @@ pub fn aggregate_anthropic<R: Read + Send>(
     }
 
     let mut blocks: Vec<Value> = Vec::new();
-    if !content.is_empty() {
-        blocks.push(json!({ "type": "text", "text": content }));
+    // 按上游原始时序投影 thinking/text 段（tool_use 块沿用既有缓冲设计缀后）
+    for (is_thinking, text) in segments {
+        if is_thinking {
+            blocks.push(json!({ "type": "thinking", "thinking": text }));
+        } else {
+            blocks.push(json!({ "type": "text", "text": text }));
+        }
     }
     for (i, t) in tools.iter().enumerate() {
         let input: Value = serde_json::from_str(t.args.trim()).unwrap_or(json!({}));
@@ -1492,14 +1585,22 @@ pub fn aggregate_anthropic<R: Read + Send>(
 
     let mut usage_obj = json!({ "input_tokens": 0, "output_tokens": 0 });
     if let Some(u) = &usage {
-        if let Some(v) = usage_i64(u, &["input_tokens", "prompt_tokens"]) {
+        // 口径对齐流式侧 message_delta 回填（交叉审查修复）：input_tokens
+        // 优先直取；仅 prompt_tokens 时减 cached_tokens 还原未缓存基数
+        //（OpenAI 含缓存总量 → Anthropic 未缓存基数），避免非流式出口在
+        // 缓存命中场景与流式出口数字分叉（系统性高估 input_tokens）
+        let cached = cached_tokens_of(u);
+        let in_tokens = usage_i64(u, &["input_tokens"]).or_else(|| {
+            usage_i64(u, &["prompt_tokens"])
+                .map(|p| p.saturating_sub(cached.min(i64::MAX as u64) as i64))
+        });
+        if let Some(v) = in_tokens {
             usage_obj["input_tokens"] = json!(v);
         }
         if let Some(v) = usage_i64(u, &["output_tokens", "completion_tokens"]) {
             usage_obj["output_tokens"] = json!(v);
         }
         // 缓存读：宽口径提取（对齐 wb_sse::cached_tokens_of，正值过滤）
-        let cached = cached_tokens_of(u);
         if cached > 0 {
             usage_obj["cache_read_input_tokens"] = json!(cached);
         }
@@ -1617,6 +1718,235 @@ mod tests {
         assert_eq!(error_info, Some((4001, "model config is empty".to_string())));
         assert!(!sent_any, "流未开始：错误延迟给调用方决策（可重试）");
         assert!(collect_events(rx).is_empty());
+    }
+
+    // ==================== thinking 块投影（reasoning_content → thinking_delta）====================
+
+    #[test]
+    fn anthropic_stream_reasoning_projects_to_thinking_block_before_text() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"reasoning_content\":\"先想一步\",\"response\":\"答案\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None);
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        // thinking 块：index 0，先于文本块
+        assert!(joined.contains("\"content_block\":{\"thinking\":\"\",\"type\":\"thinking\"}"));
+        assert!(joined.contains("\"delta\":{\"thinking\":\"先想一步\",\"type\":\"thinking_delta\"}"));
+        assert!(joined.contains("\"delta\":{\"text\":\"答案\",\"type\":\"text_delta\"}"));
+        let think_start = joined.find("\"type\":\"thinking\"").expect("应有 thinking 块");
+        let text_delta = joined.find("\"type\":\"text_delta\"").expect("应有 text_delta");
+        assert!(think_start < text_delta, "thinking 块必须先于文本块");
+        // 收尾后无未闭合块：thinking_stop 出现在 text_delta 之前
+        let think_stop = joined.find("event: content_block_stop").expect("应收口 thinking 块");
+        assert!(think_stop < text_delta, "thinking 块必须在文本块开启前收口");
+    }
+
+    #[test]
+    fn anthropic_stream_tool_call_closes_thinking_block() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"reasoning_content\":\"想想\"}\n\n\
+                     event: output\ndata: {\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{}\"}}]}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"tool_calls\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None);
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        let think_stop = joined.find("event: content_block_stop").expect("thinking 块应收口");
+        let tool_start = joined
+            .find("\"content_block\":{\"id\":\"call_1\"")
+            .or_else(|| joined.find("\"type\": \"tool_use\""))
+            .or_else(|| joined.find("tool_use"))
+            .expect("应有 tool_use 块");
+        assert!(think_stop < tool_start, "thinking 块必须在 tool_use 块前收口");
+    }
+
+    #[test]
+    fn anthropic_aggregate_reasoning_projects_to_thinking_block() {
+        let input = "event: output\ndata: {\"reasoning_content\":\"先想\",\"response\":\"后答\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "msg_1", "m", None);
+        assert!(err.is_none());
+        let resp = resp.expect("应有聚合响应");
+        let blocks = resp["content"].as_array().expect("content 应为数组");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "先想");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "后答");
+    }
+
+    #[test]
+    fn anthropic_stream_interleaved_reasoning_preserves_block_order() {
+        // 交错思考：reasoning/text 交替到达时，块序按上游事件时序展开，
+        // 不得把多个 thinking 段归并到一个块或统一提前
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"reasoning_content\":\"想1\",\"response\":\"答1\"}\n\n\
+                     event: output\ndata: {\"reasoning_content\":\"想2\"}\n\n\
+                     event: output\ndata: {\"response\":\"答2\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None);
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        let pos = |s: &str| joined.find(s).unwrap_or_else(|| panic!("应含 {s}"));
+        assert!(pos("\"type\":\"thinking\"") < pos("答1"));
+        assert!(pos("答1") < pos("想2"), "第二个 thinking 段必须晚于第一段 text");
+        assert!(pos("想2") < pos("答2"), "第二个 text 段必须晚于第二个 thinking 段");
+        assert_eq!(joined.matches("event: content_block_start").count(), 4, "应展开为 4 个独立内容块");
+    }
+
+    #[test]
+    fn anthropic_aggregate_interleaved_reasoning_preserves_block_order() {
+        let input = "event: output\ndata: {\"reasoning_content\":\"想1\",\"response\":\"答1\"}\n\n\
+                     event: output\ndata: {\"reasoning_content\":\"想2\"}\n\n\
+                     event: output\ndata: {\"response\":\"答2\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "msg_1", "m", None);
+        assert!(err.is_none());
+        let resp = resp.expect("应有聚合响应");
+        let blocks = resp["content"].as_array().expect("content 应为数组");
+        assert_eq!(blocks.len(), 4, "交错段不得归并");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "想1");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "答1");
+        assert_eq!(blocks[2]["type"], "thinking");
+        assert_eq!(blocks[2]["thinking"], "想2");
+        assert_eq!(blocks[3]["type"], "text");
+        assert_eq!(blocks[3]["text"], "答2");
+    }
+
+    // ==================== usage input_tokens 口径还原 ====================
+
+    /// 从事件流中取 message_delta 的 usage 对象
+    fn message_delta_usage(events: &[String]) -> Value {
+        for e in events {
+            for line in e.lines() {
+                if let Some(rest) = line.strip_prefix("data: ") {
+                    if let Ok(v) = serde_json::from_str::<Value>(rest) {
+                        if v.get("type").and_then(|t| t.as_str()) == Some("message_delta") {
+                            return v["usage"].clone();
+                        }
+                    }
+                }
+            }
+        }
+        panic!("应含 message_delta 事件");
+    }
+
+    #[test]
+    fn anthropic_stream_usage_input_tokens_subtracts_cached_from_prompt() {
+        // OpenAI 口径：prompt_tokens 含缓存命中总量，须减 cached_tokens
+        // 还原 Anthropic "未缓存基数"语义
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\n\
+                     event: token_usage\ndata: {\"prompt_tokens\":1000,\"completion_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":800}}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, _, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None);
+        let usage = message_delta_usage(&collect_events(rx));
+        assert_eq!(usage["input_tokens"], 1000 - 800, "须按未缓存基数还原");
+        assert_eq!(usage["output_tokens"], 10);
+        assert_eq!(usage["cache_read_input_tokens"], 800);
+    }
+
+    #[test]
+    fn anthropic_stream_usage_prefers_native_input_tokens_without_subtraction() {
+        // 上游原生 input_tokens（已排除缓存）优先直取，不得再做减法
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\n\
+                     event: token_usage\ndata: {\"input_tokens\":50,\"output_tokens\":5,\"cache_read_input_tokens\":800}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (error_info, _, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None);
+        let usage = message_delta_usage(&collect_events(rx));
+        assert_eq!(usage["input_tokens"], 50, "原生 input_tokens 直取，不做减法");
+        assert_eq!(usage["cache_read_input_tokens"], 800);
+    }
+
+    #[test]
+    fn anthropic_aggregate_usage_input_tokens_subtracts_cached_from_prompt() {
+        // 非流式聚合出口口径对齐流式侧（交叉审查修复）：prompt_tokens 须减
+        // cached_tokens 还原未缓存基数，不得与流式出口数字分叉
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\n\
+                     event: token_usage\ndata: {\"prompt_tokens\":1000,\"completion_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":800}}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "msg_1", "m", None);
+        assert!(err.is_none());
+        let usage = resp.expect("应有聚合响应")["usage"].clone();
+        assert_eq!(usage["input_tokens"], 1000 - 800, "非流式同样须按未缓存基数还原");
+        assert_eq!(usage["output_tokens"], 10);
+        assert_eq!(usage["cache_read_input_tokens"], 800);
+    }
+
+    #[test]
+    fn anthropic_aggregate_usage_prefers_native_input_tokens() {
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\n\
+                     event: token_usage\ndata: {\"input_tokens\":50,\"output_tokens\":5,\"cache_read_input_tokens\":800}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (resp, err) = aggregate_anthropic(std::io::Cursor::new(input), "msg_1", "m", None);
+        assert!(err.is_none());
+        let usage = resp.expect("应有聚合响应")["usage"].clone();
+        assert_eq!(usage["input_tokens"], 50, "原生 input_tokens 直取，不做减法");
+        assert_eq!(usage["cache_read_input_tokens"], 800);
+    }
+
+    #[test]
+    fn anthropic_stream_late_output_after_done_is_ignored() {
+        // done 后迟到的 output 事件须静默忽略（交叉审查修复）：重开内容块
+        // 会把事件追加在 message_stop 之后（协议违规）且永不闭合
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let input = "event: output\ndata: {\"response\":\"答1\"}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n\
+                     event: output\ndata: {\"reasoning_content\":\"迟到思考\"}\n\n\
+                     event: output\ndata: {\"response\":\"迟到文本\"}\n\n";
+        let (error_info, sent_any, _) = stream_convert_anthropic_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "msg_t",
+            "m",
+            None,
+        );
+        assert_eq!(error_info, None);
+        assert!(sent_any);
+        let joined = collect_events(rx).join("\n");
+        let stop_pos = joined.find("event: message_stop").expect("应有 message_stop");
+        let tail = &joined[stop_pos..];
+        assert!(!tail.contains("content_block_start"), "done 后不得再开内容块");
+        assert!(!tail.contains("迟到思考"));
+        assert!(!tail.contains("迟到文本"));
     }
 
     // ==================== 行源等价性：IO 逐行读 vs 内存切分 ====================
@@ -2250,7 +2580,9 @@ mod tests {
         assert!(err.is_none());
         let resp = resp.expect("message");
         let usage = &resp["usage"];
-        assert_eq!(usage["input_tokens"], serde_json::json!(100));
+        // 口径对齐流式侧（交叉审查修复）：prompt_tokens=100 含 cached=80，
+        // 未缓存基数 = 100 - 80 = 20（input_tokens 与 cache_read 之和才是完整输入）
+        assert_eq!(usage["input_tokens"], serde_json::json!(20));
         assert_eq!(usage["output_tokens"], serde_json::json!(20));
         // 0 值别名（cache_read_input_tokens=0）不遮蔽有效别名（cache_read_token=80）
         assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(80));

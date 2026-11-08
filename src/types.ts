@@ -667,7 +667,7 @@ export interface ApiPoolFile {
   qoder_pool_sticky_ttl_secs?: number;
   /** Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800；仅会话粘性开启时生效） */
   qoder_sticky_ttl_secs?: number;
-  /** Qoder 池内调度策略；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  /** Qoder 池内调度策略；空 = 跟随 Trae 池（wb_strategy 已改公平轮转专属默认，不在此列） */
   qoder_strategy?: string;
   /** Qoder 池入池白名单（qd- 账号 id）；空 = fail-open 全部含凭证账号入池 */
   qoder_enabled_uids?: string[];

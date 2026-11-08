@@ -299,7 +299,8 @@ pub fn pool_set(
     }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     drop(_pool_cfg); // 写回完成即释放；下方热应用段读内存值，不持配置锁
-    // 热应用：网关运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
+    // 热应用：网关运行中即改内存池策略（Buddy 池空 = 加权公平轮转 fair_rotation
+    //（WB 专属默认，PR #187）；Qoder/buddy-ai 空 = 跟随 Trae 池，与启动逻辑一致）
     if let Some(shared) = crate::api_server::runtime::gateway_shared() {
         shared
             .pool
@@ -307,11 +308,13 @@ pub fn pool_set(
         shared.wb_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy),
         );
-        // Qoder 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致）
+        // Qoder 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致；wb_strategy
+        // 已改公平轮转专属默认，不在此列）
         shared.qoder_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_qoder(&pool_file.strategy, &pool_file.qoder_strategy),
         );
-        // buddy-ai 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致）
+        // buddy-ai 池策略热应用（空 = 跟随 Trae 池，与 Qoder 池同语义——
+        // wb_strategy 已改公平轮转专属默认，不在此列）
         shared.buddy_ai_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
                 &pool_file.strategy,
@@ -674,7 +677,8 @@ pub fn spawn_pool_reconciler(state: AppState) {
                 // 策略同步（审查修复）：apply_pool_snapshot 只重建账号条目；
                 // 绕过 pool_set 直写 kv 改策略的场景运行侧指纹含旧策略永不
                 // 收敛 → 每 3 tick 空转重载。四池口径与 pool_set 热应用段/
-                // 启动装配一致
+                // 启动装配一致（Qoder/buddy-ai 空 = 跟随 Trae 池；WB 空 =
+                // fair_rotation 专属默认，resolve_wb 各自解析）
                 let pool_file_now = crate::api_server::runtime::load_pool_file(&state.data_dir);
                 shared.pool.set_strategy(crate::api_server::pool::PoolStrategy::parse(
                     &pool_file_now.strategy,
