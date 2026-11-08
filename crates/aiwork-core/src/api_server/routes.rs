@@ -3716,48 +3716,81 @@ pub(crate) fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> 
 
 /// 流式错误统一下发：sse 层在流未开始时不透传错误（留待重试决策），
 /// 由此处按客户端协议格式化错误事件并收尾
+/// 统一流式错误帧下发核心（审查 #2 收敛：wb_route::send_stream_error_wb 与
+/// qoder_route::send_stream_error(_named) 均委托此实现，三池形态一致）
+pub(crate) fn send_stream_error_full(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    proto: Protocol,
+    model: &str,
+    // 数字 HTTP 状态码（400/上游 status）或字符串业务码（no_healthy_account，
+    // 耗尽出口客户端兼容口径）——OpenAI 臂按原值透传不变形
+    code: serde_json::Value,
+    msg: &str,
+) {
+    // 空 message 兜底（issue #71）：字符串业务码无数字语义，仅用于空 message
+    // 的等级兜底（耗尽出口文案由 exhaust_message 构造、恒非空，不触达此兜底）
+    let msg = stream_msg_or_fallback(msg, code.as_i64().unwrap_or(0));
+    match proto {
+        Protocol::Anthropic => {
+            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: error\ndata: {}\n\n",
+                err
+            ))));
+            // Anthropic 流尾合成收口（docker 审查 #2 同族）：仅 error 事件对
+            // Anthropic 客户端而言流未终止，等待收口的实现会挂死到客户端超时。
+            // 只补 message_stop 不发 message_delta——delta.stop_reason 无「错误」
+            // 官方枚举值（end_turn/max_tokens/stop_sequence/tool_use/refusal/
+            // pause_turn），合成值会被严格 SDK 拒验；event:error 已让 SDK 进入
+            // 错误分支，message_stop 仅负责终止流
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(concat!(
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ))));
+        }
+        Protocol::Responses => {
+            // 取号失败/无健康账号等错误 → response.failed（Responses 无 [DONE] 帧）。
+            // 复用 responses_object 骨架保证字段集完整——openai 官方 SDK Response
+            // 模型对 created_at/model/parallel_tool_calls/tool_choice/tools 等有
+            // 必读要求（缺字段整帧反序列化失败被吞为连接错误，根因与 #73 同族）。
+            // model 缺省 ""：通用入口无模型上下文（字段在位即可通过 SDK 校验），
+            // 有模型上下文的调用方（wb 路径）经 send_stream_error_wb 传入真值
+            let ts = now_ts();
+            let mut resp = super::wb_sse::responses_object(
+                &format!("resp_{}", ts),
+                model,
+                "failed",
+                vec![],
+                None,
+            );
+            resp["error"] = json!({
+                "code": code.as_str().map(str::to_string).unwrap_or_else(|| code.to_string()),
+                "message": msg
+            });
+            let body = json!({"type": "response.failed", "response": resp});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: response.failed\ndata: {}\n\n",
+                body
+            ))));
+        }
+        _ => {
+            // usage 门注释（审查 #2 同族）：本错误帧刻意不带 usage——错误帧的
+            // usage 不是记账信号；计费链路只在流成功收口时聚合入账
+            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        }
+    }
+}
+
+/// 流式错误帧下发（数字 code 便捷入口； Responses/Anthropic 收口加固统一在
+/// send_stream_error_full——custom_route/Trae/qoder 入口共用）
 pub(crate) fn send_stream_error(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
     code: i64,
     msg: &str,
 ) {
-    let msg = stream_msg_or_fallback(msg, code);
-    match proto {
-        Protocol::OpenAi | Protocol::OpenAiText => {
-            let body = json!({
-                "error": { "message": msg, "type": "api_error", "code": code }
-            });
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-        }
-        Protocol::Anthropic => {
-            let err = json!({
-                "type": "error",
-                "error": { "type": "api_error", "message": msg },
-            });
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: error\ndata: {}\n\n",
-                err
-            ))));
-        }
-        Protocol::Responses => {
-            let body = json!({
-                "type": "response.failed",
-                "response": {
-                    "id": format!("resp_{}", now_ts()),
-                    "object": "response",
-                    "status": "failed",
-                    "output": [],
-                    "error": {"code": code.to_string(), "message": msg},
-                },
-            });
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: response.failed\ndata: {}\n\n",
-                body
-            ))));
-        }
-    }
+    send_stream_error_full(tx, proto, "", json!(code), msg);
 }
 
 fn now_ts() -> u64 {
@@ -4162,6 +4195,51 @@ mod tests {
         let bytes = axum::body::to_bytes(denied.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["code"], "model_not_found");
+    }
+
+    /// 统一错误帧出口（审查 #2 收敛后锁定行为）：Responses 臂复用 responses_object
+    /// 骨架带全官方 SDK 必读字段；Anthropic 臂 event:error 后仅以 message_stop 合成
+    /// 收口（不带 message_delta——stop_reason 无「错误」官方枚举，严格 SDK 拒验）
+    #[test]
+    fn send_stream_error_full_responses_skeleton_and_anthropic_stop_only() {
+        // Responses 臂：骨架字段集完整 + error 透传
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error(&tx, Protocol::Responses, 503, "上游不可用");
+        drop(tx);
+        let text =
+            String::from_utf8_lossy(&rx.try_recv().expect("Responses 臂应有一帧").unwrap()).to_string();
+        assert!(text.starts_with("event: response.failed\ndata: "), "{text}");
+        let data = text
+            .strip_prefix("event: response.failed\ndata: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .expect("帧体应为 SSE data 行");
+        let body: serde_json::Value = serde_json::from_str(data).expect("应为合法 JSON");
+        let resp = &body["response"];
+        assert_eq!(resp["object"], "response");
+        assert_eq!(resp["status"], "failed");
+        assert!(resp["created_at"].is_number(), "created_at 为 SDK 必读字段");
+        assert!(resp["model"].is_string(), "model 为 SDK 必读字段（缺省空串）");
+        assert_eq!(resp["error"]["code"], "503");
+        assert!(rx.try_recv().is_err(), "Responses 臂应恰好一帧");
+
+        // Anthropic 臂：error + message_stop-only 合成收口
+        let (tx2, mut rx2) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        send_stream_error(&tx2, Protocol::Anthropic, 503, "上游不可用");
+        drop(tx2);
+        let f1 = String::from_utf8_lossy(&rx2.try_recv().expect("Anthropic 臂应有 error 帧").unwrap())
+            .to_string();
+        assert!(f1.starts_with("event: error\ndata: "), "{f1}");
+        let f2 = String::from_utf8_lossy(
+            &rx2.try_recv().expect("Anthropic 臂应有合成收口帧").unwrap(),
+        )
+        .to_string();
+        assert!(
+            f2.contains("event: message_stop") && !f2.contains("message_delta"),
+            "收口应仅含 message_stop（严格 SDK 兼容）：{f2}"
+        );
+        assert!(rx2.try_recv().is_err(), "Anthropic 臂应恰好两包");
     }
 
     /// 审查 C1 + issue #90 修复③a：池前缀模型按裸名准入（与 /v1/models 别名

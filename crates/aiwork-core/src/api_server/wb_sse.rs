@@ -558,6 +558,11 @@ pub fn stream_forward_ex(
                         crate::api_server::routes::Protocol::Anthropic => {
                             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
                             send!(format!("event: error\ndata: {}\n\n", err));
+                            // 流尾合成收口（与 routes::send_stream_error_full 同口径）：
+                            // 仅 error 事件流未终止，等待收口的客户端会挂死；只补
+                            // message_stop 不发 message_delta（stop_reason 无「错误」
+                            // 官方枚举，严格 SDK 拒验）
+                            send!("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
                         }
                         crate::api_server::routes::Protocol::Responses => {
                             // 流内错误 → response.failed（Responses 无 [DONE] 帧）
@@ -807,11 +812,14 @@ pub fn stream_forward_ex(
                             // 原实现空 delta chunk 也触发 created：空完成换号重试失效
                             // （调用方据 sent_any 误判「已发送数据」不再重试），且真
                             // 换号会向已含 created 的流拼接第二份响应（与下方 P2-9
-                            // 注释矛盾）。对齐 OpenAi 分支整帧跳过口径：仅载荷帧
-                            // （正文/思考/工具调用/finish/usage 任一非空）触发
-                            let frame_has_payload = frame_has_usage
-                                || !finish.is_empty()
-                                || delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                            // 注释矛盾）。审查修复（批次 2）：门控收窄到真实载荷帧
+                            // （正文/思考/工具调用任一非空，与 has_content 判据一致）
+                            // ——finish/usage-only 帧不再触发 created，否则「有 usage
+                            // 无内容」流会先发 created 再按空完成换号，客户端收到
+                            // 重复 created；收窄后不变式成立：created 已发 ⟺ 有内容
+                            // ⟺ 不会走空完成换号
+                            let frame_has_payload =
+                                delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
                                 || delta.get("reasoning_content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
                                 || delta.get("tool_calls").and_then(|t| t.as_array()).map_or(false, |a| !a.is_empty());
                             if frame_has_payload {
@@ -1476,6 +1484,43 @@ mod tests {
         assert!(body.contains("event: response.created"));
         assert!(body.contains("event: response.failed"));
         assert!(body.contains("中途失败"));
+    }
+
+    /// 审查修复（批次 2）：usage/finish-only 帧不得触发 created——「有 usage 无
+    /// 内容」流此前会先发 created（frame_has_payload 含 usage）再按空完成哨兵
+    /// 换号，客户端收到重复 created。门控收窄到真实载荷帧（与 has_content 判据
+    /// 一致）后不变式成立：created 已发 ⟺ 有内容 ⟺ 不会走空完成换号
+    #[test]
+    fn stream_forward_responses_usage_only_frame_does_not_emit_created() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
+        let lines = lines(&[
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}",
+            "",
+            "data: [DONE]",
+            "",
+        ]);
+        let (err, sent_any, failed_inline, usage) =
+            stream_forward_ex(lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_u", "m", &HashSet::new(), None);
+        assert_eq!(
+            err,
+            Some((
+                crate::api_server::EMPTY_COMPLETION_CODE,
+                crate::api_server::EMPTY_COMPLETION_MSG.to_string()
+            )),
+            "零内容流仍按空完成哨兵换号重试"
+        );
+        assert!(!sent_any, "usage-only 帧不得置 sent_any（否则换号重试失效）");
+        assert!(!failed_inline);
+        assert!(usage.is_some(), "usage 仍应上抛供记账");
+        drop(tx);
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(
+            !body.contains("event: response.created"),
+            "usage-only 帧不得提前下发 created：{body}"
+        );
     }
 
     /// 正常完成流：failed_inline 必须为 false（不得误报流内失败）

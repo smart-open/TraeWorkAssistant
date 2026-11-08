@@ -782,6 +782,13 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
                     saw_done = true;
                 }
                 "error" => {
+                    // 迟到错误守卫（docker 审查 #2 同族，聚合侧补齐）：done/turn_completion
+                    // 已收口后上游迟到的 error 不得改写 error_info——聚合读取同一上游流
+                    // 且不 break 于 done（读到 EOF），已完整收集的响应被迟到错误丢弃会
+                    // 触发调用方误落账/冷却/换号正常账号
+                    if saw_done {
+                        continue;
+                    }
                     out.error_info = Some((ev.error_code.unwrap_or(0), ev.error_message));
                 }
                 _ => {}
@@ -1571,6 +1578,12 @@ pub fn aggregate_anthropic<R: Read + Send>(
                     saw_done = true;
                 }
                 "error" => {
+                    // 迟到错误守卫（docker 审查 #2 同族，聚合侧补齐）：done/turn_completion
+                    // 已收口后上游迟到的 error 不得改写 error_info——下方 error_info 命中
+                    // 即丢弃已完整聚合的 message 返回错误，会触发调用方误落账/冷却/换号
+                    if saw_done {
+                        continue;
+                    }
                     error_info = Some((ev.error_code.unwrap_or(0), ev.error_message));
                 }
                 _ => {}
@@ -2044,7 +2057,47 @@ mod tests {
         assert_eq!(joined.matches("data: [DONE]").count(), 1, "不得重复 [DONE]");
     }
 
+    /// 聚合侧同族回归（docker 审查 #2 补齐）：done 收口后迟到的 error 不得丢弃
+    /// 已完整聚合的 completion——collect_plain 不 break 于 done（读到 EOF），迟到
+    /// error 若改写 error_info，aggregate 会丢弃完整响应返回错误，触发调用方误
+    /// 落账/冷却/换号正常账号
+    #[test]
+    fn aggregate_late_error_after_done_is_ignored() {
+        let sse = concat!(
+            "event: output\ndata: {\"response\":\"答\"}\n",
+            "\n",
+            "event: done\ndata: {\"finish_reason\":\"stop\"}\n",
+            "\n",
+            "event: error\ndata: {\"code\":500,\"message\":\"迟到错误\"}\n",
+            "\n",
+        );
+        let (resp, err) = aggregate(sse.as_bytes(), "c1", None);
+        assert!(err.is_none(), "done 后迟到的 error 不得改写终态：{err:?}");
+        let resp = resp.expect("完整聚合的 completion 应保留");
+        assert_eq!(resp["choices"][0]["message"]["content"], "答");
+        assert_eq!(resp["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// 聚合侧同族回归（Anthropic）：done 收口后迟到的 error 不得丢弃已完整聚合
+    /// 的 message（aggregate_anthropic error_info 命中即 return (None, err)）
+    #[test]
+    fn aggregate_anthropic_late_error_after_done_is_ignored() {
+        let sse = concat!(
+            "event: output\ndata: {\"response\":\"答\"}\n",
+            "\n",
+            "event: done\ndata: {\"finish_reason\":\"stop\"}\n",
+            "\n",
+            "event: error\ndata: {\"code\":500,\"message\":\"迟到错误\"}\n",
+            "\n",
+        );
+        let (resp, err) = aggregate_anthropic(sse.as_bytes(), "msg_t", "glm-5.3", None);
+        assert!(err.is_none(), "done 后迟到的 error 不得改写终态：{err:?}");
+        let resp = resp.expect("完整聚合的 message 应保留");
+        assert_eq!(resp["content"][0]["text"], "答");
+    }
+
     // ==================== 行源等价性：IO 逐行读 vs 内存切分 ====================
+
 
     #[test]
     fn lines_entry_io_cursor_and_split_agree() {

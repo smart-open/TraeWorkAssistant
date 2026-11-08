@@ -49,7 +49,7 @@ use super::wb_upstream::{
     ReadErrSlot, InterruptibleLines,
 };
 use super::{ApiSharedState, ErrKind, InflightGuard};
-use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
 use crate::tasks::qoder_common::QoderCreds;
 use crate::tasks::qoder_upstream::{self, ErrMeta, UpstreamKind};
 
@@ -2433,82 +2433,30 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
-/// 流内错误帧下发（自抄 send_stream_error_wb：私有不可复用；形态同构）
+/// 流内错误帧下发（审查 #2 收敛：统一委托 routes::send_stream_error——Responses
+/// 骨架与 Anthropic message_stop 收口加固随 routes 侧实现三池一致）
 fn send_stream_error(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
     code: i64,
     msg: &str,
 ) {
-    let msg = stream_msg_or_fallback(msg, code);
-    match proto {
-        Protocol::Anthropic => {
-            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: error\ndata: {}\n\n",
-                err
-            ))));
-        }
-        Protocol::Responses => {
-            let resp = json!({
-                "id": format!("resp_{}", now_ts()),
-                "object": "response",
-                "status": "failed",
-                "output": [],
-                "error": {"code": code.to_string(), "message": msg},
-            });
-            let body = json!({"type": "response.failed", "response": resp});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: response.failed\ndata: {}\n\n",
-                body
-            ))));
-        }
-        _ => {
-            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-        }
-    }
+    crate::api_server::routes::send_stream_error(tx, proto, code, msg);
 }
 
 /// 字符串 code 变体（轮换耗尽收尾专用）：错误 code 保持字符串 "no_healthy_account"
-/// 不变（客户端兼容，工程惯例）——i64 版会把它变数字。三协议分流形态同构
-/// send_stream_error；耗尽文案 exhaust_message 恒非空，空 msg 兜底用 code
+/// 不变（客户端兼容，工程惯例）——i64 版会把它变数字。统一委托
+/// routes::send_stream_error_full；耗尽文案 exhaust_message 恒非空，空 msg 兜底
+/// 走 full 的等级兜底（code 无数字语义按业务码处理）
 fn send_stream_error_named(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     proto: Protocol,
     code: &str,
     msg: &str,
 ) {
+    // 空 message 兜底沿用原口径：文案用 code 字符串本身（非 full 的等级兜底）
     let msg = if msg.trim().is_empty() { code } else { msg };
-    match proto {
-        Protocol::Anthropic => {
-            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: error\ndata: {}\n\n",
-                err
-            ))));
-        }
-        Protocol::Responses => {
-            let resp = json!({
-                "id": format!("resp_{}", now_ts()),
-                "object": "response",
-                "status": "failed",
-                "output": [],
-                "error": {"code": code, "message": msg},
-            });
-            let body = json!({"type": "response.failed", "response": resp});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: response.failed\ndata: {}\n\n",
-                body
-            ))));
-        }
-        _ => {
-            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-        }
-    }
+    crate::api_server::routes::send_stream_error_full(tx, proto, "", serde_json::json!(code), msg);
 }
 
 fn internal_error_response() -> Response {

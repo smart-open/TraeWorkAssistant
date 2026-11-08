@@ -36,7 +36,7 @@ use super::wb_sse::{cache_write_tokens_of, cached_tokens_of, u64_pair};
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{self, WbCreds};
 use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
-use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
 
 // ==================== wb 族执行视图（buddy-ai 阶段 2 分流） ====================
 
@@ -2786,53 +2786,9 @@ fn send_stream_error_wb(
     code: serde_json::Value,
     msg: &str,
 ) {
-    // 空 message 兜底（issue #71）：与 routes/qoder 的 send_stream_error 同防线；
-    // 字符串业务码无数字语义，仅用于空 message 的等级兜底（exhaust 出口文案
-    // 由 exhaust_message_with_transport_cut 构造、恒非空，不触达此兜底）
-    let msg = stream_msg_or_fallback(msg, code.as_i64().unwrap_or(0));
-    match proto {
-        Protocol::Anthropic => {
-            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: error\ndata: {}\n\n",
-                err
-            ))));
-            // Anthropic 流尾补收口帧（docker 审查 #2 同族）：仅 error 事件对 Anthropic
-            // 客户端而言流未终止，等待 message_delta/message_stop 的实现会挂死到
-            // 客户端自身超时；合成收口让 SDK/客户端立即走 error 处理分支
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(concat!(
-                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"error\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n",
-                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-            ))));
-        }
-        Protocol::Responses => {
-            // 取号失败/无健康账号等入口错误 → response.failed（Responses 无 [DONE] 帧）。
-            // docker 侧加固（超出 main：上游仅做协议分流，帧本身只有 6 个字段）：
-            // 复用流内 responses_object 骨架保证字段集完整——openai 官方 SDK Response
-            // 模型对 created_at/model/parallel_tool_calls/tool_choice/tools 等字段有
-            // 必读要求（审查 #2 先补 created_at 只补一半，缺 model 仍整帧反序列化
-            // 失败被吞为连接错误，根因与 #73 同族）
-            let ts = now_ts();
-            let mut resp =
-                wb_sse::responses_object(&format!("resp_{}", ts), model, "failed", vec![], None);
-            resp["error"] = json!({
-                "code": code.as_str().map(str::to_string).unwrap_or_else(|| code.to_string()),
-                "message": msg
-            });
-            let body = json!({"type": "response.failed", "response": resp});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "event: response.failed\ndata: {}\n\n",
-                body
-            ))));
-        }
-        _ => {
-            // usage 门注释（审查 #2 同族）：本错误帧刻意不带 usage——错误帧的
-            // usage 不是记账信号；计费链路只在流成功收口时聚合入账
-            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-        }
-    }
+    // 统一实现收敛到 routes::send_stream_error_full（审查 #2：wb/qoder/routes
+    // 三套同构实现合一，Responses 骨架与 Anthropic 收口加固三池一致）
+    crate::api_server::routes::send_stream_error_full(tx, proto, model, code, msg);
 }
 
 fn internal_error_response() -> Response {
@@ -2952,8 +2908,10 @@ mod tests {
 
     /// 池耗尽出口（main 审查 #7）：code 保持字符串 no_healthy_account 客户端兼容
     /// ——OpenAI 臂 data 帧字符串 code 原样透传 + [DONE] 收尾；Responses 臂
-    /// error.code 直通字符串；Anthropic 臂 event: error 后补 message_delta/
-    /// message_stop 合成收口（docker 审查 #2 同族，防等待收口的客户端挂死）
+    /// error.code 直通字符串；Anthropic 臂 event: error 后补 message_stop 合成
+    /// 收口（docker 审查 #2 同族，防等待收口的客户端挂死）。审查修复（批次 2）：
+    /// 收口不再带 message_delta——delta.stop_reason 无「错误」官方枚举值，合成值
+    /// 会被严格 SDK 拒验；event:error 已进入错误分支，message_stop 仅终止流
     #[test]
     fn send_stream_error_wb_string_code_and_anthropic_closure() {
         let (tx, mut rx) =
@@ -3012,7 +2970,8 @@ mod tests {
         .expect("data 应为合法 JSON");
         assert_eq!(body2["response"]["error"]["code"], "no_healthy_account");
 
-        // Anthropic 臂：error + message_delta/message_stop 合成收口
+        // Anthropic 臂：error + message_stop 合成收口（不带 message_delta——
+        // delta.stop_reason 无「错误」官方枚举值，严格 SDK 会拒验）
         let (tx3, mut rx3) =
             tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         send_stream_error_wb(
@@ -3033,8 +2992,12 @@ mod tests {
         )
         .to_string();
         assert!(
-            f4.contains("event: message_delta") && f4.contains("event: message_stop"),
-            "收口包应含 message_delta 与 message_stop 两个事件：{f4}"
+            f4.contains("event: message_stop") && f4.contains("\"type\":\"message_stop\""),
+            "收口包应含 message_stop 终止事件：{f4}"
+        );
+        assert!(
+            !f4.contains("message_delta"),
+            "收口不得带 message_delta（stop_reason 无错误枚举，严格 SDK 拒验）：{f4}"
         );
         assert!(rx3.try_recv().is_err(), "Anthropic 臂应恰好两包");
     }

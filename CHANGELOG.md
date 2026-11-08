@@ -22,6 +22,14 @@
 - **scheduler 池读取失败走重试链**：空池判定改 `_raw` 加载器，DB 读失败不再被吞成 skipped_empty_pool。
 - **Qoder 签到已领回放不短路**：reclaim 裁决 already 时仍盲发兜底再裁决，防漏领每日 100 积分；兜底全 miss 保留 already 口径防重试噪声。
 
+### 发布前审查修复（5 项）
+
+- **聚合侧迟到 error 守卫补齐**：非流式聚合收集器（collect_plain / aggregate_anthropic）done 收口后迟到的 error 不再丢弃已完整聚合的响应误判失败（与流式三出口同族口径，上游 main 同样未覆盖聚合路径）。
+- **三套错误帧出口统一**：wb/qoder/routes 同构的 `send_stream_error` 收敛到 `routes::send_stream_error_full` 单实现——Qoder/Trae/custom 池 Responses 错误帧同步补齐官方 SDK 必读字段、Anthropic 臂同步补收口。
+- **Anthropic 合成收口改仅 message_stop**：收口不再带 message_delta——`stop_reason` 无「错误」官方枚举值，合成值会被严格 SDK 拒验；`event: error` 已进入错误分支，`message_stop` 仅负责终止流。
+- **Responses 门控收窄到真实载荷帧**：finish/usage-only 帧不再触发 created——消除「有 usage 无内容」流先发 created 再按空完成换号的重复 created 边界（不变式：created 已发 ⟺ 有内容 ⟺ 不走空完成换号）。
+- **kv_update 良性竞态判定结构化**：回滚清场失败以 `is_autocommit` 判定替代 «no transaction is active» 错误文案字符串匹配，不受 rusqlite 文案变化影响。
+
 ### 验证
 
 - `cargo test`（workspace）、`tsc --noEmit`、`vitest` 全部通过。
