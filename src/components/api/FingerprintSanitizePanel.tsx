@@ -405,8 +405,10 @@ export default function FingerprintSanitizePanel() {
           <div className="mt-1.5 space-y-1">
             {samples.map((s, i) => (
               <div key={`${s.kind}-${s.ts}-${i}`} className="flex items-center gap-2 text-xs">
-                <Badge tone={s.kind === '11128' ? 'red' : 'amber'}>
-                  {s.kind === '11128' ? '11128 拦截' : '空完成'}
+                {/* kind 三分支（issue #195 第二轮）：11128 显式拦截 / 11128_cleaned 清洗后样本
+                    （进出对比，生成规则按钮隐藏——仅供诊断对照）/ empty 空完成影子风控 */}
+                <Badge tone={s.kind === '11128' ? 'red' : s.kind === '11128_cleaned' ? 'violet' : 'amber'}>
+                  {s.kind === '11128' ? '11128 拦截' : s.kind === '11128_cleaned' ? '11128 清洗后' : '空完成'}
                 </Badge>
                 <Badge tone="slate">{s.pool}</Badge>
                 <span className="shrink-0 tabular-nums text-slate-400">{fmtTs(s.ts)}</span>
@@ -417,13 +419,15 @@ export default function FingerprintSanitizePanel() {
                   {s.sample}
                 </code>
                 {s.note && <Badge tone="blue">已命中</Badge>}
-                <button
-                  onClick={() => void applySample(s)}
-                  className="flex shrink-0 items-center gap-1 rounded-md border border-violet-300 px-2 py-1 text-violet-600 transition hover:bg-violet-50 dark:border-violet-700/50 dark:text-violet-300 dark:hover:bg-violet-900/20"
-                >
-                  <Wand2 size={12} />
-                  生成规则
-                </button>
+                {s.kind !== '11128_cleaned' && (
+                  <button
+                    onClick={() => void applySample(s)}
+                    className="flex shrink-0 items-center gap-1 rounded-md border border-violet-300 px-2 py-1 text-violet-600 transition hover:bg-violet-50 dark:border-violet-700/50 dark:text-violet-300 dark:hover:bg-violet-900/20"
+                  >
+                    <Wand2 size={12} />
+                    生成规则
+                  </button>
+                )}
               </div>
             ))}
           </div>

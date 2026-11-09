@@ -147,7 +147,8 @@ fn tool_alias_map_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
     // 无自定义（KV 缺失或 rules 空 = load_tool_alias_rules 走纯默认）时回显
     // 内置默认表并标记 builtin:true——前端「工具别名」tab 以此展示生效中规则；
     // 保存后成为自定义覆盖表（合并语义：默认表全量生效，自定义按 from 覆盖/
-    // 追加，to null = 停用该规则原名透传；与 merged_tool_alias_rules 口径一致）
+    // 追加，to null = 停用该规则原名透传且阻断通配接管；与 merged_tool_alias_rules
+    // 口径一致）
     let file: crate::api_server::wb_payload::ToolAliasFile =
         crate::store::db(data_dir).kv_get("tool_alias_map");
     if file.rules.is_empty() {
@@ -167,9 +168,11 @@ fn tool_alias_map_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
 
 /// 结构校验：对齐 wb_route::load_tool_alias_rules 的读取形状（ToolAliasFile）——
 /// rules 为 [{from,to?}] 数组（from 必填字符串；to 为 null/缺省=停用），updated_at
-/// 可空。语义收紧两处：from 非空且唯一（重复项在合并语义中靠后覆盖，UI 编辑态
-/// 不应产生，落库层兜底拒绝）；to 拒绝空串（工具名不可为空，读取侧虽将空串统一
-/// 解释为停用，落库层直接拒绝以免用户误存「改名成空」的残规则）
+/// 可空。语义收紧三处：from 非空且唯一（重复项在合并语义中靠后覆盖，UI 编辑态
+/// 不应产生，落库层兜底拒绝）；from 拒绝裸「*」（空前缀通配会改写全部工具名，
+/// 读取侧虽静默忽略，落库层直接拒绝以免用户误存全量改写残规则）；to 拒绝空串
+/// （工具名不可为空，读取侧虽将空串统一解释为停用，落库层直接拒绝以免用户
+/// 误存「改名成空」的残规则）
 fn tool_alias_map_set_at(data_dir: &std::path::Path, map: &Value) -> Result<(), String> {
     if !map.is_object() {
         return Err("工具别名表必须是 JSON 对象（含 rules 数组）".into());
@@ -182,6 +185,9 @@ fn tool_alias_map_set_at(data_dir: &std::path::Path, map: &Value) -> Result<(), 
     for r in &file.rules {
         if r.from.is_empty() {
             return Err("工具别名规则 from 不能为空".into());
+        }
+        if r.from == "*" {
+            return Err("工具别名规则不支持裸「*」（空前缀会改写全部工具名）：通配请写「前缀*」如 acp_*，精确匹配请写完整工具名".into());
         }
         if !seen.insert(r.from.clone()) {
             return Err(format!("工具别名规则 from 重复: {}", r.from));

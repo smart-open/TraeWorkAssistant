@@ -568,6 +568,12 @@ pub fn default_tool_alias_rules() -> Vec<(String, String)> {
         ("acp_cache".to_string(), "tool_cache".to_string()),
         ("acp_read_original_image".to_string(), "read_source_image".to_string()),
         ("acp_status".to_string(), "runtime_status".to_string()),
+        // B-4 通配兜底（issue #195 方案）：40 工具集还有其余 acp_* 名（此前样本
+        // 只落前 10 个，全量名单未观测到），前缀通配逐个接管无须逐名布防；
+        // 精确规则（上方三条）优先于通配命中。from 以 `*` 结尾 = 前缀替换语义
+        // （acp_*→tool_ 把 acp_cache 改写为 tool_cache），响应侧逆映射按请求
+        // 动态生成无须改动
+        ("acp_*".to_string(), "tool_".to_string()),
         // DSH 0.2.1-rc.3 实证补十一条（2026-11-05 会话 request/header 抓包 141 工具）：
         // rc.2 的 25 工具样本未涵盖插件化后的新增面——Cordis 内省二件、Agent Teams
         // 协作七件（list_agents/spawn_teammate/wait_agent/team_task_* 四件）、
@@ -642,7 +648,8 @@ pub struct ToolAliasFile {
 
 impl ToolAliasFile {
     /// 自定义表 → (from, to?) 列表（to=None/Some("") 统一为停用——工具名不可
-    /// 为空串，与模板表的「空串=剥离」语义在此不适用）
+    /// 为空串，与模板表的「空串=剥离」语义在此不适用；停用保留空 to 占位，
+    /// 阻断前缀通配规则接管该精确名，issue #195 第二轮审查②）
     pub fn into_rules(self) -> Option<Vec<(String, Option<String>)>> {
         if self.rules.is_empty() {
             return None;
@@ -657,9 +664,14 @@ impl ToolAliasFile {
 }
 
 /// 工具别名合并语义（对齐 merged_template_rules）：内置默认表全量生效，自定义
-/// 按 from 同名覆盖/追加；to=None 或空串 = 停用（从生效表移除，原名透传）。
+/// 按 from 同名覆盖/追加；to=None 或空串 = 停用（原名透传）。停用保留空 to
+/// 占位而非移除：issue #195 起生效表含前缀通配（acp_*→tool_），若按精确 from
+/// 移除，通配会接管被停用的精确名（停用语义被穿透，第二轮审查②）——apply
+/// 侧按空 to 推导阻断集，通配命中停用名即跳过。
 /// 注意：工具别名不支持 `|` 多候选——别名改写必须请求/响应双向一致，候选
-/// 随轮换种子变化会导致响应侧逆映射失配（模板表无回程不受此限）
+/// 随轮换种子变化会导致响应侧逆映射失配（模板表无回程不受此限）。
+/// issue #195 起 from 支持 `*` 结尾前缀通配（acp_*→tool_ 前缀替换），精确
+/// 规则优先；通配命中的逆映射按请求动态生成，响应侧无须感知
 pub fn merged_tool_alias_rules(
     custom: Option<Vec<(String, Option<String>)>>,
 ) -> Vec<(String, String)> {
@@ -667,7 +679,15 @@ pub fn merged_tool_alias_rules(
     if let Some(rules) = custom {
         for (from, to) in rules {
             match to {
-                None => merged.retain(|(f, _)| *f != from),
+                // 停用：默认表命中改写为空 to 占位；未命中默认表的自定义条目
+                // 同样落占位（防止默认表通配规则接管该名）
+                None => {
+                    if let Some(slot) = merged.iter_mut().find(|(f, _)| *f == from) {
+                        slot.1 = String::new();
+                    } else {
+                        merged.push((from, String::new()));
+                    }
+                }
                 Some(t) => {
                     if let Some(slot) = merged.iter_mut().find(|(f, _)| *f == from) {
                         slot.1 = t;
@@ -684,9 +704,9 @@ pub fn merged_tool_alias_rules(
 /// 请求侧工具名别名改写（issue #150 治本）：入参为 prepare_llm_chat_body /
 /// prepare_wb_chat_body 产物（llm_utils_chat 形态），覆盖三个透传点——
 /// `tools[].function.name`、`tool_choice`（normalize 后为字符串工具名）、
-/// `messages[].tool_calls[].function_call.name`（历史轮）。命中才改（窄口径，
-/// 逐字匹配），改写后返回逆映射（别名→原名）供响应侧回改；无 tools / 零命中
-/// 返回 None（响应侧零开销直通）。
+/// `messages[].tool_calls[].function_call.name`（历史轮）。命中才改（窄口径：
+/// 精确逐字匹配 + issue #195 前缀通配 from 以 `*` 结尾），改写后返回逆映射
+/// （别名→原名）供响应侧回改；无 tools / 零命中返回 None（响应侧零开销直通）。
 /// 一致性约束：逆映射按「别名→首个原名」先到先得——两条规则映射到同一别名时
 /// 第二个原名不改写（配置冲突的防御性兜底，内置表无冲突；UI 侧不拦截）。
 /// 碰撞防御：别名命中请求内其他真实工具名（且该名未被更早规则改名让出）时，
@@ -719,18 +739,34 @@ pub fn apply_tool_alias_forward_value(
         return None;
     }
     let obj = v.as_object_mut()?;
-    // 生效前向表：from → to（停用规则不在表内——to 非空才入表）
-    let forward: Vec<(&str, &str)> = rules
-        .iter()
-        .filter(|(_, to)| !to.is_empty())
-        .map(|(from, to)| (from.as_str(), to.as_str()))
-        .collect();
-    if forward.is_empty() {
+    // 生效前向表：精确规则（from 逐字）+ 前缀通配（issue #195：from 以 `*`
+    // 结尾 = 前缀替换语义，acp_*→tool_ 把 acp_cache 改写为 tool_cache——通配
+    // 覆盖未逐一布防的客户端独家命名族）。裸 `*`（空前缀）全匹配禁用防误伤；
+    // 通配按表序首个命中，精确规则优先于通配。
+    // 空 to = 停用占位（issue #195 第二轮审查②）：精确 from 落阻断集 blocked，
+    // 通配命中停用名即跳过——停用语义（原名透传）不被通配穿透；停用的通配
+    // 规则整条失效且不产生阻断
+    let mut exact: Vec<(&str, &str)> = Vec::new();
+    let mut wilds: Vec<(&str, &str)> = Vec::new();
+    let mut blocked: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (from, to) in rules.iter() {
+        match from.strip_suffix('*') {
+            Some(prefix) if !prefix.is_empty() && !to.is_empty() => {
+                wilds.push((prefix, to.as_str()));
+            }
+            Some(_) => {}
+            None if to.is_empty() => {
+                blocked.insert(from.as_str());
+            }
+            None => exact.push((from.as_str(), to.as_str())),
+        }
+    }
+    if exact.is_empty() && wilds.is_empty() {
         return None;
     }
     // 碰撞防御（审查修复）：改名前采集请求内全部真实工具名；别名命中存活真实名
     // 时该规则跳过。freed = 已被更早接受规则改名让出的原名——链式改写（B→C 后
-    // A→B）在规则序下合法放行，仅拦真实重复
+    // A→B）在规则序下合法放行，仅拦真实重复；通配生成名同样过碰撞防御
     let real: std::collections::HashSet<String> = obj
         .get("tools")
         .and_then(Value::as_array)
@@ -741,17 +777,58 @@ pub fn apply_tool_alias_forward_value(
                 .collect()
         })
         .unwrap_or_default();
-    let mut freed: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let effective: std::collections::HashMap<&str, &str> = forward
+    let mut freed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let effective: std::collections::HashMap<&str, &str> = exact
         .into_iter()
         .filter(|(from, to)| {
             if real.contains(*to) && !freed.contains(*to) {
                 return false; // 别名与存活真实名碰撞：整条跳过，原名透传
             }
-            freed.insert(*from);
+            freed.insert((*from).to_string());
             true
         })
         .collect();
+    // 别名解析（tools/tool_choice/历史轮三处共用）：精确表优先；未命中按通配
+    // 表序首个前缀命中生成别名，生成名与存活真实名碰撞则跳过该条试下一条；
+    // 恒等别名（to==from / 生成名==原名）零语义改写一律跳过（issue #195 第三轮
+    // 审查②）。freed 以参数传入（调用点在冲突裁决通过后提交让出，issue #195
+    // 第二轮审查⑤）：通配接受时预置 freed 会让被冲突否决改写的原名错误进入
+    // freed——原名仍存活却被视为已让出，后续通配可错误接管（上游重复工具名 +
+    // 逆映射错改真实工具调用）。提交后的 freed 使被让出的名字可被后续通配
+    // 接管（链式改写）
+    let resolve = |name: &str, freed: &mut std::collections::HashSet<String>| -> Option<String> {
+        if let Some(alias) = effective.get(name) {
+            if *alias == name {
+                // 恒等别名跳过（issue #195 第三轮审查②）：to==from 零语义改写，
+                // 放行只制造 reverse 恒等项（保守性否决后续合法改写）+ 命中流水
+                // 噪音 + renamed 误报；不下沉通配——精确规则优先语义下恒等即
+                // 「原名透传」（与停用名同款口径）
+                return None;
+            }
+            return Some((*alias).to_string());
+        }
+        // 停用精确名阻断（issue #195 第二轮审查②）：自定义 to=None 停用后该名
+        // 原名透传，前缀通配规则不得接管
+        if blocked.contains(name) {
+            return None;
+        }
+        for (prefix, to) in wilds.iter() {
+            if let Some(rest) = name.strip_prefix(prefix) {
+                let alias = format!("{to}{rest}");
+                if real.contains(&alias) && !freed.contains(alias.as_str()) {
+                    continue;
+                }
+                // 恒等别名跳过（issue #195 第三轮审查②）：生成名等于原名仍是
+                // 零语义改写（存活名已被上方碰撞检查拦下，此处兜住不在当前
+                // tools 的历史轮引用），试下一条通配
+                if alias == name {
+                    continue;
+                }
+                return Some(alias);
+            }
+        }
+        None
+    };
     let mut reverse: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut renamed = false;
     // tools[].function/name
@@ -759,18 +836,33 @@ pub fn apply_tool_alias_forward_value(
         for tool in tools.iter_mut() {
             if let Some(name) = tool.pointer_mut("/function/name").and_then(|v| v.as_str()) {
                 let orig = name.to_string();
-                if let Some(alias) = effective.get(orig.as_str()) {
+                if let Some(alias) = resolve(&orig, &mut freed) {
                     // 同别名冲突先到先得：第二个原名不改写
                     let conflict = reverse
-                        .get(*alias)
+                        .get(alias.as_str())
                         .map(|prev| prev != &orig)
                         .unwrap_or(false);
-                    if !conflict {
+                    // 存活名碰撞复查（issue #195 第三轮审查①）：过滤期 freed 预插
+                    // 快照可能已被先前改写点的冲突回滚失效——别名命中仍存活的
+                    // 真实名时同样不改写，防上游重复工具名 + 逆映射错改真实调用
+                    let live_hit = real.contains(alias.as_str()) && !freed.contains(alias.as_str());
+                    if !conflict && !live_hit {
                         if let Some(slot) = tool.pointer_mut("/function/name") {
-                            *slot = Value::String((*alias).to_string());
+                            *slot = Value::String(alias.clone());
                         }
-                        reverse.insert((*alias).to_string(), orig);
+                        record_alias_hit(&orig, &alias);
+                        // 让出提交（issue #195 第二轮审查⑤）：改写生效后原名才真正
+                        // 让出，可被后续规则接管（链式改写）；精确规则原名已在
+                        // effective 过滤时入 freed，此处重复插入幂等
+                        freed.insert(orig.clone());
+                        reverse.insert(alias, orig);
                         renamed = true;
+                    } else {
+                        // 冲突回滚（issue #195 第二轮审查⑤）：精确规则原名在过滤期
+                        // 预入 freed 但此处改写被冲突裁决否决——原名仍存活，回滚
+                        // 让出记录，否则后续通配可错误接管该存活名（上游重复工具名
+                        // + 逆映射错改真实工具调用）
+                        freed.remove(orig.as_str());
                     }
                 }
             }
@@ -781,8 +873,9 @@ pub fn apply_tool_alias_forward_value(
     // 避免上游收到指向不存在/错误工具的 tool_choice
     if let Some(Value::String(tc)) = obj.get_mut("tool_choice") {
         if reverse.values().any(|orig| orig == tc) {
-            if let Some(alias) = effective.get(tc.as_str()) {
-                *tc = (*alias).to_string();
+            if let Some(alias) = resolve(tc.as_str(), &mut freed) {
+                record_alias_hit(tc, &alias);
+                *tc = alias;
                 renamed = true;
             }
         }
@@ -804,17 +897,29 @@ pub fn apply_tool_alias_forward_value(
                     else {
                         continue;
                     };
-                    if let Some(alias) = effective.get(name.as_str()) {
+                    if let Some(alias) = resolve(&name, &mut freed) {
                         let conflict = reverse
-                            .get(alias.to_string().as_str())
+                            .get(alias.as_str())
                             .map(|prev| prev != &name)
                             .unwrap_or(false);
-                        if !conflict {
+                        // 存活名碰撞复查（issue #195 第三轮审查①）：同 tools 循环，
+                        // 过滤期 freed 快照失效后别名仍可能命中存活真实名
+                        let live_hit =
+                            real.contains(alias.as_str()) && !freed.contains(alias.as_str());
+                        if !conflict && !live_hit {
                             if let Some(slot) = tc.pointer_mut(&format!("/{key}/name")) {
-                                *slot = Value::String((*alias).to_string());
+                                *slot = Value::String(alias.clone());
                             }
-                            reverse.insert((*alias).to_string(), name);
+                            record_alias_hit(&name, &alias);
+                            // 让出提交（issue #195 第二轮审查⑤）：同 tools 循环，
+                            // 改写生效后原名才真正让出
+                            freed.insert(name.clone());
+                            reverse.insert(alias, name);
                             renamed = true;
+                        } else {
+                            // 冲突回滚（issue #195 第二轮审查⑤）：同 tools 循环，
+                            // 被否决改写的原名仍存活，回滚 freed 让出记录
+                            freed.remove(name.as_str());
                         }
                     }
                     break;
@@ -838,9 +943,64 @@ fn hit_counter() -> &'static Mutex<BTreeMap<String, u64>> {
 }
 
 fn record_hit(from: &str, to: &str) {
+    let key = format!("{from} → {to}");
     if let Ok(mut m) = hit_counter().lock() {
-        *m.entry(format!("{from} → {to}")).or_insert(0) += 1;
+        *m.entry(key.clone()).or_insert(0) += 1;
     }
+    ledger_push(key);
+}
+
+/// 别名命中流水（issue #195 方案 B5）：别名改写接受时记录，key 带「别名」
+/// 前缀与模板命中区分——11128 样本行「本次命中」据此可同时看到清洗句与
+/// 别名两个通道的实际命中
+fn record_alias_hit(from: &str, to: &str) {
+    ledger_push(format!("别名 {from} → {to}"));
+}
+
+// ==================== 本次请求命中流水（issue #195 方案 B5） ====================
+
+/// 进程级累计计数（hit_counter）只证明「历史上命中过」，不能证明「本次请求」
+/// 被清洗了什么——11128 样本行此前附带的累计值在日志侧易误读为本次清洗依据。
+/// cursor 方案：请求入口 prepare 前取单调序号快照（template_hits_mark），Fatal
+/// 落样本时导出快照之后的命中流水（template_hits_since），样本行即该请求
+/// 实际命中的规则清单。不用 thread_local：tokio 任务跨线程跳转不可靠
+static HIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 命中流水环形缓冲容量：极端并发下早于此窗口的条目被挤出（进程级累计计数
+/// hit_counter 仍完整）
+const HIT_LEDGER_CAP: usize = 4096;
+
+fn hit_ledger() -> &'static Mutex<VecDeque<(u64, String)>> {
+    static LEDGER: OnceLock<Mutex<VecDeque<(u64, String)>>> = OnceLock::new();
+    LEDGER.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn ledger_push(key: String) {
+    let seq = HIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let mut ledger = hit_ledger().lock().unwrap_or_else(|e| e.into_inner());
+    if ledger.len() >= HIT_LEDGER_CAP {
+        ledger.pop_front();
+    }
+    ledger.push_back((seq, key));
+}
+
+/// 命中流水游标：请求入口（prepare 清洗前）调用一次，返回值随请求传递，
+/// 供同请求的 Fatal 落样本时 template_hits_since 导出「本次实际命中」
+pub fn template_hits_mark() -> u64 {
+    HIT_SEQ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 导出游标之后的命中流水（去重保持首现顺序，含模板与别名两类）。并发负载
+/// 下早于窗口的条目可能已被挤出环形缓冲
+pub fn template_hits_since(cursor: u64) -> Vec<String> {
+    let ledger = hit_ledger().lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen: Vec<String> = Vec::new();
+    for (seq, key) in ledger.iter() {
+        if *seq > cursor && !seen.contains(key) {
+            seen.push(key.clone());
+        }
+    }
+    seen
 }
 
 /// 命中统计全文（"from → to ×N; ..."；无命中返回 None）
@@ -869,7 +1029,8 @@ pub fn template_hit_note() -> String {
 
 /// 指纹样本条目：网关命中风控时随日志同步采入内存环形缓冲，UI「指纹清洗」
 /// tab 拉取展示、一键预填规则（from/to）。kind：`11128` = 显式指纹拦截
-/// （清洗已启用仍命中）；`empty` = 空完成影子风控收尾采样。
+/// （清洗已启用仍命中）；`11128_cleaned` = 11128 终局同采的清洗后样本（进出
+/// 对比使漏网指纹现形，issue #195 第二轮）；`empty` = 空完成影子风控收尾采样。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FingerprintSampleEntry {
     pub kind: String,
@@ -951,8 +1112,8 @@ pub fn empty_sample_note(exhaust_tag: &str, pool: &str, body: &[u8]) -> String {
 }
 
 /// 11128 清洗后仍命中的指纹样本提取（issue #99 诊断闭环）：首条 system 消息
-/// 文本前 300 字符（压缩空白单行化，内嵌引号转单引号）+ 工具名列表（前 10 个，
-/// 缺 function 回退顶层 name——Responses 原生工具形态）。
+/// 文本前 300 字符（压缩空白单行化，内嵌引号转单引号）+ 全量工具名列表（缺
+/// function 回退顶层 name——Responses 原生工具形态）。
 /// 用途：目前只知模板命中了什么、不知漏了什么——样本落 app.log 后用户可直接
 /// 反查精确触发句，经 UI「指纹清洗」tab 热更新规则表，无须发版。样本取**清洗前**
 /// 原始请求体（保留原始句式便于逐字配规则），已改写部分由模板命中注记区分；
@@ -981,9 +1142,10 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
         sys.replace('"', "'"),
         if truncated { "…" } else { "" }
     );
-    // 工具名画像（issue #150 增强）：此前仅截前 10 个，tools 工具集指纹识别
-    // 升级后需全量画像定位「哪类客户端形态在被拦」——展示前 10 + 全量总数 +
-    // 排序名 FNV-1a 短哈希（同名集合跨请求稳定聚合，日志侧可按 hash 分桶统计）
+    // 工具名画像（issue #195 增强）：此前仅展示前 10 个——40 工具集仅 11 名布防
+    // 时其余名字永远不可观测，无法布防也无法排除；改为全量展示逐个落日志。
+    // 保留全量总数 + 排序名 FNV-1a 短哈希（同名集合跨请求稳定聚合，日志侧可
+    // 按 hash 分桶统计客户端形态）
     let tool_names: Vec<String> = v
         .get("tools")
         .and_then(|t| t.as_array())
@@ -1001,13 +1163,12 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
         .unwrap_or_default();
     if !tool_names.is_empty() {
         let total = tool_names.len();
-        let shown: Vec<String> = tool_names.iter().take(10).cloned().collect();
         let mut sorted = tool_names.clone();
         sorted.sort();
         let set_hash = fnv1a(&sorted.join("\u{1}")) & 0xFFFF_FFFF;
         out.push_str(&format!(
             " tools=[{}](total={total} hash={set_hash:08x})",
-            shown.join(",")
+            tool_names.join(",")
         ));
     }
     out
@@ -1105,6 +1266,105 @@ pub fn residual_fingerprint_note(body: &[u8]) -> Option<String> {
         return None;
     };
     residual_fingerprint_note_value(&v)
+}
+
+/// 字节层 rules-aware 残指纹自检（wb_route 11128 Fatal 站点便捷入口，
+/// 口径同 [residual_fingerprint_note_with_rules]）
+pub fn residual_fingerprint_note_rules_bytes(
+    body: &[u8],
+    alias_rules: &[(String, String)],
+) -> Option<String> {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return None;
+    };
+    residual_fingerprint_note_with_rules(&v, alias_rules)
+}
+
+/// rules-aware 残指纹自检扩展（issue #195 方案 B3）：在 system 文本特征词扫描
+/// （[residual_fingerprint_note_value] 同口径）之上扩展 tools 维度——句表已净
+/// 仍 11128 时，残余指纹大概率在工具名通道：
+/// ① 工具名含已知特征词（RESIDUAL_MARKERS 同表，小写比对）；
+/// ② 工具名仍带 `acp_` 前缀（ACP 桥接独家命名，通配规则被停用/未接线时的
+///    漏网信号）；
+/// ③ 别名表 from 在清洗后仍存活（精确逐字比对；from 以 `*` 结尾按前缀判——
+///    from 均为客户端独家命名，存活即该条规则本请求未生效，诊断信号非误报；
+///    停用规则空 to 不参与——用户主动停用非故障信号）。
+/// 命中项去重保持首现顺序（system 与 tools 同词组只报一次），逗号连接；
+/// 无命中 None
+pub fn residual_fingerprint_note_with_rules(
+    v: &Value,
+    alias_rules: &[(String, String)],
+) -> Option<String> {
+    let mut hits: Vec<String> = Vec::new();
+    // ① system 文本既有特征词扫描（与旧口径一致）
+    let system = first_system_text(v).to_lowercase();
+    if !system.is_empty() {
+        hits.extend(
+            RESIDUAL_MARKERS
+                .iter()
+                .copied()
+                .filter(|m| system.contains(m))
+                .map(str::to_string),
+        );
+    }
+    let tool_names: Vec<String> = v
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    t.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .or_else(|| t.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for name in &tool_names {
+        let lower = name.to_lowercase();
+        // ① 工具名含已知特征词
+        hits.extend(
+            RESIDUAL_MARKERS
+                .iter()
+                .copied()
+                .filter(|m| lower.contains(m))
+                .map(str::to_string),
+        );
+        // ② ACP 桥接前缀残留
+        if lower.starts_with("acp_") {
+            hits.push("acp_*".to_string());
+        }
+    }
+    // ③ 别名表 from 清洗后仍存活（别名未生效信号）——仅扫描生效规则（空 to
+    // = 用户主动停用，非「未生效」故障信号，不参与）
+    for (from, to) in alias_rules {
+        if to.is_empty() {
+            continue;
+        }
+        if let Some(prefix) = from.strip_suffix('*') {
+            if prefix.is_empty() {
+                continue;
+            }
+            if tool_names.iter().any(|n| n.starts_with(prefix)) {
+                hits.push(from.clone());
+            }
+        } else if tool_names.iter().any(|n| n == from) {
+            hits.push(from.clone());
+        }
+    }
+    // 去重保持首现顺序（system 与 tools 同词组只报一次）
+    let mut seen: Vec<String> = Vec::new();
+    for h in hits {
+        if !seen.contains(&h) {
+            seen.push(h);
+        }
+    }
+    if seen.is_empty() {
+        None
+    } else {
+        Some(seen.join(","))
+    }
 }
 
 // ==================== 池级指纹拦截短记忆（issue #122 缺口2） ====================
@@ -3276,8 +3536,225 @@ mod tests {
         );
     }
 
-    /// 工具别名合并语义：默认表全量生效；自定义同名覆盖；to=None 停用（从
-    /// 生效表移除）；空串 to 经 into_rules 过滤后等价停用；新条目追加
+    /// 前缀通配规则正向改写（issue #195 方案 B4）：acp_*→tool_ 前缀替换逐个
+    /// 接管未逐一布防的命名族；精确规则优先于通配（acp_read_original_image 走
+    /// 精确别名而非通配产物）；tool_choice 与历史轮跟随；逆映射可回改
+    #[test]
+    fn tool_alias_wildcard_prefix_rules() {
+        let rules = vec![
+            (
+                "acp_read_original_image".to_string(),
+                "read_source_image".to_string(),
+            ),
+            ("acp_*".to_string(), "tool_".to_string()),
+        ];
+        let body = json!({
+            "tools": [
+                {"function": {"name": "acp_initialize"}},
+                {"function": {"name": "acp_read_original_image"}},
+                {"function": {"name": "acp_new_session"}}
+            ],
+            "tool_choice": "acp_new_session",
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "t1", "type": "function",
+                     "function_call": {"name": "acp_initialize", "arguments": "{}"}}
+                ]}
+            ]
+        });
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse = apply_tool_alias_forward(&mut buf, &rules).expect("应发生改写");
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        // 通配：前缀替换
+        assert_eq!(v["tools"][0]["function"]["name"], json!("tool_initialize"));
+        // 精确规则优先：不走通配产物 tool_read_original_image
+        assert_eq!(v["tools"][1]["function"]["name"], json!("read_source_image"));
+        assert_eq!(v["tools"][2]["function"]["name"], json!("tool_new_session"));
+        assert_eq!(v["tool_choice"], json!("tool_new_session"));
+        assert_eq!(
+            v["messages"][0]["tool_calls"][0]["function_call"]["name"],
+            json!("tool_initialize")
+        );
+        assert_eq!(
+            reverse.get("tool_initialize").map(String::as_str),
+            Some("acp_initialize")
+        );
+        assert_eq!(
+            reverse
+                .get("read_source_image")
+                .map(String::as_str),
+            Some("acp_read_original_image")
+        );
+        assert_eq!(
+            reverse.get("tool_new_session").map(String::as_str),
+            Some("acp_new_session")
+        );
+        // 裸 `*`（空前缀）全匹配禁用：规则被忽略，原名透传零改写
+        let rules2 = vec![("*".to_string(), "x_".to_string())];
+        let body2 = json!({"tools": [{"function": {"name": "grep"}}]});
+        let mut b2 = serde_json::to_vec(&body2).unwrap();
+        assert!(apply_tool_alias_forward(&mut b2, &rules2).is_none(), "裸 * 应被忽略");
+        let v2: Value = serde_json::from_slice(&b2).unwrap();
+        assert_eq!(v2["tools"][0]["function"]["name"], json!("grep"));
+    }
+
+    /// 通配生成名碰撞防御与链式让出：生成别名与请求内存活真实名冲突时该名字
+    /// 跳过通配（原名透传）；更早精确规则已把真实名改名让出（freed）时，通配
+    /// 可接管该名——与精确规则链式语义一致
+    #[test]
+    fn tool_alias_wildcard_collision_and_chain_free() {
+        // 碰撞：tool_cache 是存活真实名 → acp_cache 不改名，零改写返回 None
+        let rules = vec![("acp_*".to_string(), "tool_".to_string())];
+        let body = json!({"tools": [
+            {"function": {"name": "acp_cache"}},
+            {"function": {"name": "tool_cache"}}
+        ]});
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        assert!(
+            apply_tool_alias_forward(&mut buf, &rules).is_none(),
+            "生成名与存活真实名碰撞应零改写"
+        );
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("acp_cache"));
+        assert_eq!(v["tools"][1]["function"]["name"], json!("tool_cache"));
+        // 链式让出：精确规则先把真实名 tool_cache 改名（tool_cache→tc），
+        // 通配随后可把 acp_cache 接管为 tool_cache
+        let rules2 = vec![
+            ("tool_cache".to_string(), "tc".to_string()),
+            ("acp_*".to_string(), "tool_".to_string()),
+        ];
+        let body2 = json!({"tools": [
+            {"function": {"name": "tool_cache"}},
+            {"function": {"name": "acp_cache"}}
+        ]});
+        let mut b2 = serde_json::to_vec(&body2).unwrap();
+        let reverse2 = apply_tool_alias_forward(&mut b2, &rules2).expect("链式改写应生效");
+        let v2: Value = serde_json::from_slice(&b2).unwrap();
+        assert_eq!(v2["tools"][0]["function"]["name"], json!("tc"));
+        assert_eq!(
+            v2["tools"][1]["function"]["name"],
+            json!("tool_cache"),
+            "被让出的名字可被通配接管"
+        );
+        assert_eq!(reverse2.get("tc").map(String::as_str), Some("tool_cache"));
+        assert_eq!(
+            reverse2.get("tool_cache").map(String::as_str),
+            Some("acp_cache")
+        );
+    }
+
+    /// B-1 全量工具名落样本（issue #195）：40 工具集只落前 10 个时其余名字
+    /// 永远不可观测——样本必须逐个列出全部工具名 + total + 排序名短哈希
+    #[test]
+    fn fingerprint_sample_lists_all_tool_names() {
+        let names: Vec<String> = (0..15).map(|i| format!("acp_tool_{i:02}")).collect();
+        let tools: Vec<Value> = names
+            .iter()
+            .map(|n| json!({"type": "function", "function": {"name": n, "parameters": {}}}))
+            .collect();
+        let body = json!({
+            "messages": [{"role": "system", "content": "s"}],
+            "tools": tools
+        });
+        let s = fingerprint_sample(&serde_json::to_vec(&body).unwrap());
+        for n in &names {
+            assert!(s.contains(n.as_str()), "工具名 {n} 应全量出现在样本: {s}");
+        }
+        assert!(s.contains("total=15"), "{s}");
+        assert!(s.contains("hash="), "{s}");
+    }
+
+    /// B-3 rules-aware 残指纹自检（issue #195 方案）：tools 维度扫描——工具名
+    /// 特征词、acp_ 前缀残留、别名表 from 存活（未生效信号）；system 与 tools
+    /// 同词组去重；别名改写成功后 from 不再存活 → 不误报
+    #[test]
+    fn residual_note_with_rules_scans_tools_dimension() {
+        let rules = vec![("acp_cache".to_string(), "tool_cache".to_string())];
+        // 改写前：acp_ 前缀 + from 存活 + 品牌词工具名均应检出
+        let body = json!({
+            "messages": [{"role": "system", "content": "clean text"}],
+            "tools": [
+                {"function": {"name": "acp_cache"}},
+                {"function": {"name": "codebuddy_index"}}
+            ]
+        });
+        let note = residual_fingerprint_note_with_rules(&body, &rules)
+            .expect("tools 维度残指纹应被检出");
+        assert!(note.contains("acp_*"), "{note}");
+        assert!(note.contains("acp_cache"), "{note}");
+        assert!(note.contains("codebuddy"), "{note}");
+        // system 与 tools 同词组只报一次
+        let body_dup = json!({
+            "messages": [{"role": "system", "content": "CodeBuddy harness"}],
+            "tools": [{"function": {"name": "codebuddy_index"}}]
+        });
+        let note2 = residual_fingerprint_note_with_rules(&body_dup, &rules).unwrap();
+        assert_eq!(
+            note2.matches("codebuddy").count(),
+            1,
+            "同词组只报一次: {note2}"
+        );
+        // 别名改写成功后：from 不存活、acp_ 前缀消失 → 无命中不误报
+        let body3 = json!({
+            "messages": [{"role": "system", "content": "clean text"}],
+            "tools": [{"function": {"name": "acp_cache"}}]
+        });
+        let note3 = residual_fingerprint_note_with_rules(&body3, &rules)
+            .expect("改写前应检出");
+        assert!(note3.contains("acp_*") && note3.contains("acp_cache"), "{note3}");
+        let mut buf3 = serde_json::to_vec(&body3).unwrap();
+        apply_tool_alias_forward(&mut buf3, &rules).unwrap();
+        let v3: Value = serde_json::from_slice(&buf3).unwrap();
+        assert_eq!(
+            residual_fingerprint_note_with_rules(&v3, &rules),
+            None,
+            "改写后不应误报"
+        );
+    }
+
+    /// B-5 本次请求命中流水（issue #195 方案）：游标之后的别名/模板命中被导出
+    /// 且带类别标记（「别名」前缀区分）；游标前的命中不出现（进程级累计值
+    /// 的误导性由此消除）
+    #[test]
+    fn template_hits_ledger_exports_per_request() {
+        let cursor = template_hits_mark();
+        // 别名命中：通配规则接受改写时入流水
+        let rules = vec![("acp_*".to_string(), "tool_".to_string())];
+        let body = json!({"tools": [{"function": {"name": "acp_probe"}}]});
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        apply_tool_alias_forward(&mut buf, &rules).unwrap();
+        let hits = template_hits_since(cursor);
+        assert!(
+            hits.iter()
+                .any(|h| h.contains("别名 acp_probe → tool_probe")),
+            "{hits:?}"
+        );
+        // 模板命中：prepare 清洗管线命中身份句时入流水
+        let tpl = vec![(
+            "You are ZCode, an interactive coding agent".to_string(),
+            "You are a coding assistant".to_string(),
+        )];
+        let src = serde_json::to_vec(&json!({
+            "model": "glm-5", "stream": true,
+            "messages": [
+                {"role": "system", "content": "You are ZCode, an interactive coding agent"},
+                {"role": "user", "content": "hi"}
+            ]
+        }))
+        .unwrap();
+        prepare_wb_chat_body(&src, "glm-5", "u1", "c1", None, true, &tpl, 0, false);
+        let hits2 = template_hits_since(cursor);
+        assert!(
+            hits2.iter().any(|h| {
+                h.contains("You are ZCode, an interactive coding agent → You are a coding assistant")
+            }),
+            "{hits2:?}"
+        );
+    }
+
+    /// 工具别名合并语义：默认表全量生效；自定义同名覆盖；to=None 停用（保留
+    /// 空 to 占位阻断通配接管，issue #195 第二轮审查②）；空串 to 经 into_rules
+    /// 过滤后等价停用；新条目追加
     #[test]
     fn tool_alias_merged_rules_disable_and_override() {
         let base = merged_tool_alias_rules(None);
@@ -3286,10 +3763,10 @@ mod tests {
         let custom = vec![("ask_user_question".to_string(), Some("clarify".to_string()))];
         let m1 = merged_tool_alias_rules(Some(custom));
         assert!(m1.iter().any(|(f, t)| f == "ask_user_question" && t == "clarify"));
-        // to=None 停用：仅移除该条，其余默认规则不受影响
+        // to=None 停用：空 to 占位保留（阻断通配接管），其余默认规则不受影响
         let custom2 = vec![("ask_user_question".to_string(), None)];
         let m2 = merged_tool_alias_rules(Some(custom2));
-        assert!(!m2.iter().any(|(f, _)| f == "ask_user_question"));
+        assert!(m2.iter().any(|(f, t)| f == "ask_user_question" && t.is_empty()));
         assert!(m2.iter().any(|(f, _)| f == "create_goal"));
         // 空串 to：into_rules 统一过滤为停用（工具名不可为空）
         let file = ToolAliasFile {
@@ -3300,11 +3777,150 @@ mod tests {
             updated_at: None,
         };
         let m3 = merged_tool_alias_rules(file.into_rules());
-        assert!(!m3.iter().any(|(f, _)| f == "create_goal"));
+        assert!(m3.iter().any(|(f, t)| f == "create_goal" && t.is_empty()));
         // 新条目追加
         let custom4 = vec![("custom_tool".to_string(), Some("generic".to_string()))];
         let m4 = merged_tool_alias_rules(Some(custom4));
         assert!(m4.iter().any(|(f, t)| f == "custom_tool" && t == "generic"));
         assert_eq!(m4.len(), default_tool_alias_rules().len() + 1);
+    }
+
+    /// 停用语义防通配穿透（issue #195 第二轮审查②）：自定义 to=None 停用精确
+    /// 规则后，前缀通配不得接管该名——原名透传；未停用的同前缀名照常改写
+    #[test]
+    fn tool_alias_disabled_rule_blocks_wildcard_takeover() {
+        let rules = merged_tool_alias_rules(Some(vec![(
+            "acp_cache".to_string(),
+            None,
+        )]));
+        // 合并表：acp_cache 空 to 占位 + acp_* 通配仍在
+        assert!(rules.iter().any(|(f, t)| f == "acp_cache" && t.is_empty()));
+        assert!(rules.iter().any(|(f, _)| f == "acp_*"));
+        let body = json!({"tools": [
+            {"function": {"name": "acp_cache"}},
+            {"function": {"name": "acp_extra"}}
+        ]});
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse = apply_tool_alias_forward(&mut buf, &rules).expect("未停用名应改写");
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            v["tools"][0]["function"]["name"],
+            json!("acp_cache"),
+            "被停用的精确名应原名透传，不被通配接管"
+        );
+        assert_eq!(
+            v["tools"][1]["function"]["name"],
+            json!("tool_extra"),
+            "未停用的同前缀名照常通配改写"
+        );
+        assert!(!reverse.contains_key("acp_cache"));
+        assert_eq!(
+            reverse.get("tool_extra").map(String::as_str),
+            Some("acp_extra")
+        );
+    }
+
+    /// 冲突回滚 freed（issue #195 第二轮审查⑤）：通配改写被同别名冲突裁决否决
+    /// 后，该原名仍存活——后续通配生成名与该存活名碰撞时必须跳过（否则上游
+    /// 收到重复工具名 + 逆映射错改真实工具调用）
+    #[test]
+    fn tool_alias_wildcard_conflict_rolls_back_freed() {
+        // acp_x_a 与 acp_a 经两条通配映射到同一别名 tool_a：后者冲突被否决
+        let rules = vec![
+            ("acp_x_*".to_string(), "tool_".to_string()),
+            ("acp_*".to_string(), "tool_".to_string()),
+            ("y_*".to_string(), "acp_".to_string()),
+        ];
+        let body = json!({"tools": [
+            {"function": {"name": "acp_x_a"}},
+            {"function": {"name": "acp_a"}},
+            {"function": {"name": "y_a"}}
+        ]});
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse = apply_tool_alias_forward(&mut buf, &rules).expect("首个改写应生效");
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("tool_a"));
+        // acp_a 冲突被否决：原名透传，且不污染 freed
+        assert_eq!(v["tools"][1]["function"]["name"], json!("acp_a"));
+        // y_a 的通配生成名 acp_a 与存活真实名碰撞：必须跳过（freed 未被污染）
+        assert_eq!(
+            v["tools"][2]["function"]["name"],
+            json!("y_a"),
+            "冲突否决的原名仍存活，后续通配不得接管"
+        );
+        assert_eq!(reverse.get("tool_a").map(String::as_str), Some("acp_x_a"));
+        assert!(!reverse.contains_key("acp_a"), "存活真实名不得入逆映射");
+    }
+
+    #[test]
+    fn tool_alias_exact_chain_collision_rechecked_after_rollback() {
+        // 精确链式场景（issue #195 第三轮审查①）：c1→x 接受后，a1→x 冲突否决
+        // 并回滚 freed；b1→a1 的别名命中仍存活的 a1——改写期必须复查（过滤期
+        // freed 快照已失效），否则上游出现重复工具名 a1，且逆映射 a1→b1 会把
+        // 响应侧真实 a1 调用错改为 b1（静默错工具执行）
+        let rules = vec![
+            ("c1".to_string(), "x".to_string()),
+            ("a1".to_string(), "x".to_string()),
+            ("b1".to_string(), "a1".to_string()),
+        ];
+        let body = json!({"tools": [
+            {"function": {"name": "c1"}},
+            {"function": {"name": "a1"}},
+            {"function": {"name": "b1"}}
+        ]});
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse = apply_tool_alias_forward(&mut buf, &rules).expect("首个改写应生效");
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("x"));
+        // a1 同别名冲突被否决：原名透传
+        assert_eq!(v["tools"][1]["function"]["name"], json!("a1"));
+        // b1→a1 命中存活真实名：改写期复查必须拦下（回滚后的 freed 不再保护 a1）
+        assert_eq!(
+            v["tools"][2]["function"]["name"],
+            json!("b1"),
+            "别名命中存活真实名 a1，不得改写"
+        );
+        assert_eq!(reverse.get("x").map(String::as_str), Some("c1"));
+        assert!(!reverse.contains_key("a1"), "存活真实名不得入逆映射");
+    }
+
+    #[test]
+    fn tool_alias_identity_rewrite_skipped() {
+        // 恒等别名零语义改写（issue #195 第三轮审查②）：精确 to==from 与通配
+        // 生成名==原名一律跳过——不产生 reverse 恒等项（保守性否决后续合法
+        // 改写）+ 命中流水噪音 + renamed 误报；精确恒等不下沉通配（精确优先
+        // 语义下恒等 = 原名透传，与停用名同款口径）
+        let rules = vec![
+            ("a1".to_string(), "a1".to_string()),  // 精确恒等：存活名，过滤期整条跳过
+            ("z1".to_string(), "z1".to_string()), // 精确恒等：仅历史轮引用（不在 tools）
+            ("x_*".to_string(), "x_".to_string()), // 通配恒等：生成名==原名
+            ("b1".to_string(), "c1".to_string()),
+        ];
+        let body = json!({
+            "tools": [{"function": {"name": "a1"}}, {"function": {"name": "b1"}}],
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "t1", "function_call": {"name": "x_a", "arguments": "{}"}},
+                    {"id": "t2", "function": {"name": "z1"}}
+                ]}
+            ]
+        });
+        let mut buf = serde_json::to_vec(&body).unwrap();
+        let reverse = apply_tool_alias_forward(&mut buf, &rules).expect("b1→c1 应生效");
+        let v: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], json!("a1"));
+        assert_eq!(v["tools"][1]["function"]["name"], json!("c1"));
+        assert_eq!(
+            v["messages"][0]["tool_calls"][0]["function_call"]["name"],
+            json!("x_a"),
+            "通配生成名等于原名：恒等跳过不改写"
+        );
+        assert_eq!(
+            v["messages"][0]["tool_calls"][1]["function"]["name"],
+            json!("z1"),
+            "精确恒等：原名透传且不下沉通配"
+        );
+        assert_eq!(reverse.get("c1").map(String::as_str), Some("b1"));
+        assert!(!reverse.iter().any(|(a, o)| a == o), "逆映射不得含恒等项");
     }
 }
