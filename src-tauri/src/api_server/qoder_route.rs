@@ -664,7 +664,10 @@ fn translate_race_lines(
 
 // ==================== 流式入口 ====================
 
-/// Qoder 流式对话（routes.rs 各协议端点 TargetPool::Qoder 分支调用）
+/// Qoder 流式对话（routes.rs 各协议端点 TargetPool::Qoder 分支调用）。
+/// `encoded`：Responses 命名空间工具名集合——qoder 自身出站不消费，但耗尽移交
+/// 回 wb（Responses 协议）时必须透传（审查修复 H-1：qoder 经 wb 移交在 Responses
+/// 下可达，空集会让二次移交后的工具还原静默丢失）。非 Responses 入口恒传空集。
 pub fn qoder_stream_chat(
     state: Arc<ApiSharedState>,
     body_vec: Vec<u8>,
@@ -673,6 +676,8 @@ pub fn qoder_stream_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    fallback: Vec<super::dispatch::PoolCandidate>,
+    encoded: std::collections::HashSet<String>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -711,7 +716,7 @@ pub fn qoder_stream_chat(
             });
         }
 
-        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
+        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &fallback, &encoded);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -724,7 +729,32 @@ pub fn qoder_stream_chat(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_qoder_stream(
+/// F-81：跨池移交尝试（流式两处耗尽收尾共用）。成功 = 剩余流已移交下一池
+///（调用方直接 return，不再发错误帧）；链空/客户端断连/全不支持 → false。
+/// `encoded` 透传（审查修复 H-1）：耗尽移交回 wb（Responses）时保命名空间还原。
+#[allow(clippy::too_many_arguments)]
+fn try_cross_pool(
+    state: &Arc<ApiSharedState>,
+    fallback: &[super::dispatch::PoolCandidate],
+    body_vec: &[u8],
+    proto: Protocol,
+    key_id: &str,
+    chat_id: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    guard: InflightGuard,
+    start_ts: Instant,
+    encoded: &std::collections::HashSet<String>,
+) -> bool {
+    if fallback.is_empty() || tx.is_closed() {
+        return false;
+    }
+    super::cross_pool::continue_stream_on_next_pool(
+        state, "qoder", fallback, body_vec, proto, key_id, chat_id, tx, guard,
+        encoded, start_ts,
+    )
+}
+
+pub(crate) fn run_qoder_stream(
     state: &Arc<ApiSharedState>,
     body_vec: &[u8],
     model: &str,
@@ -734,6 +764,8 @@ fn run_qoder_stream(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     start_ts: Instant,
     mut guard: InflightGuard,
+    fallback: &[super::dispatch::PoolCandidate],
+    encoded: &std::collections::HashSet<String>,
 ) {
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
@@ -917,7 +949,7 @@ fn run_qoder_stream(
         // 分支取号失败路径统一拼装，tried 非空保证healthy 统计口径正确）
         if !tried.is_empty() && Instant::now() > rotate_deadline {
             let duration_ms = start_ts.elapsed().as_millis() as u64;
-            state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
+            // 审查修复（A-M1）：耗尽用量行挪到跨池移交之后（同 wb_route 口径）
             let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
             let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
             let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message_with_transport_cut(
@@ -950,6 +982,12 @@ fn run_qoder_stream(
                     cut_hits,
                 ));
             }
+            // F-81 跨池移交：链非空 → 下一池接管剩余流（移交成功不落本池用量行；
+            // 503 日志行保留原位=本池尝试的排障归因，wb_route 同口径）
+            if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, start_ts, encoded) {
+                return;
+            }
+            state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
             // 审查修复（M）：错误帧按客户端协议分流（对齐下方取号耗尽收尾
             // send_stream_error 口径）——Anthropic 客户端收 event: error、
             // Responses 收 response.failed，不再硬编码 OpenAI data: 帧形态
@@ -971,7 +1009,7 @@ fn run_qoder_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
+                    // 审查修复（A-M1）：耗尽用量行挪到跨池移交之后（同 wb_route 口径）
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示打开
                     // Qoder 客户端重建设备信任），否则维持无健康账号文案；
@@ -1003,6 +1041,11 @@ fn run_qoder_stream(
                             cut_hits,
                         ));
                     }
+                    // F-81 跨池移交：链非空 → 下一池接管剩余流（移交成功不落本池用量行）
+                    if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, start_ts, encoded) {
+                        return;
+                    }
+                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
                     // 审查 P1-1：无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
                     // 各自形态，helper 内已含收尾帧），不再硬编码 OpenAI 格式。
                     // 审查 #8：message 改传 exhaust_msg（对齐 routes.rs Trae 流式收尾

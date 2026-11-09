@@ -10,9 +10,9 @@ use crate::state::AppState;
 
 use super::cli::{load_cli_rotate_state, save_cli_rotate_state};
 use super::common::{
-    account_id_of, as_str, as_ts_seconds, auth_file_path_of, extract_access_token, is_running,
-    load_pool, save_pool, snapshot_json_path, upsert_token_store, wb_data_dir, wb_renew_locks,
-    WorkBuddyAccount, WbPool,
+    account_id_of, as_str, as_ts_seconds, auth_file_path_of, extract_access_token_with_hint,
+    is_running, load_pool, save_pool, snapshot_json_path, upsert_token_store, wb_data_dir,
+    wb_renew_locks, WorkBuddyAccount, WbPool,
 };
 
 // ── 数据结构 ────────────────────────────────────────────────────────────────
@@ -359,6 +359,23 @@ pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_
     Ok(())
 }
 
+/// issue #198 可观测：$wbEncrypted 解密未全清时落 app_log（密钥/凭证零输出，仅计数与原因）
+fn log_atrest_if_imperfect(state: &AppState, atrest: &crate::workbuddy_atrest::DecryptStats) {
+    if atrest.all_clear() {
+        return;
+    }
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "auth 文件 $wbEncrypted 解密未全清: 成功{} 失败{} asym不支持{} 最近原因: {}",
+            atrest.decrypted,
+            atrest.failed,
+            atrest.unsupported_asym,
+            atrest.last_error.as_deref().unwrap_or("-")
+        ),
+    );
+}
+
 /// 扫描本机 auth 文件（F-04 导入预览；不写盘）
 #[tauri::command(async)]
 pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBuddyScanResult>, String> {
@@ -366,13 +383,17 @@ pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBud
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs_utils::read_json::<serde_json::Value>(&path);
+    let mut raw = fs_utils::read_json::<serde_json::Value>(&path);
     if !raw.is_object() {
         return Err("auth 文件格式无法识别（JSON 解析失败）".into());
     }
+    // issue #198：客户端升级后敏感字段为 $wbEncrypted 加密包裹——先原位解密
+    //（旧明文格式零改动空操作）；uid 明文不受影响，解密失败不阻断后续分类报错
+    let atrest = crate::workbuddy_atrest::decrypt_auth_file_fields(&mut raw);
+    log_atrest_if_imperfect(&state, &atrest);
     // token 键对齐 tasks 侧 creds_of 超集（wb_common.rs）：含通用 `token`；
     // 失败分类报错（issue #58）：null/空串 → 未登录提示，键不存在 → 结构变更 + 键名诊断
-    let access = extract_access_token(&raw)?;
+    let access = extract_access_token_with_hint(&raw, atrest.last_error.as_deref())?;
     let id = account_id_of(&access);
     let uid = as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default();
     let pool = load_pool(&state);
@@ -566,9 +587,12 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
     if !path.exists() {
         return Err("未找到 auth 文件，请先在 WorkBuddy 客户端登录".into());
     }
-    let raw = fs_utils::read_json::<serde_json::Value>(&path);
+    let mut raw = fs_utils::read_json::<serde_json::Value>(&path);
+    // issue #198：$wbEncrypted 字段级加密原位解密（与 scan 同口径，旧明文空操作）
+    let atrest = crate::workbuddy_atrest::decrypt_auth_file_fields(&mut raw);
+    log_atrest_if_imperfect(&state, &atrest);
     // token 键对齐 creds_of 超集 + 失败分类报错（issue #58，与 scan 同口径）
-    let access = extract_access_token(&raw)?;
+    let access = extract_access_token_with_hint(&raw, atrest.last_error.as_deref())?;
     // §4.7 兼容窗口：CN 池不收国际凭证——auth 文件来自国际版客户端时直接拒绝，
     // 国际账号统一走 BuddyAi 页导入（buddy-ai 独立池），防混居复发（迁移仅一次性兜底）
     let auth_domain = as_str(fs_utils::dig(&raw, &["domain"]));
@@ -694,7 +718,12 @@ pub fn workbuddy_refresh_token(
         as_ts_seconds(fs_utils::dig(&rec, &["refresh_expires_at_ms", "refreshExpiresAt", "refresh_expires_at"]))
             .or_else(|| as_ts_seconds(fs_utils::dig(&rec, &["expires_at_ms"]))),
     );
-    let auth_raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(&state));
+    let mut auth_raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(&state));
+    // issue #198：新格式 auth 文件 refreshToken 为 $wbEncrypted 包裹——续期是用户
+    // 显式操作，探针解密数秒可接受；uid 为明文，下方匹配门卫语义不变。
+    // （tasks 侧 effective_creds 热路径有意不接解密：探针不可入高频链，401 自愈兜底）
+    let atrest = crate::workbuddy_atrest::decrypt_auth_file_fields(&mut auth_raw);
+    log_atrest_if_imperfect(&state, &atrest);
     let auth_cand = {
         let fuid = as_str(fs_utils::dig(&auth_raw, &["uid"]));
         if fuid.as_deref() == Some(acct.uid.as_str()) && !acct.uid.is_empty() {
@@ -723,8 +752,23 @@ pub fn workbuddy_refresh_token(
             (None, None) => None,
         }
     };
-    let refresh = pick_newer(&store_cand, &auth_cand)
-        .ok_or("该账号无 refreshToken（不可刷新，需重新登录）")?;
+    let refresh = pick_newer(&store_cand, &auth_cand).ok_or_else(|| {
+        // issue #198 口径拉齐：auth 源 refreshToken 仍为 $wbEncrypted 包裹（解密失败）
+        // 且 store 副本亦无值时，报「需重新登录」会误导——重登录后 auth 文件仍是加密
+        // 形态。附解密失败原因，与 scan/import 的包裹感知报错（common.rs）同口径
+        let rt_wrapper = fs_utils::dig(&auth_raw, &["refreshToken"])
+            .map(crate::workbuddy_atrest::is_encrypted_wrapper)
+            .unwrap_or(false);
+        if rt_wrapper {
+            format!(
+                "该账号无 refreshToken（不可刷新）：auth 文件 refreshToken 为客户端字段级加密形态（$wbEncrypted）\
+                 且自动解密未成功（{}），工具侧亦无副本；请确认本机已安装 WorkBuddy / CodeBuddy 桌面客户端后重试",
+                atrest.last_error.as_deref().unwrap_or("原因未知")
+            )
+        } else {
+            "该账号无 refreshToken（不可刷新，需重新登录）".to_string()
+        }
+    })?;
     if refresh.is_empty() {
         return Err("该账号 refreshToken 为空（不可刷新，需重新登录）".into());
     }
@@ -1082,11 +1126,12 @@ pub fn workbuddy_accounts_import(
 #[cfg(test)]
 mod tests {
     use super::{
-        as_str, as_ts_seconds, extract_access_token, is_intl_credential, lazy_renew_skippable,
-        merge_auth_entry, AuthMerge, WorkBuddyAccount, WbPool,
+        as_str, as_ts_seconds, extract_access_token_with_hint, is_intl_credential,
+        lazy_renew_skippable, merge_auth_entry, AuthMerge, WorkBuddyAccount, WbPool,
     };
-    // auth_key_names 仅测试直用（非测试代码已改经 extract_access_token 间接引用）
-    use super::super::common::auth_key_names;
+    // auth_key_names / extract_access_token 仅测试直用（非测试代码已改经
+    // extract_access_token_with_hint 间接引用）
+    use super::super::common::{auth_key_names, extract_access_token};
     use crate::fs_utils;
 
     fn entry(id: &str, uid: &str, nickname: &str) -> WorkBuddyAccount {
@@ -1306,6 +1351,63 @@ mod tests {
         let err = extract_access_token(&raw).unwrap_err();
         assert!(err.contains("结构可能已变更"), "{err}");
         assert!(err.contains("foo（number）"), "{err}");
+    }
+
+    // ── $wbEncrypted 字段级加密（issue #198）────────────────────────────────
+
+    /// 与客户端 seal 同构的测试封装（AES-256-GCM + field framing AAD）
+    fn seal_wrapper_for_test(key: &[u8], plaintext: &str) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let kid = Sha256::digest(key)[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        crate::workbuddy_atrest::seal_wrapper_export_for_test(key, &kid, plaintext)
+    }
+
+    /// 端到端（issue #198）：升级后新格式 auth 文件——uid 明文、token 加密包裹——
+    /// 解密原位还原后 extract_access_token 正常提取
+    #[test]
+    fn encrypted_auth_file_decrypt_then_extract_access_token() {
+        use crate::workbuddy_atrest::decrypt_with_keys_for_test;
+        use std::collections::HashMap;
+        let key = [0x5au8; 32];
+        let kid = {
+            use sha2::{Digest, Sha256};
+            let h = Sha256::digest(&key);
+            h[..8].iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let mut raw = serde_json::json!({
+            "uid": "cf1473ce-a60e-4f7c-a9aa-b4e19480d90e",
+            "auth": {
+                "accessToken": crate::workbuddy_atrest::seal_wrapper_export_for_test(&key, &kid, "eyJx.198.sig"),
+                "refreshToken": crate::workbuddy_atrest::seal_wrapper_export_for_test(&key, &kid, "rt-198"),
+            },
+        });
+        let keys = HashMap::from([(kid, key.to_vec())]);
+        let stats = decrypt_with_keys_for_test(&mut raw, &keys);
+        assert_eq!(stats.decrypted, 2, "{stats:?}");
+        assert!(stats.all_clear());
+        assert_eq!(extract_access_token(&raw).unwrap(), "eyJx.198.sig");
+        assert_eq!(
+            as_str(fs_utils::dig(&raw, &["refreshToken"])),
+            Some("rt-198".into())
+        );
+    }
+
+    /// 解密不可用时（信封未还原），extract_access_token 报「字段级加密」而非「结构变更」
+    #[test]
+    fn encrypted_wrapper_without_decrypt_reports_atrest_error() {
+        use crate::workbuddy_atrest::is_encrypted_wrapper;
+        let key = [0x5au8; 32];
+        let wrapper = seal_wrapper_for_test(&key, "secret");
+        assert!(is_encrypted_wrapper(&wrapper));
+        let raw = serde_json::json!({ "auth": { "accessToken": wrapper } });
+        let err = extract_access_token_with_hint(&raw, Some("探针失败: 客户端未安装")).unwrap_err();
+        assert!(err.contains("$wbEncrypted"), "{err}");
+        assert!(err.contains("字段级加密"), "{err}");
+        assert!(err.contains("探针失败: 客户端未安装"), "{err}");
+        assert!(!err.contains("结构可能已变更"), "{err}");
     }
 
     /// P2 键对齐：通用 `token` 键与 accessTokenExpiresAtMs 经 dig 可命中（原键列表会漏），

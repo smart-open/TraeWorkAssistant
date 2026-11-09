@@ -279,6 +279,8 @@ export interface DiscoveredAccount {
   /** true = 仅经某账号 JWT 的 data.id 命中（该账号 user_id 与本 uid 不一致） */
   matched_via_jwt?: boolean;
   storage_path: string;
+  /** F-70：tc 凭证直读是否成功（false = 需回退 MITM 抓包路径获取凭证） */
+  tc_decrypted?: boolean;
 }
 
 // ---- Trae 会员/套餐信息 ----
@@ -417,6 +419,8 @@ export interface Settings {
   api_default_model: string;
   /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
   buddy_switch_migrate_chats: boolean;
+  /** F-86（issue #175）：静默自动更新——每 2 小时后台检查，空闲时自动下载安装并重启（默认关） */
+  auto_update_silent: boolean;
   /** issue #82 T6.1：会话明细显示首条消息概述（默认开；关闭仅隐藏 UI 展示，不删存量缓存） */
   sessions_preview_enabled: boolean;
   /** Qoder CN IDE 桌面版 exe 手动路径（环境配置页；默认 %LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe） */
@@ -627,6 +631,50 @@ export interface CreditsDailySnapshot {
   accounts?: Record<string, number>;
 }
 
+/** F-84：网关单条请求的结构化视图（由当日文本日志行解析） */
+export interface ApiLogEntry {
+  /** 日志文件日期（YYYY-MM-DD） */
+  date: string;
+  /** 行首时间（HH:MM:SS） */
+  time: string;
+  method: string;
+  path: string;
+  /** 网关 API Key 展示名（匿名 = "-"） */
+  keyName: string;
+  /** 实际服务池（trae/buddy/buddy-ai/qoder/custom；调度早退行 = "-"） */
+  pool: string;
+  model: string;
+  /** 实际服务账号名（未取号 = "-"） */
+  acct: string;
+  /** 上游账号 uid 前 12 位 */
+  uid: string;
+  stream: boolean;
+  status: number;
+  durationMs: number;
+  /** TTFT（首字延迟，仅流式成功路径记录） */
+  ttfbMs?: number | null;
+  /** custom 池阶段标记 */
+  stage?: string | null;
+  /** 失败原因（落行管线既有脱敏口径） */
+  error?: string | null;
+}
+
+/** F-84：结构化「最近请求」分页结果 */
+export interface ApiLogRecentResult {
+  rows: ApiLogEntry[];
+  total: number;
+  /** true = 达到后端单次解析行数上限，total 仅统计已扫部分 */
+  truncated: boolean;
+}
+
+/** F-86：无人值守更新编排单轮结果 */
+export interface UpdateAutoTickResult {
+  /** skipped_cli / skipped_disabled / busy / busy_gateway / no_update / error / installed */
+  action: string;
+  detail: string;
+}
+
+/** 网关外的设备代理日志（与 api_logger 无关） */
 export interface ProxyLogEntry {
   id: string;
   timestamp: string;

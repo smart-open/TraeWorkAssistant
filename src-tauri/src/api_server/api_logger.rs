@@ -12,7 +12,8 @@ use chrono::{Datelike, Local, Timelike};
 /// 写入异步化（网关性能批次 B）：`log_request` / `log_sched_event` / `log_debug`
 /// 仅将格式化后的行推入内存队列（µs 级、零磁盘 IO），由专用写入线程
 /// 每 100ms（或被唤醒时）批量落盘。读路径（read_log/search_log/list_dates）
-/// 先同步排空队列再读文件，保证「写后读」一致（测试与 UI 依赖此语义）。
+/// 先同步排空**本实例**队列再读文件——查询经 for_query 实例发起（无写入队列），
+/// 「写后读一致」相对运行时实例存在 100ms 落盘间隔迟滞，UI 有手动刷新兜底。
 pub struct ApiLogger {
     dir: PathBuf,
     /// 队列 + 文件句柄同锁互斥（写入线程与读路径排空共用一把锁，保证一致）
@@ -58,6 +59,19 @@ impl ApiLogger {
         Self { dir, state, cv, sync_mode }
     }
 
+    /// 查询/列表专用实例（审查 P4 修复）：不 spawn flusher 线程——查询命令每次
+    /// `new` 会各泄漏一个常驻线程（api_logs_recent 分页翻页放大）。查询实例无
+    /// 写入，flush_pending 空转无害；读取内容为运行时实例已落盘部分。
+    pub fn for_query(dir: PathBuf) -> Self {
+        fs::create_dir_all(&dir).ok();
+        Self {
+            dir,
+            state: Arc::new(Mutex::new(LoggerState::new())),
+            cv: Arc::new(Condvar::new()),
+            sync_mode: true,
+        }
+    }
+
     fn today_filename() -> String {
         // 使用 chrono 本地时间获取精确日期
         let now = Local::now();
@@ -71,9 +85,20 @@ impl ApiLogger {
         (t.hour(), t.minute(), t.second())
     }
 
-    /// 入队一条日志（异步化热路径：仅内存操作，磁盘 IO 由写入线程承担）
+    /// 入队一条日志（异步化热路径：仅内存操作，磁盘 IO 由写入线程承担）。
+    /// 审查修复（B-M3）：队列带上限——「写入持续慢但成功」（慢盘/杀毒扫描/网络盘）
+    /// 场景下无背压会无界增长；满时丢最旧行（日志尾部保真优先），丢行仅 stderr
+    /// 观测一次（首次触发提示，不逐行刷屏——日志丢了观测行再进同队列无意义）
     fn enqueue(&self, line: String) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.queue.len() >= MAX_QUEUE_LINES {
+            st.queue.pop_front();
+            if !QUEUE_OVERFLOW_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[api_logger] 落盘速率持续低于写入速率，队列已满（{MAX_QUEUE_LINES} 行），丢弃最旧行"
+                );
+            }
+        }
         st.queue.push_back(line);
         if self.sync_mode {
             // 写入线程不可用：持锁直写（与读路径同锁，语义一致）
@@ -195,17 +220,21 @@ impl ApiLogger {
             None => String::new(),
         };
         let err_part = match error {
-            Some(e) => format!(" error={}", e),
+            Some(e) => format!(" error={}", sanitize_log_value(e)),
             None => String::new(),
         };
         // 空名称（匿名 Key / 无可用账号）统一显示 "-"，保持字段可检索
-        let key_disp = if key_name.is_empty() { "-" } else { key_name };
-        let acct_disp = if acct_name.is_empty() { "-" } else { acct_name };
+        // 审查修复（B-M3）：用户可控值（Key 名/账号名/模型名/错误消息）经 token
+        // 清洗——值内若含 " key=" 等解析锚，parse_log_line 首现定位会落在值内部
+        // 造成字段错位甚至整行从「最近请求」静默消失
+        let key_disp = sanitize_log_value(if key_name.is_empty() { "-" } else { key_name });
+        let acct_disp = sanitize_log_value(if acct_name.is_empty() { "-" } else { acct_name });
+        let model_disp = sanitize_log_value(model);
 
         let line = format!(
             "[{:02}:{:02}:{:02}] {} {} key={} pool={} model={} acct={} uid={} stream={} status={} {}ms{}{}{}\n",
             h, m, s,
-            method, path, key_disp, pool, model, acct_disp, uid_short, stream, status, duration_ms, ttfb_part, stage_part, err_part,
+            method, path, key_disp, pool, model_disp, acct_disp, uid_short, stream, status, duration_ms, ttfb_part, stage_part, err_part,
         );
 
         self.enqueue(line);
@@ -285,12 +314,13 @@ impl ApiLogger {
 
     /// 读取指定日期的日志文件内容（按时间倒序排列）
     pub fn read_log(&self, date: &str) -> Option<String> {
-        self.flush_pending();
-        // 审查 P2-7：date 白名单校验后才拼进文件路径，防路径注入；
-        // 不合法按「无日志」处理
+        // 安全收口（docker/macos 审查项）：date 直接拼文件路径，未校验的
+        // `../../x` 输入可穿越读任意 .log 文件。单点前置校验（search_log 委托
+        // 本函数自动覆盖）；合法日期零行为变化。
         if !Self::is_valid_log_date(date) {
             return None;
         }
+        self.flush_pending();
         let path = self.dir.join(format!("api_{}.log", date));
         match fs::read(&path) {
             Ok(bytes) => {
@@ -415,7 +445,12 @@ impl ApiLogger {
                 // 匹配 api_YYYY-MM-DD.log
                 if name.starts_with("api_") && name.ends_with(".log") {
                     let date = &name[4..name.len() - 4];
-                    dates.push(date.to_string());
+                    // 与 read_log 的 valid_date 同口径（安全收口配套）：畸形文件名
+                    //（如手动备份 api_备份.log）不入列表——否则前端出现可点但
+                    // 恒无内容的死条目，非 ASCII 名倒序后还会抢占默认选中
+                    if valid_date(date) {
+                        dates.push(date.to_string());
+                    }
                 }
             }
         }
@@ -424,6 +459,284 @@ impl ApiLogger {
         dates.truncate(max);
         dates
     }
+
+    /// F-84：结构化「最近请求」查询——解析最近 N 天请求行为条目（新→旧），分页 + 池/结果筛选。
+    /// 复用文本日志为唯一事实源（零格式变更、零 DDL）；SCHED/DEBUG 块与不可解析行跳过。
+    pub fn recent_entries(
+        &self,
+        days: u32,
+        page: u32,
+        page_size: u32,
+        pool: Option<&str>,
+        result: Option<&str>,
+    ) -> ApiLogRecentResult {
+        self.flush_pending();
+        let days = days.clamp(1, 30) as usize;
+        // 审查修复（L，严格筛选前置，三审查 B-L4）：result 仅接受 "ok"/"fail"，
+        // 未知值返回空集——防调用方拼写错误被静默吞掉显示全量（None 仍为不过滤）。
+        // 校验前置到扫描之前，未知值不做任何文件 IO
+        if let Some(r) = result {
+            if r != "ok" && r != "fail" {
+                return ApiLogRecentResult { rows: Vec::new(), total: 0, truncated: false };
+            }
+        }
+        let mut dates = self.list_dates(days);
+        // 审查修复（L，days 语义）：days = 回看自然日窗口而非「最近 N 个文件」——
+        // 应用停用一段时间后仅剩 3 个旧文件时，days=3 会返回 40 天前数据。
+        // 按本地自然日截断窗口（文件名日期 >= today-(days-1)），UI 文案同步成立
+        let cutoff = (Local::now().date_naive()
+            - chrono::Duration::days(days as i64 - 1))
+        .format("%Y-%m-%d")
+        .to_string();
+        dates.retain(|d| d.as_str() >= cutoff.as_str());
+        let mut all: Vec<ApiLogEntry> = Vec::new();
+        let mut truncated = false;
+        let mut scanned_lines = 0usize;
+        let mut scanned_bytes = 0usize;
+        'outer: for d in &dates {
+            // 审查修复（B-M2 残余收口）：全文读入前 metadata 预检——read_log 会
+            // 全量读入 + 倒序重建（峰值内存约为内容 2.5 倍），数 GB 单文件仅靠
+            // 读后检查无法防内存放大。超限文件直接记 truncated 跳过
+            let path = self.dir.join(format!("api_{d}.log"));
+            if let Ok(md) = fs::metadata(&path) {
+                if md.len() > MAX_RECENT_SCAN_BYTES as u64 {
+                    truncated = true;
+                    break 'outer;
+                }
+            }
+            let Some(content) = self.read_log(d) else { continue };
+            scanned_bytes += content.len();
+            if scanned_bytes > MAX_RECENT_SCAN_BYTES {
+                truncated = true;
+                break 'outer;
+            }
+            for line in content.lines() {
+                scanned_lines += 1;
+                if scanned_lines > MAX_RECENT_SCAN_LINES {
+                    truncated = true;
+                    break 'outer;
+                }
+                if all.len() >= MAX_RECENT_PARSE_LINES {
+                    truncated = true;
+                    break 'outer;
+                }
+                if let Some(e) = parse_log_line(line, d) {
+                    all.push(e);
+                }
+            }
+        }
+        // 筛选：pool 精确匹配；result "ok"=2xx / "fail"=其余（未知值已在扫描前拒绝）
+        let filtered: Vec<ApiLogEntry> = all
+            .into_iter()
+            .filter(|e| {
+                if let Some(p) = pool {
+                    if e.pool != p {
+                        return false;
+                    }
+                }
+                match result {
+                    Some("ok") => (200..300).contains(&e.status),
+                    Some("fail") => !(200..300).contains(&e.status),
+                    _ => true,
+                }
+            })
+            .collect();
+        let total = filtered.len();
+        let page_size = page_size.clamp(1, 200) as usize;
+        let page = page.max(1) as usize;
+        let start = (page - 1).saturating_mul(page_size);
+        let rows = filtered.into_iter().skip(start).take(page_size).collect();
+        ApiLogRecentResult { rows, total, truncated }
+    }
+}
+
+// ==================== F-84 结构化请求条目 ====================
+
+/// 单日解析行数保护（防超大日志文件拖慢查询；达到上限 truncated=true，total 为已扫部分计数）
+const MAX_RECENT_PARSE_LINES: usize = 300_000;
+/// 审查修复（B-M2）：扫描面双上限——解析成功条目数只对可解析行计数，DEBUG/畸形
+/// 行密集的超大文件会全量扫描无 CPU/内存保护。行数与字节双闸兜底（truncated 同语义）
+const MAX_RECENT_SCAN_LINES: usize = 800_000;
+const MAX_RECENT_SCAN_BYTES: usize = 256 * 1024 * 1024;
+/// 审查修复（B-M3）：待落盘队列上限（约 10k 行 ≈ 1MB 文本）+ 溢出提示一次性开关
+const MAX_QUEUE_LINES: usize = 10_000;
+static QUEUE_OVERFLOW_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 请求行解析锚全集（与 parse_log_line 的 token 定位一致；含未解析但可能成为
+/// 未来锚的字段分隔符）。含行级排除锚（三审查 B-M1）：parse_log_line 对整行做
+/// `contains("[DEBUG]"/"[SCHED]")` 排除——值内出现此字样同样会让整行从
+/// 「最近请求」静默消失，一并清洗。
+const LOG_PARSE_TOKENS: [&str; 12] = [
+    " key=", " pool=", " model=", " acct=", " uid=",
+    " stream=", " status=", " ttfb=", " stage=", " error=",
+    "[DEBUG]", "[SCHED]",
+];
+
+/// 审查修复（B-M3）：字段值内解析锚转义——用户可控值（Key 展示名/账号名/模型名/
+/// 错误消息）中若含 " key=" 等锚字面量，parse_log_line 首现定位落在值内部导致
+/// 字段错位或整行解析失败（从「最近请求」静默消失）。统一把锚的首空格替换为
+/// 零宽空格（U+200B，行级锚保留原字面仅前插 ZWSP）：解析不再误锚、真分隔符
+/// 不受影响；ZWSP 不可见，显示基本无差。
+fn sanitize_log_value(v: &str) -> String {
+    let mut s = v.to_string();
+    for t in LOG_PARSE_TOKENS {
+        if s.contains(t) {
+            s = s.replace(t, &format!("\u{200b}{}", t.trim_start()));
+        }
+    }
+    s
+}
+
+/// F-84：网关单条请求的结构化视图（由当日文本日志行解析，最新在前分页返回）
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiLogEntry {
+    /// 日志文件日期（YYYY-MM-DD）
+    pub date: String,
+    /// 行首时间（HH:MM:SS）
+    pub time: String,
+    pub method: String,
+    pub path: String,
+    /// 网关 API Key 展示名（匿名 = "-"）
+    pub key_name: String,
+    /// 实际服务池（trae/buddy/buddy-ai/qoder/custom；调度早退行 = "-"）
+    pub pool: String,
+    pub model: String,
+    /// 实际服务账号名（未取号 = "-"）
+    pub acct: String,
+    /// 上游账号 uid 前 12 位
+    pub uid: String,
+    pub stream: bool,
+    pub status: u16,
+    pub duration_ms: u64,
+    /// TTFT（首字延迟，仅流式成功路径记录）
+    pub ttfb_ms: Option<u64>,
+    /// custom 池阶段标记
+    pub stage: Option<String>,
+    /// 失败原因（既有管线脱敏口径，原样透出）
+    pub error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiLogRecentResult {
+    pub rows: Vec<ApiLogEntry>,
+    pub total: usize,
+    /// true = 达到单次解析行数上限，total 仅统计已扫部分
+    pub truncated: bool,
+}
+
+/// 行内已知 `字段=` token（按落行顺序；key/acct/model 值可含空格，靠相邻 token 定界）
+const PARSE_TOKENS: [&str; 8] = [
+    " key=", " pool=", " model=", " acct=", " uid=", " stream=", " status=", " error=",
+];
+
+/// F-84：解析单行请求日志为结构化条目。非请求行（[SCHED]/[DEBUG] 块正文/不可解析）返回 None。
+/// 宽容语义：任一必备字段缺失或类型不符 → None（跳过该行，不中断）。
+pub fn parse_log_line(line: &str, date: &str) -> Option<ApiLogEntry> {
+    let t = line.trim();
+    if !t.starts_with('[') || t.contains("[SCHED]") || t.contains("[DEBUG]") {
+        return None;
+    }
+    // [HH:MM:SS] 前缀
+    let close = t.find(']')?;
+    let time = &t[1..close];
+    if time.len() != 8 || time.as_bytes()[2] != b':' || time.as_bytes()[5] != b':' {
+        return None;
+    }
+    if !time.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+        return None;
+    }
+    let rest = t[close + 1..].trim_start();
+
+    // 定位各 token 位置（首次出现；error= 之后的文本可能含其他 token 字样，
+    // 因此先找 error= 的位置并将其后的 token 搜索截止）
+    let err_tok = rest.find(" error=");
+    let search_end = err_tok.unwrap_or(rest.len());
+    let mut positions: Vec<(usize, usize)> = Vec::new(); // (token 序号, 字节位置)
+    for (i, tok) in PARSE_TOKENS.iter().enumerate() {
+        if *tok == " error=" {
+            continue;
+        }
+        let hay = &rest[..search_end];
+        let pos = hay.find(tok)?;
+        positions.push((i, pos));
+    }
+    positions.sort_by_key(|(_, p)| *p);
+    if positions.len() != 7 {
+        return None;
+    }
+
+    // 首段 = "METHOD /path"
+    let first_tok_pos = positions[0].1;
+    let head = rest[..first_tok_pos].trim();
+    let (method, path) = head.split_once(' ')?;
+    if method.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+
+    // 逐 token 提值：值域 = 本 token 值起点 → 下一 token 位置（error 取到行尾）
+    let get_value = |idx: usize| -> Option<String> {
+        let (tok_i, pos) = positions.iter().find(|(i, _)| *i == idx)?;
+        let vs = pos + PARSE_TOKENS[*tok_i].len();
+        let ve = positions
+            .iter()
+            .filter(|(_, p)| *p > *pos)
+            .map(|(_, p)| *p)
+            .min()
+            .unwrap_or(search_end);
+        Some(rest[vs..ve].trim().to_string())
+    };
+
+    let key_name = get_value(0)?;
+    let pool = get_value(1)?;
+    let model = get_value(2)?;
+    let acct = get_value(3)?;
+    let uid = get_value(4)?;
+    let stream = match get_value(5)?.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    // status 段原始值域为 "200 43765ms"（duration 紧随 status，均以空格分隔）
+    let status_pos = positions.iter().find(|(i, _)| *i == 6)?.1;
+    let tail_raw = &rest[status_pos + PARSE_TOKENS[6].len()..search_end];
+    let mut seg_parts = tail_raw.split_whitespace();
+    let status: u16 = seg_parts.next()?.parse().ok()?;
+    let duration_ms: u64 = seg_parts
+        .find_map(|p| p.strip_suffix("ms").and_then(|n| n.parse().ok()))?;
+    // error 取到行尾（可能含空格与 token 字样）
+    let error = err_tok.map(|p| rest[p + " error=".len()..].trim().to_string());
+    // ttfb/stage 在 status 段之后的剩余文本里找
+    let ttfb_ms = tail_raw
+        .split(" ttfb=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.strip_suffix("ms"))
+        .and_then(|n| n.parse().ok());
+    let stage = tail_raw
+        .split(" stage=")
+        .nth(1)
+        .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
+        .filter(|s| !s.is_empty());
+
+    Some(ApiLogEntry {
+        date: date.to_string(),
+        time: time.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+        key_name,
+        pool,
+        model,
+        acct,
+        uid,
+        stream,
+        status,
+        duration_ms,
+        ttfb_ms,
+        stage,
+        error,
+    })
 }
 
 // ==================== 写入线程与批量落盘 ====================
@@ -485,6 +798,10 @@ fn write_locked(st: &mut LoggerState, dir: &PathBuf) {
     while let Some(line) = st.queue.pop_front() {
         if f.write_all(line.as_bytes()).is_err() {
             st.file = None; // 句柄失效，下次重开
+            // 审查修复（B-L1）：写失败时已弹出的该行既未写出也未回队，原静默
+            // 丢失与「打开失败无痕丢批」修复口径不一致——补 stderr 观测
+            //（不落 app_log：app_log 自身走本队列，写失败时会造成递归噪音）
+            eprintln!("[api_logger] 日志行写盘失败，该行丢失（句柄失效下次重开）");
             return;
         }
     }
@@ -607,6 +924,13 @@ fn reverse_log_blocks(content: &str) -> String {
     blocks.join("\n")
 }
 
+/// 日期字面校验（安全收口）：仅接受 `YYYY-MM-DD` 纯数字形态，拒绝任何含
+/// 路径分隔符/非法字符的输入（防 `api_{date}.log` 拼接路径穿越）。
+/// 审查修复（B-L1 去重）：原独立实现与 Self::is_valid_log_date 等价，委托单点防漂移
+fn valid_date(date: &str) -> bool {
+    ApiLogger::is_valid_log_date(date)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,6 +954,178 @@ mod tests {
     fn today() -> String {
         let now = Local::now();
         format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day())
+    }
+
+    /// F-84：完整成功行解析（含 TTFT、中文 Key/账号名、uid 截断）
+    #[test]
+    fn parse_log_line_success_with_ttfb() {
+        let line = "[09:30:01] POST /v2/chat/completions key=测试Key pool=buddy model=glm-5.3 acct=账号A uid=user-123456 stream=true status=200 43765ms ttfb=812ms";
+        let e = parse_log_line(line, "2026-11-08").expect("应解析成功");
+        assert_eq!(e.time, "09:30:01");
+        assert_eq!(e.method, "POST");
+        assert_eq!(e.path, "/v2/chat/completions");
+        assert_eq!(e.key_name, "测试Key");
+        assert_eq!(e.pool, "buddy");
+        assert_eq!(e.model, "glm-5.3");
+        assert_eq!(e.acct, "账号A");
+        assert_eq!(e.uid, "user-123456");
+        assert!(e.stream);
+        assert_eq!(e.status, 200);
+        assert_eq!(e.duration_ms, 43765);
+        assert_eq!(e.ttfb_ms, Some(812));
+        assert!(e.stage.is_none());
+        assert!(e.error.is_none());
+    }
+
+    /// F-84：失败行（stage + error 含空格与 token 字样）与非请求行跳过
+    #[test]
+    fn parse_log_line_failure_and_skips_non_request_lines() {
+        let line = "[22:05:11] POST /v1/messages key=- pool=qoder model=gpt-5 acct=- uid=- stream=false status=503 120ms stage=dispatch error=no healthy account (model=x pool=trae)";
+        let e = parse_log_line(line, "2026-11-08").expect("应解析成功");
+        assert_eq!(e.status, 503);
+        assert_eq!(e.duration_ms, 120);
+        assert_eq!(e.stage.as_deref(), Some("dispatch"));
+        assert_eq!(
+            e.error.as_deref(),
+            Some("no healthy account (model=x pool=trae)")
+        );
+        assert_eq!(e.key_name, "-");
+        assert!(!e.stream);
+
+        for bad in [
+            "[09:00:00] [SCHED] 落池: pool=buddy model=glm-5.3 bind=None fallback_from=None",
+            "[09:00:01] [DEBUG] uid=abc status=200",
+            "--- Request Body (10 bytes, preview 10B) ---",
+            "任意非日志行",
+            "[09:00:02] GET /health",
+        ] {
+            assert!(parse_log_line(bad, "2026-11-08").is_none(), "应跳过: {bad}");
+        }
+    }
+
+    /// F-84：custom 池带 stage 行 + 无 ttfb 聚合行解析
+    #[test]
+    fn parse_log_line_custom_stage_and_aggregate() {
+        let line = "[12:00:00] POST /v1/chat/completions key=k1 pool=custom model=m1 acct=甲 uid=abcdef123456 stream=false status=200 900ms stage=upstream_1";
+        let e = parse_log_line(line, "2026-11-08").expect("应解析成功");
+        assert_eq!(e.stage.as_deref(), Some("upstream_1"));
+        assert_eq!(e.ttfb_ms, None);
+        assert_eq!(e.duration_ms, 900);
+    }
+
+    /// 审查修复（B-M3）：落行侧 token 清洗回归——用户可控值内嵌解析锚时，
+    /// 清洗后落行的解析结果字段不错位、行不丢失；真分隔符不受影响
+    #[test]
+    fn sanitize_log_value_防解析锚错位() {
+        // 恶意 Key 名内嵌 " model=" / " error="：不清洗时 parse 首现定位落在
+        // key 值内部 → model/status 字段错位甚至整行丢弃
+        let raw = "k model=evil error=x";
+        let cleaned = sanitize_log_value(raw);
+        for t in LOG_PARSE_TOKENS {
+            assert!(!cleaned.contains(t), "清洗后不得含锚 {t:?}: {cleaned:?}");
+        }
+        // 模拟清洗后落行：字段解析全部正确
+        let line = format!(
+            "[12:00:00] POST /v1/chat/completions key={} pool=buddy model={} acct=- uid=abcdef123456 stream=false status=200 900ms",
+            cleaned,
+            sanitize_log_value("m error=boom"),
+        );
+        let e = parse_log_line(&line, "2026-11-08").expect("清洗后行应解析成功");
+        assert_eq!(e.key_name, cleaned);
+        assert_eq!(e.pool, "buddy");
+        assert_eq!(e.status, 200);
+        // 不含锚的正常值原样透传（零宽空格零污染）
+        assert_eq!(sanitize_log_value("普通名称-abc_123"), "普通名称-abc_123");
+    }
+
+    /// 安全收口（docker/macos 审查项）：read_log 对非法 date 一律 None，
+    /// 合法日期正常可读；search_log 委托 read_log 自动覆盖
+    #[test]
+    fn read_log_rejects_non_date_input() {
+        let dir = tmp_dir("traversal");
+        let logger = ApiLogger::new(dir.clone());
+        logger.log_request("buddy", "POST", "/v1/chat/completions", "m", false, 200, "u", 5, "k", "a", None);
+        let today = today();
+        logger.flush_pending();
+
+        // 合法日期可读
+        assert!(logger.read_log(&today).is_some(), "合法日期应正常读取");
+        assert!(logger.search_log(&today, "", "", "").is_some());
+
+        // 穿越与畸形输入一律 None（不落任何文件读取）
+        for bad in [
+            "../../etc/passwd",
+            "..\\..\\x",
+            "2026-08-14/../../secret",
+            "20260814",
+            "2026-8-4",
+            "aaaa-bb-cc",
+            "",
+        ] {
+            assert!(logger.read_log(bad).is_none(), "非法输入应拒绝: {bad:?}");
+            assert!(logger.search_log(bad, "", "", "").is_none(), "search 应拒绝: {bad:?}");
+        }
+    }
+
+    /// 安全收口配套：list_dates 与 read_log 校验同口径——畸形文件名不入日期列表
+    #[test]
+    fn list_dates_filters_malformed_filenames() {
+        let dir = tmp_dir("dates");
+        let logger = ApiLogger::new(dir.clone());
+        logger.log_request("buddy", "POST", "/v1/chat/completions", "m", false, 200, "u", 5, "k", "a", None);
+        let today = today();
+        logger.flush_pending();
+        // 模拟外来畸形文件混入日志目录（用户手动备份等）
+        std::fs::write(dir.join("api_备份.log"), "x").unwrap();
+        std::fs::write(dir.join("api_20260814.log"), "x").unwrap();
+        let dates = logger.list_dates(30);
+        assert!(dates.contains(&today), "合法日期应在列表: {dates:?}");
+        assert!(dates.iter().all(|d| valid_date(d)), "列表不得混入畸形日期: {dates:?}");
+    }
+
+    /// F-84：recent_entries 分页 + result 筛选（写线程异步落盘，用 flush_pending 兜底）
+    #[test]
+    fn recent_entries_pages_and_filters() {
+        let dir = tmp_dir("recent");
+        let logger = ApiLogger::new(dir.clone());
+        for i in 0..7 {
+            logger.log_request(
+                if i % 2 == 0 { "buddy" } else { "trae" },
+                "POST",
+                "/v1/chat/completions",
+                "glm-5.3",
+                false,
+                if i < 5 { 200 } else { 503 },
+                "uid-x",
+                100 + i,
+                "k",
+                "a",
+                if i < 5 { None } else { Some("exhausted") },
+            );
+        }
+        logger.flush_pending();
+        // 全量：7 行，新→旧（后写的在前）
+        let r = logger.recent_entries(3, 1, 50, None, None);
+        assert_eq!(r.total, 7);
+        assert!(!r.truncated);
+        assert_eq!(r.rows.len(), 7);
+        assert_eq!(r.rows[0].duration_ms, 106);
+        assert_eq!(r.rows[6].duration_ms, 100);
+        // 第 2 页（size=3）跨页取值
+        let r2 = logger.recent_entries(3, 2, 3, None, None);
+        assert_eq!(r2.rows.len(), 3);
+        assert_eq!(r2.rows[0].duration_ms, 103);
+        // fail 筛选：仅 2 条 503
+        let rf = logger.recent_entries(3, 1, 50, None, Some("fail"));
+        assert_eq!(rf.total, 2);
+        assert!(rf.rows.iter().all(|e| e.status == 503));
+        // ok 筛选：5 条 200
+        let ro = logger.recent_entries(3, 1, 50, None, Some("ok"));
+        assert_eq!(ro.total, 5);
+        // pool 筛选：buddy = 偶数下标 4 条
+        let rp = logger.recent_entries(3, 1, 50, Some("buddy"), None);
+        assert_eq!(rp.total, 4);
+        let _ = today();
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {

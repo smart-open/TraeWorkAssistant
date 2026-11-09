@@ -1,9 +1,10 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import TitleBar from './components/TitleBar';
 import Sidebar from './components/Sidebar';
 import TopBar from './components/TopBar';
 import Toaster from './components/Toaster';
 import { useAppStore } from './store';
+import { api } from './lib/tauri';
 import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
 import Accounts from './pages/Accounts';
@@ -132,6 +133,38 @@ export default function App() {
     mq.addEventListener('change', apply);
     return () => mq.removeEventListener('change', apply);
   }, [settings?.theme]);
+
+  // F-86（issue #175）：静默自动更新——开关开启时每 2 小时后台检查一轮，
+  // 空闲（网关无在途请求）时自动下载安装并重启；关闭即停表。错误仅落 console
+  //（编排命令网络失败归 error action，不抛 Promise rejection 打扰用户）
+  const needManualNotifiedRef = useRef('');
+  useEffect(() => {
+    if (!settings?.auto_update_silent) return;
+    const tick = () => {
+      api.updater
+        .autoTick()
+        .then((r) => {
+          if (r.action === 'error') console.warn('[auto-update]', r.detail);
+          else if (r.action === 'need_manual') {
+            // macOS：dmg 无免确认安装通道，自动路径止于检查——同版本仅提示一次
+            //（detail 含版本号做去重键），不打扰但保证新版本可感知
+            if (needManualNotifiedRef.current !== r.detail) {
+              needManualNotifiedRef.current = r.detail;
+              useAppStore.getState().pushToast('info', r.detail);
+            }
+          }
+        })
+        .catch((e) => console.warn('[auto-update] tick 失败:', e));
+    };
+    // 审查修复（L）：挂载后 30s 延迟首查（纯 setInterval 首查要等 2h，短会话
+    // 永远不触发检查），避让启动期初始化 IO；之后每 2h 一轮
+    const first = window.setTimeout(tick, 30_000);
+    const id = window.setInterval(tick, 2 * 60 * 60 * 1000);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(id);
+    };
+  }, [settings?.auto_update_silent]);
 
   if (!ready) {
     return (

@@ -51,8 +51,9 @@ fn system_powershell_path() -> Option<std::path::PathBuf> {
 
 /// 构建无窗口 PowerShell 子进程（platform::cmd 收口，Windows 专属；
 /// 绝对路径优先，缺失回退 PATH，两路均带 CREATE_NO_WINDOW）
+/// pub(crate)：供 misc::enable_task_wakeup_settings_inner（计划任务唤醒补跑）复用
 #[cfg(windows)]
-fn powershell_command() -> std::process::Command {
+pub(crate) fn powershell_command() -> std::process::Command {
     match system_powershell_path() {
         Some(exe) => crate::platform::cmd::sys_command_path(&exe),
         None => crate::platform::cmd::sys_command("powershell"),

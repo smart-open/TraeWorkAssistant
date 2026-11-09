@@ -821,6 +821,7 @@ pub fn wb_stream_chat(
     key_id: String,
     guard: InflightGuard,
     ns_encoded: std::collections::HashSet<String>,
+    fallback: Vec<super::dispatch::PoolCandidate>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -867,7 +868,7 @@ pub fn wb_stream_chat(
 
         // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核
         let view = WbView::new(state, buddy_ai);
-        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &ns_encoded);
+        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &ns_encoded, &fallback);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -885,7 +886,7 @@ pub fn wb_stream_chat(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_wb_stream(
+pub(crate) fn run_wb_stream(
     state: &WbView,
     body_vec: &[u8],
     model: &str,
@@ -896,6 +897,7 @@ fn run_wb_stream(
     start_ts: Instant,
     mut guard: InflightGuard,
     ns_encoded: &std::collections::HashSet<String>,
+    fallback: &[super::dispatch::PoolCandidate],
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
@@ -1005,7 +1007,10 @@ fn run_wb_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
+                    // 审查修复（A-M1）：耗尽用量行挪到跨池移交之后落账——移交成功
+                    // 时发起池不落「none」失败行（接收池落终态行），恢复「每请求
+                    // 终态单行」记账原则；移交失败/链空时下方原位落账。503 日志行
+                    // 保留原位（本池尝试的排障归因，可观测口径不变）
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
@@ -1052,6 +1057,15 @@ fn run_wb_stream(
                         diag_summary.join(", "),
                         sample_note,
                     ));
+                    // F-81 跨池移交：有健康候选链且客户端未断连 → 把剩余流生命
+                    // 周期交给下一池（guard move；移交成功不再发错误帧）；链空或
+                    // 全不支持 → 原收尾（此时落「none」用量行，终态单行原则）
+                    if !fallback.is_empty() && !tx.is_closed() {
+                        if super::cross_pool::continue_stream_on_next_pool(&state.state, state.pool_label(), fallback, body_vec, proto, key_id, chat_id, tx, guard, ns_encoded, start_ts) {
+                            return;
+                        }
+                    }
+                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
                     // 无健康账号错误帧按客户端协议分流（OpenAI/Anthropic/Responses
                     // 各自形态，helper 内已含收尾帧），不再硬编码 OpenAI 格式；
                     // 文案对齐 qoder_route 口径下发 exhaust_msg（指纹拦截场景给出差异化

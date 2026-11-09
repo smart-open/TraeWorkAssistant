@@ -269,6 +269,17 @@ pub struct Resolved {
     /// 内部落 app_log；本字段供调度测试断言与 Phase 2 资源页展示预留）
     #[allow(dead_code)]
     pub fallback_from: Option<TargetPool>,
+    /// F-81：执行期跨池回退链——调度时点按候选序收集的全部健康池（不含本池，
+    /// 本池耗尽时按序移交执行）；policy.fallback 关闭或前缀锁定时恒空
+    pub fallback_chain: Vec<PoolCandidate>,
+}
+
+/// F-81：跨池回退链单项（轻量，仅执行期跨池所需字段；模型名按池归一化完毕）
+#[derive(Debug, Clone)]
+pub struct PoolCandidate {
+    pub pool: TargetPool,
+    pub model: String,
+    pub effort_hint: Option<String>,
 }
 
 /// 回退原因（供 warn 日志）
@@ -748,12 +759,59 @@ pub fn resolve_target(
                 && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref())
             {
                 record_sticky(state, sk, pool);
+                // F-81 回补（审查 A-L2）：粘性命中也构建跨池链——原恒空链导致同会话
+                // 60s TTL 内池耗尽直接走原错误矩阵，与非粘性请求不对称。policy 有
+                // 缓存（config_cache），读成本可忽略；smart 重排不参与（粘性链按基础
+                // 候选序，链是机会性候选，执行期 cross_pool 还会做健康复核）
+                let policy = load_policy(&state.data_dir);
+                let mut chain: Vec<PoolCandidate> = Vec::new();
+                if policy.fallback && forced_pool.is_none() && pool != TargetPool::Custom {
+                    // 候选序与主循环同构：per_model/优先级序 + POOL_FIXED_ORDER 尾补。
+                    // 口径差异备案（三审查 A-L1）：粘性链内永不含 Custom（双重排除），
+                    // 主循环链可含 Custom（执行期 cross_pool 跳过）——终态等价；若
+                    // 未来执行期支持 Custom 目标，需同步放开粘性链的 Custom 排除。
+                    // 绑定 Key 场景（三审查 A-L3）：链序按 per_model/priority 构建，
+                    // 未感知绑定强制序——链是机会性候选且执行期会健康复核，偏差可
+                    // 接受，严格对齐需在此按 bind 分支取序
+                    let mut seq: Vec<TargetPool> = policy
+                        .per_model
+                        .get(&canonical)
+                        .cloned()
+                        .unwrap_or_else(|| policy.priority.clone())
+                        .iter()
+                        .filter_map(|s| TargetPool::parse(s))
+                        .collect();
+                    for p in POOL_FIXED_ORDER {
+                        if !seq.contains(&p) {
+                            seq.push(p);
+                        }
+                    }
+                    for p in seq {
+                        // Custom 胜出不收链（审查 A-L3：无消费者）；同池去重（审查 A-M3）
+                        if p == pool
+                            || p == TargetPool::Custom
+                            || !sources.available(p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled)
+                        {
+                            continue;
+                        }
+                        if pool_healthy(state, p, &sources, wb_enabled, key_allowed_for(p).as_ref())
+                            && !chain.iter().any(|c| c.pool == p)
+                        {
+                            chain.push(PoolCandidate {
+                                pool: p,
+                                model: final_model_for(p, &sources, model),
+                                effort_hint: effort_for(p, &sources),
+                            });
+                        }
+                    }
+                }
                 return Ok(Resolved {
                     pool,
                     model: final_model_for(pool, &sources, model),
                     effort_hint: effort_for(pool, &sources),
                     max_mode_hint: max_mode_for(pool, &sources),
                     fallback_from: None,
+                    fallback_chain: chain,
                 });
             }
         }
@@ -828,6 +886,10 @@ pub fn resolve_target(
     // 模型冷却），全部耗尽时随 app_log 落盘——「白名单把池排除」与「账号不健康」
     // 在一行日志内即可区分，替代盲猜调用路径
     let mut pool_reasons: Vec<String> = Vec::new();
+    // F-81：首个健康池（正式胜出者）字段暂存与跨池回退链收集——胜出后不立即
+    // 返回，继续遍历把其余健康池收进链（原实现 return 先于链收集，链恒空）
+    let mut win: Option<(TargetPool, String, Option<String>, bool)> = None;
+    let mut chain: Vec<PoolCandidate> = Vec::new();
     for (i, pool) in order.iter().copied().enumerate() {
         if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) {
             // 审查 F-3 修复（issue #186 移植）：原 unavailable 二义（「上游开关未启用」
@@ -839,6 +901,42 @@ pub fn resolve_target(
         }
         match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref()) {
             Ok(()) => {
+                // F-81：首个健康池 = 正式胜出者（日志/sticky 语义不变）；
+                // 后续健康池仅收进跨池回退链（fallback 开 && 非前缀锁定）
+                if win.is_some() {
+                    if policy.fallback && forced_pool.is_none() {
+                        // 审查修复（A-L3）：Custom 胜出时跳过收链——Custom 分支不消费
+                        // fallback_chain（组内自冗余），非空链无消费者徒增调试困惑；
+                        // 保持「链非空 = 可移交」隐含契约。链内 Custom 候选仍可出现
+                        // （其他池胜出时），执行期 cross_pool 按第一期范围跳过
+                        let custom_won = win.as_ref().is_some_and(|(w, ..)| *w == TargetPool::Custom);
+                        // 审查修复（M，链去重）：policy.priority/per_model 基础序无
+                        // 去重（load_policy 仅过滤非法值），配置重复池会在链中出现
+                        // 两次——耗尽后移交回刚失败的同一池整轮重烧一次（多一轮
+                        // 503 账面行 + 一轮取号）才走链尾。同池只收一次；胜出池
+                        // 本身也在去重集合内（三审查 M-1：priority=[buddy,qoder,buddy]
+                        // 且 buddy 胜出时第二个 buddy 不得再次入链，否则耗尽后链上
+                        // 会回头重试刚失败的胜出池——与粘性分支 p==pool 排除同口径）
+                        let win_pool = win.as_ref().map(|(w, ..)| *w);
+                        if !custom_won
+                            && win_pool != Some(pool)
+                            && !chain.iter().any(|c| c.pool == pool)
+                        {
+                            chain.push(PoolCandidate {
+                                pool,
+                                model: final_model_for(pool, &sources, model),
+                                effort_hint: effort_for(pool, &sources),
+                            });
+                        }
+                    }
+                    continue;
+                }
+                win = Some((
+                    pool,
+                    final_model_for(pool, &sources, model),
+                    effort_for(pool, &sources),
+                    max_mode_for(pool, &sources),
+                ));
                 // 首个可用池胜出；此前有可用池失败 → 跨池回退 warn 日志（§4.5）。
                 // 源剔除（如 wb_enabled=false）不算回退，不记日志
                 if let Some((pref, reason)) = fallback_from {
@@ -859,16 +957,16 @@ pub fn resolve_target(
                 if let Some(sk) = &sticky_key {
                     record_sticky(state, sk, pool);
                 }
-                return Ok(Resolved {
-                    pool,
-                    model: final_model_for(pool, &sources, model),
-                    effort_hint: effort_for(pool, &sources),
-                    max_mode_hint: max_mode_for(pool, &sources),
-                    fallback_from: fallback_from.map(|(p, _)| p),
-                });
+                // F-81：胜出后不立即返回——继续遍历收集其余健康池进跨池链，
+                // 循环外统一组装 Resolved（链收集与胜出解耦）
             }
             Err(reason) => {
                 pool_reasons.push(format!("{}={}", pool.as_str(), reason.as_str()));
+                // F-81：已有胜出者时，后续池预检失败仅记录归因（不进链、不触发
+                // 提前 Err——胜出者循环外统一返回）
+                if win.is_some() {
+                    continue;
+                }
                 // 首选池不可用：双源 + fallback 开 + 后续还有可用源 → 按序回退；
                 // 单源（或 fallback 关）→ 错误矩阵显式报错（§4.3，不静默换池）。
                 // BM-3 审查修复：门控从 is_dual（家族计数，Buddy/BuddyAi 同族不叠加）
@@ -933,6 +1031,18 @@ pub fn resolve_target(
                 }
             }
         }
+    }
+    // F-81：有胜出者 → 链已收齐，组装返回（fallback_from 语义不变：仅记录
+    // 胜出前的首个失败池）；无胜出者才走下方耗尽块
+    if let Some((pool, win_model, effort_hint, max_mode_hint)) = win {
+        return Ok(Resolved {
+            pool,
+            model: win_model,
+            effort_hint,
+            max_mode_hint,
+            fallback_from: fallback_from.map(|(p, _)| p),
+            fallback_chain: chain,
+        });
     }
     // 仅零可用源（循环内全部 continue）才走到此处；有可用池但失败的场景均在
     // 循环内 !can_fallback 提前终止并落同款归因日志（issue #136）。落盘调度
@@ -2483,6 +2593,61 @@ mod tests {
         assert_eq!(t.pool, TargetPool::Trae);
         assert_eq!(t.model, "Kimi-K3");
         assert!(t.effort_hint.is_none());
+    }
+
+    // ---------- F-81 跨池回退链（fallback_chain） ----------
+
+    /// 双源全健康：胜出 Buddy（smart 倍率序），其余健康池 Trae 按序收进跨池链
+    ///（回归锁定：原实现胜出即 return 先于链收集，链恒空 = F-81 整体失效）
+    #[test]
+    fn t81_fallback_chain_collects_remaining_healthy_pools() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.fallback_chain.len(), 1);
+        assert_eq!(r.fallback_chain[0].pool, TargetPool::Trae);
+        assert_eq!(r.fallback_chain[0].model, "glm-5.3");
+        // 单源模型：无其余健康池，链必空
+        let f2 = fixture(&["Kimi-K3"], Some(&["hy4"]), Some(&policy_default()));
+        f2.seed_healthy(true);
+        assert!(f2.resolve_no_session("Kimi-K3").unwrap().fallback_chain.is_empty());
+    }
+
+    /// fallback 关闭：其余健康池不进链（policy.fallback 门控；路由行为不变）
+    #[test]
+    fn t81_fallback_chain_empty_when_fallback_disabled() {
+        let mut p = policy_default();
+        p.fallback = false;
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert!(r.fallback_chain.is_empty());
+    }
+
+    /// 前缀锁定池（buddy/glm-5.3）：用户点名单池，不构建跨池链（forced_pool 门控）
+    #[test]
+    fn t81_fallback_chain_empty_on_pool_prefix_lock() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve_no_session("buddy/glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert!(r.fallback_chain.is_empty());
+    }
+
+    /// 胜出后其余池不健康：不进链（链只收健康候选），胜出语义与归因日志不变
+    #[test]
+    fn t81_fallback_chain_skips_unhealthy_pools() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(false); // 仅 Buddy 健康，Trae 池耗尽
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert!(r.fallback_chain.is_empty());
+        assert_eq!(r.fallback_from, None);
     }
 
     // ---------- 后缀剥离跨池（issue #31 T3.1） ----------

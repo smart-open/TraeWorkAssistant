@@ -5,7 +5,7 @@
  * issue #26 全局模型白名单：白名单非空 = 仅放行名单内模型（/v1/models 过滤 + 推理端点准入），
  * 空 = 不限；编辑弹框为三源全量多选，管理端目录（unifiedModels）不过滤白名单。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Copy, Globe, ListFilter, Pencil, Save, Search, X } from 'lucide-react';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
@@ -13,6 +13,8 @@ import { copyText } from '../../lib/clipboard';
 import { getVisiblePoolText, isPoolVisible } from '../../lib/appVisibility';
 import { useAppStore } from '../../store';
 import { Badge, Modal } from '../ui';
+import { buildClientExamples, CLIENT_EXAMPLE_TABS } from './clientExamples';
+import type { ClientExampleKey } from './clientExamples';
 import type { GatewaySettings, LanIfaceIp, UnifiedModel } from '../../types';
 
 /** 与后端 canonical_id 一致：trim + 小写（§3.3 #1） */
@@ -61,7 +63,17 @@ export default function InterfaceConfig() {
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [copying, setCopying] = useState(false);
+  // F-83：客户端配置示例 Tab（issue #174）与复制成功态（记录 Tab 键，2 秒复位）
+  const [exampleTab, setExampleTab] = useState<ClientExampleKey>('openai');
+  const [copiedTab, setCopiedTab] = useState<ClientExampleKey | null>(null);
+  // 审查修复（L，一致性）：复制成功态定时器卸载清理——对齐 GatewayHelpModal 的
+  // copiedTimerRef 惯例（React 18 卸载后 setState 虽为 no-op，仍消除同构瑕疵）
+  const copiedTabTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (copiedTabTimerRef.current != null) window.clearTimeout(copiedTabTimerRef.current);
+    };
+  }, []);
   // 局域网网卡 IPv4（issue #34：网关 0.0.0.0 监听后的接入地址展示）
   const [lanIps, setLanIps] = useState<LanIfaceIp[]>([]);
 
@@ -176,39 +188,21 @@ export default function InterfaceConfig() {
     });
   };
 
-  const copyConfigExample = async () => {
+  /** F-83：复制当前客户端 Tab 的配置片段（issue #174，copiedTab 2 秒复位防重复点击误觉） */
+  const copyClientExample = async (key: ClientExampleKey) => {
     const p = gw?.port ?? 7864;
     const m = gw?.default_model ?? 'glm-5.3';
-    // 局域网接入地址（issue #34：网关 0.0.0.0 监听，内网设备按局域网 IP 访问）
-    const lanLines = lanIps
-      .map((e) => `接口地址(局域网): http://${e.ip}:${p}/v1  # ${e.name}`)
-      .join('\n');
-    const example = `# 客户端配置示例（OpenAI 兼容格式）
-接口地址: http://127.0.0.1:${p}/v1
-${lanLines ? lanLines + '\n' : ''}API Key:  <在「API Keys 管理」中创建并复制>
-模型 ID:  ${m}（统一目录内任一模型均可，请求按模型 ID 匹配资源池）
-
-# Anthropic 兼容端点（Claude Code 等工具直连）
-POST http://127.0.0.1:${p}/v1/messages
-鉴权头: x-api-key: your-api-key 或 Authorization: Bearer
-
-# cURL 测试（请将 API Key 替换为列表中的完整值）
-curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer your-api-key" \\
-  -d '{
-    "model": "${m}",
-    "messages": [{"role": "user", "content": "你好"}],
-    "stream": true
-  }'`;
-    setCopying(true);
-    try {
-      await withMinDelay(Promise.resolve(copyText(example)));
+    const example = buildClientExamples(p, m, lanIps)[key];
+    if (await copyText(example)) {
+      setCopiedTab(key);
       toast('success', '配置示例已复制到剪贴板');
-    } catch {
+      if (copiedTabTimerRef.current != null) window.clearTimeout(copiedTabTimerRef.current);
+      copiedTabTimerRef.current = window.setTimeout(
+        () => setCopiedTab((cur) => (cur === key ? null : cur)),
+        2000,
+      );
+    } else {
       toast('error', '复制失败');
-    } finally {
-      setCopying(false);
     }
   };
 
@@ -382,15 +376,6 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
         <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
           <div className="mb-2 flex items-center justify-between">
             <p className="font-medium">使用方式 & 配置示例</p>
-            <button
-              className="btn-ghost flex items-center gap-1 !p-1 text-xs"
-              onClick={() => void copyConfigExample()}
-              disabled={copying}
-              title="复制完整配置示例"
-            >
-              <Copy size={12} className={copying ? 'animate-pulse' : ''} />
-              {copying ? '复制中…' : '复制示例'}
-            </button>
           </div>
           <div className="space-y-1.5">
             <div>
@@ -456,6 +441,39 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
                 支持模型（Max 列 ✓）ID 加 -max 后缀启用 1M 上下文，如 glm-5.3-max；qwen3.8-max 需写 qwen3.8-max-max
               </code>
             </div>
+          </div>
+
+          {/* F-83（issue #174）：客户端配置示例 Tab——每个客户端「复制即可用」，含真实端口与 Key 占位 */}
+          <div className="mt-3 border-t border-slate-200 pt-2.5 dark:border-zinc-700/60">
+            <div className="mb-2 flex flex-wrap items-center gap-1">
+              {CLIENT_EXAMPLE_TABS.map((t) => (
+                <button
+                  key={t.key}
+                  className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                    exampleTab === t.key
+                      ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-zinc-400 dark:hover:text-zinc-200'
+                  }`}
+                  onClick={() => setExampleTab(t.key)}
+                >
+                  {t.label}
+                </button>
+              ))}
+              <button
+                className="btn-ghost ml-auto flex items-center gap-1 !p-1 text-xs"
+                onClick={() => void copyClientExample(exampleTab)}
+                title={`复制 ${CLIENT_EXAMPLE_TABS.find((t) => t.key === exampleTab)?.label ?? ''} 配置片段`}
+              >
+                <Copy size={12} />
+                {copiedTab === exampleTab ? '已复制' : '复制'}
+              </button>
+            </div>
+            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-md border border-slate-200 bg-white p-2.5 font-mono text-[11px] leading-relaxed text-slate-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+              {buildClientExamples(gw?.port ?? 7864, gw?.default_model ?? 'glm-5.3', lanIps)[exampleTab]}
+            </pre>
+            <p className="mt-1.5 text-[11px] text-slate-400">
+              片段中的 &lt;API Key&gt; 请替换为「API Keys 管理」中创建的完整 Key（ck_ 前缀）；模型 ID 可换成统一目录内任一模型。
+            </p>
           </div>
         </div>
       </div>

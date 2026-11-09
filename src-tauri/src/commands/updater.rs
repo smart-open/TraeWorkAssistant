@@ -26,7 +26,7 @@
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 
 const RELEASES_API: &str =
     "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
@@ -578,6 +578,21 @@ pub fn update_download(
         }
     };
 
+    // 审查修复（M→三审查 M-1 收紧）：download_url 信任锚收敛到本仓库 releases 路径——
+    // 仅锚定 github.com 域不足（任意用户可上传 release 资产，被注入的 webview 可
+    // 传攻击者仓库 URL + 自供哈希走完三道闸）；锚定到本仓库后，自供哈希无法与
+    // 任意第三方内容匹配（哈希需真实命中本仓库资产内容）。update_check 产出的
+    // browser_download_url 恒为 https://github.com/smart-open/TraeWorkAssistant/
+    // releases/download/…（api.github.com 仅用于 releases 清单查询，从不是下载目标，
+    // 不再列白名单）
+    const TRUSTED_DOWNLOAD_PREFIX: &str =
+        "https://github.com/smart-open/TraeWorkAssistant/releases/download/";
+    if !download_url.starts_with(TRUSTED_DOWNLOAD_PREFIX) {
+        return Err(format!(
+            "下载地址非官方发布通道，已拒绝（安全策略）。请手动下载：{RELEASES_PAGE}"
+        ));
+    }
+
     // 下载目录：%TEMP%\ai-work-assistant-update\
     let dir = std::env::temp_dir().join("ai-work-assistant-update");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
@@ -618,7 +633,15 @@ pub fn update_download(
             Ok(received) => {
                 // 完整性校验（闸②前半）：下载完成立即与发布方 SHA256 比对，不匹配删除文件并中止
                 // （防供应链篡改；expected 已在入口强制非空，无「跳过校验」路径）
-                let actual = file_sha256(&dest).unwrap_or_default();
+                // 审查修复（C-L1）：哈希重算 IO 失败（杀软锁定/删除）与哈希不匹配区分归因——
+                // 原 unwrap_or_default() 把 IO 失败折叠成「网络劫持」误导排障；行为均 fail-closed
+                let actual = match file_sha256(&dest) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&dest);
+                        return Err(format!("安装包校验失败（文件不可读：{e}），请重试或手动下载：{RELEASES_PAGE}"));
+                    }
+                };
                 if actual != expected {
                     let _ = std::fs::remove_file(&dest);
                     return Err(format!(
@@ -915,6 +938,130 @@ pub fn update_quit_app(app: AppHandle) -> Result<(), String> {
     {
         let _ = app;
         Err("仅 macOS 手动安装流程需要退出应用".to_string())
+    }
+}
+
+// ---------------- F-86：全自动静默更新编排（issue #175，设置默认关） ----------------
+
+/// 防重入闸：上一轮 tick 仍在下载/安装期间时跳过本轮（前端 2h 定时 + 此闸双保险）
+static AUTO_TICK_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct AutoTickGuard;
+impl Drop for AutoTickGuard {
+    fn drop(&mut self) {
+        AUTO_TICK_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 无人值守更新编排结果（前端仅用于状态展示与日志，不参与决策）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAutoTickResult {
+    /// skipped_cli / skipped_disabled / busy / busy_gateway / no_update / error / installed
+    pub action: String,
+    pub detail: String,
+}
+
+/// F-86：无人值守更新编排——check → 空闲判定 → download → run_installer。
+/// 由前端每 2 小时定时触发；设置 `auto_update_silent` 默认关。
+/// **安全红线**：三道完整性闸（发布方 SHA256 强制、下载比对、安装前复验）全部
+/// 沿用既有 update_download / update_run_installer 路径，静默路径零绕过分支；
+/// CLI 任务进程（--task-run）永不参与自动更新（避免双进程竞争安装）。
+#[tauri::command(async)]
+pub fn update_auto_tick(
+    app: AppHandle,
+    state: State<'_, crate::state::AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<UpdateAutoTickResult, String> {
+    use std::sync::atomic::Ordering;
+    let r = |action: &str, detail: String| {
+        Ok(UpdateAutoTickResult { action: action.to_string(), detail })
+    };
+    // 审查修复（M，可观测性）：失败路径与成功路径（update-installing 事件）不对称——
+    // 开启静默更新后长期失败（网络/代理/杀软）用户毫无感知。error 归因落 app_log。
+    let r_err = |detail: String| {
+        crate::fs_utils::app_log_default(&format!("[静默更新] {detail}"));
+        Ok(UpdateAutoTickResult { action: "error".to_string(), detail })
+    };
+    // CLI 任务进程排除（GUI 前端定时器不会在 CLI 进程运行，双保险）
+    if std::env::args().nth(1).as_deref() == Some("--task-run") {
+        return r("skipped_cli", "CLI 任务进程不参与自动更新".into());
+    }
+    // 设置开关（默认关）
+    if !state.settings().auto_update_silent {
+        return r("skipped_disabled", "静默自动更新未开启".into());
+    }
+    // 防重入
+    if AUTO_TICK_BUSY.swap(true, Ordering::SeqCst) {
+        return r("busy", "上一轮自动更新仍在进行".into());
+    }
+    let _guard = AutoTickGuard;
+    // 空闲判定：网关在途请求为 0 才安装（未运行 / 状态锁中毒均视为空闲——
+    // 安装会退出本进程，仅在途请求会被中断，故只挡 inflight > 0）
+    match runtime.lock() {
+        Ok(guard) => {
+            if let Some(rt) = guard.as_ref() {
+                if rt.shared.inflight.load(Ordering::Relaxed) > 0 {
+                    return r("busy_gateway", "网关存在在途请求，已推迟到下一轮".into());
+                }
+            }
+        }
+        Err(_) => { /* 状态锁中毒：按空闲继续（安装即退出，无中断面） */ }
+    }
+    // ① 检查（网络失败归 error，不 Err——避免前端定时器持续报未捕获错误）
+    let chk = match update_check() {
+        Ok(c) => c,
+        Err(e) => return r_err(format!("检查更新失败：{e}")),
+    };
+    if !chk.has_update {
+        return r("no_update", format!("已是最新版本 {}", chk.current_version));
+    }
+    // 审查修复（H，mac 语义断裂）：dmg 无免确认静默安装通道——mac 的
+    // update_run_installer 仅 `open` 挂载 dmg 弹 Finder 引导手动拖拽、不退出本进程
+    // （见下方 mac 分支注释），若走 Windows 同款自动安装，前端 2h 定时器会导致
+    // 「每 2 小时弹一次 dmg 窗口且永不完成」，与「全程零确认」承诺直接冲突。
+    // 故 mac 自动路径止于检查：提示用户从「检查更新」入口完成安装（该入口本就
+    // 按 mac 流程引导拖拽 + update_restart_app 重启），每轮仅一次轻量 check 请求。
+    #[cfg(target_os = "macos")]
+    {
+        // mac 上 app/runtime 仅 not(macos) 分支消费——显式借用消除 unused 警告（零警告红线）
+        let _ = (&app, &runtime);
+        return r(
+            "need_manual",
+            format!(
+                "检测到新版本 {}：macOS 不支持免确认静默安装，请打开「检查更新」按引导完成（拖入 Applications 后重启）",
+                chk.latest_version
+            ),
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // ② 下载（三道闸前两道在此路径内）
+        let dl = match update_download(
+            app.clone(),
+            chk.download_url.clone(),
+            chk.asset_name.clone(),
+            chk.latest_version.clone(),
+            chk.sha256.clone(),
+        ) {
+            Ok(d) => d,
+            Err(e) => return r_err(format!("下载 {} 失败：{e}", chk.latest_version)),
+        };
+        // 审查修复 P3：安装前二次空闲判定——下载耗时分钟级，期间新进的在途请求
+        // 会被安装重启中断；把竞态窗口从整个下载时长压缩到判定→安装的毫秒级。
+        // 本轮放弃的安装包留在更新缓存，下一轮/手动更新直接覆盖复用
+        if let Ok(rt_guard) = runtime.lock() {
+            if let Some(rt) = rt_guard.as_ref() {
+                if rt.shared.inflight.load(Ordering::Relaxed) > 0 {
+                    return r("busy_gateway", "下载完成但网关出现新的在途请求，已推迟安装到下一轮".into());
+                }
+            }
+        }
+        // ③ 安装（第三道闸 + /R 装完自动重启；成功路径 emit update-installing 后进程退出）
+        match update_run_installer(app.clone(), dl.file_path, dl.asset_name) {
+            Ok(()) => r("installed", format!("已启动 {} 安装，应用将自动重启", dl.version)),
+            Err(e) => r_err(format!("安装失败：{e}")),
+        }
     }
 }
 

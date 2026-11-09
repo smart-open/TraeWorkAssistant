@@ -49,6 +49,8 @@ import type {
   OAuthLoginUrl,
   OAuthLoginResult,
   OAuthLoginDoneEvent,
+  ApiLogRecentResult,
+  UpdateAutoTickResult,
   PoolStatus,
   ProfileInfo,
   ProxyLogListResult,
@@ -117,6 +119,10 @@ const INVOKE_TIMEOUT_MS = 120_000;
 const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   // 大文件安装包下载：后端注释明示「大文件慢速下载不能被整体超时掐断」，前端同步豁免
   update_download: null,
+  // 静默更新 tick：Windows 路径内串行 check → download → install，下载耗时与
+  // update_download 同量级，不能被默认 120s 掐断（前端超时仅 reject，后端仍继续
+  // 安装并重启，超时语义会造成「看似失败实则重启」的错觉）
+  update_auto_tick: null,
   // 多账号串行网络操作：耗时随账号数线性增长，放宽到 10 分钟
   doubao_renew_run: 600_000,
   // 签到批量：签到逐账号串行 + probe 自动保活（保活开关默认开 + per-sid 分键，
@@ -1002,9 +1008,27 @@ export const api = {
     }) => invoke<string | null>('api_logs_search', {
       opts: {
         date: opts.date,
-        start_time: opts.startTime,
-        end_time: opts.endTime,
+        // 修复：Rust 端 ApiLogSearchOpts 为 camelCase 反序列化，原 snake_case 键
+        // 会被静默忽略导致时间段过滤从未生效
+        startTime: opts.startTime,
+        endTime: opts.endTime,
         keyword: opts.keyword,
+      },
+    }),
+    /** F-84：结构化「最近请求」查询（解析文本日志行，新→旧分页 + 池/结果筛选） */
+    logsRecent: (opts: {
+      days?: number;
+      page?: number;
+      pageSize?: number;
+      pool?: string;
+      result?: 'ok' | 'fail';
+    }) => invoke<ApiLogRecentResult>('api_logs_recent', {
+      opts: {
+        days: opts.days,
+        page: opts.page,
+        pageSize: opts.pageSize,
+        pool: opts.pool || undefined,
+        result: opts.result || undefined,
       },
     }),
     debugToggle: () => invoke<boolean>('api_debug_toggle'),
@@ -1185,6 +1209,9 @@ export const api = {
       ),
     onInstalling: async (cb: (assetName: string) => void): Promise<UnlistenFn> =>
       listen<string>('update-installing', (ev) => cb(ev.payload)),
+    // F-86：无人值守更新编排单轮 tick（check → 空闲判定 → download → install 自动重启；
+    // 设置 auto_update_silent 默认关，前端每 2h 调一次）
+    autoTick: () => invoke<UpdateAutoTickResult>('update_auto_tick'),
   },
 };
 
