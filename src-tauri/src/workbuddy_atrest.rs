@@ -302,10 +302,16 @@ fn probe_once(exe: &std::path::Path) -> Result<String, String> {
         ("mjs", PROBE_JS_ESM),
     ] {
         let n = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 审查修复（L-2，临时脚本名不可预测）：pid+原子序号可被同权限进程预测并
+        // 抢先创建/替换（占位攻击），追加纳秒级时间戳提高不可预测性
         let tmp = std::env::temp_dir().join(format!(
-            "wb-atrest-probe-{}-{}.{script}",
+            "wb-atrest-probe-{}-{}-{}.{script}",
             std::process::id(),
-            n
+            n,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
         ));
         if let Err(e) = std::fs::write(&tmp, body) {
             // 审查修复：写失败（磁盘满/权限/杀软锁定）记入 last_err——原静默
@@ -344,18 +350,24 @@ fn run_probe_script(exe: &std::path::Path, script: &std::path::Path) -> Result<S
         cmd.creation_flags(0x0800_0000);
     }
     let mut child = cmd.spawn().map_err(|e| format!("客户端启动失败: {e}"))?;
-    // stdout/stderr 侧线程收集（payload 数 KB）；主线程限时轮询退出
+    // stdout/stderr 侧线程收集（payload 数 KB）；主线程限时轮询退出。
+    // 审查修复（C-13，join 无超时）：child 被 kill 但孙进程继承管道写端时
+    // read_to_end 永不 EOF，原 reader.join() 会永久挂死。改 mpsc channel 传递 +
+    // 主线程 recv_timeout 限时收取，超时即放弃收集（线程 detach 留在后台，
+    // 收不到就不再等），收集线程句柄不再持有
     let mut out = child.stdout.take().ok_or("客户端 stdout 不可读")?;
     let mut err = child.stderr.take().ok_or("客户端 stderr 不可读")?;
-    let reader = std::thread::spawn(move || {
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut out, &mut buf);
-        buf
+        let _ = out_tx.send(buf);
     });
-    let err_reader = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut err, &mut buf);
-        String::from_utf8_lossy(&buf).to_string()
+        let _ = err_tx.send(String::from_utf8_lossy(&buf).to_string());
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let status = loop {
@@ -370,15 +382,20 @@ fn run_probe_script(exe: &std::path::Path, script: &std::path::Path) -> Result<S
             }
         }
     };
-    // 审查修复（超时死锁）：超时先 kill 再 join——子进程存活时管道写端不关，
-    // 读线程的 read_to_end 永久阻塞、join 永不返回，原「先 join 后 kill」顺序
-    // 使 20s 超时在真正挂起场景完全失效（kill 不可达）。先 kill 关闭管道写端，
-    // 读线程借 EOF 自然退出，join 方可返回
+    // 审查修复（超时死锁）：超时先 kill 再收集——子进程存活时管道写端不关，
+    // 读线程的 read_to_end 永久阻塞，原「先 join 后 kill」顺序使 20s 超时在
+    // 真正挂起场景完全失效（kill 不可达）。kill 关闭本子进程的管道写端使其
+    // 退出；孙进程继承写端的残余场景由下方 recv_timeout 兜底放弃收集
     if status.is_none() {
         let _ = child.kill();
     }
-    let stdout = reader.join().map_err(|_| "探针输出收集线程异常".to_string())?;
-    let stderr = err_reader.join().unwrap_or_default();
+    // stdout 严格（缺数据无法判定魔数，报错）；stderr 仅供诊断，尽力而为
+    let stdout = out_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .map_err(|_| "探针 stdout 收集超时（孙进程可能继承管道持有句柄），已放弃收集".to_string())?;
+    let stderr = err_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap_or_default();
     if status.is_none() {
         return Err("客户端探针超时（20s）".into());
     }
@@ -610,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn 载荷篡改_GCM认证失败() {
+    fn 载荷篡改_gcm认证失败() {
         let key = [0x42u8; 32];
         let mut w = wrapper(&key, "secret-token");
         // 篡改 envelope 内 ciphertext：翻一个字节后重编码
@@ -689,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn 明文非JSON_还原为字符串_JSON对象_还原结构() {
+    fn 明文非json_还原为字符串_json对象_还原结构() {
         let key = [0x42u8; 32];
         let mut raw = json!({
             "a": wrapper(&key, "plain-jwt"),

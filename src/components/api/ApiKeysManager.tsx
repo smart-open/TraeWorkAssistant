@@ -370,12 +370,23 @@ export default function ApiKeysManager({
 
   // 复制成功按钮级反馈（不依赖 toast，通知方式设为 none/system 时也可见）
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // 复制态复位定时器句柄：重复点击重置、卸载清理，防卸载后 setState 泄漏（同 InterfaceConfig）
+  const copiedIdTimerRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copiedIdTimerRef.current !== null) window.clearTimeout(copiedIdTimerRef.current);
+    },
+    [],
+  );
 
   const copyKeyValue = async (k: ApiKeyEntry) => {
     const ok = await copyText(k.key);
     if (ok) {
       setCopiedId(k.id);
-      setTimeout(() => setCopiedId((cur) => (cur === k.id ? null : cur)), 1500);
+      // 重复点击先清旧定时器再起新的
+      if (copiedIdTimerRef.current !== null) window.clearTimeout(copiedIdTimerRef.current);
+      copiedIdTimerRef.current = window.setTimeout(() => setCopiedId((cur) => (cur === k.id ? null : cur)), 1500);
       toast('success', 'Key 已复制到剪贴板');
     } else {
       toast('error', '复制失败');

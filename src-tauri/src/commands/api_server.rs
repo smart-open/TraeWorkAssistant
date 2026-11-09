@@ -1975,7 +1975,7 @@ pub struct ApiLogRecentOpts {
     pub page_size: u32,
     #[serde(default)]
     pub pool: Option<String>,
-    /// "ok" = 2xx / "fail" = 非 2xx / None = 全部
+    /// "ok" = 2xx / "fail" = 非 2xx / None = 全部；其他值（含大小写不符）→ 空结果
     #[serde(default)]
     pub result: Option<String>,
 }
@@ -1990,16 +1990,25 @@ fn default_recent_page_size() -> u32 {
     50
 }
 
-#[tauri::command]
-pub fn api_logs_recent(state: State<AppState>, opts: ApiLogRecentOpts) -> ApiLogRecentResult {
-    let logger = ApiLogger::for_query(state.logs_dir());
-    logger.recent_entries(
-        opts.days,
-        opts.page,
-        opts.page_size,
-        opts.pool.as_deref(),
-        opts.result.as_deref(),
-    )
+/// B-6：异步命令 + spawn_blocking——30 天扫描（双上限 80 万行/256MB）不再卡
+/// UI 线程；Ok 时 Promise 仍 resolve 为 ApiLogRecentResult，前端 invoke 泛型不变
+#[tauri::command(async)]
+pub async fn api_logs_recent(
+    state: State<'_, AppState>,
+    opts: ApiLogRecentOpts,
+) -> Result<ApiLogRecentResult, String> {
+    let dir = state.logs_dir();
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        ApiLogger::for_query(dir).recent_entries(
+            opts.days,
+            opts.page,
+            opts.page_size,
+            opts.pool.as_deref(),
+            opts.result.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("日志查询任务执行失败: {e}"))?)
 }
 
 /// 切换 API Debug 模式（开启后记录完整请求/响应）

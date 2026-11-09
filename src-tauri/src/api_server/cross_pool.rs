@@ -8,19 +8,29 @@
 //! 第一期范围：Buddy/BuddyAi ↔ Qoder 双向 + Trae 耗尽 → Buddy/Qoder；
 //! Trae 作为移交目标（wb→trae / qoder→trae）待 Trae 流核心抽出后接入
 //! （见 backlog F-81 第一期范围说明），Custom 池组内已有多上游冗余不参与移交。
+//!
+//! 审查 A-5/H-1：`encoded` 工具名集合（Responses 协议 wb 侧 namespace 编码名）
+//! 随执行链全链透传（wb_stream_chat/run_wb_stream → continue_stream_on_next_pool
+//! → Qoder 分支 → run_qoder_stream → try_cross_pool → 回 wb 分支）。集合由 wb
+//! 受理 Responses 时收集（routes.rs encoded_tool_names）；各协议直受理入口传空集。
+//! 当前透传链不可达（防御性预留）：Responses 流式入口 routes.rs responses_api 以
+//! 空移交链调用 wb_stream_chat，移交链恒空、集合恒不参与，零行为变化。未来
+//! Responses 接入 dispatch 建链时集合随链生效：回程投影按集合成员把编码名还原为
+//! {name, namespace} 双字段（issue #93 Codex 契约），无需再改执行链签名。
 
 use super::dispatch::{PoolCandidate, TargetPool};
 use super::routes::Protocol;
 
 /// 跨池移交落 [SCHED] 行（逐请求口径，对齐落池日志先例）。
-/// 仅在实际移交成功点调用（审查 P2：目标为第一期不支持池时不得虚报移交）
+/// 在移交发起点调用（目标池执行前）；若目标池执行仍耗尽，该 [SCHED] 行不撤销，
+/// 后续结果见落池日志
 fn log_cross_pool(
     state: &std::sync::Arc<super::ApiSharedState>,
     from: &str,
     to: &PoolCandidate,
 ) {
     state.logger.log_sched_event(&format!(
-        "cross_pool_retry: from={} to={} model={}（池内耗尽移交）",
+        "cross_pool_retry: from={} to={} model={}（池内耗尽移交发起）",
         from,
         to.pool.as_str(),
         to.model,
@@ -95,6 +105,7 @@ pub fn continue_stream_on_next_pool(
                     tx,
                     start_ts,
                     guard,
+                    encoded,
                     rest,
                 );
                 return true;

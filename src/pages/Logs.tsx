@@ -442,9 +442,17 @@ function ProxyLogsTab() {
         {detailLoading ? (
           <div className="py-8 text-center text-sm text-slate-400">加载中…</div>
         ) : (
-          <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
-            {detail}
-          </pre>
+          <>
+            {/* L-7：超长详情仅渲染截断文本防卡死；复制按钮仍取全量 */}
+            {detail !== null && detail.length > PROXY_DETAIL_MAX_CHARS && (
+              <p className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
+                日志过长（共 {detail.length.toLocaleString()} 字符），仅显示前 {PROXY_DETAIL_MAX_CHARS.toLocaleString()} 字符，复制仍取全量。
+              </p>
+            )}
+            <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-950">
+              {detail !== null && detail.length > PROXY_DETAIL_MAX_CHARS ? detail.slice(0, PROXY_DETAIL_MAX_CHARS) : detail}
+            </pre>
+          </>
         )}
       </Modal>
     </div>
@@ -482,6 +490,8 @@ function statusChipCls(status: number): string {
 }
 
 function ApiRecentRequests() {
+  // D-14：可选时间窗口（后端 api_logs_recent 默认 3 天），供「天数」按钮组切换
+  const RECENT_DAYS = [1, 3, 7, 14, 30] as const;
   const [rows, setRows] = useState<ApiLogEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [truncated, setTruncated] = useState(false);
@@ -489,13 +499,18 @@ function ApiRecentRequests() {
   const [pool, setPool] = useState('all');
   const [result, setResult] = useState('all');
   const [loading, setLoading] = useState(false);
+  // D-14：当前窗口天数；daysRef 双轨记录，防 load 闭包拿到旧值
+  const [days, setDays] = useState(3);
+  const daysRef = useRef(3);
   const reqIdRef = useRef(0);
 
-  const load = useCallback(async (p: number, pf: string, rf: string) => {
+  const load = useCallback(async (p: number, pf: string, rf: string, d?: number) => {
     const reqId = ++reqIdRef.current;
     setLoading(true);
     try {
       const r = await api.apiServer.logsRecent({
+        // D-14：显式天数优先，未传时回落 daysRef（避免回调闭包旧值）
+        days: d ?? daysRef.current,
         page: p,
         pageSize: RECENT_PAGE_SIZE,
         pool: pf === 'all' ? undefined : pf,
@@ -534,6 +549,7 @@ function ApiRecentRequests() {
                   ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
                   : 'bg-white text-slate-500 hover:bg-slate-100 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
               }`}
+              disabled={loading}
               onClick={() => { setPool(p.v); void load(1, p.v, result); }}
             >
               {p.label}
@@ -550,9 +566,27 @@ function ApiRecentRequests() {
                   ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
                   : 'bg-white text-slate-500 hover:bg-slate-100 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
               }`}
+              disabled={loading}
               onClick={() => { setResult(r.v); void load(1, pool, r.v); }}
             >
               {r.label}
+            </button>
+          ))}
+        </div>
+        <span className="ml-2 text-xs text-slate-400">天数</span>
+        <div className="flex gap-1">
+          {RECENT_DAYS.map((d) => (
+            <button
+              key={d}
+              className={`rounded-md px-2 py-0.5 text-xs font-medium transition ${
+                days === d
+                  ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
+                  : 'bg-white text-slate-500 hover:bg-slate-100 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
+              }`}
+              disabled={loading}
+              onClick={() => { setDays(d); daysRef.current = d; void load(1, pool, result, d); }}
+            >
+              {d}
             </button>
           ))}
         </div>
@@ -622,10 +656,18 @@ function ApiRecentRequests() {
                 </td>
               </tr>
             ))}
+            {loading && (
+              <tr>
+                <td colSpan={9} className="px-2 py-6 text-center text-slate-400">
+                  加载中…
+                </td>
+              </tr>
+            )}
             {rows.length === 0 && !loading && (
               <tr>
                 <td colSpan={9} className="px-2 py-6 text-center text-slate-400">
-                  {total === 0 ? '最近 3 天无匹配请求' : '加载中…'}
+                  {/* M-7：total 为筛选后计数，文案分场景——有筛选用筛选文案，无筛选才提天数 */}
+                  {(pool !== 'all' || result !== 'all') ? '当前筛选无匹配请求' : `最近 ${days} 天无请求`}
                 </td>
               </tr>
             )}
@@ -661,6 +703,8 @@ function ApiRecentRequests() {
 
 /** 整日日志内容渲染软上限：超过时截断展示，避免超大 <pre> 卡死主线程 */
 const MAX_API_LOG_CHARS = 200_000;
+/** 代理详情弹窗渲染软上限（同上）：超长仅展示截断文本，复制仍取全量 */
+const PROXY_DETAIL_MAX_CHARS = 200_000;
 
 function ApiLogsTab() {
   const toast = useAppStore((s) => s.pushToast);

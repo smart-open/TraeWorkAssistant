@@ -1428,7 +1428,6 @@ mod tests {
     /// 整个响应而非仅 core（审查修复：原实现只扫 core，挪出 core 症状依旧）
     #[test]
     fn packages_collected_outside_core() {
-        let core = json!({ "TotalDosage": 7 });
         let root = json!({
             "code": 0,
             "data": { "Response": { "Data": { "TotalDosage": 7 } } },

@@ -5,7 +5,7 @@
  * issue #26 全局模型白名单：白名单非空 = 仅放行名单内模型（/v1/models 过滤 + 推理端点准入），
  * 空 = 不限；编辑弹框为三源全量多选，管理端目录（unifiedModels）不过滤白名单。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Copy, Globe, ListFilter, Pencil, Save, Search, X } from 'lucide-react';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
@@ -66,6 +66,16 @@ export default function InterfaceConfig() {
   // F-83：客户端配置示例 Tab（issue #174）与复制成功态（记录 Tab 键，2 秒复位）
   const [exampleTab, setExampleTab] = useState<ClientExampleKey>('openai');
   const [copiedTab, setCopiedTab] = useState<ClientExampleKey | null>(null);
+  // D-15：复制成功态复位定时器句柄（重复点击重置、卸载清理，防卸载后 setState 泄漏）
+  const copiedTabTimerRef = useRef<number | null>(null);
+
+  // 卸载时清理复位定时器（StrictMode 下卸载重建亦安全）
+  useEffect(
+    () => () => {
+      if (copiedTabTimerRef.current !== null) window.clearTimeout(copiedTabTimerRef.current);
+    },
+    [],
+  );
   // 局域网网卡 IPv4（issue #34：网关 0.0.0.0 监听后的接入地址展示）
   const [lanIps, setLanIps] = useState<LanIfaceIp[]>([]);
 
@@ -188,7 +198,9 @@ export default function InterfaceConfig() {
     if (await copyText(example)) {
       setCopiedTab(key);
       toast('success', '配置示例已复制到剪贴板');
-      window.setTimeout(() => setCopiedTab((cur) => (cur === key ? null : cur)), 2000);
+      // 重复点击先清旧定时器再起新的，句柄留存供卸载清理
+      if (copiedTabTimerRef.current !== null) window.clearTimeout(copiedTabTimerRef.current);
+      copiedTabTimerRef.current = window.setTimeout(() => setCopiedTab((cur) => (cur === key ? null : cur)), 2000);
     } else {
       toast('error', '复制失败');
     }

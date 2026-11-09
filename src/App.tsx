@@ -136,18 +136,25 @@ export default function App() {
 
   // F-86（issue #175）：静默自动更新——开关开启时每 2 小时后台检查一轮，
   // 空闲（网关无在途请求）时自动下载安装并重启；关闭即停表。错误仅落 console
-  //（编排命令网络失败归 error action，不抛 Promise rejection 打扰用户）
+  //（编排命令网络失败归 error action，不抛 Promise rejection 打扰用户）。
+  // D-16：开启后 30 秒即做首查（不必等满 2 小时）——与网关启动错峰，autoTick 对忙/未就绪自会跳过；
+  // 首查定时器与 interval 在 cleanup 中成对清理（StrictMode 卸载重建亦安全）
   useEffect(() => {
     if (!settings?.auto_update_silent) return;
-    const id = window.setInterval(() => {
+    const tick = () => {
       api.updater
         .autoTick()
         .then((r) => {
           if (r.action === 'error') console.warn('[auto-update]', r.detail);
         })
         .catch((e) => console.warn('[auto-update] tick 失败:', e));
-    }, 2 * 60 * 60 * 1000);
-    return () => window.clearInterval(id);
+    };
+    const first = window.setTimeout(tick, 30_000);
+    const id = window.setInterval(tick, 2 * 60 * 60 * 1000);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(id);
+    };
   }, [settings?.auto_update_silent]);
 
   if (!ready) {

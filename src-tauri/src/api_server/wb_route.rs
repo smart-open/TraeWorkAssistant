@@ -989,7 +989,6 @@ pub(crate) fn run_wb_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
@@ -1040,13 +1039,17 @@ pub(crate) fn run_wb_stream(
                     // OpenAI 系维持 data: 错误帧；message 均为 exhaust_msg，
                     // code 保持 no_healthy_account（客户端兼容）
                     // F-81 跨池移交：有健康候选链且客户端未断连 → 把剩余流生命
-                    // 周期交给下一池（guard move；503 账面行保留=本池尝试记录；
-                    // 移交成功不再发错误帧）；链空或全不支持 → 原收尾
+                    // 周期交给下一池（guard move；503 账面行保留=本池尝试记录，
+                    // 移交成功同样留行；移交成功不再发错误帧）；链空或全不支持
+                    // → 原收尾。审查 A-1：usage 行后置到移交失败之后——移交成功
+                    // 由接收池落终态用量（含真实账号），本池不再补 "none" 行，
+                    // 避免同一请求两条用量行（双记账）
                     if !fallback.is_empty() && !tx.is_closed() {
                         if super::cross_pool::continue_stream_on_next_pool(&state.state, state.pool_label(), fallback, body_vec, proto, key_id, chat_id, tx, guard, encoded, start_ts) {
                             return;
                         }
                     }
+                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
                     match proto {
                         Protocol::Anthropic => {
                             let err = json!({"type":"error","error":{"type":"api_error","message":exhaust_msg}});

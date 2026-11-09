@@ -348,8 +348,10 @@ export const api = {
     }) => invoke<ProxyLogListResult>('proxy_logs_list', {
       opts: {
         keyword: opts.keyword,
-        start_time: opts.startTime,
-        end_time: opts.endTime,
+        // 修复：Rust 端 ProxyLogQueryOpts 为 camelCase 反序列化，原 snake_case 键
+        // 会被静默忽略导致时间段过滤从未生效（与 logsSearch 同类问题）
+        startTime: opts.startTime,
+        endTime: opts.endTime,
         offset: opts.offset,
         limit: opts.limit,
       },

@@ -28,6 +28,14 @@ const RELEASES_API: &str =
     "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
 const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
 
+// 审查修复（M-6，下载 URL 单前缀锚）：download_url 经 IPC 由前端传入，被注入的
+// webview 可传攻击者 URL + 自供 sha256 绕过域校验走完三道闸（下载并安装恶意包）。
+// 下载地址仅接受官方 GitHub Releases 资产直链前缀，校验单点收口于 update_download
+// （update_check 返回的 download_url 来自 GitHub API 受信来源，天然命中前缀；
+// 自动更新路径 update_auto_tick 内部走同一函数，无需重复校验）
+const RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/smart-open/TraeWorkAssistant/releases/download/";
+
 /// 发布校验清单资产名（scripts/rename_release.mjs 生成，随 Release 上传）：
 /// `{ "version": "x.y.z", "assets": { "<资产文件名>": "<sha256hex>" } }`
 const MANIFEST_ASSET: &str = "latest.json";
@@ -502,6 +510,43 @@ fn validate_target(asset_name: &str, expected_version: &str) -> Result<(u64, u64
     Ok(asset_ver)
 }
 
+/// 审查修复（M-6）：下载地址信任判定——仅接受官方 GitHub Releases 资产直链前缀。
+/// 独立成函数便于单测（update_download 依赖 AppHandle/网络，难以直测）。
+fn is_trusted_download_url(url: &str) -> bool {
+    url.starts_with(RELEASE_DOWNLOAD_PREFIX)
+}
+
+/// 审查修复（M-6 收口）：下载地址形态交叉校验——前缀闸只保证「官方 Releases 域名
+/// 直链」，未校验 tag 与资产归属：同仓库历史 release 均落受信前缀（含 2.x 产品线
+/// 安装包），可被指向旧资产降级。此处解析前缀剩余段 `<tag>/<资产文件名>`：
+/// tag 必须与目标版本一致（兼容 "v3.8.2"/"3.8.2" 两形态——GitHub tag 带 v 前缀，
+/// expected_version 是 parse_version 剥离后的裸版本）、末段文件名必须与目标资产
+/// 一致、不得有多余路径段。独立成函数便于单测（同 is_trusted_download_url）。
+fn verify_release_identity(
+    url: &str,
+    expected_version: &str,
+    asset_name: &str,
+) -> Result<(), String> {
+    let rest = url
+        .strip_prefix(RELEASE_DOWNLOAD_PREFIX)
+        .ok_or_else(|| "下载地址不受信任（仅接受官方 GitHub Releases 资产）".to_string())?;
+    let mut segs = rest.split('/');
+    let tag = segs.next().unwrap_or("");
+    let file = segs.next().unwrap_or("");
+    if tag.is_empty() || file.is_empty() || segs.next().is_some() {
+        return Err("下载地址形态非法（应为 /releases/download/<tag>/<资产文件名>）".to_string());
+    }
+    if tag != expected_version && tag != format!("v{expected_version}") {
+        return Err(format!(
+            "下载地址版本与目标版本不一致（URL tag={tag}，目标 {expected_version}），已中止"
+        ));
+    }
+    if file != asset_name {
+        return Err("下载地址资产名与目标资产不一致，已中止".to_string());
+    }
+    Ok(())
+}
+
 /// 第一步：下载安装包到临时目录（不安装）。完成后前端确认，再调 update_run_installer。
 /// async 派发：下载耗时不可控（最坏 3 通道各连+读超时），同步命令跑主线程会冻住 UI。
 #[tauri::command(async)]
@@ -513,6 +558,16 @@ pub fn update_download(
     expected_sha256: Option<String>,
 ) -> Result<UpdateDownloaded, String> {
     validate_target(&asset_name, &expected_version)?;
+    // 审查修复（M-6）：前置信任校验——拒绝非官方前缀的下载地址（fail-closed），
+    // 不信任的地址绝不进入下载流程
+    if !is_trusted_download_url(&download_url) {
+        return Err("下载地址不受信任（仅接受官方 GitHub Releases 资产）".to_string());
+    }
+    // 审查修复（M-6 收口）：前缀命中后交叉校验 URL 形态——tag 与目标版本一致、
+    // 末段文件名与目标资产一致，闭合「受信前缀 + 任意旧 release 资产」降级面。
+    // update_check 返回的 download_url 天然命中（tag/资产同源 GitHub API 响应），
+    // 自动更新路径 update_auto_tick 走同一函数，无需重复校验
+    verify_release_identity(&download_url, &expected_version, &asset_name)?;
 
     // 审查修复（H4，闸①）：发布方摘要是强制闸门——None（存量旧 release 无清单无正文行）
     // 与格式非法同样拒绝下载，绝不放行无校验的安装包（原实现 None 直接跳过校验，
@@ -573,7 +628,18 @@ pub fn update_download(
             Ok(received) => {
                 // 完整性校验（闸②前半）：下载完成立即与发布方 SHA256 比对，不匹配删除文件并中止
                 // （防供应链篡改；expected 已在入口强制非空，无「跳过校验」路径）
-                let actual = file_sha256(&dest).unwrap_or_default();
+                // 审查修复（L-1）：IO 失败与哈希不匹配区分归因——原 unwrap_or_default
+                // 把读取失败折叠为「SHA256 不匹配/网络劫持」误导文案；两种情况均
+                // fail-closed 删除下载文件
+                let actual = match file_sha256(&dest) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&dest);
+                        return Err(format!(
+                            "安装包完整性校验无法执行（读取失败），已删除下载文件：{e}"
+                        ));
+                    }
+                };
                 if actual != expected {
                     let _ = std::fs::remove_file(&dest);
                     return Err(format!(
@@ -714,8 +780,20 @@ pub fn update_run_installer(
         .filter(|h| is_sha256_hex(h))
         .ok_or("安装包校验文件损坏，已中止安装。请重新下载")?
         .to_ascii_lowercase();
-    let actual = file_sha256(path).unwrap_or_default();
+    // 审查修复（L-1）：IO 失败与哈希不匹配区分归因（原 unwrap_or_default 把读取
+    // 失败折叠为「文件被改动」）；两种情况均 fail-closed 删除安装包（原实现不匹配
+    // 时篡改文件仍残留磁盘）
+    let actual = match file_sha256(path) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            return Err(format!(
+                "安装包完整性校验无法执行（读取失败），已删除安装包：{e}"
+            ));
+        }
+    };
     if actual != expected {
+        let _ = std::fs::remove_file(path);
         return Err(
             "安装包完整性校验失败（SHA256 与下载时不一致），文件可能在下载后被改动，已中止安装。请重新下载"
                 .to_string(),
@@ -1000,5 +1078,57 @@ mod tests {
         let text = r#"{ "version": "3.2.9", "assets": {} }"#;
         let m: UpdateManifest = serde_json::from_str(text).unwrap();
         assert_ne!(parse_version(&m.version), Some((3, 3, 3)));
+    }
+
+    /// M-6：下载 URL 单前缀锚——仅接受官方 GitHub Releases 资产直链
+    #[test]
+    fn download_url_prefix_gate() {
+        assert!(is_trusted_download_url(
+            "https://github.com/smart-open/TraeWorkAssistant/releases/download/v3.8.2/AI.Work._3.8.2_x64-setup.exe"
+        ));
+        // 非 https / 非官方域名 / 错仓库 / 错路径形态 / 空串一律拒绝
+        for bad in [
+            "http://github.com/smart-open/TraeWorkAssistant/releases/download/v1/x.exe",
+            "https://evil.com/smart-open/TraeWorkAssistant/releases/download/v1/x.exe",
+            "https://github.com/smart-open/OtherRepo/releases/download/v1/x.exe",
+            "https://github.com/smart-open/TraeWorkAssistant/releases/expanded_assets/v1",
+            "",
+        ] {
+            assert!(!is_trusted_download_url(bad), "须拒绝: {bad:?}");
+        }
+    }
+
+    /// M-6 收口：URL 形态交叉校验——tag 与目标版本一致、末段与目标资产一致
+    #[test]
+    fn download_url_identity_gate() {
+        let base = "https://github.com/smart-open/TraeWorkAssistant/releases/download/";
+        // 正常形态：tag 带 v 前缀 / 裸版本号两种均接受
+        for tag in ["v3.8.2", "3.8.2"] {
+            assert!(verify_release_identity(
+                &format!("{base}{tag}/AI Work 助手_3.8.2_x64-setup.exe"),
+                "3.8.2",
+                "AI Work 助手_3.8.2_x64-setup.exe",
+            )
+            .is_ok());
+        }
+        // tag 与目标版本不一致（旧 release 资产降级面）
+        assert!(verify_release_identity(
+            &format!("{base}v3.0.1/AI Work 助手_3.0.1_x64-setup.exe"),
+            "3.8.2",
+            "AI Work 助手_3.8.2_x64-setup.exe",
+        )
+        .is_err());
+        // URL 末段与目标资产不一致
+        assert!(verify_release_identity(
+            &format!("{base}v3.8.2/AI.Work._3.8.2_x64-setup.exe"),
+            "3.8.2",
+            "AI Work 助手_3.8.2_x64-setup.exe",
+        )
+        .is_err());
+        // 形态非法：缺文件名 / 多余路径段
+        assert!(verify_release_identity(&format!("{base}v3.8.2/"), "3.8.2", "x").is_err());
+        assert!(verify_release_identity(&format!("{base}v3.8.2/a/b.exe"), "3.8.2", "b.exe").is_err());
+        // 前缀不命中（独立调用时的兜底）
+        assert!(verify_release_identity("https://evil.com/x", "3.8.2", "x").is_err());
     }
 }
