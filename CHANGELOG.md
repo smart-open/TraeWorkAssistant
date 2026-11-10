@@ -6,6 +6,13 @@
 
 ---
 
+## [未发布]
+
+### 修复与加固
+- **Qoder 账号「Token 有效」徽标滞留**：`ensure_fresh` 永久失败出口（凭证已过期且无刷新令牌 / PAT 被服务端拒绝）此前只返回 note 不回写池 `needs_relogin`，账号列表徽标滞留「Token 有效」+ 已过期日期，看板/调度跳过口径永不生效——现对照 `auth_dead` 同款落库（重登/OAuth 重新入池或重导 PAT 续期成功后由 `sync_pool_expiry` 复位）。
+
+---
+
 ## [1.6.4] · 2026-11-10 · 语义移植 main afe1966 => 63c354f（3 提交）
 
 > 语义移植 afe1966（issue #198 批次）及其后 2 提交（2b87e1a 网关审查修复批次、63c354f DSH 11128 三轮审查加固），未 merge；跳过桌面/OS 专属项：更新包下载信任锚（updater 桌面更新器专属）、workbuddy_atrest 解密层与客户端密钥探针、App.tsx 静默更新、tauri proxy_logs_list 命令（docker 无 ProxyLogsTab，logsRecent 已支持 days 透传）、账号页帮助弹窗滚动高度；cmd_bridge 异步化由既有 spawn_blocking 结构性覆盖，无须移植。
