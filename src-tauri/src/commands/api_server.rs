@@ -1819,7 +1819,7 @@ pub struct ApiLogRecentOpts {
     pub page_size: u32,
     #[serde(default)]
     pub pool: Option<String>,
-    /// "ok" = 2xx / "fail" = 非 2xx / None = 全部
+    /// "ok" = 2xx / "fail" = 非 2xx / None = 全部；其他值（含大小写不符）→ 空结果
     #[serde(default)]
     pub result: Option<String>,
 }

@@ -1036,7 +1036,7 @@ export interface ApiKeyEntry {
    * 可带 `trae:`/`buddy:` 池前缀（专一锁定其归属池）
    */
   dedicated_account: string;
-  /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" | "qoder" */
+  /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" | "buddy-ai" | "qoder" | "custom" */
   bind_pool: string;
   /** 共享分组 id 白名单（shg_ 前缀）；空 = 不通过该维度限制。运行时实时展开并入
    * 白名单，与 allowed_tags 同时勾选时取交集（D5） */
@@ -1351,7 +1351,8 @@ export interface ToolAliasMapView {
 // 网关命中（11128 拦截 / 空完成影子风控）落下的指纹样本（内存环形缓冲，最新在前；
 // 重启即清空）。sample 为 fingerprint_sample 输出：system="<首条 system 前 300 字符>" tools=[…]
 export interface FingerprintSample {
-  /** "11128" = 清洗已启用仍被拦；"empty" = 空完成影子风控 */
+  /** "11128" = 清洗已启用仍被拦；"11128_cleaned" = 11128 终局同采的清洗后样本
+   * （进出对比诊断用，issue #195 第二轮）；"empty" = 空完成影子风控 */
   kind: string;
   /** 来源池：buddy-ai / buddy / trae / qoder */
   pool: string;

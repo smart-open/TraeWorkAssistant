@@ -23,6 +23,9 @@ pub struct ApiLogger {
     sync_mode: bool,
 }
 
+/// 队列上限（M-5 背压）：慢盘场景防内存无界增长，超限丢最旧行
+const MAX_QUEUE_LINES: usize = 10_000;
+
 struct LoggerState {
     /// 待落盘日志行（FIFO）
     queue: VecDeque<String>,
@@ -30,6 +33,8 @@ struct LoggerState {
     file: Option<std::fs::File>,
     /// 句柄对应日期（与今日不同则滚动换文件）
     date: String,
+    /// 队列溢出一次性观测标记（首次丢最旧行时置位，防 stderr 刷屏）
+    overflow_noted: bool,
 }
 
 impl LoggerState {
@@ -38,6 +43,7 @@ impl LoggerState {
             queue: VecDeque::new(),
             file: None,
             date: String::new(),
+            overflow_noted: false,
         }
     }
 }
@@ -59,9 +65,12 @@ impl ApiLogger {
         Self { dir, state, cv, sync_mode }
     }
 
-    /// 查询/列表专用实例（审查 P4 修复）：不 spawn flusher 线程——查询命令每次
-    /// `new` 会各泄漏一个常驻线程（api_logs_recent 分页翻页放大）。查询实例无
-    /// 写入，flush_pending 空转无害；读取内容为运行时实例已落盘部分。
+    /// 查询/列表专用实例（审查 P4 修复）：不 spawn flusher 线程——若沿用 `new`，
+    /// 每次调用都会泄漏一个永不退出的常驻线程（flusher_loop 持 Arc 死循环，
+    /// api_logs_recent 分页翻页会持续放大泄漏）。查询实例自身无写入、队列恒空，
+    /// flush_pending → write_locked 首行判空即返回，真空转无副作用；sync_mode=true
+    /// 兜底确保万一有写入也是持锁直写，不会滞留在无 flusher 的队列。读取内容为
+    /// 运行时实例已落盘部分（最多滞后一个 100ms 批量落盘周期）。
     pub fn for_query(dir: PathBuf) -> Self {
         fs::create_dir_all(&dir).ok();
         Self {
@@ -91,15 +100,16 @@ impl ApiLogger {
     /// 观测一次（首次触发提示，不逐行刷屏——日志丢了观测行再进同队列无意义）
     fn enqueue(&self, line: String) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.queue.len() >= MAX_QUEUE_LINES {
+        // M-5：队列上限背压——超限丢最旧行，防慢盘场景无界内存增长；
+        // 首次触发 stderr 观测一次（不落 app_log，防递归噪音）
+        st.queue.push_back(line);
+        if st.queue.len() > MAX_QUEUE_LINES {
             st.queue.pop_front();
-            if !QUEUE_OVERFLOW_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[api_logger] 落盘速率持续低于写入速率，队列已满（{MAX_QUEUE_LINES} 行），丢弃最旧行"
-                );
+            if !st.overflow_noted {
+                st.overflow_noted = true;
+                eprintln!("[api_logger] 日志队列溢出（>{MAX_QUEUE_LINES} 行），丢弃最旧行（慢盘/杀毒扫描？）");
             }
         }
-        st.queue.push_back(line);
         if self.sync_mode {
             // 写入线程不可用：持锁直写（与读路径同锁，语义一致）
             write_locked(&mut st, &self.dir);
@@ -122,6 +132,12 @@ impl ApiLogger {
     /// 直写一行诊断日志（[DEBUG] 前缀诊断行）：走同一异步队列，
     /// 行尾无换行时自动补 `\n`（替代旧 get_writer 直写句柄方案）
     pub fn log_debug_line(&self, line: String) {
+        // B-7/M-3：正文段清洗防锚字面量误锚；保留行首 [DEBUG] 结构前缀
+        //（整行清洗会破坏 search_log/reverse_log_blocks 的块检测）
+        let line = match line.strip_prefix("[DEBUG] ") {
+            Some(body) => format!("[DEBUG] {}", sanitize_log_value(body)),
+            None => sanitize_log_value(&line),
+        };
         let line = if line.ends_with('\n') { line } else { format!("{line}\n") };
         self.enqueue(line);
     }
@@ -209,8 +225,10 @@ impl ApiLogger {
     ) {
         let (h, m, s) = Self::local_hms();
 
-        // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
-        let uid_short: String = uid.chars().take(12).collect();
+        // 审查 P2-6 + B-7/M-3 合流：先按 Unicode 字符截断（原字节切片落点多字节
+        // 字符内会 panic），再清洗解析锚（值内含 " key=" 等字面量会字段错位/整行
+        // 被误排除）；method/path/结构化数字字段不清洗
+        let uid_short: String = sanitize_log_value(&uid.chars().take(12).collect::<String>());
         let ttfb_part = match ttfb_ms {
             Some(t) => format!(" ttfb={t}ms"),
             None => String::new(),
@@ -244,7 +262,11 @@ impl ApiLogger {
     /// 单行 `[SCHED]` 前缀写入当日日志，供用量页日志检索与调度行为观测
     pub fn log_sched_event(&self, event: &str) {
         let (h, m, s) = Self::local_hms();
-        let line = format!("[{:02}:{:02}:{:02}] [SCHED] {}\n", h, m, s, event);
+        // B-7/M-3：message 含 [SCHED]/字段锚字面量时清洗，防行级锚 contains 误匹配
+        let line = format!(
+            "[{:02}:{:02}:{:02}] [SCHED] {}\n",
+            h, m, s, sanitize_log_value(event)
+        );
         self.enqueue(line);
     }
 
@@ -259,8 +281,10 @@ impl ApiLogger {
     ) {
         let (h, m, s) = Self::local_hms();
 
-        // 审查 P2-6：按 Unicode 字符截断（原字节切片落点多字节字符内会 panic）
-        let uid_short: String = uid.chars().take(12).collect();
+        // 审查 P2-6 + B-7/M-3 合流：uid 截断按 Unicode 字符（防多字节 panic），
+        // 再清洗解析锚；正文段（请求/响应体）为用户可控内容，清洗防正文行被
+        // 误解析为请求条目
+        let uid_short: String = sanitize_log_value(&uid.chars().take(12).collect::<String>());
         let mut lines = Vec::new();
         lines.push(format!(
             "[{:02}:{:02}:{:02}] [DEBUG] uid={} status={}",
@@ -275,7 +299,7 @@ impl ApiLogger {
         };
         let req_str = String::from_utf8_lossy(req_preview);
         lines.push(format!("--- Request Body ({} bytes, preview {}B) ---", req_body.len(), req_preview.len()));
-        lines.push(req_str.to_string());
+        lines.push(sanitize_log_value(&req_str));
 
         // 响应体（截取前 8KB）
         if let Some(resp) = resp_body {
@@ -286,11 +310,11 @@ impl ApiLogger {
             };
             let resp_str = String::from_utf8_lossy(resp_preview);
             lines.push(format!("--- Response Body ({} bytes, preview {}B) ---", resp.len(), resp_preview.len()));
-            lines.push(resp_str.to_string());
+            lines.push(sanitize_log_value(&resp_str));
         }
 
         if let Some(e) = error {
-            lines.push(format!("--- Error: {} ---", e));
+            lines.push(format!("--- Error: {} ---", sanitize_log_value(e)));
         }
 
         lines.push(String::new()); // 空行分隔
@@ -470,16 +494,15 @@ impl ApiLogger {
         pool: Option<&str>,
         result: Option<&str>,
     ) -> ApiLogRecentResult {
-        self.flush_pending();
-        let days = days.clamp(1, 30) as usize;
-        // 审查修复（L，严格筛选前置，三审查 B-L4）：result 仅接受 "ok"/"fail"，
-        // 未知值返回空集——防调用方拼写错误被静默吞掉显示全量（None 仍为不过滤）。
-        // 校验前置到扫描之前，未知值不做任何文件 IO
+        // B-10/L-4：result 未知值前置校验（零 IO，先于 flush/扫描）——拼写错误
+        // 不再静默放行显示全量，直接返回空结果
         if let Some(r) = result {
             if r != "ok" && r != "fail" {
                 return ApiLogRecentResult { rows: Vec::new(), total: 0, truncated: false };
             }
         }
+        self.flush_pending();
+        let days = days.clamp(1, 30) as usize;
         let mut dates = self.list_dates(days);
         // 审查修复（L，days 语义）：days = 回看自然日窗口而非「最近 N 个文件」——
         // 应用停用一段时间后仅剩 3 个旧文件时，days=3 会返回 40 天前数据。
@@ -496,12 +519,13 @@ impl ApiLogger {
         'outer: for d in &dates {
             // 审查修复（B-M2 残余收口）：全文读入前 metadata 预检——read_log 会
             // 全量读入 + 倒序重建（峰值内存约为内容 2.5 倍），数 GB 单文件仅靠
-            // 读后检查无法防内存放大。超限文件直接记 truncated 跳过
+            // 读后检查无法防内存放大。超限文件记 truncated 跳过、继续扫后续
+            // 小文件（main M-4 口径：单文件内存闸 + 全局行数/字节闸共同兜底）
             let path = self.dir.join(format!("api_{d}.log"));
             if let Ok(md) = fs::metadata(&path) {
                 if md.len() > MAX_RECENT_SCAN_BYTES as u64 {
                     truncated = true;
-                    break 'outer;
+                    continue;
                 }
             }
             let Some(content) = self.read_log(d) else { continue };
@@ -558,34 +582,6 @@ const MAX_RECENT_PARSE_LINES: usize = 300_000;
 /// 行密集的超大文件会全量扫描无 CPU/内存保护。行数与字节双闸兜底（truncated 同语义）
 const MAX_RECENT_SCAN_LINES: usize = 800_000;
 const MAX_RECENT_SCAN_BYTES: usize = 256 * 1024 * 1024;
-/// 审查修复（B-M3）：待落盘队列上限（约 10k 行 ≈ 1MB 文本）+ 溢出提示一次性开关
-const MAX_QUEUE_LINES: usize = 10_000;
-static QUEUE_OVERFLOW_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// 请求行解析锚全集（与 parse_log_line 的 token 定位一致；含未解析但可能成为
-/// 未来锚的字段分隔符）。含行级排除锚（三审查 B-M1）：parse_log_line 对整行做
-/// `contains("[DEBUG]"/"[SCHED]")` 排除——值内出现此字样同样会让整行从
-/// 「最近请求」静默消失，一并清洗。
-const LOG_PARSE_TOKENS: [&str; 12] = [
-    " key=", " pool=", " model=", " acct=", " uid=",
-    " stream=", " status=", " ttfb=", " stage=", " error=",
-    "[DEBUG]", "[SCHED]",
-];
-
-/// 审查修复（B-M3）：字段值内解析锚转义——用户可控值（Key 展示名/账号名/模型名/
-/// 错误消息）中若含 " key=" 等锚字面量，parse_log_line 首现定位落在值内部导致
-/// 字段错位或整行解析失败（从「最近请求」静默消失）。统一把锚的首空格替换为
-/// 零宽空格（U+200B，行级锚保留原字面仅前插 ZWSP）：解析不再误锚、真分隔符
-/// 不受影响；ZWSP 不可见，显示基本无差。
-fn sanitize_log_value(v: &str) -> String {
-    let mut s = v.to_string();
-    for t in LOG_PARSE_TOKENS {
-        if s.contains(t) {
-            s = s.replace(t, &format!("\u{200b}{}", t.trim_start()));
-        }
-    }
-    s
-}
 
 /// F-84：网关单条请求的结构化视图（由当日文本日志行解析，最新在前分页返回）
 #[derive(Debug, Clone, serde::Serialize)]
@@ -622,7 +618,7 @@ pub struct ApiLogEntry {
 pub struct ApiLogRecentResult {
     pub rows: Vec<ApiLogEntry>,
     pub total: usize,
-    /// true = 达到单次解析行数上限，total 仅统计已扫部分
+    /// true = 触发扫描双上限之一（行数/字节），total 仅统计已扫部分
     pub truncated: bool,
 }
 
@@ -630,6 +626,38 @@ pub struct ApiLogRecentResult {
 const PARSE_TOKENS: [&str; 8] = [
     " key=", " pool=", " model=", " acct=", " uid=", " stream=", " status=", " error=",
 ];
+
+/// 全量解析/行级锚（B-7/M-3 清洗依据）：PARSE_TOKENS 的 8 个空格前缀字段锚
+/// + ttfb/stage 2 个空格前缀字段锚 + [DEBUG]/[SCHED] 2 个行级块锚（无前缀空格）
+const LOG_PARSE_TOKENS: [&str; 12] = [
+    " key=", " pool=", " model=", " acct=", " uid=", " stream=", " status=", " error=",
+    " ttfb=", " stage=", "[DEBUG]", "[SCHED]",
+];
+
+/// 清洗用户可控值（key 名/账号名/模型名/错误消息/uid/日志正文）中与解析锚冲突的
+/// 字面量（B-7/M-3）：空格前缀锚（10 个）把命中处的首空格替换为 U+200B 零宽空格
+///（" key=" → "\u{200B}key="）；行级锚 "[DEBUG]"/"[SCHED]" 在 "[" 之后插 ZWSP
+///（"[\u{200B}DEBUG]"），保留 [ 完整形态。写侧清洗后读侧 parse_log_line 不再
+/// 误锚/误排除，故 parse_log_line 本体无需改动。
+fn sanitize_log_value(v: &str) -> String {
+    let mut s = v.to_string();
+    for tok in LOG_PARSE_TOKENS.iter() {
+        // 循环处理多次出现；替换后从 ZWSP 之后重新 find，避免死循环
+        let mut search_from = 0;
+        while let Some(rel) = s[search_from..].find(tok) {
+            let pos = search_from + rel;
+            // 空格前缀锚：首空格（1 字节）替换为 ZWSP；行级锚：在 "[" 后插入 ZWSP
+            let (start, end) = if tok.starts_with(' ') {
+                (pos, pos + 1)
+            } else {
+                (pos + 1, pos + 1)
+            };
+            s.replace_range(start..end, "\u{200B}");
+            search_from = start + 3; // ZWSP 占 3 字节（U+200B = E2 80 8B）
+        }
+    }
+    s
+}
 
 /// F-84：解析单行请求日志为结构化条目。非请求行（[SCHED]/[DEBUG] 块正文/不可解析）返回 None。
 /// 宽容语义：任一必备字段缺失或类型不符 → None（跳过该行，不中断）。
@@ -796,7 +824,14 @@ fn write_locked(st: &mut LoggerState, dir: &PathBuf) {
     }
     let Some(f) = st.file.as_mut() else { return };
     while let Some(line) = st.queue.pop_front() {
-        if f.write_all(line.as_bytes()).is_err() {
+        if let Err(e) = f.write_all(line.as_bytes()) {
+            // 审查修复（L-3）：写失败不再无痕置空句柄——stderr 观测一次（含
+            // io error 与剩余队列行数）；不落 app_log（防递归噪音，app_log
+            // 写入路径可能再触发本 logger）。保留「句柄失效，下次重开」逻辑
+            eprintln!(
+                "[api_logger] 写入日志失败: {e}，句柄失效待重开，剩余队列 {} 行",
+                st.queue.len()
+            );
             st.file = None; // 句柄失效，下次重开
             // 审查修复（B-L1）：写失败时已弹出的该行既未写出也未回队，原静默
             // 丢失与「打开失败无痕丢批」修复口径不一致——补 stderr 观测
@@ -1016,7 +1051,7 @@ mod tests {
     /// 审查修复（B-M3）：落行侧 token 清洗回归——用户可控值内嵌解析锚时，
     /// 清洗后落行的解析结果字段不错位、行不丢失；真分隔符不受影响
     #[test]
-    fn sanitize_log_value_防解析锚错位() {
+    fn sanitize_log_value_锚全量排除与零污染() {
         // 恶意 Key 名内嵌 " model=" / " error="：不清洗时 parse 首现定位落在
         // key 值内部 → model/status 字段错位甚至整行丢弃
         let raw = "k model=evil error=x";
@@ -1125,6 +1160,11 @@ mod tests {
         // pool 筛选：buddy = 偶数下标 4 条
         let rp = logger.recent_entries(3, 1, 50, Some("buddy"), None);
         assert_eq!(rp.total, 4);
+        // B-10：未知 result 值前置校验 → 空集（不静默放行全量）
+        let rb = logger.recent_entries(3, 1, 50, None, Some("success"));
+        assert_eq!(rb.total, 0);
+        assert!(rb.rows.is_empty());
+        assert!(!rb.truncated);
         let _ = today();
     }
 
@@ -1164,7 +1204,88 @@ mod tests {
         let logger = ApiLogger::new(dir.clone());
         logger.log_sched_event("sticky_yield uid=abc inflight=1 limit=1");
         let content = logger.read_log(&today()).expect("log written");
-        assert!(content.contains("[SCHED] sticky_yield uid=abc inflight=1 limit=1"));
+        // M-3 清洗：message 内 " uid=" 字面量锚首空格被替换为 ZWSP，防读侧误锚
+        assert!(
+            content.contains("[SCHED] sticky_yield\u{200B}uid=abc inflight=1 limit=1"),
+            "需含 [SCHED] 前缀与清洗后正文: {content}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// B-7/M-3：用户可控值内含解析锚字面量时，落行前清洗破坏锚匹配——
+    /// 行不被排除、字段不错位（读回值与写入值只差 ZWSP，锚定字段正确）
+    #[test]
+    fn sanitize_log_value_防解析锚错位() {
+        let dir = tmp_dir("sanitize");
+        let logger = ApiLogger::new(dir.clone());
+        // key 名含 " key=" 与 " pool="；模型名含 " ttfb="；错误消息含 [SCHED] 与 " key="
+        let key_with_anchor = "我的 key=假 pool=x";
+        let model_with_anchor = "glm-5.3 ttfb=1ms";
+        let error_with_anchor = "上游异常 [SCHED] 内部 key=y";
+        logger.log_request(
+            "buddy",
+            "POST",
+            "/v1/chat/completions",
+            model_with_anchor,
+            false,
+            502,
+            "uid-sanitize",
+            88,
+            key_with_anchor,
+            "账号A",
+            Some(error_with_anchor),
+        );
+        logger.flush_pending();
+
+        let r = logger.recent_entries(3, 1, 50, None, None);
+        assert_eq!(r.total, 1, "行不得因值内锚字面量被误排除: {:?}", r.rows);
+        let e = &r.rows[0];
+        // 锚定字段（结构化）不受值内锚污染
+        assert_eq!(e.pool, "buddy");
+        assert_eq!(e.status, 502);
+        assert_eq!(e.uid, "uid-sanitize");
+        assert_eq!(e.acct, "账号A");
+        assert_eq!(e.duration_ms, 88);
+        // 值还原：与写入值只差 ZWSP（空格前缀锚首空格被替换 / [ 后插入 ZWSP）
+        let expected_key = key_with_anchor
+            .replace(" key=", "\u{200B}key=")
+            .replace(" pool=", "\u{200B}pool=");
+        assert_eq!(e.key_name, expected_key);
+        let expected_model = model_with_anchor.replace(" ttfb=", "\u{200B}ttfb=");
+        assert_eq!(e.model, expected_model);
+        let expected_error = error_with_anchor
+            .replace(" key=", "\u{200B}key=")
+            .replace("[SCHED]", "[\u{200B}SCHED]");
+        assert_eq!(e.error.as_deref(), Some(expected_error.as_str()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// B-9：自然日窗口——手工放置 40 天前日志文件（模拟应用长期停用），
+    /// days=3 查询不得返回窗口外的旧数据
+    #[test]
+    fn recent_entries_natural_day_window_filters_old_dates() {
+        let dir = tmp_dir("window");
+        let logger = ApiLogger::new(dir.clone());
+        logger.log_request("buddy", "POST", "/v1/chat/completions", "m", false, 200, "u", 5, "k", "a", None);
+        logger.flush_pending();
+        let old_date = (Local::now().date_naive() - chrono::Duration::days(40))
+            .format("%Y-%m-%d")
+            .to_string();
+        std::fs::write(
+            dir.join(format!("api_{old_date}.log")),
+            "[09:00:00] GET /old key=k pool=buddy model=m acct=a uid=u stream=false status=200 1ms\n",
+        )
+        .unwrap();
+        let r = logger.recent_entries(3, 1, 50, None, None);
+        assert_eq!(
+            r.total, 1,
+            "自然日窗口应过滤 40 天前文件，仅剩今日 1 条: {:?}",
+            r.rows.iter().map(|e| e.date.as_str()).collect::<Vec<_>>()
+        );
+        assert!(r.rows.iter().all(|e| e.date == today()));
+        // days=1 同样只含今日
+        let r1 = logger.recent_entries(1, 1, 50, None, None);
+        assert_eq!(r1.total, 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }

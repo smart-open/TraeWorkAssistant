@@ -492,12 +492,13 @@ function ApiRecentRequests() {
   const [total, setTotal] = useState(0);
   const [truncated, setTruncated] = useState(false);
   const [page, setPage] = useState(1);
-  const [days, setDays] = useState(3);
   const [pool, setPool] = useState('all');
   const [result, setResult] = useState('all');
   const [loading, setLoading] = useState(false);
-  const reqIdRef = useRef(0);
+  // D-14（三审查 D-L3）：当前窗口天数；daysRef 双轨记录，防 load 闭包拿到旧值
+  const [days, setDays] = useState(3);
   const daysRef = useRef(3);
+  const reqIdRef = useRef(0);
   // 审查修复（M）：查询失败补 toast——与同页 SystemLogs/ProxyLogs/ApiLogs 三视图
   // 口径对齐；原静默吞错会让「筛选高亮已切换但数据仍是旧池」无从察觉
   const toast = useAppStore((s) => s.pushToast);
@@ -508,9 +509,10 @@ function ApiRecentRequests() {
     setLoading(true);
     try {
       const r = await api.apiServer.logsRecent({
+        // D-14：显式天数优先，未传时回落 daysRef（避免回调闭包旧值）
+        days: curDays,
         page: p,
         pageSize: RECENT_PAGE_SIZE,
-        days: curDays,
         pool: pf === 'all' ? undefined : pf,
         result: rf === 'all' ? undefined : (rf as 'ok' | 'fail'),
       });
@@ -654,6 +656,13 @@ function ApiRecentRequests() {
                 </td>
               </tr>
             ))}
+            {loading && (
+              <tr>
+                <td colSpan={9} className="px-2 py-6 text-center text-slate-400">
+                  加载中…
+                </td>
+              </tr>
+            )}
             {rows.length === 0 && !loading && (
               <tr>
                 <td colSpan={9} className="px-2 py-6 text-center text-slate-400">
@@ -663,14 +672,6 @@ function ApiRecentRequests() {
                   {pool === 'all' && result === 'all'
                     ? `最近 ${days} 天无匹配请求`
                     : '当前筛选无匹配请求'}
-                </td>
-              </tr>
-            )}
-            {rows.length === 0 && loading && (
-              <tr>
-                <td colSpan={9} className="px-2 py-6 text-center text-slate-400">
-                  {/* 审查修复（三审查 L-1）：首挂载/切筛选清空旧数据后 loading 无占位，与同页其他视图口径对齐 */}
-                  加载中…
                 </td>
               </tr>
             )}

@@ -189,30 +189,46 @@ export default function BuddyCheckin() {
           void refresh();
           pushToast(parsed.failed > 0 ? 'warn' : 'success', `WorkBuddy 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}`);
         }
-      } else if ('type' in parsed && parsed.type === 'growth') {
+      } else if ('type' in parsed && parsed.type === 'growth' && (parsed as { index?: unknown }).index != null) {
+        // index 守卫与下方 lines 分支对齐：无 index 的 growth 事件会使
+        // key={g.index} 多行同键且 sort 出 NaN——防御性丢弃
         const line = parsed as WbGrowthLine;
         // 能量/连签归一为标量（接口返回嵌套对象时防 [object Object] 展示）
         const energy = scalarNum(line.energy);
         const streak = scalarNum(line.streak);
         const checkinStreak = scalarNum(line.checkin_streak);
+        // 进度行按 index 槽位赋值（next[index-1] = row）在事件乱序到达或跳号时
+        // 会产生稀疏数组空洞——渲染期 new Map(lines.map(...)) 迭代到空洞即抛
+        // 「Iterator value undefined is not an entry object」（ErrorBoundary 兜底）。
+        // 改为按 index 去重 upsert + 排序插入：数组恒稠密，乱序事件下仍按后端顺序展示
         setGrowthLines((prev) => {
-          const next = prev.slice();
-          next[line.index - 1] = {
+          const row = {
             ...line,
             energy: energy ?? undefined,
             streak: streak ?? undefined,
             checkin_streak: checkinStreak ?? undefined,
           };
-          return next;
+          const i = prev.findIndex((p) => p.index === line.index);
+          if (i >= 0) {
+            const next = prev.slice();
+            next[i] = row;
+            return next;
+          }
+          return [...prev, row].sort((a, b) => a.index - b.index);
         });
       } else if ('index' in parsed && parsed.index != null) {
         const line = parsed as WbAccountLine;
         const reward = scalarNum(line.reward);
         const checkinStreak = scalarNum(line.checkin_streak);
         setLines((prev) => {
-          const next = prev.slice();
-          next[line.index - 1] = { ...line, reward: reward ?? undefined, checkin_streak: checkinStreak ?? undefined };
-          return next;
+          const row = { ...line, reward: reward ?? undefined, checkin_streak: checkinStreak ?? undefined };
+          const i = prev.findIndex((p) => p.index === line.index);
+          if (i >= 0) {
+            const next = prev.slice();
+            next[i] = row;
+            return next;
+          }
+          return [...prev, row].sort((a, b) => a.index - b.index);
         });
       } else if ('type' in parsed && parsed.type === 'exit') {
         setRunning(false);
@@ -367,8 +383,8 @@ export default function BuddyCheckin() {
         {/* 成长任务执行明细 */}
         {growthLines.length > 0 && (
           <div className="mt-3 space-y-1.5">
-            {growthLines.map((g, i) => (
-              <div key={i} className="rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800">
+            {growthLines.map((g) => (
+              <div key={g.index} className="rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800">
                 <div className="flex items-center gap-3">
                   <Badge tone={g.status === 'fail' ? 'red' : 'green'}>{g.status === 'fail' ? '失败' : '完成'}</Badge>
                   <span className="min-w-0 flex-1 truncate font-medium">{g.name || g.user_id}</span>
@@ -525,7 +541,7 @@ export default function BuddyCheckin() {
             </div>
           </div>
           <div className="space-y-1">
-            {lines.map((l, i) => {
+            {lines.map((l) => {
               const tone =
                 l.status === 'success'
                   ? 'text-emerald-600 dark:text-emerald-300'
@@ -534,7 +550,7 @@ export default function BuddyCheckin() {
                   : 'text-rose-600 dark:text-rose-300';
               const Icon = l.status === 'fail' ? XCircle : CheckCircle2;
               return (
-                <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
+                <div key={l.index} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
                   <Icon size={14} className={tone} />
                   <span className="w-8 text-right text-xs text-slate-400">{l.index}</span>
                   <span className="flex-1 truncate">{l.name || l.user_id}</span>

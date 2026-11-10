@@ -668,6 +668,7 @@ fn translate_race_lines(
 /// `encoded`：Responses 命名空间工具名集合——qoder 自身出站不消费，但耗尽移交
 /// 回 wb（Responses 协议）时必须透传（审查修复 H-1：qoder 经 wb 移交在 Responses
 /// 下可达，空集会让二次移交后的工具还原静默丢失）。非 Responses 入口恒传空集。
+#[allow(clippy::too_many_arguments)]
 pub fn qoder_stream_chat(
     state: Arc<ApiSharedState>,
     body_vec: Vec<u8>,
@@ -716,7 +717,7 @@ pub fn qoder_stream_chat(
             });
         }
 
-        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &fallback, &encoded);
+        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded, &fallback);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -728,7 +729,6 @@ pub fn qoder_stream_chat(
         .unwrap_or_else(|_| internal_error_response())
 }
 
-#[allow(clippy::too_many_arguments)]
 /// F-81：跨池移交尝试（流式两处耗尽收尾共用）。成功 = 剩余流已移交下一池
 ///（调用方直接 return，不再发错误帧）；链空/客户端断连/全不支持 → false。
 /// `encoded` 透传（审查修复 H-1）：耗尽移交回 wb（Responses）时保命名空间还原。
@@ -742,8 +742,8 @@ fn try_cross_pool(
     chat_id: &str,
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     guard: InflightGuard,
-    start_ts: Instant,
     encoded: &std::collections::HashSet<String>,
+    start_ts: Instant,
 ) -> bool {
     if fallback.is_empty() || tx.is_closed() {
         return false;
@@ -754,6 +754,10 @@ fn try_cross_pool(
     )
 }
 
+/// Qoder 池流式执行核心（qoder_stream_chat 直受理 / cross_pool 移交目标共用）。
+/// `encoded` 为 wb 侧编码工具名集合（H-1）：仅随跨池移交链透传，qoder 协议
+/// 自身不消费；移交耗尽回 wb 时原样带回，保 Responses 回程投影不丢
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_qoder_stream(
     state: &Arc<ApiSharedState>,
     body_vec: &[u8],
@@ -764,8 +768,8 @@ pub(crate) fn run_qoder_stream(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     start_ts: Instant,
     mut guard: InflightGuard,
-    fallback: &[super::dispatch::PoolCandidate],
     encoded: &std::collections::HashSet<String>,
+    fallback: &[super::dispatch::PoolCandidate],
 ) {
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
@@ -983,8 +987,10 @@ pub(crate) fn run_qoder_stream(
                 ));
             }
             // F-81 跨池移交：链非空 → 下一池接管剩余流（移交成功不落本池用量行；
-            // 503 日志行保留原位=本池尝试的排障归因，wb_route 同口径）
-            if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, start_ts, encoded) {
+            // 503 日志行保留原位=本池尝试的排障归因，wb_route 同口径）。
+            // 审查 A-1：usage 行后置到移交失败之后——移交成功由接收池落终态
+            // 用量（含真实账号），避免双记账
+            if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, encoded, start_ts) {
                 return;
             }
             state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
@@ -1041,8 +1047,10 @@ pub(crate) fn run_qoder_stream(
                             cut_hits,
                         ));
                     }
-                    // F-81 跨池移交：链非空 → 下一池接管剩余流（移交成功不落本池用量行）
-                    if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, start_ts, encoded) {
+                    // F-81 跨池移交：链非空 → 下一池接管剩余流（移交成功不落本池
+                    // 用量行）。审查 A-1：usage 行后置到移交失败之后——移交成功
+                    // 由接收池落终态用量，避免双记账
+                    if try_cross_pool(state, fallback, body_vec, proto, key_id, chat_id, tx, guard, encoded, start_ts) {
                         return;
                     }
                     state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None, None, None, &session_ctx(&peek));
@@ -1242,10 +1250,11 @@ pub(crate) fn run_qoder_stream(
                     // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
                     let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
                     let (error_info, sent_any, failed_inline, usage, eof_truncated) =
-                        // Qoder 无 namespace 展平编码（Responses 分支为防御性兜底，
-                        // 实际仅 OpenAi/Anthropic 可达）→ 空集合禁用编码名拆分（审查 F4）
+                        // 透传 encoded（审查 F4 收口 + H-1）：qoder 直受理入口传空集，
+                        // 跨池移交进来的请求携带真实集合，回程投影闸门即刻生效；
+                        // 移交耗尽回 wb 时集合随透传链原样带回
                         wb_sse::stream_forward_ex(
-                            ilines, tx, proto, chat_id, model, &std::collections::HashSet::new(),
+                            ilines, tx, proto, chat_id, model, encoded,
                             tool_alias.as_ref(),
                         );
                     let duration_ms = start_ts.elapsed().as_millis() as u64;

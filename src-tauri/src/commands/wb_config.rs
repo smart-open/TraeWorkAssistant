@@ -147,7 +147,8 @@ fn tool_alias_map_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
     // 无自定义（KV 缺失或 rules 空 = load_tool_alias_rules 走纯默认）时回显
     // 内置默认表并标记 builtin:true——前端「工具别名」tab 以此展示生效中规则；
     // 保存后成为自定义覆盖表（合并语义：默认表全量生效，自定义按 from 覆盖/
-    // 追加，to null = 停用该规则原名透传；与 merged_tool_alias_rules 口径一致）
+    // 追加，to null = 停用该规则原名透传且阻断通配接管；与 merged_tool_alias_rules
+    // 口径一致）
     let file: crate::api_server::wb_payload::ToolAliasFile =
         crate::store::db(data_dir).kv_get("tool_alias_map");
     if file.rules.is_empty() {
@@ -167,9 +168,11 @@ fn tool_alias_map_get_at(data_dir: &std::path::Path) -> Result<Value, String> {
 
 /// 结构校验：对齐 wb_route::load_tool_alias_rules 的读取形状（ToolAliasFile）——
 /// rules 为 [{from,to?}] 数组（from 必填字符串；to 为 null/缺省=停用），updated_at
-/// 可空。语义收紧两处：from 非空且唯一（重复项在合并语义中靠后覆盖，UI 编辑态
-/// 不应产生，落库层兜底拒绝）；to 拒绝空串（工具名不可为空，读取侧虽将空串统一
-/// 解释为停用，落库层直接拒绝以免用户误存「改名成空」的残规则）
+/// 可空。语义收紧三处：from 非空且唯一（重复项在合并语义中靠后覆盖，UI 编辑态
+/// 不应产生，落库层兜底拒绝）；from 拒绝裸「*」（空前缀通配会改写全部工具名，
+/// 读取侧虽静默忽略，落库层直接拒绝以免用户误存全量改写残规则）；to 拒绝空串
+/// （工具名不可为空，读取侧虽将空串统一解释为停用，落库层直接拒绝以免用户
+/// 误存「改名成空」的残规则）
 fn tool_alias_map_set_at(data_dir: &std::path::Path, map: &Value) -> Result<(), String> {
     if !map.is_object() {
         return Err("工具别名表必须是 JSON 对象（含 rules 数组）".into());
@@ -179,23 +182,66 @@ fn tool_alias_map_set_at(data_dir: &std::path::Path, map: &Value) -> Result<(), 
             format!("工具别名表格式不正确（rules[].from 必填，to 可为字符串/null）: {e}")
         })?;
     let mut seen = std::collections::HashSet::new();
+    let mut normalized: Vec<Value> = Vec::with_capacity(file.rules.len());
     for r in &file.rules {
-        if r.from.is_empty() {
+        // trim 归一（交叉复审发现 4）：UI 保存前已 trim，直连 invoke 传空白包裹
+        // 值不再落成永不相符的死规则；trim 后为空 = 空
+        let from = r.from.trim().to_string();
+        if from.is_empty() {
             return Err("工具别名规则 from 不能为空".into());
         }
-        if !seen.insert(r.from.clone()) {
-            return Err(format!("工具别名规则 from 重复: {}", r.from));
+        if from == "*" {
+            return Err("工具别名规则不支持裸「*」（空前缀会改写全部工具名）：通配请写「前缀*」如 acp_*，精确匹配请写完整工具名".into());
         }
-        if let Some(to) = &r.to {
-            if to.is_empty() {
-                return Err(format!(
-                    "工具别名规则 to 不能为空串（停用请传 null）: {}",
-                    r.from
-                ));
+        // 中间星号（如 a*b）不以 * 结尾 → 读取侧按字面量精确匹配，永不命中
+        // 任何工具名——落库层拒绝以免用户误存静默死规则
+        if from.contains('*') && !from.ends_with('*') {
+            return Err(format!(
+                "工具别名规则「*」仅支持「前缀*」结尾形态（如 acp_*）：{} 的星号不在结尾，会按字面量精确匹配而永不生效",
+                from
+            ));
+        }
+        // 多星号（a*b* / **）在读取侧是「含字面量星号的前缀」，工具名不含星号
+        // 依旧永不命中（交叉复审发现 2）——统一只放行单结尾星号形态
+        if from.matches('*').count() > 1 {
+            return Err(format!(
+                "工具别名规则仅支持一个「*」且必须在结尾（如 acp_*）：{}",
+                from
+            ));
+        }
+        if !seen.insert(from.clone()) {
+            return Err(format!("工具别名规则 from 重复: {}", from));
+        }
+        let to = match &r.to {
+            Some(t) => {
+                let t = t.trim();
+                if t.is_empty() {
+                    return Err(format!(
+                        "工具别名规则 to 不能为空串（停用请传 null）: {}",
+                        from
+                    ));
+                }
+                // 别名是逐字名：含「*」会按字面量改写（function name 含星号部分
+                // 上游不可用）且与「前缀* 通配」视觉语义冲突（交叉复审发现 3）
+                if t.contains('*') {
+                    return Err(format!(
+                        "工具别名规则 to 不支持「*」（别名是逐字名，不支持通配）: {} → {}",
+                        from, t
+                    ));
+                }
+                Some(Value::String(t.to_string()))
             }
-        }
+            None => None,
+        };
+        normalized.push(serde_json::json!({"from": from, "to": to.unwrap_or(Value::Null)}));
     }
-    crate::store::db(data_dir).kv_set("tool_alias_map", map)
+    // 落库 trim 归一后的表（保留 updated_at；未识别的额外字段读取侧本就不解析）
+    let mut out = serde_json::Map::new();
+    if let Some(u) = map.get("updated_at") {
+        out.insert("updated_at".into(), u.clone());
+    }
+    out.insert("rules".into(), Value::Array(normalized));
+    crate::store::db(data_dir).kv_set("tool_alias_map", &Value::Object(out))
 }
 
 // ==================== 指纹样本（issue #125 增强：一键从样本生成规则） ====================
@@ -367,10 +413,35 @@ mod tests {
         .is_err());
         assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "a", "to": ""}]})).is_err());
         assert!(tool_alias_map_set_at(&dir, &json!([1, 2])).is_err());
+        // 裸「*」与中间星号（a*b，非「前缀*」结尾形态的字面量死规则）均拒绝
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "*", "to": "x"}]})).is_err());
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "a*b", "to": "x"}]})).is_err());
+        // 多星号（a*b* / **：含字面量星号的前缀同样永不命中）与 to 含星号均拒绝
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "a*b*", "to": "x"}]})).is_err());
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "**", "to": "x"}]})).is_err());
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "a", "to": "x_*"}]})).is_err());
         // 拒绝后不得落库
         assert!(crate::store::db(&dir).kv_get_raw("tool_alias_map").is_none());
-        // to 缺省/null = 停用规则（合法）
+        // to 缺省/null = 停用规则（合法）；「前缀*」通配合法
         assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "a", "to": null}]})).is_ok());
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "acp_*", "to": "tool_"}]})).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 落库 trim 归一（交叉复审发现 4）：空白包裹的 from/to 落库前裁边，
+    /// 直连 invoke 不再落成永不相符的死规则；纯空白 to 视为空串拒绝
+    #[test]
+    fn tool_alias_map_trims_rule_fields_on_save() {
+        let dir = tmp_dir("alias_trim");
+        // 纯空白 to = 空串（trim 后为空）→ 拒绝
+        assert!(tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "a", "to": "   "}]})).is_err());
+        // 空白包裹值归一落库
+        tool_alias_map_set_at(&dir, &json!({"rules": [{"from": "  a*  ", "to": " b "}], "updated_at": 9}))
+            .unwrap();
+        let got = tool_alias_map_get_at(&dir).unwrap();
+        assert_eq!(got["rules"][0]["from"], json!("a*"));
+        assert_eq!(got["rules"][0]["to"], json!("b"));
+        assert_eq!(got["updated_at"], json!(9));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -368,19 +368,15 @@ fn probe_once(exe: &std::path::Path) -> Result<String, String> {
 
 /// 跑单份探针脚本：返回 stdout 全文；失败附 stderr 摘要（不含密钥——stderr 只有
 /// Node 报错栈，密钥仅经 stdout 传递）。
+/// F-75 子进程红线：经 platform::cmd::sys_command_path 构建（Windows 自动附加
+/// CREATE_NO_WINDOW 探针不闪控制台，语义与原散写 CommandExt 完全一致）
 fn run_probe_script(exe: &std::path::Path, script: &std::path::Path) -> Result<String, String> {
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = crate::platform::cmd::sys_command_path(exe);
     cmd.arg(script)
         .env("ELECTRON_RUN_AS_NODE", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        // Node 模式跑探针不闪控制台窗口（对齐 switcher/proc.rs 口径）
-        cmd.creation_flags(0x0800_0000);
-    }
     let mut child = cmd.spawn().map_err(|e| format!("客户端启动失败: {e}"))?;
     // stdout/stderr 侧线程收集（payload 数 KB）；主线程限时轮询退出。
     // 审查修复（C-L1）：收集线程经 channel + recv_timeout 回收而非裸 join——

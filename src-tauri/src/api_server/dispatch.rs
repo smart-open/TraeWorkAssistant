@@ -452,6 +452,28 @@ fn log_fallback(state: &ApiSharedState, model: &str, preferred: TargetPool, actu
     );
 }
 
+/// Key 绑定池候选序（issue #25/#90 绑定语义：绑定池优先 + 池内同构兜底位）。
+/// 主循环选池与粘性命中建链（审查 A-3）共用，防两处字面量漂移。
+/// b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"buddy-ai"/"qoder"/"custom"
+fn bind_pool_order(b: &str) -> Vec<TargetPool> {
+    if b == "trae" {
+        vec![TargetPool::Trae, TargetPool::Buddy]
+    } else if b == "custom" {
+        // v3 决策 C：绑定 custom = custom 优先 + 不可用按序回退（「偏好非硬限制」）；
+        // 其余池由尾部补全循环按默认序追加
+        vec![TargetPool::Custom]
+    } else if b == "qoder" {
+        // Qoder 绑定（审查修复：原先落 else 被当 Buddy 处理，「Key 绑定池 >
+        // 全局策略」对 Qoder 断链——多源模型先打 Buddy，仅回退才到 Qoder）
+        vec![TargetPool::Qoder, TargetPool::Buddy, TargetPool::Trae]
+    } else if b == "buddy-ai" {
+        // buddy-ai 绑定：国际档优先，国内 Buddy 兜底（同源回退不跨账号体系）
+        vec![TargetPool::BuddyAi, TargetPool::Buddy, TargetPool::Trae]
+    } else {
+        vec![TargetPool::Buddy, TargetPool::Trae]
+    }
+}
+
 /// 统一调度分流点（§4.1 ②~⑥）：替代原 `resolve_wb_target` 单向判定。
 ///
 /// - `key_id`：命中 Key 条目 id（None = 匿名/未启用鉴权）；用于 Key 级资源池
@@ -766,21 +788,24 @@ pub fn resolve_target(
                 let policy = load_policy(&state.data_dir);
                 let mut chain: Vec<PoolCandidate> = Vec::new();
                 if policy.fallback && forced_pool.is_none() && pool != TargetPool::Custom {
-                    // 候选序与主循环同构：per_model/优先级序 + POOL_FIXED_ORDER 尾补。
+                    // 候选序与主循环同构：绑定序（bind_pool_order）/per_model/优先级序
+                    // + POOL_FIXED_ORDER 尾补（main 侧审查 A-3 收口：粘性链链序感知
+                    // 绑定强制序，闭合此前「绑定场景链序偏差」备案）。
                     // 口径差异备案（三审查 A-L1）：粘性链内永不含 Custom（双重排除），
                     // 主循环链可含 Custom（执行期 cross_pool 跳过）——终态等价；若
                     // 未来执行期支持 Custom 目标，需同步放开粘性链的 Custom 排除。
-                    // 绑定 Key 场景（三审查 A-L3）：链序按 per_model/priority 构建，
-                    // 未感知绑定强制序——链是机会性候选且执行期会健康复核，偏差可
-                    // 接受，严格对齐需在此按 bind 分支取序
-                    let mut seq: Vec<TargetPool> = policy
-                        .per_model
-                        .get(&canonical)
-                        .cloned()
-                        .unwrap_or_else(|| policy.priority.clone())
-                        .iter()
-                        .filter_map(|s| TargetPool::parse(s))
-                        .collect();
+                    let mut seq: Vec<TargetPool> = if let Some(b) = bind {
+                        bind_pool_order(b)
+                    } else {
+                        policy
+                            .per_model
+                            .get(&canonical)
+                            .cloned()
+                            .unwrap_or_else(|| policy.priority.clone())
+                            .iter()
+                            .filter_map(|s| TargetPool::parse(s))
+                            .collect()
+                    };
                     for p in POOL_FIXED_ORDER {
                         if !seq.contains(&p) {
                             seq.push(p);
@@ -825,22 +850,7 @@ pub fn resolve_target(
         vec![p]
     } else if let Some(b) = bind {
         // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"buddy-ai"/"qoder"/"custom"，无需再 parse
-        if b == "trae" {
-            vec![TargetPool::Trae, TargetPool::Buddy]
-        } else if b == "custom" {
-            // v3 决策 C：绑定 custom = custom 优先 + 不可用按序回退（「偏好非硬限制」）；
-            // 其余池由尾部补全循环按默认序追加
-            vec![TargetPool::Custom]
-        } else if b == "qoder" {
-            // Qoder 绑定（审查修复：原先落 else 被当 Buddy 处理，「Key 绑定池 >
-            // 全局策略」对 Qoder 断链——多源模型先打 Buddy，仅回退才到 Qoder）
-            vec![TargetPool::Qoder, TargetPool::Buddy, TargetPool::Trae]
-        } else if b == "buddy-ai" {
-            // buddy-ai 绑定：国际档优先，国内 Buddy 兜底（同源回退不跨账号体系）
-            vec![TargetPool::BuddyAi, TargetPool::Buddy, TargetPool::Trae]
-        } else {
-            vec![TargetPool::Buddy, TargetPool::Trae]
-        }
+        bind_pool_order(b)
     } else {
         policy
             .per_model
@@ -2648,6 +2658,64 @@ mod tests {
         assert_eq!(r.pool, TargetPool::Buddy);
         assert!(r.fallback_chain.is_empty());
         assert_eq!(r.fallback_from, None);
+    }
+
+    /// 审查 A-3：粘性命中（TTL 内沿用上轮胜出池）也构建跨池回退链——粘性池
+    /// 耗尽后可移交下一池而非直接 503；链序与主循环同构（绑定序/per_model/
+    /// priority + 尾补），且不含粘性胜出池本身（M-1 同口径）
+    #[test]
+    fn t81_sticky_hit_builds_fallback_chain() {
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&policy_default()));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        // 第一轮：Buddy 胜出并写入池粘性
+        assert_eq!(f.resolve("glm-5.3").unwrap().pool, TargetPool::Buddy);
+        // 第二轮同会话粘性命中 Buddy：链收 Trae，粘性池本身不入链
+        let r = f.resolve("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        assert_eq!(r.fallback_from, None);
+        assert_eq!(r.fallback_chain.len(), 1);
+        assert_eq!(r.fallback_chain[0].pool, TargetPool::Trae);
+    }
+
+    /// 审查 A-4：Custom 胜出时后续健康池不进链——custom 上游组内自冗余
+    ///（组内熔断/换上游自理），链上候选无人消费，收链纯噪音
+    #[test]
+    fn t81_custom_win_skips_chain_collection() {
+        // per_model 把 custom 排前：custom 胜出（上游健康），Trae 健康 → 门控下不进链
+        let mut p = policy_default();
+        p.per_model
+            .insert("glm-5.3".into(), vec!["custom".into(), "trae".into()]);
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        let cm: super::super::custom_models::CustomModel = serde_json::from_value(json!({
+            "name": "glm-5.3",
+            "base_url": "https://custom.example.invalid",
+            "enabled": true
+        }))
+        .unwrap();
+        super::super::custom_models::upsert(&f.dir, cm).unwrap();
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Custom);
+        assert!(r.fallback_chain.is_empty());
+    }
+
+    /// 审查 M-1：priority 配置重复池（[buddy, trae, buddy]）且 Buddy 胜出时，
+    /// 第二个 Buddy 不得再次入链——防链尾回头重试刚失败的胜出池
+    #[test]
+    fn t81_fallback_chain_dedupes_duplicate_priority() {
+        let mut p = policy_default();
+        p.strategy = DispatchStrategy::Priority;
+        p.priority = vec!["buddy".into(), "trae".into(), "buddy".into()];
+        let f = fixture(&["glm-5.3"], Some(&["glm-5.3"]), Some(&p));
+        f.seed_healthy(true);
+        f.seed_healthy(false);
+        let r = f.resolve_no_session("glm-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::Buddy);
+        // Trae 收进链一次；重复的 Buddy（胜出池）不入链
+        assert_eq!(r.fallback_chain.len(), 1);
+        assert_eq!(r.fallback_chain[0].pool, TargetPool::Trae);
+        assert!(!r.fallback_chain.iter().any(|c| c.pool == TargetPool::Buddy));
     }
 
     // ---------- 后缀剥离跨池（issue #31 T3.1） ----------
