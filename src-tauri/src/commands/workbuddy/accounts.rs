@@ -181,6 +181,29 @@ fn cb_slot_missing_login(slot_dir: &std::path::Path) -> bool {
     has == 0
 }
 
+/// CodeBuddy 槽位「快照异常」判定（2026-11-10 加固）：以**内容级身份**（槽内
+/// vscdb genie.userId，confirm 期望链同源的权威答案）分派——
+/// - 内容身份 = 账号本人：登录态本体正确，meta.uid 历史污染（WorkBuddy auth uid
+///   误写入 CB 槽位 meta，本机实测 4/6 账号中招）不判异常，仅缺登录令牌（登出态
+///   残留）仍判异常；
+/// - 内容身份是别的账号（A 的现场写进 A' 槽位）：切回去必登错账号，无论 meta 是否
+///   一致都判异常（10-30 写守卫上线前保存的槽位可能存在 meta 恰好一致的漏报形态）；
+/// - 内容身份读不到（无 vscdb/storage.json / genie 空）：维持原口径——槽位身份
+///   不符（meta.uid ≠ 账号 uid）或缺令牌。
+fn cb_slot_invalid(dir: &std::path::Path, id: &str, account_uid: &str) -> bool {
+    let slot = dir.join(id);
+    match crate::switcher::authfile::cb_slot_content_uid(&slot) {
+        Some(uid) if uid == account_uid => cb_slot_missing_login(&slot),
+        Some(_) => true,
+        None => {
+            crate::switcher::authfile::read_slot_uid(dir, id)
+                .map(|u| u != account_uid)
+                .unwrap_or(false)
+                || cb_slot_missing_login(&slot)
+        }
+    }
+}
+
 fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, String> {
     let pool = load_pool(state);
     // 在线判定：auth 文件 uid 与账号一致（客户端当前生效登录）
@@ -254,8 +277,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                     .unwrap_or(false)
             };
             let snap_invalid = mismatch(&snap_path);
-            let snap_cb_invalid = mismatch(&snap_cb_path)
-                || cb_slot_missing_login(&snap_cb_path.join(&a.id));
+            let snap_cb_invalid = cb_slot_invalid(&snap_cb_path, &a.id, &a.uid);
             WorkBuddyAccountView {
                 id: a.id.clone(),
                 uid: a.uid.clone(),
@@ -1127,6 +1149,116 @@ mod tests {
     // extract_access_token_with_hint 间接引用）
     use super::super::common::{auth_key_names, extract_access_token};
     use crate::fs_utils;
+
+    /// 2026-11-10 加固回归：CB 槽位「快照异常」判定容忍 meta 污染——槽内
+    /// vscdb genie.userId 与账号一致时，meta.uid 被他端 uid 污染不判异常，
+    /// 仅缺登录令牌仍判异常；内容身份不一致/缺失维持原口径。
+    #[test]
+    fn cb_slot_invalid_tolerates_polluted_meta_when_content_identity_matches() {
+        let dir = std::env::temp_dir().join(format!(
+            "sw-cb-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("slot-1").join("vscdb")).unwrap();
+        let acct_uid = "a7cd23f1-efa8-4cf7-a837-3022d3a30c78";
+        let polluted = "c93377d8-e509-456c-90d7-2b1f22b494fb";
+
+        // 内容身份一致 + meta 污染 + 令牌在 → 不判异常（此前误报红标的形态）
+        std::fs::write(
+            dir.join("slot-1").join("meta.json"),
+            format!(r#"{{"uid":"{polluted}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("slot-1").join("vscdb").join("storage.json"),
+            format!(r#"{{"genie.userId":"{acct_uid}"}}"#),
+        )
+        .unwrap();
+        let db = dir.join("slot-1").join("vscdb").join("state.vscdb");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            [
+                r#"secret://{"extensionId":"tencent-cloud.coding-copilot","key":"planning-genie.new.accessTokencn"}"#,
+                "token",
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            !super::cb_slot_invalid(&dir, "slot-1", acct_uid),
+            "内容身份一致 + 令牌在：meta 污染不得判异常"
+        );
+
+        // 内容身份一致但缺令牌（登出态残留）→ 仍判异常
+        std::fs::remove_file(&db).unwrap();
+        let conn2 = rusqlite::Connection::open(&db).unwrap();
+        conn2.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        drop(conn2);
+        assert!(
+            super::cb_slot_invalid(&dir, "slot-1", acct_uid),
+            "缺登录令牌仍须判异常"
+        );
+
+        // 内容身份与账号不一致（真污染现场：槽里装的是别人）→ 直接判异常
+        std::fs::write(
+            dir.join("slot-1").join("vscdb").join("storage.json"),
+            format!(r#"{{"genie.userId":"{polluted}"}}"#),
+        )
+        .unwrap();
+        assert!(
+            super::cb_slot_invalid(&dir, "slot-1", acct_uid),
+            "内容身份不一致须判异常"
+        );
+
+        // 历史漏报形态（10-30 写守卫上线前的槽位）：meta 恰好与账号一致、令牌在，
+        // 但内容身份是别的账号 → 仍须判异常（切回去必登错人）
+        let conn3 = rusqlite::Connection::open(&db).unwrap();
+        conn3.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            [
+                r#"secret://{"extensionId":"tencent-cloud.coding-copilot","key":"planning-genie.new.accessTokencn"}"#,
+                "token",
+            ],
+        )
+        .unwrap();
+        drop(conn3);
+        std::fs::write(
+            dir.join("slot-1").join("meta.json"),
+            format!(r#"{{"uid":"{acct_uid}"}}"#),
+        )
+        .unwrap();
+        assert!(
+            super::cb_slot_invalid(&dir, "slot-1", acct_uid),
+            "内容为他人账号时 meta 一致也不得放行"
+        );
+
+        // 内容身份读不到（genie 空）→ 维持原口径：meta 一致 + 令牌在 → 有效
+        std::fs::write(
+            dir.join("slot-1").join("vscdb").join("storage.json"),
+            r#"{"other":"x"}"#,
+        )
+        .unwrap();
+        assert!(
+            !super::cb_slot_invalid(&dir, "slot-1", acct_uid),
+            "内容身份读不到时维持原口径"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn entry(id: &str, uid: &str, nickname: &str) -> WorkBuddyAccount {
         WorkBuddyAccount {

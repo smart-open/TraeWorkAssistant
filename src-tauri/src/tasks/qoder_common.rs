@@ -1097,6 +1097,9 @@ fn is_pat_channel(creds: &QoderCreds) -> bool {
 /// 返回 (creds, refreshed, note)，note ∈ no_credential/vault_down/fresh/
 /// expired_needs_relogin/refreshed/refreshed_unsaved/refresh_failed/auth_dead/
 /// pat_rejected/refresh_busy。
+/// 永久失败出口（expired_needs_relogin / auth_dead / pat_rejected）均已在函数内
+/// 回写池 needs_relogin（徽标/看板/调度跳过即时生效；重登或重导 PAT 续期成功后
+/// 由 sync_pool_expiry 复位），调用方无需再落库。
 /// vault_down（issue #153 修复 2）：vault 系统性故障（DPAPI/快照/锁）导致凭证
 /// 读出为空，与「确实无凭证」区分——暂态语义，调用方不得据此永久禁用账号。
 /// refresh_busy（H3 审查修复）：账号级跨进程刷新锁被他进程持有时，沿用当前
@@ -1192,7 +1195,12 @@ pub fn ensure_fresh(
             // 此前误报 pat_rejected 会被当成「重试无解」放弃 + 误导用户重导 PAT）；
             // 首通道 4xx 才是 PAT 被拒（永久，需人工）
             Err(JobExchangeFail::Transient) => (creds, false, "refresh_failed"),
-            Err(JobExchangeFail::Rejected) => (creds, false, "pat_rejected"),
+            Err(JobExchangeFail::Rejected) => {
+                // PAT 被拒同样重试无解：回写池 needs_relogin 徽标即时生效
+                //（重导 PAT 并续期成功后由 sync_pool_expiry 复位）
+                mark_needs_relogin(state, acct_id, "PAT 已被服务端拒绝（无效或已吊销），请重新导入 PAT");
+                (creds, false, "pat_rejected")
+            }
         };
     }
     // ── 客户端 token 通道：惰性刷新（deviceToken/refresh）──
@@ -1200,16 +1208,41 @@ pub fn ensure_fresh(
     // 客户端刷新。原实现仅在「已过期且带 expires_at」时前置判定，其余空 refresh_token
     // 场景会掉进 refresh_token_once_ex 的空守卫被误报 refresh_failed（暂态），触发无效重试
     if creds.refresh_token.is_empty() {
-        if let Some(exp) = creds.expires_at_ms {
-            let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
-            if remain_h > lazy_hours as f64 {
-                return (creds, false, "fresh");
+        let needs_relogin = match creds.expires_at_ms {
+            Some(exp) => {
+                let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
+                remain_h <= lazy_hours as f64
             }
-        } else {
             // 无 expires_at 也无 refresh_token：无法判定新鲜度也无法刷新，按需重登
+            None => true,
+        };
+        if !needs_relogin {
+            return (creds, false, "fresh");
+        }
+        // 回写池 needs_relogin（对照 auth_dead 同款）：此前仅返回 note 不落库，
+        // 徽标滞留「Token 有效」+ 过期日期，看板/调度跳过口径永不生效。
+        // 无 RT 即无自动续期通道，重试注定失败；用户重登/OAuth 重新入池后
+        // 由 sync_pool_expiry（续期成功路径）复位。reason 按有无到期时间区分
+        //（无 expires_at 时「已过期」文案失真）。
+        // **落库复核（审查修复）**：初次读取后他进程可能已刷新落库写入新 RT——
+        // 此处重读一次，有 RT 则放弃永久标记继续走客户端通道（下方持跨进程锁后
+        // 还会重读生效凭证），避免把他进程刚救活的账号误标 needs_relogin 且被
+        // 调度跳过后无法自复位
+        let recheck = effective_creds(state, acct_id);
+        if recheck.refresh_token.is_empty() {
+            // 复核读空先探 vault（对齐函数头部/持锁后两处同构守卫）：
+            // vault 故障期读空 ≠ 真无 RT，不得永久标记
+            if !crate::vault::available(&state.data_dir) {
+                return (creds, false, "vault_down");
+            }
+            let reason = if creds.expires_at_ms.is_some() {
+                "凭证已过期且无刷新令牌，无法自动续期"
+            } else {
+                "凭证无刷新令牌且无到期时间，无法自动续期"
+            };
+            mark_needs_relogin(state, acct_id, reason);
             return (creds, false, "expired_needs_relogin");
         }
-        return (creds, false, "expired_needs_relogin");
     }
     if let Some(exp) = creds.expires_at_ms {
         let remain_h = (exp - now_ms) as f64 / 3_600_000.0;

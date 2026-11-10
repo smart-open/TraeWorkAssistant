@@ -150,14 +150,17 @@ pub(crate) fn read_slot_uid(dir: &Path, id: &str) -> Option<String> {
     read_slot_meta_uid(&dir.join(id))
 }
 
-/// 客户端当前 live 登录身份：CodeBuddy 系取 `globalStorage\storage.json` 的 genie.userId
-/// （缺失回退共享 auth 文件 uid），WorkBuddy 系优先 skeleton 登录快照 primary.uid、
-/// 缺失才回退 auth 文件 uid。
-/// 注意：共享 auth 文件记录的是 **WorkBuddy** 当前账号，与 CodeBuddy 端可能不一致，
-/// 故 CodeBuddy 系必须优先用 genie.userId；WorkBuddy 系同理——现版本客户端接受登录
-/// 后只重写 skeleton 快照、不回写 auth 文件（2026-10-30 实测 auth mtime 停在旧日期），
-/// 手动登录后立即「保存当前登录态」时 auth 文件可能仍停在上一个账号，用它会触发
-/// 槽位身份对齐守卫误拦；skeleton primary.uid 随每次登录/切换重写，是更可信的 live 信号。
+/// 客户端当前 live 登录身份：CodeBuddy 系取 `globalStorage\storage.json` 的 genie.userId；
+/// WorkBuddy 系优先 skeleton 登录快照 primary.uid、缺失才回退 auth 文件 uid。
+/// **2026-11-10 污染源头切断**：共享 auth 文件记录的是 **WorkBuddy** 当前账号，
+/// CB 系 genie.userId 读不到时回退它，会把 WorkBuddy 的 uid 写进 CB 槽位 meta.json
+///（本机确诊的「CB快照异常」全量误报根因：4/6 账号槽位 meta.uid 均为他端 uid）。
+/// 故 CB 系 genie 读不到 = 客户端未运行/未登录/genie 未回写，fail-closed 返回 None
+///（守卫跳过比对、meta 落 null，绝不落他端身份）。
+/// WorkBuddy 系同理优先 skeleton——现版本客户端接受登录后只重写 skeleton 快照、
+/// 不回写 auth 文件（2026-10-30 实测 auth mtime 停在旧日期），手动登录后立即
+/// 「保存当前登录态」时 auth 文件可能仍停在上一个账号，用它会触发槽位身份对齐
+/// 守卫误拦；skeleton primary.uid 随每次登录/切换重写，是更可信的 live 信号。
 pub(crate) fn live_login_uid(sess: &Session) -> Option<String> {
     if matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
         sess.prof
@@ -171,10 +174,23 @@ pub(crate) fn live_login_uid(sess: &Session) -> Option<String> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
             })
-            .or_else(|| auth_file_uid(&sess.auth_file))
     } else {
         skeleton_snapshot_uid(sess).or_else(|| auth_file_uid(&sess.auth_file))
     }
+}
+
+/// 槽位**内容级**登录身份：槽内 `vscdb/storage.json` 的 genie.userId（恢复会把它
+/// 原样拷进 live，是「槽里装的是谁」的权威答案，confirm_switch 期望链同源）。
+/// 缺失/损坏 → None。`pub(crate)`：账号列表读侧容忍判定（commands/workbuddy/
+/// accounts.rs）复用同一份解析，避免两处各写一套键序而漂移。
+pub(crate) fn cb_slot_content_uid(slot_dir: &Path) -> Option<String> {
+    let raw = crate::fs_utils::read_json::<serde_json::Value>(
+        &slot_dir.join("vscdb").join("storage.json"),
+    );
+    crate::fs_utils::dig(&raw, &["genie.userId"])
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// WorkBuddy skeleton 登录快照（`storage\skeleton\account-snapshot.json`）的
@@ -210,27 +226,38 @@ pub fn backup_authfile(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> R
         );
         return Ok(());
     }
-    // live 身份（L2 用，同时做槽位身份对齐守卫）：CodeBuddy 系优先读 genie.userId，
-    // 缺失才回退共享 auth 文件（auth 文件记录的是 WorkBuddy 当前登录账号，与 CodeBuddy
-    // 端不一致时会把 WorkBuddy 的 uid 写进 CodeBuddy 槽位 meta）。
+    // live 身份（L2 用，同时做槽位身份对齐守卫）：CodeBuddy 系只读 genie.userId
+    //（2026-11-10 切断 auth 文件回退——那会把 WorkBuddy 的 uid 写进 CodeBuddy 槽位
+    // meta），WorkBuddy 系 skeleton 优先、缺失回退 auth 文件。
     let uid = live_login_uid(sess);
 
     // 槽位身份对齐守卫（2026-10-30 实测）：客户端把无效会话回退到账号 A 后，流程仍按
     // 「检测到的目标 A'」把现场写进 A' 槽位，结果 A' 槽里装的是 A 的登录态（槽 meta.uid
     // 与槽位账号不符，下次切换必然失败）。具名槽位写入前比对原有 meta.uid 与当前 live
     // 身份，不一致就跳过；last/last.bak 是"当前现场"备份，放行。
+    // **内容级放行（2026-11-10 加固）**：守卫本意是防「A 的现场写进 A' 槽位」；槽内
+    // vscdb genie.userId 与 live 一致说明槽里装的就是当前登录的这个账号，meta.uid
+    // 不一致只是历史污染（WorkBuddy auth uid 误写入）——放行回写并顺带把 meta 修正
+    // 为正确身份（下方 meta 写入用 live uid），「保存当前登录态」从此也是 meta 污染
+    // 的自愈路径。
     if is_named_slot(slot) {
-        if let (Some(live), Some(prev)) = (uid.as_deref(), read_slot_meta_uid(&dest)) {
-            if prev != live {
-                sink.step(
-                    "backup",
-                    StepStatus::Warn,
-                    &format!(
-                        "槽位 {slot} 原有登录身份 {prev}，与客户端当前实际登录 {live} 不一致，\
-                         已跳过回写（防止把别的账号登录态写进该槽位）；请确认客户端已登录目标账号后重试"
-                    ),
-                );
-                return Ok(());
+        let content_healed = matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI")
+            && uid
+                .as_deref()
+                .is_some_and(|live| cb_slot_content_uid(&dest).as_deref() == Some(live));
+        if !content_healed {
+            if let (Some(live), Some(prev)) = (uid.as_deref(), read_slot_meta_uid(&dest)) {
+                if prev != live {
+                    sink.step(
+                        "backup",
+                        StepStatus::Warn,
+                        &format!(
+                            "槽位 {slot} 原有登录身份 {prev}，与客户端当前实际登录 {live} 不一致，\
+                             已跳过回写（防止把别的账号登录态写进该槽位）；请确认客户端已登录目标账号后重试"
+                        ),
+                    );
+                    return Ok(());
+                }
             }
         }
     }
@@ -1084,6 +1111,30 @@ fn mark_slot_key(profiles_dir: &std::path::Path, slot: &str, key: &str) {
     let _ = crate::fs_utils::write_text_atomic(&path, &v.to_string());
 }
 
+/// 确认成功后的 meta 自愈（2026-11-10 加固）：槽位 meta.json 的 uid 与确认身份
+/// 不一致（历史污染：WorkBuddy auth uid 误写入 CB 槽位）时改写为确认身份，其余
+/// 字段原样保留；uid 已一致则不动，meta 缺失/损坏跳过（合成升级路径会全量重写）。
+/// 失败静默——meta 修正不改变确认语义。
+fn heal_slot_meta_uid(profiles_dir: &std::path::Path, slot: &str, uid: &str) {
+    let path = profiles_dir.join(slot).join("meta.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut v) =
+        serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
+    else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    if obj.get("uid").and_then(|x| x.as_str()) == Some(uid) {
+        return;
+    }
+    obj.insert("uid".into(), serde_json::json!(uid));
+    let _ = crate::fs_utils::write_text_atomic(&path, &v.to_string());
+}
+
 /// 清除切换验证标记（身份不符 / 超时均清；确认登录成功或重新保存快照时）。
 pub(crate) fn clear_snapshot_verify_failed(profiles_dir: &std::path::Path, slot: &str) {
     let path = profiles_dir.join(slot).join("meta.json");
@@ -1566,6 +1617,27 @@ pub(crate) fn client_log_says_session_dead(
 /// 「客户端尚未回写」，判 Reverted 即假阳性。
 /// WorkBuddy 信号②本就是内容级校验，直接确认（零额外延迟）。
 fn confirm_ok(sess: &Session, slot: &str, expect_uid: &str, sink: &dyn ProgressSink) -> VerifyResult {
+    let result = confirm_ok_inner(sess, slot, expect_uid, sink);
+    if result == VerifyResult::Ok {
+        // **meta 自愈（2026-11-10 加固）**：确认成功 = live 身份已权威确认等于
+        // expect_uid。历史槽位 meta.uid 可能被 WorkBuddy auth uid 污染（本机确诊的
+        // 「CB快照异常」根因），顺手把 meta 修正为确认身份——切换成功即自愈，无需
+        // 人工删快照重存。expect_uid 来自槽名兜底（wb-<池id> ≠ uuid uid）时不是
+        // 真实登录身份，不写。
+        if expect_uid != slot {
+            heal_slot_meta_uid(&sess.prof.profiles_dir, slot, expect_uid);
+        }
+    }
+    result
+}
+
+/// 确认收尾 + 信号④ live 身份复核（真正的实现，见 confirm_ok 注释）。
+fn confirm_ok_inner(
+    sess: &Session,
+    slot: &str,
+    expect_uid: &str,
+    sink: &dyn ProgressSink,
+) -> VerifyResult {
     if !matches!(sess.prof.app_name, "CodeBuddy" | "CodeBuddy AI") {
         sink.step("verify", StepStatus::Ok, "登录身份已确认为目标账号");
         return VerifyResult::Ok;
@@ -1751,6 +1823,150 @@ mod tests {
             .join("auth")
             .join(WB_AUTH_FILE_NAME)
             .exists());
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 2026-11-10 加固回归：CB live 身份 fail-closed——genie.userId 读不到时
+    /// 不得回退共享 auth 文件（那是 WorkBuddy 的登录账号，回退会把它写进 CB
+    /// 槽位 meta，即本机确诊的「CB快照异常」全量误报污染源头）。
+    #[test]
+    fn live登录身份_codebuddy系不再回退共享auth文件() {
+        let _guard = test_io_lock();
+        let mut sess = session(TargetApp::CodeBuddy, "cb-live-failclosed");
+        // auth 文件带 WorkBuddy 侧 uid，但 CB 系不得采用
+        std::fs::create_dir_all(&sess.auth_dir).unwrap();
+        std::fs::write(&sess.auth_file, r#"{"account":{"uid":"uid-wb"}}"#).unwrap();
+        // genie 缺失（storage.json 不存在）→ None
+        let gs_empty = sess.data_dir.join("gs-empty");
+        std::fs::create_dir_all(&gs_empty).unwrap();
+        sess.prof.cb_global_storage_dir = Some(gs_empty);
+        assert_eq!(
+            live_login_uid(&sess),
+            None,
+            "genie 读不到必须 fail-closed，不得回退 auth 文件 uid"
+        );
+        // genie 存在 → 采用 genie 身份
+        let gs = sess.data_dir.join("gs");
+        std::fs::create_dir_all(&gs).unwrap();
+        std::fs::write(gs.join("storage.json"), r#"{"genie.userId":"uid-cb"}"#).unwrap();
+        sess.prof.cb_global_storage_dir = Some(gs);
+        assert_eq!(live_login_uid(&sess), Some("uid-cb".into()));
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 2026-11-10 加固回归：保存守卫内容级放行——槽内 vscdb genie.userId 与 live
+    /// 一致时，meta.uid 历史污染不再拦截回写，且回写把 meta 修正为正确身份；
+    /// 内容身份不一致时维持原守卫（拒绝回写、不动 meta）。
+    #[test]
+    fn 备份守卫对内容身份一致的污染槽位放行并修正meta() {
+        let _guard = test_io_lock();
+        let mut sess = session(TargetApp::CodeBuddy, "cb-guard-heal");
+        let sink = QuietSink;
+        let gs = sess.data_dir.join("gs");
+        std::fs::create_dir_all(&gs).unwrap();
+        std::fs::write(gs.join("storage.json"), r#"{"genie.userId":"uid-live"}"#).unwrap();
+        sess.prof.cb_global_storage_dir = Some(gs);
+
+        // 槽位：meta.uid 被污染为 WorkBuddy 侧 uid，但槽内登录态本体身份正确
+        let slot_dir = sess.prof.profiles_dir.join("100");
+        std::fs::create_dir_all(slot_dir.join("vscdb")).unwrap();
+        std::fs::write(slot_dir.join("meta.json"), r#"{"uid":"uid-polluted","savedAt":"2026-11-10 10:00:00"}"#).unwrap();
+        std::fs::write(
+            slot_dir.join("vscdb").join("storage.json"),
+            r#"{"genie.userId":"uid-live"}"#,
+        )
+        .unwrap();
+
+        backup_authfile(&sess, "100", &sink).expect("内容身份一致应放行回写");
+        let meta = std::fs::read_to_string(slot_dir.join("meta.json")).unwrap();
+        assert!(
+            meta.contains("\"uid\":\"uid-live\""),
+            "回写应把 meta.uid 修正为正确身份：{meta}"
+        );
+
+        // 对照：槽内内容身份与 live 不一致（真污染现场）→ 维持守卫拒绝
+        let slot2_dir = sess.prof.profiles_dir.join("200");
+        std::fs::create_dir_all(slot2_dir.join("vscdb")).unwrap();
+        std::fs::write(slot2_dir.join("meta.json"), r#"{"uid":"uid-x"}"#).unwrap();
+        std::fs::write(
+            slot2_dir.join("vscdb").join("storage.json"),
+            r#"{"genie.userId":"uid-other"}"#,
+        )
+        .unwrap();
+        backup_authfile(&sess, "200", &sink).expect("身份不符应跳过并返回 Ok");
+        let meta2 = std::fs::read_to_string(slot2_dir.join("meta.json")).unwrap();
+        assert!(meta2.contains("uid-x"), "内容身份不一致时 meta 不得被改写：{meta2}");
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 2026-11-10 加固回归：heal_slot_meta_uid 三态——污染重写（保留其他字段）、
+    /// 已一致不动、meta 缺失不凭空创建。
+    #[test]
+    fn meta身份自愈_重写保留字段_缺失跳过() {
+        let _guard = test_io_lock();
+        let sess = session(TargetApp::WorkBuddy, "heal-meta");
+        let slot_dir = sess.prof.profiles_dir.join("100");
+        std::fs::create_dir_all(&slot_dir).unwrap();
+
+        // meta 缺失 → 不创建
+        heal_slot_meta_uid(&sess.prof.profiles_dir, "100", "uid-t");
+        assert!(!slot_dir.join("meta.json").exists(), "meta 缺失时不得凭空创建");
+
+        // 污染 → 重写 uid 且保留其他字段
+        std::fs::write(
+            slot_dir.join("meta.json"),
+            r#"{"uid":"uid-old","savedAt":"2026-11-10 10:00:00","savedAtMs":1}"#,
+        )
+        .unwrap();
+        heal_slot_meta_uid(&sess.prof.profiles_dir, "100", "uid-t");
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(slot_dir.join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["uid"], "uid-t");
+        assert_eq!(v["savedAt"], "2026-11-10 10:00:00", "其余字段必须保留");
+        assert_eq!(v["savedAtMs"], 1);
+
+        // 已一致 → 内容不变（重写无意义）
+        heal_slot_meta_uid(&sess.prof.profiles_dir, "100", "uid-t");
+        let v2: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(slot_dir.join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v2, v, "uid 已一致时不得改写");
+        let _ = std::fs::remove_dir_all(&sess.data_dir);
+    }
+
+    /// 2026-11-10 加固回归：确认成功（Ok）即自愈槽位 meta.uid——切换成功后无需
+    /// 人工删快照重存；expect_uid 来自槽名兜底（wb-<池id>）时不写（那不是真实
+    /// 登录身份）。WorkBuddy 会话走 confirm_ok 零延迟 Ok 分支。
+    #[test]
+    fn 确认成功自愈槽位meta身份() {
+        let _guard = test_io_lock();
+        let sess = session(TargetApp::WorkBuddy, "confirm-heal");
+        let sink = QuietSink;
+        let slot_dir = sess.prof.profiles_dir.join("100");
+        std::fs::create_dir_all(&slot_dir).unwrap();
+        std::fs::write(
+            slot_dir.join("meta.json"),
+            r#"{"uid":"uid-polluted","savedAt":"2026-11-10 10:00:00"}"#,
+        )
+        .unwrap();
+
+        let result = confirm_ok(&sess, "100", "uid-target", &sink);
+        assert!(matches!(result, VerifyResult::Ok));
+        let meta = std::fs::read_to_string(slot_dir.join("meta.json")).unwrap();
+        assert!(meta.contains("\"uid\":\"uid-target\""), "确认成功应修正 meta.uid：{meta}");
+        assert!(meta.contains("2026-11-10 10:00:00"), "其余字段必须保留：{meta}");
+
+        // expect_uid == 槽名（兜底链走到底）→ 不是真实身份，不得写 meta
+        let r2 = confirm_ok(&sess, "100", "100", &sink);
+        assert!(matches!(r2, VerifyResult::Ok));
+        let meta2 = std::fs::read_to_string(slot_dir.join("meta.json")).unwrap();
+        assert!(
+            meta2.contains("\"uid\":\"uid-target\""),
+            "槽名兜底不得改写 meta：{meta2}"
+        );
         let _ = std::fs::remove_dir_all(&sess.data_dir);
     }
 
@@ -2044,6 +2260,10 @@ mod tests {
         )
         .unwrap();
         assert!(client_log_says_session_dead(&dir, None));
+        // 2026-11-10 偶发修复：最新日志按 mtime 选取（严格 >，并列保留先遍历者）。
+        // 满载并发下两次写入可能落进同一 mtime 粒度 → 旧会话（invalid_grant）被
+        // 选为最新 → 断言偶发失败；与 CB 版测试同款，写入间保证 mtime 间隔。
+        std::thread::sleep(std::time::Duration::from_millis(30));
         // 换一天的新目录（无标记）→ 不判死
         let day2 = dir.join("logs").join("2026-10-31");
         std::fs::create_dir_all(&day2).unwrap();
