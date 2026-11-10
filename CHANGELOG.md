@@ -6,6 +6,25 @@
 
 ---
 
+## [1.6.4] · 2026-11-10 · 语义移植 main afe1966 => 63c354f（3 提交）
+
+> 语义移植 afe1966（issue #198 批次）及其后 2 提交（2b87e1a 网关审查修复批次、63c354f DSH 11128 三轮审查加固），未 merge；跳过桌面/OS 专属项：更新包下载信任锚（updater 桌面更新器专属）、workbuddy_atrest 解密层与客户端密钥探针、App.tsx 静默更新、tauri proxy_logs_list 命令（docker 无 ProxyLogsTab，logsRecent 已支持 days 透传）、账号页帮助弹窗滚动高度；cmd_bridge 异步化由既有 spawn_blocking 结构性覆盖，无须移植。
+
+### 新功能
+- **工具别名前缀通配规则**：`from` 以 `*` 结尾按前缀替换语义生效（内置布防 `acp_*→tool_`，ACP 桥接命名族无须逐一布防）；精确规则优先于通配；生成名与存活真实名碰撞/恒等改写一律跳过；冲突否决回滚后名字仍可被后续规则接管（链式回归锁定）；停用规则（to=null）落空 to 占位并阻断通配接管；`tool_alias_map_set_at` 落库拒绝裸 `*`。
+- **11128 诊断闭环升级（issue #195）**：六处 Fatal 站点收敛到 `log_and_record_11128` 公共 helper（指纹样本 + 本次命中流水 + 池级短记忆 + 残留自检口径一致），清洗后样本同采（`11128_cleaned` Badge，进出对比漏网现形）；本次请求命中流水改 `template_hits_mark`/`template_hits_since` 游标（环形缓冲 4096），样本行附带「本次实际命中」而非进程级历史累计，别名命中以「别名」前缀区分；残指纹自检扩展 tools 维度（工具名特征词、`acp_` 前缀残留、别名 from 清洗后仍存活，去重保序）；样本工具名改全量落样（原前 10 截断，40 工具集 29 个名字永不可观测）。
+- **WB/CodeBuddy 新版 auth 文件字段级加密识别（issue #198）**：客户端升级（WorkBuddy 5.9+ / CodeBuddy CN 4.12+）后 auth 文件敏感字段为 `$wbEncrypted` 字段级加密包裹，原解析误报「值为 object/结构变更」；现报「字段级加密形态」明确错误并引导提供明文 auth 文件 / OAuth 接入（Web/Docker 形态无本机探针能力，不解密）。
+
+### 修复与加固
+- **Buddy 签到页稀疏数组崩溃**：日历格子按 index 直接赋值在越界日期产生稀疏数组，后续遍历崩溃——改 upsert + 排序。
+- **最近请求日志加固**：解析字段锚清洗内嵌 ZWSP（保留前缀空格防伪锚）+ 行级锚防注入，uid/密钥/账号/模型/请求响应体等日志值全量 sanitize；查询 result 未知值前置校验、days 对齐自然日窗口、扫描预检上限 256MB、解析行上限 30 万→80 万；api_logger 队列超 1 万行丢最旧、日志写失败 stderr 观测（原静默丢弃）；API 日志日期列表对畸形文件名按 `valid_date` 同口径过滤（防可点恒空的死条目）。
+- **跨池移交记账收口**：wb/qoder 耗尽路径 usage 记账后置到移交失败之后（防移交成功双记账）；trae 耗尽日志前移（含真实终局）；qoder 分支补 `encoded` 透传（tool_alias 跨池保持生效）；粘性命中也按绑定序/模型序/优先级收集降级链（Custom 胜出不收链，链去重）。
+
+### 验证
+- `cargo test --workspace`（989+13 通过 / 0 失败 / 8 忽略，含 issue #195 通配与命中流水 9 条、issue #198 加密识别 3 条新回归）/ `cargo check --all-targets` 零警告 / `tsc --noEmit` 零错误 / `vitest`（90 用例）全部通过。
+
+---
+
 ## [1.6.3] · 2026-11-08 · 语义移植 main bfa0bc2 => dffcecc
 
 > 语义移植 3.9.2 两提交；跳过桌面/OS 专属项（schtasks 唤醒、Trae 凭证直读、静默更新链路）。

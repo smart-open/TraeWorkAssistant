@@ -203,24 +203,38 @@ export default function BuddyCheckin() {
         const energy = scalarNum(line.energy);
         const streak = scalarNum(line.streak);
         const checkinStreak = scalarNum(line.checkin_streak);
+        // 进度行按 index 槽位赋值（next[index-1] = row）在事件乱序到达或跳号时
+        // 会产生稀疏数组空洞——渲染期 new Map(lines.map(...)) 迭代到空洞即抛
+        // 「Iterator value undefined is not an entry object」（ErrorBoundary 兜底）。
+        // 改为按 index 去重 upsert + 排序插入：数组恒稠密，乱序事件下仍按后端顺序展示
         setGrowthLines((prev) => {
-          const next = prev.slice();
-          next[line.index - 1] = {
+          const row = {
             ...line,
             energy: energy ?? undefined,
             streak: streak ?? undefined,
             checkin_streak: checkinStreak ?? undefined,
           };
-          return next;
+          const i = prev.findIndex((p) => p.index === line.index);
+          if (i >= 0) {
+            const next = prev.slice();
+            next[i] = row;
+            return next;
+          }
+          return [...prev, row].sort((a, b) => a.index - b.index);
         });
       } else if ('index' in parsed && parsed.index != null) {
         const line = parsed as WbAccountLine;
         const reward = scalarNum(line.reward);
         const checkinStreak = scalarNum(line.checkin_streak);
         setLines((prev) => {
-          const next = prev.slice();
-          next[line.index - 1] = { ...line, reward: reward ?? undefined, checkin_streak: checkinStreak ?? undefined };
-          return next;
+          const row = { ...line, reward: reward ?? undefined, checkin_streak: checkinStreak ?? undefined };
+          const i = prev.findIndex((p) => p.index === line.index);
+          if (i >= 0) {
+            const next = prev.slice();
+            next[i] = row;
+            return next;
+          }
+          return [...prev, row].sort((a, b) => a.index - b.index);
         });
       } else if ('type' in parsed && parsed.type === 'exit') {
         setRunning(false);

@@ -500,6 +500,54 @@ pub(crate) fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
     wb_payload::merged_tool_alias_rules(custom)
 }
 
+/// 11128 终局统一落样本（issue #195 第二轮审查④抽公共 helper，六处 Fatal 站点
+/// 口径一致）：指纹样本+本次命中流水日志、显式/清洗后两条样本入环形缓冲、
+/// 池级指纹短记忆标记、清洗后残留自检。样本由调用点取（来源各异：请求原文
+/// body_vec / chat_body 序列化），按请求去重守卫（last_11128_sample）与终局
+/// 说明（清洗后仍命中=模板需更新 vs 内容已流出=不可同号重试）留在调用点
+fn log_and_record_11128(
+    state: &WbView,
+    sample: &str,
+    converted: &[u8],
+    tool_alias_rules: &[(String, String)],
+    hit_cursor: u64,
+) {
+    let note = wb_payload::template_hit_note();
+    // 本次请求实际命中（issue #195 方案 B5）：游标之后的模板/别名命中流水，
+    // 替代进程级累计值的误导性
+    let per_req = wb_payload::template_hits_since(hit_cursor);
+    let per_req_note = if per_req.is_empty() {
+        String::new()
+    } else {
+        format!("；本次命中: {}", per_req.join(", "))
+    };
+    state
+        .logger
+        .log_sched_event(&format!("11128 指纹样本: {}{}{}", sample, note, per_req_note));
+    // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
+    wb_payload::record_fingerprint_sample("11128", state.pool_label(), sample, &note);
+    // 清洗后样本（issue #195 方案 B2）：原样与清洗产物同落「指纹样本」环形缓冲，
+    // 进出对比漏网现形
+    let cleaned = wb_payload::fingerprint_sample(converted);
+    state
+        .logger
+        .log_sched_event(&format!("11128 清洗后指纹样本: {cleaned}{per_req_note}"));
+    wb_payload::record_fingerprint_sample("11128_cleaned", state.pool_label(), &cleaned, &note);
+    // issue #195：显式 11128 与空完成主导同视为渠道指纹确认，标记池级短记忆
+    // ——TTL 内同池新请求首轮即激进起步（prepare 末参经 fp_block_recent 生效），
+    // 不再每次都先吃一次 11128 才升级
+    wb_payload::mark_channel_fp_block(state.pool_label(), true);
+    // 清洗后残留自检（issue #195 可观测性，方案 B3 扩展到 tools 维度）：给出
+    // 清洗产物仍命中的已知特征词/未生效别名，缩小漏网排查面
+    if let Some(res) =
+        wb_payload::residual_fingerprint_note_rules_bytes(converted, tool_alias_rules)
+    {
+        state
+            .logger
+            .log_sched_event(&format!("11128 清洗后残留自检: {res}"));
+    }
+}
+
 // ==================== 错误分类（WB 上游） ====================
 
 /// WB 流内错误 → ErrKind：WB 无 SOLO 业务码体系，按类 HTTP 状态码 +
@@ -927,6 +975,10 @@ pub(crate) fn run_wb_stream(
     // 而 tools=[ask_user_question,create_goal,...] 全为原名）。与 Trae/Qoder 池同表
     // 复用 kv `tool_alias_map`（工具集指纹是上游风控家族共性，分档无收益）。
     let tool_alias_rules = load_tool_alias_rules(state);
+    // 本次请求命中流水游标（issue #195 方案 B5）：请求首个 prepare 前取快照，
+    // 11128 Fatal 落样本时导出之后的命中清单——样本行附带「本次实际命中」
+    // 而非进程级累计值
+    let hit_cursor = wb_payload::template_hits_mark();
     let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
     // F-35 子 Key 约束：限定上游 + 专一/临期优先（匿名/无约束 Key 全空 → 走默认调度）。
@@ -1010,7 +1062,6 @@ pub(crate) fn run_wb_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
@@ -1065,12 +1116,16 @@ pub(crate) fn run_wb_stream(
                     // 客户端兼容（main 口径）
                     // F-81 跨池移交：有健康候选链且客户端未断连 → 把剩余流生命
                     // 周期交给下一池（guard move；503 账面行保留=本池尝试记录；
-                    // 移交成功不再发错误帧）；链空或全不支持 → 原收尾
+                    // 移交成功不再发错误帧）；链空或全不支持 → 原收尾。
+                    // 审查 A-1：usage 行后置到移交失败之后——移交成功由接收池落
+                    // 终态用量（含真实账号），本池不再补 "none" 行，避免同一请求
+                    // 两条用量行（双记账）
                     if !fallback.is_empty() && !tx.is_closed() {
                         if super::cross_pool::continue_stream_on_next_pool(&state.state, state.pool_label(), fallback, body_vec, proto, key_id, chat_id, tx, guard, encoded, start_ts) {
                             return;
                         }
                     }
+                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, duration_ms, 0, 0);
                     send_stream_error_wb(tx, proto, model, json!("no_healthy_account"), &exhaust_msg);
                     return;
                 }
@@ -1130,7 +1185,9 @@ pub(crate) fn run_wb_stream(
         // 残指纹自检（issue #122 方案 C3）：改写后首条 system 仍命中已知特征词
         // → debug 日志（按请求去重），提示模板表需经 UI「指纹清洗」tab 热更新
         if sanitize {
-            if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+            if let Some(note) =
+                wb_payload::residual_fingerprint_note_rules_bytes(&converted, &tool_alias_rules)
+            {
                 if last_residual_note.as_deref() != Some(note.as_str()) {
                     last_residual_note = Some(note.clone());
                     state.logger.log_debug_line(format!(
@@ -1308,23 +1365,9 @@ pub(crate) fn run_wb_stream(
                                 // Fatal 终局：样本按请求最多落一次（落完即 return，
                                 // 无需按请求去重）
                                 let sample = wb_payload::fingerprint_sample(body_vec);
-                                let note = wb_payload::template_hit_note();
-                                state.logger.log_sched_event(&format!(
-                                    "11128 指纹样本: {}{}", sample, note
-                                ));
-                                wb_payload::record_fingerprint_sample(
-                                    "11128", state.pool_label(), &sample, &note,
+                                log_and_record_11128(
+                                    state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                 );
-                                // issue #195：显式 11128 与空完成主导同视为渠道指纹
-                                // 确认，标记池级短记忆——TTL 内同池新请求首轮即激进
-                                // 起步（prepare 末参经 fp_block_recent 生效），不再
-                                // 每次都先吃一次 11128 才升级
-                                wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                // 清洗后残留自检（issue #195 可观测性）：给出清洗产物
-                                // 仍命中的已知特征词，缩小漏网触发句排查面
-                                if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                    state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                }
                                 // 终局说明（审查修复：区分两种不可重试情形——清洗后
                                 // 仍命中=模板需更新；内容已流出=不可同号重试）
                                 if sanitize {
@@ -1447,23 +1490,9 @@ pub(crate) fn run_wb_stream(
                         let sample = wb_payload::fingerprint_sample(body_vec);
                         if last_11128_sample.as_deref() != Some(sample.as_str()) {
                             last_11128_sample = Some(sample.clone());
-                            let note = wb_payload::template_hit_note();
-                            state.logger.log_sched_event(&format!(
-                                "11128 指纹样本: {}{}",
-                                sample, note
-                            ));
-                            // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
-                            wb_payload::record_fingerprint_sample(
-                                "11128",
-                                state.pool_label(),
-                                &sample,
-                                &note,
+                            log_and_record_11128(
+                                state, &sample, &converted, &tool_alias_rules, hit_cursor,
                             );
-                            // issue #195：池级短记忆标记 + 清洗后残留自检（口径同流内 Fatal）
-                            wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                            if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                            }
                             // Fatal 透传前的排查指引（仅日志，客户端响应体不变）
                             state.logger.log_sched_event(
                                 "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
@@ -1605,6 +1634,8 @@ pub async fn wb_aggregate_chat(
         // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）共用；
         // 与 wb_stream_chat 同口径（详见该入口注记）
         let tool_alias_rules = load_tool_alias_rules(&state);
+        // 本次请求命中流水游标（issue #195 方案 B5，口径同流式路径）
+        let hit_cursor = wb_payload::template_hits_mark();
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
         // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
@@ -1747,7 +1778,9 @@ pub async fn wb_aggregate_chat(
             }
             // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
             if sanitize {
-                if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                if let Some(note) =
+                    wb_payload::residual_fingerprint_note_rules_bytes(&converted, &tool_alias_rules)
+                {
                     if last_residual_note.as_deref() != Some(note.as_str()) {
                         last_residual_note = Some(note.clone());
                         state.logger.log_debug_line(format!(
@@ -1879,19 +1912,9 @@ pub async fn wb_aggregate_chat(
                                     // Fatal 终局：样本按请求最多落一次（落完即
                                     // return，无需按请求去重）
                                     let sample = wb_payload::fingerprint_sample(&body_vec);
-                                    let note = wb_payload::template_hit_note();
-                                    state.logger.log_sched_event(&format!(
-                                        "11128 指纹样本: {}{}", sample, note
-                                    ));
-                                    wb_payload::record_fingerprint_sample(
-                                        "11128", state.pool_label(), &sample, &note,
+                                    log_and_record_11128(
+                                        &state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                     );
-                                    // issue #195：池级短记忆标记 + 清洗后残留自检
-                                    //（口径同流式 Fatal）
-                                    wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                    if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                        state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                    }
                                     state.logger.log_sched_event(
                                         "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                     );
@@ -1976,24 +1999,9 @@ pub async fn wb_aggregate_chat(
                             let sample = wb_payload::fingerprint_sample(&body_vec);
                             if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                 last_11128_sample = Some(sample.clone());
-                                let note = wb_payload::template_hit_note();
-                                state.logger.log_sched_event(&format!(
-                                    "11128 指纹样本: {}{}",
-                                    sample, note
-                                ));
-                                // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
-                                wb_payload::record_fingerprint_sample(
-                                    "11128",
-                                    state.pool_label(),
-                                    &sample,
-                                    &note,
+                                log_and_record_11128(
+                                    &state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                 );
-                                // issue #195：池级短记忆标记 + 清洗后残留自检
-                                //（口径同流式 Fatal）
-                                wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                    state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                }
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );
@@ -2179,6 +2187,8 @@ pub async fn wb_tool_exec_chat(
         // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）共用；
         // 与 wb_stream_chat 同口径（详见该入口注记）
         let tool_alias_rules = load_tool_alias_rules(&state);
+        // 本次请求命中流水游标（issue #195 方案 B5，口径同流式路径）
+        let hit_cursor = wb_payload::template_hits_mark();
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
         // P1-6 劫持防护：false = 客户端已声明同名 function 工具，未注入代理工具，
         // 全程跳过代执行（客户端工具调用照常透传，由客户端自行执行）
@@ -2294,7 +2304,9 @@ pub async fn wb_tool_exec_chat(
                 };
                 // 残指纹自检（issue #122 方案 C3，同流式路径口径：按请求去重）
                 if sanitize {
-                    if let Some(note) = wb_payload::residual_fingerprint_note(&converted) {
+                    if let Some(note) =
+                        wb_payload::residual_fingerprint_note_rules_bytes(&converted, &tool_alias_rules)
+                    {
                         if last_residual_note.as_deref() != Some(note.as_str()) {
                             last_residual_note = Some(note.clone());
                             state.logger.log_debug_line(format!(
@@ -2363,19 +2375,9 @@ pub async fn wb_tool_exec_chat(
                                 );
                                 if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                     last_11128_sample = Some(sample.clone());
-                                    let note = wb_payload::template_hit_note();
-                                    state.logger.log_sched_event(&format!(
-                                        "11128 指纹样本: {}{}", sample, note
-                                    ));
-                                    wb_payload::record_fingerprint_sample(
-                                        "11128", state.pool_label(), &sample, &note,
+                                    log_and_record_11128(
+                                        &state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                     );
-                                    // issue #195：池级短记忆标记 + 清洗后残留自检
-                                    //（口径同流式/聚合 Fatal）
-                                    wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                    if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                        state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                    }
                                     state.logger.log_sched_event(
                                         "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                     );
@@ -2514,24 +2516,9 @@ pub async fn wb_tool_exec_chat(
                             );
                             if last_11128_sample.as_deref() != Some(sample.as_str()) {
                                 last_11128_sample = Some(sample.clone());
-                                let note = wb_payload::template_hit_note();
-                                state.logger.log_sched_event(&format!(
-                                    "11128 指纹样本: {}{}",
-                                    sample, note
-                                ));
-                                // issue #125 增强：同步入内存样本环形缓冲（UI「指纹清洗」tab 一键生成规则）
-                                wb_payload::record_fingerprint_sample(
-                                    "11128",
-                                    state.pool_label(),
-                                    &sample,
-                                    &note,
+                                log_and_record_11128(
+                                    &state, &sample, &converted, &tool_alias_rules, hit_cursor,
                                 );
-                                // issue #195：池级短记忆标记 + 清洗后残留自检
-                                //（口径同流式/聚合 Fatal）
-                                wb_payload::mark_channel_fp_block(state.pool_label(), true);
-                                if let Some(res) = wb_payload::residual_fingerprint_note(&converted) {
-                                    state.logger.log_sched_event(&format!("11128 清洗后残留自检: {res}"));
-                                }
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
                                 );

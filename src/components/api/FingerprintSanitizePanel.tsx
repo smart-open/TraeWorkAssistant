@@ -535,31 +535,37 @@ export default function FingerprintSanitizePanel() {
                     className="rounded-md border border-slate-200 px-2 py-1.5 dark:border-zinc-700"
                   >
                     <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
-                      <Badge tone={s.kind === 'empty' ? 'amber' : 'red'}>
-                        {s.kind === 'empty' ? '空完成' : '11128'}
+                      {/* kind 三分支（issue #195 第二轮）：11128 显式拦截 / 11128_cleaned 清洗后样本
+                          （进出对比，生成规则按钮隐藏——仅供诊断对照）/ empty 空完成影子风控 */}
+                      <Badge tone={s.kind === '11128' ? 'red' : s.kind === '11128_cleaned' ? 'violet' : 'amber'}>
+                        {s.kind === '11128' ? '11128' : s.kind === '11128_cleaned' ? '11128 清洗后' : '空完成'}
                       </Badge>
                       <span>{s.pool}</span>
                       {ts && <span>{ts}</span>}
                       {s.note && <span className="truncate">{s.note}</span>}
                       <span className="ml-auto flex shrink-0 gap-1">
-                        <button
-                          onClick={() => addFromSample(s.sample, false)}
-                          disabled={!usable}
-                          title={
-                            usable ? '以首英文逗号/句号前的整段作为原文指纹' : blockReason
-                          }
-                          className="rounded p-1 text-brand-500 transition hover:bg-brand-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-transparent dark:hover:bg-brand-900/20 dark:disabled:text-zinc-600"
-                        >
-                          <Wand2 size={13} />
-                        </button>
-                        <button
-                          onClick={() => addFromSample(s.sample, true)}
-                          disabled={!usable}
-                          title={usable ? '以整条 system 文本作为原文指纹' : blockReason}
-                          className="rounded p-1 text-brand-500 transition hover:bg-brand-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-transparent dark:hover:bg-brand-900/20 dark:disabled:text-zinc-600"
-                        >
-                          <FileSignature size={13} />
-                        </button>
+                        {s.kind !== '11128_cleaned' && (
+                          <>
+                            <button
+                              onClick={() => addFromSample(s.sample, false)}
+                              disabled={!usable}
+                              title={
+                                usable ? '以首英文逗号/句号前的整段作为原文指纹' : blockReason
+                              }
+                              className="rounded p-1 text-brand-500 transition hover:bg-brand-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-transparent dark:hover:bg-brand-900/20 dark:disabled:text-zinc-600"
+                            >
+                              <Wand2 size={13} />
+                            </button>
+                            <button
+                              onClick={() => addFromSample(s.sample, true)}
+                              disabled={!usable}
+                              title={usable ? '以整条 system 文本作为原文指纹' : blockReason}
+                              className="rounded p-1 text-brand-500 transition hover:bg-brand-50 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:bg-transparent dark:hover:bg-brand-900/20 dark:disabled:text-zinc-600"
+                            >
+                              <FileSignature size={13} />
+                            </button>
+                          </>
+                        )}
                       </span>
                     </div>
                     <p className="mt-1 break-all font-mono text-[11px] text-slate-500 dark:text-zinc-400">

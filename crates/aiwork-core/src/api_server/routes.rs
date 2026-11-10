@@ -1330,7 +1330,7 @@ pub async fn chat_completions(
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
                 // 无 effort/后缀预处理（思考档位由 resolve_thinking 按条目解析）
                 if stream {
-                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, r.fallback_chain);
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
@@ -1705,7 +1705,7 @@ pub async fn messages(
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
                 if stream {
-                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, r.fallback_chain);
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
             }
@@ -1860,7 +1860,7 @@ pub async fn completions(
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
                 if stream {
-                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, r.fallback_chain);
+                    return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
             }
@@ -2679,12 +2679,6 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
 
         // 所有账号不可用（空完成/传输掐断主导 → 明示对应归因，否则维持原文案）
         let duration_ms = start_ts.elapsed().as_millis() as u64;
-        state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
-        // F-81 跨池移交（Trae 目标第一期不支持，见 cross_pool 注释）
-        if !fallback.is_empty() && !tx.is_closed() {
-            let ok = super::cross_pool::continue_stream_on_next_pool(&state, "trae", &fallback, &body_vec, proto, &key_id, &chat_id, &tx, guard, &std::collections::HashSet::new(), start_ts);
-            if ok { return; }
-        }
         let (healthy_total, _) = state.pool.selectable_stats_in(None, false);
         let (hard_credit_cnt, _) = state.pool.hard_credit_stats();
         let (exhaust_msg, exhaust_tag) = exhaust_message_with_transport_cut(
@@ -2693,6 +2687,21 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         // 池级指纹拦截短记忆（issue #122 缺口2）：空完成主导（指纹拦截）才标记，
         // TTL 内同池新请求直接激进起步，不再从零试探烧账号
         super::wb_payload::mark_channel_fp_block("trae", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
+        // 503 请求行前移到移交块之前（M-2 口径与 wb/qoder 三池同构：移交成功同样
+        // 留行 = 本池尝试记录）
+        state.logger.log_request(
+            "trae", "POST", proto.log_path(), &model, stream,
+            503, "none", duration_ms, &key_name, "",
+            Some(&exhaust_msg),
+        );
+        // F-81 跨池移交（Trae 目标第一期不支持，见 cross_pool 注释）。
+        // 审查 A-1：usage 行后置到移交失败之后——移交成功由接收池落终态用量
+        //（含真实账号），本池不再补 "none" 行，避免同一请求两条用量行（双记账）
+        if !fallback.is_empty() && !tx.is_closed() {
+            let ok = super::cross_pool::continue_stream_on_next_pool(&state, "trae", &fallback, &body_vec, proto, &key_id, &chat_id, &tx, guard, &std::collections::HashSet::new(), start_ts);
+            if ok { return; }
+        }
+        state.record_usage(false, &model, "none", &key_id, false, true, duration_ms, 0, 0);
         let diag = state.pool.diagnose();
         let diag_summary: Vec<String> = diag
             .iter()
@@ -2704,11 +2713,6 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                 format!("{}({}:{},cr={}{}{}{})", d.name, d.uid.get(..8).unwrap_or(&d.uid), d.reason, credits_str, cd_str, exp_str, dis_str)
             })
             .collect();
-        state.logger.log_request(
-            "trae", "POST", proto.log_path(), &model, stream,
-            503, "none", duration_ms, &key_name, "",
-            Some(&exhaust_msg),
-        );
         // 写入 app.log 供排查
         {
             let now = std::time::SystemTime::now()

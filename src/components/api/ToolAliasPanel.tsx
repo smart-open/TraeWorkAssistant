@@ -9,8 +9,9 @@
  *
  * 数据流：tool_alias_map KV（合并语义：内置默认表始终生效，本表为增量覆盖/
  * 追加）→ load_tool_alias_rules 每请求读取，保存即对下一请求生效，无需重启
- * 网关。保存空 rules 数组 = 恢复内置默认；to=null（停用）= 从生效表移除该规则，
- * 原名透传。注意与「指纹清洗」不同：别名不支持留空剥离（to=""），别名必须
+ * 网关。保存空 rules 数组 = 恢复内置默认；to=null（停用）= 该规则不再改写、
+ * 原名透传（被停用的精确名同时阻断前缀通配规则接管，issue #195 第二轮审查②）。
+ * 注意与「指纹清洗」不同：别名不支持留空剥离（to=""），别名必须
  * 非空且请求/响应双向一致，不支持多候选。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -74,14 +75,17 @@ export default function ToolAliasPanel() {
     [rows, savedRules],
   );
 
-  /** 保存前置校验：from 必填且唯一；未停用行 to 必填非空（别名不可为空串，
-   * 后端落库层同样拒绝——工具名改写为空会破坏 function calling 协议） */
+  /** 保存前置校验：from 必填且唯一、拒绝裸「*」（空前缀会改写全部工具名，
+   * 后端落库层同样拒绝）；未停用行 to 必填非空（别名不可为空串，后端落库层
+   * 同样拒绝——工具名改写为空会破坏 function calling 协议） */
   const validate = (): string | null => {
     const seen = new Set<string>();
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i].rule;
       const from = r.from.trim();
       if (!from) return `第 ${i + 1} 条规则的「原工具名」不能为空`;
+      if (from === '*')
+        return `第 ${i + 1} 条规则不支持裸「*」：通配请写「前缀*」（如 acp_*），精确匹配请写完整工具名`;
       if (seen.has(from)) return `「原工具名」重复：${from}`;
       seen.add(from);
       if (r.to !== null && !r.to.trim()) return `「${from}」的别名不能为空（停用请勾选停用）`;
@@ -155,12 +159,14 @@ export default function ToolAliasPanel() {
             Cline·Roo / Codex / DSH / CodeBuddy / Qoder）。
           </p>
           <p className="mt-1 opacity-80">
-            仅收特定客户端独家命名，glob/grep 等通用名不改。规则为逐字精确匹配（无正则）；
+            仅收特定客户端独家命名，glob/grep 等通用名不改。规则为逐字精确匹配（无正则），
+            支持「前缀*」通配（如 acp_* 匹配全部 acp_ 前缀工具名，精确规则优先）；
             别名必须非空且请求/响应双向一致，不支持留空剥离与多候选；别名不得与请求中
             其他真实工具名重名（重名时该规则自动跳过、原名透传）。生效面：Trae 池
             （SOLO 管线）、Qoder 池（issue #158）与 WB 族池（Buddy CN / BuddyAI Intl），
             三者均受「指纹清洗」tab 对应池级开关门控（默认开）。规则表为增量覆盖：
-            内置默认表始终生效，此处可覆盖、追加或停用（停用 = 原名透传）。保存即对下一条请求生效，
+            内置默认表始终生效，此处可覆盖、追加或停用（停用 = 原名透传，且不被
+            通配规则接管）。保存即对下一条请求生效，
             无需重启网关；
             {builtin ? '当前生效内置默认表，保存后成为自定义覆盖副本。' : '当前为自定义覆盖副本（默认表仍在其下生效）。'}
             {savedAt && !builtin && ` 最近保存：${fmtTs(savedAt)}`}
@@ -230,7 +236,7 @@ export default function ToolAliasPanel() {
               />
               <label
                 className="flex shrink-0 cursor-pointer select-none items-center gap-1 text-xs text-slate-500 dark:text-zinc-400"
-                title={disabled ? '停用：从生效表移除该规则（原名透传）' : '停用该规则'}
+                title={disabled ? '停用：该名不再改写（原名透传，通配规则不接管）' : '停用该规则'}
               >
                 <input
                   type="checkbox"

@@ -283,6 +283,9 @@ pub(super) fn auth_key_names(raw: &serde_json::Value) -> String {
 /// 对候选键逐个 dig，命中即决（语义与 dig 一致，null 不回退尝试后续候选键，避免误采其他 token 字段串号）：
 /// 命中且为非空字符串 → Ok；命中但为 null/非字符串/空串 → 「未登录/凭证为空」类错误（不再误报结构变更）；
 /// 全部候选键未命中 → 「结构可能已变更」+ 键名诊断（含值类型）。
+/// afe1966（issue #198，docker 适配）：值为 `$wbEncrypted` 包裹 → 客户端字段级加密形态专用报错
+///（区别于「结构变更」）。桌面版经 workbuddy_atrest 自动解密；本版为 Web/Docker 形态，
+/// 无本机客户端探针能力，不做解密，文案引导提供明文 auth 文件。
 pub(super) fn extract_access_token(raw: &serde_json::Value) -> Result<String, String> {
     for k in ["accessToken", "access_token", "token"] {
         let Some(v) = fs_utils::dig(raw, &[k]) else { continue };
@@ -294,6 +297,12 @@ pub(super) fn extract_access_token(raw: &serde_json::Value) -> Result<String, St
                 "auth 文件 accessToken 为空字符串（可能未登录）：键 {k} 存在但无值，请先在 WorkBuddy 客户端登录后重试"
             ));
         }
+        if is_encrypted_wrapper(v) {
+            return Err(format!(
+                "auth 文件凭证不可用：键 {k} 为客户端字段级加密形态（$wbEncrypted）；\
+                 本版本不支持自动解密，请在桌面版工具中导入，或提供明文 auth 文件 / 改用 OAuth 登录接入"
+            ));
+        }
         return Err(format!(
             "auth 文件凭证不可用：键 {k} 存在但值为 {}（预期字符串；null 多为未登录或客户端已清空登录态），请先在 WorkBuddy 客户端登录后重试",
             json_type_name(v)
@@ -303,6 +312,31 @@ pub(super) fn extract_access_token(raw: &serde_json::Value) -> Result<String, St
         "auth 文件中未找到 accessToken（结构可能已变更）；实际键名: {}",
         auth_key_names(raw)
     ))
+}
+
+// ── $wbEncrypted 包裹识别（afe1966，issue #198）──────────────────────────────
+// 完整解密层（AES-256-GCM + 客户端密钥探针）为桌面版专属（workbuddy_atrest.rs），
+// docker 形态仅移植纯识别函数：让新格式 auth 文件得到「字段级加密」明确报错，
+// 不再误报「结构可能已变更」。
+
+/// 标准 sym-v1 包裹：恰好 `{$wbEncrypted:1, envelope:<string>}`
+fn is_standard_wrapper(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.len() == 2
+        && obj.get("$wbEncrypted").and_then(serde_json::Value::as_i64) == Some(1)
+        && obj.get("envelope").and_then(serde_json::Value::as_str).is_some()
+}
+
+/// 非对称包裹：恰好 `{$wbEncrypted:1, envelope:<string>, scheme:"asym-v1"}`
+fn is_asym_wrapper(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.len() == 3
+        && obj.get("$wbEncrypted").and_then(serde_json::Value::as_i64) == Some(1)
+        && obj.get("scheme").and_then(serde_json::Value::as_str) == Some("asym-v1")
+        && obj.get("envelope").and_then(serde_json::Value::as_str).is_some()
+}
+
+/// 值是否为任意 `$wbEncrypted` 包裹（供报错分支识别，区别于「结构变更」）
+pub(super) fn is_encrypted_wrapper(v: &serde_json::Value) -> bool {
+    v.as_object().map(|o| is_standard_wrapper(o) || is_asym_wrapper(o)).unwrap_or(false)
 }
 
 // ── 设置（F-55 配置化）──────────────────────────────────────────────────────

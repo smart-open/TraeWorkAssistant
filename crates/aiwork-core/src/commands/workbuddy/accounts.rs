@@ -568,8 +568,21 @@ pub fn workbuddy_refresh_token(
             (None, None) => None,
         }
     };
-    let refresh = pick_newer(&store_cand, &auth_cand)
-        .ok_or("该账号无 refreshToken（不可刷新，需重新登录）")?;
+    let refresh = pick_newer(&store_cand, &auth_cand).ok_or_else(|| {
+        // afe1966 口径拉齐（issue #198，docker 无解密能力故文案适配）：auth 源
+        // refreshToken 仍为 $wbEncrypted 包裹且 store 副本亦无值时，报「需重新登录」
+        // 会误导——重登录后 auth 文件仍是加密形态。与 scan/import 的包裹感知报错同口径
+        let rt_wrapper = fs_utils::dig(&auth_raw, &["refreshToken", "refresh_token"])
+            .map(super::common::is_encrypted_wrapper)
+            .unwrap_or(false);
+        if rt_wrapper {
+            "该账号无 refreshToken（不可刷新）：auth 文件 refreshToken 为客户端字段级加密形态（$wbEncrypted），\
+             本版本不支持自动解密且工具侧副本亦无值；请在桌面版工具中续期，或提供明文 auth 文件 / 改用 OAuth 登录接入"
+                .to_string()
+        } else {
+            "该账号无 refreshToken（不可刷新，需重新登录）".to_string()
+        }
+    })?;
     if refresh.is_empty() {
         return Err("该账号 refreshToken 为空（不可刷新，需重新登录）".into());
     }
@@ -1112,6 +1125,37 @@ mod tests {
         let err = extract_access_token(&raw).unwrap_err();
         assert!(err.contains("结构可能已变更"), "{err}");
         assert!(err.contains("foo（number）"), "{err}");
+    }
+
+    // ── $wbEncrypted 包裹感知报错（afe1966，issue #198 docker 适配）──────────
+
+    /// 标准 sym-v1 包裹：报「字段级加密形态」而非「结构可能已变更」；docker 无解密
+    /// 能力，文案不得引导用户期待自动解密
+    #[test]
+    fn extract_access_token_encrypted_wrapper_reports_wrapper_error() {
+        let wrapper = serde_json::json!({ "$wbEncrypted": 1, "envelope": "AAAA" });
+        let raw = serde_json::json!({ "auth": { "accessToken": wrapper } });
+        let err = extract_access_token(&raw).unwrap_err();
+        assert!(err.contains("$wbEncrypted"), "{err}");
+        assert!(err.contains("字段级加密"), "{err}");
+        assert!(!err.contains("结构可能已变更"), "包裹不得误报结构变更: {err}");
+        assert!(!err.contains("自动解密未成功"), "docker 无解密能力，不应出现该文案: {err}");
+    }
+
+    /// 非对称包裹（scheme=asym-v1）同样识别；普通对象不误判
+    #[test]
+    fn is_encrypted_wrapper_shape_coverage() {
+        let asym = serde_json::json!({ "$wbEncrypted": 1, "envelope": "AAAA", "scheme": "asym-v1" });
+        assert!(crate::commands::workbuddy::common::is_encrypted_wrapper(&asym));
+        // 缺 envelope / 多余键 / 非 object 值：均不识别
+        assert!(!crate::commands::workbuddy::common::is_encrypted_wrapper(
+            &serde_json::json!({ "$wbEncrypted": 1 })
+        ));
+        assert!(!crate::commands::workbuddy::common::is_encrypted_wrapper(&serde_json::json!(
+            { "$wbEncrypted": 1, "envelope": "AAAA", "extra": 1 }
+        )));
+        assert!(!crate::commands::workbuddy::common::is_encrypted_wrapper(&serde_json::json!("$wbEncrypted")));
+        assert!(!crate::commands::workbuddy::common::is_encrypted_wrapper(&serde_json::json!(null)));
     }
 
     /// P2 键对齐：通用 `token` 键与 accessTokenExpiresAtMs 经 dig 可命中（原键列表会漏），

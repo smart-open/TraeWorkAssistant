@@ -129,10 +129,13 @@ pub async fn bearer_auth(
 /// 报错（如 Trae「empty content 502」）时无法区分 Key 无效 / 未携带 / 超限。
 /// model 未知（body 未解析）记 "-"，uid 记 "-"；reason 写入 error 字段。
 fn log_reject(state: &ApiSharedState, request: &Request, status: u16, reason: &str) {
+    // B-7/M-3 补口：path 是请求行中唯一客户端可控且 logger 侧不清洗的字段——
+    // 路径内嵌解析锚字面量（"[SCHED]"/"[DEBUG]" 无需空格即可注入）会让
+    // parse_log_line 整行误排除（401 行在用量页不可见），落行前按同口径清洗
     state.logger.log_request(
         "-",
         request.method().as_str(),
-        request.uri().path(),
+        &super::api_logger::sanitize_log_value(request.uri().path()),
         "-",
         false,
         status,

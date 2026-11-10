@@ -297,7 +297,8 @@ export interface SanitizeSwitches {
 
 /** 网关命中（指纹拦截/空完成影子风控）落下的指纹样本：供一键生成清洗规则 */
 export interface FingerprintSample {
-  /** 11128 = 指纹拦截；empty = 空完成（影子风控收尾采样） */
+  /** "11128" = 清洗已启用仍被拦；"11128_cleaned" = 11128 终局同采的清洗后样本
+   * （进出对比诊断用，issue #195 第二轮）；"empty" = 空完成影子风控 */
   kind: string;
   /** wb | trae | qoder | buddy-ai */
   pool: string;

@@ -188,6 +188,8 @@ function statusChipCls(status: number): string {
 }
 
 function ApiRecentRequests() {
+  // D-14：可选时间窗口（后端 api_logs_recent 默认 3 天），供「天数」按钮组切换
+  const RECENT_DAYS = [1, 3, 7, 14, 30] as const;
   const [rows, setRows] = useState<ApiLogEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [truncated, setTruncated] = useState(false);
@@ -195,13 +197,18 @@ function ApiRecentRequests() {
   const [pool, setPool] = useState('all');
   const [result, setResult] = useState('all');
   const [loading, setLoading] = useState(false);
+  // D-14：当前窗口天数；daysRef 双轨记录，防 load 闭包拿到旧值
+  const [days, setDays] = useState(3);
+  const daysRef = useRef(3);
   const reqIdRef = useRef(0);
 
-  const load = useCallback(async (p: number, pf: string, rf: string) => {
+  const load = useCallback(async (p: number, pf: string, rf: string, d?: number) => {
     const reqId = ++reqIdRef.current;
     setLoading(true);
     try {
       const r = await api.apiServer.logsRecent({
+        // D-14：显式天数优先，未传时回落 daysRef（避免回调闭包旧值）
+        days: d ?? daysRef.current,
         page: p,
         pageSize: RECENT_PAGE_SIZE,
         pool: pf === 'all' ? undefined : pf,
@@ -240,6 +247,7 @@ function ApiRecentRequests() {
                   ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
                   : 'bg-white text-slate-500 hover:bg-slate-100 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
               }`}
+              disabled={loading}
               onClick={() => { setPool(p.v); void load(1, p.v, result); }}
             >
               {p.label}
@@ -256,9 +264,27 @@ function ApiRecentRequests() {
                   ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
                   : 'bg-white text-slate-500 hover:bg-slate-100 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
               }`}
+              disabled={loading}
               onClick={() => { setResult(r.v); void load(1, pool, r.v); }}
             >
               {r.label}
+            </button>
+          ))}
+        </div>
+        <span className="ml-2 text-xs text-slate-400">天数</span>
+        <div className="flex gap-1">
+          {RECENT_DAYS.map((d) => (
+            <button
+              key={d}
+              className={`rounded-md px-2 py-0.5 text-xs font-medium transition ${
+                days === d
+                  ? 'bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900'
+                  : 'bg-white text-slate-500 hover:bg-slate-100 dark:bg-zinc-800 dark:text-zinc-400 dark:hover:bg-zinc-700'
+              }`}
+              disabled={loading}
+              onClick={() => { setDays(d); daysRef.current = d; void load(1, pool, result, d); }}
+            >
+              {d}
             </button>
           ))}
         </div>
@@ -328,10 +354,18 @@ function ApiRecentRequests() {
                 </td>
               </tr>
             ))}
+            {loading && (
+              <tr>
+                <td colSpan={9} className="px-2 py-6 text-center text-slate-400">
+                  加载中…
+                </td>
+              </tr>
+            )}
             {rows.length === 0 && !loading && (
               <tr>
                 <td colSpan={9} className="px-2 py-6 text-center text-slate-400">
-                  {total === 0 ? '最近 3 天无匹配请求' : '加载中…'}
+                  {/* M-7：total 为筛选后计数，文案分场景——有筛选用筛选文案，无筛选才提天数 */}
+                  {(pool !== 'all' || result !== 'all') ? '当前筛选无匹配请求' : `最近 ${days} 天无请求`}
                 </td>
               </tr>
             )}
