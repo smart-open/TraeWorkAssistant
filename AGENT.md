@@ -1,14 +1,11 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.9.1
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.9.3
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
 
 ## 1. 一句话
 
-Windows / macOS 双平台桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / CodeBuddy / 豆包 / Qoder / Qoder Work 六应用**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；桥档案表可扩展更多应用；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom / buddy-ai 多池统一调度**（custom 为自定义上游组：组内负载均衡 + 熔断；默认候选序尾部兜底），每池独立开关。**所有数据仅存在本地数据目录（Windows `%APPDATA%\AIWorkAssistant\`，macOS `~/Library/Application Support/AIWorkAssistant/`），零外部网络**。
-
-> **macOS 支持（F-75）**：平台服务层 `platform/` 分层归位（子进程构建 / 数据目录 / vault Keychain / 系统代理 networksetup / CA security / 进程 SIGTERM / bundle 定位），打包 dmg（aarch64 + x64 双架构，`tauri.macos.conf.json`）。应用域灰度放开中（`mac_supported`，待各应用 mac 版数据布局侦察），设计与进度见 `docs/tmp/f75-macos-support-design.md`。schtasks 系统级定时、MachineGuid 系统级重置、UI 点击兜底为 Windows 专属（mac 由内置调度器 + 开机自启覆盖，入口按 platform 标志隐藏）。
-
+Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / Qoder 三应用 + 豆包**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom / buddy-ai 多池统一调度**（custom 为自定义上游组：组内负载均衡 + 熔断；默认候选序尾部兜底），每池独立开关。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
 
 ## 2. Quick Start
 
@@ -58,7 +55,6 @@ ai-work-assistant/
 │   ├── tauri.conf.json           # 无装饰窗 / 无外部资源（Python 与 PS 桥均已移除，全 Rust）
 │   └── src/
 │       ├── main.rs               # 注册全部命令 + --task-run CLI 任务模式
-│       ├── platform/             # F-75 平台服务层（M0 底座）：mod.rs 数据根/OS 标志 + cmd.rs sys_command 子进程构建（全仓 creation_flags 收敛点，禁止再散写 CommandExt）+ secret.rs vault 主密码原语（win DPAPI / mac Keychain via keyring）
 │       ├── state.rs              # AppState（%APPDATA%\AIWorkAssistant + 旧目录迁移）
 │       ├── models.rs             # DTO（含 CheckinSummary.time 字段）
 │       ├── store/                # SQLite 存储层（v3.4.5 起全量承载 data 目录状态，替代 JSON 文件读写）
@@ -145,7 +141,6 @@ ai-work-assistant/
 | 豆包 | `doubao_open_as_account(userId, proxyPort?)` | **C1 一键以账号打开**：调 `switcher::run_action(Switch, Doubao)`（恢复该账号快照后直接拉起客户端，把「切换 → 等待 → 打开」两步合并为一步）；proxyPort>0 时注入 `--proxy-server`；NDJSON 进度复用 switch-progress / switch-done 事件管线（前端走 store.openDoubaoAs，与 switchTo 互斥共用 switchingTo 状态） |
 | 豆包 | `doubao_snapshot_meta(userId)` → `DoubaoSnapshotMeta?` | **C3 快照版本校验**：读 `profiles_doubao/<uid>/snapshot_meta.json`（schemaVersion / createdAt / chromiumVersion / includeIndexedDB），无元数据文件时回退读快照内 `Last Version`（返回 schema_version=0 标记为旧版快照）；账号页快照列「已保存」处悬停展示版本信息 |
 | 豆包 | `settings.doubao_snapshot_include_idb` | **C4 IndexedDB 可选纳入快照**：默认 false（体积大，默认排除）；开启后 profile_backup / profile_restore / switch_account / save_current_login 透传 `include_indexeddb` 给 switcher；备份时纳入 `Default/IndexedDB`，恢复时**只要快照内含就回写**（不看当前开关，保证快照完整回写） |
-| 豆包 | `settings.doubao_keepalive_enabled` / `settings.doubao_quota_enabled` | **应用内调度双开关（issue #147）**：默认开（serde `default_true` + kv 缺失/损坏回填防漏开）；关闭后应用内调度器不再执行 doubao-keepalive / doubao-quota，**不影响 Windows schtasks 计划任务**（`--task-run` CLI 路径不读开关）；空池/客户端缺失时静默跳过（`skipped_empty_pool` 豁免键，不 mark_run、保留当日补打窗口、不记失败不通知，对齐审查 #15 口径） |
 | 豆包 | `doubao_chatdata_backup(userId)` / `doubao_chatdata_restore(userId)` / `doubao_chatdata_info(userId)` | **D1 对话数据独立备份/恢复**：源=豆包 User Data 各 Profile 下 IndexedDB（chrome_doubao-* / https_www.doubao.com*）+ DoubaoStorage → `data/doubao_chats/<uid>/`（按 profile 名分层 + chat_backup_meta.json，覆盖式）；备份/恢复均先 graceful_kill_app("Doubao")；恢复按 profile 名回写；与快照解耦（对话正文在云端跟账号走，本地备份的是客户端状态，换机/重装后恢复备份+登录即可同步对话）；info 供账号行「对话已备份」徽标 |
 | 豆包 | `doubao_export_chats(userId)` | **D2 对话记录导出**：Rust 直调 `tasks/doubao_chats.rs`（原 python `--export --uid X` 语义，stdout 末行 JSON 契约不变）；走官方 IM 接口 `POST www.doubao.com/im/chain/recent_conv`（cmd 3200 会话列表，conv_version=0 首跳 limit≤50）+ `im/chain/single`（cmd 3100 单会话消息，anchor_index=2^53-1 起翻页，index_in_conv 为字符串需 int 转换）；必需 Cookie：sessionid/sessionid_ss/sid_tt + sid_guard + **ttwid**（登录校验），sid_guard/ttwid 必须以 Set-Cookie 下发的 **URL 编码原样**发送（原始 | 形式报 712010702，_cookie_enc 兼容两种存储形式），query 必须含设备指纹 web_id/tea_uuid/fp（缺失报 712010702）+ 头 agw-js-conv:str + UA SamanthaDoubao；输出 markdown+json 到 data/exports/doubao_chats_<uid>_<ts>.*；正文提取 content_block text_block → tts_content/brief 兜底；池内凭证过期（客户端重新登录后 sessionid 轮换）时需重开代理自动回写 |
 | 日志 | `proxy_logs_list(...)` / `proxy_log_detail(...)` | 代理请求日志列表 / 详情。**性能（2026-10-07 实测）**：改为「条目索引 + 按需读字节」——`proxy_req_*.log` 目录实测 11 文件 / 230MB / 35.9k 条，原实现每次把**全部文件**读成 String 并逐条 parse（最后才 `skip/take` 取当前页 30 条），翻页 / 改日期 / 改关键字都重来一遍；现每文件维护 mtime+size 增量的条目索引（字节区间 + 首行时间戳，定长数组无堆分配），时间筛选走内存、仅为当前页那 30 条读字节区间，11 个文件分 4 路并行：列表首屏（冷建索引）285ms / 热命中 12ms / 深翻页 9ms / 关键字 569ms（旧等价路径约 850ms+ 且每页重算）；详情由「读完整文件（单文件最大 60MB）」改为只读该条区间。两命令均改 `#[tauri::command(async)]`（不占 UI 线程）。**id 口径修正**：id = 文件内**原始**非空分块序号，与 detail 取序号方式一致（原实现 index 只在通过筛选时自增，带筛选时列表 id 与详情错位、点开是另一条） |
@@ -173,10 +168,9 @@ ai-work-assistant/
 | 计划 | `task_register(time)` / `task_status()` / `task_unregister()` | `schtasks` 注册每日签到 |
 | 更新 | `update_check()` / `update_download(...)` → `UpdateDownloaded` / `update_run_installer({file_path, asset_name})` | 两步确认制：下载（确认一）→ 安装（确认二）。安装器参数 `/P /UPDATE /R`：被动进度条 + 跳过卸载直接覆盖 + 完成后自动重启应用；`run_installer` 校验路径必须位于临时更新目录 |
 | WorkBuddy | `workbuddy_env_check()` → `WorkBuddyEnvCheck` | 客户端安装/运行/版本 + auth 文件存在性 + `~/.workbuddy` 快照解析（uid/昵称/editionType）；复用 app_locate 四级探测 |
-| WorkBuddy | `workbuddy_accounts_list` → `WorkBuddyAccountView[]` | 账号池（data/workbuddy_accounts.json）+ 在线标记（auth 文件 uid 匹配）+ 快照/凭证副本存在性 + 切换验证标记（`snapshot_verify_failed_*_ms` 红=身份不符/回退、`snapshot_verify_timeout_*_ms` 黄=确认超时 fail-open、`snapshot_invalid_*` 红=快照不可用需重新保存登录态；id = `wb-<sha256(token)前12位>`（同 token 稳定同 id） |
+| WorkBuddy | `workbuddy_accounts_list` → `WorkBuddyAccountView[]` | 账号池（data/workbuddy_accounts.json）+ 在线标记（auth 文件 uid 匹配）+ 快照/凭证副本存在性；id = `wb-<sha256(token)前12位>`（同 token 稳定同 id） |
 | WorkBuddy | `workbuddy_account_save/remove` / `workbuddy_scan_auth_file` / `workbuddy_account_import_auth` | 别名备注 / 删除 / auth 文件扫描预览 / 确认入池（凭证入 token store 副本，零明文出 Rust） |
 | WorkBuddy | `workbuddy_refresh_token(userId)` | plugin refresh 端点（X-Refresh-Token 仅限此端点）+ 回写 token store 与账号池过期时间；失败提示需重登 |
-| WorkBuddy | `workbuddy_clear_relogin(id)` | 人工清除「需重登」标记（只清账号池条目的 needs_relogin 标记与原因，不动凭证；快照槽位验证标记 snapshot_verify_* 不受影响）；凭证真失效时下一轮签到会重新标记；幂等（已清直接 Ok）；async |
 | WorkBuddy | `workbuddy_checkin_start(opts)` → NDJSON `wb-checkin-progress` | Rust 直调 `tasks/wb_checkin.rs::run_checkin_round`（状态查询回退旧路径 / code:10001 已签容错 / 401 刷新一次重试 / 零 token 输出）；opts: `{ user_ids?, skip_checked_in, skip_expired, lazy_hours? }` |
 | WorkBuddy | `workbuddy_growth_run()` | 成长中心执行入口（旅行/盲盒/任务开关从 workbuddy_settings.json 读取；`wb_checkin::run_growth_round` 链式执行：travel status→claim→config→depart / lottery chances→draw 循环（上限 20）/ tasks→accept，各步独立容错、401 刷新一次重试、奖励数额以接口返回为准） |
 | WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（wb_checkin_results 表 90 天滚动，默认展示 30 天；**纯追加**：同日同账号多轮并存，返回新→旧序；活动档期日历聚合 `daysFromWbRecords` 按账号取当日最终态——任一 success/already 即当日已领、仅全失败计 fail） |
@@ -209,7 +203,7 @@ ai-work-assistant/
 | Qoder | `qoder_ide_scan()` / `qoder_cli_status()` / `qoder_live_logins()` | 本机 Qoder 客户端账号发现 / CLI 切号桥状态 / 双客户端实时登录标记——`{ide, work}` 均为池反查后的账号 id（ide=state.vscdb `secret://auth.userInfo` 解密；work=Work 数据目录根级 `auth.v1.dat` v10 解密 `user.id`，2026-10-04 实测修正：Cookies 库无 qoderuid）；未登录/解密失败 → null（fail-open，前端不展示徽标）；async（spawn_blocking 派发，join 失败拒绝 → 前端 catch 静默置空） |
 | Qoder | `qoder_checkin_start(opts)` → NDJSON `qoder-checkin-progress` | Rust 直调 `tasks/qoder_checkin.rs::run_checkin_round`（sash 双活动 claim，幂等回放归类已签；claim 间隔 1~3s 随机抖动；claim POST 与列表补学统一最小头形态 `minimal_auth_headers`——issue #114：claim 端点带设备指纹头族被上游风控按形态 503 拦截，最小头通过，主列表/余额 GET 维持完整头；401 刷新一次重试；campaign_id 路径段白名单；done 事件含 `failed_empty_campaigns` 单列计数） |
 | Qoder | `qoder_checkin_results(days?)` | 签到日志（qoder_checkin_results 表 90 天滚动，逐条 UPSERT 按 pk=date\|user_id\|time_ms 去重） |
-| Qoder | ~~`qoder_checkin_task_register/_status/_unregister`~~（2026-10-05 移除） | 每日签到统一由应用内 Rust 调度器 `qoder-checkin` 驱动（scheduler.rs 60s tick + 当日幂等 + 启动补跑），时刻 `settings.qoder_checkin_hhmm` 可改；不再有 schtasks 双轨命令 |
+| Qoder | `qoder_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日签到任务（主 exe `--task-run qoder-checkin`；应用内调度器同款默认 10:15 单次覆盖双活动） |
 | Qoder | `qoder_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/qoder_credits.rs`：usage 三通道取数（R-7 主结构 userQuota/addOnQuota + 宽容兜底全 None 显式失败）+ R-11 逐包明细端点 `GET {WEB_BASE}/api/v2/me/usages/big_model_credits`（官网域 qoder.cn 优先、openapi 兜底；total_quota.quota_detail → packages[]，source: plan 订阅配额 / bonus 个人资源包）；sash usage 原生 `dedicated_resource_packages[]` 同步解析为逐包（source: dedicated 专属/组织资源包，Work 客户端解析器同款字段、status 枚举前缀 QUOTA_DETAIL_STATUS_* 归一，已用完/非激活过滤、expires_at 缺失回退订阅周期）；字段级覆盖、全失败回退聚合口径并记 app.log warn + 30 分钟负缓存防噪音（双端点实测恒 401/503：qoder.cn 需 Web 会话鉴权、openapi 主机无路由；TTL 内静默跳过、TTL 过自动复探自愈）；缓存 10min（仅全部成功落缓存）；401 自愈刷新一次；成功回写池余额；全量且全部成功才落每日快照（含当日消耗差分） |
 | Qoder | `qoder_credits_history_list()` | 积分每日快照时序读取（qoder_credits_history 表 365 天，同日覆盖） |
 | Qoder | `qoder_groups_list / create / update / remove` | 分组管理（kv("qoder_groups")，结构与 Trae/Buddy 一致；create 重名校验；删除时组内账号回落未分组） |
@@ -382,14 +376,6 @@ ai-work-assistant/
 
 > **升版时机（红线）**：**不要随意升版**——只有用户明确说「升级版本」时才升版并走全流程（见下文「发版全流程」）。日常提交 / bug 修复一律不动版本号；下表的升位判断标准仅在用户主动发版时用于确定升哪一位。
 
-> **macOS 构建与分发（F-75）**：`tauri.conf.json` 为公共配置，Windows 配置在 `tauri.windows.conf.json`、macOS 在 `tauri.macos.conf.json`（Tauri v2 按目标平台深度合并）。mac 产物为 `dmg` + `app`（aarch64），ad-hoc 签名（`signingIdentity: "-"`，暂不申请 Developer ID）。**Gatekeeper 首装放行引导（Release 正文模板固定附加）**：
->
-> > macOS 因应用未经公证会提示「无法验证开发者」，两种放行方式任选：
-> > ① 在「应用程序」文件夹中**右键点击**「AI Work 助手」→「打开」→ 再点「打开」（此后不再提示）；
-> > ② 或在「终端」执行：`xattr -d com.apple.quarantine "/Applications/AI Work 助手.app"`
->
-> 应用内同款引导内置于 AboutDialog 的 mac 更新安装视图（update-installing 事件后渲染）。
-
 | 提交内容 | 升级位 | 示例 |
 |---|---|---|
 | 新增一个完整的有意义的功能 | **中位（MINOR）** | 3.0.0 → 3.1.0 |
@@ -457,7 +443,7 @@ ai-work-assistant/
 
 ## 14. 已知约束
 
-- **平台支持（F-75）**：Windows 10/11（完整功能）+ macOS 12+（Apple Silicon / Intel，dmg 分发；功能域灰度放开中——schtasks 注册 / MachineGuid 重置 / UI 点击兜底为 Windows 专属，mac 由内置调度器 + 开机自启覆盖；平台差异实现收敛于 `platform/` 模块）。
+- 仅 Windows（代理证书安装 + MachineGuid 重置只在 Windows 验证）。
 - **PowerShell 运行时依赖已移除**：切换/保存/备份/恢复/保活全链路由 `switcher` 模块进程内直调（仅 Windows，sysinfo 0.33 锁定版——0.38+ 需 rustc 1.88 超出项目 MSRV 1.85）。
 - **环境检测零子进程（2026-10-07）**：版本号直读 PE 版本资源（`pe_version.rs`，按 mtime+size 缓存，读不到才回退 powershell）、运行态走 `switcher::proc::any_running`（sysinfo 快照 + 2s TTL）、`app_locate` 兜底两级（注册表/进程）带 3s TTL——切换板块时概览页与顶栏会重复探测，缓存即为此设计。**注意：关闭/强杀轮询（`commands/process.rs`、`switcher::proc::list_procs`）需实时快照，勿接入上述缓存。**
 - **Buddy 积分 SWR 语义（2026-10-08）**：`workbuddy_credits_fetch` 在非 `fresh` 且缓存过期时返回旧值 + `refreshing:true`，刷新转入后台线程（同刻仅一轮，日志 `[wb-credits] 后台刷新完成…`）；`stale:true` 仍**专指** F-59「刷新失败回退」，两者勿混用；前端按 `refreshing` 决定是否重取（`BuddyOverview`）。
