@@ -1423,7 +1423,10 @@ pub fn ensure_fresh(
                     }
                     return (creds, false, "fresh");
                 }
-                false
+                // 已过期（remain_h <= 0）：无 RT 无法续期，需重登——落入下方
+                // 复核 + 落库永久标记路径（融合 main 3.9.3 落徽标语义，
+                // 修复合并回归：此处误写 false 会让过期凭证伪装 "fresh" 提前返回）
+                true
             }
             // 无 expires_at 也无 refresh_token：无法判定新鲜度也无法刷新，按需重登
             None => true,
