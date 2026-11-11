@@ -271,6 +271,16 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You are Qoder's desktop agentic assistant, built by the Qoder team to help users solve problems and get things done with clarity and confidence.".to_string(),
             "You are a desktop work companion built by an internal productivity team to help users solve problems and get things done with clarity and confidence.".to_string(),
         ),
+        // issue #195 二期（2026-11-10 v3.9.2 样本实证）：DSH 裸品牌词兜底——
+        // 11128 样本中两条身份句/模型句已被上述规则改净，残留自检仍命中
+        // "deepseek harness"：dsh-code-review 预设描述等客户端本地文本中
+        // 非 "powered by" 形态的品牌词出现（样本 300 字符截断不可见）。裸词
+        // 规则居表尾：句级/短语级规则先行（防 "coding agent powered by"
+        // 残留），本规则只兜任意上下文的漏网品牌词；to 零特征词（回归门锁定）
+        (
+            "DeepSeek Harness".to_string(),
+            "AI coding assistant".to_string(),
+        ),
     ]
 }
 
@@ -417,6 +427,11 @@ pub fn aggressive_template_rules() -> Vec<(String, String)> {
         (
             "You are Qoder's".to_string(),
             "You are a".to_string(),
+        ),
+        // issue #195 二期：DSH 裸品牌词兜底（同默认表，升级重试路径同款兜底）
+        (
+            "DeepSeek Harness".to_string(),
+            "AI coding assistant".to_string(),
         ),
     ]
 }
@@ -1362,6 +1377,48 @@ pub fn residual_fingerprint_note_with_rules(
     } else {
         Some(seen.join(","))
     }
+}
+
+/// 残留命中上下文提取（issue #195 二期诊断增强）：指纹样本 system 仅取前
+/// 300 字符（fingerprint_sample），残留词出现在深部时（如 2026-11-10 v3.9.2
+/// 样本：dsh-code-review 预设描述中段的品牌词）样本不可见、用户无法据此
+/// 生成热更新清洗规则。本函数对首条 system 文本中每个命中特征词提取首次
+/// 出现处 ±80 字符的上下文片段（换行折叠空格、中点省略标界），供 11128
+/// Fatal 日志定位残留原文。无命中返回空串。
+pub fn residual_fingerprint_context(v: &Value) -> String {
+    const CTX_CHARS: usize = 80;
+    let system = first_system_text(v).to_lowercase();
+    if system.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = system.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    for m in RESIDUAL_MARKERS {
+        // find 给出字节下标 → 换算字符下标（marker 均为 ASCII，字节长=字符长）
+        let byte_pos = match system.find(m) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let char_pos = system[..byte_pos].chars().count();
+        let m_len = m.chars().count();
+        let start = char_pos.saturating_sub(CTX_CHARS);
+        let end = (char_pos + m_len + CTX_CHARS).min(chars.len());
+        let snippet: String = chars[start..end].iter().collect();
+        parts.push(format!(
+            "{m} @ …{}…",
+            snippet.replace(['\n', '\r'], " ")
+        ));
+    }
+    parts.join(" | ")
+}
+
+/// 残留命中上下文提取字节层便捷入口（wb_route 11128 Fatal 站点）
+pub fn residual_fingerprint_context_bytes(body: &[u8]) -> String {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return String::new();
+    };
+    residual_fingerprint_context(&v)
 }
 
 // ==================== 池级指纹拦截短记忆（issue #122 缺口2） ====================
@@ -2465,6 +2522,43 @@ mod tests {
             !out2.to_lowercase().contains("deepseek harness"),
             "合并表下品牌词同样零残留: {out2}"
         );
+    }
+
+    /// issue #195 二期（2026-11-10 v3.9.2 网关 11128 样本实证）：DSH 裸品牌词
+    /// 兜底——11128 样本中身份句/模型句均已被句级规则改净，残留自检仍命中
+    /// "deepseek harness"：dsh-code-review 预设描述等客户端本地文本以非
+    /// "powered by" 形态出现品牌词（样本 300 字符截断不可见）。默认表尾部
+    /// 裸词规则兜任意上下文；句级规则先行口径复核（"powered by" 形态不被
+    /// 裸词规则截断出 "coding agent powered by" 残留）+ 上下文诊断函数
+    #[test]
+    fn dsh_bare_brand_word_mopup_in_any_context() {
+        let tpl = default_template_map();
+        // v3.9.2 样本同构：身份句+模型句被改净后，预设描述中段仍有裸品牌词
+        let src = "You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent powered by the glm-5.3-flash model. 本机已安装 dsh-code-review 插件（代码审查模式 agent preset）：该预设基于 DeepSeek Harness 的只读工具集构建。";
+        let out = apply_template_map(src, &tpl);
+        assert!(
+            !out.to_lowercase().contains("deepseek harness"),
+            "裸品牌词残留: {out}"
+        );
+        assert!(out.contains("AI coding assistant 的只读工具集"), "{out}");
+        assert!(!out.contains("coding agent powered by"), "{out}");
+        // 改写幂等 + 默认表口径回归门（to 零特征词）
+        assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等");
+        // 默认+激进合并表口径同款
+        let mut agg = default_template_map();
+        agg.extend(aggressive_template_rules());
+        let out2 = apply_template_map(src, &agg);
+        assert!(!out2.to_lowercase().contains("deepseek harness"), "{out2}");
+        // 残留自检+上下文诊断闭环：改写后自检零命中；残留词深藏在 300 字符
+        // 截断之外时（Fatal 站点对清洗产物取上下文的口径），±80 字符片段
+        // 仍可定位残留原文
+        let washed = json!({"messages":[{"role":"system","content":out}]});
+        assert_eq!(residual_fingerprint_note(&serde_json::to_vec(&washed).unwrap()), None);
+        let deep = json!({"messages":[{"role":"system","content":"该预设基于 DeepSeek Harness 的只读工具集构建，默认只读。"}]});
+        assert_eq!(residual_fingerprint_context(&washed), String::new());
+        let ctx = residual_fingerprint_context(&deep);
+        assert!(ctx.contains("deepseek harness"), "{ctx}");
+        assert!(ctx.contains("dsh-code-review") || ctx.contains("预设"), "{ctx}");
     }
 
     /// DSH 0.2.1-rc.2 模型句整句同义改写（2026-10-29 headless 抓包实证：模型

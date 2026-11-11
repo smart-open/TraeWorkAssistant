@@ -6,10 +6,21 @@
 
 ---
 
-## [未发布]
+## [1.6.5] · 2026-11-11 · 语义移植 main 63c354f => b075a81（1 提交）
+
+> 语义移植 3.9.3 单提交（未 merge）；跳过桌面/OS 专属项：CodeBuddy 槽位 meta 污染加固（switcher 模块桌面专属）、README 免费额度说明。
 
 ### 修复与加固
-- **Qoder 账号「Token 有效」徽标滞留**：`ensure_fresh` 永久失败出口（凭证已过期且无刷新令牌 / PAT 被服务端拒绝）此前只返回 note 不回写池 `needs_relogin`，账号列表徽标滞留「Token 有效」+ 已过期日期，看板/调度跳过口径永不生效——现对照 `auth_dead` 同款落库（重登/OAuth 重新入池或重导 PAT 续期成功后由 `sync_pool_expiry` 复位）。
+- **Qoder「Token 有效」徽标滞留**：`ensure_fresh` 永久失败出口（过期无 RT / PAT 被拒 / 空 RT）均在函数内回写池 `needs_relogin`（重登或重导 PAT 成功后由 `sync_pool_expiry` 复位）；空 RT 落库前重读复核防他进程刚刷新的误标（含 vault 故障守卫、复核凭证条件采纳），reason 按有无到期时间区分。
+- **DSH 裸品牌词 11128 残留根治（issue #195 二期）**：默认/激进清洗表尾部补裸词兜底规则 `DeepSeek Harness → AI coding assistant`；11128 Fatal 站点残留自检新增 ±80 字符上下文片段，定位 300 字符样本截断之外的漏网品牌词。
+
+### 全面审查（2026-11-11，2 子代理交叉验证）
+- 逐 hunk 比对确认移植保真（wb_payload / wb_route / qoder_common 与 b075a81 语义一致）；authfile / accounts CB 槽位加固为桌面切换链专属，裁剪正确。
+- **审查修复（条件采纳复核凭证）**：空 RT 落库复核读到非空 RT 时，复核 AT 非空才采纳（`creds = recheck`）——采纳必须满足被采纳位置的既有不变量（AT 非空）；否则 token store「RT 有值但 AT 空」半写状态会以 `"fresh"` + 空 AT 返回，调用方 401 自愈重入同状态循环。AT 空时走原路径按 `no_credential` 暂态处理（与上游一致）。
+- **知悉项（不修）**：11128 残留上下文入 `[SCHED]` 日志与存量 300 字符样本同泄露量级、仅罕见失败路径触发；tool_alias 维度命中时日志退回旧格式（无信息损失）。
+
+### 验证
+- `cargo test --workspace`：991+13 通过 / 0 失败；`cargo check --all-targets` 零警告 / `tsc --noEmit` 零错误 / `vitest` 90 用例全过。
 
 ---
 

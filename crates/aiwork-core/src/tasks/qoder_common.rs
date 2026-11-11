@@ -989,7 +989,7 @@ pub fn ensure_fresh(
     // 他人已刷新落库的新令牌直接命中 fresh/复用路径（二次检查），不再重复发起网络刷新
     let lock = refresh_lock_for(acct_id);
     let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let creds = effective_creds(state, acct_id);
+    let mut creds = effective_creds(state, acct_id);
     if creds.access_token.is_empty() {
         // 修复 2（issue #153）：vault 系统性故障时 ns_get fail-secure 返回 None，
         // 与「无凭证」不可区分——故障期返回暂态 vault_down，调用方按暂态处理
@@ -1093,9 +1093,38 @@ pub fn ensure_fresh(
         // 回写池 needs_relogin（对照 auth_dead 同款）：此前仅返回 note 不落库，
         // 徽标滞留「Token 有效」+ 过期日期，看板/调度跳过口径永不生效。
         // 无 RT 即无自动续期通道，重试注定失败；用户重登/OAuth 重新入池后
-        // 由 sync_pool_expiry（续期成功路径）复位
-        mark_needs_relogin(state, acct_id, "凭证已过期且无刷新令牌，无法自动续期");
-        return (creds, false, "expired_needs_relogin");
+        // 由 sync_pool_expiry（续期成功路径）复位。reason 按有无到期时间区分
+        //（无 expires_at 时「已过期」文案失真）。
+        // **落库复核（b075a81 审查修复）**：初次读取后他进程可能已刷新落库写入新 RT——
+        // 此处重读一次，有 RT 则放弃永久标记继续走客户端通道（下方持跨进程锁后
+        // 还会重读生效凭证），避免把他进程刚救活的账号误标 needs_relogin 且被
+        // 调度跳过后无法自复位
+        let recheck = effective_creds(state, acct_id);
+        if recheck.refresh_token.is_empty() {
+            // 复核读空先探 vault（对齐函数头部/持锁后两处同构守卫）：
+            // vault 故障期读空 ≠ 真无 RT，不得永久标记
+            if !crate::vault::available(&state.data_dir) {
+                return (creds, false, "vault_down");
+            }
+            let reason = if creds.expires_at_ms.is_some() {
+                "凭证已过期且无刷新令牌，无法自动续期"
+            } else {
+                "凭证无刷新令牌且无到期时间，无法自动续期"
+            };
+            mark_needs_relogin(state, acct_id, reason);
+            return (creds, false, "expired_needs_relogin");
+        }
+        // 复核有 RT：采纳复核凭证再往下走（本进程审查修复）。不采纳虽因「进入
+        // 此分支必临期」隐式前提而行为等价（持锁后还会重读生效凭证），但 recheck
+        // 含他进程刚写入的新 expires_at_ms，显式采纳消除对旧 creds 过期时间的
+        // 隐式依赖，避免未来重构（如调整 fresh 判定位置）时误标。
+        // 仅在复核 AT 非空时采纳——token store 记录可能处于「RT 有值但 AT 空」
+        // 的半写/损坏状态（vault 两键独立回填），无条件采纳会让下方 fresh 提前
+        // 返回携带空 AT（此前由函数头部空 AT 守卫保证非空），调用方 401 自愈
+        // 重入同状态形成循环；不采纳则走原路径经持锁重读按 no_credential 暂态处理
+        if !recheck.access_token.is_empty() {
+            creds = recheck;
+        }
     }
     if let Some(exp) = creds.expires_at_ms {
         let remain_h = (exp - now_ms) as f64 / 3_600_000.0;

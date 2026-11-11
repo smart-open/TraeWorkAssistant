@@ -538,13 +538,19 @@ fn log_and_record_11128(
     // 不再每次都先吃一次 11128 才升级
     wb_payload::mark_channel_fp_block(state.pool_label(), true);
     // 清洗后残留自检（issue #195 可观测性，方案 B3 扩展到 tools 维度）：给出
-    // 清洗产物仍命中的已知特征词/未生效别名，缩小漏网排查面
+    // 清洗产物仍命中的已知特征词/未生效别名，缩小漏网排查面；命中词深藏在
+    // 指纹样本 300 字符截断之外时（issue #195 二期：v3.9.2 dsh-code-review
+    // 预设描述中段品牌词实证），附 ±80 字符上下文片段定位残留原文
     if let Some(res) =
         wb_payload::residual_fingerprint_note_rules_bytes(converted, tool_alias_rules)
     {
-        state
-            .logger
-            .log_sched_event(&format!("11128 清洗后残留自检: {res}"));
+        let ctx = wb_payload::residual_fingerprint_context_bytes(converted);
+        let msg = if ctx.is_empty() {
+            format!("11128 清洗后残留自检: {res}")
+        } else {
+            format!("11128 清洗后残留自检: {res}；残留上下文: {ctx}")
+        };
+        state.logger.log_sched_event(&msg);
     }
 }
 
