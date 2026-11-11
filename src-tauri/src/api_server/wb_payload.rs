@@ -282,6 +282,36 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "DeepSeek Harness".to_string(),
             "AI coding assistant".to_string(),
         ),
+        // issue #195 三期（2026-11-11 v3.9.2 api 日志盲区实证）：DSH 注入的
+        // 预设描述块「本机已安装 dsh-code-review 插件（代码审查模式 agent
+        // preset）：新建会话的预设选择器中可选「代码审查模式」。该预设是只读
+        // 代码审查 Agent……」原样透传即 11128 主嫌疑——短语级规则在前、裸词
+        // 兜底在后（"agent preset"/"预设选择器" 是上方短语规则的子串，表序
+        // 保证先整后零）；to 零特征词（回归门锁定）
+        (
+            "（代码审查模式 agent preset）".to_string(),
+            "（只读审查模式）".to_string(),
+        ),
+        (
+            "新建会话的预设选择器中可选「代码审查模式」".to_string(),
+            "新建会话时可在选择器中选择「只读审查」".to_string(),
+        ),
+        (
+            "该预设是只读代码审查 Agent".to_string(),
+            "该预设是只读审查助手".to_string(),
+        ),
+        (
+            "dsh-code-review".to_string(),
+            "code-review".to_string(),
+        ),
+        (
+            "agent preset".to_string(),
+            "assistant preset".to_string(),
+        ),
+        (
+            "预设选择器".to_string(),
+            "选择器".to_string(),
+        ),
     ]
 }
 
@@ -1127,7 +1157,7 @@ pub fn empty_sample_note(exhaust_tag: &str, pool: &str, body: &[u8]) -> String {
 }
 
 /// 11128 清洗后仍命中的指纹样本提取（issue #99 诊断闭环）：首条 system 消息
-/// 文本前 300 字符（压缩空白单行化，内嵌引号转单引号）+ 全量工具名列表（缺
+/// 文本前 2000 字符（压缩空白单行化，内嵌引号转单引号）+ 全量工具名列表（缺
 /// function 回退顶层 name——Responses 原生工具形态）。
 /// 用途：目前只知模板命中了什么、不知漏了什么——样本落 app.log 后用户可直接
 /// 反查精确触发句，经 UI「指纹清洗」tab 热更新规则表，无须发版。样本取**清洗前**
@@ -1146,12 +1176,14 @@ pub fn fingerprint_sample(body: &[u8]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
-        .take(300)
+        .take(2000)
         .collect();
-    // 截断标记：原文超出 300 字符时尾部补省略号。UI「生成规则」取首句作 from
-    // （模板改写是逐字 contains+replace 精确匹配），首句完整才可逐字命中；省略号
-    // 让调用方明确区分「首句已完整」与「被截断的残句」，避免拿残句当规则落库
-    let truncated = system.chars().count() > 300;
+    // 截断标记：原文超出 2000 字符时尾部补省略号（issue #195 三期：300→2000，
+    // DSH 预设描述块位于首条 system 中段、300 字符内不可见）。UI「生成规则」
+    // 取首句作 from（模板改写是逐字 contains+replace 精确匹配），首句完整才可
+    // 逐字命中；省略号让调用方明确区分「首句已完整」与「被截断的残句」，避免
+    // 拿残句当规则落库
+    let truncated = system.chars().count() > 2000;
     let mut out = format!(
         "system=\"{}{}\"",
         sys.replace('"', "'"),
@@ -1251,6 +1283,14 @@ const RESIDUAL_MARKERS: &[&str] = &[
     "interactive cli",
     "traecode",
     "zcode",
+    // issue #195 三期（2026-11-11 v3.9.2 api 日志实证）：清洗已净仍 11128，
+    // 主嫌疑为 DSH 独家预设描述块——「本机已安装 dsh-code-review 插件（代码
+    // 审查模式 agent preset）：新建会话的预设选择器中可选「代码审查模式」。
+    // 该预设是只读代码审查 Agent……」原样透传，三个特征词均不在模板表与本表。
+    // 整词组口径防误报（"code-review" 裸词、单独 "preset"/"选择器" 不入表）
+    "dsh-code-review",
+    "agent preset",
+    "预设选择器",
 ];
 
 /// 残指纹自检 Value 核心（issue #158 P1-1：Qoder 池已在 active_peek 上持有
@@ -1301,7 +1341,10 @@ pub fn residual_fingerprint_note_rules_bytes(
 /// ① 工具名含已知特征词（RESIDUAL_MARKERS 同表，小写比对）；
 /// ② 工具名仍带 `acp_` 前缀（ACP 桥接独家命名，通配规则被停用/未接线时的
 ///    漏网信号）；
-/// ③ 别名表 from 在清洗后仍存活（精确逐字比对；from 以 `*` 结尾按前缀判——
+/// ③ 工具描述文本含已知特征词（issue #195 三期：`function.description`，缺
+///    function 回退顶层 description——描述通道此前样本/自检均不可观测，
+///    harness 独家文本可注入于此，句表/工具名已净仍 11128 时同口径补扫）；
+/// ④ 别名表 from 在清洗后仍存活（精确逐字比对；from 以 `*` 结尾按前缀判——
 ///    from 均为客户端独家命名，存活即该条规则本请求未生效，诊断信号非误报；
 ///    停用规则空 to 不参与——用户主动停用非故障信号）。
 /// 命中项去重保持首现顺序（system 与 tools 同词组只报一次），逗号连接；
@@ -1351,7 +1394,29 @@ pub fn residual_fingerprint_note_with_rules(
             hits.push("acp_*".to_string());
         }
     }
-    // ③ 别名表 from 清洗后仍存活（别名未生效信号）——仅扫描生效规则（空 to
+    // ③ 工具描述特征词扫描（issue #195 三期 B4b）：harness 独家文本可注入
+    // 工具描述（样本与自检此前对描述通道均不可观测），与工具名同口径小写比对
+    if let Some(arr) = v.get("tools").and_then(Value::as_array) {
+        for t in arr {
+            let desc = t
+                .pointer("/function/description")
+                .and_then(Value::as_str)
+                .or_else(|| t.get("description").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_lowercase();
+            if desc.is_empty() {
+                continue;
+            }
+            hits.extend(
+                RESIDUAL_MARKERS
+                    .iter()
+                    .copied()
+                    .filter(|m| desc.contains(m))
+                    .map(str::to_string),
+            );
+        }
+    }
+    // ④ 别名表 from 清洗后仍存活（别名未生效信号）——仅扫描生效规则（空 to
     // = 用户主动停用，非「未生效」故障信号，不参与）
     for (from, to) in alias_rules {
         if to.is_empty() {
@@ -1383,7 +1448,7 @@ pub fn residual_fingerprint_note_with_rules(
 }
 
 /// 残留命中上下文提取（issue #195 二期诊断增强）：指纹样本 system 仅取前
-/// 300 字符（fingerprint_sample），残留词出现在深部时（如 2026-11-10 v3.9.2
+/// 2000 字符（fingerprint_sample），残留词出现在深部时（如 2026-11-10 v3.9.2
 /// 样本：dsh-code-review 预设描述中段的品牌词）样本不可见、用户无法据此
 /// 生成热更新清洗规则。本函数对首条 system 文本中每个命中特征词提取首次
 /// 出现处 ±80 字符的上下文片段（换行折叠空格、中点省略标界），供 11128
@@ -1978,21 +2043,22 @@ mod tests {
         assert!(s2.starts_with("system=\"sys\"") && !s2.contains("tools="), "{s2}");
     }
 
-    /// 指纹样本截断与 blocks 形态 content：300 字符截断、text blocks 拼接、
-    /// 内嵌双引号转单引号（日志单行安全）
+    /// 指纹样本截断与 blocks 形态 content：2000 字符截断（issue #195 三期
+    /// 300→2000，DSH 预设描述块位于首条 system 中段须可观测）、text blocks
+    /// 拼接、内嵌双引号转单引号（日志单行安全）
     #[test]
     fn fingerprint_sample_truncates_and_handles_blocks() {
         let body = json!({
             "messages":[{"role":"system","content":[
                 {"type":"text","text":"say \"hi\" "},
-                {"type":"text","text":"x".repeat(400)}
+                {"type":"text","text":"x".repeat(2200)}
             ]}]
         });
         let s = fingerprint_sample(&serde_json::to_vec(&body).unwrap());
         assert!(s.starts_with("system=\"say 'hi' x"), "{s}");
-        // 300 字符截断：总长远小于 400 源文本
-        assert!(s.len() < 400, "len={}", s.len());
-        // 截断标记：原文超 300 字符时尾部有省略号，供 UI 区分「首句完整」与「残句」
+        // 2000 字符截断：样本总长远小于 2200 源文本（窗口内全量 + 省略号）
+        assert!(s.len() < 2100, "len={}", s.len());
+        // 截断标记：原文超 2000 字符时尾部有省略号，供 UI 区分「首句完整」与「残句」
         assert!(s.contains("…\""), "截断样本应带省略号标记: {s}");
         // Responses 原生工具形态（无 function 包裹）回退顶层 name
         let body2 = json!({
@@ -2001,7 +2067,7 @@ mod tests {
         });
         let s2 = fingerprint_sample(&serde_json::to_vec(&body2).unwrap());
         assert!(s2.contains("tools=[web_search]"), "{s2}");
-        // 未超 300 字符 → 不带省略号（避免 UI 误判为残句）
+        // 未超 2000 字符 → 不带省略号（避免 UI 误判为残句）
         assert!(!s2.contains("…"), "短样本不应带省略号: {s2}");
     }
 
@@ -2667,6 +2733,75 @@ mod tests {
             }
             assert_eq!(apply_template_map(&out, &tpl), out, "改写须幂等: {from} → {out}");
         }
+    }
+
+    /// issue #195 三期：DSH 预设描述块（dsh-code-review 插件注入，11128 主
+    /// 嫌疑原文）被默认表连根清洗——短语级规则逐句消除 + 裸词兜底，零残留
+    /// 特征词且幂等
+    #[test]
+    fn dsh_preset_block_is_sanitized_by_default_map() {
+        let tpl = default_template_map();
+        let block = "本机已安装 dsh-code-review 插件（代码审查模式 agent preset）：新建会话的预设选择器中可选「代码审查模式」。该预设是只读代码审查 Agent——可对当前工作区做只读分析。";
+        let out = apply_template_map(block, &tpl);
+        let low = out.to_lowercase();
+        for m in RESIDUAL_MARKERS {
+            assert!(!low.contains(*m), "预设描述块残留特征词 {m}: → {out}");
+        }
+        assert!(!out.contains("代码审查模式"), "短语级残留: {out}");
+        assert_eq!(apply_template_map(&out, &tpl), out, "预设描述块清洗须幂等");
+    }
+
+    /// issue #195 三期 B4b：残留自检扩展到工具描述——harness 独家文本注入
+    /// function.description / 顶层 description 时同样报警（此前描述通道不可
+    /// 观测，句表/工具名已净仍 11128 的漏网排查面）
+    #[test]
+    fn residual_note_detects_dsh_markers_in_tool_description() {
+        let tpl = default_template_map();
+        let v = json!({
+            "messages": [{"role": "system", "content": "You are a helpful assistant."}],
+            "tools": [
+                {"type": "function", "function": {"name": "read_file", "description":
+                    "只读审查工具。本机已安装 dsh-code-review 插件（代码审查模式 agent preset）。"}},
+                {"type": "function", "name": "web_search", "description": "干净描述"}
+            ]
+        });
+        let note = residual_fingerprint_note_with_rules(&v, &tpl);
+        let note = note.unwrap_or_default();
+        assert!(
+            note.contains("dsh-code-review") && note.contains("agent preset"),
+            "工具描述残留未报警: {note}"
+        );
+    }
+
+    /// issue #195 三期 B4a：指纹样本 system 截断 300→2000——DSH 预设描述块
+    /// 位于首条 system 中段（~500 字符处），300 窗口不可见、2000 窗口内可见；
+    /// 超出 2000 仍不入样本且带截断省略号
+    #[test]
+    fn fingerprint_sample_window_covers_dsh_preset_block() {
+        let mut sys = "You are a helpful assistant. ".to_string();
+        sys.push_str(&"x".repeat(500));
+        sys.push_str("本机已安装 dsh-code-review 插件");
+        sys.push_str(&"y".repeat(100));
+        let v = json!({
+            "messages": [{"role": "system", "content": sys}],
+            "tools": []
+        });
+        let body = serde_json::to_vec(&v).unwrap();
+        let sample = fingerprint_sample(&body);
+        assert!(sample.contains("dsh-code-review"), "500 字符处残留未入样本");
+        assert!(!sample.contains('…'), "未超长不应标截断");
+
+        let mut sys2 = "You are a helpful assistant. ".to_string();
+        sys2.push_str(&"x".repeat(2600));
+        sys2.push_str("dsh-code-review");
+        let v2 = json!({
+            "messages": [{"role": "system", "content": sys2}],
+            "tools": []
+        });
+        let body2 = serde_json::to_vec(&v2).unwrap();
+        let sample2 = fingerprint_sample(&body2);
+        assert!(!sample2.contains("dsh-code-review"), "2000 窗口外不应入样本");
+        assert!(sample2.contains('…'), "超长样本未标截断");
     }
 
     /// issue #122 缺口2：池级指纹拦截短记忆——blocked=true 标记后同池 TTL 内

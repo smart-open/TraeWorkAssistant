@@ -501,13 +501,17 @@ pub fn load_tool_alias_rules(state: &WbView) -> Vec<(String, String)> {
 /// 口径一致）：指纹样本+本次命中流水日志、显式/清洗后两条样本入环形缓冲、
 /// 池级指纹短记忆标记、清洗后残留自检。样本由调用点取（来源各异：请求原文
 /// body_vec / chat_body 序列化），按请求去重守卫（last_11128_sample）与终局
-/// 说明（清洗后仍命中=模板需更新 vs 内容已流出=不可同号重试）留在调用点
+/// 说明（清洗后仍命中=模板需更新 vs 内容已流出=不可同号重试）留在调用点。
+/// probe（issue #195 三期 B1）：Some((creds, model)) 时终局以 detach 线程追加
+/// 归因探针——同号新会话极简规范请求二分风控维度（账号/池标记 vs 内容残留），
+/// 结论只落日志不改重试策略
 fn log_and_record_11128(
     state: &WbView,
     sample: &str,
     converted: &[u8],
     tool_alias_rules: &[(String, String)],
     hit_cursor: u64,
+    probe: Option<(&WbCreds, &str)>,
 ) {
     let note = wb_payload::template_hit_note();
     // 本次请求实际命中（issue #195 方案 B5）：游标之后的模板/别名命中流水，
@@ -536,7 +540,7 @@ fn log_and_record_11128(
     wb_payload::mark_channel_fp_block(state.pool_label(), true);
     // 清洗后残留自检（issue #195 可观测性，方案 B3 扩展到 tools 维度）：给出
     // 清洗产物仍命中的已知特征词/未生效别名，缩小漏网排查面；命中词深藏在
-    // 指纹样本 300 字符截断之外时（issue #195 二期：v3.9.2 dsh-code-review
+    // 指纹样本 2000 字符截断之外时（issue #195 二期：v3.9.2 dsh-code-review
     // 预设描述中段品牌词实证），附 ±80 字符上下文片段定位残留原文
     if let Some(res) =
         wb_payload::residual_fingerprint_note_rules_bytes(converted, tool_alias_rules)
@@ -549,6 +553,101 @@ fn log_and_record_11128(
         };
         state.logger.log_sched_event(&msg);
     }
+    // 归因探针（issue #195 三期 B1）：目前无法断定风控原因——清洗已净仍被拦
+    // 时用同一账号发极简规范请求二分定位（账号/池标记 vs 内容残留），以日志
+    // 证据收敛后再修复；结论只落日志，不改 Fatal 语义
+    if let Some((creds, model)) = probe {
+        probe_11128_account_marked(state, creds, model);
+    }
+}
+
+/// 11128 归因探针（issue #195 三期 B1）：用**触发 11128 的同一账号**发一次
+/// 极简规范请求（无 tools、一句通用 system，零客户端指纹；会话用 gen_conv_id()
+/// 新 id 隔离会话维度——探针只二分账号/池维度 vs 内容维度，X-Conversation
+/// 三头由 make_wb_request 按新 id 同源补齐），二分定位风控维度：
+/// - 探针仍 11128 → 账号/池维度标记嫌疑（内容无关——建议换号/换池对照验证；
+///   11-09 同形态曾通过的记录提示标记可能随时效/池轮换消退）；
+/// - 探针通过 → 内容残留嫌疑（指纹样本/残留自检已落上方日志，继续模板
+///   路线热更新收敛）。
+/// 探针 detach 线程执行（ureq 读路径无整体超时上限，同步会拖延客户端 Fatal
+/// 错误下发）；仅 Fatal 终局执行一次；自身网络/响应异常 → 归因未知不落结论
+/// （防误导）。结论只落日志，不改重试策略
+fn probe_11128_account_marked(state: &WbView, creds: &WbCreds, model: &str) {
+    let creds = creds.clone();
+    let model = model.to_string();
+    let spawn = std::thread::Builder::new()
+        .name("wb-11128-probe".to_string())
+        .spawn({
+            let state = state.clone();
+            move || probe_11128_probe_run(state, creds, model)
+        });
+    if let Err(e) = spawn {
+        state
+            .logger
+            .log_sched_event(&format!("[11128 归因探针] 探针线程启动失败，归因未知: {e}"));
+    }
+}
+
+/// 探针线程体（detach 发射后不管；持 WbView/WbCreds 克隆，'static）
+fn probe_11128_probe_run(state: WbView, creds: WbCreds, model: String) {
+    let conv_id = gen_conv_id();
+    state.logger.log_sched_event(&format!(
+        "[11128 归因探针] 发起：同号新会话极简规范请求 pool={} uid={} model={model}",
+        state.pool_label(),
+        creds.uid
+    ));
+    let body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "conversation_id": conv_id,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let body_bytes = match serde_json::to_vec(&body) {
+        Ok(b) => b,
+        Err(_) => {
+            state
+                .logger
+                .log_sched_event("[11128 归因探针] 探针体序列化失败，归因未知");
+            return;
+        }
+    };
+    let blocked = match wb_upstream::make_wb_request(&creds, &conv_id, &body_bytes) {
+        Ok(reader) => {
+            // HTTP 200：11128 亦可能以 SSE 错误帧形态下发（issue #123 实证）；
+            // 极简请求响应极短，读到 EOF 扫全文即可。判定只走
+            // is_illegal_channel_error（"code":11128 键值精确匹配 + 英文关键词）
+            // ——裸匹配数字 11128 会与 usage 帧 token 计数误撞（retry.rs 既定口径）
+            let mut reader = std::io::BufReader::new(reader);
+            let mut text = String::new();
+            if reader.read_to_string(&mut text).is_err() && text.is_empty() {
+                state
+                    .logger
+                    .log_sched_event("[11128 归因探针] 响应读取失败，归因未知");
+                return;
+            }
+            super::retry::is_illegal_channel_error(&text)
+        }
+        Err((code, ref msg, _)) => {
+            if code == 400 && super::retry::is_illegal_channel_error(msg) {
+                true
+            } else {
+                // 非 11128 上游错误（401/429/5xx…）：探针结论未知，不误导归因
+                state.logger.log_sched_event(&format!(
+                    "[11128 归因探针] 探针收到非 11128 上游错误（HTTP {code}），归因未知"
+                ));
+                return;
+            }
+        }
+    };
+    let verdict = if blocked {
+        "[11128 归因探针] 结论：同号新会话极简规范请求仍被拦（无工具/零指纹内容）→ 账号/池维度标记嫌疑；建议换号或换池对照验证（内容路线无需再加规则）"
+    } else {
+        "[11128 归因探针] 结论：同号新会话极简规范请求通过 → 内容残留嫌疑；以上方指纹样本+残留自检定位漏网句，UI「指纹清洗」tab 热更新规则"
+    };
+    state.logger.log_sched_event(verdict);
 }
 
 // ==================== 错误分类（WB 上游） ====================
@@ -1378,6 +1477,7 @@ pub(crate) fn run_wb_stream(
                                 let sample = wb_payload::fingerprint_sample(body_vec);
                                 log_and_record_11128(
                                     state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                    Some((&creds, model)),
                                 );
                                 // 终局说明（审查修复：区分两种不可重试情形——清洗后
                                 // 仍命中=模板需更新；内容已流出=不可同号重试）
@@ -1503,6 +1603,7 @@ pub(crate) fn run_wb_stream(
                             last_11128_sample = Some(sample.clone());
                             log_and_record_11128(
                                 state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                Some((&creds, model)),
                             );
                             // Fatal 透传前的排查指引（仅日志，客户端响应体不变）
                             state.logger.log_sched_event(
@@ -1923,6 +2024,7 @@ pub async fn wb_aggregate_chat(
                                     let sample = wb_payload::fingerprint_sample(&body_vec);
                                     log_and_record_11128(
                                         &state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                        Some((&creds, &model)),
                                     );
                                     state.logger.log_sched_event(
                                         "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
@@ -2008,6 +2110,7 @@ pub async fn wb_aggregate_chat(
                                 last_11128_sample = Some(sample.clone());
                                 log_and_record_11128(
                                     &state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                    Some((&creds, &model)),
                                 );
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
@@ -2384,6 +2487,7 @@ pub async fn wb_tool_exec_chat(
                                     last_11128_sample = Some(sample.clone());
                                     log_and_record_11128(
                                         &state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                        Some((&creds, &model)),
                                     );
                                     state.logger.log_sched_event(
                                         "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
@@ -2525,6 +2629,7 @@ pub async fn wb_tool_exec_chat(
                                 last_11128_sample = Some(sample.clone());
                                 log_and_record_11128(
                                     &state, &sample, &converted, &tool_alias_rules, hit_cursor,
+                                    Some((&creds, &model)),
                                 );
                                 state.logger.log_sched_event(
                                     "11128 清洗已启用仍被拦截：模板需更新（UI「指纹清洗」tab 热更新 wb_template_map.json），指纹样本见上方日志",
