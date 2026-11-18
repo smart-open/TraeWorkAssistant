@@ -290,72 +290,94 @@ fn probe_exe_candidates() -> Vec<PathBuf> {
     cands
 }
 
+/// 家族 exe 白名单（小写；注册表回退仅收集这些名，防 RepairApp/unins000 等卸载器
+/// 与国际版/主程序无关卸载项误入）
+const FAMILY_EXES: &[&str] = &[
+    "workbuddy.exe",
+    "workbuddyai.exe",
+    "workbuddy ai.exe",
+    "codebuddy.exe",
+    "codebuddy cn.exe",
+];
+/// 注册表 DisplayName 匹配的家族模式串（大小写不敏感 contains）
+const FAMILY_PATTERNS: &[&str] = &["WorkBuddy", "CodeBuddy"];
+
+/// DisplayIcon/InstallLocation 值清洗为候选 exe 路径（审查修复：抽函数供单测直测
+/// 实现，不再内联复刻）。返回 0..2 条——DisplayIcon 剥 ",0" 图标索引后缀（须为
+/// 白名单 exe 名且文件存在）+ InstallLocation 拼全部白名单名（存在且未重复）。
+fn registry_value_to_exe_paths(
+    display_icon: Option<&str>,
+    install_location: Option<&str>,
+    dedup: &mut Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Some(icon) = display_icon {
+        let clean = icon.split(',').next().unwrap_or("").trim().to_string();
+        let hit = std::path::Path::new(&clean)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("exe"))
+            .unwrap_or(false)
+            && std::path::Path::new(&clean)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .map(|f| FAMILY_EXES.contains(&f.to_lowercase().as_str()))
+                .unwrap_or(false);
+        if hit
+            && std::path::Path::new(&clean).is_file()
+            && !found.contains(&PathBuf::from(&clean))
+            && !dedup.contains(&PathBuf::from(&clean))
+        {
+            found.push(PathBuf::from(&clean));
+        }
+    }
+    if let Some(loc) = install_location {
+        if !loc.is_empty() {
+            for name in FAMILY_EXES {
+                let exe = PathBuf::from(loc).join(name);
+                if exe.is_file() && !found.contains(&exe) && !dedup.contains(&exe) {
+                    found.push(exe);
+                }
+            }
+        }
+    }
+    found
+}
+
 /// 注册表回退：枚举卸载键（HKCU/HKLM 64+32 视图，口径对齐 commands/env.rs
 /// registry_app_path），DisplayName 含 WorkBuddy/CodeBuddy 家族名 → DisplayIcon /
-/// InstallLocation 指向的 exe 收为候选。仅收集 exe 白名单名，防国际版/主程序
-/// 卸载项（RepairApp/unins000 等）误入。
+/// InstallLocation 指向的 exe 收为候选。审查修复：键枚举提外层（8 组键只遍历
+/// 一遍，pattern 匹配内层），消除原 2×2×2 重复枚举。
 fn registry_family_exes() -> Vec<PathBuf> {
     use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
-    const FAMILY_EXES: &[&str] = &[
-        "workbuddy.exe",
-        "workbuddyai.exe",
-        "workbuddy ai.exe",
-        "codebuddy.exe",
-        "codebuddy cn.exe",
-    ];
-    const PATTERNS: &[&str] = &["WorkBuddy", "CodeBuddy"];
     let uninstall_sub = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
-    let mut found = Vec::new();
-    for pattern in PATTERNS {
-        let pat_upper = pattern.to_uppercase();
-        for root in [CURRENT_USER, LOCAL_MACHINE] {
-            for view in [uninstall_sub, "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"] {
-                let Ok(uninstall) = root.open(view) else {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for root in [CURRENT_USER, LOCAL_MACHINE] {
+        for view in [uninstall_sub, "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"] {
+            let Ok(uninstall) = root.open(view) else {
+                continue;
+            };
+            let Ok(subkeys) = uninstall.keys() else {
+                continue;
+            };
+            for key in subkeys {
+                let Ok(item) = uninstall.open(&key) else {
                     continue;
                 };
-                let Ok(subkeys) = uninstall.keys() else {
+                let Ok(display) = item.get_string("DisplayName") else {
                     continue;
                 };
-                for key in subkeys {
-                    let Ok(item) = uninstall.open(&key) else {
-                        continue;
-                    };
-                    let Ok(display) = item.get_string("DisplayName") else {
-                        continue;
-                    };
-                    if !display.to_uppercase().contains(&pat_upper) {
-                        continue;
-                    }
-                    // DisplayIcon 优先（剥 ",0" 图标索引），InstallLocation 拼白名单名兜底
-                    let icon = item.get_string("DisplayIcon").ok();
-                    let loc = item.get_string("InstallLocation").ok();
-                    if let Some(icon) = icon {
-                        let clean = icon.split(',').next().unwrap_or("").trim().to_string();
-                        if std::path::Path::new(&clean)
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| e.eq_ignore_ascii_case("exe"))
-                            .unwrap_or(false)
-                            && std::path::Path::new(&clean)
-                                .file_name()
-                                .and_then(|f| f.to_str())
-                                .map(|f| FAMILY_EXES.contains(&f.to_lowercase().as_str()))
-                                .unwrap_or(false)
-                            && std::path::Path::new(&clean).is_file()
-                        {
-                            found.push(PathBuf::from(clean));
-                        }
-                    }
-                    if let Some(loc) = loc {
-                        if !loc.is_empty() {
-                            for name in FAMILY_EXES {
-                                let exe = PathBuf::from(&loc).join(name);
-                                if exe.is_file() && !found.contains(&exe) {
-                                    found.push(exe);
-                                }
-                            }
-                        }
-                    }
+                let display_upper = display.to_uppercase();
+                if !FAMILY_PATTERNS
+                    .iter()
+                    .any(|p| display_upper.contains(&p.to_uppercase()))
+                {
+                    continue;
+                }
+                let icon = item.get_string("DisplayIcon").ok();
+                let loc = item.get_string("InstallLocation").ok();
+                for p in registry_value_to_exe_paths(icon.as_deref(), loc.as_deref(), &mut found) {
+                    found.push(p);
                 }
             }
         }
@@ -439,7 +461,9 @@ fn extract_probe_meta(stdout: &str) -> Option<String> {
 /// 该形态经 extract_probe_meta 附入失败原因（issue #203：替代 Node 崩溃页脚
 /// 只剩 `} | Node.js vX` 的无信息量 stderr）；stderr 仍捕获兜底真实崩溃场景。
 fn probe_once(exe: &std::path::Path, names: &[String]) -> Result<String, String> {
-    let mut last_err = String::new();
+    // 审查修复（两轮错误累积）：.cjs/.mjs 两轮 last_err 由覆盖改累积——首轮失败
+    // 原因（可能含自诊断 meta）不再被次轮覆盖，两轮失败时根因信息完整
+    let mut errs: Vec<String> = Vec::new();
     for (script, esm) in [("cjs", false), ("mjs", true)] {
         let body = build_probe_script(esm, names);
         let n = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -455,9 +479,9 @@ fn probe_once(exe: &std::path::Path, names: &[String]) -> Result<String, String>
                 .as_nanos()
         ));
         if let Err(e) = std::fs::write(&tmp, body) {
-            // 审查修复：写失败（磁盘满/权限/杀软锁定）记入 last_err——原静默
+            // 审查修复：写失败（磁盘满/权限/杀软锁定）记入错误——原静默
             // continue 会让两轮均失败时返回空错误串，用户只见「探针失败: 」
-            last_err = format!("探针脚本写入 {} 失败: {e}", tmp.display());
+            errs.push(format!("探针脚本写入 {} 失败: {e}", tmp.display()));
             continue;
         }
         let result = run_probe_script(exe, &tmp);
@@ -468,16 +492,16 @@ fn probe_once(exe: &std::path::Path, names: &[String]) -> Result<String, String>
                 // 脚本干净退出但无 payload：meta（若有）即真实根因
                 let meta = extract_probe_meta(&out)
                     .unwrap_or_else(|| format!("无自诊断输出（len={}）", out.len()));
-                last_err = format!("{} 未产出密钥（自诊断: {meta}）", exe.display());
+                errs.push(format!("{} 未产出密钥（自诊断: {meta}）", exe.display()));
             }
             Err(e) => {
                 // 真实崩溃（非零退出/超时）：stderr 摘要兜底（meta 走 stdout，
                 // 该场景由 run_probe_script 失败分支尽力附带）
-                last_err = e;
+                errs.push(e);
             }
         }
     }
-    Err(last_err)
+    Err(errs.join("；"))
 }
 
 /// 跑单份探针脚本：返回 stdout 全文；失败附 stderr 摘要（不含密钥——stderr 只有
@@ -576,11 +600,11 @@ fn summarize_stderr(stderr: &str) -> String {
     if let Some(err_line) = err_line {
         parts.push(err_line.chars().take(240).collect());
     }
-    let tail: Vec<String> = lines
+    // 尾 3 行上下文：与 err_line 重复的行剔除（错误行恰在尾部时不重复占 cap）
+    let tail_start = lines.len().saturating_sub(3);
+    let tail: Vec<String> = lines[tail_start..]
         .iter()
-        .rev()
-        .take(3)
-        .rev()
+        .filter(|l| Some(**l) != err_line.copied())
         .map(|l| l.chars().take(80).collect())
         .collect();
     parts.push(tail.join(" | "));
@@ -589,9 +613,13 @@ fn summarize_stderr(stderr: &str) -> String {
 
 // ── binding 候选名自适应发现（issue #203）────────────────────────────────────
 
-/// binding 候选名缓存（按 exe 路径；探针为低频命令路径，无需失效策略）
-static BINDING_NAMES_CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, Vec<String>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// binding 候选名缓存（按 exe 路径；审查修复：加 1h TTL——客户端进程内自动升级
+/// 后 binding 可能改名，永不过期的缓存会让探针持续用旧名必败直至应用重启）。
+static BINDING_NAMES_CACHE: std::sync::LazyLock<
+    Mutex<HashMap<PathBuf, (std::time::Instant, Vec<String>)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 缓存 TTL：binding 发现为低频路径（秒级 IO），1h 后重扫成本低且能感知升级
+const BINDING_NAMES_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// 从客户端 resources 自适应发现 `_linkedBinding('<name>')` 实际引用的 binding 名。
 /// 背景（issue #203）：CodeBuddy CN 4.12+（VS Code fork，散文件 `resources/app/out/`
@@ -600,8 +628,10 @@ static BINDING_NAMES_CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, Vec<Strin
 /// 默认名（现状实测可达），其后按发现顺序追加构建特有名（去重，cap 16）。
 fn discover_binding_names(exe: &std::path::Path) -> Vec<String> {
     if let Ok(cache) = BINDING_NAMES_CACHE.lock() {
-        if let Some(names) = cache.get(exe) {
-            return names.clone();
+        if let Some((at, names)) = cache.get(exe) {
+            if at.elapsed() < BINDING_NAMES_TTL {
+                return names.clone();
+            }
         }
     }
     let mut names = vec![DEFAULT_BINDING_NAME.to_string()];
@@ -621,19 +651,19 @@ fn discover_binding_names(exe: &std::path::Path) -> Vec<String> {
         for f in &files {
             scan_file_for_bindings(f, &mut names);
         }
-        // asar 整包兜底：上述两形态均未发现时才扫（单文件可能上百 MB，字节级
-        // 搜索一次 ~秒级，仅低频触发）
+        // asar 整包兜底：上述两形态均未发现时才扫（单文件可能上百 MB，分块流式
+        // 扫描内存恒定 ~秒级，仅低频触发）
         if names.len() == 1 {
             let asar = resources.join("app.asar");
             if let Ok(meta) = std::fs::metadata(&asar) {
                 if meta.len() <= 256 * 1024 * 1024 {
-                    scan_file_for_bindings(&asar, &mut names);
+                    scan_file_for_bindings_chunked(&asar, &mut names);
                 }
             }
         }
     }
     if let Ok(mut cache) = BINDING_NAMES_CACHE.lock() {
-        cache.insert(exe.to_path_buf(), names.clone());
+        cache.insert(exe.to_path_buf(), (std::time::Instant::now(), names.clone()));
     }
     names
 }
@@ -683,6 +713,46 @@ fn scan_file_for_bindings(path: &std::path::Path, names: &mut Vec<String>) {
         }
         if !names.contains(&name) {
             names.push(name);
+        }
+    }
+}
+
+/// NEEDLE 常量（与 scan_bytes_for_bindings 内 NEEDLE 同串，改一处须同步另一处）
+const NEEDLE_LEN: usize = "_linkedBinding(".len();
+
+/// 分块流式扫描（审查修复，asar 兜底专用）：固定 4MB 窗口滚动，块间保留
+/// NEEDLE_LEN-1 字节重叠区防调用点跨块截断漏检；内存峰值恒定，不再整读
+/// ≤256MB 包。重叠区不可能容纳完整 needle（14 < 15），整 buf 起扫无重复上报。
+const SCAN_CHUNK: usize = 4 * 1024 * 1024;
+
+fn scan_file_for_bindings_chunked(path: &std::path::Path, names: &mut Vec<String>) {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return;
+    };
+    use std::io::Read;
+    let mut carry: Vec<u8> = Vec::new(); // 上一块尾 NEEDLE_LEN-1 字节重叠
+    loop {
+        let mut chunk = vec![0u8; SCAN_CHUNK];
+        let n = match f.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        chunk.truncate(n);
+        let mut buf = std::mem::take(&mut carry);
+        buf.extend_from_slice(&chunk);
+        for name in scan_bytes_for_bindings(&buf) {
+            if names.len() >= 16 {
+                return;
+            }
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        // 保尾：仅保留与下一块可能拼接出完整调用的尾部字节
+        let keep_from = buf.len().saturating_sub(NEEDLE_LEN - 1);
+        carry = buf[keep_from..].to_vec();
+        if n < SCAN_CHUNK {
+            break;
         }
     }
 }
@@ -1161,29 +1231,71 @@ const b = process._linkedBinding('electron_browser_native_bindings');
 
     #[test]
     fn 注册表回退_exe白名单_过滤卸载器与图标索引() {
-        // DisplayIcon 带 ",0" 图标索引后缀 → 剥后缀；exe 名不在白名单（RepairApp/
-        // unins000）→ 不收
-        let family = ["workbuddy.exe", "workbuddyai.exe", "workbuddy ai.exe", "codebuddy.exe", "codebuddy cn.exe"];
-        let cases = [
-            ("C:\\Programs\\WorkBuddy\\WorkBuddy.exe,0", true),
-            ("C:\\Programs\\WorkBuddy\\WorkBuddyAI.exe", true),
-            ("C:\\Programs\\WorkBuddy\\RepairApp.exe,0", false),
-            ("C:\\Programs\\CodeBuddy CN\\unins000.exe", false),
+        // 审查修复：直接调用实现 registry_value_to_exe_paths（不再内联复刻，
+        // 实现改动时本测试同步失效）。临时目录造真实 exe 文件走通 is_file 链。
+        let dir = std::env::temp_dir().join(format!("wb-reg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let touch = |name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"").unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let wb = touch("WorkBuddy.exe");
+        let _wbai = touch("WorkBuddyAI.exe");
+        let _unins = touch("unins000.exe");
+        // ",0" 图标索引剥后缀后命中白名单 → 收；卸载器/未知名 → 过滤
+        let cases: &[(&str, bool)] = &[
+            (&format!("{wb},0"), true),
+            (&format!("{}\\WorkBuddyAI.exe", dir.to_string_lossy()), true),
+            (&format!("{}\\RepairApp.exe,0", dir.to_string_lossy()), false),
+            (&format!("{}\\unins000.exe", dir.to_string_lossy()), false),
         ];
         for (icon, expect) in cases {
-            let clean = icon.split(',').next().unwrap_or("").trim().to_string();
-            let hit = std::path::Path::new(&clean)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("exe"))
-                .unwrap_or(false)
-                && std::path::Path::new(&clean)
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .map(|f| family.contains(&f.to_lowercase().as_str()))
-                    .unwrap_or(false);
-            assert_eq!(hit, expect, "{icon}");
+            let mut dedup = Vec::new();
+            let found = registry_value_to_exe_paths(Some(icon), None, &mut dedup);
+            assert_eq!(found.is_empty(), !*expect, "{icon}");
+            assert!(dedup.is_empty(), "DisplayIcon 分支不写 dedup: {icon}");
         }
+        // InstallLocation 分支：拼白名单名，已存在文件全部收录
+        let mut dedup = Vec::new();
+        let found =
+            registry_value_to_exe_paths(None, Some(&dir.to_string_lossy()), &mut dedup);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_lowercase())
+            .collect();
+        assert!(names.contains(&"workbuddy.exe".into()), "{names:?}");
+        assert!(names.contains(&"workbuddyai.exe".into()), "{names:?}");
+        assert!(!names.contains(&"unins000.exe".into()), "非白名单名不收: {names:?}");
+        // dedup 兜底：模拟上层 registry_family_exes 累积已返回项后，重复调用不再收录
+        dedup.extend(found.iter().cloned());
+        let found2 =
+            registry_value_to_exe_paths(None, Some(&dir.to_string_lossy()), &mut dedup);
+        assert!(found2.is_empty(), "dedup 已含全部命中，二次调用应为空: {found2:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 分块扫描_跨块命中不漏检() {
+        // needle 恰好骑在块边界：前半在本块尾、后半在下块首——carry 重叠区
+        // 必须能拼出完整调用（临时文件真实走分块路径）
+        let dir = std::env::temp_dir().join(format!("wb-scan-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 构造 >SCAN_CHUNK 的文件：块 1 尾放 needle 前半，块 2 首放后半
+        let head = vec![0x61u8; SCAN_CHUNK - 10]; // 'a' 填充
+        let mut body = head.clone();
+        body.extend_from_slice(b"process._linkedBinding('electron_browser_workbuddy_storage');");
+        let path = dir.join("cross_chunk.mjs");
+        std::fs::write(&path, &body).unwrap();
+        let mut names = vec![DEFAULT_BINDING_NAME.to_string()];
+        scan_file_for_bindings_chunked(&path, &mut names);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+        assert!(
+            names.iter().any(|n| n == "electron_browser_workbuddy_storage"),
+            "跨块调用点不应漏检: {names:?}"
+        );
+        assert_eq!(names.len(), 1, "默认名 + 扫描发现去重后应恰 1 项: {names:?}");
     }
 
     /// 真机端到端（#[ignore]，手工运行）：读取本机真实 auth 文件走完整解密链
