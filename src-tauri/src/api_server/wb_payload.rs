@@ -1450,32 +1450,55 @@ pub fn residual_fingerprint_note_with_rules(
 /// 残留命中上下文提取（issue #195 二期诊断增强）：指纹样本 system 仅取前
 /// 2000 字符（fingerprint_sample），残留词出现在深部时（如 2026-11-10 v3.9.2
 /// 样本：dsh-code-review 预设描述中段的品牌词）样本不可见、用户无法据此
-/// 生成热更新清洗规则。本函数对首条 system 文本中每个命中特征词提取首次
-/// 出现处 ±80 字符的上下文片段（换行折叠空格、中点省略标界），供 11128
-/// Fatal 日志定位残留原文。无命中返回空串。
+/// 生成热更新清洗规则。本函数对命中特征词提取首次出现处 ±80 字符的上下文
+/// 片段（换行折叠空格、中点省略标界），供 11128 Fatal 日志定位残留原文。
+/// 扫描面对齐 [residual_fingerprint_note_with_rules] 的 ①③ 两通道：
+/// ① 首条 system 文本；③ 工具描述通道（三期 B4b 实证 harness 独家文本可注入
+/// 于此前不可观测的描述通道——自检报出「描述命中」但旧版上下文只扫 system，
+/// Fatal 日志只剩词无上下文，热修规则仍无从生成）。note 的 ② 工具名通道
+/// 不在扫描面：工具名为短字符串（无 ±80 上下文可提取），其命中已由 note
+/// 报词覆盖，此处不再重复展开。无命中返回空串。
 pub fn residual_fingerprint_context(v: &Value) -> String {
     const CTX_CHARS: usize = 80;
+    // (通道标签, 小写文本)；小写比对口径与 note_with_rules 一致
+    let mut channels: Vec<(&str, String)> = Vec::new();
     let system = first_system_text(v).to_lowercase();
-    if system.is_empty() {
-        return String::new();
+    if !system.is_empty() {
+        channels.push(("system", system));
     }
-    let chars: Vec<char> = system.chars().collect();
+    if let Some(arr) = v.get("tools").and_then(Value::as_array) {
+        for t in arr {
+            let desc = t
+                .pointer("/function/description")
+                .and_then(Value::as_str)
+                .or_else(|| t.get("description").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_lowercase();
+            if !desc.is_empty() {
+                channels.push(("tool desc", desc));
+            }
+        }
+    }
     let mut parts: Vec<String> = Vec::new();
     for m in RESIDUAL_MARKERS {
-        // find 给出字节下标 → 换算字符下标（marker 均为 ASCII，字节长=字符长）
-        let byte_pos = match system.find(m) {
-            Some(p) => p,
-            None => continue,
-        };
-        let char_pos = system[..byte_pos].chars().count();
-        let m_len = m.chars().count();
-        let start = char_pos.saturating_sub(CTX_CHARS);
-        let end = (char_pos + m_len + CTX_CHARS).min(chars.len());
-        let snippet: String = chars[start..end].iter().collect();
-        parts.push(format!(
-            "{m} @ …{}…",
-            snippet.replace(['\n', '\r'], " ")
-        ));
+        for (label, text) in &channels {
+            // find 给出字节下标 → 换算字符下标（marker 均为 ASCII，字节长=字符长）
+            let byte_pos = match text.find(m) {
+                Some(p) => p,
+                None => continue,
+            };
+            let char_pos = text[..byte_pos].chars().count();
+            let m_len = m.chars().count();
+            let start = char_pos.saturating_sub(CTX_CHARS);
+            let end = (char_pos + m_len + CTX_CHARS).min(text.chars().count());
+            let chars: Vec<char> = text.chars().collect();
+            let snippet: String = chars[start..end].iter().collect();
+            parts.push(format!(
+                "{m} @ {label} …{}…",
+                snippet.replace(['\n', '\r'], " ")
+            ));
+            break; // 同 marker 首个命中通道即报，不重复展开
+        }
     }
     parts.join(" | ")
 }
@@ -2549,11 +2572,25 @@ mod tests {
         // 仍可定位残留原文
         let washed = json!({"messages":[{"role":"system","content":out}]});
         assert_eq!(residual_fingerprint_note(&serde_json::to_vec(&washed).unwrap()), None);
-        let deep = json!({"messages":[{"role":"system","content":"该预设基于 DeepSeek Harness 的只读工具集构建，默认只读。"}]});
+        let deep = json!({"messages":[{"role":"system","content":"该预设基于 DeepSeek Harness 的只读工具集构建，本机已安装 code-review 插件（只读审查模式），默认只读。"}]});
         assert_eq!(residual_fingerprint_context(&washed), String::new());
         let ctx = residual_fingerprint_context(&deep);
         assert!(ctx.contains("deepseek harness"), "{ctx}");
         assert!(ctx.contains("dsh-code-review") || ctx.contains("预设"), "{ctx}");
+        // 三期扩展（B4b 对齐）：工具描述通道命中时上下文可提取——旧版只扫
+        // system，描述命中只剩词无上下文，热修规则无从生成
+        let desc_hit = json!({"messages":[{"role":"user","content":"hi"}],"tools":[
+            {"type":"function","function":{"name":"read_file","description":"Reads files using the deepseek harness runtime. 本机已安装 dsh-code-review 插件。"}},
+            {"description":"顶层 description 回退通道: agent preset 文本"}
+        ]});
+        assert_eq!(
+            residual_fingerprint_note_with_rules(&desc_hit, &[]).unwrap(),
+            "deepseek harness,dsh-code-review,agent preset"
+        );
+        let ctx2 = residual_fingerprint_context(&desc_hit);
+        assert!(ctx2.contains("deepseek harness @ tool desc"), "{ctx2}");
+        assert!(ctx2.contains("dsh-code-review @ tool desc"), "{ctx2}");
+        assert!(ctx2.contains("agent preset @ tool desc"), "{ctx2}");
     }
 
     /// DSH 0.2.1-rc.2 模型句整句同义改写（2026-10-29 headless 抓包实证：模型

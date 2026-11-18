@@ -118,6 +118,18 @@ impl WbView {
         }
     }
 
+    /// 家族账号×模型冷却表视图（issue #206：429/SoftRate 记 (uid, model) 对，
+    /// 不钉账号级 until；CN/Intl 独立实例同 §4.2）
+    pub fn route_account_model_cooldowns(
+        &self,
+    ) -> &Mutex<std::collections::HashMap<(String, String), i64>> {
+        if self.buddy_ai {
+            &self.state.buddy_ai_account_model_cooldowns
+        } else {
+            &self.state.wb_account_model_cooldowns
+        }
+    }
+
     /// 池标签（请求日志 pool 列 + Key 白名单约束作用域）
     pub fn pool_label(&self) -> &'static str {
         if self.buddy_ai { "buddy-ai" } else { "buddy" }
@@ -257,6 +269,59 @@ pub fn note_model_failure_ex(state: &WbView, model: &str, msg: Option<&str>) {
         }
     };
     map.insert(model.to_string(), (until, fails));
+}
+
+// ==================== 账号×模型维度冷却（issue #206） ====================
+
+/// 账号×模型冷却钳制下限（60s）与上限（7 天，防异常远期值钉死配对）
+const AM_COOLDOWN_MIN_SECS: i64 = 60;
+const AM_COOLDOWN_MAX_SECS: i64 = 7 * 24 * 3600;
+
+/// 记录一次账号×模型维度冷却（issue #206）：429（SoftRate）上游实为模型维度
+/// 限流——只记 (uid, model) 对的冷却截止，不写账号级 until（否则一个模型被限
+/// → 全池进冷却 → 其他模型 503 no healthy account）。
+/// 值钳制 [now+60s, now+7d]，且取与既有值的较大者防缩短。
+pub(crate) fn note_account_model_cooldown(state: &WbView, uid: &str, model: &str, until: i64) {
+    let now = now_ts();
+    let until = until.clamp(now + AM_COOLDOWN_MIN_SECS, now + AM_COOLDOWN_MAX_SECS);
+    let mut map = safe_lock(&state.route_account_model_cooldowns());
+    let entry = map
+        .entry((uid.to_string(), model.to_string()))
+        .or_insert(until);
+    if until > *entry {
+        *entry = until;
+    }
+}
+
+/// 指定账号×模型的冷却剩余秒数（None = 未冷却/已过期）
+pub(crate) fn account_model_cooling_remaining(
+    state: &WbView,
+    uid: &str,
+    model: &str,
+) -> Option<i64> {
+    let map = safe_lock(&state.route_account_model_cooldowns());
+    let until = *map.get(&(uid.to_string(), model.to_string()))?;
+    let now = now_ts();
+    if until > now {
+        Some(until - now)
+    } else {
+        None
+    }
+}
+
+/// 成功请求后清除账号×模型冷却对（与 clear_model_failure 同触发点）
+pub(crate) fn clear_account_model_cooldown(state: &WbView, uid: &str, model: &str) {
+    safe_lock(&state.route_account_model_cooldowns())
+        .remove(&(uid.to_string(), model.to_string()));
+}
+
+/// 清空指定账号的全部账号×模型冷却（账号级禁用/凭证失效等场景调用）
+pub(crate) fn clear_account_model_cooldowns_for(
+    state: &WbView,
+    uid: &str,
+) {
+    let mut map = safe_lock(&state.route_account_model_cooldowns());
+    map.retain(|k, _| k.0 != uid);
 }
 
 /// 从限额文案解析精确恢复时刻（agent2api parse_quota_reset_at 同源语义）：
@@ -460,6 +525,68 @@ fn parse_relative_unfreeze_secs(msg: &str) -> Option<i64> {
 /// 请求成功后清除该模型的冷却与失败计数
 pub fn clear_model_failure(state: &WbView, model: &str) {
     safe_lock(&state.route_model_cooldowns()).remove(model);
+}
+
+// ==================== 统一错误记账入口（issue #206） ====================
+
+/// wb 族上游错误统一记账（6 处站点共用，issue #206）：
+/// - SoftRate（429 模型维度限流）→ 只记账号×模型冷却对 `(uid, model)`，
+///   **不再写账号级 until**（改前钉全账号 4~7h → 一个模型被限 → 全池瘫痪，
+///   其他模型 503 no healthy account）；也不写整池模型冷却表（防回归 issue #159）。
+///   解冻优先级：上游文案解析 > Retry-After 秒 > SoftRate 固定时长兜底。
+/// - Server/NotFound/Client（网关/模型级故障）→ 维持整池模型级冷却
+///   （note_model_failure_ex）+ 账号级 note_error_until（既有行为）。
+/// - SessionDead/Forbidden/HardCredit/PlanLimit/None → 维持账号级
+///   note_error_until 现状（PlanLimit 是账号订阅档位问题，与模型维度限流不同源）。
+/// - kind.unbinds_sticky() 硬冷却/禁用类解绑粘性（既有行为）。
+///
+/// `retry_after_secs`：HTTP 429 响应头 Retry-After（秒），仅流式 HTTP 路径有值。
+pub(crate) fn note_wb_error(
+    state: &WbView,
+    uid: &str,
+    model: &str,
+    kind: ErrKind,
+    upstream_msg: Option<&str>,
+    retry_after_secs: Option<u64>,
+) {
+    if kind == ErrKind::None {
+        return;
+    }
+    if kind == ErrKind::SoftRate {
+        // issue #206：解冻时刻解析（复用账号级解析逻辑）→ Retry-After → 固定时长
+        let unfreeze = parse_account_unfreeze_at(upstream_msg.unwrap_or(""))
+            .or_else(|| retry_after_secs.map(|s| now_ts() + s.max(1) as i64))
+            .unwrap_or_else(|| {
+                now_ts() + kind.cooldown_duration().as_secs() as i64
+            });
+        note_account_model_cooldown(state, uid, model, unfreeze);
+        // 有意不进 note_error_until → 不计 e.failures（审查确认的取舍）：429 是
+        // 模型维度限流而非账号质量问题，成功率因子（weighted_score）不应惩罚账号；
+        // 补 F-80 风格观测行（审查问题 3）：账号级冷却不再落 account cooldown 日志，
+        // 429 限流事件须可从 app.log 回答「该账号对该模型为何不可用/何时解冻」
+        state.logger.log_sched_event(&format!(
+            "account cooldown: pool={} acct-model uid={} model={} kind=soft_rate \
+             action=am_cooldown secs={} until={}",
+            state.pool_label(),
+            uid,
+            model,
+            unfreeze - now_ts(),
+            unfreeze,
+        ));
+        return;
+    }
+    // 其余类别维持既有账本：账号级 note_error_until（含熔断/禁用/硬冷却）
+    let unfreeze = parse_account_unfreeze_at(upstream_msg.unwrap_or(""));
+    state.route_pool().note_error_until(uid, kind, unfreeze);
+    // 模型级冷却仅对网关/模型级故障生效（issue #159 解耦）
+    if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
+        note_model_failure_ex(state, model, upstream_msg);
+    }
+    if kind.unbinds_sticky() {
+        state.route_sticky().unbind_uid(uid);
+        // 硬冷却/禁用类：账号整体不可用，连带清其全部账号×模型冷却对
+        clear_account_model_cooldowns_for(state, uid);
+    }
 }
 
 // ==================== 审核模板映射热更新（T2.1） ====================
@@ -793,6 +920,7 @@ fn race_first_byte(
     state: &WbView,
     primary_uid: &str,
     conv_id: &str,
+    model: &str,
     converted: &[u8],
     reader: Box<dyn Read + Send>,
     tried: &HashSet<String>,
@@ -821,6 +949,9 @@ fn race_first_byte(
     let allowed2 = allowed.cloned();
     let dedicated2 = dedicated.map(str::to_string);
     let body = converted.to_vec();
+    // issue #206：对冲取号同样按账号×模型冷却过滤（模型名随闭包捕获）
+    let model2 = model.to_string();
+    let view2 = state.clone();
     // 对冲闭包 move 捕获（同 body 取快照）：conv_id 随闭包存续
     let conv_id2 = conv_id.to_string();
     // 审查修复（L2）：捕获对冲账号 uid（仅建连成功 = 对冲实际发起时记录）——
@@ -828,9 +959,13 @@ fn race_first_byte(
     let hedge_uid_cell = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
     let hedge_uid_slot = hedge_uid_cell.clone();
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
-        let (picked2, ev) = state2
-            .route_pool()
-            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref(), false)?;
+        let (picked2, ev) = state2.route_pool().pick_excluding_constrained_ev_matching(
+            &tried2,
+            allowed2.as_ref(),
+            dedicated2.as_deref(),
+            false,
+            &|uid| account_model_cooling_remaining(&view2, uid, &model2).is_none(),
+        )?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -1081,6 +1216,11 @@ pub(crate) fn run_wb_stream(
             if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
                 return None;
             }
+            // issue #206：绑定账号对该模型冷却中（429 模型维度限流）→ 忽略粘性，
+            // 走正常调度换可用账号
+            if account_model_cooling_remaining(state, &b.uid, model).is_some() {
+                return None;
+            }
             state
                 .route_pool()
                 .pick_by_uid(&b.uid, false)
@@ -1105,8 +1245,22 @@ pub(crate) fn run_wb_stream(
                     p
                 })
         })
-        .or_else(|| dedicated.as_deref().and_then(|uid| state.route_pool().pick_by_uid(uid, false)));
-
+        // issue #206：专一绑定账号对该模型冷却中 → 让位走正常调度（不直调
+        // pick_by_uid 绕过模型谓词；空 tried + 恒 allowed/dedicated 与直调等价）
+        .or_else(|| {
+            dedicated.as_deref().and_then(|uid| {
+                state
+                    .route_pool()
+                    .pick_excluding_constrained_ev_matching(
+                        &HashSet::new(),
+                        allowed_set.as_ref(),
+                        Some(uid),
+                        false,
+                        &|u| account_model_cooling_remaining(state, u, model).is_none(),
+                    )
+                    .map(|(p, _)| p)
+            })
+        });
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
@@ -1136,7 +1290,13 @@ pub(crate) fn run_wb_stream(
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
         let picked = match first_pick.take() {
             Some(p) => p,
-            None => match state.route_pool().pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
+            None => match state.route_pool().pick_excluding_constrained_ev_matching(
+                &tried,
+                allowed_set.as_ref(),
+                dedicated.as_deref(),
+                false,
+                &|uid| account_model_cooling_remaining(&state, uid, &model).is_none(),
+            ) {
                 Some((p, ev)) => {
                     // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
                     if let Some(ev) = ev {
@@ -1339,6 +1499,7 @@ pub(crate) fn run_wb_stream(
                         state,
                         &picked.uid,
                         &conv_id,
+                        model,
                         &converted,
                         reader,
                         &tried,
@@ -1510,21 +1671,11 @@ pub(crate) fn run_wb_stream(
                             }
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
-                                // issue #159：账号级/模型级冷却解耦——账号级错误带解冻
-                                // 时刻精确冷却该账号；模型级冷却仅对网关/模型级故障
-                                // （Server/NotFound/Client）生效，防单账号限额把整池
-                                // 同名模型钉死 → pool_health 跳过 buddy 池 → 503
-                                let unfreeze = parse_account_unfreeze_at(&msg);
-                                state.route_pool().note_error_until(win_uid, kind, unfreeze);
-                                if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
-                                    note_model_failure_ex(state, model, Some(&msg));
-                                }
+                                // issue #206：SoftRate 记账号×模型冷却对（不钉账号级
+                                // until）；其余类别维持既有账号级/模型级分账（issue #159）
+                                note_wb_error(state, win_uid, model, kind, Some(&msg), None);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
-                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                if kind.unbinds_sticky() {
-                                    state.route_sticky().unbind_uid(&win_uid);
-                                }
                             }
                             if !sent_any {
                                 // 流未开始：错误不下发，允许换号重试
@@ -1552,6 +1703,8 @@ pub(crate) fn run_wb_stream(
                             }
                             state.route_pool().note_success(win_uid);
                             clear_model_failure(state, model);
+                            // issue #206：成功同时清该账号×模型冷却对
+                            clear_account_model_cooldown(state, win_uid, model);
                             // 绑定粘性会话（Mutex 内 re-check 防 TOCTOU）
                             state.sticky_bind(&sticky_key, win_uid, &conv_id, now_ts());
                             state.route_sticky().save(&state.data_dir);
@@ -1650,25 +1803,11 @@ pub(crate) fn run_wb_stream(
                             let kind = classify_error(status, &resp_body);
                             if kind != ErrKind::None {
                                 // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
-                                // 账号级/模型级冷却解耦——模型级冷却仅对网关/模型级故障生效，
-                                // 防单账号限额文案把整池同名模型钉死 → 503
+                                // issue #206：SoftRate 记账号×模型冷却对（不钉账号级 until）；
+                                // 其余类别维持既有账号级/模型级分账
                                 let upstream = upstream_msg(&resp_body);
-                                // issue #178：账号级解冻时刻——上游文案解析优先；
-                                // 429/SoftRate 未解析出时以 Retry-After（秒）为解冻基准
-                                let mut unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
-                                if unfreeze.is_none() && kind == ErrKind::SoftRate {
-                                    if let Some(secs) = retry_after {
-                                        unfreeze = Some(now_ts() + secs.max(1) as i64);
-                                    }
-                                }
-                                state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
-                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                if kind.unbinds_sticky() {
-                                    state.route_sticky().unbind_uid(&picked.uid);
-                                }
-                                if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
-                                    note_model_failure_ex(state, model, upstream.as_deref());
-                                }
+                                note_wb_error(state, &picked.uid, model, kind,
+                                    upstream.as_deref(), retry_after);
                             }
                             *safe_lock(&state.last_error) = Some(format!(
                                 "wb uid={} status={} body={}",
@@ -1763,6 +1902,11 @@ pub async fn wb_aggregate_chat(
                 if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
                     return None;
                 }
+                // issue #206：绑定账号对该模型冷却中（429 模型维度限流）→ 忽略粘性，
+                // 走正常调度换可用账号（口径同流式路径 sticky0）
+                if account_model_cooling_remaining(&state, &b.uid, &model).is_some() {
+                    return None;
+                }
                 state
                     .route_pool()
                     .pick_by_uid(&b.uid, false)
@@ -1786,7 +1930,21 @@ pub async fn wb_aggregate_chat(
                         p
                     })
             })
-            .or_else(|| dedicated.as_deref().and_then(|uid| state.route_pool().pick_by_uid(uid, false)));
+            // issue #206：专一绑定账号对该模型冷却中 → 让位走正常调度（口径同流式路径）
+            .or_else(|| {
+                dedicated.as_deref().and_then(|uid| {
+                    state
+                        .route_pool()
+                        .pick_excluding_constrained_ev_matching(
+                            &HashSet::new(),
+                            allowed_set.as_ref(),
+                            Some(uid),
+                            false,
+                            &|u| account_model_cooling_remaining(&state, u, &model).is_none(),
+                        )
+                        .map(|(p, _)| p)
+                })
+            });
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
@@ -1802,7 +1960,13 @@ pub async fn wb_aggregate_chat(
         loop {
             let picked = match first_pick.take() {
                 Some(p) => p,
-                None => match state.route_pool().pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
+                None => match state.route_pool().pick_excluding_constrained_ev_matching(
+                &tried,
+                allowed_set.as_ref(),
+                dedicated.as_deref(),
+                false,
+                &|uid| account_model_cooling_remaining(&state, uid, &model).is_none(),
+            ) {
                     Some((p, ev)) => {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -1922,6 +2086,7 @@ pub async fn wb_aggregate_chat(
                             &state,
                             &picked.uid,
                             &conv_id,
+                            &model,
                             &converted,
                             reader,
                             &tried,
@@ -1975,6 +2140,8 @@ pub async fn wb_aggregate_chat(
                                 state.record_usage_bucket_ttfb(state.usage_bucket(), &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
                                 state.route_pool().note_success(win_uid);
                                 clear_model_failure(&state, &model);
+                                // issue #206：成功同时清该账号×模型冷却对
+                                clear_account_model_cooldown(&state, win_uid, &model);
                                 state.sticky_bind(&sticky_key, win_uid, &conv_id, now_ts());
                                 state.route_sticky().save(&state.data_dir);
                                 state.logger.log_request_ttfb(
@@ -2042,16 +2209,8 @@ pub async fn wb_aggregate_chat(
                                 }
                                 let kind = classify_wb_error(code, &msg);
                                 if kind != ErrKind::None {
-                                    // issue #159：账号级/模型级冷却解耦（口径同流式路径）
-                                    let unfreeze = parse_account_unfreeze_at(&msg);
-                                    state.route_pool().note_error_until(win_uid, kind, unfreeze);
-                                    if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
-                                        note_model_failure_ex(&state, &model, Some(&msg));
-                                    }
-                                    // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                    if kind.unbinds_sticky() {
-                                        state.route_sticky().unbind_uid(&win_uid);
-                                    }
+                                    // issue #206：SoftRate 记账号×模型冷却对（口径同流式路径）
+                                    note_wb_error(&state, win_uid, &model, kind, Some(&msg), None);
                                 }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
@@ -2145,25 +2304,10 @@ pub async fn wb_aggregate_chat(
                                 }
                                 let kind = classify_error(status, &resp_body);
                                 if kind != ErrKind::None {
-                                    // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
-                                    // 账号级/模型级冷却解耦（口径同流式路径）
+                                    // issue #206：SoftRate 记账号×模型冷却对（口径同流式路径）
                                     let upstream = upstream_msg(&resp_body);
-                                    // issue #178：账号级解冻时刻——上游文案解析优先；
-                                    // 429/SoftRate 未解析出时以 Retry-After（秒）为解冻基准
-                                    let mut unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
-                                    if unfreeze.is_none() && kind == ErrKind::SoftRate {
-                                        if let Some(secs) = retry_after {
-                                            unfreeze = Some(now_ts() + secs.max(1) as i64);
-                                        }
-                                    }
-                                    state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
-                                    // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                    if kind.unbinds_sticky() {
-                                        state.route_sticky().unbind_uid(&picked.uid);
-                                    }
-                                    if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
-                                        note_model_failure_ex(&state, &model, upstream.as_deref());
-                                    }
+                                    note_wb_error(&state, &picked.uid, &model, kind,
+                                        upstream.as_deref(), retry_after);
                                 }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
@@ -2338,7 +2482,13 @@ pub async fn wb_tool_exec_chat(
         'accounts: loop {
             let picked = match state
                 .route_pool()
-                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false)
+                .pick_excluding_constrained_ev_matching(
+                    &tried,
+                    allowed_set.as_ref(),
+                    dedicated.as_deref(),
+                    false,
+                    &|uid| account_model_cooling_remaining(&state, uid, &model).is_none(),
+                )
             {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {
@@ -2500,16 +2650,8 @@ pub async fn wb_tool_exec_chat(
                             }
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
-                                // issue #159：账号级/模型级冷却解耦（口径同流式路径）
-                                let unfreeze = parse_account_unfreeze_at(&msg);
-                                state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
-                                if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
-                                    note_model_failure_ex(&state, &model, Some(&msg));
-                                }
-                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                if kind.unbinds_sticky() {
-                                    state.route_sticky().unbind_uid(&picked.uid);
-                                }
+                                // issue #206：SoftRate 记账号×模型冷却对（口径同流式路径）
+                                note_wb_error(&state, &picked.uid, &model, kind, Some(&msg), None);
                             }
                             *safe_lock(&state.last_error) =
                                 Some(format!("wb-toolexec uid={} code={} msg={}", picked.uid, code, msg));
@@ -2672,25 +2814,10 @@ pub async fn wb_tool_exec_chat(
                                 }
                                 let kind = classify_error(status, &resp_body);
                                 if kind != ErrKind::None {
-                                    // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
-                                    // 账号级/模型级冷却解耦（口径同流式路径）
+                                    // issue #206：SoftRate 记账号×模型冷却对（口径同流式路径）
                                     let upstream = upstream_msg(&resp_body);
-                                    // issue #178：账号级解冻时刻——上游文案解析优先；
-                                    // 429/SoftRate 未解析出时以 Retry-After（秒）为解冻基准
-                                    let mut unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
-                                    if unfreeze.is_none() && kind == ErrKind::SoftRate {
-                                        if let Some(secs) = retry_after {
-                                            unfreeze = Some(now_ts() + secs.max(1) as i64);
-                                        }
-                                    }
-                                    state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
-                                    // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                    if kind.unbinds_sticky() {
-                                        state.route_sticky().unbind_uid(&picked.uid);
-                                    }
-                                    if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
-                                        note_model_failure_ex(&state, &model, upstream.as_deref());
-                                    }
+                                    note_wb_error(&state, &picked.uid, &model, kind,
+                                        upstream.as_deref(), retry_after);
                                 }
                                 break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 200)));
                             }
@@ -2706,6 +2833,8 @@ pub async fn wb_tool_exec_chat(
                 Ok(c) => {
                     state.route_pool().note_success(&picked.uid);
                     clear_model_failure(&state, &model);
+                    // issue #206：成功同时清该账号×模型冷却对
+                    clear_account_model_cooldown(&state, &picked.uid, &model);
                     success_uid = Some(picked.uid.clone());
                     final_completion = Some(c);
                     break 'accounts;
