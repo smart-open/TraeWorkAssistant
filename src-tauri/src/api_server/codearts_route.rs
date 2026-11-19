@@ -380,15 +380,51 @@ fn retry_decision(status: u16, body: &str, attempt: u32) -> RetryAction {
 
 // ==================== CodeArts 错误归因（状态码 + 账号处置）====================
 
-/// 并发会话上限（码道单账号只给 3 个会话）：瞬时限流，短退避后重试即可，
+/// 并发会话数超限（码道单账号只给 3 个会话）：瞬时限流，短退避后重试即可，
 /// **与账号健康无关**——按 Server 熔断 30 分钟会把整池打进
 /// `no_healthy_account`，用户侧表现为「反代一直失败」。
 fn is_concurrency_full(text: &str) -> bool {
     text.contains("TM.00001041")
         || text.contains("并发会话数已达上限")
-        || text.contains("ModelArts.811")
-        || text.to_ascii_lowercase().contains("rate limit")
-        || text.to_ascii_lowercase().contains("too many requests")
+}
+
+/// 上游令牌桶限流（账号级速率上限，如 `InferHub.ModelArts.81114.429`）：
+/// 与「并发会话数超限」是两回事——前者是**令牌/分钟速率**被打满，后者是
+/// **在途会话条数**超限。两者都是短退避即可的瞬时限流，但归因文案不同，
+/// 且限流窗口按分钟重置、会话数上限按会话释放。
+///
+/// 此前把 `ModelArts.811` / `rate limit` / `too many requests` 一并塞进
+/// `is_concurrency_full`，导致上游令牌桶 429 被误报成「并发会话数已达上限」。
+fn is_rate_limited(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains("ModelArts.811")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("429")
+}
+
+/// 令牌桶限流的冷却时长（秒）。
+///
+/// 码道的限流口径是「每分钟令牌上限」（如 `the rate limit is 300000000
+/// tokens per minute`）——窗口按**自然分钟**重置，不是固定 60s。固定 60s
+/// 有两个问题：
+/// ① 冷却可能跨过下一个分钟窗口仍不放行（白等）；
+/// ② 也可能刚过窗口就放行，随即再次 429（反复撞）。
+///
+/// 取「到下一个分钟边界 + 3s 余量」，既不早放行（避免立刻再 429）也不
+/// 白等太久（最多多等 63s）。文案未明确分钟粒度时退回固定 60s。
+fn rate_limit_cooldown_secs(text: &str) -> i64 {
+    let lower = text.to_ascii_lowercase();
+    let per_minute = lower.contains("per minute")
+        || lower.contains("/min")
+        || lower.contains("tokens per minute");
+    if !per_minute {
+        return 60;
+    }
+    let now = now_ts();
+    // 到下一个自然分钟边界的秒数 + 3s 余量
+    let secs_into_minute = now % 60;
+    (60 - secs_into_minute) + 3
 }
 
 /// 请求级错误：请求本身不合法，换号重试不会变，冷却账号只会缩小可用池 →
@@ -430,6 +466,11 @@ pub(crate) fn codearts_failure(status: u16, text: &str) -> (u16, ErrKind) {
     if is_concurrency_full(text) {
         return (429, ErrKind::SoftRate);
     }
+    if is_rate_limited(text) {
+        // 上游令牌桶限流：账号级短冷却（SoftRate）+ 429 回客户端。
+        // 不按 Server 熔断——限流窗口过后账号即可用，熔断 30 分钟会把整池打死。
+        return (429, ErrKind::SoftRate);
+    }
     if let Some(s) = request_level_status(text) {
         // 模型/参数侧问题而非账号问题，不冷却
         return (s, ErrKind::None);
@@ -437,6 +478,10 @@ pub(crate) fn codearts_failure(status: u16, text: &str) -> (u16, ErrKind) {
     match status {
         // 凭据失效：APIG 签名/STS 令牌问题，换号（由 note_error 记 SessionDead）
         401 | 403 => (status, ErrKind::SessionDead),
+        // 429 未带可识别文案：仍按短冷却限流处理（账号级速率上限），
+        // 不能落到 4xx 兜底（ErrKind::None = 不冷却）——不冷却会让限流账号
+        // 持续被选中并反复 429。
+        429 => (429, ErrKind::SoftRate),
         s if s >= 500 => (s, ErrKind::Server),
         // 其余 4xx 属于客户端请求，账号不动
         s if s >= 400 => (s, ErrKind::None),
@@ -497,11 +542,30 @@ fn clear_model_failure(model: &str) {
 
 /// 按归因结果记账：账号级冷却 + 模型级冷却（仅 Server 类）。
 /// 集中一处，避免流内错误/HTTP 错误/聚合三条路径口径漂移。
-fn note_failure(state: &ApiSharedState, model: &str, uid: &str, kind: ErrKind) {
+///
+/// `upstream_text`：上游错误原文，用于按限流粒度算冷却时长（令牌桶按分钟
+/// 窗口重置，固定 60s 会白等或早放行）。None = 走该错误类的默认时长。
+fn note_failure(
+    state: &ApiSharedState,
+    model: &str,
+    uid: &str,
+    kind: ErrKind,
+    upstream_text: Option<&str>,
+) {
     if kind == ErrKind::None {
         return;
     }
-    state.codearts_pool.note_error(uid, kind);
+    if kind == ErrKind::SoftRate {
+        // 限流冷却时长按上游文案粒度算（令牌桶按分钟窗口）；无文案则用默认 60s
+        let secs = upstream_text.map(rate_limit_cooldown_secs).unwrap_or(60);
+        state.codearts_pool.note_error_until(
+            uid,
+            kind,
+            Some(now_ts() + secs.max(1)),
+        );
+    } else {
+        state.codearts_pool.note_error(uid, kind);
+    }
     // 只有 Server（上游 5xx / 未知流内帧）是模型/上游故障：账号级
     // （401/429/并发名额）与请求级（400 参数/role）都不该冷却模型
     if kind == ErrKind::Server {
@@ -844,7 +908,7 @@ pub(crate) fn run_codearts_stream(
                     }
                     RetryAction::SwitchKey => {
                         let (client_status, kind) = codearts_failure(status, &resp_body);
-                        note_failure(state, model, &picked.uid, kind);
+                        note_failure(state, model, &picked.uid, kind, Some(&resp_body));
                         let msg = format!("upstream status={status}");
                         set_last_error(state, format!("codearts uid={} model={} status={} body={}",
                             picked.uid, model, status, resp_body.chars().take(200).collect::<String>()));
@@ -858,7 +922,7 @@ pub(crate) fn run_codearts_stream(
                     RetryAction::Fatal => {
                         // 终态：请求级错误（参数/模型/审核）换号无意义，也不冷却账号
                         let (client_status, kind) = codearts_failure(status, &resp_body);
-                        note_failure(state, model, &picked.uid, kind);
+                        note_failure(state, model, &picked.uid, kind, Some(&resp_body));
                         let msg = format!("upstream {status} error: {}",
                             resp_body.chars().take(300).collect::<String>());
                         state.record_usage_codearts(model, &picked.uid, key_id, false, true,
@@ -880,7 +944,7 @@ pub(crate) fn run_codearts_stream(
                 ) {
                     Ok(w) => w,
                     Err(()) => {
-                        note_failure(state, model, &picked.uid, ErrKind::Server);
+                        note_failure(state, model, &picked.uid, ErrKind::Server, None);
                         last_err = "CodeArts 上游 10 秒内未响应（首字超时）".into();
                         state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
                             504, &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
@@ -933,9 +997,9 @@ pub(crate) fn run_codearts_stream(
                 if let Some((code, msg)) = error_info {
                     // 归因按真实错误码分轨（并发上限 / 请求级错误不冷却账号）：
                     // 修复前一律 Server → 账号熔断 30 分钟 → 整池 no_healthy_account
-                    let (client_status, kind) =
-                        codearts_failure(0, &format!("{code} {msg}"));
-                    note_failure(state, model, &win_uid, kind);
+                    let detail = format!("{code} {msg}");
+                    let (client_status, kind) = codearts_failure(0, &detail);
+                    note_failure(state, model, &win_uid, kind, Some(&detail));
                     set_last_error(state, format!("codearts uid={} model={} code={} msg={}",
                         win_uid, model, code, msg));
                     // 保留真实状态码与原因，轮换耗尽时按此透传（不再一律 503）
@@ -1054,7 +1118,7 @@ pub async fn codearts_aggregate_chat(
                         }
                         RetryAction::SwitchKey => {
                             let (client_status, kind) = codearts_failure(status, &resp_body);
-                            note_failure(&state, &model, &picked.uid, kind);
+                            note_failure(&state, &model, &picked.uid, kind, Some(&resp_body));
                             set_last_error(&state, format!("codearts uid={} model={} status={} body={}",
                                 picked.uid, model, status,
                                 resp_body.chars().take(200).collect::<String>()));
@@ -1069,7 +1133,7 @@ pub async fn codearts_aggregate_chat(
                         RetryAction::Fatal => {
                             // 终态：请求级错误（参数/模型/审核）换号无意义，也不冷却账号
                             let (client_status, kind) = codearts_failure(status, &resp_body);
-                            note_failure(&state, &model, &picked.uid, kind);
+                            note_failure(&state, &model, &picked.uid, kind, Some(&resp_body));
                             let msg = format!("upstream {client_status} error: {}",
                                 resp_body.chars().take(300).collect::<String>());
                             state.record_usage_codearts(&model, &picked.uid, &key_id, false, stream,
@@ -1082,7 +1146,7 @@ pub async fn codearts_aggregate_chat(
                     let lines = match wb_upstream::lines_with_first_byte_timeout_interruptible(reader) {
                         Ok(l) => l,
                         Err(()) => {
-                            note_failure(&state, &model, &picked.uid, ErrKind::Server);
+                            note_failure(&state, &model, &picked.uid, ErrKind::Server, None);
                             last_err = "CodeArts 上游 10 秒内未响应（首字超时）".into();
                             continue;
                         }
@@ -1113,7 +1177,7 @@ pub async fn codearts_aggregate_chat(
                             // 请求级错误不得按 Server 熔断账号
                             let detail = format!("{code} {msg}");
                             let (client_status, kind) = codearts_failure(0, &detail);
-                            note_failure(&state, &model, &picked.uid, kind);
+                            note_failure(&state, &model, &picked.uid, kind, Some(&detail));
                             state.record_usage_codearts(&model, &picked.uid, &key_id, false, stream,
                                 duration_ms, 0, 0, None, &session_ctx);
                             set_last_error(&state, format!("codearts uid={} model={} code={} msg={}",
@@ -1122,7 +1186,7 @@ pub async fn codearts_aggregate_chat(
                             exhausted_status = client_status as i64;
                         }
                         (None, None) => {
-                            note_failure(&state, &model, &picked.uid, ErrKind::Server);
+                            note_failure(&state, &model, &picked.uid, ErrKind::Server, None);
                             last_err = "CodeArts 上游返回空响应".into();
                         }
                     }
@@ -1248,8 +1312,7 @@ mod tests {
     /// 请求级错误（参数不合法 / 非多模态 / 内容审核）与账号健康无关：
     /// 换号重试不会变，冷却账号只会白白缩小可用池 → ErrKind::None。
     #[test]
-    fn request_level_errors_do_not_penalize_account() {
-        for (text, want_status) in [
+    fn request_level_errors_do_not_penalize_account() {        for (text, want_status) in [
             ("InferHub.001001005.400 The request param is invalid", 400u16),
             ("InferHub.001001020.406 The request model is not multimodal", 400),
             ("TM.00001054 内容安全审核未通过", 400),
@@ -1382,6 +1445,54 @@ mod tests {
         .unwrap();
         assert!(!signed.authorization.contains("user-session-id"));
         assert!(!signed.authorization.contains("x-session-affinity"));
+    }
+
+    /// 上游令牌桶限流（`InferHub.ModelArts.81114.429`）与「并发会话数超限」
+    /// 是两回事：前者按**令牌/分钟**速率重置，后者按**在途会话条数**释放。
+    /// 两者都短冷却（SoftRate），但归因必须分开——此前混为一谈会把上游
+    /// 令牌桶 429 报成「并发会话数已达上限」，排障方向被带偏。
+    #[test]
+    fn token_bucket_limit_is_distinct_from_concurrency_limit() {
+        let bucket = "InferHub.ModelArts.81114.429 Too many requests, the rate limit is 300000000 tokens per minute.";
+        // 令牌桶：命中限流分支，但不命中并发上限判定
+        assert!(is_rate_limited(bucket), "令牌桶文案应命中限流判定");
+        assert!(
+            !is_concurrency_full(bucket),
+            "令牌桶不得被误判为并发会话数超限"
+        );
+        // 归因：429 + 短冷却（不熔断账号）
+        let (status, kind) = codearts_failure(200, bucket);
+        assert_eq!(status, 429, "限流应回 429");
+        assert_eq!(kind, ErrKind::SoftRate, "限流只短冷却，不熔断");
+
+        // 并发上限：只命中并发判定，不命中令牌桶判定
+        let conc = "TM.00001041 并发会话数已达上限(3个)，请关闭部分会话后重试。";
+        assert!(is_concurrency_full(conc));
+        assert!(
+            !is_rate_limited(conc),
+            "并发上限不应被误判为令牌桶限流"
+        );
+        assert_eq!(codearts_failure(200, conc), (429, ErrKind::SoftRate));
+
+        // 无文案可判的裸 429：仍按限流短冷却（不落 4xx 兜底的不冷却口径，
+        // 否则限流账号会被持续选中反复 429）
+        assert_eq!(codearts_failure(429, ""), (429, ErrKind::SoftRate));
+    }
+
+    /// 令牌桶冷却时长按「到下一个自然分钟边界 + 3s 余量」计算：
+    /// 固定 60s 可能跨过下一个窗口仍不放行（白等），也可能刚过窗口就
+    /// 放行随即再 429（反复撞）。
+    #[test]
+    fn rate_limit_cooldown_aligns_to_next_minute_window() {
+        let bucket = "the rate limit is 300000000 tokens per minute.";
+        let secs = rate_limit_cooldown_secs(bucket);
+        // 落点：下一个分钟边界 + 3s 余量 → 距今 4..=63s
+        assert!(
+            (4..=63).contains(&secs),
+            "分钟桶冷却应落在 4..63s，实际 {secs}"
+        );
+        // 文案未声明分钟粒度 → 退回固定 60s
+        assert_eq!(rate_limit_cooldown_secs("Too many requests"), 60);
     }
 }
 
@@ -1610,8 +1721,7 @@ mod live_tests {
     /// 所以串行请求必须全部成功。这是本 bug 的**决定性验证**。
     #[test]
     #[ignore = "真实上游调用：cargo test -- --ignored --nocapture"]
-    fn live_serial_requests_do_not_exhaust_session_quota() {
-        if first_account().is_none() {
+    fn live_serial_requests_do_not_exhaust_session_quota() {        if first_account().is_none() {
             eprintln!("[skip] 本机无可用 CodeArts 凭据");
             return;
         }
@@ -1692,6 +1802,69 @@ mod live_tests {
         );
         for v in &verdicts {
             assert!(!v.contains("-9901"), "出现空完成伪装：{v}");
+        }
+    }
+
+    /// 上游令牌桶限流（`InferHub.ModelArts.81114.429 Too many requests, the
+    /// rate limit is N tokens per minute`）的真实链路归因验证。
+    ///
+    /// 修复前：该文案被 `is_concurrency_full` 吞成「并发会话数已达上限」，
+    /// 且令牌桶是**服务商级**的（同一账号体系的账号会同时撞），两个账号一起
+    /// 被 60s 短冷却 → 池内无可选账号 → 网关回 503「无健康账号」——
+    /// 瞬时限流被报成网关故障。
+    ///
+    /// 修复后：归因为 429 + SoftRate（与并发上限分轨），冷却时长按分钟窗口
+    /// 计算；池全冷时回 429 + 退避秒数而非 503。
+    #[test]
+    #[ignore = "真实上游调用：cargo test -- --ignored --nocapture"]
+    fn live_token_bucket_limit_is_not_reported_as_no_healthy_account() {
+        if first_account().is_none() {
+            eprintln!("[skip] 本机无可用 CodeArts 凭据");
+            return;
+        }
+        let model = std::env::var("CODEARTS_LIVE_MODEL")
+            .unwrap_or_else(|_| "deepseek-v4.1-flash".to_string());
+        // 反复打大请求，主动撞上游令牌桶（每分钟令牌上限）
+        let body = json!({
+            "stream": false,
+            "max_tokens": 60000,
+            "messages": [{"role": "user", "content": "请写一篇 3000 字的技术长文。"}]
+        });
+        let mut verdicts = Vec::new();
+        for i in 0..4 {
+            let (ok, verdict, sample) = call_live(&model, &body);
+            eprintln!("[bucket #{i}] ok={ok} {verdict}\n  {sample}");
+            verdicts.push(verdict.clone());
+            if verdict.contains("ModelArts.811") || verdict.contains("rate limit") {
+                // 撞到令牌桶：核心断言——不得被判成「并发会话数已达上限」
+                // （文案与归因码都不同），且必须是 429 + SoftRate
+                assert!(
+                    !verdict.contains("TM.00001041") && !verdict.contains("并发会话"),
+                    "令牌桶限流不得被误报为并发会话数超限：{verdict}"
+                );
+                assert!(
+                    verdict.contains("429"),
+                    "令牌桶限流应回 429：{verdict}"
+                );
+                assert!(
+                    verdict.contains("SoftRate"),
+                    "令牌桶限流应归 SoftRate（短冷却）：{verdict}"
+                );
+                assert!(
+                    !verdict.contains("Server"),
+                    "令牌桶限流不得归 Server（会熔断 30 分钟打死整池）：{verdict}"
+                );
+                return;
+            }
+        }
+        eprintln!("[bucket] 本轮未撞上令牌桶（上游窗口未满），归因链静态断言已由单测覆盖");
+        // 未撞上限也算通过：不能出现空完成伪装或 503 误报
+        for v in &verdicts {
+            assert!(!v.contains("-9901"), "出现空完成伪装：{v}");
+            assert!(
+                !v.contains("no healthy account"),
+                "限流场景不得报「无健康账号」：{v}"
+            );
         }
     }
 }

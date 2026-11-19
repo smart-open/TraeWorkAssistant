@@ -249,6 +249,10 @@ pub enum DispatchError {
     /// `buddy=no_healthy_account,trae=no_healthy_account`，仅 resolve_target
     /// 主循环两条耗尽路径携带；测试直调等无候选序上下文的构造点传 None）
     NoHealthy(TargetPool, Option<String>),
+    /// 池内账号全部处于软冷却（上游限流）：应回 429 + 退避秒数，
+    /// 而非 503「无健康账号」——限流是瞬时的，退避后重试即可成功。
+    /// .0 = 目标池，.1 = 最早恢复秒数
+    PoolCooling(TargetPool, i64),
 }
 
 /// 选池结果
@@ -288,6 +292,10 @@ pub struct PoolCandidate {
 enum FallbackReason {
     NoHealthyAccount,
     ModelCooldown,
+    /// 池内账号全部处于**软冷却**（上游限流等短冷却），非「池空/无健康账号」。
+    /// 与 NoHealthyAccount 区分：前者应回 429 + 退避秒数（可立即重试），
+    /// 后者回 503（配置/凭据问题，重试无意义）。
+    PoolCooling,
 }
 
 impl FallbackReason {
@@ -295,6 +303,7 @@ impl FallbackReason {
         match self {
             FallbackReason::NoHealthyAccount => "no_healthy_account",
             FallbackReason::ModelCooldown => "model_cooldown",
+            FallbackReason::PoolCooling => "pool_cooling",
         }
     }
 }
@@ -1032,6 +1041,17 @@ pub fn resolve_target(
                             .unwrap_or(0) as i64;
                             DispatchError::ModelCooling(secs, TargetPool::CodeArts)
                         }
+                        // CodeArts 池全在软冷却（上游限流）：回 429 + 退避秒数，
+                        // 不回 503「无健康账号」——限流瞬时，退避后重试即可成功
+                        (TargetPool::CodeArts, FallbackReason::PoolCooling) => {
+                            let secs = state
+                                .codearts_pool
+                                .soft_cooldown_stats()
+                                .1
+                                .map(|t| t.saturating_sub(now_ts()).max(1))
+                                .unwrap_or(60);
+                            DispatchError::PoolCooling(TargetPool::CodeArts, secs)
+                        }
                         (p, _) => DispatchError::NoHealthy(p, Some(pool_reasons.join(","))),
                     });
                 }
@@ -1295,6 +1315,13 @@ fn pool_health(
                 return Err(FallbackReason::ModelCooldown);
             }
             if !state.codearts_pool.has_selectable_in(allowed, false) {
+                // 池内无可选账号：区分「上游限流软冷却」与「真的没健康账号」。
+                // 软冷却是瞬时的（几十秒），回 503「无健康账号」会让客户端把
+                // 限流当网关故障反复重试；应回 429 + 退避秒数。
+                let (soft_cooling, _) = state.codearts_pool.soft_cooldown_stats();
+                if soft_cooling > 0 {
+                    return Err(FallbackReason::PoolCooling);
+                }
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
@@ -3042,6 +3069,32 @@ mod tests {
         assert!(line.contains("healthy_in_scope=0"), "{line}");
     }
 
+    /// 上游限流软冷却（PoolCooling）必须回 429 + pool_cooling + 退避秒数，
+    /// 而不是 503「无健康账号」——用户直接看到的就是这个响应体。
+    #[tokio::test]
+    async fn t49_pool_cooling_response_is_429_not_503() {
+        let f = fixture(&[], None, None);
+        let resp = super::super::routes::dispatch_error_response(
+            &f.state,
+            DispatchError::PoolCooling(TargetPool::CodeArts, 37),
+            super::super::routes::Protocol::OpenAi,
+            "deepseek-v4.1-flash",
+            true,
+            "k1",
+            12,
+        );
+        assert_eq!(resp.status().as_u16(), 429, "限流必须回 429，不能回 503");
+        let body = resp.into_body();
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("pool_cooling"), "错误码应为 pool_cooling: {text}");
+        assert!(text.contains("37s"), "消息应带退避秒数: {text}");
+        assert!(
+            !text.contains("no healthy account"),
+            "不得误报「无健康账号」: {text}"
+        );
+    }
+
     // ---------- issue #26 全局模型白名单 ----------
 
     /// 白名单感知后台任务降级（dispatch 白名单联动）：候选 ∩ 白名单非空 →
@@ -3125,6 +3178,84 @@ mod tests {
                 credits_fetched_at: None,
             }],
             &["q1".to_string()],
+        );
+    }
+
+    /// 启用 CodeArts 并种入给定 uid 的账号（enabled=true 即视为有凭据）
+    fn seed_codearts(f: &Fixture, uids: &[&str]) {
+        f.state
+            .codearts_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let accounts: Vec<super::super::pool::CodeartsSyncAccount> = uids
+            .iter()
+            .map(|uid| super::super::pool::CodeartsSyncAccount {
+                uid: (*uid).into(),
+                name: "ca-acc".into(),
+                enabled: true,
+                credits: Some(100.0),
+                credits_expire_at: None,
+                credits_fetched_at: None,
+            })
+            .collect();
+        let enabled: Vec<String> = uids.iter().map(|u| (*u).to_string()).collect();
+        f.state.codearts_pool.sync_from_codearts(&accounts, &enabled);
+    }
+
+    /// CodeArts 池全部账号处于上游限流软冷却时，调度必须判「限流中」
+    ///（PoolCooling → 429 + 退避秒数），而不是「无健康账号」（503）——
+    /// 后者把瞬时限流报成网关故障，客户端会反复重试并放大限流。
+    #[test]
+    fn t47_codearts_pool_all_rate_limited_is_429_not_503() {
+        let f = fixture(&[], None, None);
+        seed_codearts(&f, &["ca-a", "ca-b"]);
+        let sources = ModelSources {
+            buddy: None,
+            buddy_intl_only: false,
+            buddy_in_both: false,
+            trae: false,
+            trae_final: ("m".into(), None, false),
+            qoder: None,
+            codearts: Some("deepseek-v4.1-flash".into()),
+            custom: Vec::new(),
+        };
+        // 初始：池健康
+        assert!(
+            pool_health(&f.state, TargetPool::CodeArts, &sources, true, None).is_ok(),
+            "池有健康账号时应判健康"
+        );
+        // 两个账号都撞上游限流 → SoftRate 冷却
+        f.state.codearts_pool.note_error("ca-a", super::super::ErrKind::SoftRate);
+        f.state.codearts_pool.note_error("ca-b", super::super::ErrKind::SoftRate);
+        let reason = pool_health(&f.state, TargetPool::CodeArts, &sources, true, None)
+            .expect_err("全池限流冷却应判不健康");
+        assert_eq!(
+            reason,
+            FallbackReason::PoolCooling,
+            "全池限流冷却应判 PoolCooling（回 429），不是 NoHealthyAccount（回 503）"
+        );
+    }
+
+    /// 池内**没有账号**（真·无健康账号）时仍判 NoHealthyAccount——限流与
+    /// 「池空/账号失效」必须区分开。
+    #[test]
+    fn t48_codearts_empty_pool_is_still_no_healthy_account() {
+        let f = fixture(&[], None, None);
+        let sources = ModelSources {
+            buddy: None,
+            buddy_intl_only: false,
+            buddy_in_both: false,
+            trae: false,
+            trae_final: ("m".into(), None, false),
+            qoder: None,
+            codearts: Some("deepseek-v4.1-flash".into()),
+            custom: Vec::new(),
+        };
+        let reason = pool_health(&f.state, TargetPool::CodeArts, &sources, true, None)
+            .expect_err("空池应判不健康");
+        assert_eq!(
+            reason,
+            FallbackReason::NoHealthyAccount,
+            "空池（无账号）应判 NoHealthyAccount，不是 PoolCooling"
         );
     }
 

@@ -422,6 +422,17 @@ pub(crate) fn dispatch_error_response(
                 "model_cooldown",
                 "rate_limit_error",
             ),
+            DispatchError::PoolCooling(pool, secs) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                pool.as_str(),
+                format!(
+                    "pool {} accounts are temporarily rate-limited upstream, retry after {}s（上游限流，非账号故障；退避后重试即可）",
+                    pool.as_str(),
+                    secs
+                ),
+                "pool_cooling",
+                "rate_limit_error",
+            ),
             DispatchError::NoHealthy(pool, candidates) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 pool.as_str(),

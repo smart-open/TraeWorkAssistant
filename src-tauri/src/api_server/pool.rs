@@ -1385,6 +1385,30 @@ impl ApiPool {
         (count, earliest)
     }
 
+    /// 软冷却（账号级限流冷却）统计：返回 (处于软冷却中的账号数, 最早恢复
+    /// 时刻 Unix 秒)。与 [Self::hard_credit_stats] 互补——hard 是「积分耗尽，
+    /// 等次日 04:00」，软冷却是「上游限流，等几十秒」。
+    ///
+    /// 用途：池内账号全部处于软冷却时，`has_selectable_in` 为 false，
+    /// 调度会判「无健康账号」并回 503——但真实根因是「上游限流中，稍后
+    /// 重试」，应回 429 + 退避秒数，否则客户端把瞬时限流当网关故障。
+    pub fn soft_cooldown_stats(&self) -> (usize, Option<i64>) {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let mut count = 0usize;
+        let mut earliest: Option<i64> = None;
+        for e in entries.values() {
+            if e.until > now && !e.disabled && e.hard_until <= now {
+                count += 1;
+                earliest = Some(match earliest {
+                    Some(t) => t.min(e.until),
+                    None => e.until,
+                });
+            }
+        }
+        (count, earliest)
+    }
+
     /// 诊断：返回所有账号被过滤的原因（用于 "no healthy account" 排查）
     pub fn diagnose(&self) -> Vec<PoolDiagnosis> {
         let entries = safe_lock(&self.entries);
@@ -1854,8 +1878,55 @@ mod tests {
         assert_eq!(until3, Some(earlier), "剩余最早恢复时刻取未禁用账号");
     }
 
-    // ==================== F-80：冷却/禁用标记落 app.log ====================
+    // ==================== soft_cooldown_stats（上游限流软冷却） ====================
 
+    /// 软冷却（上游限流）统计：池内账号全部处于软冷却时，调度不能再报
+    /// 「无健康账号」503——真实根因是「上游限流中」，应回 429 + 退避秒数。
+    #[test]
+    fn soft_cooldown_stats_counts_and_earliest() {
+        let pool = build_pool(&[("ca-a", 50.0, 0), ("ca-b", 50.0, 0), ("ca-c", 50.0, 0)]);
+        let (n0, until0) = pool.soft_cooldown_stats();
+        assert_eq!(n0, 0, "初始无软冷却账号");
+        assert!(until0.is_none(), "初始无恢复时刻");
+
+        // SoftRate（限流）→ 进入软冷却
+        pool.note_error("ca-a", ErrKind::SoftRate);
+        let (n1, until1) = pool.soft_cooldown_stats();
+        assert_eq!(n1, 1, "SoftRate 后应计 1 个软冷却账号");
+        let until = until1.expect("应有恢复时刻");
+        assert!(until > now_ts(), "恢复时刻应在未来");
+
+        // 多账号取最早恢复时刻
+        {
+            let mut entries = safe_lock(&pool.entries);
+            if let Some(e) = entries.get_mut("ca-a") {
+                e.until = now_ts() + 120;
+            }
+            if let Some(e) = entries.get_mut("ca-b") {
+                e.until = now_ts() + 60;
+            }
+        }
+        let (n2, until2) = pool.soft_cooldown_stats();
+        assert_eq!(n2, 2, "两个账号软冷却应计 2 个");
+        assert!(until2.is_some_and(|t| t <= now_ts() + 61), "应取最早恢复时刻");
+
+        // 硬冷却（积分耗尽）账号不计入软冷却——两者的恢复语义不同
+        pool.note_error("ca-c", ErrKind::HardCredit);
+        let (n3, _) = pool.soft_cooldown_stats();
+        assert_eq!(n3, 2, "hard_credit 账号不计入软冷却统计");
+
+        // 禁用账号不计入：需重新登录，与限流退避无关
+        {
+            let mut entries = safe_lock(&pool.entries);
+            if let Some(e) = entries.get_mut("ca-b") {
+                e.disabled = true;
+            }
+        }
+        let (n4, _) = pool.soft_cooldown_stats();
+        assert_eq!(n4, 1, "禁用账号不计入软冷却统计");
+    }
+
+    // ==================== F-80：冷却/禁用标记落 app.log ====================
     #[test]
     fn cooldown_event_logged_when_ctx_assembled() {
         let dir = std::env::temp_dir().join(format!("aiwa_f80_on_{}", std::process::id()));
