@@ -110,6 +110,9 @@ const TASKS: &[SchedTask] = &[
     // F-80 Qoder 凭证 6h 兜底刷新（kind "refresh" → EveryHours(6)；hhmm 不参与判定）。
     // 空池空转；开关独立（settings.qoder_token_renew_enabled，默认开，环境配置页可关）
     SchedTask { key: "qoder-refresh", name: "Qoder 凭证定时刷新", hhmm: "06:00", kind: "refresh" },
+    // CodeArts OAuth 凭证 6h 兜底刷新（kind "refresh" → EveryHours(6)；hhmm 不参与判定）：
+    // 提前 7h 窗口续期，跨进程锁防 refresh_token 争抢（STS5.1806 事故根因）
+    SchedTask { key: "codearts-refresh", name: "CodeArts 凭证定时刷新", hhmm: "06:10", kind: "refresh" },
     // Qoder 会话流水定时合并（kind "compact" → EveryHours(6)；hhmm 不参与判定）：
     // 每 6 小时把「7 天前」的请求级流水按 (date, uid, preview) 合并为单行
     // （幂等自愈，积分/token 合计不变；历史行 session_id 为随机值，按 preview
@@ -459,6 +462,8 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "codearts-checkin" => crate::commands::codearts::load_settings(st).auto_checkin,
         // CodeArts 积分快照：每日一次恒开（无独立模式开关）
         "codearts-credits-snapshot" => true,
+        // CodeArts 凭证兜底续期：每 6h 恒开（无独立开关；空池空转，永久失败落 needs_relogin）
+        "codearts-refresh" => true,
         // Buddy 国际版每日活跃打卡（阶段 3b）：独立开关（默认关，国际档显式开启制）
         "buddy-ai-checkin" => crate::commands::workbuddy::buddy_ai_checkin_enabled(st),
         // Buddy 国际版凭证兜底续期（2026-10-16，默认开，任务配置页可关）
@@ -842,6 +847,9 @@ fn run_task(
         }
         // CodeArts 积分快照（与 CLI 同款；空池空转）
         "codearts-credits-snapshot" => super::codearts_credits::run_snapshot_task(st),
+        // CodeArts OAuth 凭证 6h 兜底刷新（与 CLI 同款；跨进程锁防 refresh_token 争抢，
+        // 暂态失败返 Err 交调度器 30 分钟冷却重试，永久失败落 needs_relogin 徽标）
+        "codearts-refresh" => super::codearts_refresh::run_task(st),
         // Qoder Token 定时刷新：与 `--task-run qoder-refresh` 同款（6h 周期，lazy 7h 惰性门；
         // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试）
         "qoder-refresh" => super::qoder_refresh::run_task(st),

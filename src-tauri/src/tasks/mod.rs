@@ -20,6 +20,7 @@ pub mod codearts_common;
 pub mod codearts_credits;
 pub mod codearts_diag;
 pub mod codearts_oauth;
+pub mod codearts_refresh;
 pub mod codearts_sign;
 pub mod doubao_chats;
 pub mod doubao_checkin;
@@ -233,6 +234,8 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         "codearts-diag" => Ok(serde_json::json!({ "exit": codearts_diag::run(state) })),
         // CodeArts 模型目录每日同步（调度器/CLI 共用；空池/无凭证空转）
         "codearts-catalog-sync" => codearts_catalog::run_task(state),
+        // CodeArts OAuth 凭证 6h 兜底刷新（调度器/CLI 共用；跨进程锁防 refresh_token 争抢）
+        "codearts-refresh" => codearts_refresh::run_task(state),
         // Buddy 国际版积分数据同步 / 凭证兜底续期 / 模型目录同步（调度器/CLI 共用；
         // runtime=None：CLI 独立进程无网关运行态，仅落库不做运行池拨新）
         "buddy-ai-credits-sync" => crate::commands::workbuddy::buddy_ai_credits_sync_impl(state, None)

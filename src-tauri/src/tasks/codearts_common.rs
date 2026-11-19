@@ -20,9 +20,19 @@ use sha2::{Digest, Sha256};
 /// 避免一次抖动把本可自愈的账号永久禁用（对齐 qoder_common::TRANSIENT_ERR_TAG）。
 pub const TRANSIENT_ERR_TAG: &str = "[codearts-transient]";
 
+/// 凭据永久失效标记：OAuth refresh_token 被服务端拒绝 / 缺续期材料且旧凭据
+/// 已过期——重试无解，必须重新登录。区别于 TRANSIENT_ERR_TAG（网络/5xx 抖动）。
+/// 网关据此生成「请重新登录 CodeArts 账号」的用户可读提示。
+pub const NEEDS_RELOGIN_TAG: &str = "[codearts-needs-relogin]";
+
 /// 判断一段错误信息是否为暂态失败（两侧同源常量，无文案耦合面）。
 pub fn is_transient_err(e: &str) -> bool {
     e.starts_with(TRANSIENT_ERR_TAG)
+}
+
+/// 判断是否凭据永久失效需重登（与 is_transient_err 互斥）
+pub fn is_needs_relogin_err(e: &str) -> bool {
+    e.starts_with(NEEDS_RELOGIN_TAG)
 }
 
 /// CodeArts 凭据（手写 Debug 脱敏，避免 derive 把任何密钥片段打进日志）。
@@ -251,7 +261,7 @@ pub fn ensure_fresh_creds(data_dir: &std::path::Path, account_id: &str) -> Resul
         return Ok(creds);
     }
     if creds.refresh_token.is_empty() || creds.code_verifier.is_empty() || creds.dpop_key_pem.is_empty() {
-        return Err(format!("{TRANSIENT_ERR_TAG} CodeArts OAuth 凭据缺少续期材料，请重新登录"));
+        return Err(format!("{NEEDS_RELOGIN_TAG} CodeArts OAuth 凭据缺少续期材料，请重新登录"));
     }
     // 续期失败不得一票否决：STS 临时凭据在 expires_at 之前一直可签名，
     // 提前 30 分钟续期只是「提前准备」，换新失败说明不了当前凭据已失效。
@@ -275,8 +285,9 @@ pub fn ensure_fresh_creds(data_dir: &std::path::Path, account_id: &str) -> Resul
                 );
                 Ok(creds)
             } else {
-                // 确实已过期：只能报错，让上层记 SessionDead 并提示重新登录
-                Err(format!("{TRANSIENT_ERR_TAG} {e}"))
+                // 确实已过期且续期失败（refresh_token 被拒/一次性轮换已消耗）：
+                // 重试无解，标记永久失效让上层提示重新登录，而不是当暂态反复重试
+                Err(format!("{NEEDS_RELOGIN_TAG} {e}；请重新登录 CodeArts 账号"))
             }
         }
     }
@@ -543,6 +554,17 @@ mod tests {
         let mut c = oauth_creds(0);
         c.ak.clear();
         assert!(!c.usable_now());
+    }
+
+    /// 永久失效 vs 暂态失败的标记必须互斥：网关据此决定「提示重登」还是「换号重试」
+    #[test]
+    fn transient_and_needs_relogin_errors_are_disjoint() {
+        let transient = format!("{TRANSIENT_ERR_TAG} 网络抖动");
+        let permanent = format!("{NEEDS_RELOGIN_TAG} refresh token 已被使用");
+        assert!(is_transient_err(&transient));
+        assert!(!is_needs_relogin_err(&transient));
+        assert!(is_needs_relogin_err(&permanent));
+        assert!(!is_transient_err(&permanent));
     }
 
     /// needs_refresh 与 usable_now 的边界关系：窗口内且未过期 = 两者皆真

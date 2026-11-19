@@ -303,9 +303,17 @@ fn identity_of(
     let cb = state.codearts_identity.as_ref().ok_or_else(|| {
         "CodeArts 凭证解析回调未注入".to_string()
     })?;
-    let creds: CodeartsCreds = cb(uid)?;
+    let creds: CodeartsCreds = cb(uid).map_err(|e| {
+        // 永久失效（refresh_token 被拒/已过期）：转成用户可读提示，
+        // 而不是把内部 STS5.1806 原文甩给客户端（用户看不懂要重登）
+        if crate::tasks::codearts_common::is_needs_relogin_err(&e) {
+            format!("CodeArts 账号凭证已失效，请在「CodeArts 账号管理」重新登录（原 refresh_token 已被使用或拒绝）")
+        } else {
+            e
+        }
+    })?;
     if !creds.is_valid() {
-        return Err("CodeArts AK/SK 为空或失效".into());
+        return Err("CodeArts AK/SK 为空或失效，请重新登录或录入 AK/SK".into());
     }
     Ok(codearts_sign::identity_from_creds(&creds))
 }

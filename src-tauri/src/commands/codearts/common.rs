@@ -37,6 +37,13 @@ pub struct CodeartsAccount {
     /// 入池时间戳（Unix 秒）
     #[serde(default)]
     pub added_at: i64,
+    /// OAuth 凭据永久失效（refresh_token 被拒/缺续期材料），需用户重新登录。
+    /// 由 6h 兜底刷新任务落库；徽标即时生效，重登成功后清除。
+    #[serde(default)]
+    pub needs_relogin: bool,
+    /// 需重登原因（静态描述，不含凭证）
+    #[serde(default)]
+    pub relogin_reason: String,
 }
 
 fn default_true() -> bool {

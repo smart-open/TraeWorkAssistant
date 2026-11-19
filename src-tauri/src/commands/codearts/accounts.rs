@@ -24,6 +24,10 @@ pub struct CodeartsAccountView {
     pub credits_expire_at: Option<i64>,
     pub auto_checkin: bool,
     pub added_at: i64,
+    /// OAuth 凭据永久失效，需重新登录（6h 兜底刷新落库）
+    pub needs_relogin: bool,
+    /// 需重登原因（静态描述，不含凭证）
+    pub relogin_reason: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
@@ -41,6 +45,8 @@ fn view_of(a: &CodeartsAccount, has_credential: bool, tags: Vec<String>) -> Code
         credits_expire_at: a.credits_expire_at,
         auto_checkin: a.auto_checkin,
         added_at: a.added_at,
+        needs_relogin: a.needs_relogin,
+        relogin_reason: a.relogin_reason.clone(),
         tags,
     }
 }
@@ -125,6 +131,8 @@ pub fn codearts_account_import_ak_sk(
         credits_expire_at: None,
         auto_checkin: true,
         added_at: chrono::Utc::now().timestamp(),
+        needs_relogin: false,
+        relogin_reason: String::new(),
         tags: Vec::new(),
     })
 }

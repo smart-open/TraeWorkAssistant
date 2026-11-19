@@ -2088,6 +2088,10 @@ export interface CodeartsAccountView {
   /** 共享标签 tag id 列表（老后端缺省 undefined） */
   tags?: string[];
   added_at?: string | null;
+  /** OAuth 凭据永久失效，需重新登录（6h 兜底刷新落库） */
+  needs_relogin?: boolean;
+  /** 需重登原因（静态描述，不含凭证） */
+  relogin_reason?: string;
 }
 
 /** 签到结果记录（checkin_results；逐账号逐日，补签/重试多轮并存） */

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  AlertTriangle,
   KeyRound,
   Loader2,
   Pencil,
@@ -287,9 +288,19 @@ export default function CodeArtsAccounts() {
                     />
                   </td>
                   <td className="px-4 py-3">
-                    <Badge tone={a.has_credential ? 'green' : 'red'}>
-                      {a.has_credential ? '已录入' : '无凭证'}
-                    </Badge>
+                    <div className="flex flex-col gap-1">
+                      <Badge tone={a.has_credential ? 'green' : 'red'}>
+                        {a.has_credential ? '已录入' : '无凭证'}
+                      </Badge>
+                      {a.needs_relogin && (
+                        <span
+                          className="inline-flex items-center gap-1 text-xs text-amber-500"
+                          title={a.relogin_reason || 'OAuth 凭据已失效，请重新登录'}
+                        >
+                          <AlertTriangle size={12} /> 需重新登录
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-right tabular-nums text-xs">
                     {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
