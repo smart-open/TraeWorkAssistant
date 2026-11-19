@@ -1024,6 +1024,14 @@ pub fn resolve_target(
                             .unwrap_or(0) as i64;
                             DispatchError::ModelCooling(secs, TargetPool::Qoder)
                         }
+                        // CodeArts 模型级冷却同构映射：独立静态表（与 WB 池隔离）
+                        (TargetPool::CodeArts, FallbackReason::ModelCooldown) => {
+                            let secs = super::codearts_route::model_cooling_remaining_secs(
+                                &sources.codearts.clone().unwrap_or_default(),
+                            )
+                            .unwrap_or(0) as i64;
+                            DispatchError::ModelCooling(secs, TargetPool::CodeArts)
+                        }
                         (p, _) => DispatchError::NoHealthy(p, Some(pool_reasons.join(","))),
                     });
                 }
@@ -1280,8 +1288,12 @@ fn pool_health(
             Ok(())
         }
         TargetPool::CodeArts => {
-            // CodeArts 无模型级冷却表（模型级 429 走账号冷却/换号），仅账号级
-            // 健康预检；无积分豁免概念（skip_credit_filters=false）
+            // 模型级冷却预检（对齐 Buddy/Qoder）：单模型失败后窗口内快速回退，
+            // 不再每请求硬打已知异常的模型；无积分豁免（skip_credit_filters=false）
+            let model = sources.codearts.clone().unwrap_or_default();
+            if super::codearts_route::model_cooling_remaining_secs(&model).is_some() {
+                return Err(FallbackReason::ModelCooldown);
+            }
             if !state.codearts_pool.has_selectable_in(allowed, false) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
