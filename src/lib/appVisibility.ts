@@ -1,16 +1,17 @@
 import type { AppKey, Settings } from '../types';
 
 /** 全部合法应用 key */
-export const ALL_APPS: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao', 'buddy-ai'];
+export const ALL_APPS: AppKey[] = ['trae', 'buddy', 'qoder', 'codearts', 'doubao', 'buddy-ai'];
 
 /** 参与资源池调度的应用（豆包无池；custom 池恒可见不在此列） */
-export const POOL_APPS: AppKey[] = ['trae', 'buddy', 'qoder', 'buddy-ai'];
+export const POOL_APPS: AppKey[] = ['trae', 'buddy', 'qoder', 'buddy-ai', 'codearts'];
 
 /** 资源池 key → 所属应用（custom 恒可见不在映射内；未知池视为可见） */
 const POOL_TO_APP: Partial<Record<string, AppKey>> = {
   trae: 'trae',
   buddy: 'buddy',
   qoder: 'qoder',
+  codearts: 'codearts',
   'buddy-ai': 'buddy-ai',
 };
 
@@ -69,6 +70,7 @@ const POOL_TEXT: Record<string, string> = {
   trae: 'Trae',
   buddy: 'Buddy',
   qoder: 'Qoder',
+  codearts: 'CodeArts',
   'buddy-ai': 'BuddyAI 国际',
 };
 

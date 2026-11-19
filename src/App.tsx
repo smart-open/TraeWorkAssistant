@@ -30,6 +30,11 @@ import QoderAccounts from './pages/qoder/QoderAccounts';
 import QoderCheckin from './pages/qoder/QoderCheckin';
 import QoderApiService from './pages/qoder/QoderApiService';
 import QoderSettings from './pages/qoder/QoderSettings';
+import CodeArtsOverview from './pages/codearts/CodeArtsOverview';
+import CodeArtsAccounts from './pages/codearts/CodeArtsAccounts';
+import CodeArtsCheckin from './pages/codearts/CodeArtsCheckin';
+import CodeArtsApiService from './pages/codearts/CodeArtsApiService';
+import CodeArtsSettings from './pages/codearts/CodeArtsSettings';
 import BuddyAiOverview from './pages/buddyai/BuddyAiOverview';
 import BuddyAiAccounts from './pages/buddyai/BuddyAiAccounts';
 import BuddyAiCheckin from './pages/buddyai/BuddyAiCheckin';
@@ -91,6 +96,16 @@ function renderView(view: string) {
       return <QoderApiService key="qoder-api-service" />;
     case 'qoder-settings':
       return <QoderSettings />;
+    case 'codearts-overview':
+      return <CodeArtsOverview />;
+    case 'codearts-accounts':
+      return <CodeArtsAccounts />;
+    case 'codearts-checkin':
+      return <CodeArtsCheckin />;
+    case 'codearts-api-service':
+      return <CodeArtsApiService key="codearts-api-service" />;
+    case 'codearts-settings':
+      return <CodeArtsSettings />;
     case 'buddyai-overview':
       return <BuddyAiOverview />;
     case 'buddyai-accounts':

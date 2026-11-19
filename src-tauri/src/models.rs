@@ -968,6 +968,37 @@ pub struct ApiPoolFile {
     /// 上游活动结束后关闭即恢复官方同步倍率
     #[serde(default = "default_true")]
     pub qoder_flash_free_rate: bool,
+    // ── CodeArts（华为云码道）独立池配置（阶段2）────────────────────────────
+    /// CodeArts 上游开关（默认关，资源调度页显式开启）
+    #[serde(default)]
+    pub codearts_enabled: bool,
+    /// CodeArts 池调度策略（空 = 跟随 Trae 池）
+    #[serde(default)]
+    pub codearts_strategy: String,
+    /// CodeArts 池入池白名单（ca- 前缀账号 id）；空 = 全部含凭证账号入池
+    #[serde(default)]
+    pub codearts_enabled_uids: Vec<String>,
+    /// CodeArts 池分组筛选（共享分组体系）；空 = 不限分组
+    #[serde(default)]
+    pub codearts_group_ids: Vec<String>,
+    /// CodeArts 池标签筛选；空 = 不限
+    #[serde(default)]
+    pub codearts_tag_ids: Vec<String>,
+    /// CodeArts 慢请求竞速对冲阈值毫秒（0 = 关闭；预留）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub codearts_hedge_threshold_ms: u64,
+    /// CodeArts 会话粘性开关（默认关；预留）
+    #[serde(default)]
+    pub codearts_sticky_enabled: bool,
+    /// CodeArts 池账号并发上限（默认 1；0 = 不限）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub codearts_account_concurrency_limit: u32,
+    /// CodeArts 池粘性 TTL 秒（默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub codearts_pool_sticky_ttl_secs: u64,
+    /// CodeArts 显式会话粘性 TTL 秒（默认 1800；预留）
+    #[serde(default = "default_sticky_ttl_secs")]
+    pub codearts_sticky_ttl_secs: u64,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -1042,6 +1073,16 @@ impl Default for ApiPoolFile {
             buddy_ai_group_ids: Vec::new(),
             buddy_ai_tag_ids: Vec::new(),
             buddy_ai_strategy: String::new(),
+            codearts_enabled: false,
+            codearts_strategy: String::new(),
+            codearts_enabled_uids: Vec::new(),
+            codearts_group_ids: Vec::new(),
+            codearts_tag_ids: Vec::new(),
+            codearts_hedge_threshold_ms: default_hedge_threshold_ms(),
+            codearts_sticky_enabled: false,
+            codearts_account_concurrency_limit: default_account_concurrency_limit(),
+            codearts_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            codearts_sticky_ttl_secs: default_sticky_ttl_secs(),
         }
     }
 }

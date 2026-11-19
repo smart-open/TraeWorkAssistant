@@ -28,7 +28,7 @@
 
 ![AI Work 助手](./docs/images/main.png)
 
-> 深度支持 **Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包 / Qoder CN（包含 IDE）** 五应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + Qoder + 自定义模型多池调度）、6 层设备标识重置等；WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份，Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池、每日双活动签到与网关上游接入（当前仅 CN 区）。后续规划扩展更多 AI 应用。
+> 深度支持 **Trae（Trae CN）/ WorkBuddy / CodeBuddy / 豆包 / Qoder CN（包含 IDE）/ CodeArts（华为云码道，国内站）** 六应用：多账号签到、登录态切换、积分看板、成长中心自动化、OpenAI / Anthropic / Codex 三协议兼容 API 网关（Trae + WorkBuddy + Qoder + CodeArts + 自定义模型多池调度）、6 层设备标识重置等；WorkBuddy 与 CodeBuddy 共享账号体系，豆包支持快照切换 / 保活 / 额度巡检 / 对话备份，Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池、每日双活动签到与网关上游接入（当前仅 CN 区），CodeArts 支持 AK/SK 手工录入或华为云浏览器 OAuth（PKCE+DPoP，凭据自动续期）入池、每日签到领积分与网关 CodeArts 一等池。后续规划扩展更多 AI 应用。
 
 ## 产品形态与版本线
 
@@ -62,6 +62,7 @@
 | CodeBuddy | ✅ 已支持 | 与 WorkBuddy 共享账号体系，auth 文件扫描入池、签到与登录态切换 | 与 WorkBuddy 同口径：免费版 500 积分/月 + 签到 / 活动叠加 |
 | 豆包 | ✅ 已支持 | 签到、快照切换/保活/额度巡检/对话备份（公开 Open API 暂时搁置，见[重要提示](#重要提示与免责声明)） | 对话本身免费（无积分制），签到为活动 / 保活性质 |
 | Qoder CN（包含 IDE） | ✅ 已支持 | PAT / OAuth 设备流 / IDE 登录态扫描三通道入池、每日双活动签到、网关上游接入（当前仅 CN 区） | 每日签到 **100 Credits/天**（确定性最高）+ 每日登录奖励（10:00 开窗，多档）；部分模型免费（目录带免费标记） |
+| CodeArts（华为云码道，国内站） | ✅ 已支持 | AK/SK 手工 / 华为云浏览器 OAuth（自动续期）入池、每日签到领积分、网关 CodeArts 池 | 每日签到最高 1000 积分（积分制套餐用户） |
 | WorkBuddy AI / CodeBuddy AI（国际版） | ✅ 已支持 | 国际版客户端 authfile 布局变体，独立账号池 | 额度随官方套餐 / 试用发放，独立核算 |
 | Qoder（国际版） | 🕒 暂不支持 | 独立池方案已留档（[docs/pending/Qoder国际版支持落地方案.md](docs/pending/Qoder国际版支持落地方案.md)），暂未排期 | 每日单活动领取 100 Credits（10:00 开窗）；Qwen3.8-Flash 等免费模型（0 系数） |
 | LobsterAI（有道） | 🕒 暂不支持 | 暂未规划 | 每日签到领龙虾积分 |
@@ -97,7 +98,7 @@
 - **一键签到**：批量签到、按分组/手动勾选、跳过已签/过期、实时进度；WorkBuddy 成长中心自动化（旅行/盲盒/任务领奖）；Qoder 每日双活动（签到 + 登录奖励）与档期月历；豆包/WorkBuddy 定时保活与续期
 - **积分看板**：Trae / Buddy / Qoder 三平台统一看板（KPI / 趋势 / 日热度 / 到期日历互不混装）；排行、三线趋势图、今日新增统计；WorkBuddy 积分三件套 + 官方用量 + 本地 Token 统计（缓存命中率/热力图）；Qoder 积分包逐包明细
 - **本地代理**：MITM 代理自动捕获 JWT / 豆包凭证、注入独立设备 ID；**自动串联已有系统代理（VPN）作为上游**，停止时原样还原系统代理
-- **API 网关**：内嵌 OpenAI / Anthropic / Codex Responses 三协议兼容 API 服务——Trae 账号池 + WorkBuddy 池 + Qoder 池 + 自定义 OpenAI 兼容模型多池调度（smart 智能策略/优先级/模型级覆盖、每池独立开关与调度参数）、会话粘性、慢请求竞速对冲、指纹清洗、`ck_` 子 Key、四段模型路由、生图双端点、web_search 工具代执行
+- **API 网关**：内嵌 OpenAI / Anthropic / Codex Responses 三协议兼容 API 服务——Trae 账号池 + WorkBuddy 池 + Qoder 池 + CodeArts 池 + 自定义 OpenAI 兼容模型多池调度（smart 智能策略/优先级/模型级覆盖、每池独立开关与调度参数）、会话粘性、慢请求竞速对冲、指纹清洗、`ck_` 子 Key、四段模型路由、生图双端点、web_search 工具代执行
 - **定时任务**：Windows 计划任务 + 应用内调度器双轨，后台自动签到 / 保活 / 续期 / 额度巡检 / 模型目录同步
 - **6 层设备标识重置**：machineid / storage.json 遥测 / aha.device / 注册表 MachineGuid / webview 追踪数据 / aha TinyStorage
 - **快照管理**：查看/备份/恢复/删除账号登录态快照（各应用独立管理）；豆包/WorkBuddy 对话数据独立备份恢复与导出；Qoder / Trae 账号池加密导入导出
@@ -127,7 +128,7 @@ flowchart LR
     SW["switcher/<br/>登录态切换 · 设备指纹 · 快照布局管线"]
     PROXY["device_proxy/<br/>MITM 代理 · JWT/凭证自动捕获"]
     STORE[("store/ + vault<br/>aiwork.sqlite<br/>vault.stronghold")]
-    UP["Trae · WorkBuddy · CodeBuddy<br/>豆包 · Qoder CN（包含 IDE）"]
+    UP["Trae · WorkBuddy · CodeBuddy<br/>豆包 · Qoder CN（包含 IDE）· CodeArts（华为云码道）"]
 
     UI -- Tauri IPC --> CMD
     CMD --> GW & TASKS & SW & PROXY

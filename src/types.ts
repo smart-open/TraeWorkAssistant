@@ -29,6 +29,12 @@ export type ViewKey =
   | 'qoder-credits'
   | 'qoder-api-service'
   | 'qoder-settings'
+  // CodeArts（华为云码道，国内站）应用页面（AK/SK 录入 + 签到 + 积分 + 网关资源调度）
+  | 'codearts-overview'
+  | 'codearts-accounts'
+  | 'codearts-checkin'
+  | 'codearts-api-service'
+  | 'codearts-settings'
   // BuddyAI 应用页面（buddy-ai 国际版独立池；六页子导航对齐国内 Buddy，应用显示默认不展示）
   | 'buddyai-overview'
   | 'buddyai-accounts'
@@ -38,13 +44,14 @@ export type ViewKey =
   | 'buddyai-settings';
 
 /** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 / BuddyAI（buddy-ai 国际版） */
-export type AppKey = 'trae' | 'buddy' | 'qoder' | 'doubao' | 'buddy-ai';
+export type AppKey = 'trae' | 'buddy' | 'qoder' | 'codearts' | 'doubao' | 'buddy-ai';
 
 /** 各应用的默认落地页 */
 export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
   trae: 'dashboard',
   buddy: 'buddy-overview',
   qoder: 'qoder-overview',
+  codearts: 'codearts-overview',
   doubao: 'doubao-overview',
   'buddy-ai': 'buddyai-overview',
 };
@@ -704,7 +711,7 @@ export interface ApiServiceStatus {
  *  disabled 为 L1 显式静态禁用（issue #145 渠道内单模型开关，meta.enabled=false），
  *  与运行时 enabled 徽章不同构：disabled 源不参与调度且不对外发布） */
 export interface UnifiedModelSource {
-  pool: 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'custom';
+  pool: 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'custom' | 'codearts';
   rate: number | null;
   enabled: boolean;
   /** L1 显式禁用（issue #145）：true = 该源被管理端单模型开关停用 */
@@ -936,6 +943,26 @@ export interface ApiPoolFile {
   wb_tag_ids?: string[];
   /** Qoder 池标签筛选；空 = 不限 */
   qoder_tag_ids?: string[];
+  /** CodeArts 上游开关（华为云码道）：开启后 CodeArts 目录模型路由到 AK/SK 账号池（默认关） */
+  codearts_enabled?: boolean;
+  /** CodeArts 竞速对冲阈值毫秒；0 = 关闭 */
+  codearts_hedge_threshold_ms?: number;
+  /** CodeArts 会话粘性开关（默认关） */
+  codearts_sticky_enabled?: boolean;
+  /** CodeArts 池账号并发上限（默认 1；0 = 不限） */
+  codearts_account_concurrency_limit?: number;
+  /** CodeArts 池粘性 TTL 秒（默认 300） */
+  codearts_pool_sticky_ttl_secs?: number;
+  /** CodeArts 池显式会话粘性 TTL 秒（默认 1800） */
+  codearts_sticky_ttl_secs?: number;
+  /** CodeArts 池内调度策略；空 = 跟随 Trae 池 */
+  codearts_strategy?: string;
+  /** CodeArts 池入池白名单（ca- 账号 id）；空 = fail-open 全部入池 */
+  codearts_enabled_uids?: string[];
+  /** CodeArts 池分组筛选（共享分组 id）；空 = 不限 */
+  codearts_group_ids?: string[];
+  /** CodeArts 池标签筛选；空 = 不限 */
+  codearts_tag_ids?: string[];
 }
 
 /** CC Switch 协同状态（T5.7/F-43） */
@@ -2044,4 +2071,79 @@ export interface QoderCreditsSnapshot {
   /** 当日获得（签到奖励合计；无签到数据 null） */
   earned?: number | null;
   accounts: { user_id: string; total: number | null }[];
+}
+
+// ---- CodeArts（华为云码道，国内站；Rust commands/codearts；字段名严格 snake_case）----
+/** 账号视图（accounts_list）；AK/SK 只回显脱敏 AK，SK 永不回传前端 */
+export interface CodeartsAccountView {
+  id: string;
+  name: string;
+  /** 脱敏 AK（如 AK****XYZ），仅用于展示；完整凭证只在录入时提交一次 */
+  ak_masked?: string;
+  group_id: string | null;
+  note: string;
+  has_credential: boolean;
+  credits_balance?: number | null;
+  credits_fetched_at?: string | null;
+  /** 共享标签 tag id 列表（老后端缺省 undefined） */
+  tags?: string[];
+  added_at?: string | null;
+}
+
+/** 签到结果记录（checkin_results；逐账号逐日，补签/重试多轮并存） */
+export interface CodeartsCheckinRecord {
+  date: string;
+  time?: string;
+  user_id: string;
+  name: string;
+  status: string;
+  message?: string;
+  reward?: number;
+}
+
+/** codearts-checkin-progress NDJSON 单行：逐账号结果（index 为本轮序号，1 起） */
+export interface CodeartsCheckinLine {
+  index: number;
+  user_id: string;
+  name: string;
+  status: 'success' | 'already' | 'fail' | 'skip';
+  message?: string;
+  reward?: number;
+}
+
+/** 签到完成汇总（done 事件归约产物；empty/blocked 老后端缺省 0） */
+export interface CodeartsCheckinDone {
+  ok: number;
+  already: number;
+  failed: number;
+  empty?: number;
+  blocked?: number;
+}
+
+/** 单账号积分（credits_fetch 结果内 accounts[]；缺字段一律兜底） */
+export interface CodeartsCreditAccount {
+  user_id: string;
+  name?: string;
+  ok: boolean;
+  total?: number | null;
+  message?: string;
+}
+
+/** 积分查询结果（credits_fetch） */
+export interface CodeartsCreditsResult {
+  ok: boolean;
+  cached?: boolean;
+  stale?: boolean;
+  stale_reason?: string;
+  accounts: CodeartsCreditAccount[];
+  total_balance?: number;
+  message?: string;
+}
+
+/** CodeArts 设置（settings_get / settings_set） */
+export interface CodeartsSettings {
+  /** 自动签到（默认开） */
+  auto_checkin?: boolean;
+  /** 签到时刻 HH:MM（老后端缺省 10:15） */
+  checkin_hhmm?: string;
 }

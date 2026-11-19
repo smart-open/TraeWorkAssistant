@@ -470,6 +470,7 @@ const RECENT_POOLS = [
   { v: 'buddy', label: 'Buddy' },
   { v: 'buddy-ai', label: 'Buddy AI' },
   { v: 'qoder', label: 'Qoder' },
+  { v: 'codearts', label: 'CodeArts' },
   { v: 'custom', label: '自定义' },
 ];
 const RECENT_RESULTS = [

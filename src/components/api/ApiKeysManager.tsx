@@ -16,7 +16,7 @@ import { isPoolVisible } from '../../lib/appVisibility';
 import type { ApiKeyEntry, GroupView, PoolStatus, TagView, UsageDayView } from '../../types';
 
 /** issue #30 混合白名单：候选账号平台标记 */
-type CandidatePool = 'trae' | 'buddy' | 'buddy-ai' | 'qoder';
+type CandidatePool = 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'codearts';
 /** 调度配置候选：上游账号 + 所属池标记 */
 interface PoolCandidate extends PoolStatus {
   pool: CandidatePool;
@@ -28,6 +28,7 @@ const POOL_TAG: Record<CandidatePool, { label: string; tone: 'blue' | 'green' | 
   buddy: { label: 'Buddy', tone: 'green' },
   'buddy-ai': { label: 'BuddyAI', tone: 'cyan' },
   qoder: { label: 'Qoder', tone: 'violet' },
+  codearts: { label: 'CodeArts', tone: 'cyan' },
 };
 /** 绑定池 → 展示文案（空串由调用方处理为跨池文案） */
 const bindPoolLabel = (p: string) =>
@@ -39,9 +40,11 @@ const bindPoolLabel = (p: string) =>
         ? 'BuddyAI 国际池'
         : p === 'qoder'
           ? 'Qoder 池'
-          : p === 'custom'
-            ? '自定义上游池'
-            : 'Trae/Buddy/Qoder/BuddyAI/自定义';
+          : p === 'codearts'
+            ? 'CodeArts 池'
+            : p === 'custom'
+              ? '自定义上游池'
+              : 'Trae/Buddy/Qoder/BuddyAI/CodeArts/自定义';
 
 export default function ApiKeysManager({
   onSubModalChange,
@@ -83,13 +86,15 @@ export default function ApiKeysManager({
   const [deleteForKey, setDeleteForKey] = useState<ApiKeyEntry | null>(null);
   // F8：关闭鉴权二次确认（全局安全开关，误触即放行所有无 Key 请求；重新开启不确认）
   const [authConfirmOpen, setAuthConfirmOpen] = useState(false);
-  // 子 Key 配置候选（四池上游账号；打开弹框时刷新）：
+  // 子 Key 配置候选（五池上游账号；打开弹框时刷新）：
   // poolStatus = Trae 池（invoke pool_status），buddyPoolStatus = Buddy/WB 池，
-  // buddyAiPoolStatus = BuddyAI 国际池，qoderPoolStatus = Qoder 池（fail-open 全量含凭证账号）
+  // buddyAiPoolStatus = BuddyAI 国际池，qoderPoolStatus = Qoder 池（fail-open 全量含凭证账号），
+  // codeArtsPoolStatus = CodeArts 池（fail-open 全量含凭证账号）
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [buddyPoolStatus, setBuddyPoolStatus] = useState<PoolStatus[]>([]);
   const [buddyAiPoolStatus, setBuddyAiPoolStatus] = useState<PoolStatus[]>([]);
   const [qoderPoolStatus, setQoderPoolStatus] = useState<PoolStatus[]>([]);
+  const [codeArtsPoolStatus, setCodeArtsPoolStatus] = useState<PoolStatus[]>([]);
   // 今日按 Key 的 token 用量（「今日已用」列展示；四桶分账记账，跨桶合并后按 Key 聚合）
   const [usage, setUsage] = useState<UsageDayView[][]>([]);
   // Qoder 上游开关（对齐方案 §5.3 警告徽标数据源，已交付归档）：
@@ -97,6 +102,8 @@ export default function ApiKeysManager({
   const [qoderEnabled, setQoderEnabled] = useState<boolean | null>(null);
   // BuddyAI 国际上游开关（同上口径）：Key 绑定 buddy-ai 池但未启用时显式告警
   const [buddyAiEnabled, setBuddyAiEnabled] = useState<boolean | null>(null);
+  // CodeArts 上游开关（同上口径）：Key 绑定 codearts 池但未启用时显式告警
+  const [codeartsEnabled, setCodeartsEnabled] = useState<boolean | null>(null);
 
   // ---- 多 API Key 管理（原 ApiService.tsx 逻辑原样搬移） ----
   const loadKeys = useCallback(async () => {
@@ -219,7 +226,7 @@ export default function ApiKeysManager({
     // issue #30：bind="" 旧数据裸 uid 显示时归一为 buddy: 前缀（与候选编码对齐，
     // UI 勾选状态与实际限定一致）；原值存入 editOrigRef，保存时未改动则写回原值
     const norm = (v: string) =>
-      !k.bind_pool && v && !/^(trae|buddy|buddy-ai|qoder|custom):/i.test(v) ? `buddy:${v}` : v;
+      !k.bind_pool && v && !/^(trae|buddy|buddy-ai|qoder|codearts|custom):/i.test(v) ? `buddy:${v}` : v;
     editOrigRef.current = { allowed: k.allowed_accounts, dedicated: k.dedicated_account || '' };
     setEditAllowed(new Set(k.allowed_accounts.map(norm)));
     setEditMode(k.schedule_mode || 'expire_first');
@@ -238,7 +245,7 @@ export default function ApiKeysManager({
       .list()
       .then(setSharedTags)
       .catch(() => toast('error', '标签候选加载失败：请关闭弹框后重新打开重试'));
-    // 服务可能刚启动，四池候选列表即时刷新
+    // 服务可能刚启动，五池候选列表即时刷新
     api.apiServer
       .poolStatus()
       .then(setPoolStatus)
@@ -263,13 +270,19 @@ export default function ApiKeysManager({
       .catch(() => {
         /* 保留上次候选 */
       });
+    api.apiServer
+      .codeArtsPoolStatus()
+      .then(setCodeArtsPoolStatus)
+      .catch(() => {
+        /* 保留上次候选 */
+      });
   };
 
   const confirmKeyEdit = () => {
     if (!editKey) return;
     // issue #30：归一化比较——用户未改动白名单/专一（仅打开弹框触发的前缀归一）
     // 时写回原值，旧裸 uid 保持旧语义（trae 不限）；改动过才落前缀编码（升级语义）
-    const stripTag = (v: string) => v.replace(/^(trae|buddy|buddy-ai|qoder):/i, '');
+    const stripTag = (v: string) => v.replace(/^(trae|buddy|buddy-ai|qoder|codearts):/i, '');
     const normSig = (arr: string[]) =>
       arr
         .map(stripTag)
@@ -396,7 +409,7 @@ export default function ApiKeysManager({
   useEffect(() => {
     void loadKeys();
     generateKeyValue();
-    // 上游账号候选（服务未运行时为空列表）：Trae 池 + Buddy 池 + BuddyAI 国际池 + Qoder 池
+    // 上游账号候选（服务未运行时为空列表）：Trae 池 + Buddy 池 + BuddyAI 国际池 + Qoder 池 + CodeArts 池 + CodeArts 池
     api.apiServer
       .poolStatus()
       .then(setPoolStatus)
@@ -421,8 +434,14 @@ export default function ApiKeysManager({
       .catch(() => {
         /* 保留空列表 */
       });
-    // 今日 token 用量（读落盘数据，仅取当日条目）：五桶并拉——key_tokens 按池分账
-    // （Trae/Buddy/BuddyAI 国际/Qoder/Custom 各自的 DayStats），只读 Trae 桶会漏记
+    api.apiServer
+      .codeArtsPoolStatus()
+      .then(setCodeArtsPoolStatus)
+      .catch(() => {
+        /* 保留空列表 */
+      });
+    // 今日 token 用量（读落盘数据，仅取当日条目）：六桶并拉——key_tokens 按池分账
+    // （Trae/Buddy/BuddyAI 国际/Qoder/CodeArts/Custom 各自的 DayStats），只读 Trae 桶会漏记
     // 非 Trae 流量的 Key 用量
     Promise.all([
       api.apiServer.usageStats(14).catch(() => [] as UsageDayView[]),
@@ -430,13 +449,17 @@ export default function ApiKeysManager({
       api.apiServer.buddyAiUsageStats(14).catch(() => [] as UsageDayView[]),
       api.apiServer.customUsageStats(14).catch(() => [] as UsageDayView[]),
       api.apiServer.qoderUsageStats(14).catch(() => [] as UsageDayView[]),
-    ]).then(([trae, wb, buddyAi, custom, qoder]) => setUsage([trae, wb, buddyAi, custom, qoder]));
-    // Qoder / BuddyAI 国际上游开关（Key 绑定对应池的警告徽标数据源）
+      api.apiServer.codeArtsUsageStats(14).catch(() => [] as UsageDayView[]),
+    ]).then(([trae, wb, buddyAi, custom, qoder, codearts]) =>
+      setUsage([trae, wb, buddyAi, custom, qoder, codearts]),
+    );
+    // Qoder / BuddyAI 国际 / CodeArts 上游开关（Key 绑定对应池的警告徽标数据源）
     api.apiServer
       .poolList()
       .then((p) => {
         setQoderEnabled(p.qoder_enabled ?? false);
         setBuddyAiEnabled(p.buddy_ai_enabled ?? false);
+        setCodeartsEnabled(p.codearts_enabled ?? false);
       })
       .catch(() => {
         /* 未知状态不告警 */
@@ -449,7 +472,7 @@ export default function ApiKeysManager({
   }, [editKey, deleteForKey, authConfirmOpen, onSubModalChange]);
 
   // 今日按 Key 的 token 用量（Keys 表「今日已用」并列展示；日期口径与后端一致 = 本地时区 YYYY-MM-DD）
-  // 五桶合并：同一 Key 的请求可能落 Trae/Buddy/BuddyAI/Qoder/Custom 任一桶，按 Key 名跨桶求和
+  // 六桶合并：同一 Key 的请求可能落 Trae/Buddy/BuddyAI/Qoder/CodeArts/Custom 任一桶，按 Key 名跨桶求和
   const todayKey = new Date().toLocaleDateString('sv-SE');
   const todayKeyTokens = useMemo(() => {
     const m = new Map<string, { prompt: number; completion: number }>();
@@ -467,9 +490,9 @@ export default function ApiKeysManager({
   }, [usage, todayKey]);
 
   // issue #25 资源池绑定 + issue #30 混合白名单：限定上游/专一候选按绑定池切换数据源。
-  // 跟随全局调度（bind=""）合并展示 Trae + Buddy + BuddyAI 国际 + Qoder 四池账号并标记
+  // 跟随全局调度（bind=""）合并展示 Trae + Buddy + BuddyAI 国际 + Qoder + CodeArts 五池账号并标记
   // 平台，可跨池勾选；绑定池时仅展示对应池（trae → Trae 池；buddy → Buddy 池；
-  // buddy-ai → BuddyAI 国际池；qoder → Qoder 池）。
+  // buddy-ai → BuddyAI 国际池；qoder → Qoder 池；codearts → CodeArts 池）。
   // 修复历史问题：原候选列表拉的是 Trae 池，而后端白名单只作用于 WB 池
   const editCandidates: PoolCandidate[] = useMemo(() => {
     const tag = (pool: CandidatePool, list: PoolStatus[]) => list.map((p) => ({ ...p, pool }));
@@ -477,13 +500,15 @@ export default function ApiKeysManager({
     if (editBindPool === 'buddy') return tag('buddy', buddyPoolStatus);
     if (editBindPool === 'buddy-ai') return tag('buddy-ai', buddyAiPoolStatus);
     if (editBindPool === 'qoder') return tag('qoder', qoderPoolStatus);
+    if (editBindPool === 'codearts') return tag('codearts', codeArtsPoolStatus);
     return [
       ...tag('trae', poolStatus),
       ...tag('buddy', buddyPoolStatus),
       ...tag('buddy-ai', buddyAiPoolStatus),
       ...tag('qoder', qoderPoolStatus),
+      ...tag('codearts', codeArtsPoolStatus),
     ];
-  }, [editBindPool, poolStatus, buddyPoolStatus, buddyAiPoolStatus, qoderPoolStatus]);
+  }, [editBindPool, poolStatus, buddyPoolStatus, buddyAiPoolStatus, qoderPoolStatus, codeArtsPoolStatus]);
 
   // issue #30 编码：跟随全局调度时白名单/专一值携带池前缀（trae:/buddy:），
   // 后端按前缀分池作用域；绑定池时存裸 uid（与旧格式一致）
@@ -494,7 +519,7 @@ export default function ApiKeysManager({
 
   // 可见池名串（限定上游提示文案用；全部隐藏时兜底占位）
   const visiblePoolsText =
-    (['trae', 'buddy', 'qoder', 'buddy-ai'] as CandidatePool[])
+    (['trae', 'buddy', 'qoder', 'buddy-ai', 'codearts'] as CandidatePool[])
       .filter((p) => isPoolVisible(settings, p))
       .map((p) => POOL_TAG[p].label)
       .join(' + ') || '无可见池';
@@ -572,6 +597,7 @@ export default function ApiKeysManager({
               { key: 'buddy', label: 'Buddy', title: '优先走 Buddy，异常可回退' },
               { key: 'buddy-ai', label: 'BuddyAI', title: '优先走 BuddyAI 国际池，异常可回退' },
               { key: 'qoder', label: 'Qoder', title: '优先走 Qoder，异常可回退' },
+              { key: 'codearts', label: 'CodeArts', title: '优先走 CodeArts，异常可回退' },
               { key: 'custom', label: '自定义', title: '优先走自定义上游组，异常可回退' },
               // 应用显隐联动：新增 Key 不提供隐藏应用的池选项
             ].filter((p) => p.key === '' || isPoolVisible(settings, p.key)).map((p) => (
@@ -704,6 +730,7 @@ export default function ApiKeysManager({
                       {k.bind_pool === 'buddy' && <Badge tone="green" className="ml-1">Buddy 池</Badge>}
                       {k.bind_pool === 'buddy-ai' && <Badge tone="cyan" className="ml-1">BuddyAI 国际池</Badge>}
                       {k.bind_pool === 'qoder' && <Badge tone="violet" className="ml-1">Qoder 池</Badge>}
+                      {k.bind_pool === 'codearts' && <Badge tone="cyan" className="ml-1">CodeArts 池</Badge>}
                       {/* §5.3 保存后校验提示：绑定 Qoder 池但上游未启用 → 警告徽标 */}
                       {k.bind_pool === 'qoder' && qoderEnabled === false && (
                         <span
@@ -718,6 +745,15 @@ export default function ApiKeysManager({
                         <span
                           className="ml-1 inline-flex align-middle"
                           title="BuddyAI 国际上游未启用：该 Key 的请求将显式报错；开启入口在 BuddyAI 国际「资源调度」页"
+                        >
+                          <Badge tone="amber">上游未启用</Badge>
+                        </span>
+                      )}
+                      {/* 同上口径：绑定 CodeArts 池但上游未启用 → 警告徽标 */}
+                      {k.bind_pool === 'codearts' && codeartsEnabled === false && (
+                        <span
+                          className="ml-1 inline-flex align-middle"
+                          title="CodeArts 上游未启用：该 Key 的请求将显式报错；开启入口在 CodeArts「资源调度」页"
                         >
                           <Badge tone="amber">上游未启用</Badge>
                         </span>
@@ -826,6 +862,7 @@ export default function ApiKeysManager({
                 { key: 'buddy', label: 'Buddy 池', desc: '优先走 Buddy，异常可回退' },
                 { key: 'buddy-ai', label: 'BuddyAI 池', desc: '优先走 BuddyAI，异常可回退' },
                 { key: 'qoder', label: 'Qoder 池', desc: '优先走 Qoder，异常可回退' },
+                { key: 'codearts', label: 'CodeArts 池', desc: '优先走 CodeArts，异常可回退' },
                 { key: 'custom', label: '自定义上游池', desc: '优先走自定义上游组，异常可回退' },
                 // 应用显隐联动：保留全量按钮（存量 bind_pool 指向隐藏池时需有选中态），
                 // 隐藏池加「已隐藏」徽标——隐藏不停功能、不删数据
@@ -857,6 +894,13 @@ export default function ApiKeysManager({
               <p className="mt-1.5 text-xs text-amber-500">
                 BuddyAI 国际上游当前未启用：保存后该 Key 的请求将显式报错；请先到
                 BuddyAI 国际「资源调度」页开启「启用 BuddyAI 国际上游」。
+              </p>
+            )}
+            {/* 同上口径：绑定 CodeArts 池但上游未启用 → 弹框内即时提示 */}
+            {editBindPool === 'codearts' && codeartsEnabled === false && (
+              <p className="mt-1.5 text-xs text-amber-500">
+                CodeArts 上游当前未启用：保存后该 Key 的请求将显式报错；请先到
+                CodeArts「资源调度」页开启「启用 CodeArts 上游」。
               </p>
             )}
           </div>
@@ -1019,6 +1063,7 @@ export default function ApiKeysManager({
               {orgPreview.buddy ? ` · Buddy ${orgPreview.buddy}` : ''}
               {orgPreview['buddy-ai'] ? ` · BuddyAI 国际 ${orgPreview['buddy-ai']}` : ''}
               {orgPreview.qoder ? ` · Qoder ${orgPreview.qoder}` : ''}
+              {orgPreview.codearts ? ` · CodeArts ${orgPreview.codearts}` : ''}
               {orgPreview.total === 0 && ' ⚠ 展开为空集：该 Key 将无任何可取号账号，请调整分组/标签组合'}
             </p>
           )}

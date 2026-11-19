@@ -668,6 +668,13 @@ pub fn migrate_ns_on_startup(state: &AppState) {
             &format!("启动迁移: Qoder 凭证入 vault 失败（数据库未改动，明文保留待重试）: {e}"),
         ),
     }
+    // ②-b CodeArts token store（codearts_tokens 表；AK/SK 明文挪入 vault）
+    if let Err(e) = crate::tasks::codearts_common::migrate_token_store(&state.data_dir) {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("启动迁移: CodeArts 凭证入 vault 失败（数据库未改动，明文保留待重试）: {e}"),
+        );
+    }
     // ③ 豆包账号池（doubao_accounts 表）
     {
         // 读-改-写互斥：load→save 持池锁，防启动迁移与并发写方互踩

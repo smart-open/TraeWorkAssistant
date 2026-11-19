@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use serde_json::Value;
+
 use tauri::{Manager, State};
 
 use crate::fs_utils;
@@ -189,12 +191,14 @@ pub async fn do_start(
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
     let buddy_ai_pool = ApiPool::new();
+    let codearts_pool = ApiPool::new();
     // 冷却/禁用标记落 app.log（F-80）：四池注入 (data_dir, 池标签)，
     // note_error 打冷却/禁用时同步写 `account cooldown: pool=…` 便于排查跨池回退链路
     pool.set_log_ctx(&state.data_dir, "trae");
     wb_pool.set_log_ctx(&state.data_dir, "buddy");
     qoder_pool.set_log_ctx(&state.data_dir, "qoder");
     buddy_ai_pool.set_log_ctx(&state.data_dir, "buddy-ai");
+    codearts_pool.set_log_ctx(&state.data_dir, "codearts");
     // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时四池应用
     //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置。
     // M3 审查修复：buddy-ai 池补齐——原先冷启动漏设，调度策略保存前启动的服务
@@ -204,8 +208,9 @@ pub async fn do_start(
     wb_pool.set_reserve_credits(reserve_credits);
     qoder_pool.set_reserve_credits(reserve_credits);
     buddy_ai_pool.set_reserve_credits(reserve_credits);
-    let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
-        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool, &buddy_ai_pool);
+    codearts_pool.set_reserve_credits(reserve_credits);
+    let (pool_count, wb_uids_len, wb_accounts_total, qoder_count, codearts_count) =
+        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool, &buddy_ai_pool, &codearts_pool);
 
     let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -246,6 +251,26 @@ pub async fn do_start(
             pool_file.qoder_enabled,
             qoder_count,
             qoder_strategy.as_str(),
+        ),
+    );
+
+    // CodeArts 池启动概况（阶段2）：开关默认 false，未启用时不产生告警噪音；
+    // codearts_strategy 空 = 跟随 Trae 池
+    let codearts_strategy = crate::api_server::pool::PoolStrategy::resolve_codearts(
+        &pool_file.strategy,
+        &pool_file.codearts_strategy,
+    );
+    codearts_pool.set_strategy(codearts_strategy);
+    // 目录同步：注册 data_dir（供 resolve/list 读取），并注入进程级目录缓存。
+    // 同步任务由调度器/命令触发，此处仅注册路径，零网络 IO
+    crate::tasks::codearts_catalog::set_data_dir(&state.data_dir);
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-CodeArts上游池: enabled={} accounts={} strategy={}",
+            pool_file.codearts_enabled,
+            codearts_count,
+            codearts_strategy.as_str(),
         ),
     );
 
@@ -430,6 +455,28 @@ pub async fn do_start(
         qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(pool_file.qoder_sticky_enabled),
         qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
         qoder_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "q:"),
+        // CodeArts 上游（阶段2）：专用池 + identity 回调（借 AppHandle 每次取 State
+        // 走 vault 解密 AK/SK，内存签名零明文日志）；开关默认关
+        codearts_pool,
+        codearts_enabled: std::sync::atomic::AtomicBool::new(pool_file.codearts_enabled),
+        codearts_identity: Some({
+            let app = app.clone();
+            std::sync::Arc::new(move |acct_id: &str| {
+                let st = app.state::<AppState>();
+                crate::tasks::codearts_common::ensure_fresh_creds(&st.data_dir, acct_id)
+            })
+        }),
+        codearts_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(
+            pool_file.codearts_hedge_threshold_ms,
+        ),
+        codearts_sticky_enabled: std::sync::atomic::AtomicBool::new(
+            pool_file.codearts_sticky_enabled,
+        ),
+        codearts_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "c:"),
+        codearts_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
+            pool_file.codearts_pool_sticky_ttl_secs,
+        ),
+        codearts_sanitize: std::sync::atomic::AtomicBool::new(true),
     });
 
     // per-pool 三参数热应用（F-76②/F-77 拆分版）：账号并发上限 / 池粘性 TTL /
@@ -443,6 +490,9 @@ pub async fn do_start(
     shared
         .qoder_pool
         .set_concurrency_limit(pool_file.qoder_account_concurrency_limit);
+    shared
+        .codearts_pool
+        .set_concurrency_limit(pool_file.codearts_account_concurrency_limit);
     shared
         .buddy_ai_pool
         .set_concurrency_limit(pool_file.buddy_ai_account_concurrency_limit);
@@ -867,12 +917,13 @@ fn spawn_pool_reconciler(app: tauri::AppHandle, data_dir: std::path::PathBuf) {
                     &rt.shared.wb_pool,
                     &rt.shared.qoder_pool,
                     &rt.shared.buddy_ai_pool,
+                    &rt.shared.codearts_pool,
                 )),
                 None => Err("网关已停止".to_string()),
             };
             drop(guard);
             match reload_result {
-                Ok((_, wb_n, wb_total, _)) => {
+                Ok((_, wb_n, wb_total, _, _)) => {
                     fs_utils::app_log(
                         &data_dir,
                         &format!("池一致性巡检: WB 池热重载完成（入池 {wb_n} / 上游 {wb_total} 个账号）"),
@@ -908,6 +959,12 @@ fn spawn_pool_reconciler(app: tauri::AppHandle, data_dir: std::path::PathBuf) {
                                     crate::api_server::pool::PoolStrategy::resolve_buddy_ai(
                                         &pool_file.strategy,
                                         &pool_file.buddy_ai_strategy,
+                                    ),
+                                );
+                                rt.shared.codearts_pool.set_strategy(
+                                    crate::api_server::pool::PoolStrategy::resolve_codearts(
+                                        &pool_file.strategy,
+                                        &pool_file.codearts_strategy,
                                     ),
                                 );
                                 rt.shared.wb_pool.config_fingerprint() == expected
@@ -1139,14 +1196,15 @@ fn merge_pool_expire_times(rc: &RemainingCreditsFile) -> std::collections::HashM
 
 /// 池装配公共逻辑（do_start 构建 / 凭据变更热重载共用）：
 /// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建三池内条目。
-/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数, qoder 池条目数) 供调用方记日志。
+/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数, qoder 池条目数, codearts 池条目数) 供调用方记日志。
 fn apply_pool_snapshot(
     state: &AppState,
     pool: &ApiPool,
     wb_pool: &ApiPool,
     qoder_pool: &ApiPool,
     buddy_ai_pool: &ApiPool,
-) -> (usize, usize, usize, usize) {
+    codearts_pool: &ApiPool,
+) -> (usize, usize, usize, usize, usize) {
     let accounts = crate::vault::load_accounts(state);
     let pool_file = load_pool_file(&state.data_dir);
     let groups_file: crate::models::GroupsFile =
@@ -1310,7 +1368,64 @@ fn apply_pool_snapshot(
     };
     let buddy_ai_uids: Vec<String> = buddy_ai_accounts.iter().map(|a| a.uid.clone()).collect();
     buddy_ai_pool.sync_from_wb(&buddy_ai_accounts, &buddy_ai_uids);
-    (pool.count(), wb_uids.len(), wb_accounts.len(), qoder_pool.count())
+    // CodeArts 池装配（阶段2）：账号池行 + token store（凭证存在徽标）→
+    // CodeartsSyncAccount。AK/SK 明文不入池，池内 jwt 槽位恒空；真凭证由
+    // codearts_identity 回调按次从 vault 解析。分组/标签筛选与其余池同构。
+    let codearts_accounts_raw =
+        crate::store::docs::codearts_pool_load(&crate::store::db(&state.data_dir));
+    let codearts_tokens =
+        crate::store::docs::codearts_token_store_load(&crate::store::db(&state.data_dir));
+    let codearts_group_filter: Option<std::collections::HashSet<&str>> =
+        if pool_file.codearts_group_ids.is_empty() {
+            None
+        } else {
+            Some(pool_file.codearts_group_ids.iter().map(|s| s.as_str()).collect())
+        };
+    let codearts_tag_filter =
+        crate::api_server::org_index::tag_uid_set(&pool_file.codearts_tag_ids, &tag_map);
+    let codearts_sync: Vec<crate::api_server::pool::CodeartsSyncAccount> = codearts_accounts_raw
+        .get("accounts")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|a| {
+            let id = a.get("id").and_then(Value::as_str)?.to_string();
+            let group_ok = codearts_group_filter
+                .as_ref()
+                .map_or(true, |f| f.contains(a.get("group_id").and_then(Value::as_str).unwrap_or("")));
+            let tag_ok = codearts_tag_filter.as_ref().map_or(true, |t| t.contains(&id));
+            if !group_ok || !tag_ok {
+                return None;
+            }
+            // 凭证存在 = token store 中有该账号占位行（credential_source=vault）
+            let has_cred = codearts_tokens
+                .get("tokens")
+                .and_then(|t| t.get(&id))
+                .and_then(|r| r.get("credential_source"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty());
+            let credits_fetched_at = a
+                .get("credits_fetched_at")
+                .and_then(Value::as_str)
+                .and_then(fs_utils::parse_ts_loose);
+            Some(crate::api_server::pool::CodeartsSyncAccount {
+                uid: id,
+                name: a.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                enabled: has_cred,
+                credits: a.get("credits_balance").and_then(Value::as_f64),
+                credits_expire_at: a.get("credits_expire_at").and_then(Value::as_i64),
+                credits_fetched_at,
+            })
+        })
+        .collect();
+    let codearts_ids: Vec<String> = codearts_sync.iter().map(|a| a.uid.clone()).collect();
+    let codearts_uids = if pool_file.codearts_enabled_uids.is_empty() {
+        codearts_ids
+    } else {
+        pool_file.codearts_enabled_uids.clone()
+    };
+    codearts_pool.sync_from_codearts(&codearts_sync, &codearts_uids);
+    (pool.count(), wb_uids.len(), wb_accounts.len(), qoder_pool.count(), codearts_pool.count())
 }
 
 /// 网关运行中热重载两池（凭据/成员变更联动）：OAuth 重登、refresh_token 刷新、
@@ -1324,17 +1439,18 @@ pub fn reload_pools_if_running(
 ) {
     let guard = safe_lock(runtime);
     let Some(rt) = guard.as_ref() else { return };
-    let (trae, wb_uids, wb_total, qoder) = apply_pool_snapshot(
+    let (trae, wb_uids, wb_total, qoder, codearts) = apply_pool_snapshot(
         state,
         &rt.shared.pool,
         &rt.shared.wb_pool,
         &rt.shared.qoder_pool,
         &rt.shared.buddy_ai_pool,
+        &rt.shared.codearts_pool,
     );
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "API服务池热重载(凭据/成员变更联动): trae_pool={trae} wb_whitelist={wb_uids} wb_accounts={wb_total} qoder_pool={qoder}"
+            "API服务池热重载(凭据/成员变更联动): trae_pool={trae} wb_whitelist={wb_uids} wb_accounts={wb_total} qoder_pool={qoder} codearts_pool={codearts}"
         ),
     );
 }
@@ -1502,6 +1618,18 @@ fn merge_pool_set(
         buddy_ai_tag_ids: existing.buddy_ai_tag_ids.clone(),
         // buddy-ai 池内调度策略：pool_set 命令在 merge 后追加应用
         buddy_ai_strategy: existing.buddy_ai_strategy.clone(),
+        // CodeArts 全套配置：pool_set 命令在 merge 后追加应用（同 buddy-ai 先例，
+        // merge_pool_set 纯函数签名不动，存量单测零改动）
+        codearts_enabled: existing.codearts_enabled,
+        codearts_strategy: existing.codearts_strategy.clone(),
+        codearts_enabled_uids: existing.codearts_enabled_uids.clone(),
+        codearts_group_ids: existing.codearts_group_ids.clone(),
+        codearts_tag_ids: existing.codearts_tag_ids.clone(),
+        codearts_hedge_threshold_ms: existing.codearts_hedge_threshold_ms,
+        codearts_sticky_enabled: existing.codearts_sticky_enabled,
+        codearts_account_concurrency_limit: existing.codearts_account_concurrency_limit,
+        codearts_pool_sticky_ttl_secs: existing.codearts_pool_sticky_ttl_secs,
+        codearts_sticky_ttl_secs: existing.codearts_sticky_ttl_secs,
     }
 }
 
@@ -1577,6 +1705,18 @@ pub fn pool_set(
     trae_tag_ids: Option<Vec<String>>,
     wb_tag_ids: Option<Vec<String>>,
     qoder_tag_ids: Option<Vec<String>>,
+    // CodeArts 池配置（阶段2）；None = 保留原值，merge 后追加应用
+    codearts_enabled: Option<bool>,
+    codearts_strategy: Option<String>,
+    // 白名单参数名沿用各池 `*_uids` 口径（前端 codeartsUids → codearts_uids 自动映射）
+    codearts_uids: Option<Vec<String>>,
+    codearts_group_ids: Option<Vec<String>>,
+    codearts_tag_ids: Option<Vec<String>>,
+    codearts_account_concurrency_limit: Option<u32>,
+    codearts_pool_sticky_ttl_secs: Option<u64>,
+    codearts_sticky_ttl_secs: Option<u64>,
+    codearts_hedge_threshold_ms: Option<u64>,
+    codearts_sticky_enabled: Option<bool>,
 ) -> Result<(), String> {
     // B1（审查修复清单 v1.4.9）：api_pool 整文档覆盖写互斥——3 个写点
     // （本命令 / shared_groups ③段 / tags ③段）并发「load→merge→kv_set」互相
@@ -1657,6 +1797,17 @@ pub fn pool_set(
     if let Some(v) = buddy_ai_strategy {
         pool_file.buddy_ai_strategy = v;
     }
+    // CodeArts 全套配置 merge 后追加应用（None = 保留原值）
+    if let Some(v) = codearts_enabled { pool_file.codearts_enabled = v; }
+    if let Some(v) = codearts_strategy { pool_file.codearts_strategy = v; }
+    if let Some(v) = codearts_uids { pool_file.codearts_enabled_uids = v; }
+    if let Some(v) = codearts_group_ids { pool_file.codearts_group_ids = v; }
+    if let Some(v) = codearts_tag_ids { pool_file.codearts_tag_ids = v; }
+    if let Some(v) = codearts_account_concurrency_limit { pool_file.codearts_account_concurrency_limit = v; }
+    if let Some(v) = codearts_pool_sticky_ttl_secs { pool_file.codearts_pool_sticky_ttl_secs = v; }
+    if let Some(v) = codearts_sticky_ttl_secs { pool_file.codearts_sticky_ttl_secs = v; }
+    if let Some(v) = codearts_hedge_threshold_ms { pool_file.codearts_hedge_threshold_ms = v; }
+    if let Some(v) = codearts_sticky_enabled { pool_file.codearts_sticky_enabled = v; }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     drop(_cfg);
     // 热应用（配置锁外）：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
@@ -1786,6 +1937,26 @@ pub fn pool_set(
             pool_file.qoder_flash_free_rate,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // CodeArts 池策略/并发/开关热应用（阶段2）
+        rt.shared.codearts_pool.set_strategy(
+            crate::api_server::pool::PoolStrategy::resolve_codearts(
+                &pool_file.strategy, &pool_file.codearts_strategy,
+            ),
+        );
+        rt.shared.codearts_pool.set_concurrency_limit(pool_file.codearts_account_concurrency_limit);
+        rt.shared.codearts_enabled.store(
+            pool_file.codearts_enabled, std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.codearts_sticky_enabled.store(
+            pool_file.codearts_sticky_enabled, std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.codearts_hedge_threshold_ms.store(
+            pool_file.codearts_hedge_threshold_ms, std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.codearts_pool_sticky_ttl_secs.store(
+            pool_file.codearts_pool_sticky_ttl_secs, std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.codearts_sticky.set_explicit_ttl(pool_file.codearts_sticky_ttl_secs as i64);
     }
     // 成员/分组热应用：此前仅策略/参数热生效，成员变更要求重启服务；
     // 现统一走凭据/成员变更联动热重载，保存账号池后立即生效
@@ -1823,6 +1994,38 @@ pub fn qoder_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) ->
         Some(rt) => rt.shared.qoder_pool.status_list(),
         None => vec![],
     }
+}
+
+/// 返回运行中 CodeArts 池的实时状态（阶段2「资源调度」页可观测，含 per-account
+/// inflight 在途计数）；服务未运行时返回空数组
+#[tauri::command]
+pub fn codearts_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<PoolStatus> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => rt.shared.codearts_pool.status_list(),
+        None => vec![],
+    }
+}
+
+/// 手动同步 CodeArts 模型目录（资源调度页「立即同步」按钮；与 scheduler/CLI 同款）。
+#[tauri::command]
+pub async fn codearts_catalog_sync(state: State<'_, AppState>) -> Result<usize, String> {
+    let st = AppState {
+        data_dir: state.data_dir.clone(),
+        jwt_refresh_lock: state.inner().jwt_refresh_lock.clone(),
+        qoder_pool_lock: state.inner().qoder_pool_lock.clone(),
+        codearts_pool_lock: state.inner().codearts_pool_lock.clone(),
+        wb_pool_lock: state.inner().wb_pool_lock.clone(),
+        buddy_ai_pool_lock: state.inner().buddy_ai_pool_lock.clone(),
+        doubao_pool_lock: state.inner().doubao_pool_lock.clone(),
+        group_defs_lock: state.inner().group_defs_lock.clone(),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = crate::tasks::codearts_catalog::run_task(&st)?;
+        Ok(out.get("models").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize)
+    })
+    .await
+    .map_err(|e| format!("目录同步任务失败: {e}"))?
 }
 
 /// 返回运行中 Buddy 国际版（buddy-ai）池的实时状态（全局 API 管理·API Keys
@@ -1876,6 +2079,7 @@ pub fn sanitize_switch_set(
     let (flag, label) = match pool.as_str() {
         "wb" => (&rt.shared.wb_sanitize, "wb/Trae"),
         "qoder" => (&rt.shared.qoder_sanitize, "qoder"),
+        "codearts" => (&rt.shared.codearts_sanitize, "codearts"),
         other => return Err(format!("未知清洗开关池: {other}")),
     };
     flag.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -1900,6 +2104,7 @@ pub async fn qoder_catalog_sync(state: State<'_, AppState>) -> Result<usize, Str
         data_dir: state.data_dir.clone(),
         jwt_refresh_lock: state.inner().jwt_refresh_lock.clone(),
         qoder_pool_lock: state.inner().qoder_pool_lock.clone(),
+        codearts_pool_lock: state.inner().codearts_pool_lock.clone(),
         wb_pool_lock: state.inner().wb_pool_lock.clone(),
         buddy_ai_pool_lock: state.inner().buddy_ai_pool_lock.clone(),
         doubao_pool_lock: state.inner().doubao_pool_lock.clone(),
@@ -2166,6 +2371,17 @@ pub fn api_qoder_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> V
     )
 }
 
+/// 查询最近 N 天的 CodeArts 上游用量统计（codearts_days 桶，与其余池分账；阶段2）
+#[tauri::command]
+pub fn api_codearts_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    crate::api_server::usage::query_recent_in(
+        &state.data_dir,
+        days,
+        crate::api_server::usage::UsageBucket::CodeArts,
+    )
+}
+
 // ==================== 多 API Key 命令 ====================
 
 /// 读取 API Key 列表与鉴权开关
@@ -2290,6 +2506,8 @@ pub fn api_unified_models(
         buddy_ai_enabled,
         buddy_ai_ok,
         qoder_flash_free,
+        codearts_enabled,
+        codearts_ok,
     ) = match safe_lock(&runtime).as_ref() {
         Some(rt) => {
             let s = &rt.shared;
@@ -2307,6 +2525,8 @@ pub fn api_unified_models(
                 // Qwen3.8-Flash 免费活动覆盖（issue #111），与取号/排序同口径
                 s.qoder_flash_free_rate
                     .load(std::sync::atomic::Ordering::Relaxed),
+                s.codearts_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                s.codearts_pool.has_selectable(),
             )
         }
         None => {
@@ -2320,6 +2540,8 @@ pub fn api_unified_models(
                 pf.buddy_ai_enabled,
                 true,
                 pf.qoder_flash_free_rate,
+                pf.codearts_enabled,
+                true,
             )
         }
     };
@@ -2332,6 +2554,7 @@ pub fn api_unified_models(
         Some((qoder_enabled, qoder_ok)),
         Some((buddy_ai_enabled, buddy_ai_ok)),
         qoder_flash_free,
+        Some((codearts_enabled, codearts_ok)),
     );
     if available_only.unwrap_or(false) {
         // issue #145：可用口径须含 L1 静态禁用——disabled 源不承接请求，不能计为可用
@@ -2765,6 +2988,16 @@ mod pool_merge_tests {
             buddy_ai_group_ids: Vec::new(),
             buddy_ai_tag_ids: Vec::new(),
             buddy_ai_strategy: "credit_first".into(),
+            codearts_enabled: false,
+            codearts_strategy: String::new(),
+            codearts_enabled_uids: Vec::new(),
+            codearts_group_ids: Vec::new(),
+            codearts_tag_ids: Vec::new(),
+            codearts_hedge_threshold_ms: 8000,
+            codearts_sticky_enabled: false,
+            codearts_account_concurrency_limit: 1,
+            codearts_pool_sticky_ttl_secs: 300,
+            codearts_sticky_ttl_secs: 1800,
         }
     }
 

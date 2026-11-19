@@ -110,6 +110,17 @@ pub fn continue_stream_on_next_pool(
                 );
                 return true;
             }
+            // 阶段2：CodeArts 跨池移交——复用与 qoder 同构的流式执行核心
+            TargetPool::CodeArts => {
+                log_cross_pool(shared, from, cand);
+                let chat_id = format!("chatcmpl-{}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0));
+                super::codearts_route::run_codearts_stream(
+                    shared, body_vec, &cand.model, proto, key_id, &chat_id, tx,
+                    start_ts, guard,
+                );
+                return true;
+            }
             // 第一期暂不支持（Trae 流核心未抽出 / Custom 组内自冗余）：跳过该候选
             TargetPool::Trae | TargetPool::Custom => {}
         }

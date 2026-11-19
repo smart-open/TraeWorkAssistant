@@ -1581,6 +1581,7 @@ fn bucket_name(b: UsageBucket) -> &'static str {
         UsageBucket::Custom => "custom",
         UsageBucket::Qoder => "qoder",
         UsageBucket::BuddyAi => "buddy-ai",
+        UsageBucket::CodeArts => "codearts",
     }
 }
 
@@ -1591,6 +1592,7 @@ fn bucket_of(name: &str) -> Option<UsageBucket> {
         "custom" => Some(UsageBucket::Custom),
         "qoder" => Some(UsageBucket::Qoder),
         "buddy-ai" => Some(UsageBucket::BuddyAi),
+        "codearts" => Some(UsageBucket::CodeArts),
         _ => None,
     }
 }
@@ -1602,6 +1604,7 @@ fn bucket_map_mut<'a>(f: &'a mut UsageFile, b: UsageBucket) -> &'a mut std::coll
         UsageBucket::Custom => &mut f.custom_days,
         UsageBucket::Qoder => &mut f.qoder_days,
         UsageBucket::BuddyAi => &mut f.buddy_ai_days,
+        UsageBucket::CodeArts => &mut f.codearts_days,
     }
 }
 
@@ -1639,6 +1642,7 @@ pub fn api_usage_save(s: &Store, f: &UsageFile) -> Result<(), String> {
         // api_usage_load→save 往返及迁移导入静默清空 buddy-ai 历史用量
         //（load 侧 bucket_map_mut 五桶齐全，save 侧必须对称）
         (UsageBucket::BuddyAi, &f.buddy_ai_days),
+        (UsageBucket::CodeArts, &f.codearts_days),
     ]
     .into_iter()
     .flat_map(|(b, map)| {
@@ -1789,6 +1793,46 @@ pub fn custom_session_insert(
         )?;
         Ok(())
     })
+}
+
+/// 阶段2：CodeArts 网关单请求会话行插入（request_id 内部生成 uuid，纯 INSERT）。
+/// 记账热路径直写，失败由调用方静默（与 custom_session_insert 同策略）
+#[allow(clippy::too_many_arguments)]
+pub fn codearts_session_insert(
+    s: &Store,
+    request_id: &str,
+    session_id: &str,
+    uid: &str,
+    date: &str,
+    ts: i64,
+    model: &str,
+    pt: i64,
+    ct: i64,
+    duration_ms: i64,
+    stream: bool,
+    ok: bool,
+    preview: &str,
+) -> Result<(), String> {
+    s.with_conn(|c| {
+        c.execute(
+            "INSERT INTO codearts_sessions
+             (request_id, session_id, uid, date, ts, model, pt, ct, duration_ms, stream, ok, preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                request_id, session_id, uid, date, ts, model, pt, ct, duration_ms,
+                stream as i64, ok as i64, preview
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// codearts_sessions 保留期裁剪（与 api_usage 同口径 90 天；低频附带执行）
+pub fn codearts_sessions_prune(s: &Store, keep_days: i64) -> Result<usize, String> {
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(keep_days))
+        .format("%Y-%m-%d")
+        .to_string();
+    s.with_conn(|c| Ok(c.execute("DELETE FROM codearts_sessions WHERE date < ?1", [cutoff.as_str()])?))
 }
 
 /// custom_sessions 保留期裁剪（与 qoder_sessions 同口径 90 天；低频附带执行）
@@ -2486,6 +2530,147 @@ pub fn qoder_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), Strin
     }
     if fail > 0 {
         eprintln!("[qoder] 积分快照滚动裁剪删除失败 {fail} 条（首错: {first_err}），过期行将留待下次裁剪");
+    }
+    Ok(())
+}
+
+// ── CodeArts（华为云码道，国内站）────────────────────────────────────────────
+// 与 Qoder 同构的四张行文档表：账号池 / token store / 签到结果（90 天）/ 积分快照（365 天）。
+
+/// 读整池（结构 {accounts: [...]}；账号对象原样保真）
+pub fn codearts_pool_load(s: &Store) -> Value {
+    let accounts: Vec<Value> = s
+        .rows_all("codearts_accounts")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "accounts": accounts })
+}
+
+/// 可失败口径读整池（写路径把关，防损坏行被整池覆盖）
+pub fn codearts_pool_load_checked(s: &Store) -> Result<Value, String> {
+    let accounts: Vec<Value> = s
+        .rows_all("codearts_accounts")?
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    Ok(json!({ "accounts": accounts }))
+}
+
+/// 写整池（pk = 账号 id）
+pub fn codearts_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = pool.get("accounts").and_then(Value::as_array).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let id = a.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+            (id.map(String::from).unwrap_or_else(|| format!("__idx{i}")), a.clone())
+        })
+        .collect();
+    s.rows_replace("codearts_accounts", &rows)
+}
+
+/// 读 token store（结构 {version, tokens: {id: rec}}；AK/SK 明文由 tasks 层从 vault 回填）
+pub fn codearts_token_store_load(s: &Store) -> Value {
+    let tokens: serde_json::Map<String, Value> = s
+        .rows_all("codearts_tokens")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v.is_object())
+        .collect();
+    let version = s.kv_get_raw("codearts_tokens_meta").and_then(|v| v.parse::<i64>().ok());
+    let mut root = serde_json::Map::new();
+    root.insert("tokens".into(), Value::Object(tokens));
+    if let Some(v) = version {
+        root.insert("version".into(), json!(v));
+    }
+    Value::Object(root)
+}
+
+/// 写 token store（整表替换 + version）
+pub fn codearts_token_store_save(s: &Store, store_val: &Value) -> Result<(), String> {
+    let empty = serde_json::Map::new();
+    let tokens = store_val.get("tokens").and_then(Value::as_object).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> = tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    s.rows_replace("codearts_tokens", &rows)?;
+    if let Some(v) = store_val.get("version").and_then(Value::as_i64) {
+        s.kv_set_raw("codearts_tokens_meta", &v.to_string())?;
+    }
+    Ok(())
+}
+
+/// 读签到结果（{results: [...]}，按 rowid 追加序）
+pub fn codearts_checkin_results_load(s: &Store) -> Vec<Value> {
+    s.rows_all("codearts_checkin_results")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect()
+}
+
+/// 批量签到结果 UPSERT + 90 天裁剪。pk = date|uid|time_ms（毫秒防并发碰撞）。
+pub fn codearts_checkin_results_upsert(s: &Store, recs: &[Value]) -> Result<(), String> {
+    for rec in recs {
+        let date = rec.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+        let uid = rec.get("user_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let tail = match rec.get("time_ms").and_then(Value::as_i64) {
+            Some(ms) => ms.to_string(),
+            None => rec.get("time").and_then(Value::as_str).unwrap_or("").to_string(),
+        };
+        if date.is_empty() || uid.is_empty() || tail.is_empty() {
+            return Err("签到结果缺少 date/user_id/time_ms(time)".into());
+        }
+        s.row_upsert("codearts_checkin_results", &format!("{date}|{uid}|{tail}"), rec)?;
+    }
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(90))
+        .format("%Y-%m-%d")
+        .to_string();
+    let stale: Vec<String> = s
+        .rows_all("codearts_checkin_results")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pk, _)| pk)
+        .filter(|pk| pk.as_str() < cutoff.as_str())
+        .collect();
+    for pk in stale {
+        let _ = s.with_conn(|c| c.execute("DELETE FROM codearts_checkin_results WHERE pk = ?1", [&pk]));
+    }
+    Ok(())
+}
+
+/// 读积分快照（按 pk = date 升序）
+pub fn codearts_credits_history_load(s: &Store) -> Vec<Value> {
+    s.rows_all("codearts_credits_history")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect()
+}
+
+/// 批量积分快照 UPSERT（pk = date 同日覆盖）+ 365 天裁剪
+pub fn codearts_credits_history_upsert(s: &Store, snaps: &[Value]) -> Result<(), String> {
+    for snap in snaps {
+        let date = snap.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+        if date.is_empty() {
+            return Err("快照缺少 date 字段".into());
+        }
+        s.row_upsert("codearts_credits_history", &date, snap)?;
+    }
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
+        .format("%Y-%m-%d")
+        .to_string();
+    let stale: Vec<String> = s
+        .rows_all("codearts_credits_history")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pk, _)| pk)
+        .filter(|pk| pk.as_str() < cutoff.as_str())
+        .collect();
+    for pk in stale {
+        let _ = s.with_conn(|c| c.execute("DELETE FROM codearts_credits_history WHERE pk = ?1", [&pk]));
     }
     Ok(())
 }

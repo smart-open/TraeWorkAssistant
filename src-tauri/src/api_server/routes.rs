@@ -393,6 +393,13 @@ pub(crate) fn dispatch_error_response(
                 "qoder_upstream_disabled",
                 "invalid_request_error",
             ),
+            DispatchError::CodeArtsDisabled => (
+                StatusCode::BAD_REQUEST,
+                "codearts",
+                "该模型属 CodeArts 上游，但 CodeArts 上游未启用（api_pool.json codearts_enabled）".to_string(),
+                "codearts_upstream_disabled",
+                "invalid_request_error",
+            ),
             DispatchError::TraeDisabled => (
                 StatusCode::BAD_REQUEST,
                 "trae",
@@ -594,6 +601,7 @@ pub(crate) fn no_healthy_detail_with_model(
         TargetPool::Buddy => &state.wb_pool,
         TargetPool::BuddyAi => &state.buddy_ai_pool,
         TargetPool::Qoder => &state.qoder_pool,
+        TargetPool::CodeArts => &state.codearts_pool,
         // custom 池无账号列表，无 healthier 账号枚举——直接按错误矩阵基准文案返回
         // （v3：组内全熔断 → NoHealthy(Custom) 走此处；前缀锁池即 503 单池语义）
         TargetPool::Custom => return "no healthy account available".to_string(),
@@ -622,6 +630,7 @@ pub(crate) fn no_healthy_detail_with_model(
             TargetPool::Buddy => " hint=Buddy 池内 0 账号：请在「资源池管理」的 WB 上游池设置中勾选账号入池",
             TargetPool::BuddyAi => " hint=Buddy 国际池内 0 账号：请在「资源池管理」的国际版池设置中勾选账号入池",
             TargetPool::Qoder => " hint=Qoder 池内 0 账号：请检查 Qoder 池的分组/标签筛选与账号入池设置",
+            TargetPool::CodeArts => " hint=CodeArts 池内 0 账号：请在「CodeArts 账号管理」录入 AK/SK 凭证并开启上游开关",
             // 防御性注释：Custom 池在本函数入口的 match 已 early-return（见上方
             // 「custom 池无账号列表」分支），此臂不可达；Rust match 穷尽匹配要求
             // 必须保留该臂，勿删
@@ -905,7 +914,9 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
     // buddy-ai 独立池（§3.4 隔离清单）：healthz 四池化——仅部署 Intl 账号时探活同样正常
     let buddy_ai_enabled = state.buddy_ai_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let buddy_ai_ok = buddy_ai_enabled && state.buddy_ai_pool.has_selectable();
-    if solo_ok || wb_ok || qoder_ok || buddy_ai_ok {
+    let codearts_enabled = state.codearts_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let codearts_ok = codearts_enabled && state.codearts_pool.has_selectable();
+    if solo_ok || wb_ok || qoder_ok || buddy_ai_ok || codearts_ok {
         (
             StatusCode::OK,
             axum::Json(json!({
@@ -914,6 +925,7 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
                 "wb_available": wb_ok,
                 "qoder_available": qoder_ok,
                 "buddy_ai_available": buddy_ai_ok,
+                "codearts_available": codearts_ok,
             })),
         )
             .into_response()
@@ -1099,6 +1111,9 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // Qoder 源旗标（p3-3）：条目始终入表（开关关闭时徽章置灰）
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = state.qoder_pool.has_selectable();
+    // CodeArts 源旗标（阶段2）：条目入表（开关关闭时徽章置灰）
+    let codearts_enabled = state.codearts_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let codearts_ok = state.codearts_pool.has_selectable();
     // buddy-ai 源旗标（阶段 2 审查修复）：Intl 静态目录入统一目录（Intl 专属 id
     // 可被发现/加入白名单），徽章 = 开关 && 池健康
     let buddy_ai_enabled = state
@@ -1124,6 +1139,7 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             Some((qoder_enabled, qoder_ok)),
             Some((buddy_ai_enabled, buddy_ai_ok)),
             qoder_flash_free,
+            Some((codearts_enabled, codearts_ok)),
         )
     })
     .await
@@ -1283,6 +1299,13 @@ pub async fn chat_completions(
                     return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+            }
+            TargetPool::CodeArts => {
+                // CodeArts 上游（阶段2）：AK/SK 签名推理，OpenAI 兼容 SSE
+                if stream {
+                    return super::codearts_route::codearts_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
+                }
+                return super::codearts_route::codearts_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Trae 池 effort 通道（默认思考两池对齐）——
@@ -1659,6 +1682,12 @@ pub async fn messages(
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
             }
+            TargetPool::CodeArts => {
+                if stream {
+                    return super::codearts_route::codearts_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
+                }
+                return super::codearts_route::codearts_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+            }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Anthropic thinking 参数视为显式请求
                 //（enabled → high 档；disabled → 空串短路默认思考与路由提示）
@@ -1813,6 +1842,12 @@ pub async fn completions(
                     return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+            }
+            TargetPool::CodeArts => {
+                if stream {
+                    return super::codearts_route::codearts_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
+                }
+                return super::codearts_route::codearts_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
@@ -4004,6 +4039,14 @@ mod tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
+            codearts_pool: super::super::pool::ApiPool::new(),
+            codearts_enabled: std::sync::atomic::AtomicBool::new(false),
+            codearts_identity: None,
+            codearts_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            codearts_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            codearts_sticky: super::super::wb_sticky::StickyStore::default(),
+            codearts_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            codearts_sanitize: std::sync::atomic::AtomicBool::new(true),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
             buddy_ai_sticky: super::super::wb_sticky::StickyStore::default(),
             buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),

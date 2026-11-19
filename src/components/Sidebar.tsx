@@ -17,6 +17,7 @@ import {
   Boxes,
   LayoutGrid,
   Globe,
+  Code2,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
@@ -67,6 +68,15 @@ const QODER_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'qoder-settings', label: '环境配置', icon: Settings },
 ];
 
+/** CodeArts 应用菜单（华为云码道，国内站：AK/SK 入池 + 签到 + 积分 + 网关资源调度） */
+const CODEARTS_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
+  { key: 'codearts-overview', label: '概述', icon: LayoutDashboard },
+  { key: 'codearts-accounts', label: '账号管理', icon: Users },
+  { key: 'codearts-checkin', label: '每日签到', icon: PlayCircle },
+  { key: 'codearts-api-service', label: '资源调度', icon: Server },
+  { key: 'codearts-settings', label: '环境配置', icon: Settings },
+];
+
 /** BuddyAI 应用菜单（buddy-ai 国际版独立池；六页子导航对齐国内 Buddy 产品形态） */
 const BUDDYAI_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'buddyai-overview', label: '概述', icon: LayoutDashboard },
@@ -83,6 +93,7 @@ export const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disable
   { key: 'trae', label: 'Trae', icon: Sparkles },
   { key: 'buddy', label: 'Buddy', icon: Bot, title: 'WorkBuddy / CodeBuddy' },
   { key: 'qoder', label: 'Qoder', icon: Boxes, title: 'Qoder CN（Qoder CN IDE / Qoder CN / CLI）' },
+  { key: 'codearts', label: 'CodeArts', icon: Code2, title: '华为云码道（国内站）' },
   { key: 'doubao', label: '豆包', icon: LayoutGrid },
   { key: 'buddy-ai', label: 'BuddyAI', icon: Globe, title: 'Buddy 国际版（buddy-ai 独立池）' },
 ];
@@ -139,6 +150,8 @@ export default function Sidebar({
       ? BUDDY_NAV
       : activeApp === 'qoder'
       ? QODER_NAV
+      : activeApp === 'codearts'
+      ? CODEARTS_NAV
       : activeApp === 'buddy-ai'
       ? BUDDYAI_NAV
       : NAV;

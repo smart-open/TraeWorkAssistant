@@ -84,6 +84,7 @@ dependencies = [
  "chrono",
  "flate2",
  "futures-util",
+ "hmac",
  "http-body-util",
  "hyper",
  "hyper-rustls",

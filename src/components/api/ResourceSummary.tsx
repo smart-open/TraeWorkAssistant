@@ -7,13 +7,15 @@
  *  ② 池间调度策略：smart / priority + 优先级序编辑 + 跨池回退（dispatch_policy_get/set 即时生效）；
  *  ③ 各资源池池内调度：Trae（strategy）/ Buddy（wb_strategy，空 = 加权公平轮转，
  *     WB 专属默认；PR #187）/ Qoder（qoder_strategy，空 = 跟随 Trae 池）/
- *     BuddyAI 国际（buddy_ai_strategy，空 = 跟随 Trae 池）下拉编辑，自定义模型命中即直达；
+ *     BuddyAI 国际（buddy_ai_strategy，空 = 跟随 Trae 池）/
+ *     CodeArts（codearts_strategy，空 = 跟随 Trae 池）下拉编辑，自定义模型命中即直达；
  *     上游开关与池成员在各应用「资源调度」页维护。
- * 下方为 Trae / Buddy / Qoder / BuddyAI 国际 / 自定义 五池摘要卡；前四者详情引导至
+ * 下方为 Trae / Buddy / Qoder / BuddyAI 国际 / CodeArts / 自定义 六池摘要卡；前五者详情引导至
  * 各应用「资源调度」页，自定义池详情引导至「自定义模型」Tab。
  * 数据源：pool_list / accounts_list（Trae 池）、pool_list.wb_enabled / workbuddy_accounts_list
  * （Buddy 池）、pool_list.qoder_enabled / qoder_accounts_list（Qoder 池）、
- * buddyai.accountsList（BuddyAI 国际池）、custom_models_list（自定义模型池）。
+ * buddyai.accountsList（BuddyAI 国际池）、codearts.accountsList（CodeArts 池）、
+ * custom_models_list（自定义模型池）。
  */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ArrowDown, ArrowUp, Blocks, Bot, Boxes, Globe, Layers, Server, SlidersHorizontal, Star, X } from 'lucide-react';
@@ -28,6 +30,7 @@ import type {
   AccountView,
   ApiPoolFile,
   BuddyAiAccountView,
+  CodeartsAccountView,
   CustomModel,
   DispatchPolicy,
   QoderAccountView,
@@ -80,6 +83,7 @@ const POOL_LABELS: Record<string, string> = {
   trae: 'Trae 池',
   qoder: 'Qoder 池',
   'buddy-ai': 'BuddyAI 国际池',
+  codearts: 'CodeArts 池',
   custom: '自定义上游池',
 };
 
@@ -90,7 +94,7 @@ const inputCls =
   'h-7 w-44 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none placeholder:text-slate-300 focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200';
 
 /** 池间候选序全集（优先级编辑补尾与沉尾写回用全量；可见池排列的候选序在组件内按可见性动态派生。v3：custom 入池间策略全集，尾部兜底位） */
-const POOL_KEYS = ['buddy', 'trae', 'qoder', 'buddy-ai', 'custom'];
+const POOL_KEYS = ['buddy', 'trae', 'qoder', 'buddy-ai', 'codearts', 'custom'];
 
 /** 全排列（per_model 候选序选项：n 池 n! 种，覆盖全部合法顺序） */
 function permutations(arr: string[]): string[][] {
@@ -162,13 +166,14 @@ function DispatchCenterCard({
   // 可见性变化后旧默认序不再在候选内时回落首个可见序（四池全隐藏时为空串 = 禁用新增绑定）
   const newOrderEff = poolOrders.includes(newPerModelOrder) ? newPerModelOrder : (poolOrders[0] ?? '');
 
-  /** 统一保存入口：inter 走 dispatch_policy_set；trae/buddy/qoder/buddyAi 走 pool_set（未传维度保留原值） */
+  /** 统一保存入口：inter 走 dispatch_policy_set；trae/buddy/qoder/buddyAi/codearts 走 pool_set（未传维度保留原值） */
   const save = async (patch: {
     inter?: DispatchPolicy['strategy'];
     trae?: string;
     buddy?: string;
     qoder?: string;
     buddyAi?: string;
+    codearts?: string;
   }) => {
     if (!pool) return;
     // F2 序号守卫（与 savePolicy 同类竞态）：池内策略快速连续修改时保存响应可能
@@ -188,7 +193,7 @@ function DispatchCenterCard({
         pool.enabled_uids,
         patch.trae,
         pool.group_ids,
-        { qoderStrategy: patch.qoder, buddyAiStrategy: patch.buddyAi },
+        { qoderStrategy: patch.qoder, buddyAiStrategy: patch.buddyAi, codeartsStrategy: patch.codearts },
         patch.buddy,
       );
       if (seq === saveSeqRef.current) {
@@ -208,6 +213,7 @@ function DispatchCenterCard({
               ...(patch.buddy !== undefined ? { wb_strategy: patch.buddy } : null),
               ...(patch.qoder !== undefined ? { qoder_strategy: patch.qoder } : null),
               ...(patch.buddyAi !== undefined ? { buddy_ai_strategy: patch.buddyAi } : null),
+              ...(patch.codearts !== undefined ? { codearts_strategy: patch.codearts } : null),
             });
           }
           toast('success', '调度策略已保存，运行中网关即时生效');
@@ -320,7 +326,14 @@ function DispatchCenterCard({
                 title={p.desc}
                 disabled={!pool || saving}
                 onClick={() =>
-                  void save({ inter: p.inter, trae: p.trae, buddy: p.buddy, qoder: p.qoder, buddyAi: p.buddyAi })
+                  void save({
+                    inter: p.inter,
+                    trae: p.trae,
+                    buddy: p.buddy,
+                    qoder: p.qoder,
+                    buddyAi: p.buddyAi,
+                    codearts: (p as { codearts?: string }).codearts,
+                  })
                 }
                 className={`flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors disabled:opacity-50 ${
                   active
@@ -626,6 +639,24 @@ function DispatchCenterCard({
               </select>
             </label>
           )}
+          {isPoolVisible(settings, 'codearts') && (
+            <label className="flex items-center gap-2">
+              <span className="text-slate-400 dark:text-zinc-500">CodeArts 池</span>
+              <select
+                className={selectCls}
+                value={pool?.codearts_strategy ?? ''}
+                disabled={!pool || saving}
+                onChange={(e) => void save({ codearts: e.target.value })}
+              >
+                <option value="">跟随 Trae 池</option>
+                {STRATEGIES.map((s) => (
+                  <option key={s} value={s}>
+                    {STRATEGY_LABELS[s]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <span className="text-slate-400 dark:text-zinc-500">
             自定义模型：<span className="text-slate-700 dark:text-zinc-200">命中即直达</span>（上游自有计费，无池内调度）
           </span>
@@ -645,7 +676,8 @@ export default function ResourceSummary() {
   const [wbAccounts, setWbAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [qoderAccounts, setQoderAccounts] = useState<QoderAccountView[]>([]);
   const [buddyAiAccounts, setBuddyAiAccounts] = useState<BuddyAiAccountView[]>([]);
-  // 共享标签（Buddy/Qoder/BuddyAI 池内口径的标签筛选 ∩ 集合，与后端装配一致）
+  const [codeartsAccounts, setCodeartsAccounts] = useState<CodeartsAccountView[]>([]);
+  // 共享标签（Buddy/Qoder/BuddyAI/CodeArts 池内口径的标签筛选 ∩ 集合，与后端装配一致）
   const [tags, setTags] = useState<TagView[]>([]);
   const [customModels, setCustomModels] = useState<CustomModel[]>([]);
 
@@ -680,6 +712,12 @@ export default function ResourceSummary() {
       .catch(() => {
         /* 保留空摘要 */
       });
+    api.codearts
+      .accountsList()
+      .then(setCodeartsAccounts)
+      .catch(() => {
+        /* 保留空摘要 */
+      });
     api.tags
       .list()
       .then(setTags)
@@ -694,7 +732,7 @@ export default function ResourceSummary() {
       });
   }, []);
 
-  // 五池摘要指标（池内成员与积分口径的纯计算见 poolMetrics.ts，含单测）
+  // 六池摘要指标（池内成员与积分口径的纯计算见 poolMetrics.ts，含单测）
   const metrics = computePoolMetrics(
     pool,
     accounts,
@@ -703,6 +741,7 @@ export default function ResourceSummary() {
     qoderAccounts,
     buddyAiAccounts,
     tags,
+    codeartsAccounts,
   );
   // Buddy 池内策略文案：空 = 加权公平轮转（WB 专属默认，PR #187；改前为跟随 Trae 池）
   const buddyStrategyText = pool?.wb_strategy
@@ -720,6 +759,12 @@ export default function ResourceSummary() {
     : pool?.strategy
       ? `跟随 Trae 池（${STRATEGY_LABELS[pool.strategy] ?? pool.strategy}）`
       : '—';
+  // CodeArts 池内策略文案：空 = 跟随 Trae 池（同 Qoder / BuddyAI 语义）
+  const codeartsStrategyText = pool?.codearts_strategy
+    ? (STRATEGY_LABELS[pool.codearts_strategy] ?? pool.codearts_strategy)
+    : pool?.strategy
+      ? `跟随 Trae 池（${STRATEGY_LABELS[pool.strategy] ?? pool.strategy}）`
+      : '—';
 
   // 自定义模型池：启用条目数 / 总条目数
   const customEnabled = customModels.filter((m) => m.enabled).length;
@@ -729,7 +774,7 @@ export default function ResourceSummary() {
       {/* 调度策略中心（预设 + 池间 + 池内集中管理，整宽一行） */}
       <DispatchCenterCard pool={pool} onPoolChanged={setPool} />
 
-      {/* 五池摘要卡（Trae / Buddy / Qoder / BuddyAI 国际 / 自定义）：两行一行三个，自适应宽度 */}
+      {/* 六池摘要卡（Trae / Buddy / Qoder / BuddyAI 国际 / CodeArts / 自定义）：两行一行三个，自适应宽度 */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
       {/* Trae 资源池摘要（应用隐藏时不渲染，数据照常统计） */}
       {isPoolVisible(settings, 'trae') && (
@@ -890,6 +935,46 @@ export default function ResourceSummary() {
         <p className="mt-3 border-t border-slate-100 pt-2 text-[11px] text-slate-400 dark:border-zinc-800 dark:text-zinc-500">
           <Layers size={11} className="mr-1 inline" />
           详情（上游开关 / 模型目录 / 账号池）见 BuddyAI 国际「资源调度」页
+        </p>
+      </div>
+      )}
+
+      {/* CodeArts 资源池摘要（应用隐藏时不渲染，数据照常统计） */}
+      {isPoolVisible(settings, 'codearts') && (
+      <div className="card p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <Layers size={16} className="text-orange-500" />
+          <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">CodeArts 池</span>
+          <Badge tone={metrics.codeartsEnabled ? 'green' : 'slate'}>
+            {metrics.codeartsEnabled ? '上游已启用' : '上游未启用'}
+          </Badge>
+        </div>
+        <div className="space-y-1.5">
+          <Row label="池内账号数" value={metrics.codeartsPoolCount} />
+          <Row
+            label="可用积分"
+            value={
+              <span className="font-semibold text-amber-600 dark:text-amber-400">
+                {metrics.codeartsPoolCredits != null ? fmtCredits(metrics.codeartsPoolCredits) : '未知'}
+              </span>
+            }
+          />
+          <Row label="账号总数" value={metrics.codeartsAccountTotal} />
+          <UnpooledRow total={metrics.codeartsAccountTotal} pooled={metrics.codeartsPoolCount} />
+          <Row
+            label="积分总余额"
+            value={
+              <span className="font-semibold text-amber-600 dark:text-amber-400">
+                {metrics.codeartsTotalCredits != null ? fmtCredits(metrics.codeartsTotalCredits) : '未知'}
+              </span>
+            }
+          />
+          <Row label="池内调度策略" value={codeartsStrategyText} />
+          <Row label="消耗口径" value="CodeArts 通用 credits" />
+        </div>
+        <p className="mt-3 border-t border-slate-100 pt-2 text-[11px] text-slate-400 dark:border-zinc-800 dark:text-zinc-500">
+          <Layers size={11} className="mr-1 inline" />
+          详情（上游开关 / 模型目录 / 账号清单）见 CodeArts「资源调度」页
         </p>
       </div>
       )}
