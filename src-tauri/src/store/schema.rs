@@ -31,6 +31,10 @@ pub const ROW_TABLES: &[&str] = &[
     "qoder_tokens",
     "qoder_checkin_results",
     "qoder_credits_history",
+    "codearts_accounts",
+    "codearts_tokens",
+    "codearts_checkin_results",
+    "codearts_credits_history",
 ];
 
 const DDL: &[&str] = &[
@@ -115,6 +119,27 @@ const DDL: &[&str] = &[
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
     "CREATE TABLE IF NOT EXISTS qoder_credits_history (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    // CodeArts（华为云码道，国内站）：AK/SK 凭据池 / token store / 签到结果（90 天）/ 积分快照（365 天）
+    "CREATE TABLE IF NOT EXISTS codearts_accounts (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS codearts_tokens (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS codearts_checkin_results (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS codearts_credits_history (
         pk         TEXT PRIMARY KEY,
         data       TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
@@ -299,6 +324,23 @@ const DDL: &[&str] = &[
         preview     TEXT NOT NULL DEFAULT ''
     )",
     "CREATE INDEX IF NOT EXISTS idx_custom_sessions_date ON custom_sessions(date)",
+    // 阶段2：CodeArts 网关请求级会话流水（无 compact 定时合并，仅保留期裁剪）。
+    // request_id 内部生成 uuid（纯 INSERT），session_id 预留（精简版空串）。
+    "CREATE TABLE IF NOT EXISTS codearts_sessions (
+        request_id  TEXT PRIMARY KEY,
+        session_id  TEXT NOT NULL DEFAULT '',
+        uid         TEXT NOT NULL DEFAULT '',
+        date        TEXT NOT NULL,
+        ts          INTEGER NOT NULL DEFAULT 0,
+        model       TEXT NOT NULL DEFAULT '',
+        pt          INTEGER NOT NULL DEFAULT 0,
+        ct          INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        stream      INTEGER NOT NULL DEFAULT 0,
+        ok          INTEGER NOT NULL DEFAULT 1,
+        preview     TEXT NOT NULL DEFAULT ''
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_codearts_sessions_date ON codearts_sessions(date)",
     // P6 流水迁出：会话粘性绑定（原 kv wb_sticky_sessions；过期项落库前清理）
     "CREATE TABLE IF NOT EXISTS sticky_bindings (
         key        TEXT PRIMARY KEY,

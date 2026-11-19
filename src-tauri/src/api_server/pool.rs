@@ -80,6 +80,16 @@ impl PoolStrategy {
         })
     }
 
+    /// CodeArts 池生效策略：codearts_strategy 独立配置优先；空 = 跟随 Trae 池。
+    /// 隔离理由同 resolve_qoder
+    pub fn resolve_codearts(strategy: &str, codearts_strategy: &str) -> Self {
+        Self::parse(if codearts_strategy.is_empty() {
+            strategy
+        } else {
+            codearts_strategy
+        })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExpireFirst => "expire_first",
@@ -770,6 +780,51 @@ impl ApiPool {
         }
     }
 
+    /// 从 CodeArts 账号同步池（阶段2）：专用池实例，全量重建语义同 sync_from_wb。
+    /// AK/SK 明文不入池（jwt 槽位留空），请求期真凭证由 codearts_identity 回调
+    /// 按次解析；enabled 列表即生效入池白名单，空令牌账号（无 AK/SK）跳过。
+    pub fn sync_from_codearts(&self, accounts: &[CodeartsSyncAccount], enabled: &[String]) {
+        let mut entries = safe_lock(&self.entries);
+        entries.clear();
+        let enabled_set: HashSet<&str> = enabled.iter().map(|s| s.as_str()).collect();
+        for a in accounts {
+            if !enabled_set.contains(a.uid.as_str()) || !a.enabled {
+                continue;
+            }
+            entries.insert(
+                a.uid.clone(),
+                PoolEntry {
+                    uid: a.uid.clone(),
+                    name: a.name.clone(),
+                    // AK/SK 零明文：池内凭证槽位恒空
+                    jwt: String::new(),
+                    credits: a.credits,
+                    credits_expire_at: a.credits_expire_at,
+                    credits_fetched_at: a.credits_fetched_at,
+                    disabled: false,
+                    err_count: 0,
+                    until: 0,
+                    reason: String::new(),
+                    device_id: String::new(),
+                    machine_id: String::new(),
+                    hard_until: 0,
+                    last_used: 0,
+                    successes: 0,
+                    failures: 0,
+                    cb_trips: 0,
+                    domain: String::new(),
+                    enterprise_id: String::new(),
+                    global_region: false,
+                    refresh_invalid: false,
+                },
+            );
+        }
+        {
+            let mut inflight = safe_lock(&self.inflight);
+            inflight.retain(|uid, _| entries.contains_key(uid));
+        }
+    }
+
     /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None。
     /// `skip_credit_filters`：跳过积分维度过滤（issue #111 免费模型豁免，
     /// 仅 Qoder 免费模型取号路径传 true），见 [`selectable`]
@@ -1450,6 +1505,21 @@ pub struct QoderSyncAccount {
     /// selectable 到期过滤的数据源；None = 无到期信息
     pub credits_expire_at: Option<i64>,
     /// 余额快照采集时间（Unix 秒）：reserve 过滤新鲜度门槛（issue #91 口径）
+    pub credits_fetched_at: Option<i64>,
+}
+
+/// CodeArts 账号入池同步结构（阶段2）：uid 即 codearts 账号 id（token store 键）。
+/// AK/SK 明文不随本结构入池（池内 jwt 槽位恒空，真凭证由 identity 回调按需解析）。
+pub struct CodeartsSyncAccount {
+    pub uid: String,
+    pub name: String,
+    /// 是否入池（有凭证 = true；无凭证账号跳过）
+    pub enabled: bool,
+    /// 余额快照（无快照/旧数据 = None，reserve 过滤 fail-open）
+    pub credits: Option<f64>,
+    /// 最早积分包到期（Unix 秒）；None = 无到期信息
+    pub credits_expire_at: Option<i64>,
+    /// 余额快照采集时间（Unix 秒）
     pub credits_fetched_at: Option<i64>,
 }
 

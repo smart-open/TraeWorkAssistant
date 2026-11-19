@@ -22,6 +22,12 @@ import type {
   CheckinTrendPoint,
   DeviceConflictGroup,
   CodeBuddyEnvCheck,
+  CodeartsAccountView,
+  CodeartsCheckinDone,
+  CodeartsCheckinLine,
+  CodeartsCheckinRecord,
+  CodeartsCreditsResult,
+  CodeartsSettings,
   CreditRecord,
   CreditDetail,
   CreditsDailySnapshot,
@@ -817,6 +823,47 @@ export const api = {
     /** 环境重置执行（M4；自动关闭 Qoder CN，单项失败不中断） */
     envReset: (items: string[]) => invoke<QoderResetResult[]>('qoder_env_reset', { items }),
   },
+  // ---- CodeArts（华为云码道，国内站；Rust commands/codearts；字段名严格 snake_case）----
+  codearts: {
+    accountsList: () => invoke<CodeartsAccountView[]>('codearts_accounts_list'),
+    /** AK/SK 手工录入（SK 仅提交一次，后端加密落库，前端不回显） */
+    accountImportAkSk: (name: string | undefined, ak: string, sk: string, groupId?: string | null) =>
+      invoke<CodeartsAccountView>('codearts_account_import_ak_sk', {
+        name: name ?? null,
+        ak,
+        sk,
+        group_id: groupId ?? null,
+      }),
+    accountSave: (id: string, name?: string, note?: string, groupId?: string | null) =>
+      invoke('codearts_account_save', {
+        id,
+        name: name ?? null,
+        note: note ?? null,
+        group_id: groupId ?? null,
+      }),
+    accountRemove: (id: string) => invoke('codearts_account_remove', { id }),
+    checkinStart: (opts?: { user_ids?: string[]; skip_checked_in?: boolean }) =>
+      invoke('codearts_checkin_start', {
+        user_ids: opts?.user_ids ?? null,
+        skip_checked_in: opts?.skip_checked_in ?? true,
+      }),
+    checkinResults: (days?: number) =>
+      invoke<CodeartsCheckinRecord[]>('codearts_checkin_results', { days: days ?? null }),
+    checkinTaskRegister: (times: string[]) => invoke('codearts_checkin_task_register', { times }),
+    checkinTaskStatus: () => invoke<string[]>('codearts_checkin_task_status'),
+    checkinTaskUnregister: () => invoke('codearts_checkin_task_unregister'),
+    creditsFetch: (userId?: string, fresh?: boolean) =>
+      invoke<CodeartsCreditsResult>('codearts_credits_fetch', {
+        user_id: userId ?? null,
+        fresh: fresh ?? null,
+      }),
+    creditsHistoryList: () => invoke<unknown>('codearts_credits_history_list'),
+    settingsGet: () => invoke<CodeartsSettings>('codearts_settings_get'),
+    settingsSet: (patch: CodeartsSettings) => invoke('codearts_settings_set', { patch }),
+    /** 华为云浏览器 OAuth 登录（PKCE+DPoP）；返回授权 URL 供手动兜底 */
+    oauthLogin: () => invoke<string>('codearts_oauth_login'),
+    oauthCancel: () => invoke('codearts_oauth_cancel'),
+  },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),
     parseCallback: (callbackUrl: string) =>
@@ -926,6 +973,26 @@ export const api = {
         buddyAiTagIds?: string[] | null;
         /** buddy-ai 池内调度策略（空串 = 跟随 Trae 池）；null/未传 = 保留原值 */
         buddyAiStrategy?: string;
+        /** CodeArts 上游开关（华为云码道）；null/未传 = 保留原值 */
+        codeartsEnabled?: boolean;
+        /** CodeArts 竞速对冲阈值毫秒（0 = 关闭）；null/未传 = 保留原值 */
+        codeartsHedgeThresholdMs?: number;
+        /** CodeArts 会话粘性开关；null/未传 = 保留原值 */
+        codeartsStickyEnabled?: boolean;
+        /** CodeArts 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        codeartsAccountConcurrencyLimit?: number;
+        /** CodeArts 池粘性 TTL 秒；null/未传 = 保留原值 */
+        codeartsPoolStickyTtlSecs?: number;
+        /** CodeArts 会话粘性 TTL 秒；null/未传 = 保留原值 */
+        codeartsStickyTtlSecs?: number;
+        /** CodeArts 池入池白名单（ca- 账号 id）；null/未传 = 保留原值 */
+        codeartsUids?: string[];
+        /** CodeArts 池分组筛选；null/未传 = 保留原值 */
+        codeartsGroupIds?: string[];
+        /** CodeArts 池标签筛选；null/未传 = 保留原值 */
+        codeartsTagIds?: string[] | null;
+        /** CodeArts 池内调度策略（空串 = 跟随 Trae 池）；null/未传 = 保留原值 */
+        codeartsStrategy?: string;
       },
       wbStrategy?: string,
     ) =>
@@ -971,6 +1038,16 @@ export const api = {
         buddyAiGroupIds: wbFlags?.buddyAiGroupIds ?? null,
         buddyAiTagIds: wbFlags?.buddyAiTagIds ?? null,
         buddyAiStrategy: wbFlags?.buddyAiStrategy ?? null,
+        codeartsEnabled: wbFlags?.codeartsEnabled ?? null,
+        codeartsHedgeThresholdMs: wbFlags?.codeartsHedgeThresholdMs ?? null,
+        codeartsStickyEnabled: wbFlags?.codeartsStickyEnabled ?? null,
+        codeartsAccountConcurrencyLimit: wbFlags?.codeartsAccountConcurrencyLimit ?? null,
+        codeartsPoolStickyTtlSecs: wbFlags?.codeartsPoolStickyTtlSecs ?? null,
+        codeartsStickyTtlSecs: wbFlags?.codeartsStickyTtlSecs ?? null,
+        codeartsUids: wbFlags?.codeartsUids ?? null,
+        codeartsGroupIds: wbFlags?.codeartsGroupIds ?? null,
+        codeartsTagIds: wbFlags?.codeartsTagIds ?? null,
+        codeartsStrategy: wbFlags?.codeartsStrategy ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
@@ -983,8 +1060,12 @@ export const api = {
     qoderPoolStatus: () => invoke<PoolStatus[]>('qoder_pool_status'),
     /** Buddy 国际版（buddy-ai）池实时状态（全局 API 管理·API Keys 调度配置候选） */
     buddyAiPoolStatus: () => invoke<PoolStatus[]>('buddy_ai_pool_status'),
+    /** CodeArts（华为云码道）池实时状态 */
+    codeArtsPoolStatus: () => invoke<PoolStatus[]>('codearts_pool_status'),
     /** 手动同步 Qoder 模型目录（复用每日调度任务入口；返回采纳模型数） */
     qoderCatalogSync: () => invoke<number>('qoder_catalog_sync'),
+    /** 手动同步 CodeArts 模型目录（复用每日调度任务入口；返回采纳模型数） */
+    codeArtsCatalogSync: () => invoke<number>('codearts_catalog_sync'),
     logsList: () => invoke<string[]>('api_logs_list'),
     logsDetail: (date: string) => invoke<string | null>('api_logs_detail', { date }),
     logsSearch: (opts: {
@@ -1084,6 +1165,9 @@ export const api = {
     // Qoder 上游用量统计（qoder_days 桶，与 Trae/WB/Custom 侧分账；上游接入前恒空）
     qoderUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_qoder_usage_stats', { days: days ?? null }),
+    // CodeArts 上游用量统计
+    codeArtsUsageStats: (days?: number) =>
+      invoke<UsageDayView[]>('api_codearts_usage_stats', { days: days ?? null }),
     // 自定义模型列表（custom_models.json，OpenAI 兼容上游直通）
     customModelsList: () => invoke<CustomModel[]>('custom_models_list'),
     // 保存自定义模型（upsert：id 空 = 新增；返回保存后的完整列表）
@@ -1283,6 +1367,12 @@ export interface ListenerHandlers {
   onProfileDone?: (e: ProfileDoneEvent) => void;
   /** Qoder 签到 NDJSON 进度（payload 为 JSON 字符串，归约前需 parse） */
   onQoderCheckinProgress?: (line: string) => void;
+  /** CodeArts 签到 NDJSON 进度（payload 为 JSON 字符串，归约前需 parse） */
+  onCodeartsCheckinProgress?: (line: string) => void;
+  /** CodeArts OAuth 登录进度 */
+  onCodeartsOAuthProgress?: (e: { stage: string; message: string; auth_url?: string | null }) => void;
+  /** CodeArts OAuth 登录终态 */
+  onCodeartsOAuthDone?: (e: { ok: boolean; id: string; name: string; message: string }) => void;
 }
 
 export async function setupListeners(
@@ -1371,6 +1461,29 @@ export async function setupListeners(
       unsubs.push(
         await listen<string>('qoder-checkin-progress', (e) =>
           handlers.onQoderCheckinProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onCodeartsCheckinProgress) {
+      unsubs.push(
+        await listen<string>('codearts-checkin-progress', (e) =>
+          handlers.onCodeartsCheckinProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onCodeartsOAuthProgress) {
+      unsubs.push(
+        await listen<{ stage: string; message: string; auth_url?: string | null }>(
+          'codearts-oauth-progress',
+          (e) => handlers.onCodeartsOAuthProgress!(e.payload),
+        ),
+      );
+    }
+    if (handlers.onCodeartsOAuthDone) {
+      unsubs.push(
+        await listen<{ ok: boolean; id: string; name: string; message: string }>(
+          'codearts-oauth-done',
+          (e) => handlers.onCodeartsOAuthDone!(e.payload),
         ),
       );
     }

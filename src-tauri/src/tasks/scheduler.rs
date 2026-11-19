@@ -78,6 +78,11 @@ const TASKS: &[SchedTask] = &[
     // F-80 Qoder 每日签到：默认 10:15 单次覆盖「0 点签到」与「10:00 登录奖励」双活动
     //（§2.2 调度设计结论；settings.qoder_checkin_hhmm 可改，任务配置页）
     SchedTask { key: "qoder-checkin", name: "Qoder 每日签到", hhmm: "10:15", kind: "fix" },
+    // CodeArts 每日签到（华为云码道，积分制套餐用户每日最高 1000 积分）：
+    // 默认 10:20 错峰 Qoder；开关/时刻由 codearts_settings 独立维护
+    SchedTask { key: "codearts-checkin", name: "CodeArts 每日签到", hhmm: "10:20", kind: "fix" },
+    // CodeArts 积分数据同步：每日 23:40 落快照（与 Trae/Qoder 同款 credits 模式）
+    SchedTask { key: "codearts-credits-snapshot", name: "CodeArts 积分数据同步", hhmm: "23:40", kind: "credits" },
     // Buddy 国际版每日活跃打卡（阶段 3b，§4.5 补篇）：网页会话 + 沙箱 ACP 跑完一轮
     // → completed 后服务端自动入账 30/50 积分（无 claim 端点）；默认 09:20 可改
     //（settings.buddy_ai_checkin_hhmm）；开关独立（buddy_ai_checkin_enabled，默认关）
@@ -122,6 +127,9 @@ const TASKS: &[SchedTask] = &[
     // Buddy 国际版模型目录同步（2026-10-16）：/v3/config 直连拉取（动态目录替换，
     // 与 API 服务启动挂点互补）；开关/时刻独立（默认开，05:55 错峰）
     SchedTask { key: "buddy-ai-catalog-sync", name: "Buddy 国际版模型目录同步", hhmm: "05:55", kind: "models" },
+    // CodeArts 模型目录同步：签名 GET /v1/model/builtin → 原子替换 kv 缓存；
+    // 默认开（无账号时内部静默跳过），05:58 错峰 Buddy 国际版
+    SchedTask { key: "codearts-catalog-sync", name: "CodeArts 模型目录同步", hhmm: "05:58", kind: "models" },
 ];
 
 /// 启动调度线程（main.rs setup 调用；启动 90s 后首跑，避开启动高峰）
@@ -400,6 +408,7 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "wb-credits-snapshot" => Some(st.settings().wb_credits_sync_hhmm),
         "trae-credits-snapshot" => Some(st.settings().trae_credits_sync_hhmm),
         "qoder-checkin" => Some(st.settings().qoder_checkin_hhmm),
+        "codearts-checkin" => Some(crate::commands::codearts::load_settings(st).checkin_hhmm),
         "buddy-ai-checkin" => Some(st.settings().buddy_ai_checkin_hhmm),
         "buddy-ai-renew" => Some(st.settings().buddy_ai_renew_hhmm),
         "buddy-ai-credits-sync" => Some(st.settings().buddy_ai_credits_sync_hhmm),
@@ -446,6 +455,10 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "wb-growth" => st.settings().wb_growth_enabled,
         // F-80 Qoder：签到跟随环境配置开关（qoder_settings.auto_checkin 默认开）
         "qoder-checkin" => crate::commands::qoder::load_settings(st).auto_checkin,
+        // CodeArts：签到跟随 codearts_settings.auto_checkin（默认开）
+        "codearts-checkin" => crate::commands::codearts::load_settings(st).auto_checkin,
+        // CodeArts 积分快照：每日一次恒开（无独立模式开关）
+        "codearts-credits-snapshot" => true,
         // Buddy 国际版每日活跃打卡（阶段 3b）：独立开关（默认关，国际档显式开启制）
         "buddy-ai-checkin" => crate::commands::workbuddy::buddy_ai_checkin_enabled(st),
         // Buddy 国际版凭证兜底续期（2026-10-16，默认开，任务配置页可关）
@@ -471,6 +484,8 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "buddy-ai-catalog-sync" => st.settings().buddy_ai_catalog_sync_enabled,
         "trae-models-sync" => st.settings().trae_models_sync_enabled,
         "qoder-catalog-sync" => st.settings().qoder_catalog_sync_enabled,
+        // CodeArts 模型目录同步：默认开（与其余 models 任务同款，空池内部静默跳过）
+        "codearts-catalog-sync" => true,
         // 其余任务幂等且低风险，恒开（Trae 签到 run_round 自带状态核验）
         _ => true,
     }
@@ -807,6 +822,26 @@ fn run_task(
         // runtime 传入网关运行态，成功行快照三键拨新进 qoder_pool（issue #102
         // 运行期保鲜，对齐 trae-credits-snapshot 的 issue #67 口径）
         "qoder-credits-snapshot" => super::qoder_credits::run_snapshot_task(st, runtime),
+        // CodeArts 每日签到：与 CLI 同款；空池豁免 + 暂态失败返 Err 交冷却重试，
+        // 永久认证失败与"未到刷新时间"剔除（重试注定失败/无意义）
+        "codearts-checkin" => {
+            let pool = crate::store::docs::codearts_pool_load_checked(&crate::store::db(&st.data_dir))
+                .map_err(|e| format!("CodeArts 账号池读取失败：{e}"))?;
+            if pool.get("accounts").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true) {
+                return Ok(json!({ "ok": true, "skipped": "无 CodeArts 账号", "skipped_empty_pool": true }));
+            }
+            let opts = super::codearts_checkin::CodeartsCheckinOpts::daily();
+            let done = super::codearts_checkin::run_checkin_round(st, &opts, &mut |_| {});
+            let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let failed_empty = done.get("failed_empty_campaigns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let failed_perm = done.get("failed_permanent").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            if failed - failed_empty - failed_perm > 0 {
+                return Err(format!("CodeArts 签到：{failed} 个账号失败（稍后自动重试）"));
+            }
+            Ok(done)
+        }
+        // CodeArts 积分快照（与 CLI 同款；空池空转）
+        "codearts-credits-snapshot" => super::codearts_credits::run_snapshot_task(st),
         // Qoder Token 定时刷新：与 `--task-run qoder-refresh` 同款（6h 周期，lazy 7h 惰性门；
         // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试）
         "qoder-refresh" => super::qoder_refresh::run_task(st),
@@ -825,6 +860,9 @@ fn run_task(
         // Qoder 模型目录同步：与 `--task-run qoder-catalog-sync` 同款（真签名拉
         // model/list → adopt_remote；空池/无凭证空转，网络失败返 Err 冷却重试）
         "qoder-catalog-sync" => super::qoder_catalog::run_task(st),
+        // CodeArts 模型目录同步：签名 GET /v1/model/builtin → 原子替换 kv 缓存
+        //（空池/无凭证空转，网络失败返 Err 冷却重试）
+        "codearts-catalog-sync" => super::codearts_catalog::run_task(st),
         // Buddy 国际版凭证兜底续期（lazy 48h）：无临期账号空转，全失败返 Err 冷却重试
         "buddy-ai-renew" => crate::commands::workbuddy::buddy_ai_renew_task(st),
         // Buddy 国际版积分数据同步（get-user-resource 全池取数 → 池回写 + 快照）：
@@ -1189,6 +1227,7 @@ mod tests {
             data_dir: dir,
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            codearts_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),

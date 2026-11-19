@@ -395,8 +395,10 @@ fn main() {
             commands::api_server::pool_status,
             commands::api_server::wb_pool_status,
             commands::api_server::qoder_pool_status,
+            commands::api_server::codearts_pool_status,
             commands::api_server::buddy_ai_pool_status,
             commands::api_server::qoder_catalog_sync,
+            commands::api_server::codearts_catalog_sync,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
             commands::api_server::api_logs_search,
@@ -410,6 +412,7 @@ fn main() {
             commands::api_server::api_buddy_ai_usage_stats,
             commands::api_server::api_custom_usage_stats,
             commands::api_server::api_qoder_usage_stats,
+            commands::api_server::api_codearts_usage_stats,
             commands::api_server::api_keys_list,
             commands::api_server::api_keys_save,
             commands::api_server::api_wb_catalog_sync,
@@ -609,6 +612,22 @@ fn main() {
             commands::qoder::qoder_accounts_import,
             commands::qoder::qoder_env_reset_items,
             commands::qoder::qoder_env_reset,
+            // CodeArts（华为云码道，国内站）：AK/SK 入池 + 每日签到 + 积分
+            commands::codearts::codearts_settings_get,
+            commands::codearts::codearts_settings_set,
+            commands::codearts::codearts_accounts_list,
+            commands::codearts::codearts_account_import_ak_sk,
+            commands::codearts::codearts_account_save,
+            commands::codearts::codearts_account_remove,
+            commands::codearts::codearts_checkin_start,
+            commands::codearts::codearts_checkin_results,
+            commands::codearts::codearts_checkin_task_register,
+            commands::codearts::codearts_checkin_task_status,
+            commands::codearts::codearts_checkin_task_unregister,
+            commands::codearts::codearts_credits_fetch,
+            commands::codearts::codearts_credits_history_list,
+            commands::codearts::codearts_oauth_login,
+            commands::codearts::codearts_oauth_cancel,
             tasks::scheduler::scheduler_status,
         ])
         .setup(|app| {
@@ -931,6 +950,13 @@ fn main() {
                 let app2 = app.handle().clone();
                 let st = app.state::<AppState>();
                 commands::qoder::startup_auto_checkin(&app2, &st);
+            }
+
+            // CodeArts 启动自动补签：独立开关，与 Qoder/WB 补签互不影响
+            {
+                let app2 = app.handle().clone();
+                let st = app.state::<AppState>().inner().clone();
+                commands::codearts::startup_auto_checkin(app2, st);
             }
 
             // CodeBuddy CLI 五重防护自动轮换（F-59）：独立后台线程按检查间隔执行，

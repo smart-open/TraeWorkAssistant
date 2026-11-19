@@ -161,6 +161,28 @@ impl WbSseParser<InterruptibleLines> {
     }
 }
 
+/// 码道（CodeArts）帧内错误码提取：`error_code` 是字符串业务码
+/// （`TM.00001041` / `InferHub.001001005.400` / `ModelArts.81003.401`），
+/// 数值形态解析不了，统一折叠为 1（非 0 即「有错」，数值仅用于
+/// `is_empty_completion` 之类按 0 判空的旧口径安全）。
+/// 返回 (数值码, 原始码字面量)：原始码必须进 message，否则归因与
+/// 分类（并发上限 / 参数错 / 模型抖动）全部丢失。
+fn codearts_error_of(v: &Value) -> Option<(i64, String)> {
+    let raw = v
+        .get("error_code")
+        .and_then(|c| c.as_str().or_else(|| c.as_i64().map(|_| "")))
+        .or_else(|| v.get("errorCode").and_then(Value::as_str))?;
+    if raw.is_empty() {
+        // error_code 为数值形态：视为有错，码值直接取用
+        let n = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+        if n == 0 {
+            return None;
+        }
+        return Some((n, n.to_string()));
+    }
+    Some((1, raw.to_string()))
+}
+
 /// 解析单条 data 载荷
 fn parse_data(data: &str) -> Option<WbEvent> {
     let t = data.trim();
@@ -174,9 +196,41 @@ fn parse_data(data: &str) -> Option<WbEvent> {
         Ok(v) => v,
         Err(_) => return None,
     };
+    // 码道错误帧（HTTP 200 + `error_code`/`error_msg`）：上游把并发会话上限
+    // （TM.00001041）、参数不合法（InferHub.001001005）、模型抖动
+    // （ModelArts.81003）等全塞在帧里下发。不认它就会落进下方 Chunk 分支
+    // 产出空 delta → 流结束零内容 → -9901「空完成」，真实原因被彻底吞掉，
+    // 账号还被误计 Server 熔断 30 分钟。只对「无 choices」的帧生效，
+    // 带正文的 chunk 不受影响。
+    if v.get("choices").map_or(true, |c| c.is_null()) {
+        if let Some((code, raw)) = codearts_error_of(&v) {
+            let detail = v
+                .get("error_msg")
+                .or_else(|| v.get("errorMsg"))
+                .or_else(|| v.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("upstream error");
+            return Some(WbEvent::Error {
+                code,
+                msg: format!("{raw} {detail}").trim().to_string(),
+            });
+        }
+    }
     // 错误帧：{"error": {...}}（与 OpenAI 一致；兼容顶层 code/message）。
     // filter null：{"error": null} 非错误帧（部分网关心跳形态），不得产生伪错误
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        // 码道偶尔把 error_code/error_msg 再包一层 error
+        if let Some((code, raw)) = codearts_error_of(err) {
+            let detail = err
+                .get("error_msg")
+                .or_else(|| err.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("upstream error");
+            return Some(WbEvent::Error {
+                code,
+                msg: format!("{raw} {detail}").trim().to_string(),
+            });
+        }
         let msg = err
             .get("message")
             .or_else(|| err.get("msg"))
@@ -1410,6 +1464,36 @@ mod tests {
         }
     }
 
+    /// CodeArts 错误帧（HTTP 200 + `error_code`/`error_msg`）必须识别为流内错误。
+    /// 漏认时落进 Chunk 空 delta → 流结束零内容 → -9901「空完成」，上游真实原因
+    /// （会话并发上限 / 参数不合法 / 模型抖动）被彻底吞掉，账号还会被误计
+    /// Server 熔断 30 分钟。
+    #[test]
+    fn parse_data_recognizes_codearts_error_frame() {
+        match parse_data(
+            r#"{"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)，请关闭部分会话后重试。","request_id":"r1"}"#,
+        ) {
+            Some(WbEvent::Error { msg, .. }) => {
+                assert!(msg.contains("TM.00001041"), "码值必须留在 message 里供归因: {msg}");
+                assert!(msg.contains("并发会话数已达上限"), "{msg}");
+            }
+            other => panic!("CodeArts 错误帧必须识别为 Error，实际 {other:?}"),
+        }
+        // 嵌套在 error 里的 error_code/error_msg 同口径
+        match parse_data(r#"{"error":{"error_code":"InferHub.001001005.400","error_msg":"The request param is invalid"}}"#) {
+            Some(WbEvent::Error { msg, .. }) => {
+                assert!(msg.contains("InferHub.001001005.400"), "{msg}");
+                assert!(msg.contains("param is invalid"), "{msg}");
+            }
+            other => panic!("嵌套 error 包裹必须识别为 Error，实际 {other:?}"),
+        }
+        // 正常 chunk（带 choices）不得被误判为错误
+        assert!(matches!(
+            parse_data(r#"{"choices":[{"delta":{"content":"hi"}}],"id":"c1"}"#),
+            Some(WbEvent::Chunk { .. })
+        ));
+    }
+
     /// 边缘加固：error 包裹块 null 值不产生伪错误；"choices": null 仍走顶层
     /// 错误判定（Some(Value::Null) 会绕过 is_none 漏检）
     #[test]
@@ -1889,5 +1973,63 @@ mod tests {
             "0 值别名不得遮蔽正值别名"
         );
         assert_eq!(usage["cache_creation_input_tokens"], json!(5));
+    }
+
+    /// 端到端：码道流内错误帧（零正文）必须原样上抛真实错误，而不是退化成
+    /// -9901「空完成」。这是用户侧症状的**精确复现**——上游 HTTP 200 + 一帧
+    /// error_code 之后直接 EOF 时，修复前调用方只看到「零内容」。
+    #[test]
+    fn codearts_error_frame_surfaces_real_error_not_empty_completion() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = lines(&[
+            "data: {\"error_code\":\"TM.00001041\",\"error_msg\":\"并发会话数已达上限(3个)，请关闭部分会话后重试。\"}",
+            "",
+        ]);
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-3", "deepseek-v4.1-flash",
+            &HashSet::new(), None,
+        );
+        let (code, msg) = err.expect("流内错误帧必须上抛错误（未流出任何内容）");
+        assert!(
+            !crate::api_server::is_empty_completion(code, &msg),
+            "不得退化成空完成哨兵：code={code} msg={msg}"
+        );
+        assert!(msg.contains("TM.00001041"), "真实错误码必须保留: {msg}");
+        assert!(msg.contains("并发会话数已达上限"), "真实原因必须保留: {msg}");
+        assert!(!sent_any, "首帧即错误，不得向客户端下发内容帧");
+        assert!(!failed_inline);
+        // 客户端一个字节都没收到（错误在换号重试前不下发）
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// 对照：真正零内容的 EOF（影子风控）仍必须走 -9901 哨兵换号重试，
+    /// 本次修复不得把「上游确实什么都没给」误判成业务错误。
+    #[test]
+    fn silent_eof_still_yields_empty_completion_sentinel() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = lines(&["", ""]);
+        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-4", "m", &HashSet::new(), None,
+        );
+        let (code, msg) = err.expect("零内容 EOF 必须上抛哨兵");
+        assert_eq!(code, crate::api_server::EMPTY_COMPLETION_CODE);
+        assert!(crate::api_server::is_empty_completion(code, &msg));
+        assert!(!sent_any && !failed_inline);
+    }
+
+    /// 非流式聚合路径同口径：错误帧必须让 aggregate 返回错误而非空 completion
+    #[test]
+    fn aggregate_reports_codearts_error_frame() {
+        let (resp, err) = aggregate(
+            lines(&[
+                "data: {\"error_code\":\"InferHub.001001005.400\",\"error_msg\":\"The request param is invalid\"}",
+                "",
+            ]),
+            "chat-5",
+            None,
+        );
+        assert!(resp.is_none(), "错误帧不得被聚合成空 completion");
+        let (_code, msg) = err.expect("必须返回错误");
+        assert!(msg.contains("InferHub.001001005.400"), "{msg}");
     }
 }

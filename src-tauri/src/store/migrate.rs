@@ -613,6 +613,7 @@ fn import_api_usage(store: &Store, path: &Path) -> ImportStatus {
                     (&f.custom_days, &mut cur.custom_days),
                     (&f.qoder_days, &mut cur.qoder_days),
                     (&f.buddy_ai_days, &mut cur.buddy_ai_days),
+                    (&f.codearts_days, &mut cur.codearts_days),
                 ] {
                     for (day, stats) in src {
                         dst.entry(day.clone()).or_insert_with(|| stats.clone());
@@ -1441,6 +1442,7 @@ mod tests {
             data_dir: dir.clone(),
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            codearts_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             wb_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             buddy_ai_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             doubao_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),

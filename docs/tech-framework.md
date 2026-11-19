@@ -4,6 +4,7 @@
 > 产品侧（需求/交互/界面）见 [product-design.md](product-design.md)；未排期优化项见 [backlog.md](backlog.md)（WorkBuddy 接入蓝本协议事实已归并至本文附录 B）。
 > **完整 Tauri 命令契约表以根目录 `AGENT.md` §5 为权威**，本文只保留契约概览与协议细节，避免双维护漂移。
 > **v3.7.0 变更**（2026-10-06，随 F-80 Qoder 支持同步）：① API 网关由三池升级为 **trae / buddy / qoder / custom 四池调度**，Qoder 池以 COSY 签名接入上游（§5.4–5.6）；② Qoder 账号三通道入池（PAT / OAuth 设备流 / IDE 登录态扫描）+ 双活动签到 + 积分看板三平台化（§3、§6、附录 C）；③ 切换器扩展为**七应用档案表**（新增 Qoder IDE / Qoder Work）与设备指纹覆写（§5.3）。
+> **当前网关池状态**：在上述四池之上，custom 已转正为第五池、CodeArts（华为云码道，国内站）作为第六池加入，现为 **trae / buddy / qoder / codearts / custom / buddy-ai 六池调度**（§5.5）。
 
 ## 1. 技术选型
 
@@ -13,10 +14,10 @@
 | 外壳 | Tauri 2.x（Rust 1.85+ MSVC，Cargo.toml rust-version） | 包体 8~15MB（远小于 Electron），可调用系统 API（注册表/证书/计划任务/DPAPI） |
 | 核心逻辑 | Rust（`src-tauri/src/tasks/` 直调模块） | 原 Python 脚本已全部重写为 Rust 后台任务（trae_checkin / wb_* / doubao_* / qoder_* / device_proxy），无子进程、无解释器依赖 |
 | 登录态切换 | Rust `switcher/` 模块（七应用档案表 × 4 快照布局驱动，进程内直调） | 原 `trae-switch-bridge.ps1` 已全量 Rust 化：sysinfo 进程管理 + windows-registry + lnk 解析，无外部运行时 |
-| API 网关 | Rust axum（内嵌，复用 Tauri tokio runtime） | OpenAI / Anthropic 双协议端点 + SSE 转换 + 账号池调度（四池），无独立进程 |
+| API 网关 | Rust axum（内嵌，复用 Tauri tokio runtime） | OpenAI / Anthropic 双协议端点 + SSE 转换 + 账号池调度（六池），无独立进程 |
 | HTTP 客户端 | ureq（同步）+ `spawn_blocking` 包装 | 双 Client 设计：短请求 120s 超时 / 流式仅 ResponseHeaderTimeout 120s，共享连接池 |
 | 加密 | tauri-plugin-stronghold + windows-sys(DPAPI) | jwt/refresh_token 入 vault，主密码经 DPAPI 仅本机当前用户可解 |
-| 测试 | cargo test + vitest | Rust 700+ 用例（tasks/qoder_* 签名与上游、api_server/dispatch 四池调度、switcher 纯函数） / 前端 `src/lib/format.test.ts` |
+| 测试 | cargo test + vitest | Rust 700+ 用例（tasks/qoder_*、codearts_sign 签名与上游、api_server/dispatch 六池调度、switcher 纯函数） / 前端 `src/lib/format.test.ts` |
 | 打包 | Tauri Bundler → MSI / NSIS（自定义模板） | 全 Rust 零外部运行时（Python 与 PowerShell 均已移除）；产物经 `scripts/rename_release.mjs` 输出中文命名到 release/ |
 
 **不采用**：Electron（体积过大）、WPF/WinUI（样式成本高）、PyQt（视觉不达要求）、React Router/Redux（依赖最小原则）。
@@ -48,7 +49,7 @@ Bridge        Tauri Commands（src-tauri/src/commands/，注册表见 main.rs `g
                               + WB 池（wb_route/wb_payload/wb_sse/wb_upstream/wb_responses/wb_images/wb_sticky/wb_toolexec/wb_catalog/wb_model_route）
                               + Qoder 池（qoder_route：hedge 竞速 / 排队退避 / 模型级冷却 / 粘性选号，
                                 上游签名与协议在 tasks/qoder_sign.rs + qoder_upstream.rs）
-                              + 四池调度（dispatch/unified_catalog/custom_models/custom_route/retry/api_keys/gateway_settings/config_cache/efforts）
+                              + 六池调度（dispatch/unified_catalog/custom_models/custom_route/codearts_route/retry/api_keys/gateway_settings/config_cache/efforts）
 Rust Tasks    tasks/（trae_checkin / wb_checkin / wb_common / wb_credits / ui_click / doubao_session / doubao_quota / doubao_chats
               / qoder_checkin / qoder_credits / qoder_refresh / qoder_catalog / qoder_common / qoder_sign / qoder_upstream / qoder_device
               —— Qoder 上游 COSY 签名与协议层集中于 tasks/qoder_sign.rs + qoder_upstream.rs，网关与签到共用
@@ -96,8 +97,8 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 | `credits_history` / `credits_daily` / `remaining_credits`（表） | 积分明细 / 每日三线快照 / 剩余积分缓存（裁剪 90~365 天） |
 | `checkin_results`（表） | 签到最终态按日落库（T8，保留 90 天） |
 | `account_cooldowns`（表） | 签到错误冷却状态 |
-| `api_pool`（kv） | 四池配置：账号池 enabled_uids + `strategy`(expire_first/credit_first/random/weighted/p2c) + `group_ids` + **每池独立开关** `trae_enabled` / `wb_enabled` / `qoder_enabled` 及各池同构参数（详见 §5.5） |
-| `api_keys`（表）/ `api_usage`（表）/ `api_models`（kv） | 多 API Key+每日配额 / 用量按日统计（`(bucket, day)` 复合主键，Qoder 桶 `UsageBucket::Qoder`）/ 模型目录 |
+| `api_pool`（kv） | 六池配置：账号池 enabled_uids + `strategy`(expire_first/credit_first/random/weighted/p2c) + `group_ids` + **每池独立开关** `trae_enabled` / `wb_enabled` / `qoder_enabled` / `codearts_enabled` 及各池同构参数（详见 §5.5） |
+| `api_keys`（表）/ `api_usage`（表）/ `api_models`（kv） | 多 API Key+每日配额 / 用量按日统计（`(bucket, day)` 复合主键，含 `UsageBucket::Qoder` / `UsageBucket::CodeArts` 等分桶）/ 模型目录 |
 | `data/profiles*/`、`doubao_chats/`、`exports/`、`certs/` | 快照槽（current_account.txt + <uid> 槽位 + .bak 单代回滚）/ 对话备份 / 导出产物 / 自签 CA——保留文件形态不入库 |
 | `doubao_accounts`（表）/ `doubao_captured_credentials`（kv）/ `doubao_health_events`（表） | 豆包账号池 / 抓包凭证回写 / 运维健康史 |
 | `qoder_accounts`（表） | Qoder 账号池（行文档，pk 例外采用 seq 自增保序）：`QoderAccount`{ id(`qd-<hex12>`) / uid / plan(free·pro·pro+·teams) / `credential_source`(pat·ide_store·qoderwork_store·mitm·cli) / `needs_relogin` / `device_profile` } |
@@ -105,6 +106,9 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 | `qoder_checkin_results`（表） | 双活动签到结果，pk = `{date}\|{uid}\|{tail}`，90 天逐 pk DELETE 滚动 |
 | `qoder_credits_history`（表） | 每日积分快照，pk = date 同日覆盖，365 天裁剪；kv `qoder_credits_cache` 读缓存 TTL 600s + stale-on-error |
 | kv `qoder_settings` / `qoder_groups` | Qoder 自动签到开关与调度时刻设置 / Qoder 分组 |
+| `codearts_accounts`（表）/ `codearts_tokens`（表） | CodeArts（华为云码道，国内站）AK/SK 账号池 / token store；AK/SK 敏感字段入 vault，库内占位 |
+| `codearts_checkin_results`（表）/ `codearts_credits_history`（表） | CodeArts 签到结果（90 天滚动）/ 每日积分快照（365 天，每日签到最高 1000 积分，积分制套餐用户） |
+| kv `codearts_settings` | CodeArts 自动签到开关与调度时刻 / 网关上游开关 |
 | `logs/` | proxy / checkin / switcher / api / proxy-requests / app.log |
 
 账号唯一主键 `UserID`（JWT payload `data.id`）。**红线**：账户中心 dc id与 Cloud-IDE id 两套 id 空间不通用，混用会产生重复账号。
@@ -183,12 +187,12 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 - 账号池 app 无关：Trae 账号入池即被同一网关服务（通用积分 208）。
 - **Qoder 池（v3.7.0）**：命中 Qoder 源模型时由 `qoder_route.rs` 执行，上游为 Qoder agent 网关（非 OpenAI 兼容协议，需 COSY 签名 + 请求体加密 + SSE 信封翻译，详见 §5.6 与附录 C）。
 
-### 5.5 多池调度与统一模型目录（v3.3.x 起；v3.7.0 扩四池；v3.8.x custom 转正第五池）
+### 5.5 多池调度与统一模型目录（v3.3.x 起；v3.7.0 扩四池；v3.8.x custom 转正第五池；现为六池）
 
-- **资源池**：`trae`（SOLO `llm_utils_chat`，积分 208）/ `buddy`（copilot.tencent.com 或 www.workbuddy.ai `/v2/chat/completions`）/ `qoder`（`gateway.qoder.com.cn` agent 上游，COSY 签名，见 §5.6）/ `custom`（自定义 OpenAI 兼容**上游组**，`custom_models` 表，同名多条 = 上游组；**v3.8.x 起为第五资源池参与统一调度，默认候选序尾部兜底**，纯 custom 模型唯一源直达）。
-- **池开关（`ApiPoolFile`，`models.rs`；持久化为 kv 键 `api_pool`，非独立文件）**：`trae_enabled`(默认 true) / `wb_enabled`(默认 false) / **`qoder_enabled`(默认 false)**，运行期镜像为 `ApiSharedState` 的 `AtomicBool` 三兄弟，`pool_set` 命令保存后热更新（`Ordering::Relaxed` store），无需重启。Qoder 池同构参数组：`qoder_enabled_uids`（`qd-` 前缀白名单，空 = fail-open 全池入池）/ `qoder_group_ids` / `qoder_strategy` / `qoder_hedge_threshold_ms` / `qoder_sticky_enabled` / `qoder_account_concurrency_limit`(默认 1) / `qoder_pool_sticky_ttl_secs`(默认 300) / `qoder_sticky_ttl_secs`(默认 1800)；trae_/wb_ 各有同构三参数。
-- **池间策略（`dispatch.rs` → kv 键 `dispatch_policy`）**：`TargetPool { Trae, Buddy, Custom, Qoder, BuddyAi }`；`smart`（默认：复合键 `SmartKey = (池内最早积分到期, 模型倍率小者, 健康账号积分总和多)`，custom 倍率键取组内最小 rate、到期/积分后置，并列回退固定序）/ `priority`（严格按 priority 数组取首个可用池）；默认优先级 `["buddy","trae","qoder"]`（尾部补全循环追加 custom 兜底位）；`per_model` 模型级覆盖优先于智能重排（值可写 `"custom"` 任意位置）；`fallback` 开关控制多源模型是否跨池回退。`TargetPool::parse` 接受 trae/buddy/qoder/**custom**（`custom/模型名` 前缀锁池直达；Key 绑定 "custom" 同语义：优先 + 不可用按序回退）。
-- **`resolve_target` 主流程**：② Buddy 模型归一化（含 buddy-ai Intl 目录折入）→ ③ Trae 源解析 → ③⁻ Qoder 源解析（`qoder_upstream::resolve(model, QoderRegion::Cn)`，**v1 调度恒 CN 区执行**）→ 源集合（buddy + trae + qoder + custom 上游组四源并行判定）→ 池开关检查（`DispatchError::{TraeDisabled, WbDisabled, QoderDisabled}`，custom 源存在时不早退）→ Key 绑定池 → 池粘性 `pool_sticky` → 候选序 → `pool_health`（custom 侧查组内任一上游未熔断；Qoder 侧查 `model_cooling_remaining_secs` + `has_selectable_in`）→ 跨池 fallback。
+- **资源池**：`trae`（SOLO `llm_utils_chat`，积分 208）/ `buddy`（copilot.tencent.com 或 www.workbuddy.ai `/v2/chat/completions`）/ `qoder`（`gateway.qoder.com.cn` agent 上游，COSY 签名，见 §5.6）/ `codearts`（华为云码道国内站，AK/SK 长期凭据 + 华为云 APIG `SDK-HMAC-SHA256` 签名，上游 snap 引擎 `snap-access.cn-north-4.myhuaweicloud.com`，**第六资源池**参与统一调度，与其余池同款开关 / 调度参数 / 用量分桶；见 §5.7）/ `custom`（自定义 OpenAI 兼容**上游组**，`custom_models` 表，同名多条 = 上游组；**v3.8.x 起为第五资源池参与统一调度，默认候选序尾部兜底**，纯 custom 模型唯一源直达）。
+- **池开关（`ApiPoolFile`，`models.rs`；持久化为 kv 键 `api_pool`，非独立文件）**：`trae_enabled`(默认 true) / `wb_enabled`(默认 false) / **`qoder_enabled`(默认 false)** / **`codearts_enabled`(默认 false)**，运行期镜像为 `ApiSharedState` 的 `AtomicBool` 各池开关，`pool_set` 命令保存后热更新（`Ordering::Relaxed` store），无需重启。Qoder 池同构参数组：`qoder_enabled_uids`（`qd-` 前缀白名单，空 = fail-open 全池入池）/ `qoder_group_ids` / `qoder_strategy` / `qoder_hedge_threshold_ms` / `qoder_sticky_enabled` / `qoder_account_concurrency_limit`(默认 1) / `qoder_pool_sticky_ttl_secs`(默认 300) / `qoder_sticky_ttl_secs`(默认 1800)；trae_/wb_/codearts_ 各有同构参数组。
+- **池间策略（`dispatch.rs` → kv 键 `dispatch_policy`）**：`TargetPool { Trae, Buddy, Custom, Qoder, BuddyAi, CodeArts }`；`smart`（默认：复合键 `SmartKey = (池内最早积分到期, 模型倍率小者, 健康账号积分总和多)`，custom 倍率键取组内最小 rate、到期/积分后置，并列回退固定序）/ `priority`（严格按 priority 数组取首个可用池）；默认优先级 `["buddy","trae","qoder","codearts"]`（尾部补全循环追加 custom 兜底位）；`per_model` 模型级覆盖优先于智能重排（值可写 `"custom"` 任意位置）；`fallback` 开关控制多源模型是否跨池回退。`TargetPool::parse` 接受 trae/buddy/qoder/codearts/**custom**（`custom/模型名` 前缀锁池直达；Key 绑定 "custom" 同语义：优先 + 不可用按序回退）。
+- **`resolve_target` 主流程**：② Buddy 模型归一化（含 buddy-ai Intl 目录折入）→ ③ Trae 源解析 → ③⁻ Qoder 源解析（`qoder_upstream::resolve(model, QoderRegion::Cn)`，**v1 调度恒 CN 区执行**）→ ③˙ CodeArts 源解析（snap 引擎模型目录）→ 源集合（buddy + trae + qoder + codearts + custom 上游组五源并行判定）→ 池开关检查（`DispatchError::{TraeDisabled, WbDisabled, QoderDisabled, CodeartsDisabled}`，custom 源存在时不早退）→ Key 绑定池 → 池粘性 `pool_sticky` → 候选序 → `pool_health`（custom 侧查组内任一上游未熔断；Qoder / CodeArts 侧查 `model_cooling_remaining_secs` + `has_selectable_in`）→ 跨池 fallback。
 - **统一模型目录（`unified_catalog.rs`）**：`api_unified_models` 命令与 `GET /v1/models` 共用**多源合并视图**（Trae 官网同步 + WB 目录 + Qoder 目录 + 自定义模型上游组），canonical_id 归并（trim+lowercase）；同 canonical 多条 custom 条目聚合为单行（倍率取组内最小）；模型元数据四层兜底（L1 人工覆盖 `trae_model_meta.json` → L2 官网同步 → L3 默认 128K/倍率参考 → L4 系列/思考档位/图片支持推断）。
 - **自定义模型上游组（`custom_models.rs` / `custom_lb.rs` / `custom_route.rs`）**：upsert 校验（name/base_url 必填、仅拒绝完全重复「同名+同 base_url+同 api_key」、id `cm-<12hex>` 自动生成；条目含 `weight`/`standby`）；组内 `custom_lb::pick_upstream` 加权轮询（粘性 TTL 60s、standby 备胎 failover）+ 实例级熔断（30s×2ⁿ 封顶 480s，401/403/402 长 600s，成功即清重启清零）；执行路径专用 agent 连接 3s 快速失败、`!sent_any` 组内轮换（≤ min(N,3)）；`chat_url` 归一（base 含 `/v1` 与否两种形态）；`custom_model_test` 连通性测试与保存同口径预检；`custom_lb_status` 熔断快照。
 - **热路径缓存（`config_cache.rs`）**：调度配置 5s TTL + 写失效，避免每请求读 SQLite（F-79 过渡方案之一）。
@@ -226,6 +230,20 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 | `qoder-sessions-compact` | 每 6h | 会话流水定时合并：早于保留窗（默认 3 天，`qoder_sessions_compact_days` 可配 1..=90）的 `qoder_sessions` 请求行按 (date, uid, preview) 合并单行（幂等自愈，积分/token 合计不变；历史行 session_id 为随机值故按 preview 归并；展示层 `qoder_sessions_query` 另有两遍读时聚合：session_id 桶 + preview 归并；`qoder_session_detail_query` 支持会话行展开看各轮请求级明细，轮键 = 信封 `chat_record_id`） | `qoder_sessions_compact_enabled`（默认开）/ `qoder_sessions_compact_days`（默认 3） |
 
 双轨机制：以上为应用内轨道（60s tick + 启动补跑 + 30min `RETRY_COOLDOWN_MS` + `scheduler_state.json` + `scheduler_status` 命令）；另一轨为 Windows `schtasks` 每日任务经主 exe `--task-run <name>` 兜底直调，注册命令 `qoder_checkin_task_register(times)`（配套 `_status` / `_unregister`）。
+
+### 5.7 CodeArts 池与每日签到（华为云码道，国内站）
+
+**凭据与签名（`tasks/codearts_sign.rs`）**
+- 凭据两种来源：① 手工 AK/SK（长期密钥，入口 `codearts_account_import_ak_sk`，按 ak/sk 稳定派生 `ca-` id）；② 浏览器 OAuth（`commands/codearts/oauth.rs` + `tasks/codearts_oauth.rs`，PKCE S256 + ES256 DPoP，本地回环 `127.0.0.1:17389` 收 code → STS `/v1/oauth2/tokens` 换临时 AK/SK+security_token+refresh_token，按稳定 user_id 派生 `ca-o-` id）。敏感字段（含 refresh_token/verifier/DPoP 私钥）明文唯一驻 vault(ns=codearts)，DB 恒占位；OAuth 凭据到期前 30min 经 `ensure_fresh_creds` 静默续期（按账号串行锁，防 refresh_token 轮转下重复续期）。
+- 上游固定区域 `cn-north-4`，主机 `snap-access.cn-north-4.myhuaweicloud.com`（模型推理 / 活动签到 / 模型目录 / 积分统计共用 snap 引擎）。
+- 所有上游请求做华为云 APIG `SDK-HMAC-SHA256` 签名：头名小写按字典序排序，`CanonicalRequest` = METHOD + URI(带尾斜杠) + CanonicalQuery + CanonicalHeaders + SignedHeaders + SHA256(body)，`StringToSign` = `SDK-HMAC-SHA256` + `x-sdk-date` + SHA256(CanonicalRequest)，签名 = HMAC-SHA256(SK, StringToSign) 十六进制，`Authorization: SDK-HMAC-SHA256 Access={AK}, SignedHeaders={...}, Signature={...}`。OAuth 临时凭据模式额外把 `x-security-token` 与 `x-sdk-content-sha256` 纳入签名头集（`CodeartsIdentity::new_oauth` / `identity_from_creds`），手工 AK/SK 模式头集不变（5 个签名向量单测锁定）。
+- 关键坑：`/v1/ops/*` 可选头必须小写 `agent-type: PromptCenter`（大写被当系统头不入 SignedHeaders → 401 APIG.0301）；`/v1/ops/*` 前缀不能带 `snap-manager`，而积分统计 `/snap-manager/v1/statistics/plugin` 必须带；模型目录 `/v1/model/builtin` 同样必须带 `agent-type: PromptCenter`，否则 400 `TM.00001001 请求头Agent-Type为空`。STS token 端点（OAuth）只认 `DPoP` 头，绝不能发 `Authorization`（会被当 AK/SK 解析而 401 APIGW.0301）。
+- 真实响应解析口径（2026-11 抓包实证）：积分统计 `metrics[]` 中 `usageTotalPackageCredit` 项的 `value`（如 67）只是类型/状态标记，**真正额度在该项的 `package_credit_amount`（总额）/ `package_credit_used`（已用）/ `package_credit_remain`（剩余）**；模型目录返回 `{count, builtinModels:[...]}`，条目字段为 `model_id/model_name/context_window/max_tokens/credit[].ratio_display/supports_images`。解析实现与单测按此口径锁定。
+- 排障：`--task-run codearts-diag` 用真实凭据抓 `statistics/plugin`、`model/builtin`、`ops/delivery` 及一次极简 chat 的原始响应，写入 `data/codearts_diag.json`（chat 会真实消耗极少积分）。
+
+**端点与命令**
+- 对话 `POST /api/v2/chat/completions`；活动列表/状态 `GET /v1/ops/delivery`（四态预检，唯一真相源）→ 领取 `POST /v1/ops/claim` → 必要时 `POST /v1/ops/confirm`；模型目录 `GET /v1/model/builtin`；积分统计 `GET /snap-manager/v1/statistics/plugin`。
+- `codearts_checkin_start` → `tasks/codearts_checkin.rs` 幂等签到；`codearts_checkin_results` 落 codearts_checkin_results 表（90 天滚动）；`codearts_credits_fetch` → `tasks/codearts_credits.rs` 查积分并回写余额，每日签到最高 1000 积分（积分制套餐用户），落 codearts_credits_history 表（365 天）；`codearts_checkin_task_register(times[])` 每日签到任务（应用内调度器 + schtasks `--task-run codearts-checkin` 双轨）；`codearts_settings_get/set` 管理开关与时刻；`codearts_pool_status` / `api_codearts_usage_stats` 透出池状态与独立用量桶 `UsageBucket::CodeArts`。
 
 ## 6. 附录 A：Trae API 协议参考（抓包实证）
 

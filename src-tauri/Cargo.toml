@@ -33,6 +33,8 @@ tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-t
 tokio-stream = "0.1"
 bytes = "1"
 sha2 = "0.10"
+# CodeArts 上游 SDK-HMAC-SHA256 请求签名（AK/SK 凭据；ecs 签名算法：HMAC-SHA256）
+hmac = "0.12"
 # 口令派生 KDF：导出信封口令派生用 Argon2id（疑点⑤：抗 GPU/ASIC 暴力破解，
 # 内存困难 19MiB/t=2；sha2 链式 10 万轮仅为旧版导出文件的兼容解密路径保留）
 argon2 = "0.5"

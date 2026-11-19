@@ -30,18 +30,19 @@ use crate::tasks::qoder_upstream;
 /// Qoder 追加尾部：双源/三源模型的默认命中顺序保持改造前行为
 ///（Buddy → Trae），Qoder 池仅在前两者不可用或单源时接管（§9.1 零行为差异）
 pub fn default_priority() -> Vec<String> {
-    vec!["buddy".into(), "trae".into(), "qoder".into()]
+    vec!["buddy".into(), "trae".into(), "qoder".into(), "codearts".into()]
 }
 
 /// 池固定序（A2 共享常量）：候选序尾部补全与统一目录显示层兜底回退共用同一
 /// 顺序，杜绝两处字面量漂移（unified_catalog 曾按 sources 插入序回退，buddy-ai
 /// 被插在 trae 之前与默认候选序不一致）。默认 priority 下尾部补全结果
 /// [buddy, trae, qoder, buddy-ai, custom] 与既有行为零差异；custom 保持尾部兜底位。
-pub const POOL_FIXED_ORDER: [TargetPool; 5] = [
+pub const POOL_FIXED_ORDER: [TargetPool; 6] = [
     TargetPool::Buddy,
     TargetPool::Trae,
     TargetPool::Qoder,
     TargetPool::BuddyAi,
+    TargetPool::CodeArts,
     TargetPool::Custom,
 ];
 
@@ -62,6 +63,9 @@ pub enum TargetPool {
     Custom,
     /// Qoder 上游（p3-3，gateway.qoder.com.cn 推理网关；Qoder 目录命中即源）
     Qoder,
+    /// CodeArts 上游（华为云码道，snap-access 推理网关；AK/SK 签名请求，
+    /// 目录命中即源；开关默认关，用户在资源调度页显式开启）
+    CodeArts,
 }
 
 impl TargetPool {
@@ -72,6 +76,7 @@ impl TargetPool {
             TargetPool::BuddyAi => "buddy-ai",
             TargetPool::Custom => "custom",
             TargetPool::Qoder => "qoder",
+            TargetPool::CodeArts => "codearts",
         }
     }
 
@@ -81,6 +86,7 @@ impl TargetPool {
             "buddy" => Some(TargetPool::Buddy),
             "buddy-ai" => Some(TargetPool::BuddyAi),
             "qoder" => Some(TargetPool::Qoder),
+            "codearts" => Some(TargetPool::CodeArts),
             // v3 拍板：custom 转正——前缀锁池（custom/xxx）与 per_model/priority
             // 写入 "custom" 随 parse 打通自然生效
             "custom" => Some(TargetPool::Custom),
@@ -227,6 +233,8 @@ pub enum DispatchError {
     WbDisabled,
     /// 仅 Qoder 源模型且 qoder_enabled=false（同 WbDisabled 语义镜像）
     QoderDisabled,
+    /// 仅 CodeArts 源模型且 codearts_enabled=false（同 WbDisabled 语义镜像）
+    CodeArtsDisabled,
     /// 仅 Trae 源模型且 trae_enabled=false（同族镜像；Trae 开关默认开，
     /// 关闭属用户显式动作，与"池耗尽 503"区分开）
     TraeDisabled,
@@ -313,6 +321,9 @@ struct ModelSources {
     /// Qoder 源（p3-3）：Qoder 目录命中（Some(目录归一化 id)）；
     /// upstreamKey/efforts 等请求素材由执行路径经 qoder_upstream::resolve 再查
     qoder: Option<String>,
+    /// CodeArts 源：CodeArts 目录命中（Some(目录归一化 model_id)）；
+    /// upstreamKey 等请求素材由执行路径经 codearts_catalog::resolve 再查
+    codearts: Option<String>,
     /// custom 上游组（P1::find_enabled_all 结果，空 = 无 custom 源；v3 第四源：
     /// 与 buddy/trae/qoder 并列参与源集合判定与 fallback 管线，组内选路/熔断
     /// 由 custom_lb 在执行路径自理，pool_health 仅判「任一上游未熔断」）
@@ -329,6 +340,7 @@ impl ModelSources {
         wb_enabled: bool,
         qoder_enabled: bool,
         buddy_ai_enabled: bool,
+        codearts_enabled: bool,
     ) -> usize {
         let mut n = 0;
         if self.trae && trae_enabled {
@@ -347,6 +359,9 @@ impl ModelSources {
             n += 1;
         }
         if self.qoder.is_some() && qoder_enabled {
+            n += 1;
+        }
+        if self.codearts.is_some() && codearts_enabled {
             n += 1;
         }
         // custom 上游组（v3 第四源）：组非空即独立失败域计数（组内熔断细节由
@@ -368,6 +383,7 @@ impl ModelSources {
                 self.buddy.is_some() && (self.buddy_intl_only || self.buddy_in_both)
             }
             TargetPool::Qoder => self.qoder.is_some(),
+            TargetPool::CodeArts => self.codearts.is_some(),
             TargetPool::Custom => !self.custom.is_empty(),
         }
     }
@@ -380,6 +396,7 @@ impl ModelSources {
         wb_enabled: bool,
         qoder_enabled: bool,
         buddy_ai_enabled: bool,
+        codearts_enabled: bool,
     ) -> bool {
         match pool {
             TargetPool::Trae => self.trae && trae_enabled,
@@ -393,6 +410,7 @@ impl ModelSources {
                     && (self.buddy_intl_only || self.buddy_in_both)
             }
             TargetPool::Qoder => self.qoder.is_some() && qoder_enabled,
+            TargetPool::CodeArts => self.codearts.is_some() && codearts_enabled,
             // v3：custom 为真源判定（原恒 false 仅为匹配穷尽）——组非空即可候选，
             // 全熔断由 pool_health 拦截走 fallback
             TargetPool::Custom => !self.custom.is_empty(),
@@ -458,6 +476,9 @@ fn bind_pool_order(b: &str) -> Vec<TargetPool> {
     } else if b == "buddy-ai" {
         // buddy-ai 绑定：国际档优先，国内 Buddy 兜底（同源回退不跨账号体系）
         vec![TargetPool::BuddyAi, TargetPool::Buddy, TargetPool::Trae]
+    } else if b == "codearts" {
+        // CodeArts 绑定：CodeArts 优先，Buddy/Trae 兜底
+        vec![TargetPool::CodeArts, TargetPool::Buddy, TargetPool::Trae]
     } else {
         vec![TargetPool::Buddy, TargetPool::Trae]
     }
@@ -614,13 +635,16 @@ pub fn resolve_target(
     // v1 不做路由后缀剥离（-thinking/-max 是 WB/Trae 侧机制），请求素材由执行路径按条目再查
     let qoder_hit = qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn)
         .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string));
+    // ③⁻ CodeArts 源判定：目录 canonical 命中（upstream_key/model_id 由执行路径
+    // 再查 codearts_catalog::resolve；此处只做源存在性与归一化 id 判定）
+    let codearts_hit = crate::tasks::codearts_catalog::resolve(model).map(|(_, id)| id);
     let trae_final = if buddy_hit.is_none() {
         if in_trae(model) {
             // 整名命中：真模型名透传，不做任何后缀剥离
             (model.to_string(), None, false)
-        } else if qoder_hit.is_some() {
-            // Qoder 目录命中且整名未命中 Trae 列表：跳过后缀剥离，整名保留
-            // （剥离只服务 WB/Trae 侧机制，此处剥离会把 Qoder 专属模型改写为
+        } else if qoder_hit.is_some() || codearts_hit.is_some() {
+            // Qoder / CodeArts 目录命中且整名未命中 Trae 列表：跳过后缀剥离，整名保留
+            // （剥离只服务 WB/Trae 侧机制，此处剥离会把其专属模型改写为
             // 基名误路由 Trae）
             (model.to_string(), None, false)
         } else if let Some((base, hint)) = wb_model_route::strip_route_suffix(model, &cfg)
@@ -662,7 +686,7 @@ pub fn resolve_target(
     // Trae 透传语义收窄：Qoder 目录命中的模型不再默认透传 Trae（透传会让
     // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）
     let trae_hit = !trae_model_disabled
-        && ((buddy_hit.is_none() && qoder_hit.is_none())
+        && ((buddy_hit.is_none() && qoder_hit.is_none() && codearts_hit.is_none())
             || trae_list.iter().any(|m| canonical_id(&m.id) == canonical));
     let sources = ModelSources {
         buddy: buddy_hit,
@@ -673,6 +697,7 @@ pub fn resolve_target(
         trae: trae_hit,
         trae_final,
         qoder: qoder_hit,
+        codearts: codearts_hit,
         // v3 第四源：custom 上游组（P1 find_enabled_all，与 buddy/qoder 判定并列
         // 全量收集后按序筛选同构；命中信息由执行路径重新按 data_dir 读取一致性
         // 由 config_cache 5s TTL 保证，此处仅做源存在性与健康判定）
@@ -685,6 +710,9 @@ pub fn resolve_target(
         .load(std::sync::atomic::Ordering::Relaxed);
     let trae_enabled = state
         .trae_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let codearts_enabled = state
+        .codearts_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
     // 仅 Buddy 源模型 + wb_enabled=false → 显式报错（§4.3：保持现有
     // wb_upstream_disabled 语义；"关闭"与"不可用"是两个概念）。
@@ -702,8 +730,10 @@ pub fn resolve_target(
             wb_enabled,
             qoder_enabled,
             buddy_ai_enabled,
+            codearts_enabled,
         )
         && !(sources.qoder.is_some() && qoder_enabled)
+        && !(sources.codearts.is_some() && codearts_enabled)
         && sources.custom.is_empty()
     {
         return Err(DispatchError::WbDisabled);
@@ -713,15 +743,27 @@ pub fn resolve_target(
         && !sources.trae
         && sources.buddy.is_none()
         && !qoder_enabled
+        && sources.codearts.is_none()
         && sources.custom.is_empty()
     {
         return Err(DispatchError::QoderDisabled);
+    }
+    // 仅 CodeArts 源模型 + codearts_enabled=false → 同语义镜像
+    if sources.codearts.is_some()
+        && !sources.trae
+        && sources.buddy.is_none()
+        && sources.qoder.is_none()
+        && !codearts_enabled
+        && sources.custom.is_empty()
+    {
+        return Err(DispatchError::CodeArtsDisabled);
     }
     // 仅 Trae 源模型 + trae_enabled=false → 同族镜像（Trae 开关默认开，
     // 关闭属用户显式动作，与"池耗尽 503"区分开）
     if sources.trae
         && sources.buddy.is_none()
         && sources.qoder.is_none()
+        && sources.codearts.is_none()
         && !trae_enabled
         && sources.custom.is_empty()
     {
@@ -762,7 +804,7 @@ pub fn resolve_target(
         };
         if let Some(pool) = sticky_pool {
             if bind.map_or(true, |b| pool.as_str() == b)
-                && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled)
+                && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled, codearts_enabled)
                 && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref())
             {
                 // 审查 A-3：粘性命中也构建跨池回退链——粘性池耗尽后可移交下一池，
@@ -795,7 +837,7 @@ pub fn resolve_target(
                     for p in order {
                         if p == pool
                             || sticky_chain.iter().any(|c| c.pool == p)
-                            || !sources.available(p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled)
+                            || !sources.available(p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled, codearts_enabled)
                             || !pool_healthy(state, p, &sources, wb_enabled, key_allowed_for(p).as_ref())
                         {
                             continue;
@@ -854,7 +896,7 @@ pub fn resolve_target(
     if forced_pool.is_none() && bind.is_none()
         && policy.strategy == DispatchStrategy::Smart
         && policy.per_model.get(&canonical).is_none()
-        && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) >= 2
+        && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled, codearts_enabled) >= 2
     {
         order = smart_pool_order(state, &order, &canonical, &catalog, &sources);
     }
@@ -862,7 +904,7 @@ pub fn resolve_target(
     let preferred = order
         .iter()
         .copied()
-        .find(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled));
+        .find(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled, codearts_enabled));
 
     let mut fallback_from: Option<(TargetPool, FallbackReason)> = None;
     // issue #136 逐池归因：记录候选序中每个池的失败原因（unavailable / 账号不健康 /
@@ -874,7 +916,7 @@ pub fn resolve_target(
     let mut win: Option<(TargetPool, String, Option<String>, bool)> = None;
     let mut chain: Vec<PoolCandidate> = Vec::new();
     for (i, pool) in order.iter().copied().enumerate() {
-        if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) {
+        if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled, codearts_enabled) {
             // 审查 F-3 修复：原 unavailable 二义（「上游开关未启用」与「该池无此
             // 模型源」混用），用户无从判断该开开关还是换模型——细分为
             // switch_off（源存在，去开开关）/ no_source（该池目录不含此模型）
@@ -949,9 +991,9 @@ pub fn resolve_target(
                 //（旧 is_dual 把已停用池也计入家族数）
                 let has_next = order[i + 1..]
                     .iter()
-                    .any(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled));
+                    .any(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled, codearts_enabled));
                 let can_fallback = policy.fallback
-                    && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled) >= 2
+                    && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, buddy_ai_enabled, codearts_enabled) >= 2
                     && has_next;
                 if !can_fallback {
                     // issue #136：提前终止（无更多回退目标）同样落逐池归因——实证
@@ -1080,6 +1122,7 @@ fn smart_pool_order(
     let wb_stats = state.wb_pool.stats();
     let buddy_ai_stats = state.buddy_ai_pool.stats();
     let qoder_stats = state.qoder_pool.stats();
+    let codearts_stats = state.codearts_pool.stats();
     // 倍率数据源：Buddy = wb 目录原始值（0 = 免费）；Trae = 官网同步声明值（None = 未声明）；
     // Qoder = 目录 credits 文本解析（"x0.1 credits" → 0.1）。
     // 各列表均为内存缓存，热路径零磁盘读
@@ -1111,6 +1154,16 @@ fn smart_pool_order(
                 .and_then(Value::as_str)
                 .and_then(qoder_upstream::credits_rate_of)
         });
+    // CodeArts 倍率：目录条目 rate 文本解析（无声明按后置处理）
+    let codearts_rate = sources
+        .codearts
+        .as_ref()
+        .and_then(|id| {
+            crate::tasks::codearts_catalog::list_models()
+                .into_iter()
+                .find(|m| m.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        })
+        .and_then(|m| m.get("rate").and_then(Value::as_f64));
     // custom 组倍率键（v3 四池参与）：组内最小 rate 正常参与（rate=0 免费上游
     // 可在 Smart 下自然胜出）；到期/积分两键无数据按后置处理，不阻塞排序
     let custom_rate = sources
@@ -1125,6 +1178,7 @@ fn smart_pool_order(
             // buddy-ai：同目录倍率（R-9 同账号体系定价同构），积分快照取国际池
             TargetPool::BuddyAi => (buddy_ai_stats, buddy_rate),
             TargetPool::Qoder => (qoder_stats, qoder_rate),
+            TargetPool::CodeArts => (codearts_stats, codearts_rate),
             // custom：到期 = i64::MAX 后置、倍率 = 组内最小 rate 正常参与、
             // 积分和 = f64::MIN（-total = f64::MAX，第三键后置）
             TargetPool::Custom => ((None, f64::MIN), custom_rate),
@@ -1225,6 +1279,14 @@ fn pool_health(
             }
             Ok(())
         }
+        TargetPool::CodeArts => {
+            // CodeArts 无模型级冷却表（模型级 429 走账号冷却/换号），仅账号级
+            // 健康预检；无积分豁免概念（skip_credit_filters=false）
+            if !state.codearts_pool.has_selectable_in(allowed, false) {
+                return Err(FallbackReason::NoHealthyAccount);
+            }
+            Ok(())
+        }
         // v3：custom 上游组健康判定——任一上游「未熔断且在 Key 白名单内」即可候选
         // （M-2 预检感知白名单，与 custom_lb::pick_upstream 执行侧同口径：白名单
         // 排除组内全部健康条目时判不健康走 fallback，避免执行侧 pick_next 返回
@@ -1271,6 +1333,8 @@ fn final_model_for(pool: TargetPool, sources: &ModelSources, request_model: &str
         TargetPool::Trae => sources.trae_final.0.clone(),
         // Qoder：目录归一化 id（去空白形态，执行路径据此 resolve 请求素材）
         TargetPool::Qoder => sources.qoder.clone().unwrap_or_default(),
+        // CodeArts：目录归一化 model_id（执行路径据此 resolve 请求素材）
+        TargetPool::CodeArts => sources.codearts.clone().unwrap_or_default(),
         TargetPool::Custom => request_model.to_string(),
     }
 }
@@ -1282,6 +1346,8 @@ fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
         TargetPool::Trae => sources.trae_final.1.clone(),
         // Qoder：v1 无路由级 effort 通道（思考档位由执行路径按目录条目解析）
         TargetPool::Qoder => None,
+        // CodeArts：思考档位由执行路径按请求体注入（上游兼容 OpenAI reasoning_effort）
+        TargetPool::CodeArts => None,
         TargetPool::Custom => None,
     }
 }
@@ -1291,7 +1357,7 @@ fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
 fn max_mode_for(pool: TargetPool, sources: &ModelSources) -> bool {
     match pool {
         TargetPool::Trae => sources.trae_final.2,
-        TargetPool::Buddy | TargetPool::BuddyAi | TargetPool::Custom | TargetPool::Qoder => false,
+        TargetPool::Buddy | TargetPool::BuddyAi | TargetPool::Custom | TargetPool::Qoder | TargetPool::CodeArts => false,
     }
 }
 
@@ -1325,6 +1391,7 @@ fn pool_sticky_ttl_secs(state: &ApiSharedState, pool: TargetPool) -> u64 {
         TargetPool::Buddy => &state.wb_pool_sticky_ttl_secs,
         TargetPool::BuddyAi => &state.buddy_ai_pool_sticky_ttl_secs,
         TargetPool::Qoder => &state.qoder_pool_sticky_ttl_secs,
+        TargetPool::CodeArts => &state.codearts_pool_sticky_ttl_secs,
     };
     cell.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1453,6 +1520,14 @@ mod tests {
             buddy_ai_enabled: AtomicBool::new(false),
             buddy_ai_sticky_enabled: AtomicBool::new(false),
             buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            codearts_pool: super::super::pool::ApiPool::new(),
+            codearts_enabled: AtomicBool::new(false),
+            codearts_identity: None,
+            codearts_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            codearts_sticky_enabled: AtomicBool::new(false),
+            codearts_sticky: super::super::wb_sticky::StickyStore::default(),
+            codearts_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            codearts_sanitize: AtomicBool::new(true),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
             custom_upstream_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
             custom_lb_counters: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2290,7 +2365,7 @@ mod tests {
 
     // ---------- 策略加载与合法性 ----------
 
-    /// 策略文件缺失 → 默认 ["buddy","trae","qoder"]；非法池名被过滤
+    /// 策略文件缺失 → 默认 ["buddy","trae","qoder","codearts"]；非法池名被过滤
     #[test]
     fn t21_policy_missing_and_invalid_values() {
         let dir = std::env::temp_dir().join(format!("twa_policy_{}", std::process::id()));
@@ -2299,7 +2374,7 @@ mod tests {
         let p = load_policy(&dir);
         assert_eq!(
             p.priority,
-            vec!["buddy".to_string(), "trae".to_string(), "qoder".to_string()]
+            vec!["buddy".to_string(), "trae".to_string(), "qoder".to_string(), "codearts".to_string()]
         );
         assert!(p.fallback);
         // 非法值（kv 直写）
