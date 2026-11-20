@@ -380,7 +380,22 @@ fn send_signed_request(
 }
 
 /// 分流决策：同号退避 / 换号 / 终态（401/403 恒换号）
+///
+/// 本机网络故障（断网 / 换网 / DNS 抖动）**必须同号重试且不换号**：同一张
+/// 网卡出问题，换账号只是把同一个失败重演一遍，还会白白消耗其他健康账号的
+/// 重试预算。退避用阶梯拉长，给网络恢复留时间。
 fn retry_decision(status: u16, body: &str, attempt: u32) -> RetryAction {
+    if is_local_network_fault(body) {
+        // 3 次阶梯（2s / 5s / 10s）覆盖典型换网时长；耗尽后仍换号——若整机
+        // 网络长时间不通，换号至少能让池状态反映「全都失败过」而非死盯一个账号
+        return if attempt >= 3 {
+            RetryAction::SwitchKey
+        } else {
+            RetryAction::RetrySame {
+                delay_ms: [2_000u64, 5_000, 10_000][attempt as usize],
+            }
+        };
+    }
     if status == 401 || status == 403 {
         return RetryAction::SwitchKey;
     }
@@ -543,12 +558,65 @@ fn is_queue_code(text: &str) -> bool {
     matches_code(text, "TM.00001045") || matches_code(text, "TM.000010051")
 }
 
+/// 本机网络故障（断网 / 换网 / DNS 抖动 / 连接被重置）识别。
+///
+/// **这类失败与账号、模型都无关**：换账号无用（同一张网卡），冷却模型更无意义
+/// （上游根本没收不到请求）。此前它落到 `codearts_failure` 的 5xx 分支 →
+/// `ErrKind::Server` → 账号 30 分钟指数熔断 + 模型渐进冷却，于是网络恢复后
+/// 客户端每次重试都撞 `model_cooldown`，表现成「网关跟着网络一起挂掉」。
+///
+/// 判定依据是 `ureq` 传输层错误的 Display 文本（建连失败 / 读写中断 / DNS），
+/// 以及流内掐断哨兵。**不含裸 `timeout` 关键词**：上游 APIG 的
+/// `APIG.0203 Backend timeout` 是网关层后端超时、属真实上游故障，必须仍按
+/// Server 熔断（否则真故障永不被熔断，池会一直重试已知坏掉的上游）。
+fn is_local_network_fault(text: &str) -> bool {
+    // 上游业务码优先排除：它们是上游明确答复，不是本机传输失败
+    if text.contains("APIG.") || text.contains("InferHub.") || text.contains("ModelArts.") {
+        return false;
+    }
+    let m = text.to_ascii_lowercase();
+    // 网关自造的传输层错误前缀（send_signed_request 的 Err(e) 分支）
+    text.contains("上游传输错误")
+        // 流内掐断哨兵：transport cut: <io::Error Display>
+        || m.contains("transport cut")
+        // 建连 / DNS / 连接生命周期类
+        || m.contains("connection refused")
+        || m.contains("connection reset")
+        || m.contains("connection aborted")
+        || m.contains("connection closed")
+        || m.contains("broken pipe")
+        || m.contains("network is unreachable")
+        || m.contains("no route to host")
+        || m.contains("host unreachable")
+        || m.contains("dns error")
+        || m.contains("failed to lookup")
+        || m.contains("name or service not known")
+        || m.contains("temporary failure in name resolution")
+        // ureq 传输层超时（非上游业务码）：建连/读写超时
+        || m.contains("network error")
+        || m.contains("timed out")
+        // TLS/传输层
+        || m.contains("tls error")
+        || m.contains("unexpected eof")
+        || m.contains("rst_stream")
+        || m.contains("rst stream")
+        || m.contains("goaway")
+        || m.contains("http2")
+        || m.contains("h2 error")
+}
+
 /// CodeArts 上游失败 → (对客户端的状态码, 账号处置分类)。
 ///
 /// `status` 是上游 HTTP 状态码（流内错误帧传 200，真实码在文本里）。
 /// 归因顺序即优先级：排队码先于一切、并发上限先于通用 5xx、请求级错误先于
 /// 通用 4xx——否则这几类都会被兜底口径吃掉，误熔断账号。
 pub(crate) fn codearts_failure(status: u16, text: &str) -> (u16, ErrKind) {
+    // 本机网络故障优先于一切：它既不是账号问题也不是上游问题，账号与模型
+    // 都不该被记一笔。回 503（可重试语义），客户端退避后重试即可自愈。
+    // 必须前置——否则会被下面 5xx 分支吃成 Server 熔断 30 分钟。
+    if is_local_network_fault(text) {
+        return (503, ErrKind::None);
+    }
     if is_queue_code(text) {
         // 排队：换号无意义（排队按模型算，换账号仍在同一队），但**不能碰账号**。
         // ErrKind::None = 不冷却不熔断；429 让客户端按退避重试。
@@ -1053,6 +1121,24 @@ pub(crate) fn run_codearts_stream(
                     }
                     RetryAction::SwitchKey => {
                         let (client_status, kind) = codearts_failure(status, &resp_body);
+                        // 本机网络故障：同号阶梯退避 3 次仍未通，说明断的确实是
+                        // 本机网络。此时遍历池内其余账号毫无意义（同一张网卡），
+                        // 只会让用户干等「池内每个账号各试 3 次」，且掩盖真实原因。
+                        // 直接以 503 + 明确文案终止，客户端网络恢复后重试即可。
+                        if is_local_network_fault(&resp_body) {
+                            let msg = format!(
+                                "upstream 503 error: 本机网络不可达（断网/换网/DNS 抖动），非账号或上游故障；\
+                                 网络恢复后重试即可（{status}）");
+                            state.record_usage_codearts(model, &picked.uid, key_id, false, true,
+                                start_ts.elapsed().as_millis() as u64, 0, 0, None, &session_ctx);
+                            state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
+                                client_status, &picked.uid, start_ts.elapsed().as_millis() as u64,
+                                &key_name, &state.codearts_pool.name_of(&picked.uid), Some(&msg));
+                            set_last_error(state, format!("codearts uid={} model={} 本机网络故障: {}",
+                                picked.uid, model, resp_body.chars().take(200).collect::<String>()));
+                            send_stream_error(tx, proto, client_status as i64, &msg);
+                            return;
+                        }
                         note_failure(state, model, &picked.uid, kind, Some(&resp_body));
                         let msg = format!("upstream status={status}");
                         set_last_error(state, format!("codearts uid={} model={} status={} body={}",
@@ -1219,6 +1305,26 @@ pub(crate) fn run_codearts_stream(
                     return;
                 }
 
+                // 内容已流出：SSE 铁律——不能再换号重发（会向同一流拼接第二份
+                // 完整响应，客户端会看到重复/错乱内容）。不论是网络中断还是上游
+                // 掐断，都只能就地收尾：把真实原因作为错误帧发给客户端，然后结束。
+                // 这是断网场景的正确处置：用户已看到部分内容，此时静默换号重发
+                // 比直接报错更有害。
+                if sent_any {
+                    let text = format!("upstream {client_status} error: {msg}");
+                    // 网络中断不冷却账号/模型（与本函数开头归因一致）
+                    if !is_local_network_fault(&detail) {
+                        note_failure(state, model, &win_uid, kind, Some(&detail));
+                    }
+                    set_last_error(state, format!("codearts uid={} model={} code={} msg={} (已流出部分内容)",
+                        win_uid, model, code, msg));
+                    state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
+                        client_status, &win_uid, duration_ms, &key_name,
+                        &state.codearts_pool.name_of(&win_uid), Some(&text));
+                    send_stream_error(tx, proto, client_status as i64, &text);
+                    return;
+                }
+
                 note_failure(state, model, &win_uid, kind, Some(&detail));
                 set_last_error(state, format!("codearts uid={} model={} code={} msg={}",
                     win_uid, model, code, msg));
@@ -1347,6 +1453,25 @@ pub async fn codearts_aggregate_chat(
                         }
                         RetryAction::SwitchKey => {
                             let (client_status, kind) = codearts_failure(status, &resp_body);
+                            // 本机网络故障：同号阶梯退避 3 次仍未通 = 断的确实是
+                            // 本机网络，遍历池内其余账号毫无意义（同一张网卡），
+                            // 直接以 503 + 明确文案终止，网络恢复后重试即可。
+                            if is_local_network_fault(&resp_body) {
+                                let msg = format!(
+                                    "upstream 503 error: 本机网络不可达（断网/换网/DNS 抖动），\
+                                     非账号或上游故障；网络恢复后重试即可（{status}）");
+                                state.record_usage_codearts(&model, &picked.uid, &key_id, false, stream,
+                                    start_ts.elapsed().as_millis() as u64, 0, 0, None, &session_ctx);
+                                state.logger.log_request("codearts", "POST", proto.log_path(), &model,
+                                    stream, client_status, &picked.uid,
+                                    start_ts.elapsed().as_millis() as u64, &key_name,
+                                    &state.codearts_pool.name_of(&picked.uid), Some(&msg));
+                                set_last_error(&state, format!(
+                                    "codearts uid={} model={} 本机网络故障: {}",
+                                    picked.uid, model,
+                                    resp_body.chars().take(200).collect::<String>()));
+                                return Err(msg);
+                            }
                             note_failure(&state, &model, &picked.uid, kind, Some(&resp_body));
                             set_last_error(&state, format!("codearts uid={} model={} status={} body={}",
                                 picked.uid, model, status,
@@ -1976,6 +2101,169 @@ mod tests {
                       the rate limit is 300000000 tokens per minute.";
         assert!(is_model_busy(bucket), "限流族应记模型冷却");
         assert!(!is_queue_code(bucket), "限流族不得进排队等待分支");
+    }
+
+    /// 本机网络故障必须归为「不碰账号、不碰模型」的可重试错误。
+    ///
+    /// 回归背景：断网/换网时 `send_signed_request` 返回 `Err((502, "…传输错误…"))`，
+    /// 此前落 `codearts_failure` 的 5xx 分支 → `ErrKind::Server` → 账号 30 分钟
+    /// 指数熔断 + 模型渐进冷却。网络恢复后客户端每次重试都撞 `model_cooldown`
+    /// （实测 34s），表现为「网关跟着网络一起挂」。
+    #[test]
+    fn local_network_faults_do_not_poison_pool() {
+        // 判定覆盖：建连/DNS/读写中断/流内掐断哨兵
+        for text in [
+            "CodeArts 上游传输错误: Network Error: connection refused",
+            "CodeArts 上游传输错误: timed out",
+            "CodeArts 上游传输错误: dns error: failed to lookup address information",
+            "CodeArts 上游传输错误: Connection reset by peer (os error 104)",
+            "CodeArts 上游传输错误: broken pipe",
+            "-9902 transport cut: connection reset by peer",
+            "transport cut: http2 error",
+        ] {
+            assert!(is_local_network_fault(text), "应识别为本机网络故障：{text}");
+            // 关键：不得冷却账号，不得写模型表
+            assert_eq!(
+                codearts_failure(502, text),
+                (503, ErrKind::None),
+                "网络故障不得归为 Server：{text}"
+            );
+        }
+
+        // 上游业务错误不得被误判为网络故障（否则真故障永不熔断）
+        for text in [
+            "InferHub.ModelArts.81114.429 Too many requests",
+            r#"{"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)"}"#,
+            "InferHub.001001005.400 The request param is invalid",
+            "internal server error from upstream",
+            // APIG.0203 是网关层「后端超时」= 上游真实故障，不是本机网络问题。
+            // 误判成网络故障会让真故障永不被熔断，池一直重试坏掉的上游。
+            "APIG.0203 Backend timeout",
+        ] {
+            assert!(!is_local_network_fault(text), "业务错误不得误判为网络故障：{text}");
+        }
+        // APIG.0203 必须仍按 Server 熔断（既有语义，不得被网络口径吃掉）
+        assert_eq!(
+            codearts_failure(200, "APIG.0203 Backend timeout").1,
+            ErrKind::Server,
+            "上游后端超时必须仍熔断，不能当成网络抖动"
+        );
+    }
+
+    /// 网络故障必须同号重试，不得立刻换号。
+    ///
+    /// 同一张网卡出问题，换账号只是把同一个失败重演一遍，还白白消耗其他
+    /// 健康账号的重试预算（每个账号都会各吃一次失败）。
+    #[test]
+    fn local_network_fault_retries_same_account_with_backoff() {
+        let net = "CodeArts 上游传输错误: timed out";
+        // 阶梯退避 2s / 5s / 10s，且都是 RetrySame（不是 SwitchKey）
+        assert_eq!(
+            retry_decision(502, net, 0),
+            RetryAction::RetrySame { delay_ms: 2_000 }
+        );
+        assert_eq!(
+            retry_decision(502, net, 1),
+            RetryAction::RetrySame { delay_ms: 5_000 }
+        );
+        assert_eq!(
+            retry_decision(502, net, 2),
+            RetryAction::RetrySame { delay_ms: 10_000 }
+        );
+        // 3 次耗尽后才换号（让池状态反映"全都失败过"，不死盯一个账号）
+        assert_eq!(retry_decision(502, net, 3), RetryAction::SwitchKey);
+
+        // 对照：普通 502（非网络故障）仍是既有口径（重试 1 次后换号）
+        assert_eq!(
+            retry_decision(502, "upstream bad gateway", 0),
+            RetryAction::RetrySame { delay_ms: 500 }
+        );
+        assert_eq!(retry_decision(502, "upstream bad gateway", 1), RetryAction::SwitchKey);
+    }
+
+    /// 网络故障不写模型冷却表——这是 `model_cooldown` 报错的直接来源。
+    #[test]
+    fn local_network_fault_writes_no_model_cooldown() {
+        let m = "__test_net_fault_model__";
+        clear_model_failure(m);
+
+        let text = "CodeArts 上游传输错误: connection refused";
+        let (_, kind) = codearts_failure(502, text);
+        // 模拟 note_failure 的模型繁忙分支判定：网络故障不得命中
+        assert!(!is_model_busy(text), "网络故障不是模型繁忙");
+        assert_eq!(kind, ErrKind::None, "网络故障不冷却账号");
+        // 因此模型表应保持干净
+        assert!(
+            model_cooling_remaining_secs(m).is_none(),
+            "网络故障不得在模型表留下冷却"
+        );
+
+        clear_model_failure(m);
+    }
+
+    /// 真实网络故障文本必须被识别（用真实 ureq 调用触发，不靠手写样例）。
+    ///
+    /// 手写样例只能证明「我以为的错误文本能命中」；这里真发一个必然失败的
+    /// 连接，取 ureq 实际 Display 文本喂给判定，验证关键词表覆盖真实输出。
+    /// 断网兜底：本机若意外能连通（如代理接管），跳过而非失败。
+    #[test]
+    fn real_ureq_network_error_text_is_recognized() {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(800))
+            .timeout_read(Duration::from_millis(800))
+            .build();
+        // 127.0.0.1:1 是保留端口，正常机器上必然连接被拒绝
+        let err = match agent.get("http://127.0.0.1:1/").call() {
+            Err(ureq::Error::Status(_, _)) => return, // 意外拿到 HTTP 响应，跳过
+            Err(e) => e,
+            Ok(_) => return,
+        };
+        let text = err.to_string();
+        assert!(
+            is_local_network_fault(&text),
+            "ureq 真实网络错误文本未被识别为网络故障，实际输出: {text}"
+        );
+        // 且必须归为不冷却账号/模型
+        assert_eq!(
+            codearts_failure(502, &text),
+            (503, ErrKind::None),
+            "真实网络错误必须归 503+None（不冷却），实际文本: {text}"
+        );
+    }
+
+    /// 网络故障判定必须能区分「本机传输失败」与「上游明确答复」。
+    ///
+    /// 这两类在客户端侧都表现为"连不上"，但处置完全相反：前者不该冷却任何
+    /// 东西（等网络恢复即可），后者必须熔断（否则池一直重试坏掉的上游）。
+    #[test]
+    fn network_fault_is_disjoint_from_upstream_verdicts() {
+        // 本机传输失败：归 503 + 不冷却
+        let local = [
+            "CodeArts 上游传输错误: Network Error: connection refused",
+            "transport cut: connection reset by peer",
+        ];
+        for t in local {
+            assert!(is_local_network_fault(t));
+            assert_eq!(codearts_failure(502, t), (503, ErrKind::None));
+            // 且不得被判成排队/限流（那会把网络问题记成模型繁忙）
+            assert!(!is_queue_code(t), "网络故障不是排队：{t}");
+            assert!(!is_rate_limited(t), "网络故障不是限流：{t}");
+            assert!(!is_model_busy(t), "网络故障不是模型繁忙：{t}");
+        }
+
+        // 上游明确答复：不是网络故障，按各自口径处置
+        let upstream = [
+            "APIG.0203 Backend timeout",
+            "InferHub.ModelArts.81114.429 Too many requests",
+            r#"{"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)"}"#,
+            r#"{"error_code":"TM.00001045","error_msg":"queue busy"}"#,
+        ];
+        for t in upstream {
+            assert!(!is_local_network_fault(t), "上游答复不得判为网络故障：{t}");
+        }
+        // APIG.0203 仍熔断；排队码仍不碰账号
+        assert_eq!(codearts_failure(200, "APIG.0203 Backend timeout").1, ErrKind::Server);
+        assert_eq!(codearts_failure(200, "TM.00001045").1, ErrKind::None);
     }
 }
 
