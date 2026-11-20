@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.9.3
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.9.4
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -386,11 +386,12 @@ ai-work-assistant/
 - 大位（MAJOR）仅在重大架构/破坏性变更时升级
 - 一个提交包含多类变更时，按最高级别升位；纯文档/注释改动不升级；版本同步提交本身不再升位
 - 升版提交执行 `npm run set-version <x.y.z>` 一键同步（底层 `scripts/sync_version.mjs`：package.json / Cargo.toml / Cargo.lock / AGENT.md 标题）；CHANGELOG.md 手动新增条目
+- **package-lock.json 脚本不覆盖，需手动同步**（3.9.4 升版曾遗漏）：升版后运行 `npm install --package-lock-only` 再生成，或手改文件内两处 `"version"`（根级与 `packages[""]` 各一处）
 - 版本号单一来源为 `src-tauri/Cargo.toml`：tauri.conf.json 不写 version（自动回退），Rust 端 `env!("CARGO_PKG_VERSION")` 自动取，前端关于页运行时经 `getVersion()` 读取（about.ts 不写版本号），NSIS / MSI 安装包版本号自动跟随
 
 **发版全流程**（仅用户明确发版时）：
 
-1. **调整版本**：`npm run set-version <x.y.z>` + CHANGELOG.md 新增条目
+1. **调整版本**：`npm run set-version <x.y.z>` + package-lock.json 同步（见上方升位细则） + CHANGELOG.md 新增条目
 2. **编译**：Windows 本机 `npm run tauri build` 产出 setup / msi / portable 三件套；macOS 由 GitHub Actions `build-macos.yml`（push macos_main 触发）产出 aarch64 / x64 / universal 三个 dmg
 3. **提交 → 推送 → 打 tag 并推送**
 4. **发布 GitHub Release**：上传资产 + `latest.json`，标题见下方格式约定

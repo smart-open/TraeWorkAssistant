@@ -397,6 +397,8 @@ export interface Settings {
   doubao_checkin_hhmm: string;
   /** 豆包 probe 自动保活（方案 A，默认开）：签到前 probe 缺失/过期时自动开代理+切客户端抓包对齐 */
   doubao_probe_auto_keepalive: boolean;
+  /** 豆包保活单账号等待抓包秒数（默认 75；0/未配置 = 回退默认；后端读取侧 clamp 1..=600） */
+  doubao_probe_keepalive_wait_secs: number | null;
   /** 豆包数据同步模式：off/hourly/every_hours/every_days/daily（默认 every_hours） */
   doubao_sync_mode: string;
   /** 豆包数据同步 every_hours 间隔小时数（1-24，默认 2） */
@@ -1108,6 +1110,8 @@ export interface DoubaoCheckinTrendPoint {
   date: string;
   ok: number;
   already: number;
+  /** 当日确定性不可签到（未投放/task_status≠2）单列计数，不并入 already */
+  skip: number;
   failed: number;
   reward_total: number;
 }
@@ -1331,6 +1335,19 @@ export interface SanitizeSwitches {
   qoder: boolean;
 }
 
+// 池级伪流式开关视图（issue #213 S7）：仅内存热切换、重启复位默认关
+// wb = Buddy CN 档（wb_pool）；buddy_ai = 国际档独立灰度
+export interface PseudoStreamSwitches {
+  wb: boolean;
+  buddy_ai: boolean;
+}
+
+// 池级换号重试预算视图（issue #213 阶段2）：0 = 旧行为（重试机会 = 池内账号数）
+export interface RetryBudgets {
+  wb: number;
+  buddy_ai: number;
+}
+
 // ---- 工具名别名表（issue #150：tool_alias_map KV；Trae 池 tools 工具集指纹识别治本）----
 // 请求侧 tools[].function.name / tool_choice / 历史轮 tool_calls 名 → 通用别名，
 // 响应侧按逆映射回改（协议对客户端透明）。合并语义同指纹清洗：内置默认表始终
@@ -1483,6 +1500,8 @@ export interface WorkBuddyAccountView {
   relogin_reason: string;
   group_id: string;
   note: string;
+  /** 账号级独立出口代理 URL（P4 防风控；null/空 = 直连，老后端缺省 undefined） */
+  proxy_url?: string | null;
   credits_balance: number | null;
   credits_fetched_at: string | null;
   /** 共享标签 tag id 列表（老后端缺省 undefined） */

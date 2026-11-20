@@ -31,8 +31,14 @@ use super::doubao_checkin::{probe_key_for_sid, probe_own_fresh};
 /// 进程内保活闸门：手动签到与调度签到并发时只跑一轮保活（WouldBlock 直接跳过）
 static KEEPALIVE_GATE: Mutex<()> = Mutex::new(());
 
-/// 单账号等待抓包超时（实测首条 campaign 请求 ~16s，留 3 倍余量）
+/// 单账号等待抓包超时（实测首条 campaign 请求 ~16s，留 3 倍余量）。
+/// 2026-11-17 修复③：等待窗口兼顾「客户端代签」场景——客户端首页自动签到实测
+/// ~16s 内发出，但用户手动点签到按钮可能更慢，75s 已覆盖绝大多数操作节奏；
+/// 仍不够时 settings.doubao_probe_keepalive_wait_secs 可调（0=回退默认 75）
 const WAIT_CAPTURE_SECS: u64 = 75;
+/// 审查修复（2026-11-18 #3）：可配置等待秒数上限——误配极大值会按账号顺序累加，
+/// 拖死整轮签到（对照 scheduler.rs doubao_sync_hours 的 clamp 归一化先例）
+const WAIT_CAPTURE_SECS_MAX: u64 = 600;
 /// 轮询间隔
 const POLL_INTERVAL_MS: u64 = 3000;
 
@@ -103,8 +109,16 @@ fn keepalive_one(
         e
     })?;
 
-    // 轮询等待抓包入库（per-sid 键出现/变化，或全局键变化——双键任一命中即可）
-    let deadline = Instant::now() + Duration::from_secs(WAIT_CAPTURE_SECS);
+    // 轮询等待抓包入库（per-sid 键出现/变化，或全局键变化——双键任一命中即可）。
+    // 等待窗口可经 settings.doubao_probe_keepalive_wait_secs 覆盖（0/未配置=默认 75）
+    let wait_secs = {
+        let s = state.settings();
+        s.doubao_probe_keepalive_wait_secs
+            .filter(|v| *v > 0)
+            .unwrap_or(WAIT_CAPTURE_SECS)
+            .clamp(1, WAIT_CAPTURE_SECS_MAX)
+    };
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         let now_sid = probe_captured_at(&state.data_dir, &probe_key_for_sid(sid));
@@ -130,7 +144,7 @@ fn keepalive_one(
     }
     fs_utils::app_log(
         &state.data_dir,
-        &format!("[probe-keepalive] 等待抓包超时（{WAIT_CAPTURE_SECS}s）: uid={uid} name={name}"),
+        &format!("[probe-keepalive] 等待抓包超时（{wait_secs}s）: uid={uid} name={name}"),
     );
     Ok(false)
 }

@@ -795,6 +795,12 @@ pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
     if code == 11140 || super::retry::is_account_restricted_error(msg) {
         return ErrKind::Forbidden;
     }
+    // 4054 精确码（issue #212/#151）：上游模型侧瞬态过载，非账号质量问题 →
+    // SoftRate 60s 账号×模型冷却。原兜底 code>=400 → Client 10 分钟冷却会
+    // 误杀健康账号，池小则饿死成 503 no healthy account
+    if code == 4054 {
+        return ErrKind::SoftRate;
+    }
     let lower = msg.to_lowercase();
     if code == 401 || lower.contains("unauthorized") || lower.contains("token expired") {
         return ErrKind::SessionDead;
@@ -810,6 +816,12 @@ pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
         return ErrKind::HardCredit;
     }
     if code == 429 || lower.contains("rate") || lower.contains("too many") || lower.contains("限频") {
+        return ErrKind::SoftRate;
+    }
+    // 短语兜底（issue #212/#151）：code 未带 4054 的「模型请求失败，请稍后
+    // 重试」形态 → SoftRate。置于关键词分支之后，避免复合文案（积分不足/
+    // token expired 等含「请稍后重试」）被劫持改判，硬限额/会话失效优先
+    if super::retry::is_retry_later_error(msg) {
         return ErrKind::SoftRate;
     }
     if code >= 500 {
@@ -1085,6 +1097,57 @@ fn log_longctx_hint(state: &WbView, peek: &Value, model: &str) {
 
 // ==================== 流式入口 ====================
 
+/// 预算耗尽判定（issue #213 阶段2，纯函数便于单测）：`rounds` = 本请求内累计
+/// 发起过上游请求的账号次数（跨重开轮换累计、不清零，见 run_wb_stream/
+/// run_wb_aggregate_inner 的 budget_used）；`budget` = 0 即旧行为（耗尽直接收尾）。
+pub(crate) fn budget_exhausted(rounds: u32, budget: u32) -> bool {
+    budget == 0 || rounds >= budget
+}
+
+/// 预算重开抖动退避毫秒（方案 §5.3：base 2s × 轮次，±25% 抖动，封顶 15s；
+/// `round` = 已耗尽轮数（≥1））。轮次时长基于轮换计数而非池大小，池大小不可靠
+///（tried 里可能混入粘性/专一候选）。
+pub(crate) fn budget_backoff_ms(round: u32) -> u64 {
+    let base = (2_000u64.saturating_mul(round as u64)).min(15_000);
+    // ±25% 抖动：[base*0.75, base*1.25)，时间戳取模（对齐 server.rs jitter 先例）
+    let span = (base / 4).max(1);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    base - span + (seed % (2 * span))
+}
+
+/// 轮换耗尽 + 预算未用尽时的重开判定（方案 §5.3）：清空 tried 中所有**非冷却中**
+/// 账号（清空 = 移出 tried，下一轮可被 pick 重选），冷却截止未到的 uid 保留在
+/// tried 中（pick 继续排除，不烧已判定不可用的号）。返回 Some(新 tried) = 重开
+/// 成功（调用方 sleep 后 continue 轮换）；None = 全部已试账号均进冷却（无可重试
+/// 候选，无重开意义）或预算用尽，落原耗尽收尾，防空转烧请求。
+pub(crate) fn budget_retry_round(
+    state: &WbView,
+    tried: &HashSet<String>,
+    model: &str,
+    rounds: u32,
+    budget: u32,
+) -> Option<HashSet<String>> {
+    if budget_exhausted(rounds, budget) {
+        return None;
+    }
+    let mut kept = HashSet::new();
+    for uid in tried.iter() {
+        if account_model_cooling_remaining(state, uid, model).is_some() {
+            kept.insert(uid.clone());
+        }
+    }
+    // 全部已试账号均进冷却 → 重开只会得到同一批被排除账号，无重开意义
+    //（kept.len() < tried.len() = 至少存在一个非冷却账号可重试）
+    if kept.len() < tried.len() {
+        Some(kept)
+    } else {
+        None
+    }
+}
+
 pub fn wb_stream_chat(
     state: Arc<ApiSharedState>,
     buddy_ai: bool,
@@ -1143,6 +1206,101 @@ pub fn wb_stream_chat(
         // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核
         let view = WbView::new(state, buddy_ai);
         run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded, &fallback);
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("internal server error"))
+                .unwrap()
+        })
+}
+
+/// 伪流式入口（issue #213 P0/S5）：客户端 stream:true 时内部走聚合管线
+/// （run_wb_aggregate_inner，断流/空完成全可无损换号重试），成功后按
+/// proto 合成 SSE 下发；本池耗尽走跨池兜底移交（无 fallback / 移交失败
+/// 则按 proto 发错误帧收尾）。签名与 wb_stream_chat 同构。
+#[allow(clippy::too_many_arguments)]
+pub fn wb_pseudo_stream(
+    state: Arc<ApiSharedState>,
+    buddy_ai: bool,
+    body_vec: Vec<u8>,
+    model: String,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+    encoded: HashSet<String>,
+    fallback: Vec<super::dispatch::PoolCandidate>,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    // 聚合含分级重试退避（RetrySame sleep 最长 60s×N），对齐 wb_aggregate_chat
+    // 迁入 stream_runtime 专用阻塞池（防饿死主池鉴权等短任务）
+    super::stream_runtime().spawn_blocking(move || {
+        // inflight guard 随后台任务存续至流结束（§4.5，客户端断连由 Drop 兜底）
+        let chat_id = match proto {
+            Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+            Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
+            Protocol::Anthropic => format!("msg_{}", now_ts()),
+            Protocol::Responses => format!("resp_{}", now_ts()),
+        };
+
+        // keep-alive ticker：wb_stream_chat 同款 watch + DoneSignal 范式；间隔取
+        // pseudo_keepalive_secs（默认 5s，比流式 15s 更激进防 idle 回收；0 = 关闭）
+        let keepalive_secs = state
+            .pseudo_keepalive_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if keepalive_secs > 0 {
+            let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+            let _done = super::routes::DoneSignal(done_tx);
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(keepalive_secs));
+                tick.tick().await; // 首个 tick 立即返回，跳过
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            if tx2
+                                .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        // 主任务已结束：ticker 退出，放行流终结
+                        _ = done_rx.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核；
+        // Sse sink 成功就地合成下发，耗尽/Fatal 均内核内错误帧收尾（Json sink
+        // 的 Fatal Err 由 wb_aggregate_chat 外层映射 HTTP 错误响应）
+        let view = WbView::new(state, buddy_ai);
+        // Err 仅 Fatal 会抵达（成功/耗尽/移交均已就地收尾或发帧）——Sse 出口已在
+        // 内核内发帧，此处无需再处理
+        let _ = run_wb_aggregate_inner(
+            &view,
+            &body_vec,
+            &model,
+            &key_id,
+            true, // 伪流式对外是流，记账 is_stream 口径与流式路径一致
+            start_ts,
+            guard,
+            &encoded,
+            fallback,
+            AggregateSink::Sse { tx, proto, chat_id },
+        );
     });
 
     let stream = ReceiverStream::new(rx);
@@ -1263,6 +1421,11 @@ pub(crate) fn run_wb_stream(
         });
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
+    // issue #213 阶段2 审查修复：预算累计计数器——重开轮换会把 tried 中非冷却
+    // 账号移出（tried.len() 回落到池账号数），用 tried.len() 判预算会归零导致
+    // 无限轮换（cut/空完成不冷却时 budget 永不耗尽）。改为 insert 累加、耗尽
+    // 判定用累计值，跨轮不重置（口径 =「累计发起过上游请求的账号次数」）。
+    let mut budget_used: u32 = 0;
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
     // PR #162：传输掐断计数——全池被掐时耗尽收尾改报传输掐断而非误报无健康账号
     let mut cut_hits: usize = 0;
@@ -1305,6 +1468,29 @@ pub(crate) fn run_wb_stream(
                     p
                 }
                 None => {
+                    // issue #213 阶段2：预算重开轮换——tried 耗尽且未达 budget 时
+                    // 清空非冷却账号 + 抖动退避后重开（0 = 旧行为，直接落收尾）
+                    let budget = state.retry_budget(state.buddy_ai);
+                    let rounds = budget_used;
+                    if let Some(new_tried) = budget_retry_round(&state, &tried, model, rounds, budget) {
+                        let round = rounds / state.route_pool().count().max(1) as u32;
+                        let delay = budget_backoff_ms(round.max(1));
+                        state.logger.log_sched_event(&format!(
+                            "retry budget 重开轮换 round={}/budget={} 退避 {}ms pool={}",
+                            round.max(1),
+                            budget,
+                            delay,
+                            state.pool_label(),
+                        ));
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                        // 退避期间客户端离开 → 不再烧重开轮次（对齐轮换入口断连检测）
+                        if tx.is_closed() {
+                            state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, true, start_ts.elapsed().as_millis() as u64, 0, 0);
+                            return;
+                        }
+                        tried = new_tried;
+                        continue;
+                    }
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
@@ -1404,6 +1590,7 @@ pub(crate) fn run_wb_stream(
             },
         };
         tried.insert(picked.uid.clone());
+        budget_used += 1; // 预算累计计数（重开轮换不清零，见声明处注释）
         // F-77 账号级在途计数：取号即绑定（重试换号时 bind_account 自动解绑旧账号）。
         // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
         // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
@@ -1847,42 +2034,66 @@ pub(crate) fn run_wb_stream(
 
 // ==================== 非流式（上游只回 SSE → 本地聚合） ====================
 
-pub async fn wb_aggregate_chat(
-    state: Arc<ApiSharedState>,
-    buddy_ai: bool,
-    body_vec: Vec<u8>,
-    model: String,
+/// 聚合内核出口（issue #213 S3）：wb_aggregate_chat 闭包主体参数化抽出——
+/// 单一内核两出口（AggregateSink::Json = 现状聚合行为；AggregateSink::Sse =
+/// 伪流式 S5 使用），杜绝复制漂移。Json 出口行为必须与抽出前逐字节一致。
+pub(crate) enum AggregateSink {
+    /// 现状聚合：成功 completion 由薄壳按 proto 投影 JSON 响应
+    Json,
+    /// 伪流式（S5）：成功 completion 就地合成 SSE 帧序列下发
+    Sse {
+        tx: SseTx,
+        proto: Protocol,
+        chat_id: String,
+    },
+}
+
+/// 聚合内核成功出口产物（issue #213 S3）：
+/// - Completion：聚合 completion（Json sink；薄壳按 proto 投影，行为与抽出前一致）
+/// - SseSent：SSE 帧已合成下发完毕（Sse sink；薄壳无需再构造响应体）
+pub(crate) enum AggregateOutcome {
+    Completion(Value),
+    SseSent,
+}
+
+/// 聚合内核（issue #213 S3）：wb_aggregate_chat 闭包主体参数化抽出——
+/// 单一内核两出口（AggregateSink::Json = 现状聚合行为；AggregateSink::Sse =
+/// 伪流式 S5 使用），杜绝复制漂移。Json 出口行为必须与抽出前逐字节一致。
+/// 仅参数化，不改逻辑：粘性解析、Key 约束、种子/别名改写、残指纹自检、
+/// 11128 处置、retry_plan 分级重试、对冲竞速、空完成换号、TTFT 记账、
+/// 耗尽收尾全部零改动；fallback 参数 S5 已接线——仅 Sse 出口在本池轮换
+/// 耗尽时走跨池移交（Json 出口恒传空链，行为不变）。
+pub(crate) fn run_wb_aggregate_inner(
+    view: &WbView,
+    body_vec: &[u8],
+    model: &str,
+    key_id: &str,
     stream: bool,
     start_ts: Instant,
-    proto: Protocol,
-    key_id: String,
-    guard: InflightGuard,
-    encoded: std::collections::HashSet<String>,
-) -> Response {
-    let model_out = model.clone();
-    // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
-    // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池
-    let result = super::stream_runtime().spawn_blocking(move || {
-        // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
-        let mut guard = guard;
-        // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核；
-        // 影子化后家族字段（route_pool/route_sticky/记账桶/池标签）按视图分流，
-        // 共享字段（data_dir/logger/wb_sanitize）经 Deref 零改动
-        let state = WbView::new(state, buddy_ai);
-        // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
-        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
-        // issue #138 P0：peek DOM 用完即弃——块内一次性提取 sticky/longctx 提示
-        // 与 effort 后立即释放，不再存活整条闭包；sticky 键改走 from_slice 窄探测，
-        // 块内也不再有整包 DOM（大 body 下 DOM 放大 3~6 倍）
-        let (sticky_key, effort_hint) = {
-            let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
-            // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
-            log_longctx_hint(&state, &peek, &model);
-            (
-                SessionKey::from_slice(&body_vec),
-                peek.get("reasoning_effort").and_then(|v| v.as_str()).map(str::to_string),
-            )
-        };
+    mut guard: InflightGuard,
+    encoded: &HashSet<String>,
+    fallback: Vec<super::dispatch::PoolCandidate>,
+    sink: AggregateSink,
+) -> Result<AggregateOutcome, String> {
+    let state = view;
+    // inflight guard 随后台任务存续至聚合完成（§4.5）；F-77 取号后绑定账号级计数
+    // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核；
+    // 影子化后家族字段（route_pool/route_sticky/记账桶/池标签）按视图分流，
+    // 共享字段（data_dir/logger/wb_sanitize）经 Deref 零改动
+    // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
+    let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
+    // issue #138 P0：peek DOM 用完即弃——块内一次性提取 sticky/longctx 提示
+    // 与 effort 后立即释放，不再存活整条闭包；sticky 键改走 from_slice 窄探测，
+    // 块内也不再有整包 DOM（大 body 下 DOM 放大 3~6 倍）
+    let (sticky_key, effort_hint) = {
+        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
+        // F-76④ 上下文过大提示（仅日志标注，不做真裁剪）
+        log_longctx_hint(&state, &peek, &model);
+        (
+            SessionKey::from_slice(&body_vec),
+            peek.get("reasoning_effort").and_then(|v| v.as_str()).map(str::to_string),
+        )
+    };
         let templates = load_templates(&state);
         // 工具名别名表（issue #150 接线）：WB 族池（Buddy CN / BuddyAI Intl）共用；
         // 与 wb_stream_chat 同口径（详见该入口注记）
@@ -1948,6 +2159,10 @@ pub async fn wb_aggregate_chat(
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
+        // issue #213 阶段2 审查修复：预算累计计数器（口径同 run_wb_stream 流式
+        // 路径声明处注释——重开轮换清空 tried 后 tried.len() 会归零，必须用
+        // 跨轮累计值判预算，否则 cut/空完成不冷却场景下无限轮换）
+        let mut budget_used: u32 = 0;
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
         // PR #162：传输掐断计数（聚合侧对齐流式路径）
         let mut cut_hits: usize = 0;
@@ -1958,6 +2173,15 @@ pub async fn wb_aggregate_chat(
         let mut aggressive_tried = false;
 
         loop {
+            // 客户端断连检测（审查修复：对齐 run_wb_stream loop 顶部口径）——
+            // 仅 Sse sink（伪流式）持有客户端通道；断连即终止轮换，不再烧账号
+            //（RetrySame 退避最长 60s×N，此前需烧完当前轮换才终止）
+            if let AggregateSink::Sse { tx, .. } = &sink {
+                if tx.is_closed() {
+                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, stream, start_ts.elapsed().as_millis() as u64, 0, 0);
+                    return Ok(AggregateOutcome::SseSent);
+                }
+            }
             let picked = match first_pick.take() {
                 Some(p) => p,
                 None => match state.route_pool().pick_excluding_constrained_ev_matching(
@@ -1974,8 +2198,31 @@ pub async fn wb_aggregate_chat(
                         p
                     }
                     None => {
-                        state.record_usage_bucket(state.usage_bucket(), &model, "none", &key_id, false, stream,
-                            start_ts.elapsed().as_millis() as u64, 0, 0);
+                        // issue #213 阶段2：预算重开轮换（口径同 run_wb_stream 流式
+                        // 路径——聚合/伪流式两出口共用本内核）
+                        let budget = state.retry_budget(state.buddy_ai);
+                        let rounds = budget_used;
+                        if let Some(new_tried) = budget_retry_round(&state, &tried, model, rounds, budget) {
+                            let round = rounds / state.route_pool().count().max(1) as u32;
+                            let delay = budget_backoff_ms(round.max(1));
+                            state.logger.log_sched_event(&format!(
+                                "retry budget 重开轮换 round={}/budget={} 退避 {}ms pool={}",
+                                round.max(1),
+                                budget,
+                                delay,
+                                state.pool_label(),
+                            ));
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                            // 断连检查（对齐 §4.5 聚合检查点口径）：退避后客户端离开即终止
+                            if let AggregateSink::Sse { tx, .. } = &sink {
+                                if tx.is_closed() {
+                                    state.record_usage_bucket(state.usage_bucket(), model, "none", key_id, false, stream, start_ts.elapsed().as_millis() as u64, 0, 0);
+                                    return Ok(AggregateOutcome::SseSent);
+                                }
+                            }
+                            tried = new_tried;
+                            continue;
+                        }
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                         let (healthy_total, _) = state.route_pool().selectable_stats_in(None, false);
                         let (hard_credit_cnt, _) = state.route_pool().hard_credit_stats();
@@ -2000,11 +2247,32 @@ pub async fn wb_aggregate_chat(
                                 wb_payload::fingerprint_sample(&body_vec),
                             ));
                         }
+                        // issue #213 S5：Sse 出口跨池兜底移交（对齐 run_wb_stream 耗尽
+                        // 收尾 L1376-1381 既有范式）——移交成功由接收池落终态用量，
+                        // 本池不补 "none" 行（防双记账）；移交失败/无 fallback → 本池
+                        // 落 "none" 行 + 按 proto 发错误帧收尾（客户端仍持开流）
+                        if let AggregateSink::Sse { tx, proto, chat_id } = sink {
+                            if !fallback.is_empty() && !tx.is_closed() {
+                                if super::cross_pool::continue_stream_on_next_pool(
+                                    &state.state, state.pool_label(), &fallback, &body_vec, proto,
+                                    &key_id, &chat_id, &tx, guard, encoded, start_ts,
+                                ) {
+                                    return Ok(AggregateOutcome::SseSent);
+                                }
+                            }
+                            state.record_usage_bucket(state.usage_bucket(), &model, "none", &key_id, false, stream,
+                                start_ts.elapsed().as_millis() as u64, 0, 0);
+                            send_pseudo_exhaust_frame(&tx, proto, &exhaust_msg);
+                            return Ok(AggregateOutcome::SseSent);
+                        }
+                        state.record_usage_bucket(state.usage_bucket(), &model, "none", &key_id, false, stream,
+                            start_ts.elapsed().as_millis() as u64, 0, 0);
                         return Err(exhaust_msg);
                     }
                 },
             };
             tried.insert(picked.uid.clone());
+            budget_used += 1; // 预算累计计数（重开轮换不清零，见声明处注释）
             // F-77 账号级在途计数：取号即绑定。
             // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
             // 不发起请求换下一候选（不计错误不冷却）；over_limit 候选（专一/粘性
@@ -2149,7 +2417,16 @@ pub async fn wb_aggregate_chat(
                                     duration_ms, Some(ttfb_ms), &key_name,
                                     &state.route_pool().name_of(win_uid), None,
                                 );
-                                return Ok((r, tool_alias));
+                                // 成功出口（S3）：Json sink 原样带出 completion（薄壳投影，
+                                // tool_alias 与原路径一致在此丢弃——流式收集阶段已回改原名，
+                                // 此处再回改会二次改名损坏工具名）；Sse sink 就地合成下发
+                                return match sink {
+                                    AggregateSink::Json => Ok(AggregateOutcome::Completion(r)),
+                                    AggregateSink::Sse { tx, proto, chat_id } => {
+                                        synthesize_sse(&tx, proto, &r, &chat_id, model, encoded);
+                                        Ok(AggregateOutcome::SseSent)
+                                    }
+                                };
                             }
                             (None, Some((code, msg))) => {
                                 // P2-2：传输层掐断（账号无关传输故障）——不冷却、不解绑
@@ -2205,6 +2482,13 @@ pub async fn wb_aggregate_chat(
                                         duration_ms, Some(ttfb_ms), &key_name,
                                         &state.route_pool().name_of(win_uid), Some(&fatal_msg),
                                     );
+                                    // Sse sink Fatal 收尾（伪流式静默断流修复）：HTTP 200
+                                    // 已发出无法改状态码，内核内按 proto 发错误帧后再透传
+                                    // Err——否则客户端只收到 keep-alive 后连接静默关闭
+                                    //（Json sink 由 wb_aggregate_chat 外层映射 HTTP 错误，跳过）
+                                    if let AggregateSink::Sse { tx, proto, .. } = &sink {
+                                        send_pseudo_exhaust_frame(tx, *proto, &fatal_msg);
+                                    }
                                     return Err(fatal_msg);
                                 }
                                 let kind = classify_wb_error(code, &msg);
@@ -2332,22 +2616,60 @@ pub async fn wb_aggregate_chat(
                                     &key_name, &state.route_pool().name_of(&picked.uid),
                                     Some(&safe_slice(&resp_body, 300)),
                                 );
-                                return Err(format!(
+                                let fatal_msg = format!(
                                     "upstream {} error: {}",
                                     status,
                                     safe_slice(&resp_body, 300)
-                                ));
+                                );
+                                // Sse sink Fatal 收尾（伪流式静默断流修复，口径同 11128
+                                // Fatal 分支）：发 proto 错误帧防客户端静默断流
+                                if let AggregateSink::Sse { tx, proto, .. } = &sink {
+                                    send_pseudo_exhaust_frame(tx, *proto, &fatal_msg);
+                                }
+                                return Err(fatal_msg);
                             }
                         }
                     }
                 }
             }
         }
-    })
-    .await;
+    // 轮换 loop 无 break 出口（换号 continue / 成功与终局均 return）→ 类型为 !，
+    // 函数尾无需 unreachable 占位返回值
+}
+
+/// 非流式聚合入口（issue #213 S3 薄壳化）：spawn_blocking 调聚合内核
+/// run_wb_aggregate_inner（AggregateSink::Json，行为与抽出前逐字节一致），
+/// 内核结果透传——成功 Completion 按 proto 投影 JSON 响应；失败 Err 按原
+/// 口径映射状态码/错误体（Fatal 透传上游状态码 + proto 分流错误体）。
+pub async fn wb_aggregate_chat(
+    state: Arc<ApiSharedState>,
+    buddy_ai: bool,
+    body_vec: Vec<u8>,
+    model: String,
+    stream: bool,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+    encoded: std::collections::HashSet<String>,
+) -> Response {
+    let model_out = model.clone();
+    // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
+    // 长阻塞占主池会饿死鉴权等短任务，迁入 stream_runtime 专用阻塞池
+    let encoded_inner = encoded.clone();
+    let result = super::stream_runtime()
+        .spawn_blocking(move || {
+            let view = WbView::new(state, buddy_ai);
+            run_wb_aggregate_inner(
+                &view, &body_vec, &model, &key_id, stream, start_ts, guard, &encoded_inner,
+                Vec::new(), // S3：聚合路径无 fallback 链（现状）；S5 伪流式入口传入
+                AggregateSink::Json,
+            )
+        })
+        .await;
 
     match result {
-        Ok(Ok((resp, _tool_alias))) => {
+        Ok(Ok(AggregateOutcome::Completion(resp))) => {
             let body = match proto {
                 // tool_alias 传 None（对齐 qoder_route 聚合分支正确范式）：resp 来自
                 // 闭包内 wb_sse::aggregate，流式收集阶段已按逆映射回改原名；此处再传
@@ -2373,6 +2695,8 @@ pub async fn wb_aggregate_chat(
                 .body(Body::from(body.to_string()))
                 .unwrap_or_else(|_| internal_error_response())
         }
+        // Json sink 恒走 Completion（SseSent 仅 Sse sink 产生；Json 出口合成由 S5 接线）
+        Ok(Ok(AggregateOutcome::SseSent)) => internal_error_response(),
         Ok(Err(msg)) => {
             // 审查修复：Fatal 错误透传上游状态码（对齐 SOLO 聚合路径 AggregateFail::Upstream）。
             // 上游 400/404/413 等请求级错误此前被统一降级 503 no_healthy_account，
@@ -2399,6 +2723,466 @@ pub async fn wb_aggregate_chat(
             &format!("task join error: {}", e),
         ),
     }
+}
+
+// ==================== 伪流式 SSE 帧合成（issue #213 §4.4） ====================
+
+/// delta 切片粒度（§4.4 决策点 3）：~512 字符切片拆多个 delta 帧——兼容按
+/// delta 计数做进度条的客户端；纯帧粒度调整，语义不变
+const SSE_DELTA_CHUNK_CHARS: usize = 512;
+
+/// 按字符边界切片（禁止按字节切出半个 UTF-8）：chars.collect 后按块切
+fn chunk_chars(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .chunks(SSE_DELTA_CHUNK_CHARS)
+        .map(|c| c.iter().collect())
+        .collect()
+}
+
+/// 伪流式 SSE 通道帧类型（issue #213 §4.4/S5）：与 wb_stream_chat 流通道同型
+/// （Sender<Result<Bytes, io::Error>>）——keep-alive ticker、ReceiverStream 组装、
+/// 跨池移交 continue_stream_on_next_pool（要求 Result 型通道）共用同一通道类型
+type SseTx = tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>;
+
+/// 伪流式 SSE 合成（issue #213 §4.4）：聚合 completion 按客户端协议合成 SSE 帧
+/// 序列，tx 逐帧 blocking_send（内核在 spawn_blocking 同步上下文中调用）。发送
+/// 失败（客户端断连）立即 return。
+///
+/// 帧序列规格（严格照 docs/pending §4.4）：
+/// - OpenAi：role 帧 → 内容帧（512 切片）→ tool_calls/stop 收尾 → [usage 帧] → [DONE]
+/// - Anthropic：message_start → content_block_start → text_delta×N →
+///   content_block_stop → [tool_use 块×N] → message_delta → message_stop
+/// - Responses：复用 tool_exec 现成合成口径（created → items → completed）
+/// - OpenAiText：text 帧×N → finish 帧 → [DONE]
+pub(crate) fn synthesize_sse(
+    tx: &SseTx,
+    proto: Protocol,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+    encoded: &HashSet<String>,
+) {
+    match proto {
+        Protocol::OpenAi => synth_openai(tx, completion, chat_id, model),
+        Protocol::Anthropic => synth_anthropic(tx, completion, chat_id, model),
+        Protocol::Responses => synth_responses(tx, completion, chat_id, model, encoded),
+        Protocol::OpenAiText => synth_openai_text(tx, completion, chat_id, model),
+    }
+}
+
+/// 发送一帧（`data: {json}\n\n`）；失败（客户端断连）返回 false
+fn send_data(tx: &SseTx, data: &Value) -> bool {
+    send_raw(tx, &format!("data: {data}\n\n"))
+}
+
+/// 发送一帧（`event: {name}\ndata: {json}\n\n`）；失败返回 false
+fn send_event(tx: &SseTx, event: &str, data: &Value) -> bool {
+    send_raw(tx, &format!("event: {event}\ndata: {data}\n\n"))
+}
+
+/// 原始帧发送；blocking_send 失败（接收端已关闭 = 客户端断连）→ false
+fn send_raw(tx: &SseTx, frame: &str) -> bool {
+    tx.blocking_send(Ok(bytes::Bytes::from(frame.to_string()))).is_ok()
+}
+
+/// 伪流式耗尽收尾错误帧（issue #213 S5）：本池轮换耗尽且无 fallback 或移交
+/// 失败时，按客户端协议发各自错误帧（文案/帧形态/归因对齐 wb_stream_chat
+/// 耗尽收尾既有口径：Anthropic 收 event: error、Responses 收 response.failed、
+/// OpenAI 系 data: 错误帧 + [DONE]）
+fn send_pseudo_exhaust_frame(
+    tx: &SseTx,
+    proto: Protocol,
+    exhaust_msg: &str,
+) {
+    match proto {
+        Protocol::Anthropic => {
+            let err = json!({"type":"error","error":{"type":"api_error","message":exhaust_msg}});
+            let _ = send_raw(tx, &format!("event: error\ndata: {err}\n\n"));
+        }
+        Protocol::Responses => {
+            let resp = json!({
+                "id": format!("resp_{}", now_ts()),
+                "object": "response",
+                "status": "failed",
+                "output": [],
+                "error": {"code": "no_healthy_account", "message": exhaust_msg},
+            });
+            let body = json!({"type": "response.failed", "response": resp});
+            let _ = send_raw(tx, &format!("event: response.failed\ndata: {body}\n\n"));
+        }
+        _ => {
+            let err_body = json!({
+                "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
+            });
+            let _ = send_raw(tx, &format!("data: {err_body}\n\n"));
+            let _ = send_raw(tx, "data: [DONE]\n\n");
+        }
+    }
+}
+
+/// choice/message 提取（completion 侧与 wb_sse::completion_to_anthropic 同口径）
+fn synth_choice(completion: &Value) -> (Value, Value) {
+    let choice = completion
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(json!({}));
+    let message = choice.get("message").cloned().unwrap_or(json!({}));
+    (choice, message)
+}
+
+/// 上游 finish_reason → OpenAI 流式收尾帧语义（stop / tool_calls）
+fn synth_finish_stream(choice: &Value, message: &Value) -> &'static str {
+    let has_tool_calls = message
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if has_tool_calls {
+        "tool_calls"
+    } else {
+        match choice.get("finish_reason").and_then(|f| f.as_str()) {
+            Some("tool_calls") | Some("function_call") => "tool_calls",
+            _ => "stop",
+        }
+    }
+}
+
+/// OpenAI /v1/chat/completions 伪流式帧序列
+fn synth_openai(
+    tx: &SseTx,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+) {
+    // 审查修复：chat_id 由入口按 proto 生成时已带前缀（chatcmpl-/cmpl-/msg_/resp_），
+    // 此处直接使用，不得二次拼前缀（否则产出 "chatcmpl-chatcmpl-…" 畸形 ID）
+    let id = chat_id.to_string();
+    let created = now_ts();
+    let chunk = |delta: Value, finish: Value| {
+        json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        })
+    };
+    // 首帧：role 帧
+    if !send_data(tx, &chunk(json!({"role": "assistant", "content": ""}), Value::Null)) {
+        return;
+    }
+    let (choice, message) = synth_choice(completion);
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .filter(|a| !a.is_empty())
+        .cloned();
+    if let Some(tcs) = tool_calls.as_ref() {
+        // 内容帧（有文本仍先下发文本）
+        let text = message.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        for piece in chunk_chars(text) {
+            if !send_data(tx, &chunk(json!({"content": piece}), Value::Null)) {
+                return;
+            }
+        }
+        // tool_calls 按 index 逐项完整下发（id/type/function.name/arguments 整段）
+        for tc in tcs {
+            if !send_data(tx, &chunk(json!({"tool_calls": [tc]}), Value::Null)) {
+                return;
+            }
+        }
+    } else {
+        let text = message.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        for piece in chunk_chars(text) {
+            if !send_data(tx, &chunk(json!({"content": piece}), Value::Null)) {
+                return;
+            }
+        }
+    }
+    // usage 帧（completion.usage 非空时补，choices:[]，对齐 stream_options.include_usage）
+    let usage = completion.get("usage").filter(|u| !u.is_null());
+    if let Some(u) = usage {
+        let mut frame = chunk(json!({}), Value::Null);
+        frame["choices"] = json!([]);
+        frame["usage"] = u.clone();
+        if !send_data(tx, &frame) {
+            return;
+        }
+    }
+    // 收尾帧
+    let finish = synth_finish_stream(&choice, &message);
+    if !send_data(tx, &chunk(json!({}), json!(finish))) {
+        return;
+    }
+    let _ = send_raw(tx, "data: [DONE]\n\n");
+}
+
+/// Anthropic /v1/messages 伪流式事件序列
+fn synth_anthropic(
+    tx: &SseTx,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+) {
+    let (choice, message) = synth_choice(completion);
+    let (it, ot) = completion.get("usage").map(u64_pair).unwrap_or((0, 0));
+    // message_start（usage.output_tokens 起始 1，对齐 Anthropic 流式惯例与 §4.4 规格样例）
+    let msg_start = json!({
+        "type": "message_start",
+        "message": {
+            "id": chat_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {"input_tokens": it, "output_tokens": 1},
+        },
+    });
+    if !send_event(tx, "message_start", &msg_start) {
+        return;
+    }
+    let mut index: i64 = 0;
+    let mut stop_reason = "end_turn";
+    // reasoning_content → thinking block（与 completion_to_anthropic 同口径，置于 text 之前）
+    if let Some(t) = message
+        .get("reasoning_content")
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        if !send_event(tx, "content_block_start", &json!({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "thinking", "thinking": ""},
+        })) {
+            return;
+        }
+        for piece in chunk_chars(t) {
+            if !send_event(tx, "content_block_delta", &json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "thinking_delta", "thinking": piece},
+            })) {
+                return;
+            }
+        }
+        if !send_event(tx, "content_block_stop", &json!({
+            "type": "content_block_stop", "index": index,
+        })) {
+            return;
+        }
+        index += 1;
+    }
+    // text block（内容非空才开块；completion_to_anthropic 投影同样空文本不出块）
+    if let Some(t) = message.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
+        if !send_event(tx, "content_block_start", &json!({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "text", "text": ""},
+        })) {
+            return;
+        }
+        for piece in chunk_chars(t) {
+            if !send_event(tx, "content_block_delta", &json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "text_delta", "text": piece},
+            })) {
+                return;
+            }
+        }
+        if !send_event(tx, "content_block_stop", &json!({
+            "type": "content_block_stop", "index": index,
+        })) {
+            return;
+        }
+        index += 1;
+    }
+    // tool_use 块：每个 tool_call 一块（input_json_delta 整段 arguments）
+    if let Some(tcs) = message.get("tool_calls").and_then(|t| t.as_array()) {
+        for tc in tcs {
+            let args = tc
+                .pointer("/function/arguments")
+                .and_then(|a| a.as_str())
+                .unwrap_or("{}")
+                .to_string();
+            let id = tc.get("id").cloned().unwrap_or(json!("toolu_0"));
+            let name = tc
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if !send_event(tx, "content_block_start", &json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}},
+            })) {
+                return;
+            }
+            if !send_event(tx, "content_block_delta", &json!({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": args},
+            })) {
+                return;
+            }
+            if !send_event(tx, "content_block_stop", &json!({
+                "type": "content_block_stop", "index": index,
+            })) {
+                return;
+            }
+            index += 1;
+            stop_reason = "tool_use";
+        }
+    }
+    // 全空兜底（completion_to_anthropic 空内容兜底同口径）：补空 text 块
+    if index == 0 {
+        if !send_event(tx, "content_block_start", &json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })) {
+            return;
+        }
+        if !send_event(tx, "content_block_stop", &json!({
+            "type": "content_block_stop", "index": 0,
+        })) {
+            return;
+        }
+    }
+    // message_delta + message_stop
+    let finish = choice.get("finish_reason").and_then(|f| f.as_str()).unwrap_or("");
+    if stop_reason != "tool_use" {
+        stop_reason = match finish {
+            "length" => "max_tokens",
+            "content_filter" => "refusal",
+            _ => "end_turn",
+        };
+    }
+    let msg_delta = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+        "usage": {"output_tokens": ot},
+    });
+    if !send_event(tx, "message_delta", &msg_delta) {
+        return;
+    }
+    let _ = send_event(tx, "message_stop", &json!({"type": "message_stop"}));
+}
+
+/// Responses /v1/responses 伪流式事件序列：复用 wb_tool_exec 现成合成口径
+/// （created → output_item.added → delta×N → output_item.done → completed），
+/// delta 按 512 字符切片（tool_exec 原为整段一帧，此处粒度调整语义不变）
+fn synth_responses(
+    tx: &SseTx,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+    encoded: &HashSet<String>,
+) {
+    // 审查修复：chat_id 已带 resp_ 前缀（同 synth_openai 注释），直接使用
+    let resp_id = chat_id.to_string();
+    let mut resp_obj = super::wb_responses::completion_to_responses(completion, &resp_id, model, encoded);
+    resp_obj["model"] = json!(model);
+    let send = |event: &str, data: &Value| -> bool { send_event(tx, event, data) };
+    let mut created = resp_obj.clone();
+    created["status"] = json!("in_progress");
+    created["output"] = json!([]);
+    if !send("response.created", &json!({"type": "response.created", "response": created})) {
+        return;
+    }
+    let output_items = resp_obj
+        .get("output")
+        .and_then(|o| o.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for (i, item) in output_items.iter().enumerate() {
+        if !send("response.output_item.added", &json!({
+            "type": "response.output_item.added",
+            "output_index": i,
+            "item": item,
+        })) {
+            return;
+        }
+        // message 文本增量（512 切片多帧）
+        if item.get("type").and_then(|v| v.as_str()) == Some("message") {
+            if let Some(text) = item
+                .pointer("/content/0/text")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                for piece in chunk_chars(text) {
+                    if !send("response.output_text.delta", &json!({
+                        "type": "response.output_text.delta",
+                        "item_id": item.get("id").cloned().unwrap_or(json!("")),
+                        "output_index": i,
+                        "content_index": 0,
+                        "delta": piece,
+                    })) {
+                        return;
+                    }
+                }
+            }
+        }
+        // function_call 参数增量（512 切片多帧）
+        if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+            if let Some(args) = item
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                for piece in chunk_chars(args) {
+                    if !send("response.function_call_arguments.delta", &json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item.get("id").cloned().unwrap_or(json!("")),
+                        "output_index": i,
+                        "delta": piece,
+                    })) {
+                        return;
+                    }
+                }
+            }
+        }
+        if !send("response.output_item.done", &json!({
+            "type": "response.output_item.done",
+            "output_index": i,
+            "item": item,
+        })) {
+            return;
+        }
+    }
+    let _ = send("response.completed", &json!({"type": "response.completed", "response": resp_obj}));
+}
+
+/// OpenAiText /v1/completions 伪流式帧序列
+fn synth_openai_text(
+    tx: &SseTx,
+    completion: &Value,
+    chat_id: &str,
+    model: &str,
+) {
+    let text = completion
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let finish = completion
+        .pointer("/choices/0/finish_reason")
+        .and_then(|f| f.as_str())
+        .unwrap_or("stop");
+    for piece in chunk_chars(text) {
+        if !send_data(tx, &json!({
+            "id": chat_id,
+            "object": "text_completion",
+            "choices": [{"index": 0, "text": piece, "finish_reason": null}],
+            "model": model,
+        })) {
+            return;
+        }
+    }
+    if !send_data(tx, &json!({
+        "id": chat_id,
+        "object": "text_completion",
+        "choices": [{"index": 0, "text": "", "finish_reason": finish}],
+        "model": model,
+    })) {
+        return;
+    }
+    let _ = send_raw(tx, "data: [DONE]\n\n");
 }
 
 // ==================== T5.5/F-64 网关工具代执行编排 ====================
@@ -3223,6 +4007,25 @@ mod tests {
         ));
         // 与渠道级 11128 互不误撞
         assert!(!matches!(classify_wb_error(11128, "request illegal"), ErrKind::Forbidden));
+        // 4054「模型请求失败，请稍后重试」（issue #212/#151）：瞬态过载 →
+        // SoftRate 60s 短冷却，不得落兜底 Client 10 分钟误杀健康账号
+        assert!(matches!(classify_wb_error(4054, "x"), ErrKind::SoftRate));
+        assert!(matches!(
+            classify_wb_error(0, "模型请求失败，请稍后重试。"),
+            ErrKind::SoftRate
+        ));
+        // 数字边界：40540 不命中 4054 识别（落既有 >=500 分段 Server）
+        assert!(matches!(classify_wb_error(40540, "x"), ErrKind::Server));
+        // 复合文案优先级：关键词分类（HardCredit/SessionDead）优先于
+        // 「请稍后重试」短语兜底，不得被劫持改判 SoftRate
+        assert!(matches!(
+            classify_wb_error(200, "积分不足，请稍后重试"),
+            ErrKind::HardCredit
+        ));
+        assert!(matches!(
+            classify_wb_error(200, "token expired，请稍后重试"),
+            ErrKind::SessionDead
+        ));
     }
 
     /// 6004 限额文案 → 精确恢复时刻（agent2api errors.rs 同源语义；
@@ -3410,5 +4213,331 @@ mod tests {
         assert!(u.get("total_tokens").is_none());
         assert_eq!(u["cache_read_token"], serde_json::json!(0));
         assert_eq!(u["cache_write_token"], serde_json::json!(0));
+    }
+
+    // ==================== 伪流式 SSE 帧合成测试（issue #213 §4.4 S4） ====================
+
+    /// 收帧辅助：collector 线程收满通道（tx drop 后通道关闭终止），
+    /// 返回原始帧字符串列表（synth_* 内部 blocking_send 要求非 async 上下文，
+    /// 测试线程恰好满足；通道类型与 SseTx 一致）
+    fn collect_frames(
+        f: impl FnOnce(&tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>) + Send + 'static,
+    ) -> Vec<String> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let handle = std::thread::spawn(move || {
+            let mut frames = Vec::new();
+            while let Some(item) = rx.blocking_recv() {
+                if let Ok(bytes) = item {
+                    frames.push(String::from_utf8(bytes.to_vec()).unwrap());
+                }
+            }
+            frames
+        });
+        f(&tx);
+        drop(tx);
+        handle.join().unwrap()
+    }
+
+    /// 提取 data: 载荷 JSON（[DONE] 返回 None）
+    fn data_payload(frame: &str) -> Option<Value> {
+        let body = frame.strip_prefix("data: ")?.trim_end();
+        if body == "[DONE]" {
+            return None;
+        }
+        Some(serde_json::from_str(body).unwrap())
+    }
+
+    /// OpenAI 纯文本 completion：role 首帧 → 内容帧 → stop 收尾 → [DONE]
+    #[test]
+    fn synth_openai_plain_text_frame_sequence() {
+        let completion = json!({
+            "id": "chatcmpl-x",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "你好世界"}}],
+            "usage": null,
+        });
+        let frames = collect_frames(move |tx| {
+            synth_openai(tx, &completion, "cid1", "gpt-test");
+        });
+        // 首帧(role) + 1 内容帧(短文本不切片) + 收尾帧 + [DONE]
+        assert_eq!(frames.len(), 4, "frames: {frames:?}");
+        assert!(frames.last().unwrap() == "data: [DONE]\n\n", "末帧 [DONE]");
+        // 首帧：role 帧（finish_reason null）
+        let first = data_payload(&frames[0]).unwrap();
+        assert_eq!(first["choices"][0]["delta"]["role"], json!("assistant"));
+        assert_eq!(first["choices"][0]["finish_reason"], Value::Null);
+        // 内容帧：整段文本
+        let content = data_payload(&frames[1]).unwrap();
+        assert_eq!(content["choices"][0]["delta"]["content"], json!("你好世界"));
+        // 收尾帧：finish_reason stop
+        let finish = data_payload(&frames[2]).unwrap();
+        assert_eq!(finish["choices"][0]["delta"], json!({}));
+        assert_eq!(finish["choices"][0]["finish_reason"], json!("stop"));
+        assert_eq!(finish["object"], json!("chat.completion.chunk"));
+    }
+
+    /// OpenAI tool_calls + usage：tool_calls 逐项帧、usage 帧（choices:[]）、
+    /// finish_reason:"tool_calls"
+    #[test]
+    fn synth_openai_tool_calls_and_usage() {
+        let completion = json!({
+            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                         "message": {"role": "assistant", "content": "",
+                                     "tool_calls": [{"index": 0, "id": "call_a", "type": "function",
+                                                     "function": {"name": "get_weather", "arguments": "{\"city\":\"北京\"}"}}]}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        });
+        let frames = collect_frames(move |tx| {
+            synth_openai(tx, &completion, "cid2", "gpt-test");
+        });
+        // role + 内容帧(空文本仍有空串切片帧) + tool_calls 帧 + usage 帧 + finish + [DONE]
+        let datas: Vec<Option<Value>> =
+            frames.iter().map(|f| data_payload(f)).collect();
+        assert_eq!(frames.last().unwrap(), "data: [DONE]\n\n");
+        // tool_calls 帧：delta.tool_calls 整段下发
+        let tc_frame = datas.iter().flatten()
+            .find(|d| d["choices"][0]["delta"]["tool_calls"].is_array())
+            .expect("必须有 tool_calls 帧");
+        assert_eq!(tc_frame["choices"][0]["delta"]["tool_calls"][0]["id"], json!("call_a"));
+        assert_eq!(tc_frame["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+                   json!("get_weather"));
+        // usage 帧：choices 为空数组
+        let usage_frame = datas.iter().flatten()
+            .find(|d| d.get("usage").is_some())
+            .expect("必须有 usage 帧");
+        assert_eq!(usage_frame["choices"], json!([]));
+        assert_eq!(usage_frame["usage"]["total_tokens"], json!(15));
+        // 收尾帧 finish_reason:"tool_calls"
+        let finish = datas.iter().flatten()
+            .find(|d| d["choices"][0]["finish_reason"] == json!("tool_calls"))
+            .expect("收尾帧必须 tool_calls");
+        assert_eq!(finish["choices"][0]["delta"], json!({}));
+    }
+
+    /// Anthropic 纯文本：message_start → content_block_start → text_delta×N →
+    /// content_block_stop → message_delta → message_stop 五类事件完整
+    #[test]
+    fn synth_anthropic_plain_text_event_sequence() {
+        let completion = json!({
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "你好"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+        });
+        let frames = collect_frames(move |tx| {
+            synth_anthropic(tx, &completion, "cid3", "claude-x");
+        });
+        // message_start + block_start + 1 delta + block_stop + message_delta + message_stop
+        assert_eq!(frames.len(), 6, "frames: {frames:?}");
+        let events: Vec<&str> = frames.iter()
+            .filter_map(|f| f.strip_prefix("event: "))
+            .filter_map(|rest| rest.split('\n').next())
+            .collect();
+        assert_eq!(events, vec![
+            "message_start", "content_block_start", "content_block_delta",
+            "content_block_stop", "message_delta", "message_stop",
+        ]);
+        // message_start 元信息
+        let start: Value = serde_json::from_str(
+            frames[0].split("\ndata: ").nth(1).unwrap().trim_end(),
+        ).unwrap();
+        assert_eq!(start["type"], json!("message_start"));
+        assert_eq!(start["message"]["usage"]["input_tokens"], json!(7));
+        // text_delta 内容
+        let delta: Value = serde_json::from_str(
+            frames[2].split("\ndata: ").nth(1).unwrap().trim_end(),
+        ).unwrap();
+        assert_eq!(delta["delta"]["type"], json!("text_delta"));
+        assert_eq!(delta["delta"]["text"], json!("你好"));
+        // message_delta stop_reason + usage
+        let msg_delta: Value = serde_json::from_str(
+            frames[4].split("\ndata: ").nth(1).unwrap().trim_end(),
+        ).unwrap();
+        assert_eq!(msg_delta["delta"]["stop_reason"], json!("end_turn"));
+        assert_eq!(msg_delta["usage"]["output_tokens"], json!(3));
+    }
+
+    /// Responses：created → output_item.added → output_text.delta →
+    /// output_item.done → completed，items 含文本
+    #[test]
+    fn synth_responses_created_items_completed() {
+        let completion = json!({
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "回复正文"}}],
+        });
+        let frames = collect_frames(move |tx| {
+            synth_responses(tx, &completion, "cid4", "gpt-test", &HashSet::new());
+        });
+        let events: Vec<&str> = frames.iter()
+            .filter_map(|f| f.strip_prefix("event: "))
+            .filter_map(|rest| rest.split('\n').next())
+            .collect();
+        assert!(events.contains(&"response.created"), "events: {events:?}");
+        assert!(events.contains(&"response.output_item.added"));
+        assert!(events.contains(&"response.output_text.delta"));
+        assert!(events.contains(&"response.output_item.done"));
+        assert_eq!(events.last().copied(), Some("response.completed"));
+        // delta 事件文本拼接 = 原文
+        let mut text = String::new();
+        for f in &frames {
+            if f.starts_with("event: response.output_text.delta") {
+                let v: Value = serde_json::from_str(f.split("\ndata: ").nth(1).unwrap().trim_end()).unwrap();
+                text.push_str(v["delta"].as_str().unwrap_or(""));
+            }
+        }
+        assert_eq!(text, "回复正文");
+        // completed 载荷含 message item 文本
+        let last = frames.last().unwrap();
+        let v: Value = serde_json::from_str(last.split("\ndata: ").nth(1).unwrap().trim_end()).unwrap();
+        assert_eq!(v["response"]["status"], json!("completed"));
+        assert_eq!(v["response"]["output"][0]["type"], json!("message"));
+    }
+
+    /// OpenAiText：text 帧（legacy choices[0].text）→ finish 帧 → [DONE]
+    #[test]
+    fn synth_openai_text_frames() {
+        let completion = json!({
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "legacy text"}}],
+        });
+        let frames = collect_frames(move |tx| {
+            synth_openai_text(tx, &completion, "cid5", "gpt-test");
+        });
+        // 1 text 帧 + finish 帧 + [DONE]
+        assert_eq!(frames.len(), 3, "frames: {frames:?}");
+        let text = data_payload(&frames[0]).unwrap();
+        assert_eq!(text["object"], json!("text_completion"));
+        assert_eq!(text["choices"][0]["text"], json!("legacy text"));
+        assert_eq!(text["choices"][0]["finish_reason"], Value::Null);
+        let finish = data_payload(&frames[1]).unwrap();
+        assert_eq!(finish["choices"][0]["text"], json!(""));
+        assert_eq!(finish["choices"][0]["finish_reason"], json!("stop"));
+        assert_eq!(frames.last().unwrap(), "data: [DONE]\n\n");
+    }
+
+    /// 客户端断连（tx 关闭）：合成函数逐帧 short-circuit return，不 panic 不死循环
+    #[test]
+    fn synth_short_circuits_on_disconnected_tx() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+        drop(rx); // 接收端立即关闭
+        let completion = json!({
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "断连"}}],
+        });
+        // 所有合成器均须静默返回（send 失败 → return false → 提前退出）
+        synth_openai(&tx, &completion, "c", "m");
+        synth_anthropic(&tx, &completion, "c", "m");
+        synth_responses(&tx, &completion, "c", "m", &HashSet::new());
+        synth_openai_text(&tx, &completion, "c", "m");
+        send_pseudo_exhaust_frame(&tx, Protocol::OpenAi, "耗尽");
+        send_pseudo_exhaust_frame(&tx, Protocol::Anthropic, "耗尽");
+        send_pseudo_exhaust_frame(&tx, Protocol::Responses, "耗尽");
+    }
+
+    /// 伪流式耗尽收尾错误帧（S5）：各协议帧形态对齐 wb_stream_chat 耗尽口径
+    #[test]
+    fn pseudo_exhaust_frame_per_proto() {
+        // OpenAi：data 错误帧 + [DONE]
+        let frames = collect_frames(move |tx| {
+            send_pseudo_exhaust_frame(tx, Protocol::OpenAi, "池内无可用账号");
+        });
+        assert_eq!(frames.len(), 2);
+        let err = data_payload(&frames[0]).unwrap();
+        assert_eq!(err["error"]["code"], json!("no_healthy_account"));
+        assert_eq!(err["error"]["message"], json!("池内无可用账号"));
+        assert_eq!(frames.last().unwrap(), "data: [DONE]\n\n");
+
+        // OpenAiText：同 OpenAi 帧形态（data 错误帧 + [DONE]）
+        let frames = collect_frames(move |tx| {
+            send_pseudo_exhaust_frame(tx, Protocol::OpenAiText, "池内无可用账号");
+        });
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.last().unwrap(), "data: [DONE]\n\n");
+
+        // Anthropic：event: error 帧（message 为耗尽文案）
+        let frames = collect_frames(move |tx| {
+            send_pseudo_exhaust_frame(tx, Protocol::Anthropic, "池内无可用账号");
+        });
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].starts_with("event: error\ndata: "));
+        let err: Value = serde_json::from_str(frames[0].split("\ndata: ").nth(1).unwrap().trim_end()).unwrap();
+        assert_eq!(err["type"], json!("error"));
+        assert_eq!(err["error"]["type"], json!("api_error"));
+        assert_eq!(err["error"]["message"], json!("池内无可用账号"));
+
+        // Responses：event: response.failed 帧（error.code = no_healthy_account）
+        let frames = collect_frames(move |tx| {
+            send_pseudo_exhaust_frame(tx, Protocol::Responses, "池内无可用账号");
+        });
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].starts_with("event: response.failed\ndata: "));
+        let body: Value = serde_json::from_str(frames[0].split("\ndata: ").nth(1).unwrap().trim_end()).unwrap();
+        assert_eq!(body["type"], json!("response.failed"));
+        assert_eq!(body["response"]["status"], json!("failed"));
+        assert_eq!(body["response"]["error"]["code"], json!("no_healthy_account"));
+    }
+
+    /// 预算耗尽判定（issue #213 阶段2）：budget=0 旧行为恒耗尽；rounds 达 budget 耗尽
+    #[test]
+    fn budget_exhausted_boundaries() {
+        assert!(budget_exhausted(3, 0), "budget=0 = 旧行为，耗尽直接收尾");
+        assert!(!budget_exhausted(3, 6));
+        assert!(budget_exhausted(6, 6));
+        assert!(budget_exhausted(7, 6), "超预算必耗尽（防越界重开）");
+        assert!(!budget_exhausted(0, 6), "空 tried 首轮不判耗尽");
+    }
+
+    /// 预算重开轮换判定（issue #213 阶段2）：冷却账号保留、非冷却账号清空、
+    /// 全部冷却中（无状态变化）→ None 落耗尽收尾防空转
+    #[test]
+    fn budget_retry_round_keeps_cooldown_and_detects_stall() {
+        let shared = Arc::new(crate::api_server::test_shared_state(std::env::temp_dir().join(
+            "wb_route_budget_retry_test",
+        )));
+        let state = WbView::wb(shared);
+        let model = "gpt-test";
+        let tried: HashSet<String> = ["wb-a".to_string(), "wb-b".to_string()].into_iter().collect();
+
+        // 预算 0（旧行为）→ 不重开
+        assert!(budget_retry_round(&state, &tried, model, 3, 0).is_none());
+
+        // 两账号均未冷却（503 Server 不记账号×模型冷却）→ 全部清空重开（§5.4
+        // 全黑窗口语义：黑窗内重轮换同样三账号，靠退避跨窗，非空转）
+        let next0 = budget_retry_round(&state, &tried, model, 3, 9).expect("有非冷却账号必须重开");
+        assert!(next0.is_empty(), "非冷却账号全部清空（下一轮可重选）");
+
+        // 一账号进冷却（SoftRate 账号×模型冷却）→ 冷却账号保留在 tried（pick 继续
+        // 排除，不烧已判定不可用的号），非冷却账号清空（可被 pick 重选）
+        note_account_model_cooldown(&state, "wb-a", model, now_ts() + 120);
+        let next = budget_retry_round(&state, &tried, model, 3, 9).expect("有冷却变化必须重开");
+        assert!(next.contains("wb-a"), "冷却中的账号必须保留（pick 继续排除它）");
+        assert!(!next.contains("wb-b"), "非冷却账号必须清空（重开轮换可再选中）");
+
+        // 重开后再耗尽且 wb-a 仍在冷却、wb-b 仍未冷却 → 再次重开同样只留 wb-a
+        let tried2: HashSet<String> = ["wb-a".to_string(), "wb-b".to_string()].into_iter().collect();
+        let next2 = budget_retry_round(&state, &tried2, model, 6, 9).expect("预算未用尽仍有变化");
+        assert_eq!(next2.len(), 1);
+        assert!(next2.contains("wb-a"));
+        assert!(!next2.contains("wb-b"));
+
+        // 全部已试账号均进冷却 → 无可重试候选，落耗尽收尾防空转
+        note_account_model_cooldown(&state, "wb-b", model, now_ts() + 120);
+        assert!(budget_retry_round(&state, &tried2, model, 6, 9).is_none());
+
+        // rounds 达 budget → 不再重开
+        assert!(budget_retry_round(&state, &tried, model, 9, 9).is_none());
+    }
+
+    /// 重开退避：base 2s × 轮次封顶 15s，抖动 ±25% 不越界
+    #[test]
+    fn budget_backoff_ms_bounds() {
+        // round=1 → base 2s，抖动 ±25% = [1.5s, 2.5s)
+        let ms = budget_backoff_ms(1);
+        assert!(ms >= 1_500 && ms < 2_500);
+        // round=2 → base 4s，抖动 [3s, 5s)
+        let ms = budget_backoff_ms(2);
+        assert!(ms >= 3_000 && ms < 5_000);
+        // 封顶：round=100 → base 封顶 15s，抖动 [11.25s, 18.75s)
+        let ms = budget_backoff_ms(100);
+        assert!(ms >= 11_250 && ms < 18_750);
     }
 }

@@ -902,6 +902,12 @@ pub fn stream_forward_ex(
     // 掐断；有内容时上方分支已补齐终止帧（客户端看到完整收尾），此处只补
     // 上抛——调用方按失败落账（不绑粘性不记成功）；零内容时覆盖空完成哨兵
     //（调用方换号且不计空完成指纹）
+    // issue #213 S1b（轻量处理）：本函数返回值是四元组（调用方多处解构），
+    // 断流现场字段 sent_bytes / last_frame_kind（累计 payload 字节数、最后
+    // 帧类型 Chunk/Error/Done）暂不追加——改动面过大；归因现场可用信息 =
+    // has_content（本函数局部）+ 上抛的底层读错误文本（已含在哨兵 msg 中，
+    // 覆盖 cut 关键词库 mod.rs::is_transport_cut_text 全部形态）。后续如需
+    // 字节级断点归因，先把返回值升级为结构体再补两字段。
     if error_info.is_none() && !finished && !failed_inline {
         if let Some(e) = parser.take_read_error() {
             error_info = Some((

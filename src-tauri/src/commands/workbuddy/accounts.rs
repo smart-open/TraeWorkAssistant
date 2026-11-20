@@ -31,6 +31,8 @@ pub struct WorkBuddyAccountView {
     pub relogin_reason: String,
     pub group_id: String,
     pub note: String,
+    /// 账号级独立出口代理（P4 防风控；None/空 = 直连）
+    pub proxy_url: Option<String>,
     pub credits_balance: Option<f64>,
     pub credits_fetched_at: Option<String>,
     /// 在线 = 本机 auth 文件当前生效账号（F-54 双态）
@@ -291,6 +293,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 relogin_reason: a.relogin_reason.clone(),
                 group_id: a.group_id.clone(),
                 note: a.note.clone(),
+                proxy_url: a.proxy_url.clone(),
                 credits_balance: a.credits_balance,
                 credits_fetched_at: a.credits_fetched_at.clone(),
                 is_current: current_uid.is_some() && current_uid == Some(a.uid.clone()),
@@ -315,7 +318,15 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
 }
 
 #[tauri::command]
-pub fn workbuddy_account_save(state: State<AppState>, user_id: String, name: Option<String>, note: Option<String>) -> Result<(), String> {
+pub fn workbuddy_account_save(
+    state: State<AppState>,
+    user_id: String,
+    name: Option<String>,
+    note: Option<String>,
+    // P4 防风控：账号级独立出口代理。None = 不变；Some("") = 清空回直连；
+    // Some(url) = 设置（仅接受 http(s)://，非法 URL 会让 http_agent_with_proxy 静默回退直连，故入口先拦）
+    proxy_url: Option<String>,
+) -> Result<(), String> {
     // 池读-改-写互斥（wb_pool_lock）：防与其他写点并发时旧副本整文档覆盖丢改动
     let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
@@ -329,6 +340,17 @@ pub fn workbuddy_account_save(state: State<AppState>, user_id: String, name: Opt
     }
     if let Some(n) = note {
         acct.note = n;
+    }
+    if let Some(p) = proxy_url {
+        let p = p.trim().to_string();
+        if p.is_empty() {
+            acct.proxy_url = None;
+        } else {
+            if !(p.starts_with("http://") || p.starts_with("https://")) {
+                return Err("代理地址需以 http:// 或 https:// 开头（如 http://127.0.0.1:7890）".to_string());
+            }
+            acct.proxy_url = Some(p);
+        }
     }
     save_pool(&state, &pool)
 }

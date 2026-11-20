@@ -223,6 +223,8 @@ function defaultSettings(): Settings {
     doubao_checkin_hhmm: '09:15',
     // 豆包 probe 自动保活（方案 A，默认开）：签到前 probe 缺失/过期自动抓包对齐
     doubao_probe_auto_keepalive: true,
+    // 保活单账号等待抓包秒数（null = 默认 75；后端读取侧 clamp 1..=600）
+    doubao_probe_keepalive_wait_secs: null,
     doubao_sync_mode: 'every_hours',
     doubao_sync_hours: '2',
     doubao_sync_hhmm: '23:50',

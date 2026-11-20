@@ -57,6 +57,7 @@ export default function DoubaoSettings() {
   const [checkinRunning, setCheckinRunning] = useState(false);
   const [checkinEnabled, setCheckinEnabled] = useState(true);
   const [probeAutoKeepalive, setProbeAutoKeepalive] = useState(true);
+  const [probeKeepaliveWaitSecs, setProbeKeepaliveWaitSecs] = useState('');
 
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
@@ -134,6 +135,33 @@ export default function DoubaoSettings() {
     } catch (err) {
       setProbeAutoKeepalive(!v);
       pushToast('error', `保存设置失败：${String(err)}`);
+    }
+  };
+
+  // probe 保活单账号等待抓包秒数（审查修复 2026-11-18 #3）：空/0 = 回退默认 75，
+  // 1-600 落库（后端读取侧另有 clamp 兜底）。校验失败/保存失败回弹已保存值。
+  // 并发序号守卫（对齐 checkinHhmmSeqRef 范式）：失焦连发时仅最后请求可提示
+  // 成功/回滚，避免慢请求迟到覆盖新值
+  const probeKeepaliveSeqRef = useRef(0);
+  const changeProbeKeepaliveWaitSecs = async (v: string) => {
+    setProbeKeepaliveWaitSecs(v);
+    const t = v.trim();
+    const savedText = settings?.doubao_probe_keepalive_wait_secs != null ? String(settings.doubao_probe_keepalive_wait_secs) : '';
+    const n = /^\d+$/.test(t) ? Number.parseInt(t, 10) : NaN;
+    if (t !== '' && t !== '0' && (!Number.isFinite(n) || n < 1 || n > 600)) {
+      pushToast('warn', '等待秒数应为 1-600 的整数，留空或 0 表示默认 75（已保持原值）');
+      setProbeKeepaliveWaitSecs(savedText);
+      return;
+    }
+    const seq = ++probeKeepaliveSeqRef.current;
+    try {
+      await saveSettings({ doubao_probe_keepalive_wait_secs: t === '' || t === '0' ? null : n });
+      if (seq === probeKeepaliveSeqRef.current) pushToast('success', t === '' || t === '0' ? '等待窗口已恢复默认（75 秒）' : `等待窗口已保存（${n} 秒）`);
+    } catch (err) {
+      if (seq === probeKeepaliveSeqRef.current) {
+        setProbeKeepaliveWaitSecs(savedText);
+        pushToast('error', `保存设置失败：${String(err)}`);
+      }
     }
   };
 
@@ -285,6 +313,7 @@ export default function DoubaoSettings() {
       sync_hours: settings?.doubao_sync_hours ?? null,
       sync_hhmm: settings?.doubao_sync_hhmm ?? null,
       checkin_hhmm: settings?.doubao_checkin_hhmm ?? null,
+      probe_wait_secs: settings?.doubao_probe_keepalive_wait_secs != null ? String(settings.doubao_probe_keepalive_wait_secs) : null,
     };
     if (cur.path && cur.path !== prev.path) setPath(cur.path);
     if (cur.renew_url && cur.renew_url !== prev.renew_url) setRenewUrl(cur.renew_url);
@@ -300,13 +329,14 @@ export default function DoubaoSettings() {
       if (cur.sync_hours && cur.sync_hours !== prev.sync_hours) setSyncHours(cur.sync_hours);
       if (cur.sync_hhmm && cur.sync_hhmm !== prev.sync_hhmm) setSyncHhmm(cur.sync_hhmm);
       if (cur.checkin_hhmm && cur.checkin_hhmm !== prev.checkin_hhmm) setCheckinHhmm(cur.checkin_hhmm);
+      if (cur.probe_wait_secs && cur.probe_wait_secs !== prev.probe_wait_secs) setProbeKeepaliveWaitSecs(cur.probe_wait_secs);
     }
     prevTextSettingsRef.current = cur;
     void refreshTaskStatus();
     void refreshQuotaTaskStatus();
     void refreshCheckinTaskStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_probe_auto_keepalive]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_probe_auto_keepalive, settings?.doubao_probe_keepalive_wait_secs]);
 
   const detect = async () => {
     setDetecting(true);
@@ -843,6 +873,19 @@ export default function DoubaoSettings() {
                 </span>
               </span>
             </label>
+
+            {/* probe 保活等待窗口（审查修复 #3）：单账号等待抓包秒数可调 */}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="shrink-0 text-slate-500">单账号等待抓包</span>
+              <input
+                value={probeKeepaliveWaitSecs}
+                onChange={(e) => setProbeKeepaliveWaitSecs(e.target.value)}
+                onBlur={(e) => void changeProbeKeepaliveWaitSecs(e.target.value)}
+                placeholder="75"
+                className="input w-20 text-xs"
+              />
+              <span className="text-slate-400">秒（1-600；留空 = 默认 75，手动点签到较慢时可调大）</span>
+            </div>
 
             {/* 手动签到 */}
             <div className="flex flex-wrap items-center gap-2">

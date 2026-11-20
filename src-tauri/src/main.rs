@@ -199,8 +199,11 @@ fn repair_window_geometry(window: &tauri::WebviewWindow) {
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
-/// 显示主窗口：unminimize + show + set_focus；若隐藏前为最大化，则强制
-/// unmaximize→maximize 重建最大化状态（issue #46：即使内部状态已失同步也能恢复）。
+/// 显示主窗口：unminimize + show + set_focus；若隐藏前为最大化，则在 show 前
+/// 强制 unmaximize→maximize 重建最大化状态（issue #46：即使内部状态已失同步也能恢复）。
+/// 重建必须先于 show（issue #211）：窗口隐藏时 tao 跳过 ShowWindow（无 SW_MAXIMIZE/
+/// SW_RESTORE 动画），仅更新 Win32 样式与内部标志；若在 show 之后再重建，用户会看到
+/// 窗口先以还原尺寸出现、再跳变最大化——即「每次从托盘打开界面闪一下」。
 /// show 前校验窗口几何，失效（休眠唤醒/显示器变更后落到屏外或尺寸退化）则
 /// 平移回最近显示器工作区并保留用户尺寸（issue #183：表现为任务栏有图标但
 /// 主页面无法显示、缩略图只有一条线）。
@@ -221,12 +224,13 @@ fn show_main_window(app: &tauri::AppHandle) {
             let _ = window.unmaximize();
             repair_window_geometry(&window);
         }
-        let _ = window.show();
-        let _ = window.set_focus();
         if was_maximized {
+            // 隐藏状态下重建：无可见动画，show 后直接以最大化形态出现
             let _ = window.unmaximize();
             let _ = window.maximize();
         }
+        let _ = window.show();
+        let _ = window.set_focus();
     }
 }
 
@@ -427,6 +431,13 @@ fn main() {
             // 池级指纹清洗开关（issue #158 P1-4：wb_sanitize / qoder_sanitize 热切换）
             commands::api_server::sanitize_switches_get,
             commands::api_server::sanitize_switch_set,
+            // 伪流式开关 / 重试预算 / keep-alive 间隔（issue #213 S7）
+            commands::api_server::pseudo_stream_switches_get,
+            commands::api_server::pseudo_stream_switch_set,
+            commands::api_server::retry_budgets_get,
+            commands::api_server::retry_budget_set,
+            commands::api_server::pseudo_keepalive_get,
+            commands::api_server::pseudo_keepalive_set,
             commands::api_server::api_unified_models,
             commands::api_server::dispatch_policy_get,
             commands::api_server::dispatch_policy_set,
@@ -612,6 +623,8 @@ fn main() {
             tasks::scheduler::scheduler_status,
         ])
         .setup(|app| {
+            // 审查修复 #2：注册全局句柄供后台线程状态告警弹桌面通知（notify.rs global_app）
+            crate::notify::set_global_app(app.handle().clone());
             let state = app.state::<AppState>();
 
             // 数据存储层 SQLite 化（docs/sqllite-storage-plan.md）：旧 JSON 导入 aiwork.sqlite

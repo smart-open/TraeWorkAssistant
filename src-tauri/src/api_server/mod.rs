@@ -90,6 +90,18 @@ pub struct ApiSharedState {
     /// buddy-ai 显式会话粘性开关（§4.2：qoder_sticky_enabled 同款独立开关，
     /// 默认关——国际档显式开启制；wb 档粘性恒开不受此字段影响）
     pub buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool,
+    /// WB 池伪流式开关（issue #213，默认关）：客户端 stream:true 时内部走聚合管线，
+    /// 成功后合成 SSE 下发——断流场景全部可无损换号重试
+    pub wb_pseudo_stream: std::sync::atomic::AtomicBool,
+    /// buddy-ai 档伪流式开关（独立配置，与 CN 档分开灰度）
+    pub buddy_ai_pseudo_stream: std::sync::atomic::AtomicBool,
+    /// WB 换号重试预算（issue #213 阶段2，0 = 旧行为：重试机会 = 池内账号数）
+    pub wb_retry_budget: std::sync::atomic::AtomicU32,
+    /// buddy-ai 档换号重试预算（同构独立配置）
+    pub buddy_ai_retry_budget: std::sync::atomic::AtomicU32,
+    /// 伪流式等待期 keep-alive 间隔秒（issue #213，0 = 关闭）：聚合期间周期性
+    /// 向客户端下发 SSE 注释帧防中间层空闲超时断连
+    pub pseudo_keepalive_secs: std::sync::atomic::AtomicU64,
     /// 免费活动模型倍率覆盖（issue #111/#156，默认开）：开启时 Qwen3.8-Flash /
     /// DeepSeek-Flash 目录倍率按 0 处理——展示 0× + 取号豁免零积分过滤；上游
     /// 活动结束后关闭恢复官方同步倍率（api_pool.json.qoder_flash_free_rate 持久化）
@@ -107,6 +119,13 @@ pub struct ApiSharedState {
     /// buddy-ai（国际版）模型级冷却独立实例（§4.2：Intl 池冷却表独立——同名模型
     /// 跨区不混轮，CN 侧模型故障不得冷却 Intl 池同型号，反之亦然）
     pub buddy_ai_model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
+    /// 账号×模型维度冷却（issue #206）：(uid, model) → 冷却截止 Unix 秒。
+    /// 上游 429（SoftRate）实为模型维度限流——只记该账号对该模型的冷却，
+    /// 不再钉账号级 until，避免一个模型被限 → 全池进冷却 → 其他模型 503。
+    /// 严禁把 SoftRate 写入整池 model_cooldowns（会回归 issue #159）
+    pub wb_account_model_cooldowns: Mutex<std::collections::HashMap<(String, String), i64>>,
+    /// buddy-ai 档账号×模型冷却独立实例（§4.2 同名模型跨区不混轮）
+    pub buddy_ai_account_model_cooldowns: Mutex<std::collections::HashMap<(String, String), i64>>,
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
@@ -218,12 +237,19 @@ pub(crate) fn test_shared_state(data_dir: std::path::PathBuf) -> ApiSharedState 
         buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
         buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
         buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        wb_pseudo_stream: std::sync::atomic::AtomicBool::new(false),
+        buddy_ai_pseudo_stream: std::sync::atomic::AtomicBool::new(false),
+        wb_retry_budget: std::sync::atomic::AtomicU32::new(0),
+        buddy_ai_retry_budget: std::sync::atomic::AtomicU32::new(0),
+        pseudo_keepalive_secs: std::sync::atomic::AtomicU64::new(5),
         qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(true),
         wb_sticky: wb_sticky::StickyStore::default(),
         buddy_ai_sticky: wb_sticky::StickyStore::default(),
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        wb_account_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_account_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model: String::new(),
         logger: ApiLogger::new(data_dir.join("logs")),
         data_dir,
@@ -262,6 +288,18 @@ impl ApiSharedState {
     /// panic 展开 / 客户端断连（axum 丢弃 handler future）/ 流异常终止均兜底释放
     pub fn inflight_guard(&self) -> InflightGuard {
         InflightGuard::acquire(&self.inflight)
+    }
+
+    /// 伪流式开关判定（issue #213）：routes.rs 分流点用（无 WbView 上下文）
+    pub fn pseudo_stream_on(&self, buddy_ai: bool) -> bool {
+        let flag = if buddy_ai { &self.buddy_ai_pseudo_stream } else { &self.wb_pseudo_stream };
+        flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 换号重试预算（issue #213 阶段2）：0 = 旧行为
+    pub fn retry_budget(&self, buddy_ai: bool) -> u32 {
+        let v = if buddy_ai { &self.buddy_ai_retry_budget } else { &self.wb_retry_budget };
+        v.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 记录一次请求用量并原子落盘；写盘失败静默忽略，不影响主流程。
@@ -872,10 +910,18 @@ pub const TRANSPORT_CUT_MSG_PREFIX: &str = "transport cut:";
 /// 传输层掐断文案识别（issue #158 报错A：Trae 池 ~5min 长流被上游
 /// RST_STREAM 掐断）。仅作用于 io::Error 的 Display 文本（reqwest/hyper
 /// 传输层错误消息），不作用于上游业务错误消息——业务侧 4xx/5xx 文本即使
-/// 含相近词也不会走到这里（读错误只可能来自传输层）
+/// 含相近词也不会走到这里（读错误只可能来自传输层）。
+/// issue #212：Windows 中文 locale 的连接重置文案为
+/// 「远程主机强迫关闭了一个现有的连接。 (os error 10054)」，与英文
+/// connection reset 同源，一并布防（中文不受 lowercase 影响，原文匹配）
+/// issue #213：补齐 rustls/hyper TLS 层掐断形态——WB 池 ~5min 长流被
+/// TLS 层静默掐断时报「cannot decrypt peer's message」（rustls 解密
+/// 失败）或「error while decoding chunks」（hyper 分块解码失败）
 pub fn is_transport_cut_text(text: &str) -> bool {
     let m = text.to_ascii_lowercase();
-    m.contains("rst_stream")
+    text.contains("远程主机强迫关闭")
+        || m.contains("os error 10054")
+        || m.contains("rst_stream")
         || m.contains("rst stream")
         || m.contains("stream error")
         || m.contains("http2")
@@ -884,6 +930,8 @@ pub fn is_transport_cut_text(text: &str) -> bool {
         || m.contains("connection reset")
         || m.contains("broken pipe")
         || m.contains("connection closed before")
+        || m.contains("cannot decrypt peer's message") // rustls 解密失败（issue #213 TLS 层掐断）
+        || m.contains("error while decoding chunks") // hyper 解码失败（issue #213 流体截断）
 }
 
 /// 判定是否传输层掐断哨兵（对齐 is_empty_completion 双口径：码相等 ||
@@ -1021,6 +1069,8 @@ mod inflight_tests {
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
             buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+            wb_account_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+            buddy_ai_account_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
             default_model: String::new(),
             data_dir: dir.clone(),
             total_requests: AtomicU64::new(0),
@@ -1052,6 +1102,11 @@ mod inflight_tests {
             buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
             buddy_ai_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            wb_pseudo_stream: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_pseudo_stream: std::sync::atomic::AtomicBool::new(false),
+            wb_retry_budget: std::sync::atomic::AtomicU32::new(0),
+            buddy_ai_retry_budget: std::sync::atomic::AtomicU32::new(0),
+            pseudo_keepalive_secs: std::sync::atomic::AtomicU64::new(5),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
             custom_upstream_sticky: Mutex::new(std::collections::HashMap::new()),
             custom_lb_counters: Mutex::new(std::collections::HashMap::new()),

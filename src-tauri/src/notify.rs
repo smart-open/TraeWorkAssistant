@@ -12,6 +12,23 @@ pub fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
+// ── 全局 AppHandle 注册（issue #220 审查修复 #2）────────────────────
+// 调度器 mark_needs_relogin / 网关 pool note_error_until 位于后台线程，
+// 状态跃迁告警此前传 None 只推渠道不弹桌面通知（注释「后台无 AppHandle」
+// 不准确——句柄可经 setup 注册）。setup 时注册全局句柄，后台调用点经
+// global_app() 恢复桌面通知；AppHandle: Send + Sync + 'static 可静态持有。
+static GLOBAL_APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+/// 启动时注册全局句柄（main.rs setup；幂等，仅首次生效）
+pub fn set_global_app(app: AppHandle) {
+    let _ = GLOBAL_APP.set(app);
+}
+
+/// 后台线程取全局句柄（未注册/测试环境返回 None → 仅推渠道）
+pub fn global_app() -> Option<&'static AppHandle> {
+    GLOBAL_APP.get()
+}
+
 // ── F-19 通知渠道（全部应用共用，配置存 app Settings） ─────────────
 
 /// 通知事件类别：用于按事件开关过滤推送（总开关之后二级过滤）
@@ -21,6 +38,9 @@ pub enum NotifyEvent {
     CheckinDone,
     /// 调度任务失败（应用内调度器任务返回 Err）
     TaskFail,
+    /// 账号状态跃迁告警（issue #220 P3）：needs_relogin / 网关 Forbidden /
+    /// 积分保护冷却——语义归入失败类推送（走 notify_on_task_fail 开关过滤）
+    AccountState,
     /// 其他手动操作结果（设备标识重置、测试等，不受事件开关限制）
     Other,
 }
@@ -191,6 +211,63 @@ pub fn notify_pushplus(
         .into_string()
         .map_err(|e| format!("PushPlus 响应读取失败: {e}"))?;
     parse_pushplus_resp(&text)
+}
+
+/// 账号状态跃迁告警（issue #220 P3）：needs_relogin / 网关 Forbidden / 积分保护
+/// 冷却等状态变化 → 桌面通知 + 渠道推送（AccountState 事件类别）。冷却防重：
+/// 同一账号同一事件 24h 仅推一次（kv `notify_state:<account>:<event>` 存最近推送
+/// 毫秒时刻，跨重启仍生效）——上游反复报错（如每轮签到都命中 12153）不会刷屏。
+/// app=None（后台无句柄）时仅推渠道。
+pub fn notify_account_state(
+    app: Option<&AppHandle>,
+    data_dir: &std::path::Path,
+    account_id: &str,
+    event_kind: &str,
+    title: &str,
+    body: &str,
+) {
+    const COOLDOWN_MS: i64 = 24 * 3600 * 1000;
+    let key = format!("notify_state:{account_id}:{event_kind}");
+    let db = crate::store::db(data_dir);
+    let now = chrono::Utc::now().timestamp_millis();
+    let prev: serde_json::Value = db.kv_get(&key);
+    if let Some(ts) = prev.get("ts").and_then(serde_json::Value::as_i64) {
+        if now - ts < COOLDOWN_MS {
+            return;
+        }
+    }
+    // 冷却后置（审查修复）：原实现 kv_set 冷却标记先于推送，而推送为 fire-and-forget
+    // （spawn 后台线程不知成败），一旦推送失败 24h 内不再重推。改为推送前写 pending
+    // 在途标记（防并发重复推送；TTL 120s 兜底进程中断后标记泄漏——大于四渠道推送
+    // 最坏 ~40s 耗时），推送线程结束后（无论渠道成败，统一口径「推送至少尝试过一次
+    // 即进冷却」）再写冷却标记覆盖 pending；被开关过滤未发起推送时不写冷却，
+    // 下轮状态跃迁重试。
+    const PENDING_TTL_MS: i64 = 120 * 1000;
+    if let Some(pa) = prev.get("pending_at").and_then(serde_json::Value::as_i64) {
+        if now - pa < PENDING_TTL_MS {
+            return;
+        }
+    }
+    if let Err(e) = db.kv_set(&key, &serde_json::json!({ "pending_at": now })) {
+        crate::fs_utils::app_log(data_dir, &format!("账号状态告警 pending 标记写入失败: {e}"));
+    }
+    let key_done = key.clone();
+    let dir_done = data_dir.to_path_buf();
+    crate::commands::workbuddy::push_notify_bg_on_done(
+        app.cloned(),
+        data_dir.to_path_buf(),
+        title,
+        body,
+        NotifyEvent::AccountState,
+        move || {
+            if let Err(e) = crate::store::db(&dir_done).kv_set(
+                &key_done,
+                &serde_json::json!({ "ts": chrono::Utc::now().timestamp_millis() }),
+            ) {
+                crate::fs_utils::app_log(&dir_done, &format!("账号状态告警冷却标记写入失败: {e}"));
+            }
+        },
+    );
 }
 
 /// 统一分发入口：桌面通知（有 AppHandle 时）+ 可选渠道；渠道失败仅记日志。

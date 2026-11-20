@@ -25,7 +25,7 @@ use crate::jwt;
 use crate::models::{CooldownEntry, DeviceEntry, RawAccount};
 use crate::state::AppState;
 
-use super::http_agent;
+use super::{friendly_net_err, http_agent};
 
 const SIGNIN_URL: &str = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim";
 const STATUS_URL: &str = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status";
@@ -115,7 +115,9 @@ fn http_post(
             let parsed = serde_json::from_str(&raw).ok();
             (code as i32, parsed, raw)
         }
-        Err(e) => (0, None, e.to_string()),
+        // 仅 DNS 解析失败在 agent 的 resolver 层自动重试（连接超时/拒连不经 resolver，
+        // 由调用方外层重试兜底），此处仅做用户可见文案归一化（issue #209）
+        Err(e) => (0, None, friendly_net_err(&e.to_string())),
     }
 }
 

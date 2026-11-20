@@ -593,7 +593,9 @@ pub fn run_batch(state: &AppState) -> Result<Value, String> {
         let now = fs_utils::now_ts();
         // detail 只读探针（2026-10-28 解耦）：查累计获得额度 + 签到状态快照回写——
         // 额度数值与签到动作无关，会话有效即可查（签到失败/未配也能回写 quota_total）
-        if let Some(d) = crate::tasks::doubao_checkin::detail_probe(&agent, &sid, sg.as_deref(), None) {
+        if let Some(d) =
+            crate::tasks::doubao_checkin::detail_probe(&agent, &state.data_dir, &sid, sg.as_deref(), None)
+        {
             detail_updates.push((
                 uid.clone(),
                 d.get("total_amount").and_then(Value::as_i64),

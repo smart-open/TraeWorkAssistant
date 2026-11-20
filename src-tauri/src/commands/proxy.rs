@@ -173,6 +173,64 @@ fn sync_tray_proxy_text(app: &tauri::AppHandle, running: bool) {
 
 // ---------------- 启动 / 停止 核心逻辑（页面命令 / 托盘菜单共用） ----------------
 
+/// 上游代理快照路径（issue #209）：把启动时捕获的外部系统代理落盘，
+/// 供「系统代理残留指向本应用」时恢复上游
+fn proxy_snapshot_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("prev_system_proxy.json")
+}
+
+/// 写上游代理快照；失败仅落 app_log（快照是兜底手段，失败不阻断启动）
+fn write_proxy_snapshot(data_dir: &std::path::Path, enabled: bool, server: &str, override_list: &str) {
+    let body = serde_json::json!({ "enabled": enabled, "server": server, "override": override_list });
+    if let Err(e) = std::fs::write(proxy_snapshot_path(data_dir), body.to_string()) {
+        fs_utils::app_log(data_dir, &format!("上游代理快照写入失败: {e}"));
+    }
+}
+
+/// 读上游代理快照（上次启动时捕获的外部代理）
+fn read_proxy_snapshot(data_dir: &std::path::Path) -> Option<(bool, String, String)> {
+    let raw = std::fs::read_to_string(proxy_snapshot_path(data_dir)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some((
+        v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true),
+        v.get("server").and_then(|s| s.as_str())?.to_string(),
+        v.get("override").and_then(|o| o.as_str()).unwrap_or("").to_string(),
+    ))
+}
+
+/// 快照活性探测（审查修复 I1）：崩溃残留快照可能指向已关闭的 VPN（如重启后未开
+/// Clash），无条件恢复会在 stop/退出/看门狗还原时把死代理写回系统代理导致全机断网。
+/// server 兼容注册表两种形态（单条 host:port；分号分隔的 http=host:port;https=...），
+/// 任一条目可连即视为存活；单地址 1s 连接超时（本地 VPN 毫秒级通过，仅启动路径调用）
+#[cfg(target_os = "windows")]
+fn probe_snapshot_alive(server: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    for part in server.split(';') {
+        let hp = part.trim();
+        let hp = match hp.split_once('=') {
+            Some((_, rest)) => rest,
+            None => hp,
+        };
+        let Some((host, port)) = hp.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = port.parse::<u16>() else { continue };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let alive = (host, port)
+            .to_socket_addrs()
+            .map(|addrs| {
+                addrs.take(4).any(|addr| {
+                    TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1)).is_ok()
+                })
+            })
+            .unwrap_or(false);
+        if alive {
+            return true;
+        }
+    }
+    false
+}
+
 /// 启动代理核心逻辑（对齐 Python 桌面端注入的环境变量集合，但全部改为进程内配置）
 pub async fn do_start(
     app: &AppHandle,
@@ -228,18 +286,59 @@ pub async fn do_start(
                 Some((en, sv, ov))
                     if sv != proxy_addr && !sv.contains(&format!("127.0.0.1:{port}")) =>
                 {
-                    // 这是外部代理(VPN)，作为上游透传，并在停止时还原
+                    // 这是外部代理(VPN)，作为上游透传，并在停止时还原；同时落盘快照，
+                    // 供下次「残留自指」时恢复（issue #209）
+                    write_proxy_snapshot(&state.data_dir, en, &sv, &ov);
+                    let upstream = sv.clone();
                     *PREV_SYSTEM_PROXY
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner()) =
-                        Some((en, sv.clone(), ov));
-                    Some(sv)
+                        .unwrap_or_else(|e| e.into_inner()) = Some((en, sv, ov));
+                    Some(upstream)
                 }
                 _ => {
-                    *PREV_SYSTEM_PROXY
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = None;
-                    None
+                    // 无外部代理，或系统代理残留指向本应用（上次异常退出未还原，自指条目
+                    // 被上方条件排除落入本分支）：尝试从上次快照恢复上游，避免无上游直连
+                    // 被墙域名造成的重试流量风暴（issue #209）
+                    let restored = read_proxy_snapshot(&state.data_dir).filter(|(_, sv, _)| {
+                        sv != &proxy_addr && !sv.contains(&format!("127.0.0.1:{port}"))
+                    });
+                    match restored {
+                        // 审查修复 I1：恢复前先探测快照地址活性——崩溃残留快照可能指向
+                        // 已关闭的 VPN，无条件恢复会在还原链路把死代理写回系统代理
+                        Some((_, sv, _)) if probe_snapshot_alive(&sv) => {
+                            fs_utils::app_log(
+                                &state.data_dir,
+                                "系统代理残留指向本应用或为空（疑似上次异常退出未还原），已按上次快照恢复上游代理透传",
+                            );
+                            // 审查修复（2026-11-18）：还原点记「启动前真实状态」（空/自指残留，
+                            // 停止时清空即可），快照 VPN 仅作本次上游——原实现把 PREV 覆盖为快照
+                            // 值，「用户已关 VPN 系统代理但进程存活」场景下 stop 会替用户把系统
+                            // 代理改写为 VPN 地址（还原点从当前真实状态漂移为历史快照）
+                            *PREV_SYSTEM_PROXY
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = None;
+                            Some(sv)
+                        }
+                        // 快照指向的 VPN 已不可达（已关闭/过期）：跳过恢复并删除快照，
+                        // 防止后续 stop/退出/看门狗还原把死代理地址写回系统代理
+                        Some((_, sv, _)) => {
+                            fs_utils::app_log(
+                                &state.data_dir,
+                                &format!("快照上游代理 {sv} 不可达（VPN 已关闭或快照过期），跳过恢复并删除快照"),
+                            );
+                            let _ = std::fs::remove_file(proxy_snapshot_path(&state.data_dir));
+                            *PREV_SYSTEM_PROXY
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = None;
+                            None
+                        }
+                        None => {
+                            *PREV_SYSTEM_PROXY
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = None;
+                            None
+                        }
+                    }
                 }
             }
         }

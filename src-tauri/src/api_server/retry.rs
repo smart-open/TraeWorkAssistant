@@ -45,6 +45,33 @@ pub fn is_account_restricted_error(body: &str) -> bool {
         || contains_code_value(body, "11140")
 }
 
+/// 传输层连接重置识别（issue #212）：上游（或中间链路）在读取响应状态行阶段
+/// 强制关闭连接（Windows `os error 10054`）。与账号质量无关——正确处置是
+/// 同号退避重试（重试本身会丢弃池内 stale 连接新建连接），而非按 502 既有
+/// 口径「试一次就换号」把传输故障误归账号维度轮换。
+/// Windows 中文 locale 的 io::Error 文本是「远程主机强迫关闭了一个现有的连接」，
+/// 须与英文 `connection reset` 关键词一并命中
+pub fn is_transport_reset_error(body: &str) -> bool {
+    let m = body.to_ascii_lowercase();
+    // 中文关键词不受 lowercase 影响，原文补充匹配
+    body.contains("远程主机强迫关闭")
+        || m.contains("os error 10054")
+        || m.contains("forcibly closed")
+        || m.contains("connection reset")
+}
+
+/// 上游瞬态重试类业务码识别（issue #212/#151）：4054「模型请求失败，请稍后
+/// 重试」为模型侧瞬态过载（语义等同 5xx），既不该按 400 → Fatal 透传终止，
+/// 也不该按未知 4xx → Client 误冷却 10 分钟。数字边界匹配复用
+/// contains_code_value，防 40540 等更长数字误撞；「请稍后重试」短语兜底
+/// 报文不带 code 的形态
+pub fn is_retry_later_error(body: &str) -> bool {
+    // 短语兜底须双词同现：单独「请稍后重试」会误撞复合文案（积分不足/
+    // context_too_long 等附带「请稍后重试」），完整报文语义才识别
+    contains_code_value(body, "4054")
+        || (body.contains("模型请求失败") && body.contains("请稍后重试"))
+}
+
 /// `"code": <code>` 宽松匹配：容忍键/冒号/值之间的序列化空白差异
 /// （Go encoding/json 紧凑无空格，但报文可能经中间层重序列化）；
 /// 值须带数字边界（`111280`/`111289` 不误撞），键名引号边界天然排除
@@ -91,6 +118,16 @@ pub fn retry_plan(status: u16, body: &str, attempt: u32, retry_after: Option<u64
     if status == 400 && is_account_restricted_error(body) {
         return RetryAction::SwitchKey;
     }
+    // 400 + 4054「模型请求失败，请稍后重试」（issue #212/#151）：上游模型侧
+    // 瞬态过载，语义等同 5xx——Fatal 透传会把「请稍后重试」类错误直接终止
+    // 请求，换号同样有意义（其余账号可能落在健康分片）
+    if status == 400 && is_retry_later_error(body) {
+        return if attempt == 0 {
+            RetryAction::RetrySame { delay_ms: 500 }
+        } else {
+            RetryAction::SwitchKey
+        };
+    }
     match status {
         // 429：优先 Retry-After；缺省线性退避 1/2/3s；耗尽后换号
         429 => {
@@ -112,8 +149,18 @@ pub fn retry_plan(status: u16, body: &str, attempt: u32, retry_after: Option<u64
                 delay_ms: 10_000u64 << attempt.min(2),
             }
         }
-        // 502：同 Key 重试 1 次（错误三态 RETRY_SAME）
+        // 502：同 Key 重试 1 次（错误三态 RETRY_SAME）；传输层连接重置
+        // （issue #212：os error 10054）与账号无关，同号退避重试 2 次
+        // （重试即新建连接，绕开池内 stale 连接），耗尽后换号兜底
         502 => {
+            if is_transport_reset_error(body) {
+                if attempt >= 2 {
+                    return RetryAction::SwitchKey;
+                }
+                return RetryAction::RetrySame {
+                    delay_ms: 300u64 << attempt.min(1),
+                };
+            }
             if attempt == 0 {
                 RetryAction::RetrySame { delay_ms: 500 }
             } else {
@@ -199,6 +246,70 @@ mod tests {
             RetryAction::RetrySame { delay_ms: 500 }
         );
         assert_eq!(retry_plan(502, "", 1, None), RetryAction::SwitchKey);
+    }
+
+    /// 502 + 传输层连接重置（issue #212）：同号退避重试 2 次（300/600ms）
+    /// 后换号兜底——重试本身即新建连接，绕开池内 stale 连接
+    #[test]
+    fn transport_reset_502_retries_same_twice() {
+        // issue #212 原始报文形态（Windows 中文 locale io::Error 文本）
+        let body = "传输错误: https://copilot.tencent.com/v2/chat/completions: \
+                    Network Error: Error encountered in the status line: \
+                    远程主机强迫关闭了一个现有的连接。 (os error 10054)";
+        assert_eq!(
+            retry_plan(502, body, 0, None),
+            RetryAction::RetrySame { delay_ms: 300 }
+        );
+        assert_eq!(
+            retry_plan(502, body, 1, None),
+            RetryAction::RetrySame { delay_ms: 600 }
+        );
+        assert_eq!(retry_plan(502, body, 2, None), RetryAction::SwitchKey);
+        // 英文 locale 形态与裸 code 形态均命中
+        assert_eq!(
+            retry_plan(502, "connection reset by peer", 0, None),
+            RetryAction::RetrySame { delay_ms: 300 }
+        );
+        assert_eq!(
+            retry_plan(502, "os error 10054", 1, None),
+            RetryAction::RetrySame { delay_ms: 600 }
+        );
+        // 非 502 状态不受影响
+        assert_eq!(retry_plan(500, body, 0, None), RetryAction::SwitchKey);
+    }
+
+    /// 400 + 4054「模型请求失败，请稍后重试」（issue #212/#151）：瞬态重试类，
+    /// 同号重试 1 次后换号，不得按 400 → Fatal 透传终止
+    #[test]
+    fn retry_later_4054_not_fatal() {
+        // code 形态（紧凑与空白两种序列化均命中）与纯文案形态
+        let bodies = [
+            r#"{"error":{"code":4054,"msg":"模型请求失败，请稍后重试。"}}"#,
+            r#"{"error":{"code": 4054 }}"#,
+            "模型请求失败，请稍后重试。",
+        ];
+        for b in bodies {
+            assert_eq!(
+                retry_plan(400, b, 0, None),
+                RetryAction::RetrySame { delay_ms: 500 },
+                "应同号重试: {b}"
+            );
+            assert_eq!(retry_plan(400, b, 1, None), RetryAction::SwitchKey);
+        }
+        // 数字边界：更长数字不误撞（40540 归 400 → Fatal 既有口径）
+        assert!(!is_retry_later_error(r#"{"code":40540}"#));
+        assert_eq!(
+            retry_plan(400, r#"{"code":40540}"#, 0, None),
+            RetryAction::Fatal
+        );
+        // 非 400 状态不受影响（500 维持 SwitchKey 既有口径）
+        assert_eq!(
+            retry_plan(500, r#"{"code":4054}"#, 0, None),
+            RetryAction::SwitchKey
+        );
+        // 复合文案不误撞：其他错误附带「请稍后重试」不命中双词兜底
+        assert!(!is_retry_later_error("context_too_long，请稍后重试"));
+        assert!(!is_retry_later_error("积分不足，请稍后重试"));
     }
 
     #[test]

@@ -56,9 +56,13 @@ const TASKS: &[SchedTask] = &[
     // Trae 每日签到：默认 09:00，环境配置页可改（settings.trae_checkin_hhmm）；
     // Windows 计划任务（AIWorkAssistant_DailyCheckin）注册时间复用同一设置值
     SchedTask { key: "trae-checkin", name: "Trae 每日签到", hhmm: "09:00", kind: "fix" },
-    // Trae JWT 定时续期（issue #27）：默认 09:00，环境配置页可改（settings.jwt_renew_hhmm）；
-    // 惰性判定（剩余 ≤48h 才真正刷新），每日一次为安全超集
-    SchedTask { key: "trae-renew", name: "Trae JWT 定时续期", hhmm: "09:00", kind: "fix" },
+    // Trae JWT 定时续期（issue #27 → issue #201 P2）：kind "renew" → 每 6 小时
+    //（对齐 qoder-refresh 先例）。原 daily 09:00 仅一次机会，PC 关机错过窗口或
+    // 瞬态失败即整日停摆；48h 惰性窗内 6h 间隔最多 8 次触发，单次瞬态失败可自愈。
+    // 轮换次数不受影响：是否真正刷新仍由 lazy_refresh_needed 门控（每 tick 全量
+    // 判定，未到期即空转）。开关（settings.jwt_renew_enabled）与时刻设置
+    //（jwt_renew_hhmm）保留兼容：开关仍生效；hhmm 不再参与判定（EveryHours 模式）
+    SchedTask { key: "trae-renew", name: "Trae JWT 定时续期", hhmm: "09:00", kind: "renew" },
     SchedTask { key: "wb-checkin", name: "WorkBuddy 每日签到", hhmm: "09:10", kind: "fix" },
     // WorkBuddy 每日成长（任务配置页）：默认 09:00 可改（settings.wb_growth_hhmm）；
     // 成长三开关驱动（旅行/盲盒/任务），全关时空轮无副作用
@@ -226,6 +230,9 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
         },
         // Qoder 凭证兜底刷新：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_token_renew_enabled）
         "refresh" => SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS),
+        // Trae JWT 续期（issue #201 P2）：固定每 6 小时（hhmm 不参与判定；开关 settings.jwt_renew_enabled）；
+        // 真实刷新仍由 lazy_refresh_needed 门控，轮换频率不因调度加密而增加
+        "renew" => SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS),
         // Qoder 会话流水合并：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_sessions_compact_enabled）
         "compact" => SchedPlan::EveryHours(COMPACT_INTERVAL_HOURS),
         _ => SchedPlan::Daily(effective_hhmm(st, t)),
@@ -261,7 +268,15 @@ fn tick(app: &AppHandle, st: &AppState) {
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：「每日 HH:MM」/「每小时」/「每N小时」）
         let trigger = match sched_plan(st, t) {
-            SchedPlan::Skip => continue,
+            // issue #220 P1：wb-checkin 关闭（auto_checkin=false）不再完全静默——
+            // 状态文件落一行「未开启自动签到，已跳过」摘要；不写 last_run_date，
+            // 当日中途开启后到点仍会补跑。其余任务关闭属正常态，保持静默
+            SchedPlan::Skip => {
+                if t.key == "wb-checkin" {
+                    mark_skip_note(st, t.key, "未开启自动签到，已跳过");
+                }
+                continue;
+            }
             SchedPlan::Daily(hhmm) => {
                 if last_run_date(st, t.key).as_deref() == Some(today.as_str()) {
                     continue;
@@ -388,13 +403,14 @@ fn tick(app: &AppHandle, st: &AppState) {
     }
 }
 
-/// 任务生效触发时刻：trae-checkin / trae-renew / wb-growth / wb-checkin 跟随设置页时刻
+/// 任务生效触发时刻：trae-checkin / wb-growth / wb-checkin 跟随设置页时刻
 /// （环境配置页 / 任务配置页可改），看板同步与模型同步跟随各自 settings 时刻；
-/// 其余任务用内置默认；配置非法（非 HH:MM 格式）时回退默认值
+/// 其余任务用内置默认；配置非法（非 HH:MM 格式）时回退默认值。
+/// 注：trae-renew 已改 EveryHours(6) 调度（sched_plan 短路，不走 Daily），此处
+/// 不再读取 jwt_renew_hhmm（历史配置字段保留兼容旧落盘 JSON）
 fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
     let configured = match t.key {
         "trae-checkin" => Some(st.settings().trae_checkin_hhmm),
-        "trae-renew" => Some(st.settings().jwt_renew_hhmm),
         "wb-growth" => Some(st.settings().wb_growth_hhmm),
         "wb-checkin" => Some(st.settings().wb_checkin_hhmm),
         "wb-credits-snapshot" => Some(st.settings().wb_credits_sync_hhmm),
@@ -1119,6 +1135,33 @@ fn mark_fail(st: &AppState, key: &str, summary: &str) {
     );
 }
 
+/// 关闭态摘要落盘（issue #220 P1）：wb-checkin 关闭不再完全静默，状态页/排查
+/// 日志可见原因。仅在摘要变化时写（tick 每 60s 一轮，原样重写是无谓落库）；
+/// 合并写入（审查修复）——last_fail_ts 等既有字段保留，重新开启后冷却语义
+/// 连续；缺失条目场景由 write_entry 落整对象，mark_run/mark_fail 仍会自然重建
+fn mark_skip_note(st: &AppState, key: &str, summary: &str) {
+    let state = load_state(st);
+    let cur = state
+        .pointer(&format!("/tasks/{key}/last_summary"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if cur == summary {
+        return;
+    }
+    // 审查修复：write_entry 是 tasks[key]=entry 整体覆盖（C6 注释明言字段丢失
+    // 风险），直接写 {last_summary} 会抹掉 last_fail_ts（失败冷却）/last_ok/
+    // last_run_ts——关→开后会绕过冷却重试、当日已签重复跑。改为读现有 entry
+    // 合并写回，其余字段原样保留
+    let mut entry = state
+        .pointer(&format!("/tasks/{key}"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("last_summary".to_string(), json!(summary));
+    }
+    write_entry(st, key, entry);
+}
+
 fn write_entry(st: &AppState, key: &str, entry: Value) {
     let mut root = load_state(st);
     if let Some(obj) = root.as_object_mut() {
@@ -1213,38 +1256,39 @@ mod tests {
             .unwrap();
     }
 
-    /// 默认（无 kv）：零值回填链路保证「默认开 + 09:00」（issue #27 语义）
+    /// 默认（无 kv）：零值回填链路保证「默认开」（issue #27 语义）；
+    /// P2（issue #201）：kind 改 "renew" → 每 6 小时（hhmm 不再参与调度判定）
     #[test]
-    fn effective_hhmm_default_0900_and_enabled() {
+    fn renew_plan_default_enabled_every_hours() {
         let st = temp_state("dflt");
-        assert_eq!(effective_hhmm(&st, renew_task()), "09:00");
+        assert!(matches!(sched_plan(&st, renew_task()), SchedPlan::EveryHours(6)));
         assert!(enabled(&st, "trae-renew"), "默认应启用续期任务");
     }
 
-    /// 环境配置页可改：合法 HH:MM 覆盖内置默认
+    /// 显式配置开关与时刻：开关仍生效（hhmm 不影响 EveryHours 判定，保留 kv 兼容）
     #[test]
-    fn effective_hhmm_follows_settings() {
+    fn renew_plan_ignores_hhmm_setting() {
         let st = temp_state("cfg");
         seed_settings(&st, true, "07:30");
-        assert_eq!(effective_hhmm(&st, renew_task()), "07:30");
+        assert!(matches!(sched_plan(&st, renew_task()), SchedPlan::EveryHours(6)));
     }
 
-    /// 非法配置回退内置默认：小时越界 / 非 HH:MM 格式 / 分钟越界 / 非法串 / 缺冒号
+    /// 非法配置不致命：enabled 走默认；hhmm 已不参与调度判定，非法值不影响计划
     #[test]
-    fn effective_hhmm_invalid_falls_back() {
+    fn renew_plan_invalid_hhmm_still_every_hours() {
         for bad in ["24:00", "9:00", "07:60", "abc", "0730"] {
             let st = temp_state("bad");
             seed_settings(&st, true, bad);
-            assert_eq!(effective_hhmm(&st, renew_task()), "09:00", "非法值 {bad:?} 应回退默认");
+            assert!(matches!(sched_plan(&st, renew_task()), SchedPlan::EveryHours(6)), "非法值 {bad:?} 不影响 EveryHours 计划");
         }
     }
 
-    /// 前后空白容忍：trim 后生效
+    /// 前后空白容忍：trim 后 enabled 语义不变（hhmm 不再参与判定，保留用例防回归）
     #[test]
-    fn effective_hhmm_trims_whitespace() {
+    fn renew_plan_whitespace_hhmm_still_every_hours() {
         let st = temp_state("trim");
         seed_settings(&st, true, " 08:15 ");
-        assert_eq!(effective_hhmm(&st, renew_task()), "08:15");
+        assert!(matches!(sched_plan(&st, renew_task()), SchedPlan::EveryHours(6)));
     }
 
     /// 续期时刻配置不外溢：其他任务（wb-checkin）仍用内置 09:10

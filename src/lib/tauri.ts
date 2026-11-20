@@ -14,6 +14,8 @@ import type {
   SanitizeRule,
   SanitizeSwitches,
   SanitizeTier,
+  PseudoStreamSwitches,
+  RetryBudgets,
   ToolAliasMapView,
   FingerprintSample,
   AppLocate,
@@ -594,8 +596,14 @@ export const api = {
   workbuddy: {
     envCheck: () => invoke<WorkBuddyEnvCheck>('workbuddy_env_check'),
     accountsList: () => invoke<WorkBuddyAccountView[]>('workbuddy_accounts_list'),
-    accountSave: (userId: string, name?: string, note?: string) =>
-      invoke('workbuddy_account_save', { userId, name: name ?? null, note: note ?? null }),
+    // proxyUrl：undefined=不变，''=清空回直连（P4 账号级独立出口代理）
+    accountSave: (userId: string, name?: string, note?: string, proxyUrl?: string) =>
+      invoke('workbuddy_account_save', {
+        userId,
+        name: name ?? null,
+        note: note ?? null,
+        proxyUrl: proxyUrl ?? null,
+      }),
     accountMove: (userId: string, groupId: string | null) =>
       invoke('workbuddy_account_move', { userId, groupId: groupId ?? null }),
     groups: {
@@ -1170,6 +1178,18 @@ export const api = {
     sanitizeSwitchesGet: () => invoke<SanitizeSwitches>('sanitize_switches_get'),
     sanitizeSwitchSet: (pool: 'wb' | 'qoder', enabled: boolean) =>
       invoke<void>('sanitize_switch_set', { pool, enabled }),
+    // ---- 池级伪流式开关 / 重试预算 / keep-alive 间隔（issue #213：仅内存热切换）----
+    // wb = Buddy CN 档（wb_pool）；buddy_ai = 国际档独立灰度；默认关，重启复位
+    pseudoStreamSwitchesGet: () => invoke<PseudoStreamSwitches>('pseudo_stream_switches_get'),
+    pseudoStreamSwitchSet: (pool: 'wb' | 'buddy_ai', enabled: boolean) =>
+      invoke<void>('pseudo_stream_switch_set', { pool, enabled }),
+    // 池级换号重试预算：0 = 旧行为（重试机会 = 池内账号数）；重启复位为配置文件值
+    retryBudgetsGet: () => invoke<RetryBudgets>('retry_budgets_get'),
+    retryBudgetSet: (pool: 'wb' | 'buddy_ai', value: number) =>
+      invoke<void>('retry_budget_set', { pool, value }),
+    // 伪流式等待期 keep-alive 间隔秒数：0–60，0 = 关闭；重启复位为配置文件值
+    pseudoKeepaliveGet: () => invoke<number>('pseudo_keepalive_get'),
+    pseudoKeepaliveSet: (secs: number) => invoke<void>('pseudo_keepalive_set', { secs }),
   },
   updater: {
     check: () => invoke<UpdateCheckResult>('update_check'),

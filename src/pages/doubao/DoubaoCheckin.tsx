@@ -22,7 +22,7 @@ type Scope = 'all' | 'group' | 'selected';
 interface ResultLine {
   userId: string;
   name: string;
-  status: 'success' | 'already' | 'fail';
+  status: 'success' | 'already' | 'skip' | 'fail';
   message?: string;
   reward?: number;
 }
@@ -44,7 +44,7 @@ export default function DoubaoCheckin() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<ResultLine[]>([]);
-  const [summary, setSummary] = useState<{ ok: number; failed: number; reward: number } | null>(null);
+  const [summary, setSummary] = useState<{ ok: number; failed: number; skipped: number; reward: number } | null>(null);
 
   // 组件存活标记：切页卸载后终止批量签到循环（单账号 invoke 超时 600s，不守卫会后台继续发真实签到请求；
   // 重进页面是新实例、running 归零，不守卫还会造成并发双跑）
@@ -120,6 +120,7 @@ export default function DoubaoCheckin() {
     setSummary(null);
     let ok = 0;
     let failed = 0;
+    let skipped = 0;
     let reward = 0;
     // 失败首因 + probe 保活错误（失败排障透出，2026-11-07）：收尾 toast 不再只报计数——
     // 全失败时用户只看到「失败 N」无法定性（probe 未对齐风控拒 vs 凭证过期 vs 无资格）。
@@ -145,6 +146,14 @@ export default function DoubaoCheckin() {
           failed += 1;
           if (!firstFailMsg) firstFailMsg = (o?.message ?? '').trim();
           setLines((prev) => [...prev, { userId: a.user_id, name: a.name, status: 'fail', message: o?.message }]);
+        } else if (st === 'skip') {
+          // skip（审查 #8）：确定性不可签到（未投放/task_status≠2）——不计失败不计成功，
+          // 单独展示跳过原因（完整语义与后端 skip 状态贯通）
+          skipped += 1; // 审查修复 2026-11-18：计入 summary，收尾透出（原实现仅行内展示，汇总数与进度行数对不上）
+          setLines((prev) => [
+            ...prev,
+            { userId: a.user_id, name: a.name, status: 'skip', message: o?.message },
+          ]);
         } else {
           // success / already 均视为当日已签（已签 = 之前已成功，标记成功）
           ok += 1;
@@ -163,7 +172,7 @@ export default function DoubaoCheckin() {
     }
     // 卸载后跳过全部收尾（组件已销毁，running 无需复位；pushToast/reload 均为多余副作用）
     if (!aliveRef.current) return;
-    setSummary({ ok, failed, reward });
+    setSummary({ ok, failed, skipped, reward });
     setRunning(false);
     // 失败时透出首因与 probe 保活状态（各自截断防 toast 过长；完整原因见结果列表行
     // 与按日落库 message，重开页面日历明细仍可查）
@@ -173,7 +182,7 @@ export default function DoubaoCheckin() {
     const probeHint = failed > 0 && probeErr ? `；抓包参数未对齐（${probeErr.slice(0, 60)}）——易被风控拒绝，请开启代理并保持豆包客户端打开后重试` : '';
     pushToast(
       failed > 0 ? 'warn' : 'success',
-      `签到完成：成功 ${ok} · 失败 ${failed}${reward > 0 ? ` · 新增额度 +${reward.toLocaleString()}` : ''}${failHint}${probeHint}`,
+      `签到完成：成功 ${ok} · 失败 ${failed}${skipped > 0 ? ` · 跳过 ${skipped}` : ''}${reward > 0 ? ` · 新增额度 +${reward.toLocaleString()}` : ''}${failHint}${probeHint}`,
     );
     await reload();
   };
@@ -181,6 +190,7 @@ export default function DoubaoCheckin() {
   const lineIcon = (st: ResultLine['status']) => {
     if (st === 'success') return <CheckCircle2 size={14} className="text-emerald-500" />;
     if (st === 'already') return <CircleSlash size={14} className="text-sky-500" />;
+    if (st === 'skip') return <CircleSlash size={14} className="text-slate-400" />;
     return <XCircle size={14} className="text-rose-500" />;
   };
 
@@ -389,6 +399,7 @@ export default function DoubaoCheckin() {
                 {summary ? (
                   <Badge tone={summary.failed > 0 ? 'amber' : 'green'}>
                     完成：成功 {summary.ok} · 失败 {summary.failed}
+                    {summary.skipped > 0 ? ` · 跳过 ${summary.skipped}` : ''}
                     {summary.reward > 0 ? ` · +${summary.reward.toLocaleString()}` : ''}
                   </Badge>
                 ) : (
@@ -406,7 +417,9 @@ export default function DoubaoCheckin() {
                         ? `签到成功${l.reward ? ` · +${l.reward.toLocaleString()} 额度` : ''}`
                         : l.status === 'already'
                           ? '今天已签过（幂等跳过，计成功）'
-                          : `失败：${l.message ?? '未知错误'}`}
+                          : l.status === 'skip'
+                            ? `跳过：${l.message ?? '今日不可签到'}`
+                            : `失败：${l.message ?? '未知错误'}`}
                     </span>
                   </div>
                 ))}

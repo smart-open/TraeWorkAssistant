@@ -136,6 +136,8 @@ export default function BuddyAccounts() {
   const importFileRef = useRef<HTMLInputElement>(null);
   const [editFor, setEditFor] = useState<WorkBuddyAccountView | null>(null);
   const [editName, setEditName] = useState('');
+  // P4 防风控：账号级独立出口代理（空 = 直连）
+  const [editProxyUrl, setEditProxyUrl] = useState('');
   // OAuth 扫码（F-50）：事件驱动弹框（后端全流程，进度经 wb-oauth-progress / 结果 wb-oauth-done）
   const [oauthOpen, setOauthOpen] = useState(false);
   const [oauthStage, setOauthStage] = useState('');
@@ -651,13 +653,15 @@ export default function BuddyAccounts() {
   const handleEdit = (a: WorkBuddyAccountView) => {
     setEditFor(a);
     setEditName(a.nickname);
+    setEditProxyUrl(a.proxy_url ?? '');
   };
 
   const confirmEdit = async () => {
     if (!editFor) return;
     setEditBusy(true);
     try {
-      await withMinDelay(api.workbuddy.accountSave(editFor.id, editName || undefined, undefined), 1000);
+      // proxyUrl 始终回传当前输入（空串=清空回直连；后端校验 http(s):// 前缀）
+      await withMinDelay(api.workbuddy.accountSave(editFor.id, editName || undefined, undefined, editProxyUrl.trim()), 1000);
       setEditFor(null);
       await refresh();
       pushToast('success', '账号已更新');
@@ -1454,6 +1458,20 @@ export default function BuddyAccounts() {
             onChange={(e) => setEditName(e.target.value)}
             placeholder="账号显示名"
           />
+        </label>
+        <label className="mt-3 block text-sm">
+          <span className="mb-1 block text-xs font-medium text-slate-500">
+            独立出口代理（P4 防风控，留空 = 直连）
+          </span>
+          <input
+            className="input w-full"
+            value={editProxyUrl}
+            onChange={(e) => setEditProxyUrl(e.target.value)}
+            placeholder="http://127.0.0.1:7890"
+          />
+          <span className="mt-1 block text-xs text-slate-400">
+            该账号签到/成长请求经此代理出网，与其他账号出口隔离；需以 http:// 或 https:// 开头
+          </span>
         </label>
       </Modal>
 

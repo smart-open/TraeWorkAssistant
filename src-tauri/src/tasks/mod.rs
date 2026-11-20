@@ -36,7 +36,59 @@ pub mod wb_checkin;
 pub mod wb_common;
 pub mod wb_credits;
 
+use std::net::ToSocketAddrs;
+
 use crate::state::AppState;
+
+/// 瞬时网络错误判定（issue #209）：仅连接期故障（DNS 解析失败 11001/11002、
+/// 连接超时/拒连 10060/10061、主机不可达 10064）值得重试——连接未建立、请求未
+/// 到达服务器，POST 重试无副作用；HTTP 4xx/5xx（Error::Status）与 ureq 自身
+/// 超时（文案不含 os error 码）不在此列，避免重复提交。
+pub fn is_transient_net_err(msg: &str) -> bool {
+    ["11001", "11002", "10060", "10061", "10064"]
+        .iter()
+        .any(|c| msg.contains(&format!("os error {c}")))
+}
+
+/// 网络错误文案归一化（issue #209）：DNS 失败多为本机安全软件（如火绒）网络
+/// 防护或代理/VPN（TUN/fake-ip）拦截应用进程解析所致，附可操作提示后流入
+/// 用户可见错误（事件/摘要/通知）。「No ip address」为 ureq 对解析返回空集的
+/// 报错（无 os error 后缀），同属 DNS 类故障一并归入。
+pub fn friendly_net_err(msg: &str) -> String {
+    if ["11001", "11002"]
+        .iter()
+        .any(|c| msg.contains(&format!("os error {c}")))
+        || msg.contains("No ip address")
+    {
+        format!("{msg}（本地 DNS 解析失败：常由安全软件网络防护或代理/VPN 拦截引起，请检查后重试）")
+    } else if is_transient_net_err(msg) {
+        format!("{msg}（连接不可达：请检查网络/代理/VPN 后重试）")
+    } else {
+        msg.to_string()
+    }
+}
+
+/// DNS 解析（带瞬时失败重试，issue #209）：行为等价 StdResolver（to_socket_addrs），
+/// getaddrinfo 被安全软件/代理链瞬时拦截（os error 11001/11002）时自动重试 2 次
+///（200ms/1s 退避），避免单次解析失败让整轮签到报错。
+fn resolve_with_retry(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    const MAX_EXTRA: usize = 2;
+    let mut attempt = 0;
+    loop {
+        match netloc.to_socket_addrs().map(|it| it.collect()) {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < MAX_EXTRA && is_transient_net_err(&e.to_string()) => {
+                std::thread::sleep(std::time::Duration::from_millis(if attempt == 0 {
+                    200
+                } else {
+                    1000
+                }));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// 构建 ureq agent（统一出口）。
 /// 直连语义：ureq 默认不读系统/环境代理（对齐 python OPENER 绕代理约定），
@@ -44,7 +96,33 @@ use crate::state::AppState;
 pub fn http_agent(timeout_secs: u64) -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(timeout_secs))
+        .resolver(resolve_with_retry)
         .build()
+}
+
+/// 单账号独立出口代理（P4 防风控）：proxy_url 配置成功则按同参数构建带代理的
+/// agent；URL 非法/为空回退直连（与 http_agent 同配置）。每账号独立 agent
+/// 避免连接池复用把不同出口的 TCP/会话指纹串到一起。
+pub fn http_agent_with_proxy(timeout_secs: u64, proxy_url: Option<&str>) -> ureq::Agent {
+    let proxy = proxy_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| match ureq::Proxy::new(s) {
+            Ok(p) => Some(p),
+            // 纯函数无 data_dir/app logger 上下文，沿用本模块 eprintln! 先例
+            Err(e) => {
+                eprintln!("单账号代理 URL 解析失败（已回退直连）: {s} — {e}");
+                None
+            }
+        });
+    match proxy {
+        Some(p) => ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .resolver(resolve_with_retry)
+            .proxy(p)
+            .build(),
+        None => http_agent(timeout_secs),
+    }
 }
 
 /// 解析 `--task-run <name>` CLI 参数（`--task-run` 为首个参数时进入任务模式）。
