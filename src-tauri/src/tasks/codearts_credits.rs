@@ -226,7 +226,7 @@ fn fetch_account(
         row["source"] = json!("none");
         return row;
     }
-    let identity = crate::tasks::codearts_sign::identity_from_creds(&creds);
+    let identity = crate::tasks::codearts_sign::identity_from_creds(&creds, &uid);
     let url = format!("https://{SNAP_HOST}{STATS_PLUGIN_PATH}");
     let extra: [(&str, &str); 1] = [("agent-type", "PromptCenter")];
     let signed = match codearts_sign::sign(&identity, "GET", &url, b"", &extra) {

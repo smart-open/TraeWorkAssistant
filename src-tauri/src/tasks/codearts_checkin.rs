@@ -200,7 +200,7 @@ fn process_account(
     if !creds.is_valid() {
         return ("fail".into(), "未配置有效的 AK/SK（请在账号管理中重新录入）".into(), None, FAIL_PERMANENT.into());
     }
-    let identity = crate::tasks::codearts_sign::identity_from_creds(creds);
+    let identity = crate::tasks::codearts_sign::identity_from_creds(creds, &uid);
 
     // ① 活动列表（GET，body 为空字节参与签名）
     let url = format!("https://{SNAP_HOST}{OPS_DELIVERY_PATH}?channel=IDE");

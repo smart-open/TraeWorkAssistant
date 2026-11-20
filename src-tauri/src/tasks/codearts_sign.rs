@@ -45,16 +45,82 @@ pub struct CodeartsIdentity {
     pub sk: String,
     /// OAuth STS 临时安全令牌（手工 AK/SK 模式为空）
     pub security_token: String,
+    /// 客户端指纹：按账号稳定派生的设备标识。
+    ///
+    /// 为什么需要：上游按「同一客户端 / 同一设备」识别调用来源。缺少这组头时，
+    /// 一台机器上的全部账号会被上游归并为同一调用来源，账号之间无法区分。
+    /// 每个账号派生一份稳定指纹后，两个账号在协议层面就是两台不同的客户端。
+    ///
+    /// 由账号稳定 id 摘要派生（不含明文），进程重启、凭据轮转都不变，同账号恒同值。
+    pub fingerprint: CodeartsFingerprint,
 }
+
+/// 账号级客户端指纹（对齐真实 CodeArts Agent 客户端的标识头集合）。
+///
+/// 真实客户端固定发送：`ide-name: CodeArts Agent` / `ide-version: 1.109.5` /
+/// `plugin-name: snap_vscode` / `plugin-version: 26.11.200` / `x-snap-traceid`。
+/// 版本类字段取真实客户端同款常量（便于上游按合法客户端版本识别）；
+/// `trace_id` 与 `user_agent` 按账号派生（trace_id 每请求随机，UA 稳定）。
+#[derive(Debug, Clone, Default)]
+pub struct CodeartsFingerprint {
+    /// 设备派生 seed（sha256(账号稳定 id) 前 16 hex，不含明文）
+    pub seed: String,
+    /// 客户端 UA：按 seed 派生设备号，形如真实 Electron 客户端
+    pub user_agent: String,
+}
+
+/// 真实客户端常量（逆向自 CodeArts Agent 26.11.200 的请求头）。
+pub const IDE_NAME: &str = "CodeArts Agent";
+pub const IDE_VERSION: &str = "1.109.5";
+pub const PLUGIN_NAME: &str = "snap_vscode";
+pub const PLUGIN_VERSION: &str = "26.11.200";
+
+impl CodeartsFingerprint {
+    /// 按账号稳定标识派生指纹。**同账号恒同值**（进程重启、凭据轮转都不变）。
+    ///
+    /// `account_seed` 必须取**账号稳定标识**，不能取 AK：OAuth 账号的 AK 是 STS
+    /// 临时凭据，每次续期都会换成新值——若按 AK 派生，指纹会跟着凭据一起漂移，
+    /// 上游看到的就是「同一账号不断换设备」，比不区分更可疑。调用方传入
+    /// 账号池 id（`ca-o-…`，由上游稳定 user_id 派生）或手工 AK/SK 的派生 id。
+    pub fn derive(account_seed: &str) -> Self {
+        let digest = Sha256::digest(account_seed.as_bytes());
+        let seed: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        // UA 用 seed 的 8 位十六进制做设备段，形态对齐真实 Electron 客户端
+        let user_agent = format!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) CodeArts Agent/{IDE_VERSION} Chrome/126.0.6478.234 \
+             Electron/31.7.7 Safari/537.36 device/{seed}"
+        );
+        Self { seed, user_agent }
+    }
+
+    /// 设备段（排障用：确认两个账号的指纹确实不同，不含任何凭据明文）。
+    pub fn device_segment(&self) -> &str {
+        &self.seed
+    }
+}
+
 
 impl CodeartsIdentity {
     pub fn new(ak: impl Into<String>, sk: impl Into<String>) -> Self {
-        Self { ak: ak.into(), sk: sk.into(), security_token: String::new() }
+        let ak = ak.into();
+        Self {
+            fingerprint: CodeartsFingerprint::derive(&ak),
+            ak,
+            sk: sk.into(),
+            security_token: String::new(),
+        }
     }
 
     /// OAuth 临时凭据构造。
     pub fn new_oauth(ak: impl Into<String>, sk: impl Into<String>, security_token: impl Into<String>) -> Self {
-        Self { ak: ak.into(), sk: sk.into(), security_token: security_token.into() }
+        let ak = ak.into();
+        Self {
+            fingerprint: CodeartsFingerprint::derive(&ak),
+            ak,
+            sk: sk.into(),
+            security_token: security_token.into(),
+        }
     }
 
     pub fn is_valid(&self) -> bool {
@@ -64,7 +130,28 @@ impl CodeartsIdentity {
     pub fn is_oauth(&self) -> bool {
         !self.security_token.trim().is_empty()
     }
+
+    /// 客户端标识头（不参与签名，仅随请求发送）：按账号区分调用来源。
+    ///
+    /// 刻意不放进 `sign()` 的 extra 头集——这组头是**客户端身份**而非请求内容，
+    /// 不参与签名可避免改动既有 5 个签名向量（AK/SK 与 OAuth 各半）。
+    pub fn client_headers(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("ide-name", IDE_NAME.to_string()),
+            ("ide-version", IDE_VERSION.to_string()),
+            ("plugin-name", PLUGIN_NAME.to_string()),
+            ("plugin-version", PLUGIN_VERSION.to_string()),
+            ("user-agent", self.fingerprint.user_agent.clone()),
+            ("x-snap-traceid", new_trace_id()),
+        ]
+    }
 }
+
+/// 每请求随机的 32 位十六进制 trace id（对齐真实客户端 `x-snap-traceid` 形状）。
+pub fn new_trace_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 
 /// 已签名请求头集合（返回顺序即发送顺序；调用方逐条 set 到 ureq 请求）。
 #[derive(Debug, Clone)]
@@ -197,12 +284,23 @@ pub fn sign(
 /// 从统一凭据构造签名身份：OAuth 凭据（security_token 非空）自动带上 security_token，
 /// 手工 AK/SK 凭据走既有路径（签名向量不变）。所有上游调用点统一经此函数，避免
 /// OAuth 账号漏带 x-security-token 被 APIG 拒签。
-pub fn identity_from_creds(creds: &crate::tasks::codearts_common::CodeartsCreds) -> CodeartsIdentity {
-    if creds.is_oauth() {
+///
+/// `account_id`：账号池稳定 id（`ca-…`），用于派生**不随凭据轮转漂移**的客户端指纹。
+/// OAuth 的 AK 每次续期都换新，若拿 AK 派生指纹，同一账号会不断"换设备"。
+pub fn identity_from_creds(
+    creds: &crate::tasks::codearts_common::CodeartsCreds,
+    account_id: &str,
+) -> CodeartsIdentity {
+    let mut id = if creds.is_oauth() {
         CodeartsIdentity::new_oauth(&creds.ak, &creds.sk, &creds.security_token)
     } else {
         CodeartsIdentity::new(&creds.ak, &creds.sk)
+    };
+    // 指纹改按稳定账号 id 派生（缺 id 时保留 AK 派生作兜底，仅测试路径会走到）
+    if !account_id.trim().is_empty() {
+        id.fingerprint = CodeartsFingerprint::derive(account_id);
     }
+    id
 }
 
 /// RFC3986 query 规整：key / value 均按 unreserved 保留、其余 %XX（大写 hex）编码，
@@ -327,5 +425,133 @@ mod tests {
     #[test]
     fn empty_credentials_rejected() {
         assert!(sign(&CodeartsIdentity::default(), "GET", HOST_URL, b"", &[]).is_err());
+    }
+
+    /// 核心约束：不同账号必须得到不同指纹——这正是「把一个 TPM 拆成多个
+    /// 调用来源」的协议层前提。两个账号的 UA / 设备段全等则等于没做区分。
+    #[test]
+    fn different_accounts_get_different_fingerprints() {
+        let a = CodeartsIdentity::new_oauth("AK_ACCOUNT_A", "SK_A", "ST_A");
+        let b = CodeartsIdentity::new_oauth("AK_ACCOUNT_B", "SK_B", "ST_B");
+        assert_ne!(
+            a.fingerprint.device_segment(),
+            b.fingerprint.device_segment(),
+            "两个账号的设备段必须不同"
+        );
+        assert_ne!(a.fingerprint.user_agent, b.fingerprint.user_agent, "两个账号的 UA 必须不同");
+    }
+
+    /// 同账号必须稳定：进程重启后指纹不变（否则每次重启都被上游当新设备，
+    /// 反而制造异常特征）。
+    #[test]
+    fn same_account_fingerprint_is_stable() {
+        let x = CodeartsFingerprint::derive("ca-o-stable-account-id");
+        let y = CodeartsFingerprint::derive("ca-o-stable-account-id");
+        assert_eq!(x.device_segment(), y.device_segment());
+        assert_eq!(x.user_agent, y.user_agent);
+    }
+
+    /// 核心约束：指纹必须绑定**账号稳定 id**，不能绑定 AK。
+    ///
+    /// OAuth 的 AK 是 STS 临时凭据，每次续期都会换新。若指纹跟着 AK 漂移，
+    /// 上游看到的就是「同一账号不断换设备」——比不区分更可疑，且会让上游
+    /// 无法把多次请求归到同一客户端。
+    #[test]
+    fn fingerprint_survives_ak_rotation() {
+        let account_id = "ca-o-435c429a2560";
+        // 同一账号，两套不同 AK（模拟 STS 续期前后）
+        let before = identity_from_creds(
+            &crate::tasks::codearts_common::CodeartsCreds {
+                ak: "HSTA_OLD_AK_1111".into(),
+                sk: "SK_OLD".into(),
+                security_token: "ST_OLD".into(),
+                credential_source: "oauth".into(),
+                ..Default::default()
+            },
+            account_id,
+        );
+        let after = identity_from_creds(
+            &crate::tasks::codearts_common::CodeartsCreds {
+                ak: "HSTA_NEW_AK_2222".into(),
+                sk: "SK_NEW".into(),
+                security_token: "ST_NEW".into(),
+                credential_source: "oauth".into(),
+                ..Default::default()
+            },
+            account_id,
+        );
+        // AK 变了，但指纹不变
+        assert_ne!(before.ak, after.ak, "前提：两次的 AK 不同");
+        assert_eq!(
+            before.fingerprint.device_segment(),
+            after.fingerprint.device_segment(),
+            "AK 轮转后指纹必须保持不变"
+        );
+        assert_eq!(before.fingerprint.user_agent, after.fingerprint.user_agent);
+
+        // 不同账号仍必须不同
+        let other = identity_from_creds(
+            &crate::tasks::codearts_common::CodeartsCreds {
+                ak: "HSTA_NEW_AK_2222".into(),
+                sk: "SK_NEW".into(),
+                security_token: "ST_NEW".into(),
+                credential_source: "oauth".into(),
+                ..Default::default()
+            },
+            "ca-o-69763dee1143",
+        );
+        assert_ne!(
+            after.fingerprint.device_segment(),
+            other.fingerprint.device_segment(),
+            "不同账号即使 AK 相同也必须不同指纹"
+        );
+    }
+
+    /// 指纹段不得泄露 AK 明文（零明文红线）。
+    #[test]
+    fn fingerprint_does_not_leak_ak() {
+        let ak = "AK_SUPER_SECRET_VALUE_12345";
+        let fp = CodeartsFingerprint::derive(ak);
+        assert!(!fp.user_agent.contains(ak));
+        assert!(!fp.device_segment().contains(ak));
+        // 设备段应为 16 位十六进制
+        assert_eq!(fp.device_segment().len(), 16);
+        assert!(fp.device_segment().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// 客户端标识头必须齐全，且版本类字段取真实客户端常量。
+    #[test]
+    fn client_headers_carry_real_client_identity() {
+        let id = CodeartsIdentity::new_oauth("AK_X", "SK_X", "ST_X");
+        let headers: std::collections::HashMap<&str, String> =
+            id.client_headers().into_iter().collect();
+        assert_eq!(headers.get("ide-name").map(String::as_str), Some(IDE_NAME));
+        assert_eq!(headers.get("ide-version").map(String::as_str), Some(IDE_VERSION));
+        assert_eq!(headers.get("plugin-name").map(String::as_str), Some(PLUGIN_NAME));
+        assert_eq!(headers.get("plugin-version").map(String::as_str), Some(PLUGIN_VERSION));
+        // trace id 每请求随机：两次调用必须不同
+        let t1 = headers.get("x-snap-traceid").cloned().unwrap_or_default();
+        let t2 = id
+            .client_headers()
+            .into_iter()
+            .find(|(k, _)| *k == "x-snap-traceid")
+            .map(|(_, v)| v)
+            .unwrap_or_default();
+        assert_eq!(t1.len(), 32, "trace id 应为 32 位 hex");
+        assert_ne!(t1, t2, "trace id 每请求必须随机");
+    }
+
+    /// 客户端标识头不参与签名：加入它们不得改变既有签名向量（回归保护——
+    /// 改动 header 集合会让 5 个签名向量全红，而这组头是客户端身份、非请求内容）。
+    #[test]
+    fn client_headers_do_not_affect_signature() {
+        let id = identity();
+        let signed = sign_with_date(&id, "GET", HOST_URL, b"", &[], TS).unwrap();
+        // client_headers 只读不写签名：再次签名结果必须完全一致
+        let _ = id.client_headers();
+        let signed2 = sign_with_date(&id, "GET", HOST_URL, b"", &[], TS).unwrap();
+        assert_eq!(signed.authorization, signed2.authorization);
+        assert!(!signed.authorization.contains("ide-name"));
+        assert!(!signed.authorization.contains("user-agent"));
     }
 }

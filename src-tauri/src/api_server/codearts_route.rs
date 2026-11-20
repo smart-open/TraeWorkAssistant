@@ -176,6 +176,10 @@ fn send_heartbeat(identity: &CodeartsIdentity, session_id: &str, status: &str) -
     for (k, v) in &signed.extra {
         req = req.set(k.as_str(), v.as_str());
     }
+    // 账号级客户端指纹头（心跳同口径）：名额登记与推理请求须呈现同一客户端身份
+    for (k, v) in identity.client_headers() {
+        req = req.set(k, v.as_str());
+    }
     match req.send_bytes(&b"{}"[..]) {
         Ok(resp) => match resp.into_string() {
             Ok(text) => {
@@ -315,7 +319,7 @@ fn identity_of(
     if !creds.is_valid() {
         return Err("CodeArts AK/SK 为空或失效，请重新登录或录入 AK/SK".into());
     }
-    Ok(codearts_sign::identity_from_creds(&creds))
+    Ok(codearts_sign::identity_from_creds(&creds, uid))
 }
 
 /// 发签名请求（ak/sk 已由 identity 校验；签名头逐条 set）：
@@ -360,6 +364,11 @@ fn send_signed_request(
     for (k, v) in &signed.extra {
         req = req.set(k.as_str(), v.as_str());
     }
+    // 账号级客户端指纹头（不参与签名）：让上游把每个账号识别为独立客户端。
+    // 缺少这组头时，同机多账号会被归并为同一调用来源，无法区分。
+    for (k, v) in identity.client_headers() {
+        req = req.set(k, v.as_str());
+    }
     match req.send_bytes(body) {
         Ok(resp) => Ok(Box::new(resp.into_reader())),
         Err(ureq::Error::Status(code, resp)) => {
@@ -398,9 +407,9 @@ fn is_concurrency_full(text: &str) -> bool {
 fn is_rate_limited(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     text.contains("ModelArts.811")
+        || text.contains("002002010.429")   // InferHub 限流族（error_msg.type 分 RPM/RPH/TPM/TPD 等）
         || lower.contains("rate limit")
         || lower.contains("too many requests")
-        || lower.contains("429")
 }
 
 /// 令牌桶限流的冷却时长（秒）。
@@ -457,12 +466,46 @@ fn request_level_status(text: &str) -> Option<u16> {
     None
 }
 
+/// 排队类业务码：上游明确的「排不上号」信号，**既不是账号故障也不是上游故障**。
+///
+/// 线上实测（`GET /api/v1/queue/status`）确认排队是该协议的一等公民：
+/// `status` 取 `working` / `waiting`，`queue_length` / `queue_position` 给位次
+/// （实测 `deepseek-v4.1-flash-1017` 排队 39 位、`openpangu-2.0-pro` 排队 1 位），
+/// `message` 下发「您排在第 N 位，建议切换其他模型」+「立即升级」按钮。
+/// 推理路径上对应的业务码是 `TM.00001045` / `TM.000010051`（真实客户端把它们与
+/// 并发码同组处理）。
+///
+/// 为什么必须前置：这两个码若落到 `codearts_failure` 的流内兜底（HTTP 200 无
+/// 已知码 → `(502, Server)`），会经 `note_failure` 触发账号 30 分钟指数熔断
+/// （`pool.rs` 的 Server 分支）——一个纯排队信号把健康账号打死 3 次即不可用。
+fn is_queue_code(text: &str) -> bool {
+    // 整码匹配（不是裸 contains）：`TM.00001045` 与并发码 `TM.00001041` 前缀相近，
+    // 且 `TM.00001045x` 这类更长的串不得被误命中。码后一位不能是数字/字母。
+    fn matches_code(text: &str, code: &str) -> bool {
+        let mut rest = text;
+        while let Some(pos) = rest.find(code) {
+            let after = &rest[pos + code.len()..];
+            if !after.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                return true;
+            }
+            rest = after;
+        }
+        false
+    }
+    matches_code(text, "TM.00001045") || matches_code(text, "TM.000010051")
+}
+
 /// CodeArts 上游失败 → (对客户端的状态码, 账号处置分类)。
 ///
 /// `status` 是上游 HTTP 状态码（流内错误帧传 200，真实码在文本里）。
-/// 归因顺序即优先级：并发上限先于通用 5xx、请求级错误先于通用 4xx——
-/// 否则这两类都会被 `classify_error` 的兜底口径吃掉，误熔断账号。
+/// 归因顺序即优先级：排队码先于一切、并发上限先于通用 5xx、请求级错误先于
+/// 通用 4xx——否则这几类都会被兜底口径吃掉，误熔断账号。
 pub(crate) fn codearts_failure(status: u16, text: &str) -> (u16, ErrKind) {
+    if is_queue_code(text) {
+        // 排队：换号无意义（排队按模型算，换账号仍在同一队），但**不能碰账号**。
+        // ErrKind::None = 不冷却不熔断；429 让客户端按退避重试。
+        return (429, ErrKind::None);
+    }
     if is_concurrency_full(text) {
         return (429, ErrKind::SoftRate);
     }
@@ -540,7 +583,47 @@ fn clear_model_failure(model: &str) {
     codearts_cooldown_map().lock().unwrap_or_else(|e| e.into_inner()).remove(model);
 }
 
-/// 按归因结果记账：账号级冷却 + 模型级冷却（仅 Server 类）。
+/// 模型级「繁忙」：上游限流/排队族，**按模型核算而非按账号**。
+///
+/// 线上实测与日志双重佐证它不该只罚账号：
+/// - `queue/status` 实测排队按模型区分（同刻 `deepseek-v4.1-flash` = working，
+///   `deepseek-v4.1-flash-1017` = 排队 39 位），说明「忙」是模型属性；
+/// - 两次 81114 事件里，**窗口内零请求的账号也在几秒后被同一个 81114 命中**
+///   （22:26 事件 82 万 token 的账号先撞、0 请求账号 5s 后跟随；13:06 事件反向），
+///   而用量仅占宣称 3 亿 TPM 的 0.23%~0.27%，单账号不可能打满。
+///
+/// 因此：账号侧保留既有 SoftRate 短冷却（不动 `codearts_failure` 的契约，
+/// 既有的并发上限/令牌桶归因测试因此不受影响），**另外**记一笔模型冷却，
+/// 让 dispatch 的 `model_cooling_remaining_secs` 预检在下一个请求就快速挡掉，
+/// 而不是逐账号把整池打冷再回 `pool_cooling`。
+fn is_model_busy(text: &str) -> bool {
+    is_queue_code(text) || is_rate_limited(text)
+}
+
+/// 模型级繁忙冷却：取「既有窗口」与「本次建议」的较大者，绝不缩短既有窗口。
+///
+/// 与 [`note_model_failure`] 共用同一张表（`CODEARTS_MODEL_COOLDOWNS`），
+/// 但语义不同：这里是上游明示的繁忙时长，不是失败计数驱动的渐进退避。
+fn note_model_busy(model: &str, secs: u64) {
+    let secs = secs.clamp(1, QUEUE_BACKOFF_MAX_SECS);
+    let mut map = codearts_cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let until = now + Duration::from_secs(secs);
+    map.entry(model.to_string())
+        // fails 保持原值：繁忙不计入「连续失败」计数，避免与 Server 渐进退避
+        // 的 10→20→40s 语义混在一起（`note_model_failure` 依赖 fails 递增）
+        .and_modify(|(cur, _)| {
+            if until > *cur {
+                *cur = until;
+            }
+        })
+        .or_insert_with(|| (until, 0));
+}
+
+/// 排队退避上限（秒）：上游建议值异常大时钳制，避免单个请求把模型锁死过久。
+const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
+
+/// 按归因结果记账：账号级冷却 + 模型级冷却（Server 渐进 / 模型繁忙短窗）。
 /// 集中一处，避免流内错误/HTTP 错误/聚合三条路径口径漂移。
 ///
 /// `upstream_text`：上游错误原文，用于按限流粒度算冷却时长（令牌桶按分钟
@@ -552,6 +635,15 @@ fn note_failure(
     kind: ErrKind,
     upstream_text: Option<&str>,
 ) {
+    // 模型繁忙（排队/限流族）：无论账号侧怎么处置，都要记一笔模型冷却——
+    // 它是模型属性，换账号不会好转。放在账号处置之前，保证 ErrKind::None
+    // （排队码不走账号冷却）也能落到模型表。
+    if let Some(text) = upstream_text {
+        if is_model_busy(text) {
+            let secs = rate_limit_cooldown_secs(text).max(1) as u64;
+            note_model_busy(model, secs);
+        }
+    }
     if kind == ErrKind::None {
         return;
     }
@@ -572,6 +664,7 @@ fn note_failure(
         note_model_failure(model);
     }
 }
+
 
 // ==================== 慢请求竞速对冲（对齐 wb_route::race_first_byte）====================
 
@@ -944,8 +1037,15 @@ pub(crate) fn run_codearts_stream(
                 ) {
                     Ok(w) => w,
                     Err(()) => {
-                        note_failure(state, model, &picked.uid, ErrKind::Server, None);
-                        last_err = "CodeArts 上游 10 秒内未响应（首字超时）".into();
+                        // 首字超时 ≠ 上游故障：CodeArts 推理路径没有排队错误码，
+                        // 「模型繁忙/排队」唯一可观测的表现就是首字迟迟不来
+                        // （实测 `queue/status` 会给出 waiting + 位次，但推理请求
+                        // 本身只表现为慢）。记 Server 会触发 pool.rs 的 30 分钟
+                        // 指数熔断，几次排队就能把健康账号打成不可用——与
+                        // concurrency_limit_is_transient_not_account_fault 修掉的
+                        // 事故同型。故只记模型级繁忙短窗，不动账号。
+                        note_model_busy(model, QUEUE_BACKOFF_MAX_SECS);
+                        last_err = "CodeArts 上游 10 秒内未响应（可能是模型排队，非账号故障）".into();
                         state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
                             504, &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
                             &state.codearts_pool.name_of(&picked.uid), Some(&last_err));
@@ -1146,8 +1246,10 @@ pub async fn codearts_aggregate_chat(
                     let lines = match wb_upstream::lines_with_first_byte_timeout_interruptible(reader) {
                         Ok(l) => l,
                         Err(()) => {
-                            note_failure(&state, &model, &picked.uid, ErrKind::Server, None);
-                            last_err = "CodeArts 上游 10 秒内未响应（首字超时）".into();
+                            // 首字超时归因为模型级繁忙（同流式路径）：不动账号，
+                            // 避免排队场景把健康账号指数熔断。
+                            note_model_busy(&model, QUEUE_BACKOFF_MAX_SECS);
+                            last_err = "CodeArts 上游 10 秒内未响应（可能是模型排队，非账号故障）".into();
                             continue;
                         }
                     };
@@ -1362,8 +1464,11 @@ mod tests {
         assert!(heartbeat_url("busy").contains("/snap-manager/v1/chat-session/heartbeat"));
     }
 
-    /// 模型冷却：渐进退避 + 成功清除；且只在 Server 类错误时触发
-    /// （并发上限/请求级错误不该冷却模型，否则误伤其他账号）
+    /// 模型渐进冷却（`note_model_failure`）：10→20→40s 渐进退避 + 成功清除。
+    ///
+    /// 只覆盖 Server 类这条来源；模型繁忙的短窗走 `note_model_busy`（另一函数，
+    /// 见 `model_busy_marks_model_not_account`）。两者共用同一张表但语义不同：
+    /// 这里由连续失败计数驱动，那里由上游明示的繁忙时长驱动。
     #[test]
     fn model_cooldown_is_server_only_and_clearable() {
         let m = "__test_model_cooldown__";
@@ -1494,6 +1599,138 @@ mod tests {
         // 文案未声明分钟粒度 → 退回固定 60s
         assert_eq!(rate_limit_cooldown_secs("Too many requests"), 60);
     }
+
+    /// `is_rate_limited` 曾用裸 `contains("429")` 判定：任何带「429」三个数字的
+    /// 报错（request_id、行号、模型快照名）都会被误判成限流并冷却账号。
+    /// 现改为只认真实的限流信号：ModelArts.811 族、InferHub 002002010.429 族、
+    /// rate limit / too many requests 关键词。
+    #[test]
+    fn bare_429_digits_do_not_trigger_rate_limit() {
+        // 这些都不是限流，不得命中
+        for text in [
+            r#"{"error_code":"001001005","error_msg":"param is invalid","request_id":"abc429def"}"#,
+            "model is not registered, model_id=deepseek-v4.1-flash-1429-snapshot",
+            "APIG.0101 The API does not exist, trace 91429",
+            "context_length exceeded: 1048577 > 1048576 (line 429)",
+            r#"{"error_msg":"内容安全审核未通过","request_id":"x429"}"#,
+        ] {
+            assert!(
+                !is_rate_limited(text),
+                "非限流报错不得被误判：{text}"
+            );
+        }
+
+        // 真实限流族必须命中（两种错误码族各一例）
+        assert!(is_rate_limited(
+            "InferHub.ModelArts.81114.429 Too many requests, the rate limit is 300000000 tokens per minute."
+        ));
+        assert!(
+            is_rate_limited(r#"InferHub.002002010.429 {"type":"TPM"}"#),
+            "InferHub 限流族（error_msg 带 type）必须命中"
+        );
+        assert!(is_rate_limited("ModelArts.81101 Too many requests"));
+        assert!(is_rate_limited("the rate limit is 60 times per minute"));
+    }
+
+    /// 排队码（`TM.00001045` / `TM.000010051`）必须归为「不碰账号」。
+    ///
+    /// 回归背景：这两个码此前落到 `codearts_failure` 的流内兜底
+    /// （HTTP 200 无已知码 → `(502, ErrKind::Server)`），经 `note_failure` 触发
+    /// 账号 30 分钟指数熔断——一个纯排队信号就能把健康账号打死。
+    /// 线上实测 `queue/status` 确认排队是模型属性（同刻不同模型排队位次各异），
+    /// 换账号仍在同一队，因此正确处置是 429 + `ErrKind::None`（不冷却账号）。
+    #[test]
+    fn queue_codes_are_not_account_faults() {
+        for text in [
+            r#"{"error_code":"TM.00001045","error_msg":"queue busy"}"#,
+            r#"{"error_code":"TM.000010051","error_msg":"queue busy"}"#,
+            "TM.00001045",
+        ] {
+            assert!(is_queue_code(text), "排队码应命中 is_queue_code：{text}");
+            // HTTP 400 与流内 200 两条路径都必须是不碰账号
+            assert_eq!(
+                codearts_failure(400, text),
+                (429, ErrKind::None),
+                "排队码（HTTP 400）不得冷却账号：{text}"
+            );
+            assert_eq!(
+                codearts_failure(200, text),
+                (429, ErrKind::None),
+                "排队码（流内帧）不得被判 Server 熔断：{text}"
+            );
+        }
+
+        // 排队码不得被并发上限/令牌桶判定吞掉（三档归因互不串味）
+        let conc = r#"{"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)"}"#;
+        assert!(!is_queue_code(conc), "并发上限不是排队码");
+        assert_eq!(codearts_failure(200, conc), (429, ErrKind::SoftRate));
+
+        // 非排队码不得误命中（1045 与 1041 前缀相同，必须整码匹配）
+        assert!(!is_queue_code(r#"{"error_code":"TM.00001041"}"#));
+        assert!(!is_queue_code("TM.00001045x"));
+    }
+
+    /// 模型繁忙（排队/限流族）记**模型**表，不记账号表。
+    ///
+    /// 两次 81114 事件的硬证据：窗口内零请求的账号也在几秒后被同一 81114 命中，
+    /// 且用量仅占宣称 3 亿 TPM 的 0.23%~0.27%——「忙」是模型属性。
+    #[test]
+    fn model_busy_marks_model_not_account() {
+        let m = "__test_model_busy__";
+        clear_model_failure(m);
+        assert!(model_cooling_remaining_secs(m).is_none());
+
+        // 排队码与限流族都算「模型繁忙」
+        assert!(is_model_busy("TM.00001045"));
+        assert!(is_model_busy(
+            "InferHub.ModelArts.81114.429 Too many requests, the rate limit is 300000000 tokens per minute."
+        ));
+        // 并发上限（账号级名额）不算模型繁忙
+        assert!(!is_model_busy(
+            r#"{"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)"}"#
+        ));
+
+        note_model_busy(m, 30);
+        let left = model_cooling_remaining_secs(m).expect("模型繁忙应写模型表");
+        assert!((1..=30).contains(&left), "繁忙冷却应 <=30s，实际 {left}");
+
+        // 缩短式写入不得覆盖既有更长窗口
+        note_model_busy(m, 5);
+        let after = model_cooling_remaining_secs(m).unwrap();
+        assert!(after + 1 >= left, "短窗不得缩短既有窗口：{left} -> {after}");
+
+        // 上限钳制：异常大的建议值收敛到 QUEUE_BACKOFF_MAX_SECS
+        note_model_busy(m, 99999);
+        let capped = model_cooling_remaining_secs(m).unwrap();
+        assert!(capped <= QUEUE_BACKOFF_MAX_SECS + 1, "应钳制到 {QUEUE_BACKOFF_MAX_SECS}s，实际 {capped}");
+
+        clear_model_failure(m);
+        assert!(model_cooling_remaining_secs(m).is_none(), "成功后应清除");
+    }
+
+    /// 繁忙记账不得污染 `note_model_failure` 的渐进退避计数。
+    ///
+    /// 两者共用一张表但 fails 语义不同：繁忙写 `fails=0` 且不递增，
+    /// Server 失败依赖 fails 递增算 10→20→40s。若繁忙把它改成 0 之后再走
+    /// note_model_failure，`(*fails - 1)` 曾会下溢。
+    #[test]
+    fn busy_window_does_not_break_progressive_backoff() {
+        let m = "__test_busy_then_server__";
+        clear_model_failure(m);
+
+        // 先落一条繁忙条目（fails=0）
+        note_model_busy(m, 1);
+        // 等它过期，让 note_model_failure 视为新失败片段
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(model_cooling_remaining_secs(m).is_none(), "1s 窗口应已过期");
+
+        // 再走 Server 渐进：fails=0 → 递增到 1，不得下溢 panic
+        note_model_failure(m);
+        let left = model_cooling_remaining_secs(m).expect("应进冷却");
+        assert!((1..=10).contains(&left), "首次 Server 退避 10s，实际 {left}");
+
+        clear_model_failure(m);
+    }
 }
 
 /// 真实链路验证（`cargo test -- --ignored --nocapture` 显式触发）。
@@ -1561,7 +1798,7 @@ mod live_tests {
         let Some((uid, creds)) = first_account() else {
             panic!("本机无 CodeArts 凭据（应在上层 skip）");
         };
-        let identity = codearts_sign::identity_from_creds(&creds);
+        let identity = codearts_sign::identity_from_creds(&creds, &uid);
         // 修复后的构造：强制 stream + 模型名对齐 + max_tokens 夹取
         let prepared = rebuild_body(body, model, model);
         let affinity = affinity_of(body);

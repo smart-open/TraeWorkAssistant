@@ -262,7 +262,7 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
         if !has_cred {
             continue;
         }
-        let identity = crate::tasks::codearts_sign::identity_from_creds(&creds);
+        let identity = crate::tasks::codearts_sign::identity_from_creds(&creds, id);
         // 真实响应（2026-11 实测）：/v1/model/builtin 缺 Agent-Type 头返回
         // 400 TM.00001001「请求头Agent-Type为空」；该头须小写参与签名（与 ops 同款）。
         let extra: [(&str, &str); 1] = [("agent-type", "PromptCenter")];
