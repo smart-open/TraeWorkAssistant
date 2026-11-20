@@ -297,6 +297,8 @@ fn resolve_notify_channels(
     let on = match event {
         crate::notify::NotifyEvent::CheckinDone => s.notify_on_checkin,
         crate::notify::NotifyEvent::TaskFail => s.notify_on_task_fail,
+        // issue #222：定时任务完成推送（默认关，成功推送易耗尽 Server酱免费档每日 5 条）
+        crate::notify::NotifyEvent::TaskSuccess => s.notify_on_task_success,
         // issue #220 P3：账号状态跃迁（需重登/Forbidden/积分耗尽）归入失败类推送
         crate::notify::NotifyEvent::AccountState => s.notify_on_task_fail,
         crate::notify::NotifyEvent::Other => true,
@@ -604,6 +606,26 @@ mod tests {
             r#"{"notify_enabled":true,"notify_on_checkin":false,"notify_on_task_fail":false,"notify_bark_url":"http://b","notify_webhook_url":"ftp://w","notify_serverchan_sendkey":"bad key"}"#,
         );
         push_notify(None, &dir, "标题", "内容", NotifyEvent::Other);
+        assert_sent(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TaskSuccess 独立开关（issue #222）：默认关（serde default → false）不推送；
+    /// 显式开启后推送
+    #[test]
+    fn push_notify_task_success_gated_by_own_switch() {
+        let dir = tmp_dir("task_success");
+        seed_app_settings(
+            &dir,
+            r#"{"notify_enabled":true,"notify_on_checkin":false,"notify_on_task_fail":false,"notify_bark_url":"http://b","notify_webhook_url":"ftp://w","notify_serverchan_sendkey":"bad key"}"#,
+        );
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::TaskSuccess);
+        assert_not_sent(&dir);
+        seed_app_settings(
+            &dir,
+            r#"{"notify_enabled":true,"notify_on_task_success":true,"notify_on_checkin":false,"notify_on_task_fail":false,"notify_bark_url":"http://b","notify_webhook_url":"ftp://w","notify_serverchan_sendkey":"bad key"}"#,
+        );
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::TaskSuccess);
         assert_sent(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }

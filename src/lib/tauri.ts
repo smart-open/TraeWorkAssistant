@@ -131,6 +131,12 @@ const INVOKE_TIMEOUT_OVERRIDES: Record<string, number | null> = {
   workbuddy_cli_rotate_run: 600_000,
   workbuddy_usage_official_all: 600_000,
   workbuddy_credits_fetch: 600_000,
+  // buddy-ai（国际版）同构命令（2026-11-20 审查修复，High）：原漏配走默认 120s，
+  // 全账号串行网络聚合账号稍多即超时中止——用户看到失败 toast 但后端仍在跑，
+  // 数据稍后才写入；与国内版口径对齐
+  buddy_ai_credits_fetch: 600_000,
+  buddy_ai_usage_official_all: 600_000,
+  buddy_ai_env_reset: 600_000,
   // 全量账号积分刷新：逐账号串行网络请求（单请求内部超时即 120s），耗时随账号数增长，放宽到 10 分钟
   refresh_remaining_credits: 600_000,
   // 证书安装：PowerShell RunAs 触发 UAC，等待用户点击无时长上限（取消/失败会立即返回错误）
@@ -336,6 +342,9 @@ export const api = {
     settingsGet: () => invoke<Settings>('settings_get'),
     settingsSet: (patch: Partial<Settings>) => invoke('settings_set', { patch }),
     notifyTest: () => invoke<string>('notify_test'),
+    /** 渠道最近一次推送结果（issue #222）：kv notify_last_result，按渠道 {ts, ok, err?, src?} */
+    notifyLastResult: () =>
+      invoke<Record<string, { ts: number; ok: boolean; err?: string; src?: string }>>('notify_last_result_get'),
     creditsHistory: () => invoke<CreditRecord[]>('credits_history'),
     inviteLink: () => invoke<{ url: string }>('invite_link'),
     taskRegister: (time: string) => invoke('task_register', { time }),

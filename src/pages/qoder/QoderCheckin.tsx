@@ -128,7 +128,9 @@ export default function QoderCheckin() {
     if (recs.some((r) => r.status === 'success' || r.status === 'already')) {
       return recs.some((r) => r.status === 'success') ? 'success' : 'already';
     }
-    return recs.find((r) => r.status === 'fail') ? 'fail' : null;
+    if (recs.some((r) => r.status === 'fail')) return 'fail';
+    // skip（体验版未满足活动资格，issue #223）：确定性跳过非失败，中性展示
+    return recs.some((r) => r.status === 'skip') ? 'skip' : null;
   };
 
   const earned = Math.round(lines.reduce((s, l) => s + (l.reward ?? 0), 0) * 100) / 100;
@@ -215,7 +217,7 @@ export default function QoderCheckin() {
                         ) : st === 'already' ? (
                           <Badge tone="blue">已领（此前已领）</Badge>
                         ) : st === 'skip' ? (
-                          <Badge tone="amber">跳过</Badge>
+                          <Badge tone="slate">未满足资格</Badge>
                         ) : (
                           <Badge tone="red">失败</Badge>
                         )}

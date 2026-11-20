@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.9.4
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.9.5
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -385,8 +385,8 @@ ai-work-assistant/
 
 - 大位（MAJOR）仅在重大架构/破坏性变更时升级
 - 一个提交包含多类变更时，按最高级别升位；纯文档/注释改动不升级；版本同步提交本身不再升位
-- 升版提交执行 `npm run set-version <x.y.z>` 一键同步（底层 `scripts/sync_version.mjs`：package.json / Cargo.toml / Cargo.lock / AGENT.md 标题）；CHANGELOG.md 手动新增条目
-- **package-lock.json 脚本不覆盖，需手动同步**（3.9.4 升版曾遗漏）：升版后运行 `npm install --package-lock-only` 再生成，或手改文件内两处 `"version"`（根级与 `packages[""]` 各一处）
+- 升版提交执行 `npm run set-version <x.y.z>` 一键同步（底层 `scripts/sync_version.mjs`：package.json / **package-lock.json**（根级 + `packages[""]` 两处）/ Cargo.toml / Cargo.lock / AGENT.md 标题）；CHANGELOG.md 手动新增条目
+- **package-lock.json 曾两次遗漏**（3.9.4、3.9.5 升版）：根因是脚本不覆盖，3.9.5 起已收敛进 `sync_version.mjs` 自动同步两处 `"version"`——若脚本异常报「结构异常」需人工检查；兜底手工方式为 `npm install --package-lock-only` 或手改两处 `"version"`
 - 版本号单一来源为 `src-tauri/Cargo.toml`：tauri.conf.json 不写 version（自动回退），Rust 端 `env!("CARGO_PKG_VERSION")` 自动取，前端关于页运行时经 `getVersion()` 读取（about.ts 不写版本号），NSIS / MSI 安装包版本号自动跟随
 
 **发版全流程**（仅用户明确发版时）：

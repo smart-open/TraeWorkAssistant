@@ -504,8 +504,39 @@ fn sync_pool_expiry(state: &AppState, aid: &str, creds: &Creds) {
     }
 }
 
+/// wb_checkin_results 文档写互斥（2026-11-20 审查修复，Medium）：append_results /
+/// try_backfill_pending 均为整文档 load→改→save 且无锁——GUI 手动签到与 schtasks
+/// CLI 轮次并发时后保存方整表覆盖先保存方，本轮签到事件或 T+1 回填结果丢失
+/// （pending 标记被覆盖后差值回填永久失效，pre_balance 基准随之丢失）。
+/// 对齐 doubao_checkin_results::record_day_at 同款双层锁：进程内 Mutex 串行化 +
+/// CrossProcLock 跨进程互斥；跨进程锁 Busy/机制性失败降级进程内锁继续写（尽力
+/// 不丢——签到记录为本进程侧产出，跳过即永久丢失，与 doubao skip_on_busy 路径
+/// 语义不同；残余竞态窗口由 SQLite 写原子性兜底）。权衡：try_backfill 持锁跨越
+/// 余额查询网络往返（秒级），他进程写方最长等待 3s 后降级。
+static RESULTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 签到结果 90 天滚动存储（趋势/日志数据源，F-55/F-22；SQLite 化 P3：wb_checkin_results 表）
 fn append_results(state: &AppState, events: &[Value]) {
+    let _g = RESULTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+        &state.data_dir,
+        "wb_checkin",
+        "append_results",
+        3_000,
+    ) {
+        (Some(g), _) => Some(g),
+        (None, Some(fail)) => {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[wb_checkin] 结果落库跨进程锁未获取（{}），降级进程内锁继续写",
+                    fail.describe()
+                ),
+            );
+            None
+        }
+        (None, None) => None,
+    };
     let store = crate::store::db(&state.data_dir);
     let mut data: Value = crate::store::docs::wb_checkin_results_load(&store);
     let results: Vec<Value> = data
@@ -557,6 +588,28 @@ fn try_backfill_pending(
     headers: &[(String, String)],
     base: &str,
 ) -> Option<f64> {
+    // 与 append_results 同款双层锁（2026-11-20 审查修复）：同段 load→改→save，
+    // 与 GUI/CLI 并发轮次互斥；持锁跨越余额查询网络往返（见 RESULTS_LOCK 注释权衡）
+    let _g = RESULTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cross = match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+        &state.data_dir,
+        "wb_checkin",
+        "append_results",
+        3_000,
+    ) {
+        (Some(g), _) => Some(g),
+        (None, Some(fail)) => {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[wb_checkin] T+1 回填跨进程锁未获取（{}），降级进程内锁继续写",
+                    fail.describe()
+                ),
+            );
+            None
+        }
+        (None, None) => None,
+    };
     let mut results: Value =
         crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
     let diff = backfill_pending_reward(state, aid, agent, headers, base, &mut results)?;

@@ -24,12 +24,14 @@ export type { CheckinCalendarDay, CheckinCalendarEntry } from './checkinCalendar
 
 const STATUS_BADGE: Record<
   import('./checkinCalendarModel').CheckinCalendarEntry['status'],
-  { text: string; tone: 'green' | 'blue' | 'red' | 'amber' }
+  { text: string; tone: 'green' | 'blue' | 'red' | 'amber' | 'slate' }
 > = {
   success: { text: '已领', tone: 'green' },
   already: { text: '此前已领', tone: 'blue' },
   fail: { text: '失败', tone: 'red' },
   partial: { text: '部分失败', tone: 'amber' },
+  // 未满足活动资格（issue #223）：确定性跳过非失败，中性灰标
+  skip: { text: '未满足资格', tone: 'slate' },
 };
 
 export default function CheckinCalendarCard({

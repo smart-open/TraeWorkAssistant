@@ -494,6 +494,8 @@ export interface Settings {
   notify_on_checkin: boolean;
   /** 调度任务失败时推送（默认开） */
   notify_on_task_fail: boolean;
+  /** 定时调度任务完成时推送（issue #222；默认关——成功推送易耗尽 Server酱免费档每日 5 条） */
+  notify_on_task_success: boolean;
   /** Bark 推送地址（https://api.day.app/<key>；空 = 关闭该渠道） */
   notify_bark_url: string | null;
   /** 通用 Webhook 地址（POST JSON，兼容企业微信群机器人等自建端；空 = 关闭） */
@@ -2009,6 +2011,9 @@ export interface QoderCheckinDone {
   /** failed 中「风控信任未建立（BLOCKED）」数：恢复需用户操作（切换账号+客户端建信任），
    * 自动重试无效（issue #190，口径对齐 Rust 侧） */
   blocked: number;
+  /** 确定性跳过数（体验版账号未满足每日 100 Credits 活动资格，issue #223）：
+   * 不计入 failed，不重试不推送（口径对齐 Rust 侧） */
+  skipped_ineligible: number;
 }
 
 export interface QoderCreditPackage {

@@ -271,6 +271,8 @@ function defaultSettings(): Settings {
     notify_enabled: true,
     notify_on_checkin: true,
     notify_on_task_fail: true,
+    // 定时任务完成推送（issue #222）：默认关，成功推送易耗尽 Server酱免费档每日 5 条
+    notify_on_task_success: false,
     notify_bark_url: null,
     notify_webhook_url: null,
     notify_serverchan_sendkey: null,
@@ -726,6 +728,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       // failed_blocked（风控信任未建立 BLOCKED，issue #190）恢复需用户操作
       // （切换账号 + 客户端建信任），单列提示操作路径，不混入可重试失败
       const blocked = Math.max(0, num(ev.failed_blocked));
+      // skipped_ineligible（体验版未满足活动资格，issue #223）为确定性跳过：
+      // 中性提示，不计失败、不抬升级别
+      const ineligible = Math.max(0, num(ev.skipped_ineligible));
       const failed = num(ev.failed);
       const done: QoderCheckinDone = {
         ok: num(ev.ok),
@@ -733,6 +738,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         failed,
         empty,
         blocked,
+        skipped_ineligible: ineligible,
       };
       set((s) => ({
         qoderCheckin: { ...s.qoderCheckin, running: false, done, doneRev: s.qoderCheckin.doneRev + 1 },
@@ -747,6 +753,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         retryable > 0 || permanent > 0 || blocked > 0 ? 'warn' : 'success',
         `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
           (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : '') +
+          (ineligible > 0
+            ? `（另有 ${ineligible} 个体验版账号未满足活动资格，开通试用/订阅/会员卡后可领取）`
+            : '') +
           (blocked > 0
             ? `（其中 ${blocked} 项被风控拦截：请切换到该账号并打开 Qoder 客户端使用一次建立信任，再手动重试（信任生效可能有延迟）；若重试仍拦截，在客户端内重新登录该账号正常使用后，用「扫描本地账号」重新添加）`
             : '') +

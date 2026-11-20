@@ -785,29 +785,51 @@ pub fn notify_test(state: State<AppState>) -> Result<String, String> {
     let body = "这是一条测试消息：如果你收到它，说明对应通知渠道配置生效。";
     let mut errs: Vec<String> = Vec::new();
     if let Some(bark) = channels.bark_url.as_deref().filter(|x| !x.trim().is_empty()) {
-        if let Err(e) = crate::notify::notify_bark(bark, title, body) {
+        let res = crate::notify::notify_bark(bark, title, body);
+        if let Err(e) = &res {
             errs.push(format!("Bark: {e}"));
         }
+        crate::notify::record_channel_result(&state.data_dir, "bark", "test", &res);
     }
     if let Some(wh) = channels.wechat_webhook.as_deref().filter(|x| !x.trim().is_empty()) {
-        if let Err(e) = crate::notify::notify_wechat_webhook(wh, title, body) {
+        let res = crate::notify::notify_wechat_webhook(wh, title, body);
+        if let Err(e) = &res {
             errs.push(format!("Webhook: {e}"));
         }
+        crate::notify::record_channel_result(&state.data_dir, "wechat", "test", &res);
     }
     if let Some(sk) = channels.serverchan_sendkey.as_deref().filter(|x| !x.trim().is_empty()) {
-        if let Err(e) = crate::notify::notify_serverchan(sk, title, body) {
+        let res = crate::notify::notify_serverchan(sk, title, body);
+        if let Err(e) = &res {
             errs.push(format!("Server酱: {e}"));
         }
+        crate::notify::record_channel_result(&state.data_dir, "serverchan", "test", &res);
     }
     if let Some(pp) = channels.pushplus_token.as_deref().filter(|x| !x.trim().is_empty()) {
-        if let Err(e) = crate::notify::notify_pushplus(pp, title, body, channels.pushplus_template.as_deref(), channels.pushplus_topic.as_deref()) {
+        let res = crate::notify::notify_pushplus(pp, title, body, channels.pushplus_template.as_deref(), channels.pushplus_topic.as_deref());
+        if let Err(e) = &res {
             errs.push(format!("PushPlus: {e}"));
         }
+        crate::notify::record_channel_result(&state.data_dir, "pushplus", "test", &res);
     }
     if errs.is_empty() {
         Ok("测试消息已发送至全部已配置渠道".into())
     } else {
         Err(errs.join("；"))
+    }
+}
+
+/// 渠道最近一次推送结果（issue #222 可观测性）：kv `notify_last_result` 按渠道记录
+/// 最近一次推送的时间/成败/错误，通知渠道面板展示「最近推送」状态，让静默失败可见。
+/// 边界归一化（审查修复）：kv_get 缺键/损坏回退 Value::Null，前端
+/// Object.keys(null) 会抛 TypeError——非 object 一律归一为空对象
+#[tauri::command]
+pub fn notify_last_result_get(state: State<AppState>) -> serde_json::Value {
+    let doc: serde_json::Value = crate::store::db(&state.data_dir).kv_get("notify_last_result");
+    if doc.is_object() {
+        doc
+    } else {
+        serde_json::json!({})
     }
 }
 

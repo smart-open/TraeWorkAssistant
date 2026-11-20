@@ -89,6 +89,10 @@ export default function BuddyAiApiService() {
   // 保存请求序号守卫（审查 #6，与 ResourceSummary F2 同类竞态）：连续保存时旧请求
   // 慢败返回，陈旧快照回滚会覆盖其后已成功保存的字段并可能经下次 onBlur 写回后端
   const saveSeqRef = useRef(0);
+  // refresh 序号守卫（2026-11-20 审查修复，Medium）：savePool 结束后的 refresh() 与
+  // 用户点「刷新」或挂载 effect 并发时，两个 Promise.all 乱序 resolve，旧快照
+  // （含旧 pool、旧 pendingEnabled 清空）覆盖新快照——保存后列表回跳旧 disabled 态
+  const refreshSeqRef = useRef(0);
 
   const refreshCatalog = useCallback(async () => {
     const [cat, unified] = await Promise.all([
@@ -101,6 +105,7 @@ export default function BuddyAiApiService() {
   }, []);
 
   const refresh = useCallback(async () => {
+    const seq = ++refreshSeqRef.current;
     setLoading(true);
     try {
       const [pf, accs, cat, unified, gs, tags] = await Promise.all([
@@ -119,6 +124,8 @@ export default function BuddyAiApiService() {
         api.groups.sharedList().catch(() => [] as GroupView[]),
         api.tags.list().catch(() => [] as TagView[]),
       ]);
+      // 过期响应丢弃（序号守卫）：新请求已发出，旧快照不得覆盖新数据
+      if (seq !== refreshSeqRef.current) return;
       setPool(pf);
       setAccounts(accs);
       setCatalog(cat);
@@ -145,7 +152,8 @@ export default function BuddyAiApiService() {
         };
       }
     } finally {
-      setLoading(false);
+      // 仅当前序号才收 loading（过期请求早退时不抢最新请求的进行中态）
+      if (seq === refreshSeqRef.current) setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -160,7 +168,11 @@ export default function BuddyAiApiService() {
           hhmm: st.buddy_ai_catalog_sync_hhmm || '05:55',
         });
       })
-      .catch(() => {});
+      .catch(() => {
+        // 审查修复（2026-11-20，Medium）：静默吞错时 UI 停留默认值假态，用户随手
+        // 碰开关就会把默认值写回后端——加载失败必须可见
+        pushToast('error', '每日定时同步配置加载失败，请点「刷新」重试后再修改');
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refresh]);
 
@@ -320,6 +332,7 @@ export default function BuddyAiApiService() {
 
   /** 每日定时同步目录：开关/时刻即改即存（与国内「每日定时同步行」同范式） */
   const saveCatalogTask = async (next: { enabled: boolean; hhmm: string }) => {
+    const prev = catalogTask;
     setCatalogTask(next);
     try {
       await api.misc.settingsSet({
@@ -335,6 +348,8 @@ export default function BuddyAiApiService() {
         next.enabled ? `每日定时同步已保存（每天 ${next.hhmm || '05:55'} 触发）` : '每日定时同步已关闭',
       );
     } catch (err) {
+      // 审查修复（2026-11-20，Low）：失败回滚乐观 UI（与 saveFlags/togglePseudo 范式一致）
+      setCatalogTask(prev);
       pushToast('error', `保存定时同步配置失败：${String(err).slice(0, 120)}`);
     }
   };

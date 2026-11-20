@@ -1714,12 +1714,38 @@ pub fn cooldown_clear_all(
     };
 
     // 同时清除运行中 API 池的内存冷却状态
+    // 审查修复（2026-11-20，Medium）：原只清 Trae 池——#206 引入的账号×模型冷却
+    // 与 WB/BuddyAi 池账号级冷却、两池模型级冷却均不在覆盖面，用户点「清除冷却」
+    // 后 429 冷却的账号×模型对依然生效（只能等 TTL 最长 7 天或重启网关）
     let mem_count = {
         let guard = runtime
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
-            Some(rt) => rt.shared.pool.clear_cooldowns(),
+            Some(rt) => {
+                let mut n = rt.shared.pool.clear_cooldowns();
+                n += rt.shared.wb_pool.clear_cooldowns();
+                n += rt.shared.buddy_ai_pool.clear_cooldowns();
+                // 模型级冷却两表（F-34，CN/Intl 独立实例）
+                for tbl in [
+                    &rt.shared.model_cooldowns,
+                    &rt.shared.buddy_ai_model_cooldowns,
+                ] {
+                    let mut m = tbl.lock().unwrap_or_else(|e| e.into_inner());
+                    n += m.len();
+                    m.clear();
+                }
+                // 账号×模型冷却两表（issue #206，CN/Intl 独立实例）
+                for tbl in [
+                    &rt.shared.wb_account_model_cooldowns,
+                    &rt.shared.buddy_ai_account_model_cooldowns,
+                ] {
+                    let mut m = tbl.lock().unwrap_or_else(|e| e.into_inner());
+                    n += m.len();
+                    m.clear();
+                }
+                n
+            }
             None => 0,
         }
     };
@@ -2256,7 +2282,47 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
         }
         account.name.clone()
     };
-    crate::vault::save_accounts(&state, &mut accounts)?;
+    // 审查修复（2026-11-20，High，issue #201 窗口补齐）：2026-11-18 修复只覆盖了
+    // capture 窗口——`accounts` 在 capture 后重读一次，随后 ExchangeToken（网络调用，
+    // 秒级）期间 device_proxy 自动捕获 / OAuth 登录 / 他进程续期仍可能向 vault 写入
+    // 其他账号新凭证，整文件保存旧快照会回滚这些写入（旧凭证复活）。
+    // 写回前重读最新 vault，仅把本账号刚换发的凭证字段合并进最新视图；
+    // 本账号已被并发移除时跳过写回（复活已删除账号无意义）。
+    {
+        let mut fresh = crate::vault::load_accounts(state);
+        let merged = match fresh
+            .accounts
+            .iter_mut()
+            .find(|a| a.user_id.as_deref() == Some(user_id))
+        {
+            Some(a) => {
+                if let Some(cur) = accounts
+                    .accounts
+                    .iter()
+                    .find(|x| x.user_id.as_deref() == Some(user_id))
+                {
+                    a.jwt = cur.jwt.clone();
+                    a.refresh_token = cur.refresh_token.clone();
+                    a.updated_at = cur.updated_at.clone();
+                    a.refresh_token_fails = cur.refresh_token_fails;
+                    a.refresh_token_invalid = cur.refresh_token_invalid;
+                    a.auth_saved_at = cur.auth_saved_at.clone();
+                    a.refresh_token_expires_at = cur.refresh_token_expires_at;
+                }
+                true
+            }
+            None => {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("预对齐/刷新 [{user_id}]: 本账号已被并发移除，跳过凭证写回"),
+                );
+                false
+            }
+        };
+        if merged {
+            crate::vault::save_accounts(&state, &mut fresh)?;
+        }
+    }
     // 记录成功刷新时刻：供 401 自愈 force 路径并发去重（FORCE_REFRESH_DEDUP_SECS 窗内复用）
     LAST_SUCCESS_REFRESH
         .lock()

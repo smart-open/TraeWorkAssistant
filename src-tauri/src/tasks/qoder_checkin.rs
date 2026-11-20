@@ -212,6 +212,13 @@ const BLOCKED_NEED_TRUST_TAG: &str = "blocked_need_trust";
 /// 上游 claim 对过期活动返回 `{"code":{"code":"CAMPAIGN_NOT_ACTIVE",...}}`。
 const CAMPAIGN_NOT_ACTIVE_TAG: &str = "CAMPAIGN_NOT_ACTIVE";
 
+/// 未满足活动资格标记（issue #223）：体验版（plan=free）账号自 2026-11-19 起
+/// 不在每日 100 Credits 活动投放范围（官方公告），服务端对这类账号不下发活动
+///（campaigns 双形态空表）。空表 × plan=free → 归类 skip（确定性跳过，对齐豆包
+/// 3.9.4 口径）：不算失败、不进重试与失败推送，UI 中性展示。plan 为空/非 free
+/// 的空表保持原口径（付费用户空表可能是暂态上游故障，照旧重试）
+const INELIGIBLE_TAG: &str = "ineligible";
+
 /// 拉取活动列表原始数据（**全量，不过滤，允许空列表**）。
 /// 返回 Ok(campaign 列表，可为空)；Err(kind, message)：auth（401）| fail。
 /// 与 [`list_campaigns`] 的区别：不把空列表判为 fail——盲发兜底当轮重学
@@ -1379,6 +1386,10 @@ fn process_account(
             if uid.is_empty() { aid.clone() } else { uid.chars().take(12).collect() }
         });
     let base_ev = json!({"user_id": aid, "name": name});
+    // 未满足活动资格判定（issue #223）：plan 由 userinfo 回填（free | pro | pro+ |
+    // teams），导入时 userinfo 失败可为空——仅显式 free 才归类 skip，空 plan 不
+    // 误判（账号页刷新账号信息可回填）
+    let plan_free = s_of(acct.get("plan")).eq_ignore_ascii_case("free");
     let (creds, refreshed, note) = qoder_common::ensure_fresh(state, agent, &aid, opts.lazy_hours);
     if creds.access_token.is_empty() {
         let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
@@ -1563,8 +1574,20 @@ fn process_account(
             // 先盲发试领（多账号轮次 learned 通常已含当日 id，首个账号靠 conf/
             // 内置表），命中即真实领取/回放确认，与零 CLAIMABLE 路径同款
             if m.starts_with(EMPTY_CAMPAIGNS_TAG) {
-                // Failed 分支保留原空表分类 + 详情追加的完整语义说明见 run_fallback 文档
-                run_fallback(state, agent, &min_token, &urls, learned, table, Some((k.as_str(), m.as_str())))
+                // 未满足活动资格（issue #223）：体验版账号官方已不再投放每日
+                // 100 Credits，服务端不下发活动（双形态均空表）——盲发注定 409，
+                // 直接归类 skip：不进兜底（省必败请求与风控暴露）、不计失败、
+                // 不触发调度器重试与失败推送
+                if plan_free {
+                    (
+                        "skip".into(),
+                        "体验版账号不参与每日 100 Credits 活动（开通试用/订阅/会员卡后可领取）".into(),
+                        None,
+                    )
+                } else {
+                    // Failed 分支保留原空表分类 + 详情追加的完整语义说明见 run_fallback 文档
+                    run_fallback(state, agent, &min_token, &urls, learned, table, Some((k.as_str(), m.as_str())))
+                }
             } else {
                 (k, m, None)
             }
@@ -1789,6 +1812,7 @@ fn process_account(
     let status_txt = match kind.as_str() {
         "success" => "success",
         "already" => "already",
+        "skip" => "skip",
         _ => "fail",
     };
     // 空活动列表诊断（脱敏：只记账号与结论，不含 token/响应原文）
@@ -1816,7 +1840,11 @@ fn process_account(
     // fail_kind 字段，不再各自耦合 message 文案；前缀派生已收敛到
     // EMPTY_CAMPAIGNS_TAG 常量（与产源 list_campaigns 同源，改展示文案尾缀
     // 不破坏统计，换标记只动常量一处）
-    if message.starts_with(EMPTY_CAMPAIGNS_TAG) {
+    if kind == "skip" {
+        // 未满足活动资格（issue #223）：前端按 fail_kind 渲染中性徽标，
+        // 与真正失败（红标/重试/推送）明确区分
+        ev["fail_kind"] = json!(INELIGIBLE_TAG);
+    } else if message.starts_with(EMPTY_CAMPAIGNS_TAG) {
         ev["fail_kind"] = json!(EMPTY_CAMPAIGNS_TAG);
     } else if message.contains(BLOCKED_NEED_TRUST_TAG) {
         // 风控信任未建立（issue #190）：BLOCKED 消息（盲发带「{账号名} 盲发失败：」
@@ -1931,7 +1959,10 @@ pub fn run_checkin_round(
 
     let ok = events.iter().filter(|e| e["status"] == "success").count();
     let already = events.iter().filter(|e| e["status"] == "already").count();
-    let failed = events.len() - ok - already;
+    // skip（未满足活动资格，issue #223）单列：确定性跳过非失败——调度器/CLI
+    // 按 failed 字段判定重试与首败推送，failed 不含 skip 即自然豁免
+    let skipped_ineligible = events.iter().filter(|e| e["status"] == "skip").count();
+    let failed = events.len() - ok - already - skipped_ineligible;
     // empty_campaigns 单列（审查 L-empty_campaigns）：活动未开始/不可用属非用户可操作
     // 失败，启动补签推送按 failed - failed_empty_campaigns 判定，避免无效打扰。
     // 判定读结构化 fail_kind 字段（process_account 产出），字段值取自
@@ -1966,6 +1997,7 @@ pub fn run_checkin_round(
         "failed_empty_campaigns": failed_empty_campaigns,
         "failed_permanent": failed_permanent,
         "failed_blocked": failed_blocked,
+        "skipped_ineligible": skipped_ineligible,
     });
     // 先落库再广播 done（issue #190）：账号页 doneRev 消费方收到事件后立即
     // 回查 checkinResults，若先广播会在落库完成前读到旧快照，徽标滞后一轮

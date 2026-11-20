@@ -76,7 +76,7 @@ pub fn is_retry_later_error(body: &str) -> bool {
 /// （Go encoding/json 紧凑无空格，但报文可能经中间层重序列化）；
 /// 值须带数字边界（`111280`/`111289` 不误撞），键名引号边界天然排除
 /// `some_code` 等字段名
-fn contains_code_value(body: &str, code: &str) -> bool {
+pub(crate) fn contains_code_value(body: &str, code: &str) -> bool {
     const KEY: &str = "\"code\"";
     let mut rest = body;
     while let Some(pos) = rest.find(KEY) {

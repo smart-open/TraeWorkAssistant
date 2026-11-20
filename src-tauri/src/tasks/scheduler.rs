@@ -359,6 +359,25 @@ fn tick(app: &AppHandle, st: &AppState) {
                 } else if v.get("skipped_empty_pool").is_none() {
                     mark_run(st, t.key, &today, &summary);
                     fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
+                    // 定时任务完成推送（issue #222）：默认关（notify_on_task_success）。
+                    // 普通空池 skipped（无账号空转，「无 X 账号」类 summary）与 empty_pool
+                    // 同义不推——审查修复 #5：避免 trivial skip 噪声耗尽渠道免费额度；
+                    // 后台版推送（审查修复 #1）：四渠道 HTTP 最坏 ~40s 不阻塞调度 tick
+                    // 循环（app=Some 恢复桌面通知），渠道失败静默，绝不影响调度循环
+                    // 审查修复（major）：成功推送仅限奖励型任务（success_pushable 白名单，
+                    // Daily 语义 mark_run 保证每任务至多 1 次/日，全开 ≤6 条/日）——
+                    // 快照/续期/目录同步类恒开任务最高每 2h 一轮，全量推送每日可达
+                    // 90+ 条，会在故障发生前耗尽 Server酱免费档每日 5 条额度，
+                    // 失败告警反被成功侧挤占发不出去
+                    if v.get("skipped").is_none() && success_pushable(t.key) {
+                        crate::commands::workbuddy::push_notify_bg(
+                            Some(app.clone()),
+                            st.data_dir.clone(),
+                            &format!("{} 完成", t.name),
+                            &summary,
+                            crate::notify::NotifyEvent::TaskSuccess,
+                        );
+                    }
                     // 看板数据同步成功 → 通知前端重读缓存（issue #61 前端联动：
                     // Dashboard listen 后按 platform 匹配静默 refresh(false)，零额外网络）
                     if let Some(p) = board_platform(t.key) {
@@ -800,6 +819,7 @@ fn run_task(
             // 审查 minor：永久性认证失败（pat_rejected/expired_needs_relogin/auth_dead）
             // 重试注定失败，与 empty_campaigns 一并从重试判定剔除——否则失效账号
             // 会拖动整轮全天约 28 次冷却重试（含每轮必败的刷新请求）
+            // issue #223：未满足活动资格（体验版 skip）不计入 failed，自然豁免
             let failed_permanent = done
                 .get("failed_permanent")
                 .and_then(serde_json::Value::as_i64)
@@ -1175,6 +1195,17 @@ fn write_entry(st: &AppState, key: &str, entry: Value) {
     }
 }
 
+/// 定时任务完成推送（issue #222）白名单：仅奖励型任务（漏跑=丢收益的签到/成长）。
+/// Daily 语义 mark_run 关闭当日重复触发，保证每任务至多推送 1 次/日（全开 ≤6 条）；
+/// 恒开的快照/续期/同步类任务频率高（credits 类默认每 2h、续期每 6h）且无用户
+/// 可操作收益，成功推送纯噪声且挤占渠道免费额度（Server酱 每日 5 条），不推。
+fn success_pushable(task_key: &str) -> bool {
+    matches!(
+        task_key,
+        "trae-checkin" | "wb-checkin" | "qoder-checkin" | "buddy-ai-checkin" | "doubao-checkin" | "wb-growth"
+    )
+}
+
 /// 结果 JSON → 单行摘要（签到/打卡轮次取 ok/already/failed 计数，其余截断展示；
 /// buddy-ai 活跃打卡用「已打」，国内各平台签到仍用「已签」）
 fn summarize(v: &Value, task_key: &str) -> String {
@@ -1182,7 +1213,34 @@ fn summarize(v: &Value, task_key: &str) -> String {
         let get = |k: &str| v.get(k).and_then(Value::as_i64);
         if let (Some(o), Some(a), Some(f)) = (get("ok"), get("already"), get("failed")) {
             let unit = if task_key == "buddy-ai-checkin" { "已打" } else { "已签" };
-            return format!("成功 {o}，{unit} {a}，失败 {f}");
+            // 审查修复：skip（体验版未满足资格，issue #223）单列展示——否则
+            // skip-only 轮次推送「成功 0，已签 0，失败 0」全 0 数字误导
+            let mut s = format!("成功 {o}，{unit} {a}，失败 {f}");
+            if let Some(sk) = get("skipped_ineligible").filter(|x| *x > 0) {
+                s.push_str(&format!("，跳过 {sk}"));
+            }
+            return s;
+        }
+        // 审查修复：无计数字段的对象改用 key=value 摘要（原实现 JSON 序列化截断
+        // 120 字符推送到手机不可读）；嵌套/数组值收窄为 …，整体仍截断 120
+        let parts: Vec<String> = v
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .take(6)
+                    .map(|(k, val)| match val {
+                        Value::String(s) => format!("{k}={s}"),
+                        Value::Number(n) => format!("{k}={n}"),
+                        Value::Bool(b) => format!("{k}={b}"),
+                        Value::Null => format!("{k}=null"),
+                        _ => format!("{k}=…"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !parts.is_empty() {
+            let s = parts.join("，");
+            return s.chars().take(120).collect();
         }
     }
     let s = serde_json::to_string(v).unwrap_or_default();

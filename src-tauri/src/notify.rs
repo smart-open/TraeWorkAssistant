@@ -38,6 +38,9 @@ pub enum NotifyEvent {
     CheckinDone,
     /// 调度任务失败（应用内调度器任务返回 Err）
     TaskFail,
+    /// 定时调度任务完成推送（issue #222；成功推送易耗尽 Server酱免费档每日 5 条，
+    /// 默认关——独立开关 notify_on_task_success 控制）
+    TaskSuccess,
     /// 账号状态跃迁告警（issue #220 P3）：needs_relogin / 网关 Forbidden /
     /// 积分保护冷却——语义归入失败类推送（走 notify_on_task_fail 开关过滤）
     AccountState,
@@ -124,6 +127,26 @@ pub fn notify_wechat_webhook(webhook: &str, title: &str, body: &str) -> Result<(
     Ok(())
 }
 
+/// 解析 Server酱 响应体（issue #222）：sctapi 成功返回 `{"code":0,...}`，业务失败
+/// （如 SendKey 无效 / 免费档每日 5 条超限）也带 code/message——HTTP 200 与 4xx 均
+/// 可能出现，必须查 body 才能给出可诊断的错误信息（对齐 PushPlus 业务码解析做法）。
+/// 错误文本不带「Server酱」前缀，由调用方按 HTTP 语境统一加前缀（审查修复：避免
+/// 4xx 路径产出「Server酱 HTTP 400: Server酱 返回业务码…」双重前缀）。
+fn parse_serverchan_resp(body: &str) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|_| "响应非 JSON（网关或网络异常）".to_string())?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code == 0 {
+        return Ok(());
+    }
+    let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("").trim();
+    if msg.is_empty() {
+        Err(format!("返回业务码 {code}"))
+    } else {
+        Err(format!("返回业务码 {code}: {msg}"))
+    }
+}
+
 /// Server酱：表单提交 title/desp（Turbo 版 sctapi 端点）
 pub fn notify_serverchan(sendkey: &str, title: &str, body: &str) -> Result<(), String> {
     let key = sendkey.trim();
@@ -135,11 +158,23 @@ pub fn notify_serverchan(sendkey: &str, title: &str, body: &str) -> Result<(), S
         .build();
     // desp 支持 markdown：换行转两空格+换行保持段落
     let desp = body.replace('\n', "  \n");
-    agent
+    match agent
         .post(&format!("https://sctapi.ftqq.com/{key}.send"))
         .send_form(&[("title", title), ("desp", desp.as_str())])
-        .map_err(|e| format!("Server酱 请求失败: {e}"))?;
-    Ok(())
+    {
+        // HTTP 200 仍可能业务失败（code != 0），必须查响应体
+        Ok(resp) => {
+            let text =
+                resp.into_string().map_err(|e| format!("Server酱 响应读取失败: {e}"))?;
+            parse_serverchan_resp(&text).map_err(|e| format!("Server酱 {e}"))
+        }
+        // HTTP 4xx/5xx：错误体同样含业务码（如超限），解析后带出具体原因
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            parse_serverchan_resp(&text).map_err(|e| format!("Server酱 HTTP {code}: {e}"))
+        }
+        Err(e) => Err(format!("Server酱 请求失败: {e}")),
+    }
 }
 
 /// PushPlus 允许的模板白名单（issue #157：html / txt / markdown）
@@ -248,7 +283,15 @@ pub fn notify_account_state(
             return;
         }
     }
-    if let Err(e) = db.kv_set(&key, &serde_json::json!({ "pending_at": now })) {
+    // 审查修复（2026-11-20，Medium）：pending 标记整值覆盖会抹掉同键的 ts（上次
+    // 推送成功时刻）——被开关过滤的尝试不执行 on_done（值停留在 pending 形态），
+    // 24h 冷却记忆丢失 → 之后每次状态跃迁（间隔 >120s）都重复推送。写 pending 时
+    // 保留既有 ts（on_done 冷却标记为整值覆盖 {ts}，pending 残留字段随之清除）。
+    let mut pending = serde_json::json!({ "pending_at": now });
+    if let Some(ts) = prev.get("ts").and_then(serde_json::Value::as_i64) {
+        pending["ts"] = serde_json::json!(ts);
+    }
+    if let Err(e) = db.kv_set(&key, &pending) {
         crate::fs_utils::app_log(data_dir, &format!("账号状态告警 pending 标记写入失败: {e}"));
     }
     let key_done = key.clone();
@@ -270,6 +313,49 @@ pub fn notify_account_state(
     );
 }
 
+/// 渠道推送结果落盘（issue #222 可观测性）：kv `notify_last_result` 按渠道记录
+/// 最近一次推送的时间/成败/错误。此前渠道失败只静默写 app.log，通知面板上看不到
+/// 「为什么没推」（如 Server酱免费档每日 5 条超限）；记录写失败不影响推送主流程。
+/// pub(crate)：notify_test（misc.rs）发送测试后同样记录（src="test"，面板区分展示），
+/// 记录后 emit `notify-result-updated` 供打开中的面板实时刷新（global_app 未注册时
+/// 静默跳过；渠道失败静默的总原则不受影响）。
+pub(crate) fn record_channel_result(data_dir: &std::path::Path, channel: &str, src: &str, res: &Result<(), String>) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let entry = match res {
+        Ok(()) => serde_json::json!({ "ts": now, "ok": true, "src": src }),
+        Err(e) => serde_json::json!({ "ts": now, "ok": false, "err": e, "src": src }),
+    };
+    let updated = crate::store::db(data_dir).kv_update("notify_last_result", |doc| {
+        // 审查修复（2026-11-20）：kv 缺键/损坏时 doc 可能为 Null 等非 object 值，
+        // 原实现静默不插入（记录停更无线索）——非 object 一律重置为单条目新对象
+        if !doc.is_object() {
+            *doc = serde_json::json!({});
+        }
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert(channel.to_string(), entry);
+        }
+        Ok::<_, String>(true)
+    });
+    if updated.is_ok() {
+        if let Some(app) = global_app() {
+            crate::events::emit_logged(
+                app,
+                "notify-result-updated",
+                serde_json::json!({ "channel": channel }),
+                None,
+            );
+        }
+    } else if let Err(e) = &updated {
+        // 审查修复：落盘失败留痕（对齐调度状态落库失败补日志口径）——可观测性
+        // 功能自身静默停更将无线索（如「最近推送」面板停在旧时间）；日志写入
+        // 失败同样不影响推送主流程
+        crate::fs_utils::app_log(
+            data_dir,
+            &format!("通知渠道({channel})最近推送结果落盘失败: {e}"),
+        );
+    }
+}
+
 /// 统一分发入口：桌面通知（有 AppHandle 时）+ 可选渠道；渠道失败仅记日志。
 pub fn notify_all(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &str, body: &str, channels: &NotifyChannels) {
     if let Some(app) = app {
@@ -279,30 +365,38 @@ pub fn notify_all(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &s
         return;
     }
     if let Some(bark) = channels.bark_url.as_deref().filter(|s| !s.trim().is_empty()) {
-        if let Err(e) = notify_bark(bark, title, body) {
+        let res = notify_bark(bark, title, body);
+        if let Err(e) = &res {
             crate::fs_utils::app_log(data_dir, &format!("通知渠道(Bark)失败: {e}"));
         }
+        record_channel_result(data_dir, "bark", "push", &res);
     }
     if let Some(webhook) = channels.wechat_webhook.as_deref().filter(|s| !s.trim().is_empty()) {
-        if let Err(e) = notify_wechat_webhook(webhook, title, body) {
+        let res = notify_wechat_webhook(webhook, title, body);
+        if let Err(e) = &res {
             crate::fs_utils::app_log(data_dir, &format!("通知渠道(企业微信)失败: {e}"));
         }
+        record_channel_result(data_dir, "wechat", "push", &res);
     }
     if let Some(sendkey) = channels.serverchan_sendkey.as_deref().filter(|s| !s.trim().is_empty()) {
-        if let Err(e) = notify_serverchan(sendkey, title, body) {
+        let res = notify_serverchan(sendkey, title, body);
+        if let Err(e) = &res {
             crate::fs_utils::app_log(data_dir, &format!("通知渠道(Server酱)失败: {e}"));
         }
+        record_channel_result(data_dir, "serverchan", "push", &res);
     }
     if let Some(token) = channels.pushplus_token.as_deref().filter(|s| !s.trim().is_empty()) {
-        if let Err(e) = notify_pushplus(
+        let res = notify_pushplus(
             token,
             title,
             body,
             channels.pushplus_template.as_deref(),
             channels.pushplus_topic.as_deref(),
-        ) {
+        );
+        if let Err(e) = &res {
             crate::fs_utils::app_log(data_dir, &format!("通知渠道(PushPlus)失败: {e}"));
         }
+        record_channel_result(data_dir, "pushplus", "push", &res);
     }
 }
 
@@ -398,6 +492,17 @@ mod tests {
         assert!(parse_pushplus_resp(r#"{"code":903,"msg":"无效的token"}"#).is_err());
         assert!(parse_pushplus_resp(r#"{"code":888,"msg":""}"#).is_err());
         assert!(parse_pushplus_resp("不是 JSON").is_err());
+    }
+
+    /// Server酱 响应码解析（纯函数，不触网，issue #222）：code=0 成功；业务码带出
+    /// message（每日 5 条超限等）；非 JSON 拒绝
+    #[test]
+    fn parse_serverchan_resp_codes() {
+        assert!(parse_serverchan_resp(r#"{"code":0,"message":"","data":[]}"#).is_ok());
+        assert!(parse_serverchan_resp(r#"{"code":40001,"message":"错误的SENDKEY，请检查您的SENDKEY"}"#).is_err());
+        assert!(parse_serverchan_resp(r#"{"code":40002,"message":"每日次数超过免费上限5次"}"#).is_err());
+        assert!(parse_serverchan_resp(r#"{"code":40002,"message":""}"#).is_err());
+        assert!(parse_serverchan_resp("不是 JSON").is_err());
     }
 
     /// 合法格式 + 本地不可达端点（127.0.0.1:1 保留端口，回环立即拒连）：

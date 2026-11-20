@@ -348,6 +348,9 @@ pub struct Settings {
     /// 调度任务失败时推送（默认开）
     #[serde(default = "default_true")]
     pub notify_on_task_fail: bool,
+    /// 定时调度任务完成时推送（issue #222；默认关——成功推送易耗尽 Server酱免费档每日 5 条）
+    #[serde(default)]
+    pub notify_on_task_success: bool,
     /// Bark 推送地址（https://api.day.app/<key>；空 = 关闭该渠道）
     #[serde(default)]
     pub notify_bark_url: Option<String>,

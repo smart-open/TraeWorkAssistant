@@ -700,6 +700,30 @@ fn log_and_record_11128(
 /// 错误下发）；仅 Fatal 终局执行一次；自身网络/响应异常 → 归因未知不落结论
 /// （防误导）。结论只落日志，不改重试策略
 fn probe_11128_account_marked(state: &WbView, creds: &WbCreds, model: &str) {
+    // 进程级探针去重（2026-11-20 审查修复，Medium）：FP_BLOCK_TTL（600s）窗口内
+    // 客户端重试风暴会让每个 11128 Fatal 终局都 spawn 探针线程向真实上游发请求
+    // （耗账号额度 + 放大上游压力），且 detach 线程读路径无整体超时、上游挂起时
+    // 永久滞留。11128 归因是全局性结论（指纹/通道问题），600s 内一次探针足够；
+    // compare_exchange 原子占位防并发双发。
+    const PROBE_DEDUP_SECS: i64 = 600;
+    static LAST_PROBE_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = now_ts();
+    let prev = LAST_PROBE_TS.load(std::sync::atomic::Ordering::Relaxed);
+    if now - prev < PROBE_DEDUP_SECS
+        || LAST_PROBE_TS
+            .compare_exchange(
+                prev,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        state
+            .logger
+            .log_sched_event("[11128 归因探针] 600s 内已发起过探针（进程级去重），本轮跳过");
+        return;
+    }
     let creds = creds.clone();
     let model = model.to_string();
     let spawn = std::thread::Builder::new()
@@ -749,10 +773,14 @@ fn probe_11128_probe_run(state: WbView, creds: WbCreds, model: String) {
             // ——裸匹配数字 11128 会与 usage 帧 token 计数误撞（retry.rs 既定口径）
             let mut reader = std::io::BufReader::new(reader);
             let mut text = String::new();
-            if reader.read_to_string(&mut text).is_err() && text.is_empty() {
+            // 审查修复（2026-11-20，Medium）：读取中途失败（text 可能截断）或 EOF 但
+            // 响应为空（上游立即断连/空 body）都不足以判定「未命中 11128 → 内容残留
+            // 嫌疑」——网络/响应异常一律归因未知，防把排查方向误导到「继续加清洗规则」
+            //（与函数自声明的「自身网络/响应异常 → 归因未知不落结论」原则一致）
+            if reader.read_to_string(&mut text).is_err() || text.trim().is_empty() {
                 state
                     .logger
-                    .log_sched_event("[11128 归因探针] 响应读取失败，归因未知");
+                    .log_sched_event("[11128 归因探针] 响应读取失败或为空响应，归因未知");
                 return;
             }
             super::retry::is_illegal_channel_error(&text)
@@ -833,6 +861,30 @@ pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
         return ErrKind::Client;
     }
     ErrKind::Server
+}
+
+/// WB 族 HTTP 状态码错误路径专用分类（2026-11-20 审查修复，High）：wb_stream_chat /
+/// wb_aggregate_chat / wb_tool_exec_chat 的非 2xx 分支原用通用 `classify_error`，
+/// 其无 WB 特有分支——HTTP 形态的 4054/「请稍后重试」会误落 Client（10 分钟账号级
+/// 冷却，正是 #212/#151 在流内路径修掉的误杀：池小则饿死成 503）；`quota exceeded`
+/// 被 classify_error 有意排除（Trae 4008=频率限流），WB 侧却是硬性配额耗尽 →
+/// 冷却维度分裂。先套 WB 特有判定（与流内 classify_wb_error 同源），未命中回落
+/// 通用分类器（401→SessionDead / 429→SoftRate / 404→NotFound 等状态码口径不变）。
+fn classify_wb_http_error(status: u16, body: &str) -> ErrKind {
+    // 4054 精确码：优先于短语判定（对齐 classify_wb_error 分支顺序）
+    if super::retry::contains_code_value(body, "4054") {
+        return ErrKind::SoftRate;
+    }
+    // quota exceeded（WB 口径 = 硬性配额耗尽）：置于「请稍后重试」短语之前，
+    // 防复合文案（积分不足附带请稍后重试）被劫持改判
+    if body.to_lowercase().contains("quota exceeded") {
+        return ErrKind::HardCredit;
+    }
+    // 「模型请求失败，请稍后重试」短语兜底（is_retry_later_error 内含双词同现）
+    if super::retry::is_retry_later_error(body) {
+        return ErrKind::SoftRate;
+    }
+    classify_error(status, body)
 }
 
 // ==================== F-76③ 慢请求竞速对冲（取号侧编排） ====================
@@ -1987,7 +2039,7 @@ pub(crate) fn run_wb_stream(
                                     }
                                 }
                             }
-                            let kind = classify_error(status, &resp_body);
+                            let kind = classify_wb_http_error(status, &resp_body);
                             if kind != ErrKind::None {
                                 // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
                                 // issue #206：SoftRate 记账号×模型冷却对（不钉账号级 until）；
@@ -2586,7 +2638,7 @@ pub(crate) fn run_wb_aggregate_inner(
                                         }
                                     }
                                 }
-                                let kind = classify_error(status, &resp_body);
+                                let kind = classify_wb_http_error(status, &resp_body);
                                 if kind != ErrKind::None {
                                     // issue #206：SoftRate 记账号×模型冷却对（口径同流式路径）
                                     let upstream = upstream_msg(&resp_body);
@@ -3596,7 +3648,7 @@ pub async fn wb_tool_exec_chat(
                                         }
                                     }
                                 }
-                                let kind = classify_error(status, &resp_body);
+                                let kind = classify_wb_http_error(status, &resp_body);
                                 if kind != ErrKind::None {
                                     // issue #206：SoftRate 记账号×模型冷却对（口径同流式路径）
                                     let upstream = upstream_msg(&resp_body);
