@@ -466,6 +466,54 @@ fn request_level_status(text: &str) -> Option<u16> {
     None
 }
 
+// ==================== 排队等待口径（对齐 qoder_route）====================
+
+/// 同号排队重试上限（次）。与 Qoder 同值：3 次足够覆盖一次典型排队窗口，
+/// 再多只是把预算烧在同一模型上。
+const QUEUE_RETRY_LIMIT: u32 = 3;
+
+/// 缺省排队退避（秒）。取 5s 是因为上游官方轮询间隔就是 5s：比这更快地重试
+/// 只会给已经繁忙的模型加负担，且拿不到新状态。
+const QUEUE_DEFAULT_BACKOFF_SECS: u64 = 5;
+
+/// 排队退避上限（秒）：上游建议值异常大时钳制，避免单个请求把模型锁死过久。
+const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
+
+/// 单请求排队总预算（秒）。与 Qoder 同值 45s：即使 3 次都按 30s 上限退避，
+/// 实际耗时会先被这个预算截断，保证不突破客户端 60s 读超时（CodeArts 流式
+/// keep-alive 15s 会持续续命，但客户端自身队列轮询上限是 30×5s=150s）。
+const QUEUE_BUDGET_SECS: u64 = 45;
+
+/// 排队/退避分片等待：长 sleep 切成 ≤500ms 片段逐段睡，每段后检查下行通道
+/// 是否关闭——客户端已断连即提前退出，不空等数十秒。
+///
+/// 返回 false = 已断连（调用方应把请求视为终局直接返回）。非流式路径没有
+/// 下行通道可查（handler 返回 Response 前无断连通知），传 None 等同整段 sleep。
+fn sleep_in_slices(
+    total: Duration,
+    tx: Option<&tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>,
+) -> bool {
+    let mut left = total;
+    while !left.is_zero() {
+        let step = left.min(Duration::from_millis(500));
+        std::thread::sleep(step);
+        left = left.saturating_sub(step);
+        if let Some(t) = tx {
+            if t.is_closed() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 排队退避秒数：缺省 5s，钳到 1..=30。
+fn queue_backoff_secs(suggested: Option<u64>) -> u64 {
+    suggested
+        .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+        .clamp(1, QUEUE_BACKOFF_MAX_SECS)
+}
+
 /// 排队类业务码：上游明确的「排不上号」信号，**既不是账号故障也不是上游故障**。
 ///
 /// 线上实测（`GET /api/v1/queue/status`）确认排队是该协议的一等公民：
@@ -563,7 +611,9 @@ fn note_model_failure(model: &str) {
                 // 窗口已过期 = 新失败片段 → 递增并设新窗口；未过期 = 同片段换号，
                 // 维持原截止时刻不后延（防持续失败把窗口无限滑动）
                 *fails = fails.saturating_add(1);
-                *until = now + Duration::from_secs(10u64 << (*fails - 1).min(2));
+                // saturating_sub 防下溢：note_model_busy 写的条目 fails=0
+                // （繁忙不计入失败计数），此处减 1 会下溢 panic
+                *until = now + Duration::from_secs(10u64 << (*fails).saturating_sub(1).min(2));
             }
         })
         .or_insert_with(|| (now + Duration::from_secs(10), 1));
@@ -619,9 +669,6 @@ fn note_model_busy(model: &str, secs: u64) {
         })
         .or_insert_with(|| (until, 0));
 }
-
-/// 排队退避上限（秒）：上游建议值异常大时钳制，避免单个请求把模型锁死过久。
-const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
 
 /// 按归因结果记账：账号级冷却 + 模型级冷却（Server 渐进 / 模型繁忙短窗）。
 /// 集中一处，避免流内错误/HTTP 错误/聚合三条路径口径漂移。
@@ -983,9 +1030,14 @@ pub(crate) fn run_codearts_stream(
         };
         // 登记会话名额（RAII：本循环迭代结束时自动 idle 注销）。
         // 必须在取号之后、发请求之前——名额是**按账号**算的。
-        let slot = SessionSlot::acquire(&identity, &state.data_dir);
-        let session_id = slot.as_ref().map(|s| s.id());
-        match send_signed_request(&codearts_agent(), &identity, &prepared, session_id, Some(&affinity)) {
+        // 声明为 mut：排队等待期间必须先归还名额（drop）再睡，醒来重新登记。
+        let mut slot = SessionSlot::acquire(&identity, &state.data_dir);
+        // 本账号本轮已排队重试次数（与 attempts 的 HTTP 层退避计数独立）
+        let mut queue_same: u32 = 0;
+        // 排队总预算：从本轮首次进入排队等待起算，超预算即收尾回 429
+        let mut queue_deadline: Option<Instant> = None;
+        let reader0 = match send_signed_request(&codearts_agent(), &identity, &prepared,
+            slot.as_ref().map(|s| s.id()), Some(&affinity)) {
             Err((status, resp_body)) => {
                 // 同号重试计数：retry_plan 以 attempt 递增判断「退避是否耗尽」，
                 // 恒传 0 会让 429/503 永远返回 RetrySame（要么死循环，要么因
@@ -1028,85 +1080,157 @@ pub(crate) fn run_codearts_stream(
                     }
                 }
             }
-            Ok(reader) => {
-                // 首字竞速对冲（阈值 0 关闭，与纯首字超时同语义）：主请求慢时
-                // 对第二账号发对冲请求（独立 SessionSlot 登记名额），先出首字者胜
-                let hedge_ms = state.codearts_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed);
-                let mut win = match race_codearts_first_byte(
-                    state, &picked.uid, &prepared, &affinity, reader, hedge_ms,
-                ) {
-                    Ok(w) => w,
-                    Err(()) => {
-                        // 首字超时 ≠ 上游故障：CodeArts 推理路径没有排队错误码，
-                        // 「模型繁忙/排队」唯一可观测的表现就是首字迟迟不来
-                        // （实测 `queue/status` 会给出 waiting + 位次，但推理请求
-                        // 本身只表现为慢）。记 Server 会触发 pool.rs 的 30 分钟
-                        // 指数熔断，几次排队就能把健康账号打成不可用——与
-                        // concurrency_limit_is_transient_not_account_fault 修掉的
-                        // 事故同型。故只记模型级繁忙短窗，不动账号。
-                        note_model_busy(model, QUEUE_BACKOFF_MAX_SECS);
-                        last_err = "CodeArts 上游 10 秒内未响应（可能是模型排队，非账号故障）".into();
-                        state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
-                            504, &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
-                            &state.codearts_pool.name_of(&picked.uid), Some(&last_err));
-                        continue;
-                    }
-                };
-                // 竞速收尾：败者补记错误、释放对冲租约；接管时生效 uid 切到对冲账号
-                let (win_uid, _took_over) = settle_codearts_hedge(state, &mut win, &picked.uid);
-                let read_slot = win.read_slot.clone();
-                // 竞速胜者行源是 Box<dyn Iterator>，桥接为 InterruptibleLines
-                // 供 stream_forward_ex 消费（读错误经 read_slot 单独合并）
-                let lines = wb_upstream::InterruptibleLines::from_iterator(win.lines);
-                let (error_info, _sent_any, failed_inline, up_usage) = wb_sse::stream_forward_ex(
-                    lines, tx, proto, chat_id, &model_id, &HashSet::new(), None,
-                );
-                // 胜者行源读错误（h2 RST 等掐断）合并进错误归因
-                let cut = super::transport_cut_from_slot(&read_slot);
-                let error_info = match (cut, error_info) {
-                    (Some(cut), None) => Some(cut),
-                    (Some(cut), Some((c, m))) if super::is_empty_completion(c, &m) => Some(cut),
-                    (_, other) => other,
-                };
-                let duration_ms = start_ts.elapsed().as_millis() as u64;
-                let ok = error_info.is_none() && !failed_inline;
-                let (pt, ct) = up_usage.as_ref().map(wb_sse::u64_pair).unwrap_or((0, 0));
-                // 记账按生效账号（对冲接管时为 win_uid，不能记到主账号头上）
-                state.record_usage_codearts(&model, &win_uid, key_id, ok, true,
-                    duration_ms, pt, ct, None, &session_ctx);
-                if ok {
-                    state.codearts_pool.note_success(&win_uid);
-                    clear_model_failure(model);
-                    // 成功后写入会话粘性绑定（conv_id 用 affinity 留档：CodeArts
-                    // 的上游会话由 affinity/session-id 决定，绑定真正生效的是 uid）
-                    if state.codearts_sticky_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.codearts_sticky.bind(&sticky_key, &win_uid, &affinity, now_ts());
-                        state.codearts_sticky.save(&state.data_dir);
-                    }
+            Ok(reader) => reader,
+        };
+        // ── 排队等待内层循环 ──
+        // 排队是模型级现象：换账号仍在同一队（排队维度里没有账号身份），
+        // 所以正确处置是「同号退避后原样重发」。循环直到：内容已流出 /
+        // 预算或次数耗尽 / 客户端断连 / 命中非排队类错误，才落回外层换号。
+        let mut cur = reader0;
+        loop {
+            // 首字竞速对冲（阈值 0 关闭，与纯首字超时同语义）：主请求慢时
+            // 对第二账号发对冲请求（独立 SessionSlot 登记名额），先出首字者胜
+            let hedge_ms = state.codearts_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed);
+            // 模型已在繁忙冷却时关闭对冲：排队期间换号不改排队位置，却会
+            // 多占一个账号的会话名额（每账号仅 3 个），把并发更快推到上限。
+            let hedge_ms = if model_cooling_remaining_secs(model).is_some() { 0 } else { hedge_ms };
+            let mut win = match race_codearts_first_byte(
+                state, &picked.uid, &prepared, &affinity, cur, hedge_ms,
+            ) {
+                Ok(w) => w,
+                Err(()) => {
+                    // 首字超时 ≠ 上游故障：CodeArts 推理路径没有排队错误码，
+                    // 「模型繁忙/排队」唯一可观测的表现就是首字迟迟不来
+                    // （实测 `queue/status` 会给出 waiting + 位次，但推理请求
+                    // 本身只表现为慢）。记 Server 会触发 pool.rs 的 30 分钟
+                    // 指数熔断，几次排队就能把健康账号打成不可用——与
+                    // concurrency_limit_is_transient_not_account_fault 修掉的
+                    // 事故同型。故只记模型级繁忙短窗，不动账号。
+                    note_model_busy(model, QUEUE_BACKOFF_MAX_SECS);
+                    last_err = "CodeArts 上游 10 秒内未响应（可能是模型排队，非账号故障）".into();
                     state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
-                        200, &win_uid, duration_ms, &key_name,
-                        &state.codearts_pool.name_of(&win_uid), None);
-                    return;
+                        504, &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
+                        &state.codearts_pool.name_of(&picked.uid), Some(&last_err));
+                    break;
                 }
-                if failed_inline {
-                    state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
-                        200, &win_uid, duration_ms, &key_name,
-                        &state.codearts_pool.name_of(&win_uid), Some("流内失败已透传客户端"));
-                    return;
+            };
+            // 竞速收尾：败者补记错误、释放对冲租约；接管时生效 uid 切到对冲账号
+            let (win_uid, _took_over) = settle_codearts_hedge(state, &mut win, &picked.uid);
+            let read_slot = win.read_slot.clone();
+            // 竞速胜者行源是 Box<dyn Iterator>，桥接为 InterruptibleLines
+            // 供 stream_forward_ex 消费（读错误经 read_slot 单独合并）
+            let lines = wb_upstream::InterruptibleLines::from_iterator(win.lines);
+            let (error_info, sent_any, failed_inline, up_usage) = wb_sse::stream_forward_ex(
+                lines, tx, proto, chat_id, &model_id, &HashSet::new(), None,
+            );
+            // 胜者行源读错误（h2 RST 等掐断）合并进错误归因
+            let cut = super::transport_cut_from_slot(&read_slot);
+            let error_info = match (cut, error_info) {
+                (Some(cut), None) => Some(cut),
+                (Some(cut), Some((c, m))) if super::is_empty_completion(c, &m) => Some(cut),
+                (_, other) => other,
+            };
+            let duration_ms = start_ts.elapsed().as_millis() as u64;
+            let ok = error_info.is_none() && !failed_inline;
+            let (pt, ct) = up_usage.as_ref().map(wb_sse::u64_pair).unwrap_or((0, 0));
+            // 记账按生效账号（对冲接管时为 win_uid，不能记到主账号头上）
+            state.record_usage_codearts(&model, &win_uid, key_id, ok, true,
+                duration_ms, pt, ct, None, &session_ctx);
+            if ok {
+                state.codearts_pool.note_success(&win_uid);
+                clear_model_failure(model);
+                // 成功后写入会话粘性绑定（conv_id 用 affinity 留档：CodeArts
+                // 的上游会话由 affinity/session-id 决定，绑定真正生效的是 uid）
+                if state.codearts_sticky_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    state.codearts_sticky.bind(&sticky_key, &win_uid, &affinity, now_ts());
+                    state.codearts_sticky.save(&state.data_dir);
                 }
-                if let Some((code, msg)) = error_info {
-                    // 归因按真实错误码分轨（并发上限 / 请求级错误不冷却账号）：
-                    // 修复前一律 Server → 账号熔断 30 分钟 → 整池 no_healthy_account
-                    let detail = format!("{code} {msg}");
-                    let (client_status, kind) = codearts_failure(0, &detail);
-                    note_failure(state, model, &win_uid, kind, Some(&detail));
-                    set_last_error(state, format!("codearts uid={} model={} code={} msg={}",
-                        win_uid, model, code, msg));
-                    // 保留真实状态码与原因，轮换耗尽时按此透传（不再一律 503）
-                    exhausted_status = client_status as i64;
-                    last_err = msg;
-                }
+                state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
+                    200, &win_uid, duration_ms, &key_name,
+                    &state.codearts_pool.name_of(&win_uid), None);
+                return;
             }
+            if failed_inline {
+                state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
+                    200, &win_uid, duration_ms, &key_name,
+                    &state.codearts_pool.name_of(&win_uid), Some("流内失败已透传客户端"));
+                return;
+            }
+            if let Some((code, msg)) = error_info {
+                // 归因按真实错误码分轨（并发上限 / 请求级错误不冷却账号）：
+                // 修复前一律 Server → 账号熔断 30 分钟 → 整池 no_healthy_account
+                let detail = format!("{code} {msg}");
+                let (client_status, kind) = codearts_failure(0, &detail);
+
+                // ── 排队等待：同号退避后原样重发 ──
+                // 判定用 is_queue_code 而非 is_model_busy：81114 令牌桶限流也属
+                // 模型繁忙，但它的既有路径（账号 SoftRate 短冷却 + 换号）工作
+                // 良好且被 token_bucket_limit_* 测试锁定，不该混进「同号硬等」。
+                // 内容已流出（sent_any）时重发会向同一 SSE 流拼接第二份完整
+                // 响应，故只允许在内容未流出时等待。
+                if is_queue_code(&detail) && !sent_any {
+                    let deadline = *queue_deadline.get_or_insert_with(||
+                        Instant::now() + Duration::from_secs(QUEUE_BUDGET_SECS));
+                    if queue_same < QUEUE_RETRY_LIMIT && Instant::now() < deadline {
+                        let secs = queue_backoff_secs(None);
+                        note_model_busy(model, secs);
+                        queue_same += 1;
+                        // 先归还上游会话名额再睡：名额每账号仅 3 个，握着睡
+                        // 等于替上游占着并发槽，重试越多越排不上，还会把同
+                        // 账号其他请求挤成 TM.00001041。
+                        drop(slot.take());
+                        if !sleep_in_slices(Duration::from_secs(secs), Some(tx)) {
+                            // 客户端已断连：请求终局
+                            state.record_usage_codearts(&model, &win_uid, key_id, false, true,
+                                start_ts.elapsed().as_millis() as u64, 0, 0, None, &session_ctx);
+                            return;
+                        }
+                        // 重新登记名额后原样重发（同账号、同请求体、同亲和头）
+                        slot = SessionSlot::acquire(&identity, &state.data_dir);
+                        match send_signed_request(&codearts_agent(), &identity, &prepared,
+                            slot.as_ref().map(|s| s.id()), Some(&affinity)) {
+                            Ok(r) => { cur = r; continue; }
+                            Err((st, body)) => {
+                                // 重发在 HTTP 层失败：按既有归因收尾，落回外层换号
+                                let (cs, k) = codearts_failure(st, &body);
+                                note_failure(state, model, &win_uid, k, Some(&body));
+                                set_last_error(state, format!(
+                                    "codearts uid={} model={} status={} body={}",
+                                    win_uid, model, st, body.chars().take(200).collect::<String>()));
+                                exhausted_status = cs as i64;
+                                last_err = format!("upstream status={st}");
+                                break;
+                            }
+                        }
+                    }
+                    // 次数/预算耗尽：如实回 429（语义是「排队中，稍后重试」，
+                    // 不是「无健康账号」）。文案前缀必须是 upstream 429 error:
+                    // ——非流式状态映射靠该前缀取码，否则会被降级成 503。
+                    let secs = model_cooling_remaining_secs(model)
+                        .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS);
+                    let text = format!(
+                        "upstream 429 error: 上游模型排队中（不是登录态或额度问题），建议 {secs}s 后重试");
+                    state.record_usage_codearts(&model, &win_uid, key_id, false, true,
+                        start_ts.elapsed().as_millis() as u64, 0, 0, None, &session_ctx);
+                    state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
+                        429, &win_uid, start_ts.elapsed().as_millis() as u64, &key_name,
+                        &state.codearts_pool.name_of(&win_uid), Some(&text));
+                    send_stream_error(tx, proto, 429, &text);
+                    return;
+                }
+
+                note_failure(state, model, &win_uid, kind, Some(&detail));
+                set_last_error(state, format!("codearts uid={} model={} code={} msg={}",
+                    win_uid, model, code, msg));
+                // 保留真实状态码与原因，轮换耗尽时按此透传（不再一律 503）
+                exhausted_status = client_status as i64;
+                last_err = msg;
+                // 非排队类错误：跳出排队内层循环，交外层换号（账号槽位型 /
+                // 凭据 / 请求级错误的正确处置都是换号或终局，不是继续等）
+                break;
+            }
+            // error_info 为 None 但走到这里（例如空响应）：跳出内层循环换号
+            break;
         }
     }
 }
@@ -1204,9 +1328,14 @@ pub async fn codearts_aggregate_chat(
                 }
             };
             // 登记会话名额（RAII：离开本轮迭代自动 idle 注销）
-            let slot = SessionSlot::acquire(&identity, &state.data_dir);
-            let session_id = slot.as_ref().map(|s| s.id());
-            match send_signed_request(&codearts_agent(), &identity, &prepared, session_id, Some(&affinity)) {
+            // 声明为 mut：排队等待期间必须先归还名额（drop）再睡，醒来重新登记。
+            let mut slot = SessionSlot::acquire(&identity, &state.data_dir);
+            // 本账号本轮已排队重试次数（与 attempts 的 HTTP 层退避计数独立）
+            let mut queue_same: u32 = 0;
+            // 排队总预算：从本轮首次进入排队等待起算，超预算即收尾回 429
+            let mut queue_deadline: Option<Instant> = None;
+            let reader0 = match send_signed_request(&codearts_agent(), &identity, &prepared,
+                slot.as_ref().map(|s| s.id()), Some(&affinity)) {
                 Err((status, resp_body)) => {
                     let attempt = attempts.entry(picked.uid.clone()).or_insert(0);
                     match retry_decision(status, &resp_body, *attempt) {
@@ -1242,15 +1371,22 @@ pub async fn codearts_aggregate_chat(
                         }
                     }
                 }
-                Ok(reader) => {
-                    let lines = match wb_upstream::lines_with_first_byte_timeout_interruptible(reader) {
+                Ok(reader) => reader,
+            };
+            // ── 排队等待内层循环（非流式镜像）──
+            // 排队是模型级现象，换账号无效，只能同号退避后原样重发。
+            // 非流式无下行通道（handler 返回 Response 前没有断连通知），
+            // 因此等待不可被客户端中断，靠 queue_deadline 总预算兜底。
+            let mut cur = reader0;
+            loop {
+                    let lines = match wb_upstream::lines_with_first_byte_timeout_interruptible(cur) {
                         Ok(l) => l,
                         Err(()) => {
                             // 首字超时归因为模型级繁忙（同流式路径）：不动账号，
                             // 避免排队场景把健康账号指数熔断。
                             note_model_busy(&model, QUEUE_BACKOFF_MAX_SECS);
                             last_err = "CodeArts 上游 10 秒内未响应（可能是模型排队，非账号故障）".into();
-                            continue;
+                            break;
                         }
                     };
                     let agg_chat_id = format!("chatcmpl-{}", now_ts());
@@ -1279,6 +1415,44 @@ pub async fn codearts_aggregate_chat(
                             // 请求级错误不得按 Server 熔断账号
                             let detail = format!("{code} {msg}");
                             let (client_status, kind) = codearts_failure(0, &detail);
+
+                            // 排队等待：同号退避后原样重发（与流式同口径）
+                            if is_queue_code(&detail) {
+                                let deadline = *queue_deadline.get_or_insert_with(||
+                                    Instant::now() + Duration::from_secs(QUEUE_BUDGET_SECS));
+                                if queue_same < QUEUE_RETRY_LIMIT && Instant::now() < deadline {
+                                    let secs = queue_backoff_secs(None);
+                                    note_model_busy(&model, secs);
+                                    queue_same += 1;
+                                    // 先归还名额再睡（名额每账号仅 3 个）
+                                    drop(slot.take());
+                                    sleep_in_slices(Duration::from_secs(secs), None);
+                                    slot = SessionSlot::acquire(&identity, &state.data_dir);
+                                    match send_signed_request(&codearts_agent(), &identity, &prepared,
+                                        slot.as_ref().map(|s| s.id()), Some(&affinity)) {
+                                        Ok(r) => { cur = r; continue; }
+                                        Err((st, body)) => {
+                                            let (cs, k) = codearts_failure(st, &body);
+                                            note_failure(&state, &model, &picked.uid, k, Some(&body));
+                                            exhausted_status = cs as i64;
+                                            last_err = format!("upstream status={st}");
+                                            break;
+                                        }
+                                    }
+                                }
+                                // 次数/预算耗尽：如实回 429。文案前缀必须是
+                                // upstream 429 error:，否则非流式状态映射会降级成 503。
+                                let secs = model_cooling_remaining_secs(&model)
+                                    .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS);
+                                state.record_usage_codearts(&model, &picked.uid, &key_id, false, stream,
+                                    duration_ms, 0, 0, None, &session_ctx);
+                                state.logger.log_request("codearts", "POST", proto.log_path(), &model,
+                                    stream, 429, &picked.uid, duration_ms, &key_name,
+                                    &state.codearts_pool.name_of(&picked.uid), Some("上游模型排队中"));
+                                return Err(format!(
+                                    "upstream 429 error: 上游模型排队中（不是登录态或额度问题），建议 {secs}s 后重试"));
+                            }
+
                             note_failure(&state, &model, &picked.uid, kind, Some(&detail));
                             state.record_usage_codearts(&model, &picked.uid, &key_id, false, stream,
                                 duration_ms, 0, 0, None, &session_ctx);
@@ -1292,7 +1466,7 @@ pub async fn codearts_aggregate_chat(
                             last_err = "CodeArts 上游返回空响应".into();
                         }
                     }
-                }
+                    break;
             }
         }
     }).await;
@@ -1730,6 +1904,78 @@ mod tests {
         assert!((1..=10).contains(&left), "首次 Server 退避 10s，实际 {left}");
 
         clear_model_failure(m);
+    }
+
+    /// 排队退避秒数：缺省 5s、显式建议值原样、越界钳到 1..=30。
+    ///
+    /// 5s 不是随手取的：上游官方轮询间隔就是 5s，比这更快地重试只会给已经
+    /// 繁忙的模型加负担且拿不到新状态；上限 30s 防止异常大的建议值把模型
+    /// 长时间锁死。
+    #[test]
+    fn queue_backoff_is_bounded_and_defaults_to_poll_interval() {
+        assert_eq!(queue_backoff_secs(None), QUEUE_DEFAULT_BACKOFF_SECS);
+        assert_eq!(QUEUE_DEFAULT_BACKOFF_SECS, 5, "缺省退避应等于上游轮询间隔 5s");
+        assert_eq!(queue_backoff_secs(Some(12)), 12, "合理建议值应原样采用");
+        assert_eq!(queue_backoff_secs(Some(0)), 1, "下界钳到 1s");
+        assert_eq!(queue_backoff_secs(Some(9999)), QUEUE_BACKOFF_MAX_SECS, "上限钳到 30s");
+        // 预算必须覆盖最坏情况又不突破客户端读超时
+        assert_eq!(QUEUE_BUDGET_SECS, 45);
+        assert!(QUEUE_BUDGET_SECS >= QUEUE_DEFAULT_BACKOFF_SECS * QUEUE_RETRY_LIMIT as u64,
+            "预算应至少容纳 {QUEUE_RETRY_LIMIT} 次缺省退避");
+    }
+
+    /// 分片等待必须真的等够时长，且能按分片粒度观察下行状态。
+    #[test]
+    fn sleep_in_slices_waits_full_duration_without_channel() {
+        let started = Instant::now();
+        assert!(
+            sleep_in_slices(Duration::from_millis(600), None),
+            "无下行通道时应返回 true（整段等完）"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(600), "应真的等满时长");
+    }
+
+    /// 客户端已断连时，分片等待必须提前返回 false，不再空等。
+    ///
+    /// 这是排队场景的体验底线：用户关掉对话后，网关不该继续握着请求
+    /// 睡满几十秒退避才收尾。
+    #[test]
+    fn sleep_in_slices_exits_early_on_closed_channel() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+        drop(rx); // 模拟客户端已断连
+        let started = Instant::now();
+        assert!(
+            !sleep_in_slices(Duration::from_secs(5), Some(&tx)),
+            "下行通道已关闭时必须返回 false"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "应在第一个 500ms 分片后就退出，实际 {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 只有排队码进「同号等待」分支；并发上限与令牌桶限流都不得混入。
+    ///
+    /// 这是本改动的核心边界：`is_model_busy` 比 `is_queue_code` 宽（含 81114），
+    /// 若拿它做等待判定，令牌桶限流会被改成"同号硬等 30s×3"——而它的正确
+    /// 处置是账号短冷却 + 换号（换号对令牌桶有效，对排队无效）。
+    #[test]
+    fn only_queue_codes_enter_queue_wait() {
+        // 排队码：进等待
+        assert!(is_queue_code("TM.00001045"));
+        assert!(is_queue_code(r#"{"error_code":"TM.000010051"}"#));
+
+        // 并发会话上限：账号级名额耗尽，换号有效，不进等待
+        let conc = r#"{"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)"}"#;
+        assert!(!is_queue_code(conc));
+        assert!(is_model_busy(conc) == false, "并发上限不是模型繁忙");
+
+        // 令牌桶限流：属模型繁忙但**不是**排队码，不得进同号硬等
+        let bucket = "InferHub.ModelArts.81114.429 Too many requests, \
+                      the rate limit is 300000000 tokens per minute.";
+        assert!(is_model_busy(bucket), "限流族应记模型冷却");
+        assert!(!is_queue_code(bucket), "限流族不得进排队等待分支");
     }
 }
 
