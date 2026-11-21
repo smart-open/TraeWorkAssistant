@@ -258,7 +258,7 @@ pub fn unified_models_whitelisted(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None, false)
+    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None, false, None)
 }
 
 /// 同 [`unified_models_whitelisted`]，`qoder = Some((开关, 池健康))` 时合并
@@ -275,6 +275,7 @@ pub fn unified_models_whitelisted_ex(
     qoder: Option<(bool, bool)>,
     buddy_ai: Option<(bool, bool)>,
     qoder_flash_free: bool,
+    codearts: Option<(bool, bool)>,
 ) -> Vec<UnifiedModel> {
     let wl = load_whitelist(data_dir);
     unified_models_ex(
@@ -285,6 +286,7 @@ pub fn unified_models_whitelisted_ex(
         qoder,
         buddy_ai,
         qoder_flash_free,
+        codearts,
     )
         .into_iter()
         .filter(|m| whitelist_allows(&wl, &m.id))
@@ -424,7 +426,7 @@ pub fn unified_models(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None, false)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None, false, None)
 }
 
 /// 同 [`unified_models`]，`qoder = Some((开关, 池健康))` 时合并 Qoder 目录：
@@ -440,6 +442,7 @@ pub fn unified_models_ex(
     qoder: Option<(bool, bool)>,
     buddy_ai: Option<(bool, bool)>,
     qoder_flash_free: bool,
+    codearts: Option<(bool, bool)>,
 ) -> Vec<UnifiedModel> {
     let l1 = load_meta(data_dir);
     // 注（issue #38-4 排查决策）：Trae 侧快照（kv api_models）无条件参与聚合，
@@ -459,6 +462,8 @@ pub fn unified_models_ex(
         TargetPool::Custom => true,
         // Qoder：开关 && 池健康（调用方未提供旗标时该源不参与聚合）
         TargetPool::Qoder => qoder.map_or(false, |(e, ok)| e && ok),
+        // CodeArts：开关 && 池健康（同 Qoder 口径，未提供旗标时不参与聚合）
+        TargetPool::CodeArts => codearts.map_or(false, |(e, ok)| e && ok),
     };
 
     let mut order: Vec<String> = Vec::new();
@@ -888,6 +893,85 @@ pub fn unified_models_ex(
         }
     }
 
+    // 源6：CodeArts（阶段2，codearts_catalog 进程目录；对外标识 codearts）——
+    // 调用方未提供旗标时不合并（旧签名包装/测试零变化）；与 Trae/Buddy/Qoder
+    // 同 canonical 条目仅追加来源标记，倍率取目录 rate（无声明 = None）
+    if codearts.is_some() {
+        for m in crate::tasks::codearts_catalog::list_models() {
+            let Some(id) = m.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let canonical = canonical_id(id);
+            if canonical.is_empty() {
+                continue;
+            }
+            let crate_rate = m.get("rate").and_then(Value::as_f64);
+            let crate_ctx = m.get("context_length").and_then(Value::as_u64).filter(|v| *v > 0);
+            let crate_img = m.get("supports_image").and_then(Value::as_bool);
+            let display = m
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id)
+                .to_string();
+            let crate_efforts: Vec<String> = m
+                .get("efforts")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            match acc.get_mut(&canonical) {
+                Some(u) => {
+                    u.sources.push(UnifiedSource {
+                        pool: "codearts",
+                        rate: crate_rate,
+                        enabled: enabled_of(TargetPool::CodeArts),
+                        disabled: false,
+                    });
+                    if let Some(r) = crate_rate {
+                        u.rate = Some(r);
+                    }
+                    if let Some(c) = crate_ctx {
+                        u.context_length = Some(c);
+                    }
+                    if let Some(img) = crate_img {
+                        u.supports_image = Some(img);
+                    }
+                    if !crate_efforts.is_empty() {
+                        u.efforts = super::efforts::declared_union(&[
+                            std::mem::take(&mut u.efforts),
+                            crate_efforts,
+                        ]);
+                    }
+                }
+                None => {
+                    order.push(canonical.clone());
+                    acc.insert(
+                        canonical,
+                        UnifiedModel {
+                            id: id.to_string(),
+                            display,
+                            vendor: "CodeArts".to_string(),
+                            region: None,
+                            rate: crate_rate,
+                            efforts: crate_efforts,
+                            max_mode: false,
+                            context_length: crate_ctx,
+                            max_tokens: None,
+                            supports_image: crate_img,
+                            sources: vec![UnifiedSource {
+                                pool: "codearts",
+                                rate: crate_rate,
+                                enabled: enabled_of(TargetPool::CodeArts),
+                                disabled: false,
+                            }],
+                            manual: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     let mut out: Vec<UnifiedModel> = order
         .into_iter()
         .filter_map(|c| acc.remove(&c))
@@ -1220,7 +1304,7 @@ mod tests {
     #[test]
     fn t_buddy_ai_source_merged() {
         let f = fixture(&[("glm-5.3", None)], &["glm-5.3"], None);
-        let list = unified_models_ex(&f.dir, true, true, true, None, Some((true, true)), false);
+        let list = unified_models_ex(&f.dir, true, true, true, None, Some((true, true)), false, None);
         // Intl 专属 id：deepseek-v4.1-flash 新条目，来源 buddy-ai 且 enabled
         let d = find(&list, "deepseek-v4.1-flash");
         let ds = d.sources.iter().find(|s| s.pool == "buddy-ai").expect("Intl 专属条目应带 buddy-ai 源");
@@ -1231,7 +1315,7 @@ mod tests {
         assert!(g.sources.iter().any(|s| s.pool == "buddy"));
         assert!(g.sources.iter().any(|s| s.pool == "buddy-ai"));
         // 开关关闭 → 徽章置灰，条目仍在
-        let list2 = unified_models_ex(&f.dir, true, true, true, None, Some((false, true)), false);
+        let list2 = unified_models_ex(&f.dir, true, true, true, None, Some((false, true)), false, None);
         let d2 = find(&list2, "deepseek-v4.1-flash");
         assert!(!d2.sources.iter().find(|s| s.pool == "buddy-ai").unwrap().enabled);
         // 未提供旗标（旧签名包装语义）→ 不合并

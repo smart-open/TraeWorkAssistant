@@ -3,13 +3,14 @@ import { api } from '../lib/tauri';
 import type { PoolStatus } from '../types';
 
 /** 池种类 → 对应 pool_status 命令（issue #178 账号列表限流徽标数据源） */
-export type PoolKind = 'trae' | 'wb' | 'qoder' | 'buddyai';
+export type PoolKind = 'trae' | 'wb' | 'qoder' | 'buddyai' | 'codearts';
 
 const FETCHERS: Record<PoolKind, () => Promise<PoolStatus[]>> = {
   trae: () => api.apiServer.poolStatus(),
   wb: () => api.apiServer.wbPoolStatus(),
   qoder: () => api.apiServer.qoderPoolStatus(),
   buddyai: () => api.apiServer.buddyAiPoolStatus(),
+  codearts: () => api.apiServer.codeArtsPoolStatus(),
 };
 
 /**

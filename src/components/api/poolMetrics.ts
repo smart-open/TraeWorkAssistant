@@ -11,14 +11,18 @@
  *   （qoder_enabled_uids 非空按名单取，空/缺失 = fail-open 全部含凭证账号入池）；
  * - BuddyAI 国际：分组筛选（buddy_ai_group_ids）∩ 标签筛选（buddy_ai_tag_ids）；
  *   无独立白名单字段 = fail-open 全部含凭证账号入池（已停用账号不入池，与后端一致）。
+ * - CodeArts：分组筛选（codearts_group_ids）∩ 标签筛选（codearts_tag_ids）→ 白名单
+ *   （codearts_enabled_uids 非空按名单取，空/缺失 = fail-open 全部含凭证账号入池）；
+ *   与 Qoder 同口径。
  * 积分口径：可用积分 = 池内账号积分之和；积分总余额 = 全部账号积分之和；
- * Buddy/Qoder/BuddyAI 侧全部账号无余额数据（credits_balance 全 null）时返回 null
+ * Buddy/Qoder/BuddyAI/CodeArts 侧全部账号无余额数据（credits_balance 全 null）时返回 null
  * （上层展示「未知」）。
  */
 import type {
   AccountView,
   ApiPoolFile,
   BuddyAiAccountView,
+  CodeartsAccountView,
   CustomModel,
   QoderAccountView,
   TagView,
@@ -64,6 +68,16 @@ export interface PoolMetrics {
   qoderTotalCredits: number | null;
   /** Qoder 账号总数 */
   qoderAccountTotal: number;
+  /** CodeArts 上游开关（华为云码道） */
+  codeartsEnabled: boolean;
+  /** CodeArts 池内账号数（分组 ∩ 标签 → 白名单，白名单空 = fail-open） */
+  codeartsPoolCount: number;
+  /** CodeArts 池内账号积分之和；无任何余额数据 = null（展示「未知」） */
+  codeartsPoolCredits: number | null;
+  /** CodeArts 全部含凭证账号积分之和；无任何余额数据 = null */
+  codeartsTotalCredits: number | null;
+  /** CodeArts 账号总数 */
+  codeartsAccountTotal: number;
   /** 自定义模型池：启用条目数 */
   customEnabledCount: number;
   /** 自定义模型池：总条目数 */
@@ -101,6 +115,7 @@ export function computePoolMetrics(
   qoderAccounts: QoderAccountView[] = [],
   buddyAiAccounts: BuddyAiAccountView[] = [],
   tags: TagView[] = [],
+  codeartsAccounts: CodeartsAccountView[] = [],
 ): PoolMetrics {
   // Trae 池内口径：enabled_uids ∩ 分组（group_ids）∩ 标签（trae_tag_ids）。
   // 此前仅按 enabled_uids 过滤，被分组/标签拦截的账号被计入池内，使
@@ -140,6 +155,21 @@ export function computePoolMetrics(
   const qoderKnown = qoderPoolAccounts.some((a) => a.credits_balance != null);
   const qoderTotalKnown = qoderCredAccounts.some((a) => a.credits_balance != null);
 
+  // CodeArts 池内口径：分组 ∩ 标签 → 白名单（codearts_enabled_uids 非空按名单取，
+  // 空/缺失 = fail-open 全部含凭证账号入池），与 Qoder 同口径
+  const codeartsCredAccounts = codeartsAccounts.filter((a) => a.has_credential);
+  const codeartsGroupIds = pool?.codearts_group_ids ?? [];
+  const codeartsTagSet = tagUidUnion(pool?.codearts_tag_ids ?? [], tags);
+  const codeartsOrgScoped = codeartsCredAccounts.filter((a) =>
+    inOrgScope(a.group_id ?? '', codeartsGroupIds, a.id, codeartsTagSet),
+  );
+  const codeartsPoolIds = pool?.codearts_enabled_uids ?? [];
+  const codeartsPoolAccounts = codeartsPoolIds.length
+    ? codeartsOrgScoped.filter((a) => codeartsPoolIds.includes(a.id))
+    : codeartsOrgScoped;
+  const codeartsKnown = codeartsPoolAccounts.some((a) => a.credits_balance != null);
+  const codeartsTotalKnown = codeartsCredAccounts.some((a) => a.credits_balance != null);
+
   // BuddyAI 国际池内口径：分组 ∩ 标签（无独立白名单字段 = fail-open 全部含
   // 凭证账号入池）；已停用（disabled）账号不入网关池，与后端装配一致不计入
   const buddyAiCredAccounts = buddyAiAccounts.filter((a) => !a.disabled && a.has_credential);
@@ -175,6 +205,15 @@ export function computePoolMetrics(
     qoderPoolCredits: qoderKnown ? qoderPoolAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0) : null,
     qoderTotalCredits: qoderTotalKnown ? qoderCredAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0) : null,
     qoderAccountTotal: qoderAccounts.length,
+    codeartsEnabled: pool?.codearts_enabled ?? false,
+    codeartsPoolCount: codeartsPoolAccounts.length,
+    codeartsPoolCredits: codeartsKnown
+      ? codeartsPoolAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0)
+      : null,
+    codeartsTotalCredits: codeartsTotalKnown
+      ? codeartsCredAccounts.reduce((s, a) => s + (a.credits_balance ?? 0), 0)
+      : null,
+    codeartsAccountTotal: codeartsAccounts.length,
     customEnabledCount: customModels.filter((m) => m.enabled).length,
     customModelTotal: customModels.length,
   };

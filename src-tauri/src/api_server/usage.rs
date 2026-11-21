@@ -239,6 +239,7 @@ pub enum UsageBucket {
     Custom,
     Qoder,
     BuddyAi,
+    CodeArts,
 }
 
 /// 用量数据根结构：日期 → 单日统计。
@@ -257,6 +258,9 @@ pub struct UsageFile {
     pub qoder_days: HashMap<String, DayStats>,
     #[serde(default)]
     pub buddy_ai_days: HashMap<String, DayStats>,
+    /// CodeArts 上游请求（codearts 独立池分账）
+    #[serde(default)]
+    pub codearts_days: HashMap<String, DayStats>,
 }
 
 impl UsageFile {
@@ -267,6 +271,7 @@ impl UsageFile {
             UsageBucket::Custom => &mut self.custom_days,
             UsageBucket::Qoder => &mut self.qoder_days,
             UsageBucket::BuddyAi => &mut self.buddy_ai_days,
+            UsageBucket::CodeArts => &mut self.codearts_days,
         }
     }
 
@@ -278,6 +283,7 @@ impl UsageFile {
             UsageBucket::Custom => &self.custom_days,
             UsageBucket::Qoder => &self.qoder_days,
             UsageBucket::BuddyAi => &self.buddy_ai_days,
+            UsageBucket::CodeArts => &self.codearts_days,
         };
         b.get(day)
     }
@@ -412,7 +418,7 @@ impl UsageFile {
     pub fn trim(&mut self, keep_days: i64) {
         let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(keep_days);
         let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
-        for bucket in [&mut self.days, &mut self.wb_days, &mut self.custom_days, &mut self.qoder_days, &mut self.buddy_ai_days] {
+        for bucket in [&mut self.days, &mut self.wb_days, &mut self.custom_days, &mut self.qoder_days, &mut self.buddy_ai_days, &mut self.codearts_days] {
             bucket.retain(|d, _| d.as_str() >= cutoff_str.as_str());
         }
     }
@@ -428,6 +434,7 @@ impl UsageFile {
             UsageBucket::Custom => &self.custom_days,
             UsageBucket::Qoder => &self.qoder_days,
             UsageBucket::BuddyAi => &self.buddy_ai_days,
+            UsageBucket::CodeArts => &self.codearts_days,
         };
         // 窗口含今日：days=7 → 今日与此前 6 个日历天（字符串比较口径对齐 trim）
         let cutoff = (chrono::Local::now().date_naive()
@@ -474,6 +481,15 @@ impl QoderSessionCtx {
     }
 }
 
+/// CodeArts 请求级会话上下文（codearts_sessions 流水行）。
+/// request_id 为幂等键（uuid 占位）；ts = Unix 秒；preview = 末条 user 消息截断。
+pub struct CodeartsSessionCtx {
+    pub request_id: String,
+    pub session_id: String,
+    pub ts: i64,
+    pub preview: String,
+}
+
 /// Custom 网关请求级会话上下文（issue #149 P2：custom_sessions 流水行）。
 /// request_id 由记账入口内部生成 uuid（custom 上游无信封可取，纯 INSERT 无幂等诉求）；
 /// session_id = conversation_key（前 2 条消息指纹，"cv|" 前缀，跨轮稳定）；
@@ -498,6 +514,8 @@ pub fn load(data_dir: &Path) -> UsageFile {
     let _ = crate::store::docs::qoder_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
     // issue #149 P2：Custom 会话流水同口径保留期裁剪（启动一次）
     let _ = crate::store::docs::custom_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
+    // 阶段2：CodeArts 会话流水同口径保留期裁剪（启动一次）
+    let _ = crate::store::docs::codearts_sessions_prune(&crate::store::db(data_dir), RETENTION_DAYS);
     f
 }
 
@@ -515,6 +533,7 @@ pub fn save_day(data_dir: &Path, bucket: UsageBucket, day: &str, stats: &DayStat
         UsageBucket::Custom => "custom",
         UsageBucket::Qoder => "qoder",
         UsageBucket::BuddyAi => "buddy-ai",
+        UsageBucket::CodeArts => "codearts",
     };
     crate::store::docs::api_usage_upsert_day(&crate::store::db(data_dir), b, day, &text).is_ok()
 }
