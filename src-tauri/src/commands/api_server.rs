@@ -368,6 +368,12 @@ pub async fn do_start(
         buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(
             pool_file.buddy_ai_hedge_threshold_ms,
         ),
+        // issue #213：伪流式开关/换号重试预算/keep-alive 间隔（api_pool.json，serde default 兼容旧文件）
+        wb_pseudo_stream: std::sync::atomic::AtomicBool::new(pool_file.wb_pseudo_stream),
+        buddy_ai_pseudo_stream: std::sync::atomic::AtomicBool::new(pool_file.buddy_ai_pseudo_stream),
+        wb_retry_budget: std::sync::atomic::AtomicU32::new(pool_file.wb_retry_budget),
+        buddy_ai_retry_budget: std::sync::atomic::AtomicU32::new(pool_file.buddy_ai_retry_budget),
+        pseudo_keepalive_secs: std::sync::atomic::AtomicU64::new(pool_file.pseudo_keepalive_secs),
         // Qwen3.8-Flash 免费活动倍率覆盖（issue #111，api_pool.json，serde default 兼容旧文件）
         qoder_flash_free_rate: std::sync::atomic::AtomicBool::new(pool_file.qoder_flash_free_rate),
         wb_sticky: crate::api_server::wb_sticky::StickyStore::load(&state.data_dir),
@@ -384,6 +390,8 @@ pub async fn do_start(
         custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        wb_account_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_account_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -1618,6 +1626,13 @@ fn merge_pool_set(
         buddy_ai_tag_ids: existing.buddy_ai_tag_ids.clone(),
         // buddy-ai 池内调度策略：pool_set 命令在 merge 后追加应用
         buddy_ai_strategy: existing.buddy_ai_strategy.clone(),
+        // issue #213：伪流式/重试预算/keep-alive 间隔——pool_set merge 不消费这些
+        // 字段（配置页接线在后续阶段），原样保留防往返丢失
+        wb_pseudo_stream: existing.wb_pseudo_stream,
+        buddy_ai_pseudo_stream: existing.buddy_ai_pseudo_stream,
+        pseudo_keepalive_secs: existing.pseudo_keepalive_secs,
+        wb_retry_budget: existing.wb_retry_budget,
+        buddy_ai_retry_budget: existing.buddy_ai_retry_budget,
         // CodeArts 全套配置：pool_set 命令在 merge 后追加应用（同 buddy-ai 先例，
         // merge_pool_set 纯函数签名不动，存量单测零改动）
         codearts_enabled: existing.codearts_enabled,
@@ -2090,6 +2105,141 @@ pub fn sanitize_switch_set(
         &format!(
             "指纹清洗开关热切换：pool={label} enabled={enabled}（仅内存生效，网关重启复位为开启）"
         ),
+    );
+    Ok(())
+}
+
+// ==================== 伪流式开关 / 重试预算 / keep-alive 间隔（issue #213 S7） ====================
+
+/// 池级伪流式开关视图（issue #213）：`wb_pseudo_stream`（Buddy CN 档）与
+/// `buddy_ai_pseudo_stream`（BuddyAI Intl 档独立灰度）。默认关（现状流式直连）；
+/// 服务未运行时返回错误（与 sanitize_switches_get 同口径）
+#[tauri::command]
+pub fn pseudo_stream_switches_get(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Result<serde_json::Value, String> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => Ok(serde_json::json!({
+            "wb": rt
+                .shared
+                .wb_pseudo_stream
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "buddy_ai": rt
+                .shared
+                .buddy_ai_pseudo_stream
+                .load(std::sync::atomic::Ordering::Relaxed),
+        })),
+        None => Err("API 服务未运行，开关不可用".into()),
+    }
+}
+
+/// 池级伪流式开关热切换：仅改内存 AtomicBool，下一请求即生效，无持久化
+/// （对齐 sanitize_switch_set 范式——开关属灰度手段，重启复位默认关）
+#[tauri::command]
+pub fn pseudo_stream_switch_set(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    pool: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let guard = safe_lock(&runtime);
+    let Some(rt) = guard.as_ref() else {
+        return Err("API 服务未运行，开关不可用".into());
+    };
+    let (flag, label) = match pool.as_str() {
+        "wb" => (&rt.shared.wb_pseudo_stream, "wb"),
+        "buddy_ai" => (&rt.shared.buddy_ai_pseudo_stream, "buddy-ai"),
+        other => return Err(format!("未知伪流式开关池: {other}")),
+    };
+    flag.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    crate::fs_utils::app_log(
+        &rt.shared.data_dir,
+        &format!("伪流式开关热切换：pool={label} enabled={enabled}（仅内存生效，重启回落 pool_file 配置值）"),
+    );
+    Ok(())
+}
+
+/// 池级换号重试预算视图（issue #213 阶段2）：0 = 旧行为（重试机会 = 池内账号数）
+#[tauri::command]
+pub fn retry_budgets_get(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Result<serde_json::Value, String> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => Ok(serde_json::json!({
+            "wb": rt.shared.retry_budget(false),
+            "buddy_ai": rt.shared.retry_budget(true),
+        })),
+        None => Err("API 服务未运行，配置不可用".into()),
+    }
+}
+
+/// 池级换号重试预算热切换：仅改内存 AtomicU32，下一请求即生效，无持久化
+/// （与 hedge 阈值同档；pool ∈ {"wb", "buddy_ai"}）
+#[tauri::command]
+pub fn retry_budget_set(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    pool: String,
+    value: u32,
+) -> Result<(), String> {
+    // clamp 对齐前端 UI（BuddyApiService/BuddyAiApiService 0-16）：防御直调
+    // invoke 设置超大值使换号轮数失去上限（budget_exhausted 恒 false）
+    let value = value.min(16);
+    let guard = safe_lock(&runtime);
+    let Some(rt) = guard.as_ref() else {
+        return Err("API 服务未运行，配置不可用".into());
+    };
+    match pool.as_str() {
+        "wb" => rt
+            .shared
+            .wb_retry_budget
+            .store(value, std::sync::atomic::Ordering::Relaxed),
+        "buddy_ai" => rt
+            .shared
+            .buddy_ai_retry_budget
+            .store(value, std::sync::atomic::Ordering::Relaxed),
+        other => return Err(format!("未知重试预算池: {other}")),
+    }
+    crate::fs_utils::app_log(
+        &rt.shared.data_dir,
+        &format!("重试预算热切换：pool={pool} budget={value}（仅内存生效，网关重启复位为配置文件值）"),
+    );
+    Ok(())
+}
+
+/// 伪流式等待期 keep-alive 间隔秒回显（0 = 关闭）
+#[tauri::command]
+pub fn pseudo_keepalive_get(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Result<u64, String> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => Ok(rt
+            .shared
+            .pseudo_keepalive_secs
+            .load(std::sync::atomic::Ordering::Relaxed)),
+        None => Err("API 服务未运行，配置不可用".into()),
+    }
+}
+
+/// 伪流式等待期 keep-alive 间隔热切换（秒；clamp 0–60，0 = 关闭）；
+/// 仅改内存 AtomicU64，下一伪流式请求即生效，无持久化
+#[tauri::command]
+pub fn pseudo_keepalive_set(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    secs: u64,
+) -> Result<(), String> {
+    let guard = safe_lock(&runtime);
+    let Some(rt) = guard.as_ref() else {
+        return Err("API 服务未运行，配置不可用".into());
+    };
+    let clamped = secs.clamp(0, 60);
+    rt.shared
+        .pseudo_keepalive_secs
+        .store(clamped, std::sync::atomic::Ordering::Relaxed);
+    crate::fs_utils::app_log(
+        &rt.shared.data_dir,
+        &format!("伪流式 keep-alive 间隔热切换：secs={clamped}（仅内存生效，网关重启复位为配置文件值）"),
     );
     Ok(())
 }
@@ -2988,6 +3138,11 @@ mod pool_merge_tests {
             buddy_ai_group_ids: Vec::new(),
             buddy_ai_tag_ids: Vec::new(),
             buddy_ai_strategy: "credit_first".into(),
+            wb_pseudo_stream: true,
+            buddy_ai_pseudo_stream: true,
+            pseudo_keepalive_secs: 7,
+            wb_retry_budget: 3,
+            buddy_ai_retry_budget: 4,
             codearts_enabled: false,
             codearts_strategy: String::new(),
             codearts_enabled_uids: Vec::new(),
@@ -3048,6 +3203,12 @@ mod pool_merge_tests {
         assert!(m.trae_enabled);
         // buddy-ai 池内策略未传 → 保留原值（pool_set 在 merge 后追加应用，本函数恒保留）
         assert_eq!(m.buddy_ai_strategy, "credit_first");
+        // issue #213：伪流式/重试预算/keep-alive 未传 → 原样保留（merge 不消费）
+        assert!(m.wb_pseudo_stream);
+        assert!(m.buddy_ai_pseudo_stream);
+        assert_eq!(m.pseudo_keepalive_secs, 7);
+        assert_eq!(m.wb_retry_budget, 3);
+        assert_eq!(m.buddy_ai_retry_budget, 4);
     }
 
     #[test]

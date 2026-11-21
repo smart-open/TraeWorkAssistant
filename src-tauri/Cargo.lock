@@ -72,11 +72,12 @@ dependencies = [
 
 [[package]]
 name = "ai-work-assistant"
-version = "3.9.3"
+version = "3.9.5"
 dependencies = [
  "aes",
  "aes-gcm",
  "argon2",
+ "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -98,6 +99,7 @@ dependencies = [
  "rcgen",
  "regex",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -4362,7 +4364,6 @@ version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
- "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
@@ -4387,7 +4388,6 @@ version = "0.103.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0527518605e68109d875e248ea259b6758801cf165e4b2c2733ae3b51f12535a"
 dependencies = [
- "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted 0.9.0",

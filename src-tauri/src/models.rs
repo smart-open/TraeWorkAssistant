@@ -222,6 +222,11 @@ pub struct Settings {
     /// 入库 → 继续签到」，无需手动开代理+客户端签到对齐。710010702 设备指纹缺失的自愈链
     #[serde(default = "default_true")]
     pub doubao_probe_auto_keepalive: bool,
+    /// 豆包保活单账号等待抓包秒数（2026-11-17 修复③客户端代签等待窗口；默认 75s，
+    /// 客户端自动签到实测 ~16s，用户手动点签到可调大；0/未配置 = 回退默认；
+    /// 审查修复 2026-11-18 #3：读取侧 clamp 1..=600，误配极大值不会拖死整轮签到）
+    #[serde(default)]
+    pub doubao_probe_keepalive_wait_secs: Option<u64>,
     /// Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；
     /// Windows 计划任务注册时间复用该值）
     #[serde(default = "default_trae_checkin_hhmm")]
@@ -343,6 +348,9 @@ pub struct Settings {
     /// 调度任务失败时推送（默认开）
     #[serde(default = "default_true")]
     pub notify_on_task_fail: bool,
+    /// 定时调度任务完成时推送（issue #222；默认关——成功推送易耗尽 Server酱免费档每日 5 条）
+    #[serde(default)]
+    pub notify_on_task_success: bool,
     /// Bark 推送地址（https://api.day.app/<key>；空 = 关闭该渠道）
     #[serde(default)]
     pub notify_bark_url: Option<String>,
@@ -961,6 +969,24 @@ pub struct ApiPoolFile {
     /// 共用 PoolStrategy::resolve_buddy_ai 解析，保证两处行为一致
     #[serde(default)]
     pub buddy_ai_strategy: String,
+    /// WB 池伪流式开关（issue #213）：客户端 stream:true 时内部走聚合管线，
+    /// 成功后合成 SSE 下发——断流场景全部可无损换号重试；默认 false（旧行为）
+    #[serde(default)]
+    pub wb_pseudo_stream: bool,
+    /// buddy-ai 档伪流式开关（issue #213 同构，独立配置与 CN 档分开灰度）
+    #[serde(default)]
+    pub buddy_ai_pseudo_stream: bool,
+    /// 伪流式等待期 keep-alive 间隔秒（issue #213）：聚合期间周期性向客户端
+    /// 下发 SSE 注释帧防中间层空闲超时断连；0 = 关闭
+    #[serde(default = "default_pseudo_keepalive_secs")]
+    pub pseudo_keepalive_secs: u64,
+    /// WB 换号重试预算（issue #213 阶段2）：轮换重试次数上限；0 = 旧行为
+    /// （重试机会 = 池内账号数）
+    #[serde(default)]
+    pub wb_retry_budget: u32,
+    /// buddy-ai 档换号重试预算（issue #213 阶段2 同构，独立配置）
+    #[serde(default)]
+    pub buddy_ai_retry_budget: u32,
     /// Qwen3.8-Flash 免费活动倍率覆盖（资源调度页模型目录开关，默认开）：
     /// 开启时该模型目录/兜底倍率按 0 处理——/v1/models 展示 0× + 取号豁免
     /// 零积分过滤（issue #111：上游免费活动期 billable=false 不扣分，但
@@ -1025,6 +1051,11 @@ fn default_sticky_ttl_secs() -> u64 {
     1800
 }
 
+/// 伪流式等待期 keep-alive 间隔秒默认值（issue #213）：5s 防中间层空闲超时
+fn default_pseudo_keepalive_secs() -> u64 {
+    5
+}
+
 /// Default 与 serde default 对齐（derive Default 的数值字段会落 0，与旧版
 /// api_pool.json 缺字段的语义不一致：F-76③ 对冲默认 15s、F-77 并发默认 1、
 /// F-76② 池粘性 300s / 会话粘性 1800s）
@@ -1073,6 +1104,11 @@ impl Default for ApiPoolFile {
             buddy_ai_group_ids: Vec::new(),
             buddy_ai_tag_ids: Vec::new(),
             buddy_ai_strategy: String::new(),
+            wb_pseudo_stream: false,
+            buddy_ai_pseudo_stream: false,
+            pseudo_keepalive_secs: default_pseudo_keepalive_secs(),
+            wb_retry_budget: 0,
+            buddy_ai_retry_budget: 0,
             codearts_enabled: false,
             codearts_strategy: String::new(),
             codearts_enabled_uids: Vec::new(),

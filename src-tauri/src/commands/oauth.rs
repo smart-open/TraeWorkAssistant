@@ -1642,18 +1642,50 @@ pub fn oauth_login(
     // 「refresh_token 交换失败」通用文案，上游信封详情丢失排查失据；现透传
     // RefreshExchangeError.msg（内含 volcano_error 解析的火山信封 code/msg 或
     // 旧形态 message/请求失败原因）
-    let new_pair: Result<(String, Option<String>), String> = match callback_info.access_token {
-        Some(ref at) => Ok((at.clone(), None)),
-        None => {
-            // 此处 refresh_token 刚从 OAuth 回调取得（非存量失效凭证），
-            // server_rejected 分支仅转为错误信息，不涉及生命周期标记
-            exchange_token_refresh(&state, &callback_info.refresh_token, Some(&login_device_id))
-                .map(|(a, r, _)| (a, r))
-                .map_err(|e| e.msg)
-        }
-    };
-    let (access_token, new_refresh_token) =
+    let new_pair: Result<(String, Option<String>, serde_json::Value), String> =
+        match callback_info.access_token {
+            Some(ref at) => Ok((at.clone(), None, serde_json::Value::Null)),
+            None => {
+                // 此处 refresh_token 刚从 OAuth 回调取得（非存量失效凭证），
+                // server_rejected 分支仅转为错误信息，不涉及生命周期标记
+                exchange_token_refresh(&state, &callback_info.refresh_token, Some(&login_device_id))
+                    .map(|(a, r, b)| (a, r, b))
+                    .map_err(|e| e.msg)
+            }
+        };
+    let (access_token, new_refresh_token, exchange_body) =
         new_pair.map_err(|e| format!("refresh_token 交换失败: {e}"))?;
+
+    // P1（issue #201）：登录交换响应若携带 refresh_token 过期时间则落库，与刷新路径
+    //（accounts.rs ExchangeToken 写回）同源提取（兼容秒/毫秒时间戳），消除
+    // refresh_token_expires_at=None 盲区——惰性门的 rt 临期续命判定依赖该字段
+    // 审查补充（issue #201 复审#1）：key 列表源自 Buddy/Qoder 跨平台类推，无 Trae
+    // 侧抓包对照证据；dig 未命中时落一条响应顶层键清单日志（掩码由 log 前置链路
+    // 处理，此处仅列键名不含值），便于用真实日志实测校准 key 列表
+    let refresh_token_expires_at = crate::fs_utils::dig(
+        &exchange_body,
+        &[
+            "RefreshExpireAt",
+            "refresh_token_expires_at",
+            "refresh_expires_at",
+            "refreshTokenExpiresAt",
+            "refresh_expires_at_ms",
+        ],
+    )
+    .and_then(|v| v.as_i64())
+    .map(|exp| if exp > 10_000_000_000 { exp / 1000 } else { exp });
+    if refresh_token_expires_at.is_none() && exchange_body.is_object() {
+        let top_keys: Vec<&str> = exchange_body
+            .as_object()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        if !top_keys.is_empty() {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("[OAuth登录-exchange键清单] 未命中 rt 过期字段，响应顶层键: {top_keys:?}"),
+            );
+        }
+    }
 
     // 3. 规范化 JWT 格式
     let jwt = if access_token.starts_with("Cloud-IDE-JWT ") {
@@ -1763,6 +1795,10 @@ pub fn oauth_login(
         acct.refresh_token_invalid = false;
         // 合并路径同属「OAuth 登录成功更新凭证」，auth_saved_at 与新账号/刷新成功路径对齐刷新
         acct.auth_saved_at = Some(fs_utils::now_iso());
+        // P1（issue #201）：登录交换响应携带的 rt 过期时间落库（None 时保留旧值不覆盖）
+        if refresh_token_expires_at.is_some() {
+            acct.refresh_token_expires_at = refresh_token_expires_at;
+        }
         crate::vault::save_accounts(&state, &mut accounts)?;
 
         // 日志必须指向实际被更新的账号名（existing_name），而非本次登录输入的新名，
@@ -1790,7 +1826,8 @@ pub fn oauth_login(
             added_at: Some(fs_utils::now_iso()),
             updated_at: Some(fs_utils::now_iso()),
             dc_id: None,
-            refresh_token_expires_at: None,
+            // P1（issue #201）：登录交换响应携带的 rt 过期时间随新账号一并落库
+            refresh_token_expires_at,
             refresh_token_fails: 0,
             refresh_token_invalid: false,
             // 凭证最近落盘时间（F-78 批次 3 收尾，对齐 Buddy auth_saved_at）

@@ -16,12 +16,14 @@ pub const RETENTION_DAYS: i64 = 365;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AccountResult {
     pub name: String,
-    /// success | already | fail
+    /// success | already | skip | fail
+    /// （skip = 2026-11-17 审查 #8：确定性不可签到——未投放/task_status≠2；
+    ///   落库照常、运维历史不算故障，仅不进调度重试链）
     pub status: String,
-    /// 签到奖励额度（landing/checkin 响应 reward_amount；already/fail 时通常 None）
+    /// 签到奖励额度（claim 响应 reward_amount；already/skip/fail 时通常 None）
     #[serde(default)]
     pub reward: Option<i64>,
-    /// 失败原因（仅 fail 时携带；旧数据/成功记录为 None——serde default 兼容）。
+    /// 失败原因（仅 fail/skip 时携带；旧数据/成功记录为 None——serde default 兼容）。
     /// 2026-11-07 可观测性补齐：此前失败 message 不落库，一键签到页切页后
     /// 逐账号失败原因即丢失，用户只看到笼统「失败」无法排障（风控 710010702
     /// 等需要看上游 message 才能定性）。长度可控（上游 message 透出 + 固定指引）。
@@ -60,8 +62,17 @@ impl ResultsFile {
         for (uid, name, status, reward, message) in entries {
             if status == "fail" {
                 if let Some(prev) = day.accounts.get(&uid) {
-                    if prev.status == "success" || prev.status == "already" {
-                        continue; // 成功是当日最终事实，失败重试不回退
+                    if matches!(prev.status.as_str(), "success" | "already" | "skip") {
+                        continue; // 成功/确定性跳过是当日最终事实，失败重试不回退
+                    }
+                }
+            } else if status != "success" {
+                // already/skip 属弱事实（幂等确认/未投放跳过）：不回退当日 success——
+                // 代理捕获的 already 形态通常无 reward_amount 字段，回退会把早先
+                // CLI/任务 success 的 reward 抹掉，看板 reward_total 丢额度
+                if let Some(prev) = day.accounts.get(&uid) {
+                    if prev.status == "success" {
+                        continue;
                     }
                 }
             }
@@ -244,6 +255,11 @@ fn merge_fresh_into(f: &mut ResultsFile, fresh: ResultsFile) {
                 Some(prev) if prev.status == "fail" && a.status != "fail" => true,
                 // 快照行已到账而 fresh 行为 fail → 保留快照行
                 Some(prev) if prev.status != "fail" && a.status == "fail" => false,
+                // 弱事实不回退强事实（2026-11-20 审查 P3，与 record_day 语义对齐）：
+                // fresh 行 already/skip 不回退快照行 success——代理捕获的幂等确认
+                // 通常无 reward 字段，回退会抹掉早先到账额度；反向 fresh=success
+                // 升级覆盖快照 already/skip 由下方「新者胜」天然成立
+                Some(prev) if prev.status == "success" && matches!(a.status.as_str(), "already" | "skip") => false,
                 // 其余组合：updated_at 新者胜，平局保留快照行
                 Some(prev) => prev.updated_at < a.updated_at,
                 None => true, // fresh 独有行并入，防整表替换丢他进程写入
@@ -261,6 +277,9 @@ pub struct TrendPoint {
     pub date: String,
     pub ok: u64,
     pub already: u64,
+    /// 当日确定性不可签到（未投放/task_status≠2）单列计数，不并入 already
+    /// （2026-11-20 看板语义修正：前端堆叠图单独灰柱，未投放不混入「已签」）
+    pub skip: u64,
     pub failed: u64,
     /// 当日签到奖励额度合计（success 各账号 reward_amount 之和）
     pub reward_total: i64,
@@ -273,13 +292,14 @@ pub struct TrendPoint {
 pub fn trend_from(f: &ResultsFile, days: u32) -> Vec<TrendPoint> {
     let mut sorted: Vec<(&String, &DayRecord)> = f.days.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
-    let skip = sorted.len().saturating_sub(days as usize);
+    let trim = sorted.len().saturating_sub(days as usize);
     sorted
         .into_iter()
-        .skip(skip)
+        .skip(trim)
         .map(|(date, day)| {
             let mut ok = 0u64;
             let mut already = 0u64;
+            let mut skip = 0u64;
             let mut failed = 0u64;
             let mut reward_total = 0i64;
             for st in day.accounts.values() {
@@ -288,6 +308,9 @@ pub fn trend_from(f: &ResultsFile, days: u32) -> Vec<TrendPoint> {
                         ok += 1;
                         reward_total += st.reward.unwrap_or(0);
                     }
+                    // skip（2026-11-17 审查 #8）：确定性不可签到（未投放/task_status≠2），
+                    // 归 failed 虚增失败率——单列 skip 计数（2026-11-20：不再并入 already）
+                    "skip" => skip += 1,
                     "already" => already += 1,
                     _ => failed += 1,
                 }
@@ -296,6 +319,7 @@ pub fn trend_from(f: &ResultsFile, days: u32) -> Vec<TrendPoint> {
                 date: date.clone(),
                 ok,
                 already,
+                skip,
                 failed,
                 reward_total,
             }
@@ -380,6 +404,116 @@ mod tests {
         f.record_day(&today, [("u3".to_string(), "丙".into(), "fail".into(), None, None)]);
         f.record_day(&today, [("u3".to_string(), "丙".into(), "fail".into(), None, None)]);
         assert_eq!(f.days[&today].accounts["u3"].status, "fail");
+    }
+
+    /// already/skip 不得覆盖当日 success（代理捕获的 already 形态无 reward 字段，
+    /// 回退会抹掉早先 success 的 reward，看板 reward_total 丢额度）；success 仍可
+    /// 升级覆盖 already（更晚的确定性事实）
+    #[test]
+    fn record_day_already_skip_不回退success() {
+        let today = today_key();
+        let mut f = ResultsFile::default();
+        f.record_day(&today, [("u1".to_string(), "甲".into(), "success".into(), Some(200), None)]);
+        f.record_day(&today, [("u1".to_string(), "甲".into(), "already".into(), None, None)]);
+        let r = &f.days[&today].accounts["u1"];
+        assert_eq!(r.status, "success");
+        assert_eq!(r.reward, Some(200));
+        // skip 同理不回退
+        f.record_day(&today, [("u1".to_string(), "甲".into(), "skip".into(), None, None)]);
+        assert_eq!(f.days[&today].accounts["u1"].status, "success");
+        assert_eq!(f.days[&today].accounts["u1"].reward, Some(200));
+        // success 覆盖 already：更晚领取成功是确定性事实，仍可升级并补 reward
+        f.record_day(&today, [("u2".to_string(), "乙".into(), "already".into(), None, None)]);
+        f.record_day(&today, [("u2".to_string(), "乙".into(), "success".into(), Some(100), None)]);
+        assert_eq!(f.days[&today].accounts["u2"].status, "success");
+        assert_eq!(f.days[&today].accounts["u2"].reward, Some(100));
+        // already/skip 之间正常互写（均无 reward，新者胜刷新 message/updated_at）
+        f.record_day(&today, [("u3".to_string(), "丙".into(), "skip".into(), None, None)]);
+        f.record_day(&today, [("u3".to_string(), "丙".into(), "already".into(), None, None)]);
+        assert_eq!(f.days[&today].accounts["u3"].status, "already");
+    }
+
+    /// merge_fresh_into 弱事实矩阵（审查 P3 降级路径）：fresh 行 already/skip 不得
+    /// 回退快照行 success（代理捕获的 already 无 reward，updated_at 必然最新，纯
+    /// 新者胜会抹掉早先到账额度）；fresh=success 升级覆盖快照 already 仍成立
+    #[test]
+    fn merge_fresh_into_already_skip_不回退success() {
+        let today = today_key();
+        let mk = |status: &str, reward: Option<i64>, at: &str| AccountResult {
+            name: "甲".into(),
+            status: status.into(),
+            reward,
+            message: None,
+            updated_at: at.into(),
+        };
+        // ⑤ 快照 success+reward（持锁方早写）vs fresh already（代理降级路径晚写、
+        // 无 reward）：fresh 不得回退——与 record_day「already 不回退 success」对齐
+        let mut f = ResultsFile::default();
+        f.days.entry(today.clone()).or_default().accounts.insert(
+            "u1".into(),
+            mk("success", Some(200), "2026-11-08 10:00:01"),
+        );
+        let mut fresh = ResultsFile::default();
+        fresh.days.entry(today.clone()).or_default().accounts.insert(
+            "u1".into(),
+            mk("already", None, "2026-11-08 10:00:02"),
+        );
+        merge_fresh_into(&mut f, fresh);
+        let r = &f.days[&today].accounts["u1"];
+        assert_eq!(r.status, "success", "更晚的 already 不得回退 success");
+        assert_eq!(r.reward, Some(200), "already 无 reward，回退会丢额度");
+
+        // ⑥ skip 同理（确定性跳过是弱事实，不回退 success）
+        let mut f = ResultsFile::default();
+        f.days.entry(today.clone()).or_default().accounts.insert(
+            "u2".into(),
+            mk("success", Some(100), "2026-11-08 10:00:01"),
+        );
+        let mut fresh = ResultsFile::default();
+        fresh.days.entry(today.clone()).or_default().accounts.insert(
+            "u2".into(),
+            mk("skip", None, "2026-11-08 10:00:02"),
+        );
+        merge_fresh_into(&mut f, fresh);
+        let r = &f.days[&today].accounts["u2"];
+        assert_eq!(r.status, "success", "更晚的 skip 不得回退 success");
+        assert_eq!(r.reward, Some(100));
+
+        // ⑦ 反向升级：快照 already（早）vs fresh success+reward（晚）→ fresh 胜
+        //（确定性事实升级由「新者胜」天然成立，此断言防修复误伤）
+        let mut f = ResultsFile::default();
+        f.days.entry(today.clone()).or_default().accounts.insert(
+            "u3".into(),
+            mk("already", None, "2026-11-08 10:00:01"),
+        );
+        let mut fresh = ResultsFile::default();
+        fresh.days.entry(today.clone()).or_default().accounts.insert(
+            "u3".into(),
+            mk("success", Some(300), "2026-11-08 10:00:02"),
+        );
+        merge_fresh_into(&mut f, fresh);
+        let r = &f.days[&today].accounts["u3"];
+        assert_eq!(r.status, "success", "更晚的 success 仍可升级覆盖 already");
+        assert_eq!(r.reward, Some(300));
+    }
+
+    /// 端到端看板闭环（审查 P3）：already 捕获落库不回退 success 后，trend_from
+    /// 的 ok 计数与 reward_total 保持早先 success 口径，already 计数不受影响
+    #[test]
+    fn record_day_到trend_from_reward_total不丢() {
+        let today = today_key();
+        let mut f = ResultsFile::default();
+        // CLI/任务先签：success+reward 落库
+        f.record_day(&today, [("u1".into(), "甲".into(), "success".into(), Some(200), None)]);
+        // 客户端随后手动签到：代理捕获幂等确认 already（无 reward 字段）落库
+        f.record_day(&today, [("u1".into(), "甲".into(), "already".into(), None, None)]);
+        let trend = trend_from(&f, 7);
+        assert_eq!(trend.len(), 1);
+        let p = &trend[0];
+        assert_eq!(p.ok, 1, "success 未被 already 回退，仍计 ok");
+        assert_eq!(p.reward_total, 200, "reward_total 保持早先 success 额度");
+        assert_eq!(p.already, 0, "回退被拒，already 计数不虚增");
+        assert_eq!(p.failed, 0);
     }
 
     /// 降级路径最终合并（merge_fresh_into）回归：一侧 success/already、另一侧

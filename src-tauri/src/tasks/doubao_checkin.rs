@@ -1,16 +1,32 @@
-//! 豆包每日签到（需求③）：detail 查询签到状态 → 未签账号提交 landing/checkin →
-//! 按日落库 doubao_checkin_results + 账号池回写（quota_total/签到缓存）+ 运维历史。
-//! 端点（2026-10 抓包固化）：
-//! - POST /alice/ug/campaign/v3/detail/      body {"campaign_group_code":"pc_incentive_task_mvp_v3"}
+//! 豆包每日签到（需求③）：launch 读活动组 → detail 查签到状态 → 未签账号提交
+//! item/reward/claim 领取 → 按日落库 doubao_checkin_results + 账号池回写
+//! （quota_total/签到缓存）+ 运维历史。
+//! 端点（2026-11-17 magpie-doubao-work-auth 交叉验证修正）：
+//! - POST /alice/user/launch                     body {} → data.ug_campaign_info.campaign_group_code
+//!   （账号实际投放的活动组；为空 = 未投放签到活动，任何提交必然失败）
+//! - POST /alice/ug/campaign/v3/detail/          body {"campaign_group_code": group}
 //!   → data.progress.total_amount（累计获得额度 = 「总额度」口径）、
 //!     data.tasks[] task_kind=="daily_signin" 的 daily_checkin（今日已签/连续天数/上次日期）
-//! - POST /alice/ug/campaign/landing/checkin body {"scene":"pc_incentive_task_mvp_v3"}
-//!   → data.checked_in / reward_amount / continuous_days / idempotent
+//!     与 task_status（**2026-11-21 活动改版双口径**：v3 新口径 1=未签到可签——客户端
+//!     实测未签态 daily_signin task_status=1、checked_in_today=false 后直签成功；旧
+//!     magpie 口径 2=可领取。按值分派提交端点，见 submit_endpoint_for）
+//! - POST /alice/ug/campaign/landing/checkin     body {"scene": group}（v3 活动客户端
+//!   真实提交端点，2026-11-21 抓包实锤：客户端点签到按钮即发此请求 → data.checked_in/
+//!   idempotent/reward_amount，直签成功不回「确认中」）
+//! - POST /alice/ug/campaign/item/reward/claim/  body {"task_id":"","campaign_group_code":group,
+//!   "campaign_item_code":"daily_signin"}（旧口径 task_status=2 兼容路径）
+//!   历史（magpie 期）「landing/checkin 直调一律 710010702」结论是当时端点选错所致；
+//!   v3 下 landing/checkin 即正确端点，直调若仍被拒按 fail + detail 复查兜底处理。
+//!   字段名红线 campaign_item_code（写成 campaign_code 得 710010202 common invalid param）。
+//!   旧口径下领取被服务端限死在豆包电脑版客户端（HTTP 直调回 biz_error.code=3「确认中」）。
 //! msToken/a_bogus 为一次性反爬 token（CLI 无法生成），实测仅稳定 query 参数 + Cookie 即可通过。
-//! 红线：凭证等同密码，仅本地使用；仅执行官方签到动作，不做代刷。
+//! 红线：凭证等同密码，仅本地使用；仅执行官方签到动作，不做代刷、不做失败重试刷接口
+//! （高频无效写请求正是风控最敏感的模式，magpie 同款保守原则）。
 
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -19,19 +35,36 @@ use super::http_agent;
 
 const TIMEOUT_SECS: u64 = 15;
 const HISTORY_MAX: usize = 400;
-/// 签到活动 scene / campaign_group_code（抓包固化）
+/// 签到活动 scene / campaign_group_code 兜底值（实际以 launch 返回为准，修复⑤）
 const SCENE: &str = "pc_incentive_task_mvp_v3";
 /// detail 端点（含稳定 query 参数；msToken/a_bogus 省略）
 const DETAIL_URL: &str = "https://www.doubao.com/alice/ug/campaign/v3/detail/?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
-/// 签到执行端点（同上）
-const CHECKIN_URL: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
-/// 签到路径（抓包参数可用时拼客户端真实 query）
-const CHECKIN_BASE: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin";
+/// 领取端点（2026-11-17 修复①：landing/checkin → item/reward/claim，magpie 实测定论）
+const CLAIM_URL: &str = "https://www.doubao.com/alice/ug/campaign/item/reward/claim/?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
+/// 领取路径（抓包参数可用时拼客户端真实 query）
+const CLAIM_BASE: &str = "https://www.doubao.com/alice/ug/campaign/item/reward/claim/";
+/// v3 活动提交端点（2026-11-21 抓包实锤：客户端在 pc_incentive_task_mvp_v3 下点签到
+/// 按钮发 POST landing/checkin，body 仅 {"scene":"pc_incentive_task_mvp_v3"}，直签成功）
+const LANDING_CHECKIN_URL: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
+/// v3 提交路径（抓包参数可用时拼客户端真实 query）
+const LANDING_CHECKIN_BASE: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin";
+/// 活动组读取端点（修复⑤：GET 语义但走 POST 空体，magpie session.json('/alice/user/launch',{}) 同形）
+const LAUNCH_URL: &str = "https://www.doubao.com/alice/user/launch?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
 const REFERER: &str = "https://www.doubao.com/pc/agent-explore";
 /// 抓包 UA：桌面客户端自带 SamanthaDoubao 标识（区别于纯浏览器请求）
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 SamanthaDoubao/2.33.5";
-/// 批量模式下账号间隔（防上游频控，与 wb/trae 的 gap 思路一致，固定短间隔）
-const ACCOUNT_GAP_MS: u64 = 800;
+/// 批量模式下账号间隔基准（修复④：800ms → 2s + 0~2s 随机抖动，防上游频控/风控画像）。
+/// 审查 #5：nanos % 2000 非密码学随机（零依赖取舍，本仓无 rand crate），但实际间隔
+/// = 2s 基准 + 上一账号 run_one 网络耗时（天然波动大）+ 抖动，三重叠加后节拍画像
+/// 难度已显著高于原固定间隔；更显著的画像信号（固定下限/串行模式）为批量语义固有，
+/// 不在此处理
+const ACCOUNT_GAP_MS: u64 = 2000;
+/// 修复④（重试策略收敛，设计文档 §0.3）：每账号每日提交上限 2 次（首发 + 非确定性
+/// 失败重试后的一次补提兜底），超限只读不发 claim 写请求——高频无效写请求正是风控
+/// 最敏感的模式
+const DAILY_SUBMIT_LIMIT: i64 = 2;
+/// 修复②：pending「确认中」10 分钟后 detail-only 复查延迟（设计文档 §0.3 修复②口径）
+const PENDING_RECHECK_DELAY_SECS: u64 = 600;
 
 /// 构造 Cookie（sessionid + sid_guard + 可选 msToken + 抓包设备级 Cookie 追加）
 fn cookie_of(
@@ -254,12 +287,15 @@ pub fn parse_detail(body: &Value) -> Value {
     let mut last_checkin_date: Option<String> = None;
     let mut reward_amount: Option<i64> = None;
     let mut has_signin_task = false;
+    // 修复⑥：task_status（magpie 口径 2=可领取，1=未满足条件/未投放）——提交前门槛判定用
+    let mut task_status: Option<i64> = None;
     if let Some(tasks) = data.and_then(|d| d.get("tasks")).and_then(Value::as_array) {
         for t in tasks {
             if t.get("task_kind").and_then(Value::as_str) != Some("daily_signin") {
                 continue;
             }
             has_signin_task = true;
+            task_status = t.get("task_status").and_then(Value::as_i64);
             if let Some(dc) = t.get("daily_checkin").filter(|d| d.is_object()) {
                 checked_in_today = dc
                     .get("checked_in_today")
@@ -281,6 +317,7 @@ pub fn parse_detail(body: &Value) -> Value {
     json!({
         "checked_in_today": checked_in_today,
         "has_signin_task": has_signin_task,
+        "task_status": task_status,
         "continuous_days": continuous_days,
         "last_checkin_date": last_checkin_date,
         "reward_amount": reward_amount,
@@ -288,17 +325,191 @@ pub fn parse_detail(body: &Value) -> Value {
     })
 }
 
-/// 单账号一轮签到（detail → 判定 → 未签则提交 checkin）。
+/// 审查修复（2026-11-18 #2）：launch 投放组按 sid 短 TTL 缓存——campaign_group_code
+/// 随账号基本不变，而签到与 quota 巡检每账号每轮各发一次 launch。仅缓存「成功且非空」
+/// 结果：显式空串（未投放判定）/字段缺失/网络失败一律不缓存，保留实时判定的
+/// skip 语义与回退 SCENE 语义。
+static CAMPAIGN_GROUP_CACHE: LazyLock<Mutex<HashMap<String, (String, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const CAMPAIGN_GROUP_TTL: Duration = Duration::from_secs(6 * 3600);
+
+fn campaign_group_cached(sid: &str) -> Option<String> {
+    CAMPAIGN_GROUP_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sid)
+        .filter(|(_, at)| at.elapsed() < CAMPAIGN_GROUP_TTL)
+        .map(|(g, _)| g.clone())
+}
+
+fn campaign_group_store(sid: &str, group: &str) {
+    CAMPAIGN_GROUP_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sid.to_string(), (group.to_string(), Instant::now()));
+}
+
+/// 修复⑤：launch 现取账号实际投放的活动组（magpie campaignGroup 同形）。
+/// 返回 Ok(Some(空串)) = 服务端**显式**返回空 campaign_group_code = 未投放签到活动
+/// （此时任何 detail/claim 都注定失败，调用方直接短路）；
+/// Ok(None) = data.ug_campaign_info / campaign_group_code **字段缺失**（响应形态变化/
+/// 接口升级信号）——语义与「显式空串」不同，调用方不得据此判未投放，应回退 SCENE
+/// 继续 detail 二次判定（审查 #1：unwrap_or_default 把两者折叠成空串会让形态变化的
+/// 账号被统一误判「未投放」）；Err → 网络层/信封层失败，同样回退 SCENE。
+fn campaign_group_from_launch(
+    agent: &ureq::Agent,
+    sid: &str,
+    sg: Option<&str>,
+    ms: Option<&str>,
+    ua: &str,
+    device_cookies: &[(String, String)],
+) -> Result<Option<String>, String> {
+    let body = post_json(agent, LAUNCH_URL, sid, sg, ms, &json!({}), ua, device_cookies)?;
+    let Some(info) = body
+        .get("data")
+        .and_then(|d| d.get("ug_campaign_info"))
+        .and_then(|c| c.as_object())
+    else {
+        return Ok(None); // 字段缺失 ≠ 未投放：回退 SCENE 走 detail 二次判定
+    };
+    // 字段缺失或存在但非字符串（null/数字——unwrap_or_default 会把 null 折叠成空串，
+    // 进而被误判「未投放」短路）→ 同口径回退 SCENE 走 detail 二次判定；
+    // 显式空串（含纯空白）仍返回 Some("") 判「未投放」（magpie 口径不变）
+    let Some(code) = info
+        .get("campaign_group_code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(code.to_string()))
+}
+
+/// 修复②：claim 回执业务层解析。信封 code==0 ≠ 领取成功——「确认中」形态
+/// {"data":{"biz_error":{"code":3,"message":"领取结果确认中，请稍后重试"},"task_status":0},"code":0}
+/// 返回 (is_success, is_already, is_pending, message)：
+/// - is_success：checked_in=true（本次实签）
+/// - is_already：idempotent=true（幂等命中——此前已领过，审查 #2：归 already 不归
+///   success，与 handler.rs 落库链路 `if checked {success} else {already}` 口径一致，
+///   否则 CLI 统计虚增成功数且「签到成功 +0 额度」文案误导）
+/// - is_pending：biz_error.code=3「领取结果确认中」——服务端异步延迟确认，当日不再
+///   重试提交（审查 #3：立即复查 detail 大概率未翻转，砍掉；明示客户端路径兜底）
+fn parse_claim_outcome(body: &Value) -> (bool, bool, bool, String) {
+    let data = body.get("data");
+    // 本次实签：checked_in=true
+    if data
+        .and_then(|d| d.get("checked_in"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return (true, false, false, String::new());
+    }
+    // 幂等命中：此前已领过 → already（口径与落库链路一致）
+    if data
+        .and_then(|d| d.get("idempotent"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return (false, true, false, String::new());
+    }
+    // 旧兜底恢复（防回执形态变化误判 fail 触发重提）：checkin_date 有值且
+    // checked_in=false → 当日实际已签（detail 未反映或并发窗口），归 already
+    //（口径对齐历史逻辑 `idempotent || (!checked && date.is_some())` 的后半支）
+    if data
+        .and_then(|d| d.get("checkin_date"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return (false, true, false, String::new());
+    }
+    // 业务层拒绝：biz_error.code（3=确认中/其余=明确拒绝）
+    let biz = data.and_then(|d| d.get("biz_error"));
+    if let Some(b) = biz.filter(|b| !b.is_null()) {
+        let bcode = b.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        let bmsg = b
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if bcode == 3 {
+            return (false, false, true, if bmsg.is_empty() { "领取结果确认中，请稍后复查".into() } else { bmsg });
+        }
+        return (false, false, false, format!("biz_error code={bcode}：{bmsg}"));
+    }
+    // 无 checked_in 也无 biz_error → 未知形态，按失败处理
+    (false, false, false, "签到未生效（checked_in=false 且无 biz_error）".into())
+}
+
+/// 2026-11-21 活动改版：task_status → 提交端点分派。
+/// 返回 Some(true)=走 landing/checkin（v3 新口径 1=未签到可签，客户端实测形态）；
+/// Some(false)=走旧 item/reward/claim（旧 magpie 口径 2=可领取；task_status 字段缺失
+/// /旧形态响应 None 时保持旧流程兼容）；None=其余已知值确定性不可签（调用方 skip）。
+/// 判定依据：2026-11-21 proxy_req 抓包——客户端 v3/detail 未签态 daily_signin
+/// task_status=1 + checked_in_today=false，随后 landing/checkin 直签成功（reward 200）。
+fn submit_endpoint_for(task_status: Option<i64>) -> Option<bool> {
+    match task_status {
+        None | Some(2) => Some(false),
+        Some(1) => Some(true),
+        Some(_) => None,
+    }
+}
+
+// ── 修复④/② 当日 kv 标记（设计文档 §0.3 修复④：重试策略收敛）──
+// 用 SQLite kv 而非进程内静态：GUI 调度器与 schtasks CLI 双进程须同口径防重复提交；
+// 键内嵌当日日期（today_key 本地时区口径，同落库 day 键风格）自然失效，无需清理。
+
+/// 提交类确定性拒绝当日标记键（claim 被拒 fail / pending 确认中 → 当日不再重试提交）
+fn claim_rejected_key(uid: &str, day: &str) -> String {
+    format!("doubao_claim_rejected:{uid}:{day}")
+}
+
+/// 每账号每日提交计数键（run_one 发 claim 后无论成败 +1，防任何路径超限第三刷）
+fn claim_submit_count_key(uid: &str, day: &str) -> String {
+    format!("doubao_claim_submit_count:{uid}:{day}")
+}
+
+/// pending「确认中」标记键（值含落库时间戳供排障；复查线程完成后删除）
+fn claim_pending_key(uid: &str, day: &str) -> String {
+    format!("doubao_claim_pending:{uid}:{day}")
+}
+
+/// 落当日「提交类确定性拒绝」标记（修复④）。写失败必须落 app_log：标记丢失会让
+/// 调度器冷却重跑 run_batch 时再次提交，触碰「不做失败重试刷接口」风控红线
+fn claim_rejected_mark(data_dir: &std::path::Path, uid: &str, day: &str) {
+    if let Err(e) = crate::store::db(data_dir).kv_set(&claim_rejected_key(uid, day), &true) {
+        crate::fs_utils::app_log(
+            data_dir,
+            &format!("[doubao-checkin] 当日拒绝标记写入失败（调度重试链可能再次提交）: {e}"),
+        );
+    }
+}
+
+/// 单账号一轮签到（launch 活动组 → detail 判定 → 未签则按 task_status 分派提交端点：
+/// v3 口径 task_status=1 走 landing/checkin，旧口径 2 走 item/reward/claim）。
 /// probe = 客户端抓包参数（None 回退内置稳定参数）。
-/// 返回 outcome：status ∈ success | already | fail。
+/// 返回 outcome：status ∈ success | already | skip | fail
+/// （skip = 确定性不可签到：未投放/不可签 task_status，落库但不进调度重试链，审查 #8）。
+/// 修复⑥（2026-11-21 改版）：task_status 分派见 submit_endpoint_for——v3 未签态
+/// task_status=1 是可签态（旧逻辑误判 skip 导致当日三账号全部漏签）。
+/// 修复③：claim 被拒/确认中时给出「豆包客户端点一下」明示（客户端手动签到会经
+/// 代理捕获链路按日落库，handler.rs try_capture_doubao_campaign 兜底闭环）。
+/// 修复④（重试策略收敛）：当日已有「提交类确定性拒绝」标记（claim 被拒/确认中）
+/// 或当日提交次数达上限时，不再发 claim 写请求，只查 detail（已签由 ③ already 兜住，
+/// 未签落「请打开豆包客户端点击签到领取」只读文案）；claim 提交无论成败计数 +1。
 pub fn run_one(
     agent: &ureq::Agent,
+    data_dir: &std::path::Path,
     uid: &str,
     sid: &str,
     sg: Option<&str>,
     name: &str,
     probe: Option<&CampaignProbe>,
 ) -> Value {
+    let day = crate::doubao_checkin_results::today_key();
+    // 修复④：当日「提交类确定性拒绝」标记（claim 被拒/确认中落库时写入）→ 本次不发
+    // claim 写请求（launch/detail 只读不受影响），提交前据此短路落只读文案
+    let claim_rejected_today = crate::store::db(data_dir)
+        .kv_get::<bool>(&claim_rejected_key(uid, &day));
     let ms = probe.and_then(|p| p.ms_token.as_deref());
     // 抓包对齐（2026-11-06）：UA/设备 Cookie 取本账号 probe，缺失回退内置常量
     let ua_s = probe
@@ -308,26 +519,61 @@ pub fn run_one(
     let device_cookies: &[(String, String)] = probe
         .map(|p| p.device_cookies.as_slice())
         .unwrap_or(&[]);
-    // ① detail：签到状态 + 总额度
+    let fail = |message: String, detail: Option<&Value>| {
+        json!({
+            "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
+            "continuous_days": detail.map(|d| d.get("continuous_days").cloned()).flatten().unwrap_or(Value::Null),
+            "total_amount": detail.map(|d| d.get("total_amount").cloned()).flatten().unwrap_or(Value::Null),
+            "last_checkin_date": detail.map(|d| d.get("last_checkin_date").cloned()).flatten().unwrap_or(Value::Null),
+            "message": message,
+            "day": day,
+        })
+    };
+
+    // ① launch：账号实际投放的活动组（修复⑤）；显式空串 = 未投放 → skip（不发 detail/claim）
+    // 审查 #8：未投放/task_status≠2 是确定性不可签到（非故障），归 skip 不归 fail——
+    // fail 会触发调度器当日冷却重试，对确定性账号每日反复整批重跑 + probe 保活
+    // （开客户端抓包）纯属无效开销；skip 落库与运维历史照常，仅不进重试链
+    let skip = |message: String, detail: Option<&Value>| {
+        json!({
+            "uid": uid, "name": name, "status": "skip", "reward": Value::Null,
+            "continuous_days": detail.map(|d| d.get("continuous_days").cloned()).flatten().unwrap_or(Value::Null),
+            "total_amount": detail.map(|d| d.get("total_amount").cloned()).flatten().unwrap_or(Value::Null),
+            "last_checkin_date": detail.map(|d| d.get("last_checkin_date").cloned()).flatten().unwrap_or(Value::Null),
+            "message": message,
+            "day": day,
+        })
+    };
+    let group = match campaign_group_cached(sid) {
+        Some(g) => g,
+        None => match campaign_group_from_launch(agent, sid, sg, ms, ua_s, device_cookies) {
+            Ok(Some(g)) if !g.is_empty() => {
+                campaign_group_store(sid, &g);
+                g
+            }
+            Ok(Some(_)) => {
+                return skip("该账号当前未投放签到活动（launch 活动组为空）——跳过提交，请确认账号在豆包客户端能看到签到入口".into(), None);
+            }
+            // 字段缺失（Ok(None)）或网络/信封失败（Err）：回退 SCENE 常量继续 detail——
+            // detail 自身能反映任务有无（has_signin_task/task_status），launch 层面的
+            // 不确定不改变签到流程（审查 #1：字段缺失 ≠ 未投放，不得据此短路）
+            Ok(None) | Err(_) => SCENE.to_string(),
+        },
+    };
+
+    // ② detail：签到状态 + 总额度 + task_status（修复⑥）
     let detail = match post_json(
         agent,
         DETAIL_URL,
         sid,
         sg,
         ms,
-        &json!({"campaign_group_code": SCENE}),
+        &json!({"campaign_group_code": group}),
         ua_s,
         device_cookies,
     ) {
         Ok(body) => parse_detail(&body),
-        Err(e) => {
-            return json!({
-                "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
-                "continuous_days": Value::Null, "total_amount": Value::Null,
-                "last_checkin_date": Value::Null, "message": format!("detail 查询：{e}"),
-                "day": crate::doubao_checkin_results::today_key(),
-            })
-        }
+        Err(e) => return fail(format!("detail 查询：{e}"), None),
     };
     let checked_in_today = detail
         .get("checked_in_today")
@@ -335,7 +581,7 @@ pub fn run_one(
         .unwrap_or(false);
     let total_amount = detail.get("total_amount").cloned().unwrap_or(Value::Null);
 
-    // ② 已签 → already（回写 detail 携带的连签/上次日期即可）
+    // ③ 已签 → already（回写 detail 携带的连签/上次日期即可）
     if checked_in_today {
         return json!({
             "uid": uid, "name": name, "status": "already", "reward": Value::Null,
@@ -343,37 +589,93 @@ pub fn run_one(
             "total_amount": total_amount,
             "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
             "message": "今日已签到",
-            "day": crate::doubao_checkin_results::today_key(),
+            "day": day,
         });
     }
 
-    // ③ 未签 → 提交 landing/checkin（有抓包参数时用客户端真实 query，否则内置稳定参数）
-    let checkin_url = match probe {
-        Some(p) if !p.checkin_query.is_empty() => {
-            format!("{CHECKIN_BASE}?{}", p.checkin_query)
+    // ④ task_status 门槛（2026-11-21 活动改版双口径）：旧逻辑「非 2 即 skip」把 v3
+    // 未签态（task_status=1）误判为不可领取——当天三个账号全部 skip 而客户端实际可签。
+    // 现按 submit_endpoint_for 分派：1 → landing/checkin（v3 客户端真实形态），
+    // 2/字段缺失 → 旧 item/reward/claim，其余已知值 → skip
+    let task_status = detail.get("task_status").and_then(Value::as_i64);
+    let use_landing = match submit_endpoint_for(task_status) {
+        Some(u) => u,
+        None => {
+            return skip(
+                format!(
+                    "今日签到暂不可领取（task_status={}，非可签/可领态）——豆包按账号投放该活动；\
+                     若客户端能手动签到，请开启代理后在豆包客户端点一次，日志会捕获并按日落库",
+                    task_status.unwrap_or(-1)
+                ),
+                Some(&detail),
+            );
         }
-        _ => CHECKIN_URL.to_string(),
     };
-    match post_json(
-        agent,
-        &checkin_url,
-        sid,
-        sg,
-        ms,
-        &json!({"scene": SCENE}),
-        ua_s,
-        device_cookies,
-    ) {
+
+    // ④′ 修复④：当日「提交类确定性拒绝」→ 只读复查不重试提交（对齐 magpie「提交
+    // 一次、回查确认；没确认就当天只查不重提」）。detail 已签由 ③ already 兜住；
+    // 未签落客户端领取明示（skip 确定性态，不进调度重试链）
+    if claim_rejected_today {
+        return skip(
+            "当日已提交过签到且被拒绝/确认中——请打开豆包客户端点击签到领取（代理开着会自动捕获落库）"
+                .into(),
+            Some(&detail),
+        );
+    }
+    // ④″ 修复④：每账号每日提交上限 2 次，超限只读（任何路径不得第三刷）
+    let submit_count = crate::store::db(data_dir).kv_get::<i64>(&claim_submit_count_key(uid, &day));
+    if submit_count >= DAILY_SUBMIT_LIMIT {
+        return skip(
+            "今日签到提交次数已达上限——请打开豆包客户端点击签到领取（代理开着会自动捕获落库）"
+                .into(),
+            Some(&detail),
+        );
+    }
+
+    // ⑤ 未签且可签 → 提交。v3（task_status=1）走 landing/checkin，body 仅
+    // {"scene": group}（2026-11-21 客户端抓包实锤形态）；旧口径走 item/reward/claim
+    // （字段名红线 campaign_item_code）。
+    // 审查 #4（有意识取舍）：probe.checkin_query 回放到提交端点——a_bogus 一次性
+    // token 已在捕获侧剔除不入 vault（handler.rs 2026-10-29 审查修复），msToken 为
+    // 会话级复用值非一次性（实测仅稳定 query + Cookie 即可通过）；24h 新鲜期到期整组
+    // 弃用走内置稳定参数，回放窗口内失效属可接受残余风险
+    let (submit_url, submit_body) = if use_landing {
+        let url = match probe {
+            Some(p) if !p.checkin_query.is_empty() => {
+                format!("{LANDING_CHECKIN_BASE}?{}", p.checkin_query)
+            }
+            _ => LANDING_CHECKIN_URL.to_string(),
+        };
+        (url, json!({ "scene": group }))
+    } else {
+        let url = match probe {
+            Some(p) if !p.checkin_query.is_empty() => format!("{CLAIM_BASE}?{}", p.checkin_query),
+            _ => CLAIM_URL.to_string(),
+        };
+        (
+            url,
+            json!({
+                "task_id": "",                       // daily_signin 无 task_id，空串为正确形态
+                "campaign_group_code": group,
+                "campaign_item_code": "daily_signin", // 字段名红线：campaign_item_code
+            }),
+        )
+    };
+    let claim_res = post_json(agent, &submit_url, sid, sg, ms, &submit_body, ua_s, device_cookies);
+    // 修复④：提交类请求无论成败（含 pending/业务码/网络层失败）完成后计数 +1——
+    // 上限口径是「已发出的提交尝试」；写失败落日志（计数丢失会让超限防线失效）
+    if let Err(e) = crate::store::db(data_dir)
+        .kv_set(&claim_submit_count_key(uid, &day), &(submit_count + 1))
+    {
+        crate::fs_utils::app_log(
+            data_dir,
+            &format!("[doubao-checkin] 当日提交计数写入失败（超限防线可能失效）: {e}"),
+        );
+    }
+    match claim_res {
         Ok(body) => {
+            let (is_success, is_already, is_pending, bmsg) = parse_claim_outcome(&body);
             let data = body.get("data");
-            let checked = data
-                .and_then(|d| d.get("checked_in"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let idempotent = data
-                .and_then(|d| d.get("idempotent"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
             let reward = data
                 .and_then(|d| d.get("reward_amount"))
                 .and_then(Value::as_i64);
@@ -384,20 +686,7 @@ pub fn run_one(
                 .and_then(|d| d.get("checkin_date"))
                 .and_then(Value::as_str)
                 .map(|s| s.to_string());
-            if idempotent || (!checked && date.is_some()) {
-                // 幂等命中：当日实际已签（detail 未反映或并发窗口）
-                return json!({
-                    "uid": uid, "name": name, "status": "already", "reward": Value::Null,
-                    "continuous_days": continuous.map(Value::from)
-                        .or_else(|| detail.get("continuous_days").cloned()),
-                    "total_amount": total_amount,
-                    "last_checkin_date": date.map(Value::from)
-                        .or_else(|| detail.get("last_checkin_date").cloned()),
-                    "message": "今日已签到（幂等）",
-                    "day": crate::doubao_checkin_results::today_key(),
-                });
-            }
-            if checked {
+            if is_success {
                 return json!({
                     "uid": uid, "name": name, "status": "success",
                     "reward": reward.map(Value::from).unwrap_or(Value::Null),
@@ -407,22 +696,62 @@ pub fn run_one(
                     "last_checkin_date": date.map(Value::from)
                         .or_else(|| detail.get("last_checkin_date").cloned()),
                     "message": format!("签到成功 +{} 额度", reward.unwrap_or(0)),
-                    "day": crate::doubao_checkin_results::today_key(),
+                    "day": day,
                 });
             }
-            json!({
-                "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
-                "continuous_days": detail.get("continuous_days").cloned().unwrap_or(Value::Null),
-                "total_amount": total_amount,
-                "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
-                "message": "签到未生效（checked_in=false）",
-                "day": crate::doubao_checkin_results::today_key(),
-            })
+            if is_already {
+                // 幂等命中（审查 #2）：此前已领过 → already（不虚增成功统计）
+                return json!({
+                    "uid": uid, "name": name, "status": "already", "reward": Value::Null,
+                    "continuous_days": continuous.map(Value::from)
+                        .or_else(|| detail.get("continuous_days").cloned()),
+                    "total_amount": total_amount,
+                    "last_checkin_date": date.map(Value::from)
+                        .or_else(|| detail.get("last_checkin_date").cloned()),
+                    "message": "今日已签到（claim 幂等命中）",
+                    "day": day,
+                });
+            }
+            if is_pending {
+                // 确认中（修复②）：服务端异步延迟确认，立即复查 detail 大概率未翻转
+                // （审查 #3：砍掉立即复查，省一次无效读请求）——落 fail + 客户端兜底
+                // 明示（修复③）；当日不再重试提交（修复④：落当日拒绝标记，调度器
+                // 冷却重跑 run_batch 时 run_one 据此只读复查），10 分钟后仅 detail-only
+                // 复查一次（spawn_pending_recheck，修复②）；若实际已到账，客户端侧
+                // 代理捕获链路/复查补记会落 success（record_day fail-不覆盖-success 规则
+                // 保最终事实）
+                claim_rejected_mark(data_dir, uid, &day);
+                let _ = crate::store::db(data_dir).kv_set(
+                    &claim_pending_key(uid, &day),
+                    &json!({ "ts": fs_utils::now_ts() }),
+                );
+                let mut o = fail(
+                    format!(
+                        "领取确认中未完成（{bmsg}）——豆包把领取限死在电脑版客户端，\
+                         请打开豆包客户端点一下签到按钮（代理开着会自动捕获落库）；\
+                         当日不再重试提交，10 分钟后仅复查一次结果（只读）"
+                    ),
+                    Some(&detail),
+                );
+                // 修复④：结构化标记供 run_batch 失败分流（Err→Ok，不进调度冷却重试链）
+                o["claim_rejected"] = json!(true);
+                o["pending_recheck"] = json!(true);
+                return o;
+            }
+            // 领取被拒（修复④：信封 code=0 的 biz_error 明确拒绝属提交类确定性拒绝）
+            // ——当日不再重试提交，调度器冷却重跑时 run_one 据标记只读复查
+            claim_rejected_mark(data_dir, uid, &day);
+            let mut o = fail(
+                format!(
+                    "领取被拒：{bmsg}；若客户端能手动签到，请开启代理后在客户端点一次（当日不再重试提交）"
+                ),
+                Some(&detail),
+            );
+            o["claim_rejected"] = json!(true);
+            return o;
         }
         Err(e) => {
-            // 业务码失败 → detail 复查兜底：部分活动侧业务码（如 710010702）实际对应
-            // 「已签/活动未覆盖」等状态。复查 detail 今日已签 → 按 already 落库（避免误报失败）；
-            // detail 正常且未签 → 会话健康、活动端点单独拒绝，大概率无签到资格（给出明确指引）
+            // 业务码失败 → detail 复查兜底：部分活动侧业务码实际对应「已签/活动未覆盖」
             if e.starts_with("接口返回异常 code=") {
                 if let Ok(re_body) = post_json(
                     agent,
@@ -430,7 +759,7 @@ pub fn run_one(
                     sid,
                     sg,
                     ms,
-                    &json!({"campaign_group_code": SCENE}),
+                    &json!({"campaign_group_code": group}),
                     ua_s,
                     device_cookies,
                 ) {
@@ -442,44 +771,43 @@ pub fn run_one(
                             "total_amount": re.get("total_amount").cloned().unwrap_or(Value::Null),
                             "last_checkin_date": re.get("last_checkin_date").cloned().unwrap_or(Value::Null),
                             "message": format!("{e}；复查 detail 今日已签 → 按已签处理"),
-                            "day": crate::doubao_checkin_results::today_key(),
+                            "day": day,
                         });
                     }
-                    // detail 正常但提交被拒：按 detail 里有无 daily_signin 任务项分流定性
-                    // ① 无任务项 → scene 不匹配/无资格；② 有任务项 → 请求形态被风控（需抓包对齐）
                     let has_task = re.get("has_signin_task").and_then(Value::as_bool).unwrap_or(false);
-                    let hint = if has_task {
-                        "detail 有 daily_signin 任务但提交被拒 → 请求形态疑似被上游风控拦截；\
-                         请开启代理后在豆包客户端手动签到一次，日志会捕获客户端真实请求用于对齐修复"
+                    // 2026-11-21 排障：发奖端点 710010702 两层嫌疑——①抓包参数缺失/过期
+                    // （回退内置参数的形态已知被拒）；②账号级风控（客户端手动签到同报
+                    // 「签到失败」即为②，伪装 system error，通常 24h 内过期）。文案分层明示
+                    let probe_hint = if probe_own_fresh(data_dir, sid) {
+                        String::new()
                     } else {
-                        "detail 无 daily_signin 任务项 → 该账号未加入当前签到活动（scene 不匹配或无资格）；\
-                         若客户端能手动签到，同样请开代理抓一次真实请求"
+                        // 文案覆盖两级回退（本账号键缺失时 load_campaign_probe 仍可能
+                        // 命中全局兜底 probe，未必是内置参数——2026-11-21 二轮审查修正）
+                        "本账号抓包参数缺失/已过期（本次使用回退参数：全局兜底或内置稳定参数，\
+                         设备指纹不对齐时发奖端点大概率被拒）——\
+                         请在豆包设置开启「签到前自动抓包」或开代理后用「以账号打开」刷新参数再重试；"
+                            .to_string()
                     };
-                    return json!({
-                        "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
-                        "continuous_days": re.get("continuous_days").cloned().unwrap_or(Value::Null),
-                        "total_amount": re.get("total_amount").cloned().unwrap_or(Value::Null),
-                        "last_checkin_date": re.get("last_checkin_date").cloned().unwrap_or(Value::Null),
-                        "message": format!("{e}；{hint}"),
-                        "day": crate::doubao_checkin_results::today_key(),
-                    });
+                    let hint = if has_task {
+                        "detail 有 daily_signin 任务但提交被拒——若客户端能手动签到，\
+                         请开启代理后在豆包客户端点一次（日志会捕获并按日落库）；\
+                         若客户端同样报「签到失败」，为账号级风控（通常 24h 内过期后自愈，勿反复重试提交）"
+                    } else {
+                        "detail 无 daily_signin 任务项 → 该账号未加入当前签到活动（活动组不匹配或无资格）"
+                    };
+                    return fail(format!("{e}；{probe_hint}{hint}"), Some(&re));
                 }
             }
-            json!({
-                "uid": uid, "name": name, "status": "fail", "reward": Value::Null,
-                "continuous_days": detail.get("continuous_days").cloned().unwrap_or(Value::Null),
-                "total_amount": total_amount,
-                "last_checkin_date": detail.get("last_checkin_date").cloned().unwrap_or(Value::Null),
-                "message": format!("签到提交：{e}"),
-                "day": crate::doubao_checkin_results::today_key(),
-            })
+            fail(format!("签到提交：{e}"), Some(&detail))
         }
     }
 }
 
-/// 追加滚动运维历史（同 doubao_quota::append_history，kind="checkin"；失败落 app_log）
-fn append_history(state: &AppState, event: Value) {
-    let store = crate::store::db(&state.data_dir);
+/// 追加滚动运维历史（同 doubao_quota::append_history，kind="checkin"；失败落 app_log）。
+/// 参数收窄为 data_dir：persist_outcomes 与 pending 复查后台线程（无 AppState 句柄，
+/// 修复②）共用
+fn append_history(data_dir: &std::path::Path, event: Value) {
+    let store = crate::store::db(data_dir);
     let mut events = crate::store::docs::doubao_health_load(&store);
     events.push(event);
     if events.len() > HISTORY_MAX {
@@ -487,7 +815,7 @@ fn append_history(state: &AppState, event: Value) {
     }
     if let Err(e) = crate::store::docs::doubao_health_save(&store, &events) {
         crate::fs_utils::app_log(
-            &state.data_dir,
+            data_dir,
             &format!("[doubao_checkin] 运维历史写入失败（本次签到事件可能丢失）: {e}"),
         );
     }
@@ -540,16 +868,59 @@ fn merge_checkin_updates_into_pool(
 /// 只读 detail 探针：查签到状态 + 累计获得额度（progress.total_amount），
 /// 供额度巡检/数据同步任务回写 quota_total——**与签到提交解耦**（detail 是只读接口，
 /// 会话有效即可查，签到是否成功无关）。Ok(parse_detail) / Err(_) → None。
-pub fn detail_probe(agent: &ureq::Agent, sid: &str, sg: Option<&str>, ms: Option<&str>) -> Option<Value> {
+/// 审查 #7 同步修复⑤：campaign_group_code 不再硬编码 SCENE 常量——先经 launch
+/// 读账号实际投放组（失败/缺失回退 SCENE，与 run_one 同语义）；UA/设备 Cookie/
+/// msToken 走本账号抓包 probe（缺失回退内置常量），与签到请求形态一致降低风控拒率。
+pub fn detail_probe(
+    agent: &ureq::Agent,
+    data_dir: &std::path::Path,
+    sid: &str,
+    sg: Option<&str>,
+    ms: Option<&str>,
+) -> Option<Value> {
+    let probe = load_campaign_probe(data_dir, Some(sid));
+    probe_detail(agent, sid, sg, ms, probe.as_ref())
+}
+
+/// detail 探针核心（probe 由调用方注入，便于单测与上层复用）
+pub fn probe_detail(
+    agent: &ureq::Agent,
+    sid: &str,
+    sg: Option<&str>,
+    ms: Option<&str>,
+    probe: Option<&CampaignProbe>,
+) -> Option<Value> {
+    let p_ms = probe.and_then(|p| p.ms_token.as_deref()).or(ms);
+    let ua_s = probe
+        .and_then(|p| p.ua.as_deref())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(UA);
+    let device_cookies: &[(String, String)] = probe
+        .map(|p| p.device_cookies.as_slice())
+        .unwrap_or(&[]);
+    // 活动组：launch 实际投放组优先（审查修复 #2：命中缓存免重复 launch），
+    // 失败/字段缺失回退 SCENE（与 run_one 同语义）
+    let group = match campaign_group_cached(sid) {
+        Some(g) => g,
+        None => campaign_group_from_launch(agent, sid, sg, p_ms, ua_s, device_cookies)
+            .ok()
+            .flatten()
+            .filter(|g| !g.is_empty())
+            .map(|g| {
+                campaign_group_store(sid, &g);
+                g
+            })
+            .unwrap_or_else(|| SCENE.to_string()),
+    };
     let body = post_json(
         agent,
         DETAIL_URL,
         sid,
         sg,
-        ms,
-        &json!({"campaign_group_code": SCENE}),
-        UA,
-        &[],
+        p_ms,
+        &json!({"campaign_group_code": group}),
+        ua_s,
+        device_cookies,
     )
     .ok()?;
     Some(parse_detail(&body))
@@ -594,18 +965,19 @@ fn collect_targets(state: &AppState) -> Result<Vec<(String, String, Option<Strin
 /// 落库锁 Busy 幂等跳过时出现——调用方 run_batch 据此打 skipped_busy 交调度器
 /// 不 mark_run、下一轮重跑补录（已签账号幂等归 already），防结果丢失且无法补录。
 fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_busy: bool) -> bool {
-    // ① 按日落库（success/already/fail 全记；reward 仅 success 携带）。
+    // ① 按日落库（success/already/fail/skip 全记；reward 仅 success 携带）。
     // day 取 outcome 产生时刻打点（跨零点批次各归各日）；旧 outcome 无 day 回退当日。
-    // message 仅 fail 携带（失败原因落库，切页/重开后日历明细仍可排障）——
-    // success/already 的 message 恒为固定成功文案，落库只增体积无价值
+    // message 仅 fail/skip 携带（失败原因/确定性跳过原因落库，切页/重开后日历明细
+    // 仍可排障）——success/already 的 message 恒为固定成功文案，落库只增体积无价值
     let today = crate::doubao_checkin_results::today_key();
     let entries = outcomes.iter().map(|o| {
+        let status = o.get("status").and_then(Value::as_str).unwrap_or("fail");
         (
             o.get("uid").and_then(Value::as_str).unwrap_or("").to_string(),
             o.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
-            o.get("status").and_then(Value::as_str).unwrap_or("fail").to_string(),
+            status.to_string(),
             o.get("reward").and_then(Value::as_i64),
-            (o.get("status").and_then(Value::as_str) == Some("fail"))
+            (status == "fail" || status == "skip")
                 .then(|| {
                     o.get("message")
                         .and_then(Value::as_str)
@@ -661,11 +1033,12 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_
         }
     }
 
-    // ③ 运维历史（逐账号，kind="checkin"）
+    // ③ 运维历史（逐账号，kind="checkin"）；skip 是确定性跳过非故障，不算 ok=false
     for o in outcomes {
-        let ok = o.get("status").and_then(Value::as_str) != Some("fail");
+        let status = o.get("status").and_then(Value::as_str).unwrap_or("fail");
+        let ok = status != "fail";
         append_history(
-            state,
+            &state.data_dir,
             json!({
                 "ts": fs_utils::now_ts(), "kind": "checkin", "uid": o.get("uid"), "ok": ok,
                 "status": o.get("status"), "reward": o.get("reward"),
@@ -674,6 +1047,139 @@ fn persist_outcomes(state: &AppState, outcomes: &[Value], source: &str, skip_on_
         );
     }
     persisted
+}
+
+/// 修复④：失败分流（纯函数，run_batch Err/Ok 判定与单测共用）——
+/// 返回 (提交类确定性拒绝失败数, 其他失败数)。前者 = outcome 带 claim_rejected=true
+/// 的 fail（claim 被拒/确认中，run_one 已落当日「不再重试提交」标记）；后者 = 网络层/
+/// 系统错误等非确定性失败，维持调度重试链
+fn split_claim_rejected_fails(outcomes: &[Value]) -> (usize, usize) {
+    let rejected = outcomes
+        .iter()
+        .filter(|o| {
+            o.get("status").and_then(Value::as_str) == Some("fail")
+                && o.get("claim_rejected").and_then(Value::as_bool).unwrap_or(false)
+        })
+        .count();
+    let failed = outcomes
+        .iter()
+        .filter(|o| o.get("status").and_then(Value::as_str) == Some("fail"))
+        .count();
+    (rejected, failed - rejected)
+}
+
+/// 修复②：pending「确认中」10 分钟后 detail-only 复查（设计文档 §0.3 修复②口径）。
+/// 选 std::thread::spawn + sleep（仓内 buddy_ai SSE 读线程 / probe 等待同款先例，
+/// 最小侵入；调度器侧无更自然挂载点——tick 粒度与 10 分钟延迟不匹配）。复查只读
+/// 不发 claim 写请求：
+/// - checked_in_today 翻 true → 补记 success（带 detail.reward_amount，看板 reward_total
+///   完整）；防护：当日已有 success/already 记录则跳过（落库保护逻辑——success 是
+///   最强事实但补记可能无 reward，不得降级覆盖既有带 reward 的成功记录）
+/// - 未翻转 → 落「请打开豆包客户端点击签到领取」skip（确定性结局，不进重试链；
+///   record_day 允许 skip 覆盖 pending 落的 fail、不回退 success）；当日不再提交由
+///   pending 时已落的 claim_rejected 标记保证（与修复④第 1 项同一标记）
+/// 跨零点放弃复查（detail 状态属新的一天，无法用于补记 pending 所在日）；
+/// skip_on_busy=false：复查结果是本线程独有，幂等跳过即永久丢失（与 manual 同口径）
+fn spawn_pending_recheck(
+    state: &AppState,
+    uid: &str,
+    sid: &str,
+    sg: Option<&str>,
+    name: &str,
+    probe: Option<CampaignProbe>,
+) {
+    let data_dir = state.data_dir.clone();
+    let uid = uid.to_string();
+    let sid = sid.to_string();
+    let sg = sg.map(str::to_string);
+    let name = name.to_string();
+    let day = crate::doubao_checkin_results::today_key();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(PENDING_RECHECK_DELAY_SECS));
+        // 跨零点（pending 落在 23:5x）：放弃复查，pending 标记清理，当日记录保持
+        // fail 原状（次日 run_one 走新日正常流程，昨日键自然失效）
+        if crate::doubao_checkin_results::today_key() != day {
+            let _ = crate::store::db(&data_dir).kv_delete(&claim_pending_key(&uid, &day));
+            return;
+        }
+        let agent = http_agent(TIMEOUT_SECS);
+        let detail = probe_detail(&agent, &sid, sg.as_deref(), None, probe.as_ref());
+        // pending 标记无论复查成败都清理（当日不再提交由 claim_rejected 标记保证）
+        let _ = crate::store::db(&data_dir).kv_delete(&claim_pending_key(&uid, &day));
+        let Some(detail) = detail else {
+            // detail 查询失败：保持 fail 原状（下次 run_batch 时 run_one 标记分支
+            // 只读复查兜底，detail 恢复后仍能补记/明示）
+            crate::fs_utils::app_log(
+                &data_dir,
+                &format!("[doubao-checkin] pending 复查 detail 查询失败（uid={uid}），保持当日不提交口径"),
+            );
+            return;
+        };
+        let checked = detail
+            .get("checked_in_today")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !checked {
+            // 未翻转：skip 明示（覆盖 pending 落的 fail；不回退既有 success/already）
+            crate::doubao_checkin_results::record_day_at(
+                &data_dir,
+                [(
+                    uid.clone(),
+                    name.clone(),
+                    "skip".to_string(),
+                    None,
+                    Some("领取确认中未翻转——请打开豆包客户端点击签到领取（当日不再重试提交）".to_string()),
+                    day.clone(),
+                )],
+                false,
+            );
+            append_history(
+                &data_dir,
+                json!({
+                    "ts": fs_utils::now_ts(), "kind": "checkin", "uid": uid, "ok": true,
+                    "status": "skip", "reward": Value::Null,
+                    "summary": "pending 复查：确认中未翻转，明示客户端领取",
+                    "source": "pending-recheck",
+                }),
+            );
+            return;
+        }
+        // 翻 true：补记 success。防护（落库保护逻辑）：当日已有 success/already
+        // （客户端代理捕获/重试轮已补记）则不覆盖——避免无 reward 的补记降级既有
+        // 成功记录；fail/skip/无记录才补记升级
+        let f = crate::doubao_checkin_results::load(&data_dir);
+        let already_recorded = f
+            .days
+            .get(&day)
+            .and_then(|d| d.accounts.get(&uid))
+            .map(|p| matches!(p.status.as_str(), "success" | "already"))
+            .unwrap_or(false);
+        if already_recorded {
+            return;
+        }
+        let reward = detail.get("reward_amount").and_then(Value::as_i64);
+        crate::doubao_checkin_results::record_day_at(
+            &data_dir,
+            [(
+                uid.clone(),
+                name.clone(),
+                "success".to_string(),
+                reward,
+                None,
+                day.clone(),
+            )],
+            false,
+        );
+        append_history(
+            &data_dir,
+            json!({
+                "ts": fs_utils::now_ts(), "kind": "checkin", "uid": uid, "ok": true,
+                "status": "success", "reward": reward,
+                "summary": "pending 复查：detail 确认已签，补记 success",
+                "source": "pending-recheck",
+            }),
+        );
+    });
 }
 
 /// 批量签到（调度器/CLI `--task-run doubao-checkin`）：遍历池内有凭证账号 → 签到 →
@@ -726,12 +1232,28 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
     let mut outcomes: Vec<Value> = Vec::new();
     for (i, (uid, sid, sg, name)) in targets.iter().enumerate() {
         if i > 0 {
-            std::thread::sleep(Duration::from_millis(ACCOUNT_GAP_MS));
+            // 修复④：2s 基准 + 0~2s 随机抖动（固定短间隔是可被上游画像的机器节拍）。
+            // 零依赖原则：用纳秒取模做伪随机（本仓无 rand crate）
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0);
+            std::thread::sleep(Duration::from_millis(ACCOUNT_GAP_MS + nanos % 2000));
         }
         // 回退语义由 load_campaign_probe 内部保证（本账号键 → 全局键两级回退）；
         // 外层再 or_else 全局快照属死分支，且命中时取的是循环前更旧快照
         let probe = load_campaign_probe(&state.data_dir, Some(sid));
-        outcomes.push(run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref()));
+        let outcome = run_one(&agent, &state.data_dir, uid, sid, sg.as_deref(), name, probe.as_ref());
+        // 修复②：确认中（pending）→ 10 分钟后 detail-only 复查（后台线程，不占调度
+        // 轮；复查只读不发 claim 写请求，见 spawn_pending_recheck）
+        if outcome
+            .get("pending_recheck")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            spawn_pending_recheck(state, uid, sid, sg.as_deref(), name, probe.clone());
+        }
+        outcomes.push(outcome);
     }
     // 审查 M-3：落库锁 Busy 幂等跳过（结果未落库）时打 skipped_busy 交调度器不
     // mark_run、下一 tick 重跑补录（已签账号幂等归 already，无重复奖励）——否则
@@ -756,7 +1278,13 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
         .iter()
         .filter(|o| o.get("status").and_then(Value::as_str) == Some("already"))
         .count();
-    let failed = outcomes.len() - success - already;
+    // skip（审查 #8）：确定性不可签到（未投放/task_status≠2）——不计失败不触发
+    // 调度器当日冷却重试（mark_fail），落库照常仅不进重试链
+    let skipped = outcomes
+        .iter()
+        .filter(|o| o.get("status").and_then(Value::as_str) == Some("skip"))
+        .count();
+    let failed = outcomes.len() - success - already - skipped;
     let reward_total: i64 = outcomes
         .iter()
         .filter_map(|o| o.get("reward").and_then(Value::as_i64))
@@ -777,8 +1305,14 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
     // CLI `--task-run` 退出码 1 可见 + 调度器走 mark_fail 当日冷却重试（返 Ok 会
     // mark_run 固化「当日已跑」关闭重试链）；落库/池回写/运维历史已在 persist_outcomes
     // 完成，Err 仅改变汇总出口。GUI「立即签到全部」经此路径收到 Err 时 toast 展示
-    // 失败汇总，无数据副作用
-    if failed > 0 {
+    // 失败汇总，无数据副作用。
+    // 修复④：失败分流——仅存在**非确定性失败**（网络/系统错误）才维持 Err（触发
+    // mark_fail → 30/60/120min 冷却重跑 run_batch；重跑时确定性拒绝账号已被 run_one
+    // 当日标记拦住只读复查，不会再提交）；failed 全部为「提交类确定性拒绝」时改返
+    // Ok——Err 会让调度器当日反复重跑整批，对已确定性拒绝的账号纯属再次提交（触碰
+    // 「不做失败重试刷接口」红线），失败已在结果明细/summary 中体现
+    let (claim_rejected_fails, other_fails) = split_claim_rejected_fails(&outcomes);
+    if failed > 0 && other_fails > 0 {
         // 审查 L-1：汇总串逐条钳制（单行化 + 120 字截断）——超长多行错误文案会污染
         // CLI `--task-run` 退出输出与失败通知；errors 数组保原始完整供前端展示
         let clamp_msg = |m: &str| -> String {
@@ -808,13 +1342,30 @@ pub fn run_batch(state: &AppState, app: Option<&tauri::AppHandle>) -> Result<Val
             .map(|e| format!("；此外抓包参数自动保活未完成（{e}），本次签到未对齐客户端指纹，易被风控拒绝——请开启代理并保持豆包客户端打开后重试"))
             .unwrap_or_default();
         return Err(format!(
-            "豆包签到：{success} 成功 / {already} 已领 / {failed} 失败：{err_head}{probe_hint}"
+            "豆包签到：{success} 成功 / {already} 已领 / {failed} 失败（另有 {skipped} 个账号确定性跳过）：{err_head}{probe_hint}"
         ));
+    }
+    // 修复④：failed 全部为「提交类确定性拒绝」（claim 被拒/确认中）→ 返 Ok——
+    // 调度器 mark_run 固化「当日已跑」，当日不再重跑提交（Err 会触发冷却重试链
+    // 对已拒绝账号再次提交）；失败已在 outcome 落库、errors 明细与 summary 计数中
+    // 体现；pending 账号另有 10 分钟后 detail-only 复查兜底（spawn_pending_recheck）
+    if claim_rejected_fails > 0 {
+        return Ok(json!({
+            "ok": true, "mode": "all",
+            "total": outcomes.len(), "success": success, "already": already, "failed": failed,
+            "skipped": skipped,
+            "claim_rejected": claim_rejected_fails,
+            "reward_total": reward_total,
+            "errors": errors,
+            "probe_keepalive_error": probe_keepalive_error,
+            "finished_at": fs_utils::now_ts(),
+        }));
     }
 
     Ok(json!({
         "ok": true, "mode": "all",
         "total": outcomes.len(), "success": success, "already": already, "failed": failed,
+        "skipped": skipped,
         "reward_total": reward_total,
         "errors": errors,
         "probe_keepalive_error": probe_keepalive_error,
@@ -844,7 +1395,16 @@ pub fn checkin_single(state: &AppState, app: Option<&tauri::AppHandle>, uid: &st
     // 回退语义由 load_campaign_probe 内部保证（本账号键 → 全局键两级回退，与
     // run_batch 同口径）；外层再 or_else 全局查询属死分支（内部已试过全局键）
     let probe = load_campaign_probe(&state.data_dir, Some(sid));
-    let outcome = run_one(&agent, uid, sid, sg.as_deref(), name, probe.as_ref());
+    // 手动触发与调度路径同受修复④约束：当日拒绝标记/每日提交上限在 run_one 内生效
+    let outcome = run_one(&agent, &state.data_dir, uid, sid, sg.as_deref(), name, probe.as_ref());
+    // 修复②：确认中 → 10 分钟后 detail-only 复查（与 run_batch 同款后台线程）
+    if outcome
+        .get("pending_recheck")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        spawn_pending_recheck(state, uid, sid, sg.as_deref(), name, probe.clone());
+    }
     persist_outcomes(state, std::slice::from_ref(&outcome), "manual", false);
     let ok = outcome.get("status").and_then(Value::as_str) != Some("fail");
     Ok(json!({
@@ -974,6 +1534,131 @@ mod doubao_checkin_tests {
         assert_eq!(p["total_amount"], 0);
     }
 
+    // ── parse_claim_outcome（修复②：信封 code=0 ≠ 领取成功；审查 #2：幂等归 already）──
+
+    #[test]
+    fn claim_成功形态_checked_in_true() {
+        let b = json!({"code": 0, "data": {"checked_in": true, "reward_amount": 200}});
+        let (ok, already, pending, msg) = parse_claim_outcome(&b);
+        assert!(ok && !already && !pending && msg.is_empty());
+    }
+
+    #[test]
+    fn claim_幂等命中_归already不归success() {
+        // 审查 #2：幂等命中 = 此前已领过，须与 handler.rs 落库链路 already 口径一致，
+        // 否则 CLI 统计虚增成功数（「签到成功 +0 额度」误导）
+        let b = json!({"code": 0, "data": {"idempotent": true}});
+        let (ok, already, pending, _) = parse_claim_outcome(&b);
+        assert!(!ok && already && !pending);
+    }
+
+    #[test]
+    fn claim_checkin_date有值且checked_in_false_兜底归already() {
+        // 旧兜底恢复（防回执形态变化误判 fail 触发重提）：checkin_date 有值且
+        // checked_in=false → 当日实际已签，对齐历史口径 `!checked && date.is_some()`
+        let b = json!({"code": 0, "data": {"checked_in": false, "checkin_date": "2026-11-20"}});
+        let (ok, already, pending, _) = parse_claim_outcome(&b);
+        assert!(!ok && already && !pending);
+    }
+
+    #[test]
+    fn claim_确认中_biz_error_code_3() {
+        // magpie 实测形态：信封 code=0 但实际未领取成功
+        let b = json!({"code": 0, "data": {
+            "biz_error": {"code": 3, "message": "领取结果确认中，请稍后重试"},
+            "task_status": 0
+        }});
+        let (ok, already, pending, msg) = parse_claim_outcome(&b);
+        assert!(!ok && !already && pending && msg.contains("确认中"));
+    }
+
+    #[test]
+    fn claim_业务层明确拒绝_非确认中() {
+        let b = json!({"code": 0, "data": {
+            "biz_error": {"code": 8, "message": "当前暂不符合领取条件"}
+        }});
+        let (ok, already, pending, msg) = parse_claim_outcome(&b);
+        assert!(!ok && !already && !pending && msg.contains("不符合领取条件"));
+    }
+
+    #[test]
+    fn claim_无checked_in无biz_error_按失败() {
+        let b = json!({"code": 0, "data": {"task_status": 0}});
+        let (ok, already, pending, msg) = parse_claim_outcome(&b);
+        assert!(!ok && !already && !pending && msg.contains("未生效"));
+    }
+
+    #[test]
+    fn submit_endpoint_分派_20261121改版双口径() {
+        // 2026-11-21 抓包实锤：v3 未签态 task_status=1（旧逻辑误 skip 导致漏签）
+        assert_eq!(submit_endpoint_for(Some(1)), Some(true)); // landing/checkin
+        assert_eq!(submit_endpoint_for(Some(2)), Some(false)); // 旧 item/reward/claim
+        assert_eq!(submit_endpoint_for(None), Some(false)); // 字段缺失保持旧流程兼容
+        assert_eq!(submit_endpoint_for(Some(0)), None); // 其余已知值 → skip
+        assert_eq!(submit_endpoint_for(Some(3)), None);
+    }
+
+    // ── campaign_group_from_launch 返回语义（审查 #1：缺失 ≠ 显式空串）──
+    // 注：网络请求函数不直接单测（依赖 ureq Agent），此处验证返回类型契约——
+    // Ok(Some("")) = 显式空串（未投放短路）、Ok(None) = 字段缺失（回退 SCENE）。
+    // launch 解析逻辑由 probe_detail 集成路径覆盖（campaign_group_code 缺失回退）。
+
+    #[test]
+    fn trend_聚合_skip独立计数不虚增失败率() {
+        // 审查 #8：skip（未投放/task_status≠2）是确定性不可签到，归 failed 会虚增
+        // 失败率——trend_from 单列 skip 计数（2026-11-20 看板：不再并入 already，
+        // 前端堆叠图单独灰柱展示）
+        let mut f = crate::doubao_checkin_results::ResultsFile::default();
+        f.record_day("2026-11-17", [
+            ("u1".into(), "账号1".into(), "success".into(), Some(200), None),
+            ("u2".into(), "账号2".into(), "skip".into(), None, Some("未投放".into())),
+            ("u3".into(), "账号3".into(), "fail".into(), None, Some("网络失败".into())),
+        ]);
+        let trend = crate::doubao_checkin_results::trend_from(&f, 7);
+        assert_eq!(trend.len(), 1);
+        assert_eq!(trend[0].ok, 1);
+        assert_eq!(trend[0].already, 0); // skip 不并入 already
+        assert_eq!(trend[0].skip, 1); // 单列 skip 计数
+        assert_eq!(trend[0].failed, 1); // 仅真实 fail 计失败
+        assert_eq!(trend[0].reward_total, 200);
+    }
+
+    /// skip 是当日确定性事实：后续重试轮 fail 不得覆盖（与 success/already 同规则）
+    #[test]
+    fn record_day_fail不覆盖skip() {
+        let mut f = crate::doubao_checkin_results::ResultsFile::default();
+        f.record_day("2026-11-17", [
+            ("u1".into(), "账号1".into(), "skip".into(), None, Some("未投放".into())),
+        ]);
+        f.record_day("2026-11-17", [
+            ("u1".into(), "账号1".into(), "fail".into(), None, Some("网络失败".into())),
+        ]);
+        let day = f.days.get("2026-11-17").unwrap();
+        let st = day.accounts.get("u1").unwrap();
+        assert_eq!(st.status, "skip");
+        assert_eq!(st.message.as_deref(), Some("未投放"));
+    }
+
+    // ── parse_detail task_status（修复⑥：可领取态门槛）──
+
+    #[test]
+    fn parse_detail_透出task_status供提交门槛() {
+        let body = json!({"code": 0, "data": {"tasks": [
+            {"campaign_code": "daily_signin", "task_kind": "daily_signin",
+             "task_status": 2,
+             "daily_checkin": {"checked_in_today": false}}
+        ]}});
+        let p = parse_detail(&body);
+        assert_eq!(p["task_status"], 2);
+        assert_eq!(p["has_signin_task"], true);
+        // 无投放账号：task_status=1（未满足条件）→ 提交门槛直接短路
+        let body = json!({"code": 0, "data": {"tasks": [
+            {"campaign_code": "daily_signin", "task_kind": "daily_signin", "task_status": 1}
+        ]}});
+        let p = parse_detail(&body);
+        assert_eq!(p["task_status"], 1);
+    }
+
     /// 回归（两阶段回写）：签到合并只动签到相关字段——窗口内新入池账号保留、
     /// 被删账号不复活、并发方更新的其他字段不被覆盖、fail 仅回写运行时间。
     #[test]
@@ -1039,5 +1724,70 @@ mod doubao_checkin_tests {
         let _ = merge_checkin_updates_into_pool(&mut latest2, &updates2);
         let a2 = latest2["accounts"].as_array().unwrap().first().unwrap();
         assert_eq!(a2["quota_total"], 900, "fail 且 detail 未成功 → 保留旧总额度");
+    }
+
+    // ── 修复④：失败分流（run_batch Err/Ok 判定口径）──
+
+    #[test]
+    fn 分流_全为提交类确定性拒绝_其他失败为零() {
+        let outcomes = vec![
+            json!({"uid": "u1", "status": "fail", "claim_rejected": true, "message": "领取被拒"}),
+            json!({"uid": "u2", "status": "fail", "claim_rejected": true, "pending_recheck": true}),
+            json!({"uid": "u3", "status": "success"}),
+        ];
+        let (rejected, other) = split_claim_rejected_fails(&outcomes);
+        assert_eq!((rejected, other), (2, 0), "全部确定性拒绝 → 返 Ok 不进重试链");
+    }
+
+    #[test]
+    fn 分流_混合网络失败_维持Err() {
+        let outcomes = vec![
+            json!({"uid": "u1", "status": "fail", "claim_rejected": true}),
+            json!({"uid": "u2", "status": "fail", "message": "签到提交：请求失败"}),
+            json!({"uid": "u3", "status": "skip"}),
+        ];
+        let (rejected, other) = split_claim_rejected_fails(&outcomes);
+        assert_eq!((rejected, other), (1, 1), "存在非确定性失败 → 维持 Err");
+    }
+
+    #[test]
+    fn 分流_无fail_零值() {
+        let outcomes = vec![
+            json!({"uid": "u1", "status": "success"}),
+            json!({"uid": "u2", "status": "already"}),
+            json!({"uid": "u3", "status": "skip"}),
+        ];
+        assert_eq!(split_claim_rejected_fails(&outcomes), (0, 0));
+        // fail 但未带 claim_rejected 标记（如 detail 查询失败）→ 归其他失败
+        let outcomes2 = vec![json!({"uid": "u4", "status": "fail", "message": "detail 查询：请求失败"})];
+        assert_eq!(split_claim_rejected_fails(&outcomes2), (0, 1));
+    }
+
+    // ── 修复④/②：当日 kv 标记键格式（today_key 本地时区口径，跨进程共享）──
+
+    #[test]
+    fn 当日kv标记键_格式与日期内嵌() {
+        let day = crate::doubao_checkin_results::today_key();
+        assert_eq!(claim_rejected_key("u1", "2026-11-20"), "doubao_claim_rejected:u1:2026-11-20");
+        assert_eq!(claim_submit_count_key("u1", &day), format!("doubao_claim_submit_count:u1:{day}"));
+        assert_eq!(claim_pending_key("u2", &day), format!("doubao_claim_pending:u2:{day}"));
+    }
+
+    /// 当日拒绝标记 kv 往返 + 跨日自然失效（键内嵌日期，次日读取为 false）
+    #[test]
+    fn 当日拒绝标记_写入读取与跨日失效() {
+        let d = std::env::temp_dir().join(format!("aiwork_checkin_flag_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let day = crate::doubao_checkin_results::today_key();
+        let db = crate::store::db(&d);
+        assert!(!db.kv_get::<bool>(&claim_rejected_key("u1", &day)), "未标记默认 false");
+        claim_rejected_mark(&d, "u1", &day);
+        assert!(db.kv_get::<bool>(&claim_rejected_key("u1", &day)), "标记后当日生效");
+        // 昨日键独立，不受今日标记影响（跨日自然失效口径）
+        assert!(!db.kv_get::<bool>(&claim_rejected_key("u1", "2020-01-01")));
+        // 计数键往返（i64）
+        db.kv_set(&claim_submit_count_key("u1", &day), &2i64).unwrap();
+        assert_eq!(db.kv_get::<i64>(&claim_submit_count_key("u1", &day)), 2);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -424,7 +424,7 @@ impl UpstreamConnector {
 
 /// rustls 客户端配置：webpki roots + ALPN 仅 http/1.1（对齐 Python：客户端不协商 h2）
 fn build_client_tls_config() -> tokio_rustls::rustls::ClientConfig {
-    let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)

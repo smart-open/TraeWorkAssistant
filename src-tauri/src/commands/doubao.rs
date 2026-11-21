@@ -1051,7 +1051,7 @@ fn update_quota_cache(state: &State<AppState>, uid: &str, parsed: &serde_json::V
             .and_then(|a| a.session_id.clone().map(|sid| (sid, a.sid_guard.clone())))
             .and_then(|(sid, sg)| {
                 let agent = crate::tasks::http_agent(8);
-                crate::tasks::doubao_checkin::detail_probe(&agent, &sid, sg.as_deref(), None)
+                crate::tasks::doubao_checkin::detail_probe(&agent, &state.data_dir, &sid, sg.as_deref(), None)
             })
     };
     // 读-改-写互斥：罩住 load→改→save 段，防旧副本整文档覆盖

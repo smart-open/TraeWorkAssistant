@@ -1714,12 +1714,38 @@ pub fn cooldown_clear_all(
     };
 
     // 同时清除运行中 API 池的内存冷却状态
+    // 审查修复（2026-11-20，Medium）：原只清 Trae 池——#206 引入的账号×模型冷却
+    // 与 WB/BuddyAi 池账号级冷却、两池模型级冷却均不在覆盖面，用户点「清除冷却」
+    // 后 429 冷却的账号×模型对依然生效（只能等 TTL 最长 7 天或重启网关）
     let mem_count = {
         let guard = runtime
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
-            Some(rt) => rt.shared.pool.clear_cooldowns(),
+            Some(rt) => {
+                let mut n = rt.shared.pool.clear_cooldowns();
+                n += rt.shared.wb_pool.clear_cooldowns();
+                n += rt.shared.buddy_ai_pool.clear_cooldowns();
+                // 模型级冷却两表（F-34，CN/Intl 独立实例）
+                for tbl in [
+                    &rt.shared.model_cooldowns,
+                    &rt.shared.buddy_ai_model_cooldowns,
+                ] {
+                    let mut m = tbl.lock().unwrap_or_else(|e| e.into_inner());
+                    n += m.len();
+                    m.clear();
+                }
+                // 账号×模型冷却两表（issue #206，CN/Intl 独立实例）
+                for tbl in [
+                    &rt.shared.wb_account_model_cooldowns,
+                    &rt.shared.buddy_ai_account_model_cooldowns,
+                ] {
+                    let mut m = tbl.lock().unwrap_or_else(|e| e.into_inner());
+                    n += m.len();
+                    m.clear();
+                }
+                n
+            }
             None => 0,
         }
     };
@@ -2004,6 +2030,146 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
         ));
     }
 
+    // 预对齐（issue #201）：发起 ExchangeToken 前，先从 TRAE IDE 本地登录态捕获最新 JWT。
+    // 背景：IDE 自身会定期续期并轮换 refresh_token（issue #126 复盘），IDE 每轮换一次，
+    // vault 中的旧 rt 即被服务端作废——这正是「48h 窗口内刷新失败(20101)」的主因。
+    // capture 通路只回写 JWT 不带 rt（update_account_jwt 不传 refresh_token），因此做两层补救：
+    //   a) IDE JWT 更新且余量 >48h：直接沿用 IDE 凭证，免 ExchangeToken 免轮换（缩小互踢冲突面）；
+    //   b) IDE JWT 更新但余量 ≤48h：vault 至少持有 IDE 最新 JWT（可继续服务签到），
+    //      再尝试 ExchangeToken（rt「可能轮换」，试了才知道；失败则如实置 invalid，
+    //      交由 try_recover_from_local / 重新 OAuth 登录恢复）。
+    // 防降级由 update_account_jwt_and_refresh 内置（新 exp ≤ 旧 exp 跳过 JWT），不会写回更旧凭证。
+    // 预对齐可能整体替换 accounts（capture 已回写 IDE 最新 JWT），需在借用结束后写回；
+    // adopted（沿用免轮换）则提前 return，不触碰内存 accounts。
+    // 结构说明（issue #201 复审#5）：post_capture 延迟写回是借用约束必需（account
+    // 借用自 accounts，存活期不能重赋值）；日志数据在分支内直接取用，不设载体变量
+    let mut adopted_jwt: Option<String> = None;
+    let mut post_capture: Option<AccountsFile> = None;
+    let capture_result = crate::device_proxy::local_capture::capture_from_local(state);
+    if let Err(e) = &capture_result {
+        // 复审#3：capture 失败不再静默（Windows 内部目录失败仅进 proxy.log，非 Windows
+        // 恒 Err），app.log 补一条，排障时可区分「捕获失败」与「IDE 凭证未更新」
+        fs_utils::app_log(&state.data_dir, &format!("预对齐: 本地捕获失败: {e}"));
+    }
+    if capture_result.is_ok() {
+        let fresh = crate::vault::load_accounts(state);
+        if let Some(a) = fresh
+            .accounts
+            .iter()
+            .find(|a| a.user_id.as_deref() == Some(user_id))
+        {
+            let ide_exp = jwt::parse(&a.jwt).exp_timestamp;
+            let vault_exp = jwt::parse(&account.jwt).exp_timestamp;
+            let ide_newer = match (vault_exp, ide_exp) {
+                (Some(old), Some(new)) => new > old,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if ide_newer {
+                let remain_secs = ide_exp.unwrap_or(0) - chrono::Utc::now().timestamp();
+                let remain_h = remain_secs as f64 / 3600.0;
+                let a_name = a.name.clone();
+                let ide_jwt = a.jwt.clone();
+                if !force && remain_secs > TRAE_LAZY_REFRESH_MIN_SECS {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("预对齐 [{a_name}]: IDE 本地 JWT 更新（余量 {remain_h:.1}h），沿用免轮换（issue #201）"),
+                    );
+                    adopted_jwt = Some(ide_jwt);
+                } else {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("预对齐 [{a_name}]: IDE 本地 JWT 更新（余量 {remain_h:.1}h），以 IDE 最新 JWT 继续刷新（issue #201）"),
+                    );
+                }
+            }
+        }
+        // 审查修复（2026-11-18）：capture 已对全账号回写 IDE 最新 JWT，无论本账号
+        // adopted 还是继续 ExchangeToken，都必须以 capture 后的 vault 现值替换
+        // pre-capture 快照——否则 ExchangeToken 成功后的整体 save_accounts 会
+        // 回滚其他账号的凭证回写（复活 issue #201 要防的旧凭证问题）。
+        // capture 自带防降级（新 exp ≤ 旧 exp 跳过 JWT），本账号取 fresh 无回退风险；
+        // ide_newer=false 时 fresh 与快照对本账号等价，对其他账号则保住回写。
+        post_capture = Some(fresh);
+    }
+    if let Some(fresh) = post_capture {
+        accounts = fresh;
+    }
+    // adopted（IDE JWT 余量充足沿用免轮换）：提前返回，跳过 ExchangeToken 免轮换。
+    // 审查修复（2026-11-18，验证员双确认 major）：沿用路径的 JWT 同样「刚从 IDE 抓取、
+    // 必然有效」，完整刷新路径的三件收尾缺一不可——
+    //   a) SessionDead 等冷却解冻：renew_due_accounts_impl 对冷却账号不过滤，本路径是
+    //      冷却账号的唯一续期出口，不解冻则签到调度永久跳过（401 打上的永久冷却无自救）；
+    //   b) refresh_token_fails/invalid/auth_saved_at 复位：capture 通路不清理 invalid
+    //      标记（见上方 L1857 注释），不解除则 UI 恒显「已失效」误导用户；
+    //   c) LAST_SUCCESS_REFRESH：401 自愈 force 去重窗口依赖，缺失则同窗内重复全量刷新。
+    // 三步各自尽力而为（失败仅落日志），不阻断返回：JWT 已抓取成功，回滚无收益
+    if let Some(adopted) = adopted_jwt {
+        let reset_name = {
+            let mut fresh = crate::vault::load_accounts(state);
+            let found = fresh
+                .accounts
+                .iter_mut()
+                .find(|a| a.user_id.as_deref() == Some(user_id))
+                .map(|a| {
+                    a.refresh_token_fails = 0;
+                    a.refresh_token_invalid = false;
+                    a.auth_saved_at = Some(fs_utils::now_iso());
+                    a.name.clone()
+                });
+            if let Err(e) = crate::vault::save_accounts(state, &mut fresh) {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("预对齐: adopted 状态复位落盘失败: {e}"),
+                );
+            }
+            found
+        };
+        // 记录成功刷新时刻：供 401 自愈 force 路径并发去重（与完整刷新路径同义）
+        LAST_SUCCESS_REFRESH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(user_id.to_string(), std::time::Instant::now());
+        // 冷却自动解冻：同完整刷新路径（持 ACCOUNT_COOLDOWNS_LOCK 叶子锁，app_log 在锁外）
+        let thaw_entry = {
+            let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut cd: AccountCooldownsFile =
+                crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
+            let removed = cd.cooldowns.remove(user_id);
+            if removed.is_some() {
+                cd.updated_at = Some(fs_utils::now_iso());
+                if let Err(e) = crate::store::docs::account_cooldowns_save(
+                    &crate::store::db(&state.data_dir),
+                    &cd,
+                ) {
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("预对齐: adopted 冷却解冻落盘失败: {e}"),
+                    );
+                }
+            }
+            removed
+        };
+        if let (Some(name), Some(entry)) = (reset_name, thaw_entry) {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "JWT 刷新成功自动解冻 [{}]（原冷却类型={}，IDE JWT 沿用路径）",
+                    name, entry.error_type
+                ),
+            );
+        }
+        return Ok(adopted);
+    }
+    // 预对齐可能整体替换了 accounts（capture 已回写 IDE 最新 JWT），重新绑定当前账号
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|a| a.user_id.as_deref() == Some(user_id))
+        .ok_or("账号不存在")?;
+
     let refresh_token = account
         .refresh_token
         .as_ref()
@@ -2083,7 +2249,9 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
         account.refresh_token_invalid = false;
         account.auth_saved_at = Some(fs_utils::now_iso());
         // 若响应携带 refresh_token 过期时间则更新（兼容秒/毫秒两种时间戳）
-        if let Some(exp) = crate::fs_utils::dig(
+        // 审查补充（issue #201 复审#1）：key 列表源自 Buddy/Qoder 类推，dig 未命中时
+        // 落一条顶层键清单日志，便于用真实日志实测校准（与 oauth.rs 登录路径同源）
+        let rt_exp = crate::fs_utils::dig(
             &body,
             &[
                 "RefreshExpireAt",
@@ -2093,14 +2261,68 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
                 "refresh_expires_at_ms",
             ],
         )
-        .and_then(|v| v.as_i64())
-        {
+        .and_then(|v| v.as_i64());
+        if let Some(exp) = rt_exp {
             account.refresh_token_expires_at =
                 Some(if exp > 10_000_000_000 { exp / 1000 } else { exp });
+        } else if body.is_object() {
+            let top_keys: Vec<&str> = body
+                .as_object()
+                .map(|m| m.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            if !top_keys.is_empty() {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "[ExchangeToken-exchange键清单] {} 未命中 rt 过期字段，响应顶层键: {top_keys:?}",
+                        account.name
+                    ),
+                );
+            }
         }
         account.name.clone()
     };
-    crate::vault::save_accounts(&state, &mut accounts)?;
+    // 审查修复（2026-11-20，High，issue #201 窗口补齐）：2026-11-18 修复只覆盖了
+    // capture 窗口——`accounts` 在 capture 后重读一次，随后 ExchangeToken（网络调用，
+    // 秒级）期间 device_proxy 自动捕获 / OAuth 登录 / 他进程续期仍可能向 vault 写入
+    // 其他账号新凭证，整文件保存旧快照会回滚这些写入（旧凭证复活）。
+    // 写回前重读最新 vault，仅把本账号刚换发的凭证字段合并进最新视图；
+    // 本账号已被并发移除时跳过写回（复活已删除账号无意义）。
+    {
+        let mut fresh = crate::vault::load_accounts(state);
+        let merged = match fresh
+            .accounts
+            .iter_mut()
+            .find(|a| a.user_id.as_deref() == Some(user_id))
+        {
+            Some(a) => {
+                if let Some(cur) = accounts
+                    .accounts
+                    .iter()
+                    .find(|x| x.user_id.as_deref() == Some(user_id))
+                {
+                    a.jwt = cur.jwt.clone();
+                    a.refresh_token = cur.refresh_token.clone();
+                    a.updated_at = cur.updated_at.clone();
+                    a.refresh_token_fails = cur.refresh_token_fails;
+                    a.refresh_token_invalid = cur.refresh_token_invalid;
+                    a.auth_saved_at = cur.auth_saved_at.clone();
+                    a.refresh_token_expires_at = cur.refresh_token_expires_at;
+                }
+                true
+            }
+            None => {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("预对齐/刷新 [{user_id}]: 本账号已被并发移除，跳过凭证写回"),
+                );
+                false
+            }
+        };
+        if merged {
+            crate::vault::save_accounts(&state, &mut fresh)?;
+        }
+    }
     // 记录成功刷新时刻：供 401 自愈 force 路径并发去重（FORCE_REFRESH_DEDUP_SECS 窗内复用）
     LAST_SUCCESS_REFRESH
         .lock()

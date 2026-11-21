@@ -372,7 +372,7 @@ async fn live_mitm_case(tag: &str, upstream: Option<UpstreamProxy>) {
     roots
         .add(tokio_rustls::rustls::pki_types::CertificateDer::from(ca_der))
         .expect("导入代理 CA");
-    let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
     let tls_cfg = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("protocol versions")

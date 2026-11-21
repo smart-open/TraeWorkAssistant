@@ -100,6 +100,10 @@ pub struct WorkBuddyAccount {
     /// [{name, code, remain, size, expire_secs}]；None = 未取数或上游无明细）
     #[serde(default)]
     pub credits_packages: Option<Value>,
+    /// 账号级独立出口代理（P4 防风控）：http(s) 代理 URL（如 http://127.0.0.1:7890），
+    /// 签到/成长轮按账号单独构建 agent；None/空 = 直连。serde default 兼容旧池 JSON。
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -108,10 +112,12 @@ pub(super) struct WbPool {
     pub(super) accounts: Vec<WorkBuddyAccount>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct WorkBuddySettings {
     /// 启动自动补签（F-55）：启动时核验未签账号自动补签
-    #[serde(default)]
+    /// issue #220 P1：默认开启（default_true 仅作用于缺失字段——显式保存过
+    /// false 的用户不受影响）；Default 实现见下方手动 impl（与字段缺省对齐）
+    #[serde(default = "default_true")]
     pub auto_checkin: bool,
     /// 保活阈值（天）；0 = 每天无条件刷新全部带 refreshToken 账号
     #[serde(default)]
@@ -183,7 +189,8 @@ fn default_cli_guard() -> i64 {
 impl WorkBuddySettings {
     fn with_defaults() -> Self {
         Self {
-            auto_checkin: false,
+            // issue #220 P1：默认模板与新装缺省保持 auto_checkin=true
+            auto_checkin: true,
             keepalive_days: 0,
             lazy_refresh_hours: 24,
             growth_travel: true,
@@ -200,6 +207,15 @@ impl WorkBuddySettings {
             ui_click_x: 0,
             ui_click_y: 0,
         }
+    }
+}
+
+// issue #220 P1：kv_get 缺键回退 T::default()——此前 derive Default 会让新装用户
+// 的 auto_checkin=false 绕过字段级 serde default。手动实现与 with_defaults() 对齐，
+// 保证「缺键默认」与「缺字段默认」口径一致（均为开启）
+impl Default for WorkBuddySettings {
+    fn default() -> Self {
+        Self::with_defaults()
     }
 }
 
@@ -243,6 +259,20 @@ pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &
 /// 后台线程——托盘菜单回调运行在主线程，同步版会让 UI 事件循环（托盘/菜单
 /// 响应）最长卡 40s。同步版保持原语义供后台任务线程与同步时序测试使用。
 pub fn push_notify_bg(app: Option<AppHandle>, data_dir: std::path::PathBuf, title: &str, body: &str, event: crate::notify::NotifyEvent) {
+    push_notify_bg_on_done(app, data_dir, title, body, event, || ());
+}
+
+/// 带完成回调的后台推送（notify_account_state 冷却后置用）：on_done 统一在推送线程
+/// 结束时执行——notify_all 渠道成败仅内部记日志，这里无论成败都算「推送至少尝试过
+/// 一次」；被开关过滤未发起推送时不回调（调用方据此不进冷却，后续状态跃迁可重试）。
+pub fn push_notify_bg_on_done(
+    app: Option<AppHandle>,
+    data_dir: std::path::PathBuf,
+    title: &str,
+    body: &str,
+    event: crate::notify::NotifyEvent,
+    on_done: impl FnOnce() + Send + 'static,
+) {
     let Some(channels) = resolve_notify_channels(&data_dir, event) else {
         return;
     };
@@ -250,6 +280,7 @@ pub fn push_notify_bg(app: Option<AppHandle>, data_dir: std::path::PathBuf, titl
     let body = body.to_string();
     std::thread::spawn(move || {
         crate::notify::notify_all(app.as_ref(), &data_dir, &title, &body, &channels);
+        on_done();
     });
 }
 
@@ -266,6 +297,10 @@ fn resolve_notify_channels(
     let on = match event {
         crate::notify::NotifyEvent::CheckinDone => s.notify_on_checkin,
         crate::notify::NotifyEvent::TaskFail => s.notify_on_task_fail,
+        // issue #222：定时任务完成推送（默认关，成功推送易耗尽 Server酱免费档每日 5 条）
+        crate::notify::NotifyEvent::TaskSuccess => s.notify_on_task_success,
+        // issue #220 P3：账号状态跃迁（需重登/Forbidden/积分耗尽）归入失败类推送
+        crate::notify::NotifyEvent::AccountState => s.notify_on_task_fail,
         crate::notify::NotifyEvent::Other => true,
     };
     if !on {
@@ -571,6 +606,26 @@ mod tests {
             r#"{"notify_enabled":true,"notify_on_checkin":false,"notify_on_task_fail":false,"notify_bark_url":"http://b","notify_webhook_url":"ftp://w","notify_serverchan_sendkey":"bad key"}"#,
         );
         push_notify(None, &dir, "标题", "内容", NotifyEvent::Other);
+        assert_sent(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TaskSuccess 独立开关（issue #222）：默认关（serde default → false）不推送；
+    /// 显式开启后推送
+    #[test]
+    fn push_notify_task_success_gated_by_own_switch() {
+        let dir = tmp_dir("task_success");
+        seed_app_settings(
+            &dir,
+            r#"{"notify_enabled":true,"notify_on_checkin":false,"notify_on_task_fail":false,"notify_bark_url":"http://b","notify_webhook_url":"ftp://w","notify_serverchan_sendkey":"bad key"}"#,
+        );
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::TaskSuccess);
+        assert_not_sent(&dir);
+        seed_app_settings(
+            &dir,
+            r#"{"notify_enabled":true,"notify_on_task_success":true,"notify_on_checkin":false,"notify_on_task_fail":false,"notify_bark_url":"http://b","notify_webhook_url":"ftp://w","notify_serverchan_sendkey":"bad key"}"#,
+        );
+        push_notify(None, &dir, "标题", "内容", NotifyEvent::TaskSuccess);
         assert_sent(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
