@@ -7,13 +7,18 @@
 //! - POST /alice/ug/campaign/v3/detail/          body {"campaign_group_code": group}
 //!   → data.progress.total_amount（累计获得额度 = 「总额度」口径）、
 //!     data.tasks[] task_kind=="daily_signin" 的 daily_checkin（今日已签/连续天数/上次日期）
-//!     与 task_status（magpie 口径：2=可领取，1=未满足条件/未投放）
+//!     与 task_status（**2026-11-21 活动改版双口径**：v3 新口径 1=未签到可签——客户端
+//!     实测未签态 daily_signin task_status=1、checked_in_today=false 后直签成功；旧
+//!     magpie 口径 2=可领取。按值分派提交端点，见 submit_endpoint_for）
+//! - POST /alice/ug/campaign/landing/checkin     body {"scene": group}（v3 活动客户端
+//!   真实提交端点，2026-11-21 抓包实锤：客户端点签到按钮即发此请求 → data.checked_in/
+//!   idempotent/reward_amount，直签成功不回「确认中」）
 //! - POST /alice/ug/campaign/item/reward/claim/  body {"task_id":"","campaign_group_code":group,
-//!   "campaign_item_code":"daily_signin"}
-//!   **旧端点 landing/checkin 对 HTTP 直调一律 710010702（system error = 端点选错的通用
-//!   拒绝非风控）**——即使带全套客户端抓包参数也一样；字段名红线 campaign_item_code
-//!   （写成 campaign_code 得 710010202 common invalid param）。领取动作被服务端限死在
-//!   豆包电脑版客户端：HTTP 直调即便端点正确也只会回 biz_error.code=3「领取结果确认中」。
+//!   "campaign_item_code":"daily_signin"}（旧口径 task_status=2 兼容路径）
+//!   历史（magpie 期）「landing/checkin 直调一律 710010702」结论是当时端点选错所致；
+//!   v3 下 landing/checkin 即正确端点，直调若仍被拒按 fail + detail 复查兜底处理。
+//!   字段名红线 campaign_item_code（写成 campaign_code 得 710010202 common invalid param）。
+//!   旧口径下领取被服务端限死在豆包电脑版客户端（HTTP 直调回 biz_error.code=3「确认中」）。
 //! msToken/a_bogus 为一次性反爬 token（CLI 无法生成），实测仅稳定 query 参数 + Cookie 即可通过。
 //! 红线：凭证等同密码，仅本地使用；仅执行官方签到动作，不做代刷、不做失败重试刷接口
 //! （高频无效写请求正是风控最敏感的模式，magpie 同款保守原则）。
@@ -38,6 +43,11 @@ const DETAIL_URL: &str = "https://www.doubao.com/alice/ug/campaign/v3/detail/?ve
 const CLAIM_URL: &str = "https://www.doubao.com/alice/ug/campaign/item/reward/claim/?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
 /// 领取路径（抓包参数可用时拼客户端真实 query）
 const CLAIM_BASE: &str = "https://www.doubao.com/alice/ug/campaign/item/reward/claim/";
+/// v3 活动提交端点（2026-11-21 抓包实锤：客户端在 pc_incentive_task_mvp_v3 下点签到
+/// 按钮发 POST landing/checkin，body 仅 {"scene":"pc_incentive_task_mvp_v3"}，直签成功）
+const LANDING_CHECKIN_URL: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
+/// v3 提交路径（抓包参数可用时拼客户端真实 query）
+const LANDING_CHECKIN_BASE: &str = "https://www.doubao.com/alice/ug/campaign/landing/checkin";
 /// 活动组读取端点（修复⑤：GET 语义但走 POST 空体，magpie session.json('/alice/user/launch',{}) 同形）
 const LAUNCH_URL: &str = "https://www.doubao.com/alice/user/launch?version_code=20800&language=zh&device_platform=web&aid=497858&real_aid=497858&pc_version=2.33.5&samantha_web=1&web_platform=desktop&use-olympus-account=1";
 const REFERER: &str = "https://www.doubao.com/pc/agent-explore";
@@ -430,6 +440,20 @@ fn parse_claim_outcome(body: &Value) -> (bool, bool, bool, String) {
     (false, false, false, "签到未生效（checked_in=false 且无 biz_error）".into())
 }
 
+/// 2026-11-21 活动改版：task_status → 提交端点分派。
+/// 返回 Some(true)=走 landing/checkin（v3 新口径 1=未签到可签，客户端实测形态）；
+/// Some(false)=走旧 item/reward/claim（旧 magpie 口径 2=可领取；task_status 字段缺失
+/// /旧形态响应 None 时保持旧流程兼容）；None=其余已知值确定性不可签（调用方 skip）。
+/// 判定依据：2026-11-21 proxy_req 抓包——客户端 v3/detail 未签态 daily_signin
+/// task_status=1 + checked_in_today=false，随后 landing/checkin 直签成功（reward 200）。
+fn submit_endpoint_for(task_status: Option<i64>) -> Option<bool> {
+    match task_status {
+        None | Some(2) => Some(false),
+        Some(1) => Some(true),
+        Some(_) => None,
+    }
+}
+
 // ── 修复④/② 当日 kv 标记（设计文档 §0.3 修复④：重试策略收敛）──
 // 用 SQLite kv 而非进程内静态：GUI 调度器与 schtasks CLI 双进程须同口径防重复提交；
 // 键内嵌当日日期（today_key 本地时区口径，同落库 day 键风格）自然失效，无需清理。
@@ -460,11 +484,13 @@ fn claim_rejected_mark(data_dir: &std::path::Path, uid: &str, day: &str) {
     }
 }
 
-/// 单账号一轮签到（launch 活动组 → detail 判定 → 未签则提交 item/reward/claim）。
+/// 单账号一轮签到（launch 活动组 → detail 判定 → 未签则按 task_status 分派提交端点：
+/// v3 口径 task_status=1 走 landing/checkin，旧口径 2 走 item/reward/claim）。
 /// probe = 客户端抓包参数（None 回退内置稳定参数）。
 /// 返回 outcome：status ∈ success | already | skip | fail
-/// （skip = 确定性不可签到：未投放/task_status≠2，落库但不进调度重试链，审查 #8）。
-/// 修复⑥：task_status!=2（未投放/未满足条件）时跳过提交——省掉注定失败的写请求。
+/// （skip = 确定性不可签到：未投放/不可签 task_status，落库但不进调度重试链，审查 #8）。
+/// 修复⑥（2026-11-21 改版）：task_status 分派见 submit_endpoint_for——v3 未签态
+/// task_status=1 是可签态（旧逻辑误判 skip 导致当日三账号全部漏签）。
 /// 修复③：claim 被拒/确认中时给出「豆包客户端点一下」明示（客户端手动签到会经
 /// 代理捕获链路按日落库，handler.rs try_capture_doubao_campaign 兜底闭环）。
 /// 修复④（重试策略收敛）：当日已有「提交类确定性拒绝」标记（claim 被拒/确认中）
@@ -567,20 +593,24 @@ pub fn run_one(
         });
     }
 
-    // ④ task_status 门槛（修复⑥，magpie 口径 2=可领取）：非 2 时提交必然「确认中」，
-    // 跳过写请求（风控最敏感高频无效提交），明示客户端领取路径。
-    // 审查 #6/#8：None（字段缺失/旧形态响应）放行保持旧流程兼容；已知非 2 数值
-    // （1=未满足条件/未投放等确定性不可领态）归 skip 不进重试链
+    // ④ task_status 门槛（2026-11-21 活动改版双口径）：旧逻辑「非 2 即 skip」把 v3
+    // 未签态（task_status=1）误判为不可领取——当天三个账号全部 skip 而客户端实际可签。
+    // 现按 submit_endpoint_for 分派：1 → landing/checkin（v3 客户端真实形态），
+    // 2/字段缺失 → 旧 item/reward/claim，其余已知值 → skip
     let task_status = detail.get("task_status").and_then(Value::as_i64);
-    if let Some(st) = task_status.filter(|s| *s != 2) {
-        return skip(
-            format!(
-                "今日签到暂不可领取（task_status={st}，非可领取态）——豆包按账号投放该活动；\
-                 若客户端能手动签到，请开启代理后在豆包客户端点一次，日志会捕获并按日落库"
-            ),
-            Some(&detail),
-        );
-    }
+    let use_landing = match submit_endpoint_for(task_status) {
+        Some(u) => u,
+        None => {
+            return skip(
+                format!(
+                    "今日签到暂不可领取（task_status={}，非可签/可领态）——豆包按账号投放该活动；\
+                     若客户端能手动签到，请开启代理后在豆包客户端点一次，日志会捕获并按日落库",
+                    task_status.unwrap_or(-1)
+                ),
+                Some(&detail),
+            );
+        }
+    };
 
     // ④′ 修复④：当日「提交类确定性拒绝」→ 只读复查不重试提交（对齐 magpie「提交
     // 一次、回查确认；没确认就当天只查不重提」）。detail 已签由 ③ already 兜住；
@@ -602,29 +632,36 @@ pub fn run_one(
         );
     }
 
-    // ⑤ 未签且可领取 → 提交 item/reward/claim（修复①端点 + 字段名红线）。
-    // 审查 #4（有意识取舍）：probe.checkin_query 回放到 claim 端点——a_bogus 一次性
+    // ⑤ 未签且可签 → 提交。v3（task_status=1）走 landing/checkin，body 仅
+    // {"scene": group}（2026-11-21 客户端抓包实锤形态）；旧口径走 item/reward/claim
+    // （字段名红线 campaign_item_code）。
+    // 审查 #4（有意识取舍）：probe.checkin_query 回放到提交端点——a_bogus 一次性
     // token 已在捕获侧剔除不入 vault（handler.rs 2026-10-29 审查修复），msToken 为
     // 会话级复用值非一次性（实测仅稳定 query + Cookie 即可通过）；24h 新鲜期到期整组
     // 弃用走内置稳定参数，回放窗口内失效属可接受残余风险
-    let claim_url = match probe {
-        Some(p) if !p.checkin_query.is_empty() => format!("{CLAIM_BASE}?{}", p.checkin_query),
-        _ => CLAIM_URL.to_string(),
+    let (submit_url, submit_body) = if use_landing {
+        let url = match probe {
+            Some(p) if !p.checkin_query.is_empty() => {
+                format!("{LANDING_CHECKIN_BASE}?{}", p.checkin_query)
+            }
+            _ => LANDING_CHECKIN_URL.to_string(),
+        };
+        (url, json!({ "scene": group }))
+    } else {
+        let url = match probe {
+            Some(p) if !p.checkin_query.is_empty() => format!("{CLAIM_BASE}?{}", p.checkin_query),
+            _ => CLAIM_URL.to_string(),
+        };
+        (
+            url,
+            json!({
+                "task_id": "",                       // daily_signin 无 task_id，空串为正确形态
+                "campaign_group_code": group,
+                "campaign_item_code": "daily_signin", // 字段名红线：campaign_item_code
+            }),
+        )
     };
-    let claim_res = post_json(
-        agent,
-        &claim_url,
-        sid,
-        sg,
-        ms,
-        &json!({
-            "task_id": "",                       // daily_signin 无 task_id，空串为正确形态
-            "campaign_group_code": group,
-            "campaign_item_code": "daily_signin", // 字段名红线：campaign_item_code
-        }),
-        ua_s,
-        device_cookies,
-    );
+    let claim_res = post_json(agent, &submit_url, sid, sg, ms, &submit_body, ua_s, device_cookies);
     // 修复④：提交类请求无论成败（含 pending/业务码/网络层失败）完成后计数 +1——
     // 上限口径是「已发出的提交尝试」；写失败落日志（计数丢失会让超限防线失效）
     if let Err(e) = crate::store::db(data_dir)
@@ -738,13 +775,27 @@ pub fn run_one(
                         });
                     }
                     let has_task = re.get("has_signin_task").and_then(Value::as_bool).unwrap_or(false);
+                    // 2026-11-21 排障：发奖端点 710010702 两层嫌疑——①抓包参数缺失/过期
+                    // （回退内置参数的形态已知被拒）；②账号级风控（客户端手动签到同报
+                    // 「签到失败」即为②，伪装 system error，通常 24h 内过期）。文案分层明示
+                    let probe_hint = if probe_own_fresh(data_dir, sid) {
+                        String::new()
+                    } else {
+                        // 文案覆盖两级回退（本账号键缺失时 load_campaign_probe 仍可能
+                        // 命中全局兜底 probe，未必是内置参数——2026-11-21 二轮审查修正）
+                        "本账号抓包参数缺失/已过期（本次使用回退参数：全局兜底或内置稳定参数，\
+                         设备指纹不对齐时发奖端点大概率被拒）——\
+                         请在豆包设置开启「签到前自动抓包」或开代理后用「以账号打开」刷新参数再重试；"
+                            .to_string()
+                    };
                     let hint = if has_task {
-                        "detail 有 daily_signin 任务但 claim 被拒——若客户端能手动签到，\
-                         请开启代理后在豆包客户端点一次，日志会捕获真实请求用于对齐"
+                        "detail 有 daily_signin 任务但提交被拒——若客户端能手动签到，\
+                         请开启代理后在豆包客户端点一次（日志会捕获并按日落库）；\
+                         若客户端同样报「签到失败」，为账号级风控（通常 24h 内过期后自愈，勿反复重试提交）"
                     } else {
                         "detail 无 daily_signin 任务项 → 该账号未加入当前签到活动（活动组不匹配或无资格）"
                     };
-                    return fail(format!("{e}；{hint}"), Some(&re));
+                    return fail(format!("{e}；{probe_hint}{hint}"), Some(&re));
                 }
             }
             fail(format!("签到提交：{e}"), Some(&detail))
@@ -1535,6 +1586,16 @@ mod doubao_checkin_tests {
         let b = json!({"code": 0, "data": {"task_status": 0}});
         let (ok, already, pending, msg) = parse_claim_outcome(&b);
         assert!(!ok && !already && !pending && msg.contains("未生效"));
+    }
+
+    #[test]
+    fn submit_endpoint_分派_20261121改版双口径() {
+        // 2026-11-21 抓包实锤：v3 未签态 task_status=1（旧逻辑误 skip 导致漏签）
+        assert_eq!(submit_endpoint_for(Some(1)), Some(true)); // landing/checkin
+        assert_eq!(submit_endpoint_for(Some(2)), Some(false)); // 旧 item/reward/claim
+        assert_eq!(submit_endpoint_for(None), Some(false)); // 字段缺失保持旧流程兼容
+        assert_eq!(submit_endpoint_for(Some(0)), None); // 其余已知值 → skip
+        assert_eq!(submit_endpoint_for(Some(3)), None);
     }
 
     // ── campaign_group_from_launch 返回语义（审查 #1：缺失 ≠ 显式空串）──

@@ -722,9 +722,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         return;
       }
       const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
-      // failed_empty_campaigns（活动未开始/不可用）为非用户可操作失败：与真实
-      // 失败分开计数，避免用户对无解失败反复重试（口径对齐 Rust 侧补签通知）
-      const empty = Math.max(0, num(ev.failed_empty_campaigns));
+      // skipped_empty_campaigns（无签到任务，2026-11-21 起 skip 非失败）：确定性
+      // 跳过单列计数，不计入 failed；人工「开始签到」轮次 >0 时页面弹框提示官网
+      //（口径对齐 Rust 侧 run_checkin_round）。旧字段 failed_empty_campaigns 兜底：
+      // 前端热更早于 Rust 重编译的过渡期，旧后端 done 仍带旧字段名，不兜底会误读 0
+      const empty = Math.max(0, num(ev.skipped_empty_campaigns) || num(ev.failed_empty_campaigns));
       // failed_blocked（风控信任未建立 BLOCKED，issue #190）恢复需用户操作
       // （切换账号 + 客户端建信任），单列提示操作路径，不混入可重试失败
       const blocked = Math.max(0, num(ev.failed_blocked));
@@ -744,15 +746,16 @@ export const useAppStore = create<AppState>((set, get) => ({
         qoderCheckin: { ...s.qoderCheckin, running: false, done, doneRev: s.qoderCheckin.doneRev + 1 },
       }));
       // 审查 Low：消费后端 failed_permanent（凭证终态失败，重试注定无效）——
-      // 可重试数 = failed - empty - permanent（口径对齐调度器 retryable 判定），
+      // 可重试数 = failed - permanent - blocked（口径对齐调度器 retryable 判定；
+      // empty 已归 skip 不在 failed 内，不参与扣减），
       // 文案明示其中哪些需重新登录/更新 PAT，防用户对终态失败反复手点重试；
       // 级别：含终态失败同样 warn（需要用户行动，不降级 success）
-      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - empty - blocked));
-      const retryable = failed - empty - permanent - blocked;
+      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - blocked));
+      const retryable = failed - permanent - blocked;
       get().pushToast(
         retryable > 0 || permanent > 0 || blocked > 0 ? 'warn' : 'success',
         `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
-          (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : '') +
+          (empty > 0 ? `（另有 ${empty} 项无签到任务，已跳过）` : '') +
           (ineligible > 0
             ? `（另有 ${ineligible} 个体验版账号未满足活动资格，开通试用/订阅/会员卡后可领取）`
             : '') +

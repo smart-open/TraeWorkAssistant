@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, Gift, PlayCircle, RefreshCw, XCircle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
-import { Badge } from '../../components/ui';
+import { Badge, Modal } from '../../components/ui';
 import CheckinCalendarCard from '../../components/CheckinCalendar';
 import { daysFromQoderRecords } from '../../components/checkinCalendarModel';
 import { api } from '../../lib/tauri';
@@ -54,6 +54,10 @@ export default function QoderCheckin() {
   const [refreshing, setRefreshing] = useState(false);
   // F-80-余 v2 档期日历：90 天签到结果（通用组件渲染；聚合在 checkinCalendarModel）
   const [history, setHistory] = useState<QoderCheckinRecord[]>([]);
+  // 无签到任务弹框（2026-11-21）：人工点击「开始签到」且本轮存在 empty_campaigns
+  // 跳过时弹出官网提示；静默补签/调度轮次不打扰（manualStartRef 区分入口）
+  const [emptyNoticeOpen, setEmptyNoticeOpen] = useState(false);
+  const manualStartRef = useRef(false);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -91,15 +95,37 @@ export default function QoderCheckin() {
   // 疑点⑦：进度事件由 store 归约（applyQoderCheckinLine），页面只按 doneRev 联动刷新
   // 账号列表/签到记录（skipped_busy 整轮跳过不递增 doneRev，不触发刷新——对齐原页面语义）
   useEffect(() => {
-    if (doneRev > 0) void refresh();
+    if (doneRev > 0) {
+      void refresh();
+      // 人工「开始签到」轮次含无签到任务跳过 → 弹框提示官网（done 与 doneRev 同批
+      // 写入 store，本 effect 拿到的 doneInfo 即本轮终值；调度/静默轮次不打扰）。
+      // 两类跳过都算「无签到任务」：empty=空活动表；skipped_ineligible=体验版不在
+      // 投放范围（服务端同样不下发活动，issue #223）——只看 empty 会漏弹后者
+      if (manualStartRef.current) {
+        manualStartRef.current = false;
+        if (doneInfo && (doneInfo.empty > 0 || doneInfo.skipped_ineligible > 0)) {
+          setEmptyNoticeOpen(true);
+        }
+      }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doneRev]);
+
+  // manualStartRef 悬挂防护（2026-11-21 审查）：轮次结束但 doneRev 未递增的两条路径
+  //（invoke 发起失败 / skipped_busy 整轮跳过——均无 done 计数事件）不会走上一 effect，
+  // 标记会悬挂到下一轮调度/静默 done 误弹「无签到任务」弹框。running 复位 false 时
+  // 兜底清标记；正常 done 路径上一 effect（声明序在前）已先复位，本 effect 为 no-op
+  useEffect(() => {
+    if (!running) manualStartRef.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
 
   const startCheckin = async () => {
     if (accounts.length === 0) {
       pushToast('warn', '账号池为空：请先在「账号管理」导入 PAT 或客户端账号');
       return;
     }
+    manualStartRef.current = true;
     // 连点自守/进度清理/失败置回均在 store 动作内（疑点⑦）
     await startQoderCheckin();
   };
@@ -129,8 +155,28 @@ export default function QoderCheckin() {
       return recs.some((r) => r.status === 'success') ? 'success' : 'already';
     }
     if (recs.some((r) => r.status === 'fail')) return 'fail';
-    // skip（体验版未满足活动资格，issue #223）：确定性跳过非失败，中性展示
+    // skip（体验版未满足活动资格，issue #223 / 无签到任务，2026-11-21）：确定性
+    // 跳过非失败，中性展示（徽标文案按 fail_kind 细分，见 skipKindOf）
     return recs.some((r) => r.status === 'skip') ? 'skip' : null;
+  };
+
+  // skip 细分：empty=无签到任务（fail_kind=empty_campaigns）/ ineligible=体验版
+  // 未满足资格。进行中读实时行 message 前缀（EMPTY_CAMPAIGNS_TAG），落库后读记录
+  // fail_kind 字段（历史记录无该字段回退 ineligible 文案）
+  const skipKindOf = (uid: string): 'empty' | 'ineligible' => {
+    const live = lines.find((l) => l.user_id === uid);
+    if (live && live.status === 'skip') {
+      // 两形态均属「无签到任务」：empty_campaigns=空活动表（消息前缀）；
+      // no_claimable_task=零可领+盲发全 miss（run_fallback 拼接后标记可能不在行首）
+      const msg = live.message ?? '';
+      return msg.startsWith('empty_campaigns') || msg.includes('no_claimable_task')
+        ? 'empty'
+        : 'ineligible';
+    }
+    const recs = checkinMap.get(uid) ?? [];
+    return recs.some((r) => r.status === 'skip' && r.fail_kind === 'empty_campaigns')
+      ? 'empty'
+      : 'ineligible';
   };
 
   const earned = Math.round(lines.reduce((s, l) => s + (l.reward ?? 0), 0) * 100) / 100;
@@ -217,7 +263,7 @@ export default function QoderCheckin() {
                         ) : st === 'already' ? (
                           <Badge tone="blue">已领（此前已领）</Badge>
                         ) : st === 'skip' ? (
-                          <Badge tone="slate">未满足资格</Badge>
+                          <Badge tone="slate">{skipKindOf(a.id) === 'empty' ? '无签到任务' : '未满足资格'}</Badge>
                         ) : (
                           <Badge tone="red">失败</Badge>
                         )}
@@ -263,7 +309,7 @@ export default function QoderCheckin() {
               <Badge tone="blue">运行中</Badge>
             ) : doneInfo ? (
               <Badge
-                tone={doneInfo.failed - doneInfo.empty > 0 || doneInfo.blocked > 0 ? 'amber' : 'green'}
+                tone={doneInfo.failed > 0 || doneInfo.blocked > 0 ? 'amber' : 'green'}
                 title={
                   doneInfo.blocked > 0
                     ? '「风控拦截」恢复需用户操作：在工具内切换到该账号后打开 Qoder 客户端使用一次建立信任，再手动重试（issue #190）'
@@ -271,7 +317,7 @@ export default function QoderCheckin() {
                 }
               >
                 完成：成功 {doneInfo.ok} · 已签 {doneInfo.already} · 失败 {doneInfo.failed}
-                {doneInfo.empty > 0 && `（含 ${doneInfo.empty} 项活动未开放）`}
+                {doneInfo.empty > 0 && `（另有 ${doneInfo.empty} 项无签到任务，已跳过）`}
                 {doneInfo.blocked > 0 && `（含 ${doneInfo.blocked} 项风控拦截）`}
                 {earned > 0 && ` · 获得 ${earned} Credits`}
               </Badge>
@@ -317,6 +363,32 @@ export default function QoderCheckin() {
         days={calDays}
         footnote="档期：0:00 每日签到刷新 · 10:00 登录奖励开窗 · 10:15 应用内调度"
       />
+
+      {/* 无签到任务弹框（2026-11-21）：仅人工「开始签到」轮次弹出（manualStartRef
+          区分入口），静默补签/调度/CLI 轮次直接跳过不打扰 */}
+      <Modal
+        open={emptyNoticeOpen}
+        onClose={() => setEmptyNoticeOpen(false)}
+        title="未发现签到任务"
+        footer={
+          <button className="btn-outline" onClick={() => setEmptyNoticeOpen(false)}>
+            知道了
+          </button>
+        }
+      >
+        <p>签到任务已经接入，当前未发现可执行的签到任务（活动未开放或账号不在投放范围），本轮已跳过。</p>
+        <p className="mt-2">
+          详情请查看官网：
+          <a
+            className="break-all text-sky-600 underline dark:text-sky-400"
+            href="https://docs.qoder.cn/events/100credits"
+            target="_blank"
+            rel="noreferrer"
+          >
+            https://docs.qoder.cn/events/100credits
+          </a>
+        </p>
+      </Modal>
     </div>
   );
 }

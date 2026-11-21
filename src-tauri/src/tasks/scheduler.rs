@@ -807,17 +807,12 @@ fn run_task(
             let opts = super::qoder_checkin::QoderCheckinOpts::daily();
             let done = super::qoder_checkin::run_checkin_round(st, &opts, runtime, &mut |_| {});
             // 审查 M-1：存在失败账号时返 Err，交调度器 30 分钟冷却重试（暂态失败自愈）。
-            // P2 重试口径：empty_campaigns（活动未上线/不可用）属非用户可操作失败，
-            // 计入重试只会全天无效重试 + 当日首败误报通知——按 failed - failed_empty_campaigns
-            // > 0 判定（对照 qoder_checkin::run_checkin_round 的设计注释）。done 事件恒携带
-            // 该字段；旧结构缺字段时 as_i64 为 None → 0，退回原口径，安全兼容
+            // P2 重试口径：永久性认证失败与 BLOCKED 从重试判定剔除；empty_campaigns
+            //（无签到任务）2026-11-21 起归类 skip、不计入 failed，天然豁免重试
+            //（对照 qoder_checkin::run_checkin_round 的设计注释）
             let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            let failed_empty = done
-                .get("failed_empty_campaigns")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
             // 审查 minor：永久性认证失败（pat_rejected/expired_needs_relogin/auth_dead）
-            // 重试注定失败，与 empty_campaigns 一并从重试判定剔除——否则失效账号
+            // 重试注定失败，从重试判定剔除——否则失效账号
             // 会拖动整轮全天约 28 次冷却重试（含每轮必败的刷新请求）
             // issue #223：未满足活动资格（体验版 skip）不计入 failed，自然豁免
             let failed_permanent = done
@@ -830,7 +825,7 @@ fn run_task(
                 .get("failed_blocked")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
+            if failed - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 return Err(format!(
@@ -1216,7 +1211,9 @@ fn summarize(v: &Value, task_key: &str) -> String {
             // 审查修复：skip（体验版未满足资格，issue #223）单列展示——否则
             // skip-only 轮次推送「成功 0，已签 0，失败 0」全 0 数字误导
             let mut s = format!("成功 {o}，{unit} {a}，失败 {f}");
-            if let Some(sk) = get("skipped_ineligible").filter(|x| *x > 0) {
+            // 跳过合计（未满足资格 + 无签到任务，均为确定性跳过非失败）
+            let sk = get("skipped_ineligible").unwrap_or(0) + get("skipped_empty_campaigns").unwrap_or(0);
+            if sk > 0 {
                 s.push_str(&format!("，跳过 {sk}"));
             }
             return s;

@@ -45,6 +45,9 @@ export default function DoubaoCheckin() {
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<ResultLine[]>([]);
   const [summary, setSummary] = useState<{ ok: number; failed: number; skipped: number; reward: number } | null>(null);
+  // 「获取额度」列数据源：uid → 今日签到获得额度（按日落库）。未签/失败/跳过为 0；
+  // 成功/已签展示实际奖励，回执无 reward（旧数据/捕获链路缺字段）按 200 展示
+  const [todayRewards, setTodayRewards] = useState<Record<string, number>>({});
 
   // 组件存活标记：切页卸载后终止批量签到循环（单账号 invoke 超时 600s，不守卫会后台继续发真实签到请求；
   // 重进页面是新实例、running 归零，不守卫还会造成并发双跑）
@@ -77,6 +80,19 @@ export default function DoubaoCheckin() {
       setAccounts(accs);
       setGroups(gs);
       setCalDays(daysFromDoubaoDetail(det));
+      const rewards: Record<string, number> = {};
+      for (const d of det) {
+        if (d.date !== today) continue;
+        for (const r of d.accounts) {
+          rewards[r.user_id] =
+            r.status === 'success' || r.status === 'already'
+              ? Number(r.reward) > 0
+                ? Number(r.reward)
+                : 200
+              : 0;
+        }
+      }
+      setTodayRewards(rewards);
     } catch (err) {
       if (!aliveRef.current) return;
       pushToast('error', `读取豆包账号失败：${String(err)}`);
@@ -316,7 +332,7 @@ export default function DoubaoCheckin() {
                     <th className="whitespace-nowrap px-3 py-2 text-left">账号</th>
                     <th className="whitespace-nowrap px-3 py-2 text-left">会话</th>
                     <th className="whitespace-nowrap px-3 py-2 text-left">今日</th>
-                    <th className="whitespace-nowrap px-3 py-2 text-left">额度</th>
+                    <th className="whitespace-nowrap px-3 py-2 text-left">获取额度</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -361,10 +377,12 @@ export default function DoubaoCheckin() {
                         </td>
                         <td className="whitespace-nowrap px-3 py-2">{todayBadge(a)}</td>
                         <td className="whitespace-nowrap px-3 py-2 text-xs tabular-nums">
-                          {a.quota_total != null ? (
-                            <span className="font-medium text-amber-600 dark:text-amber-400">{a.quota_total.toLocaleString()}</span>
+                          {(todayRewards[a.user_id] ?? 0) > 0 ? (
+                            <span className="font-medium text-amber-600 dark:text-amber-400">
+                              +{(todayRewards[a.user_id] ?? 0).toLocaleString()}
+                            </span>
                           ) : (
-                            <span className="text-slate-400">—</span>
+                            <span className="text-slate-400">0</span>
                           )}
                         </td>
                       </tr>

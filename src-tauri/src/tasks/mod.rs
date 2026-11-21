@@ -248,14 +248,10 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
             let opts = qoder_checkin::QoderCheckinOpts::daily();
             let done = qoder_checkin::run_checkin_round(state, &opts, None, &mut print_progress);
             // 审查 M-1：存在失败账号时返 Err（schtasks 退出码可见 + 通知渠道）。
-            // 口径对齐调度器（scheduler.rs 同款）：empty_campaigns（活动未上线/不可用）
-            // 属非用户可操作失败，不计失败——CLI 进程本身无 30min 冷却重试链，
-            // 重试由次日调度覆盖；done 事件恒携带该字段，旧结构缺字段时按 0 兜底
+            // 口径对齐调度器（scheduler.rs 同款）：empty_campaigns（无签到任务）
+            // 2026-11-21 起归类 skip、不计失败，任务签到直接跳过；CLI 进程本身
+            // 无 30min 冷却重试链，重试由次日调度覆盖
             let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            let failed_empty = done
-                .get("failed_empty_campaigns")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
             // 永久性认证失败与调度器口径对齐（scheduler.rs 同款）：重试注定失败，
             // 不计入 Err（否则失效账号让 schtasks 每日执行结果恒为失败）
             let failed_permanent = done
@@ -268,7 +264,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 .get("failed_blocked")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
+            if failed - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 Err(format!(

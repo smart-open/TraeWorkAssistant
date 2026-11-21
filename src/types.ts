@@ -2006,7 +2006,9 @@ export interface QoderCheckinDone {
   ok: number;
   already: number;
   failed: number;
-  /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
+  /** 无签到任务跳过数（empty_campaigns：活动未开放/账号不在投放范围）：
+   * 不计入 failed（口径对齐 Rust skipped_empty_campaigns，2026-11-21 起 skip）；
+   * 人工「开始签到」轮次 empty>0 时前端弹框提示官网 */
   empty: number;
   /** failed 中「风控信任未建立（BLOCKED）」数：恢复需用户操作（切换账号+客户端建信任），
    * 自动重试无效（issue #190，口径对齐 Rust 侧） */

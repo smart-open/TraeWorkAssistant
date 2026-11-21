@@ -185,16 +185,29 @@ fn append_results(state: &AppState, events: &[Value]) {
 
 // ── 签到主流程 ─────────────────────────────────────────────────────────────
 
-/// empty_campaigns 失败标记（结构化 fail_kind 的唯一产源标记）。
-/// 产源 = list_campaigns 空活动分支（message 以本常量开头）；诊断日志与 fail_kind
-/// 均按 `starts_with(EMPTY_CAMPAIGNS_TAG)` 派生——调整「：」后的展示文案不影响
-/// 统计，更换标记本身只需改本常量一处（勿在消费侧绕过常量硬编码前缀）。
+/// empty_campaigns 跳过标记（结构化 fail_kind 的唯一产源标记）。
+/// 产源 = list_campaigns 空活动分支（message 以本常量开头）；诊断日志、skip 归类
+/// 与 fail_kind 均按 `starts_with(EMPTY_CAMPAIGNS_TAG)` 派生——调整「：」后的展示
+/// 文案不影响统计，更换标记本身只需改本常量一处（勿在消费侧绕过常量硬编码前缀）。
+/// 分类口径（2026-11-21 升级）：无签到任务 = skip（非失败），静默/任务签到直接
+/// 跳过、人工路径前端弹框提示官网；fail_kind 字段保留用于前端区分徽标与计数。
 const EMPTY_CAMPAIGNS_TAG: &str = "empty_campaigns";
+
+/// 零可领任务标记（aggregate_fallback 产源）：盲发兜底全 miss 且**无真实失败**的
+/// 两种形态——①全部候选 409 CAMPAIGN_NOT_ACTIVE（活动未开放/批次过期）；②候选池
+/// 为空（learned 重学产空 + 硬编码表清空）。与 empty_campaigns（列表空表）同归
+/// 「无签到任务」skip 口径（2026-11-21 升级）：静默/任务签到直接跳过，人工路径
+/// 前端弹框提示官网。真实失败（fail_parts 非空：网络/5xx/BLOCKED 等）不带本标记，
+/// 保持 fail 重试语义（10:00 开窗前的调度冷却重试不受伤）。
+/// process_account 尾部按 contains 派生（run_fallback fail_ctx 会把详情拼在
+/// 原消息之后，前缀可能不再居首）。
+const NO_CLAIMABLE_TAG: &str = "no_claimable_task";
 
 /// 永久性认证失败标记（fail_kind 产源标记，与 EMPTY_CAMPAIGNS_TAG 同模式）：
 /// pat_rejected / expired_needs_relogin / auth_dead 前置拦截分支产出——
-/// 重试注定失败，调度器按 failed - failed_empty - failed_permanent -
-/// failed_blocked 判定是否冷却重试，避免全天约 28 轮无效重试（审查 minor）
+/// 重试注定失败，调度器/CLI 按 failed - failed_permanent - failed_blocked 判定
+/// 是否冷却重试（无签到任务已归 skip 不在 failed 内），避免全天约 28 轮无效
+/// 重试（审查 minor）
 const PERMANENT_AUTH_TAG: &str = "permanent_auth";
 
 /// 风控信任未建立标记（fail_kind 产源标记，与 EMPTY_CAMPAIGNS_TAG 同模式）：
@@ -275,11 +288,12 @@ fn list_campaigns(
 ) -> Result<Vec<Value>, (String, String)> {
     let campaigns = fetch_campaigns(state, agent, headers, urls)?;
     // ⚠ campaigns 为空 ≠ 已签：可能活动未开始 / Cosy-ClientType 缺失（本层
-    // 恒带）/ 接口结构变更——与「无可领项」显式区分，kind=fail 触发 UI 提示（§5.2）
+    // 恒带）/ 接口结构变更——与「无可领项」显式区分（2026-11-21 起上游空表
+    // 归 skip：无签到任务直接跳过，人工路径前端弹框提示官网）
     if campaigns.is_empty() {
         return Err((
             "fail".into(),
-            format!("{EMPTY_CAMPAIGNS_TAG}：活动列表为空（活动未开始或不可用）"),
+            format!("{EMPTY_CAMPAIGNS_TAG}：当前无签到任务（活动未开放或账号不在投放范围），已跳过"),
         ));
     }
     Ok(campaigns)
@@ -294,9 +308,8 @@ fn list_campaigns(
 /// `process_account` 的 Ok 分支内——空表走 Err，补学从未执行，故此处兜一层。
 ///
 /// 错误口径：复取自身失败（401 / 429 / 5xx / 网络）时**透传其错误**，不伪装成
-/// empty_campaigns——否则 401 进不了凭证刷新自愈，暂态故障还会被调度器按
-/// `failed_empty_campaigns` 排除当日重试。仅当复取同样为空表时才回退到首次的
-/// 空表错误。
+/// empty_campaigns——否则 401 进不了凭证刷新自愈，暂态故障还会被误归类为
+/// 无任务跳过（当日失去重试机会）。仅当复取同样为空表时才回退到首次的空表错误。
 ///
 /// 返回值第二项 = 列表是否来自最小头复取：调用方据此跳过 `learn_from_min_headers`
 /// 的重复补学（否则同一 token/头/URL 会立刻再 GET 一次）。
@@ -1057,9 +1070,19 @@ fn aggregate_fallback(
         return FallbackOutcome::AlreadyReplayed;
     }
     if !stale_parts.is_empty() {
-        return FallbackOutcome::Failed(stale_parts.join("；"), reward);
+        // 仅 stale（全候选 409 活动未开放/批次过期，无真实失败）：带无可领任务
+        // 标记——process_account 尾部据此归 skip（2026-11-21 无签到任务跳过口径），
+        // 详情保留在前端实时行与落库消息中供排障
+        return FallbackOutcome::Failed(
+            format!("{NO_CLAIMABLE_TAG}：{}", stale_parts.join("；")),
+            reward,
+        );
     }
-    FallbackOutcome::Failed("已知每日活动表为空，无兜底可尝试".into(), reward)
+    // 全空（learned 重学产空 + 硬编码表清空/全被白名单拦下）：同归无可领任务
+    FallbackOutcome::Failed(
+        format!("{NO_CLAIMABLE_TAG}：已知每日活动表为空，无兜底可尝试"),
+        reward,
+    )
 }
 
 /// 盲发单轮聚合中间态（纯数据，可单测）：一圈候选的归类结果，
@@ -1327,6 +1350,23 @@ fn fallback_with_relearn(
     outcome
 }
 
+/// run_fallback Failed 分支的消息合成（纯函数，可单测）。
+/// `fail_ctx = Some`：原消息优先（empty 前缀场景 skip 口径由 starts_with 派生；
+/// 真实失败场景必须**剥除**兜底 `NO_CLAIMABLE_TAG`——process_account 按 contains
+/// 归类，标记透传会把「reclaim 复核失败 409/网络异常 + 盲发全 miss」这类真实
+/// 失败误归无签到任务 skip（丢调度重试、丢失败推送），违背「真实失败掩码一切」
+/// 原则）；`None`：零 CLAIMABLE 路径，标记保留——本轮确无真实失败，skip 口径成立。
+fn compose_fallback_failed(fail_ctx: Option<(&str, &str)>, fm: &str) -> String {
+    match fail_ctx {
+        Some((_, m)) => {
+            let tag_prefix = format!("{NO_CLAIMABLE_TAG}：");
+            let detail = fm.strip_prefix(&tag_prefix).unwrap_or(fm);
+            format!("{m}；盲发试领全 miss：{detail}")
+        }
+        None => fm.to_string(),
+    }
+}
+
 /// 盲发兜底结果 → (kind, message, reward) 统一映射（4 处调用点共用）。
 /// `fail_ctx = Some((k, m))`：空表路径——Failed 维持原空表分类 `k`（根因仍是
 /// 列表不可见，fail_kind=empty_campaigns 语义不变：调度器当日重试排除 + 推送
@@ -1337,6 +1377,8 @@ fn fallback_with_relearn(
 /// 原分类 k 恒为 fail（复核消息在前），语义与空表路径同构）；`None`：零
 /// CLAIMABLE 路径——Failed 直接归 fail，不掩盖（2026-10-07 误报
 /// 「已领（此前已领）」修复点的延续口径）。
+/// Failed 消息合成收敛到 compose_fallback_failed（2026-11-21 无签到任务跳过
+/// 口径：fail_ctx 在场时剥除兜底 NO_CLAIMABLE_TAG，防真实失败误归 skip）。
 fn run_fallback(
     state: &AppState,
     agent: &ureq::Agent,
@@ -1353,8 +1395,8 @@ fn run_fallback(
         }
         FallbackOutcome::Auth(r) => ("auth".into(), "登录态失效（401）".into(), r),
         FallbackOutcome::Failed(fm, r) => match fail_ctx {
-            Some((k, m)) => (k.into(), format!("{m}；盲发试领全 miss：{fm}"), r),
-            None => ("fail".into(), fm, r),
+            Some((k, _)) => (k.into(), compose_fallback_failed(fail_ctx, &fm), r),
+            None => ("fail".into(), compose_fallback_failed(None, &fm), r),
         },
     }
 }
@@ -1809,11 +1851,23 @@ fn process_account(
             }
         }
     }
-    let status_txt = match kind.as_str() {
-        "success" => "success",
-        "already" => "already",
-        "skip" => "skip",
-        _ => "fail",
+    // 无签到任务归类 skip（2026-11-21 口径升级）：两种形态——①empty_campaigns
+    //（campaigns 空表）；②no_claimable_task（列表有条目但零 CLAIMABLE，盲发兜底
+    // 全 miss 且无真实失败，aggregate_fallback 产源标记）。静默签到（启动补签）/
+    // 任务签到（调度器 / schtasks CLI）直接跳过——不算失败、不进重试与失败推送，
+    // UI 中性展示；人工「开始签到」由前端按 done.skipped_empty_campaigns 弹框提示
+    // 官网。盲发兜底（issue #141）在此之前已试领，miss 才落到本分类，当日确实
+    // 无任务可领，skip 语义成立（对齐 issue #223 体验版跳过口径）
+    let status_txt = if message.starts_with(EMPTY_CAMPAIGNS_TAG) || message.contains(NO_CLAIMABLE_TAG)
+    {
+        "skip"
+    } else {
+        match kind.as_str() {
+            "success" => "success",
+            "already" => "already",
+            "skip" => "skip",
+            _ => "fail",
+        }
     };
     // 空活动列表诊断（脱敏：只记账号与结论，不含 token/响应原文）
     if message.starts_with(EMPTY_CAMPAIGNS_TAG) {
@@ -1840,12 +1894,15 @@ fn process_account(
     // fail_kind 字段，不再各自耦合 message 文案；前缀派生已收敛到
     // EMPTY_CAMPAIGNS_TAG 常量（与产源 list_campaigns 同源，改展示文案尾缀
     // 不破坏统计，换标记只动常量一处）
-    if kind == "skip" {
+    if message.starts_with(EMPTY_CAMPAIGNS_TAG) || message.contains(NO_CLAIMABLE_TAG) {
+        // 无签到任务跳过（2026-11-21 口径升级，含空表与零可领两形态）：status 已归
+        // skip，fail_kind 统一复用 EMPTY_CAMPAIGNS_TAG——前端徽标「无签到任务」与本轮
+        // done 计数（skipped_empty_campaigns）单源，无需区分产生形态
+        ev["fail_kind"] = json!(EMPTY_CAMPAIGNS_TAG);
+    } else if kind == "skip" {
         // 未满足活动资格（issue #223）：前端按 fail_kind 渲染中性徽标，
         // 与真正失败（红标/重试/推送）明确区分
         ev["fail_kind"] = json!(INELIGIBLE_TAG);
-    } else if message.starts_with(EMPTY_CAMPAIGNS_TAG) {
-        ev["fail_kind"] = json!(EMPTY_CAMPAIGNS_TAG);
     } else if message.contains(BLOCKED_NEED_TRUST_TAG) {
         // 风控信任未建立（issue #190）：BLOCKED 消息（盲发带「{账号名} 盲发失败：」
         // 前缀、直领为单条消息）按 contains 派生 fail_kind——调度器/启动补签据此
@@ -1901,7 +1958,7 @@ pub fn run_checkin_round(
         );
         let done = json!({
             "type": "done", "ok": 0, "already": 0, "failed": 0,
-            "failed_empty_campaigns": 0, "failed_permanent": 0, "failed_blocked": 0,
+            "skipped_empty_campaigns": 0, "failed_permanent": 0, "failed_blocked": 0,
             "skipped_busy": true,
         });
         emit(&done);
@@ -1959,21 +2016,20 @@ pub fn run_checkin_round(
 
     let ok = events.iter().filter(|e| e["status"] == "success").count();
     let already = events.iter().filter(|e| e["status"] == "already").count();
-    // skip（未满足活动资格，issue #223）单列：确定性跳过非失败——调度器/CLI
-    // 按 failed 字段判定重试与首败推送，failed 不含 skip 即自然豁免
-    let skipped_ineligible = events.iter().filter(|e| e["status"] == "skip").count();
-    let failed = events.len() - ok - already - skipped_ineligible;
-    // empty_campaigns 单列（审查 L-empty_campaigns）：活动未开始/不可用属非用户可操作
-    // 失败，启动补签推送按 failed - failed_empty_campaigns 判定，避免无效打扰。
-    // 判定读结构化 fail_kind 字段（process_account 产出），字段值取自
-    // EMPTY_CAMPAIGNS_TAG 常量，与产源/派生同源
-    let failed_empty_campaigns = events
+    // skip 总数单列：确定性跳过非失败——调度器/CLI 按 failed 字段判定重试与
+    // 首败推送，failed 不含 skip 即自然豁免。两类跳过细分（均读结构化 fail_kind，
+    // 与产源/派生同源）：ineligible=体验版未满足资格（issue #223）；
+    // empty=无签到任务（2026-11-21 口径升级，前端人工路径据此弹框提示官网）
+    let skipped_total = events.iter().filter(|e| e["status"] == "skip").count();
+    let skipped_empty = events
         .iter()
         .filter(|e| {
-            e["status"] == "fail"
+            e["status"] == "skip"
                 && e.get("fail_kind").and_then(Value::as_str) == Some(EMPTY_CAMPAIGNS_TAG)
         })
         .count();
+    let skipped_ineligible = skipped_total - skipped_empty;
+    let failed = events.len() - ok - already - skipped_total;
     // 永久性认证失败单列（审查 minor）：pat_rejected/expired_needs_relogin/auth_dead
     // 重试注定失败，调度器从重试判定中剔除，避免全天约 28 轮无效重试 + 必败刷新请求
     let failed_permanent = events
@@ -1994,7 +2050,7 @@ pub fn run_checkin_round(
         .count();
     let done = json!({
         "type": "done", "ok": ok, "already": already, "failed": failed,
-        "failed_empty_campaigns": failed_empty_campaigns,
+        "skipped_empty_campaigns": skipped_empty,
         "failed_permanent": failed_permanent,
         "failed_blocked": failed_blocked,
         "skipped_ineligible": skipped_ineligible,
@@ -2513,26 +2569,53 @@ mod tests {
             aggregate_fallback(false, true, &[], &[], &["stale".to_string()], None),
             FallbackOutcome::AlreadyReplayed
         ));
-        // 仅 stale → 如实 Failed（触发重试，重试轮次重学 id）；reward 无成功来源 → None
+        // 仅 stale → Failed 带 NO_CLAIMABLE_TAG（2026-11-21 无签到任务跳过口径：
+        // process_account 尾部据此归 skip）；reward 无成功来源 → None
         assert!(matches!(
             aggregate_fallback(false, false, &[], &[], &["stale".to_string()], None),
-            FallbackOutcome::Failed(m, None) if m.contains("stale")
+            FallbackOutcome::Failed(m, None) if m.contains("stale") && m.contains(NO_CLAIMABLE_TAG)
         ));
         // 真实失败掩码一切（含新鲜成功：宁 fail 不假 success）——但已领到的
         // reward 随行不丢弃（真实入账不因整体 fail 而回滚，对齐 Auth 语义）
         assert!(matches!(
             aggregate_fallback(true, false, &fresh, &["real fail".to_string()], &["stale".to_string()], Some(100.0)),
-            FallbackOutcome::Failed(m, Some(100.0)) if m.contains("real fail") && m.contains("盲发直领")
+            FallbackOutcome::Failed(m, Some(100.0)) if m.contains("real fail") && m.contains("盲发直领") && !m.contains(NO_CLAIMABLE_TAG)
         ));
         assert!(matches!(
             aggregate_fallback(false, true, &[], &["real fail".to_string()], &[], None),
             FallbackOutcome::Failed(m, None) if m.contains("real fail")
         ));
-        // 全空（表空/全被白名单拦下）→ Failed 兜底；空表 reward 必为 None（透传等价）
+        // 全空（表空/全被白名单拦下）→ Failed 带 NO_CLAIMABLE_TAG（同归无签到任务
+        // skip 口径）；空表 reward 必为 None（透传等价）
         assert!(matches!(
             aggregate_fallback(false, false, &[], &[], &[], None),
-            FallbackOutcome::Failed(m, None) if m.contains("表为空")
+            FallbackOutcome::Failed(m, None) if m.contains("表为空") && m.contains(NO_CLAIMABLE_TAG)
         ));
+    }
+
+    /// compose_fallback_failed（2026-11-21 无签到任务跳过口径回归）：
+    /// fail_ctx 在场时兜底 NO_CLAIMABLE_TAG 必须剥除——process_account 按 contains
+    /// 归类，透传会把「reclaim 复核失败（409/网络）+ 盲发全 miss」真实失败误归 skip；
+    /// fail_ctx = None 时标记保留（skip 口径产源）
+    #[test]
+    fn compose_fallback_failed_剥除兜底标记_20261121() {
+        // 真实失败 fail_ctx（issue #193 CLAIMED grant 复核 fail + 兜底全 miss）
+        let fm = format!("{NO_CLAIMABLE_TAG}：409 CAMPAIGN_NOT_ACTIVE ×2");
+        let m = compose_fallback_failed(Some(("fail", "复核失败：网络异常")), &fm);
+        assert!(m.contains("复核失败：网络异常") && m.contains("409 CAMPAIGN_NOT_ACTIVE"));
+        assert!(!m.contains(NO_CLAIMABLE_TAG), "真实失败不得携带兜底标记");
+        // empty_campaigns fail_ctx：原前缀保留（skip 由 starts_with 派生，标记剥除无影响）
+        let m2 = compose_fallback_failed(
+            Some(("fail", &format!("{EMPTY_CAMPAIGNS_TAG}：当前无签到任务"))),
+            &fm,
+        );
+        assert!(m2.starts_with(EMPTY_CAMPAIGNS_TAG) && !m2.contains(NO_CLAIMABLE_TAG));
+        // 无 fail_ctx：标记原样保留（零 CLAIMABLE 路径 skip 口径）
+        let m3 = compose_fallback_failed(None, &fm);
+        assert!(m3.contains(NO_CLAIMABLE_TAG));
+        // fm 未带标记前缀的防御形态：原样透传不 panic
+        let m4 = compose_fallback_failed(Some(("fail", "复核失败")), "表为空");
+        assert!(m4.contains("复核失败；盲发试领全 miss：表为空"));
     }
 
     /// filter_claimable：CLAIMABLE 大小写宽容 + 非 CLAIMABLE 全排除
