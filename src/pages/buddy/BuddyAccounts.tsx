@@ -83,6 +83,8 @@ export default function BuddyAccounts() {
   const importFileRef = useRef<HTMLInputElement>(null);
   const [editFor, setEditFor] = useState<WorkBuddyAccountView | null>(null);
   const [editName, setEditName] = useState('');
+  // P4 防风控：账号级独立出口代理（空 = 直连）
+  const [editProxyUrl, setEditProxyUrl] = useState('');
   // OAuth 扫码（F-50）：事件驱动弹框（后端全流程，进度经 wb-oauth-progress / 结果 wb-oauth-done）
   const [oauthOpen, setOauthOpen] = useState(false);
   const [oauthStage, setOauthStage] = useState('');
@@ -152,10 +154,16 @@ export default function BuddyAccounts() {
     return accounts.filter((a) => a.group_id === filter);
   }, [accounts, filter]);
 
+  // refreshSeqRef 序号守卫（对齐 BuddyApiService/BuddyAiApiService/QoderCheckin 范式）：
+  // OAuth done 事件、导入/删除后的自动刷新与手动刷新可三方并发，乱序 resolve 时
+  // 旧响应会覆盖新响应（刚导入的账号闪没）或提前解除 loading
+  const refreshSeqRef = useRef(0);
   const refresh = useCallback(async () => {
+    const seq = ++refreshSeqRef.current;
     setLoading(true);
     try {
       const accs = await api.workbuddy.accountsList();
+      if (seq !== refreshSeqRef.current) return;
       setAccounts(accs);
       // 分组列表（失败静默：过滤 chips 缺失不阻断列表）
       reloadGroups();
@@ -165,6 +173,7 @@ export default function BuddyAccounts() {
       api.workbuddy
         .creditsFetch()
         .then((r: WbCreditsResult) => {
+          if (seq !== refreshSeqRef.current) return;
           const m = new Map<string, WbCreditPackage[]>();
           for (const a of r.accounts) m.set(a.user_id, a.packages ?? []);
           setCredits(m);
@@ -173,15 +182,22 @@ export default function BuddyAccounts() {
           if (accs.some((a) => !a.edition_type)) {
             api.workbuddy
               .accountsList()
-              .then((fresh) => setAccounts(fresh))
+              .then((fresh) => {
+                if (seq !== refreshSeqRef.current) return;
+                setAccounts(fresh);
+              })
               .catch(() => {});
           }
         })
-        .catch(() => pushToast('warn', '积分缓存查询失败，积分包列为空'));
+        .catch(() => {
+          if (seq !== refreshSeqRef.current) return;
+          pushToast('warn', '积分缓存查询失败，积分包列为空');
+        });
       // 今日签到状态（失败静默，不阻断列表）
       api.workbuddy
         .checkinResults(1)
         .then((recs: WbCheckinRecord[]) => {
+          if (seq !== refreshSeqRef.current) return;
           const today = new Date();
           const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
           const m = new Map<string, WbCheckinRecord>();
@@ -192,13 +208,15 @@ export default function BuddyAccounts() {
           setCheckinMap(m);
         })
         .catch(() => {
+          if (seq !== refreshSeqRef.current) return;
           setCheckinMap(new Map());
           pushToast('warn', '今日签到状态查询失败');
         });
     } catch (err) {
+      if (seq !== refreshSeqRef.current) return;
       pushToast('error', `读取账号失败：${String(err)}`);
     } finally {
-      setLoading(false);
+      if (seq === refreshSeqRef.current) setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -356,13 +374,15 @@ export default function BuddyAccounts() {
   const handleEdit = (a: WorkBuddyAccountView) => {
     setEditFor(a);
     setEditName(a.nickname);
+    setEditProxyUrl(a.proxy_url ?? '');
   };
 
   const confirmEdit = async () => {
     if (!editFor) return;
     setEditBusy(true);
     try {
-      await withMinDelay(api.workbuddy.accountSave(editFor.id, editName || undefined, undefined), 1000);
+      // proxyUrl 始终回传当前输入（空串=清空回直连；后端校验 http(s):// 前缀）
+      await withMinDelay(api.workbuddy.accountSave(editFor.id, editName || undefined, undefined, editProxyUrl.trim()), 1000);
       setEditFor(null);
       await refresh();
       pushToast('success', '账号已更新');
@@ -840,6 +860,20 @@ export default function BuddyAccounts() {
             onChange={(e) => setEditName(e.target.value)}
             placeholder="账号显示名"
           />
+        </label>
+        <label className="mt-3 block text-sm">
+          <span className="mb-1 block text-xs font-medium text-slate-500">
+            独立出口代理（P4 防风控，留空 = 直连）
+          </span>
+          <input
+            className="input w-full"
+            value={editProxyUrl}
+            onChange={(e) => setEditProxyUrl(e.target.value)}
+            placeholder="http://127.0.0.1:7890"
+          />
+          <span className="mt-1 block text-xs text-slate-400">
+            该账号签到/成长请求经此代理出网，与其他账号出口隔离；需以 http:// 或 https:// 开头
+          </span>
         </label>
       </Modal>
 

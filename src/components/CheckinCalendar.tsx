@@ -24,12 +24,14 @@ export type { CheckinCalendarDay, CheckinCalendarEntry } from './checkinCalendar
 
 const STATUS_BADGE: Record<
   import('./checkinCalendarModel').CheckinCalendarEntry['status'],
-  { text: string; tone: 'green' | 'blue' | 'red' | 'amber' }
+  { text: string; tone: 'green' | 'blue' | 'red' | 'amber' | 'slate' }
 > = {
   success: { text: '已领', tone: 'green' },
   already: { text: '此前已领', tone: 'blue' },
   fail: { text: '失败', tone: 'red' },
   partial: { text: '部分失败', tone: 'amber' },
+  // 未满足活动资格（issue #223）：确定性跳过非失败，中性灰标
+  skip: { text: '未满足资格', tone: 'slate' },
 };
 
 export default function CheckinCalendarCard({
@@ -54,7 +56,9 @@ export default function CheckinCalendarCard({
   const [selectedDay, setSelectedDay] = useState<string | null>(null);
 
   const cal = useMemo(() => monthCells(calMonth.y, calMonth.m), [calMonth]);
-  const bounds = useMemo(() => monthBounds(new Date()), []);
+  // 边界随数据刷新重算（2026-11-21 审查修复）：卡片长驻页签跨月后，固定在挂载
+  // 时刻的 bounds 会让「下一月」可翻进超出 90 天回看窗口的空月（禁用逻辑失真）
+  const bounds = useMemo(() => monthBounds(new Date()), [days]);
   const canPrev = canShiftMonth(calMonth, bounds, -1);
   const canNext = canShiftMonth(calMonth, bounds, 1);
   const goMonth = (delta: number) => setCalMonth((cur) => shiftMonth(cur, delta));

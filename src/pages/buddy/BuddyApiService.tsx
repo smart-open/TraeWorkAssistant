@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, Save, Coins, ToggleLeft, Activity, Gauge } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner, StatCard } from '../../components/ui';
@@ -147,17 +147,43 @@ export default function BuddyApiService() {
   const [usage, setUsage] = useState<UsageDayView[]>([]);
   // WB 池实时状态（F-77⑤ 可观测：per-account inflight 在途计数）
   const [wbPool, setWbPool] = useState<PoolStatus[]>([]);
+  // 伪流式灰度（issue #213）：仅内存热切换、重启复位默认关；
+  // null = 服务未运行/读取失败（开关置灰、输入禁用），与指纹清洗开关同口径
+  const [pseudoEnabled, setPseudoEnabled] = useState<boolean | null>(null);
+  // 池级换号重试预算（0 = 旧行为：重试机会 = 池内账号数）
+  const [pseudoBudget, setPseudoBudget] = useState<number | null>(null);
+  // 伪流式等待期 keep-alive 间隔秒数（全局配置，两档共用；0 = 关闭，0–60）
+  const [pseudoKeepalive, setPseudoKeepalive] = useState<number | null>(null);
+  // 伪流式数值参数最近落库值（审查修复：onBlur 与「最近落库值」比较而非 state——
+  // 清空输入（Number("")=0）或改后回退原值时 state 已等于 clamped，按 state 判断会
+  // 漏保存导致前后端分叉；保存成功才记入 ref，与 BuddyAiApiService savedParamsRef 同范式）
+  const savedPseudoRef = useRef<{ budget: number | null; keepalive: number | null }>({
+    budget: null,
+    keepalive: null,
+  });
   // 审查 F1：账号列表加载失败态（null = 正常）——区分「成功但空」（空集引导）
   // 与「请求失败」（错误态），避免把读取失败误报成「暂无账号」
   const [accountsError, setAccountsError] = useState<string | null>(null);
+  // refresh 序号守卫（2026-11-21 审查修复，对齐 BuddyAiApiService refreshSeqRef 范式）：
+  // 挂载 effect、手动「刷新」与 saveFlags 成功后的池快照重取三方并发时，两个
+  // Promise.all 乱序 resolve，旧快照（含旧 wbFlags/wbUids/pool）覆盖新快照——
+  // 保存后的回显被回滚成保存前状态
+  const refreshSeqRef = useRef(0);
 
   const refresh = useCallback(async () => {
+    const seq = ++refreshSeqRef.current;
     setRefreshing(true);
     try {
       // 审查 F1：账号列表失败时返回 null（区别于「成功但空数组」）
       let accsErr: unknown = null;
+      // 审查修复（2026-11-21）：池配置加载失败补可见反馈（对齐 BuddyAi 页 FM-1）——
+      // 原静默置 null，用户无从分辨「未启用」与「加载失败」
+      let poolErr: unknown = null;
       const [pf, accs, cat, wbp, wbg, unified, tags] = await Promise.all([
-        api.apiServer.poolList().catch(() => null),
+        api.apiServer.poolList().catch((e) => {
+          poolErr = e;
+          return null;
+        }),
         api.workbuddy
           .accountsList()
           .catch((e) => {
@@ -170,6 +196,8 @@ export default function BuddyApiService() {
         api.apiServer.unifiedModels().catch(() => [] as UnifiedModel[]),
         api.tags.list().catch(() => [] as TagView[]),
       ]);
+      // 过期响应丢弃：新请求已发出，旧快照不得覆盖新回显（错误 toast 同口径）
+      if (seq !== refreshSeqRef.current) return;
       setPool(pf);
       setTagDefs(tags);
       if (accs === null) {
@@ -183,6 +211,9 @@ export default function BuddyApiService() {
       setCatalog(cat);
       setWbPool(wbp);
       setWbGroups(wbg);
+      if (pf === null) {
+        pushToast('error', `池配置加载失败：${String(poolErr)}`);
+      }
       setVendorMap(new Map(unified.filter((m) => m.vendor).map((m) => [m.id, m.vendor])));
       if (pf) {
         setWbFlags({
@@ -215,7 +246,7 @@ export default function BuddyApiService() {
     } catch (err) {
       pushToast('error', `读取资源状态失败：${String(err)}`);
     } finally {
-      setRefreshing(false);
+      if (seq === refreshSeqRef.current) setRefreshing(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -236,6 +267,74 @@ export default function BuddyApiService() {
   useEffect(() => {
     void loadTodayUsage();
   }, [loadTodayUsage]);
+
+  // 伪流式灰度回显（issue #213）：失败置 null（开关置灰按默认关展示），启动后点「刷新」可恢复。
+  // 并发守卫（2026-11-21 审查修复，对齐 BuddyAi 侧 refreshSeqRef 范式）：挂载与
+  // savePseudoParam 失败回调可能并发触发，慢的旧响应不得覆盖新回显
+  const pseudoSeqRef = useRef(0);
+  const loadPseudo = useCallback(async () => {
+    const seq = ++pseudoSeqRef.current;
+    try {
+      const [sw, budgets, ka] = await Promise.all([
+        api.apiServer.pseudoStreamSwitchesGet(),
+        api.apiServer.retryBudgetsGet(),
+        api.apiServer.pseudoKeepaliveGet(),
+      ]);
+      // 过期响应丢弃：新请求已发出，旧快照不得覆盖新回显
+      if (seq !== pseudoSeqRef.current) return;
+      setPseudoEnabled(sw.wb);
+      setPseudoBudget(budgets.wb);
+      setPseudoKeepalive(ka);
+      savedPseudoRef.current = { budget: budgets.wb, keepalive: ka };
+    } catch {
+      // 失败路径同口径：过期请求的失败不得清空新回显
+      if (seq !== pseudoSeqRef.current) return;
+      setPseudoEnabled(null);
+      setPseudoBudget(null);
+      setPseudoKeepalive(null);
+      savedPseudoRef.current = { budget: null, keepalive: null };
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadPseudo();
+  }, [loadPseudo]);
+
+  /** 伪流式开关热切换（issue #213）：乐观更新 + 失败回滚，即时生效无保存按钮 */
+  const togglePseudo = async (enabled: boolean) => {
+    const prev = pseudoEnabled;
+    setPseudoEnabled(enabled);
+    try {
+      await api.apiServer.pseudoStreamSwitchSet('wb', enabled);
+      pushToast(
+        'success',
+        `已${enabled ? '开启' : '关闭'}WB 池伪流式，下一条请求即生效`,
+      );
+    } catch (err) {
+      // 条件回滚（审查修复：快速连点+失败时陈旧 prev 会覆盖新状态——仅当 state
+      // 仍等于本次乐观值才回滚，其后已成功的切换不被乱序旧失败覆盖）
+      setPseudoEnabled((cur) => (cur === enabled ? prev : cur));
+      pushToast('error', `切换伪流式开关失败：${String(err)}`);
+    }
+  };
+
+  /** 伪流式数值参数（重试预算 / keep-alive 秒）保存：后端 clamp 归一，以热切换即生效 */
+  const savePseudoParam = async (kind: 'budget' | 'keepalive', value: number) => {
+    try {
+      if (kind === 'budget') {
+        await api.apiServer.retryBudgetSet('wb', value);
+        savedPseudoRef.current.budget = value;
+        pushToast('success', `已保存 WB 池重试预算（${value}，下一条请求即生效）`);
+      } else {
+        await api.apiServer.pseudoKeepaliveSet(value);
+        savedPseudoRef.current.keepalive = value;
+        pushToast('success', `已保存伪流式 keep-alive 间隔（${value} 秒，下一条请求即生效）`);
+      }
+    } catch (err) {
+      pushToast('error', `保存失败：${String(err)}`);
+      void loadPseudo();
+    }
+  };
 
   // 保存资源开关/调度参数/账号池白名单：uids/strategy/groups 原样回传（本页不改 Trae 池配置）；
   // WB 白名单随本次保存提交：未自定义传 null（后端保留原值，fail-open 语义不变，
@@ -269,7 +368,10 @@ export default function BuddyApiService() {
       // enabled_uids/strategy/groups，页面停留期间若他端（全局 API 管理弹窗等）
       // 改动了池配置，旧快照回传会覆盖回去——保存成功后立即同步最新快照收窄窗口
       try {
-        setPool(await api.apiServer.poolList());
+        const seq = ++refreshSeqRef.current;
+        const pf = await api.apiServer.poolList();
+        // 快照重取纳入 refresh 序号守卫：与并发 refresh 乱序 resolve 时旧值不得回滚新值
+        if (seq === refreshSeqRef.current) setPool(pf);
       } catch {
         /* 快照同步失败不阻塞保存结果，下次刷新自愈 */
       }
@@ -619,6 +721,108 @@ export default function BuddyApiService() {
                     </span>
                   </label>
                 ))}
+              </div>
+
+              {/* 伪流式灰度（issue #213）：仅内存热切换，重启复位默认关；开关样式对齐
+                  全局 API 管理「池级开关」范式——乐观更新 + 失败回滚，下一请求即生效 */}
+              <div className="mt-4">
+                <div className="mb-2 flex items-center gap-2">
+                  <ToggleLeft size={16} className="text-brand-500" />
+                  <span className="text-sm font-medium">伪流式灰度（issue #213）</span>
+                  <span className="text-xs text-slate-400">
+                    仅内存热切换 · 重启网关复位为关闭
+                  </span>
+                  <button
+                    onClick={() => void loadPseudo()}
+                    className="ml-auto shrink-0 rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-600 transition hover:bg-slate-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                  >
+                    刷新
+                  </button>
+                </div>
+                {pseudoEnabled === null && (
+                  <p className="mb-1 text-[11px] leading-4 text-amber-600 dark:text-amber-400">
+                    网关未运行或配置读取失败：已按默认（关闭）展示并置灰，启动 API 服务后点「刷新」即可操作
+                  </p>
+                )}
+                <label
+                  className={`flex items-start gap-2.5 rounded-md px-1.5 py-1 transition hover:bg-slate-100/60 dark:hover:bg-zinc-800/60 ${pseudoEnabled ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}
+                >
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                    checked={pseudoEnabled ?? false}
+                    disabled={pseudoEnabled === null}
+                    onChange={(e) => void togglePseudo(e.target.checked)}
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                      启用伪流式（WB 池）
+                    </span>
+                    <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                      开启后客户端流式请求内部走聚合管线，成功后合成 SSE 下发；上游断流可无损换号重试（issue #213）
+                    </span>
+                  </span>
+                </label>
+                <div className="mt-1.5 space-y-1">
+                  <div className="rounded-md px-1.5 py-1">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-xs text-slate-700 dark:text-zinc-200">换号重试预算</span>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          className="w-24 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+                          min={0}
+                          max={16}
+                          step={1}
+                          value={pseudoBudget ?? 0}
+                          disabled={pseudoBudget === null}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (Number.isFinite(v)) setPseudoBudget(Math.min(16, Math.max(0, v)));
+                          }}
+                          onBlur={() => {
+                            const clamped = Math.min(Math.max(Math.round(pseudoBudget ?? 0), 0), 16);
+                            setPseudoBudget(clamped);
+                            if (clamped !== savedPseudoRef.current.budget) void savePseudoParam('budget', clamped);
+                          }}
+                        />
+                        <span className="w-8 shrink-0 text-[11px] text-slate-400">次</span>
+                      </div>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                      单请求换号重试次数上限；0 = 旧行为（重试机会 = 池内账号数）；失焦保存，下一条请求即生效
+                    </p>
+                  </div>
+                  <div className="rounded-md px-1.5 py-1">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-xs text-slate-700 dark:text-zinc-200">keep-alive 间隔</span>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          className="w-24 rounded-md border border-slate-200 bg-transparent px-2 py-1 text-right text-xs tabular-nums focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900"
+                          min={0}
+                          max={60}
+                          step={1}
+                          value={pseudoKeepalive ?? 0}
+                          disabled={pseudoKeepalive === null}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (Number.isFinite(v)) setPseudoKeepalive(Math.min(60, Math.max(0, v)));
+                          }}
+                          onBlur={() => {
+                            const clamped = Math.min(Math.max(Math.round(pseudoKeepalive ?? 0), 0), 60);
+                            setPseudoKeepalive(clamped);
+                            if (clamped !== savedPseudoRef.current.keepalive) void savePseudoParam('keepalive', clamped);
+                          }}
+                        />
+                        <span className="w-8 shrink-0 text-[11px] text-slate-400">秒</span>
+                      </div>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                      伪流式聚合等待期向客户端发 SSE 注释帧的间隔（两档共用）；0 = 关闭；失焦保存，下一条请求即生效
+                    </p>
+                  </div>
+                </div>
               </div>
 
               {/* 调度参数（F-76②/③/F-77：数值热参数，保存即热生效） */}

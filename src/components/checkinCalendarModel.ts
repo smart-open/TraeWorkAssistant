@@ -12,7 +12,7 @@
 /** 单日明细行 */
 export interface CheckinCalendarEntry {
   name: string;
-  status: 'success' | 'already' | 'fail' | 'partial';
+  status: 'success' | 'already' | 'fail' | 'partial' | 'skip';
   note?: string;
 }
 
@@ -223,10 +223,18 @@ export function daysFromQoderRecords(recs: QoderCalRecord[]): CheckinCalendarDay
         recsA.find((r) => r.status === 'success') ??
         recsA.find((r) => r.status === 'already') ??
         recsA[0];
+      // skip（体验版未满足活动资格，issue #223）：确定性跳过非失败——不入 ok/fail
+      // 计数（该账号当日日格灰点），明细中性展示并保留跳过原因
       const status: CheckinCalendarEntry['status'] =
-        finalRec.status === 'success' ? 'success' : finalRec.status === 'already' ? 'already' : 'fail';
+        finalRec.status === 'success'
+          ? 'success'
+          : finalRec.status === 'already'
+            ? 'already'
+            : finalRec.status === 'skip'
+              ? 'skip'
+              : 'fail';
       if (status === 'fail') fail += 1;
-      else ok += 1;
+      else if (status !== 'skip') ok += 1;
       // 明细 note：最终态记录的逐活动摘要（auth 单独标注「登录态中断」）+ 失败原因
       const chips: string[] = [];
       for (const c of finalRec.campaigns ?? []) {
@@ -238,7 +246,7 @@ export function daysFromQoderRecords(recs: QoderCalRecord[]): CheckinCalendarDay
         const verb = c.kind ? CAMPAIGN_KIND_LABEL[c.kind] ?? c.kind : '';
         chips.push(`${label} ${verb}`.trim());
       }
-      const note = [...(status === 'fail' && finalRec.message ? [finalRec.message] : []), ...chips]
+      const note = [...((status === 'fail' || status === 'skip') && finalRec.message ? [finalRec.message] : []), ...chips]
         .filter(Boolean)
         .join(' · ');
       entries.push({ name: finalRec.name || finalRec.user_id, status, note: note || undefined });

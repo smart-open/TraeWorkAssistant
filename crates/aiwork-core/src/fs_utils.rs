@@ -117,13 +117,17 @@ pub fn parse_ts_loose(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    // 纯数字：按时间戳秒/毫秒解释（毫秒 ≥1e12）
+    // 纯数字：按时间戳秒/毫秒解释（毫秒 ≥1e12）。
+    // 下界过滤（第五轮审查修复）：全 0/极短数字串（字段漂移回 "0"）此前解析为
+    // 1970 年 → 恒被判陈旧 → 兜底轮反复触发；2001-09 之前视为非法回 None
     if s.chars().all(|c| c.is_ascii_digit()) {
         let n: f64 = s.parse().ok()?;
         return if n >= 1e12 {
             Some((n / 1000.0) as i64)
-        } else {
+        } else if n > 1_000_000_000.0 {
             Some(n as i64)
+        } else {
+            None
         };
     }
     let s = s.replace('Z', "+00:00").replace('/', "-");
@@ -233,6 +237,22 @@ pub fn app_log(data_dir: &Path, msg: &str) {
     {
         let _ = writeln!(f, "[{}] {}", now_ts(), msg);
     }
+}
+
+/// 无 data_dir 上下文的全局日志兜底（issue #224 移植：panic hook / 启动早期用）：
+/// `AIWORK_DATA_DIR` 优先（与 AppState::new 同源），未设置时回落默认根目录
+///（DEFAULT_DATA_ROOT/DATA_DIR_NAME，Windows 按进程当前盘符解析）。目录不可写
+/// 静默放弃——panic hook 内绝不能再 panic（写入失败吞错，不产生二次 panic）
+pub fn app_log_default(msg: &str) {
+    let root = std::env::var("AIWORK_DATA_DIR")
+        .ok()
+        .map(|v| std::path::PathBuf::from(v.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(crate::state::DEFAULT_DATA_ROOT)
+                .join(crate::state::DATA_DIR_NAME)
+        });
+    app_log(&root, msg);
 }
 
 // ── F-49：响应宽容解析（信封解包 + 递归键查找）────────────────────────────

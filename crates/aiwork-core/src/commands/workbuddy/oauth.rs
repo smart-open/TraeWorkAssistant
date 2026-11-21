@@ -317,7 +317,7 @@ fn oauth_flow(
                 if !t.is_empty() {
                     token = t;
                     refresh_token = as_str(fs_utils::dig(&body, &["refreshToken"])).unwrap_or_default();
-                    expires_in_s = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| v.as_i64());
+                    expires_in_s = super::common::expires_in_secs(fs_utils::dig(&body, &["expiresIn"]));
                     break;
                 }
             }
@@ -388,7 +388,11 @@ fn oauth_flow(
             if !edition.is_empty() {
                 a.edition_type = edition.clone();
             }
-            a.access_token_expires_at = exp_s;
+            // 2026-11-21 审查修复：资料端点静默失败且 JWT 无 exp 时 exp_s=None，
+            // 无条件覆盖会清掉既有到期时间（对齐 uid/nickname 等字段「非空才覆盖」口径）
+            if exp_s.is_some() {
+                a.access_token_expires_at = exp_s.clone();
+            }
             a.auth_saved_at = Some(now_s);
             a.needs_relogin = false;
             a.relogin_reason.clear();
@@ -435,8 +439,23 @@ fn oauth_flow(
                 creds["refresh_token"] = old_rt.clone();
             }
         }
+        // 2026-11-21 审查修复：expires_at_ms 同款 null 回填——上游未回 expiresIn 且
+        // JWT 无 exp 时构造为 null，or_insert 补不回（null 属「键存在」），整行 REPLACE
+        // 抹掉旧到期时间（惰性续期按缺失放行多续一次）
+        if creds.get("expires_at_ms").map(serde_json::Value::is_null).unwrap_or(false) {
+            if let Some(old_exp) = existing.get("expires_at_ms").filter(|v| !v.is_null()) {
+                creds["expires_at_ms"] = old_exp.clone();
+            }
+        }
         sink.upsert_token(state, &target_id, &creds)?;
     } else {
+        // 审查修复（第五轮，M2）：CN 分支同样持每账号刷新锁——与网关 401 自愈
+        //（refresh_access_token_for 持 refresh_lock_for 读旧凭证→轮换回写）并发时，
+        // 锁外 upsert 会让重扫码的旧 rt 覆盖刚轮换落库的新 rt（账号被迫重登）。
+        // upsert_token_store 内部为读改写合并语义，锁域罩住调用即可与 BuddyAi
+        // 分支（上方 M14 修复）同口径
+        let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
+        let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
         sink.upsert_token(state, &target_id, &creds)?;
     }
     fs_utils::app_log(
@@ -453,6 +472,17 @@ fn oauth_flow(
     // accounts.rs 的入池热重载同口径）。网关未注册（CLI 任务模式）静默跳过；
     // 极端竞态由池一致性巡检线程 60s 内兜底捕获
     crate::api_server::runtime::reload_pools_after_change(state);
+
+    // issue #220 P2：扫码重登自动补签——重登多因 token 失效/上游限制，当日签到
+    // 大概率失败或未跑；开关开启且当日未成功时后台补跑（轮次锁幂等互斥，撞锁/
+    // 关闭/已成功均静默跳过）。CN=单号补签；Intl=整轮打卡（已完成账号靠
+    // last_daily_chat 本地幂等早返回，秒级空过）
+    if matches!(sink, PoolSink::BuddyAi) {
+        super::buddy_ai::spawn_oauth_checkin_catchup_buddy_ai(state, &target_id);
+    } else {
+        super::checkin::spawn_oauth_checkin_catchup(state, &target_id, &label);
+    }
+
     emit_progress("success", &format!("账号「{label}」已扫码登录并自动入池"), None);
     Ok((target_id, label))
 }

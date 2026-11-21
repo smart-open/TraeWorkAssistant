@@ -31,6 +31,8 @@ pub struct WorkBuddyAccountView {
     pub relogin_reason: String,
     pub group_id: String,
     pub note: String,
+    /// 账号级独立出口代理（P4 防风控；None/空 = 直连）
+    pub proxy_url: Option<String>,
     pub credits_balance: Option<f64>,
     pub credits_fetched_at: Option<String>,
     /// 在线 = 本机 auth 文件当前生效账号（F-54 双态）
@@ -119,6 +121,7 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 relogin_reason: a.relogin_reason.clone(),
                 group_id: a.group_id.clone(),
                 note: a.note.clone(),
+                proxy_url: a.proxy_url.clone(),
                 credits_balance: a.credits_balance,
                 credits_fetched_at: a.credits_fetched_at.clone(),
                 is_current: auth_uid.is_some() && auth_uid == Some(a.uid.clone()),
@@ -134,7 +137,15 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
     Ok(views)
 }
 
-pub fn workbuddy_account_save(state: &AppState, user_id: String, name: Option<String>, note: Option<String>) -> Result<(), String> {
+pub fn workbuddy_account_save(
+    state: &AppState,
+    user_id: String,
+    name: Option<String>,
+    note: Option<String>,
+    // P4 防风控：账号级独立出口代理。None = 不变；Some("") = 清空回直连；
+    // Some(url) = 设置（仅接受 http(s)://，非法 URL 会让 http_agent_with_proxy 静默回退直连，故入口先拦）
+    proxy_url: Option<String>,
+) -> Result<(), String> {
     // 池读-改-写互斥（wb_pool_lock）：防与其他写点并发时旧副本整文档覆盖丢改动
     let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(state);
@@ -148,6 +159,24 @@ pub fn workbuddy_account_save(state: &AppState, user_id: String, name: Option<St
     }
     if let Some(n) = note {
         acct.note = n;
+    }
+    if let Some(p) = proxy_url {
+        let p = p.trim().to_string();
+        if p.is_empty() {
+            acct.proxy_url = None;
+        } else {
+            if !(p.starts_with("http://") || p.starts_with("https://")) {
+                return Err("代理地址需以 http:// 或 https:// 开头（如 http://127.0.0.1:7890）".to_string());
+            }
+            // 同源解析校验（审查修复）：与消费端 tasks/mod.rs http_agent_with_proxy
+            // 用同一 ureq::Proxy::new 解析器口径——前缀合法但畸形的 URL（缺端口/
+            // 主机非法等）此前照常落库，消费端解析失败静默回退直连，防风控形同
+            // 虚设；入口先以同一解析器拦下并把解析错误回显给前端
+            if let Err(e) = ureq::Proxy::new(&p) {
+                return Err(format!("代理地址无效（解析失败: {e}），请检查格式（如 http://127.0.0.1:7890）"));
+            }
+            acct.proxy_url = Some(p);
+        }
     }
     save_pool(state, &pool)
 }
@@ -616,8 +645,10 @@ pub fn workbuddy_refresh_token(
     };
     let new_access = as_str(fs_utils::dig(&body, &["accessToken"])).ok_or("刷新响应中无 accessToken")?;
     let new_refresh = as_str(fs_utils::dig(&body, &["refreshToken"]));
-    let expires_in: Option<i64> = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| v.as_i64());
-    let refresh_expires_in: Option<i64> = fs_utils::dig(&body, &["refreshExpiresIn"]).and_then(|v| v.as_i64());
+    // 审查修复（第五轮）：对齐 buddy-ai 续期路径——宽容解析 + 非法值过滤
+    //（0/负值/数字串形态此前会穿透算出过去时刻的 exp_ms 覆盖旧有效值）
+    let expires_in: Option<i64> = super::common::expires_in_secs(fs_utils::dig(&body, &["expiresIn"]));
+    let refresh_expires_in: Option<i64> = super::common::expires_in_secs(fs_utils::dig(&body, &["refreshExpiresIn"]));
     let now_ms = chrono::Utc::now().timestamp_millis();
     let exp_ms = expires_in.map(|s| now_ms + s * 1000);
     let rexp_ms = refresh_expires_in.map(|s| now_ms + s * 1000);
@@ -642,8 +673,10 @@ pub fn workbuddy_refresh_token(
         let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut pool = load_pool(state);
         if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == acct.id) {
-            a.access_token_expires_at = exp_ms.map(|m| m / 1000);
-            a.refresh_token_expires_at = rexp_ms.map(|m| m / 1000);
+            // 响应缺 expiresIn 时保留池内旧值（对齐 buddy-ai 续期路径 .or() 口径；
+            // 清成 None 会触发「无法判定就续」的多余轮换，可自愈故为低危）
+            a.access_token_expires_at = exp_ms.map(|m| m / 1000).or(a.access_token_expires_at);
+            a.refresh_token_expires_at = rexp_ms.map(|m| m / 1000).or(a.refresh_token_expires_at);
             a.needs_relogin = false;
             a.relogin_reason.clear();
             save_pool(state, &pool)?;

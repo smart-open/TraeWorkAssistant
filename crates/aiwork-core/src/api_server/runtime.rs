@@ -420,6 +420,15 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
         // buddy-ai 模型级冷却独立实例（§4.2：Intl 池冷却表独立，CN 侧模型故障
         // 不得冷却 Intl 池同型号，反之亦然）
         buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        // 账号×模型维度冷却（issue #206）：(uid, model) → 冷却截止 Unix 秒
+        wb_account_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_account_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        // WB/BuddyAi 伪流式与换号重试预算（issue #213，api_pool.json，serde default 兼容旧文件）
+        wb_pseudo_stream: std::sync::atomic::AtomicBool::new(pool_file.wb_pseudo_stream),
+        buddy_ai_pseudo_stream: std::sync::atomic::AtomicBool::new(pool_file.buddy_ai_pseudo_stream),
+        wb_retry_budget: std::sync::atomic::AtomicU32::new(pool_file.wb_retry_budget),
+        buddy_ai_retry_budget: std::sync::atomic::AtomicU32::new(pool_file.buddy_ai_retry_budget),
+        pseudo_keepalive_secs: std::sync::atomic::AtomicU64::new(pool_file.pseudo_keepalive_secs),
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -511,7 +520,12 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
             let trae_stale = shared2.pool.has_stale_credits();
             let wb_stale = shared2.wb_pool.has_stale_credits();
             let qoder_stale = shared2.qoder_pool.has_zero_or_expired_credits();
-            if !trae_stale && !wb_stale && !qoder_stale {
+            // 审查修复（2026-11-21）：buddy-ai 池保鲜缺席——上方 M3 修复已给该池
+            // 启用 reserve_credits（reserve 过滤依赖 credits_fetched_at 新鲜度），
+            // 快照陈旧时过滤 fail-open，低余额账号照样被调度秃号，与 Trae/WB/Qoder
+            // 三池「启动即拨新」口径不一致
+            let buddy_ai_stale = shared2.buddy_ai_pool.has_stale_credits();
+            if !trae_stale && !wb_stale && !qoder_stale && !buddy_ai_stale {
                 return;
             }
             fs_utils::app_log(&st2.data_dir, "API服务启动-积分保鲜: 检测到陈旧积分快照, 后台刷新中");
@@ -573,6 +587,20 @@ pub fn build_shared(state: &AppState) -> Arc<ApiSharedState> {
                     Err(e) => fs_utils::app_log(
                         &st2.data_dir,
                         &format!("API服务启动-积分保鲜: Qoder池刷新失败(不影响使用) {}", e),
+                    ),
+                }
+            }
+            if buddy_ai_stale {
+                // 拨新在 buddy_ai_credits_sync_impl 内部经 gateway_shared() 完成
+                // （账号记录回写 + 运行池三键拨新，注释见其函数尾段）
+                match crate::commands::workbuddy::buddy_ai_credits_sync_impl(&st2) {
+                    Ok(rows) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Buddy-AI池拨新完成 accounts={}", rows.len()),
+                    ),
+                    Err(e) => fs_utils::app_log(
+                        &st2.data_dir,
+                        &format!("API服务启动-积分保鲜: Buddy-AI池刷新失败(不影响使用) {}", e),
                     ),
                 }
             }

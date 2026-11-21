@@ -6,7 +6,7 @@
 //! 环境变量：
 //! - AIWORK_DATA_DIR     数据目录（默认 /data/AIWorkAssistant，Windows 按启动盘符解析；旧 %APPDATA%/XDG 数据首启自动复制迁移）
 //! - AIWORK_LISTEN_ADDR  监听地址（默认 127.0.0.1:{网关设置端口}；容器部署设 0.0.0.0:<port>）
-//! - AIWORK_WEB_DIST     前端构建产物目录（默认 web/dist）
+//! - AIWORK_WEB_DIST     前端构建产物目录（默认 dist/）
 //! - AIWORK_ADMIN_TOKEN  管理面 token（未设置时首启生成 conf/admin_token）
 //! - --task-run <name>   CLI 任务兜底（checkin / wb-checkin / wb-renew / refresh-credits，跑完即退）
 
@@ -35,6 +35,11 @@ mod admin;
 
 #[tokio::main]
 async fn main() {
+    // 全局 panic hook（issue #224 移植）必须最先安装（在任何可能 panic 的初始化之前），
+    // 兜底观测窗口覆盖整个进程生命周期（含 CLI 任务模式与 migrate 阶段）。服务端
+    // 容器部署有 stderr/容器日志，但崩溃日志落 app.log 后可与历史时间线交叉定位
+    install_panic_hook();
+
     // CLI 任务模式：--task-run <name> 直调单任务后退出（容器 exec / 手动兜底入口）
     let args: Vec<String> = std::env::args().collect();
     if let Some(task) = aiwork_core::tasks::parse_task_mode(&args) {
@@ -166,6 +171,40 @@ async fn main() {
     // 优雅退出：排空用量脏队列与 api_keys 计数（对齐桌面 do_stop 语义）
     shared.flush_pending_writes();
     fs_utils::app_log(&state.data_dir, "aiwork-server 已退出（用量/计数已落库）");
+}
+
+/// 全局 panic hook（issue #224 移植）：panic 默认输出仅到 stderr，容器部署下
+/// 若被运行时吞掉/丢弃则 app.log 戛然而止无任何线索。abort（panic 跨 FFI 边界
+/// 无法 unwind 被强制 abort、double panic）前也会先过本 hook，留痕后再终止。
+/// 记录：线程名 + panic 位置 + 消息 + 强制 backtrace（release 无符号时仍含帧
+/// 地址，可与报告的异常偏移直接对应做符号化）
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| info.payload().downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "<non-string payload>".to_string());
+        // 审查修复（#224 跟进，main 同步）：先落 app.log 再打 stderr——stderr 句柄
+        // 存在但无效时 print 宏写失败会在 hook 内二次 panic → double panic abort，
+        // 若文件先落盘则线索不丢；日志写入自身全吞错（fs_utils::app_log 无 panic 路径）
+        fs_utils::app_log_default(&format!("[PANIC] thread={thread} loc={loc} msg={msg}"));
+        eprintln!("[PANIC] thread={thread} loc={loc} msg={msg}");
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        if !bt.trim().is_empty() {
+            fs_utils::app_log_default(&format!("[PANIC] backtrace:\n{bt}"));
+            eprintln!("[PANIC] backtrace:\n{bt}");
+        }
+    }));
 }
 
 /// CSP 响应头中间件（9ba5fd0 移植，纵深防御）：仅对 HTML 文档响应下发——

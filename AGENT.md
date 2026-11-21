@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v1.6.5
+# AGENT.md — AI Work 助手 (ai-work-assistant) v1.6.6
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > **产品形态（2026-09 Web 化转型已落地）**：Web-only 单体——`crates/aiwork-core`（业务核心，零桌面依赖）+ `crates/aiwork-server`（axum：管理面 `/api/*` + 网关 `/v1/*` + 静态托管 + 调度器），浏览器直访，Docker 部署。桌面壳（Tauri/托盘/代理/切换器/豆包/CC Switch/更新器）已整体退役并删除 `src-tauri/`（git 历史归档）。转型决策与裁剪清单见 `docs/tmp/docker-headless-server-plan.md`（ADR-1~4）。
@@ -16,7 +16,7 @@ npm run dev
 
 # 后端
 cargo run -p aiwork-server       # 监听 127.0.0.1:7864；AIWORK_LISTEN_ADDR 可配；数据目录默认 /data/AIWorkAssistant（Windows 按启动盘符解析，AIWORK_DATA_DIR 可覆盖）
-cargo test --workspace           # Rust 单测（core 304+ / server 12+）
+cargo test --workspace           # Rust 单测（core 1000+ / server 13+）
 
 # 生产部署
 docker compose up -d --build     # 详见 docs/server-deploy.md
@@ -39,7 +39,7 @@ ai-work-assistant/
 ├── Cargo.toml                    # workspace（aiwork-core + aiwork-server）
 ├── package.json / vite.config.ts / tsconfig.json / tailwind.config.js / postcss.config.js / index.html
 ├── Dockerfile / docker-compose.yml / .dockerignore   # 部署
-├── docs/                         # server-deploy.md（部署）/ user-manual（手册）/ tech-framework（架构）/ product-design（设计）/ backlog（待办）/ tmp（转型计划）
+├── docs/                         # server-deploy.md（部署）/ user-manual（手册）/ tech-framework（架构）/ product-design（设计）/ backlog（待办）/ tmp（转型计划）/ pending（设计稿与复盘档案，随版本入库）
 ├── src/                          # 前端（复用桌面版页面骨架，lib/tauri.ts 单点适配 REST + WS/SSE 实时层）
 │   ├── App.tsx                   # 登录 gate（authed）+ Sidebar + 页面切换 + Toaster
 │   ├── store.ts                  # Zustand 单一真相（init/afterLogin/resetAuth + 401 全局拦截 + checkin SSE 归约）

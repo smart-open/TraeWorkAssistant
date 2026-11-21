@@ -54,6 +54,8 @@ import type {
   SanitizeSwitches,
   ToolAliasMapView,
   SanitizeTier,
+  PseudoStreamSwitches,
+  RetryBudgets,
   TagView,
   TraeExpiredEntsResult,
   TraeLongContextView,
@@ -501,6 +503,9 @@ export const api = {
     setConfig: (config: NotifyConfig) => invoke<NotifyConfig>('notify_config_set', { config }),
     // 用表单当前值直接发测试通知（不落盘，不校验总开关）
     test: (config: NotifyConfig) => invoke<NotifyResult>('notify_test', { config }),
+    /** 渠道最近一次推送结果（issue #222）：kv notify_last_result，按渠道 {ts, ok, err?, src?} */
+    notifyLastResult: () =>
+      invoke<Record<string, { ts: number; ok: boolean; err?: string; src?: string }>>('notify_last_result_get'),
   },
   // ---- IP 允许列表（Phase 3 T12a：应用层访问控制，覆盖网关与管理面）----
   ipAllowlist: {
@@ -655,6 +660,18 @@ export const api = {
     buddyAiPoolStatus: () => invoke<PoolStatus[]>('buddy_ai_pool_status'),
     /** 手动同步 Qoder 模型目录（复用每日调度任务入口；返回采纳模型数） */
     qoderCatalogSync: () => invoke<number>('api_qoder_catalog_sync'),
+    // ---- 池级伪流式开关 / 重试预算 / keep-alive 间隔（issue #213：仅内存热切换）----
+    // wb = Buddy CN 档（wb_pool）；buddy_ai = 国际档独立灰度；默认关，重启复位
+    pseudoStreamSwitchesGet: () => invoke<PseudoStreamSwitches>('pseudo_stream_switches_get'),
+    pseudoStreamSwitchSet: (pool: 'wb' | 'buddy_ai', enabled: boolean) =>
+      invoke<void>('pseudo_stream_switch_set', { pool, enabled }),
+    // 池级换号重试预算：0 = 旧行为（重试机会 = 池内账号数）；重启复位为配置文件值
+    retryBudgetsGet: () => invoke<RetryBudgets>('retry_budgets_get'),
+    retryBudgetSet: (pool: 'wb' | 'buddy_ai', value: number) =>
+      invoke<void>('retry_budget_set', { pool, value }),
+    // 伪流式等待期 keep-alive 间隔秒数：0–60，0 = 关闭；重启复位为配置文件值
+    pseudoKeepaliveGet: () => invoke<number>('pseudo_keepalive_get'),
+    pseudoKeepaliveSet: (secs: number) => invoke<void>('pseudo_keepalive_set', { secs }),
     logsList: () => invoke<string[]>('api_logs_list'),
     logsDetail: (date: string) => invoke<string | null>('api_logs_detail', { date }),
     logsSearch: (opts: {
@@ -936,8 +953,14 @@ export const api = {
   // ---- WorkBuddy（Web 版保留：账号/分组/签到/积分/设置/导入导出/OAuth/用量）----
   workbuddy: {
     accountsList: () => invoke<WorkBuddyAccountView[]>('workbuddy_accounts_list'),
-    accountSave: (userId: string, name?: string, note?: string) =>
-      invoke('workbuddy_account_save', { userId, name, note }),
+    // proxyUrl：undefined=不变，''=清空回直连（P4 账号级独立出口代理）
+    accountSave: (userId: string, name?: string, note?: string, proxyUrl?: string) =>
+      invoke('workbuddy_account_save', {
+        userId,
+        name: name ?? null,
+        note: note ?? null,
+        proxyUrl: proxyUrl ?? null,
+      }),
     accountMove: (userId: string, groupId: string | null) =>
       invoke('workbuddy_account_move', { userId, groupId }),
     groups: {

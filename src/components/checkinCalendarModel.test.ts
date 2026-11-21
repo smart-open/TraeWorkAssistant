@@ -252,6 +252,29 @@ describe('daysFromQoderRecords（Qoder 双活动记录 → 逐日聚合）', () 
     expect(days[0].entries[0].status).toBe('already');
   });
 
+  it('skip（体验版未满足资格，issue #223）：不入 ok/fail 计数，明细中性展示且 note 保留原因', () => {
+    const days = daysFromQoderRecords([
+      {
+        date: '2026-10-01', user_id: 'u1', name: 'A', status: 'skip',
+        message: '体验版账号不参与每日 100 Credits 活动（开通试用/订阅/会员卡后可领取）',
+      },
+      {
+        date: '2026-10-01', user_id: 'u2', name: 'B', status: 'success', reward: 100,
+        campaigns: [{ id: 'c1', name: '每日签到', kind: 'success' }],
+      },
+    ]);
+    // 混合日：skip 不计失败，成功照常计数；skip 行中性灰标 + 原因进 note
+    expect(days[0]).toMatchObject({ ok: 1, fail: 0 });
+    expect(days[0].entries[0].status).toBe('skip');
+    expect(days[0].entries[0].note).toContain('体验版账号不参与');
+    const [onlySkip] = daysFromQoderRecords([
+      { date: '2026-10-02', user_id: 'u1', name: 'A', status: 'skip' },
+    ]);
+    // 纯 skip 日：ok/fail 均为 0 → 灰点（非红非绿）
+    expect(onlySkip).toMatchObject({ ok: 0, fail: 0 });
+    expect(dayDotToneClass(onlySkip.ok, onlySkip.fail)).toBe('bg-slate-300 dark:bg-zinc-600');
+  });
+
   it('同日同账号多轮按最终态去重（调度+手动重试）：计数/明细不双计，先失败后成功不残留红点', () => {
     // 新→旧序：第一轮 fail（网络抖动），第二轮重试 success
     const days = daysFromQoderRecords([

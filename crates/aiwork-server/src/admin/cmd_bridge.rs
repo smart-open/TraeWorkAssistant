@@ -392,6 +392,26 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let enabled = arg(&args, "enabled")?;
             api_server_cmd::sanitize_switch_set(&pool, enabled).and_then(to_json)
         }
+        // 伪流式开关 / 换号重试预算 / keep-alive 间隔（issue #213 S7，移植 main 6f8a8cb）
+        "pseudo_stream_switches_get" => {
+            api_server_cmd::pseudo_stream_switches_get().and_then(to_json)
+        }
+        "pseudo_stream_switch_set" => {
+            let pool = arg::<String>(&args, "pool")?;
+            let enabled = arg(&args, "enabled")?;
+            api_server_cmd::pseudo_stream_switch_set(&pool, enabled).and_then(to_json)
+        }
+        "retry_budgets_get" => api_server_cmd::retry_budgets_get().and_then(to_json),
+        "retry_budget_set" => {
+            let pool = arg::<String>(&args, "pool")?;
+            let value = arg::<u32>(&args, "value")?;
+            api_server_cmd::retry_budget_set(&pool, value).and_then(to_json)
+        }
+        "pseudo_keepalive_get" => api_server_cmd::pseudo_keepalive_get().and_then(to_json),
+        "pseudo_keepalive_set" => {
+            let secs = arg::<u64>(&args, "secs")?;
+            api_server_cmd::pseudo_keepalive_set(secs).and_then(to_json)
+        }
         "api_logs_list" => to_json(api_server_cmd::api_logs_list(state)),
         "api_logs_detail" => {
             let date = arg(&args, "date")?;
@@ -561,7 +581,9 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let user_id = arg(&args, "user_id")?;
             let name_ = opt_arg(&args, "name")?;
             let note = opt_arg(&args, "note")?;
-            workbuddy::workbuddy_account_save(state, user_id, name_, note).and_then(to_json)
+            let proxy_url = opt_arg(&args, "proxy_url")?;
+            workbuddy::workbuddy_account_save(state, user_id, name_, note, proxy_url)
+                .and_then(to_json)
         }
         "workbuddy_account_move" => {
             let user_id = arg(&args, "user_id")?;
@@ -945,6 +967,7 @@ pub fn dispatch(admin: &AdminState, name: &str, args: Value) -> Result<Value, St
             let config = arg(&args, "config")?;
             Ok(aiwork_core::notify::notify_test(state, config))
         }
+        "notify_last_result_get" => Ok(aiwork_core::notify::notify_last_result_get(state)),
 
         // ==================== ip_allowlist（IP 允许列表，Phase 3 T12a） ====================
         "ip_allowlist_get" => to_json(super::ip_allow::config_get(state)),

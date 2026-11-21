@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { Save, RotateCcw, BellRing, Send, GripVertical } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Save, RotateCcw, BellRing, Send, GripVertical, RefreshCw } from 'lucide-react';
 import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
 import { THEMES } from '../lib/themes';
@@ -14,6 +14,21 @@ import type {
   NotifyResult,
   AppKey,
 } from '../types';
+
+/** 通知渠道 kv key → 面板展示名（最近推送回显用，issue #222） */
+const NOTIFY_CHANNEL_LABELS: Record<string, string> = {
+  bark: 'Bark',
+  // 键名对齐后端 notify.rs record_channel_result 写入的 webhook 键（原 wechat
+  // 键恒 miss，Webhook 推送记录被误过滤）；后端无 pushplus 写入，仅兜底展示
+  webhook: 'Webhook',
+  serverchan: 'Server酱',
+  pushplus: 'PushPlus',
+};
+
+/** 兼容旧主题值：light→graphite、dark→charcoal（挂载归一与保存比较共用同一映射） */
+function normalizeLegacyTheme(theme: SettingsType['theme']): SettingsType['theme'] {
+  return theme === 'light' ? 'graphite' : theme === 'dark' ? 'charcoal' : theme;
+}
 
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 通知渠道。
@@ -40,19 +55,61 @@ export default function GeneralSettingsPanel() {
   // 卸载兜底：window 级 pointermove/pointerup 监听器不随组件销毁自动移除，必须显式清理
   useEffect(() => () => dragCleanupRef.current?.(), []);
 
+  // 渠道最近一次推送结果（issue #222）：打开面板时加载，测试后刷新回显。
+  // docker 适配：无 Tauri 事件总线（main 经 notify-result-updated 事件实时刷新），
+  // 面板内真实推送不发生；但调度器定时推送可能发生在面板停留期间，加 30s 轮询
+  // 拉取兜底回显（卸载时清除定时器）
+  const [lastNotifyResult, setLastNotifyResult] = useState<
+    Record<string, { ts: number; ok: boolean; err?: string; src?: string }>
+  >({});
+  const loadLastNotifyResult = useCallback(() => {
+    api.notify
+      .notifyLastResult()
+      .then(setLastNotifyResult)
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
+    loadLastNotifyResult();
+    const timer = setInterval(loadLastNotifyResult, 30_000);
+    return () => clearInterval(timer);
+  }, [loadLastNotifyResult]);
+
   useEffect(() => {
     void refreshSettings();
   }, [refreshSettings]);
 
+  // 审查修复（第五轮）：form 是挂载时的单向快照——面板停留期间 settings 被他端
+  // 更新（另一浏览器 Tab / 系统弹框内其他面板保存 → refreshSettings 整体替换）时
+  // form 停留旧值，打开即误报「有未保存的更改」，且此时保存会把旧表单值逐字段
+  // 回写覆盖服务端新配置。以「上次同步来源快照」判断用户是否编辑过：form 仍等于
+  // 来源快照（未编辑）或来源未知（保存完成后）→ 跟随最新 settings 重置；已编辑
+  // 则尊重用户输入不动 form
+  const formSourceRef = useRef<SettingsType | null>(null);
   useEffect(() => {
-    if (settings && !form) {
-      // 兼容旧主题值：light→graphite、dark→charcoal
-      const theme = settings.theme === 'light' ? 'graphite' : settings.theme === 'dark' ? 'charcoal' : settings.theme;
-      setForm({ ...settings, theme });
-    }
-  }, [settings, form]);
+    if (!settings) return;
+    const theme = normalizeLegacyTheme(settings.theme);
+    const next = { ...settings, theme };
+    setForm((prev) => {
+      if (prev == null) {
+        formSourceRef.current = next;
+        return next;
+      }
+      const src = formSourceRef.current;
+      if (src == null || JSON.stringify(prev) === JSON.stringify(src)) {
+        formSourceRef.current = next;
+        return next;
+      }
+      return prev;
+    });
+    // 仅在 settings 变化时跟随；form 置于依赖会破坏「编辑中不被覆盖」语义
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings]);
 
-  const dirty = form != null && settings != null && JSON.stringify(form) !== JSON.stringify(settings);
+  // 审查修复（2026-11-21，脏标记误报）：form 挂载时对 theme 做旧值归一，而
+  // settings 保持原值——legacy light/dark 下 JSON 比较恒不相等，打开面板即显示
+  // 「有未保存的更改」。比较基线对 settings 做同款归一（dirty 与逐字段 patch 同源）
+  const savedBaseline = settings != null ? { ...settings, theme: normalizeLegacyTheme(settings.theme) } : null;
+  const dirty = form != null && savedBaseline != null && JSON.stringify(form) !== JSON.stringify(savedBaseline);
 
   const update = <K extends keyof SettingsType>(key: K, val: SettingsType[K]) => {
     setForm((prev) => (prev ? { ...prev, [key]: val } : prev));
@@ -165,39 +222,66 @@ export default function GeneralSettingsPanel() {
   };
 
   const save = async () => {
-    if (!form || !settings) return;
-    setSaving(true);
-    try {
-      // 审查修复（L35）：逐字段 diff，只把与已保存值不同的字段提交（saveSettings 即 patch 语义），不回传整份表单快照
-      const patch: Partial<SettingsType> = {};
-      (Object.keys(form) as (keyof SettingsType)[]).forEach((k) => {
-        if (JSON.stringify(form[k] ?? null) !== JSON.stringify(settings[k] ?? null)) {
-          (patch as Record<string, unknown>)[k] = form[k];
-        }
-      });
-      await withMinDelay(saveSettings(patch));
-      // 通知渠道（独立 kv）随底部保存统一持久化；设置成功而通知失败时单独报错
-      let notifyErr: string | null = null;
-      if (notifyForm && notifyDirty) {
-        try {
-          const saved = await withMinDelay(api.notify.setConfig(notifyForm));
-          setNotifyForm(saved);
-          setNotifyLoaded(saved);
-        } catch (e) {
-          notifyErr = e instanceof Error ? e.message : '保存失败';
-        }
-      }
-      if (notifyErr) toast('error', `设置已保存，但通知渠道保存失败：${notifyErr}`);
-      else toast('success', '设置已保存');
-    } catch {
-      /* toast 已发出 */
-    } finally {
-      setSaving(false);
+    if (!form || !savedBaseline) return;
+    // 审查修复（2026-11-21，L1）：无任何改动（设置 patch 为空且通知渠道未改）时
+    // 不再弹「设置已保存」假成功提示
+    const hasPatch = (Object.keys(form) as (keyof SettingsType)[]).some(
+      (k) => JSON.stringify(form[k] ?? null) !== JSON.stringify(savedBaseline[k] ?? null),
+    );
+    if (!hasPatch && !notifyDirty) {
+      toast('success', '设置无更改');
+      return;
     }
+    setSaving(true);
+    // 审查修复（2026-11-21，M3）：设置保存与通知渠道保存解耦——原实现
+    // saveSettings 抛错时直接进 catch，通知渠道保存被整体跳过且无任何提示，
+    // 用户改的 Bark/Webhook 配置无声丢失
+    let settingsErr = false;
+    if (hasPatch) {
+      try {
+        // 审查修复（L35）：逐字段 diff，只把与已保存值不同的字段提交（saveSettings 即 patch 语义），不回传整份表单快照
+        const patch: Partial<SettingsType> = {};
+        (Object.keys(form) as (keyof SettingsType)[]).forEach((k) => {
+          if (JSON.stringify(form[k] ?? null) !== JSON.stringify(savedBaseline[k] ?? null)) {
+            (patch as Record<string, unknown>)[k] = form[k];
+          }
+        });
+        await withMinDelay(saveSettings(patch));
+        // 第五轮审查修复：form 已持久化，来源快照置空——refreshSettings 回读的
+        // 最新 settings 到达时无条件重新对齐（含保存期间他端的并发更新）
+        formSourceRef.current = null;
+      } catch {
+        settingsErr = true; // 失败 toast 已由 saveSettings 发出
+      }
+    }
+    // 通知渠道（独立 kv）随底部保存统一持久化；两路失败分别报错不互相吞没
+    let notifyErr: string | null = null;
+    if (notifyForm && notifyDirty) {
+      try {
+        const saved = await withMinDelay(api.notify.setConfig(notifyForm));
+        setNotifyForm(saved);
+        setNotifyLoaded(saved);
+        // 保存成功后补一次最近推送刷新：保存期间发生的调度推送立即回显对齐
+        loadLastNotifyResult();
+      } catch (e) {
+        notifyErr = e instanceof Error ? e.message : '保存失败';
+      }
+    }
+    if (settingsErr && notifyErr) toast('error', `设置保存失败；通知渠道保存失败：${notifyErr}`);
+    else if (settingsErr) {
+      /* saveSettings 已报错，通知渠道若保存成功无需再提示 */
+    } else if (notifyErr) toast('error', `设置已保存，但通知渠道保存失败：${notifyErr}`);
+    else toast('success', '设置已保存');
+    setSaving(false);
   };
 
   const reset = () => {
-    if (settings) setForm({ ...settings });
+    if (settings) {
+      const next = { ...settings, theme: normalizeLegacyTheme(settings.theme) };
+      setForm(next);
+      // 撤销后 form 重新对齐当前 settings：回写来源快照，后续 settings 变化可继续跟随
+      formSourceRef.current = next;
+    }
     if (notifyLoaded) setNotifyForm(notifyLoaded);
   };
 
@@ -205,21 +289,30 @@ export default function GeneralSettingsPanel() {
   const [notifyForm, setNotifyForm] = useState<NotifyConfigType | null>(null);
   const [notifyLoaded, setNotifyLoaded] = useState<NotifyConfigType | null>(null);
   const [notifyTesting, setNotifyTesting] = useState(false);
-  const notifyDirty =
-    notifyForm != null && notifyLoaded != null && JSON.stringify(notifyForm) !== JSON.stringify(notifyLoaded);
+  // 读取失败可见化（2026-11-21 审查修复）：原先 catch 静默置 null，整个「通知渠道」
+  // 区块不渲染且无提示——用户无从分辨「未配置」与「读取失败」，也无法修改渠道
+  const [notifyLoadError, setNotifyLoadError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const loadNotifyConfig = useCallback(() => {
     api.notify
       .getConfig()
       .then((c) => {
         setNotifyForm(c);
         setNotifyLoaded(c);
+        setNotifyLoadError(null);
       })
-      .catch(() => {
+      .catch((e) => {
         setNotifyForm(null);
         setNotifyLoaded(null);
+        setNotifyLoadError(String(e));
       });
   }, []);
+
+  useEffect(() => {
+    loadNotifyConfig();
+  }, [loadNotifyConfig]);
+  const notifyDirty =
+    notifyForm != null && notifyLoaded != null && JSON.stringify(notifyForm) !== JSON.stringify(notifyLoaded);
 
   const testNotify = async () => {
     if (!notifyForm) return;
@@ -239,6 +332,7 @@ export default function GeneralSettingsPanel() {
       toast('error', e instanceof Error ? e.message : '测试发送失败');
     } finally {
       setNotifyTesting(false);
+      loadLastNotifyResult();
     }
   };
 
@@ -475,6 +569,20 @@ export default function GeneralSettingsPanel() {
         </div>
       </section>
 
+      {/* 通知渠道读取失败态：错误占位 + 重试（对齐 poolList/账号列表同类修复范式） */}
+      {!notifyForm && notifyLoadError && (
+        <section className="card p-4">
+          <div className="flex items-center gap-2">
+            <BellRing size={16} className="text-brand-500" />
+            <h3 className="font-medium">通知渠道</h3>
+          </div>
+          <p className="mt-2 text-sm text-red-500">通知渠道配置读取失败：{notifyLoadError}</p>
+          <button onClick={loadNotifyConfig} className="btn-outline mt-2">
+            <RefreshCw size={15} /> 重试
+          </button>
+        </section>
+      )}
+
       {/* 通知渠道（全部应用共用：Bark / Server酱 / Webhook；随底部「保存设置」统一保存） */}
       {notifyForm && (
         <section className="card p-4">
@@ -488,8 +596,8 @@ export default function GeneralSettingsPanel() {
             </button>
           </div>
           <p className="mb-3 text-xs text-slate-400">
-            签到完成 / 调度任务失败时推送到手机（Bark / Server酱）或自建 Webhook，对全部应用（Trae、WorkBuddy、Qoder、Buddy 国际版）共用，
-            未配置的渠道自动跳过；修改后点底部「保存设置」生效。
+            签到完成 / 调度任务失败 / 定时任务完成（默认关，仅签到/成长类奖励任务，快照/续期/同步类高频任务不推；注意 Server酱 免费档每日仅 5 条）时推送到手机（Bark / Server酱）或自建
+            Webhook，对全部应用（Trae、WorkBuddy、Qoder、Buddy 国际版）共用，未配置的渠道自动跳过；修改后点底部「保存设置」生效。
           </p>
           {/* 事件开关组：横排一条，与下方渠道输入视觉分离 */}
           <div className="mb-3 flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-slate-200/70 bg-slate-50/60 px-3.5 py-2.5 text-sm dark:border-zinc-700/50 dark:bg-zinc-800/30">
@@ -516,6 +624,17 @@ export default function GeneralSettingsPanel() {
                 onChange={(e) => setNotifyForm({ ...notifyForm, on_task_failed: e.target.checked })}
               />
               调度任务失败时通知
+            </label>
+            <label
+              className="flex items-center gap-2"
+              title="签到/成长类奖励任务成功完成时推送（快照/续期/目录同步类高频任务不推，避免刷屏并保护渠道额度）；Server酱 免费档每日仅 5 条"
+            >
+              <input
+                type="checkbox"
+                checked={notifyForm.on_task_success}
+                onChange={(e) => setNotifyForm({ ...notifyForm, on_task_success: e.target.checked })}
+              />
+              定时任务完成时通知
             </label>
           </div>
           <div className="grid gap-x-4 gap-y-3 text-sm sm:grid-cols-2">
@@ -549,6 +668,39 @@ export default function GeneralSettingsPanel() {
               />
             </div>
           </div>
+          {/* 最近推送状态（issue #222）：渠道失败此前只静默落 app.log，面板直接回显成败与原因。
+              仅展示当前仍配置的渠道（审查修复 #3：清空渠道后的陈旧条目不再误导）；「测试」
+              标记区分来源（审查修复 #7，src="test" 由 notify_test 写入）。docker 渠道集：
+              bark / webhook / serverchan（无 pushplus） */}
+          {Object.keys(lastNotifyResult).length > 0 && (
+            <div className="mt-3 rounded-lg border border-slate-200/70 bg-slate-50/60 px-3.5 py-2.5 text-xs dark:border-zinc-700/50 dark:bg-zinc-800/30">
+              <div className="mb-1 font-medium text-slate-500 dark:text-zinc-400">最近推送</div>
+              <div className="space-y-1">
+                {Object.entries(lastNotifyResult)
+                  .filter(([k]) => {
+                    const configured: Record<string, boolean> = {
+                      bark: Boolean(notifyForm.bark_url?.trim()),
+                      // 键名对齐后端写入的 webhook 键（原 wechat 键恒 miss，Webhook
+                      // 推送记录被误过滤）；pushplus 后端不写入，恒 false
+                      webhook: Boolean(notifyForm.webhook_url?.trim()),
+                      serverchan: Boolean(notifyForm.serverchan_sendkey?.trim()),
+                      pushplus: false,
+                    };
+                    return configured[k];
+                  })
+                  .map(([k, v]) => (
+                    <div key={k} className="flex flex-wrap items-baseline gap-x-2">
+                      <span className={v.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}>
+                        {NOTIFY_CHANNEL_LABELS[k] ?? k}
+                        {v.src === 'test' ? '（测试）' : ''} · {v.ok ? '成功' : '失败'}
+                      </span>
+                      <span className="text-slate-400 dark:text-zinc-500">{new Date(v.ts).toLocaleString()}</span>
+                      {!v.ok && v.err && <span className="text-slate-400 dark:text-zinc-500">{v.err}</span>}
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )}
         </section>
       )}
 

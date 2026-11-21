@@ -105,6 +105,71 @@ pub(crate) fn wb_auto_checkin_enabled(state: &AppState) -> bool {
     load_settings(state).auto_checkin
 }
 
+// ── OAuth 重登自动补签（issue #220 P2）───────────────────────────────────────
+
+/// 当日该账号签到状态（wb_checkin_results 当日最后一条记录；None = 无记录）
+fn wb_today_checkin_status(state: &AppState, aid: &str) -> Option<String> {
+    let root: Value =
+        crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    root.get("results")?
+        .as_array()?
+        .iter()
+        .filter(|r| {
+            r.get("user_id").and_then(Value::as_str) == Some(aid)
+                && r.get("date").and_then(Value::as_str) == Some(today.as_str())
+        })
+        .last()
+        .and_then(|r| r.get("status").and_then(Value::as_str).map(str::to_string))
+}
+
+/// OAuth 重登后单号补签：自动签到开启且当日记录非成功/已签时，后台单号补跑
+/// 一轮（完整轮次锁幂等互斥，撞锁静默放弃——当日调度/手动轮次仍会覆盖该账号）。
+/// 供 oauth.rs CN sink 调用；开关关闭/当日已成功直接返回，失败仅落日志不影响主流程。
+/// docker 适配：无 AppHandle/事件总线，补签进度不进前端 SSE，仅落 app_log；
+/// 结果可见性由签到结果页（wb_checkin_results）覆盖
+pub(crate) fn spawn_oauth_checkin_catchup(state: &AppState, target_id: &str, label: &str) {
+    if !wb_auto_checkin_enabled(state) {
+        return;
+    }
+    if matches!(
+        wb_today_checkin_status(state, target_id).as_deref(),
+        Some("success") | Some("already")
+    ) {
+        return;
+    }
+    let st = state.clone();
+    let target_id = target_id.to_string();
+    let label = label.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("wb-oauth-catchup".into())
+        .spawn(move || {
+            // 完整轮次锁在本线程内获取并持有至轮次结束（与 UI/调度轮次互斥）
+            let Ok(_round) = try_acquire_wb_round("oauth-catchup", &st.data_dir) else {
+                crate::fs_utils::app_log(
+                    &st.data_dir,
+                    &format!("wb: OAuth 补签跳过（{label}）：签到轮次锁被占用"),
+                );
+                return;
+            };
+            crate::fs_utils::app_log(
+                &st.data_dir,
+                &format!("wb: OAuth 重登后自动补签（{label}，{target_id}）"),
+            );
+            let opts = CheckinOpts {
+                uids: vec![target_id],
+                skip_checked: true,
+                skip_expired: true,
+                lazy_hours: 24,
+            };
+            // docker 适配：无事件总线，进度事件丢弃（结果落 wb_checkin_results 表）
+            wb_checkin::run_checkin_round(&st, &opts, &mut |_ev| {});
+        });
+    if let Err(e) = spawned {
+        crate::fs_utils::app_log(&state.data_dir, &format!("wb: OAuth 补签线程创建失败: {e}"));
+    }
+}
+
 /// NDJSON 事件转发（原 python 管线同款：emit 序列化 JSON 字符串，前端逐行 JSON.parse）。
 /// pub(crate)：issue #134 方案1（移植 main）——调度器后台轮次（wb-checkin/wb-growth）
 /// 同步接入事件管线，前端运行态不再只由 UI 点击驱动

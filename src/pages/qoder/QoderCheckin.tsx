@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, Gift, PlayCircle, RefreshCw, XCircle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
@@ -55,7 +55,13 @@ export default function QoderCheckin() {
   // F-80-余 v2 档期日历：90 天签到结果（通用组件渲染；聚合在 checkinCalendarModel）
   const [history, setHistory] = useState<QoderCheckinRecord[]>([]);
 
+  // refresh 序号守卫（2026-11-21 审查修复，对齐 BuddyApiService refreshSeqRef 范式）：
+  // doneRev 联动刷新与手动「刷新」并发时，两个 Promise.all 乱序 resolve，旧响应
+  // 覆盖新响应——刚签完的账号在表里短暂回显「未签」
+  const refreshSeqRef = useRef(0);
+
   const refresh = useCallback(async () => {
+    const seq = ++refreshSeqRef.current;
     setRefreshing(true);
     try {
       // 不做内层吞错：任一源失败走外层 catch 统一 toast，避免「静默空态无反馈」
@@ -63,6 +69,8 @@ export default function QoderCheckin() {
         api.qoder.accountsList(),
         api.qoder.checkinResults(90),
       ]);
+      // 过期响应丢弃：新请求已发出，旧快照不得覆盖新回显
+      if (seq !== refreshSeqRef.current) return;
       setAccounts(accs);
       setHistory(recs);
       const today = new Date();
@@ -78,7 +86,7 @@ export default function QoderCheckin() {
     } catch (err) {
       pushToast('error', `读取签到数据失败：${String(err)}`);
     } finally {
-      setRefreshing(false);
+      if (seq === refreshSeqRef.current) setRefreshing(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -122,13 +130,16 @@ export default function QoderCheckin() {
     return sum > 0 ? Math.round(sum * 100) / 100 : null;
   };
   const checkinStatusOf = (uid: string): 'success' | 'already' | 'fail' | 'skip' | null => {
-    const live = lines.find((l) => l.user_id === uid);
+    // find 不跳过稀疏空洞（hole 以 undefined 调用回调会 TypeError），与下方 filter 防御同口径
+    const live = lines.find((l) => l && l.user_id === uid);
     if (live) return live.status;
     const recs = checkinMap.get(uid) ?? [];
     if (recs.some((r) => r.status === 'success' || r.status === 'already')) {
       return recs.some((r) => r.status === 'success') ? 'success' : 'already';
     }
-    return recs.find((r) => r.status === 'fail') ? 'fail' : null;
+    if (recs.some((r) => r.status === 'fail')) return 'fail';
+    // skip（体验版未满足活动资格，issue #223）：确定性跳过非失败，中性展示
+    return recs.some((r) => r.status === 'skip') ? 'skip' : null;
   };
 
   const earned = Math.round(lines.reduce((s, l) => s + (l.reward ?? 0), 0) * 100) / 100;
@@ -198,7 +209,7 @@ export default function QoderCheckin() {
               ) : (
                 accounts.map((a) => {
                   const st = checkinStatusOf(a.id);
-                  const earn = lines.find((l) => l.user_id === a.id)?.reward ?? todayEarnedOf(a.id);
+                  const earn = lines.find((l) => l && l.user_id === a.id)?.reward ?? todayEarnedOf(a.id);
                   return (
                     <tr key={a.id} className="border-t border-slate-100 dark:border-zinc-800">
                       <td className="px-3 py-1.5">
@@ -215,7 +226,7 @@ export default function QoderCheckin() {
                         ) : st === 'already' ? (
                           <Badge tone="blue">已领（此前已领）</Badge>
                         ) : st === 'skip' ? (
-                          <Badge tone="amber">跳过</Badge>
+                          <Badge tone="slate">未满足资格</Badge>
                         ) : (
                           <Badge tone="red">失败</Badge>
                         )}
@@ -261,9 +272,11 @@ export default function QoderCheckin() {
               <Badge tone="blue">运行中</Badge>
             ) : doneInfo ? (
               <div className="flex flex-col items-end gap-1">
-                <Badge tone={doneInfo.failed - doneInfo.empty > 0 ? 'amber' : 'green'}>
+                {/* empty 已属 skip 非失败（后端新口径与 failed 不相交）：不再从
+                    failed 扣减判 tone，仅按真实失败数决定琥珀/绿 */}
+                <Badge tone={doneInfo.failed > 0 ? 'amber' : 'green'}>
                   完成：成功 {doneInfo.ok} · 已签 {doneInfo.already} · 失败 {doneInfo.failed}
-                  {doneInfo.empty > 0 && `（含 ${doneInfo.empty} 项活动未开放）`}
+                  {doneInfo.empty > 0 && `（另有 ${doneInfo.empty} 项无签到任务，已跳过）`}
                   {earned > 0 && ` · 获得 ${earned} Credits`}
                 </Badge>
                 {/* 风控拦截单列（issue #190）：BLOCKED 自动重试无效，需用户在
@@ -288,7 +301,8 @@ export default function QoderCheckin() {
                     : l.status === 'already'
                     ? 'text-sky-600 dark:text-sky-300'
                     : l.status === 'skip'
-                    ? 'text-amber-600 dark:text-amber-300'
+                    ? // 确定性跳过（无签到任务）非失败：中性灰，与账号表/日历 slate 口径一致
+                      'text-slate-500 dark:text-zinc-400'
                     : 'text-rose-600 dark:text-rose-300';
                 const Icon = l.status === 'fail' ? XCircle : CheckCircle2;
                 return (

@@ -25,6 +25,7 @@ use crate::jwt;
 use crate::models::{CooldownEntry, DeviceEntry, RawAccount};
 use crate::state::AppState;
 
+use super::friendly_net_err;
 use super::http_agent;
 
 const SIGNIN_URL: &str = "https://api.trae.cn/trae/api/v2/ug/checkin_credits/claim";
@@ -115,7 +116,9 @@ fn http_post(
             let parsed = serde_json::from_str(&raw).ok();
             (code as i32, parsed, raw)
         }
-        Err(e) => (0, None, e.to_string()),
+        // 仅 DNS 解析失败在 agent 的 resolver 层自动重试（连接超时/拒连不经 resolver，
+        // 由调用方外层重试兜底），此处仅做用户可见文案归一化（issue #209）
+        Err(e) => (0, None, friendly_net_err(&e.to_string())),
     }
 }
 
@@ -727,6 +730,14 @@ pub fn run_round(
         } else {
             // 签到失败 → 分类错误并写入冷却（Unknown 不落盘不外发）
             let (mut error_type, mut cooldown_secs) = classify_error(http_status, code);
+            // 「JWT 存在但损坏/无法解析 user id」（第五轮审查修复）：与「未配置 jwt」
+            // 同属终态——重试与冷却均无法自愈，此前 classify_error(0,None) 归 Unknown
+            // 导致调度器全天 30→120min 退避重试 + 每轮失败推送噪声；单列永久类型
+            // 供重试轮排除（scheduler failed_permanent 口径对齐 SessionDead）
+            if info.user_id.is_none() {
+                error_type = "BadJwt";
+                cooldown_secs = -1;
+            }
             // 「服务端拒绝认证」（issue #128）：HTTP 200 + 业务码拒绝的凭证级失效，
             // 重试与短冷却均无法自愈——单列永久类型供重试轮排除（对齐 SessionDead 口径）
             if is_auth_rejected_error(&msg) {

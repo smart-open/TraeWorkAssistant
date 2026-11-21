@@ -25,8 +25,8 @@ docker compose exec aiwork-server cat /app/data/conf/admin_token
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `AIWORK_LISTEN_ADDR` | `0.0.0.0:8080` | 监听地址；改端口时需同步 `AIWORK_PORT` 与 compose 端口映射 |
-| `AIWORK_PORT` | `8080` | 仅供容器 HEALTHCHECK 探活取端口 |
+| `AIWORK_LISTEN_ADDR` | `0.0.0.0:8080` | 监听地址（容器内由镜像 ENV 固定 `0.0.0.0:8080`；改宿主端口只调下方 `AIWORK_PORT`） |
+| `AIWORK_PORT` | `8080` | 仅供 compose 宿主端口映射插值（容器内监听恒为 8080，HEALTHCHECK 探 127.0.0.1:8080 无需此变量） |
 | `AIWORK_ADMIN_TOKEN` | 空（自动生成） | 管理面令牌；留空则首启生成 64 位随机 hex 写 `conf/admin_token` |
 | `AIWORK_VAULT_KEY` | 空（自动生成） | 敏感数据加密密钥（任意字符串 SHA-256 归一 32B）；**容器重建必须可复现**，否则已存凭据不可解密 |
 | `AIWORK_DATA_DIR` | `/app/data` | 数据目录（容器内固定挂载 volume） |

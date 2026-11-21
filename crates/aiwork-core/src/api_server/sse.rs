@@ -333,11 +333,16 @@ fn stream_convert_src(
                     }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
-                        // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）
-                        error_info = Some((
-                            crate::api_server::EMPTY_COMPLETION_CODE,
-                            super::EMPTY_COMPLETION_MSG.to_string(),
-                        ));
+                        // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）。
+                        // 审查修复（2026-11-21）：error_info 已有值（上游「流内 error
+                        // 帧+无正文+done 收尾」序列）不得覆盖为空完成哨兵——请求级
+                        // 错误会被误走「空完成换号重试」全池轮换（上游同源，需回提 main）
+                        if error_info.is_none() {
+                            error_info = Some((
+                                crate::api_server::EMPTY_COMPLETION_CODE,
+                                super::EMPTY_COMPLETION_MSG.to_string(),
+                            ));
+                        }
                         break;
                     }
                     // issue #148：OpenAI 语义要求本流出现过 tool_calls 时收尾帧
@@ -531,11 +536,14 @@ fn stream_convert_text_src(
                     }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
-                        // 调用方换号重试（issue #57）
-                        error_info = Some((
-                            crate::api_server::EMPTY_COMPLETION_CODE,
-                            super::EMPTY_COMPLETION_MSG.to_string(),
-                        ));
+                        // 调用方换号重试（issue #57）。审查修复（2026-11-21）：
+                        // 已有流内 error 不得覆盖为空完成哨兵（同上，上游同源）
+                        if error_info.is_none() {
+                            error_info = Some((
+                                crate::api_server::EMPTY_COMPLETION_CODE,
+                                super::EMPTY_COMPLETION_MSG.to_string(),
+                            ));
+                        }
                         break;
                     }
                     let data = write_chunk("", &ev.finish_reason, &pending_usage);
@@ -1351,11 +1359,14 @@ fn stream_convert_anthropic_src(
                     }
                     if !(message_started || !tools.is_empty()) {
                         // 空完成（影子风控/上游异常）：不发 message_delta/message_stop，
-                        // 以哨兵错误上抛调用方换号重试（issue #57）
-                        error_info = Some((
-                            crate::api_server::EMPTY_COMPLETION_CODE,
-                            super::EMPTY_COMPLETION_MSG.to_string(),
-                        ));
+                        // 以哨兵错误上抛调用方换号重试（issue #57）。审查修复
+                        // （2026-11-21）：已有流内 error 不得覆盖为空完成哨兵（同上）
+                        if error_info.is_none() {
+                            error_info = Some((
+                                crate::api_server::EMPTY_COMPLETION_CODE,
+                                super::EMPTY_COMPLETION_MSG.to_string(),
+                            ));
+                        }
                         break;
                     }
                     start_message!();
@@ -2176,6 +2187,9 @@ mod tests {
             "broken pipe (os error 32)",
             "connection closed before message completed",
             "h2 error: protocol violation",
+            // issue #212：Windows 中文 locale 连接重置文案（502 报文与长流掐断同源）
+            "远程主机强迫关闭了一个现有的连接。 (os error 10054)",
+            "os error 10054",
         ];
         for s in hits {
             assert!(crate::api_server::is_transport_cut_text(s), "应命中: {s}");
@@ -2185,6 +2199,9 @@ mod tests {
             "weird os error 42",
             "upstream 500: internal server error",
             "stream completed normally",
+            // 干扰反例：相近数字/短语不得命中
+            "os error 1005",
+            "远程主机主动断开",
         ];
         for s in misses {
             assert!(!crate::api_server::is_transport_cut_text(s), "不应命中: {s}");

@@ -4,6 +4,8 @@ node_modules/
 target/
 # 并行测试运行独立 target（cargo test --target-dir target-testrun）
 target-testrun/
+# 构建缓存目录（937ab9b 移植：依赖构建期自动下载的缓存件，zip+签名可随时重新生成）
+.cargo-dist/
 
 # Logs
 *.log

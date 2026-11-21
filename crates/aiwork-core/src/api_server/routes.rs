@@ -1321,6 +1321,11 @@ pub async fn chat_completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 let buddy_ai = r.pool == TargetPool::BuddyAi;
+                // issue #213 S6 伪流式分流：开关开时走聚合内核合成 SSE（断流/空完成
+                // 全可无损换号重试），耗尽走跨池兜底移交
+                if stream && state.pseudo_stream_on(buddy_ai) {
+                    return wb_route::wb_pseudo_stream(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
+                }
                 if stream {
                     return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
@@ -1498,6 +1503,12 @@ pub async fn responses_api(
     let hint = effective_effort_hint(&state, route_hint, explicit);
     let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
+    // issue #213 S6 伪流式分流：开关开时走聚合内核合成 SSE（断流/空完成全可无损
+    // 换号重试）；encoded 集合同传（Responses 合成 delta 需排除已编码工具名）。
+    // 注：wb_tool_exec_chat 路径不走伪流式分流（内部已是非流式聚合 + 合成 SSE）
+    if stream && state.pseudo_stream_on(buddy_ai) {
+        return wb_route::wb_pseudo_stream(state_clone, buddy_ai, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, encoded_tools, Vec::new());
+    }
     if stream {
         wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, encoded_tools, Vec::new())
     } else {
@@ -1697,6 +1708,10 @@ pub async fn messages(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 let buddy_ai = r.pool == TargetPool::BuddyAi;
+                // issue #213 S6 伪流式分流（口径同 OpenAI 分流点）
+                if stream && state.pseudo_stream_on(buddy_ai) {
+                    return wb_route::wb_pseudo_stream(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
+                }
                 if stream {
                     return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
@@ -1852,6 +1867,10 @@ pub async fn completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, false);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 let buddy_ai = r.pool == TargetPool::BuddyAi;
+                // issue #213 S6 伪流式分流（口径同 OpenAI 分流点）
+                if stream && state.pseudo_stream_on(buddy_ai) {
+                    return wb_route::wb_pseudo_stream(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
+                }
                 if stream {
                     return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new(), r.fallback_chain);
                 }
@@ -4086,6 +4105,13 @@ mod tests {
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             buddy_ai_model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wb_account_model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            buddy_ai_account_model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wb_pseudo_stream: std::sync::atomic::AtomicBool::new(false),
+            buddy_ai_pseudo_stream: std::sync::atomic::AtomicBool::new(false),
+            wb_retry_budget: std::sync::atomic::AtomicU32::new(0),
+            buddy_ai_retry_budget: std::sync::atomic::AtomicU32::new(0),
+            pseudo_keepalive_secs: std::sync::atomic::AtomicU64::new(5),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
             total_requests: std::sync::atomic::AtomicU64::new(0),

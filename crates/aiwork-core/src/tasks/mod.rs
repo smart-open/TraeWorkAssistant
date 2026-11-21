@@ -17,7 +17,85 @@ pub mod wb_checkin;
 pub mod wb_common;
 pub mod wb_credits;
 
+use std::net::ToSocketAddrs;
+
 use crate::state::AppState;
+
+/// glibc DNS 解析失败短语（Linux 容器，docker 运行层 debian:bookworm-slim 下
+/// getaddrinfo 失败文案，无稳定 os error 码）：is_transient_net_err / friendly_net_err
+/// 共用，统一小写比较
+const GLIBC_DNS_PHRASES: [&str; 4] = [
+    "name or service not known",
+    "temporary failure in name resolution",
+    "no address associated with hostname",
+    "failed to lookup address information",
+];
+
+/// 瞬时网络错误判定（issue #209）：仅连接期故障值得重试——连接未建立、请求未
+/// 到达服务器，POST 重试无副作用；HTTP 4xx/5xx（Error::Status）与 ureq 自身
+/// 超时（文案不含 os error 码）不在此列，避免重复提交。
+/// 双平台覆盖（docker 适配）：Windows 桌面 WinSock 码（11001/11002=DNS 解析失败、
+/// 10060=连接超时、10061=拒连、10064=主机不可达）+ Linux 容器 errno 文本
+///（111=拒连、110=超时、113=不可达、101=网络断）与 glibc DNS 短语——原实现仅
+/// 匹配 Windows 码，debian 容器下全部失效。统一小写比较；「os error 110」是
+/// 「os error 11001」的前缀子串，但两者同属瞬时故障判定无害（friendly_net_err
+/// 的 DNS 分支先行，11001 仍归 DNS 文案）。
+pub fn is_transient_net_err(msg: &str) -> bool {
+    // 统一小写比较（glibc 短语实际文案首字母可能大写，如 "Name or service not
+    // known"；os error 码文本本身全小写，小写化无副作用）
+    let lower = msg.to_lowercase();
+    let win = ["11001", "11002", "10060", "10061", "10064"]
+        .iter()
+        .any(|c| lower.contains(&format!("os error {c}")));
+    let linux = ["os error 111", "os error 110", "os error 113", "os error 101"]
+        .iter()
+        .any(|c| lower.contains(c))
+        || GLIBC_DNS_PHRASES.iter().any(|p| lower.contains(p));
+    win || linux
+}
+
+/// 网络错误文案归一化（issue #209）：DNS 失败多为本机安全软件（如火绒）网络
+/// 防护或代理/VPN（TUN/fake-ip）拦截应用进程解析所致，附可操作提示后流入
+/// 用户可见错误（事件/摘要/通知）。「No ip address」为 ureq 对解析返回空集的
+/// 报错（无 os error 后缀），同属 DNS 类故障一并归入；Linux 容器侧补 glibc
+/// DNS 短语与拒连/超时 errno 文案的归一化分支（双平台覆盖，同 is_transient_net_err）。
+pub fn friendly_net_err(msg: &str) -> String {
+    let lower = msg.to_lowercase();
+    let dns_like = ["11001", "11002"]
+        .iter()
+        .any(|c| msg.contains(&format!("os error {c}")))
+        || msg.contains("No ip address")
+        || GLIBC_DNS_PHRASES.iter().any(|p| lower.contains(p));
+    if dns_like {
+        format!("{msg}（本地 DNS 解析失败：常由安全软件网络防护或代理/VPN 拦截引起，请检查后重试）")
+    } else if is_transient_net_err(msg) {
+        format!("{msg}（连接不可达：请检查网络/代理/VPN 后重试）")
+    } else {
+        msg.to_string()
+    }
+}
+
+/// DNS 解析（带瞬时失败重试，issue #209）：行为等价 StdResolver（to_socket_addrs），
+/// getaddrinfo 被安全软件/代理链瞬时拦截（os error 11001/11002）时自动重试 2 次
+///（200ms/1s 退避），避免单次解析失败让整轮签到报错。
+fn resolve_with_retry(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    const MAX_EXTRA: usize = 2;
+    let mut attempt = 0;
+    loop {
+        match netloc.to_socket_addrs().map(|it| it.collect()) {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < MAX_EXTRA && is_transient_net_err(&e.to_string()) => {
+                std::thread::sleep(std::time::Duration::from_millis(if attempt == 0 {
+                    200
+                } else {
+                    1000
+                }));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// 构建 ureq agent（统一出口）。
 /// 直连语义：ureq 默认不读系统/环境代理（对齐 python OPENER 绕代理约定），
@@ -25,7 +103,48 @@ use crate::state::AppState;
 pub fn http_agent(timeout_secs: u64) -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(timeout_secs))
+        .resolver(resolve_with_retry)
         .build()
+}
+
+/// 代理 URL 日志脱敏：仅保留 scheme://host[:port]，剥离 userinfo——
+/// proxy_url 常为 http://user:pass@host 形态，原始回显会把凭证泄进日志。
+fn sanitize_proxy_url_for_log(s: &str) -> String {
+    let trimmed = s.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return "<无 scheme>".into();
+    };
+    // userinfo 可含 @，host 不含——取最后一个 @ 之后为 host 段
+    let host = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
+    format!("{scheme}://{host}")
+}
+
+/// 单账号独立出口代理（P4 防风控）：proxy_url 配置成功则按同参数构建带代理的
+/// agent；URL 非法/为空回退直连（与 http_agent 同配置）。每账号独立 agent
+/// 避免连接池复用把不同出口的 TCP/会话指纹串到一起。
+pub fn http_agent_with_proxy(timeout_secs: u64, proxy_url: Option<&str>) -> ureq::Agent {
+    let proxy = proxy_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| match ureq::Proxy::new(s) {
+            Ok(p) => Some(p),
+            // 纯函数无 data_dir/app logger 上下文，沿用 eprintln! 先例。
+            // 审查修复（第五轮）：不回显原始 URL——proxy_url 常为
+            // http://user:pass@host 形态，原样输出会把内嵌凭证泄进
+            // stderr/docker logs；只留 scheme/host 前缀定位问题
+            Err(e) => {
+                eprintln!("单账号代理 URL 解析失败（已回退直连）: {} — {e}", sanitize_proxy_url_for_log(s));
+                None
+            }
+        });
+    match proxy {
+        Some(p) => ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .resolver(resolve_with_retry)
+            .proxy(p)
+            .build(),
+        None => http_agent(timeout_secs),
+    }
 }
 
 /// 解析 `--task-run <name>` CLI 参数（`--task-run` 为首个参数时进入任务模式）。
@@ -65,14 +184,10 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 }
             });
             // 审查 M-1：存在失败账号时返 Err（CLI 退出码可见 + 通知渠道）。
-            // 口径对齐调度器（scheduler.rs 同款）：empty_campaigns（活动未上线/不可用）
-            // 属非用户可操作失败，不计失败——CLI 进程本身无 30min 冷却重试链，
-            // 重试由次日调度覆盖；done 事件恒携带该字段，旧结构缺字段时按 0 兜底
+            // 口径对齐调度器（scheduler.rs 同款）：empty_campaigns（无签到任务）
+            // 2026-11-21 起归类 skip、不计失败，任务签到直接跳过；CLI 进程本身
+            // 无 30min 冷却重试链，重试由次日调度覆盖
             let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            let failed_empty = done
-                .get("failed_empty_campaigns")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
             // 永久性认证失败与调度器口径对齐（scheduler.rs 同款）：重试注定失败，
             // 不计入 Err（否则失效账号让 CLI 每日执行结果恒为失败）
             let failed_permanent = done
@@ -85,7 +200,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 .get("failed_blocked")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
+            if failed - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 Err(format!(
@@ -176,5 +291,22 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
     match result {
         Ok(v) => { println!("{}", serde_json::to_string(&v).unwrap_or_default()); 0 }
         Err(e) => { println!("{}", serde_json::json!({"ok": false, "error": e})); 1 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_proxy_url_for_log;
+
+    #[test]
+    fn 代理url脱敏_剥离userinfo保留host端口() {
+        assert_eq!(sanitize_proxy_url_for_log("http://user:pass@1.2.3.4:7890"), "http://1.2.3.4:7890");
+        assert_eq!(sanitize_proxy_url_for_log("socks5://a:b@c.com"), "socks5://c.com");
+        // userinfo 可含 @：取最后一个 @ 之后（host 不含 @）
+        assert_eq!(sanitize_proxy_url_for_log("http://u@p:w@host:8080"), "http://host:8080");
+        // 无 userinfo 原样保留（trim 后）
+        assert_eq!(sanitize_proxy_url_for_log(" http://host:8080 "), "http://host:8080");
+        // 无 scheme：不猜结构，整段不回显
+        assert_eq!(sanitize_proxy_url_for_log("user:pass@host"), "<无 scheme>");
     }
 }

@@ -708,14 +708,18 @@ pub fn refresh_access_token(
             .map(|d| dig_str(d, &["refreshToken"]))
             .unwrap_or(None)
     });
+    // 0/负值/异常大值过滤（对齐 buddy_ai 续期/oauth filter 口径）：非法值丢弃保持
+    // None 盲区语义，防落过去时刻的 expires_at_ms 导致每轮强制刷新
     let expires_in = body
         .pointer("/expiresIn")
         .or_else(|| body.pointer("/data/expiresIn"))
-        .and_then(|v| v.as_i64());
+        .and_then(|v| v.as_i64())
+        .filter(|&s| s > 0 && s < 10 * 365 * 24 * 3600);
     let refresh_expires_in = body
         .pointer("/refreshExpiresIn")
         .or_else(|| body.pointer("/data/refreshExpiresIn"))
-        .and_then(|v| v.as_i64());
+        .and_then(|v| v.as_i64())
+        .filter(|&s| s > 0 && s < 10 * 365 * 24 * 3600);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -887,14 +891,17 @@ fn refresh_access_token_intl(
     let new_refresh = dig_str(&body, &["refreshToken"]).or_else(|| {
         body.get("data").and_then(|d| dig_str(d, &["refreshToken"]))
     });
+    // 0/负值/异常大值过滤（对齐 CN 侧/buddy_ai 续期口径）：非法值丢弃保持 None 盲区
     let expires_in = body
         .pointer("/expiresIn")
         .or_else(|| body.pointer("/data/expiresIn"))
-        .and_then(|v| v.as_i64());
+        .and_then(|v| v.as_i64())
+        .filter(|&s| s > 0 && s < 10 * 365 * 24 * 3600);
     let refresh_expires_in = body
         .pointer("/refreshExpiresIn")
         .or_else(|| body.pointer("/data/refreshExpiresIn"))
-        .and_then(|v| v.as_i64());
+        .and_then(|v| v.as_i64())
+        .filter(|&s| s > 0 && s < 10 * 365 * 24 * 3600);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

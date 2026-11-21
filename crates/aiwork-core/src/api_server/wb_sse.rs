@@ -537,6 +537,10 @@ pub fn stream_forward_ex(
                     // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）。
                     // 注：Responses 协议 created 仅在载荷帧时下发（噪声帧门控），
                     // 影子风控场景上游零载荷 chunk → 未发 created，换号重试干净
+                    // 结构不变量（对照 sse.rs done 分支的 error_info.is_none() 守卫）：
+                    // 此处 error_info 必为 None——error_info 唯一赋值点是 Error 分支，
+                    // 且该分支无条件 break，error→done 序列不可达，故此处空完成哨兵
+                    // 不会覆盖真实业务错误；未来若 Error 分支改为 continue 需同步补守卫
                     error_info = Some((
                         super::EMPTY_COMPLETION_CODE,
                         super::EMPTY_COMPLETION_MSG.to_string(),
@@ -598,7 +602,7 @@ pub fn stream_forward_ex(
                     usage = Some(x);
                 }
                 // 真实内容标记（issue #57 空完成检测）：空 delta chunk 不计入
-                if delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                let frame_has_payload = delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
                     || delta
                         .get("reasoning_content")
                         .and_then(|c| c.as_str())
@@ -606,12 +610,18 @@ pub fn stream_forward_ex(
                     || delta
                         .get("tool_calls")
                         .and_then(|t| t.as_array())
-                        .map_or(false, |a| !a.is_empty())
-                {
+                        .map_or(false, |a| !a.is_empty());
+                if frame_has_payload {
                     has_content = true;
                 }
                 if proto == crate::api_server::routes::Protocol::Anthropic {
-                    anthropic_start(tx, &mut message_started, chat_id, model);
+                    // 审查修复（第五轮）：message_start 门控到本帧确有载荷——噪声帧/
+                    // 空 delta 不再提前发 message_start，防「空完成换号重试」（sent_any
+                    // 未置位）时客户端已收到 message_start 又被拼接第二份完整响应
+                    // （与 Responses 侧 created 仅载荷帧下发的门控同口径）
+                    if frame_has_payload {
+                        anthropic_start(tx, &mut message_started, chat_id, model);
+                    }
                     // T5.3/F-62：思考链增量 → thinking block（先于文本块）
                     if let Some(t) = delta.get("reasoning_content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
                         if !thinking_block_open {
@@ -694,7 +704,11 @@ pub fn stream_forward_ex(
                                 }
                             }
                         }
-                        sent_any = true;
+                        // 空数组不算真实流出（与 frame_has_payload 口径一致，
+                        // 防 noise-only 流被误判已发内容而错过空完成换号）
+                        if !tcs.is_empty() {
+                            sent_any = true;
+                        }
                     }
                 } else {
                     match proto {
@@ -909,6 +923,12 @@ pub fn stream_forward_ex(
     // 掐断；有内容时上方分支已补齐终止帧（客户端看到完整收尾），此处只补
     // 上抛——调用方按失败落账（不绑粘性不记成功）；零内容时覆盖空完成哨兵
     //（调用方换号且不计空完成指纹）
+    // issue #213 S1b（轻量处理）：本函数返回值是四元组（调用方多处解构），
+    // 断流现场字段 sent_bytes / last_frame_kind（累计 payload 字节数、最后
+    // 帧类型 Chunk/Error/Done）暂不追加——改动面过大；归因现场可用信息 =
+    // has_content（本函数局部）+ 上抛的底层读错误文本（已含在哨兵 msg 中，
+    // 覆盖 cut 关键词库 mod.rs::is_transport_cut_text 全部形态）。后续如需
+    // 字节级断点归因，先把返回值升级为结构体再补两字段。
     if error_info.is_none() && !finished && !failed_inline {
         if let Some(e) = parser.take_read_error() {
             // M3 审查收口：按特征分流——掐断特征（RST_STREAM 等）→ -9902

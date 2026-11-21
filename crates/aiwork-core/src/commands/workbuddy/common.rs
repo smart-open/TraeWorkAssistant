@@ -91,6 +91,10 @@ pub struct WorkBuddyAccount {
     /// [{name, code, remain, size, expire_secs}]；None = 未取数或上游无明细）
     #[serde(default)]
     pub credits_packages: Option<serde_json::Value>,
+    /// 账号级独立出口代理（P4 防风控）：http(s) 代理 URL（如 http://127.0.0.1:7890），
+    /// 签到/成长轮按账号单独构建 agent；None/空 = 直连。serde default 兼容旧池 JSON。
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -99,10 +103,12 @@ pub(super) struct WbPool {
     pub(super) accounts: Vec<WorkBuddyAccount>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct WorkBuddySettings {
     /// 启动自动补签（F-55）：启动时核验未签账号自动补签
-    #[serde(default)]
+    /// issue #220 P1：默认开启（default_true 仅作用于缺失字段——显式保存过
+    /// false 的用户不受影响）；Default 实现见下方手动 impl（与字段缺省对齐）
+    #[serde(default = "default_true")]
     pub auto_checkin: bool,
     /// 保活阈值（天）；0 = 每天无条件刷新全部带 refreshToken 账号
     #[serde(default)]
@@ -175,7 +181,8 @@ fn default_cli_guard() -> i64 {
 impl WorkBuddySettings {
     fn with_defaults() -> Self {
         Self {
-            auto_checkin: false,
+            // issue #220 P1：默认模板与新装缺省保持 auto_checkin=true
+            auto_checkin: true,
             keepalive_days: 0,
             lazy_refresh_hours: 24,
             growth_travel: true,
@@ -192,6 +199,15 @@ impl WorkBuddySettings {
             ui_click_x: 0,
             ui_click_y: 0,
         }
+    }
+}
+
+// issue #220 P1：kv_get 缺键回退 T::default()——此前 derive Default 会让新装用户
+// 的 auto_checkin=false 绕过字段级 serde default。手动实现与 with_defaults() 对齐，
+// 保证「缺键默认」与「缺字段默认」口径一致（均为开启）
+impl Default for WorkBuddySettings {
+    fn default() -> Self {
+        Self::with_defaults()
     }
 }
 
@@ -224,6 +240,19 @@ pub(crate) fn load_settings(state: &AppState) -> WorkBuddySettings {
 
 pub(super) fn as_str(v: Option<&serde_json::Value>) -> Option<String> {
     v.and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// expiresIn/refreshExpiresIn 宽容解析 + 非法值过滤（第五轮审查修复，收敛
+/// buddy_ai.rs 原地实现为共享函数）：字段漂移时可能以数字字符串返回（仅 as_i64
+/// 会静默丢失 → 到期时间被清成 None 盲区）；0/负值/异常大值会让 exp_ms 落在
+/// 过去时刻覆盖旧有效值 → 兜底续期每轮必刷。非法值丢弃保持 None 盲区语义
+/// （相对秒数，上界 10 年，对齐 commands/oauth.rs refresh_token_expires_at 过滤口径）。
+pub(super) fn expires_in_secs(v: Option<&serde_json::Value>) -> Option<i64> {
+    const EXPIRES_IN_MAX_SECS: i64 = 10 * 365 * 24 * 3600;
+    let v = v?;
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        .filter(|s| *s > 0 && *s < EXPIRES_IN_MAX_SECS)
 }
 
 pub(super) fn as_ts_seconds(v: Option<&serde_json::Value>) -> Option<i64> {

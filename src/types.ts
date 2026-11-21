@@ -295,6 +295,19 @@ export interface SanitizeSwitches {
   qoder: boolean;
 }
 
+/** 池级伪流式开关视图（issue #213）：仅内存热切换、重启复位默认关
+ * wb = Buddy CN 档（wb_pool）；buddy_ai = 国际档独立灰度 */
+export interface PseudoStreamSwitches {
+  wb: boolean;
+  buddy_ai: boolean;
+}
+
+/** 池级换号重试预算视图（issue #213）：0 = 旧行为（重试机会 = 池内账号数） */
+export interface RetryBudgets {
+  wb: number;
+  buddy_ai: number;
+}
+
 /** 网关命中（指纹拦截/空完成影子风控）落下的指纹样本：供一键生成清洗规则 */
 export interface FingerprintSample {
   /** "11128" = 清洗已启用仍被拦；"11128_cleaned" = 11128 终局同采的清洗后样本
@@ -324,6 +337,8 @@ export interface NotifyConfig {
   on_checkin_done: boolean;
   /** 调度任务失败时通知 */
   on_task_failed: boolean;
+  /** 定时任务完成推送（issue #222）：仅奖励型任务白名单，默认关 */
+  on_task_success: boolean;
 }
 
 /** IP 允许列表配置（Phase 3 T12a：应用层访问控制，独立 kv） */
@@ -918,6 +933,8 @@ export interface WorkBuddyAccountView {
   relogin_reason: string;
   group_id: string;
   note: string;
+  /** 账号级独立出口代理（P4 防风控；null = 直连） */
+  proxy_url: string | null;
   credits_balance: number | null;
   credits_fetched_at: string | null;
   /** 共享标签 tag id 列表（老后端缺省 undefined） */
@@ -1389,11 +1406,13 @@ export interface QoderCheckinDone {
   ok: number;
   already: number;
   failed: number;
-  /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
+  /** 无签到任务跳过（2026-11-21 口径升级：空表 + 零可领盲发全 miss，均归 skip 非失败） */
   empty: number;
   /** failed 中「风控信任未建立（BLOCKED）」数：恢复需用户操作（切换账号+客户端建信任），
    * 自动重试无效（issue #190，口径对齐 Rust 侧） */
   blocked: number;
+  /** 体验版未满足活动资格跳过（issue #223：plan=free 不在投放范围，中性灰标） */
+  skipped_ineligible?: number;
 }
 
 export interface QoderCreditPackage {

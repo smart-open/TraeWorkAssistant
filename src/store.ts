@@ -96,10 +96,10 @@ interface AppState {
   startQoderCheckin: () => Promise<void>;
 
   refreshAccounts: () => Promise<void>;
-  refreshGroups: () => Promise<void>;
+  refreshGroups: (manual?: boolean) => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshLogs: (q?: LogQuery, manual?: boolean) => Promise<void>;
-  refreshCreditsDaily: () => Promise<void>;
+  refreshCreditsDaily: (manual?: boolean) => Promise<void>;
   setShowApiManager: (v: boolean) => void;
 
   addAccount: (name: string, jwt: string, groupId?: string) => Promise<void>;
@@ -167,6 +167,49 @@ function checkinWatchdogFired() {
 function armCheckinWatchdog() {
   clearCheckinWatchdog();
   checkinWatchdog = window.setTimeout(checkinWatchdogFired, CHECKIN_WATCHDOG_MS);
+}
+
+/** Qoder 签到看门狗（审查 H1 对齐 F5.2 范式）：qoderCheckin.running 只能由
+ * done/exit/skipped_busy 事件复位，WS/SSE 断线丢帧时「签到进行中」永久卡死、
+ * 按钮永久禁用（Trae 侧同款问题已有看门狗，Qoder 侧未对齐）。事件到达即续期；
+ * 超时未有任何事件则解除卡死并提示以签到记录页为准 */
+const QODER_CHECKIN_WATCHDOG_MS = 15 * 60_000;
+let qoderCheckinWatchdog: number | null = null;
+function clearQoderCheckinWatchdog() {
+  if (qoderCheckinWatchdog !== null) {
+    clearTimeout(qoderCheckinWatchdog);
+    qoderCheckinWatchdog = null;
+  }
+}
+function qoderCheckinWatchdogFired() {
+  qoderCheckinWatchdog = null;
+  const s = useAppStore.getState();
+  if (!s.qoderCheckin.running) return;
+  useAppStore.setState((st) => ({ qoderCheckin: { ...st.qoderCheckin, running: false } }));
+  s.pushToast(
+    'error',
+    'Qoder 签到进度长时间未收到事件（连接可能中断），已解除「进行中」卡死；实际结果请到签到记录页核对',
+  );
+}
+function armQoderCheckinWatchdog() {
+  clearQoderCheckinWatchdog();
+  qoderCheckinWatchdog = window.setTimeout(qoderCheckinWatchdogFired, QODER_CHECKIN_WATCHDOG_MS);
+}
+
+/** 丢帧后短周期兜底（2026-11-21 审查修复，兑现 ws-lagged 注释承诺）：丢帧意味着
+ * done/exit 复位事件可能已丢失，15min 看门狗过长——签到进行中时改以 60s 短周期
+ * 重新计时，尽快解除卡死（不误报：仅在确实进行中时重挂） */
+const CHECKIN_WATCHDOG_LAGGED_MS = 60_000;
+function rearmCheckinWatchdogLagged() {
+  const s = useAppStore.getState();
+  if (s.checkin.active) {
+    clearCheckinWatchdog();
+    checkinWatchdog = window.setTimeout(checkinWatchdogFired, CHECKIN_WATCHDOG_LAGGED_MS);
+  }
+  if (s.qoderCheckin.running) {
+    clearQoderCheckinWatchdog();
+    qoderCheckinWatchdog = window.setTimeout(qoderCheckinWatchdogFired, CHECKIN_WATCHDOG_LAGGED_MS);
+  }
 }
 
 
@@ -293,6 +336,10 @@ let logsPollInflight = false;
 let logsReqSeq = 0;
 // 同因 toast 限频：读取持续失败期间每 60s 最多弹一次（防 toast 风暴）；手动调用直通
 let lastLogsErrToastAt = 0;
+// 审查修复（2026-11-21）：分组/每日积分快照加载失败此前静默——页面呈现空数据且
+// 无提示。对齐 refreshLogs 的 60s 限频 toast 范式
+let lastGroupsErrToastAt = 0;
+let lastCreditsDailyErrToastAt = 0;
 
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
@@ -348,7 +395,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       onQoderCheckinProgress: (line) => get().applyQoderCheckinLine(line),
     });
     // WS 慢消费者丢帧通知（审查 F6.3）：此前该事件被前端静默丢弃。
-    // 丢帧意味着界面状态可能滞后于服务端——提示用户，签到进行中时同步缩短看门狗
+    // 丢帧意味着界面状态可能滞后于服务端——提示用户；签到进行中时以 60s 短周期
+    // 重挂看门狗（复位事件可能已丢，缩短解除卡死的最坏等待）
     unsubs.push(
       await listen<{ missed?: number }>('ws-lagged', (e) => {
         const missed = e.payload?.missed;
@@ -356,6 +404,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           'info',
           `实时事件通道丢帧（${missed ?? '未知'} 条），界面状态可能滞后；签到结果请以签到记录页为准`,
         );
+        rearmCheckinWatchdogLagged();
       }),
     );
     await Promise.all([
@@ -379,6 +428,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     unsubs.forEach((fn) => fn());
     unsubs = [];
     clearCheckinWatchdog();
+    clearQoderCheckinWatchdog();
     // 保留 ready 与主题等本地态；数据清空防止串号
     set({
       authed: false,
@@ -513,46 +563,63 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     if (!parsed || typeof parsed !== 'object') return;
     const ev = parsed as Record<string, unknown>;
+    // 看门狗：running 期间任何事件到达都续期（start/逐账号行/done 前推进）
+    if (get().qoderCheckin.running) armQoderCheckinWatchdog();
     if (ev.type === 'start') {
       // 调度器后台触发时页面不在场也能正确进入 running 态（store 层归约的收益）
       set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: true, lines: [], done: null } }));
+      armQoderCheckinWatchdog();
       return;
     }
     if (ev.type === 'done') {
       // 跨进程锁被占用：整轮幂等跳过，不误报「成功完成」、不落全 0 的 done 徽标
       if (ev.skipped_busy === true) {
         set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: false, done: null } }));
+        clearQoderCheckinWatchdog();
         get().pushToast('warn', '另一进程正在执行 Qoder 签到，本轮已跳过（调度稍后会自动重试）');
         return;
       }
       const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
-      // failed_empty_campaigns（活动未开始/不可用）为非用户可操作失败：与真实
-      // 失败分开计数，避免用户对无解失败反复重试（口径对齐 Rust 侧补签通知）
-      const empty = Math.max(0, num(ev.failed_empty_campaigns));
+      // 无签到任务跳过（2026-11-21 口径升级，2774d48 移植）：空表 + 零可领盲发全 miss
+      // 均归 skip 非失败（Rust 侧 done.skipped_empty_campaigns 单列），中性提示不计失败
+      const empty = Math.max(0, num(ev.skipped_empty_campaigns));
       const failed = num(ev.failed);
+      // skipped_ineligible（体验版未满足活动资格，issue #223）为确定性跳过：
+      // 中性提示，不计失败、不抬升级别
+      const ineligible = Math.max(0, num(ev.skipped_ineligible));
       // failed_blocked（风控信任未建立 BLOCKED，issue #190）同为非用户可自动
-      // 重试失败：恢复需用户操作（切换账号 + 客户端建信任），文案单列引导
-      const blocked = Math.max(0, Math.min(num(ev.failed_blocked), failed - empty));
+      // 重试失败：恢复需用户操作（切换账号 + 客户端建信任），文案单列引导。
+      // 后端新口径：skip（empty）已从 failed 剔除，empty 与 failed 不相交，
+      // blocked/permanent 均为 failed 子集——只按 failed 钳制（旧 failed-empty
+      // 钳制把 skip 重复扣一次，会误截真实失败数）
+      const blocked = Math.max(0, Math.min(num(ev.failed_blocked), failed));
       const done: QoderCheckinDone = {
         ok: num(ev.ok),
         already: num(ev.already),
         failed,
         empty,
         blocked,
+        skipped_ineligible: ineligible,
       };
       set((s) => ({
         qoderCheckin: { ...s.qoderCheckin, running: false, done, doneRev: s.qoderCheckin.doneRev + 1 },
       }));
+      clearQoderCheckinWatchdog();
       // 审查 Low：消费后端 failed_permanent（凭证终态失败，重试注定无效）——
-      // 可重试数 = failed - empty - permanent（口径对齐调度器 retryable 判定），
+      // 可重试数 = failed - permanent - blocked（口径对齐调度器 retryable 判定
+      // scheduler.rs：failed - failed_permanent - failed_blocked；empty 已属
+      // skip 非失败，不再从 failed 扣减），
       // 文案明示其中哪些需重新登录/更新 PAT，防用户对终态失败反复手点重试；
       // 级别：含终态失败同样 warn（需要用户行动，不降级 success）
-      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - empty));
-      const retryable = failed - empty - permanent;
+      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed));
+      const retryable = Math.max(0, failed - permanent - blocked);
       get().pushToast(
         retryable > 0 || permanent > 0 || blocked > 0 ? 'warn' : 'success',
         `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
-          (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : '') +
+          (empty > 0 ? `（另有 ${empty} 项无签到任务，已跳过）` : '') +
+          (ineligible > 0
+            ? `（另有 ${ineligible} 个体验版账号未满足活动资格，开通试用/订阅/会员卡后可领取）`
+            : '') +
           (permanent > 0 ? `（其中 ${permanent} 项需重新登录/更新 PAT 后重试）` : '') +
           (blocked > 0 ? `（其中 ${blocked} 项被风控拦截：需在客户端使用该账号建立信任后重试）` : ''),
       );
@@ -560,6 +627,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     if (ev.type === 'exit') {
       set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: false } }));
+      clearQoderCheckinWatchdog();
       return;
     }
     if (typeof ev.index === 'number' && ev.index > 0) {
@@ -590,10 +658,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   startQoderCheckin: async () => {
     if (get().qoderCheckin.running) return; // 连点自守（后端轮次锁仍兜底）
     set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: true, lines: [], done: null } }));
+    armQoderCheckinWatchdog();
     try {
       await api.qoder.checkinStart({ skip_checked_in: true });
     } catch (err) {
       set((s) => ({ qoderCheckin: { ...s.qoderCheckin, running: false } }));
+      clearQoderCheckinWatchdog();
       get().pushToast('error', `发起签到失败：${String(err)}`);
     }
   },
@@ -606,12 +676,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `读取账号失败：${String(err)}`);
     }
   },
-  refreshGroups: async () => {
+  refreshGroups: async (manual) => {
     try {
       const groups = await api.groups.list();
       set({ groups });
-    } catch {
-      /* ignore */
+    } catch (err) {
+      // 手动触发直通（对齐 refreshLogs）：60s 窗口内的显式操作失败必须有反馈
+      const now = Date.now();
+      if (manual || now - lastGroupsErrToastAt > 60_000) {
+        lastGroupsErrToastAt = now;
+        get().pushToast('error', `读取分组失败：${String(err)}`);
+      }
     }
   },
   refreshSettings: async () => {
@@ -652,12 +727,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       logsPollInflight = false;
     }
   },
-  refreshCreditsDaily: async () => {
+  refreshCreditsDaily: async (manual) => {
     try {
       const creditsDaily = await api.accounts.dailyList();
       set({ creditsDaily });
-    } catch {
-      /* ignore */
+    } catch (err) {
+      // 手动触发直通（对齐 refreshLogs）：60s 窗口内的显式操作失败必须有反馈
+      const now = Date.now();
+      if (manual || now - lastCreditsDailyErrToastAt > 60_000) {
+        lastCreditsDailyErrToastAt = now;
+        get().pushToast('error', `读取每日积分快照失败：${String(err)}`);
+      }
     }
   },
 
@@ -693,7 +773,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   createGroup: async (name, color) => {
     try {
       await api.groups.create(name, color);
-      await get().refreshGroups();
+      // 写操作的关联刷新带 manual 直通：若恰逢自动刷新失败已弹过 toast（60s
+      // 窗口内），本次失败静默会让「刚创建的分组不出现且无任何提示」
+      await get().refreshGroups(true);
       get().pushToast('success', `分组「${name}」已创建`);
     } catch (err) {
       get().pushToast('error', `创建分组失败：${String(err)}`);
@@ -704,7 +786,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   updateGroup: async (id, patch) => {
     try {
       await api.groups.update(id, patch);
-      await get().refreshGroups();
+      await get().refreshGroups(true);
       // 写操作可见反馈（对齐 createGroup/removeGroup）
       get().pushToast(
         'success',
@@ -718,7 +800,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   removeGroup: async (id) => {
     try {
       await api.groups.remove(id);
-      await get().refreshGroups();
+      await get().refreshGroups(true);
       await get().refreshAccounts();
       get().pushToast('info', '分组已删除');
     } catch (err) {

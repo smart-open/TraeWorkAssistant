@@ -182,6 +182,16 @@ fn clear_model_cooldown(model: &str) {
         .remove(model);
 }
 
+/// 清空全部模型级冷却（「清除冷却」覆盖面，2026-11-21 审查修复）：本表为模块级
+/// 静态表且无过期主动回收，此前无任何入口可清——用户点「清除冷却」后 429/Server
+/// 冷却的模型最长仍需等 600s 或重启网关。返回清除条目数（供计数回显）
+pub fn clear_all_model_cooldowns() -> usize {
+    let mut map = cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
+    let n = map.len();
+    map.clear();
+    n
+}
+
 /// last_error 时间戳（UTC+8，与 app 日志时间线同区，issue #90 修复②）：
 /// 504 类上游异常是否持续、何时开始，用户此前只能靠猜（正是「切换模型导致」
 /// 误解的成因），带时刻后可与日志逐行对照

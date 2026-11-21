@@ -463,7 +463,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
         if (isTrae && fresh) ok = (await refreshRemainingCredits()) && ok;
         await Promise.all([
           // 按平台只加载本侧数据源
-          isTrae ? refreshCreditsDaily() : Promise.resolve(),
+          isTrae ? refreshCreditsDaily(true) : Promise.resolve(),
           isTrae ? loadUsage(fresh).then((v) => void (ok = ok && v)) : Promise.resolve(),
           // 逐包到期实时查询（issue #82 T5.1）：仅「刷新数据」联动重拉；
           // 进入页面由独立 effect 拉取、调度器静默同步不触发（避免后台静默网络请求）

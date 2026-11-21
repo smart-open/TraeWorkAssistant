@@ -17,10 +17,27 @@ use crate::fs_utils;
 use crate::state::AppState;
 
 use super::http_agent;
+use super::http_agent_with_proxy;
 use super::wb_common::{self, Creds};
 
 /// 盲盒抽取循环上限（防接口异常时死循环；正常 balance 会归零）
 const LOTTERY_MAX_DRAWS: usize = 20;
+
+/// 签到间隔抖动（P4 防风控）：在配置 gap 基础上乘 0.5–1.5 的随机系数，
+/// 打散固定间隔节奏（无 rand 依赖，纳秒熵源）。gap=0（关闭间隔）不抖动。
+fn jittered_gap_secs(gap_secs: u64) -> u64 {
+    if gap_secs == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let jittered = gap_secs * (500 + u64::from(nanos % 1000)) / 1000;
+    // 下限钳制（审查修复）：小 gap 整数除法可能得 0（如 gap=1 且 nanos%1000<500），
+    // 间隔失效——钳到 max(1, gap/2)，保持抖动区间 [0.5gap, 1.5gap) 的下界语义
+    jittered.max(gap_secs / 2).max(1)
+}
 
 /// 签到轮次参数（对齐 python --uid/--skip-checked/--skip-expired/--lazy-hours）
 #[derive(Clone, Default)]
@@ -487,8 +504,53 @@ fn sync_pool_expiry(state: &AppState, aid: &str, creds: &Creds) {
     }
 }
 
+/// wb_checkin_results 文档写互斥（2026-11-20 审查修复，Medium 移植）：append_results /
+/// try_backfill_pending 均为整文档 load→改→save 且无锁——手动签到与调度/CLI 轮次
+/// 并发时后保存方整表覆盖先保存方，本轮签到事件或 T+1 回填结果丢失（pending 标记
+/// 被覆盖后差值回填永久失效，pre_balance 基准随之丢失）。对齐 doubao_checkin_results
+/// record_day_at 同款双层锁：进程内 Mutex 串行化 + CrossProcLock 跨进程互斥；跨进程
+/// 锁 Busy/机制性失败降级进程内锁继续写（尽力不丢——签到记录为本进程侧产出，跳过即
+/// 永久丢失）。降级窗口内跨进程并发写仍可能整文档覆盖丢事件（尽力不丢），SQLite
+/// 写原子性仅防文档损坏、不防丢更新（审查注释修正：原「SQLite 写原子性兜底」
+/// 表述误导）。权衡：try_backfill 持锁跨越余额查询网络往返（秒级），他进程写方
+/// 最长等待 3s 后降级。
+static RESULTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 跨进程锁（append_results / try_backfill_pending 共用 namespace+name）
+fn results_cross_lock(state: &AppState, what: &str) -> Option<crate::tasks::qoder_common::CrossProcLock> {
+    match crate::tasks::qoder_common::CrossProcLock::try_acquire_ns(
+        &state.data_dir,
+        "wb_checkin",
+        "append_results",
+        3_000,
+    ) {
+        (Some(g), _) => Some(g),
+        (None, Some(fail)) => {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[wb_checkin] {what}跨进程锁未获取（{}），降级进程内锁继续写",
+                    fail.describe()
+                ),
+            );
+            None
+        }
+        (None, None) => {
+            // 2026-11-21 审查修复：机制性失败（锁创建不可用）≠ 他方占用——降级静默
+            // 无痕恰是排查「记录为何丢」时最需要留痕的分支（2026-10-04 err=3 同教训）
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                &format!("[wb_checkin] {what}跨进程锁机制性失败，降级进程内锁继续写"),
+            );
+            None
+        }
+    }
+}
+
 /// 签到结果 90 天滚动存储（趋势/日志数据源，F-55/F-22；SQLite 化 P3：wb_checkin_results 表）
 fn append_results(state: &AppState, events: &[Value]) {
+    let _g = RESULTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cross = results_cross_lock(state, "结果落库");
     let store = crate::store::db(&state.data_dir);
     let mut data: Value = crate::store::docs::wb_checkin_results_load(&store);
     let results: Vec<Value> = data
@@ -540,6 +602,10 @@ fn try_backfill_pending(
     headers: &[(String, String)],
     base: &str,
 ) -> Option<f64> {
+    // 与 append_results 同款双层锁（2026-11-20 审查修复移植）：同段 load→改→save，
+    // 与手动/调度轮次并发互斥；持锁跨越余额查询网络往返（见 RESULTS_LOCK 注释权衡）
+    let _g = RESULTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cross = results_cross_lock(state, "T+1 回填");
     let mut results: Value =
         crate::store::docs::wb_checkin_results_load(&crate::store::db(&state.data_dir));
     let diff = backfill_pending_reward(state, aid, agent, headers, base, &mut results)?;
@@ -651,6 +717,8 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     let pre_wb_credits = fetch_wb_credits_balance(state, &aid);
     let (mut kind, mut message, mut reward, mut delayed, mut do_streak, mut dbg_keys) =
         checkin_do(agent, &headers, &urls);
+    // 显式 permanent 字段（调度器 is_permanent_failure 结构化优先；None=不携带）
+    let mut permanent_ev: Option<bool> = None;
     if kind == "auth" {
         // 401：刷新一次仅重试失败分支（禁止二次刷新，F-09）。
         // H-1：加锁刷新 + 二次检查（他人已刷新落库直接复用）+ 内部落库
@@ -674,15 +742,20 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                     reward = None;
                     delayed = false;
                     do_streak = None;
+                    permanent_ev = Some(true);
                 }
             }
             None => {
                 // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）。
-                // NoRefreshToken = 永久不可自愈态（RT 为空且已 401），与 Auth 同样标记（审查 #11）
-                if matches!(
+                // NoRefreshToken = 永久不可自愈态（RT 为空且已 401），与 Auth 同样标记（审查 #11）。
+                // 2026-11-21 审查修复（对齐下方 with_retry M16 口径）：瞬时失败（Network/
+                // BadResponse/Busy）文案不得含「需重新登录」——is_permanent_failure 无结构化
+                // 字段时退化文案匹配会把瞬时刷新失败固化成「当日已跑」放弃重试
+                let auth_dead = matches!(
                     fail_reason,
                     Some(wb_common::RefreshFail::Auth) | Some(wb_common::RefreshFail::NoRefreshToken)
-                ) {
+                );
+                if auth_dead {
                     // issue #118：透传上游 error/error_description，便于区分会话失效与账号封禁
                     let mut reason = format!("签到 refresh 失败: {message}");
                     if let Some(d) = fail_detail.as_deref() {
@@ -691,16 +764,27 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                     wb_common::mark_needs_relogin(state, &aid, &reason);
                 }
                 kind = "fail".into();
-                message = match fail_detail.as_deref() {
-                    Some(d) => format!(
-                        "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
-                        wb_common::refresh_fail_hint(d)
-                    ),
-                    None => "登录态失效且刷新失败，需重新登录".into(),
+                message = if auth_dead {
+                    match fail_detail.as_deref() {
+                        Some(d) => format!(
+                            "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
+                            wb_common::refresh_fail_hint(d)
+                        ),
+                        None => "登录态失效且刷新失败，需重新登录".into(),
+                    }
+                } else {
+                    match fail_detail.as_deref() {
+                        Some(d) => format!(
+                            "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试；上游: {d}（{}）",
+                            wb_common::refresh_fail_hint(d)
+                        ),
+                        None => "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试".into(),
+                    }
                 };
                 reward = None;
                 delayed = false;
                 do_streak = None;
+                permanent_ev = Some(auth_dead);
             }
         }
     }
@@ -792,6 +876,9 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
         );
     }
     let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": status_txt, "message": message });
+    if let Some(p) = permanent_ev {
+        ev["permanent"] = json!(p);
+    }
     if let Some(r) = reward {
         ev["reward"] = json!(r);
     }
@@ -838,10 +925,14 @@ pub fn run_checkin_round(state: &AppState, opts: &CheckinOpts, emit: &mut dyn Fn
     let mut events: Vec<Value> = Vec::new();
     for (i, acct) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(gap_secs));
+            std::thread::sleep(std::time::Duration::from_secs(jittered_gap_secs(gap_secs)));
         }
+        // P4 防风控：账号配置了独立代理则单独构建 agent（出口隔离），否则共用直连 agent
+        let proxy_url = acct.get("proxy_url").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let acct_agent = proxy_url.map(|p| http_agent_with_proxy(30, Some(p)));
+        let agent = acct_agent.as_ref().unwrap_or(&agent);
         // 单账号失败不中断整轮（python try/except 语义；Rust 直调无异常路径）
-        let mut ev = process_account(state, &agent, acct, opts);
+        let mut ev = process_account(state, agent, acct, opts);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);
@@ -851,16 +942,23 @@ pub fn run_checkin_round(state: &AppState, opts: &CheckinOpts, emit: &mut dyn Fn
     let already = events.iter().filter(|e| e["status"] == "already").count();
     let failed = events.len() - ok - already;
     let done = json!({"type": "done", "ok": ok, "already": already, "failed": failed});
-    emit(&done);
+    // 2026-11-21 审查修复：先落库再广播（对齐 qoder issue #190 口径）——done 后立即
+    // 读 wb_checkin_results 的消费端（结果页刷新/启动补签当日判定）原会读到旧数据
     append_results(state, &events);
+    emit(&done);
     done
 }
 
 // ── 成长中心自动化（T2.5/F-17）────────────────────────────────────────────
 
 /// 401 刷新一次重试封装（对齐 python with_retry）：f 以 headers 为参，
-/// 返回 (kind, msg)；kind=auth 时刷新凭证后重试一次。
-fn with_retry<F>(state: &AppState, agent: &ureq::Agent, acct_id: &str, creds: &Creds, f: F) -> (String, String)
+/// 返回 (kind, msg, permanent)；kind=auth 时刷新凭证后重试一次。第三元为
+/// 「凭证级永久失效」（Auth/NoRefreshToken 或刷新成功后仍 401）——消费方
+/// （growth 事件）须把它并入事件的显式 `permanent` 字段，供调度器
+/// is_permanent_failure 剔除重试口径（2026-11-21 审查修复 H-1：此前的
+/// 「显式 permanent 字段」修复只覆盖 wb-checkin 账号事件，growth 路径漏接，
+/// 凭证已死账号在成长轮全天按可重试失败 30→120 分钟退避重试）
+fn with_retry<F>(state: &AppState, agent: &ureq::Agent, acct_id: &str, creds: &Creds, f: F) -> (String, String, bool)
 where
     F: Fn(&[(String, String)]) -> (String, String),
 {
@@ -877,9 +975,9 @@ where
             // 归一为 fail 并回写 needs_relogin（避免 auth 泄漏到上层结果）
             if kind2 == "auth" {
                 wb_common::mark_needs_relogin(state, acct_id, "刷新后仍 401");
-                return ("fail".into(), "登录态失效（刷新后仍 401），需重新登录".into());
+                return ("fail".into(), "登录态失效（刷新后仍 401），需重新登录".into(), true);
             }
-            return (kind2, msg2);
+            return (kind2, msg2, false);
         }
         // 审查修复（M16）：按 RefreshFail 枚举区分文案——仅 Auth/NoRefreshToken 归为
         // 登录态问题（前者标 needs_relogin，后者无 rt 永不自愈同样标记，审查 #11）；
@@ -903,7 +1001,7 @@ where
                 ),
                 None => "登录态失效且刷新失败".into(),
             };
-            return ("fail".into(), msg_fail);
+            return ("fail".into(), msg_fail, true);
         }
         let msg_fail = match fail_detail.as_deref() {
             Some(d) => format!(
@@ -912,13 +1010,154 @@ where
             ),
             None => "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试".into(),
         };
-        return ("fail".into(), msg_fail);
+        return ("fail".into(), msg_fail, false);
     }
-    (kind, msg)
+    (kind, msg, false)
 }
 
-/// Buddy 旅行：status → arrived 则 claim → config → depart（各步独立容错）
-fn growth_travel(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) -> (String, String) {
+/// 旅行行程三态（issue #210）：到达（领奖+出发）/ 在途（跳过）/ 空闲（直接出发）。
+/// 旧行为二值化——`!arrived` 一律按在途跳过：行程结束已领走/首次使用/响应结构
+/// 变化（行程字段被 record 等业务容器包裹，dig 只沿信封键下钻会漏）时喵喵永远
+/// 不会再被派出，奖励也永远不会被领取。
+#[derive(PartialEq, Eq, Debug)]
+enum TravelState {
+    Arrived,
+    InTransit,
+    Idle,
+}
+
+/// 在途状态串白名单（精确值匹配，防 API 信封顶层 `status:"success"` 误判在途）
+const TRAVELING_STATUS: [&str; 6] =
+    ["traveling", "travelling", "on_trip", "in_transit", "ongoing", "on_the_way"];
+
+/// 明确「无行程/已结束」状态词（审查修复 2026-11-18）：行程专用键命中这些值时，
+/// 覆盖残留 record_id/destination 的在途推断——旧逻辑有 record 即在途，行程结束但
+/// arrived 字段名不匹配（响应结构漂移）时会「不出发不领奖」卡死且无自救
+const IDLE_STATUS: [&str; 9] = [
+    "idle", "none", "no_trip", "not_traveling", "finished", "completed", "done",
+    "cancelled", "canceled",
+];
+
+/// 旅行字段递归深挖：精确键名命中（travel/status 的行程字段可能被 record/trip
+/// 等业务容器包裹——dig 只沿信封键下钻会漏，导致 arrived/record_id 全部 miss）。
+/// 与 deep_reward_dig 同模式：限深 8、精确等值匹配（不做 contains，防误命中）。
+fn deep_travel_dig<'a>(v: &'a Value, keys: &[&str], depth: usize) -> Option<&'a Value> {
+    if depth > 8 {
+        return None;
+    }
+    match v {
+        Value::Object(m) => {
+            for k in keys {
+                if let Some(hit) = m.get(*k) {
+                    return Some(hit);
+                }
+            }
+            m.values()
+                .filter(|val| val.is_object() || val.is_array())
+                .find_map(|val| deep_travel_dig(val, keys, depth + 1))
+        }
+        Value::Array(a) => a.iter().find_map(|x| deep_travel_dig(x, keys, depth + 1)),
+        _ => None,
+    }
+}
+
+/// 旅行状态判定：arrived 真值 → Arrived；有行程标识（record_id / 目的地 /
+/// 在途状态串）→ InTransit；其余（空响应/无任何行程字段）→ Idle 按空闲出发。
+/// 误判在途的代价 = 喵喵永不出发（issue #210 主症状），故无标识时宁可出发——
+/// 服务端对「无行程时出发」只会拒绝，下次调度自然重试。
+fn classify_travel(b: &Value) -> TravelState {
+    if py_truthy(deep_travel_dig(b, &["arrived", "is_arrived", "has_arrived"], 0)) {
+        return TravelState::Arrived;
+    }
+    // 行程标识须为「有值」：null 字段（空闲常见形状 {"record_id":null}）不算
+    // 在途证据（审查 issue #1，与下方 claim 侧 record_id 的 null 过滤同口径）。
+    // 第五轮审查修复：空串同理不算（{"record_id":"","destination":""} 形态
+    // 此前被当作在途证据 → 误判在途不出发）
+    let nonempty_str = |v: &Value| !v.is_null() && v.as_str().map_or(true, |s| !s.trim().is_empty());
+    let has_record = deep_travel_dig(b, &["record_id", "recordId"], 0)
+        .filter(|v| nonempty_str(v))
+        .is_some();
+    let has_dest = deep_travel_dig(b, &["destination"], 0)
+        .filter(|v| nonempty_str(v))
+        .is_some();
+    // status 证据分级（审查修复 2026-11-18）：行程专用键（trip_status/travel_status）
+    // 可信；泛化键 "status" 可能命中无关业务容器（如 task.status="done"），仅在前者
+    // miss 时兜底读取（不影响下方 record/dest 推断）
+    let travel_status = deep_travel_dig(b, &["trip_status", "travel_status"], 0)
+        .map(|v| s_of(Some(v)))
+        .filter(|s| !s.is_empty());
+    let status_str = travel_status
+        .clone()
+        .or_else(|| {
+            deep_travel_dig(b, &["status"], 0)
+                .map(|v| s_of(Some(v)))
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // 明确「无行程/已结束」状态覆盖残留 record_id/destination 误判：行程结束但
+    // arrived 字段名不匹配时，残留 record 曾把状态钉死在 InTransit（不出发不领奖
+    // 无自救）。否定证据仅信任行程专用键——泛化键误覆盖会把真在途误判 Idle 触发
+    // 无效出发；误判 Idle 的代价仅 depart 被服务端拒绝后下轮重试，可自纠，故宁可出发
+    let idle_override = travel_status
+        .map(|s| IDLE_STATUS.contains(&s.to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    let traveling = !idle_override
+        && (has_record || has_dest || TRAVELING_STATUS.contains(&status_str.as_str()));
+    if traveling {
+        TravelState::InTransit
+    } else {
+        TravelState::Idle
+    }
+}
+
+/// JSON 键路径摘要（脱敏：只记键名不含值，与签到 dbg_keys 同红线，供诊断校准）
+fn key_paths_of(b: &Value) -> String {
+    let mut paths = Vec::new();
+    collect_key_paths(b, "", 0, &mut paths);
+    if paths.is_empty() {
+        "（响应无可记键）".to_string()
+    } else {
+        paths.join(" | ")
+    }
+}
+
+/// 查目的地配置并出发（config 失败不阻塞 depart；destinations 数组配置取首个）。
+/// 返回 (depart 是否 2xx, 目的地文本, 状态码)。
+fn travel_depart(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    urls: &Urls,
+) -> (bool, String, u16) {
+    let dest = wb_common::get_json(agent, &urls.travel_config, headers)
+        .1
+        .filter(|b2| b2.is_object())
+        .and_then(|b2| fs_utils::dig(&b2, &["destination", "destinations", "name", "target"]).cloned())
+        .map(|v| match v {
+            Value::Array(a) => a.into_iter().next().unwrap_or(Value::Null),
+            other => other,
+        });
+    let depart_body = match &dest {
+        Some(d) if !d.is_null() => json!({ "destination": d }),
+        _ => json!({}),
+    };
+    let (st3, _b3, _r3) = wb_common::post_json_raw(agent, &urls.travel_depart, headers, &depart_body);
+    let dest_txt = dest
+        .filter(|d| !d.is_null())
+        .as_ref()
+        .map(|d| format!("（{}）", value_display(d)))
+        .unwrap_or_default();
+    ((200..=201).contains(&st3), dest_txt, st3)
+}
+
+/// Buddy 旅行（issue #210 三态）：status → Arrived 则 claim→depart / InTransit
+/// 跳过 / Idle 直接出发（无奖可领）。各步独立容错。
+fn growth_travel(
+    state: &AppState,
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    urls: &Urls,
+) -> (String, String) {
     let (status, body, raw) = wb_common::get_json(agent, &urls.travel_status, headers);
     if status == 401 {
         return ("auth".into(), "登录态失效（401）".into());
@@ -933,16 +1172,38 @@ fn growth_travel(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls)
         return ("fail".into(), msg);
     }
     let b = body.as_ref().unwrap();
-    let arrived = py_truthy(fs_utils::dig(b, &["arrived", "is_arrived", "has_arrived"]));
-    let record_id = fs_utils::dig(b, &["record_id", "recordId"]).cloned();
-    if !arrived {
-        // 未到达：报告在途状态即可
-        let dest = fs_utils::dig(b, &["destination", "name", "target"]).map(|v| s_of(Some(v)));
-        let suffix = dest
-            .filter(|d| !d.is_empty())
-            .map(|d| format!("（{d}）"))
-            .unwrap_or_default();
-        return ("skip".into(), format!("旅行在途{suffix}"));
+    // record_id 深挖（claim 入参；可能被业务容器包裹）
+    let record_id = deep_travel_dig(b, &["record_id", "recordId"], 0)
+        .filter(|v| !v.is_null())
+        .cloned();
+    match classify_travel(b) {
+        TravelState::InTransit => {
+            // 在途：报告在途状态即可
+            let dest = fs_utils::dig(b, &["destination", "name", "target"]).map(|v| s_of(Some(v)));
+            let suffix = dest
+                .filter(|d| !d.is_empty())
+                .map(|d| format!("（{d}）"))
+                .unwrap_or_default();
+            return ("skip".into(), format!("旅行在途{suffix}"));
+        }
+        TravelState::Idle => {
+            // 空闲（无行程）：无奖可领，直接出发。旧行为此处误判「旅行在途」致
+            // 喵喵永不出发（issue #210）；未识别出任何行程字段时落键路径诊断
+            //（脱敏：只记键名），供按真实响应结构校准
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "wb 旅行状态未识别出在途/到达字段（按空闲处理并出发），响应键路径: {}",
+                    key_paths_of(b)
+                ),
+            );
+            let (ok, dest_txt, st3) = travel_depart(agent, headers, urls);
+            if ok {
+                return ("ok".into(), format!("已出发{dest_txt}"));
+            }
+            return ("fail".into(), format!("出发失败（HTTP {st3}）"));
+        }
+        TravelState::Arrived => {}
     }
     // 领奖
     let claim_body = match &record_id {
@@ -959,20 +1220,8 @@ fn growth_travel(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls)
         format!("claim 失败（HTTP {st1}）")
     };
     // 查目的地配置并出发（config 失败不阻塞 depart）
-    let dest = wb_common::get_json(agent, &urls.travel_config, headers)
-        .1
-        .filter(|b2| b2.is_object())
-        .and_then(|b2| fs_utils::dig(&b2, &["destination", "name", "target"]).cloned());
-    let depart_body = match &dest {
-        Some(d) => json!({"destination": d}),
-        None => json!({}),
-    };
-    let (st3, _b3, _r3) = wb_common::post_json_raw(agent, &urls.travel_depart, headers, &depart_body);
-    let dest_txt = dest
-        .as_ref()
-        .map(|d| format!("（{}）", value_display(d)))
-        .unwrap_or_default();
-    if (200..=201).contains(&st3) {
+    let (ok, dest_txt, st3) = travel_depart(agent, headers, urls);
+    if ok {
         return ("ok".into(), format!("领奖{claim_txt}，已出发{dest_txt}"));
     }
     ("ok".into(), format!("领奖{claim_txt}；depart 失败（HTTP {st3}）"))
@@ -1058,7 +1307,7 @@ fn growth_tasks(agent: &ureq::Agent, headers: &[(String, String)], urls: &Urls) 
         return ("fail".into(), msg);
     }
     let b = body.as_ref().unwrap();
-    let tasks: Vec<&Value> = fs_utils::dig(b, &["tasks", "list", "records"])
+    let tasks: Vec<&Value> = fs_utils::dig(b, &["tasks", "list", "records", "items", "task_list", "taskList"])
         .and_then(Value::as_array)
         .map(|a| a.iter().collect())
         .unwrap_or_default();
@@ -1148,24 +1397,44 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
         Some(aid.clone()),
     ]);
     let base_ev = json!({"type": "growth", "user_id": aid, "name": name});
-    let (creds, _refreshed, note) = wb_common::ensure_fresh(state, agent, acct, 24);
+    let (creds, refreshed, note) = wb_common::ensure_fresh(state, agent, acct, 24);
     if creds.access_token.is_empty() {
         return cred_missing_event(Some("growth"), &aid, &base_ev["name"], &note);
+    }
+    // 对齐签到路径：惰性刷新成功后回写池过期时间，否则账号列表/到期日历
+    // 显示陈旧（签到轮与 wb-renew 均同步，唯 growth 漏）
+    if refreshed {
+        sync_pool_expiry(state, &aid, &creds);
     }
     let urls = urls_for(wb_common::region_billing_base(&creds.domain));
 
     let mut result = Map::new();
+    // 审查修复（H-1，2026-11-21）：记录首个失败文案与「全部失败均凭证级永久」——
+    // status=fail 事件须携带 message/permanent，调度器 is_permanent_failure 以
+    // 结构化字段为权威（文案退化匹配读 message，growth 事件此前两字段皆缺省恒判可重试）
+    let mut fail_meta: Option<(String, bool)> = None;
+    let mut note_fail = |kind: &str, msg: &str, permanent: bool, key: &str, result: &mut Map<String, Value>| {
+        if kind == "fail" {
+            result.insert(key.to_string(), json!("fail"));
+            fail_meta = Some(match fail_meta.take() {
+                Some((m, all_perm)) => (m, all_perm && permanent),
+                None => (msg.to_string(), permanent),
+            });
+        } else {
+            result.insert(key.to_string(), json!(msg));
+        }
+    };
     if flags.travel {
-        let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_travel(agent, h, &urls));
-        result.insert("travel".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
+        let (kind, msg, permanent) = with_retry(state, agent, &aid, &creds, |h| growth_travel(state, agent, h, &urls));
+        note_fail(&kind, &msg, permanent, "travel", &mut result);
     }
     if flags.lottery {
-        let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_lottery(agent, h, &urls));
-        result.insert("lottery".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
+        let (kind, msg, permanent) = with_retry(state, agent, &aid, &creds, |h| growth_lottery(agent, h, &urls));
+        note_fail(&kind, &msg, permanent, "lottery", &mut result);
     }
     if flags.tasks {
-        let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_tasks(agent, h, &urls));
-        result.insert("tasks".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
+        let (kind, msg, permanent) = with_retry(state, agent, &aid, &creds, |h| growth_tasks(agent, h, &urls));
+        note_fail(&kind, &msg, permanent, "tasks", &mut result);
     }
     // 能量/连签（不带刷新重试，纯展示）
     let headers = wb_common::build_auth_headers(&creds, false);
@@ -1186,6 +1455,14 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     for (k, v) in result {
         ev[k.as_str()] = v;
     }
+    if status == "fail" {
+        if let Some((msg, all_perm)) = fail_meta {
+            // 审查修复（H-1）：失败事件补 message/permanent（cred_missing 路径经
+            // cred_missing_event 早已携带；此为 with_retry 失败路径补齐）
+            ev["message"] = json!(msg);
+            ev["permanent"] = json!(all_perm);
+        }
+    }
     ev
 }
 
@@ -1202,13 +1479,18 @@ pub fn run_growth_round(state: &AppState, flags: &GrowthOpts, uids: &[String], e
         accounts.retain(|a| uids.iter().any(|u| s_of(a.get("id")) == *u));
     }
     emit(&json!({"type": "start", "total": accounts.len(), "mode": "growth"}));
-    // 多账号成长间隔（与签到共用 wb_checkin_gap_secs，默认 3s，0=关闭）：防上游频控
+    // 多账号成长间隔（与签到共用 wb_checkin_gap_secs，默认 3s，0=关闭）：防上游频控，
+    // 同签到一样叠加抖动（P4 防风控）
     let gap_secs = crate::models::effective_checkin_gap(state.settings().wb_checkin_gap_secs);
     for (i, acct) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(gap_secs));
+            std::thread::sleep(std::time::Duration::from_secs(jittered_gap_secs(gap_secs)));
         }
-        let mut ev = process_account_growth(state, &agent, acct, flags);
+        // P4：独立代理账号单独构建 agent（与签到轮一致）
+        let proxy_url = acct.get("proxy_url").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let acct_agent = proxy_url.map(|p| http_agent_with_proxy(30, Some(p)));
+        let agent = acct_agent.as_ref().unwrap_or(&agent);
+        let mut ev = process_account_growth(state, agent, acct, flags);
         ev["index"] = json!(i + 1);
         emit(&ev);
     }
@@ -1251,6 +1533,78 @@ pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Value {
 #[cfg(test)]
 mod wb_checkin_tests {
     use super::*;
+
+    // ── issue #210：旅行三态判定 ──
+
+    #[test]
+    fn deep_travel_dig_finds_fields_wrapped_in_business_containers() {
+        // 行程字段被 record 容器包裹（非信封键）——dig 沿信封键下钻恒 miss，
+        // 旧行为据此误判「旅行在途」致喵喵永不出发；深挖按精确键名命中
+        let b = json!({"code": 0, "data": {"record": {"record_id": "r1", "arrived": true}}});
+        assert_eq!(fs_utils::dig(&b, &["arrived"]), None);
+        assert!(py_truthy(deep_travel_dig(&b, &["arrived", "is_arrived"], 0)));
+        assert_eq!(
+            deep_travel_dig(&b, &["record_id", "recordId"], 0).and_then(Value::as_str),
+            Some("r1")
+        );
+    }
+
+    #[test]
+    fn classify_travel_three_states() {
+        // 到达：领奖 + 出发
+        assert_eq!(
+            classify_travel(&json!({"data": {"arrived": true, "record_id": "r"}})),
+            TravelState::Arrived
+        );
+        // 在途：有行程标识（record / 目的地 / 在途状态串）
+        assert_eq!(
+            classify_travel(&json!({"data": {"record_id": "r", "destination": "上海"}})),
+            TravelState::InTransit
+        );
+        assert_eq!(
+            classify_travel(&json!({"data": {"trip_status": "Traveling"}})),
+            TravelState::InTransit
+        );
+        // 空闲：无任何行程字段（旧行为误判「旅行在途」永不出发，issue #210）
+        assert_eq!(classify_travel(&json!({"code": 0, "data": null})), TravelState::Idle);
+        assert_eq!(classify_travel(&json!({"code": 0, "data": {}})), TravelState::Idle);
+        assert_eq!(classify_travel(&json!({"data": {"status": "idle"}})), TravelState::Idle);
+        // null 字段不算行程证据（空闲常见形状，审查 issue #1）
+        assert_eq!(
+            classify_travel(&json!({"data": {"record_id": null, "destination": null}})),
+            TravelState::Idle
+        );
+        assert_eq!(
+            classify_travel(&json!({"data": {"record": {"record_id": null}}})),
+            TravelState::Idle
+        );
+        // API 信封顶层 status:"success" 不得误判在途
+        assert_eq!(
+            classify_travel(&json!({"code": 0, "status": "success", "data": {}})),
+            TravelState::Idle
+        );
+        // 审查修复 2026-11-18：行程结束但 arrived 字段名不匹配 → 专用键明确
+        // 「已结束」覆盖残留 record/dest，不再钉死在途（不出发不领奖无自救）
+        assert_eq!(
+            classify_travel(&json!({"data": {"record_id": "r", "trip_status": "finished"}})),
+            TravelState::Idle
+        );
+        // 泛化键 "status" 的否定词不作否定证据（可能命中无关容器 task.status="done"）：
+        // 专用键 miss 时保留 record/dest 推断，真在途不误判 Idle
+        assert_eq!(
+            classify_travel(&json!({"data": {"record_id": "r", "task": {"status": "done"}}})),
+            TravelState::InTransit
+        );
+    }
+
+    #[test]
+    fn key_paths_of_masks_values() {
+        // 诊断只记键名不含值（红线：日志不得落业务数据）
+        let b = json!({"code": 0, "data": {"record": {"record_id": "secret"}}});
+        let paths = key_paths_of(&b);
+        assert!(!paths.contains("secret"));
+        assert!(paths.contains("code") && paths.contains("record_id"));
+    }
 
     #[test]
     fn cred_missing_event_vault_down_is_transient() {

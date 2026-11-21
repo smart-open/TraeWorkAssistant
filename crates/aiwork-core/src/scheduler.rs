@@ -167,6 +167,15 @@ fn sched_plan(st: &AppState, cfg: &Value, t: &SchedTask) -> SchedPlan {
     if t.key == "qoder-refresh" {
         return SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS);
     }
+    // Trae JWT 续期（issue #201 P2 移植）：固定每 6 小时（对齐 qoder-refresh 先例）。
+    // 原 daily 05:30 仅一次机会，服务器时区偏差/容器重启错过窗口或瞬态失败即整日
+    // 停摆；48h 惰性窗内 6h 间隔最多 8 次触发，单次瞬态失败可自愈。真实刷新仍由
+    // lazy_refresh_needed 门控（每 tick 全量判定，未到期即空转），轮换频率不因调度
+    // 加密而增加。scheduler_cfg.task_times 的 trae-jwt-renew 时刻保留兼容旧落盘
+    // JSON（不再参与判定）
+    if t.key == "trae-jwt-renew" {
+        return SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS);
+    }
     // Qoder 会话流水定时合并（移植 main）：固定每 6 小时，hhmm 不参与判定
     if t.key == "qoder-sessions-compact" {
         return SchedPlan::EveryHours(COMPACT_INTERVAL_HOURS);
@@ -269,7 +278,15 @@ fn tick(st: &AppState) {
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：每日 HH:MM 或「每小时」）
         let trigger = match sched_plan(st, &cfg, t) {
-            SchedPlan::Skip => continue,
+            // issue #220 P1：wb-checkin 关闭（auto_checkin=false）不再完全静默——
+            // 状态文件落一行「未开启自动签到，已跳过」摘要；不写 last_run_date，
+            // 当日中途开启后到点仍会补跑。其余任务关闭属正常态，保持静默
+            SchedPlan::Skip => {
+                if t.key == "wb-checkin" {
+                    mark_skip_note(st, t.key, "未开启自动签到，已跳过");
+                }
+                continue;
+            }
             SchedPlan::Daily(hhmm) => {
                 if last_run_date(&state, t.key).as_deref() == Some(today.as_str()) {
                     continue;
@@ -363,6 +380,32 @@ fn tick(st: &AppState) {
                         &st.data_dir,
                         &format!("[调度器] {}（{trigger}）：{}", t.name, summary),
                     );
+                    // 定时任务完成推送（issue #222 移植）：默认关（notify_cfg.on_task_success）。
+                    // 普通空池 skipped（无账号空转，「无 X 账号」类 summary）与 empty_pool
+                    // 同义不推——审查修复 #5：避免 trivial skip 噪声耗尽渠道免费额度；
+                    // 后台版推送（审查修复 #1）：四渠道 HTTP 最坏 ~40s 不阻塞调度 tick
+                    // 循环（docker 适配 notify::send_bg 后台线程版），渠道失败静默
+                    // 审查修复（major）：成功推送仅限奖励型任务（success_pushable 白名单，
+                    // Daily 语义 mark_run 保证每任务至多 1 次/日，全开 ≤5 条/日）——
+                    // 快照/续期/目录同步类恒开任务最高每 2h 一轮，全量推送每日可达
+                    // 90+ 条，会在故障发生前耗尽 Server酱免费档每日 5 条额度，
+                    // 失败告警反被成功侧挤占发不出去
+                    if v.get("skipped").is_none()
+                        && notify_cfg.on_task_success
+                        && success_pushable(t.key)
+                    {
+                        // #222 语义修正：任务 Ok ≠ 账号级零失败（永久性失败剔除出重试
+                        // 判定后整轮仍 Ok，如 wb-growth 全部凭证失败仍 Ok）。返回值带
+                        // failed 计数且 >0 时标题分流「完成（含失败 n）」，正文（summary）
+                        // 不变；无 failed 字段或为 0 的任务保持原标题
+                        let failed_n = v.get("failed").and_then(Value::as_i64).unwrap_or(0);
+                        let title = if failed_n > 0 {
+                            format!("{} 完成（含失败 {}）", t.name, failed_n)
+                        } else {
+                            format!("{} 完成", t.name)
+                        };
+                        crate::notify::send_bg(st, title, summary.clone(), "task_success");
+                    }
                     // 看板数据同步成功 → 通知前端重读缓存（issue #61 前端联动：
                     // Dashboard listen 后按 platform 匹配静默 refresh(false)，零额外网络）
                     if let Some(p) = board_platform(t.key) {
@@ -375,7 +418,9 @@ fn tick(st: &AppState) {
                         // 门禁暂停轮（skipped_fail_streak）：标题用「暂停」——正文已是
                         // 「已暂停…」，标题再叫「完成」自相矛盾
                         let verb = if v.get("skipped_fail_streak").is_some() { "暂停" } else { "完成" };
-                        crate::notify::send(st, &format!("{}{verb}", t.name), &summary, "checkin");
+                        // 2026-11-21 审查修复：改 send_bg（对齐上方 task_success）——同步
+                        // send 最坏 ~30s×3 阻塞调度 tick，顺延后续任务执行
+                        crate::notify::send_bg(st, format!("{}{verb}", t.name), summary.clone(), "checkin");
                     }
                 }
             }
@@ -392,9 +437,9 @@ fn tick(st: &AppState) {
                         t.name, summary
                     ),
                 );
-                // T11：任务失败推送（全部任务；通知内部再按总开关静默）
+                // T11：任务失败推送（全部任务；通知内部再按总开关静默）——send_bg 防 HTTP 阻塞 tick
                 if notify_cfg.on_task_failed {
-                    crate::notify::send(st, &format!("{}失败", t.name), &summary, "task_failed");
+                    crate::notify::send_bg(st, format!("{}失败", t.name), summary.clone(), "task_failed");
                 }
             }
         }
@@ -487,8 +532,11 @@ fn task_hours(st: &AppState) -> std::collections::HashMap<String, i64> {
 /// 与页面承诺不符。此处仅对 buddy-ai 四任务补 settings 二级回退（对齐蓝本
 /// `effective_hhmm`），非法 HH:MM 值回退默认，不阻断调度。
 fn effective_hhmm_from(st: &AppState, cfg: &Value, t: &SchedTask) -> String {
-    if let Some(v) = task_times_from(cfg).get(t.key) {
-        return v.clone();
+    // task_times 读取侧同口径校验（2026-11-21 审查修复）：写侧 valid_hhmm 校验
+    // 上线前的存量 kv 脏值（如 "9:00"，4 字符）会让字符串比较时间序失真——
+    // 非法值回退内置默认，与下方 settings 回退路径的 hhmm_valid 过滤一致
+    if let Some(v) = task_times_from(cfg).get(t.key).filter(|v| hhmm_valid(v)) {
+        return v.trim().to_string();
     }
     let s = st.settings();
     let from_settings: Option<&String> = match t.key {
@@ -776,7 +824,7 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                     }
                     matches!(
                         e.get("error_type").and_then(Value::as_str),
-                        Some("SessionDead") | Some("AuthRejected") | Some("DeviceSigned")
+                        Some("SessionDead") | Some("AuthRejected") | Some("DeviceSigned") | Some("BadJwt")
                     )
                 })
                 .count() as i64;
@@ -937,7 +985,10 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             } else {
                 "WB 成长完成".to_string()
             };
-            Ok(json!({ "ok": true, "summary": summary }))
+            // #222 语义：Ok ≠ 账号级零失败——可重试失败已 Err 上抛，走到此处仍可能
+            // 含永久性凭证失败（此时 failed == failed_permanent），补 failed 计数供
+            // 成功推送标题分流（「完成（含失败 n）」），避免标题「完成」掩盖失败真相
+            Ok(json!({ "ok": true, "summary": summary, "failed": failed }))
         }
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
         "wb-renew" => Ok(crate::tasks::wb_checkin::run_renew_only(st, 24)),
@@ -1098,17 +1149,14 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             let opts = crate::tasks::qoder_checkin::QoderCheckinOpts::daily();
             let done = crate::tasks::qoder_checkin::run_checkin_round(st, &opts, &mut |_| {});
             // 审查 M-1：存在失败账号时返 Err，交调度器 30 分钟冷却重试（暂态失败自愈）。
-            // P2 重试口径：empty_campaigns（活动未上线/不可用）属非用户可操作失败，
-            // 计入重试只会全天无效重试 + 当日首败误报通知——按 failed - failed_empty_campaigns
-            // > 0 判定。done 事件恒携带该字段；缺字段时 as_i64 为 None → 0，安全兼容
+            // P2 重试口径：永久性认证失败与 BLOCKED 从重试判定剔除；empty_campaigns
+            //（无签到任务）2026-11-21 起归类 skip、不计入 failed，天然豁免重试
+            //（对照 qoder_checkin::run_checkin_round 的设计注释）
             let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
-            let failed_empty = done
-                .get("failed_empty_campaigns")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
             // 审查 minor：永久性认证失败（pat_rejected/expired_needs_relogin/auth_dead）
-            // 重试注定失败，与 empty_campaigns 一并从重试判定剔除——否则失效账号
+            // 重试注定失败，从重试判定剔除——否则失效账号
             // 会拖动整轮全天约 28 次冷却重试（含每轮必败的刷新请求）
+            // issue #223：未满足活动资格（体验版 skip）不计入 failed，自然豁免
             let failed_permanent = done
                 .get("failed_permanent")
                 .and_then(Value::as_i64)
@@ -1117,7 +1165,7 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             // 同样注定失败（信任单列需用户在风控页确认），从重试判定剔除——
             // 与 qoder_checkin 内部重试链同口径（审查修复）
             let failed_blocked = done.get("failed_blocked").and_then(Value::as_i64).unwrap_or(0);
-            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
+            if failed - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(Value::as_i64).unwrap_or(0);
                 return Err(format!(
@@ -1313,6 +1361,45 @@ fn mark_fail(st: &AppState, key: &str, summary: &str) {
     );
 }
 
+/// 关闭态摘要落盘（issue #220 P1）：wb-checkin 关闭不再完全静默，状态页/排查
+/// 日志可见原因。仅在摘要变化时写（tick 每 60s 一轮，原样重写是无谓落库）；
+/// 合并写入（审查修复）——last_fail_ts 等既有字段保留，重新开启后冷却语义
+/// 连续；缺失条目场景由 write_entry 落整对象，mark_run/mark_fail 仍会自然重建
+fn mark_skip_note(st: &AppState, key: &str, summary: &str) {
+    let state = load_state(st);
+    let cur = state
+        .pointer(&format!("/tasks/{key}/last_summary"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if cur == summary {
+        return;
+    }
+    // 审查修复：write_entry 是 tasks[key]=entry 整体覆盖（C6 注释明言字段丢失
+    // 风险），直接写 {last_summary} 会抹掉 last_fail_ts（失败冷却）/last_ok/
+    // last_run_ts——关→开后会绕过冷却重试、当日已签重复跑。改为读现有 entry
+    // 合并写回，其余字段原样保留
+    let mut entry = state
+        .pointer(&format!("/tasks/{key}"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("last_summary".to_string(), json!(summary));
+    }
+    write_entry(st, key, entry);
+}
+
+/// 定时任务完成推送（issue #222 移植）白名单：仅奖励型任务（漏跑=丢收益的签到/成长）。
+/// Daily 语义 mark_run 关闭当日重复触发，保证每任务至多推送 1 次/日（全开 ≤5 条）；
+/// 恒开的快照/续期/同步类任务频率高（credits 类默认每 2h、续期每 6h）且无用户
+/// 可操作收益，成功推送纯噪声且挤占渠道免费额度（Server酱 每日 5 条），不推。
+/// 注：docker 无 doubao-checkin 任务，白名单较 main 少一项
+fn success_pushable(task_key: &str) -> bool {
+    matches!(
+        task_key,
+        "trae-checkin" | "wb-checkin" | "qoder-checkin" | "buddy-ai-checkin" | "wb-growth"
+    )
+}
+
 fn write_entry(st: &AppState, key: &str, entry: Value) {
     let mut root = load_state(st);
     if let Some(obj) = root.as_object_mut() {
@@ -1339,7 +1426,36 @@ fn summarize(v: &Value, task_key: &str) -> String {
         let get = |k: &str| v.get(k).and_then(Value::as_i64);
         if let (Some(o), Some(a), Some(f)) = (get("ok"), get("already"), get("failed")) {
             let already_word = if task_key == "buddy-ai-checkin" { "已完成" } else { "已签" };
-            return format!("成功 {o}，{already_word} {a}，失败 {f}");
+            // 审查修复：skip（体验版未满足资格，issue #223）单列展示——否则
+            // skip-only 轮次推送「成功 0，已签 0，失败 0」全 0 数字误导
+            let mut s = format!("成功 {o}，{already_word} {a}，失败 {f}");
+            // 跳过合计（未满足资格 + 无签到任务，均为确定性跳过非失败，2774d48 口径）
+            let sk = get("skipped_ineligible").unwrap_or(0) + get("skipped_empty_campaigns").unwrap_or(0);
+            if sk > 0 {
+                s.push_str(&format!("，跳过 {sk}"));
+            }
+            return s;
+        }
+        // 审查修复：无计数字段的对象改用 key=value 摘要（原实现 JSON 序列化截断
+        // 120 字符推送到手机不可读）；嵌套/数组值收窄为 …，整体仍截断 120
+        let parts: Vec<String> = v
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .take(6)
+                    .map(|(k, val)| match val {
+                        Value::String(s) => format!("{k}={s}"),
+                        Value::Number(n) => format!("{k}={n}"),
+                        Value::Bool(b) => format!("{k}={b}"),
+                        Value::Null => format!("{k}=null"),
+                        _ => format!("{k}=…"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !parts.is_empty() {
+            let s = parts.join("，");
+            return s.chars().take(120).collect();
         }
     }
     let s = serde_json::to_string(v).unwrap_or_default();
@@ -1440,6 +1556,30 @@ mod sched_plan_tests {
         assert_eq!(growth_fail_stats(&[]), (0, 0));
     }
 
+    /// 审查修复（H-1，2026-11-21）回归锁：with_retry 失败路径的 growth 事件须携带
+    /// 显式 message/permanent——凭证级失效（登录态失效且刷新失败）不得因文案不含
+    /// 「需重新登录」而漏判永久、全天按可重试失败退避重试
+    #[test]
+    fn growth_with_retry_fail_event_is_permanent_when_credential_dead() {
+        // with_retry auth_dead 分支事件形态（process_account_growth 产出）
+        let ev = json!({
+            "type": "growth", "status": "fail",
+            "message": "登录态失效且刷新失败；上游: invalid_grant（凭证已被服务端吊销）",
+            "permanent": true,
+        });
+        assert!(is_permanent_failure(&ev));
+        let (failed, permanent) = growth_fail_stats(&[ev.clone()]);
+        assert_eq!((failed, permanent), (1, 1));
+        // 瞬时刷新失败分支事件形态：可重试，不得被文案翻案
+        let transient = json!({
+            "type": "growth", "status": "fail",
+            "message": "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试",
+            "permanent": false,
+        });
+        assert!(!is_permanent_failure(&transient));
+        assert_eq!(growth_fail_stats(&[transient]), (1, 0));
+    }
+
     fn task(key: &str) -> &'static SchedTask {
         TASKS.iter().find(|t| t.key == key).unwrap()
     }
@@ -1486,7 +1626,9 @@ mod sched_plan_tests {
         assert!(matches!(sched_plan(&st, &cfg, task("wb-checkin")), SchedPlan::Daily(_)));
     }
 
-    /// 停用名单与外部设置门（wb-checkin → 启动自动补签）任一不满足即 Skip
+    /// 停用名单与外部设置门（wb-checkin → 启动自动补签）任一不满足即 Skip。
+    /// issue #220 P1 后 auto_checkin 默认开启，显式落 false 才触发外部设置门
+    ///（ wb-checkin 关闭态仍会在 tick 落「未开启自动签到」摘要，不再完全静默）
     #[test]
     fn disabled_or_external_gate_skips() {
         let st = temp_state("gate");
@@ -1495,6 +1637,9 @@ mod sched_plan_tests {
             sched_plan(&st, &cfg, task("trae-credits-snapshot")),
             SchedPlan::Skip
         ));
+        crate::store::db(&st.data_dir)
+            .kv_set_raw("workbuddy_settings", r#"{"auto_checkin":false}"#)
+            .unwrap();
         assert!(matches!(
             sched_plan(&st, &json!({}), task("wb-checkin")),
             SchedPlan::Skip
@@ -1514,6 +1659,21 @@ mod sched_plan_tests {
         match sched_plan(&st, &json!({}), t) {
             SchedPlan::Daily(hhmm) => assert_eq!(hhmm, t.hhmm),
             _ => panic!("models-sync 应为每日计划"),
+        }
+    }
+
+    /// trae-jwt-renew 每 6 小时（issue #201 P2 移植）：时刻配置不参与判定，
+    /// 真实刷新由 lazy_refresh_needed 门控（调度层不重复验证）
+    #[test]
+    fn trae_jwt_renew_is_every6h() {
+        let st = temp_state("trenew");
+        let cfg = json!({
+            "task_times": { "trae-jwt-renew": "12:00" },
+            "task_modes": { "trae-jwt-renew": "hourly" },
+        });
+        match sched_plan(&st, &cfg, task("trae-jwt-renew")) {
+            SchedPlan::EveryHours(h) => assert_eq!(h, REFRESH_INTERVAL_HOURS),
+            other => panic!("trae-jwt-renew 应为 EveryHours 计划，实际 {other:?}"),
         }
     }
 

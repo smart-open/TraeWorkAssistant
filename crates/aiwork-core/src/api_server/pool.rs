@@ -824,9 +824,27 @@ impl ApiPool {
         dedicated: Option<&str>,
         skip_credit_filters: bool,
     ) -> Option<(PickedAccount, Option<String>)> {
-        // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定（专一绑定不让位）
+        // issue #206：委托谓词版本，恒真谓词 = 既有行为零变化
+        self.pick_excluding_constrained_ev_matching(
+            tried, allowed, dedicated, skip_credit_filters, &|_| true,
+        )
+    }
+
+    /// 同 [pick_excluding_constrained_ev]，附加账号×模型冷却谓词过滤（issue #206）：
+    /// `model_filter(uid)` 返回 false = 该账号对此模型不可用（(uid, model) 冷却中，
+    /// 上游 429 为模型维度限流）。谓词在池锁内调用，须只读外部状态、不得回调池方法
+    pub fn pick_excluding_constrained_ev_matching(
+        &self,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+        dedicated: Option<&str>,
+        skip_credit_filters: bool,
+        model_filter: &dyn Fn(&str) -> bool,
+    ) -> Option<(PickedAccount, Option<String>)> {
+        // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定（专一绑定不让位）；
+        // 绑定账号同样过模型过滤——冷却中则视为不可用，由调用方走无健康收尾
         if let Some(uid) = dedicated {
-            if !tried.contains(uid) {
+            if !tried.contains(uid) && model_filter(uid) {
                 if let Some(p) = self.pick_by_uid(uid, skip_credit_filters) {
                     let mut entries = safe_lock(&self.entries);
                     if let Some(e) = entries.get_mut(uid) {
@@ -844,6 +862,7 @@ impl ApiPool {
             .values()
             .filter(|e| selectable(e, tried, now, reserve, skip_credit_filters))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .filter(|e| model_filter(&e.uid))
             .collect();
         // F-77 busy 过滤 + 全 busy 降级
         let inflight = self.inflight_snapshot();
@@ -1107,19 +1126,30 @@ impl ApiPool {
         let now = now_ts();
         let mut entries = safe_lock(&self.entries);
         let mut cooldown_ev: Option<(String, String)> = None;
+        let mut state_ev: Option<String> = None; // issue #220 P3：状态跃迁告警文案
         if let Some(e) = entries.get_mut(uid) {
             e.failures = e.failures.saturating_add(1);
             let mut action: Option<String> = None;
             match kind {
                 ErrKind::SessionDead | ErrKind::Forbidden => {
+                    let fresh = !e.disabled;
                     e.disabled = true;
                     e.reason = kind.as_str().to_string();
                     action = Some("action=disabled".to_string());
+                    // issue #220 P3：Forbidden 首次禁用跃迁才告警（SessionDead 可由
+                    // 凭证轮换自愈不推；重复 11140 由跃迁判定 + 24h 冷却双重防刷屏）
+                    if kind == ErrKind::Forbidden && fresh {
+                        state_ev = Some(format!(
+                            "账号「{}」被上游限制（Forbidden），已临时停用",
+                            e.name
+                        ));
+                    }
                 }
                 ErrKind::HardCredit => {
                     // 积分耗尽：优先上游解冻时刻（issue #159），缺省冷却到下个
                     // 04:00（凌晨 00:00–04:00 窗口内为当天，next_0400 语义），
                     // 到期自动恢复探测（F-29 v1.2）
+                    let fresh_hard = e.hard_until <= now; // 原无活跃硬冷却 = 本次跃迁
                     let until = match unfreeze {
                         Some(u) => clamp_unfreeze(u, now),
                         None => next_0400(now),
@@ -1127,6 +1157,10 @@ impl ApiPool {
                     e.hard_until = until;
                     e.reason = "hard_credit".to_string();
                     e.err_count = 0;
+                    // issue #220 P3：积分耗尽跃迁告警（重复命中不刷屏）
+                    if fresh_hard {
+                        state_ev = Some(format!("账号「{}」积分耗尽，已进入保护冷却", e.name));
+                    }
                     action = Some(format!(
                         "action=hard_cooldown until={} ({})",
                         fmt_local_ts(until),
@@ -1196,6 +1230,14 @@ impl ApiPool {
                 );
             }
         }
+        // issue #220 P3：账号状态跃迁主动告警（旁路：通知栈未启用/失败不影响主流程）。
+        // data_dir 未装配（测试）时静默跳过；24h 同事件冷却由 notify 栈内控制
+        if let Some(ev) = state_ev {
+            let ctx = safe_lock(&self.log_ctx).clone();
+            if let Some((dir, label)) = ctx {
+                crate::notify::notify_account_state(&dir, uid, kind.as_str(), &format!("账号状态告警：{label}"), &ev);
+            }
+        }
     }
 
     /// 记录成功（重置熔断与错误计数）
@@ -1208,7 +1250,9 @@ impl ApiPool {
         }
     }
 
-    /// 清除所有账号的内存冷却状态（不影响 disabled/SessionDead）
+    /// 清除所有账号的内存冷却状态（不影响 disabled/SessionDead）。
+    /// 仅手动「清除冷却」调用：人工确认账号健康，一并复位熔断档位 cb_trips
+    ///（第五轮审查修复——否则解除后首个 Server 错误按历史档位直接跳长熔断）
     pub fn clear_cooldowns(&self) -> usize {
         let mut entries = safe_lock(&self.entries);
         let now = now_ts();
@@ -1221,8 +1265,29 @@ impl ApiPool {
             e.hard_until = 0;
             e.reason.clear();
             e.err_count = 0;
+            e.cb_trips = 0;
         }
         count
+    }
+
+    /// 清除指定账号的内存冷却状态（不影响 disabled/SessionDead；返回清除前是否处于冷却中）。
+    /// 单账号「解除冷却」配套（2026-11-21 审查修复，覆盖面口径对齐 clear_cooldowns）
+    pub fn clear_cooldown_for(&self, uid: &str) -> bool {
+        let mut entries = safe_lock(&self.entries);
+        match entries.get_mut(uid) {
+            Some(e) => {
+                let now = now_ts();
+                let had = (e.until > 0 && now < e.until) || (e.hard_until > 0 && now < e.hard_until);
+                e.until = 0;
+                e.hard_until = 0;
+                e.reason.clear();
+                e.err_count = 0;
+                // 手动解除 = 人工确认账号健康，同 clear_cooldowns 复位熔断档位
+                e.cb_trips = 0;
+                had
+            }
+            None => false,
+        }
     }
 
     /// 返回池状态列表
@@ -1309,6 +1374,27 @@ impl ApiPool {
             }
         }
         (total, in_allowed)
+    }
+
+    /// 账号×模型维度可选性判定（issue #206）：在 has_selectable_in 语义上追加
+    /// model_filter 谓词（(uid, model) 冷却中的账号对该模型不可用）。供
+    /// run_wb_stream 入口前置短路——预算耗尽前判明「该模型下无可选账号」，
+    /// 避免死循环空转（换号预算只对「可选但本次失败」有意义）
+    pub fn has_selectable_in_matching(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        skip_credit_filters: bool,
+        model_filter: &dyn Fn(&str) -> bool,
+    ) -> bool {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let tried = HashSet::new();
+        let reserve = self.reserve_credits();
+        entries.values().any(|e| {
+            selectable(e, &tried, now, reserve, skip_credit_filters)
+                && allowed.map_or(true, |a| a.contains(&e.uid))
+                && model_filter(&e.uid)
+        })
     }
 
     /// hard_credit（积分耗尽）账号统计（issue #156）：返回 (处于次日 04:00 硬冷却
@@ -1731,6 +1817,68 @@ mod tests {
             &HashMap::new(),
         );
         pool
+    }
+
+    // ==================== 账号×模型冷却谓词（issue #206） ====================
+
+    #[test]
+    fn pick_matching_filters_by_model_predicate() {
+        // issue #206：模型谓词过滤——u1 对某模型冷却中被跳过，u2 照常取号；
+        // 恒真谓词下行为与既有 pick 完全一致；谓词也作用于专一绑定账号
+        let pool = build_pool(&[("u1", 10.0, 0), ("u2", 10.0, 0)]);
+        pool.set_strategy(PoolStrategy::FairRotation);
+
+        // 谓词排除 u1 → 只能取到 u2
+        let picked = pool
+            .pick_excluding_constrained_ev_matching(
+                &HashSet::new(),
+                None,
+                None,
+                false,
+                &|uid| uid != "u1",
+            )
+            .unwrap();
+        assert_eq!(picked.0.uid, "u2", "谓词冷却账号应被跳过");
+        // 反向谓词排除 u2 → 只能取到 u1
+        let picked = pool
+            .pick_excluding_constrained_ev_matching(
+                &HashSet::new(),
+                None,
+                None,
+                false,
+                &|uid| uid != "u2",
+            )
+            .unwrap();
+        assert_eq!(picked.0.uid, "u1");
+
+        // 专一绑定：绑定账号被谓词排除 → 不锁定绑定账号，但池内仍有 u2 可用
+        //（让位走正常调度，这正是 issue #206 期望的降级语义）
+        let picked = pool
+            .pick_excluding_constrained_ev_matching(
+                &HashSet::new(),
+                None,
+                Some("u1"),
+                false,
+                &|uid| uid != "u1",
+            )
+            .unwrap();
+        assert_eq!(picked.0.uid, "u2", "绑定账号冷却中应让位给其他可用账号");
+        // 全部账号被谓词排除 → None
+        assert!(
+            pool.pick_excluding_constrained_ev_matching(
+                &HashSet::new(),
+                None,
+                Some("u1"),
+                false,
+                &|_| false,
+            )
+            .is_none(),
+            "全池被谓词排除应返回 None"
+        );
+
+        // has_selectable_in_matching 同口径：排除全部 → false；排除部分 → true
+        assert!(!pool.has_selectable_in_matching(None, false, &|_| false));
+        assert!(pool.has_selectable_in_matching(None, false, &|uid| uid != "u1"));
     }
 
     // ==================== hard_credit_stats（issue #156） ====================
@@ -2440,7 +2588,8 @@ mod tests {
         assert!((1799..=1801).contains(&s1), "首次熔断应约 30m，实际 {}s", s1);
         // 手动解除后再触发第二次 → 指数递增到 1h
         pool.clear_cooldowns();
-        // clear_cooldowns 重置 until 但 cb_trips 保留（指数递增的记忆）
+        // clear_cooldowns 现一并复位 cb_trips（第五轮审查修复：手动解除=人工确认
+        // 健康）——测试预置档位模拟「清除后再次累积」场景
         {
             let mut entries = safe_lock(&pool.entries);
             entries.get_mut("uid_a").unwrap().cb_trips = 1;
@@ -2456,6 +2605,25 @@ mod tests {
         {
             let entries = safe_lock(&pool.entries);
             assert_eq!(entries.get("uid_a").unwrap().cb_trips, 0);
+        }
+    }
+
+    #[test]
+    fn manual_clear_resets_circuit_breaker_memory() {
+        // 第五轮审查修复回归：手动「解除冷却」一并复位 cb_trips——否则解除后
+        // 首个 Server 错误按历史档位直接跳长熔断（30m<<trips），手动恢复语义不完整
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        for _ in 0..3 {
+            pool.note_error("uid_a", ErrKind::Server);
+        }
+        {
+            let entries = safe_lock(&pool.entries);
+            assert_eq!(entries.get("uid_a").unwrap().cb_trips, 1);
+        }
+        pool.clear_cooldown_for("uid_a");
+        {
+            let entries = safe_lock(&pool.entries);
+            assert_eq!(entries.get("uid_a").unwrap().cb_trips, 0, "单账号手动解除应复位熔断档位");
         }
     }
 

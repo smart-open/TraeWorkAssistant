@@ -1525,15 +1525,43 @@ pub fn credits_daily_list(state: &AppState) -> Vec<CreditsDailySnapshot> {
 
 /// 手动清除指定账号的冷却状态
 pub fn cooldown_clear(state: &AppState, user_id: String) -> Result<(), String> {
-    // 整表读-改-写互斥（审查 P4）：与签到路径 save_cooldown 共锁
-    let _cd_lock = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
-    if cd.cooldowns.remove(&user_id).is_some() {
-        cd.updated_at = Some(fs_utils::now_iso());
-        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
+    // 整表读-改-写互斥（审查 P4）：与签到路径 save_cooldown 共锁。审查修复
+    // （2026-11-21）：锁守卫收进块作用域——原绑定存活至函数尾，内存池清理
+    // （clear_cooldown_for 内部持池锁）实际发生在 ACCOUNT_COOLDOWNS_LOCK 锁内，
+    // 与下方注释及 cooldown_clear_all 的叶子锁纪律（防「持池锁→取冷却表锁」
+    // 路径锁序反转）矛盾；现文件段与 cooldown_clear_all 同构块作用域化
+    let file_removed = {
+        let _cd_lock = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
+        let removed = cd.cooldowns.remove(&user_id).is_some();
+        if removed {
+            cd.updated_at = Some(fs_utils::now_iso());
+            crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
+        }
+        removed
+    };
+    // 内存态同步清理（2026-11-21 审查修复，覆盖面口径对齐 cooldown_clear_all）：
+    // 原只清持久化文件——wb/buddy-ai 池内存冷却（#206 账号×模型冷却最长 7 天）
+    // 与两张账号×模型表中该 uid 条目依然生效，用户点「解除冷却」后网关侧照旧
+    // 排除该账号（复位路径闭环缺口）。锁外执行（叶子锁纪律，见 cooldown_clear_all）；
+    // 模型级冷却表按 model 键存储无法按 uid 拆除，交由 TTL 自然过期
+    if let Some(shared) = crate::api_server::runtime::gateway_shared() {
+        let _ = shared.pool.clear_cooldown_for(&user_id);
+        let _ = shared.wb_pool.clear_cooldown_for(&user_id);
+        let _ = shared.buddy_ai_pool.clear_cooldown_for(&user_id);
+        // Qoder 池内存冷却（账号级软熔断最长 30min，2026-11-21 审查修复补齐）
+        let _ = shared.qoder_pool.clear_cooldown_for(&user_id);
+        for tbl in [
+            &shared.wb_account_model_cooldowns,
+            &shared.buddy_ai_account_model_cooldowns,
+        ] {
+            let mut m = tbl.lock().unwrap_or_else(|e| e.into_inner());
+            m.retain(|(uid, _), _| uid != &user_id);
+        }
     }
+    let _ = file_removed; // 清除与否不影响 Ok 返回（占位防 unused 告警，语义见块内）
     Ok(())
 }
 
@@ -1558,8 +1586,37 @@ pub fn cooldown_clear_all(state: &AppState) -> Result<usize, String> {
     };
 
     // 同时清除运行中 API 池的内存冷却状态（网关未注册/未运行时计 0；锁外，见上）
+    // 审查修复（2026-11-20，Medium）：原只清 Trae 池——#206 引入的账号×模型冷却
+    // 与 WB/BuddyAi 池账号级冷却、两池模型级冷却均不在覆盖面，用户点「清除冷却」
+    // 后 429 冷却的账号×模型对依然生效（只能等 TTL 最长 7 天或重启网关）
     let mem_count = match crate::api_server::runtime::gateway_shared() {
-        Some(shared) => shared.pool.clear_cooldowns(),
+        Some(shared) => {
+            let mut n = shared.pool.clear_cooldowns();
+            n += shared.wb_pool.clear_cooldowns();
+            n += shared.buddy_ai_pool.clear_cooldowns();
+            n += shared.qoder_pool.clear_cooldowns();
+            // 模型级冷却两表（F-34，CN/Intl 独立实例）。
+            // 第五轮审查修复：计数只算冷却中的条目（对齐账号级 clear_cooldowns
+            // 只计 until>now 的口径），已过期条目不再虚报清除数
+            let now = chrono::Utc::now().timestamp();
+            for tbl in [&shared.model_cooldowns, &shared.buddy_ai_model_cooldowns] {
+                let mut m = tbl.lock().unwrap_or_else(|e| e.into_inner());
+                n += m.values().filter(|(until, _)| *until > now).count();
+                m.clear();
+            }
+            // Qoder 模型级冷却（模块级静态表，2026-11-21 审查修复补齐）
+            n += crate::api_server::qoder_route::clear_all_model_cooldowns();
+            // 账号×模型冷却两表（issue #206，CN/Intl 独立实例）
+            for tbl in [
+                &shared.wb_account_model_cooldowns,
+                &shared.buddy_ai_account_model_cooldowns,
+            ] {
+                let mut m = tbl.lock().unwrap_or_else(|e| e.into_inner());
+                n += m.values().filter(|until| **until > now).count();
+                m.clear();
+            }
+            n
+        }
         None => 0,
     };
 
@@ -1789,7 +1846,9 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
         account.refresh_token_invalid = false;
         account.auth_saved_at = Some(fs_utils::now_iso());
         // 若响应携带 refresh_token 过期时间则更新（兼容秒/毫秒两种时间戳）
-        if let Some(exp) = crate::fs_utils::dig(
+        // 审查补充（issue #201 复审#1）：key 列表源自 Buddy/Qoder 类推，dig 未命中时
+        // 落一条顶层键清单日志，便于用真实日志实测校准（与 oauth.rs 登录路径同源）
+        let rt_exp = crate::fs_utils::dig(
             &body,
             &[
                 "RefreshExpireAt",
@@ -1799,14 +1858,68 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
                 "refresh_expires_at_ms",
             ],
         )
-        .and_then(|v| v.as_i64())
+        .and_then(|v| v.as_i64());
+        if let Some(exp) = rt_exp.map(|exp| if exp > 10_000_000_000 { exp / 1000 } else { exp })
+            .filter(|exp| *exp > 0 && *exp < 4_102_444_800)
         {
-            account.refresh_token_expires_at =
-                Some(if exp > 10_000_000_000 { exp / 1000 } else { exp });
+            account.refresh_token_expires_at = Some(exp);
+        } else if body.is_object() {
+            let top_keys: Vec<&str> = body
+                .as_object()
+                .map(|m| m.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            if !top_keys.is_empty() {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "[ExchangeToken-exchange键清单] {} 未命中 rt 过期字段，响应顶层键: {top_keys:?}",
+                        account.name
+                    ),
+                );
+            }
         }
         account.name.clone()
     };
-    crate::vault::save_accounts(state, &mut accounts)?;
+    // 审查修复（2026-11-20，High，issue #201 窗口补齐）：`accounts` 快照取得后
+    // ExchangeToken（网络调用，秒级）期间，其他进程的续期/登录仍可能向 vault 写入
+    // 其他账号新凭证，整文件保存旧快照会回滚这些写入（旧凭证复活）。
+    // 写回前重读最新 vault，仅把本账号刚换发的凭证字段合并进最新视图；
+    // 本账号已被并发移除时跳过写回（复活已删除账号无意义）。
+    {
+        let mut fresh = crate::vault::load_accounts(state);
+        let merged = match fresh
+            .accounts
+            .iter_mut()
+            .find(|a| a.user_id.as_deref() == Some(user_id))
+        {
+            Some(a) => {
+                if let Some(cur) = accounts
+                    .accounts
+                    .iter()
+                    .find(|x| x.user_id.as_deref() == Some(user_id))
+                {
+                    a.jwt = cur.jwt.clone();
+                    a.refresh_token = cur.refresh_token.clone();
+                    a.updated_at = cur.updated_at.clone();
+                    a.refresh_token_fails = cur.refresh_token_fails;
+                    a.refresh_token_invalid = cur.refresh_token_invalid;
+                    a.auth_saved_at = cur.auth_saved_at.clone();
+                    a.refresh_token_expires_at = cur.refresh_token_expires_at;
+                }
+                true
+            }
+            None => {
+                fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("刷新 [{user_id}]: 本账号已被并发移除，跳过凭证写回"),
+                );
+                false
+            }
+        };
+        if merged {
+            crate::vault::save_accounts(state, &mut fresh)?;
+        }
+    }
     // 记录成功刷新时刻：供 401 自愈 force 路径并发去重（FORCE_REFRESH_DEDUP_SECS 窗内复用）
     LAST_SUCCESS_REFRESH
         .lock()
